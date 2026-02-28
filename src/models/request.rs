@@ -35,6 +35,18 @@ pub struct AstgenRequest {
     /// Diff input (for context command via session)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
+    /// Lint rules (for lint command via session)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules: Option<Vec<crate::models::lint::Rule>>,
+    /// Number of recent commits for co-change analysis
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lookback: Option<usize>,
+    /// Minimum confidence for co-change analysis
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_confidence: Option<f64>,
+    /// File filter for co-change analysis
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,4 +58,8 @@ pub enum Command {
     Calls,
     Refs,
     Context,
+    Imports,
+    Lint,
+    Sequence,
+    Cochange,
 }

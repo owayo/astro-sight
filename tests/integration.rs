@@ -648,3 +648,327 @@ fn context_batch_refs_consistency() {
     // Verify impacted_callers is an array (may or may not have entries depending on workspace)
     assert!(changes[0]["impacted_callers"].is_array());
 }
+
+// ---- Imports tests ----
+
+#[test]
+fn imports_on_own_source() {
+    let output = cargo_bin()
+        .args(["imports", "--path", "src/main.rs"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["language"], "rust");
+
+    let imports = json["imports"].as_array().unwrap();
+    assert!(!imports.is_empty(), "Should find imports in main.rs");
+
+    // All imports should be 'use' kind for Rust
+    for imp in imports {
+        assert_eq!(imp["kind"], "use");
+    }
+}
+
+#[test]
+fn imports_batch() {
+    let output = cargo_bin()
+        .args(["imports", "--paths", "src/main.rs,src/lib.rs"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 2, "Batch should produce 2 NDJSON lines");
+}
+
+// ---- Lint tests ----
+
+#[test]
+fn lint_with_pattern_rule() {
+    use std::io::Write;
+
+    let rules = r#"- id: no-unwrap
+  language: rust
+  severity: warning
+  message: "Avoid unwrap()"
+  pattern: "unwrap"
+"#;
+
+    let tmp = std::env::temp_dir().join("astro_sight_lint_rules.yaml");
+    let mut f = std::fs::File::create(&tmp).unwrap();
+    f.write_all(rules.as_bytes()).unwrap();
+    drop(f);
+
+    let output = cargo_bin()
+        .args([
+            "lint",
+            "--path",
+            "src/main.rs",
+            "--rules",
+            tmp.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["language"], "rust");
+    let matches = json["matches"].as_array().unwrap();
+    assert!(!matches.is_empty(), "Should find unwrap pattern");
+    assert_eq!(matches[0]["rule_id"], "no-unwrap");
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn lint_with_query_rule() {
+    use std::io::Write;
+
+    let rules = r#"- id: find-functions
+  language: rust
+  severity: info
+  message: "Found a function"
+  query: "(function_item name: (identifier) @fn_name)"
+"#;
+
+    let tmp = std::env::temp_dir().join("astro_sight_lint_query_rules.yaml");
+    let mut f = std::fs::File::create(&tmp).unwrap();
+    f.write_all(rules.as_bytes()).unwrap();
+    drop(f);
+
+    let output = cargo_bin()
+        .args([
+            "lint",
+            "--path",
+            "src/main.rs",
+            "--rules",
+            tmp.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["language"], "rust");
+    let matches = json["matches"].as_array().unwrap();
+    assert!(!matches.is_empty(), "Should find function definitions");
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// ---- Phase 4: Sequence diagram tests ----
+
+#[test]
+fn sequence_on_own_source() {
+    let output = cargo_bin()
+        .args(["sequence", "--path", "src/main.rs"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["language"], "rust");
+    assert!(!json["participants"].as_array().unwrap().is_empty());
+    assert!(
+        json["diagram"]
+            .as_str()
+            .unwrap()
+            .contains("sequenceDiagram")
+    );
+}
+
+#[test]
+fn sequence_with_function_filter() {
+    let output = cargo_bin()
+        .args(["sequence", "--path", "src/main.rs", "--function", "run"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert!(
+        json["diagram"]
+            .as_str()
+            .unwrap()
+            .contains("sequenceDiagram")
+    );
+}
+
+// ---- Lint boundary tests ----
+
+#[test]
+fn lint_with_invalid_query_reports_warning() {
+    use std::io::Write;
+
+    let rules = r#"- id: bad-query
+  language: rust
+  severity: warning
+  message: "This query is invalid"
+  query: "(this_is_not_valid @x"
+"#;
+
+    let tmp = std::env::temp_dir().join("astro_sight_lint_bad_query.yaml");
+    let mut f = std::fs::File::create(&tmp).unwrap();
+    f.write_all(rules.as_bytes()).unwrap();
+    drop(f);
+
+    let output = cargo_bin()
+        .args([
+            "lint",
+            "--path",
+            "src/main.rs",
+            "--rules",
+            tmp.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    // Should succeed but include a warning about the invalid query
+    let warnings = json["warnings"].as_array().unwrap();
+    assert!(
+        !warnings.is_empty(),
+        "Should have a warning for invalid query"
+    );
+    assert!(warnings[0].as_str().unwrap().contains("bad-query"));
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn lint_with_no_query_or_pattern_reports_warning() {
+    use std::io::Write;
+
+    let rules = r#"- id: empty-rule
+  language: rust
+  severity: info
+  message: "This rule has no query or pattern"
+"#;
+
+    let tmp = std::env::temp_dir().join("astro_sight_lint_empty_rule.yaml");
+    let mut f = std::fs::File::create(&tmp).unwrap();
+    f.write_all(rules.as_bytes()).unwrap();
+    drop(f);
+
+    let output = cargo_bin()
+        .args([
+            "lint",
+            "--path",
+            "src/main.rs",
+            "--rules",
+            tmp.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let warnings = json["warnings"].as_array().unwrap();
+    assert!(
+        !warnings.is_empty(),
+        "Should warn about rule with no query or pattern"
+    );
+    assert!(warnings[0].as_str().unwrap().contains("empty-rule"));
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// ---- Co-change analysis tests ----
+
+#[test]
+fn cochange_on_own_repo() {
+    let output = cargo_bin()
+        .args([
+            "cochange",
+            "--dir",
+            ".",
+            "--lookback",
+            "50",
+            "--min-confidence",
+            "0.1",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert!(json["commits_analyzed"].as_u64().unwrap() > 0);
+    assert!(json["entries"].as_array().is_some());
+}
+
+#[test]
+fn cochange_with_file_filter() {
+    let output = cargo_bin()
+        .args([
+            "cochange",
+            "--dir",
+            ".",
+            "--lookback",
+            "50",
+            "--min-confidence",
+            "0.1",
+            "--file",
+            "src/main.rs",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let entries = json["entries"].as_array().unwrap();
+    // All entries should contain src/main.rs
+    for entry in entries {
+        let a = entry["file_a"].as_str().unwrap();
+        let b = entry["file_b"].as_str().unwrap();
+        assert!(
+            a == "src/main.rs" || b == "src/main.rs",
+            "Entry should contain src/main.rs: {a} / {b}"
+        );
+    }
+}
+
+#[test]
+fn cochange_rejects_lookback_zero() {
+    let output = cargo_bin()
+        .args(["cochange", "--dir", ".", "--lookback", "0"])
+        .output()
+        .expect("failed to run");
+    assert!(!output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("lookback")
+    );
+}
+
+#[test]
+fn cochange_rejects_invalid_confidence() {
+    let output = cargo_bin()
+        .args([
+            "cochange",
+            "--dir",
+            ".",
+            "--lookback",
+            "10",
+            "--min-confidence",
+            "1.5",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(!output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("min_confidence")
+    );
+}
