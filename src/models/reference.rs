@@ -23,7 +23,6 @@ pub struct SymbolReference {
 /// The refs response envelope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefsResult {
-    pub version: String,
     pub symbol: String,
     pub references: Vec<SymbolReference>,
 }

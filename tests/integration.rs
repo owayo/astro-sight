@@ -177,7 +177,10 @@ fn calls_on_own_source() {
     assert!(output.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    assert_eq!(json["version"], PKG_VERSION);
+    assert!(
+        json.get("version").is_none(),
+        "calls should not have version"
+    );
     assert_eq!(json["language"], "rust");
 
     let calls = json["calls"].as_array().unwrap();
@@ -217,7 +220,10 @@ fn refs_finds_symbol() {
     assert!(output.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    assert_eq!(json["version"], PKG_VERSION);
+    assert!(
+        json.get("version").is_none(),
+        "refs should not have version"
+    );
     assert_eq!(json["symbol"], "AstgenResponse");
 
     let refs = json["references"].as_array().unwrap();
@@ -285,7 +291,10 @@ fn context_with_diff() {
     assert!(output.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    assert_eq!(json["version"], PKG_VERSION);
+    assert!(
+        json.get("version").is_none(),
+        "context should not have version"
+    );
 
     let changes = json["changes"].as_array().unwrap();
     assert!(!changes.is_empty(), "Should have changes");
@@ -405,7 +414,10 @@ fn context_diff_file_arg() {
     assert!(output.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    assert_eq!(json["version"], PKG_VERSION);
+    assert!(
+        json.get("version").is_none(),
+        "context should not have version"
+    );
     let changes = json["changes"].as_array().unwrap();
     assert!(!changes.is_empty());
     assert_eq!(changes[0]["path"], "src/engine/symbols.rs");

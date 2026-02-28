@@ -15,12 +15,14 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - **バッチ処理**（`--paths` / `--paths-file` で複数ファイル NDJSON 出力）
 - **JSON エラー出力**（`{"error":{"code":"...","message":"..."}}` を stdout に出力）
 - **セキュリティ** — パス境界チェック（MCP: cwd サンドボックス）、ファイル/入力サイズ 100MB 上限
+- **トークン最適化** — version フィールド省略（doctor/MCP のみ保持）、refs/context で相対パス出力
 - **設定ファイル** — `~/.config/astro-sight/config.toml`（TOML 形式、`astro-sight init` で生成）
 - **ロギング** — logroller による日次ローテーション（ローカルタイムゾーン、3日保持）
 
 ## Key Modules
 
-- `src/service.rs` - **AppService**: 全コア操作の統一エントリポイント（extract_ast/symbols/calls, find_references, analyze_context + パス検証）
+- `src/service.rs` - **AppService**: 全コア操作の統一エントリポイント（extract_ast/symbols/calls, find_references, analyze_context + パス検証 + tracing ログ）
+- `src/skill.rs` - スキルインストール（`skill-install claude/codex` → ~/.claude/skills/ or ~/.codex/skills/）
 - `src/config.rs` - 設定ファイル管理（ConfigService: load/generate、TOML 形式）
 - `src/logger.rs` - ロギング（logroller 日次ローテーション、3日保持、tracing-subscriber）
 - `src/cli.rs` - CLI サブコマンド定義（ast, symbols, calls, refs, context, doctor, session, mcp, init）

@@ -26,7 +26,6 @@ pub struct CallEdge {
 /// The call graph response for a single file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallGraph {
-    pub version: String,
     pub language: String,
     pub calls: Vec<CallEdge>,
 }

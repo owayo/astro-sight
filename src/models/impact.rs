@@ -56,6 +56,5 @@ pub struct FileImpact {
 /// The context (impact analysis) response envelope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextResult {
-    pub version: String,
     pub changes: Vec<FileImpact>,
 }
