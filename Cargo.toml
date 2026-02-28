@@ -1,6 +1,6 @@
 [package]
 name = "astro-sight"
-version = "0.1.0"
+version = "26.2.100"
 edition = "2024"
 authors = ["owayo <yoheiowa@gmail.com>"]
 description = "AI-agent-friendly AST information generation CLI"
