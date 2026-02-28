@@ -10,3 +10,4 @@ pub mod mcp;
 pub mod models;
 pub mod service;
 pub mod session;
+pub mod skill;
