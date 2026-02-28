@@ -155,4 +155,10 @@ pub enum Commands {
         #[arg(short, long)]
         path: Option<std::path::PathBuf>,
     },
+
+    /// Install astro-sight skill for an AI agent
+    SkillInstall {
+        /// Target agent: "claude" (~/.claude/skills/) or "codex" (~/.codex/skills/)
+        target: String,
+    },
 }

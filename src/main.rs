@@ -105,17 +105,24 @@ fn run(cli: Cli) -> Result<()> {
         astro_sight::logger::init(&config)?;
     }
 
-    // Handle init command before creating AppService
-    if let Commands::Init { path } = &cli.command {
-        let config_path = if let Some(p) = path {
-            ConfigService::generate_at(p)?;
-            p.clone()
-        } else {
-            ConfigService::generate_default()?;
-            ConfigService::default_path()
-        };
-        eprintln!("Configuration file created at: {}", config_path.display());
-        return Ok(());
+    // Handle early-exit commands before creating AppService
+    match &cli.command {
+        Commands::Init { path } => {
+            let config_path = if let Some(p) = path {
+                ConfigService::generate_at(p)?;
+                p.clone()
+            } else {
+                ConfigService::generate_default()?;
+                ConfigService::default_path()
+            };
+            eprintln!("Configuration file created at: {}", config_path.display());
+            return Ok(());
+        }
+        Commands::SkillInstall { target } => {
+            astro_sight::skill::install(target)?;
+            return Ok(());
+        }
+        _ => {}
     }
 
     let service = AppService::new();
@@ -194,7 +201,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Doctor => cmd_doctor(pretty),
         Commands::Session => cmd_session(),
         Commands::Mcp => cmd_mcp(),
-        Commands::Init { .. } => unreachable!("handled above"),
+        Commands::Init { .. } | Commands::SkillInstall { .. } => unreachable!("handled above"),
     }
 }
 

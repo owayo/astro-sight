@@ -1,5 +1,7 @@
 use std::process::Command;
 
+const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 fn cargo_bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_astro-sight"))
 }
@@ -10,7 +12,7 @@ fn doctor_returns_json() {
     assert!(output.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    assert_eq!(json["version"], "0.1.0");
+    assert_eq!(json["version"], PKG_VERSION);
     assert!(json["languages"].as_array().unwrap().len() >= 14);
 
     // All languages should be available
@@ -175,7 +177,7 @@ fn calls_on_own_source() {
     assert!(output.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    assert_eq!(json["version"], "0.1.0");
+    assert_eq!(json["version"], PKG_VERSION);
     assert_eq!(json["language"], "rust");
 
     let calls = json["calls"].as_array().unwrap();
@@ -215,7 +217,7 @@ fn refs_finds_symbol() {
     assert!(output.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    assert_eq!(json["version"], "0.1.0");
+    assert_eq!(json["version"], PKG_VERSION);
     assert_eq!(json["symbol"], "AstgenResponse");
 
     let refs = json["references"].as_array().unwrap();
@@ -283,7 +285,7 @@ fn context_with_diff() {
     assert!(output.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    assert_eq!(json["version"], "0.1.0");
+    assert_eq!(json["version"], PKG_VERSION);
 
     let changes = json["changes"].as_array().unwrap();
     assert!(!changes.is_empty(), "Should have changes");
@@ -403,7 +405,7 @@ fn context_diff_file_arg() {
     assert!(output.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    assert_eq!(json["version"], "0.1.0");
+    assert_eq!(json["version"], PKG_VERSION);
     let changes = json["changes"].as_array().unwrap();
     assert!(!changes.is_empty());
     assert_eq!(changes[0]["path"], "src/engine/symbols.rs");
@@ -506,7 +508,7 @@ fn mcp_initialize() {
     assert_eq!(json["jsonrpc"], "2.0");
     assert_eq!(json["id"], 1);
     assert_eq!(json["result"]["serverInfo"]["name"], "astro-sight");
-    assert_eq!(json["result"]["serverInfo"]["version"], "0.1.0");
+    assert_eq!(json["result"]["serverInfo"]["version"], PKG_VERSION);
     assert!(json["result"]["capabilities"]["tools"].is_object());
 }
 
