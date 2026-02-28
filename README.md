@@ -92,7 +92,7 @@ astro-sight refs --name "AstgenResponse" --dir src/ --glob "**/*.rs"
 
 ### context - スマートコンテキスト（diff → 影響分析）
 
-unified diff を受け取り、変更の影響範囲を分析する。CodeRabbit スタイルの AI コードレビュー支援機能。
+unified diff を受け取り、変更の影響範囲を分析する。AI コードレビュー支援機能。
 
 ```bash
 # git diff から影響分析（stdin）

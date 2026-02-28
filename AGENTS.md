@@ -9,7 +9,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - **BLAKE3** コンテンツハッシュによるファイルベースキャッシュ
 - **clap derive** による CLI 引数パーサー
 - **NDJSON** ストリーミングセッション対応
-- **CodeRabbit スタイル** スマートコンテキスト（diff→影響分析、バッチ参照検索 O(N+S)）
+- **スマートコンテキスト**（diff→影響分析、バッチ参照検索 O(N+S)）
 - **MCP サーバーモード**（rmcp による stdio JSON-RPC 2.0、ワークスペースサンドボックス）
 - **デフォルト compact JSON** 出力（`--pretty` で整形出力）
 - **バッチ処理**（`--paths` / `--paths-file` で複数ファイル NDJSON 出力）
@@ -21,13 +21,13 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Key Modules
 
-- `src/service.rs` - **AppService**: 全コア操作の統一エントリポイント（extract_ast/symbols/calls, find_references, analyze_context + パス検証 + tracing ログ）
+- `src/service.rs` - **AppService**: 全コア操作の統一エントリポイント（extract_ast/symbols/calls/imports/lint/sequence/cochange, find_references, analyze_context + パス検証 + tracing ログ）
 - `src/skill.rs` - スキルインストール（`skill-install claude/codex` → ~/.claude/skills/ or ~/.codex/skills/）
 - `src/config.rs` - 設定ファイル管理（ConfigService: load/generate、TOML 形式）
 - `src/logger.rs` - ロギング（logroller 日次ローテーション、3日保持、tracing-subscriber）
-- `src/cli.rs` - CLI サブコマンド定義（ast, symbols, calls, refs, context, doctor, session, mcp, init）
+- `src/cli.rs` - CLI サブコマンド定義（ast, symbols, calls, refs, context, imports, lint, sequence, cochange, doctor, session, mcp, init）
 - `src/main.rs` - コマンドディスパッチ、キャッシュ層、バッチ処理（全て AppService 経由）
-- `src/mcp/mod.rs` - MCP サーバー（AstroSightServer + AppService::sandboxed(cwd) + 6 ツール）
+- `src/mcp/mod.rs` - MCP サーバー（AstroSightServer + AppService::sandboxed(cwd) + 10 ツール）
 - `src/engine/parser.rs` - tree-sitter パーサー管理（100MB ファイルサイズ上限）
 - `src/engine/extractor.rs` - AST ノード抽出
 - `src/engine/symbols.rs` - シンボル抽出（tree-sitter クエリ）
@@ -35,8 +35,12 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/engine/refs.rs` - クロスファイル参照検索（ignore + rayon 並列 + `find_references_batch` バッチ検索）
 - `src/engine/diff.rs` - unified diff パーサー
 - `src/engine/impact.rs` - 影響分析オーケストレーター（2パス方式: collect affected → batch refs）
+- `src/engine/sequence.rs` - コールグラフから Mermaid シーケンス図を生成
+- `src/engine/imports.rs` - ファイル間の import/export 関係を抽出（言語別 tree-sitter クエリ）
+- `src/engine/lint.rs` - YAML ルールによる AST パターンマッチ（tree-sitter クエリ + テキストパターン）
+- `src/engine/cochange.rs` - git log から共変更ファイルペアを検出（confidence スコア付き）
 - `src/engine/snippet.rs` - コンテキストスニペット生成
-- `src/models/` - Request/Response/AST ノード/Call/Reference/Impact 型定義
+- `src/models/` - Request/Response/AST ノード/Call/Reference/Impact/Sequence/Import/Lint/CoChange 型定義
 - `src/error.rs` - AstroError + ErrorCode（PathOutOfBounds 含む）
 - `src/cache/store.rs` - content-addressed キャッシュ
 - `src/session/mod.rs` - NDJSON セッション処理（100MB 行サイズ上限）

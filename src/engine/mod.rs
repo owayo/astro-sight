@@ -1,8 +1,12 @@
 pub mod calls;
+pub mod cochange;
 pub mod diff;
 pub mod extractor;
 pub mod impact;
+pub mod imports;
+pub mod lint;
 pub mod parser;
 pub mod refs;
+pub mod sequence;
 pub mod snippet;
 pub mod symbols;

@@ -17,8 +17,10 @@ release: ## Build release version
 
 ## Installation
 
-install: release ## Build release and install to /usr/local/bin
+install: release ## Build release, install binary, and install skills (claude + codex)
 	cp target/release/$(BINARY_NAME) $(INSTALL_PATH)/
+	$(INSTALL_PATH)/$(BINARY_NAME) skill-install claude
+	$(INSTALL_PATH)/$(BINARY_NAME) skill-install codex
 
 ## Development
 

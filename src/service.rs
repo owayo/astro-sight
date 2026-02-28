@@ -4,13 +4,16 @@ use std::path::PathBuf;
 use tracing::{debug, warn};
 
 use crate::cache::store::CacheStore;
-use crate::engine::{calls, extractor, impact, parser, refs, snippet, symbols};
+use crate::engine::{calls, extractor, impact, imports, lint, parser, refs, snippet, symbols};
 use crate::error::{AstroError, ErrorCode};
 use crate::models::call::CallGraph;
+use crate::models::cochange::CoChangeResult;
 use crate::models::impact::ContextResult;
+use crate::models::import::ImportsResult;
 use crate::models::location::LocationKey;
 use crate::models::reference::RefsResult;
 use crate::models::response::AstgenResponse;
+use crate::models::sequence::SequenceDiagramResult;
 
 // ---------------------------------------------------------------------------
 // AppService: unified core logic for CLI / Session / MCP
@@ -258,6 +261,87 @@ impl AppService {
         Ok(graph)
     }
 
+    /// Generate a Mermaid sequence diagram from a source file's call graph.
+    pub fn generate_sequence(
+        &self,
+        path: &str,
+        function: Option<&str>,
+    ) -> Result<SequenceDiagramResult> {
+        debug!(path = path, function = ?function, "generate_sequence called");
+        let canonical = self.validate_path(path)?;
+        let utf8_path = Utf8Path::new(canonical.to_str().unwrap_or(path));
+
+        let source = parser::read_file(utf8_path)?;
+        let (tree, lang_id) = parser::parse_file(utf8_path, &source)?;
+        let root = tree.root_node();
+
+        let edges = calls::extract_calls(root, &source, lang_id, function)?;
+        let language = format!("{lang_id:?}").to_lowercase();
+
+        let result = crate::engine::sequence::generate_sequence_diagram(&edges, &language);
+        debug!(
+            path = path,
+            participants = result.participants.len(),
+            "generate_sequence completed"
+        );
+        Ok(result)
+    }
+
+    /// Extract import/export dependencies from a source file.
+    pub fn extract_imports(&self, path: &str) -> Result<ImportsResult> {
+        debug!(path = path, "extract_imports called");
+        let canonical = self.validate_path(path)?;
+        let utf8_path = Utf8Path::new(canonical.to_str().unwrap_or(path));
+
+        let source = parser::read_file(utf8_path)?;
+        let (tree, lang_id) = parser::parse_file(utf8_path, &source)?;
+        let root = tree.root_node();
+
+        let edges = imports::extract_imports(root, &source, lang_id)?;
+        let language = format!("{lang_id:?}").to_lowercase();
+
+        let result = ImportsResult {
+            language,
+            imports: edges,
+        };
+        debug!(
+            path = path,
+            imports = result.imports.len(),
+            "extract_imports completed"
+        );
+        Ok(result)
+    }
+
+    /// Lint a source file against the given rules.
+    pub fn lint_file(
+        &self,
+        path: &str,
+        rules: &[crate::models::lint::Rule],
+    ) -> Result<crate::models::lint::LintResult> {
+        debug!(path = path, rules = rules.len(), "lint_file called");
+        let canonical = self.validate_path(path)?;
+        let utf8_path = Utf8Path::new(canonical.to_str().unwrap_or(path));
+
+        let source = parser::read_file(utf8_path)?;
+        let (tree, lang_id) = parser::parse_file(utf8_path, &source)?;
+        let root = tree.root_node();
+
+        let (matches, warnings) = lint::lint_file(root, &source, lang_id, rules)?;
+        let language = lang_id.to_string();
+
+        let result = crate::models::lint::LintResult {
+            language,
+            matches,
+            warnings,
+        };
+        debug!(
+            path = path,
+            matches = result.matches.len(),
+            "lint_file completed"
+        );
+        Ok(result)
+    }
+
     /// Search for symbol references across files.
     pub fn find_references(&self, name: &str, dir: &str, glob: Option<&str>) -> Result<RefsResult> {
         debug!(name = name, dir = dir, glob = ?glob, "find_references called");
@@ -312,6 +396,56 @@ impl AppService {
                 .map(|c| c.impacted_callers.len())
                 .sum::<usize>(),
             "analyze_context completed"
+        );
+        Ok(result)
+    }
+
+    /// Analyze co-change patterns from git history.
+    pub fn analyze_cochange(
+        &self,
+        dir: &str,
+        lookback: usize,
+        min_confidence: f64,
+        filter_file: Option<&str>,
+    ) -> Result<CoChangeResult> {
+        debug!(
+            dir = dir,
+            lookback = lookback,
+            min_confidence = min_confidence,
+            filter_file = ?filter_file,
+            "analyze_cochange called"
+        );
+        // Validate parameters
+        const MAX_LOOKBACK: usize = 10_000;
+        if lookback == 0 || lookback > MAX_LOOKBACK {
+            bail!(AstroError::new(
+                ErrorCode::InvalidRequest,
+                format!("lookback must be 1..={MAX_LOOKBACK}, got {lookback}"),
+            ));
+        }
+        if !min_confidence.is_finite() || !(0.0..=1.0).contains(&min_confidence) {
+            bail!(AstroError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "min_confidence must be a finite value in [0.0, 1.0], got {min_confidence}"
+                ),
+            ));
+        }
+
+        let canonical_dir = self.validate_dir(dir)?;
+        let dir_str = canonical_dir.to_string_lossy();
+
+        let result = crate::engine::cochange::analyze_cochange(
+            &dir_str,
+            lookback,
+            min_confidence,
+            filter_file,
+        )?;
+        debug!(
+            dir = dir,
+            entries = result.entries.len(),
+            commits_analyzed = result.commits_analyzed,
+            "analyze_cochange completed"
         );
         Ok(result)
     }

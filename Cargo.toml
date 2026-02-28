@@ -19,6 +19,7 @@ memmap2 = "0.9.10"
 rayon = "1.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+serde_yaml = "0.9.33"
 streaming-iterator = "0.1.9"
 tree-sitter = "0.26.6"
 tree-sitter-language = "0.1.7"

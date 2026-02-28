@@ -140,6 +140,82 @@ pub enum Commands {
         diff_file: Option<String>,
     },
 
+    /// Extract import/export dependencies from a source file
+    Imports {
+        /// Path to the source file (single mode)
+        #[arg(short, long)]
+        path: Option<String>,
+
+        /// Comma-separated paths (batch mode, NDJSON output)
+        #[arg(long, conflicts_with = "path")]
+        paths: Option<String>,
+
+        /// File containing paths, one per line (batch mode)
+        #[arg(long, conflicts_with_all = ["path", "paths"])]
+        paths_file: Option<String>,
+    },
+
+    /// Lint source files with AST pattern rules
+    Lint {
+        /// Path to the source file (single mode)
+        #[arg(short, long)]
+        path: Option<String>,
+
+        /// Comma-separated paths (batch mode, NDJSON output)
+        #[arg(long, conflicts_with = "path")]
+        paths: Option<String>,
+
+        /// File containing paths, one per line (batch mode)
+        #[arg(long, conflicts_with_all = ["path", "paths"])]
+        paths_file: Option<String>,
+
+        /// Path to YAML rules file
+        #[arg(short, long)]
+        rules: Option<String>,
+
+        /// Directory containing YAML rule files
+        #[arg(long, conflicts_with = "rules")]
+        rules_dir: Option<String>,
+    },
+
+    /// Generate Mermaid sequence diagram from call graph
+    Sequence {
+        /// Path to the source file (single mode)
+        #[arg(short, long)]
+        path: Option<String>,
+
+        /// Comma-separated paths (batch mode, NDJSON output)
+        #[arg(long, conflicts_with = "path")]
+        paths: Option<String>,
+
+        /// File containing paths, one per line (batch mode)
+        #[arg(long, conflicts_with_all = ["path", "paths"])]
+        paths_file: Option<String>,
+
+        /// Filter to a specific function name
+        #[arg(short, long)]
+        function: Option<String>,
+    },
+
+    /// Analyze co-change patterns from git history
+    Cochange {
+        /// Git repository directory
+        #[arg(short, long, default_value = ".")]
+        dir: String,
+
+        /// Number of recent commits to analyze (default: 200)
+        #[arg(short, long, default_value = "200")]
+        lookback: usize,
+
+        /// Minimum confidence threshold (0.0 to 1.0, default: 0.3)
+        #[arg(short, long, default_value = "0.3")]
+        min_confidence: f64,
+
+        /// Filter to pairs containing this file
+        #[arg(short, long)]
+        file: Option<String>,
+    },
+
     /// Check tool availability and language support
     Doctor,
 

@@ -184,9 +184,70 @@ fn run(cli: Cli) -> Result<()> {
                 PathInput::Batch(ps) => batch_calls(&service, &ps, function.as_deref()),
             }
         }
+        Commands::Imports {
+            path,
+            paths,
+            paths_file,
+        } => {
+            let input = resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
+            match input {
+                PathInput::Single(p) => cmd_imports(&service, &p, pretty),
+                PathInput::Batch(ps) => batch_imports(&service, &ps),
+            }
+        }
+        Commands::Lint {
+            path,
+            paths,
+            paths_file,
+            rules,
+            rules_dir,
+        } => {
+            let loaded_rules = if let Some(rules_path) = &rules {
+                astro_sight::engine::lint::load_rules_from_file(rules_path)?
+            } else if let Some(dir) = &rules_dir {
+                astro_sight::engine::lint::load_rules_from_dir(dir)?
+            } else {
+                return Err(AstroError::new(
+                    ErrorCode::InvalidRequest,
+                    "One of --rules or --rules-dir is required",
+                )
+                .into());
+            };
+
+            let input = resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
+            match input {
+                PathInput::Single(p) => cmd_lint(&service, &p, &loaded_rules, pretty),
+                PathInput::Batch(ps) => batch_lint(&service, &ps, &loaded_rules),
+            }
+        }
+        Commands::Sequence {
+            path,
+            paths,
+            paths_file,
+            function,
+        } => {
+            let input = resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
+            match input {
+                PathInput::Single(p) => cmd_sequence(&service, &p, function.as_deref(), pretty),
+                PathInput::Batch(ps) => batch_sequence(&service, &ps, function.as_deref()),
+            }
+        }
         Commands::Refs { name, dir, glob } => {
             cmd_refs(&service, &name, &dir, glob.as_deref(), pretty)
         }
+        Commands::Cochange {
+            dir,
+            lookback,
+            min_confidence,
+            file,
+        } => cmd_cochange(
+            &service,
+            &dir,
+            lookback,
+            min_confidence,
+            file.as_deref(),
+            pretty,
+        ),
         Commands::Context {
             dir,
             diff,
@@ -307,6 +368,37 @@ fn cmd_calls(service: &AppService, path: &str, function: Option<&str>, pretty: b
     Ok(())
 }
 
+fn cmd_imports(service: &AppService, path: &str, pretty: bool) -> Result<()> {
+    let result = service.extract_imports(path)?;
+    let output = serialize_output(&result, pretty)?;
+    println!("{output}");
+    Ok(())
+}
+
+fn cmd_lint(
+    service: &AppService,
+    path: &str,
+    rules: &[astro_sight::models::lint::Rule],
+    pretty: bool,
+) -> Result<()> {
+    let result = service.lint_file(path, rules)?;
+    let output = serialize_output(&result, pretty)?;
+    println!("{output}");
+    Ok(())
+}
+
+fn cmd_sequence(
+    service: &AppService,
+    path: &str,
+    function: Option<&str>,
+    pretty: bool,
+) -> Result<()> {
+    let result = service.generate_sequence(path, function)?;
+    let output = serialize_output(&result, pretty)?;
+    println!("{output}");
+    Ok(())
+}
+
 fn cmd_refs(
     service: &AppService,
     name: &str,
@@ -315,6 +407,20 @@ fn cmd_refs(
     pretty: bool,
 ) -> Result<()> {
     let result = service.find_references(name, dir, glob)?;
+    let output = serialize_output(&result, pretty)?;
+    println!("{output}");
+    Ok(())
+}
+
+fn cmd_cochange(
+    service: &AppService,
+    dir: &str,
+    lookback: usize,
+    min_confidence: f64,
+    file: Option<&str>,
+    pretty: bool,
+) -> Result<()> {
+    let result = service.analyze_cochange(dir, lookback, min_confidence, file)?;
     let output = serialize_output(&result, pretty)?;
     println!("{output}");
     Ok(())
@@ -378,72 +484,91 @@ fn cmd_mcp() -> Result<()> {
 // Batch processing (NDJSON output, rayon parallel)
 // ---------------------------------------------------------------------------
 
+/// NDJSON batch output: process in parallel (order preserved), write with locked stdout.
+fn batch_ndjson<F>(paths: &[String], process: F) -> Result<()>
+where
+    F: Fn(&str) -> String + Sync,
+{
+    use std::io::Write;
+    let results: Vec<String> = paths.par_iter().map(|p| process(p)).collect();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for line in &results {
+        writeln!(out, "{line}")?;
+    }
+    Ok(())
+}
+
 fn batch_ast(
     service: &AppService,
     paths: &[String],
     depth: usize,
     context_lines: usize,
 ) -> Result<()> {
-    let results: Vec<String> = paths
-        .par_iter()
-        .map(|p| {
-            let params = AstParams {
-                path: p,
-                line: None,
-                col: None,
-                end_line: None,
-                end_col: None,
-                depth,
-                context_lines,
-            };
-            match service.extract_ast(&params) {
-                Ok(response) => {
-                    serde_json::to_string(&response).unwrap_or_else(|e| make_error_line(&e.into()))
-                }
-                Err(e) => make_error_line(&e),
-            }
-        })
-        .collect();
-
-    for line in &results {
-        println!("{line}");
-    }
-    Ok(())
-}
-
-fn batch_symbols(service: &AppService, paths: &[String]) -> Result<()> {
-    let results: Vec<String> = paths
-        .par_iter()
-        .map(|p| match service.extract_symbols(p) {
+    batch_ndjson(paths, |p| {
+        let params = AstParams {
+            path: p,
+            line: None,
+            col: None,
+            end_line: None,
+            end_col: None,
+            depth,
+            context_lines,
+        };
+        match service.extract_ast(&params) {
             Ok(response) => {
                 serde_json::to_string(&response).unwrap_or_else(|e| make_error_line(&e.into()))
             }
             Err(e) => make_error_line(&e),
-        })
-        .collect();
+        }
+    })
+}
 
-    for line in &results {
-        println!("{line}");
-    }
-    Ok(())
+fn batch_symbols(service: &AppService, paths: &[String]) -> Result<()> {
+    batch_ndjson(paths, |p| match service.extract_symbols(p) {
+        Ok(response) => {
+            serde_json::to_string(&response).unwrap_or_else(|e| make_error_line(&e.into()))
+        }
+        Err(e) => make_error_line(&e),
+    })
 }
 
 fn batch_calls(service: &AppService, paths: &[String], function: Option<&str>) -> Result<()> {
     let func = function.map(|s| s.to_string());
-    let results: Vec<String> = paths
-        .par_iter()
-        .map(|p| match service.extract_calls(p, func.as_deref()) {
+    batch_ndjson(paths, |p| match service.extract_calls(p, func.as_deref()) {
+        Ok(result) => serde_json::to_string(&result).unwrap_or_else(|e| make_error_line(&e.into())),
+        Err(e) => make_error_line(&e),
+    })
+}
+
+fn batch_imports(service: &AppService, paths: &[String]) -> Result<()> {
+    batch_ndjson(paths, |p| match service.extract_imports(p) {
+        Ok(result) => serde_json::to_string(&result).unwrap_or_else(|e| make_error_line(&e.into())),
+        Err(e) => make_error_line(&e),
+    })
+}
+
+fn batch_lint(
+    service: &AppService,
+    paths: &[String],
+    rules: &[astro_sight::models::lint::Rule],
+) -> Result<()> {
+    batch_ndjson(paths, |p| match service.lint_file(p, rules) {
+        Ok(result) => serde_json::to_string(&result).unwrap_or_else(|e| make_error_line(&e.into())),
+        Err(e) => make_error_line(&e),
+    })
+}
+
+fn batch_sequence(service: &AppService, paths: &[String], function: Option<&str>) -> Result<()> {
+    let func = function.map(|s| s.to_string());
+    batch_ndjson(paths, |p| {
+        match service.generate_sequence(p, func.as_deref()) {
             Ok(result) => {
                 serde_json::to_string(&result).unwrap_or_else(|e| make_error_line(&e.into()))
             }
             Err(e) => make_error_line(&e),
-        })
-        .collect();
-
-    for line in &results {
-        println!("{line}");
-    }
-    Ok(())
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -492,6 +617,27 @@ fn handle_request(
             let dir = req.dir.as_deref().unwrap_or(".");
             let diff_input = req.diff.as_deref().unwrap_or("");
             let result = service.analyze_context(diff_input, dir)?;
+            Ok(serde_json::to_value(result)?)
+        }
+        Command::Imports => {
+            let result = service.extract_imports(&req.path)?;
+            Ok(serde_json::to_value(result)?)
+        }
+        Command::Lint => {
+            let rules = req.rules.as_deref().unwrap_or(&[]);
+            let result = service.lint_file(&req.path, rules)?;
+            Ok(serde_json::to_value(result)?)
+        }
+        Command::Sequence => {
+            let result = service.generate_sequence(&req.path, req.function.as_deref())?;
+            Ok(serde_json::to_value(result)?)
+        }
+        Command::Cochange => {
+            let dir = req.dir.as_deref().unwrap_or(".");
+            let lookback = req.lookback.unwrap_or(200);
+            let min_confidence = req.min_confidence.unwrap_or(0.3);
+            let result =
+                service.analyze_cochange(dir, lookback, min_confidence, req.file.as_deref())?;
             Ok(serde_json::to_value(result)?)
         }
     }

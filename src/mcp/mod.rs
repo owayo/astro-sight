@@ -80,6 +80,70 @@ pub struct ContextAnalyzeParams {
     pub dir: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ImportsExtractParams {
+    /// Path to the source file
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LintParams {
+    /// Path to the source file
+    pub path: String,
+    /// Lint rules as JSON array
+    pub rules: Vec<LintRuleParam>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct LintRuleParam {
+    /// Unique rule identifier
+    pub id: String,
+    /// Target language (e.g. "rust", "javascript")
+    pub language: String,
+    /// Severity: "error", "warning", or "info"
+    pub severity: String,
+    /// Human-readable message
+    pub message: String,
+    /// tree-sitter query (optional)
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Text pattern (optional)
+    #[serde(default)]
+    pub pattern: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SequenceDiagramParams {
+    /// Path to the source file
+    pub path: String,
+    /// Filter to a specific function name
+    #[serde(default)]
+    pub function: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CochangeAnalyzeParams {
+    /// Git repository directory
+    pub dir: String,
+    /// Number of recent commits to analyze (default: 200)
+    #[serde(default = "default_lookback")]
+    pub lookback: usize,
+    /// Minimum confidence threshold (default: 0.3)
+    #[serde(default = "default_min_confidence")]
+    pub min_confidence: f64,
+    /// Filter to pairs containing this file
+    #[serde(default)]
+    pub file: Option<String>,
+}
+
+fn default_lookback() -> usize {
+    200
+}
+
+fn default_min_confidence() -> f64 {
+    0.3
+}
+
 // ---------------------------------------------------------------------------
 // MCP Server
 // ---------------------------------------------------------------------------
@@ -177,6 +241,87 @@ impl AstroSightServer {
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
         Self::to_tool_result(self.service.analyze_context(&p.diff, &p.dir))
+    }
+
+    #[tool(
+        name = "imports_extract",
+        description = "Extract import/export dependencies from a source file"
+    )]
+    async fn imports_extract(
+        &self,
+        params: Parameters<ImportsExtractParams>,
+    ) -> Result<CallToolResult, McpError> {
+        Self::to_tool_result(self.service.extract_imports(&params.0.path))
+    }
+
+    #[tool(
+        name = "lint",
+        description = "Lint a source file using AST pattern matching rules"
+    )]
+    async fn lint(&self, params: Parameters<LintParams>) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        let rules: Result<Vec<crate::models::lint::Rule>, McpError> = p
+            .rules
+            .into_iter()
+            .map(|r| {
+                let severity = match r.severity.as_str() {
+                    "error" => crate::models::lint::Severity::Error,
+                    "warning" => crate::models::lint::Severity::Warning,
+                    "info" => crate::models::lint::Severity::Info,
+                    other => {
+                        return Err(McpError::internal_error(
+                            format!(
+                                "Invalid severity '{other}' for rule '{}': must be error/warning/info",
+                                r.id
+                            ),
+                            None,
+                        ))
+                    }
+                };
+                Ok(crate::models::lint::Rule {
+                    id: r.id,
+                    language: r.language,
+                    severity,
+                    message: r.message,
+                    query: r.query,
+                    pattern: r.pattern,
+                })
+            })
+            .collect();
+        let rules = rules?;
+        Self::to_tool_result(self.service.lint_file(&p.path, &rules))
+    }
+
+    #[tool(
+        name = "sequence_diagram",
+        description = "Generate Mermaid sequence diagram from a source file's call graph"
+    )]
+    async fn sequence_diagram(
+        &self,
+        params: Parameters<SequenceDiagramParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        Self::to_tool_result(
+            self.service
+                .generate_sequence(&p.path, p.function.as_deref()),
+        )
+    }
+
+    #[tool(
+        name = "cochange_analyze",
+        description = "Analyze co-change patterns from git history to find files that frequently change together"
+    )]
+    async fn cochange_analyze(
+        &self,
+        params: Parameters<CochangeAnalyzeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        Self::to_tool_result(self.service.analyze_cochange(
+            &p.dir,
+            p.lookback,
+            p.min_confidence,
+            p.file.as_deref(),
+        ))
     }
 
     #[tool(
