@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use camino::Utf8Path;
 use std::path::PathBuf;
+use tracing::{debug, warn};
 
 use crate::cache::store::CacheStore;
 use crate::engine::{calls, extractor, impact, parser, refs, snippet, symbols};
@@ -84,11 +85,16 @@ impl AppService {
     /// Validate and canonicalize a file path. Returns the canonical path.
     fn validate_path(&self, path: &str) -> Result<PathBuf> {
         let canonical = std::fs::canonicalize(path).map_err(|_| {
+            warn!(path = path, "validate_path: file not found");
             AstroError::new(ErrorCode::FileNotFound, format!("File not found: {path}"))
         })?;
         if let Some(root) = &self.workspace_root
             && !canonical.starts_with(root)
         {
+            warn!(
+                path = path,
+                "validate_path: path outside workspace boundary"
+            );
             bail!(AstroError::new(
                 ErrorCode::PathOutOfBounds,
                 format!("Path outside workspace boundary: {path}"),
@@ -136,6 +142,15 @@ impl AppService {
 
     /// Extract AST at a given position/range with optional snippet + diagnostics.
     pub fn extract_ast(&self, p: &AstParams<'_>) -> Result<AstgenResponse> {
+        debug!(
+            path = p.path,
+            line = ?p.line,
+            col = ?p.col,
+            end_line = ?p.end_line,
+            end_col = ?p.end_col,
+            depth = p.depth,
+            "extract_ast called"
+        );
         let canonical = self.validate_path(p.path)?;
         let utf8_path = Utf8Path::new(canonical.to_str().unwrap_or(p.path));
 
@@ -181,11 +196,19 @@ impl AppService {
         response.ast = Some(ast_nodes);
         response.snippet = snip;
         collect_diagnostics(root, &mut response);
+        debug!(
+            path = p.path,
+            language = ?lang_id,
+            ast_nodes = response.ast.as_ref().map(|a| a.len()).unwrap_or(0),
+            diagnostics = response.diagnostics.len(),
+            "extract_ast completed"
+        );
         Ok(response)
     }
 
     /// Extract symbols from a source file with diagnostics.
     pub fn extract_symbols(&self, path: &str) -> Result<AstgenResponse> {
+        debug!(path = path, "extract_symbols called");
         let canonical = self.validate_path(path)?;
         let utf8_path = Utf8Path::new(canonical.to_str().unwrap_or(path));
 
@@ -200,11 +223,19 @@ impl AppService {
         response.hash = Some(CacheStore::hash(&source));
         response.symbols = Some(syms);
         collect_diagnostics(root, &mut response);
+        debug!(
+            path = path,
+            language = ?lang_id,
+            symbols = response.symbols.as_ref().map(|s| s.len()).unwrap_or(0),
+            diagnostics = response.diagnostics.len(),
+            "extract_symbols completed"
+        );
         Ok(response)
     }
 
     /// Extract call graph from a source file.
     pub fn extract_calls(&self, path: &str, function: Option<&str>) -> Result<CallGraph> {
+        debug!(path = path, function = ?function, "extract_calls called");
         let canonical = self.validate_path(path)?;
         let utf8_path = Utf8Path::new(canonical.to_str().unwrap_or(path));
 
@@ -214,33 +245,94 @@ impl AppService {
 
         let edges = calls::extract_calls(root, &source, lang_id, function)?;
 
-        Ok(CallGraph {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+        let graph = CallGraph {
             language: format!("{lang_id:?}").to_lowercase(),
             calls: edges,
-        })
+        };
+        debug!(
+            path = path,
+            function = ?function,
+            call_edges = graph.calls.len(),
+            "extract_calls completed"
+        );
+        Ok(graph)
     }
 
     /// Search for symbol references across files.
     pub fn find_references(&self, name: &str, dir: &str, glob: Option<&str>) -> Result<RefsResult> {
+        debug!(name = name, dir = dir, glob = ?glob, "find_references called");
         let canonical_dir = self.validate_dir(dir)?;
 
         let references = refs::find_references(name, &canonical_dir, glob)?;
 
-        Ok(RefsResult {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+        // Convert absolute paths to relative (relative to dir)
+        let references = relativize_paths(references, &canonical_dir);
+
+        let result = RefsResult {
             symbol: name.to_string(),
             references,
-        })
+        };
+        debug!(
+            name = name,
+            dir = dir,
+            references = result.references.len(),
+            "find_references completed"
+        );
+        Ok(result)
     }
 
     /// Analyze the impact of a unified diff on the codebase.
     pub fn analyze_context(&self, diff: &str, dir: &str) -> Result<ContextResult> {
+        debug!(dir = dir, diff_bytes = diff.len(), "analyze_context called");
         let canonical_dir = self.validate_dir(dir)?;
         self.validate_input_size(diff)?;
 
-        impact::analyze_impact(diff, &canonical_dir)
+        let mut result = impact::analyze_impact(diff, &canonical_dir)?;
+
+        // Convert absolute paths in impacted_callers to relative
+        for change in &mut result.changes {
+            for caller in &mut change.impacted_callers {
+                if let Ok(rel) = std::path::Path::new(&caller.path).strip_prefix(&canonical_dir) {
+                    caller.path = rel.to_string_lossy().to_string();
+                }
+            }
+        }
+
+        debug!(
+            dir = dir,
+            changes = result.changes.len(),
+            total_affected = result
+                .changes
+                .iter()
+                .map(|c| c.affected_symbols.len())
+                .sum::<usize>(),
+            total_callers = result
+                .changes
+                .iter()
+                .map(|c| c.impacted_callers.len())
+                .sum::<usize>(),
+            "analyze_context completed"
+        );
+        Ok(result)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Path helpers
+// ---------------------------------------------------------------------------
+
+/// Convert absolute paths to relative (relative to `dir`).
+/// Paths outside `dir` are left as-is.
+fn relativize_paths(
+    mut refs: Vec<crate::models::reference::SymbolReference>,
+    dir: &std::path::Path,
+) -> Vec<crate::models::reference::SymbolReference> {
+    for r in &mut refs {
+        if let Ok(rel) = std::path::Path::new(&r.path).strip_prefix(dir) {
+            r.path = rel.to_string_lossy().to_string();
+        }
+    }
+    refs
 }
 
 // ---------------------------------------------------------------------------

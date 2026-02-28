@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 /// The response envelope for all commands.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AstgenResponse {
-    pub version: String,
     pub location: LocationKey,
     pub language: LangId,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -35,7 +34,6 @@ pub struct ErrorInfo {
 impl AstgenResponse {
     pub fn success(location: LocationKey, language: LangId) -> Self {
         Self {
-            version: env!("CARGO_PKG_VERSION").to_string(),
             location,
             language,
             hash: None,
@@ -49,7 +47,6 @@ impl AstgenResponse {
 
     pub fn error(location: LocationKey, language: LangId, code: ErrorCode, msg: &str) -> Self {
         Self {
-            version: env!("CARGO_PKG_VERSION").to_string(),
             location,
             language,
             hash: None,

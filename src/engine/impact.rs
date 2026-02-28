@@ -156,10 +156,7 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
         });
     }
 
-    Ok(ContextResult {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        changes,
-    })
+    Ok(ContextResult { changes })
 }
 
 /// Match hunks against symbol ranges to find affected symbols.
