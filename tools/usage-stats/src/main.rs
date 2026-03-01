@@ -346,7 +346,7 @@ fn process_claude_file(path: &Path, project: &str) -> Stats {
     stats
 }
 
-fn process_codex_file(path: &Path) -> Stats {
+fn process_codex_file(path: &Path, exclude_project: Option<&str>) -> Stats {
     let mut stats = Stats::default();
     let source = "codex".to_string();
 
@@ -387,6 +387,11 @@ fn process_codex_file(path: &Path) -> Stats {
                 .and_then(|c| c.as_str())
         {
             project = cwd.rsplit('/').next().unwrap_or("unknown").to_string();
+            if let Some(excluded) = exclude_project
+                && project == excluded
+            {
+                return Stats::default();
+            }
         }
 
         if msg_type != "response_item" {
@@ -581,7 +586,10 @@ fn is_modified_since(path: &Path, since: NaiveDate) -> bool {
         .unwrap_or(false)
 }
 
-fn find_claude_files(cutoff: Option<NaiveDate>) -> Vec<(PathBuf, String)> {
+fn find_claude_files(
+    cutoff: Option<NaiveDate>,
+    exclude_project: Option<&str>,
+) -> Vec<(PathBuf, String)> {
     let home = dirs::home_dir().expect("cannot find home dir");
     let base = home.join(".claude/projects");
     let pattern = format!("{}/*/*.jsonl", base.display());
@@ -599,6 +607,11 @@ fn find_claude_files(cutoff: Option<NaiveDate>) -> Vec<(PathBuf, String)> {
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown")
                 .to_string();
+            if let Some(excluded) = exclude_project
+                && shorten_project_name(&project) == excluded
+            {
+                continue;
+            }
             files.push((path, project));
         }
     }
@@ -840,18 +853,27 @@ fn print_summary(stats: &Stats, label: &str) {
     }
 }
 
+/// Project name to exclude by default (the tool's own project).
+const SELF_PROJECT: &str = "astro-sight";
+
 struct CliArgs {
     days: Option<u32>,
     json: bool,
+    include_self: bool,
 }
 
 fn parse_args() -> CliArgs {
     let args: Vec<String> = std::env::args().collect();
 
     let json = args.iter().any(|a| a == "--json" || a == "-j");
+    let include_self = args.iter().any(|a| a == "--include-self");
 
     if args.iter().any(|a| a == "--all" || a == "-a") {
-        return CliArgs { days: None, json };
+        return CliArgs {
+            days: None,
+            json,
+            include_self,
+        };
     }
 
     // --days N or -d N
@@ -863,6 +885,7 @@ fn parse_args() -> CliArgs {
             return CliArgs {
                 days: Some(n),
                 json,
+                include_self,
             };
         }
         if let Some(val) = arg.strip_prefix("--days=")
@@ -871,6 +894,7 @@ fn parse_args() -> CliArgs {
             return CliArgs {
                 days: Some(n),
                 json,
+                include_self,
             };
         }
     }
@@ -878,6 +902,7 @@ fn parse_args() -> CliArgs {
     CliArgs {
         days: Some(1),
         json,
+        include_self,
     }
 }
 
@@ -1086,13 +1111,19 @@ fn main() {
     let cli = parse_args();
     let cutoff = cutoff_date(cli.days);
 
+    let exclude = if cli.include_self {
+        None
+    } else {
+        Some(SELF_PROJECT)
+    };
+
     let label = match cli.days {
         None => "[all time]".to_string(),
         Some(1) => format!("[{}]", Local::now().format("%Y-%m-%d")),
         Some(n) => format!("[last {n} days]"),
     };
 
-    let claude_files = find_claude_files(cutoff);
+    let claude_files = find_claude_files(cutoff, exclude);
     let codex_files = find_codex_files(cutoff);
 
     let hint = match cli.days {
@@ -1100,11 +1131,17 @@ fn main() {
         Some(1) => "(today only, use --days N or --all)".to_string(),
         Some(n) => format!("(last {n} days, use --all for all time)"),
     };
+    let exclude_hint = if exclude.is_some() {
+        format!(", excluding '{SELF_PROJECT}' project")
+    } else {
+        String::new()
+    };
     eprintln!(
-        "Scanning {} Claude Code files, {} Codex files... {}",
+        "Scanning {} Claude Code files, {} Codex files... {}{}",
         claude_files.len(),
         codex_files.len(),
         hint,
+        exclude_hint,
     );
 
     let merged = Mutex::new(Stats::default());
@@ -1115,7 +1152,7 @@ fn main() {
     });
 
     codex_files.par_iter().for_each(|path| {
-        let stats = process_codex_file(path);
+        let stats = process_codex_file(path, exclude);
         merged.lock().unwrap().merge(stats);
     });
 
