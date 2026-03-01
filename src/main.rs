@@ -167,8 +167,9 @@ fn run(cli: Cli) -> Result<()> {
     );
 
     let service = AppService::new();
+    let start = std::time::Instant::now();
 
-    match cli.command {
+    let result = match cli.command {
         Commands::Ast {
             path,
             paths,
@@ -323,7 +324,12 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Session => cmd_session(),
         Commands::Mcp => cmd_mcp(),
         Commands::Init { .. } | Commands::SkillInstall { .. } => unreachable!("handled above"),
-    }
+    };
+
+    let elapsed = start.elapsed();
+    info!(elapsed_ms = elapsed.as_millis() as u64, "command finished");
+
+    result
 }
 
 // ---------------------------------------------------------------------------
