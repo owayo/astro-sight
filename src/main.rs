@@ -219,7 +219,7 @@ fn run(cli: Cli) -> Result<()> {
                     resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
                 match input {
                     PathInput::Single(p) => cmd_symbols(&service, &p, no_cache, pretty, doc, full),
-                    PathInput::Batch(ps) => batch_symbols(&service, &ps, doc, full),
+                    PathInput::Batch(ps) => batch_symbols(&service, &ps, doc, full, None),
                 }
             }
         }
@@ -430,7 +430,7 @@ fn cmd_symbols_dir(
         .iter()
         .filter_map(|p| p.to_str().map(|s| s.to_string()))
         .collect();
-    batch_symbols(service, &file_paths, doc, full)
+    batch_symbols(service, &file_paths, doc, full, Some(&canonical_dir))
 }
 
 fn cmd_symbols(
@@ -749,9 +749,21 @@ fn batch_ast(
     })
 }
 
-fn batch_symbols(service: &AppService, paths: &[String], doc: bool, full: bool) -> Result<()> {
+fn batch_symbols(
+    service: &AppService,
+    paths: &[String],
+    doc: bool,
+    full: bool,
+    dir: Option<&std::path::Path>,
+) -> Result<()> {
     batch_ndjson(paths, |p| match service.extract_symbols(p) {
-        Ok(response) => {
+        Ok(mut response) => {
+            // Convert absolute path to relative when dir is specified
+            if let Some(base) = dir
+                && let Ok(rel) = std::path::Path::new(&response.location.path).strip_prefix(base)
+            {
+                response.location.path = rel.to_string_lossy().to_string();
+            }
             if full {
                 serde_json::to_string(&response).unwrap_or_else(|e| make_error_line(&e.into()))
             } else {
