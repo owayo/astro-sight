@@ -731,9 +731,11 @@ fn shorten_project_name(name: &str) -> String {
 }
 
 fn print_summary(stats: &Stats, label: &str) {
-    println!("\n╔══════════════════════════════════════════════╗");
-    println!("║  astro-sight Usage Statistics  {:<15}║", label);
-    println!("╚══════════════════════════════════════════════╝\n");
+    let title = format!("  astro-sight Usage Statistics  {}", label);
+    let width = title.len();
+    println!("\n╔{}╗", "═".repeat(width));
+    println!("║{}║", title);
+    println!("╚{}╝\n", "═".repeat(width));
 
     // Overview
     let mut table = Table::new();
