@@ -26,12 +26,12 @@ pub fn generate_sequence_diagram(edges: &[CallEdge], language: &str) -> Sequence
     lines.push("sequenceDiagram".to_string());
     for p in &participants {
         let safe = sanitize_mermaid(p);
-        lines.push(format!("    participant {safe}"));
+        lines.push(format!("participant {safe}"));
     }
     for edge in &sorted {
         let caller = sanitize_mermaid(&edge.caller.name);
         let callee = sanitize_mermaid(&edge.callee.name);
-        lines.push(format!("    {caller}->>{callee}: {callee}()"));
+        lines.push(format!("{caller}->>{callee}: {callee}()"));
     }
 
     let diagram = lines.join("\n");
