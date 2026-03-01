@@ -163,7 +163,7 @@ fn run(cli: Cli) -> Result<()> {
     info!(
         command = ?cli.command,
         cwd = %cwd.display(),
-        "command invoked"
+        "🚀 command invoked"
     );
 
     let service = AppService::new();
@@ -329,7 +329,10 @@ fn run(cli: Cli) -> Result<()> {
     };
 
     let elapsed = start.elapsed();
-    info!(elapsed_ms = elapsed.as_millis() as u64, "command finished");
+    info!(
+        elapsed_ms = elapsed.as_millis() as u64,
+        "⏱️ command finished"
+    );
 
     result
 }
@@ -381,7 +384,7 @@ fn cmd_ast(service: &AppService, opts: &CmdAstOpts<'_>) -> Result<()> {
             path = opts.path,
             output_bytes = cached.len(),
             cached = true,
-            "command completed"
+            "💾 cache hit"
         );
         std::io::Write::write_all(&mut std::io::stdout(), &cached)?;
         return Ok(());
@@ -405,7 +408,6 @@ fn cmd_ast(service: &AppService, opts: &CmdAstOpts<'_>) -> Result<()> {
         command = "ast",
         path = opts.path,
         output_bytes = output.len(),
-        cached = false,
         "command completed"
     );
 
@@ -463,7 +465,7 @@ fn cmd_symbols(
             path = path,
             output_bytes = cached.len(),
             cached = true,
-            "command completed"
+            "💾 cache hit"
         );
         std::io::Write::write_all(&mut std::io::stdout(), &cached)?;
         return Ok(());
@@ -483,7 +485,6 @@ fn cmd_symbols(
         command = "symbols",
         path = path,
         output_bytes = output.len(),
-        cached = false,
         "command completed"
     );
 

@@ -88,7 +88,7 @@ impl AppService {
     /// Validate and canonicalize a file path. Returns the canonical path.
     fn validate_path(&self, path: &str) -> Result<PathBuf> {
         let canonical = std::fs::canonicalize(path).map_err(|_| {
-            warn!(path = path, "validate_path: file not found");
+            warn!(path = path, "⚠️ validate_path: file not found");
             AstroError::new(ErrorCode::FileNotFound, format!("File not found: {path}"))
         })?;
         if let Some(root) = &self.workspace_root
@@ -96,7 +96,7 @@ impl AppService {
         {
             warn!(
                 path = path,
-                "validate_path: path outside workspace boundary"
+                "🚫 validate_path: path outside workspace boundary"
             );
             bail!(AstroError::new(
                 ErrorCode::PathOutOfBounds,
