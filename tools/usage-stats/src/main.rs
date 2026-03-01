@@ -31,6 +31,7 @@ struct Stats {
     project_tool_counts: HashMap<String, HashMap<String, HashMap<String, u64>>>,
     astro_subcmds: HashMap<String, HashMap<String, u64>>,
     astro_daily: HashMap<String, u64>,
+    bash_cmd_counts: HashMap<String, HashMap<String, u64>>,
     session_counts: HashMap<String, u64>,
     file_counts: HashMap<String, u64>,
     total_tool_calls: HashMap<String, u64>,
@@ -68,6 +69,12 @@ impl Stats {
         }
         for (src, count) in other.file_counts {
             *self.file_counts.entry(src).or_default() += count;
+        }
+        for (src, cmds) in other.bash_cmd_counts {
+            let entry = self.bash_cmd_counts.entry(src).or_default();
+            for (cmd, count) in cmds {
+                *entry.entry(cmd).or_default() += count;
+            }
         }
         for (src, count) in other.total_tool_calls {
             *self.total_tool_calls.entry(src).or_default() += count;
@@ -137,6 +144,48 @@ fn skip_flags(s: &str) -> &str {
 
 fn is_astro_sight_cmd(cmd: &str) -> bool {
     cmd.contains("astro-sight") && !cmd.contains("cargo")
+}
+
+fn extract_bash_category(cmd: &str) -> String {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return "(empty)".to_string();
+    }
+
+    // Skip env var prefixes (e.g., RUST_LOG=debug cargo build)
+    let mut s = trimmed;
+    loop {
+        let token = match s.split_whitespace().next() {
+            Some(t) => t,
+            None => return "(empty)".to_string(),
+        };
+        if token.contains('=') && !token.starts_with('=') {
+            s = s[s.find(token).unwrap() + token.len()..].trim_start();
+        } else {
+            break;
+        }
+    }
+
+    // Take first command (before && || ; |)
+    let first_cmd = s
+        .split("&&")
+        .next()
+        .unwrap_or(s)
+        .split("||")
+        .next()
+        .unwrap_or(s)
+        .split(';')
+        .next()
+        .unwrap_or(s)
+        .trim();
+
+    // Extract the command name (strip path prefix)
+    let cmd_name = match first_cmd.split_whitespace().next() {
+        Some(name) => name.rsplit('/').next().unwrap_or(name),
+        None => return "(empty)".to_string(),
+    };
+
+    cmd_name.to_string()
 }
 
 fn extract_user_text(val: &simd_json::BorrowedValue) -> String {
@@ -294,6 +343,19 @@ fn process_claude_file(path: &Path, project: &str) -> Stats {
                     .and_then(|i| i.get("command"))
                     .and_then(|c| c.as_str())
                     .unwrap_or("");
+
+                let category = if is_astro_sight_cmd(cmd) {
+                    "astro-sight".to_string()
+                } else {
+                    extract_bash_category(cmd)
+                };
+                *stats
+                    .bash_cmd_counts
+                    .entry(source.clone())
+                    .or_default()
+                    .entry(category)
+                    .or_default() += 1;
+
                 if is_astro_sight_cmd(cmd) {
                     let subcmd = extract_astro_subcmd(cmd).unwrap_or("unknown");
                     pending_tools.push(ToolDetail {
@@ -485,11 +547,24 @@ fn process_codex_file(path: &Path, exclude_project: Option<&str>) -> Stats {
             .and_then(|a| a.as_str())
             .unwrap_or("");
 
-        // Track grep/rg in codex exec_command
+        // Track grep/rg and bash category in codex exec_command
         if func_name == "exec_command" {
             let mut args_buf = args.as_bytes().to_vec();
             if let Ok(args_val) = simd_json::to_borrowed_value(&mut args_buf) {
                 let cmd = args_val.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
+
+                let category = if is_astro_sight_cmd(cmd) {
+                    "astro-sight".to_string()
+                } else {
+                    extract_bash_category(cmd)
+                };
+                *stats
+                    .bash_cmd_counts
+                    .entry(source.clone())
+                    .or_default()
+                    .entry(category)
+                    .or_default() += 1;
+
                 if cmd.starts_with("grep ")
                     || cmd.starts_with("rg ")
                     || cmd.contains("| grep")
@@ -718,6 +793,50 @@ fn print_summary(stats: &Stats, label: &str) {
                 ]);
             }
             println!("## Tool Distribution [{src}] (top 20)\n{table}\n");
+
+            // Bash breakdown
+            if let Some(bash_cmds) = stats.bash_cmd_counts.get(*src) {
+                let mut sorted_cmds: Vec<_> = bash_cmds.iter().collect();
+                sorted_cmds.sort_by(|a, b| b.1.cmp(a.1));
+
+                let bash_total: u64 = sorted_cmds.iter().map(|(_, c)| **c).sum();
+                let top_n = 15;
+                let shown: Vec<_> = sorted_cmds.iter().take(top_n).copied().collect::<Vec<_>>();
+                let shown_sum: u64 = shown.iter().map(|(_, c)| **c).sum();
+                let other_count = bash_total - shown_sum;
+
+                let mut bash_table = Table::new();
+                bash_table.load_preset(UTF8_FULL_CONDENSED);
+                bash_table.set_header(vec![
+                    Cell::new("Command").add_attribute(Attribute::Bold),
+                    Cell::new("Count").add_attribute(Attribute::Bold),
+                    Cell::new("%").add_attribute(Attribute::Bold),
+                ]);
+
+                for (name, count) in &shown {
+                    let pct = if bash_total > 0 {
+                        (**count as f64 / bash_total as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    bash_table.add_row(vec![
+                        Cell::new(name),
+                        Cell::new(count).set_alignment(CellAlignment::Right),
+                        Cell::new(format!("{pct:.1}")).set_alignment(CellAlignment::Right),
+                    ]);
+                }
+
+                if other_count > 0 {
+                    let pct = (other_count as f64 / bash_total as f64) * 100.0;
+                    bash_table.add_row(vec![
+                        Cell::new("(other)"),
+                        Cell::new(other_count).set_alignment(CellAlignment::Right),
+                        Cell::new(format!("{pct:.1}")).set_alignment(CellAlignment::Right),
+                    ]);
+                }
+
+                println!("## Bash Breakdown [{src}] (top {top_n})\n{bash_table}\n");
+            }
         }
     }
 
@@ -926,6 +1045,7 @@ fn print_json(stats: &Stats, label: &str) {
         astro_sight_calls: u64,
         adoption_rate_pct: f64,
         tool_distribution: Vec<ToolEntry>,
+        bash_breakdown: Vec<ToolEntry>,
         top_projects: Vec<ProjectEntry>,
     }
 
@@ -1033,6 +1153,25 @@ fn print_json(stats: &Stats, label: &str) {
             }
         }
 
+        let mut bash_breakdown = Vec::new();
+        if let Some(bash_cmds) = stats.bash_cmd_counts.get(*src) {
+            let bash_total = bash_cmds.values().sum::<u64>() as f64;
+            let mut sorted: Vec<_> = bash_cmds.iter().collect();
+            sorted.sort_by(|a, b| b.1.cmp(a.1));
+            for (name, count) in sorted {
+                let pct = if bash_total > 0.0 {
+                    (*count as f64 / bash_total) * 100.0
+                } else {
+                    0.0
+                };
+                bash_breakdown.push(ToolEntry {
+                    tool: name.clone(),
+                    count: *count,
+                    pct: (pct * 10.0).round() / 10.0,
+                });
+            }
+        }
+
         sources.push(SourceSummary {
             name: src.to_string(),
             files_scanned: files,
@@ -1041,6 +1180,7 @@ fn print_json(stats: &Stats, label: &str) {
             astro_sight_calls: astro,
             adoption_rate_pct: (adoption * 1000.0).round() / 1000.0,
             tool_distribution: tool_dist,
+            bash_breakdown,
             top_projects,
         });
     }
