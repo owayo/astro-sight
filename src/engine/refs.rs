@@ -111,6 +111,8 @@ fn collect_identifier_refs(
         || kind == "field_identifier"
         || kind == "property_identifier"
         || kind == "simple_identifier"
+        || kind == "namespace_identifier"
+        || kind == "package_identifier"
         || kind == "name"
         || kind == "word";
 
@@ -166,25 +168,28 @@ fn definition_node_kinds(lang_id: LangId) -> Vec<&'static str> {
             "struct_item",
             "enum_item",
             "trait_item",
+            "impl_item",
             "const_item",
             "static_item",
             "type_item",
             "mod_item",
         ],
-        LangId::C | LangId::Cpp => vec![
+        LangId::C => vec!["function_definition", "struct_specifier", "enum_specifier"],
+        LangId::Cpp => vec![
             "function_definition",
             "struct_specifier",
-            "enum_specifier",
             "class_specifier",
+            "enum_specifier",
+            "namespace_definition",
         ],
         LangId::Python => vec!["function_definition", "class_definition"],
-        LangId::Javascript | LangId::Tsx => vec![
+        LangId::Javascript => vec![
             "function_declaration",
             "class_declaration",
             "method_definition",
             "variable_declarator",
         ],
-        LangId::Typescript => vec![
+        LangId::Typescript | LangId::Tsx => vec![
             "function_declaration",
             "class_declaration",
             "method_definition",
@@ -193,12 +198,18 @@ fn definition_node_kinds(lang_id: LangId) -> Vec<&'static str> {
             "enum_declaration",
             "variable_declarator",
         ],
-        LangId::Go => vec!["function_declaration", "method_declaration", "type_spec"],
+        LangId::Go => vec![
+            "package_clause",
+            "function_declaration",
+            "method_declaration",
+            "type_spec",
+        ],
         LangId::Php => vec![
             "function_definition",
             "class_declaration",
             "method_declaration",
             "interface_declaration",
+            "enum_declaration",
             "trait_declaration",
         ],
         LangId::Java => vec![
@@ -215,11 +226,10 @@ fn definition_node_kinds(lang_id: LangId) -> Vec<&'static str> {
         LangId::Swift => vec![
             "function_declaration",
             "class_declaration",
-            "struct_declaration",
             "protocol_declaration",
-            "enum_declaration",
         ],
         LangId::CSharp => vec![
+            "namespace_declaration",
             "method_declaration",
             "class_declaration",
             "struct_declaration",
@@ -342,6 +352,8 @@ fn collect_identifier_refs_batch(
         || kind == "field_identifier"
         || kind == "property_identifier"
         || kind == "simple_identifier"
+        || kind == "namespace_identifier"
+        || kind == "package_identifier"
         || kind == "name"
         || kind == "word";
 

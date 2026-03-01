@@ -110,7 +110,7 @@ fn import_query(lang_id: LangId) -> (&'static str, ImportKind) {
             "#,
             ImportKind::Import,
         ),
-        LangId::Javascript | LangId::Tsx => (
+        LangId::Javascript => (
             r#"
             (import_statement source: (string) @import.source)
             (call_expression
@@ -120,7 +120,7 @@ fn import_query(lang_id: LangId) -> (&'static str, ImportKind) {
             "#,
             ImportKind::Import,
         ),
-        LangId::Typescript => (
+        LangId::Typescript | LangId::Tsx => (
             r#"
             (import_statement source: (string) @import.source)
             (call_expression
@@ -142,12 +142,13 @@ fn import_query(lang_id: LangId) -> (&'static str, ImportKind) {
             r#"(preproc_include path: (_) @import.source)"#,
             ImportKind::Include,
         ),
-        LangId::CSharp => (
-            r#"(using_directive (qualified_name) @import.source)"#,
-            ImportKind::Use,
-        ),
+        LangId::CSharp => (r#"(using_directive (_) @import.source)"#, ImportKind::Use),
         LangId::Php => (
-            r#"(namespace_use_declaration (namespace_use_clause (qualified_name) @import.source))"#,
+            r#"
+            (namespace_use_declaration
+              (namespace_use_clause
+                [(qualified_name) (name)] @import.source))
+            "#,
             ImportKind::Use,
         ),
         LangId::Kotlin => (

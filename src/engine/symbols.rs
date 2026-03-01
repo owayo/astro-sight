@@ -150,7 +150,7 @@ fn symbol_query(lang_id: LangId) -> &'static str {
             (struct_item name: (type_identifier) @struct.name)
             (enum_item name: (type_identifier) @enum.name)
             (trait_item name: (type_identifier) @trait.name)
-            (impl_item trait: (type_identifier) @interface.name)
+            (impl_item type: (type_identifier) @type.name)
             (const_item name: (identifier) @constant.name)
             (static_item name: (identifier) @constant.name)
             (type_item name: (type_identifier) @type.name)
@@ -170,6 +170,7 @@ fn symbol_query(lang_id: LangId) -> &'static str {
             (class_specifier name: (type_identifier) @class.name)
             (struct_specifier name: (type_identifier) @struct.name)
             (enum_specifier name: (type_identifier) @enum.name)
+            (namespace_definition name: (namespace_identifier) @module.name)
             "#
         }
         LangId::Python => {
@@ -178,7 +179,7 @@ fn symbol_query(lang_id: LangId) -> &'static str {
             (class_definition name: (identifier) @class.name)
             "#
         }
-        LangId::Javascript | LangId::Tsx => {
+        LangId::Javascript => {
             r#"
             (function_declaration name: (identifier) @function.name)
             (class_declaration name: (identifier) @class.name)
@@ -186,7 +187,7 @@ fn symbol_query(lang_id: LangId) -> &'static str {
             (lexical_declaration (variable_declarator name: (identifier) @variable.name))
             "#
         }
-        LangId::Typescript => {
+        LangId::Typescript | LangId::Tsx => {
             r#"
             (function_declaration name: (identifier) @function.name)
             (class_declaration name: (type_identifier) @class.name)
@@ -199,6 +200,7 @@ fn symbol_query(lang_id: LangId) -> &'static str {
         }
         LangId::Go => {
             r#"
+            (package_clause (package_identifier) @module.name)
             (function_declaration name: (identifier) @function.name)
             (method_declaration name: (field_identifier) @method.name)
             (type_declaration (type_spec name: (type_identifier) @type.name))
@@ -210,6 +212,7 @@ fn symbol_query(lang_id: LangId) -> &'static str {
             (class_declaration name: (name) @class.name)
             (method_declaration name: (name) @method.name)
             (interface_declaration name: (name) @interface.name)
+            (enum_declaration name: (name) @enum.name)
             (trait_declaration name: (name) @trait.name)
             "#
         }
@@ -229,16 +232,16 @@ fn symbol_query(lang_id: LangId) -> &'static str {
             "#
         }
         LangId::Swift => {
+            // tree-sitter-swift uses class_declaration for struct/class/enum
             r#"
             (function_declaration name: (simple_identifier) @function.name)
             (class_declaration name: (type_identifier) @class.name)
-            (struct_declaration name: (type_identifier) @struct.name)
             (protocol_declaration name: (type_identifier) @interface.name)
-            (enum_declaration name: (type_identifier) @enum.name)
             "#
         }
         LangId::CSharp => {
             r#"
+            (namespace_declaration name: (_) @module.name)
             (method_declaration name: (identifier) @function.name)
             (class_declaration name: (identifier) @class.name)
             (struct_declaration name: (identifier) @struct.name)

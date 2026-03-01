@@ -97,12 +97,12 @@ fn function_node_kinds(lang_id: LangId) -> &'static [&'static str] {
         LangId::Rust => &["function_item"],
         LangId::C | LangId::Cpp => &["function_definition"],
         LangId::Python => &["function_definition"],
-        LangId::Javascript | LangId::Tsx => &[
+        LangId::Javascript => &[
             "function_declaration",
             "method_definition",
             "arrow_function",
         ],
-        LangId::Typescript => &[
+        LangId::Typescript | LangId::Tsx => &[
             "function_declaration",
             "method_definition",
             "arrow_function",
@@ -182,13 +182,13 @@ fn call_query(lang_id: LangId) -> &'static str {
             (call function: (attribute attribute: (identifier) @method.callee))
             "#
         }
-        LangId::Javascript | LangId::Tsx => {
+        LangId::Javascript => {
             r#"
             (call_expression function: (identifier) @direct.callee)
             (call_expression function: (member_expression property: (property_identifier) @method.callee))
             "#
         }
-        LangId::Typescript => {
+        LangId::Typescript | LangId::Tsx => {
             r#"
             (call_expression function: (identifier) @direct.callee)
             (call_expression function: (member_expression property: (property_identifier) @method.callee))
@@ -222,6 +222,9 @@ fn call_query(lang_id: LangId) -> &'static str {
         LangId::Swift => {
             r#"
             (call_expression (simple_identifier) @direct.callee)
+            (call_expression
+              (navigation_expression
+                (navigation_suffix suffix: (simple_identifier) @method.callee)))
             "#
         }
         LangId::CSharp => {
