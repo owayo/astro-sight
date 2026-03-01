@@ -34,6 +34,20 @@ fn default_log_path() -> PathBuf {
         .join("logs")
 }
 
+/// Expand leading `~` or `~/` to the user's home directory.
+fn expand_tilde(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s == "~" {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// Configuration service.
 pub struct ConfigService;
 
@@ -76,6 +90,9 @@ impl ConfigService {
         {
             config.log_path = dir.join("logs");
         }
+
+        // Expand ~ in log_path
+        config.log_path = expand_tilde(&config.log_path);
 
         Ok(config)
     }
@@ -213,5 +230,40 @@ mod tests {
         let config = ConfigService::load(Some(&config_path)).unwrap();
         assert!(config.debug);
         assert_eq!(config.log_path, PathBuf::from("/tmp/astro-logs"));
+    }
+
+    #[test]
+    fn test_expand_tilde_home() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_tilde(Path::new("~")), home);
+        assert_eq!(expand_tilde(Path::new("~/tmp")), home.join("tmp"));
+        assert_eq!(
+            expand_tilde(Path::new("~/a/b/c")),
+            home.join("a").join("b").join("c"),
+        );
+    }
+
+    #[test]
+    fn test_expand_tilde_no_op() {
+        assert_eq!(
+            expand_tilde(Path::new("/tmp/logs")),
+            PathBuf::from("/tmp/logs"),
+        );
+        assert_eq!(
+            expand_tilde(Path::new("relative/path")),
+            PathBuf::from("relative/path"),
+        );
+    }
+
+    #[test]
+    fn test_load_tilde_log_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        fs::write(&config_path, "debug = true\nlog_path = \"~/tmp\"\n").unwrap();
+
+        let config = ConfigService::load(Some(&config_path)).unwrap();
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(config.log_path, home.join("tmp"));
     }
 }

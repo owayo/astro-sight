@@ -73,6 +73,17 @@ pub struct RefsSearchParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct RefsBatchSearchParams {
+    /// Symbol names to search for
+    pub names: Vec<String>,
+    /// Directory to search in
+    pub dir: String,
+    /// Glob pattern to filter files (e.g. "**/*.rs")
+    #[serde(default)]
+    pub glob: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ContextAnalyzeParams {
     /// Unified diff text
     pub diff: String,
@@ -229,6 +240,22 @@ impl AstroSightServer {
             self.service
                 .find_references(&p.name, &p.dir, p.glob.as_deref()),
         )
+    }
+
+    #[tool(
+        name = "refs_batch_search",
+        description = "Search for references to multiple symbols across files in a single pass (batch mode)"
+    )]
+    async fn refs_batch_search(
+        &self,
+        params: Parameters<RefsBatchSearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = params.0;
+        Self::to_tool_result(self.service.find_references_batch(
+            &p.names,
+            &p.dir,
+            p.glob.as_deref(),
+        ))
     }
 
     #[tool(

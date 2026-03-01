@@ -1,6 +1,12 @@
-# astro-sight
+<p align="center">
+  <img src="docs/images/app.png" width="128" alt="astro-sight">
+</p>
 
-AI エージェント向け AST 情報生成 CLI。tree-sitter ベースの高速構文解析で、指定位置の AST 断片・シンボル定義・スニペットを JSON で返す。
+<h1 align="center">astro-sight</h1>
+
+<p align="center">
+  AI エージェント向け AST 情報生成 CLI。tree-sitter ベースの高速構文解析で、指定位置の AST 断片・シンボル定義・スニペットを JSON で返す。
+</p>
 
 ## Install
 
@@ -41,6 +47,12 @@ astro-sight ast --path src/main.rs --line 10 --col 0 --depth 5 --context 5
 ```bash
 # ファイル内の関数・構造体・クラス等を一覧
 astro-sight symbols --path src/main.rs
+
+# ディレクトリ内の全ソースファイルのシンボルを NDJSON で出力
+astro-sight symbols --dir src/
+
+# glob でフィルタ
+astro-sight symbols --dir src/ --glob "**/*.rs"
 ```
 
 ### calls - コールグラフ抽出
@@ -76,6 +88,9 @@ astro-sight refs --name "extract_symbols" --dir src/
 
 # glob パターンでファイルを絞り込み
 astro-sight refs --name "AstgenResponse" --dir src/ --glob "**/*.rs"
+
+# 複数シンボルを一括検索（NDJSON 出力、1シンボル1行）
+astro-sight refs --names "AppService,AstgenResponse" --dir src/
 ```
 
 出力例:
@@ -95,7 +110,16 @@ astro-sight refs --name "AstgenResponse" --dir src/ --glob "**/*.rs"
 unified diff を受け取り、変更の影響範囲を分析する。AI コードレビュー支援機能。
 
 ```bash
-# git diff から影響分析（stdin）
+# git diff を自動取得して影響分析（推奨）
+astro-sight context --dir . --git
+
+# ステージ済み変更を分析
+astro-sight context --dir . --git --staged
+
+# カスタムベースを指定
+astro-sight context --dir . --git --base HEAD~3
+
+# stdin からパイプ
 git diff HEAD~1 | astro-sight context --dir .
 
 # インライン diff 文字列
@@ -140,7 +164,7 @@ astro-sight doctor
 echo '{"command":"symbols","path":"src/main.rs"}' | astro-sight session
 ```
 
-stdin から NDJSON リクエストを受け取り、stdout に NDJSON レスポンスを返す。複数リクエストの連続処理に対応。全コマンド（ast, symbols, doctor, calls, refs, context）をサポート。
+stdin から NDJSON リクエストを受け取り、stdout に NDJSON レスポンスを返す。複数リクエストの連続処理に対応。全コマンド（ast, symbols, doctor, calls, refs, context）をサポート。1行あたり 100MB（改行を除く生入力サイズ）を上限としている。
 
 ```bash
 # calls コマンド
@@ -172,7 +196,7 @@ astro-sight calls --paths src/lib.rs,src/main.rs
 
 個別ファイルのエラーは行内 JSON エラーとして出力される（プロセスは成功終了）:
 ```jsonl
-{"version":"0.1.0","location":{"path":"src/lib.rs"},"language":"rust","symbols":[...]}
+{"location":{"path":"src/lib.rs"},"language":"rust","symbols":[...]}
 {"error":{"code":"FILE_NOT_FOUND","message":"File not found: nonexistent.rs"}}
 ```
 
@@ -188,7 +212,8 @@ astro-sight mcp
 - `ast_extract` - AST 断片抽出
 - `symbols_extract` - シンボル抽出
 - `calls_extract` - コールグラフ抽出
-- `refs_search` - クロスファイル参照検索
+- `refs_search` - クロスファイル参照検索（単一シンボル）
+- `refs_batch_search` - 複数シンボル一括参照検索
 - `context_analyze` - diff 影響分析
 - `doctor` - 対応言語チェック
 
@@ -310,13 +335,53 @@ $ astro-sight ast --path nonexistent.rs
 プロジェクトの `CLAUDE.md` またはグローバルの `~/.claude/CLAUDE.md` に以下を追記すると、構造分析時に astro-sight を優先的に使用するようになります:
 
 ```markdown
-# コード構造分析について
-以下のような構造的なコード分析が必要な場合は、Grep/Read ではなく astro-sight スキルを使用すること:
-- コールグラフ / 呼び出し元・呼び出し先の調査
-- クロスファイルのシンボル参照検索（definition/reference の区別付き）
-- git diff の影響分析（影響を受けるシンボル、シグネチャ変更、影響を受ける呼び出し元）
-- リファクタリング前の安全性確認（関数のシグネチャ変更が他にどう影響するか）
-astro-sight は tree-sitter ベースの AST 解析ツールで、テキスト検索では不可能な構造的関係を取得できる
+# Code Structure Analysis — astro-sight MANDATORY Rules
+
+## STOP-AND-CHECK Rule (CRITICAL: Check BEFORE every Grep call)
+
+**Before calling Grep, ask yourself**: "Does my search target contain code identifiers (function/class/variable/type/constant names)?"
+- **YES → Use `astro-sight refs`** (Grep FORBIDDEN)
+- **NO → Grep OK** (error messages, config values, TODOs, file paths, etc.)
+
+⚠️ **Pipe-separated patterns**: `Grep "FOO|Bar|baz"` with code identifiers is also FORBIDDEN. Use `session` for batch refs instead.
+
+This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches only identifier nodes, zero false positives from comments/strings.
+
+## Decision Table
+
+| Search Pattern | Correct Tool | Reason |
+|---|---|---|
+| `Grep "functionName"` | ❌ → `astro-sight refs --name functionName --dir .` | Code identifier |
+| `Grep "ClassName"` | ❌ → `astro-sight refs --name ClassName --dir .` | Code identifier |
+| `Grep "MY_CONST\|OtherVar"` | ❌ → `astro-sight refs --names MY_CONST,OtherVar --dir .` | Pipe-separated identifiers |
+| `Grep "import.*module"` | ❌ → `astro-sight imports --path file` | Import analysis |
+| `Grep "TODO"` | ✅ Grep OK | Non-code search |
+| `Grep "error message text"` | ✅ Grep OK | String literal search |
+| `Grep "config_key"` | ✅ Grep OK | Config value search |
+
+## Workflow Rules
+- **Before editing code**: Run `astro-sight context --dir . --git` to check impact
+- **Understanding a file**: Run `astro-sight symbols --path <file>` to see structure
+- **Understanding a directory**: Run `astro-sight symbols --dir <dir>` to see all symbols
+- **Finding symbol usage**: Run `astro-sight refs` (Grep FORBIDDEN)
+- **Finding multiple symbols**: Run `astro-sight refs --names sym1,sym2 --dir .`
+
+## Command Quick Reference
+
+astro-sight refs --name <symbol> --dir .           # Symbol reference search (REPLACES Grep for identifiers)
+astro-sight refs --names sym1,sym2 --dir .         # Batch symbol search (REPLACES Grep "FOO|Bar")
+astro-sight symbols --path <file>                  # File structure overview
+astro-sight symbols --dir <dir>                    # Directory structure overview (NDJSON)
+astro-sight calls --path <file> --function <name>  # Caller/callee relationships
+astro-sight context --dir . --git                  # Change impact analysis (run BEFORE editing code)
+astro-sight imports --path <file>                  # Import relationships
+astro-sight sequence --path <file>                 # Call flow visualization
+astro-sight cochange --dir .                       # Co-change patterns
+
+## Efficiency Rules
+- **`refs` results include `context` (source line)** → No need for additional Read/Grep
+- **Batch multiple symbol searches with `refs --names`** (simpler than session)
+- **Use Read for surrounding context when editing** (astro-sight shows 1 line only)
 ```
 
 ### MCP サーバーとして登録
