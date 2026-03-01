@@ -115,13 +115,19 @@ Output: `imports` array with `source`, `line`, `kind` (Import/Use/Include/Requir
 
 ### `symbols` — Symbol Extraction
 
-Lists all function/class/struct/enum definitions in a file or directory.
+Lists all function/class/struct/enum definitions in a file or directory. Default output is compact (name, kind, line only — no hash/range/doc) for token efficiency.
 
 ```bash
-# Single file
+# Single file (compact: name, kind, line)
 astro-sight symbols --path <file>
 
-# Directory scan (NDJSON output)
+# Include docstrings in compact output
+astro-sight symbols --path <file> --doc
+
+# Full legacy output (hash, range, doc)
+astro-sight symbols --path <file> --full
+
+# Directory scan (NDJSON output, compact)
 astro-sight symbols --dir <directory>
 
 # Directory scan with glob filter
