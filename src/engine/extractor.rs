@@ -126,9 +126,41 @@ fn is_within(ns: Point, ne: Point, rs: Point, re: Point) -> bool {
     start_ok && end_ok
 }
 
+/// Remove common leading whitespace from multi-line text.
+fn dedent(s: &str) -> String {
+    if !s.contains('\n') {
+        return s.to_string();
+    }
+    let lines: Vec<&str> = s.lines().collect();
+    let min_indent = lines
+        .iter()
+        .skip(1) // first line has no leading indent (starts at node column)
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    if min_indent == 0 {
+        return s.to_string();
+    }
+    let mut result = String::with_capacity(s.len());
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            result.push('\n');
+        }
+        if i == 0 {
+            result.push_str(line);
+        } else if line.len() >= min_indent {
+            result.push_str(&line[min_indent..]);
+        } else {
+            result.push_str(line.trim_start());
+        }
+    }
+    result
+}
+
 fn node_to_ast(node: Node<'_>, source: &[u8], remaining_depth: usize) -> AstNode {
     let text = if node.child_count() == 0 || remaining_depth == 0 {
-        node.utf8_text(source).ok().map(|s| s.to_string())
+        node.utf8_text(source).ok().map(dedent)
     } else {
         None
     };
