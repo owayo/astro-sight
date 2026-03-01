@@ -45,8 +45,14 @@ astro-sight ast --path src/main.rs --line 10 --col 0 --depth 5 --context 5
 ### symbols - シンボル抽出
 
 ```bash
-# ファイル内の関数・構造体・クラス等を一覧
+# ファイル内の関数・構造体・クラス等を一覧（compact: name, kind, line のみ）
 astro-sight symbols --path src/main.rs
+
+# docstring 付き compact 出力
+astro-sight symbols --path src/main.rs --doc
+
+# 旧来の完全出力（hash, range, doc 全て含む）
+astro-sight symbols --path src/main.rs --full
 
 # ディレクトリ内の全ソースファイルのシンボルを NDJSON で出力
 astro-sight symbols --dir src/

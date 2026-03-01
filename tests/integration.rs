@@ -73,6 +73,74 @@ fn symbols_on_own_source() {
     let main_fn = symbols.iter().find(|s| s["name"] == "main");
     assert!(main_fn.is_some(), "Should find main function");
     assert_eq!(main_fn.unwrap()["kind"], "function");
+
+    // Compact output: has line, no range/hash
+    assert!(
+        main_fn.unwrap().get("line").is_some(),
+        "Compact output should have line field"
+    );
+    assert!(
+        main_fn.unwrap().get("range").is_none(),
+        "Compact output should not have range field"
+    );
+    assert!(
+        json.get("hash").is_none(),
+        "Compact output should not have hash field"
+    );
+}
+
+#[test]
+fn symbols_full_output() {
+    let output = cargo_bin()
+        .args(["symbols", "--path", "src/main.rs", "--full"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["language"], "rust");
+
+    // Full output: has hash and range
+    assert!(
+        json.get("hash").is_some(),
+        "Full output should have hash field"
+    );
+
+    let symbols = json["symbols"].as_array().unwrap();
+    let main_fn = symbols.iter().find(|s| s["name"] == "main").unwrap();
+    assert!(
+        main_fn.get("range").is_some(),
+        "Full output should have range field"
+    );
+    assert!(
+        main_fn.get("line").is_none(),
+        "Full output should not have line field"
+    );
+}
+
+#[test]
+fn symbols_doc_flag() {
+    let output = cargo_bin()
+        .args(["symbols", "--path", "src/service.rs", "--doc"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+
+    // Should be compact format with doc included
+    assert!(
+        json.get("hash").is_none(),
+        "Compact+doc should not have hash"
+    );
+
+    let symbols = json["symbols"].as_array().unwrap();
+    // At least one symbol should have a doc field
+    let has_doc = symbols.iter().any(|s| s.get("doc").is_some());
+    assert!(
+        has_doc,
+        "With --doc flag, documented symbols should include doc"
+    );
 }
 
 #[test]

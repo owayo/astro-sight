@@ -94,6 +94,14 @@ pub enum Commands {
         #[arg(short, long)]
         query: Option<String>,
 
+        /// Include docstrings in compact output
+        #[arg(long, conflicts_with = "full")]
+        doc: bool,
+
+        /// Full output with hash, range, and doc (legacy format)
+        #[arg(long)]
+        full: bool,
+
         /// Disable cache
         #[arg(long)]
         no_cache: bool,
