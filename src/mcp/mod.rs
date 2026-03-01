@@ -201,7 +201,11 @@ impl AstroSightServer {
             depth: p.depth,
             context_lines: p.context_lines,
         };
-        Self::to_tool_result(self.service.extract_ast(&ast_params))
+        Self::to_tool_result(
+            self.service
+                .extract_ast(&ast_params)
+                .map(|r| r.to_compact_ast()),
+        )
     }
 
     #[tool(

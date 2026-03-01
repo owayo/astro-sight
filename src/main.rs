@@ -180,6 +180,7 @@ fn run(cli: Cli) -> Result<()> {
             end_col,
             depth,
             context,
+            full,
             no_cache,
         } => {
             let input = resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
@@ -193,12 +194,13 @@ fn run(cli: Cli) -> Result<()> {
                         end_col,
                         depth,
                         context_lines: context,
+                        full,
                         no_cache,
                         pretty,
                     };
                     cmd_ast(&service, &opts)
                 }
-                PathInput::Batch(ps) => batch_ast(&service, &ps, depth, context),
+                PathInput::Batch(ps) => batch_ast(&service, &ps, depth, context, full),
             }
         }
         Commands::Symbols {
@@ -349,6 +351,7 @@ struct CmdAstOpts<'a> {
     end_col: Option<usize>,
     depth: usize,
     context_lines: usize,
+    full: bool,
     no_cache: bool,
     pretty: bool,
 }
@@ -365,14 +368,16 @@ fn cmd_ast(service: &AppService, opts: &CmdAstOpts<'_>) -> Result<()> {
             None => "N".to_string(),
         }
     }
+    let mode = if opts.full { "full" } else { "compact" };
     let cache_key = format!(
-        "ast_{}_{}_{}_{}_{}_{}",
+        "ast_{}_{}_{}_{}_{}_{}_{}",
         opt_key(opts.line),
         opt_key(opts.col),
         opt_key(opts.end_line),
         opt_key(opts.end_col),
         opts.depth,
-        opts.context_lines
+        opts.context_lines,
+        mode
     );
 
     if use_cache
@@ -401,7 +406,11 @@ fn cmd_ast(service: &AppService, opts: &CmdAstOpts<'_>) -> Result<()> {
     };
     let response = service.extract_ast(&params)?;
 
-    let mut output = serialize_output(&response, opts.pretty)?;
+    let mut output = if opts.full {
+        serialize_output(&response, opts.pretty)?
+    } else {
+        serialize_output(&response.to_compact_ast(), opts.pretty)?
+    };
     output.push('\n');
 
     info!(
@@ -730,6 +739,7 @@ fn batch_ast(
     paths: &[String],
     depth: usize,
     context_lines: usize,
+    full: bool,
 ) -> Result<()> {
     batch_ndjson(paths, |p| {
         let params = AstParams {
@@ -743,7 +753,12 @@ fn batch_ast(
         };
         match service.extract_ast(&params) {
             Ok(response) => {
-                serde_json::to_string(&response).unwrap_or_else(|e| make_error_line(&e.into()))
+                if full {
+                    serde_json::to_string(&response).unwrap_or_else(|e| make_error_line(&e.into()))
+                } else {
+                    serde_json::to_string(&response.to_compact_ast())
+                        .unwrap_or_else(|e| make_error_line(&e.into()))
+                }
             }
             Err(e) => make_error_line(&e),
         }

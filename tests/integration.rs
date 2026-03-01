@@ -27,6 +27,7 @@ fn doctor_returns_json() {
 
 #[test]
 fn ast_on_own_source() {
+    // Default compact output: schema present, range as array, no id/named/hash
     let output = cargo_bin()
         .args(["ast", "--path", "src/main.rs", "--line", "0", "--col", "0"])
         .output()
@@ -36,8 +37,38 @@ fn ast_on_own_source() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
     assert_eq!(json["language"], "rust");
     assert!(!json["ast"].as_array().unwrap().is_empty());
+    assert!(json["schema"]["range"].as_str().is_some());
+    // compact: range is [sL,sC,eL,eC] array, no id/named
+    let first = &json["ast"][0];
+    assert!(first["range"].as_array().is_some());
+    assert!(first.get("id").is_none());
+    assert!(first.get("named").is_none());
+}
+
+#[test]
+fn ast_full_output() {
+    // --full: legacy format with id, named, nested range, hash
+    let output = cargo_bin()
+        .args([
+            "ast",
+            "--path",
+            "src/main.rs",
+            "--line",
+            "0",
+            "--col",
+            "0",
+            "--full",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["language"], "rust");
     assert!(json["hash"].as_str().is_some());
-    assert!(json["snippet"].as_str().is_some());
+    let first = &json["ast"][0];
+    assert!(first["id"].as_u64().is_some());
+    assert!(first["range"]["start"]["line"].is_number());
 }
 
 #[test]
@@ -51,8 +82,6 @@ fn ast_full_file() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
     assert_eq!(json["language"], "rust");
     assert!(!json["ast"].as_array().unwrap().is_empty());
-    // No snippet for full file
-    assert!(json["snippet"].is_null() || json.get("snippet").is_none());
 }
 
 #[test]

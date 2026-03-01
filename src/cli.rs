@@ -63,6 +63,10 @@ pub enum Commands {
         #[arg(long, default_value = "3")]
         context: usize,
 
+        /// Full output with id, named, nested range (legacy format)
+        #[arg(long)]
+        full: bool,
+
         /// Disable cache
         #[arg(long)]
         no_cache: bool,
