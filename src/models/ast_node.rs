@@ -22,3 +22,48 @@ pub struct AstEdge {
     pub field: Option<String>,
     pub node: AstNode,
 }
+
+// ── Compact (token-optimized) variants ──
+
+/// Token-optimized AST node: no id/named, range as [startLine, startCol, endLine, endCol].
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactAstNode {
+    pub kind: String,
+    pub range: [usize; 4],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub children: Vec<CompactAstEdge>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactAstEdge {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    pub node: CompactAstNode,
+}
+
+impl AstNode {
+    pub fn to_compact(&self) -> CompactAstNode {
+        CompactAstNode {
+            kind: self.kind.clone(),
+            range: [
+                self.range.start.line,
+                self.range.start.column,
+                self.range.end.line,
+                self.range.end.column,
+            ],
+            text: self.text.clone(),
+            children: self.children.iter().map(|e| e.to_compact()).collect(),
+        }
+    }
+}
+
+impl AstEdge {
+    pub fn to_compact(&self) -> CompactAstEdge {
+        CompactAstEdge {
+            field: self.field.clone(),
+            node: self.node.to_compact(),
+        }
+    }
+}

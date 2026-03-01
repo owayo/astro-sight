@@ -1,4 +1,4 @@
-use super::ast_node::AstNode;
+use super::ast_node::{AstNode, CompactAstNode};
 use super::diagnostic::Diagnostic;
 use super::location::LocationKey;
 use super::symbol::{CompactSymbol, Symbol};
@@ -61,6 +61,20 @@ impl AstgenResponse {
         }
     }
 
+    pub fn to_compact_ast(&self) -> CompactAstResponse {
+        CompactAstResponse {
+            location: self.location.clone(),
+            language: self.language,
+            schema: AstSchema::default(),
+            ast: self
+                .ast
+                .as_ref()
+                .map(|nodes| nodes.iter().map(|n| n.to_compact()).collect())
+                .unwrap_or_default(),
+            diagnostics: self.diagnostics.clone(),
+        }
+    }
+
     pub fn to_compact_symbols(&self, include_doc: bool) -> CompactSymbolsResponse {
         CompactSymbolsResponse {
             location: self.location.clone(),
@@ -73,6 +87,31 @@ impl AstgenResponse {
             diagnostics: self.diagnostics.clone(),
         }
     }
+}
+
+/// Schema hint for compact AST output.
+#[derive(Debug, Clone, Serialize)]
+pub struct AstSchema {
+    pub range: &'static str,
+}
+
+impl Default for AstSchema {
+    fn default() -> Self {
+        Self {
+            range: "[startLine,startCol,endLine,endCol]",
+        }
+    }
+}
+
+/// Token-optimized response for ast command.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactAstResponse {
+    pub location: LocationKey,
+    pub language: LangId,
+    pub schema: AstSchema,
+    pub ast: Vec<CompactAstNode>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 /// Token-optimized response for symbols command.
