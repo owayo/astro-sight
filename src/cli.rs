@@ -23,7 +23,7 @@ pub struct Cli {
     pub config: Option<std::path::PathBuf>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Extract AST fragment at a given position or range
     Ast {
@@ -82,6 +82,14 @@ pub enum Commands {
         #[arg(long, conflicts_with_all = ["path", "paths"])]
         paths_file: Option<String>,
 
+        /// Directory to scan for source files (NDJSON output)
+        #[arg(long, conflicts_with_all = ["path", "paths", "paths_file"])]
+        dir: Option<String>,
+
+        /// Glob pattern to filter files when using --dir (e.g. "**/*.rs")
+        #[arg(long)]
+        glob: Option<String>,
+
         /// Custom tree-sitter query
         #[arg(short, long)]
         query: Option<String>,
@@ -112,9 +120,13 @@ pub enum Commands {
 
     /// Search for symbol references across files
     Refs {
-        /// Symbol name to search for
+        /// Symbol name to search for (single mode)
         #[arg(short, long)]
-        name: String,
+        name: Option<String>,
+
+        /// Comma-separated symbol names (batch mode, NDJSON output)
+        #[arg(long, conflicts_with = "name")]
+        names: Option<String>,
 
         /// Directory to search in
         #[arg(short, long)]
@@ -138,6 +150,18 @@ pub enum Commands {
         /// Path to a diff file
         #[arg(long, conflicts_with = "diff")]
         diff_file: Option<String>,
+
+        /// Auto-run git diff to get changes
+        #[arg(long, conflicts_with_all = ["diff", "diff_file"])]
+        git: bool,
+
+        /// Base ref for git diff (default: HEAD)
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+
+        /// Use staged changes (git diff --cached)
+        #[arg(long)]
+        staged: bool,
     },
 
     /// Extract import/export dependencies from a source file

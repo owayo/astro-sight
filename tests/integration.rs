@@ -972,3 +972,104 @@ fn cochange_rejects_invalid_confidence() {
             .contains("min_confidence")
     );
 }
+
+// ---- Refs --names batch tests ----
+
+#[test]
+fn refs_batch_names() {
+    let output = cargo_bin()
+        .args([
+            "refs",
+            "--names",
+            "AppService,AstgenResponse",
+            "--dir",
+            "src/",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 2, "Should have 2 NDJSON lines for 2 symbols");
+
+    let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(first["symbol"], "AppService");
+    assert!(!first["references"].as_array().unwrap().is_empty());
+
+    let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(second["symbol"], "AstgenResponse");
+    assert!(!second["references"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn refs_name_or_names_required() {
+    let output = cargo_bin()
+        .args(["refs", "--dir", "src/"])
+        .output()
+        .expect("failed to run");
+    assert!(!output.status.success());
+}
+
+// ---- Context --git tests ----
+
+#[test]
+fn context_git_auto_diff() {
+    let output = cargo_bin()
+        .args(["context", "--dir", ".", "--git", "--base", "HEAD~1"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert!(json["changes"].is_array());
+}
+
+#[test]
+fn context_git_staged() {
+    let output = cargo_bin()
+        .args(["context", "--dir", ".", "--git", "--staged"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert!(json["changes"].is_array());
+}
+
+#[test]
+fn symbols_dir() {
+    let output = cargo_bin()
+        .args(["symbols", "--dir", "src/engine/"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    // src/engine/ has multiple .rs files
+    assert!(
+        lines.len() >= 2,
+        "Should have multiple NDJSON lines for engine dir, got {}",
+        lines.len()
+    );
+
+    for line in &lines {
+        let json: serde_json::Value =
+            serde_json::from_str(line).expect("each line should be valid JSON");
+        assert!(json["symbols"].is_array() || json["error"].is_object());
+    }
+}
+
+#[test]
+fn symbols_dir_with_glob() {
+    let output = cargo_bin()
+        .args(["symbols", "--dir", "src/", "--glob", "*.rs"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert!(!lines.is_empty(), "Should have at least one NDJSON line");
+}

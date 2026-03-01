@@ -41,7 +41,7 @@ pub fn find_references(
 }
 
 /// Collect files using the `ignore` crate (.gitignore aware).
-fn collect_files(dir: &Path, glob_pattern: Option<&str>) -> Result<Vec<std::path::PathBuf>> {
+pub fn collect_files(dir: &Path, glob_pattern: Option<&str>) -> Result<Vec<std::path::PathBuf>> {
     use ignore::WalkBuilder;
 
     let mut builder = WalkBuilder::new(dir);

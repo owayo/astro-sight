@@ -2,6 +2,8 @@ use anyhow::Result;
 use clap::Parser;
 use rayon::prelude::*;
 
+use tracing::info;
+
 use astro_sight::cache::store::CacheStore;
 use astro_sight::cli::{Cli, Commands};
 use astro_sight::config::ConfigService;
@@ -57,6 +59,37 @@ fn make_error_line(e: &anyhow::Error) -> String {
 enum PathInput {
     Single(String),
     Batch(Vec<String>),
+}
+
+enum NameInput {
+    Single(String),
+    Batch(Vec<String>),
+}
+
+fn resolve_names(name: Option<&str>, names: Option<&str>) -> Result<NameInput> {
+    if let Some(n) = name {
+        Ok(NameInput::Single(n.to_string()))
+    } else if let Some(ns) = names {
+        let list: Vec<String> = ns
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if list.is_empty() {
+            return Err(AstroError::new(
+                ErrorCode::InvalidRequest,
+                "--names must contain at least one symbol name",
+            )
+            .into());
+        }
+        Ok(NameInput::Batch(list))
+    } else {
+        Err(AstroError::new(
+            ErrorCode::InvalidRequest,
+            "One of --name or --names is required",
+        )
+        .into())
+    }
 }
 
 fn resolve_paths(
@@ -125,6 +158,14 @@ fn run(cli: Cli) -> Result<()> {
         _ => {}
     }
 
+    // Log command invocation with CWD and input parameters
+    let cwd = std::env::current_dir().unwrap_or_default();
+    info!(
+        command = ?cli.command,
+        cwd = %cwd.display(),
+        "command invoked"
+    );
+
     let service = AppService::new();
 
     match cli.command {
@@ -163,13 +204,20 @@ fn run(cli: Cli) -> Result<()> {
             path,
             paths,
             paths_file,
+            dir,
+            glob,
             query: _,
             no_cache,
         } => {
-            let input = resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
-            match input {
-                PathInput::Single(p) => cmd_symbols(&service, &p, no_cache, pretty),
-                PathInput::Batch(ps) => batch_symbols(&service, &ps),
+            if let Some(d) = &dir {
+                cmd_symbols_dir(&service, d, glob.as_deref())
+            } else {
+                let input =
+                    resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
+                match input {
+                    PathInput::Single(p) => cmd_symbols(&service, &p, no_cache, pretty),
+                    PathInput::Batch(ps) => batch_symbols(&service, &ps),
+                }
             }
         }
         Commands::Calls {
@@ -232,9 +280,15 @@ fn run(cli: Cli) -> Result<()> {
                 PathInput::Batch(ps) => batch_sequence(&service, &ps, function.as_deref()),
             }
         }
-        Commands::Refs { name, dir, glob } => {
-            cmd_refs(&service, &name, &dir, glob.as_deref(), pretty)
-        }
+        Commands::Refs {
+            name,
+            names,
+            dir,
+            glob,
+        } => match resolve_names(name.as_deref(), names.as_deref())? {
+            NameInput::Single(n) => cmd_refs(&service, &n, &dir, glob.as_deref(), pretty),
+            NameInput::Batch(ns) => cmd_refs_batch(&service, &ns, &dir, glob.as_deref()),
+        },
         Commands::Cochange {
             dir,
             lookback,
@@ -252,11 +306,17 @@ fn run(cli: Cli) -> Result<()> {
             dir,
             diff,
             diff_file,
+            git,
+            base,
+            staged,
         } => cmd_context(
             &service,
             &dir,
             diff.as_deref(),
             diff_file.as_deref(),
+            git,
+            &base,
+            staged,
             pretty,
         ),
         Commands::Doctor => cmd_doctor(pretty),
@@ -308,6 +368,13 @@ fn cmd_ast(service: &AppService, opts: &CmdAstOpts<'_>) -> Result<()> {
         && let Ok(cache) = CacheStore::new()
         && let Some(cached) = cache.get(&hash, &cache_key)
     {
+        info!(
+            command = "ast",
+            path = opts.path,
+            output_bytes = cached.len(),
+            cached = true,
+            "command completed"
+        );
         std::io::Write::write_all(&mut std::io::stdout(), &cached)?;
         return Ok(());
     }
@@ -326,12 +393,30 @@ fn cmd_ast(service: &AppService, opts: &CmdAstOpts<'_>) -> Result<()> {
     let mut output = serialize_output(&response, opts.pretty)?;
     output.push('\n');
 
+    info!(
+        command = "ast",
+        path = opts.path,
+        output_bytes = output.len(),
+        cached = false,
+        "command completed"
+    );
+
     if use_cache && let Ok(cache) = CacheStore::new() {
         let _ = cache.put(&hash, &cache_key, output.as_bytes());
     }
 
     print!("{output}");
     Ok(())
+}
+
+fn cmd_symbols_dir(service: &AppService, dir: &str, glob: Option<&str>) -> Result<()> {
+    let canonical_dir = std::fs::canonicalize(dir)?;
+    let files = astro_sight::engine::refs::collect_files(&canonical_dir, glob)?;
+    let file_paths: Vec<String> = files
+        .iter()
+        .filter_map(|p| p.to_str().map(|s| s.to_string()))
+        .collect();
+    batch_symbols(service, &file_paths)
 }
 
 fn cmd_symbols(service: &AppService, path: &str, no_cache: bool, pretty: bool) -> Result<()> {
@@ -344,6 +429,13 @@ fn cmd_symbols(service: &AppService, path: &str, no_cache: bool, pretty: bool) -
         && let Ok(cache) = CacheStore::new()
         && let Some(cached) = cache.get(&hash, "symbols")
     {
+        info!(
+            command = "symbols",
+            path = path,
+            output_bytes = cached.len(),
+            cached = true,
+            "command completed"
+        );
         std::io::Write::write_all(&mut std::io::stdout(), &cached)?;
         return Ok(());
     }
@@ -352,6 +444,14 @@ fn cmd_symbols(service: &AppService, path: &str, no_cache: bool, pretty: bool) -
 
     let mut output = serialize_output(&response, pretty)?;
     output.push('\n');
+
+    info!(
+        command = "symbols",
+        path = path,
+        output_bytes = output.len(),
+        cached = false,
+        "command completed"
+    );
 
     if use_cache && let Ok(cache) = CacheStore::new() {
         let _ = cache.put(&hash, "symbols", output.as_bytes());
@@ -364,6 +464,7 @@ fn cmd_symbols(service: &AppService, path: &str, no_cache: bool, pretty: bool) -
 fn cmd_calls(service: &AppService, path: &str, function: Option<&str>, pretty: bool) -> Result<()> {
     let result = service.extract_calls(path, function)?;
     let output = serialize_output(&result, pretty)?;
+    info!(command = "calls", path = path, function = ?function, output_bytes = output.len(), "command completed");
     println!("{output}");
     Ok(())
 }
@@ -371,6 +472,12 @@ fn cmd_calls(service: &AppService, path: &str, function: Option<&str>, pretty: b
 fn cmd_imports(service: &AppService, path: &str, pretty: bool) -> Result<()> {
     let result = service.extract_imports(path)?;
     let output = serialize_output(&result, pretty)?;
+    info!(
+        command = "imports",
+        path = path,
+        output_bytes = output.len(),
+        "command completed"
+    );
     println!("{output}");
     Ok(())
 }
@@ -383,6 +490,13 @@ fn cmd_lint(
 ) -> Result<()> {
     let result = service.lint_file(path, rules)?;
     let output = serialize_output(&result, pretty)?;
+    info!(
+        command = "lint",
+        path = path,
+        rules_count = rules.len(),
+        output_bytes = output.len(),
+        "command completed"
+    );
     println!("{output}");
     Ok(())
 }
@@ -395,6 +509,7 @@ fn cmd_sequence(
 ) -> Result<()> {
     let result = service.generate_sequence(path, function)?;
     let output = serialize_output(&result, pretty)?;
+    info!(command = "sequence", path = path, function = ?function, output_bytes = output.len(), "command completed");
     println!("{output}");
     Ok(())
 }
@@ -408,7 +523,31 @@ fn cmd_refs(
 ) -> Result<()> {
     let result = service.find_references(name, dir, glob)?;
     let output = serialize_output(&result, pretty)?;
+    info!(command = "refs", name = name, dir = dir, glob = ?glob, output_bytes = output.len(), "command completed");
     println!("{output}");
+    Ok(())
+}
+
+fn cmd_refs_batch(
+    service: &AppService,
+    names: &[String],
+    dir: &str,
+    glob: Option<&str>,
+) -> Result<()> {
+    use std::io::Write;
+    let results = service.find_references_batch(names, dir, glob)?;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for result in &results {
+        let line = serde_json::to_string(result)?;
+        writeln!(out, "{line}")?;
+    }
+    info!(
+        command = "refs_batch",
+        names_count = names.len(),
+        total_refs = results.iter().map(|r| r.references.len()).sum::<usize>(),
+        "command completed"
+    );
     Ok(())
 }
 
@@ -422,21 +561,55 @@ fn cmd_cochange(
 ) -> Result<()> {
     let result = service.analyze_cochange(dir, lookback, min_confidence, file)?;
     let output = serialize_output(&result, pretty)?;
+    info!(command = "cochange", dir = dir, lookback = lookback, min_confidence = min_confidence, file = ?file, output_bytes = output.len(), "command completed");
     println!("{output}");
     Ok(())
 }
 
+fn run_git_diff(dir: &str, base: &str, staged: bool) -> Result<String> {
+    let mut args = vec!["diff".to_string()];
+    if staged {
+        args.push("--cached".to_string());
+    }
+    args.push(base.to_string());
+
+    let output = std::process::Command::new("git")
+        .args(&args)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| {
+            AstroError::new(ErrorCode::InvalidRequest, format!("Failed to run git: {e}"))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AstroError::new(
+            ErrorCode::InvalidRequest,
+            format!("git diff failed: {stderr}"),
+        )
+        .into());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_context(
     service: &AppService,
     dir: &str,
     diff: Option<&str>,
     diff_file: Option<&str>,
+    git: bool,
+    base: &str,
+    staged: bool,
     pretty: bool,
 ) -> Result<()> {
     let diff_input = if let Some(d) = diff {
         d.to_string()
     } else if let Some(df) = diff_file {
         std::fs::read_to_string(df)?
+    } else if git {
+        run_git_diff(dir, base, staged)?
     } else {
         use std::io::Read;
         let mut buf = String::new();
@@ -446,6 +619,13 @@ fn cmd_context(
 
     let result = service.analyze_context(&diff_input, dir)?;
     let output = serialize_output(&result, pretty)?;
+    info!(
+        command = "context",
+        dir = dir,
+        diff_bytes = diff_input.len(),
+        output_bytes = output.len(),
+        "command completed"
+    );
     println!("{output}");
     Ok(())
 }
@@ -453,6 +633,11 @@ fn cmd_context(
 fn cmd_doctor(pretty: bool) -> Result<()> {
     let report = doctor::run_doctor();
     let output = serialize_output(&report, pretty)?;
+    info!(
+        command = "doctor",
+        output_bytes = output.len(),
+        "command completed"
+    );
     println!("{output}");
     Ok(())
 }
@@ -491,6 +676,12 @@ where
 {
     use std::io::Write;
     let results: Vec<String> = paths.par_iter().map(|p| process(p)).collect();
+    let total_bytes: usize = results.iter().map(|r| r.len()).sum();
+    info!(
+        batch_size = paths.len(),
+        output_bytes = total_bytes,
+        "batch completed"
+    );
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     for line in &results {
@@ -608,10 +799,17 @@ fn handle_request(
             Ok(serde_json::to_value(result)?)
         }
         Command::Refs => {
-            let name = req.name.as_deref().unwrap_or("");
             let dir = req.dir.as_deref().unwrap_or(".");
-            let result = service.find_references(name, dir, req.glob.as_deref())?;
-            Ok(serde_json::to_value(result)?)
+            if let Some(names) = &req.names {
+                // Batch mode
+                let results = service.find_references_batch(names, dir, req.glob.as_deref())?;
+                Ok(serde_json::to_value(results)?)
+            } else {
+                // Single mode
+                let name = req.name.as_deref().unwrap_or("");
+                let result = service.find_references(name, dir, req.glob.as_deref())?;
+                Ok(serde_json::to_value(result)?)
+            }
         }
         Command::Context => {
             let dir = req.dir.as_deref().unwrap_or(".");

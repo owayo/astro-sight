@@ -365,6 +365,40 @@ impl AppService {
         Ok(result)
     }
 
+    /// Search for references to multiple symbols across files (batch mode).
+    pub fn find_references_batch(
+        &self,
+        names: &[String],
+        dir: &str,
+        glob: Option<&str>,
+    ) -> Result<Vec<RefsResult>> {
+        debug!(names = ?names, dir = dir, glob = ?glob, "find_references_batch called");
+        let canonical_dir = self.validate_dir(dir)?;
+
+        let batch = refs::find_references_batch(names, &canonical_dir, glob)?;
+
+        // Convert to Vec<RefsResult> preserving input order, with path relativization
+        let results: Vec<RefsResult> = names
+            .iter()
+            .map(|name| {
+                let references = batch.get(name).cloned().unwrap_or_default();
+                let references = relativize_paths(references, &canonical_dir);
+                RefsResult {
+                    symbol: name.clone(),
+                    references,
+                }
+            })
+            .collect();
+
+        debug!(
+            names = ?names,
+            dir = dir,
+            total_refs = results.iter().map(|r| r.references.len()).sum::<usize>(),
+            "find_references_batch completed"
+        );
+        Ok(results)
+    }
+
     /// Analyze the impact of a unified diff on the codebase.
     pub fn analyze_context(&self, diff: &str, dir: &str) -> Result<ContextResult> {
         debug!(dir = dir, diff_bytes = diff.len(), "analyze_context called");

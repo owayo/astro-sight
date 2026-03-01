@@ -23,9 +23,12 @@ pub struct AstgenRequest {
     /// Function name filter (for calls command)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function: Option<String>,
-    /// Symbol name to search (for refs command)
+    /// Symbol name to search (for refs command, single mode)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Symbol names for batch refs search
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub names: Option<Vec<String>>,
     /// Directory to search in (for refs/context commands)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dir: Option<String>,
