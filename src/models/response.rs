@@ -1,7 +1,7 @@
 use super::ast_node::AstNode;
 use super::diagnostic::Diagnostic;
 use super::location::LocationKey;
-use super::symbol::Symbol;
+use super::symbol::{CompactSymbol, Symbol};
 use crate::error::ErrorCode;
 use crate::language::LangId;
 use serde::{Deserialize, Serialize};
@@ -60,4 +60,27 @@ impl AstgenResponse {
             }),
         }
     }
+
+    pub fn to_compact_symbols(&self, include_doc: bool) -> CompactSymbolsResponse {
+        CompactSymbolsResponse {
+            location: self.location.clone(),
+            language: self.language,
+            symbols: self
+                .symbols
+                .as_ref()
+                .map(|syms| syms.iter().map(|s| s.to_compact(include_doc)).collect())
+                .unwrap_or_default(),
+            diagnostics: self.diagnostics.clone(),
+        }
+    }
+}
+
+/// Token-optimized response for symbols command.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactSymbolsResponse {
+    pub location: LocationKey,
+    pub language: LangId,
+    pub symbols: Vec<CompactSymbol>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub diagnostics: Vec<Diagnostic>,
 }

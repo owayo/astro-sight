@@ -208,16 +208,18 @@ fn run(cli: Cli) -> Result<()> {
             dir,
             glob,
             query: _,
+            doc,
+            full,
             no_cache,
         } => {
             if let Some(d) = &dir {
-                cmd_symbols_dir(&service, d, glob.as_deref())
+                cmd_symbols_dir(&service, d, glob.as_deref(), doc, full)
             } else {
                 let input =
                     resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
                 match input {
-                    PathInput::Single(p) => cmd_symbols(&service, &p, no_cache, pretty),
-                    PathInput::Batch(ps) => batch_symbols(&service, &ps),
+                    PathInput::Single(p) => cmd_symbols(&service, &p, no_cache, pretty, doc, full),
+                    PathInput::Batch(ps) => batch_symbols(&service, &ps, doc, full),
                 }
             }
         }
@@ -415,25 +417,46 @@ fn cmd_ast(service: &AppService, opts: &CmdAstOpts<'_>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_symbols_dir(service: &AppService, dir: &str, glob: Option<&str>) -> Result<()> {
+fn cmd_symbols_dir(
+    service: &AppService,
+    dir: &str,
+    glob: Option<&str>,
+    doc: bool,
+    full: bool,
+) -> Result<()> {
     let canonical_dir = std::fs::canonicalize(dir)?;
     let files = astro_sight::engine::refs::collect_files(&canonical_dir, glob)?;
     let file_paths: Vec<String> = files
         .iter()
         .filter_map(|p| p.to_str().map(|s| s.to_string()))
         .collect();
-    batch_symbols(service, &file_paths)
+    batch_symbols(service, &file_paths, doc, full)
 }
 
-fn cmd_symbols(service: &AppService, path: &str, no_cache: bool, pretty: bool) -> Result<()> {
+fn cmd_symbols(
+    service: &AppService,
+    path: &str,
+    no_cache: bool,
+    pretty: bool,
+    doc: bool,
+    full: bool,
+) -> Result<()> {
     let utf8_path = camino::Utf8Path::new(path);
     let source = parser::read_file(utf8_path)?;
     let hash = CacheStore::hash(&source);
     let use_cache = !no_cache && !pretty;
 
+    let cache_key = if full {
+        "symbols_full"
+    } else if doc {
+        "symbols_doc"
+    } else {
+        "symbols"
+    };
+
     if use_cache
         && let Ok(cache) = CacheStore::new()
-        && let Some(cached) = cache.get(&hash, "symbols")
+        && let Some(cached) = cache.get(&hash, cache_key)
     {
         info!(
             command = "symbols",
@@ -448,7 +471,12 @@ fn cmd_symbols(service: &AppService, path: &str, no_cache: bool, pretty: bool) -
 
     let response = service.extract_symbols(path)?;
 
-    let mut output = serialize_output(&response, pretty)?;
+    let mut output = if full {
+        serialize_output(&response, pretty)?
+    } else {
+        let compact = response.to_compact_symbols(doc);
+        serialize_output(&compact, pretty)?
+    };
     output.push('\n');
 
     info!(
@@ -460,7 +488,7 @@ fn cmd_symbols(service: &AppService, path: &str, no_cache: bool, pretty: bool) -
     );
 
     if use_cache && let Ok(cache) = CacheStore::new() {
-        let _ = cache.put(&hash, "symbols", output.as_bytes());
+        let _ = cache.put(&hash, cache_key, output.as_bytes());
     }
 
     print!("{output}");
@@ -721,10 +749,15 @@ fn batch_ast(
     })
 }
 
-fn batch_symbols(service: &AppService, paths: &[String]) -> Result<()> {
+fn batch_symbols(service: &AppService, paths: &[String], doc: bool, full: bool) -> Result<()> {
     batch_ndjson(paths, |p| match service.extract_symbols(p) {
         Ok(response) => {
-            serde_json::to_string(&response).unwrap_or_else(|e| make_error_line(&e.into()))
+            if full {
+                serde_json::to_string(&response).unwrap_or_else(|e| make_error_line(&e.into()))
+            } else {
+                let compact = response.to_compact_symbols(doc);
+                serde_json::to_string(&compact).unwrap_or_else(|e| make_error_line(&e.into()))
+            }
         }
         Err(e) => make_error_line(&e),
     })
@@ -794,7 +827,8 @@ fn handle_request(
         }
         Command::Symbols => {
             let response = service.extract_symbols(&req.path)?;
-            Ok(serde_json::to_value(response)?)
+            let compact = response.to_compact_symbols(false);
+            Ok(serde_json::to_value(compact)?)
         }
         Command::Doctor => {
             let report = doctor::run_doctor();
