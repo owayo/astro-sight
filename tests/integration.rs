@@ -13,7 +13,7 @@ fn doctor_returns_json() {
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
     assert_eq!(json["version"], PKG_VERSION);
-    assert!(json["languages"].as_array().unwrap().len() >= 14);
+    assert!(json["languages"].as_array().unwrap().len() >= 15);
 
     // All languages should be available
     for lang in json["languages"].as_array().unwrap() {
@@ -1274,4 +1274,84 @@ fn symbols_dir_with_glob() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let lines: Vec<&str> = stdout.trim().lines().collect();
     assert!(!lines.is_empty(), "Should have at least one NDJSON line");
+}
+
+// ---- Ruby language support tests ----
+
+#[test]
+fn ruby_symbols() {
+    let output = cargo_bin()
+        .args(["symbols", "--path", "tests/fixtures/sample.rb"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "ruby");
+
+    let symbols = json["symbols"].as_array().unwrap();
+    assert!(!symbols.is_empty());
+
+    // Should find module, classes, and methods
+    let module = symbols.iter().find(|s| s["name"] == "MyApp");
+    assert!(module.is_some(), "Should find MyApp module");
+    assert_eq!(module.unwrap()["kind"], "mod");
+
+    let user_class = symbols.iter().find(|s| s["name"] == "User");
+    assert!(user_class.is_some(), "Should find User class");
+    assert_eq!(user_class.unwrap()["kind"], "class");
+
+    let init_method = symbols.iter().find(|s| s["name"] == "initialize");
+    assert!(init_method.is_some(), "Should find initialize method");
+    assert_eq!(init_method.unwrap()["kind"], "fn");
+}
+
+#[test]
+fn ruby_calls() {
+    let output = cargo_bin()
+        .args(["calls", "--path", "tests/fixtures/sample.rb"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "ruby");
+
+    let calls = json["calls"].as_array().unwrap();
+    assert!(!calls.is_empty(), "Should find calls in Ruby file");
+}
+
+#[test]
+fn ruby_imports() {
+    let output = cargo_bin()
+        .args(["imports", "--path", "tests/fixtures/sample.rb"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "ruby");
+
+    let imports = json["imports"].as_array().unwrap();
+    assert!(!imports.is_empty(), "Should find require statements");
+
+    // Should find 'json' require
+    let json_import = imports
+        .iter()
+        .find(|i| i["src"].as_str().unwrap_or("").contains("json"));
+    assert!(json_import.is_some(), "Should find require 'json'");
+    assert_eq!(json_import.unwrap()["kind"], "require");
+}
+
+#[test]
+fn ruby_ast() {
+    let output = cargo_bin()
+        .args(["ast", "--path", "tests/fixtures/sample.rb"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "ruby");
+    assert!(!json["ast"].as_array().unwrap().is_empty());
 }

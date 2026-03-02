@@ -236,6 +236,7 @@ fn definition_node_kinds(lang_id: LangId) -> Vec<&'static str> {
             "enum_declaration",
         ],
         LangId::Bash => vec!["function_definition"],
+        LangId::Ruby => vec!["method", "singleton_method", "class", "module"],
     }
 }
 
