@@ -43,7 +43,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/engine/snippet.rs` - コンテキストスニペット生成
 - `src/models/` - Request/Response/AST ノード/Call/Reference/Impact/Sequence/Import/Lint/CoChange 型定義
 - `src/error.rs` - AstroError + ErrorCode（PathOutOfBounds 含む）
-- `src/cache/store.rs` - content-addressed キャッシュ（dirs::cache_dir() による OS 標準パス）
+- `src/cache/store.rs` - content-addressed キャッシュ（~/.cache/astro-sight/）
 - `src/session/mod.rs` - NDJSON セッション処理（生行サイズで100MB上限）
 - `src/language.rs` - 言語検出（拡張子/shebang）
 
