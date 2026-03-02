@@ -334,10 +334,19 @@ $ astro-sight ast --path nonexistent.rs
 
 ## Claude Code との連携
 
-### スキル（自動）
+### スキルインストール
 
-`cargo install --path .` でインストール済みであれば、[Claude Code のスキル](https://docs.anthropic.com/en/docs/claude-code/skills)として自動登録されます（`~/.claude/skills/astro-sight/SKILL.md`）。
-「コールグラフを調べて」「この関数の呼び出し元は？」「diff の影響範囲は？」等の質問で自動的に起動します。
+`skill-install` サブコマンドで [Claude Code](https://docs.anthropic.com/en/docs/claude-code/skills) / [Codex](https://developers.openai.com/codex/skills/) のスキルとして登録できます。
+
+```bash
+# Claude Code 用（~/.claude/skills/astro-sight/SKILL.md）
+astro-sight skill-install claude
+
+# Codex 用（~/.codex/skills/astro-sight/SKILL.md）
+astro-sight skill-install codex
+```
+
+登録後は「コールグラフを調べて」「この関数の呼び出し元は？」「diff の影響範囲は？」等の質問で自動的に起動します。
 
 ### CLAUDE.md に追記して確実に使わせる
 
