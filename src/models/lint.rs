@@ -48,6 +48,7 @@ pub struct PatternMatch {
 /// Result of linting a single file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LintResult {
+    #[serde(rename = "lang")]
     pub language: String,
     pub matches: Vec<PatternMatch>,
     /// Warnings about skipped or invalid rules

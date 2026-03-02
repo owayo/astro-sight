@@ -228,7 +228,11 @@ impl AstroSightServer {
         params: Parameters<CallsExtractParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        Self::to_tool_result(self.service.extract_calls(&p.path, p.function.as_deref()))
+        Self::to_tool_result(
+            self.service
+                .extract_calls(&p.path, p.function.as_deref())
+                .map(|r| r.to_compact()),
+        )
     }
 
     #[tool(

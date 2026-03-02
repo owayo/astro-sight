@@ -63,8 +63,8 @@ impl AstgenResponse {
 
     pub fn to_compact_ast(&self) -> CompactAstResponse {
         CompactAstResponse {
-            location: self.location.clone(),
-            language: self.language,
+            path: self.location.path.clone(),
+            lang: self.language,
             schema: AstSchema::default(),
             ast: self
                 .ast
@@ -77,8 +77,8 @@ impl AstgenResponse {
 
     pub fn to_compact_symbols(&self, include_doc: bool) -> CompactSymbolsResponse {
         CompactSymbolsResponse {
-            location: self.location.clone(),
-            language: self.language,
+            path: self.location.path.clone(),
+            lang: self.language,
             symbols: self
                 .symbols
                 .as_ref()
@@ -106,8 +106,8 @@ impl Default for AstSchema {
 /// Token-optimized response for ast command.
 #[derive(Debug, Clone, Serialize)]
 pub struct CompactAstResponse {
-    pub location: LocationKey,
-    pub language: LangId,
+    pub path: String,
+    pub lang: LangId,
     pub schema: AstSchema,
     pub ast: Vec<CompactAstNode>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -117,8 +117,8 @@ pub struct CompactAstResponse {
 /// Token-optimized response for symbols command.
 #[derive(Debug, Clone, Serialize)]
 pub struct CompactSymbolsResponse {
-    pub location: LocationKey,
-    pub language: LangId,
+    pub path: String,
+    pub lang: LangId,
     pub symbols: Vec<CompactSymbol>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub diagnostics: Vec<Diagnostic>,

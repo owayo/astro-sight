@@ -1,5 +1,5 @@
 use super::location::Range;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -36,12 +36,34 @@ pub struct Symbol {
 #[derive(Debug, Clone, Serialize)]
 pub struct CompactSymbol {
     pub name: String,
+    #[serde(serialize_with = "serialize_compact_kind")]
     pub kind: SymbolKind,
+    #[serde(rename = "ln")]
     pub line: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub children: Vec<CompactSymbol>,
+}
+
+fn serialize_compact_kind<S: Serializer>(kind: &SymbolKind, s: S) -> Result<S::Ok, S::Error> {
+    let short = match kind {
+        SymbolKind::Function => "fn",
+        SymbolKind::Method => "method",
+        SymbolKind::Class => "class",
+        SymbolKind::Struct => "struct",
+        SymbolKind::Enum => "enum",
+        SymbolKind::Interface => "iface",
+        SymbolKind::Trait => "trait",
+        SymbolKind::Variable => "var",
+        SymbolKind::Constant => "const",
+        SymbolKind::Module => "mod",
+        SymbolKind::Import => "import",
+        SymbolKind::Type => "type",
+        SymbolKind::Field => "field",
+        SymbolKind::Parameter => "param",
+    };
+    s.serialize_str(short)
 }
 
 impl Symbol {
