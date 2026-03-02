@@ -74,7 +74,6 @@ astro-sight calls --path src/main.rs --function cmd_ast
 出力例:
 ```json
 {
-  "version": "0.1.0",
   "language": "rust",
   "calls": [
     {
@@ -99,10 +98,11 @@ astro-sight refs --name "AstgenResponse" --dir src/ --glob "**/*.rs"
 astro-sight refs --names "AppService,AstgenResponse" --dir src/
 ```
 
+`--name` は空文字を受け付けない。`--names` も空要素のみ（例: `",,,"`）の場合は `INVALID_REQUEST` を返す。
+
 出力例:
 ```json
 {
-  "version": "0.1.0",
   "symbol": "extract_symbols",
   "references": [
     { "path": "src/engine/symbols.rs", "line": 9, "column": 7, "context": "pub fn extract_symbols(...)", "kind": "definition" },
@@ -139,7 +139,6 @@ astro-sight context --dir . --diff-file /tmp/changes.diff
 出力例:
 ```json
 {
-  "version": "0.1.0",
   "changes": [
     {
       "path": "src/engine/symbols.rs",
@@ -183,6 +182,8 @@ echo '{"command":"refs","name":"AstgenResponse","dir":"src/"}' | astro-sight ses
 echo '{"command":"context","dir":".","diff":"--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,3 +1,4 @@\n+use new_mod;"}' | astro-sight session
 ```
 
+`refs` を session で使う場合も `name` または `names` の指定が必須（空文字不可）。
+
 ### バッチ処理（ast, symbols, calls）
 
 複数ファイルを一度に処理し、NDJSON（1ファイル1行）で出力。rayon による並列処理。
@@ -199,6 +200,8 @@ astro-sight symbols --paths-file /tmp/files.txt
 astro-sight ast --paths src/lib.rs,src/main.rs --depth 2
 astro-sight calls --paths src/lib.rs,src/main.rs
 ```
+
+`--paths` / `--paths-file` は 1 件以上の有効なパスが必要。空リストは `INVALID_REQUEST` を返す。
 
 個別ファイルのエラーは行内 JSON エラーとして出力される（プロセスは成功終了）:
 ```jsonl
@@ -313,7 +316,6 @@ $ astro-sight ast --path nonexistent.rs
 
 ```json
 {
-  "version": "0.1.0",
   "location": { "path": "src/main.rs", "line": 10, "column": 0 },
   "language": "rust",
   "hash": "blake3-content-hash",
@@ -323,6 +325,8 @@ $ astro-sight ast --path nonexistent.rs
   "diagnostics": []
 }
 ```
+
+`version` フィールドは `doctor` と MCP `initialize` 応答のみ。`ast` / `symbols` / `calls` / `refs` / `context` など通常コマンドでは省略される。
 
 ## Cache
 

@@ -1,6 +1,6 @@
 use crate::models::impact::{DiffFile, HunkInfo};
 
-/// Parse a unified diff string into a list of DiffFile entries.
+/// unified diff 文字列を `DiffFile` の配列に変換する。
 pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
     let mut files = Vec::new();
     let mut current_old_path: Option<String> = None;
@@ -9,7 +9,7 @@ pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
 
     for line in input.lines() {
         if let Some(path) = line.strip_prefix("--- a/") {
-            // Flush previous file
+            // 直前のファイル情報を確定
             flush_file(
                 &mut files,
                 &mut current_old_path,
@@ -17,14 +17,14 @@ pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
                 &mut current_hunks,
             );
             current_old_path = Some(path.to_string());
-        } else if let Some(path) = line.strip_prefix("--- /dev/null") {
+        } else if line.starts_with("--- /dev/null") {
             flush_file(
                 &mut files,
                 &mut current_old_path,
                 &mut current_new_path,
                 &mut current_hunks,
             );
-            current_old_path = Some(path.to_string());
+            current_old_path = Some("/dev/null".to_string());
         } else if let Some(path) = line.strip_prefix("+++ b/") {
             current_new_path = Some(path.to_string());
         } else if line.starts_with("+++ /dev/null") {
@@ -36,7 +36,7 @@ pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
         }
     }
 
-    // Flush last file
+    // 最後のファイル情報を確定
     flush_file(
         &mut files,
         &mut current_old_path,
@@ -65,15 +65,15 @@ fn flush_file(
     hunks.clear();
 }
 
-/// Parse a hunk header like "@@ -10,5 +10,8 @@" or "@@ -10,5 +10,8 @@ fn foo()".
+/// `"@@ -10,5 +10,8 @@"` や `"@@ -10,5 +10,8 @@ fn foo()"` の hunk ヘッダを解析する。
 fn parse_hunk_header(line: &str) -> Option<HunkInfo> {
-    // Strip the leading "@@ "
+    // 先頭の `"@@ "` を除去
     let rest = line.strip_prefix("@@ ")?;
-    // Find the closing " @@"
+    // 終端の `" @@"` の位置を探す
     let end = rest.find(" @@")?;
     let range_part = &rest[..end];
 
-    // Split into old and new parts: "-10,5 +10,8"
+    // old/new の範囲に分割: "-10,5 +10,8"
     let mut parts = range_part.split_whitespace();
     let old_part = parts.next()?.strip_prefix('-')?;
     let new_part = parts.next()?.strip_prefix('+')?;
@@ -89,7 +89,7 @@ fn parse_hunk_header(line: &str) -> Option<HunkInfo> {
     })
 }
 
-/// Parse "10,5" or "10" into (start, count).
+/// `"10,5"` または `"10"` を `(start, count)` に変換する。
 fn parse_range_spec(spec: &str) -> Option<(usize, usize)> {
     if let Some((start, count)) = spec.split_once(',') {
         Some((start.parse().ok()?, count.parse().ok()?))
@@ -153,5 +153,21 @@ index abc1234..def5678 100644
         assert_eq!(h.old_count, 1);
         assert_eq!(h.new_start, 1);
         assert_eq!(h.new_count, 1);
+    }
+
+    #[test]
+    fn parse_new_file_diff_with_dev_null() {
+        let diff = r#"diff --git a/src/new.rs b/src/new.rs
+new file mode 100644
+index 0000000..1234567
+--- /dev/null
++++ b/src/new.rs
+@@ -0,0 +1,2 @@
++fn new_fn() {}
++"#;
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].old_path, "/dev/null");
+        assert_eq!(files[0].new_path, "src/new.rs");
     }
 }
