@@ -221,3 +221,4 @@ git diff origin/main | astro-sight context --dir .
 - `refs` results include `context` (source line) — no need to Read files afterward
 - `refs` respects `.gitignore` and uses parallel scanning
 - Multiple symbol searches: use `refs --names` for batching (or `session` for mixed commands)
+- **Input validation**: Empty `--name`/`--names`, empty `--paths`/`--paths-file` are rejected with `INVALID_REQUEST` error
