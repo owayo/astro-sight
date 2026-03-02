@@ -14,6 +14,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - **デフォルト compact JSON** 出力（`--pretty` で整形出力）
 - **バッチ処理**（`--paths` / `--paths-file` で複数ファイル NDJSON 出力）
 - **JSON エラー出力**（`{"error":{"code":"...","message":"..."}}` を stdout に出力）
+- **入力検証の強化**（`refs` の空 `name/names` を拒否、`--paths` / `--paths-file` の空リストを拒否）
 - **セキュリティ** — パス境界チェック（MCP: cwd サンドボックス）、ファイル/入力サイズ 100MB 上限
 - **トークン最適化** — version フィールド省略（doctor/MCP のみ保持）、refs/context で相対パス出力、symbols デフォルト compact 出力（`--doc` で docstring 付加、`--full` で旧来の完全出力）
 - **設定ファイル** — `~/.config/astro-sight/config.toml`（TOML 形式、`astro-sight init` で生成）

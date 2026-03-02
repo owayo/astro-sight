@@ -68,7 +68,13 @@ enum NameInput {
 
 fn resolve_names(name: Option<&str>, names: Option<&str>) -> Result<NameInput> {
     if let Some(n) = name {
-        Ok(NameInput::Single(n.to_string()))
+        let trimmed = n.trim();
+        if trimmed.is_empty() {
+            return Err(
+                AstroError::new(ErrorCode::InvalidRequest, "--name must not be empty").into(),
+            );
+        }
+        Ok(NameInput::Single(trimmed.to_string()))
     } else if let Some(ns) = names {
         let list: Vec<String> = ns
             .split(',')
@@ -105,6 +111,13 @@ fn resolve_paths(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        if list.is_empty() {
+            return Err(AstroError::new(
+                ErrorCode::InvalidRequest,
+                "--paths must contain at least one path",
+            )
+            .into());
+        }
         Ok(PathInput::Batch(list))
     } else if let Some(pf) = paths_file {
         let content = std::fs::read_to_string(pf)?;
@@ -113,6 +126,13 @@ fn resolve_paths(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        if list.is_empty() {
+            return Err(AstroError::new(
+                ErrorCode::InvalidRequest,
+                "--paths-file must contain at least one path",
+            )
+            .into());
+        }
         Ok(PathInput::Batch(list))
     } else {
         Err(AstroError::new(
@@ -869,14 +889,30 @@ fn handle_request(
         Command::Refs => {
             let dir = req.dir.as_deref().unwrap_or(".");
             if let Some(names) = &req.names {
-                // Batch mode
-                let results = service.find_references_batch(names, dir, req.glob.as_deref())?;
+                let filtered: Vec<String> = names
+                    .iter()
+                    .map(|name| name.trim().to_string())
+                    .filter(|name| !name.is_empty())
+                    .collect();
+                if filtered.is_empty() {
+                    return Err(AstroError::new(
+                        ErrorCode::InvalidRequest,
+                        "One of name or names is required",
+                    )
+                    .into());
+                }
+                let results = service.find_references_batch(&filtered, dir, req.glob.as_deref())?;
                 Ok(serde_json::to_value(results)?)
-            } else {
-                // Single mode
-                let name = req.name.as_deref().unwrap_or("");
+            } else if let Some(name) = req.name.as_deref().map(str::trim).filter(|n| !n.is_empty())
+            {
                 let result = service.find_references(name, dir, req.glob.as_deref())?;
                 Ok(serde_json::to_value(result)?)
+            } else {
+                Err(AstroError::new(
+                    ErrorCode::InvalidRequest,
+                    "One of name or names is required",
+                )
+                .into())
             }
         }
         Command::Context => {
