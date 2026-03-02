@@ -52,15 +52,7 @@ impl CacheStore {
 }
 
 fn cache_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-        PathBuf::from(xdg).join("astro-sight")
-    } else if let Some(home) = dirs_home() {
-        home.join(".cache").join("astro-sight")
-    } else {
-        PathBuf::from("/tmp/astro-sight-cache")
-    }
-}
-
-fn dirs_home() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(PathBuf::from)
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("astro-sight")
 }

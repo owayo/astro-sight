@@ -36,15 +36,58 @@ pub fn parse_source(source: &[u8], lang_id: LangId) -> Result<Tree> {
 /// Maximum file size: 100 MB.
 const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
 
-/// Read a file using mmap for efficiency.
-pub fn read_file(path: &Utf8Path) -> Result<Vec<u8>> {
+/// Zero-copy capable source buffer.
+/// Uses mmap for files > 64KB (avoids copying), Vec<u8> for smaller files.
+pub enum SourceBuf {
+    Mmap(memmap2::Mmap),
+    Vec(Vec<u8>),
+}
+
+impl SourceBuf {
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            SourceBuf::Mmap(m) => m,
+            SourceBuf::Vec(v) => v,
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.as_bytes().len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.as_bytes().is_empty()
+    }
+}
+
+impl std::ops::Deref for SourceBuf {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl AsRef<[u8]> for SourceBuf {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+/// Read a file into a zero-copy buffer (mmap for large files, Vec for small).
+pub fn read_file(path: &Utf8Path) -> Result<SourceBuf> {
     use std::fs::File;
     let file =
         File::open(path.as_std_path()).map_err(|_| AstroError::file_not_found(path.as_str()))?;
     let metadata = file.metadata()?;
 
     if metadata.len() == 0 {
-        return Ok(Vec::new());
+        return Ok(SourceBuf::Vec(Vec::new()));
     }
 
     if metadata.len() > MAX_FILE_SIZE {
@@ -59,15 +102,15 @@ pub fn read_file(path: &Utf8Path) -> Result<Vec<u8>> {
         ));
     }
 
-    // Use mmap for files > 64KB
+    // Use mmap for files > 64KB (zero-copy via SourceBuf::Mmap)
     if metadata.len() > 65536 {
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        Ok(mmap.to_vec())
+        Ok(SourceBuf::Mmap(mmap))
     } else {
         use std::io::Read;
         let mut buf = Vec::with_capacity(metadata.len() as usize);
         let mut reader = std::io::BufReader::new(file);
         reader.read_to_end(&mut buf)?;
-        Ok(buf)
+        Ok(SourceBuf::Vec(buf))
     }
 }

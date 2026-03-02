@@ -73,9 +73,8 @@ pub fn collect_files(dir: &Path, glob_pattern: Option<&str>) -> Result<Vec<std::
 fn find_refs_in_file(symbol_name: &str, path: &camino::Utf8Path) -> Result<Vec<SymbolReference>> {
     let source = parser::read_file(path)?;
 
-    // Quick text check: skip if symbol name not in source
-    let source_str = std::str::from_utf8(&source).unwrap_or("");
-    if !source_str.contains(symbol_name) {
+    // Quick byte-level check: skip if symbol name not in source (SIMD-accelerated)
+    if memchr::memmem::find(&source, symbol_name.as_bytes()).is_none() {
         return Ok(Vec::new());
     }
 
@@ -252,6 +251,7 @@ fn extract_line_context(source: &[u8], row: usize) -> String {
 
 /// Search for references to *all* symbol names in a single directory walk.
 /// Returns a map from symbol name to its references.
+/// Uses Aho-Corasick automaton for efficient multi-pattern pre-filtering.
 pub fn find_references_batch(
     symbol_names: &[String],
     dir: &Path,
@@ -263,13 +263,17 @@ pub fn find_references_batch(
         return Ok(HashMap::new());
     }
 
+    // Build Aho-Corasick automaton once, share across all files
+    let ac = aho_corasick::AhoCorasick::new(symbol_names)
+        .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))?;
+
     let files = collect_files(dir, glob_pattern)?;
 
     let per_file: Vec<HashMap<String, Vec<SymbolReference>>> = files
         .par_iter()
         .filter_map(|path| {
             let utf8_path = camino::Utf8Path::new(path.to_str()?);
-            find_refs_batch_in_file(symbol_names, utf8_path).ok()
+            find_refs_batch_in_file(symbol_names, &ac, utf8_path).ok()
         })
         .collect();
 
@@ -299,24 +303,30 @@ pub fn find_references_batch(
 }
 
 /// Find references to multiple symbols in a single file (one parse).
+/// Uses a pre-built Aho-Corasick automaton for O(file_size) multi-pattern filtering.
 fn find_refs_batch_in_file(
     symbol_names: &[String],
+    ac: &aho_corasick::AhoCorasick,
     path: &camino::Utf8Path,
 ) -> Result<std::collections::HashMap<String, Vec<SymbolReference>>> {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     let source = parser::read_file(path)?;
-    let source_str = std::str::from_utf8(&source).unwrap_or("");
 
-    // Quick text filter: only keep symbols that appear in this file
-    let present: Vec<&String> = symbol_names
-        .iter()
-        .filter(|name| source_str.contains(name.as_str()))
-        .collect();
+    // Multi-pattern pre-filter: find which symbols appear in this file (one pass)
+    let mut present_indices: HashSet<usize> = HashSet::new();
+    for mat in ac.find_overlapping_iter(source.as_bytes()) {
+        present_indices.insert(mat.pattern().as_usize());
+        if present_indices.len() == symbol_names.len() {
+            break; // All patterns found
+        }
+    }
 
-    if present.is_empty() {
+    if present_indices.is_empty() {
         return Ok(HashMap::new());
     }
+
+    let present: Vec<&String> = present_indices.iter().map(|&i| &symbol_names[i]).collect();
 
     let (tree, lang_id) = parser::parse_file(path, &source)?;
     let root = tree.root_node();

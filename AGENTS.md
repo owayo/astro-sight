@@ -28,11 +28,11 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/cli.rs` - CLI サブコマンド定義（ast, symbols, calls, refs, context, imports, lint, sequence, cochange, doctor, session, mcp, init）
 - `src/main.rs` - コマンドディスパッチ、キャッシュ層、バッチ処理（全て AppService 経由）
 - `src/mcp/mod.rs` - MCP サーバー（AstroSightServer + AppService::sandboxed(cwd) + 11 ツール）
-- `src/engine/parser.rs` - tree-sitter パーサー管理（100MB ファイルサイズ上限）
+- `src/engine/parser.rs` - tree-sitter パーサー管理（100MB ファイルサイズ上限、SourceBuf によるゼロコピー mmap）
 - `src/engine/extractor.rs` - AST ノード抽出
 - `src/engine/symbols.rs` - シンボル抽出（tree-sitter クエリ）
 - `src/engine/calls.rs` - コールグラフ抽出（言語別 call expression クエリ）
-- `src/engine/refs.rs` - クロスファイル参照検索（ignore + rayon 並列 + `find_references_batch` バッチ検索 + `collect_files` pub ユーティリティ）
+- `src/engine/refs.rs` - クロスファイル参照検索（ignore + rayon 並列 + memchr/memmem 事前フィルタ + Aho-Corasick バッチ検索 + `collect_files` pub ユーティリティ）
 - `src/engine/diff.rs` - unified diff パーサー
 - `src/engine/impact.rs` - 影響分析オーケストレーター（2パス方式: collect affected → batch refs）
 - `src/engine/sequence.rs` - コールグラフから Mermaid シーケンス図を生成
@@ -42,7 +42,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/engine/snippet.rs` - コンテキストスニペット生成
 - `src/models/` - Request/Response/AST ノード/Call/Reference/Impact/Sequence/Import/Lint/CoChange 型定義
 - `src/error.rs` - AstroError + ErrorCode（PathOutOfBounds 含む）
-- `src/cache/store.rs` - content-addressed キャッシュ
+- `src/cache/store.rs` - content-addressed キャッシュ（dirs::cache_dir() による OS 標準パス）
 - `src/session/mod.rs` - NDJSON セッション処理（生行サイズで100MB上限）
 - `src/language.rs` - 言語検出（拡張子/shebang）
 
