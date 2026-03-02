@@ -129,7 +129,7 @@ fn is_within(ns: Point, ne: Point, rs: Point, re: Point) -> bool {
 /// Remove common leading whitespace from multi-line text.
 fn dedent(s: &str) -> String {
     if !s.contains('\n') {
-        return s.to_string();
+        return s.replace('\t', " ");
     }
     let lines: Vec<&str> = s.lines().collect();
     let min_indent = lines
@@ -140,7 +140,7 @@ fn dedent(s: &str) -> String {
         .min()
         .unwrap_or(0);
     if min_indent == 0 {
-        return s.to_string();
+        return s.replace('\t', " ");
     }
     let mut result = String::with_capacity(s.len());
     for (i, line) in lines.iter().enumerate() {
@@ -155,7 +155,7 @@ fn dedent(s: &str) -> String {
             result.push_str(line.trim_start());
         }
     }
-    result
+    result.replace('\t', " ")
 }
 
 fn node_to_ast(node: Node<'_>, source: &[u8], remaining_depth: usize) -> AstNode {
