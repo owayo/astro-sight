@@ -98,6 +98,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 name = "astro-sight"
 version = "26.3.100"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "blake3",
  "camino",
@@ -106,6 +107,7 @@ dependencies = [
  "ignore",
  "libc",
  "logroller",
+ "memchr",
  "memmap2",
  "rayon",
  "rmcp",

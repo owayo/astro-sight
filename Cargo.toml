@@ -14,7 +14,9 @@ anyhow = "1.0.102"
 blake3 = "1.8.3"
 camino = { version = "1.2.2", features = ["serde1"] }
 clap = { version = "4.5.60", features = ["derive"] }
+aho-corasick = "1.1.4"
 ignore = "0.4.25"
+memchr = "2.8.0"
 memmap2 = "0.9.10"
 rayon = "1.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
