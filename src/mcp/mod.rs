@@ -240,9 +240,13 @@ impl AstroSightServer {
         params: Parameters<RefsSearchParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
+        let name = p.name.trim();
+        if name.is_empty() {
+            return Err(McpError::invalid_params("name must not be empty", None));
+        }
         Self::to_tool_result(
             self.service
-                .find_references(&p.name, &p.dir, p.glob.as_deref()),
+                .find_references(name, &p.dir, p.glob.as_deref()),
         )
     }
 
@@ -255,8 +259,20 @@ impl AstroSightServer {
         params: Parameters<RefsBatchSearchParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
+        let filtered: Vec<String> = p
+            .names
+            .iter()
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .collect();
+        if filtered.is_empty() {
+            return Err(McpError::invalid_params(
+                "names must contain at least one non-empty symbol name",
+                None,
+            ));
+        }
         Self::to_tool_result(self.service.find_references_batch(
-            &p.names,
+            &filtered,
             &p.dir,
             p.glob.as_deref(),
         ))
