@@ -390,7 +390,7 @@ fn cmd_ast(service: &AppService, opts: &CmdAstOpts<'_>) -> Result<()> {
     }
     let mode = if opts.full { "full" } else { "compact" };
     let cache_key = format!(
-        "ast_{}_{}_{}_{}_{}_{}_{}",
+        "v2_ast_{}_{}_{}_{}_{}_{}_{}",
         opt_key(opts.line),
         opt_key(opts.col),
         opt_key(opts.end_line),
@@ -480,9 +480,9 @@ fn cmd_symbols(
     let cache_key = if full {
         "symbols_full"
     } else if doc {
-        "symbols_doc"
+        "v2_symbols_doc"
     } else {
-        "symbols"
+        "v2_symbols"
     };
 
     if use_cache
@@ -527,7 +527,11 @@ fn cmd_symbols(
 
 fn cmd_calls(service: &AppService, path: &str, function: Option<&str>, pretty: bool) -> Result<()> {
     let result = service.extract_calls(path, function)?;
-    let output = serialize_output(&result, pretty)?;
+    let output = if pretty {
+        serialize_output(&result, true)?
+    } else {
+        serialize_output(&result.to_compact(), false)?
+    };
     info!(command = "calls", path = path, function = ?function, output_bytes = output.len(), "command completed");
     println!("{output}");
     Ok(())
@@ -814,7 +818,8 @@ fn batch_symbols(
 fn batch_calls(service: &AppService, paths: &[String], function: Option<&str>) -> Result<()> {
     let func = function.map(|s| s.to_string());
     batch_ndjson(paths, |p| match service.extract_calls(p, func.as_deref()) {
-        Ok(result) => serde_json::to_string(&result).unwrap_or_else(|e| make_error_line(&e.into())),
+        Ok(result) => serde_json::to_string(&result.to_compact())
+            .unwrap_or_else(|e| make_error_line(&e.into())),
         Err(e) => make_error_line(&e),
     })
 }
@@ -884,7 +889,7 @@ fn handle_request(
         }
         Command::Calls => {
             let result = service.extract_calls(&req.path, req.function.as_deref())?;
-            Ok(serde_json::to_value(result)?)
+            Ok(serde_json::to_value(result.to_compact())?)
         }
         Command::Refs => {
             let dir = req.dir.as_deref().unwrap_or(".");

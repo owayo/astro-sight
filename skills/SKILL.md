@@ -64,7 +64,7 @@ astro-sight refs --name <symbol_name> --dir <directory> --glob "**/*.rs"
 astro-sight refs --names sym1,sym2,sym3 --dir <directory>
 ```
 
-Output: `references` array with `path`, `line`, `column`, `context` (source line), `kind` ("definition" or "reference"). No need to Read files afterward — `context` already shows the source line. Batch mode (`--names`) outputs NDJSON with one `{"symbol":..., "references":[...]}` per line.
+Output: `refs` array with `path`, `ln`, `col`, `ctx` (source line), `kind` (`"def"` or `"ref"`). No need to Read files afterward — `ctx` already shows the source line. Batch mode (`--names`) outputs NDJSON with one `{"symbol":..., "refs":[...]}` per line.
 
 ### `calls` — Call Graph Extraction
 
@@ -78,7 +78,7 @@ astro-sight calls --path <file>
 astro-sight calls --path <file> --function <function_name>
 ```
 
-Output: `calls` array with `caller`, `callee`, and `call_site` (line + column).
+Output (compact): `calls` array grouped by `caller` (string), each with `range` and `callees` array (`name`, `ln`, `col`). Use `--pretty` for full format.
 
 ### `context` — Diff Impact Analysis
 
@@ -111,7 +111,7 @@ astro-sight imports --path <file>
 astro-sight imports --paths src/main.rs,src/lib.rs
 ```
 
-Output: `imports` array with `source`, `line`, `kind` (Import/Use/Include/Require), `context`.
+Output: `imports` array with `src`, `ln`, `kind` (Import/Use/Include/Require), `ctx`.
 
 ### `symbols` — Symbol Extraction
 
@@ -217,8 +217,8 @@ git diff origin/main | astro-sight context --dir .
 ## Notes
 
 - 14 languages: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash
-- All output is JSON
-- `refs` results include `context` (source line) — no need to Read files afterward
+- All output is compact JSON (short keys: `lang`, `ln`, `col`, `ctx`, `refs`, `src`, `def`/`ref`, `fn` etc.)
+- `refs` results include `ctx` (source line) — no need to Read files afterward
 - `refs` respects `.gitignore` and uses parallel scanning
 - Multiple symbol searches: use `refs --names` for batching (or `session` for mixed commands)
 - **Input validation**: Empty `--name`/`--names`, empty `--paths`/`--paths-file` are rejected with `INVALID_REQUEST` error

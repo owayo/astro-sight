@@ -35,9 +35,11 @@ fn ast_on_own_source() {
     assert!(output.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    assert_eq!(json["language"], "rust");
+    assert_eq!(json["lang"], "rust");
     assert!(!json["ast"].as_array().unwrap().is_empty());
     assert!(json["schema"]["range"].as_str().is_some());
+    // compact: path instead of location, lang instead of language
+    assert!(json["path"].as_str().is_some());
     // compact: range is [sL,sC,eL,eC] array, no id/named
     let first = &json["ast"][0];
     assert!(first["range"].as_array().is_some());
@@ -80,7 +82,7 @@ fn ast_full_file() {
     assert!(output.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    assert_eq!(json["language"], "rust");
+    assert_eq!(json["lang"], "rust");
     assert!(!json["ast"].as_array().unwrap().is_empty());
 }
 
@@ -93,7 +95,8 @@ fn symbols_on_own_source() {
     assert!(output.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    assert_eq!(json["language"], "rust");
+    assert_eq!(json["lang"], "rust");
+    assert!(json["path"].as_str().is_some());
 
     let symbols = json["symbols"].as_array().unwrap();
     assert!(!symbols.is_empty());
@@ -101,12 +104,12 @@ fn symbols_on_own_source() {
     // Should find the main function
     let main_fn = symbols.iter().find(|s| s["name"] == "main");
     assert!(main_fn.is_some(), "Should find main function");
-    assert_eq!(main_fn.unwrap()["kind"], "function");
+    assert_eq!(main_fn.unwrap()["kind"], "fn");
 
-    // Compact output: has line, no range/hash
+    // Compact output: has ln, no range/hash
     assert!(
-        main_fn.unwrap().get("line").is_some(),
-        "Compact output should have line field"
+        main_fn.unwrap().get("ln").is_some(),
+        "Compact output should have ln field"
     );
     assert!(
         main_fn.unwrap().get("range").is_none(),
@@ -262,7 +265,7 @@ fn no_cache_flag() {
     assert!(output.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    assert_eq!(json["language"], "rust");
+    assert_eq!(json["lang"], "rust");
 }
 
 #[test]
@@ -278,17 +281,21 @@ fn calls_on_own_source() {
         json.get("version").is_none(),
         "calls should not have version"
     );
-    assert_eq!(json["language"], "rust");
+    assert_eq!(json["lang"], "rust");
 
     let calls = json["calls"].as_array().unwrap();
-    assert!(!calls.is_empty(), "Should find call edges in main.rs");
+    assert!(!calls.is_empty(), "Should find call groups in main.rs");
 
-    // Should find a call from main to some function
-    let main_calls: Vec<_> = calls
-        .iter()
-        .filter(|c| c["caller"]["name"] == "main")
-        .collect();
-    assert!(!main_calls.is_empty(), "main should call other functions");
+    // Compact: calls are grouped by caller
+    let main_group = calls.iter().find(|c| c["caller"] == "main");
+    assert!(main_group.is_some(), "main should have a call group");
+    assert!(
+        !main_group.unwrap()["callees"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "main should call other functions"
+    );
 }
 
 #[test]
@@ -302,9 +309,9 @@ fn calls_with_function_filter() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
     let calls = json["calls"].as_array().unwrap();
 
-    // All callers should be cmd_ast
+    // Compact: all caller groups should be cmd_ast
     for call in calls {
-        assert_eq!(call["caller"]["name"], "cmd_ast");
+        assert_eq!(call["caller"], "cmd_ast");
     }
 }
 
@@ -323,14 +330,14 @@ fn refs_finds_symbol() {
     );
     assert_eq!(json["symbol"], "AstgenResponse");
 
-    let refs = json["references"].as_array().unwrap();
+    let refs = json["refs"].as_array().unwrap();
     assert!(
         refs.len() >= 2,
         "Should find AstgenResponse in multiple files"
     );
 
     // Should have at least one definition
-    let defs: Vec<_> = refs.iter().filter(|r| r["kind"] == "definition").collect();
+    let defs: Vec<_> = refs.iter().filter(|r| r["kind"] == "def").collect();
     assert!(!defs.is_empty(), "Should find definition of AstgenResponse");
 }
 
@@ -351,7 +358,7 @@ fn refs_with_glob_filter() {
     assert!(output.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    let refs = json["references"].as_array().unwrap();
+    let refs = json["refs"].as_array().unwrap();
     assert!(!refs.is_empty());
 }
 
@@ -434,13 +441,13 @@ fn session_ndjson_calls() {
     let lines: Vec<&str> = stdout.trim().lines().collect();
     assert_eq!(lines.len(), 2, "Should have 2 NDJSON response lines");
 
-    // First: calls response
+    // First: calls response (compact: grouped by caller)
     let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
     assert!(first["calls"].is_array());
 
     // Second: refs response
     let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
-    assert!(second["references"].is_array());
+    assert!(second["refs"].is_array());
 }
 
 // ---- New tests: compact/pretty, --diff, batch, MCP ----
@@ -805,7 +812,7 @@ fn imports_on_own_source() {
     assert!(output.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    assert_eq!(json["language"], "rust");
+    assert_eq!(json["lang"], "rust");
 
     let imports = json["imports"].as_array().unwrap();
     assert!(!imports.is_empty(), "Should find imports in main.rs");
@@ -860,7 +867,7 @@ fn lint_with_pattern_rule() {
     assert!(output.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    assert_eq!(json["language"], "rust");
+    assert_eq!(json["lang"], "rust");
     let matches = json["matches"].as_array().unwrap();
     assert!(!matches.is_empty(), "Should find unwrap pattern");
     assert_eq!(matches[0]["rule_id"], "no-unwrap");
@@ -897,7 +904,7 @@ fn lint_with_query_rule() {
     assert!(output.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    assert_eq!(json["language"], "rust");
+    assert_eq!(json["lang"], "rust");
     let matches = json["matches"].as_array().unwrap();
     assert!(!matches.is_empty(), "Should find function definitions");
 
@@ -915,7 +922,7 @@ fn sequence_on_own_source() {
     assert!(output.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    assert_eq!(json["language"], "rust");
+    assert_eq!(json["lang"], "rust");
     assert!(!json["participants"].as_array().unwrap().is_empty());
     assert!(
         json["diagram"]
@@ -1140,11 +1147,11 @@ fn refs_batch_names() {
 
     let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(first["symbol"], "AppService");
-    assert!(!first["references"].as_array().unwrap().is_empty());
+    assert!(!first["refs"].as_array().unwrap().is_empty());
 
     let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
     assert_eq!(second["symbol"], "AstgenResponse");
-    assert!(!second["references"].as_array().unwrap().is_empty());
+    assert!(!second["refs"].as_array().unwrap().is_empty());
 }
 
 #[test]

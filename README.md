@@ -45,7 +45,7 @@ astro-sight ast --path src/main.rs --line 10 --col 0 --depth 5 --context 5
 ### symbols - シンボル抽出
 
 ```bash
-# ファイル内の関数・構造体・クラス等を一覧（compact: name, kind, line のみ）
+# ファイル内の関数・構造体・クラス等を一覧（compact: name, kind(短縮形), ln のみ）
 astro-sight symbols --path src/main.rs
 
 # docstring 付き compact 出力
@@ -71,19 +71,24 @@ astro-sight calls --path src/main.rs
 astro-sight calls --path src/main.rs --function cmd_ast
 ```
 
-出力例:
+compact 出力例（caller でグルーピング）:
 ```json
 {
-  "language": "rust",
+  "lang": "rust",
   "calls": [
     {
-      "caller": { "name": "cmd_ast", "range": {...} },
-      "callee": { "name": "read_file", "range": {...} },
-      "call_site": { "line": 63, "column": 24 }
+      "caller": "cmd_ast",
+      "range": [63, 0, 120, 1],
+      "callees": [
+        { "name": "read_file", "ln": 65, "col": 24 },
+        { "name": "CacheStore::hash", "ln": 66, "col": 16 }
+      ]
     }
   ]
 }
 ```
+
+`--pretty` で従来のフルフォーマット（caller/callee オブジェクト + call_site）を出力。
 
 ### refs - クロスファイル参照検索
 
@@ -104,9 +109,9 @@ astro-sight refs --names "AppService,AstgenResponse" --dir src/
 ```json
 {
   "symbol": "extract_symbols",
-  "references": [
-    { "path": "src/engine/symbols.rs", "line": 9, "column": 7, "context": "pub fn extract_symbols(...)", "kind": "definition" },
-    { "path": "src/main.rs", "line": 156, "column": 24, "context": "let syms = symbols::extract_symbols(...)", "kind": "reference" }
+  "refs": [
+    { "path": "src/engine/symbols.rs", "ln": 9, "col": 7, "ctx": "pub fn extract_symbols(...)", "kind": "def" },
+    { "path": "src/main.rs", "ln": 156, "col": 24, "ctx": "let syms = symbols::extract_symbols(...)", "kind": "ref" }
   ]
 }
 ```
@@ -312,21 +317,24 @@ $ astro-sight ast --path nonexistent.rs
 
 ## Output Format
 
-全コマンドの出力はデフォルト compact JSON（`--pretty` で整形）。主要フィールド:
+全コマンドの出力はデフォルト compact JSON（`--pretty` で整形）。compact モードではトークン削減のためキー名を短縮:
 
+- `language` → `lang`（calls, imports, lint, sequence, compact ast/symbols）
+- `location` → `path`（compact ast/symbols）
+- `references` → `refs`、`line` → `ln`、`column` → `col`、`context` → `ctx`（refs）
+- `source` → `src`（imports）
+- `kind`: `"definition"` → `"def"`、`"reference"` → `"ref"`（refs）
+- `SymbolKind`: `"function"` → `"fn"`、`"interface"` → `"iface"`、`"variable"` → `"var"` 等（compact symbols）
+- `calls`: caller でグルーピング、callee は `{name, ln, col}` に簡略化
+
+compact 出力例（ast/symbols）:
 ```json
-{
-  "location": { "path": "src/main.rs", "line": 10, "column": 0 },
-  "language": "rust",
-  "hash": "blake3-content-hash",
-  "ast": [...],
-  "symbols": [...],
-  "snippet": ">10 | fn main() {\n 11 |     ...",
-  "diagnostics": []
-}
+{"path":"src/main.rs","lang":"rust","schema":{"range":"[startLine,startCol,endLine,endCol]"},"ast":[...]}
+{"path":"src/main.rs","lang":"rust","symbols":[{"name":"main","kind":"fn","ln":20}]}
 ```
 
-`version` フィールドは `doctor` と MCP `initialize` 応答のみ。`ast` / `symbols` / `calls` / `refs` / `context` など通常コマンドでは省略される。
+`--full`/`--pretty` で従来のフルフォーマット（`location`, `language`, `hash`, `range` 等）を出力。
+`version` フィールドは `doctor` と MCP `initialize` 応答のみ。
 
 ## Cache
 
