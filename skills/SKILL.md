@@ -1,6 +1,6 @@
 ---
 name: astro-sight
-description: "STOP before using Grep for code identifiers (including pipe-separated patterns like FOO|Bar). Use `astro-sight refs` — AST-based, zero false positives. Use `symbols` to understand file structure. Use `git diff | astro-sight context` before editing code. 14 languages."
+description: "STOP before using Grep for code identifiers (including pipe-separated patterns like FOO|Bar). Use `astro-sight refs` — AST-based, zero false positives. Use `symbols` to understand file structure. Use `git diff | astro-sight context` before editing code. 15 languages."
 ---
 
 # astro-sight
@@ -216,7 +216,7 @@ git diff origin/main | astro-sight context --dir .
 
 ## Notes
 
-- 14 languages: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash
+- 15 languages: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby
 - All output is compact JSON (short keys: `lang`, `ln`, `col`, `ctx`, `refs`, `src`, `def`/`ref`, `fn` etc.)
 - `refs` results include `ctx` (source line) — no need to Read files afterward
 - `refs` respects `.gitignore` and uses parallel scanning

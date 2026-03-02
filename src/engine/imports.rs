@@ -69,6 +69,7 @@ fn find_import_statement(node: Node<'_>) -> Node<'_> {
         "using_directive",
         "import_header",
         "call_expression", // for require() calls
+        "call",            // for Ruby require/require_relative
     ];
     let mut current = Some(node);
     while let Some(n) = current {
@@ -160,5 +161,14 @@ fn import_query(lang_id: LangId) -> (&'static str, ImportKind) {
             ImportKind::Import,
         ),
         LangId::Bash => ("", ImportKind::Import), // Not supported
+        LangId::Ruby => (
+            r#"
+            (call
+              method: (identifier) @fn_name
+              arguments: (argument_list (string) @import.source)
+              (#match? @fn_name "^(require|require_relative)$"))
+            "#,
+            ImportKind::Require,
+        ),
     }
 }

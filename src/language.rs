@@ -20,6 +20,7 @@ pub enum LangId {
     #[serde(rename = "csharp")]
     CSharp,
     Bash,
+    Ruby,
 }
 
 impl std::fmt::Display for LangId {
@@ -39,6 +40,7 @@ impl std::fmt::Display for LangId {
             Self::Swift => "swift",
             Self::CSharp => "csharp",
             Self::Bash => "bash",
+            Self::Ruby => "ruby",
         };
         write!(f, "{s}")
     }
@@ -70,6 +72,7 @@ impl LangId {
             "swift" => Ok(Self::Swift),
             "cs" => Ok(Self::CSharp),
             "sh" | "bash" | "zsh" => Ok(Self::Bash),
+            "rb" | "rake" | "gemspec" => Ok(Self::Ruby),
             other => {
                 if other.is_empty() {
                     Err(AstroError::unsupported_language("<no extension>"))
@@ -98,6 +101,8 @@ impl LangId {
             Some(Self::Swift)
         } else if line.contains("bash") || line.contains("/sh") || line.contains("zsh") {
             Some(Self::Bash)
+        } else if line.contains("ruby") {
+            Some(Self::Ruby)
         } else {
             None
         }
@@ -123,6 +128,7 @@ impl LangId {
             Self::Swift => Language::new(tree_sitter_swift::LANGUAGE),
             Self::CSharp => Language::new(tree_sitter_c_sharp::LANGUAGE),
             Self::Bash => Language::new(tree_sitter_bash::LANGUAGE),
+            Self::Ruby => Language::new(tree_sitter_ruby::LANGUAGE),
         }
     }
 }
@@ -208,6 +214,14 @@ mod tests {
         assert_eq!(
             LangId::from_path(Utf8Path::new("deploy.sh")).unwrap(),
             LangId::Bash
+        );
+    }
+
+    #[test]
+    fn detect_ruby() {
+        assert_eq!(
+            LangId::from_path(Utf8Path::new("app.rb")).unwrap(),
+            LangId::Ruby
         );
     }
 

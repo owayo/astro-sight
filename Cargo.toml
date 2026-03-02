@@ -38,6 +38,7 @@ tree-sitter-kotlin = "=0.3.5"
 tree-sitter-swift = "0.7.1"
 tree-sitter-c-sharp = "0.23.1"
 tree-sitter-bash = "0.25.1"
+tree-sitter-ruby = { git = "https://github.com/owayo/tree-sitter-ruby.git", branch = "master" }
 tree-sitter-html = "0.23.2"
 tree-sitter-css = "0.25"
 rmcp = { version = "0.17", features = ["server", "macros", "transport-io"] }

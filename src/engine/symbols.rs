@@ -254,5 +254,15 @@ fn symbol_query(lang_id: LangId) -> &'static str {
             (function_definition name: (word) @function.name)
             "#
         }
+        LangId::Ruby => {
+            r#"
+            (method name: (_) @function.name)
+            (singleton_method name: (_) @function.name)
+            (class name: (constant) @class.name)
+            (class name: (scope_resolution name: (_) @class.name))
+            (module name: (constant) @module.name)
+            (module name: (scope_resolution name: (_) @module.name))
+            "#
+        }
     }
 }

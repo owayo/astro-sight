@@ -32,6 +32,7 @@ pub fn run_doctor() -> DoctorReport {
         LangId::Swift,
         LangId::CSharp,
         LangId::Bash,
+        LangId::Ruby,
     ];
 
     let statuses: Vec<LanguageStatus> = languages
