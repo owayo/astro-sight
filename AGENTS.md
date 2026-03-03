@@ -26,7 +26,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/skill.rs` - スキルインストール（`skill-install claude/codex` → ~/.claude/skills/ or ~/.codex/skills/）
 - `src/config.rs` - 設定ファイル管理（ConfigService: load/generate、TOML 形式）
 - `src/logger.rs` - ロギング（logroller 日次ローテーション、3日保持、tracing-subscriber）
-- `src/cli.rs` - CLI サブコマンド定義（ast, symbols, calls, refs, context, imports, lint, sequence, cochange, doctor, session, mcp, init）
+- `src/cli.rs` - CLI サブコマンド定義（ast, symbols, calls, refs, context, impact, imports, lint, sequence, cochange, doctor, session, mcp, init）
 - `src/main.rs` - コマンドディスパッチ、キャッシュ層、バッチ処理（全て AppService 経由）
 - `src/mcp/mod.rs` - MCP サーバー（AstroSightServer + AppService::sandboxed(cwd) + 11 ツール）
 - `src/engine/parser.rs` - tree-sitter パーサー管理（100MB ファイルサイズ上限、SourceBuf によるゼロコピー mmap）
