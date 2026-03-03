@@ -113,7 +113,8 @@ fn collect_identifier_refs(
         || kind == "namespace_identifier"
         || kind == "package_identifier"
         || kind == "name"
-        || kind == "word";
+        || kind == "word"
+        || kind == "constant"; // Ruby: class/module/constant names
 
     if is_identifier
         && let Ok(text) = node.utf8_text(source)
@@ -366,7 +367,8 @@ fn collect_identifier_refs_batch(
         || kind == "namespace_identifier"
         || kind == "package_identifier"
         || kind == "name"
-        || kind == "word";
+        || kind == "word"
+        || kind == "constant"; // Ruby: class/module/constant names
 
     if is_identifier && let Ok(text) = node.utf8_text(source) {
         for name in symbol_names {
