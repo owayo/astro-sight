@@ -196,7 +196,7 @@ jobs:
           body: |
             ## astro-sight ${{ needs.prepare-release.outputs.version }}
 
-            AI エージェント向け AST 情報生成 CLI (tree-sitter ベース、14言語対応)
+            AI エージェント向け AST 情報生成 CLI (tree-sitter ベース、15言語対応)
 
             ### Installation
 
