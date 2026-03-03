@@ -15,6 +15,7 @@ description: "STOP before using Grep for code identifiers (including pipe-separa
 - Need to **understand a directory's structure**? → `astro-sight symbols --dir <dir>`
 - Need to know **who calls a function** or **what a function calls**? → `astro-sight calls`
 - Want to know **what a code change breaks**? → `astro-sight context --dir . --git`
+- Want to detect **unresolved impacts after editing**? → `astro-sight impact --dir . --git`
 - Need to see **what a file imports**? → `astro-sight imports`
 - Need a **visual call flow diagram**? → `astro-sight sequence`
 - Need to find **files that usually change together**? → `astro-sight cochange`
@@ -99,6 +100,23 @@ git diff | astro-sight context --dir .
 ```
 
 Output: `changes` array per file with `affected_symbols`, `signature_changes`, `impacted_callers`.
+
+### `impact` — Unresolved Impact Detection (Stop Hook)
+
+Detects unresolved impacts after code changes. Uses `context` internally, then checks if impacted callers are in files NOT included in the diff. Designed for AI agent stop hooks.
+
+```bash
+# Auto-run git diff (recommended)
+astro-sight impact --dir . --git
+
+# Staged changes
+astro-sight impact --dir . --git --staged
+
+# Pipe from stdin
+git diff | astro-sight impact --dir .
+```
+
+Exit codes: `0` = no unresolved impacts (silent), `1` = unresolved impacts found (stderr text output).
 
 ### `imports` — Import/Export Extraction
 
@@ -193,6 +211,11 @@ astro-sight refs --names FOO,Bar,baz --dir .
 ### "Before editing code" (run FIRST)
 ```bash
 astro-sight context --dir . --git
+```
+
+### "After editing code" (check unresolved impacts)
+```bash
+astro-sight impact --dir . --git
 ```
 
 ### "How does this module work?"

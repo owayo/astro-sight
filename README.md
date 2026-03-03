@@ -182,6 +182,43 @@ astro-sight context --dir . --diff-file /tmp/changes.diff
 }
 ```
 
+### impact - 未解決の影響検出（stop hook 用）
+
+`context` の結果から、diff に含まれないファイルへの影響を「未解決」と判定する。AI エージェントの stop hook で使用し、未対応の影響先があればブロックして続行を促す。
+
+```bash
+# git diff を自動取得して未解決影響を検出（推奨）
+astro-sight impact --dir . --git
+
+# ステージ済み変更を検査
+astro-sight impact --dir . --git --staged
+
+# カスタムベースを指定
+astro-sight impact --dir . --git --base HEAD~3
+
+# stdin からパイプ
+git diff HEAD~1 | astro-sight impact --dir .
+```
+
+- 未解決なし → exit 0（出力なし）
+- 未解決あり → stderr にテキスト出力 + exit 1
+
+出力例（exit 1 時）:
+```
+Unresolved impacts found:
+
+src/engine/symbols.rs changed [extract_symbols]:
+  → src/service.rs:89
+  → src/main.rs:42
+```
+
+claw-hooks との連携例（`.claw-hooks.toml`）:
+```toml
+[[stop_hooks]]
+commands = ["astro-sight impact --git --dir ."]
+condition = { command_exists = "astro-sight" }
+```
+
 ### doctor - 対応言語チェック
 
 ```bash
@@ -385,6 +422,7 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 
 ## Workflow Rules
 - **Before editing code**: Run `astro-sight context --dir . --git` to check impact
+- **After editing code**: Run `astro-sight impact --dir . --git` to detect unresolved impacts
 - **Understanding a file**: Run `astro-sight symbols --path <file>` to see structure
 - **Understanding a directory**: Run `astro-sight symbols --dir <dir>` to see all symbols
 - **Finding symbol usage**: Run `astro-sight refs` (Grep FORBIDDEN)
@@ -398,6 +436,7 @@ astro-sight symbols --path <file>                  # File structure overview
 astro-sight symbols --dir <dir>                    # Directory structure overview (NDJSON)
 astro-sight calls --path <file> --function <name>  # Caller/callee relationships
 astro-sight context --dir . --git                  # Change impact analysis (run BEFORE editing code)
+astro-sight impact --dir . --git                   # Detect unresolved impacts (run AFTER editing code)
 astro-sight imports --path <file>                  # Import relationships
 astro-sight sequence --path <file>                 # Call flow visualization
 astro-sight cochange --dir .                       # Co-change patterns

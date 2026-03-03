@@ -176,6 +176,25 @@ pub enum Commands {
         staged: bool,
     },
 
+    /// Detect unresolved change impacts (for stop hooks)
+    Impact {
+        /// Workspace directory
+        #[arg(short, long)]
+        dir: String,
+
+        /// Auto-run git diff to get changes
+        #[arg(long)]
+        git: bool,
+
+        /// Base ref for git diff (default: HEAD)
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+
+        /// Use staged changes (git diff --cached)
+        #[arg(long)]
+        staged: bool,
+    },
+
     /// Extract import/export dependencies from a source file
     Imports {
         /// Path to the source file (single mode)

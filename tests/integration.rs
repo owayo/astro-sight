@@ -1393,3 +1393,93 @@ fn ruby_ast() {
     assert_eq!(json["lang"], "ruby");
     assert!(!json["ast"].as_array().unwrap().is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// impact command tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn impact_clean_pass() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // Empty diff → exit 0, no output
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["impact", "--dir", "."])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn impact");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"")
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("failed to wait");
+    assert!(output.status.success(), "expected exit 0 for empty diff");
+    assert!(output.stdout.is_empty(), "expected no stdout");
+}
+
+#[test]
+fn impact_with_unresolved() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // Diff that changes extract_symbols signature → callers in other files are unresolved
+    let diff = r#"--- a/src/engine/symbols.rs
++++ b/src/engine/symbols.rs
+@@ -9,7 +9,7 @@
+-pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
++pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, flag: bool) -> Result<Vec<Symbol>> {
+     let query_src = symbol_query(lang_id);
+"#;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["impact", "--dir", "."])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn impact");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("failed to wait");
+    assert!(
+        !output.status.success(),
+        "expected exit 1 for unresolved impacts"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Unresolved impacts found"),
+        "expected 'Unresolved impacts found' in stderr, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("extract_symbols"),
+        "expected 'extract_symbols' in stderr, got: {stderr}"
+    );
+}
+
+#[test]
+fn impact_git_mode() {
+    // --git with HEAD base on a clean repo → exit 0 (no diff = no unresolved)
+    let output = cargo_bin()
+        .args(["impact", "--dir", ".", "--git"])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "expected exit 0 for clean git diff"
+    );
+    assert!(output.stdout.is_empty(), "expected no stdout");
+}

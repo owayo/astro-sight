@@ -344,6 +344,12 @@ fn run(cli: Cli) -> Result<()> {
             staged,
             pretty,
         ),
+        Commands::Impact {
+            dir,
+            git,
+            base,
+            staged,
+        } => cmd_impact(&service, &dir, git, &base, staged),
         Commands::Doctor => cmd_doctor(pretty),
         Commands::Session => cmd_session(),
         Commands::Mcp => cmd_mcp(),
@@ -696,6 +702,98 @@ fn cmd_context(
     );
     println!("{output}");
     Ok(())
+}
+
+fn cmd_impact(service: &AppService, dir: &str, git: bool, base: &str, staged: bool) -> Result<()> {
+    let diff_input = if git {
+        run_git_diff(dir, base, staged)?
+    } else {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf
+    };
+
+    if diff_input.trim().is_empty() {
+        return Ok(());
+    }
+
+    let result = service.analyze_context(&diff_input, dir)?;
+
+    // Collect set of changed file paths
+    let changed_paths: std::collections::HashSet<&str> =
+        result.changes.iter().map(|c| c.path.as_str()).collect();
+
+    // Group unresolved impacts: callers in files NOT in the diff
+    type UnresolvedEntry = (Vec<String>, Vec<(String, usize)>);
+    let mut unresolved: std::collections::BTreeMap<String, UnresolvedEntry> =
+        std::collections::BTreeMap::new();
+
+    for change in &result.changes {
+        let symbols: Vec<String> = change
+            .affected_symbols
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        if symbols.is_empty() {
+            continue;
+        }
+
+        for caller in &change.impacted_callers {
+            // Resolve relative path against dir for comparison
+            let caller_abs = if std::path::Path::new(&caller.path).is_relative() {
+                std::path::Path::new(dir)
+                    .join(&caller.path)
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                caller.path.clone()
+            };
+
+            // Check if caller file is NOT in the changed files
+            let in_diff = changed_paths.iter().any(|cp| {
+                let cp_abs = if std::path::Path::new(cp).is_relative() {
+                    std::path::Path::new(dir)
+                        .join(cp)
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    cp.to_string()
+                };
+                // Canonicalize both for reliable comparison
+                match (
+                    std::fs::canonicalize(&caller_abs),
+                    std::fs::canonicalize(&cp_abs),
+                ) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => caller_abs == cp_abs,
+                }
+            });
+
+            if !in_diff {
+                let entry = unresolved
+                    .entry(change.path.clone())
+                    .or_insert_with(|| (symbols.clone(), Vec::new()));
+                entry.1.push((caller.path.clone(), caller.line));
+            }
+        }
+    }
+
+    if unresolved.is_empty() {
+        return Ok(());
+    }
+
+    // Print human-readable output and exit 1
+    eprintln!("Unresolved impacts found:\n");
+    for (changed_path, (symbols, callers)) in &unresolved {
+        eprintln!("{} changed [{}]:", changed_path, symbols.join(", "));
+        for (caller_path, line) in callers {
+            eprintln!("  → {}:{}", caller_path, line);
+        }
+        eprintln!();
+    }
+
+    std::process::exit(1);
 }
 
 fn cmd_doctor(pretty: bool) -> Result<()> {
