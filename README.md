@@ -290,7 +290,7 @@ $ astro-sight ast --path nonexistent.rs
 | <img src="https://img.shields.io/badge/-F05138?logo=swift&logoColor=white" height="16"> Swift | `.swift` | `tree-sitter-swift` | 0.7 |
 | <img src="https://img.shields.io/badge/-512BD4?logo=dotnet&logoColor=white" height="16"> C# | `.cs` | `tree-sitter-c-sharp` | 0.23 |
 | <img src="https://img.shields.io/badge/-4EAA25?logo=gnubash&logoColor=white" height="16"> Bash | `.sh`, `.bash`, `.zsh` | `tree-sitter-bash` | 0.25 |
-| <img src="https://img.shields.io/badge/-CC342D?logo=ruby&logoColor=white" height="16"> Ruby | `.rb`, `.rake`, `.gemspec` | `tree-sitter-ruby` | 0.23 |
+| <img src="https://img.shields.io/badge/-CC342D?logo=ruby&logoColor=white" height="16"> Ruby | `.rb`, `.rake`, `.gemspec` | `tree-sitter-ruby` | [owayo/tree-sitter-ruby](https://github.com/owayo/tree-sitter-ruby) |
 
 全言語で tree-sitter クエリによる精密なシンボル抽出に対応。
 
@@ -304,37 +304,6 @@ $ astro-sight ast --path nonexistent.rs
 > package `tree-sitter v0.26.6`
 > Only one package in the dependency graph may specify the same links value.
 > ```
-
-## tree-sitter Grammar 一覧（crates.io）
-
-### 未対応（tree-sitter 0.26 互換・追加可能）
-
-| Crate | Version | 備考 |
-|-------|---------|------|
-| `tree-sitter-ruby` | 0.23.1 | |
-| `tree-sitter-scala` | 0.24.0 | |
-| `tree-sitter-haskell` | 0.23.1 | |
-| `tree-sitter-lua` | 0.5.0 | |
-| `tree-sitter-elixir` | 0.3.4 | |
-| `tree-sitter-elm` | 5.9.0 | |
-| `tree-sitter-ocaml` | 0.24.2 | `LANGUAGE_OCAML` / `LANGUAGE_OCAML_INTERFACE` |
-| `tree-sitter-r` | 1.2.0 | |
-| `tree-sitter-yaml` | 0.7.2 | |
-| `tree-sitter-zig` | 1.1.2 | |
-| `tree-sitter-html` | 0.23.2 | シンボル抽出の効果薄 |
-| `tree-sitter-css` | 0.25.0 | シンボル抽出の効果薄 |
-| `tree-sitter-json` | 0.24.8 | シンボル抽出の効果薄 |
-| `tree-sitter-md` | 0.5.3 | シンボル抽出の効果薄 |
-| `tree-sitter-regex` | 0.25.0 | 単体ファイルの需要なし |
-| `tree-sitter-sequel` | 0.3.11 | SQL。シンボル抽出の効果薄 |
-
-### 未対応（非互換）
-
-| Crate | Version | 問題 |
-|-------|---------|------|
-| `tree-sitter-toml` | 0.20 | Legacy API（extern C ブリッジ必要） |
-| `tree-sitter-kotlin` | >=0.3.8 | `links = "tree-sitter"` 競合 |
-| `tree-sitter-dart` | 0.0.4 | 旧 API、メンテナンス停止 |
 
 ## Output Format
 
