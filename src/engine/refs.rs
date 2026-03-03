@@ -89,6 +89,7 @@ fn find_refs_in_file(symbol_name: &str, path: &camino::Utf8Path) -> Result<Vec<S
         symbol_name,
         path.as_str(),
         &definition_kinds,
+        lang_id,
         &mut refs,
     );
 
@@ -102,6 +103,7 @@ fn collect_identifier_refs(
     symbol_name: &str,
     path: &str,
     definition_kinds: &[&str],
+    lang_id: LangId,
     refs: &mut Vec<SymbolReference>,
 ) {
     let kind = node.kind();
@@ -120,7 +122,7 @@ fn collect_identifier_refs(
         && let Ok(text) = node.utf8_text(source)
         && text == symbol_name
     {
-        let is_def = is_definition_context(node, definition_kinds);
+        let is_def = is_definition_context(node, definition_kinds, lang_id);
         let context = extract_line_context(source, node.start_position().row);
 
         refs.push(SymbolReference {
@@ -139,12 +141,24 @@ fn collect_identifier_refs(
     // Recurse into children
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_identifier_refs(child, source, symbol_name, path, definition_kinds, refs);
+        collect_identifier_refs(
+            child,
+            source,
+            symbol_name,
+            path,
+            definition_kinds,
+            lang_id,
+            refs,
+        );
     }
 }
 
 /// Check if this identifier node is in a definition context.
-fn is_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bool {
+fn is_definition_context(node: Node<'_>, definition_kinds: &[&str], lang_id: LangId) -> bool {
+    if lang_id == LangId::Ruby {
+        return is_ruby_definition_context(node);
+    }
+
     if let Some(parent) = node.parent() {
         // Check if the parent is a definition node
         if definition_kinds.contains(&parent.kind()) {
@@ -158,6 +172,47 @@ fn is_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bool {
         }
     }
     false
+}
+
+fn is_ruby_definition_context(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+
+    match parent.kind() {
+        "method" | "singleton_method" => parent
+            .child_by_field_name("name")
+            .is_some_and(|name| name.id() == node.id()),
+        "assignment" => parent
+            .child_by_field_name("left")
+            .is_some_and(|left| left.id() == node.id()),
+        "class" | "module" => parent
+            .child_by_field_name("name")
+            .is_some_and(|name| name.id() == node.id()),
+        "scope_resolution" => {
+            let is_name = parent
+                .child_by_field_name("name")
+                .is_some_and(|name| name.id() == node.id());
+            if !is_name {
+                return false;
+            }
+
+            if let Some(grandparent) = parent.parent() {
+                match grandparent.kind() {
+                    "assignment" => grandparent
+                        .child_by_field_name("left")
+                        .is_some_and(|left| left.id() == parent.id()),
+                    "class" | "module" => grandparent
+                        .child_by_field_name("name")
+                        .is_some_and(|name| name.id() == parent.id()),
+                    _ => false,
+                }
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Get node kinds that represent definitions for a language.
@@ -237,7 +292,13 @@ fn definition_node_kinds(lang_id: LangId) -> Vec<&'static str> {
             "enum_declaration",
         ],
         LangId::Bash => vec!["function_definition"],
-        LangId::Ruby => vec!["method", "singleton_method", "class", "module"],
+        LangId::Ruby => vec![
+            "method",
+            "singleton_method",
+            "class",
+            "module",
+            "assignment",
+        ],
     }
 }
 
@@ -343,6 +404,7 @@ fn find_refs_batch_in_file(
         &present,
         path.as_str(),
         &definition_kinds,
+        lang_id,
         &mut result,
     );
 
@@ -356,6 +418,7 @@ fn collect_identifier_refs_batch(
     symbol_names: &[&String],
     path: &str,
     definition_kinds: &[&str],
+    lang_id: LangId,
     refs: &mut std::collections::HashMap<String, Vec<SymbolReference>>,
 ) {
     let kind = node.kind();
@@ -373,7 +436,7 @@ fn collect_identifier_refs_batch(
     if is_identifier && let Ok(text) = node.utf8_text(source) {
         for name in symbol_names {
             if text == name.as_str() {
-                let is_def = is_definition_context(node, definition_kinds);
+                let is_def = is_definition_context(node, definition_kinds, lang_id);
                 let context = extract_line_context(source, node.start_position().row);
 
                 refs.entry(name.to_string())
@@ -396,6 +459,14 @@ fn collect_identifier_refs_batch(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_identifier_refs_batch(child, source, symbol_names, path, definition_kinds, refs);
+        collect_identifier_refs_batch(
+            child,
+            source,
+            symbol_names,
+            path,
+            definition_kinds,
+            lang_id,
+            refs,
+        );
     }
 }

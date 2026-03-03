@@ -1344,6 +1344,44 @@ fn ruby_imports() {
 }
 
 #[test]
+fn ruby_refs_constant_definition() {
+    let output = cargo_bin()
+        .args([
+            "refs",
+            "--name",
+            "DEFAULT_ROLE",
+            "--dir",
+            "tests/fixtures",
+            "--glob",
+            "**/*.rb",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["symbol"], "DEFAULT_ROLE");
+
+    let refs = json["refs"].as_array().unwrap();
+    assert!(
+        refs.len() >= 2,
+        "Should find both definition and reference for DEFAULT_ROLE"
+    );
+
+    let defs: Vec<_> = refs.iter().filter(|r| r["kind"] == "def").collect();
+    assert!(
+        !defs.is_empty(),
+        "Should classify constant assignment as definition"
+    );
+
+    let refs_only: Vec<_> = refs.iter().filter(|r| r["kind"] == "ref").collect();
+    assert!(
+        !refs_only.is_empty(),
+        "Should classify non-assignment constant usage as reference"
+    );
+}
+
+#[test]
 fn ruby_ast() {
     let output = cargo_bin()
         .args(["ast", "--path", "tests/fixtures/sample.rb"])

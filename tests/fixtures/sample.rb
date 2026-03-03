@@ -2,6 +2,8 @@ require "json"
 require_relative "lib/helper"
 
 module MyApp
+  DEFAULT_ROLE = "member"
+
   class User
     def initialize(name, age)
       @name = name
@@ -10,6 +12,7 @@ module MyApp
 
     def greet
       puts "Hello, #{@name}!"
+      puts "Role: #{DEFAULT_ROLE}"
     end
 
     def self.create(name, age)
