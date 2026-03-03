@@ -412,18 +412,12 @@ impl AstroSightServer {
 
 impl ServerHandler for AstroSightServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities {
-                tools: Some(ToolsCapability::default()),
-                ..Default::default()
-            },
-            server_info: Implementation {
-                name: "astro-sight".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
+        let mut caps = ServerCapabilities::default();
+        caps.tools = Some(ToolsCapability::default());
+
+        ServerInfo::new(caps).with_server_info(Implementation::new(
+            "astro-sight",
+            env!("CARGO_PKG_VERSION"),
+        ))
     }
 }
