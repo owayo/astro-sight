@@ -1455,8 +1455,8 @@ fn impact_with_unresolved() {
 
     let output = child.wait_with_output().expect("failed to wait");
     assert!(
-        !output.status.success(),
-        "expected exit 1 for unresolved impacts"
+        output.status.success(),
+        "expected exit 0 for unresolved impacts (informational, not an error)"
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
