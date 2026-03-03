@@ -783,7 +783,6 @@ fn cmd_impact(service: &AppService, dir: &str, git: bool, base: &str, staged: bo
         return Ok(());
     }
 
-    // Print human-readable output and exit 1
     eprintln!("Unresolved impacts found:\n");
     for (changed_path, (symbols, callers)) in &unresolved {
         eprintln!("{} changed [{}]:", changed_path, symbols.join(", "));
@@ -793,7 +792,7 @@ fn cmd_impact(service: &AppService, dir: &str, git: bool, base: &str, staged: bo
         eprintln!();
     }
 
-    std::process::exit(1);
+    Ok(())
 }
 
 fn cmd_doctor(pretty: bool) -> Result<()> {
