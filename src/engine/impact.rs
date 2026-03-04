@@ -64,8 +64,17 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
         let sig_changes = detect_signature_changes(diff_input, &df.new_path, &affected);
         let call_edges = calls::extract_calls(root, &source, lang_id, None).unwrap_or_default();
 
+        // Filter: exclude non-exported symbols from cross-file search
         for sym in &affected {
-            if !all_symbol_names.contains(&sym.name) {
+            if all_symbol_names.contains(&sym.name) {
+                continue;
+            }
+            let is_exported = syms
+                .iter()
+                .find(|s| s.name == sym.name)
+                .map(|s| symbols::is_symbol_exported(root, &source, lang_id, &s.range))
+                .unwrap_or(true);
+            if is_exported {
                 all_symbol_names.push(sym.name.clone());
             }
         }

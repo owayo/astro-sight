@@ -6,6 +6,121 @@ use crate::language::LangId;
 use crate::models::location::Range;
 use crate::models::symbol::{Symbol, SymbolKind};
 
+/// Check if a symbol at the given range is exported (visible outside the file).
+///
+/// For languages without clear export semantics (Java, Python, C, etc.),
+/// conservatively returns `true` to avoid false negatives.
+pub fn is_symbol_exported(
+    root: Node,
+    source: &[u8],
+    lang_id: LangId,
+    symbol_range: &Range,
+) -> bool {
+    let start = tree_sitter::Point {
+        row: symbol_range.start.line,
+        column: symbol_range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: symbol_range.end.line,
+        column: symbol_range.end.column,
+    };
+
+    let Some(node) = root.descendant_for_point_range(start, end) else {
+        return true; // conservative: treat as exported if node not found
+    };
+
+    match lang_id {
+        LangId::Typescript | LangId::Tsx | LangId::Javascript => {
+            is_exported_js_ts(node, source, root)
+        }
+        LangId::Rust => is_exported_rust(node),
+        LangId::Go => is_exported_go(node, source),
+        _ => true, // conservative for unsupported languages
+    }
+}
+
+/// JS/TS: check export_statement ancestor or named export { name }.
+fn is_exported_js_ts(node: Node, source: &[u8], root: Node) -> bool {
+    // Check if any ancestor is an export_statement
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if n.kind() == "export_statement" {
+            return true;
+        }
+        current = n.parent();
+    }
+
+    // Check for named exports: export { name }
+    if let Some(name_node) = node.child_by_field_name("name")
+        && let Ok(name) = name_node.utf8_text(source)
+    {
+        return has_named_export(root, source, name);
+    }
+
+    false
+}
+
+/// Search top-level export { ... } statements for a matching name.
+fn has_named_export(root: Node, source: &[u8], target_name: &str) -> bool {
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() != "export_statement" {
+            continue;
+        }
+        let mut inner = child.walk();
+        for grandchild in child.children(&mut inner) {
+            if grandchild.kind() != "export_clause" {
+                continue;
+            }
+            let mut spec_cursor = grandchild.walk();
+            for spec in grandchild.children(&mut spec_cursor) {
+                if spec.kind() != "export_specifier" {
+                    continue;
+                }
+                let local_name = spec
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok());
+                if local_name == Some(target_name) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Rust: check visibility_modifier (pub) or impl block membership.
+fn is_exported_rust(node: Node) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "visibility_modifier" {
+            return true;
+        }
+    }
+
+    // Methods inside impl blocks are considered exported
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if p.kind() == "impl_item" {
+            return true;
+        }
+        parent = p.parent();
+    }
+
+    false
+}
+
+/// Go: exported identifiers start with an uppercase letter.
+fn is_exported_go(node: Node, source: &[u8]) -> bool {
+    let name = node
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(source).ok());
+    match name {
+        Some(n) => n.starts_with(char::is_uppercase),
+        None => true, // conservative
+    }
+}
+
 /// Extract symbols from a parsed tree.
 pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
     let query_src = symbol_query(lang_id);
@@ -264,5 +379,86 @@ fn symbol_query(lang_id: LangId) -> &'static str {
             (module name: (scope_resolution name: (_) @module.name))
             "#
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check_exported(source: &str, lang_id: LangId, symbol_name: &str) -> bool {
+        let language = lang_id.ts_language();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+
+        let syms = extract_symbols(root, source.as_bytes(), lang_id).unwrap();
+        let sym = syms
+            .iter()
+            .find(|s| s.name == symbol_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "symbol '{}' not found in {:?}",
+                    symbol_name,
+                    syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            });
+        is_symbol_exported(root, source.as_bytes(), lang_id, &sym.range)
+    }
+
+    #[test]
+    fn ts_export_function_is_exported() {
+        assert!(check_exported(
+            "export function foo() {}",
+            LangId::Typescript,
+            "foo"
+        ));
+    }
+
+    #[test]
+    fn ts_non_export_function_is_not_exported() {
+        assert!(!check_exported(
+            "function foo() {}",
+            LangId::Typescript,
+            "foo"
+        ));
+    }
+
+    #[test]
+    fn ts_named_export_is_exported() {
+        assert!(check_exported(
+            "function foo() {}\nexport { foo }",
+            LangId::Typescript,
+            "foo"
+        ));
+    }
+
+    #[test]
+    fn rust_pub_fn_is_exported() {
+        assert!(check_exported("pub fn foo() {}", LangId::Rust, "foo"));
+    }
+
+    #[test]
+    fn rust_private_fn_is_not_exported() {
+        assert!(!check_exported("fn foo() {}", LangId::Rust, "foo"));
+    }
+
+    #[test]
+    fn go_uppercase_is_exported() {
+        assert!(check_exported(
+            "package main\nfunc Foo() {}",
+            LangId::Go,
+            "Foo"
+        ));
+    }
+
+    #[test]
+    fn go_lowercase_is_not_exported() {
+        assert!(!check_exported(
+            "package main\nfunc foo() {}",
+            LangId::Go,
+            "foo"
+        ));
     }
 }
