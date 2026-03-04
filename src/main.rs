@@ -792,7 +792,7 @@ fn cmd_impact(service: &AppService, dir: &str, git: bool, base: &str, staged: bo
         eprintln!();
     }
 
-    Ok(())
+    std::process::exit(1);
 }
 
 fn cmd_doctor(pretty: bool) -> Result<()> {
