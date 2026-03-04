@@ -64,7 +64,7 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
         let sig_changes = detect_signature_changes(diff_input, &df.new_path, &affected);
         let call_edges = calls::extract_calls(root, &source, lang_id, None).unwrap_or_default();
 
-        // Filter: exclude non-exported symbols from cross-file search
+        // Filter: exclude non-exported symbols and body-only changes from cross-file search
         for sym in &affected {
             if all_symbol_names.contains(&sym.name) {
                 continue;
@@ -74,9 +74,14 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
                 .find(|s| s.name == sym.name)
                 .map(|s| symbols::is_symbol_exported(root, &source, lang_id, &s.range))
                 .unwrap_or(true);
-            if is_exported {
-                all_symbol_names.push(sym.name.clone());
+            if !is_exported {
+                continue;
             }
+            // Skip if symbol name doesn't appear in any changed line (body-only change)
+            if !is_symbol_in_changed_lines(diff_input, &df.new_path, &sym.name) {
+                continue;
+            }
+            all_symbol_names.push(sym.name.clone());
         }
 
         let hunks = df
@@ -324,6 +329,28 @@ fn extract_function_from_context(context: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Check if a symbol name appears in any changed (+/-) line for the given file in the diff.
+///
+/// If the symbol name is absent from all changed lines, the change is body-only
+/// (e.g. internal JSX/logic change) and callers are not affected.
+fn is_symbol_in_changed_lines(diff_input: &str, file_path: &str, symbol_name: &str) -> bool {
+    let mut in_file = false;
+
+    for line in diff_input.lines() {
+        if line.starts_with("+++ b/") {
+            in_file = line.strip_prefix("+++ b/").unwrap_or("") == file_path;
+        } else if in_file
+            && ((line.starts_with('+') && !line.starts_with("+++"))
+                || (line.starts_with('-') && !line.starts_with("---")))
+            && line[1..].contains(symbol_name)
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Validate that a diff path is safe (no absolute paths or traversal components).
