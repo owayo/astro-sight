@@ -149,10 +149,10 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
                         continue;
                     }
                     // Skip cross-language false positives (e.g. Rust `command` vs Bash builtin)
-                    if let Ok(ref_lang) = LangId::from_path(Utf8Path::new(&r.path)) {
-                        if lang_compat_group(ref_lang) != source_lang_group {
-                            continue;
-                        }
+                    if let Ok(ref_lang) = LangId::from_path(Utf8Path::new(&r.path))
+                        && lang_compat_group(ref_lang) != source_lang_group
+                    {
+                        continue;
                     }
                     impacted_callers.push(ImpactedCaller {
                         path: r.path.clone(),
