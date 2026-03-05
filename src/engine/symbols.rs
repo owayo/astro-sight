@@ -97,6 +97,10 @@ fn has_named_export(root: Node, source: &[u8], target_name: &str) -> bool {
 }
 
 /// Rust: check visibility_modifier (pub) or impl block membership.
+///
+/// - `pub fn` → exported
+/// - Trait impl methods (no explicit `pub` needed) → exported
+/// - Inherent impl methods without `pub` → module-private, NOT exported
 fn is_exported_rust(node: Node) -> bool {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -105,11 +109,13 @@ fn is_exported_rust(node: Node) -> bool {
         }
     }
 
-    // Methods inside impl blocks are considered exported
+    // Check enclosing impl block
     let mut parent = node.parent();
     while let Some(p) = parent {
         if p.kind() == "impl_item" {
-            return true;
+            // Trait impl: methods inherit trait visibility (always public)
+            // Inherent impl: method without pub → module-private
+            return p.child_by_field_name("trait").is_some();
         }
         parent = p.parent();
     }
