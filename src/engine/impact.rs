@@ -3,6 +3,7 @@ use camino::Utf8Path;
 use std::path::Path;
 
 use crate::engine::{calls, diff, parser, refs, symbols};
+use crate::language::LangId;
 use crate::models::impact::{
     AffectedSymbol, ContextResult, FileImpact, ImpactedCaller, SignatureChange,
 };
@@ -20,6 +21,7 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
     // --- Pass 1: Parse changed files and collect affected symbols ---
     struct FileContext {
         new_path: String,
+        lang_id: LangId,
         affected: Vec<AffectedSymbol>,
         sig_changes: Vec<SignatureChange>,
         hunks: Vec<crate::models::impact::HunkInfo>,
@@ -69,6 +71,19 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
             if all_symbol_names.contains(&sym.name) {
                 continue;
             }
+            // Skip impl block type names (e.g. "Foo" from `impl Foo { ... }`).
+            // The struct/enum definition itself is captured separately; the impl
+            // type name changing only means the impl body changed, not the type's API.
+            if sym.kind == "type" {
+                continue;
+            }
+            // For functions/methods, only include if the signature actually changed.
+            // Body-only changes (e.g. modified logic, added logging) don't affect callers.
+            if (sym.kind == "function" || sym.kind == "method")
+                && !sig_changes.iter().any(|sc| sc.name == sym.name)
+            {
+                continue;
+            }
             // Check export status only for symbols that overlap with changed hunks
             // (avoid using a different same-named symbol's export status)
             let any_affected_exported = syms.iter().any(|s| {
@@ -99,6 +114,7 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
 
         file_contexts.push(FileContext {
             new_path: df.new_path.clone(),
+            lang_id,
             affected,
             sig_changes,
             hunks,
@@ -120,6 +136,7 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
         let mut impacted_callers = Vec::new();
 
         // Cross-file callers from batch results (only References, not Definitions)
+        let source_lang_group = lang_compat_group(ctx.lang_id);
         for sym in &ctx.affected {
             if let Some(caller_refs) = batch_refs.get(&sym.name) {
                 for r in caller_refs {
@@ -130,6 +147,12 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
                     // Skip same-file refs (use exact path comparison via canonical paths)
                     if r.path.ends_with(&ctx.new_path) {
                         continue;
+                    }
+                    // Skip cross-language false positives (e.g. Rust `command` vs Bash builtin)
+                    if let Ok(ref_lang) = LangId::from_path(Utf8Path::new(&r.path)) {
+                        if lang_compat_group(ref_lang) != source_lang_group {
+                            continue;
+                        }
                     }
                     impacted_callers.push(ImpactedCaller {
                         path: r.path.clone(),
@@ -365,6 +388,27 @@ fn is_symbol_in_changed_lines(diff_input: &str, file_path: &str, symbol_name: &s
     }
 
     false
+}
+
+/// Language compatibility group for cross-file reference filtering.
+///
+/// Languages in the same group can reference each other's symbols
+/// (e.g. JS/TS/TSX share imports, C/C++ share headers, Java/Kotlin share JVM).
+/// Cross-group matches (e.g. Rust `command` in a Bash script) are false positives.
+fn lang_compat_group(lang: LangId) -> u8 {
+    match lang {
+        LangId::Rust => 0,
+        LangId::C | LangId::Cpp => 1,
+        LangId::Python => 2,
+        LangId::Javascript | LangId::Typescript | LangId::Tsx => 3,
+        LangId::Go => 4,
+        LangId::Java | LangId::Kotlin => 5,
+        LangId::Swift => 6,
+        LangId::CSharp => 7,
+        LangId::Php => 8,
+        LangId::Ruby => 9,
+        LangId::Bash => 10,
+    }
 }
 
 /// Validate that a diff path is safe (no absolute paths or traversal components).
