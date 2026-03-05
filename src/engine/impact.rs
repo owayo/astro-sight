@@ -30,6 +30,8 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
 
     let mut file_contexts = Vec::new();
     let mut all_symbol_names: Vec<String> = Vec::new();
+    let mut method_parent_types: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     for df in &diff_files {
         // Reject diff paths that attempt path traversal (e.g. "../../etc/passwd")
@@ -77,6 +79,15 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
             if sym.kind == "type" {
                 continue;
             }
+            // Skip symbols in test context (#[cfg(test)] modules, #[test] functions, etc.)
+            let in_test = syms.iter().any(|s| {
+                s.name == sym.name
+                    && symbol_overlaps_hunks(s, &df.hunks)
+                    && is_in_test_context(root, &source, &s.range, lang_id)
+            });
+            if in_test {
+                continue;
+            }
             // For functions/methods, only include if the signature actually changed.
             // Body-only changes (e.g. modified logic, added logging) don't affect callers.
             if (sym.kind == "function" || sym.kind == "method")
@@ -97,6 +108,18 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
             // Skip if symbol name doesn't appear in any changed line (body-only change)
             if !is_symbol_in_changed_lines(diff_input, &df.new_path, &sym.name) {
                 continue;
+            }
+            // For methods, collect parent type for cross-file scoping
+            if let Some(orig) = syms
+                .iter()
+                .find(|s| s.name == sym.name && symbol_overlaps_hunks(s, &df.hunks))
+                && let Some(parent_type) =
+                    find_parent_type_name(root, &source, &orig.range, lang_id)
+            {
+                method_parent_types.insert(sym.name.clone(), parent_type.clone());
+                if !all_symbol_names.contains(&parent_type) {
+                    all_symbol_names.push(parent_type);
+                }
             }
             all_symbol_names.push(sym.name.clone());
         }
@@ -153,6 +176,17 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
                         && lang_compat_group(ref_lang) != source_lang_group
                     {
                         continue;
+                    }
+                    // Method type scoping: for methods inside impl/class blocks,
+                    // only include refs from files that also reference the parent type.
+                    // This prevents e.g. StopHookFilter::execute from matching RmFilter::execute.
+                    if let Some(parent_type) = method_parent_types.get(&sym.name) {
+                        let type_in_ref_file = batch_refs
+                            .get(parent_type.as_str())
+                            .is_some_and(|type_refs| type_refs.iter().any(|tr| tr.path == r.path));
+                        if !type_in_ref_file {
+                            continue;
+                        }
                     }
                     impacted_callers.push(ImpactedCaller {
                         path: r.path.clone(),
@@ -408,6 +442,137 @@ fn lang_compat_group(lang: LangId) -> u8 {
         LangId::Php => 8,
         LangId::Ruby => 9,
         LangId::Bash => 10,
+    }
+}
+
+/// Check if a symbol is inside a test context (e.g. `#[cfg(test)]` module, `#[test]` function).
+///
+/// Test symbols should not propagate cross-file impacts because:
+/// - Test functions are not called from production code
+/// - Changes to test helpers only affect the test module
+fn is_in_test_context(
+    root: tree_sitter::Node,
+    source: &[u8],
+    symbol_range: &crate::models::location::Range,
+    lang_id: LangId,
+) -> bool {
+    match lang_id {
+        LangId::Rust => is_rust_test_context(root, source, symbol_range),
+        _ => false,
+    }
+}
+
+/// Rust-specific test context detection via AST.
+///
+/// Checks if the symbol is inside a `#[cfg(test)]` module or has a `#[test]` attribute.
+fn is_rust_test_context(
+    root: tree_sitter::Node,
+    source: &[u8],
+    symbol_range: &crate::models::location::Range,
+) -> bool {
+    let start = tree_sitter::Point {
+        row: symbol_range.start.line,
+        column: symbol_range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: symbol_range.end.line,
+        column: symbol_range.end.column,
+    };
+    let Some(node) = root.descendant_for_point_range(start, end) else {
+        return false;
+    };
+
+    let mut current = Some(node);
+    while let Some(n) = current {
+        // Check if this function has #[test] attribute
+        if n.kind() == "function_item" && has_attribute_text(n, source, "test") {
+            return true;
+        }
+        // Check if inside a #[cfg(test)] module
+        if n.kind() == "mod_item" && has_attribute_text(n, source, "cfg(test)") {
+            return true;
+        }
+        current = n.parent();
+    }
+    false
+}
+
+/// Check if a node has a preceding attribute_item sibling containing the given text.
+fn has_attribute_text(node: tree_sitter::Node, source: &[u8], pattern: &str) -> bool {
+    let mut prev = node.prev_named_sibling();
+    while let Some(p) = prev {
+        match p.kind() {
+            "attribute_item" => {
+                if let Ok(text) = p.utf8_text(source)
+                    && text.contains(pattern)
+                {
+                    return true;
+                }
+                prev = p.prev_named_sibling();
+            }
+            "line_comment" | "block_comment" => {
+                prev = p.prev_named_sibling();
+            }
+            _ => break,
+        }
+    }
+    false
+}
+
+/// Find the parent type name for a method inside an impl/class block.
+///
+/// For Rust `impl Foo { fn bar() {} }` → returns `Some("Foo")`
+/// For Rust `impl Trait for Foo { fn bar() {} }` → returns `Some("Foo")`
+/// For class-based languages → returns the class name
+fn find_parent_type_name(
+    root: tree_sitter::Node,
+    source: &[u8],
+    symbol_range: &crate::models::location::Range,
+    lang_id: LangId,
+) -> Option<String> {
+    let start = tree_sitter::Point {
+        row: symbol_range.start.line,
+        column: symbol_range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: symbol_range.end.line,
+        column: symbol_range.end.column,
+    };
+    let node = root.descendant_for_point_range(start, end)?;
+
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if n.kind() == "impl_item" && lang_id == LangId::Rust {
+            return n
+                .child_by_field_name("type")
+                .and_then(|t| extract_type_name(t, source));
+        }
+        if matches!(
+            n.kind(),
+            "class_declaration" | "class_definition" | "class_specifier"
+        ) {
+            return n
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(source).ok())
+                .map(|s| s.to_string());
+        }
+        current = n.parent();
+    }
+    None
+}
+
+/// Extract a type name from a tree-sitter type node, handling generics and scoped types.
+fn extract_type_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "type_identifier" | "identifier" => node.utf8_text(source).ok().map(|s| s.to_string()),
+        "generic_type" => node
+            .child_by_field_name("type")
+            .and_then(|t| extract_type_name(t, source)),
+        "scoped_type_identifier" => node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok())
+            .map(|s| s.to_string()),
+        _ => node.utf8_text(source).ok().map(|s| s.to_string()),
     }
 }
 
