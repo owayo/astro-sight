@@ -69,12 +69,14 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
             if all_symbol_names.contains(&sym.name) {
                 continue;
             }
-            let is_exported = syms
-                .iter()
-                .find(|s| s.name == sym.name)
-                .map(|s| symbols::is_symbol_exported(root, &source, lang_id, &s.range))
-                .unwrap_or(true);
-            if !is_exported {
+            // Check export status only for symbols that overlap with changed hunks
+            // (avoid using a different same-named symbol's export status)
+            let any_affected_exported = syms.iter().any(|s| {
+                s.name == sym.name
+                    && symbol_overlaps_hunks(s, &df.hunks)
+                    && symbols::is_symbol_exported(root, &source, lang_id, &s.range)
+            });
+            if !any_affected_exported {
                 continue;
             }
             // Skip if symbol name doesn't appear in any changed line (body-only change)
@@ -208,6 +210,18 @@ fn find_affected_symbols(
     }
 
     affected
+}
+
+/// Check if a symbol's range overlaps with any of the given hunks.
+fn symbol_overlaps_hunks(
+    sym: &crate::models::symbol::Symbol,
+    hunks: &[crate::models::impact::HunkInfo],
+) -> bool {
+    hunks.iter().any(|h| {
+        let hunk_start = h.new_start.saturating_sub(1);
+        let hunk_end = hunk_start + h.new_count;
+        hunk_start < sym.range.end.line && hunk_end > sym.range.start.line
+    })
 }
 
 fn symbol_kind_str(kind: SymbolKind) -> String {
