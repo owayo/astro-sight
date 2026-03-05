@@ -41,11 +41,18 @@ pub fn is_symbol_exported(
 
 /// JS/TS: check export_statement ancestor or named export { name }.
 fn is_exported_js_ts(node: Node, source: &[u8], root: Node) -> bool {
-    // Check if any ancestor is an export_statement
+    // Check if any ancestor is an export_statement, stopping at function scope boundaries.
+    // Without this boundary check, local variables inside exported functions
+    // (e.g. `const result` inside `export function foo()`) would be falsely
+    // detected as exported because `export_statement` is an ancestor.
     let mut current = Some(node);
     while let Some(n) = current {
         if n.kind() == "export_statement" {
             return true;
+        }
+        // Stop at function body boundaries — symbols inside are local
+        if is_js_function_body(n) {
+            break;
         }
         current = n.parent();
     }
@@ -108,6 +115,24 @@ fn is_exported_rust(node: Node) -> bool {
     }
 
     false
+}
+
+/// JS/TS: check if a node is a function body (statement_block whose parent is a function-like).
+fn is_js_function_body(node: Node) -> bool {
+    if node.kind() != "statement_block" {
+        return false;
+    }
+    node.parent().is_some_and(|p| {
+        matches!(
+            p.kind(),
+            "function_declaration"
+                | "function"
+                | "arrow_function"
+                | "method_definition"
+                | "generator_function_declaration"
+                | "generator_function"
+        )
+    })
 }
 
 /// Go: exported identifiers start with an uppercase letter.
@@ -459,6 +484,24 @@ mod tests {
             "package main\nfunc foo() {}",
             LangId::Go,
             "foo"
+        ));
+    }
+
+    #[test]
+    fn ts_local_var_inside_exported_fn_is_not_exported() {
+        assert!(!check_exported(
+            "export function foo() { const result = 1; }",
+            LangId::Typescript,
+            "result"
+        ));
+    }
+
+    #[test]
+    fn ts_top_level_exported_const_is_exported() {
+        assert!(check_exported(
+            "export const bar = 42;",
+            LangId::Typescript,
+            "bar"
         ));
     }
 }
