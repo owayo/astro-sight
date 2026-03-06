@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
@@ -31,7 +31,7 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
     let diff_files = diff::parse_unified_diff(diff_input);
 
     // Pass 1: Parse changed files and collect affected symbols
-    let (file_contexts, all_symbol_names, method_parent_types) =
+    let (file_contexts, all_symbol_names, method_parent_types, included_symbols) =
         collect_affected_symbols(diff_input, &diff_files, dir);
 
     // Pass 2: Batch cross-file reference search (one walk for all symbols)
@@ -42,7 +42,12 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
     };
 
     // Pass 3: Assemble results
-    let changes = assemble_impacts(file_contexts, &batch_refs, &method_parent_types);
+    let changes = assemble_impacts(
+        file_contexts,
+        &batch_refs,
+        &method_parent_types,
+        &included_symbols,
+    );
 
     Ok(ContextResult { changes })
 }
@@ -53,10 +58,16 @@ fn collect_affected_symbols(
     diff_input: &str,
     diff_files: &[DiffFile],
     dir: &Path,
-) -> (Vec<FileContext>, Vec<String>, HashMap<String, String>) {
+) -> (
+    Vec<FileContext>,
+    Vec<String>,
+    HashMap<String, String>,
+    HashSet<String>,
+) {
     let mut file_contexts = Vec::new();
     let mut all_symbol_names: Vec<String> = Vec::new();
     let mut method_parent_types: HashMap<String, String> = HashMap::new();
+    let mut included_symbols: HashSet<String> = HashSet::new();
 
     for df in diff_files {
         if !is_safe_diff_path(&df.new_path) {
@@ -108,6 +119,7 @@ fn collect_affected_symbols(
             ) {
                 continue;
             }
+            included_symbols.insert(sym.name.clone());
             if let Some(orig) = find_overlapping_symbol(&syms, &sym.name, &df.hunks)
                 && let Some(parent_type) =
                     find_parent_type_name(root, &source, &orig.range, lang_id)
@@ -141,14 +153,24 @@ fn collect_affected_symbols(
         });
     }
 
-    (file_contexts, all_symbol_names, method_parent_types)
+    (
+        file_contexts,
+        all_symbol_names,
+        method_parent_types,
+        included_symbols,
+    )
 }
 
 /// Pass 3: For each changed file, collect cross-file and same-file impacted callers.
+///
+/// Only symbols that passed `should_include_for_cross_file` (tracked in `included_symbols`)
+/// are used for cross-file reference lookup. Symbols added to `batch_refs` solely as parent
+/// types for method scoping are not iterated as impact sources.
 fn assemble_impacts(
     file_contexts: Vec<FileContext>,
     batch_refs: &HashMap<String, Vec<SymbolReference>>,
     method_parent_types: &HashMap<String, String>,
+    included_symbols: &HashSet<String>,
 ) -> Vec<FileImpact> {
     let mut changes = Vec::new();
     let mut target_file_cache: HashMap<String, Option<ParsedFile>> = HashMap::new();
@@ -158,6 +180,9 @@ fn assemble_impacts(
 
         let source_lang_group = lang_compat_group(ctx.lang_id);
         for sym in &ctx.affected {
+            if !included_symbols.contains(&sym.name) {
+                continue;
+            }
             if let Some(caller_refs) = batch_refs.get(&sym.name) {
                 for r in caller_refs {
                     if !is_relevant_cross_file_ref(

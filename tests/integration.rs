@@ -1592,3 +1592,101 @@ mod tests {
         }
     }
 }
+
+#[test]
+fn impact_additive_impl_block_no_false_positive() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // Fixture: types.rs with a struct, consumer.rs that uses the struct
+    let dir = tempfile::tempdir().expect("tempdir");
+    let types_rs = dir.path().join("types.rs");
+    let consumer_rs = dir.path().join("consumer.rs");
+
+    // types.rs: struct with an existing impl and a NEW impl block being added
+    std::fs::write(
+        &types_rs,
+        r#"pub struct HookInput {
+    pub name: String,
+}
+
+impl HookInput {
+    pub fn new(name: String) -> Self {
+        Self { name }
+    }
+}
+
+impl HookInput {
+    pub fn bash_command(&self) -> &str {
+        &self.name
+    }
+
+    pub fn file_path(&self) -> &str {
+        &self.name
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // consumer.rs: uses HookInput (struct construction + method call)
+    std::fs::write(
+        &consumer_rs,
+        r#"use crate::types::HookInput;
+
+pub fn run() -> String {
+    let input = HookInput::new("test".to_string());
+    input.name.clone()
+}
+"#,
+    )
+    .unwrap();
+
+    // Diff: adding a new impl block with new methods (backward-compatible)
+    let diff = r#"--- a/types.rs
++++ b/types.rs
+@@ -9,3 +9,13 @@
+     }
+ }
++
++impl HookInput {
++    pub fn bash_command(&self) -> &str {
++        &self.name
++    }
++
++    pub fn file_path(&self) -> &str {
++        &self.name
++    }
++}
+"#;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["impact", "--dir", dir.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn impact");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Adding new methods to a type is backward-compatible.
+    // consumer.rs should NOT be reported as impacted.
+    assert!(
+        output.status.success(),
+        "expected exit 0 (no unresolved impacts) for additive impl block.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("consumer.rs"),
+        "consumer.rs should not appear as impacted for additive impl block: {stderr}"
+    );
+}
