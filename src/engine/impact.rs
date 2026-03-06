@@ -1,14 +1,26 @@
+use std::collections::HashMap;
+use std::path::Path;
+
 use anyhow::Result;
 use camino::Utf8Path;
-use std::path::Path;
 
 use crate::engine::{calls, diff, parser, refs, symbols};
 use crate::language::LangId;
+use crate::models::call::CallEdge;
 use crate::models::impact::{
-    AffectedSymbol, ContextResult, FileImpact, ImpactedCaller, SignatureChange,
+    AffectedSymbol, ContextResult, DiffFile, FileImpact, HunkInfo, ImpactedCaller, SignatureChange,
 };
-use crate::models::reference::RefKind;
+use crate::models::reference::{RefKind, SymbolReference};
 use crate::models::symbol::SymbolKind;
+
+struct FileContext {
+    new_path: String,
+    lang_id: LangId,
+    affected: Vec<AffectedSymbol>,
+    sig_changes: Vec<SignatureChange>,
+    hunks: Vec<HunkInfo>,
+    call_edges: Vec<CallEdge>,
+}
 
 /// Analyze the impact of a unified diff within a workspace directory.
 ///
@@ -18,23 +30,35 @@ use crate::models::symbol::SymbolKind;
 pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
     let diff_files = diff::parse_unified_diff(diff_input);
 
-    // --- Pass 1: Parse changed files and collect affected symbols ---
-    struct FileContext {
-        new_path: String,
-        lang_id: LangId,
-        affected: Vec<AffectedSymbol>,
-        sig_changes: Vec<SignatureChange>,
-        hunks: Vec<crate::models::impact::HunkInfo>,
-        call_edges: Vec<crate::models::call::CallEdge>,
-    }
+    // Pass 1: Parse changed files and collect affected symbols
+    let (file_contexts, all_symbol_names, method_parent_types) =
+        collect_affected_symbols(diff_input, &diff_files, dir);
 
+    // Pass 2: Batch cross-file reference search (one walk for all symbols)
+    let batch_refs = if all_symbol_names.is_empty() {
+        HashMap::new()
+    } else {
+        refs::find_references_batch(&all_symbol_names, dir, None).unwrap_or_default()
+    };
+
+    // Pass 3: Assemble results
+    let changes = assemble_impacts(file_contexts, &batch_refs, &method_parent_types);
+
+    Ok(ContextResult { changes })
+}
+
+/// Pass 1: Parse each changed file, extract symbols, and determine which
+/// symbol names need cross-file reference search.
+fn collect_affected_symbols(
+    diff_input: &str,
+    diff_files: &[DiffFile],
+    dir: &Path,
+) -> (Vec<FileContext>, Vec<String>, HashMap<String, String>) {
     let mut file_contexts = Vec::new();
     let mut all_symbol_names: Vec<String> = Vec::new();
-    let mut method_parent_types: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut method_parent_types: HashMap<String, String> = HashMap::new();
 
-    for df in &diff_files {
-        // Reject diff paths that attempt path traversal (e.g. "../../etc/passwd")
+    for df in diff_files {
         if !is_safe_diff_path(&df.new_path) {
             continue;
         }
@@ -44,7 +68,6 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
             continue;
         }
 
-        // Verify resolved path stays within workspace
         if let Ok(canonical) = std::fs::canonicalize(&file_path)
             && let Ok(canonical_dir) = std::fs::canonicalize(dir)
             && !canonical.starts_with(&canonical_dir)
@@ -68,51 +91,24 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
         let sig_changes = detect_signature_changes(diff_input, &df.new_path, &affected);
         let call_edges = calls::extract_calls(root, &source, lang_id, None).unwrap_or_default();
 
-        // Filter: exclude non-exported symbols and body-only changes from cross-file search
         for sym in &affected {
             if all_symbol_names.contains(&sym.name) {
                 continue;
             }
-            // Skip impl block type names (e.g. "Foo" from `impl Foo { ... }`).
-            // The struct/enum definition itself is captured separately; the impl
-            // type name changing only means the impl body changed, not the type's API.
-            if sym.kind == "type" {
+            if !should_include_for_cross_file(
+                sym,
+                &syms,
+                &df.hunks,
+                &sig_changes,
+                diff_input,
+                &df.new_path,
+                root,
+                &source,
+                lang_id,
+            ) {
                 continue;
             }
-            // Skip symbols in test context (#[cfg(test)] modules, #[test] functions, etc.)
-            let in_test = syms.iter().any(|s| {
-                s.name == sym.name
-                    && symbol_overlaps_hunks(s, &df.hunks)
-                    && is_in_test_context(root, &source, &s.range, lang_id)
-            });
-            if in_test {
-                continue;
-            }
-            // For functions/methods, only include if the signature actually changed.
-            // Body-only changes (e.g. modified logic, added logging) don't affect callers.
-            if (sym.kind == "function" || sym.kind == "method")
-                && !sig_changes.iter().any(|sc| sc.name == sym.name)
-            {
-                continue;
-            }
-            // Check export status only for symbols that overlap with changed hunks
-            // (avoid using a different same-named symbol's export status)
-            let any_affected_exported = syms.iter().any(|s| {
-                s.name == sym.name
-                    && symbol_overlaps_hunks(s, &df.hunks)
-                    && symbols::is_symbol_exported(root, &source, lang_id, &s.range)
-            });
-            if !any_affected_exported {
-                continue;
-            }
-            // Skip if symbol name doesn't appear in any changed line (body-only change)
-            if !is_symbol_in_changed_lines(diff_input, &df.new_path, &sym.name) {
-                continue;
-            }
-            // For methods, collect parent type for cross-file scoping
-            if let Some(orig) = syms
-                .iter()
-                .find(|s| s.name == sym.name && symbol_overlaps_hunks(s, &df.hunks))
+            if let Some(orig) = find_overlapping_symbol(&syms, &sym.name, &df.hunks)
                 && let Some(parent_type) =
                     find_parent_type_name(root, &source, &orig.range, lang_id)
             {
@@ -127,7 +123,7 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
         let hunks = df
             .hunks
             .iter()
-            .map(|h| crate::models::impact::HunkInfo {
+            .map(|h| HunkInfo {
                 old_start: h.old_start,
                 old_count: h.old_count,
                 new_start: h.new_start,
@@ -145,57 +141,32 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
         });
     }
 
-    // --- Pass 2: Batch cross-file reference search (one walk for all symbols) ---
-    let batch_refs = if all_symbol_names.is_empty() {
-        std::collections::HashMap::new()
-    } else {
-        refs::find_references_batch(&all_symbol_names, dir, None).unwrap_or_default()
-    };
+    (file_contexts, all_symbol_names, method_parent_types)
+}
 
-    // --- Assemble results ---
+/// Pass 3: For each changed file, collect cross-file and same-file impacted callers.
+fn assemble_impacts(
+    file_contexts: Vec<FileContext>,
+    batch_refs: &HashMap<String, Vec<SymbolReference>>,
+    method_parent_types: &HashMap<String, String>,
+) -> Vec<FileImpact> {
     let mut changes = Vec::new();
-    // Cache parsed target files for test-context checks (avoid re-parsing)
-    let mut target_file_cache: std::collections::HashMap<String, Option<ParsedFile>> =
-        std::collections::HashMap::new();
+    let mut target_file_cache: HashMap<String, Option<ParsedFile>> = HashMap::new();
 
     for ctx in file_contexts {
         let mut impacted_callers = Vec::new();
 
-        // Cross-file callers from batch results (only References, not Definitions)
         let source_lang_group = lang_compat_group(ctx.lang_id);
         for sym in &ctx.affected {
             if let Some(caller_refs) = batch_refs.get(&sym.name) {
                 for r in caller_refs {
-                    // Skip definitions — we only want call-site references
-                    if r.kind == Some(RefKind::Definition) {
-                        continue;
-                    }
-                    // Skip same-file refs (use exact path comparison via canonical paths)
-                    if r.path.ends_with(&ctx.new_path) {
-                        continue;
-                    }
-                    // Skip cross-language false positives (e.g. Rust `command` vs Bash builtin)
-                    if let Ok(ref_lang) = LangId::from_path(Utf8Path::new(&r.path))
-                        && lang_compat_group(ref_lang) != source_lang_group
-                    {
-                        continue;
-                    }
-                    // Method type scoping: for methods inside impl/class blocks,
-                    // only include refs from files that also reference the parent type.
-                    // This prevents e.g. StopHookFilter::execute from matching RmFilter::execute.
-                    if let Some(parent_type) = method_parent_types.get(&sym.name) {
-                        let type_in_ref_file = batch_refs
-                            .get(parent_type.as_str())
-                            .is_some_and(|type_refs| type_refs.iter().any(|tr| tr.path == r.path));
-                        if !type_in_ref_file {
-                            continue;
-                        }
-                    }
-                    // Skip refs in test context in the target file
-                    if is_ref_in_target_test_context(
-                        &r.path,
-                        r.line,
-                        r.column,
+                    if !is_relevant_cross_file_ref(
+                        r,
+                        &ctx.new_path,
+                        source_lang_group,
+                        &sym.name,
+                        method_parent_types,
+                        batch_refs,
                         &mut target_file_cache,
                     ) {
                         continue;
@@ -213,7 +184,6 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
             }
         }
 
-        // Same-file callers from call graph
         for sym in &ctx.affected {
             for edge in &ctx.call_edges {
                 if edge.callee.name == sym.name {
@@ -241,13 +211,109 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
         });
     }
 
-    Ok(ContextResult { changes })
+    changes
+}
+
+/// Determine whether an affected symbol should be included in cross-file reference search.
+///
+/// Applies a 5-stage filter:
+/// 1. Skip impl block type names (not API-affecting)
+/// 2. Skip symbols in test context
+/// 3. Skip functions/methods with body-only changes (no signature change)
+/// 4. Skip non-exported symbols
+/// 5. Skip symbols whose name doesn't appear in any changed diff line
+#[allow(clippy::too_many_arguments)]
+fn should_include_for_cross_file(
+    sym: &AffectedSymbol,
+    syms: &[crate::models::symbol::Symbol],
+    hunks: &[HunkInfo],
+    sig_changes: &[SignatureChange],
+    diff_input: &str,
+    file_path: &str,
+    root: tree_sitter::Node,
+    source: &[u8],
+    lang_id: LangId,
+) -> bool {
+    // 1. Skip impl block type names
+    if sym.kind == "type" {
+        return false;
+    }
+    // 2. Skip symbols in test context
+    if find_overlapping_symbol(syms, &sym.name, hunks)
+        .is_some_and(|s| is_in_test_context(root, source, &s.range, lang_id))
+    {
+        return false;
+    }
+    // 3. Skip functions/methods with body-only changes
+    if (sym.kind == "function" || sym.kind == "method")
+        && !sig_changes.iter().any(|sc| sc.name == sym.name)
+    {
+        return false;
+    }
+    // 4. Skip non-exported symbols
+    if !find_overlapping_symbol(syms, &sym.name, hunks)
+        .is_some_and(|s| symbols::is_symbol_exported(root, source, lang_id, &s.range))
+    {
+        return false;
+    }
+    // 5. Skip if symbol name doesn't appear in any changed line
+    if !is_symbol_in_changed_lines(diff_input, file_path, &sym.name) {
+        return false;
+    }
+    true
+}
+
+/// Determine whether a cross-file reference is relevant as an impacted caller.
+///
+/// Applies a 5-stage filter:
+/// 1. Skip definitions (only call-site references matter)
+/// 2. Skip same-file refs
+/// 3. Skip cross-language false positives
+/// 4. Skip refs lacking parent type in the target file (method type scoping)
+/// 5. Skip refs in test context in the target file
+fn is_relevant_cross_file_ref(
+    r: &SymbolReference,
+    source_path: &str,
+    source_lang_group: u8,
+    sym_name: &str,
+    method_parent_types: &HashMap<String, String>,
+    batch_refs: &HashMap<String, Vec<SymbolReference>>,
+    target_file_cache: &mut HashMap<String, Option<ParsedFile>>,
+) -> bool {
+    // 1. Skip definitions
+    if r.kind == Some(RefKind::Definition) {
+        return false;
+    }
+    // 2. Skip same-file refs
+    if r.path.ends_with(source_path) {
+        return false;
+    }
+    // 3. Skip cross-language false positives
+    if let Ok(ref_lang) = LangId::from_path(Utf8Path::new(&r.path))
+        && lang_compat_group(ref_lang) != source_lang_group
+    {
+        return false;
+    }
+    // 4. Method type scoping
+    if let Some(parent_type) = method_parent_types.get(sym_name) {
+        let type_in_ref_file = batch_refs
+            .get(parent_type.as_str())
+            .is_some_and(|type_refs| type_refs.iter().any(|tr| tr.path == r.path));
+        if !type_in_ref_file {
+            return false;
+        }
+    }
+    // 5. Skip refs in test context
+    if is_ref_in_target_test_context(&r.path, r.line, r.column, target_file_cache) {
+        return false;
+    }
+    true
 }
 
 /// Match hunks against symbol ranges to find affected symbols.
 fn find_affected_symbols(
     syms: &[crate::models::symbol::Symbol],
-    hunks: &[crate::models::impact::HunkInfo],
+    hunks: &[HunkInfo],
 ) -> Vec<AffectedSymbol> {
     let mut affected = Vec::new();
 
@@ -282,15 +348,38 @@ fn find_affected_symbols(
 }
 
 /// Check if a symbol's range overlaps with any of the given hunks.
-fn symbol_overlaps_hunks(
-    sym: &crate::models::symbol::Symbol,
-    hunks: &[crate::models::impact::HunkInfo],
-) -> bool {
+fn symbol_overlaps_hunks(sym: &crate::models::symbol::Symbol, hunks: &[HunkInfo]) -> bool {
     hunks.iter().any(|h| {
         let hunk_start = h.new_start.saturating_sub(1);
         let hunk_end = hunk_start + h.new_count;
         hunk_start < sym.range.end.line && hunk_end > sym.range.start.line
     })
+}
+
+/// Find the first symbol with the given name that overlaps any hunk.
+fn find_overlapping_symbol<'a>(
+    syms: &'a [crate::models::symbol::Symbol],
+    name: &str,
+    hunks: &[HunkInfo],
+) -> Option<&'a crate::models::symbol::Symbol> {
+    syms.iter()
+        .find(|s| s.name == name && symbol_overlaps_hunks(s, hunks))
+}
+
+/// Find the deepest AST node covering the given source range.
+fn descendant_for_range<'a>(
+    root: tree_sitter::Node<'a>,
+    range: &crate::models::location::Range,
+) -> Option<tree_sitter::Node<'a>> {
+    let start = tree_sitter::Point {
+        row: range.start.line,
+        column: range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: range.end.line,
+        column: range.end.column,
+    };
+    root.descendant_for_point_range(start, end)
 }
 
 fn symbol_kind_str(kind: SymbolKind) -> String {
@@ -468,7 +557,7 @@ fn is_ref_in_target_test_context(
     path: &str,
     line: usize,
     column: usize,
-    cache: &mut std::collections::HashMap<String, Option<ParsedFile>>,
+    cache: &mut HashMap<String, Option<ParsedFile>>,
 ) -> bool {
     let entry = cache.entry(path.to_string()).or_insert_with(|| {
         let utf8_path = Utf8Path::new(path);
@@ -515,15 +604,7 @@ fn is_rust_test_context(
     source: &[u8],
     symbol_range: &crate::models::location::Range,
 ) -> bool {
-    let start = tree_sitter::Point {
-        row: symbol_range.start.line,
-        column: symbol_range.start.column,
-    };
-    let end = tree_sitter::Point {
-        row: symbol_range.end.line,
-        column: symbol_range.end.column,
-    };
-    let Some(node) = root.descendant_for_point_range(start, end) else {
+    let Some(node) = descendant_for_range(root, symbol_range) else {
         return false;
     };
 
@@ -575,15 +656,7 @@ fn find_parent_type_name(
     symbol_range: &crate::models::location::Range,
     lang_id: LangId,
 ) -> Option<String> {
-    let start = tree_sitter::Point {
-        row: symbol_range.start.line,
-        column: symbol_range.start.column,
-    };
-    let end = tree_sitter::Point {
-        row: symbol_range.end.line,
-        column: symbol_range.end.column,
-    };
-    let node = root.descendant_for_point_range(start, end)?;
+    let node = descendant_for_range(root, symbol_range)?;
 
     let mut current = Some(node);
     while let Some(n) = current {
