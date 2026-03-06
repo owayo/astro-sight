@@ -1483,3 +1483,112 @@ fn impact_git_mode() {
     );
     assert!(output.stdout.is_empty(), "expected no stdout");
 }
+
+#[test]
+fn impact_excludes_target_test_refs() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // Create fixture: lib.rs with pub fn, consumer.rs with prod + test usage
+    let dir = tempfile::tempdir().expect("tempdir");
+    let lib_rs = dir.path().join("lib.rs");
+    let consumer_rs = dir.path().join("consumer.rs");
+
+    std::fs::write(
+        &lib_rs,
+        r#"pub fn do_work(x: i32) -> i32 {
+    x + 1
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        &consumer_rs,
+        r#"use crate::lib::do_work;
+
+pub fn run() -> i32 {
+    do_work(42)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_run() {
+        assert_eq!(do_work(1), 2);
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // Diff that changes do_work signature
+    let diff = r#"--- a/lib.rs
++++ b/lib.rs
+@@ -1,3 +1,3 @@
+-pub fn do_work(x: i32) -> i32 {
++pub fn do_work(x: i32, y: i32) -> i32 {
+     x + 1
+"#;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["impact", "--dir", dir.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn impact");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should detect unresolved impact in consumer.rs production code (line 4: do_work(42))
+    assert!(
+        !output.status.success(),
+        "expected exit 1 for unresolved impacts"
+    );
+    assert!(
+        stderr.contains("consumer.rs"),
+        "expected consumer.rs in stderr: {stderr}"
+    );
+
+    // Verify test-context refs are excluded:
+    // Only production-code caller (line 4) should appear, NOT the #[cfg(test)] ref (line 14)
+    let lines: Vec<&str> = stderr.lines().collect();
+    let consumer_lines: Vec<&str> = lines
+        .iter()
+        .filter(|l| l.contains("consumer.rs:"))
+        .copied()
+        .collect();
+
+    assert!(
+        !consumer_lines.is_empty(),
+        "expected at least one consumer.rs caller"
+    );
+
+    for line in &consumer_lines {
+        // Extract line number after "consumer.rs:"
+        if let Some(pos) = line.find("consumer.rs:") {
+            let after = &line[pos + "consumer.rs:".len()..];
+            let line_num: usize = after
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0);
+            assert!(
+                line_num < 8,
+                "test-context ref at line {line_num} should be excluded: {line}"
+            );
+        }
+    }
+}

@@ -154,6 +154,9 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
 
     // --- Assemble results ---
     let mut changes = Vec::new();
+    // Cache parsed target files for test-context checks (avoid re-parsing)
+    let mut target_file_cache: std::collections::HashMap<String, Option<ParsedFile>> =
+        std::collections::HashMap::new();
 
     for ctx in file_contexts {
         let mut impacted_callers = Vec::new();
@@ -187,6 +190,15 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
                         if !type_in_ref_file {
                             continue;
                         }
+                    }
+                    // Skip refs in test context in the target file
+                    if is_ref_in_target_test_context(
+                        &r.path,
+                        r.line,
+                        r.column,
+                        &mut target_file_cache,
+                    ) {
+                        continue;
                     }
                     impacted_callers.push(ImpactedCaller {
                         path: r.path.clone(),
@@ -443,6 +455,39 @@ fn lang_compat_group(lang: LangId) -> u8 {
         LangId::Ruby => 9,
         LangId::Bash => 10,
     }
+}
+
+/// Cached parse result: (tree, source bytes, language).
+type ParsedFile = (tree_sitter::Tree, Vec<u8>, LangId);
+
+/// Check if a reference at the given line/column in a target file is inside test context.
+///
+/// Parses the target file on-demand and caches the result to avoid re-parsing.
+/// This filters out impacted callers that are in `#[cfg(test)]` modules or `#[test]` functions.
+fn is_ref_in_target_test_context(
+    path: &str,
+    line: usize,
+    column: usize,
+    cache: &mut std::collections::HashMap<String, Option<ParsedFile>>,
+) -> bool {
+    let entry = cache.entry(path.to_string()).or_insert_with(|| {
+        let utf8_path = Utf8Path::new(path);
+        let source = parser::read_file(utf8_path).ok()?;
+        let source_vec = source.as_bytes().to_vec();
+        let (tree, lang_id) = parser::parse_file(utf8_path, &source).ok()?;
+        Some((tree, source_vec, lang_id))
+    });
+
+    let Some((tree, source, lang_id)) = entry else {
+        return false;
+    };
+
+    let range = crate::models::location::Range {
+        start: crate::models::location::Point { line, column },
+        end: crate::models::location::Point { line, column },
+    };
+
+    is_in_test_context(tree.root_node(), source, &range, *lang_id)
 }
 
 /// Check if a symbol is inside a test context (e.g. `#[cfg(test)]` module, `#[test]` function).
