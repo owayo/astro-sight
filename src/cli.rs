@@ -193,6 +193,10 @@ pub enum Commands {
         /// Use staged changes (git diff --cached)
         #[arg(long)]
         staged: bool,
+
+        /// Append triage hint for AI agent hooks
+        #[arg(long)]
+        hook: bool,
     },
 
     /// Extract import/export dependencies from a source file

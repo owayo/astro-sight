@@ -349,7 +349,8 @@ fn run(cli: Cli) -> Result<()> {
             git,
             base,
             staged,
-        } => cmd_impact(&service, &dir, git, &base, staged),
+            hook,
+        } => cmd_impact(&service, &dir, git, &base, staged, hook),
         Commands::Doctor => cmd_doctor(pretty),
         Commands::Session => cmd_session(),
         Commands::Mcp => cmd_mcp(),
@@ -704,7 +705,14 @@ fn cmd_context(
     Ok(())
 }
 
-fn cmd_impact(service: &AppService, dir: &str, git: bool, base: &str, staged: bool) -> Result<()> {
+fn cmd_impact(
+    service: &AppService,
+    dir: &str,
+    git: bool,
+    base: &str,
+    staged: bool,
+    hook: bool,
+) -> Result<()> {
     let diff_input = if git {
         run_git_diff(dir, base, staged)?
     } else {
@@ -790,6 +798,12 @@ fn cmd_impact(service: &AppService, dir: &str, git: bool, base: &str, staged: bo
             eprintln!("  → {}:{}", caller_path, line);
         }
         eprintln!();
+    }
+
+    if hook {
+        eprintln!(
+            "If these look like false positives, run the `astro-sight-triage` skill to generate a triage report."
+        );
     }
 
     std::process::exit(1);
