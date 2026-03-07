@@ -802,7 +802,7 @@ fn cmd_impact(
 
     if hook {
         eprintln!(
-            "If these look like false positives, run the `astro-sight-triage` skill to generate a triage report."
+            "IMPORTANT: If these look like false positives, you MUST run the `astro-sight-triage` skill to generate a triage report."
         );
     }
 
