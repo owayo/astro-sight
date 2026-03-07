@@ -1690,3 +1690,74 @@ pub fn run() -> String {
         "consumer.rs should not appear as impacted for additive impl block: {stderr}"
     );
 }
+
+#[test]
+fn impact_module_decl_no_false_positive() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // Fixture: lib.rs with module declarations, consumer.rs with same-name local variables
+    let dir = tempfile::tempdir().expect("tempdir");
+    let lib_rs = dir.path().join("lib.rs");
+    let consumer_rs = dir.path().join("consumer.rs");
+
+    // lib.rs: new crate with pub mod declarations
+    std::fs::write(
+        &lib_rs,
+        r#"pub mod arena;
+pub mod ops;
+pub mod tensor;
+"#,
+    )
+    .unwrap();
+
+    // consumer.rs: uses "tensor" as a local variable name (unrelated crate)
+    std::fs::write(
+        &consumer_rs,
+        r#"pub fn process() {
+    let tensor = vec![1.0, 2.0, 3.0];
+    let shape = tensor.len();
+    println!("{shape}");
+}
+"#,
+    )
+    .unwrap();
+
+    // Diff: adding new module declarations
+    let diff = r#"--- /dev/null
++++ b/lib.rs
+@@ -0,0 +1,3 @@
++pub mod arena;
++pub mod ops;
++pub mod tensor;
+"#;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["impact", "--dir", dir.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn impact");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Module declarations should NOT cause false positives on same-name local variables.
+    assert!(
+        output.status.success(),
+        "expected exit 0 for module declarations.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("consumer.rs"),
+        "consumer.rs should not appear as impacted for module declarations: {stdout}"
+    );
+}

@@ -259,8 +259,10 @@ fn should_include_for_cross_file(
     source: &[u8],
     lang_id: LangId,
 ) -> bool {
-    // 1. Skip impl block type names
-    if sym.kind == "type" {
+    // 1. Skip impl block type names and module declarations
+    // Module declarations (e.g. `pub mod tensor`) don't change API surface;
+    // actual content changes are detected from the module's own files in the diff.
+    if sym.kind == "type" || sym.kind == "module" {
         return false;
     }
     // 2. Skip symbols in test context
