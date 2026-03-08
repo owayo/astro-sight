@@ -96,7 +96,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "astro-sight"
-version = "26.3.109"
+version = "26.3.110"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -723,9 +723,9 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "libc"
-version = "0.2.182"
+version = "0.2.183"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6800badb6cb2082ffd7b6a67e6125bb39f18782f793520caee8cb8846be06112"
+checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 
 [[package]]
 name = "libredox"
@@ -1691,6 +1691,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-ruby"
 version = "26.3.101"
+source = "git+https://github.com/owayo/tree-sitter-ruby.git?branch=master#b0f877cd389fb387d0a43fe9a8c2997fdebcbcab"
 dependencies = [
  "cc",
  "tree-sitter-language",
