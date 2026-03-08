@@ -1893,6 +1893,97 @@ pub fn run() -> i32 {
 }
 
 #[test]
+fn impact_same_name_method_no_false_positive() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // Pattern: same-name method across different types.
+    // `Transport::write` changes should NOT be reported as impacting
+    // `Device::write` references in another file.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let transport_rs = dir.path().join("transport.rs");
+    let device_rs = dir.path().join("device.rs");
+
+    // transport.rs: impl Transport with write method
+    std::fs::write(
+        &transport_rs,
+        r#"pub struct Transport {
+    pub base: u64,
+}
+
+impl Transport {
+    pub fn write(&mut self, offset: u64, value: u32) {
+        // write to MMIO register
+        let addr = self.base + offset;
+        unsafe { core::ptr::write_volatile(addr as *mut u32, value) };
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // device.rs: different trait with same-name method, plus usage of both
+    std::fs::write(
+        &device_rs,
+        r#"pub trait Device {
+    fn write(&mut self, offset: u64, size: u8, value: u64);
+}
+
+pub struct Keyboard;
+
+impl Device for Keyboard {
+    fn write(&mut self, offset: u64, size: u8, value: u64) {
+        // handle keyboard write
+    }
+}
+
+pub fn dispatch(dev: &mut dyn Device, offset: u64, value: u64) {
+    dev.write(offset, 1, value);
+}
+"#,
+    )
+    .unwrap();
+
+    // Diff: Transport::write signature changes
+    let diff = r#"--- a/transport.rs
++++ b/transport.rs
+@@ -5,7 +5,7 @@
+
+ impl Transport {
+-    pub fn write(&mut self, offset: u64, value: u32) {
++    pub fn write(&mut self, offset: u64, value: u32, mem: &[u8]) {
+         // write to MMIO register
+         let addr = self.base + offset;
+"#;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["impact", "--dir", dir.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn impact");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // device.rs has its own `write` definition (in trait Device).
+    // Transport::write change should NOT impact Device::write references.
+    assert!(
+        !stdout.contains("device.rs"),
+        "device.rs should not appear as impacted for Transport::write change.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
 fn impact_module_decl_no_false_positive() {
     use std::io::Write;
     use std::process::Stdio;

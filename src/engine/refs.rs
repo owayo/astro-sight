@@ -220,6 +220,7 @@ fn definition_node_kinds(lang_id: LangId) -> Vec<&'static str> {
     match lang_id {
         LangId::Rust => vec![
             "function_item",
+            "function_signature_item", // trait method declarations (no body)
             "struct_item",
             "enum_item",
             "trait_item",

@@ -348,6 +348,19 @@ fn is_relevant_cross_file_ref(
         if !type_in_ref_file {
             return false;
         }
+        // 4b. Skip refs in files that define their own version of the same method
+        // (e.g. target has `trait MmioDevice { fn write() }` which is a different type
+        // from source's `impl MmioTransport { fn write() }`).
+        // When the target file has a competing definition, name-only matching cannot
+        // distinguish which type's method is being called, so we conservatively filter.
+        if let Some(all_refs) = batch_refs.get(sym_name) {
+            let target_has_own_def = all_refs
+                .iter()
+                .any(|other| other.path == r.path && other.kind == Some(RefKind::Definition));
+            if target_has_own_def {
+                return false;
+            }
+        }
     }
     // 5. Skip refs in test context
     if is_ref_in_target_test_context(&r.path, r.line, r.column, target_file_cache) {
