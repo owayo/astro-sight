@@ -98,7 +98,16 @@ fn collect_affected_symbols(
         let root = tree.root_node();
 
         let syms = symbols::extract_symbols(root, &source, lang_id).unwrap_or_default();
-        let affected = find_affected_symbols(&syms, &df.hunks);
+        let affected_raw = find_affected_symbols(&syms, &df.hunks);
+        // Filter test symbols from affected list so they don't appear in output
+        // and don't propagate as impact sources.
+        let affected: Vec<AffectedSymbol> = affected_raw
+            .into_iter()
+            .filter(|sym| {
+                !find_overlapping_symbol(&syms, &sym.name, &df.hunks)
+                    .is_some_and(|s| is_in_test_context(root, &source, &s.range, lang_id))
+            })
+            .collect();
         let sig_changes = detect_signature_changes(diff_input, &df.new_path, &affected);
         let call_edges = calls::extract_calls(root, &source, lang_id, None).unwrap_or_default();
 
@@ -274,6 +283,16 @@ fn should_include_for_cross_file(
     // 3. Skip functions/methods with body-only changes
     if (sym.kind == "function" || sym.kind == "method")
         && !sig_changes.iter().any(|sc| sc.name == sym.name)
+    {
+        return false;
+    }
+    // 3b. Skip type-like symbols whose definition header is unchanged.
+    // e.g. if `trait GuestMemory` line itself didn't change, don't propagate
+    // even if the name appears in other changed lines (like free function signatures).
+    if matches!(
+        sym.kind.as_str(),
+        "trait" | "struct" | "class" | "interface" | "enum"
+    ) && !is_definition_header_in_changed_lines(diff_input, file_path, &sym.name, &sym.kind)
     {
         return false;
     }
@@ -528,6 +547,48 @@ fn extract_function_from_context(context: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Check if a type-like symbol's definition header appears in changed (+/-) lines.
+///
+/// For trait/struct/class/interface/enum symbols, checks that the declaration keyword
+/// followed by the symbol name (e.g. `trait GuestMemory`, `struct Foo`) is present
+/// in a changed line. This prevents false positives where the symbol name only appears
+/// in other changed symbols' signatures (e.g. `fn read_obj(m: &impl GuestMemory)`).
+fn is_definition_header_in_changed_lines(
+    diff_input: &str,
+    file_path: &str,
+    symbol_name: &str,
+    kind: &str,
+) -> bool {
+    let keywords: &[&str] = match kind {
+        "trait" => &["trait"],
+        "struct" => &["struct"],
+        "class" => &["class"],
+        "interface" => &["interface", "trait"],
+        "enum" => &["enum"],
+        _ => return true, // non-type symbols: always pass
+    };
+
+    let mut in_file = false;
+    for line in diff_input.lines() {
+        if line.starts_with("+++ b/") {
+            in_file = line.strip_prefix("+++ b/").unwrap_or("") == file_path;
+        } else if in_file
+            && ((line.starts_with('+') && !line.starts_with("+++"))
+                || (line.starts_with('-') && !line.starts_with("---")))
+        {
+            let content = &line[1..];
+            for kw in keywords {
+                let pattern = format!("{kw} {symbol_name}");
+                if content.contains(&pattern) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 /// Check if a symbol name appears in any changed (+/-) line for the given file in the diff.
