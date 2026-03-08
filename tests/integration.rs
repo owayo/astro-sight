@@ -1692,6 +1692,207 @@ pub fn run() -> String {
 }
 
 #[test]
+fn impact_trait_unchanged_no_false_positive() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // Pattern 1: trait definition is unchanged, but free functions using the trait
+    // have signature changes. The trait name appears in changed lines but the trait
+    // definition header (`trait GuestMemory`) is NOT changed.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mem_rs = dir.path().join("mem.rs");
+    let consumer_rs = dir.path().join("consumer.rs");
+
+    // mem.rs: trait + free function using the trait
+    std::fs::write(
+        &mem_rs,
+        r#"pub trait GuestMemory {
+    fn read(&self, addr: u64, buf: &mut [u8]);
+    fn write(&self, addr: u64, data: &[u8]);
+}
+
+pub fn read_obj<M: GuestMemory + ?Sized>(mem: &M, addr: u64) -> u32 {
+    let mut buf = [0u8; 4];
+    mem.read(addr, &mut buf);
+    u32::from_le_bytes(buf)
+}
+"#,
+    )
+    .unwrap();
+
+    // consumer.rs: imports and uses GuestMemory
+    std::fs::write(
+        &consumer_rs,
+        r#"use crate::mem::GuestMemory;
+
+pub fn process(mem: &dyn GuestMemory) {
+    let val = crate::mem::read_obj(mem, 0x1000);
+    println!("{val}");
+}
+"#,
+    )
+    .unwrap();
+
+    // Diff: only read_obj signature changes (dyn → impl + ?Sized), trait is unchanged
+    let diff = r#"--- a/mem.rs
++++ b/mem.rs
+@@ -5,7 +5,7 @@
+ }
+
+-pub fn read_obj(mem: &dyn GuestMemory, addr: u64) -> u32 {
++pub fn read_obj<M: GuestMemory + ?Sized>(mem: &M, addr: u64) -> u32 {
+     let mut buf = [0u8; 4];
+     mem.read(addr, &mut buf);
+"#;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["impact", "--dir", dir.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn impact");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // GuestMemory trait is NOT changed, so `use crate::mem::GuestMemory` imports
+    // in consumer.rs should NOT be reported as impacted.
+    // read_obj signature DID change, so read_obj callers may be reported.
+    let ctx: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_default();
+    if let Some(changes) = ctx["changes"].as_array() {
+        for change in changes {
+            // GuestMemory should NOT be in affected_symbols
+            let empty = vec![];
+            let affected = change["affected_symbols"].as_array().unwrap_or(&empty);
+            let has_guest_memory = affected
+                .iter()
+                .any(|s| s["name"].as_str() == Some("GuestMemory"));
+            assert!(
+                !has_guest_memory,
+                "GuestMemory trait should not be affected when its definition is unchanged.\nstdout: {stdout}\nstderr: {stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn impact_test_symbols_excluded_from_affected() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // Pattern 2: test symbols (#[cfg(test)] mod tests) should not appear
+    // in affected_symbols list.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let lib_rs = dir.path().join("lib.rs");
+    let consumer_rs = dir.path().join("consumer.rs");
+
+    // lib.rs: pub fn + test module
+    std::fs::write(
+        &lib_rs,
+        r#"pub fn compute(x: i32, y: i32) -> i32 {
+    x * y + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup() -> i32 {
+        42
+    }
+
+    #[test]
+    fn test_compute() {
+        assert_eq!(compute(setup(), 2), 85);
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        &consumer_rs,
+        r#"use crate::lib::compute;
+
+pub fn run() -> i32 {
+    compute(1, 2)
+}
+"#,
+    )
+    .unwrap();
+
+    // Diff: changes both compute signature and test helper
+    let diff = r#"--- a/lib.rs
++++ b/lib.rs
+@@ -1,3 +1,3 @@
+-pub fn compute(x: i32) -> i32 {
+-    x + 1
++pub fn compute(x: i32, y: i32) -> i32 {
++    x * y + 1
+ }
+@@ -8,8 +8,8 @@
+
+-    fn setup() -> i32 {
+-        0
++    fn setup() -> i32 {
++        42
+     }
+
+     #[test]
+-    fn test_compute() {
+-        assert_eq!(compute(setup()), 1);
++    fn test_compute() {
++        assert_eq!(compute(setup(), 2), 85);
+     }
+"#;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["impact", "--dir", dir.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn impact");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let ctx: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_default();
+    if let Some(changes) = ctx["changes"].as_array() {
+        for change in changes {
+            let empty = vec![];
+            let affected = change["affected_symbols"].as_array().unwrap_or(&empty);
+            let test_symbols: Vec<&str> = affected
+                .iter()
+                .filter_map(|s| s["name"].as_str())
+                .filter(|name| *name == "tests" || *name == "setup" || *name == "test_compute")
+                .collect();
+            assert!(
+                test_symbols.is_empty(),
+                "Test symbols should not appear in affected_symbols: {:?}\nstdout: {stdout}",
+                test_symbols
+            );
+        }
+    }
+}
+
+#[test]
 fn impact_module_decl_no_false_positive() {
     use std::io::Write;
     use std::process::Stdio;
