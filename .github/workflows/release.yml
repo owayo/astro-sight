@@ -11,6 +11,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   BINARY_NAME: astro-sight
@@ -78,7 +82,7 @@ jobs:
 
           git commit -m "Release ${{ steps.bump.outputs.tag }}"
           git tag -a "${{ steps.bump.outputs.tag }}" -m "Release ${{ steps.bump.outputs.tag }}"
-          git push origin HEAD "${{ steps.bump.outputs.tag }}"
+          git push origin ${{ github.ref_name }} "${{ steps.bump.outputs.tag }}"
 
       - name: Dry run info
         if: ${{ inputs.dry_run }}
@@ -241,9 +245,134 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  update-homebrew:
+    name: Update Homebrew Tap
+    needs: [prepare-release, release]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.APP_ID }}
+          private_key: ${{ secrets.PRIVATE_KEY }}
+          repositories: '["homebrew-astro-sight"]'
+
+      - name: Download release binaries and create bottles
+        id: bottles
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ needs.prepare-release.outputs.version }}"
+          TAG="${{ needs.prepare-release.outputs.tag }}"
+          REPO="${{ github.repository }}"
+
+          # Download source archive SHA256
+          curl -sL "https://github.com/${REPO}/archive/refs/tags/${TAG}.tar.gz" -o source.tar.gz
+          SHA256_SOURCE=$(sha256sum source.tar.gz | cut -d' ' -f1)
+          echo "sha256_source=${SHA256_SOURCE}" >> $GITHUB_OUTPUT
+
+          # Download release tarballs
+          curl -sL "https://github.com/${REPO}/releases/download/${TAG}/astro-sight-aarch64-apple-darwin.tar.gz" -o mac_arm64.tar.gz
+          curl -sL "https://github.com/${REPO}/releases/download/${TAG}/astro-sight-x86_64-apple-darwin.tar.gz" -o mac_x86_64.tar.gz
+          curl -sL "https://github.com/${REPO}/releases/download/${TAG}/astro-sight-x86_64-unknown-linux-gnu.tar.gz" -o linux_x86_64.tar.gz
+
+          # Function to create a Homebrew bottle tarball
+          create_bottle() {
+            local src_tarball=$1
+            local bottle_tag=$2
+            rm -rf bottle_staging
+            mkdir -p "bottle_staging/astro-sight/${VERSION}/bin"
+            tar xzf "${src_tarball}" -C "bottle_staging/astro-sight/${VERSION}/bin/"
+            chmod +x "bottle_staging/astro-sight/${VERSION}/bin/astro-sight"
+            local bottle_name="astro-sight-${VERSION}.${bottle_tag}.bottle.tar.gz"
+            tar czf "${bottle_name}" -C bottle_staging astro-sight
+            sha256sum "${bottle_name}" | cut -d' ' -f1
+          }
+
+          # Create bottles for each platform
+          SHA256_ARM64=$(create_bottle mac_arm64.tar.gz arm64_sonoma)
+          SHA256_INTEL=$(create_bottle mac_x86_64.tar.gz sonoma)
+          SHA256_LINUX=$(create_bottle linux_x86_64.tar.gz x86_64_linux)
+
+          echo "sha256_arm64=${SHA256_ARM64}" >> $GITHUB_OUTPUT
+          echo "sha256_intel=${SHA256_INTEL}" >> $GITHUB_OUTPUT
+          echo "sha256_linux=${SHA256_LINUX}" >> $GITHUB_OUTPUT
+
+      - name: Upload bottles to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.prepare-release.outputs.tag }}"
+          gh release upload "${TAG}" *.bottle.tar.gz --clobber --repo "${{ github.repository }}"
+
+      - name: Update Homebrew Formula
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          VERSION="${{ needs.prepare-release.outputs.version }}"
+          TAG="${{ needs.prepare-release.outputs.tag }}"
+          SHA256_SOURCE="${{ steps.bottles.outputs.sha256_source }}"
+          SHA256_ARM64="${{ steps.bottles.outputs.sha256_arm64 }}"
+          SHA256_INTEL="${{ steps.bottles.outputs.sha256_intel }}"
+          SHA256_LINUX="${{ steps.bottles.outputs.sha256_linux }}"
+
+          # Clone homebrew tap
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/owayo/homebrew-astro-sight.git"
+          cd homebrew-astro-sight
+
+          # Create Formula directory if not exists
+          mkdir -p Formula
+
+          # Create/update formula
+          cat > Formula/astro-sight.rb << 'FORMULA'
+          class AstroSight < Formula
+            desc "AST information generator CLI for AI agents"
+            homepage "https://github.com/owayo/astro-sight"
+            url "https://github.com/owayo/astro-sight/archive/refs/tags/vVERSION_PLACEHOLDER.tar.gz"
+            sha256 "SOURCE_SHA256_PLACEHOLDER"
+            license "MIT"
+
+            bottle do
+              root_url "https://github.com/owayo/astro-sight/releases/download/vVERSION_PLACEHOLDER"
+              sha256 cellar: :any_skip_relocation, arm64_sonoma: "ARM64_SHA256_PLACEHOLDER"
+              sha256 cellar: :any_skip_relocation, sonoma: "INTEL_SHA256_PLACEHOLDER"
+              sha256 cellar: :any_skip_relocation, x86_64_linux: "LINUX_SHA256_PLACEHOLDER"
+            end
+
+            depends_on "rust" => :build
+
+            def install
+              system "cargo", "install", *std_cargo_args
+            end
+
+            test do
+              system "#{bin}/astro-sight", "--version"
+            end
+          end
+          FORMULA
+
+          # Replace placeholders with actual values
+          sed -i "s|VERSION_PLACEHOLDER|${VERSION}|g" Formula/astro-sight.rb
+          sed -i "s|SOURCE_SHA256_PLACEHOLDER|${SHA256_SOURCE}|g" Formula/astro-sight.rb
+          sed -i "s|ARM64_SHA256_PLACEHOLDER|${SHA256_ARM64}|g" Formula/astro-sight.rb
+          sed -i "s|INTEL_SHA256_PLACEHOLDER|${SHA256_INTEL}|g" Formula/astro-sight.rb
+          sed -i "s|LINUX_SHA256_PLACEHOLDER|${SHA256_LINUX}|g" Formula/astro-sight.rb
+
+          # Remove leading spaces from heredoc
+          sed -i 's/^          //' Formula/astro-sight.rb
+
+          # Commit and push
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/astro-sight.rb
+          git commit -m "Update astro-sight to ${TAG}"
+          git push
+
   release-summary:
     name: Release Summary
-    needs: [prepare-release, release]
+    needs: [prepare-release, release, update-homebrew]
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     steps:
@@ -257,3 +386,5 @@ jobs:
           echo "  - astro-sight-x86_64-apple-darwin.tar.gz"
           echo "  - astro-sight-aarch64-apple-darwin.tar.gz"
           echo "  - astro-sight-x86_64-pc-windows-msvc.zip"
+          echo ""
+          echo "🍺 Homebrew tap updated: owayo/homebrew-astro-sight"
