@@ -16,7 +16,7 @@ use crate::models::response::AstgenResponse;
 use crate::models::sequence::SequenceDiagramResult;
 
 // ---------------------------------------------------------------------------
-// AppService: unified core logic for CLI / Session / MCP
+// AppService: CLI / Session / MCP で共有するコアロジック
 // ---------------------------------------------------------------------------
 
 pub struct AppService {
@@ -24,7 +24,7 @@ pub struct AppService {
     max_input_size: usize,
 }
 
-/// Parameters for AST extraction.
+/// AST 抽出パラメータ。
 pub struct AstParams<'a> {
     pub path: &'a str,
     pub line: Option<usize>,
@@ -42,7 +42,7 @@ impl Default for AppService {
 }
 
 impl AppService {
-    /// Create an unrestricted service (CLI mode).
+    /// 制限なしのサービスを生成する（CLI モード）。
     pub fn new() -> Self {
         Self {
             workspace_root: None,
@@ -50,8 +50,8 @@ impl AppService {
         }
     }
 
-    /// Create a sandboxed service (MCP mode) that restricts paths to `root`.
-    /// The root is canonicalized and must be a valid, non-empty directory.
+    /// パスを `root` 配下に制限したサービスを生成する（MCP モード）。
+    /// `root` は正規化可能な空でないディレクトリでなければならない。
     pub fn sandboxed(root: PathBuf) -> Result<Self> {
         let canonical_root = std::fs::canonicalize(&root).map_err(|_| {
             AstroError::new(
@@ -65,19 +65,38 @@ impl AppService {
                 "Workspace root must not be empty",
             ));
         }
+        if !canonical_root.is_dir() {
+            bail!(AstroError::new(
+                ErrorCode::InvalidRequest,
+                format!("Workspace root must be a directory: {}", root.display()),
+            ));
+        }
         Ok(Self {
             workspace_root: Some(canonical_root),
             max_input_size: 100 * 1024 * 1024, // 100 MB
         })
     }
 
-    /// Create a sandboxed service from an optional workspace spec (Session mode).
-    pub fn from_env() -> Self {
+    /// 環境変数からサービスを生成する（Session モード）。
+    /// `ASTRO_SIGHT_WORKSPACE` が指定されている場合は、不正な値でも無制限モードへは戻さない。
+    pub fn from_env() -> Result<Self> {
         match std::env::var("ASTRO_SIGHT_WORKSPACE") {
-            Ok(ws) if !ws.is_empty() => {
-                Self::sandboxed(PathBuf::from(ws)).unwrap_or_else(|_| Self::new())
-            }
-            _ => Self::new(),
+            Ok(ws) if !ws.is_empty() => Self::sandboxed(PathBuf::from(&ws)).map_err(|e| {
+                if let Some(ae) = e.downcast_ref::<AstroError>() {
+                    AstroError::new(
+                        ae.code,
+                        format!("Invalid ASTRO_SIGHT_WORKSPACE ({ws}): {}", ae.message),
+                    )
+                    .into()
+                } else {
+                    AstroError::new(
+                        ErrorCode::InvalidRequest,
+                        format!("Invalid ASTRO_SIGHT_WORKSPACE ({ws}): {e}"),
+                    )
+                    .into()
+                }
+            }),
+            _ => Ok(Self::new()),
         }
     }
 

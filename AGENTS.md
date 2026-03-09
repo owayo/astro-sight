@@ -14,8 +14,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - **デフォルト compact JSON** 出力（`--pretty` で整形出力）
 - **バッチ処理**（`--paths` / `--paths-file` で複数ファイル NDJSON 出力）
 - **JSON エラー出力**（`{"error":{"code":"...","message":"..."}}` を stdout に出力）
-- **入力検証の強化**（`refs` の空 `name/names` を拒否、`--paths` / `--paths-file` の空リストを拒否）
-- **セキュリティ** — パス境界チェック（MCP: cwd サンドボックス）、ファイル/入力サイズ 100MB 上限
+- **入力検証の強化**（`refs` の空 `name/names` を拒否、`--paths` / `--paths-file` の空リストを拒否、`session` の不正な `ASTRO_SIGHT_WORKSPACE` を拒否）
+- **セキュリティ** — パス境界チェック（Session/MCP のワークスペースサンドボックス）、ファイル/入力サイズ 100MB 上限
 - **トークン最適化** — version フィールド省略（doctor/MCP のみ）、compact キー短縮（`lang`/`ln`/`col`/`ctx`/`refs`/`src`/`def`/`ref`/`fn` 等）、calls を caller グルーピング、CompactAstEdge フラット化、refs/context で相対パス出力、symbols デフォルト compact 出力（`--doc` で docstring 付加、`--full` で旧来の完全出力）
 - **設定ファイル** — `~/.config/astro-sight/config.toml`（TOML 形式、`astro-sight init` で生成）
 - **ロギング** — logroller による日次ローテーション（ローカルタイムゾーン、3日保持）
@@ -44,8 +44,15 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/models/` - Request/Response/AST ノード/Call/Reference/Impact/Sequence/Import/Lint/CoChange 型定義
 - `src/error.rs` - AstroError + ErrorCode（PathOutOfBounds 含む）
 - `src/cache/store.rs` - content-addressed キャッシュ（~/.cache/astro-sight/）
-- `src/session/mod.rs` - NDJSON セッション処理（生行サイズで100MB上限）
+- `src/session/mod.rs` - NDJSON セッション処理（生行サイズで100MB上限、`ASTRO_SIGHT_WORKSPACE` の不正値は fail-closed）
 - `src/language.rs` - 言語検出（拡張子/shebang）
+
+## Review Standards
+
+- 修正対象は再現可能で根拠を示せる不具合に限る。推測や好みに基づく変更は行わない
+- セキュリティ境界は fail-open にしない。設定値やサンドボックスが不正なら明示的に失敗させる
+- コード変更の前には `astro-sight context --dir . --git`、変更後には `astro-sight impact --dir . --git` を実行する
+- コードコメントは必要な箇所にだけ付け、付ける場合は日本語で簡潔に記述する
 
 ## Build & Test
 

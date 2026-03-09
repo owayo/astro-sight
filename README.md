@@ -277,7 +277,7 @@ astro-sight doctor
 echo '{"command":"symbols","path":"src/main.rs"}' | astro-sight session
 ```
 
-stdin から NDJSON リクエストを受け取り、stdout に NDJSON レスポンスを返す。複数リクエストの連続処理に対応。全コマンド（ast, symbols, doctor, calls, refs, context）をサポート。1行あたり 100MB（改行を除く生入力サイズ）を上限としている。
+stdin から NDJSON リクエストを受け取り、stdout に NDJSON レスポンスを返す。複数リクエストの連続処理に対応。`ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange` をサポートする。1行あたり 100MB（改行を除く生入力サイズ）を上限としている。`ASTRO_SIGHT_WORKSPACE` を指定した場合はそのディレクトリ配下だけを扱い、不正な値なら `INVALID_REQUEST` で終了する。
 
 ```bash
 # calls コマンド
@@ -450,7 +450,7 @@ astro-sight skill-install codex
 - **YES → Use `astro-sight refs`** (Grep FORBIDDEN)
 - **NO → Grep OK** (error messages, config values, TODOs, file paths, etc.)
 
-⚠️ **Pipe-separated patterns**: `Grep "FOO|Bar|baz"` with code identifiers is also FORBIDDEN. Use `session` for batch refs instead.
+⚠️ **Pipe-separated patterns**: `Grep "FOO|Bar|baz"` with code identifiers is also FORBIDDEN. Use `astro-sight refs --names FOO,Bar,baz --dir .`.
 
 This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches only identifier nodes, zero false positives from comments/strings.
 
@@ -473,6 +473,8 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 - **Understanding a directory**: Run `astro-sight symbols --dir <dir>` to see all symbols
 - **Finding symbol usage**: Run `astro-sight refs` (Grep FORBIDDEN)
 - **Finding multiple symbols**: Run `astro-sight refs --names sym1,sym2 --dir .`
+- **Batching mixed astro-sight queries**: Run `astro-sight session`
+- **Checking repeated AST/text patterns**: Run `astro-sight lint --path <file> --rules rules.yaml`
 
 ## Command Quick Reference
 
@@ -484,14 +486,24 @@ astro-sight calls --path <file> --function <name>  # Caller/callee relationships
 astro-sight context --dir . --git                  # Change impact analysis (run BEFORE editing code)
 astro-sight impact --dir . --git                   # Detect unresolved impacts (run AFTER editing code)
 astro-sight imports --path <file>                  # Import relationships
+astro-sight lint --path <file> --rules rules.yaml  # AST/text pattern checks
 astro-sight sequence --path <file>                 # Call flow visualization
 astro-sight cochange --dir .                       # Co-change patterns
+astro-sight session                                # Mixed NDJSON batch queries
 
 ## Efficiency Rules
 - **`refs` results include `context` (source line)** → No need for additional Read/Grep
-- **Batch multiple symbol searches with `refs --names`** (simpler than session)
+- **Batch multiple symbol searches with `refs --names`** (reserve `session` for mixed commands)
 - **Use Read for surrounding context when editing** (astro-sight shows 1 line only)
 ```
+
+### CodeRabbit と併用する
+
+CodeRabbit は `AGENTS.md` / `CLAUDE.md` / `agent.md` などのガイドラインファイルを自動検出してレビュー基準に反映するため、このリポジトリではこれらの指示を最新に保つのが効果的。
+
+- 通常は incremental review を前提にし、追加コミットだけを見直したいときは `@coderabbitai review`、既存コメントを無視して全体を見直したいときは `@coderabbitai full review` を使う
+- PR 要約は `@coderabbitai summary` プレースホルダや `.coderabbit.yaml` の `high_level_summary_instructions` / `high_level_summary_in_walkthrough` で制御すると、変更概要を安定して共有しやすい
+- 継続させたいレビュー方針はレビューコメントへの返信で learning として伝え、単発の例外は恒久ルール化しない
 
 ### MCP サーバーとして登録
 
