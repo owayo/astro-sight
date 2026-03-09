@@ -1,6 +1,6 @@
 ---
 name: astro-sight
-description: "STOP before using Grep for code identifiers (including pipe-separated patterns like FOO|Bar). Use `astro-sight refs` — AST-based, zero false positives. Use `symbols` to understand file structure. Use `git diff | astro-sight context` before editing code. 15 languages."
+description: "STOP before using Grep for code identifiers (including pipe-separated patterns like FOO|Bar). Use `astro-sight refs` / `refs --names` for symbol search, `context` / `impact` around edits, and `session` for mixed batch queries. 15 languages."
 ---
 
 # astro-sight
@@ -17,6 +17,8 @@ description: "STOP before using Grep for code identifiers (including pipe-separa
 - Want to know **what a code change breaks**? → `astro-sight context --dir . --git`
 - Want to detect **unresolved impacts after editing**? → `astro-sight impact --dir . --git`
 - Need to see **what a file imports**? → `astro-sight imports`
+- Need to **batch mixed astro-sight queries** in one process? → `astro-sight session`
+- Need to **check repeated AST/text patterns**? → `astro-sight lint`
 - Need a **visual call flow diagram**? → `astro-sight sequence`
 - Need to find **files that usually change together**? → `astro-sight cochange`
 
@@ -46,6 +48,9 @@ astro-sight calls --path <file> --function <function_name>
 # 7. Batch operations — multiple queries in one process
 echo '{"command":"refs","name":"Sym1","dir":"."}
 {"command":"symbols","path":"src/main.rs"}' | astro-sight session
+
+# 8. Repeated AST/text checks
+astro-sight lint --path <file> --rules rules.yaml
 ```
 
 ## Commands
@@ -208,6 +213,13 @@ echo '{"command":"refs","name":"MyType","dir":"src/"}
 astro-sight refs --names FOO,Bar,baz --dir .
 ```
 
+### "I need several different astro-sight queries in one request"
+```bash
+echo '{"command":"symbols","path":"src/main.rs"}
+{"command":"calls","path":"src/main.rs","function":"main"}
+{"command":"context","dir":".","diff":"..."}' | astro-sight session
+```
+
 ### "Before editing code" (run FIRST)
 ```bash
 astro-sight context --dir . --git
@@ -237,11 +249,17 @@ astro-sight calls --path file.rs --function old_name  # See callers
 git diff origin/main | astro-sight context --dir .
 ```
 
+### "I need to enforce a repeated AST/text rule"
+```bash
+astro-sight lint --path src/main.rs --rules rules.yaml
+```
+
 ## Notes
 
 - 15 languages: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby
 - All output is compact JSON (short keys: `lang`, `ln`, `col`, `ctx`, `refs`, `src`, `def`/`ref`, `fn` etc.)
 - `refs` results include `ctx` (source line) — no need to Read files afterward
 - `refs` respects `.gitignore` and uses parallel scanning
-- Multiple symbol searches: use `refs --names` for batching (or `session` for mixed commands)
+- Multiple symbol searches: use `refs --names` for batching; reserve `session` for mixed commands
+- `session` supports `ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange`
 - **Input validation**: Empty `--name`/`--names`, empty `--paths`/`--paths-file` are rejected with `INVALID_REQUEST` error

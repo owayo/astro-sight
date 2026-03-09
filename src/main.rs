@@ -822,7 +822,7 @@ fn cmd_doctor(pretty: bool) -> Result<()> {
 }
 
 fn cmd_session() -> Result<()> {
-    let service = AppService::from_env();
+    let service = AppService::from_env()?;
     session::run_session(|req| handle_request(&service, req))
 }
 

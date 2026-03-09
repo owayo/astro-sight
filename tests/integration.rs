@@ -676,16 +676,16 @@ fn mcp_initialize() {
     assert!(json["result"]["capabilities"]["tools"].is_object());
 }
 
-// ---- Phase 2: Security tests ----
+// ---- フェーズ 2: セキュリティテスト ----
 
 #[test]
 fn sandboxed_service_rejects_path_traversal() {
-    // AppService::sandboxed should reject paths outside the workspace boundary
+    // AppService::sandboxed はワークスペース外のパスを拒否する。
     let cwd = std::env::current_dir().unwrap();
     let cwd = std::fs::canonicalize(cwd).unwrap();
     let service = astro_sight::service::AppService::sandboxed(cwd).unwrap();
 
-    // Try to extract AST for /etc/hosts (outside workspace)
+    // ワークスペース外の /etc/hosts を指定する。
     let params = astro_sight::service::AstParams {
         path: "/etc/hosts",
         line: None,
@@ -696,25 +696,80 @@ fn sandboxed_service_rejects_path_traversal() {
         context_lines: 3,
     };
     let result = service.extract_ast(&params);
-    assert!(result.is_err(), "Should reject path outside workspace");
+    assert!(result.is_err(), "ワークスペース外のパスは拒否されるべき");
 
-    let err_msg = result.unwrap_err().to_string();
+    let err_msg = match result {
+        Ok(_) => String::new(),
+        Err(err) => err.to_string(),
+    };
     assert!(
         err_msg.contains("outside workspace") || err_msg.contains("PATH_OUT_OF_BOUNDS"),
-        "Error should mention workspace boundary: {err_msg}"
+        "エラーにワークスペース境界が含まれるべき: {err_msg}"
     );
 }
 
 #[test]
 fn sandboxed_service_allows_workspace_paths() {
-    // AppService::sandboxed should allow paths within the workspace
+    // AppService::sandboxed はワークスペース内のパスを許可する。
     let cwd = std::env::current_dir().unwrap();
     let cwd = std::fs::canonicalize(cwd).unwrap();
     let service = astro_sight::service::AppService::sandboxed(cwd).unwrap();
 
-    // src/lib.rs should be within workspace
+    // src/lib.rs はワークスペース内にある。
     let result = service.extract_symbols("src/lib.rs");
-    assert!(result.is_ok(), "Should allow path within workspace");
+    assert!(result.is_ok(), "ワークスペース内のパスは許可されるべき");
+}
+
+#[test]
+fn sandboxed_service_rejects_file_workspace_root() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let file_path = dir.path().join("workspace.txt");
+    std::fs::write(&file_path, "not a directory").unwrap();
+
+    let result = astro_sight::service::AppService::sandboxed(file_path.clone());
+    assert!(
+        result.is_err(),
+        "ファイルをワークスペースルートにしてはいけない"
+    );
+
+    let err_msg = match result {
+        Ok(_) => String::new(),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err_msg.contains("directory"),
+        "エラーにディレクトリ要件が含まれるべき: {err_msg}"
+    );
+}
+
+#[test]
+fn session_rejects_invalid_workspace_env() {
+    let missing = std::env::temp_dir().join(format!(
+        "astro-sight-missing-workspace-{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("session")
+    ));
+
+    let output = cargo_bin()
+        .arg("session")
+        .env("ASTRO_SIGHT_WORKSPACE", &missing)
+        .output()
+        .expect("failed to run session");
+
+    assert!(
+        !output.status.success(),
+        "不正なワークスペース環境変数では失敗するべき"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["error"]["code"], "INVALID_REQUEST");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("ASTRO_SIGHT_WORKSPACE"),
+        "エラーに環境変数名が含まれるべき"
+    );
 }
 
 #[test]
@@ -722,7 +777,7 @@ fn session_ast_includes_diagnostics() {
     use std::io::Write;
     use std::process::Stdio;
 
-    // Session AST should now include snippet + diagnostics (unified via AppService)
+    // Session の AST 応答には snippet と diagnostics が含まれる。
     let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
         .arg("session")
         .stdin(Stdio::piped())
@@ -744,12 +799,12 @@ fn session_ast_includes_diagnostics() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let json: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("should be valid JSON");
-    // Session AST should now include snippet (previously missing via AppService unification)
+    // snippet が含まれることを確認する。
     assert!(
         json.get("snippet").is_some(),
         "Session AST response should include snippet field"
     );
-    // hash should also be present
+    // hash も含まれることを確認する。
     assert!(json.get("hash").is_some());
 }
 
