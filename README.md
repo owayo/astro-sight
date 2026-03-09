@@ -30,9 +30,55 @@
 
 ## Install
 
+### Homebrew (macOS/Linux)
+
 ```bash
-cargo install --path .
+brew install owayo/astro-sight/astro-sight
 ```
+
+### From Source
+
+```bash
+git clone https://github.com/owayo/astro-sight.git
+cd astro-sight
+make install
+```
+
+### From GitHub Releases
+
+Download the latest binary from [Releases](https://github.com/owayo/astro-sight/releases).
+
+#### macOS (Apple Silicon)
+
+```bash
+curl -L https://github.com/owayo/astro-sight/releases/latest/download/astro-sight-aarch64-apple-darwin.tar.gz | tar xz
+sudo mv astro-sight /usr/local/bin/
+```
+
+#### macOS (Intel)
+
+```bash
+curl -L https://github.com/owayo/astro-sight/releases/latest/download/astro-sight-x86_64-apple-darwin.tar.gz | tar xz
+sudo mv astro-sight /usr/local/bin/
+```
+
+#### Linux (x86_64)
+
+```bash
+curl -L https://github.com/owayo/astro-sight/releases/latest/download/astro-sight-x86_64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv astro-sight /usr/local/bin/
+```
+
+#### Linux (ARM64)
+
+```bash
+curl -L https://github.com/owayo/astro-sight/releases/latest/download/astro-sight-aarch64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv astro-sight /usr/local/bin/
+```
+
+#### Windows
+
+Download `astro-sight-x86_64-pc-windows-msvc.zip` from [Releases](https://github.com/owayo/astro-sight/releases), extract, and add to PATH.
 
 ## Usage
 
