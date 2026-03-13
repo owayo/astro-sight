@@ -351,16 +351,17 @@ fn is_relevant_cross_file_ref(
         if !type_in_ref_file {
             return false;
         }
-        // 4b. Skip refs in files that define their own version of the same method
-        // (e.g. target has `trait MmioDevice { fn write() }` which is a different type
-        // from source's `impl MmioTransport { fn write() }`).
-        // When the target file has a competing definition, name-only matching cannot
-        // distinguish which type's method is being called, so we conservatively filter.
+        // 4b. 同名メソッドの型横断マッチ防止
+        // ソースファイル以外に同名メソッドの Definition が存在する場合、
+        // 異なる型が同名メソッドを定義している。名前だけでは呼び出し元が
+        // どの型のメソッドを参照しているか判別できないため保守的にフィルタ。
+        // (例: MmapDictionary::search と DoubleArrayTrie::search が共存する場合、
+        //  ターゲットファイルの search() 呼び出しがどちらの型かは不明)
         if let Some(all_refs) = batch_refs.get(sym_name) {
-            let target_has_own_def = all_refs
-                .iter()
-                .any(|other| other.path == r.path && other.kind == Some(RefKind::Definition));
-            if target_has_own_def {
+            let has_competing_def = all_refs.iter().any(|other| {
+                other.kind == Some(RefKind::Definition) && !other.path.ends_with(source_path)
+            });
+            if has_competing_def {
                 return false;
             }
         }
