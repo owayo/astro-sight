@@ -808,19 +808,19 @@ fn is_python_test_context(
     while let Some(n) = current {
         if n.kind() == "function_definition"
             && let Some(name) = n.child_by_field_name("name")
-                && let Ok(text) = name.utf8_text(source)
-                && text.starts_with("test_")
-            {
-                return true;
-            }
+            && let Ok(text) = name.utf8_text(source)
+            && text.starts_with("test_")
+        {
+            return true;
+        }
         // TestCase サブクラス内
         if n.kind() == "class_definition"
             && let Some(bases) = n.child_by_field_name("superclasses")
-                && let Ok(text) = bases.utf8_text(source)
-                && text.contains("TestCase")
-            {
-                return true;
-            }
+            && let Ok(text) = bases.utf8_text(source)
+            && text.contains("TestCase")
+        {
+            return true;
+        }
         // pytest decorator
         if n.kind() == "decorated_definition" {
             let mut cursor = n.walk();
@@ -852,19 +852,14 @@ fn is_js_test_context(
     while let Some(n) = current {
         if n.kind() == "call_expression"
             && let Some(func) = n.child_by_field_name("function")
-                && let Ok(name) = func.utf8_text(source)
-                && matches!(
-                    name,
-                    "test"
-                        | "it"
-                        | "describe"
-                        | "beforeEach"
-                        | "afterEach"
-                        | "beforeAll"
-                        | "afterAll"
-                ) {
-                    return true;
-                }
+            && let Ok(name) = func.utf8_text(source)
+            && matches!(
+                name,
+                "test" | "it" | "describe" | "beforeEach" | "afterEach" | "beforeAll" | "afterAll"
+            )
+        {
+            return true;
+        }
         current = n.parent();
     }
     false
@@ -903,12 +898,11 @@ fn has_jvm_annotation(node: tree_sitter::Node, source: &[u8], name: &str) -> boo
         if matches!(
             child.kind(),
             "modifiers" | "marker_annotation" | "annotation"
-        )
-            && let Ok(text) = child.utf8_text(source)
-                && text.contains(name)
-            {
-                return true;
-            }
+        ) && let Ok(text) = child.utf8_text(source)
+            && text.contains(name)
+        {
+            return true;
+        }
     }
     // prev sibling check (annotation が method の前に独立ノードとして存在する場合)
     let mut prev = node.prev_named_sibling();
@@ -942,9 +936,10 @@ fn is_csharp_test_context(
     let mut current = Some(node);
     while let Some(n) = current {
         if n.kind() == "method_declaration"
-            && has_csharp_attribute(n, source, &["Test", "TestMethod", "Fact", "Theory"]) {
-                return true;
-            }
+            && has_csharp_attribute(n, source, &["Test", "TestMethod", "Fact", "Theory"])
+        {
+            return true;
+        }
         current = n.parent();
     }
     false
@@ -983,19 +978,19 @@ fn is_ruby_test_context(
         // RSpec: describe/it/before/after call
         if n.kind() == "call"
             && let Some(method) = n.child_by_field_name("method")
-                && let Ok(name) = method.utf8_text(source)
-                && matches!(name, "describe" | "context" | "it" | "before" | "after")
-            {
-                return true;
-            }
+            && let Ok(name) = method.utf8_text(source)
+            && matches!(name, "describe" | "context" | "it" | "before" | "after")
+        {
+            return true;
+        }
         // Minitest: test_* メソッド
         if n.kind() == "method"
             && let Some(name) = n.child_by_field_name("name")
-                && let Ok(text) = name.utf8_text(source)
-                && (text.starts_with("test_") || text == "setup" || text == "teardown")
-            {
-                return true;
-            }
+            && let Ok(text) = name.utf8_text(source)
+            && (text.starts_with("test_") || text == "setup" || text == "teardown")
+        {
+            return true;
+        }
         current = n.parent();
     }
     false
