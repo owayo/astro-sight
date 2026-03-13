@@ -303,6 +303,7 @@ fn is_identifier_kind(kind: &str) -> bool {
             | "namespace_identifier"
             | "package_identifier"
             | "name"
+            | "qualified_name"
             | "word"
             | "constant"
     )
