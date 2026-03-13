@@ -268,7 +268,7 @@ impl AppService {
         let edges = calls::extract_calls(root, &source, lang_id, function)?;
 
         let graph = CallGraph {
-            language: format!("{lang_id:?}").to_lowercase(),
+            language: lang_id.to_string(),
             calls: edges,
         };
         debug!(
@@ -295,7 +295,7 @@ impl AppService {
         let root = tree.root_node();
 
         let edges = calls::extract_calls(root, &source, lang_id, function)?;
-        let language = format!("{lang_id:?}").to_lowercase();
+        let language = lang_id.to_string();
 
         let result = crate::engine::sequence::generate_sequence_diagram(&edges, &language);
         debug!(
@@ -317,7 +317,7 @@ impl AppService {
         let root = tree.root_node();
 
         let edges = imports::extract_imports(root, &source, lang_id)?;
-        let language = format!("{lang_id:?}").to_lowercase();
+        let language = lang_id.to_string();
 
         let result = ImportsResult {
             language,

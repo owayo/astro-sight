@@ -106,19 +106,7 @@ fn collect_identifier_refs(
     lang_id: LangId,
     refs: &mut Vec<SymbolReference>,
 ) {
-    let kind = node.kind();
-    let is_identifier = kind == "identifier"
-        || kind == "type_identifier"
-        || kind == "field_identifier"
-        || kind == "property_identifier"
-        || kind == "simple_identifier"
-        || kind == "namespace_identifier"
-        || kind == "package_identifier"
-        || kind == "name"
-        || kind == "word"
-        || kind == "constant"; // Ruby: class/module/constant names
-
-    if is_identifier
+    if is_identifier_kind(node.kind())
         && let Ok(text) = node.utf8_text(source)
         && text == symbol_name
     {
@@ -303,6 +291,23 @@ fn definition_node_kinds(lang_id: LangId) -> Vec<&'static str> {
     }
 }
 
+/// identifier ノードかどうかを判定する。
+fn is_identifier_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier"
+            | "type_identifier"
+            | "field_identifier"
+            | "property_identifier"
+            | "simple_identifier"
+            | "namespace_identifier"
+            | "package_identifier"
+            | "name"
+            | "word"
+            | "constant"
+    )
+}
+
 /// Extract the source line at a given row for context.
 fn extract_line_context(source: &[u8], row: usize) -> String {
     let text = std::str::from_utf8(source).unwrap_or("");
@@ -422,19 +427,9 @@ fn collect_identifier_refs_batch(
     lang_id: LangId,
     refs: &mut std::collections::HashMap<String, Vec<SymbolReference>>,
 ) {
-    let kind = node.kind();
-    let is_identifier = kind == "identifier"
-        || kind == "type_identifier"
-        || kind == "field_identifier"
-        || kind == "property_identifier"
-        || kind == "simple_identifier"
-        || kind == "namespace_identifier"
-        || kind == "package_identifier"
-        || kind == "name"
-        || kind == "word"
-        || kind == "constant"; // Ruby: class/module/constant names
-
-    if is_identifier && let Ok(text) = node.utf8_text(source) {
+    if is_identifier_kind(node.kind())
+        && let Ok(text) = node.utf8_text(source)
+    {
         for name in symbol_names {
             if text == name.as_str() {
                 let is_def = is_definition_context(node, definition_kinds, lang_id);
