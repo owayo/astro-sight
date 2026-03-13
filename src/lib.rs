@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod cli;
+pub mod commands;
 pub mod config;
 pub mod doctor;
 pub mod engine;
