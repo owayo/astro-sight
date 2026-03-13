@@ -66,6 +66,7 @@ fn collect_affected_symbols(
 ) {
     let mut file_contexts = Vec::new();
     let mut all_symbol_names: Vec<String> = Vec::new();
+    let mut symbol_name_set: HashSet<String> = HashSet::new();
     let mut method_parent_types: HashMap<String, String> = HashMap::new();
     let mut included_symbols: HashSet<String> = HashSet::new();
 
@@ -112,7 +113,7 @@ fn collect_affected_symbols(
         let call_edges = calls::extract_calls(root, &source, lang_id, None).unwrap_or_default();
 
         for sym in &affected {
-            if all_symbol_names.contains(&sym.name) {
+            if symbol_name_set.contains(&sym.name) {
                 continue;
             }
             if !should_include_for_cross_file(
@@ -134,10 +135,11 @@ fn collect_affected_symbols(
                     find_parent_type_name(root, &source, &orig.range, lang_id)
             {
                 method_parent_types.insert(sym.name.clone(), parent_type.clone());
-                if !all_symbol_names.contains(&parent_type) {
+                if symbol_name_set.insert(parent_type.clone()) {
                     all_symbol_names.push(parent_type);
                 }
             }
+            symbol_name_set.insert(sym.name.clone());
             all_symbol_names.push(sym.name.clone());
         }
 
@@ -395,7 +397,7 @@ fn find_affected_symbols(
 
                 affected.push(AffectedSymbol {
                     name: sym.name.clone(),
-                    kind: symbol_kind_str(sym.kind),
+                    kind: symbol_kind_str(sym.kind).to_string(),
                     change_type: change_type.to_string(),
                 });
                 break; // Don't double-count
@@ -441,7 +443,7 @@ fn descendant_for_range<'a>(
     root.descendant_for_point_range(start, end)
 }
 
-fn symbol_kind_str(kind: SymbolKind) -> String {
+fn symbol_kind_str(kind: SymbolKind) -> &'static str {
     match kind {
         SymbolKind::Function => "function",
         SymbolKind::Method => "method",
@@ -458,7 +460,6 @@ fn symbol_kind_str(kind: SymbolKind) -> String {
         SymbolKind::Field => "field",
         SymbolKind::Parameter => "parameter",
     }
-    .to_string()
 }
 
 /// Detect signature changes by looking at removed (-) and added (+) lines in the diff

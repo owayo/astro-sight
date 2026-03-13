@@ -52,8 +52,7 @@ impl CacheStore {
 }
 
 fn cache_dir() -> PathBuf {
-    dirs::home_dir()
+    dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".cache")
         .join("astro-sight")
 }
