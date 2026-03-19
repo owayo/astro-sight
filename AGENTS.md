@@ -15,7 +15,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - **バッチ処理**（`--paths` / `--paths-file` で複数ファイル NDJSON 出力）
 - **JSON エラー出力**（`{"error":{"code":"...","message":"..."}}` を stdout に出力）
 - **入力検証の強化**（`refs` の空 `name/names` を拒否、`--paths` / `--paths-file` の空リストを拒否、`session` の不正な `ASTRO_SIGHT_WORKSPACE` を拒否）
-- **セキュリティ** — パス境界チェック（Session/MCP のワークスペースサンドボックス）、ファイル/入力サイズ 100MB 上限
+- **セキュリティ** — パス境界チェック（Session/MCP のワークスペースサンドボックス）、ファイル/入力サイズ 100MB 上限（`session` / `context` / `impact` の生入力を含む）
 - **トークン最適化** — version フィールド省略（doctor/MCP のみ）、compact キー短縮（`lang`/`ln`/`col`/`ctx`/`refs`/`src`/`def`/`ref`/`fn` 等）、calls を caller グルーピング、CompactAstEdge フラット化、refs/context で相対パス出力、symbols デフォルト compact 出力（`--doc` で docstring 付加、`--full` で旧来の完全出力）
 - **設定ファイル** — `~/.config/astro-sight/config.toml`（TOML 形式、`astro-sight init` で生成）
 - **ロギング** — logroller による日次ローテーション（ローカルタイムゾーン、3日保持）
@@ -53,6 +53,15 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - セキュリティ境界は fail-open にしない。設定値やサンドボックスが不正なら明示的に失敗させる
 - コード変更の前には `astro-sight context --dir . --git`、変更後には `astro-sight impact --dir . --git` を実行する
 - コードコメントは必要な箇所にだけ付け、付ける場合は日本語で簡潔に記述する
+
+## CodeRabbit
+
+- `AGENTS.md` は CodeRabbit の code guidelines として自動参照される前提で、実装と矛盾しない内容を保つ
+- `.coderabbit.yaml` の `path_instructions` は補助ルールとして使い、恒久ルールや広域ルールは `AGENTS.md` / `skills/SKILL.md` に置く
+- `.coderabbit.yaml` の `path_instructions` では `src/**/*.rs` は正確性・セキュリティ・fail-closed・サイズ上限、`tests/**/*.rs` は境界値・異常系・回帰防止を優先させる
+- pre-merge checks を導入する場合は、まず `warning` で学習させ、安定後にだけ `error` へ上げる
+- pre-merge checks の override は原則として requested reviewer のみに許可する
+- 恒久ルールは `AGENTS.md` / `skills/SKILL.md` に集約し、単発の例外は PR 上の会話で伝える
 
 ## Build & Test
 

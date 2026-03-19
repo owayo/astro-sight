@@ -1,6 +1,6 @@
 ---
 name: astro-sight
-description: "STOP before using Grep for code identifiers (including pipe-separated patterns like FOO|Bar). Use `astro-sight refs` / `refs --names` for symbol search, `context` / `impact` around edits, and `session` for mixed batch queries. 15 languages."
+description: "STOP before using Grep for code identifiers (including pipe-separated patterns like FOO|Bar). Use `refs` for identifiers, `symbols`/`calls`/`imports` for structure, `context`/`impact` around edits, and `session`/`sequence`/`cochange`/`lint` when you need mixed queries, flow, hotspots, or repeated rules."
 ---
 
 # astro-sight
@@ -17,7 +17,7 @@ description: "STOP before using Grep for code identifiers (including pipe-separa
 - Want to know **what a code change breaks**? → `astro-sight context --dir . --git`
 - Want to detect **unresolved impacts after editing**? → `astro-sight impact --dir . --git`
 - Need to see **what a file imports**? → `astro-sight imports`
-- Need to **batch mixed astro-sight queries** in one process? → `astro-sight session`
+- Need to **batch 2+ mixed astro-sight queries** in one process? → `astro-sight session`
 - Need to **check repeated AST/text patterns**? → `astro-sight lint`
 - Need a **visual call flow diagram**? → `astro-sight sequence`
 - Need to find **files that usually change together**? → `astro-sight cochange`
@@ -33,23 +33,32 @@ astro-sight refs --name <symbol_name> --dir .
 # 2. Batch symbol search (REPLACES Grep "FOO|Bar|baz")
 astro-sight refs --names sym1,sym2,sym3 --dir .
 
-# 3. Analyze what a diff breaks (run BEFORE editing code)
-astro-sight context --dir . --git
-
-# 4. Understand file structure (functions, classes, structs)
+# 3. Understand file structure (functions, classes, structs)
 astro-sight symbols --path <file>
 
-# 5. Understand directory structure (all files, NDJSON)
-astro-sight symbols --dir <dir> --glob "**/*.rs"
+# 4. Analyze what a diff breaks (run BEFORE editing code)
+astro-sight context --dir . --git
 
-# 6. Show caller/callee relationships
+# 5. Show caller/callee relationships
 astro-sight calls --path <file> --function <function_name>
 
-# 7. Batch operations — multiple queries in one process
+# 6. Extract imports/exports
+astro-sight imports --path <file>
+
+# 7. Detect unresolved impacts after edits
+astro-sight impact --dir . --git
+
+# 8. Batch operations — multiple queries in one process
 echo '{"command":"refs","name":"Sym1","dir":"."}
 {"command":"symbols","path":"src/main.rs"}' | astro-sight session
 
-# 8. Repeated AST/text checks
+# 9. Visualize call flow
+astro-sight sequence --path src/main.rs --function main
+
+# 10. Check change hotspots
+astro-sight cochange --dir . --file src/service.rs
+
+# 11. Repeated AST/text checks
 astro-sight lint --path <file> --rules rules.yaml
 ```
 
@@ -247,6 +256,16 @@ astro-sight calls --path file.rs --function old_name  # See callers
 ### "What does this PR break?"
 ```bash
 git diff origin/main | astro-sight context --dir .
+```
+
+### "What changed together with this file recently?"
+```bash
+astro-sight cochange --dir . --file src/service.rs
+```
+
+### "Show me the call flow visually"
+```bash
+astro-sight sequence --path src/main.rs --function main
 ```
 
 ### "I need to enforce a repeated AST/text rule"

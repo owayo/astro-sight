@@ -188,7 +188,8 @@ fn assemble_impacts(
     let mut target_file_cache: HashMap<String, Option<ParsedFile>> = HashMap::new();
 
     for ctx in file_contexts {
-        let mut impacted_callers = Vec::new();
+        // (path, line) → (name, symbols) で重複マージしつつシンボルを追跡
+        let mut caller_map: HashMap<(String, usize), (String, Vec<String>)> = HashMap::new();
 
         let source_lang_group = lang_compat_group(ctx.lang_id);
         for sym in &ctx.affected {
@@ -208,15 +209,18 @@ fn assemble_impacts(
                     ) {
                         continue;
                     }
-                    impacted_callers.push(ImpactedCaller {
-                        path: r.path.clone(),
-                        name: r
+                    let key = (r.path.clone(), r.line);
+                    let entry = caller_map.entry(key).or_insert_with(|| {
+                        let name = r
                             .context
                             .as_deref()
                             .and_then(extract_function_from_context)
-                            .unwrap_or_else(|| sym.name.clone()),
-                        line: r.line,
+                            .unwrap_or_else(|| sym.name.clone());
+                        (name, Vec::new())
                     });
+                    if !entry.1.contains(&sym.name) {
+                        entry.1.push(sym.name.clone());
+                    }
                 }
             }
         }
@@ -226,18 +230,28 @@ fn assemble_impacts(
                 if edge.callee.name == sym.name {
                     let caller_line = edge.call_site.line;
                     if !ctx.affected.iter().any(|a| a.name == edge.caller.name) {
-                        impacted_callers.push(ImpactedCaller {
-                            path: ctx.new_path.clone(),
-                            name: edge.caller.name.clone(),
-                            line: caller_line,
-                        });
+                        let key = (ctx.new_path.clone(), caller_line);
+                        let entry = caller_map
+                            .entry(key)
+                            .or_insert_with(|| (edge.caller.name.clone(), Vec::new()));
+                        if !entry.1.contains(&sym.name) {
+                            entry.1.push(sym.name.clone());
+                        }
                     }
                 }
             }
         }
 
+        let mut impacted_callers: Vec<ImpactedCaller> = caller_map
+            .into_iter()
+            .map(|((path, line), (name, symbols))| ImpactedCaller {
+                path,
+                name,
+                line,
+                symbols,
+            })
+            .collect();
         impacted_callers.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line.cmp(&b.line)));
-        impacted_callers.dedup_by(|a, b| a.path == b.path && a.line == b.line);
 
         changes.push(FileImpact {
             path: ctx.new_path,

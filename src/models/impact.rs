@@ -31,6 +31,9 @@ pub struct ImpactedCaller {
     pub path: String,
     pub name: String,
     pub line: usize,
+    /// 影響を引き起こしたシンボル名のリスト
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub symbols: Vec<String>,
 }
 
 /// A parsed diff file entry with change and hunk info.

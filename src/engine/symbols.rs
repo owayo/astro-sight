@@ -35,8 +35,50 @@ pub fn is_symbol_exported(
         }
         LangId::Rust => is_exported_rust(node),
         LangId::Go => is_exported_go(node, source),
+        LangId::Java | LangId::Kotlin => is_exported_jvm(node, source),
         _ => true, // conservative for unsupported languages
     }
+}
+
+/// Java/Kotlin: `private` 修飾子があれば非公開と判定。
+/// デフォルト（修飾子なし）は公開扱い（Java の package-private も cross-file 参照可能）。
+fn is_exported_jvm(node: Node, source: &[u8]) -> bool {
+    let decl = find_enclosing_declaration(node);
+    let Some(decl) = decl else {
+        return true;
+    };
+
+    // modifiers 子ノードのテキストに "private" が含まれるかチェック
+    let mut cursor = decl.walk();
+    for child in decl.children(&mut cursor) {
+        if child.kind() == "modifiers"
+            && let Ok(text) = child.utf8_text(source)
+            && text.contains("private")
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// シンボル名ノードから囲んでいる宣言ノードを探す。
+fn find_enclosing_declaration(node: Node) -> Option<Node> {
+    let declaration_kinds = [
+        "function_declaration",
+        "method_declaration",
+        "class_declaration",
+        "interface_declaration",
+        "enum_declaration",
+        "object_declaration",
+    ];
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if declaration_kinds.contains(&n.kind()) {
+            return Some(n);
+        }
+        current = n.parent();
+    }
+    None
 }
 
 /// JS/TS: check export_statement ancestor or named export { name }.

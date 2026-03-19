@@ -1,5 +1,6 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use rayon::prelude::*;
+use std::io::Read;
 use tracing::info;
 
 use crate::cache::store::CacheStore;
@@ -9,8 +10,10 @@ use crate::error::{AstroError, ErrorCode};
 use crate::service::{AppService, AstParams};
 
 // ---------------------------------------------------------------------------
-// Shared helpers
+// 共通ヘルパー
 // ---------------------------------------------------------------------------
+
+const MAX_INPUT_SIZE: usize = 100 * 1024 * 1024;
 
 pub fn classify_error(e: &anyhow::Error) -> (String, String) {
     if let Some(ae) = e.downcast_ref::<AstroError>() {
@@ -34,8 +37,100 @@ fn make_error_line(e: &anyhow::Error) -> String {
     serde_json::to_string(&obj).unwrap()
 }
 
+fn read_bytes_limited<R: std::io::Read>(
+    reader: R,
+    max_bytes: usize,
+    source_name: &str,
+) -> Result<Vec<u8>> {
+    let mut limited = reader.take((max_bytes + 1) as u64);
+    let mut buf = Vec::new();
+    limited.read_to_end(&mut buf)?;
+
+    if buf.len() > max_bytes {
+        return Err(AstroError::new(
+            ErrorCode::InvalidRequest,
+            format!(
+                "{source_name} exceeds maximum size ({} bytes > {} bytes)",
+                buf.len(),
+                max_bytes
+            ),
+        )
+        .into());
+    }
+
+    Ok(buf)
+}
+
+fn read_bytes_limited_and_drain<R: std::io::Read>(
+    mut reader: R,
+    max_bytes: usize,
+    source_name: &str,
+) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut total_bytes = 0usize;
+    let mut chunk = [0u8; 8192];
+
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+
+        total_bytes = total_bytes.saturating_add(read);
+        if buf.len() <= max_bytes {
+            let remaining = max_bytes.saturating_add(1).saturating_sub(buf.len());
+            buf.extend_from_slice(&chunk[..read.min(remaining)]);
+        }
+    }
+
+    if total_bytes > max_bytes {
+        return Err(AstroError::new(
+            ErrorCode::InvalidRequest,
+            format!(
+                "{source_name} exceeds maximum size ({} bytes > {} bytes)",
+                total_bytes, max_bytes
+            ),
+        )
+        .into());
+    }
+
+    Ok(buf)
+}
+
+fn read_to_string_limited<R: std::io::Read>(
+    reader: R,
+    max_bytes: usize,
+    source_name: &str,
+) -> Result<String> {
+    let buf = read_bytes_limited(reader, max_bytes, source_name)?;
+    String::from_utf8(buf).map_err(|e| {
+        AstroError::new(
+            ErrorCode::InvalidRequest,
+            format!("{source_name} is not valid UTF-8: {e}"),
+        )
+        .into()
+    })
+}
+
+fn read_file_to_string_limited(path: &str, max_bytes: usize) -> Result<String> {
+    let file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.len() > max_bytes as u64 {
+        return Err(AstroError::new(
+            ErrorCode::InvalidRequest,
+            format!(
+                "{path} exceeds maximum size ({} bytes > {} bytes)",
+                metadata.len(),
+                max_bytes
+            ),
+        )
+        .into());
+    }
+    read_to_string_limited(file, max_bytes, path)
+}
+
 // ---------------------------------------------------------------------------
-// Single-file commands (with cache + pretty support)
+// 単一ファイル系コマンド（キャッシュ・pretty 対応）
 // ---------------------------------------------------------------------------
 
 pub struct CmdAstOpts<'a> {
@@ -321,16 +416,43 @@ pub fn run_git_diff(dir: &str, base: &str, staged: bool) -> Result<String> {
     }
     args.push(base.to_string());
 
-    let output = std::process::Command::new("git")
+    let mut child = std::process::Command::new("git")
         .args(&args)
         .current_dir(dir)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| {
             AstroError::new(ErrorCode::InvalidRequest, format!("Failed to run git: {e}"))
         })?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("Failed to capture git diff stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("Failed to capture git diff stderr"))?;
+
+    let stdout_handle = std::thread::spawn(move || {
+        // 子プロセスのパイプは上限超過後も読み捨てて、wait() の詰まりを防ぐ。
+        read_bytes_limited_and_drain(stdout, MAX_INPUT_SIZE, "git diff output")
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        read_bytes_limited_and_drain(stderr, MAX_INPUT_SIZE, "git diff stderr")
+    });
+
+    let status = child.wait()?;
+    let stdout_bytes = stdout_handle
+        .join()
+        .map_err(|_| anyhow!("Failed to join git diff stdout reader"))??;
+    let stderr_bytes = stderr_handle
+        .join()
+        .map_err(|_| anyhow!("Failed to join git diff stderr reader"))??;
+
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         return Err(AstroError::new(
             ErrorCode::InvalidRequest,
             format!("git diff failed: {stderr}"),
@@ -338,7 +460,13 @@ pub fn run_git_diff(dir: &str, base: &str, staged: bool) -> Result<String> {
         .into());
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    String::from_utf8(stdout_bytes).map_err(|e| {
+        AstroError::new(
+            ErrorCode::InvalidRequest,
+            format!("git diff output is not valid UTF-8: {e}"),
+        )
+        .into()
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -355,14 +483,12 @@ pub fn cmd_context(
     let diff_input = if let Some(d) = diff {
         d.to_string()
     } else if let Some(df) = diff_file {
-        std::fs::read_to_string(df)?
+        read_file_to_string_limited(df, MAX_INPUT_SIZE)?
     } else if git {
         run_git_diff(dir, base, staged)?
     } else {
-        use std::io::Read;
-        let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf)?;
-        buf
+        let stdin = std::io::stdin();
+        read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?
     };
 
     let result = service.analyze_context(&diff_input, dir)?;
@@ -389,10 +515,8 @@ pub fn cmd_impact(
     let diff_input = if git {
         run_git_diff(dir, base, staged)?
     } else {
-        use std::io::Read;
-        let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf)?;
-        buf
+        let stdin = std::io::stdin();
+        read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?
     };
 
     if diff_input.trim().is_empty() {
@@ -406,17 +530,17 @@ pub fn cmd_impact(
         result.changes.iter().map(|c| c.path.as_str()).collect();
 
     // Group unresolved impacts: callers in files NOT in the diff
-    type UnresolvedEntry = (Vec<String>, Vec<(String, usize)>);
-    let mut unresolved: std::collections::BTreeMap<String, UnresolvedEntry> =
+    // caller ごとに影響シンボルを追跡
+    struct UnresolvedCaller {
+        path: String,
+        line: usize,
+        symbols: Vec<String>,
+    }
+    let mut unresolved: std::collections::BTreeMap<String, Vec<UnresolvedCaller>> =
         std::collections::BTreeMap::new();
 
     for change in &result.changes {
-        let symbols: Vec<String> = change
-            .affected_symbols
-            .iter()
-            .map(|s| s.name.clone())
-            .collect();
-        if symbols.is_empty() {
+        if change.affected_symbols.is_empty() {
             continue;
         }
 
@@ -441,7 +565,6 @@ pub fn cmd_impact(
                 } else {
                     cp.to_string()
                 };
-                // Canonicalize both for reliable comparison
                 match (
                     std::fs::canonicalize(&caller_abs),
                     std::fs::canonicalize(&cp_abs),
@@ -452,10 +575,14 @@ pub fn cmd_impact(
             });
 
             if !in_diff {
-                let entry = unresolved
+                unresolved
                     .entry(change.path.clone())
-                    .or_insert_with(|| (symbols.clone(), Vec::new()));
-                entry.1.push((caller.path.clone(), caller.line));
+                    .or_default()
+                    .push(UnresolvedCaller {
+                        path: caller.path.clone(),
+                        line: caller.line,
+                        symbols: caller.symbols.clone(),
+                    });
             }
         }
     }
@@ -465,10 +592,28 @@ pub fn cmd_impact(
     }
 
     eprintln!("Unresolved impacts found:\n");
-    for (changed_path, (symbols, callers)) in &unresolved {
-        eprintln!("{} changed [{}]:", changed_path, symbols.join(", "));
-        for (caller_path, line) in callers {
-            eprintln!("  → {}:{}", caller_path, line);
+    for (changed_path, callers) in &unresolved {
+        // caller のシンボルを集約して表示用リストを作成
+        let all_symbols: std::collections::BTreeSet<&str> = callers
+            .iter()
+            .flat_map(|c| c.symbols.iter().map(|s| s.as_str()))
+            .collect();
+        eprintln!(
+            "{} changed [{}]:",
+            changed_path,
+            all_symbols.into_iter().collect::<Vec<_>>().join(", ")
+        );
+        for caller in callers {
+            if caller.symbols.is_empty() {
+                eprintln!("  → {}:{}", caller.path, caller.line);
+            } else {
+                eprintln!(
+                    "  → {}:{} [{}]",
+                    caller.path,
+                    caller.line,
+                    caller.symbols.join(", ")
+                );
+            }
         }
         eprintln!();
     }
@@ -735,5 +880,41 @@ pub fn handle_request(
                 service.analyze_cochange(dir, lookback, min_confidence, req.file.as_deref())?;
             Ok(serde_json::to_value(result)?)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn read_to_string_limited_accepts_small_input() {
+        let text = read_to_string_limited(Cursor::new(b"ok".to_vec()), 4, "stdin").unwrap();
+        assert_eq!(text, "ok");
+    }
+
+    #[test]
+    fn read_to_string_limited_rejects_oversized_input() {
+        let err = read_to_string_limited(Cursor::new(b"abcde".to_vec()), 4, "stdin")
+            .expect_err("oversized input should fail");
+
+        assert!(err.to_string().contains("exceeds maximum size"));
+    }
+
+    #[test]
+    fn read_bytes_limited_and_drain_reports_full_size() {
+        let err = read_bytes_limited_and_drain(Cursor::new(vec![b'a'; 10]), 4, "git diff output")
+            .expect_err("oversized input should fail");
+
+        assert!(err.to_string().contains("10 bytes > 4 bytes"));
+    }
+
+    #[test]
+    fn read_to_string_limited_rejects_invalid_utf8() {
+        let err = read_to_string_limited(Cursor::new(vec![0xff]), 4, "stdin")
+            .expect_err("invalid utf-8 should fail");
+
+        assert!(err.to_string().contains("not valid UTF-8"));
     }
 }
