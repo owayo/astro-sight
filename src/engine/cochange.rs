@@ -72,11 +72,13 @@ pub fn analyze_cochange(
 
     // 4. Count co-changes (file pairs that appear in the same commit)
     let mut pair_counts: HashMap<(String, String), usize> = HashMap::new();
+    // ファイル数が多すぎるコミット（初期コミット、大規模リファクタ等）はペア爆発を防ぐためスキップ
+    const MAX_FILES_PER_COMMIT: usize = 100;
     for commit in &commits {
-        if commit.len() < 2 {
+        if commit.len() < 2 || commit.len() > MAX_FILES_PER_COMMIT {
             continue;
         }
-        // Generate all pairs (sorted to avoid duplicates)
+        // 重複排除済みペアを生成
         let mut files: Vec<&String> = commit.iter().collect();
         files.sort();
         files.dedup();

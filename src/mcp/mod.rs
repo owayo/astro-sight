@@ -175,8 +175,10 @@ impl Default for AstroSightServer {
 #[tool_router]
 impl AstroSightServer {
     pub fn new() -> Self {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let service = AppService::sandboxed(cwd).unwrap_or_else(|_| AppService::new());
+        // cwd 取得またはサンドボックス生成に失敗した場合は制限なしにフォールバックせず即座にパニック（fail-closed）
+        let cwd = std::env::current_dir().expect("MCP server requires a valid current directory");
+        let service = AppService::sandboxed(cwd)
+            .expect("MCP server requires a valid sandbox (failed to canonicalize cwd)");
         Self {
             tool_router: Self::tool_router(),
             service: std::sync::Arc::new(service),
