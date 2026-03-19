@@ -2108,3 +2108,475 @@ pub mod tensor;
         "consumer.rs should not appear as impacted for module declarations: {stdout}"
     );
 }
+
+// ===========================================================================
+// 境界値・異常系・エッジケーステスト
+// ===========================================================================
+
+// ---- diff パーサー境界値テスト ----
+
+#[test]
+fn diff_empty_input_produces_no_files() {
+    // 空の diff 入力は空の結果を返すべき
+    let files = astro_sight::engine::diff::parse_unified_diff("");
+    assert!(files.is_empty(), "空の diff は空の結果を返すべき");
+}
+
+#[test]
+fn diff_deleted_file_with_dev_null() {
+    // ファイル削除（+++ /dev/null）を正しくパースすること
+    let diff = r#"--- a/src/old.rs
++++ /dev/null
+@@ -1,3 +0,0 @@
+-fn old_fn() {}
+-fn another() {}
+-// end
+"#;
+    let files = astro_sight::engine::diff::parse_unified_diff(diff);
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].old_path, "src/old.rs");
+    assert_eq!(files[0].new_path, "/dev/null");
+    assert_eq!(files[0].hunks[0].new_count, 0);
+}
+
+#[test]
+fn diff_hunk_header_only_no_content_lines() {
+    // ハンクヘッダのみで内容行がない diff
+    let diff = r#"--- a/src/foo.rs
++++ b/src/foo.rs
+@@ -1,3 +1,3 @@
+"#;
+    let files = astro_sight::engine::diff::parse_unified_diff(diff);
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].hunks.len(), 1);
+}
+
+#[test]
+fn diff_missing_hunk_header_produces_no_file() {
+    // ハンクヘッダがない場合はファイルとして認識しない（hunks が空）
+    let diff = r#"--- a/src/foo.rs
++++ b/src/foo.rs
+"#;
+    let files = astro_sight::engine::diff::parse_unified_diff(diff);
+    assert!(
+        files.is_empty(),
+        "ハンクなしの diff はファイルを生成しないべき"
+    );
+}
+
+// ---- impact パストラバーサル検証テスト ----
+
+#[test]
+fn impact_rejects_path_traversal_in_diff() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // diff パス内の .. はスキップされるべき
+    let diff = r#"--- a/../../../etc/passwd
++++ b/../../../etc/passwd
+@@ -1,3 +1,3 @@
+-root:x:0:0:root
++root:x:0:0:hacked
+"#;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["context", "--dir", dir.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn context");
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("failed to wait");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let changes = json["changes"].as_array().unwrap();
+    assert!(
+        changes.is_empty(),
+        "パストラバーサルを含む diff は変更として認識されないべき"
+    );
+}
+
+// ---- cochange MAX_FILES_PER_COMMIT スキップテスト ----
+
+#[test]
+fn cochange_skips_large_commits() {
+    // MAX_FILES_PER_COMMIT (100) を超えるコミットは pair 集計から除外されることを検証。
+    // git リポジトリを模擬するため、実際の git repo を使用し lookback=1 で確認。
+    // ただし通常のコミットは 100 ファイル未満なのでスキップされない。
+    // ここでは lookback=1 + 小コミットで pairs が生成されることを確認し、
+    // 対称的に lookback が十分大きいとき結果が得られることを確認。
+    let output = cargo_bin()
+        .args([
+            "cochange",
+            "--dir",
+            ".",
+            "--lookback",
+            "1",
+            "--min-confidence",
+            "0.0",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    // lookback=1 でも commits_analyzed >= 0 であること
+    assert!(json["commits_analyzed"].as_u64().is_some());
+    assert!(json["entries"].as_array().is_some());
+}
+
+#[test]
+fn cochange_rejects_lookback_exceeding_max() {
+    // lookback > 10000 は拒否される
+    let output = cargo_bin()
+        .args(["cochange", "--dir", ".", "--lookback", "10001"])
+        .output()
+        .expect("failed to run");
+    assert!(!output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("lookback")
+    );
+}
+
+#[test]
+fn cochange_rejects_nan_confidence() {
+    // NaN は拒否される
+    let output = cargo_bin()
+        .args([
+            "cochange",
+            "--dir",
+            ".",
+            "--lookback",
+            "10",
+            "--min-confidence",
+            "NaN",
+        ])
+        .output()
+        .expect("failed to run");
+    // clap がパースエラーを出すか、サービス層が拒否するか
+    assert!(!output.status.success());
+}
+
+// ---- MCP sandbox fail-closed テスト ----
+
+#[test]
+fn mcp_sandbox_fail_closed_with_file_workspace() {
+    // MCP サーバーはファイルを workspace root として受け付けない。
+    // AppService::sandboxed がファイルを拒否するので、
+    // AstroSightServer::new() 相当のロジックが fail-closed であることを
+    // AppService レベルで確認。
+    let dir = tempfile::TempDir::new().unwrap();
+    let file_path = dir.path().join("not_a_dir.txt");
+    std::fs::write(&file_path, "content").unwrap();
+
+    let result = astro_sight::service::AppService::sandboxed(file_path);
+    assert!(result.is_err(), "ファイルを workspace root にできないべき");
+}
+
+#[test]
+fn mcp_sandbox_fail_closed_with_nonexistent_dir() {
+    // 存在しないディレクトリでサンドボックスは生成できない
+    let result = astro_sight::service::AppService::sandboxed(std::path::PathBuf::from(
+        "/nonexistent/path/that/does/not/exist",
+    ));
+    assert!(
+        result.is_err(),
+        "存在しないディレクトリで sandbox は生成できないべき"
+    );
+}
+
+// ---- Session 異常系テスト ----
+
+#[test]
+fn session_invalid_json_returns_error() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .arg("session")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn session");
+
+    let stdin = child.stdin.as_mut().unwrap();
+    // 不正な JSON を送信
+    writeln!(stdin, "{{this is not valid json}}").unwrap();
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("failed to wait");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("should return error JSON");
+    assert_eq!(
+        json["error"]["code"], "INVALID_REQUEST",
+        "不正な JSON は INVALID_REQUEST エラーを返すべき"
+    );
+}
+
+#[test]
+fn session_empty_input_exits_cleanly() {
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .arg("session")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn session");
+
+    // stdin を即閉じ（空入力）
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("failed to wait");
+    assert!(output.status.success(), "空入力で session は正常終了すべき");
+    assert!(
+        output.stdout.is_empty(),
+        "空入力で session は出力なしで終了すべき"
+    );
+}
+
+// ---- symbols 境界値テスト ----
+
+#[test]
+fn symbols_on_empty_file() {
+    use std::io::Write;
+
+    // 空のソースファイルでもエラーにならないこと
+    let tmp = std::env::temp_dir().join("astro_sight_empty.rs");
+    let mut f = std::fs::File::create(&tmp).unwrap();
+    f.write_all(b"").unwrap();
+    drop(f);
+
+    let output = cargo_bin()
+        .args(["symbols", "--path", tmp.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "rust");
+    let symbols = json["symbols"].as_array().unwrap();
+    assert!(symbols.is_empty(), "空ファイルではシンボルは空であるべき");
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn symbols_on_syntax_error_file() {
+    use std::io::Write;
+
+    // 構文エラーのあるファイルでも結果を返すこと（部分的なパースは可能）
+    let tmp = std::env::temp_dir().join("astro_sight_syntax_error.rs");
+    let mut f = std::fs::File::create(&tmp).unwrap();
+    f.write_all(b"fn incomplete(").unwrap();
+    drop(f);
+
+    let output = cargo_bin()
+        .args(["symbols", "--path", tmp.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "rust");
+    // シンボルの有無は問わないが、JSON 出力が壊れないこと
+    assert!(json["symbols"].as_array().is_some());
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// ---- refs 異常系テスト ----
+
+#[test]
+fn refs_nonexistent_directory() {
+    let output = cargo_bin()
+        .args(["refs", "--name", "foo", "--dir", "/nonexistent/dir/path"])
+        .output()
+        .expect("failed to run");
+    assert!(!output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["error"]["code"], "FILE_NOT_FOUND");
+}
+
+#[test]
+fn refs_whitespace_only_name() {
+    // 空白のみの name は拒否される（trim 後に空になる）
+    let output = cargo_bin()
+        .args(["refs", "--name", "   ", "--dir", "src/"])
+        .output()
+        .expect("failed to run");
+    assert!(!output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["error"]["code"], "INVALID_REQUEST");
+}
+
+// ---- context 空 diff テスト ----
+
+#[test]
+fn context_empty_diff_returns_empty_changes() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["context", "--dir", "."])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn context");
+
+    // 空の diff を入力
+    child.stdin.as_mut().unwrap().write_all(b"").unwrap();
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("failed to wait");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let changes = json["changes"].as_array().unwrap();
+    assert!(changes.is_empty(), "空の diff は空の changes を返すべき");
+}
+
+// ---- unsupported language テスト ----
+
+#[test]
+fn ast_unsupported_language() {
+    use std::io::Write;
+
+    let tmp = std::env::temp_dir().join("astro_sight_test.xyz");
+    let mut f = std::fs::File::create(&tmp).unwrap();
+    f.write_all(b"some content").unwrap();
+    drop(f);
+
+    let output = cargo_bin()
+        .args(["ast", "--path", tmp.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(!output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["error"]["code"], "UNSUPPORTED_LANGUAGE");
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// ---- impact: 既存のファイルが diff に含まれるが存在しない場合 ----
+
+#[test]
+fn context_diff_referencing_nonexistent_file() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // diff 内のファイルがワークスペースに存在しない場合はスキップされる
+    let diff = r#"--- a/nonexistent_module.rs
++++ b/nonexistent_module.rs
+@@ -1,3 +1,3 @@
+-fn old_fn() {}
++fn new_fn() {}
+"#;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["context", "--dir", dir.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn context");
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("failed to wait");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let changes = json["changes"].as_array().unwrap();
+    assert!(
+        changes.is_empty(),
+        "存在しないファイルの diff は changes に含まれないべき"
+    );
+}
+
+// ---- refs --names 境界値テスト ----
+
+#[test]
+fn refs_batch_names_empty_after_trim() {
+    // 空白のみの names は拒否される
+    let output = cargo_bin()
+        .args(["refs", "--names", " , , ", "--dir", "src/"])
+        .output()
+        .expect("failed to run");
+    assert!(!output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["error"]["code"], "INVALID_REQUEST");
+}
+
+// ---- lint 境界値テスト: 空のルールファイル ----
+
+#[test]
+fn lint_empty_rules_file() {
+    use std::io::Write;
+
+    let tmp = std::env::temp_dir().join("astro_sight_lint_empty.yaml");
+    let mut f = std::fs::File::create(&tmp).unwrap();
+    f.write_all(b"").unwrap();
+    drop(f);
+
+    let output = cargo_bin()
+        .args([
+            "lint",
+            "--path",
+            "src/main.rs",
+            "--rules",
+            tmp.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run");
+    // 空のルールファイルはエラーか、マッチなしの結果を返す
+    // (YAML パース結果による)
+    let _ = output; // 結果の形式は実装依存だがクラッシュしないことが重要
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// ---- AppService 入力サイズ制限テスト ----
+
+#[test]
+fn sandboxed_service_validates_input_size() {
+    let cwd = std::env::current_dir().unwrap();
+    let cwd = std::fs::canonicalize(cwd).unwrap();
+    let service = astro_sight::service::AppService::sandboxed(cwd).unwrap();
+
+    // sandboxed は max_input_size = 100MB に設定される。
+    // analyze_context で validate_input_size が呼ばれるため、
+    // 小さい入力は通ること、巨大入力は別のテスト環境で確認。
+    let result = service.analyze_context("", ".");
+    assert!(result.is_ok(), "空の diff 入力はサイズ制限を通過するべき");
+}

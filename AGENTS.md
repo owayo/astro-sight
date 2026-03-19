@@ -28,7 +28,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/logger.rs` - ロギング（logroller 日次ローテーション、3日保持、tracing-subscriber）
 - `src/cli.rs` - CLI サブコマンド定義（ast, symbols, calls, refs, context, impact, imports, lint, sequence, cochange, doctor, session, mcp, init）
 - `src/main.rs` - コマンドディスパッチ、キャッシュ層、バッチ処理（全て AppService 経由）
-- `src/mcp/mod.rs` - MCP サーバー（AstroSightServer + AppService::sandboxed(cwd) + 11 ツール）
+- `src/mcp/mod.rs` - MCP サーバー（AstroSightServer + AppService::sandboxed(cwd) + 11 ツール、fail-closed: sandbox 生成失敗時はパニック）
 - `src/engine/parser.rs` - tree-sitter パーサー管理（100MB ファイルサイズ上限、SourceBuf によるゼロコピー mmap）
 - `src/engine/extractor.rs` - AST ノード抽出
 - `src/engine/symbols.rs` - シンボル抽出（tree-sitter クエリ）
@@ -39,7 +39,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/engine/sequence.rs` - コールグラフから Mermaid シーケンス図を生成
 - `src/engine/imports.rs` - ファイル間の import/export 関係を抽出（言語別 tree-sitter クエリ）
 - `src/engine/lint.rs` - YAML ルールによる AST パターンマッチ（tree-sitter クエリ + テキストパターン）
-- `src/engine/cochange.rs` - git log から共変更ファイルペアを検出（confidence スコア付き）
+- `src/engine/cochange.rs` - git log から共変更ファイルペアを検出（confidence スコア付き、100ファイル超のコミットはスキップ）
 - `src/engine/snippet.rs` - コンテキストスニペット生成
 - `src/models/` - Request/Response/AST ノード/Call/Reference/Impact/Sequence/Import/Lint/CoChange 型定義
 - `src/error.rs` - AstroError + ErrorCode（PathOutOfBounds 含む）
