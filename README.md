@@ -497,18 +497,6 @@ astro-sight session                                # Mixed NDJSON batch queries
 - **Use Read for surrounding context when editing** (astro-sight shows 1 line only)
 ```
 
-### CodeRabbit と併用する
-
-CodeRabbit では `AGENTS.md` / `CLAUDE.md` / `agent.md` などは code guidelines として自動検出される。一方で `.coderabbit.yaml` の `path_instructions` は「どのパスをどうレビューするか」を指定する用途で、ガイドラインファイル名そのものを書く場所ではない。このリポジトリでは両者を分けて運用する。
-
-- `AGENTS.md` には恒久的なレビュー基準を置き、`.coderabbit.yaml` には `src/**/*.rs` / `tests/**/*.rs` / `README.md` / `AGENTS.md` / `skills/SKILL.md` ごとの観点を設定する
-- `reviews.path_filters` では `docs/images/**` などレビュー価値の低いアセットを除外し、レビュー対象を絞る
-- 通常は incremental review を前提にし、追加コミットだけを見直したいときは `@coderabbitai review`、既存コメントを無視して全体を見直したいときは `@coderabbitai full review` を使う
-- PR 要約は `@coderabbitai summary` プレースホルダや `.coderabbit.yaml` の `high_level_summary_in_walkthrough` で制御すると、変更概要を安定して共有しやすい
-- pre-merge checks を使う場合は、まず `warning` で運用を始めてから `error` に上げると誤検知の切り分けがしやすい。動作確認には `@coderabbitai run pre-merge checks`、新しい custom check の試験には `@coderabbitai evaluate custom pre-merge check --name <name> --instructions <text> --mode warning` を使う
-- テスト不足の PR では `@coderabbitai generate unit tests` を補助的に使えるが、生成結果も通常レビュー対象として扱う
-- 継続させたいレビュー方針はレビューコメントへの返信で learning として伝え、単発の例外は恒久ルール化しない
-
 ### MCP サーバーとして登録
 
 Claude Desktop や Cursor 等の MCP クライアントから利用する場合:

@@ -54,15 +54,6 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - コード変更の前には `astro-sight context --dir . --git`、変更後には `astro-sight impact --dir . --git` を実行する
 - コードコメントは必要な箇所にだけ付け、付ける場合は日本語で簡潔に記述する
 
-## CodeRabbit
-
-- `AGENTS.md` は CodeRabbit の code guidelines として自動参照される前提で、実装と矛盾しない内容を保つ
-- `.coderabbit.yaml` の `path_instructions` は補助ルールとして使い、恒久ルールや広域ルールは `AGENTS.md` / `skills/SKILL.md` に置く
-- `.coderabbit.yaml` の `path_instructions` では `src/**/*.rs` は正確性・セキュリティ・fail-closed・サイズ上限、`tests/**/*.rs` は境界値・異常系・回帰防止を優先させる
-- pre-merge checks を導入する場合は、まず `warning` で学習させ、安定後にだけ `error` へ上げる
-- pre-merge checks の override は原則として requested reviewer のみに許可する
-- 恒久ルールは `AGENTS.md` / `skills/SKILL.md` に集約し、単発の例外は PR 上の会話で伝える
-
 ## Build & Test
 
 ```bash
