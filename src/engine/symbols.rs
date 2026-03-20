@@ -6,6 +6,116 @@ use crate::language::LangId;
 use crate::models::location::Range;
 use crate::models::symbol::{Symbol, SymbolKind};
 
+/// シンボルが関数/メソッド本体内のローカルスコープ定義かどうかを判定。
+///
+/// 関数内の `const`/`let`/`var` 等はファイル外への影響を持たないため、
+/// impact 分析の cross-file 起点から除外できる。
+/// 未対応言語では保守的に `false`（ローカルではない＝除外しない）を返す。
+pub fn is_local_scope_symbol(
+    root: Node,
+    _source: &[u8],
+    lang_id: LangId,
+    symbol_range: &Range,
+) -> bool {
+    let start = tree_sitter::Point {
+        row: symbol_range.start.line,
+        column: symbol_range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: symbol_range.end.line,
+        column: symbol_range.end.column,
+    };
+
+    let Some(node) = root.descendant_for_point_range(start, end) else {
+        return false; // 保守的: ノード未検出はローカルと判定しない
+    };
+
+    match lang_id {
+        LangId::Typescript | LangId::Tsx | LangId::Javascript => {
+            has_enclosing_function_body_js(node)
+        }
+        LangId::Rust => has_enclosing_function_body_rust(node),
+        LangId::Python => has_enclosing_function_body_python(node),
+        LangId::Go => has_enclosing_function_body_go(node),
+        LangId::Java | LangId::Kotlin => has_enclosing_function_body_jvm(node),
+        _ => false, // 未対応言語は保守的にローカルと判定しない
+    }
+}
+
+/// JS/TS: 祖先に関数本体 (statement_block) があるかチェック。
+fn has_enclosing_function_body_js(node: Node) -> bool {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if is_js_function_body(n) {
+            return true;
+        }
+        current = n.parent();
+    }
+    false
+}
+
+/// Rust: 祖先に function_item の block があるかチェック。
+fn has_enclosing_function_body_rust(node: Node) -> bool {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if n.kind() == "block" && n.parent().is_some_and(|p| p.kind() == "function_item") {
+            return true;
+        }
+        current = n.parent();
+    }
+    false
+}
+
+/// Python: 祖先に function_definition の block があるかチェック。
+fn has_enclosing_function_body_python(node: Node) -> bool {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if n.kind() == "block"
+            && n.parent()
+                .is_some_and(|p| p.kind() == "function_definition")
+        {
+            return true;
+        }
+        current = n.parent();
+    }
+    false
+}
+
+/// Go: 祖先に function/method の block があるかチェック。
+fn has_enclosing_function_body_go(node: Node) -> bool {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if n.kind() == "block"
+            && n.parent().is_some_and(|p| {
+                p.kind() == "function_declaration" || p.kind() == "method_declaration"
+            })
+        {
+            return true;
+        }
+        current = n.parent();
+    }
+    false
+}
+
+/// Java/Kotlin: 祖先に method/constructor の block があるかチェック。
+fn has_enclosing_function_body_jvm(node: Node) -> bool {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if n.kind() == "block"
+            && n.parent().is_some_and(|p| {
+                matches!(
+                    p.kind(),
+                    "method_declaration" | "constructor_declaration" | "function_declaration"
+                )
+            })
+        {
+            return true;
+        }
+        current = n.parent();
+    }
+    false
+}
+
 /// Check if a symbol at the given range is exported (visible outside the file).
 ///
 /// For languages without clear export semantics (Java, Python, C, etc.),
@@ -548,6 +658,76 @@ mod tests {
     fn ts_top_level_exported_const_is_exported() {
         assert!(check_exported(
             "export const bar = 42;",
+            LangId::Typescript,
+            "bar"
+        ));
+    }
+
+    // --- is_local_scope_symbol テスト ---
+
+    fn check_local_scope(source: &str, lang_id: LangId, symbol_name: &str) -> bool {
+        let language = lang_id.ts_language();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+
+        let syms = extract_symbols(root, source.as_bytes(), lang_id).unwrap();
+        let sym = syms
+            .iter()
+            .find(|s| s.name == symbol_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "symbol '{}' not found in {:?}",
+                    symbol_name,
+                    syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            });
+        is_local_scope_symbol(root, source.as_bytes(), lang_id, &sym.range)
+    }
+
+    #[test]
+    fn ts_local_var_is_local_scope() {
+        assert!(check_local_scope(
+            "export function foo() { const result = 1; }",
+            LangId::Typescript,
+            "result"
+        ));
+    }
+
+    #[test]
+    fn ts_top_level_var_is_not_local_scope() {
+        assert!(!check_local_scope(
+            "export const bar = 42;",
+            LangId::Typescript,
+            "bar"
+        ));
+    }
+
+    #[test]
+    fn ts_arrow_fn_local_is_local_scope() {
+        assert!(check_local_scope(
+            "export const foo = () => { const x = 1; }",
+            LangId::Typescript,
+            "x"
+        ));
+    }
+
+    #[test]
+    fn rust_local_var_is_local_scope() {
+        assert!(
+            check_local_scope(
+                "pub fn foo() { let x = 1; }",
+                LangId::Rust,
+                "foo" // Rust のクエリは関数内ローカル変数をキャプチャしないが、関数自体をチェック
+            ) == false
+        ); // 関数定義自体はローカルスコープではない
+    }
+
+    #[test]
+    fn ts_non_export_top_level_var_is_not_local_scope() {
+        assert!(!check_local_scope(
+            "const bar = 42;",
             LangId::Typescript,
             "bar"
         ));

@@ -31,7 +31,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/mcp/mod.rs` - MCP サーバー（AstroSightServer + AppService::sandboxed(cwd) + 11 ツール、fail-closed: sandbox 生成失敗時はパニック）
 - `src/engine/parser.rs` - tree-sitter パーサー管理（100MB ファイルサイズ上限、SourceBuf によるゼロコピー mmap）
 - `src/engine/extractor.rs` - AST ノード抽出
-- `src/engine/symbols.rs` - シンボル抽出（tree-sitter クエリ）
+- `src/engine/symbols.rs` - シンボル抽出（tree-sitter クエリ）+ スコープ判定（is_local_scope_symbol, is_symbol_exported）
 - `src/engine/calls.rs` - コールグラフ抽出（言語別 call expression クエリ）
 - `src/engine/refs.rs` - クロスファイル参照検索（ignore + rayon 並列 + memchr/memmem 事前フィルタ + Aho-Corasick バッチ検索 + `collect_files` pub ユーティリティ）
 - `src/engine/diff.rs` - unified diff パーサー

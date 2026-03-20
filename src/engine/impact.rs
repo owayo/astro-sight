@@ -100,14 +100,25 @@ fn collect_affected_symbols(
 
         let syms = symbols::extract_symbols(root, &source, lang_id).unwrap_or_default();
         let affected_raw = find_affected_symbols(&syms, &df.hunks);
-        // Filter test symbols from affected list so they don't appear in output
-        // and don't propagate as impact sources.
+        // テストシンボルとローカルスコープ変数を affected から除外。
+        // ローカル変数（関数内 const/let 等）はファイル外への影響を持たないため、
+        // affected_symbols 出力と cross-file 伝播の両方からノイズを除去する。
         let affected: Vec<AffectedSymbol> = affected_raw
             .into_iter()
             .filter(|sym| {
-                !find_overlapping_symbol(&syms, &sym.name, &df.hunks).is_some_and(|s| {
-                    is_in_test_context(root, &source, &s.range, lang_id, &df.new_path)
-                })
+                if let Some(s) = find_overlapping_symbol(&syms, &sym.name, &df.hunks) {
+                    // テストコンテキスト内のシンボルを除外
+                    if is_in_test_context(root, &source, &s.range, lang_id, &df.new_path) {
+                        return false;
+                    }
+                    // 関数内ローカル変数/定数を除外
+                    if matches!(sym.kind.as_str(), "variable" | "constant")
+                        && symbols::is_local_scope_symbol(root, &source, lang_id, &s.range)
+                    {
+                        return false;
+                    }
+                }
+                true
             })
             .collect();
         let sig_changes = detect_signature_changes(diff_input, &df.new_path, &affected);
