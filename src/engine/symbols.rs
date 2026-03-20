@@ -714,14 +714,13 @@ mod tests {
     }
 
     #[test]
-    fn rust_local_var_is_local_scope() {
-        assert!(
-            check_local_scope(
-                "pub fn foo() { let x = 1; }",
-                LangId::Rust,
-                "foo" // Rust のクエリは関数内ローカル変数をキャプチャしないが、関数自体をチェック
-            ) == false
-        ); // 関数定義自体はローカルスコープではない
+    fn rust_fn_def_is_not_local_scope() {
+        // Rust のクエリは関数内ローカル変数をキャプチャしないが、関数定義自体はローカルスコープではない
+        assert!(!check_local_scope(
+            "pub fn foo() { let x = 1; }",
+            LangId::Rust,
+            "foo"
+        ));
     }
 
     #[test]
