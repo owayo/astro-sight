@@ -773,6 +773,58 @@ fn session_rejects_invalid_workspace_env() {
 }
 
 #[test]
+fn session_rejects_empty_workspace_env() {
+    let output = cargo_bin()
+        .arg("session")
+        .env("ASTRO_SIGHT_WORKSPACE", "")
+        .output()
+        .expect("failed to run session");
+
+    assert!(
+        !output.status.success(),
+        "空文字のワークスペース環境変数では失敗するべき"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["error"]["code"], "INVALID_REQUEST");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("must not be empty"),
+        "空文字は fail-closed で拒否されるべき"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn session_rejects_non_utf8_workspace_env() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let output = cargo_bin()
+        .arg("session")
+        .env("ASTRO_SIGHT_WORKSPACE", OsStr::from_bytes(&[0xff]))
+        .output()
+        .expect("failed to run session");
+
+    assert!(
+        !output.status.success(),
+        "非 UTF-8 のワークスペース環境変数では失敗するべき"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["error"]["code"], "INVALID_REQUEST");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not valid UTF-8"),
+        "非 UTF-8 値は fail-closed で拒否されるべき"
+    );
+}
+
+#[test]
 fn session_ast_includes_diagnostics() {
     use std::io::Write;
     use std::process::Stdio;
@@ -2416,6 +2468,24 @@ fn refs_nonexistent_directory() {
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
     assert_eq!(json["error"]["code"], "FILE_NOT_FOUND");
+}
+
+#[test]
+fn refs_rejects_file_as_dir_argument() {
+    let output = cargo_bin()
+        .args(["refs", "--name", "main", "--dir", "src/main.rs"])
+        .output()
+        .expect("failed to run");
+    assert!(!output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["error"]["code"], "INVALID_REQUEST");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not a directory")
+    );
 }
 
 #[test]

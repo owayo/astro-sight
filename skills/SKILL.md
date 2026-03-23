@@ -1,6 +1,6 @@
 ---
 name: astro-sight
-description: "STOP before using Grep for code identifiers (including pipe-separated patterns like FOO|Bar). Use `refs` for identifiers, `symbols`/`calls`/`imports` for structure, `context`/`impact` around edits, and `session`/`sequence`/`cochange`/`lint` when you need mixed queries, flow, hotspots, or repeated rules."
+description: "STOP before using Grep for code identifiers (including pipe-separated patterns like FOO|Bar). Use `refs` for identifiers, `symbols`/`calls`/`imports` for structure, `ast` for exact syntax, `context`/`impact` around edits, and `session`/`sequence`/`cochange`/`lint` when you need mixed queries, flow, hotspots, or repeated rules."
 ---
 
 # astro-sight
@@ -13,6 +13,7 @@ description: "STOP before using Grep for code identifiers (including pipe-separa
 - Searching with **pipe-separated identifiers** like `FOO|Bar|baz`? → `astro-sight refs --names FOO,Bar,baz --dir .` (NOT Grep)
 - Need to **understand a file's structure** (functions, classes, structs)? → `astro-sight symbols --path <file>`
 - Need to **understand a directory's structure**? → `astro-sight symbols --dir <dir>`
+- Need to inspect the **exact syntax node at a cursor/range** or debug a parse error? → `astro-sight ast`
 - Need to know **who calls a function** or **what a function calls**? → `astro-sight calls`
 - Want to know **what a code change breaks**? → `astro-sight context --dir . --git`
 - Want to detect **unresolved impacts after editing**? → `astro-sight impact --dir . --git`
@@ -61,6 +62,12 @@ astro-sight cochange --dir . --file src/service.rs
 # 11. Repeated AST/text checks
 astro-sight lint --path <file> --rules rules.yaml
 ```
+
+## Low-Adoption But Useful
+
+- Need the **exact AST node** at a cursor/range, or want to confirm whether a parse error is structural? → `astro-sight ast --path <file> --line <n> --col <n>`
+- Need **2+ mixed astro-sight queries** in one loop and want to avoid repeated startup cost? → `astro-sight session`
+- Need to check a **repeated rule** like banned APIs, required patterns, or AST-based policy? → `astro-sight lint --path <file> --rules rules.yaml`
 
 ## Commands
 

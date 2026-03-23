@@ -169,7 +169,7 @@ astro-sight refs --name "AstgenResponse" --dir src/ --glob "**/*.rs"
 astro-sight refs --names "AppService,AstgenResponse" --dir src/
 ```
 
-`--name` は空文字を受け付けない。`--names` も空要素のみ（例: `",,,"`）の場合は `INVALID_REQUEST` を返す。
+`--name` は空文字を受け付けない。`--names` も空要素のみ（例: `",,,"`）の場合は `INVALID_REQUEST` を返す。`--dir` にはディレクトリのみ指定でき、ファイルパスを渡した場合も `INVALID_REQUEST` を返す。
 
 出力例:
 ```json
@@ -277,7 +277,7 @@ astro-sight doctor
 echo '{"command":"symbols","path":"src/main.rs"}' | astro-sight session
 ```
 
-stdin から NDJSON リクエストを受け取り、stdout に NDJSON レスポンスを返す。複数リクエストの連続処理に対応。`ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange` をサポートする。1行あたり 100MB（改行を除く生入力サイズ）を上限としている。`ASTRO_SIGHT_WORKSPACE` を指定した場合はそのディレクトリ配下だけを扱い、不正な値なら `INVALID_REQUEST` で終了する。
+stdin から NDJSON リクエストを受け取り、stdout に NDJSON レスポンスを返す。複数リクエストの連続処理に対応。`ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange` をサポートする。1行あたり 100MB（改行を除く生入力サイズ）を上限としている。`ASTRO_SIGHT_WORKSPACE` を指定した場合はそのディレクトリ配下だけを扱い、空文字・非 UTF-8・存在しないパスなどの不正な値は `INVALID_REQUEST` で終了する。
 
 ```bash
 # calls コマンド
@@ -469,6 +469,7 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 ## Workflow Rules
 - **Before editing code**: Run `astro-sight context --dir . --git` to check impact
 - **After editing code**: Run `astro-sight impact --dir . --git` to detect unresolved impacts
+- **Inspecting exact syntax or parse errors**: Run `astro-sight ast --path <file> --line <n> --col <n>`
 - **Understanding a file**: Run `astro-sight symbols --path <file>` to see structure
 - **Understanding a directory**: Run `astro-sight symbols --dir <dir>` to see all symbols
 - **Finding symbol usage**: Run `astro-sight refs` (Grep FORBIDDEN)
@@ -481,6 +482,7 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 astro-sight refs --name <symbol> --dir .           # Symbol reference search (REPLACES Grep for identifiers)
 astro-sight refs --names sym1,sym2 --dir .         # Batch symbol search (REPLACES Grep "FOO|Bar")
 astro-sight symbols --path <file>                  # File structure overview
+astro-sight ast --path <file> --line <n> --col <n> # Exact AST fragment at cursor/range
 astro-sight symbols --dir <dir>                    # Directory structure overview (NDJSON)
 astro-sight calls --path <file> --function <name>  # Caller/callee relationships
 astro-sight context --dir . --git                  # Change impact analysis (run BEFORE editing code)
@@ -511,6 +513,15 @@ Claude Desktop や Cursor 等の MCP クライアントから利用する場合:
   }
 }
 ```
+
+## CodeRabbit
+
+このリポジトリには `.coderabbit.yaml` を同梱し、CodeRabbit のレビューを以下の方針で調整している。
+
+- push ごとの incremental review を有効化し、新規差分への追従を継続する
+- `src/**/*.rs`、`tests/**/*.rs`、`README.md`、`AGENTS.md`、`skills/SKILL.md` に path-based review instructions を与える
+- `README.md`、`AGENTS.md`、`skills/SKILL.md` を code guidelines として読み込み、レビュー基準に反映する
+- CLI と文書の不整合は custom pre-merge check で warning として検出する
 
 ## License
 

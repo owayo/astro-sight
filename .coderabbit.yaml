@@ -1,0 +1,56 @@
+language: ja-JP
+
+reviews:
+  profile: chill
+  high_level_summary_in_walkthrough: true
+  enable_prompt_for_ai_agents: true
+  path_filters:
+    - "!docs/images/**"
+    - "!**/*.png"
+    - "!**/*.jpg"
+    - "!**/*.jpeg"
+    - "!**/*.gif"
+  path_instructions:
+    - path: "src/**/*.rs"
+      instructions: |
+        具体的に再現できる不具合、セキュリティ境界の fail-open、panic 経路、計算量退行を優先してレビューする。
+        推測や好みに基づく指摘は避け、根拠と発生条件を説明できる問題だけを報告する。
+    - path: "tests/**/*.rs"
+      instructions: |
+        変更した振る舞いには決定的で再現性のあるテストを要求する。
+        境界値、異常系、回帰ケースを優先し、広すぎるスナップショットは避ける。
+    - path: "README.md"
+      instructions: |
+        CLI のコマンド例、JSON 出力、サイズ制限、ワークスペース制約が実装と一致しているか確認する。
+    - path: "AGENTS.md"
+      instructions: |
+        リポジトリ運用ルールとして扱い、実装・README.md・skills/SKILL.md と矛盾があれば指摘する。
+    - path: "skills/SKILL.md"
+      instructions: |
+        指示は短く行動指向に保ち、Grep と astro-sight refs の境界を曖昧にしない。
+        ast、session、lint のような利用が少ないコマンドも、適切な場面では具体例付きで提案する。
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+  pre_merge_checks:
+    override_requested_reviewers_only: true
+    description:
+      mode: warning
+    custom_checks:
+      - name: "CLI と文書の整合"
+        mode: warning
+        instructions: |
+          CLI コマンド、フラグ、JSON フィールド、サイズ制限、ワークスペース制約、レビュー手順が変わった場合は、
+          README.md・AGENTS.md・skills/SKILL.md の該当箇所も同じ内容に更新されているときだけ合格にする。
+
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "**/AGENTS.md"
+      - "README.md"
+      - "skills/SKILL.md"
+  learnings:
+    scope: local
+  web_search:
+    enabled: true

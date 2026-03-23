@@ -16,7 +16,7 @@ use crate::models::response::AstgenResponse;
 use crate::models::sequence::SequenceDiagramResult;
 
 // ---------------------------------------------------------------------------
-// AppService: CLI / Session / MCP で共有するコアロジック
+// AppService: CLI / Session / MCP で共有する中核ロジック
 // ---------------------------------------------------------------------------
 
 pub struct AppService {
@@ -78,33 +78,46 @@ impl AppService {
     }
 
     /// 環境変数からサービスを生成する（Session モード）。
-    /// `ASTRO_SIGHT_WORKSPACE` が指定されている場合は、不正な値でも無制限モードへは戻さない。
+    /// `ASTRO_SIGHT_WORKSPACE` が指定されている場合は、
+    /// 不正な値でも無制限モードへフォールバックしない。
     pub fn from_env() -> Result<Self> {
         match std::env::var("ASTRO_SIGHT_WORKSPACE") {
-            Ok(ws) if !ws.is_empty() => Self::sandboxed(PathBuf::from(&ws)).map_err(|e| {
-                if let Some(ae) = e.downcast_ref::<AstroError>() {
-                    AstroError::new(
-                        ae.code,
-                        format!("Invalid ASTRO_SIGHT_WORKSPACE ({ws}): {}", ae.message),
-                    )
-                    .into()
-                } else {
-                    AstroError::new(
+            Ok(ws) => {
+                if ws.is_empty() {
+                    bail!(AstroError::new(
                         ErrorCode::InvalidRequest,
-                        format!("Invalid ASTRO_SIGHT_WORKSPACE ({ws}): {e}"),
-                    )
-                    .into()
+                        "Invalid ASTRO_SIGHT_WORKSPACE: value must not be empty",
+                    ));
                 }
-            }),
-            _ => Ok(Self::new()),
+                Self::sandboxed(PathBuf::from(&ws)).map_err(|e| {
+                    if let Some(ae) = e.downcast_ref::<AstroError>() {
+                        AstroError::new(
+                            ae.code,
+                            format!("Invalid ASTRO_SIGHT_WORKSPACE ({ws}): {}", ae.message),
+                        )
+                        .into()
+                    } else {
+                        AstroError::new(
+                            ErrorCode::InvalidRequest,
+                            format!("Invalid ASTRO_SIGHT_WORKSPACE ({ws}): {e}"),
+                        )
+                        .into()
+                    }
+                })
+            }
+            Err(std::env::VarError::NotPresent) => Ok(Self::new()),
+            Err(std::env::VarError::NotUnicode(_)) => bail!(AstroError::new(
+                ErrorCode::InvalidRequest,
+                "Invalid ASTRO_SIGHT_WORKSPACE: value is not valid UTF-8",
+            )),
         }
     }
 
     // -----------------------------------------------------------------------
-    // Validation helpers
+    // 検証ヘルパー
     // -----------------------------------------------------------------------
 
-    /// Validate and canonicalize a file path. Returns the canonical path.
+    /// ファイルパスを検証して正規化し、正規化済みパスを返す。
     fn validate_path(&self, path: &str) -> Result<PathBuf> {
         let canonical = std::fs::canonicalize(path).map_err(|_| {
             warn!(path = path, "⚠️ validate_path: file not found");
@@ -125,7 +138,7 @@ impl AppService {
         Ok(canonical)
     }
 
-    /// Validate and canonicalize a directory path. Returns the canonical path.
+    /// ディレクトリパスを検証して正規化し、正規化済みパスを返す。
     fn validate_dir(&self, dir: &str) -> Result<PathBuf> {
         let canonical = std::fs::canonicalize(dir).map_err(|_| {
             AstroError::new(
@@ -133,6 +146,12 @@ impl AppService {
                 format!("Directory not found: {dir}"),
             )
         })?;
+        if !canonical.is_dir() {
+            bail!(AstroError::new(
+                ErrorCode::InvalidRequest,
+                format!("Path is not a directory: {dir}"),
+            ));
+        }
         if let Some(root) = &self.workspace_root
             && !canonical.starts_with(root)
         {
@@ -159,10 +178,10 @@ impl AppService {
     }
 
     // -----------------------------------------------------------------------
-    // Core operations
+    // コア操作
     // -----------------------------------------------------------------------
 
-    /// Extract AST at a given position/range with optional snippet + diagnostics.
+    /// 指定位置または範囲の AST を抽出し、必要に応じてスニペットと診断情報を付与する。
     pub fn extract_ast(&self, p: &AstParams<'_>) -> Result<AstgenResponse> {
         debug!(
             path = p.path,
@@ -180,7 +199,7 @@ impl AppService {
         let (tree, lang_id) = parser::parse_file(utf8_path, &source)?;
         let root = tree.root_node();
 
-        // Use original path in the response location for user readability
+        // 利用者が見やすいよう、レスポンスの location には元のパス表記を残す。
         let location = match (p.line, p.col, p.end_line, p.end_col) {
             (Some(l), Some(c), Some(el), Some(ec)) => LocationKey::range(p.path, l, c, el, ec),
             (Some(l), Some(c), _, _) => LocationKey::point(p.path, l, c),
@@ -228,7 +247,7 @@ impl AppService {
         Ok(response)
     }
 
-    /// Extract symbols from a source file with diagnostics.
+    /// ソースファイルからシンボルを抽出し、診断情報も返す。
     pub fn extract_symbols(&self, path: &str) -> Result<AstgenResponse> {
         debug!(path = path, "extract_symbols called");
         let canonical = self.validate_path(path)?;
@@ -255,7 +274,7 @@ impl AppService {
         Ok(response)
     }
 
-    /// Extract call graph from a source file.
+    /// ソースファイルからコールグラフを抽出する。
     pub fn extract_calls(&self, path: &str, function: Option<&str>) -> Result<CallGraph> {
         debug!(path = path, function = ?function, "extract_calls called");
         let canonical = self.validate_path(path)?;
@@ -280,7 +299,7 @@ impl AppService {
         Ok(graph)
     }
 
-    /// Generate a Mermaid sequence diagram from a source file's call graph.
+    /// ソースファイルのコールグラフから Mermaid のシーケンス図を生成する。
     pub fn generate_sequence(
         &self,
         path: &str,
@@ -306,7 +325,7 @@ impl AppService {
         Ok(result)
     }
 
-    /// Extract import/export dependencies from a source file.
+    /// ソースファイルから import/export 依存関係を抽出する。
     pub fn extract_imports(&self, path: &str) -> Result<ImportsResult> {
         debug!(path = path, "extract_imports called");
         let canonical = self.validate_path(path)?;
@@ -331,7 +350,7 @@ impl AppService {
         Ok(result)
     }
 
-    /// Lint a source file against the given rules.
+    /// ソースファイルを指定ルールで lint する。
     pub fn lint_file(
         &self,
         path: &str,
@@ -361,14 +380,14 @@ impl AppService {
         Ok(result)
     }
 
-    /// Search for symbol references across files.
+    /// 複数ファイルを横断してシンボル参照を検索する。
     pub fn find_references(&self, name: &str, dir: &str, glob: Option<&str>) -> Result<RefsResult> {
         debug!(name = name, dir = dir, glob = ?glob, "find_references called");
         let canonical_dir = self.validate_dir(dir)?;
 
         let references = refs::find_references(name, &canonical_dir, glob)?;
 
-        // Convert absolute paths to relative (relative to dir)
+        // 絶対パスを `dir` 基準の相対パスへ変換する。
         let references = relativize_paths(references, &canonical_dir);
 
         let result = RefsResult {
@@ -384,7 +403,7 @@ impl AppService {
         Ok(result)
     }
 
-    /// Search for references to multiple symbols across files (batch mode).
+    /// 複数シンボルの参照をバッチで横断検索する。
     pub fn find_references_batch(
         &self,
         names: &[String],
@@ -396,7 +415,7 @@ impl AppService {
 
         let batch = refs::find_references_batch(names, &canonical_dir, glob)?;
 
-        // Convert to Vec<RefsResult> preserving input order, with path relativization
+        // 入力順を保ったまま `Vec<RefsResult>` に変換し、パスも相対化する。
         let results: Vec<RefsResult> = names
             .iter()
             .map(|name| {
@@ -418,7 +437,7 @@ impl AppService {
         Ok(results)
     }
 
-    /// Analyze the impact of a unified diff on the codebase.
+    /// unified diff がコードベースへ与える影響を解析する。
     pub fn analyze_context(&self, diff: &str, dir: &str) -> Result<ContextResult> {
         debug!(dir = dir, diff_bytes = diff.len(), "analyze_context called");
         let canonical_dir = self.validate_dir(dir)?;
@@ -426,7 +445,7 @@ impl AppService {
 
         let mut result = impact::analyze_impact(diff, &canonical_dir)?;
 
-        // Convert absolute paths in impacted_callers to relative
+        // impacted_callers 内の絶対パスを相対パスへ変換する。
         for change in &mut result.changes {
             for caller in &mut change.impacted_callers {
                 if let Ok(rel) = std::path::Path::new(&caller.path).strip_prefix(&canonical_dir) {
@@ -453,7 +472,7 @@ impl AppService {
         Ok(result)
     }
 
-    /// Analyze co-change patterns from git history.
+    /// git 履歴から共変更パターンを解析する。
     pub fn analyze_cochange(
         &self,
         dir: &str,
@@ -468,7 +487,7 @@ impl AppService {
             filter_file = ?filter_file,
             "analyze_cochange called"
         );
-        // Validate parameters
+        // パラメータを検証する。
         const MAX_LOOKBACK: usize = 10_000;
         if lookback == 0 || lookback > MAX_LOOKBACK {
             bail!(AstroError::new(
@@ -505,11 +524,11 @@ impl AppService {
 }
 
 // ---------------------------------------------------------------------------
-// Path helpers
+// パス補助関数
 // ---------------------------------------------------------------------------
 
-/// Convert absolute paths to relative (relative to `dir`).
-/// Paths outside `dir` are left as-is.
+/// 絶対パスを `dir` 基準の相対パスへ変換する。
+/// `dir` 配下でないパスはそのまま残す。
 fn relativize_paths(
     mut refs: Vec<crate::models::reference::SymbolReference>,
     dir: &std::path::Path,
@@ -523,7 +542,7 @@ fn relativize_paths(
 }
 
 // ---------------------------------------------------------------------------
-// Diagnostics helper (shared by all code paths via AppService)
+// 診断情報ヘルパー（AppService の全コード経路で共有）
 // ---------------------------------------------------------------------------
 
 fn collect_diagnostics(root: tree_sitter::Node<'_>, response: &mut AstgenResponse) {
