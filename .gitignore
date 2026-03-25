@@ -27,3 +27,5 @@ target
 
 # ローカル開発用のパス上書き設定 (CI では git 依存を使用)
 .cargo/config.toml
+
+.claude/settings.json
