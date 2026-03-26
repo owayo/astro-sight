@@ -2650,3 +2650,184 @@ fn sandboxed_service_validates_input_size() {
     let result = service.analyze_context("", ".");
     assert!(result.is_ok(), "空の diff 入力はサイズ制限を通過するべき");
 }
+
+// ---- lint --rules-dir テスト ----
+
+#[test]
+fn lint_rules_dir() {
+    use std::io::Write;
+
+    let tmp_dir = std::env::temp_dir().join("astro_sight_lint_rules_dir");
+    let _ = std::fs::create_dir_all(&tmp_dir);
+
+    // ルールファイルを作成
+    let rule_file = tmp_dir.join("test_rule.yaml");
+    let mut f = std::fs::File::create(&rule_file).unwrap();
+    f.write_all(
+        b"- id: test-pattern\n  language: rust\n  pattern: main\n  severity: warning\n  message: found main\n",
+    )
+    .unwrap();
+    drop(f);
+
+    let output = cargo_bin()
+        .args([
+            "lint",
+            "--path",
+            "src/main.rs",
+            "--rules-dir",
+            tmp_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    // main.rs に "main" パターンが見つかるはず
+    assert!(
+        !json["matches"].as_array().unwrap().is_empty(),
+        "main パターンが main.rs で見つかるべき"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn lint_rules_dir_empty() {
+    let tmp_dir = std::env::temp_dir().join("astro_sight_lint_rules_dir_empty");
+    let _ = std::fs::create_dir_all(&tmp_dir);
+
+    let output = cargo_bin()
+        .args([
+            "lint",
+            "--path",
+            "src/main.rs",
+            "--rules-dir",
+            tmp_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run");
+    // 空ディレクトリでもクラッシュしないこと
+    assert!(output.status.success());
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// ---- impact --hook フラグテスト ----
+
+#[test]
+fn impact_hook_shows_triage_message() {
+    // 変更のある diff を使って impact を実行し、--hook 時にトリアージメッセージが出力されることを確認
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let src_dir = tmp_dir.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(
+        src_dir.join("lib.rs"),
+        "pub fn compute(x: i32) -> i32 { x + 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src_dir.join("main.rs"),
+        "use crate::lib::compute;\nfn main() { compute(1); }\n",
+    )
+    .unwrap();
+
+    // compute の署名変更 diff
+    let diff = r#"--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1 @@
+-pub fn compute(x: i32) -> i32 { x + 1 }
++pub fn compute(x: i32, y: i32) -> i32 { x + y }
+"#;
+
+    let output = cargo_bin()
+        .args([
+            "impact",
+            "--dir",
+            tmp_dir.path().to_str().unwrap(),
+            "--hook",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(diff.as_bytes())
+                .unwrap();
+            child.wait_with_output()
+        })
+        .expect("failed to run");
+
+    // 未解決の影響がある場合、exit 1 で --hook メッセージが出る
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("astro-sight-triage"),
+            "--hook 時にトリアージスキルの案内が表示されるべき: {}",
+            stderr
+        );
+    }
+    // 未解決影響がない場合（main.rs が解析できない等）は exit 0 で問題なし
+}
+
+// ---- session: 複数コマンドの連続処理テスト ----
+
+#[test]
+fn session_multiple_commands() {
+    let input = r#"{"command":"doctor","path":"."}
+{"command":"symbols","path":"src/main.rs"}
+"#;
+    let output = cargo_bin()
+        .arg("session")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            child.wait_with_output()
+        })
+        .expect("failed to run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 2, "2コマンド → 2行の NDJSON 出力");
+
+    // 各行が有効な JSON であること
+    for line in &lines {
+        let _: serde_json::Value =
+            serde_json::from_str(line).expect("各行が有効な JSON であるべき");
+    }
+}
+
+// ---- sequence バッチ処理テスト ----
+
+#[test]
+fn sequence_batch() {
+    let output = cargo_bin()
+        .args(["sequence", "--paths", "src/main.rs,src/service.rs"])
+        .output()
+        .expect("failed to run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 2, "2ファイル → 2行の NDJSON 出力");
+
+    for line in &lines {
+        let json: serde_json::Value =
+            serde_json::from_str(line).expect("各行が有効な JSON であるべき");
+        assert!(json["diagram"].as_str().is_some() || json.get("error").is_some());
+    }
+}

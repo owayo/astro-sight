@@ -103,6 +103,7 @@ const KNOWN_SUBCMDS: &[&str] = &[
     "calls",
     "refs",
     "context",
+    "impact",
     "imports",
     "lint",
     "sequence",
