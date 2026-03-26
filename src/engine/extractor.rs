@@ -167,12 +167,15 @@ fn node_to_ast(node: Node<'_>, source: &[u8], remaining_depth: usize) -> AstNode
 
     let children = if remaining_depth > 0 {
         let mut cursor = node.walk();
+        // named child のインデックスでフィールド名を取得
+        let mut named_index = 0u32;
         node.children(&mut cursor)
             .filter(|c| c.is_named())
             .map(|child| {
                 let field = node
-                    .field_name_for_named_child(child.id() as u32)
+                    .field_name_for_named_child(named_index)
                     .map(|s| s.to_string());
+                named_index += 1;
                 AstEdge {
                     field,
                     node: node_to_ast(child, source, remaining_depth - 1),
