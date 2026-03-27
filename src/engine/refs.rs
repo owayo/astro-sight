@@ -404,11 +404,14 @@ fn find_refs_batch_in_file(
 
     let mut result: HashMap<String, Vec<SymbolReference>> = HashMap::new();
 
+    // O(1) ルックアップ用 HashSet を1回だけ構築
+    let name_set: std::collections::HashSet<&str> = present.iter().map(|s| s.as_str()).collect();
+
     // AST を1回走査し、含まれるシンボルを全てチェック
     collect_identifier_refs_batch(
         root,
         &source,
-        &present,
+        &name_set,
         path.as_str(),
         &definition_kinds,
         lang_id,
@@ -419,10 +422,11 @@ fn find_refs_batch_in_file(
 }
 
 /// AST を再帰走査し、指定シンボル群に一致する identifier ノードを収集する。
+/// symbol_names は呼び出し元で構築済みの HashSet（O(1) ルックアップ）。
 fn collect_identifier_refs_batch(
     node: Node<'_>,
     source: &[u8],
-    symbol_names: &[&String],
+    symbol_names: &std::collections::HashSet<&str>,
     path: &str,
     definition_kinds: &[&str],
     lang_id: LangId,
@@ -430,28 +434,24 @@ fn collect_identifier_refs_batch(
 ) {
     if is_identifier_kind(node.kind())
         && let Ok(text) = node.utf8_text(source)
+        && symbol_names.contains(text)
     {
-        for name in symbol_names {
-            if text == name.as_str() {
-                let is_def = is_definition_context(node, definition_kinds, lang_id);
-                let context = extract_line_context(source, node.start_position().row);
+        let is_def = is_definition_context(node, definition_kinds, lang_id);
+        let context = extract_line_context(source, node.start_position().row);
 
-                refs.entry(name.to_string())
-                    .or_default()
-                    .push(SymbolReference {
-                        path: path.to_string(),
-                        line: node.start_position().row,
-                        column: node.start_position().column,
-                        context: Some(context),
-                        kind: Some(if is_def {
-                            RefKind::Definition
-                        } else {
-                            RefKind::Reference
-                        }),
-                    });
-                break; // 各 identifier は最大1つのシンボルに一致
-            }
-        }
+        refs.entry(text.to_string())
+            .or_default()
+            .push(SymbolReference {
+                path: path.to_string(),
+                line: node.start_position().row,
+                column: node.start_position().column,
+                context: Some(context),
+                kind: Some(if is_def {
+                    RefKind::Definition
+                } else {
+                    RefKind::Reference
+                }),
+            });
     }
 
     let mut cursor = node.walk();

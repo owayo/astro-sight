@@ -525,9 +525,34 @@ pub fn cmd_impact(
 
     let result = service.analyze_context(&diff_input, dir)?;
 
-    // 変更されたファイルパスの集合を収集
+    // 変更されたファイルパスを事前に canonicalize してキャッシュ（O(M) syscall に削減）
     let changed_paths: std::collections::HashSet<&str> =
         result.changes.iter().map(|c| c.path.as_str()).collect();
+    let changed_canonical: std::collections::HashSet<std::path::PathBuf> = changed_paths
+        .iter()
+        .filter_map(|cp| {
+            let abs = if std::path::Path::new(cp).is_relative() {
+                std::path::Path::new(dir).join(cp)
+            } else {
+                std::path::PathBuf::from(cp)
+            };
+            std::fs::canonicalize(&abs).ok()
+        })
+        .collect();
+    // canonicalize 失敗時のフォールバック用に文字列セットも保持
+    let changed_abs_strs: std::collections::HashSet<String> = changed_paths
+        .iter()
+        .map(|cp| {
+            if std::path::Path::new(cp).is_relative() {
+                std::path::Path::new(dir)
+                    .join(cp)
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                cp.to_string()
+            }
+        })
+        .collect();
 
     // 未解決の影響をグループ化: diff に含まれないファイルの caller
     // caller ごとに影響シンボルを追跡
@@ -555,24 +580,11 @@ pub fn cmd_impact(
                 caller.path.clone()
             };
 
-            // caller のファイルが変更ファイルに含まれていないかチェック
-            let in_diff = changed_paths.iter().any(|cp| {
-                let cp_abs = if std::path::Path::new(cp).is_relative() {
-                    std::path::Path::new(dir)
-                        .join(cp)
-                        .to_string_lossy()
-                        .to_string()
-                } else {
-                    cp.to_string()
-                };
-                match (
-                    std::fs::canonicalize(&caller_abs),
-                    std::fs::canonicalize(&cp_abs),
-                ) {
-                    (Ok(a), Ok(b)) => a == b,
-                    _ => caller_abs == cp_abs,
-                }
-            });
+            // caller のファイルが変更ファイルに含まれていないかチェック（キャッシュ参照で O(1)）
+            let in_diff = match std::fs::canonicalize(&caller_abs) {
+                Ok(canon) => changed_canonical.contains(&canon),
+                Err(_) => changed_abs_strs.contains(&caller_abs),
+            };
 
             if !in_diff {
                 unresolved
