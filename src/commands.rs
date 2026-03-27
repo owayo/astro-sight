@@ -767,30 +767,54 @@ fn detect_missing_cochanges(
     dir: &str,
     changed_files: &HashSet<String>,
 ) -> Vec<MissingCochange> {
-    let cochange_result = match service.analyze_cochange(dir, 200, 0.3, None) {
+    // 閾値 0.5 でノイズ削減
+    let cochange_result = match service.analyze_cochange(dir, 200, 0.5, None) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
 
-    let mut missing = Vec::new();
+    // 各 missing file につき最も confidence が高いペアのみ残す
+    let mut best: std::collections::HashMap<String, MissingCochange> =
+        std::collections::HashMap::new();
     for entry in &cochange_result.entries {
         let a_in_diff = changed_files.contains(&entry.file_a);
         let b_in_diff = changed_files.contains(&entry.file_b);
 
-        if a_in_diff && !b_in_diff {
-            missing.push(MissingCochange {
+        let candidate = if a_in_diff && !b_in_diff {
+            Some(MissingCochange {
                 file: entry.file_b.clone(),
                 expected_with: entry.file_a.clone(),
                 confidence: entry.confidence,
-            });
+            })
         } else if b_in_diff && !a_in_diff {
-            missing.push(MissingCochange {
+            Some(MissingCochange {
                 file: entry.file_a.clone(),
                 expected_with: entry.file_b.clone(),
                 confidence: entry.confidence,
-            });
+            })
+        } else {
+            None
+        };
+
+        if let Some(c) = candidate {
+            best.entry(c.file.clone())
+                .and_modify(|existing| {
+                    if c.confidence > existing.confidence {
+                        *existing = c.clone();
+                    }
+                })
+                .or_insert(c);
         }
     }
+
+    // confidence 降順でソートし最大10件に制限
+    let mut missing: Vec<MissingCochange> = best.into_values().collect();
+    missing.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    missing.truncate(10);
     missing
 }
 
@@ -971,6 +995,47 @@ fn extract_exported_symbols_from_file(
     Some(filter_exported_symbols(&syms, root, &source, lang_id))
 }
 
+/// シンボルの種類に応じた API シグネチャを抽出する。
+/// 関数/メソッド → 宣言行、struct/enum/trait/interface/class → 全行を結合。
+fn extract_api_signature(sym: &crate::models::symbol::Symbol, lines: &[&str]) -> String {
+    use crate::models::symbol::SymbolKind;
+    match sym.kind {
+        SymbolKind::Function | SymbolKind::Method => {
+            // 関数は先頭行で十分
+            lines
+                .get(sym.range.start.line)
+                .unwrap_or(&"")
+                .trim()
+                .to_string()
+        }
+        SymbolKind::Struct
+        | SymbolKind::Enum
+        | SymbolKind::Trait
+        | SymbolKind::Interface
+        | SymbolKind::Class => {
+            // 型はメンバー行を集約してシグネチャとする
+            let start = sym.range.start.line;
+            let end = sym.range.end.line.min(lines.len().saturating_sub(1));
+            let members: Vec<String> = (start..=end)
+                .filter_map(|i| {
+                    let line = lines.get(i)?.trim();
+                    if !line.is_empty() {
+                        Some(line.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            members.join("\n")
+        }
+        _ => lines
+            .get(sym.range.start.line)
+            .unwrap_or(&"")
+            .trim()
+            .to_string(),
+    }
+}
+
 fn filter_exported_symbols(
     syms: &[crate::models::symbol::Symbol],
     root: tree_sitter::Node<'_>,
@@ -985,11 +1050,12 @@ fn filter_exported_symbols(
         if !crate::engine::symbols::is_symbol_exported(root, source, lang_id, &sym.range) {
             continue;
         }
-        let sig = lines
-            .get(sym.range.start.line)
-            .unwrap_or(&"")
-            .trim()
-            .to_string();
+        // pub(crate), pub(super) 等はクレート内部APIなので除外
+        let decl_line = lines.get(sym.range.start.line).unwrap_or(&"").trim();
+        if decl_line.contains("pub(") {
+            continue;
+        }
+        let sig = extract_api_signature(sym, &lines);
         result.push((
             sym.name.clone(),
             format!("{:?}", sym.kind).to_lowercase(),
