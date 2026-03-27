@@ -294,10 +294,21 @@ fn run(cli: Cli) -> Result<()> {
         },
         Commands::Review {
             dir,
+            diff,
+            diff_file,
             git,
             base,
             staged,
-        } => cmd_review(&service, &dir, git, &base, staged, pretty),
+        } => cmd_review(
+            &service,
+            &dir,
+            diff.as_deref(),
+            diff_file.as_deref(),
+            git,
+            &base,
+            staged,
+            pretty,
+        ),
         Commands::Cochange {
             dir,
             lookback,

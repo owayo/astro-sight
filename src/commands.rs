@@ -682,16 +682,23 @@ pub fn cmd_mcp() -> Result<()> {
 // Review コマンド: impact / cochange / API surface diff / dead symbol 統合
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_review(
     service: &AppService,
     dir: &str,
+    diff: Option<&str>,
+    diff_file: Option<&str>,
     git: bool,
     base: &str,
     staged: bool,
     pretty: bool,
 ) -> Result<()> {
-    // 1. diff 取得
-    let diff_input = if git {
+    // 1. diff 取得（context コマンドと同じ入力方式）
+    let diff_input = if let Some(d) = diff {
+        d.to_string()
+    } else if let Some(df) = diff_file {
+        read_file_to_string_limited(df, MAX_INPUT_SIZE)?
+    } else if git {
         run_git_diff(dir, base, staged)?
     } else {
         let stdin = std::io::stdin();

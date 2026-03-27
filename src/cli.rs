@@ -281,8 +281,16 @@ pub enum Commands {
         #[arg(short, long)]
         dir: String,
 
-        /// Auto-run git diff to get changes
+        /// Inline diff string
         #[arg(long)]
+        diff: Option<String>,
+
+        /// Path to a diff file
+        #[arg(long, conflicts_with = "diff")]
+        diff_file: Option<String>,
+
+        /// Auto-run git diff to get changes
+        #[arg(long, conflicts_with_all = ["diff", "diff_file"])]
         git: bool,
 
         /// Base ref for git diff (default: HEAD)
