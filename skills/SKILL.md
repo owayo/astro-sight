@@ -116,6 +116,12 @@ astro-sight context --dir . --git --staged
 # Custom base ref
 astro-sight context --dir . --git --base HEAD~3
 
+# Inline diff string
+astro-sight context --dir . --diff "$(git diff)"
+
+# Diff file
+astro-sight context --dir . --diff-file changes.patch
+
 # Pipe from git diff (legacy)
 git diff | astro-sight context --dir .
 ```
@@ -133,15 +139,18 @@ astro-sight impact --dir . --git
 # Staged changes
 astro-sight impact --dir . --git --staged
 
+# AI agent hook mode (appends triage hint on detection)
+astro-sight impact --dir . --git --hook
+
 # Pipe from stdin
 git diff | astro-sight impact --dir .
 ```
 
-Exit codes: `0` = no unresolved impacts (silent), `1` = unresolved impacts found (stderr text output).
+Exit codes: `0` = no unresolved impacts (silent), `1` = unresolved impacts found (stderr text output). With `--hook`, appends a triage hint for AI agents.
 
 ### `imports` — Import/Export Extraction
 
-Extracts import/export relationships using language-specific tree-sitter queries. 13 languages (Bash excluded).
+Extracts import/export relationships using language-specific tree-sitter queries. 14 languages (Bash excluded).
 
 ```bash
 astro-sight imports --path <file>
@@ -283,7 +292,8 @@ astro-sight lint --path src/main.rs --rules rules.yaml
 ## Notes
 
 - 15 languages: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby
-- All output is compact JSON (short keys: `lang`, `ln`, `col`, `ctx`, `refs`, `src`, `def`/`ref`, `fn` etc.)
+- All output is compact JSON by default (short keys: `lang`, `ln`, `col`, `ctx`, `refs`, `src`, `def`/`ref`, `fn` etc.)
+- Use `--pretty` (global flag) for human-readable formatted JSON output
 - `refs` results include `ctx` (source line) — no need to Read files afterward
 - `refs` respects `.gitignore` and uses parallel scanning
 - Multiple symbol searches: use `refs --names` for batching; reserve `session` for mixed commands
