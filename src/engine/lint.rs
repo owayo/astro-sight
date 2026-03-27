@@ -5,14 +5,14 @@ use tree_sitter::{Node, Query, QueryCursor};
 use crate::language::LangId;
 use crate::models::lint::{PatternMatch, Rule};
 
-/// Load rules from a YAML file.
+/// YAML ファイルからルールを読み込む。
 pub fn load_rules_from_file(path: &str) -> Result<Vec<Rule>> {
     let content = std::fs::read_to_string(path)?;
     let rules: Vec<Rule> = serde_yaml::from_str(&content)?;
     Ok(rules)
 }
 
-/// Load rules from all YAML files in a directory.
+/// ディレクトリ内の全 YAML ファイルからルールを読み込む。
 pub fn load_rules_from_dir(dir: &str) -> Result<Vec<Rule>> {
     let mut all_rules = Vec::new();
     let dir_path = std::path::Path::new(dir);
@@ -40,8 +40,8 @@ pub fn load_rules_from_dir(dir: &str) -> Result<Vec<Rule>> {
     Ok(all_rules)
 }
 
-/// Lint a file against the given rules.
-/// Returns (matches, warnings). Warnings contain info about skipped/invalid rules.
+/// 指定ルールでファイルを lint する。
+/// (matches, warnings) を返す。warnings にはスキップ・無効ルールの情報を含む。
 pub fn lint_file(
     root: Node<'_>,
     source: &[u8],
@@ -54,12 +54,12 @@ pub fn lint_file(
     let mut warnings = Vec::new();
 
     for rule in rules {
-        // Skip rules for other languages
+        // 異なる言語のルールをスキップ
         if rule.language != lang_name {
             continue;
         }
 
-        // Validate: must have exactly one of query or pattern
+        // バリデーション: query または pattern のいずれかが必須
         if rule.query.is_some() && rule.pattern.is_some() {
             warnings.push(format!(
                 "Rule '{}': query and pattern are mutually exclusive; using query",
@@ -75,7 +75,7 @@ pub fn lint_file(
         }
 
         if let Some(query_src) = &rule.query {
-            // Mode 1: tree-sitter query
+            // モード 1: tree-sitter クエリ
             match Query::new(&language, query_src) {
                 Ok(query) => {
                     let mut cursor = QueryCursor::new();
@@ -106,7 +106,7 @@ pub fn lint_file(
                 }
             }
         } else if let Some(pattern) = &rule.pattern {
-            // Mode 2: text pattern matching on identifier nodes
+            // モード 2: identifier ノードへのテキストパターンマッチ
             collect_pattern_matches(root, source, pattern, rule, &mut matches);
         }
     }
@@ -114,7 +114,7 @@ pub fn lint_file(
     Ok((matches, warnings))
 }
 
-/// Recursively walk the AST and match identifier nodes against a text pattern.
+/// AST を再帰走査し、identifier ノードをテキストパターンと照合する。
 fn collect_pattern_matches(
     node: Node<'_>,
     source: &[u8],
@@ -123,7 +123,7 @@ fn collect_pattern_matches(
     matches: &mut Vec<PatternMatch>,
 ) {
     let kind = node.kind();
-    // Check identifier-like nodes
+    // identifier 系ノードをチェック
     let is_identifier = kind == "identifier"
         || kind == "field_identifier"
         || kind == "type_identifier"

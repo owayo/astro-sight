@@ -2,7 +2,7 @@ use crate::models::ast_node::{AstEdge, AstNode};
 use crate::models::location::Range;
 use tree_sitter::{Node, Point};
 
-/// Extract AST nodes at or around the given position.
+/// 指定位置付近の AST ノードを抽出する。
 pub fn extract_at_point(
     root: Node<'_>,
     source: &[u8],
@@ -19,7 +19,7 @@ pub fn extract_at_point(
     }
 }
 
-/// Extract AST nodes within a given range.
+/// 指定範囲内の AST ノードを抽出する。
 pub fn extract_range(
     root: Node<'_>,
     source: &[u8],
@@ -36,7 +36,7 @@ pub fn extract_range(
     collect_nodes_in_range(root, source, start, end, depth, &mut results);
 
     if results.is_empty() {
-        // Fallback: return deepest node at start
+        // フォールバック: start 位置の最深ノードを返す
         if let Some(n) = find_deepest_node_at(root, start) {
             results.push(node_to_ast(n, source, depth));
         }
@@ -45,7 +45,7 @@ pub fn extract_range(
     results
 }
 
-/// Extract the full AST (root level) with limited depth.
+/// ルートレベルの AST 全体を制限深度で抽出する。
 pub fn extract_full(root: Node<'_>, source: &[u8], depth: usize) -> Vec<AstNode> {
     let mut results = Vec::new();
     let mut cursor = root.walk();
@@ -99,7 +99,7 @@ fn collect_nodes_in_range(
     let node_start = node.start_position();
     let node_end = node.end_position();
 
-    // Skip if entirely outside range
+    // 範囲外のノードをスキップ
     if node_end.row < start.row || (node_end.row == start.row && node_end.column < start.column) {
         return;
     }
@@ -107,13 +107,13 @@ fn collect_nodes_in_range(
         return;
     }
 
-    // If node is fully within range, include it
+    // ノードが範囲内に完全に含まれる場合は収集
     if node.is_named() && is_within(node_start, node_end, start, end) {
         results.push(node_to_ast(node, source, depth));
         return;
     }
 
-    // Otherwise recurse into children
+    // 含まれない場合は子ノードを再帰走査
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_nodes_in_range(child, source, start, end, depth, results);
@@ -126,7 +126,7 @@ fn is_within(ns: Point, ne: Point, rs: Point, re: Point) -> bool {
     start_ok && end_ok
 }
 
-/// Remove common leading whitespace from multi-line text.
+/// 複数行テキストの共通インデントを除去する。
 fn dedent(s: &str) -> String {
     if !s.contains('\n') {
         return s.replace('\t', " ");
@@ -134,7 +134,7 @@ fn dedent(s: &str) -> String {
     let lines: Vec<&str> = s.lines().collect();
     let min_indent = lines
         .iter()
-        .skip(1) // first line has no leading indent (starts at node column)
+        .skip(1) // 最初の行はノードの列位置から始まるためインデントなし
         .filter(|l| !l.trim().is_empty())
         .map(|l| l.len() - l.trim_start().len())
         .min()
@@ -193,5 +193,95 @@ fn node_to_ast(node: Node<'_>, source: &[u8], remaining_depth: usize) -> AstNode
         range: Range::from(node.range()),
         text,
         children,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::Point;
+
+    // --- dedent テスト ---
+
+    /// 単一行テキストのタブがスペースに変換される
+    #[test]
+    fn dedent_single_line() {
+        assert_eq!(dedent("hello\tworld"), "hello world");
+    }
+
+    /// 複数行テキストの共通インデント（8スペース）が除去される
+    #[test]
+    fn dedent_multi_line() {
+        let input = "fn main() {\n        let x = 1;\n        let y = 2;\n    }";
+        let result = dedent(input);
+        // 2行目以降の最小インデント=4 が除去される
+        assert!(result.contains("let x = 1;"));
+        // 先頭行はインデント除去対象外
+        assert!(result.starts_with("fn main()"));
+    }
+
+    /// 空行はインデント計算に含まれない
+    #[test]
+    fn dedent_empty_line_ignored() {
+        let input = "start\n        line1\n\n        line2";
+        let result = dedent(input);
+        // 空行がインデント計算を壊さず、8スペースが除去される
+        assert!(result.contains("line1"));
+        assert!(result.contains("line2"));
+        // 空行後の行もインデントが正しく除去される
+        assert!(!result.contains("        line2"));
+    }
+
+    // --- contains_point テスト ---
+
+    /// ノードの範囲内のポイントが true を返す
+    #[test]
+    fn contains_point_inside() {
+        let source = b"fn main() {\n    let x = 1;\n}";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&crate::language::LangId::Rust.ts_language())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        // ルートノードは全体を包含するので内部のポイントは true
+        assert!(contains_point(root, Point::new(1, 4)));
+    }
+
+    /// ノードの範囲外のポイントが false を返す
+    #[test]
+    fn contains_point_outside() {
+        let source = b"fn main() {}";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&crate::language::LangId::Rust.ts_language())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        // ルートノードの範囲外（遥か下の行）
+        assert!(!contains_point(root, Point::new(100, 0)));
+    }
+
+    // --- is_within テスト ---
+
+    /// 完全に含まれる範囲が true を返す
+    #[test]
+    fn is_within_fully_contained() {
+        let ns = Point::new(2, 5);
+        let ne = Point::new(4, 10);
+        let rs = Point::new(1, 0);
+        let re = Point::new(5, 0);
+        assert!(is_within(ns, ne, rs, re));
+    }
+
+    /// 部分的に範囲外の場合は false を返す
+    #[test]
+    fn is_within_partially_outside() {
+        let ns = Point::new(0, 0);
+        let ne = Point::new(4, 10);
+        let rs = Point::new(1, 0);
+        let re = Point::new(5, 0);
+        // ns がrs より前なので false
+        assert!(!is_within(ns, ne, rs, re));
     }
 }

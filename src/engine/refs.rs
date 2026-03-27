@@ -7,8 +7,8 @@ use crate::engine::parser;
 use crate::language::LangId;
 use crate::models::reference::{RefKind, SymbolReference};
 
-/// Search for references to `symbol_name` across files in `dir`.
-/// Optionally filter by a glob pattern (e.g., "**/*.rs").
+/// 指定シンボルへの参照をディレクトリ内のファイルから検索する。
+/// glob パターン（例: "**/*.rs"）によるフィルタも可能。
 pub fn find_references(
     symbol_name: &str,
     dir: &Path,
@@ -25,7 +25,7 @@ pub fn find_references(
         .collect();
 
     let mut all_refs: Vec<SymbolReference> = refs.into_iter().flatten().collect();
-    // Sort: definitions first, then by path/line
+    // ソート: 定義を先頭に、その後パス/行番号順
     all_refs.sort_by(|a, b| {
         let def_order = |k: &Option<RefKind>| match k {
             Some(RefKind::Definition) => 0,
@@ -40,14 +40,14 @@ pub fn find_references(
     Ok(all_refs)
 }
 
-/// Collect files using the `ignore` crate (.gitignore aware).
+/// ignore クレートでファイルを収集する（.gitignore 対応）。
 pub fn collect_files(dir: &Path, glob_pattern: Option<&str>) -> Result<Vec<std::path::PathBuf>> {
     use ignore::WalkBuilder;
 
     let mut builder = WalkBuilder::new(dir);
     builder.hidden(true).git_ignore(true).git_global(true);
 
-    // Apply glob filter via override
+    // glob フィルタを override で適用
     if let Some(pattern) = glob_pattern {
         let mut overrides = ignore::overrides::OverrideBuilder::new(dir);
         overrides.add(pattern)?;
@@ -59,7 +59,7 @@ pub fn collect_files(dir: &Path, glob_pattern: Option<&str>) -> Result<Vec<std::
         let entry = entry?;
         if entry.file_type().is_some_and(|ft| ft.is_file()) {
             let path = entry.into_path();
-            // Only include files we can parse
+            // パース可能なファイルのみ対象
             if LangId::from_path(camino::Utf8Path::new(path.to_str().unwrap_or(""))).is_ok() {
                 files.push(path);
             }
@@ -69,11 +69,11 @@ pub fn collect_files(dir: &Path, glob_pattern: Option<&str>) -> Result<Vec<std::
     Ok(files)
 }
 
-/// Find references to `symbol_name` in a single file.
+/// 単一ファイル内でシンボル参照を検索する。
 fn find_refs_in_file(symbol_name: &str, path: &camino::Utf8Path) -> Result<Vec<SymbolReference>> {
     let source = parser::read_file(path)?;
 
-    // Quick byte-level check: skip if symbol name not in source (SIMD-accelerated)
+    // バイトレベルの高速チェック: シンボル名がソースに含まれなければスキップ（SIMD 加速）
     if memchr::memmem::find(&source, symbol_name.as_bytes()).is_none() {
         return Ok(Vec::new());
     }
@@ -96,7 +96,7 @@ fn find_refs_in_file(symbol_name: &str, path: &camino::Utf8Path) -> Result<Vec<S
     Ok(refs)
 }
 
-/// Recursively walk the tree and collect identifier nodes matching `symbol_name`.
+/// AST を再帰走査し、指定シンボル名に一致する identifier ノードを収集する。
 fn collect_identifier_refs(
     node: Node<'_>,
     source: &[u8],
@@ -126,7 +126,7 @@ fn collect_identifier_refs(
         });
     }
 
-    // Recurse into children
+    // 子ノードを再帰走査
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_identifier_refs(
@@ -141,18 +141,18 @@ fn collect_identifier_refs(
     }
 }
 
-/// Check if this identifier node is in a definition context.
+/// この identifier ノードが定義コンテキストにあるかを判定する。
 fn is_definition_context(node: Node<'_>, definition_kinds: &[&str], lang_id: LangId) -> bool {
     if lang_id == LangId::Ruby {
         return is_ruby_definition_context(node);
     }
 
     if let Some(parent) = node.parent() {
-        // Check if the parent is a definition node
+        // 親ノードが定義ノードかチェック
         if definition_kinds.contains(&parent.kind()) {
             return true;
         }
-        // Check grandparent (e.g., function_declarator > identifier)
+        // 祖父ノードもチェック（例: function_declarator > identifier）
         if let Some(grandparent) = parent.parent()
             && definition_kinds.contains(&grandparent.kind())
         {
@@ -203,7 +203,7 @@ fn is_ruby_definition_context(node: Node<'_>) -> bool {
     }
 }
 
-/// Get node kinds that represent definitions for a language.
+/// 言語ごとの定義ノード種別を返す。
 fn definition_node_kinds(lang_id: LangId) -> Vec<&'static str> {
     match lang_id {
         LangId::Rust => vec![
@@ -309,7 +309,7 @@ fn is_identifier_kind(kind: &str) -> bool {
     )
 }
 
-/// Extract the source line at a given row for context.
+/// 指定行のソース行をコンテキストとして抽出する。
 fn extract_line_context(source: &[u8], row: usize) -> String {
     let text = std::str::from_utf8(source).unwrap_or("");
     text.lines().nth(row).unwrap_or("").trim().to_string()
@@ -319,9 +319,9 @@ fn extract_line_context(source: &[u8], row: usize) -> String {
 // Batch reference search: O(N + S) instead of O(S × N)
 // ---------------------------------------------------------------------------
 
-/// Search for references to *all* symbol names in a single directory walk.
-/// Returns a map from symbol name to its references.
-/// Uses Aho-Corasick automaton for efficient multi-pattern pre-filtering.
+/// 全シンボル名の参照を1回のディレクトリウォークで検索する。
+/// シンボル名→参照リストのマップを返す。
+/// Aho-Corasick オートマトンによる効率的なマルチパターン事前フィルタを使用。
 pub fn find_references_batch(
     symbol_names: &[String],
     dir: &Path,
@@ -333,7 +333,7 @@ pub fn find_references_batch(
         return Ok(HashMap::new());
     }
 
-    // Build Aho-Corasick automaton once, share across all files
+    // Aho-Corasick オートマトンを1回構築し、全ファイルで共有する
     let ac = aho_corasick::AhoCorasick::new(symbol_names)
         .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))?;
 
@@ -347,7 +347,7 @@ pub fn find_references_batch(
         })
         .collect();
 
-    // Merge per-file results
+    // ファイルごとの結果をマージ
     let mut merged: HashMap<String, Vec<SymbolReference>> = HashMap::new();
     for file_map in per_file {
         for (name, refs) in file_map {
@@ -355,7 +355,7 @@ pub fn find_references_batch(
         }
     }
 
-    // Sort each symbol's refs: definitions first, then by path/line
+    // 各シンボルの参照をソート: 定義を先頭に、その後パス/行番号順
     for refs in merged.values_mut() {
         refs.sort_by(|a, b| {
             let def_order = |k: &Option<RefKind>| match k {
@@ -372,8 +372,8 @@ pub fn find_references_batch(
     Ok(merged)
 }
 
-/// Find references to multiple symbols in a single file (one parse).
-/// Uses a pre-built Aho-Corasick automaton for O(file_size) multi-pattern filtering.
+/// 単一ファイル内で複数シンボルの参照を検索する（1回のパースで処理）。
+/// 事前構築した Aho-Corasick オートマトンで O(file_size) のマルチパターンフィルタを使用。
 fn find_refs_batch_in_file(
     symbol_names: &[String],
     ac: &aho_corasick::AhoCorasick,
@@ -383,12 +383,12 @@ fn find_refs_batch_in_file(
 
     let source = parser::read_file(path)?;
 
-    // Multi-pattern pre-filter: find which symbols appear in this file (one pass)
+    // マルチパターン事前フィルタ: 1パスでこのファイルに含まれるシンボルを特定
     let mut present_indices: HashSet<usize> = HashSet::new();
     for mat in ac.find_overlapping_iter(source.as_bytes()) {
         present_indices.insert(mat.pattern().as_usize());
         if present_indices.len() == symbol_names.len() {
-            break; // All patterns found
+            break; // 全パターン検出済み
         }
     }
 
@@ -404,7 +404,7 @@ fn find_refs_batch_in_file(
 
     let mut result: HashMap<String, Vec<SymbolReference>> = HashMap::new();
 
-    // Walk the tree once, checking all present symbols at each identifier node
+    // AST を1回走査し、含まれるシンボルを全てチェック
     collect_identifier_refs_batch(
         root,
         &source,
@@ -418,7 +418,7 @@ fn find_refs_batch_in_file(
     Ok(result)
 }
 
-/// Recursively walk the tree and collect identifier nodes matching any of the given symbols.
+/// AST を再帰走査し、指定シンボル群に一致する identifier ノードを収集する。
 fn collect_identifier_refs_batch(
     node: Node<'_>,
     source: &[u8],
@@ -449,7 +449,7 @@ fn collect_identifier_refs_batch(
                             RefKind::Reference
                         }),
                     });
-                break; // Each identifier matches at most one symbol name
+                break; // 各 identifier は最大1つのシンボルに一致
             }
         }
     }
@@ -465,5 +465,65 @@ fn collect_identifier_refs_batch(
             lang_id,
             refs,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 既知の identifier ノード種別が true を返すことを検証
+    #[test]
+    fn is_identifier_kind_matches() {
+        assert!(is_identifier_kind("identifier"));
+        assert!(is_identifier_kind("type_identifier"));
+        assert!(is_identifier_kind("field_identifier"));
+        assert!(is_identifier_kind("property_identifier"));
+        assert!(is_identifier_kind("constant"));
+        assert!(is_identifier_kind("name"));
+        assert!(is_identifier_kind("word"));
+    }
+
+    /// 非 identifier ノード種別が false を返すことを検証
+    #[test]
+    fn is_identifier_kind_rejects_non_identifier() {
+        assert!(!is_identifier_kind("function_definition"));
+        assert!(!is_identifier_kind("block"));
+        assert!(!is_identifier_kind("string"));
+        assert!(!is_identifier_kind("comment"));
+    }
+
+    /// 指定行のソースが正しく抽出され、前後の空白が除去されることを検証
+    #[test]
+    fn extract_line_context_basic() {
+        let source = b"line0\n  line1  \nline2";
+        let ctx = extract_line_context(source, 1);
+        assert_eq!(ctx, "line1");
+    }
+
+    /// 範囲外の行に対して空文字を返すことを検証
+    #[test]
+    fn extract_line_context_out_of_range() {
+        let source = b"only one line";
+        let ctx = extract_line_context(source, 5);
+        assert_eq!(ctx, "");
+    }
+
+    /// Rust の定義ノード種別に function_item と struct_item が含まれることを検証
+    #[test]
+    fn definition_node_kinds_rust() {
+        let kinds = definition_node_kinds(LangId::Rust);
+        assert!(kinds.contains(&"function_item"));
+        assert!(kinds.contains(&"struct_item"));
+        assert!(kinds.contains(&"enum_item"));
+        assert!(kinds.contains(&"trait_item"));
+    }
+
+    /// Python の定義ノード種別に function_definition と class_definition が含まれることを検証
+    #[test]
+    fn definition_node_kinds_python() {
+        let kinds = definition_node_kinds(LangId::Python);
+        assert!(kinds.contains(&"function_definition"));
+        assert!(kinds.contains(&"class_definition"));
     }
 }

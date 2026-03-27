@@ -116,10 +116,10 @@ fn has_enclosing_function_body_jvm(node: Node) -> bool {
     false
 }
 
-/// Check if a symbol at the given range is exported (visible outside the file).
+/// 指定範囲のシンボルがエクスポートされているか（ファイル外から参照可能か）を判定する。
 ///
-/// For languages without clear export semantics (Java, Python, C, etc.),
-/// conservatively returns `true` to avoid false negatives.
+/// エクスポートのセマンティクスが明確でない言語（Java、Python、C 等）では、
+/// 偽陰性を避けるため保守的に `true` を返す。
 pub fn is_symbol_exported(
     root: Node,
     source: &[u8],
@@ -136,7 +136,7 @@ pub fn is_symbol_exported(
     };
 
     let Some(node) = root.descendant_for_point_range(start, end) else {
-        return true; // conservative: treat as exported if node not found
+        return true; // 保守的: ノード未検出時はエクスポートと判定
     };
 
     match lang_id {
@@ -146,7 +146,7 @@ pub fn is_symbol_exported(
         LangId::Rust => is_exported_rust(node),
         LangId::Go => is_exported_go(node, source),
         LangId::Java | LangId::Kotlin => is_exported_jvm(node, source),
-        _ => true, // conservative for unsupported languages
+        _ => true, // 未対応言語は保守的にエクスポートと判定
     }
 }
 
@@ -191,25 +191,25 @@ fn find_enclosing_declaration(node: Node) -> Option<Node> {
     None
 }
 
-/// JS/TS: check export_statement ancestor or named export { name }.
+/// JS/TS: 祖先の export_statement または named export { name } をチェック。
 fn is_exported_js_ts(node: Node, source: &[u8], root: Node) -> bool {
-    // Check if any ancestor is an export_statement, stopping at function scope boundaries.
-    // Without this boundary check, local variables inside exported functions
-    // (e.g. `const result` inside `export function foo()`) would be falsely
-    // detected as exported because `export_statement` is an ancestor.
+    // 祖先に export_statement があるかチェック（関数スコープ境界で停止）。
+    // この境界チェックがないと、export された関数内のローカル変数
+    // （例: `export function foo()` 内の `const result`）が export_statement の
+    // 子孫であるため誤ってエクスポートと判定される。
     let mut current = Some(node);
     while let Some(n) = current {
         if n.kind() == "export_statement" {
             return true;
         }
-        // Stop at function body boundaries — symbols inside are local
+        // 関数本体の境界で停止 — 内部のシンボルはローカル
         if is_js_function_body(n) {
             break;
         }
         current = n.parent();
     }
 
-    // Check for named exports: export { name }
+    // named export のチェック: export { name }
     if let Some(name_node) = node.child_by_field_name("name")
         && let Ok(name) = name_node.utf8_text(source)
     {
@@ -219,7 +219,7 @@ fn is_exported_js_ts(node: Node, source: &[u8], root: Node) -> bool {
     false
 }
 
-/// Search top-level export { ... } statements for a matching name.
+/// トップレベルの export { ... } 文から一致する名前を検索する。
 fn has_named_export(root: Node, source: &[u8], target_name: &str) -> bool {
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
@@ -248,11 +248,11 @@ fn has_named_export(root: Node, source: &[u8], target_name: &str) -> bool {
     false
 }
 
-/// Rust: check visibility_modifier (pub) or impl block membership.
+/// Rust: visibility_modifier (pub) または impl ブロック所属をチェック。
 ///
-/// - `pub fn` → exported
-/// - Trait impl methods (no explicit `pub` needed) → exported
-/// - Inherent impl methods without `pub` → module-private, NOT exported
+/// - `pub fn` → エクスポート
+/// - trait impl のメソッド（明示的な `pub` 不要）→ エクスポート
+/// - 固有 impl の `pub` なしメソッド → モジュール内限定、非エクスポート
 fn is_exported_rust(node: Node) -> bool {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -261,12 +261,12 @@ fn is_exported_rust(node: Node) -> bool {
         }
     }
 
-    // Check enclosing impl block
+    // 囲んでいる impl ブロックをチェック
     let mut parent = node.parent();
     while let Some(p) = parent {
         if p.kind() == "impl_item" {
-            // Trait impl: methods inherit trait visibility (always public)
-            // Inherent impl: method without pub → module-private
+            // trait impl: メソッドは trait の可視性を継承（常に公開）
+            // 固有 impl: pub なしメソッド → モジュール内限定
             return p.child_by_field_name("trait").is_some();
         }
         parent = p.parent();
@@ -275,7 +275,7 @@ fn is_exported_rust(node: Node) -> bool {
     false
 }
 
-/// JS/TS: check if a node is a function body (statement_block whose parent is a function-like).
+/// JS/TS: ノードが関数本体（親が関数系ノードの statement_block）かどうかを判定する。
 fn is_js_function_body(node: Node) -> bool {
     if node.kind() != "statement_block" {
         return false;
@@ -293,18 +293,18 @@ fn is_js_function_body(node: Node) -> bool {
     })
 }
 
-/// Go: exported identifiers start with an uppercase letter.
+/// Go: 大文字で始まる識別子はエクスポート。
 fn is_exported_go(node: Node, source: &[u8]) -> bool {
     let name = node
         .child_by_field_name("name")
         .and_then(|n| n.utf8_text(source).ok());
     match name {
         Some(n) => n.starts_with(char::is_uppercase),
-        None => true, // conservative
+        None => true, // 保守的
     }
 }
 
-/// Extract symbols from a parsed tree.
+/// パース済み AST からシンボルを抽出する。
 pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
     let query_src = symbol_query(lang_id);
     if query_src.is_empty() {
@@ -382,7 +382,7 @@ fn extract_doc_comment(node: Node<'_>, source: &[u8]) -> Option<String> {
     }
 }
 
-/// Fallback: extract top-level named nodes as symbols.
+/// フォールバック: トップレベルの named ノードをシンボルとして抽出する。
 fn fallback_symbols(root: Node<'_>, source: &[u8]) -> Vec<Symbol> {
     let mut symbols = Vec::new();
     let mut cursor = root.walk();
@@ -530,7 +530,7 @@ fn symbol_query(lang_id: LangId) -> &'static str {
             "#
         }
         LangId::Swift => {
-            // tree-sitter-swift uses class_declaration for struct/class/enum
+            // tree-sitter-swift は struct/class/enum に class_declaration を使用
             r#"
             (function_declaration name: (simple_identifier) @function.name)
             (class_declaration name: (type_identifier) @class.name)

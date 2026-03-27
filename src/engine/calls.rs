@@ -6,8 +6,8 @@ use crate::language::LangId;
 use crate::models::call::{CallEdge, CallEndpoint, CallSite};
 use crate::models::location::Range;
 
-/// Extract call edges from a parsed tree.
-/// If `filter_function` is provided, only return calls where the caller matches.
+/// パース済み AST からコールエッジを抽出する。
+/// `filter_function` 指定時は caller が一致するもののみ返す。
 pub fn extract_calls(
     root: Node<'_>,
     source: &[u8],
@@ -72,7 +72,7 @@ pub fn extract_calls(
     Ok(edges)
 }
 
-/// Walk up the tree to find the nearest enclosing function definition.
+/// AST を上方走査し、最も近い関数定義を見つける。
 fn find_enclosing_function(node: Node<'_>, source: &[u8], lang_id: LangId) -> Option<CallEndpoint> {
     let func_kinds = function_node_kinds(lang_id);
     let mut current = node.parent();
@@ -91,7 +91,7 @@ fn find_enclosing_function(node: Node<'_>, source: &[u8], lang_id: LangId) -> Op
     None
 }
 
-/// Get function-like node kinds for a language.
+/// 言語ごとの関数ノード種別を返す。
 fn function_node_kinds(lang_id: LangId) -> &'static [&'static str] {
     match lang_id {
         LangId::Rust => &["function_item"],
@@ -118,9 +118,9 @@ fn function_node_kinds(lang_id: LangId) -> &'static [&'static str] {
     }
 }
 
-/// Extract the name of a function node.
+/// 関数ノードの名前を抽出する。
 fn find_function_name(node: Node<'_>, source: &[u8], lang_id: LangId) -> Option<String> {
-    // Try the "name" field first (most languages)
+    // まず "name" フィールドを試行（多くの言語で共通）
     if let Some(name_node) = node.child_by_field_name("name") {
         return name_node.utf8_text(source).ok().map(|s| s.to_string());
     }
@@ -135,7 +135,7 @@ fn find_function_name(node: Node<'_>, source: &[u8], lang_id: LangId) -> Option<
         }
     }
 
-    // For function_definition in C/Rust: declarator > function_declarator > declarator (identifier)
+    // C/Rust の function_definition: declarator > function_declarator > declarator (identifier)
     if let Some(decl) = node.child_by_field_name("declarator") {
         if let Some(inner) = decl.child_by_field_name("declarator") {
             return inner.utf8_text(source).ok().map(|s| s.to_string());
@@ -143,7 +143,7 @@ fn find_function_name(node: Node<'_>, source: &[u8], lang_id: LangId) -> Option<
         return decl.utf8_text(source).ok().map(|s| s.to_string());
     }
 
-    // Fallback: first identifier child
+    // フォールバック: 最初の identifier 子ノード
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         let k = child.kind();
@@ -155,7 +155,7 @@ fn find_function_name(node: Node<'_>, source: &[u8], lang_id: LangId) -> Option<
     None
 }
 
-/// Language-specific tree-sitter queries for call expressions.
+/// 言語別の call expression 用 tree-sitter クエリを返す。
 fn call_query(lang_id: LangId) -> &'static str {
     match lang_id {
         LangId::Rust => {

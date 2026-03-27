@@ -22,26 +22,26 @@ struct FileContext {
     call_edges: Vec<CallEdge>,
 }
 
-/// Analyze the impact of a unified diff within a workspace directory.
+/// unified diff のワークスペースディレクトリ内での影響を解析する。
 ///
-/// Uses a 2-pass approach for cross-file references:
-///   Pass 1: Parse changed files, collect affected symbols per file.
-///   Pass 2: Batch-search all affected symbol names in one directory walk.
+/// 2パス方式で cross-file 参照を検索する：
+///   Pass 1: 変更ファイルをパースし、affected シンボルを収集する。
+///   Pass 2: 全 affected シンボル名を1回のディレクトリウォークでバッチ検索する。
 pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
     let diff_files = diff::parse_unified_diff(diff_input);
 
-    // Pass 1: Parse changed files and collect affected symbols
+    // Pass 1: 変更ファイルをパースし affected シンボルを収集
     let (file_contexts, all_symbol_names, method_parent_types, included_symbols) =
         collect_affected_symbols(diff_input, &diff_files, dir);
 
-    // Pass 2: Batch cross-file reference search (one walk for all symbols)
+    // Pass 2: cross-file 参照のバッチ検索（全シンボルを1回のウォークで処理）
     let batch_refs = if all_symbol_names.is_empty() {
         HashMap::new()
     } else {
         refs::find_references_batch(&all_symbol_names, dir, None).unwrap_or_default()
     };
 
-    // Pass 3: Assemble results
+    // Pass 3: 結果を組み立て
     let changes = assemble_impacts(
         file_contexts,
         &batch_refs,
@@ -52,8 +52,7 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
     Ok(ContextResult { changes })
 }
 
-/// Pass 1: Parse each changed file, extract symbols, and determine which
-/// symbol names need cross-file reference search.
+/// Pass 1: 変更ファイルをパースし、シンボルを抽出し、cross-file 参照検索が必要なシンボル名を決定する。
 fn collect_affected_symbols(
     diff_input: &str,
     diff_files: &[DiffFile],
@@ -184,11 +183,11 @@ fn collect_affected_symbols(
     )
 }
 
-/// Pass 3: For each changed file, collect cross-file and same-file impacted callers.
+/// Pass 3: 各変更ファイルについて、cross-file および同一ファイル内の影響を受ける呼び出し元を収集する。
 ///
-/// Only symbols that passed `should_include_for_cross_file` (tracked in `included_symbols`)
-/// are used for cross-file reference lookup. Symbols added to `batch_refs` solely as parent
-/// types for method scoping are not iterated as impact sources.
+/// `should_include_for_cross_file` を通過したシンボル（`included_symbols` で追跡）のみが
+/// cross-file 参照検索に使用される。メソッドの型スコーピングのためだけに `batch_refs` に
+/// 追加された親型は、影響源として反復されない。
 fn assemble_impacts(
     file_contexts: Vec<FileContext>,
     batch_refs: &HashMap<String, Vec<SymbolReference>>,
@@ -276,14 +275,14 @@ fn assemble_impacts(
     changes
 }
 
-/// Determine whether an affected symbol should be included in cross-file reference search.
+/// affected シンボルを cross-file 参照検索に含めるべきか判定する。
 ///
-/// Applies a 5-stage filter:
-/// 1. Skip impl block type names (not API-affecting)
-/// 2. Skip symbols in test context
-/// 3. Skip functions/methods with body-only changes (no signature change)
-/// 4. Skip non-exported symbols
-/// 5. Skip symbols whose name doesn't appear in any changed diff line
+/// 5段階のフィルタを適用する：
+/// 1. impl ブロックの型名をスキップ（API に影響しない）
+/// 2. テストコンテキスト内のシンボルをスキップ
+/// 3. ボディのみの変更（シグネチャ変更なし）の関数/メソッドをスキップ
+/// 4. エクスポートされていないシンボルをスキップ
+/// 5. 変更された diff 行にシンボル名が出現しない場合スキップ
 #[allow(clippy::too_many_arguments)]
 fn should_include_for_cross_file(
     sym: &AffectedSymbol,
@@ -296,27 +295,27 @@ fn should_include_for_cross_file(
     source: &[u8],
     lang_id: LangId,
 ) -> bool {
-    // 1. Skip impl block type names and module declarations
-    // Module declarations (e.g. `pub mod tensor`) don't change API surface;
-    // actual content changes are detected from the module's own files in the diff.
+    // 1. impl ブロックの型名とモジュール宣言をスキップ
+    // モジュール宣言（例: `pub mod tensor`）は API サーフェスを変更しない。
+    // 実際の内容変更は diff 内のモジュール自身のファイルから検出される。
     if sym.kind == "type" || sym.kind == "module" {
         return false;
     }
-    // 2. Skip symbols in test context
+    // 2. テストコンテキスト内のシンボルをスキップ
     if find_overlapping_symbol(syms, &sym.name, hunks)
         .is_some_and(|s| is_in_test_context(root, source, &s.range, lang_id, file_path))
     {
         return false;
     }
-    // 3. Skip functions/methods with body-only changes
+    // 3. ボディのみの変更の関数/メソッドをスキップ
     if (sym.kind == "function" || sym.kind == "method")
         && !sig_changes.iter().any(|sc| sc.name == sym.name)
     {
         return false;
     }
-    // 3b. Skip type-like symbols whose definition header is unchanged.
-    // e.g. if `trait GuestMemory` line itself didn't change, don't propagate
-    // even if the name appears in other changed lines (like free function signatures).
+    // 3b. 定義ヘッダが変更されていない型シンボルをスキップ。
+    // 例: `trait GuestMemory` 行自体が変更されていなければ、
+    // 他の変更行（フリー関数のシグネチャ等）に名前が出現しても伝播しない。
     if matches!(
         sym.kind.as_str(),
         "trait" | "struct" | "class" | "interface" | "enum"
@@ -324,27 +323,27 @@ fn should_include_for_cross_file(
     {
         return false;
     }
-    // 4. Skip non-exported symbols
+    // 4. エクスポートされていないシンボルをスキップ
     if !find_overlapping_symbol(syms, &sym.name, hunks)
         .is_some_and(|s| symbols::is_symbol_exported(root, source, lang_id, &s.range))
     {
         return false;
     }
-    // 5. Skip if symbol name doesn't appear in any changed line
+    // 5. 変更行にシンボル名が出現しない場合スキップ
     if !is_symbol_in_changed_lines(diff_input, file_path, &sym.name) {
         return false;
     }
     true
 }
 
-/// Determine whether a cross-file reference is relevant as an impacted caller.
+/// cross-file 参照が影響を受ける呼び出し元として関連するか判定する。
 ///
-/// Applies a 5-stage filter:
-/// 1. Skip definitions (only call-site references matter)
-/// 2. Skip same-file refs
-/// 3. Skip cross-language false positives
-/// 4. Skip refs lacking parent type in the target file (method type scoping)
-/// 5. Skip refs in test context in the target file
+/// 5段階のフィルタを適用する：
+/// 1. 定義をスキップ（呼び出し箇所の参照のみが対象）
+/// 2. 同一ファイルの参照をスキップ
+/// 3. 言語間の偽陽性をスキップ
+/// 4. ターゲットファイルに親型が存在しない参照をスキップ（メソッド型スコーピング）
+/// 5. ターゲットファイルのテストコンテキスト内の参照をスキップ
 fn is_relevant_cross_file_ref(
     r: &SymbolReference,
     source_path: &str,
@@ -354,21 +353,21 @@ fn is_relevant_cross_file_ref(
     batch_refs: &HashMap<String, Vec<SymbolReference>>,
     target_file_cache: &mut HashMap<String, Option<ParsedFile>>,
 ) -> bool {
-    // 1. Skip definitions
+    // 1. 定義をスキップ
     if r.kind == Some(RefKind::Definition) {
         return false;
     }
-    // 2. Skip same-file refs
+    // 2. 同一ファイルの参照をスキップ
     if r.path.ends_with(source_path) {
         return false;
     }
-    // 3. Skip cross-language false positives
+    // 3. 言語間の偽陽性をスキップ
     if let Ok(ref_lang) = LangId::from_path(Utf8Path::new(&r.path))
         && lang_compat_group(ref_lang) != source_lang_group
     {
         return false;
     }
-    // 4. Method type scoping
+    // 4. メソッドの型スコーピング
     if let Some(parent_type) = method_parent_types.get(sym_name) {
         let type_in_ref_file = batch_refs
             .get(parent_type.as_str())
@@ -391,14 +390,14 @@ fn is_relevant_cross_file_ref(
             }
         }
     }
-    // 5. Skip refs in test context
+    // 5. テストコンテキスト内の参照をスキップ
     if is_ref_in_target_test_context(&r.path, r.line, r.column, target_file_cache) {
         return false;
     }
     true
 }
 
-/// Match hunks against symbol ranges to find affected symbols.
+/// hunk をシンボル範囲と照合して affected シンボルを検出する。
 fn find_affected_symbols(
     syms: &[crate::models::symbol::Symbol],
     hunks: &[HunkInfo],
@@ -412,7 +411,7 @@ fn find_affected_symbols(
             let sym_start = sym.range.start.line;
             let sym_end = sym.range.end.line;
 
-            // Check overlap
+            // オーバーラップチェック
             if hunk_start < sym_end && hunk_end > sym_start {
                 let change_type = if hunk.old_count == 0 {
                     "added"
@@ -427,7 +426,7 @@ fn find_affected_symbols(
                     kind: symbol_kind_str(sym.kind).to_string(),
                     change_type: change_type.to_string(),
                 });
-                break; // Don't double-count
+                break; // 重複カウントを防止
             }
         }
     }
@@ -435,7 +434,7 @@ fn find_affected_symbols(
     affected
 }
 
-/// Check if a symbol's range overlaps with any of the given hunks.
+/// シンボルの範囲がいずれかの hunk とオーバーラップするか確認する。
 fn symbol_overlaps_hunks(sym: &crate::models::symbol::Symbol, hunks: &[HunkInfo]) -> bool {
     hunks.iter().any(|h| {
         let hunk_start = h.new_start.saturating_sub(1);
@@ -444,7 +443,7 @@ fn symbol_overlaps_hunks(sym: &crate::models::symbol::Symbol, hunks: &[HunkInfo]
     })
 }
 
-/// Find the first symbol with the given name that overlaps any hunk.
+/// 指定名のシンボルのうち、いずれかの hunk とオーバーラップする最初のものを返す。
 fn find_overlapping_symbol<'a>(
     syms: &'a [crate::models::symbol::Symbol],
     name: &str,
@@ -454,7 +453,7 @@ fn find_overlapping_symbol<'a>(
         .find(|s| s.name == name && symbol_overlaps_hunks(s, hunks))
 }
 
-/// Find the deepest AST node covering the given source range.
+/// 指定されたソース範囲を包含する最深の AST ノードを返す。
 fn descendant_for_range<'a>(
     root: tree_sitter::Node<'a>,
     range: &crate::models::location::Range,
@@ -489,8 +488,7 @@ fn symbol_kind_str(kind: SymbolKind) -> &'static str {
     }
 }
 
-/// Detect signature changes by looking at removed (-) and added (+) lines in the diff
-/// that contain function signatures for affected symbols.
+/// diff 内の削除行(-)と追加行(+)から、affected シンボルの関数シグネチャ変更を検出する。
 fn detect_signature_changes(
     diff_input: &str,
     file_path: &str,
@@ -510,7 +508,7 @@ fn detect_signature_changes(
                 added_lines.clear();
             }
         } else if line.starts_with("--- ") {
-            // Will be followed by +++ line
+            // 次の +++ 行で処理される
         } else if in_file {
             if let Some(content) = line.strip_prefix('-') {
                 removed_lines.push(content.to_string());
@@ -542,7 +540,7 @@ fn detect_signature_changes(
     changes
 }
 
-/// Find a function signature line containing the given function name.
+/// 指定された関数名を含むシグネチャ行を検索する。
 fn find_signature_in_lines(lines: &[String], func_name: &str) -> Option<String> {
     for line in lines {
         let trimmed = line.trim();
@@ -553,7 +551,7 @@ fn find_signature_in_lines(lines: &[String], func_name: &str) -> Option<String> 
     None
 }
 
-/// Heuristic: a line is a signature if it contains "fn ", "def ", "function ", "func ", etc.
+/// ヒューリスティック: "fn ", "def ", "function ", "func " 等を含む行をシグネチャと判定する。
 fn is_signature_line(line: &str) -> bool {
     let keywords = [
         "fn ",
@@ -574,9 +572,9 @@ fn is_signature_line(line: &str) -> bool {
     keywords.iter().any(|kw| line.contains(kw))
 }
 
-/// Try to extract a function name from a context line like "    symbols::extract_symbols(...)".
+/// コンテキスト行（例: "    symbols::extract_symbols(...)"）から関数名の抽出を試みる。
 fn extract_function_from_context(context: &str) -> Option<String> {
-    // Look for "fn name" pattern
+    // "fn name" パターンを検索
     if let Some(pos) = context.find("fn ") {
         let rest = &context[pos + 3..];
         let name: String = rest
@@ -590,12 +588,12 @@ fn extract_function_from_context(context: &str) -> Option<String> {
     None
 }
 
-/// Check if a type-like symbol's definition header appears in changed (+/-) lines.
+/// 型シンボルの定義ヘッダが変更行(+/-)に出現するか確認する。
 ///
-/// For trait/struct/class/interface/enum symbols, checks that the declaration keyword
-/// followed by the symbol name (e.g. `trait GuestMemory`, `struct Foo`) is present
-/// in a changed line. This prevents false positives where the symbol name only appears
-/// in other changed symbols' signatures (e.g. `fn read_obj(m: &impl GuestMemory)`).
+/// trait/struct/class/interface/enum シンボルについて、宣言キーワードに続くシンボル名
+/// （例: `trait GuestMemory`, `struct Foo`）が変更行に存在するかを検査する。
+/// シンボル名が他のシンボルのシグネチャ（例: `fn read_obj(m: &impl GuestMemory)`）
+/// にのみ出現する場合の偽陽性を防止する。
 fn is_definition_header_in_changed_lines(
     diff_input: &str,
     file_path: &str,
@@ -608,7 +606,7 @@ fn is_definition_header_in_changed_lines(
         "class" => &["class"],
         "interface" => &["interface", "trait"],
         "enum" => &["enum"],
-        _ => return true, // non-type symbols: always pass
+        _ => return true, // 非型シンボルは常にパス
     };
 
     let mut in_file = false;
@@ -632,10 +630,10 @@ fn is_definition_header_in_changed_lines(
     false
 }
 
-/// Check if a symbol name appears in any changed (+/-) line for the given file in the diff.
+/// 指定ファイルの diff 変更行(+/-)にシンボル名が出現するか確認する。
 ///
-/// If the symbol name is absent from all changed lines, the change is body-only
-/// (e.g. internal JSX/logic change) and callers are not affected.
+/// 全変更行にシンボル名が存在しない場合、変更はボディのみ
+/// （例: 内部の JSX/ロジック変更）であり、呼び出し元に影響しない。
 fn is_symbol_in_changed_lines(diff_input: &str, file_path: &str, symbol_name: &str) -> bool {
     let mut in_file = false;
 
@@ -654,11 +652,11 @@ fn is_symbol_in_changed_lines(diff_input: &str, file_path: &str, symbol_name: &s
     false
 }
 
-/// Language compatibility group for cross-file reference filtering.
+/// cross-file 参照フィルタリング用の言語互換グループ。
 ///
-/// Languages in the same group can reference each other's symbols
-/// (e.g. JS/TS/TSX share imports, C/C++ share headers, Java/Kotlin share JVM).
-/// Cross-group matches (e.g. Rust `command` in a Bash script) are false positives.
+/// 同一グループの言語は互いのシンボルを参照可能
+/// （例: JS/TS/TSX は import を共有、C/C++ はヘッダを共有、Java/Kotlin は JVM を共有）。
+/// グループ間のマッチ（例: Bash スクリプト内の Rust `command`）は偽陽性。
 fn lang_compat_group(lang: LangId) -> u8 {
     match lang {
         LangId::Rust => 0,
@@ -675,13 +673,13 @@ fn lang_compat_group(lang: LangId) -> u8 {
     }
 }
 
-/// Cached parse result: (tree, source bytes, language).
+/// キャッシュされたパース結果: (tree, ソースバイト列, 言語)。
 type ParsedFile = (tree_sitter::Tree, Vec<u8>, LangId);
 
-/// Check if a reference at the given line/column in a target file is inside test context.
+/// ターゲットファイルの指定行/列の参照がテストコンテキスト内にあるか確認する。
 ///
-/// Parses the target file on-demand and caches the result to avoid re-parsing.
-/// This filters out impacted callers that are in `#[cfg(test)]` modules or `#[test]` functions.
+/// ターゲットファイルをオンデマンドでパースし、再パースを避けるためキャッシュする。
+/// `#[cfg(test)]` モジュールや `#[test]` 関数内の影響を受ける呼び出し元を除外する。
 fn is_ref_in_target_test_context(
     path: &str,
     line: usize,
@@ -708,15 +706,15 @@ fn is_ref_in_target_test_context(
     is_in_test_context(tree.root_node(), source, &range, *lang_id, path)
 }
 
-/// Check if a symbol is inside a test context.
+/// シンボルがテストコンテキスト内にあるか確認する。
 ///
-/// Test symbols should not propagate cross-file impacts because:
-/// - Test functions are not called from production code
-/// - Changes to test helpers only affect the test module
+/// テストシンボルは cross-file 影響を伝播すべきでない：
+/// - テスト関数はプロダクションコードから呼ばれない
+/// - テストヘルパーの変更はテストモジュールのみに影響する
 ///
-/// Uses a two-layer approach:
-/// 1. File-path based detection (fast, covers all languages)
-/// 2. AST-based detection (precise, language-specific)
+/// 2層のアプローチを使用する：
+/// 1. ファイルパスベースの判定（高速、全言語対応）
+/// 2. AST ベースの判定（精密、言語固有）
 fn is_in_test_context(
     root: tree_sitter::Node,
     source: &[u8],
@@ -1022,7 +1020,7 @@ fn is_ruby_test_context(
     false
 }
 
-/// Check if a node has a preceding attribute_item sibling containing the given text.
+/// ノードの前に指定テキストを含む attribute_item 兄弟が存在するか確認する。
 fn has_attribute_text(node: tree_sitter::Node, source: &[u8], pattern: &str) -> bool {
     let mut prev = node.prev_named_sibling();
     while let Some(p) = prev {
@@ -1044,11 +1042,11 @@ fn has_attribute_text(node: tree_sitter::Node, source: &[u8], pattern: &str) -> 
     false
 }
 
-/// Find the parent type name for a method inside an impl/class block.
+/// impl/class ブロック内のメソッドの親型名を取得する。
 ///
-/// For Rust `impl Foo { fn bar() {} }` → returns `Some("Foo")`
-/// For Rust `impl Trait for Foo { fn bar() {} }` → returns `Some("Foo")`
-/// For class-based languages → returns the class name
+/// Rust `impl Foo { fn bar() {} }` → `Some("Foo")` を返す
+/// Rust `impl Trait for Foo { fn bar() {} }` → `Some("Foo")` を返す
+/// クラスベース言語 → クラス名を返す
 fn find_parent_type_name(
     root: tree_sitter::Node,
     source: &[u8],
@@ -1078,7 +1076,7 @@ fn find_parent_type_name(
     None
 }
 
-/// Extract a type name from a tree-sitter type node, handling generics and scoped types.
+/// tree-sitter の型ノードから型名を抽出する（ジェネリクスやスコープ付き型を処理）。
 fn extract_type_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
     match node.kind() {
         "type_identifier" | "identifier" => node.utf8_text(source).ok().map(|s| s.to_string()),
@@ -1093,7 +1091,7 @@ fn extract_type_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
     }
 }
 
-/// Validate that a diff path is safe (no absolute paths or traversal components).
+/// diff パスが安全か検証する（絶対パスやトラバーサルコンポーネントを拒否）。
 fn is_safe_diff_path(path: &str) -> bool {
     if path.starts_with('/') || path.starts_with('\\') {
         return false;
@@ -1104,4 +1102,157 @@ fn is_safe_diff_path(path: &str) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // SymbolKind → 文字列マッピングの検証
+    #[test]
+    fn symbol_kind_str_mapping() {
+        assert_eq!(symbol_kind_str(SymbolKind::Function), "function");
+        assert_eq!(symbol_kind_str(SymbolKind::Method), "method");
+        assert_eq!(symbol_kind_str(SymbolKind::Class), "class");
+        assert_eq!(symbol_kind_str(SymbolKind::Module), "module");
+    }
+
+    // 通常の相対パスは安全と判定される
+    #[test]
+    fn is_safe_diff_path_normal() {
+        assert!(is_safe_diff_path("src/main.rs"));
+        assert!(is_safe_diff_path("a/b/c.txt"));
+    }
+
+    // 絶対パスは拒否される
+    #[test]
+    fn is_safe_diff_path_absolute() {
+        assert!(!is_safe_diff_path("/etc/passwd"));
+    }
+
+    // ディレクトリトラバーサルを含むパスは拒否される
+    #[test]
+    fn is_safe_diff_path_traversal() {
+        assert!(!is_safe_diff_path("src/../etc/passwd"));
+        assert!(!is_safe_diff_path("../secret"));
+    }
+
+    // Windows 形式の絶対パスは拒否される
+    #[test]
+    fn is_safe_diff_path_windows_absolute() {
+        assert!(!is_safe_diff_path("\\windows\\system32"));
+    }
+
+    // 関数定義キーワードを含む行はシグネチャ行と判定される
+    #[test]
+    fn is_signature_line_detects_fn() {
+        assert!(is_signature_line(
+            "    pub fn process_data(x: i32) -> bool {"
+        ));
+        assert!(is_signature_line("def handle_request(self):"));
+        assert!(is_signature_line("function calculate() {"));
+    }
+
+    // 通常のコード行はシグネチャ行と判定されない
+    #[test]
+    fn is_signature_line_rejects_normal_code() {
+        assert!(!is_signature_line("    let x = 42;"));
+        assert!(!is_signature_line("    x += 1"));
+    }
+
+    // "fn name(...)" パターンから関数名を抽出できる
+    #[test]
+    fn extract_function_from_context_fn() {
+        assert_eq!(
+            extract_function_from_context("    fn process_data(x: i32) {"),
+            Some("process_data".to_string())
+        );
+    }
+
+    // fn キーワードが含まれない場合は None を返す
+    #[test]
+    fn extract_function_from_context_no_fn() {
+        assert_eq!(extract_function_from_context("let x = 42;"), None);
+    }
+
+    // Go のテストファイルパターン (*_test.go) を検出する
+    #[test]
+    fn is_test_file_path_go() {
+        assert!(is_test_file_path("pkg/handler_test.go"));
+    }
+
+    // JS/TS の spec ファイルパターン (*.spec.ts) を検出する
+    #[test]
+    fn is_test_file_path_js_spec() {
+        assert!(is_test_file_path("src/app.spec.ts"));
+    }
+
+    // Python のテストファイルパターン (test_*.py) を検出する
+    #[test]
+    fn is_test_file_path_python() {
+        assert!(is_test_file_path("tests/test_main.py"));
+    }
+
+    // Ruby の spec ファイルパターン (*_spec.rb) を検出する
+    #[test]
+    fn is_test_file_path_ruby() {
+        assert!(is_test_file_path("spec/model_spec.rb"));
+    }
+
+    // 通常のソースファイルはテストファイルと判定されない
+    #[test]
+    fn is_test_file_path_normal() {
+        assert!(!is_test_file_path("src/main.rs"));
+        assert!(!is_test_file_path("lib/handler.py"));
+    }
+
+    // 同じ言語互換グループに属するペアは同じ値を返す
+    #[test]
+    fn lang_compat_group_same() {
+        assert_eq!(
+            lang_compat_group(LangId::Javascript),
+            lang_compat_group(LangId::Typescript)
+        );
+        assert_eq!(
+            lang_compat_group(LangId::Javascript),
+            lang_compat_group(LangId::Tsx)
+        );
+        assert_eq!(
+            lang_compat_group(LangId::Java),
+            lang_compat_group(LangId::Kotlin)
+        );
+        assert_eq!(lang_compat_group(LangId::C), lang_compat_group(LangId::Cpp));
+    }
+
+    // 異なる言語互換グループは異なる値を返す
+    #[test]
+    fn lang_compat_group_different() {
+        assert_ne!(
+            lang_compat_group(LangId::Rust),
+            lang_compat_group(LangId::Python)
+        );
+        assert_ne!(
+            lang_compat_group(LangId::Go),
+            lang_compat_group(LangId::Ruby)
+        );
+    }
+
+    // 変更行にシンボル名が含まれる場合 true を返す
+    #[test]
+    fn is_symbol_in_changed_lines_present() {
+        let diff = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,3 @@\n-fn old_func() {}\n+fn new_func() {}";
+        assert!(is_symbol_in_changed_lines(diff, "src/lib.rs", "old_func"));
+        assert!(is_symbol_in_changed_lines(diff, "src/lib.rs", "new_func"));
+    }
+
+    // 変更行にシンボル名が含まれない場合 false を返す
+    #[test]
+    fn is_symbol_in_changed_lines_absent() {
+        let diff = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,3 @@\n-fn old_func() {}\n+fn new_func() {}";
+        assert!(!is_symbol_in_changed_lines(
+            diff,
+            "src/lib.rs",
+            "other_func"
+        ));
+    }
 }

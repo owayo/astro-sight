@@ -6,7 +6,7 @@ use anyhow::{Result, bail};
 use crate::error::{AstroError, ErrorCode};
 use crate::models::cochange::{CoChangeEntry, CoChangeResult};
 
-/// Analyze co-change patterns from git log.
+/// git log から共変更パターンを解析する。
 ///
 /// - `dir`: the git repository directory
 /// - `lookback`: number of recent commits to analyze
@@ -18,7 +18,7 @@ pub fn analyze_cochange(
     min_confidence: f64,
     filter_file: Option<&str>,
 ) -> Result<CoChangeResult> {
-    // 1. Run git log to get commit file lists
+    // 1. git log でコミットのファイルリストを取得
     let output = Command::new("git")
         .args([
             "log",
@@ -41,7 +41,7 @@ pub fn analyze_cochange(
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // 2. Parse commits
+    // 2. コミットを解析
     let mut commits: Vec<Vec<String>> = Vec::new();
     let mut current_files: Vec<String> = Vec::new();
 
@@ -55,14 +55,14 @@ pub fn analyze_cochange(
             current_files.push(trimmed.to_string());
         }
     }
-    // Don't forget the last commit
+    // 最後のコミットを忘れずに追加
     if !current_files.is_empty() {
         commits.push(current_files);
     }
 
     let commits_analyzed = commits.len();
 
-    // 3. Count individual file changes
+    // 3. 各ファイルの変更回数をカウント
     let mut file_counts: HashMap<String, usize> = HashMap::new();
     for commit in &commits {
         for file in commit {
@@ -70,7 +70,7 @@ pub fn analyze_cochange(
         }
     }
 
-    // 4. Count co-changes (file pairs that appear in the same commit)
+    // 4. 共変更（同一コミット内のファイルペア）をカウント
     let mut pair_counts: HashMap<(String, String), usize> = HashMap::new();
     // ファイル数が多すぎるコミット（初期コミット、大規模リファクタ等）はペア爆発を防ぐためスキップ
     const MAX_FILES_PER_COMMIT: usize = 100;
@@ -90,7 +90,7 @@ pub fn analyze_cochange(
         }
     }
 
-    // 5. Calculate confidence and build entries
+    // 5. confidence を算出しエントリを構築
     let mut entries: Vec<CoChangeEntry> = pair_counts
         .into_iter()
         .filter_map(|((file_a, file_b), co_changes)| {
@@ -106,7 +106,7 @@ pub fn analyze_cochange(
                 return None;
             }
 
-            // Filter by file if specified
+            // ファイル指定時はフィルタ
             if let Some(filter) = filter_file
                 && file_a != filter
                 && file_b != filter
@@ -125,7 +125,7 @@ pub fn analyze_cochange(
         })
         .collect();
 
-    // 6. Sort by confidence descending
+    // 6. confidence の降順でソート
     entries.sort_by(|a, b| {
         b.confidence
             .partial_cmp(&a.confidence)

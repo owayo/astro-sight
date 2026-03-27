@@ -525,11 +525,11 @@ pub fn cmd_impact(
 
     let result = service.analyze_context(&diff_input, dir)?;
 
-    // Collect set of changed file paths
+    // 変更されたファイルパスの集合を収集
     let changed_paths: std::collections::HashSet<&str> =
         result.changes.iter().map(|c| c.path.as_str()).collect();
 
-    // Group unresolved impacts: callers in files NOT in the diff
+    // 未解決の影響をグループ化: diff に含まれないファイルの caller
     // caller ごとに影響シンボルを追跡
     struct UnresolvedCaller {
         path: String,
@@ -545,7 +545,7 @@ pub fn cmd_impact(
         }
 
         for caller in &change.impacted_callers {
-            // Resolve relative path against dir for comparison
+            // 比較のため相対パスを dir を基準に解決
             let caller_abs = if std::path::Path::new(&caller.path).is_relative() {
                 std::path::Path::new(dir)
                     .join(&caller.path)
@@ -555,7 +555,7 @@ pub fn cmd_impact(
                 caller.path.clone()
             };
 
-            // Check if caller file is NOT in the changed files
+            // caller のファイルが変更ファイルに含まれていないかチェック
             let in_diff = changed_paths.iter().any(|cp| {
                 let cp_abs = if std::path::Path::new(cp).is_relative() {
                     std::path::Path::new(dir)
@@ -727,7 +727,7 @@ pub fn batch_symbols(
 ) -> Result<()> {
     batch_ndjson(paths, |p| match service.extract_symbols(p) {
         Ok(mut response) => {
-            // Convert absolute path to relative when dir is specified
+            // dir 指定時に絶対パスを相対パスに変換
             if let Some(base) = dir
                 && let Ok(rel) = std::path::Path::new(&response.location.path).strip_prefix(base)
             {

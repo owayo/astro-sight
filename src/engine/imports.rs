@@ -5,7 +5,7 @@ use tree_sitter::{Node, Query, QueryCursor};
 use crate::language::LangId;
 use crate::models::import::{ImportEdge, ImportKind};
 
-/// Extract import edges from a parsed tree.
+/// パース済み AST から import エッジを抽出する。
 pub fn extract_imports(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<ImportEdge>> {
     let (query_src, kind) = import_query(lang_id);
     if query_src.is_empty() {
@@ -31,13 +31,13 @@ pub fn extract_imports(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result
                 continue;
             }
 
-            // Clean up source text (remove quotes from string literals)
+            // ソーステキストをクリーンアップ（文字列リテラルの引用符を除去）
             let clean_source = source_text
                 .trim_matches(|c| c == '"' || c == '\'' || c == '`')
                 .to_string();
 
-            // Get the context: the full text of the import statement
-            // Walk up to find the import statement node
+            // コンテキスト: import 文の全テキストを取得
+            // import 文ノードまで上方走査
             let import_node = find_import_statement(node);
             let context = import_node.utf8_text(source).unwrap_or("").to_string();
 
@@ -56,7 +56,7 @@ pub fn extract_imports(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result
     Ok(edges)
 }
 
-/// Walk up to find the nearest import/use/include statement node.
+/// import/use/include 文ノードまで上方走査する。
 fn find_import_statement(node: Node<'_>) -> Node<'_> {
     let import_kinds = [
         "use_declaration",
@@ -68,8 +68,8 @@ fn find_import_statement(node: Node<'_>) -> Node<'_> {
         "namespace_use_declaration",
         "using_directive",
         "import_header",
-        "call_expression", // for require() calls
-        "call",            // for Ruby require/require_relative
+        "call_expression", // require() 呼び出し用
+        "call",            // Ruby の require/require_relative 用
     ];
     let mut current = Some(node);
     while let Some(n) = current {
@@ -81,10 +81,10 @@ fn find_import_statement(node: Node<'_>) -> Node<'_> {
     node
 }
 
-/// Determine the actual ImportKind based on language and pattern.
+/// 言語とパターンに基づき実際の ImportKind を決定する。
 fn determine_kind(lang_id: LangId, pattern_index: usize, default: ImportKind) -> ImportKind {
     match lang_id {
-        // JS/TS: pattern 0 = Import (import statement), pattern 1 = Require (require())
+        // JS/TS: パターン 0 = Import 文、パターン 1 = require()
         LangId::Javascript | LangId::Typescript | LangId::Tsx => {
             if pattern_index >= 1 {
                 ImportKind::Require
@@ -96,8 +96,8 @@ fn determine_kind(lang_id: LangId, pattern_index: usize, default: ImportKind) ->
     }
 }
 
-/// Language-specific tree-sitter queries for import statements.
-/// Returns (query_string, default ImportKind)
+/// 言語別の import 文用 tree-sitter クエリを返す。
+/// (query_string, デフォルト ImportKind) を返す。
 fn import_query(lang_id: LangId) -> (&'static str, ImportKind) {
     match lang_id {
         LangId::Rust => (
@@ -160,7 +160,7 @@ fn import_query(lang_id: LangId) -> (&'static str, ImportKind) {
             r#"(import_declaration (identifier) @import.source)"#,
             ImportKind::Import,
         ),
-        LangId::Bash => ("", ImportKind::Import), // Not supported
+        LangId::Bash => ("", ImportKind::Import), // 非対応
         LangId::Ruby => (
             r#"
             (call
