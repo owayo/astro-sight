@@ -47,9 +47,17 @@ impl std::fmt::Display for LangId {
 }
 
 // tree-sitter-kotlin 0.3.5 uses old tree-sitter API; bridge via extern C function
-#[link(name = "parser", kind = "static")]
-unsafe extern "C" {
-    safe fn tree_sitter_kotlin() -> *const std::ffi::c_void;
+// `safe fn` は Rust 2024 構文だが tree-sitter-rust がパースできないため、
+// 旧来の unsafe extern + ラッパー関数で対応
+mod ffi_kotlin {
+    #[link(name = "parser", kind = "static")]
+    unsafe extern "C" {
+        pub unsafe fn tree_sitter_kotlin() -> *const std::ffi::c_void;
+    }
+}
+
+fn tree_sitter_kotlin() -> *const std::ffi::c_void {
+    unsafe { ffi_kotlin::tree_sitter_kotlin() }
 }
 
 impl LangId {

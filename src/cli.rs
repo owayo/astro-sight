@@ -275,6 +275,25 @@ pub enum Commands {
         file: Option<String>,
     },
 
+    /// Structured review: integrates impact, cochange, API surface diff, and dead symbol detection
+    Review {
+        /// Workspace directory
+        #[arg(short, long)]
+        dir: String,
+
+        /// Auto-run git diff to get changes
+        #[arg(long)]
+        git: bool,
+
+        /// Base ref for git diff (default: HEAD)
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+
+        /// Use staged changes (git diff --cached)
+        #[arg(long)]
+        staged: bool,
+    },
+
     /// Check tool availability and language support
     Doctor,
 

@@ -22,6 +22,7 @@ description: "STOP before using Grep for code identifiers (including pipe-separa
 - Need to **check repeated AST/text patterns**? → `astro-sight lint`
 - Need a **visual call flow diagram**? → `astro-sight sequence`
 - Need to find **files that usually change together**? → `astro-sight cochange`
+- Want a **structured one-shot review** of a diff (impact + missing cochanges + API surface diff + dead symbols)? → `astro-sight review`
 
 **Grep is fine for**: error messages, config values, TODO comments, file path patterns — anything that is NOT a code identifier.
 
@@ -61,6 +62,9 @@ astro-sight cochange --dir . --file src/service.rs
 
 # 11. Repeated AST/text checks
 astro-sight lint --path <file> --rules rules.yaml
+
+# 12. Structured review (impact + cochange + API diff + dead symbols)
+astro-sight review --dir . --git
 ```
 
 ## Low-Adoption But Useful
@@ -147,6 +151,23 @@ git diff | astro-sight impact --dir .
 ```
 
 Exit codes: `0` = no unresolved impacts (silent), `1` = unresolved impacts found (stderr text output). With `--hook`, appends a triage hint for AI agents.
+
+### `review` — Structured Diff Review (One-Shot)
+
+Integrates `context` (impact analysis), `cochange` (missing co-change detection), API surface diff (added/removed/modified public symbols), and dead symbol detection into a single command. Ideal for PR review or pre-merge checks.
+
+```bash
+# Auto-run git diff (recommended)
+astro-sight review --dir . --git
+
+# Staged changes
+astro-sight review --dir . --git --staged
+
+# Custom base ref
+astro-sight review --dir . --git --base HEAD~3
+```
+
+Output: JSON with `impact` (ContextResult), `missing_cochanges` (files expected to change together but absent from diff), `api_changes` (added/removed/modified public symbols), `dead_symbols` (public symbols with zero non-definition references in changed files).
 
 ### `imports` — Import/Export Extraction
 
@@ -289,6 +310,11 @@ astro-sight sequence --path src/main.rs --function main
 astro-sight lint --path src/main.rs --rules rules.yaml
 ```
 
+### "Give me a full structured review of this diff"
+```bash
+astro-sight review --dir . --git
+```
+
 ## Notes
 
 - 15 languages: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby
@@ -297,5 +323,5 @@ astro-sight lint --path src/main.rs --rules rules.yaml
 - `refs` results include `ctx` (source line) — no need to Read files afterward
 - `refs` respects `.gitignore` and uses parallel scanning
 - Multiple symbol searches: use `refs --names` for batching; reserve `session` for mixed commands
-- `session` supports `ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange`
+- `session` supports `ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange` (note: `review` is CLI-only, not available in session mode)
 - **Input validation**: Empty `--name`/`--names`, empty `--paths`/`--paths-file` are rejected with `INVALID_REQUEST` error

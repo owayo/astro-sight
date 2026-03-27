@@ -304,6 +304,109 @@ fn is_exported_go(node: Node, source: &[u8]) -> bool {
     }
 }
 
+/// 関数/メソッドノードの循環的複雑度を算出する（ベース1 + 分岐ノード数）。
+pub fn calculate_complexity(node: Node, lang_id: LangId) -> usize {
+    let branch_kinds = branch_node_kinds(lang_id);
+    let mut count = 1; // ベース複雑度
+    count_branch_nodes(node, &branch_kinds, &mut count);
+    count
+}
+
+/// 再帰的に分岐ノードをカウントする。
+fn count_branch_nodes(node: Node, branch_kinds: &[&str], count: &mut usize) {
+    let kind = node.kind();
+    if branch_kinds.contains(&kind) {
+        *count += 1;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        count_branch_nodes(child, branch_kinds, count);
+    }
+}
+
+/// 言語別の分岐ノード種別を返す。
+fn branch_node_kinds(lang_id: LangId) -> Vec<&'static str> {
+    match lang_id {
+        LangId::Rust => vec![
+            "if_expression",
+            "match_expression",
+            "for_expression",
+            "while_expression",
+            "loop_expression",
+            "else_clause",
+            "match_arm",
+        ],
+        LangId::Javascript | LangId::Typescript | LangId::Tsx => vec![
+            "if_statement",
+            "switch_case",
+            "for_statement",
+            "for_in_statement",
+            "while_statement",
+            "do_statement",
+            "ternary_expression",
+            "catch_clause",
+        ],
+        LangId::Python => vec![
+            "if_statement",
+            "elif_clause",
+            "for_statement",
+            "while_statement",
+            "except_clause",
+            "conditional_expression",
+        ],
+        LangId::Go => vec![
+            "if_statement",
+            "for_statement",
+            "select_statement",
+            "type_switch_statement",
+            "case_clause",
+        ],
+        LangId::Java | LangId::Kotlin => vec![
+            "if_statement",
+            "switch_expression",
+            "for_statement",
+            "enhanced_for_statement",
+            "while_statement",
+            "do_statement",
+            "catch_clause",
+        ],
+        LangId::Ruby => vec![
+            "if", "elsif", "unless", "case", "when", "for", "while", "until", "rescue",
+        ],
+        LangId::Php => vec![
+            "if_statement",
+            "switch_statement",
+            "case_statement",
+            "for_statement",
+            "foreach_statement",
+            "while_statement",
+            "do_statement",
+            "catch_clause",
+        ],
+        LangId::CSharp => vec![
+            "if_statement",
+            "switch_section",
+            "for_statement",
+            "for_each_statement",
+            "while_statement",
+            "do_statement",
+            "catch_clause",
+        ],
+        // 汎用パターン（C, C++, Swift, Bash 等）
+        _ => vec![
+            "if_statement",
+            "if_expression",
+            "for_statement",
+            "for_expression",
+            "while_statement",
+            "while_expression",
+            "switch_statement",
+            "case_statement",
+            "catch_clause",
+        ],
+    }
+}
+
 /// パース済み AST からシンボルを抽出する。
 pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
     let query_src = symbol_query(lang_id);
@@ -327,11 +430,19 @@ pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result
                 let name = node.utf8_text(source).unwrap_or("").to_string();
                 if !name.is_empty() {
                     let doc = extract_doc_comment(node, source);
+                    let parent_node = node.parent().unwrap_or(node);
+                    // 関数/メソッドの場合のみ循環的複雑度を算出
+                    let complexity = if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
+                        Some(calculate_complexity(parent_node, lang_id))
+                    } else {
+                        None
+                    };
                     symbols.push(Symbol {
                         name,
                         kind,
-                        range: Range::from(node.parent().unwrap_or(node).range()),
+                        range: Range::from(parent_node.range()),
                         doc,
+                        complexity,
                         children: Vec::new(),
                     });
                 }
@@ -399,6 +510,7 @@ fn fallback_symbols(root: Node<'_>, source: &[u8]) -> Vec<Symbol> {
             kind,
             range: Range::from(child.range()),
             doc: None,
+            complexity: None,
             children: Vec::new(),
         });
     }
@@ -730,5 +842,105 @@ mod tests {
             LangId::Typescript,
             "bar"
         ));
+    }
+
+    // --- calculate_complexity テスト ---
+
+    fn get_complexity(source: &str, lang_id: LangId, symbol_name: &str) -> Option<usize> {
+        let language = lang_id.ts_language();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+
+        let syms = extract_symbols(root, source.as_bytes(), lang_id).unwrap();
+        let sym = syms
+            .iter()
+            .find(|s| s.name == symbol_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "symbol '{}' not found in {:?}",
+                    symbol_name,
+                    syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            });
+        sym.complexity
+    }
+
+    #[test]
+    fn rust_empty_fn_complexity_1() {
+        // 空の関数はベース複雑度 1
+        assert_eq!(get_complexity("fn foo() {}", LangId::Rust, "foo"), Some(1));
+    }
+
+    #[test]
+    fn rust_if_else_match_complexity() {
+        // if(+1) + else(+1) + match(+1) + 2 match_arm(+2) = base 1 + 5 = 6
+        // ただし match_arm は各アーム全てカウント
+        let src = r#"
+fn foo() {
+    if x {
+    } else {
+        match y {
+            1 => {},
+            _ => {},
+        }
+    }
+}
+"#;
+        // if_expression=1, else_clause=1, match_expression=1, match_arm=2 → 1+5=6
+        assert_eq!(get_complexity(src, LangId::Rust, "foo"), Some(6));
+    }
+
+    #[test]
+    fn rust_for_while_loop_complexity() {
+        let src = r#"
+fn bar() {
+    for i in 0..10 {
+        while x > 0 {
+            loop {
+                break;
+            }
+        }
+    }
+}
+"#;
+        // for_expression=1, while_expression=1, loop_expression=1 → 1+3=4
+        assert_eq!(get_complexity(src, LangId::Rust, "bar"), Some(4));
+    }
+
+    #[test]
+    fn python_complexity() {
+        let src = r#"
+def foo():
+    if x:
+        pass
+    elif y:
+        pass
+    for i in range(10):
+        pass
+"#;
+        // if_statement=1, elif_clause=1, for_statement=1 → 1+3=4
+        assert_eq!(get_complexity(src, LangId::Python, "foo"), Some(4));
+    }
+
+    #[test]
+    fn ts_complexity() {
+        let src = r#"
+function foo() {
+    if (x) {
+        for (let i = 0; i < 10; i++) {}
+    }
+    const y = x ? 1 : 2;
+}
+"#;
+        // if_statement=1, for_statement=1, ternary_expression=1 → 1+3=4
+        assert_eq!(get_complexity(src, LangId::Typescript, "foo"), Some(4));
+    }
+
+    #[test]
+    fn struct_has_no_complexity() {
+        // struct にはcomplexity が付かない
+        assert_eq!(get_complexity("struct Foo {}", LangId::Rust, "Foo"), None);
     }
 }

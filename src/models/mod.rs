@@ -9,5 +9,6 @@ pub mod location;
 pub mod reference;
 pub mod request;
 pub mod response;
+pub mod review;
 pub mod sequence;
 pub mod symbol;

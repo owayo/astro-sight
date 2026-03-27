@@ -6,8 +6,8 @@ use astro_sight::cli::{Cli, Commands};
 use astro_sight::commands::{
     self, CmdAstOpts, batch_ast, batch_calls, batch_imports, batch_lint, batch_sequence,
     batch_symbols, cmd_ast, cmd_calls, cmd_cochange, cmd_context, cmd_doctor, cmd_impact,
-    cmd_imports, cmd_lint, cmd_mcp, cmd_refs, cmd_refs_batch, cmd_sequence, cmd_session,
-    cmd_symbols, cmd_symbols_dir,
+    cmd_imports, cmd_lint, cmd_mcp, cmd_refs, cmd_refs_batch, cmd_review, cmd_sequence,
+    cmd_session, cmd_symbols, cmd_symbols_dir,
 };
 use astro_sight::config::ConfigService;
 use astro_sight::error::{AstroError, ErrorCode};
@@ -292,6 +292,12 @@ fn run(cli: Cli) -> Result<()> {
             NameInput::Single(n) => cmd_refs(&service, &n, &dir, glob.as_deref(), pretty),
             NameInput::Batch(ns) => cmd_refs_batch(&service, &ns, &dir, glob.as_deref()),
         },
+        Commands::Review {
+            dir,
+            git,
+            base,
+            staged,
+        } => cmd_review(&service, &dir, git, &base, staged, pretty),
         Commands::Cochange {
             dir,
             lookback,

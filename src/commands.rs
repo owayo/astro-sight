@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::io::Read;
 use tracing::info;
 
@@ -7,6 +8,9 @@ use crate::cache::store::CacheStore;
 use crate::doctor;
 use crate::engine::parser;
 use crate::error::{AstroError, ErrorCode};
+use crate::models::review::{
+    ApiChanges, ApiSymbol, ApiSymbolChange, DeadSymbol, MissingCochange, ReviewResult,
+};
 use crate::service::{AppService, AstParams};
 
 // ---------------------------------------------------------------------------
@@ -672,6 +676,327 @@ pub fn cmd_mcp() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("MCP server error: {e}"))?;
         Ok(())
     })
+}
+
+// ---------------------------------------------------------------------------
+// Review コマンド: impact / cochange / API surface diff / dead symbol 統合
+// ---------------------------------------------------------------------------
+
+pub fn cmd_review(
+    service: &AppService,
+    dir: &str,
+    git: bool,
+    base: &str,
+    staged: bool,
+    pretty: bool,
+) -> Result<()> {
+    // 1. diff 取得
+    let diff_input = if git {
+        run_git_diff(dir, base, staged)?
+    } else {
+        let stdin = std::io::stdin();
+        read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?
+    };
+
+    if diff_input.trim().is_empty() {
+        let result = ReviewResult {
+            impact: crate::models::impact::ContextResult {
+                changes: Vec::new(),
+            },
+            missing_cochanges: Vec::new(),
+            api_changes: ApiChanges {
+                added: Vec::new(),
+                removed: Vec::new(),
+                modified: Vec::new(),
+            },
+            dead_symbols: Vec::new(),
+        };
+        let output = serialize_output(&result, pretty)?;
+        println!("{output}");
+        return Ok(());
+    }
+
+    // 2. impact 分析
+    let impact = service.analyze_context(&diff_input, dir)?;
+
+    // 3. diff に含まれるファイルリストを収集
+    let diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
+    let changed_file_set: HashSet<String> = diff_files
+        .iter()
+        .flat_map(|f| {
+            let mut s = Vec::new();
+            if f.new_path != "/dev/null" {
+                s.push(f.new_path.clone());
+            }
+            if f.old_path != "/dev/null" {
+                s.push(f.old_path.clone());
+            }
+            s
+        })
+        .collect();
+
+    // 4. cochange 分析 → missing_cochanges 検出
+    let missing_cochanges = detect_missing_cochanges(service, dir, &changed_file_set);
+
+    // 5. API surface diff
+    let api_changes = detect_api_changes(dir, base, &diff_files);
+
+    // 6. dead symbol 検出
+    let dead_symbols = detect_dead_symbols(service, dir, &diff_files);
+
+    let result = ReviewResult {
+        impact,
+        missing_cochanges,
+        api_changes,
+        dead_symbols,
+    };
+
+    let output = serialize_output(&result, pretty)?;
+    info!(
+        command = "review",
+        dir = dir,
+        output_bytes = output.len(),
+        "command completed"
+    );
+    println!("{output}");
+    Ok(())
+}
+
+fn detect_missing_cochanges(
+    service: &AppService,
+    dir: &str,
+    changed_files: &HashSet<String>,
+) -> Vec<MissingCochange> {
+    let cochange_result = match service.analyze_cochange(dir, 200, 0.3, None) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut missing = Vec::new();
+    for entry in &cochange_result.entries {
+        let a_in_diff = changed_files.contains(&entry.file_a);
+        let b_in_diff = changed_files.contains(&entry.file_b);
+
+        if a_in_diff && !b_in_diff {
+            missing.push(MissingCochange {
+                file: entry.file_b.clone(),
+                expected_with: entry.file_a.clone(),
+                confidence: entry.confidence,
+            });
+        } else if b_in_diff && !a_in_diff {
+            missing.push(MissingCochange {
+                file: entry.file_a.clone(),
+                expected_with: entry.file_b.clone(),
+                confidence: entry.confidence,
+            });
+        }
+    }
+    missing
+}
+
+fn detect_api_changes(
+    dir: &str,
+    base: &str,
+    diff_files: &[crate::models::impact::DiffFile],
+) -> ApiChanges {
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut modified = Vec::new();
+
+    for df in diff_files {
+        if df.old_path == "/dev/null" {
+            if let Some(new_syms) = extract_exported_symbols_from_file(dir, &df.new_path) {
+                for (name, kind, _sig) in &new_syms {
+                    added.push(ApiSymbol {
+                        name: name.clone(),
+                        kind: kind.clone(),
+                        file: df.new_path.clone(),
+                    });
+                }
+            }
+            continue;
+        }
+
+        if df.new_path == "/dev/null" {
+            if let Some(old_syms) = extract_exported_symbols_from_git(dir, base, &df.old_path) {
+                for (name, kind, _sig) in &old_syms {
+                    removed.push(ApiSymbol {
+                        name: name.clone(),
+                        kind: kind.clone(),
+                        file: df.old_path.clone(),
+                    });
+                }
+            }
+            continue;
+        }
+
+        let old_syms = extract_exported_symbols_from_git(dir, base, &df.new_path);
+        let new_syms = extract_exported_symbols_from_file(dir, &df.new_path);
+
+        let (old_syms, new_syms) = match (old_syms, new_syms) {
+            (Some(o), Some(n)) => (o, n),
+            _ => continue,
+        };
+
+        let old_map: std::collections::HashMap<&str, &str> = old_syms
+            .iter()
+            .map(|(name, _kind, sig)| (name.as_str(), sig.as_str()))
+            .collect();
+        let new_map: std::collections::HashMap<&str, (&str, &str)> = new_syms
+            .iter()
+            .map(|(name, kind, sig)| (name.as_str(), (kind.as_str(), sig.as_str())))
+            .collect();
+
+        for (name, kind, _sig) in &new_syms {
+            if !old_map.contains_key(name.as_str()) {
+                added.push(ApiSymbol {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    file: df.new_path.clone(),
+                });
+            }
+        }
+
+        for (name, kind, _sig) in &old_syms {
+            if !new_map.contains_key(name.as_str()) {
+                removed.push(ApiSymbol {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    file: df.new_path.clone(),
+                });
+            }
+        }
+
+        for (name, kind, new_sig) in &new_syms {
+            if let Some(old_sig) = old_map.get(name.as_str())
+                && old_sig != &new_sig.as_str()
+            {
+                modified.push(ApiSymbolChange {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    file: df.new_path.clone(),
+                    old_signature: Some(old_sig.to_string()),
+                    new_signature: Some(new_sig.clone()),
+                });
+            }
+        }
+    }
+
+    ApiChanges {
+        added,
+        removed,
+        modified,
+    }
+}
+
+fn detect_dead_symbols(
+    service: &AppService,
+    dir: &str,
+    diff_files: &[crate::models::impact::DiffFile],
+) -> Vec<DeadSymbol> {
+    let mut dead = Vec::new();
+
+    for df in diff_files {
+        if df.new_path == "/dev/null" {
+            continue;
+        }
+
+        let syms = match extract_exported_symbols_from_file(dir, &df.new_path) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        for (name, kind, _sig) in &syms {
+            let refs_result = match service.find_references(name, dir, None) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            let ref_count = refs_result
+                .references
+                .iter()
+                .filter(|r| r.kind != Some(crate::models::reference::RefKind::Definition))
+                .count();
+
+            if ref_count == 0 {
+                dead.push(DeadSymbol {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    file: df.new_path.clone(),
+                });
+            }
+        }
+    }
+
+    dead
+}
+
+fn extract_exported_symbols_from_git(
+    dir: &str,
+    base: &str,
+    file_path: &str,
+) -> Option<Vec<(String, String, String)>> {
+    let output = std::process::Command::new("git")
+        .args(["show", &format!("{base}:{file_path}")])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let source = &output.stdout;
+    let utf8_path = camino::Utf8Path::new(file_path);
+    let lang_id = crate::language::LangId::from_path(utf8_path).ok()?;
+    let tree = parser::parse_source(source, lang_id).ok()?;
+    let root = tree.root_node();
+
+    let syms = crate::engine::symbols::extract_symbols(root, source, lang_id).ok()?;
+    Some(filter_exported_symbols(&syms, root, source, lang_id))
+}
+
+fn extract_exported_symbols_from_file(
+    dir: &str,
+    file_path: &str,
+) -> Option<Vec<(String, String, String)>> {
+    let full_path = std::path::Path::new(dir).join(file_path);
+    let utf8_path = camino::Utf8Path::new(full_path.to_str()?);
+    let source = parser::read_file(utf8_path).ok()?;
+    let lang_id = crate::language::LangId::from_path(utf8_path).ok()?;
+    let tree = parser::parse_source(&source, lang_id).ok()?;
+    let root = tree.root_node();
+
+    let syms = crate::engine::symbols::extract_symbols(root, &source, lang_id).ok()?;
+    Some(filter_exported_symbols(&syms, root, &source, lang_id))
+}
+
+fn filter_exported_symbols(
+    syms: &[crate::models::symbol::Symbol],
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    lang_id: crate::language::LangId,
+) -> Vec<(String, String, String)> {
+    let source_str = std::str::from_utf8(source).unwrap_or("");
+    let lines: Vec<&str> = source_str.lines().collect();
+
+    let mut result = Vec::new();
+    for sym in syms {
+        if !crate::engine::symbols::is_symbol_exported(root, source, lang_id, &sym.range) {
+            continue;
+        }
+        let sig = lines
+            .get(sym.range.start.line)
+            .unwrap_or(&"")
+            .trim()
+            .to_string();
+        result.push((
+            sym.name.clone(),
+            format!("{:?}", sym.kind).to_lowercase(),
+            sig,
+        ));
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------

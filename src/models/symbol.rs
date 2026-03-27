@@ -28,6 +28,8 @@ pub struct Symbol {
     pub range: Range,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complexity: Option<usize>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub children: Vec<Symbol>,
 }
@@ -40,6 +42,9 @@ pub struct CompactSymbol {
     pub kind: SymbolKind,
     #[serde(rename = "ln")]
     pub line: usize,
+    /// 循環的複雑度（関数/メソッドのみ）
+    #[serde(rename = "cx", skip_serializing_if = "Option::is_none")]
+    pub complexity: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -72,6 +77,7 @@ impl Symbol {
             name: self.name.clone(),
             kind: self.kind,
             line: self.range.start.line,
+            complexity: self.complexity,
             doc: if include_doc { self.doc.clone() } else { None },
             children: self
                 .children
