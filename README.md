@@ -522,15 +522,6 @@ Claude Desktop や Cursor 等の MCP クライアントから利用する場合:
 }
 ```
 
-## CodeRabbit
-
-このリポジトリには `.coderabbit.yaml` を同梱し、CodeRabbit のレビューを以下の方針で調整している。
-
-- push ごとの incremental review を有効化し、新規差分への追従を継続する
-- `src/**/*.rs`、`tests/**/*.rs`、`README.md`、`AGENTS.md`、`skills/SKILL.md` に path-based review instructions を与える
-- `README.md`、`AGENTS.md`、`skills/SKILL.md` を code guidelines として読み込み、レビュー基準に反映する
-- CLI と文書の不整合は custom pre-merge check で warning として検出する
-
 ## License
 
 MIT

@@ -54,12 +54,6 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - コード変更の前には `astro-sight context --dir . --git`、変更後には `astro-sight impact --dir . --git` を実行する
 - コードコメントは必要な箇所にだけ付け、付ける場合は日本語で簡潔に記述する
 
-## Review Automation
-
-- `.coderabbit.yaml` で incremental review を有効化し、push ごとに差分レビューを継続する
-- `src/**/*.rs`、`tests/**/*.rs`、`README.md`、`AGENTS.md`、`skills/SKILL.md` に path-based review instructions を設定する
-- CLI と文書の不整合は CodeRabbit の custom pre-merge check で warning として検出する
-
 ## Build & Test
 
 ```bash
