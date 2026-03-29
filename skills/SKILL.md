@@ -1,6 +1,6 @@
 ---
 name: astro-sight
-description: "STOP before using Grep for code identifiers (including pipe-separated patterns like FOO|Bar). Use `refs` for identifiers, `symbols`/`calls`/`imports` for structure, `ast` for exact syntax, `context`/`impact` around edits, and `session`/`sequence`/`cochange`/`lint` when you need mixed queries, flow, hotspots, or repeated rules."
+description: "STOP before using Grep for code identifiers (including pipe-separated patterns like FOO|Bar). Use `refs` for identifiers, `symbols`/`calls`/`imports` for structure, `ast` for exact syntax, `context`/`impact` around edits, `review` for one-shot diff review, and `session`/`sequence`/`cochange`/`lint` when you need mixed queries, flow, hotspots, or repeated rules."
 ---
 
 # astro-sight
@@ -23,6 +23,7 @@ description: "STOP before using Grep for code identifiers (including pipe-separa
 - Need a **visual call flow diagram**? → `astro-sight sequence`
 - Need to find **files that usually change together**? → `astro-sight cochange`
 - Want a **structured one-shot review** of a diff (impact + missing cochanges + API surface diff + dead symbols)? → `astro-sight review`
+- Need to review an **external patch or rename-aware diff file**? → `astro-sight review --dir . --diff-file <patch>`
 
 **Grep is fine for**: error messages, config values, TODO comments, file path patterns — anything that is NOT a code identifier.
 
@@ -50,26 +51,27 @@ astro-sight imports --path <file>
 # 7. Detect unresolved impacts after edits
 astro-sight impact --dir . --git
 
-# 8. Batch operations — multiple queries in one process
+# 8. Structured review (impact + cochange + API diff + dead symbols)
+astro-sight review --dir . --git
+
+# 9. Batch operations — multiple queries in one process
 echo '{"command":"refs","name":"Sym1","dir":"."}
 {"command":"symbols","path":"src/main.rs"}' | astro-sight session
 
-# 9. Visualize call flow
+# 10. Visualize call flow
 astro-sight sequence --path src/main.rs --function main
 
-# 10. Check change hotspots
+# 11. Check change hotspots
 astro-sight cochange --dir . --file src/service.rs
 
-# 11. Repeated AST/text checks
+# 12. Repeated AST/text checks
 astro-sight lint --path <file> --rules rules.yaml
-
-# 12. Structured review (impact + cochange + API diff + dead symbols)
-astro-sight review --dir . --git
 ```
 
 ## Low-Adoption But Useful
 
 - Need the **exact AST node** at a cursor/range, or want to confirm whether a parse error is structural? → `astro-sight ast --path <file> --line <n> --col <n>`
+- Need a **single JSON review** that combines impact, cochange, API surface changes, and dead symbols? → `astro-sight review --dir . --git`
 - Need **2+ mixed astro-sight queries** in one loop and want to avoid repeated startup cost? → `astro-sight session`
 - Need to check a **repeated rule** like banned APIs, required patterns, or AST-based policy? → `astro-sight lint --path <file> --rules rules.yaml`
 
@@ -165,6 +167,9 @@ astro-sight review --dir . --git --staged
 
 # Custom base ref
 astro-sight review --dir . --git --base HEAD~3
+
+# External patch file (useful when rename-aware diff is already generated)
+astro-sight review --dir . --diff-file changes.patch
 ```
 
 Output: JSON with `impact` (ContextResult), `missing_cochanges` (files expected to change together but absent from diff), `api_changes` (added/removed/modified public symbols), `dead_symbols` (public symbols with zero non-definition references in changed files).

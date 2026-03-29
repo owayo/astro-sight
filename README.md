@@ -265,6 +265,48 @@ commands = ["astro-sight impact --git --dir ."]
 condition = { command_exists = "astro-sight" }
 ```
 
+### review - 構造化 diff レビュー
+
+`context` の影響分析に加えて、`cochange` による変更漏れ候補、公開 API 差分、死蔵シンボルを 1 回の実行でまとめて返す。PR レビューや pre-merge チェック向け。
+
+```bash
+# git diff を自動取得してレビュー（推奨）
+astro-sight review --dir . --git
+
+# ステージ済み変更をレビュー
+astro-sight review --dir . --git --staged
+
+# カスタムベースを指定
+astro-sight review --dir . --git --base HEAD~3
+
+# 既に生成済みの patch / PR diff を使う
+astro-sight review --dir . --diff-file /tmp/pr.patch
+```
+
+出力例:
+```json
+{
+  "impact": { "changes": [...] },
+  "missing_cochanges": [
+    { "file": "src/service.rs", "expected_with": "src/commands.rs", "confidence": 0.75 }
+  ],
+  "api_changes": {
+    "added": [],
+    "removed": [],
+    "modified": [
+      {
+        "name": "greet",
+        "kind": "function",
+        "file": "src/new.rs",
+        "old_signature": "pub fn greet() -> i32 {",
+        "new_signature": "pub fn greet(name: &str) -> i32 {"
+      }
+    ]
+  },
+  "dead_symbols": []
+}
+```
+
 ### doctor - 対応言語チェック
 
 ```bash
@@ -439,6 +481,7 @@ astro-sight skill-install codex
 ```
 
 登録後は「コールグラフを調べて」「この関数の呼び出し元は？」「diff の影響範囲は？」等の質問で自動的に起動します。
+PR や patch 全体をまとめて見たい場合は、`astro-sight review --dir . --git` まで含めて指示すると一括レビューに入りやすくなります。
 
 ### CLAUDE.md に追記して確実に使わせる
 
@@ -482,6 +525,7 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 - **What does this file import?**: Run `astro-sight imports --path <file>`
 - **Files that change together**: Run `astro-sight cochange --dir . --file <file>`
 - **Visualize call flow**: Run `astro-sight sequence --path <file> --function <name>`
+- **Run a full structured diff review**: Run `astro-sight review --dir . --git` or `astro-sight review --dir . --diff-file <patch>`
 - **Batching mixed astro-sight queries**: Run `astro-sight session`
 - **Checking repeated AST/text patterns**: Run `astro-sight lint --path <file> --rules rules.yaml`
 
@@ -495,6 +539,7 @@ astro-sight symbols --dir <dir>                    # Directory structure overvie
 astro-sight calls --path <file> --function <name>  # Caller/callee relationships
 astro-sight context --dir . --git                  # Change impact analysis (run BEFORE editing code)
 astro-sight impact --dir . --git                   # Detect unresolved impacts (run AFTER editing code)
+astro-sight review --dir . --git                   # One-shot structured diff review
 astro-sight imports --path <file>                  # Import relationships
 astro-sight lint --path <file> --rules rules.yaml  # AST/text pattern checks
 astro-sight sequence --path <file>                 # Call flow visualization

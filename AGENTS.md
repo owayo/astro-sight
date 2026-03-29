@@ -27,7 +27,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/skill.rs` - スキルインストール（`skill-install claude/codex` → ~/.claude/skills/ or ~/.codex/skills/）
 - `src/config.rs` - 設定ファイル管理（ConfigService: load/generate、TOML 形式）
 - `src/logger.rs` - ロギング（logroller 日次ローテーション、3日保持、tracing-subscriber）
-- `src/cli.rs` - CLI サブコマンド定義（ast, symbols, calls, refs, context, impact, imports, lint, sequence, cochange, doctor, session, mcp, init）
+- `src/cli.rs` - CLI サブコマンド定義（ast, symbols, calls, refs, context, impact, review, imports, lint, sequence, cochange, doctor, session, mcp, init）
 - `src/main.rs` - コマンドディスパッチ、キャッシュ層、バッチ処理（全て AppService 経由）
 - `src/mcp/mod.rs` - MCP サーバー（AstroSightServer + AppService::sandboxed(cwd) + 11 ツール、fail-closed: sandbox 生成失敗時はパニック）
 - `src/engine/parser.rs` - tree-sitter パーサー管理（100MB ファイルサイズ上限、SourceBuf によるゼロコピー mmap）
@@ -36,7 +36,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/engine/calls.rs` - コールグラフ抽出（言語別 call expression クエリ）
 - `src/engine/refs.rs` - クロスファイル参照検索（ignore + rayon 並列 + memchr/memmem 事前フィルタ + Aho-Corasick バッチ検索 + `collect_files` pub ユーティリティ）
 - `src/engine/diff.rs` - unified diff パーサー
-- `src/engine/impact.rs` - 影響分析オーケストレーター（2パス方式: collect affected → batch refs）
+- `src/engine/impact/mod.rs` - 影響分析オーケストレーター（2パス方式: collect affected → batch refs）
 - `src/engine/sequence.rs` - コールグラフから Mermaid シーケンス図を生成
 - `src/engine/imports.rs` - ファイル間の import/export 関係を抽出（言語別 tree-sitter クエリ）
 - `src/engine/lint.rs` - YAML ルールによる AST パターンマッチ（tree-sitter クエリ + テキストパターン）
@@ -53,6 +53,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - 修正対象は再現可能で根拠を示せる不具合に限る。推測や好みに基づく変更は行わない
 - セキュリティ境界は fail-open にしない。設定値やサンドボックスが不正なら明示的に失敗させる
 - コード変更の前には `astro-sight context --dir . --git`、変更後には `astro-sight impact --dir . --git` を実行する
+- diff 全体の一括レビューでは `astro-sight review --dir . --git` も併用し、影響・共変更・API 差分・死蔵シンボルをまとめて確認する
 - コードコメントは必要な箇所にだけ付け、付ける場合は日本語で簡潔に記述する
 
 ## Build & Test

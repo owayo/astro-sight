@@ -861,7 +861,8 @@ fn detect_api_changes(
             continue;
         }
 
-        let old_syms = extract_exported_symbols_from_git(dir, base, &df.new_path);
+        // rename 差分では base 側に新パスが存在しないため、旧版は old_path から読む。
+        let old_syms = extract_exported_symbols_from_git(dir, base, &df.old_path);
         let new_syms = extract_exported_symbols_from_file(dir, &df.new_path);
 
         let (old_syms, new_syms) = match (old_syms, new_syms) {
@@ -1296,7 +1297,9 @@ pub fn handle_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Cursor;
+    use std::process::Command;
 
     #[test]
     fn read_to_string_limited_accepts_small_input() {
@@ -1326,5 +1329,91 @@ mod tests {
             .expect_err("invalid utf-8 should fail");
 
         assert!(err.to_string().contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn detect_api_changes_uses_old_path_for_renamed_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let src_dir = repo.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+
+        assert!(
+            Command::new("git")
+                .args(["init", "-b", "main"])
+                .current_dir(repo)
+                .status()
+                .expect("git init")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["config", "user.name", "astro-sight-tests"])
+                .current_dir(repo)
+                .status()
+                .expect("git config user.name")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["config", "user.email", "astro-sight@example.com"])
+                .current_dir(repo)
+                .status()
+                .expect("git config user.email")
+                .success()
+        );
+
+        let old_path = src_dir.join("old.rs");
+        fs::write(&old_path, "pub fn greet() -> i32 {\n    1\n}\n").expect("write old file");
+
+        assert!(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+
+        let new_path = src_dir.join("new.rs");
+        fs::rename(&old_path, &new_path).expect("rename file");
+        fs::write(
+            &new_path,
+            "pub fn greet(name: &str) -> i32 {\n    name.len() as i32\n}\n",
+        )
+        .expect("write renamed file");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/old.rs".to_string(),
+            new_path: "src/new.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 3,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        assert!(
+            api_changes
+                .modified
+                .iter()
+                .any(|change| change.name == "greet"
+                    && change.old_signature.as_deref() == Some("pub fn greet() -> i32 {")
+                    && change.new_signature.as_deref()
+                        == Some("pub fn greet(name: &str) -> i32 {")),
+            "rename を含む差分でも関数シグネチャ変更を検出するべき"
+        );
     }
 }
