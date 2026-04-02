@@ -926,37 +926,62 @@ fn detect_dead_symbols(
     dir: &str,
     diff_files: &[crate::models::impact::DiffFile],
 ) -> Vec<DeadSymbol> {
-    let mut dead = Vec::new();
-
+    // 全ファイルのエクスポートシンボルを収集
+    let mut all_syms: Vec<(String, String, String)> = Vec::new(); // (name, kind, file)
     for df in diff_files {
         if df.new_path == "/dev/null" {
             continue;
         }
-
-        let syms = match extract_exported_symbols_from_file(dir, &df.new_path) {
-            Some(s) => s,
-            None => continue,
-        };
-
-        for (name, kind, _sig) in &syms {
-            let refs_result = match service.find_references(name, dir, None) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-
-            let ref_count = refs_result
-                .references
-                .iter()
-                .filter(|r| r.kind != Some(crate::models::reference::RefKind::Definition))
-                .count();
-
-            if ref_count == 0 {
-                dead.push(DeadSymbol {
-                    name: name.clone(),
-                    kind: kind.clone(),
-                    file: df.new_path.clone(),
-                });
+        if let Some(syms) = extract_exported_symbols_from_file(dir, &df.new_path) {
+            for (name, kind, _sig) in syms {
+                all_syms.push((name, kind, df.new_path.clone()));
             }
+        }
+    }
+
+    if all_syms.is_empty() {
+        return Vec::new();
+    }
+
+    // 全シンボル名をバッチ検索（O(N+S)）
+    let names: Vec<String> = all_syms.iter().map(|(name, _, _)| name.clone()).collect();
+    let unique_names: Vec<String> = {
+        let mut seen = HashSet::new();
+        names
+            .into_iter()
+            .filter(|n| seen.insert(n.clone()))
+            .collect()
+    };
+
+    let batch_refs = match service.find_references_batch(&unique_names, dir, None) {
+        Ok(results) => {
+            let mut map = std::collections::HashMap::new();
+            for result in results {
+                map.insert(result.symbol.clone(), result.references);
+            }
+            map
+        }
+        Err(_) => return Vec::new(),
+    };
+
+    // 定義以外の参照が0件のシンボルを dead として報告
+    let mut dead = Vec::new();
+    for (name, kind, file) in &all_syms {
+        let ref_count = batch_refs
+            .get(name)
+            .map(|refs| {
+                refs.iter()
+                    .filter(|r| r.kind != Some(crate::models::reference::RefKind::Definition))
+                    .count()
+            })
+            .unwrap_or(0);
+
+        if ref_count == 0 {
+            dead.push(DeadSymbol {
+                name: name.clone(),
+                kind: kind.clone(),
+                file: file.clone(),
+            });
         }
     }
 

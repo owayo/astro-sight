@@ -246,3 +246,112 @@ fn call_query(lang_id: LangId) -> &'static str {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::parser;
+
+    /// Rust の関数呼び出しを正しく抽出する
+    #[test]
+    fn extract_calls_rust() {
+        let source = b"fn main() { helper(); }\nfn helper() {}";
+        let tree = parser::parse_source(source, LangId::Rust).unwrap();
+        let edges = extract_calls(tree.root_node(), source, LangId::Rust, None).unwrap();
+        assert!(!edges.is_empty());
+        assert!(edges.iter().any(|e| e.callee.name == "helper"));
+        assert!(edges.iter().any(|e| e.caller.name == "main"));
+    }
+
+    /// filter_function で特定の caller のみ抽出できる
+    #[test]
+    fn extract_calls_with_filter() {
+        let source = b"fn a() { b(); }\nfn b() { c(); }\nfn c() {}";
+        let tree = parser::parse_source(source, LangId::Rust).unwrap();
+        let edges = extract_calls(tree.root_node(), source, LangId::Rust, Some("a")).unwrap();
+        assert!(edges.iter().all(|e| e.caller.name == "a"));
+    }
+
+    /// Python の関数呼び出しを抽出する
+    #[test]
+    fn extract_calls_python() {
+        let source = b"def main():\n    helper()\ndef helper():\n    pass\n";
+        let tree = parser::parse_source(source, LangId::Python).unwrap();
+        let edges = extract_calls(tree.root_node(), source, LangId::Python, None).unwrap();
+        assert!(edges.iter().any(|e| e.callee.name == "helper"));
+    }
+
+    /// JavaScript の関数呼び出しを抽出する
+    #[test]
+    fn extract_calls_javascript() {
+        let source = b"function main() { helper(); }\nfunction helper() {}";
+        let tree = parser::parse_source(source, LangId::Javascript).unwrap();
+        let edges = extract_calls(tree.root_node(), source, LangId::Javascript, None).unwrap();
+        assert!(edges.iter().any(|e| e.callee.name == "helper"));
+    }
+
+    /// 空クエリの言語でも空配列を返しパニックしない
+    #[test]
+    fn extract_calls_empty_source() {
+        let source = b"";
+        let tree = parser::parse_source(source, LangId::Rust).unwrap();
+        let edges = extract_calls(tree.root_node(), source, LangId::Rust, None).unwrap();
+        assert!(edges.is_empty());
+    }
+
+    /// 全言語の call_query が空文字でないことを確認（Bash 含む）
+    #[test]
+    fn call_query_all_languages_non_empty() {
+        let languages = [
+            LangId::Rust,
+            LangId::C,
+            LangId::Cpp,
+            LangId::Python,
+            LangId::Javascript,
+            LangId::Typescript,
+            LangId::Tsx,
+            LangId::Go,
+            LangId::Php,
+            LangId::Java,
+            LangId::Kotlin,
+            LangId::Swift,
+            LangId::CSharp,
+            LangId::Bash,
+            LangId::Ruby,
+        ];
+        for lang in &languages {
+            let q = call_query(*lang);
+            assert!(!q.is_empty(), "{:?} should have a call query", lang);
+        }
+    }
+
+    /// function_node_kinds が全言語で空でないことを確認
+    #[test]
+    fn function_node_kinds_all_languages() {
+        let languages = [
+            LangId::Rust,
+            LangId::C,
+            LangId::Cpp,
+            LangId::Python,
+            LangId::Javascript,
+            LangId::Typescript,
+            LangId::Tsx,
+            LangId::Go,
+            LangId::Php,
+            LangId::Java,
+            LangId::Kotlin,
+            LangId::Swift,
+            LangId::CSharp,
+            LangId::Bash,
+            LangId::Ruby,
+        ];
+        for lang in &languages {
+            let kinds = function_node_kinds(*lang);
+            assert!(
+                !kinds.is_empty(),
+                "{:?} should have function node kinds",
+                lang
+            );
+        }
+    }
+}

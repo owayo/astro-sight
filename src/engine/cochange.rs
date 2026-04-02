@@ -137,3 +137,165 @@ pub fn analyze_cochange(
         commits_analyzed,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// git 未初期化のディレクトリでエラーを返す
+    #[test]
+    fn analyze_cochange_non_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = analyze_cochange(dir.path().to_str().unwrap(), 10, 0.3, None);
+        assert!(result.is_err());
+    }
+
+    /// コミットが少ない（空リポジトリ）場合でもパニックしない
+    #[test]
+    fn analyze_cochange_empty_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "test"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+
+        let result = analyze_cochange(repo.to_str().unwrap(), 10, 0.3, None).unwrap();
+        assert_eq!(result.commits_analyzed, 0);
+        assert!(result.entries.is_empty());
+    }
+
+    /// 共変更パターンが正しく検出される
+    #[test]
+    fn analyze_cochange_detects_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+
+        // git 初期化
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.name", "test"],
+            vec!["config", "user.email", "test@example.com"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+        }
+
+        // ファイル作成とコミット（a.rs + b.rs を一緒に変更）
+        for i in 0..3 {
+            std::fs::write(repo.join("a.rs"), format!("fn a() {{ {} }}", i)).unwrap();
+            std::fs::write(repo.join("b.rs"), format!("fn b() {{ {} }}", i)).unwrap();
+            std::process::Command::new("git")
+                .args(["add", "."])
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            std::process::Command::new("git")
+                .args(["commit", "-m", &format!("commit {}", i)])
+                .current_dir(repo)
+                .output()
+                .unwrap();
+        }
+
+        let result = analyze_cochange(repo.to_str().unwrap(), 10, 0.3, None).unwrap();
+        assert_eq!(result.commits_analyzed, 3);
+        assert!(!result.entries.is_empty());
+        // a.rs と b.rs のペアが存在するはず
+        assert!(result.entries.iter().any(|e| {
+            (e.file_a == "a.rs" && e.file_b == "b.rs") || (e.file_a == "b.rs" && e.file_b == "a.rs")
+        }));
+    }
+
+    /// filter_file で特定ファイルのペアのみ返す
+    #[test]
+    fn analyze_cochange_filter_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.name", "test"],
+            vec!["config", "user.email", "test@example.com"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+        }
+
+        for i in 0..3 {
+            std::fs::write(repo.join("a.rs"), format!("// {}", i)).unwrap();
+            std::fs::write(repo.join("b.rs"), format!("// {}", i)).unwrap();
+            std::fs::write(repo.join("c.rs"), format!("// {}", i)).unwrap();
+            std::process::Command::new("git")
+                .args(["add", "."])
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            std::process::Command::new("git")
+                .args(["commit", "-m", &format!("commit {}", i)])
+                .current_dir(repo)
+                .output()
+                .unwrap();
+        }
+
+        let result = analyze_cochange(repo.to_str().unwrap(), 10, 0.3, Some("a.rs")).unwrap();
+        // a.rs を含むペアのみ
+        for entry in &result.entries {
+            assert!(entry.file_a == "a.rs" || entry.file_b == "a.rs");
+        }
+    }
+
+    /// 100 ファイル超のコミットはスキップされる
+    #[test]
+    fn analyze_cochange_skips_large_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.name", "test"],
+            vec!["config", "user.email", "test@example.com"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+        }
+
+        // 101 ファイルを一度にコミット
+        for i in 0..101 {
+            std::fs::write(repo.join(format!("f{}.rs", i)), format!("// {}", i)).unwrap();
+        }
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "large commit"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+
+        let result = analyze_cochange(repo.to_str().unwrap(), 10, 0.0, None).unwrap();
+        // ペアは生成されないはず（101ファイルのコミットはスキップ）
+        assert!(result.entries.is_empty());
+    }
+}

@@ -576,3 +576,153 @@ fn collect_error_nodes(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 制限なしサービスの生成
+    #[test]
+    fn new_creates_unrestricted_service() {
+        let service = AppService::new();
+        assert!(service.workspace_root.is_none());
+        assert_eq!(service.max_input_size, 0);
+    }
+
+    /// Default trait が new() と同じ結果を返す
+    #[test]
+    fn default_equals_new() {
+        let service = AppService::default();
+        assert!(service.workspace_root.is_none());
+    }
+
+    /// sandboxed で有効なディレクトリを指定した場合
+    #[test]
+    fn sandboxed_valid_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = AppService::sandboxed(dir.path().to_path_buf()).unwrap();
+        assert!(service.workspace_root.is_some());
+        assert_eq!(service.max_input_size, 100 * 1024 * 1024);
+    }
+
+    /// sandboxed で存在しないパスを指定するとエラー
+    #[test]
+    fn sandboxed_nonexistent_path() {
+        let result = AppService::sandboxed(PathBuf::from("/nonexistent/path"));
+        assert!(result.is_err());
+    }
+
+    /// sandboxed でファイル（ディレクトリでない）を指定するとエラー
+    #[test]
+    fn sandboxed_file_not_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, "hello").unwrap();
+        let result = AppService::sandboxed(file_path);
+        assert!(result.is_err());
+    }
+
+    /// validate_path でワークスペース外のパスを拒否する
+    #[test]
+    fn validate_path_rejects_outside_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = AppService::sandboxed(dir.path().to_path_buf()).unwrap();
+        // /tmp 自体はワークスペース外
+        let result = service.validate_path("/etc/passwd");
+        assert!(result.is_err());
+    }
+
+    /// validate_path で存在しないファイルをエラーにする
+    #[test]
+    fn validate_path_rejects_nonexistent() {
+        let service = AppService::new();
+        let result = service.validate_path("/nonexistent/file.rs");
+        assert!(result.is_err());
+    }
+
+    /// validate_dir でファイルパスを拒否する
+    #[test]
+    fn validate_dir_rejects_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, "hello").unwrap();
+        let service = AppService::new();
+        let result = service.validate_dir(file_path.to_str().unwrap());
+        assert!(result.is_err());
+    }
+
+    /// validate_input_size で上限超過を拒否する
+    #[test]
+    fn validate_input_size_rejects_oversized() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = AppService::sandboxed(dir.path().to_path_buf()).unwrap();
+        let large = "x".repeat(100 * 1024 * 1024 + 1);
+        let result = service.validate_input_size(&large);
+        assert!(result.is_err());
+    }
+
+    /// validate_input_size で無制限モード（max_input_size=0）では何でも許可
+    #[test]
+    fn validate_input_size_unlimited() {
+        let service = AppService::new();
+        let large = "x".repeat(200 * 1024 * 1024);
+        let result = service.validate_input_size(&large);
+        assert!(result.is_ok());
+    }
+
+    /// relativize_paths でディレクトリ内のパスを相対化する
+    #[test]
+    fn relativize_paths_converts_absolute() {
+        use crate::models::reference::SymbolReference;
+        let dir = std::path::Path::new("/home/user/project");
+        let refs = vec![SymbolReference {
+            path: "/home/user/project/src/main.rs".to_string(),
+            line: 10,
+            column: 5,
+            context: None,
+            kind: None,
+        }];
+        let result = relativize_paths(refs, dir);
+        assert_eq!(result[0].path, "src/main.rs");
+    }
+
+    /// relativize_paths でディレクトリ外のパスはそのまま
+    #[test]
+    fn relativize_paths_keeps_outside() {
+        use crate::models::reference::SymbolReference;
+        let dir = std::path::Path::new("/home/user/project");
+        let refs = vec![SymbolReference {
+            path: "/other/path/file.rs".to_string(),
+            line: 1,
+            column: 0,
+            context: None,
+            kind: None,
+        }];
+        let result = relativize_paths(refs, dir);
+        assert_eq!(result[0].path, "/other/path/file.rs");
+    }
+
+    /// extract_symbols で有効な Rust ファイルからシンボルを抽出する
+    #[test]
+    fn extract_symbols_from_rust_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.rs");
+        std::fs::write(&file_path, "fn hello() {}\nstruct Foo {}").unwrap();
+        let service = AppService::new();
+        let result = service
+            .extract_symbols(file_path.to_str().unwrap())
+            .unwrap();
+        let syms = result.symbols.unwrap();
+        assert!(syms.iter().any(|s| s.name == "hello"));
+        assert!(syms.iter().any(|s| s.name == "Foo"));
+    }
+
+    /// from_env で ASTRO_SIGHT_WORKSPACE が未設定の場合は無制限モード
+    #[test]
+    fn from_env_without_workspace() {
+        // Rust 2024 では remove_var は unsafe
+        unsafe { std::env::remove_var("ASTRO_SIGHT_WORKSPACE") };
+        let service = AppService::from_env().unwrap();
+        assert!(service.workspace_root.is_none());
+    }
+}
