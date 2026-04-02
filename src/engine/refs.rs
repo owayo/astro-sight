@@ -88,7 +88,7 @@ fn find_refs_in_file(symbol_name: &str, path: &camino::Utf8Path) -> Result<Vec<S
         &source,
         symbol_name,
         path.as_str(),
-        &definition_kinds,
+        definition_kinds,
         lang_id,
         &mut refs,
     );
@@ -204,11 +204,12 @@ fn is_ruby_definition_context(node: Node<'_>) -> bool {
 }
 
 /// 言語ごとの定義ノード種別を返す。
-fn definition_node_kinds(lang_id: LangId) -> Vec<&'static str> {
+/// 静的スライスを返すことで毎回の Vec アロケーションを回避する。
+fn definition_node_kinds(lang_id: LangId) -> &'static [&'static str] {
     match lang_id {
-        LangId::Rust => vec![
+        LangId::Rust => &[
             "function_item",
-            "function_signature_item", // trait method declarations (no body)
+            "function_signature_item", // trait メソッド宣言（ボディなし）
             "struct_item",
             "enum_item",
             "trait_item",
@@ -218,22 +219,22 @@ fn definition_node_kinds(lang_id: LangId) -> Vec<&'static str> {
             "type_item",
             "mod_item",
         ],
-        LangId::C => vec!["function_definition", "struct_specifier", "enum_specifier"],
-        LangId::Cpp => vec![
+        LangId::C => &["function_definition", "struct_specifier", "enum_specifier"],
+        LangId::Cpp => &[
             "function_definition",
             "struct_specifier",
             "class_specifier",
             "enum_specifier",
             "namespace_definition",
         ],
-        LangId::Python => vec!["function_definition", "class_definition"],
-        LangId::Javascript => vec![
+        LangId::Python => &["function_definition", "class_definition"],
+        LangId::Javascript => &[
             "function_declaration",
             "class_declaration",
             "method_definition",
             "variable_declarator",
         ],
-        LangId::Typescript | LangId::Tsx => vec![
+        LangId::Typescript | LangId::Tsx => &[
             "function_declaration",
             "class_declaration",
             "method_definition",
@@ -242,13 +243,13 @@ fn definition_node_kinds(lang_id: LangId) -> Vec<&'static str> {
             "enum_declaration",
             "variable_declarator",
         ],
-        LangId::Go => vec![
+        LangId::Go => &[
             "package_clause",
             "function_declaration",
             "method_declaration",
             "type_spec",
         ],
-        LangId::Php => vec![
+        LangId::Php => &[
             "function_definition",
             "class_declaration",
             "method_declaration",
@@ -256,23 +257,23 @@ fn definition_node_kinds(lang_id: LangId) -> Vec<&'static str> {
             "enum_declaration",
             "trait_declaration",
         ],
-        LangId::Java => vec![
+        LangId::Java => &[
             "method_declaration",
             "class_declaration",
             "interface_declaration",
             "enum_declaration",
         ],
-        LangId::Kotlin => vec![
+        LangId::Kotlin => &[
             "function_declaration",
             "class_declaration",
             "object_declaration",
         ],
-        LangId::Swift => vec![
+        LangId::Swift => &[
             "function_declaration",
             "class_declaration",
             "protocol_declaration",
         ],
-        LangId::CSharp => vec![
+        LangId::CSharp => &[
             "namespace_declaration",
             "method_declaration",
             "class_declaration",
@@ -280,8 +281,8 @@ fn definition_node_kinds(lang_id: LangId) -> Vec<&'static str> {
             "interface_declaration",
             "enum_declaration",
         ],
-        LangId::Bash => vec!["function_definition"],
-        LangId::Ruby => vec![
+        LangId::Bash => &["function_definition"],
+        LangId::Ruby => &[
             "method",
             "singleton_method",
             "class",
@@ -413,7 +414,7 @@ fn find_refs_batch_in_file(
         &source,
         &name_set,
         path.as_str(),
-        &definition_kinds,
+        definition_kinds,
         lang_id,
         &mut result,
     );

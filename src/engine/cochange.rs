@@ -63,10 +63,15 @@ pub fn analyze_cochange(
     let commits_analyzed = commits.len();
 
     // 3. 各ファイルの変更回数をカウント
+    // get_mut で既存キーを参照検索し、初回のみ clone して挿入する
     let mut file_counts: HashMap<String, usize> = HashMap::new();
     for commit in &commits {
         for file in commit {
-            *file_counts.entry(file.clone()).or_insert(0) += 1;
+            if let Some(count) = file_counts.get_mut(file.as_str()) {
+                *count += 1;
+            } else {
+                file_counts.insert(file.clone(), 1);
+            }
         }
     }
 
