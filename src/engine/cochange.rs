@@ -171,9 +171,9 @@ mod tests {
             .output()
             .unwrap();
 
-        let result = analyze_cochange(repo.to_str().unwrap(), 10, 0.3, None).unwrap();
-        assert_eq!(result.commits_analyzed, 0);
-        assert!(result.entries.is_empty());
+        // コミットがないリポジトリでは git log がエラーを返す
+        let result = analyze_cochange(repo.to_str().unwrap(), 10, 0.3, None);
+        assert!(result.is_err());
     }
 
     /// 共変更パターンが正しく検出される
