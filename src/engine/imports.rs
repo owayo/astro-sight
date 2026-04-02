@@ -97,7 +97,7 @@ fn determine_kind(lang_id: LangId, pattern_index: usize, default: ImportKind) ->
 }
 
 /// 言語別の import 文用 tree-sitter クエリを返す。
-/// (query_string, デフォルト ImportKind) を返す。
+/// (クエリ文字列, デフォルト ImportKind) を返す。
 fn import_query(lang_id: LangId) -> (&'static str, ImportKind) {
     match lang_id {
         LangId::Rust => (
@@ -170,5 +170,136 @@ fn import_query(lang_id: LangId) -> (&'static str, ImportKind) {
             "#,
             ImportKind::Require,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::parser;
+
+    /// Rust の use 宣言が正しく抽出される
+    #[test]
+    fn extract_imports_rust() {
+        let source = b"use std::collections::HashMap;\nuse anyhow::Result;\n\nfn main() {}";
+        let tree = parser::parse_source(source, LangId::Rust).unwrap();
+        let root = tree.root_node();
+
+        let imports = extract_imports(root, source, LangId::Rust).unwrap();
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].source, "std::collections::HashMap");
+        assert_eq!(imports[0].kind, ImportKind::Use);
+        assert_eq!(imports[1].source, "anyhow::Result");
+    }
+
+    /// Python の import/from import が正しく抽出される
+    #[test]
+    fn extract_imports_python() {
+        let source = b"import os\nfrom collections import defaultdict\n";
+        let tree = parser::parse_source(source, LangId::Python).unwrap();
+        let root = tree.root_node();
+
+        let imports = extract_imports(root, source, LangId::Python).unwrap();
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].source, "os");
+        assert_eq!(imports[0].kind, ImportKind::Import);
+        assert_eq!(imports[1].source, "collections");
+    }
+
+    /// JavaScript の import と require() が正しく抽出される
+    #[test]
+    fn extract_imports_javascript() {
+        let source = b"import { foo } from './bar';\nconst x = require('lodash');\n";
+        let tree = parser::parse_source(source, LangId::Javascript).unwrap();
+        let root = tree.root_node();
+
+        let imports = extract_imports(root, source, LangId::Javascript).unwrap();
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].source, "./bar");
+        assert_eq!(imports[0].kind, ImportKind::Import);
+        assert_eq!(imports[1].source, "lodash");
+        assert_eq!(imports[1].kind, ImportKind::Require);
+    }
+
+    /// Bash は非対応で空リストを返す
+    #[test]
+    fn extract_imports_bash_returns_empty() {
+        let source = b"#!/bin/bash\nsource ./helper.sh\n";
+        let tree = parser::parse_source(source, LangId::Bash).unwrap();
+        let root = tree.root_node();
+
+        let imports = extract_imports(root, source, LangId::Bash).unwrap();
+        assert!(imports.is_empty());
+    }
+
+    /// Go の import が正しく抽出される
+    #[test]
+    fn extract_imports_go() {
+        let source = b"package main\n\nimport \"fmt\"\n\nfunc main() {}";
+        let tree = parser::parse_source(source, LangId::Go).unwrap();
+        let root = tree.root_node();
+
+        let imports = extract_imports(root, source, LangId::Go).unwrap();
+        assert_eq!(imports.len(), 1);
+        // Go はダブルクォートを含む場合があるがクリーンアップされる
+        let clean = imports[0].source.trim_matches('"');
+        assert_eq!(clean, "fmt");
+    }
+
+    /// 全言語の import クエリが構文的に有効（空文字列を除く）
+    #[test]
+    fn import_query_all_languages_valid() {
+        let all_langs = [
+            LangId::Rust,
+            LangId::Python,
+            LangId::Javascript,
+            LangId::Typescript,
+            LangId::Tsx,
+            LangId::Go,
+            LangId::Java,
+            LangId::C,
+            LangId::Cpp,
+            LangId::CSharp,
+            LangId::Php,
+            LangId::Kotlin,
+            LangId::Swift,
+            LangId::Ruby,
+        ];
+
+        for lang in all_langs {
+            let (query_src, _kind) = import_query(lang);
+            if query_src.is_empty() {
+                continue;
+            }
+            let language = lang.ts_language();
+            let result = Query::new(&language, query_src);
+            assert!(
+                result.is_ok(),
+                "{lang:?} の import クエリがパースに失敗: {:?}",
+                result.err()
+            );
+        }
+    }
+
+    /// determine_kind が JS/TS でパターンインデックスに応じた正しい種別を返す
+    #[test]
+    fn determine_kind_js_patterns() {
+        assert_eq!(
+            determine_kind(LangId::Javascript, 0, ImportKind::Import),
+            ImportKind::Import
+        );
+        assert_eq!(
+            determine_kind(LangId::Javascript, 1, ImportKind::Import),
+            ImportKind::Require
+        );
+        // 非 JS/TS 言語はデフォルトを返す
+        assert_eq!(
+            determine_kind(LangId::Rust, 0, ImportKind::Use),
+            ImportKind::Use
+        );
+        assert_eq!(
+            determine_kind(LangId::Rust, 1, ImportKind::Use),
+            ImportKind::Use
+        );
     }
 }

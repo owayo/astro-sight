@@ -264,4 +264,128 @@ mod tests {
             "other_func"
         ));
     }
+
+    // detect_signature_changes がシグネチャ変更を正しく検出する
+    #[test]
+    fn detect_signature_changes_detects_change() {
+        let diff = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,3 @@
+-pub fn greet() -> String {
++pub fn greet(name: &str) -> String {
+     \"hello\".to_string()
+ }";
+        let affected = vec![AffectedSymbol {
+            name: "greet".to_string(),
+            kind: "function".to_string(),
+            change_type: "modified".to_string(),
+        }];
+        let changes = detect_signature_changes(diff, "src/lib.rs", &affected);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].name, "greet");
+        assert!(changes[0].old_signature.contains("greet()"));
+        assert!(changes[0].new_signature.contains("greet(name: &str)"));
+    }
+
+    // シグネチャが同一の場合は変更として報告しない
+    #[test]
+    fn detect_signature_changes_ignores_same_sig() {
+        let diff = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,3 @@
+-fn greet() {
++fn greet() {
+     // 変更はボディのみ
+ }";
+        let affected = vec![AffectedSymbol {
+            name: "greet".to_string(),
+            kind: "function".to_string(),
+            change_type: "modified".to_string(),
+        }];
+        let changes = detect_signature_changes(diff, "src/lib.rs", &affected);
+        assert!(changes.is_empty());
+    }
+
+    // 非関数シンボル（struct 等）はスキップされる
+    #[test]
+    fn detect_signature_changes_skips_non_function() {
+        let diff = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,3 @@
+-struct Foo { x: i32 }
++struct Foo { x: i32, y: i32 }";
+        let affected = vec![AffectedSymbol {
+            name: "Foo".to_string(),
+            kind: "struct".to_string(),
+            change_type: "modified".to_string(),
+        }];
+        let changes = detect_signature_changes(diff, "src/lib.rs", &affected);
+        assert!(changes.is_empty());
+    }
+
+    // 異なるファイルの diff は無視される
+    #[test]
+    fn detect_signature_changes_wrong_file() {
+        let diff = "\
+--- a/src/other.rs
++++ b/src/other.rs
+@@ -1,3 +1,3 @@
+-fn greet() {
++fn greet(x: i32) {";
+        let affected = vec![AffectedSymbol {
+            name: "greet".to_string(),
+            kind: "function".to_string(),
+            change_type: "modified".to_string(),
+        }];
+        let changes = detect_signature_changes(diff, "src/lib.rs", &affected);
+        assert!(changes.is_empty());
+    }
+
+    // is_definition_header_in_changed_lines が trait/struct の変更行を検出する
+    #[test]
+    fn is_definition_header_detects_trait_change() {
+        let diff = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,3 @@
+-pub trait GuestMemory {
++pub trait GuestMemory: Send + Sync {";
+        assert!(is_definition_header_in_changed_lines(
+            diff,
+            "src/lib.rs",
+            "GuestMemory",
+            "trait"
+        ));
+    }
+
+    // 型ヘッダが変更行に存在しない場合は false を返す
+    #[test]
+    fn is_definition_header_absent() {
+        let diff = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -5,3 +5,3 @@
+-    fn read_obj(&self) -> i32;
++    fn read_obj(&self, buf: &[u8]) -> i32;";
+        assert!(!is_definition_header_in_changed_lines(
+            diff,
+            "src/lib.rs",
+            "GuestMemory",
+            "trait"
+        ));
+    }
+
+    // 非型シンボルは常に true を返す
+    #[test]
+    fn is_definition_header_non_type_always_true() {
+        assert!(is_definition_header_in_changed_lines(
+            "",
+            "src/lib.rs",
+            "foo",
+            "function"
+        ));
+    }
 }

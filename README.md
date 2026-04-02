@@ -497,7 +497,7 @@ PR や patch 全体をまとめて見たい場合は、`astro-sight review --dir
 - **YES → Use `astro-sight refs`** (Grep FORBIDDEN)
 - **NO → Grep OK** (error messages, config values, TODOs, file paths, etc.)
 
-⚠️ **Pipe-separated patterns**: `Grep "FOO|Bar|baz"` with code identifiers is also FORBIDDEN. Use `astro-sight refs --names FOO,Bar,baz --dir .`.
+⚠️ **Pipe-separated patterns**: `Grep "FOO|Bar|baz"` with code identifiers is also FORBIDDEN. Use `refs --names` instead.
 
 This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches only identifier nodes, zero false positives from comments/strings.
 
@@ -513,42 +513,36 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 | `Grep "error message text"` | ✅ Grep OK | String literal search |
 | `Grep "config_key"` | ✅ Grep OK | Config value search |
 
-## Workflow Rules
+## Workflow Rules (MANDATORY for code changes)
 - **Before editing code**: Run `astro-sight context --dir . --git` to check impact
 - **After editing code**: Run `astro-sight impact --dir . --git` to detect unresolved impacts
-- **Inspecting exact syntax or parse errors**: Run `astro-sight ast --path <file> --line <n> --col <n>`
+- **One-shot diff review**: Run `astro-sight review --dir . --git` for impact + cochange + API diff + dead symbols
 - **Understanding a file**: Run `astro-sight symbols --path <file>` to see structure
 - **Understanding a directory**: Run `astro-sight symbols --dir <dir>` to see all symbols
 - **Finding symbol usage**: Run `astro-sight refs` (Grep FORBIDDEN)
 - **Finding multiple symbols**: Run `astro-sight refs --names sym1,sym2 --dir .`
 - **Who calls this function?**: Run `astro-sight calls --path <file> --function <name>`
 - **What does this file import?**: Run `astro-sight imports --path <file>`
-- **Files that change together**: Run `astro-sight cochange --dir . --file <file>`
-- **Visualize call flow**: Run `astro-sight sequence --path <file> --function <name>`
-- **Run a full structured diff review**: Run `astro-sight review --dir . --git` or `astro-sight review --dir . --diff-file <patch>`
-- **Batching mixed astro-sight queries**: Run `astro-sight session`
-- **Checking repeated AST/text patterns**: Run `astro-sight lint --path <file> --rules rules.yaml`
 
 ## Command Quick Reference
 
+```
 astro-sight refs --name <symbol> --dir .           # Symbol reference search (REPLACES Grep for identifiers)
 astro-sight refs --names sym1,sym2 --dir .         # Batch symbol search (REPLACES Grep "FOO|Bar")
 astro-sight symbols --path <file>                  # File structure overview
-astro-sight ast --path <file> --line <n> --col <n> # Exact AST fragment at cursor/range
 astro-sight symbols --dir <dir>                    # Directory structure overview (NDJSON)
 astro-sight calls --path <file> --function <name>  # Caller/callee relationships
 astro-sight context --dir . --git                  # Change impact analysis (run BEFORE editing code)
 astro-sight impact --dir . --git                   # Detect unresolved impacts (run AFTER editing code)
-astro-sight review --dir . --git                   # One-shot structured diff review
+astro-sight review --dir . --git                   # Structured diff review (impact + cochange + API + dead)
 astro-sight imports --path <file>                  # Import relationships
-astro-sight lint --path <file> --rules rules.yaml  # AST/text pattern checks
 astro-sight sequence --path <file>                 # Call flow visualization
 astro-sight cochange --dir .                       # Co-change patterns
-astro-sight session                                # Mixed NDJSON batch queries
+```
 
 ## Efficiency Rules
 - **`refs` results include `context` (source line)** → No need for additional Read/Grep
-- **Batch multiple symbol searches with `refs --names`** (reserve `session` for mixed commands)
+- **Batch multiple symbol searches with `refs --names`** (simpler than session)
 - **Use Read for surrounding context when editing** (astro-sight shows 1 line only)
 ```
 
