@@ -62,6 +62,15 @@ fn cache_dir() -> PathBuf {
 mod tests {
     use super::*;
 
+    /// テスト用の隔離された CacheStore を生成
+    fn test_store() -> (CacheStore, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = CacheStore {
+            dir: tmp.path().to_path_buf(),
+        };
+        (store, tmp)
+    }
+
     /// 同じ入力に対して決定論的に同じハッシュを返すことを検証
     #[test]
     fn hash_deterministic() {
@@ -81,7 +90,7 @@ mod tests {
     /// put で保存したデータを get で正しく取得できることを検証
     #[test]
     fn put_and_get() {
-        let store = CacheStore::new().unwrap();
+        let (store, _tmp) = test_store();
         let hash = CacheStore::hash(b"test_put_and_get_content");
         store.put(&hash, "test_cmd", b"cached data").unwrap();
         let result = store.get(&hash, "test_cmd");
@@ -91,7 +100,7 @@ mod tests {
     /// 存在しないキーに対して None を返すことを検証
     #[test]
     fn get_missing_returns_none() {
-        let store = CacheStore::new().unwrap();
+        let (store, _tmp) = test_store();
         let result = store.get("nonexistent_hash_for_test", "cmd");
         assert!(result.is_none());
     }
@@ -99,7 +108,7 @@ mod tests {
     /// clear 後にキャッシュが空になることを検証
     #[test]
     fn clear_removes_cache() {
-        let store = CacheStore::new().unwrap();
+        let (store, _tmp) = test_store();
         let hash = CacheStore::hash(b"test_clear_content");
         store.put(&hash, "test_clear", b"data").unwrap();
         assert!(store.get(&hash, "test_clear").is_some());
