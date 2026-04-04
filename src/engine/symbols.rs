@@ -308,7 +308,7 @@ fn is_exported_go(node: Node, source: &[u8]) -> bool {
 pub fn calculate_complexity(node: Node, lang_id: LangId) -> usize {
     let branch_kinds = branch_node_kinds(lang_id);
     let mut count = 1; // ベース複雑度
-    count_branch_nodes(node, &branch_kinds, &mut count);
+    count_branch_nodes(node, branch_kinds, &mut count);
     count
 }
 
