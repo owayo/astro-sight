@@ -47,6 +47,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/cache/store.rs` - content-addressed キャッシュ（~/.cache/astro-sight/）
 - `src/session/mod.rs` - NDJSON セッション処理（生行サイズで100MB上限、空文字・非 UTF-8 を含む `ASTRO_SIGHT_WORKSPACE` の不正値は fail-closed）
 - `src/language.rs` - 言語検出（拡張子/shebang）
+- `tests/fixtures/` - 多言語テストフィクスチャ（sample.rb, sample.py, sample.go, sample.ts）
 
 ## Review Standards
 

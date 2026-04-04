@@ -2831,3 +2831,271 @@ fn sequence_batch() {
         assert!(json["diagram"].as_str().is_some() || json.get("error").is_some());
     }
 }
+
+// ---- init サブコマンドテスト ----
+
+#[test]
+fn init_creates_config_file() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config_path = dir.path().join("config.toml");
+
+    let output = cargo_bin()
+        .args(["init", "--path", config_path.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    assert!(config_path.exists(), "init が設定ファイルを作成すべき");
+
+    let content = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        content.contains("debug = false"),
+        "デフォルト設定を含むべき"
+    );
+}
+
+// ---- skill-install サブコマンドテスト ----
+
+#[test]
+fn skill_install_unknown_target() {
+    let output = cargo_bin()
+        .args(["skill-install", "unknown-agent"])
+        .output()
+        .expect("failed to run");
+    assert!(!output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("JSON エラー出力であるべき");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown target")
+    );
+}
+
+// ---- Python 多言語テスト ----
+
+#[test]
+fn python_symbols() {
+    let output = cargo_bin()
+        .args(["symbols", "--path", "tests/fixtures/sample.py"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "python");
+
+    let symbols = json["symbols"].as_array().unwrap();
+    let names: Vec<&str> = symbols
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"Config"), "class Config を検出すべき");
+    assert!(
+        names.contains(&"create_config"),
+        "function create_config を検出すべき"
+    );
+}
+
+#[test]
+fn python_calls() {
+    let output = cargo_bin()
+        .args(["calls", "--path", "tests/fixtures/sample.py"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "python");
+    assert!(json["calls"].as_array().is_some());
+}
+
+#[test]
+fn python_imports() {
+    let output = cargo_bin()
+        .args(["imports", "--path", "tests/fixtures/sample.py"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let imports = json["imports"].as_array().unwrap();
+    let sources: Vec<&str> = imports.iter().map(|i| i["src"].as_str().unwrap()).collect();
+    assert!(
+        sources.contains(&"pathlib"),
+        "pathlib の import を検出すべき"
+    );
+}
+
+#[test]
+fn python_ast() {
+    let output = cargo_bin()
+        .args([
+            "ast",
+            "--path",
+            "tests/fixtures/sample.py",
+            "--line",
+            "0",
+            "--col",
+            "0",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "python");
+    assert!(!json["ast"].as_array().unwrap().is_empty());
+}
+
+// ---- Go 多言語テスト ----
+
+#[test]
+fn go_symbols() {
+    let output = cargo_bin()
+        .args(["symbols", "--path", "tests/fixtures/sample.go"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "go");
+
+    let symbols = json["symbols"].as_array().unwrap();
+    let names: Vec<&str> = symbols
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"Server"), "type Server を検出すべき");
+    assert!(names.contains(&"NewServer"), "func NewServer を検出すべき");
+}
+
+#[test]
+fn go_calls() {
+    let output = cargo_bin()
+        .args(["calls", "--path", "tests/fixtures/sample.go"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "go");
+    assert!(json["calls"].as_array().is_some());
+}
+
+#[test]
+fn go_imports() {
+    let output = cargo_bin()
+        .args(["imports", "--path", "tests/fixtures/sample.go"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let imports = json["imports"].as_array().unwrap();
+    let sources: Vec<&str> = imports.iter().map(|i| i["src"].as_str().unwrap()).collect();
+    assert!(sources.contains(&"fmt"), "fmt の import を検出すべき");
+    assert!(
+        sources.contains(&"strings"),
+        "strings の import を検出すべき"
+    );
+}
+
+// ---- TypeScript 多言語テスト ----
+
+#[test]
+fn typescript_symbols() {
+    let output = cargo_bin()
+        .args(["symbols", "--path", "tests/fixtures/sample.ts"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "typescript");
+
+    let symbols = json["symbols"].as_array().unwrap();
+    let names: Vec<&str> = symbols
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"AppServer"), "class AppServer を検出すべき");
+    assert!(
+        names.contains(&"createServer"),
+        "function createServer を検出すべき"
+    );
+    assert!(names.contains(&"Config"), "interface Config を検出すべき");
+}
+
+#[test]
+fn typescript_calls() {
+    let output = cargo_bin()
+        .args(["calls", "--path", "tests/fixtures/sample.ts"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "typescript");
+    assert!(json["calls"].as_array().is_some());
+}
+
+#[test]
+fn typescript_imports() {
+    let output = cargo_bin()
+        .args(["imports", "--path", "tests/fixtures/sample.ts"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let imports = json["imports"].as_array().unwrap();
+    assert!(!imports.is_empty(), "TypeScript の import を検出すべき");
+}
+
+// ---- refs 多言語テスト ----
+
+#[test]
+fn python_refs() {
+    let output = cargo_bin()
+        .args(["refs", "--name", "Config", "--dir", "tests/fixtures"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let refs = json["refs"].as_array().unwrap();
+    // Config は sample.py と sample.ts 両方に存在
+    assert!(!refs.is_empty(), "Config の参照を検出すべき");
+}
+
+#[test]
+fn go_refs() {
+    let output = cargo_bin()
+        .args(["refs", "--name", "Server", "--dir", "tests/fixtures"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let refs = json["refs"].as_array().unwrap();
+    assert!(!refs.is_empty(), "Server の参照を検出すべき");
+}
+
+// ---- review サブコマンドテスト ----
+
+#[test]
+fn review_on_clean_repo() {
+    // クリーンな状態では変更なしの結果を返すべき
+    let output = cargo_bin()
+        .args(["review", "--dir", "."])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    // review は JSON 出力を返すこと
+    assert!(json.is_object(), "review は JSON オブジェクトを返すべき");
+}
