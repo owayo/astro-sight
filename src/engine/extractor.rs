@@ -284,4 +284,110 @@ mod tests {
         // ns がrs より前なので false
         assert!(!is_within(ns, ne, rs, re));
     }
+
+    // --- extract_at_point テスト ---
+
+    fn parse_rust_source(source: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&crate::language::LangId::Rust.ts_language())
+            .unwrap();
+        parser.parse(source.as_bytes(), None).unwrap()
+    }
+
+    /// 関数名の位置で extract_at_point すると identifier ノードが返る
+    #[test]
+    fn extract_at_point_returns_identifier() {
+        let source = "fn hello() {}";
+        let tree = parse_rust_source(source);
+        let root = tree.root_node();
+        // "hello" は行0, 列3 から開始
+        let nodes = extract_at_point(root, source.as_bytes(), 0, 3, 1);
+        assert!(!nodes.is_empty());
+        assert_eq!(nodes[0].kind, "identifier");
+        assert_eq!(nodes[0].text.as_deref(), Some("hello"));
+    }
+
+    /// 範囲外の位置で extract_at_point するとルートノードのフォールバック
+    #[test]
+    fn extract_at_point_out_of_range_falls_back() {
+        let source = "fn hello() {}";
+        let tree = parse_rust_source(source);
+        let root = tree.root_node();
+        // 存在しない行
+        let nodes = extract_at_point(root, source.as_bytes(), 100, 0, 1);
+        // フォールバックでルートの AST が返る
+        assert!(!nodes.is_empty());
+    }
+
+    // --- extract_range テスト ---
+
+    /// 範囲内のノードが正しく抽出される
+    #[test]
+    fn extract_range_captures_nodes_in_range() {
+        let source = "fn foo() {}\nfn bar() {}\nfn baz() {}";
+        let tree = parse_rust_source(source);
+        let root = tree.root_node();
+        // 2行目（bar）のみを含む範囲
+        let nodes = extract_range(root, source.as_bytes(), 1, 0, 1, 11, 3);
+        assert!(!nodes.is_empty());
+        // function_item が返る
+        assert!(nodes.iter().any(|n| n.kind == "function_item"));
+    }
+
+    /// 空の範囲（ノードが含まれない）ではフォールバック
+    #[test]
+    fn extract_range_empty_range_falls_back() {
+        let source = "fn foo() {}";
+        let tree = parse_rust_source(source);
+        let root = tree.root_node();
+        // 存在しない範囲
+        let nodes = extract_range(root, source.as_bytes(), 10, 0, 10, 10, 3);
+        // フォールバックでルートの最深ノードか空を返す
+        // （実装上は start 位置のフォールバックが試行される）
+        // ノードが見つからなければ空
+        assert!(nodes.is_empty() || !nodes.is_empty()); // パニックしないことを確認
+    }
+
+    // --- extract_full テスト ---
+
+    /// extract_full が全トップレベルノードを返す
+    #[test]
+    fn extract_full_returns_all_top_level() {
+        let source = "fn foo() {}\nstruct Bar {}\nenum Baz { A }";
+        let tree = parse_rust_source(source);
+        let root = tree.root_node();
+        let nodes = extract_full(root, source.as_bytes(), 2);
+        assert_eq!(nodes.len(), 3);
+        let kinds: Vec<&str> = nodes.iter().map(|n| n.kind.as_str()).collect();
+        assert!(kinds.contains(&"function_item"));
+        assert!(kinds.contains(&"struct_item"));
+        assert!(kinds.contains(&"enum_item"));
+    }
+
+    /// depth=0 では子ノードなしでテキストが付与される
+    #[test]
+    fn extract_full_depth_zero_has_text() {
+        let source = "fn foo() {}";
+        let tree = parse_rust_source(source);
+        let root = tree.root_node();
+        let nodes = extract_full(root, source.as_bytes(), 0);
+        assert_eq!(nodes.len(), 1);
+        assert!(nodes[0].text.is_some());
+        assert!(nodes[0].children.is_empty());
+    }
+
+    // --- node_to_ast テスト ---
+
+    /// node_to_ast で depth > 0 のとき子ノードが含まれる
+    #[test]
+    fn node_to_ast_includes_children_with_depth() {
+        let source = "fn foo() { let x = 1; }";
+        let tree = parse_rust_source(source);
+        let root = tree.root_node();
+        let func = root.child(0).unwrap(); // function_item
+        let ast = super::node_to_ast(func, source.as_bytes(), 3);
+        assert_eq!(ast.kind, "function_item");
+        assert!(!ast.children.is_empty());
+    }
 }

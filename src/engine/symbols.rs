@@ -313,7 +313,7 @@ pub fn calculate_complexity(node: Node, lang_id: LangId) -> usize {
 }
 
 /// 再帰的に分岐ノードをカウントする。
-fn count_branch_nodes(node: Node, branch_kinds: &[&str], count: &mut usize) {
+fn count_branch_nodes(node: Node, branch_kinds: &'static [&'static str], count: &mut usize) {
     let kind = node.kind();
     if branch_kinds.contains(&kind) {
         *count += 1;
@@ -325,9 +325,10 @@ fn count_branch_nodes(node: Node, branch_kinds: &[&str], count: &mut usize) {
 }
 
 /// 言語別の分岐ノード種別を返す。
-fn branch_node_kinds(lang_id: LangId) -> Vec<&'static str> {
+/// 静的スライスを返すことで毎回の Vec アロケーションを回避する。
+fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
     match lang_id {
-        LangId::Rust => vec![
+        LangId::Rust => &[
             "if_expression",
             "match_expression",
             "for_expression",
@@ -336,7 +337,7 @@ fn branch_node_kinds(lang_id: LangId) -> Vec<&'static str> {
             "else_clause",
             "match_arm",
         ],
-        LangId::Javascript | LangId::Typescript | LangId::Tsx => vec![
+        LangId::Javascript | LangId::Typescript | LangId::Tsx => &[
             "if_statement",
             "switch_case",
             "for_statement",
@@ -346,7 +347,7 @@ fn branch_node_kinds(lang_id: LangId) -> Vec<&'static str> {
             "ternary_expression",
             "catch_clause",
         ],
-        LangId::Python => vec![
+        LangId::Python => &[
             "if_statement",
             "elif_clause",
             "for_statement",
@@ -354,14 +355,14 @@ fn branch_node_kinds(lang_id: LangId) -> Vec<&'static str> {
             "except_clause",
             "conditional_expression",
         ],
-        LangId::Go => vec![
+        LangId::Go => &[
             "if_statement",
             "for_statement",
             "select_statement",
             "type_switch_statement",
             "case_clause",
         ],
-        LangId::Java | LangId::Kotlin => vec![
+        LangId::Java | LangId::Kotlin => &[
             "if_statement",
             "switch_expression",
             "for_statement",
@@ -370,10 +371,10 @@ fn branch_node_kinds(lang_id: LangId) -> Vec<&'static str> {
             "do_statement",
             "catch_clause",
         ],
-        LangId::Ruby => vec![
+        LangId::Ruby => &[
             "if", "elsif", "unless", "case", "when", "for", "while", "until", "rescue",
         ],
-        LangId::Php => vec![
+        LangId::Php => &[
             "if_statement",
             "switch_statement",
             "case_statement",
@@ -383,7 +384,7 @@ fn branch_node_kinds(lang_id: LangId) -> Vec<&'static str> {
             "do_statement",
             "catch_clause",
         ],
-        LangId::CSharp => vec![
+        LangId::CSharp => &[
             "if_statement",
             "switch_section",
             "for_statement",
@@ -393,7 +394,7 @@ fn branch_node_kinds(lang_id: LangId) -> Vec<&'static str> {
             "catch_clause",
         ],
         // 汎用パターン（C, C++, Swift, Bash 等）
-        _ => vec![
+        _ => &[
             "if_statement",
             "if_expression",
             "for_statement",
