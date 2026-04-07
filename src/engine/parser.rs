@@ -103,6 +103,8 @@ pub fn read_file(path: &Utf8Path) -> Result<SourceBuf> {
     }
 
     // 64KB 超のファイルは mmap でゼロコピー
+    // Safety: ファイルが他プロセスから truncate されると SIGBUS の可能性がある。
+    // memmap2 の既知の制限事項であり、CLI ツールとしては許容範囲。
     if metadata.len() > 65536 {
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
         Ok(SourceBuf::Mmap(mmap))

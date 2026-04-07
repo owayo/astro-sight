@@ -425,8 +425,13 @@ fn find_affected_symbols(
             let sym_start = sym.range.start.line;
             let sym_end = sym.range.end.line;
 
-            // オーバーラップチェック
-            if hunk_start < sym_end && hunk_end > sym_start {
+            // オーバーラップチェック（ゼロ幅 hunk は点として境界を含む判定）
+            let overlaps = if hunk.new_count == 0 {
+                hunk_start >= sym_start && hunk_start < sym_end
+            } else {
+                hunk_start < sym_end && hunk_end > sym_start
+            };
+            if overlaps {
                 let change_type = if hunk.old_count == 0 {
                     "added"
                 } else if hunk.new_count == 0 {
@@ -453,7 +458,12 @@ fn symbol_overlaps_hunks(sym: &crate::models::symbol::Symbol, hunks: &[HunkInfo]
     hunks.iter().any(|h| {
         let hunk_start = h.new_start.saturating_sub(1);
         let hunk_end = hunk_start + h.new_count;
-        hunk_start < sym.range.end.line && hunk_end > sym.range.start.line
+        // ゼロ幅 hunk（pure-delete）は点として境界を含む判定
+        if h.new_count == 0 {
+            hunk_start >= sym.range.start.line && hunk_start < sym.range.end.line
+        } else {
+            hunk_start < sym.range.end.line && hunk_end > sym.range.start.line
+        }
     })
 }
 
