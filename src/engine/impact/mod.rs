@@ -737,4 +737,99 @@ mod tests {
         // （修正前は false を返していた）
         let _ = result;
     }
+
+    /// ヘルパー: テスト用シンボルを生成する
+    fn make_sym(name: &str, start_line: usize, end_line: usize) -> crate::models::symbol::Symbol {
+        use crate::models::location::{Point, Range};
+        crate::models::symbol::Symbol {
+            name: name.to_string(),
+            kind: crate::models::symbol::SymbolKind::Function,
+            range: Range {
+                start: Point {
+                    line: start_line,
+                    column: 0,
+                },
+                end: Point {
+                    line: end_line,
+                    column: 0,
+                },
+            },
+            doc: None,
+            complexity: None,
+            children: vec![],
+        }
+    }
+
+    /// pure-delete hunk（new_count=0）がシンボル開始行と一致する場合に検出される
+    #[test]
+    fn find_affected_pure_delete_at_symbol_start() {
+        let sym = make_sym("foo", 4, 9);
+        let hunk = HunkInfo {
+            old_start: 5,
+            old_count: 3,
+            new_start: 5,
+            new_count: 0,
+        };
+        let result = find_affected_symbols(&[sym], &[hunk]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "foo");
+        assert_eq!(result[0].change_type, "removed");
+    }
+
+    /// pure-delete hunk がシンボル内部にある場合も検出される
+    #[test]
+    fn find_affected_pure_delete_inside_symbol() {
+        let sym = make_sym("bar", 2, 10);
+        let hunk = HunkInfo {
+            old_start: 6,
+            old_count: 2,
+            new_start: 6,
+            new_count: 0,
+        };
+        let result = find_affected_symbols(&[sym], &[hunk]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "bar");
+    }
+
+    /// pure-delete hunk がシンボル範囲外にある場合は検出されない
+    #[test]
+    fn find_affected_pure_delete_outside_symbol() {
+        let sym = make_sym("baz", 10, 20);
+        let hunk = HunkInfo {
+            old_start: 5,
+            old_count: 3,
+            new_start: 5,
+            new_count: 0,
+        };
+        let result = find_affected_symbols(&[sym], &[hunk]);
+        assert!(result.is_empty());
+    }
+
+    /// symbol_overlaps_hunks: pure-delete hunk でシンボル境界の検出
+    #[test]
+    fn symbol_overlaps_pure_delete_at_boundary() {
+        let sym = make_sym("fn_at_boundary", 4, 9);
+        let hunk = HunkInfo {
+            old_start: 5,
+            old_count: 3,
+            new_start: 5,
+            new_count: 0,
+        };
+        assert!(symbol_overlaps_hunks(&sym, &[hunk]));
+    }
+
+    /// 通常の hunk（new_count > 0）は従来通り動作する
+    #[test]
+    fn find_affected_normal_hunk() {
+        let sym = make_sym("normal", 4, 9);
+        let hunk = HunkInfo {
+            old_start: 5,
+            old_count: 2,
+            new_start: 5,
+            new_count: 3,
+        };
+        let result = find_affected_symbols(&[sym], &[hunk]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].change_type, "modified");
+    }
 }

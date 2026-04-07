@@ -523,6 +523,8 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 - **Finding multiple symbols**: Run `astro-sight refs --names sym1,sym2 --dir .`
 - **Who calls this function?**: Run `astro-sight calls --path <file> --function <name>`
 - **What does this file import?**: Run `astro-sight imports --path <file>`
+- **Files that change together**: Run `astro-sight cochange --dir . --file <file>`
+- **Visualize call flow**: Run `astro-sight sequence --path <file> --function <name>`
 
 ## Command Quick Reference
 

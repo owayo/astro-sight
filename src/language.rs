@@ -107,7 +107,11 @@ impl LangId {
             Some(Self::Kotlin)
         } else if line.contains("swift") {
             Some(Self::Swift)
-        } else if line.contains("bash") || line.contains("/sh") || line.contains("zsh") {
+        } else if line.contains("bash")
+            || line.contains("/bin/sh")
+            || line.contains("env sh")
+            || line.contains("zsh")
+        {
             Some(Self::Bash)
         } else if line.contains("ruby") {
             Some(Self::Ruby)
@@ -249,5 +253,29 @@ mod tests {
     #[test]
     fn shebang_bash() {
         assert_eq!(LangId::from_shebang("#!/bin/bash"), Some(LangId::Bash));
+    }
+
+    #[test]
+    fn shebang_bin_sh() {
+        assert_eq!(LangId::from_shebang("#!/bin/sh"), Some(LangId::Bash));
+    }
+
+    #[test]
+    fn shebang_env_sh() {
+        assert_eq!(
+            LangId::from_shebang("#!/usr/bin/env sh"),
+            Some(LangId::Bash)
+        );
+    }
+
+    #[test]
+    fn shebang_zsh() {
+        assert_eq!(LangId::from_shebang("#!/bin/zsh"), Some(LangId::Bash));
+    }
+
+    /// `/sh` を含むが sh ではないコマンド（ssh 等）は Bash として誤検出しない
+    #[test]
+    fn shebang_ssh_not_bash() {
+        assert_eq!(LangId::from_shebang("#!/usr/bin/ssh"), None);
     }
 }

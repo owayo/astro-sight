@@ -55,8 +55,8 @@ pub fn init(config: &Config) -> Result<()> {
     tracing::subscriber::set_global_default(subscriber)
         .map_err(|e| anyhow::anyhow!("Failed to set global subscriber: {}", e))?;
 
-    // Keep the guard alive for the duration of the program
-    std::mem::forget(_guard);
+    // guard をプロセス終了まで保持し、Drop でログをフラッシュさせる
+    Box::leak(Box::new(_guard));
 
     Ok(())
 }
