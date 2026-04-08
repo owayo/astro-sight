@@ -370,7 +370,7 @@ fn context_with_diff() {
     // Create a synthetic diff
     let diff = r#"--- a/src/engine/symbols.rs
 +++ b/src/engine/symbols.rs
-@@ -456,7 +456,7 @@
+@@ -495,7 +495,7 @@
 -pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
 +pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, include_refs: bool) -> Result<Vec<Symbol>> {
      let query_src = symbol_query(lang_id);
@@ -871,7 +871,7 @@ fn context_batch_refs_consistency() {
     // with the batch refs approach (same output as before)
     let diff = r#"--- a/src/engine/symbols.rs
 +++ b/src/engine/symbols.rs
-@@ -456,7 +456,7 @@
+@@ -495,7 +495,7 @@
 -pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
 +pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, flag: bool) -> Result<Vec<Symbol>> {
      let query_src = symbol_query(lang_id);
@@ -1539,7 +1539,7 @@ fn impact_with_unresolved() {
     // Diff that changes extract_symbols signature → callers in other files are unresolved
     let diff = r#"--- a/src/engine/symbols.rs
 +++ b/src/engine/symbols.rs
-@@ -456,7 +456,7 @@
+@@ -495,7 +495,7 @@
 -pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
 +pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, flag: bool) -> Result<Vec<Symbol>> {
      let query_src = symbol_query(lang_id);
@@ -3098,4 +3098,395 @@ fn review_on_clean_repo() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
     // review は JSON 出力を返すこと
     assert!(json.is_object(), "review は JSON オブジェクトを返すべき");
+}
+
+// ---- Java 多言語統合テスト ----
+
+#[test]
+fn java_symbols() {
+    let output = cargo_bin()
+        .args(["symbols", "--path", "tests/fixtures/sample.java"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "java");
+
+    let symbols = json["symbols"].as_array().unwrap();
+    assert!(
+        symbols.iter().any(|s| s["name"] == "SampleService"),
+        "SampleService クラスを検出すべき"
+    );
+    assert!(
+        symbols.iter().any(|s| s["name"] == "addItem"),
+        "addItem メソッドを検出すべき"
+    );
+}
+
+#[test]
+fn java_calls() {
+    let output = cargo_bin()
+        .args([
+            "calls",
+            "--path",
+            "tests/fixtures/sample.java",
+            "--function",
+            "addItem",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "java");
+}
+
+#[test]
+fn java_imports() {
+    let output = cargo_bin()
+        .args(["imports", "--path", "tests/fixtures/sample.java"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let imports = json["imports"].as_array().unwrap();
+    assert!(
+        imports
+            .iter()
+            .any(|i| { i["ctx"].as_str().unwrap_or("").contains("java.util.List") }),
+        "java.util.List の import を検出すべき"
+    );
+}
+
+// ---- Kotlin 多言語統合テスト ----
+
+#[test]
+fn kotlin_symbols() {
+    let output = cargo_bin()
+        .args(["symbols", "--path", "tests/fixtures/sample.kt"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "kotlin");
+
+    let symbols = json["symbols"].as_array().unwrap();
+    assert!(
+        symbols.iter().any(|s| s["name"] == "SampleRepository"),
+        "SampleRepository クラスを検出すべき"
+    );
+    assert!(
+        symbols.iter().any(|s| s["name"] == "main"),
+        "main 関数を検出すべき"
+    );
+}
+
+#[test]
+fn kotlin_calls() {
+    let output = cargo_bin()
+        .args([
+            "calls",
+            "--path",
+            "tests/fixtures/sample.kt",
+            "--function",
+            "main",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "kotlin");
+}
+
+#[test]
+fn kotlin_imports() {
+    let output = cargo_bin()
+        .args(["imports", "--path", "tests/fixtures/sample.kt"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let imports = json["imports"].as_array().unwrap();
+    assert!(!imports.is_empty(), "Kotlin の import を検出すべき");
+}
+
+// ---- Swift 多言語統合テスト ----
+
+#[test]
+fn swift_symbols() {
+    let output = cargo_bin()
+        .args(["symbols", "--path", "tests/fixtures/sample.swift"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "swift");
+
+    let symbols = json["symbols"].as_array().unwrap();
+    assert!(
+        symbols.iter().any(|s| s["name"] == "TaskManager"),
+        "TaskManager クラスを検出すべき"
+    );
+    assert!(
+        symbols.iter().any(|s| s["name"] == "addTask"),
+        "addTask メソッドを検出すべき"
+    );
+}
+
+#[test]
+fn swift_calls() {
+    let output = cargo_bin()
+        .args([
+            "calls",
+            "--path",
+            "tests/fixtures/sample.swift",
+            "--function",
+            "removeTask",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "swift");
+}
+
+#[test]
+fn swift_imports() {
+    let output = cargo_bin()
+        .args(["imports", "--path", "tests/fixtures/sample.swift"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let imports = json["imports"].as_array().unwrap();
+    assert!(
+        imports
+            .iter()
+            .any(|i| i["ctx"].as_str().unwrap_or("").contains("Foundation")),
+        "Foundation の import を検出すべき"
+    );
+}
+
+// ---- C# 多言語統合テスト ----
+
+#[test]
+fn csharp_symbols() {
+    let output = cargo_bin()
+        .args(["symbols", "--path", "tests/fixtures/sample.cs"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "csharp");
+
+    let symbols = json["symbols"].as_array().unwrap();
+    assert!(
+        symbols.iter().any(|s| s["name"] == "Calculator"),
+        "Calculator クラスを検出すべき"
+    );
+    assert!(
+        symbols.iter().any(|s| s["name"] == "Add"),
+        "Add メソッドを検出すべき"
+    );
+}
+
+#[test]
+fn csharp_imports() {
+    let output = cargo_bin()
+        .args(["imports", "--path", "tests/fixtures/sample.cs"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let imports = json["imports"].as_array().unwrap();
+    assert!(
+        imports
+            .iter()
+            .any(|i| i["ctx"].as_str().unwrap_or("").contains("System")),
+        "System の using を検出すべき"
+    );
+}
+
+// ---- PHP 多言語統合テスト ----
+
+#[test]
+fn php_symbols() {
+    let output = cargo_bin()
+        .args(["symbols", "--path", "tests/fixtures/sample.php"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "php");
+
+    let symbols = json["symbols"].as_array().unwrap();
+    assert!(
+        symbols.iter().any(|s| s["name"] == "UserService"),
+        "UserService クラスを検出すべき"
+    );
+    assert!(
+        symbols.iter().any(|s| s["name"] == "findUser"),
+        "findUser メソッドを検出すべき"
+    );
+}
+
+#[test]
+fn php_imports() {
+    let output = cargo_bin()
+        .args(["imports", "--path", "tests/fixtures/sample.php"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let imports = json["imports"].as_array().unwrap();
+    assert!(
+        imports
+            .iter()
+            .any(|i| { i["ctx"].as_str().unwrap_or("").contains("UserRepository") }),
+        "UserRepository の use を検出すべき"
+    );
+}
+
+// ---- C 多言語統合テスト ----
+
+#[test]
+fn c_symbols() {
+    let output = cargo_bin()
+        .args(["symbols", "--path", "tests/fixtures/sample.c"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "c");
+
+    let symbols = json["symbols"].as_array().unwrap();
+    assert!(
+        symbols.iter().any(|s| s["name"] == "main"),
+        "main 関数を検出すべき"
+    );
+    assert!(
+        symbols.iter().any(|s| s["name"] == "buffer_append"),
+        "buffer_append 関数を検出すべき"
+    );
+}
+
+#[test]
+fn c_calls() {
+    let output = cargo_bin()
+        .args([
+            "calls",
+            "--path",
+            "tests/fixtures/sample.c",
+            "--function",
+            "main",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "c");
+}
+
+#[test]
+fn c_imports() {
+    let output = cargo_bin()
+        .args(["imports", "--path", "tests/fixtures/sample.c"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let imports = json["imports"].as_array().unwrap();
+    assert!(
+        imports
+            .iter()
+            .any(|i| i["ctx"].as_str().unwrap_or("").contains("stdio.h")),
+        "stdio.h の include を検出すべき"
+    );
+}
+
+// ---- C++ 多言語統合テスト ----
+
+#[test]
+fn cpp_symbols() {
+    let output = cargo_bin()
+        .args(["symbols", "--path", "tests/fixtures/sample.cpp"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "cpp");
+
+    let symbols = json["symbols"].as_array().unwrap();
+    assert!(
+        symbols.iter().any(|s| s["name"] == "StringPool"),
+        "StringPool クラスを検出すべき"
+    );
+}
+
+#[test]
+fn cpp_calls() {
+    let output = cargo_bin()
+        .args([
+            "calls",
+            "--path",
+            "tests/fixtures/sample.cpp",
+            "--function",
+            "main",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "cpp");
+}
+
+#[test]
+fn cpp_imports() {
+    let output = cargo_bin()
+        .args(["imports", "--path", "tests/fixtures/sample.cpp"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let imports = json["imports"].as_array().unwrap();
+    assert!(
+        imports
+            .iter()
+            .any(|i| i["ctx"].as_str().unwrap_or("").contains("string")),
+        "string の include を検出すべき"
+    );
+}
+
+// ---- dead-code サブコマンドテスト ----
+
+#[test]
+fn dead_code_on_fixtures() {
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", "tests/fixtures"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert!(json["dir"].as_str().is_some());
+    assert!(json["scanned_files"].as_u64().is_some());
+    assert!(json["dead_symbols"].as_array().is_some());
 }

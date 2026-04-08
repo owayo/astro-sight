@@ -337,22 +337,62 @@ fn find_enclosing_declaration_zig(node: Node) -> Option<Node> {
 }
 
 /// 関数/メソッドノードの循環的複雑度を算出する（ベース1 + 分岐ノード数）。
+/// ネストした関数/クロージャの分岐は含めない。
 pub fn calculate_complexity(node: Node, lang_id: LangId) -> usize {
     let branch_kinds = branch_node_kinds(lang_id);
+    let func_kinds = function_boundary_kinds(lang_id);
     let mut count = 1; // ベース複雑度
-    count_branch_nodes(node, branch_kinds, &mut count);
+    count_branch_nodes(node, branch_kinds, &func_kinds, true, &mut count);
     count
 }
 
 /// 再帰的に分岐ノードをカウントする。
-fn count_branch_nodes(node: Node, branch_kinds: &'static [&'static str], count: &mut usize) {
+/// ネストした関数境界（クロージャ・内部関数）で走査を停止する。
+fn count_branch_nodes(
+    node: Node,
+    branch_kinds: &'static [&'static str],
+    func_kinds: &[&str],
+    is_root: bool,
+    count: &mut usize,
+) {
     let kind = node.kind();
+    // ルート以外の関数境界で停止（ネスト関数の分岐を除外）
+    if !is_root && func_kinds.contains(&kind) {
+        return;
+    }
     if branch_kinds.contains(&kind) {
         *count += 1;
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        count_branch_nodes(child, branch_kinds, count);
+        count_branch_nodes(child, branch_kinds, func_kinds, false, count);
+    }
+}
+
+/// 関数境界を示すノード種別を返す（ネスト関数検出用）。
+fn function_boundary_kinds(lang_id: LangId) -> Vec<&'static str> {
+    match lang_id {
+        LangId::Rust => vec!["function_item", "closure_expression"],
+        LangId::Javascript | LangId::Typescript | LangId::Tsx => vec![
+            "function_declaration",
+            "function_expression",
+            "arrow_function",
+            "method_definition",
+            "generator_function_declaration",
+        ],
+        LangId::Python => vec!["function_definition", "lambda"],
+        LangId::Go => vec!["function_declaration", "method_declaration", "func_literal"],
+        LangId::Java => vec!["method_declaration", "lambda_expression"],
+        LangId::Kotlin => vec!["function_declaration", "lambda_literal"],
+        LangId::Swift => vec!["function_declaration", "lambda_literal"],
+        LangId::CSharp => vec!["method_declaration", "lambda_expression"],
+        LangId::Php => vec![
+            "function_definition",
+            "method_declaration",
+            "anonymous_function_creation_expression",
+        ],
+        LangId::Ruby => vec!["method", "singleton_method", "lambda", "block"],
+        _ => vec![],
     }
 }
 
@@ -500,7 +540,8 @@ pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result
 
 fn capture_name_to_kind(name: &str) -> Option<SymbolKind> {
     match name {
-        "function.name" | "method.name" => Some(SymbolKind::Function),
+        "function.name" => Some(SymbolKind::Function),
+        "method.name" => Some(SymbolKind::Method),
         "class.name" => Some(SymbolKind::Class),
         "struct.name" => Some(SymbolKind::Struct),
         "enum.name" => Some(SymbolKind::Enum),

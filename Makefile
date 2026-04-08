@@ -7,8 +7,9 @@
 BINARY_NAME := astro-sight
 INSTALL_PATH := /usr/local/bin
 
-# Homebrew binutils の ar を使用（Xcode ar は -D フラグ未対応）
-export AR := /opt/homebrew/opt/binutils/bin/ar
+# macOS: classic linker を使用（Xcode 15+ のリンカーは ar アーカイブの
+# 8-byte alignment を厳格にチェックし tree-sitter-kotlin がリンク失敗する）
+export RUSTFLAGS ?= -C link-arg=-Wl,-ld_classic
 
 ## Build Commands
 

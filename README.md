@@ -525,10 +525,10 @@ PR や patch 全体をまとめて見たい場合は、`astro-sight review --dir
 ```markdown
 # Code Structure Analysis — astro-sight MANDATORY Rules
 
-## STOP-AND-CHECK Rule (CRITICAL: Check BEFORE every Grep call)
+## STOP-AND-CHECK Rule (CRITICAL: Check BEFORE every Grep/grep/rg call)
 
-**Before calling Grep, ask yourself**: "Does my search target contain code identifiers (function/class/variable/type/constant names)?"
-- **YES → Use `astro-sight refs`** (Grep FORBIDDEN)
+**Before calling Grep, `grep`, or `rg`, ask yourself**: "Does my search target contain code identifiers (function/class/variable/type/constant names)?"
+- **YES → Use `astro-sight refs`** (Grep, `bash grep`, `bash rg` ALL FORBIDDEN)
 - **NO → Grep OK** (error messages, config values, TODOs, file paths, etc.)
 
 ⚠️ **Pipe-separated patterns**: `Grep "FOO|Bar|baz"` with code identifiers is also FORBIDDEN. Use `refs --names` instead.
@@ -543,6 +543,7 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 | `Grep "ClassName"` | ❌ → `astro-sight refs --name ClassName --dir .` | Code identifier |
 | `Grep "MY_CONST\|OtherVar"` | ❌ → `astro-sight refs --names MY_CONST,OtherVar --dir .` | Pipe-separated identifiers |
 | `Grep "import.*module"` | ❌ → `astro-sight imports --path file` | Import analysis |
+| `bash grep/rg "identifier"` | ❌ → `astro-sight refs` | Bash grep is also forbidden for identifiers |
 | `Grep "TODO"` | ✅ Grep OK | Non-code search |
 | `Grep "error message text"` | ✅ Grep OK | String literal search |
 | `Grep "config_key"` | ✅ Grep OK | Config value search |
@@ -559,6 +560,8 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 - **What does this file import?**: Run `astro-sight imports --path <file>`
 - **Files that change together**: Run `astro-sight cochange --dir . --file <file>`
 - **Visualize call flow**: Run `astro-sight sequence --path <file> --function <name>`
+- **Structured diff review**: Run `astro-sight review --dir . --git`
+- **Find dead code**: Run `astro-sight dead-code --dir .` or `--git` for diff-scoped
 
 ## Command Quick Reference
 
@@ -571,6 +574,7 @@ astro-sight calls --path <file> --function <name>  # Caller/callee relationships
 astro-sight context --dir . --git                  # Change impact analysis (run BEFORE editing code)
 astro-sight impact --dir . --git                   # Detect unresolved impacts (run AFTER editing code)
 astro-sight review --dir . --git                   # Structured diff review (impact + cochange + API + dead)
+astro-sight dead-code --dir . --git                # Find dead/unreferenced exported symbols
 astro-sight imports --path <file>                  # Import relationships
 astro-sight sequence --path <file>                 # Call flow visualization
 astro-sight cochange --dir .                       # Co-change patterns

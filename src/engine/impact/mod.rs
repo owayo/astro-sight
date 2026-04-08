@@ -91,10 +91,12 @@ fn collect_affected_symbols(
             continue;
         }
 
-        if let Ok(canonical) = std::fs::canonicalize(&file_path)
-            && let Ok(canonical_dir) = std::fs::canonicalize(dir)
-            && !canonical.starts_with(&canonical_dir)
-        {
+        // fail-closed: canonicalize 失敗時もスキップ
+        let is_within_boundary = std::fs::canonicalize(&file_path)
+            .ok()
+            .zip(std::fs::canonicalize(dir).ok())
+            .is_some_and(|(canonical, canonical_dir)| canonical.starts_with(&canonical_dir));
+        if !is_within_boundary {
             continue;
         }
 
