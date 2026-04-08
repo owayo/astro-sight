@@ -592,6 +592,7 @@ fn lang_compat_group(lang: LangId) -> u8 {
         LangId::Php => 8,
         LangId::Ruby => 9,
         LangId::Bash => 10,
+        LangId::Zig => 11,
     }
 }
 

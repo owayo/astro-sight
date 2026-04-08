@@ -161,6 +161,15 @@ fn import_query(lang_id: LangId) -> (&'static str, ImportKind) {
             ImportKind::Import,
         ),
         LangId::Bash => ("", ImportKind::Import), // 非対応
+        LangId::Zig => (
+            r#"
+            (builtin_function
+              (builtin_identifier) @fn_name
+              (arguments (string) @import.source)
+              (#eq? @fn_name "@import"))
+            "#,
+            ImportKind::Import,
+        ),
         LangId::Ruby => (
             r#"
             (call

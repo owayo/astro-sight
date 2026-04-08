@@ -115,6 +115,7 @@ fn function_node_kinds(lang_id: LangId) -> &'static [&'static str] {
         LangId::CSharp => &["method_declaration", "constructor_declaration"],
         LangId::Bash => &["function_definition"],
         LangId::Ruby => &["method", "singleton_method"],
+        LangId::Zig => &["function_declaration", "test_declaration"],
     }
 }
 
@@ -242,6 +243,12 @@ fn call_query(lang_id: LangId) -> &'static str {
         LangId::Ruby => {
             r#"
             (call method: (identifier) @direct.callee)
+            "#
+        }
+        LangId::Zig => {
+            r#"
+            (call_expression function: (identifier) @direct.callee)
+            (call_expression function: (field_expression member: (identifier) @method.callee))
             "#
         }
     }

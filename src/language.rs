@@ -21,6 +21,7 @@ pub enum LangId {
     CSharp,
     Bash,
     Ruby,
+    Zig,
 }
 
 impl std::fmt::Display for LangId {
@@ -41,6 +42,7 @@ impl std::fmt::Display for LangId {
             Self::CSharp => "csharp",
             Self::Bash => "bash",
             Self::Ruby => "ruby",
+            Self::Zig => "zig",
         };
         write!(f, "{s}")
     }
@@ -81,6 +83,7 @@ impl LangId {
             "cs" => Ok(Self::CSharp),
             "sh" | "bash" | "zsh" => Ok(Self::Bash),
             "rb" | "rake" | "gemspec" => Ok(Self::Ruby),
+            "zig" | "zon" => Ok(Self::Zig),
             other => {
                 if other.is_empty() {
                     Err(AstroError::unsupported_language("<no extension>"))
@@ -141,6 +144,7 @@ impl LangId {
             Self::CSharp => Language::new(tree_sitter_c_sharp::LANGUAGE),
             Self::Bash => Language::new(tree_sitter_bash::LANGUAGE),
             Self::Ruby => Language::new(tree_sitter_ruby::LANGUAGE),
+            Self::Zig => Language::new(tree_sitter_zig::LANGUAGE),
         }
     }
 }
@@ -234,6 +238,14 @@ mod tests {
         assert_eq!(
             LangId::from_path(Utf8Path::new("app.rb")).unwrap(),
             LangId::Ruby
+        );
+    }
+
+    #[test]
+    fn detect_zig() {
+        assert_eq!(
+            LangId::from_path(Utf8Path::new("main.zig")).unwrap(),
+            LangId::Zig
         );
     }
 

@@ -289,6 +289,14 @@ fn definition_node_kinds(lang_id: LangId) -> &'static [&'static str] {
             "module",
             "assignment",
         ],
+        LangId::Zig => &[
+            "function_declaration",
+            "variable_declaration",
+            "test_declaration",
+            "struct_declaration",
+            "enum_declaration",
+            "union_declaration",
+        ],
     }
 }
 

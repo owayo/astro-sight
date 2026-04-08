@@ -146,6 +146,7 @@ pub fn is_symbol_exported(
         LangId::Rust => is_exported_rust(node),
         LangId::Go => is_exported_go(node, source),
         LangId::Java | LangId::Kotlin => is_exported_jvm(node, source),
+        LangId::Zig => is_exported_zig(node, source),
         _ => true, // 未対応言語は保守的にエクスポートと判定
     }
 }
@@ -304,6 +305,37 @@ fn is_exported_go(node: Node, source: &[u8]) -> bool {
     }
 }
 
+/// Zig: 宣言行に `pub` キーワードがあればエクスポート。
+fn is_exported_zig(node: Node, source: &[u8]) -> bool {
+    // variable_declaration / function_declaration の先頭行に "pub " があるかチェック
+    let decl = find_enclosing_declaration_zig(node);
+    let Some(decl) = decl else {
+        return true; // 保守的
+    };
+    let start = decl.start_byte();
+    // "pub " は宣言の先頭に付くため最初の20バイト程度をチェック
+    let end = (start + 20).min(source.len());
+    let prefix = &source[start..end];
+    prefix.starts_with(b"pub ")
+}
+
+/// Zig: 囲んでいる宣言ノードを探す。
+fn find_enclosing_declaration_zig(node: Node) -> Option<Node> {
+    let zig_decl_kinds = [
+        "function_declaration",
+        "variable_declaration",
+        "test_declaration",
+    ];
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if zig_decl_kinds.contains(&n.kind()) {
+            return Some(n);
+        }
+        current = n.parent();
+    }
+    None
+}
+
 /// 関数/メソッドノードの循環的複雑度を算出する（ベース1 + 分岐ノード数）。
 pub fn calculate_complexity(node: Node, lang_id: LangId) -> usize {
     let branch_kinds = branch_node_kinds(lang_id);
@@ -392,6 +424,18 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
             "while_statement",
             "do_statement",
             "catch_clause",
+        ],
+        LangId::Zig => &[
+            "if_expression",
+            "if_statement",
+            "for_expression",
+            "for_statement",
+            "while_expression",
+            "while_statement",
+            "switch_expression",
+            "switch_case",
+            "catch_expression",
+            "else_clause",
         ],
         // 汎用パターン（C, C++, Swift, Bash 等）
         _ => &[
@@ -673,6 +717,15 @@ fn symbol_query(lang_id: LangId) -> &'static str {
             (class name: (scope_resolution name: (_) @class.name))
             (module name: (constant) @module.name)
             (module name: (scope_resolution name: (_) @module.name))
+            "#
+        }
+        LangId::Zig => {
+            // Zig: 型は const X = struct/enum/union {} で定義されるため variable_declaration 経由
+            r#"
+            (function_declaration name: (identifier) @function.name)
+            (variable_declaration (identifier) @variable.name)
+            (test_declaration (identifier) @function.name)
+            (test_declaration (string) @function.name)
             "#
         }
     }
