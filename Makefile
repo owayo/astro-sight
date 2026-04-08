@@ -7,6 +7,9 @@
 BINARY_NAME := astro-sight
 INSTALL_PATH := /usr/local/bin
 
+# Homebrew binutils の ar を使用（Xcode ar は -D フラグ未対応）
+export AR := /opt/homebrew/opt/binutils/bin/ar
+
 ## Build Commands
 
 build: ## Build debug version
