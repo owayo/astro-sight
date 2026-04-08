@@ -299,6 +299,7 @@ fn run(cli: Cli) -> Result<()> {
             git,
             base,
             staged,
+            hook,
         } => cmd_review(
             &service,
             &dir,
@@ -308,6 +309,7 @@ fn run(cli: Cli) -> Result<()> {
             &base,
             staged,
             pretty,
+            hook,
         ),
         Commands::Cochange {
             dir,

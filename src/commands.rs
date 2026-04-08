@@ -693,6 +693,7 @@ pub fn cmd_review(
     base: &str,
     staged: bool,
     pretty: bool,
+    hook: bool,
 ) -> Result<()> {
     // 1. diff 取得（context コマンドと同じ入力方式）
     let diff_input = if let Some(d) = diff {
@@ -759,6 +760,10 @@ pub fn cmd_review(
         dead_symbols,
     };
 
+    if hook {
+        return review_hook_output(&result, dir);
+    }
+
     let output = serialize_output(&result, pretty)?;
     info!(
         command = "review",
@@ -768,6 +773,151 @@ pub fn cmd_review(
     );
     println!("{output}");
     Ok(())
+}
+
+/// --hook 時の review 出力: 未解決 impact / missing cochanges / API 変更 / dead symbols を stderr に表示し exit 1
+fn review_hook_output(result: &ReviewResult, dir: &str) -> Result<()> {
+    // 未解決 impact（impact --hook と同じロジック）
+    let changed_paths: std::collections::HashSet<&str> = result
+        .impact
+        .changes
+        .iter()
+        .map(|c| c.path.as_str())
+        .collect();
+    let changed_canonical: std::collections::HashSet<std::path::PathBuf> = changed_paths
+        .iter()
+        .filter_map(|cp| {
+            let abs = if std::path::Path::new(cp).is_relative() {
+                std::path::Path::new(dir).join(cp)
+            } else {
+                std::path::PathBuf::from(cp)
+            };
+            std::fs::canonicalize(&abs).ok()
+        })
+        .collect();
+    let changed_abs_strs: std::collections::HashSet<String> = changed_paths
+        .iter()
+        .map(|cp| {
+            if std::path::Path::new(cp).is_relative() {
+                std::path::Path::new(dir)
+                    .join(cp)
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                cp.to_string()
+            }
+        })
+        .collect();
+
+    let mut has_issues = false;
+
+    // 未解決 impact
+    let mut unresolved: std::collections::BTreeMap<String, Vec<(String, usize, Vec<String>)>> =
+        std::collections::BTreeMap::new();
+    for change in &result.impact.changes {
+        if change.affected_symbols.is_empty() {
+            continue;
+        }
+        for caller in &change.impacted_callers {
+            let caller_abs = if std::path::Path::new(&caller.path).is_relative() {
+                std::path::Path::new(dir)
+                    .join(&caller.path)
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                caller.path.clone()
+            };
+            let in_diff = match std::fs::canonicalize(&caller_abs) {
+                Ok(canon) => changed_canonical.contains(&canon),
+                Err(_) => changed_abs_strs.contains(&caller_abs),
+            };
+            if !in_diff {
+                unresolved.entry(change.path.clone()).or_default().push((
+                    caller.path.clone(),
+                    caller.line,
+                    caller.symbols.clone(),
+                ));
+            }
+        }
+    }
+
+    if !unresolved.is_empty() {
+        has_issues = true;
+        eprintln!("Unresolved impacts found:\n");
+        for (changed_path, callers) in &unresolved {
+            let all_symbols: std::collections::BTreeSet<&str> = callers
+                .iter()
+                .flat_map(|c| c.2.iter().map(|s| s.as_str()))
+                .collect();
+            eprintln!(
+                "{} changed [{}]:",
+                changed_path,
+                all_symbols.into_iter().collect::<Vec<_>>().join(", ")
+            );
+            for (path, line, symbols) in callers {
+                if symbols.is_empty() {
+                    eprintln!("  → {}:{}", path, line);
+                } else {
+                    eprintln!("  → {}:{} [{}]", path, line, symbols.join(", "));
+                }
+            }
+            eprintln!();
+        }
+    }
+
+    // missing cochanges
+    if !result.missing_cochanges.is_empty() {
+        has_issues = true;
+        eprintln!("Missing co-changes detected:\n");
+        for mc in &result.missing_cochanges {
+            eprintln!(
+                "  {} often changes with {} (confidence: {:.0}%)",
+                mc.file,
+                mc.expected_with,
+                mc.confidence * 100.0
+            );
+        }
+        eprintln!();
+    }
+
+    // API 変更
+    let has_api_changes = !result.api_changes.added.is_empty()
+        || !result.api_changes.removed.is_empty()
+        || !result.api_changes.modified.is_empty();
+    if has_api_changes {
+        has_issues = true;
+        eprintln!("API surface changes detected:\n");
+        for sym in &result.api_changes.removed {
+            eprintln!("  - removed: {} ({})", sym.name, sym.file);
+        }
+        for mc in &result.api_changes.modified {
+            eprintln!("  ~ modified: {} ({})", mc.name, mc.file);
+        }
+        for sym in &result.api_changes.added {
+            eprintln!("  + added: {} ({})", sym.name, sym.file);
+        }
+        eprintln!();
+    }
+
+    // dead symbols
+    if !result.dead_symbols.is_empty() {
+        has_issues = true;
+        eprintln!("Dead symbols detected:\n");
+        for ds in &result.dead_symbols {
+            eprintln!("  {} ({})", ds.name, ds.file);
+        }
+        eprintln!();
+    }
+
+    if !has_issues {
+        return Ok(());
+    }
+
+    eprintln!(
+        "IMPORTANT: If these look like false positives, you MUST run the `astro-sight-triage` skill to generate a triage report."
+    );
+
+    std::process::exit(1);
 }
 
 fn detect_missing_cochanges(
