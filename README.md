@@ -26,6 +26,7 @@
   <img src="https://img.shields.io/badge/C%23-512BD4?logo=dotnet&logoColor=white" alt="C#">
   <img src="https://img.shields.io/badge/Bash-4EAA25?logo=gnubash&logoColor=white" alt="Bash">
   <img src="https://img.shields.io/badge/Ruby-CC342D?logo=ruby&logoColor=white" alt="Ruby">
+  <img src="https://img.shields.io/badge/Zig-F7A41D?logo=zig&logoColor=white" alt="Zig">
 </p>
 
 ## Install
@@ -307,6 +308,38 @@ astro-sight review --dir . --diff-file /tmp/pr.patch
 }
 ```
 
+### dead-code - デッドコード検出
+
+エクスポートされているが参照されていないシンボルを検出する。diff 指定時は変更関連ファイルのみ、指定なしはプロジェクト全体をスキャン。
+
+```bash
+# プロジェクト全体をスキャン
+astro-sight dead-code --dir .
+
+# Rust ファイルのみスキャン
+astro-sight dead-code --dir . --glob "**/*.rs"
+
+# git diff に関連するファイルのみスキャン
+astro-sight dead-code --dir . --git
+
+# ステージ済み変更に関連するファイルのみ
+astro-sight dead-code --dir . --git --staged
+```
+
+出力例:
+```json
+{
+  "dir": "/path/to/project",
+  "scanned_files": 48,
+  "dead_symbols": [
+    { "name": "unused_helper", "kind": "function", "file": "src/utils.rs" },
+    { "name": "OldConfig", "kind": "struct", "file": "src/config.rs" }
+  ]
+}
+```
+
+同名シンボルが複数ファイルに存在する場合は誤判定防止のためスキップされる。
+
 ### doctor - 対応言語チェック
 
 ```bash
@@ -401,7 +434,7 @@ $ astro-sight ast --path nonexistent.rs
 {"error":{"code":"FILE_NOT_FOUND","message":"File not found: nonexistent.rs"}}
 ```
 
-## Supported Languages (15)
+## Supported Languages (16)
 
 | Language | Extension | Crate | Version |
 |----------|-----------|-------|---------|
@@ -420,6 +453,7 @@ $ astro-sight ast --path nonexistent.rs
 | <img src="https://img.shields.io/badge/-512BD4?logo=dotnet&logoColor=white" height="16"> C# | `.cs` | `tree-sitter-c-sharp` | 0.23 |
 | <img src="https://img.shields.io/badge/-4EAA25?logo=gnubash&logoColor=white" height="16"> Bash | `.sh`, `.bash`, `.zsh` | `tree-sitter-bash` | 0.25 |
 | <img src="https://img.shields.io/badge/-CC342D?logo=ruby&logoColor=white" height="16"> Ruby | `.rb`, `.rake`, `.gemspec` | `tree-sitter-ruby` | [owayo/tree-sitter-ruby](https://github.com/owayo/tree-sitter-ruby) |
+| <img src="https://img.shields.io/badge/-F7A41D?logo=zig&logoColor=white" height="16"> Zig | `.zig`, `.zon` | `tree-sitter-zig` | 1.1 |
 
 全言語で tree-sitter クエリによる精密なシンボル抽出に対応。
 
