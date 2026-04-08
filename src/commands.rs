@@ -954,15 +954,15 @@ pub(crate) fn detect_dead_symbols_from_files(
     // 全ファイルのエクスポートシンボルを収集
     let mut all_syms: Vec<(String, String, String)> = Vec::new(); // (name, kind, file)
     for path in files {
-        // strip_prefix を確実にするため canonicalize（削除済みファイルはスキップ）
+        // canonicalize で削除済みファイルをスキップ、dir 外のパスも除外
         let canonical_path = match std::fs::canonicalize(path) {
             Ok(p) => p,
             Err(_) => continue,
         };
-        let rel = canonical_path
-            .strip_prefix(&canonical_dir)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| canonical_path.to_string_lossy().to_string());
+        let rel = match canonical_path.strip_prefix(&canonical_dir) {
+            Ok(p) => p.to_string_lossy().to_string(),
+            Err(_) => continue, // dir 外のパスは除外（セキュリティ境界）
+        };
         if let Some(syms) = extract_exported_symbols_from_file(dir, &rel) {
             for (name, kind, _sig) in syms {
                 all_syms.push((name, kind, rel.clone()));
@@ -974,12 +974,18 @@ pub(crate) fn detect_dead_symbols_from_files(
         return Vec::new();
     }
 
+    // 同名 export が複数ファイルに存在する場合は保守的にスキップ（誤判定防止）
+    let mut name_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (name, _, _) in &all_syms {
+        *name_counts.entry(name.as_str()).or_default() += 1;
+    }
+
     // 全シンボル名をバッチ検索（O(N+S)）
-    let names: Vec<String> = all_syms.iter().map(|(name, _, _)| name.clone()).collect();
     let unique_names: Vec<String> = {
         let mut seen = HashSet::new();
-        names
-            .into_iter()
+        all_syms
+            .iter()
+            .map(|(name, _, _)| name.clone())
             .filter(|n| seen.insert(n.clone()))
             .collect()
     };
@@ -998,6 +1004,11 @@ pub(crate) fn detect_dead_symbols_from_files(
     // 定義以外の参照が0件のシンボルを dead として報告
     let mut dead = Vec::new();
     for (name, kind, file) in &all_syms {
+        // 同名 export が複数ファイルにある場合は判定不能なのでスキップ
+        if name_counts.get(name.as_str()).copied().unwrap_or(0) > 1 {
+            continue;
+        }
+
         let ref_count = batch_refs
             .get(name)
             .map(|refs| {
@@ -1146,6 +1157,11 @@ pub fn cmd_dead_code(
     pretty: bool,
 ) -> Result<()> {
     let canonical_dir = std::fs::canonicalize(dir)?;
+    if !canonical_dir.is_dir() {
+        return Err(
+            AstroError::new(ErrorCode::InvalidRequest, format!("Not a directory: {dir}")).into(),
+        );
+    }
 
     // diff 指定があれば diff 関連ファイルのみ、なければプロジェクト全体
     let has_diff = diff.is_some() || diff_file.is_some() || git;
@@ -1180,14 +1196,12 @@ pub fn cmd_dead_code(
                     .is_ok()
             })
             .collect();
-        // glob フィルタが指定されていれば適用
+        // glob フィルタが指定されていれば適用（不正パターンはエラー）
         if let Some(pattern) = glob {
             let mut ob = ignore::overrides::OverrideBuilder::new(&canonical_dir);
-            if ob.add(pattern).is_ok()
-                && let Ok(overrides) = ob.build()
-            {
-                files.retain(|p| overrides.matched(p, false).is_whitelist());
-            }
+            ob.add(pattern)?;
+            let overrides = ob.build()?;
+            files.retain(|p| overrides.matched(p, false).is_whitelist());
         }
         files
     } else {
