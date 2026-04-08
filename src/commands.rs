@@ -1183,10 +1183,10 @@ pub fn cmd_dead_code(
         // glob フィルタが指定されていれば適用
         if let Some(pattern) = glob {
             let mut ob = ignore::overrides::OverrideBuilder::new(&canonical_dir);
-            if ob.add(pattern).is_ok() {
-                if let Ok(overrides) = ob.build() {
-                    files.retain(|p| overrides.matched(p, false).is_whitelist());
-                }
+            if ob.add(pattern).is_ok()
+                && let Ok(overrides) = ob.build()
+            {
+                files.retain(|p| overrides.matched(p, false).is_whitelist());
             }
         }
         files
