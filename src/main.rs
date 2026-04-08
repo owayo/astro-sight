@@ -5,8 +5,8 @@ use tracing::info;
 use astro_sight::cli::{Cli, Commands};
 use astro_sight::commands::{
     self, CmdAstOpts, batch_ast, batch_calls, batch_imports, batch_lint, batch_sequence,
-    batch_symbols, cmd_ast, cmd_calls, cmd_cochange, cmd_context, cmd_doctor, cmd_impact,
-    cmd_imports, cmd_lint, cmd_mcp, cmd_refs, cmd_refs_batch, cmd_review, cmd_sequence,
+    batch_symbols, cmd_ast, cmd_calls, cmd_cochange, cmd_context, cmd_dead_code, cmd_doctor,
+    cmd_impact, cmd_imports, cmd_lint, cmd_mcp, cmd_refs, cmd_refs_batch, cmd_review, cmd_sequence,
     cmd_session, cmd_symbols, cmd_symbols_dir,
 };
 use astro_sight::config::ConfigService;
@@ -346,6 +346,25 @@ fn run(cli: Cli) -> Result<()> {
             staged,
             hook,
         } => cmd_impact(&service, &dir, git, &base, staged, hook),
+        Commands::DeadCode {
+            dir,
+            glob,
+            diff,
+            diff_file,
+            git,
+            base,
+            staged,
+        } => cmd_dead_code(
+            &service,
+            &dir,
+            glob.as_deref(),
+            diff.as_deref(),
+            diff_file.as_deref(),
+            git,
+            &base,
+            staged,
+            pretty,
+        ),
         Commands::Doctor => cmd_doctor(pretty),
         Commands::Session => cmd_session(),
         Commands::Mcp => cmd_mcp(),

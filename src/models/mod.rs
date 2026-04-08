@@ -1,6 +1,7 @@
 pub mod ast_node;
 pub mod call;
 pub mod cochange;
+pub mod dead_code;
 pub mod diagnostic;
 pub mod impact;
 pub mod import;

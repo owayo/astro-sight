@@ -302,6 +302,37 @@ pub enum Commands {
         staged: bool,
     },
 
+    /// Detect dead (unreferenced) exported symbols
+    DeadCode {
+        /// Workspace / project root directory
+        #[arg(short, long, default_value = ".")]
+        dir: String,
+
+        /// Glob pattern to filter files (e.g. "**/*.rs")
+        #[arg(short, long)]
+        glob: Option<String>,
+
+        /// Inline diff string (limit scan to diff-related files only)
+        #[arg(long)]
+        diff: Option<String>,
+
+        /// Path to a diff file (limit scan to diff-related files only)
+        #[arg(long, conflicts_with = "diff")]
+        diff_file: Option<String>,
+
+        /// Auto-run git diff (limit scan to diff-related files only)
+        #[arg(long, conflicts_with_all = ["diff", "diff_file"])]
+        git: bool,
+
+        /// Base ref for git diff (default: HEAD)
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+
+        /// Use staged changes (git diff --cached)
+        #[arg(long)]
+        staged: bool,
+    },
+
     /// Check tool availability and language support
     Doctor,
 

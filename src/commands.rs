@@ -8,6 +8,7 @@ use crate::cache::store::CacheStore;
 use crate::doctor;
 use crate::engine::parser;
 use crate::error::{AstroError, ErrorCode};
+use crate::models::dead_code::DeadCodeResult;
 use crate::models::review::{
     ApiChanges, ApiSymbol, ApiSymbolChange, DeadSymbol, MissingCochange, ReviewResult,
 };
@@ -926,15 +927,45 @@ fn detect_dead_symbols(
     dir: &str,
     diff_files: &[crate::models::impact::DiffFile],
 ) -> Vec<DeadSymbol> {
+    let Ok(canonical_dir) = std::fs::canonicalize(dir) else {
+        return Vec::new();
+    };
+    let files: Vec<std::path::PathBuf> = diff_files
+        .iter()
+        .filter(|f| f.new_path != "/dev/null")
+        .map(|f| canonical_dir.join(&f.new_path))
+        .collect();
+    detect_dead_symbols_from_files(service, dir, &files, None)
+}
+
+/// ファイルリストからエクスポートシンボルを収集し、参照ゼロのシンボルを返す。
+/// dead-code コマンドと review コマンドの共通コアロジック。
+pub(crate) fn detect_dead_symbols_from_files(
+    service: &AppService,
+    dir: &str,
+    files: &[std::path::PathBuf],
+    glob: Option<&str>,
+) -> Vec<DeadSymbol> {
+    let canonical_dir = match std::fs::canonicalize(dir) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+
     // 全ファイルのエクスポートシンボルを収集
     let mut all_syms: Vec<(String, String, String)> = Vec::new(); // (name, kind, file)
-    for df in diff_files {
-        if df.new_path == "/dev/null" {
-            continue;
-        }
-        if let Some(syms) = extract_exported_symbols_from_file(dir, &df.new_path) {
+    for path in files {
+        // strip_prefix を確実にするため canonicalize（削除済みファイルはスキップ）
+        let canonical_path = match std::fs::canonicalize(path) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let rel = canonical_path
+            .strip_prefix(&canonical_dir)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| canonical_path.to_string_lossy().to_string());
+        if let Some(syms) = extract_exported_symbols_from_file(dir, &rel) {
             for (name, kind, _sig) in syms {
-                all_syms.push((name, kind, df.new_path.clone()));
+                all_syms.push((name, kind, rel.clone()));
             }
         }
     }
@@ -953,7 +984,7 @@ fn detect_dead_symbols(
             .collect()
     };
 
-    let batch_refs = match service.find_references_batch(&unique_names, dir, None) {
+    let batch_refs = match service.find_references_batch(&unique_names, dir, glob) {
         Ok(results) => {
             let mut map = std::collections::HashMap::new();
             for result in results {
@@ -1096,6 +1127,92 @@ fn filter_exported_symbols(
         ));
     }
     result
+}
+
+// ---------------------------------------------------------------------------
+// Dead-code コマンド: diff 関連 or プロジェクト全体のデッドコード検出
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_dead_code(
+    service: &AppService,
+    dir: &str,
+    glob: Option<&str>,
+    diff: Option<&str>,
+    diff_file: Option<&str>,
+    git: bool,
+    base: &str,
+    staged: bool,
+    pretty: bool,
+) -> Result<()> {
+    let canonical_dir = std::fs::canonicalize(dir)?;
+
+    // diff 指定があれば diff 関連ファイルのみ、なければプロジェクト全体
+    let has_diff = diff.is_some() || diff_file.is_some() || git;
+    let files: Vec<std::path::PathBuf> = if has_diff {
+        let diff_input = if let Some(d) = diff {
+            d.to_string()
+        } else if let Some(df) = diff_file {
+            read_file_to_string_limited(df, MAX_INPUT_SIZE)?
+        } else {
+            run_git_diff(dir, base, staged)?
+        };
+
+        if diff_input.trim().is_empty() {
+            let result = DeadCodeResult {
+                dir: canonical_dir.to_string_lossy().to_string(),
+                scanned_files: 0,
+                dead_symbols: Vec::new(),
+            };
+            let output = serialize_output(&result, pretty)?;
+            println!("{output}");
+            return Ok(());
+        }
+
+        let diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
+        let mut files: Vec<std::path::PathBuf> = diff_files
+            .iter()
+            .filter(|f| f.new_path != "/dev/null")
+            .map(|f| canonical_dir.join(&f.new_path))
+            .filter(|p| {
+                // パース可能な言語のファイルのみ対象
+                crate::language::LangId::from_path(camino::Utf8Path::new(p.to_str().unwrap_or("")))
+                    .is_ok()
+            })
+            .collect();
+        // glob フィルタが指定されていれば適用
+        if let Some(pattern) = glob {
+            let mut ob = ignore::overrides::OverrideBuilder::new(&canonical_dir);
+            if ob.add(pattern).is_ok() {
+                if let Ok(overrides) = ob.build() {
+                    files.retain(|p| overrides.matched(p, false).is_whitelist());
+                }
+            }
+        }
+        files
+    } else {
+        crate::engine::refs::collect_files(&canonical_dir, glob)?
+    };
+
+    let scanned_files = files.len();
+    let dead_symbols = detect_dead_symbols_from_files(service, dir, &files, glob);
+
+    let result = DeadCodeResult {
+        dir: canonical_dir.to_string_lossy().to_string(),
+        scanned_files,
+        dead_symbols,
+    };
+
+    let output = serialize_output(&result, pretty)?;
+    info!(
+        command = "dead-code",
+        dir = dir,
+        scanned_files = scanned_files,
+        dead_count = result.dead_symbols.len(),
+        "command completed"
+    );
+    println!("{output}");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

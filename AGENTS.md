@@ -27,7 +27,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/skill.rs` - スキルインストール（`skill-install claude/codex` → ~/.claude/skills/ or ~/.codex/skills/）
 - `src/config.rs` - 設定ファイル管理（ConfigService: load/generate、TOML 形式）
 - `src/logger.rs` - ロギング（logroller 日次ローテーション、3日保持、tracing-subscriber）
-- `src/cli.rs` - CLI サブコマンド定義（ast, symbols, calls, refs, context, impact, review, imports, lint, sequence, cochange, doctor, session, mcp, init）
+- `src/cli.rs` - CLI サブコマンド定義（ast, symbols, calls, refs, context, impact, review, dead-code, imports, lint, sequence, cochange, doctor, session, mcp, init）
 - `src/main.rs` - コマンドディスパッチ、キャッシュ層、バッチ処理（全て AppService 経由）
 - `src/mcp/mod.rs` - MCP サーバー（AstroSightServer + AppService::sandboxed(cwd) + 11 ツール、fail-closed: sandbox 生成失敗時はパニック）
 - `src/engine/parser.rs` - tree-sitter パーサー管理（100MB ファイルサイズ上限、SourceBuf によるゼロコピー mmap）
@@ -42,7 +42,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/engine/lint.rs` - YAML ルールによる AST パターンマッチ（tree-sitter クエリ + テキストパターン）
 - `src/engine/cochange.rs` - git log から共変更ファイルペアを検出（confidence スコア付き、100ファイル超のコミットはスキップ）
 - `src/engine/snippet.rs` - コンテキストスニペット生成
-- `src/models/` - Request/Response/AST ノード/Call/Reference/Impact/Sequence/Import/Lint/CoChange 型定義
+- `src/models/` - Request/Response/AST ノード/Call/Reference/Impact/Sequence/Import/Lint/CoChange/DeadCode 型定義
 - `src/error.rs` - AstroError + ErrorCode（PathOutOfBounds 含む）
 - `src/cache/store.rs` - content-addressed キャッシュ（~/.cache/astro-sight/）
 - `src/session/mod.rs` - NDJSON セッション処理（生行サイズで100MB上限、空文字・非 UTF-8 を含む `ASTRO_SIGHT_WORKSPACE` の不正値は fail-closed）
