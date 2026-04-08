@@ -24,6 +24,8 @@ description: "STOP before using Grep for code identifiers (including pipe-separa
 - Need to find **files that usually change together**? → `astro-sight cochange`
 - Want a **structured one-shot review** of a diff (impact + missing cochanges + API surface diff + dead symbols)? → `astro-sight review`
 - Need to review an **external patch or rename-aware diff file**? → `astro-sight review --dir . --diff-file <patch>`
+- Need to find **dead (unreferenced) exported symbols**? → `astro-sight dead-code --dir .`
+- Need to find **dead code related to a diff**? → `astro-sight dead-code --dir . --git`
 
 **Grep is fine for**: error messages, config values, TODO comments, file path patterns — anything that is NOT a code identifier.
 
@@ -66,6 +68,12 @@ astro-sight cochange --dir . --file src/service.rs
 
 # 12. Repeated AST/text checks
 astro-sight lint --path <file> --rules rules.yaml
+
+# 13. Find dead (unreferenced) exported symbols
+astro-sight dead-code --dir .
+
+# 14. Find dead code related to a diff
+astro-sight dead-code --dir . --git
 ```
 
 ## Low-Adoption But Useful
@@ -248,6 +256,26 @@ Lint with custom YAML rules (tree-sitter query or text pattern).
 astro-sight lint --path <file> --rules rules.yaml
 ```
 
+### `dead-code` — Dead Code Detection
+
+Finds exported symbols with zero non-definition references. With diff flags, limits scan to diff-related files; without diff, scans the entire project.
+
+```bash
+# Full project scan
+astro-sight dead-code --dir .
+
+# Rust files only
+astro-sight dead-code --dir . --glob "**/*.rs"
+
+# Diff-related files only (git diff)
+astro-sight dead-code --dir . --git
+
+# Staged changes only
+astro-sight dead-code --dir . --git --staged
+```
+
+Output: JSON with `dir`, `scanned_files` (count), `dead_symbols` array (`name`, `kind`, `file`). Symbols with duplicate names across files are conservatively skipped.
+
 ### `session` — NDJSON Batch Mode
 
 For multiple queries in one process (avoids repeated startup):
@@ -320,9 +348,19 @@ astro-sight lint --path src/main.rs --rules rules.yaml
 astro-sight review --dir . --git
 ```
 
+### "Find unused exported symbols in the project"
+```bash
+astro-sight dead-code --dir .
+```
+
+### "Are there dead symbols related to my changes?"
+```bash
+astro-sight dead-code --dir . --git
+```
+
 ## Notes
 
-- 15 languages: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby
+- 16 languages: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby, Zig
 - All output is compact JSON by default (short keys: `lang`, `ln`, `col`, `ctx`, `refs`, `src`, `def`/`ref`, `fn` etc.)
 - Use `--pretty` (global flag) for human-readable formatted JSON output
 - `refs` results include `ctx` (source line) — no need to Read files afterward
