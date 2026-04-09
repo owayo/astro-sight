@@ -775,9 +775,9 @@ pub fn cmd_review(
     Ok(())
 }
 
-/// --hook 時の review 出力: 未解決 impact / missing cochanges / API 変更 / dead symbols を stderr に表示し exit 1
+/// --hook 時の review 出力: compact JSON を stderr に出力し exit 1
 fn review_hook_output(result: &ReviewResult, dir: &str) -> Result<()> {
-    // 未解決 impact（impact --hook と同じロジック）
+    // 未解決 impact を収集
     let changed_paths: std::collections::HashSet<&str> = result
         .impact
         .changes
@@ -809,9 +809,6 @@ fn review_hook_output(result: &ReviewResult, dir: &str) -> Result<()> {
         })
         .collect();
 
-    let mut has_issues = false;
-
-    // 未解決 impact
     let mut unresolved: std::collections::BTreeMap<String, Vec<(String, usize, Vec<String>)>> =
         std::collections::BTreeMap::new();
     for change in &result.impact.changes {
@@ -841,82 +838,136 @@ fn review_hook_output(result: &ReviewResult, dir: &str) -> Result<()> {
         }
     }
 
+    // 空セクションは省略した compact JSON を構築
+    let mut hook_obj = serde_json::Map::new();
+    let mut has_issues = false;
+
+    // impacts: [{src,syms,refs:[{p,ln,s}]}]
     if !unresolved.is_empty() {
         has_issues = true;
-        eprintln!("Unresolved impacts found:\n");
-        for (changed_path, callers) in &unresolved {
-            let all_symbols: std::collections::BTreeSet<&str> = callers
-                .iter()
-                .flat_map(|c| c.2.iter().map(|s| s.as_str()))
-                .collect();
-            eprintln!(
-                "{} changed [{}]:",
-                changed_path,
-                all_symbols.into_iter().collect::<Vec<_>>().join(", ")
-            );
-            for (path, line, symbols) in callers {
-                if symbols.is_empty() {
-                    eprintln!("  → {}:{}", path, line);
-                } else {
-                    eprintln!("  → {}:{} [{}]", path, line, symbols.join(", "));
-                }
-            }
-            eprintln!();
-        }
+        let impacts: Vec<serde_json::Value> = unresolved
+            .iter()
+            .map(|(changed_path, callers)| {
+                let all_syms: std::collections::BTreeSet<&str> = callers
+                    .iter()
+                    .flat_map(|c| c.2.iter().map(|s| s.as_str()))
+                    .collect();
+                let refs: Vec<serde_json::Value> = callers
+                    .iter()
+                    .map(|(p, ln, s)| {
+                        let mut r = serde_json::Map::new();
+                        r.insert("p".into(), serde_json::Value::String(p.clone()));
+                        r.insert("ln".into(), serde_json::json!(*ln));
+                        if !s.is_empty() {
+                            r.insert(
+                                "s".into(),
+                                serde_json::Value::Array(
+                                    s.iter()
+                                        .map(|v| serde_json::Value::String(v.clone()))
+                                        .collect(),
+                                ),
+                            );
+                        }
+                        serde_json::Value::Object(r)
+                    })
+                    .collect();
+                serde_json::json!({
+                    "src": changed_path,
+                    "syms": all_syms.into_iter().collect::<Vec<_>>(),
+                    "refs": refs,
+                })
+            })
+            .collect();
+        hook_obj.insert("impacts".into(), serde_json::Value::Array(impacts));
     }
 
-    // missing cochanges
+    // cochange: [{f,w,c}]
     if !result.missing_cochanges.is_empty() {
         has_issues = true;
-        eprintln!("Missing co-changes detected:\n");
-        for mc in &result.missing_cochanges {
-            eprintln!(
-                "  {} often changes with {} (confidence: {:.0}%)",
-                mc.file,
-                mc.expected_with,
-                mc.confidence * 100.0
-            );
-        }
-        eprintln!();
+        let cochanges: Vec<serde_json::Value> = result
+            .missing_cochanges
+            .iter()
+            .map(|mc| {
+                serde_json::json!({
+                    "f": mc.file,
+                    "w": mc.expected_with,
+                    "c": (mc.confidence * 100.0).round() as u32,
+                })
+            })
+            .collect();
+        hook_obj.insert("cochange".into(), serde_json::Value::Array(cochanges));
     }
 
-    // API 変更
+    // api: {add,rm,mod} — 空でないセクションのみ
     let has_api_changes = !result.api_changes.added.is_empty()
         || !result.api_changes.removed.is_empty()
         || !result.api_changes.modified.is_empty();
     if has_api_changes {
         has_issues = true;
-        eprintln!("API surface changes detected:\n");
-        for sym in &result.api_changes.removed {
-            eprintln!("  - removed: {} ({})", sym.name, sym.file);
+        let mut api = serde_json::Map::new();
+        if !result.api_changes.added.is_empty() {
+            api.insert(
+                "add".into(),
+                serde_json::Value::Array(
+                    result
+                        .api_changes
+                        .added
+                        .iter()
+                        .map(|s| serde_json::json!({"n": s.name, "f": s.file}))
+                        .collect(),
+                ),
+            );
         }
-        for mc in &result.api_changes.modified {
-            eprintln!("  ~ modified: {} ({})", mc.name, mc.file);
+        if !result.api_changes.removed.is_empty() {
+            api.insert(
+                "rm".into(),
+                serde_json::Value::Array(
+                    result
+                        .api_changes
+                        .removed
+                        .iter()
+                        .map(|s| serde_json::json!({"n": s.name, "f": s.file}))
+                        .collect(),
+                ),
+            );
         }
-        for sym in &result.api_changes.added {
-            eprintln!("  + added: {} ({})", sym.name, sym.file);
+        if !result.api_changes.modified.is_empty() {
+            api.insert(
+                "mod".into(),
+                serde_json::Value::Array(
+                    result
+                        .api_changes
+                        .modified
+                        .iter()
+                        .map(|m| serde_json::json!({"n": m.name, "f": m.file}))
+                        .collect(),
+                ),
+            );
         }
-        eprintln!();
+        hook_obj.insert("api".into(), serde_json::Value::Object(api));
     }
 
-    // dead symbols
+    // dead: [{n,f}]
     if !result.dead_symbols.is_empty() {
         has_issues = true;
-        eprintln!("Dead symbols detected:\n");
-        for ds in &result.dead_symbols {
-            eprintln!("  {} ({})", ds.name, ds.file);
-        }
-        eprintln!();
+        let dead: Vec<serde_json::Value> = result
+            .dead_symbols
+            .iter()
+            .map(|ds| serde_json::json!({"n": ds.name, "f": ds.file}))
+            .collect();
+        hook_obj.insert("dead".into(), serde_json::Value::Array(dead));
     }
 
     if !has_issues {
         return Ok(());
     }
 
-    eprintln!(
-        "IMPORTANT: If these look like false positives, you MUST run the `astro-sight-triage` skill to generate a triage report."
+    hook_obj.insert(
+        "hint".into(),
+        serde_json::Value::String("False positives? Run astro-sight-triage skill.".into()),
     );
 
+    eprintln!("{}", serde_json::Value::Object(hook_obj));
     std::process::exit(1);
 }
 
