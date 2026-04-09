@@ -708,18 +708,11 @@ pub fn cmd_review(
     };
 
     if diff_input.trim().is_empty() {
-        let result = ReviewResult {
-            impact: crate::models::impact::ContextResult {
-                changes: Vec::new(),
-            },
-            missing_cochanges: Vec::new(),
-            api_changes: ApiChanges {
-                added: Vec::new(),
-                removed: Vec::new(),
-                modified: Vec::new(),
-            },
-            dead_symbols: Vec::new(),
-        };
+        if hook {
+            return Ok(());
+        }
+
+        let result = empty_review_result();
         let output = serialize_output(&result, pretty)?;
         println!("{output}");
         return Ok(());
@@ -775,8 +768,28 @@ pub fn cmd_review(
     Ok(())
 }
 
-/// --hook 時の review 出力: compact JSON を stderr に出力し exit 1
-fn review_hook_output(result: &ReviewResult, dir: &str) -> Result<()> {
+fn empty_review_result() -> ReviewResult {
+    ReviewResult {
+        impact: crate::models::impact::ContextResult {
+            changes: Vec::new(),
+        },
+        missing_cochanges: Vec::new(),
+        api_changes: ApiChanges {
+            added: Vec::new(),
+            removed: Vec::new(),
+            modified: Vec::new(),
+        },
+        dead_symbols: Vec::new(),
+    }
+}
+
+fn build_review_hook_json(result: &ReviewResult, dir: &str) -> Option<serde_json::Value> {
+    #[derive(Default)]
+    struct HookImpactGroup {
+        changed_symbols: std::collections::BTreeSet<String>,
+        refs: Vec<(String, usize, Vec<String>)>,
+    }
+
     // 未解決 impact を収集
     let changed_paths: std::collections::HashSet<&str> = result
         .impact
@@ -809,7 +822,7 @@ fn review_hook_output(result: &ReviewResult, dir: &str) -> Result<()> {
         })
         .collect();
 
-    let mut unresolved: std::collections::BTreeMap<String, Vec<(String, usize, Vec<String>)>> =
+    let mut unresolved: std::collections::BTreeMap<String, HookImpactGroup> =
         std::collections::BTreeMap::new();
     for change in &result.impact.changes {
         if change.affected_symbols.is_empty() {
@@ -829,11 +842,16 @@ fn review_hook_output(result: &ReviewResult, dir: &str) -> Result<()> {
                 Err(_) => changed_abs_strs.contains(&caller_abs),
             };
             if !in_diff {
-                unresolved.entry(change.path.clone()).or_default().push((
-                    caller.path.clone(),
-                    caller.line,
-                    caller.symbols.clone(),
-                ));
+                let entry = unresolved.entry(change.path.clone()).or_default();
+                entry.changed_symbols.extend(
+                    change
+                        .affected_symbols
+                        .iter()
+                        .map(|symbol| symbol.name.clone()),
+                );
+                entry
+                    .refs
+                    .push((caller.path.clone(), caller.line, caller.symbols.clone()));
             }
         }
     }
@@ -847,12 +865,9 @@ fn review_hook_output(result: &ReviewResult, dir: &str) -> Result<()> {
         has_issues = true;
         let impacts: Vec<serde_json::Value> = unresolved
             .iter()
-            .map(|(changed_path, callers)| {
-                let all_syms: std::collections::BTreeSet<&str> = callers
-                    .iter()
-                    .flat_map(|c| c.2.iter().map(|s| s.as_str()))
-                    .collect();
-                let refs: Vec<serde_json::Value> = callers
+            .map(|(changed_path, group)| {
+                let refs: Vec<serde_json::Value> = group
+                    .refs
                     .iter()
                     .map(|(p, ln, s)| {
                         let mut r = serde_json::Map::new();
@@ -873,7 +888,7 @@ fn review_hook_output(result: &ReviewResult, dir: &str) -> Result<()> {
                     .collect();
                 serde_json::json!({
                     "src": changed_path,
-                    "syms": all_syms.into_iter().collect::<Vec<_>>(),
+                    "syms": group.changed_symbols.iter().collect::<Vec<_>>(),
                     "refs": refs,
                 })
             })
@@ -959,7 +974,7 @@ fn review_hook_output(result: &ReviewResult, dir: &str) -> Result<()> {
     }
 
     if !has_issues {
-        return Ok(());
+        return None;
     }
 
     hook_obj.insert(
@@ -967,7 +982,16 @@ fn review_hook_output(result: &ReviewResult, dir: &str) -> Result<()> {
         serde_json::Value::String("False positives? Run astro-sight-triage skill.".into()),
     );
 
-    eprintln!("{}", serde_json::Value::Object(hook_obj));
+    Some(serde_json::Value::Object(hook_obj))
+}
+
+/// --hook 時の review 出力: compact JSON を stderr に出力し exit 1
+fn review_hook_output(result: &ReviewResult, dir: &str) -> Result<()> {
+    let Some(hook_output) = build_review_hook_json(result, dir) else {
+        return Ok(());
+    };
+
+    eprintln!("{hook_output}");
     std::process::exit(1);
 }
 
@@ -1772,5 +1796,66 @@ mod tests {
                         == Some("pub fn greet(name: &str) -> i32 {")),
             "rename を含む差分でも関数シグネチャ変更を検出するべき"
         );
+    }
+
+    #[test]
+    fn build_review_hook_json_returns_none_when_no_issues() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        assert!(
+            build_review_hook_json(
+                &empty_review_result(),
+                dir.path().to_str().expect("utf-8 path")
+            )
+            .is_none(),
+            "問題がない review 結果では hook JSON を生成しないべき"
+        );
+    }
+
+    #[test]
+    fn build_review_hook_json_uses_changed_symbols_in_summary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        fs::write(src_dir.join("lib.rs"), "pub fn compute() {}\n").expect("write changed file");
+        fs::write(src_dir.join("main.rs"), "fn main() { compute(); }\n").expect("write caller");
+
+        let result = ReviewResult {
+            impact: crate::models::impact::ContextResult {
+                changes: vec![crate::models::impact::FileImpact {
+                    path: "src/lib.rs".to_string(),
+                    hunks: Vec::new(),
+                    affected_symbols: vec![crate::models::impact::AffectedSymbol {
+                        name: "compute".to_string(),
+                        kind: "function".to_string(),
+                        change_type: "modified".to_string(),
+                    }],
+                    signature_changes: Vec::new(),
+                    impacted_callers: vec![crate::models::impact::ImpactedCaller {
+                        path: "src/main.rs".to_string(),
+                        name: "main".to_string(),
+                        line: 1,
+                        symbols: vec!["main".to_string()],
+                    }],
+                }],
+            },
+            missing_cochanges: Vec::new(),
+            api_changes: ApiChanges {
+                added: Vec::new(),
+                removed: Vec::new(),
+                modified: Vec::new(),
+            },
+            dead_symbols: Vec::new(),
+        };
+
+        let hook_json = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"))
+            .expect("hook json should be generated");
+        let impacts = hook_json["impacts"]
+            .as_array()
+            .expect("impacts should be an array");
+        assert_eq!(impacts.len(), 1);
+        assert_eq!(impacts[0]["src"], "src/lib.rs");
+        assert_eq!(impacts[0]["syms"], serde_json::json!(["compute"]));
+        assert_eq!(impacts[0]["refs"][0]["s"], serde_json::json!(["main"]));
     }
 }
