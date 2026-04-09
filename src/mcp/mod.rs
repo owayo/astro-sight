@@ -423,3 +423,11 @@ impl ServerHandler for AstroSightServer {
         ))
     }
 }
+
+impl AstroSightServer {
+    /// Router でラップして tools/list・tools/call を有効化する
+    pub fn into_router(self) -> rmcp::handler::server::router::Router<Self> {
+        let tool_router = Self::tool_router();
+        rmcp::handler::server::router::Router::new(self).with_tools(tool_router)
+    }
+}

@@ -666,8 +666,9 @@ pub fn cmd_mcp() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let server = crate::mcp::AstroSightServer::new();
+        let router = server.into_router();
         let transport = rmcp::transport::io::stdio();
-        let service = server
+        let service = router
             .serve(transport)
             .await
             .map_err(|e| anyhow::anyhow!("MCP server initialization failed: {e}"))?;

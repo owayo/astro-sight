@@ -342,7 +342,7 @@ pub fn calculate_complexity(node: Node, lang_id: LangId) -> usize {
     let branch_kinds = branch_node_kinds(lang_id);
     let func_kinds = function_boundary_kinds(lang_id);
     let mut count = 1; // ベース複雑度
-    count_branch_nodes(node, branch_kinds, &func_kinds, true, &mut count);
+    count_branch_nodes(node, branch_kinds, func_kinds, true, &mut count);
     count
 }
 
@@ -370,29 +370,31 @@ fn count_branch_nodes(
 }
 
 /// 関数境界を示すノード種別を返す（ネスト関数検出用）。
-fn function_boundary_kinds(lang_id: LangId) -> Vec<&'static str> {
+/// 言語別の関数境界ノード種別を返す。
+/// 静的スライスを返すことで毎回の Vec アロケーションを回避する。
+fn function_boundary_kinds(lang_id: LangId) -> &'static [&'static str] {
     match lang_id {
-        LangId::Rust => vec!["function_item", "closure_expression"],
-        LangId::Javascript | LangId::Typescript | LangId::Tsx => vec![
+        LangId::Rust => &["function_item", "closure_expression"],
+        LangId::Javascript | LangId::Typescript | LangId::Tsx => &[
             "function_declaration",
             "function_expression",
             "arrow_function",
             "method_definition",
             "generator_function_declaration",
         ],
-        LangId::Python => vec!["function_definition", "lambda"],
-        LangId::Go => vec!["function_declaration", "method_declaration", "func_literal"],
-        LangId::Java => vec!["method_declaration", "lambda_expression"],
-        LangId::Kotlin => vec!["function_declaration", "lambda_literal"],
-        LangId::Swift => vec!["function_declaration", "lambda_literal"],
-        LangId::CSharp => vec!["method_declaration", "lambda_expression"],
-        LangId::Php => vec![
+        LangId::Python => &["function_definition", "lambda"],
+        LangId::Go => &["function_declaration", "method_declaration", "func_literal"],
+        LangId::Java => &["method_declaration", "lambda_expression"],
+        LangId::Kotlin => &["function_declaration", "lambda_literal"],
+        LangId::Swift => &["function_declaration", "lambda_literal"],
+        LangId::CSharp => &["method_declaration", "lambda_expression"],
+        LangId::Php => &[
             "function_definition",
             "method_declaration",
             "anonymous_function_creation_expression",
         ],
-        LangId::Ruby => vec!["method", "singleton_method", "lambda", "block"],
-        _ => vec![],
+        LangId::Ruby => &["method", "singleton_method", "lambda", "block"],
+        _ => &[],
     }
 }
 
