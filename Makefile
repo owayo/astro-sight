@@ -11,6 +11,12 @@ INSTALL_PATH := /usr/local/bin
 # 8-byte alignment を厳格にチェックし tree-sitter-kotlin がリンク失敗する）
 export RUSTFLAGS ?= -C link-arg=-Wl,-ld_classic
 
+# macOS: GNU ar を使用（Xcode の ar は -D フラグ非対応で warning が出る）
+AR_GNU := $(wildcard /opt/homebrew/opt/binutils/bin/ar)
+ifdef AR_GNU
+export AR := $(AR_GNU)
+endif
+
 ## Build Commands
 
 build: ## Build debug version
