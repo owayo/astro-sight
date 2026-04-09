@@ -676,6 +676,142 @@ fn mcp_initialize() {
     assert!(json["result"]["capabilities"]["tools"].is_object());
 }
 
+/// MCP テスト用ヘルパー: initialize + initialized 後に追加メッセージを送信し、stdout を返す
+fn mcp_send_after_init(extra_messages: &[&str]) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn mcp");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+
+    // 別スレッドで stdout を最後まで読み取る
+    let reader_handle = std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        let mut lines = Vec::new();
+        for line in reader.lines() {
+            match line {
+                Ok(l) => lines.push(l),
+                Err(_) => break,
+            }
+        }
+        lines
+    });
+
+    // initialize 送信
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"test","version":"1.0"}}}}}}"#
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    // サーバーが initialize を処理する時間を確保
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // initialized 通知 + 追加メッセージを送信
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
+    )
+    .unwrap();
+    for msg in extra_messages {
+        writeln!(stdin, "{msg}").unwrap();
+    }
+    stdin.flush().unwrap();
+    drop(stdin);
+
+    let _ = child.wait();
+    let lines = reader_handle.join().expect("reader thread panicked");
+    lines.join("\n")
+}
+
+#[test]
+fn mcp_tools_list() {
+    let stdout = mcp_send_after_init(&[r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#]);
+
+    let tools_line = stdout
+        .lines()
+        .find(|l| l.contains("\"id\":2"))
+        .expect("tools/list レスポンスが必要");
+    let json: serde_json::Value = serde_json::from_str(tools_line).expect("valid JSON-RPC");
+    let tools = json["result"]["tools"]
+        .as_array()
+        .expect("tools 配列が必要");
+    assert!(
+        tools.len() >= 11,
+        "11ツール以上が必要、実際: {}",
+        tools.len()
+    );
+    let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    for expected in [
+        "ast_extract",
+        "symbols_extract",
+        "calls_extract",
+        "refs_search",
+        "refs_batch_search",
+        "context_analyze",
+        "imports_extract",
+        "lint",
+        "sequence_diagram",
+        "cochange_analyze",
+        "doctor",
+    ] {
+        assert!(
+            tool_names.contains(&expected),
+            "ツール '{expected}' が tools/list に含まれるべき"
+        );
+    }
+}
+
+#[test]
+fn mcp_tools_call_symbols() {
+    let stdout = mcp_send_after_init(&[
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"symbols_extract","arguments":{"path":"tests/fixtures/sample.py"}}}"#,
+    ]);
+
+    let result_line = stdout
+        .lines()
+        .find(|l| l.contains("\"id\":2"))
+        .expect("tools/call レスポンスが必要");
+    let json: serde_json::Value = serde_json::from_str(result_line).expect("valid JSON-RPC");
+    let content = json["result"]["content"]
+        .as_array()
+        .expect("content 配列が必要");
+    assert!(!content.is_empty(), "content が空であってはならない");
+    let text = content[0]["text"].as_str().expect("text フィールドが必要");
+    let symbols: serde_json::Value =
+        serde_json::from_str(text).expect("symbols JSON がパース可能であるべき");
+    assert!(
+        symbols["symbols"].as_array().is_some(),
+        "symbols 配列が必要"
+    );
+}
+
+#[test]
+fn mcp_tools_call_path_traversal() {
+    let stdout = mcp_send_after_init(&[
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"symbols_extract","arguments":{"path":"/etc/hosts"}}}"#,
+    ]);
+
+    let result_line = stdout
+        .lines()
+        .find(|l| l.contains("\"id\":2"))
+        .expect("エラーレスポンスが必要");
+    let json: serde_json::Value = serde_json::from_str(result_line).expect("valid JSON-RPC");
+    assert!(
+        json["error"].is_object(),
+        "パストラバーサルはエラーを返すべき: {json}"
+    );
+}
+
 // ---- フェーズ 2: セキュリティテスト ----
 
 #[test]
