@@ -352,12 +352,13 @@ fn should_include_for_cross_file(
 
 /// cross-file 参照が影響を受ける呼び出し元として関連するか判定する。
 ///
-/// 5段階のフィルタを適用する：
+/// 6段階のフィルタを適用する：
 /// 1. 定義をスキップ（呼び出し箇所の参照のみが対象）
 /// 2. 同一ファイルの参照をスキップ
 /// 3. 言語間の偽陽性をスキップ
 /// 4. ターゲットファイルに親型が存在しない参照をスキップ（メソッド型スコーピング）
 /// 5. ターゲットファイルのテストコンテキスト内の参照をスキップ
+/// 6. import/re-export 行をスキップ（シンボルの型情報を使わず名前だけ経由する行）
 fn is_relevant_cross_file_ref(
     r: &SymbolReference,
     source_path: &str,
@@ -410,7 +411,72 @@ fn is_relevant_cross_file_ref(
     if is_ref_in_target_test_context(&r.path, r.line, r.column, target_file_cache) {
         return false;
     }
+    // 6. import/re-export 行をスキップ
+    // import 文や re-export はシンボルの名前を経由するだけで、
+    // 実装やシグネチャの変更に影響されない。
+    if is_import_context(r.context.as_deref()) {
+        return false;
+    }
     true
+}
+
+/// 参照のコンテキスト行が import/re-export 文かどうかを判定する。
+fn is_import_context(context: Option<&str>) -> bool {
+    let ctx = match context {
+        Some(c) => c.trim(),
+        None => return false,
+    };
+    // JS/TS: import { X } from '...', import X from '...'
+    if ctx.starts_with("import ") || ctx.starts_with("import{") {
+        return true;
+    }
+    // JS/TS: export { X } from '...', export * from '...'
+    if (ctx.starts_with("export ") || ctx.starts_with("export{"))
+        && (ctx.contains(" from ") || ctx.contains(" from\"") || ctx.contains(" from'"))
+    {
+        return true;
+    }
+    // JS/TS: const { X } = require('...'), require('...')
+    if ctx.contains("= require(") || ctx.starts_with("require(") {
+        return true;
+    }
+    // Python: from module import X
+    if ctx.starts_with("from ") && ctx.contains(" import ") {
+        return true;
+    }
+    // Rust: use crate::..., pub use ...
+    if ctx.starts_with("use ") || ctx.starts_with("pub use ") {
+        return true;
+    }
+    // Go: import "..."
+    // Go は個別シンボルを import しないため通常は該当しないが念のため
+    if ctx.starts_with("import (") || ctx.starts_with("import \"") {
+        return true;
+    }
+    // Ruby: require, require_relative
+    if ctx.starts_with("require ") || ctx.starts_with("require_relative ") {
+        return true;
+    }
+    // C/C++: #include "..." / #include <...>
+    if ctx.starts_with("#include ") {
+        return true;
+    }
+    // C#: using System; / using static ...
+    // "using var" / "using (" はリソース管理（import ではない）
+    if ctx.starts_with("using ")
+        && ctx.ends_with(';')
+        && !ctx.starts_with("using var ")
+        && !ctx.starts_with("using (")
+    {
+        return true;
+    }
+    // Zig: const std = @import("std");
+    if ctx.contains("@import(") {
+        return true;
+    }
+    // Java/Kotlin/Swift/PHP: すでにカバー済み
+    // ("import " / "use " で捕捉)
+    false
 }
 
 /// hunk をシンボル範囲と照合して affected シンボルを検出する。
@@ -834,5 +900,100 @@ mod tests {
         let result = find_affected_symbols(&[sym], &[hunk]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].change_type, "modified");
+    }
+
+    // --- is_import_context テスト ---
+
+    #[test]
+    fn import_context_ts_import() {
+        assert!(is_import_context(Some(
+            "import { useCommitStore } from '../stores'"
+        )));
+        assert!(is_import_context(Some(
+            "import useCommitStore from '../stores'"
+        )));
+        assert!(is_import_context(Some(
+            "import{ useCommitStore } from '../stores'"
+        )));
+    }
+
+    #[test]
+    fn import_context_ts_reexport() {
+        assert!(is_import_context(Some(
+            "export { useCommitStore } from '../stores'"
+        )));
+        assert!(is_import_context(Some(
+            "export{ useCommitStore } from './commitStore'"
+        )));
+    }
+
+    #[test]
+    fn import_context_rust_use() {
+        assert!(is_import_context(Some("use crate::stores::commit_store;")));
+        assert!(is_import_context(Some(
+            "pub use crate::stores::commit_store;"
+        )));
+    }
+
+    #[test]
+    fn import_context_python_from() {
+        assert!(is_import_context(Some("from stores import commit_store")));
+    }
+
+    #[test]
+    fn import_context_ruby_require() {
+        assert!(is_import_context(Some("require 'commit_store'")));
+        assert!(is_import_context(Some(
+            "require_relative 'stores/commit_store'"
+        )));
+    }
+
+    #[test]
+    fn import_context_non_import() {
+        // 通常のコード行は false
+        assert!(!is_import_context(Some("const result = useCommitStore();")));
+        assert!(!is_import_context(Some("useCommitStore.getState()")));
+        assert!(!is_import_context(Some("fn main() {")));
+        assert!(!is_import_context(None));
+    }
+
+    #[test]
+    fn import_context_ts_export_without_from() {
+        // re-export ではない通常の export は false
+        assert!(!is_import_context(Some(
+            "export const useCommitStore = create()"
+        )));
+        assert!(!is_import_context(Some("export function foo() {")));
+    }
+
+    #[test]
+    fn import_context_c_include() {
+        assert!(is_import_context(Some("#include \"header.h\"")));
+        assert!(is_import_context(Some("#include <stdio.h>")));
+    }
+
+    #[test]
+    fn import_context_csharp_using() {
+        assert!(is_import_context(Some("using System;")));
+        assert!(is_import_context(Some("using static System.Math;")));
+        // using ブロック（リソース管理）は import ではない
+        assert!(!is_import_context(Some(
+            "using var stream = new FileStream();"
+        )));
+    }
+
+    #[test]
+    fn import_context_zig_import() {
+        assert!(is_import_context(Some("const std = @import(\"std\");")));
+    }
+
+    #[test]
+    fn import_context_php_use() {
+        assert!(is_import_context(Some("use App\\Models\\User;")));
+    }
+
+    #[test]
+    fn import_context_swift_import() {
+        assert!(is_import_context(Some("import Foundation")));
     }
 }
