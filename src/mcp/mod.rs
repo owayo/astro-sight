@@ -139,7 +139,7 @@ pub struct CochangeAnalyzeParams {
     /// Number of recent commits to analyze (default: 200)
     #[serde(default = "default_lookback")]
     pub lookback: usize,
-    /// Minimum confidence threshold (default: 0.3)
+    /// Minimum confidence threshold (default: 0.7)
     #[serde(default = "default_min_confidence")]
     pub min_confidence: f64,
     /// Filter to pairs containing this file
@@ -152,7 +152,7 @@ fn default_lookback() -> usize {
 }
 
 fn default_min_confidence() -> f64 {
-    0.3
+    0.7
 }
 
 // ---------------------------------------------------------------------------

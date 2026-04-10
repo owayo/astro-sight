@@ -266,8 +266,8 @@ pub enum Commands {
         #[arg(short, long, default_value = "200")]
         lookback: usize,
 
-        /// Minimum confidence threshold (0.0 to 1.0, default: 0.3)
-        #[arg(short, long, default_value = "0.3")]
+        /// Minimum confidence threshold (0.0 to 1.0, default: 0.7)
+        #[arg(short, long, default_value = "0.7")]
         min_confidence: f64,
 
         /// Filter to pairs containing this file

@@ -1668,7 +1668,7 @@ pub fn handle_request(
         Command::Cochange => {
             let dir = req.dir.as_deref().unwrap_or(".");
             let lookback = req.lookback.unwrap_or(200);
-            let min_confidence = req.min_confidence.unwrap_or(0.3);
+            let min_confidence = req.min_confidence.unwrap_or(0.7);
             let result =
                 service.analyze_cochange(dir, lookback, min_confidence, req.file.as_deref())?;
             Ok(serde_json::to_value(result)?)
