@@ -299,6 +299,7 @@ fn run(cli: Cli) -> Result<()> {
             git,
             base,
             staged,
+            min_confidence,
             hook,
         } => cmd_review(
             &service,
@@ -308,6 +309,7 @@ fn run(cli: Cli) -> Result<()> {
             git,
             &base,
             staged,
+            min_confidence,
             pretty,
             hook,
         ),

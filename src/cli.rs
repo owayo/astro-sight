@@ -301,6 +301,10 @@ pub enum Commands {
         #[arg(long)]
         staged: bool,
 
+        /// Minimum cochange confidence threshold (0.0 to 1.0, default: 0.7)
+        #[arg(long, default_value = "0.7")]
+        min_confidence: f64,
+
         /// Append triage hint for AI agent hooks
         #[arg(long)]
         hook: bool,

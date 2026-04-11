@@ -693,6 +693,7 @@ pub fn cmd_review(
     git: bool,
     base: &str,
     staged: bool,
+    min_confidence: f64,
     pretty: bool,
     hook: bool,
 ) -> Result<()> {
@@ -739,7 +740,8 @@ pub fn cmd_review(
         .collect();
 
     // 4. cochange 分析 → missing_cochanges 検出
-    let missing_cochanges = detect_missing_cochanges(service, dir, &changed_file_set);
+    let missing_cochanges =
+        detect_missing_cochanges(service, dir, &changed_file_set, min_confidence);
 
     // 5. API surface diff
     let api_changes = detect_api_changes(dir, base, &diff_files);
@@ -1000,9 +1002,9 @@ fn detect_missing_cochanges(
     service: &AppService,
     dir: &str,
     changed_files: &HashSet<String>,
+    min_confidence: f64,
 ) -> Vec<MissingCochange> {
-    // 閾値 0.5 でノイズ削減
-    let cochange_result = match service.analyze_cochange(dir, 200, 0.5, None) {
+    let cochange_result = match service.analyze_cochange(dir, 200, min_confidence, None) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
