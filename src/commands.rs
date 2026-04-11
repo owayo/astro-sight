@@ -1862,6 +1862,96 @@ mod tests {
     }
 
     #[test]
+    fn detect_api_changes_skips_python_private_helpers() {
+        // Python: `_` プレフィックスのヘルパーを public リファクタで追加しても
+        // api.add として通知されないことを確認する（レポートの再現シナリオ）
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.name", "astro-sight-tests"],
+            vec!["config", "user.email", "astro-sight@example.com"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(&args)
+                    .current_dir(repo)
+                    .status()
+                    .expect("git")
+                    .success()
+            );
+        }
+
+        let script_path = repo.join("tool.py");
+        fs::write(&script_path, "def check_layout():\n    return True\n").expect("write old file");
+
+        assert!(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+
+        // 拡張: private helper 2 個と public helper 1 個を追加
+        fs::write(
+            &script_path,
+            r#"def _add_error(msg):
+    return msg
+
+def _check_plugin_manifest(path):
+    return _add_error(path)
+
+def check_layout():
+    return _check_plugin_manifest("x")
+
+def new_public_api():
+    return 1
+"#,
+        )
+        .expect("write new file");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "tool.py".to_string(),
+            new_path: "tool.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 2,
+                new_start: 1,
+                new_count: 11,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let added_names: Vec<&str> = api_changes.added.iter().map(|s| s.name.as_str()).collect();
+
+        assert!(
+            !added_names.contains(&"_add_error"),
+            "Python の `_` プレフィックス関数は api.add から除外されるべき。got: {added_names:?}"
+        );
+        assert!(
+            !added_names.contains(&"_check_plugin_manifest"),
+            "Python の `_` プレフィックス関数は api.add から除外されるべき。got: {added_names:?}"
+        );
+        assert!(
+            added_names.contains(&"new_public_api"),
+            "`_` プレフィックスを持たない関数は引き続き api.add として検出されるべき。got: {added_names:?}"
+        );
+    }
+
+    #[test]
     fn build_review_hook_json_returns_none_when_no_issues() {
         let dir = tempfile::tempdir().expect("tempdir");
 

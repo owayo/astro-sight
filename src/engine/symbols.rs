@@ -147,6 +147,7 @@ pub fn is_symbol_exported(
         LangId::Go => is_exported_go(node, source),
         LangId::Java | LangId::Kotlin => is_exported_jvm(node, source),
         LangId::Zig => is_exported_zig(node, source),
+        LangId::Python => is_exported_python(node, source, root),
         _ => true, // 未対応言語は保守的にエクスポートと判定
     }
 }
@@ -358,6 +359,86 @@ fn find_enclosing_declaration_zig(node: Node) -> Option<Node> {
             return Some(n);
         }
         current = n.parent();
+    }
+    None
+}
+
+/// Python: PEP8 の `_` プレフィックスを private 慣習として扱い、
+/// モジュール先頭に `__all__` があればそのリストを優先して判定する。
+fn is_exported_python(node: Node, source: &[u8], root: Node) -> bool {
+    let name = node
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(source).ok())
+        .or_else(|| {
+            // フォールバック: ノードが識別子そのものの場合
+            if node.kind() == "identifier" {
+                node.utf8_text(source).ok()
+            } else {
+                None
+            }
+        });
+    let Some(name) = name else {
+        return true; // 保守的
+    };
+
+    // `__all__` が定義されていればその集合のみを public とみなす
+    if let Some(dunder_all) = parse_python_dunder_all(root, source) {
+        return dunder_all.iter().any(|s| s == name);
+    }
+
+    // デフォルト: `_` プレフィックスは private
+    !name.starts_with('_')
+}
+
+/// Python モジュールのトップレベル `__all__` 定義を解析し、収録された
+/// シンボル名の一覧を返す。定義がなければ None。
+///
+/// 対応する形式:
+///   - `__all__ = ["foo", 'bar']`
+///   - `__all__ = ("foo", "bar")`
+///   - `__all__: list[str] = ["foo"]`
+///
+/// 複雑な演算（`__all__ += [...]` 等）は未対応。
+fn parse_python_dunder_all(root: Node, source: &[u8]) -> Option<Vec<String>> {
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() != "expression_statement" {
+            continue;
+        }
+        let Some(assignment) = child.child(0) else {
+            continue;
+        };
+        if assignment.kind() != "assignment" {
+            continue;
+        }
+        let Some(left) = assignment.child_by_field_name("left") else {
+            continue;
+        };
+        if left.utf8_text(source).ok() != Some("__all__") {
+            continue;
+        }
+        let Some(right) = assignment.child_by_field_name("right") else {
+            continue;
+        };
+        if right.kind() != "list" && right.kind() != "tuple" {
+            // 現状は単純な list / tuple リテラルのみ対応
+            return None;
+        }
+
+        let mut names = Vec::new();
+        let mut rc = right.walk();
+        for element in right.children(&mut rc) {
+            if element.kind() != "string" {
+                continue;
+            }
+            if let Ok(text) = element.utf8_text(source) {
+                let stripped = text.trim_matches(|c: char| c == '"' || c == '\'');
+                if !stripped.is_empty() {
+                    names.push(stripped.to_string());
+                }
+            }
+        }
+        return Some(names);
     }
     None
 }
@@ -896,6 +977,107 @@ mod tests {
             LangId::Typescript,
             "bar"
         ));
+    }
+
+    #[test]
+    fn python_public_function_is_exported() {
+        assert!(check_exported(
+            "def foo():\n    pass\n",
+            LangId::Python,
+            "foo"
+        ));
+    }
+
+    #[test]
+    fn python_underscore_function_is_not_exported() {
+        assert!(!check_exported(
+            "def _helper():\n    pass\n",
+            LangId::Python,
+            "_helper"
+        ));
+    }
+
+    #[test]
+    fn python_dunder_function_is_not_exported() {
+        // `__dunder__` も `_` プレフィックスなので private 扱い
+        assert!(!check_exported(
+            "def __internal__():\n    pass\n",
+            LangId::Python,
+            "__internal__"
+        ));
+    }
+
+    #[test]
+    fn python_underscore_method_is_not_exported() {
+        assert!(!check_exported(
+            "class C:\n    def _helper(self):\n        pass\n",
+            LangId::Python,
+            "_helper"
+        ));
+    }
+
+    #[test]
+    fn python_underscore_class_is_not_exported() {
+        assert!(!check_exported(
+            "class _Internal:\n    pass\n",
+            LangId::Python,
+            "_Internal"
+        ));
+    }
+
+    #[test]
+    fn python_dunder_all_limits_exports_to_list() {
+        let src = r#"
+__all__ = ["public_api"]
+
+def public_api():
+    pass
+
+def also_public_without_underscore():
+    pass
+"#;
+        assert!(check_exported(src, LangId::Python, "public_api"));
+        // `also_public_without_underscore` は `_` プレフィックスを持たないが
+        // `__all__` に含まれていないため非 public と判定される
+        assert!(!check_exported(
+            src,
+            LangId::Python,
+            "also_public_without_underscore"
+        ));
+    }
+
+    #[test]
+    fn python_dunder_all_tuple_form_supported() {
+        let src = r#"
+__all__ = ("foo", 'bar')
+
+def foo():
+    pass
+
+def bar():
+    pass
+
+def baz():
+    pass
+"#;
+        assert!(check_exported(src, LangId::Python, "foo"));
+        assert!(check_exported(src, LangId::Python, "bar"));
+        assert!(!check_exported(src, LangId::Python, "baz"));
+    }
+
+    #[test]
+    fn python_typed_dunder_all_supported() {
+        let src = r#"
+__all__: list[str] = ["typed_api"]
+
+def typed_api():
+    pass
+
+def other():
+    pass
+"#;
+        assert!(check_exported(src, LangId::Python, "typed_api"));
+        assert!(!check_exported(src, LangId::Python, "other"));
     }
 
     // --- is_local_scope_symbol テスト ---
