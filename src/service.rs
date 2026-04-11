@@ -7,7 +7,7 @@ use crate::cache::store::CacheStore;
 use crate::engine::{calls, extractor, impact, imports, lint, parser, refs, snippet, symbols};
 use crate::error::{AstroError, ErrorCode};
 use crate::models::call::CallGraph;
-use crate::models::cochange::CoChangeResult;
+use crate::models::cochange::{CoChangeOptions, CoChangeResult};
 use crate::models::impact::ContextResult;
 use crate::models::import::ImportsResult;
 use crate::models::location::LocationKey;
@@ -473,46 +473,46 @@ impl AppService {
     }
 
     /// git 履歴から共変更パターンを解析する。
-    pub fn analyze_cochange(
-        &self,
-        dir: &str,
-        lookback: usize,
-        min_confidence: f64,
-        filter_file: Option<&str>,
-    ) -> Result<CoChangeResult> {
+    pub fn analyze_cochange(&self, dir: &str, opts: &CoChangeOptions) -> Result<CoChangeResult> {
         debug!(
             dir = dir,
-            lookback = lookback,
-            min_confidence = min_confidence,
-            filter_file = ?filter_file,
+            lookback = opts.lookback,
+            min_confidence = opts.min_confidence,
+            min_samples = opts.min_samples,
+            max_files_per_commit = opts.max_files_per_commit,
+            bounded_by_merge_base = opts.bounded_by_merge_base,
+            skip_deleted_files = opts.skip_deleted_files,
+            filter_file = ?opts.filter_file,
             "analyze_cochange called"
         );
         // パラメータを検証する。
         const MAX_LOOKBACK: usize = 10_000;
-        if lookback == 0 || lookback > MAX_LOOKBACK {
+        if opts.lookback == 0 || opts.lookback > MAX_LOOKBACK {
             bail!(AstroError::new(
                 ErrorCode::InvalidRequest,
-                format!("lookback must be 1..={MAX_LOOKBACK}, got {lookback}"),
+                format!("lookback must be 1..={MAX_LOOKBACK}, got {}", opts.lookback),
             ));
         }
-        if !min_confidence.is_finite() || !(0.0..=1.0).contains(&min_confidence) {
+        if !opts.min_confidence.is_finite() || !(0.0..=1.0).contains(&opts.min_confidence) {
             bail!(AstroError::new(
                 ErrorCode::InvalidRequest,
                 format!(
-                    "min_confidence must be a finite value in [0.0, 1.0], got {min_confidence}"
+                    "min_confidence must be a finite value in [0.0, 1.0], got {}",
+                    opts.min_confidence
                 ),
+            ));
+        }
+        if opts.max_files_per_commit == 0 {
+            bail!(AstroError::new(
+                ErrorCode::InvalidRequest,
+                "max_files_per_commit must be >= 1".to_string(),
             ));
         }
 
         let canonical_dir = self.validate_dir(dir)?;
         let dir_str = canonical_dir.to_string_lossy();
 
-        let result = crate::engine::cochange::analyze_cochange(
-            &dir_str,
-            lookback,
-            min_confidence,
-            filter_file,
-        )?;
+        let result = crate::engine::cochange::analyze_cochange(&dir_str, opts)?;
         debug!(
             dir = dir,
             entries = result.entries.len(),

@@ -270,6 +270,22 @@ pub enum Commands {
         #[arg(short, long, default_value = "0.7")]
         min_confidence: f64,
 
+        /// Minimum shared commit count required per pair (default: 2)
+        #[arg(long, default_value = "2")]
+        min_samples: usize,
+
+        /// Exclude commits touching more files than this threshold (default: 30)
+        #[arg(long, default_value = "30")]
+        max_files_per_commit: usize,
+
+        /// Disable merge-base history bounding (default: enabled)
+        #[arg(long)]
+        no_merge_base: bool,
+
+        /// Include pairs where either file is absent from HEAD (default: excluded)
+        #[arg(long)]
+        include_deleted: bool,
+
         /// Filter to pairs containing this file
         #[arg(short, long)]
         file: Option<String>,

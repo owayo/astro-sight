@@ -317,15 +317,23 @@ fn run(cli: Cli) -> Result<()> {
             dir,
             lookback,
             min_confidence,
+            min_samples,
+            max_files_per_commit,
+            no_merge_base,
+            include_deleted,
             file,
-        } => cmd_cochange(
-            &service,
-            &dir,
-            lookback,
-            min_confidence,
-            file.as_deref(),
-            pretty,
-        ),
+        } => {
+            let opts = astro_sight::models::cochange::CoChangeOptions {
+                lookback,
+                min_confidence,
+                min_samples,
+                max_files_per_commit,
+                bounded_by_merge_base: !no_merge_base,
+                skip_deleted_files: !include_deleted,
+                filter_file: file,
+            };
+            cmd_cochange(&service, &dir, &opts, pretty)
+        }
         Commands::Context {
             dir,
             diff,

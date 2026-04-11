@@ -142,6 +142,18 @@ pub struct CochangeAnalyzeParams {
     /// Minimum confidence threshold (default: 0.7)
     #[serde(default = "default_min_confidence")]
     pub min_confidence: f64,
+    /// Minimum shared commit count per pair (default: 2)
+    #[serde(default = "default_min_samples")]
+    pub min_samples: usize,
+    /// Commits touching more files than this threshold are skipped (default: 30)
+    #[serde(default = "default_max_files_per_commit")]
+    pub max_files_per_commit: usize,
+    /// Limit history to commits reachable from merge-base HEAD <default-branch> (default: true)
+    #[serde(default = "default_bool_true")]
+    pub bounded_by_merge_base: bool,
+    /// Drop pairs where either file is missing from HEAD (default: true)
+    #[serde(default = "default_bool_true")]
+    pub skip_deleted_files: bool,
     /// Filter to pairs containing this file
     #[serde(default)]
     pub file: Option<String>,
@@ -153,6 +165,18 @@ fn default_lookback() -> usize {
 
 fn default_min_confidence() -> f64 {
     0.7
+}
+
+fn default_min_samples() -> usize {
+    2
+}
+
+fn default_max_files_per_commit() -> usize {
+    30
+}
+
+fn default_bool_true() -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -369,12 +393,16 @@ impl AstroSightServer {
         params: Parameters<CochangeAnalyzeParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        Self::to_tool_result(self.service.analyze_cochange(
-            &p.dir,
-            p.lookback,
-            p.min_confidence,
-            p.file.as_deref(),
-        ))
+        let opts = crate::models::cochange::CoChangeOptions {
+            lookback: p.lookback,
+            min_confidence: p.min_confidence,
+            min_samples: p.min_samples,
+            max_files_per_commit: p.max_files_per_commit,
+            bounded_by_merge_base: p.bounded_by_merge_base,
+            skip_deleted_files: p.skip_deleted_files,
+            filter_file: p.file,
+        };
+        Self::to_tool_result(self.service.analyze_cochange(&p.dir, &opts))
     }
 
     #[tool(

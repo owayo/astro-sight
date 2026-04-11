@@ -8,6 +8,7 @@ use crate::cache::store::CacheStore;
 use crate::doctor;
 use crate::engine::parser;
 use crate::error::{AstroError, ErrorCode};
+use crate::models::cochange::CoChangeOptions;
 use crate::models::dead_code::DeadCodeResult;
 use crate::models::review::{
     ApiChanges, ApiSymbol, ApiSymbolChange, DeadSymbol, MissingCochange, ReviewResult,
@@ -402,14 +403,24 @@ pub fn cmd_refs_batch(
 pub fn cmd_cochange(
     service: &AppService,
     dir: &str,
-    lookback: usize,
-    min_confidence: f64,
-    file: Option<&str>,
+    opts: &CoChangeOptions,
     pretty: bool,
 ) -> Result<()> {
-    let result = service.analyze_cochange(dir, lookback, min_confidence, file)?;
+    let result = service.analyze_cochange(dir, opts)?;
     let output = serialize_output(&result, pretty)?;
-    info!(command = "cochange", dir = dir, lookback = lookback, min_confidence = min_confidence, file = ?file, output_bytes = output.len(), "command completed");
+    info!(
+        command = "cochange",
+        dir = dir,
+        lookback = opts.lookback,
+        min_confidence = opts.min_confidence,
+        min_samples = opts.min_samples,
+        max_files_per_commit = opts.max_files_per_commit,
+        bounded_by_merge_base = opts.bounded_by_merge_base,
+        skip_deleted_files = opts.skip_deleted_files,
+        file = ?opts.filter_file,
+        output_bytes = output.len(),
+        "command completed"
+    );
     println!("{output}");
     Ok(())
 }
@@ -1004,7 +1015,11 @@ fn detect_missing_cochanges(
     changed_files: &HashSet<String>,
     min_confidence: f64,
 ) -> Vec<MissingCochange> {
-    let cochange_result = match service.analyze_cochange(dir, 200, min_confidence, None) {
+    let opts = CoChangeOptions {
+        min_confidence,
+        ..CoChangeOptions::default()
+    };
+    let cochange_result = match service.analyze_cochange(dir, &opts) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
@@ -1669,10 +1684,23 @@ pub fn handle_request(
         }
         Command::Cochange => {
             let dir = req.dir.as_deref().unwrap_or(".");
-            let lookback = req.lookback.unwrap_or(200);
-            let min_confidence = req.min_confidence.unwrap_or(0.7);
-            let result =
-                service.analyze_cochange(dir, lookback, min_confidence, req.file.as_deref())?;
+            let defaults = CoChangeOptions::default();
+            let opts = CoChangeOptions {
+                lookback: req.lookback.unwrap_or(defaults.lookback),
+                min_confidence: req.min_confidence.unwrap_or(defaults.min_confidence),
+                min_samples: req.min_samples.unwrap_or(defaults.min_samples),
+                max_files_per_commit: req
+                    .max_files_per_commit
+                    .unwrap_or(defaults.max_files_per_commit),
+                bounded_by_merge_base: req
+                    .bounded_by_merge_base
+                    .unwrap_or(defaults.bounded_by_merge_base),
+                skip_deleted_files: req
+                    .skip_deleted_files
+                    .unwrap_or(defaults.skip_deleted_files),
+                filter_file: req.file.clone(),
+            };
+            let result = service.analyze_cochange(dir, &opts)?;
             Ok(serde_json::to_value(result)?)
         }
     }

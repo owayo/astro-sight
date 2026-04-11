@@ -47,6 +47,18 @@ pub struct AstgenRequest {
     /// Minimum confidence for co-change analysis
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_confidence: Option<f64>,
+    /// Minimum shared commit count for co-change analysis
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_samples: Option<usize>,
+    /// Commits touching more files than this threshold are skipped
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_files_per_commit: Option<usize>,
+    /// Limit history to commits reachable from merge-base HEAD <default-branch>
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bounded_by_merge_base: Option<bool>,
+    /// Drop pairs where either file is missing from HEAD
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_deleted_files: Option<bool>,
     /// File filter for co-change analysis
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
