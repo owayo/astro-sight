@@ -426,7 +426,10 @@ pub fn cmd_cochange(
 }
 
 pub fn run_git_diff(dir: &str, base: &str, staged: bool) -> Result<String> {
-    let mut args = vec!["diff".to_string()];
+    // git config `diff.renames` がユーザー環境で無効化されていても rename を検出できるよう、
+    // 明示的に `--find-renames` を指定する。ファイル rename が api.rm/api.add の誤発報源に
+    // なるため、astro-sight 側で強制しておく。
+    let mut args = vec!["diff".to_string(), "--find-renames".to_string()];
     if staged {
         args.push("--cached".to_string());
     }
@@ -1069,23 +1072,43 @@ fn detect_missing_cochanges(
     missing
 }
 
+/// 内部用: reconcile のために signature を保持する一時構造。
+#[derive(Debug, Clone)]
+struct ApiSymbolCandidate {
+    name: String,
+    kind: String,
+    file: String,
+    signature: String,
+}
+
+impl ApiSymbolCandidate {
+    fn into_api_symbol(self) -> ApiSymbol {
+        ApiSymbol {
+            name: self.name,
+            kind: self.kind,
+            file: self.file,
+        }
+    }
+}
+
 fn detect_api_changes(
     dir: &str,
     base: &str,
     diff_files: &[crate::models::impact::DiffFile],
 ) -> ApiChanges {
-    let mut added = Vec::new();
-    let mut removed = Vec::new();
+    let mut added: Vec<ApiSymbolCandidate> = Vec::new();
+    let mut removed: Vec<ApiSymbolCandidate> = Vec::new();
     let mut modified = Vec::new();
 
     for df in diff_files {
         if df.old_path == "/dev/null" {
             if let Some(new_syms) = extract_exported_symbols_from_file(dir, &df.new_path) {
-                for (name, kind, _sig) in &new_syms {
-                    added.push(ApiSymbol {
+                for (name, kind, sig) in &new_syms {
+                    added.push(ApiSymbolCandidate {
                         name: name.clone(),
                         kind: kind.clone(),
                         file: df.new_path.clone(),
+                        signature: sig.clone(),
                     });
                 }
             }
@@ -1094,11 +1117,12 @@ fn detect_api_changes(
 
         if df.new_path == "/dev/null" {
             if let Some(old_syms) = extract_exported_symbols_from_git(dir, base, &df.old_path) {
-                for (name, kind, _sig) in &old_syms {
-                    removed.push(ApiSymbol {
+                for (name, kind, sig) in &old_syms {
+                    removed.push(ApiSymbolCandidate {
                         name: name.clone(),
                         kind: kind.clone(),
                         file: df.old_path.clone(),
+                        signature: sig.clone(),
                     });
                 }
             }
@@ -1123,22 +1147,24 @@ fn detect_api_changes(
             .map(|(name, kind, sig)| (name.as_str(), (kind.as_str(), sig.as_str())))
             .collect();
 
-        for (name, kind, _sig) in &new_syms {
+        for (name, kind, sig) in &new_syms {
             if !old_map.contains_key(name.as_str()) {
-                added.push(ApiSymbol {
+                added.push(ApiSymbolCandidate {
                     name: name.clone(),
                     kind: kind.clone(),
                     file: df.new_path.clone(),
+                    signature: sig.clone(),
                 });
             }
         }
 
-        for (name, kind, _sig) in &old_syms {
+        for (name, kind, sig) in &old_syms {
             if !new_map.contains_key(name.as_str()) {
-                removed.push(ApiSymbol {
+                removed.push(ApiSymbolCandidate {
                     name: name.clone(),
                     kind: kind.clone(),
                     file: df.new_path.clone(),
+                    signature: sig.clone(),
                 });
             }
         }
@@ -1158,11 +1184,54 @@ fn detect_api_changes(
         }
     }
 
+    // git の rename detection が効かない diff (外部供給 / 非 git 入力 / 設定で無効化された
+    // 環境など) に対するフォールバックとして、同一 (name, kind, signature) の add/rm ペアを
+    // rename または move として相殺する。
+    let (added, removed) = reconcile_api_symbols(added, removed);
+
     ApiChanges {
-        added,
-        removed,
+        added: added.into_iter().map(|c| c.into_api_symbol()).collect(),
+        removed: removed.into_iter().map(|c| c.into_api_symbol()).collect(),
         modified,
     }
+}
+
+/// 同名・同種別・同シグネチャの api.add と api.rm のペアを相殺する。
+/// 1 対 1 マッチングで相殺し、残ったものだけを返す。
+fn reconcile_api_symbols(
+    added: Vec<ApiSymbolCandidate>,
+    removed: Vec<ApiSymbolCandidate>,
+) -> (Vec<ApiSymbolCandidate>, Vec<ApiSymbolCandidate>) {
+    use std::collections::HashMap;
+    use std::collections::VecDeque;
+
+    let mut removed_bucket: HashMap<(String, String, String), VecDeque<ApiSymbolCandidate>> =
+        HashMap::new();
+    for sym in removed {
+        removed_bucket
+            .entry((sym.name.clone(), sym.kind.clone(), sym.signature.clone()))
+            .or_default()
+            .push_back(sym);
+    }
+
+    let mut kept_added = Vec::with_capacity(added.len());
+    for sym in added {
+        let key = (sym.name.clone(), sym.kind.clone(), sym.signature.clone());
+        if let Some(bucket) = removed_bucket.get_mut(&key)
+            && bucket.pop_front().is_some()
+        {
+            // 同一ペアが rm 側にあれば相殺
+            continue;
+        }
+        kept_added.push(sym);
+    }
+
+    let kept_removed: Vec<ApiSymbolCandidate> = removed_bucket
+        .into_values()
+        .flat_map(|bucket| bucket.into_iter())
+        .collect();
+
+    (kept_added, kept_removed)
 }
 
 fn detect_dead_symbols(
@@ -1859,6 +1928,332 @@ mod tests {
                         == Some("pub fn greet(name: &str) -> i32 {")),
             "rename を含む差分でも関数シグネチャ変更を検出するべき"
         );
+    }
+
+    /// テストヘルパー: 一時 git リポジトリを初期化する。
+    fn init_git_repo_for_test(repo: &std::path::Path) {
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.name", "astro-sight-tests"],
+            vec!["config", "user.email", "astro-sight@example.com"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(&args)
+                    .current_dir(repo)
+                    .status()
+                    .expect("git")
+                    .success()
+            );
+        }
+    }
+
+    /// テストヘルパー: 与えられたファイル一覧を書き込み、add + commit する。
+    fn git_commit_files(repo: &std::path::Path, files: &[(&str, &str)], msg: &str) {
+        for (rel, content) in files {
+            let full = repo.join(rel);
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent).expect("mkdir");
+            }
+            fs::write(full, content).expect("write file");
+        }
+        assert!(
+            Command::new("git")
+                .args(["add", "-A"])
+                .current_dir(repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", msg])
+                .current_dir(repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+    }
+
+    #[test]
+    fn detect_api_changes_rename_preserves_symbols() {
+        // Python スクリプトを rename した際、同名・同シグネチャの関数は
+        // api.rm / api.add として報告されないことを確認する（レポートの再現シナリオ）。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let old_content = "\
+def iter_plugin_manifests():
+    return []
+
+def check_layout():
+    return 0
+
+def build_entries():
+    return []
+
+def regenerate():
+    return None
+
+def main():
+    pass
+";
+        git_commit_files(
+            repo,
+            &[("scripts/regenerate_marketplace.py", old_content)],
+            "initial",
+        );
+
+        // 旧ファイル削除 + 新ファイル追加 (git mv と同じ効果)
+        fs::remove_file(repo.join("scripts/regenerate_marketplace.py")).expect("rm old");
+        let new_content = "\
+def iter_plugin_manifests():
+    return []
+
+def check_layout():
+    return 0
+
+def build_entries():
+    return []
+
+def regenerate():
+    return None
+
+def main():
+    pass
+";
+        fs::write(repo.join("scripts/marketplace.py"), new_content).expect("write new");
+
+        // git の rename detection で単一 DiffFile として扱われる場合
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "scripts/regenerate_marketplace.py".to_string(),
+            new_path: "scripts/marketplace.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 14,
+                new_start: 1,
+                new_count: 14,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let added: Vec<&str> = api_changes.added.iter().map(|s| s.name.as_str()).collect();
+        let removed: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            added.is_empty(),
+            "rename で保持された関数は api.add に出るべきではない。got: {added:?}"
+        );
+        assert!(
+            removed.is_empty(),
+            "rename で保持された関数は api.rm に出るべきではない。got: {removed:?}"
+        );
+    }
+
+    #[test]
+    fn detect_api_changes_reconciles_delete_and_add_as_rename() {
+        // git diff が rename を検出できず、旧ファイル削除 + 新ファイル追加の
+        // 2 エントリとして供給された場合でも、同一シグネチャの関数は相殺される。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let old_content = "\
+def iter_plugin_manifests():
+    return []
+
+def check_layout():
+    return 0
+
+def main():
+    pass
+";
+        git_commit_files(
+            repo,
+            &[("scripts/regenerate_marketplace.py", old_content)],
+            "initial",
+        );
+
+        // ファイル削除 + 別パスに再配置 (rename detection が無効な想定)
+        fs::remove_file(repo.join("scripts/regenerate_marketplace.py")).expect("rm old");
+        let new_content = "\
+def iter_plugin_manifests():
+    return []
+
+def check_layout():
+    return 0
+
+def main():
+    pass
+
+def new_public_api():
+    return 1
+";
+        fs::write(repo.join("scripts/marketplace.py"), new_content).expect("write new");
+
+        // rename 未検出の diff: delete + add の 2 エントリ
+        let diff_files = vec![
+            crate::models::impact::DiffFile {
+                old_path: "scripts/regenerate_marketplace.py".to_string(),
+                new_path: "/dev/null".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 9,
+                    new_start: 0,
+                    new_count: 0,
+                }],
+            },
+            crate::models::impact::DiffFile {
+                old_path: "/dev/null".to_string(),
+                new_path: "scripts/marketplace.py".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 0,
+                    old_count: 0,
+                    new_start: 1,
+                    new_count: 12,
+                }],
+            },
+        ];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let added_names: Vec<&str> = api_changes.added.iter().map(|s| s.name.as_str()).collect();
+        let removed_names: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+
+        // 同一シグネチャの 3 関数は相殺される
+        assert!(
+            !removed_names.contains(&"iter_plugin_manifests"),
+            "同一シグネチャの関数は相殺されるべき。got removed: {removed_names:?}"
+        );
+        assert!(
+            !removed_names.contains(&"check_layout"),
+            "同一シグネチャの関数は相殺されるべき。got removed: {removed_names:?}"
+        );
+        assert!(
+            !removed_names.contains(&"main"),
+            "同一シグネチャの関数は相殺されるべき。got removed: {removed_names:?}"
+        );
+        assert!(
+            !added_names.contains(&"iter_plugin_manifests"),
+            "相殺済みの関数は added にも現れるべきではない。got added: {added_names:?}"
+        );
+
+        // ただし純粋な新規関数は api.add に残る
+        assert!(
+            added_names.contains(&"new_public_api"),
+            "新規追加された関数は引き続き検出されるべき。got added: {added_names:?}"
+        );
+    }
+
+    #[test]
+    fn detect_api_changes_still_detects_genuine_removal() {
+        // リネームではなく純粋に関数を削除した場合は api.rm が発報される。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        git_commit_files(
+            repo,
+            &[("mod.py", "def foo():\n    pass\n\ndef bar():\n    pass\n")],
+            "initial",
+        );
+        // bar を削除
+        fs::write(repo.join("mod.py"), "def foo():\n    pass\n").expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "mod.py".to_string(),
+            new_path: "mod.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 5,
+                new_start: 1,
+                new_count: 2,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.contains(&"bar"),
+            "純粋な関数削除は api.rm として検出されるべき。got: {removed:?}"
+        );
+    }
+
+    #[test]
+    fn reconcile_api_symbols_pairs_by_signature() {
+        // reconcile_api_symbols のユニットテスト: 同じ (name,kind,sig) を相殺し、
+        // 残りだけを返す。
+        let added = vec![
+            ApiSymbolCandidate {
+                name: "foo".into(),
+                kind: "function".into(),
+                file: "new.py".into(),
+                signature: "def foo():".into(),
+            },
+            ApiSymbolCandidate {
+                name: "new_api".into(),
+                kind: "function".into(),
+                file: "new.py".into(),
+                signature: "def new_api():".into(),
+            },
+        ];
+        let removed = vec![
+            ApiSymbolCandidate {
+                name: "foo".into(),
+                kind: "function".into(),
+                file: "old.py".into(),
+                signature: "def foo():".into(),
+            },
+            ApiSymbolCandidate {
+                name: "gone".into(),
+                kind: "function".into(),
+                file: "old.py".into(),
+                signature: "def gone():".into(),
+            },
+        ];
+
+        let (kept_added, kept_removed) = reconcile_api_symbols(added, removed);
+        assert_eq!(kept_added.len(), 1);
+        assert_eq!(kept_added[0].name, "new_api");
+        assert_eq!(kept_removed.len(), 1);
+        assert_eq!(kept_removed[0].name, "gone");
+    }
+
+    #[test]
+    fn reconcile_api_symbols_keeps_different_signatures() {
+        // 同名でもシグネチャが違うなら相殺しない（signature change の検出漏れ防止）。
+        let added = vec![ApiSymbolCandidate {
+            name: "foo".into(),
+            kind: "function".into(),
+            file: "b.py".into(),
+            signature: "def foo(x):".into(),
+        }];
+        let removed = vec![ApiSymbolCandidate {
+            name: "foo".into(),
+            kind: "function".into(),
+            file: "a.py".into(),
+            signature: "def foo():".into(),
+        }];
+
+        let (kept_added, kept_removed) = reconcile_api_symbols(added, removed);
+        assert_eq!(kept_added.len(), 1);
+        assert_eq!(kept_removed.len(), 1);
     }
 
     #[test]
