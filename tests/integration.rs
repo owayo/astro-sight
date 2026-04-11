@@ -370,7 +370,7 @@ fn context_with_diff() {
     // Create a synthetic diff
     let diff = r#"--- a/src/engine/symbols.rs
 +++ b/src/engine/symbols.rs
-@@ -495,7 +495,7 @@
+@@ -524,7 +524,7 @@
 -pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
 +pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, include_refs: bool) -> Result<Vec<Symbol>> {
      let query_src = symbol_query(lang_id);
@@ -1007,7 +1007,7 @@ fn context_batch_refs_consistency() {
     // with the batch refs approach (same output as before)
     let diff = r#"--- a/src/engine/symbols.rs
 +++ b/src/engine/symbols.rs
-@@ -495,7 +495,7 @@
+@@ -524,7 +524,7 @@
 -pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
 +pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, flag: bool) -> Result<Vec<Symbol>> {
      let query_src = symbol_query(lang_id);
@@ -1675,7 +1675,7 @@ fn impact_with_unresolved() {
     // Diff that changes extract_symbols signature → callers in other files are unresolved
     let diff = r#"--- a/src/engine/symbols.rs
 +++ b/src/engine/symbols.rs
-@@ -495,7 +495,7 @@
+@@ -524,7 +524,7 @@
 -pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
 +pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, flag: bool) -> Result<Vec<Symbol>> {
      let query_src = symbol_query(lang_id);

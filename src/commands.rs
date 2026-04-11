@@ -1194,7 +1194,7 @@ pub(crate) fn detect_dead_symbols_from_files(
         Err(_) => return Vec::new(),
     };
 
-    // 全ファイルのエクスポートシンボルを収集
+    // 全ファイルのエクスポートシンボルを収集（trait impl メソッドは除外）
     let mut all_syms: Vec<(String, String, String)> = Vec::new(); // (name, kind, file)
     for path in files {
         // canonicalize で削除済みファイルをスキップ、dir 外のパスも除外
@@ -1206,7 +1206,7 @@ pub(crate) fn detect_dead_symbols_from_files(
             Ok(p) => p.to_string_lossy().to_string(),
             Err(_) => continue, // dir 外のパスは除外（セキュリティ境界）
         };
-        if let Some(syms) = extract_exported_symbols_from_file(dir, &rel) {
+        if let Some(syms) = extract_dead_code_candidates_from_file(dir, &rel) {
             for (name, kind, _sig) in syms {
                 all_syms.push((name, kind, rel.clone()));
             }
@@ -1295,12 +1295,28 @@ fn extract_exported_symbols_from_git(
     let root = tree.root_node();
 
     let syms = crate::engine::symbols::extract_symbols(root, source, lang_id).ok()?;
-    Some(filter_exported_symbols(&syms, root, source, lang_id))
+    // API 変更検出では trait impl も差分に含めたいので除外しない
+    Some(filter_exported_symbols(&syms, root, source, lang_id, false))
 }
 
 fn extract_exported_symbols_from_file(
     dir: &str,
     file_path: &str,
+) -> Option<Vec<(String, String, String)>> {
+    extract_exported_symbols_from_file_inner(dir, file_path, false)
+}
+
+fn extract_dead_code_candidates_from_file(
+    dir: &str,
+    file_path: &str,
+) -> Option<Vec<(String, String, String)>> {
+    extract_exported_symbols_from_file_inner(dir, file_path, true)
+}
+
+fn extract_exported_symbols_from_file_inner(
+    dir: &str,
+    file_path: &str,
+    exclude_trait_impls: bool,
 ) -> Option<Vec<(String, String, String)>> {
     let full_path = std::path::Path::new(dir).join(file_path);
     let utf8_path = camino::Utf8Path::new(full_path.to_str()?);
@@ -1310,7 +1326,13 @@ fn extract_exported_symbols_from_file(
     let root = tree.root_node();
 
     let syms = crate::engine::symbols::extract_symbols(root, &source, lang_id).ok()?;
-    Some(filter_exported_symbols(&syms, root, &source, lang_id))
+    Some(filter_exported_symbols(
+        &syms,
+        root,
+        &source,
+        lang_id,
+        exclude_trait_impls,
+    ))
 }
 
 /// シンボルの種類に応じた API シグネチャを抽出する。
@@ -1359,6 +1381,7 @@ fn filter_exported_symbols(
     root: tree_sitter::Node<'_>,
     source: &[u8],
     lang_id: crate::language::LangId,
+    exclude_trait_impls: bool,
 ) -> Vec<(String, String, String)> {
     let source_str = std::str::from_utf8(source).unwrap_or("");
     let lines: Vec<&str> = source_str.lines().collect();
@@ -1371,6 +1394,15 @@ fn filter_exported_symbols(
         // pub(crate), pub(super) 等はクレート内部APIなので除外
         let decl_line = lines.get(sym.range.start.line).unwrap_or(&"").trim();
         if decl_line.contains("pub(") {
+            continue;
+        }
+        // Rust の trait impl メソッドは trait dispatch 経由で呼ばれ、
+        // cross-file refs 検索では caller を辿れない。dead-code 判定では
+        // 偽陽性になるためスキップする。API 変更検出では含める。
+        if exclude_trait_impls
+            && lang_id == crate::language::LangId::Rust
+            && crate::engine::symbols::is_trait_impl_method_rust(root, &sym.range)
+        {
             continue;
         }
         let sig = extract_api_signature(sym, &lines);

@@ -276,6 +276,32 @@ fn is_exported_rust(node: Node) -> bool {
     false
 }
 
+/// Rust のシンボルが trait impl ブロックに属しているかを判定する。
+/// trait impl メソッドは trait dispatch 経由で呼ばれるため、cross-file refs
+/// 検索では caller を追跡できず、dead-code 判定でスキップする必要がある。
+pub(crate) fn is_trait_impl_method_rust(root: Node, symbol_range: &Range) -> bool {
+    let start = tree_sitter::Point {
+        row: symbol_range.start.line,
+        column: symbol_range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: symbol_range.end.line,
+        column: symbol_range.end.column,
+    };
+    let Some(node) = root.descendant_for_point_range(start, end) else {
+        return false;
+    };
+
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if p.kind() == "impl_item" {
+            return p.child_by_field_name("trait").is_some();
+        }
+        parent = p.parent();
+    }
+    false
+}
+
 /// JS/TS: ノードが関数本体（親が関数系ノードの statement_block）かどうかを判定する。
 fn is_js_function_body(node: Node) -> bool {
     if node.kind() != "statement_block" {
