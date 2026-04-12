@@ -1163,7 +1163,8 @@ fn detect_api_changes(
                 removed.push(ApiSymbolCandidate {
                     name: name.clone(),
                     kind: kind.clone(),
-                    file: df.new_path.clone(),
+                    // 削除シンボルの出所は旧ファイルパス
+                    file: df.old_path.clone(),
                     signature: sig.clone(),
                 });
             }
@@ -2343,6 +2344,59 @@ def new_public_api():
         assert!(
             added_names.contains(&"new_public_api"),
             "`_` プレフィックスを持たない関数は引き続き api.add として検出されるべき。got: {added_names:?}"
+        );
+    }
+
+    #[test]
+    fn detect_api_changes_rename_removed_uses_old_path() {
+        // ファイルリネーム時にシンボルが削除された場合、removed の file は
+        // 旧パス (old_path) を使用することを確認する。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[(
+                "src/old.rs",
+                "pub fn greet() -> i32 {\n    1\n}\n\npub fn farewell() -> i32 {\n    0\n}\n",
+            )],
+            "initial",
+        );
+
+        // リネーム後のファイルから farewell を削除
+        let new_path = repo.join("src/new.rs");
+        if let Some(parent) = new_path.parent() {
+            fs::create_dir_all(parent).expect("mkdir");
+        }
+        fs::write(&new_path, "pub fn greet() -> i32 {\n    1\n}\n").expect("write renamed file");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/old.rs".to_string(),
+            new_path: "src/new.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 7,
+                new_start: 1,
+                new_count: 3,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed_farewell = api_changes.removed.iter().find(|s| s.name == "farewell");
+
+        assert!(
+            removed_farewell.is_some(),
+            "farewell が removed に含まれるべき。got: {:?}",
+            api_changes.removed
+        );
+
+        assert_eq!(
+            removed_farewell.unwrap().file,
+            "src/old.rs",
+            "削除シンボルの file は旧パス (old_path) であるべき"
         );
     }
 

@@ -10,7 +10,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - **clap derive** による CLI 引数パーサー
 - **NDJSON** ストリーミングセッション対応
 - **スマートコンテキスト**（diff→影響分析、バッチ参照検索 O(N+S)）
-- **MCP サーバーモード**（rmcp による stdio JSON-RPC 2.0、ワークスペースサンドボックス、11 ツール）
+- **MCP サーバーモード**（rmcp 1.4 による stdio JSON-RPC 2.0、ワークスペースサンドボックス、11 ツール）
 - **デフォルト compact JSON** 出力（`--pretty` で整形出力）
 - **バッチ処理**（`--paths` / `--paths-file` で複数ファイル NDJSON 出力）
 - **JSON エラー出力**（`{"error":{"code":"...","message":"..."}}` を stdout に出力）

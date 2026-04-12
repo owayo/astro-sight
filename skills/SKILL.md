@@ -44,36 +44,36 @@ astro-sight symbols --path <file>
 # 4. Analyze what a diff breaks (run BEFORE editing code)
 astro-sight context --dir . --git
 
-# 5. Show caller/callee relationships
-astro-sight calls --path <file> --function <function_name>
-
-# 6. Extract imports/exports
-astro-sight imports --path <file>
-
-# 7. Detect unresolved impacts after edits
+# 5. Detect unresolved impacts after edits
 astro-sight impact --dir . --git
 
-# 8. Structured review (impact + cochange + API diff + dead symbols)
+# 6. Structured review (impact + cochange + API diff + dead symbols)
 astro-sight review --dir . --git
 
-# 9. Batch operations — multiple queries in one process
+# 7. Show caller/callee relationships
+astro-sight calls --path <file> --function <function_name>
+
+# 8. Extract imports/exports
+astro-sight imports --path <file>
+
+# 9. Find dead (unreferenced) exported symbols
+astro-sight dead-code --dir .
+
+# 10. Find dead code related to a diff
+astro-sight dead-code --dir . --git
+
+# 11. Visualize call flow
+astro-sight sequence --path src/main.rs --function main
+
+# 12. Check change hotspots
+astro-sight cochange --dir . --file src/service.rs
+
+# 13. Batch operations — multiple queries in one process
 echo '{"command":"refs","name":"Sym1","dir":"."}
 {"command":"symbols","path":"src/main.rs"}' | astro-sight session
 
-# 10. Visualize call flow
-astro-sight sequence --path src/main.rs --function main
-
-# 11. Check change hotspots
-astro-sight cochange --dir . --file src/service.rs
-
-# 12. Repeated AST/text checks
+# 14. Repeated AST/text checks
 astro-sight lint --path <file> --rules rules.yaml
-
-# 13. Find dead (unreferenced) exported symbols
-astro-sight dead-code --dir .
-
-# 14. Find dead code related to a diff
-astro-sight dead-code --dir . --git
 ```
 
 ## Low-Adoption But Useful
