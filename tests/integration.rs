@@ -13,10 +13,12 @@ fn doctor_returns_json() {
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
     assert_eq!(json["version"], PKG_VERSION);
-    assert!(json["languages"].as_array().unwrap().len() >= 15);
+    let languages = json["languages"].as_array().unwrap();
+    assert_eq!(languages.len(), 16);
+    assert!(languages.iter().any(|lang| lang["language"] == "zig"));
 
-    // All languages should be available
-    for lang in json["languages"].as_array().unwrap() {
+    // すべての対応言語が利用可能であること
+    for lang in languages {
         assert!(
             lang["available"].as_bool().unwrap(),
             "Language {:?} not available",

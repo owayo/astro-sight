@@ -1,6 +1,25 @@
 use crate::language::LangId;
 use serde::Serialize;
 
+const SUPPORTED_LANGUAGES: [LangId; 16] = [
+    LangId::Rust,
+    LangId::C,
+    LangId::Cpp,
+    LangId::Python,
+    LangId::Javascript,
+    LangId::Typescript,
+    LangId::Tsx,
+    LangId::Go,
+    LangId::Php,
+    LangId::Java,
+    LangId::Kotlin,
+    LangId::Swift,
+    LangId::CSharp,
+    LangId::Bash,
+    LangId::Ruby,
+    LangId::Zig,
+];
+
 #[derive(Debug, Serialize)]
 pub struct DoctorReport {
     pub version: String,
@@ -15,27 +34,9 @@ pub struct LanguageStatus {
     pub parser_version: Option<String>,
 }
 
-/// Run the doctor check: verify all tree-sitter grammars are functional.
+/// `doctor` チェックを実行し、対応済み tree-sitter grammar を検証する。
 pub fn run_doctor() -> DoctorReport {
-    let languages = [
-        LangId::Rust,
-        LangId::C,
-        LangId::Cpp,
-        LangId::Python,
-        LangId::Javascript,
-        LangId::Typescript,
-        LangId::Tsx,
-        LangId::Go,
-        LangId::Php,
-        LangId::Java,
-        LangId::Kotlin,
-        LangId::Swift,
-        LangId::CSharp,
-        LangId::Bash,
-        LangId::Ruby,
-    ];
-
-    let statuses: Vec<LanguageStatus> = languages
+    let statuses: Vec<LanguageStatus> = SUPPORTED_LANGUAGES
         .iter()
         .map(|&lang| {
             let available = check_language(lang);
@@ -60,4 +61,41 @@ pub fn run_doctor() -> DoctorReport {
 fn check_language(lang: LangId) -> bool {
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&lang.ts_language()).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_doctor_reports_all_supported_languages() {
+        let report = run_doctor();
+        assert_eq!(report.languages.len(), SUPPORTED_LANGUAGES.len());
+        assert!(
+            report
+                .languages
+                .iter()
+                .any(|status| status.language == LangId::Zig)
+        );
+    }
+
+    #[test]
+    fn available_languages_always_include_parser_version() {
+        let report = run_doctor();
+        for status in report.languages {
+            if status.available {
+                assert!(
+                    status.parser_version.is_some(),
+                    "{:?} に parser_version がありません",
+                    status.language
+                );
+            } else {
+                assert!(
+                    status.parser_version.is_none(),
+                    "{:?} が unavailable なのに parser_version を持っています",
+                    status.language
+                );
+            }
+        }
+    }
 }

@@ -54,7 +54,10 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - 修正対象は再現可能で根拠を示せる不具合に限る。推測や好みに基づく変更は行わない
 - セキュリティ境界は fail-open にしない。設定値やサンドボックスが不正なら明示的に失敗させる
 - コード変更の前には `astro-sight context --dir . --git`、変更後には `astro-sight impact --dir . --git` を実行する
+- diff / PR 全体のレビュー依頼では、個別コマンドを積み上げる前に `astro-sight review --dir . --git` で全体像を確認する
 - diff 全体の一括レビューでは `astro-sight review --dir . --git` も併用し、影響・共変更・API 差分・死蔵シンボルをまとめて確認する
+- 公開 API や export を触った変更では `astro-sight dead-code --dir . --git` も併用して死蔵シンボルを確認する
+- 繰り返しの構造ルール確認には `astro-sight lint --path <file> --rules <rules.yaml>` を使い、アドホックなテキスト検索で代用しない
 - コードコメントは必要な箇所にだけ付け、付ける場合は日本語で簡潔に記述する
 
 ## Build & Test

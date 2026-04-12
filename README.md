@@ -346,6 +346,8 @@ astro-sight dead-code --dir . --git --staged
 astro-sight doctor
 ```
 
+`doctor` は Zig を含む 16 言語の parser 可用性を確認し、利用可能な言語には tree-sitter ABI version も返す。
+
 ### session - NDJSON ストリーミング
 
 ```bash
@@ -448,7 +450,7 @@ $ astro-sight ast --path nonexistent.rs
 | <img src="https://img.shields.io/badge/-00ADD8?logo=go&logoColor=white" height="16"> Go | `.go` | `tree-sitter-go` | 0.25 |
 | <img src="https://img.shields.io/badge/-777BB4?logo=php&logoColor=white" height="16"> PHP | `.php`, `.phtml` | `tree-sitter-php` | 0.24 |
 | <img src="https://img.shields.io/badge/-ED8B00?logo=openjdk&logoColor=white" height="16"> Java | `.java` | `tree-sitter-java` | 0.23 |
-| <img src="https://img.shields.io/badge/-7F52FF?logo=kotlin&logoColor=white" height="16"> Kotlin | `.kt`, `.kts` | `tree-sitter-kotlin` | =0.3.5 * |
+| <img src="https://img.shields.io/badge/-7F52FF?logo=kotlin&logoColor=white" height="16"> Kotlin | `.kt`, `.kts` | `tree-sitter-kotlin` | 0.3.5 * |
 | <img src="https://img.shields.io/badge/-F05138?logo=swift&logoColor=white" height="16"> Swift | `.swift` | `tree-sitter-swift` | 0.7 |
 | <img src="https://img.shields.io/badge/-512BD4?logo=dotnet&logoColor=white" height="16"> C# | `.cs` | `tree-sitter-c-sharp` | 0.23 |
 | <img src="https://img.shields.io/badge/-4EAA25?logo=gnubash&logoColor=white" height="16"> Bash | `.sh`, `.bash`, `.zsh` | `tree-sitter-bash` | 0.25 |
@@ -457,7 +459,7 @@ $ astro-sight ast --path nonexistent.rs
 
 全言語で tree-sitter クエリによる精密なシンボル抽出に対応。
 
-> **\* Kotlin バージョン固定について:** `tree-sitter-kotlin` 0.3.8 以降は `links = "tree-sitter"` を宣言しており、コアクレート `tree-sitter` 0.26 と Cargo の native library リンク名が競合してビルドできない。そのため `=0.3.5` に固定している。
+> **\* Kotlin バージョンについて:** `tree-sitter-kotlin` 0.3.8 以降は `links = "tree-sitter"` を宣言しており、コアクレート `tree-sitter` 0.26 と Cargo の native library リンク名が競合してビルドできない。現在は 0.3.5 系を利用している。
 >
 > ```
 > error: failed to select a version for `tree-sitter`.
@@ -500,7 +502,7 @@ compact 出力例（ast/symbols）:
 - **`--pretty` 時はキャッシュをスキップ**（compact 出力のみキャッシュ）
 - **`--no-cache`** で無効化可能
 
-## Claude Code との連携
+## AI エージェントとの連携
 
 ### スキルインストール
 
@@ -516,6 +518,12 @@ astro-sight skill-install codex
 
 登録後は「コールグラフを調べて」「この関数の呼び出し元は？」「diff の影響範囲は？」等の質問で自動的に起動します。
 PR や patch 全体をまとめて見たい場合は、`astro-sight review --dir . --git` まで含めて指示すると一括レビューに入りやすくなります。
+
+### CodeRabbit との併用
+
+CodeRabbit の Knowledge Base は `AGENTS.md` / `CLAUDE.md` / `.github/copilot-instructions.md` などの AI エージェント向け指示ファイルを自動で読み込みます。astro-sight の STOP-AND-CHECK ルールや `review` / `dead-code` 中心のレビュー手順をこれらのファイルに書いておくと、ローカルの AI エージェントと CodeRabbit で同じレビュー方針を共有しやすくなります。
+
+また、CodeRabbit の自動レビューでは ast-grep ベースの AST path instructions を使って構文ルールを追加できます。astro-sight はローカル側の事前確認として、CodeRabbit に送る前に `astro-sight review --dir . --git` と `astro-sight dead-code --dir . --git` を回す運用と相性が良いです。
 
 ### CLAUDE.md に追記して確実に使わせる
 
@@ -550,6 +558,7 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 
 ## Workflow Rules (MANDATORY for code changes)
 - **Before editing code**: Run `astro-sight context --dir . --git` to check impact
+- **If asked to review a diff / PR**: Run `astro-sight review --dir . --git` before piecemeal analysis
 - **After editing code**: Run `astro-sight impact --dir . --git` to detect unresolved impacts
 - **One-shot diff review**: Run `astro-sight review --dir . --git` for impact + cochange + API diff + dead symbols
 - **Understanding a file**: Run `astro-sight symbols --path <file>` to see structure
@@ -562,6 +571,7 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 - **Visualize call flow**: Run `astro-sight sequence --path <file> --function <name>`
 - **Structured diff review**: Run `astro-sight review --dir . --git`
 - **Find dead code**: Run `astro-sight dead-code --dir .` or `--git` for diff-scoped
+- **Enforce repeated structural rules**: Run `astro-sight lint --path <file> --rules rules.yaml`
 
 ## Command Quick Reference
 

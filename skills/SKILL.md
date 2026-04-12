@@ -1,6 +1,6 @@
 ---
 name: astro-sight
-description: "STOP before using Grep for code identifiers (including pipe-separated patterns like FOO|Bar). Use `refs` for identifiers, `symbols`/`calls`/`imports` for structure, `ast` for exact syntax, `context`/`impact` around edits, `review` for one-shot diff review, and `session`/`sequence`/`cochange`/`lint` when you need mixed queries, flow, hotspots, or repeated rules."
+description: "STOP before using Grep for code identifiers (including pipe-separated patterns like FOO|Bar). Use `refs` for identifiers, `review` for diff/PR review, `context`/`impact` around edits, `dead-code` for exported symbol cleanup, and `symbols`/`calls`/`imports`/`lint`/`cochange`/`sequence`/`session` for structural analysis."
 ---
 
 # astro-sight
@@ -11,6 +11,7 @@ description: "STOP before using Grep for code identifiers (including pipe-separa
 
 - Searching for a **function, class, variable, type, constant, or method name**? → `astro-sight refs` (NOT Grep)
 - Searching with **pipe-separated identifiers** like `FOO|Bar|baz`? → `astro-sight refs --names FOO,Bar,baz --dir .` (NOT Grep)
+- Asked to **review a diff / PR / recent changes end-to-end**? → `astro-sight review --dir . --git`
 - Need to **understand a file's structure** (functions, classes, structs)? → `astro-sight symbols --path <file>`
 - Need to **understand a directory's structure**? → `astro-sight symbols --dir <dir>`
 - Need to inspect the **exact syntax node at a cursor/range** or debug a parse error? → `astro-sight ast`
@@ -29,52 +30,59 @@ description: "STOP before using Grep for code identifiers (including pipe-separa
 
 **Grep is fine for**: error messages, config values, TODO comments, file path patterns — anything that is NOT a code identifier.
 
-## Quick Reference (Top Commands by Usage)
+## Quick Reference (Start Here)
 
 ```bash
-# 1. Find all references to a symbol (REPLACES Grep for identifiers)
-astro-sight refs --name <symbol_name> --dir .
-
-# 2. Batch symbol search (REPLACES Grep "FOO|Bar|baz")
-astro-sight refs --names sym1,sym2,sym3 --dir .
-
-# 3. Understand file structure (functions, classes, structs)
-astro-sight symbols --path <file>
-
-# 4. Analyze what a diff breaks (run BEFORE editing code)
-astro-sight context --dir . --git
-
-# 5. Detect unresolved impacts after edits
-astro-sight impact --dir . --git
-
-# 6. Structured review (impact + cochange + API diff + dead symbols)
+# 1. Review a diff / PR in one shot
 astro-sight review --dir . --git
 
-# 7. Show caller/callee relationships
-astro-sight calls --path <file> --function <function_name>
+# 2. Analyze what a diff breaks before editing
+astro-sight context --dir . --git
 
-# 8. Extract imports/exports
-astro-sight imports --path <file>
+# 3. Detect unresolved impacts after edits
+astro-sight impact --dir . --git
 
-# 9. Find dead (unreferenced) exported symbols
-astro-sight dead-code --dir .
-
-# 10. Find dead code related to a diff
+# 4. Find dead exported symbols before merge
 astro-sight dead-code --dir . --git
 
-# 11. Visualize call flow
-astro-sight sequence --path src/main.rs --function main
+# 5. Find all references to a symbol (REPLACES Grep for identifiers)
+astro-sight refs --name <symbol_name> --dir .
+
+# 6. Batch symbol search (REPLACES Grep "FOO|Bar|baz")
+astro-sight refs --names sym1,sym2,sym3 --dir .
+
+# 7. Understand file structure (functions, classes, structs)
+astro-sight symbols --path <file>
+
+# 8. Show caller/callee relationships
+astro-sight calls --path <file> --function <function_name>
+
+# 9. Extract imports/exports
+astro-sight imports --path <file>
+
+# 10. Inspect exact syntax when structure alone is not enough
+astro-sight ast --path <file> --line <n> --col <n>
+
+# 11. Repeated AST/text checks
+astro-sight lint --path <file> --rules rules.yaml
 
 # 12. Check change hotspots
 astro-sight cochange --dir . --file src/service.rs
 
-# 13. Batch operations — multiple queries in one process
+# 13. Visualize call flow
+astro-sight sequence --path src/main.rs --function main
+
+# 14. Batch operations — multiple queries in one process
 echo '{"command":"refs","name":"Sym1","dir":"."}
 {"command":"symbols","path":"src/main.rs"}' | astro-sight session
-
-# 14. Repeated AST/text checks
-astro-sight lint --path <file> --rules rules.yaml
 ```
+
+## Review-First Workflow
+
+- Reviewing a diff or PR? Start with `astro-sight review --dir . --git` before splitting into `context`, `impact`, `dead-code`, or `cochange`.
+- Editing code? Run `astro-sight context --dir . --git` first, then `astro-sight impact --dir . --git` after the edit.
+- Touching exported APIs or public modules? Add `astro-sight dead-code --dir . --git` before concluding the change.
+- Repeating the same structural review policy across files? Reach for `astro-sight lint` instead of ad-hoc text search.
 
 ## Low-Adoption But Useful
 
@@ -82,6 +90,7 @@ astro-sight lint --path <file> --rules rules.yaml
 - Need a **single JSON review** that combines impact, cochange, API surface changes, and dead symbols? → `astro-sight review --dir . --git`
 - Need **2+ mixed astro-sight queries** in one loop and want to avoid repeated startup cost? → `astro-sight session`
 - Need to check a **repeated rule** like banned APIs, required patterns, or AST-based policy? → `astro-sight lint --path <file> --rules rules.yaml`
+- Need to predict **co-change fallout** before missing a related file? → `astro-sight cochange --dir . --file <file>`
 
 ## Commands
 
