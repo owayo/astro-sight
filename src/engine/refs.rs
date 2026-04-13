@@ -629,12 +629,10 @@ fn count_identifier_refs(
     if is_identifier_kind(node.kind())
         && let Ok(text) = node.utf8_text(source)
         && symbol_names.contains(text)
+        && let Some(&ix) = name_to_ix.get(text)
+        && !is_definition_context(node, definition_kinds, lang_id)
     {
-        if let Some(&ix) = name_to_ix.get(text) {
-            if !is_definition_context(node, definition_kinds, lang_id) {
-                counts[ix] += 1;
-            }
-        }
+        counts[ix] += 1;
     }
 
     let mut cursor = node.walk();
