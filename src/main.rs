@@ -367,7 +367,6 @@ fn run(cli: Cli) -> Result<()> {
             base,
             staged,
         } => cmd_dead_code(
-            &service,
             &dir,
             glob.as_deref(),
             diff.as_deref(),

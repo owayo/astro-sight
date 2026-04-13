@@ -761,7 +761,7 @@ pub fn cmd_review(
     let api_changes = detect_api_changes(dir, base, &diff_files);
 
     // 6. dead symbol 検出
-    let dead_symbols = detect_dead_symbols(service, dir, &diff_files);
+    let dead_symbols = detect_dead_symbols(dir, &diff_files);
 
     let result = ReviewResult {
         impact,
@@ -1236,7 +1236,6 @@ fn reconcile_api_symbols(
 }
 
 fn detect_dead_symbols(
-    service: &AppService,
     dir: &str,
     diff_files: &[crate::models::impact::DiffFile],
 ) -> Vec<DeadSymbol> {
@@ -1248,13 +1247,13 @@ fn detect_dead_symbols(
         .filter(|f| f.new_path != "/dev/null")
         .map(|f| canonical_dir.join(&f.new_path))
         .collect();
-    detect_dead_symbols_from_files(service, dir, &files, None)
+    detect_dead_symbols_from_files(dir, &files, None)
 }
 
 /// ファイルリストからエクスポートシンボルを収集し、参照ゼロのシンボルを返す。
 /// dead-code コマンドと review コマンドの共通コアロジック。
+/// count_non_definition_refs_batch で件数のみカウントし、SymbolReference を確保しない。
 pub(crate) fn detect_dead_symbols_from_files(
-    service: &AppService,
     dir: &str,
     files: &[std::path::PathBuf],
     glob: Option<&str>,
@@ -1293,7 +1292,7 @@ pub(crate) fn detect_dead_symbols_from_files(
         *name_counts.entry(name.as_str()).or_default() += 1;
     }
 
-    // 全シンボル名をバッチ検索（O(N+S)）
+    // 全シンボル名の非 Definition 参照件数をカウント（SymbolReference を確保しない）
     let unique_names: Vec<String> = {
         let mut seen = HashSet::new();
         all_syms
@@ -1303,14 +1302,12 @@ pub(crate) fn detect_dead_symbols_from_files(
             .collect()
     };
 
-    let batch_refs = match service.find_references_batch(&unique_names, dir, glob) {
-        Ok(results) => {
-            let mut map = std::collections::HashMap::new();
-            for result in results {
-                map.insert(result.symbol.clone(), result.references);
-            }
-            map
-        }
+    let counts = match crate::engine::refs::count_non_definition_refs_batch(
+        &unique_names,
+        &canonical_dir,
+        glob,
+    ) {
+        Ok(v) => v,
         Err(_) => return Vec::new(),
     };
 
@@ -1322,16 +1319,7 @@ pub(crate) fn detect_dead_symbols_from_files(
             continue;
         }
 
-        let ref_count = batch_refs
-            .get(name)
-            .map(|refs| {
-                refs.iter()
-                    .filter(|r| r.kind != Some(crate::models::reference::RefKind::Definition))
-                    .count()
-            })
-            .unwrap_or(0);
-
-        if ref_count == 0 {
+        if counts.get(name).copied().unwrap_or(0) == 0 {
             dead.push(DeadSymbol {
                 name: name.clone(),
                 kind: kind.clone(),
@@ -1491,7 +1479,6 @@ fn filter_exported_symbols(
 
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_dead_code(
-    service: &AppService,
     dir: &str,
     glob: Option<&str>,
     diff: Option<&str>,
@@ -1554,7 +1541,7 @@ pub fn cmd_dead_code(
     };
 
     let scanned_files = files.len();
-    let dead_symbols = detect_dead_symbols_from_files(service, dir, &files, glob);
+    let dead_symbols = detect_dead_symbols_from_files(dir, &files, glob);
 
     let result = DeadCodeResult {
         dir: canonical_dir.to_string_lossy().to_string(),

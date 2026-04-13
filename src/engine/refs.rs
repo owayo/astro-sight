@@ -319,9 +319,18 @@ fn is_identifier_kind(kind: &str) -> bool {
 }
 
 /// 指定行のソース行をコンテキストとして抽出する。
+/// minified/生成コードの巨大行によるメモリ爆発を防ぐため 256B で切り詰める。
 fn extract_line_context(source: &[u8], row: usize) -> String {
+    const MAX_CTX: usize = 256;
     let text = std::str::from_utf8(source).unwrap_or("");
-    text.lines().nth(row).unwrap_or("").trim().to_string()
+    let line = text.lines().nth(row).unwrap_or("").trim();
+    if line.len() <= MAX_CTX {
+        line.to_string()
+    } else {
+        // UTF-8 境界で安全に切り詰める
+        let truncated = &line[..line.floor_char_boundary(MAX_CTX)];
+        format!("{truncated}...")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +340,9 @@ fn extract_line_context(source: &[u8], row: usize) -> String {
 /// 全シンボル名の参照を1回のディレクトリウォークで検索する。
 /// シンボル名→参照リストのマップを返す。
 /// Aho-Corasick オートマトンによる効率的なマルチパターン事前フィルタを使用。
+///
+/// fold/reduce でワーカー局所バケットに直接統合し、
+/// per_file Vec + merged HashMap の二重保持を回避する。
 pub fn find_references_batch(
     symbol_names: &[String],
     dir: &Path,
@@ -342,30 +354,50 @@ pub fn find_references_batch(
         return Ok(HashMap::new());
     }
 
-    // Aho-Corasick オートマトンを1回構築し、全ファイルで共有する
     let ac = aho_corasick::AhoCorasick::new(symbol_names)
         .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))?;
 
     let files = collect_files(dir, glob_pattern)?;
-
-    let per_file: Vec<HashMap<String, Vec<SymbolReference>>> = files
-        .par_iter()
-        .filter_map(|path| {
-            let utf8_path = camino::Utf8Path::new(path.to_str()?);
-            find_refs_batch_in_file(symbol_names, &ac, utf8_path).ok()
-        })
+    let name_to_ix: HashMap<&str, usize> = symbol_names
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
         .collect();
 
-    // ファイルごとの結果をマージ
-    let mut merged: HashMap<String, Vec<SymbolReference>> = HashMap::new();
-    for file_map in per_file {
-        for (name, refs) in file_map {
-            merged.entry(name).or_default().extend(refs);
-        }
-    }
+    // fold/reduce: ワーカーごとに Vec<Vec<SymbolReference>> を持ち、直接統合
+    let mut buckets: Vec<Vec<SymbolReference>> = files
+        .into_par_iter()
+        .fold(
+            || vec![Vec::new(); symbol_names.len()],
+            |mut local, path| {
+                let Some(path_str) = path.to_str() else {
+                    return local;
+                };
+                let utf8_path = camino::Utf8Path::new(path_str);
+                if let Ok(per_file) =
+                    find_refs_batch_in_file_indexed(symbol_names, &name_to_ix, &ac, utf8_path)
+                {
+                    for (ix, mut refs) in per_file.into_iter().enumerate() {
+                        local[ix].append(&mut refs);
+                    }
+                }
+                local
+            },
+        )
+        .reduce(
+            || vec![Vec::new(); symbol_names.len()],
+            |mut acc, mut local| {
+                for (acc_refs, local_refs) in acc.iter_mut().zip(local.iter_mut()) {
+                    acc_refs.append(local_refs);
+                }
+                acc
+            },
+        );
 
-    // 各シンボルの参照をソート: 定義を先頭に、その後パス/行番号順
-    for refs in merged.values_mut() {
+    let mut merged = HashMap::with_capacity(symbol_names.len());
+    for (i, name) in symbol_names.iter().enumerate() {
+        let mut refs = std::mem::take(&mut buckets[i]);
+        // ソート: 定義を先頭に、その後パス/行番号順
         refs.sort_by(|a, b| {
             let def_order = |k: &Option<RefKind>| match k {
                 Some(RefKind::Definition) => 0,
@@ -376,51 +408,110 @@ pub fn find_references_batch(
                 .then_with(|| a.path.cmp(&b.path))
                 .then_with(|| a.line.cmp(&b.line))
         });
+        if !refs.is_empty() {
+            merged.insert(name.clone(), refs);
+        }
     }
 
     Ok(merged)
 }
 
-/// 単一ファイル内で複数シンボルの参照を検索する（1回のパースで処理）。
-/// 事前構築した Aho-Corasick オートマトンで O(file_size) のマルチパターンフィルタを使用。
-fn find_refs_batch_in_file(
+/// dead-code 判定用: フル SymbolReference を作らず非 Definition 参照の件数のみ返す。
+/// SymbolReference のヒープ確保を全排除し、メモリ消費を大幅に削減する。
+pub fn count_non_definition_refs_batch(
     symbol_names: &[String],
+    dir: &Path,
+    glob_pattern: Option<&str>,
+) -> Result<std::collections::HashMap<String, usize>> {
+    use std::collections::HashMap;
+
+    if symbol_names.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let ac = aho_corasick::AhoCorasick::new(symbol_names)
+        .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))?;
+
+    let name_to_ix: HashMap<&str, usize> = symbol_names
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
+
+    let files = collect_files(dir, glob_pattern)?;
+
+    let counts: Vec<usize> = files
+        .into_par_iter()
+        .fold(
+            || vec![0usize; symbol_names.len()],
+            |mut local, path| {
+                let Some(path_str) = path.to_str() else {
+                    return local;
+                };
+                let utf8_path = camino::Utf8Path::new(path_str);
+                if let Ok(per_file) = count_refs_in_file(symbol_names, &name_to_ix, &ac, utf8_path)
+                {
+                    for (ix, cnt) in per_file.into_iter().enumerate() {
+                        local[ix] += cnt;
+                    }
+                }
+                local
+            },
+        )
+        .reduce(
+            || vec![0usize; symbol_names.len()],
+            |mut acc, local| {
+                for (a, b) in acc.iter_mut().zip(local) {
+                    *a += b;
+                }
+                acc
+            },
+        );
+
+    Ok(symbol_names.iter().cloned().zip(counts).collect())
+}
+
+/// 単一ファイル内で複数シンボルの参照を index ベースの Vec に格納する。
+/// find_references_batch の fold/reduce から呼ばれる。
+fn find_refs_batch_in_file_indexed(
+    symbol_names: &[String],
+    name_to_ix: &std::collections::HashMap<&str, usize>,
     ac: &aho_corasick::AhoCorasick,
     path: &camino::Utf8Path,
-) -> Result<std::collections::HashMap<String, Vec<SymbolReference>>> {
-    use std::collections::{HashMap, HashSet};
+) -> Result<Vec<Vec<SymbolReference>>> {
+    use std::collections::HashSet;
 
+    let num = symbol_names.len();
     let source = parser::read_file(path)?;
 
-    // マルチパターン事前フィルタ: 1パスでこのファイルに含まれるシンボルを特定
+    // マルチパターン事前フィルタ
     let mut present_indices: HashSet<usize> = HashSet::new();
     for mat in ac.find_overlapping_iter(source.as_bytes()) {
         present_indices.insert(mat.pattern().as_usize());
-        if present_indices.len() == symbol_names.len() {
-            break; // 全パターン検出済み
+        if present_indices.len() == num {
+            break;
         }
     }
 
     if present_indices.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(vec![Vec::new(); num]);
     }
 
-    let present: Vec<&String> = present_indices.iter().map(|&i| &symbol_names[i]).collect();
+    let name_set: HashSet<&str> = present_indices
+        .iter()
+        .map(|&i| symbol_names[i].as_str())
+        .collect();
 
     let (tree, lang_id) = parser::parse_file(path, &source)?;
     let root = tree.root_node();
     let definition_kinds = definition_node_kinds(lang_id);
 
-    let mut result: HashMap<String, Vec<SymbolReference>> = HashMap::new();
-
-    // O(1) ルックアップ用 HashSet を1回だけ構築
-    let name_set: std::collections::HashSet<&str> = present.iter().map(|s| s.as_str()).collect();
-
-    // AST を1回走査し、含まれるシンボルを全てチェック
-    collect_identifier_refs_batch(
+    let mut result = vec![Vec::new(); num];
+    collect_identifier_refs_indexed(
         root,
         &source,
         &name_set,
+        name_to_ix,
         path.as_str(),
         definition_kinds,
         lang_id,
@@ -430,49 +521,132 @@ fn find_refs_batch_in_file(
     Ok(result)
 }
 
-/// AST を再帰走査し、指定シンボル群に一致する identifier ノードを収集する。
-/// symbol_names は呼び出し元で構築済みの HashSet（O(1) ルックアップ）。
-fn collect_identifier_refs_batch(
+/// AST を再帰走査し、シンボル index ベースの Vec に参照を格納する。
+#[allow(clippy::too_many_arguments)]
+fn collect_identifier_refs_indexed(
     node: Node<'_>,
     source: &[u8],
     symbol_names: &std::collections::HashSet<&str>,
+    name_to_ix: &std::collections::HashMap<&str, usize>,
     path: &str,
     definition_kinds: &[&str],
     lang_id: LangId,
-    refs: &mut std::collections::HashMap<String, Vec<SymbolReference>>,
+    refs: &mut [Vec<SymbolReference>],
+) {
+    if is_identifier_kind(node.kind())
+        && let Ok(text) = node.utf8_text(source)
+        && symbol_names.contains(text)
+        && let Some(&ix) = name_to_ix.get(text)
+    {
+        let is_def = is_definition_context(node, definition_kinds, lang_id);
+        let context = extract_line_context(source, node.start_position().row);
+
+        refs[ix].push(SymbolReference {
+            path: path.to_string(),
+            line: node.start_position().row,
+            column: node.start_position().column,
+            context: Some(context),
+            kind: Some(if is_def {
+                RefKind::Definition
+            } else {
+                RefKind::Reference
+            }),
+        });
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_identifier_refs_indexed(
+            child,
+            source,
+            symbol_names,
+            name_to_ix,
+            path,
+            definition_kinds,
+            lang_id,
+            refs,
+        );
+    }
+}
+
+/// 単一ファイル内の非 Definition 参照件数をカウントする（SymbolReference を確保しない）。
+fn count_refs_in_file(
+    symbol_names: &[String],
+    name_to_ix: &std::collections::HashMap<&str, usize>,
+    ac: &aho_corasick::AhoCorasick,
+    path: &camino::Utf8Path,
+) -> Result<Vec<usize>> {
+    use std::collections::HashSet;
+
+    let num = symbol_names.len();
+    let source = parser::read_file(path)?;
+
+    let mut present_indices: HashSet<usize> = HashSet::new();
+    for mat in ac.find_overlapping_iter(source.as_bytes()) {
+        present_indices.insert(mat.pattern().as_usize());
+        if present_indices.len() == num {
+            break;
+        }
+    }
+
+    if present_indices.is_empty() {
+        return Ok(vec![0; num]);
+    }
+
+    let name_set: HashSet<&str> = present_indices
+        .iter()
+        .map(|&i| symbol_names[i].as_str())
+        .collect();
+
+    let (tree, lang_id) = parser::parse_file(path, &source)?;
+    let root = tree.root_node();
+    let definition_kinds = definition_node_kinds(lang_id);
+
+    let mut counts = vec![0usize; num];
+    count_identifier_refs(
+        root,
+        &source,
+        &name_set,
+        name_to_ix,
+        definition_kinds,
+        lang_id,
+        &mut counts,
+    );
+
+    Ok(counts)
+}
+
+/// AST を再帰走査し、非 Definition 参照の件数のみカウントする。
+fn count_identifier_refs(
+    node: Node<'_>,
+    source: &[u8],
+    symbol_names: &std::collections::HashSet<&str>,
+    name_to_ix: &std::collections::HashMap<&str, usize>,
+    definition_kinds: &[&str],
+    lang_id: LangId,
+    counts: &mut [usize],
 ) {
     if is_identifier_kind(node.kind())
         && let Ok(text) = node.utf8_text(source)
         && symbol_names.contains(text)
     {
-        let is_def = is_definition_context(node, definition_kinds, lang_id);
-        let context = extract_line_context(source, node.start_position().row);
-
-        refs.entry(text.to_string())
-            .or_default()
-            .push(SymbolReference {
-                path: path.to_string(),
-                line: node.start_position().row,
-                column: node.start_position().column,
-                context: Some(context),
-                kind: Some(if is_def {
-                    RefKind::Definition
-                } else {
-                    RefKind::Reference
-                }),
-            });
+        if let Some(&ix) = name_to_ix.get(text) {
+            if !is_definition_context(node, definition_kinds, lang_id) {
+                counts[ix] += 1;
+            }
+        }
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_identifier_refs_batch(
+        count_identifier_refs(
             child,
             source,
             symbol_names,
-            path,
+            name_to_ix,
             definition_kinds,
             lang_id,
-            refs,
+            counts,
         );
     }
 }
