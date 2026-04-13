@@ -96,7 +96,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "astro-sight"
-version = "26.4.106"
+version = "26.4.107"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -1692,6 +1692,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-ruby"
 version = "26.4.100"
+source = "git+https://github.com/owayo/tree-sitter-ruby.git?branch=master#8cc0c85738c684c989a93e7994a52764160d8672"
 dependencies = [
  "cc",
  "tree-sitter-language",
