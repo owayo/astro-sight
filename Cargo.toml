@@ -13,12 +13,12 @@ categories = ["command-line-utilities", "development-tools"]
 anyhow = "1.0.102"
 blake3 = "1.8.4"
 camino = { version = "1.2.2", features = ["serde1"] }
-clap = { version = "4.6.0", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive"] }
 aho-corasick = "1.1.4"
 ignore = "0.4.25"
 memchr = "2.8.0"
 memmap2 = "0.9.10"
-rayon = "1.11.0"
+rayon = "1.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 serde_yaml = "0.9.33"
@@ -34,15 +34,16 @@ tree-sitter-typescript = "0.23.2"
 tree-sitter-go = "0.25"
 tree-sitter-php = "0.24.2"
 tree-sitter-java = "0.23.5"
+# tree-sitter-kotlin 0.3.6+ は tree-sitter 0.21/0.22 系を要求するため links 衝突で 0.3.5 に固定
 tree-sitter-kotlin = "0.3.5"
 tree-sitter-swift = "0.7.1"
-tree-sitter-c-sharp = "0.23.1"
+tree-sitter-c-sharp = "0.23.5"
 tree-sitter-bash = "0.25.1"
 tree-sitter-ruby = { git = "https://github.com/owayo/tree-sitter-ruby.git", branch = "master" }
 tree-sitter-html = "0.23.2"
 tree-sitter-css = "0.25"
 rmcp = { version = "1.4.0", features = ["server", "macros", "transport-io"] }
-tokio = { version = "1.51.1", features = ["full"] }
+tokio = { version = "1.52.0", features = ["full"] }
 schemars = "1.2.1"
 dirs = "6.0.0"
 toml = "1.1.2"
@@ -56,7 +57,7 @@ tree-sitter-xojo = { git = "https://github.com/owayo/tree-sitter-xojo.git", bran
 
 [dev-dependencies]
 tempfile = "3.27.0"
-libc = "0.2.184"
+libc = "0.2.185"
 
 [profile.release]
 lto = true
