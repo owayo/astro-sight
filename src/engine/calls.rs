@@ -116,6 +116,13 @@ fn function_node_kinds(lang_id: LangId) -> &'static [&'static str] {
         LangId::Bash => &["function_definition"],
         LangId::Ruby => &["method", "singleton_method"],
         LangId::Zig => &["function_declaration", "test_declaration"],
+        LangId::Xojo => &[
+            "sub_declaration",
+            "function_declaration",
+            "constructor_declaration",
+            "destructor_declaration",
+            "event_declaration",
+        ],
     }
 }
 
@@ -251,6 +258,12 @@ fn call_query(lang_id: LangId) -> &'static str {
             (call_expression function: (field_expression member: (identifier) @method.callee))
             "#
         }
+        LangId::Xojo => {
+            r#"
+            (array_or_call_expression function: (identifier) @direct.callee)
+            (array_or_call_expression function: (member_expression property: (identifier) @method.callee))
+            "#
+        }
     }
 }
 
@@ -325,6 +338,8 @@ mod tests {
             LangId::CSharp,
             LangId::Bash,
             LangId::Ruby,
+            LangId::Zig,
+            LangId::Xojo,
         ];
         for lang in &languages {
             let q = call_query(*lang);
@@ -351,6 +366,8 @@ mod tests {
             LangId::CSharp,
             LangId::Bash,
             LangId::Ruby,
+            LangId::Zig,
+            LangId::Xojo,
         ];
         for lang in &languages {
             let kinds = function_node_kinds(*lang);

@@ -1277,7 +1277,9 @@ pub(crate) fn detect_dead_symbols_from_files(
     let gitattrs = crate::engine::gitattributes::GitAttributes::load(&canonical_dir);
 
     // 全ファイルのエクスポートシンボルを収集（trait impl メソッドは除外）
-    let mut all_syms: Vec<(String, String, String)> = Vec::new(); // (name, kind, file)
+    // (original_name, kind, file, lang_id) — case-insensitive 言語では lang_id で
+    // シンボル名を正規化した比較を行うため lang も保持する。
+    let mut all_syms: Vec<(String, String, String, crate::language::LangId)> = Vec::new();
     for path in files {
         // canonicalize で削除済みファイルをスキップ、dir 外のパスも除外
         let canonical_path = match std::fs::canonicalize(path) {
@@ -1291,9 +1293,13 @@ pub(crate) fn detect_dead_symbols_from_files(
         if gitattrs.is_generated(&rel) {
             continue;
         }
+        let lang = match crate::language::LangId::from_path(camino::Utf8Path::new(&rel)) {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
         if let Some(syms) = extract_dead_code_candidates_from_file(dir, &rel) {
             for (name, kind, _sig) in syms {
-                all_syms.push((name, kind, rel.clone()));
+                all_syms.push((name, kind, rel.clone(), lang));
             }
         }
     }
@@ -1302,18 +1308,25 @@ pub(crate) fn detect_dead_symbols_from_files(
         return Vec::new();
     }
 
-    // 同名 export が複数ファイルに存在する場合は保守的にスキップ（誤判定防止）
-    let mut name_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for (name, _, _) in &all_syms {
-        *name_counts.entry(name.as_str()).or_default() += 1;
+    let norm = |lang: crate::language::LangId, n: &str| -> String {
+        crate::language::normalize_identifier(lang, n).into_owned()
+    };
+
+    // 同名 export が複数ファイルに存在する場合は保守的にスキップ（誤判定防止）。
+    // キーは言語別に正規化する (Xojo では `Foo` と `FOO` を同一視)。
+    let mut name_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (name, _, _, lang) in &all_syms {
+        *name_counts.entry(norm(*lang, name)).or_default() += 1;
     }
 
-    // 全シンボル名の非 Definition 参照件数をカウント（SymbolReference を確保しない）
+    // 全シンボル名の非 Definition 参照件数をカウント（SymbolReference を確保しない）。
+    // 入力も正規化済みキーで渡し、refs 側の HashMap キーと lookup を一致させる。
     let unique_names: Vec<String> = {
         let mut seen = HashSet::new();
         all_syms
             .iter()
-            .map(|(name, _, _)| name.clone())
+            .map(|(name, _, _, lang)| norm(*lang, name))
             .filter(|n| seen.insert(n.clone()))
             .collect()
     };
@@ -1329,13 +1342,14 @@ pub(crate) fn detect_dead_symbols_from_files(
 
     // 定義以外の参照が0件のシンボルを dead として報告
     let mut dead = Vec::new();
-    for (name, kind, file) in &all_syms {
+    for (name, kind, file, lang) in &all_syms {
+        let key = norm(*lang, name);
         // 同名 export が複数ファイルにある場合は判定不能なのでスキップ
-        if name_counts.get(name.as_str()).copied().unwrap_or(0) > 1 {
+        if name_counts.get(&key).copied().unwrap_or(0) > 1 {
             continue;
         }
 
-        if counts.get(name).copied().unwrap_or(0) == 0 {
+        if counts.get(&key).copied().unwrap_or(0) == 0 {
             dead.push(DeadSymbol {
                 name: name.clone(),
                 kind: kind.clone(),

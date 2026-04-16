@@ -1,10 +1,23 @@
+use crate::language::{LangId, normalize_identifier};
 use crate::models::impact::{AffectedSymbol, SignatureChange};
+
+/// case-insensitive な言語では haystack / needle を正規化した上で contains 判定する。
+fn text_contains(haystack: &str, needle: &str, lang: LangId) -> bool {
+    if lang.is_case_insensitive() {
+        normalize_identifier(lang, haystack)
+            .as_ref()
+            .contains(normalize_identifier(lang, needle).as_ref())
+    } else {
+        haystack.contains(needle)
+    }
+}
 
 /// diff 内の削除行(-)と追加行(+)から、affected シンボルの関数シグネチャ変更を検出する。
 pub(crate) fn detect_signature_changes(
     diff_input: &str,
     file_path: &str,
     affected: &[AffectedSymbol],
+    lang_id: LangId,
 ) -> Vec<SignatureChange> {
     let mut changes = Vec::new();
     let mut in_file = false;
@@ -35,8 +48,8 @@ pub(crate) fn detect_signature_changes(
             continue;
         }
 
-        let old_sig = find_signature_in_lines(&removed_lines, &sym.name);
-        let new_sig = find_signature_in_lines(&added_lines, &sym.name);
+        let old_sig = find_signature_in_lines(&removed_lines, &sym.name, lang_id);
+        let new_sig = find_signature_in_lines(&added_lines, &sym.name, lang_id);
 
         if let (Some(old), Some(new)) = (old_sig, new_sig)
             && old != new
@@ -53,10 +66,14 @@ pub(crate) fn detect_signature_changes(
 }
 
 /// 指定された関数名を含むシグネチャ行を検索する。
-pub(crate) fn find_signature_in_lines(lines: &[String], func_name: &str) -> Option<String> {
+pub(crate) fn find_signature_in_lines(
+    lines: &[String],
+    func_name: &str,
+    lang_id: LangId,
+) -> Option<String> {
     for line in lines {
         let trimmed = line.trim();
-        if trimmed.contains(func_name) && is_signature_line(trimmed) {
+        if text_contains(trimmed, func_name, lang_id) && is_signature_line(trimmed) {
             return Some(trimmed.to_string());
         }
     }
@@ -72,6 +89,18 @@ pub(crate) fn is_signature_line(line: &str) -> bool {
     // 言語固有の関数定義キーワード（十分に特異的なのでそのままマッチ）
     let lang_keywords = ["fn ", "def ", "function ", "func ", "fun "];
     if lang_keywords.iter().any(|kw| line.contains(kw)) {
+        return true;
+    }
+
+    // Xojo: `Function X(...)`, `Sub X(...)`, `Event X(...)` で宣言する。
+    // 言語仕様上 case-insensitive のため ASCII case-insensitive で判定する。
+    let xojo_keywords = ["function ", "sub ", "event "];
+    let lower_prefix: String = line
+        .chars()
+        .take(40)
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    if xojo_keywords.iter().any(|kw| lower_prefix.contains(kw)) {
         return true;
     }
 
@@ -105,6 +134,7 @@ pub(crate) fn is_definition_header_in_changed_lines(
     file_path: &str,
     symbol_name: &str,
     kind: &str,
+    lang_id: LangId,
 ) -> bool {
     let keywords: &[&str] = match kind {
         "trait" => &["trait"],
@@ -126,7 +156,7 @@ pub(crate) fn is_definition_header_in_changed_lines(
             let content = &line[1..];
             for kw in keywords {
                 let pattern = format!("{kw} {symbol_name}");
-                if content.contains(&pattern) {
+                if text_contains(content, &pattern, lang_id) {
                     return true;
                 }
             }
@@ -144,6 +174,7 @@ pub(crate) fn is_symbol_in_changed_lines(
     diff_input: &str,
     file_path: &str,
     symbol_name: &str,
+    lang_id: LangId,
 ) -> bool {
     let mut in_file = false;
 
@@ -153,7 +184,7 @@ pub(crate) fn is_symbol_in_changed_lines(
         } else if in_file
             && ((line.starts_with('+') && !line.starts_with("+++"))
                 || (line.starts_with('-') && !line.starts_with("---")))
-            && line[1..].contains(symbol_name)
+            && text_contains(&line[1..], symbol_name, lang_id)
         {
             return true;
         }
@@ -190,6 +221,20 @@ mod tests {
         ));
         assert!(is_signature_line("def handle_request(self):"));
         assert!(is_signature_line("function calculate() {"));
+    }
+
+    // Xojo の Function/Sub/Event 宣言は case-insensitive に判定される
+    #[test]
+    fn is_signature_line_xojo_keywords() {
+        assert!(is_signature_line(
+            "\t\tFunction Greet(name as String = \"\") As String"
+        ));
+        assert!(is_signature_line("\tSub DoThing(value as Integer)"));
+        assert!(is_signature_line("    Event Triggered(code as Integer)"));
+        // 大文字混在でも OK
+        assert!(is_signature_line(
+            "  FUNCTION Compute(x as Double) as Double"
+        ));
     }
 
     // 通常のコード行はシグネチャ行と判定されない
@@ -250,8 +295,18 @@ mod tests {
     #[test]
     fn is_symbol_in_changed_lines_present() {
         let diff = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,3 @@\n-fn old_func() {}\n+fn new_func() {}";
-        assert!(is_symbol_in_changed_lines(diff, "src/lib.rs", "old_func"));
-        assert!(is_symbol_in_changed_lines(diff, "src/lib.rs", "new_func"));
+        assert!(is_symbol_in_changed_lines(
+            diff,
+            "src/lib.rs",
+            "old_func",
+            LangId::Rust
+        ));
+        assert!(is_symbol_in_changed_lines(
+            diff,
+            "src/lib.rs",
+            "new_func",
+            LangId::Rust
+        ));
     }
 
     // 変更行にシンボル名が含まれない場合 false を返す
@@ -261,7 +316,8 @@ mod tests {
         assert!(!is_symbol_in_changed_lines(
             diff,
             "src/lib.rs",
-            "other_func"
+            "other_func",
+            LangId::Rust
         ));
     }
 
@@ -281,7 +337,7 @@ mod tests {
             kind: "function".to_string(),
             change_type: "modified".to_string(),
         }];
-        let changes = detect_signature_changes(diff, "src/lib.rs", &affected);
+        let changes = detect_signature_changes(diff, "src/lib.rs", &affected, LangId::Rust);
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].name, "greet");
         assert!(changes[0].old_signature.contains("greet()"));
@@ -304,7 +360,7 @@ mod tests {
             kind: "function".to_string(),
             change_type: "modified".to_string(),
         }];
-        let changes = detect_signature_changes(diff, "src/lib.rs", &affected);
+        let changes = detect_signature_changes(diff, "src/lib.rs", &affected, LangId::Rust);
         assert!(changes.is_empty());
     }
 
@@ -322,7 +378,7 @@ mod tests {
             kind: "struct".to_string(),
             change_type: "modified".to_string(),
         }];
-        let changes = detect_signature_changes(diff, "src/lib.rs", &affected);
+        let changes = detect_signature_changes(diff, "src/lib.rs", &affected, LangId::Rust);
         assert!(changes.is_empty());
     }
 
@@ -340,7 +396,7 @@ mod tests {
             kind: "function".to_string(),
             change_type: "modified".to_string(),
         }];
-        let changes = detect_signature_changes(diff, "src/lib.rs", &affected);
+        let changes = detect_signature_changes(diff, "src/lib.rs", &affected, LangId::Rust);
         assert!(changes.is_empty());
     }
 
@@ -357,7 +413,8 @@ mod tests {
             diff,
             "src/lib.rs",
             "GuestMemory",
-            "trait"
+            "trait",
+            LangId::Rust
         ));
     }
 
@@ -374,7 +431,8 @@ mod tests {
             diff,
             "src/lib.rs",
             "GuestMemory",
-            "trait"
+            "trait",
+            LangId::Rust
         ));
     }
 
@@ -385,7 +443,8 @@ mod tests {
             "",
             "src/lib.rs",
             "foo",
-            "function"
+            "function",
+            LangId::Rust
         ));
     }
 }

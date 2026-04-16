@@ -369,7 +369,8 @@ astro-sight dead-code --dir . --git
 
 ## Notes
 
-- 16 languages: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby, Zig
+- 17 languages: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby, Zig, Xojo
+- Xojo files (`.xojo_code`, `.xojo_window`, `.xojo_menu`, `.xojo_toolbar`, `.xojo_report`, `.rbbas`) use **case-insensitive identifier matching** (`myVar` and `MYVAR` are the same symbol)
 - All output is compact JSON by default (short keys: `lang`, `ln`, `col`, `ctx`, `refs`, `src`, `def`/`ref`, `fn` etc.)
 - Use `--pretty` (global flag) for human-readable formatted JSON output
 - `refs` results include `ctx` (source line) — no need to Read files afterward

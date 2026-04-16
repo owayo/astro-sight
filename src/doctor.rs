@@ -1,7 +1,7 @@
 use crate::language::LangId;
 use serde::Serialize;
 
-const SUPPORTED_LANGUAGES: [LangId; 16] = [
+const SUPPORTED_LANGUAGES: [LangId; 17] = [
     LangId::Rust,
     LangId::C,
     LangId::Cpp,
@@ -18,6 +18,7 @@ const SUPPORTED_LANGUAGES: [LangId; 16] = [
     LangId::Bash,
     LangId::Ruby,
     LangId::Zig,
+    LangId::Xojo,
 ];
 
 #[derive(Debug, Serialize)]

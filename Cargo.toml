@@ -52,6 +52,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
 tracing-appender = "0.2.4"
 time = { version = "0.3.47", features = ["formatting", "macros", "local-offset"] }
 tree-sitter-zig = "1.1.2"
+tree-sitter-xojo = { git = "https://github.com/owayo/tree-sitter-xojo.git", branch = "main" }
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -141,6 +141,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-swift",
  "tree-sitter-typescript",
+ "tree-sitter-xojo",
  "tree-sitter-zig",
 ]
 
@@ -1722,6 +1723,15 @@ name = "tree-sitter-typescript"
 version = "0.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c5f76ed8d947a75cc446d5fccd8b602ebf0cde64ccf2ffa434d873d7a575eff"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-xojo"
+version = "0.1.0"
+source = "git+https://github.com/owayo/tree-sitter-xojo.git?branch=main#bd7690c6fd26ebb4b23bb8c1ecd58da373b1a3a2"
 dependencies = [
  "cc",
  "tree-sitter-language",

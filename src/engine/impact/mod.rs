@@ -8,7 +8,7 @@ use anyhow::Result;
 use camino::Utf8Path;
 
 use crate::engine::{calls, diff, parser, refs, symbols};
-use crate::language::LangId;
+use crate::language::{LangId, normalize_identifier};
 use crate::models::call::CallEdge;
 use crate::models::impact::{
     AffectedSymbol, ContextResult, DiffFile, FileImpact, HunkInfo, ImpactedCaller, SignatureChange,
@@ -33,6 +33,13 @@ struct FileContext {
 
 /// キャッシュされたパース結果: (tree, ソースバイト列, 言語)。
 type ParsedFile = (tree_sitter::Tree, Vec<u8>, LangId);
+
+/// 言語別にシンボル名を正規化した HashMap/HashSet キー。
+/// 非 CI 言語ではアロケーション無し (Cow::Borrowed → into_owned は元の String 相当)、
+/// CI 言語 (Xojo) では Unicode-aware に小文字化する。
+fn ci_key(lang: LangId, name: &str) -> String {
+    normalize_identifier(lang, name).into_owned()
+}
 
 /// unified diff のワークスペースディレクトリ内での影響を解析する。
 ///
@@ -134,11 +141,12 @@ fn collect_affected_symbols(
                 true
             })
             .collect();
-        let sig_changes = detect_signature_changes(diff_input, &df.new_path, &affected);
+        let sig_changes = detect_signature_changes(diff_input, &df.new_path, &affected, lang_id);
         let call_edges = calls::extract_calls(root, &source, lang_id, None).unwrap_or_default();
 
         for sym in &affected {
-            if symbol_name_set.contains(&sym.name) {
+            let sym_key = ci_key(lang_id, &sym.name);
+            if symbol_name_set.contains(&sym_key) {
                 continue;
             }
             if !should_include_for_cross_file(
@@ -154,18 +162,20 @@ fn collect_affected_symbols(
             ) {
                 continue;
             }
-            included_symbols.insert(sym.name.clone());
+            included_symbols.insert(sym_key.clone());
             if let Some(orig) = find_overlapping_symbol(&syms, &sym.name, &df.hunks)
                 && let Some(parent_type) =
                     find_parent_type_name(root, &source, &orig.range, lang_id)
             {
-                method_parent_types.insert(sym.name.clone(), parent_type.clone());
-                if symbol_name_set.insert(parent_type.clone()) {
-                    all_symbol_names.push(parent_type);
+                let parent_key = ci_key(lang_id, &parent_type);
+                method_parent_types.insert(sym_key.clone(), parent_key.clone());
+                if symbol_name_set.insert(parent_key.clone()) {
+                    all_symbol_names.push(parent_key);
                 }
             }
-            symbol_name_set.insert(sym.name.clone());
-            all_symbol_names.push(sym.name.clone());
+            if symbol_name_set.insert(sym_key.clone()) {
+                all_symbol_names.push(sym_key);
+            }
         }
 
         let hunks = df
@@ -217,16 +227,18 @@ fn assemble_impacts(
 
         let source_lang_group = lang_compat_group(ctx.lang_id);
         for sym in &ctx.affected {
-            if !included_symbols.contains(&sym.name) {
+            let sym_key = ci_key(ctx.lang_id, &sym.name);
+            if !included_symbols.contains(&sym_key) {
                 continue;
             }
-            if let Some(caller_refs) = batch_refs.get(&sym.name) {
+            if let Some(caller_refs) = batch_refs.get(&sym_key) {
                 for r in caller_refs {
                     if !is_relevant_cross_file_ref(
                         r,
                         &ctx.new_path,
                         source_lang_group,
-                        &sym.name,
+                        ctx.lang_id,
+                        &sym_key,
                         method_parent_types,
                         batch_refs,
                         &mut target_file_cache,
@@ -250,10 +262,13 @@ fn assemble_impacts(
         }
 
         for sym in &ctx.affected {
+            let sym_key = ci_key(ctx.lang_id, &sym.name);
             for edge in &ctx.call_edges {
-                if edge.callee.name == sym.name {
+                if ci_key(ctx.lang_id, &edge.callee.name) == sym_key {
                     let caller_line = edge.call_site.line;
-                    if !ctx.affected.iter().any(|a| a.name == edge.caller.name) {
+                    if !ctx.affected.iter().any(|a| {
+                        ci_key(ctx.lang_id, &a.name) == ci_key(ctx.lang_id, &edge.caller.name)
+                    }) {
                         let key = (ctx.new_path.clone(), caller_line);
                         let entry = caller_map
                             .entry(key)
@@ -333,8 +348,9 @@ fn should_include_for_cross_file(
     if matches!(
         sym.kind.as_str(),
         "trait" | "struct" | "class" | "interface" | "enum"
-    ) && !is_definition_header_in_changed_lines(diff_input, file_path, &sym.name, &sym.kind)
-    {
+    ) && !is_definition_header_in_changed_lines(
+        diff_input, file_path, &sym.name, &sym.kind, lang_id,
+    ) {
         return false;
     }
     // 4. エクスポートされていないシンボルをスキップ
@@ -344,7 +360,7 @@ fn should_include_for_cross_file(
         return false;
     }
     // 5. 変更行にシンボル名が出現しない場合スキップ
-    if !is_symbol_in_changed_lines(diff_input, file_path, &sym.name) {
+    if !is_symbol_in_changed_lines(diff_input, file_path, &sym.name, lang_id) {
         return false;
     }
     true
@@ -359,10 +375,12 @@ fn should_include_for_cross_file(
 /// 4. ターゲットファイルに親型が存在しない参照をスキップ（メソッド型スコーピング）
 /// 5. ターゲットファイルのテストコンテキスト内の参照をスキップ
 /// 6. import/re-export 行をスキップ（シンボルの型情報を使わず名前だけ経由する行）
+#[allow(clippy::too_many_arguments)]
 fn is_relevant_cross_file_ref(
     r: &SymbolReference,
     source_path: &str,
     source_lang_group: u8,
+    _source_lang: LangId,
     sym_name: &str,
     method_parent_types: &HashMap<String, String>,
     batch_refs: &HashMap<String, Vec<SymbolReference>>,
@@ -661,6 +679,7 @@ fn lang_compat_group(lang: LangId) -> u8 {
         LangId::Ruby => 9,
         LangId::Bash => 10,
         LangId::Zig => 11,
+        LangId::Xojo => 12,
     }
 }
 
@@ -750,6 +769,7 @@ mod tests {
             &r,
             "src/main.rs",
             0,
+            LangId::Rust,
             "foo",
             &HashMap::new(),
             &HashMap::new(),
@@ -772,6 +792,7 @@ mod tests {
             &r,
             "src/main.rs",
             0,
+            LangId::Rust,
             "foo",
             &HashMap::new(),
             &HashMap::new(),
@@ -795,6 +816,7 @@ mod tests {
             &r,
             "main.rs",
             0,
+            LangId::Rust,
             "foo",
             &HashMap::new(),
             &HashMap::new(),

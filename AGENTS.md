@@ -5,7 +5,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 ## Architecture
 
 - **AppService 層** — CLI / Session / MCP の統一コアロジック（`src/service.rs`）
-- **tree-sitter** ベースの構文解析エンジン（16言語対応）
+- **tree-sitter** ベースの構文解析エンジン（17言語対応、Xojo は case-insensitive 識別子）
 - **BLAKE3** コンテンツハッシュによるファイルベースキャッシュ
 - **clap derive** による CLI 引数パーサー
 - **NDJSON** ストリーミングセッション対応

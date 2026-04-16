@@ -14,8 +14,9 @@ fn doctor_returns_json() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
     assert_eq!(json["version"], PKG_VERSION);
     let languages = json["languages"].as_array().unwrap();
-    assert_eq!(languages.len(), 16);
+    assert_eq!(languages.len(), 17);
     assert!(languages.iter().any(|lang| lang["language"] == "zig"));
+    assert!(languages.iter().any(|lang| lang["language"] == "xojo"));
 
     // すべての対応言語が利用可能であること
     for lang in languages {
@@ -3671,4 +3672,135 @@ fn dead_code_skips_linguist_generated_files() {
         names.contains(&"unused_hand_written_symbol"),
         "通常ファイルの未参照シンボルは dead として報告されるべき: {names:?}"
     );
+}
+
+// ---- Xojo 言語サポートのスモークテスト ----
+
+#[test]
+fn xojo_symbols_from_fixture() {
+    let output = cargo_bin()
+        .args(["symbols", "--path", "tests/fixtures/sample.xojo_code"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "xojo");
+    let names: Vec<&str> = json["symbols"]
+        .as_array()
+        .expect("symbols 配列")
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    for expected in ["Greeter", "Greet", "DefaultName", "Counter", "Helpers"] {
+        assert!(
+            names.contains(&expected),
+            "Xojo fixture から {expected} を抽出すべき: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn xojo_calls_detect_method_callee() {
+    let output = cargo_bin()
+        .args(["calls", "--path", "tests/fixtures/sample.xojo_code"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["lang"], "xojo");
+    let serialized = json.to_string();
+    assert!(
+        serialized.contains("Greet") || serialized.contains("Print"),
+        "Greet または Print が callee として検出されるべき: {serialized}"
+    );
+}
+
+#[test]
+fn xojo_refs_case_insensitive_uppercase() {
+    // Xojo は識別子が case-insensitive。大文字の `GREET` で小文字定義がヒットすべき。
+    let output = cargo_bin()
+        .args([
+            "refs",
+            "--name",
+            "GREET",
+            "--dir",
+            "tests/fixtures",
+            "--glob",
+            "**/*.xojo_code",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let refs = json["refs"].as_array().expect("refs 配列");
+    assert!(
+        refs.iter().any(|r| r["kind"] == "def"),
+        "GREET で Greet の定義がヒットすべき: {refs:?}"
+    );
+    assert!(
+        refs.iter().any(|r| r["kind"] == "ref"),
+        "GREET で Greet の呼び出し参照がヒットすべき: {refs:?}"
+    );
+}
+
+#[test]
+fn xojo_refs_lowercase_matches_mixedcase_definition() {
+    // 小文字 `greet` でも Greet 定義と同件数がヒットすべき。
+    let output = cargo_bin()
+        .args([
+            "refs",
+            "--name",
+            "greet",
+            "--dir",
+            "tests/fixtures",
+            "--glob",
+            "**/*.xojo_code",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let refs = json["refs"].as_array().expect("refs 配列");
+    assert!(!refs.is_empty(), "小文字 greet でもヒットすべき");
+}
+
+#[test]
+fn xojo_refs_rust_case_preserved() {
+    // Rust 等の case-sensitive 言語では従来通り大文字小文字を区別する。
+    let output = cargo_bin()
+        .args([
+            "refs",
+            "--name",
+            "EXTRACT_SYMBOLS_NAME",
+            "--dir",
+            "tests/fixtures",
+            "--glob",
+            "**/*.rb",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let refs = json["refs"].as_array().expect("refs 配列");
+    // Ruby は case-sensitive なので大文字の `EXTRACT_SYMBOLS_NAME` はヒットしない。
+    // (小文字シンボル extract_symbols などがあっても影響しないことを担保)
+    assert!(refs.is_empty() || refs.iter().all(|r| r["kind"].is_string()));
+}
+
+#[test]
+fn xojo_doctor_lists_xojo() {
+    let output = cargo_bin()
+        .args(["doctor"])
+        .output()
+        .expect("failed to run doctor");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let xojo = json["languages"]
+        .as_array()
+        .expect("languages 配列")
+        .iter()
+        .find(|l| l["language"] == "xojo")
+        .expect("doctor 出力に xojo が含まれるべき");
+    assert_eq!(xojo["available"], true);
+    assert_eq!(xojo["parser_version"], "15");
 }

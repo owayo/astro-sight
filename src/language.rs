@@ -22,6 +22,7 @@ pub enum LangId {
     Bash,
     Ruby,
     Zig,
+    Xojo,
 }
 
 impl std::fmt::Display for LangId {
@@ -43,6 +44,7 @@ impl std::fmt::Display for LangId {
             Self::Bash => "bash",
             Self::Ruby => "ruby",
             Self::Zig => "zig",
+            Self::Xojo => "xojo",
         };
         write!(f, "{s}")
     }
@@ -84,6 +86,8 @@ impl LangId {
             "sh" | "bash" | "zsh" => Ok(Self::Bash),
             "rb" | "rake" | "gemspec" => Ok(Self::Ruby),
             "zig" | "zon" => Ok(Self::Zig),
+            "xojo_code" | "xojo_window" | "xojo_menu" | "xojo_toolbar" | "xojo_report"
+            | "rbbas" => Ok(Self::Xojo),
             other => {
                 if other.is_empty() {
                     Err(AstroError::unsupported_language("<no extension>"))
@@ -145,7 +149,29 @@ impl LangId {
             Self::Bash => Language::new(tree_sitter_bash::LANGUAGE),
             Self::Ruby => Language::new(tree_sitter_ruby::LANGUAGE),
             Self::Zig => Language::new(tree_sitter_zig::LANGUAGE),
+            Self::Xojo => Language::new(tree_sitter_xojo::LANGUAGE),
         }
+    }
+
+    /// 識別子の大文字小文字を区別しない言語かどうかを返す。
+    /// Xojo は仕様上 `myVar` と `MYVAR` を同一識別子として扱う。
+    #[inline]
+    pub fn is_case_insensitive(self) -> bool {
+        matches!(self, Self::Xojo)
+    }
+}
+
+/// case-insensitive な言語では識別子を Unicode-aware に小文字化する。
+/// 非 CI 言語ではゼロコピーで `Cow::Borrowed` を返し、既存の挙動を変えない。
+pub fn normalize_identifier(lang: LangId, name: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if !lang.is_case_insensitive() {
+        return Cow::Borrowed(name);
+    }
+    if name.is_ascii() {
+        Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        Cow::Owned(name.chars().flat_map(|c| c.to_lowercase()).collect())
     }
 }
 
@@ -247,6 +273,61 @@ mod tests {
             LangId::from_path(Utf8Path::new("main.zig")).unwrap(),
             LangId::Zig
         );
+    }
+
+    #[test]
+    fn detect_xojo_code() {
+        assert_eq!(
+            LangId::from_path(Utf8Path::new("Window1.xojo_code")).unwrap(),
+            LangId::Xojo
+        );
+    }
+
+    #[test]
+    fn detect_xojo_window() {
+        assert_eq!(
+            LangId::from_path(Utf8Path::new("Form.xojo_window")).unwrap(),
+            LangId::Xojo
+        );
+    }
+
+    #[test]
+    fn detect_xojo_rbbas() {
+        assert_eq!(
+            LangId::from_path(Utf8Path::new("Legacy.rbbas")).unwrap(),
+            LangId::Xojo
+        );
+    }
+
+    #[test]
+    fn case_insensitive_only_xojo() {
+        assert!(LangId::Xojo.is_case_insensitive());
+        assert!(!LangId::Rust.is_case_insensitive());
+        assert!(!LangId::Python.is_case_insensitive());
+        assert!(!LangId::Ruby.is_case_insensitive());
+    }
+
+    #[test]
+    fn normalize_identifier_xojo_ascii() {
+        let v = normalize_identifier(LangId::Xojo, "MyVar");
+        assert_eq!(&*v, "myvar");
+    }
+
+    #[test]
+    fn normalize_identifier_non_ci_is_zero_copy() {
+        let v = normalize_identifier(LangId::Rust, "MyVar");
+        assert!(matches!(v, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(&*v, "MyVar");
+    }
+
+    #[test]
+    fn normalize_identifier_xojo_unicode() {
+        // Xojo は Unicode 識別子 (日本語メンバ名) をサポート
+        let v = normalize_identifier(LangId::Xojo, "顧客名");
+        assert_eq!(&*v, "顧客名");
+        // ß はドイツ語の eszett — to_lowercase で "ss" ではなく "ß" のまま残る
+        let v = normalize_identifier(LangId::Xojo, "Größe");
+        assert_eq!(&*v, "größe");
     }
 
     #[test]

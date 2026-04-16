@@ -179,6 +179,9 @@ fn import_query(lang_id: LangId) -> (&'static str, ImportKind) {
             "#,
             ImportKind::Require,
         ),
+        // Xojo の using_statement は grammar rule 上存在するが node-types.json に
+        // 公開されないため、現時点では import 抽出は非対応 (後続課題)。
+        LangId::Xojo => ("", ImportKind::Use),
     }
 }
 
@@ -273,6 +276,8 @@ mod tests {
             LangId::Kotlin,
             LangId::Swift,
             LangId::Ruby,
+            LangId::Zig,
+            LangId::Xojo,
         ];
 
         for lang in all_langs {

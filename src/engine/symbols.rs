@@ -878,6 +878,22 @@ fn symbol_query(lang_id: LangId) -> &'static str {
             (test_declaration (string) @function.name)
             "#
         }
+        LangId::Xojo => {
+            r#"
+            (class_declaration name: (identifier) @class.name)
+            (module_declaration name: (identifier) @module.name)
+            (interface_declaration name: (identifier) @interface.name)
+            (structure_declaration name: (identifier) @struct.name)
+            (enum_declaration name: (identifier) @enum.name)
+            (sub_declaration name: (identifier) @method.name)
+            (function_declaration name: (identifier) @method.name)
+            (event_declaration name: (identifier) @method.name)
+            (delegate_declaration name: (identifier) @method.name)
+            (simple_property_declaration name: (identifier) @field.name)
+            (computed_property_declaration name: (identifier) @field.name)
+            (const_declaration name: (identifier) @constant.name)
+            "#
+        }
     }
 }
 
