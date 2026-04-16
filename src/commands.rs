@@ -1100,7 +1100,17 @@ fn detect_api_changes(
     let mut removed: Vec<ApiSymbolCandidate> = Vec::new();
     let mut modified = Vec::new();
 
+    // .gitattributes の linguist-generated 指定ファイルは API 変更検出から除外する
+    let gitattrs = std::fs::canonicalize(dir)
+        .map(|d| crate::engine::gitattributes::GitAttributes::load(&d))
+        .unwrap_or_default();
+
     for df in diff_files {
+        // 新旧いずれかが生成物扱いなら API 変更検出の対象外
+        if gitattrs.is_generated(&df.new_path) || gitattrs.is_generated(&df.old_path) {
+            continue;
+        }
+
         if df.old_path == "/dev/null" {
             if let Some(new_syms) = extract_exported_symbols_from_file(dir, &df.new_path) {
                 for (name, kind, sig) in &new_syms {
@@ -1263,6 +1273,9 @@ pub(crate) fn detect_dead_symbols_from_files(
         Err(_) => return Vec::new(),
     };
 
+    // .gitattributes の linguist-generated 指定ファイルは dead-code 検出から除外する
+    let gitattrs = crate::engine::gitattributes::GitAttributes::load(&canonical_dir);
+
     // 全ファイルのエクスポートシンボルを収集（trait impl メソッドは除外）
     let mut all_syms: Vec<(String, String, String)> = Vec::new(); // (name, kind, file)
     for path in files {
@@ -1275,6 +1288,9 @@ pub(crate) fn detect_dead_symbols_from_files(
             Ok(p) => p.to_string_lossy().to_string(),
             Err(_) => continue, // dir 外のパスは除外（セキュリティ境界）
         };
+        if gitattrs.is_generated(&rel) {
+            continue;
+        }
         if let Some(syms) = extract_dead_code_candidates_from_file(dir, &rel) {
             for (name, kind, _sig) in syms {
                 all_syms.push((name, kind, rel.clone()));
@@ -2180,6 +2196,71 @@ def new_public_api():
         assert!(
             removed.contains(&"bar"),
             "純粋な関数削除は api.rm として検出されるべき。got: {removed:?}"
+        );
+    }
+
+    #[test]
+    fn detect_api_changes_skips_linguist_generated_files() {
+        // .gitattributes で linguist-generated 指定されたファイルの API 変更は報告しない。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        git_commit_files(
+            repo,
+            &[
+                (".gitattributes", "generated.py linguist-generated\n"),
+                ("generated.py", "def old_gen():\n    pass\n"),
+                ("hand.py", "def old_hand():\n    pass\n"),
+            ],
+            "initial",
+        );
+        // 生成ファイルと手書きファイルの双方で関数追加
+        fs::write(
+            repo.join("generated.py"),
+            "def old_gen():\n    pass\n\ndef new_gen():\n    pass\n",
+        )
+        .expect("write");
+        fs::write(
+            repo.join("hand.py"),
+            "def old_hand():\n    pass\n\ndef new_hand():\n    pass\n",
+        )
+        .expect("write");
+
+        let diff_files = vec![
+            crate::models::impact::DiffFile {
+                old_path: "generated.py".to_string(),
+                new_path: "generated.py".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 2,
+                    new_start: 1,
+                    new_count: 5,
+                }],
+            },
+            crate::models::impact::DiffFile {
+                old_path: "hand.py".to_string(),
+                new_path: "hand.py".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 2,
+                    new_start: 1,
+                    new_count: 5,
+                }],
+            },
+        ];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let added: Vec<&str> = api_changes.added.iter().map(|s| s.name.as_str()).collect();
+
+        assert!(
+            !added.contains(&"new_gen"),
+            "linguist-generated ファイルの API 変更は除外されるべき。got: {added:?}"
+        );
+        assert!(
+            added.contains(&"new_hand"),
+            "通常ファイルの API 追加は検出されるべき。got: {added:?}"
         );
     }
 

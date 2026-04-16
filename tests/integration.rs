@@ -3628,3 +3628,47 @@ fn dead_code_on_fixtures() {
     assert!(json["scanned_files"].as_u64().is_some());
     assert!(json["dead_symbols"].as_array().is_some());
 }
+
+#[test]
+fn dead_code_skips_linguist_generated_files() {
+    // .gitattributes で linguist-generated 指定されたファイルは
+    // dead-code 検出から除外する（tree-sitter parser.c 等の生成物対応）。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join(".gitattributes"),
+        "src/generated_sample.rs linguist-generated\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/generated_sample.rs"),
+        "pub fn unused_generated_symbol() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/hand_written_sample.rs"),
+        "pub fn unused_hand_written_symbol() {}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success(), "dead-code は成功するべき");
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead = json["dead_symbols"].as_array().expect("dead_symbols 配列");
+    let names: Vec<&str> = dead.iter().filter_map(|s| s["name"].as_str()).collect();
+
+    assert!(
+        !names.contains(&"unused_generated_symbol"),
+        "linguist-generated ファイルのシンボルは報告すべきでない: {names:?}"
+    );
+    assert!(
+        names.contains(&"unused_hand_written_symbol"),
+        "通常ファイルの未参照シンボルは dead として報告されるべき: {names:?}"
+    );
+}

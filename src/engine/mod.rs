@@ -2,6 +2,7 @@ pub mod calls;
 pub mod cochange;
 pub mod diff;
 pub mod extractor;
+pub mod gitattributes;
 pub mod impact;
 pub mod imports;
 pub mod lint;
