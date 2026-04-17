@@ -1198,8 +1198,17 @@ fn detect_api_changes(
             .map(|(name, kind, sig)| (name.as_str(), (kind.as_str(), sig.as_str())))
             .collect();
 
+        // 新ファイル内の call 先名を集める。同一ファイル内から呼ばれている新規関数は
+        // 「内部ヘルパー」として api.add から除外する（Bash スクリプトのトップレベル関数や
+        // Python の同一ファイル内で接続済みの private 関数が api.add に出る誤検出対策）。
+        let in_file_callees = extract_in_file_callees(dir, &df.new_path);
+
         for (name, kind, sig) in &new_syms {
             if !old_map.contains_key(name.as_str()) {
+                // qualname または bare name が同一ファイル内の call に存在すれば内部参照
+                if is_internally_connected(&in_file_callees, name) {
+                    continue;
+                }
                 added.push(ApiSymbolCandidate {
                     name: name.clone(),
                     kind: kind.clone(),
@@ -1541,6 +1550,48 @@ fn filter_exported_symbols(
         result.push((qualname, format!("{:?}", sym.kind).to_lowercase(), sig));
     }
     result
+}
+
+/// 指定ファイル内で発生している全ての callee 名を集合として返す。
+/// 失敗時（読み込み/パース不能）は空集合を返す。
+fn extract_in_file_callees(dir: &str, file_path: &str) -> std::collections::HashSet<String> {
+    let mut result = std::collections::HashSet::new();
+    let full_path = std::path::Path::new(dir).join(file_path);
+    let Some(utf8_str) = full_path.to_str() else {
+        return result;
+    };
+    let utf8_path = camino::Utf8Path::new(utf8_str);
+    let Ok(source) = parser::read_file(utf8_path) else {
+        return result;
+    };
+    let Ok(lang_id) = crate::language::LangId::from_path(utf8_path) else {
+        return result;
+    };
+    let Ok(tree) = parser::parse_source(&source, lang_id) else {
+        return result;
+    };
+    let edges = crate::engine::calls::extract_calls(tree.root_node(), &source, lang_id, None)
+        .unwrap_or_default();
+    for edge in edges {
+        result.insert(edge.callee.name);
+    }
+    result
+}
+
+/// `qualname` (例: `Class.method` や bare name `foo`) が `callees` に含まれるかを判定する。
+/// Python/Ruby など「obj.method()」形式で呼び出される言語では callee 側は bare name のみ
+/// なので、qualname の末尾 (`.` 区切りの最後) でも判定する。
+fn is_internally_connected(callees: &std::collections::HashSet<String>, qualname: &str) -> bool {
+    if callees.contains(qualname) {
+        return true;
+    }
+    if let Some(bare) = qualname.rsplit('.').next()
+        && bare != qualname
+        && callees.contains(bare)
+    {
+        return true;
+    }
+    false
 }
 
 /// `sym` の range を内包する最も内側の container (class/struct/trait/interface/enum) を返す。
@@ -2506,6 +2557,149 @@ class Reviewer:
             mod_names.contains(&"Reviewer.execute"),
             "qualname 形式のメソッドシグネチャ変更を検出すべき。got: {mod_names:?}"
         );
+    }
+
+    /// Bash スクリプトで同一ファイル内から呼ばれている新規関数は api.add に出ない。
+    /// (レポート 2026-04-17-api-add-bash-connected-function-false-positive.md)
+    #[test]
+    fn detect_api_changes_bash_internally_called_function_is_not_added() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let before = "#!/usr/bin/env bash\n\
+sparse_clone_or_update() {\n    echo clone\n}\n\n\
+for repo in \"foo\"; do\n    sparse_clone_or_update\ndone\n";
+        git_commit_files(repo, &[("sp.sh", before)], "initial");
+
+        // sparse_patterns_for を新規追加し、同ファイル内の sparse_clone_or_update から呼び出す
+        let after = "#!/usr/bin/env bash\n\
+sparse_patterns_for() {\n    echo pattern\n}\n\n\
+sparse_clone_or_update() {\n    sparse_patterns_for\n    echo clone\n}\n\n\
+for repo in \"foo\"; do\n    sparse_clone_or_update\ndone\n";
+        fs::write(repo.join("sp.sh"), after).expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "sp.sh".to_string(),
+            new_path: "sp.sh".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 8,
+                new_start: 1,
+                new_count: 11,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let added: Vec<&str> = api_changes.added.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            !added.contains(&"sparse_patterns_for"),
+            "同一ファイル内から呼ばれている Bash 関数は api.add に出してはならない。got: {added:?}"
+        );
+    }
+
+    /// Bash で同一ファイル内から呼ばれていない新規関数は api.add に残る。
+    #[test]
+    fn detect_api_changes_bash_disconnected_function_is_still_added() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let before = "#!/usr/bin/env bash\n\
+main() {\n    echo hi\n}\nmain\n";
+        git_commit_files(repo, &[("sp.sh", before)], "initial");
+
+        // 新規関数 unused_helper は誰も呼んでいない
+        let after = "#!/usr/bin/env bash\n\
+unused_helper() {\n    echo unused\n}\n\n\
+main() {\n    echo hi\n}\nmain\n";
+        fs::write(repo.join("sp.sh"), after).expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "sp.sh".to_string(),
+            new_path: "sp.sh".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 4,
+                new_start: 1,
+                new_count: 7,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let added: Vec<&str> = api_changes.added.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            added.contains(&"unused_helper"),
+            "同一ファイル内から呼ばれていない新規関数は api.add に残すべき。got: {added:?}"
+        );
+    }
+
+    /// Python で同一ファイル内から呼ばれている新規 public 関数は api.add に出ない。
+    #[test]
+    fn detect_api_changes_python_internally_called_function_is_not_added() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let before = "def main():\n    print(\"hi\")\n";
+        git_commit_files(repo, &[("svc.py", before)], "initial");
+
+        // helper を追加し、main から呼ぶ
+        let after = "def helper() -> str:\n    return \"x\"\n\n\
+def main():\n    helper()\n    print(\"hi\")\n";
+        fs::write(repo.join("svc.py"), after).expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "svc.py".to_string(),
+            new_path: "svc.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 2,
+                new_start: 1,
+                new_count: 6,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let added: Vec<&str> = api_changes.added.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            !added.contains(&"helper"),
+            "同一ファイル内で呼ばれている Python 関数は api.add に出してはならない。got: {added:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // is_internally_connected ヘルパー
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn is_internally_connected_matches_bare_name() {
+        let mut callees = std::collections::HashSet::new();
+        callees.insert("foo".to_string());
+        assert!(is_internally_connected(&callees, "foo"));
+        assert!(!is_internally_connected(&callees, "bar"));
+    }
+
+    #[test]
+    fn is_internally_connected_matches_qualname_via_bare() {
+        let mut callees = std::collections::HashSet::new();
+        // Python/Ruby 等では callee 側は bare name のみになることが多い
+        callees.insert("execute".to_string());
+        assert!(is_internally_connected(&callees, "Reviewer.execute"));
+    }
+
+    #[test]
+    fn is_internally_connected_does_not_match_disjoint() {
+        let mut callees = std::collections::HashSet::new();
+        callees.insert("other_fn".to_string());
+        assert!(!is_internally_connected(&callees, "Reviewer.execute"));
+        assert!(!is_internally_connected(&callees, "execute"));
     }
 
     #[test]
