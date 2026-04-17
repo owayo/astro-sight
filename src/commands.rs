@@ -1221,9 +1221,13 @@ fn detect_api_changes(
             }
         }
 
+        // 同一 (file, qualname) の modified を重複排除するためのキーセット
+        let mut seen_modified: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
         for (name, kind, new_sig) in &new_syms {
             if let Some(old_sig) = old_map.get(name.as_str())
                 && old_sig != &new_sig.as_str()
+                && seen_modified.insert((df.new_path.clone(), name.clone()))
             {
                 modified.push(ApiSymbolChange {
                     name: name.clone(),
@@ -1465,44 +1469,18 @@ fn extract_exported_symbols_from_file_inner(
 }
 
 /// シンボルの種類に応じた API シグネチャを抽出する。
-/// 関数/メソッド → 宣言行、struct/enum/trait/interface/class → 全行を結合。
+/// 関数/メソッド → 宣言行、struct/enum/trait/interface/class → 宣言行のみ。
+///
+/// クラス/型は宣言行（`class Foo(Bar):` や `struct Foo {` など）のみをシグネチャとする。
+/// 本体（メソッド本体や private フィールド）の変更でクラス全体の API 変更として
+/// 再検出されるのを避けるため、メンバーの集約はしない。
+/// メンバー個々の変更は method シンボル単独で検出される。
 fn extract_api_signature(sym: &crate::models::symbol::Symbol, lines: &[&str]) -> String {
-    use crate::models::symbol::SymbolKind;
-    match sym.kind {
-        SymbolKind::Function | SymbolKind::Method => {
-            // 関数は先頭行で十分
-            lines
-                .get(sym.range.start.line)
-                .unwrap_or(&"")
-                .trim()
-                .to_string()
-        }
-        SymbolKind::Struct
-        | SymbolKind::Enum
-        | SymbolKind::Trait
-        | SymbolKind::Interface
-        | SymbolKind::Class => {
-            // 型はメンバー行を集約してシグネチャとする
-            let start = sym.range.start.line;
-            let end = sym.range.end.line.min(lines.len().saturating_sub(1));
-            let members: Vec<String> = (start..=end)
-                .filter_map(|i| {
-                    let line = lines.get(i)?.trim();
-                    if !line.is_empty() {
-                        Some(line.to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            members.join("\n")
-        }
-        _ => lines
-            .get(sym.range.start.line)
-            .unwrap_or(&"")
-            .trim()
-            .to_string(),
-    }
+    lines
+        .get(sym.range.start.line)
+        .unwrap_or(&"")
+        .trim()
+        .to_string()
 }
 
 fn filter_exported_symbols(
@@ -1512,8 +1490,26 @@ fn filter_exported_symbols(
     lang_id: crate::language::LangId,
     exclude_trait_impls: bool,
 ) -> Vec<(String, String, String)> {
+    use crate::models::symbol::SymbolKind;
     let source_str = std::str::from_utf8(source).unwrap_or("");
     let lines: Vec<&str> = source_str.lines().collect();
+
+    // 同名別メソッドを区別するための enclosing container (class/struct/trait/interface) を収集。
+    // メソッド/関数の range が container の range に内包される場合、qualname として
+    // `Container.method` を使う（最も内側の container を優先）。
+    let containers: Vec<&crate::models::symbol::Symbol> = syms
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.kind,
+                SymbolKind::Class
+                    | SymbolKind::Struct
+                    | SymbolKind::Trait
+                    | SymbolKind::Interface
+                    | SymbolKind::Enum
+            )
+        })
+        .collect();
 
     let mut result = Vec::new();
     for sym in syms {
@@ -1535,13 +1531,35 @@ fn filter_exported_symbols(
             continue;
         }
         let sig = extract_api_signature(sym, &lines);
-        result.push((
-            sym.name.clone(),
-            format!("{:?}", sym.kind).to_lowercase(),
-            sig,
-        ));
+        let qualname = if matches!(sym.kind, SymbolKind::Method | SymbolKind::Function) {
+            enclosing_container(sym, &containers)
+                .map(|c| format!("{}.{}", c.name, sym.name))
+                .unwrap_or_else(|| sym.name.clone())
+        } else {
+            sym.name.clone()
+        };
+        result.push((qualname, format!("{:?}", sym.kind).to_lowercase(), sig));
     }
     result
+}
+
+/// `sym` の range を内包する最も内側の container (class/struct/trait/interface/enum) を返す。
+/// `sym` 自身は除外する。
+fn enclosing_container<'a>(
+    sym: &crate::models::symbol::Symbol,
+    containers: &'a [&'a crate::models::symbol::Symbol],
+) -> Option<&'a crate::models::symbol::Symbol> {
+    let s = sym.range.start.line;
+    let e = sym.range.end.line;
+    containers
+        .iter()
+        .copied()
+        .filter(|c| {
+            let cs = c.range.start.line;
+            let ce = c.range.end.line;
+            cs <= s && ce >= e && !(cs == s && ce == e)
+        })
+        .min_by_key(|c| c.range.end.line.saturating_sub(c.range.start.line))
 }
 
 // ---------------------------------------------------------------------------
@@ -2316,6 +2334,177 @@ def new_public_api():
         assert!(
             added.contains(&"new_hand"),
             "通常ファイルの API 追加は検出されるべき。got: {added:?}"
+        );
+    }
+
+    /// Python で同名メソッドを持つ複数クラスがあるとき、qualname (`ClassName.method`)
+    /// として区別され、触っていない方は api.mod に出ない。
+    #[test]
+    fn detect_api_changes_distinguishes_same_named_python_methods() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let before = "\
+class ClaudeReviewer:
+    def execute(self) -> int:
+        return 1
+
+
+class CodexReviewer:
+    def execute(self) -> str:
+        return \"ok\"
+
+
+class ReReviewExecutor:
+    def execute(self) -> None:
+        pass
+";
+        git_commit_files(repo, &[("svc.py", before)], "initial");
+
+        // ReReviewExecutor.execute だけ本体を変更（シグネチャは同じ）
+        let after = "\
+class ClaudeReviewer:
+    def execute(self) -> int:
+        return 1
+
+
+class CodexReviewer:
+    def execute(self) -> str:
+        return \"ok\"
+
+
+class ReReviewExecutor:
+    def execute(self) -> None:
+        return None
+";
+        fs::write(repo.join("svc.py"), after).expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "svc.py".to_string(),
+            new_path: "svc.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 13,
+                old_count: 1,
+                new_start: 13,
+                new_count: 1,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let mod_names: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+
+        // bare name `execute` は重複検出されず、qualname で区別されていること
+        assert!(
+            mod_names.iter().all(|n| *n != "execute"),
+            "bare name `execute` は出ないはず（qualname 化されているべき）。got: {mod_names:?}"
+        );
+        // シグネチャ変更なし（本体のみ変更）なので api.mod には何も出ないはず
+        assert!(
+            api_changes.modified.is_empty(),
+            "本体のみの変更で signature 不変なら modified に出ないはず。got: {:?}",
+            api_changes.modified
+        );
+    }
+
+    /// Python クラスの private メソッドの本体変更は、クラス自体の modified として上がらない。
+    /// 宣言行（`class Foo:`）が変わらない限り Class のシグネチャは不変。
+    #[test]
+    fn detect_api_changes_class_body_change_does_not_mark_class_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let before = "\
+class PromptBuilder:
+    def _build_common(self) -> str:
+        return \"v1\"
+";
+        git_commit_files(repo, &[("pb.py", before)], "initial");
+
+        let after = "\
+class PromptBuilder:
+    def _build_common(self) -> str:
+        return \"v2 with much more text\"
+";
+        fs::write(repo.join("pb.py"), after).expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "pb.py".to_string(),
+            new_path: "pb.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 3,
+                old_count: 1,
+                new_start: 3,
+                new_count: 1,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let mod_names: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+
+        assert!(
+            !mod_names.contains(&"PromptBuilder"),
+            "クラス本体の変更でクラス自体を api.mod に出してはならない。got: {mod_names:?}"
+        );
+    }
+
+    /// Python で同一クラス内のメソッドシグネチャが変わった場合は qualname で検出される。
+    #[test]
+    fn detect_api_changes_detects_qualified_method_signature_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let before = "\
+class Reviewer:
+    def execute(self) -> int:
+        return 1
+";
+        git_commit_files(repo, &[("r.py", before)], "initial");
+
+        let after = "\
+class Reviewer:
+    def execute(self, mode: str) -> int:
+        return 1
+";
+        fs::write(repo.join("r.py"), after).expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "r.py".to_string(),
+            new_path: "r.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 2,
+                old_count: 1,
+                new_start: 2,
+                new_count: 1,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let mod_names: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+
+        assert!(
+            mod_names.contains(&"Reviewer.execute"),
+            "qualname 形式のメソッドシグネチャ変更を検出すべき。got: {mod_names:?}"
         );
     }
 
