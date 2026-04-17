@@ -2,10 +2,10 @@
   <img src="docs/images/app.png" width="128" alt="astro-sight">
 </p>
 
-<h1 align="center">astro-sight</h1>
+<h1 align="center"><bold>AST</bold>ro-sight</h1>
 
 <p align="center">
-  AI エージェント向け AST 情報生成 CLI。tree-sitter ベースの高速構文解析で、指定位置の AST 断片・シンボル定義・スニペットを JSON で返す。
+  AI エージェント向け AST 情報生成 CLI。tree-sitter ベースの高速構文解析で、AST 断片・シンボル定義・スニペットを JSON で返す。
 </p>
 
 <h3 align="center">Supported Languages</h3>
@@ -521,15 +521,9 @@ astro-sight skill-install codex
 登録後は「コールグラフを調べて」「この関数の呼び出し元は？」「diff の影響範囲は？」等の質問で自動的に起動します。
 PR や patch 全体をまとめて見たい場合は、`astro-sight review --dir . --git` まで含めて指示すると一括レビューに入りやすくなります。
 
-### CodeRabbit との併用
+### CLAUDE.md/AGENTS.md に追記して確実に使わせる
 
-CodeRabbit の Knowledge Base は `AGENTS.md` / `CLAUDE.md` / `.github/copilot-instructions.md` などの AI エージェント向け指示ファイルを自動で読み込みます。astro-sight の STOP-AND-CHECK ルールや `review` / `dead-code` 中心のレビュー手順をこれらのファイルに書いておくと、ローカルの AI エージェントと CodeRabbit で同じレビュー方針を共有しやすくなります。
-
-また、CodeRabbit の自動レビューでは ast-grep ベースの AST path instructions を使って構文ルールを追加できます。astro-sight はローカル側の事前確認として、CodeRabbit に送る前に `astro-sight review --dir . --git` と `astro-sight dead-code --dir . --git` を回す運用と相性が良いです。
-
-### CLAUDE.md に追記して確実に使わせる
-
-スキルだけでは Claude Code が Grep/Read にフォールバックすることがあります。
+スキルだけでは Claude Code/Codex が Grep/Read にフォールバックすることがあります。
 プロジェクトの `CLAUDE.md` またはグローバルの `~/.claude/CLAUDE.md` に以下を追記すると、構造分析時に astro-sight を優先的に使用するようになります:
 
 ```markdown
