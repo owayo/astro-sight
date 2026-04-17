@@ -1012,6 +1012,42 @@ fn review_hook_output(result: &ReviewResult, dir: &str) -> Result<()> {
     std::process::exit(1);
 }
 
+/// 依存マニフェストとロックファイルの既知ペア。
+/// これらは `cargo update` や `npm install` など片側のみが変更される正規操作が頻繁に発生するため、
+/// missing_cochange 警告から除外する。同一ディレクトリに属するペアのみ除外対象とする（monorepo 配慮）。
+const DEPENDENCY_MANIFEST_LOCK_PAIRS: &[(&str, &str)] = &[
+    ("Cargo.toml", "Cargo.lock"),
+    ("package.json", "package-lock.json"),
+    ("package.json", "pnpm-lock.yaml"),
+    ("package.json", "yarn.lock"),
+    ("pyproject.toml", "uv.lock"),
+    ("pyproject.toml", "poetry.lock"),
+    ("pyproject.toml", "pdm.lock"),
+    ("Gemfile", "Gemfile.lock"),
+    ("composer.json", "composer.lock"),
+    ("go.mod", "go.sum"),
+    ("mix.exs", "mix.lock"),
+];
+
+/// 2 つのパスが既知の依存マニフェスト/ロックペアであれば true を返す。
+/// monorepo 誤判定を避けるため、親ディレクトリが一致する場合のみ真。
+fn is_dependency_manifest_pair(file_a: &str, file_b: &str) -> bool {
+    let path_a = std::path::Path::new(file_a);
+    let path_b = std::path::Path::new(file_b);
+    let (Some(base_a), Some(base_b)) = (
+        path_a.file_name().and_then(|s| s.to_str()),
+        path_b.file_name().and_then(|s| s.to_str()),
+    ) else {
+        return false;
+    };
+    if path_a.parent() != path_b.parent() {
+        return false;
+    }
+    DEPENDENCY_MANIFEST_LOCK_PAIRS
+        .iter()
+        .any(|(a, b)| (base_a == *a && base_b == *b) || (base_a == *b && base_b == *a))
+}
+
 fn detect_missing_cochanges(
     service: &AppService,
     dir: &str,
@@ -1031,6 +1067,11 @@ fn detect_missing_cochanges(
     let mut best: std::collections::HashMap<String, MissingCochange> =
         std::collections::HashMap::new();
     for entry in &cochange_result.entries {
+        // 依存マニフェスト/ロックペアは片側変更が正規操作として頻発するためスキップ
+        if is_dependency_manifest_pair(&entry.file_a, &entry.file_b) {
+            continue;
+        }
+
         let a_in_diff = changed_files.contains(&entry.file_a);
         let b_in_diff = changed_files.contains(&entry.file_b);
 
@@ -2541,5 +2582,118 @@ def new_public_api():
         assert_eq!(impacts[0]["src"], "src/lib.rs");
         assert_eq!(impacts[0]["syms"], serde_json::json!(["compute"]));
         assert_eq!(impacts[0]["refs"][0]["s"], serde_json::json!(["main"]));
+    }
+
+    // ------------------------------------------------------------------
+    // is_dependency_manifest_pair
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn is_dependency_manifest_pair_matches_cargo() {
+        assert!(is_dependency_manifest_pair("Cargo.toml", "Cargo.lock"));
+        assert!(is_dependency_manifest_pair("Cargo.lock", "Cargo.toml"));
+    }
+
+    #[test]
+    fn is_dependency_manifest_pair_matches_node_lockfiles() {
+        for lock in ["package-lock.json", "pnpm-lock.yaml", "yarn.lock"] {
+            assert!(
+                is_dependency_manifest_pair("package.json", lock),
+                "package.json ↔ {lock} should match"
+            );
+        }
+    }
+
+    #[test]
+    fn is_dependency_manifest_pair_matches_other_ecosystems() {
+        let pairs = [
+            ("pyproject.toml", "uv.lock"),
+            ("pyproject.toml", "poetry.lock"),
+            ("pyproject.toml", "pdm.lock"),
+            ("Gemfile", "Gemfile.lock"),
+            ("composer.json", "composer.lock"),
+            ("go.mod", "go.sum"),
+            ("mix.exs", "mix.lock"),
+        ];
+        for (a, b) in pairs {
+            assert!(is_dependency_manifest_pair(a, b), "{a} ↔ {b} should match");
+        }
+    }
+
+    #[test]
+    fn is_dependency_manifest_pair_rejects_unrelated_files() {
+        assert!(!is_dependency_manifest_pair("src/lib.rs", "Cargo.toml"));
+        assert!(!is_dependency_manifest_pair("Cargo.toml", "README.md"));
+        assert!(!is_dependency_manifest_pair(
+            "package.json",
+            "tsconfig.json"
+        ));
+    }
+
+    #[test]
+    fn is_dependency_manifest_pair_rejects_cross_directory_pairs() {
+        // monorepo: 異なるディレクトリのマニフェスト/ロックは別プロジェクトなので除外対象外
+        assert!(!is_dependency_manifest_pair(
+            "apps/web/package.json",
+            "apps/api/package-lock.json"
+        ));
+        assert!(!is_dependency_manifest_pair(
+            "crates/foo/Cargo.toml",
+            "crates/bar/Cargo.lock"
+        ));
+    }
+
+    #[test]
+    fn is_dependency_manifest_pair_accepts_same_directory_pairs() {
+        assert!(is_dependency_manifest_pair(
+            "apps/web/package.json",
+            "apps/web/package-lock.json"
+        ));
+        assert!(is_dependency_manifest_pair(
+            "crates/foo/Cargo.toml",
+            "crates/foo/Cargo.lock"
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // detect_missing_cochanges: 依存マニフェスト/ロックペアを除外する
+    // ------------------------------------------------------------------
+
+    /// Cargo.toml ↔ Cargo.lock が過去繰り返し共変更されていても
+    /// Cargo.lock のみの変更で missing_cochange 警告を出さない。
+    #[test]
+    fn detect_missing_cochanges_excludes_cargo_manifest_lock_pair() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        // Cargo.toml と Cargo.lock を何度も共変更（cochange 統計を作る）
+        for i in 0..4 {
+            git_commit_files(
+                repo,
+                &[
+                    ("Cargo.toml", &format!("# v{i}\n")),
+                    ("Cargo.lock", &format!("# lock v{i}\n")),
+                ],
+                &format!("dep update {i}"),
+            );
+        }
+
+        let service = AppService::new();
+        let mut changed_files = HashSet::new();
+        // Cargo.lock のみが変更された状況（cargo update -p 相当）
+        changed_files.insert("Cargo.lock".to_string());
+
+        let missing = detect_missing_cochanges(
+            &service,
+            repo.to_str().expect("utf-8 path"),
+            &changed_files,
+            0.3,
+        );
+
+        assert!(
+            missing.iter().all(|m| m.file != "Cargo.toml"),
+            "Cargo.toml が missing_cochange に含まれてはならない。got: {missing:?}"
+        );
     }
 }
