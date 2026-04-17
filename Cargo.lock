@@ -96,7 +96,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "astro-sight"
-version = "26.4.108"
+version = "26.4.109"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -1033,9 +1033,9 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rmcp"
-version = "1.4.0"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f542f74cf247da16f19bbc87e298cd201e912314f4083e88cdd671f44f5fcb53"
+checksum = "67d69668de0b0ccd9cc435f700f3b39a7861863cf37a15e1f304ea78688a4826"
 dependencies = [
  "async-trait",
  "base64",
@@ -1055,9 +1055,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "1.4.0"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2391e4ae47f314e70eaafb6c7bd82e495e770b935448864446302143019151f"
+checksum = "48fdc01c81097b0aed18633e676e269fefa3a78ec1df56b4fe597c1241b92025"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -1388,9 +1388,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.0"
+version = "1.52.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a91135f59b1cbf38c91e73cf3386fca9bb77915c45ce2771460c9d92f0f3d776"
+checksum = "b67dee974fe86fd92cc45b7a95fdd2f99a36a6d7b0d431a231178d3d670bbcc6"
 dependencies = [
  "bytes",
  "libc",
@@ -1693,6 +1693,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-ruby"
 version = "26.4.100"
+source = "git+https://github.com/owayo/tree-sitter-ruby.git?branch=master#8cc0c85738c684c989a93e7994a52764160d8672"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -1731,7 +1732,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-xojo"
 version = "0.1.0"
-source = "git+https://github.com/owayo/tree-sitter-xojo.git?branch=main#15048b957c45c51cf07868fee91c055109ef44d4"
+source = "git+https://github.com/owayo/tree-sitter-xojo.git?branch=main#f41817b388699009fade8cc3c952cf1644f46be4"
 dependencies = [
  "cc",
  "tree-sitter-language",
