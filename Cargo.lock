@@ -1693,7 +1693,6 @@ dependencies = [
 [[package]]
 name = "tree-sitter-ruby"
 version = "26.4.100"
-source = "git+https://github.com/owayo/tree-sitter-ruby.git?branch=master#8cc0c85738c684c989a93e7994a52764160d8672"
 dependencies = [
  "cc",
  "tree-sitter-language",

@@ -1,6 +1,18 @@
 ---
 name: astro-sight
-description: "STOP before using Grep for code identifiers (including pipe-separated patterns like FOO|Bar). Use `refs` for identifiers, `review` for diff/PR review, `context`/`impact` around edits, `dead-code` for exported symbol cleanup, and `symbols`/`calls`/`imports`/`lint`/`cochange`/`sequence`/`session` for structural analysis."
+description: "STOP before using Grep for code identifiers (function/class/variable/type/constant/method names, including pipe-separated patterns like FOO|Bar). Use astro-sight `refs` for identifier search, `review` for diff/PR review, `context`/`impact` around edits, `dead-code` for exported symbol cleanup, and `symbols`/`calls`/`imports`/`lint`/`cochange`/`sequence`/`session` for structural analysis via tree-sitter AST."
+when_to_use: |
+  - Searching for any code identifier (function, class, variable, type, constant, method) — use `refs --name` / `refs --names` instead of `Grep`
+  - Pipe-separated identifier search like `FOO|Bar|baz` — use `refs --names FOO,Bar,baz --dir .`
+  - Reviewing a diff, PR, or recent changes end-to-end — start with `review --dir . --git`
+  - Before editing code — run `context --dir . --git` to analyze impact
+  - After editing code — run `impact --dir . --git` to detect unresolved impacts
+  - Touching exported APIs / public modules — add `dead-code --dir . --git` to detect dead symbols
+  - Understanding a file or directory — use `symbols --path <file>` or `symbols --dir <dir>`
+  - Call graphs, imports, sequence diagrams, co-change history, or repeated AST/text rules — use the matching command (`calls` / `imports` / `sequence` / `cochange` / `lint`)
+  - Running 2+ mixed astro-sight queries in one process — use `session` (NDJSON)
+  Skip for non-code text searches (error messages, config values, TODO comments, file-path patterns) — Grep handles those.
+allowed-tools: Bash(astro-sight:*)
 ---
 
 # astro-sight
