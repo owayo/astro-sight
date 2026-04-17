@@ -559,21 +559,21 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 | `Grep "config_key"` | ✅ Grep OK | Config value search |
 
 ## Workflow Rules (MANDATORY for code changes)
+- **Reviewing a diff / PR (START HERE)**: Run `astro-sight review --dir . --git` for impact + cochange + API diff + dead symbols before any piecemeal analysis
 - **Before editing code**: Run `astro-sight context --dir . --git` to check impact
-- **If asked to review a diff / PR**: Run `astro-sight review --dir . --git` before piecemeal analysis
 - **After editing code**: Run `astro-sight impact --dir . --git` to detect unresolved impacts
-- **One-shot diff review**: Run `astro-sight review --dir . --git` for impact + cochange + API diff + dead symbols
 - **Understanding a file**: Run `astro-sight symbols --path <file>` to see structure
 - **Understanding a directory**: Run `astro-sight symbols --dir <dir>` to see all symbols
+- **Exact AST node / parse debug**: Run `astro-sight ast --path <file> --line <n> --col <n>`
 - **Finding symbol usage**: Run `astro-sight refs` (Grep FORBIDDEN)
 - **Finding multiple symbols**: Run `astro-sight refs --names sym1,sym2 --dir .`
 - **Who calls this function?**: Run `astro-sight calls --path <file> --function <name>`
 - **What does this file import?**: Run `astro-sight imports --path <file>`
 - **Files that change together**: Run `astro-sight cochange --dir . --file <file>`
 - **Visualize call flow**: Run `astro-sight sequence --path <file> --function <name>`
-- **Structured diff review**: Run `astro-sight review --dir . --git`
 - **Find dead code**: Run `astro-sight dead-code --dir .` or `--git` for diff-scoped
 - **Enforce repeated structural rules**: Run `astro-sight lint --path <file> --rules rules.yaml`
+- **Multiple mixed queries in one run**: Pipe NDJSON requests to `astro-sight session`
 
 ## Command Quick Reference
 
@@ -582,6 +582,7 @@ astro-sight refs --name <symbol> --dir .           # Symbol reference search (RE
 astro-sight refs --names sym1,sym2 --dir .         # Batch symbol search (REPLACES Grep "FOO|Bar")
 astro-sight symbols --path <file>                  # File structure overview
 astro-sight symbols --dir <dir>                    # Directory structure overview (NDJSON)
+astro-sight ast --path <file> --line <n> --col <n> # Exact AST node at cursor (parse debug)
 astro-sight calls --path <file> --function <name>  # Caller/callee relationships
 astro-sight context --dir . --git                  # Change impact analysis (run BEFORE editing code)
 astro-sight impact --dir . --git                   # Detect unresolved impacts (run AFTER editing code)
@@ -590,6 +591,7 @@ astro-sight dead-code --dir . --git                # Find dead/unreferenced expo
 astro-sight imports --path <file>                  # Import relationships
 astro-sight sequence --path <file>                 # Call flow visualization
 astro-sight cochange --dir .                       # Co-change patterns
+astro-sight session                                # NDJSON multi-query batch (stdin→stdout)
 ```
 
 ## Efficiency Rules
