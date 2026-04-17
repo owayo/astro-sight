@@ -34,8 +34,7 @@ tree-sitter-typescript = "0.23.2"
 tree-sitter-go = "0.25"
 tree-sitter-php = "0.24.2"
 tree-sitter-java = "0.23.5"
-# tree-sitter-kotlin 0.3.6+ は tree-sitter 0.21/0.22 系を要求するため links 衝突で 0.3.5 に固定
-tree-sitter-kotlin = "0.3.5"
+tree-sitter-kotlin = "=0.3.5"  # tree-sitter 0.26 と非互換 (0.3.8 以降が >=0.21,<0.23 を要求)
 tree-sitter-swift = "0.7.1"
 tree-sitter-c-sharp = "0.23.5"
 tree-sitter-bash = "0.25.1"
@@ -50,7 +49,7 @@ toml = "1.1.2"
 logroller = "0.1.10"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
-tracing-appender = "0.2.4"
+tracing-appender = "0.2.5"
 time = { version = "0.3.47", features = ["formatting", "macros", "local-offset"] }
 tree-sitter-zig = "1.1.2"
 tree-sitter-xojo = { git = "https://github.com/owayo/tree-sitter-xojo.git", branch = "main" }
