@@ -31,8 +31,9 @@ struct FileContext {
     call_edges: Vec<CallEdge>,
 }
 
-/// キャッシュされたパース結果: (tree, ソースバイト列, 言語)。
-type ParsedFile = (tree_sitter::Tree, Vec<u8>, LangId);
+/// キャッシュされたパース結果: (tree, ソースバッファ, 言語)。
+/// `SourceBuf` を直接保持することで mmap のゼロコピー経路を維持する。
+type ParsedFile = (tree_sitter::Tree, crate::engine::parser::SourceBuf, LangId);
 
 /// 言語別にシンボル名を正規化した HashMap/HashSet キー。
 /// 非 CI 言語ではアロケーション無し (Cow::Borrowed → into_owned は元の String 相当)、

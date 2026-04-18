@@ -449,10 +449,26 @@ fn rust_attr_string_ref_segments<'a>(
 
 /// 指定行のソース行をコンテキストとして抽出する。
 /// minified/生成コードの巨大行によるメモリ爆発を防ぐため 256B で切り詰める。
+/// `memchr` で該当行の範囲のみ走査し、ソース全体の UTF-8 検証は行わない。
+/// これにより 1 ファイル内で N 識別子を処理するとき O(N × filesize) → O(N × row + filesize) に削減する。
 fn extract_line_context(source: &[u8], row: usize) -> String {
     const MAX_CTX: usize = 256;
-    let text = std::str::from_utf8(source).unwrap_or("");
-    let line = text.lines().nth(row).unwrap_or("").trim();
+    // row 行目の開始位置を memchr で高速に特定する
+    let mut line_start = 0usize;
+    for _ in 0..row {
+        match memchr::memchr(b'\n', &source[line_start..]) {
+            Some(nl) => line_start += nl + 1,
+            None => return String::new(),
+        }
+    }
+    let line_end = memchr::memchr(b'\n', &source[line_start..])
+        .map(|n| line_start + n)
+        .unwrap_or(source.len());
+
+    // 必要な範囲のみ UTF-8 変換する（失敗時は空コンテキストを返す）
+    let line = std::str::from_utf8(&source[line_start..line_end])
+        .unwrap_or("")
+        .trim();
     if line.len() <= MAX_CTX {
         line.to_string()
     } else {
@@ -623,10 +639,14 @@ fn find_refs_batch_in_file_indexed(
     let definition_kinds = definition_node_kinds(lang_id);
 
     // 言語別に正規化済みキーで name_to_ix を再構築する (Xojo では case 違いを吸収)。
-    let name_to_ix: std::collections::HashMap<std::borrow::Cow<'_, str>, usize> = present_indices
-        .iter()
-        .map(|&i| (normalize_identifier(lang_id, symbol_names[i].as_str()), i))
-        .collect();
+    // CI 言語では `Foo` と `foo` のように正規化後キーが衝突し得るため、
+    // 単一 index ではなく Vec<usize> を値として保持し、全シンボルに参照を配る。
+    let mut name_to_ix: std::collections::HashMap<std::borrow::Cow<'_, str>, Vec<usize>> =
+        std::collections::HashMap::with_capacity(present_indices.len());
+    for &i in &present_indices {
+        let key = normalize_identifier(lang_id, symbol_names[i].as_str());
+        name_to_ix.entry(key).or_default().push(i);
+    }
 
     let mut result = vec![Vec::new(); num];
     collect_identifier_refs_indexed(
@@ -643,10 +663,12 @@ fn find_refs_batch_in_file_indexed(
 }
 
 /// AST を再帰走査し、シンボル index ベースの Vec に参照を格納する。
+/// CI 言語（Xojo）で正規化後キーが衝突する場合でも全 index に参照を配るため、
+/// 値は `Vec<usize>` を受け取る。
 fn collect_identifier_refs_indexed(
     node: Node<'_>,
     source: &[u8],
-    name_to_ix: &std::collections::HashMap<std::borrow::Cow<'_, str>, usize>,
+    name_to_ix: &std::collections::HashMap<std::borrow::Cow<'_, str>, Vec<usize>>,
     path: &str,
     definition_kinds: &[&str],
     lang_id: LangId,
@@ -654,34 +676,42 @@ fn collect_identifier_refs_indexed(
 ) {
     if is_identifier_kind(node.kind())
         && let Ok(text) = node.utf8_text(source)
-        && let Some(&ix) = name_to_ix.get(&normalize_identifier(lang_id, text))
+        && let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, text))
     {
         let is_def = is_definition_context(node, definition_kinds, lang_id);
         let context = extract_line_context(source, node.start_position().row);
+        let line = node.start_position().row;
+        let column = node.start_position().column;
+        let kind = if is_def {
+            RefKind::Definition
+        } else {
+            RefKind::Reference
+        };
 
-        refs[ix].push(SymbolReference {
-            path: path.to_string(),
-            line: node.start_position().row,
-            column: node.start_position().column,
-            context: Some(context),
-            kind: Some(if is_def {
-                RefKind::Definition
-            } else {
-                RefKind::Reference
-            }),
-        });
+        for &ix in indices {
+            refs[ix].push(SymbolReference {
+                path: path.to_string(),
+                line,
+                column,
+                context: Some(context.clone()),
+                kind: Some(kind),
+            });
+        }
     }
 
     // Rust の serde 属性文字列値を識別子参照として扱う。
     for (seg, row, col) in rust_attr_string_ref_segments(node, source, lang_id) {
-        if let Some(&ix) = name_to_ix.get(&normalize_identifier(lang_id, seg)) {
-            refs[ix].push(SymbolReference {
-                path: path.to_string(),
-                line: row,
-                column: col,
-                context: Some(extract_line_context(source, row)),
-                kind: Some(RefKind::Reference),
-            });
+        if let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, seg)) {
+            let context = extract_line_context(source, row);
+            for &ix in indices {
+                refs[ix].push(SymbolReference {
+                    path: path.to_string(),
+                    line: row,
+                    column: col,
+                    context: Some(context.clone()),
+                    kind: Some(RefKind::Reference),
+                });
+            }
         }
     }
 
@@ -814,6 +844,37 @@ mod tests {
         let source = b"only one line";
         let ctx = extract_line_context(source, 5);
         assert_eq!(ctx, "");
+    }
+
+    /// 改行なしで終わる最終行も正しく抽出できることを検証（memchr 版で新規テスト）
+    #[test]
+    fn extract_line_context_final_line_without_newline() {
+        let source = b"first\nsecond";
+        let ctx = extract_line_context(source, 1);
+        assert_eq!(ctx, "second");
+    }
+
+    /// 巨大行を 256 バイト境界で切り詰めることを検証（minified コード防御）
+    #[test]
+    fn extract_line_context_truncates_long_line() {
+        let long = "a".repeat(500);
+        let source = format!("line0\n{long}");
+        let ctx = extract_line_context(source.as_bytes(), 1);
+        assert!(ctx.ends_with("..."), "256 バイト超は省略記号で終わるべき");
+        assert!(ctx.len() <= 256 + 3, "256 バイト + '...' 以内に収まるべき");
+    }
+
+    /// UTF-8 境界で安全に切り詰められることを検証（マルチバイト文字の分割禁止）
+    #[test]
+    fn extract_line_context_utf8_boundary_safe() {
+        // 「あ」は UTF-8 で 3 バイト。256B 境界を跨ぐ位置に配置する
+        let mut long = "a".repeat(254);
+        long.push_str("あいうえお");
+        let source = format!("x\n{long}");
+        let ctx = extract_line_context(source.as_bytes(), 1);
+        // UTF-8 境界違反でパニックしないこと
+        assert!(ctx.ends_with("..."));
+        assert!(std::str::from_utf8(ctx.as_bytes()).is_ok());
     }
 
     /// Rust の定義ノード種別に function_item と struct_item が含まれることを検証

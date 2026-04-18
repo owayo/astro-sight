@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::io::Read;
@@ -425,7 +425,34 @@ pub fn cmd_cochange(
     Ok(())
 }
 
+/// `git diff` / `git show` に渡す revision を検証する。
+/// 先頭が `-` の値は git がオプションとして解釈するため拒否する。
+/// (例: `--output=/path` によるファイル書き込みを防ぐ)
+fn validate_git_revision(rev: &str, arg_name: &str) -> Result<()> {
+    if rev.is_empty() {
+        bail!(AstroError::new(
+            ErrorCode::InvalidRequest,
+            format!("{arg_name} must not be empty"),
+        ));
+    }
+    if rev.starts_with('-') {
+        bail!(AstroError::new(
+            ErrorCode::InvalidRequest,
+            format!("{arg_name} must not start with '-': {rev}"),
+        ));
+    }
+    // `\0` を含む値はプロセス引数として不正
+    if rev.contains('\0') {
+        bail!(AstroError::new(
+            ErrorCode::InvalidRequest,
+            format!("{arg_name} must not contain NUL"),
+        ));
+    }
+    Ok(())
+}
+
 pub fn run_git_diff(dir: &str, base: &str, staged: bool) -> Result<String> {
+    validate_git_revision(base, "--base")?;
     // git config `diff.renames` がユーザー環境で無効化されていても rename を検出できるよう、
     // 明示的に `--find-renames` を指定する。ファイル rename が api.rm/api.add の誤発報源に
     // なるため、astro-sight 側で強制しておく。
@@ -1420,6 +1447,9 @@ fn extract_exported_symbols_from_git(
     base: &str,
     file_path: &str,
 ) -> Option<Vec<(String, String, String)>> {
+    // `base` と `file_path` はオプション誤認識を避けるため先頭が `-` のものを拒否する
+    validate_git_revision(base, "--base").ok()?;
+    validate_git_revision(file_path, "diff file path").ok()?;
     let output = std::process::Command::new("git")
         .args(["show", &format!("{base}:{file_path}")])
         .current_dir(dir)
@@ -1705,25 +1735,79 @@ pub fn cmd_dead_code(
 // Batch processing (NDJSON output, rayon parallel)
 // ---------------------------------------------------------------------------
 
-/// NDJSON batch output: process in parallel (order preserved), write with locked stdout.
+/// NDJSON バッチ出力: 並列処理の結果をインデックス順に stdout へ書き出す。
+/// `par_iter().collect::<Vec<String>>()` は中間 Vec に全結果を保持して
+/// ピーク RSS が膨張するため、完了済みスロットを別スレッドで随時排出する。
+/// 入力順と一致する出力を保つ（既存テストの期待値）。
 fn batch_ndjson<F>(paths: &[String], process: F) -> Result<()>
 where
     F: Fn(&str) -> String + Sync,
 {
     use std::io::Write;
-    let results: Vec<String> = paths.par_iter().map(|p| process(p)).collect();
-    let total_bytes: usize = results.iter().map(|r| r.len()).sum();
-    info!(
-        batch_size = paths.len(),
-        output_bytes = total_bytes,
-        "batch completed"
-    );
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    for line in &results {
-        writeln!(out, "{line}")?;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+
+    if paths.is_empty() {
+        return Ok(());
     }
-    Ok(())
+
+    let batch_size = paths.len();
+    // 各スロットは排出時に `take` されるため Mutex<Option<String>>
+    let slots: Vec<Mutex<Option<String>>> = (0..batch_size).map(|_| Mutex::new(None)).collect();
+    let (tx, rx) = mpsc::channel::<usize>();
+    let next_to_write = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| -> Result<()> {
+        let slots_ref = &slots;
+        let next_to_write_ref = &next_to_write;
+
+        let writer = scope.spawn(move || -> Result<usize> {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            let mut bytes = 0usize;
+            // 完了通知を受け取り、次に書くべきインデックスが揃っている間は順次排出する
+            for _ in rx {
+                loop {
+                    let cur = next_to_write_ref.load(Ordering::Acquire);
+                    if cur >= batch_size {
+                        break;
+                    }
+                    let taken = {
+                        let mut guard = slots_ref[cur].lock().expect("slot mutex poisoned");
+                        guard.take()
+                    };
+                    if let Some(line) = taken {
+                        bytes += line.len() + 1;
+                        writeln!(out, "{line}")?;
+                        next_to_write_ref.store(cur + 1, Ordering::Release);
+                    } else {
+                        break;
+                    }
+                }
+            }
+            Ok(bytes)
+        });
+
+        paths
+            .par_iter()
+            .enumerate()
+            .for_each_with(tx, |tx, (i, p)| {
+                let line = process(p);
+                *slots_ref[i].lock().expect("slot mutex poisoned") = Some(line);
+                let _ = tx.send(i);
+            });
+
+        let written = writer
+            .join()
+            .map_err(|_| anyhow!("batch_ndjson writer thread panicked"))??;
+        info!(
+            batch_size = batch_size,
+            output_bytes = written,
+            "batch completed"
+        );
+        Ok(())
+    })
 }
 
 pub fn batch_ast(
@@ -1970,6 +2054,43 @@ mod tests {
             .expect_err("invalid utf-8 should fail");
 
         assert!(err.to_string().contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn validate_git_revision_accepts_normal_values() {
+        assert!(validate_git_revision("HEAD", "--base").is_ok());
+        assert!(validate_git_revision("HEAD^", "--base").is_ok());
+        assert!(validate_git_revision("main", "--base").is_ok());
+        assert!(validate_git_revision("origin/main", "--base").is_ok());
+        assert!(validate_git_revision("feature/foo", "--base").is_ok());
+        assert!(validate_git_revision("abc1234", "--base").is_ok());
+        assert!(validate_git_revision("v1.0.0", "--base").is_ok());
+    }
+
+    // `--output=/path` 等のオプション注入を拒否する
+    #[test]
+    fn validate_git_revision_rejects_option_prefix() {
+        let err = validate_git_revision("--output=/tmp/pwn", "--base")
+            .expect_err("option-like base should be rejected");
+        assert!(err.to_string().contains("must not start with '-'"));
+
+        let err =
+            validate_git_revision("-p", "--base").expect_err("short option should be rejected");
+        assert!(err.to_string().contains("must not start with '-'"));
+    }
+
+    #[test]
+    fn validate_git_revision_rejects_empty() {
+        let err =
+            validate_git_revision("", "--base").expect_err("empty revision should be rejected");
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn validate_git_revision_rejects_nul() {
+        let err =
+            validate_git_revision("HEAD\0foo", "--base").expect_err("NUL byte should be rejected");
+        assert!(err.to_string().contains("must not contain NUL"));
     }
 
     #[test]

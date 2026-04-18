@@ -173,6 +173,8 @@ astro-sight refs --names "AppService,AstgenResponse" --dir src/
 
 `--name` は空文字を受け付けない。`--names` も空要素のみ（例: `",,,"`）の場合は `INVALID_REQUEST` を返す。`--dir` にはディレクトリのみ指定でき、ファイルパスを渡した場合も `INVALID_REQUEST` を返す。
 
+`context` / `impact` / `review` の `--base` は `git diff` / `git show` にそのまま渡るため、`-` で始まる値・NUL を含む値・空文字を `INVALID_REQUEST` で拒否する（`--output=/path` 等のオプション誤認識を防ぐ）。
+
 出力例:
 ```json
 {

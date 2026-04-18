@@ -356,9 +356,9 @@ pub(crate) fn is_ref_in_target_test_context(
     let entry = cache.entry(path.to_string()).or_insert_with(|| {
         let utf8_path = Utf8Path::new(path);
         let source = parser::read_file(utf8_path).ok()?;
-        let source_vec = source.as_bytes().to_vec();
         let (tree, lang_id) = parser::parse_file(utf8_path, &source).ok()?;
-        Some((tree, source_vec, lang_id))
+        // mmap 経路を維持するため SourceBuf をそのままキャッシュする
+        Some((tree, source, lang_id))
     });
 
     let Some((tree, source, lang_id)) = entry else {
@@ -370,7 +370,7 @@ pub(crate) fn is_ref_in_target_test_context(
         end: crate::models::location::Point { line, column },
     };
 
-    is_in_test_context(tree.root_node(), source, &range, *lang_id, path)
+    is_in_test_context(tree.root_node(), source.as_bytes(), &range, *lang_id, path)
 }
 
 #[cfg(test)]

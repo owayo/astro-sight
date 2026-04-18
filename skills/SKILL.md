@@ -389,4 +389,4 @@ astro-sight dead-code --dir . --git
 - `refs` respects `.gitignore` and uses parallel scanning
 - Multiple symbol searches: use `refs --names` for batching; reserve `session` for mixed commands
 - `session` supports `ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange` (note: `review` is CLI-only, not available in session mode)
-- **Input validation**: Empty `--name`/`--names`, empty `--paths`/`--paths-file` are rejected with `INVALID_REQUEST` error
+- **Input validation**: Empty `--name`/`--names`, empty `--paths`/`--paths-file` are rejected with `INVALID_REQUEST` error. `--base` for `context`/`impact`/`review` rejects values starting with `-` (blocks option-style injection into `git diff` / `git show`)

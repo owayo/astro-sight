@@ -3788,6 +3788,45 @@ fn xojo_refs_rust_case_preserved() {
 }
 
 #[test]
+fn xojo_refs_batch_case_insensitive_collision() {
+    // Xojo は case-insensitive。`Greet` と `greet` を同一バッチで渡しても
+    // 両方に同じ参照リストが割り当たるべき（正規化キーの衝突で片方が欠落しないこと）。
+    let output = cargo_bin()
+        .args([
+            "refs",
+            "--names",
+            "Greet,greet",
+            "--dir",
+            "tests/fixtures",
+            "--glob",
+            "**/*.xojo_code",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 2, "2シンボル分の NDJSON が出力されるべき");
+
+    let first: serde_json::Value = serde_json::from_str(lines[0]).expect("invalid JSON");
+    let second: serde_json::Value = serde_json::from_str(lines[1]).expect("invalid JSON");
+    let refs1 = first["refs"].as_array().expect("refs array");
+    let refs2 = second["refs"].as_array().expect("refs array");
+
+    assert!(
+        !refs1.is_empty() && !refs2.is_empty(),
+        "`Greet` / `greet` どちらも参照を持つべき (片方欠落しないこと): Greet={:?}, greet={:?}",
+        refs1,
+        refs2
+    );
+    assert_eq!(
+        refs1.len(),
+        refs2.len(),
+        "同じ正規化キーなら同数の参照であるべき"
+    );
+}
+
+#[test]
 fn xojo_doctor_lists_xojo() {
     let output = cargo_bin()
         .args(["doctor"])
