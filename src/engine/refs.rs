@@ -131,6 +131,19 @@ fn collect_identifier_refs(
         });
     }
 
+    // Rust の serde 属性文字列値を識別子参照として扱う。
+    for (seg, row, col) in rust_attr_string_ref_segments(node, source, lang_id) {
+        if normalize_identifier(lang_id, seg).as_ref() == symbol_name {
+            refs.push(SymbolReference {
+                path: path.to_string(),
+                line: row,
+                column: col,
+                context: Some(extract_line_context(source, row)),
+                kind: Some(RefKind::Reference),
+            });
+        }
+    }
+
     // 子ノードを再帰走査
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -339,6 +352,99 @@ fn is_identifier_kind(kind: &str) -> bool {
             | "word"
             | "constant"
     )
+}
+
+/// Rust の属性引数で文字列値を識別子/パス参照として解釈すべきキー。
+/// serde 系の `#[serde(serialize_with = "path::to::fn")]` 形式を想定する。
+const RUST_ATTR_STRING_REF_KEYS: &[&str] = &[
+    "serialize_with",
+    "deserialize_with",
+    "with",
+    "skip_serializing_if",
+    "try_from",
+    "from",
+    "into",
+];
+
+/// `string_content` ノードが Rust の serde 系属性値として現れるかを判定する。
+/// 構造: `attribute > token_tree > identifier "=" string_literal > string_content`
+fn is_rust_attribute_ref_string(node: Node<'_>, source: &[u8]) -> bool {
+    let Some(string_literal) = node.parent() else {
+        return false;
+    };
+    if string_literal.kind() != "string_literal" {
+        return false;
+    }
+    let Some(token_tree) = string_literal.parent() else {
+        return false;
+    };
+    if token_tree.kind() != "token_tree" {
+        return false;
+    }
+
+    // token_tree の直下兄弟で `identifier "=" string_literal` の並びを検出する。
+    let mut cursor = token_tree.walk();
+    let mut prev_prev: Option<Node> = None;
+    let mut prev: Option<Node> = None;
+    for child in token_tree.children(&mut cursor) {
+        if child.id() == string_literal.id() {
+            let Some(eq) = prev else {
+                return false;
+            };
+            if eq.kind() != "=" {
+                return false;
+            }
+            let Some(key) = prev_prev else {
+                return false;
+            };
+            if key.kind() != "identifier" {
+                return false;
+            }
+            let Ok(key_text) = key.utf8_text(source) else {
+                return false;
+            };
+            return RUST_ATTR_STRING_REF_KEYS.contains(&key_text);
+        }
+        prev_prev = prev;
+        prev = Some(child);
+    }
+    false
+}
+
+/// "Option::is_none" を [("Option", 0), ("is_none", 8)] のように (segment, byte offset) で分割する。
+fn split_path_segments(text: &str) -> Vec<(&str, usize)> {
+    let mut results = Vec::new();
+    let mut offset = 0usize;
+    for seg in text.split("::") {
+        if !seg.is_empty() {
+            results.push((seg, offset));
+        }
+        offset += seg.len() + 2; // "::"
+    }
+    results
+}
+
+/// Rust 属性の string_content から (segment, row, col) を列挙する。
+/// 非 Rust やパターンに合わない場合は空 Vec を返す。
+fn rust_attr_string_ref_segments<'a>(
+    node: Node<'_>,
+    source: &'a [u8],
+    lang_id: LangId,
+) -> Vec<(&'a str, usize, usize)> {
+    if lang_id != LangId::Rust || node.kind() != "string_content" {
+        return Vec::new();
+    }
+    if !is_rust_attribute_ref_string(node, source) {
+        return Vec::new();
+    }
+    let Ok(text) = node.utf8_text(source) else {
+        return Vec::new();
+    };
+    let base = node.start_position();
+    split_path_segments(text)
+        .into_iter()
+        .map(|(seg, off)| (seg, base.row, base.column + off))
+        .collect()
 }
 
 /// 指定行のソース行をコンテキストとして抽出する。
@@ -566,6 +672,19 @@ fn collect_identifier_refs_indexed(
         });
     }
 
+    // Rust の serde 属性文字列値を識別子参照として扱う。
+    for (seg, row, col) in rust_attr_string_ref_segments(node, source, lang_id) {
+        if let Some(&ix) = name_to_ix.get(&normalize_identifier(lang_id, seg)) {
+            refs[ix].push(SymbolReference {
+                path: path.to_string(),
+                line: row,
+                column: col,
+                context: Some(extract_line_context(source, row)),
+                kind: Some(RefKind::Reference),
+            });
+        }
+    }
+
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_identifier_refs_indexed(
@@ -643,6 +762,13 @@ fn count_identifier_refs(
         counts[ix] += 1;
     }
 
+    // Rust の serde 属性文字列値を非 Definition 参照としてカウントする。
+    for (seg, _row, _col) in rust_attr_string_ref_segments(node, source, lang_id) {
+        if let Some(&ix) = name_to_ix.get(&normalize_identifier(lang_id, seg)) {
+            counts[ix] += 1;
+        }
+    }
+
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         count_identifier_refs(child, source, name_to_ix, definition_kinds, lang_id, counts);
@@ -706,5 +832,189 @@ mod tests {
         let kinds = definition_node_kinds(LangId::Python);
         assert!(kinds.contains(&"function_definition"));
         assert!(kinds.contains(&"class_definition"));
+    }
+
+    /// `split_path_segments` が "::" 区切りの各セグメントとバイトオフセットを返すことを検証
+    #[test]
+    fn split_path_segments_basic() {
+        assert_eq!(split_path_segments("foo"), vec![("foo", 0)]);
+        assert_eq!(
+            split_path_segments("Option::is_none"),
+            vec![("Option", 0), ("is_none", 8)]
+        );
+        assert_eq!(
+            split_path_segments("a::b::c"),
+            vec![("a", 0), ("b", 3), ("c", 6)]
+        );
+        assert!(split_path_segments("").is_empty());
+    }
+
+    /// ヘルパー: Rust ソースを tree-sitter でパースしてツリーを返す
+    fn parse_rust(source: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("load rust language");
+        parser.parse(source, None).expect("parse rust source")
+    }
+
+    /// serde の serialize_with = "..." 内の関数名が参照として収集されることを検証
+    #[test]
+    fn rust_attr_string_ref_detected_for_serialize_with() {
+        let source = r#"
+fn serialize_jst() {}
+struct Foo;
+impl Foo {
+    fn placeholder() {}
+}
+#[derive(Serialize)]
+struct Bar {
+    #[serde(serialize_with = "serialize_jst")]
+    time: i64,
+}
+"#;
+        let tree = parse_rust(source);
+        let defs = definition_node_kinds(LangId::Rust);
+        let mut refs = Vec::new();
+        collect_identifier_refs(
+            tree.root_node(),
+            source.as_bytes(),
+            "serialize_jst",
+            "test.rs",
+            defs,
+            LangId::Rust,
+            &mut refs,
+        );
+
+        // 定義 1 件 + 属性文字列内参照 1 件
+        let def_cnt = refs
+            .iter()
+            .filter(|r| matches!(r.kind, Some(RefKind::Definition)))
+            .count();
+        let ref_cnt = refs
+            .iter()
+            .filter(|r| matches!(r.kind, Some(RefKind::Reference)))
+            .count();
+        assert_eq!(def_cnt, 1, "definition should be captured");
+        assert_eq!(ref_cnt, 1, "serde attribute string ref should be captured");
+    }
+
+    /// 属性文字列参照が非 Definition としてカウントされ、dead-code 判定に反映されることを検証
+    #[test]
+    fn rust_attr_string_ref_counted_as_non_definition() {
+        use std::borrow::Cow;
+        use std::collections::HashMap;
+
+        let source = r#"
+fn serialize_jst() {}
+#[derive(Serialize)]
+struct Bar {
+    #[serde(serialize_with = "serialize_jst")]
+    time: i64,
+}
+"#;
+        let tree = parse_rust(source);
+        let defs = definition_node_kinds(LangId::Rust);
+        let mut name_to_ix: HashMap<Cow<'_, str>, usize> = HashMap::new();
+        name_to_ix.insert(Cow::Borrowed("serialize_jst"), 0);
+        let mut counts = vec![0usize];
+        count_identifier_refs(
+            tree.root_node(),
+            source.as_bytes(),
+            &name_to_ix,
+            defs,
+            LangId::Rust,
+            &mut counts,
+        );
+        assert_eq!(counts[0], 1, "attribute string ref must lift dead-code");
+    }
+
+    /// `Option::is_none` のようなパス文字列では最終セグメントもカウントされることを検証
+    #[test]
+    fn rust_attr_string_ref_path_segments() {
+        let source = r#"
+#[derive(Serialize)]
+struct Bar {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inner: Option<i64>,
+}
+"#;
+        let tree = parse_rust(source);
+        let defs = definition_node_kinds(LangId::Rust);
+        let mut refs = Vec::new();
+        collect_identifier_refs(
+            tree.root_node(),
+            source.as_bytes(),
+            "is_none",
+            "test.rs",
+            defs,
+            LangId::Rust,
+            &mut refs,
+        );
+        assert_eq!(
+            refs.len(),
+            1,
+            "path tail segment should be matched as reference"
+        );
+    }
+
+    /// 対象外キー (例: rename) の文字列値は参照として扱わないことを検証
+    #[test]
+    fn rust_attr_string_ref_ignores_non_ref_keys() {
+        let source = r#"
+#[derive(Serialize)]
+struct Bar {
+    #[serde(rename = "created_at")]
+    time: i64,
+}
+"#;
+        let tree = parse_rust(source);
+        let defs = definition_node_kinds(LangId::Rust);
+        let mut refs = Vec::new();
+        collect_identifier_refs(
+            tree.root_node(),
+            source.as_bytes(),
+            "created_at",
+            "test.rs",
+            defs,
+            LangId::Rust,
+            &mut refs,
+        );
+        assert!(
+            refs.is_empty(),
+            "rename is not a reference key and must not match"
+        );
+    }
+
+    /// 非 Rust 言語では属性文字列ヒューリスティックが動作しないことを検証
+    #[test]
+    fn rust_attr_helper_is_noop_for_other_languages() {
+        // Python AST 上に string_content が登場しても反応しない
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .expect("load python language");
+        let source = "x = \"serialize_jst\"\n";
+        let tree = parser.parse(source, None).unwrap();
+        let segs = collect_all_attr_segments(tree.root_node(), source.as_bytes(), LangId::Python);
+        assert!(segs.is_empty());
+    }
+
+    /// ヘルパー: 木全体で rust_attr_string_ref_segments が拾うセグメントを再帰収集
+    fn collect_all_attr_segments<'a>(
+        node: Node<'a>,
+        source: &'a [u8],
+        lang_id: LangId,
+    ) -> Vec<(String, usize, usize)> {
+        let mut out: Vec<(String, usize, usize)> =
+            rust_attr_string_ref_segments(node, source, lang_id)
+                .into_iter()
+                .map(|(s, r, c)| (s.to_string(), r, c))
+                .collect();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            out.extend(collect_all_attr_segments(child, source, lang_id));
+        }
+        out
     }
 }
