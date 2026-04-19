@@ -1341,6 +1341,12 @@ fn detect_dead_symbols(
     detect_dead_symbols_from_files(dir, &files, None)
 }
 
+/// qualname (`Container.method`) から末尾セグメントのみを抜き出す。
+/// `a.b.c` → `c`、`foo` → `foo`。
+fn bare_name(qualname: &str) -> &str {
+    qualname.rsplit('.').next().unwrap_or(qualname)
+}
+
 /// ファイルリストからエクスポートシンボルを収集し、参照ゼロのシンボルを返す。
 /// dead-code コマンドと review コマンドの共通コアロジック。
 /// count_non_definition_refs_batch で件数のみカウントし、SymbolReference を確保しない。
@@ -1389,16 +1395,20 @@ pub(crate) fn detect_dead_symbols_from_files(
         return Vec::new();
     }
 
-    let norm = |lang: crate::language::LangId, n: &str| -> String {
-        crate::language::normalize_identifier(lang, n).into_owned()
+    // refs 検索は AST 上の identifier ノードに対してマッチするため、
+    // `Container.method` 形式の qualname ではマッチせず常に 0 件となってしまう。
+    // そのため検索キーは末尾セグメント（bare name）に統一する。
+    // 同名シンボルが複数箇所にある場合は保守的にスキップする。
+    let norm_bare = |lang: crate::language::LangId, n: &str| -> String {
+        crate::language::normalize_identifier(lang, bare_name(n)).into_owned()
     };
 
-    // 同名 export が複数ファイルに存在する場合は保守的にスキップ（誤判定防止）。
-    // キーは言語別に正規化する (Xojo では `Foo` と `FOO` を同一視)。
+    // 同名 export が複数ファイル/複数コンテナに存在する場合は保守的にスキップ（誤判定防止）。
+    // キーは bare name を言語別に正規化したもの (Xojo では `Foo` と `FOO` を同一視)。
     let mut name_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     for (name, _, _, lang) in &all_syms {
-        *name_counts.entry(norm(*lang, name)).or_default() += 1;
+        *name_counts.entry(norm_bare(*lang, name)).or_default() += 1;
     }
 
     // 全シンボル名の非 Definition 参照件数をカウント（SymbolReference を確保しない）。
@@ -1407,7 +1417,7 @@ pub(crate) fn detect_dead_symbols_from_files(
         let mut seen = HashSet::new();
         all_syms
             .iter()
-            .map(|(name, _, _, lang)| norm(*lang, name))
+            .map(|(name, _, _, lang)| norm_bare(*lang, name))
             .filter(|n| seen.insert(n.clone()))
             .collect()
     };
@@ -1424,8 +1434,8 @@ pub(crate) fn detect_dead_symbols_from_files(
     // 定義以外の参照が0件のシンボルを dead として報告
     let mut dead = Vec::new();
     for (name, kind, file, lang) in &all_syms {
-        let key = norm(*lang, name);
-        // 同名 export が複数ファイルにある場合は判定不能なのでスキップ
+        let key = norm_bare(*lang, name);
+        // 同名シンボルが複数存在する場合は bare name では区別できないためスキップ
         if name_counts.get(&key).copied().unwrap_or(0) > 1 {
             continue;
         }

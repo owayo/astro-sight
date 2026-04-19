@@ -3674,6 +3674,96 @@ fn dead_code_skips_linguist_generated_files() {
     );
 }
 
+#[test]
+fn dead_code_python_instance_method_is_live() {
+    // Python の `obj.method()` 形式の呼び出しが参照として認識され、
+    // class 内メソッドが偽陽性で dead 判定されないことを確認。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("sample.py"),
+        "class GitLabClient:\n    def post_comment(self, body):\n        print(body)\n\n\ndef main():\n    client = GitLabClient()\n    client.post_comment(\"hi\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success(), "dead-code は成功するべき");
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead = json["dead_symbols"].as_array().expect("dead_symbols 配列");
+    let names: Vec<&str> = dead.iter().filter_map(|s| s["name"].as_str()).collect();
+
+    assert!(
+        !names.iter().any(|n| n.contains("post_comment")),
+        "obj.method() 参照が live として検出されるべき: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_python_classmethod_and_property_are_live() {
+    // @classmethod (`Class.method()`) と @property (`obj.attr`) を参照として認識する。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("sample.py"),
+        "class ReviewConfig:\n    @classmethod\n    def from_env(cls):\n        return cls()\n\n    @property\n    def project_name(self):\n        return \"demo\"\n\n\ndef main():\n    config = ReviewConfig.from_env()\n    print(config.project_name)\n\n\nmain()\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success(), "dead-code は成功するべき");
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead = json["dead_symbols"].as_array().expect("dead_symbols 配列");
+    let names: Vec<&str> = dead.iter().filter_map(|s| s["name"].as_str()).collect();
+
+    assert!(
+        !names.iter().any(|n| n.contains("from_env")),
+        "@classmethod 呼び出しは live: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains("project_name")),
+        "@property アクセスは live: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_same_method_name_in_multiple_classes_skipped() {
+    // 同名メソッドが複数クラスに存在する場合、bare name では区別できないため
+    // 保守的に dead 判定から除外されることを確認する。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("sample.py"),
+        "class Alpha:\n    def run(self):\n        pass\n\nclass Beta:\n    def run(self):\n        pass\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success(), "dead-code は成功するべき");
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead = json["dead_symbols"].as_array().expect("dead_symbols 配列");
+    let names: Vec<&str> = dead.iter().filter_map(|s| s["name"].as_str()).collect();
+
+    assert!(
+        !names.iter().any(|n| n.ends_with(".run")),
+        "同名メソッドが複数クラスにある場合はスキップされるべき: {names:?}"
+    );
+}
+
 // ---- Xojo 言語サポートのスモークテスト ----
 
 #[test]
