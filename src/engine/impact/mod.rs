@@ -40,7 +40,9 @@ type ParsedFile = (tree_sitter::Tree, crate::engine::parser::SourceBuf, LangId);
 /// `assemble_impacts` でテストコンテキスト判定に使う LRU キャッシュ上限。
 /// 1 エントリあたり Tree + SourceBuf(Mmap) + LangId を保持するため、
 /// 大規模リポジトリ（数万ファイル）でもピーク RSS を抑える目的で上限を設ける。
-const TARGET_FILE_CACHE_SIZE: usize = 512;
+/// ほとんどの参照は同一ファイル内で連続するため少数の hot エントリで十分に hit し、
+/// サイズを小さく保つことで最大メモリ量を予測可能にする。
+const TARGET_FILE_CACHE_SIZE: usize = 64;
 
 /// 言語別にシンボル名を正規化した HashMap/HashSet キー。
 /// 非 CI 言語ではアロケーション無し (Cow::Borrowed → into_owned は元の String 相当)、

@@ -13,11 +13,20 @@ use astro_sight::config::ConfigService;
 use astro_sight::error::{AstroError, ErrorCode};
 use astro_sight::service::AppService;
 
+// dhat-heap feature 有効時のみヒーププロファイラを差し込む。
+// 実行後に `dhat-heap.json` が書き出されるので dh_view.html で可視化する。
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 fn main() {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
+
     let cli = Cli::parse();
 
     if let Err(e) = run(cli) {
