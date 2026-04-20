@@ -7,6 +7,19 @@ use crate::engine::parser;
 use crate::language::{LangId, normalize_identifier};
 use crate::models::reference::{RefKind, SymbolReference};
 
+/// `find_references_batch` 用の最大並列ワーカー数。
+///
+/// 数万ファイル級の大規模リポジトリでは rayon fold バケットがワーカー数に比例して
+/// `Vec<Vec<SymbolReference>>` を抱えるため、物理コア数をそのまま使うと RSS が
+/// 線形に膨張し OOM を招く。`ASTRO_SIGHT_BATCH_WORKERS` で上書き可能。
+fn bounded_worker_count() -> usize {
+    std::env::var("ASTRO_SIGHT_BATCH_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4)
+}
+
 /// 指定シンボルへの参照をディレクトリ内のファイルから検索する。
 /// glob パターン（例: "**/*.rs"）によるフィルタも可能。
 pub fn find_references(
@@ -508,34 +521,50 @@ pub fn find_references_batch(
 
     let files = collect_files(dir, glob_pattern)?;
 
+    // rayon のワーカー数を上限付きにする。ワーカー毎に `Vec<Vec<SymbolReference>>` の
+    // fold バケットが生成されるため、大規模リポジトリではワーカー数 × 参照件数に比例して
+    // ピーク RSS が線形増大する。
+    // 物理コア数と上限のうち小さい方を採用し、バケット総量を押さえつつ並列性を維持する。
+    let worker_limit = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(bounded_worker_count());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_limit)
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build rayon pool: {e}"))?;
+
     // fold/reduce: ワーカーごとに Vec<Vec<SymbolReference>> を持ち、直接統合
-    let mut buckets: Vec<Vec<SymbolReference>> = files
-        .into_par_iter()
-        .fold(
-            || vec![Vec::new(); symbol_names.len()],
-            |mut local, path| {
-                let Some(path_str) = path.to_str() else {
-                    return local;
-                };
-                let utf8_path = camino::Utf8Path::new(path_str);
-                if let Ok(per_file) = find_refs_batch_in_file_indexed(symbol_names, &ac, utf8_path)
-                {
-                    for (ix, mut refs) in per_file.into_iter().enumerate() {
-                        local[ix].append(&mut refs);
+    let mut buckets: Vec<Vec<SymbolReference>> = pool.install(|| {
+        files
+            .into_par_iter()
+            .fold(
+                || vec![Vec::new(); symbol_names.len()],
+                |mut local, path| {
+                    let Some(path_str) = path.to_str() else {
+                        return local;
+                    };
+                    let utf8_path = camino::Utf8Path::new(path_str);
+                    if let Ok(per_file) =
+                        find_refs_batch_in_file_indexed(symbol_names, &ac, utf8_path)
+                    {
+                        for (ix, mut refs) in per_file.into_iter().enumerate() {
+                            local[ix].append(&mut refs);
+                        }
                     }
-                }
-                local
-            },
-        )
-        .reduce(
-            || vec![Vec::new(); symbol_names.len()],
-            |mut acc, mut local| {
-                for (acc_refs, local_refs) in acc.iter_mut().zip(local.iter_mut()) {
-                    acc_refs.append(local_refs);
-                }
-                acc
-            },
-        );
+                    local
+                },
+            )
+            .reduce(
+                || vec![Vec::new(); symbol_names.len()],
+                |mut acc, mut local| {
+                    for (acc_refs, local_refs) in acc.iter_mut().zip(local.iter_mut()) {
+                        acc_refs.append(local_refs);
+                    }
+                    acc
+                },
+            )
+    });
 
     let mut merged = HashMap::with_capacity(symbol_names.len());
     for (i, name) in symbol_names.iter().enumerate() {

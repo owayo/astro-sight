@@ -1,6 +1,5 @@
-use std::collections::HashMap;
-
 use camino::Utf8Path;
+use lru::LruCache;
 
 use crate::engine::parser;
 use crate::language::LangId;
@@ -343,25 +342,64 @@ pub(crate) fn has_attribute_text(node: tree_sitter::Node, source: &[u8], pattern
     false
 }
 
+/// `LangId` が AST ベースのテストコンテキスト判定に対応しているか。
+/// 非対応言語ではファイル内容を読まずに即 false を返すことで、
+/// 大規模な PHP/HTML/CSS リポジトリで Tree/mmap が溜まるのを防ぐ。
+fn supports_ast_test_context(lang_id: LangId) -> bool {
+    matches!(
+        lang_id,
+        LangId::Rust
+            | LangId::Python
+            | LangId::Javascript
+            | LangId::Typescript
+            | LangId::Tsx
+            | LangId::Java
+            | LangId::Kotlin
+            | LangId::CSharp
+            | LangId::Ruby
+    )
+}
+
 /// ターゲットファイルの指定行/列の参照がテストコンテキスト内にあるか確認する。
 ///
-/// ターゲットファイルをオンデマンドでパースし、再パースを避けるためキャッシュする。
-/// `#[cfg(test)]` モジュールや `#[test]` 関数内の影響を受ける呼び出し元を除外する。
+/// 3 段階で判定し、必要最小限のファイルだけをパースする:
+///   1. パス判定（ファイル読み込み不要、全言語共通）
+///   2. 拡張子から言語を判定し、AST 判定非対応の言語は即 false（PHP 等）
+///   3. 対応言語のみパースし、再パースを避けるため LRU キャッシュに保持する
+///
+/// LRU 上限でキャッシュを有界にすることで、数千〜数万ファイル級のリポジトリでも
+/// Tree + SourceBuf が残留しても RSS ピークが定数に収束する。
 pub(crate) fn is_ref_in_target_test_context(
     path: &str,
     line: usize,
     column: usize,
-    cache: &mut HashMap<String, Option<ParsedFile>>,
+    cache: &mut LruCache<String, Option<ParsedFile>>,
 ) -> bool {
-    let entry = cache.entry(path.to_string()).or_insert_with(|| {
-        let utf8_path = Utf8Path::new(path);
-        let source = parser::read_file(utf8_path).ok()?;
-        let (tree, lang_id) = parser::parse_file(utf8_path, &source).ok()?;
-        // mmap 経路を維持するため SourceBuf をそのままキャッシュする
-        Some((tree, source, lang_id))
-    });
+    // 1. パスベース判定（ファイル読み込み不要）
+    if is_test_file_path(path) {
+        return true;
+    }
 
-    let Some((tree, source, lang_id)) = entry else {
+    // 2. 言語判定: AST 判定非対応なら parse せずに即 false
+    let utf8_path = Utf8Path::new(path);
+    let Ok(lang_id) = LangId::from_path(utf8_path) else {
+        return false;
+    };
+    if !supports_ast_test_context(lang_id) {
+        return false;
+    }
+
+    // 3. 対応言語のみ parse して LRU にキャッシュ
+    if cache.get(path).is_none() {
+        let parsed = parser::read_file(utf8_path).ok().and_then(|source| {
+            let (tree, parsed_lang_id) = parser::parse_file(utf8_path, &source).ok()?;
+            // mmap 経路を維持するため SourceBuf をそのままキャッシュする
+            Some((tree, source, parsed_lang_id))
+        });
+        cache.put(path.to_string(), parsed);
+    }
+
+    let Some(Some((tree, source, lang_id))) = cache.get(path) else {
         return false;
     };
 

@@ -2,10 +2,12 @@ mod signature;
 mod test_context;
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use anyhow::Result;
 use camino::Utf8Path;
+use lru::LruCache;
 
 use crate::engine::{calls, diff, parser, refs, symbols};
 use crate::language::{LangId, normalize_identifier};
@@ -34,6 +36,11 @@ struct FileContext {
 /// キャッシュされたパース結果: (tree, ソースバッファ, 言語)。
 /// `SourceBuf` を直接保持することで mmap のゼロコピー経路を維持する。
 type ParsedFile = (tree_sitter::Tree, crate::engine::parser::SourceBuf, LangId);
+
+/// `assemble_impacts` でテストコンテキスト判定に使う LRU キャッシュ上限。
+/// 1 エントリあたり Tree + SourceBuf(Mmap) + LangId を保持するため、
+/// 大規模リポジトリ（数万ファイル）でもピーク RSS を抑える目的で上限を設ける。
+const TARGET_FILE_CACHE_SIZE: usize = 512;
 
 /// 言語別にシンボル名を正規化した HashMap/HashSet キー。
 /// 非 CI 言語ではアロケーション無し (Cow::Borrowed → into_owned は元の String 相当)、
@@ -220,7 +227,8 @@ fn assemble_impacts(
     included_symbols: &HashSet<String>,
 ) -> Vec<FileImpact> {
     let mut changes = Vec::new();
-    let mut target_file_cache: HashMap<String, Option<ParsedFile>> = HashMap::new();
+    let mut target_file_cache: LruCache<String, Option<ParsedFile>> =
+        LruCache::new(NonZeroUsize::new(TARGET_FILE_CACHE_SIZE).expect("cache size is non-zero"));
 
     for ctx in file_contexts {
         // (path, line) → (name, symbols) で重複マージしつつシンボルを追跡
@@ -385,7 +393,7 @@ fn is_relevant_cross_file_ref(
     sym_name: &str,
     method_parent_types: &HashMap<String, String>,
     batch_refs: &HashMap<String, Vec<SymbolReference>>,
-    target_file_cache: &mut HashMap<String, Option<ParsedFile>>,
+    target_file_cache: &mut LruCache<String, Option<ParsedFile>>,
 ) -> bool {
     // 1. 定義をスキップ
     if r.kind == Some(RefKind::Definition) {
@@ -764,7 +772,8 @@ mod tests {
             context: None,
             kind: Some(RefKind::Reference),
         };
-        let mut cache = HashMap::new();
+        let mut cache: LruCache<String, Option<ParsedFile>> =
+            LruCache::new(NonZeroUsize::new(TARGET_FILE_CACHE_SIZE).unwrap());
         // 完全一致は除外される
         assert!(!is_relevant_cross_file_ref(
             &r,
@@ -787,7 +796,8 @@ mod tests {
             context: None,
             kind: Some(RefKind::Reference),
         };
-        let mut cache = HashMap::new();
+        let mut cache: LruCache<String, Option<ParsedFile>> =
+            LruCache::new(NonZeroUsize::new(TARGET_FILE_CACHE_SIZE).unwrap());
         // パス区切り付きのサフィックスマッチも除外される
         assert!(!is_relevant_cross_file_ref(
             &r,
@@ -810,7 +820,8 @@ mod tests {
             context: None,
             kind: Some(RefKind::Reference),
         };
-        let mut cache = HashMap::new();
+        let mut cache: LruCache<String, Option<ParsedFile>> =
+            LruCache::new(NonZeroUsize::new(TARGET_FILE_CACHE_SIZE).unwrap());
         // "test_main.rs" は "main.rs" と別ファイルなので除外されない
         // (言語チェック等で false を返す可能性はあるが、ステージ2は通過する)
         let result = is_relevant_cross_file_ref(
