@@ -102,13 +102,13 @@ pub fn read_file(path: &Utf8Path) -> Result<SourceBuf> {
         ));
     }
 
-    // 4MB 超のファイルは mmap でゼロコピー、それ以下は Vec に読み込む。
-    // 24k ファイル級の大規模リポジトリで mmap が積み上がると VM 空間が数十 GB まで
-    // 膨張し、macOS の memory pressure で SIGKILL を招く。Vec ならファイル処理完了時に
-    // 即解放され、RSS/VM ともに予測可能になる。PHP/TS/Rust の大半は 4MB 以下に収まる。
+    // 64KB 超のファイルは mmap でゼロコピー、それ以下は Vec に読み込む。
+    // 大半の source ファイル（数百 KB 級）は mmap 経路になり、drop 時に OS が即 unmap するため
+    // macOS の libmalloc fragmentation を経由せず RSS が線形に解放される。
+    // 小さいファイルだけ Vec で読むことで、mmap syscall オーバーヘッドも最小化する。
     // Safety: mmap 分岐は他プロセスから truncate されると SIGBUS の可能性がある。
     // memmap2 の既知の制限事項であり、CLI ツールとしては許容範囲。
-    if metadata.len() > 4 * 1024 * 1024 {
+    if metadata.len() > 65536 {
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
         Ok(SourceBuf::Mmap(mmap))
     } else {

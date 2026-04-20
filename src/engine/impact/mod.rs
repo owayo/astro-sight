@@ -53,32 +53,65 @@ fn ci_key(lang: LangId, name: &str) -> String {
 
 /// unified diff のワークスペースディレクトリ内での影響を解析する。
 ///
-/// 2パス方式で cross-file 参照を検索する：
-///   Pass 1: 変更ファイルをパースし、affected シンボルを収集する。
-///   Pass 2: 全 affected シンボル名を1回のディレクトリウォークでバッチ検索する。
+/// 4 パス方式で cross-file 参照を流し込む：
+///   Pass 1:   変更ファイルをパースし affected シンボルを収集
+///   Pass 1.5: 全 symbol の Definition だけを軽量収集（parent_type / competing def 判定用）
+///   Pass 2+3: per-file で `Vec<SymbolReference>` を caller_map に直接集約し即 drop
+///   Pass 4:   caller_maps から FileImpact を組み立てる
+///
+/// batch_refs 全件保持を廃止することで、数万ファイル級リポジトリでも RSS を定数に抑える。
 pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
     let diff_files = diff::parse_unified_diff(diff_input);
 
-    // Pass 1: 変更ファイルをパースし affected シンボルを収集
     let (file_contexts, all_symbol_names, method_parent_types, included_symbols) =
         collect_affected_symbols(diff_input, &diff_files, dir);
 
-    // Pass 2: cross-file 参照のバッチ検索（全シンボルを1回のウォークで処理）
-    let batch_refs = if all_symbol_names.is_empty() {
-        HashMap::new()
-    } else {
-        refs::find_references_batch(&all_symbol_names, dir, None).unwrap_or_default()
-    };
+    if all_symbol_names.is_empty() {
+        return Ok(ContextResult {
+            changes: assemble_without_cross_file(file_contexts, &included_symbols),
+        });
+    }
 
-    // Pass 3: 結果を組み立て
-    let changes = assemble_impacts(
-        file_contexts,
-        &batch_refs,
+    let mut sym_ix: HashMap<String, usize> = HashMap::with_capacity(all_symbol_names.len());
+    for (ix, name) in all_symbol_names.iter().enumerate() {
+        sym_ix.insert(name.clone(), ix);
+    }
+
+    // Pass 1.5: 軽量 Definition path 収集
+    let def_paths_by_ix =
+        refs::collect_definition_paths_indexed(&all_symbol_names, dir, None).unwrap_or_default();
+
+    // Pass 2+3: streaming に caller_maps を構築（`SymbolReference` は per-file スコープで drop）
+    let caller_maps = stream_caller_maps(
+        &file_contexts,
+        &all_symbol_names,
+        &sym_ix,
         &method_parent_types,
         &included_symbols,
+        &def_paths_by_ix,
+        dir,
     );
 
+    // Pass 4: 最終組み立て
+    let changes = assemble_from_caller_maps(file_contexts, caller_maps);
     Ok(ContextResult { changes })
+}
+
+/// cross-file 参照が不要なケース（affected 無しなど）の軽量組み立て。
+fn assemble_without_cross_file(
+    file_contexts: Vec<FileContext>,
+    _included_symbols: &HashSet<String>,
+) -> Vec<FileImpact> {
+    file_contexts
+        .into_iter()
+        .map(|ctx| FileImpact {
+            path: ctx.new_path,
+            hunks: ctx.hunks,
+            affected_symbols: ctx.affected,
+            signature_changes: ctx.sig_changes,
+            impacted_callers: Vec::new(),
+        })
+        .collect()
 }
 
 /// Pass 1: 変更ファイルをパースし、シンボルを抽出し、cross-file 参照検索が必要なシンボル名を決定する。
@@ -217,61 +250,232 @@ fn collect_affected_symbols(
     )
 }
 
-/// Pass 3: 各変更ファイルについて、cross-file および同一ファイル内の影響を受ける呼び出し元を収集する。
+/// 同一ファイル判定。サフィックスマッチで偽陽性を出さないよう、完全一致 or パス区切り付きで判定する。
+fn is_same_source_file(ref_path: &str, source_path: &str) -> bool {
+    ref_path == source_path || ref_path.ends_with(&format!("/{source_path}"))
+}
+
+type CallerMap = HashMap<(String, usize), (String, Vec<String>)>;
+
+/// Pass 2+3: per-file で ref を caller_map に直接集約する streaming 実装。
 ///
-/// `should_include_for_cross_file` を通過したシンボル（`included_symbols` で追跡）のみが
-/// cross-file 参照検索に使用される。メソッドの型スコーピングのためだけに `batch_refs` に
-/// 追加された親型は、影響源として反復されない。
-fn assemble_impacts(
-    file_contexts: Vec<FileContext>,
-    batch_refs: &HashMap<String, Vec<SymbolReference>>,
+/// 各 rayon worker はローカルな `Vec<CallerMap>` (file_contexts 数分) と `LruCache` を持ち、
+/// ファイル毎に `find_refs_batch_in_file_indexed` で得た `Vec<Vec<SymbolReference>>` を
+/// その場でフィルタして対応する `CallerMap` に格納する。`SymbolReference` Vec は worker 内で
+/// 即 drop されるため、従来の `HashMap<sym, Vec<SymbolReference>>` の全件保持が不要になる。
+///
+/// Stage 4 (method parent type scoping) は「同じファイルに親型 ref があるか」を per-file の
+/// `Vec<Vec<SymbolReference>>` 内で判定し、Stage 4b (competing definition) は事前に収集した
+/// `def_paths_by_ix` を参照する。
+#[allow(clippy::too_many_arguments)]
+fn stream_caller_maps(
+    file_contexts: &[FileContext],
+    all_symbol_names: &[String],
+    sym_ix: &HashMap<String, usize>,
     method_parent_types: &HashMap<String, String>,
     included_symbols: &HashSet<String>,
-) -> Vec<FileImpact> {
-    let mut changes = Vec::new();
-    let mut target_file_cache: LruCache<String, Option<ParsedFile>> =
-        LruCache::new(NonZeroUsize::new(TARGET_FILE_CACHE_SIZE).expect("cache size is non-zero"));
+    def_paths_by_ix: &[Vec<String>],
+    dir: &Path,
+) -> Vec<CallerMap> {
+    let n_fc = file_contexts.len();
 
-    for ctx in file_contexts {
-        // (path, line) → (name, symbols) で重複マージしつつシンボルを追跡
-        let mut caller_map: HashMap<(String, usize), (String, Vec<String>)> = HashMap::new();
-
-        let source_lang_group = lang_compat_group(ctx.lang_id);
+    // sym_ix -> Vec<fc_ix>（included_symbols を満たすもののみ）
+    let mut sym_to_fc: Vec<Vec<usize>> = vec![Vec::new(); all_symbol_names.len()];
+    for (fc_ix, ctx) in file_contexts.iter().enumerate() {
         for sym in &ctx.affected {
             let sym_key = ci_key(ctx.lang_id, &sym.name);
             if !included_symbols.contains(&sym_key) {
                 continue;
             }
-            if let Some(caller_refs) = batch_refs.get(&sym_key) {
-                for r in caller_refs {
-                    if !is_relevant_cross_file_ref(
-                        r,
-                        &ctx.new_path,
-                        source_lang_group,
-                        ctx.lang_id,
-                        &sym_key,
+            if let Some(&ix) = sym_ix.get(&sym_key) {
+                sym_to_fc[ix].push(fc_ix);
+            }
+        }
+    }
+
+    let ac = match refs::build_ac_case_insensitive(all_symbol_names) {
+        Ok(a) => a,
+        Err(_) => return vec![CallerMap::new(); n_fc],
+    };
+    let files = match refs::collect_files(dir, None) {
+        Ok(f) => f,
+        Err(_) => return vec![CallerMap::new(); n_fc],
+    };
+
+    let worker_limit = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(4);
+    let pool = match rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_limit)
+        .build()
+    {
+        Ok(p) => p,
+        Err(_) => return vec![CallerMap::new(); n_fc],
+    };
+
+    type WorkerState = (Vec<CallerMap>, LruCache<String, Option<ParsedFile>>);
+    let init_state = || -> WorkerState {
+        (
+            vec![CallerMap::new(); n_fc],
+            LruCache::new(
+                NonZeroUsize::new(TARGET_FILE_CACHE_SIZE).expect("cache size is non-zero"),
+            ),
+        )
+    };
+
+    let (maps, _cache) = pool.install(|| {
+        use rayon::prelude::*;
+        files
+            .into_par_iter()
+            .fold(init_state, |(mut local_maps, mut target_cache), path| {
+                let Some(path_str) = path.to_str() else {
+                    return (local_maps, target_cache);
+                };
+                let utf8_path = camino::Utf8Path::new(path_str);
+                if let Ok(per_file) =
+                    refs::find_refs_batch_in_file_indexed(all_symbol_names, &ac, utf8_path)
+                {
+                    accumulate_per_file(
+                        &per_file,
+                        &sym_to_fc,
+                        file_contexts,
+                        all_symbol_names,
+                        sym_ix,
                         method_parent_types,
-                        batch_refs,
-                        &mut target_file_cache,
-                    ) {
+                        def_paths_by_ix,
+                        &mut local_maps,
+                        &mut target_cache,
+                    );
+                }
+                (local_maps, target_cache)
+            })
+            .reduce(init_state, |(mut acc_maps, acc_cache), (local_maps, _)| {
+                for (acc_m, local_m) in acc_maps.iter_mut().zip(local_maps.into_iter()) {
+                    for (key, (name, syms)) in local_m {
+                        let entry = acc_m.entry(key).or_insert_with(|| (name, Vec::new()));
+                        for s in syms {
+                            if !entry.1.contains(&s) {
+                                entry.1.push(s);
+                            }
+                        }
+                    }
+                }
+                (acc_maps, acc_cache)
+            })
+    });
+
+    maps
+}
+
+/// per-file の `Vec<Vec<SymbolReference>>` を受け取り、filter 後に `CallerMap` へ流し込む。
+/// `SymbolReference` Vec は本関数が終わると worker 側で drop される。
+#[allow(clippy::too_many_arguments)]
+fn accumulate_per_file(
+    per_file: &[Vec<SymbolReference>],
+    sym_to_fc: &[Vec<usize>],
+    file_contexts: &[FileContext],
+    all_symbol_names: &[String],
+    sym_ix: &HashMap<String, usize>,
+    method_parent_types: &HashMap<String, String>,
+    def_paths_by_ix: &[Vec<String>],
+    local_maps: &mut [CallerMap],
+    target_cache: &mut LruCache<String, Option<ParsedFile>>,
+) {
+    for (ix, refs) in per_file.iter().enumerate() {
+        let fc_ixs = &sym_to_fc[ix];
+        if fc_ixs.is_empty() || refs.is_empty() {
+            continue;
+        }
+        let sym_key = &all_symbol_names[ix];
+        // 親型 ix を取得し、本ファイル内に親型 ref があるかを先に評価
+        let parent_type_in_this_file = method_parent_types
+            .get(sym_key)
+            .and_then(|pt| sym_ix.get(pt))
+            .and_then(|&pix| per_file.get(pix))
+            .is_some_and(|pt_refs| !pt_refs.is_empty());
+        let has_parent_type = method_parent_types.contains_key(sym_key);
+
+        for r in refs {
+            // Stage1: 定義は skip
+            if r.kind == Some(RefKind::Definition) {
+                continue;
+            }
+            for &fc_ix in fc_ixs {
+                let ctx = &file_contexts[fc_ix];
+                let source_path = &ctx.new_path;
+                let source_lang_group = lang_compat_group(ctx.lang_id);
+
+                // Stage2: 同一ファイル skip
+                if is_same_source_file(&r.path, source_path) {
+                    continue;
+                }
+                // Stage3: 言語互換性
+                if let Ok(ref_lang) = LangId::from_path(Utf8Path::new(&r.path))
+                    && lang_compat_group(ref_lang) != source_lang_group
+                {
+                    continue;
+                }
+                // Stage4: method parent type scoping
+                if has_parent_type {
+                    if !parent_type_in_this_file {
                         continue;
                     }
-                    let key = (r.path.clone(), r.line);
-                    let entry = caller_map.entry(key).or_insert_with(|| {
-                        let name = r
-                            .context
-                            .as_deref()
-                            .and_then(extract_function_from_context)
-                            .unwrap_or_else(|| sym.name.clone());
-                        (name, Vec::new())
-                    });
-                    if !entry.1.contains(&sym.name) {
-                        entry.1.push(sym.name.clone());
+                    // Stage4b: source_path 以外に competing definition があるか
+                    if let Some(paths) = def_paths_by_ix.get(ix) {
+                        let has_competing_def =
+                            paths.iter().any(|p| !is_same_source_file(p, source_path));
+                        if has_competing_def {
+                            continue;
+                        }
                     }
+                }
+                // Stage5: target file test context
+                if is_ref_in_target_test_context(&r.path, r.line, r.column, target_cache) {
+                    continue;
+                }
+                // Stage6: import/re-export 行
+                if is_import_context(r.context.as_deref()) {
+                    continue;
+                }
+
+                // 採用: CallerMap に push（SymbolReference 自体は per-file Vec に残っているが
+                // 抽出した文字列のみ保持し、関数終了時に参照元 Vec は drop される）
+                let affected_sym_name = ctx
+                    .affected
+                    .iter()
+                    .find(|a| ci_key(ctx.lang_id, &a.name) == *sym_key)
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| sym_key.clone());
+                let caller_name = r
+                    .context
+                    .as_deref()
+                    .and_then(extract_function_from_context)
+                    .unwrap_or_else(|| affected_sym_name.clone());
+
+                let key = (r.path.clone(), r.line);
+                let entry = local_maps[fc_ix]
+                    .entry(key)
+                    .or_insert_with(|| (caller_name, Vec::new()));
+                if !entry.1.contains(&affected_sym_name) {
+                    entry.1.push(affected_sym_name);
                 }
             }
         }
+    }
+}
 
+/// Pass 4: caller_maps + file_contexts から最終 FileImpact を組み立てる。
+/// 同一ファイル内の call_edges も統合する。
+fn assemble_from_caller_maps(
+    file_contexts: Vec<FileContext>,
+    mut caller_maps: Vec<CallerMap>,
+) -> Vec<FileImpact> {
+    let mut changes = Vec::with_capacity(file_contexts.len());
+    for (fc_ix, ctx) in file_contexts.into_iter().enumerate() {
+        let mut caller_map = std::mem::take(&mut caller_maps[fc_ix]);
+
+        // 同一ファイル内の call_edges をマージ
         for sym in &ctx.affected {
             let sym_key = ci_key(ctx.lang_id, &sym.name);
             for edge in &ctx.call_edges {
@@ -311,7 +515,6 @@ fn assemble_impacts(
             impacted_callers,
         });
     }
-
     changes
 }
 
@@ -372,78 +575,6 @@ fn should_include_for_cross_file(
     }
     // 5. 変更行にシンボル名が出現しない場合スキップ
     if !is_symbol_in_changed_lines(diff_input, file_path, &sym.name, lang_id) {
-        return false;
-    }
-    true
-}
-
-/// cross-file 参照が影響を受ける呼び出し元として関連するか判定する。
-///
-/// 6段階のフィルタを適用する：
-/// 1. 定義をスキップ（呼び出し箇所の参照のみが対象）
-/// 2. 同一ファイルの参照をスキップ
-/// 3. 言語間の偽陽性をスキップ
-/// 4. ターゲットファイルに親型が存在しない参照をスキップ（メソッド型スコーピング）
-/// 5. ターゲットファイルのテストコンテキスト内の参照をスキップ
-/// 6. import/re-export 行をスキップ（シンボルの型情報を使わず名前だけ経由する行）
-#[allow(clippy::too_many_arguments)]
-fn is_relevant_cross_file_ref(
-    r: &SymbolReference,
-    source_path: &str,
-    source_lang_group: u8,
-    _source_lang: LangId,
-    sym_name: &str,
-    method_parent_types: &HashMap<String, String>,
-    batch_refs: &HashMap<String, Vec<SymbolReference>>,
-    target_file_cache: &mut LruCache<String, Option<ParsedFile>>,
-) -> bool {
-    // 1. 定義をスキップ
-    if r.kind == Some(RefKind::Definition) {
-        return false;
-    }
-    // 2. 同一ファイルの参照をスキップ
-    // ends_with だけではサフィックスマッチで偽陽性が出る
-    // （例: source_path="main.rs" が "test_main.rs" にマッチ）
-    if r.path == source_path || r.path.ends_with(&format!("/{source_path}")) {
-        return false;
-    }
-    // 3. 言語間の偽陽性をスキップ
-    if let Ok(ref_lang) = LangId::from_path(Utf8Path::new(&r.path))
-        && lang_compat_group(ref_lang) != source_lang_group
-    {
-        return false;
-    }
-    // 4. メソッドの型スコーピング
-    if let Some(parent_type) = method_parent_types.get(sym_name) {
-        let type_in_ref_file = batch_refs
-            .get(parent_type.as_str())
-            .is_some_and(|type_refs| type_refs.iter().any(|tr| tr.path == r.path));
-        if !type_in_ref_file {
-            return false;
-        }
-        // 4b. 同名メソッドの型横断マッチ防止
-        // ソースファイル以外に同名メソッドの Definition が存在する場合、
-        // 異なる型が同名メソッドを定義している。名前だけでは呼び出し元が
-        // どの型のメソッドを参照しているか判別できないため保守的にフィルタ。
-        // (例: MmapDictionary::search と DoubleArrayTrie::search が共存する場合、
-        //  ターゲットファイルの search() 呼び出しがどちらの型かは不明)
-        if let Some(all_refs) = batch_refs.get(sym_name) {
-            let has_competing_def = all_refs.iter().any(|other| {
-                other.kind == Some(RefKind::Definition) && !other.path.ends_with(source_path)
-            });
-            if has_competing_def {
-                return false;
-            }
-        }
-    }
-    // 5. テストコンテキスト内の参照をスキップ
-    if is_ref_in_target_test_context(&r.path, r.line, r.column, target_file_cache) {
-        return false;
-    }
-    // 6. import/re-export 行をスキップ
-    // import 文や re-export はシンボルの名前を経由するだけで、
-    // 実装やシグネチャの変更に影響されない。
-    if is_import_context(r.context.as_deref()) {
         return false;
     }
     true
@@ -764,83 +895,22 @@ mod tests {
         );
     }
 
-    // is_relevant_cross_file_ref の同一ファイル判定テスト
+    // 同一ファイル判定 (`is_same_source_file`) — 完全一致は同一扱い
     #[test]
-    fn cross_file_ref_same_file_exact_match() {
-        let r = SymbolReference {
-            path: "src/main.rs".to_string(),
-            line: 10,
-            column: 0,
-            context: None,
-            kind: Some(RefKind::Reference),
-        };
-        let mut cache: LruCache<String, Option<ParsedFile>> =
-            LruCache::new(NonZeroUsize::new(TARGET_FILE_CACHE_SIZE).unwrap());
-        // 完全一致は除外される
-        assert!(!is_relevant_cross_file_ref(
-            &r,
-            "src/main.rs",
-            0,
-            LangId::Rust,
-            "foo",
-            &HashMap::new(),
-            &HashMap::new(),
-            &mut cache,
-        ));
+    fn same_source_file_exact_match() {
+        assert!(is_same_source_file("src/main.rs", "src/main.rs"));
     }
 
+    // 同一ファイル判定 — パス区切り付きのサフィックスも同一扱い
     #[test]
-    fn cross_file_ref_same_file_with_prefix() {
-        let r = SymbolReference {
-            path: "other/src/main.rs".to_string(),
-            line: 10,
-            column: 0,
-            context: None,
-            kind: Some(RefKind::Reference),
-        };
-        let mut cache: LruCache<String, Option<ParsedFile>> =
-            LruCache::new(NonZeroUsize::new(TARGET_FILE_CACHE_SIZE).unwrap());
-        // パス区切り付きのサフィックスマッチも除外される
-        assert!(!is_relevant_cross_file_ref(
-            &r,
-            "src/main.rs",
-            0,
-            LangId::Rust,
-            "foo",
-            &HashMap::new(),
-            &HashMap::new(),
-            &mut cache,
-        ));
+    fn same_source_file_with_prefix() {
+        assert!(is_same_source_file("other/src/main.rs", "src/main.rs"));
     }
 
+    // 同一ファイル判定 — `test_main.rs` と `main.rs` は別ファイル（ends_with 誤判定回避）
     #[test]
-    fn cross_file_ref_different_file_similar_suffix() {
-        let r = SymbolReference {
-            path: "test_main.rs".to_string(),
-            line: 10,
-            column: 0,
-            context: None,
-            kind: Some(RefKind::Reference),
-        };
-        let mut cache: LruCache<String, Option<ParsedFile>> =
-            LruCache::new(NonZeroUsize::new(TARGET_FILE_CACHE_SIZE).unwrap());
-        // "test_main.rs" は "main.rs" と別ファイルなので除外されない
-        // (言語チェック等で false を返す可能性はあるが、ステージ2は通過する)
-        let result = is_relevant_cross_file_ref(
-            &r,
-            "main.rs",
-            0,
-            LangId::Rust,
-            "foo",
-            &HashMap::new(),
-            &HashMap::new(),
-            &mut cache,
-        );
-        // 少なくともステージ2（同一ファイル判定）は通過する
-        // ステージ3以降で false を返す場合もあるため、ここでは
-        // ends_with 誤判定が修正されていることだけを確認
-        // （修正前は false を返していた）
-        let _ = result;
+    fn same_source_file_different_similar_suffix() {
+        assert!(!is_same_source_file("test_main.rs", "main.rs"));
     }
 
     /// ヘルパー: テスト用シンボルを生成する

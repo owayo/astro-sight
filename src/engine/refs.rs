@@ -588,6 +588,79 @@ pub fn find_references_batch(
     Ok(merged)
 }
 
+/// impact analyze 用: symbol_names を AC 事前フィルタで 1 回構築して返す。
+/// streaming Pass から per-file 呼び出しのためのユーティリティ。
+pub(crate) fn build_ac_case_insensitive(
+    symbol_names: &[String],
+) -> Result<aho_corasick::AhoCorasick> {
+    aho_corasick::AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build(symbol_names)
+        .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))
+}
+
+/// impact analyze 用: `symbol_names` の Definition だけを集めて `sym_index -> Vec<path>` を返す。
+///
+/// `SymbolReference` より軽量（path 文字列のみ、context や行情報なし）で、streaming Pass の中で
+/// competing definition / method parent type の判定にだけ使う。
+pub(crate) fn collect_definition_paths_indexed(
+    symbol_names: &[String],
+    dir: &Path,
+    glob_pattern: Option<&str>,
+) -> Result<Vec<Vec<String>>> {
+    if symbol_names.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let ac = build_ac_case_insensitive(symbol_names)?;
+    let files = collect_files(dir, glob_pattern)?;
+    let num = symbol_names.len();
+
+    let worker_limit = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(bounded_worker_count());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_limit)
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build rayon pool: {e}"))?;
+
+    let buckets: Vec<Vec<String>> = pool.install(|| {
+        files
+            .into_par_iter()
+            .fold(
+                || vec![Vec::new(); num],
+                |mut local, path| {
+                    let Some(path_str) = path.to_str() else {
+                        return local;
+                    };
+                    let utf8_path = camino::Utf8Path::new(path_str);
+                    if let Ok(per_file) =
+                        find_refs_batch_in_file_indexed(symbol_names, &ac, utf8_path)
+                    {
+                        for (ix, refs) in per_file.into_iter().enumerate() {
+                            if refs.iter().any(|r| r.kind == Some(RefKind::Definition)) {
+                                local[ix].push(path_str.to_string());
+                            }
+                        }
+                    }
+                    local
+                },
+            )
+            .reduce(
+                || vec![Vec::new(); num],
+                |mut acc, mut local| {
+                    for (acc_v, local_v) in acc.iter_mut().zip(local.iter_mut()) {
+                        acc_v.append(local_v);
+                    }
+                    acc
+                },
+            )
+    });
+
+    Ok(buckets)
+}
+
 /// dead-code 判定用: フル SymbolReference を作らず非 Definition 参照の件数のみ返す。
 /// SymbolReference のヒープ確保を全排除し、メモリ消費を大幅に削減する。
 pub fn count_non_definition_refs_batch(
@@ -639,8 +712,8 @@ pub fn count_non_definition_refs_batch(
 }
 
 /// 単一ファイル内で複数シンボルの参照を index ベースの Vec に格納する。
-/// find_references_batch の fold/reduce から呼ばれる。
-fn find_refs_batch_in_file_indexed(
+/// find_references_batch の fold/reduce および impact analyze の streaming Pass から呼ばれる。
+pub(crate) fn find_refs_batch_in_file_indexed(
     symbol_names: &[String],
     ac: &aho_corasick::AhoCorasick,
     path: &camino::Utf8Path,
