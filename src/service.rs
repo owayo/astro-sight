@@ -439,37 +439,60 @@ impl AppService {
 
     /// unified diff がコードベースへ与える影響を解析する。
     pub fn analyze_context(&self, diff: &str, dir: &str) -> Result<ContextResult> {
-        debug!(dir = dir, diff_bytes = diff.len(), "analyze_context called");
+        let mut changes = Vec::new();
+        self.analyze_context_streaming(diff, dir, |impact| {
+            changes.push(impact);
+            Ok(())
+        })?;
+        Ok(ContextResult { changes })
+    }
+
+    /// unified diff の影響を `FileImpact` 1 件ずつ callback に渡す streaming API。
+    ///
+    /// CLI 層で JSON を 1 件ずつ stdout に書き出せば、`Vec<FileImpact>` を全件保持する
+    /// ことによる数 GB 級のピーク RSS を排除できる。`analyze_context` はこの薄い wrapper。
+    pub fn analyze_context_streaming<F>(
+        &self,
+        diff: &str,
+        dir: &str,
+        mut on_file_impact: F,
+    ) -> Result<()>
+    where
+        F: FnMut(crate::models::impact::FileImpact) -> Result<()>,
+    {
+        debug!(
+            dir = dir,
+            diff_bytes = diff.len(),
+            "analyze_context_streaming called"
+        );
         let canonical_dir = self.validate_dir(dir)?;
         self.validate_input_size(diff)?;
 
-        let mut result = impact::analyze_impact(diff, &canonical_dir)?;
+        let mut changes_count = 0usize;
+        let mut callers_count = 0usize;
+        let mut affected_count = 0usize;
 
-        // impacted_callers 内の絶対パスを相対パスへ変換する。
-        for change in &mut result.changes {
-            for caller in &mut change.impacted_callers {
+        impact::analyze_impact_streaming(diff, &canonical_dir, |mut impact| {
+            // impacted_callers 内の絶対パスを相対パスへ変換する。
+            for caller in &mut impact.impacted_callers {
                 if let Ok(rel) = std::path::Path::new(&caller.path).strip_prefix(&canonical_dir) {
                     caller.path = rel.to_string_lossy().to_string();
                 }
             }
-        }
+            changes_count += 1;
+            affected_count += impact.affected_symbols.len();
+            callers_count += impact.impacted_callers.len();
+            on_file_impact(impact)
+        })?;
 
         debug!(
             dir = dir,
-            changes = result.changes.len(),
-            total_affected = result
-                .changes
-                .iter()
-                .map(|c| c.affected_symbols.len())
-                .sum::<usize>(),
-            total_callers = result
-                .changes
-                .iter()
-                .map(|c| c.impacted_callers.len())
-                .sum::<usize>(),
-            "analyze_context completed"
+            changes = changes_count,
+            total_affected = affected_count,
+            total_callers = callers_count,
+            "analyze_context_streaming completed"
         );
-        Ok(result)
+        Ok(())
     }
 
     /// git 履歴から共変更パターンを解析する。

@@ -537,16 +537,49 @@ pub fn cmd_context(
         read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?
     };
 
-    let result = service.analyze_context(&diff_input, dir)?;
-    let output = serialize_output(&result, pretty)?;
+    if pretty {
+        // pretty 出力は人間向けで整形が必要なため、従来どおり全 FileImpact を集約してから
+        // 一括 serialize する。数 GB 級リポでは compact 出力推奨。
+        let result = service.analyze_context(&diff_input, dir)?;
+        let output = serialize_output(&result, pretty)?;
+        info!(
+            command = "context",
+            dir = dir,
+            diff_bytes = diff_input.len(),
+            output_bytes = output.len(),
+            "command completed"
+        );
+        println!("{output}");
+        return Ok(());
+    }
+
+    // compact 出力: streaming API で `FileImpact` を 1 件ずつ stdout に flush し、
+    // `Vec<FileImpact>` の累積による数 GB 級ピーク RSS を排除する。
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    out.write_all(b"{\"changes\":[")?;
+    let mut first = true;
+    let mut changes_count = 0usize;
+    service.analyze_context_streaming(&diff_input, dir, |impact| {
+        if !first {
+            out.write_all(b",")
+                .map_err(|e| anyhow::anyhow!("stdout write failed: {e}"))?;
+        }
+        serde_json::to_writer(&mut out, &impact)
+            .map_err(|e| anyhow::anyhow!("json serialization failed: {e}"))?;
+        first = false;
+        changes_count += 1;
+        Ok(())
+    })?;
+    out.write_all(b"]}\n")?;
     info!(
         command = "context",
         dir = dir,
         diff_bytes = diff_input.len(),
-        output_bytes = output.len(),
-        "command completed"
+        changes = changes_count,
+        "command completed (streaming)"
     );
-    println!("{output}");
     Ok(())
 }
 

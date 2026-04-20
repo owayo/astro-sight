@@ -66,15 +66,39 @@ fn ci_key(lang: LangId, name: &str) -> String {
 /// 中間バッファを `caller_map` のサイズ (数百MB) まで抑え、融合版で発生した
 /// fold 中の 1GB 級バッファ問題を排除する。
 pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
+    // 互換 API: streaming 版で各 FileImpact を Vec に集めて返す。
+    // 呼び出し側が全件 materialize を許容するケース（MCP/ライブラリ経由）で使う。
+    let mut changes = Vec::new();
+    analyze_impact_streaming(diff_input, dir, |impact| {
+        changes.push(impact);
+        Ok(())
+    })?;
+    Ok(ContextResult { changes })
+}
+
+/// `FileImpact` を 1 件生成するごとに `on_file_impact` callback に渡す streaming API。
+///
+/// `Vec<FileImpact>` を全件 memory に貯めないため、呼び出し側（CLI）で JSON を 1 件ずつ
+/// stdout に flush すれば、最終 `ContextResult.changes` の成長に伴う数 GB 級のピーク RSS を
+/// 排除できる。通常の `analyze_impact` はこの API の薄い wrapper。
+pub fn analyze_impact_streaming<F>(
+    diff_input: &str,
+    dir: &Path,
+    mut on_file_impact: F,
+) -> Result<()>
+where
+    F: FnMut(FileImpact) -> Result<()>,
+{
     let diff_files = diff::parse_unified_diff(diff_input);
 
     let (file_contexts, all_symbol_names, method_parent_types, included_symbols) =
         collect_affected_symbols(diff_input, &diff_files, dir);
 
     if all_symbol_names.is_empty() {
-        return Ok(ContextResult {
-            changes: assemble_without_cross_file(file_contexts, &included_symbols),
-        });
+        for change in assemble_without_cross_file(file_contexts, &included_symbols) {
+            on_file_impact(change)?;
+        }
+        return Ok(());
     }
 
     let mut sym_ix: HashMap<String, usize> = HashMap::with_capacity(all_symbol_names.len());
@@ -95,10 +119,10 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
     // Stage 4b 判定用: method parent を持つ sym_ix のビットセット
     let has_parent_by_ix = compute_has_parent_by_ix(&sym_ix, &method_parent_types);
 
-    // Pass 3/4 融合: 各 FileContext を 1 件ずつ取り出し、de-intern → FileImpact → drop。
+    // Pass 3/4 融合: 各 FileContext を 1 件ずつ取り出し、de-intern → FileImpact → callback → drop。
     // 旧実装は `Vec<CallerMap>` 全件を String 化してから `FileImpact` を作っていたため、
     // 中間表現が 2 重に materialize されて RSS の 0.7-1.2 GB を食っていた（codex 分析）。
-    let mut changes = Vec::with_capacity(file_contexts.len());
+    // さらに streaming callback で呼び出し側（CLI）へ即渡し、`Vec<FileImpact>` の累積も廃止する。
     for (fc_ix, ctx) in file_contexts.into_iter().enumerate() {
         let typed_map = std::mem::take(&mut typed_caller_maps[fc_ix]);
         let caller_map = apply_stage4b_single(
@@ -108,14 +132,24 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
             &has_parent_by_ix,
             &ctx.new_path,
         );
-        changes.push(build_file_impact(ctx, caller_map));
-        // caller_map / typed_map はスコープ終了で drop され、
-        // 次の fc へ進む前に interned 以外のヒープを解放する。
+        let impact = build_file_impact(ctx, caller_map);
+        // affected_symbols / impacted_callers / signature_changes がすべて空の FileImpact は
+        // 解析対象外（AST が抽出できなかった minified / dist / 生成物ファイル等）なので出力せず
+        // スキップする。大規模リポジトリでは dist/*.js 等で数千件の空 FileImpact が
+        // 発生し、stdout への書き出しだけで数 GB に達するのを防ぐ。
+        if impact.affected_symbols.is_empty()
+            && impact.impacted_callers.is_empty()
+            && impact.signature_changes.is_empty()
+        {
+            continue;
+        }
+        on_file_impact(impact)?;
+        // caller_map / typed_map は scope 終了で drop、FileImpact は callback に consume される。
     }
     drop(typed_caller_maps);
     drop(string_pool);
 
-    Ok(ContextResult { changes })
+    Ok(())
 }
 
 /// method parent type を持つ sym_ix のビットセット相当の map を返す。
