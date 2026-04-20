@@ -53,13 +53,17 @@ fn ci_key(lang: LangId, name: &str) -> String {
 
 /// unified diff のワークスペースディレクトリ内での影響を解析する。
 ///
-/// 4 パス方式で cross-file 参照を流し込む：
-///   Pass 1:   変更ファイルをパースし affected シンボルを収集
-///   Pass 1.5: 全 symbol の Definition だけを軽量収集（parent_type / competing def 判定用）
-///   Pass 2+3: per-file で `Vec<SymbolReference>` を caller_map に直接集約し即 drop
-///   Pass 4:   caller_maps から FileImpact を組み立てる
+/// 3 パス方式で cross-file 参照を流し込む：
+///   Pass 1:  変更ファイルをパースし affected シンボルを収集
+///   Pass 2:  per-file で tree-sitter parse を 1 回実行し、Definition 集合と References を
+///            同時に集める。References は Stage 1-6 (Stage 4b 除く) を per-file で適用して
+///            その場で `caller_map` に流し、候補 Vec を保持しない
+///   Pass 3:  結合済み caller_maps に Stage 4b (competing definition) を post-filter として
+///            適用し、FileImpact を組み立てる
 ///
-/// batch_refs 全件保持を廃止することで、数万ファイル級リポジトリでも RSS を定数に抑える。
+/// candidate 保持を廃止し per-file で caller_map に即流すことで、worker ローカルの
+/// 中間バッファを `caller_map` のサイズ (数百MB) まで抑え、融合版で発生した
+/// fold 中の 1GB 級バッファ問題を排除する。
 pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
     let diff_files = diff::parse_unified_diff(diff_input);
 
@@ -77,22 +81,23 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
         sym_ix.insert(name.clone(), ix);
     }
 
-    // Pass 1.5: 軽量 Definition path 収集
-    let def_paths_by_ix =
-        refs::collect_definition_paths_indexed(&all_symbol_names, dir, None).unwrap_or_default();
-
-    // Pass 2+3: streaming に caller_maps を構築（`SymbolReference` は per-file スコープで drop）
-    let caller_maps = stream_caller_maps(
+    // Pass 2: per-file で Definition 集合と References を同時収集し、caller_maps に即流す
+    let (typed_caller_maps, def_paths_by_ix) = stream_caller_maps_and_defs(
         &file_contexts,
         &all_symbol_names,
         &sym_ix,
         &method_parent_types,
         &included_symbols,
-        &def_paths_by_ix,
         dir,
     );
 
-    // Pass 4: 最終組み立て
+    // Pass 3: Stage 4b 適用 → sym_ix を剥がした最終 CallerMap に整形
+    let caller_maps = apply_stage4b(
+        typed_caller_maps,
+        &def_paths_by_ix,
+        &sym_ix,
+        &method_parent_types,
+    );
     let changes = assemble_from_caller_maps(file_contexts, caller_maps);
     Ok(ContextResult { changes })
 }
@@ -257,30 +262,46 @@ fn is_same_source_file(ref_path: &str, source_path: &str) -> bool {
 
 type CallerMap = HashMap<(String, usize), (String, Vec<String>)>;
 
-/// Pass 2+3: per-file で ref を caller_map に直接集約する streaming 実装。
+/// Pass 2 内部用。caller_map の値に sym_ix を追加で持たせて Stage 4b を post-filter
+/// で正しく適用できるようにした中間表現。sym_ix は `u32` で軽量。
+type TypedCallerMap = HashMap<(String, usize), (String, Vec<(u32, String)>)>;
+
+/// 1 チャンクの処理単位。大規模リポジトリで worker local state が肥大化するのを防ぐため、
+/// ファイルを `CHUNK_SIZE` 件ずつに区切り、各チャンクの fold/reduce が終わったら
+/// ただちに global accumulator に merge して chunk local state を drop する。
+/// 128 は「chunk 中の一時データ + reduce 2x でも数百 MB 以内」を狙った保守的な値。
+const CHUNK_SIZE: usize = 128;
+
+/// impact streaming Pass の並列度。デフォルトは 1 (= fold/reduce のピーク 2x を避けて
+/// RSS を最小化)。CI 等で速度優先にしたい場合は `ASTRO_SIGHT_IMPACT_WORKERS` で上書きする。
+fn impact_worker_count() -> usize {
+    std::env::var("ASTRO_SIGHT_IMPACT_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1)
+}
+
+/// Pass 2: per-file で tree-sitter parse を 1 回実行し、Definition 集合と References を
+/// 同時に集める。References は Stage 1-6 のうち Stage 4b を除くフィルタを per-file で
+/// 適用し、その場で per-worker local の `TypedCallerMap` に流す。候補 Vec は保持しない。
 ///
-/// 各 rayon worker はローカルな `Vec<CallerMap>` (file_contexts 数分) と `LruCache` を持ち、
-/// ファイル毎に `find_refs_batch_in_file_indexed` で得た `Vec<Vec<SymbolReference>>` を
-/// その場でフィルタして対応する `CallerMap` に格納する。`SymbolReference` Vec は worker 内で
-/// 即 drop されるため、従来の `HashMap<sym, Vec<SymbolReference>>` の全件保持が不要になる。
-///
-/// Stage 4 (method parent type scoping) は「同じファイルに親型 ref があるか」を per-file の
-/// `Vec<Vec<SymbolReference>>` 内で判定し、Stage 4b (competing definition) は事前に収集した
-/// `def_paths_by_ix` を参照する。
+/// worker local state の肥大化を抑えるため、ファイル群を `CHUNK_SIZE` 件ずつに区切って
+/// rayon fold/reduce を動かし、chunk 終了時に global accumulator へ merge → chunk state を
+/// drop する。これにより次の chunk 開始時には前回の chunk local は解放済みとなる。
 #[allow(clippy::too_many_arguments)]
-fn stream_caller_maps(
+fn stream_caller_maps_and_defs(
     file_contexts: &[FileContext],
     all_symbol_names: &[String],
     sym_ix: &HashMap<String, usize>,
     method_parent_types: &HashMap<String, String>,
     included_symbols: &HashSet<String>,
-    def_paths_by_ix: &[Vec<String>],
     dir: &Path,
-) -> Vec<CallerMap> {
+) -> (Vec<TypedCallerMap>, Vec<Vec<String>>) {
+    let n_sym = all_symbol_names.len();
     let n_fc = file_contexts.len();
 
-    // sym_ix -> Vec<fc_ix>（included_symbols を満たすもののみ）
-    let mut sym_to_fc: Vec<Vec<usize>> = vec![Vec::new(); all_symbol_names.len()];
+    let mut sym_to_fc: Vec<Vec<u32>> = vec![Vec::new(); n_sym];
     for (fc_ix, ctx) in file_contexts.iter().enumerate() {
         for sym in &ctx.affected {
             let sym_key = ci_key(ctx.lang_id, &sym.name);
@@ -288,165 +309,185 @@ fn stream_caller_maps(
                 continue;
             }
             if let Some(&ix) = sym_ix.get(&sym_key) {
-                sym_to_fc[ix].push(fc_ix);
+                sym_to_fc[ix].push(fc_ix as u32);
             }
+        }
+    }
+
+    let mut parent_ix_by_sym: Vec<Option<usize>> = vec![None; n_sym];
+    for (sym_key, parent_key) in method_parent_types {
+        if let (Some(&ix), Some(&pix)) = (sym_ix.get(sym_key), sym_ix.get(parent_key)) {
+            parent_ix_by_sym[ix] = Some(pix);
         }
     }
 
     let ac = match refs::build_ac_case_insensitive(all_symbol_names) {
         Ok(a) => a,
-        Err(_) => return vec![CallerMap::new(); n_fc],
+        Err(_) => return (vec![TypedCallerMap::new(); n_fc], vec![Vec::new(); n_sym]),
     };
     let files = match refs::collect_files(dir, None) {
         Ok(f) => f,
-        Err(_) => return vec![CallerMap::new(); n_fc],
+        Err(_) => return (vec![TypedCallerMap::new(); n_fc], vec![Vec::new(); n_sym]),
     };
 
-    let worker_limit = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(4);
+    // rayon fold/reduce は worker local 集約 + reduce acc 併存でピーク RSS が 2x まで
+    // 膨らむため、デフォルトは 1 worker (= fold バケット 1 個、ピーク 2x も小さい) とする。
+    // 並列性を使いたい CI 環境などでは `ASTRO_SIGHT_IMPACT_WORKERS` で上書きできる。
+    let worker_limit = impact_worker_count();
     let pool = match rayon::ThreadPoolBuilder::new()
         .num_threads(worker_limit)
         .build()
     {
         Ok(p) => p,
-        Err(_) => return vec![CallerMap::new(); n_fc],
+        Err(_) => return (vec![TypedCallerMap::new(); n_fc], vec![Vec::new(); n_sym]),
     };
 
-    type WorkerState = (Vec<CallerMap>, LruCache<String, Option<ParsedFile>>);
+    type WorkerState = (
+        Vec<TypedCallerMap>,
+        Vec<Vec<String>>,
+        LruCache<String, Option<ParsedFile>>,
+    );
     let init_state = || -> WorkerState {
         (
-            vec![CallerMap::new(); n_fc],
+            vec![TypedCallerMap::new(); n_fc],
+            vec![Vec::new(); n_sym],
             LruCache::new(
                 NonZeroUsize::new(TARGET_FILE_CACHE_SIZE).expect("cache size is non-zero"),
             ),
         )
     };
 
-    let (maps, _cache) = pool.install(|| {
-        use rayon::prelude::*;
-        files
-            .into_par_iter()
-            .fold(init_state, |(mut local_maps, mut target_cache), path| {
-                let Some(path_str) = path.to_str() else {
-                    return (local_maps, target_cache);
-                };
-                let utf8_path = camino::Utf8Path::new(path_str);
-                if let Ok(per_file) =
-                    refs::find_refs_batch_in_file_indexed(all_symbol_names, &ac, utf8_path)
-                {
-                    accumulate_per_file(
-                        &per_file,
-                        &sym_to_fc,
-                        file_contexts,
-                        all_symbol_names,
-                        sym_ix,
-                        method_parent_types,
-                        def_paths_by_ix,
-                        &mut local_maps,
-                        &mut target_cache,
-                    );
-                }
-                (local_maps, target_cache)
-            })
-            .reduce(init_state, |(mut acc_maps, acc_cache), (local_maps, _)| {
-                for (acc_m, local_m) in acc_maps.iter_mut().zip(local_maps) {
-                    for (key, (name, syms)) in local_m {
-                        let entry = acc_m.entry(key).or_insert_with(|| (name, Vec::new()));
-                        for s in syms {
-                            if !entry.1.contains(&s) {
-                                entry.1.push(s);
-                            }
-                        }
-                    }
-                }
-                (acc_maps, acc_cache)
-            })
-    });
+    let mut global_maps: Vec<TypedCallerMap> = vec![TypedCallerMap::new(); n_fc];
+    let mut global_defs: Vec<Vec<String>> = vec![Vec::new(); n_sym];
 
-    maps
+    for chunk in files.chunks(CHUNK_SIZE) {
+        let (chunk_maps, chunk_defs, _cache) = pool.install(|| {
+            use rayon::prelude::*;
+            chunk
+                .par_iter()
+                .fold(
+                    init_state,
+                    |(mut local_maps, mut def_paths, mut target_cache), path| {
+                        let Some(path_str) = path.to_str() else {
+                            return (local_maps, def_paths, target_cache);
+                        };
+                        let utf8_path = camino::Utf8Path::new(path_str);
+                        if let Ok(visit) =
+                            refs::visit_refs_and_defs_in_file(all_symbol_names, &ac, utf8_path)
+                        {
+                            for ix in &visit.def_sym_indices {
+                                def_paths[*ix].push(path_str.to_string());
+                            }
+                            accumulate_caller_maps_per_file(
+                                &visit.refs_by_ix,
+                                &sym_to_fc,
+                                file_contexts,
+                                all_symbol_names,
+                                &parent_ix_by_sym,
+                                &mut local_maps,
+                                &mut target_cache,
+                            );
+                        }
+                        (local_maps, def_paths, target_cache)
+                    },
+                )
+                .reduce(
+                    init_state,
+                    |(mut acc_maps, mut acc_defs, acc_cache), (local_maps, local_defs, _)| {
+                        merge_typed_maps(&mut acc_maps, local_maps);
+                        for (acc_v, local_v) in acc_defs.iter_mut().zip(local_defs) {
+                            acc_v.extend(local_v);
+                        }
+                        (acc_maps, acc_defs, acc_cache)
+                    },
+                )
+        });
+
+        // chunk 結果を global にマージし、chunk state をスコープ終了で drop させる。
+        merge_typed_maps(&mut global_maps, chunk_maps);
+        for (g, c) in global_defs.iter_mut().zip(chunk_defs) {
+            g.extend(c);
+        }
+    }
+
+    (global_maps, global_defs)
 }
 
-/// per-file の `Vec<Vec<SymbolReference>>` を受け取り、filter 後に `CallerMap` へ流し込む。
-/// `SymbolReference` Vec は本関数が終わると worker 側で drop される。
+/// 2 つの `Vec<TypedCallerMap>` をエントリ単位で重複排除しつつ merge する。
+fn merge_typed_maps(dst: &mut [TypedCallerMap], src: Vec<TypedCallerMap>) {
+    for (acc_m, local_m) in dst.iter_mut().zip(src) {
+        for (key, (name, entries)) in local_m {
+            let entry = acc_m.entry(key).or_insert_with(|| (name, Vec::new()));
+            for (sym_ix_val, sym_name) in entries {
+                if !entry.1.iter().any(|(existing_ix, existing_name)| {
+                    *existing_ix == sym_ix_val && *existing_name == sym_name
+                }) {
+                    entry.1.push((sym_ix_val, sym_name));
+                }
+            }
+        }
+    }
+}
+
+/// 1 ファイル分の `refs_by_ix` を走査し、Stage 1-6（Stage 4b を除く）を適用して
+/// `local_maps` に直接流す。SymbolReference Vec は呼び出し側で即 drop されるため、
+/// fold 中に保持される中間データは `TypedCallerMap` の成長分のみ。
 #[allow(clippy::too_many_arguments)]
-fn accumulate_per_file(
-    per_file: &[Vec<SymbolReference>],
-    sym_to_fc: &[Vec<usize>],
+fn accumulate_caller_maps_per_file(
+    refs_by_ix: &[Vec<SymbolReference>],
+    sym_to_fc: &[Vec<u32>],
     file_contexts: &[FileContext],
     all_symbol_names: &[String],
-    sym_ix: &HashMap<String, usize>,
-    method_parent_types: &HashMap<String, String>,
-    def_paths_by_ix: &[Vec<String>],
-    local_maps: &mut [CallerMap],
+    parent_ix_by_sym: &[Option<usize>],
+    local_maps: &mut [TypedCallerMap],
     target_cache: &mut LruCache<String, Option<ParsedFile>>,
 ) {
-    for (ix, refs) in per_file.iter().enumerate() {
+    for (ix, refs) in refs_by_ix.iter().enumerate() {
         let fc_ixs = &sym_to_fc[ix];
         if fc_ixs.is_empty() || refs.is_empty() {
             continue;
         }
-        let sym_key = &all_symbol_names[ix];
-        // 親型 ix を取得し、本ファイル内に親型 ref があるかを先に評価
-        let parent_type_in_this_file = method_parent_types
-            .get(sym_key)
-            .and_then(|pt| sym_ix.get(pt))
-            .and_then(|&pix| per_file.get(pix))
-            .is_some_and(|pt_refs| !pt_refs.is_empty());
-        let has_parent_type = method_parent_types.contains_key(sym_key);
+        let parent_in_this_file = parent_ix_by_sym[ix]
+            .and_then(|pix| refs_by_ix.get(pix))
+            .is_some_and(|pt| !pt.is_empty());
+        let has_parent_type = parent_ix_by_sym[ix].is_some();
+
+        let sym_key_canonical = &all_symbol_names[ix];
 
         for r in refs {
-            // Stage1: 定義は skip
             if r.kind == Some(RefKind::Definition) {
                 continue;
             }
-            for &fc_ix in fc_ixs {
+            for &fc_ix_raw in fc_ixs {
+                let fc_ix = fc_ix_raw as usize;
                 let ctx = &file_contexts[fc_ix];
                 let source_path = &ctx.new_path;
                 let source_lang_group = lang_compat_group(ctx.lang_id);
 
-                // Stage2: 同一ファイル skip
                 if is_same_source_file(&r.path, source_path) {
                     continue;
                 }
-                // Stage3: 言語互換性
                 if let Ok(ref_lang) = LangId::from_path(Utf8Path::new(&r.path))
                     && lang_compat_group(ref_lang) != source_lang_group
                 {
                     continue;
                 }
-                // Stage4: method parent type scoping
-                if has_parent_type {
-                    if !parent_type_in_this_file {
-                        continue;
-                    }
-                    // Stage4b: source_path 以外に competing definition があるか
-                    if let Some(paths) = def_paths_by_ix.get(ix) {
-                        let has_competing_def =
-                            paths.iter().any(|p| !is_same_source_file(p, source_path));
-                        if has_competing_def {
-                            continue;
-                        }
-                    }
+                if has_parent_type && !parent_in_this_file {
+                    continue;
                 }
-                // Stage5: target file test context
                 if is_ref_in_target_test_context(&r.path, r.line, r.column, target_cache) {
                     continue;
                 }
-                // Stage6: import/re-export 行
                 if is_import_context(r.context.as_deref()) {
                     continue;
                 }
 
-                // 採用: CallerMap に push（SymbolReference 自体は per-file Vec に残っているが
-                // 抽出した文字列のみ保持し、関数終了時に参照元 Vec は drop される）
                 let affected_sym_name = ctx
                     .affected
                     .iter()
-                    .find(|a| ci_key(ctx.lang_id, &a.name) == *sym_key)
+                    .find(|a| ci_key(ctx.lang_id, &a.name) == *sym_key_canonical)
                     .map(|a| a.name.clone())
-                    .unwrap_or_else(|| sym_key.clone());
+                    .unwrap_or_else(|| sym_key_canonical.clone());
                 let caller_name = r
                     .context
                     .as_deref()
@@ -457,12 +498,62 @@ fn accumulate_per_file(
                 let entry = local_maps[fc_ix]
                     .entry(key)
                     .or_insert_with(|| (caller_name, Vec::new()));
-                if !entry.1.contains(&affected_sym_name) {
-                    entry.1.push(affected_sym_name);
+                let ix_u32 = ix as u32;
+                if !entry.1.iter().any(|(existing_ix, existing_name)| {
+                    *existing_ix == ix_u32 && *existing_name == affected_sym_name
+                }) {
+                    entry.1.push((ix_u32, affected_sym_name));
                 }
             }
         }
     }
+}
+
+/// Pass 3: `TypedCallerMap` 集合に対して Stage 4b (competing definition) を post-filter
+/// として適用し、sym_ix を剥がした最終 `CallerMap` を返す。caller entry の sym_names が
+/// 空になった場合はその caller 自体を削除する。
+fn apply_stage4b(
+    typed_caller_maps: Vec<TypedCallerMap>,
+    def_paths_by_ix: &[Vec<String>],
+    sym_ix_by_name: &HashMap<String, usize>,
+    method_parent_types: &HashMap<String, String>,
+) -> Vec<CallerMap> {
+    // sym_ix -> has_parent フラグ（Stage 4b はメソッド型スコーピングが有効なシンボルだけに適用）
+    let mut has_parent_by_ix: HashMap<u32, bool> = HashMap::new();
+    for parent_child in method_parent_types.keys() {
+        if let Some(&ix) = sym_ix_by_name.get(parent_child) {
+            has_parent_by_ix.insert(ix as u32, true);
+        }
+    }
+
+    typed_caller_maps
+        .into_iter()
+        .map(|typed_map| {
+            let mut out: CallerMap = HashMap::with_capacity(typed_map.len());
+            for (key, (caller_name, sym_entries)) in typed_map {
+                let source_path = &key.0;
+                let mut kept: Vec<String> = Vec::with_capacity(sym_entries.len());
+                for (sym_ix_val, sym_name) in sym_entries {
+                    if *has_parent_by_ix.get(&sym_ix_val).unwrap_or(&false)
+                        && let Some(paths) = def_paths_by_ix.get(sym_ix_val as usize)
+                    {
+                        let has_competing_def =
+                            paths.iter().any(|p| !is_same_source_file(p, source_path));
+                        if has_competing_def {
+                            continue;
+                        }
+                    }
+                    if !kept.contains(&sym_name) {
+                        kept.push(sym_name);
+                    }
+                }
+                if !kept.is_empty() {
+                    out.insert(key, (caller_name, kept));
+                }
+            }
+            out
+        })
+        .collect()
 }
 
 /// Pass 4: caller_maps + file_contexts から最終 FileImpact を組み立てる。

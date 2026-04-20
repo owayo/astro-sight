@@ -599,68 +599,6 @@ pub(crate) fn build_ac_case_insensitive(
         .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))
 }
 
-/// impact analyze 用: `symbol_names` の Definition だけを集めて `sym_index -> Vec<path>` を返す。
-///
-/// `SymbolReference` より軽量（path 文字列のみ、context や行情報なし）で、streaming Pass の中で
-/// competing definition / method parent type の判定にだけ使う。
-pub(crate) fn collect_definition_paths_indexed(
-    symbol_names: &[String],
-    dir: &Path,
-    glob_pattern: Option<&str>,
-) -> Result<Vec<Vec<String>>> {
-    if symbol_names.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let ac = build_ac_case_insensitive(symbol_names)?;
-    let files = collect_files(dir, glob_pattern)?;
-    let num = symbol_names.len();
-
-    let worker_limit = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(bounded_worker_count());
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(worker_limit)
-        .build()
-        .map_err(|e| anyhow::anyhow!("Failed to build rayon pool: {e}"))?;
-
-    let buckets: Vec<Vec<String>> = pool.install(|| {
-        files
-            .into_par_iter()
-            .fold(
-                || vec![Vec::new(); num],
-                |mut local, path| {
-                    let Some(path_str) = path.to_str() else {
-                        return local;
-                    };
-                    let utf8_path = camino::Utf8Path::new(path_str);
-                    // 軽量経路: `SymbolReference` を生成せず、Definition が存在する sym_ix だけ
-                    // `HashSet<usize>` に集める。per-file の一時メモリが大幅に減る。
-                    if let Ok(def_ixs) =
-                        find_definition_sym_indices_in_file(symbol_names, &ac, utf8_path)
-                    {
-                        for ix in def_ixs {
-                            local[ix].push(path_str.to_string());
-                        }
-                    }
-                    local
-                },
-            )
-            .reduce(
-                || vec![Vec::new(); num],
-                |mut acc, mut local| {
-                    for (acc_v, local_v) in acc.iter_mut().zip(local.iter_mut()) {
-                        acc_v.append(local_v);
-                    }
-                    acc
-                },
-            )
-    });
-
-    Ok(buckets)
-}
-
 /// dead-code 判定用: フル SymbolReference を作らず非 Definition 参照の件数のみ返す。
 /// SymbolReference のヒープ確保を全排除し、メモリ消費を大幅に削減する。
 pub fn count_non_definition_refs_batch(
@@ -711,15 +649,27 @@ pub fn count_non_definition_refs_batch(
     Ok(symbol_names.iter().cloned().zip(counts).collect())
 }
 
-/// impact Pass1.5 専用の軽量版: Definition として出現した sym_index の集合だけ返す。
+/// impact streaming Pass が 1 ファイルから得たい情報の一式。
+/// parse 結果を使い回して Definition 集合と全 References を同時に取得する。
+pub(crate) struct FileVisitResult {
+    /// 当該ファイルに Definition として出現した sym_ix の集合
+    pub def_sym_indices: std::collections::HashSet<usize>,
+    /// sym_ix -> refs の Vec。index は `symbol_names` と対応。
+    pub refs_by_ix: Vec<Vec<SymbolReference>>,
+}
+
+/// impact streaming Pass 用: per-file で tree-sitter parse を 1 度だけ実行し、
+/// Definition 集合と References を同時に集める。
 ///
-/// `SymbolReference` を生成せず `HashSet<usize>` のみを保持するため、
-/// 同一ファイルに同名 Definition が大量に並ぶケースでも一時メモリが constant に収まる。
-fn find_definition_sym_indices_in_file(
+/// 従来は Pass1.5（Definition 軽量収集）と Pass2（References 収集）で同一ファイルを
+/// 2 度 parse していたため、大規模リポジトリで tree-sitter Tree のピーク RSS が
+/// 二重コストになっていた。本関数で 1 パスに統合することで per-file のメモリと
+/// 実行時間の両方を半分にする。
+pub(crate) fn visit_refs_and_defs_in_file(
     symbol_names: &[String],
     ac: &aho_corasick::AhoCorasick,
     path: &camino::Utf8Path,
-) -> Result<std::collections::HashSet<usize>> {
+) -> Result<FileVisitResult> {
     use std::collections::HashSet;
 
     let num = symbol_names.len();
@@ -733,7 +683,10 @@ fn find_definition_sym_indices_in_file(
         }
     }
     if present_indices.is_empty() {
-        return Ok(HashSet::new());
+        return Ok(FileVisitResult {
+            def_sym_indices: HashSet::new(),
+            refs_by_ix: vec![Vec::new(); num],
+        });
     }
 
     let (tree, lang_id) = parser::parse_file(path, &source)?;
@@ -747,45 +700,92 @@ fn find_definition_sym_indices_in_file(
         name_to_ix.entry(key).or_default().push(i);
     }
 
-    let mut result: HashSet<usize> = HashSet::new();
-    collect_definition_sym_indices(
+    let mut refs_by_ix = vec![Vec::new(); num];
+    let mut def_sym_indices: HashSet<usize> = HashSet::new();
+    collect_refs_and_defs_indexed(
         root,
         &source,
         &name_to_ix,
+        path.as_str(),
         definition_kinds,
         lang_id,
-        &mut result,
+        &mut refs_by_ix,
+        &mut def_sym_indices,
     );
-    Ok(result)
+    Ok(FileVisitResult {
+        def_sym_indices,
+        refs_by_ix,
+    })
 }
 
-/// AST を再帰走査し、Definition context に該当する identifier の sym_ix を `result` に集める。
-fn collect_definition_sym_indices(
+/// AST を再帰走査し、各 identifier ノードについて `refs_by_ix` へ参照を push しつつ、
+/// Definition 判定が真のものは `def_sym_indices` にも記録する。
+#[allow(clippy::too_many_arguments)]
+fn collect_refs_and_defs_indexed(
     node: Node<'_>,
     source: &[u8],
     name_to_ix: &std::collections::HashMap<std::borrow::Cow<'_, str>, Vec<usize>>,
+    path: &str,
     definition_kinds: &[&str],
     lang_id: LangId,
-    result: &mut std::collections::HashSet<usize>,
+    refs_by_ix: &mut [Vec<SymbolReference>],
+    def_sym_indices: &mut std::collections::HashSet<usize>,
 ) {
     if is_identifier_kind(node.kind())
         && let Ok(text) = node.utf8_text(source)
         && let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, text))
-        && is_definition_context(node, definition_kinds, lang_id)
     {
+        let is_def = is_definition_context(node, definition_kinds, lang_id);
+        let context = extract_line_context(source, node.start_position().row);
+        let line = node.start_position().row;
+        let column = node.start_position().column;
+        let kind = if is_def {
+            RefKind::Definition
+        } else {
+            RefKind::Reference
+        };
+
         for &ix in indices {
-            result.insert(ix);
+            refs_by_ix[ix].push(SymbolReference {
+                path: path.to_string(),
+                line,
+                column,
+                context: Some(context.clone()),
+                kind: Some(kind),
+            });
+            if is_def {
+                def_sym_indices.insert(ix);
+            }
         }
     }
+
+    // Rust の serde 属性文字列値を identifier 参照として扱う（非定義）。
+    for (seg, row, col) in rust_attr_string_ref_segments(node, source, lang_id) {
+        if let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, seg)) {
+            let context = extract_line_context(source, row);
+            for &ix in indices {
+                refs_by_ix[ix].push(SymbolReference {
+                    path: path.to_string(),
+                    line: row,
+                    column: col,
+                    context: Some(context.clone()),
+                    kind: Some(RefKind::Reference),
+                });
+            }
+        }
+    }
+
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_definition_sym_indices(
+        collect_refs_and_defs_indexed(
             child,
             source,
             name_to_ix,
+            path,
             definition_kinds,
             lang_id,
-            result,
+            refs_by_ix,
+            def_sym_indices,
         );
     }
 }
