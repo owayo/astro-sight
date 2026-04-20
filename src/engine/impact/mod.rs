@@ -299,10 +299,14 @@ impl StringPool {
     }
 }
 
+/// 1 caller における (sym_ix, sym_name_id) のリスト。実測的に 1-2 件が大半のため
+/// `SmallVec` で inline 保持して `Vec` の heap allocation を回避する。
+type SymEntries = smallvec::SmallVec<[(u32, u32); 2]>;
+
 /// Pass 2 内部用。caller_map の key と value を interned ID で保持する中間表現。
 ///   key:   (path_id, line)
-///   value: (caller_name_id, Vec<(sym_ix, sym_name_id)>)
-type TypedCallerMap = HashMap<(u32, usize), (u32, Vec<(u32, u32)>)>;
+///   value: (caller_name_id, SymEntries)
+type TypedCallerMap = HashMap<(u32, usize), (u32, SymEntries)>;
 
 /// 1 チャンクの処理単位。大規模リポジトリで worker local state が肥大化するのを防ぐため、
 /// ファイルを `CHUNK_SIZE` 件ずつに区切り、各チャンクの fold/reduce が終わったら
@@ -477,7 +481,9 @@ fn stream_caller_maps_and_defs(
 fn merge_typed_maps(dst: &mut [TypedCallerMap], src: Vec<TypedCallerMap>) {
     for (acc_m, local_m) in dst.iter_mut().zip(src) {
         for (key, (name, entries)) in local_m {
-            let entry = acc_m.entry(key).or_insert_with(|| (name, Vec::new()));
+            let entry = acc_m
+                .entry(key)
+                .or_insert_with(|| (name, SymEntries::new()));
             for (sym_ix_val, sym_name) in entries {
                 if !entry.1.iter().any(|(existing_ix, existing_name)| {
                     *existing_ix == sym_ix_val && *existing_name == sym_name
@@ -570,7 +576,7 @@ fn accumulate_caller_maps_per_file(
                 let key = (path_id, r.line);
                 let entry = local_maps[fc_ix]
                     .entry(key)
-                    .or_insert_with(|| (caller_name_id, Vec::new()));
+                    .or_insert_with(|| (caller_name_id, SymEntries::new()));
                 if !entry.1.iter().any(|(existing_ix, existing_name_id)| {
                     *existing_ix == ix_u32 && *existing_name_id == sym_name_id
                 }) {
