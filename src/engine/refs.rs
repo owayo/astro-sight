@@ -1,7 +1,6 @@
 use anyhow::Result;
 use rayon::prelude::*;
 use std::path::Path;
-use std::sync::Arc;
 use tree_sitter::Node;
 
 use crate::engine::parser;
@@ -101,13 +100,11 @@ fn find_refs_in_file(symbol_name: &str, path: &camino::Utf8Path) -> Result<Vec<S
     let mut refs = Vec::new();
     let definition_kinds = definition_node_kinds(lang_id);
     let target = normalize_identifier(lang_id, symbol_name);
-    // ファイル 1 回分のパス Arc を作り、各参照は Arc::clone で共有する。
-    let path_arc: Arc<str> = Arc::from(path.as_str());
     collect_identifier_refs(
         root,
         &source,
         target.as_ref(),
-        &path_arc,
+        path.as_str(),
         definition_kinds,
         lang_id,
         &mut refs,
@@ -122,7 +119,7 @@ fn collect_identifier_refs(
     node: Node<'_>,
     source: &[u8],
     symbol_name: &str,
-    path: &Arc<str>,
+    path: &str,
     definition_kinds: &[&str],
     lang_id: LangId,
     refs: &mut Vec<SymbolReference>,
@@ -135,7 +132,7 @@ fn collect_identifier_refs(
         let context = extract_line_context(source, node.start_position().row);
 
         refs.push(SymbolReference {
-            path: Arc::clone(path),
+            path: path.to_string(),
             line: node.start_position().row,
             column: node.start_position().column,
             context: Some(context),
@@ -151,7 +148,7 @@ fn collect_identifier_refs(
     for (seg, row, col) in rust_attr_string_ref_segments(node, source, lang_id) {
         if normalize_identifier(lang_id, seg).as_ref() == symbol_name {
             refs.push(SymbolReference {
-                path: Arc::clone(path),
+                path: path.to_string(),
                 line: row,
                 column: col,
                 context: Some(extract_line_context(source, row)),
@@ -681,13 +678,11 @@ fn find_refs_batch_in_file_indexed(
     }
 
     let mut result = vec![Vec::new(); num];
-    // ファイル 1 回分のパス Arc を作り、全参照で共有する。
-    let path_arc: Arc<str> = Arc::from(path.as_str());
     collect_identifier_refs_indexed(
         root,
         &source,
         &name_to_ix,
-        &path_arc,
+        path.as_str(),
         definition_kinds,
         lang_id,
         &mut result,
@@ -703,7 +698,7 @@ fn collect_identifier_refs_indexed(
     node: Node<'_>,
     source: &[u8],
     name_to_ix: &std::collections::HashMap<std::borrow::Cow<'_, str>, Vec<usize>>,
-    path: &Arc<str>,
+    path: &str,
     definition_kinds: &[&str],
     lang_id: LangId,
     refs: &mut [Vec<SymbolReference>],
@@ -724,7 +719,7 @@ fn collect_identifier_refs_indexed(
 
         for &ix in indices {
             refs[ix].push(SymbolReference {
-                path: Arc::clone(path),
+                path: path.to_string(),
                 line,
                 column,
                 context: Some(context.clone()),
@@ -739,7 +734,7 @@ fn collect_identifier_refs_indexed(
             let context = extract_line_context(source, row);
             for &ix in indices {
                 refs[ix].push(SymbolReference {
-                    path: Arc::clone(path),
+                    path: path.to_string(),
                     line: row,
                     column: col,
                     context: Some(context.clone()),
@@ -975,7 +970,7 @@ struct Bar {
             tree.root_node(),
             source.as_bytes(),
             "serialize_jst",
-            &Arc::<str>::from("test.rs"),
+            "test.rs",
             defs,
             LangId::Rust,
             &mut refs,
@@ -1041,7 +1036,7 @@ struct Bar {
             tree.root_node(),
             source.as_bytes(),
             "is_none",
-            &Arc::<str>::from("test.rs"),
+            "test.rs",
             defs,
             LangId::Rust,
             &mut refs,
@@ -1070,7 +1065,7 @@ struct Bar {
             tree.root_node(),
             source.as_bytes(),
             "created_at",
-            &Arc::<str>::from("test.rs"),
+            "test.rs",
             defs,
             LangId::Rust,
             &mut refs,

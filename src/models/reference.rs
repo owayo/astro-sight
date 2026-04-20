@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 
 /// The kind of a reference (definition or usage).
@@ -12,13 +10,9 @@ pub enum RefKind {
 }
 
 /// A single reference to a symbol in a file.
-///
-/// `path` は `Arc<str>` で、同一ファイル内の大量参照でパス文字列を共有する。
-/// これによりヒープ割当数が 1 ファイルあたり 1 回に収まり、数万参照の
-/// ピーク RSS を大幅に削減する。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolReference {
-    pub path: Arc<str>,
+    pub path: String,
     #[serde(rename = "ln")]
     pub line: usize,
     #[serde(rename = "col")]
