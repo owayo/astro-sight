@@ -254,7 +254,10 @@ fn assemble_impacts(
                     ) {
                         continue;
                     }
-                    let key = (r.path.clone(), r.line);
+                    // caller_map のキーは cross-file フィルタ通過後の参照のみに対して
+                    // 1 度だけ作られるため、ここで Arc<str> → String 変換しても hot path の
+                    // コピーにはならない。hot loop の Arc<str> 共有はそのまま有効。
+                    let key = (r.path.to_string(), r.line);
                     let entry = caller_map.entry(key).or_insert_with(|| {
                         let name = r
                             .context
@@ -402,11 +405,11 @@ fn is_relevant_cross_file_ref(
     // 2. 同一ファイルの参照をスキップ
     // ends_with だけではサフィックスマッチで偽陽性が出る
     // （例: source_path="main.rs" が "test_main.rs" にマッチ）
-    if r.path == source_path || r.path.ends_with(&format!("/{source_path}")) {
+    if &*r.path == source_path || r.path.ends_with(&format!("/{source_path}")) {
         return false;
     }
     // 3. 言語間の偽陽性をスキップ
-    if let Ok(ref_lang) = LangId::from_path(Utf8Path::new(&r.path))
+    if let Ok(ref_lang) = LangId::from_path(Utf8Path::new(&*r.path))
         && lang_compat_group(ref_lang) != source_lang_group
     {
         return false;
@@ -766,7 +769,7 @@ mod tests {
     #[test]
     fn cross_file_ref_same_file_exact_match() {
         let r = SymbolReference {
-            path: "src/main.rs".to_string(),
+            path: std::sync::Arc::<str>::from("src/main.rs"),
             line: 10,
             column: 0,
             context: None,
@@ -790,7 +793,7 @@ mod tests {
     #[test]
     fn cross_file_ref_same_file_with_prefix() {
         let r = SymbolReference {
-            path: "other/src/main.rs".to_string(),
+            path: std::sync::Arc::<str>::from("other/src/main.rs"),
             line: 10,
             column: 0,
             context: None,
@@ -814,7 +817,7 @@ mod tests {
     #[test]
     fn cross_file_ref_different_file_similar_suffix() {
         let r = SymbolReference {
-            path: "test_main.rs".to_string(),
+            path: std::sync::Arc::<str>::from("test_main.rs"),
             line: 10,
             column: 0,
             context: None,

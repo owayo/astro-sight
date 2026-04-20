@@ -534,8 +534,8 @@ fn relativize_paths(
     dir: &std::path::Path,
 ) -> Vec<crate::models::reference::SymbolReference> {
     for r in &mut refs {
-        if let Ok(rel) = std::path::Path::new(&r.path).strip_prefix(dir) {
-            r.path = rel.to_string_lossy().to_string();
+        if let Ok(rel) = std::path::Path::new(&*r.path).strip_prefix(dir) {
+            r.path = std::sync::Arc::<str>::from(rel.to_string_lossy().as_ref());
         }
     }
     refs
@@ -676,14 +676,14 @@ mod tests {
         use crate::models::reference::SymbolReference;
         let dir = std::path::Path::new("/home/user/project");
         let refs = vec![SymbolReference {
-            path: "/home/user/project/src/main.rs".to_string(),
+            path: std::sync::Arc::<str>::from("/home/user/project/src/main.rs"),
             line: 10,
             column: 5,
             context: None,
             kind: None,
         }];
         let result = relativize_paths(refs, dir);
-        assert_eq!(result[0].path, "src/main.rs");
+        assert_eq!(&*result[0].path, "src/main.rs");
     }
 
     /// relativize_paths でディレクトリ外のパスはそのまま
@@ -692,14 +692,14 @@ mod tests {
         use crate::models::reference::SymbolReference;
         let dir = std::path::Path::new("/home/user/project");
         let refs = vec![SymbolReference {
-            path: "/other/path/file.rs".to_string(),
+            path: std::sync::Arc::<str>::from("/other/path/file.rs"),
             line: 1,
             column: 0,
             context: None,
             kind: None,
         }];
         let result = relativize_paths(refs, dir);
-        assert_eq!(result[0].path, "/other/path/file.rs");
+        assert_eq!(&*result[0].path, "/other/path/file.rs");
     }
 
     /// extract_symbols で有効な Rust ファイルからシンボルを抽出する
