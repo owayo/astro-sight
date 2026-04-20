@@ -82,7 +82,7 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
     }
 
     // Pass 2: per-file で Definition 集合と References を同時収集し、caller_maps に即流す
-    let (typed_caller_maps, def_paths_by_ix, string_pool) = stream_caller_maps_and_defs(
+    let (mut typed_caller_maps, def_paths_by_ix, string_pool) = stream_caller_maps_and_defs(
         &file_contexts,
         &all_symbol_names,
         &sym_ix,
@@ -91,18 +91,45 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
         dir,
     );
 
-    // Pass 3: Stage 4b 適用 → interning ID を剥がした最終 CallerMap に整形
-    let caller_maps = apply_stage4b(
-        typed_caller_maps,
-        &def_paths_by_ix,
-        &string_pool,
-        &sym_ix,
-        &method_parent_types,
-        &file_contexts,
-    );
+    // Stage 4b 判定用: method parent を持つ sym_ix のビットセット
+    let has_parent_by_ix = compute_has_parent_by_ix(&sym_ix, &method_parent_types);
+
+    // Pass 3/4 融合: 各 FileContext を 1 件ずつ取り出し、de-intern → FileImpact → drop。
+    // 旧実装は `Vec<CallerMap>` 全件を String 化してから `FileImpact` を作っていたため、
+    // 中間表現が 2 重に materialize されて RSS の 0.7-1.2 GB を食っていた（codex 分析）。
+    let mut changes = Vec::with_capacity(file_contexts.len());
+    for (fc_ix, ctx) in file_contexts.into_iter().enumerate() {
+        let typed_map = std::mem::take(&mut typed_caller_maps[fc_ix]);
+        let caller_map = apply_stage4b_single(
+            typed_map,
+            &def_paths_by_ix,
+            &string_pool,
+            &has_parent_by_ix,
+            &ctx.new_path,
+        );
+        changes.push(build_file_impact(ctx, caller_map));
+        // caller_map / typed_map はスコープ終了で drop され、
+        // 次の fc へ進む前に interned 以外のヒープを解放する。
+    }
+    drop(typed_caller_maps);
     drop(string_pool);
-    let changes = assemble_from_caller_maps(file_contexts, caller_maps);
+
     Ok(ContextResult { changes })
+}
+
+/// method parent type を持つ sym_ix のビットセット相当の map を返す。
+/// Stage 4b は method scope のシンボルだけに適用する。
+fn compute_has_parent_by_ix(
+    sym_ix: &HashMap<String, usize>,
+    method_parent_types: &HashMap<String, String>,
+) -> HashMap<u32, bool> {
+    let mut has_parent: HashMap<u32, bool> = HashMap::new();
+    for parent_child in method_parent_types.keys() {
+        if let Some(&ix) = sym_ix.get(parent_child) {
+            has_parent.insert(ix as u32, true);
+        }
+    }
+    has_parent
 }
 
 /// cross-file 参照が不要なケース（affected 無しなど）の軽量組み立て。
@@ -270,10 +297,20 @@ type CallerMap = HashMap<(String, usize), (String, Vec<String>)>;
 /// `u32` の ID に置き換えて保持することで hashmap の key/value サイズと heap allocation
 /// 数を大幅に削減する。workers=1 の streaming Pass で使うことを想定し、内部状態は
 /// 単一スレッドから更新される前提（マルチ worker 利用時は `Mutex` で包んで使う）。
-#[derive(Default)]
 pub(crate) struct StringPool {
     strings: Vec<String>,
-    index: HashMap<String, u32>,
+    /// `hashbrown` + `ahash` で integer-friendly なハッシュに切替。SipHash より高速で
+    /// allocation/バケット overhead も小さい。
+    index: hashbrown::HashMap<String, u32, ahash::RandomState>,
+}
+
+impl Default for StringPool {
+    fn default() -> Self {
+        Self {
+            strings: Vec::new(),
+            index: hashbrown::HashMap::with_hasher(ahash::RandomState::new()),
+        }
+    }
 }
 
 impl StringPool {
@@ -304,9 +341,15 @@ impl StringPool {
 type SymEntries = smallvec::SmallVec<[(u32, u32); 2]>;
 
 /// Pass 2 内部用。caller_map の key と value を interned ID で保持する中間表現。
+/// `hashbrown + ahash` を採用して `u32` key のバケット overhead を削減する。
 ///   key:   (path_id, line)
 ///   value: (caller_name_id, SymEntries)
-type TypedCallerMap = HashMap<(u32, usize), (u32, SymEntries)>;
+type TypedCallerMap = hashbrown::HashMap<(u32, usize), (u32, SymEntries), ahash::RandomState>;
+
+/// `TypedCallerMap` の空インスタンスを生成する（`ahash` state を明示初期化）。
+fn new_typed_caller_map() -> TypedCallerMap {
+    hashbrown::HashMap::with_hasher(ahash::RandomState::new())
+}
 
 /// 1 チャンクの処理単位。大規模リポジトリで worker local state が肥大化するのを防ぐため、
 /// ファイルを `CHUNK_SIZE` 件ずつに区切り、各チャンクの fold/reduce が終わったら
@@ -365,7 +408,7 @@ fn stream_caller_maps_and_defs(
 
     let empty_result = || {
         (
-            vec![TypedCallerMap::new(); n_fc],
+            (0..n_fc).map(|_| new_typed_caller_map()).collect(),
             vec![Vec::new(); n_sym],
             StringPool::new(),
         )
@@ -402,7 +445,7 @@ fn stream_caller_maps_and_defs(
     );
     let init_state = || -> WorkerState {
         (
-            vec![TypedCallerMap::new(); n_fc],
+            (0..n_fc).map(|_| new_typed_caller_map()).collect(),
             vec![Vec::new(); n_sym],
             LruCache::new(
                 NonZeroUsize::new(TARGET_FILE_CACHE_SIZE).expect("cache size is non-zero"),
@@ -410,7 +453,7 @@ fn stream_caller_maps_and_defs(
         )
     };
 
-    let mut global_maps: Vec<TypedCallerMap> = vec![TypedCallerMap::new(); n_fc];
+    let mut global_maps: Vec<TypedCallerMap> = (0..n_fc).map(|_| new_typed_caller_map()).collect();
     let mut global_defs: Vec<Vec<u32>> = vec![Vec::new(); n_sym];
 
     for chunk in files.chunks(CHUNK_SIZE) {
@@ -587,115 +630,89 @@ fn accumulate_caller_maps_per_file(
     }
 }
 
-/// Pass 3: `TypedCallerMap` 集合に対して Stage 4b (competing definition) を post-filter
-/// として適用し、interning ID を剥がした最終 `CallerMap` を返す。caller entry の
-/// sym_names が空になった場合はその caller 自体を削除する。
-fn apply_stage4b(
-    typed_caller_maps: Vec<TypedCallerMap>,
+/// Pass 3 (per-fc): 1 つの `TypedCallerMap` に Stage 4b を適用し、interning ID を
+/// 剥がした `CallerMap` を返す。呼び出し側で 1 fc_ix ずつ処理し、完了後すぐ drop する
+/// ことで、旧実装の `Vec<CallerMap>` 全件同時保持 (0.7-1.2 GB) を回避する。
+fn apply_stage4b_single(
+    typed_map: TypedCallerMap,
     def_paths_by_ix: &[Vec<u32>],
     pool: &StringPool,
-    sym_ix_by_name: &HashMap<String, usize>,
-    method_parent_types: &HashMap<String, String>,
-    file_contexts: &[FileContext],
-) -> Vec<CallerMap> {
-    // sym_ix -> has_parent フラグ（Stage 4b はメソッド型スコーピングが有効なシンボルだけに適用）
-    let mut has_parent_by_ix: HashMap<u32, bool> = HashMap::new();
-    for parent_child in method_parent_types.keys() {
-        if let Some(&ix) = sym_ix_by_name.get(parent_child) {
-            has_parent_by_ix.insert(ix as u32, true);
-        }
-    }
-
-    typed_caller_maps
-        .into_iter()
-        .enumerate()
-        .map(|(fc_ix, typed_map)| {
-            let source_path = file_contexts
-                .get(fc_ix)
-                .map(|ctx| ctx.new_path.as_str())
-                .unwrap_or("");
-            let mut out: CallerMap = HashMap::with_capacity(typed_map.len());
-            for ((path_id, line), (caller_name_id, sym_entries)) in typed_map {
-                let path_str = pool.get(path_id).to_string();
-                let caller_name = pool.get(caller_name_id).to_string();
-                let mut kept: Vec<String> = Vec::with_capacity(sym_entries.len());
-                for (sym_ix_val, sym_name_id) in sym_entries {
-                    if *has_parent_by_ix.get(&sym_ix_val).unwrap_or(&false)
-                        && let Some(paths) = def_paths_by_ix.get(sym_ix_val as usize)
-                    {
-                        let has_competing_def = paths.iter().any(|&pid| {
-                            let p = pool.get(pid);
-                            !is_same_source_file(p, source_path)
-                        });
-                        if has_competing_def {
-                            continue;
-                        }
-                    }
-                    let sym_name = pool.get(sym_name_id).to_string();
-                    if !kept.contains(&sym_name) {
-                        kept.push(sym_name);
-                    }
-                }
-                if !kept.is_empty() {
-                    out.insert((path_str, line), (caller_name, kept));
+    has_parent_by_ix: &HashMap<u32, bool>,
+    source_path: &str,
+) -> CallerMap {
+    let mut out: CallerMap = HashMap::with_capacity(typed_map.len());
+    for ((path_id, line), (caller_name_id, sym_entries)) in typed_map {
+        let path_str = pool.get(path_id).to_string();
+        let caller_name = pool.get(caller_name_id).to_string();
+        let mut kept: Vec<String> = Vec::with_capacity(sym_entries.len());
+        for (sym_ix_val, sym_name_id) in sym_entries {
+            if *has_parent_by_ix.get(&sym_ix_val).unwrap_or(&false)
+                && let Some(paths) = def_paths_by_ix.get(sym_ix_val as usize)
+            {
+                let has_competing_def = paths.iter().any(|&pid| {
+                    let p = pool.get(pid);
+                    !is_same_source_file(p, source_path)
+                });
+                if has_competing_def {
+                    continue;
                 }
             }
-            out
-        })
-        .collect()
+            let sym_name = pool.get(sym_name_id).to_string();
+            if !kept.contains(&sym_name) {
+                kept.push(sym_name);
+            }
+        }
+        if !kept.is_empty() {
+            out.insert((path_str, line), (caller_name, kept));
+        }
+    }
+    out
 }
 
-/// Pass 4: caller_maps + file_contexts から最終 FileImpact を組み立てる。
-/// 同一ファイル内の call_edges も統合する。
-fn assemble_from_caller_maps(
-    file_contexts: Vec<FileContext>,
-    mut caller_maps: Vec<CallerMap>,
-) -> Vec<FileImpact> {
-    let mut changes = Vec::with_capacity(file_contexts.len());
-    for (fc_ix, ctx) in file_contexts.into_iter().enumerate() {
-        let mut caller_map = std::mem::take(&mut caller_maps[fc_ix]);
-
-        // 同一ファイル内の call_edges をマージ
-        for sym in &ctx.affected {
-            let sym_key = ci_key(ctx.lang_id, &sym.name);
-            for edge in &ctx.call_edges {
-                if ci_key(ctx.lang_id, &edge.callee.name) == sym_key {
-                    let caller_line = edge.call_site.line;
-                    if !ctx.affected.iter().any(|a| {
-                        ci_key(ctx.lang_id, &a.name) == ci_key(ctx.lang_id, &edge.caller.name)
-                    }) {
-                        let key = (ctx.new_path.clone(), caller_line);
-                        let entry = caller_map
-                            .entry(key)
-                            .or_insert_with(|| (edge.caller.name.clone(), Vec::new()));
-                        if !entry.1.contains(&sym.name) {
-                            entry.1.push(sym.name.clone());
-                        }
+/// Pass 4 (per-fc): 1 ファイル分の `CallerMap` と `FileContext` から `FileImpact` を組み立てる。
+/// 同一ファイル内の `call_edges` もここでマージする。
+fn build_file_impact(ctx: FileContext, mut caller_map: CallerMap) -> FileImpact {
+    // 同一ファイル内の call_edges をマージ
+    for sym in &ctx.affected {
+        let sym_key = ci_key(ctx.lang_id, &sym.name);
+        for edge in &ctx.call_edges {
+            if ci_key(ctx.lang_id, &edge.callee.name) == sym_key {
+                let caller_line = edge.call_site.line;
+                if !ctx
+                    .affected
+                    .iter()
+                    .any(|a| ci_key(ctx.lang_id, &a.name) == ci_key(ctx.lang_id, &edge.caller.name))
+                {
+                    let key = (ctx.new_path.clone(), caller_line);
+                    let entry = caller_map
+                        .entry(key)
+                        .or_insert_with(|| (edge.caller.name.clone(), Vec::new()));
+                    if !entry.1.contains(&sym.name) {
+                        entry.1.push(sym.name.clone());
                     }
                 }
             }
         }
-
-        let mut impacted_callers: Vec<ImpactedCaller> = caller_map
-            .into_iter()
-            .map(|((path, line), (name, symbols))| ImpactedCaller {
-                path,
-                name,
-                line,
-                symbols,
-            })
-            .collect();
-        impacted_callers.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line.cmp(&b.line)));
-
-        changes.push(FileImpact {
-            path: ctx.new_path,
-            hunks: ctx.hunks,
-            affected_symbols: ctx.affected,
-            signature_changes: ctx.sig_changes,
-            impacted_callers,
-        });
     }
-    changes
+
+    let mut impacted_callers: Vec<ImpactedCaller> = caller_map
+        .into_iter()
+        .map(|((path, line), (name, symbols))| ImpactedCaller {
+            path,
+            name,
+            line,
+            symbols,
+        })
+        .collect();
+    impacted_callers.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line.cmp(&b.line)));
+
+    FileImpact {
+        path: ctx.new_path,
+        hunks: ctx.hunks,
+        affected_symbols: ctx.affected,
+        signature_changes: ctx.sig_changes,
+        impacted_callers,
+    }
 }
 
 /// affected シンボルを cross-file 参照検索に含めるべきか判定する。

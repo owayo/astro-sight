@@ -31,6 +31,20 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // mimalloc に idle ページを即 OS へ返却させる。短命 allocation を大量に行う
+    // impact streaming Pass で、chunk 完了後の free が RSS に即反映されるようにする。
+    // SAFETY: clap parse よりも前、シングルスレッド状態で設定しているため環境変数
+    // の更新は他スレッドと競合しない。
+    #[cfg(not(feature = "dhat-heap"))]
+    unsafe {
+        if std::env::var_os("MI_PURGE_DELAY").is_none() {
+            std::env::set_var("MI_PURGE_DELAY", "0");
+        }
+        if std::env::var_os("MI_ABANDONED_PAGE_PURGE").is_none() {
+            std::env::set_var("MI_ABANDONED_PAGE_PURGE", "1");
+        }
+    }
+
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
