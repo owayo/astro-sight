@@ -40,9 +40,9 @@ type ParsedFile = (tree_sitter::Tree, crate::engine::parser::SourceBuf, LangId);
 /// `assemble_impacts` でテストコンテキスト判定に使う LRU キャッシュ上限。
 /// 1 エントリあたり Tree + SourceBuf(Mmap) + LangId を保持するため、
 /// 大規模リポジトリ（数万ファイル）でもピーク RSS を抑える目的で上限を設ける。
-/// ほとんどの参照は同一ファイル内で連続するため少数の hot エントリで十分に hit し、
-/// サイズを小さく保つことで最大メモリ量を予測可能にする。
-const TARGET_FILE_CACHE_SIZE: usize = 64;
+/// streaming Pass では per-file で順次走査しキャッシュ hit は同一ファイル連続時のみのため、
+/// 16 でも実用上十分。worker 並列で最大 `workers × SIZE` の mmap を抱えるため小さめに保つ。
+const TARGET_FILE_CACHE_SIZE: usize = 16;
 
 /// 言語別にシンボル名を正規化した HashMap/HashSet キー。
 /// 非 CI 言語ではアロケーション無し (Cow::Borrowed → into_owned は元の String 相当)、
@@ -351,7 +351,7 @@ fn stream_caller_maps(
                 (local_maps, target_cache)
             })
             .reduce(init_state, |(mut acc_maps, acc_cache), (local_maps, _)| {
-                for (acc_m, local_m) in acc_maps.iter_mut().zip(local_maps.into_iter()) {
+                for (acc_m, local_m) in acc_maps.iter_mut().zip(local_maps) {
                     for (key, (name, syms)) in local_m {
                         let entry = acc_m.entry(key).or_insert_with(|| (name, Vec::new()));
                         for s in syms {

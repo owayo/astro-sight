@@ -635,13 +635,13 @@ pub(crate) fn collect_definition_paths_indexed(
                         return local;
                     };
                     let utf8_path = camino::Utf8Path::new(path_str);
-                    if let Ok(per_file) =
-                        find_refs_batch_in_file_indexed(symbol_names, &ac, utf8_path)
+                    // 軽量経路: `SymbolReference` を生成せず、Definition が存在する sym_ix だけ
+                    // `HashSet<usize>` に集める。per-file の一時メモリが大幅に減る。
+                    if let Ok(def_ixs) =
+                        find_definition_sym_indices_in_file(symbol_names, &ac, utf8_path)
                     {
-                        for (ix, refs) in per_file.into_iter().enumerate() {
-                            if refs.iter().any(|r| r.kind == Some(RefKind::Definition)) {
-                                local[ix].push(path_str.to_string());
-                            }
+                        for ix in def_ixs {
+                            local[ix].push(path_str.to_string());
                         }
                     }
                     local
@@ -709,6 +709,85 @@ pub fn count_non_definition_refs_batch(
         );
 
     Ok(symbol_names.iter().cloned().zip(counts).collect())
+}
+
+/// impact Pass1.5 専用の軽量版: Definition として出現した sym_index の集合だけ返す。
+///
+/// `SymbolReference` を生成せず `HashSet<usize>` のみを保持するため、
+/// 同一ファイルに同名 Definition が大量に並ぶケースでも一時メモリが constant に収まる。
+fn find_definition_sym_indices_in_file(
+    symbol_names: &[String],
+    ac: &aho_corasick::AhoCorasick,
+    path: &camino::Utf8Path,
+) -> Result<std::collections::HashSet<usize>> {
+    use std::collections::HashSet;
+
+    let num = symbol_names.len();
+    let source = parser::read_file(path)?;
+
+    let mut present_indices: HashSet<usize> = HashSet::new();
+    for mat in ac.find_overlapping_iter(source.as_bytes()) {
+        present_indices.insert(mat.pattern().as_usize());
+        if present_indices.len() == num {
+            break;
+        }
+    }
+    if present_indices.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let (tree, lang_id) = parser::parse_file(path, &source)?;
+    let root = tree.root_node();
+    let definition_kinds = definition_node_kinds(lang_id);
+
+    let mut name_to_ix: std::collections::HashMap<std::borrow::Cow<'_, str>, Vec<usize>> =
+        std::collections::HashMap::with_capacity(present_indices.len());
+    for &i in &present_indices {
+        let key = normalize_identifier(lang_id, symbol_names[i].as_str());
+        name_to_ix.entry(key).or_default().push(i);
+    }
+
+    let mut result: HashSet<usize> = HashSet::new();
+    collect_definition_sym_indices(
+        root,
+        &source,
+        &name_to_ix,
+        definition_kinds,
+        lang_id,
+        &mut result,
+    );
+    Ok(result)
+}
+
+/// AST を再帰走査し、Definition context に該当する identifier の sym_ix を `result` に集める。
+fn collect_definition_sym_indices(
+    node: Node<'_>,
+    source: &[u8],
+    name_to_ix: &std::collections::HashMap<std::borrow::Cow<'_, str>, Vec<usize>>,
+    definition_kinds: &[&str],
+    lang_id: LangId,
+    result: &mut std::collections::HashSet<usize>,
+) {
+    if is_identifier_kind(node.kind())
+        && let Ok(text) = node.utf8_text(source)
+        && let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, text))
+        && is_definition_context(node, definition_kinds, lang_id)
+    {
+        for &ix in indices {
+            result.insert(ix);
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_definition_sym_indices(
+            child,
+            source,
+            name_to_ix,
+            definition_kinds,
+            lang_id,
+            result,
+        );
+    }
 }
 
 /// 単一ファイル内で複数シンボルの参照を index ベースの Vec に格納する。
