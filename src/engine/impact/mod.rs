@@ -15,7 +15,8 @@ use crate::models::call::CallEdge;
 use crate::models::impact::{
     AffectedSymbol, ContextResult, DiffFile, FileImpact, HunkInfo, ImpactedCaller, SignatureChange,
 };
-use crate::models::reference::{RefKind, SymbolReference};
+// `SymbolReference`/`RefKind` は旧実装で使用していたが、現在の visitor callback 化された
+// per-file Pass では `refs::RefVisitor` 経由で直接 callback を受け取るため直接参照はしない。
 use crate::models::symbol::SymbolKind;
 
 use signature::{
@@ -438,78 +439,89 @@ fn stream_caller_maps_and_defs(
     // 全 chunk を通して 1 つの StringPool を共有する。workers=1 なら lock 競合は発生しない。
     let string_pool = std::sync::Mutex::new(StringPool::new());
 
-    type WorkerState = (
-        Vec<TypedCallerMap>,
-        Vec<Vec<u32>>,
-        LruCache<String, Option<ParsedFile>>,
-    );
     let init_state = || -> WorkerState {
-        (
-            (0..n_fc).map(|_| new_typed_caller_map()).collect(),
-            vec![Vec::new(); n_sym],
-            LruCache::new(
+        WorkerState {
+            local_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
+            local_def_paths: vec![Vec::new(); n_sym],
+            target_cache: LruCache::new(
                 NonZeroUsize::new(TARGET_FILE_CACHE_SIZE).expect("cache size is non-zero"),
             ),
-        )
+            ref_hit: vec![false; n_sym],
+            ref_events: Vec::new(),
+            def_events: Vec::new(),
+        }
     };
 
     let mut global_maps: Vec<TypedCallerMap> = (0..n_fc).map(|_| new_typed_caller_map()).collect();
     let mut global_defs: Vec<Vec<u32>> = vec![Vec::new(); n_sym];
 
     for chunk in files.chunks(CHUNK_SIZE) {
-        let (chunk_maps, chunk_defs, _cache) = rayon_pool.install(|| {
+        let chunk_state = rayon_pool.install(|| {
             use rayon::prelude::*;
             chunk
                 .par_iter()
-                .fold(
-                    init_state,
-                    |(mut local_maps, mut def_paths, mut target_cache), path| {
-                        let Some(path_str) = path.to_str() else {
-                            return (local_maps, def_paths, target_cache);
+                .fold(init_state, |mut state, path| {
+                    let Some(path_str) = path.to_str() else {
+                        return state;
+                    };
+                    let utf8_path = camino::Utf8Path::new(path_str);
+
+                    // 本 per-file の可変バッファを `ImpactCollector` にまとめて borrow し、
+                    // `visit_refs_and_defs_in_file_cb` の内部から callback で直接流す。
+                    // `Vec<Vec<SymbolReference>>` のような per-file の中間バッファを作らない。
+                    {
+                        let WorkerState {
+                            local_maps,
+                            local_def_paths,
+                            target_cache,
+                            ref_hit,
+                            ref_events,
+                            def_events,
+                        } = &mut state;
+                        let mut collector = ImpactCollector {
+                            sym_to_fc: &sym_to_fc,
+                            file_contexts,
+                            all_symbol_names,
+                            parent_ix_by_sym: &parent_ix_by_sym,
+                            pool: &string_pool,
+                            path_str,
+                            local_maps: local_maps.as_mut_slice(),
+                            local_def_paths: local_def_paths.as_mut_slice(),
+                            target_cache,
+                            ref_hit: ref_hit.as_mut_slice(),
+                            ref_events,
+                            def_events,
                         };
-                        let utf8_path = camino::Utf8Path::new(path_str);
-                        if let Ok(visit) =
-                            refs::visit_refs_and_defs_in_file(all_symbol_names, &ac, utf8_path)
+                        if refs::visit_refs_and_defs_in_file_cb(
+                            all_symbol_names,
+                            &ac,
+                            utf8_path,
+                            &mut collector,
+                        )
+                        .is_ok()
                         {
-                            if !visit.def_sym_indices.is_empty() {
-                                // Definition が 1 件でもあるファイルの path だけ intern する。
-                                let path_id = string_pool
-                                    .lock()
-                                    .expect("string pool mutex poisoned")
-                                    .intern(path_str);
-                                for ix in &visit.def_sym_indices {
-                                    def_paths[*ix].push(path_id);
-                                }
-                            }
-                            accumulate_caller_maps_per_file(
-                                &visit.refs_by_ix,
-                                &sym_to_fc,
-                                file_contexts,
-                                all_symbol_names,
-                                &parent_ix_by_sym,
-                                &string_pool,
-                                &mut local_maps,
-                                &mut target_cache,
-                            );
+                            collector.finish_file();
+                        } else {
+                            // visit に失敗した場合でもバッファだけはクリアして再利用
+                            collector.reset_buffers();
                         }
-                        (local_maps, def_paths, target_cache)
-                    },
-                )
-                .reduce(
-                    init_state,
-                    |(mut acc_maps, mut acc_defs, acc_cache), (local_maps, local_defs, _)| {
-                        merge_typed_maps(&mut acc_maps, local_maps);
-                        for (acc_v, local_v) in acc_defs.iter_mut().zip(local_defs) {
-                            acc_v.extend(local_v);
-                        }
-                        (acc_maps, acc_defs, acc_cache)
-                    },
-                )
+                    }
+                    state
+                })
+                .reduce(init_state, |mut acc, local| {
+                    merge_typed_maps(&mut acc.local_maps, local.local_maps);
+                    for (acc_v, local_v) in
+                        acc.local_def_paths.iter_mut().zip(local.local_def_paths)
+                    {
+                        acc_v.extend(local_v);
+                    }
+                    acc
+                })
         });
 
         // chunk 結果を global にマージし、chunk state をスコープ終了で drop させる。
-        merge_typed_maps(&mut global_maps, chunk_maps);
-        for (g, c) in global_defs.iter_mut().zip(chunk_defs) {
+        merge_typed_maps(&mut global_maps, chunk_state.local_maps);
+        for (g, c) in global_defs.iter_mut().zip(chunk_state.local_def_paths) {
             g.extend(c);
         }
     }
@@ -518,6 +530,176 @@ fn stream_caller_maps_and_defs(
         .into_inner()
         .expect("string pool mutex poisoned on unwrap");
     (global_maps, global_defs, pool)
+}
+
+/// per-worker の中間状態。per-file バッファ (`ref_hit` / `ref_events` / `def_events`) は
+/// `finish_file` / `reset_buffers` で再利用されるため、巨大ファイルでも再割当ては発生しない。
+struct WorkerState {
+    local_maps: Vec<TypedCallerMap>,
+    local_def_paths: Vec<Vec<u32>>,
+    target_cache: LruCache<String, Option<ParsedFile>>,
+    ref_hit: Vec<bool>,
+    ref_events: Vec<RefEventMini>,
+    def_events: Vec<u32>,
+}
+
+/// 1 件の reference event を最小サイズで表現する（context は 256B truncate 済み）。
+struct RefEventMini {
+    sym_ix: u32,
+    line: u32,
+    column: u32,
+    context: String,
+}
+
+/// `RefVisitor` の実装: per-file の ref 走査中は最小限の buffering だけ行い、
+/// ファイル走査完了後に `finish_file` で Stage 1-6 (Stage 4b 除く) の filter を適用して
+/// `local_maps` / `local_def_paths` へ流す。`SymbolReference` の Vec は生成しない。
+struct ImpactCollector<'a> {
+    sym_to_fc: &'a [Vec<u32>],
+    file_contexts: &'a [FileContext],
+    all_symbol_names: &'a [String],
+    parent_ix_by_sym: &'a [Option<usize>],
+    pool: &'a std::sync::Mutex<StringPool>,
+    path_str: &'a str,
+
+    local_maps: &'a mut [TypedCallerMap],
+    local_def_paths: &'a mut [Vec<u32>],
+    target_cache: &'a mut LruCache<String, Option<ParsedFile>>,
+
+    ref_hit: &'a mut [bool],
+    ref_events: &'a mut Vec<RefEventMini>,
+    def_events: &'a mut Vec<u32>,
+}
+
+impl<'a> refs::RefVisitor for ImpactCollector<'a> {
+    fn on_ref(&mut self, sym_ix: u32, line: usize, column: usize, context: &str, is_def: bool) {
+        let ix = sym_ix as usize;
+        if ix < self.ref_hit.len() {
+            self.ref_hit[ix] = true;
+        }
+        if is_def {
+            self.def_events.push(sym_ix);
+        } else {
+            self.ref_events.push(RefEventMini {
+                sym_ix,
+                line: line as u32,
+                column: column as u32,
+                context: context.to_string(),
+            });
+        }
+    }
+}
+
+impl<'a> ImpactCollector<'a> {
+    /// ファイル走査完了時に呼ぶ。buffered events に対して Stage 1-6 (Stage 4b 除く) の
+    /// filter を適用し、`local_maps` / `local_def_paths` に push する。バッファは clear して
+    /// 次ファイルで再利用する。
+    fn finish_file(self) {
+        // Definition: path を 1 回だけ intern して全 def sym へ配布
+        if !self.def_events.is_empty() {
+            let path_id = self
+                .pool
+                .lock()
+                .expect("string pool mutex poisoned")
+                .intern(self.path_str);
+            for &ix in self.def_events.iter() {
+                if let Some(paths) = self.local_def_paths.get_mut(ix as usize) {
+                    paths.push(path_id);
+                }
+            }
+            self.def_events.clear();
+        }
+
+        // References: 1 件ずつ Stage 1-6 (Stage 4b 除く) の filter を適用し local_maps へ流す
+        // ref_events を drain することで Vec のヒープは再利用される。
+        for e in self.ref_events.drain(..) {
+            let sym_ix_usize = e.sym_ix as usize;
+            let fc_ixs = &self.sym_to_fc[sym_ix_usize];
+            if fc_ixs.is_empty() {
+                continue;
+            }
+
+            let has_parent_type = self.parent_ix_by_sym[sym_ix_usize].is_some();
+            let parent_in_this_file = self.parent_ix_by_sym[sym_ix_usize]
+                .and_then(|pix| self.ref_hit.get(pix))
+                .copied()
+                .unwrap_or(false);
+
+            for &fc_ix_raw in fc_ixs {
+                let fc_ix = fc_ix_raw as usize;
+                let ctx = &self.file_contexts[fc_ix];
+                let source_path = &ctx.new_path;
+                let source_lang_group = lang_compat_group(ctx.lang_id);
+
+                if is_same_source_file(self.path_str, source_path) {
+                    continue;
+                }
+                if let Ok(ref_lang) = LangId::from_path(Utf8Path::new(self.path_str))
+                    && lang_compat_group(ref_lang) != source_lang_group
+                {
+                    continue;
+                }
+                if has_parent_type && !parent_in_this_file {
+                    continue;
+                }
+                if is_ref_in_target_test_context(
+                    self.path_str,
+                    e.line as usize,
+                    e.column as usize,
+                    self.target_cache,
+                ) {
+                    continue;
+                }
+                if is_import_context(Some(&e.context)) {
+                    continue;
+                }
+
+                let sym_key_canonical = &self.all_symbol_names[sym_ix_usize];
+                let affected_sym_name = ctx
+                    .affected
+                    .iter()
+                    .find(|a| ci_key(ctx.lang_id, &a.name) == *sym_key_canonical)
+                    .map(|a| a.name.clone())
+                    .unwrap_or_else(|| sym_key_canonical.clone());
+                let caller_name = extract_function_from_context(&e.context)
+                    .unwrap_or_else(|| affected_sym_name.clone());
+
+                let (path_id, caller_name_id, sym_name_id) = {
+                    let mut p = self.pool.lock().expect("string pool mutex poisoned");
+                    (
+                        p.intern(self.path_str),
+                        p.intern(&caller_name),
+                        p.intern(&affected_sym_name),
+                    )
+                };
+
+                let ix_u32 = e.sym_ix;
+                let key = (path_id, e.line as usize);
+                let entry = self.local_maps[fc_ix]
+                    .entry(key)
+                    .or_insert_with(|| (caller_name_id, SymEntries::new()));
+                if !entry.1.iter().any(|(existing_ix, existing_name_id)| {
+                    *existing_ix == ix_u32 && *existing_name_id == sym_name_id
+                }) {
+                    entry.1.push((ix_u32, sym_name_id));
+                }
+            }
+        }
+
+        // ref_hit のクリア（次ファイル向け）
+        for v in self.ref_hit.iter_mut() {
+            *v = false;
+        }
+    }
+
+    /// visit に失敗したファイルでも buffer だけは空にして次ファイルに備える。
+    fn reset_buffers(self) {
+        self.ref_events.clear();
+        self.def_events.clear();
+        for v in self.ref_hit.iter_mut() {
+            *v = false;
+        }
+    }
 }
 
 /// 2 つの `Vec<TypedCallerMap>` をエントリ単位で重複排除しつつ merge する。
@@ -532,98 +714,6 @@ fn merge_typed_maps(dst: &mut [TypedCallerMap], src: Vec<TypedCallerMap>) {
                     *existing_ix == sym_ix_val && *existing_name == sym_name
                 }) {
                     entry.1.push((sym_ix_val, sym_name));
-                }
-            }
-        }
-    }
-}
-
-/// 1 ファイル分の `refs_by_ix` を走査し、Stage 1-6（Stage 4b を除く）を適用して
-/// `local_maps` に直接流す。path / caller_name / sym_name はすべて `StringPool` で
-/// interning しておき、`u32` の ID として保持する（hashmap エントリのサイズと
-/// heap allocation 数を大幅に削減するため）。
-#[allow(clippy::too_many_arguments)]
-fn accumulate_caller_maps_per_file(
-    refs_by_ix: &[Vec<SymbolReference>],
-    sym_to_fc: &[Vec<u32>],
-    file_contexts: &[FileContext],
-    all_symbol_names: &[String],
-    parent_ix_by_sym: &[Option<usize>],
-    pool: &std::sync::Mutex<StringPool>,
-    local_maps: &mut [TypedCallerMap],
-    target_cache: &mut LruCache<String, Option<ParsedFile>>,
-) {
-    for (ix, refs) in refs_by_ix.iter().enumerate() {
-        let fc_ixs = &sym_to_fc[ix];
-        if fc_ixs.is_empty() || refs.is_empty() {
-            continue;
-        }
-        let parent_in_this_file = parent_ix_by_sym[ix]
-            .and_then(|pix| refs_by_ix.get(pix))
-            .is_some_and(|pt| !pt.is_empty());
-        let has_parent_type = parent_ix_by_sym[ix].is_some();
-
-        let sym_key_canonical = &all_symbol_names[ix];
-
-        for r in refs {
-            if r.kind == Some(RefKind::Definition) {
-                continue;
-            }
-            for &fc_ix_raw in fc_ixs {
-                let fc_ix = fc_ix_raw as usize;
-                let ctx = &file_contexts[fc_ix];
-                let source_path = &ctx.new_path;
-                let source_lang_group = lang_compat_group(ctx.lang_id);
-
-                if is_same_source_file(&r.path, source_path) {
-                    continue;
-                }
-                if let Ok(ref_lang) = LangId::from_path(Utf8Path::new(&r.path))
-                    && lang_compat_group(ref_lang) != source_lang_group
-                {
-                    continue;
-                }
-                if has_parent_type && !parent_in_this_file {
-                    continue;
-                }
-                if is_ref_in_target_test_context(&r.path, r.line, r.column, target_cache) {
-                    continue;
-                }
-                if is_import_context(r.context.as_deref()) {
-                    continue;
-                }
-
-                let affected_sym_name = ctx
-                    .affected
-                    .iter()
-                    .find(|a| ci_key(ctx.lang_id, &a.name) == *sym_key_canonical)
-                    .map(|a| a.name.clone())
-                    .unwrap_or_else(|| sym_key_canonical.clone());
-                let caller_name = r
-                    .context
-                    .as_deref()
-                    .and_then(extract_function_from_context)
-                    .unwrap_or_else(|| affected_sym_name.clone());
-
-                // pool への intern は 3 回分をまとめて 1 回の lock で行う。
-                let (path_id, caller_name_id, sym_name_id) = {
-                    let mut p = pool.lock().expect("string pool mutex poisoned");
-                    (
-                        p.intern(&r.path),
-                        p.intern(&caller_name),
-                        p.intern(&affected_sym_name),
-                    )
-                };
-
-                let ix_u32 = ix as u32;
-                let key = (path_id, r.line);
-                let entry = local_maps[fc_ix]
-                    .entry(key)
-                    .or_insert_with(|| (caller_name_id, SymEntries::new()));
-                if !entry.1.iter().any(|(existing_ix, existing_name_id)| {
-                    *existing_ix == ix_u32 && *existing_name_id == sym_name_id
-                }) {
-                    entry.1.push((ix_u32, sym_name_id));
                 }
             }
         }

@@ -649,27 +649,17 @@ pub fn count_non_definition_refs_batch(
     Ok(symbol_names.iter().cloned().zip(counts).collect())
 }
 
-/// impact streaming Pass が 1 ファイルから得たい情報の一式。
-/// parse 結果を使い回して Definition 集合と全 References を同時に取得する。
-pub(crate) struct FileVisitResult {
-    /// 当該ファイルに Definition として出現した sym_ix の集合
-    pub def_sym_indices: std::collections::HashSet<usize>,
-    /// sym_ix -> refs の Vec。index は `symbol_names` と対応。
-    pub refs_by_ix: Vec<Vec<SymbolReference>>,
-}
-
-/// impact streaming Pass 用: per-file で tree-sitter parse を 1 度だけ実行し、
-/// Definition 集合と References を同時に集める。
+/// visitor callback 版の per-file ref 走査。
 ///
-/// 従来は Pass1.5（Definition 軽量収集）と Pass2（References 収集）で同一ファイルを
-/// 2 度 parse していたため、大規模リポジトリで tree-sitter Tree のピーク RSS が
-/// 二重コストになっていた。本関数で 1 パスに統合することで per-file のメモリと
-/// 実行時間の両方を半分にする。
-pub(crate) fn visit_refs_and_defs_in_file(
+/// `SymbolReference` を 1 件も生成せず、identifier にヒットした瞬間に `visitor.on_ref`
+/// を直接呼ぶため、per-file の `Vec<Vec<SymbolReference>>` に起因する heap 確保を完全に
+/// 廃止できる。呼び出し側（impact streaming Pass）で filter + intern まで一気に処理する。
+pub(crate) fn visit_refs_and_defs_in_file_cb<V: RefVisitor>(
     symbol_names: &[String],
     ac: &aho_corasick::AhoCorasick,
     path: &camino::Utf8Path,
-) -> Result<FileVisitResult> {
+    visitor: &mut V,
+) -> Result<()> {
     use std::collections::HashSet;
 
     let num = symbol_names.len();
@@ -683,10 +673,7 @@ pub(crate) fn visit_refs_and_defs_in_file(
         }
     }
     if present_indices.is_empty() {
-        return Ok(FileVisitResult {
-            def_sym_indices: HashSet::new(),
-            refs_by_ix: vec![Vec::new(); num],
-        });
+        return Ok(());
     }
 
     let (tree, lang_id) = parser::parse_file(path, &source)?;
@@ -700,36 +687,34 @@ pub(crate) fn visit_refs_and_defs_in_file(
         name_to_ix.entry(key).or_default().push(i);
     }
 
-    let mut refs_by_ix = vec![Vec::new(); num];
-    let mut def_sym_indices: HashSet<usize> = HashSet::new();
-    collect_refs_and_defs_indexed(
+    collect_refs_and_defs_indexed_cb(
         root,
         &source,
         &name_to_ix,
-        path.as_str(),
         definition_kinds,
         lang_id,
-        &mut refs_by_ix,
-        &mut def_sym_indices,
+        visitor,
     );
-    Ok(FileVisitResult {
-        def_sym_indices,
-        refs_by_ix,
-    })
+    Ok(())
 }
 
-/// AST を再帰走査し、各 identifier ノードについて `refs_by_ix` へ参照を push しつつ、
-/// Definition 判定が真のものは `def_sym_indices` にも記録する。
-#[allow(clippy::too_many_arguments)]
-fn collect_refs_and_defs_indexed(
+/// `visit_refs_and_defs_in_file_cb` が内部で呼び出す訪問者 trait。
+/// Xojo の case-insensitive 多重 index (`name_to_ix[key]` が `Vec<usize>`) や
+/// Rust attribute 文字列内参照の場合も、ヒットしたすべての sym_ix について
+/// 1 回ずつ `on_ref` が呼ばれる。
+pub(crate) trait RefVisitor {
+    fn on_ref(&mut self, sym_ix: u32, line: usize, column: usize, context: &str, is_def: bool);
+}
+
+/// `visit_refs_and_defs_in_file_cb` 用の AST 再帰走査。Identifier と Rust attribute 文字列
+/// 参照を発見したら `visitor.on_ref` を直接呼び、`Vec<SymbolReference>` を一切生成しない。
+fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
     node: Node<'_>,
     source: &[u8],
     name_to_ix: &std::collections::HashMap<std::borrow::Cow<'_, str>, Vec<usize>>,
-    path: &str,
     definition_kinds: &[&str],
     lang_id: LangId,
-    refs_by_ix: &mut [Vec<SymbolReference>],
-    def_sym_indices: &mut std::collections::HashSet<usize>,
+    visitor: &mut V,
 ) {
     if is_identifier_kind(node.kind())
         && let Ok(text) = node.utf8_text(source)
@@ -739,53 +724,29 @@ fn collect_refs_and_defs_indexed(
         let context = extract_line_context(source, node.start_position().row);
         let line = node.start_position().row;
         let column = node.start_position().column;
-        let kind = if is_def {
-            RefKind::Definition
-        } else {
-            RefKind::Reference
-        };
-
         for &ix in indices {
-            refs_by_ix[ix].push(SymbolReference {
-                path: path.to_string(),
-                line,
-                column,
-                context: Some(context.clone()),
-                kind: Some(kind),
-            });
-            if is_def {
-                def_sym_indices.insert(ix);
-            }
+            visitor.on_ref(ix as u32, line, column, &context, is_def);
         }
     }
 
-    // Rust の serde 属性文字列値を identifier 参照として扱う（非定義）。
     for (seg, row, col) in rust_attr_string_ref_segments(node, source, lang_id) {
         if let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, seg)) {
             let context = extract_line_context(source, row);
             for &ix in indices {
-                refs_by_ix[ix].push(SymbolReference {
-                    path: path.to_string(),
-                    line: row,
-                    column: col,
-                    context: Some(context.clone()),
-                    kind: Some(RefKind::Reference),
-                });
+                visitor.on_ref(ix as u32, row, col, &context, false);
             }
         }
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_refs_and_defs_indexed(
+        collect_refs_and_defs_indexed_cb(
             child,
             source,
             name_to_ix,
-            path,
             definition_kinds,
             lang_id,
-            refs_by_ix,
-            def_sym_indices,
+            visitor,
         );
     }
 }
