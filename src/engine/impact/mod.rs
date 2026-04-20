@@ -543,12 +543,17 @@ struct WorkerState {
     def_events: Vec<u32>,
 }
 
-/// 1 件の reference event を最小サイズで表現する（context は 256B truncate 済み）。
+/// 1 件の reference event を最小サイズで表現する。
+///
+/// `on_ref` 時点で import 判定と caller_name 抽出・intern まで済ませておき、
+/// `context` 文字列自体は保持しない（per-file buffer の heap を劇的に削減）。
+/// sym_ix / line / column / caller_name_id / is_import_flag の計 24 B 構造体 + 1 bit。
 struct RefEventMini {
     sym_ix: u32,
     line: u32,
     column: u32,
-    context: String,
+    caller_name_id: u32,
+    is_import: bool,
 }
 
 /// `RefVisitor` の実装: per-file の ref 走査中は最小限の buffering だけ行い、
@@ -579,14 +584,29 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
         }
         if is_def {
             self.def_events.push(sym_ix);
-        } else {
-            self.ref_events.push(RefEventMini {
-                sym_ix,
-                line: line as u32,
-                column: column as u32,
-                context: context.to_string(),
-            });
+            return;
         }
+
+        // Stage 6 (import 行) の判定は文字列のままでないと行えないため、ここで即決する。
+        // caller_name も context から抽出し、pool へ intern して ID にしてから push する。
+        // これにより `RefEventMini` は固定長で済み、per-file バッファの heap を削減する。
+        let is_import = is_import_context(Some(context));
+        let caller_name_fallback = || self.all_symbol_names.get(ix).cloned().unwrap_or_default();
+        let caller_name =
+            extract_function_from_context(context).unwrap_or_else(caller_name_fallback);
+        let caller_name_id = self
+            .pool
+            .lock()
+            .expect("string pool mutex poisoned")
+            .intern(&caller_name);
+
+        self.ref_events.push(RefEventMini {
+            sym_ix,
+            line: line as u32,
+            column: column as u32,
+            caller_name_id,
+            is_import,
+        });
     }
 }
 
@@ -611,8 +631,13 @@ impl<'a> ImpactCollector<'a> {
         }
 
         // References: 1 件ずつ Stage 1-6 (Stage 4b 除く) の filter を適用し local_maps へ流す
-        // ref_events を drain することで Vec のヒープは再利用される。
+        // ref_events を drain することで Vec のヒープは再利用される。Stage 6 (import 判定) と
+        // caller_name の抽出は on_ref 時点で済ませてあるため、ここでは flag / ID で判定する。
         for e in self.ref_events.drain(..) {
+            if e.is_import {
+                continue;
+            }
+
             let sym_ix_usize = e.sym_ix as usize;
             let fc_ixs = &self.sym_to_fc[sym_ix_usize];
             if fc_ixs.is_empty() {
@@ -650,9 +675,6 @@ impl<'a> ImpactCollector<'a> {
                 ) {
                     continue;
                 }
-                if is_import_context(Some(&e.context)) {
-                    continue;
-                }
 
                 let sym_key_canonical = &self.all_symbol_names[sym_ix_usize];
                 let affected_sym_name = ctx
@@ -661,23 +683,17 @@ impl<'a> ImpactCollector<'a> {
                     .find(|a| ci_key(ctx.lang_id, &a.name) == *sym_key_canonical)
                     .map(|a| a.name.clone())
                     .unwrap_or_else(|| sym_key_canonical.clone());
-                let caller_name = extract_function_from_context(&e.context)
-                    .unwrap_or_else(|| affected_sym_name.clone());
 
-                let (path_id, caller_name_id, sym_name_id) = {
+                let (path_id, sym_name_id) = {
                     let mut p = self.pool.lock().expect("string pool mutex poisoned");
-                    (
-                        p.intern(self.path_str),
-                        p.intern(&caller_name),
-                        p.intern(&affected_sym_name),
-                    )
+                    (p.intern(self.path_str), p.intern(&affected_sym_name))
                 };
 
                 let ix_u32 = e.sym_ix;
                 let key = (path_id, e.line as usize);
                 let entry = self.local_maps[fc_ix]
                     .entry(key)
-                    .or_insert_with(|| (caller_name_id, SymEntries::new()));
+                    .or_insert_with(|| (e.caller_name_id, SymEntries::new()));
                 if !entry.1.iter().any(|(existing_ix, existing_name_id)| {
                     *existing_ix == ix_u32 && *existing_name_id == sym_name_id
                 }) {
@@ -787,11 +803,16 @@ fn build_file_impact(ctx: FileContext, mut caller_map: CallerMap) -> FileImpact 
 
     let mut impacted_callers: Vec<ImpactedCaller> = caller_map
         .into_iter()
-        .map(|((path, line), (name, symbols))| ImpactedCaller {
-            path,
-            name,
-            line,
-            symbols,
+        .map(|((path, line), (name, mut symbols))| {
+            // ahash RandomState 採用で HashMap の iteration 順序が非決定的になるため、
+            // 出力の安定性を保つため各 caller 内の symbols もソートする。
+            symbols.sort_unstable();
+            ImpactedCaller {
+                path,
+                name,
+                line,
+                symbols,
+            }
         })
         .collect();
     impacted_callers.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line.cmp(&b.line)));
