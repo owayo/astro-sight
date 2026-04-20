@@ -13,7 +13,7 @@ use crate::engine::{calls, diff, parser, refs, symbols};
 use crate::language::{LangId, normalize_identifier};
 use crate::models::call::CallEdge;
 use crate::models::impact::{
-    AffectedSymbol, ContextResult, DiffFile, FileImpact, HunkInfo, ImpactedCaller, SignatureChange,
+    AffectedSymbol, DiffFile, FileImpact, HunkInfo, ImpactedCaller, SignatureChange,
 };
 // `SymbolReference`/`RefKind` は旧実装で使用していたが、現在の visitor callback 化された
 // per-file Pass では `refs::RefVisitor` 経由で直接 callback を受け取るため直接参照はしない。
@@ -65,17 +65,6 @@ fn ci_key(lang: LangId, name: &str) -> String {
 /// candidate 保持を廃止し per-file で caller_map に即流すことで、worker ローカルの
 /// 中間バッファを `caller_map` のサイズ (数百MB) まで抑え、融合版で発生した
 /// fold 中の 1GB 級バッファ問題を排除する。
-pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
-    // 互換 API: streaming 版で各 FileImpact を Vec に集めて返す。
-    // 呼び出し側が全件 materialize を許容するケース（MCP/ライブラリ経由）で使う。
-    let mut changes = Vec::new();
-    analyze_impact_streaming(diff_input, dir, |impact| {
-        changes.push(impact);
-        Ok(())
-    })?;
-    Ok(ContextResult { changes })
-}
-
 /// `FileImpact` を 1 件生成するごとに `on_file_impact` callback に渡す streaming API。
 ///
 /// `Vec<FileImpact>` を全件 memory に貯めないため、呼び出し側（CLI）で JSON を 1 件ずつ
