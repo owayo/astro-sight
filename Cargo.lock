@@ -1898,7 +1898,6 @@ dependencies = [
 [[package]]
 name = "tree-sitter-xojo"
 version = "26.4.100"
-source = "git+https://github.com/owayo/tree-sitter-xojo.git?branch=main#045c52a6db5390da14d96c0e4804a6208552dc8f"
 dependencies = [
  "cc",
  "tree-sitter-language",
