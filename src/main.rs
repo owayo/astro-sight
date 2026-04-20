@@ -19,6 +19,13 @@ use astro_sight::service::AppService;
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+// それ以外では mimalloc を採用する。macOS の libmalloc は短命 heap の断片化が
+// 激しく、大規模リポジトリの impact 解析で RSS が数 GB に膨らむ主要因になるため。
+// mimalloc は thread-local caching と小オブジェクト合体でフットプリントを大きく抑える。
+#[cfg(not(feature = "dhat-heap"))]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------

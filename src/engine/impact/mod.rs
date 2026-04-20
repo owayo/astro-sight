@@ -82,7 +82,7 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
     }
 
     // Pass 2: per-file で Definition 集合と References を同時収集し、caller_maps に即流す
-    let (typed_caller_maps, def_paths_by_ix) = stream_caller_maps_and_defs(
+    let (typed_caller_maps, def_paths_by_ix, string_pool) = stream_caller_maps_and_defs(
         &file_contexts,
         &all_symbol_names,
         &sym_ix,
@@ -91,13 +91,16 @@ pub fn analyze_impact(diff_input: &str, dir: &Path) -> Result<ContextResult> {
         dir,
     );
 
-    // Pass 3: Stage 4b 適用 → sym_ix を剥がした最終 CallerMap に整形
+    // Pass 3: Stage 4b 適用 → interning ID を剥がした最終 CallerMap に整形
     let caller_maps = apply_stage4b(
         typed_caller_maps,
         &def_paths_by_ix,
+        &string_pool,
         &sym_ix,
         &method_parent_types,
+        &file_contexts,
     );
+    drop(string_pool);
     let changes = assemble_from_caller_maps(file_contexts, caller_maps);
     Ok(ContextResult { changes })
 }
@@ -262,9 +265,44 @@ fn is_same_source_file(ref_path: &str, source_path: &str) -> bool {
 
 type CallerMap = HashMap<(String, usize), (String, Vec<String>)>;
 
-/// Pass 2 内部用。caller_map の値に sym_ix を追加で持たせて Stage 4b を post-filter
-/// で正しく適用できるようにした中間表現。sym_ix は `u32` で軽量。
-type TypedCallerMap = HashMap<(String, usize), (String, Vec<(u32, String)>)>;
+/// 文字列の重複を取り除くための小さな interning pool。
+/// caller_map のキー (path)・caller_name・sym_name は同じ文字列が大量に繰り返されるため、
+/// `u32` の ID に置き換えて保持することで hashmap の key/value サイズと heap allocation
+/// 数を大幅に削減する。workers=1 の streaming Pass で使うことを想定し、内部状態は
+/// 単一スレッドから更新される前提（マルチ worker 利用時は `Mutex` で包んで使う）。
+#[derive(Default)]
+pub(crate) struct StringPool {
+    strings: Vec<String>,
+    index: HashMap<String, u32>,
+}
+
+impl StringPool {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// 文字列を登録し ID を返す。既存の文字列は再利用される。
+    fn intern(&mut self, s: &str) -> u32 {
+        if let Some(&id) = self.index.get(s) {
+            return id;
+        }
+        let id = self.strings.len() as u32;
+        let owned = s.to_string();
+        self.strings.push(owned.clone());
+        self.index.insert(owned, id);
+        id
+    }
+
+    /// ID に対応する文字列を返す。
+    fn get(&self, id: u32) -> &str {
+        &self.strings[id as usize]
+    }
+}
+
+/// Pass 2 内部用。caller_map の key と value を interned ID で保持する中間表現。
+///   key:   (path_id, line)
+///   value: (caller_name_id, Vec<(sym_ix, sym_name_id)>)
+type TypedCallerMap = HashMap<(u32, usize), (u32, Vec<(u32, u32)>)>;
 
 /// 1 チャンクの処理単位。大規模リポジトリで worker local state が肥大化するのを防ぐため、
 /// ファイルを `CHUNK_SIZE` 件ずつに区切り、各チャンクの fold/reduce が終わったら
@@ -297,7 +335,7 @@ fn stream_caller_maps_and_defs(
     method_parent_types: &HashMap<String, String>,
     included_symbols: &HashSet<String>,
     dir: &Path,
-) -> (Vec<TypedCallerMap>, Vec<Vec<String>>) {
+) -> (Vec<TypedCallerMap>, Vec<Vec<u32>>, StringPool) {
     let n_sym = all_symbol_names.len();
     let n_fc = file_contexts.len();
 
@@ -321,30 +359,41 @@ fn stream_caller_maps_and_defs(
         }
     }
 
+    let empty_result = || {
+        (
+            vec![TypedCallerMap::new(); n_fc],
+            vec![Vec::new(); n_sym],
+            StringPool::new(),
+        )
+    };
+
     let ac = match refs::build_ac_case_insensitive(all_symbol_names) {
         Ok(a) => a,
-        Err(_) => return (vec![TypedCallerMap::new(); n_fc], vec![Vec::new(); n_sym]),
+        Err(_) => return empty_result(),
     };
     let files = match refs::collect_files(dir, None) {
         Ok(f) => f,
-        Err(_) => return (vec![TypedCallerMap::new(); n_fc], vec![Vec::new(); n_sym]),
+        Err(_) => return empty_result(),
     };
 
     // rayon fold/reduce は worker local 集約 + reduce acc 併存でピーク RSS が 2x まで
     // 膨らむため、デフォルトは 1 worker (= fold バケット 1 個、ピーク 2x も小さい) とする。
     // 並列性を使いたい CI 環境などでは `ASTRO_SIGHT_IMPACT_WORKERS` で上書きできる。
     let worker_limit = impact_worker_count();
-    let pool = match rayon::ThreadPoolBuilder::new()
+    let rayon_pool = match rayon::ThreadPoolBuilder::new()
         .num_threads(worker_limit)
         .build()
     {
         Ok(p) => p,
-        Err(_) => return (vec![TypedCallerMap::new(); n_fc], vec![Vec::new(); n_sym]),
+        Err(_) => return empty_result(),
     };
+
+    // 全 chunk を通して 1 つの StringPool を共有する。workers=1 なら lock 競合は発生しない。
+    let string_pool = std::sync::Mutex::new(StringPool::new());
 
     type WorkerState = (
         Vec<TypedCallerMap>,
-        Vec<Vec<String>>,
+        Vec<Vec<u32>>,
         LruCache<String, Option<ParsedFile>>,
     );
     let init_state = || -> WorkerState {
@@ -358,10 +407,10 @@ fn stream_caller_maps_and_defs(
     };
 
     let mut global_maps: Vec<TypedCallerMap> = vec![TypedCallerMap::new(); n_fc];
-    let mut global_defs: Vec<Vec<String>> = vec![Vec::new(); n_sym];
+    let mut global_defs: Vec<Vec<u32>> = vec![Vec::new(); n_sym];
 
     for chunk in files.chunks(CHUNK_SIZE) {
-        let (chunk_maps, chunk_defs, _cache) = pool.install(|| {
+        let (chunk_maps, chunk_defs, _cache) = rayon_pool.install(|| {
             use rayon::prelude::*;
             chunk
                 .par_iter()
@@ -375,8 +424,15 @@ fn stream_caller_maps_and_defs(
                         if let Ok(visit) =
                             refs::visit_refs_and_defs_in_file(all_symbol_names, &ac, utf8_path)
                         {
-                            for ix in &visit.def_sym_indices {
-                                def_paths[*ix].push(path_str.to_string());
+                            if !visit.def_sym_indices.is_empty() {
+                                // Definition が 1 件でもあるファイルの path だけ intern する。
+                                let path_id = string_pool
+                                    .lock()
+                                    .expect("string pool mutex poisoned")
+                                    .intern(path_str);
+                                for ix in &visit.def_sym_indices {
+                                    def_paths[*ix].push(path_id);
+                                }
                             }
                             accumulate_caller_maps_per_file(
                                 &visit.refs_by_ix,
@@ -384,6 +440,7 @@ fn stream_caller_maps_and_defs(
                                 file_contexts,
                                 all_symbol_names,
                                 &parent_ix_by_sym,
+                                &string_pool,
                                 &mut local_maps,
                                 &mut target_cache,
                             );
@@ -410,7 +467,10 @@ fn stream_caller_maps_and_defs(
         }
     }
 
-    (global_maps, global_defs)
+    let pool = string_pool
+        .into_inner()
+        .expect("string pool mutex poisoned on unwrap");
+    (global_maps, global_defs, pool)
 }
 
 /// 2 つの `Vec<TypedCallerMap>` をエントリ単位で重複排除しつつ merge する。
@@ -430,8 +490,9 @@ fn merge_typed_maps(dst: &mut [TypedCallerMap], src: Vec<TypedCallerMap>) {
 }
 
 /// 1 ファイル分の `refs_by_ix` を走査し、Stage 1-6（Stage 4b を除く）を適用して
-/// `local_maps` に直接流す。SymbolReference Vec は呼び出し側で即 drop されるため、
-/// fold 中に保持される中間データは `TypedCallerMap` の成長分のみ。
+/// `local_maps` に直接流す。path / caller_name / sym_name はすべて `StringPool` で
+/// interning しておき、`u32` の ID として保持する（hashmap エントリのサイズと
+/// heap allocation 数を大幅に削減するため）。
 #[allow(clippy::too_many_arguments)]
 fn accumulate_caller_maps_per_file(
     refs_by_ix: &[Vec<SymbolReference>],
@@ -439,6 +500,7 @@ fn accumulate_caller_maps_per_file(
     file_contexts: &[FileContext],
     all_symbol_names: &[String],
     parent_ix_by_sym: &[Option<usize>],
+    pool: &std::sync::Mutex<StringPool>,
     local_maps: &mut [TypedCallerMap],
     target_cache: &mut LruCache<String, Option<ParsedFile>>,
 ) {
@@ -494,15 +556,25 @@ fn accumulate_caller_maps_per_file(
                     .and_then(extract_function_from_context)
                     .unwrap_or_else(|| affected_sym_name.clone());
 
-                let key = (r.path.clone(), r.line);
+                // pool への intern は 3 回分をまとめて 1 回の lock で行う。
+                let (path_id, caller_name_id, sym_name_id) = {
+                    let mut p = pool.lock().expect("string pool mutex poisoned");
+                    (
+                        p.intern(&r.path),
+                        p.intern(&caller_name),
+                        p.intern(&affected_sym_name),
+                    )
+                };
+
+                let ix_u32 = ix as u32;
+                let key = (path_id, r.line);
                 let entry = local_maps[fc_ix]
                     .entry(key)
-                    .or_insert_with(|| (caller_name, Vec::new()));
-                let ix_u32 = ix as u32;
-                if !entry.1.iter().any(|(existing_ix, existing_name)| {
-                    *existing_ix == ix_u32 && *existing_name == affected_sym_name
+                    .or_insert_with(|| (caller_name_id, Vec::new()));
+                if !entry.1.iter().any(|(existing_ix, existing_name_id)| {
+                    *existing_ix == ix_u32 && *existing_name_id == sym_name_id
                 }) {
-                    entry.1.push((ix_u32, affected_sym_name));
+                    entry.1.push((ix_u32, sym_name_id));
                 }
             }
         }
@@ -510,13 +582,15 @@ fn accumulate_caller_maps_per_file(
 }
 
 /// Pass 3: `TypedCallerMap` 集合に対して Stage 4b (competing definition) を post-filter
-/// として適用し、sym_ix を剥がした最終 `CallerMap` を返す。caller entry の sym_names が
-/// 空になった場合はその caller 自体を削除する。
+/// として適用し、interning ID を剥がした最終 `CallerMap` を返す。caller entry の
+/// sym_names が空になった場合はその caller 自体を削除する。
 fn apply_stage4b(
     typed_caller_maps: Vec<TypedCallerMap>,
-    def_paths_by_ix: &[Vec<String>],
+    def_paths_by_ix: &[Vec<u32>],
+    pool: &StringPool,
     sym_ix_by_name: &HashMap<String, usize>,
     method_parent_types: &HashMap<String, String>,
+    file_contexts: &[FileContext],
 ) -> Vec<CallerMap> {
     // sym_ix -> has_parent フラグ（Stage 4b はメソッド型スコーピングが有効なシンボルだけに適用）
     let mut has_parent_by_ix: HashMap<u32, bool> = HashMap::new();
@@ -528,27 +602,36 @@ fn apply_stage4b(
 
     typed_caller_maps
         .into_iter()
-        .map(|typed_map| {
+        .enumerate()
+        .map(|(fc_ix, typed_map)| {
+            let source_path = file_contexts
+                .get(fc_ix)
+                .map(|ctx| ctx.new_path.as_str())
+                .unwrap_or("");
             let mut out: CallerMap = HashMap::with_capacity(typed_map.len());
-            for (key, (caller_name, sym_entries)) in typed_map {
-                let source_path = &key.0;
+            for ((path_id, line), (caller_name_id, sym_entries)) in typed_map {
+                let path_str = pool.get(path_id).to_string();
+                let caller_name = pool.get(caller_name_id).to_string();
                 let mut kept: Vec<String> = Vec::with_capacity(sym_entries.len());
-                for (sym_ix_val, sym_name) in sym_entries {
+                for (sym_ix_val, sym_name_id) in sym_entries {
                     if *has_parent_by_ix.get(&sym_ix_val).unwrap_or(&false)
                         && let Some(paths) = def_paths_by_ix.get(sym_ix_val as usize)
                     {
-                        let has_competing_def =
-                            paths.iter().any(|p| !is_same_source_file(p, source_path));
+                        let has_competing_def = paths.iter().any(|&pid| {
+                            let p = pool.get(pid);
+                            !is_same_source_file(p, source_path)
+                        });
                         if has_competing_def {
                             continue;
                         }
                     }
+                    let sym_name = pool.get(sym_name_id).to_string();
                     if !kept.contains(&sym_name) {
                         kept.push(sym_name);
                     }
                 }
                 if !kept.is_empty() {
-                    out.insert(key, (caller_name, kept));
+                    out.insert((path_str, line), (caller_name, kept));
                 }
             }
             out
