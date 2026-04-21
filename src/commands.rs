@@ -1510,15 +1510,17 @@ fn extract_exported_symbols_from_git(
     let root = tree.root_node();
 
     let syms = crate::engine::symbols::extract_symbols(root, source, lang_id).ok()?;
-    // API 変更検出では trait impl も差分に含めたいので除外しない
-    Some(filter_exported_symbols(&syms, root, source, lang_id, false))
+    // Rust の `impl Trait for Type` 配下のメソッドは trait の実装事実であり、独立した
+    // 公開 API item ではない。module 移動など実体は維持したままの変更でも api.add / api.rm
+    // に誤計上されるのを避けるため、API 変更検出でも trait impl メソッドを除外する。
+    Some(filter_exported_symbols(&syms, root, source, lang_id, true))
 }
 
 fn extract_exported_symbols_from_file(
     dir: &str,
     file_path: &str,
 ) -> Option<Vec<(String, String, String)>> {
-    extract_exported_symbols_from_file_inner(dir, file_path, false)
+    extract_exported_symbols_from_file_inner(dir, file_path, true)
 }
 
 fn extract_dead_code_candidates_from_file(
@@ -1603,9 +1605,12 @@ fn filter_exported_symbols(
         if decl_line.contains("pub(") {
             continue;
         }
-        // Rust の trait impl メソッドは trait dispatch 経由で呼ばれ、
-        // cross-file refs 検索では caller を辿れない。dead-code 判定では
-        // 偽陽性になるためスキップする。API 変更検出では含める。
+        // Rust の `impl Trait for Type` 配下のメソッドは除外する。
+        //   - dead-code 判定: trait dispatch 経由で呼ばれるため cross-file refs で caller を
+        //     追跡できず、偽陽性になる。
+        //   - API 変更検出: trait メソッドの実装は公開 item ではなく実装事実のため、個別の
+        //     `on_ref` / `default` 等を api.add / api.rm にしない。必要であれば `impl Trait
+        //     for Type` 単位で差分を扱うべきで、メソッド単位では扱わない。
         if exclude_trait_impls
             && lang_id == crate::language::LangId::Rust
             && crate::engine::symbols::is_trait_impl_method_rust(root, &sym.range)
@@ -3067,6 +3072,84 @@ def new_public_api():
             removed_farewell.unwrap().file,
             "src/old.rs",
             "削除シンボルの file は旧パス (old_path) であるべき"
+        );
+    }
+
+    #[test]
+    fn detect_api_changes_ignores_moved_trait_impl_methods() {
+        // Rust の `impl Trait for Type` 配下の trait メソッドは実装事実であり、
+        // 独立した公開 API item として扱うべきではない。`impl` ブロックをファイル間で
+        // 移動しただけで `api.rm` / `api.add` に出るのは誤検出。
+        // 本テストは mod.rs を複数サブモジュールに分割する際に `on_ref` / `default` が
+        // api.rm へ漏れ出していた実例 (2026-04-21 トリアージ) の回帰防止。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        // 初期: a.rs に struct Foo と impl Default for Foo
+        git_commit_files(
+            repo,
+            &[(
+                "src/a.rs",
+                "pub struct Foo;\n\nimpl Default for Foo {\n    fn default() -> Self {\n        Self\n    }\n}\n",
+            )],
+            "initial",
+        );
+
+        // 変更: impl Default for Foo を b.rs に移動 (struct は a.rs に残す)
+        fs::write(repo.join("src/a.rs"), "pub struct Foo;\n").expect("rewrite a.rs");
+        fs::write(
+            repo.join("src/b.rs"),
+            "use super::a::Foo;\n\nimpl Default for Foo {\n    fn default() -> Self {\n        Self\n    }\n}\n",
+        )
+        .expect("write b.rs");
+
+        let diff_files = vec![
+            crate::models::impact::DiffFile {
+                old_path: "src/a.rs".to_string(),
+                new_path: "src/a.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 7,
+                    new_start: 1,
+                    new_count: 1,
+                }],
+            },
+            crate::models::impact::DiffFile {
+                old_path: "/dev/null".to_string(),
+                new_path: "src/b.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 0,
+                    old_count: 0,
+                    new_start: 1,
+                    new_count: 7,
+                }],
+            },
+        ];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed_has_default = api_changes
+            .removed
+            .iter()
+            .any(|s| s.name.ends_with("default"));
+        let added_has_default = api_changes
+            .added
+            .iter()
+            .any(|s| s.name.ends_with("default"));
+
+        assert!(
+            !removed_has_default,
+            "impl Default for Foo の default メソッドは trait impl であり \
+             api.rm に計上すべきでない。got removed: {:?}",
+            api_changes.removed
+        );
+        assert!(
+            !added_has_default,
+            "impl Default for Foo の default メソッドは trait impl であり \
+             api.add に計上すべきでない。got added: {:?}",
+            api_changes.added
         );
     }
 
