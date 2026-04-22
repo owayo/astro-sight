@@ -860,7 +860,16 @@ fn empty_review_result() -> ReviewResult {
     }
 }
 
-fn build_review_hook_json(result: &ReviewResult, dir: &str) -> Option<serde_json::Value> {
+/// `--hook` の出力判定結果。
+/// - `value`: stderr に書き出す JSON (何もなければ None)
+/// - `is_blocking`: exit 1 にして Stop hook を止めるべきか。cochange だけは informational
+///   として block しない (レポート 2026-04-11-cochange-new-repo-initial-commit-noise.md の提案)
+struct HookJsonBuild {
+    value: Option<serde_json::Value>,
+    is_blocking: bool,
+}
+
+fn build_review_hook_json(result: &ReviewResult, dir: &str) -> HookJsonBuild {
     #[derive(Default)]
     struct HookImpactGroup {
         changed_symbols: std::collections::BTreeSet<String>,
@@ -935,11 +944,15 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> Option<serde_json
 
     // 空セクションは省略した compact JSON を構築
     let mut hook_obj = serde_json::Map::new();
-    let mut has_issues = false;
+    // has_blocking_issues: Stop hook を止めるべき重要な検出 (impacts / api / dead)
+    // has_any_output: 出力すべき検出 (上記 + cochange)
+    let mut has_blocking_issues = false;
+    let mut has_any_output = false;
 
     // impacts: [{src,syms,refs:[{p,ln,s}]}]
     if !unresolved.is_empty() {
-        has_issues = true;
+        has_blocking_issues = true;
+        has_any_output = true;
         let impacts: Vec<serde_json::Value> = unresolved
             .iter()
             .map(|(changed_path, group)| {
@@ -973,9 +986,9 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> Option<serde_json
         hook_obj.insert("impacts".into(), serde_json::Value::Array(impacts));
     }
 
-    // cochange: [{f,w,c}]
+    // cochange: [{f,w,c}] — 情報提供のみ。is_blocking にはしない
     if !result.missing_cochanges.is_empty() {
-        has_issues = true;
+        has_any_output = true;
         let cochanges: Vec<serde_json::Value> = result
             .missing_cochanges
             .iter()
@@ -995,7 +1008,8 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> Option<serde_json
         || !result.api_changes.removed.is_empty()
         || !result.api_changes.modified.is_empty();
     if has_api_changes {
-        has_issues = true;
+        has_blocking_issues = true;
+        has_any_output = true;
         let mut api = serde_json::Map::new();
         if !result.api_changes.added.is_empty() {
             api.insert(
@@ -1041,7 +1055,8 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> Option<serde_json
 
     // dead: [{n,f}]
     if !result.dead_symbols.is_empty() {
-        has_issues = true;
+        has_blocking_issues = true;
+        has_any_output = true;
         let dead: Vec<serde_json::Value> = result
             .dead_symbols
             .iter()
@@ -1050,8 +1065,11 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> Option<serde_json
         hook_obj.insert("dead".into(), serde_json::Value::Array(dead));
     }
 
-    if !has_issues {
-        return None;
+    if !has_any_output {
+        return HookJsonBuild {
+            value: None,
+            is_blocking: false,
+        };
     }
 
     hook_obj.insert(
@@ -1059,17 +1077,26 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> Option<serde_json
         serde_json::Value::String("False positives? Run astro-sight-triage skill.".into()),
     );
 
-    Some(serde_json::Value::Object(hook_obj))
+    HookJsonBuild {
+        value: Some(serde_json::Value::Object(hook_obj)),
+        is_blocking: has_blocking_issues,
+    }
 }
 
-/// --hook 時の review 出力: compact JSON を stderr に出力し exit 1
+/// --hook 時の review 出力: compact JSON を stderr に出力する。
+/// blocking な検出 (impacts / api / dead) があれば exit 1、
+/// cochange のみの informational な出力は exit 0 にして Stop hook を止めない。
 fn review_hook_output(result: &ReviewResult, dir: &str) -> Result<()> {
-    let Some(hook_output) = build_review_hook_json(result, dir) else {
+    let build = build_review_hook_json(result, dir);
+    let Some(hook_output) = build.value else {
         return Ok(());
     };
 
     eprintln!("{hook_output}");
-    std::process::exit(1);
+    if build.is_blocking {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// 依存マニフェストとロックファイルの既知ペア。
@@ -3794,14 +3821,75 @@ def new_public_api():
     fn build_review_hook_json_returns_none_when_no_issues() {
         let dir = tempfile::tempdir().expect("tempdir");
 
+        let build = build_review_hook_json(
+            &empty_review_result(),
+            dir.path().to_str().expect("utf-8 path"),
+        );
         assert!(
-            build_review_hook_json(
-                &empty_review_result(),
-                dir.path().to_str().expect("utf-8 path")
-            )
-            .is_none(),
+            build.value.is_none(),
             "問題がない review 結果では hook JSON を生成しないべき"
         );
+        assert!(!build.is_blocking, "出力なしなら blocking にしないべき");
+    }
+
+    /// cochange のみの場合は出力はするが exit 1 にはしない (informational)
+    #[test]
+    fn build_review_hook_json_cochange_only_is_informational() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let result = ReviewResult {
+            impact: crate::models::impact::ContextResult {
+                changes: Vec::new(),
+            },
+            missing_cochanges: vec![MissingCochange {
+                file: "a.rs".to_string(),
+                expected_with: "b.rs".to_string(),
+                confidence: 0.9,
+            }],
+            api_changes: ApiChanges {
+                added: Vec::new(),
+                removed: Vec::new(),
+                modified: Vec::new(),
+            },
+            dead_symbols: Vec::new(),
+        };
+
+        let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
+        assert!(
+            build.value.is_some(),
+            "cochange は情報提供として JSON 出力はするべき"
+        );
+        assert!(
+            !build.is_blocking,
+            "cochange のみの場合は Stop hook を止めないべき"
+        );
+    }
+
+    /// api.add があれば blocking になる
+    #[test]
+    fn build_review_hook_json_api_changes_are_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let result = ReviewResult {
+            impact: crate::models::impact::ContextResult {
+                changes: Vec::new(),
+            },
+            missing_cochanges: Vec::new(),
+            api_changes: ApiChanges {
+                added: vec![ApiSymbol {
+                    name: "foo".to_string(),
+                    kind: "function".to_string(),
+                    file: "a.rs".to_string(),
+                }],
+                removed: Vec::new(),
+                modified: Vec::new(),
+            },
+            dead_symbols: Vec::new(),
+        };
+
+        let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
+        assert!(build.value.is_some(), "api.add は hook JSON に出すべき");
+        assert!(build.is_blocking, "api.add があれば blocking にすべき");
     }
 
     #[test]
@@ -3840,8 +3928,9 @@ def new_public_api():
             dead_symbols: Vec::new(),
         };
 
-        let hook_json = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"))
-            .expect("hook json should be generated");
+        let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
+        let hook_json = build.value.expect("hook json should be generated");
+        assert!(build.is_blocking, "impacts があれば blocking にすべき");
         let impacts = hook_json["impacts"]
             .as_array()
             .expect("impacts should be an array");

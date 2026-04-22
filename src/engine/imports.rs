@@ -160,7 +160,18 @@ fn import_query(lang_id: LangId) -> (&'static str, ImportKind) {
             r#"(import_declaration (identifier) @import.source)"#,
             ImportKind::Import,
         ),
-        LangId::Bash => ("", ImportKind::Import), // 非対応
+        LangId::Bash => (
+            // bash の `source <path>` / `. <path>` によるファイル読み込みを import として扱う。
+            // 最初の word/string 引数を source として抽出する (アンカー `.` で command_name
+            // 直後のもののみ)。
+            r#"
+            (command
+              name: (command_name (word) @_cmd) .
+              argument: [(word) (string) (raw_string)] @import.source
+              (#match? @_cmd "^(source|\\.)$"))
+            "#,
+            ImportKind::Import,
+        ),
         LangId::Zig => (
             r#"
             (builtin_function
@@ -233,15 +244,39 @@ mod tests {
         assert_eq!(imports[1].kind, ImportKind::Require);
     }
 
-    /// Bash は非対応で空リストを返す
+    /// Bash の `source <file>` と `. <file>` をファイル読み込み import として抽出する
     #[test]
-    fn extract_imports_bash_returns_empty() {
-        let source = b"#!/bin/bash\nsource ./helper.sh\n";
+    fn extract_imports_bash_source_and_dot() {
+        let source = b"#!/bin/bash\n\
+source ./helper.sh\n\
+. ./utils.sh\n\
+source \"./quoted.sh\"\n\
+echo not_source\n";
         let tree = parser::parse_source(source, LangId::Bash).unwrap();
         let root = tree.root_node();
 
         let imports = extract_imports(root, source, LangId::Bash).unwrap();
-        assert!(imports.is_empty());
+        let sources: Vec<String> = imports
+            .iter()
+            .map(|i| i.source.trim_matches('"').to_string())
+            .collect();
+        assert!(
+            sources.contains(&"./helper.sh".to_string()),
+            "source <file> を import として拾うべき: {sources:?}"
+        );
+        assert!(
+            sources.contains(&"./utils.sh".to_string()),
+            ". <file> (source の短縮形) を import として拾うべき: {sources:?}"
+        );
+        assert!(
+            sources.iter().any(|s| s.contains("quoted.sh")),
+            "クォート付きパスも拾うべき: {sources:?}"
+        );
+        // 通常のコマンドは import に含めない
+        assert!(
+            !sources.iter().any(|s| s == "not_source"),
+            "通常コマンドの引数は import に入ってはならない: {sources:?}"
+        );
     }
 
     /// Go の import が正しく抽出される
