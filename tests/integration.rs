@@ -2101,6 +2101,77 @@ class DnsPacketTest {
     );
 }
 
+/// 新規クレートで `pub mod foo; pub mod bar;` のようなモジュール宣言のみを
+/// 追加した場合、他クレート内で同名のローカル変数 (`tensor` / `ops` 等) が
+/// impact に巻き添えで紐付かないことを確認する。モジュール名は
+/// `should_include_for_cross_file` の段階で除外される。
+/// (レポート triage-ocrus-nn-impact.md の再現)
+#[test]
+fn impact_module_declaration_no_cross_file_false_positive() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let nn_dir = dir.path().join("crates/ocrus-nn/src");
+    let cli_dir = dir.path().join("crates/ocrus-cli/src");
+    std::fs::create_dir_all(&nn_dir).unwrap();
+    std::fs::create_dir_all(&cli_dir).unwrap();
+
+    std::fs::write(nn_dir.join("lib.rs"), "// empty\n").unwrap();
+    // consumer 側に tensor / ops という名前のローカル変数 / クロージャ引数を持つコード
+    std::fs::write(
+        cli_dir.join("main.rs"),
+        r#"fn char_accuracy() {
+    let tensor = normalize_line();
+    let _shape = tensor.shape();
+    for (_i, tensor) in [1, 2].iter().enumerate() {
+        let _ = tensor;
+    }
+    let ops: Vec<u8> = vec![];
+    let _ = ops;
+}
+fn normalize_line() -> Vec<u8> { vec![] }
+"#,
+    )
+    .unwrap();
+    // 新規モジュール宣言を追加する diff
+    let diff = r#"--- a/crates/ocrus-nn/src/lib.rs
++++ b/crates/ocrus-nn/src/lib.rs
+@@ -1 +1,3 @@
+-// empty
++pub mod arena;
++pub mod ops;
++pub mod tensor;
+"#;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["impact", "--dir", dir.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn impact");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "expected exit 0 (module 宣言追加は impact を出さない).\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("main.rs"),
+        "consumer 側のローカル変数 tensor/ops は impact に載せてはならない: {stderr}"
+    );
+}
+
 #[test]
 fn impact_trait_unchanged_no_false_positive() {
     use std::io::Write;
