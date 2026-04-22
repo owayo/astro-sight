@@ -1646,6 +1646,12 @@ fn filter_exported_symbols(
 
     let mut result = Vec::new();
     for sym in syms {
+        // モジュール宣言 (`pub mod foo;`) はファイル構成の整理であり、
+        // 公開 API 面としての意味は薄い。dead-code / api.add 両経路で除外する
+        // (Rust `mod`, Python の module、他言語の同等表現)。
+        if matches!(sym.kind, SymbolKind::Module) {
+            continue;
+        }
         if !crate::engine::symbols::is_symbol_exported(root, source, lang_id, &sym.range) {
             continue;
         }
