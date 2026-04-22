@@ -2101,6 +2101,72 @@ class DnsPacketTest {
     );
 }
 
+/// Rust の `pub use submodule::Foo;` で再エクスポートしているだけのファイルは、
+/// エクスポート元シンボルの body-only 変更で impact に載せてはならない。
+/// (R7 の TypeScript `export from` と同等、Rust 版の回帰ガード)
+#[test]
+fn impact_rust_pub_use_reexport_no_false_positive() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let inner_rs = dir.path().join("inner.rs");
+    let lib_rs = dir.path().join("lib.rs");
+
+    std::fs::write(
+        &inner_rs,
+        r#"pub fn do_work(x: i32) -> i32 {
+    x + 1
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &lib_rs,
+        r#"pub mod inner;
+pub use inner::do_work;
+"#,
+    )
+    .unwrap();
+
+    // do_work の body のみ変更 (シグネチャは不変)
+    let diff = r#"--- a/inner.rs
++++ b/inner.rs
+@@ -1,3 +1,4 @@
+ pub fn do_work(x: i32) -> i32 {
+-    x + 1
++    let y = x;
++    y + 1
+ }
+"#;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["impact", "--dir", dir.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn impact");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "expected exit 0.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("lib.rs"),
+        "`pub use` 再エクスポートのみの行は impact に載せてはならない: {stderr}"
+    );
+}
+
 /// 新規クレートで `pub mod foo; pub mod bar;` のようなモジュール宣言のみを
 /// 追加した場合、他クレート内で同名のローカル変数 (`tensor` / `ops` 等) が
 /// impact に巻き添えで紐付かないことを確認する。モジュール名は

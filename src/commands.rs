@@ -2738,6 +2738,56 @@ def new_public_api():
         );
     }
 
+    /// Rust の `pub mod foo;` 宣言追加は api.add に出してはならない。
+    /// モジュール宣言はファイル構成の整理であり、公開 API 面としての意味が薄いため
+    /// `filter_exported_symbols` で `SymbolKind::Module` を除外している。
+    /// (Stop hook 改善時に導入。`extract_all_callees` 追加コミットで Stop hook が
+    /// `pub mod generated;` を api.add 通知した問題の再発防止)
+    #[test]
+    fn detect_api_changes_skips_module_declaration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let before = "\
+pub mod existing;
+pub fn hello() {}
+";
+        git_commit_files(repo, &[("src/lib.rs", before)], "initial");
+
+        // 新規モジュール宣言を追加 (副ファイルは存在しなくても tree-sitter パースには影響しない)
+        let after = "\
+pub mod existing;
+pub mod generated;
+pub fn hello() {}
+";
+        fs::write(repo.join("src/lib.rs"), after).expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/lib.rs".to_string(),
+            new_path: "src/lib.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 2,
+                new_start: 1,
+                new_count: 3,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let added: Vec<&str> = api_changes.added.iter().map(|s| s.name.as_str()).collect();
+
+        assert!(
+            !added.contains(&"generated"),
+            "pub mod 追加は api.add に出してはならない。got: {added:?}"
+        );
+        assert!(
+            !added.contains(&"existing"),
+            "既存 pub mod も api.add に出してはならない。got: {added:?}"
+        );
+    }
+
     /// Rust の `pub struct` へ private フィールドを追加しただけでは api.mod に出ない。
     /// 宣言行 (`pub struct Foo {`) は変わらず、本体 (フィールド) の変更のため
     /// `extract_api_signature` が宣言行のみを見る既存のロジックで自然に除外される。

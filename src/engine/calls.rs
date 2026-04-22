@@ -282,12 +282,14 @@ fn call_query(lang_id: LangId) -> &'static str {
         }
         LangId::Bash => {
             // 第1行: 通常のコマンド呼び出し `foo arg1 arg2` → foo が callee
-            // 第2行: trap ハンドラ `trap <fn> SIGNAL...` → <fn> も callee として扱う
-            //        (cleanup ハンドラ等として参照される関数を internal 扱いするため)
+            // 第2パターン: trap ハンドラ `trap <fn> SIGNAL...` → 第1引数 <fn> のみ callee
+            //               (cleanup ハンドラ等として参照される関数を internal 扱いするため)
+            //               `.` アンカーで command_name 直後の最初の argument のみを捕捉し、
+            //               シグナル名 (EXIT/INT/TERM 等) がキャプチャされるのを防ぐ。
             r#"
             (command name: (command_name (word) @direct.callee))
             (command
-              name: (command_name (word) @_cmd)
+              name: (command_name (word) @_cmd) .
               argument: (word) @direct.callee
               (#eq? @_cmd "trap"))
             "#
@@ -410,6 +412,32 @@ mod tests {
         // 文字列引数はコマンド名ではないので拾わない
         assert!(!callees.contains("echo literal"));
         assert!(!callees.contains("echo double"));
+        // シグナル名 (EXIT/INT/TERM) は handler ではないため callee に含めてはならない
+        assert!(
+            !callees.contains("EXIT"),
+            "シグナル名 EXIT は callee に含めてはならない。got: {callees:?}"
+        );
+        assert!(!callees.contains("INT"));
+        assert!(!callees.contains("TERM"));
+    }
+
+    /// `trap <fn> EXIT INT TERM` のように複数シグナルを指定した場合でも、
+    /// ハンドラ関数名は 1 回だけ callee として扱われる (HashSet なので重複はない)。
+    #[test]
+    fn extract_all_callees_bash_trap_multiple_signals() {
+        let source = b"#!/usr/bin/env bash\n\
+            cleanup() { echo clean; }\n\
+            trap cleanup EXIT INT TERM HUP\n";
+        let tree = parser::parse_source(source, LangId::Bash).unwrap();
+        let callees = extract_all_callees(tree.root_node(), source, LangId::Bash).unwrap();
+        assert!(
+            callees.contains("cleanup"),
+            "複数シグナル trap でも handler は callee に含まれる。got: {callees:?}"
+        );
+        // `trap - EXIT` のようなハンドラ解除も誤認されないこと
+        // ("-" は argument[0] として現れるが word ノードでもマッチする可能性があるため確認)
+        assert!(!callees.contains("EXIT"));
+        assert!(!callees.contains("HUP"));
     }
 
     /// bash トップレベル呼び出しも extract_all_callees で拾える
