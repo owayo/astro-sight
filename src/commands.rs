@@ -1298,6 +1298,17 @@ fn detect_api_changes(
                 && old_sig != &new_sig.as_str()
                 && seen_modified.insert((df.new_path.clone(), name.clone()))
             {
+                // closed-in-diff: 同一ファイル内でしか呼ばれていない関数のシグネチャ変更は
+                // caller の追随が同一 diff 内で完結するため、api.mod から除外する。
+                // bash エントリポイントのローカル関数や Python CLI スクリプト内部関数の
+                // シグネチャ変更がレビューノイズになる問題への対策。
+                // added 側の `is_internally_connected` フィルタと対称。
+                if is_internally_connected(&in_file_callees, name)
+                    && !has_cross_file_refs(dir, &df.new_path, name)
+                {
+                    continue;
+                }
+
                 modified.push(ApiSymbolChange {
                     name: name.clone(),
                     kind: kind.clone(),
@@ -1670,6 +1681,26 @@ fn is_internally_connected(callees: &std::collections::HashSet<String>, qualname
         return true;
     }
     false
+}
+
+/// `name` が `file_path` 以外のファイルから参照されているかを判定する。
+/// 参照検索に失敗した場合は保守的に true（＝外部参照ありとみなす）を返し、
+/// modified の除外を抑止する（false positive を恐れて false negative を起こさない方針）。
+///
+/// `file_path` は `dir` からの相対パスを想定する。`find_references` の出力も
+/// `dir` 相対なので `Path` 単位で比較する。
+fn has_cross_file_refs(dir: &str, file_path: &str, name: &str) -> bool {
+    use std::path::Path;
+
+    let service = AppService::new();
+    let Ok(refs_result) = service.find_references(name, dir, None) else {
+        return true;
+    };
+    let self_path = Path::new(file_path);
+    refs_result
+        .references
+        .iter()
+        .any(|r| Path::new(r.path.as_str()) != self_path)
 }
 
 /// `sym` の range を内包する最も内側の container (class/struct/trait/interface/enum) を返す。
@@ -2840,6 +2871,182 @@ def main():\n    helper()\n    print(\"hi\")\n";
         assert!(
             !added.contains(&"helper"),
             "同一ファイル内で呼ばれている Python 関数は api.add に出してはならない。got: {added:?}"
+        );
+    }
+
+    /// Python CLI スクリプト（同一ファイル内でのみ呼ばれる関数）のシグネチャ変更は
+    /// caller が同じ diff 内で追随できるため api.mod に出さない。
+    /// (レポート 2026-04-22-closed-in-diff-signature-change-noise.md の再現)
+    #[test]
+    fn detect_api_changes_python_cli_signature_change_not_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let before = "\
+def run_osv_scanner(path: str) -> int:
+    return 0
+
+
+def scan_worktree(path: str) -> int:
+    rc = run_osv_scanner(path)
+    return rc
+
+
+if __name__ == \"__main__\":
+    scan_worktree(\".\")
+";
+        git_commit_files(repo, &[("osv_scan.py", before)], "initial");
+
+        // run_osv_scanner の戻り値型を int -> tuple[int, float] に変更。
+        // caller (scan_worktree) も同じ diff 内で追随する。
+        let after = "\
+def run_osv_scanner(path: str) -> tuple[int, float]:
+    return (0, 0.0)
+
+
+def scan_worktree(path: str) -> int:
+    _rc, _elapsed = run_osv_scanner(path)
+    return _rc
+
+
+if __name__ == \"__main__\":
+    scan_worktree(\".\")
+";
+        fs::write(repo.join("osv_scan.py"), after).expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "osv_scan.py".to_string(),
+            new_path: "osv_scan.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 11,
+                new_start: 1,
+                new_count: 11,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let mod_names: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !mod_names.contains(&"run_osv_scanner"),
+            "同一ファイル内でのみ呼ばれる関数のシグネチャ変更は api.mod に出してはならない。got: {mod_names:?}"
+        );
+    }
+
+    /// Bash の内部ヘルパー関数（同一ファイル内でのみ呼ばれる）のシグネチャ変更も
+    /// api.mod に出さない（パターン A と対称）。
+    #[test]
+    fn detect_api_changes_bash_internal_signature_change_not_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let before = "#!/usr/bin/env bash\n\
+timed() {\n    \"$@\"\n}\n\n\
+main() {\n    timed echo hi\n}\nmain\n";
+        git_commit_files(repo, &[("run.sh", before)], "initial");
+
+        // timed の宣言行を変更（シグネチャ変更相当）
+        let after = "#!/usr/bin/env bash\n\
+timed() { # wrap with timing\n    \"$@\"\n}\n\n\
+main() {\n    timed echo hi\n}\nmain\n";
+        fs::write(repo.join("run.sh"), after).expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "run.sh".to_string(),
+            new_path: "run.sh".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 2,
+                old_count: 1,
+                new_start: 2,
+                new_count: 1,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let mod_names: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !mod_names.contains(&"timed"),
+            "同一ファイル内でのみ呼ばれる bash 関数のシグネチャ変更は api.mod に出してはならない。got: {mod_names:?}"
+        );
+    }
+
+    /// 他ファイルから参照される関数のシグネチャ変更は api.mod に残す（false negative 防止）。
+    /// 同一ファイル内でも呼び出しが存在するが、他ファイルから import/call されている場合は
+    /// closed-in-diff とは言えないため、レビュー対象として残す必要がある。
+    #[test]
+    fn detect_api_changes_externally_called_signature_change_is_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let lib_before = "\
+def run(value: int) -> int:
+    return value
+
+
+def wrapper() -> int:
+    return run(1)
+";
+        let caller_before = "\
+from lib import run
+
+
+def main() -> int:
+    return run(2)
+";
+        git_commit_files(
+            repo,
+            &[("lib.py", lib_before), ("caller.py", caller_before)],
+            "initial",
+        );
+
+        // lib.run のシグネチャを変更（引数追加）。caller.py は diff に含まれない（追随なし）。
+        let lib_after = "\
+def run(value: int, flag: bool = False) -> int:
+    return value
+
+
+def wrapper() -> int:
+    return run(1, False)
+";
+        fs::write(repo.join("lib.py"), lib_after).expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "lib.py".to_string(),
+            new_path: "lib.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 6,
+                new_start: 1,
+                new_count: 6,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let mod_names: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            mod_names.contains(&"run"),
+            "他ファイルから参照される関数のシグネチャ変更は api.mod に残すべき。got: {mod_names:?}"
         );
     }
 
