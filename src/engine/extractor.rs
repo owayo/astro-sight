@@ -158,9 +158,46 @@ fn dedent(s: &str) -> String {
     result.replace('\t', " ")
 }
 
+const MAX_AST_TEXT_LEN: usize = 256;
+const MAX_AST_TEXT_SCAN_LEN: usize = MAX_AST_TEXT_LEN * 4;
+
+fn truncate_ast_text(s: &str, force_ellipsis: bool) -> String {
+    if s.len() <= MAX_AST_TEXT_LEN {
+        if force_ellipsis {
+            format!("{s}...")
+        } else {
+            s.to_string()
+        }
+    } else {
+        let truncated = &s[..s.floor_char_boundary(MAX_AST_TEXT_LEN)];
+        format!("{truncated}...")
+    }
+}
+
+fn preview_prefix(s: &str, limit: usize) -> (&str, bool) {
+    if s.len() <= limit {
+        (s, false)
+    } else {
+        (&s[..s.floor_char_boundary(limit)], true)
+    }
+}
+
+fn normalize_ast_text(s: &str) -> String {
+    if s.contains('\n') {
+        let (preview, was_cut) = preview_prefix(s, MAX_AST_TEXT_SCAN_LEN);
+        truncate_ast_text(&dedent(preview), was_cut)
+    } else if s.len() <= MAX_AST_TEXT_LEN {
+        s.replace('\t', " ")
+    } else {
+        // 単一巨大行は先頭だけを取り込み、無制限コピーを避ける。
+        let truncated = &s[..s.floor_char_boundary(MAX_AST_TEXT_LEN)];
+        format!("{}...", truncated.replace('\t', " "))
+    }
+}
+
 fn node_to_ast(node: Node<'_>, source: &[u8], remaining_depth: usize) -> AstNode {
     let text = if node.child_count() == 0 || remaining_depth == 0 {
-        node.utf8_text(source).ok().map(dedent)
+        node.utf8_text(source).ok().map(normalize_ast_text)
     } else {
         None
     };
@@ -375,6 +412,35 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert!(nodes[0].text.is_some());
         assert!(nodes[0].children.is_empty());
+    }
+
+    /// depth=0 の text は長大行でも上限で切り詰められる
+    #[test]
+    fn extract_full_depth_zero_truncates_long_text() {
+        let source = format!("fn foo() {{ let s = \"{}\"; }}", "x".repeat(512));
+        let tree = parse_rust_source(&source);
+        let root = tree.root_node();
+        let nodes = extract_full(root, source.as_bytes(), 0);
+        let text = nodes[0].text.as_deref().expect("text");
+
+        assert!(text.ends_with("..."));
+        assert!(text.len() <= MAX_AST_TEXT_LEN + 3);
+    }
+
+    /// depth=0 の複数行 text も巨大入力を丸ごとコピーせず上限で切り詰める
+    #[test]
+    fn extract_full_depth_zero_truncates_long_multiline_text() {
+        let body = (0..64)
+            .map(|_| format!("    let s = \"{}\";\n", "y".repeat(32)))
+            .collect::<String>();
+        let source = format!("fn foo() {{\n{body}}}\n");
+        let tree = parse_rust_source(&source);
+        let root = tree.root_node();
+        let nodes = extract_full(root, source.as_bytes(), 0);
+        let text = nodes[0].text.as_deref().expect("text");
+
+        assert!(text.ends_with("..."));
+        assert!(text.len() <= MAX_AST_TEXT_LEN + 3);
     }
 
     // --- node_to_ast テスト ---

@@ -94,6 +94,30 @@ astro-sight symbols --path src/main.rs
 astro-sight symbols --pretty --path src/main.rs
 ```
 
+### エージェント向けレビュー手順
+
+```bash
+# 1. diff 全体は review から入る
+astro-sight review --dir . --git
+
+# 2. 編集前後は context / impact を対にする
+astro-sight context --dir . --git
+astro-sight impact --dir . --git
+
+# 3. 構造把握は symbols、識別子参照は refs
+astro-sight symbols --path src/main.rs
+astro-sight refs --name "AppService" --dir src/
+
+# 4. exact node が欲しいときだけ ast へ上げる
+astro-sight ast --path src/main.rs --line 10 --col 0
+
+# 5. 2 個以上の mixed query は session にまとめる
+printf '%s\n' \
+  '{"command":"symbols","path":"src/main.rs"}' \
+  '{"command":"refs","name":"AppService","dir":"src"}' \
+  | astro-sight session
+```
+
 ### ast - AST 断片抽出
 
 ```bash
@@ -109,6 +133,8 @@ astro-sight ast --path src/main.rs
 # 深さとコンテキスト行数を指定
 astro-sight ast --path src/main.rs --line 10 --col 0 --depth 5 --context 5
 ```
+
+`text` と `snippet` は 256 文字上限で切り詰められるため、minified/生成コードの巨大行でも応答サイズが暴れにくい。
 
 ### symbols - シンボル抽出
 

@@ -222,6 +222,8 @@ impl AppService {
 
         let source_str = std::str::from_utf8(&source).unwrap_or("");
         let snip = match (p.line, p.end_line) {
+            // AST 抽出時の text/snippet は長大行を内部で切り詰め、minified/生成コードでも
+            // JSON 応答サイズが跳ね上がらないようにする。
             (Some(l), Some(el)) => Some(snippet::generate_range_snippet(
                 source_str,
                 l,

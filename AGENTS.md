@@ -10,6 +10,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - **clap derive** による CLI 引数パーサー
 - **NDJSON** ストリーミングセッション対応
 - **スマートコンテキスト**（diff→影響分析、バッチ参照検索 O(N+S)）
+- **AST 応答の巨大行抑制**（`ast` の `text` / `snippet` は 256 文字上限で切り詰め、巨大行で応答が肥大化しない）
 - **MCP サーバーモード**（rmcp 1.4 による stdio JSON-RPC 2.0、ワークスペースサンドボックス、11 ツール）
 - **デフォルト compact JSON** 出力（`--pretty` で整形出力）
 - **バッチ処理**（`--paths` / `--paths-file` で複数ファイル NDJSON 出力）
@@ -57,6 +58,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - diff / PR 全体のレビュー依頼では、個別コマンドを積み上げる前に `astro-sight review --dir . --git` で全体像を確認する
 - diff 全体の一括レビューでは `astro-sight review --dir . --git` も併用し、影響・共変更・API 差分・死蔵シンボルをまとめて確認する
 - 公開 API や export を触った変更では `astro-sight dead-code --dir . --git` も併用して死蔵シンボルを確認する
+- 複数の `astro-sight` クエリを連続で投げる場合は `session` を優先し、プロセス起動コストを抑える
 - 繰り返しの構造ルール確認には `astro-sight lint --path <file> --rules <rules.yaml>` を使い、アドホックなテキスト検索で代用しない
 - コードコメントは必要な箇所にだけ付け、付ける場合は日本語で簡潔に記述する
 

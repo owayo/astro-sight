@@ -1,6 +1,6 @@
 ---
 name: astro-sight
-description: "STOP before using Grep for code identifiers (function/class/variable/type/constant/method names, including pipe-separated patterns like FOO|Bar). Use astro-sight `refs` for identifier search, `review` for diff/PR review, `context`/`impact` around edits, `dead-code` for exported symbol cleanup, and `symbols`/`calls`/`imports`/`lint`/`cochange`/`sequence`/`session` for structural analysis via tree-sitter AST."
+description: "STOP before using Grep for code identifiers (function/class/variable/type/constant/method names, including pipe-separated patterns like FOO|Bar). Use astro-sight `refs` for identifier search, `review` for diff/PR review, `context`/`impact` around edits, `dead-code` for exported symbol cleanup, and `symbols`/`ast`/`calls`/`imports`/`lint`/`cochange`/`sequence`/`session` for structural analysis via tree-sitter AST."
 when_to_use: |
   - Searching for any code identifier (function, class, variable, type, constant, method) — use `refs --name` / `refs --names` instead of `Grep`
   - Pipe-separated identifier search like `FOO|Bar|baz` — use `refs --names FOO,Bar,baz --dir .`
@@ -95,12 +95,20 @@ echo '{"command":"refs","name":"Sym1","dir":"."}
 - Editing code? Run `astro-sight context --dir . --git` first, then `astro-sight impact --dir . --git` after the edit.
 - Touching exported APIs or public modules? Add `astro-sight dead-code --dir . --git` before concluding the change.
 - Repeating the same structural review policy across files? Reach for `astro-sight lint` instead of ad-hoc text search.
+- Asking 2+ mixed astro-sight questions in one loop? Use `astro-sight session` instead of paying startup cost for each command.
+
+## Escalation Path
+
+- Start with `review`, `context`, or `symbols` for the broad picture.
+- Escalate to `ast` when symbol lists are not enough and you need the exact syntax node at a cursor/range.
+- Escalate to `session` when you already know you will run several mixed queries in sequence.
+- Escalate to `lint` or `cochange` when the problem is repeated policy or historical coupling, not one-off structure lookup.
 
 ## Low-Adoption But Useful
 
+- Need **2+ mixed astro-sight queries** in one loop and want to avoid repeated startup cost? → `astro-sight session`
 - Need the **exact AST node** at a cursor/range, or want to confirm whether a parse error is structural? → `astro-sight ast --path <file> --line <n> --col <n>`
 - Need a **single JSON review** that combines impact, cochange, API surface changes, and dead symbols? → `astro-sight review --dir . --git`
-- Need **2+ mixed astro-sight queries** in one loop and want to avoid repeated startup cost? → `astro-sight session`
 - Need to check a **repeated rule** like banned APIs, required patterns, or AST-based policy? → `astro-sight lint --path <file> --rules rules.yaml`
 - Need to predict **co-change fallout** before missing a related file? → `astro-sight cochange --dir . --file <file>`
 
