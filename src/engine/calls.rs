@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashSet;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Query, QueryCursor};
 
@@ -70,6 +71,43 @@ pub fn extract_calls(
     }
 
     Ok(edges)
+}
+
+/// ファイル全体の呼び出し先名 (callee) の集合を抽出する。
+/// `extract_calls` はトップレベル呼び出し (caller が関数本体に属さないもの) を除外するため、
+/// CLI スクリプトの `main()` 呼び出しや bash エントリポイントのコマンド呼び出しを
+/// 拾えない。本関数は caller の有無を問わず純粋に callee 名を収集する。
+pub fn extract_all_callees(
+    root: Node<'_>,
+    source: &[u8],
+    lang_id: LangId,
+) -> Result<HashSet<String>> {
+    let query_src = call_query(lang_id);
+    if query_src.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let language = lang_id.ts_language();
+    let query = Query::new(&language, query_src)?;
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, root, source);
+
+    let mut callees = HashSet::new();
+    while let Some(m) = matches.next() {
+        for capture in m.captures {
+            let capture_name = &query.capture_names()[capture.index as usize];
+            if !capture_name.ends_with("callee") {
+                continue;
+            }
+            let node = capture.node;
+            let callee_name = node.utf8_text(source).unwrap_or("").to_string();
+            if !callee_name.is_empty() {
+                callees.insert(callee_name);
+            }
+        }
+    }
+
+    Ok(callees)
 }
 
 /// AST を上方走査し、最も近い関数定義を見つける。

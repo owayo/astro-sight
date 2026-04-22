@@ -1214,7 +1214,14 @@ fn detect_api_changes(
 
         if df.old_path == "/dev/null" {
             if let Some(new_syms) = extract_exported_symbols_from_file(dir, &df.new_path) {
+                // 新規ファイルでも、同一ファイル内で呼ばれている関数は内部ヘルパーと
+                // 判断して api.add から除外する。CLI スクリプト (main から内部関数を
+                // 呼び出す構造) を新規追加した時に全関数が api.add に積まれるノイズを防ぐ。
+                let in_file_callees = extract_in_file_callees(dir, &df.new_path);
                 for (name, kind, sig) in &new_syms {
+                    if is_internally_connected(&in_file_callees, name) {
+                        continue;
+                    }
                     added.push(ApiSymbolCandidate {
                         name: name.clone(),
                         kind: kind.clone(),
@@ -1263,8 +1270,15 @@ fn detect_api_changes(
         // Python の同一ファイル内で接続済みの private 関数が api.add に出る誤検出対策）。
         let in_file_callees = extract_in_file_callees(dir, &df.new_path);
 
+        // rename 検出用: 同ファイル内に新規追加された全シンボル名を追跡する
+        // （internally_connected で除外される内部ヘルパーも含む）。削除シンボルと
+        // 組み合わせて「rename + 実装置換」の api.rm ノイズを抑止する。
+        let mut new_symbols_in_current_file: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         for (name, kind, sig) in &new_syms {
             if !old_map.contains_key(name.as_str()) {
+                new_symbols_in_current_file.insert(name.clone());
                 // qualname または bare name が同一ファイル内の call に存在すれば内部参照
                 if is_internally_connected(&in_file_callees, name) {
                     continue;
@@ -1280,6 +1294,15 @@ fn detect_api_changes(
 
         for (name, kind, sig) in &old_syms {
             if !new_map.contains_key(name.as_str()) {
+                // closed-in-diff for api.rm: 同ファイルに新規追加されたシンボルがあり、
+                // 削除されたシンボルが変更後ツリーで 0 件参照なら「rename + 実装置換」
+                // と判断して api.rm から除外する。caller は同一 diff 内で追随済み。
+                // 純粋な関数削除（新規追加がない）は api.rm に残す。
+                if !new_symbols_in_current_file.is_empty()
+                    && is_removed_symbol_unreferenced(dir, name)
+                {
+                    continue;
+                }
                 removed.push(ApiSymbolCandidate {
                     name: name.clone(),
                     kind: kind.clone(),
@@ -1642,29 +1665,27 @@ fn filter_exported_symbols(
 }
 
 /// 指定ファイル内で発生している全ての callee 名を集合として返す。
+/// `extract_calls` と異なり、トップレベル呼び出し (関数本体外の `main()` や bash の
+/// `timed "..."` 等) も含める。API 変更検出の内部ヘルパー判定用。
 /// 失敗時（読み込み/パース不能）は空集合を返す。
 fn extract_in_file_callees(dir: &str, file_path: &str) -> std::collections::HashSet<String> {
-    let mut result = std::collections::HashSet::new();
+    let empty = std::collections::HashSet::new();
     let full_path = std::path::Path::new(dir).join(file_path);
     let Some(utf8_str) = full_path.to_str() else {
-        return result;
+        return empty;
     };
     let utf8_path = camino::Utf8Path::new(utf8_str);
     let Ok(source) = parser::read_file(utf8_path) else {
-        return result;
+        return empty;
     };
     let Ok(lang_id) = crate::language::LangId::from_path(utf8_path) else {
-        return result;
+        return empty;
     };
     let Ok(tree) = parser::parse_source(&source, lang_id) else {
-        return result;
+        return empty;
     };
-    let edges = crate::engine::calls::extract_calls(tree.root_node(), &source, lang_id, None)
-        .unwrap_or_default();
-    for edge in edges {
-        result.insert(edge.callee.name);
-    }
-    result
+    crate::engine::calls::extract_all_callees(tree.root_node(), &source, lang_id)
+        .unwrap_or_default()
 }
 
 /// `qualname` (例: `Class.method` や bare name `foo`) が `callees` に含まれるかを判定する。
@@ -1701,6 +1722,18 @@ fn has_cross_file_refs(dir: &str, file_path: &str, name: &str) -> bool {
         .references
         .iter()
         .any(|r| Path::new(r.path.as_str()) != self_path)
+}
+
+/// 削除されたシンボル `name` が、変更後のツリー全体のどこからも参照されていないかを判定する。
+/// 参照が 0 件であれば同一 diff 内で全 caller が追随済みと判断し、`api.rm` から除外する。
+/// 参照検索に失敗した場合は保守的に false（外部参照ありとみなす）を返し、
+/// レビュー対象として残す（false negative を起こさない方針）。
+fn is_removed_symbol_unreferenced(dir: &str, name: &str) -> bool {
+    let service = AppService::new();
+    let Ok(refs_result) = service.find_references(name, dir, None) else {
+        return false;
+    };
+    refs_result.references.is_empty()
 }
 
 /// `sym` の range を内包する最も内側の container (class/struct/trait/interface/enum) を返す。
@@ -3047,6 +3080,142 @@ def wrapper() -> int:
         assert!(
             mod_names.contains(&"run"),
             "他ファイルから参照される関数のシグネチャ変更は api.mod に残すべき。got: {mod_names:?}"
+        );
+    }
+
+    /// 後方互換なオプショナル引数の追加（末尾にデフォルト値付き引数を追加）は、
+    /// closed-in-diff 判定により api.mod から除外される。
+    /// (レポート追記 2026-04-22 コミット c045fdf `json_to_markdown` の再現)
+    #[test]
+    fn detect_api_changes_optional_arg_addition_not_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let before = "\
+def json_to_markdown(raw, impact_file=None):
+    return str(raw)
+
+
+def _finalize_result(raw):
+    return json_to_markdown(raw)
+
+
+if __name__ == \"__main__\":
+    _finalize_result({})
+";
+        git_commit_files(repo, &[("review_mr.py", before)], "initial");
+
+        let after = "\
+def json_to_markdown(raw, impact_file=None, osv_scan_file=None):
+    return str(raw)
+
+
+def _finalize_result(raw):
+    return json_to_markdown(raw, impact_file=None, osv_scan_file=None)
+
+
+if __name__ == \"__main__\":
+    _finalize_result({})
+";
+        fs::write(repo.join("review_mr.py"), after).expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "review_mr.py".to_string(),
+            new_path: "review_mr.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 10,
+                new_start: 1,
+                new_count: 10,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let mod_names: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !mod_names.contains(&"json_to_markdown"),
+            "同一ファイル内でのみ呼ばれる関数へのオプショナル引数追加は api.mod に出してはならない。got: {mod_names:?}"
+        );
+    }
+
+    /// CLI スクリプト内で関数を rename + 実装置換した場合、api.rm に残してはならない。
+    /// `api.rm { old_name }` + `api.add { new_name }` の両方が closed-in-diff として
+    /// 扱えることを確認する。
+    /// (レポート追記 2026-04-22 コミット 3f2b082 `detect_changed_manifests` の再現)
+    #[test]
+    fn detect_api_changes_rename_with_impl_replacement_not_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let before = "\
+def detect_changed_manifests(base, head):
+    return []
+
+
+def main():
+    files = detect_changed_manifests(\"a\", \"b\")
+    return files
+
+
+if __name__ == \"__main__\":
+    main()
+";
+        git_commit_files(repo, &[("osv_scan.py", before)], "initial");
+
+        // detect_changed_manifests を削除し、同じ diff 内で list_changed_files を追加。
+        // caller (main) も list_changed_files に追随。
+        let after = "\
+def list_changed_files(base, head):
+    return []
+
+
+def main():
+    files = list_changed_files(\"a\", \"b\")
+    return files
+
+
+if __name__ == \"__main__\":
+    main()
+";
+        fs::write(repo.join("osv_scan.py"), after).expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "osv_scan.py".to_string(),
+            new_path: "osv_scan.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 10,
+                new_start: 1,
+                new_count: 10,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        let added: Vec<&str> = api_changes.added.iter().map(|s| s.name.as_str()).collect();
+
+        assert!(
+            !removed.contains(&"detect_changed_manifests"),
+            "同一 diff 内で新規関数に切り替わった関数の削除は api.rm に出してはならない。got: {removed:?}"
+        );
+        // 新規関数側も is_internally_connected により除外される（main から呼ばれている）。
+        assert!(
+            !added.contains(&"list_changed_files"),
+            "同一ファイル内でのみ呼ばれる新規関数は api.add に出してはならない。got: {added:?}"
         );
     }
 
