@@ -281,8 +281,15 @@ fn call_query(lang_id: LangId) -> &'static str {
             "#
         }
         LangId::Bash => {
+            // 第1行: 通常のコマンド呼び出し `foo arg1 arg2` → foo が callee
+            // 第2行: trap ハンドラ `trap <fn> SIGNAL...` → <fn> も callee として扱う
+            //        (cleanup ハンドラ等として参照される関数を internal 扱いするため)
             r#"
             (command name: (command_name (word) @direct.callee))
+            (command
+              name: (command_name (word) @_cmd)
+              argument: (word) @direct.callee
+              (#eq? @_cmd "trap"))
             "#
         }
         LangId::Ruby => {
@@ -383,6 +390,41 @@ mod tests {
             let q = call_query(*lang);
             assert!(!q.is_empty(), "{:?} should have a call query", lang);
         }
+    }
+
+    /// bash の `trap <fn> SIGNAL` で指定される関数名を callee として抽出できる。
+    /// extract_calls はトップレベル呼び出しを除外するので extract_all_callees で確認する。
+    #[test]
+    fn extract_all_callees_bash_trap_handler() {
+        let source = b"#!/usr/bin/env bash\n\
+            stop_memory_sampler() { echo stop; }\n\
+            trap stop_memory_sampler EXIT\n\
+            trap 'echo literal' INT\n\
+            trap \"echo double\" TERM\n";
+        let tree = parser::parse_source(source, LangId::Bash).unwrap();
+        let callees = extract_all_callees(tree.root_node(), source, LangId::Bash).unwrap();
+        assert!(
+            callees.contains("stop_memory_sampler"),
+            "trap <fn> の関数名は callee として抽出されるべき。got: {callees:?}"
+        );
+        // 文字列引数はコマンド名ではないので拾わない
+        assert!(!callees.contains("echo literal"));
+        assert!(!callees.contains("echo double"));
+    }
+
+    /// bash トップレベル呼び出しも extract_all_callees で拾える
+    /// (extract_calls は caller なしで除外するが extract_all_callees は拾う)
+    #[test]
+    fn extract_all_callees_bash_top_level_command() {
+        let source = b"#!/usr/bin/env bash\n\
+            timed() { \"$@\"; }\n\
+            timed echo hi\n";
+        let tree = parser::parse_source(source, LangId::Bash).unwrap();
+        let callees = extract_all_callees(tree.root_node(), source, LangId::Bash).unwrap();
+        assert!(
+            callees.contains("timed"),
+            "トップレベルコマンドも callee として扱われるべき。got: {callees:?}"
+        );
     }
 
     /// function_node_kinds が全言語で空でないことを確認

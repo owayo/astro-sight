@@ -1937,6 +1937,170 @@ pub fn run() -> String {
     );
 }
 
+/// エクスポートシンボルの body (内部実装) のみが変わったとき、
+/// import/re-export 行しか参照のないファイルは impact に載せない。
+/// (レポート 2026-04-08-commitstore-internal-change-false-positive.md の再現)
+#[test]
+fn impact_body_only_change_import_only_callers_no_false_positive() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let commit_store = dir.path().join("commitStore.ts");
+    let index_ts = dir.path().join("index.ts");
+    let app_tsx = dir.path().join("App.tsx");
+
+    std::fs::write(
+        &commit_store,
+        r#"export function useCommitStore() {
+  return { validate: async () => true };
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &index_ts,
+        r#"export { useCommitStore } from "./commitStore";
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &app_tsx,
+        r#"import { useCommitStore } from "./commitStore";
+function App() { return null; }
+"#,
+    )
+    .unwrap();
+
+    // useCommitStore の body のみを変更 (宣言行は不変)
+    let diff = r#"--- a/commitStore.ts
++++ b/commitStore.ts
+@@ -1,3 +1,7 @@
+ export function useCommitStore() {
+-  return { validate: async () => true };
++  let currentRequestId = 0;
++  return {
++    validate: async () => { currentRequestId += 1; return currentRequestId > 0; },
++  };
+ }
+"#;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["impact", "--dir", dir.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn impact");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // import / re-export しかしていないファイルは impact に載せない
+    assert!(
+        output.status.success(),
+        "expected exit 0 (no unresolved impacts) for body-only change.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("index.ts"),
+        "re-export-only file should not appear in impact: {stderr}"
+    );
+    assert!(
+        !stderr.contains("App.tsx"),
+        "import-only file should not appear in impact: {stderr}"
+    );
+}
+
+/// 変更ファイルに新規追加シンボルが複数あっても、影響先ファイルの行が実際に
+/// 参照しているシンボルだけが impact に紐付き、他の無関係な変更シンボルが
+/// 巻き添えで紐付かない（バルク紐付け禁止）。private シンボルも同様に外部ファイルへ
+/// 影響伝播しない。
+/// (レポート 2026-03-19-dnspacket-bulk-symbol-binding.md の再現)
+#[test]
+fn impact_bulk_symbol_binding_no_false_positive() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src_kt = dir.path().join("DnsPacket.kt");
+    let test_kt = dir.path().join("DnsPacketTest.kt");
+
+    std::fs::write(
+        &src_kt,
+        r#"package pkg
+
+class DnsPacket(val data: ByteArray) {
+    companion object {
+        fun createZeroResponse(packet: DnsPacket): ByteArray = byteArrayOf()
+    }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &test_kt,
+        r#"package pkg
+
+class DnsPacketTest {
+    fun zero_response() {
+        val packet = DnsPacket(byteArrayOf())
+        DnsPacket.createZeroResponse(packet)
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // createServFailResponse と private createIpResponse を新規追加
+    let diff = r#"--- a/DnsPacket.kt
++++ b/DnsPacket.kt
+@@ -4,5 +4,7 @@
+ class DnsPacket(val data: ByteArray) {
+     companion object {
+         fun createZeroResponse(packet: DnsPacket): ByteArray = byteArrayOf()
++        fun createServFailResponse(packet: DnsPacket): ByteArray = byteArrayOf(1)
++        private fun createIpResponse(packet: DnsPacket, ip: String): ByteArray = byteArrayOf()
+     }
+ }
+"#;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["impact", "--dir", dir.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn impact");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("failed to wait");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // DnsPacketTest.kt は createZeroResponse しか参照していない & 新規追加は未使用
+    // → 無関係な変更シンボル (createServFailResponse / createIpResponse) が巻き添えで
+    //   紐付かないこと、および impact として unresolved 扱いにならないことを確認する
+    assert!(
+        !stderr.contains("createServFailResponse"),
+        "未使用の新規関数は他ファイルの impact に紐付けてはならない: {stderr}"
+    );
+    assert!(
+        !stderr.contains("createIpResponse"),
+        "private 関数は他ファイルの impact に紐付けてはならない: {stderr}"
+    );
+}
+
 #[test]
 fn impact_trait_unchanged_no_false_positive() {
     use std::io::Write;
@@ -3732,6 +3896,68 @@ fn dead_code_python_classmethod_and_property_are_live() {
     assert!(
         !names.iter().any(|n| n.contains("project_name")),
         "@property アクセスは live: {names:?}"
+    );
+}
+
+/// Python で `self.method()` / `self.attr` のクラス内自己参照も live として認識される。
+/// `@property` 経由の self 属性アクセスと、他メソッドから呼ばれる self.method 呼び出しの
+/// 両方が dead に載らないことを確認。
+/// (レポート 2026-04-20-python-dead-code-attribute-resolution.md の再現)
+#[test]
+fn dead_code_python_self_method_and_property_is_live() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("sample.py"),
+        r#"class GitLabClient:
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    @property
+    def project(self):
+        return self.cfg
+
+    def post_comment(self, body):
+        _ = self.project
+        print(body)
+
+    def post_comment_as(self, body, user):
+        self.post_comment(body)
+
+
+def main():
+    client = GitLabClient({"project_name": "x"})
+    client.post_comment("hi")
+    client.post_comment_as("hi", "u")
+
+
+main()
+"#,
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success(), "dead-code は成功するべき");
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead = json["dead_symbols"].as_array().expect("dead_symbols 配列");
+    let names: Vec<&str> = dead.iter().filter_map(|s| s["name"].as_str()).collect();
+
+    assert!(
+        !names.iter().any(|n| n.contains("project")),
+        "@property への self アクセスは live: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains("post_comment")),
+        "self.method() 自己呼び出しは live: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains("post_comment_as")),
+        "外部 caller からの obj.method() は live: {names:?}"
     );
 }
 
