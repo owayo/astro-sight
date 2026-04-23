@@ -373,7 +373,7 @@ fn context_with_diff() {
     // Create a synthetic diff
     let diff = r#"--- a/src/engine/symbols.rs
 +++ b/src/engine/symbols.rs
-@@ -603,7 +603,7 @@
+@@ -733,7 +733,7 @@
 -pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
 +pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, include_refs: bool) -> Result<Vec<Symbol>> {
      let query_src = symbol_query(lang_id);
@@ -1010,7 +1010,7 @@ fn context_batch_refs_consistency() {
     // with the batch refs approach (same output as before)
     let diff = r#"--- a/src/engine/symbols.rs
 +++ b/src/engine/symbols.rs
-@@ -603,7 +603,7 @@
+@@ -733,7 +733,7 @@
 -pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
 +pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, flag: bool) -> Result<Vec<Symbol>> {
      let query_src = symbol_query(lang_id);
@@ -1678,7 +1678,7 @@ fn impact_with_unresolved() {
     // Diff that changes extract_symbols signature → callers in other files are unresolved
     let diff = r#"--- a/src/engine/symbols.rs
 +++ b/src/engine/symbols.rs
-@@ -603,7 +603,7 @@
+@@ -733,7 +733,7 @@
 -pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
 +pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, flag: bool) -> Result<Vec<Symbol>> {
      let query_src = symbol_query(lang_id);
@@ -4124,6 +4124,201 @@ fn dead_code_same_method_name_in_multiple_classes_skipped() {
     assert!(
         !names.iter().any(|n| n.ends_with(".run")),
         "同名メソッドが複数クラスにある場合はスキップされるべき: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_excludes_kotlin_override() {
+    // Kotlin の `override` メソッドは親 interface / superclass 経由で呼ばれるため
+    // cross-file refs では追跡できず、dead-code 判定で偽陽性になる。
+    // AdapterView.OnItemSelectedListener / TextWatcher の override は除外されるべき。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("MainActivity.kt"),
+        r#"package com.example
+
+class MainActivity : AppCompatActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {}
+
+    fun setup() {
+        val watcher = object : TextWatcher {
+            override fun afterTextChanged(s: Editable?) {}
+        }
+    }
+
+    override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {}
+    override fun onNothingSelected(parent: AdapterView<*>?) {}
+
+    fun unusedRegular() {}
+}
+"#,
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success(), "dead-code は成功するべき");
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead = json["dead_symbols"].as_array().expect("dead_symbols 配列");
+    let names: Vec<&str> = dead.iter().filter_map(|s| s["name"].as_str()).collect();
+
+    for override_name in [
+        "MainActivity.onCreate",
+        "MainActivity.onItemSelected",
+        "MainActivity.onNothingSelected",
+        "MainActivity.afterTextChanged",
+    ] {
+        assert!(
+            !names.contains(&override_name),
+            "Kotlin の override メソッド {override_name} は dead に含めるべきでない: {names:?}"
+        );
+    }
+    // override でない通常メソッドは dead として残る
+    assert!(
+        names.contains(&"MainActivity.unusedRegular"),
+        "override でない未参照メソッドは dead として報告されるべき: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_excludes_java_override_annotation() {
+    // Java の `@Override` アノテーション付きメソッドも dead から除外される。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("Sample.java"),
+        r#"package com.example;
+
+public class Sample extends Base {
+    @Override
+    public void handleEvent() {}
+
+    public void plainUnused() {}
+}
+"#,
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success(), "dead-code は成功するべき");
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead = json["dead_symbols"].as_array().expect("dead_symbols 配列");
+    let names: Vec<&str> = dead.iter().filter_map(|s| s["name"].as_str()).collect();
+
+    assert!(
+        !names.iter().any(|n| n.ends_with(".handleEvent")),
+        "@Override 付きメソッドは dead に含めるべきでない: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.ends_with(".plainUnused")),
+        "@Override のない未参照メソッドは dead として報告されるべき: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_excludes_android_manifest_activity() {
+    // AndroidManifest.xml で `android:name=".MainActivity"` と宣言された
+    // activity は Android OS から起動されるため dead に含めるべきでない。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("AndroidManifest.xml"),
+        r#"<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <application>
+    <activity android:name=".MainActivity" android:exported="true">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN" />
+        <category android:name="android.intent.category.LAUNCHER" />
+      </intent-filter>
+    </activity>
+  </application>
+</manifest>
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("MainActivity.kt"),
+        r#"package com.example
+
+class MainActivity : AppCompatActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {}
+}
+"#,
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success(), "dead-code は成功するべき");
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead = json["dead_symbols"].as_array().expect("dead_symbols 配列");
+    let names: Vec<&str> = dead.iter().filter_map(|s| s["name"].as_str()).collect();
+
+    assert!(
+        !names.contains(&"MainActivity"),
+        "AndroidManifest.xml で宣言された activity は dead 扱いすべきでない: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_layout_onclick_references_handler() {
+    // layout XML の `android:onClick="handler"` から Kotlin/Java のメソッドが
+    // 呼ばれるため、そのハンドラは dead 扱いすべきでない。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("AndroidManifest.xml"),
+        r#"<manifest xmlns:android="http://schemas.android.com/apk/res/android"><application><activity android:name=".MainActivity"/></application></manifest>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("activity_main.xml"),
+        r#"<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android">
+  <Button android:onClick="onSubmit" android:id="@+id/btn"/>
+</LinearLayout>
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("MainActivity.kt"),
+        r#"package com.example
+
+class MainActivity : AppCompatActivity() {
+    fun onSubmit(view: View) {}
+}
+"#,
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success(), "dead-code は成功するべき");
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead = json["dead_symbols"].as_array().expect("dead_symbols 配列");
+    let names: Vec<&str> = dead.iter().filter_map(|s| s["name"].as_str()).collect();
+
+    assert!(
+        !names.iter().any(|n| n.ends_with(".onSubmit")),
+        "layout XML の android:onClick で参照されたハンドラは dead 扱いすべきでない: {names:?}"
     );
 }
 

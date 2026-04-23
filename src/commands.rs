@@ -1540,6 +1540,13 @@ pub(crate) fn detect_dead_symbols_from_files(
         Err(_) => return Vec::new(),
     };
 
+    // Android プロジェクトでは `AndroidManifest.xml` / layout XML から
+    // シンボルが参照されうる（`<activity android:name=".MainActivity"/>` 等）。
+    // Kotlin/Java AST のみでは追跡できない Android framework 経由の生存判定を補うため、
+    // XML 参照集合に含まれるシンボルは dead から除外する。
+    // AndroidManifest.xml が存在しないプロジェクトでは空集合が返り副作用なし。
+    let xml_refs = crate::engine::xml_refs::collect_xml_symbol_references(&canonical_dir);
+
     // 定義以外の参照が0件のシンボルを dead として報告
     let mut dead = Vec::new();
     for (name, kind, file, lang) in &all_syms {
@@ -1550,6 +1557,13 @@ pub(crate) fn detect_dead_symbols_from_files(
         }
 
         if counts.get(&key).copied().unwrap_or(0) == 0 {
+            // bare name と qualname (Container.method) の両方を XML 参照と突き合わせる。
+            // layout XML の `android:onClick="handler"` は単純名でしか書けないため bare で検索し、
+            // `android:name=".Foo"` 等で Container 側をカバーするケースは qualname でも検査する。
+            let bare = bare_name(name);
+            if xml_refs.contains(bare) || xml_refs.contains(name.as_str()) {
+                continue;
+            }
             dead.push(DeadSymbol {
                 name: name.clone(),
                 kind: kind.clone(),
@@ -1696,6 +1710,16 @@ fn filter_exported_symbols(
         if exclude_trait_impls
             && lang_id == crate::language::LangId::Rust
             && crate::engine::symbols::is_trait_impl_method_rust(root, &sym.range)
+        {
+            continue;
+        }
+        // Kotlin/Java/Swift/TS/C# の `override` メソッドは親 interface/class の
+        // メソッドを実装しているため、親型経由（Android の Listener callback 等）
+        // で呼ばれる。cross-file refs では caller を追跡できず dead-code / api.add/rm
+        // のいずれでも偽陽性になるため除外する。
+        if exclude_trait_impls
+            && matches!(sym.kind, SymbolKind::Method | SymbolKind::Function)
+            && crate::engine::symbols::is_override_method(root, source, lang_id, &sym.range)
         {
             continue;
         }

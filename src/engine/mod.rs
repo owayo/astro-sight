@@ -12,3 +12,4 @@ pub mod refs;
 pub mod sequence;
 pub mod snippet;
 pub mod symbols;
+pub mod xml_refs;

@@ -332,6 +332,15 @@ fn should_include_for_cross_file(
     {
         return false;
     }
+    // 3a. Kotlin/Java/Swift/TS/C# の `override` メソッドは親 interface/class から
+    // 呼ばれるため cross-file caller を追跡できない。親 API のシグネチャは不変なので
+    // 下流互換性にも影響せず、本体変更は impl 変更として扱い api.mod から除外する。
+    if (sym.kind == "function" || sym.kind == "method")
+        && find_overlapping_symbol(syms, &sym.name, hunks)
+            .is_some_and(|s| symbols::is_override_method(root, source, lang_id, &s.range))
+    {
+        return false;
+    }
     // 3b. 定義ヘッダが変更されていない型シンボルをスキップ。
     // 例: `trait GuestMemory` 行自体が変更されていなければ、
     // 他の変更行（フリー関数のシグネチャ等）に名前が出現しても伝播しない。
