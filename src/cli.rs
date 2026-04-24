@@ -370,6 +370,22 @@ pub enum Commands {
         /// (既定: 除外)
         #[arg(long)]
         include_build: bool,
+
+        /// Framework preset を指定してフレームワーク規約のエントリポイントを除外する。
+        /// 現在対応: "laravel" (database/migrations, app/Http/Controllers 等)
+        #[arg(long)]
+        framework: Option<String>,
+
+        /// 追加で除外するディレクトリ名 (完全一致、複数指定可)。
+        /// 例: --exclude-dir generated --exclude-dir .cache
+        #[arg(long = "exclude-dir", value_name = "NAME", num_args = 0..)]
+        exclude_dirs: Vec<String>,
+
+        /// 追加で除外する glob パターン (ワークスペース相対、複数指定可)。
+        /// 先頭の `!` は不要 (内部で negative pattern として扱う)。
+        /// 例: --exclude-glob 'app/Legacy/**' --exclude-glob 'config/*.php'
+        #[arg(long = "exclude-glob", value_name = "PATTERN", num_args = 0..)]
+        exclude_globs: Vec<String>,
     },
 
     /// Check tool availability and language support

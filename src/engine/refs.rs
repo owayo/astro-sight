@@ -55,29 +55,49 @@ pub fn find_references(
 
 /// ignore クレートでファイルを収集する（.gitignore 対応）。
 pub fn collect_files(dir: &Path, glob_pattern: Option<&str>) -> Result<Vec<std::path::PathBuf>> {
-    collect_files_with_excludes(dir, glob_pattern, &[])
+    collect_files_with_excludes(dir, glob_pattern, &[], &[])
 }
 
-/// ignore クレートでファイルを収集し、指定ディレクトリ名のサブツリーを除外する。
+/// ignore クレートでファイルを収集し、ディレクトリ名またはネガティブ glob で除外する。
 ///
-/// `excluded_dir_names` に含まれる **ディレクトリ名** と完全一致するパスセグメントは、
-/// その配下も含めてすべてスキップされる（例: `vendor`, `node_modules`, `tests`）。
-/// `collect_files` と同様に `.gitignore` は常に尊重する。
+/// - `excluded_dir_names`: 完全一致するパスセグメント (例: `vendor`, `node_modules`) を
+///   含むファイルを除外。軽量な判定用。
+/// - `excluded_globs`: `database/migrations/**` のような glob パターン (ワークスペース相対)。
+///   内部で `!<pattern>` として `ignore::overrides` に追加し、パッケージパス内の特定サブ
+///   ディレクトリだけをピンポイント除外する。
+///
+/// 両方が空であれば `collect_files(dir, glob)` と同じ挙動。`.gitignore` は常に尊重する。
 pub fn collect_files_with_excludes(
     dir: &Path,
     glob_pattern: Option<&str>,
     excluded_dir_names: &[&str],
+    excluded_globs: &[&str],
 ) -> Result<Vec<std::path::PathBuf>> {
     use ignore::WalkBuilder;
 
     let mut builder = WalkBuilder::new(dir);
     builder.hidden(true).git_ignore(true).git_global(true);
 
-    // glob フィルタを override で適用
-    if let Some(pattern) = glob_pattern {
-        let mut overrides = ignore::overrides::OverrideBuilder::new(dir);
-        overrides.add(pattern)?;
-        builder.overrides(overrides.build()?);
+    // glob フィルタと除外 glob を同じ OverrideBuilder にまとめる。
+    // ignore::overrides は「ポジティブパターンがある → その中だけ許可 / ネガティブ (`!`
+    // 接頭辞) → 除外」なので、glob_pattern が None のときも `**/*` を足してから
+    // `!excluded_globs...` を重ねることで「全体許可 + 指定分だけ除外」を実現する。
+    if glob_pattern.is_some() || !excluded_globs.is_empty() {
+        let mut ob = ignore::overrides::OverrideBuilder::new(dir);
+        if let Some(pattern) = glob_pattern {
+            ob.add(pattern)?;
+        } else if !excluded_globs.is_empty() {
+            ob.add("**/*")?;
+        }
+        for pat in excluded_globs {
+            let negated = if pat.starts_with('!') {
+                pat.to_string()
+            } else {
+                format!("!{pat}")
+            };
+            ob.add(&negated)?;
+        }
+        builder.overrides(ob.build()?);
     }
 
     let mut files = Vec::new();

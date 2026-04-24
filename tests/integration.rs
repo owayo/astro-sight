@@ -4109,6 +4109,189 @@ fn dead_code_excludes_tests_dir_by_default() {
 }
 
 #[test]
+fn dead_code_framework_laravel_excludes_migrations_and_controllers() {
+    // --framework laravel で Laravel の規約的エントリポイント
+    // (database/migrations, app/Http/Controllers 等) が除外されることを検証。
+    // 一次創作の Laravel-ish な最小構造を使い、対象プロジェクトのコードは引用しない。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("app/Http/Controllers")).unwrap();
+    std::fs::create_dir_all(root.join("app/Services")).unwrap();
+    std::fs::create_dir_all(root.join("database/migrations")).unwrap();
+    std::fs::create_dir_all(root.join("database/seeds")).unwrap();
+
+    std::fs::write(
+        root.join("app/Http/Controllers/SampleController.php"),
+        "<?php\nclass SampleController {\n    public function index() { return 'x'; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("app/Services/SampleService.php"),
+        "<?php\nclass SampleService {\n    public function loadProfile() { return []; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("database/migrations/2025_01_example.php"),
+        "<?php\nclass CreateExampleTable {\n    public function up() {}\n    public function down() {}\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("database/seeds/ExampleSeeder.php"),
+        "<?php\nclass ExampleSeeder {\n    public function run() {}\n}\n",
+    )
+    .unwrap();
+
+    // --framework laravel なし: Controllers / migrations / seeds も dead 候補に出る
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        names.iter().any(|n| n.contains("SampleController")),
+        "framework preset なしでは Controller が dead 候補に出る: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.contains("CreateExampleTable")),
+        "framework preset なしでは migration class が dead 候補に出る: {names:?}"
+    );
+
+    // --framework laravel: Controllers / migrations / seeds は除外、Services は残る
+    let output = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--framework",
+            "laravel",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+
+    for banned in ["SampleController", "CreateExampleTable", "ExampleSeeder"] {
+        assert!(
+            !names.iter().any(|n| n.contains(banned)),
+            "{banned} は Laravel preset で除外されるべき: {names:?}"
+        );
+    }
+    assert!(
+        names
+            .iter()
+            .any(|n| n.contains("SampleService") || n.contains("loadProfile")),
+        "app/Services/ 配下は Laravel preset でも dead 判定される: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_exclude_glob_and_exclude_dir_drop_targets() {
+    // --exclude-glob 'app/Legacy/**' と --exclude-dir custom_dir で
+    // それぞれサブツリーが除外されることを検証。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("app/Legacy")).unwrap();
+    std::fs::create_dir_all(root.join("custom_dir/sub")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+
+    std::fs::write(
+        root.join("app/Legacy/OldHandler.php"),
+        "<?php\nclass OldHandler {\n    public function legacyEntry() {}\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("custom_dir/sub/PluginBridge.php"),
+        "<?php\nclass PluginBridge {\n    public function pluginEntry() {}\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/runtime.php"),
+        "<?php\nfunction runtime_only_entry() {}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--exclude-glob",
+            "app/Legacy/**",
+            "--exclude-dir",
+            "custom_dir",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.contains("OldHandler") || n.contains("legacyEntry")),
+        "--exclude-glob 指定パターンは除外される: {names:?}"
+    );
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.contains("PluginBridge") || n.contains("pluginEntry")),
+        "--exclude-dir 指定ディレクトリは除外される: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "runtime_only_entry"),
+        "非除外 src/ の未参照シンボルは dead として報告される: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_unknown_framework_is_rejected() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("sample.php"), "<?php\n").unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--framework",
+            "djangular",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(
+        !output.status.success(),
+        "未知の framework 名はエラー (exit != 0)"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Unknown framework preset") || stdout.contains("INVALID_REQUEST"),
+        "エラーメッセージに framework 未対応が示される: {stdout}"
+    );
+}
+
+#[test]
 fn dead_code_php_phpunit_conventions_excluded() {
     // PHPUnit の規約的メソッド / クラスは識別子レベルの cross-file ref がないが
     // PHPUnit ランナーから自動呼出しされるため dead-code から除外する。

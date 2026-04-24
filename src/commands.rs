@@ -1996,8 +1996,68 @@ fn resolve_dead_code_excludes(
     excludes
 }
 
+/// Laravel 規約プリセット。フレームワークが自動で呼び出す規約的エントリポイントを除外する。
+///
+/// - `database/migrations/**`: Artisan `migrate` から `up()` / `down()` を呼ぶ
+/// - `database/seeds/**` / `database/seeders/**` / `database/factories/**`: Artisan `db:seed` が `run()` を呼ぶ
+/// - `database/views/**`: DB view 定義 (Artisan 駆動)
+/// - `app/Console/Commands/**`: `handle()` が Artisan から呼ばれる
+/// - `app/Http/Controllers/**`: Route 定義 (`routes/web.php` 等) から文字列経由で呼ばれる
+/// - `app/Http/Middleware/**`: `handle()` が Route/Kernel 経由で呼ばれる
+/// - `app/Http/Requests/**`: `authorize()` / `rules()` が Form Request 解決時に自動呼出し
+/// - `app/Http/Resources/**`: `toArray()` が Response serialization で呼ばれる
+/// - `app/GraphQL/**`: GraphQL schema ファイルから文字列経由で解決される
+/// - `app/Listeners/**`, `app/Providers/**`: Service Container / Event Bus 経由
+/// - `_ide_helper*.php`, `.phpstorm.meta.php`: IDE 補助の自動生成ファイル
+///
+/// `**/` 接頭辞でサブディレクトリに埋め込まれた Laravel アプリ（モノレポ内の複数 Laravel
+/// 等）にも対応する。
+const LARAVEL_PRESET_EXCLUDE_GLOBS: &[&str] = &[
+    // 標準マイグレーション経路 (Artisan 駆動)
+    "**/database/migrations/**",
+    // Multi-DB / 複数コネクション構成で派生する migrations_foo, migrations-foo
+    // (Laravel 公式 ドキュメントの `--path` 指定パターン) も同様に Artisan 駆動
+    "**/database/migrations_*/**",
+    "**/database/migrations-*/**",
+    // シーダー / ファクトリ / ビュー定義 / テーブル定義スナップショット
+    "**/database/seeds/**",
+    "**/database/seeders/**",
+    "**/database/factories/**",
+    "**/database/views/**",
+    "**/database/TableDefinitions/**",
+    // Artisan / Route / GraphQL 経由で呼ばれるエントリポイント
+    "**/app/Console/Commands/**",
+    "**/app/Http/Controllers/**",
+    "**/app/Http/Middleware/**",
+    "**/app/Http/Requests/**",
+    "**/app/Http/Resources/**",
+    "**/app/GraphQL/**",
+    "**/app/Listeners/**",
+    "**/app/Providers/**",
+    // IDE 補助の自動生成ファイル
+    "**/_ide_helper.php",
+    "**/_ide_helper_models.php",
+    "**/.phpstorm.meta.php",
+];
+
+/// フレームワーク名から対応する除外 glob プリセットを返す。
+/// 未知のフレームワーク名はエラー。
+fn resolve_framework_globs(framework: Option<&str>) -> Result<&'static [&'static str]> {
+    match framework {
+        None => Ok(&[]),
+        Some(name) => match name.to_ascii_lowercase().as_str() {
+            "laravel" => Ok(LARAVEL_PRESET_EXCLUDE_GLOBS),
+            other => Err(AstroError::new(
+                ErrorCode::InvalidRequest,
+                format!("Unknown framework preset: {other} (supported: laravel)"),
+            )
+            .into()),
+        },
+    }
+}
+
 /// 指定パスが既定除外対象のディレクトリセグメントを含むかを判定する。
-fn path_is_default_excluded(path: &str, excludes: &[&'static str]) -> bool {
+fn path_is_default_excluded(path: &str, excludes: &[&str]) -> bool {
     if excludes.is_empty() {
         return false;
     }
@@ -2066,6 +2126,9 @@ pub fn cmd_dead_code(
     include_vendor: bool,
     include_tests: bool,
     include_build: bool,
+    framework: Option<&str>,
+    extra_exclude_dirs: &[String],
+    extra_exclude_globs: &[String],
     pretty: bool,
 ) -> Result<()> {
     let canonical_dir = std::fs::canonicalize(dir)?;
@@ -2075,7 +2138,18 @@ pub fn cmd_dead_code(
         );
     }
 
-    let excludes = resolve_dead_code_excludes(include_vendor, include_tests, include_build);
+    let default_excludes = resolve_dead_code_excludes(include_vendor, include_tests, include_build);
+    let mut excludes: Vec<&str> = default_excludes.to_vec();
+    for name in extra_exclude_dirs {
+        excludes.push(name.as_str());
+    }
+
+    // glob 除外: フレームワークプリセット + ユーザ指定
+    let framework_globs = resolve_framework_globs(framework)?;
+    let mut combined_globs: Vec<&str> = framework_globs.to_vec();
+    for pat in extra_exclude_globs {
+        combined_globs.push(pat.as_str());
+    }
 
     // diff 指定があれば diff 関連ファイルのみ、なければプロジェクト全体
     let has_diff = diff.is_some() || diff_file.is_some() || git;
@@ -2114,16 +2188,40 @@ pub fn cmd_dead_code(
                 !path_is_default_excluded(&p.to_string_lossy(), &excludes)
             })
             .collect();
-        // glob フィルタが指定されていれば適用（不正パターンはエラー）
-        if let Some(pattern) = glob {
+        // glob フィルタ (正) と除外 glob (負) を同じ OverrideBuilder にまとめる
+        if glob.is_some() || !combined_globs.is_empty() {
             let mut ob = ignore::overrides::OverrideBuilder::new(&canonical_dir);
-            ob.add(pattern)?;
+            if let Some(pattern) = glob {
+                ob.add(pattern)?;
+            } else {
+                ob.add("**/*")?;
+            }
+            for pat in &combined_globs {
+                let negated = if pat.starts_with('!') {
+                    (*pat).to_string()
+                } else {
+                    format!("!{pat}")
+                };
+                ob.add(&negated)?;
+            }
             let overrides = ob.build()?;
-            files.retain(|p| overrides.matched(p, false).is_whitelist());
+            files.retain(|p| !overrides.matched(p, false).is_ignore());
+            // glob が指定されていた場合は「whitelist されたもの」のみ残す必要もある
+            if glob.is_some() {
+                files.retain(|p| {
+                    let m = overrides.matched(p, false);
+                    m.is_whitelist() || m.is_none()
+                });
+            }
         }
         files
     } else {
-        crate::engine::refs::collect_files_with_excludes(&canonical_dir, glob, &excludes)?
+        crate::engine::refs::collect_files_with_excludes(
+            &canonical_dir,
+            glob,
+            &excludes,
+            &combined_globs,
+        )?
     };
 
     let scanned_files = files.len();
