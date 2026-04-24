@@ -55,6 +55,19 @@ pub fn find_references(
 
 /// ignore クレートでファイルを収集する（.gitignore 対応）。
 pub fn collect_files(dir: &Path, glob_pattern: Option<&str>) -> Result<Vec<std::path::PathBuf>> {
+    collect_files_with_excludes(dir, glob_pattern, &[])
+}
+
+/// ignore クレートでファイルを収集し、指定ディレクトリ名のサブツリーを除外する。
+///
+/// `excluded_dir_names` に含まれる **ディレクトリ名** と完全一致するパスセグメントは、
+/// その配下も含めてすべてスキップされる（例: `vendor`, `node_modules`, `tests`）。
+/// `collect_files` と同様に `.gitignore` は常に尊重する。
+pub fn collect_files_with_excludes(
+    dir: &Path,
+    glob_pattern: Option<&str>,
+    excluded_dir_names: &[&str],
+) -> Result<Vec<std::path::PathBuf>> {
     use ignore::WalkBuilder;
 
     let mut builder = WalkBuilder::new(dir);
@@ -70,16 +83,28 @@ pub fn collect_files(dir: &Path, glob_pattern: Option<&str>) -> Result<Vec<std::
     let mut files = Vec::new();
     for entry in builder.build() {
         let entry = entry?;
-        if entry.file_type().is_some_and(|ft| ft.is_file()) {
-            let path = entry.into_path();
-            // パース可能なファイルのみ対象
-            if LangId::from_path(camino::Utf8Path::new(path.to_str().unwrap_or(""))).is_ok() {
-                files.push(path);
-            }
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        let path = entry.into_path();
+        if !excluded_dir_names.is_empty() && path_has_excluded_segment(&path, excluded_dir_names) {
+            continue;
+        }
+        // パース可能なファイルのみ対象
+        if LangId::from_path(camino::Utf8Path::new(path.to_str().unwrap_or(""))).is_ok() {
+            files.push(path);
         }
     }
 
     Ok(files)
+}
+
+/// パスのいずれかの中間ディレクトリ名が除外対象と完全一致するかを判定する。
+fn path_has_excluded_segment(path: &Path, excluded: &[&str]) -> bool {
+    path.components().any(|c| match c.as_os_str().to_str() {
+        Some(name) => excluded.contains(&name),
+        None => false,
+    })
 }
 
 /// 単一ファイル内でシンボル参照を検索する。

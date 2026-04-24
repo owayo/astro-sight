@@ -3976,6 +3976,196 @@ fn dead_code_skips_linguist_generated_files() {
 }
 
 #[test]
+fn dead_code_excludes_vendor_dir_by_default() {
+    // パッケージマネージャ配下 (vendor/, node_modules/, .venv/ 等) は
+    // 既定で dead-code 走査から除外される。`--include-vendor` で opt-in 可能。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("vendor/pkg-a/src")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("vendor/pkg-a/src/lib.php"),
+        "<?php\nfunction vendor_only_helper(): void { echo 'x'; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/app.php"),
+        "<?php\nfunction app_only_helper(): void { echo 'y'; }\n",
+    )
+    .unwrap();
+
+    // 既定: vendor 除外
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"vendor_only_helper"),
+        "vendor/ 配下の symbol は既定で dead-code に含めない: {names:?}"
+    );
+    assert!(
+        names.contains(&"app_only_helper"),
+        "src/ 配下の未参照 symbol は dead として報告される: {names:?}"
+    );
+
+    // opt-in: --include-vendor で vendor も含める
+    let output = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--include-vendor",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"vendor_only_helper"),
+        "--include-vendor で vendor/ 配下も対象に含まれる: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_excludes_tests_dir_by_default() {
+    // テストディレクトリ (tests/, Tests/, __tests__/, spec/, testdata/) は
+    // 既定で dead-code 走査から除外される。`--include-tests` で opt-in 可能。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("tests/unit")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    // 意図的に PHPUnit 命名規約 (`^test[A-Z_]`) に合致しない関数名を使い、
+    // 「ディレクトリ除外」単独での効果を検証する。
+    std::fs::write(
+        root.join("tests/unit/sample_case.php"),
+        "<?php\nfunction fixture_assertion_helper(): void { echo 'y'; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/runtime.php"),
+        "<?php\nfunction runtime_only_helper(): void { echo 'z'; }\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"fixture_assertion_helper"),
+        "tests/ 配下の symbol は既定で dead-code に含めない: {names:?}"
+    );
+    assert!(
+        names.contains(&"runtime_only_helper"),
+        "src/ 配下の未参照 symbol は dead として報告される: {names:?}"
+    );
+
+    // opt-in: --include-tests
+    let output = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--include-tests",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"fixture_assertion_helper"),
+        "--include-tests で tests/ 配下も対象に含まれる: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_php_phpunit_conventions_excluded() {
+    // PHPUnit の規約的メソッド / クラスは識別子レベルの cross-file ref がないが
+    // PHPUnit ランナーから自動呼出しされるため dead-code から除外する。
+    // - メソッド名が `^test[A-Z_]` で始まる (testBar, test_case_one, testAccess_ok)
+    // - `setUp`, `tearDown`, `setUpBeforeClass`, `tearDownAfterClass`
+    // - クラス名末尾が `Test` / `TestCase` / `IntegrationTest` / `FeatureTest`
+    //
+    // 意図的に `--include-tests` を付けて tests/ ディレクトリ除外を無効化し、
+    // 命名規約ベースの除外だけを効かせる。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::write(
+        root.join("tests/SampleCaseTest.php"),
+        "<?php\nclass SampleCaseTest {\n    public function setUp(): void {}\n    public function tearDown(): void {}\n    public function testBar(): void {}\n    public function regular_helper(): void {}\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--include-tests",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+
+    // PHPUnit 規約シンボルは除外される
+    for banned in [
+        "SampleCaseTest",
+        "SampleCaseTest.setUp",
+        "SampleCaseTest.tearDown",
+        "SampleCaseTest.testBar",
+    ] {
+        assert!(
+            !names.iter().any(|n| n == banned),
+            "{banned} は PHPUnit 規約として dead-code から除外されるべき: {names:?}"
+        );
+    }
+    // 規約外の通常 public メソッドは従来通り dead 判定
+    assert!(
+        names.iter().any(|n| n == "SampleCaseTest.regular_helper"),
+        "PHPUnit 規約外のメソッドは dead として報告される: {names:?}"
+    );
+}
+
+#[test]
 fn dead_code_python_instance_method_is_live() {
     // Python の `obj.method()` 形式の呼び出しが参照として認識され、
     // class 内メソッドが偽陽性で dead 判定されないことを確認。

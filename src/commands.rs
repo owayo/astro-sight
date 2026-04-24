@@ -1762,6 +1762,14 @@ fn filter_exported_symbols(
         {
             continue;
         }
+        // PHPUnit 規約のテストメソッド / テストクラス。PHP 限定。
+        // `public function testXxx`, `setUp`, `tearDown`, `setUpBeforeClass`,
+        // `tearDownAfterClass`, および `*Test` / `*TestCase` / `*IntegrationTest` /
+        // `*FeatureTest` クラスは PHPUnit のランナーから自動で呼ばれる規約的シンボルで、
+        // 識別子レベルの cross-file ref は発生しないが dead でもない。
+        if is_phpunit_test_symbol(&sym.name, sym.kind, lang_id) {
+            continue;
+        }
         let sig = extract_api_signature(sym, &lines);
         let qualname = if matches!(sym.kind, SymbolKind::Method | SymbolKind::Function) {
             enclosing_container(sym, &containers)
@@ -1770,6 +1778,10 @@ fn filter_exported_symbols(
         } else {
             sym.name.clone()
         };
+        // qualname ベースでも最終チェック (例: `Foo.testBar` を PHP で除外)
+        if is_phpunit_test_symbol(&qualname, sym.kind, lang_id) {
+            continue;
+        }
         result.push((qualname, format!("{:?}", sym.kind).to_lowercase(), sig));
     }
     result
@@ -1932,6 +1944,116 @@ fn enclosing_container<'a>(
 // Dead-code コマンド: diff 関連 or プロジェクト全体のデッドコード検出
 // ---------------------------------------------------------------------------
 
+/// `dead-code` の既定除外ディレクトリ名。
+///
+/// 大規模リポでは `vendor/`, `node_modules/`, `tests/` 等が `dead-code` 候補の 88%+ を占め、
+/// 実運用のノイズになる。ディレクトリ名と完全一致するセグメントをパスに含むファイルを
+/// 走査対象から落とす。`--include-vendor` / `--include-tests` / `--include-build` で
+/// 個別に再取込できる。
+///
+/// グループ化の意図:
+/// - `vendor`: Composer, Ruby Bundler, Go modules vendor
+/// - `node_modules`, `bower_components`: Node パッケージ
+/// - `tests`, `Tests`, `__tests__`, `spec`, `testdata`: 言語共通のテストディレクトリ
+/// - `target`, `dist`, `build`, `out`, `_build`, `cmake-build-debug`, `cmake-build-release`: ビルド成果物
+/// - `.venv`, `venv`, `.tox`: Python 仮想環境
+const DEFAULT_DEAD_CODE_EXCLUDES_VENDOR: &[&str] = &[
+    "vendor",
+    "node_modules",
+    "bower_components",
+    ".venv",
+    "venv",
+    ".tox",
+];
+const DEFAULT_DEAD_CODE_EXCLUDES_TESTS: &[&str] =
+    &["tests", "Tests", "__tests__", "spec", "testdata"];
+const DEFAULT_DEAD_CODE_EXCLUDES_BUILD: &[&str] = &[
+    "target",
+    "dist",
+    "build",
+    "out",
+    "_build",
+    "cmake-build-debug",
+    "cmake-build-release",
+];
+
+/// 現在のフラグ設定から除外ディレクトリリストを組み立てる。
+fn resolve_dead_code_excludes(
+    include_vendor: bool,
+    include_tests: bool,
+    include_build: bool,
+) -> Vec<&'static str> {
+    let mut excludes: Vec<&'static str> = Vec::new();
+    if !include_vendor {
+        excludes.extend(DEFAULT_DEAD_CODE_EXCLUDES_VENDOR);
+    }
+    if !include_tests {
+        excludes.extend(DEFAULT_DEAD_CODE_EXCLUDES_TESTS);
+    }
+    if !include_build {
+        excludes.extend(DEFAULT_DEAD_CODE_EXCLUDES_BUILD);
+    }
+    excludes
+}
+
+/// 指定パスが既定除外対象のディレクトリセグメントを含むかを判定する。
+fn path_is_default_excluded(path: &str, excludes: &[&'static str]) -> bool {
+    if excludes.is_empty() {
+        return false;
+    }
+    path.split('/').any(|seg| excludes.contains(&seg))
+}
+
+/// PHPUnit 命名規約に合致するシンボルかどうかを判定する。
+///
+/// PHP プロジェクト (Laravel を含む) ではテストメソッドは `public function testXxx` や
+/// `setUp` / `tearDown` / `setUpBeforeClass` / `tearDownAfterClass` 等、PHPUnit が自動で
+/// 呼び出す規約的メソッドが大半。識別子レベルの cross-file ref は生じないが dead ではない。
+///
+/// 同じ規約は JUnit / NUnit / MSTest でも使われるが誤判定を避けるため、本判定は PHP
+/// ファイルに限定する。
+fn is_phpunit_test_symbol(
+    name: &str,
+    kind: crate::models::symbol::SymbolKind,
+    lang_id: crate::language::LangId,
+) -> bool {
+    use crate::language::LangId;
+    use crate::models::symbol::SymbolKind;
+    if lang_id != LangId::Php {
+        return false;
+    }
+    // qualname (`Foo.testBar`) の末尾要素を取る
+    let short = name.rsplit_once('.').map(|(_, t)| t).unwrap_or(name);
+    match kind {
+        SymbolKind::Class => {
+            short.ends_with("Test")
+                || short.ends_with("TestCase")
+                || short.ends_with("IntegrationTest")
+                || short.ends_with("FeatureTest")
+        }
+        SymbolKind::Method | SymbolKind::Function => {
+            matches!(
+                short,
+                "setUp" | "tearDown" | "setUpBeforeClass" | "tearDownAfterClass"
+            ) || is_phpunit_test_method_name(short)
+        }
+        _ => false,
+    }
+}
+
+/// `^test[A-Z_]` で始まるメソッド名かどうか (PHPUnit の testXxx 規約)。
+fn is_phpunit_test_method_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.len() <= 4 {
+        return false;
+    }
+    if &bytes[..4] != b"test" {
+        return false;
+    }
+    let c = bytes[4];
+    c.is_ascii_uppercase() || c == b'_'
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_dead_code(
     dir: &str,
@@ -1941,6 +2063,9 @@ pub fn cmd_dead_code(
     git: bool,
     base: &str,
     staged: bool,
+    include_vendor: bool,
+    include_tests: bool,
+    include_build: bool,
     pretty: bool,
 ) -> Result<()> {
     let canonical_dir = std::fs::canonicalize(dir)?;
@@ -1949,6 +2074,8 @@ pub fn cmd_dead_code(
             AstroError::new(ErrorCode::InvalidRequest, format!("Not a directory: {dir}")).into(),
         );
     }
+
+    let excludes = resolve_dead_code_excludes(include_vendor, include_tests, include_build);
 
     // diff 指定があれば diff 関連ファイルのみ、なければプロジェクト全体
     let has_diff = diff.is_some() || diff_file.is_some() || git;
@@ -1982,6 +2109,10 @@ pub fn cmd_dead_code(
                 crate::language::LangId::from_path(camino::Utf8Path::new(p.to_str().unwrap_or("")))
                     .is_ok()
             })
+            .filter(|p| {
+                // 既定除外ディレクトリ配下は dead-code 対象から落とす
+                !path_is_default_excluded(&p.to_string_lossy(), &excludes)
+            })
             .collect();
         // glob フィルタが指定されていれば適用（不正パターンはエラー）
         if let Some(pattern) = glob {
@@ -1992,7 +2123,7 @@ pub fn cmd_dead_code(
         }
         files
     } else {
-        crate::engine::refs::collect_files(&canonical_dir, glob)?
+        crate::engine::refs::collect_files_with_excludes(&canonical_dir, glob, &excludes)?
     };
 
     let scanned_files = files.len();

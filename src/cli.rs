@@ -355,6 +355,21 @@ pub enum Commands {
         /// Use staged changes (git diff --cached)
         #[arg(long)]
         staged: bool,
+
+        /// Include vendor / node_modules / .venv 等のパッケージマネージャ配下
+        /// (既定: 除外)
+        #[arg(long)]
+        include_vendor: bool,
+
+        /// Include tests / Tests / __tests__ / spec / testdata ディレクトリ配下
+        /// (既定: 除外)
+        #[arg(long)]
+        include_tests: bool,
+
+        /// Include target / dist / build / out 等のビルド成果物ディレクトリ配下
+        /// (既定: 除外)
+        #[arg(long)]
+        include_build: bool,
     },
 
     /// Check tool availability and language support
