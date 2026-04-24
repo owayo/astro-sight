@@ -289,6 +289,8 @@ astro-sight lint --path <file> --rules rules.yaml
 
 Finds exported symbols with zero non-definition references. With diff flags, limits scan to diff-related files; without diff, scans the entire project.
 
+By default, package-manager trees (`vendor/`, `node_modules/`, `.venv/` 等), test directories (`tests/`, `Tests/`, `__tests__/`, `spec/`, `testdata/`), and build artifacts (`target/`, `dist/`, `build/`, `out/`) are excluded. Use `--include-vendor` / `--include-tests` / `--include-build` to opt back in.
+
 ```bash
 # Full project scan
 astro-sight dead-code --dir .
@@ -301,6 +303,13 @@ astro-sight dead-code --dir . --git
 
 # Staged changes only
 astro-sight dead-code --dir . --git --staged
+
+# Framework preset: Laravel conventions (excludes migrations, Controllers, Middleware,
+# FormRequest, Console Commands, GraphQL resolvers, Listeners, Providers, IDE helpers)
+astro-sight dead-code --dir . --framework laravel
+
+# Additional ad-hoc exclusions (directory name or glob pattern)
+astro-sight dead-code --dir . --exclude-dir generated --exclude-glob 'app/Legacy/**'
 ```
 
 Output: JSON with `dir`, `scanned_files` (count), `dead_symbols` array (`name`, `kind`, `file`). Symbols with duplicate names across files are conservatively skipped.
@@ -398,3 +407,9 @@ astro-sight dead-code --dir . --git
 - Multiple symbol searches: use `refs --names` for batching; reserve `session` for mixed commands
 - `session` supports `ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange` (note: `review` is CLI-only, not available in session mode)
 - **Input validation**: Empty `--name`/`--names`, empty `--paths`/`--paths-file` are rejected with `INVALID_REQUEST` error. `--base` for `context`/`impact`/`review` rejects values starting with `-` (blocks option-style injection into `git diff` / `git show`)
+- **Large repositories (10k+ source files)**: `review --dir .` runs `context` + `cochange` + API diff + dead-code in one process and is the heaviest command. On very large monorepos it can exhaust memory. Mitigations:
+  - Narrow `--dir` to a module-level subtree (`--dir packages/server` instead of `--dir .`)
+  - For diff-based commands (`review` / `impact` / `context` / `dead-code --git`), bound the window with `--base HEAD~N`
+  - Prefer `--glob` to restrict to the primary language (e.g. `--glob '**/*.php'`)
+  - Split `review` into per-command runs (`impact` → `dead-code` → `cochange`) if the unified run is too heavy
+  - `refs` / `symbols --path` are memory-light and safe to run at the repo root even on large trees
