@@ -4411,6 +4411,167 @@ fn dead_code_exclude_glob_and_exclude_dir_drop_targets() {
 }
 
 #[test]
+fn dead_code_framework_laravel_preset_works_when_dir_is_app_root() {
+    // F1 回帰テスト: `--dir <fixture>/app --framework laravel` の場合も
+    // プリセット glob が効き、`Http/Controllers/` 配下が dead_symbols から除外されること。
+    // 従来は `**/app/Http/Controllers/**` が `--dir` 相対パス (`Http/Controllers/...`) に
+    // マッチせず Controller が全件 FP になっていた。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("app/Http/Controllers")).unwrap();
+    std::fs::create_dir_all(root.join("app/Services")).unwrap();
+
+    std::fs::write(
+        root.join("app/Http/Controllers/SampleController.php"),
+        "<?php\nclass SampleController {\n    public function index() { return 'x'; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("app/Services/SampleService.php"),
+        "<?php\nclass SampleService {\n    public function loadProfile() { return []; }\n}\n",
+    )
+    .unwrap();
+
+    // --dir を `app/` 直下に指定 — 旧挙動では Laravel プリセット無効で SampleController が dead
+    let output = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.join("app").to_str().unwrap(),
+            "--framework",
+            "laravel",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.contains("SampleController")),
+        "--dir が app/ 直下でも Laravel preset で Controllers/ は除外されるべき (F1 regression): {names:?}"
+    );
+    // app/Services は Laravel プリセットの対象外なので dead 判定が残るのが正しい
+    assert!(
+        names
+            .iter()
+            .any(|n| n.contains("SampleService") || n.contains("loadProfile")),
+        "app/Services は Laravel preset 対象外のため dead 判定されるべき: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_framework_laravel_excludes_exceptions_handler() {
+    // F2 回帰テスト: Laravel プリセットに `**/app/Exceptions/**` が含まれること。
+    // App\Exceptions\Handler::report は bootstrap/app.php の規約で登録される
+    // フレームワーク hook で、dead_symbols に含めるべきでない。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("app/Exceptions")).unwrap();
+    std::fs::create_dir_all(root.join("app/Services")).unwrap();
+
+    std::fs::write(
+        root.join("app/Exceptions/Handler.php"),
+        "<?php\nclass Handler {\n    public function report(\\Throwable $e) { return null; }\n    public function render($request, \\Throwable $e) { return null; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("app/Services/SampleService.php"),
+        "<?php\nclass SampleService {\n    public function loadProfile() { return []; }\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--framework",
+            "laravel",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    for banned in ["Handler", "report", "render"] {
+        assert!(
+            !names.iter().any(|n| n.contains(banned)),
+            "{banned} は app/Exceptions/ 配下なので Laravel preset で除外されるべき: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn dead_code_refs_scope_not_limited_by_glob() {
+    // F3 回帰テスト: `--glob` で symbols 対象ファイルを絞っても、
+    // refs 探索は `--dir` 全体で行われ、`--glob` 範囲外からの参照でも
+    // dead 判定を回避できること。
+    //
+    // 従来は `detect_dead_symbols_from_files` が refs 探索にも `--glob` を
+    // 適用していたため、`--glob 'lib/**/*.rs'` で走らせると `app/` からの
+    // 参照が見えず、lib/ 配下の共通関数が誤って dead 扱いになっていた。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::create_dir_all(root.join("app")).unwrap();
+
+    // lib 配下: 共通関数の定義
+    std::fs::write(
+        root.join("lib/util.rs"),
+        "pub fn shared_helper() -> i32 { 42 }\n",
+    )
+    .unwrap();
+    // app 配下: lib の関数を呼ぶ (refs スコープを広げれば見える)
+    std::fs::write(
+        root.join("app/main.rs"),
+        "fn main() { let _ = shared_helper(); }\n",
+    )
+    .unwrap();
+
+    // --glob で lib/ 配下のみを dead 対象にするが、refs は root 全体で探索されるべき
+    let output = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--glob",
+            "lib/**/*.rs",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.contains("shared_helper")),
+        "shared_helper は app/ から参照されており、--glob が refs スコープを狭めるべきでない (F3 regression): {names:?}"
+    );
+}
+
+#[test]
 fn dead_code_unknown_framework_is_rejected() {
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path();

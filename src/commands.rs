@@ -835,7 +835,8 @@ pub fn cmd_review(
             for name in extra_exclude_dirs {
                 excludes.push(name.as_str());
             }
-            let mut combined_globs: Vec<&str> = framework_globs.to_vec();
+            let mut combined_globs: Vec<&str> =
+                framework_globs.iter().map(String::as_str).collect();
             for pat in extra_exclude_globs {
                 combined_globs.push(pat.as_str());
             }
@@ -846,7 +847,7 @@ pub fn cmd_review(
                 &combined_globs,
                 None,
             )?;
-            detect_dead_symbols_from_files(dir, &files, None)
+            detect_dead_symbols_from_files(dir, &files)
         }
         Err(_) => Vec::new(),
     };
@@ -1506,10 +1507,13 @@ fn bare_name(qualname: &str) -> &str {
 /// ファイルリストからエクスポートシンボルを収集し、参照ゼロのシンボルを返す。
 /// dead-code コマンドと review コマンドの共通コアロジック。
 /// count_non_definition_refs_batch で件数のみカウントし、SymbolReference を確保しない。
+/// `files` は呼び出し側で `--glob` 等のフィルタを適用済み。
+/// refs 探索は `--dir` 全体で実施する (F3 修正: `--glob` で refs スコープが
+/// 狭まると、フィルタ外のファイルから同シンボルを参照している場合に dead
+/// 判定が誤陽性になるため)。
 pub(crate) fn detect_dead_symbols_from_files(
     dir: &str,
     files: &[std::path::PathBuf],
-    glob: Option<&str>,
 ) -> Vec<DeadSymbol> {
     let canonical_dir = match std::fs::canonicalize(dir) {
         Ok(d) => d,
@@ -1586,7 +1590,7 @@ pub(crate) fn detect_dead_symbols_from_files(
     let counts = match crate::engine::refs::count_non_definition_refs_batch(
         &unique_names,
         &canonical_dir,
-        glob,
+        None,
     ) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
@@ -2047,6 +2051,20 @@ const LARAVEL_PRESET_EXCLUDE_GLOBS: &[&str] = &[
     "**/app/GraphQL/**",
     "**/app/Listeners/**",
     "**/app/Providers/**",
+    // bootstrap/app.php で ExceptionHandler 規約で登録されるハンドラ
+    "**/app/Exceptions/**",
+    // Service Container / Observer / Cast / Policy / Event / Queue / Mail / Notification /
+    // Broadcast channel / FormRequest validation Rule — いずれも Laravel のフレームワーク側が
+    // reflection / 文字列 FQN / 自動ディスパッチで呼び出す規約的エントリポイント群
+    "**/app/Casts/**",
+    "**/app/Observers/**",
+    "**/app/Policies/**",
+    "**/app/Events/**",
+    "**/app/Jobs/**",
+    "**/app/Notifications/**",
+    "**/app/Mail/**",
+    "**/app/Rules/**",
+    "**/app/Broadcasting/**",
     // IDE 補助の自動生成ファイル
     "**/_ide_helper.php",
     "**/_ide_helper_models.php",
@@ -2055,11 +2073,30 @@ const LARAVEL_PRESET_EXCLUDE_GLOBS: &[&str] = &[
 
 /// フレームワーク名から対応する除外 glob プリセットを返す。
 /// 未知のフレームワーク名はエラー。
-fn resolve_framework_globs(framework: Option<&str>) -> Result<&'static [&'static str]> {
+///
+/// `**/app/X/**` / `**/database/X/**` のような app-prefix 付きパターンには、
+/// `**/X/**` という prefix 省略版も自動で追加する。これにより
+/// `--dir <project>/app` のように `app/` 直下を指した場合でも、
+/// ファイルパス `Http/Controllers/...` がプリセットで除外される。
+fn resolve_framework_globs(framework: Option<&str>) -> Result<Vec<String>> {
     match framework {
-        None => Ok(&[]),
+        None => Ok(Vec::new()),
         Some(name) => match name.to_ascii_lowercase().as_str() {
-            "laravel" => Ok(LARAVEL_PRESET_EXCLUDE_GLOBS),
+            "laravel" => {
+                let mut globs: Vec<String> =
+                    Vec::with_capacity(LARAVEL_PRESET_EXCLUDE_GLOBS.len() * 2);
+                for pat in LARAVEL_PRESET_EXCLUDE_GLOBS {
+                    globs.push((*pat).to_string());
+                    // app/database prefix の省略版を並列で登録 (--dir が app/ 直下の場合の fallback)
+                    if let Some(rest) = pat
+                        .strip_prefix("**/app/")
+                        .or_else(|| pat.strip_prefix("**/database/"))
+                    {
+                        globs.push(format!("**/{rest}"));
+                    }
+                }
+                Ok(globs)
+            }
             other => Err(AstroError::new(
                 ErrorCode::InvalidRequest,
                 format!("Unknown framework preset: {other} (supported: laravel)"),
@@ -2210,7 +2247,7 @@ pub fn cmd_dead_code(
 
     // glob 除外: フレームワークプリセット + ユーザ指定
     let framework_globs = resolve_framework_globs(framework)?;
-    let mut combined_globs: Vec<&str> = framework_globs.to_vec();
+    let mut combined_globs: Vec<&str> = framework_globs.iter().map(String::as_str).collect();
     for pat in extra_exclude_globs {
         combined_globs.push(pat.as_str());
     }
@@ -2255,7 +2292,7 @@ pub fn cmd_dead_code(
     };
 
     let scanned_files = files.len();
-    let dead_symbols = detect_dead_symbols_from_files(dir, &files, glob);
+    let dead_symbols = detect_dead_symbols_from_files(dir, &files);
 
     let result = DeadCodeResult {
         dir: canonical_dir.to_string_lossy().to_string(),
@@ -3136,7 +3173,7 @@ def new_public_api():
         fs::write(repo.join("hand.py"), "def unused_hand():\n    pass\n").expect("write");
 
         let files = vec![repo.join("gen.py"), repo.join("hand.py")];
-        let dead = detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files, None);
+        let dead = detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
         let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
 
         assert!(
