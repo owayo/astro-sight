@@ -3540,6 +3540,152 @@ fn review_on_clean_repo() {
     assert!(json.is_object(), "review は JSON オブジェクトを返すべき");
 }
 
+/// 新規ファイル追加の unified diff 片を組み立てるテストヘルパー。
+fn make_new_file_diff(path: &str, content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let n = lines.len();
+    let body: String = lines.iter().map(|l| format!("+{l}\n")).collect();
+    format!(
+        "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{n} @@\n{body}"
+    )
+}
+
+#[test]
+fn review_respects_framework_laravel_preset() {
+    // review が dead-code と同じ `--framework laravel` プリセットを尊重し、
+    // app/Http/Controllers 等を dead_symbols から除外することを検証する。
+    // 対象プロジェクトのコードは引用せず、Laravel-ish な最小フィクスチャを一次創作する。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("app/Http/Controllers")).unwrap();
+    std::fs::create_dir_all(root.join("app/Services")).unwrap();
+
+    let controller_src =
+        "<?php\nclass SampleController {\n    public function index() { return 'x'; }\n}\n";
+    let service_src =
+        "<?php\nclass SampleService {\n    public function loadProfile() { return []; }\n}\n";
+
+    std::fs::write(
+        root.join("app/Http/Controllers/SampleController.php"),
+        controller_src,
+    )
+    .unwrap();
+    std::fs::write(root.join("app/Services/SampleService.php"), service_src).unwrap();
+
+    let mut diff = String::new();
+    diff.push_str(&make_new_file_diff(
+        "app/Http/Controllers/SampleController.php",
+        controller_src,
+    ));
+    diff.push_str(&make_new_file_diff(
+        "app/Services/SampleService.php",
+        service_src,
+    ));
+    let diff_path = root.join("changes.patch");
+    std::fs::write(&diff_path, &diff).unwrap();
+
+    // --framework laravel なし: Controllers/SampleController も dead に出る (回帰担保)
+    let output = cargo_bin()
+        .args([
+            "review",
+            "--dir",
+            root.to_str().unwrap(),
+            "--diff-file",
+            diff_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead_without: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        dead_without.iter().any(|n| n.contains("SampleController")),
+        "preset なしでは app/Http/Controllers 配下が dead_symbols に残るべき: {dead_without:?}"
+    );
+
+    // --framework laravel あり: Controllers/SampleController は除外、Services/SampleService は残る
+    let output = cargo_bin()
+        .args([
+            "review",
+            "--dir",
+            root.to_str().unwrap(),
+            "--diff-file",
+            diff_path.to_str().unwrap(),
+            "--framework",
+            "laravel",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead_with: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !dead_with.iter().any(|n| n.contains("SampleController")),
+        "Laravel preset で app/Http/Controllers 配下は dead_symbols から除外されるべき: {dead_with:?}"
+    );
+    assert!(
+        dead_with
+            .iter()
+            .any(|n| n.contains("SampleService") || n.contains("loadProfile")),
+        "app/Services/ は Laravel preset 対象外のため dead 判定が残るべき: {dead_with:?}"
+    );
+}
+
+#[test]
+fn review_framework_unknown_errors() {
+    // 未知の framework 値は cmd_dead_code と同じエラー形式で拒否されること。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("dummy.patch"),
+        "diff --git a/dummy.php b/dummy.php\nnew file mode 100644\n--- /dev/null\n+++ b/dummy.php\n@@ -0,0 +1,1 @@\n+<?php\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "review",
+            "--dir",
+            root.to_str().unwrap(),
+            "--diff-file",
+            root.join("dummy.patch").to_str().unwrap(),
+            "--framework",
+            "djangular",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(
+        !output.status.success(),
+        "未知の framework 名はエラー (exit != 0)"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("Unknown framework preset") || combined.contains("INVALID_REQUEST"),
+        "エラーメッセージに framework 未対応が示される: {combined}"
+    );
+}
+
 // ---- Java 多言語統合テスト ----
 
 #[test]

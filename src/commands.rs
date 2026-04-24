@@ -770,7 +770,12 @@ pub fn cmd_review(
     min_confidence: f64,
     pretty: bool,
     hook: bool,
+    framework: Option<&str>,
+    extra_exclude_dirs: &[String],
+    extra_exclude_globs: &[String],
 ) -> Result<()> {
+    // framework 指定は早期に検証して未知名はここで弾く (dead_symbols 検出に到達する前に)。
+    let framework_globs = resolve_framework_globs(framework)?;
     // 1. diff 取得（context コマンドと同じ入力方式）
     let diff_input = if let Some(d) = diff {
         d.to_string()
@@ -820,8 +825,31 @@ pub fn cmd_review(
     // 5. API surface diff
     let api_changes = detect_api_changes(dir, base, &diff_files);
 
-    // 6. dead symbol 検出
-    let dead_symbols = detect_dead_symbols(dir, &diff_files);
+    // 6. dead symbol 検出 (framework プリセット + ユーザ指定 exclude を適用)
+    //    review では vendor / tests / build を常に除外する固定挙動。
+    //    必要になった段階で dead-code と同様の --include-* オプションを追加する。
+    let dead_symbols = match std::fs::canonicalize(dir) {
+        Ok(canonical_dir) => {
+            let default_excludes = resolve_dead_code_excludes(false, false, false);
+            let mut excludes: Vec<&str> = default_excludes.to_vec();
+            for name in extra_exclude_dirs {
+                excludes.push(name.as_str());
+            }
+            let mut combined_globs: Vec<&str> = framework_globs.to_vec();
+            for pat in extra_exclude_globs {
+                combined_globs.push(pat.as_str());
+            }
+            let files = filter_diff_files_for_dead_code(
+                &canonical_dir,
+                &diff_files,
+                &excludes,
+                &combined_globs,
+                None,
+            )?;
+            detect_dead_symbols_from_files(dir, &files, None)
+        }
+        Err(_) => Vec::new(),
+    };
 
     let result = ReviewResult {
         impact,
@@ -1469,21 +1497,6 @@ fn reconcile_api_symbols(
     (kept_added, kept_removed)
 }
 
-fn detect_dead_symbols(
-    dir: &str,
-    diff_files: &[crate::models::impact::DiffFile],
-) -> Vec<DeadSymbol> {
-    let Ok(canonical_dir) = std::fs::canonicalize(dir) else {
-        return Vec::new();
-    };
-    let files: Vec<std::path::PathBuf> = diff_files
-        .iter()
-        .filter(|f| f.new_path != "/dev/null")
-        .map(|f| canonical_dir.join(&f.new_path))
-        .collect();
-    detect_dead_symbols_from_files(dir, &files, None)
-}
-
 /// qualname (`Container.method`) から末尾セグメントのみを抜き出す。
 /// `a.b.c` → `c`、`foo` → `foo`。
 fn bare_name(qualname: &str) -> &str {
@@ -2064,6 +2077,57 @@ fn path_is_default_excluded(path: &str, excludes: &[&str]) -> bool {
     path.split('/').any(|seg| excludes.contains(&seg))
 }
 
+/// `diff_files` を dead-code 検出対象に絞り込む共通ヘルパー。
+/// `cmd_dead_code` と `cmd_review` の両者から呼び、除外ロジックを一元化する。
+///
+/// - `excludes`: 既定除外ディレクトリ名 (vendor / tests / build 等、呼び出し側で合成済み)
+/// - `combined_exclude_globs`: framework プリセット + ユーザ指定 `--exclude-glob` を合成したパターン列
+/// - `glob`: positive glob フィルタ。指定時は whitelist されたもののみ残す。
+pub(crate) fn filter_diff_files_for_dead_code(
+    canonical_dir: &std::path::Path,
+    diff_files: &[crate::models::impact::DiffFile],
+    excludes: &[&str],
+    combined_exclude_globs: &[&str],
+    glob: Option<&str>,
+) -> Result<Vec<std::path::PathBuf>> {
+    let mut files: Vec<std::path::PathBuf> = diff_files
+        .iter()
+        .filter(|f| f.new_path != "/dev/null")
+        .map(|f| canonical_dir.join(&f.new_path))
+        .filter(|p| {
+            crate::language::LangId::from_path(camino::Utf8Path::new(p.to_str().unwrap_or("")))
+                .is_ok()
+        })
+        .filter(|p| !path_is_default_excluded(&p.to_string_lossy(), excludes))
+        .collect();
+
+    if glob.is_some() || !combined_exclude_globs.is_empty() {
+        let mut ob = ignore::overrides::OverrideBuilder::new(canonical_dir);
+        if let Some(pattern) = glob {
+            ob.add(pattern)?;
+        } else {
+            ob.add("**/*")?;
+        }
+        for pat in combined_exclude_globs {
+            let negated = if pat.starts_with('!') {
+                (*pat).to_string()
+            } else {
+                format!("!{pat}")
+            };
+            ob.add(&negated)?;
+        }
+        let overrides = ob.build()?;
+        files.retain(|p| !overrides.matched(p, false).is_ignore());
+        if glob.is_some() {
+            files.retain(|p| {
+                let m = overrides.matched(p, false);
+                m.is_whitelist() || m.is_none()
+            });
+        }
+    }
+    Ok(files)
+}
+
 /// PHPUnit 命名規約に合致するシンボルかどうかを判定する。
 ///
 /// PHP プロジェクト (Laravel を含む) ではテストメソッドは `public function testXxx` や
@@ -2174,47 +2238,13 @@ pub fn cmd_dead_code(
         }
 
         let diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
-        let mut files: Vec<std::path::PathBuf> = diff_files
-            .iter()
-            .filter(|f| f.new_path != "/dev/null")
-            .map(|f| canonical_dir.join(&f.new_path))
-            .filter(|p| {
-                // パース可能な言語のファイルのみ対象
-                crate::language::LangId::from_path(camino::Utf8Path::new(p.to_str().unwrap_or("")))
-                    .is_ok()
-            })
-            .filter(|p| {
-                // 既定除外ディレクトリ配下は dead-code 対象から落とす
-                !path_is_default_excluded(&p.to_string_lossy(), &excludes)
-            })
-            .collect();
-        // glob フィルタ (正) と除外 glob (負) を同じ OverrideBuilder にまとめる
-        if glob.is_some() || !combined_globs.is_empty() {
-            let mut ob = ignore::overrides::OverrideBuilder::new(&canonical_dir);
-            if let Some(pattern) = glob {
-                ob.add(pattern)?;
-            } else {
-                ob.add("**/*")?;
-            }
-            for pat in &combined_globs {
-                let negated = if pat.starts_with('!') {
-                    (*pat).to_string()
-                } else {
-                    format!("!{pat}")
-                };
-                ob.add(&negated)?;
-            }
-            let overrides = ob.build()?;
-            files.retain(|p| !overrides.matched(p, false).is_ignore());
-            // glob が指定されていた場合は「whitelist されたもの」のみ残す必要もある
-            if glob.is_some() {
-                files.retain(|p| {
-                    let m = overrides.matched(p, false);
-                    m.is_whitelist() || m.is_none()
-                });
-            }
-        }
-        files
+        filter_diff_files_for_dead_code(
+            &canonical_dir,
+            &diff_files,
+            &excludes,
+            &combined_globs,
+            glob,
+        )?
     } else {
         crate::engine::refs::collect_files_with_excludes(
             &canonical_dir,

@@ -331,6 +331,9 @@ fn run(cli: Cli) -> Result<()> {
             staged,
             min_confidence,
             hook,
+            framework,
+            exclude_dirs,
+            exclude_globs,
         } => cmd_review(
             &service,
             &dir,
@@ -342,6 +345,9 @@ fn run(cli: Cli) -> Result<()> {
             min_confidence,
             pretty,
             hook,
+            framework.as_deref(),
+            &exclude_dirs,
+            &exclude_globs,
         ),
         Commands::Cochange {
             dir,

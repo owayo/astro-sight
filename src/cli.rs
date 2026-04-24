@@ -324,6 +324,23 @@ pub enum Commands {
         /// Append triage hint for AI agent hooks
         #[arg(long)]
         hook: bool,
+
+        /// Framework preset を指定して dead_symbols からフレームワーク規約の
+        /// エントリポイントを除外する。現在対応: "laravel" (database/migrations,
+        /// app/Http/Controllers, app/Http/Middleware, app/Providers 等)
+        #[arg(long)]
+        framework: Option<String>,
+
+        /// dead_symbols 検出時に追加で除外するディレクトリ名 (完全一致、複数指定可)。
+        /// 例: --exclude-dir generated --exclude-dir .cache
+        #[arg(long = "exclude-dir", value_name = "NAME", num_args = 0..)]
+        exclude_dirs: Vec<String>,
+
+        /// dead_symbols 検出時に追加で除外する glob パターン (ワークスペース相対、複数指定可)。
+        /// 先頭の `!` は不要 (内部で negative pattern として扱う)。
+        /// 例: --exclude-glob 'app/Legacy/**' --exclude-glob 'config/*.php'
+        #[arg(long = "exclude-glob", value_name = "PATTERN", num_args = 0..)]
+        exclude_globs: Vec<String>,
     },
 
     /// Detect dead (unreferenced) exported symbols

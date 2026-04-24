@@ -207,9 +207,17 @@ astro-sight review --dir . --git --base HEAD~3
 
 # External patch file (useful when rename-aware diff is already generated)
 astro-sight review --dir . --diff-file changes.patch
+
+# Laravel project: exclude framework conventions (Controllers, migrations, etc.) from dead_symbols
+astro-sight review --dir . --git --framework laravel
+
+# Additional ad-hoc exclusions for dead_symbols detection
+astro-sight review --dir . --git --exclude-dir generated --exclude-glob 'app/Legacy/**'
 ```
 
 Output: JSON with `impact` (ContextResult), `missing_cochanges` (files expected to change together but absent from diff), `api_changes` (added/removed/modified public symbols), `dead_symbols` (public symbols with zero non-definition references in changed files).
+
+`--framework` / `--exclude-dir` / `--exclude-glob` narrow the `dead_symbols` portion only; they share semantics with the same flags on `dead-code`. `review` always excludes `vendor/` / `tests/` / build artifacts from `dead_symbols`.
 
 ### `imports` — Import/Export Extraction
 
