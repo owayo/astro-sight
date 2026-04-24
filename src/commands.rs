@@ -1007,8 +1007,15 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> HookJsonBuild {
     let has_api_changes = !result.api_changes.added.is_empty()
         || !result.api_changes.removed.is_empty()
         || !result.api_changes.modified.is_empty();
+    // api.added は新規 pub シンボル追加 (additive) で既存コードを壊さないため Stop hook の
+    // ブロッキング対象から外し informational 扱いにする。api.removed / api.modified は
+    // 破壊的変更の可能性があるため従来どおり blocking。
+    let has_api_breaking =
+        !result.api_changes.removed.is_empty() || !result.api_changes.modified.is_empty();
     if has_api_changes {
-        has_blocking_issues = true;
+        if has_api_breaking {
+            has_blocking_issues = true;
+        }
         has_any_output = true;
         let mut api = serde_json::Map::new();
         if !result.api_changes.added.is_empty() {
@@ -1233,6 +1240,15 @@ fn detect_api_changes(
         .map(|d| crate::engine::gitattributes::GitAttributes::load(&d))
         .unwrap_or_default();
 
+    // 同一 diff 内で追加/変更されたファイルパスの集合。新規 pub シンボルが diff 内の
+    // 別ファイルから参照されていれば「同一 diff 内で完結して使用されている」と判断し、
+    // api.add から除外する（binary crate の pub struct が同 diff 内で use されるケース等）。
+    let diff_new_paths: HashSet<String> = diff_files
+        .iter()
+        .filter(|f| f.new_path != "/dev/null")
+        .map(|f| f.new_path.clone())
+        .collect();
+
     let canonical_dir = std::fs::canonicalize(dir).ok();
     for df in diff_files {
         // 新旧いずれかが生成物扱いなら API 変更検出の対象外
@@ -1251,12 +1267,23 @@ fn detect_api_changes(
 
         if df.old_path == "/dev/null" {
             if let Some(new_syms) = extract_exported_symbols_from_file(dir, &df.new_path) {
+                // Rust binary crate (src/lib.rs が存在しない crate) の pub シンボルは
+                // クレート外から到達できないため api.add の対象外とする。
+                let is_binary_rust_crate = is_binary_only_rust_crate(dir, &df.new_path);
                 // 新規ファイルでも、同一ファイル内で呼ばれている関数は内部ヘルパーと
                 // 判断して api.add から除外する。CLI スクリプト (main から内部関数を
                 // 呼び出す構造) を新規追加した時に全関数が api.add に積まれるノイズを防ぐ。
                 let in_file_callees = extract_in_file_callees(dir, &df.new_path);
                 for (name, kind, sig) in &new_syms {
+                    if is_binary_rust_crate {
+                        continue;
+                    }
                     if is_internally_connected(&in_file_callees, name) {
+                        continue;
+                    }
+                    // 同一 diff 内の別ファイルから参照されている新規シンボルは
+                    // 「コミット内で完結」として api.add から除外する。
+                    if is_used_in_diff_paths(dir, name, &df.new_path, &diff_new_paths) {
                         continue;
                     }
                     added.push(ApiSymbolCandidate {
@@ -1307,6 +1334,10 @@ fn detect_api_changes(
         // Python の同一ファイル内で接続済みの private 関数が api.add に出る誤検出対策）。
         let in_file_callees = extract_in_file_callees(dir, &df.new_path);
 
+        // Rust binary crate (src/lib.rs が存在しない crate) の pub シンボルは
+        // クレート外から到達できないため api.add の対象外とする。
+        let is_binary_rust_crate = is_binary_only_rust_crate(dir, &df.new_path);
+
         // rename 検出用: 同ファイル内に新規追加された全シンボル名を追跡する
         // （internally_connected で除外される内部ヘルパーも含む）。削除シンボルと
         // 組み合わせて「rename + 実装置換」の api.rm ノイズを抑止する。
@@ -1316,8 +1347,16 @@ fn detect_api_changes(
         for (name, kind, sig) in &new_syms {
             if !old_map.contains_key(name.as_str()) {
                 new_symbols_in_current_file.insert(name.clone());
+                if is_binary_rust_crate {
+                    continue;
+                }
                 // qualname または bare name が同一ファイル内の call に存在すれば内部参照
                 if is_internally_connected(&in_file_callees, name) {
+                    continue;
+                }
+                // 同一 diff 内の別ファイルから参照されている新規シンボルは
+                // 「コミット内で完結」として api.add から除外する（pub struct の import 等）。
+                if is_used_in_diff_paths(dir, name, &df.new_path, &diff_new_paths) {
                     continue;
                 }
                 added.push(ApiSymbolCandidate {
@@ -1772,6 +1811,68 @@ fn is_internally_connected(callees: &std::collections::HashSet<String>, qualname
         && callees.contains(bare)
     {
         return true;
+    }
+    false
+}
+
+/// 新規追加シンボル `name` が、同一 diff 内の別ファイル（`diff_new_paths`）から
+/// 参照されているかを判定する。参照があれば「コミット内で完結して使用されている」
+/// として api.add から除外する（pub struct の import や型参照が典型例）。
+///
+/// `defining_file` / `diff_new_paths` は `dir` からの相対パスを想定する。
+/// 参照検索に失敗した場合は false を返し、保守的に api.add に残す。
+fn is_used_in_diff_paths(
+    dir: &str,
+    name: &str,
+    defining_file: &str,
+    diff_new_paths: &HashSet<String>,
+) -> bool {
+    use crate::models::reference::RefKind;
+    // qualname (`Container.method`) の場合は bare name で参照検索する
+    let search_name = bare_name(name);
+    if search_name.is_empty() {
+        return false;
+    }
+    let service = AppService::new();
+    let Ok(refs_result) = service.find_references(search_name, dir, None) else {
+        return false;
+    };
+    let defining_path = std::path::Path::new(defining_file);
+    refs_result.references.iter().any(|r| {
+        if r.kind == Some(RefKind::Definition) {
+            return false;
+        }
+        let ref_path = r.path.as_str();
+        std::path::Path::new(ref_path) != defining_path && diff_new_paths.contains(ref_path)
+    })
+}
+
+/// `file_path` が属する Rust crate が binary-only (`src/lib.rs` を持たず外部から
+/// `pub` シンボルへ到達できない構成) かを判定する。binary-only crate では `pub` は
+/// クレート内モジュール境界の役割しか持たないため api.add の対象から除外する。
+///
+/// 判定方針: `file_path` (dir 相対) から祖先方向に遡って最も近い `Cargo.toml` を
+/// 見つけ、そのディレクトリに `src/lib.rs` が存在しなければ binary-only とみなす。
+/// Rust ファイル以外や `Cargo.toml` が見つからない場合は false を返す。
+fn is_binary_only_rust_crate(dir: &str, file_path: &str) -> bool {
+    let path = std::path::Path::new(file_path);
+    if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+        return false;
+    }
+    let full = std::path::Path::new(dir).join(file_path);
+    let dir_canonical = std::fs::canonicalize(dir).ok();
+    let mut current = full.parent();
+    while let Some(d) = current {
+        if d.join("Cargo.toml").is_file() {
+            return !d.join("src").join("lib.rs").is_file();
+        }
+        // dir より上には探索しない
+        if let (Some(root), Ok(canon)) = (dir_canonical.as_ref(), std::fs::canonicalize(d))
+            && canon == *root
+        {
+            return false;
+        }
+        current = d.parent();
     }
     false
 }
@@ -3531,6 +3632,229 @@ if __name__ == \"__main__\":
         );
     }
 
+    /// 2026-04-24 レポート再現: binary crate (src/lib.rs なし) で新規 pub struct を
+    /// 追加し、同一 diff 内の別ファイルから use で取り込むケース。gitlab-cli の `MrDiff`
+    /// 追加と同じ構造。binary-only crate のため api.add の対象外になるべき。
+    #[test]
+    fn detect_api_changes_binary_rust_crate_excludes_pub_additions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let cargo_toml = "\
+[package]
+name = \"demo-bin\"
+version = \"0.1.0\"
+edition = \"2021\"
+
+[dependencies]
+";
+        let models_before = "pub struct Issue { pub id: u32 }\n";
+        let main_before = "\
+use crate::models::Issue;
+
+fn main() {
+    let _ = Issue { id: 1 };
+}
+
+mod models;
+";
+        git_commit_files(
+            repo,
+            &[
+                ("Cargo.toml", cargo_toml),
+                ("src/models.rs", models_before),
+                ("src/main.rs", main_before),
+            ],
+            "initial",
+        );
+
+        // 新規 pub struct MrDiff を models.rs に追加し、main.rs の use に追随させる
+        let models_after = "\
+pub struct Issue { pub id: u32 }
+
+pub struct MrDiff {
+    pub old_path: String,
+    pub new_path: String,
+}
+";
+        let main_after = "\
+use crate::models::{Issue, MrDiff};
+
+fn main() {
+    let _ = Issue { id: 1 };
+    let _ = MrDiff { old_path: String::new(), new_path: String::new() };
+}
+
+mod models;
+";
+        fs::write(repo.join("src/models.rs"), models_after).expect("write models");
+        fs::write(repo.join("src/main.rs"), main_after).expect("write main");
+
+        let diff_files = vec![
+            crate::models::impact::DiffFile {
+                old_path: "src/models.rs".to_string(),
+                new_path: "src/models.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 1,
+                    new_start: 1,
+                    new_count: 6,
+                }],
+            },
+            crate::models::impact::DiffFile {
+                old_path: "src/main.rs".to_string(),
+                new_path: "src/main.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 8,
+                    new_start: 1,
+                    new_count: 8,
+                }],
+            },
+        ];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let added: Vec<&str> = api_changes.added.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            !added.contains(&"MrDiff"),
+            "binary crate (src/lib.rs なし) の新規 pub struct は api.add に出してはならない。got: {added:?}"
+        );
+    }
+
+    /// library crate (src/lib.rs あり) では新規 pub シンボルを api.add に残す。
+    /// binary crate 判定の副作用で library crate のシンボルまで消さないことを保証する。
+    #[test]
+    fn detect_api_changes_library_rust_crate_keeps_pub_additions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let cargo_toml = "\
+[package]
+name = \"demo-lib\"
+version = \"0.1.0\"
+edition = \"2021\"
+";
+        let lib_before = "pub mod models;\n";
+        let models_before = "pub struct Issue { pub id: u32 }\n";
+        git_commit_files(
+            repo,
+            &[
+                ("Cargo.toml", cargo_toml),
+                ("src/lib.rs", lib_before),
+                ("src/models.rs", models_before),
+            ],
+            "initial",
+        );
+
+        // library crate に新規 pub struct を追加（同一 diff 内では参照しない）
+        let models_after = "\
+pub struct Issue { pub id: u32 }
+
+pub struct LibraryApi { pub name: String }
+";
+        fs::write(repo.join("src/models.rs"), models_after).expect("write models");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/models.rs".to_string(),
+            new_path: "src/models.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 4,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let added: Vec<&str> = api_changes.added.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            added.contains(&"LibraryApi"),
+            "library crate (src/lib.rs あり) の新規 pub struct は api.add に残すべき。got: {added:?}"
+        );
+    }
+
+    /// lib.rs 有りクレートでも、新規 pub シンボルが同一 diff 内の別ファイルから
+    /// 参照されていれば api.add から除外する。
+    #[test]
+    fn detect_api_changes_library_used_in_same_diff_excluded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let cargo_toml = "\
+[package]
+name = \"demo-lib\"
+version = \"0.1.0\"
+edition = \"2021\"
+";
+        let lib_before = "pub mod models;\npub mod consumer;\n";
+        let models_before = "pub struct Issue { pub id: u32 }\n";
+        let consumer_before = "use crate::models::Issue;\n\npub fn use_issue(i: Issue) {}\n";
+        git_commit_files(
+            repo,
+            &[
+                ("Cargo.toml", cargo_toml),
+                ("src/lib.rs", lib_before),
+                ("src/models.rs", models_before),
+                ("src/consumer.rs", consumer_before),
+            ],
+            "initial",
+        );
+
+        // models に新規 pub struct を追加し、同一 diff 内で consumer.rs から参照
+        let models_after = "\
+pub struct Issue { pub id: u32 }
+
+pub struct MrDiff { pub path: String }
+";
+        let consumer_after = "\
+use crate::models::{Issue, MrDiff};
+
+pub fn use_issue(i: Issue) {}
+pub fn use_diff(d: MrDiff) {}
+";
+        fs::write(repo.join("src/models.rs"), models_after).expect("write models");
+        fs::write(repo.join("src/consumer.rs"), consumer_after).expect("write consumer");
+
+        let diff_files = vec![
+            crate::models::impact::DiffFile {
+                old_path: "src/models.rs".to_string(),
+                new_path: "src/models.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 1,
+                    new_start: 1,
+                    new_count: 4,
+                }],
+            },
+            crate::models::impact::DiffFile {
+                old_path: "src/consumer.rs".to_string(),
+                new_path: "src/consumer.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 3,
+                    new_start: 1,
+                    new_count: 5,
+                }],
+            },
+        ];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let added: Vec<&str> = api_changes.added.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            !added.contains(&"MrDiff"),
+            "同一 diff 内で参照される新規 pub struct は api.add から除外すべき。got: {added:?}"
+        );
+    }
+
     // ------------------------------------------------------------------
     // is_internally_connected ヘルパー
     // ------------------------------------------------------------------
@@ -3557,6 +3881,63 @@ if __name__ == \"__main__\":
         callees.insert("other_fn".to_string());
         assert!(!is_internally_connected(&callees, "Reviewer.execute"));
         assert!(!is_internally_connected(&callees, "execute"));
+    }
+
+    // ------------------------------------------------------------------
+    // is_binary_only_rust_crate ヘルパー
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn is_binary_only_rust_crate_true_when_no_lib_rs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        fs::write(repo.join("Cargo.toml"), "[package]\nname = \"b\"\n").expect("cargo");
+        fs::create_dir_all(repo.join("src")).expect("mkdir src");
+        fs::write(repo.join("src/main.rs"), "fn main() {}\n").expect("main");
+
+        assert!(is_binary_only_rust_crate(
+            repo.to_str().expect("utf-8"),
+            "src/main.rs",
+        ));
+    }
+
+    #[test]
+    fn is_binary_only_rust_crate_false_when_lib_rs_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        fs::write(repo.join("Cargo.toml"), "[package]\nname = \"l\"\n").expect("cargo");
+        fs::create_dir_all(repo.join("src")).expect("mkdir src");
+        fs::write(repo.join("src/lib.rs"), "pub fn public_api() {}\n").expect("lib");
+
+        assert!(!is_binary_only_rust_crate(
+            repo.to_str().expect("utf-8"),
+            "src/lib.rs",
+        ));
+    }
+
+    #[test]
+    fn is_binary_only_rust_crate_false_for_non_rust_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        fs::write(repo.join("Cargo.toml"), "[package]\nname = \"b\"\n").expect("cargo");
+
+        assert!(!is_binary_only_rust_crate(
+            repo.to_str().expect("utf-8"),
+            "src/main.py",
+        ));
+    }
+
+    #[test]
+    fn is_binary_only_rust_crate_false_without_cargo_toml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        fs::create_dir_all(repo.join("src")).expect("mkdir src");
+        fs::write(repo.join("src/main.rs"), "fn main() {}\n").expect("main");
+
+        assert!(!is_binary_only_rust_crate(
+            repo.to_str().expect("utf-8"),
+            "src/main.rs",
+        ));
     }
 
     #[test]
@@ -3889,9 +4270,9 @@ def new_public_api():
         );
     }
 
-    /// api.add があれば blocking になる
+    /// api.add のみの場合は informational として出力されるが blocking にはしない
     #[test]
-    fn build_review_hook_json_api_changes_are_blocking() {
+    fn build_review_hook_json_api_add_only_is_informational() {
         let dir = tempfile::tempdir().expect("tempdir");
 
         let result = ReviewResult {
@@ -3913,7 +4294,66 @@ def new_public_api():
 
         let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
         assert!(build.value.is_some(), "api.add は hook JSON に出すべき");
-        assert!(build.is_blocking, "api.add があれば blocking にすべき");
+        assert!(
+            !build.is_blocking,
+            "api.add のみ (additive) は Stop hook を止めないべき"
+        );
+    }
+
+    /// api.removed は破壊的変更の可能性があるため blocking になる
+    #[test]
+    fn build_review_hook_json_api_removed_is_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let result = ReviewResult {
+            impact: crate::models::impact::ContextResult {
+                changes: Vec::new(),
+            },
+            missing_cochanges: Vec::new(),
+            api_changes: ApiChanges {
+                added: Vec::new(),
+                removed: vec![ApiSymbol {
+                    name: "foo".to_string(),
+                    kind: "function".to_string(),
+                    file: "a.rs".to_string(),
+                }],
+                modified: Vec::new(),
+            },
+            dead_symbols: Vec::new(),
+        };
+
+        let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
+        assert!(build.value.is_some(), "api.rm は hook JSON に出すべき");
+        assert!(build.is_blocking, "api.rm は blocking にすべき");
+    }
+
+    /// api.modified は破壊的変更の可能性があるため blocking になる
+    #[test]
+    fn build_review_hook_json_api_modified_is_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let result = ReviewResult {
+            impact: crate::models::impact::ContextResult {
+                changes: Vec::new(),
+            },
+            missing_cochanges: Vec::new(),
+            api_changes: ApiChanges {
+                added: Vec::new(),
+                removed: Vec::new(),
+                modified: vec![ApiSymbolChange {
+                    name: "foo".to_string(),
+                    kind: "function".to_string(),
+                    file: "a.rs".to_string(),
+                    old_signature: Some("fn foo()".to_string()),
+                    new_signature: Some("fn foo(x: u32)".to_string()),
+                }],
+            },
+            dead_symbols: Vec::new(),
+        };
+
+        let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
+        assert!(build.value.is_some(), "api.mod は hook JSON に出すべき");
+        assert!(build.is_blocking, "api.mod は blocking にすべき");
     }
 
     #[test]
