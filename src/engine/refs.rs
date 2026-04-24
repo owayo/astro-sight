@@ -222,6 +222,9 @@ fn is_definition_context(node: Node<'_>, definition_kinds: &[&str], lang_id: Lan
     if lang_id == LangId::Ruby {
         return is_ruby_definition_context(node);
     }
+    if lang_id == LangId::Php {
+        return is_php_definition_context(node);
+    }
 
     if let Some(parent) = node.parent() {
         // 親ノードが定義ノードかチェック
@@ -236,6 +239,31 @@ fn is_definition_context(node: Node<'_>, definition_kinds: &[&str], lang_id: Lan
         }
     }
     false
+}
+
+/// PHP: 識別子が「宣言の `name` フィールド」であるときだけ `Definition` とみなす。
+///
+/// 単純な parent/grandparent 走査では `class Derived extends AbstractBase` の
+/// `AbstractBase` や `implements InterfaceX` の `InterfaceX` が grandparent
+/// `class_declaration` にぶら下がって def と誤判定され、継承ツリーを経由した
+/// 参照がすべて 0 件になる (dead-code が基底 class / interface を大量に FP とする根因)。
+/// field_name が "name" のものだけを定義と数え、`base_clause` / `class_interface_clause` /
+/// `use_declaration` 等の中の識別子は ref として分類する。
+fn is_php_definition_context(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    match parent.kind() {
+        "function_definition"
+        | "class_declaration"
+        | "method_declaration"
+        | "interface_declaration"
+        | "enum_declaration"
+        | "trait_declaration" => parent
+            .child_by_field_name("name")
+            .is_some_and(|name| name.id() == node.id()),
+        _ => false,
+    }
 }
 
 fn is_ruby_definition_context(node: Node<'_>) -> bool {

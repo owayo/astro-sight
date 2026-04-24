@@ -373,7 +373,7 @@ fn context_with_diff() {
     // Create a synthetic diff
     let diff = r#"--- a/src/engine/symbols.rs
 +++ b/src/engine/symbols.rs
-@@ -733,7 +733,7 @@
+@@ -788,7 +788,7 @@
 -pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
 +pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, include_refs: bool) -> Result<Vec<Symbol>> {
      let query_src = symbol_query(lang_id);
@@ -1010,7 +1010,7 @@ fn context_batch_refs_consistency() {
     // with the batch refs approach (same output as before)
     let diff = r#"--- a/src/engine/symbols.rs
 +++ b/src/engine/symbols.rs
-@@ -733,7 +733,7 @@
+@@ -788,7 +788,7 @@
 -pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
 +pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, flag: bool) -> Result<Vec<Symbol>> {
      let query_src = symbol_query(lang_id);
@@ -1678,7 +1678,7 @@ fn impact_with_unresolved() {
     // Diff that changes extract_symbols signature → callers in other files are unresolved
     let diff = r#"--- a/src/engine/symbols.rs
 +++ b/src/engine/symbols.rs
-@@ -733,7 +733,7 @@
+@@ -788,7 +788,7 @@
 -pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
 +pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, flag: bool) -> Result<Vec<Symbol>> {
      let query_src = symbol_query(lang_id);
@@ -4289,6 +4289,176 @@ fn dead_code_unknown_framework_is_rejected() {
         stdout.contains("Unknown framework preset") || stdout.contains("INVALID_REQUEST"),
         "エラーメッセージに framework 未対応が示される: {stdout}"
     );
+}
+
+#[test]
+fn dead_code_php_abstract_methods_and_interface_decls_are_not_dead() {
+    // PHP の `abstract public function ...` は子クラスでの実装が必須、
+    // `interface X { public function y(); }` は implementer が必ず提供するため、
+    // 宣言そのものを dead として報告するのは誤検出。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+
+    std::fs::write(
+        root.join("src/abstract_interface_sample.php"),
+        "<?php\n\
+abstract class AbstractCommand {\n\
+    abstract public function mustImplement(): void;\n\
+    public function concreteHelper(): int { return 0; }\n\
+}\n\
+interface BoundaryContract {\n\
+    public function boundaryEntry(): void;\n\
+    public function boundaryExit(): void;\n\
+}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+
+    for banned in ["mustImplement", "boundaryEntry", "boundaryExit"] {
+        assert!(
+            !names.iter().any(|n| n.contains(banned)),
+            "{banned} は abstract/interface 宣言のため dead 対象から外れるべき: {names:?}"
+        );
+    }
+    // abstract class の通常 (concrete) method は従来どおり dead 判定される
+    // (子クラスからの呼び出しが refs で拾えるかは別問題)
+    assert!(
+        names.iter().any(|n| n.contains("concreteHelper")),
+        "abstract class 内の concrete method は従来どおり dead として報告される: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_php_abstract_base_and_trait_are_reachable_via_extends_and_use() {
+    // PHP の `class Derived extends AbstractBase` と `use TraitX;` は tree-sitter で
+    // 一見 class_declaration の子孫として現れるため parent/grandparent 走査だけだと
+    // 基底クラス名・使用 trait 名が `Definition` に誤分類され、実際の参照にも
+    // 関わらず dead-code 判定される。field_name == "name" の識別子だけを def と
+    // 数えることで、継承 / trait 経由の参照が正しくカウントされる。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+
+    std::fs::write(
+        root.join("src/base_contract.php"),
+        "<?php\nabstract class BaseContract {\n    public function contractHook(): void {}\n}\ninterface SignerContract {\n    public function sign(): void;\n}\ntrait SharedBehavior {\n    public function shared(): void {}\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/concrete.php"),
+        "<?php\nclass Concrete extends BaseContract implements SignerContract {\n    use SharedBehavior;\n    public function sign(): void {}\n    public function publicButUnused(): void {}\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+
+    // extends / implements / use で参照されているクラス・インターフェイス・trait は
+    // dead 扱いされない
+    for reachable in ["BaseContract", "SignerContract", "SharedBehavior"] {
+        assert!(
+            !names.iter().any(|n| n == reachable),
+            "{reachable} は extends/implements/use 経由で参照されているため dead 対象から外れるべき: {names:?}"
+        );
+    }
+    // 実際に未参照の public メソッドは従来どおり dead
+    assert!(
+        names.iter().any(|n| n.contains("publicButUnused")),
+        "真の未参照 public メソッドは dead として報告される: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_php_protected_and_private_methods_are_not_dead() {
+    // PHP の `protected` / `private` メソッドは公開 API ではないため、
+    // cross-file の識別子参照が無くても dead-code 対象にしない。
+    // 対照として `public` メソッド (参照なし) は dead として報告される。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+
+    // クラス内の各 visibility / トップレベル関数 / trait 内メソッド を網羅
+    std::fs::write(
+        root.join("src/visibility_sample.php"),
+        "<?php\n\
+class VisibilitySampleHolder {\n\
+    public function publicUnreferenced() {}\n\
+    protected function protectedHelper() {}\n\
+    private function privateHelper() {}\n\
+    public static function publicStaticUnreferenced() {}\n\
+    protected static function protectedStatic() {}\n\
+}\n\
+trait VisibilitySampleTrait {\n\
+    protected function traitProtectedHelper() {}\n\
+    private function traitPrivateHelper() {}\n\
+}\n\
+function free_unreferenced_helper() {}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+
+    // public な未参照シンボル 3 つは dead として報告される
+    assert!(
+        names.iter().any(|n| n.contains("publicUnreferenced")),
+        "public method は dead として報告される: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.contains("publicStaticUnreferenced")),
+        "public static method も dead として報告される: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "free_unreferenced_helper"),
+        "トップレベル function (暗黙 public) は dead として報告される: {names:?}"
+    );
+
+    // protected / private は visibility で除外
+    for banned in [
+        "protectedHelper",
+        "privateHelper",
+        "protectedStatic",
+        "traitProtectedHelper",
+        "traitPrivateHelper",
+    ] {
+        assert!(
+            !names.iter().any(|n| n.contains(banned)),
+            "{banned} は protected/private なので dead 判定から除外されるべき: {names:?}"
+        );
+    }
 }
 
 #[test]

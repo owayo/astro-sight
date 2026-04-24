@@ -148,8 +148,59 @@ pub fn is_symbol_exported(
         LangId::Java | LangId::Kotlin => is_exported_jvm(node, source),
         LangId::Zig => is_exported_zig(node, source),
         LangId::Python => is_exported_python(node, source, root),
+        LangId::Php => is_exported_php(node, source),
         _ => true, // 未対応言語は保守的にエクスポートと判定
     }
+}
+
+/// PHP: `method_declaration` の `visibility_modifier` が `protected` / `private` なら非公開。
+///
+/// さらに以下のケースも「公開 API として dead-code 判定する対象ではない」ため非公開扱いする:
+/// - `abstract public function foo();` — 子クラスでの実装が必須。abstract 宣言自体を
+///   dead として報告してもユーザは削除できない
+/// - `interface X { public function foo(); }` 内の method 宣言 — implementer 側が
+///   必ず提供するので宣言そのものは削除対象にならない
+///
+/// その他:
+/// - トップレベル `function_definition` は PHP では常に `public` 扱い (visibility キーワード
+///   自体を書けない)
+/// - `class_declaration` / `interface_declaration` / `trait_declaration` / `enum_declaration`
+///   は名前空間スコープで常に public (PHP には "package-private" に相当する概念がない)
+fn is_exported_php(node: Node, source: &[u8]) -> bool {
+    let Some(decl) = find_enclosing_declaration(node) else {
+        return true;
+    };
+    if decl.kind() != "method_declaration" {
+        return true;
+    }
+
+    // interface 配下の method 宣言は implementer 依存のため dead 対象外。
+    // method_declaration -> declaration_list -> interface_declaration
+    if let Some(parent) = decl.parent()
+        && let Some(grand) = parent.parent()
+        && grand.kind() == "interface_declaration"
+    {
+        return false;
+    }
+
+    // method の modifier をまとめて確認 (abstract は visibility と同列の存在で、
+    // どちらか先でも後でも構わない)
+    let mut cursor = decl.walk();
+    for child in decl.children(&mut cursor) {
+        match child.kind() {
+            "abstract_modifier" => return false,
+            "visibility_modifier" => {
+                if let Ok(text) = child.utf8_text(source) {
+                    let vis = text.trim();
+                    if vis == "private" || vis == "protected" {
+                        return false;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 /// Java/Kotlin: `private` 修飾子があれば非公開と判定。
@@ -177,11 +228,15 @@ fn is_exported_jvm(node: Node, source: &[u8]) -> bool {
 fn find_enclosing_declaration(node: Node) -> Option<Node> {
     let declaration_kinds = [
         "function_declaration",
+        // PHP ではトップレベル関数は `function_definition`
+        "function_definition",
         "method_declaration",
         "class_declaration",
         "interface_declaration",
         "enum_declaration",
         "object_declaration",
+        // PHP trait
+        "trait_declaration",
     ];
     let mut current = Some(node);
     while let Some(n) = current {
