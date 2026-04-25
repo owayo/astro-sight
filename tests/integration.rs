@@ -4702,6 +4702,166 @@ class Caller {\n\
 }
 
 #[test]
+fn refs_php_string_callable_class_at_method_is_detected() {
+    // N4: `'ClassName@method'` 形式の文字列 callable (Laravel 5.x 以前互換) を method ref として扱う。
+    // tree-sitter は string 全体を 1 ノードとしてしか出さないため、内容を pattern match して
+    // `@` 以降を method 名として抽出する。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("sample.php"),
+        "<?php\n\
+class Target {\n\
+    public function handler() { return 1; }\n\
+}\n\
+function register() {\n\
+    return 'Target@handler';\n\
+}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["refs", "--name", "handler", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let refs = json["refs"].as_array().unwrap();
+    let has_string_ref = refs.iter().any(|r| {
+        r["kind"].as_str() == Some("ref")
+            && r["ctx"]
+                .as_str()
+                .is_some_and(|c| c.contains("'Target@handler'"))
+    });
+    assert!(
+        has_string_ref,
+        "'Target@handler' の 'handler' を ref として検出すべき: {refs:?}"
+    );
+}
+
+#[test]
+fn refs_php_concat_class_class_at_method_is_detected() {
+    // N4: `Class::class . '@method'` 形式の concat callable を method ref として扱う。
+    // `'@method'` 単独の string は、親が `binary_expression` (`.` operator) かつ左辺が
+    // `class_constant_access_expression` (`X::class`) の場合のみ ref 認定する。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("sample.php"),
+        "<?php\n\
+class Target {\n\
+    public function dispatch() { return 1; }\n\
+}\n\
+function register() {\n\
+    return Target::class . '@dispatch';\n\
+}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "refs",
+            "--name",
+            "dispatch",
+            "--dir",
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let refs = json["refs"].as_array().unwrap();
+    let has_concat_ref = refs.iter().any(|r| {
+        r["kind"].as_str() == Some("ref")
+            && r["ctx"]
+                .as_str()
+                .is_some_and(|c| c.contains("Target::class . '@dispatch'"))
+    });
+    assert!(
+        has_concat_ref,
+        "Target::class . '@dispatch' の 'dispatch' を ref として検出すべき: {refs:?}"
+    );
+}
+
+#[test]
+fn refs_php_email_string_does_not_produce_fake_ref() {
+    // N4 誤検出防止: `'user@example.com'` のようなメール風文字列は method ref にしない。
+    // class_part='user' は先頭小文字 → reject、method_part='example.com' は `.` 含む → reject。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("sample.php"),
+        "<?php\n\
+function example() { return 'example.com'; }\n\
+function contact() { return 'user@example.com'; }\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["refs", "--name", "example", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let refs = json["refs"].as_array().unwrap();
+    let fake_refs: Vec<_> = refs
+        .iter()
+        .filter(|r| {
+            r["kind"].as_str() == Some("ref")
+                && r["ctx"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("'user@example.com'"))
+        })
+        .collect();
+    assert!(
+        fake_refs.is_empty(),
+        "メール風文字列を method ref にしてはならない: {fake_refs:?}"
+    );
+}
+
+#[test]
+fn dead_code_php_string_callable_prevents_false_positive() {
+    // N4 の影響: Gate::define / routing 等で string callable 経由で呼ばれるだけのメソッドが
+    // dead_symbols に入らないこと。実際のユースケースは Laravel の Policy/Ability だが、
+    // テストではその構造を抽象化した最小再現を使う。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("sample.php"),
+        "<?php\n\
+class Ability {\n\
+    public function allow() { return true; }\n\
+}\n\
+class Bootstrapper {\n\
+    public function register() {\n\
+        $this->gate('check', Ability::class . '@allow');\n\
+        $this->route('/x', 'Ability@allow');\n\
+    }\n\
+    public function gate($k, $v) { return [$k, $v]; }\n\
+    public function route($p, $v) { return [$p, $v]; }\n\
+}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !dead.iter().any(|n| n.contains("allow")),
+        "string callable で呼ばれる Ability::allow は dead にならないこと: {dead:?}"
+    );
+}
+
+#[test]
 fn refs_php_callable_array_rejects_non_class_const_first_element() {
     // N3 誤検出防止: 第1要素が `Class::class` でない場合は ref として認めない。
     let dir = tempfile::TempDir::new().unwrap();

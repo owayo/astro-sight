@@ -215,6 +215,19 @@ fn collect_identifier_refs(
         });
     }
 
+    // PHP の文字列 callable `'Class@method'` / `Class::class . '@method'` を ref として扱う (N4)。
+    if let Some((method, row, col)) = php_string_callable_method_segment(node, source, lang_id)
+        && normalize_identifier(lang_id, method).as_ref() == symbol_name
+    {
+        refs.push(SymbolReference {
+            path: path.to_string(),
+            line: row,
+            column: col,
+            context: Some(extract_line_context(source, row)),
+            kind: Some(RefKind::Reference),
+        });
+    }
+
     // 子ノードを再帰走査
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -615,6 +628,150 @@ fn is_php_identifier(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// PHP string literal が Laravel 互換の callable 表記 `Class@method` / `@method`
+/// (concat 連結の右辺) を含んでいれば、`method` 部分を ref として返す (N4)。
+///
+/// 対象構文:
+/// 1. 純粋文字列 `'ClassName@handler'` / `'\\Fully\\Qualified\\Name@handler'`
+/// 2. 連結 `ClassName::class . '@handler'` の右辺 string (class_part が空)
+///
+/// 誤検出対策:
+/// - method 部分は PHP 識別子 (2 文字以上、英小文字または `_` で始まる)
+/// - class 部分が非空の場合、名前空間 `\\` 区切りで各セグメントが 2 文字以上 + 先頭大文字
+///   (英小文字始まりの場合はメール/単語の可能性があるため reject)
+/// - class 部分が空の場合、親が `binary_expression` (`.` 演算子) で左辺が `X::class`
+///   (`class_constant_access_expression`) の場合のみ認める
+/// - double-quoted (encapsed_string) は補間で構造が崩れるため対象外
+fn php_string_callable_method_segment<'a>(
+    node: Node<'_>,
+    source: &'a [u8],
+    lang_id: LangId,
+) -> Option<(&'a str, usize, usize)> {
+    if lang_id != LangId::Php || node.kind() != "string" {
+        return None;
+    }
+    let raw = node.utf8_text(source).ok()?;
+    if raw.len() < 2 {
+        return None;
+    }
+    let bytes = raw.as_bytes();
+    let first = bytes[0];
+    let last = bytes[raw.len() - 1];
+    if (first != b'\'' && first != b'"') || first != last {
+        return None;
+    }
+    let body = &raw[1..raw.len() - 1];
+
+    let at_pos = body.find('@')?;
+    let class_part = &body[..at_pos];
+    let method_part = &body[at_pos + 1..];
+
+    if !is_php_method_name(method_part) {
+        return None;
+    }
+    let class_ok = if class_part.is_empty() {
+        is_parent_class_const_concat(node, source)
+    } else {
+        is_php_class_path_strict(class_part)
+    };
+    if !class_ok {
+        return None;
+    }
+
+    let start = node.start_position();
+    // quote 1 byte + class_part bytes + '@' 1 byte。column は tree-sitter の仕様上
+    // byte offset 相当なので、method 先頭の byte 位置として足し合わせる。
+    let byte_offset = 1 + class_part.len() + 1;
+    Some((
+        method_part,
+        start.row,
+        start.column.saturating_add(byte_offset),
+    ))
+}
+
+/// N4 method 部分用: PHP 識別子 かつ 英小文字/`_` で始まる、かつ 2 文字以上。
+/// `'P@ssw0rd'` (class_part='P', method_part='ssw0rd') を弾くため method 側は厳しめにしない
+/// 代わりに class_part 側で 1 文字を reject する。ここは英識別子であれば広めに許容する。
+fn is_php_method_name(s: &str) -> bool {
+    if s.len() < 2 {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_ascii_lowercase() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// N4 class 部分用: 名前空間 `\\` 区切りで各セグメントが先頭大文字 + 2 文字以上 + 識別子。
+/// 先頭 `\\` の absolute namespace プレフィクスも許容する。
+fn is_php_class_path_strict(s: &str) -> bool {
+    let s = s.strip_prefix('\\').unwrap_or(s);
+    if s.is_empty() {
+        return false;
+    }
+    for part in s.split('\\') {
+        if part.len() < 2 {
+            return false;
+        }
+        let mut chars = part.chars();
+        let first = chars.next().unwrap();
+        if !first.is_ascii_uppercase() {
+            return false;
+        }
+        if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return false;
+        }
+    }
+    true
+}
+
+/// N4 parent check: `node` が `X::class . node` 形式の concat 右辺であれば true。
+fn is_parent_class_const_concat(node: Node<'_>, source: &[u8]) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() != "binary_expression" {
+        return false;
+    }
+    // operator field: tree-sitter-php では binary_expression の `operator` は子ノード
+    // として現れる。field 名で取れなくても子 token で `.` を探す。
+    let mut cursor = parent.walk();
+    let op_is_dot = parent.children(&mut cursor).any(|c| {
+        // operator トークンは kind = "." になる (tree-sitter-php)
+        c.kind() == "." && c.utf8_text(source) == Ok(".")
+    });
+    if !op_is_dot {
+        return false;
+    }
+    // node が parent の右側にいるか確認: 親の children で node より前に
+    // class_constant_access_expression が存在することを検証する。
+    let mut cur2 = parent.walk();
+    let mut seen_class_const = false;
+    let mut node_is_right = false;
+    for c in parent.children(&mut cur2) {
+        if c.id() == node.id() {
+            node_is_right = seen_class_const;
+            break;
+        }
+        if c.kind() == "class_constant_access_expression" && is_class_class_expr(c, source) {
+            seen_class_const = true;
+        }
+    }
+    node_is_right
+}
+
+/// `X::class` 形式の class_constant_access_expression かを判定。
+fn is_class_class_expr(node: Node<'_>, source: &[u8]) -> bool {
+    if node.kind() != "class_constant_access_expression" {
+        return false;
+    }
+    let mut c = node.walk();
+    node.children(&mut c)
+        .any(|child| child.kind() == "name" && child.utf8_text(source) == Ok("class"))
+}
+
 /// 指定行のソース行をコンテキストとして抽出する。
 /// minified/生成コードの巨大行によるメモリ爆発を防ぐため 256B で切り詰める。
 /// `memchr` で該当行の範囲のみ走査し、ソース全体の UTF-8 検証は行わない。
@@ -752,56 +909,6 @@ pub(crate) fn build_ac_case_insensitive(
         .ascii_case_insensitive(true)
         .build(symbol_names)
         .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))
-}
-
-/// dead-code 判定用: フル SymbolReference を作らず非 Definition 参照の件数のみ返す。
-/// SymbolReference のヒープ確保を全排除し、メモリ消費を大幅に削減する。
-pub fn count_non_definition_refs_batch(
-    symbol_names: &[String],
-    dir: &Path,
-    glob_pattern: Option<&str>,
-) -> Result<std::collections::HashMap<String, usize>> {
-    use std::collections::HashMap;
-
-    if symbol_names.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let ac = aho_corasick::AhoCorasick::builder()
-        .ascii_case_insensitive(true)
-        .build(symbol_names)
-        .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))?;
-
-    let files = collect_files(dir, glob_pattern)?;
-
-    let counts: Vec<usize> = files
-        .into_par_iter()
-        .fold(
-            || vec![0usize; symbol_names.len()],
-            |mut local, path| {
-                let Some(path_str) = path.to_str() else {
-                    return local;
-                };
-                let utf8_path = camino::Utf8Path::new(path_str);
-                if let Ok(per_file) = count_refs_in_file(symbol_names, &ac, utf8_path) {
-                    for (ix, cnt) in per_file.into_iter().enumerate() {
-                        local[ix] += cnt;
-                    }
-                }
-                local
-            },
-        )
-        .reduce(
-            || vec![0usize; symbol_names.len()],
-            |mut acc, local| {
-                for (a, b) in acc.iter_mut().zip(local) {
-                    *a += b;
-                }
-                acc
-            },
-        );
-
-    Ok(symbol_names.iter().cloned().zip(counts).collect())
 }
 
 /// dead-code 判定用 (test-only 分類版): 各シンボルの非 Definition 参照件数を
@@ -1094,6 +1201,22 @@ fn collect_identifier_refs_indexed(
         }
     }
 
+    // PHP の文字列 callable `'Class@method'` / `Class::class . '@method'` を ref として扱う (N4)。
+    if let Some((method, row, col)) = php_string_callable_method_segment(node, source, lang_id)
+        && let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, method))
+    {
+        let context = extract_line_context(source, row);
+        for &ix in indices {
+            refs[ix].push(SymbolReference {
+                path: path.to_string(),
+                line: row,
+                column: col,
+                context: Some(context.clone()),
+                kind: Some(RefKind::Reference),
+            });
+        }
+    }
+
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_identifier_refs_indexed(
@@ -1185,6 +1308,13 @@ fn count_identifier_refs(
         counts[ix] += 1;
     }
 
+    // PHP の文字列 callable `'Class@method'` / `Class::class . '@method'` を ref とする (N4)。
+    if let Some((method, _row, _col)) = php_string_callable_method_segment(node, source, lang_id)
+        && let Some(&ix) = name_to_ix.get(&normalize_identifier(lang_id, method))
+    {
+        counts[ix] += 1;
+    }
+
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         count_identifier_refs(child, source, name_to_ix, definition_kinds, lang_id, counts);
@@ -1248,6 +1378,129 @@ mod tests {
         }
         let arr = find_array(tree.root_node()).expect("array_creation_expression must exist");
         assert!(php_callable_array_method_segment(arr, source, lang_id).is_none());
+    }
+
+    /// PHP 文字列 callable `'Cls@method'` 形式で method 部分が抽出されることを検証 (N4)。
+    #[test]
+    fn php_string_callable_method_segment_extracts_pure_string() {
+        let source = b"<?php\nfunction f() { return 'Controller@handle'; }\n";
+        let tree = parser::parse_source(source, LangId::Php).unwrap();
+        fn find_string<'t>(
+            n: tree_sitter::Node<'t>,
+            target: &str,
+            source: &[u8],
+        ) -> Option<tree_sitter::Node<'t>> {
+            if n.kind() == "string" && n.utf8_text(source).ok() == Some(target) {
+                return Some(n);
+            }
+            let mut c = n.walk();
+            for child in n.children(&mut c) {
+                if let Some(found) = find_string(child, target, source) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let s = find_string(tree.root_node(), "'Controller@handle'", source)
+            .expect("string must exist");
+        let seg = php_string_callable_method_segment(s, source, LangId::Php);
+        assert!(
+            seg.is_some(),
+            "'Controller@handle' should yield method segment"
+        );
+        let (m, _r, _c) = seg.unwrap();
+        assert_eq!(m, "handle");
+    }
+
+    /// PHP `Cls::class . '@method'` concat 右辺 string から method 部分が抽出されることを検証 (N4)。
+    #[test]
+    fn php_string_callable_method_segment_extracts_concat_segment() {
+        let source = b"<?php\nclass C {}\n$x = C::class . '@handler';\n";
+        let tree = parser::parse_source(source, LangId::Php).unwrap();
+        fn find_string<'t>(
+            n: tree_sitter::Node<'t>,
+            target: &str,
+            source: &[u8],
+        ) -> Option<tree_sitter::Node<'t>> {
+            if n.kind() == "string" && n.utf8_text(source).ok() == Some(target) {
+                return Some(n);
+            }
+            let mut c = n.walk();
+            for child in n.children(&mut c) {
+                if let Some(found) = find_string(child, target, source) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let s = find_string(tree.root_node(), "'@handler'", source).expect("string must exist");
+        let seg = php_string_callable_method_segment(s, source, LangId::Php);
+        assert!(seg.is_some(), "Cls::class . '@handler' should match");
+        let (m, _r, _c) = seg.unwrap();
+        assert_eq!(m, "handler");
+    }
+
+    /// メール風文字列は method ref として抽出しない (誤検出防止)
+    #[test]
+    fn php_string_callable_method_segment_rejects_email_like() {
+        let source = b"<?php\n$x = 'user@example.com';\n";
+        let tree = parser::parse_source(source, LangId::Php).unwrap();
+        fn find_string<'t>(n: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
+            if n.kind() == "string" {
+                return Some(n);
+            }
+            let mut c = n.walk();
+            for child in n.children(&mut c) {
+                if let Some(found) = find_string(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let s = find_string(tree.root_node()).expect("string must exist");
+        assert!(php_string_callable_method_segment(s, source, LangId::Php).is_none());
+    }
+
+    /// `P@ssw0rd` のようなパスワード風文字列は class 部分が 1 文字で reject される
+    #[test]
+    fn php_string_callable_method_segment_rejects_short_class_part() {
+        let source = b"<?php\n$x = 'P@ssw0rd';\n";
+        let tree = parser::parse_source(source, LangId::Php).unwrap();
+        fn find_string<'t>(n: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
+            if n.kind() == "string" {
+                return Some(n);
+            }
+            let mut c = n.walk();
+            for child in n.children(&mut c) {
+                if let Some(found) = find_string(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let s = find_string(tree.root_node()).expect("string must exist");
+        assert!(php_string_callable_method_segment(s, source, LangId::Php).is_none());
+    }
+
+    /// 引数単独の `'@method'` (concat 親ではない) は reject
+    #[test]
+    fn php_string_callable_method_segment_rejects_bare_at_method() {
+        let source = b"<?php\nfunction f($x) {} f('@handler');\n";
+        let tree = parser::parse_source(source, LangId::Php).unwrap();
+        fn find_string<'t>(n: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
+            if n.kind() == "string" {
+                return Some(n);
+            }
+            let mut c = n.walk();
+            for child in n.children(&mut c) {
+                if let Some(found) = find_string(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let s = find_string(tree.root_node()).expect("string must exist");
+        assert!(php_string_callable_method_segment(s, source, LangId::Php).is_none());
     }
 
     /// 既知の identifier ノード種別が true を返すことを検証

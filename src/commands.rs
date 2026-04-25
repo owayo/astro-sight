@@ -1508,7 +1508,8 @@ fn bare_name(qualname: &str) -> &str {
 
 /// ファイルリストからエクスポートシンボルを収集し、参照ゼロのシンボルを返す。
 /// dead-code コマンドと review コマンドの共通コアロジック。
-/// count_non_definition_refs_batch で件数のみカウントし、SymbolReference を確保しない。
+/// count_non_definition_refs_split で production / test 別に件数のみカウントし、
+/// SymbolReference を確保しない。
 /// `files` は呼び出し側で `--glob` 等のフィルタを適用済み。
 /// refs 探索は `--dir` 全体で実施する (F3 修正: `--glob` で refs スコープが
 /// 狭まると、フィルタ外のファイルから同シンボルを参照している場合に dead
