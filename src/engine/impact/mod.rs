@@ -3,7 +3,7 @@ mod filters;
 mod pass2;
 mod pass3;
 mod signature;
-mod test_context;
+pub(crate) mod test_context;
 mod types;
 
 use std::collections::{HashMap, HashSet};

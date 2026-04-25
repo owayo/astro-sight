@@ -3,12 +3,19 @@ use serde::Serialize;
 use super::impact::ContextResult;
 
 /// review コマンドの統合レスポンス。
+///
+/// `test_only_symbols` は production 側コードから参照されず、
+/// test/spec 配下からのみ参照される公開シンボル。dead 同等扱いにすると
+/// 「テスト経由で実利用されている API」を誤って除去候補に出してしまうため、
+/// 別バケットに分離してレビュアー判断に委ねる。
 #[derive(Debug, Clone, Serialize)]
 pub struct ReviewResult {
     pub impact: ContextResult,
     pub missing_cochanges: Vec<MissingCochange>,
     pub api_changes: ApiChanges,
     pub dead_symbols: Vec<DeadSymbol>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub test_only_symbols: Vec<DeadSymbol>,
 }
 
 /// cochange で検出された「一緒に変更されるはずだが diff に含まれないファイル」。

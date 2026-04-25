@@ -828,7 +828,7 @@ pub fn cmd_review(
     // 6. dead symbol 検出 (framework プリセット + ユーザ指定 exclude を適用)
     //    review では vendor / tests / build を常に除外する固定挙動。
     //    必要になった段階で dead-code と同様の --include-* オプションを追加する。
-    let dead_symbols = match std::fs::canonicalize(dir) {
+    let (dead_symbols, test_only_symbols) = match std::fs::canonicalize(dir) {
         Ok(canonical_dir) => {
             let default_excludes = resolve_dead_code_excludes(false, false, false);
             let mut excludes: Vec<&str> = default_excludes.to_vec();
@@ -849,7 +849,7 @@ pub fn cmd_review(
             )?;
             detect_dead_symbols_from_files(dir, &files)
         }
-        Err(_) => Vec::new(),
+        Err(_) => (Vec::new(), Vec::new()),
     };
 
     let result = ReviewResult {
@@ -857,6 +857,7 @@ pub fn cmd_review(
         missing_cochanges,
         api_changes,
         dead_symbols,
+        test_only_symbols,
     };
 
     if hook {
@@ -886,6 +887,7 @@ fn empty_review_result() -> ReviewResult {
             modified: Vec::new(),
         },
         dead_symbols: Vec::new(),
+        test_only_symbols: Vec::new(),
     }
 }
 
@@ -1511,13 +1513,17 @@ fn bare_name(qualname: &str) -> &str {
 /// refs 探索は `--dir` 全体で実施する (F3 修正: `--glob` で refs スコープが
 /// 狭まると、フィルタ外のファイルから同シンボルを参照している場合に dead
 /// 判定が誤陽性になるため)。
+///
+/// 戻り値は `(dead_symbols, test_only_symbols)`:
+/// - `dead_symbols`: production / test どちらからも参照されないシンボル
+/// - `test_only_symbols`: test/spec 配下からのみ参照されるシンボル (F5)
 pub(crate) fn detect_dead_symbols_from_files(
     dir: &str,
     files: &[std::path::PathBuf],
-) -> Vec<DeadSymbol> {
+) -> (Vec<DeadSymbol>, Vec<DeadSymbol>) {
     let canonical_dir = match std::fs::canonicalize(dir) {
         Ok(d) => d,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), Vec::new()),
     };
 
     // .gitattributes の linguist-generated 指定ファイルは dead-code 検出から除外する
@@ -1557,7 +1563,7 @@ pub(crate) fn detect_dead_symbols_from_files(
     }
 
     if all_syms.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     // refs 検索は AST 上の identifier ノードに対してマッチするため、
@@ -1587,13 +1593,16 @@ pub(crate) fn detect_dead_symbols_from_files(
             .collect()
     };
 
-    let counts = match crate::engine::refs::count_non_definition_refs_batch(
+    // production / test 別に refs カウント。test/ 配下のみで参照されるシンボルは
+    // dead_symbols ではなく test_only_symbols として分離する (F5)。
+    let counts = match crate::engine::refs::count_non_definition_refs_split(
         &unique_names,
         &canonical_dir,
         None,
+        is_test_path,
     ) {
         Ok(v) => v,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), Vec::new()),
     };
 
     // Android プロジェクトでは `AndroidManifest.xml` / layout XML から
@@ -1603,8 +1612,11 @@ pub(crate) fn detect_dead_symbols_from_files(
     // AndroidManifest.xml が存在しないプロジェクトでは空集合が返り副作用なし。
     let xml_refs = crate::engine::xml_refs::collect_xml_symbol_references(&canonical_dir);
 
-    // 定義以外の参照が0件のシンボルを dead として報告
+    // production 0 / test 0 → dead_symbols
+    // production 0 / test > 0 → test_only_symbols (F5)
+    // production > 0 → 生存とみなしどちらにも報告しない
     let mut dead = Vec::new();
+    let mut test_only = Vec::new();
     for (name, kind, file, lang) in &all_syms {
         let key = norm_bare(*lang, name);
         // 同名シンボルが複数存在する場合は bare name では区別できないためスキップ
@@ -1612,23 +1624,55 @@ pub(crate) fn detect_dead_symbols_from_files(
             continue;
         }
 
-        if counts.get(&key).copied().unwrap_or(0) == 0 {
-            // bare name と qualname (Container.method) の両方を XML 参照と突き合わせる。
-            // layout XML の `android:onClick="handler"` は単純名でしか書けないため bare で検索し、
-            // `android:name=".Foo"` 等で Container 側をカバーするケースは qualname でも検査する。
-            let bare = bare_name(name);
-            if xml_refs.contains(bare) || xml_refs.contains(name.as_str()) {
-                continue;
-            }
-            dead.push(DeadSymbol {
-                name: name.clone(),
-                kind: kind.clone(),
-                file: file.clone(),
-            });
+        let (prod_cnt, test_cnt) = counts.get(&key).copied().unwrap_or((0, 0));
+        if prod_cnt > 0 {
+            continue;
+        }
+
+        // bare name と qualname (Container.method) の両方を XML 参照と突き合わせる。
+        // layout XML の `android:onClick="handler"` は単純名でしか書けないため bare で検索し、
+        // `android:name=".Foo"` 等で Container 側をカバーするケースは qualname でも検査する。
+        let bare = bare_name(name);
+        if xml_refs.contains(bare) || xml_refs.contains(name.as_str()) {
+            continue;
+        }
+
+        let sym = DeadSymbol {
+            name: name.clone(),
+            kind: kind.clone(),
+            file: file.clone(),
+        };
+        if test_cnt > 0 {
+            test_only.push(sym);
+        } else {
+            dead.push(sym);
         }
     }
 
-    dead
+    (dead, test_only)
+}
+
+/// refs カウントを production / test に振り分けるための判定関数。
+///
+/// - ファイル名規約 (`*_test.go`, `*Test.php`, `*_spec.rb` 等) は既存の
+///   `is_test_file_path` に委譲する。
+/// - ディレクトリセグメント規約 (`tests/`, `__tests__/`, `spec/`, `testdata/`,
+///   `test/`, `Tests/`) を含むパスも test 配下とみなす。
+fn is_test_path(path: &std::path::Path) -> bool {
+    if let Some(s) = path.to_str() {
+        if crate::engine::impact::test_context::is_test_file_path(s) {
+            return true;
+        }
+        if s.split('/').any(|seg| {
+            matches!(
+                seg,
+                "tests" | "test" | "Tests" | "__tests__" | "spec" | "testdata"
+            )
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 fn extract_exported_symbols_from_git(
@@ -2075,9 +2119,15 @@ const LARAVEL_PRESET_EXCLUDE_GLOBS: &[&str] = &[
 /// 未知のフレームワーク名はエラー。
 ///
 /// `**/app/X/**` / `**/database/X/**` のような app-prefix 付きパターンには、
-/// `**/X/**` という prefix 省略版も自動で追加する。これにより
-/// `--dir <project>/app` のように `app/` 直下を指した場合でも、
-/// ファイルパス `Http/Controllers/...` がプリセットで除外される。
+/// `**/X/**` という prefix 省略版も自動で追加する。これにより以下が同時にカバーされる:
+/// - `--dir <project>/app` のように `app/` 直下を指した場合の fallback
+/// - `app/` を別名 (例: `core/`) にリネームしている独自レイアウト
+/// - Laravel 配下に複数 module を抱えるモノレポ (`<root>/<sub>/Http/Controllers/...`)
+///
+/// 過剰除外の懸念: `**/Http/**` の類は Laravel 規約以外でも使われ得るが、
+/// 既定除外に `vendor/` / `node_modules/` 等のサードパーティ配下が入っており、
+/// なおかつ `--framework laravel` を指定しているのは Laravel プロジェクトのみという
+/// 前提なので、実用上の誤マッチはほぼ発生しない。
 fn resolve_framework_globs(framework: Option<&str>) -> Result<Vec<String>> {
     match framework {
         None => Ok(Vec::new()),
@@ -2087,7 +2137,8 @@ fn resolve_framework_globs(framework: Option<&str>) -> Result<Vec<String>> {
                     Vec::with_capacity(LARAVEL_PRESET_EXCLUDE_GLOBS.len() * 2);
                 for pat in LARAVEL_PRESET_EXCLUDE_GLOBS {
                     globs.push((*pat).to_string());
-                    // app/database prefix の省略版を並列で登録 (--dir が app/ 直下の場合の fallback)
+                    // app/database prefix の省略版を並列で登録 (--dir が app/ 直下の場合の fallback、
+                    // および Laravel 標準外レイアウトへの自動対応)
                     if let Some(rest) = pat
                         .strip_prefix("**/app/")
                         .or_else(|| pat.strip_prefix("**/database/"))
@@ -2268,6 +2319,7 @@ pub fn cmd_dead_code(
                 dir: canonical_dir.to_string_lossy().to_string(),
                 scanned_files: 0,
                 dead_symbols: Vec::new(),
+                test_only_symbols: Vec::new(),
             };
             let output = serialize_output(&result, pretty)?;
             println!("{output}");
@@ -2292,12 +2344,13 @@ pub fn cmd_dead_code(
     };
 
     let scanned_files = files.len();
-    let dead_symbols = detect_dead_symbols_from_files(dir, &files);
+    let (dead_symbols, test_only_symbols) = detect_dead_symbols_from_files(dir, &files);
 
     let result = DeadCodeResult {
         dir: canonical_dir.to_string_lossy().to_string(),
         scanned_files,
         dead_symbols,
+        test_only_symbols,
     };
 
     let output = serialize_output(&result, pretty)?;
@@ -3173,7 +3226,8 @@ def new_public_api():
         fs::write(repo.join("hand.py"), "def unused_hand():\n    pass\n").expect("write");
 
         let files = vec![repo.join("gen.py"), repo.join("hand.py")];
-        let dead = detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
+        let (dead, _test_only) =
+            detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
         let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
 
         assert!(
@@ -4553,6 +4607,7 @@ def new_public_api():
                 modified: Vec::new(),
             },
             dead_symbols: Vec::new(),
+            test_only_symbols: Vec::new(),
         };
 
         let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
@@ -4586,6 +4641,7 @@ def new_public_api():
                 modified: Vec::new(),
             },
             dead_symbols: Vec::new(),
+            test_only_symbols: Vec::new(),
         };
 
         let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
@@ -4616,6 +4672,7 @@ def new_public_api():
                 modified: Vec::new(),
             },
             dead_symbols: Vec::new(),
+            test_only_symbols: Vec::new(),
         };
 
         let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
@@ -4645,6 +4702,7 @@ def new_public_api():
                 }],
             },
             dead_symbols: Vec::new(),
+            test_only_symbols: Vec::new(),
         };
 
         let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
@@ -4686,6 +4744,7 @@ def new_public_api():
                 modified: Vec::new(),
             },
             dead_symbols: Vec::new(),
+            test_only_symbols: Vec::new(),
         };
 
         let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));

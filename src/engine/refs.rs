@@ -202,6 +202,19 @@ fn collect_identifier_refs(
         }
     }
 
+    // PHP の callable array `[Foo::class, 'method']` の string literal を ref として扱う (N3)。
+    if let Some((method, row, col)) = php_callable_array_method_segment(node, source, lang_id)
+        && normalize_identifier(lang_id, method).as_ref() == symbol_name
+    {
+        refs.push(SymbolReference {
+            path: path.to_string(),
+            line: row,
+            column: col,
+            context: Some(extract_line_context(source, row)),
+            kind: Some(RefKind::Reference),
+        });
+    }
+
     // 子ノードを再帰走査
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -533,6 +546,75 @@ fn rust_attr_string_ref_segments<'a>(
         .collect()
 }
 
+/// PHP の callable array `[<Class>::class, '<method>']` パターンから
+/// `<method>` の文字列を method reference として返す (N3)。
+///
+/// Laravel 7+ 推奨の Route 記法 `Route::get('/path', [Foo::class, 'bar'])` や
+/// `[Foo::class, 'method']` で `'method'` 部分が string literal となるため、
+/// tree-sitter の identifier ノードでは捕捉できない。誤検出を避けるため、
+/// 第1要素が `Foo::class` (= `class_constant_access_expression` の右辺が
+/// `class` キーワード) であり、第2要素が単独の string literal で
+/// 中身が PHP 識別子文法に合致する場合のみ ref として認める。
+fn php_callable_array_method_segment<'a>(
+    node: Node<'_>,
+    source: &'a [u8],
+    lang_id: LangId,
+) -> Option<(&'a str, usize, usize)> {
+    if lang_id != LangId::Php || node.kind() != "array_creation_expression" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let elements: Vec<Node> = node
+        .children(&mut cursor)
+        .filter(|c| c.kind() == "array_element_initializer")
+        .collect();
+    if elements.len() != 2 {
+        return None;
+    }
+
+    // 第1要素: class_constant_access_expression で右辺が `class` キーワード
+    let first = elements[0];
+    let mut fc = first.walk();
+    let first_inner = first.children(&mut fc).next()?;
+    if first_inner.kind() != "class_constant_access_expression" {
+        return None;
+    }
+    let mut cc = first_inner.walk();
+    let has_class_kw = first_inner
+        .children(&mut cc)
+        .any(|c| c.kind() == "name" && c.utf8_text(source) == Ok("class"));
+    if !has_class_kw {
+        return None;
+    }
+
+    // 第2要素: string / encapsed_string literal
+    let second = elements[1];
+    let mut sc = second.walk();
+    let str_node = second
+        .children(&mut sc)
+        .find(|c| c.kind() == "string" || c.kind() == "encapsed_string")?;
+    let raw = str_node.utf8_text(source).ok()?;
+    let trimmed = raw.trim_matches(|c: char| c == '\'' || c == '"');
+    if !is_php_identifier(trimmed) {
+        return None;
+    }
+    let pos = str_node.start_position();
+    // 引用符の次の文字を method 名の開始位置として登録する
+    Some((trimmed, pos.row, pos.column.saturating_add(1)))
+}
+
+/// PHP の識別子文法 `[A-Za-z_][A-Za-z0-9_]*` に合致するかを判定する。
+fn is_php_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// 指定行のソース行をコンテキストとして抽出する。
 /// minified/生成コードの巨大行によるメモリ爆発を防ぐため 256B で切り詰める。
 /// `memchr` で該当行の範囲のみ走査し、ソース全体の UTF-8 検証は行わない。
@@ -720,6 +802,72 @@ pub fn count_non_definition_refs_batch(
         );
 
     Ok(symbol_names.iter().cloned().zip(counts).collect())
+}
+
+/// dead-code 判定用 (test-only 分類版): 各シンボルの非 Definition 参照件数を
+/// production と test それぞれ別カウントで返す。
+///
+/// `is_test` predicate は呼び出し側から渡す (例: `is_test_path` / ディレクトリセグメント判定)。
+/// 戻り値は `HashMap<symbol_name, (production_count, test_count)>`。
+pub fn count_non_definition_refs_split<F>(
+    symbol_names: &[String],
+    dir: &Path,
+    glob_pattern: Option<&str>,
+    is_test: F,
+) -> Result<std::collections::HashMap<String, (usize, usize)>>
+where
+    F: Fn(&Path) -> bool + Sync,
+{
+    use std::collections::HashMap;
+
+    if symbol_names.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let ac = aho_corasick::AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build(symbol_names)
+        .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))?;
+
+    let files = collect_files(dir, glob_pattern)?;
+
+    let n = symbol_names.len();
+    let (prod_counts, test_counts): (Vec<usize>, Vec<usize>) = files
+        .into_par_iter()
+        .fold(
+            || (vec![0usize; n], vec![0usize; n]),
+            |(mut prod, mut test), path| {
+                let Some(path_str) = path.to_str() else {
+                    return (prod, test);
+                };
+                let utf8_path = camino::Utf8Path::new(path_str);
+                if let Ok(per_file) = count_refs_in_file(symbol_names, &ac, utf8_path) {
+                    let bucket = if is_test(&path) { &mut test } else { &mut prod };
+                    for (ix, cnt) in per_file.into_iter().enumerate() {
+                        bucket[ix] += cnt;
+                    }
+                }
+                (prod, test)
+            },
+        )
+        .reduce(
+            || (vec![0usize; n], vec![0usize; n]),
+            |(mut acc_p, mut acc_t), (lp, lt)| {
+                for (a, b) in acc_p.iter_mut().zip(lp) {
+                    *a += b;
+                }
+                for (a, b) in acc_t.iter_mut().zip(lt) {
+                    *a += b;
+                }
+                (acc_p, acc_t)
+            },
+        );
+
+    let mut out = HashMap::with_capacity(n);
+    for (i, name) in symbol_names.iter().enumerate() {
+        out.insert(name.clone(), (prod_counts[i], test_counts[i]));
+    }
+    Ok(out)
 }
 
 /// visitor callback 版の per-file ref 走査。
@@ -930,6 +1078,22 @@ fn collect_identifier_refs_indexed(
         }
     }
 
+    // PHP の callable array `[Foo::class, 'method']` の string literal を ref として扱う (N3)。
+    if let Some((method, row, col)) = php_callable_array_method_segment(node, source, lang_id)
+        && let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, method))
+    {
+        let context = extract_line_context(source, row);
+        for &ix in indices {
+            refs[ix].push(SymbolReference {
+                path: path.to_string(),
+                line: row,
+                column: col,
+                context: Some(context.clone()),
+                kind: Some(RefKind::Reference),
+            });
+        }
+    }
+
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_identifier_refs_indexed(
@@ -1014,6 +1178,13 @@ fn count_identifier_refs(
         }
     }
 
+    // PHP の callable array `[Foo::class, 'method']` の string literal を ref とする (N3)。
+    if let Some((method, _row, _col)) = php_callable_array_method_segment(node, source, lang_id)
+        && let Some(&ix) = name_to_ix.get(&normalize_identifier(lang_id, method))
+    {
+        counts[ix] += 1;
+    }
+
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         count_identifier_refs(child, source, name_to_ix, definition_kinds, lang_id, counts);
@@ -1023,6 +1194,61 @@ fn count_identifier_refs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PHP の callable array `[Class::class, 'method']` で string ノードの中身が
+    /// method ref として返されることを検証 (N3 unit-level)。
+    #[test]
+    fn php_callable_array_method_segment_extracts_method_string() {
+        let source = b"<?php\nclass C {\n    public function h() { $x = [C::class, 'foo']; return $x; }\n}\n";
+        let path = camino::Utf8Path::new("dummy.php");
+        let tree = parser::parse_source(source, LangId::Php).unwrap();
+        let lang_id = LangId::Php;
+        let _ = path; // silence unused warning
+        // 再帰で array_creation_expression を探す
+        fn find_array<'t>(n: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
+            if n.kind() == "array_creation_expression" {
+                return Some(n);
+            }
+            let mut c = n.walk();
+            for child in n.children(&mut c) {
+                if let Some(found) = find_array(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let arr = find_array(tree.root_node()).expect("array_creation_expression must exist");
+        let seg = php_callable_array_method_segment(arr, source, lang_id);
+        assert!(
+            seg.is_some(),
+            "[C::class, 'foo'] should yield a method segment, got None"
+        );
+        let (m, _row, _col) = seg.unwrap();
+        assert_eq!(m, "foo");
+    }
+
+    /// 第1要素が `Class::class` でない場合は ref として認めない (誤検出防止)
+    #[test]
+    fn php_callable_array_method_segment_rejects_non_class_const() {
+        // [1, 'foo'] や ['foo', 'bar'] は callable array ではない
+        let source = b"<?php\nfunction f() { $x = [1, 'foo']; return $x; }\n";
+        let tree = parser::parse_source(source, LangId::Php).unwrap();
+        let lang_id = LangId::Php;
+        fn find_array<'t>(n: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
+            if n.kind() == "array_creation_expression" {
+                return Some(n);
+            }
+            let mut c = n.walk();
+            for child in n.children(&mut c) {
+                if let Some(found) = find_array(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let arr = find_array(tree.root_node()).expect("array_creation_expression must exist");
+        assert!(php_callable_array_method_segment(arr, source, lang_id).is_none());
+    }
 
     /// 既知の identifier ノード種別が true を返すことを検証
     #[test]

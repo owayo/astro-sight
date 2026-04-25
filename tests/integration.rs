@@ -4572,6 +4572,231 @@ fn dead_code_refs_scope_not_limited_by_glob() {
 }
 
 #[test]
+fn dead_code_framework_laravel_covers_renamed_app_dir() {
+    // F6 (F1 拡張で代替): Laravel プリセットの `**/X/**` 省略版マッチにより、
+    // `app/` を `core/` のようにリネームした独自レイアウトや、
+    // モノレポでサブディレクトリ配下に Laravel 規約構造を持つ場合でも
+    // プリセットが効くこと。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    // `core/` (Laravel 標準の `app/` をリネームした想定) 配下に規約構造を作る
+    std::fs::create_dir_all(root.join("core/Http/Controllers")).unwrap();
+    std::fs::create_dir_all(root.join("core/Services")).unwrap();
+    std::fs::create_dir_all(root.join("packages/sub/Http/Middleware")).unwrap();
+
+    std::fs::write(
+        root.join("core/Http/Controllers/SampleController.php"),
+        "<?php\nclass SampleController {\n    public function index() { return 'x'; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("core/Services/SampleService.php"),
+        "<?php\nclass SampleService {\n    public function loadProfile() { return []; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("packages/sub/Http/Middleware/SampleMiddleware.php"),
+        "<?php\nclass SampleMiddleware {\n    public function handle() { return null; }\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--framework",
+            "laravel",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    // F1 で追加した `**/Http/Controllers/**` `**/Http/Middleware/**` 等の省略版マッチが
+    // Laravel 標準外 (`core/`, `packages/sub/`) のレイアウトにも効くこと
+    assert!(
+        !names.iter().any(|n| n.contains("SampleController")),
+        "core/Http/Controllers 配下 (リネーム済み app/) は preset で除外されるべき: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains("SampleMiddleware")),
+        "packages/sub/Http/Middleware (モノレポ配下) は preset で除外されるべき: {names:?}"
+    );
+    // core/Services は preset 対象外なので残る
+    assert!(
+        names
+            .iter()
+            .any(|n| n.contains("SampleService") || n.contains("loadProfile")),
+        "core/Services は preset 対象外で dead 判定が残るべき: {names:?}"
+    );
+}
+
+#[test]
+fn refs_php_callable_array_method_is_detected() {
+    // N3: `[Class::class, 'method']` の string literal を method ref として扱う。
+    // tree-sitter の identifier ノードには現れない (string 内) ため、
+    // AST レベルで `array_creation_expression` を special-case 抽出する。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("sample.php"),
+        "<?php\n\
+class Target {\n\
+    public static function handler() { return 1; }\n\
+}\n\
+class Caller {\n\
+    public function dispatch() {\n\
+        $x = [Target::class, 'handler'];\n\
+        return call_user_func($x);\n\
+    }\n\
+}\n",
+    )
+    .unwrap();
+
+    // refs --name (single)
+    let output = cargo_bin()
+        .args(["refs", "--name", "handler", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let refs = json["refs"].as_array().unwrap();
+    let has_callable_ref = refs.iter().any(|r| {
+        r["kind"].as_str() == Some("ref")
+            && r["ctx"]
+                .as_str()
+                .is_some_and(|c| c.contains("[Target::class, 'handler']"))
+    });
+    assert!(
+        has_callable_ref,
+        "callable array `[Target::class, 'handler']` の 'handler' を ref として検出するべき: {refs:?}"
+    );
+
+    // dead-code 経由でも同等に効くこと (refs スコープを通って Target も生存判定)
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !dead.iter().any(|n| n.contains("handler")),
+        "callable array で参照される handler が dead に出てはならない: {dead:?}"
+    );
+}
+
+#[test]
+fn refs_php_callable_array_rejects_non_class_const_first_element() {
+    // N3 誤検出防止: 第1要素が `Class::class` でない場合は ref として認めない。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("sample.php"),
+        "<?php\n\
+class Helper {\n\
+    public static function doIt() { return 1; }\n\
+}\n\
+function f() { return [1, 'doIt']; }\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["refs", "--name", "doIt", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let refs = json["refs"].as_array().unwrap();
+    let ref_count = refs
+        .iter()
+        .filter(|r| r["kind"].as_str() == Some("ref"))
+        .count();
+    assert_eq!(
+        ref_count, 0,
+        "[1, 'doIt'] は callable array ではないので ref を作るべきでない: {refs:?}"
+    );
+}
+
+#[test]
+fn dead_code_test_only_symbols_separated_from_dead() {
+    // F5: production からは参照されず test/ からのみ参照されるシンボルは
+    // dead_symbols ではなく test_only_symbols バケットに分類されること。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+
+    // src/lib.rs: production helper (test からだけ呼ばれる) と really_dead (誰からも呼ばれない)
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn used_in_test_only() -> i32 { 1 }\npub fn really_dead() -> i32 { 2 }\n",
+    )
+    .unwrap();
+    // tests/it.rs: used_in_test_only を参照する (production 側 src/ からは未参照)
+    std::fs::write(
+        root.join("tests/it.rs"),
+        "use foo::used_in_test_only;\n#[test]\nfn t() { assert_eq!(used_in_test_only(), 1); }\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+
+    let dead: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    let test_only: Vec<String> = json
+        .get("test_only_symbols")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    assert!(
+        dead.iter().any(|n| n.contains("really_dead")),
+        "really_dead は production / test 双方から参照されないので dead_symbols に出るべき: dead={dead:?}"
+    );
+    assert!(
+        !dead.iter().any(|n| n.contains("used_in_test_only")),
+        "used_in_test_only は test/ から参照されるので dead_symbols から外れるべき: dead={dead:?}"
+    );
+    assert!(
+        test_only.iter().any(|n| n.contains("used_in_test_only")),
+        "used_in_test_only は test_only_symbols バケットに含まれるべき: test_only={test_only:?}"
+    );
+}
+
+#[test]
 fn dead_code_unknown_framework_is_rejected() {
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path();
