@@ -347,6 +347,31 @@ pub enum Commands {
         /// (the most recent invocation completes before the timeout fires).
         #[arg(long, default_value = "0")]
         timeout_secs: u64,
+
+        /// (blame mode) Disable Bayesian smoothing.
+        /// By default smoothing is enabled to suppress small-sample over-confidence
+        /// (e.g. co=1/denom=1 yielding 1.00). Use this flag to fall back to raw co/denom ranking.
+        #[arg(long)]
+        no_smoothing: bool,
+
+        /// (blame mode) Bayesian smoothing alpha (success prior, default 1.0).
+        /// score = (co + alpha) / (denom + alpha + beta).
+        #[arg(long, default_value = "1.0")]
+        smoothing_alpha: f64,
+
+        /// (blame mode) Bayesian smoothing beta (failure prior, default 4.0).
+        #[arg(long, default_value = "4.0")]
+        smoothing_beta: f64,
+
+        /// (blame mode) Skip source files whose blame commit set is smaller than this.
+        /// 0/1 = disabled (legacy behaviour). Recommended: 2.
+        #[arg(long, default_value = "1")]
+        min_denominator: usize,
+
+        /// (blame mode) Limit candidates per source file to top N (0 = unlimited).
+        /// Recommended: 10 to keep output focused.
+        #[arg(long, default_value = "0")]
+        per_source_limit: usize,
     },
 
     /// Structured review: integrates impact, cochange, API surface diff, and dead symbol detection

@@ -19,6 +19,14 @@ pub struct CoChangeEntry {
     /// lookback モードでは None。
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub denominator: Option<usize>,
+    /// blame モードでの smoothed ranking score。
+    ///
+    /// - 既定 (smoothing 有効): `(co + α) / (denom + α + β)` で小サンプルを過信しない
+    /// - `--no-smoothing` 指定時: `confidence` と同値 (互換のため必ず Some)
+    ///
+    /// lookback モードでは None。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub score: Option<f64>,
 }
 
 /// Result of co-change analysis.
@@ -74,6 +82,18 @@ pub struct CoChangeOptions {
     /// 各 Phase 入口で経過時間をチェックし、超過時 InvalidRequest で停止する。
     /// 既に走った subprocess は kill しないため、実際の経過は若干オーバーする可能性がある。
     pub timeout_secs: u64,
+    /// blame モードの Bayesian smoothing α (success prior)。既定 1.0。
+    /// `score = (co + α) / (denom + α + β)` で小サンプル過信を抑える。
+    pub smoothing_alpha: f64,
+    /// blame モードの Bayesian smoothing β (failure prior)。既定 4.0。
+    pub smoothing_beta: f64,
+    /// `--no-smoothing` 相当。true なら smoothing を無効化し score = confidence (raw) を使う。
+    pub disable_smoothing: bool,
+    /// blame モードの起点 blame 集合サイズの下限。`< N` の起点はスキップ。
+    /// 0 / 1 = 既存挙動 (フィルタ無効)。推奨値 2。
+    pub min_denominator: usize,
+    /// blame モードで起点ごとの候補上位 N 件に絞る。0 = 無制限。推奨値 10。
+    pub per_source_limit: usize,
 }
 
 impl Default for CoChangeOptions {
@@ -96,6 +116,11 @@ impl Default for CoChangeOptions {
             ignore_merges: false,
             max_blame_commits: 0,
             timeout_secs: 0,
+            smoothing_alpha: 1.0,
+            smoothing_beta: 4.0,
+            disable_smoothing: false,
+            min_denominator: 1,
+            per_source_limit: 0,
         }
     }
 }

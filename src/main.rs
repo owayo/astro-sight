@@ -370,6 +370,11 @@ fn run(cli: Cli) -> Result<()> {
             ignore_merges,
             max_blame_commits,
             timeout_secs,
+            no_smoothing,
+            smoothing_alpha,
+            smoothing_beta,
+            min_denominator,
+            per_source_limit,
         } => {
             // 既定 min_confidence: lookback 0.7 / blame 0.3 (分母セマンティクスが異なるため)
             let resolved_min_confidence = min_confidence.unwrap_or(if blame { 0.3 } else { 0.7 });
@@ -402,6 +407,11 @@ fn run(cli: Cli) -> Result<()> {
                 ignore_merges,
                 max_blame_commits,
                 timeout_secs,
+                smoothing_alpha,
+                smoothing_beta,
+                disable_smoothing: no_smoothing,
+                min_denominator,
+                per_source_limit,
             };
             cmd_cochange(&service, &dir, &opts, pretty)
         }

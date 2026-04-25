@@ -108,6 +108,7 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
                 total_changes_b: total_b,
                 confidence,
                 denominator: None,
+                score: None,
             })
         })
         .collect();
@@ -409,13 +410,25 @@ pub fn analyze_cochange_blame(dir: &str, opts: &CoChangeOptions) -> Result<CoCha
         }
     }
 
-    // Phase 4: 起点ファイルごとに該当候補のスコアを algun し entries を組む。
+    // Phase 4: 起点ファイルごとに該当候補のスコアを集計し entries を組む。
     //          1 起点 1 candidate → 1 entry。entry.file_a = source、file_b = candidate。
-    let denom_f = denominator as f64;
+    //
+    // ここで以下の改善を併せて適用する:
+    //   * Bayesian smoothing: ranking キー `score = (co + α) / (denom + α + β)` を計算。
+    //     `disable_smoothing` 時は raw confidence と同値を入れる。
+    //   * `min_denominator`: 起点 blame 集合が `< N` ならその起点を一切出さない。
+    //   * `per_source_limit`: 起点ごとに `score` 降順で N 件まで残す (0 = 無制限)。
+    //   * `min_confidence` フィルタは ranking に使う方の値 (smoothing 有効なら score、
+    //     無効なら confidence) で行い、フィルタ感覚を一貫させる。
+    let alpha = opts.smoothing_alpha;
+    let beta = opts.smoothing_beta;
+    let smoothing_on = !opts.disable_smoothing;
+    let min_denom = opts.min_denominator.max(1); // 0 は 1 と同義 (= 既存挙動)
+
     let mut entries: Vec<CoChangeEntry> = Vec::new();
     for (i, source) in opts.source_files.iter().enumerate() {
         let blame_set = &blame_per_file[i];
-        if blame_set.is_empty() {
+        if blame_set.len() < min_denom {
             continue;
         }
         // この起点ファイルに紐づく blame コミット集合の中で各候補の共起回数を再集計
@@ -442,15 +455,25 @@ pub fn analyze_cochange_blame(dir: &str, opts: &CoChangeOptions) -> Result<CoCha
         }
 
         let local_denom = blame_set.len() as f64;
+        // 起点単位でいったん全候補を評価し、min_confidence と min_samples を適用してから
+        // per_source_limit で truncate する。
+        let mut per_source_entries: Vec<CoChangeEntry> = Vec::new();
         for (cand, co) in per_source {
             if co < opts.min_samples {
                 continue;
             }
             let confidence = co as f64 / local_denom;
-            if confidence < opts.min_confidence {
+            let score = if smoothing_on {
+                (co as f64 + alpha) / (local_denom + alpha + beta)
+            } else {
+                confidence
+            };
+            // ranking 値で min_confidence フィルタを適用 (smoothing on/off で一貫)
+            let ranking_value = if smoothing_on { score } else { confidence };
+            if ranking_value < opts.min_confidence {
                 continue;
             }
-            entries.push(CoChangeEntry {
+            per_source_entries.push(CoChangeEntry {
                 file_a: source.clone(),
                 file_b: cand.to_string(),
                 co_changes: co,
@@ -458,19 +481,51 @@ pub fn analyze_cochange_blame(dir: &str, opts: &CoChangeOptions) -> Result<CoCha
                 total_changes_b: *co_counts.get(cand).unwrap_or(&0),
                 confidence,
                 denominator: Some(blame_set.len()),
+                score: Some(score),
             });
         }
+
+        // 起点ごとの上位 N 件に絞る (per_source_limit)
+        per_source_entries.sort_by(|a, b| {
+            let av = if smoothing_on {
+                a.score.unwrap_or(a.confidence)
+            } else {
+                a.confidence
+            };
+            let bv = if smoothing_on {
+                b.score.unwrap_or(b.confidence)
+            } else {
+                b.confidence
+            };
+            bv.partial_cmp(&av)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.file_a.cmp(&b.file_a))
+                .then_with(|| a.file_b.cmp(&b.file_b))
+        });
+        if opts.per_source_limit > 0 {
+            per_source_entries.truncate(opts.per_source_limit);
+        }
+        entries.extend(per_source_entries);
     }
 
+    // 全体 ranking。smoothing 有効なら score 降順、無効なら confidence 降順。
     entries.sort_by(|a, b| {
-        b.confidence
-            .partial_cmp(&a.confidence)
+        let av = if smoothing_on {
+            a.score.unwrap_or(a.confidence)
+        } else {
+            a.confidence
+        };
+        let bv = if smoothing_on {
+            b.score.unwrap_or(b.confidence)
+        } else {
+            b.confidence
+        };
+        bv.partial_cmp(&av)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.file_a.cmp(&b.file_a))
             .then_with(|| a.file_b.cmp(&b.file_b))
     });
 
-    let _ = denom_f; // future use
     Ok(CoChangeResult {
         entries,
         commits_analyzed: denominator,
@@ -620,10 +675,20 @@ fn list_merge_commits(dir: &str, shas: &HashSet<String>) -> Result<HashSet<Strin
     Ok(merges)
 }
 
-/// `git diff-tree --no-commit-id --name-only -r <sha>` でコミット c の変更ファイル一覧を返す。
+/// `git diff-tree --root --no-commit-id --name-only -r <sha>` でコミット c の変更ファイル一覧を返す。
+/// `--root` を付けないとルート (初期) コミットは parent がないため空が返り、blame で
+/// その SHA が拾われた場合に共変更が検出できない。`max_files_per_commit` で巨大な
+/// 初期 import は除外されるので、`--root` を有効にしておく方が常に正しい。
 fn collect_files_in_commit(dir: &str, sha: &str) -> Result<Vec<String>> {
     let output = Command::new("git")
-        .args(["diff-tree", "--no-commit-id", "--name-only", "-r", sha])
+        .args([
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            sha,
+        ])
         .current_dir(dir)
         .output()
         .map_err(|e| AstroError::new(ErrorCode::IoError, format!("Failed to run git: {e}")))?;
@@ -1549,5 +1614,233 @@ mod tests {
         // (-C 検出の再現性はテスト環境/git バージョン依存があるため、
         //  ここでは「-C を渡しても crash しない」ことだけ保証する)
         let _ = analyze_cochange_blame(repo.to_str().unwrap(), &opts).unwrap();
+    }
+
+    // ---- noise reduction (smoothing / min_denominator / per_source_limit) ----
+
+    /// blame リポを 1 起点 1 共起ペアで作る簡易ヘルパ。
+    /// `pairs` で指定した (source, candidate) を `iters` 回ずつ別コミットで一緒に変更し、
+    /// 最後に source を 1 度だけ変更して起点 diff を作る。
+    fn build_pair_repo(repo: &std::path::Path, pairs: &[(&str, &str, usize)], source_name: &str) {
+        init_repo(repo);
+        for (s, c, iters) in pairs {
+            for i in 0..*iters {
+                commit_files(
+                    repo,
+                    &[
+                        (*s, &format!("fn {}() {{ {i} }}\n", *s)),
+                        (*c, &format!("fn {}() {{ {i} }}\n", *c)),
+                    ],
+                    &format!("pair {s}/{c} #{i}"),
+                );
+            }
+        }
+        // 起点 diff
+        commit_files(
+            repo,
+            &[(source_name, &format!("fn {source_name}() {{ 99 }}\n"))],
+            "edit source",
+        );
+    }
+
+    /// Bayesian smoothing 有効: co=1/denom=1 の score は (1+α)/(1+α+β) になり、1.0 ではない。
+    #[test]
+    fn analyze_cochange_blame_smoothing_lowers_singleton_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        // a.rs と b.rs を 1 回だけ同時変更 → blame 集合 1 件、co=1, denom=1
+        build_pair_repo(repo, &[("a", "b", 1)], "a");
+
+        let opts = opts_with(|o| {
+            o.blame = true;
+            o.source_files = vec!["a".to_string()];
+            o.base = Some("HEAD~1".to_string());
+            o.smoothing_alpha = 1.0;
+            o.smoothing_beta = 4.0;
+            o.disable_smoothing = false;
+            o.min_confidence = 0.0;
+            o.min_samples = 1;
+            o.skip_deleted_files = false;
+            o.bounded_by_merge_base = false;
+        });
+        let result = analyze_cochange_blame(repo.to_str().unwrap(), &opts).unwrap();
+        let entry = result
+            .entries
+            .iter()
+            .find(|e| e.file_a == "a" && e.file_b == "b")
+            .expect("a↔b pair should exist");
+        // confidence は raw 1.0、score は (1+1)/(1+1+4) = 0.333...
+        assert!(
+            (entry.confidence - 1.0).abs() < 1e-9,
+            "raw confidence = 1.0"
+        );
+        let score = entry.score.expect("score must be Some in blame mode");
+        assert!(
+            (score - (2.0_f64 / 6.0)).abs() < 1e-9,
+            "smoothed score = (1+1)/(1+1+4) ≈ 0.333, got {score}"
+        );
+    }
+
+    /// `--no-smoothing` (disable_smoothing=true): score == confidence で互換維持。
+    #[test]
+    fn analyze_cochange_blame_no_smoothing_returns_raw_confidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        build_pair_repo(repo, &[("a", "b", 2)], "a");
+
+        let opts = opts_with(|o| {
+            o.blame = true;
+            o.source_files = vec!["a".to_string()];
+            o.base = Some("HEAD~1".to_string());
+            o.disable_smoothing = true;
+            o.min_confidence = 0.0;
+            o.min_samples = 1;
+            o.skip_deleted_files = false;
+            o.bounded_by_merge_base = false;
+        });
+        let result = analyze_cochange_blame(repo.to_str().unwrap(), &opts).unwrap();
+        for e in &result.entries {
+            let s = e.score.expect("score is Some even with --no-smoothing");
+            assert!(
+                (s - e.confidence).abs() < 1e-9,
+                "no-smoothing: score == confidence, got s={s} conf={}",
+                e.confidence,
+            );
+        }
+    }
+
+    /// `min_denominator >= 2`: 起点 blame 集合が 1 件しかない起点はスキップされる。
+    #[test]
+    fn analyze_cochange_blame_min_denominator_filters_small_sets() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        // a と b を 1 回だけ同時変更 → blame 集合 1 件
+        build_pair_repo(repo, &[("a", "b", 1)], "a");
+
+        let opts = opts_with(|o| {
+            o.blame = true;
+            o.source_files = vec!["a".to_string()];
+            o.base = Some("HEAD~1".to_string());
+            o.min_denominator = 2; // 1 件しかない起点は除外
+            o.min_confidence = 0.0;
+            o.min_samples = 1;
+            o.skip_deleted_files = false;
+            o.bounded_by_merge_base = false;
+        });
+        let result = analyze_cochange_blame(repo.to_str().unwrap(), &opts).unwrap();
+        assert!(
+            result.entries.is_empty(),
+            "min_denominator=2 should drop denom=1 source, got: {:?}",
+            result.entries
+        );
+    }
+
+    /// 起点 `a` の各行を別 commit で `b/c/d` と一緒に変更し、複数候補を作る共通ヘルパ。
+    /// 構造: HEAD~1 時点で a は 3 行 (line1=a-b 共起, line2=a-c 共起, line3=a-d 共起)。
+    /// HEAD で全 3 行を上書きすれば、blame 旧側の 3 行が 3 SHA に紐づき、
+    /// 候補 b/c/d がそれぞれ co=1 で per_source に入る。
+    fn build_multi_candidate_repo(repo: &std::path::Path) {
+        init_repo(repo);
+        // i=0: a に line1 と b を同時 add
+        commit_files(repo, &[("a", "line1\n"), ("b", "fn b() {}\n")], "pair a-b");
+        // i=1: a に line2 を追加 + c を同時 add
+        commit_files(
+            repo,
+            &[("a", "line1\nline2\n"), ("c", "fn c() {}\n")],
+            "pair a-c",
+        );
+        // i=2: a に line3 を追加 + d を同時 add
+        commit_files(
+            repo,
+            &[("a", "line1\nline2\nline3\n"), ("d", "fn d() {}\n")],
+            "pair a-d",
+        );
+        // HEAD: a の全 3 行を上書き → 旧側 3 行 + 各行が別 SHA で blame される
+        commit_files(repo, &[("a", "x1\nx2\nx3\n")], "edit a all lines");
+    }
+
+    /// `per_source_limit = N`: 起点ごと候補上位 N 件に絞られる。
+    #[test]
+    fn analyze_cochange_blame_per_source_limit_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        build_multi_candidate_repo(repo);
+
+        let opts = opts_with(|o| {
+            o.blame = true;
+            o.source_files = vec!["a".to_string()];
+            o.base = Some("HEAD~1".to_string());
+            o.per_source_limit = 1; // 候補 1 件まで
+            o.min_confidence = 0.0;
+            o.min_samples = 1;
+            o.skip_deleted_files = false;
+            o.bounded_by_merge_base = false;
+        });
+        let result = analyze_cochange_blame(repo.to_str().unwrap(), &opts).unwrap();
+        let from_a: Vec<_> = result.entries.iter().filter(|e| e.file_a == "a").collect();
+        assert_eq!(
+            from_a.len(),
+            1,
+            "per_source_limit=1 should keep only 1 candidate per source, got: {:?}",
+            from_a
+        );
+    }
+
+    /// per_source_limit = 0 は無制限 (= 既存挙動)。
+    #[test]
+    fn analyze_cochange_blame_per_source_limit_zero_is_unlimited() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        build_multi_candidate_repo(repo);
+
+        let opts = opts_with(|o| {
+            o.blame = true;
+            o.source_files = vec!["a".to_string()];
+            o.base = Some("HEAD~1".to_string());
+            o.per_source_limit = 0;
+            o.min_confidence = 0.0;
+            o.min_samples = 1;
+            o.skip_deleted_files = false;
+            o.bounded_by_merge_base = false;
+        });
+        let result = analyze_cochange_blame(repo.to_str().unwrap(), &opts).unwrap();
+        let from_a: Vec<_> = result.entries.iter().filter(|e| e.file_a == "a").collect();
+        assert!(
+            from_a.len() >= 2,
+            "per_source_limit=0 should keep multiple candidates, got: {:?}",
+            from_a,
+        );
+    }
+
+    /// lookback モードは `score` フィールドを出さない (互換維持)。
+    #[test]
+    fn analyze_cochange_lookback_does_not_emit_score() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        for i in 0..3 {
+            commit_files(
+                repo,
+                &[
+                    ("a", &format!("fn a() {{ {i} }}\n")),
+                    ("b", &format!("fn b() {{ {i} }}\n")),
+                ],
+                &format!("p{i}"),
+            );
+        }
+        let opts = opts_with(|o| {
+            o.lookback = 10;
+            o.min_confidence = 0.0;
+            o.min_samples = 2;
+            o.skip_deleted_files = false;
+            o.bounded_by_merge_base = false;
+        });
+        let result = analyze_cochange(repo.to_str().unwrap(), &opts).unwrap();
+        for e in &result.entries {
+            assert!(
+                e.score.is_none(),
+                "lookback entries must not have score, got: {e:?}"
+            );
+        }
     }
 }
