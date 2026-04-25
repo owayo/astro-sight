@@ -411,6 +411,8 @@ pub fn cmd_cochange(
     info!(
         command = "cochange",
         dir = dir,
+        blame = opts.blame,
+        source_files = opts.source_files.len(),
         lookback = opts.lookback,
         min_confidence = opts.min_confidence,
         min_samples = opts.min_samples,
@@ -423,6 +425,79 @@ pub fn cmd_cochange(
     );
     println!("{output}");
     Ok(())
+}
+
+/// blame モード用の起点ファイル解決。
+/// 優先順位: --paths-file > --paths > --git。複数指定時は明示の方を採用 (--git は追加扱い)。
+/// いずれも空なら InvalidRequest エラー。
+pub fn resolve_blame_source_files(
+    dir: &str,
+    git: bool,
+    base: Option<&str>,
+    paths: Option<&str>,
+    paths_file: Option<&str>,
+) -> Result<Vec<String>> {
+    use std::collections::BTreeSet;
+
+    let mut set: BTreeSet<String> = BTreeSet::new();
+
+    if let Some(file_path) = paths_file {
+        let content = std::fs::read_to_string(file_path).map_err(|e| {
+            anyhow::Error::from(crate::error::AstroError::new(
+                crate::error::ErrorCode::IoError,
+                format!("failed to read paths file {file_path}: {e}"),
+            ))
+        })?;
+        for line in content.lines() {
+            let p = line.trim();
+            if !p.is_empty() {
+                set.insert(p.to_string());
+            }
+        }
+    }
+    if let Some(s) = paths {
+        for p in s.split(',') {
+            let p = p.trim();
+            if !p.is_empty() {
+                set.insert(p.to_string());
+            }
+        }
+    }
+    if git {
+        let base_rev = base.unwrap_or("HEAD~1");
+        validate_git_revision(base_rev, "base")?;
+        let output = std::process::Command::new("git")
+            .args(["diff", "--name-only", base_rev, "HEAD"])
+            .current_dir(dir)
+            .output()
+            .map_err(|e| {
+                anyhow::Error::from(crate::error::AstroError::new(
+                    crate::error::ErrorCode::IoError,
+                    format!("failed to run git diff: {e}"),
+                ))
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(crate::error::AstroError::new(
+                crate::error::ErrorCode::IoError,
+                format!("git diff failed: {stderr}"),
+            ));
+        }
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let p = line.trim();
+            if !p.is_empty() {
+                set.insert(p.to_string());
+            }
+        }
+    }
+
+    if set.is_empty() {
+        anyhow::bail!(crate::error::AstroError::new(
+            crate::error::ErrorCode::InvalidRequest,
+            "blame mode requires source files: pass --git, --paths, or --paths-file".to_string(),
+        ));
+    }
+    Ok(set.into_iter().collect())
 }
 
 /// `git diff` / `git show` に渡す revision を検証する。
@@ -1179,7 +1254,20 @@ fn detect_missing_cochanges(
     changed_files: &HashSet<String>,
     min_confidence: f64,
 ) -> Vec<MissingCochange> {
+    // review では blame モードで cochange を解析する。
+    // 起点ファイル = 差分に登場したファイル。
+    // ただし起点が無い (差分が空) ときは何もせず空を返す。
+    let source_files: Vec<String> = changed_files.iter().cloned().collect();
+    if source_files.is_empty() {
+        return Vec::new();
+    }
+    // review からは base 不明 (review 自身は文字列 diff を受け取る) のため
+    // engine 側既定 (HEAD~1) を使う。base 解決失敗や git 不在は engine 側で
+    // 空集合を返すので最終的に Vec::new() に落ちる。
     let opts = CoChangeOptions {
+        blame: true,
+        source_files,
+        // review 経由では blame モード既定の閾値感覚に合わせる
         min_confidence,
         ..CoChangeOptions::default()
     };
@@ -2647,6 +2735,7 @@ pub fn handle_request(
                     .skip_deleted_files
                     .unwrap_or(defaults.skip_deleted_files),
                 filter_file: req.file.clone(),
+                ..defaults
             };
             let result = service.analyze_cochange(dir, &opts)?;
             Ok(serde_json::to_value(result)?)

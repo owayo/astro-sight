@@ -401,6 +401,7 @@ impl AstroSightServer {
             bounded_by_merge_base: p.bounded_by_merge_base,
             skip_deleted_files: p.skip_deleted_files,
             filter_file: p.file,
+            ..Default::default()
         };
         Self::to_tool_result(self.service.analyze_cochange(&p.dir, &opts))
     }

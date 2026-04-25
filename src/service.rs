@@ -537,9 +537,14 @@ impl AppService {
         let canonical_dir = self.validate_dir(dir)?;
         let dir_str = canonical_dir.to_string_lossy();
 
-        let result = crate::engine::cochange::analyze_cochange(&dir_str, opts)?;
+        let result = if opts.blame {
+            crate::engine::cochange::analyze_cochange_blame(&dir_str, opts)?
+        } else {
+            crate::engine::cochange::analyze_cochange(&dir_str, opts)?
+        };
         debug!(
             dir = dir,
+            blame = opts.blame,
             entries = result.entries.len(),
             commits_analyzed = result.commits_analyzed,
             "analyze_cochange completed"

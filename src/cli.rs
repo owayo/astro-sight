@@ -262,13 +262,14 @@ pub enum Commands {
         #[arg(short, long, default_value = ".")]
         dir: String,
 
-        /// Number of recent commits to analyze (default: 200)
+        /// Number of recent commits to analyze (lookback mode only, default: 200)
         #[arg(short, long, default_value = "200")]
         lookback: usize,
 
-        /// Minimum confidence threshold (0.0 to 1.0, default: 0.7)
-        #[arg(short, long, default_value = "0.7")]
-        min_confidence: f64,
+        /// Minimum confidence threshold (0.0 to 1.0).
+        /// lookback mode default: 0.7. blame mode default: 0.3 (denominator semantics differ).
+        #[arg(short, long)]
+        min_confidence: Option<f64>,
 
         /// Minimum shared commit count required per pair (default: 2)
         #[arg(long, default_value = "2")]
@@ -278,17 +279,43 @@ pub enum Commands {
         #[arg(long, default_value = "30")]
         max_files_per_commit: usize,
 
-        /// Disable merge-base history bounding (default: enabled)
+        /// Disable merge-base history bounding (lookback mode only, default: enabled)
         #[arg(long)]
         no_merge_base: bool,
 
-        /// Include pairs where either file is absent from HEAD (default: excluded)
+        /// Include pairs where either file is absent from HEAD (lookback mode only, default: excluded)
         #[arg(long)]
         include_deleted: bool,
 
-        /// Filter to pairs containing this file
+        /// Filter to pairs containing this file (lookback mode only)
         #[arg(short, long)]
         file: Option<String>,
+
+        /// Use blame-based mode: derive co-change from `git blame` of changed lines
+        /// in source files (requires --git, --paths, or --paths-file)
+        #[arg(long)]
+        blame: bool,
+
+        /// (blame mode) Use git diff to derive source files
+        #[arg(long)]
+        git: bool,
+
+        /// (blame mode) Base revision for diff/blame (default: HEAD~1)
+        #[arg(long)]
+        base: Option<String>,
+
+        /// (blame mode) Comma-separated source file paths (relative to repo root)
+        #[arg(long)]
+        paths: Option<String>,
+
+        /// (blame mode) File containing one source path per line
+        #[arg(long)]
+        paths_file: Option<String>,
+
+        /// (blame mode) Exclude candidate paths matching this glob (repeatable).
+        /// Built-in defaults already exclude vendor/, node_modules/, lock files, minified assets.
+        #[arg(long = "exclude-glob")]
+        exclude_globs: Vec<String>,
     },
 
     /// Structured review: integrates impact, cochange, API surface diff, and dead symbol detection
