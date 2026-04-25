@@ -58,6 +58,13 @@ pub struct CoChangeOptions {
     pub base: Option<String>,
     /// blame モードで候補ファイルから除外する glob パターン。
     pub exclude_globs: Vec<String>,
+    /// blame モードでの起点ファイル数の上限。0 = 無制限。
+    /// 上限超過時は InvalidRequest エラーで停止し、暴走を防ぐ。
+    pub max_source_files: usize,
+    /// blame モードで `git blame -M` を有効化する (リネーム/移動を追跡)。
+    pub rename: bool,
+    /// blame モードで取得した SHA 集合からマージコミットを除外する。
+    pub ignore_merges: bool,
 }
 
 impl Default for CoChangeOptions {
@@ -74,6 +81,9 @@ impl Default for CoChangeOptions {
             source_files: Vec::new(),
             base: None,
             exclude_globs: Vec::new(),
+            max_source_files: 0,
+            rename: false,
+            ignore_merges: false,
         }
     }
 }

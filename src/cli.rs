@@ -316,6 +316,21 @@ pub enum Commands {
         /// Built-in defaults already exclude vendor/, node_modules/, lock files, minified assets.
         #[arg(long = "exclude-glob")]
         exclude_globs: Vec<String>,
+
+        /// (blame mode) Maximum number of source files allowed (0 = unlimited).
+        /// Exceeding this limit aborts with InvalidRequest to prevent runaway blame cost.
+        #[arg(long, default_value = "0")]
+        max_source_files: usize,
+
+        /// (blame mode) Track file rename/move via `git blame -M`.
+        /// Slightly slower but recovers history across rename boundaries.
+        #[arg(long)]
+        rename: bool,
+
+        /// (blame mode) Drop merge commits from the blame commit set before counting co-changes.
+        /// Useful when the repository has many squash-merge style merges that bloat diff-tree output.
+        #[arg(long)]
+        ignore_merges: bool,
     },
 
     /// Structured review: integrates impact, cochange, API surface diff, and dead symbol detection

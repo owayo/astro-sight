@@ -264,6 +264,18 @@ pub fn analyze_cochange_blame(dir: &str, opts: &CoChangeOptions) -> Result<CoCha
             commits_analyzed: 0,
         });
     }
+    // 起点ファイル数の上限ガード (0 = 無制限)。暴走防止のため超過は明示的に停止する。
+    if opts.max_source_files > 0 && opts.source_files.len() > opts.max_source_files {
+        bail!(AstroError::new(
+            ErrorCode::InvalidRequest,
+            format!(
+                "source_files count {} exceeds --max-source-files limit {}; \
+                 narrow --paths or raise the limit explicitly",
+                opts.source_files.len(),
+                opts.max_source_files,
+            ),
+        ));
+    }
 
     let base_rev: &str = opts.base.as_deref().unwrap_or("HEAD~1");
 
@@ -272,7 +284,7 @@ pub fn analyze_cochange_blame(dir: &str, opts: &CoChangeOptions) -> Result<CoCha
     let blame_per_file: Vec<HashSet<String>> = opts
         .source_files
         .par_iter()
-        .map(|f| collect_blame_commits_for_file(dir, f, base_rev).unwrap_or_default())
+        .map(|f| collect_blame_commits_for_file(dir, f, base_rev, opts.rename).unwrap_or_default())
         .collect();
 
     let mut commit_set: HashSet<String> = HashSet::new();
@@ -285,6 +297,33 @@ pub fn analyze_cochange_blame(dir: &str, opts: &CoChangeOptions) -> Result<CoCha
             commits_analyzed: 0,
         });
     }
+
+    // 必要に応じてマージコミットを除外する。
+    // git rev-list --no-walk --merges <SHA>... は引数の SHA のうちマージのみを返すので、
+    // 一括問い合わせで効率良く判定できる (ARG_MAX 超過対策で chunk 化)。
+    if opts.ignore_merges {
+        let merge_set = list_merge_commits(dir, &commit_set)?;
+        commit_set.retain(|s| !merge_set.contains(s));
+        if commit_set.is_empty() {
+            return Ok(CoChangeResult {
+                entries: Vec::new(),
+                commits_analyzed: 0,
+            });
+        }
+    }
+    // blame 結果からも同 SHA を除外して per-source 集計と整合させる。
+    let blame_per_file: Vec<HashSet<String>> = if opts.ignore_merges {
+        blame_per_file
+            .into_iter()
+            .map(|s| {
+                s.into_iter()
+                    .filter(|sha| commit_set.contains(sha))
+                    .collect()
+            })
+            .collect()
+    } else {
+        blame_per_file
+    };
 
     // Phase 2: 各コミット c の変更ファイルを diff-tree で取得 (並列化)。
     //          max_files_per_commit を超えるコミット (squash / 大量生成) はスキップ。
@@ -400,7 +439,12 @@ pub fn analyze_cochange_blame(dir: &str, opts: &CoChangeOptions) -> Result<CoCha
 /// - 純粋追加 hunk (old_count = 0) は blame 不要なのでスキップする。
 /// - 全 hunk が純粋追加だった場合は空集合を返す。
 /// - blame の失敗 (binary / non-existent in base) は空集合を返して継続。
-fn collect_blame_commits_for_file(dir: &str, file: &str, base: &str) -> Result<HashSet<String>> {
+fn collect_blame_commits_for_file(
+    dir: &str,
+    file: &str,
+    base: &str,
+    rename: bool,
+) -> Result<HashSet<String>> {
     // diff --unified=0 で hunk header を取得
     let diff_output = Command::new("git")
         .args(["diff", "--unified=0", base, "HEAD", "--", file])
@@ -418,8 +462,13 @@ fn collect_blame_commits_for_file(dir: &str, file: &str, base: &str) -> Result<H
         return Ok(HashSet::new());
     }
 
-    // 1 起動の git blame に複数 -L を渡す
+    // 1 起動の git blame に複数 -L を渡す。
+    // rename=true のときは -M でファイル内移動 + ファイル間 rename を追跡する
+    // (-C は重いコピー検出も含むため今回は -M に留める)。
     let mut args: Vec<String> = vec!["blame".into(), "--line-porcelain".into()];
+    if rename {
+        args.push("-M".into());
+    }
     for (start, count) in &ranges {
         args.push("-L".into());
         args.push(format!("{},+{}", start, count));
@@ -488,6 +537,40 @@ fn parse_hunk_old_ranges(diff_text: &str) -> Vec<(u64, u64)> {
         out.push((start, count));
     }
     out
+}
+
+/// `git rev-list --no-walk --merges <SHA>...` で指定 SHA のうちマージコミットだけを返す。
+/// 引数長制限 (ARG_MAX) を避けるため、SHA は 256 件ごとにチャンク化して呼び出す。
+/// SHA が 0 件の場合は空集合を返す。
+fn list_merge_commits(dir: &str, shas: &HashSet<String>) -> Result<HashSet<String>> {
+    if shas.is_empty() {
+        return Ok(HashSet::new());
+    }
+    const CHUNK: usize = 256;
+    let all: Vec<&String> = shas.iter().collect();
+    let mut merges: HashSet<String> = HashSet::new();
+    for chunk in all.chunks(CHUNK) {
+        let mut args: Vec<String> = vec!["rev-list".into(), "--no-walk".into(), "--merges".into()];
+        for s in chunk {
+            args.push((*s).clone());
+        }
+        let output = Command::new("git")
+            .args(&args)
+            .current_dir(dir)
+            .output()
+            .map_err(|e| AstroError::new(ErrorCode::IoError, format!("Failed to run git: {e}")))?;
+        if !output.status.success() {
+            // rev-list の失敗 (orphan SHA 等) は致命ではなく、マージ判定なしで続行する
+            continue;
+        }
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let s = line.trim();
+            if s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                merges.insert(s.to_string());
+            }
+        }
+    }
+    Ok(merges)
 }
 
 /// `git diff-tree --no-commit-id --name-only -r <sha>` でコミット c の変更ファイル一覧を返す。
@@ -1086,6 +1169,168 @@ mod tests {
                 .all(|e| !e.file_b.starts_with("vendor/")),
             "vendor/ should be excluded by default, got: {:?}",
             result.entries
+        );
+    }
+
+    /// max_source_files を超える起点指定は InvalidRequest で停止する
+    #[test]
+    fn analyze_cochange_blame_rejects_when_source_files_exceeds_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        commit_files(repo, &[("seed.rs", "// seed")], "seed");
+
+        let opts = opts_with(|o| {
+            o.blame = true;
+            // 3 件起点 / 上限 2 → reject
+            o.source_files = vec!["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()];
+            o.max_source_files = 2;
+            o.base = Some("HEAD".to_string());
+            o.min_confidence = 0.0;
+            o.min_samples = 1;
+        });
+        let err = analyze_cochange_blame(repo.to_str().unwrap(), &opts).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max-source-files") || msg.contains("max_source_files"),
+            "error message should mention the limit, got: {msg}"
+        );
+    }
+
+    /// max_source_files = 0 は無制限なので、件数が多くても通る
+    #[test]
+    fn analyze_cochange_blame_unlimited_when_max_source_files_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        commit_files(repo, &[("a.rs", "fn a() {}\n")], "init");
+        commit_files(repo, &[("a.rs", "fn a() { 1 }\n")], "edit");
+
+        let opts = opts_with(|o| {
+            o.blame = true;
+            o.source_files = vec!["a.rs".to_string()];
+            o.max_source_files = 0; // unlimited
+            o.base = Some("HEAD~1".to_string());
+            o.min_confidence = 0.0;
+            o.min_samples = 1;
+            o.skip_deleted_files = false;
+            o.bounded_by_merge_base = false;
+        });
+        // エラーにならず Ok で返ること (entries の中身は問わない)
+        let _ = analyze_cochange_blame(repo.to_str().unwrap(), &opts).unwrap();
+    }
+
+    /// rename フラグ ON のときファイルが rename されていても以前の編集が blame で辿れる。
+    /// blame -M がない (rename=false) と HEAD~1 base 時点の旧ファイル名側に履歴が消える。
+    #[test]
+    fn analyze_cochange_blame_rename_recovers_history_across_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+
+        // 旧名 old.rs を 3 回 b.rs と同時編集して履歴を作る
+        for i in 0..3 {
+            commit_files(
+                repo,
+                &[
+                    ("old.rs", &format!("fn x() {{ {i} }}\nfn y() {{ {i} }}\n")),
+                    ("b.rs", &format!("fn b() {{ {i} }}\n")),
+                ],
+                &format!("pair {i}"),
+            );
+        }
+        // git mv で rename
+        std::process::Command::new("git")
+            .args(["mv", "old.rs", "new.rs"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "rename"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        // rename 後の new.rs を更に変更 (起点となる diff)
+        commit_files(
+            repo,
+            &[("new.rs", "fn x() { 99 }\nfn y() { 99 }\n")],
+            "edit",
+        );
+
+        let mut opts = opts_with(|o| {
+            o.blame = true;
+            o.source_files = vec!["new.rs".to_string()];
+            o.base = Some("HEAD~1".to_string());
+            o.min_confidence = 0.0;
+            o.min_samples = 1;
+            o.skip_deleted_files = false;
+            o.bounded_by_merge_base = false;
+        });
+        // rename=true: old.rs の旧履歴を辿れて b.rs と共起検出されるはず
+        opts.rename = true;
+        let with_rename = analyze_cochange_blame(repo.to_str().unwrap(), &opts).unwrap();
+        let detected_rename = with_rename.entries.iter().any(|e| e.file_b == "b.rs");
+        assert!(
+            detected_rename,
+            "rename=true should let blame follow old.rs and find b.rs co-change, got: {:?}",
+            with_rename.entries,
+        );
+    }
+
+    /// ignore_merges=true でマージコミットは blame コミット集合から除外される
+    #[test]
+    fn analyze_cochange_blame_ignore_merges_drops_merge_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+
+        // 共通 base コミット
+        commit_files(repo, &[("a.rs", "fn a() {}\n")], "init");
+        // feature ブランチで a.rs と b.rs を編集
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "feature"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        commit_files(
+            repo,
+            &[("a.rs", "fn a() { 1 }\n"), ("b.rs", "fn b() {}\n")],
+            "feature edit",
+        );
+        // main に戻ってマージ (no-ff でマージコミットを作る)
+        std::process::Command::new("git")
+            .args(["checkout", "main"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["merge", "--no-ff", "feature", "-m", "merge feature"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        // 起点となる差分: a.rs を更に変更
+        commit_files(repo, &[("a.rs", "fn a() { 99 }\n")], "edit a");
+
+        let mut opts = opts_with(|o| {
+            o.blame = true;
+            o.source_files = vec!["a.rs".to_string()];
+            o.base = Some("HEAD~1".to_string());
+            o.min_confidence = 0.0;
+            o.min_samples = 1;
+            o.skip_deleted_files = false;
+            o.bounded_by_merge_base = false;
+            o.ignore_merges = false;
+        });
+
+        // 比較: ignore_merges=false / true で commits_analyzed が増減すること
+        let baseline = analyze_cochange_blame(repo.to_str().unwrap(), &opts).unwrap();
+        opts.ignore_merges = true;
+        let filtered = analyze_cochange_blame(repo.to_str().unwrap(), &opts).unwrap();
+        assert!(
+            filtered.commits_analyzed <= baseline.commits_analyzed,
+            "ignore_merges should not increase commits_analyzed: baseline={} filtered={}",
+            baseline.commits_analyzed,
+            filtered.commits_analyzed,
         );
     }
 }

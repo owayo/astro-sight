@@ -364,6 +364,9 @@ fn run(cli: Cli) -> Result<()> {
             paths,
             paths_file,
             exclude_globs,
+            max_source_files,
+            rename,
+            ignore_merges,
         } => {
             // 既定 min_confidence: lookback 0.7 / blame 0.3 (分母セマンティクスが異なるため)
             let resolved_min_confidence = min_confidence.unwrap_or(if blame { 0.3 } else { 0.7 });
@@ -390,6 +393,9 @@ fn run(cli: Cli) -> Result<()> {
                 source_files,
                 base,
                 exclude_globs,
+                max_source_files,
+                rename,
+                ignore_merges,
             };
             cmd_cochange(&service, &dir, &opts, pretty)
         }
