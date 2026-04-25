@@ -277,15 +277,42 @@ pub fn analyze_cochange_blame(dir: &str, opts: &CoChangeOptions) -> Result<CoCha
         ));
     }
 
+    // 全体タイムアウト用のチェックポイント (0 = 無制限)。
+    // 各 Phase 入口で elapsed を確認し、超過なら InvalidRequest で停止する。
+    // 既に走行中の subprocess (git blame / diff-tree) は kill しないため、
+    // 直近の 1 起動の完了までは待つ実装 (実用上の許容範囲)。
+    let started = std::time::Instant::now();
+    let check_timeout = |phase: &str| -> Result<()> {
+        if opts.timeout_secs == 0 {
+            return Ok(());
+        }
+        let elapsed = started.elapsed().as_secs();
+        if elapsed >= opts.timeout_secs {
+            bail!(AstroError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "blame analysis exceeded --timeout-secs {} during {phase} (elapsed {elapsed}s)",
+                    opts.timeout_secs,
+                ),
+            ));
+        }
+        Ok(())
+    };
+
     let base_rev: &str = opts.base.as_deref().unwrap_or("HEAD~1");
 
     // Phase 1: 起点ファイルごとに blame で base コミット側の変更行 SHA を集める。
     //          ファイル単位で rayon 並列化する。
+    check_timeout("phase1_blame_setup")?;
     let blame_per_file: Vec<HashSet<String>> = opts
         .source_files
         .par_iter()
-        .map(|f| collect_blame_commits_for_file(dir, f, base_rev, opts.rename).unwrap_or_default())
+        .map(|f| {
+            collect_blame_commits_for_file(dir, f, base_rev, opts.rename, opts.copy)
+                .unwrap_or_default()
+        })
         .collect();
+    check_timeout("phase1_blame_collected")?;
 
     let mut commit_set: HashSet<String> = HashSet::new();
     for s in &blame_per_file {
@@ -298,10 +325,25 @@ pub fn analyze_cochange_blame(dir: &str, opts: &CoChangeOptions) -> Result<CoCha
         });
     }
 
+    // SHA 集合の上限ガード (0 = 無制限)。
+    // 病理的に巨大な blame 集合 (数万規模) で続く diff-tree 並列爆発を防ぐ防衛線。
+    if opts.max_blame_commits > 0 && commit_set.len() > opts.max_blame_commits {
+        bail!(AstroError::new(
+            ErrorCode::InvalidRequest,
+            format!(
+                "blame commit set size {} exceeds --max-blame-commits limit {}; \
+                 narrow --paths/--base or raise the limit explicitly",
+                commit_set.len(),
+                opts.max_blame_commits,
+            ),
+        ));
+    }
+
     // 必要に応じてマージコミットを除外する。
     // git rev-list --no-walk --merges <SHA>... は引数の SHA のうちマージのみを返すので、
     // 一括問い合わせで効率良く判定できる (ARG_MAX 超過対策で chunk 化)。
     if opts.ignore_merges {
+        check_timeout("phase2_merge_filter")?;
         let merge_set = list_merge_commits(dir, &commit_set)?;
         commit_set.retain(|s| !merge_set.contains(s));
         if commit_set.is_empty() {
@@ -324,6 +366,7 @@ pub fn analyze_cochange_blame(dir: &str, opts: &CoChangeOptions) -> Result<CoCha
     } else {
         blame_per_file
     };
+    check_timeout("phase3_diff_tree_setup")?;
 
     // Phase 2: 各コミット c の変更ファイルを diff-tree で取得 (並列化)。
     //          max_files_per_commit を超えるコミット (squash / 大量生成) はスキップ。
@@ -444,6 +487,7 @@ fn collect_blame_commits_for_file(
     file: &str,
     base: &str,
     rename: bool,
+    copy: bool,
 ) -> Result<HashSet<String>> {
     // diff --unified=0 で hunk header を取得
     let diff_output = Command::new("git")
@@ -463,11 +507,14 @@ fn collect_blame_commits_for_file(
     }
 
     // 1 起動の git blame に複数 -L を渡す。
-    // rename=true のときは -M でファイル内移動 + ファイル間 rename を追跡する
-    // (-C は重いコピー検出も含むため今回は -M に留める)。
+    // rename=true: `-M` でファイル内移動 + ファイル間 rename を追跡。
+    // copy=true:   `-C` でファイル間コピーも検出 (`-M` より重い、別フラグでオプトイン)。
     let mut args: Vec<String> = vec!["blame".into(), "--line-porcelain".into()];
     if rename {
         args.push("-M".into());
+    }
+    if copy {
+        args.push("-C".into());
     }
     for (start, count) in &ranges {
         args.push("-L".into());
@@ -1332,5 +1379,175 @@ mod tests {
             baseline.commits_analyzed,
             filtered.commits_analyzed,
         );
+    }
+
+    /// max_blame_commits を超える SHA 集合は InvalidRequest で停止する
+    #[test]
+    fn analyze_cochange_blame_rejects_when_blame_commit_set_exceeds_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        // 各行を別コミットで編集して blame の SHA 集合が複数 (3 件) になる状況を作る。
+        // 単に同じ行を上書きする履歴だと blame は最後の SHA 1 件しか返さないので
+        // 3 行構成にして 1 行ずつ別コミットで編集する。
+        commit_files(
+            repo,
+            &[("a.rs", "fn x1() {}\nfn x2() {}\nfn x3() {}\n")],
+            "init",
+        );
+        commit_files(
+            repo,
+            &[("a.rs", "fn x1() { 1 }\nfn x2() {}\nfn x3() {}\n")],
+            "edit x1",
+        );
+        commit_files(
+            repo,
+            &[("a.rs", "fn x1() { 1 }\nfn x2() { 2 }\nfn x3() {}\n")],
+            "edit x2",
+        );
+        commit_files(
+            repo,
+            &[("a.rs", "fn x1() { 1 }\nfn x2() { 2 }\nfn x3() { 3 }\n")],
+            "edit x3",
+        );
+        // HEAD: 全 3 行を変更 (= hunk の旧側に 3 行入り、それぞれの blame SHA が異なる)
+        commit_files(
+            repo,
+            &[("a.rs", "fn x1() { 9 }\nfn x2() { 9 }\nfn x3() { 9 }\n")],
+            "edit all",
+        );
+
+        let opts = opts_with(|o| {
+            o.blame = true;
+            o.source_files = vec!["a.rs".to_string()];
+            o.base = Some("HEAD~1".to_string());
+            o.max_blame_commits = 1; // SHA 集合 3 件 > 上限 1 で停止
+            o.min_confidence = 0.0;
+            o.min_samples = 1;
+            o.skip_deleted_files = false;
+            o.bounded_by_merge_base = false;
+        });
+        let err = analyze_cochange_blame(repo.to_str().unwrap(), &opts).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max-blame-commits") || msg.contains("max_blame_commits"),
+            "error should mention the limit, got: {msg}"
+        );
+    }
+
+    /// max_blame_commits = 0 は無制限で従来挙動と一致
+    #[test]
+    fn analyze_cochange_blame_unlimited_when_max_blame_commits_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        for i in 0..3 {
+            commit_files(
+                repo,
+                &[("a.rs", &format!("fn a() {{ {i} }}\n"))],
+                &format!("e{i}"),
+            );
+        }
+        commit_files(repo, &[("a.rs", "fn a() { 99 }\n")], "edit");
+
+        let opts = opts_with(|o| {
+            o.blame = true;
+            o.source_files = vec!["a.rs".to_string()];
+            o.base = Some("HEAD~3".to_string());
+            o.max_blame_commits = 0; // unlimited
+            o.min_confidence = 0.0;
+            o.min_samples = 1;
+            o.skip_deleted_files = false;
+            o.bounded_by_merge_base = false;
+        });
+        // エラー無く Ok で返ること
+        let _ = analyze_cochange_blame(repo.to_str().unwrap(), &opts).unwrap();
+    }
+
+    /// timeout_secs を極小 (1秒) にしても、テスト用の小規模リポは1秒以内で終わる。
+    /// したがってここでは「タイムアウト機構が走っても通常完走する」ことを確認する
+    /// (タイムアウト発火そのものは決定論的に再現できないため)。
+    #[test]
+    fn analyze_cochange_blame_timeout_short_does_not_abort_small_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        commit_files(repo, &[("a.rs", "fn a() {}\n")], "init");
+        commit_files(repo, &[("a.rs", "fn a() { 1 }\n")], "edit");
+
+        let opts = opts_with(|o| {
+            o.blame = true;
+            o.source_files = vec!["a.rs".to_string()];
+            o.base = Some("HEAD~1".to_string());
+            o.timeout_secs = 60; // 十分大きな上限
+            o.min_confidence = 0.0;
+            o.min_samples = 1;
+            o.skip_deleted_files = false;
+            o.bounded_by_merge_base = false;
+        });
+        let _ = analyze_cochange_blame(repo.to_str().unwrap(), &opts).unwrap();
+    }
+
+    /// timeout_secs = 0 は無制限。
+    #[test]
+    fn analyze_cochange_blame_unlimited_when_timeout_secs_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        commit_files(repo, &[("a.rs", "fn a() {}\n")], "init");
+        commit_files(repo, &[("a.rs", "fn a() { 1 }\n")], "edit");
+
+        let opts = opts_with(|o| {
+            o.blame = true;
+            o.source_files = vec!["a.rs".to_string()];
+            o.base = Some("HEAD~1".to_string());
+            o.timeout_secs = 0; // unlimited
+            o.min_confidence = 0.0;
+            o.min_samples = 1;
+            o.skip_deleted_files = false;
+            o.bounded_by_merge_base = false;
+        });
+        let _ = analyze_cochange_blame(repo.to_str().unwrap(), &opts).unwrap();
+    }
+
+    /// --copy フラグは git blame に -C を追加する。
+    /// 機能的には `git mv old.rs new.rs` 後の old.rs 由来行が copy 検出で辿れる
+    /// (rename と copy の両方が成立するケースだが、ここでは copy 単体の動作を確認する)。
+    #[test]
+    fn analyze_cochange_blame_copy_smoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+
+        // 元ファイル orig.rs を作って b.rs と一緒に何度か編集
+        for i in 0..3 {
+            commit_files(
+                repo,
+                &[
+                    ("orig.rs", &format!("fn shared() {{ {i} }}\n")),
+                    ("b.rs", &format!("fn b() {{ {i} }}\n")),
+                ],
+                &format!("pair {i}"),
+            );
+        }
+        // orig.rs の中身を copy.rs にコピー (cp 相当を新規追加で再現)
+        commit_files(repo, &[("copy.rs", "fn shared() { 0 }\n")], "copy");
+        // copy.rs を変更 (起点 diff)
+        commit_files(repo, &[("copy.rs", "fn shared() { 99 }\n")], "edit copy");
+
+        let opts = opts_with(|o| {
+            o.blame = true;
+            o.source_files = vec!["copy.rs".to_string()];
+            o.base = Some("HEAD~1".to_string());
+            o.copy = true; // -C 有効化
+            o.min_confidence = 0.0;
+            o.min_samples = 1;
+            o.skip_deleted_files = false;
+            o.bounded_by_merge_base = false;
+        });
+        // エラーなく完走することを最低限確認する
+        // (-C 検出の再現性はテスト環境/git バージョン依存があるため、
+        //  ここでは「-C を渡しても crash しない」ことだけ保証する)
+        let _ = analyze_cochange_blame(repo.to_str().unwrap(), &opts).unwrap();
     }
 }

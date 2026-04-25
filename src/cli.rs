@@ -327,10 +327,26 @@ pub enum Commands {
         #[arg(long)]
         rename: bool,
 
+        /// (blame mode) Detect file copy via `git blame -C` (heavier than `--rename`).
+        /// Useful for repositories with frequent copy-paste / file-split refactors.
+        #[arg(long)]
+        copy: bool,
+
         /// (blame mode) Drop merge commits from the blame commit set before counting co-changes.
         /// Useful when the repository has many squash-merge style merges that bloat diff-tree output.
         #[arg(long)]
         ignore_merges: bool,
+
+        /// (blame mode) Maximum number of blame commits allowed in the SHA set (0 = unlimited).
+        /// Defends against pathological blame fan-out by aborting before the diff-tree phase.
+        #[arg(long, default_value = "0")]
+        max_blame_commits: usize,
+
+        /// (blame mode) Overall timeout in seconds (0 = unlimited).
+        /// Checked at each phase entry; in-flight subprocesses are not killed
+        /// (the most recent invocation completes before the timeout fires).
+        #[arg(long, default_value = "0")]
+        timeout_secs: u64,
     },
 
     /// Structured review: integrates impact, cochange, API surface diff, and dead symbol detection

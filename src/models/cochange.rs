@@ -63,8 +63,17 @@ pub struct CoChangeOptions {
     pub max_source_files: usize,
     /// blame モードで `git blame -M` を有効化する (リネーム/移動を追跡)。
     pub rename: bool,
+    /// blame モードで `git blame -C` を有効化する (ファイル間コピー検出、`-M` より重い)。
+    pub copy: bool,
     /// blame モードで取得した SHA 集合からマージコミットを除外する。
     pub ignore_merges: bool,
+    /// blame モードで集めた SHA 集合の上限。0 = 無制限。
+    /// 上限超過時は InvalidRequest エラーで停止し、diff-tree 爆発を防ぐ。
+    pub max_blame_commits: usize,
+    /// blame モードの解析全体のタイムアウト (秒)。0 = 無制限。
+    /// 各 Phase 入口で経過時間をチェックし、超過時 InvalidRequest で停止する。
+    /// 既に走った subprocess は kill しないため、実際の経過は若干オーバーする可能性がある。
+    pub timeout_secs: u64,
 }
 
 impl Default for CoChangeOptions {
@@ -83,7 +92,10 @@ impl Default for CoChangeOptions {
             exclude_globs: Vec::new(),
             max_source_files: 0,
             rename: false,
+            copy: false,
             ignore_merges: false,
+            max_blame_commits: 0,
+            timeout_secs: 0,
         }
     }
 }
