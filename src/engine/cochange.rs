@@ -411,125 +411,137 @@ pub fn analyze_cochange_blame(dir: &str, opts: &CoChangeOptions) -> Result<CoCha
     }
 
     // Phase 4: 起点ファイルごとに該当候補のスコアを集計し entries を組む。
-    //          1 起点 1 candidate → 1 entry。entry.file_a = source、file_b = candidate。
-    //
-    // ここで以下の改善を併せて適用する:
-    //   * Bayesian smoothing: ranking キー `score = (co + α) / (denom + α + β)` を計算。
-    //     `disable_smoothing` 時は raw confidence と同値を入れる。
-    //   * `min_denominator`: 起点 blame 集合が `< N` ならその起点を一切出さない。
-    //   * `per_source_limit`: 起点ごとに `score` 降順で N 件まで残す (0 = 無制限)。
-    //   * `min_confidence` フィルタは ranking に使う方の値 (smoothing 有効なら score、
-    //     無効なら confidence) で行い、フィルタ感覚を一貫させる。
-    let alpha = opts.smoothing_alpha;
-    let beta = opts.smoothing_beta;
+    //          詳細は `aggregate_source_entries` を参照。
     let smoothing_on = !opts.disable_smoothing;
     let min_denom = opts.min_denominator.max(1); // 0 は 1 と同義 (= 既存挙動)
 
+    let ctx = AggregationContext {
+        commits: &commits,
+        commit_files: &commit_files,
+        source_set: &source_set,
+        exclude_matcher: &exclude_matcher,
+        co_counts: &co_counts,
+        opts,
+        smoothing_on,
+    };
     let mut entries: Vec<CoChangeEntry> = Vec::new();
     for (i, source) in opts.source_files.iter().enumerate() {
         let blame_set = &blame_per_file[i];
         if blame_set.len() < min_denom {
             continue;
         }
-        // この起点ファイルに紐づく blame コミット集合の中で各候補の共起回数を再集計
-        let mut per_source: HashMap<&str, usize> = HashMap::new();
-        for (j, sha) in commits.iter().enumerate() {
-            if !blame_set.contains(sha) {
-                continue;
-            }
-            let files = &commit_files[j];
-            let mut seen: HashSet<&str> = HashSet::new();
-            for f in files {
-                let path = f.as_str();
-                if !seen.insert(path) {
-                    continue;
-                }
-                if source_set.contains(path) {
-                    continue;
-                }
-                if exclude_matcher.is_match(path) {
-                    continue;
-                }
-                *per_source.entry(path).or_insert(0) += 1;
-            }
-        }
-
-        let local_denom = blame_set.len() as f64;
-        // 起点単位でいったん全候補を評価し、min_confidence と min_samples を適用してから
-        // per_source_limit で truncate する。
-        let mut per_source_entries: Vec<CoChangeEntry> = Vec::new();
-        for (cand, co) in per_source {
-            if co < opts.min_samples {
-                continue;
-            }
-            let confidence = co as f64 / local_denom;
-            let score = if smoothing_on {
-                (co as f64 + alpha) / (local_denom + alpha + beta)
-            } else {
-                confidence
-            };
-            // ranking 値で min_confidence フィルタを適用 (smoothing on/off で一貫)
-            let ranking_value = if smoothing_on { score } else { confidence };
-            if ranking_value < opts.min_confidence {
-                continue;
-            }
-            per_source_entries.push(CoChangeEntry {
-                file_a: source.clone(),
-                file_b: cand.to_string(),
-                co_changes: co,
-                total_changes_a: blame_set.len(),
-                total_changes_b: *co_counts.get(cand).unwrap_or(&0),
-                confidence,
-                denominator: Some(blame_set.len()),
-                score: Some(score),
-            });
-        }
-
-        // 起点ごとの上位 N 件に絞る (per_source_limit)
-        per_source_entries.sort_by(|a, b| {
-            let av = if smoothing_on {
-                a.score.unwrap_or(a.confidence)
-            } else {
-                a.confidence
-            };
-            let bv = if smoothing_on {
-                b.score.unwrap_or(b.confidence)
-            } else {
-                b.confidence
-            };
-            bv.partial_cmp(&av)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.file_a.cmp(&b.file_a))
-                .then_with(|| a.file_b.cmp(&b.file_b))
-        });
-        if opts.per_source_limit > 0 {
-            per_source_entries.truncate(opts.per_source_limit);
-        }
-        entries.extend(per_source_entries);
+        entries.extend(aggregate_source_entries(source, blame_set, &ctx));
     }
 
     // 全体 ranking。smoothing 有効なら score 降順、無効なら confidence 降順。
-    entries.sort_by(|a, b| {
-        let av = if smoothing_on {
-            a.score.unwrap_or(a.confidence)
-        } else {
-            a.confidence
-        };
-        let bv = if smoothing_on {
-            b.score.unwrap_or(b.confidence)
-        } else {
-            b.confidence
-        };
-        bv.partial_cmp(&av)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.file_a.cmp(&b.file_a))
-            .then_with(|| a.file_b.cmp(&b.file_b))
-    });
+    entries.sort_by(|a, b| compare_entries_by_ranking(a, b, smoothing_on));
 
     Ok(CoChangeResult {
         entries,
         commits_analyzed: denominator,
     })
+}
+
+/// `aggregate_source_entries` に渡す共通コンテキスト。
+/// 起点ファイルごとに変わらない参照群をまとめて clippy::too_many_arguments を回避する。
+struct AggregationContext<'a> {
+    commits: &'a [String],
+    commit_files: &'a [Vec<String>],
+    source_set: &'a HashSet<&'a str>,
+    exclude_matcher: &'a CoChangeExclude,
+    co_counts: &'a HashMap<String, usize>,
+    opts: &'a CoChangeOptions,
+    smoothing_on: bool,
+}
+
+/// 1 起点ファイルに紐づく blame コミット集合から、共起候補ごとの CoChangeEntry を集計する。
+///
+/// 適用フィルタ:
+///   * `min_samples`: co_changes 未満の候補は除外
+///   * `min_confidence`: ranking 値 (smoothing on/off で切替) が閾値未満は除外
+///   * `per_source_limit`: ranking 値降順で上位 N 件に truncate (0 = 無制限)
+///
+/// 集計内訳:
+///   * `confidence` = co / local_denom (raw)
+///   * `score`      = (co + α) / (local_denom + α + β) (smoothing on) または confidence (off)
+fn aggregate_source_entries(
+    source: &str,
+    blame_set: &HashSet<String>,
+    ctx: &AggregationContext<'_>,
+) -> Vec<CoChangeEntry> {
+    // 起点 blame 集合内で各候補の共起回数を再集計
+    let mut per_source: HashMap<&str, usize> = HashMap::new();
+    for (j, sha) in ctx.commits.iter().enumerate() {
+        if !blame_set.contains(sha) {
+            continue;
+        }
+        let files = &ctx.commit_files[j];
+        let mut seen: HashSet<&str> = HashSet::new();
+        for f in files {
+            let path = f.as_str();
+            if !seen.insert(path) {
+                continue;
+            }
+            if ctx.source_set.contains(path) {
+                continue;
+            }
+            if ctx.exclude_matcher.is_match(path) {
+                continue;
+            }
+            *per_source.entry(path).or_insert(0) += 1;
+        }
+    }
+
+    let local_denom = blame_set.len() as f64;
+    let alpha = ctx.opts.smoothing_alpha;
+    let beta = ctx.opts.smoothing_beta;
+
+    let mut per_source_entries: Vec<CoChangeEntry> = Vec::new();
+    for (cand, co) in per_source {
+        if co < ctx.opts.min_samples {
+            continue;
+        }
+        let confidence = co as f64 / local_denom;
+        let score = if ctx.smoothing_on {
+            (co as f64 + alpha) / (local_denom + alpha + beta)
+        } else {
+            confidence
+        };
+        let entry = CoChangeEntry {
+            file_a: source.to_string(),
+            file_b: cand.to_string(),
+            co_changes: co,
+            total_changes_a: blame_set.len(),
+            total_changes_b: *ctx.co_counts.get(cand).unwrap_or(&0),
+            confidence,
+            denominator: Some(blame_set.len()),
+            score: Some(score),
+        };
+        // ranking 値で min_confidence を判定 (smoothing on/off で一貫)
+        if entry.ranking_value(ctx.smoothing_on) < ctx.opts.min_confidence {
+            continue;
+        }
+        per_source_entries.push(entry);
+    }
+
+    per_source_entries.sort_by(|a, b| compare_entries_by_ranking(a, b, ctx.smoothing_on));
+    if ctx.opts.per_source_limit > 0 {
+        per_source_entries.truncate(ctx.opts.per_source_limit);
+    }
+    per_source_entries
+}
+
+/// CoChangeEntry を ranking 値で降順比較する。同値時は path 昇順で安定化する。
+fn compare_entries_by_ranking(
+    a: &CoChangeEntry,
+    b: &CoChangeEntry,
+    smoothing_on: bool,
+) -> std::cmp::Ordering {
+    b.ranking_value(smoothing_on)
+        .partial_cmp(&a.ranking_value(smoothing_on))
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| a.file_a.cmp(&b.file_a))
+        .then_with(|| a.file_b.cmp(&b.file_b))
 }
 
 /// 1 ファイルの diff hunk 群を 1 回の `git blame -L S,+C [-L S,+C]...` にまとめて

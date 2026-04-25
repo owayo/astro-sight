@@ -29,6 +29,20 @@ pub struct CoChangeEntry {
     pub score: Option<f64>,
 }
 
+impl CoChangeEntry {
+    /// ランキング/フィルタに使う値を返す。blame モードで smoothing 有効なら `score`、
+    /// 無効または lookback モードなら raw `confidence`。
+    /// `score` が `Some` でも `disable_smoothing` 時は呼び出し側が `false` を渡すことで
+    /// raw 値に切り替わる。
+    pub fn ranking_value(&self, smoothing_on: bool) -> f64 {
+        if smoothing_on {
+            self.score.unwrap_or(self.confidence)
+        } else {
+            self.confidence
+        }
+    }
+}
+
 /// Result of co-change analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoChangeResult {
