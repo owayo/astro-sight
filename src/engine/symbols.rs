@@ -460,6 +460,156 @@ fn contains_keyword(text: &str, keyword: &str) -> bool {
     false
 }
 
+/// Python の関数 / メソッド / クラスがフレームワーク登録デコレータ
+/// (Typer / Click / FastAPI / Flask / pytest 等) で装飾されているかを判定する。
+///
+/// `@app.command(...)` のようなデコレータはフレームワーク内部レジストリに関数を
+/// 登録するため、識別子レベルの cross-file refs では caller を追跡できず
+/// dead-code 判定で誤陽性になる。本判定で装飾されたシンボルは保守的に
+/// 「フレームワーク到達可能」と見なし、dead 候補から除外できる。
+///
+/// 末尾セグメントマッチ (`<obj>.<method>` 形式):
+/// - Typer / Click / Discord.py / aiogram: `command`, `callback`, `group`, `event`
+/// - FastAPI / Flask HTTP: `get`, `post`, `put`, `delete`, `patch`, `options`,
+///   `head`, `route`, `websocket`
+/// - FastAPI / Flask lifecycle: `middleware`, `on_event`, `exception_handler`,
+///   `before_request`, `after_request`, `errorhandler`, `teardown_request`,
+///   `teardown_appcontext`, `context_processor`, `shell_context_processor`,
+///   `before_first_request`
+/// - Celery / RQ: `task`
+/// - pytest: `fixture`, `parametrize`, `usefixtures`
+///
+/// 単体名マッチ:
+/// - Django: `receiver`, `login_required`, `permission_required`,
+///   `csrf_exempt`, `cache_page`, `require_GET`, `require_POST`,
+///   `require_http_methods`, `require_safe`, `staff_member_required`,
+///   `user_passes_test`
+///
+/// その他: `pytest.mark.<anything>` プレフィックスを pytest test marker として認識。
+pub fn has_framework_entrypoint_decorator_python(
+    root: Node,
+    source: &[u8],
+    symbol_range: &Range,
+) -> bool {
+    let start = tree_sitter::Point {
+        row: symbol_range.start.line,
+        column: symbol_range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: symbol_range.end.line,
+        column: symbol_range.end.column,
+    };
+    let Some(node) = root.descendant_for_point_range(start, end) else {
+        return false;
+    };
+
+    // 関数 / メソッド / クラス定義の祖先を探す
+    let mut current = Some(node);
+    let mut def_node = None;
+    while let Some(n) = current {
+        if matches!(n.kind(), "function_definition" | "class_definition") {
+            def_node = Some(n);
+            break;
+        }
+        current = n.parent();
+    }
+    let Some(def) = def_node else {
+        return false;
+    };
+
+    // 親が decorated_definition でなければデコレータ無し
+    let Some(parent) = def.parent() else {
+        return false;
+    };
+    if parent.kind() != "decorated_definition" {
+        return false;
+    }
+
+    let mut cursor = parent.walk();
+    for child in parent.children(&mut cursor) {
+        if child.kind() != "decorator" {
+            continue;
+        }
+        if decorator_matches_framework_pattern_python(child, source) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Python decorator ノードのテキストから先頭式 (call 引数を除く) を取り出し、
+/// 既知のフレームワーク登録パターンに一致するかを判定する。
+fn decorator_matches_framework_pattern_python(decorator: Node, source: &[u8]) -> bool {
+    let Ok(text) = decorator.utf8_text(source) else {
+        return false;
+    };
+    let stripped = text.trim_start_matches('@').trim();
+    let head = stripped.split('(').next().unwrap_or(stripped).trim();
+    if head.is_empty() {
+        return false;
+    }
+
+    // pytest.mark.<anything> は pytest test marker として扱う
+    if head.starts_with("pytest.mark.") {
+        return true;
+    }
+
+    const BARE_DECORATORS: &[&str] = &[
+        "receiver",
+        "login_required",
+        "permission_required",
+        "csrf_exempt",
+        "cache_page",
+        "require_GET",
+        "require_POST",
+        "require_http_methods",
+        "require_safe",
+        "staff_member_required",
+        "user_passes_test",
+    ];
+    if BARE_DECORATORS.contains(&head) {
+        return true;
+    }
+
+    let last = head.rsplit('.').next().unwrap_or(head);
+    const TAIL_DECORATORS: &[&str] = &[
+        // Typer / Click / Discord.py / aiogram
+        "command",
+        "callback",
+        "group",
+        "event",
+        // FastAPI / Flask HTTP methods
+        "get",
+        "post",
+        "put",
+        "delete",
+        "patch",
+        "options",
+        "head",
+        "route",
+        "websocket",
+        // FastAPI / Flask lifecycle
+        "middleware",
+        "on_event",
+        "exception_handler",
+        "before_request",
+        "after_request",
+        "errorhandler",
+        "teardown_request",
+        "teardown_appcontext",
+        "context_processor",
+        "shell_context_processor",
+        "before_first_request",
+        // Celery / RQ
+        "task",
+        // pytest
+        "fixture",
+        "parametrize",
+        "usefixtures",
+    ];
+    TAIL_DECORATORS.contains(&last)
+}
+
 /// Rust のシンボルが trait impl ブロックに属しているかを判定する。
 /// trait impl メソッドは trait dispatch 経由で呼ばれるため、cross-file refs
 /// 検索では caller を追跡できず、dead-code 判定でスキップする必要がある。
@@ -1517,5 +1667,229 @@ function foo() {
         assert!(!super::contains_keyword("public overrider", "override"));
         assert!(super::contains_keyword("public override fun", "override"));
         assert!(super::contains_keyword("override", "override"));
+    }
+
+    // --- has_framework_entrypoint_decorator_python テスト ---
+
+    fn check_python_framework_decorator(source: &str, symbol_name: &str) -> bool {
+        let language = LangId::Python.ts_language();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+
+        let syms = extract_symbols(root, source.as_bytes(), LangId::Python).unwrap();
+        let sym = syms
+            .iter()
+            .find(|s| s.name == symbol_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "symbol '{}' not found in {:?}",
+                    symbol_name,
+                    syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            });
+        has_framework_entrypoint_decorator_python(root, source.as_bytes(), &sym.range)
+    }
+
+    #[test]
+    fn python_typer_command_decorator_detected() {
+        // Issue 報告ケース: Typer の @app.command(...) で装飾された関数
+        let src = r#"
+import typer
+app = typer.Typer()
+
+@app.command("list")
+def list_tokens():
+    pass
+"#;
+        assert!(check_python_framework_decorator(src, "list_tokens"));
+    }
+
+    #[test]
+    fn python_typer_callback_decorator_detected() {
+        let src = r#"
+@app.callback()
+def main():
+    pass
+"#;
+        assert!(check_python_framework_decorator(src, "main"));
+    }
+
+    #[test]
+    fn python_click_command_decorator_detected() {
+        let src = r#"
+import click
+
+@click.command()
+def hello():
+    pass
+"#;
+        assert!(check_python_framework_decorator(src, "hello"));
+    }
+
+    #[test]
+    fn python_click_group_subcommand_detected() {
+        let src = r#"
+@cli.command()
+def sync():
+    pass
+"#;
+        assert!(check_python_framework_decorator(src, "sync"));
+    }
+
+    #[test]
+    fn python_fastapi_route_detected() {
+        let src = r#"
+@app.get("/items/{item_id}")
+def read_item(item_id: int):
+    return {"item_id": item_id}
+"#;
+        assert!(check_python_framework_decorator(src, "read_item"));
+    }
+
+    #[test]
+    fn python_fastapi_router_post_detected() {
+        let src = r#"
+@router.post("/users/")
+def create_user(user: User):
+    return user
+"#;
+        assert!(check_python_framework_decorator(src, "create_user"));
+    }
+
+    #[test]
+    fn python_flask_route_detected() {
+        let src = r#"
+@app.route("/")
+def index():
+    return "Hello"
+"#;
+        assert!(check_python_framework_decorator(src, "index"));
+    }
+
+    #[test]
+    fn python_flask_blueprint_route_detected() {
+        let src = r#"
+@bp.route("/foo")
+def foo():
+    return "foo"
+"#;
+        assert!(check_python_framework_decorator(src, "foo"));
+    }
+
+    #[test]
+    fn python_pytest_fixture_detected() {
+        let src = r#"
+import pytest
+
+@pytest.fixture
+def db_session():
+    return None
+"#;
+        assert!(check_python_framework_decorator(src, "db_session"));
+    }
+
+    #[test]
+    fn python_pytest_mark_parametrize_detected() {
+        let src = r#"
+import pytest
+
+@pytest.mark.parametrize("x", [1, 2])
+def test_x(x):
+    assert x > 0
+"#;
+        assert!(check_python_framework_decorator(src, "test_x"));
+    }
+
+    #[test]
+    fn python_celery_task_detected() {
+        let src = r#"
+@app.task
+def send_email(to):
+    pass
+"#;
+        assert!(check_python_framework_decorator(src, "send_email"));
+    }
+
+    #[test]
+    fn python_django_receiver_detected() {
+        let src = r#"
+from django.dispatch import receiver
+
+@receiver(post_save, sender=User)
+def on_user_save(sender, instance, **kwargs):
+    pass
+"#;
+        assert!(check_python_framework_decorator(src, "on_user_save"));
+    }
+
+    #[test]
+    fn python_django_login_required_detected() {
+        let src = r#"
+from django.contrib.auth.decorators import login_required
+
+@login_required
+def my_view(request):
+    return None
+"#;
+        assert!(check_python_framework_decorator(src, "my_view"));
+    }
+
+    #[test]
+    fn python_dataclass_decorator_not_detected() {
+        // @dataclass はフレームワーク登録ではないので除外しない
+        let src = r#"
+from dataclasses import dataclass
+
+@dataclass
+class Point:
+    x: int
+    y: int
+"#;
+        assert!(!check_python_framework_decorator(src, "Point"));
+    }
+
+    #[test]
+    fn python_property_decorator_not_detected() {
+        let src = r#"
+class Foo:
+    @property
+    def name(self):
+        return self._name
+"#;
+        assert!(!check_python_framework_decorator(src, "name"));
+    }
+
+    #[test]
+    fn python_classmethod_decorator_not_detected() {
+        let src = r#"
+class Foo:
+    @classmethod
+    def create(cls):
+        return cls()
+"#;
+        assert!(!check_python_framework_decorator(src, "create"));
+    }
+
+    #[test]
+    fn python_undecorated_function_not_detected() {
+        let src = r#"
+def helper():
+    return None
+"#;
+        assert!(!check_python_framework_decorator(src, "helper"));
+    }
+
+    #[test]
+    fn python_decorated_method_in_class_detected() {
+        // クラス内のメソッドでも @app.command が認識できること
+        let src = r#"
+class Cli:
+    @app.command("show")
+    def show(self):
+        pass
+"#;
+        assert!(check_python_framework_decorator(src, "show"));
     }
 }

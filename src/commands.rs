@@ -1792,27 +1792,39 @@ fn extract_exported_symbols_from_git(
     // Rust の `impl Trait for Type` 配下のメソッドは trait の実装事実であり、独立した
     // 公開 API item ではない。module 移動など実体は維持したままの変更でも api.add / api.rm
     // に誤計上されるのを避けるため、API 変更検出でも trait impl メソッドを除外する。
-    Some(filter_exported_symbols(&syms, root, source, lang_id, true))
+    // git の base 側を読む経路は API 変更検出 (api.rm 比較) のみで使われる。
+    // dead-code は最新コミット側だけを見るため framework entrypoint の除外は不要。
+    Some(filter_exported_symbols(
+        &syms, root, source, lang_id, true, false,
+    ))
 }
 
 fn extract_exported_symbols_from_file(
     dir: &str,
     file_path: &str,
 ) -> Option<Vec<(String, String, String)>> {
-    extract_exported_symbols_from_file_inner(dir, file_path, true)
+    // API 変更検出ではフレームワーク登録デコレータ付き関数も「公開 API 面」として
+    // 検出対象に残す (新規 CLI サブコマンドの追加・削除も api.add / api.rm として
+    // 報告したい)。
+    extract_exported_symbols_from_file_inner(dir, file_path, true, false)
 }
 
 fn extract_dead_code_candidates_from_file(
     dir: &str,
     file_path: &str,
 ) -> Option<Vec<(String, String, String)>> {
-    extract_exported_symbols_from_file_inner(dir, file_path, true)
+    // dead-code 判定では Typer / Click / FastAPI / Flask / pytest 等のフレームワーク
+    // 登録デコレータが付いた関数を除外する。デコレータ経由でフレームワーク内部
+    // レジストリに登録されるため、識別子レベルの cross-file refs では caller を
+    // 追跡できず偽陽性源になる。
+    extract_exported_symbols_from_file_inner(dir, file_path, true, true)
 }
 
 fn extract_exported_symbols_from_file_inner(
     dir: &str,
     file_path: &str,
     exclude_trait_impls: bool,
+    exclude_framework_entrypoints: bool,
 ) -> Option<Vec<(String, String, String)>> {
     let full_path = std::path::Path::new(dir).join(file_path);
     let utf8_path = camino::Utf8Path::new(full_path.to_str()?);
@@ -1828,6 +1840,7 @@ fn extract_exported_symbols_from_file_inner(
         &source,
         lang_id,
         exclude_trait_impls,
+        exclude_framework_entrypoints,
     ))
 }
 
@@ -1852,6 +1865,7 @@ fn filter_exported_symbols(
     source: &[u8],
     lang_id: crate::language::LangId,
     exclude_trait_impls: bool,
+    exclude_framework_entrypoints: bool,
 ) -> Vec<(String, String, String)> {
     use crate::models::symbol::SymbolKind;
     let source_str = std::str::from_utf8(source).unwrap_or("");
@@ -1918,6 +1932,22 @@ fn filter_exported_symbols(
         // `*FeatureTest` クラスは PHPUnit のランナーから自動で呼ばれる規約的シンボルで、
         // 識別子レベルの cross-file ref は発生しないが dead でもない。
         if is_phpunit_test_symbol(&sym.name, sym.kind, lang_id) {
+            continue;
+        }
+        // Python のフレームワーク登録デコレータ (Typer / Click / FastAPI / Flask /
+        // pytest 等) で装飾された関数 / メソッド / クラスは、フレームワーク内部
+        // レジストリ経由で呼び出されるため識別子レベルの cross-file refs では
+        // caller を追跡できない。dead-code 判定では偽陽性源になるため除外する。
+        if exclude_framework_entrypoints
+            && lang_id == crate::language::LangId::Python
+            && matches!(
+                sym.kind,
+                SymbolKind::Method | SymbolKind::Function | SymbolKind::Class
+            )
+            && crate::engine::symbols::has_framework_entrypoint_decorator_python(
+                root, source, &sym.range,
+            )
+        {
             continue;
         }
         let sig = extract_api_signature(sym, &lines);
