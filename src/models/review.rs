@@ -27,11 +27,18 @@ pub struct MissingCochange {
 }
 
 /// 公開シンボルの変更サマリ。
+///
+/// `moved` は同一コミット内で「ある file から消えたシンボル」と「別 file に追加された
+/// 同名・同種別・同シグネチャのシンボル」が一致した場合に 1 件にまとめる。module →
+/// package 化リファクタや git rename 未検出時の add/rm ペアを informational として
+/// 提示し、`removed`/`added` の誤検出ノイズを抑える。
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiChanges {
     pub added: Vec<ApiSymbol>,
     pub removed: Vec<ApiSymbol>,
     pub modified: Vec<ApiSymbolChange>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub moved: Vec<MovedSymbol>,
 }
 
 /// 公開シンボル情報。
@@ -60,4 +67,16 @@ pub struct DeadSymbol {
     pub name: String,
     pub kind: String,
     pub file: String,
+}
+
+/// 別ファイルへ移動された公開シンボル。
+///
+/// 同一コミット内で `from` ファイルから消えたシンボルと、`to` ファイルに追加された
+/// 同名・同種別・同シグネチャのシンボルが対応するときに生成される。
+#[derive(Debug, Clone, Serialize)]
+pub struct MovedSymbol {
+    pub name: String,
+    pub kind: String,
+    pub from: String,
+    pub to: String,
 }

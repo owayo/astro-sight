@@ -11,7 +11,7 @@ use crate::error::{AstroError, ErrorCode};
 use crate::models::cochange::CoChangeOptions;
 use crate::models::dead_code::DeadCodeResult;
 use crate::models::review::{
-    ApiChanges, ApiSymbol, ApiSymbolChange, DeadSymbol, MissingCochange, ReviewResult,
+    ApiChanges, ApiSymbol, ApiSymbolChange, DeadSymbol, MissingCochange, MovedSymbol, ReviewResult,
 };
 use crate::service::{AppService, AstParams};
 
@@ -960,6 +960,7 @@ fn empty_review_result() -> ReviewResult {
             added: Vec::new(),
             removed: Vec::new(),
             modified: Vec::new(),
+            moved: Vec::new(),
         },
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
@@ -1109,13 +1110,14 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> HookJsonBuild {
         hook_obj.insert("cochange".into(), serde_json::Value::Array(cochanges));
     }
 
-    // api: {add,rm,mod} — 空でないセクションのみ
+    // api: {add,rm,mod,moved} — 空でないセクションのみ
     let has_api_changes = !result.api_changes.added.is_empty()
         || !result.api_changes.removed.is_empty()
-        || !result.api_changes.modified.is_empty();
-    // api.added は新規 pub シンボル追加 (additive) で既存コードを壊さないため Stop hook の
-    // ブロッキング対象から外し informational 扱いにする。api.removed / api.modified は
-    // 破壊的変更の可能性があるため従来どおり blocking。
+        || !result.api_changes.modified.is_empty()
+        || !result.api_changes.moved.is_empty();
+    // api.added / api.moved は破壊的変更ではないため Stop hook のブロッキング対象から外し
+    // informational 扱いにする。api.removed / api.modified は破壊的変更の可能性があるため
+    // 従来どおり blocking。
     let has_api_breaking =
         !result.api_changes.removed.is_empty() || !result.api_changes.modified.is_empty();
     if has_api_changes {
@@ -1159,6 +1161,25 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> HookJsonBuild {
                         .modified
                         .iter()
                         .map(|m| serde_json::json!({"n": m.name, "f": m.file}))
+                        .collect(),
+                ),
+            );
+        }
+        if !result.api_changes.moved.is_empty() {
+            api.insert(
+                "moved".into(),
+                serde_json::Value::Array(
+                    result
+                        .api_changes
+                        .moved
+                        .iter()
+                        .map(|m| {
+                            serde_json::json!({
+                                "n": m.name,
+                                "from": m.from,
+                                "to": m.to,
+                            })
+                        })
                         .collect(),
                 ),
             );
@@ -1353,6 +1374,13 @@ fn detect_api_changes(
     let mut added: Vec<ApiSymbolCandidate> = Vec::new();
     let mut removed: Vec<ApiSymbolCandidate> = Vec::new();
     let mut modified = Vec::new();
+    // 移動検出用に「フィルタ前の新規側候補」を全件追跡する。`is_used_in_diff_paths` 等で
+    // `added` から除外された候補も `removed` との突き合わせには利用したいため、
+    // フィルタ適用前の候補を別バケットに溜めておく。module → package 化 (cli.py →
+    // cli/__init__.py + cli/_commands/*.py) のように、新規ファイル側のシンボルが
+    // 同 diff 内の別ファイルから参照されて `added` から消える典型ケースで、対応する
+    // `removed` を `moved` として相殺するために使う。
+    let mut all_new_candidates: Vec<ApiSymbolCandidate> = Vec::new();
 
     // .gitattributes の linguist-generated 指定ファイルは API 変更検出から除外する
     let gitattrs = std::fs::canonicalize(dir)
@@ -1394,6 +1422,14 @@ fn detect_api_changes(
                 // 呼び出す構造) を新規追加した時に全関数が api.add に積まれるノイズを防ぐ。
                 let in_file_callees = extract_in_file_callees(dir, &df.new_path);
                 for (name, kind, sig) in &new_syms {
+                    let candidate = ApiSymbolCandidate {
+                        name: name.clone(),
+                        kind: kind.clone(),
+                        file: df.new_path.clone(),
+                        signature: sig.clone(),
+                    };
+                    // 移動検出には全候補を必要とするので、フィルタ前に積む。
+                    all_new_candidates.push(candidate.clone());
                     if is_binary_rust_crate {
                         continue;
                     }
@@ -1405,12 +1441,7 @@ fn detect_api_changes(
                     if is_used_in_diff_paths(dir, name, &df.new_path, &diff_new_paths) {
                         continue;
                     }
-                    added.push(ApiSymbolCandidate {
-                        name: name.clone(),
-                        kind: kind.clone(),
-                        file: df.new_path.clone(),
-                        signature: sig.clone(),
-                    });
+                    added.push(candidate);
                 }
             }
             continue;
@@ -1466,6 +1497,14 @@ fn detect_api_changes(
         for (name, kind, sig) in &new_syms {
             if !old_map.contains_key(name.as_str()) {
                 new_symbols_in_current_file.insert(name.clone());
+                let candidate = ApiSymbolCandidate {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    file: df.new_path.clone(),
+                    signature: sig.clone(),
+                };
+                // 移動検出には全候補を必要とするので、フィルタ前に積む。
+                all_new_candidates.push(candidate.clone());
                 if is_binary_rust_crate {
                     continue;
                 }
@@ -1478,12 +1517,7 @@ fn detect_api_changes(
                 if is_used_in_diff_paths(dir, name, &df.new_path, &diff_new_paths) {
                     continue;
                 }
-                added.push(ApiSymbolCandidate {
-                    name: name.clone(),
-                    kind: kind.clone(),
-                    file: df.new_path.clone(),
-                    signature: sig.clone(),
-                });
+                added.push(candidate);
             }
         }
 
@@ -1540,25 +1574,43 @@ fn detect_api_changes(
 
     // git の rename detection が効かない diff (外部供給 / 非 git 入力 / 設定で無効化された
     // 環境など) に対するフォールバックとして、同一 (name, kind, signature) の add/rm ペアを
-    // rename または move として相殺する。
-    let (added, removed) = reconcile_api_symbols(added, removed);
+    // rename または move として相殺し、`moved` カテゴリに移す。`all_new_candidates` には
+    // `is_used_in_diff_paths` 等で `added` から外れた候補も含まれるため、module → package
+    // 化のように新規ファイル側のシンボルが同 diff 内の `__init__.py` 等から参照されて
+    // `added` に乗らないケースでも `removed` を相殺できる。
+    let (added, removed, moved) = reconcile_with_moves(added, removed, all_new_candidates);
 
     ApiChanges {
         added: added.into_iter().map(|c| c.into_api_symbol()).collect(),
         removed: removed.into_iter().map(|c| c.into_api_symbol()).collect(),
         modified,
+        moved,
     }
 }
 
-/// 同名・同種別・同シグネチャの api.add と api.rm のペアを相殺する。
-/// 1 対 1 マッチングで相殺し、残ったものだけを返す。
-fn reconcile_api_symbols(
+/// 同名・同種別・同シグネチャの api.add / api.rm ペアを `moved` として相殺する。
+///
+/// `all_new_candidates` は `added` フィルタ適用前の新規側候補一覧（`added` の上位集合）。
+/// `is_used_in_diff_paths` などで `added` から落ちた候補も `removed` との突き合わせに
+/// 利用するため、別系統で渡す。
+///
+/// 戻り値:
+/// - `kept_added`: `moved` で相殺されなかった追加シンボル
+/// - `kept_removed`: `moved` で相殺されなかった削除シンボル
+/// - `moved`: `from`/`to` のペアにまとめた移動シンボル
+fn reconcile_with_moves(
     added: Vec<ApiSymbolCandidate>,
     removed: Vec<ApiSymbolCandidate>,
-) -> (Vec<ApiSymbolCandidate>, Vec<ApiSymbolCandidate>) {
+    all_new_candidates: Vec<ApiSymbolCandidate>,
+) -> (
+    Vec<ApiSymbolCandidate>,
+    Vec<ApiSymbolCandidate>,
+    Vec<MovedSymbol>,
+) {
     use std::collections::HashMap;
     use std::collections::VecDeque;
 
+    // 1) removed を (name, kind, signature) でバケット化。
     let mut removed_bucket: HashMap<(String, String, String), VecDeque<ApiSymbolCandidate>> =
         HashMap::new();
     for sym in removed {
@@ -1568,24 +1620,64 @@ fn reconcile_api_symbols(
             .push_back(sym);
     }
 
-    let mut kept_added = Vec::with_capacity(added.len());
-    for sym in added {
-        let key = (sym.name.clone(), sym.kind.clone(), sym.signature.clone());
-        if let Some(bucket) = removed_bucket.get_mut(&key)
-            && bucket.pop_front().is_some()
-        {
-            // 同一ペアが rm 側にあれば相殺
+    // 2) 新規候補を順に走査して removed と突き合わせ、`moved` を組み立てる。
+    //    同じ (name, kind, signature, file) の重複候補は最初の 1 件だけ扱う。
+    //    (name, kind, signature) を共有する複数 add が同じ removed と組まないように、
+    //    一度マッチした new 側は `matched_new_files` に記録しておき、後で `added` から
+    //    除外する。
+    let mut moved: Vec<MovedSymbol> = Vec::new();
+    let mut seen_new_keys: std::collections::HashSet<(String, String, String, String)> =
+        std::collections::HashSet::new();
+    let mut matched_new_files: HashMap<
+        (String, String, String),
+        std::collections::HashSet<String>,
+    > = HashMap::new();
+    for new in &all_new_candidates {
+        let dedup_key = (
+            new.name.clone(),
+            new.kind.clone(),
+            new.signature.clone(),
+            new.file.clone(),
+        );
+        if !seen_new_keys.insert(dedup_key) {
             continue;
         }
-        kept_added.push(sym);
+        let bucket_key = (new.name.clone(), new.kind.clone(), new.signature.clone());
+        if let Some(bucket) = removed_bucket.get_mut(&bucket_key)
+            && let Some(rm) = bucket.pop_front()
+        {
+            matched_new_files
+                .entry(bucket_key)
+                .or_default()
+                .insert(new.file.clone());
+            moved.push(MovedSymbol {
+                name: rm.name,
+                kind: rm.kind,
+                from: rm.file,
+                to: new.file.clone(),
+            });
+        }
     }
 
+    // 3) `moved` で相殺された候補は `added` からも除外する。
+    let kept_added: Vec<ApiSymbolCandidate> = added
+        .into_iter()
+        .filter(|a| {
+            let key = (a.name.clone(), a.kind.clone(), a.signature.clone());
+            !matched_new_files
+                .get(&key)
+                .map(|files| files.contains(&a.file))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    // 4) ペア化されなかった `removed` を集める。
     let kept_removed: Vec<ApiSymbolCandidate> = removed_bucket
         .into_values()
         .flat_map(|bucket| bucket.into_iter())
         .collect();
 
-    (kept_added, kept_removed)
+    (kept_added, kept_removed, moved)
 }
 
 /// qualname (`Container.method`) から末尾セグメントのみを抜き出す。
@@ -3157,6 +3249,206 @@ def new_public_api():
             added_names.contains(&"new_public_api"),
             "新規追加された関数は引き続き検出されるべき。got added: {added_names:?}"
         );
+
+        // 相殺された 3 関数は moved として informational に提示されるべき
+        let moved_names: std::collections::HashSet<&str> =
+            api_changes.moved.iter().map(|m| m.name.as_str()).collect();
+        for name in ["iter_plugin_manifests", "check_layout", "main"] {
+            assert!(
+                moved_names.contains(name),
+                "相殺された関数は moved に積まれるべき。got moved: {moved_names:?}"
+            );
+        }
+        for m in &api_changes.moved {
+            assert_eq!(m.from, "scripts/regenerate_marketplace.py");
+            assert_eq!(m.to, "scripts/marketplace.py");
+        }
+    }
+
+    #[test]
+    fn detect_api_changes_module_to_package_split_reports_moved_not_removed() {
+        // 報告再現: cli.py を cli/ パッケージに分割し、各サブコマンドを
+        // cli/_commands/<name>.py に移動。cli/__init__.py は再エクスポートを行う。
+        // 旧 cli.py の関数は削除ではなく moved として報告されるべき。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let old_cli = "\
+import typer
+
+app = typer.Typer()
+
+@app.command(\"rotate\")
+def rotate_command(name: str):
+    pass
+
+@app.command(\"list\")
+def list_tokens():
+    pass
+
+@app.command(\"check\")
+def check_command():
+    pass
+
+def main():
+    app()
+";
+        git_commit_files(repo, &[("src/token_manager/cli.py", old_cli)], "initial");
+
+        // 旧 cli.py を削除し、cli/ パッケージに分割
+        fs::remove_file(repo.join("src/token_manager/cli.py")).expect("rm old");
+        fs::create_dir_all(repo.join("src/token_manager/cli/_commands")).expect("create pkg");
+
+        let init_py = "\
+import typer
+
+from ._commands.rotate import rotate_command
+from ._commands.list import list_tokens
+from ._commands.check import check_command
+
+app = typer.Typer()
+
+app.command(\"rotate\")(rotate_command)
+app.command(\"list\")(list_tokens)
+app.command(\"check\")(check_command)
+
+
+def main():
+    app()
+";
+        let rotate_py = "\
+def rotate_command(name: str):
+    pass
+";
+        let list_py = "\
+def list_tokens():
+    pass
+";
+        let check_py = "\
+def check_command():
+    pass
+";
+        fs::write(repo.join("src/token_manager/cli/__init__.py"), init_py).expect("write init");
+        fs::write(repo.join("src/token_manager/cli/_commands/__init__.py"), "")
+            .expect("write _commands init");
+        fs::write(
+            repo.join("src/token_manager/cli/_commands/rotate.py"),
+            rotate_py,
+        )
+        .expect("write rotate");
+        fs::write(
+            repo.join("src/token_manager/cli/_commands/list.py"),
+            list_py,
+        )
+        .expect("write list");
+        fs::write(
+            repo.join("src/token_manager/cli/_commands/check.py"),
+            check_py,
+        )
+        .expect("write check");
+
+        let diff_files = vec![
+            crate::models::impact::DiffFile {
+                old_path: "src/token_manager/cli.py".to_string(),
+                new_path: "/dev/null".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 20,
+                    new_start: 0,
+                    new_count: 0,
+                }],
+            },
+            crate::models::impact::DiffFile {
+                old_path: "/dev/null".to_string(),
+                new_path: "src/token_manager/cli/__init__.py".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 0,
+                    old_count: 0,
+                    new_start: 1,
+                    new_count: 13,
+                }],
+            },
+            crate::models::impact::DiffFile {
+                old_path: "/dev/null".to_string(),
+                new_path: "src/token_manager/cli/_commands/__init__.py".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 0,
+                    old_count: 0,
+                    new_start: 1,
+                    new_count: 0,
+                }],
+            },
+            crate::models::impact::DiffFile {
+                old_path: "/dev/null".to_string(),
+                new_path: "src/token_manager/cli/_commands/rotate.py".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 0,
+                    old_count: 0,
+                    new_start: 1,
+                    new_count: 2,
+                }],
+            },
+            crate::models::impact::DiffFile {
+                old_path: "/dev/null".to_string(),
+                new_path: "src/token_manager/cli/_commands/list.py".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 0,
+                    old_count: 0,
+                    new_start: 1,
+                    new_count: 2,
+                }],
+            },
+            crate::models::impact::DiffFile {
+                old_path: "/dev/null".to_string(),
+                new_path: "src/token_manager/cli/_commands/check.py".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 0,
+                    old_count: 0,
+                    new_start: 1,
+                    new_count: 2,
+                }],
+            },
+        ];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed_names: std::collections::HashSet<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+
+        // 移動した関数は api.rm から消えていること（report 再現のコア）
+        for name in ["rotate_command", "list_tokens", "check_command", "main"] {
+            assert!(
+                !removed_names.contains(name),
+                "module → package 化で移動したシンボルは api.rm に残らないべき。got removed: {removed_names:?}"
+            );
+        }
+
+        // 移動した関数は moved に積まれていること
+        let moved_by_name: std::collections::HashMap<&str, &crate::models::review::MovedSymbol> =
+            api_changes
+                .moved
+                .iter()
+                .map(|m| (m.name.as_str(), m))
+                .collect();
+        for name in ["rotate_command", "list_tokens", "check_command", "main"] {
+            let m = moved_by_name
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} が moved に含まれていない: {moved_by_name:?}"));
+            assert_eq!(
+                m.from, "src/token_manager/cli.py",
+                "from は旧 cli.py であるべき"
+            );
+            assert!(
+                m.to.starts_with("src/token_manager/cli/"),
+                "to は新パッケージ配下であるべき: {}",
+                m.to
+            );
+        }
     }
 
     #[test]
@@ -4411,9 +4703,9 @@ pub fn use_diff(d: MrDiff) {}
     }
 
     #[test]
-    fn reconcile_api_symbols_pairs_by_signature() {
-        // reconcile_api_symbols のユニットテスト: 同じ (name,kind,sig) を相殺し、
-        // 残りだけを返す。
+    fn reconcile_with_moves_pairs_by_signature() {
+        // reconcile_with_moves のユニットテスト: 同じ (name,kind,sig) を相殺して
+        // moved に分類し、残りだけを返す。
         let added = vec![
             ApiSymbolCandidate {
                 name: "foo".into(),
@@ -4442,16 +4734,22 @@ pub fn use_diff(d: MrDiff) {}
                 signature: "def gone():".into(),
             },
         ];
+        let all_new_candidates = added.clone();
 
-        let (kept_added, kept_removed) = reconcile_api_symbols(added, removed);
+        let (kept_added, kept_removed, moved) =
+            reconcile_with_moves(added, removed, all_new_candidates);
         assert_eq!(kept_added.len(), 1);
         assert_eq!(kept_added[0].name, "new_api");
         assert_eq!(kept_removed.len(), 1);
         assert_eq!(kept_removed[0].name, "gone");
+        assert_eq!(moved.len(), 1, "同シグネチャは moved に集約される");
+        assert_eq!(moved[0].name, "foo");
+        assert_eq!(moved[0].from, "old.py");
+        assert_eq!(moved[0].to, "new.py");
     }
 
     #[test]
-    fn reconcile_api_symbols_keeps_different_signatures() {
+    fn reconcile_with_moves_keeps_different_signatures() {
         // 同名でもシグネチャが違うなら相殺しない（signature change の検出漏れ防止）。
         let added = vec![ApiSymbolCandidate {
             name: "foo".into(),
@@ -4465,10 +4763,50 @@ pub fn use_diff(d: MrDiff) {}
             file: "a.py".into(),
             signature: "def foo():".into(),
         }];
+        let all_new_candidates = added.clone();
 
-        let (kept_added, kept_removed) = reconcile_api_symbols(added, removed);
+        let (kept_added, kept_removed, moved) =
+            reconcile_with_moves(added, removed, all_new_candidates);
         assert_eq!(kept_added.len(), 1);
         assert_eq!(kept_removed.len(), 1);
+        assert!(
+            moved.is_empty(),
+            "シグネチャが違えば moved に乗らない。got: {moved:?}"
+        );
+    }
+
+    #[test]
+    fn reconcile_with_moves_uses_filtered_new_candidates_for_pairing() {
+        // is_used_in_diff_paths などで `added` から落ちた候補も all_new_candidates
+        // に残っていれば removed と相殺する。module → package 化リファクタの中核。
+        let added: Vec<ApiSymbolCandidate> = Vec::new();
+        let removed = vec![ApiSymbolCandidate {
+            name: "rotate_command".into(),
+            kind: "function".into(),
+            file: "src/cli.py".into(),
+            signature: "def rotate_command(name: str):".into(),
+        }];
+        let all_new_candidates = vec![ApiSymbolCandidate {
+            name: "rotate_command".into(),
+            kind: "function".into(),
+            file: "src/cli/_commands/rotate.py".into(),
+            signature: "def rotate_command(name: str):".into(),
+        }];
+
+        let (kept_added, kept_removed, moved) =
+            reconcile_with_moves(added, removed, all_new_candidates);
+        assert!(
+            kept_added.is_empty(),
+            "added に乗らないので残らない: {kept_added:?}"
+        );
+        assert!(
+            kept_removed.is_empty(),
+            "all_new_candidates と組めば removed から消える: {kept_removed:?}"
+        );
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].name, "rotate_command");
+        assert_eq!(moved[0].from, "src/cli.py");
+        assert_eq!(moved[0].to, "src/cli/_commands/rotate.py");
     }
 
     #[test]
@@ -4725,6 +5063,7 @@ def new_public_api():
                 added: Vec::new(),
                 removed: Vec::new(),
                 modified: Vec::new(),
+                moved: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -4759,6 +5098,7 @@ def new_public_api():
                 }],
                 removed: Vec::new(),
                 modified: Vec::new(),
+                moved: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -4790,6 +5130,7 @@ def new_public_api():
                     file: "a.rs".to_string(),
                 }],
                 modified: Vec::new(),
+                moved: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -4820,6 +5161,7 @@ def new_public_api():
                     old_signature: Some("fn foo()".to_string()),
                     new_signature: Some("fn foo(x: u32)".to_string()),
                 }],
+                moved: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -4862,6 +5204,7 @@ def new_public_api():
                 added: Vec::new(),
                 removed: Vec::new(),
                 modified: Vec::new(),
+                moved: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
