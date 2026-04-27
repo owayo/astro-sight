@@ -32,6 +32,10 @@ pub struct MissingCochange {
 /// 同名・同種別・同シグネチャのシンボル」が一致した場合に 1 件にまとめる。module →
 /// package 化リファクタや git rename 未検出時の add/rm ペアを informational として
 /// 提示し、`removed`/`added` の誤検出ノイズを抑える。
+///
+/// `property_to_field` は Python の `@property def x(self) -> T` を `@dataclass` の
+/// インスタンスフィールド `x: T` に置き換えたケース。`obj.x` 属性アクセスとしての
+/// 公開面は維持されているため、破壊的削除ではなく informational として提示する。
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiChanges {
     pub added: Vec<ApiSymbol>,
@@ -39,6 +43,8 @@ pub struct ApiChanges {
     pub modified: Vec<ApiSymbolChange>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub moved: Vec<MovedSymbol>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub property_to_field: Vec<PropertyToFieldChange>,
 }
 
 /// 公開シンボル情報。
@@ -79,4 +85,16 @@ pub struct MovedSymbol {
     pub kind: String,
     pub from: String,
     pub to: String,
+}
+
+/// Python の `@property` メソッドを dataclass フィールドへ置き換えた変更。
+///
+/// `Container.member` という qualname 形式で表現され、旧 tree でメソッド定義として
+/// 検出されていたシンボルが、新 tree の同名クラス内で `member: type` のフィールド宣言
+/// として残っているケースを表す。`obj.member` 属性アクセスとしての公開面は維持される
+/// ため、破壊的削除ではなく informational として提示する。
+#[derive(Debug, Clone, Serialize)]
+pub struct PropertyToFieldChange {
+    pub name: String,
+    pub file: String,
 }

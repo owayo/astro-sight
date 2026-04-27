@@ -11,7 +11,8 @@ use crate::error::{AstroError, ErrorCode};
 use crate::models::cochange::CoChangeOptions;
 use crate::models::dead_code::DeadCodeResult;
 use crate::models::review::{
-    ApiChanges, ApiSymbol, ApiSymbolChange, DeadSymbol, MissingCochange, MovedSymbol, ReviewResult,
+    ApiChanges, ApiSymbol, ApiSymbolChange, DeadSymbol, MissingCochange, MovedSymbol,
+    PropertyToFieldChange, ReviewResult,
 };
 use crate::service::{AppService, AstParams};
 
@@ -961,6 +962,7 @@ fn empty_review_result() -> ReviewResult {
             removed: Vec::new(),
             modified: Vec::new(),
             moved: Vec::new(),
+            property_to_field: Vec::new(),
         },
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
@@ -1110,14 +1112,15 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> HookJsonBuild {
         hook_obj.insert("cochange".into(), serde_json::Value::Array(cochanges));
     }
 
-    // api: {add,rm,mod,moved} — 空でないセクションのみ
+    // api: {add,rm,mod,moved,property_to_field} — 空でないセクションのみ
     let has_api_changes = !result.api_changes.added.is_empty()
         || !result.api_changes.removed.is_empty()
         || !result.api_changes.modified.is_empty()
-        || !result.api_changes.moved.is_empty();
-    // api.added / api.moved は破壊的変更ではないため Stop hook のブロッキング対象から外し
-    // informational 扱いにする。api.removed / api.modified は破壊的変更の可能性があるため
-    // 従来どおり blocking。
+        || !result.api_changes.moved.is_empty()
+        || !result.api_changes.property_to_field.is_empty();
+    // api.added / api.moved / api.property_to_field は破壊的変更ではないため Stop hook の
+    // ブロッキング対象から外し informational 扱いにする。api.removed / api.modified は
+    // 破壊的変更の可能性があるため従来どおり blocking。
     let has_api_breaking =
         !result.api_changes.removed.is_empty() || !result.api_changes.modified.is_empty();
     if has_api_changes {
@@ -1180,6 +1183,19 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> HookJsonBuild {
                                 "to": m.to,
                             })
                         })
+                        .collect(),
+                ),
+            );
+        }
+        if !result.api_changes.property_to_field.is_empty() {
+            api.insert(
+                "property_to_field".into(),
+                serde_json::Value::Array(
+                    result
+                        .api_changes
+                        .property_to_field
+                        .iter()
+                        .map(|p| serde_json::json!({"n": p.name, "f": p.file}))
                         .collect(),
                 ),
             );
@@ -1381,6 +1397,10 @@ fn detect_api_changes(
     // 同 diff 内の別ファイルから参照されて `added` から消える典型ケースで、対応する
     // `removed` を `moved` として相殺するために使う。
     let mut all_new_candidates: Vec<ApiSymbolCandidate> = Vec::new();
+    // Python の `@property def x(self)` を `@dataclass` フィールド `x: T` に置き換えた
+    // ケースを informational として残す。`obj.x` の属性 API は維持されるため `removed`
+    // からは除外し、`property_to_field` カテゴリに移す。
+    let mut property_to_field: Vec<PropertyToFieldChange> = Vec::new();
 
     // .gitattributes の linguist-generated 指定ファイルは API 変更検出から除外する
     let gitattrs = std::fs::canonicalize(dir)
@@ -1450,6 +1470,17 @@ fn detect_api_changes(
         if df.new_path == "/dev/null" {
             if let Some(old_syms) = extract_exported_symbols_from_git(dir, base, &df.old_path) {
                 for (name, kind, sig) in &old_syms {
+                    // Python の @property → dataclass field 置き換えなら removed
+                    // 扱いせず property_to_field に振り替える。
+                    if let Some(target_file) =
+                        detect_python_property_to_field(dir, name, &diff_new_paths)
+                    {
+                        property_to_field.push(PropertyToFieldChange {
+                            name: name.clone(),
+                            file: target_file,
+                        });
+                        continue;
+                    }
                     removed.push(ApiSymbolCandidate {
                         name: name.clone(),
                         kind: kind.clone(),
@@ -1532,6 +1563,17 @@ fn detect_api_changes(
                 {
                     continue;
                 }
+                // Python の @property → dataclass field 置き換えなら removed 扱い
+                // せず property_to_field に振り替える。
+                if let Some(target_file) =
+                    detect_python_property_to_field(dir, name, &diff_new_paths)
+                {
+                    property_to_field.push(PropertyToFieldChange {
+                        name: name.clone(),
+                        file: target_file,
+                    });
+                    continue;
+                }
                 removed.push(ApiSymbolCandidate {
                     name: name.clone(),
                     kind: kind.clone(),
@@ -1585,6 +1627,7 @@ fn detect_api_changes(
         removed: removed.into_iter().map(|c| c.into_api_symbol()).collect(),
         modified,
         moved,
+        property_to_field,
     }
 }
 
@@ -2191,6 +2234,134 @@ fn is_removed_symbol_unreferenced(dir: &str, name: &str) -> bool {
         return false;
     };
     refs_result.references.is_empty()
+}
+
+/// Python のクラス内に存在するフィールド宣言 (`name: type` 形式) を集める。
+///
+/// `@property def x(self) -> T` から `@dataclass` フィールド `x: T` への置き換えを検出する
+/// ために使う。tree-sitter で `class_definition` を走査し、`name` フィールドが `class_name`
+/// と一致するクラスの body 直下にある `name: type` 宣言の左辺 identifier を返す。
+fn extract_python_class_fields(
+    dir: &str,
+    file_path: &str,
+    class_name: &str,
+) -> std::collections::HashSet<String> {
+    let mut fields = std::collections::HashSet::new();
+    let full_path = std::path::Path::new(dir).join(file_path);
+    let utf8_path = match camino::Utf8Path::from_path(&full_path) {
+        Some(p) => p,
+        None => return fields,
+    };
+    let lang_id = match crate::language::LangId::from_path(utf8_path) {
+        Ok(l) => l,
+        Err(_) => return fields,
+    };
+    if lang_id != crate::language::LangId::Python {
+        return fields;
+    }
+    let source = match parser::read_file(utf8_path) {
+        Ok(s) => s,
+        Err(_) => return fields,
+    };
+    let tree = match parser::parse_source(&source, lang_id) {
+        Ok(t) => t,
+        Err(_) => return fields,
+    };
+
+    walk_python_class_for_fields(tree.root_node(), &source, class_name, &mut fields);
+    fields
+}
+
+fn walk_python_class_for_fields(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    class_name: &str,
+    out: &mut std::collections::HashSet<String>,
+) {
+    if node.kind() == "class_definition"
+        && let Some(name_node) = node.child_by_field_name("name")
+        && name_node.utf8_text(source).ok() == Some(class_name)
+        && let Some(body) = node.child_by_field_name("body")
+    {
+        collect_python_dataclass_fields(body, source, out);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_python_class_for_fields(child, source, class_name, out);
+    }
+}
+
+/// Python のクラス body 直下にある `name: type` 形式の宣言の左辺 identifier を集める。
+///
+/// tree-sitter-python では `name: type` (右辺なし) は `expression_statement > assignment`
+/// に展開され、`assignment.left = identifier` / `assignment.type` が存在する。`name: type = default`
+/// の形式も同じく `assignment` ノードで `right` が追加されるだけなので同じハンドラで取れる。
+fn collect_python_dataclass_fields(
+    body: tree_sitter::Node<'_>,
+    source: &[u8],
+    out: &mut std::collections::HashSet<String>,
+) {
+    let mut cursor = body.walk();
+    for stmt in body.children(&mut cursor) {
+        if stmt.kind() != "expression_statement" {
+            continue;
+        }
+        let mut sub_cursor = stmt.walk();
+        for sub in stmt.children(&mut sub_cursor) {
+            if sub.kind() != "assignment" {
+                continue;
+            }
+            let Some(left) = sub.child_by_field_name("left") else {
+                continue;
+            };
+            if left.kind() != "identifier" {
+                continue;
+            }
+            // `type` フィールドが存在するもの（typed annotation）のみ対象
+            if sub.child_by_field_name("type").is_none() {
+                continue;
+            }
+            if let Ok(name) = left.utf8_text(source) {
+                out.insert(name.to_string());
+            }
+        }
+    }
+}
+
+/// Python の `@property def member(self) -> T` を `@dataclass` フィールド `member: T` に
+/// 置き換えた変更を検出する。
+///
+/// `qualname` は `Container.member` 形式の文字列。`diff_new_paths` 内のいずれかの新ファイルに
+/// 同名 `Container` クラスが存在し、その中に `member: type` の typed annotation 宣言が
+/// あれば、それが置き換え先のファイルパスであるとして返す。複数候補があれば最初のものを返す。
+fn detect_python_property_to_field(
+    dir: &str,
+    qualname: &str,
+    diff_new_paths: &HashSet<String>,
+) -> Option<String> {
+    let (container, member) = qualname.split_once('.')?;
+    if container.is_empty() || member.is_empty() {
+        return None;
+    }
+    // qualname がさらにネストしている場合 (`A.B.member`) は保守的に対象外とする。
+    if member.contains('.') {
+        return None;
+    }
+    for new_path in diff_new_paths {
+        if !std::path::Path::new(new_path)
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("py"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let fields = extract_python_class_fields(dir, new_path, container);
+        if fields.contains(member) {
+            return Some(new_path.clone());
+        }
+    }
+    None
 }
 
 /// `sym` の range を内包する最も内側の container (class/struct/trait/interface/enum) を返す。
@@ -3449,6 +3620,185 @@ def check_command():
                 m.to
             );
         }
+    }
+
+    #[test]
+    fn detect_api_changes_python_property_to_field_replacement_is_not_removed() {
+        // 報告再現: Python の `@property def x(self) -> str` を `@dataclass` フィールド
+        // `x: str` に置き換えると、`obj.x` 属性アクセス API は維持されるため
+        // `api.rm` ではなく `property_to_field` カテゴリに分類されるべき。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let old_content = "\
+from dataclasses import dataclass
+from urllib.parse import urlparse
+
+
+@dataclass
+class ReviewConfig:
+    project_url: str
+
+    @property
+    def gitlab_base_url(self) -> str:
+        parsed = urlparse(self.project_url)
+        return f\"{parsed.scheme}://{parsed.netloc}\"
+";
+        git_commit_files(repo, &[("scripts/review_mr.py", old_content)], "initial");
+
+        let new_content = "\
+from dataclasses import dataclass
+
+
+@dataclass
+class ReviewConfig:
+    project_url: str
+    gitlab_base_url: str
+";
+        fs::write(repo.join("scripts/review_mr.py"), new_content).expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "scripts/review_mr.py".to_string(),
+            new_path: "scripts/review_mr.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 12,
+                new_start: 1,
+                new_count: 7,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed_names: std::collections::HashSet<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !removed_names.contains(&"ReviewConfig.gitlab_base_url"),
+            "@property → dataclass field 置き換えは api.rm に残らないべき。got: {removed_names:?}"
+        );
+
+        let p2f_names: Vec<&str> = api_changes
+            .property_to_field
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert!(
+            p2f_names.contains(&"ReviewConfig.gitlab_base_url"),
+            "@property → dataclass field 置き換えは property_to_field に積まれるべき。got: {p2f_names:?}"
+        );
+    }
+
+    #[test]
+    fn detect_api_changes_python_property_removed_without_field_remains_removed() {
+        // 安全網: クラスから @property を削除し、対応するフィールドも追加しない場合は
+        // 通常通り api.rm として残るべき。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let old_content = "\
+from dataclasses import dataclass
+
+
+@dataclass
+class Foo:
+    name: str
+
+    @property
+    def computed(self) -> str:
+        return self.name.upper()
+";
+        git_commit_files(repo, &[("foo.py", old_content)], "initial");
+
+        let new_content = "\
+from dataclasses import dataclass
+
+
+@dataclass
+class Foo:
+    name: str
+";
+        fs::write(repo.join("foo.py"), new_content).expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "foo.py".to_string(),
+            new_path: "foo.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 10,
+                new_start: 1,
+                new_count: 6,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed_names: std::collections::HashSet<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed_names.contains(&"Foo.computed"),
+            "対応 field が無い @property 削除は api.rm に残るべき。got: {removed_names:?}"
+        );
+        assert!(
+            api_changes.property_to_field.is_empty(),
+            "対応 field が無い場合は property_to_field に積まれないべき。got: {:?}",
+            api_changes.property_to_field
+        );
+    }
+
+    #[test]
+    fn extract_python_class_fields_collects_typed_annotations_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let py = "\
+from dataclasses import dataclass
+
+
+@dataclass
+class A:
+    x: int
+    y: str = \"default\"
+    untyped = 1
+
+
+class B:
+    z: float
+";
+        fs::write(dir.path().join("m.py"), py).expect("write");
+
+        let a_fields =
+            extract_python_class_fields(dir.path().to_str().expect("utf-8"), "m.py", "A");
+        assert!(
+            a_fields.contains("x"),
+            "typed annotation は採取される: {a_fields:?}"
+        );
+        assert!(
+            a_fields.contains("y"),
+            "default 値付き typed annotation も採取される: {a_fields:?}"
+        );
+        assert!(
+            !a_fields.contains("untyped"),
+            "type annotation が無い代入は採取しない: {a_fields:?}"
+        );
+
+        let b_fields =
+            extract_python_class_fields(dir.path().to_str().expect("utf-8"), "m.py", "B");
+        assert!(
+            b_fields.contains("z"),
+            "@dataclass でないクラスでも採取する: {b_fields:?}"
+        );
+
+        let none =
+            extract_python_class_fields(dir.path().to_str().expect("utf-8"), "m.py", "Missing");
+        assert!(none.is_empty(), "存在しないクラス名は空集合: {none:?}");
     }
 
     #[test]
@@ -5064,6 +5414,7 @@ def new_public_api():
                 removed: Vec::new(),
                 modified: Vec::new(),
                 moved: Vec::new(),
+                property_to_field: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -5099,6 +5450,7 @@ def new_public_api():
                 removed: Vec::new(),
                 modified: Vec::new(),
                 moved: Vec::new(),
+                property_to_field: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -5131,6 +5483,7 @@ def new_public_api():
                 }],
                 modified: Vec::new(),
                 moved: Vec::new(),
+                property_to_field: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -5162,6 +5515,7 @@ def new_public_api():
                     new_signature: Some("fn foo(x: u32)".to_string()),
                 }],
                 moved: Vec::new(),
+                property_to_field: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -5205,6 +5559,7 @@ def new_public_api():
                 removed: Vec::new(),
                 modified: Vec::new(),
                 moved: Vec::new(),
+                property_to_field: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
