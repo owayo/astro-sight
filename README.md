@@ -554,7 +554,7 @@ PR や patch 全体をまとめて見たい場合は、`astro-sight review --dir
 スキルだけでは Claude Code/Codex が Grep/Read にフォールバックすることがあります。
 プロジェクトの `CLAUDE.md` またはグローバルの `~/.claude/CLAUDE.md` に以下を追記すると、構造分析時に astro-sight を優先的に使用するようになります:
 
-```markdown
+````markdown
 # Code Structure Analysis — astro-sight MANDATORY Rules
 
 ## STOP-AND-CHECK Rule (CRITICAL: Check BEFORE every Grep/grep/rg call)
@@ -620,7 +620,7 @@ astro-sight session                                # NDJSON multi-query batch (s
 - **`refs` results include `context` (source line)** → No need for additional Read/Grep
 - **Batch multiple symbol searches with `refs --names`** (simpler than session)
 - **Use Read for surrounding context when editing** (astro-sight shows 1 line only)
-```
+````
 
 ### MCP サーバーとして登録
 
