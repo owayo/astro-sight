@@ -9,7 +9,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - **BLAKE3** コンテンツハッシュによるファイルベースキャッシュ
 - **clap derive** による CLI 引数パーサー
 - **NDJSON** ストリーミングセッション対応
-- **スマートコンテキスト**（diff→影響分析、バッチ参照検索 O(N+S)）
+- **スマートコンテキスト**（diff→影響分析、単一/バッチ参照検索は fold/reduce でピーク RSS を抑制、バッチ参照検索 O(N+S)）
 - **AST 応答の巨大行抑制**（`ast` の `text` / `snippet` は 256 文字上限で切り詰め、巨大行で応答が肥大化しない）
 - **MCP サーバーモード**（rmcp 1.4 による stdio JSON-RPC 2.0、ワークスペースサンドボックス、11 ツール）
 - **デフォルト compact JSON** 出力（`--pretty` で整形出力）
@@ -35,7 +35,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/engine/extractor.rs` - AST ノード抽出
 - `src/engine/symbols.rs` - シンボル抽出（tree-sitter クエリ）+ スコープ判定（is_local_scope_symbol, is_symbol_exported）+ 循環的複雑度（calculate_complexity）
 - `src/engine/calls.rs` - コールグラフ抽出（言語別 call expression クエリ）
-- `src/engine/refs.rs` - クロスファイル参照検索（ignore + rayon 並列 + memchr/memmem 事前フィルタ + Aho-Corasick バッチ検索 + `collect_files` pub ユーティリティ）、CI 言語（Xojo）では正規化キー衝突を `Vec<usize>` で吸収、行コンテキスト抽出は `memchr` で該当行のみ UTF-8 変換
+- `src/engine/refs.rs` - クロスファイル参照検索（ignore + rayon 並列 + fold/reduce 集約 + memchr/memmem 事前フィルタ + Aho-Corasick バッチ検索 + `collect_files` pub ユーティリティ）、CI 言語（Xojo）では正規化キー衝突を `Vec<usize>` で吸収、行コンテキスト抽出は `memchr` で該当行のみ UTF-8 変換
 - `src/engine/diff.rs` - unified diff パーサー
 - `src/engine/impact/mod.rs` - 影響分析オーケストレーター（2パス方式: collect affected → batch refs）、`ParsedFile` キャッシュは `SourceBuf` を直接保持し mmap ゼロコピー経路を維持
 - `src/engine/sequence.rs` - コールグラフから Mermaid シーケンス図を生成
@@ -60,6 +60,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - 公開 API や export を触った変更では `astro-sight dead-code --dir . --git` も併用して死蔵シンボルを確認する
 - 複数の `astro-sight` クエリを連続で投げる場合は `session` を優先し、プロセス起動コストを抑える
 - 繰り返しの構造ルール確認には `astro-sight lint --path <file> --rules <rules.yaml>` を使い、アドホックなテキスト検索で代用しない
+- 並列集約や大規模リポジトリ向けの変更では `/usr/bin/time -l` でピーク RSS を測定し、`par_iter().collect()` で不要な中間 Vec を全展開していないか確認する
 - コードコメントは必要な箇所にだけ付け、付ける場合は日本語で簡潔に記述する
 
 ## Build & Test

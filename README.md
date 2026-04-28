@@ -111,7 +111,11 @@ astro-sight refs --name "AppService" --dir src/
 # 4. exact node が欲しいときだけ ast へ上げる
 astro-sight ast --path src/main.rs --line 10 --col 0
 
-# 5. 2 個以上の mixed query は session にまとめる
+# 5. 繰り返しの構造ルールは lint、呼び出しの流れは sequence で確認する
+astro-sight lint --path src/main.rs --rules rules.yaml
+astro-sight sequence --path src/main.rs --function main
+
+# 6. 2 個以上の mixed query は session にまとめる
 printf '%s\n' \
   '{"command":"symbols","path":"src/main.rs"}' \
   '{"command":"refs","name":"AppService","dir":"src"}' \
@@ -198,6 +202,8 @@ astro-sight refs --names "AppService,AstgenResponse" --dir src/
 ```
 
 `--name` は空文字を受け付けない。`--names` も空要素のみ（例: `",,,"`）の場合は `INVALID_REQUEST` を返す。`--dir` にはディレクトリのみ指定でき、ファイルパスを渡した場合も `INVALID_REQUEST` を返す。
+
+単一検索と複数シンボル検索はいずれも worker local の fold/reduce で結果を直接統合し、per-file の中間 `Vec` を全ファイル分保持しない。非常に多くの参照が返るシンボルでは出力自体が大きくなるため、`--glob` で対象言語を絞るか、必要に応じて `ASTRO_SIGHT_BATCH_WORKERS` で並列ワーカー数を下げる。
 
 `context` / `impact` / `review` の `--base` は `git diff` / `git show` にそのまま渡るため、`-` で始まる値・NUL を含む値・空文字を `INVALID_REQUEST` で拒否する（`--output=/path` 等のオプション誤認識を防ぐ）。
 
@@ -619,6 +625,7 @@ astro-sight session                                # NDJSON multi-query batch (s
 ## Efficiency Rules
 - **`refs` results include `context` (source line)** → No need for additional Read/Grep
 - **Batch multiple symbol searches with `refs --names`** (simpler than session)
+- **For very common symbols, combine `--glob` with `ASTRO_SIGHT_BATCH_WORKERS`** to keep output size and peak RSS bounded
 - **Use Read for surrounding context when editing** (astro-sight shows 1 line only)
 ````
 

@@ -7,11 +7,11 @@ use crate::engine::parser;
 use crate::language::{LangId, normalize_identifier};
 use crate::models::reference::{RefKind, SymbolReference};
 
-/// `find_references_batch` 用の最大並列ワーカー数。
+/// `find_references` / `find_references_batch` 用の最大並列ワーカー数。
 ///
 /// 数万ファイル級の大規模リポジトリでは rayon fold バケットがワーカー数に比例して
-/// `Vec<Vec<SymbolReference>>` を抱えるため、物理コア数をそのまま使うと RSS が
-/// 線形に膨張し OOM を招く。`ASTRO_SIGHT_BATCH_WORKERS` で上書き可能。
+/// `Vec<SymbolReference>` を抱えるため、物理コア数をそのまま使うと RSS が線形に膨張し
+/// OOM を招く。`ASTRO_SIGHT_BATCH_WORKERS` で上書き可能。
 fn bounded_worker_count() -> usize {
     std::env::var("ASTRO_SIGHT_BATCH_WORKERS")
         .ok()
@@ -29,17 +29,42 @@ pub fn find_references(
 ) -> Result<Vec<SymbolReference>> {
     let files = collect_files(dir, glob_pattern)?;
 
-    let refs: Vec<Vec<SymbolReference>> = files
-        .par_iter()
-        .filter_map(|path| {
-            let utf8_path = camino::Utf8Path::new(path.to_str()?);
-            find_refs_in_file(symbol_name, utf8_path).ok()
-        })
-        .collect();
+    let worker_limit = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(bounded_worker_count());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_limit)
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build rayon pool: {e}"))?;
 
-    let mut all_refs: Vec<SymbolReference> = refs.into_iter().flatten().collect();
+    // per-file Vec を全ファイル分保持せず、worker local の Vec へ直接統合する。
+    let mut all_refs: Vec<SymbolReference> = pool.install(|| {
+        files
+            .into_par_iter()
+            .fold(Vec::new, |mut local, path| {
+                if let Some(path_str) = path.to_str() {
+                    let utf8_path = camino::Utf8Path::new(path_str);
+                    if let Ok(mut refs) = find_refs_in_file(symbol_name, utf8_path) {
+                        local.append(&mut refs);
+                    }
+                }
+                local
+            })
+            .reduce(Vec::new, |mut acc, mut local| {
+                acc.append(&mut local);
+                acc
+            })
+    });
+
+    sort_references(&mut all_refs);
+
+    Ok(all_refs)
+}
+
+fn sort_references(refs: &mut [SymbolReference]) {
     // ソート: 定義を先頭に、その後パス/行番号順
-    all_refs.sort_by(|a, b| {
+    refs.sort_by(|a, b| {
         let def_order = |k: &Option<RefKind>| match k {
             Some(RefKind::Definition) => 0,
             _ => 1,
@@ -49,8 +74,6 @@ pub fn find_references(
             .then_with(|| a.path.cmp(&b.path))
             .then_with(|| a.line.cmp(&b.line))
     });
-
-    Ok(all_refs)
 }
 
 /// ignore クレートでファイルを収集する（.gitignore 対応）。
@@ -804,7 +827,7 @@ fn extract_line_context(source: &[u8], row: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Batch reference search: O(N + S) instead of O(S × N)
+// バッチ参照検索: O(S × N) ではなく O(N + S) で処理する
 // ---------------------------------------------------------------------------
 
 /// 全シンボル名の参照を1回のディレクトリウォークで検索する。
@@ -881,17 +904,7 @@ pub fn find_references_batch(
     let mut merged = HashMap::with_capacity(symbol_names.len());
     for (i, name) in symbol_names.iter().enumerate() {
         let mut refs = std::mem::take(&mut buckets[i]);
-        // ソート: 定義を先頭に、その後パス/行番号順
-        refs.sort_by(|a, b| {
-            let def_order = |k: &Option<RefKind>| match k {
-                Some(RefKind::Definition) => 0,
-                _ => 1,
-            };
-            def_order(&a.kind)
-                .cmp(&def_order(&b.kind))
-                .then_with(|| a.path.cmp(&b.path))
-                .then_with(|| a.line.cmp(&b.line))
-        });
+        sort_references(&mut refs);
         if !refs.is_empty() {
             merged.insert(name.clone(), refs);
         }
@@ -1522,6 +1535,27 @@ mod tests {
         assert!(!is_identifier_kind("block"));
         assert!(!is_identifier_kind("string"));
         assert!(!is_identifier_kind("comment"));
+    }
+
+    /// 単一 refs 検索が複数ファイルを横断し、定義を先頭に返すことを検証
+    #[test]
+    fn find_references_single_search_sorts_definition_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rs");
+        let b = dir.path().join("b.rs");
+        std::fs::write(&a, "pub fn greet() {}\nfn main() { greet(); }\n").unwrap();
+        std::fs::write(&b, "fn other() { crate::greet(); }\n").unwrap();
+
+        let refs = find_references("greet", dir.path(), Some("**/*.rs")).unwrap();
+
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0].kind, Some(RefKind::Definition));
+        assert_eq!(refs[0].line, 0);
+        assert!(
+            refs[1..]
+                .iter()
+                .all(|r| r.kind != Some(RefKind::Definition))
+        );
     }
 
     /// 指定行のソースが正しく抽出され、前後の空白が除去されることを検証

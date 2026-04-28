@@ -96,6 +96,8 @@ echo '{"command":"refs","name":"Sym1","dir":"."}
 - Touching exported APIs or public modules? Add `astro-sight dead-code --dir . --git` before concluding the change.
 - Repeating the same structural review policy across files? Reach for `astro-sight lint` instead of ad-hoc text search.
 - Asking 2+ mixed astro-sight questions in one loop? Use `astro-sight session` instead of paying startup cost for each command.
+- Need a call-flow overview for explanation or review? Use `astro-sight sequence` after `calls` or `symbols` identifies the target function.
+- Need exact syntax around a confusing match or parse error? Escalate from `symbols` to `astro-sight ast --path <file> --line <n> --col <n>`.
 
 ## Escalation Path
 
@@ -130,6 +132,8 @@ astro-sight refs --names sym1,sym2,sym3 --dir <directory>
 ```
 
 Output: `refs` array with `path`, `ln`, `col`, `ctx` (source line), `kind` (`"def"` or `"ref"`). No need to Read files afterward — `ctx` already shows the source line. Batch mode (`--names`) outputs NDJSON with one `{"symbol":..., "refs":[...]}` per line.
+
+Single-symbol and multi-symbol searches both merge worker-local results directly with fold/reduce instead of retaining a per-file intermediate `Vec` for the whole tree. For very common symbols, still narrow with `--glob` or lower `ASTRO_SIGHT_BATCH_WORKERS` because the final output itself can be large.
 
 ### `calls` — Call Graph Extraction
 
@@ -411,7 +415,7 @@ astro-sight dead-code --dir . --git
 - All output is compact JSON by default (short keys: `lang`, `ln`, `col`, `ctx`, `refs`, `src`, `def`/`ref`, `fn` etc.)
 - Use `--pretty` (global flag) for human-readable formatted JSON output
 - `refs` results include `ctx` (source line) — no need to Read files afterward
-- `refs` respects `.gitignore` and uses parallel scanning
+- `refs` respects `.gitignore` and uses bounded parallel scanning with fold/reduce aggregation
 - Multiple symbol searches: use `refs --names` for batching; reserve `session` for mixed commands
 - `session` supports `ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange` (note: `review` is CLI-only, not available in session mode)
 - **Input validation**: Empty `--name`/`--names`, empty `--paths`/`--paths-file` are rejected with `INVALID_REQUEST` error. `--base` for `context`/`impact`/`review` rejects values starting with `-` (blocks option-style injection into `git diff` / `git show`)
@@ -420,4 +424,5 @@ astro-sight dead-code --dir . --git
   - For diff-based commands (`review` / `impact` / `context` / `dead-code --git`), bound the window with `--base HEAD~N`
   - Prefer `--glob` to restrict to the primary language (e.g. `--glob '**/*.php'`)
   - Split `review` into per-command runs (`impact` → `dead-code` → `cochange`) if the unified run is too heavy
-  - `refs` / `symbols --path` are memory-light and safe to run at the repo root even on large trees
+  - `refs` avoids per-file intermediate result retention, but very common symbols can still produce huge final output; narrow with `--glob` or lower `ASTRO_SIGHT_BATCH_WORKERS`
+  - `symbols --path` is memory-light for single-file structure checks
