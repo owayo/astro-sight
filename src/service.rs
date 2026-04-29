@@ -1,5 +1,4 @@
 use anyhow::{Result, bail};
-use camino::Utf8Path;
 use std::path::PathBuf;
 use tracing::{debug, warn};
 
@@ -138,6 +137,19 @@ impl AppService {
         Ok(canonical)
     }
 
+    /// ファイルパスを検証し、UTF-8 として扱える `Utf8PathBuf` を返す。
+    /// 非 UTF-8 のパスは fail-closed でエラーにする（境界チェック後の元パスフォールバックを避ける）。
+    fn validate_path_utf8(&self, path: &str) -> Result<camino::Utf8PathBuf> {
+        let canonical = self.validate_path(path)?;
+        camino::Utf8PathBuf::try_from(canonical).map_err(|e| {
+            AstroError::new(
+                ErrorCode::InvalidRequest,
+                format!("Path contains non-UTF-8 bytes: {}", e.as_path().display()),
+            )
+            .into()
+        })
+    }
+
     /// ディレクトリパスを検証して正規化し、正規化済みパスを返す。
     fn validate_dir(&self, dir: &str) -> Result<PathBuf> {
         let canonical = std::fs::canonicalize(dir).map_err(|_| {
@@ -192,8 +204,8 @@ impl AppService {
             depth = p.depth,
             "extract_ast called"
         );
-        let canonical = self.validate_path(p.path)?;
-        let utf8_path = Utf8Path::new(canonical.to_str().unwrap_or(p.path));
+        let utf8_path_buf = self.validate_path_utf8(p.path)?;
+        let utf8_path = utf8_path_buf.as_path();
 
         let source = parser::read_file(utf8_path)?;
         let (tree, lang_id) = parser::parse_file(utf8_path, &source)?;
@@ -252,8 +264,8 @@ impl AppService {
     /// ソースファイルからシンボルを抽出し、診断情報も返す。
     pub fn extract_symbols(&self, path: &str) -> Result<AstgenResponse> {
         debug!(path = path, "extract_symbols called");
-        let canonical = self.validate_path(path)?;
-        let utf8_path = Utf8Path::new(canonical.to_str().unwrap_or(path));
+        let utf8_path_buf = self.validate_path_utf8(path)?;
+        let utf8_path = utf8_path_buf.as_path();
 
         let source = parser::read_file(utf8_path)?;
         let (tree, lang_id) = parser::parse_file(utf8_path, &source)?;
@@ -279,8 +291,8 @@ impl AppService {
     /// ソースファイルからコールグラフを抽出する。
     pub fn extract_calls(&self, path: &str, function: Option<&str>) -> Result<CallGraph> {
         debug!(path = path, function = ?function, "extract_calls called");
-        let canonical = self.validate_path(path)?;
-        let utf8_path = Utf8Path::new(canonical.to_str().unwrap_or(path));
+        let utf8_path_buf = self.validate_path_utf8(path)?;
+        let utf8_path = utf8_path_buf.as_path();
 
         let source = parser::read_file(utf8_path)?;
         let (tree, lang_id) = parser::parse_file(utf8_path, &source)?;
@@ -308,8 +320,8 @@ impl AppService {
         function: Option<&str>,
     ) -> Result<SequenceDiagramResult> {
         debug!(path = path, function = ?function, "generate_sequence called");
-        let canonical = self.validate_path(path)?;
-        let utf8_path = Utf8Path::new(canonical.to_str().unwrap_or(path));
+        let utf8_path_buf = self.validate_path_utf8(path)?;
+        let utf8_path = utf8_path_buf.as_path();
 
         let source = parser::read_file(utf8_path)?;
         let (tree, lang_id) = parser::parse_file(utf8_path, &source)?;
@@ -330,8 +342,8 @@ impl AppService {
     /// ソースファイルから import/export 依存関係を抽出する。
     pub fn extract_imports(&self, path: &str) -> Result<ImportsResult> {
         debug!(path = path, "extract_imports called");
-        let canonical = self.validate_path(path)?;
-        let utf8_path = Utf8Path::new(canonical.to_str().unwrap_or(path));
+        let utf8_path_buf = self.validate_path_utf8(path)?;
+        let utf8_path = utf8_path_buf.as_path();
 
         let source = parser::read_file(utf8_path)?;
         let (tree, lang_id) = parser::parse_file(utf8_path, &source)?;
@@ -359,8 +371,8 @@ impl AppService {
         rules: &[crate::models::lint::Rule],
     ) -> Result<crate::models::lint::LintResult> {
         debug!(path = path, rules = rules.len(), "lint_file called");
-        let canonical = self.validate_path(path)?;
-        let utf8_path = Utf8Path::new(canonical.to_str().unwrap_or(path));
+        let utf8_path_buf = self.validate_path_utf8(path)?;
+        let utf8_path = utf8_path_buf.as_path();
 
         let source = parser::read_file(utf8_path)?;
         let (tree, lang_id) = parser::parse_file(utf8_path, &source)?;
@@ -754,5 +766,36 @@ mod tests {
         unsafe { std::env::remove_var("ASTRO_SIGHT_WORKSPACE") };
         let service = AppService::from_env().unwrap();
         assert!(service.workspace_root.is_none());
+    }
+
+    /// validate_path_utf8 で正常 UTF-8 パスは Utf8PathBuf を返す
+    #[test]
+    fn validate_path_utf8_accepts_valid_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("ok.rs");
+        std::fs::write(&file_path, "fn main() {}").unwrap();
+        let service = AppService::new();
+        let result = service.validate_path_utf8(file_path.to_str().unwrap());
+        assert!(result.is_ok());
+    }
+
+    /// validate_path_utf8 で存在しないパスは検証段階でエラー
+    /// (validate_path 経由のチェックが先行することを担保)
+    #[test]
+    fn validate_path_utf8_rejects_nonexistent() {
+        let service = AppService::new();
+        let result = service.validate_path_utf8("/nonexistent/no/such.rs");
+        assert!(result.is_err());
+    }
+
+    /// validate_path_utf8 でサンドボックス外のパスは PathOutOfBounds で拒否される
+    /// (サンドボックスモードの境界保護が UTF-8 化前に効くことを保証)
+    #[test]
+    fn validate_path_utf8_rejects_outside_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = AppService::sandboxed(dir.path().to_path_buf()).unwrap();
+        // /etc/passwd は通常存在し、サンドボックス外
+        let result = service.validate_path_utf8("/etc/passwd");
+        assert!(result.is_err());
     }
 }

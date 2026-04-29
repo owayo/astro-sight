@@ -1861,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-ruby"
-version = "26.4.100"
+version = "26.4.101"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -1899,7 +1899,7 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-xojo"
-version = "26.4.100"
+version = "26.4.101"
 dependencies = [
  "cc",
  "tree-sitter-language",

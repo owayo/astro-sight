@@ -244,6 +244,31 @@ fn detect_default_branch(dir: &str) -> Option<String> {
     None
 }
 
+/// `git diff` / `git blame` 等に渡す revision を検証する。
+/// 先頭が `-` の値はオプションとして解釈されるため拒否する
+/// (`--output=/path` のようなファイル書き込みオプション混入を防ぐ)。
+fn validate_revision(rev: &str, arg_name: &str) -> Result<()> {
+    if rev.is_empty() {
+        bail!(AstroError::new(
+            ErrorCode::InvalidRequest,
+            format!("{arg_name} must not be empty"),
+        ));
+    }
+    if rev.starts_with('-') {
+        bail!(AstroError::new(
+            ErrorCode::InvalidRequest,
+            format!("{arg_name} must not start with '-': {rev}"),
+        ));
+    }
+    if rev.contains('\0') {
+        bail!(AstroError::new(
+            ErrorCode::InvalidRequest,
+            format!("{arg_name} must not contain NUL"),
+        ));
+    }
+    Ok(())
+}
+
 /// blame ベースの共変更解析。
 ///
 /// 起点ファイル `source_files` の **変更行** に対して `git blame -L` を当て、
@@ -301,6 +326,10 @@ pub fn analyze_cochange_blame(dir: &str, opts: &CoChangeOptions) -> Result<CoCha
     };
 
     let base_rev: &str = opts.base.as_deref().unwrap_or("HEAD~1");
+    // base は git diff / git blame に直接渡されるため、`-` プレフィクス等の
+    // オプション誤認識を防ぐ revision 検証を必ず通す。--paths/--paths-file 経由で
+    // resolve_blame_source_files の検証を迂回しても安全側に倒れる。
+    validate_revision(base_rev, "--base")?;
 
     // Phase 1: 起点ファイルごとに blame で base コミット側の変更行 SHA を集める。
     //          ファイル単位で rayon 並列化する。
@@ -1854,5 +1883,73 @@ mod tests {
                 "lookback entries must not have score, got: {e:?}"
             );
         }
+    }
+
+    /// blame モードで base がオプションプレフィクスで始まる場合は拒否する。
+    /// `--paths`/`--paths-file` 経由で `resolve_blame_source_files` の検証を
+    /// 迂回しても、`analyze_cochange_blame` 自身が validate_revision で停止する
+    /// ことを保証する。`git diff/blame` への `--output=...` 等のオプション混入を防ぐ。
+    #[test]
+    fn analyze_cochange_blame_rejects_dash_prefixed_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        commit_files(repo, &[("a.rs", "fn a() {}\n")], "init");
+
+        let opts = opts_with(|o| {
+            o.blame = true;
+            o.source_files = vec!["a.rs".to_string()];
+            o.base = Some("--output=/tmp/pwn".to_string());
+            o.min_confidence = 0.0;
+            o.min_samples = 1;
+        });
+        let err = analyze_cochange_blame(repo.to_str().unwrap(), &opts).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--base") && msg.contains("must not start with"),
+            "error message should reject `-` prefixed base, got: {msg}"
+        );
+    }
+
+    /// blame モードで base に NUL バイトが含まれる場合は拒否する。
+    #[test]
+    fn analyze_cochange_blame_rejects_nul_in_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        commit_files(repo, &[("a.rs", "fn a() {}\n")], "init");
+
+        let opts = opts_with(|o| {
+            o.blame = true;
+            o.source_files = vec!["a.rs".to_string()];
+            o.base = Some("HEAD\0foo".to_string());
+            o.min_confidence = 0.0;
+            o.min_samples = 1;
+        });
+        let err = analyze_cochange_blame(repo.to_str().unwrap(), &opts).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--base") && msg.contains("NUL"),
+            "error message should reject NUL in base, got: {msg}"
+        );
+    }
+
+    /// validate_revision のユニットテスト
+    #[test]
+    fn validate_revision_accepts_normal_refs() {
+        assert!(validate_revision("HEAD", "--base").is_ok());
+        assert!(validate_revision("HEAD~3", "--base").is_ok());
+        assert!(validate_revision("main", "--base").is_ok());
+        assert!(validate_revision("origin/main", "--base").is_ok());
+        assert!(validate_revision("v1.0.0", "--base").is_ok());
+        assert!(validate_revision("abc1234", "--base").is_ok());
+    }
+
+    #[test]
+    fn validate_revision_rejects_invalid_refs() {
+        assert!(validate_revision("", "--base").is_err());
+        assert!(validate_revision("--output=/tmp/pwn", "--base").is_err());
+        assert!(validate_revision("-p", "--base").is_err());
+        assert!(validate_revision("HEAD\0foo", "--base").is_err());
     }
 }

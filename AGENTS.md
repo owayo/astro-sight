@@ -16,7 +16,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - **バッチ処理**（`--paths` / `--paths-file` で複数ファイル NDJSON 出力）
 - **JSON エラー出力**（`{"error":{"code":"...","message":"..."}}` を stdout に出力）
 - **入力検証の強化**（`refs` の空 `name/names` を拒否、`--paths` / `--paths-file` の空リストを拒否、`session` の空文字・非 UTF-8・不正パスの `ASTRO_SIGHT_WORKSPACE` を拒否、`--dir` にはディレクトリのみ許可）
-- **セキュリティ** — パス境界チェック（Session/MCP のワークスペースサンドボックス）、ファイル/入力サイズ 100MB 上限（`session` / `context` / `impact` の生入力を含む）、`git diff` / `git show` に渡す `--base` 等 revision は `-` プレフィクス / NUL / 空文字を拒否（オプション誤認識防止）
+- **セキュリティ** — パス境界チェック（Session/MCP のワークスペースサンドボックス、非 UTF-8 パスは canonicalize 後に fail-closed で拒否）、ファイル/入力サイズ 100MB 上限（`session` / `context` / `impact` の生入力を含む）、`git diff` / `git show` / `git blame` に渡す `--base` 等 revision は `-` プレフィクス / NUL / 空文字を拒否（オプション誤認識防止、`cochange --blame` の `--paths` / `--paths-file` 経由でも検証）
 - **トークン最適化** — version フィールド省略（doctor/MCP のみ）、compact キー短縮（`lang`/`ln`/`col`/`ctx`/`refs`/`src`/`def`/`ref`/`fn`/`cx` 等）、calls を caller グルーピング、CompactAstEdge フラット化、refs/context で相対パス出力、symbols デフォルト compact 出力（`--doc` で docstring 付加、`--full` で旧来の完全出力）
 - **循環的複雑度** — symbols 出力に `cx`（cyclomatic complexity）を付加（関数/メソッドのみ、ベース1 + 分岐ノード数、ネスト関数/クロージャは除外）、言語別分岐ノード定義（Rust/JS/TS/Python/Go/Java/Kotlin/Ruby/PHP/C#等）
 - **設定ファイル** — `~/.config/astro-sight/config.toml`（TOML 形式、`astro-sight init` で生成）
