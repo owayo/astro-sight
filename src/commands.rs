@@ -1552,13 +1552,23 @@ fn detect_api_changes(
             }
         }
 
+        // Bash スクリプトでは関数定義は `export -f` (または `declare -fx`/`declare -xf`) で
+        // 明示しない限りサブプロセスへ波及しない。CLI スクリプト内のローカルヘルパーが
+        // 同一 diff 内で削除されたとき、純粋な関数削除（同ファイルに新規追加なし）でも
+        // api.rm から除外できるよう、bash ファイルかつ未 export 関数のときは closed-in-diff
+        // ロジックを純粋削除にも拡張する。`export -f` 済み関数は他リポジトリ消費者向け
+        // API として残す。
+        let is_bash_old_file = is_bash_script_path(&df.old_path);
         for (name, kind, sig) in &old_syms {
             if !new_map.contains_key(name.as_str()) {
                 // closed-in-diff for api.rm: 同ファイルに新規追加されたシンボルがあり、
                 // 削除されたシンボルが変更後ツリーで 0 件参照なら「rename + 実装置換」
                 // と判断して api.rm から除外する。caller は同一 diff 内で追随済み。
                 // 純粋な関数削除（新規追加がない）は api.rm に残す。
-                if !new_symbols_in_current_file.is_empty()
+                let bash_pure_removal_skip = is_bash_old_file
+                    && new_symbols_in_current_file.is_empty()
+                    && !bash_function_is_exported_in_git(dir, base, &df.old_path, name);
+                if (!new_symbols_in_current_file.is_empty() || bash_pure_removal_skip)
                     && is_removed_symbol_unreferenced(dir, name)
                 {
                     continue;
@@ -2234,6 +2244,64 @@ fn is_removed_symbol_unreferenced(dir: &str, name: &str) -> bool {
         return false;
     };
     refs_result.references.is_empty()
+}
+
+/// 拡張子から bash 系シェルスクリプトファイル（.sh / .bash / .zsh）かを判定する。
+fn is_bash_script_path(file_path: &str) -> bool {
+    std::path::Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| matches!(ext, "sh" | "bash" | "zsh"))
+}
+
+/// `git show <base>:<file_path>` の内容から bash 関数 `name` が `export -f` 等で
+/// 明示的にエクスポートされているか判定する。base 側の取得に失敗した場合は
+/// 保守的に false（未 export 扱い）を返す。
+fn bash_function_is_exported_in_git(dir: &str, base: &str, file_path: &str, name: &str) -> bool {
+    if validate_git_revision(base, "--base").is_err()
+        || validate_git_revision(file_path, "diff file path").is_err()
+    {
+        return false;
+    }
+    let Ok(output) = std::process::Command::new("git")
+        .args(["show", &format!("{base}:{file_path}")])
+        .current_dir(dir)
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(&output.stdout) else {
+        return false;
+    };
+    bash_has_export_f(text, name)
+}
+
+/// shell ソース文字列に `export -f <name>` / `declare -fx <name>` / `declare -xf <name>`
+/// による関数エクスポート宣言が含まれているかを判定する。
+///
+/// 各行を `trim_start()` してから先頭一致を見るため、インデント付きの宣言にも対応する。
+/// 同一行に複数名を列挙する形式 (`export -f foo bar`) もサポートする。
+fn bash_has_export_f(source: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    const PREFIXES: &[&str] = &["export -f ", "declare -fx ", "declare -xf "];
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        for prefix in PREFIXES {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                for token in rest.split_whitespace() {
+                    if token == name {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Python のクラス内に存在するフィールド宣言 (`name: type` 形式) を集める。
@@ -4542,6 +4610,147 @@ main() {\n    timed echo hi\n}\nmain\n";
         );
     }
 
+    /// Bash の未 export 関数を caller ごと同一 diff 内で削除した場合は api.rm に出さない。
+    /// (レポート 2026-05-01-bash-private-function-removal-flagged-as-api-rm.md の再現)
+    /// `dump_shallow_state` / `boundary_is_old_enough` のように、CLI スクリプト内の
+    /// クロージャ的なヘルパー関数を、同 diff 内で全 caller と一緒に削除したとき、
+    /// `export -f` が無いなら外部 API 面ではないため除外する必要がある。
+    #[test]
+    fn detect_api_changes_bash_pure_removal_without_export_is_not_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let before = "#!/usr/bin/env bash\n\
+dump_shallow_state() {\n    echo state\n}\n\n\
+boundary_is_old_enough() {\n    return 0\n}\n\n\
+main() {\n    dump_shallow_state\n    while ! boundary_is_old_enough; do\n        sleep 1\n    done\n}\nmain\n";
+        git_commit_files(repo, &[("qa_diff.sh", before)], "initial");
+
+        let after = "#!/usr/bin/env bash\n\
+main() {\n    echo done\n}\nmain\n";
+        fs::write(repo.join("qa_diff.sh"), after).expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "qa_diff.sh".to_string(),
+            new_path: "qa_diff.sh".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 14,
+                new_start: 1,
+                new_count: 4,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !removed.contains(&"dump_shallow_state"),
+            "未 export な bash 関数を caller ごと同一 diff で削除した場合は api.rm に出してはならない。got: {removed:?}"
+        );
+        assert!(
+            !removed.contains(&"boundary_is_old_enough"),
+            "未 export な bash 関数を caller ごと同一 diff で削除した場合は api.rm に出してはならない。got: {removed:?}"
+        );
+    }
+
+    /// Bash で `export -f <name>` されている関数の削除は api.rm に残す。
+    /// 他リポジトリ消費者向け API として残す必要があるため false negative を避ける。
+    #[test]
+    fn detect_api_changes_bash_exported_function_removal_is_still_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let before = "#!/usr/bin/env bash\n\
+public_helper() {\n    echo public\n}\nexport -f public_helper\n\n\
+main() {\n    echo hi\n}\nmain\n";
+        git_commit_files(repo, &[("lib.sh", before)], "initial");
+
+        let after = "#!/usr/bin/env bash\n\
+main() {\n    echo hi\n}\nmain\n";
+        fs::write(repo.join("lib.sh"), after).expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "lib.sh".to_string(),
+            new_path: "lib.sh".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 8,
+                new_start: 1,
+                new_count: 4,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.contains(&"public_helper"),
+            "`export -f` された bash 関数の削除は api.rm に残すべき。got: {removed:?}"
+        );
+    }
+
+    /// Bash の未 export 関数でも、他ファイルから参照されているなら api.rm に残す。
+    /// `source common.sh` 経由で他スクリプトが呼ぶケースを考慮し、
+    /// cross-file refs が 1 件以上なら除外しない。
+    #[test]
+    fn detect_api_changes_bash_unexported_function_with_cross_file_ref_is_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let before = "#!/usr/bin/env bash\n\
+shared_helper() {\n    echo shared\n}\n\n\
+main() {\n    shared_helper\n}\nmain\n";
+        let consumer = "#!/usr/bin/env bash\n\
+source ./common.sh\nshared_helper\n";
+        git_commit_files(
+            repo,
+            &[("common.sh", before), ("consumer.sh", consumer)],
+            "initial",
+        );
+
+        let after = "#!/usr/bin/env bash\n\
+main() {\n    echo hi\n}\nmain\n";
+        fs::write(repo.join("common.sh"), after).expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "common.sh".to_string(),
+            new_path: "common.sh".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 7,
+                new_start: 1,
+                new_count: 4,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.contains(&"shared_helper"),
+            "他ファイルから source 経由で参照されている bash 関数の削除は api.rm に残すべき。got: {removed:?}"
+        );
+    }
+
     /// 他ファイルから参照される関数のシグネチャ変更は api.mod に残す（false negative 防止）。
     /// 同一ファイル内でも呼び出しが存在するが、他ファイルから import/call されている場合は
     /// closed-in-diff とは言えないため、レビュー対象として残す必要がある。
@@ -4993,6 +5202,60 @@ pub fn use_diff(d: MrDiff) {}
         callees.insert("other_fn".to_string());
         assert!(!is_internally_connected(&callees, "Reviewer.execute"));
         assert!(!is_internally_connected(&callees, "execute"));
+    }
+
+    // ------------------------------------------------------------------
+    // is_bash_script_path / bash_has_export_f ヘルパー
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn is_bash_script_path_matches_shell_extensions() {
+        assert!(is_bash_script_path("scripts/foo.sh"));
+        assert!(is_bash_script_path("scripts/foo.bash"));
+        assert!(is_bash_script_path("scripts/foo.zsh"));
+        assert!(!is_bash_script_path("scripts/foo.py"));
+        assert!(!is_bash_script_path("scripts/Makefile"));
+        assert!(!is_bash_script_path("scripts/foo"));
+    }
+
+    #[test]
+    fn bash_has_export_f_detects_export_minus_f() {
+        let src = "#!/usr/bin/env bash\n\
+foo() { echo hi; }\n\
+export -f foo\n\
+bar() { echo bye; }\n";
+        assert!(bash_has_export_f(src, "foo"));
+        assert!(!bash_has_export_f(src, "bar"));
+    }
+
+    #[test]
+    fn bash_has_export_f_detects_declare_variants() {
+        let src = "    declare -fx foo\n  declare -xf bar\n";
+        assert!(bash_has_export_f(src, "foo"));
+        assert!(bash_has_export_f(src, "bar"));
+    }
+
+    #[test]
+    fn bash_has_export_f_supports_multiple_names_per_line() {
+        let src = "export -f foo bar baz\n";
+        assert!(bash_has_export_f(src, "foo"));
+        assert!(bash_has_export_f(src, "bar"));
+        assert!(bash_has_export_f(src, "baz"));
+        assert!(!bash_has_export_f(src, "qux"));
+    }
+
+    #[test]
+    fn bash_has_export_f_does_not_match_partial_or_substring() {
+        let src = "export -f foo_bar\n";
+        assert!(bash_has_export_f(src, "foo_bar"));
+        assert!(!bash_has_export_f(src, "foo"));
+        assert!(!bash_has_export_f(src, "bar"));
+    }
+
+    #[test]
+    fn bash_has_export_f_rejects_empty_name() {
+        let src = "export -f \n";
+        assert!(!bash_has_export_f(src, ""));
     }
 
     // ------------------------------------------------------------------
