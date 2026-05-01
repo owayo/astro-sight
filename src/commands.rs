@@ -1469,7 +1469,17 @@ fn detect_api_changes(
 
         if df.new_path == "/dev/null" {
             if let Some(old_syms) = extract_exported_symbols_from_git(dir, base, &df.old_path) {
+                // Bash ファイル丸ごと削除のケース（CLI スクリプトを別言語に書き換え等）でも
+                // 未 export 関数は外部 API 面ではない。新ツリー全体で参照 0 件なら同一 diff
+                // 内で完結した削除と判断して api.rm から除外する。
+                let is_bash_old_file = is_bash_script_path(&df.old_path);
                 for (name, kind, sig) in &old_syms {
+                    if is_bash_old_file
+                        && !bash_function_is_exported_in_git(dir, base, &df.old_path, name)
+                        && is_removed_bash_symbol_unreferenced(dir, name)
+                    {
+                        continue;
+                    }
                     // Python の @property → dataclass field 置き換えなら removed
                     // 扱いせず property_to_field に振り替える。
                     if let Some(target_file) =
@@ -2244,6 +2254,21 @@ fn is_removed_symbol_unreferenced(dir: &str, name: &str) -> bool {
         return false;
     };
     refs_result.references.is_empty()
+}
+
+/// 削除された bash 関数 `name` が、変更後ツリーの bash 系ファイル内のどこからも
+/// 参照されていないかを判定する。CLI スクリプトを別言語に書き換えたときに、
+/// 新言語側の同名定義/参照を「別物」として扱うため bash ファイル限定で検索する。
+/// 参照検索に失敗した場合は保守的に false を返してレビュー対象として残す。
+fn is_removed_bash_symbol_unreferenced(dir: &str, name: &str) -> bool {
+    let service = AppService::new();
+    let Ok(refs_result) = service.find_references(name, dir, None) else {
+        return false;
+    };
+    refs_result
+        .references
+        .iter()
+        .all(|r| !is_bash_script_path(r.path.as_str()))
 }
 
 /// 拡張子から bash 系シェルスクリプトファイル（.sh / .bash / .zsh）かを判定する。
@@ -4748,6 +4773,103 @@ main() {\n    echo hi\n}\nmain\n";
         assert!(
             removed.contains(&"shared_helper"),
             "他ファイルから source 経由で参照されている bash 関数の削除は api.rm に残すべき。got: {removed:?}"
+        );
+    }
+
+    /// Bash スクリプトファイルを丸ごと別言語 (Python) に置き換えた場合、
+    /// 未 export な bash 関数は api.rm から除外する。
+    /// (レポート 2026-05-01 再発ケース2 / コミット eae0fe0 の再現)
+    #[test]
+    fn detect_api_changes_bash_file_replaced_with_python_drops_private_funcs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let bash_before = "#!/usr/bin/env bash\n\
+fetch_with_retry() {\n    curl \"$1\"\n}\n\n\
+main() {\n    fetch_with_retry https://example.com\n}\nmain\n";
+        git_commit_files(repo, &[("scripts/qa_diff.sh", bash_before)], "initial");
+
+        // bash スクリプトを削除し、別言語ファイルを新設
+        std::fs::remove_file(repo.join("scripts/qa_diff.sh")).expect("remove bash");
+        let py_after = "def fetch_with_retry(url: str) -> str:\n    return url\n\n\
+def main() -> None:\n    fetch_with_retry(\"https://example.com\")\n\n\
+if __name__ == \"__main__\":\n    main()\n";
+        fs::write(repo.join("scripts/qa_diff.py"), py_after).expect("write py");
+
+        let diff_files = vec![
+            crate::models::impact::DiffFile {
+                old_path: "scripts/qa_diff.sh".to_string(),
+                new_path: "/dev/null".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 8,
+                    new_start: 0,
+                    new_count: 0,
+                }],
+            },
+            crate::models::impact::DiffFile {
+                old_path: "/dev/null".to_string(),
+                new_path: "scripts/qa_diff.py".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 0,
+                    old_count: 0,
+                    new_start: 1,
+                    new_count: 7,
+                }],
+            },
+        ];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !removed.contains(&"fetch_with_retry"),
+            "別言語に置換されたファイル削除でも、未 export bash 関数は api.rm に出してはならない。got: {removed:?}"
+        );
+    }
+
+    /// Bash ファイル削除時、`export -f` 済み関数は api.rm に残す。
+    /// 他リポジトリ消費者向け API として false negative を避ける。
+    #[test]
+    fn detect_api_changes_bash_file_deletion_keeps_exported_function() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let lib_before = "#!/usr/bin/env bash\n\
+public_helper() {\n    echo public\n}\nexport -f public_helper\n";
+        git_commit_files(repo, &[("lib.sh", lib_before)], "initial");
+
+        std::fs::remove_file(repo.join("lib.sh")).expect("remove");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "lib.sh".to_string(),
+            new_path: "/dev/null".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 4,
+                new_start: 0,
+                new_count: 0,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.contains(&"public_helper"),
+            "ファイル削除でも `export -f` 済み bash 関数は api.rm に残すべき。got: {removed:?}"
         );
     }
 
