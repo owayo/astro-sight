@@ -113,6 +113,7 @@ echo '{"command":"refs","name":"Sym1","dir":"."}
 - Need a **single JSON review** that combines impact, cochange, API surface changes, and dead symbols? → `astro-sight review --dir . --git`
 - Need to check a **repeated rule** like banned APIs, required patterns, or AST-based policy? → `astro-sight lint --path <file> --rules rules.yaml`
 - Need to predict **co-change fallout** before missing a related file? → `astro-sight cochange --dir . --file <file>`
+- Reviewing a multi-commit branch? → pass the same `--base <rev>` to `review`, `context`, or `impact`; `review --git --base <rev>` also uses that base for blame-backed `missing_cochanges`.
 
 ## Commands
 
@@ -222,6 +223,8 @@ astro-sight review --dir . --git --exclude-dir generated --exclude-glob 'app/Leg
 Output: JSON with `impact` (ContextResult), `missing_cochanges` (files expected to change together but absent from diff), `api_changes` (added/removed/modified public symbols), `dead_symbols` (public symbols with zero non-definition references in changed files).
 
 `--framework` / `--exclude-dir` / `--exclude-glob` narrow the `dead_symbols` portion only; they share semantics with the same flags on `dead-code`. `review` always excludes `vendor/` / `tests/` / build artifacts from `dead_symbols`.
+
+When `--git --base <rev>` is set, `review` uses the same base for both the diff and blame-backed `missing_cochanges`. This keeps multi-commit branch reviews aligned with the requested comparison range.
 
 ### `imports` — Import/Export Extraction
 
@@ -418,7 +421,7 @@ astro-sight dead-code --dir . --git
 - `refs` respects `.gitignore` and uses bounded parallel scanning with fold/reduce aggregation
 - Multiple symbol searches: use `refs --names` for batching; reserve `session` for mixed commands
 - `session` supports `ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange` (note: `review` is CLI-only, not available in session mode)
-- **Input validation**: Empty `--name`/`--names`, empty `--paths`/`--paths-file` are rejected with `INVALID_REQUEST` error. `--base` for `context`/`impact`/`review` rejects values starting with `-` (blocks option-style injection into `git diff` / `git show`)
+- **Input validation**: Empty `--name`/`--names`, empty `--paths`/`--paths-file` are rejected with `INVALID_REQUEST` error. `--base` for `context`/`impact`/`review` rejects values starting with `-` (blocks option-style injection into `git diff` / `git show` / `git blame`)
 - **Large repositories (10k+ source files)**: `review --dir .` runs `context` + `cochange` + API diff + dead-code in one process and is the heaviest command. On very large monorepos it can exhaust memory. Mitigations:
   - Narrow `--dir` to a module-level subtree (`--dir packages/server` instead of `--dir .`)
   - For diff-based commands (`review` / `impact` / `context` / `dead-code --git`), bound the window with `--base HEAD~N`

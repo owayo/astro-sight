@@ -11,7 +11,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - **NDJSON** ストリーミングセッション対応
 - **スマートコンテキスト**（diff→影響分析、単一/バッチ参照検索は fold/reduce でピーク RSS を抑制、バッチ参照検索 O(N+S)）
 - **AST 応答の巨大行抑制**（`ast` の `text` / `snippet` は 256 文字上限で切り詰め、巨大行で応答が肥大化しない）
-- **MCP サーバーモード**（rmcp 1.4 による stdio JSON-RPC 2.0、ワークスペースサンドボックス、11 ツール）
+- **MCP サーバーモード**（rmcp 1.6 による stdio JSON-RPC 2.0、ワークスペースサンドボックス、11 ツール）
 - **デフォルト compact JSON** 出力（`--pretty` で整形出力）
 - **バッチ処理**（`--paths` / `--paths-file` で複数ファイル NDJSON 出力）
 - **JSON エラー出力**（`{"error":{"code":"...","message":"..."}}` を stdout に出力）
@@ -41,7 +41,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/engine/sequence.rs` - コールグラフから Mermaid シーケンス図を生成
 - `src/engine/imports.rs` - ファイル間の import/export 関係を抽出（言語別 tree-sitter クエリ）
 - `src/engine/lint.rs` - YAML ルールによる AST パターンマッチ（tree-sitter クエリ + テキストパターン）
-- `src/engine/cochange.rs` - git log から共変更ファイルペアを検出（confidence スコア付き、100ファイル超のコミットはスキップ）
+- `src/engine/cochange.rs` - git log / blame から共変更ファイルペアを検出（confidence スコア付き、100ファイル超のコミットはスキップ、`review --base` の missing_cochanges は同じ base を blame 解析にも渡す）
 - `src/engine/snippet.rs` - コンテキストスニペット生成
 - `src/models/` - Request/Response/AST ノード/Call/Reference/Impact/Sequence/Import/Lint/CoChange/DeadCode 型定義
 - `src/error.rs` - AstroError + ErrorCode（PathOutOfBounds 含む）

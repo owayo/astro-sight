@@ -205,7 +205,7 @@ astro-sight refs --names "AppService,AstgenResponse" --dir src/
 
 単一検索と複数シンボル検索はいずれも worker local の fold/reduce で結果を直接統合し、per-file の中間 `Vec` を全ファイル分保持しない。非常に多くの参照が返るシンボルでは出力自体が大きくなるため、`--glob` で対象言語を絞るか、必要に応じて `ASTRO_SIGHT_BATCH_WORKERS` で並列ワーカー数を下げる。
 
-`context` / `impact` / `review` の `--base` は `git diff` / `git show` にそのまま渡るため、`-` で始まる値・NUL を含む値・空文字を `INVALID_REQUEST` で拒否する（`--output=/path` 等のオプション誤認識を防ぐ）。
+`context` / `impact` / `review` の `--base` は `git diff` / `git show` / `git blame` にそのまま渡るため、`-` で始まる値・NUL を含む値・空文字を `INVALID_REQUEST` で拒否する（`--output=/path` 等のオプション誤認識を防ぐ）。
 
 出力例:
 ```json
@@ -304,6 +304,8 @@ condition = { command_exists = "astro-sight" }
 ### review - 構造化 diff レビュー
 
 `context` の影響分析に加えて、`cochange` による変更漏れ候補、公開 API 差分、死蔵シンボルを 1 回の実行でまとめて返す。PR レビューや pre-merge チェック向け。
+
+`--git --base <rev>` を指定した場合、`missing_cochanges` の blame 解析にも同じ base を使う。複数コミット分の PR をまとめてレビューするときも、diff と共変更候補の解析範囲が揃う。
 
 ```bash
 # git diff を自動取得してレビュー（推奨）
@@ -565,8 +567,8 @@ PR や patch 全体をまとめて見たい場合は、`astro-sight review --dir
 
 ## STOP-AND-CHECK Rule (CRITICAL: Check BEFORE every Grep/grep/rg call)
 
-**Before calling Grep, `grep`, or `rg`, ask yourself**: "Does my search target contain code identifiers (function/class/variable/type/constant names)?"
-- **YES → Use `astro-sight refs`** (Grep, `bash grep`, `bash rg` ALL FORBIDDEN)
+**Before calling Grep, `grep`, or `rg`, ask yourself**: "Does my search target contain code identifiers (function/class/variable/type/constant/method names)?"
+- **YES → Use `astro-sight refs`** (Grep, `grep`, `rg` ALL FORBIDDEN)
 - **NO → Grep OK** (error messages, config values, TODOs, file paths, etc.)
 
 ⚠️ **Pipe-separated patterns**: `Grep "FOO|Bar|baz"` with code identifiers is also FORBIDDEN. Use `refs --names` instead.
@@ -581,7 +583,7 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 | `Grep "ClassName"` | ❌ → `astro-sight refs --name ClassName --dir .` | Code identifier |
 | `Grep "MY_CONST\|OtherVar"` | ❌ → `astro-sight refs --names MY_CONST,OtherVar --dir .` | Pipe-separated identifiers |
 | `Grep "import.*module"` | ❌ → `astro-sight imports --path file` | Import analysis |
-| `bash grep/rg "identifier"` | ❌ → `astro-sight refs` | Bash grep is also forbidden for identifiers |
+| `grep/rg "identifier"` | ❌ → `astro-sight refs` | CLI grep/rg is also forbidden for identifiers |
 | `Grep "TODO"` | ✅ Grep OK | Non-code search |
 | `Grep "error message text"` | ✅ Grep OK | String literal search |
 | `Grep "config_key"` | ✅ Grep OK | Config value search |

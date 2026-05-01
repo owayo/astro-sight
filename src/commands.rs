@@ -896,7 +896,7 @@ pub fn cmd_review(
 
     // 4. cochange 分析 → missing_cochanges 検出
     let missing_cochanges =
-        detect_missing_cochanges(service, dir, &changed_file_set, min_confidence);
+        detect_missing_cochanges(service, dir, &changed_file_set, min_confidence, Some(base));
 
     // 5. API surface diff
     let api_changes = detect_api_changes(dir, base, &diff_files);
@@ -1290,6 +1290,7 @@ fn detect_missing_cochanges(
     dir: &str,
     changed_files: &HashSet<String>,
     min_confidence: f64,
+    base: Option<&str>,
 ) -> Vec<MissingCochange> {
     // review では blame モードで cochange を解析する。
     // 起点ファイル = 差分に登場したファイル。
@@ -1298,12 +1299,13 @@ fn detect_missing_cochanges(
     if source_files.is_empty() {
         return Vec::new();
     }
-    // review からは base 不明 (review 自身は文字列 diff を受け取る) のため
-    // engine 側既定 (HEAD~1) を使う。base 解決失敗や git 不在は engine 側で
+    // review の差分取得で使った base を blame 解析にも渡し、複数コミット範囲の
+    // review でも同じ変更範囲を対象にする。base 解決失敗や git 不在は engine 側で
     // 空集合を返すので最終的に Vec::new() に落ちる。
     let opts = CoChangeOptions {
         blame: true,
         source_files,
+        base: base.map(str::to_string),
         // review 経由では blame モード既定の閾値感覚に合わせる
         min_confidence,
         ..CoChangeOptions::default()
@@ -6067,11 +6069,95 @@ def new_public_api():
             repo.to_str().expect("utf-8 path"),
             &changed_files,
             0.3,
+            None,
         );
 
         assert!(
             missing.iter().all(|m| m.file != "Cargo.toml"),
             "Cargo.toml が missing_cochange に含まれてはならない。got: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn detect_missing_cochanges_uses_review_base_for_multi_commit_ranges() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "a.rs",
+                    "fn a() {\n    let first = 0;\n    let second = 0;\n}\n",
+                ),
+                (
+                    "b.rs",
+                    "fn b() {\n    let first = 0;\n    let second = 0;\n}\n",
+                ),
+            ],
+            "initial",
+        );
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "a.rs",
+                    "fn a() {\n    let first = 1;\n    let second = 0;\n}\n",
+                ),
+                (
+                    "b.rs",
+                    "fn b() {\n    let first = 1;\n    let second = 0;\n}\n",
+                ),
+            ],
+            "pair 1",
+        );
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "a.rs",
+                    "fn a() {\n    let first = 1;\n    let second = 2;\n}\n",
+                ),
+                (
+                    "b.rs",
+                    "fn b() {\n    let first = 1;\n    let second = 2;\n}\n",
+                ),
+            ],
+            "pair 2",
+        );
+        git_commit_files(
+            repo,
+            &[(
+                "a.rs",
+                "fn a() {\n    let first = 10;\n    let second = 2;\n}\n",
+            )],
+            "a only 1",
+        );
+        git_commit_files(
+            repo,
+            &[(
+                "a.rs",
+                "fn a() {\n    let first = 10;\n    let second = 20;\n}\n",
+            )],
+            "a only 2",
+        );
+
+        let service = AppService::new();
+        let mut changed_files = HashSet::new();
+        changed_files.insert("a.rs".to_string());
+
+        let missing = detect_missing_cochanges(
+            &service,
+            repo.to_str().expect("utf-8 path"),
+            &changed_files,
+            0.3,
+            Some("HEAD~2"),
+        );
+
+        assert!(
+            missing.iter().any(|m| m.file == "b.rs"),
+            "review の base が blame 解析に渡らず HEAD~1 のみを見ると b.rs を見落とす。got: {missing:?}"
         );
     }
 }
