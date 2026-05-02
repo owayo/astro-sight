@@ -178,6 +178,46 @@ fn symbols_doc_flag() {
     );
 }
 
+/// Rust の `impl Trait for Type` 配下の同名メソッドが container 付きで区別できることを検証
+/// (Issue: 2026-05-02-symbols-impl-block-duplicate.md)。
+#[test]
+fn symbols_rust_impl_methods_carry_container() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("types.rs"),
+        "pub struct A;\npub struct B;\n\
+impl Default for A {\n    fn default() -> Self { A }\n}\n\
+impl Default for B {\n    fn default() -> Self { B }\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "symbols",
+            "--path",
+            root.join("types.rs").to_str().unwrap(),
+            "--no-cache",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let symbols = json["symbols"].as_array().unwrap();
+    let defaults: Vec<&serde_json::Value> = symbols
+        .iter()
+        .filter(|s| s["name"].as_str() == Some("default"))
+        .collect();
+    assert_eq!(defaults.len(), 2, "default が 2 件出るべき: {symbols:?}");
+    let containers: std::collections::HashSet<&str> =
+        defaults.iter().filter_map(|s| s["cn"].as_str()).collect();
+    assert!(
+        containers.contains("A") && containers.contains("B"),
+        "default の container として A と B が両方付与されるべき: {defaults:?}"
+    );
+}
+
 #[test]
 fn ast_file_not_found() {
     let output = cargo_bin()

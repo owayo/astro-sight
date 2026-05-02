@@ -639,6 +639,7 @@ mod tests {
             },
             doc: None,
             complexity: None,
+            container: None,
             children: vec![],
         }
     }

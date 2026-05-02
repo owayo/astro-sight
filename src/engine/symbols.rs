@@ -970,6 +970,7 @@ pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result
                         range: Range::from(parent_node.range()),
                         doc,
                         complexity,
+                        container: None,
                         children: Vec::new(),
                     });
                 }
@@ -977,7 +978,75 @@ pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result
         }
     }
 
+    assign_enclosing_containers(&mut symbols);
     Ok(symbols)
+}
+
+/// 同一ファイル内の symbols について、各 method/function に enclosing container 名を付与する。
+///
+/// container 候補は class / struct / trait / interface / enum / type (Rust の impl 対象型を含む)。
+/// method の range が container の range に内包される場合、最も内側 (range が小さい) container 名を
+/// `Symbol::container` に設定する。同名の method が複数の impl ブロックに存在しても、container 名で
+/// 見分けが付くようになる (例: `impl Default for A` の `default` には container=A)。
+fn assign_enclosing_containers(symbols: &mut [Symbol]) {
+    use crate::models::location::Range as Rng;
+    let containers: Vec<(usize, Rng)> = symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            matches!(
+                s.kind,
+                SymbolKind::Class
+                    | SymbolKind::Struct
+                    | SymbolKind::Trait
+                    | SymbolKind::Interface
+                    | SymbolKind::Enum
+                    | SymbolKind::Type
+            )
+        })
+        .map(|(i, s)| (i, s.range))
+        .collect();
+
+    for i in 0..symbols.len() {
+        let s = &symbols[i];
+        if !matches!(s.kind, SymbolKind::Function | SymbolKind::Method) {
+            continue;
+        }
+        let target = s.range;
+        let mut best: Option<(usize, usize)> = None;
+        for (ci, crange) in &containers {
+            if *ci == i {
+                continue;
+            }
+            if range_contains(crange, &target) {
+                let size = crange.end.line.saturating_sub(crange.start.line);
+                match best {
+                    None => best = Some((*ci, size)),
+                    Some((_, best_size)) if size < best_size => best = Some((*ci, size)),
+                    _ => {}
+                }
+            }
+        }
+        if let Some((ci, _)) = best {
+            symbols[i].container = Some(symbols[ci].name.clone());
+        }
+    }
+}
+
+fn range_contains(
+    outer: &crate::models::location::Range,
+    inner: &crate::models::location::Range,
+) -> bool {
+    if outer.start.line > inner.start.line || outer.end.line < inner.end.line {
+        return false;
+    }
+    if outer.start.line == inner.start.line && outer.start.column > inner.start.column {
+        return false;
+    }
+    if outer.end.line == inner.end.line && outer.end.column < inner.end.column {
+        return false;
+    }
+    true
 }
 
 fn capture_name_to_kind(name: &str) -> Option<SymbolKind> {
@@ -1039,6 +1108,7 @@ fn fallback_symbols(root: Node<'_>, source: &[u8]) -> Vec<Symbol> {
             range: Range::from(child.range()),
             doc: None,
             complexity: None,
+            container: None,
             children: Vec::new(),
         });
     }

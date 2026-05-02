@@ -254,12 +254,13 @@ pub fn cmd_symbols(
     let hash = CacheStore::hash(&source);
     let use_cache = !no_cache && !pretty;
 
+    // v3_: Symbol に enclosing container フィールド追加 (compact では `cn` キー)
     let cache_key = if full {
-        "symbols_full"
+        "v3_symbols_full"
     } else if doc {
-        "v2_symbols_doc"
+        "v3_symbols_doc"
     } else {
-        "v2_symbols"
+        "v3_symbols"
     };
 
     if use_cache

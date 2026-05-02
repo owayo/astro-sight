@@ -30,6 +30,11 @@ pub struct Symbol {
     pub doc: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub complexity: Option<usize>,
+    /// 直接の enclosing container (class/struct/trait/interface/enum/type) 名。
+    /// Rust の `impl Default for A { fn default() {} }` の `default` には `A` を付与し、
+    /// 同一ファイル内の同名メソッドを見分けられるようにする。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub children: Vec<Symbol>,
 }
@@ -45,6 +50,10 @@ pub struct CompactSymbol {
     /// 循環的複雑度（関数/メソッドのみ）
     #[serde(rename = "cx", skip_serializing_if = "Option::is_none")]
     pub complexity: Option<usize>,
+    /// enclosing container 名 (例: `impl Default for A` の中の method なら "A")。
+    /// 同名メソッドの見分けを付けやすくするため compact 出力でも残す。
+    #[serde(rename = "cn", skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -78,6 +87,7 @@ impl Symbol {
             kind: self.kind,
             line: self.range.start.line,
             complexity: self.complexity,
+            container: self.container.clone(),
             doc: if include_doc { self.doc.clone() } else { None },
             children: self
                 .children
