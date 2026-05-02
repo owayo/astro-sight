@@ -6,7 +6,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 - **AppService 層** — CLI / Session / MCP の統一コアロジック（`src/service.rs`）
 - **tree-sitter** ベースの構文解析エンジン（17言語対応、Xojo は case-insensitive 識別子）
-- **BLAKE3** コンテンツハッシュによるファイルベースキャッシュ
+- **BLAKE3** ベースのファイルキャッシュ（単一ファイル `ast` / `symbols` は内容ハッシュに canonical path を混ぜ、同一内容の別ファイルや別言語で `path` / `lang` が混線しない）
 - **clap derive** による CLI 引数パーサー
 - **NDJSON** ストリーミングセッション対応
 - **スマートコンテキスト**（diff→影響分析、単一/バッチ参照検索は fold/reduce でピーク RSS を抑制、バッチ参照検索 O(N+S)）
@@ -15,8 +15,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - **デフォルト compact JSON** 出力（`--pretty` で整形出力）
 - **バッチ処理**（`--paths` / `--paths-file` で複数ファイル NDJSON 出力）
 - **JSON エラー出力**（`{"error":{"code":"...","message":"..."}}` を stdout に出力）
-- **入力検証の強化**（`refs` の空 `name/names` を拒否、`--paths` / `--paths-file` の空リストを拒否、`session` の空文字・非 UTF-8・不正パスの `ASTRO_SIGHT_WORKSPACE` を拒否、`--dir` にはディレクトリのみ許可）
-- **セキュリティ** — パス境界チェック（Session/MCP のワークスペースサンドボックス、非 UTF-8 パスは canonicalize 後に fail-closed で拒否）、ファイル/入力サイズ 100MB 上限（`session` / `context` / `impact` の生入力を含む）、`git diff` / `git show` / `git blame` に渡す `--base` 等 revision は `-` プレフィクス / NUL / 空文字を拒否（オプション誤認識防止、`cochange --blame` の `--paths` / `--paths-file` 経由でも検証）
+- **入力検証の強化**（`refs` の空 `name/names` を拒否、`--paths` / `--paths-file` の空リストを拒否、`session` の空文字・非 UTF-8・不正パスの `ASTRO_SIGHT_WORKSPACE` を拒否、`--dir` にはディレクトリのみ許可、streaming `context` は JSON prefix 出力前に入力を検証）
+- **セキュリティ** — パス境界チェック（Session/MCP のワークスペースサンドボックス、相対パスはワークスペースルート基準、非 UTF-8 パスは canonicalize 後に fail-closed で拒否）、ファイル/入力サイズ 100MB 上限（`session` / `context` / `impact` の生入力を含む）、`git diff` / `git show` / `git blame` に渡す `--base` 等 revision は `-` プレフィクス / NUL / 空文字を拒否（オプション誤認識防止、`cochange --blame` の `--paths` / `--paths-file` 経由でも検証）
 - **トークン最適化** — version フィールド省略（doctor/MCP のみ）、compact キー短縮（`lang`/`ln`/`col`/`ctx`/`refs`/`src`/`def`/`ref`/`fn`/`cx` 等）、calls を caller グルーピング、CompactAstEdge フラット化、refs/context で相対パス出力、symbols デフォルト compact 出力（`--doc` で docstring 付加、`--full` で旧来の完全出力）
 - **循環的複雑度** — symbols 出力に `cx`（cyclomatic complexity）を付加（関数/メソッドのみ、ベース1 + 分岐ノード数、ネスト関数/クロージャは除外）、言語別分岐ノード定義（Rust/JS/TS/Python/Go/Java/Kotlin/Ruby/PHP/C#等）
 - **設定ファイル** — `~/.config/astro-sight/config.toml`（TOML 形式、`astro-sight init` で生成）
@@ -45,8 +45,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/engine/snippet.rs` - コンテキストスニペット生成
 - `src/models/` - Request/Response/AST ノード/Call/Reference/Impact/Sequence/Import/Lint/CoChange/DeadCode 型定義
 - `src/error.rs` - AstroError + ErrorCode（PathOutOfBounds 含む）
-- `src/cache/store.rs` - content-addressed キャッシュ（~/.cache/astro-sight/）
-- `src/session/mod.rs` - NDJSON セッション処理（生行サイズで100MB上限、空文字・非 UTF-8 を含む `ASTRO_SIGHT_WORKSPACE` の不正値は fail-closed）
+- `src/cache/store.rs` - BLAKE3 ベースのキャッシュ保存（~/.cache/astro-sight/、CLI の `ast` / `symbols` は呼び出し側で path 込みハッシュを渡す）
+- `src/session/mod.rs` - NDJSON セッション処理（生行サイズで100MB上限、相対パスは `ASTRO_SIGHT_WORKSPACE` 基準、空文字・非 UTF-8 を含む `ASTRO_SIGHT_WORKSPACE` の不正値は fail-closed）
 - `src/language.rs` - 言語検出（拡張子/shebang）
 - `tests/fixtures/` - 多言語テストフィクスチャ（sample.rb, sample.py, sample.go, sample.ts）
 

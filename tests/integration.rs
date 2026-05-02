@@ -90,6 +90,74 @@ fn ast_full_file() {
 }
 
 #[test]
+fn ast_cache_keeps_path_separate_for_same_content() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let first = tmp.path().join("first.rs");
+    let second = tmp.path().join("second.rs");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let name = format!("cache_isolation_{}_{}", std::process::id(), nonce);
+    let source = format!("fn {name}() {{}}\n");
+    std::fs::write(&first, &source).unwrap();
+    std::fs::write(&second, source).unwrap();
+
+    let first_path = first.to_str().unwrap();
+    let second_path = second.to_str().unwrap();
+    let first_output = cargo_bin()
+        .args(["ast", "--path", first_path])
+        .output()
+        .expect("failed to run ast for first file");
+    assert!(first_output.status.success());
+
+    let second_output = cargo_bin()
+        .args(["ast", "--path", second_path])
+        .output()
+        .expect("failed to run ast for second file");
+    assert!(second_output.status.success());
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&second_output.stdout).expect("invalid JSON");
+    assert_eq!(json["path"], second_path);
+    assert_eq!(json["lang"], "rust");
+}
+
+#[test]
+fn symbols_cache_keeps_path_and_language_separate_for_same_content() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let java_path = tmp.path().join("CacheIsolation.java");
+    let csharp_path = tmp.path().join("CacheIsolation.cs");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let name = format!("CacheIsolation{}{}", std::process::id(), nonce);
+    let source = format!("class {name} {{}}\n");
+    std::fs::write(&java_path, &source).unwrap();
+    std::fs::write(&csharp_path, source).unwrap();
+
+    let java_path = java_path.to_str().unwrap();
+    let csharp_path = csharp_path.to_str().unwrap();
+    let java_output = cargo_bin()
+        .args(["symbols", "--path", java_path])
+        .output()
+        .expect("failed to run symbols for java file");
+    assert!(java_output.status.success());
+
+    let csharp_output = cargo_bin()
+        .args(["symbols", "--path", csharp_path])
+        .output()
+        .expect("failed to run symbols for csharp file");
+    assert!(csharp_output.status.success());
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&csharp_output.stdout).expect("invalid JSON");
+    assert_eq!(json["path"], csharp_path);
+    assert_eq!(json["lang"], "csharp");
+}
+
+#[test]
 fn symbols_on_own_source() {
     let output = cargo_bin()
         .args(["symbols", "--path", "src/main.rs"])
@@ -1000,6 +1068,53 @@ fn session_rejects_non_utf8_workspace_env() {
             .unwrap()
             .contains("not valid UTF-8"),
         "非 UTF-8 値は fail-closed で拒否されるべき"
+    );
+}
+
+#[test]
+fn session_workspace_relative_paths_are_resolved_from_workspace() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let src_dir = workspace.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(src_dir.join("lib.rs"), "pub fn workspace_symbol() {}\n").unwrap();
+
+    let mut child = cargo_bin()
+        .arg("session")
+        .env("ASTRO_SIGHT_WORKSPACE", workspace.path())
+        .current_dir(cwd.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to run session");
+
+    {
+        let stdin = child.stdin.as_mut().expect("stdin should be available");
+        writeln!(stdin, r#"{{"command":"symbols","path":"src/lib.rs"}}"#).unwrap();
+    }
+
+    let output = child.wait_with_output().expect("failed to wait session");
+    assert!(
+        output.status.success(),
+        "session should succeed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("session output should be JSON");
+    assert!(
+        json.get("error").is_none(),
+        "workspace-relative path should not error: {json}"
+    );
+    let symbols = json["symbols"]
+        .as_array()
+        .expect("symbols array is required");
+    assert!(
+        symbols.iter().any(|s| s["name"] == "workspace_symbol"),
+        "workspace relative symbols should be extracted: {json}"
     );
 }
 
@@ -3005,6 +3120,24 @@ fn context_empty_diff_returns_empty_changes() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
     let changes = json["changes"].as_array().unwrap();
     assert!(changes.is_empty(), "空の diff は空の changes を返すべき");
+}
+
+#[test]
+fn context_streaming_validation_error_returns_valid_json() {
+    let diff = "--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n-a\n+b\n";
+    let diff_arg = format!("--diff={diff}");
+    let output = cargo_bin()
+        .args(["context", "--dir", "/nonexistent/dir/path", &diff_arg])
+        .output()
+        .expect("failed to run context");
+
+    assert!(!output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["error"]["code"], "FILE_NOT_FOUND");
+    assert!(
+        json.get("changes").is_none(),
+        "streaming prefix should not be emitted before validation errors: {json}"
+    );
 }
 
 // ---- unsupported language テスト ----

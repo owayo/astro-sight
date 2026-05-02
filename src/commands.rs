@@ -136,6 +136,17 @@ fn read_file_to_string_limited(path: &str, max_bytes: usize) -> Result<String> {
     read_to_string_limited(file, max_bytes, path)
 }
 
+fn cache_hash_for_path(path: &camino::Utf8Path, source: &[u8]) -> String {
+    let content_hash = CacheStore::hash(source);
+    let path_key = std::fs::canonicalize(path.as_std_path())
+        .ok()
+        .and_then(|p| p.to_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| path.as_str().to_string());
+
+    // 応答には path/lang が含まれるため、内容が同じ別ファイルとはキャッシュを分離する。
+    CacheStore::hash(format!("{path_key}\0{content_hash}").as_bytes())
+}
+
 // ---------------------------------------------------------------------------
 // 単一ファイル系コマンド（キャッシュ・pretty 対応）
 // ---------------------------------------------------------------------------
@@ -156,7 +167,7 @@ pub struct CmdAstOpts<'a> {
 pub fn cmd_ast(service: &AppService, opts: &CmdAstOpts<'_>) -> Result<()> {
     let utf8_path = camino::Utf8Path::new(opts.path);
     let source = parser::read_file(utf8_path)?;
-    let hash = CacheStore::hash(&source);
+    let hash = cache_hash_for_path(utf8_path, &source);
     let use_cache = !opts.no_cache && !opts.pretty;
 
     fn opt_key(v: Option<usize>) -> String {
@@ -251,7 +262,7 @@ pub fn cmd_symbols(
 ) -> Result<()> {
     let utf8_path = camino::Utf8Path::new(path);
     let source = parser::read_file(utf8_path)?;
-    let hash = CacheStore::hash(&source);
+    let hash = cache_hash_for_path(utf8_path, &source);
     let use_cache = !no_cache && !pretty;
 
     // v3_: Symbol に enclosing container フィールド追加 (compact では `cn` キー)
@@ -633,6 +644,7 @@ pub fn cmd_context(
     // compact 出力: streaming API で `FileImpact` を 1 件ずつ stdout に flush し、
     // `Vec<FileImpact>` の累積による数 GB 級ピーク RSS を排除する。
     use std::io::Write;
+    service.validate_context_inputs(&diff_input, dir)?;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     out.write_all(b"{\"changes\":[")?;

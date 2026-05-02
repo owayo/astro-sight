@@ -111,8 +111,9 @@ echo '{"command":"refs","name":"Sym1","dir":"."}
 - Need **2+ mixed astro-sight queries** in one loop and want to avoid repeated startup cost? → `astro-sight session`
 - Need the **exact AST node** at a cursor/range, or want to confirm whether a parse error is structural? → `astro-sight ast --path <file> --line <n> --col <n>`
 - Need a **single JSON review** that combines impact, cochange, API surface changes, and dead symbols? → `astro-sight review --dir . --git`
-- Need to check a **repeated rule** like banned APIs, required patterns, or AST-based policy? → `astro-sight lint --path <file> --rules rules.yaml`
-- Need to predict **co-change fallout** before missing a related file? → `astro-sight cochange --dir . --file <file>`
+- Need to check a **repeated rule** like banned APIs, required patterns, or AST-based policy? → `astro-sight lint --path <file> --rules rules.yaml` before writing an ad-hoc text scan
+- Need to predict **co-change fallout** before missing a related file? → `astro-sight cochange --dir . --file <file>` before guessing from filenames alone
+- Need to explain a non-trivial call path after `calls` identifies the target? → `astro-sight sequence --path <file> --function <name>`
 - Reviewing a multi-commit branch? → pass the same `--base <rev>` to `review`, `context`, or `impact`; `review --git --base <rev>` also uses that base for blame-backed `missing_cochanges`.
 
 ## Commands
@@ -421,6 +422,7 @@ astro-sight dead-code --dir . --git
 - `refs` respects `.gitignore` and uses bounded parallel scanning with fold/reduce aggregation
 - Multiple symbol searches: use `refs --names` for batching; reserve `session` for mixed commands
 - `session` supports `ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange` (note: `review` is CLI-only, not available in session mode)
+- With `ASTRO_SIGHT_WORKSPACE`, session-relative `path` / `dir` values resolve from the workspace root, not the process cwd; invalid workspace values fail closed
 - **Input validation**: Empty `--name`/`--names`, empty `--paths`/`--paths-file` are rejected with `INVALID_REQUEST` error. `--base` for `context`/`impact`/`review` rejects values starting with `-` (blocks option-style injection into `git diff` / `git show` / `git blame`)
 - **Large repositories (10k+ source files)**: `review --dir .` runs `context` + `cochange` + API diff + dead-code in one process and is the heaviest command. On very large monorepos it can exhaust memory. Mitigations:
   - Narrow `--dir` to a module-level subtree (`--dir packages/server` instead of `--dir .`)

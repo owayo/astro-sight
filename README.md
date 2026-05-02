@@ -391,7 +391,7 @@ astro-sight doctor
 echo '{"command":"symbols","path":"src/main.rs"}' | astro-sight session
 ```
 
-stdin から NDJSON リクエストを受け取り、stdout に NDJSON レスポンスを返す。複数リクエストの連続処理に対応。`ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange` をサポートする。1行あたり 100MB（改行を除く生入力サイズ）を上限としている。`ASTRO_SIGHT_WORKSPACE` を指定した場合はそのディレクトリ配下だけを扱い、空文字・非 UTF-8・存在しないパスなどの不正な値は `INVALID_REQUEST` で終了する。
+stdin から NDJSON リクエストを受け取り、stdout に NDJSON レスポンスを返す。複数リクエストの連続処理に対応。`ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange` をサポートする。1行あたり 100MB（改行を除く生入力サイズ）を上限としている。`ASTRO_SIGHT_WORKSPACE` を指定した場合はそのディレクトリ配下だけを扱い、リクエスト内の相対 `path` / `dir` はワークスペースルート基準で解決する。空文字・非 UTF-8・存在しないパスなどの不正なワークスペース値は `INVALID_REQUEST` で終了する。
 
 ```bash
 # calls コマンド
@@ -531,10 +531,11 @@ compact 出力例（ast/symbols）:
 
 ## Cache
 
-ファイル内容の BLAKE3 ハッシュをキーとするコンテンツアドレスキャッシュ。ファイルが変更されなければ再解析をスキップし、変更されればハッシュが変わるため自動的に無効化される。
+単一ファイル `ast` / `symbols` の compact 出力を BLAKE3 ベースで保存するキャッシュ。ファイルが変更されればハッシュが変わるため自動的に無効化される。
 
 - **対象コマンド**: `ast`, `symbols`（単一ファイルモードのみ）
-- **キャッシュキー**: `BLAKE3(ファイル内容)` + コマンド固有サフィックス（オプション組み合わせ別）
+- **キャッシュキー**: `BLAKE3(canonical path + BLAKE3(ファイル内容))` + コマンド固有サフィックス（オプション組み合わせ別）
+- **path/lang の分離**: `ast` / `symbols` の応答には `path` と `lang` が含まれるため、同じ内容でも別ファイル・別拡張子なら別キャッシュとして扱う
 - **保存先**: `~/.cache/astro-sight/`
 - **ディレクトリシャード**: ハッシュの先頭 2 文字でサブディレクトリを分割（例: `ab/cdef1234....symbols.json`）
 - **`--pretty` 時はキャッシュをスキップ**（compact 出力のみキャッシュ）

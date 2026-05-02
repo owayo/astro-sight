@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
 use crate::cache::store::CacheStore;
@@ -116,9 +116,22 @@ impl AppService {
     // 検証ヘルパー
     // -----------------------------------------------------------------------
 
+    /// sandboxed/session/MCP モードでは、相対パスをワークスペースルート基準で解決する。
+    /// CLI の無制限モードでは従来通りカレントディレクトリ基準にする。
+    fn workspace_candidate(&self, path: &str) -> PathBuf {
+        let candidate = Path::new(path);
+        if let Some(root) = &self.workspace_root
+            && candidate.is_relative()
+        {
+            return root.join(candidate);
+        }
+        candidate.to_path_buf()
+    }
+
     /// ファイルパスを検証して正規化し、正規化済みパスを返す。
     fn validate_path(&self, path: &str) -> Result<PathBuf> {
-        let canonical = std::fs::canonicalize(path).map_err(|_| {
+        let candidate = self.workspace_candidate(path);
+        let canonical = std::fs::canonicalize(&candidate).map_err(|_| {
             warn!(path = path, "⚠️ validate_path: file not found");
             AstroError::new(ErrorCode::FileNotFound, format!("File not found: {path}"))
         })?;
@@ -152,7 +165,8 @@ impl AppService {
 
     /// ディレクトリパスを検証して正規化し、正規化済みパスを返す。
     fn validate_dir(&self, dir: &str) -> Result<PathBuf> {
-        let canonical = std::fs::canonicalize(dir).map_err(|_| {
+        let candidate = self.workspace_candidate(dir);
+        let canonical = std::fs::canonicalize(&candidate).map_err(|_| {
             AstroError::new(
                 ErrorCode::FileNotFound,
                 format!("Directory not found: {dir}"),
@@ -459,6 +473,15 @@ impl AppService {
             Ok(())
         })?;
         Ok(ContextResult { changes })
+    }
+
+    /// context 解析の入力検証だけを行う。
+    ///
+    /// streaming CLI は stdout へ JSON prefix を書き始める前にこれを呼び、
+    /// 入力エラー時にも壊れていない JSON エラーを返せるようにする。
+    pub fn validate_context_inputs(&self, diff: &str, dir: &str) -> Result<()> {
+        self.validate_dir(dir)?;
+        self.validate_input_size(diff)
     }
 
     /// unified diff の影響を `FileImpact` 1 件ずつ callback に渡す streaming API。
@@ -797,5 +820,35 @@ mod tests {
         // /etc/passwd は通常存在し、サンドボックス外
         let result = service.validate_path_utf8("/etc/passwd");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn sandboxed_relative_file_path_is_workspace_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("workspace_only");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("lib.rs"), "pub fn workspace_symbol() {}\n").unwrap();
+
+        let service = AppService::sandboxed(dir.path().to_path_buf()).unwrap();
+        let result = service.extract_symbols("workspace_only/lib.rs");
+
+        assert!(
+            result.is_ok(),
+            "相対ファイルパスはプロセス cwd ではなくワークスペース基準で解決されるべき"
+        );
+    }
+
+    #[test]
+    fn sandboxed_relative_dir_is_workspace_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("only_in_workspace.rs"), "fn needle() {}\n").unwrap();
+
+        let service = AppService::sandboxed(dir.path().to_path_buf()).unwrap();
+        let refs = service
+            .find_references("needle", ".", Some("**/*.rs"))
+            .expect("ワークスペース相対の . を検索できるべき");
+
+        assert_eq!(refs.references.len(), 1);
+        assert_eq!(refs.references[0].path, "only_in_workspace.rs");
     }
 }

@@ -375,7 +375,7 @@ fn find_affected_symbols(
     for sym in syms {
         for hunk in hunks {
             let hunk_start = hunk.new_start.saturating_sub(1); // 1-indexed to 0-indexed
-            let hunk_end = hunk_start + hunk.new_count;
+            let hunk_end = hunk_start.saturating_add(hunk.new_count);
             let sym_start = sym.range.start.line;
             let sym_end = sym.range.end.line;
 
@@ -411,7 +411,7 @@ fn find_affected_symbols(
 fn symbol_overlaps_hunks(sym: &crate::models::symbol::Symbol, hunks: &[HunkInfo]) -> bool {
     hunks.iter().any(|h| {
         let hunk_start = h.new_start.saturating_sub(1);
-        let hunk_end = hunk_start + h.new_count;
+        let hunk_end = hunk_start.saturating_add(h.new_count);
         // ゼロ幅 hunk（pure-delete）は点として境界を含む判定
         if h.new_count == 0 {
             hunk_start >= sym.range.start.line && hunk_start < sym.range.end.line
@@ -715,5 +715,20 @@ mod tests {
         let result = find_affected_symbols(&[sym], &[hunk]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].change_type, "modified");
+    }
+
+    #[test]
+    fn huge_hunk_range_does_not_overflow() {
+        let sym = make_sym("normal", 4, 9);
+        let hunk = HunkInfo {
+            old_start: usize::MAX,
+            old_count: 2,
+            new_start: usize::MAX,
+            new_count: 2,
+        };
+
+        let result = find_affected_symbols(std::slice::from_ref(&sym), std::slice::from_ref(&hunk));
+        assert!(result.is_empty());
+        assert!(!symbol_overlaps_hunks(&sym, &[hunk]));
     }
 }
