@@ -136,10 +136,32 @@ pub fn collect_files_with_excludes(
         // パース可能なファイルのみ対象
         if LangId::from_path(camino::Utf8Path::new(path.to_str().unwrap_or(""))).is_ok() {
             files.push(path);
+        } else if path.extension().is_none() && detect_lang_from_shebang(&path).is_some() {
+            // 拡張子なしの実行スクリプト (例: `bin/install`) は shebang から言語推定。
+            // CLI ツール / ビルドスクリプトで shebang 命名は一般的なので、これを
+            // collect_files から落とさない。
+            files.push(path);
         }
     }
 
     Ok(files)
+}
+
+/// 拡張子なしファイルの先頭 shebang 行から言語を判定する。
+///
+/// I/O コスト軽減のため最大 4KB だけ読み、最初の 2 byte が `#!` でなければ即時 None。
+/// 実行ビット等は判定せず、shebang の有無だけで言語推定可能かを決める。
+fn detect_lang_from_shebang(path: &Path) -> Option<LangId> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = [0u8; 4096];
+    let n = file.read(&mut buf).ok()?;
+    if n < 2 || &buf[..2] != b"#!" {
+        return None;
+    }
+    let line_end = buf[..n].iter().position(|&b| b == b'\n').unwrap_or(n);
+    let first_line = std::str::from_utf8(&buf[..line_end]).ok()?;
+    LangId::from_shebang(first_line)
 }
 
 /// パスのいずれかの中間ディレクトリ名が除外対象と完全一致するかを判定する。
@@ -280,6 +302,9 @@ fn is_definition_context(node: Node<'_>, definition_kinds: &[&str], lang_id: Lan
     ) {
         return is_js_ts_definition_context(node, definition_kinds);
     }
+    if lang_id == LangId::Zig {
+        return is_zig_definition_context(node, definition_kinds);
+    }
 
     if let Some(parent) = node.parent() {
         // 親ノードが定義ノードかチェック
@@ -330,6 +355,45 @@ fn is_js_ts_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> boo
     {
         return true;
     }
+    false
+}
+
+/// Zig: 宣言の「名前位置」にある identifier だけを `Definition` とみなす。
+///
+/// tree-sitter-zig の AST では:
+/// - `variable_declaration` は `name` フィールドが無く、最初の子 identifier が変数名
+/// - `function_declaration` は `name`/`type`/`body` フィールドあり (戻り値型は `type`)
+/// - `test_declaration` は最初の identifier/string が テスト名
+/// - `struct_declaration` / `enum_declaration` 等は `name` フィールドあり
+///
+/// 単純な parent/grandparent 走査では `const Foo = bar()` の `bar` (右辺) や
+/// `fn foo() ReturnType { ... }` の `ReturnType` (戻り値型) が def 誤判定される。
+/// 各定義種別ごとに「名前位置」を厳密に判定し、それ以外の identifier は ref として返す。
+fn is_zig_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if !definition_kinds.contains(&parent.kind()) {
+        return false;
+    }
+
+    // 1. name フィールドが定義されている種別 (function_declaration, struct_declaration,
+    //    enum_declaration, union_declaration) は name 一致を要求
+    if let Some(name_node) = parent.child_by_field_name("name") {
+        return name_node.id() == node.id();
+    }
+
+    // 2. variable_declaration / test_declaration は最初の identifier (or string) 子が
+    //    名前位置。それ以降の identifier は ref として扱う。
+    if matches!(parent.kind(), "variable_declaration" | "test_declaration") {
+        let mut cursor = parent.walk();
+        for child in parent.children(&mut cursor) {
+            if matches!(child.kind(), "identifier" | "string") {
+                return child.id() == node.id();
+            }
+        }
+    }
+
     false
 }
 

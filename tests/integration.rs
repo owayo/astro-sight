@@ -3584,6 +3584,83 @@ fn typescript_class_extends_is_ref_not_def() {
     );
 }
 
+/// 拡張子なし shebang スクリプト (例: `bin/install`) が collect_files の対象として
+/// 拾われ、refs / dead-code 検索に含まれることを検証
+/// (Issue: shebang-script-collect-files)。
+#[test]
+fn refs_picks_up_shebang_script_without_extension() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+
+    // 拡張子なし bash スクリプト (shebang 付き)
+    std::fs::write(
+        root.join("bin/install"),
+        "#!/usr/bin/env bash\nfoo() { echo hi; }\nfoo\n",
+    )
+    .unwrap();
+    // 同じ名前を呼ぶ普通の .sh
+    std::fs::write(root.join("deploy.sh"), "#!/usr/bin/env bash\nfoo\n").unwrap();
+
+    let output = cargo_bin()
+        .args(["refs", "--name", "foo", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let refs = json["refs"].as_array().unwrap();
+    let paths: Vec<&str> = refs.iter().filter_map(|r| r["path"].as_str()).collect();
+    assert!(
+        paths.iter().any(|p| p.ends_with("bin/install")),
+        "拡張子なし shebang スクリプト bin/install が refs 対象に入るべき: {paths:?}"
+    );
+}
+
+/// Zig で `const X = ...` の右辺 / 関数戻り値型 / test body 内の identifier が
+/// def ではなく ref として認識されることを検証 (Issue: zig-definition-kinds-overscoped)。
+#[test]
+fn zig_initializer_and_return_type_is_ref_not_def() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("base.zig"),
+        "pub const Helper = struct {\n    pub fn make() Helper { return .{}; }\n};\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("user.zig"),
+        "const std = @import(\"std\");\nconst base = @import(\"base.zig\");\n\
+pub fn use() base.Helper {\n    const h = base.Helper.make();\n    return h;\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["refs", "--name", "Helper", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let refs = json["refs"].as_array().unwrap();
+    let def_count = refs
+        .iter()
+        .filter(|r| r["kind"].as_str() == Some("def"))
+        .count();
+    let ref_count = refs
+        .iter()
+        .filter(|r| r["kind"].as_str() == Some("ref"))
+        .count();
+    assert_eq!(
+        def_count, 1,
+        "Helper の def は base.zig の struct 宣言 1 件: {refs:?}"
+    );
+    assert!(
+        ref_count >= 1,
+        "戻り値型 / 初期化式で参照されている Helper は ref として 1 件以上出るべき: {refs:?}"
+    );
+}
+
 // ---- refs 多言語テスト ----
 
 #[test]
