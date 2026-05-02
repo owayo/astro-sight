@@ -1926,6 +1926,11 @@ fn extract_exported_symbols_from_git(
     base: &str,
     file_path: &str,
 ) -> Option<Vec<(String, String, String)>> {
+    // テストファイル配下のシンボルは API 差分検出の対象外。
+    // (api.rm の base 側比較もテストファイルからは行わない)
+    if is_test_path(std::path::Path::new(file_path)) {
+        return Some(Vec::new());
+    }
     // `base` と `file_path` はオプション誤認識を避けるため先頭が `-` のものを拒否する
     validate_git_revision(base, "--base").ok()?;
     validate_git_revision(file_path, "diff file path").ok()?;
@@ -1960,6 +1965,12 @@ fn extract_exported_symbols_from_file(
     dir: &str,
     file_path: &str,
 ) -> Option<Vec<(String, String, String)>> {
+    // テストファイル配下のシンボルは外部 API 面ではないため、api.add/rm/mod の
+    // 検出対象から外す。Swift Testing (`@Test`/`@Suite`)、JUnit テストメソッド、
+    // *.test.ts、tests/ ディレクトリ等が該当する。
+    if is_test_path(std::path::Path::new(file_path)) {
+        return Some(Vec::new());
+    }
     // API 変更検出ではフレームワーク登録デコレータ付き関数も「公開 API 面」として
     // 検出対象に残す (新規 CLI サブコマンドの追加・削除も api.add / api.rm として
     // 報告したい)。
@@ -1970,6 +1981,11 @@ fn extract_dead_code_candidates_from_file(
     dir: &str,
     file_path: &str,
 ) -> Option<Vec<(String, String, String)>> {
+    // dead-code 走査では既定でテストディレクトリ (tests/, Tests/, __tests__/, spec/,
+    // testdata/) が collect 段階で除外される。`--include-tests` で opt-in したときは
+    // テストファイルも走査対象に含めるため、ここでは test_path 除外を行わない
+    // (API 検出側 extract_exported_symbols_from_file は test path 除外を行う)。
+    //
     // dead-code 判定では Typer / Click / FastAPI / Flask / pytest 等のフレームワーク
     // 登録デコレータが付いた関数を除外する。デコレータ経由でフレームワーク内部
     // レジストリに登録されるため、識別子レベルの cross-file refs では caller を
@@ -2080,6 +2096,21 @@ fn filter_exported_symbols(
         if exclude_trait_impls
             && matches!(sym.kind, SymbolKind::Method | SymbolKind::Function)
             && crate::engine::symbols::is_override_method(root, source, lang_id, &sym.range)
+        {
+            continue;
+        }
+        // TS/JS の `constructor` メソッドは `new ClassName(...)` 構文で暗黙的に呼び出される。
+        // 識別子レベルの cross-file refs では `constructor` 名を探しても見つからず、
+        // クラスが利用されていても dead 判定される。クラス自体の dead 判定で十分なので、
+        // constructor を独立した API/dead 候補から除外する。
+        if matches!(sym.kind, SymbolKind::Method)
+            && sym.name == "constructor"
+            && matches!(
+                lang_id,
+                crate::language::LangId::Typescript
+                    | crate::language::LangId::Tsx
+                    | crate::language::LangId::Javascript
+            )
         {
             continue;
         }
@@ -4634,6 +4665,140 @@ main() {\n    timed echo hi\n}\nmain\n";
         assert!(
             !mod_names.contains(&"timed"),
             "同一ファイル内でのみ呼ばれる bash 関数のシグネチャ変更は api.mod に出してはならない。got: {mod_names:?}"
+        );
+    }
+
+    /// テストディレクトリ配下のシンボル変更は api.add/rm/mod に出さない。
+    /// (レポート 2026-04-30-test-symbol-api-detection.md / 2026-04-29-junit-reflection-entrypoints.md の再現)
+    /// Tests/ 配下、`*Test.kt`、`*.test.ts` 等のテストファイルは外部 API 面ではない。
+    #[test]
+    fn detect_api_changes_skips_test_directory_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let before = "package fixture\n\nfun helper() {}\n";
+        git_commit_files(repo, &[("app/src/test/java/FooTest.kt", before)], "initial");
+
+        // テスト関数を新規追加
+        let after = "package fixture\n\nfun helper() {}\n\
+@org.junit.Test\nfun testHelperReturnsZero() {}\n";
+        fs::write(repo.join("app/src/test/java/FooTest.kt"), after).expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "app/src/test/java/FooTest.kt".to_string(),
+            new_path: "app/src/test/java/FooTest.kt".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 5,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let added: Vec<&str> = api_changes.added.iter().map(|s| s.name.as_str()).collect();
+        let removed: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        let modified: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            added.is_empty(),
+            "テストファイル配下の新規シンボルは api.add に出してはならない。got: {added:?}"
+        );
+        assert!(
+            removed.is_empty(),
+            "テストファイル配下のシンボル削除は api.rm に出してはならない。got: {removed:?}"
+        );
+        assert!(
+            modified.is_empty(),
+            "テストファイル配下のシンボル変更は api.mod に出してはならない。got: {modified:?}"
+        );
+    }
+
+    /// テストファイル丸ごと削除でも api.rm に出さない。
+    /// (Issue D 関連: テストファイルの整理は API 削除ではない)
+    #[test]
+    fn detect_api_changes_skips_test_file_deletion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let before = "import { describe, it } from 'vitest'\n\
+export function testHelper() { return 1 }\n";
+        git_commit_files(repo, &[("src/foo.test.ts", before)], "initial");
+
+        std::fs::remove_file(repo.join("src/foo.test.ts")).expect("remove");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/foo.test.ts".to_string(),
+            new_path: "/dev/null".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 2,
+                new_start: 0,
+                new_count: 0,
+            }],
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.is_empty(),
+            "*.test.ts 削除は api.rm に出してはならない。got: {removed:?}"
+        );
+    }
+
+    /// TS/JS の constructor は dead 候補から除外される。
+    /// (レポート 2026-04-29-typescript-constructor-implicit-call.md の再現)
+    /// `new ClassName(...)` で暗黙的に呼ばれるため、`refs --name constructor` で
+    /// 見つからず dead 判定される問題への対応。
+    #[test]
+    fn detect_dead_excludes_typescript_constructor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+
+        std::fs::write(
+            repo.join("foo.ts"),
+            "export class Foo {\n  constructor(public name: string) {}\n  greet() { return this.name; }\n}\n",
+        )
+        .expect("write");
+        std::fs::write(
+            repo.join("usage.ts"),
+            "import { Foo } from './foo';\nconst f = new Foo('world');\nconsole.log(f.greet());\n",
+        )
+        .expect("write");
+
+        let candidates =
+            extract_dead_code_candidates_from_file(repo.to_str().expect("utf-8 path"), "foo.ts")
+                .expect("candidates");
+        let names: Vec<&str> = candidates
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.ends_with(".constructor") || *n == "constructor"),
+            "TS の constructor は dead 候補に含めない。got: {names:?}"
+        );
+        assert!(
+            names.contains(&"Foo"),
+            "クラス自体は dead 候補に含まれる。got: {names:?}"
         );
     }
 
