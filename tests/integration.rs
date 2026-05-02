@@ -3495,6 +3495,95 @@ fn typescript_imports() {
     assert!(!imports.is_empty(), "TypeScript の import を検出すべき");
 }
 
+/// TypeScript で関数戻り値型に使われた `type_identifier` が `kind: "ref"` として
+/// 認識されることを検証 (レポート 2026-04-24-excel-service-dead-code-false-positive.md の再現)。
+/// `function parseExcel(): ExcelParseResult {}` の `ExcelParseResult` が def ではなく
+/// ref として分類されることで、dead-code 判定が正しく動作する。
+#[test]
+fn typescript_return_type_is_ref_not_def() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("excel.ts"),
+        "export interface ExcelParseResult { rows: number }\n\
+export function parseExcel(buffer: Buffer): ExcelParseResult {\n\
+  return { rows: 0 };\n\
+}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "refs",
+            "--name",
+            "ExcelParseResult",
+            "--dir",
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let refs = json["refs"].as_array().unwrap();
+
+    let def_count = refs
+        .iter()
+        .filter(|r| r["kind"].as_str() == Some("def"))
+        .count();
+    let ref_count = refs
+        .iter()
+        .filter(|r| r["kind"].as_str() == Some("ref"))
+        .count();
+    assert_eq!(
+        def_count, 1,
+        "ExcelParseResult の def は interface 宣言の 1 件だけのはず: {refs:?}"
+    );
+    assert!(
+        ref_count >= 1,
+        "戻り値型として使われている ExcelParseResult は ref として 1 件以上検出されるべき: {refs:?}"
+    );
+}
+
+/// TypeScript の `class A extends B {}` の `B` が ref として認識されることを検証。
+/// 単純な grandparent 走査では `class_declaration` に B が def として誤分類される問題への対応。
+#[test]
+fn typescript_class_extends_is_ref_not_def() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("base.ts"), "export class Base { hello() {} }\n").unwrap();
+    std::fs::write(
+        root.join("derived.ts"),
+        "import { Base } from './base';\nexport class Derived extends Base { extra() {} }\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["refs", "--name", "Base", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let refs = json["refs"].as_array().unwrap();
+    let def_count = refs
+        .iter()
+        .filter(|r| r["kind"].as_str() == Some("def"))
+        .count();
+    let ref_count = refs
+        .iter()
+        .filter(|r| r["kind"].as_str() == Some("ref"))
+        .count();
+    assert_eq!(
+        def_count, 1,
+        "Base の def は base.ts のクラス宣言 1 件: {refs:?}"
+    );
+    assert!(
+        ref_count >= 2,
+        "import と extends で 2 件以上 ref が出るべき: {refs:?}"
+    );
+}
+
 // ---- refs 多言語テスト ----
 
 #[test]

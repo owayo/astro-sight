@@ -274,6 +274,12 @@ fn is_definition_context(node: Node<'_>, definition_kinds: &[&str], lang_id: Lan
     if lang_id == LangId::Php {
         return is_php_definition_context(node);
     }
+    if matches!(
+        lang_id,
+        LangId::Typescript | LangId::Tsx | LangId::Javascript
+    ) {
+        return is_js_ts_definition_context(node, definition_kinds);
+    }
 
     if let Some(parent) = node.parent() {
         // 親ノードが定義ノードかチェック
@@ -286,6 +292,43 @@ fn is_definition_context(node: Node<'_>, definition_kinds: &[&str], lang_id: Lan
         {
             return true;
         }
+    }
+    false
+}
+
+/// JS/TS/TSX: 識別子が「宣言の `name` フィールド」であるときだけ `Definition` とみなす。
+///
+/// 単純な parent/grandparent 走査では `function parseExcel(): ExcelParseResult {}` の
+/// `ExcelParseResult` (戻り値型) や `class A extends B {}` の `B` が grandparent
+/// `function_declaration` / `class_declaration` 等にぶら下がって def と誤判定される。
+/// これにより dead-code 判定で「型が ref されているのに def しか見つからない」状況が
+/// 発生する (例: `excel-service.ts` で戻り値型 `ExcelParseResult` が dead 扱いになる)。
+/// PHP と同じく `name` フィールドの一致を要求し、return_type / extends_clause 等の中の
+/// 識別子は ref として分類する。
+fn is_js_ts_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+
+    // parent が定義ノード: name フィールド一致を要求
+    if definition_kinds.contains(&parent.kind()) {
+        if let Some(name_node) = parent.child_by_field_name("name")
+            && name_node.id() == node.id()
+        {
+            return true;
+        }
+        return false;
+    }
+
+    // grandparent が定義ノード: parent 経由で name フィールドに到達するときのみ def 扱い
+    // (例: `variable_declarator > identifier` の identifier は def、
+    //      `function_declaration > return_type > type_identifier` は ref)
+    if let Some(grandparent) = parent.parent()
+        && definition_kinds.contains(&grandparent.kind())
+        && let Some(name_node) = grandparent.child_by_field_name("name")
+        && (name_node.id() == node.id() || name_node.id() == parent.id())
+    {
+        return true;
     }
     false
 }
