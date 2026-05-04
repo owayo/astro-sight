@@ -646,6 +646,7 @@ fn is_js_function_body(node: Node) -> bool {
             p.kind(),
             "function_declaration"
                 | "function"
+                | "function_expression"
                 | "arrow_function"
                 | "method_definition"
                 | "generator_function_declaration"

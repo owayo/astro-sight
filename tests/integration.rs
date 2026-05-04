@@ -4683,6 +4683,100 @@ fn dead_code_framework_laravel_excludes_migrations_and_controllers() {
     );
 }
 
+/// `--framework nextjs` で Next.js App Router の規約 entrypoint
+/// (page / layout / route / loading 等) と Pages Router 配下が dead-code から除外される。
+/// (レポート 2026-05-04-next-page-and-react-memo-false-positives.md パターン2 の再現)
+#[test]
+fn dead_code_framework_nextjs_excludes_app_and_pages_routes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("src/app/(authenticated)/dashboard")).unwrap();
+    std::fs::create_dir_all(root.join("src/app/api/users")).unwrap();
+    std::fs::create_dir_all(root.join("src/app")).unwrap();
+    std::fs::create_dir_all(root.join("src/pages/api")).unwrap();
+    std::fs::create_dir_all(root.join("src/services")).unwrap();
+
+    std::fs::write(
+        root.join("src/app/(authenticated)/dashboard/page.tsx"),
+        "export default function DashboardPage() { return null; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/app/api/users/route.ts"),
+        "export function GET() { return new Response('ok'); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/app/layout.tsx"),
+        "export default function RootLayout({ children }: { children: React.ReactNode }) { return <>{children}</>; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/pages/api/legacy.ts"),
+        "export default function handler() { return null; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/services/orphan.ts"),
+        "export function unusedService() { return 1; }\n",
+    )
+    .unwrap();
+
+    // --framework なし: 全部 dead に出る
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "DashboardPage"),
+        "preset なしでは page default export も dead 判定: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "unusedService"),
+        "preset なしでは services 配下も dead 判定: {names:?}"
+    );
+
+    // --framework nextjs: app/page, app/route, app/layout, pages/** は除外、services は残る
+    let output = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--framework",
+            "nextjs",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+
+    for banned in ["DashboardPage", "GET", "RootLayout", "handler"] {
+        assert!(
+            !names.iter().any(|n| n == banned),
+            "{banned} は Next.js preset で除外されるべき: {names:?}"
+        );
+    }
+    assert!(
+        names.iter().any(|n| n == "unusedService"),
+        "src/services/ 配下は Next.js preset でも dead 判定される: {names:?}"
+    );
+}
+
 #[test]
 fn dead_code_exclude_glob_and_exclude_dir_drop_targets() {
     // --exclude-glob 'app/Legacy/**' と --exclude-dir custom_dir で

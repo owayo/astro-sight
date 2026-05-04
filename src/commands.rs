@@ -2636,6 +2636,37 @@ const LARAVEL_PRESET_EXCLUDE_GLOBS: &[&str] = &[
     "**/.phpstorm.meta.php",
 ];
 
+/// Next.js (App Router / Pages Router) のフレームワーク entrypoint プリセット。
+///
+/// Next.js のファイルシステムルーティングでは、特定のファイル名 (`page` / `layout` /
+/// `route` 等) の default export が Next.js ランタイム経由で呼ばれる。AST 上の
+/// cross-file refs では caller を追跡できないため、astro-sight 単独では
+/// `dead-code` の偽陽性源になる。`--framework nextjs` でこれらを除外する。
+///
+/// - **App Router** (Next.js 13+): `app/**/page.*`, `layout.*`, `loading.*`, `error.*`,
+///   `not-found.*`, `template.*`, `default.*`, `global-error.*`, `route.*`
+/// - **Pages Router** (legacy): `pages/**/*.{js,jsx,ts,tsx}` (含む `pages/api/**`)
+/// - **Root entrypoints**: `middleware.{js,ts}`, `instrumentation.{js,ts}`
+///
+/// `src/app/**` のような src layout もそのまま `**/app/**` のグロブでカバーされる。
+const NEXTJS_PRESET_EXCLUDE_GLOBS: &[&str] = &[
+    // App Router 規約ファイル
+    "**/app/**/page.{js,jsx,ts,tsx}",
+    "**/app/**/layout.{js,jsx,ts,tsx}",
+    "**/app/**/loading.{js,jsx,ts,tsx}",
+    "**/app/**/error.{js,jsx,ts,tsx}",
+    "**/app/**/not-found.{js,jsx,ts,tsx}",
+    "**/app/**/template.{js,jsx,ts,tsx}",
+    "**/app/**/default.{js,jsx,ts,tsx}",
+    "**/app/**/global-error.{js,jsx,ts,tsx}",
+    "**/app/**/route.{js,jsx,ts,tsx}",
+    // Pages Router (legacy)
+    "**/pages/**/*.{js,jsx,ts,tsx}",
+    // Root entrypoints
+    "**/middleware.{js,ts}",
+    "**/instrumentation.{js,ts}",
+];
+
 /// フレームワーク名から対応する除外 glob プリセットを返す。
 /// 未知のフレームワーク名はエラー。
 ///
@@ -2669,9 +2700,21 @@ fn resolve_framework_globs(framework: Option<&str>) -> Result<Vec<String>> {
                 }
                 Ok(globs)
             }
+            "nextjs" | "next" => {
+                // Next.js は `app/` と `pages/` が予約ディレクトリ名で、`src/app/`
+                // / `src/pages/` レイアウトも `**/app/**` / `**/pages/**` グロブで
+                // そのままカバーされるため prefix 省略形は不要。
+                // むしろ `**/pages/**/*.{js,jsx,ts,tsx}` の省略形は
+                // `**/*.{js,jsx,ts,tsx}` となり全 TS/JS ファイルを誤除外するので
+                // Laravel と異なり省略形を生成しない。
+                Ok(NEXTJS_PRESET_EXCLUDE_GLOBS
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect())
+            }
             other => Err(AstroError::new(
                 ErrorCode::InvalidRequest,
-                format!("Unknown framework preset: {other} (supported: laravel)"),
+                format!("Unknown framework preset: {other} (supported: laravel, nextjs)"),
             )
             .into()),
         },
@@ -4812,6 +4855,45 @@ export function testHelper() { return 1 }\n";
         assert!(
             names.contains(&"Foo"),
             "クラス自体は dead 候補に含まれる。got: {names:?}"
+        );
+    }
+
+    /// React.memo (named function expression) の関数本体内の lexical const は api.add に出さない。
+    /// (レポート 2026-05-04-next-page-and-react-memo-false-positives.md パターン1 の再現)
+    /// `export const X = memo(function X() { const inner = ... })` の `inner` は
+    /// 関数本体スコープのローカル変数で公開 API ではない。`is_js_function_body` の
+    /// `function_expression` 認識で境界停止される。
+    #[test]
+    fn detect_api_changes_excludes_memo_wrapper_internal_const() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+
+        std::fs::write(
+            repo.join("Card.tsx"),
+            "import { memo } from 'react';\n\
+export const TaskKanbanCard = memo(function TaskKanbanCard() {\n\
+  const hasAssignee = true;\n\
+  const milestoneColor = hasAssignee ? 'red' : 'gray';\n\
+  return null;\n\
+});\n",
+        )
+        .expect("write");
+
+        let syms =
+            extract_exported_symbols_from_file(repo.to_str().expect("utf-8 path"), "Card.tsx")
+                .expect("symbols");
+        let names: Vec<&str> = syms.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert!(
+            !names.contains(&"hasAssignee"),
+            "memo wrapper 内のローカル const は exported API に含めない。got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"milestoneColor"),
+            "memo wrapper 内のローカル const は exported API に含めない。got: {names:?}"
+        );
+        assert!(
+            names.contains(&"TaskKanbanCard"),
+            "memo で包んだ exported const 自体は API に含める。got: {names:?}"
         );
     }
 
