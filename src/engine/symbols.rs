@@ -610,6 +610,57 @@ fn decorator_matches_framework_pattern_python(decorator: Node, source: &[u8]) ->
     TAIL_DECORATORS.contains(&last)
 }
 
+/// Python の `class_definition` が直接持つ base class 名のリストを返す。
+/// 例: `class Foo(Bar, baz.Qux):` → `["Bar", "baz.Qux"]`
+///
+/// dead-code 判定で同一ファイル内の継承チェーンを fixed-point で解決するための低レベル
+/// helper。クロスファイル継承解析や引数 (`metaclass=...`) の解釈は行わない。
+pub fn python_class_base_names(root: Node, source: &[u8], symbol_range: &Range) -> Vec<String> {
+    let start = tree_sitter::Point {
+        row: symbol_range.start.line,
+        column: symbol_range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: symbol_range.end.line,
+        column: symbol_range.end.column,
+    };
+    let Some(node) = root.descendant_for_point_range(start, end) else {
+        return Vec::new();
+    };
+
+    // class_definition の祖先を探す
+    let mut current = Some(node);
+    let mut class_node = None;
+    while let Some(n) = current {
+        if n.kind() == "class_definition" {
+            class_node = Some(n);
+            break;
+        }
+        current = n.parent();
+    }
+    let Some(class_def) = class_node else {
+        return Vec::new();
+    };
+
+    // superclasses field は argument_list ノードを含む
+    let Some(args) = class_def.child_by_field_name("superclasses") else {
+        return Vec::new();
+    };
+
+    let mut bases = Vec::new();
+    let mut cursor = args.walk();
+    for child in args.children(&mut cursor) {
+        // identifier (`Bar`) / attribute (`unittest.TestCase`) のみを拾う。
+        // keyword_argument (`metaclass=ABCMeta`) や generator 等は無視する。
+        if matches!(child.kind(), "identifier" | "attribute")
+            && let Ok(text) = child.utf8_text(source)
+        {
+            bases.push(text.to_string());
+        }
+    }
+    bases
+}
+
 /// Rust のシンボルが trait impl ブロックに属しているかを判定する。
 /// trait impl メソッドは trait dispatch 経由で呼ばれるため、cross-file refs
 /// 検索では caller を追跡できず、dead-code 判定でスキップする必要がある。
@@ -1962,5 +2013,57 @@ class Cli:
         pass
 "#;
         assert!(check_python_framework_decorator(src, "show"));
+    }
+
+    /// `python_class_base_names` がクラスの直接 base を identifier / attribute 形式で
+    /// 抽出できることを検証する (`unittest.TestCase` 等)。
+    #[test]
+    fn python_class_base_names_returns_identifier_and_attribute() {
+        let src = "import unittest\nclass Foo(unittest.TestCase, BaseMixin):\n    pass\n";
+        let language = LangId::Python.ts_language();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+
+        let syms = extract_symbols(root, src.as_bytes(), LangId::Python).unwrap();
+        let foo = syms.iter().find(|s| s.name == "Foo").expect("class Foo");
+        let bases = python_class_base_names(root, src.as_bytes(), &foo.range);
+        assert_eq!(
+            bases,
+            vec!["unittest.TestCase".to_string(), "BaseMixin".to_string()]
+        );
+    }
+
+    /// クラスが base を持たない場合は空リストを返すことを検証する。
+    #[test]
+    fn python_class_base_names_empty_when_no_base() {
+        let src = "class Foo:\n    pass\n";
+        let language = LangId::Python.ts_language();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+
+        let syms = extract_symbols(root, src.as_bytes(), LangId::Python).unwrap();
+        let foo = syms.iter().find(|s| s.name == "Foo").expect("class Foo");
+        let bases = python_class_base_names(root, src.as_bytes(), &foo.range);
+        assert!(bases.is_empty(), "no base => empty: {bases:?}");
+    }
+
+    /// `metaclass=...` のようなキーワード引数は base に含まれないことを検証する。
+    #[test]
+    fn python_class_base_names_skips_keyword_arguments() {
+        let src = "class Foo(Bar, metaclass=ABCMeta):\n    pass\n";
+        let language = LangId::Python.ts_language();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+
+        let syms = extract_symbols(root, src.as_bytes(), LangId::Python).unwrap();
+        let foo = syms.iter().find(|s| s.name == "Foo").expect("class Foo");
+        let bases = python_class_base_names(root, src.as_bytes(), &foo.range);
+        assert_eq!(bases, vec!["Bar".to_string()]);
     }
 }

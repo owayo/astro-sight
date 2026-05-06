@@ -1970,7 +1970,13 @@ fn extract_exported_symbols_from_git(
     // git の base 側を読む経路は API 変更検出 (api.rm 比較) のみで使われる。
     // dead-code は最新コミット側だけを見るため framework entrypoint の除外は不要。
     Some(filter_exported_symbols(
-        &syms, root, source, lang_id, true, false,
+        &syms,
+        root,
+        source,
+        lang_id,
+        true,
+        false,
+        Some(file_path),
     ))
 }
 
@@ -2027,6 +2033,7 @@ fn extract_exported_symbols_from_file_inner(
         lang_id,
         exclude_trait_impls,
         exclude_framework_entrypoints,
+        Some(file_path),
     ))
 }
 
@@ -2052,6 +2059,7 @@ fn filter_exported_symbols(
     lang_id: crate::language::LangId,
     exclude_trait_impls: bool,
     exclude_framework_entrypoints: bool,
+    file_path: Option<&str>,
 ) -> Vec<(String, String, String)> {
     use crate::models::symbol::SymbolKind;
     let source_str = std::str::from_utf8(source).unwrap_or("");
@@ -2073,6 +2081,16 @@ fn filter_exported_symbols(
             )
         })
         .collect();
+
+    // Python 限定: 同一ファイル内の `unittest.TestCase` 派生クラスを fixed-point で解決する。
+    // dead-code 経路でのみ使う想定だが、`exclude_framework_entrypoints` が true の場合に
+    // 集合を構築すれば十分。
+    let unittest_classes =
+        if exclude_framework_entrypoints && lang_id == crate::language::LangId::Python {
+            collect_python_unittest_classes(syms, root, source, lang_id)
+        } else {
+            std::collections::HashSet::new()
+        };
 
     let mut result = Vec::new();
     for sym in syms {
@@ -2151,6 +2169,23 @@ fn filter_exported_symbols(
         {
             continue;
         }
+        // unittest / pytest のテスト規約シンボル。Python 限定。
+        // `class Foo(unittest.TestCase):` 派生クラスとそのメソッド (`test_*`,
+        // `setUp` 等)、`test_*.py` / `*_test.py` のトップレベル `test_*` 関数、
+        // `conftest.py` 内の関数はテストランナーから動的 discover されるため、
+        // 識別子レベルの cross-file refs では caller を追跡できない。
+        if exclude_framework_entrypoints
+            && is_python_test_symbol(
+                &sym.name,
+                sym.kind,
+                lang_id,
+                file_path,
+                sym.container.as_deref(),
+                &unittest_classes,
+            )
+        {
+            continue;
+        }
         let sig = extract_api_signature(sym, &lines);
         let qualname = if matches!(sym.kind, SymbolKind::Method | SymbolKind::Function) {
             enclosing_container(sym, &containers)
@@ -2161,6 +2196,19 @@ fn filter_exported_symbols(
         };
         // qualname ベースでも最終チェック (例: `Foo.testBar` を PHP で除外)
         if is_phpunit_test_symbol(&qualname, sym.kind, lang_id) {
+            continue;
+        }
+        // qualname ベースでも Python unittest 規約をチェック (`Foo.test_bar` 等)
+        if exclude_framework_entrypoints
+            && is_python_test_symbol(
+                &qualname,
+                sym.kind,
+                lang_id,
+                file_path,
+                sym.container.as_deref(),
+                &unittest_classes,
+            )
+        {
             continue;
         }
         result.push((qualname, format!("{:?}", sym.kind).to_lowercase(), sig));
@@ -2828,6 +2876,182 @@ fn is_phpunit_test_method_name(name: &str) -> bool {
     }
     let c = bytes[4];
     c.is_ascii_uppercase() || c == b'_'
+}
+
+/// `unittest.TestCase` / `unittest.IsolatedAsyncioTestCase` を直接示す base 名集合。
+const PYTHON_UNITTEST_ROOT_BASES: &[&str] = &[
+    "TestCase",
+    "unittest.TestCase",
+    "IsolatedAsyncioTestCase",
+    "unittest.IsolatedAsyncioTestCase",
+];
+
+/// 同一ファイル内の Python クラスについて、`unittest.TestCase` 系を直接/間接継承する
+/// クラス名集合を fixed-point で解決して返す。クロスファイル継承は対象外。
+///
+/// 例: `class Base(unittest.TestCase): ...` と `class Child(Base): ...` の両方を拾う。
+fn collect_python_unittest_classes(
+    syms: &[crate::models::symbol::Symbol],
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    lang_id: crate::language::LangId,
+) -> std::collections::HashSet<String> {
+    use crate::models::symbol::SymbolKind;
+    let mut unittest_classes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if lang_id != crate::language::LangId::Python {
+        return unittest_classes;
+    }
+
+    // (クラス名, 解決待ち base 名のリスト) のペアを集める。
+    let mut class_bases: Vec<(String, Vec<String>)> = Vec::new();
+    for sym in syms {
+        if !matches!(sym.kind, SymbolKind::Class) {
+            continue;
+        }
+        let bases = crate::engine::symbols::python_class_base_names(root, source, &sym.range);
+        // 直接 root base を継承していれば即座に確定。
+        if bases
+            .iter()
+            .any(|b| PYTHON_UNITTEST_ROOT_BASES.contains(&b.as_str()))
+        {
+            unittest_classes.insert(sym.name.clone());
+            continue;
+        }
+        // それ以外は候補として保留し、後段で fixed-point 解決する。
+        class_bases.push((sym.name.clone(), bases));
+    }
+
+    // 同一ファイル内の Base → Child チェーンを fixed-point で広げる。
+    loop {
+        let mut changed = false;
+        let mut idx = 0;
+        while idx < class_bases.len() {
+            let inherited = class_bases[idx]
+                .1
+                .iter()
+                .any(|b| unittest_classes.contains(b.as_str()));
+            if inherited {
+                let (name, _) = class_bases.swap_remove(idx);
+                unittest_classes.insert(name);
+                changed = true;
+            } else {
+                idx += 1;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    unittest_classes
+}
+
+/// ファイル名が pytest のモジュール命名規約 (`test_*.py` または `*_test.py`) に
+/// 一致するかを判定する。`conftest.py` は別関数で判定する。
+fn file_name_is_pytest_module(file_path: Option<&str>) -> bool {
+    let Some(path) = file_path else {
+        return false;
+    };
+    let file_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if !file_name.ends_with(".py") {
+        return false;
+    }
+    // conftest.py は別ハンドリング。
+    if file_name == "conftest.py" {
+        return false;
+    }
+    if file_name.starts_with("test_") {
+        return true;
+    }
+    // `*_test.py` 規約 (ファイル名が `_test.py` で終わる)。
+    let stem = file_name.trim_end_matches(".py");
+    stem.ends_with("_test") && stem.len() > "_test".len()
+}
+
+/// ファイル名が pytest の `conftest.py` かどうかを判定する。
+fn file_name_is_python_conftest(file_path: Option<&str>) -> bool {
+    let Some(path) = file_path else {
+        return false;
+    };
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        == Some("conftest.py")
+}
+
+/// `unittest` / pytest のテスト規約に該当する Python シンボルかを判定する。
+///
+/// 対象:
+/// - `unittest.TestCase` 直接/間接継承クラス (同一ファイル内のチェーン)
+/// - そのクラス配下の `test_*` メソッドおよび `setUp` / `tearDown` /
+///   `setUpClass` / `tearDownClass` / `addCleanup` / `addClassCleanup`
+/// - `test_*.py` / `*_test.py` のトップレベル `test_*` 関数 (pytest 規約)
+/// - `conftest.py` 内のすべての関数 (pytest フィクスチャ規約)
+fn is_python_test_symbol(
+    name: &str,
+    kind: crate::models::symbol::SymbolKind,
+    lang_id: crate::language::LangId,
+    file_path: Option<&str>,
+    container: Option<&str>,
+    unittest_classes: &std::collections::HashSet<String>,
+) -> bool {
+    use crate::language::LangId;
+    use crate::models::symbol::SymbolKind;
+    if lang_id != LangId::Python {
+        return false;
+    }
+
+    // qualname (`Foo.test_bar`) の場合は末尾要素を取り出して container を補正する。
+    let (short, qual_container) = match name.rsplit_once('.') {
+        Some((head, tail)) => (tail, Some(head)),
+        None => (name, None),
+    };
+    let effective_container = container.or(qual_container);
+
+    if matches!(kind, SymbolKind::Class) {
+        return unittest_classes.contains(short);
+    }
+
+    if !matches!(kind, SymbolKind::Function | SymbolKind::Method) {
+        return false;
+    }
+
+    // conftest.py 内の関数はすべて pytest 規約で参照されうる。
+    if file_name_is_python_conftest(file_path) && effective_container.is_none() {
+        return true;
+    }
+
+    // `test_*.py` / `*_test.py` のトップレベル `test_*` 関数は pytest が discover する。
+    if file_name_is_pytest_module(file_path)
+        && effective_container.is_none()
+        && short.starts_with("test_")
+    {
+        return true;
+    }
+
+    // unittest.TestCase 派生クラス配下のメソッド。
+    if let Some(class_name) = effective_container
+        && unittest_classes.contains(class_name)
+    {
+        return short.starts_with("test_")
+            || matches!(
+                short,
+                "setUp"
+                    | "tearDown"
+                    | "setUpClass"
+                    | "tearDownClass"
+                    | "asyncSetUp"
+                    | "asyncTearDown"
+                    | "addCleanup"
+                    | "addClassCleanup"
+                    | "addAsyncCleanup"
+            );
+    }
+
+    false
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -330,6 +330,11 @@ astro-sight dead-code --dir . --exclude-dir generated --exclude-glob 'app/Legacy
 
 Output: JSON with `dir`, `scanned_files` (count), `dead_symbols` array (`name`, `kind`, `file`). Symbols with duplicate names across files are conservatively skipped.
 
+**Test framework conventions** are auto-excluded:
+- PHPUnit: `*Test` / `*TestCase` / `*IntegrationTest` / `*FeatureTest` classes, `testXxx` / `setUp` / `tearDown` / `setUpBeforeClass` / `tearDownAfterClass` methods
+- Python unittest: `unittest.TestCase` (and `IsolatedAsyncioTestCase`) subclasses with same-file inheritance chains, plus `test_*` / `setUp` / `tearDown` / `setUpClass` / `tearDownClass` / `addCleanup` / `addClassCleanup` methods
+- Python pytest: top-level `test_*` functions in `test_*.py` / `*_test.py` files, all functions in `conftest.py`
+
 ### `session` — NDJSON Batch Mode
 
 For multiple queries in one process (avoids repeated startup):

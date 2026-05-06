@@ -377,6 +377,15 @@ astro-sight dead-code --dir . --git --staged
 
 同名シンボルが複数ファイルに存在する場合は誤判定防止のためスキップされる。
 
+#### テストフレームワーク規約の自動除外
+
+テストランナーがリフレクションで動的 discover するシンボルは、識別子レベルの cross-file refs では caller を追跡できず誤検出になるため、以下の規約は自動的に dead-code から除外される:
+
+- **PHPUnit**: `*Test` / `*TestCase` / `*IntegrationTest` / `*FeatureTest` クラスと `testXxx` / `setUp` / `tearDown` / `setUpBeforeClass` / `tearDownAfterClass` メソッド
+- **Python unittest**: `unittest.TestCase` (および `unittest.IsolatedAsyncioTestCase`) を継承するクラス（同一ファイル内の間接継承も fixed-point で解決）と、その `test_*` / `setUp` / `tearDown` / `setUpClass` / `tearDownClass` / `addCleanup` / `addClassCleanup` メソッド
+- **Python pytest**: `test_*.py` / `*_test.py` ファイルのトップレベル `test_*` 関数と `conftest.py` 内のすべての関数
+- **Python フレームワーク登録デコレータ**: Typer / Click / FastAPI / Flask / Django / Celery / pytest 等の登録デコレータが付いた関数・メソッド・クラス
+
 ### doctor - 対応言語チェック
 
 ```bash

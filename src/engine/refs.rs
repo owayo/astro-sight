@@ -1378,11 +1378,14 @@ fn count_refs_in_file(
     let root = tree.root_node();
     let definition_kinds = definition_node_kinds(lang_id);
 
-    // 言語別に正規化キーで name_to_ix を構築
-    let name_to_ix: std::collections::HashMap<std::borrow::Cow<'_, str>, usize> = present_indices
-        .iter()
-        .map(|&i| (normalize_identifier(lang_id, symbol_names[i].as_str()), i))
-        .collect();
+    // 言語別に正規化キーで name_to_ix を構築。CI 言語 (Xojo) では `Foo` と `foo` の
+    // 正規化キーが衝突し得るため、値は `Vec<usize>` を保持して全シンボルにカウントを配る。
+    let mut name_to_ix: std::collections::HashMap<std::borrow::Cow<'_, str>, Vec<usize>> =
+        std::collections::HashMap::with_capacity(present_indices.len());
+    for &i in &present_indices {
+        let key = normalize_identifier(lang_id, symbol_names[i].as_str());
+        name_to_ix.entry(key).or_default().push(i);
+    }
 
     let mut counts = vec![0usize; num];
     count_identifier_refs(
@@ -1398,41 +1401,51 @@ fn count_refs_in_file(
 }
 
 /// AST を再帰走査し、非 Definition 参照の件数のみカウントする。
+/// CI 言語 (Xojo) で正規化後キーが衝突する場合でも全 index にカウントを配るため、
+/// 値は `Vec<usize>` を受け取る。
 fn count_identifier_refs(
     node: Node<'_>,
     source: &[u8],
-    name_to_ix: &std::collections::HashMap<std::borrow::Cow<'_, str>, usize>,
+    name_to_ix: &std::collections::HashMap<std::borrow::Cow<'_, str>, Vec<usize>>,
     definition_kinds: &[&str],
     lang_id: LangId,
     counts: &mut [usize],
 ) {
     if is_identifier_kind(node.kind())
         && let Ok(text) = node.utf8_text(source)
-        && let Some(&ix) = name_to_ix.get(&normalize_identifier(lang_id, text))
+        && let Some(ixs) = name_to_ix.get(&normalize_identifier(lang_id, text))
         && !is_definition_context(node, definition_kinds, lang_id)
     {
-        counts[ix] += 1;
+        for &ix in ixs {
+            counts[ix] += 1;
+        }
     }
 
     // Rust の serde 属性文字列値を非 Definition 参照としてカウントする。
     for (seg, _row, _col) in rust_attr_string_ref_segments(node, source, lang_id) {
-        if let Some(&ix) = name_to_ix.get(&normalize_identifier(lang_id, seg)) {
-            counts[ix] += 1;
+        if let Some(ixs) = name_to_ix.get(&normalize_identifier(lang_id, seg)) {
+            for &ix in ixs {
+                counts[ix] += 1;
+            }
         }
     }
 
     // PHP の callable array `[Foo::class, 'method']` の string literal を ref とする (N3)。
     if let Some((method, _row, _col)) = php_callable_array_method_segment(node, source, lang_id)
-        && let Some(&ix) = name_to_ix.get(&normalize_identifier(lang_id, method))
+        && let Some(ixs) = name_to_ix.get(&normalize_identifier(lang_id, method))
     {
-        counts[ix] += 1;
+        for &ix in ixs {
+            counts[ix] += 1;
+        }
     }
 
     // PHP の文字列 callable `'Class@method'` / `Class::class . '@method'` を ref とする (N4)。
     if let Some((method, _row, _col)) = php_string_callable_method_segment(node, source, lang_id)
-        && let Some(&ix) = name_to_ix.get(&normalize_identifier(lang_id, method))
+        && let Some(ixs) = name_to_ix.get(&normalize_identifier(lang_id, method))
     {
-        counts[ix] += 1;
+        for &ix in ixs {
+            counts[ix] += 1;
+        }
     }
 
     let mut cursor = node.walk();
@@ -1811,8 +1824,8 @@ struct Bar {
 "#;
         let tree = parse_rust(source);
         let defs = definition_node_kinds(LangId::Rust);
-        let mut name_to_ix: HashMap<Cow<'_, str>, usize> = HashMap::new();
-        name_to_ix.insert(Cow::Borrowed("serialize_jst"), 0);
+        let mut name_to_ix: HashMap<Cow<'_, str>, Vec<usize>> = HashMap::new();
+        name_to_ix.insert(Cow::Borrowed("serialize_jst"), vec![0]);
         let mut counts = vec![0usize];
         count_identifier_refs(
             tree.root_node(),
@@ -1823,6 +1836,47 @@ struct Bar {
             &mut counts,
         );
         assert_eq!(counts[0], 1, "attribute string ref must lift dead-code");
+    }
+
+    /// CI 言語 (Xojo) で正規化キーが衝突する場合、`count_identifier_refs` が
+    /// 同じキーに紐づく全 index にカウントを配ることを検証する。
+    /// （単一 index `usize` を保持していた旧実装では、衝突する後発 index が
+    /// 上書きされ前者のカウントが 0 になる回帰があった）
+    #[test]
+    fn count_identifier_refs_distributes_to_colliding_indices() {
+        use crate::language::LangId;
+        use std::borrow::Cow;
+        use std::collections::HashMap;
+
+        // Xojo の case-insensitive 識別子: `MyFunc` と `MYFUNC` は同一参照対象。
+        let source = "Sub Test()\n  Call MyFunc()\n  Call MYFUNC()\nEnd Sub\n";
+        let tree = {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_xojo::LANGUAGE.into())
+                .expect("xojo language");
+            parser.parse(source, None).expect("parse xojo")
+        };
+        let defs = definition_node_kinds(LangId::Xojo);
+
+        // 2 つの index に同一の正規化キー (`myfunc`) を割り当てる。
+        let normalized = normalize_identifier(LangId::Xojo, "MyFunc");
+        let mut name_to_ix: HashMap<Cow<'_, str>, Vec<usize>> = HashMap::new();
+        name_to_ix.insert(normalized, vec![0, 1]);
+
+        let mut counts = vec![0usize, 0usize];
+        count_identifier_refs(
+            tree.root_node(),
+            source.as_bytes(),
+            &name_to_ix,
+            defs,
+            LangId::Xojo,
+            &mut counts,
+        );
+
+        // 両方の index が 2 件 (MyFunc + MYFUNC) としてカウントされる。
+        assert_eq!(counts[0], 2, "index 0 should receive both refs");
+        assert_eq!(counts[1], 2, "index 1 should receive both refs (collision)");
     }
 
     /// `Option::is_none` のようなパス文字列では最終セグメントもカウントされることを検証

@@ -478,14 +478,22 @@ fn context_with_diff() {
     use std::io::Write;
     use std::process::Stdio;
 
-    // Create a synthetic diff
-    let diff = r#"--- a/src/engine/symbols.rs
-+++ b/src/engine/symbols.rs
-@@ -938,7 +938,7 @@
--pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
-+pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, include_refs: bool) -> Result<Vec<Symbol>> {
-     let query_src = symbol_query(lang_id);
-"#;
+    // 合成 diff: extract_symbols のシグネチャ変更。行番号は実コードから動的に取得する。
+    let symbols_src =
+        std::fs::read_to_string("src/engine/symbols.rs").expect("read src/engine/symbols.rs");
+    let extract_line_idx = symbols_src
+        .lines()
+        .position(|l| l.starts_with("pub fn extract_symbols("))
+        .expect("extract_symbols 関数が見つからない");
+    let line_no = extract_line_idx + 1;
+    let diff = format!(
+        "--- a/src/engine/symbols.rs\n\
+         +++ b/src/engine/symbols.rs\n\
+         @@ -{line_no},7 +{line_no},7 @@\n\
+         -pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {{\n\
+         +pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, include_refs: bool) -> Result<Vec<Symbol>> {{\n\
+             let query_src = symbol_query(lang_id);\n"
+    );
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
         .args(["context", "--dir", "."])
@@ -1161,15 +1169,23 @@ fn context_batch_refs_consistency() {
     use std::io::Write;
     use std::process::Stdio;
 
-    // Run context analysis and verify the output structure is consistent
-    // with the batch refs approach (same output as before)
-    let diff = r#"--- a/src/engine/symbols.rs
-+++ b/src/engine/symbols.rs
-@@ -938,7 +938,7 @@
--pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
-+pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, flag: bool) -> Result<Vec<Symbol>> {
-     let query_src = symbol_query(lang_id);
-"#;
+    // batch refs アプローチでの context 出力が従来通り一貫していることを確認する。
+    // 行番号は実コードから動的に取得する。
+    let symbols_src =
+        std::fs::read_to_string("src/engine/symbols.rs").expect("read src/engine/symbols.rs");
+    let extract_line_idx = symbols_src
+        .lines()
+        .position(|l| l.starts_with("pub fn extract_symbols("))
+        .expect("extract_symbols 関数が見つからない");
+    let line_no = extract_line_idx + 1;
+    let diff = format!(
+        "--- a/src/engine/symbols.rs\n\
+         +++ b/src/engine/symbols.rs\n\
+         @@ -{line_no},7 +{line_no},7 @@\n\
+         -pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {{\n\
+         +pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, flag: bool) -> Result<Vec<Symbol>> {{\n\
+             let query_src = symbol_query(lang_id);\n"
+    );
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
         .args(["context", "--dir", "."])
@@ -1830,14 +1846,23 @@ fn impact_with_unresolved() {
     use std::io::Write;
     use std::process::Stdio;
 
-    // Diff that changes extract_symbols signature → callers in other files are unresolved
-    let diff = r#"--- a/src/engine/symbols.rs
-+++ b/src/engine/symbols.rs
-@@ -938,7 +938,7 @@
--pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
-+pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, flag: bool) -> Result<Vec<Symbol>> {
-     let query_src = symbol_query(lang_id);
-"#;
+    // diff: extract_symbols のシグネチャを変更 → 他ファイルの caller が未解決になる
+    // 行番号は実コードから動的に取得する。
+    let symbols_src =
+        std::fs::read_to_string("src/engine/symbols.rs").expect("read src/engine/symbols.rs");
+    let extract_line_idx = symbols_src
+        .lines()
+        .position(|l| l.starts_with("pub fn extract_symbols("))
+        .expect("extract_symbols 関数が見つからない");
+    let line_no = extract_line_idx + 1;
+    let diff = format!(
+        "--- a/src/engine/symbols.rs\n\
+         +++ b/src/engine/symbols.rs\n\
+         @@ -{line_no},7 +{line_no},7 @@\n\
+         -pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {{\n\
+         +pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, flag: bool) -> Result<Vec<Symbol>> {{\n\
+             let query_src = symbol_query(lang_id);\n"
+    );
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
         .args(["impact", "--dir", "."])
@@ -5640,6 +5665,127 @@ fn dead_code_php_phpunit_conventions_excluded() {
     assert!(
         names.iter().any(|n| n == "SampleCaseTest.regular_helper"),
         "PHPUnit 規約外のメソッドは dead として報告される: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_python_unittest_conventions_excluded() {
+    // Python unittest の規約 (`unittest.TestCase` 派生クラスとそのテストメソッド、
+    // setUp/tearDown 等の lifecycle hook) は dead-code 判定から除外される。
+    // テストランナーがリフレクションで動的 discover するため、識別子レベルの
+    // cross-file refs では caller を追跡できない。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("scripts")).unwrap();
+    std::fs::write(
+        root.join("scripts/test_corpus_test.py"),
+        "import unittest\n\
+         \n\
+         class CorpusTestScriptTests(unittest.TestCase):\n    \
+             def test_is_separator(self):\n        \
+                 self.assertEqual(1, 1)\n\n    \
+             def test_extract_tests(self):\n        \
+                 self.assertTrue(True)\n\n    \
+             def setUp(self):\n        \
+                 pass\n\n    \
+             def tearDown(self):\n        \
+                 pass\n\n    \
+             def regular_helper(self):\n        \
+                 return 42\n\n\n\
+         class DerivedTests(CorpusTestScriptTests):\n    \
+             def test_inherited(self):\n        \
+                 self.assertTrue(True)\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--include-tests",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+
+    for banned in [
+        "CorpusTestScriptTests",
+        "CorpusTestScriptTests.test_is_separator",
+        "CorpusTestScriptTests.test_extract_tests",
+        "CorpusTestScriptTests.setUp",
+        "CorpusTestScriptTests.tearDown",
+        // 同一ファイル内の間接継承 (CorpusTestScriptTests → DerivedTests) も解決される
+        "DerivedTests",
+        "DerivedTests.test_inherited",
+    ] {
+        assert!(
+            !names.iter().any(|n| n == banned),
+            "{banned} は unittest 規約として dead-code から除外されるべき: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn dead_code_python_pytest_top_level_test_functions_excluded() {
+    // pytest 規約のファイル名 (`test_*.py` / `*_test.py`) のトップレベル `test_*`
+    // 関数と `conftest.py` 内の関数は dead-code から除外する。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("scripts")).unwrap();
+    std::fs::write(
+        root.join("scripts/test_module.py"),
+        "def test_addition():\n    assert 1 + 1 == 2\n\n\ndef regular_helper():\n    return 1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scripts/feature_test.py"),
+        "def test_feature():\n    assert True\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scripts/conftest.py"),
+        "def my_fixture():\n    return {}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--include-tests",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+
+    for banned in ["test_addition", "test_feature", "my_fixture"] {
+        assert!(
+            !names.iter().any(|n| n == banned),
+            "{banned} は pytest 規約として dead-code から除外されるべき: {names:?}"
+        );
+    }
+    // pytest 規約外のトップレベル関数は dead と判定される
+    assert!(
+        names.iter().any(|n| n == "regular_helper"),
+        "pytest 規約外のトップレベル関数は dead として報告される: {names:?}"
     );
 }
 

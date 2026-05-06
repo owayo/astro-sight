@@ -18,6 +18,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - **入力検証の強化**（`refs` の空 `name/names` を拒否、`--paths` / `--paths-file` の空リストを拒否、`session` の空文字・非 UTF-8・不正パスの `ASTRO_SIGHT_WORKSPACE` を拒否、`--dir` にはディレクトリのみ許可、streaming `context` は JSON prefix 出力前に入力を検証）
 - **セキュリティ** — パス境界チェック（Session/MCP のワークスペースサンドボックス、相対パスはワークスペースルート基準、非 UTF-8 パスは canonicalize 後に fail-closed で拒否）、ファイル/入力サイズ 100MB 上限（`session` / `context` / `impact` の生入力を含む）、`git diff` / `git show` / `git blame` に渡す `--base` 等 revision は `-` プレフィクス / NUL / 空文字を拒否（オプション誤認識防止、`cochange --blame` の `--paths` / `--paths-file` 経由でも検証）
 - **トークン最適化** — version フィールド省略（doctor/MCP のみ）、compact キー短縮（`lang`/`ln`/`col`/`ctx`/`refs`/`src`/`def`/`ref`/`fn`/`cx` 等）、calls を caller グルーピング、CompactAstEdge フラット化、refs/context で相対パス出力、symbols デフォルト compact 出力（`--doc` で docstring 付加、`--full` で旧来の完全出力）
+- **dead-code 規約除外** — PHPUnit 規約 (`*Test` / `*TestCase` クラス、`testXxx` / `setUp` / `tearDown` 等) と Python unittest/pytest 規約 (`unittest.TestCase` 派生クラス + 同一ファイル内の間接継承を fixed-point で解決、`test_*` / `setUp` / `tearDown` / `setUpClass` / `tearDownClass` / `addCleanup` / `addClassCleanup` メソッド、`test_*.py` / `*_test.py` のトップレベル `test_*` 関数、`conftest.py` 内の関数) を dead-code から除外（テストランナーが動的 discover するため）
 - **循環的複雑度** — symbols 出力に `cx`（cyclomatic complexity）を付加（関数/メソッドのみ、ベース1 + 分岐ノード数、ネスト関数/クロージャは除外）、言語別分岐ノード定義（Rust/JS/TS/Python/Go/Java/Kotlin/Ruby/PHP/C#等）
 - **設定ファイル** — `~/.config/astro-sight/config.toml`（TOML 形式、`astro-sight init` で生成）
 - **ロギング** — logroller による日次ローテーション（ローカルタイムゾーン、3日保持）
@@ -33,7 +34,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/mcp/mod.rs` - MCP サーバー（AstroSightServer + AppService::sandboxed(cwd) + 11 ツール、fail-closed: sandbox 生成失敗時はパニック）
 - `src/engine/parser.rs` - tree-sitter パーサー管理（100MB ファイルサイズ上限、SourceBuf によるゼロコピー mmap）
 - `src/engine/extractor.rs` - AST ノード抽出
-- `src/engine/symbols.rs` - シンボル抽出（tree-sitter クエリ）+ スコープ判定（is_local_scope_symbol, is_symbol_exported）+ 循環的複雑度（calculate_complexity）
+- `src/engine/symbols.rs` - シンボル抽出（tree-sitter クエリ）+ スコープ判定（is_local_scope_symbol, is_symbol_exported）+ 循環的複雑度（calculate_complexity）+ Python フレームワーク entrypoint デコレータ判定（has_framework_entrypoint_decorator_python）+ Python クラス base 抽出（python_class_base_names）
 - `src/engine/calls.rs` - コールグラフ抽出（言語別 call expression クエリ）
 - `src/engine/refs.rs` - クロスファイル参照検索（ignore + rayon 並列 + fold/reduce 集約 + memchr/memmem 事前フィルタ + Aho-Corasick バッチ検索 + `collect_files` pub ユーティリティ）、CI 言語（Xojo）では正規化キー衝突を `Vec<usize>` で吸収、行コンテキスト抽出は `memchr` で該当行のみ UTF-8 変換
 - `src/engine/diff.rs` - unified diff パーサー
