@@ -1052,11 +1052,6 @@ where
         return Ok(HashMap::new());
     }
 
-    let ac = aho_corasick::AhoCorasick::builder()
-        .ascii_case_insensitive(true)
-        .build(symbol_names)
-        .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))?;
-
     let files = collect_files(dir, glob_pattern)?;
 
     let n = symbol_names.len();
@@ -1067,24 +1062,41 @@ where
     let prod_counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
     let test_counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
 
-    files.into_par_iter().for_each(|path| {
-        let Some(path_str) = path.to_str() else {
-            return;
-        };
-        let utf8_path = camino::Utf8Path::new(path_str);
-        if let Ok(per_file) = count_refs_in_file(symbol_names, &ac, utf8_path) {
-            let bucket = if is_test(&path) {
-                &test_counts
-            } else {
-                &prod_counts
+    // AC trie はパターン数に対して非線形にメモリを食う。dead-code 経路で
+    // unique_names が数万件まで膨らむと trie 自体が GB 級になり、起動直後の
+    // 一括確保で OOM の主因になっていた。chunk 単位で構築 → 走査 → drop して
+    // ピーク RSS を AC_CHUNK_SIZE に対して定数で抑える。
+    const AC_CHUNK_SIZE: usize = 1024;
+    for (chunk_offset, chunk_start) in (0..n).step_by(AC_CHUNK_SIZE).enumerate() {
+        let chunk_end = (chunk_start + AC_CHUNK_SIZE).min(n);
+        let chunk = &symbol_names[chunk_start..chunk_end];
+        let base_idx = chunk_offset * AC_CHUNK_SIZE;
+
+        let ac = aho_corasick::AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(chunk)
+            .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))?;
+
+        files.par_iter().for_each(|path| {
+            let Some(path_str) = path.to_str() else {
+                return;
             };
-            for (ix, cnt) in per_file.into_iter().enumerate() {
-                if cnt != 0 {
-                    bucket[ix].fetch_add(cnt, Ordering::Relaxed);
+            let utf8_path = camino::Utf8Path::new(path_str);
+            if let Ok(per_file) = count_refs_in_file(chunk, &ac, utf8_path) {
+                let bucket = if is_test(path) {
+                    &test_counts
+                } else {
+                    &prod_counts
+                };
+                for (local_ix, cnt) in per_file.into_iter().enumerate() {
+                    if cnt != 0 {
+                        bucket[base_idx + local_ix].fetch_add(cnt, Ordering::Relaxed);
+                    }
                 }
             }
-        }
-    });
+        });
+        // ac はここで drop され、次 chunk まで AC trie のメモリは解放される
+    }
 
     let mut out = HashMap::with_capacity(n);
     for (i, name) in symbol_names.iter().enumerate() {
