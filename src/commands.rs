@@ -1797,6 +1797,33 @@ pub(crate) fn detect_dead_symbols_from_files(
         Err(_) => return (Vec::new(), Vec::new()),
     };
 
+    // case-insensitive 言語 (Xojo 等) のみで構成された files では dead-code 検出を
+    // skip する。
+    //
+    // CI 言語は `Foo` / `foo` / `FOO` を同じシンボルとして扱うため、汎用名が多用される
+    // プロジェクトでは:
+    // (1) 全 export シンボル × 全リポジトリファイルの AC マッチングで heap が膨張し OOM
+    // (2) 同名シンボルの誤マッチで test_only / dead 判定の精度が低い
+    // という二重の問題があるため、CI 言語のみの diff では dead-code 検出をスキップする。
+    //
+    // 強制的に従来挙動に戻したい場合は `ASTRO_SIGHT_FORCE_CI_LANG_DEAD_CODE=1` を
+    // 設定する。
+    if !files.is_empty()
+        && std::env::var("ASTRO_SIGHT_FORCE_CI_LANG_DEAD_CODE")
+            .ok()
+            .as_deref()
+            != Some("1")
+    {
+        let all_ci = files.iter().all(|p| {
+            p.to_str()
+                .and_then(|s| crate::language::LangId::from_path(camino::Utf8Path::new(s)).ok())
+                .is_some_and(|l| l.is_case_insensitive())
+        });
+        if all_ci {
+            return (Vec::new(), Vec::new());
+        }
+    }
+
     // .gitattributes の linguist-generated 指定ファイルは dead-code 検出から除外する
     let gitattrs = crate::engine::gitattributes::GitAttributes::load(&canonical_dir);
 
