@@ -66,15 +66,27 @@ pub(super) fn stream_caller_maps_and_defs(
     //
     // 強制的に従来挙動に戻したい場合は `ASTRO_SIGHT_FORCE_CI_LANG_IMPACT=1` を
     // 設定する。
-    if !file_contexts.is_empty()
+    let all_ci = !file_contexts.is_empty()
         && file_contexts
             .iter()
-            .all(|fc| fc.lang_id.is_case_insensitive())
-        && std::env::var("ASTRO_SIGHT_FORCE_CI_LANG_IMPACT")
-            .ok()
-            .as_deref()
-            != Some("1")
-    {
+            .all(|fc| fc.lang_id.is_case_insensitive());
+    let force = std::env::var("ASTRO_SIGHT_FORCE_CI_LANG_IMPACT")
+        .ok()
+        .as_deref()
+        == Some("1");
+    crate::commands::log_phase(
+        &format!(
+            "context.pass2.ci_skip all_ci={all_ci} force={force} fc_langs={:?}",
+            file_contexts
+                .iter()
+                .map(|fc| fc.lang_id)
+                .collect::<Vec<_>>()
+        ),
+        "info",
+        0,
+    );
+    if all_ci && !force {
+        crate::commands::log_phase("context.pass2.ci_skip", "applied", 0);
         return (
             (0..n_fc).map(|_| new_typed_caller_map()).collect(),
             vec![Vec::new(); n_sym],

@@ -78,15 +78,32 @@ pub fn analyze_impact_streaming<F>(
 where
     F: FnMut(FileImpact) -> Result<()>,
 {
+    use crate::commands::log_phase;
     let diff_files = diff::parse_unified_diff(diff_input);
 
+    let t = std::time::Instant::now();
+    log_phase("context.pass1", "start", 0);
     let (file_contexts, all_symbol_names, method_parent_types, included_symbols) =
         collect_affected_symbols(diff_input, &diff_files, dir);
+    log_phase("context.pass1", "end", t.elapsed().as_millis());
+    log_phase(
+        &format!(
+            "context.pass1.stats files={} all_syms={} included={}",
+            file_contexts.len(),
+            all_symbol_names.len(),
+            included_symbols.len()
+        ),
+        "info",
+        0,
+    );
 
     if all_symbol_names.is_empty() {
+        let t = std::time::Instant::now();
+        log_phase("context.assemble_no_cross", "start", 0);
         for change in assemble_without_cross_file(file_contexts, &included_symbols) {
             on_file_impact(change)?;
         }
+        log_phase("context.assemble_no_cross", "end", t.elapsed().as_millis());
         return Ok(());
     }
 
@@ -96,6 +113,8 @@ where
     }
 
     // Pass 2: per-file で Definition 集合と References を同時収集し、caller_maps に即流す
+    let t = std::time::Instant::now();
+    log_phase("context.pass2", "start", 0);
     let (mut typed_caller_maps, def_paths_by_ix, string_pool) = stream_caller_maps_and_defs(
         &file_contexts,
         &all_symbol_names,
@@ -104,6 +123,7 @@ where
         &included_symbols,
         dir,
     );
+    log_phase("context.pass2", "end", t.elapsed().as_millis());
 
     // Stage 4b 判定用: method parent を持つ sym_ix のビットセット
     let has_parent_by_ix = compute_has_parent_by_ix(&sym_ix, &method_parent_types);
@@ -112,6 +132,8 @@ where
     // 旧実装は `Vec<CallerMap>` 全件を String 化してから `FileImpact` を作っていたため、
     // 中間表現が 2 重に materialize されて RSS の 0.7-1.2 GB を食っていた（codex 分析）。
     // さらに streaming callback で呼び出し側（CLI）へ即渡し、`Vec<FileImpact>` の累積も廃止する。
+    let t = std::time::Instant::now();
+    log_phase("context.pass34", "start", 0);
     for (fc_ix, ctx) in file_contexts.into_iter().enumerate() {
         let typed_map = std::mem::take(&mut typed_caller_maps[fc_ix]);
         let caller_map = apply_stage4b_single(
@@ -137,6 +159,7 @@ where
     }
     drop(typed_caller_maps);
     drop(string_pool);
+    log_phase("context.pass34", "end", t.elapsed().as_millis());
 
     Ok(())
 }

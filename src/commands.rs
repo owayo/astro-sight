@@ -25,7 +25,7 @@ const MAX_INPUT_SIZE: usize = 100 * 1024 * 1024;
 /// 現在プロセスの RSS を KB 単位で取得 (Linux のみ正確、その他 OS は None)。
 /// `astro-sight review` の各フェーズが何 GB 消費しているかを CI の artifacts ログで
 /// 観測するため。
-fn current_rss_kb() -> Option<u64> {
+pub(crate) fn current_rss_kb() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         use std::fs;
@@ -51,7 +51,7 @@ fn current_rss_kb() -> Option<u64> {
 /// CI で `astro-sight review` がどのフェーズで何 GB を確保するかを観測するための
 /// 軽量プロファイラ。出力フォーマットは:
 /// `[as] phase=<NAME> status=<start|end> rss=<MB> elapsed=<MS>`
-fn log_phase(phase: &str, status: &str, elapsed_ms: u128) {
+pub(crate) fn log_phase(phase: &str, status: &str, elapsed_ms: u128) {
     if std::env::var("ASTRO_SIGHT_LOG_PHASES").ok().as_deref() != Some("1") {
         return;
     }
