@@ -184,13 +184,27 @@ pub(crate) fn is_symbol_in_changed_lines(
         } else if in_file
             && ((line.starts_with('+') && !line.starts_with("+++"))
                 || (line.starts_with('-') && !line.starts_with("---")))
-            && text_contains(&line[1..], symbol_name, lang_id)
+            && line_has_identifier(&line[1..], symbol_name, lang_id)
         {
             return true;
         }
     }
 
     false
+}
+
+/// 行を識別子境界 (非英数+アンダースコア以外) で分割し、`symbol` と一致する
+/// トークンが含まれるか判定する。
+///
+/// `text_contains` 系の substring 判定だと汎用名 (`e` / `row` / `setting` 等) が
+/// 長い識別子 (`PhoneEvent`, `arrow`, `mySetting` 等) の部分一致で常に true となり、
+/// cross-file 影響分析の対象が爆発して impact Pass2 のメモリが線形に膨らんでいた。
+/// 識別子境界で分割してから比較することで false-positive を排除する。
+fn line_has_identifier(line: &str, symbol: &str, lang: LangId) -> bool {
+    let target = normalize_identifier(lang, symbol);
+    line.split(|c: char| !(c == '_' || c.is_alphanumeric()))
+        .filter(|s| !s.is_empty())
+        .any(|tok| normalize_identifier(lang, tok).as_ref() == target.as_ref())
 }
 
 /// コンテキスト行（例: "    symbols::extract_symbols(...)"）から関数名の抽出を試みる。
