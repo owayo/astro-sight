@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use camino::Utf8Path;
-use tree_sitter::{Parser, Tree};
+use tree_sitter::{ParseOptions, Parser, Tree};
 
 use crate::error::AstroError;
 use crate::language::LangId;
@@ -21,16 +21,52 @@ pub fn parse_file(path: &Utf8Path, source: &[u8]) -> Result<(Tree, LangId)> {
     Ok((tree, lang_id))
 }
 
+/// パースのタイムアウト秒。デフォルト 30 秒、`ASTRO_SIGHT_PARSE_TIMEOUT_SEC` で上書き、
+/// 0 で無制限。
+///
+/// tree-sitter は ambiguous な grammar や複雑な構文で GLR バックトラッキングが
+/// 指数的に爆発し、数十 KB のファイル単位で数 GB のメモリを食うことがある。
+/// `ParseOptions::progress_callback` で経過時間を監視し、上限超過で parse を
+/// 打ち切ることで OOM を防ぐ。
+fn parse_timeout_secs() -> u64 {
+    std::env::var("ASTRO_SIGHT_PARSE_TIMEOUT_SEC")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30)
+}
+
 /// 既知の言語でソースバイト列をパースする。
 pub fn parse_source(source: &[u8], lang_id: LangId) -> Result<Tree> {
+    use std::time::{Duration, Instant};
+
     let mut parser = Parser::new();
     parser
         .set_language(&lang_id.ts_language())
         .context("Failed to set parser language")?;
 
-    parser
-        .parse(source, None)
-        .ok_or_else(|| AstroError::parse_error("<source>").into())
+    let timeout_secs = parse_timeout_secs();
+    let tree = if timeout_secs > 0 {
+        use std::ops::ControlFlow;
+        let start = Instant::now();
+        let limit = Duration::from_secs(timeout_secs);
+        let mut callback = |_state: &tree_sitter::ParseState| {
+            if start.elapsed() > limit {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        };
+        let options = ParseOptions::new().progress_callback(&mut callback);
+        parser.parse_with_options(
+            &mut |byte, _| &source[byte.min(source.len())..],
+            None,
+            Some(options),
+        )
+    } else {
+        parser.parse(source, None)
+    };
+
+    tree.ok_or_else(|| AstroError::parse_error("<source>").into())
 }
 
 /// ファイルサイズ上限: 100 MB。

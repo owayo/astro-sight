@@ -940,10 +940,36 @@ pub fn cmd_review(
     }
 
     // 2. impact 分析
-    log_phase("context", "start", 0);
-    let phase_t = std::time::Instant::now();
-    let impact = service.analyze_context(&diff_input, dir)?;
-    log_phase("context", "end", phase_t.elapsed().as_millis());
+    //
+    // diff の全 changed file が case-insensitive 言語 (Xojo 等) のみで構成される場合は
+    // context フェーズ全体を skip する。Xojo は tree-sitter-xojo grammar が
+    // GLR バックトラッキングで指数的にメモリを食うことがあり、`parse_file` 単体で
+    // 数 GB 〜数十 GB を消費する。Phase 5 の pass2 skip では parse は走るため
+    // OOM を防げない。Pass1 (collect_affected_symbols) も呼ばずに空 ContextResult
+    // を返す。`ASTRO_SIGHT_FORCE_CI_LANG_IMPACT=1` で強制的に従来挙動に戻せる。
+    let pre_diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
+    let force_ci = std::env::var("ASTRO_SIGHT_FORCE_CI_LANG_IMPACT")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let all_ci_lang = !pre_diff_files.is_empty()
+        && pre_diff_files.iter().all(|df| {
+            crate::language::LangId::from_path(camino::Utf8Path::new(&df.new_path))
+                .map(|l| l.is_case_insensitive())
+                .unwrap_or(false)
+        });
+    let impact = if all_ci_lang && !force_ci {
+        log_phase("context.skip_ci_only", "applied", 0);
+        crate::models::impact::ContextResult {
+            changes: Vec::new(),
+        }
+    } else {
+        log_phase("context", "start", 0);
+        let phase_t = std::time::Instant::now();
+        let r = service.analyze_context(&diff_input, dir)?;
+        log_phase("context", "end", phase_t.elapsed().as_millis());
+        r
+    };
 
     // 3. diff に含まれるファイルリストを収集
     let diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
@@ -969,10 +995,26 @@ pub fn cmd_review(
     log_phase("cochange", "end", phase_t.elapsed().as_millis());
 
     // 5. API surface diff
-    log_phase("api_changes", "start", 0);
-    let phase_t = std::time::Instant::now();
-    let api_changes = detect_api_changes(dir, base, &diff_files);
-    log_phase("api_changes", "end", phase_t.elapsed().as_millis());
+    //
+    // 全 changed file が CI 言語のみの場合は context と同じ理由で skip する
+    // (detect_api_changes も内部で extract_exported_symbols → tree-sitter parse を
+    // 呼ぶため、Xojo grammar 暴走の影響を受ける)。
+    let api_changes = if all_ci_lang && !force_ci {
+        log_phase("api_changes.skip_ci_only", "applied", 0);
+        ApiChanges {
+            added: Vec::new(),
+            removed: Vec::new(),
+            modified: Vec::new(),
+            moved: Vec::new(),
+            property_to_field: Vec::new(),
+        }
+    } else {
+        log_phase("api_changes", "start", 0);
+        let phase_t = std::time::Instant::now();
+        let r = detect_api_changes(dir, base, &diff_files);
+        log_phase("api_changes", "end", phase_t.elapsed().as_millis());
+        r
+    };
 
     // 6. dead symbol 検出 (framework プリセット + ユーザ指定 exclude を適用)
     //    review では vendor / tests / build を常に除外する固定挙動。

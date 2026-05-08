@@ -198,6 +198,7 @@ fn collect_affected_symbols(
     let mut method_parent_types: HashMap<String, String> = HashMap::new();
     let mut included_symbols: HashSet<String> = HashSet::new();
 
+    use crate::commands::log_phase;
     for df in diff_files {
         if !is_safe_diff_path(&df.new_path) {
             continue;
@@ -217,22 +218,48 @@ fn collect_affected_symbols(
             continue;
         }
 
+        log_phase(
+            &format!("context.pass1.file path={}", df.new_path),
+            "start",
+            0,
+        );
+
+        let t = std::time::Instant::now();
         let utf8_path = Utf8Path::new(file_path.to_str().unwrap_or(""));
         let source = match parser::read_file(utf8_path) {
             Ok(s) => s,
             Err(_) => continue,
         };
+        log_phase("context.pass1.read_file", "end", t.elapsed().as_millis());
+
+        let t = std::time::Instant::now();
         let (tree, lang_id) = match parser::parse_file(utf8_path, &source) {
             Ok(r) => r,
             Err(_) => continue,
         };
         let root = tree.root_node();
+        log_phase("context.pass1.parse", "end", t.elapsed().as_millis());
 
+        let t = std::time::Instant::now();
         let syms = symbols::extract_symbols(root, &source, lang_id).unwrap_or_default();
+        log_phase(
+            &format!("context.pass1.extract_symbols n={}", syms.len()),
+            "end",
+            t.elapsed().as_millis(),
+        );
+
+        let t = std::time::Instant::now();
         let affected_raw = find_affected_symbols(&syms, &df.hunks);
+        log_phase(
+            &format!("context.pass1.find_affected n={}", affected_raw.len()),
+            "end",
+            t.elapsed().as_millis(),
+        );
+
         // テストシンボルとローカルスコープ変数を affected から除外。
         // ローカル変数（関数内 const/let 等）はファイル外への影響を持たないため、
         // affected_symbols 出力と cross-file 伝播の両方からノイズを除去する。
+        let t = std::time::Instant::now();
         let affected: Vec<AffectedSymbol> = affected_raw
             .into_iter()
             .filter(|sym| {
@@ -251,8 +278,27 @@ fn collect_affected_symbols(
                 true
             })
             .collect();
+        log_phase(
+            &format!("context.pass1.filter n={}", affected.len()),
+            "end",
+            t.elapsed().as_millis(),
+        );
+
+        let t = std::time::Instant::now();
         let sig_changes = detect_signature_changes(diff_input, &df.new_path, &affected, lang_id);
+        log_phase(
+            &format!("context.pass1.detect_sig n={}", sig_changes.len()),
+            "end",
+            t.elapsed().as_millis(),
+        );
+
+        let t = std::time::Instant::now();
         let call_edges = calls::extract_calls(root, &source, lang_id, None).unwrap_or_default();
+        log_phase(
+            &format!("context.pass1.extract_calls n={}", call_edges.len()),
+            "end",
+            t.elapsed().as_millis(),
+        );
 
         for sym in &affected {
             let sym_key = ci_key(lang_id, &sym.name);
