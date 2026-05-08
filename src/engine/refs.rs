@@ -1046,6 +1046,7 @@ where
     F: Fn(&Path) -> bool + Sync,
 {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     if symbol_names.is_empty() {
         return Ok(HashMap::new());
@@ -1059,40 +1060,41 @@ where
     let files = collect_files(dir, glob_pattern)?;
 
     let n = symbol_names.len();
-    let (prod_counts, test_counts): (Vec<usize>, Vec<usize>) = files
-        .into_par_iter()
-        .fold(
-            || (vec![0usize; n], vec![0usize; n]),
-            |(mut prod, mut test), path| {
-                let Some(path_str) = path.to_str() else {
-                    return (prod, test);
-                };
-                let utf8_path = camino::Utf8Path::new(path_str);
-                if let Ok(per_file) = count_refs_in_file(symbol_names, &ac, utf8_path) {
-                    let bucket = if is_test(&path) { &mut test } else { &mut prod };
-                    for (ix, cnt) in per_file.into_iter().enumerate() {
-                        bucket[ix] += cnt;
-                    }
+    // shared atomic counters: rayon の chunk 単位で `(vec![0; n], vec![0; n])` を都度確保せず、
+    // n × 16 bytes 一定のメモリで全 worker から fetch_add する。
+    // dead-code は unique_names が大規模リポジトリで数万〜数十万件に達するため、
+    // fold の per-chunk Vec が同時確保されると数 GB の bursty allocation を招いていた。
+    let prod_counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+    let test_counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+
+    files.into_par_iter().for_each(|path| {
+        let Some(path_str) = path.to_str() else {
+            return;
+        };
+        let utf8_path = camino::Utf8Path::new(path_str);
+        if let Ok(per_file) = count_refs_in_file(symbol_names, &ac, utf8_path) {
+            let bucket = if is_test(&path) {
+                &test_counts
+            } else {
+                &prod_counts
+            };
+            for (ix, cnt) in per_file.into_iter().enumerate() {
+                if cnt != 0 {
+                    bucket[ix].fetch_add(cnt, Ordering::Relaxed);
                 }
-                (prod, test)
-            },
-        )
-        .reduce(
-            || (vec![0usize; n], vec![0usize; n]),
-            |(mut acc_p, mut acc_t), (lp, lt)| {
-                for (a, b) in acc_p.iter_mut().zip(lp) {
-                    *a += b;
-                }
-                for (a, b) in acc_t.iter_mut().zip(lt) {
-                    *a += b;
-                }
-                (acc_p, acc_t)
-            },
-        );
+            }
+        }
+    });
 
     let mut out = HashMap::with_capacity(n);
     for (i, name) in symbol_names.iter().enumerate() {
-        out.insert(name.clone(), (prod_counts[i], test_counts[i]));
+        out.insert(
+            name.clone(),
+            (
+                prod_counts[i].load(Ordering::Relaxed),
+                test_counts[i].load(Ordering::Relaxed),
+            ),
+        );
     }
     Ok(out)
 }

@@ -397,17 +397,29 @@ pub fn cmd_refs_batch(
     glob: Option<&str>,
 ) -> Result<()> {
     use std::io::Write;
-    let results = service.find_references_batch(names, dir, glob)?;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    for result in &results {
-        let line = serde_json::to_string(result)?;
-        writeln!(out, "{line}")?;
+    let mut total_refs = 0usize;
+
+    // per-symbol で実行 + 即出力。一括バッチは内部 fold で `Vec<Vec<SymbolReference>>` を
+    // 全保持するため、Xojo の汎用名 (`row` / `e` / `setting` 等) で 1 シンボル当たり
+    // 数千件規模のヒットが出ると、シンボル数倍の `path` / `context` String を同時
+    // 確保して RSS が線形爆発する。シンボル毎に呼び出して即フラッシュすることで
+    // ピーク RSS を 1 シンボル分に抑える。
+    for name in names {
+        let one = vec![name.clone()];
+        let results = service.find_references_batch(&one, dir, glob)?;
+        for result in &results {
+            total_refs += result.references.len();
+            let line = serde_json::to_string(result)?;
+            writeln!(out, "{line}")?;
+        }
     }
+
     info!(
         command = "refs_batch",
         names_count = names.len(),
-        total_refs = results.iter().map(|r| r.references.len()).sum::<usize>(),
+        total_refs = total_refs,
         "command completed"
     );
     Ok(())
