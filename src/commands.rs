@@ -22,6 +22,45 @@ use crate::service::{AppService, AstParams};
 
 const MAX_INPUT_SIZE: usize = 100 * 1024 * 1024;
 
+/// 現在プロセスの RSS を KB 単位で取得 (Linux のみ正確、その他 OS は None)。
+/// `astro-sight review` の各フェーズが何 GB 消費しているかを CI の artifacts ログで
+/// 観測するため。
+fn current_rss_kb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::fs;
+        let status = fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if let Some(kb) = parts.first().and_then(|s| s.parse::<u64>().ok()) {
+                    return Some(kb);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// `ASTRO_SIGHT_LOG_PHASES=1` のときのみ stderr に進捗ログを出す。
+///
+/// CI で `astro-sight review` がどのフェーズで何 GB を確保するかを観測するための
+/// 軽量プロファイラ。出力フォーマットは:
+/// `[as] phase=<NAME> status=<start|end> rss=<MB> elapsed=<MS>`
+fn log_phase(phase: &str, status: &str, elapsed_ms: u128) {
+    if std::env::var("ASTRO_SIGHT_LOG_PHASES").ok().as_deref() != Some("1") {
+        return;
+    }
+    let rss_str = current_rss_kb()
+        .map(|kb| format!("{}MB", kb / 1024))
+        .unwrap_or_else(|| "?MB".to_string());
+    eprintln!("[as] phase={phase} status={status} rss={rss_str} elapsed={elapsed_ms}ms");
+}
+
 pub fn classify_error(e: &anyhow::Error) -> (String, String) {
     if let Some(ae) = e.downcast_ref::<AstroError>() {
         (ae.code.to_string(), ae.message.clone())
@@ -901,7 +940,10 @@ pub fn cmd_review(
     }
 
     // 2. impact 分析
+    log_phase("context", "start", 0);
+    let phase_t = std::time::Instant::now();
     let impact = service.analyze_context(&diff_input, dir)?;
+    log_phase("context", "end", phase_t.elapsed().as_millis());
 
     // 3. diff に含まれるファイルリストを収集
     let diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
@@ -920,15 +962,23 @@ pub fn cmd_review(
         .collect();
 
     // 4. cochange 分析 → missing_cochanges 検出
+    log_phase("cochange", "start", 0);
+    let phase_t = std::time::Instant::now();
     let missing_cochanges =
         detect_missing_cochanges(service, dir, &changed_file_set, min_confidence, Some(base));
+    log_phase("cochange", "end", phase_t.elapsed().as_millis());
 
     // 5. API surface diff
+    log_phase("api_changes", "start", 0);
+    let phase_t = std::time::Instant::now();
     let api_changes = detect_api_changes(dir, base, &diff_files);
+    log_phase("api_changes", "end", phase_t.elapsed().as_millis());
 
     // 6. dead symbol 検出 (framework プリセット + ユーザ指定 exclude を適用)
     //    review では vendor / tests / build を常に除外する固定挙動。
     //    必要になった段階で dead-code と同様の --include-* オプションを追加する。
+    log_phase("dead_code", "start", 0);
+    let phase_t = std::time::Instant::now();
     let (dead_symbols, test_only_symbols) = match std::fs::canonicalize(dir) {
         Ok(canonical_dir) => {
             let default_excludes = resolve_dead_code_excludes(false, false, false);
@@ -952,6 +1002,7 @@ pub fn cmd_review(
         }
         Err(_) => (Vec::new(), Vec::new()),
     };
+    log_phase("dead_code", "end", phase_t.elapsed().as_millis());
 
     let result = ReviewResult {
         impact,
