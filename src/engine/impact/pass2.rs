@@ -23,24 +23,6 @@ use super::{FileContext, TARGET_FILE_CACHE_SIZE, ci_key};
 /// 128 は「chunk 中の一時データ + reduce 2x でも数百 MB 以内」を狙った保守的な値。
 const CHUNK_SIZE: usize = 128;
 
-/// 1 シンボルあたりの cross-file fanout 上限。
-///
-/// `sym_to_fc[ix]` は「シンボル ix が含まれる変更ファイルの集合」で、
-/// 同名 affected symbol が複数の diff ファイルに重複して定義されていると要素数が増える。
-/// Xojo の汎用名 (`e` / `row` / `setting` 等) や case-insensitive 衝突で fanout が
-/// 大きくなると、`ImpactCollector::on_ref` で参照 1 件あたり O(fanout) 件の
-/// `TypedCallerMap` への push が発生し、`global_maps` が処理時間に線形蓄積して
-/// CI で 30GB OOM の原因になっていた。上限を超えるシンボルは曖昧と判断して
-/// cross-file 解析対象から外す (= `sym_to_fc[ix]` を空にする)。
-const DEFAULT_MAX_FANOUT_PER_SYMBOL: usize = 32;
-
-fn max_fanout_per_symbol() -> usize {
-    std::env::var("ASTRO_SIGHT_MAX_FANOUT_PER_SYMBOL")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_MAX_FANOUT_PER_SYMBOL)
-}
-
 /// impact streaming Pass の並列度。デフォルトは 1 (= fold/reduce のピーク 2x を避けて
 /// RSS を最小化)。CI 等で速度優先にしたい場合は `ASTRO_SIGHT_IMPACT_WORKERS` で上書きする。
 fn impact_worker_count() -> usize {
@@ -70,6 +52,36 @@ pub(super) fn stream_caller_maps_and_defs(
     let n_sym = all_symbol_names.len();
     let n_fc = file_contexts.len();
 
+    // case-insensitive 言語 (Xojo 等) のみで構成された diff では cross-file 解析を
+    // skip する。
+    //
+    // CI 言語は識別子の大文字小文字を区別しないため、`Foo` / `foo` / `FOO` がすべて
+    // 同じシンボルになる。これに加えて Xojo 系プロジェクトでは汎用名 (`e` / `row` /
+    // `setting` / イベント引数等) が多用される。結果として、cross-file 影響分析は
+    // (1) 同名シンボルの per-reference fanout で `global_maps` が処理時間に線形蓄積
+    //     して RSS が無制限に膨らむ
+    // (2) ノイズだらけで実用的な精度が出ない
+    // という二重の問題を抱える。CI 言語のみの diff では cross-file 解析を行わず、
+    // 空の結果を返すことで上記を回避する。
+    //
+    // 強制的に従来挙動に戻したい場合は `ASTRO_SIGHT_FORCE_CI_LANG_IMPACT=1` を
+    // 設定する。
+    if !file_contexts.is_empty()
+        && file_contexts
+            .iter()
+            .all(|fc| fc.lang_id.is_case_insensitive())
+        && std::env::var("ASTRO_SIGHT_FORCE_CI_LANG_IMPACT")
+            .ok()
+            .as_deref()
+            != Some("1")
+    {
+        return (
+            (0..n_fc).map(|_| new_typed_caller_map()).collect(),
+            vec![Vec::new(); n_sym],
+            StringPool::new(),
+        );
+    }
+
     let mut sym_to_fc: Vec<Vec<u32>> = vec![Vec::new(); n_sym];
     for (fc_ix, ctx) in file_contexts.iter().enumerate() {
         for sym in &ctx.affected {
@@ -79,21 +91,6 @@ pub(super) fn stream_caller_maps_and_defs(
             }
             if let Some(&ix) = sym_ix.get(&sym_key) {
                 sym_to_fc[ix].push(fc_ix as u32);
-            }
-        }
-    }
-
-    // fanout 爆発の抑止: 同名 affected symbol が複数の changed file にまたがると
-    // `ImpactCollector::on_ref` で参照 1 件あたり O(fanout) 件の `TypedCallerMap`
-    // への push が発生し、`global_maps` が処理時間に線形蓄積する。
-    // Xojo のような case-insensitive 言語 + 汎用名 (`e` / `row` / `setting` 等) で
-    // 顕著で、CI で 30GB OOM の主因となっていた。一定数を超えるシンボルは曖昧と
-    // 判断して cross-file 解析対象から除外する。
-    let max_fanout = max_fanout_per_symbol();
-    if max_fanout > 0 {
-        for fcs in &mut sym_to_fc {
-            if fcs.len() > max_fanout {
-                fcs.clear();
             }
         }
     }
