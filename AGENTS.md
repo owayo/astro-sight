@@ -78,3 +78,32 @@ make help     # 全ターゲット表示
 - tree-sitter-toml 0.20 は旧 API のため、extern C ブリッジで対応
 - tree-sitter 0.26 では Point/Range のフィールドがメソッドではなくパブリックフィールド
 - QueryMatches は StreamingIterator（標準 Iterator ではない）
+
+## CI 言語 (Xojo 等) の OOM 対策（v26.5.108 で導入、load-bearing fix）
+
+### 背景
+case-insensitive な GLR バックトラッキング系言語（現状 Xojo のみ）の `parse_file` は、約 10MB の LR table をロードした瞬間から **約 1GB/秒で線形にメモリが膨張**する。実測 (実 Xojo project の `.xojo_code` 4 行 diff, 5GB watchdog 付き):
+
+| 条件 | Peak RSS | 経過 | 結果 |
+|---|---:|---:|---|
+| skip ON (既定) | 12 MB | 0.1s | OK |
+| `ASTRO_SIGHT_FORCE_CI_LANG_IMPACT=1` で skip 解除 | 5,221 MB | 5.1s | **5GB watchdog で SIGKILL**（防がなければ 30GB+ で OOMKilled） |
+
+CI 環境で Xojo 1 ファイル変更だけで 30GB OOMKilled が発生した経緯あり。
+
+### 実装方針
+review / context / impact / dead_code の各フェーズで、diff の **全 changed file が case-insensitive 言語のみ**の場合は parse を起動せずに空結果を返す:
+- `commands.rs:951` 周辺: review 内の context フェーズと api_changes フェーズ
+- `commands.rs:1900` 周辺: dead_code 検出
+- `engine/impact/pass2.rs:67` 周辺: impact 分析の pass2
+
+### 強制無効化（デバッグ用）
+従来挙動に戻したい場合のみ次の env を指定。本番 CI では絶対に設定しない:
+- `ASTRO_SIGHT_FORCE_CI_LANG_IMPACT=1` — context/api_changes/impact pass2 で skip 解除
+- `ASTRO_SIGHT_FORCE_CI_LANG_DEAD_CODE=1` — dead_code で skip 解除
+
+### tree-sitter-xojo 側の改善は補助
+tree-sitter-xojo の grammar 削減（直近: e14beb6 で parser.c -3.10%, STATE -4.9%）は parse 時の絶対消費量を僅かに下げるだけで、**OOM 防止効果は無い**（実測で確認済み）。CI 復旧の load-bearing fix はあくまで本リポジトリの skip 機構。tree-sitter-xojo 側での解決追求は時間の無駄なので避ける。
+
+### 言語追加時の注意
+新たな case-insensitive GLR 系 grammar を `language.rs` の `LangId::is_case_insensitive` に追加すると自動で skip 対象になる。スキップ範囲が想定より広い場合は `is_case_insensitive` の判定境界を見直す。
