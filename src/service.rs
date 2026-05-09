@@ -532,27 +532,17 @@ impl AppService {
         Ok(())
     }
 
-    /// git 履歴から共変更パターンを解析する。
+    /// blame ベースの共変更パターンを解析する。
     pub fn analyze_cochange(&self, dir: &str, opts: &CoChangeOptions) -> Result<CoChangeResult> {
         debug!(
             dir = dir,
-            lookback = opts.lookback,
+            source_files = opts.source_files.len(),
+            base = ?opts.base,
             min_confidence = opts.min_confidence,
             min_samples = opts.min_samples,
             max_files_per_commit = opts.max_files_per_commit,
-            bounded_by_merge_base = opts.bounded_by_merge_base,
-            skip_deleted_files = opts.skip_deleted_files,
-            filter_file = ?opts.filter_file,
             "analyze_cochange called"
         );
-        // パラメータを検証する。
-        const MAX_LOOKBACK: usize = 10_000;
-        if opts.lookback == 0 || opts.lookback > MAX_LOOKBACK {
-            bail!(AstroError::new(
-                ErrorCode::InvalidRequest,
-                format!("lookback must be 1..={MAX_LOOKBACK}, got {}", opts.lookback),
-            ));
-        }
         if !opts.min_confidence.is_finite() || !(0.0..=1.0).contains(&opts.min_confidence) {
             bail!(AstroError::new(
                 ErrorCode::InvalidRequest,
@@ -572,14 +562,9 @@ impl AppService {
         let canonical_dir = self.validate_dir(dir)?;
         let dir_str = canonical_dir.to_string_lossy();
 
-        let result = if opts.blame {
-            crate::engine::cochange::analyze_cochange_blame(&dir_str, opts)?
-        } else {
-            crate::engine::cochange::analyze_cochange(&dir_str, opts)?
-        };
+        let result = crate::engine::cochange::analyze_cochange(&dir_str, opts)?;
         debug!(
             dir = dir,
-            blame = opts.blame,
             entries = result.entries.len(),
             commits_analyzed = result.commits_analyzed,
             "analyze_cochange completed"

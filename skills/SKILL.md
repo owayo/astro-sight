@@ -78,8 +78,8 @@ astro-sight ast --path <file> --line <n> --col <n>
 # 11. Repeated AST/text checks
 astro-sight lint --path <file> --rules rules.yaml
 
-# 12. Check change hotspots
-astro-sight cochange --dir . --file src/service.rs
+# 12. Check co-change pairs around the current diff
+astro-sight cochange --dir . --git --base HEAD~5
 
 # 13. Visualize call flow
 astro-sight sequence --path src/main.rs --function main
@@ -112,7 +112,7 @@ echo '{"command":"refs","name":"Sym1","dir":"."}
 - Need the **exact AST node** at a cursor/range, or want to confirm whether a parse error is structural? → `astro-sight ast --path <file> --line <n> --col <n>`
 - Need a **single JSON review** that combines impact, cochange, API surface changes, and dead symbols? → `astro-sight review --dir . --git`
 - Need to check a **repeated rule** like banned APIs, required patterns, or AST-based policy? → `astro-sight lint --path <file> --rules rules.yaml` before writing an ad-hoc text scan
-- Need to predict **co-change fallout** before missing a related file? → `astro-sight cochange --dir . --file <file>` before guessing from filenames alone
+- Need to predict **co-change fallout** before missing a related file? → `astro-sight cochange --dir . --git --base <rev>` (or `--paths <file>`) before guessing from filenames alone
 - Need to explain a non-trivial call path after `calls` identifies the target? → `astro-sight sequence --path <file> --function <name>`
 - Reviewing a multi-commit branch? → pass the same `--base <rev>` to `review`, `context`, or `impact`; `review --git --base <rev>` also uses that base for blame-backed `missing_cochanges`.
 
@@ -274,15 +274,31 @@ Output: `diagram` (Mermaid text), `participants` (ordered list).
 
 ### `cochange` — Co-change Analysis
 
-Finds files that frequently change together in git history.
+Blame-based co-change analysis. Starts from a set of source files (auto-derived
+from `git diff` or specified explicitly), runs `git blame` on their changed
+lines to obtain the latest-modifying commits, then aggregates co-occurring
+files from each commit's diff-tree.
 
 ```bash
-astro-sight cochange --dir .
-astro-sight cochange --dir . --file src/service.rs
-astro-sight cochange --dir . --lookback 200 --min-confidence 0.3
+# Auto-derive sources from the current diff
+astro-sight cochange --dir . --git --base HEAD~5
+
+# Specify source files explicitly
+astro-sight cochange --dir . --paths src/service.rs
+
+# Track renames/copies for refactor-heavy histories
+astro-sight cochange --dir . --git --base HEAD~10 --rename --copy
+
+# Tune Bayesian smoothing (default: alpha=1.0, beta=4.0)
+astro-sight cochange --dir . --git --base HEAD~5 --no-smoothing
 ```
 
-Output: `entries` array with `file_a`, `file_b`, `confidence`.
+Output: `entries` array with `file_a`, `file_b`, `co_changes`, `confidence`,
+`denominator` (= |C|), and `score` (smoothed). `commits_analyzed` reports |C|.
+
+Requires `--git` or `--paths` / `--paths-file`. Default exclusions skip
+`vendor/`, `node_modules/`, `dist/`, lock files, and minified assets when
+collecting source files via `--git`; explicit `--paths` are kept as-is.
 
 ### `ast` — AST Fragment Extraction
 
@@ -389,7 +405,7 @@ git diff origin/main | astro-sight context --dir .
 
 ### "What changed together with this file recently?"
 ```bash
-astro-sight cochange --dir . --file src/service.rs
+astro-sight cochange --dir . --paths src/service.rs
 ```
 
 ### "Show me the call flow visually"

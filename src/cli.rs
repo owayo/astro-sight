@@ -256,114 +256,93 @@ pub enum Commands {
         function: Option<String>,
     },
 
-    /// Analyze co-change patterns from git history
+    /// Analyze blame-based co-change patterns for a diff or specified source files.
     Cochange {
         /// Git repository directory
         #[arg(short, long, default_value = ".")]
         dir: String,
 
-        /// Number of recent commits to analyze (lookback mode only, default: 200)
-        #[arg(short, long, default_value = "200")]
-        lookback: usize,
+        /// Use git diff to derive source files
+        #[arg(long)]
+        git: bool,
 
-        /// Minimum confidence threshold (0.0 to 1.0).
-        /// lookback mode default: 0.7. blame mode default: 0.3 (denominator semantics differ).
-        #[arg(short, long)]
-        min_confidence: Option<f64>,
+        /// Base revision for diff/blame (default: HEAD~1)
+        #[arg(long)]
+        base: Option<String>,
+
+        /// Comma-separated source file paths (relative to repo root)
+        #[arg(long)]
+        paths: Option<String>,
+
+        /// File containing one source path per line
+        #[arg(long)]
+        paths_file: Option<String>,
+
+        /// Minimum confidence threshold (0.0 to 1.0). Default: 0.3.
+        #[arg(short, long, default_value = "0.3")]
+        min_confidence: f64,
 
         /// Minimum shared commit count required per pair (default: 2)
         #[arg(long, default_value = "2")]
         min_samples: usize,
 
-        /// Exclude commits touching more files than this threshold (default: 30)
+        /// Skip co-change counting for commits touching more files than this
+        /// threshold (default: 30; defends against squash-merge / bulk commits).
         #[arg(long, default_value = "30")]
         max_files_per_commit: usize,
 
-        /// Disable merge-base history bounding (lookback mode only, default: enabled)
-        #[arg(long)]
-        no_merge_base: bool,
-
-        /// Include pairs where either file is absent from HEAD (lookback mode only, default: excluded)
-        #[arg(long)]
-        include_deleted: bool,
-
-        /// Filter to pairs containing this file (lookback mode only)
-        #[arg(short, long)]
-        file: Option<String>,
-
-        /// Use blame-based mode: derive co-change from `git blame` of changed lines
-        /// in source files (requires --git, --paths, or --paths-file)
-        #[arg(long)]
-        blame: bool,
-
-        /// (blame mode) Use git diff to derive source files
-        #[arg(long)]
-        git: bool,
-
-        /// (blame mode) Base revision for diff/blame (default: HEAD~1)
-        #[arg(long)]
-        base: Option<String>,
-
-        /// (blame mode) Comma-separated source file paths (relative to repo root)
-        #[arg(long)]
-        paths: Option<String>,
-
-        /// (blame mode) File containing one source path per line
-        #[arg(long)]
-        paths_file: Option<String>,
-
-        /// (blame mode) Exclude candidate paths matching this glob (repeatable).
+        /// Exclude candidate paths matching this glob (repeatable).
         /// Built-in defaults already exclude vendor/, node_modules/, lock files, minified assets.
         #[arg(long = "exclude-glob")]
         exclude_globs: Vec<String>,
 
-        /// (blame mode) Maximum number of source files allowed (0 = unlimited).
+        /// Maximum number of source files allowed (0 = unlimited).
         /// Exceeding this limit aborts with InvalidRequest to prevent runaway blame cost.
         #[arg(long, default_value = "0")]
         max_source_files: usize,
 
-        /// (blame mode) Track file rename/move via `git blame -M`.
+        /// Track file rename/move via `git blame -M`.
         /// Slightly slower but recovers history across rename boundaries.
         #[arg(long)]
         rename: bool,
 
-        /// (blame mode) Detect file copy via `git blame -C` (heavier than `--rename`).
+        /// Detect file copy via `git blame -C` (heavier than `--rename`).
         /// Useful for repositories with frequent copy-paste / file-split refactors.
         #[arg(long)]
         copy: bool,
 
-        /// (blame mode) Drop merge commits from the blame commit set before counting co-changes.
+        /// Drop merge commits from the blame commit set before counting co-changes.
         /// Useful when the repository has many squash-merge style merges that bloat diff-tree output.
         #[arg(long)]
         ignore_merges: bool,
 
-        /// (blame mode) Maximum number of blame commits allowed in the SHA set (0 = unlimited).
+        /// Maximum number of blame commits allowed in the SHA set (0 = unlimited).
         /// Defends against pathological blame fan-out by aborting before the diff-tree phase.
         #[arg(long, default_value = "0")]
         max_blame_commits: usize,
 
-        /// (blame mode) Overall timeout in seconds (0 = unlimited).
+        /// Overall timeout in seconds (0 = unlimited).
         /// Checked at each phase entry; in-flight subprocesses are not killed
         /// (the most recent invocation completes before the timeout fires).
         #[arg(long, default_value = "0")]
         timeout_secs: u64,
 
-        /// (blame mode) Disable Bayesian smoothing.
+        /// Disable Bayesian smoothing.
         /// By default smoothing is enabled to suppress small-sample over-confidence
         /// (e.g. co=1/denom=1 yielding 1.00). Use this flag to fall back to raw co/denom ranking.
         #[arg(long)]
         no_smoothing: bool,
 
-        /// (blame mode) Bayesian smoothing alpha (success prior, default 1.0).
+        /// Bayesian smoothing alpha (success prior, default 1.0).
         /// score = (co + alpha) / (denom + alpha + beta).
         #[arg(long, default_value = "1.0")]
         smoothing_alpha: f64,
 
-        /// (blame mode) Bayesian smoothing beta (failure prior, default 4.0).
+        /// Bayesian smoothing beta (failure prior, default 4.0).
         #[arg(long, default_value = "4.0")]
         smoothing_beta: f64,
 
-        /// (blame mode) Skip source files whose blame commit set is smaller than this.
+        /// Skip source files whose blame commit set is smaller than this.
         /// 0/1 = disabled (legacy behaviour). Recommended: 2.
         #[arg(long, default_value = "1")]
         min_denominator: usize,

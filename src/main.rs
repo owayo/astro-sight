@@ -351,18 +351,13 @@ fn run(cli: Cli) -> Result<()> {
         ),
         Commands::Cochange {
             dir,
-            lookback,
-            min_confidence,
-            min_samples,
-            max_files_per_commit,
-            no_merge_base,
-            include_deleted,
-            file,
-            blame,
             git,
             base,
             paths,
             paths_file,
+            min_confidence,
+            min_samples,
+            max_files_per_commit,
             exclude_globs,
             max_source_files,
             rename,
@@ -376,30 +371,20 @@ fn run(cli: Cli) -> Result<()> {
             min_denominator,
             per_source_limit,
         } => {
-            // 既定 min_confidence: lookback 0.7 / blame 0.3 (分母セマンティクスが異なるため)
-            let resolved_min_confidence = min_confidence.unwrap_or(if blame { 0.3 } else { 0.7 });
-            let source_files = if blame {
-                astro_sight::commands::resolve_blame_source_files(
-                    &dir,
-                    git,
-                    base.as_deref(),
-                    paths.as_deref(),
-                    paths_file.as_deref(),
-                )?
-            } else {
-                Vec::new()
-            };
+            let source_files = astro_sight::commands::resolve_blame_source_files(
+                &dir,
+                git,
+                base.as_deref(),
+                paths.as_deref(),
+                paths_file.as_deref(),
+                &exclude_globs,
+            )?;
             let opts = astro_sight::models::cochange::CoChangeOptions {
-                lookback,
-                min_confidence: resolved_min_confidence,
-                min_samples,
-                max_files_per_commit,
-                bounded_by_merge_base: !no_merge_base,
-                skip_deleted_files: !include_deleted,
-                filter_file: file,
-                blame,
                 source_files,
                 base,
+                min_confidence,
+                min_samples,
+                max_files_per_commit,
                 exclude_globs,
                 max_source_files,
                 rename,

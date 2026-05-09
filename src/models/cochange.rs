@@ -5,35 +5,28 @@ use serde::{Deserialize, Serialize};
 pub struct CoChangeEntry {
     pub file_a: String,
     pub file_b: String,
-    /// Number of commits where both files changed
+    /// Number of commits where both files changed.
     pub co_changes: usize,
-    /// Total changes for file_a
+    /// Total changes for file_a.
     pub total_changes_a: usize,
-    /// Total changes for file_b
+    /// Total changes for file_b.
     pub total_changes_b: usize,
-    /// Confidence score.
-    /// - lookback モード: `co_changes / max(total_a, total_b)`
-    /// - blame モード: `co_changes / |C|` (|C| = blame で得たユニークコミット数)
+    /// Confidence score: `co_changes / |C|` (|C| = blame で得たユニークコミット数)。
     pub confidence: f64,
-    /// blame モードでの分母 (= |C|: 起点ファイル変更行に関わる過去コミット集合の大きさ)。
-    /// lookback モードでは None。
+    /// 起点ファイル変更行に関わる過去コミット集合 |C| の大きさ。
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub denominator: Option<usize>,
-    /// blame モードでの smoothed ranking score。
+    /// Smoothed ranking score。
     ///
     /// - 既定 (smoothing 有効): `(co + α) / (denom + α + β)` で小サンプルを過信しない
     /// - `--no-smoothing` 指定時: `confidence` と同値 (互換のため必ず Some)
-    ///
-    /// lookback モードでは None。
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub score: Option<f64>,
 }
 
 impl CoChangeEntry {
-    /// ランキング/フィルタに使う値を返す。blame モードで smoothing 有効なら `score`、
-    /// 無効または lookback モードなら raw `confidence`。
-    /// `score` が `Some` でも `disable_smoothing` 時は呼び出し側が `false` を渡すことで
-    /// raw 値に切り替わる。
+    /// ランキング/フィルタに使う値を返す。smoothing 有効なら `score`、
+    /// 無効なら raw `confidence`。
     pub fn ranking_value(&self, smoothing_on: bool) -> f64 {
         if smoothing_on {
             self.score.unwrap_or(self.confidence)
@@ -47,84 +40,65 @@ impl CoChangeEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoChangeResult {
     pub entries: Vec<CoChangeEntry>,
-    /// lookback モード: 走査コミット数。blame モード: |C|。
+    /// blame で得たユニークコミット集合 |C| のサイズ。
     pub commits_analyzed: usize,
 }
 
-/// Options controlling co-change analysis behaviour.
+/// Options controlling blame-based co-change analysis.
+///
+/// astro-sight v26.6.0 で旧 lookback モード (`git log` ベース) は廃止され、
+/// blame モード (起点ファイルの変更行に `git blame` を当て、最終修正コミット
+/// 集合から共起ファイルを集計する) のみがサポートされる。
 #[derive(Debug, Clone)]
 pub struct CoChangeOptions {
-    /// Maximum number of commits to walk when computing statistics. (lookback モードのみ)
-    pub lookback: usize,
-    /// Minimum confidence (ratio) required for a pair to be emitted (0.0..=1.0).
-    pub min_confidence: f64,
-    /// Minimum number of shared commits required for a pair to be emitted.
-    pub min_samples: usize,
-    /// Commits touching more files than this threshold are excluded from the
-    /// statistics (initial dumps, bulk refactors, generated artefacts).
-    pub max_files_per_commit: usize,
-    /// Limit the commit walk to history reachable from
-    /// `merge-base(HEAD, <default branch>)`. Falls back to the full walk when
-    /// no default branch can be inferred. (lookback モードのみ)
-    pub bounded_by_merge_base: bool,
-    /// Drop pairs when either file is missing from the current `HEAD` tree
-    /// (renamed/deleted files). (lookback モードのみ)
-    pub skip_deleted_files: bool,
-    /// Optional filter: only keep pairs that include this file. (lookback モードのみ)
-    pub filter_file: Option<String>,
-    /// blame モードを有効化する。
-    pub blame: bool,
-    /// blame モードでの起点ファイル (リポジトリ相対パス)。
+    /// 起点ファイル (リポジトリ相対パス)。`--git` 経由で diff から自動収集するか
+    /// `--paths` / `--paths-file` で明示指定する。
     pub source_files: Vec<String>,
-    /// blame モードでの基準 revision (None のとき "HEAD~1" を既定とする)。
+    /// 基準 revision (None のとき `HEAD~1` を既定とする)。
     pub base: Option<String>,
-    /// blame モードで候補ファイルから除外する glob パターン。
+    /// pair を出すために必要な最小 confidence (0.0..=1.0)。
+    pub min_confidence: f64,
+    /// pair を出すために必要な最小 co_changes 数。
+    pub min_samples: usize,
+    /// 候補ファイルから除外する glob パターン (BLAME_DEFAULT_EXCLUDE_GLOBS と OR で適用)。
     pub exclude_globs: Vec<String>,
-    /// blame モードでの起点ファイル数の上限。0 = 無制限。
-    /// 上限超過時は InvalidRequest エラーで停止し、暴走を防ぐ。
+    /// 起点ファイル数の上限。0 = 無制限。超過時は InvalidRequest で停止する。
     pub max_source_files: usize,
-    /// blame モードで `git blame -M` を有効化する (リネーム/移動を追跡)。
+    /// 1 コミットあたりの変更ファイル数の上限。これを超えるコミット (大量生成
+    /// / squash-merge 等) は共起カウントから除外する。
+    pub max_files_per_commit: usize,
+    /// `git blame -M` でファイル内移動 + ファイル間 rename を追跡する。
     pub rename: bool,
-    /// blame モードで `git blame -C` を有効化する (ファイル間コピー検出、`-M` より重い)。
+    /// `git blame -C` でファイル間コピーを検出する (`-M` より重い)。
     pub copy: bool,
-    /// blame モードで取得した SHA 集合からマージコミットを除外する。
+    /// blame で取得した SHA 集合からマージコミットを除外する。
     pub ignore_merges: bool,
-    /// blame モードで集めた SHA 集合の上限。0 = 無制限。
-    /// 上限超過時は InvalidRequest エラーで停止し、diff-tree 爆発を防ぐ。
+    /// blame SHA 集合のサイズ上限。0 = 無制限。超過時は InvalidRequest で停止する。
     pub max_blame_commits: usize,
-    /// blame モードの解析全体のタイムアウト (秒)。0 = 無制限。
-    /// 各 Phase 入口で経過時間をチェックし、超過時 InvalidRequest で停止する。
-    /// 既に走った subprocess は kill しないため、実際の経過は若干オーバーする可能性がある。
+    /// 解析全体のタイムアウト (秒)。0 = 無制限。
     pub timeout_secs: u64,
-    /// blame モードの Bayesian smoothing α (success prior)。既定 1.0。
-    /// `score = (co + α) / (denom + α + β)` で小サンプル過信を抑える。
+    /// Bayesian smoothing α (success prior)。`score = (co + α) / (denom + α + β)`。
     pub smoothing_alpha: f64,
-    /// blame モードの Bayesian smoothing β (failure prior)。既定 4.0。
+    /// Bayesian smoothing β (failure prior)。
     pub smoothing_beta: f64,
-    /// `--no-smoothing` 相当。true なら smoothing を無効化し score = confidence (raw) を使う。
+    /// `--no-smoothing` 相当。true なら smoothing を無効化し score = confidence を使う。
     pub disable_smoothing: bool,
-    /// blame モードの起点 blame 集合サイズの下限。`< N` の起点はスキップ。
-    /// 0 / 1 = 既存挙動 (フィルタ無効)。推奨値 2。
+    /// 起点 blame 集合サイズの下限。`< N` の起点はスキップ。0 / 1 = 既定 (フィルタ無効)。
     pub min_denominator: usize,
-    /// blame モードで起点ごとの候補上位 N 件に絞る。0 = 無制限。推奨値 10。
+    /// 起点ごとの候補上位 N 件に絞る。0 = 無制限。
     pub per_source_limit: usize,
 }
 
 impl Default for CoChangeOptions {
     fn default() -> Self {
         Self {
-            lookback: 200,
-            min_confidence: 0.7,
-            min_samples: 2,
-            max_files_per_commit: 30,
-            bounded_by_merge_base: true,
-            skip_deleted_files: true,
-            filter_file: None,
-            blame: false,
             source_files: Vec::new(),
             base: None,
+            min_confidence: 0.3,
+            min_samples: 2,
             exclude_globs: Vec::new(),
             max_source_files: 0,
+            max_files_per_commit: 30,
             rename: false,
             copy: false,
             ignore_merges: false,

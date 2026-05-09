@@ -41,27 +41,21 @@ pub struct AstgenRequest {
     /// Lint rules (for lint command via session)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rules: Option<Vec<crate::models::lint::Rule>>,
-    /// Number of recent commits for co-change analysis
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub lookback: Option<usize>,
-    /// Minimum confidence for co-change analysis
+    /// Minimum confidence for co-change analysis (blame mode)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_confidence: Option<f64>,
-    /// Minimum shared commit count for co-change analysis
+    /// Minimum shared commit count for co-change analysis (blame mode)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_samples: Option<usize>,
-    /// Commits touching more files than this threshold are skipped
+    /// Commits touching more files than this threshold are skipped (blame mode)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_files_per_commit: Option<usize>,
-    /// Limit history to commits reachable from merge-base HEAD <default-branch>
+    /// Source files for blame-based co-change analysis (relative to repo root)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bounded_by_merge_base: Option<bool>,
-    /// Drop pairs where either file is missing from HEAD
+    pub source_files: Option<Vec<String>>,
+    /// Base revision for blame-based co-change analysis (defaults to HEAD~1)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub skip_deleted_files: Option<bool>,
-    /// File filter for co-change analysis
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub file: Option<String>,
+    pub base: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

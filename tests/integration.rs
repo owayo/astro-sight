@@ -1446,89 +1446,57 @@ fn lint_with_no_query_or_pattern_reports_warning() {
     let _ = std::fs::remove_file(&tmp);
 }
 
-// ---- Co-change analysis tests ----
+// ---- Co-change analysis tests (blame mode) ----
 
 #[test]
-fn cochange_on_own_repo() {
+fn cochange_blame_with_git_diff_runs() {
+    // 自リポでの blame モード実行が JSON を返すことを確認する。
+    // 直近 diff が空 (削除のみ等) の場合は entries 空・commits_analyzed=0 でも OK。
     let output = cargo_bin()
         .args([
             "cochange",
             "--dir",
             ".",
-            "--lookback",
-            "50",
+            "--git",
+            "--base",
+            "HEAD~5",
             "--min-confidence",
             "0.1",
         ])
         .output()
         .expect("failed to run");
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    assert!(json["commits_analyzed"].as_u64().unwrap() > 0);
     assert!(json["entries"].as_array().is_some());
+    assert!(json["commits_analyzed"].as_u64().is_some());
 }
 
 #[test]
-fn cochange_with_file_filter() {
+fn cochange_rejects_missing_source_files() {
+    // --git / --paths のいずれも指定しない場合は InvalidRequest で拒否される。
     let output = cargo_bin()
-        .args([
-            "cochange",
-            "--dir",
-            ".",
-            "--lookback",
-            "50",
-            "--min-confidence",
-            "0.1",
-            "--file",
-            "src/main.rs",
-        ])
-        .output()
-        .expect("failed to run");
-    assert!(output.status.success());
-
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    let entries = json["entries"].as_array().unwrap();
-    // All entries should contain src/main.rs
-    for entry in entries {
-        let a = entry["file_a"].as_str().unwrap();
-        let b = entry["file_b"].as_str().unwrap();
-        assert!(
-            a == "src/main.rs" || b == "src/main.rs",
-            "Entry should contain src/main.rs: {a} / {b}"
-        );
-    }
-}
-
-#[test]
-fn cochange_rejects_lookback_zero() {
-    let output = cargo_bin()
-        .args(["cochange", "--dir", ".", "--lookback", "0"])
+        .args(["cochange", "--dir", "."])
         .output()
         .expect("failed to run");
     assert!(!output.status.success());
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let msg = json["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        json["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("lookback")
+        msg.contains("--git") || msg.contains("--paths") || msg.contains("source files"),
+        "expected source-file requirement message, got: {msg}"
     );
 }
 
 #[test]
 fn cochange_rejects_invalid_confidence() {
     let output = cargo_bin()
-        .args([
-            "cochange",
-            "--dir",
-            ".",
-            "--lookback",
-            "10",
-            "--min-confidence",
-            "1.5",
-        ])
+        .args(["cochange", "--dir", ".", "--git", "--min-confidence", "1.5"])
         .output()
         .expect("failed to run");
     assert!(!output.status.success());
@@ -2921,69 +2889,15 @@ fn impact_rejects_path_traversal_in_diff() {
     );
 }
 
-// ---- cochange MAX_FILES_PER_COMMIT スキップテスト ----
-
-#[test]
-fn cochange_skips_large_commits() {
-    // MAX_FILES_PER_COMMIT (100) を超えるコミットは pair 集計から除外されることを検証。
-    // git リポジトリを模擬するため、実際の git repo を使用し lookback=1 で確認。
-    // ただし通常のコミットは 100 ファイル未満なのでスキップされない。
-    // ここでは lookback=1 + 小コミットで pairs が生成されることを確認し、
-    // 対称的に lookback が十分大きいとき結果が得られることを確認。
-    let output = cargo_bin()
-        .args([
-            "cochange",
-            "--dir",
-            ".",
-            "--lookback",
-            "1",
-            "--min-confidence",
-            "0.0",
-        ])
-        .output()
-        .expect("failed to run");
-    assert!(output.status.success());
-
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    // lookback=1 でも commits_analyzed >= 0 であること
-    assert!(json["commits_analyzed"].as_u64().is_some());
-    assert!(json["entries"].as_array().is_some());
-}
-
-#[test]
-fn cochange_rejects_lookback_exceeding_max() {
-    // lookback > 10000 は拒否される
-    let output = cargo_bin()
-        .args(["cochange", "--dir", ".", "--lookback", "10001"])
-        .output()
-        .expect("failed to run");
-    assert!(!output.status.success());
-
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    assert!(
-        json["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("lookback")
-    );
-}
+// ---- cochange 入力検証テスト ----
 
 #[test]
 fn cochange_rejects_nan_confidence() {
-    // NaN は拒否される
+    // NaN は拒否される (clap または service 層で)
     let output = cargo_bin()
-        .args([
-            "cochange",
-            "--dir",
-            ".",
-            "--lookback",
-            "10",
-            "--min-confidence",
-            "NaN",
-        ])
+        .args(["cochange", "--dir", ".", "--git", "--min-confidence", "NaN"])
         .output()
         .expect("failed to run");
-    // clap がパースエラーを出すか、サービス層が拒否するか
     assert!(!output.status.success());
 }
 

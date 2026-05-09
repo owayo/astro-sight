@@ -136,10 +136,12 @@ pub struct SequenceDiagramParams {
 pub struct CochangeAnalyzeParams {
     /// Git repository directory
     pub dir: String,
-    /// Number of recent commits to analyze (default: 200)
-    #[serde(default = "default_lookback")]
-    pub lookback: usize,
-    /// Minimum confidence threshold (default: 0.7)
+    /// Source files for blame-based co-change analysis (relative to repo root)
+    pub source_files: Vec<String>,
+    /// Base revision for diff/blame (default: HEAD~1)
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Minimum confidence threshold (default: 0.3)
     #[serde(default = "default_min_confidence")]
     pub min_confidence: f64,
     /// Minimum shared commit count per pair (default: 2)
@@ -148,23 +150,10 @@ pub struct CochangeAnalyzeParams {
     /// Commits touching more files than this threshold are skipped (default: 30)
     #[serde(default = "default_max_files_per_commit")]
     pub max_files_per_commit: usize,
-    /// Limit history to commits reachable from merge-base HEAD <default-branch> (default: true)
-    #[serde(default = "default_bool_true")]
-    pub bounded_by_merge_base: bool,
-    /// Drop pairs where either file is missing from HEAD (default: true)
-    #[serde(default = "default_bool_true")]
-    pub skip_deleted_files: bool,
-    /// Filter to pairs containing this file
-    #[serde(default)]
-    pub file: Option<String>,
-}
-
-fn default_lookback() -> usize {
-    200
 }
 
 fn default_min_confidence() -> f64 {
-    0.7
+    0.3
 }
 
 fn default_min_samples() -> usize {
@@ -173,10 +162,6 @@ fn default_min_samples() -> usize {
 
 fn default_max_files_per_commit() -> usize {
     30
-}
-
-fn default_bool_true() -> bool {
-    true
 }
 
 // ---------------------------------------------------------------------------
@@ -393,14 +378,20 @@ impl AstroSightServer {
         params: Parameters<CochangeAnalyzeParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
+        if p.source_files.is_empty() {
+            let err: anyhow::Error = crate::error::AstroError::new(
+                crate::error::ErrorCode::InvalidRequest,
+                "cochange_analyze requires source_files".to_string(),
+            )
+            .into();
+            return Self::to_tool_result::<crate::models::cochange::CoChangeResult>(Err(err));
+        }
         let opts = crate::models::cochange::CoChangeOptions {
-            lookback: p.lookback,
+            source_files: p.source_files,
+            base: p.base,
             min_confidence: p.min_confidence,
             min_samples: p.min_samples,
             max_files_per_commit: p.max_files_per_commit,
-            bounded_by_merge_base: p.bounded_by_merge_base,
-            skip_deleted_files: p.skip_deleted_files,
-            filter_file: p.file,
             ..Default::default()
         };
         Self::to_tool_result(self.service.analyze_cochange(&p.dir, &opts))

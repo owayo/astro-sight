@@ -475,15 +475,13 @@ pub fn cmd_cochange(
     info!(
         command = "cochange",
         dir = dir,
-        blame = opts.blame,
         source_files = opts.source_files.len(),
-        lookback = opts.lookback,
+        base = ?opts.base,
         min_confidence = opts.min_confidence,
         min_samples = opts.min_samples,
         max_files_per_commit = opts.max_files_per_commit,
-        bounded_by_merge_base = opts.bounded_by_merge_base,
-        skip_deleted_files = opts.skip_deleted_files,
-        file = ?opts.filter_file,
+        rename = opts.rename,
+        ignore_merges = opts.ignore_merges,
         output_bytes = output.len(),
         "command completed"
     );
@@ -494,12 +492,18 @@ pub fn cmd_cochange(
 /// blame モード用の起点ファイル解決。
 /// 優先順位: --paths-file > --paths > --git。複数指定時は明示の方を採用 (--git は追加扱い)。
 /// いずれも空なら InvalidRequest エラー。
+///
+/// `user_exclude_globs` は `BLAME_DEFAULT_EXCLUDE_GLOBS` と合わせ、`--git` 経由で
+/// diff から自動収集した起点ファイルに対してのみ適用する。`--paths` / `--paths-file`
+/// で明示指定された起点はユーザー意図を尊重してフィルタしない (lock ファイル等を
+/// 意図的に分析したいケースを想定)。
 pub fn resolve_blame_source_files(
     dir: &str,
     git: bool,
     base: Option<&str>,
     paths: Option<&str>,
     paths_file: Option<&str>,
+    user_exclude_globs: &[String],
 ) -> Result<Vec<String>> {
     use std::collections::BTreeSet;
 
@@ -547,11 +551,18 @@ pub fn resolve_blame_source_files(
                 format!("git diff failed: {stderr}"),
             ));
         }
+        // `--git` 経由は自動収集なので生成物・ロック類を除外する。
+        // 明示指定の `--paths` / `--paths-file` には適用しない。
+        let matcher = crate::engine::cochange::CoChangeExclude::build(user_exclude_globs)?;
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             let p = line.trim();
-            if !p.is_empty() {
-                set.insert(p.to_string());
+            if p.is_empty() {
+                continue;
             }
+            if matcher.is_match(p) {
+                continue;
+            }
+            set.insert(p.to_string());
         }
     }
 
@@ -1416,10 +1427,8 @@ fn detect_missing_cochanges(
     // review でも同じ変更範囲を対象にする。base 解決失敗や git 不在は engine 側で
     // 空集合を返すので最終的に Vec::new() に落ちる。
     let opts = CoChangeOptions {
-        blame: true,
         source_files,
         base: base.map(str::to_string),
-        // review 経由では blame モード既定の閾値感覚に合わせる
         min_confidence,
         ..CoChangeOptions::default()
     };
@@ -3547,20 +3556,21 @@ pub fn handle_request(
         Command::Cochange => {
             let dir = req.dir.as_deref().unwrap_or(".");
             let defaults = CoChangeOptions::default();
+            let source_files = req.source_files.clone().unwrap_or_default();
+            if source_files.is_empty() {
+                bail!(crate::error::AstroError::new(
+                    crate::error::ErrorCode::InvalidRequest,
+                    "cochange (blame mode) requires source_files".to_string(),
+                ));
+            }
             let opts = CoChangeOptions {
-                lookback: req.lookback.unwrap_or(defaults.lookback),
+                source_files,
+                base: req.base.clone(),
                 min_confidence: req.min_confidence.unwrap_or(defaults.min_confidence),
                 min_samples: req.min_samples.unwrap_or(defaults.min_samples),
                 max_files_per_commit: req
                     .max_files_per_commit
                     .unwrap_or(defaults.max_files_per_commit),
-                bounded_by_merge_base: req
-                    .bounded_by_merge_base
-                    .unwrap_or(defaults.bounded_by_merge_base),
-                skip_deleted_files: req
-                    .skip_deleted_files
-                    .unwrap_or(defaults.skip_deleted_files),
-                filter_file: req.file.clone(),
                 ..defaults
             };
             let result = service.analyze_cochange(dir, &opts)?;
@@ -6769,6 +6779,110 @@ def new_public_api():
         assert!(
             missing.iter().any(|m| m.file == "b.rs"),
             "review の base が blame 解析に渡らず HEAD~1 のみを見ると b.rs を見落とす。got: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_blame_source_files_filters_default_excludes_for_git_only() {
+        // --git 経由で diff から起点ファイルを取得する場合、
+        // BLAME_DEFAULT_EXCLUDE_GLOBS に該当する生成物 (dist/, *.lock) は除外される。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        git_commit_files(repo, &[("foo.txt", "v1")], "initial");
+        git_commit_files(
+            repo,
+            &[
+                ("foo.txt", "v2"),
+                ("dist/main.js", "minified"),
+                ("Cargo.lock", "lockfile"),
+                ("Angular/www/dist/bundle.js", "minified"),
+            ],
+            "next",
+        );
+
+        let result = resolve_blame_source_files(
+            repo.to_str().expect("utf-8 path"),
+            true,
+            Some("HEAD~1"),
+            None,
+            None,
+            &[],
+        )
+        .expect("resolve");
+
+        assert!(result.contains(&"foo.txt".to_string()), "got: {result:?}");
+        assert!(
+            !result.iter().any(|p| p == "dist/main.js"),
+            "dist/main.js は BLAME_DEFAULT_EXCLUDE_GLOBS で除外されるはず。got: {result:?}"
+        );
+        assert!(
+            !result.iter().any(|p| p == "Cargo.lock"),
+            "Cargo.lock は除外されるはず。got: {result:?}"
+        );
+        assert!(
+            !result.iter().any(|p| p == "Angular/www/dist/bundle.js"),
+            "サブディレクトリの dist/ も除外されるはず。got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_blame_source_files_keeps_explicit_paths_unfiltered() {
+        // --paths で明示指定した起点はユーザー意図を尊重し、
+        // BLAME_DEFAULT_EXCLUDE_GLOBS 該当でも除外しない。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(repo, &[("dummy.txt", "x")], "initial");
+
+        let result = resolve_blame_source_files(
+            repo.to_str().expect("utf-8 path"),
+            false,
+            None,
+            Some("dist/main.js,Cargo.lock"),
+            None,
+            &[],
+        )
+        .expect("resolve");
+
+        assert!(result.contains(&"dist/main.js".to_string()));
+        assert!(result.contains(&"Cargo.lock".to_string()));
+    }
+
+    #[test]
+    fn resolve_blame_source_files_applies_user_exclude_glob_for_git() {
+        // --git 経由のとき --exclude-glob (user_exclude_globs) も適用される。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        git_commit_files(repo, &[("foo.txt", "v1")], "initial");
+        git_commit_files(
+            repo,
+            &[
+                ("foo.txt", "v2"),
+                ("legacy/keep.rs", "old"),
+                ("generated/codegen.rs", "auto"),
+            ],
+            "next",
+        );
+
+        let result = resolve_blame_source_files(
+            repo.to_str().expect("utf-8 path"),
+            true,
+            Some("HEAD~1"),
+            None,
+            None,
+            &["generated/**".to_string()],
+        )
+        .expect("resolve");
+
+        assert!(result.contains(&"foo.txt".to_string()));
+        assert!(result.contains(&"legacy/keep.rs".to_string()));
+        assert!(
+            !result.iter().any(|p| p == "generated/codegen.rs"),
+            "ユーザー指定 --exclude-glob は --git 経由の起点に適用される。got: {result:?}"
         );
     }
 }

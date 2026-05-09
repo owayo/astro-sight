@@ -611,7 +611,7 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 - **Finding multiple symbols**: Run `astro-sight refs --names sym1,sym2 --dir .`
 - **Who calls this function?**: Run `astro-sight calls --path <file> --function <name>`
 - **What does this file import?**: Run `astro-sight imports --path <file>`
-- **Files that change together**: Run `astro-sight cochange --dir . --file <file>`
+- **Files that change together**: Run `astro-sight cochange --dir . --paths <file>` (or `--git --base <rev>` to derive from a diff)
 - **Visualize call flow**: Run `astro-sight sequence --path <file> --function <name>`
 - **Find dead code**: Run `astro-sight dead-code --dir .` or `--git` for diff-scoped
 - **Enforce repeated structural rules**: Run `astro-sight lint --path <file> --rules rules.yaml`
