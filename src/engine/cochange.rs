@@ -173,6 +173,20 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
         })
         .collect();
 
+    // commit_size_pivot=0 のとき weight は常に 1.0 (旧挙動)。
+    // > 0 のときは sqrt(pivot/file_count) で大コミットを抑制し、
+    // hard cap (max_files_per_commit) を超えたコミットは weight=0.0 (= スキップ済み)。
+    let commit_weights: Vec<f64> = commit_files
+        .iter()
+        .map(|files| {
+            commit_size_weight(
+                files.len(),
+                opts.commit_size_pivot,
+                opts.max_files_per_commit,
+            )
+        })
+        .collect();
+
     // Phase 3: 候補ファイルごとの共起カウント。
     //          起点ファイル自身は候補から除外。
     //          除外 glob は既定 + 利用者指定 を結合して適用。
@@ -206,6 +220,7 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
     let ctx = AggregationContext {
         commits: &commits,
         commit_files: &commit_files,
+        commit_weights: &commit_weights,
         source_set: &source_set,
         exclude_matcher: &exclude_matcher,
         co_counts: &co_counts,
@@ -235,11 +250,31 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
 struct AggregationContext<'a> {
     commits: &'a [String],
     commit_files: &'a [Vec<String>],
+    /// commits[j] のサイズ重み (1 コミットの変更ファイル数による減衰)。
+    /// commit_size_pivot=0 のとき常に 1.0 (旧挙動)。
+    commit_weights: &'a [f64],
     source_set: &'a HashSet<&'a str>,
     exclude_matcher: &'a CoChangeExclude,
     co_counts: &'a HashMap<String, usize>,
     opts: &'a CoChangeOptions,
     smoothing_on: bool,
+}
+
+/// 1 コミットあたりの「サイズ重み」を返す。
+/// - `pivot=0`: 常に 1.0 (旧挙動、size weighting 無効)
+/// - `pivot>0`: `min(1.0, sqrt(pivot/file_count))`
+///   小コミット (file_count <= pivot) は 1.0、大コミットほど 0 に近づく
+/// - `hard_max>0` かつ `file_count > hard_max`: 0.0 (スキップ済み)
+fn commit_size_weight(file_count: usize, pivot: usize, hard_max: usize) -> f64 {
+    if hard_max > 0 && file_count > hard_max {
+        return 0.0;
+    }
+    if pivot == 0 {
+        return 1.0;
+    }
+    let n = file_count.max(1) as f64;
+    let p = pivot as f64;
+    (p / n).sqrt().min(1.0)
 }
 
 /// 1 起点ファイルに紐づく blame コミット集合から、共起候補ごとの CoChangeEntry を集計する。
@@ -257,12 +292,22 @@ fn aggregate_source_entries(
     blame_set: &HashSet<String>,
     ctx: &AggregationContext<'_>,
 ) -> Vec<CoChangeEntry> {
-    // 起点 blame 集合内で各候補の共起回数を再集計
-    let mut per_source: HashMap<&str, usize> = HashMap::new();
+    // 起点 blame 集合内で各候補の raw 共起回数 (互換用) と
+    // weighted 共起 (大コミット減衰) を同時に再集計する。
+    let mut per_source_raw: HashMap<&str, usize> = HashMap::new();
+    let mut per_source_weighted: HashMap<&str, f64> = HashMap::new();
+    let mut weighted_denom: f64 = 0.0;
     for (j, sha) in ctx.commits.iter().enumerate() {
         if !blame_set.contains(sha) {
             continue;
         }
+        let weight = ctx.commit_weights[j];
+        // weight=0 のコミット (= max_files_per_commit 超過でスキップ済み) は
+        // raw/weighted いずれにも寄与させない。weighted_denom にも入れない。
+        if weight <= 0.0 {
+            continue;
+        }
+        weighted_denom += weight;
         let files = &ctx.commit_files[j];
         let mut seen: HashSet<&str> = HashSet::new();
         for f in files {
@@ -276,23 +321,29 @@ fn aggregate_source_entries(
             if ctx.exclude_matcher.is_match(path) {
                 continue;
             }
-            *per_source.entry(path).or_insert(0) += 1;
+            *per_source_raw.entry(path).or_insert(0) += 1;
+            *per_source_weighted.entry(path).or_insert(0.0) += weight;
         }
     }
 
-    let local_denom = blame_set.len() as f64;
+    let local_denom_raw = blame_set.len() as f64;
     let alpha = ctx.opts.smoothing_alpha;
     let beta = ctx.opts.smoothing_beta;
 
     let mut per_source_entries: Vec<CoChangeEntry> = Vec::new();
-    for (cand, co) in per_source {
+    for (cand, co) in per_source_raw {
         if co < ctx.opts.min_samples {
             continue;
         }
-        let confidence = co as f64 / local_denom;
+        // raw 出力は互換のためそのまま (co_changes / confidence は raw 集計値)。
+        let confidence = co as f64 / local_denom_raw;
+        // score は weighted で計算: 大コミット由来の偶然共起を抑制する。
+        // commit_size_pivot=0 のとき weighted_co/denom は raw と同値になり旧挙動と一致。
+        let weighted_co = *per_source_weighted.get(cand).unwrap_or(&0.0);
         let score = if ctx.smoothing_on {
-            (co as f64 + alpha) / (local_denom + alpha + beta)
+            (weighted_co + alpha) / (weighted_denom + alpha + beta)
         } else {
+            // smoothing 無効時は raw confidence を使う (互換)。
             confidence
         };
         let entry = CoChangeEntry {
@@ -591,7 +642,20 @@ mod tests {
     }
 
     fn opts_with(mutator: impl FnOnce(&mut CoChangeOptions)) -> CoChangeOptions {
-        let mut o = CoChangeOptions::default();
+        // テストは小さなリポ (typically <= 5 commits) で動かすため、
+        // production デフォルト (min_denominator=2, min_samples=2,
+        // min_confidence=0.3, smoothing_beta=8.0, commit_size_pivot=8) を
+        // 緩めて旧来の挙動 (recall 重視) を維持する。各テストで必要に応じて
+        // mutator で再上書きする。
+        let mut o = CoChangeOptions {
+            min_denominator: 1,
+            min_samples: 1,
+            min_confidence: 0.0,
+            smoothing_beta: 4.0,
+            // size weighting も無効化 (旧テストは均等カウント前提)。
+            commit_size_pivot: 0,
+            ..CoChangeOptions::default()
+        };
         mutator(&mut o);
         o
     }
@@ -1306,5 +1370,188 @@ mod tests {
         assert!(validate_revision("--output=/tmp/pwn", "--base").is_err());
         assert!(validate_revision("-p", "--base").is_err());
         assert!(validate_revision("HEAD\0foo", "--base").is_err());
+    }
+
+    // ---- precision tests (commit-size weighting) ----
+
+    #[test]
+    fn commit_size_weight_returns_full_for_small_commits() {
+        // file_count <= pivot のときは 1.0 (=フル重み)
+        assert!((commit_size_weight(1, 8, 100) - 1.0).abs() < 1e-9);
+        assert!((commit_size_weight(8, 8, 100) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn commit_size_weight_decays_for_large_commits() {
+        // file_count > pivot のときは sqrt(pivot/file_count) で減衰
+        let w16 = commit_size_weight(16, 8, 100);
+        let w32 = commit_size_weight(32, 8, 100);
+        assert!((w16 - (8.0_f64 / 16.0).sqrt()).abs() < 1e-9);
+        assert!((w32 - (8.0_f64 / 32.0).sqrt()).abs() < 1e-9);
+        assert!(w16 > w32, "larger commits must have lower weight");
+        assert!(w32 < 1.0);
+    }
+
+    #[test]
+    fn commit_size_weight_is_zero_above_hard_cap() {
+        // hard_max を超えるコミットは 0.0 (= 完全スキップ)
+        assert_eq!(commit_size_weight(101, 8, 100), 0.0);
+        assert_eq!(commit_size_weight(1000, 8, 100), 0.0);
+    }
+
+    #[test]
+    fn commit_size_weight_pivot_zero_disables_weighting() {
+        // pivot=0 で size weighting 無効化、常に 1.0 (hard cap 適用後)
+        assert_eq!(commit_size_weight(1, 0, 100), 1.0);
+        assert_eq!(commit_size_weight(50, 0, 100), 1.0);
+        assert_eq!(commit_size_weight(101, 0, 100), 0.0); // hard cap は効く
+    }
+
+    /// production デフォルト (β=8) では co=2/denom=2 の小サンプルは
+    /// score=(2+1)/(2+1+8)≈0.273 となり、min_confidence=0.3 で除外される。
+    #[test]
+    fn default_beta_filters_small_sample_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        // 過去 2 commit で a.rs と b.rs を同時変更 (a.rs を起点に co=2/denom=2)
+        for i in 0..2 {
+            commit_files(
+                repo,
+                &[
+                    ("a.rs", &format!("fn a() {{ {i} }}\n")),
+                    ("b.rs", &format!("fn b() {{ {i} }}\n")),
+                ],
+                &format!("pair {i}"),
+            );
+        }
+        commit_files(repo, &[("a.rs", "fn a() { 99 }\n")], "edit a");
+
+        let opts = CoChangeOptions {
+            source_files: vec!["a.rs".to_string()],
+            base: Some("HEAD~1".to_string()),
+            // production デフォルトを使う
+            ..CoChangeOptions::default()
+        };
+        let result = analyze_cochange(repo.to_str().unwrap(), &opts).unwrap();
+        // β=8 のとき co=2/denom=2 の score < 0.3 なので b.rs は出ない
+        assert!(
+            result.entries.is_empty(),
+            "co=2/denom=2 should be filtered by default min_confidence=0.3 (β=8): {:?}",
+            result.entries
+        );
+    }
+
+    /// commit-size weighting: 同じ raw co でも、小コミット由来のペアが
+    /// 大コミット由来のペアより高 score になる。
+    #[test]
+    fn commit_size_weighting_ranks_focused_commits_higher() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+
+        // blame は base 時点のファイルスナップショットを見るので、base 以前の
+        // コミットが各行を書いた履歴を残しておく必要がある。
+        //
+        // commit A (initial): src.rs に line1
+        // commit B (focused): src.rs に line2 を追加 + small.rs (= 2 ファイル)
+        // commit C (bulk):    src.rs に line3 を追加 + bulk_0..bulk_19.rs (= 21 ファイル)
+        // commit D (last):    src.rs を全行書き換え (起点となる差分を作る)
+        // base = HEAD~1 = commit C 時点。base の src.rs に A/B/C 由来の行が残り、
+        // blame をかけると blame 集合 = {A, B, C} になる。
+        commit_files(repo, &[("src.rs", "// l1 a\n")], "initial");
+        commit_files(
+            repo,
+            &[("src.rs", "// l1 a\n// l2 b\n"), ("small.rs", "// v0\n")],
+            "focused",
+        );
+        let mut bulk_files: Vec<(String, String)> = vec![(
+            "src.rs".to_string(),
+            "// l1 a\n// l2 b\n// l3 c\n".to_string(),
+        )];
+        for i in 0..20 {
+            bulk_files.push((format!("bulk_{i}.rs"), format!("// {i}\n")));
+        }
+        let bulk_refs: Vec<(&str, &str)> = bulk_files
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_str()))
+            .collect();
+        commit_files(repo, &bulk_refs, "bulk refactor");
+        commit_files(repo, &[("src.rs", "// new\n")], "edit src");
+
+        let opts = CoChangeOptions {
+            source_files: vec!["src.rs".to_string()],
+            // base = HEAD~1 = bulk commit 後。base 時点の src.rs に A/B/C の行が残る。
+            base: Some("HEAD~1".to_string()),
+            min_confidence: 0.0,
+            min_samples: 1,
+            min_denominator: 1,
+            commit_size_pivot: 8,
+            smoothing_beta: 4.0,
+            ..CoChangeOptions::default()
+        };
+        let result = analyze_cochange(repo.to_str().unwrap(), &opts).unwrap();
+
+        let small = result
+            .entries
+            .iter()
+            .find(|e| e.file_b == "small.rs")
+            .expect("small.rs should be detected (focused commit)");
+        let bulk = result
+            .entries
+            .iter()
+            .find(|e| e.file_b == "bulk_0.rs")
+            .expect("bulk_0.rs should be detected (bulk commit)");
+        assert!(
+            small.score.unwrap() > bulk.score.unwrap(),
+            "focused commit pair must rank higher than bulk pair: small={small:?}, bulk={bulk:?}",
+        );
+    }
+
+    /// pivot=0 (size weighting 無効) のとき、score は raw co/denom の smoothing と一致する。
+    #[test]
+    fn commit_size_pivot_zero_matches_legacy_score() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        for i in 0..2 {
+            commit_files(
+                repo,
+                &[
+                    ("a.rs", &format!("fn a() {{ {i} }}\n")),
+                    ("b.rs", &format!("fn b() {{ {i} }}\n")),
+                ],
+                &format!("p{i}"),
+            );
+        }
+        commit_files(repo, &[("a.rs", "fn a() { 99 }\n")], "edit a");
+
+        let opts = CoChangeOptions {
+            source_files: vec!["a.rs".to_string()],
+            base: Some("HEAD~1".to_string()),
+            min_confidence: 0.0,
+            min_samples: 1,
+            min_denominator: 1,
+            commit_size_pivot: 0, // 旧挙動 (size weighting 無効)
+            smoothing_alpha: 1.0,
+            smoothing_beta: 4.0,
+            ..CoChangeOptions::default()
+        };
+        let result = analyze_cochange(repo.to_str().unwrap(), &opts).unwrap();
+        let entry = result
+            .entries
+            .iter()
+            .find(|e| e.file_b == "b.rs")
+            .expect("a.rs↔b.rs should be detected");
+        // HEAD~1 vs HEAD の a.rs diff の旧側 (= HEAD~1 の a.rs 1 行) に
+        // blame をかけると、その行は p1 commit で書かれたものなので
+        // blame 集合は 1 commit (p1) のみになる。p1 では b.rs も同時変更されているので
+        // co=1, denom=1, α=1, β=4: score = (1+1)/(1+1+4) = 2/6 = 1/3 ≈ 0.3333
+        let expected = 1.0_f64 / 3.0;
+        assert!(
+            (entry.score.unwrap() - expected).abs() < 1e-9,
+            "pivot=0 should reproduce legacy score: got {:?}, expected {expected}",
+            entry.score
+        );
     }
 }

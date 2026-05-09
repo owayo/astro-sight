@@ -6768,11 +6768,15 @@ def new_public_api():
         let mut changed_files = HashSet::new();
         changed_files.insert("a.rs".to_string());
 
+        // 小サンプル (co=2, denom=2) なので新デフォルト β=8 では
+        // score=(2+1)/(2+1+8)=0.27 となり、production の min_confidence=0.3
+        // からは弾かれる。本テストは「base が blame 解析に正しく渡る」を
+        // 確かめるのが目的なので、閾値を 0.0 に下げて信号の有無だけ見る。
         let missing = detect_missing_cochanges(
             &service,
             repo.to_str().expect("utf-8 path"),
             &changed_files,
-            0.3,
+            0.0,
             Some("HEAD~2"),
         );
 

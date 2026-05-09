@@ -287,9 +287,17 @@ pub enum Commands {
         min_samples: usize,
 
         /// Skip co-change counting for commits touching more files than this
-        /// threshold (default: 30; defends against squash-merge / bulk commits).
-        #[arg(long, default_value = "30")]
+        /// threshold (default: 100; hard cap, the size weighting below
+        /// (`--commit-size-pivot`) handles softer suppression).
+        #[arg(long, default_value = "100")]
         max_files_per_commit: usize,
+
+        /// Commit-size weighting pivot. Each commit gets weight
+        /// `min(1.0, sqrt(pivot/file_count))` when computing the smoothed
+        /// `score`, so large refactor commits contribute less than focused
+        /// commits. `0` disables weighting (legacy behaviour). Default: 8.
+        #[arg(long, default_value = "8")]
+        commit_size_pivot: usize,
 
         /// Exclude candidate paths matching this glob (repeatable).
         /// Built-in defaults already exclude vendor/, node_modules/, lock files, minified assets.
@@ -338,18 +346,20 @@ pub enum Commands {
         #[arg(long, default_value = "1.0")]
         smoothing_alpha: f64,
 
-        /// Bayesian smoothing beta (failure prior, default 4.0).
-        #[arg(long, default_value = "4.0")]
+        /// Bayesian smoothing beta (failure prior, default 8.0).
+        /// Higher beta penalises small denominators more strongly so
+        /// `co=2/denom=2` no longer dominates the ranking.
+        #[arg(long, default_value = "8.0")]
         smoothing_beta: f64,
 
         /// Skip source files whose blame commit set is smaller than this.
-        /// 0/1 = disabled (legacy behaviour). Recommended: 2.
-        #[arg(long, default_value = "1")]
+        /// 0/1 = disabled (legacy behaviour). Default 2.
+        #[arg(long, default_value = "2")]
         min_denominator: usize,
 
-        /// (blame mode) Limit candidates per source file to top N (0 = unlimited).
-        /// Recommended: 10 to keep output focused.
-        #[arg(long, default_value = "0")]
+        /// Limit candidates per source file to top N (0 = unlimited).
+        /// Default 10 to keep output focused.
+        #[arg(long, default_value = "10")]
         per_source_limit: usize,
     },
 

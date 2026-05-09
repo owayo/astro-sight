@@ -1449,19 +1449,24 @@ fn lint_with_no_query_or_pattern_reports_warning() {
 // ---- Co-change analysis tests (blame mode) ----
 
 #[test]
-fn cochange_blame_with_git_diff_runs() {
-    // 自リポでの blame モード実行が JSON を返すことを確認する。
-    // 直近 diff が空 (削除のみ等) の場合は entries 空・commits_analyzed=0 でも OK。
+fn cochange_blame_runs_with_explicit_paths() {
+    // blame モードが JSON を返すことを確認する。CI の shallow clone (fetch-depth=1)
+    // でも安定動作させるため、`--paths` で起点を明示し、`git diff <base> HEAD`
+    // が解決できないケースでも `collect_blame_commits_for_file` 内で空集合を
+    // 返して `commits_analyzed=0` で正常終了する経路を踏ませる。
     let output = cargo_bin()
         .args([
             "cochange",
             "--dir",
             ".",
-            "--git",
-            "--base",
-            "HEAD~5",
+            "--paths",
+            "src/main.rs",
             "--min-confidence",
-            "0.1",
+            "0.0",
+            "--min-samples",
+            "1",
+            "--min-denominator",
+            "1",
         ])
         .output()
         .expect("failed to run");
@@ -1495,8 +1500,19 @@ fn cochange_rejects_missing_source_files() {
 
 #[test]
 fn cochange_rejects_invalid_confidence() {
+    // CI の shallow clone でも `--git` 非依存で min_confidence 検証が走るよう
+    // `--paths` で起点を明示する (これが無いと resolve_blame_source_files の
+    // git diff が先にエラー化し、エラーメッセージが "min_confidence" を含まない)。
     let output = cargo_bin()
-        .args(["cochange", "--dir", ".", "--git", "--min-confidence", "1.5"])
+        .args([
+            "cochange",
+            "--dir",
+            ".",
+            "--paths",
+            "src/main.rs",
+            "--min-confidence",
+            "1.5",
+        ])
         .output()
         .expect("failed to run");
     assert!(!output.status.success());
@@ -2893,9 +2909,18 @@ fn impact_rejects_path_traversal_in_diff() {
 
 #[test]
 fn cochange_rejects_nan_confidence() {
-    // NaN は拒否される (clap または service 層で)
+    // NaN は拒否される (clap または service 層で)。
+    // CI の shallow clone 非依存にするため `--paths` で起点を明示する。
     let output = cargo_bin()
-        .args(["cochange", "--dir", ".", "--git", "--min-confidence", "NaN"])
+        .args([
+            "cochange",
+            "--dir",
+            ".",
+            "--paths",
+            "src/main.rs",
+            "--min-confidence",
+            "NaN",
+        ])
         .output()
         .expect("failed to run");
     assert!(!output.status.success());

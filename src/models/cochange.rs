@@ -67,6 +67,11 @@ pub struct CoChangeOptions {
     /// 1 コミットあたりの変更ファイル数の上限。これを超えるコミット (大量生成
     /// / squash-merge 等) は共起カウントから除外する。
     pub max_files_per_commit: usize,
+    /// score 計算時の commit-size weighting のピボット。
+    /// `0` で size weighting 無効 (旧挙動)。`> 0` で `min(1.0, sqrt(pivot/file_count))` の
+    /// 重みを各コミットに掛け、大コミット由来の偶然共起を抑制する。
+    /// 推奨値 8 (= 「典型的な PR は 8 ファイル前後」のヒューリスティック)。
+    pub commit_size_pivot: usize,
     /// `git blame -M` でファイル内移動 + ファイル間 rename を追跡する。
     pub rename: bool,
     /// `git blame -C` でファイル間コピーを検出する (`-M` より重い)。
@@ -98,17 +103,22 @@ impl Default for CoChangeOptions {
             min_samples: 2,
             exclude_globs: Vec::new(),
             max_source_files: 0,
-            max_files_per_commit: 30,
+            // hard cap は緩めにし、実際の抑制は size weighting に任せる。
+            max_files_per_commit: 100,
+            commit_size_pivot: 8,
             rename: false,
             copy: false,
             ignore_merges: false,
             max_blame_commits: 0,
             timeout_secs: 0,
             smoothing_alpha: 1.0,
-            smoothing_beta: 4.0,
+            // β を 8 に上げて co=2/denom=2 のような小サンプル過信を抑える。
+            smoothing_beta: 8.0,
             disable_smoothing: false,
-            min_denominator: 1,
-            per_source_limit: 0,
+            // 推奨値 2: blame 集合が 1 件しかない起点はノイズになりやすい。
+            min_denominator: 2,
+            // 推奨値 10: 起点ごとの候補を上位 10 件に絞り、出力ノイズを抑える。
+            per_source_limit: 10,
         }
     }
 }
