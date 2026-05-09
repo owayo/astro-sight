@@ -1657,6 +1657,48 @@ fn context_git_staged() {
 }
 
 #[test]
+fn context_git_xojo_only_diff_skips_before_parse() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    let xojo_fixture = include_str!("fixtures/sample.xojo_code");
+
+    std::fs::write(root.join("sample.xojo_code"), xojo_fixture).unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "astro-sight@example.com"]);
+    git(&["config", "user.name", "astro-sight"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial", "-q"]);
+
+    std::fs::write(
+        root.join("sample.xojo_code"),
+        xojo_fixture.replace("Hello, ", "Hello!, "),
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["context", "--dir", root.to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(
+        json["changes"].as_array().unwrap().len(),
+        0,
+        "Xojo のみの diff は parse 前に skip されるべき: {json}"
+    );
+}
+
+#[test]
 fn symbols_dir() {
     let output = cargo_bin()
         .args(["symbols", "--dir", "src/engine/"])

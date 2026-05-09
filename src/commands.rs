@@ -952,12 +952,7 @@ pub fn cmd_review(
         .ok()
         .as_deref()
         == Some("1");
-    let all_ci_lang = !pre_diff_files.is_empty()
-        && pre_diff_files.iter().all(|df| {
-            crate::language::LangId::from_path(camino::Utf8Path::new(&df.new_path))
-                .map(|l| l.is_case_insensitive())
-                .unwrap_or(false)
-        });
+    let all_ci_lang = crate::engine::impact::diff_files_all_case_insensitive(&pre_diff_files);
     let impact = if all_ci_lang && !force_ci {
         log_phase("context.skip_ci_only", "applied", 0);
         crate::models::impact::ContextResult {

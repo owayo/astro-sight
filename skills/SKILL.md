@@ -426,8 +426,11 @@ astro-sight dead-code --dir . --git
 - `refs` results include `ctx` (source line) — no need to Read files afterward
 - `refs` respects `.gitignore` and uses bounded parallel scanning with fold/reduce aggregation
 - Multiple symbol searches: use `refs --names` for batching; reserve `session` for mixed commands
+- If you will run 2+ different structural commands (`symbols` + `calls`, `imports` + `refs`, etc.), prefer `session` instead of starting separate processes
+- Use `lint` for repeated AST/text policies and `sequence` when you need to explain non-trivial call flow
 - `session` supports `ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange` (note: `review` is CLI-only, not available in session mode)
 - With `ASTRO_SIGHT_WORKSPACE`, session-relative `path` / `dir` values resolve from the workspace root, not the process cwd; invalid workspace values fail closed
+- CI-language-only diffs (currently Xojo) return empty results before parsing in `context` / `impact` / `review` / `dead-code --git` to avoid OOM; deletion diffs use the old path for language detection
 - **Input validation**: Empty `--name`/`--names`, empty `--paths`/`--paths-file` are rejected with `INVALID_REQUEST` error. `--base` for `context`/`impact`/`review` rejects values starting with `-` (blocks option-style injection into `git diff` / `git show` / `git blame`)
 - **Large repositories (10k+ source files)**: `review --dir .` runs `context` + `cochange` + API diff + dead-code in one process and is the heaviest command. On very large monorepos it can exhaust memory. Mitigations:
   - Narrow `--dir` to a module-level subtree (`--dir packages/server` instead of `--dir .`)

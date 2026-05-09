@@ -506,6 +506,8 @@ $ astro-sight ast --path nonexistent.rs
 
 全言語で tree-sitter クエリによる精密なシンボル抽出に対応。Xojo は仕様上 case-insensitive な識別子マッチング (`myVar` と `MYVAR` は同一シンボル) を行う。
 
+Xojo など case-insensitive GLR 系言語だけの diff では、`context` / `impact` / `review` / `dead-code --git` が parse 前に空結果を返し、OOM を避ける。削除 diff は `new_path` が `/dev/null` になるため、旧パスで言語判定する。デバッグ時だけ `ASTRO_SIGHT_FORCE_CI_LANG_IMPACT=1` または `ASTRO_SIGHT_FORCE_CI_LANG_DEAD_CODE=1` で従来挙動に戻せる。
+
 > **\* Kotlin バージョンについて:** `tree-sitter-kotlin` 0.3.8 以降は `links = "tree-sitter"` を宣言しており、コアクレート `tree-sitter` 0.26 と Cargo の native library リンク名が競合してビルドできない。現在は 0.3.5 系を利用している。
 >
 > ```

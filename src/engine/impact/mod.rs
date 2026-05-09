@@ -80,6 +80,14 @@ where
 {
     use crate::commands::log_phase;
     let diff_files = diff::parse_unified_diff(diff_input);
+    let force_ci = std::env::var("ASTRO_SIGHT_FORCE_CI_LANG_IMPACT")
+        .ok()
+        .as_deref()
+        == Some("1");
+    if diff_files_all_case_insensitive(&diff_files) && !force_ci {
+        log_phase("context.skip_ci_only", "applied", 0);
+        return Ok(());
+    }
 
     let t = std::time::Instant::now();
     log_phase("context.pass1", "start", 0);
@@ -597,6 +605,42 @@ fn is_safe_diff_path(path: &str) -> bool {
     true
 }
 
+/// diff 内で実際に変更されたファイルパスを言語判定用に取り出す。
+/// 削除 diff は `new_path` が `/dev/null` になるため、旧パスで判定する。
+fn diff_file_path_for_language(df: &DiffFile) -> &str {
+    if df.new_path == "/dev/null" {
+        &df.old_path
+    } else {
+        &df.new_path
+    }
+}
+
+/// diff の解析対象が case-insensitive 言語だけかどうかを判定する。
+///
+/// Xojo などの case-insensitive GLR 系 grammar は小さな diff でも parse 時に
+/// メモリが線形膨張するため、対象がそれらの言語だけなら Pass1 すら起動しない。
+/// `/dev/null` を含む削除 diff では旧パスを使い、削除だけの Xojo 変更も確実に skip する。
+pub(crate) fn diff_files_all_case_insensitive(diff_files: &[DiffFile]) -> bool {
+    let mut seen_analyzable_file = false;
+
+    for df in diff_files {
+        let path = diff_file_path_for_language(df);
+        if path == "/dev/null" || !is_safe_diff_path(path) {
+            continue;
+        }
+
+        let Ok(lang) = LangId::from_path(Utf8Path::new(path)) else {
+            return false;
+        };
+        seen_analyzable_file = true;
+        if !lang.is_case_insensitive() {
+            return false;
+        }
+    }
+
+    seen_analyzable_file
+}
+
 /// cross-file 参照フィルタリング用の言語互換グループ。
 ///
 /// 同一グループの言語は互いのシンボルを参照可能
@@ -657,6 +701,38 @@ mod tests {
     #[test]
     fn is_safe_diff_path_windows_absolute() {
         assert!(!is_safe_diff_path("\\windows\\system32"));
+    }
+
+    fn diff_file(old_path: &str, new_path: &str) -> DiffFile {
+        DiffFile {
+            old_path: old_path.to_string(),
+            new_path: new_path.to_string(),
+            hunks: Vec::new(),
+        }
+    }
+
+    // Xojo などの CI 言語だけの diff は Pass1 より前にスキップ対象になる
+    #[test]
+    fn diff_files_all_case_insensitive_accepts_xojo_change() {
+        let files = vec![diff_file("sample.xojo_code", "sample.xojo_code")];
+        assert!(diff_files_all_case_insensitive(&files));
+    }
+
+    // 削除 diff は new_path が /dev/null になるため旧パスで CI 言語判定する
+    #[test]
+    fn diff_files_all_case_insensitive_uses_old_path_for_deletion() {
+        let files = vec![diff_file("sample.xojo_code", "/dev/null")];
+        assert!(diff_files_all_case_insensitive(&files));
+    }
+
+    // 非 CI 言語が混ざる diff は通常解析に回す
+    #[test]
+    fn diff_files_all_case_insensitive_rejects_mixed_languages() {
+        let files = vec![
+            diff_file("sample.xojo_code", "sample.xojo_code"),
+            diff_file("src/lib.rs", "src/lib.rs"),
+        ];
+        assert!(!diff_files_all_case_insensitive(&files));
     }
 
     // 同じ言語互換グループに属するペアは同じ値を返す
