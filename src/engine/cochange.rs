@@ -93,7 +93,7 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
     // Phase 1: 起点ファイルごとに blame で base コミット側の変更行 SHA を集める。
     //          ファイル単位で rayon 並列化する。
     check_timeout("phase1_blame_setup")?;
-    let blame_per_file: Vec<HashSet<String>> = opts
+    let blame_per_file: Vec<HashMap<String, BlameInfo>> = opts
         .source_files
         .par_iter()
         .map(|f| {
@@ -105,7 +105,9 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
 
     let mut commit_set: HashSet<String> = HashSet::new();
     for s in &blame_per_file {
-        commit_set.extend(s.iter().cloned());
+        for k in s.keys() {
+            commit_set.insert(k.clone());
+        }
     }
     if commit_set.is_empty() {
         return Ok(CoChangeResult {
@@ -143,12 +145,12 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
         }
     }
     // blame 結果からも同 SHA を除外して per-source 集計と整合させる。
-    let blame_per_file: Vec<HashSet<String>> = if opts.ignore_merges {
+    let blame_per_file: Vec<HashMap<String, BlameInfo>> = if opts.ignore_merges {
         blame_per_file
             .into_iter()
             .map(|s| {
                 s.into_iter()
-                    .filter(|sha| commit_set.contains(sha))
+                    .filter(|(sha, _)| commit_set.contains(sha))
                     .collect()
             })
             .collect()
@@ -157,83 +159,162 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
     };
     check_timeout("phase3_diff_tree_setup")?;
 
-    // Phase 2: 各コミット c の変更ファイルを diff-tree で取得 (並列化)。
-    //          max_files_per_commit を超えるコミット (squash / 大量生成) はスキップ。
-    let commits: Vec<String> = commit_set.into_iter().collect();
-    let denominator = commits.len();
-    let commit_files: Vec<Vec<String>> = commits
-        .par_iter()
-        .map(|sha| {
-            let files = collect_files_in_commit(dir, sha).unwrap_or_default();
-            if files.len() > opts.max_files_per_commit {
-                Vec::new()
-            } else {
-                files
-            }
-        })
-        .collect();
-
-    // commit_size_pivot=0 のとき weight は常に 1.0 (旧挙動)。
-    // > 0 のときは sqrt(pivot/file_count) で大コミットを抑制し、
-    // hard cap (max_files_per_commit) を超えたコミットは weight=0.0 (= スキップ済み)。
-    let commit_weights: Vec<f64> = commit_files
-        .iter()
-        .map(|files| {
-            commit_size_weight(
-                files.len(),
-                opts.commit_size_pivot,
-                opts.max_files_per_commit,
-            )
-        })
-        .collect();
-
-    // Phase 3: 候補ファイルごとの共起カウント。
-    //          起点ファイル自身は候補から除外。
-    //          除外 glob は既定 + 利用者指定 を結合して適用。
+    // Phase 2: SHA → 起点ファイル indices の逆引きを作り、SHA → BlameInfo もマージする。
+    // diff-tree 結果を全保持せず、各 SHA を 1-pass で per-source 集計に畳み込むため、
+    // 「この SHA にヒットする起点ファイルは誰か」を引けるようにしておく。
+    let mut sha_to_sources: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut sha_to_info: HashMap<String, BlameInfo> = HashMap::new();
+    for (i, blame_map) in blame_per_file.iter().enumerate() {
+        for (sha, info) in blame_map {
+            sha_to_sources.entry(sha.clone()).or_default().push(i);
+            // 起点間で同じ SHA の info があれば最初に見たものを採用する
+            sha_to_info
+                .entry(sha.clone())
+                .or_insert_with(|| info.clone());
+        }
+    }
+    let denominator = sha_to_sources.len();
+    let n_sources = opts.source_files.len();
     let source_set: HashSet<&str> = opts.source_files.iter().map(String::as_str).collect();
     let exclude_matcher = build_exclude_matcher(&opts.exclude_globs)?;
 
-    let mut co_counts: HashMap<String, usize> = HashMap::new();
-    for files in &commit_files {
-        // 同一コミットで g が複数ファイルに重複登録されないよう dedup
-        let mut seen: HashSet<&str> = HashSet::new();
-        for f in files {
-            let path = f.as_str();
-            if !seen.insert(path) {
-                continue;
-            }
-            if source_set.contains(path) {
-                continue;
-            }
-            if exclude_matcher.is_match(path) {
-                continue;
-            }
-            *co_counts.entry(path.to_string()).or_insert(0) += 1;
+    // author_unit_window_days > 0 のとき、各 SHA を「(author_mail, time_bucket)」の unit に
+    // 圧縮することで、同一 author の連続 commit を 1 knowledge unit として扱う。
+    // window=0 (旧挙動) のとき unit_key は常に None で、raw weighted 集計のみが有効。
+    let author_window_days = opts.author_unit_window_days;
+    let unit_key_for = |sha: &str| -> Option<(String, i64)> {
+        if author_window_days == 0 {
+            return None;
         }
-    }
-
-    // Phase 4: 起点ファイルごとに該当候補のスコアを集計し entries を組む。
-    //          詳細は `aggregate_source_entries` を参照。
-    let smoothing_on = !opts.disable_smoothing;
-    let min_denom = opts.min_denominator.max(1); // 0 は 1 と同義 (= 既存挙動)
-
-    let ctx = AggregationContext {
-        commits: &commits,
-        commit_files: &commit_files,
-        commit_weights: &commit_weights,
-        source_set: &source_set,
-        exclude_matcher: &exclude_matcher,
-        co_counts: &co_counts,
-        opts,
-        smoothing_on,
+        let info = sha_to_info.get(sha)?;
+        let mail = info.author_mail.as_ref()?;
+        let time = info.author_time?;
+        let bucket_seconds = (author_window_days as i64) * 86_400;
+        Some((mail.clone(), time / bucket_seconds))
     };
+
+    // Phase 3 (streaming): 各 SHA について diff-tree 取得 → サイズ重み計算 →
+    // per-source 集計 (raw / weighted / units) と global co_counts を rayon の fold/reduce で
+    // 直接畳み込む。`commit_files: Vec<Vec<String>>` を全保持しないため、
+    // 大規模 diff (commits 数百〜千超) でもピーク RSS が線形以下に収まる。
+    let sha_entries: Vec<(String, Vec<usize>)> = sha_to_sources.into_iter().collect();
+
+    let stats: ShardStats = sha_entries
+        .par_iter()
+        .fold(
+            || ShardStats::new(n_sources),
+            |mut acc, (sha, sources)| {
+                let files = collect_files_in_commit(dir, sha).unwrap_or_default();
+                let weight = commit_size_weight(
+                    files.len(),
+                    opts.commit_size_pivot,
+                    opts.max_files_per_commit,
+                );
+                if weight <= 0.0 {
+                    return acc;
+                }
+                let unit = unit_key_for(sha);
+                for &i in sources {
+                    acc.weighted_denom[i] += weight;
+                    if let Some(u) = unit.as_ref() {
+                        acc.denom_units[i].insert(u.clone());
+                    }
+                }
+                let mut seen: HashSet<&str> = HashSet::new();
+                for f in &files {
+                    let path = f.as_str();
+                    if !seen.insert(path) {
+                        continue;
+                    }
+                    if source_set.contains(path) {
+                        continue;
+                    }
+                    if exclude_matcher.is_match(path) {
+                        continue;
+                    }
+                    *acc.co_counts.entry(path.to_string()).or_insert(0) += 1;
+                    for &i in sources {
+                        *acc.per_source_raw[i].entry(path.to_string()).or_insert(0) += 1;
+                        *acc.per_source_weighted[i]
+                            .entry(path.to_string())
+                            .or_insert(0.0) += weight;
+                        if let Some(u) = unit.as_ref() {
+                            acc.co_units[i]
+                                .entry(path.to_string())
+                                .or_default()
+                                .insert(u.clone());
+                        }
+                    }
+                }
+                acc
+            },
+        )
+        .reduce(|| ShardStats::new(n_sources), ShardStats::merge);
+
+    check_timeout("phase4_assemble")?;
+
+    // Phase 4: 各起点に対して CoChangeEntry を構築する。stats は streaming で
+    // すでに per-source 集計済みなので、ここでは閾値フィルタとランキングのみ行う。
+    let smoothing_on = !opts.disable_smoothing;
+    let min_denom = opts.min_denominator.max(1);
+    let alpha = opts.smoothing_alpha;
+    let beta = opts.smoothing_beta;
+    let author_unit_active = author_window_days > 0;
+
     let mut entries: Vec<CoChangeEntry> = Vec::new();
     for (i, source) in opts.source_files.iter().enumerate() {
-        let blame_set = &blame_per_file[i];
-        if blame_set.len() < min_denom {
+        let blame_set_len = blame_per_file[i].len();
+        if blame_set_len < min_denom {
             continue;
         }
-        entries.extend(aggregate_source_entries(source, blame_set, &ctx));
+        let local_denom_raw = blame_set_len as f64;
+        let weighted_denom = stats.weighted_denom[i];
+        let raw = &stats.per_source_raw[i];
+        let weighted = &stats.per_source_weighted[i];
+
+        let mut per_source_entries: Vec<CoChangeEntry> = Vec::new();
+        for (cand, co) in raw {
+            let co = *co;
+            if co < opts.min_samples {
+                continue;
+            }
+            let confidence = co as f64 / local_denom_raw;
+            // author_unit_window_days > 0 のとき、score は unit ベース
+            // (|co_units| + α) / (|denom_units| + α + β) で計算する。
+            // unit が空 (author 情報を取れなかった SHA のみ) のとき raw weighted にフォールバック。
+            let score = if smoothing_on {
+                if author_unit_active && !stats.denom_units[i].is_empty() {
+                    let denom_units_n = stats.denom_units[i].len() as f64;
+                    let co_units_n =
+                        stats.co_units[i].get(cand).map(|s| s.len()).unwrap_or(0) as f64;
+                    (co_units_n + alpha) / (denom_units_n + alpha + beta)
+                } else {
+                    let weighted_co = *weighted.get(cand).unwrap_or(&0.0);
+                    (weighted_co + alpha) / (weighted_denom + alpha + beta)
+                }
+            } else {
+                confidence
+            };
+            let entry = CoChangeEntry {
+                file_a: source.clone(),
+                file_b: cand.clone(),
+                co_changes: co,
+                total_changes_a: blame_set_len,
+                total_changes_b: *stats.co_counts.get(cand).unwrap_or(&0),
+                confidence,
+                denominator: Some(blame_set_len),
+                score: Some(score),
+            };
+            if entry.ranking_value(smoothing_on) < opts.min_confidence {
+                continue;
+            }
+            per_source_entries.push(entry);
+        }
+        per_source_entries.sort_by(|a, b| compare_entries_by_ranking(a, b, smoothing_on));
+        if opts.per_source_limit > 0 {
+            per_source_entries.truncate(opts.per_source_limit);
+        }
+        entries.extend(per_source_entries);
     }
 
     // 全体 ranking。smoothing 有効なら score 降順、無効なら confidence 降順。
@@ -245,19 +326,66 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
     })
 }
 
-/// `aggregate_source_entries` に渡す共通コンテキスト。
-/// 起点ファイルごとに変わらない参照群をまとめて clippy::too_many_arguments を回避する。
-struct AggregationContext<'a> {
-    commits: &'a [String],
-    commit_files: &'a [Vec<String>],
-    /// commits[j] のサイズ重み (1 コミットの変更ファイル数による減衰)。
-    /// commit_size_pivot=0 のとき常に 1.0 (旧挙動)。
-    commit_weights: &'a [f64],
-    source_set: &'a HashSet<&'a str>,
-    exclude_matcher: &'a CoChangeExclude,
-    co_counts: &'a HashMap<String, usize>,
-    opts: &'a CoChangeOptions,
-    smoothing_on: bool,
+/// streaming 集計用のスレッドローカル統計。fold/reduce でマージされる。
+/// - `per_source_raw` / `per_source_weighted` / `weighted_denom`: commit-size weighting の集計
+/// - `denom_units` / `co_units`: author_unit_window_days > 0 のとき (author, time_bucket) 単位で
+///   起点ファイル別の unique unit と候補別の unique unit を保持する
+/// - `co_counts`: グローバル候補出現数 (= `CoChangeEntry.total_changes_b` の元)
+#[derive(Default)]
+struct ShardStats {
+    per_source_raw: Vec<HashMap<String, usize>>,
+    per_source_weighted: Vec<HashMap<String, f64>>,
+    weighted_denom: Vec<f64>,
+    denom_units: Vec<HashSet<(String, i64)>>,
+    co_units: Vec<HashMap<String, HashSet<(String, i64)>>>,
+    co_counts: HashMap<String, usize>,
+}
+
+impl ShardStats {
+    fn new(n_sources: usize) -> Self {
+        Self {
+            per_source_raw: (0..n_sources).map(|_| HashMap::new()).collect(),
+            per_source_weighted: (0..n_sources).map(|_| HashMap::new()).collect(),
+            weighted_denom: vec![0.0; n_sources],
+            denom_units: (0..n_sources).map(|_| HashSet::new()).collect(),
+            co_units: (0..n_sources).map(|_| HashMap::new()).collect(),
+            co_counts: HashMap::new(),
+        }
+    }
+
+    fn merge(mut a: Self, b: Self) -> Self {
+        if a.weighted_denom.is_empty() {
+            return b;
+        }
+        if b.weighted_denom.is_empty() {
+            return a;
+        }
+        for (i, m) in b.per_source_raw.into_iter().enumerate() {
+            for (k, v) in m {
+                *a.per_source_raw[i].entry(k).or_insert(0) += v;
+            }
+        }
+        for (i, m) in b.per_source_weighted.into_iter().enumerate() {
+            for (k, v) in m {
+                *a.per_source_weighted[i].entry(k).or_insert(0.0) += v;
+            }
+        }
+        for (i, w) in b.weighted_denom.into_iter().enumerate() {
+            a.weighted_denom[i] += w;
+        }
+        for (i, set) in b.denom_units.into_iter().enumerate() {
+            a.denom_units[i].extend(set);
+        }
+        for (i, map) in b.co_units.into_iter().enumerate() {
+            for (k, set) in map {
+                a.co_units[i].entry(k).or_default().extend(set);
+            }
+        }
+        for (k, v) in b.co_counts {
+            *a.co_counts.entry(k).or_insert(0) += v;
+        }
+        a
+    }
 }
 
 /// 1 コミットあたりの「サイズ重み」を返す。
@@ -277,100 +405,10 @@ fn commit_size_weight(file_count: usize, pivot: usize, hard_max: usize) -> f64 {
     (p / n).sqrt().min(1.0)
 }
 
-/// 1 起点ファイルに紐づく blame コミット集合から、共起候補ごとの CoChangeEntry を集計する。
-///
-/// 適用フィルタ:
-///   * `min_samples`: co_changes 未満の候補は除外
-///   * `min_confidence`: ranking 値 (smoothing on/off で切替) が閾値未満は除外
-///   * `per_source_limit`: ranking 値降順で上位 N 件に truncate (0 = 無制限)
-///
-/// 集計内訳:
-///   * `confidence` = co / local_denom (raw)
-///   * `score`      = (co + α) / (local_denom + α + β) (smoothing on) または confidence (off)
-fn aggregate_source_entries(
-    source: &str,
-    blame_set: &HashSet<String>,
-    ctx: &AggregationContext<'_>,
-) -> Vec<CoChangeEntry> {
-    // 起点 blame 集合内で各候補の raw 共起回数 (互換用) と
-    // weighted 共起 (大コミット減衰) を同時に再集計する。
-    let mut per_source_raw: HashMap<&str, usize> = HashMap::new();
-    let mut per_source_weighted: HashMap<&str, f64> = HashMap::new();
-    let mut weighted_denom: f64 = 0.0;
-    for (j, sha) in ctx.commits.iter().enumerate() {
-        if !blame_set.contains(sha) {
-            continue;
-        }
-        let weight = ctx.commit_weights[j];
-        // weight=0 のコミット (= max_files_per_commit 超過でスキップ済み) は
-        // raw/weighted いずれにも寄与させない。weighted_denom にも入れない。
-        if weight <= 0.0 {
-            continue;
-        }
-        weighted_denom += weight;
-        let files = &ctx.commit_files[j];
-        let mut seen: HashSet<&str> = HashSet::new();
-        for f in files {
-            let path = f.as_str();
-            if !seen.insert(path) {
-                continue;
-            }
-            if ctx.source_set.contains(path) {
-                continue;
-            }
-            if ctx.exclude_matcher.is_match(path) {
-                continue;
-            }
-            *per_source_raw.entry(path).or_insert(0) += 1;
-            *per_source_weighted.entry(path).or_insert(0.0) += weight;
-        }
-    }
-
-    let local_denom_raw = blame_set.len() as f64;
-    let alpha = ctx.opts.smoothing_alpha;
-    let beta = ctx.opts.smoothing_beta;
-
-    let mut per_source_entries: Vec<CoChangeEntry> = Vec::new();
-    for (cand, co) in per_source_raw {
-        if co < ctx.opts.min_samples {
-            continue;
-        }
-        // raw 出力は互換のためそのまま (co_changes / confidence は raw 集計値)。
-        let confidence = co as f64 / local_denom_raw;
-        // score は weighted で計算: 大コミット由来の偶然共起を抑制する。
-        // commit_size_pivot=0 のとき weighted_co/denom は raw と同値になり旧挙動と一致。
-        let weighted_co = *per_source_weighted.get(cand).unwrap_or(&0.0);
-        let score = if ctx.smoothing_on {
-            (weighted_co + alpha) / (weighted_denom + alpha + beta)
-        } else {
-            // smoothing 無効時は raw confidence を使う (互換)。
-            confidence
-        };
-        let entry = CoChangeEntry {
-            file_a: source.to_string(),
-            file_b: cand.to_string(),
-            co_changes: co,
-            total_changes_a: blame_set.len(),
-            total_changes_b: *ctx.co_counts.get(cand).unwrap_or(&0),
-            confidence,
-            denominator: Some(blame_set.len()),
-            score: Some(score),
-        };
-        // ranking 値で min_confidence を判定 (smoothing on/off で一貫)
-        if entry.ranking_value(ctx.smoothing_on) < ctx.opts.min_confidence {
-            continue;
-        }
-        per_source_entries.push(entry);
-    }
-
-    per_source_entries.sort_by(|a, b| compare_entries_by_ranking(a, b, ctx.smoothing_on));
-    if ctx.opts.per_source_limit > 0 {
-        per_source_entries.truncate(ctx.opts.per_source_limit);
-    }
-    per_source_entries
-}
-
-/// CoChangeEntry を ranking 値で降順比較する。同値時は path 昇順で安定化する。
+/// CoChangeEntry を ranking 値で降順比較する。
+/// 同値時は co_changes (実共起数) 降順 → confidence 降順 → path 昇順の順で安定化する。
+/// ranking value (score / confidence) が同点でも、より多くのコミットで一緒に変更された
+/// ペアを優先することで、低 score 帯でのランキング品質を体感的に改善する。
 fn compare_entries_by_ranking(
     a: &CoChangeEntry,
     b: &CoChangeEntry,
@@ -379,6 +417,12 @@ fn compare_entries_by_ranking(
     b.ranking_value(smoothing_on)
         .partial_cmp(&a.ranking_value(smoothing_on))
         .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| b.co_changes.cmp(&a.co_changes))
+        .then_with(|| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .then_with(|| a.file_a.cmp(&b.file_a))
         .then_with(|| a.file_b.cmp(&b.file_b))
 }
@@ -388,13 +432,17 @@ fn compare_entries_by_ranking(
 /// - 純粋追加 hunk (old_count = 0) は blame 不要なのでスキップする。
 /// - 全 hunk が純粋追加だった場合は空集合を返す。
 /// - blame の失敗 (binary / non-existent in base) は空集合を返して継続。
+///
+/// 戻り値は SHA → BlameInfo (`author_mail` / `author_time`) の map。
+/// author_unit_window_days > 0 のとき、unit ベース集計のキーとして使われる。
+/// porcelain で取れない場合は None のままにする (window=0 と等価扱い)。
 fn collect_blame_commits_for_file(
     dir: &str,
     file: &str,
     base: &str,
     rename: bool,
     copy: bool,
-) -> Result<HashSet<String>> {
+) -> Result<HashMap<String, BlameInfo>> {
     // diff --unified=0 で hunk header を取得
     let diff_output = Command::new("git")
         .args(["diff", "--unified=0", base, "HEAD", "--", file])
@@ -402,14 +450,14 @@ fn collect_blame_commits_for_file(
         .output()
         .map_err(|e| AstroError::new(ErrorCode::IoError, format!("Failed to run git: {e}")))?;
     if !diff_output.status.success() {
-        return Ok(HashSet::new());
+        return Ok(HashMap::new());
     }
     let diff_text = String::from_utf8_lossy(&diff_output.stdout);
 
     // hunk 旧側 (start, count) を抽出
     let ranges: Vec<(u64, u64)> = parse_hunk_old_ranges(&diff_text);
     if ranges.is_empty() {
-        return Ok(HashSet::new());
+        return Ok(HashMap::new());
     }
 
     // 1 起動の git blame に複数 -L を渡す。
@@ -436,29 +484,59 @@ fn collect_blame_commits_for_file(
         .output()
         .map_err(|e| AstroError::new(ErrorCode::IoError, format!("Failed to run git: {e}")))?;
     if !blame_output.status.success() {
-        return Ok(HashSet::new());
+        return Ok(HashMap::new());
     }
     let blame_text = String::from_utf8_lossy(&blame_output.stdout);
 
-    let mut shas: HashSet<String> = HashSet::new();
+    parse_blame_porcelain(&blame_text)
+}
+
+/// blame `--line-porcelain` 出力から SHA → BlameInfo を抽出する。
+/// 各 entry の先頭行 `<sha40> <orig> <final> [count]` をエントリ境界とし、
+/// それ以降の `author-mail <addr>` / `author-time <unix>` を SHA に紐付ける。
+fn parse_blame_porcelain(blame_text: &str) -> Result<HashMap<String, BlameInfo>> {
+    let mut out: HashMap<String, BlameInfo> = HashMap::new();
+    let mut current_sha: Option<String> = None;
     for line in blame_text.lines() {
-        // line-porcelain: 各エントリの先頭行は `<sha40> <orig_line> <final_line> [count]`。
-        // メタデータ行 (author / summary / filename) は日本語等のマルチバイト文字を含む
-        // ことがあるため、byte レベルで先頭 40 バイトが hex + 41 番目がスペースか確認する
-        // (str スライスを byte 境界で切るとパニックするため)。
         let bytes = line.as_bytes();
-        if bytes.len() < 41 || bytes[40] != b' ' {
+        // entry header: 40 hex + space + 残り
+        if bytes.len() >= 41
+            && bytes[40] == b' '
+            && bytes[..40].iter().all(|b| b.is_ascii_hexdigit())
+        {
+            let sha = std::str::from_utf8(&bytes[..40])
+                .expect("ascii hex is utf-8")
+                .to_string();
+            // 既出の SHA でも info を上書きしない (最初に出た情報を信頼)
+            out.entry(sha.clone()).or_default();
+            current_sha = Some(sha);
             continue;
         }
-        let sha_bytes = &bytes[..40];
-        if !sha_bytes.iter().all(|b| b.is_ascii_hexdigit()) {
+        // メタデータ行 (`author-mail <addr>` / `author-time <unix>`)
+        let Some(sha) = current_sha.as_ref() else {
             continue;
+        };
+        if let Some(rest) = line.strip_prefix("author-mail ") {
+            // git porcelain の author-mail は通常 `<addr>` で囲まれている
+            let trimmed = rest.trim().trim_start_matches('<').trim_end_matches('>');
+            if !trimmed.is_empty() {
+                out.entry(sha.clone()).or_default().author_mail = Some(trimmed.to_string());
+            }
+        } else if let Some(rest) = line.strip_prefix("author-time ")
+            && let Ok(t) = rest.trim().parse::<i64>()
+        {
+            out.entry(sha.clone()).or_default().author_time = Some(t);
         }
-        // 安全: ASCII hex のみで構成されているので UTF-8 検証は不要。
-        let sha = std::str::from_utf8(sha_bytes).expect("ascii hex is utf-8");
-        shas.insert(sha.to_string());
     }
-    Ok(shas)
+    Ok(out)
+}
+
+/// blame で抽出した SHA ごとのコミットメタデータ。
+/// `author_unit_window_days > 0` のとき、(author_mail, time_bucket) を unit キーとして使う。
+#[derive(Debug, Clone, Default)]
+struct BlameInfo {
+    author_mail: Option<String>,
+    author_time: Option<i64>,
 }
 
 /// `@@ -OLDSTART[,OLDCOUNT] +NEWSTART[,NEWCOUNT] @@` の OLDSTART/OLDCOUNT を抽出する。
@@ -654,6 +732,8 @@ mod tests {
             smoothing_beta: 4.0,
             // size weighting も無効化 (旧テストは均等カウント前提)。
             commit_size_pivot: 0,
+            // author 圧縮も無効化 (旧テストは raw weighted 集計前提)。
+            author_unit_window_days: 0,
             ..CoChangeOptions::default()
         };
         mutator(&mut o);
@@ -1487,6 +1567,9 @@ mod tests {
             min_samples: 1,
             min_denominator: 1,
             commit_size_pivot: 8,
+            // author 圧縮を無効化 (テスト config では全 commit が同 author なので、
+            // window > 0 だと unit=1 に圧縮されて denom が 1 になる)
+            author_unit_window_days: 0,
             smoothing_beta: 4.0,
             ..CoChangeOptions::default()
         };
@@ -1535,6 +1618,8 @@ mod tests {
             commit_size_pivot: 0, // 旧挙動 (size weighting 無効)
             smoothing_alpha: 1.0,
             smoothing_beta: 4.0,
+            // author 圧縮を無効化 (旧挙動再現のため)
+            author_unit_window_days: 0,
             ..CoChangeOptions::default()
         };
         let result = analyze_cochange(repo.to_str().unwrap(), &opts).unwrap();
@@ -1552,6 +1637,214 @@ mod tests {
             (entry.score.unwrap() - expected).abs() < 1e-9,
             "pivot=0 should reproduce legacy score: got {:?}, expected {expected}",
             entry.score
+        );
+    }
+
+    /// tie-break: ranking 値が同点なら co_changes 降順を優先する。
+    /// path 昇順だけでは「低 score 帯で co=2 の弱いペアが co=10 のペアより上に来る」
+    /// 不自然な順序が起きるが、co_changes 降順を入れることで解消される。
+    #[test]
+    fn tie_break_prefers_higher_co_changes_then_confidence() {
+        // 同 score を作るために、smoothing 無効 + 同 confidence のペアを 2 つ作る。
+        // confidence = co/denom が同じになるよう co=10/denom=20 と co=2/denom=4 にする。
+        let high_co = CoChangeEntry {
+            file_a: "z.rs".into(),
+            file_b: "y.rs".into(),
+            co_changes: 10,
+            total_changes_a: 20,
+            total_changes_b: 10,
+            confidence: 0.5,
+            denominator: Some(20),
+            score: Some(0.5),
+        };
+        let low_co = CoChangeEntry {
+            file_a: "a.rs".into(),
+            file_b: "b.rs".into(),
+            co_changes: 2,
+            total_changes_a: 4,
+            total_changes_b: 2,
+            confidence: 0.5,
+            denominator: Some(4),
+            score: Some(0.5),
+        };
+
+        // smoothing on/off の両方で同じ tie-break が効くことを確認
+        for smoothing_on in [true, false] {
+            let mut entries = [low_co.clone(), high_co.clone()];
+            entries.sort_by(|a, b| compare_entries_by_ranking(a, b, smoothing_on));
+            assert_eq!(
+                entries[0].co_changes, 10,
+                "higher co_changes must come first (smoothing_on={smoothing_on})"
+            );
+            assert_eq!(entries[1].co_changes, 2);
+        }
+    }
+
+    /// author 圧縮: 同一 author の連続 commit が 1 unit に圧縮されることで、
+    /// raw co_changes=2/denom=3 が unit ベース denom=1 に縮小し、score が下がる。
+    /// blame は base 時点の起点ファイルを走査するため、base 時点で各 commit の貢献が
+    /// 1 行ずつ残るように行追加で履歴を作る。
+    #[test]
+    fn author_unit_window_compresses_same_author_burst() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        // commit A: a.rs line 1 を書く (b.rs 無関係)
+        // commit B: a.rs line 2 を追加 + b.rs を変更
+        // commit C: a.rs line 3 を追加 + b.rs を変更
+        // commit D (last): a.rs を全行書き換え (起点 diff)
+        // base=HEAD~1=C, blame で {A,B,C} の 3 commit、b.rs と共起するのは B,C
+        commit_files(repo, &[("a.rs", "// l1\n")], "A");
+        commit_files(repo, &[("a.rs", "// l1\n// l2\n"), ("b.rs", "v0\n")], "B");
+        commit_files(
+            repo,
+            &[("a.rs", "// l1\n// l2\n// l3\n"), ("b.rs", "v1\n")],
+            "C",
+        );
+        commit_files(repo, &[("a.rs", "// new\n")], "edit a");
+
+        // window=0 (旧挙動): raw weighted。co=2, denom=3 (initial 含む)、α=1, β=4
+        // → score = (2+1)/(3+1+4) = 3/8 = 0.375
+        let opts_legacy = opts_with(|o| {
+            o.source_files = vec!["a.rs".to_string()];
+            o.base = Some("HEAD~1".to_string());
+            o.author_unit_window_days = 0;
+        });
+        let r_legacy = analyze_cochange(repo.to_str().unwrap(), &opts_legacy).unwrap();
+        let s_legacy = r_legacy
+            .entries
+            .iter()
+            .find(|e| e.file_b == "b.rs")
+            .map(|e| e.score.unwrap())
+            .expect("b.rs should be detected with legacy weighting");
+
+        // window=7: 同 author × 同 week で 1 unit に圧縮 → denom_units=1, co_units=1
+        // → score = (1+1)/(1+1+4) = 2/6 = 1/3 ≈ 0.333
+        let opts_unit = opts_with(|o| {
+            o.source_files = vec!["a.rs".to_string()];
+            o.base = Some("HEAD~1".to_string());
+            o.author_unit_window_days = 7;
+        });
+        let r_unit = analyze_cochange(repo.to_str().unwrap(), &opts_unit).unwrap();
+        let s_unit = r_unit
+            .entries
+            .iter()
+            .find(|e| e.file_b == "b.rs")
+            .map(|e| e.score.unwrap())
+            .expect("b.rs should still be detected with unit compression");
+
+        assert!(
+            s_unit < s_legacy,
+            "author-unit compression must lower score: legacy={s_legacy}, unit={s_unit}"
+        );
+    }
+
+    /// author 圧縮: window=0 (default の旧挙動) では `denom_units` / `co_units` が
+    /// 集計されず、score は従来どおり raw weighted のみで決まる。
+    #[test]
+    fn author_unit_window_zero_keeps_legacy_score() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        for i in 0..3 {
+            commit_files(
+                repo,
+                &[
+                    ("a.rs", &format!("fn a() {{ {i} }}\n")),
+                    ("b.rs", &format!("fn b() {{ {i} }}\n")),
+                ],
+                &format!("p{i}"),
+            );
+        }
+        commit_files(repo, &[("a.rs", "fn a() { 99 }\n")], "edit a");
+
+        let opts = opts_with(|o| {
+            o.source_files = vec!["a.rs".to_string()];
+            o.base = Some("HEAD~1".to_string());
+            o.author_unit_window_days = 0;
+            o.smoothing_beta = 4.0;
+            o.commit_size_pivot = 0;
+        });
+        let result = analyze_cochange(repo.to_str().unwrap(), &opts).unwrap();
+        let entry = result
+            .entries
+            .iter()
+            .find(|e| e.file_b == "b.rs")
+            .expect("b.rs should be detected");
+        // co=1, denom=1, α=1, β=4: score = (1+1)/(1+1+4) = 1/3
+        let expected = 1.0_f64 / 3.0;
+        assert!(
+            (entry.score.unwrap() - expected).abs() < 1e-9,
+            "window=0 should reproduce legacy weighted score: got {:?}",
+            entry.score
+        );
+    }
+
+    /// blame porcelain の `author-mail` / `author-time` を抽出できる。
+    #[test]
+    fn parse_blame_porcelain_extracts_author_metadata() {
+        let blame = "\
+abcd1234567890abcd1234567890abcd12345678 1 1 1
+author Test User
+author-mail <test@example.com>
+author-time 1700000000
+author-tz +0900
+committer Test User
+committer-mail <test@example.com>
+committer-time 1700000000
+committer-tz +0900
+summary p0
+filename a.rs
+\tfn a() {}
+fedc1234567890abcd1234567890abcd00000000 2 2 1
+author Other
+author-mail <other@example.com>
+author-time 1701000000
+filename a.rs
+\tfn b() {}
+";
+        let parsed = parse_blame_porcelain(blame).unwrap();
+        assert_eq!(parsed.len(), 2);
+        let info = parsed
+            .get("abcd1234567890abcd1234567890abcd12345678")
+            .unwrap();
+        assert_eq!(info.author_mail.as_deref(), Some("test@example.com"));
+        assert_eq!(info.author_time, Some(1_700_000_000));
+        let info2 = parsed
+            .get("fedc1234567890abcd1234567890abcd00000000")
+            .unwrap();
+        assert_eq!(info2.author_mail.as_deref(), Some("other@example.com"));
+    }
+
+    /// tie-break: ranking 値・co_changes 同点なら confidence 降順
+    #[test]
+    fn tie_break_prefers_higher_confidence_when_co_changes_equal() {
+        let high_conf = CoChangeEntry {
+            file_a: "z.rs".into(),
+            file_b: "y.rs".into(),
+            co_changes: 5,
+            total_changes_a: 5,
+            total_changes_b: 5,
+            confidence: 1.0,
+            denominator: Some(5),
+            score: Some(0.4),
+        };
+        let low_conf = CoChangeEntry {
+            file_a: "a.rs".into(),
+            file_b: "b.rs".into(),
+            co_changes: 5,
+            total_changes_a: 10,
+            total_changes_b: 10,
+            confidence: 0.5,
+            denominator: Some(10),
+            score: Some(0.4),
+        };
+
+        let mut entries = [low_conf.clone(), high_conf.clone()];
+        entries.sort_by(|a, b| compare_entries_by_ranking(a, b, true));
+        assert!(
+            (entries[0].confidence - 1.0).abs() < 1e-9,
+            "higher confidence must come first when score and co_changes tie"
         );
     }
 }

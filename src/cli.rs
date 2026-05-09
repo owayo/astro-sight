@@ -319,10 +319,18 @@ pub enum Commands {
         #[arg(long)]
         copy: bool,
 
-        /// Drop merge commits from the blame commit set before counting co-changes.
-        /// Useful when the repository has many squash-merge style merges that bloat diff-tree output.
-        #[arg(long)]
+        /// Drop merge commits from the blame commit set (default: enabled).
+        /// Merge commits' diff-tree is broad and tends to add noise to the candidate set,
+        /// so cochange filters them out by default. This flag is kept for explicit
+        /// affirmation and as a no-op fallback when paired with the legacy default.
+        #[arg(long, conflicts_with = "include_merges")]
         ignore_merges: bool,
+
+        /// Restore legacy behaviour by including merge commits in the blame commit set.
+        /// Use this when analysing a history dominated by squash/merge workflows
+        /// where the merge commit itself is the only place a related file appears.
+        #[arg(long, conflicts_with = "ignore_merges")]
+        include_merges: bool,
 
         /// Maximum number of blame commits allowed in the SHA set (0 = unlimited).
         /// Defends against pathological blame fan-out by aborting before the diff-tree phase.
@@ -361,6 +369,14 @@ pub enum Commands {
         /// Default 10 to keep output focused.
         #[arg(long, default_value = "10")]
         per_source_limit: usize,
+
+        /// Compress same-author commits within this window (days) into a single
+        /// "knowledge unit" before scoring. `0` disables compression (legacy
+        /// behaviour). Default 7 (= weekly bursts collapse to one unit), which
+        /// suppresses false positives from a single author's consecutive commits
+        /// while keeping multi-author co-changes ranked highly.
+        #[arg(long, default_value = "7")]
+        author_unit_window_days: u64,
     },
 
     /// Structured review: integrates impact, cochange, API surface diff, and dead symbol detection
@@ -389,8 +405,10 @@ pub enum Commands {
         #[arg(long)]
         staged: bool,
 
-        /// Minimum cochange confidence threshold (0.0 to 1.0, default: 0.7)
-        #[arg(long, default_value = "0.7")]
+        /// Minimum cochange confidence threshold (0.0 to 1.0). Default 0.3 to match
+        /// blame-mode score semantics; use lower values to surface more
+        /// `missing_cochanges` candidates, higher to be stricter.
+        #[arg(long, default_value = "0.3")]
         min_confidence: f64,
 
         /// Append triage hint for AI agent hooks

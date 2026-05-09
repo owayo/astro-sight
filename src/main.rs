@@ -364,6 +364,7 @@ fn run(cli: Cli) -> Result<()> {
             rename,
             copy,
             ignore_merges,
+            include_merges,
             max_blame_commits,
             timeout_secs,
             no_smoothing,
@@ -371,6 +372,7 @@ fn run(cli: Cli) -> Result<()> {
             smoothing_beta,
             min_denominator,
             per_source_limit,
+            author_unit_window_days,
         } => {
             let source_files = astro_sight::commands::resolve_blame_source_files(
                 &dir,
@@ -380,6 +382,16 @@ fn run(cli: Cli) -> Result<()> {
                 paths_file.as_deref(),
                 &exclude_globs,
             )?;
+            // 既定 true。`--include-merges` で旧挙動 (false) に戻す。
+            // `--ignore-merges` は no-op として残しているが互換のため明示 ON も尊重する。
+            let defaults = astro_sight::models::cochange::CoChangeOptions::default();
+            let resolved_ignore_merges = if include_merges {
+                false
+            } else if ignore_merges {
+                true
+            } else {
+                defaults.ignore_merges
+            };
             let opts = astro_sight::models::cochange::CoChangeOptions {
                 source_files,
                 base,
@@ -391,7 +403,7 @@ fn run(cli: Cli) -> Result<()> {
                 max_source_files,
                 rename,
                 copy,
-                ignore_merges,
+                ignore_merges: resolved_ignore_merges,
                 max_blame_commits,
                 timeout_secs,
                 smoothing_alpha,
@@ -399,6 +411,7 @@ fn run(cli: Cli) -> Result<()> {
                 disable_smoothing: no_smoothing,
                 min_denominator,
                 per_source_limit,
+                author_unit_window_days,
             };
             cmd_cochange(&service, &dir, &opts, pretty)
         }

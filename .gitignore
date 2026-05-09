@@ -29,3 +29,9 @@ target
 .cargo/config.toml
 
 .claude/settings.json
+
+# reference-improver 等のローカルプラン/ベンチマークドキュメントは
+# 個別に作成・破棄するためコミットしない
+IMPROVEMENT_PLAN.md
+IMPROVEMENT_PLAN_*.md
+BENCHMARK_*.md

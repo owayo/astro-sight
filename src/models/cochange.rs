@@ -92,6 +92,12 @@ pub struct CoChangeOptions {
     pub min_denominator: usize,
     /// 起点ごとの候補上位 N 件に絞る。0 = 無制限。
     pub per_source_limit: usize,
+    /// 同一 author × 時間 window で commit を 1 knowledge unit として圧縮するときの
+    /// window (日)。`0` で無効化 (= raw weighted 集計、旧挙動)。
+    /// `> 0` のとき、score は `(|co_units| + α) / (|denom_units| + α + β)` で計算され、
+    /// 同じ author の短時間 burst による偽陽性を抑制する。
+    /// 推奨値 7 (週単位)。
+    pub author_unit_window_days: u64,
 }
 
 impl Default for CoChangeOptions {
@@ -108,7 +114,9 @@ impl Default for CoChangeOptions {
             commit_size_pivot: 8,
             rename: false,
             copy: false,
-            ignore_merges: false,
+            // マージコミットは diff-tree が広く候補をぶれさせるため、既定で除外する。
+            // `--include-merges` (CLI) で旧挙動 (false) に戻せる。
+            ignore_merges: true,
             max_blame_commits: 0,
             timeout_secs: 0,
             smoothing_alpha: 1.0,
@@ -119,6 +127,9 @@ impl Default for CoChangeOptions {
             min_denominator: 2,
             // 推奨値 10: 起点ごとの候補を上位 10 件に絞り、出力ノイズを抑える。
             per_source_limit: 10,
+            // 既定 7 (週単位): 同一 author の短時間 burst による偽陽性を抑制する。
+            // `0` で旧挙動 (raw weighted 集計、author 圧縮なし) に戻せる。
+            author_unit_window_days: 7,
         }
     }
 }
