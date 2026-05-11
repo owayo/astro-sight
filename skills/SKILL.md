@@ -289,7 +289,7 @@ astro-sight cochange --dir . --paths src/service.rs
 # Track renames/copies for refactor-heavy histories
 astro-sight cochange --dir . --git --base HEAD~10 --rename --copy
 
-# Tune Bayesian smoothing (default: alpha=1.0, beta=4.0)
+# Disable Bayesian smoothing when raw confidence is needed (default prior: alpha=1.0, beta=8.0)
 astro-sight cochange --dir . --git --base HEAD~5 --no-smoothing
 ```
 
@@ -299,6 +299,10 @@ Output: `entries` array with `file_a`, `file_b`, `co_changes`, `confidence`,
 Requires `--git` or `--paths` / `--paths-file`. Default exclusions skip
 `vendor/`, `node_modules/`, `dist/`, lock files, and minified assets when
 collecting source files via `--git`; explicit `--paths` are kept as-is.
+`--paths-file` is read with the same 100MB input cap as other user-supplied
+file inputs. `--min-confidence` must be finite in `0.0..=1.0`; smoothing
+priors (`--smoothing-alpha` / `--smoothing-beta`) must be finite
+non-negative values.
 
 ### `ast` — AST Fragment Extraction
 
@@ -447,7 +451,7 @@ astro-sight dead-code --dir . --git
 - `session` supports `ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange` (note: `review` is CLI-only, not available in session mode)
 - With `ASTRO_SIGHT_WORKSPACE`, session-relative `path` / `dir` values resolve from the workspace root, not the process cwd; invalid workspace values fail closed
 - CI-language-only diffs (currently Xojo) return empty results before parsing in `context` / `impact` / `review` / `dead-code --git` to avoid OOM; deletion diffs use the old path for language detection
-- **Input validation**: Empty `--name`/`--names`, empty `--paths`/`--paths-file` are rejected with `INVALID_REQUEST` error. `--base` for `context`/`impact`/`review` rejects values starting with `-` (blocks option-style injection into `git diff` / `git show` / `git blame`)
+- **Input validation**: Empty `--name`/`--names`, empty `--paths`/`--paths-file` are rejected with `INVALID_REQUEST` error. `--paths-file` is capped at 100MB. `cochange` rejects non-finite/out-of-range `--min-confidence` and non-finite/negative smoothing priors. `--base` for `context`/`impact`/`review` rejects values starting with `-` (blocks option-style injection into `git diff` / `git show` / `git blame`)
 - **Large repositories (10k+ source files)**: `review --dir .` runs `context` + `cochange` + API diff + dead-code in one process and is the heaviest command. On very large monorepos it can exhaust memory. Mitigations:
   - Narrow `--dir` to a module-level subtree (`--dir packages/server` instead of `--dir .`)
   - For diff-based commands (`review` / `impact` / `context` / `dead-code --git`), bound the window with `--base HEAD~N`

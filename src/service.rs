@@ -558,6 +558,24 @@ impl AppService {
                 "max_files_per_commit must be >= 1".to_string(),
             ));
         }
+        if !opts.smoothing_alpha.is_finite() || opts.smoothing_alpha < 0.0 {
+            bail!(AstroError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "smoothing_alpha must be a finite non-negative value, got {}",
+                    opts.smoothing_alpha
+                ),
+            ));
+        }
+        if !opts.smoothing_beta.is_finite() || opts.smoothing_beta < 0.0 {
+            bail!(AstroError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "smoothing_beta must be a finite non-negative value, got {}",
+                    opts.smoothing_beta
+                ),
+            ));
+        }
 
         let canonical_dir = self.validate_dir(dir)?;
         let dir_str = canonical_dir.to_string_lossy();

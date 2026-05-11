@@ -386,6 +386,23 @@ astro-sight dead-code --dir . --git --staged
 - **Python pytest**: `test_*.py` / `*_test.py` ファイルのトップレベル `test_*` 関数と `conftest.py` 内のすべての関数
 - **Python フレームワーク登録デコレータ**: Typer / Click / FastAPI / Flask / Django / Celery / pytest 等の登録デコレータが付いた関数・メソッド・クラス
 
+### cochange - 共変更パターン検出
+
+git blame と diff-tree から、指定ファイルと一緒に変更されやすいファイルを検出する。`review --git --base <rev>` の `missing_cochanges` でも同じ解析を使う。
+
+```bash
+# git diff から起点ファイルを自動取得
+astro-sight cochange --dir . --git --base HEAD~5
+
+# 起点ファイルを明示
+astro-sight cochange --dir . --paths src/service.rs
+
+# rename / copy を追跡
+astro-sight cochange --dir . --git --base HEAD~10 --rename --copy
+```
+
+`--paths-file` は 100MB 上限付きで読み込まれ、空リストは `INVALID_REQUEST` を返す。`--min-confidence` は有限な `0.0..=1.0`、`--smoothing-alpha` / `--smoothing-beta` は有限な非負値のみ受け付ける。
+
 ### doctor - 対応言語チェック
 
 ```bash
@@ -432,7 +449,7 @@ astro-sight ast --paths src/lib.rs,src/main.rs --depth 2
 astro-sight calls --paths src/lib.rs,src/main.rs
 ```
 
-`--paths` / `--paths-file` は 1 件以上の有効なパスが必要。空リストは `INVALID_REQUEST` を返す。
+`--paths` / `--paths-file` は 1 件以上の有効なパスが必要。空リストは `INVALID_REQUEST` を返す。`--paths-file` は 100MB 上限付きで読み込まれる。
 
 個別ファイルのエラーは行内 JSON エラーとして出力される（プロセスは成功終了）:
 ```jsonl

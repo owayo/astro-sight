@@ -128,12 +128,7 @@ fn resolve_paths(
         }
         Ok(PathInput::Batch(list))
     } else if let Some(pf) = paths_file {
-        let content = std::fs::read_to_string(pf)?;
-        let list: Vec<String> = content
-            .lines()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let list = commands::read_paths_file_limited(pf, commands::MAX_INPUT_SIZE)?;
         if list.is_empty() {
             return Err(AstroError::new(
                 ErrorCode::InvalidRequest,

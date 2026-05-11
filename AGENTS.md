@@ -15,8 +15,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - **デフォルト compact JSON** 出力（`--pretty` で整形出力）
 - **バッチ処理**（`--paths` / `--paths-file` で複数ファイル NDJSON 出力）
 - **JSON エラー出力**（`{"error":{"code":"...","message":"..."}}` を stdout に出力）
-- **入力検証の強化**（`refs` の空 `name/names` を拒否、`--paths` / `--paths-file` の空リストを拒否、`session` の空文字・非 UTF-8・不正パスの `ASTRO_SIGHT_WORKSPACE` を拒否、`--dir` にはディレクトリのみ許可、streaming `context` は JSON prefix 出力前に入力を検証）
-- **セキュリティ** — パス境界チェック（Session/MCP のワークスペースサンドボックス、相対パスはワークスペースルート基準、非 UTF-8 パスは canonicalize 後に fail-closed で拒否）、ファイル/入力サイズ 100MB 上限（`session` / `context` / `impact` の生入力を含む）、`git diff` / `git show` / `git blame` に渡す `--base` 等 revision は `-` プレフィクス / NUL / 空文字を拒否（オプション誤認識防止、`cochange --blame` の `--paths` / `--paths-file` 経由でも検証）
+- **入力検証の強化**（`refs` の空 `name/names` を拒否、`--paths` / `--paths-file` の空リストを拒否、`--paths-file` は 100MB 上限付きで読み込み、`cochange` の `min_confidence` / smoothing prior は有限範囲に制限、`session` の空文字・非 UTF-8・不正パスの `ASTRO_SIGHT_WORKSPACE` を拒否、`--dir` にはディレクトリのみ許可、streaming `context` は JSON prefix 出力前に入力を検証）
+- **セキュリティ** — パス境界チェック（Session/MCP のワークスペースサンドボックス、相対パスはワークスペースルート基準、非 UTF-8 パスは canonicalize 後に fail-closed で拒否）、ファイル/入力サイズ 100MB 上限（`session` / `context` / `impact` の生入力、`--paths-file` を含む）、`git diff` / `git show` / `git blame` に渡す `--base` 等 revision は `-` プレフィクス / NUL / 空文字を拒否（オプション誤認識防止、`cochange --blame` の `--paths` / `--paths-file` 経由でも検証）
 - **トークン最適化** — version フィールド省略（doctor/MCP のみ）、compact キー短縮（`lang`/`ln`/`col`/`ctx`/`refs`/`src`/`def`/`ref`/`fn`/`cx` 等）、calls を caller グルーピング、CompactAstEdge フラット化、refs/context で相対パス出力、symbols デフォルト compact 出力（`--doc` で docstring 付加、`--full` で旧来の完全出力）
 - **dead-code 規約除外** — PHPUnit 規約 (`*Test` / `*TestCase` クラス、`testXxx` / `setUp` / `tearDown` 等) と Python unittest/pytest 規約 (`unittest.TestCase` 派生クラス + 同一ファイル内の間接継承を fixed-point で解決、`test_*` / `setUp` / `tearDown` / `setUpClass` / `tearDownClass` / `addCleanup` / `addClassCleanup` メソッド、`test_*.py` / `*_test.py` のトップレベル `test_*` 関数、`conftest.py` 内の関数) を dead-code から除外（テストランナーが動的 discover するため）
 - **循環的複雑度** — symbols 出力に `cx`（cyclomatic complexity）を付加（関数/メソッドのみ、ベース1 + 分岐ノード数、ネスト関数/クロージャは除外）、言語別分岐ノード定義（Rust/JS/TS/Python/Go/Java/Kotlin/Ruby/PHP/C#等）
@@ -25,7 +25,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Key Modules
 
-- `src/service.rs` - **AppService**: 全コア操作の統一エントリポイント（extract_ast/symbols/calls/imports/lint/sequence/cochange, find_references/find_references_batch, analyze_context + パス検証 + tracing ログ）
+- `src/service.rs` - **AppService**: 全コア操作の統一エントリポイント（extract_ast/symbols/calls/imports/lint/sequence/cochange, find_references/find_references_batch, analyze_context + パス検証 + cochange オプション検証 + tracing ログ）
 - `src/skill.rs` - スキルインストール（`skill-install claude/codex` → ~/.claude/skills/ or ~/.codex/skills/）
 - `src/config.rs` - 設定ファイル管理（ConfigService: load/generate、TOML 形式）
 - `src/logger.rs` - ロギング（logroller 日次ローテーション、3日保持、tracing-subscriber）

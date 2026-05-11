@@ -20,7 +20,7 @@ use crate::service::{AppService, AstParams};
 // 共通ヘルパー
 // ---------------------------------------------------------------------------
 
-const MAX_INPUT_SIZE: usize = 100 * 1024 * 1024;
+pub const MAX_INPUT_SIZE: usize = 100 * 1024 * 1024;
 
 /// 現在プロセスの RSS を KB 単位で取得 (Linux のみ正確、その他 OS は None)。
 /// `astro-sight review` の各フェーズが何 GB 消費しているかを CI の artifacts ログで
@@ -173,6 +173,27 @@ fn read_file_to_string_limited(path: &str, max_bytes: usize) -> Result<String> {
         .into());
     }
     read_to_string_limited(file, max_bytes, path)
+}
+
+pub fn read_paths_file_limited(path: &str, max_bytes: usize) -> Result<Vec<String>> {
+    let content = match read_file_to_string_limited(path, max_bytes) {
+        Ok(content) => content,
+        Err(e) if e.downcast_ref::<AstroError>().is_some() => return Err(e),
+        Err(e) => {
+            return Err(AstroError::new(
+                ErrorCode::IoError,
+                format!("failed to read paths file {path}: {e}"),
+            )
+            .into());
+        }
+    };
+
+    Ok(content
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 fn cache_hash_for_path(path: &camino::Utf8Path, source: &[u8]) -> String {
@@ -510,17 +531,8 @@ pub fn resolve_blame_source_files(
     let mut set: BTreeSet<String> = BTreeSet::new();
 
     if let Some(file_path) = paths_file {
-        let content = std::fs::read_to_string(file_path).map_err(|e| {
-            anyhow::Error::from(crate::error::AstroError::new(
-                crate::error::ErrorCode::IoError,
-                format!("failed to read paths file {file_path}: {e}"),
-            ))
-        })?;
-        for line in content.lines() {
-            let p = line.trim();
-            if !p.is_empty() {
-                set.insert(p.to_string());
-            }
+        for path in read_paths_file_limited(file_path, MAX_INPUT_SIZE)? {
+            set.insert(path);
         }
     }
     if let Some(s) = paths {
@@ -3614,6 +3626,30 @@ mod tests {
             .expect_err("invalid utf-8 should fail");
 
         assert!(err.to_string().contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn read_paths_file_limited_trims_blank_lines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("paths.txt");
+        fs::write(&path, " src/main.rs \n\nCargo.toml\n").expect("write paths file");
+
+        let paths =
+            read_paths_file_limited(path.to_str().expect("utf-8 path"), 1024).expect("read paths");
+
+        assert_eq!(paths, vec!["src/main.rs", "Cargo.toml"]);
+    }
+
+    #[test]
+    fn read_paths_file_limited_rejects_oversized_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("paths.txt");
+        fs::write(&path, "abcde").expect("write paths file");
+
+        let err = read_paths_file_limited(path.to_str().expect("utf-8 path"), 4)
+            .expect_err("oversized paths-file should fail");
+
+        assert!(err.to_string().contains("exceeds maximum size"));
     }
 
     #[test]

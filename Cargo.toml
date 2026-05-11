@@ -16,7 +16,7 @@ camino = { version = "1.2.2", features = ["serde1"] }
 clap = { version = "4.6.1", features = ["derive"] }
 ahash = "0.8.12"
 aho-corasick = "1.1.4"
-hashbrown = "0.17.0"
+hashbrown = "0.17.1"
 ignore = "0.4.25"
 lru = "0.18.0"
 memchr = "2.8.0"

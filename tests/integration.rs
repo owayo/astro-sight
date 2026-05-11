@@ -1526,6 +1526,29 @@ fn cochange_rejects_invalid_confidence() {
     );
 }
 
+#[test]
+fn cochange_rejects_invalid_smoothing_priors() {
+    for (arg, expected) in [
+        ("--smoothing-alpha=-1", "smoothing_alpha"),
+        ("--smoothing-beta=-1", "smoothing_beta"),
+    ] {
+        let output = cargo_bin()
+            .args(["cochange", "--dir", ".", "--paths", "src/main.rs", arg])
+            .output()
+            .expect("failed to run");
+        assert!(!output.status.success(), "{arg} should fail");
+
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(expected),
+            "expected {expected} in error message, got: {json}"
+        );
+    }
+}
+
 // ---- Refs --names batch tests ----
 
 #[test]
