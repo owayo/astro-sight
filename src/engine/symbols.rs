@@ -661,6 +661,253 @@ pub fn python_class_base_names(root: Node, source: &[u8], symbol_range: &Range) 
     bases
 }
 
+/// PHP の擬似 enum (Java enum 風 static factory) パターンを判定する。
+///
+/// 擬似 enum とは次の形のメソッドを指す。Laravel / DDD 系プロジェクトで
+/// `AbstractValueObjectString` を継承した値オブジェクトに大量に存在し、識別子レベルの
+/// cross-file refs では caller が追跡できない (migration の文字列リテラル / DB 列値 /
+/// reflection annotation 経由で利用される) ため dead 判定すると 100+ 件単位の
+/// false positive が出る。
+///
+/// ```php
+/// public static function FOO(): self {
+///     return new self('FOO');
+/// }
+/// ```
+///
+/// 判定条件 (すべて満たす場合のみ true):
+/// - PHP のメソッド宣言ノード
+/// - `static` 修飾子付き
+/// - 戻り値型注釈が `self` または `static`
+/// - 本体に `return new self(<string literal>)` または `return new static(<string literal>)`
+/// - 文字列引数のテキストがメソッド名と完全一致 (case-sensitive)
+///
+/// 第 4 引数 `enclosing_extends_value_object` は本関数の責務外の判定で、
+/// 呼び出し側が「`extends AbstractValueObject*` のクラス所属」を確認した場合に
+/// `true` を渡すと、より厳格な判定としてフィルタを通す (現状は判定本体には使わない
+/// が、将来的により厳しい条件を追加する余地として API シグネチャに残す)。
+pub fn is_php_pseudo_enum_method(
+    root: Node,
+    source: &[u8],
+    symbol_range: &Range,
+    method_name: &str,
+) -> bool {
+    let start = tree_sitter::Point {
+        row: symbol_range.start.line,
+        column: symbol_range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: symbol_range.end.line,
+        column: symbol_range.end.column,
+    };
+    let Some(node) = root.descendant_for_point_range(start, end) else {
+        return false;
+    };
+
+    // method_declaration 祖先を取る
+    let mut decl_node = None;
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if n.kind() == "method_declaration" {
+            decl_node = Some(n);
+            break;
+        }
+        current = n.parent();
+    }
+    let Some(decl) = decl_node else {
+        return false;
+    };
+
+    // static 修飾子チェック
+    if !php_method_has_static_modifier(decl, source) {
+        return false;
+    }
+
+    // 戻り値型注釈が self または static
+    if !php_return_type_is_self_or_static(decl, source) {
+        return false;
+    }
+
+    // 本体内で `return new self(method_name)` 相当を検出
+    let Some(body) = decl.child_by_field_name("body") else {
+        return false;
+    };
+    php_body_returns_new_self_with_name(body, source, method_name)
+}
+
+fn php_method_has_static_modifier(decl: Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = decl.walk();
+    for child in decl.children(&mut cursor) {
+        // tree-sitter-php では static 修飾子は `static_modifier` として直接 child に出る。
+        if child.kind() == "static_modifier" {
+            return true;
+        }
+        // フォールバック: テキスト走査で `static` キーワードを含むかチェック (古いノード名対応)
+        if child.kind() == "visibility_modifier" || child.kind() == "abstract_modifier" {
+            continue;
+        }
+        if let Ok(text) = child.utf8_text(source)
+            && text.split_whitespace().any(|tok| tok == "static")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn php_return_type_is_self_or_static(decl: Node<'_>, source: &[u8]) -> bool {
+    // tree-sitter-php では戻り値型は `return_type` フィールドにある (named_type / primitive_type)
+    let Some(rt) = decl.child_by_field_name("return_type") else {
+        return false;
+    };
+    let Ok(text) = rt.utf8_text(source) else {
+        return false;
+    };
+    let trimmed = text.trim();
+    matches!(trimmed, "self" | "static")
+}
+
+/// 本体に `return new self('NAME')` または `return new static('NAME')` があり、
+/// 引数の文字列リテラル内容が `method_name` と一致するかを判定する。
+fn php_body_returns_new_self_with_name(body: Node<'_>, source: &[u8], method_name: &str) -> bool {
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        if php_node_returns_new_self_with_name(child, source, method_name) {
+            return true;
+        }
+    }
+    false
+}
+
+fn php_node_returns_new_self_with_name(node: Node<'_>, source: &[u8], method_name: &str) -> bool {
+    // return_statement → object_creation_expression を探す
+    if node.kind() == "return_statement" {
+        // return の expression を取得
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "object_creation_expression"
+                && php_object_creation_matches_name(child, source, method_name)
+            {
+                return true;
+            }
+        }
+    }
+    // 再帰: ネストした control flow (try/match/if) の中も探す
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if php_node_returns_new_self_with_name(child, source, method_name) {
+            return true;
+        }
+    }
+    false
+}
+
+fn php_object_creation_matches_name(node: Node<'_>, source: &[u8], method_name: &str) -> bool {
+    // `new self('NAME')` の type 部分が self / static
+    let type_node = node.child_by_field_name("type").or_else(|| {
+        // tree-sitter-php のバージョンによっては type フィールドが付かないので
+        // 子ノードから直接探す
+        let mut cursor = node.walk();
+        node.children(&mut cursor).find(|c| {
+            matches!(
+                c.kind(),
+                "name" | "scoped_call_expression" | "qualified_name"
+            )
+        })
+    });
+    let type_ok = type_node
+        .and_then(|n| n.utf8_text(source).ok())
+        .is_some_and(|t| matches!(t.trim(), "self" | "static"));
+    if !type_ok {
+        return false;
+    }
+
+    // 引数リスト (arguments) を取得
+    let args = node.child_by_field_name("arguments").or_else(|| {
+        let mut cursor = node.walk();
+        node.children(&mut cursor).find(|c| c.kind() == "arguments")
+    });
+    let Some(args) = args else {
+        return false;
+    };
+
+    // 1 つ目の引数が string literal で、その中身が method_name と一致するかをチェック
+    let mut cursor = args.walk();
+    for child in args.children(&mut cursor) {
+        // argument ノードを skip して中身の string literal を探す
+        let actual = if child.kind() == "argument" {
+            child.named_child(0)
+        } else {
+            Some(child)
+        };
+        let Some(actual) = actual else { continue };
+        if matches!(actual.kind(), "string" | "encapsed_string") {
+            // string ノードの中身は string_value / string_content / encapsed_string で囲まれる
+            let Ok(raw) = actual.utf8_text(source) else {
+                continue;
+            };
+            // クォートを剥がす ('FOO' / "FOO" のいずれも対応)
+            let trimmed = raw.trim();
+            let stripped = trimmed
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+                .or_else(|| trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')));
+            if let Some(literal) = stripped
+                && literal == method_name
+            {
+                return true;
+            }
+            // 1 つ目の引数で結論が出たので break
+            return false;
+        }
+    }
+    false
+}
+
+/// PHP メソッドの docstring (`/** ... */`) に runtime annotation が含まれるかを判定する。
+///
+/// `@TypeItem`, `@dataProvider`, `@DataProvider`, `@Route`, `@Listen` 等、reflection
+/// 経由でフレームワークから動的に呼ばれることを示すアノテーションが付いていれば true。
+/// `Symbol.doc` から渡される文字列をチェックするため AST 走査は不要。
+pub fn php_doc_has_runtime_annotation(doc: &str) -> bool {
+    // `@\App\Annotations\TypeItem(...)` のような fully qualified 形式と
+    // `@TypeItem(...)` のような short 形式の両方に対応するため、`@<Identifier>` を
+    // 走査する。識別子の頭文字が大文字 (PHP の attribute / annotation 慣習) を要件にする。
+    for token in doc.split('@').skip(1) {
+        // token の先頭から識別子部分だけ取り出す
+        let name: String = token
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '\\')
+            .collect();
+        let last = name.rsplit('\\').next().unwrap_or(name.as_str());
+        // 大文字始まりの annotation (PSR / Doctrine 慣習) を検出
+        if last.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            // `@TypeItem`, `@DataProvider`, `@Route`, `@Listen`, `@Bean` 等
+            return true;
+        }
+        // 小文字始まりでも reflection 経由でよく使われるものは別途列挙
+        const RUNTIME_LOWER_ANNOTATIONS: &[&str] = &[
+            "dataProvider",
+            "depends",
+            "test",
+            "before",
+            "after",
+            "beforeClass",
+            "afterClass",
+            "covers",
+            "uses",
+            "group",
+            "ticket",
+            "preserveGlobalState",
+            "runInSeparateProcess",
+        ];
+        if RUNTIME_LOWER_ANNOTATIONS.contains(&last) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Rust のシンボルが trait impl ブロックに属しているかを判定する。
 /// trait impl メソッドは trait dispatch 経由で呼ばれるため、cross-file refs
 /// 検索では caller を追跡できず、dead-code 判定でスキップする必要がある。
@@ -2065,5 +2312,129 @@ class Cli:
         let foo = syms.iter().find(|s| s.name == "Foo").expect("class Foo");
         let bases = python_class_base_names(root, src.as_bytes(), &foo.range);
         assert_eq!(bases, vec!["Bar".to_string()]);
+    }
+
+    /// PHP 擬似 enum パターンの判定 (Laravel/DDD 系の AbstractValueObject 派生)
+    #[test]
+    fn is_php_pseudo_enum_method_detects_value_object_factory() {
+        let src = r#"<?php
+class MenuName {
+    public static function MENU_HOME(): self {
+        return new self('MENU_HOME');
+    }
+    public static function MENU_NEW_FEATURE(): static {
+        return new static('MENU_NEW_FEATURE');
+    }
+    public static function notPseudo(): self {
+        return new self('different_name');
+    }
+    public function instanceMethod(): self {
+        return new self('instanceMethod');
+    }
+}
+"#;
+        let language = LangId::Php.ts_language();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+
+        let syms = extract_symbols(root, src.as_bytes(), LangId::Php).unwrap();
+
+        let menu_home = syms
+            .iter()
+            .find(|s| s.name == "MENU_HOME")
+            .expect("MENU_HOME");
+        assert!(
+            is_php_pseudo_enum_method(root, src.as_bytes(), &menu_home.range, "MENU_HOME"),
+            "self ベースの擬似 enum を検出すべき"
+        );
+
+        let menu_new = syms
+            .iter()
+            .find(|s| s.name == "MENU_NEW_FEATURE")
+            .expect("MENU_NEW_FEATURE");
+        assert!(
+            is_php_pseudo_enum_method(root, src.as_bytes(), &menu_new.range, "MENU_NEW_FEATURE"),
+            "static ベースの擬似 enum も検出すべき"
+        );
+
+        let not_pseudo = syms
+            .iter()
+            .find(|s| s.name == "notPseudo")
+            .expect("notPseudo");
+        assert!(
+            !is_php_pseudo_enum_method(root, src.as_bytes(), &not_pseudo.range, "notPseudo"),
+            "メソッド名と new self('...') の文字列が不一致なら擬似 enum ではない"
+        );
+
+        let instance_method = syms
+            .iter()
+            .find(|s| s.name == "instanceMethod")
+            .expect("instanceMethod");
+        assert!(
+            !is_php_pseudo_enum_method(
+                root,
+                src.as_bytes(),
+                &instance_method.range,
+                "instanceMethod"
+            ),
+            "static でないメソッドは擬似 enum ではない"
+        );
+    }
+
+    /// 戻り値型が self/static でないと擬似 enum とみなさない
+    #[test]
+    fn is_php_pseudo_enum_method_requires_self_return_type() {
+        let src = r#"<?php
+class Foo {
+    public static function BAR(): Foo {
+        return new self('BAR');
+    }
+}
+"#;
+        let language = LangId::Php.ts_language();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+
+        let syms = extract_symbols(root, src.as_bytes(), LangId::Php).unwrap();
+        let bar = syms.iter().find(|s| s.name == "BAR").expect("BAR");
+        assert!(
+            !is_php_pseudo_enum_method(root, src.as_bytes(), &bar.range, "BAR"),
+            "戻り値型が self/static でないと擬似 enum とは判定しない"
+        );
+    }
+
+    /// PHP runtime annotation の検出 (`@TypeItem`, `@Route`, `@dataProvider` 等)
+    #[test]
+    fn php_doc_has_runtime_annotation_detects_uppercase_annotations() {
+        // @TypeItem fully-qualified
+        assert!(php_doc_has_runtime_annotation(
+            "/**\n * @\\App\\Annotations\\TypeItem(id=1, name=\"X\")\n */"
+        ));
+        // @TypeItem short
+        assert!(php_doc_has_runtime_annotation("/** @TypeItem(...) */"));
+        // @Route
+        assert!(php_doc_has_runtime_annotation("/** @Route(...) */"));
+        // @dataProvider (lowercase 慣用)
+        assert!(php_doc_has_runtime_annotation(
+            "/** @dataProvider voEvent */"
+        ));
+        // @DataProvider (PHPUnit 11 形式)
+        assert!(php_doc_has_runtime_annotation(
+            "/** @DataProvider('foo') */"
+        ));
+    }
+
+    #[test]
+    fn php_doc_has_runtime_annotation_skips_plain_docstring() {
+        // 通常コメント
+        assert!(!php_doc_has_runtime_annotation("/** メニュー: ホーム */"));
+        // @param / @return / @var (低リスクの常識的タグ)
+        assert!(!php_doc_has_runtime_annotation("/** @param int $x */"));
+        assert!(!php_doc_has_runtime_annotation("/** @return self */"));
+        assert!(!php_doc_has_runtime_annotation("/** @var string */"));
     }
 }

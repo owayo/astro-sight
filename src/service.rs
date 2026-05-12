@@ -749,6 +749,7 @@ mod tests {
             column: 5,
             context: None,
             kind: None,
+            confidence: None,
         }];
         let result = relativize_paths(refs, dir);
         assert_eq!(result[0].path, "src/main.rs");
@@ -765,6 +766,7 @@ mod tests {
             column: 0,
             context: None,
             kind: None,
+            confidence: None,
         }];
         let result = relativize_paths(refs, dir);
         assert_eq!(result[0].path, "/other/path/file.rs");

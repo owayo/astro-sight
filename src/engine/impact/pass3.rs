@@ -103,6 +103,7 @@ pub(super) fn build_file_impact(ctx: FileContext, mut caller_map: CallerMap) -> 
                 name,
                 line,
                 symbols,
+                confidence: None,
             }
         })
         .collect();
@@ -114,5 +115,6 @@ pub(super) fn build_file_impact(ctx: FileContext, mut caller_map: CallerMap) -> 
         affected_symbols: ctx.affected,
         signature_changes: ctx.sig_changes,
         impacted_callers,
+        low_confidence_callers: Vec::new(),
     }
 }

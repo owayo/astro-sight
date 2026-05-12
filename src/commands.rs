@@ -2060,6 +2060,23 @@ pub(crate) fn detect_dead_symbols_from_files(
             file: file.clone(),
         };
         if test_cnt > 0 {
+            // PHPUnit テストクラス内のメソッドが test 配下からのみ参照されている場合は
+            // 同一クラス内の self::/static::/$this-> ヘルパー、または @dataProvider /
+            // @depends / #[DataProvider] 経由で reflection 呼び出しされる helper である
+            // 可能性が高く、test_only_symbols としてレポートしてもユーザーには
+            // 「テストランナーが内部で使うだけのノイズ」になる。container 名が PHPUnit
+            // テストクラス規約に合致するメソッドは test_only からも除外する。
+            if matches!(*lang, crate::language::LangId::Php)
+                && let Some((container, _)) = name.rsplit_once('.')
+            {
+                let container_short = container
+                    .rsplit_once('.')
+                    .map(|(_, t)| t)
+                    .unwrap_or(container);
+                if is_phpunit_test_class_name(container_short) {
+                    continue;
+                }
+            }
             test_only.push(sym);
         } else {
             dead.push(sym);
@@ -2322,6 +2339,32 @@ fn filter_exported_symbols(
         // `*FeatureTest` クラスは PHPUnit のランナーから自動で呼ばれる規約的シンボルで、
         // 識別子レベルの cross-file ref は発生しないが dead でもない。
         if is_phpunit_test_symbol(&sym.name, sym.kind, lang_id) {
+            continue;
+        }
+        // PHP 擬似 enum (Java enum 風 static factory) パターン。PHP 限定。
+        // `public static function FOO(): self { return new self('FOO'); }` 形式は
+        // Laravel / DDD 系の AbstractValueObject 系で大量に存在し、
+        // migration の文字列リテラル / DB 列値 / annotation reflection 経由で
+        // 利用されるが識別子レベルの cross-file refs では caller が追跡できない。
+        // dead-code の framework_entrypoints 除外と同じ意味合いで除外する。
+        if exclude_framework_entrypoints
+            && lang_id == crate::language::LangId::Php
+            && matches!(sym.kind, SymbolKind::Method)
+            && crate::engine::symbols::is_php_pseudo_enum_method(
+                root, source, &sym.range, &sym.name,
+            )
+        {
+            continue;
+        }
+        // PHP の runtime annotation (`@TypeItem`, `@Route`, `@DataProvider`, `@dataProvider` 等) が
+        // docstring に付いているメソッド / クラスは reflection 経由で動的に呼ばれるため
+        // dead-code 候補から除外する。
+        if exclude_framework_entrypoints
+            && lang_id == crate::language::LangId::Php
+            && matches!(sym.kind, SymbolKind::Method | SymbolKind::Class)
+            && let Some(doc) = sym.doc.as_deref()
+            && crate::engine::symbols::php_doc_has_runtime_annotation(doc)
+        {
             continue;
         }
         // Python のフレームワーク登録デコレータ (Typer / Click / FastAPI / Flask /
@@ -3020,12 +3063,7 @@ fn is_phpunit_test_symbol(
     // qualname (`Foo.testBar`) の末尾要素を取る
     let short = name.rsplit_once('.').map(|(_, t)| t).unwrap_or(name);
     match kind {
-        SymbolKind::Class => {
-            short.ends_with("Test")
-                || short.ends_with("TestCase")
-                || short.ends_with("IntegrationTest")
-                || short.ends_with("FeatureTest")
-        }
+        SymbolKind::Class => is_phpunit_test_class_name(short),
         SymbolKind::Method | SymbolKind::Function => {
             matches!(
                 short,
@@ -3034,6 +3072,15 @@ fn is_phpunit_test_symbol(
         }
         _ => false,
     }
+}
+
+/// PHPUnit テストクラス名規約 (`*Test` / `*TestCase` / `*IntegrationTest` / `*FeatureTest`)
+/// に合致するか判定する。test_only_symbols 振り分け時に container 名と突き合わせる。
+fn is_phpunit_test_class_name(name: &str) -> bool {
+    name.ends_with("Test")
+        || name.ends_with("TestCase")
+        || name.ends_with("IntegrationTest")
+        || name.ends_with("FeatureTest")
 }
 
 /// `^test[A-Z_]` で始まるメソッド名かどうか (PHPUnit の testXxx 規約)。
@@ -6751,7 +6798,9 @@ def new_public_api():
                         name: "main".to_string(),
                         line: 1,
                         symbols: vec!["main".to_string()],
+                        confidence: None,
                     }],
+                    low_confidence_callers: Vec::new(),
                 }],
             },
             missing_cochanges: Vec::new(),

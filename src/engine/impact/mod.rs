@@ -185,6 +185,7 @@ fn assemble_without_cross_file(
             affected_symbols: ctx.affected,
             signature_changes: ctx.sig_changes,
             impacted_callers: Vec::new(),
+            low_confidence_callers: Vec::new(),
         })
         .collect()
 }
@@ -439,6 +440,13 @@ fn should_include_for_cross_file(
     if !is_symbol_in_changed_lines(diff_input, file_path, &sym.name, lang_id) {
         return false;
     }
+    // 6. 新規追加シンボル (change_type == "added") は cross-file caller がまだない
+    //    ため検索対象から除外する。同一 commit 内で追加された caller は他ファイルの
+    //    シンボル変更経由で別途検出されるため、本シンボル単独の cross-file 探索は
+    //    ノイズだけが残る。新規ファイルの全シンボルがここで除外される。
+    if sym.change_type == "added" {
+        return false;
+    }
     true
 }
 
@@ -463,8 +471,23 @@ fn find_affected_symbols(
                 hunk_start < sym_end && hunk_end > sym_start
             };
             if overlaps {
+                // change_type 判定:
+                // - hunk old_count==0: シンボル全体を hunk が覆う場合のみ "added"
+                //   (新規シンボル定義) と判定。hunk が部分的にしか覆わない場合は
+                //   既存シンボル内への行追加なので "modified" とする。これにより
+                //   既存関数本体への新規行追加が誤って "added" 扱いされ impact
+                //   ノイズになるのを防ぐ。
+                // - hunk new_count==0: pure delete なので "removed"。
+                // - それ以外: "modified"。
                 let change_type = if hunk.old_count == 0 {
-                    "added"
+                    let sym_line_span = sym_end.saturating_sub(sym_start);
+                    let hunk_covers_symbol =
+                        hunk_start <= sym_start && hunk.new_count >= sym_line_span;
+                    if hunk_covers_symbol {
+                        "added"
+                    } else {
+                        "modified"
+                    }
                 } else if hunk.new_count == 0 {
                     "removed"
                 } else {
@@ -861,6 +884,47 @@ mod tests {
         let result = find_affected_symbols(&[sym], &[hunk]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].change_type, "modified");
+    }
+
+    /// hunk が pure add で、シンボル全体を覆う場合は "added" 判定
+    #[test]
+    fn find_affected_pure_add_covering_whole_symbol_is_added() {
+        // シンボル: line 4-9 (6 行)
+        // hunk: 新規ファイル (old_count=0)、line 1 から 20 行追加 (シンボル全域カバー)
+        let sym = make_sym("new_class", 4, 9);
+        let hunk = HunkInfo {
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: 20,
+        };
+        let result = find_affected_symbols(&[sym], &[hunk]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].change_type, "added",
+            "hunk がシンボル全体を覆う pure add は added"
+        );
+    }
+
+    /// hunk が pure add でも、既存シンボル内の部分追加は "modified" 判定
+    /// (既存関数本体に新規行を 1 行追加した場合などが該当する)
+    #[test]
+    fn find_affected_pure_add_inside_existing_symbol_is_modified() {
+        // シンボル: line 4-9 (6 行) — 既存関数
+        // hunk: line 6 から 1 行だけ pure add (関数本体内への部分追加)
+        let sym = make_sym("existing_fn", 4, 9);
+        let hunk = HunkInfo {
+            old_start: 6,
+            old_count: 0,
+            new_start: 6,
+            new_count: 1,
+        };
+        let result = find_affected_symbols(&[sym], &[hunk]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].change_type, "modified",
+            "既存シンボル内への部分追加 (hunk が symbol を覆わない) は modified"
+        );
     }
 
     #[test]

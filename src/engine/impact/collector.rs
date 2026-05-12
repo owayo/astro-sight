@@ -33,13 +33,18 @@ pub(super) struct WorkerState {
 ///
 /// `on_ref` 時点で import 判定と caller_name 抽出・intern まで済ませておき、
 /// `context` 文字列自体は保持しない（per-file buffer の heap を劇的に削減）。
-/// sym_ix / line / column / caller_name_id / is_import_flag の計 24 B 構造体 + 1 bit。
+/// sym_ix / line / column / caller_name_id / is_import_flag / confidence の計 24 B 構造体 + 1 bit + 1 byte。
 pub(super) struct RefEventMini {
     pub(super) sym_ix: u32,
     pub(super) line: u32,
     pub(super) column: u32,
     pub(super) caller_name_id: u32,
     pub(super) is_import: bool,
+    /// 0 = ExactOwner, 1 = InferredOwner, 2 = BareNameOnly。
+    /// Phase 4 (impact ルーティング) で `BareNameOnly` + generic name の caller を
+    /// `low_confidence_callers` へ振り分けるために使う。Phase 3 時点では値だけ運ぶ。
+    #[allow(dead_code)]
+    pub(super) confidence: u8,
 }
 
 /// `RefVisitor` の実装: per-file の ref 走査中は最小限の buffering だけ行い、
@@ -63,7 +68,15 @@ pub(super) struct ImpactCollector<'a> {
 }
 
 impl<'a> refs::RefVisitor for ImpactCollector<'a> {
-    fn on_ref(&mut self, sym_ix: u32, line: usize, column: usize, context: &str, is_def: bool) {
+    fn on_ref(
+        &mut self,
+        sym_ix: u32,
+        line: usize,
+        column: usize,
+        context: &str,
+        is_def: bool,
+        confidence: crate::models::reference::RefConfidence,
+    ) {
         let ix = sym_ix as usize;
         if ix < self.ref_hit.len() {
             self.ref_hit[ix] = true;
@@ -86,12 +99,19 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             .expect("string pool mutex poisoned")
             .intern(&caller_name);
 
+        let confidence_u8 = match confidence {
+            crate::models::reference::RefConfidence::ExactOwner => 0,
+            crate::models::reference::RefConfidence::InferredOwner => 1,
+            crate::models::reference::RefConfidence::BareNameOnly => 2,
+        };
+
         self.ref_events.push(RefEventMini {
             sym_ix,
             line: line as u32,
             column: column as u32,
             caller_name_id,
             is_import,
+            confidence: confidence_u8,
         });
     }
 }

@@ -34,6 +34,9 @@ pub struct ImpactedCaller {
     /// 影響を引き起こしたシンボル名のリスト
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub symbols: Vec<String>,
+    /// receiver-aware 確信度。`exact` / `inferred` / `bare` のいずれか。互換のため省略可。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub confidence: Option<String>,
 }
 
 /// A parsed diff file entry with change and hunk info.
@@ -59,6 +62,11 @@ pub struct FileImpact {
     pub signature_changes: Vec<SignatureChange>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub impacted_callers: Vec<ImpactedCaller>,
+    /// 確信度の低い caller (BareNameOnly + generic method name 等)。
+    /// `impacted_callers` のシグナルを破壊しないよう別フィールドで保持する。
+    /// 空の場合は出力に含めない (互換維持)。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub low_confidence_callers: Vec<ImpactedCaller>,
 }
 
 /// The context (impact analysis) response envelope.

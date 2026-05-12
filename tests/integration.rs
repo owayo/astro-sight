@@ -4712,6 +4712,119 @@ fn dead_code_framework_laravel_excludes_migrations_and_controllers() {
     );
 }
 
+#[test]
+fn dead_code_excludes_php_pseudo_enum_factory() {
+    // Laravel / DDD 系の AbstractValueObject 派生クラスの擬似 enum パターンが dead-code から
+    // 除外されることを検証する。dead-code 経路は常に exclude_framework_entrypoints=true
+    // で呼ばれるため、preset 指定の有無に関わらず擬似 enum は除外される。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("src/Models/Menu")).unwrap();
+    std::fs::write(
+        root.join("src/Models/Menu/MenuName.php"),
+        r#"<?php
+class MenuName extends AbstractValueObjectString {
+    public static function MENU_HOME(): self {
+        return new self('MENU_HOME');
+    }
+    public static function MENU_DASHBOARD(): static {
+        return new static('MENU_DASHBOARD');
+    }
+    /** メソッド名と new self('...') の文字列が不一致 → 擬似 enum ではない */
+    public static function notPseudo(): self {
+        return new self('different_name');
+    }
+    public function getValue(): string {
+        return 'unused-impl';
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+
+    // 擬似 enum (MENU_HOME / MENU_DASHBOARD) は除外される
+    for banned in ["MENU_HOME", "MENU_DASHBOARD"] {
+        assert!(
+            !names.iter().any(|n| n.contains(banned)),
+            "PHP 擬似 enum factory ({banned}) は除外されるべき: {names:?}"
+        );
+    }
+    // 擬似 enum でない static method (notPseudo) は残る
+    assert!(
+        names.iter().any(|n| n.contains("notPseudo")),
+        "メソッド名と new self() の引数が不一致なら擬似 enum ではないので dead に残る: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_excludes_php_method_with_runtime_annotation() {
+    // @TypeItem などの runtime annotation 付きメソッドは reflection 経由で
+    // 動的呼び出しされるため dead-code から除外する。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("src/Bases/Meta")).unwrap();
+    std::fs::write(
+        root.join("src/Bases/Meta/EntityType.php"),
+        r#"<?php
+class EntityType extends AbstractValueObjectString {
+    /**
+     * @\App\Annotations\TypeItem(id=1, name="SurveyNode", alt_name="survey-node")
+     * @return static
+     */
+    public static function SurveyNode(): self {
+        return new self('SurveyNode');
+    }
+
+    /** 通常の static method (annotation なし) */
+    public static function plainMethod(): self {
+        return new self('plainMethod');
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--framework",
+            "laravel",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+
+    assert!(
+        !names.iter().any(|n| n.contains("SurveyNode")),
+        "@TypeItem 付きメソッドは dead から除外されるべき: {names:?}"
+    );
+    // plainMethod は擬似 enum パターンなので、こちらも除外される (= dead に出ない)
+}
+
 /// `--framework nextjs` で Next.js App Router の規約 entrypoint
 /// (page / layout / route / loading 等) と Pages Router 配下が dead-code から除外される。
 /// (レポート 2026-05-04-next-page-and-react-memo-false-positives.md パターン2 の再現)
@@ -5670,6 +5783,78 @@ fn dead_code_php_phpunit_conventions_excluded() {
         names.iter().any(|n| n == "SampleCaseTest.regular_helper"),
         "PHPUnit 規約外のメソッドは dead として報告される: {names:?}"
     );
+}
+
+#[test]
+fn dead_code_phpunit_class_helpers_excluded_from_test_only() {
+    // PHPUnit テストクラス内の helper メソッドが、同一クラス内の self::/static::/
+    // $this-> 呼び出しでのみ参照されている場合、test_only_symbols ではなく
+    // "ランナー内部用ヘルパー" として完全に除外される。
+    // 現実には @dataProvider / #[DataProvider] / @depends 経由で reflection 呼び出し
+    // されるが識別子レベルの cross-file refs では追跡できないため、test_only に
+    // 大量のノイズが出るのを防ぐ目的。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("test/Models")).unwrap();
+    std::fs::write(
+        root.join("test/Models/SampleLogEntityTest.php"),
+        r#"<?php
+class SampleLogEntityTest {
+    public function testCreatesEntity(): void {
+        $vo = self::voEventTime();
+        $msg = self::voMessage();
+        // assert ...
+    }
+
+    public static function voEventTime(): string {
+        return '2025-01-01T00:00:00Z';
+    }
+
+    public static function voMessage(): string {
+        return 'sample';
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // production コードからは voEventTime / voMessage を参照しない。
+    // self::voEventTime() / self::voMessage() の呼び出しはテストファイル内なので
+    // test refs > 0 になり、従来は test_only_symbols に積まれていた。
+    let output = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--include-tests",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+
+    // test_only_symbols は空 Vec の場合 serde で省略されるため、フィールド不在は空扱い
+    let test_only_names: Vec<String> = json["test_only_symbols"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // voEventTime / voMessage は PHPUnit テストクラスの内部 helper として
+    // test_only_symbols から除外される (test refs > 0 でもノイズなので捨てる)
+    for banned in [
+        "SampleLogEntityTest.voEventTime",
+        "SampleLogEntityTest.voMessage",
+    ] {
+        assert!(
+            !test_only_names.iter().any(|n| n == banned),
+            "{banned} は PHPUnit container 内 helper として test_only_symbols から除外されるべき: {test_only_names:?}"
+        );
+    }
 }
 
 #[test]
