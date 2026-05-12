@@ -23,6 +23,32 @@ use super::{FileContext, TARGET_FILE_CACHE_SIZE, ci_key};
 /// 128 は「chunk 中の一時データ + reduce 2x でも数百 MB 以内」を狙った保守的な値。
 const CHUNK_SIZE: usize = 128;
 
+/// impact (context / impact / review) の cross-file 参照検索でデフォルトで除外する
+/// ディレクトリ名。
+///
+/// vendor 系は Composer / Bundler / Go modules などのサードパーティ依存を指し、
+/// ユーザー自身のコード変更が **vendor 内コードに impact することはほぼ無い**
+/// (依存方向は逆向き)。一方で同名メソッド (`new` / `update` 等) を持つことが
+/// 多く、cross-file 参照検索で大量の偽陽性 (例: 1 リポで 3,000+ 件) を生む。
+///
+/// 解除する場合は `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` を設定する。
+const IMPACT_VENDOR_EXCLUDES: &[&str] = &[
+    "vendor",
+    "node_modules",
+    "bower_components",
+    ".venv",
+    "venv",
+    ".tox",
+];
+
+/// `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` のとき vendor 除外を解除する。
+fn impact_include_vendor() -> bool {
+    std::env::var("ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT")
+        .ok()
+        .filter(|v| !v.is_empty() && v != "0")
+        .is_some()
+}
+
 /// impact streaming Pass の並列度。デフォルトは 1 (= fold/reduce のピーク 2x を避けて
 /// RSS を最小化)。CI 等で速度優先にしたい場合は `ASTRO_SIGHT_IMPACT_WORKERS` で上書きする。
 fn impact_worker_count() -> usize {
@@ -138,7 +164,16 @@ pub(super) fn stream_caller_maps_and_defs(
         Ok(a) => a,
         Err(_) => return empty_result(),
     };
-    let files = match refs::collect_files(dir, None) {
+    // vendor / node_modules 等を impact のデフォルト除外にする。
+    // 同名メソッドが大量にある 3rd-party 依存を含めると cross-file 参照が
+    // 万件単位で偽陽性を生む (実測: Laravel/DDD 系で `new` 3,148 件のうち
+    // 大半が vendor)。`ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` で再取込可能。
+    let excluded_dirs: Vec<&str> = if impact_include_vendor() {
+        Vec::new()
+    } else {
+        IMPACT_VENDOR_EXCLUDES.to_vec()
+    };
+    let files = match refs::collect_files_with_excludes(dir, None, &excluded_dirs, &[]) {
         Ok(f) => f,
         Err(_) => return empty_result(),
     };

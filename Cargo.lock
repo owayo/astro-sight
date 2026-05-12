@@ -1862,6 +1862,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-ruby"
 version = "26.5.100"
+source = "git+https://github.com/owayo/tree-sitter-ruby.git?branch=master#4e9ed72755e6cf20a5b8636ea83124087d5b9abe"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -1900,6 +1901,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-xojo"
 version = "26.5.101"
+source = "git+https://github.com/owayo/tree-sitter-xojo.git?branch=main#bafc82f428e65c5f902764b4b5bbfe4f4a980504"
 dependencies = [
  "cc",
  "tree-sitter-language",

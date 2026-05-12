@@ -2959,6 +2959,146 @@ pub fn use_existing(e: &Existing) -> u32 {
     );
 }
 
+/// PHP trait の親型認識テスト (load-bearing バグの回帰テスト):
+/// `trait Factory { public static function new() }` のような trait scope の
+/// メソッドが変更された際、Stage 4b の parent_in_this_file チェックが
+/// 効くようにするため、`trait_declaration` が親型として認識されること。
+///
+/// 旧実装は `class_declaration` だけを親型として認識していたため、PHP trait
+/// 内の同名メソッド (`new` 等) で `parent_ix_by_sym = None` となり、Stage 4b が
+/// 完全にバイパスされ、`Other::new()` 系の同名 method 全件が誤って
+/// impacted_callers に流れていた。
+#[test]
+fn impact_php_trait_method_filters_unrelated_callers() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let trait_php = dir.path().join("Factory.php");
+    let other_php = dir.path().join("Other.php");
+    let unrelated_php = dir.path().join("Unrelated.php");
+
+    // Factory.php: trait scope の static method `new`
+    std::fs::write(
+        &trait_php,
+        r#"<?php
+namespace App\Factories;
+
+trait Factory {
+    public static function new(int $x): self {
+        return new self($x + 1);
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // Other.php: 別 class の同名 static method `new`
+    std::fs::write(
+        &other_php,
+        r#"<?php
+namespace App\Other;
+
+class Other {
+    public static function new(): self {
+        return new self();
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // Unrelated.php: Other::new() を呼ぶが Factory trait は use していない
+    std::fs::write(
+        &unrelated_php,
+        r#"<?php
+namespace App\Consumers;
+
+use App\Other\Other;
+
+class Consumer {
+    public function consume(): void {
+        $obj = Other::new();
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // diff: Factory trait の new シグネチャを変更
+    let diff = r#"--- a/Factory.php
++++ b/Factory.php
+@@ -3,7 +3,7 @@
+ namespace App\Factories;
+
+ trait Factory {
+-    public static function new(int $x): self {
++    public static function new(int $x, int $y): self {
+         return new self($x + 1);
+     }
+ }
+"#;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["context", "--dir", dir.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn context");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "context failed: {stdout}");
+
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("context stdout must be JSON");
+    let changes = json
+        .get("changes")
+        .and_then(|c| c.as_array())
+        .expect("changes array");
+
+    let factory_change = changes
+        .iter()
+        .find(|c| c.get("path").and_then(|p| p.as_str()) == Some("Factory.php"))
+        .unwrap_or_else(|| panic!("Factory.php change not found: {stdout}"));
+
+    let impacted = factory_change
+        .get("impacted_callers")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let low = factory_change
+        .get("low_confidence_callers")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Unrelated.php は Other::new() を呼ぶだけで Factory trait は触らない。
+    // trait_declaration が親型認識されれば parent_in_this_file=false で skip される。
+    let unrelated_in_impacted = impacted
+        .iter()
+        .any(|c| c.get("path").and_then(|p| p.as_str()) == Some("Unrelated.php"));
+    let unrelated_in_low = low
+        .iter()
+        .any(|c| c.get("path").and_then(|p| p.as_str()) == Some("Unrelated.php"));
+    assert!(
+        !unrelated_in_impacted,
+        "Unrelated.php must NOT appear in impacted_callers (Stage 4b parent check). impacted: {impacted:?}"
+    );
+    assert!(
+        !unrelated_in_low,
+        "Unrelated.php must NOT appear in low_confidence_callers either. low: {low:?}"
+    );
+}
+
 // ===========================================================================
 // 境界値・異常系・エッジケーステスト
 // ===========================================================================

@@ -595,11 +595,18 @@ fn symbol_kind_str(kind: SymbolKind) -> &'static str {
     }
 }
 
-/// impl/class ブロック内のメソッドの親型名を取得する。
+/// impl/class/trait/interface/enum ブロック内のメソッドの親型名を取得する。
 ///
 /// Rust `impl Foo { fn bar() {} }` → `Some("Foo")` を返す
 /// Rust `impl Trait for Foo { fn bar() {} }` → `Some("Foo")` を返す
-/// クラスベース言語 → クラス名を返す
+/// クラスベース言語 → クラス/トレイト/インタフェース/enum 名を返す
+///
+/// **PHP trait の認識は load-bearing**: 大規模 Laravel/DDD 系プロジェクトで
+/// `trait Factory` のような trait 内 method 変更時、`find_parent_type_name` が
+/// None を返すと `method_parent_types` から該当エントリが消え Stage 4b の
+/// parent_in_this_file チェックが完全にバイパスされる。結果として
+/// `Other::new()` 等の同名 method 全件が誤って impacted_callers に流れる
+/// (実測: 1 リポで数千件規模の偽陽性)。
 fn find_parent_type_name(
     root: tree_sitter::Node,
     source: &[u8],
@@ -615,14 +622,45 @@ fn find_parent_type_name(
                 .child_by_field_name("type")
                 .and_then(|t| extract_type_name(t, source));
         }
+        // クラス/トレイト/インタフェース/enum 系の宣言ノード。
+        // tree-sitter-php: class_declaration / trait_declaration / interface_declaration / enum_declaration
+        // tree-sitter-{java,kotlin,c-sharp,typescript}: class_declaration / interface_declaration / enum_declaration
+        // tree-sitter-{cpp}: class_specifier / struct_specifier
+        // tree-sitter-{python,ruby}: class_definition / class
+        // tree-sitter-{ruby}: module / singleton_class
+        // tree-sitter-{go}: type_declaration を struct/interface 含めて拾うのは困難なため除外 (Go は別経路)
         if matches!(
             n.kind(),
-            "class_declaration" | "class_definition" | "class_specifier"
+            "class_declaration"
+                | "class_definition"
+                | "class_specifier"
+                | "struct_specifier"
+                | "trait_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "module"
+                | "module_declaration"
+                | "singleton_class"
+                | "class"
+                | "object_declaration"
         ) {
-            return n
+            if let Some(name) = n
                 .child_by_field_name("name")
                 .and_then(|name| name.utf8_text(source).ok())
-                .map(|s| s.to_string());
+            {
+                return Some(name.to_string());
+            }
+            // Ruby `class Foo` / `module Foo` は name フィールドではなく
+            // 子ノードの constant / scope_resolution として配置される。
+            let count = n.named_child_count() as u32;
+            for i in 0..count {
+                if let Some(child) = n.named_child(i)
+                    && matches!(child.kind(), "constant" | "scope_resolution" | "identifier")
+                    && let Ok(text) = child.utf8_text(source)
+                {
+                    return Some(text.to_string());
+                }
+            }
         }
         current = n.parent();
     }
