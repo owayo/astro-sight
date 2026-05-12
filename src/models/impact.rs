@@ -42,6 +42,11 @@ pub struct DiffFile {
     pub old_path: String,
     pub new_path: String,
     pub hunks: Vec<HunkInfo>,
+    /// 削除ファイル (`new_path == "/dev/null"`) で、unified diff の `-` 行から
+    /// 復元した旧側ソース。`extract_exported_symbols_from_git` が base mismatch
+    /// 等で失敗した場合のフォールバック AST 解析に使う。新規/変更ファイルでは None。
+    #[serde(skip)]
+    pub deleted_old_source: Option<Vec<u8>>,
 }
 
 /// The impact analysis for a single changed file.

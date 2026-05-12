@@ -1,11 +1,17 @@
 use crate::models::impact::{DiffFile, HunkInfo};
 
 /// unified diff 文字列を `DiffFile` の配列に変換する。
+///
+/// 削除ファイル (`+++ /dev/null`) の hunk 内 `-` 行は旧ソース復元用に蓄積し、
+/// `DiffFile.deleted_old_source` にセットする。`extract_exported_symbols_from_git`
+/// が base mismatch で失敗した際の API 差分検出フォールバックで使う。
 pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
     let mut files = Vec::new();
     let mut current_old_path: Option<String> = None;
     let mut current_new_path: Option<String> = None;
     let mut current_hunks: Vec<HunkInfo> = Vec::new();
+    let mut current_deleted_lines: Vec<u8> = Vec::new();
+    let mut in_hunk = false;
 
     for line in input.lines() {
         if let Some(path) = line.strip_prefix("--- a/") {
@@ -15,24 +21,39 @@ pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
                 &mut current_old_path,
                 &mut current_new_path,
                 &mut current_hunks,
+                &mut current_deleted_lines,
             );
             current_old_path = Some(path.to_string());
+            in_hunk = false;
         } else if line.starts_with("--- /dev/null") {
             flush_file(
                 &mut files,
                 &mut current_old_path,
                 &mut current_new_path,
                 &mut current_hunks,
+                &mut current_deleted_lines,
             );
             current_old_path = Some("/dev/null".to_string());
+            in_hunk = false;
         } else if let Some(path) = line.strip_prefix("+++ b/") {
             current_new_path = Some(path.to_string());
         } else if line.starts_with("+++ /dev/null") {
             current_new_path = Some("/dev/null".to_string());
-        } else if line.starts_with("@@ ")
-            && let Some(hunk) = parse_hunk_header(line)
+        } else if line.starts_with("@@ ") {
+            if let Some(hunk) = parse_hunk_header(line) {
+                current_hunks.push(hunk);
+                in_hunk = true;
+            } else {
+                in_hunk = false;
+            }
+        } else if in_hunk
+            && current_new_path.as_deref() == Some("/dev/null")
+            && let Some(removed) = line.strip_prefix('-')
         {
-            current_hunks.push(hunk);
+            // 削除ファイルの hunk 内 `-` 行を旧ソース順で蓄積する
+            // (`---` ヘッダは `--- a/` / `--- /dev/null` で先に処理済み)。
+            current_deleted_lines.extend_from_slice(removed.as_bytes());
+            current_deleted_lines.push(b'\n');
         }
     }
 
@@ -42,6 +63,7 @@ pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
         &mut current_old_path,
         &mut current_new_path,
         &mut current_hunks,
+        &mut current_deleted_lines,
     );
 
     files
@@ -52,17 +74,25 @@ fn flush_file(
     old_path: &mut Option<String>,
     new_path: &mut Option<String>,
     hunks: &mut Vec<HunkInfo>,
+    deleted_lines: &mut Vec<u8>,
 ) {
     if let (Some(old), Some(new)) = (old_path.take(), new_path.take())
         && !hunks.is_empty()
     {
+        let deleted_old_source = if new == "/dev/null" && !deleted_lines.is_empty() {
+            Some(std::mem::take(deleted_lines))
+        } else {
+            None
+        };
         files.push(DiffFile {
             old_path: old,
             new_path: new,
             hunks: std::mem::take(hunks),
+            deleted_old_source,
         });
     }
     hunks.clear();
+    deleted_lines.clear();
 }
 
 /// `"@@ -10,5 +10,8 @@"` や `"@@ -10,5 +10,8 @@ fn foo()"` の hunk ヘッダを解析する。
@@ -169,5 +199,42 @@ index 0000000..1234567
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].old_path, "/dev/null");
         assert_eq!(files[0].new_path, "src/new.rs");
+        // 新規ファイルでは旧ソース無し
+        assert!(files[0].deleted_old_source.is_none());
+    }
+
+    #[test]
+    fn parse_deleted_file_captures_old_source() {
+        // 削除ファイルの hunk 内 `-` 行を旧ソースとして保持できることを確認する
+        let diff = r#"diff --git a/src/old.rs b/src/old.rs
+deleted file mode 100644
+index 1234567..0000000
+--- a/src/old.rs
++++ /dev/null
+@@ -1,3 +0,0 @@
+-pub fn removed_fn() {
+-    println!("gone");
+-}
+"#;
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].old_path, "src/old.rs");
+        assert_eq!(files[0].new_path, "/dev/null");
+        let restored = files[0]
+            .deleted_old_source
+            .as_ref()
+            .expect("deleted file should have old source");
+        let text = std::str::from_utf8(restored).expect("utf-8");
+        assert_eq!(text, "pub fn removed_fn() {\n    println!(\"gone\");\n}\n");
+    }
+
+    #[test]
+    fn parse_deleted_file_skips_no_newline_marker() {
+        // `\ No newline at end of file` などの diff metadata 行は旧ソースに混入させない
+        let diff = "diff --git a/foo.txt b/foo.txt\ndeleted file mode 100644\n--- a/foo.txt\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-only line\n\\ No newline at end of file\n";
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 1);
+        let restored = files[0].deleted_old_source.as_ref().expect("captured");
+        assert_eq!(std::str::from_utf8(restored).unwrap(), "only line\n");
     }
 }

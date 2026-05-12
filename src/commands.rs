@@ -1604,7 +1604,17 @@ fn detect_api_changes(
         }
 
         if df.new_path == "/dev/null" {
-            if let Some(old_syms) = extract_exported_symbols_from_git(dir, base, &df.old_path) {
+            // base が source branch HEAD と同一 (例: CI が source branch を checkout した直後で
+            // base コミット引数も HEAD のまま) の場合、`git show base:old_path` は削除済みで
+            // 失敗し None になる。その場合は --diff-file が保持している旧ソース (deleted_old_source)
+            // から AST を組み立てて exported シンボルを抽出するフォールバックを試す。
+            let old_syms_opt =
+                extract_exported_symbols_from_git(dir, base, &df.old_path).or_else(|| {
+                    df.deleted_old_source
+                        .as_deref()
+                        .and_then(|src| extract_exported_symbols_from_source(&df.old_path, src))
+                });
+            if let Some(old_syms) = old_syms_opt {
                 // Bash ファイル丸ごと削除のケース（CLI スクリプトを別言語に書き換え等）でも
                 // 未 export 関数は外部 API 面ではない。新ツリー全体で参照 0 件なら同一 diff
                 // 内で完結した削除と判断して api.rm から除外する。
@@ -2105,7 +2115,20 @@ fn extract_exported_symbols_from_git(
         return None;
     }
 
-    let source = &output.stdout;
+    extract_exported_symbols_from_source(file_path, &output.stdout)
+}
+
+/// 与えられた旧側ソースから export シンボル一覧を抽出する。
+///
+/// `extract_exported_symbols_from_git` のフォールバックとして、`--diff-file` の削除 hunk から
+/// 復元した旧ソースを直接渡す経路で使う。test path 判定とフィルタは git 経路と同一。
+fn extract_exported_symbols_from_source(
+    file_path: &str,
+    source: &[u8],
+) -> Option<Vec<(String, String, String)>> {
+    if is_test_path(std::path::Path::new(file_path)) {
+        return Some(Vec::new());
+    }
     let utf8_path = camino::Utf8Path::new(file_path);
     let lang_id = crate::language::LangId::from_path(utf8_path).ok()?;
     let tree = parser::parse_source(source, lang_id).ok()?;
@@ -2115,7 +2138,7 @@ fn extract_exported_symbols_from_git(
     // Rust の `impl Trait for Type` 配下のメソッドは trait の実装事実であり、独立した
     // 公開 API item ではない。module 移動など実体は維持したままの変更でも api.add / api.rm
     // に誤計上されるのを避けるため、API 変更検出でも trait impl メソッドを除外する。
-    // git の base 側を読む経路は API 変更検出 (api.rm 比較) のみで使われる。
+    // 旧側を読む経路は API 変更検出 (api.rm 比較) のみで使われる。
     // dead-code は最新コミット側だけを見るため framework entrypoint の除外は不要。
     Some(filter_exported_symbols(
         &syms,
@@ -3758,6 +3781,7 @@ mod tests {
                 new_start: 1,
                 new_count: 3,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -3880,6 +3904,7 @@ def main():
                 new_start: 1,
                 new_count: 14,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -3953,6 +3978,7 @@ def new_public_api():
                     new_start: 0,
                     new_count: 0,
                 }],
+                deleted_old_source: None,
             },
             crate::models::impact::DiffFile {
                 old_path: "/dev/null".to_string(),
@@ -3963,6 +3989,7 @@ def new_public_api():
                     new_start: 1,
                     new_count: 12,
                 }],
+                deleted_old_source: None,
             },
         ];
 
@@ -4013,6 +4040,92 @@ def new_public_api():
             assert_eq!(m.from, "scripts/regenerate_marketplace.py");
             assert_eq!(m.to, "scripts/marketplace.py");
         }
+    }
+
+    #[test]
+    fn detect_api_changes_uses_diff_old_source_when_git_show_fails() {
+        // CI 環境で source branch (削除コミット適用後) が HEAD の状態で `--base HEAD` を
+        // 渡したケースを再現する。`git show HEAD:old_path` は失敗するが、
+        // `--diff-file` 経由で渡された削除 hunk から旧ソースを復元できれば
+        // api_changes.removed に反映されるべき。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        // 旧ファイルを base にコミット → さらに削除を HEAD としてコミット。
+        // `git show HEAD:src/old.py` は HEAD には存在しないため失敗する。
+        git_commit_files(
+            repo,
+            &[("src/old.py", "def removed_fn():\n    return 1\n")],
+            "initial",
+        );
+        fs::remove_file(repo.join("src/old.py")).expect("rm");
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo)
+            .status()
+            .expect("git add");
+        Command::new("git")
+            .args(["commit", "-m", "delete"])
+            .current_dir(repo)
+            .status()
+            .expect("git commit");
+
+        // hunk から復元される旧ソース (`-` 行から組み立て)
+        let deleted_src = b"def removed_fn():\n    return 1\n".to_vec();
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/old.py".to_string(),
+            new_path: "/dev/null".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 2,
+                new_start: 0,
+                new_count: 0,
+            }],
+            deleted_old_source: Some(deleted_src),
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.contains(&"removed_fn"),
+            "diff の deleted_old_source からシンボルが復元されるべき。got: {removed:?}"
+        );
+    }
+
+    #[test]
+    fn detect_api_changes_skips_removed_when_no_old_source_available() {
+        // `git show base:old_path` が失敗し、かつ deleted_old_source も無い場合は
+        // 従来通り何も報告しない (false positive を出さない)。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(repo, &[("README.md", "# repo\n")], "initial");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/old.py".to_string(),
+            new_path: "/dev/null".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 2,
+                new_start: 0,
+                new_count: 0,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        assert!(
+            api_changes.removed.is_empty(),
+            "旧ソース取得不能時は removed に出すべきではない"
+        );
     }
 
     #[test]
@@ -4108,6 +4221,7 @@ def check_command():
                     new_start: 0,
                     new_count: 0,
                 }],
+                deleted_old_source: None,
             },
             crate::models::impact::DiffFile {
                 old_path: "/dev/null".to_string(),
@@ -4118,6 +4232,7 @@ def check_command():
                     new_start: 1,
                     new_count: 13,
                 }],
+                deleted_old_source: None,
             },
             crate::models::impact::DiffFile {
                 old_path: "/dev/null".to_string(),
@@ -4128,6 +4243,7 @@ def check_command():
                     new_start: 1,
                     new_count: 0,
                 }],
+                deleted_old_source: None,
             },
             crate::models::impact::DiffFile {
                 old_path: "/dev/null".to_string(),
@@ -4138,6 +4254,7 @@ def check_command():
                     new_start: 1,
                     new_count: 2,
                 }],
+                deleted_old_source: None,
             },
             crate::models::impact::DiffFile {
                 old_path: "/dev/null".to_string(),
@@ -4148,6 +4265,7 @@ def check_command():
                     new_start: 1,
                     new_count: 2,
                 }],
+                deleted_old_source: None,
             },
             crate::models::impact::DiffFile {
                 old_path: "/dev/null".to_string(),
@@ -4158,6 +4276,7 @@ def check_command():
                     new_start: 1,
                     new_count: 2,
                 }],
+                deleted_old_source: None,
             },
         ];
 
@@ -4246,6 +4365,7 @@ class ReviewConfig:
                 new_start: 1,
                 new_count: 7,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -4313,6 +4433,7 @@ class Foo:
                 new_start: 1,
                 new_count: 6,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -4404,6 +4525,7 @@ class B:
                 new_start: 1,
                 new_count: 2,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -4457,6 +4579,7 @@ class B:
                     new_start: 1,
                     new_count: 5,
                 }],
+                deleted_old_source: None,
             },
             crate::models::impact::DiffFile {
                 old_path: "hand.py".to_string(),
@@ -4467,6 +4590,7 @@ class B:
                     new_start: 1,
                     new_count: 5,
                 }],
+                deleted_old_source: None,
             },
         ];
 
@@ -4525,6 +4649,7 @@ class B:
                     new_start: 1,
                     new_count: 6,
                 }],
+                deleted_old_source: None,
             },
             crate::models::impact::DiffFile {
                 old_path: "hand.py".to_string(),
@@ -4535,6 +4660,7 @@ class B:
                     new_start: 1,
                     new_count: 5,
                 }],
+                deleted_old_source: None,
             },
         ];
 
@@ -4615,6 +4741,7 @@ pub fn hello() {}
                 new_start: 1,
                 new_count: 3,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -4668,6 +4795,7 @@ pub struct AiService {
                 new_start: 3,
                 new_count: 2,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -4736,6 +4864,7 @@ class ReReviewExecutor:
                 new_start: 13,
                 new_count: 1,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -4791,6 +4920,7 @@ class PromptBuilder:
                 new_start: 3,
                 new_count: 1,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -4838,6 +4968,7 @@ class Reviewer:
                 new_start: 2,
                 new_count: 1,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -4884,6 +5015,7 @@ for repo in \"foo\"; do\n    sparse_clone_or_update\ndone\n";
                 new_start: 1,
                 new_count: 11,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -4922,6 +5054,7 @@ main() {\n    echo hi\n}\nmain\n";
                 new_start: 1,
                 new_count: 7,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -4958,6 +5091,7 @@ def main():\n    helper()\n    print(\"hi\")\n";
                 new_start: 1,
                 new_count: 6,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -5020,6 +5154,7 @@ if __name__ == \"__main__\":
                 new_start: 1,
                 new_count: 11,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -5065,6 +5200,7 @@ echo initial\n";
                 new_start: 1,
                 new_count: 7,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -5105,6 +5241,7 @@ main() {\n    timed echo hi\n}\nmain\n";
                 new_start: 2,
                 new_count: 1,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -5147,6 +5284,7 @@ main() {\n    timed echo hi\n}\nmain\n";
                 new_start: 1,
                 new_count: 5,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -5200,6 +5338,7 @@ export function testHelper() { return 1 }\n";
                 new_start: 0,
                 new_count: 0,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -5324,6 +5463,7 @@ main() {\n    echo done\n}\nmain\n";
                 new_start: 1,
                 new_count: 4,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -5370,6 +5510,7 @@ main() {\n    echo hi\n}\nmain\n";
                 new_start: 1,
                 new_count: 4,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -5419,6 +5560,7 @@ main() {\n    echo hi\n}\nmain\n";
                 new_start: 1,
                 new_count: 4,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -5466,6 +5608,7 @@ if __name__ == \"__main__\":\n    main()\n";
                     new_start: 0,
                     new_count: 0,
                 }],
+                deleted_old_source: None,
             },
             crate::models::impact::DiffFile {
                 old_path: "/dev/null".to_string(),
@@ -5476,6 +5619,7 @@ if __name__ == \"__main__\":\n    main()\n";
                     new_start: 1,
                     new_count: 7,
                 }],
+                deleted_old_source: None,
             },
         ];
 
@@ -5516,6 +5660,7 @@ public_helper() {\n    echo public\n}\nexport -f public_helper\n";
                 new_start: 0,
                 new_count: 0,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -5582,6 +5727,7 @@ def wrapper() -> int:
                 new_start: 1,
                 new_count: 6,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -5644,6 +5790,7 @@ if __name__ == \"__main__\":
                 new_start: 1,
                 new_count: 10,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -5711,6 +5858,7 @@ if __name__ == \"__main__\":
                 new_start: 1,
                 new_count: 10,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -5803,6 +5951,7 @@ mod models;
                     new_start: 1,
                     new_count: 6,
                 }],
+                deleted_old_source: None,
             },
             crate::models::impact::DiffFile {
                 old_path: "src/main.rs".to_string(),
@@ -5813,6 +5962,7 @@ mod models;
                     new_start: 1,
                     new_count: 8,
                 }],
+                deleted_old_source: None,
             },
         ];
 
@@ -5869,6 +6019,7 @@ pub struct LibraryApi { pub name: String }
                 new_start: 1,
                 new_count: 4,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -5934,6 +6085,7 @@ pub fn use_diff(d: MrDiff) {}
                     new_start: 1,
                     new_count: 4,
                 }],
+                deleted_old_source: None,
             },
             crate::models::impact::DiffFile {
                 old_path: "src/consumer.rs".to_string(),
@@ -5944,6 +6096,7 @@ pub fn use_diff(d: MrDiff) {}
                     new_start: 1,
                     new_count: 5,
                 }],
+                deleted_old_source: None,
             },
         ];
 
@@ -6272,6 +6425,7 @@ def new_public_api():
                 new_start: 1,
                 new_count: 11,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -6326,6 +6480,7 @@ def new_public_api():
                 new_start: 1,
                 new_count: 3,
             }],
+            deleted_old_source: None,
         }];
 
         let api_changes =
@@ -6385,6 +6540,7 @@ def new_public_api():
                     new_start: 1,
                     new_count: 1,
                 }],
+                deleted_old_source: None,
             },
             crate::models::impact::DiffFile {
                 old_path: "/dev/null".to_string(),
@@ -6395,6 +6551,7 @@ def new_public_api():
                     new_start: 1,
                     new_count: 7,
                 }],
+                deleted_old_source: None,
             },
         ];
 

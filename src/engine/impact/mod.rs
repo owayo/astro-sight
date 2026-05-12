@@ -708,6 +708,7 @@ mod tests {
             old_path: old_path.to_string(),
             new_path: new_path.to_string(),
             hunks: Vec::new(),
+            deleted_old_source: None,
         }
     }
 
