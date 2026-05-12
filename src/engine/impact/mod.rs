@@ -32,6 +32,17 @@ struct FileContext {
     sig_changes: Vec<SignatureChange>,
     hunks: Vec<HunkInfo>,
     call_edges: Vec<CallEdge>,
+    /// この FileContext に対して cross-file 参照検索結果を流し込んでよい
+    /// シンボル名（`ci_key` 正規化済み）の集合。
+    ///
+    /// `should_include_for_cross_file` を **必ず per-file で実行**して詰める。
+    /// グローバルな `included_symbols` は Aho-Corasick 用の union だけに使い、
+    /// pass2 の `sym_to_fc` 構築は本フィールドだけを見ること。
+    ///
+    /// 同名シンボル (例: 異なる class の `new`) が複数ファイルに存在する場合、
+    /// 「modified の Factory.php は include / added の Id.php は exclude」の
+    /// ように **per-file 単位で** 振り分けられる。
+    cross_file_symbol_keys: HashSet<String>,
 }
 
 /// キャッシュされたパース結果: (tree, ソースバッファ, 言語)。
@@ -131,7 +142,6 @@ where
             &all_symbol_names,
             &sym_ix,
             &method_parent_types,
-            &included_symbols,
             dir,
         );
     log_phase("context.pass2", "end", t.elapsed().as_millis());
@@ -322,11 +332,12 @@ fn collect_affected_symbols(
             t.elapsed().as_millis(),
         );
 
+        // per-file の cross-file ルーティング対象集合。
+        // 同名シンボルでも他の FileContext と独立に判定する必要があるため、
+        // `symbol_name_set.contains` で early-skip してはいけない（codex 分析）。
+        let mut cross_file_symbol_keys: HashSet<String> = HashSet::new();
         for sym in &affected {
             let sym_key = ci_key(lang_id, &sym.name);
-            if symbol_name_set.contains(&sym_key) {
-                continue;
-            }
             if !should_include_for_cross_file(
                 sym,
                 &syms,
@@ -340,6 +351,10 @@ fn collect_affected_symbols(
             ) {
                 continue;
             }
+            // この FileContext にとっての cross-file 検索対象に追加。
+            // すでに別ファイル経由でグローバル set に登録済みでも、本ファイル
+            // 固有のルーティング判定は失われない。
+            cross_file_symbol_keys.insert(sym_key.clone());
             included_symbols.insert(sym_key.clone());
             if let Some(orig) = find_overlapping_symbol(&syms, &sym.name, &df.hunks)
                 && let Some(parent_type) =
@@ -374,6 +389,7 @@ fn collect_affected_symbols(
             sig_changes,
             hunks,
             call_edges,
+            cross_file_symbol_keys,
         });
     }
 

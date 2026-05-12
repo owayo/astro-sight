@@ -2830,6 +2830,135 @@ pub mod tensor;
     );
 }
 
+/// Phase 4 設計バグの回帰テスト:
+/// 同名 method (modified + added) が異なるファイルに存在するとき、
+/// added 側 (新規追加ファイル) の fc_ix へ cross-file 参照が漏れないこと。
+///
+/// 旧実装: pass2 の `sym_to_fc` を **グローバル** `included_symbols.contains(sym_key)`
+/// で判定していたため、Factory.php の `new` (modified) が include されるだけで、
+/// Id.php (added) の `new` も同じ sym_key を持つため両 fc_ix に caller が流れていた。
+///
+/// 新実装: `FileContext.cross_file_symbol_keys` で per-file 判定するため、
+/// added の Id 側には何も流れない。
+#[test]
+fn impact_per_file_routing_excludes_added_with_same_method_name() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let existing_rs = dir.path().join("existing.rs");
+    let added_rs = dir.path().join("added.rs");
+    let caller_rs = dir.path().join("caller.rs");
+
+    // existing.rs: 既存ファイル (modified) — Existing::run シグネチャ変更後の状態
+    std::fs::write(
+        &existing_rs,
+        r#"pub struct Existing;
+
+impl Existing {
+    pub fn run(&self, x: u32) -> u32 { x + 1 }
+}
+"#,
+    )
+    .unwrap();
+
+    // added.rs: 新規ファイル (added) — Added::run も同名メソッドを持つ
+    std::fs::write(
+        &added_rs,
+        r#"pub struct Added;
+
+impl Added {
+    pub fn run(&self) -> u32 { 0 }
+}
+"#,
+    )
+    .unwrap();
+
+    // caller.rs: Existing::run の caller がいる (Added は使わない)
+    std::fs::write(
+        &caller_rs,
+        r#"use crate::existing::Existing;
+
+pub fn use_existing(e: &Existing) -> u32 {
+    e.run(42)
+}
+"#,
+    )
+    .unwrap();
+
+    // diff: existing.rs を modify + added.rs を新規追加
+    let diff = r#"--- a/existing.rs
++++ b/existing.rs
+@@ -2,4 +2,4 @@
+ pub struct Existing;
+
+ impl Existing {
+-    pub fn run(&self) -> u32 { 1 }
++    pub fn run(&self, x: u32) -> u32 { x + 1 }
+ }
+--- /dev/null
++++ b/added.rs
+@@ -0,0 +1,5 @@
++pub struct Added;
++
++impl Added {
++    pub fn run(&self) -> u32 { 0 }
++}
+"#;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["context", "--dir", dir.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn context");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "context failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("context stdout must be JSON");
+    let changes = json
+        .get("changes")
+        .and_then(|c| c.as_array())
+        .unwrap_or_else(|| panic!("changes array missing: {stdout}"));
+
+    // added.rs の change を取り出して impacted_callers が空であることを確認。
+    let added_change = changes
+        .iter()
+        .find(|c| c.get("path").and_then(|p| p.as_str()) == Some("added.rs"))
+        .unwrap_or_else(|| {
+            panic!("added.rs change entry not found in: {stdout}");
+        });
+    let added_callers = added_change
+        .get("impacted_callers")
+        .and_then(|c| c.as_array());
+    assert!(
+        added_callers.is_none_or(|c| c.is_empty()),
+        "added.rs (added file) must have no impacted_callers, but got: {added_change}"
+    );
+    let added_low = added_change
+        .get("low_confidence_callers")
+        .and_then(|c| c.as_array());
+    assert!(
+        added_low.is_none_or(|c| c.is_empty()),
+        "added.rs (added file) must have no low_confidence_callers, but got: {added_change}"
+    );
+}
+
 // ===========================================================================
 // 境界値・異常系・エッジケーステスト
 // ===========================================================================

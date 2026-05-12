@@ -4,7 +4,7 @@
 //!   Pass 3: `apply_stage4b_single` で `TypedCallerMap` → `CallerMap` (String 版) に decode
 //!   Pass 4: `build_file_impact` で call_edges マージ + `ImpactedCaller` 整形 → `FileImpact`
 //! を実行してすぐ callback に渡す。中間 `Vec<CallerMap>` を保持しないため RSS が節約される。
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::models::impact::{FileImpact, ImpactedCaller};
 
@@ -118,24 +118,43 @@ pub(super) fn build_file_impact(
     impacted_callers.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line.cmp(&b.line)));
 
     // Phase 4: 低確信度 caller を `low_confidence_callers` として整形する。
-    // 同 (path, line) が `impacted_callers` 側にも存在する場合は強い信号を優先し、
-    // 低確信度側からは除外して二重計上を防ぐ。
+    //
+    // 二重計上の意図は「同じ caller 行で同じシンボルが両方に出ないこと」。
+    // 旧実装は (path, line) ペア単位で除外していたが、これだと同じ caller 行で
+    // 異なるシンボル参照が両方ある場合（例: high `config` + low `new`）に
+    // low 側全体が消える誤動作があった (codex 分析)。
+    //
+    // 正しい dedupe:
+    //   - `impacted_callers` 側に同じ (path, line, symbol) があれば low から消す
+    //   - 同 (path, line) でも別 symbol なら low に残す
+    //
+    // 効率のため (path, line) 単位の `HashSet<&String>` を一度作ってから
+    // O(1) lookup で retain する。
+    let mut impacted_index: HashMap<(&str, usize), HashSet<&str>> = HashMap::new();
+    for c in &impacted_callers {
+        impacted_index
+            .entry((c.path.as_str(), c.line))
+            .or_default()
+            .extend(c.symbols.iter().map(String::as_str));
+    }
+
     let mut low_confidence_callers: Vec<ImpactedCaller> = low_caller_map
         .into_iter()
-        .filter(|((path, line), _)| {
-            !impacted_callers
-                .iter()
-                .any(|c| &c.path == path && c.line == *line)
-        })
-        .map(|((path, line), (name, mut symbols))| {
+        .filter_map(|((path, line), (name, mut symbols))| {
+            if let Some(impacted_syms) = impacted_index.get(&(path.as_str(), line)) {
+                symbols.retain(|s| !impacted_syms.contains(s.as_str()));
+            }
+            if symbols.is_empty() {
+                return None;
+            }
             symbols.sort_unstable();
-            ImpactedCaller {
+            Some(ImpactedCaller {
                 path,
                 name,
                 line,
                 symbols,
                 confidence: Some("low".to_string()),
-            }
+            })
         })
         .collect();
     low_confidence_callers.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line.cmp(&b.line)));
@@ -147,5 +166,118 @@ pub(super) fn build_file_impact(
         signature_changes: ctx.sig_changes,
         impacted_callers,
         low_confidence_callers,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::language::LangId;
+
+    fn empty_ctx(path: &str) -> FileContext {
+        FileContext {
+            new_path: path.to_string(),
+            lang_id: LangId::Php,
+            affected: Vec::new(),
+            sig_changes: Vec::new(),
+            hunks: Vec::new(),
+            call_edges: Vec::new(),
+            cross_file_symbol_keys: std::collections::HashSet::new(),
+        }
+    }
+
+    fn caller_map(entries: Vec<(&str, usize, &str, Vec<&str>)>) -> CallerMap {
+        let mut m: CallerMap = HashMap::new();
+        for (p, l, caller, syms) in entries {
+            m.insert(
+                (p.to_string(), l),
+                (
+                    caller.to_string(),
+                    syms.into_iter().map(String::from).collect(),
+                ),
+            );
+        }
+        m
+    }
+
+    /// 同 (path, line) の caller に異なるシンボル参照がある場合、
+    /// high 側に存在しない low シンボルは保持されること。
+    /// 旧実装は (path, line) ペア単位で除外していたため、
+    /// 同行の `config` (high) があるだけで `new` (low) も消えていた。
+    #[test]
+    fn build_file_impact_keeps_low_when_different_symbol_at_same_line() {
+        let ctx = empty_ctx("src/Caller.php");
+        let high = caller_map(vec![("src/Caller.php", 42, "doStuff", vec!["config"])]);
+        let low = caller_map(vec![("src/Caller.php", 42, "doStuff", vec!["new"])]);
+
+        let imp = build_file_impact(ctx, high, low);
+
+        assert_eq!(imp.impacted_callers.len(), 1);
+        assert_eq!(imp.impacted_callers[0].symbols, vec!["config".to_string()]);
+        assert_eq!(imp.low_confidence_callers.len(), 1);
+        assert_eq!(
+            imp.low_confidence_callers[0].symbols,
+            vec!["new".to_string()]
+        );
+        assert_eq!(
+            imp.low_confidence_callers[0].confidence.as_deref(),
+            Some("low")
+        );
+    }
+
+    /// 同 (path, line) で同じシンボル名が high/low 両方にある場合は
+    /// low 側から除外されること（強い信号を優先）。
+    #[test]
+    fn build_file_impact_drops_low_when_same_symbol_at_same_line() {
+        let ctx = empty_ctx("src/Caller.php");
+        let high = caller_map(vec![("src/Caller.php", 42, "doStuff", vec!["new"])]);
+        let low = caller_map(vec![("src/Caller.php", 42, "doStuff", vec!["new"])]);
+
+        let imp = build_file_impact(ctx, high, low);
+
+        assert_eq!(imp.impacted_callers.len(), 1);
+        assert_eq!(imp.impacted_callers[0].symbols, vec!["new".to_string()]);
+        assert!(imp.low_confidence_callers.is_empty());
+    }
+
+    /// 同 (path, line) の low caller で symbols が一部だけ high と被っているとき、
+    /// 被っていないシンボルだけが low に残ること。
+    #[test]
+    fn build_file_impact_drops_only_overlapping_symbols_from_low() {
+        let ctx = empty_ctx("src/Caller.php");
+        let high = caller_map(vec![("src/Caller.php", 42, "doStuff", vec!["new"])]);
+        let low = caller_map(vec![(
+            "src/Caller.php",
+            42,
+            "doStuff",
+            vec!["new", "update"],
+        )]);
+
+        let imp = build_file_impact(ctx, high, low);
+
+        assert_eq!(imp.impacted_callers.len(), 1);
+        assert_eq!(imp.impacted_callers[0].symbols, vec!["new".to_string()]);
+        assert_eq!(imp.low_confidence_callers.len(), 1);
+        assert_eq!(
+            imp.low_confidence_callers[0].symbols,
+            vec!["update".to_string()]
+        );
+    }
+
+    /// high 側に caller がない場合、low 側がそのまま保持されること。
+    #[test]
+    fn build_file_impact_keeps_low_when_no_high() {
+        let ctx = empty_ctx("src/Caller.php");
+        let high: CallerMap = HashMap::new();
+        let low = caller_map(vec![("src/Caller.php", 42, "doStuff", vec!["new"])]);
+
+        let imp = build_file_impact(ctx, high, low);
+
+        assert!(imp.impacted_callers.is_empty());
+        assert_eq!(imp.low_confidence_callers.len(), 1);
+        assert_eq!(
+            imp.low_confidence_callers[0].symbols,
+            vec!["new".to_string()]
+        );
     }
 }

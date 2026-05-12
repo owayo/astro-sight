@@ -5,7 +5,7 @@
 //! その場で `TypedCallerMap` にフィルタ適用して流す。worker local state は `CHUNK_SIZE` 件
 //! ずつに区切って rayon fold/reduce で処理し、各 chunk の終了時に global accumulator へ
 //! merge → chunk state を drop することで RSS ピークを抑える。
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
@@ -40,13 +40,11 @@ fn impact_worker_count() -> usize {
 /// worker local state の肥大化を抑えるため、ファイル群を `CHUNK_SIZE` 件ずつに区切って
 /// rayon fold/reduce を動かし、chunk 終了時に global accumulator へ merge → chunk state を
 /// drop する。これにより次の chunk 開始時には前回の chunk local は解放済みとなる。
-#[allow(clippy::too_many_arguments)]
 pub(super) fn stream_caller_maps_and_defs(
     file_contexts: &[FileContext],
     all_symbol_names: &[String],
     sym_ix: &HashMap<String, usize>,
     method_parent_types: &HashMap<String, String>,
-    included_symbols: &HashSet<String>,
     dir: &Path,
 ) -> (
     Vec<TypedCallerMap>,
@@ -100,11 +98,18 @@ pub(super) fn stream_caller_maps_and_defs(
         );
     }
 
+    // sym_to_fc は per-file の `cross_file_symbol_keys` だけを信頼して構築する。
+    //
+    // 重要: グローバルな `included_symbols` を contains 判定に使ってはいけない。
+    // 同名シンボル (例: 異なる class の `new`) が複数ファイルにある場合、
+    // 「modified の Factory.php は include / added の Id.php は exclude」のような
+    // per-file 判定の差異が、global set の OR 判定で潰されてしまう。
+    // 詳しくは `FileContext::cross_file_symbol_keys` の docstring を参照。
     let mut sym_to_fc: Vec<Vec<u32>> = vec![Vec::new(); n_sym];
     for (fc_ix, ctx) in file_contexts.iter().enumerate() {
         for sym in &ctx.affected {
             let sym_key = ci_key(ctx.lang_id, &sym.name);
-            if !included_symbols.contains(&sym_key) {
+            if !ctx.cross_file_symbol_keys.contains(&sym_key) {
                 continue;
             }
             if let Some(&ix) = sym_ix.get(&sym_key) {
