@@ -6477,6 +6477,156 @@ fn xojo_refs_batch_case_insensitive_collision() {
     );
 }
 
+/// Phase 4: PHP `Foo::new()` は `impacted_callers`、`$x->new()` は `low_confidence_callers`
+/// に振り分けられる。`new` のような generic name + receiver-bare 呼び出しが
+/// 強い impact 信号を汚染しない仕様の回帰テスト。
+///
+/// `ASTRO_SIGHT_NO_CONFIDENCE_FILTER=1` を設定すると従来挙動 (全 caller を impacted_callers
+/// に流す) に戻ることもあわせて確認する。
+#[test]
+fn context_php_generic_method_bare_call_routed_to_low_confidence() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    // Foo.php: 変更対象クラス (method `new` のシグネチャを変える)
+    std::fs::write(
+        root.join("Foo.php"),
+        "<?php\nclass Foo {\n    public function new() {\n        return 'foo-new';\n    }\n}\n",
+    )
+    .unwrap();
+    // CallerExact.php: `Foo::new()` で ExactOwner として呼び出し
+    std::fs::write(
+        root.join("CallerExact.php"),
+        "<?php\nclass CallerExact {\n    public function callExact() {\n        return Foo::new();\n    }\n}\n",
+    )
+    .unwrap();
+    // CallerBare.php: `$x->new()` で BareNameOnly 呼び出し。
+    // `parent_in_this_file` フィルタを通過させるため、ファイル内に `Foo` 識別子を出現させる
+    // (Laravel 系の `_ide_helper.php` で起きるノイズ条件を最小再現)。
+    std::fs::write(
+        root.join("CallerBare.php"),
+        "<?php\nclass CallerBare {\n    public function callBare($x) {\n        $tmp = Foo::class;\n        return $x->new();\n    }\n}\n",
+    )
+    .unwrap();
+
+    let diff = "diff --git a/Foo.php b/Foo.php\n--- a/Foo.php\n+++ b/Foo.php\n@@ -2,5 +2,5 @@\n class Foo {\n-    public function new() {\n+    public function new($flag) {\n         return 'foo-new';\n     }\n";
+    let diff_path = root.join("changes.patch");
+    std::fs::write(&diff_path, diff).unwrap();
+
+    // 既定: confidence ベースのルーティングが効く
+    let output = cargo_bin()
+        .args([
+            "context",
+            "--dir",
+            root.to_str().unwrap(),
+            "--diff-file",
+            diff_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run context");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let changes = json["changes"].as_array().expect("changes 配列");
+    assert_eq!(changes.len(), 1, "1 ファイル分の FileImpact が出るべき");
+    let impact = &changes[0];
+
+    let impacted: Vec<&serde_json::Value> = impact["impacted_callers"]
+        .as_array()
+        .expect("impacted_callers 配列")
+        .iter()
+        .collect();
+    assert_eq!(
+        impacted.len(),
+        1,
+        "ExactOwner だけが impacted_callers に入るべき: {impacted:?}"
+    );
+    let exact_path = impacted[0]["path"].as_str().expect("path");
+    assert!(
+        exact_path.ends_with("CallerExact.php"),
+        "ExactOwner caller は CallerExact.php であるべき: {exact_path}"
+    );
+    assert!(
+        impacted[0]["confidence"].is_null(),
+        "ExactOwner には confidence は付かない: {:?}",
+        impacted[0]
+    );
+
+    let low: Vec<&serde_json::Value> = impact["low_confidence_callers"]
+        .as_array()
+        .expect("low_confidence_callers 配列")
+        .iter()
+        .collect();
+    assert_eq!(
+        low.len(),
+        1,
+        "BareNameOnly + generic name は low_confidence_callers に振り分けられるべき: {low:?}"
+    );
+    let low_path = low[0]["path"].as_str().expect("path");
+    assert!(
+        low_path.ends_with("CallerBare.php"),
+        "low confidence caller は CallerBare.php であるべき: {low_path}"
+    );
+    assert_eq!(
+        low[0]["confidence"].as_str(),
+        Some("low"),
+        "low_confidence_callers には confidence=low が付くべき: {:?}",
+        low[0]
+    );
+
+    // ASTRO_SIGHT_NO_CONFIDENCE_FILTER=1: 振り分けが無効化されて全 caller が impacted_callers に
+    let output = cargo_bin()
+        .env("ASTRO_SIGHT_NO_CONFIDENCE_FILTER", "1")
+        .args([
+            "context",
+            "--dir",
+            root.to_str().unwrap(),
+            "--diff-file",
+            diff_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run context");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let impact = &json["changes"][0];
+    let impacted_paths: Vec<&str> = impact["impacted_callers"]
+        .as_array()
+        .expect("impacted_callers 配列")
+        .iter()
+        .filter_map(|c| c["path"].as_str())
+        .collect();
+    assert_eq!(
+        impacted_paths.len(),
+        2,
+        "fallback 設定下では両 caller が impacted_callers に流れるべき: {impacted_paths:?}"
+    );
+    assert!(
+        impacted_paths
+            .iter()
+            .any(|p| p.ends_with("CallerExact.php")),
+        "fallback 下でも ExactOwner caller は残る: {impacted_paths:?}"
+    );
+    assert!(
+        impacted_paths.iter().any(|p| p.ends_with("CallerBare.php")),
+        "fallback 下では BareNameOnly caller も impacted_callers に出る: {impacted_paths:?}"
+    );
+    assert!(
+        impact["low_confidence_callers"].as_array().is_none()
+            || impact["low_confidence_callers"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+        "fallback 下では low_confidence_callers は空 (skip_serializing_if で省略) のはず: {impact:?}"
+    );
+}
+
 #[test]
 fn xojo_doctor_lists_xojo() {
     let output = cargo_bin()
