@@ -68,7 +68,15 @@ pub(super) fn apply_stage4b_single(
 
 /// Pass 4 (per-fc): 1 ファイル分の `CallerMap` と `FileContext` から `FileImpact` を組み立てる。
 /// 同一ファイル内の `call_edges` もここでマージする。
-pub(super) fn build_file_impact(ctx: FileContext, mut caller_map: CallerMap) -> FileImpact {
+///
+/// `low_caller_map` は Phase 4 で導入された低確信度 caller (BareNameOnly + generic name)。
+/// `impacted_callers` を汚染しないよう別フィールドで保持し、出力時には `confidence: "low"`
+/// を付与する。
+pub(super) fn build_file_impact(
+    ctx: FileContext,
+    mut caller_map: CallerMap,
+    low_caller_map: CallerMap,
+) -> FileImpact {
     // 同一ファイル内の call_edges をマージ
     for sym in &ctx.affected {
         let sym_key = ci_key(ctx.lang_id, &sym.name);
@@ -109,12 +117,35 @@ pub(super) fn build_file_impact(ctx: FileContext, mut caller_map: CallerMap) -> 
         .collect();
     impacted_callers.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line.cmp(&b.line)));
 
+    // Phase 4: 低確信度 caller を `low_confidence_callers` として整形する。
+    // 同 (path, line) が `impacted_callers` 側にも存在する場合は強い信号を優先し、
+    // 低確信度側からは除外して二重計上を防ぐ。
+    let mut low_confidence_callers: Vec<ImpactedCaller> = low_caller_map
+        .into_iter()
+        .filter(|((path, line), _)| {
+            !impacted_callers
+                .iter()
+                .any(|c| &c.path == path && c.line == *line)
+        })
+        .map(|((path, line), (name, mut symbols))| {
+            symbols.sort_unstable();
+            ImpactedCaller {
+                path,
+                name,
+                line,
+                symbols,
+                confidence: Some("low".to_string()),
+            }
+        })
+        .collect();
+    low_confidence_callers.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line.cmp(&b.line)));
+
     FileImpact {
         path: ctx.new_path,
         hunks: ctx.hunks,
         affected_symbols: ctx.affected,
         signature_changes: ctx.sig_changes,
         impacted_callers,
-        low_confidence_callers: Vec::new(),
+        low_confidence_callers,
     }
 }

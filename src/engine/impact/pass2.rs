@@ -48,7 +48,12 @@ pub(super) fn stream_caller_maps_and_defs(
     method_parent_types: &HashMap<String, String>,
     included_symbols: &HashSet<String>,
     dir: &Path,
-) -> (Vec<TypedCallerMap>, Vec<Vec<u32>>, StringPool) {
+) -> (
+    Vec<TypedCallerMap>,
+    Vec<TypedCallerMap>,
+    Vec<Vec<u32>>,
+    StringPool,
+) {
     let n_sym = all_symbol_names.len();
     let n_fc = file_contexts.len();
 
@@ -89,6 +94,7 @@ pub(super) fn stream_caller_maps_and_defs(
         crate::commands::log_phase("context.pass2.ci_skip", "applied", 0);
         return (
             (0..n_fc).map(|_| new_typed_caller_map()).collect(),
+            (0..n_fc).map(|_| new_typed_caller_map()).collect(),
             vec![Vec::new(); n_sym],
             StringPool::new(),
         );
@@ -116,6 +122,7 @@ pub(super) fn stream_caller_maps_and_defs(
 
     let empty_result = || {
         (
+            (0..n_fc).map(|_| new_typed_caller_map()).collect(),
             (0..n_fc).map(|_| new_typed_caller_map()).collect(),
             vec![Vec::new(); n_sym],
             StringPool::new(),
@@ -149,6 +156,7 @@ pub(super) fn stream_caller_maps_and_defs(
     let init_state = || -> WorkerState {
         WorkerState {
             local_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
+            local_low_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
             local_def_paths: vec![Vec::new(); n_sym],
             target_cache: LruCache::new(
                 NonZeroUsize::new(TARGET_FILE_CACHE_SIZE).expect("cache size is non-zero"),
@@ -160,6 +168,8 @@ pub(super) fn stream_caller_maps_and_defs(
     };
 
     let mut global_maps: Vec<TypedCallerMap> = (0..n_fc).map(|_| new_typed_caller_map()).collect();
+    let mut global_low_maps: Vec<TypedCallerMap> =
+        (0..n_fc).map(|_| new_typed_caller_map()).collect();
     let mut global_defs: Vec<Vec<u32>> = vec![Vec::new(); n_sym];
 
     for chunk in files.chunks(CHUNK_SIZE) {
@@ -179,6 +189,7 @@ pub(super) fn stream_caller_maps_and_defs(
                     {
                         let WorkerState {
                             local_maps,
+                            local_low_maps,
                             local_def_paths,
                             target_cache,
                             ref_hit,
@@ -193,6 +204,7 @@ pub(super) fn stream_caller_maps_and_defs(
                             pool: &string_pool,
                             path_str,
                             local_maps: local_maps.as_mut_slice(),
+                            local_low_maps: local_low_maps.as_mut_slice(),
                             local_def_paths: local_def_paths.as_mut_slice(),
                             target_cache,
                             ref_hit: ref_hit.as_mut_slice(),
@@ -217,6 +229,7 @@ pub(super) fn stream_caller_maps_and_defs(
                 })
                 .reduce(init_state, |mut acc, local| {
                     merge_typed_maps(&mut acc.local_maps, local.local_maps);
+                    merge_typed_maps(&mut acc.local_low_maps, local.local_low_maps);
                     for (acc_v, local_v) in
                         acc.local_def_paths.iter_mut().zip(local.local_def_paths)
                     {
@@ -228,6 +241,7 @@ pub(super) fn stream_caller_maps_and_defs(
 
         // chunk 結果を global にマージし、chunk state をスコープ終了で drop させる。
         merge_typed_maps(&mut global_maps, chunk_state.local_maps);
+        merge_typed_maps(&mut global_low_maps, chunk_state.local_low_maps);
         for (g, c) in global_defs.iter_mut().zip(chunk_state.local_def_paths) {
             g.extend(c);
         }
@@ -236,7 +250,7 @@ pub(super) fn stream_caller_maps_and_defs(
     let pool = string_pool
         .into_inner()
         .expect("string pool mutex poisoned on unwrap");
-    (global_maps, global_defs, pool)
+    (global_maps, global_low_maps, global_defs, pool)
 }
 
 /// 2 つの `Vec<TypedCallerMap>` をエントリ単位で重複排除しつつ merge する。
