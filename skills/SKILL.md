@@ -197,6 +197,8 @@ git diff | astro-sight impact --dir .
 
 Exit codes: `0` = no unresolved impacts (silent), `1` = unresolved impacts found (stderr text output). With `--hook`, appends a triage hint for AI agents.
 
+`context` / `impact` / `review` skip cross-file reference search inside vendor / package-manager trees (`vendor/`, `node_modules/`, `.venv/`, `Pods/`, `Carthage/` ...) and build artifacts (`target/`, `build/`, `dist/`, `.build/`, `DerivedData/`, `.next/`, `bin/`, `obj/` ...) by default. This stops generic method names (`new`, `save`, `find`) inside 3rd-party or generated code from flooding `impacted_callers`. Set `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` to opt back in. `.gitignore` / hidden file exclusions are independent and always on.
+
 ### `review` — Structured Diff Review (One-Shot)
 
 Integrates `context` (impact analysis), `cochange` (missing co-change detection), API surface diff (added/removed/modified public symbols), and dead symbol detection into a single command. Ideal for PR review or pre-merge checks.

@@ -3099,6 +3099,366 @@ class Consumer {
     );
 }
 
+/// Rust trait_item 親型認識の回帰テスト。
+///
+/// PHP の trait_declaration と同様、Rust の `trait Foo { fn bar() {} }` も
+/// 親型認識されないと Stage 4b parent_in_this_file が常に false になり、
+/// 別 struct の同名 method が impacted_callers に流れる。
+#[test]
+fn impact_rust_trait_item_filters_unrelated_callers() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let trait_rs = dir.path().join("factory.rs");
+    let other_rs = dir.path().join("other.rs");
+    let unrelated_rs = dir.path().join("unrelated.rs");
+
+    // factory.rs: trait scope の method `new`
+    std::fs::write(
+        &trait_rs,
+        r#"pub trait Factory {
+    fn new(x: i32) -> Self
+    where
+        Self: Sized;
+}
+"#,
+    )
+    .unwrap();
+
+    // other.rs: 別 struct の同名 method `new`
+    std::fs::write(
+        &other_rs,
+        r#"pub struct Other;
+
+impl Other {
+    pub fn new() -> Self {
+        Other
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // unrelated.rs: Other::new() を呼ぶだけ。Factory trait は触らない。
+    std::fs::write(
+        &unrelated_rs,
+        r#"use crate::other::Other;
+
+pub fn consume() {
+    let _ = Other::new();
+}
+"#,
+    )
+    .unwrap();
+
+    // diff: Factory trait の `new` シグネチャを変更
+    let diff = r#"--- a/factory.rs
++++ b/factory.rs
+@@ -1,5 +1,5 @@
+ pub trait Factory {
+-    fn new(x: i32) -> Self
++    fn new(x: i32, y: i32) -> Self
+     where
+         Self: Sized;
+ }
+"#;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["context", "--dir", dir.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn context");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "context failed: {stdout}");
+
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("context stdout must be JSON");
+    let changes = json
+        .get("changes")
+        .and_then(|c| c.as_array())
+        .expect("changes array");
+
+    let factory_change = changes
+        .iter()
+        .find(|c| c.get("path").and_then(|p| p.as_str()) == Some("factory.rs"))
+        .unwrap_or_else(|| panic!("factory.rs change not found: {stdout}"));
+
+    let impacted = factory_change
+        .get("impacted_callers")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let low = factory_change
+        .get("low_confidence_callers")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let unrelated_in_impacted = impacted
+        .iter()
+        .any(|c| c.get("path").and_then(|p| p.as_str()) == Some("unrelated.rs"));
+    let unrelated_in_low = low
+        .iter()
+        .any(|c| c.get("path").and_then(|p| p.as_str()) == Some("unrelated.rs"));
+    assert!(
+        !unrelated_in_impacted,
+        "unrelated.rs must NOT appear in impacted_callers (Rust trait_item parent check). impacted: {impacted:?}"
+    );
+    assert!(
+        !unrelated_in_low,
+        "unrelated.rs must NOT appear in low_confidence_callers either. low: {low:?}"
+    );
+}
+
+/// TypeScript abstract_class_declaration 親型認識の回帰テスト。
+///
+/// `abstract class Foo { abstract bar(): void }` は通常の class_declaration ではなく
+/// abstract_class_declaration ノードになるため、別途認識を追加しないと parent が消える。
+#[test]
+fn impact_typescript_abstract_class_filters_unrelated_callers() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let abs_ts = dir.path().join("base.ts");
+    let other_ts = dir.path().join("other.ts");
+    let unrelated_ts = dir.path().join("unrelated.ts");
+
+    // base.ts: abstract class scope の method `process`
+    std::fs::write(
+        &abs_ts,
+        r#"export abstract class Base {
+    abstract process(x: number): number;
+}
+"#,
+    )
+    .unwrap();
+
+    // other.ts: 別 class の同名 method `process`
+    std::fs::write(
+        &other_ts,
+        r#"export class Other {
+    process(): number {
+        return 0;
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // unrelated.ts: Other.process() を呼ぶだけ
+    std::fs::write(
+        &unrelated_ts,
+        r#"import { Other } from "./other";
+
+export function consume(): number {
+    const o = new Other();
+    return o.process();
+}
+"#,
+    )
+    .unwrap();
+
+    let diff = r#"--- a/base.ts
++++ b/base.ts
+@@ -1,3 +1,3 @@
+ export abstract class Base {
+-    abstract process(x: number): number;
++    abstract process(x: number, y: number): number;
+ }
+"#;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["context", "--dir", dir.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn context");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "context failed: {stdout}");
+
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("context stdout must be JSON");
+    let changes = json
+        .get("changes")
+        .and_then(|c| c.as_array())
+        .expect("changes array");
+
+    let base_change = changes
+        .iter()
+        .find(|c| c.get("path").and_then(|p| p.as_str()) == Some("base.ts"))
+        .unwrap_or_else(|| panic!("base.ts change not found: {stdout}"));
+
+    let impacted = base_change
+        .get("impacted_callers")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let low = base_change
+        .get("low_confidence_callers")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let unrelated_in_impacted = impacted
+        .iter()
+        .any(|c| c.get("path").and_then(|p| p.as_str()) == Some("unrelated.ts"));
+    let unrelated_in_low = low
+        .iter()
+        .any(|c| c.get("path").and_then(|p| p.as_str()) == Some("unrelated.ts"));
+    assert!(
+        !unrelated_in_impacted,
+        "unrelated.ts must NOT appear in impacted_callers (TS abstract_class_declaration parent check). impacted: {impacted:?}"
+    );
+    assert!(
+        !unrelated_in_low,
+        "unrelated.ts must NOT appear in low_confidence_callers either. low: {low:?}"
+    );
+}
+
+/// impact のデフォルト除外ディレクトリ動作確認。
+///
+/// vendor / node_modules / target などの 3rd-party / build artifact ディレクトリ内に
+/// 同名メソッドが置かれていても、`impacted_callers` には流れ込まないこと。
+#[test]
+fn impact_default_excluded_dirs_drops_vendor_callers() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let owner_php = dir.path().join("Owner.php");
+    let vendor_php = dir.path().join("vendor").join("Caller.php");
+    let target_rs_dir = dir.path().join("target").join("debug");
+    std::fs::create_dir_all(target_rs_dir.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(vendor_php.parent().unwrap()).unwrap();
+
+    // Owner.php: trait scope の static method `new`
+    std::fs::write(
+        &owner_php,
+        r#"<?php
+trait Factory {
+    public static function new(int $x): self {
+        return new self($x);
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // vendor/Caller.php: 同名 static method `new` を持つ別 class
+    std::fs::write(
+        &vendor_php,
+        r#"<?php
+class VendorThing {
+    public static function new(): self {
+        return new self();
+    }
+}
+function consume_vendor(): void {
+    $obj = VendorThing::new();
+}
+"#,
+    )
+    .unwrap();
+
+    let diff = r#"--- a/Owner.php
++++ b/Owner.php
+@@ -1,5 +1,5 @@
+ <?php
+ trait Factory {
+-    public static function new(int $x): self {
++    public static function new(int $x, int $y): self {
+         return new self($x);
+     }
+ }
+"#;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["context", "--dir", dir.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn context");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "context failed: {stdout}");
+
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("context stdout must be JSON");
+    let changes = json
+        .get("changes")
+        .and_then(|c| c.as_array())
+        .expect("changes array");
+    let owner_change = changes
+        .iter()
+        .find(|c| c.get("path").and_then(|p| p.as_str()) == Some("Owner.php"))
+        .unwrap_or_else(|| panic!("Owner.php change not found: {stdout}"));
+
+    let impacted = owner_change
+        .get("impacted_callers")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let low = owner_change
+        .get("low_confidence_callers")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let vendor_in_impacted = impacted.iter().any(|c| {
+        c.get("path")
+            .and_then(|p| p.as_str())
+            .map(|p| p.contains("vendor"))
+            .unwrap_or(false)
+    });
+    let vendor_in_low = low.iter().any(|c| {
+        c.get("path")
+            .and_then(|p| p.as_str())
+            .map(|p| p.contains("vendor"))
+            .unwrap_or(false)
+    });
+
+    assert!(
+        !vendor_in_impacted,
+        "vendor/ caller must NOT appear in impacted_callers. impacted: {impacted:?}"
+    );
+    assert!(
+        !vendor_in_low,
+        "vendor/ caller must NOT appear in low_confidence_callers. low: {low:?}"
+    );
+}
+
 // ===========================================================================
 // 境界値・異常系・エッジケーステスト
 // ===========================================================================

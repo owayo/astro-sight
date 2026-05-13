@@ -599,7 +599,9 @@ fn symbol_kind_str(kind: SymbolKind) -> &'static str {
 ///
 /// Rust `impl Foo { fn bar() {} }` → `Some("Foo")` を返す
 /// Rust `impl Trait for Foo { fn bar() {} }` → `Some("Foo")` を返す
+/// Rust `trait Foo { fn bar() {} }` → `Some("Foo")` を返す
 /// クラスベース言語 → クラス/トレイト/インタフェース/enum 名を返す
+/// Zig `const Foo = struct { fn bar() {} };` → `Some("Foo")` を返す
 ///
 /// **PHP trait の認識は load-bearing**: 大規模 Laravel/DDD 系プロジェクトで
 /// `trait Factory` のような trait 内 method 変更時、`find_parent_type_name` が
@@ -607,6 +609,10 @@ fn symbol_kind_str(kind: SymbolKind) -> &'static str {
 /// parent_in_this_file チェックが完全にバイパスされる。結果として
 /// `Other::new()` 等の同名 method 全件が誤って impacted_callers に流れる
 /// (実測: 1 リポで数千件規模の偽陽性)。
+///
+/// **namespace は意図的に対象外**: TS `internal_module` / C++ `namespace_definition`
+/// は「scope」であって「親型」ではない。Stage 4b に混ぜると非修飾呼び出しや
+/// alias import を持つ正当な参照を落としてしまうため対象外とする。
 fn find_parent_type_name(
     root: tree_sitter::Node,
     source: &[u8],
@@ -622,22 +628,43 @@ fn find_parent_type_name(
                 .child_by_field_name("type")
                 .and_then(|t| extract_type_name(t, source));
         }
-        // クラス/トレイト/インタフェース/enum 系の宣言ノード。
+        // Zig は `const Foo = struct { ... };` の形なので親型名は宣言ノード自身ではなく、
+        // 1つ上の variable_declaration の identifier から取る。
+        if lang_id == LangId::Zig
+            && matches!(
+                n.kind(),
+                "struct_declaration" | "enum_declaration" | "union_declaration"
+            )
+            && let Some(name) = zig_container_binding_name(n, source)
+        {
+            return Some(name);
+        }
+        // クラス/トレイト/インタフェース/enum/protocol/record/struct 系の宣言ノード。
         // tree-sitter-php: class_declaration / trait_declaration / interface_declaration / enum_declaration
         // tree-sitter-{java,kotlin,c-sharp,typescript}: class_declaration / interface_declaration / enum_declaration
-        // tree-sitter-{cpp}: class_specifier / struct_specifier
+        // tree-sitter-typescript: abstract_class_declaration (TS abstract class)
+        // tree-sitter-c-sharp: struct_declaration / record_declaration (C# 9+)
+        // tree-sitter-cpp: class_specifier / struct_specifier / enum_specifier (C++11 enum class 含む)
         // tree-sitter-{python,ruby}: class_definition / class
         // tree-sitter-{ruby}: module / singleton_class
+        // tree-sitter-rust: trait_item (trait 内メソッドの親)
+        // tree-sitter-swift: protocol_declaration (protocol 内宣言の親)
         // tree-sitter-{go}: type_declaration を struct/interface 含めて拾うのは困難なため除外 (Go は別経路)
         if matches!(
             n.kind(),
             "class_declaration"
+                | "abstract_class_declaration"
                 | "class_definition"
                 | "class_specifier"
                 | "struct_specifier"
+                | "struct_declaration"
+                | "record_declaration"
                 | "trait_declaration"
+                | "trait_item"
                 | "interface_declaration"
+                | "protocol_declaration"
                 | "enum_declaration"
+                | "enum_specifier"
                 | "module"
                 | "module_declaration"
                 | "singleton_class"
@@ -646,9 +673,9 @@ fn find_parent_type_name(
         ) {
             if let Some(name) = n
                 .child_by_field_name("name")
-                .and_then(|name| name.utf8_text(source).ok())
+                .and_then(|name| extract_type_name(name, source))
             {
-                return Some(name.to_string());
+                return Some(name);
             }
             // Ruby `class Foo` / `module Foo` は name フィールドではなく
             // 子ノードの constant / scope_resolution として配置される。
@@ -667,17 +694,40 @@ fn find_parent_type_name(
     None
 }
 
+/// Zig の `const Foo = struct { ... };` 形式で、struct/enum/union 宣言ノードの
+/// 親 variable_declaration から束縛名を取得する。
+fn zig_container_binding_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let parent = node.parent()?;
+    if parent.kind() != "variable_declaration" {
+        return None;
+    }
+    let count = parent.named_child_count() as u32;
+    for i in 0..count {
+        if let Some(child) = parent.named_child(i)
+            && child.kind() == "identifier"
+            && let Ok(text) = child.utf8_text(source)
+        {
+            return Some(text.to_string());
+        }
+    }
+    None
+}
+
 /// tree-sitter の型ノードから型名を抽出する（ジェネリクスやスコープ付き型を処理）。
+///
+/// Swift の `simple_identifier` / C++ の `qualified_identifier` も
+/// 親型ノードの name field として現れるので拾えるようにしてある。
 fn extract_type_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
     match node.kind() {
-        "type_identifier" | "identifier" => node.utf8_text(source).ok().map(|s| s.to_string()),
+        "type_identifier" | "identifier" | "simple_identifier" => {
+            node.utf8_text(source).ok().map(|s| s.to_string())
+        }
         "generic_type" => node
             .child_by_field_name("type")
             .and_then(|t| extract_type_name(t, source)),
-        "scoped_type_identifier" => node
+        "scoped_type_identifier" | "qualified_identifier" => node
             .child_by_field_name("name")
-            .and_then(|n| n.utf8_text(source).ok())
-            .map(|s| s.to_string()),
+            .and_then(|n| extract_type_name(n, source)),
         _ => node.utf8_text(source).ok().map(|s| s.to_string()),
     }
 }

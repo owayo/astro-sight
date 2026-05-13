@@ -301,6 +301,21 @@ commands = ["astro-sight impact --git --dir ."]
 condition = { command_exists = "astro-sight" }
 ```
 
+#### デフォルト除外
+
+`context` / `impact` / `review` の影響分析は、cross-file 参照検索時にサードパーティ依存と build artifact をデフォルトで除外する。`new` / `save` / `find` / `update` などの汎用メソッド名が 3rd-party / generated コードから大量に流入し、影響先を万件単位の偽陽性で埋めるのを防ぐ。
+
+- vendor / package manager: `vendor`, `node_modules`, `bower_components`, `.venv`, `venv`, `.tox`, `Pods`, `Carthage`
+- build artifact: `target`, `build`, `dist`, `out`, `.build`, `DerivedData`, `bin`, `obj`, `coverage`, `.next`, `.nuxt`, `.svelte-kit`, `.turbo`, `CMakeFiles`
+
+追加除外を解除する場合:
+
+```bash
+ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1 astro-sight impact --dir . --git
+```
+
+`.gitignore` / hidden file / generated file の除外（`refs::collect_files` 経由）は別系統で常に有効。
+
 ### review - 構造化 diff レビュー
 
 `context` の影響分析に加えて、`cochange` による変更漏れ候補、公開 API 差分、死蔵シンボルを 1 回の実行でまとめて返す。PR レビューや pre-merge チェック向け。

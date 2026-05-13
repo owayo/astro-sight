@@ -26,22 +26,50 @@ const CHUNK_SIZE: usize = 128;
 /// impact (context / impact / review) の cross-file 参照検索でデフォルトで除外する
 /// ディレクトリ名。
 ///
-/// vendor 系は Composer / Bundler / Go modules などのサードパーティ依存を指し、
-/// ユーザー自身のコード変更が **vendor 内コードに impact することはほぼ無い**
-/// (依存方向は逆向き)。一方で同名メソッド (`new` / `update` 等) を持つことが
-/// 多く、cross-file 参照検索で大量の偽陽性 (例: 1 リポで 3,000+ 件) を生む。
+/// 二系統:
+/// - **vendor 系** (vendor / node_modules / bower_components / .venv / venv / .tox /
+///   Pods / Carthage): サードパーティ依存。ユーザーコード変更が vendor 内に影響する
+///   ことはほぼ無く (依存方向は逆向き)、同名メソッド (`new` / `update` 等) で
+///   万件単位の偽陽性を生む。
+/// - **build artifact 系** (target / build / dist / out / .build / DerivedData /
+///   bin / obj / coverage / .next / .nuxt / .svelte-kit / .turbo / CMakeFiles):
+///   生成物。`.gitignore` に入っているのが普通だが、明示除外しておくことで
+///   `.gitignore` を持たないチェックアウトや CI 一時ディレクトリでも安全に動作する。
 ///
-/// 解除する場合は `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` を設定する。
-const IMPACT_VENDOR_EXCLUDES: &[&str] = &[
+/// 解除する場合は `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` を設定する
+/// (環境変数名は v26.5.115 互換のため変更しない。新規 build artifact 除外も同じ
+/// フラグで一括解除される)。`.gitignore` / hidden file / generated file の除外
+/// (refs::collect_files の挙動) は引き続き有効で、本リストとは別系統。
+const IMPACT_DEFAULT_EXCLUDED_DIRS: &[&str] = &[
+    // vendor / package manager trees
     "vendor",
     "node_modules",
     "bower_components",
     ".venv",
     "venv",
     ".tox",
+    "Pods",
+    "Carthage",
+    // build artifacts
+    "target",
+    "build",
+    "dist",
+    "out",
+    ".build",
+    "DerivedData",
+    "bin",
+    "obj",
+    "coverage",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".turbo",
+    "CMakeFiles",
 ];
 
-/// `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` のとき vendor 除外を解除する。
+/// `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` のとき impact のデフォルト除外を解除する。
+/// (環境変数名は v26.5.115 との後方互換のため `_VENDOR_` のままだが、build artifact
+/// 除外も同じフラグで解除される。)
 fn impact_include_vendor() -> bool {
     std::env::var("ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT")
         .ok()
@@ -164,14 +192,14 @@ pub(super) fn stream_caller_maps_and_defs(
         Ok(a) => a,
         Err(_) => return empty_result(),
     };
-    // vendor / node_modules 等を impact のデフォルト除外にする。
-    // 同名メソッドが大量にある 3rd-party 依存を含めると cross-file 参照が
+    // vendor / node_modules / build artifact 等を impact のデフォルト除外にする。
+    // 同名メソッドが大量にある 3rd-party 依存や生成物を含めると cross-file 参照が
     // 万件単位で偽陽性を生む (実測: Laravel/DDD 系で `new` 3,148 件のうち
     // 大半が vendor)。`ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` で再取込可能。
     let excluded_dirs: Vec<&str> = if impact_include_vendor() {
         Vec::new()
     } else {
-        IMPACT_VENDOR_EXCLUDES.to_vec()
+        IMPACT_DEFAULT_EXCLUDED_DIRS.to_vec()
     };
     let files = match refs::collect_files_with_excludes(dir, None, &excluded_dirs, &[]) {
         Ok(f) => f,
