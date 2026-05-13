@@ -104,6 +104,8 @@ const KNOWN_SUBCMDS: &[&str] = &[
     "refs",
     "context",
     "impact",
+    "review",
+    "dead-code",
     "imports",
     "lint",
     "sequence",
@@ -1305,5 +1307,51 @@ fn main() {
         print_json(&stats, &label);
     } else {
         print_summary(&stats, &label);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_astro_subcmd_basic_subcommands() {
+        assert_eq!(
+            extract_astro_subcmd("astro-sight symbols --dir src"),
+            Some("symbols")
+        );
+        assert_eq!(
+            extract_astro_subcmd("astro-sight refs --name foo"),
+            Some("refs")
+        );
+        assert_eq!(extract_astro_subcmd("astro-sight context"), Some("context"));
+    }
+
+    /// 直近の追加サブコマンドが unknown 扱いされないことの回帰テスト。
+    /// KNOWN_SUBCMDS から `review` / `dead-code` が抜けていた時期に
+    /// 多数の呼び出しが unknown に分類された経緯がある。
+    #[test]
+    fn extract_astro_subcmd_recent_subcommands() {
+        assert_eq!(
+            extract_astro_subcmd("astro-sight review --dir . --git"),
+            Some("review")
+        );
+        assert_eq!(
+            extract_astro_subcmd("astro-sight dead-code --dir ."),
+            Some("dead-code")
+        );
+    }
+
+    #[test]
+    fn extract_astro_subcmd_skips_global_flags() {
+        assert_eq!(
+            extract_astro_subcmd("astro-sight --pretty symbols --dir src"),
+            Some("symbols")
+        );
+    }
+
+    #[test]
+    fn extract_astro_subcmd_unknown_returns_none() {
+        assert_eq!(extract_astro_subcmd("astro-sight wat"), None);
     }
 }

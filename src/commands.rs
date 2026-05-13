@@ -1029,7 +1029,7 @@ pub fn cmd_review(
     log_phase("cochange", "start", 0);
     let phase_t = std::time::Instant::now();
     let missing_cochanges =
-        detect_missing_cochanges(service, dir, &changed_file_set, min_confidence, Some(base));
+        detect_missing_cochanges(service, dir, &changed_file_set, min_confidence, Some(base))?;
     log_phase("cochange", "end", phase_t.elapsed().as_millis());
 
     // 5. API surface diff
@@ -1447,13 +1447,13 @@ fn detect_missing_cochanges(
     changed_files: &HashSet<String>,
     min_confidence: f64,
     base: Option<&str>,
-) -> Vec<MissingCochange> {
+) -> Result<Vec<MissingCochange>> {
     // review では blame モードで cochange を解析する。
     // 起点ファイル = 差分に登場したファイル。
     // ただし起点が無い (差分が空) ときは何もせず空を返す。
     let source_files: Vec<String> = changed_files.iter().cloned().collect();
     if source_files.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     // review の差分取得で使った base を blame 解析にも渡し、複数コミット範囲の
     // review でも同じ変更範囲を対象にする。base 解決失敗や git 不在は engine 側で
@@ -1466,7 +1466,17 @@ fn detect_missing_cochanges(
     };
     let cochange_result = match service.analyze_cochange(dir, &opts) {
         Ok(r) => r,
-        Err(_) => return Vec::new(),
+        Err(err) => {
+            // 入力検証エラー (min_confidence の NaN / 範囲外等) はユーザーへ伝播する。
+            // git 不在 / base 解決失敗は engine 側で empty 結果を返すため、ここまで
+            // Err が来ない。InvalidRequest だけ早期失敗させて silent な誤動作を防ぐ。
+            if let Some(astro_err) = err.downcast_ref::<crate::error::AstroError>()
+                && astro_err.code == crate::error::ErrorCode::InvalidRequest
+            {
+                return Err(err);
+            }
+            return Ok(Vec::new());
+        }
     };
 
     // 各 missing file につき最も confidence が高いペアのみ残す
@@ -1516,7 +1526,7 @@ fn detect_missing_cochanges(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     missing.truncate(10);
-    missing
+    Ok(missing)
 }
 
 /// 内部用: reconcile のために signature を保持する一時構造。
@@ -1574,6 +1584,15 @@ fn detect_api_changes(
 
     let canonical_dir = std::fs::canonicalize(dir).ok();
     for df in diff_files {
+        // 信頼境界外の diff パスを `dir.join()` で読まないよう、絶対パス・トラバーサル
+        // を含むパスはここで弾く。下流の `extract_exported_symbols_from_file` でも
+        // 多層防御として再チェックしている。
+        if df.new_path != "/dev/null" && !crate::engine::impact::is_safe_diff_path(&df.new_path) {
+            continue;
+        }
+        if df.old_path != "/dev/null" && !crate::engine::impact::is_safe_diff_path(&df.old_path) {
+            continue;
+        }
         // 新旧いずれかが生成物扱いなら API 変更検出の対象外
         if gitattrs.is_generated(&df.new_path) || gitattrs.is_generated(&df.old_path) {
             continue;
@@ -2226,6 +2245,11 @@ fn extract_exported_symbols_from_file_inner(
     exclude_trait_impls: bool,
     exclude_framework_entrypoints: bool,
 ) -> Option<Vec<(String, String, String)>> {
+    // diff から得た file_path は信頼境界外。`../etc/passwd` 等のトラバーサルや絶対パスを
+    // 拒否し、workspace 外のファイルを誤って読まないようにする。
+    if !crate::engine::impact::is_safe_diff_path(file_path) {
+        return None;
+    }
     let full_path = std::path::Path::new(dir).join(file_path);
     let utf8_path = camino::Utf8Path::new(full_path.to_str()?);
     let source = parser::read_file(utf8_path).ok()?;
@@ -3027,6 +3051,9 @@ pub(crate) fn filter_diff_files_for_dead_code(
     let mut files: Vec<std::path::PathBuf> = diff_files
         .iter()
         .filter(|f| f.new_path != "/dev/null")
+        // diff の new_path は信頼境界外。絶対パスやトラバーサル成分を含むパスは
+        // canonical_dir.join() で workspace 外を指してしまうため、ここで弾く。
+        .filter(|f| crate::engine::impact::is_safe_diff_path(&f.new_path))
         .map(|f| canonical_dir.join(&f.new_path))
         .filter(|p| {
             crate::language::LangId::from_path(camino::Utf8Path::new(p.to_str().unwrap_or("")))
@@ -3052,11 +3079,11 @@ pub(crate) fn filter_diff_files_for_dead_code(
         }
         let overrides = ob.build()?;
         files.retain(|p| !overrides.matched(p, false).is_ignore());
+        // glob が指定されているときは「whitelist に明示マッチ」だけを残す。
+        // `Match::None` (どのパターンにもマッチしない) を許可すると、
+        // `--glob '**/*.py'` のような絞り込みでも Rust ファイル等が残ってしまう。
         if glob.is_some() {
-            files.retain(|p| {
-                let m = overrides.matched(p, false);
-                m.is_whitelist() || m.is_none()
-            });
+            files.retain(|p| overrides.matched(p, false).is_whitelist());
         }
     }
     Ok(files)
@@ -6957,7 +6984,8 @@ def new_public_api():
             &changed_files,
             0.3,
             None,
-        );
+        )
+        .expect("detect_missing_cochanges should succeed");
 
         assert!(
             missing.iter().all(|m| m.file != "Cargo.toml"),
@@ -7044,12 +7072,43 @@ def new_public_api():
             &changed_files,
             0.0,
             Some("HEAD~2"),
-        );
+        )
+        .expect("detect_missing_cochanges should succeed");
 
         assert!(
             missing.iter().any(|m| m.file == "b.rs"),
             "review の base が blame 解析に渡らず HEAD~1 のみを見ると b.rs を見落とす。got: {missing:?}"
         );
+    }
+
+    /// review の detect_missing_cochanges が cochange 入力検証エラーを silent に握り潰さず
+    /// 呼び出し側へ伝播することを確認する回帰テスト。
+    #[test]
+    fn detect_missing_cochanges_propagates_invalid_request_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(repo, &[("a.rs", "v1")], "initial");
+
+        let service = AppService::new();
+        let mut changed_files = HashSet::new();
+        changed_files.insert("a.rs".to_string());
+
+        // NaN は AppService::analyze_cochange の入力検証で InvalidRequest を返すため、
+        // detect_missing_cochanges もそのエラーを伝播するはず。
+        let result = detect_missing_cochanges(
+            &service,
+            repo.to_str().expect("utf-8 path"),
+            &changed_files,
+            f64::NAN,
+            None,
+        );
+
+        let err = result.expect_err("NaN min_confidence should surface as error");
+        let astro_err = err
+            .downcast_ref::<crate::error::AstroError>()
+            .expect("expect AstroError");
+        assert_eq!(astro_err.code, crate::error::ErrorCode::InvalidRequest);
     }
 
     #[test]
@@ -7154,5 +7213,67 @@ def new_public_api():
             !result.iter().any(|p| p == "generated/codegen.rs"),
             "ユーザー指定 --exclude-glob は --git 経由の起点に適用される。got: {result:?}"
         );
+    }
+
+    /// dead-code --glob が positive whitelist として絞り込みに使われていることを確認する。
+    /// 以前は Match::None も許可されており、`**/*.py` 指定でも Rust ファイル等が残っていた。
+    #[test]
+    fn filter_diff_files_for_dead_code_glob_acts_as_whitelist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        // glob による絞り込みの単体検証なので、実ファイルは作らず diff 模擬のみ。
+        let diff_files = vec![
+            crate::models::impact::DiffFile {
+                old_path: "/dev/null".to_string(),
+                new_path: "src/foo.rs".to_string(),
+                hunks: Vec::new(),
+                deleted_old_source: None,
+            },
+            crate::models::impact::DiffFile {
+                old_path: "/dev/null".to_string(),
+                new_path: "src/bar.py".to_string(),
+                hunks: Vec::new(),
+                deleted_old_source: None,
+            },
+        ];
+
+        let files = filter_diff_files_for_dead_code(repo, &diff_files, &[], &[], Some("**/*.py"))
+            .expect("filter");
+
+        // glob 絞り込み後は Python ファイルだけが残るべき。
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "bar.py"),
+            "py ファイルは glob に一致するため残る。got: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "foo.rs"),
+            "rs ファイルは glob にマッチしないため除外される。got: {names:?}"
+        );
+    }
+
+    /// detect_api_changes は diff path のトラバーサルを安全に無視する。
+    /// `../etc/passwd` のような diff を渡しても workspace 外を読まない。
+    #[test]
+    fn detect_api_changes_skips_unsafe_diff_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let dir_str = repo.to_str().expect("utf-8 path");
+
+        let unsafe_diff = vec![crate::models::impact::DiffFile {
+            old_path: "/dev/null".to_string(),
+            new_path: "../etc/passwd".to_string(),
+            hunks: Vec::new(),
+            deleted_old_source: None,
+        }];
+
+        // パス検証で弾かれ、added/removed/modified ともに空配列を返すこと。
+        let result = detect_api_changes(dir_str, "HEAD", &unsafe_diff);
+        assert!(result.added.is_empty());
+        assert!(result.removed.is_empty());
+        assert!(result.modified.is_empty());
     }
 }

@@ -146,12 +146,38 @@ pub fn read_file(path: &Utf8Path) -> Result<SourceBuf> {
     // memmap2 の既知の制限事項であり、CLI ツールとしては許容範囲。
     if metadata.len() > 65536 {
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        // metadata 取得後にファイルが拡大した場合の TOCTOU 防止として、mmap 後の
+        // 実サイズも上限と照合する。
+        if mmap.len() as u64 > MAX_FILE_SIZE {
+            anyhow::bail!(AstroError::new(
+                crate::error::ErrorCode::InvalidRequest,
+                format!(
+                    "File too large after mmap ({} bytes > {} bytes): {}",
+                    mmap.len(),
+                    MAX_FILE_SIZE,
+                    path
+                ),
+            ));
+        }
         Ok(SourceBuf::Mmap(mmap))
     } else {
         use std::io::Read;
         let mut buf = Vec::with_capacity(metadata.len() as usize);
-        let mut reader = std::io::BufReader::new(file);
+        // metadata 取得後にファイルが拡大しても物理的に上限を超えないよう、
+        // read_to_end の前に take() で上限+1 まで読み込みを制限する。
+        let mut reader = std::io::BufReader::new(file).take(MAX_FILE_SIZE + 1);
         reader.read_to_end(&mut buf)?;
+        if buf.len() as u64 > MAX_FILE_SIZE {
+            anyhow::bail!(AstroError::new(
+                crate::error::ErrorCode::InvalidRequest,
+                format!(
+                    "File too large during read ({}+ bytes > {} bytes): {}",
+                    buf.len(),
+                    MAX_FILE_SIZE,
+                    path
+                ),
+            ));
+        }
         Ok(SourceBuf::Vec(buf))
     }
 }

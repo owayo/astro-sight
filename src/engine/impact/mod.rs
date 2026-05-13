@@ -752,7 +752,7 @@ fn extract_type_name(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
 }
 
 /// diff パスが安全か検証する（絶対パスやトラバーサルコンポーネントを拒否）。
-fn is_safe_diff_path(path: &str) -> bool {
+pub(crate) fn is_safe_diff_path(path: &str) -> bool {
     if path.starts_with('/') || path.starts_with('\\') {
         return false;
     }
