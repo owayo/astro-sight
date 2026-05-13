@@ -81,9 +81,27 @@ fn ci_key(lang: LangId, name: &str) -> String {
 /// `Vec<FileImpact>` を全件 memory に貯めないため、呼び出し側（CLI）で JSON を 1 件ずつ
 /// stdout に flush すれば、最終 `ContextResult.changes` の成長に伴う数 GB 級のピーク RSS を
 /// 排除できる。通常の `analyze_impact` はこの API の薄い wrapper。
-pub fn analyze_impact_streaming<F>(
+pub fn analyze_impact_streaming<F>(diff_input: &str, dir: &Path, on_file_impact: F) -> Result<()>
+where
+    F: FnMut(FileImpact) -> Result<()>,
+{
+    analyze_impact_streaming_with_options(
+        diff_input,
+        dir,
+        &crate::models::impact::ContextAnalysisOptions::default(),
+        on_file_impact,
+    )
+}
+
+/// `analyze_impact_streaming` のオプション付き版。
+///
+/// `options.exclude_dirs` / `options.exclude_globs` は Pass2 cross-file 検索
+/// から追加で除外したい対象を指定する (固定の `IMPACT_DEFAULT_EXCLUDED_DIRS`
+/// にマージして適用される)。
+pub fn analyze_impact_streaming_with_options<F>(
     diff_input: &str,
     dir: &Path,
+    options: &crate::models::impact::ContextAnalysisOptions,
     mut on_file_impact: F,
 ) -> Result<()>
 where
@@ -143,6 +161,7 @@ where
             &sym_ix,
             &method_parent_types,
             dir,
+            options,
         );
     log_phase("context.pass2", "end", t.elapsed().as_millis());
 

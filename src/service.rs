@@ -467,8 +467,26 @@ impl AppService {
 
     /// unified diff がコードベースへ与える影響を解析する。
     pub fn analyze_context(&self, diff: &str, dir: &str) -> Result<ContextResult> {
+        self.analyze_context_with_options(
+            diff,
+            dir,
+            &crate::models::impact::ContextAnalysisOptions::default(),
+        )
+    }
+
+    /// `analyze_context` のオプション付き版。
+    ///
+    /// `options.exclude_dirs` / `options.exclude_globs` は Pass2 cross-file 検索
+    /// から追加で除外したい対象を指定する (固定の `IMPACT_DEFAULT_EXCLUDED_DIRS`
+    /// にマージして適用)。
+    pub fn analyze_context_with_options(
+        &self,
+        diff: &str,
+        dir: &str,
+        options: &crate::models::impact::ContextAnalysisOptions,
+    ) -> Result<ContextResult> {
         let mut changes = Vec::new();
-        self.analyze_context_streaming(diff, dir, |impact| {
+        self.analyze_context_streaming_with_options(diff, dir, options, |impact| {
             changes.push(impact);
             Ok(())
         })?;
@@ -480,8 +498,26 @@ impl AppService {
     /// streaming CLI は stdout へ JSON prefix を書き始める前にこれを呼び、
     /// 入力エラー時にも壊れていない JSON エラーを返せるようにする。
     pub fn validate_context_inputs(&self, diff: &str, dir: &str) -> Result<()> {
+        self.validate_context_inputs_with_options(
+            diff,
+            dir,
+            &crate::models::impact::ContextAnalysisOptions::default(),
+        )
+    }
+
+    /// `validate_context_inputs` のオプション付き版。
+    ///
+    /// `options.exclude_globs` の構文も先行検証して、streaming JSON の prefix を
+    /// 出した後に silent empty 結果を返すのを防ぐ。
+    pub fn validate_context_inputs_with_options(
+        &self,
+        diff: &str,
+        dir: &str,
+        options: &crate::models::impact::ContextAnalysisOptions,
+    ) -> Result<()> {
         self.validate_dir(dir)?;
-        self.validate_input_size(diff)
+        self.validate_input_size(diff)?;
+        validate_exclude_globs(&options.exclude_globs)
     }
 
     /// unified diff の影響を `FileImpact` 1 件ずつ callback に渡す streaming API。
@@ -492,6 +528,25 @@ impl AppService {
         &self,
         diff: &str,
         dir: &str,
+        on_file_impact: F,
+    ) -> Result<()>
+    where
+        F: FnMut(crate::models::impact::FileImpact) -> Result<()>,
+    {
+        self.analyze_context_streaming_with_options(
+            diff,
+            dir,
+            &crate::models::impact::ContextAnalysisOptions::default(),
+            on_file_impact,
+        )
+    }
+
+    /// `analyze_context_streaming` のオプション付き版。
+    pub fn analyze_context_streaming_with_options<F>(
+        &self,
+        diff: &str,
+        dir: &str,
+        options: &crate::models::impact::ContextAnalysisOptions,
         mut on_file_impact: F,
     ) -> Result<()>
     where
@@ -500,27 +555,36 @@ impl AppService {
         debug!(
             dir = dir,
             diff_bytes = diff.len(),
-            "analyze_context_streaming called"
+            extra_exclude_dirs = options.exclude_dirs.len(),
+            extra_exclude_globs = options.exclude_globs.len(),
+            "analyze_context_streaming_with_options called"
         );
         let canonical_dir = self.validate_dir(dir)?;
         self.validate_input_size(diff)?;
+        validate_exclude_globs(&options.exclude_globs)?;
 
         let mut changes_count = 0usize;
         let mut callers_count = 0usize;
         let mut affected_count = 0usize;
 
-        impact::analyze_impact_streaming(diff, &canonical_dir, |mut impact| {
-            // impacted_callers 内の絶対パスを相対パスへ変換する。
-            for caller in &mut impact.impacted_callers {
-                if let Ok(rel) = std::path::Path::new(&caller.path).strip_prefix(&canonical_dir) {
-                    caller.path = rel.to_string_lossy().to_string();
+        impact::analyze_impact_streaming_with_options(
+            diff,
+            &canonical_dir,
+            options,
+            |mut impact| {
+                // impacted_callers 内の絶対パスを相対パスへ変換する。
+                for caller in &mut impact.impacted_callers {
+                    if let Ok(rel) = std::path::Path::new(&caller.path).strip_prefix(&canonical_dir)
+                    {
+                        caller.path = rel.to_string_lossy().to_string();
+                    }
                 }
-            }
-            changes_count += 1;
-            affected_count += impact.affected_symbols.len();
-            callers_count += impact.impacted_callers.len();
-            on_file_impact(impact)
-        })?;
+                changes_count += 1;
+                affected_count += impact.affected_symbols.len();
+                callers_count += impact.impacted_callers.len();
+                on_file_impact(impact)
+            },
+        )?;
 
         debug!(
             dir = dir,
@@ -589,6 +653,41 @@ impl AppService {
         );
         Ok(result)
     }
+}
+
+// ---------------------------------------------------------------------------
+// 入力検証ヘルパー
+// ---------------------------------------------------------------------------
+
+/// `--exclude-glob` の構文を `ignore::overrides::OverrideBuilder` で先行検証する。
+///
+/// 不正なパターンや空文字を analyze_context 開始前にエラー化することで、streaming
+/// CLI が JSON prefix を出した後に silent empty 結果を返すのを防ぐ。
+fn validate_exclude_globs(globs: &[String]) -> Result<()> {
+    if globs.is_empty() {
+        return Ok(());
+    }
+    let mut ob = ignore::overrides::OverrideBuilder::new(".");
+    for g in globs {
+        if g.is_empty() {
+            bail!(AstroError::new(
+                ErrorCode::InvalidRequest,
+                "exclude-glob must not be empty".to_string(),
+            ));
+        }
+        let negated = if g.starts_with('!') {
+            g.clone()
+        } else {
+            format!("!{g}")
+        };
+        ob.add(&negated).map_err(|e| {
+            anyhow::anyhow!(AstroError::new(
+                ErrorCode::InvalidRequest,
+                format!("invalid exclude-glob '{g}': {e}"),
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

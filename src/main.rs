@@ -417,6 +417,8 @@ fn run(cli: Cli) -> Result<()> {
             git,
             base,
             staged,
+            exclude_dirs,
+            exclude_globs,
         } => cmd_context(
             &service,
             &dir,
@@ -426,6 +428,8 @@ fn run(cli: Cli) -> Result<()> {
             &base,
             staged,
             pretty,
+            &exclude_dirs,
+            &exclude_globs,
         ),
         Commands::Impact {
             dir,
@@ -433,7 +437,18 @@ fn run(cli: Cli) -> Result<()> {
             base,
             staged,
             hook,
-        } => cmd_impact(&service, &dir, git, &base, staged, hook),
+            exclude_dirs,
+            exclude_globs,
+        } => cmd_impact(
+            &service,
+            &dir,
+            git,
+            &base,
+            staged,
+            hook,
+            &exclude_dirs,
+            &exclude_globs,
+        ),
         Commands::DeadCode {
             dir,
             glob,

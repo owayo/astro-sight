@@ -174,6 +174,18 @@ pub enum Commands {
         /// Use staged changes (git diff --cached)
         #[arg(long)]
         staged: bool,
+
+        /// impact cross-file 解析から追加で除外するディレクトリ名 (完全一致、複数指定可)。
+        /// 固定の vendor/build artifact 除外リストにマージされる。
+        /// 例: --exclude-dir pjproject-2.15 --exclude-dir openssl_64_1.1.1c
+        #[arg(long = "exclude-dir", value_name = "NAME", num_args = 0..)]
+        exclude_dirs: Vec<String>,
+
+        /// impact cross-file 解析から追加で除外する glob パターン (ワークスペース相対、複数指定可)。
+        /// 先頭の `!` は不要 (内部で negative pattern として扱う)。
+        /// 例: --exclude-glob '**/openssl_*1.1.1*/**'
+        #[arg(long = "exclude-glob", value_name = "PATTERN", num_args = 0..)]
+        exclude_globs: Vec<String>,
     },
 
     /// Detect unresolved change impacts (for stop hooks)
@@ -197,6 +209,15 @@ pub enum Commands {
         /// Append triage hint for AI agent hooks
         #[arg(long)]
         hook: bool,
+
+        /// impact cross-file 解析から追加で除外するディレクトリ名 (完全一致、複数指定可)。
+        /// 固定の vendor/build artifact 除外リストにマージされる。
+        #[arg(long = "exclude-dir", value_name = "NAME", num_args = 0..)]
+        exclude_dirs: Vec<String>,
+
+        /// impact cross-file 解析から追加で除外する glob パターン (ワークスペース相対、複数指定可)。
+        #[arg(long = "exclude-glob", value_name = "PATTERN", num_args = 0..)]
+        exclude_globs: Vec<String>,
     },
 
     /// Extract import/export dependencies from a source file
@@ -421,13 +442,15 @@ pub enum Commands {
         #[arg(long)]
         framework: Option<String>,
 
-        /// dead_symbols 検出時に追加で除外するディレクトリ名 (完全一致、複数指定可)。
+        /// 追加で除外するディレクトリ名 (完全一致、複数指定可)。
+        /// review では impact cross-file 解析と dead_symbols 検出の両方に作用する。
         /// 例: --exclude-dir generated --exclude-dir .cache
         #[arg(long = "exclude-dir", value_name = "NAME", num_args = 0..)]
         exclude_dirs: Vec<String>,
 
-        /// dead_symbols 検出時に追加で除外する glob パターン (ワークスペース相対、複数指定可)。
+        /// 追加で除外する glob パターン (ワークスペース相対、複数指定可)。
         /// 先頭の `!` は不要 (内部で negative pattern として扱う)。
+        /// review では impact cross-file 解析と dead_symbols 検出の両方に作用する。
         /// 例: --exclude-glob 'app/Legacy/**' --exclude-glob 'config/*.php'
         #[arg(long = "exclude-glob", value_name = "PATTERN", num_args = 0..)]
         exclude_globs: Vec<String>,

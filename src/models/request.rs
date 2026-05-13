@@ -56,6 +56,12 @@ pub struct AstgenRequest {
     /// Base revision for blame-based co-change analysis (defaults to HEAD~1)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+    /// 追加で除外するディレクトリ名 (context コマンドの impact cross-file 解析で適用)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_dirs: Vec<String>,
+    /// 追加で除外する glob パターン (context コマンドの impact cross-file 解析で適用)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_globs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -199,6 +199,8 @@ Exit codes: `0` = no unresolved impacts (silent), `1` = unresolved impacts found
 
 `context` / `impact` / `review` skip cross-file reference search inside vendor / package-manager trees (`vendor/`, `node_modules/`, `.venv/`, `Pods/`, `Carthage/` ...) and build artifacts (`target/`, `build/`, `dist/`, `.build/`, `DerivedData/`, `.next/`, `bin/`, `obj/` ...) by default. This stops generic method names (`new`, `save`, `find`) inside 3rd-party or generated code from flooding `impacted_callers`. Set `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` to opt back in. `.gitignore` / hidden file exclusions are independent and always on.
 
+For repository-specific vendored trees that are not in the default list (e.g. `pjproject-2.15/`, `openssl_64_1.1.1c/`, `third_party/`), pass `--exclude-dir <NAME>` or `--exclude-glob <PATTERN>` (workspace-relative, negative-override semantics). Available on `context`, `impact`, and `review`; for `review` the same flags apply to both impact analysis and `dead_symbols`. Invalid glob syntax fails up-front with `INVALID_REQUEST`.
+
 ### `review` — Structured Diff Review (One-Shot)
 
 Integrates `context` (impact analysis), `cochange` (missing co-change detection), API surface diff (added/removed/modified public symbols), and dead symbol detection into a single command. Ideal for PR review or pre-merge checks.

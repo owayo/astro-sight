@@ -3459,6 +3459,181 @@ function consume_vendor(): void {
     );
 }
 
+/// `--exclude-dir` が impact 解析の cross-file 検索でも作用する回帰テスト (v26.5.117)。
+///
+/// `IMPACT_DEFAULT_EXCLUDED_DIRS` の固定リストに含まれない命名 (バージョン入りの
+/// `pjproject-2.15` 等) でも、ユーザーが `--exclude-dir` で渡せば impact から除外される。
+#[test]
+fn impact_user_exclude_dir_drops_callers() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let owner_php = dir.path().join("Owner.php");
+    let custom_dir = dir.path().join("pjproject-2.15");
+    std::fs::create_dir_all(&custom_dir).unwrap();
+    let custom_caller = custom_dir.join("Caller.php");
+
+    std::fs::write(
+        &owner_php,
+        r#"<?php
+trait Factory {
+    public static function new(int $x): self {
+        return new self($x);
+    }
+}
+"#,
+    )
+    .unwrap();
+    // 命名が IMPACT_DEFAULT_EXCLUDED_DIRS に含まれないので、デフォルトでは impact 対象。
+    std::fs::write(
+        &custom_caller,
+        r#"<?php
+class CustomThing {
+    public static function new(): self {
+        return new self();
+    }
+}
+function consume_custom(): void {
+    $obj = CustomThing::new();
+}
+"#,
+    )
+    .unwrap();
+
+    let diff = r#"--- a/Owner.php
++++ b/Owner.php
+@@ -1,5 +1,5 @@
+ <?php
+ trait Factory {
+-    public static function new(int $x): self {
++    public static function new(int $x, int $y): self {
+         return new self($x);
+     }
+ }
+"#;
+
+    // ユーザーが --exclude-dir pjproject-2.15 を渡せば、impact からも除外される。
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args([
+            "context",
+            "--dir",
+            dir.path().to_str().unwrap(),
+            "--exclude-dir",
+            "pjproject-2.15",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn context");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "context failed: {stdout}");
+
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("context stdout must be JSON");
+    let changes = json
+        .get("changes")
+        .and_then(|c| c.as_array())
+        .expect("changes array");
+    let owner_change = changes
+        .iter()
+        .find(|c| c.get("path").and_then(|p| p.as_str()) == Some("Owner.php"))
+        .unwrap_or_else(|| panic!("Owner.php change not found: {stdout}"));
+
+    let impacted = owner_change
+        .get("impacted_callers")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let low = owner_change
+        .get("low_confidence_callers")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let custom_in_impacted = impacted.iter().any(|c| {
+        c.get("path")
+            .and_then(|p| p.as_str())
+            .map(|p| p.contains("pjproject-2.15"))
+            .unwrap_or(false)
+    });
+    let custom_in_low = low.iter().any(|c| {
+        c.get("path")
+            .and_then(|p| p.as_str())
+            .map(|p| p.contains("pjproject-2.15"))
+            .unwrap_or(false)
+    });
+    assert!(
+        !custom_in_impacted,
+        "pjproject-2.15/ caller must NOT appear in impacted_callers when --exclude-dir is set. impacted: {impacted:?}"
+    );
+    assert!(
+        !custom_in_low,
+        "pjproject-2.15/ caller must NOT appear in low_confidence_callers either. low: {low:?}"
+    );
+}
+
+/// 不正な `--exclude-glob` (構文エラー) がエラーで終了することを確認する。
+///
+/// silent empty 結果 (= 全 impact が消える) の方がユーザーにとって危険なので、
+/// `validate_exclude_globs` で先行検証して `INVALID_REQUEST` で落とす。
+#[test]
+fn impact_invalid_exclude_glob_returns_error() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("foo.rs"), "fn x() {}\n").unwrap();
+    let diff = r#"--- a/foo.rs
++++ b/foo.rs
+@@ -1,1 +1,1 @@
+-fn x() {}
++fn x(y: i32) {}
+"#;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args([
+            "context",
+            "--dir",
+            dir.path().to_str().unwrap(),
+            "--exclude-glob",
+            "[",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn context");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .expect("write stdin");
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "invalid --exclude-glob should fail. stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("INVALID_REQUEST") || stdout.contains("invalid exclude-glob"),
+        "expected JSON error mentioning invalid exclude-glob. got: {stdout}"
+    );
+}
+
 // ===========================================================================
 // 境界値・異常系・エッジケーステスト
 // ===========================================================================

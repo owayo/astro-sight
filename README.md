@@ -316,6 +316,28 @@ ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1 astro-sight impact --dir . --git
 
 `.gitignore` / hidden file / generated file の除外（`refs::collect_files` 経由）は別系統で常に有効。
 
+#### ユーザー指定の追加除外（v26.5.117+）
+
+固定リストに含まれない命名のディレクトリ (`pjproject-2.15`, `openssl_64_1.1.1c`, `third_party` など) や、より細かい glob パターンで impact 解析対象を絞りたい場合は `--exclude-dir` / `--exclude-glob` を使う。`context` / `impact` / `review` で同じオプションが利用でき、固定リストに**追加**される (デフォルト除外を上書きするものではない)。
+
+```bash
+# vendored C library を除外
+astro-sight impact --dir . --git \
+  --exclude-dir pjproject-2.15 \
+  --exclude-dir openssl_64_1.1.1c
+
+# glob で複数バージョンをまとめて
+astro-sight impact --dir . --git \
+  --exclude-glob '**/openssl_*1.1.1*/**'
+
+# review でも同じオプションが impact + dead_symbols 両方に作用
+astro-sight review --dir . --git \
+  --exclude-dir pjproject-2.15 \
+  --exclude-glob '**/openssl_*/**'
+```
+
+`--exclude-glob` は `ignore::overrides` の negative pattern として扱う (先頭の `!` は不要、ワークスペース相対)。不正な glob 構文は実行前に `INVALID_REQUEST` で弾く。
+
 ### review - 構造化 diff レビュー
 
 `context` の影響分析に加えて、`cochange` による変更漏れ候補、公開 API 差分、死蔵シンボルを 1 回の実行でまとめて返す。PR レビューや pre-merge チェック向け。

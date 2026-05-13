@@ -100,6 +100,7 @@ pub(super) fn stream_caller_maps_and_defs(
     sym_ix: &HashMap<String, usize>,
     method_parent_types: &HashMap<String, String>,
     dir: &Path,
+    options: &crate::models::impact::ContextAnalysisOptions,
 ) -> (
     Vec<TypedCallerMap>,
     Vec<TypedCallerMap>,
@@ -196,12 +197,21 @@ pub(super) fn stream_caller_maps_and_defs(
     // 同名メソッドが大量にある 3rd-party 依存や生成物を含めると cross-file 参照が
     // 万件単位で偽陽性を生む (実測: Laravel/DDD 系で `new` 3,148 件のうち
     // 大半が vendor)。`ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` で再取込可能。
-    let excluded_dirs: Vec<&str> = if impact_include_vendor() {
+    //
+    // ユーザー指定の `options.exclude_dirs` / `options.exclude_globs` は
+    // デフォルト除外に **追加** で適用される (`INCLUDE_VENDOR=1` 時はデフォルトだけ
+    // 解除され、ユーザー指定は引き続き効く)。
+    let mut excluded_dirs: Vec<&str> = if impact_include_vendor() {
         Vec::new()
     } else {
         IMPACT_DEFAULT_EXCLUDED_DIRS.to_vec()
     };
-    let files = match refs::collect_files_with_excludes(dir, None, &excluded_dirs, &[]) {
+    excluded_dirs.extend(options.exclude_dirs.iter().map(String::as_str));
+    excluded_dirs.sort_unstable();
+    excluded_dirs.dedup();
+    let excluded_globs: Vec<&str> = options.exclude_globs.iter().map(String::as_str).collect();
+    let files = match refs::collect_files_with_excludes(dir, None, &excluded_dirs, &excluded_globs)
+    {
         Ok(f) => f,
         Err(_) => return empty_result(),
     };

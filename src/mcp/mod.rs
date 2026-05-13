@@ -89,6 +89,12 @@ pub struct ContextAnalyzeParams {
     pub diff: String,
     /// Workspace directory
     pub dir: String,
+    /// 追加で除外するディレクトリ名 (固定の vendor/build artifact 除外にマージされる)
+    #[serde(default)]
+    pub exclude_dirs: Vec<String>,
+    /// 追加で除外する glob パターン (workspace 相対、negative override 扱い)
+    #[serde(default)]
+    pub exclude_globs: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -302,7 +308,14 @@ impl AstroSightServer {
         params: Parameters<ContextAnalyzeParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        Self::to_tool_result(self.service.analyze_context(&p.diff, &p.dir))
+        let options = crate::models::impact::ContextAnalysisOptions {
+            exclude_dirs: p.exclude_dirs,
+            exclude_globs: p.exclude_globs,
+        };
+        Self::to_tool_result(
+            self.service
+                .analyze_context_with_options(&p.diff, &p.dir, &options),
+        )
     }
 
     #[tool(

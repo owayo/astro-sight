@@ -687,6 +687,8 @@ pub fn cmd_context(
     base: &str,
     staged: bool,
     pretty: bool,
+    exclude_dirs: &[String],
+    exclude_globs: &[String],
 ) -> Result<()> {
     let diff_input = if let Some(d) = diff {
         d.to_string()
@@ -699,10 +701,15 @@ pub fn cmd_context(
         read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?
     };
 
+    let options = crate::models::impact::ContextAnalysisOptions {
+        exclude_dirs: exclude_dirs.to_vec(),
+        exclude_globs: exclude_globs.to_vec(),
+    };
+
     if pretty {
         // pretty 出力は人間向けで整形が必要なため、従来どおり全 FileImpact を集約してから
         // 一括 serialize する。数 GB 級リポでは compact 出力推奨。
-        let result = service.analyze_context(&diff_input, dir)?;
+        let result = service.analyze_context_with_options(&diff_input, dir, &options)?;
         let output = serialize_output(&result, pretty)?;
         info!(
             command = "context",
@@ -718,13 +725,13 @@ pub fn cmd_context(
     // compact 出力: streaming API で `FileImpact` を 1 件ずつ stdout に flush し、
     // `Vec<FileImpact>` の累積による数 GB 級ピーク RSS を排除する。
     use std::io::Write;
-    service.validate_context_inputs(&diff_input, dir)?;
+    service.validate_context_inputs_with_options(&diff_input, dir, &options)?;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     out.write_all(b"{\"changes\":[")?;
     let mut first = true;
     let mut changes_count = 0usize;
-    service.analyze_context_streaming(&diff_input, dir, |impact| {
+    service.analyze_context_streaming_with_options(&diff_input, dir, &options, |impact| {
         if !first {
             out.write_all(b",")
                 .map_err(|e| anyhow::anyhow!("stdout write failed: {e}"))?;
@@ -746,6 +753,7 @@ pub fn cmd_context(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_impact(
     service: &AppService,
     dir: &str,
@@ -753,6 +761,8 @@ pub fn cmd_impact(
     base: &str,
     staged: bool,
     hook: bool,
+    exclude_dirs: &[String],
+    exclude_globs: &[String],
 ) -> Result<()> {
     let diff_input = if git {
         run_git_diff(dir, base, staged)?
@@ -765,7 +775,11 @@ pub fn cmd_impact(
         return Ok(());
     }
 
-    let result = service.analyze_context(&diff_input, dir)?;
+    let options = crate::models::impact::ContextAnalysisOptions {
+        exclude_dirs: exclude_dirs.to_vec(),
+        exclude_globs: exclude_globs.to_vec(),
+    };
+    let result = service.analyze_context_with_options(&diff_input, dir, &options)?;
 
     // 変更されたファイルパスを事前に canonicalize してキャッシュ（O(M) syscall に削減）
     let changed_paths: std::collections::HashSet<&str> =
@@ -984,7 +998,13 @@ pub fn cmd_review(
     } else {
         log_phase("context", "start", 0);
         let phase_t = std::time::Instant::now();
-        let r = service.analyze_context(&diff_input, dir)?;
+        // review の `--exclude-dir` / `--exclude-glob` は impact 解析と dead_symbols の
+        // 両方に作用させる (v26.5.117 で挙動を統一)。
+        let context_options = crate::models::impact::ContextAnalysisOptions {
+            exclude_dirs: extra_exclude_dirs.to_vec(),
+            exclude_globs: extra_exclude_globs.to_vec(),
+        };
+        let r = service.analyze_context_with_options(&diff_input, dir, &context_options)?;
         log_phase("context", "end", phase_t.elapsed().as_millis());
         r
     };
@@ -3619,7 +3639,11 @@ pub fn handle_request(
         Command::Context => {
             let dir = req.dir.as_deref().unwrap_or(".");
             let diff_input = req.diff.as_deref().unwrap_or("");
-            let result = service.analyze_context(diff_input, dir)?;
+            let options = crate::models::impact::ContextAnalysisOptions {
+                exclude_dirs: req.exclude_dirs.clone(),
+                exclude_globs: req.exclude_globs.clone(),
+            };
+            let result = service.analyze_context_with_options(diff_input, dir, &options)?;
             Ok(serde_json::to_value(result)?)
         }
         Command::Imports => {

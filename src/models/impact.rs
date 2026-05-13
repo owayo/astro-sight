@@ -74,3 +74,23 @@ pub struct FileImpact {
 pub struct ContextResult {
     pub changes: Vec<FileImpact>,
 }
+
+/// `analyze_context` / `analyze_impact_streaming` のオプション。
+///
+/// 既存の固定除外 (`IMPACT_DEFAULT_EXCLUDED_DIRS`: vendor / node_modules /
+/// target / build 等) に **追加** で除外したいリポジトリ固有名 (例:
+/// `pjproject-2.15`, `openssl_64_1.1.1c`, `third_party`) や glob パターンを
+/// ユーザー指定で受け付ける。
+///
+/// `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` と併用した場合、デフォルト除外
+/// リストだけが解除され、ユーザー指定の `exclude_dirs` / `exclude_globs` は
+/// 引き続き適用される。
+#[derive(Debug, Clone, Default)]
+pub struct ContextAnalysisOptions {
+    /// パスセグメント完全一致で除外するディレクトリ名。
+    pub exclude_dirs: Vec<String>,
+
+    /// workspace-relative の glob パターン。`refs::collect_files_with_excludes`
+    /// で negative override として扱われる (先頭の `!` は不要)。
+    pub exclude_globs: Vec<String>,
+}
