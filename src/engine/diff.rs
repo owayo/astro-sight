@@ -1,4 +1,71 @@
+use std::collections::HashSet;
+
 use crate::models::impact::{DiffFile, HunkInfo};
+
+/// 単一ファイルの unified diff から、new 側で実際に追加された行 (`+` 行) の
+/// 0-indexed 行番号 set を抽出する。
+///
+/// `find_affected_symbols` は HunkInfo の `new_start..new_start+new_count` 全域
+/// (= context 行込み) で symbol range と overlap 判定するため、隣接 hunk の
+/// context 3 行に巻き込まれた未変更 symbol が affected に残る (Issue
+/// 2026-05-14-private-const-and-unchanged-export-noise)。
+/// 本関数で返す set を symbol range と照合することで、`+` 行が 1 つも range に
+/// 入らない symbol を context-only overlap として弾ける。
+///
+/// 注意:
+/// - pure-delete hunk (new_count==0) は `+` 行が無いため、本 set には反映されない。
+///   呼び出し側はそのケースを別判定 (change_type=removed) で処理すること。
+/// - file_path は `+++ b/<path>` の `<path>` と完全一致で照合する。
+pub fn extract_changed_new_lines(input: &str, file_path: &str) -> HashSet<usize> {
+    let mut result: HashSet<usize> = HashSet::new();
+    let mut in_target_file = false;
+    let mut in_hunk = false;
+    let mut current_new_line: usize = 0;
+
+    for line in input.lines() {
+        if line.starts_with("--- ") {
+            in_target_file = false;
+            in_hunk = false;
+        } else if let Some(path) = line.strip_prefix("+++ b/") {
+            in_target_file = path == file_path;
+            in_hunk = false;
+        } else if line.starts_with("+++ ") {
+            in_target_file = false;
+            in_hunk = false;
+        } else if line.starts_with("@@ ") {
+            if in_target_file && let Some(hunk) = parse_hunk_header(line) {
+                current_new_line = hunk.new_start;
+                in_hunk = true;
+            } else {
+                in_hunk = false;
+            }
+        } else if in_hunk && in_target_file {
+            match line.as_bytes().first() {
+                Some(b'+') => {
+                    if current_new_line > 0 {
+                        result.insert(current_new_line - 1);
+                    }
+                    current_new_line += 1;
+                }
+                Some(b'-') => {
+                    // 削除行は new 側に存在しないため new_line は進めない
+                }
+                Some(b' ') => {
+                    current_new_line += 1;
+                }
+                Some(b'\\') => {
+                    // `\ No newline at end of file` 等の metadata は無視
+                }
+                _ => {
+                    // 空行は context 扱い
+                    current_new_line += 1;
+                }
+            }
+        }
+    }
+
+    result
+}
 
 /// unified diff 文字列を `DiffFile` の配列に変換する。
 ///
@@ -236,5 +303,54 @@ index 1234567..0000000
         assert_eq!(files.len(), 1);
         let restored = files[0].deleted_old_source.as_ref().expect("captured");
         assert_eq!(std::str::from_utf8(restored).unwrap(), "only line\n");
+    }
+
+    /// `+` 行のみを new_line ベースで集計する。context 行と `-` 行は new_line を
+    /// 進めるが set には含めない。
+    #[test]
+    fn extract_changed_new_lines_records_added_lines_only() {
+        let diff = "--- a/foo.rs\n+++ b/foo.rs\n@@ -10,3 +10,4 @@\n existing\n+added_at_line_11\n existing2\n existing3\n";
+        let changed = extract_changed_new_lines(diff, "foo.rs");
+        // new_start=10, line 10 ' existing' (context), line 11 '+added' (changed),
+        // line 12 ' existing2' (context), line 13 ' existing3' (context)
+        // 0-indexed: 11 - 1 = 10
+        let mut sorted: Vec<_> = changed.into_iter().collect();
+        sorted.sort();
+        assert_eq!(sorted, vec![10]);
+    }
+
+    /// 削除行は new_line を進めず、`+` 直前の add 行だけ記録される。
+    #[test]
+    fn extract_changed_new_lines_handles_deletion_correctly() {
+        let diff =
+            "--- a/foo.rs\n+++ b/foo.rs\n@@ -1,3 +1,3 @@\n line_a\n-deleted\n+added\n line_c\n";
+        let changed = extract_changed_new_lines(diff, "foo.rs");
+        // new_start=1, line 1 ' line_a' (context), '-deleted' (skip new_line),
+        // line 2 '+added' (changed → 0-indexed 1), line 3 ' line_c' (context)
+        let mut sorted: Vec<_> = changed.into_iter().collect();
+        sorted.sort();
+        assert_eq!(sorted, vec![1]);
+    }
+
+    /// 対象ファイルでない `+` 行は無視する。
+    #[test]
+    fn extract_changed_new_lines_skips_other_files() {
+        let diff = "--- a/foo.rs\n+++ b/foo.rs\n@@ -1 +1,2 @@\n existing\n+foo_added\n--- a/bar.rs\n+++ b/bar.rs\n@@ -1 +1,2 @@\n existing\n+bar_added\n";
+        let changed = extract_changed_new_lines(diff, "foo.rs");
+        assert_eq!(changed.len(), 1, "foo.rs の add のみ");
+        assert!(changed.contains(&1)); // line 2 → 0-indexed 1
+        let bar_changed = extract_changed_new_lines(diff, "bar.rs");
+        assert_eq!(bar_changed.len(), 1);
+        assert!(bar_changed.contains(&1));
+    }
+
+    /// pure-add (new file) では全 `+` 行が記録される。
+    #[test]
+    fn extract_changed_new_lines_pure_add_collects_all_lines() {
+        let diff = "--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1,3 @@\n+line1\n+line2\n+line3\n";
+        let changed = extract_changed_new_lines(diff, "new.rs");
+        let mut sorted: Vec<_> = changed.into_iter().collect();
+        sorted.sort();
+        assert_eq!(sorted, vec![0, 1, 2]);
     }
 }

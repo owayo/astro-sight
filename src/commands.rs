@@ -2436,6 +2436,23 @@ fn filter_exported_symbols(
         {
             continue;
         }
+        // JS/TS のフレームワーク DSL コールバック (WXT defineContentScript /
+        // defineBackground、Vue defineComponent、Vite/Nuxt defineConfig 等) の
+        // 引数オブジェクトメソッド (`main()`, `setup()` 等) は、フレームワーク内部
+        // からビルド時連結で呼び出されるため識別子レベルの cross-file refs では
+        // caller を追跡できない (Issue 2026-05-14-wxt-defineContentScript-main)。
+        if exclude_framework_entrypoints
+            && matches!(
+                lang_id,
+                crate::language::LangId::Typescript
+                    | crate::language::LangId::Tsx
+                    | crate::language::LangId::Javascript
+            )
+            && matches!(sym.kind, SymbolKind::Method | SymbolKind::Function)
+            && crate::engine::symbols::is_js_ts_framework_dsl_callback(root, source, &sym.range)
+        {
+            continue;
+        }
         // unittest / pytest のテスト規約シンボル。Python 限定。
         // `class Foo(unittest.TestCase):` 派生クラスとそのメソッド (`test_*`,
         // `setUp` 等)、`test_*.py` / `*_test.py` のトップレベル `test_*` 関数、

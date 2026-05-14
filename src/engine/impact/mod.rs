@@ -285,7 +285,11 @@ fn collect_affected_symbols(
         );
 
         let t = std::time::Instant::now();
-        let affected_raw = find_affected_symbols(&syms, &df.hunks);
+        // diff の `+` 行 (実変更行) を抽出して hunk context-only overlap を除外する。
+        // 隣接 hunk の context 3 行に巻き込まれた本体未変更 export
+        // (Issue 2026-05-14-private-const-and-unchanged-export-noise) を排除する。
+        let changed_new_lines = diff::extract_changed_new_lines(diff_input, &df.new_path);
+        let affected_raw = find_affected_symbols(&syms, &df.hunks, Some(&changed_new_lines));
         log_phase(
             &format!("context.pass1.find_affected n={}", affected_raw.len()),
             "end",
@@ -484,9 +488,15 @@ fn should_include_for_cross_file(
 }
 
 /// hunk をシンボル範囲と照合して affected シンボルを検出する。
+///
+/// `changed_new_lines` が `Some` のときは、`+` 行が 1 つも symbol range に入らない
+/// (= context 行だけで overlap した) symbol を除外する。pure-delete hunk
+/// (new_count==0) は `+` 行が無いため、この追加フィルタを適用せず従来通り
+/// change_type=removed として残す。
 fn find_affected_symbols(
     syms: &[crate::models::symbol::Symbol],
     hunks: &[HunkInfo],
+    changed_new_lines: Option<&std::collections::HashSet<usize>>,
 ) -> Vec<AffectedSymbol> {
     let mut affected = Vec::new();
 
@@ -504,6 +514,17 @@ fn find_affected_symbols(
                 hunk_start < sym_end && hunk_end > sym_start
             };
             if overlaps {
+                // context-only overlap の除外: changed_new_lines が Some かつ
+                // pure-delete でない hunk について、symbol range 内に `+` 行が
+                // 存在しなければ context だけの overlap と判断して skip する。
+                // pure-delete (new_count==0) は `+` 行が存在しないため、この
+                // フィルタを適用すると change_type=removed が出なくなる。
+                if let Some(cl) = changed_new_lines
+                    && hunk.new_count > 0
+                    && !(sym_start..sym_end).any(|l| cl.contains(&l))
+                {
+                    continue;
+                }
                 // change_type 判定:
                 // - hunk old_count==0: シンボル全体を hunk が覆う場合のみ "added"
                 //   (新規シンボル定義) と判定。hunk が部分的にしか覆わない場合は
@@ -944,7 +965,7 @@ mod tests {
             new_start: 5,
             new_count: 0,
         };
-        let result = find_affected_symbols(&[sym], &[hunk]);
+        let result = find_affected_symbols(&[sym], &[hunk], None);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "foo");
         assert_eq!(result[0].change_type, "removed");
@@ -960,7 +981,7 @@ mod tests {
             new_start: 6,
             new_count: 0,
         };
-        let result = find_affected_symbols(&[sym], &[hunk]);
+        let result = find_affected_symbols(&[sym], &[hunk], None);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "bar");
     }
@@ -975,7 +996,7 @@ mod tests {
             new_start: 5,
             new_count: 0,
         };
-        let result = find_affected_symbols(&[sym], &[hunk]);
+        let result = find_affected_symbols(&[sym], &[hunk], None);
         assert!(result.is_empty());
     }
 
@@ -1002,7 +1023,7 @@ mod tests {
             new_start: 5,
             new_count: 3,
         };
-        let result = find_affected_symbols(&[sym], &[hunk]);
+        let result = find_affected_symbols(&[sym], &[hunk], None);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].change_type, "modified");
     }
@@ -1019,7 +1040,7 @@ mod tests {
             new_start: 1,
             new_count: 20,
         };
-        let result = find_affected_symbols(&[sym], &[hunk]);
+        let result = find_affected_symbols(&[sym], &[hunk], None);
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].change_type, "added",
@@ -1040,7 +1061,7 @@ mod tests {
             new_start: 6,
             new_count: 1,
         };
-        let result = find_affected_symbols(&[sym], &[hunk]);
+        let result = find_affected_symbols(&[sym], &[hunk], None);
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].change_type, "modified",
@@ -1058,8 +1079,74 @@ mod tests {
             new_count: 2,
         };
 
-        let result = find_affected_symbols(std::slice::from_ref(&sym), std::slice::from_ref(&hunk));
+        let result = find_affected_symbols(
+            std::slice::from_ref(&sym),
+            std::slice::from_ref(&hunk),
+            None,
+        );
         assert!(result.is_empty());
         assert!(!symbol_overlaps_hunks(&sym, &[hunk]));
+    }
+
+    /// changed_new_lines が指定されている場合、context 行のみで overlap した
+    /// symbol (= `+` 行が symbol range 内に 1 つも無い) は除外される
+    /// (Issue 2026-05-14-private-const-and-unchanged-export-noise 修正 2)。
+    #[test]
+    fn find_affected_symbols_excludes_context_only_overlap() {
+        // hunk 領域: line 41-78 (new_start=41, new_count=38) — 隣接 symbol を巻き込む幅
+        // symbol replaceTemplate: line 42-43 (hunk 領域内だが context 行のみ)
+        // changed_new_lines: 44-77 (実 + 行は symbol range 外)
+        let sym = make_sym("replaceTemplate", 42, 43);
+        let hunk = HunkInfo {
+            old_start: 41,
+            old_count: 3,
+            new_start: 41,
+            new_count: 38,
+        };
+        let mut changed = std::collections::HashSet::new();
+        for l in 44..78usize {
+            changed.insert(l - 1);
+        }
+        let result = find_affected_symbols(&[sym], &[hunk], Some(&changed));
+        assert!(
+            result.is_empty(),
+            "context-only overlap (+ 行が symbol range 内に無い) は除外されるべき"
+        );
+    }
+
+    /// changed_new_lines が指定されていても、symbol range 内に `+` 行が 1 つでも
+    /// 含まれれば従来通り affected として残る。
+    #[test]
+    fn find_affected_symbols_keeps_overlap_with_actual_change() {
+        let sym = make_sym("modified_fn", 43, 46);
+        let hunk = HunkInfo {
+            old_start: 41,
+            old_count: 9,
+            new_start: 41,
+            new_count: 10,
+        };
+        let mut changed = std::collections::HashSet::new();
+        changed.insert(43); // 0-indexed line 43 (= 1-indexed 44) は symbol range 内
+        let result = find_affected_symbols(&[sym], &[hunk], Some(&changed));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "modified_fn");
+        assert_eq!(result[0].change_type, "modified");
+    }
+
+    /// pure-delete hunk (new_count==0) は changed_new_lines が空でも従来通り
+    /// change_type=removed として残る (削除アンカー判定はフィルタ対象外)。
+    #[test]
+    fn find_affected_symbols_pure_delete_remains_with_empty_changed_lines() {
+        let sym = make_sym("removed_fn", 4, 9);
+        let hunk = HunkInfo {
+            old_start: 5,
+            old_count: 3,
+            new_start: 5,
+            new_count: 0,
+        };
+        let changed = std::collections::HashSet::new();
+        let result = find_affected_symbols(&[sym], &[hunk], Some(&changed));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].change_type, "removed");
     }
 }

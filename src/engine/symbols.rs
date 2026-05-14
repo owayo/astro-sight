@@ -485,6 +485,101 @@ fn contains_keyword(text: &str, keyword: &str) -> bool {
 ///   `require_http_methods`, `require_safe`, `staff_member_required`,
 ///   `user_passes_test`
 ///
+/// JS/TS で symbol が「フレームワーク DSL 関数の引数オブジェクトのプロパティ
+/// (method shorthand または key:function pair)」かを判定する。該当なら
+/// dead-code から除外する (Issue 2026-05-14-wxt-defineContentScript-main)。
+///
+/// 対象 DSL (allowlist):
+///   - WXT: `defineContentScript`, `defineBackground`
+///   - Vue: `defineComponent`
+///   - Vite/Vitest: `defineConfig`
+///   - Nuxt: `defineNuxtConfig`
+///
+/// 検出パターン (method shorthand):
+///   ```text
+///   call_expression
+///     function: identifier "defineContentScript"
+///     arguments: arguments
+///       object: object
+///         method_definition (= main() { ... })  ← symbol
+///   ```
+///
+/// 検出パターン (pair value):
+///   ```text
+///   call_expression
+///     function: identifier "defineComponent"
+///     arguments: arguments
+///       object: object
+///         pair
+///           key: property_identifier "setup"
+///           value: arrow_function | function_expression  ← symbol
+///   ```
+///
+/// 直接の親チェーンで判定するため、DSL の callback 内部で定義された関数
+/// (本来 dead 判定したい helper) は誤って除外しない。
+pub fn is_js_ts_framework_dsl_callback(root: Node, source: &[u8], symbol_range: &Range) -> bool {
+    const FRAMEWORK_DSL_CALLEES: &[&str] = &[
+        "defineContentScript",
+        "defineBackground",
+        "defineComponent",
+        "defineConfig",
+        "defineNuxtConfig",
+    ];
+
+    let start = tree_sitter::Point {
+        row: symbol_range.start.line,
+        column: symbol_range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: symbol_range.end.line,
+        column: symbol_range.end.column,
+    };
+    let Some(node) = root.descendant_for_point_range(start, end) else {
+        return false;
+    };
+
+    // symbol を含む最も近い function-like ノードを探す。
+    let mut cur = node;
+    let outer = loop {
+        match cur.kind() {
+            "method_definition"
+            | "arrow_function"
+            | "function_expression"
+            | "function_declaration" => break cur,
+            _ => {}
+        }
+        match cur.parent() {
+            Some(p) => cur = p,
+            None => return false,
+        }
+    };
+
+    // outer の親チェーンを辿って `object → arguments → call_expression` を確認する。
+    // method shorthand: method_definition の親が object
+    // pair value:        arrow/function_expression の親が pair → object
+    let object = match outer.parent() {
+        Some(p) if p.kind() == "object" => p,
+        Some(p) if p.kind() == "pair" => match p.parent() {
+            Some(o) if o.kind() == "object" => o,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let Some(arguments) = object.parent().filter(|p| p.kind() == "arguments") else {
+        return false;
+    };
+    let Some(call_expression) = arguments.parent().filter(|p| p.kind() == "call_expression") else {
+        return false;
+    };
+    let Some(callee) = call_expression.child_by_field_name("function") else {
+        return false;
+    };
+    let Ok(text) = callee.utf8_text(source) else {
+        return false;
+    };
+    FRAMEWORK_DSL_CALLEES.contains(&text)
+}
+
 /// その他: `pytest.mark.<anything>` プレフィックスを pytest test marker として認識。
 pub fn has_framework_entrypoint_decorator_python(
     root: Node,
@@ -2436,5 +2531,137 @@ class Foo {
         assert!(!php_doc_has_runtime_annotation("/** @param int $x */"));
         assert!(!php_doc_has_runtime_annotation("/** @return self */"));
         assert!(!php_doc_has_runtime_annotation("/** @var string */"));
+    }
+
+    // --- is_js_ts_framework_dsl_callback テスト ---
+
+    fn check_js_ts_dsl_callback(source: &str, lang: LangId, symbol_name: &str) -> bool {
+        let language = lang.ts_language();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+
+        let syms = extract_symbols(root, source.as_bytes(), lang).unwrap();
+        let sym = syms
+            .iter()
+            .find(|s| s.name == symbol_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "symbol '{}' not found in {:?}",
+                    symbol_name,
+                    syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            });
+        is_js_ts_framework_dsl_callback(root, source.as_bytes(), &sym.range)
+    }
+
+    #[test]
+    fn js_ts_wxt_define_content_script_main_method_detected() {
+        // Issue 報告ケース: WXT defineContentScript の引数 object に method shorthand
+        let src = r#"
+import { defineContentScript } from 'wxt/sandbox';
+
+export default defineContentScript({
+    matches: ['*://example.com/*'],
+    main() {
+        console.log('hello');
+    },
+});
+"#;
+        assert!(check_js_ts_dsl_callback(src, LangId::Typescript, "main"));
+    }
+
+    #[test]
+    fn js_ts_wxt_define_background_main_method_detected() {
+        let src = r#"
+export default defineBackground({
+    main() {
+        console.log('background');
+    },
+});
+"#;
+        assert!(check_js_ts_dsl_callback(src, LangId::Typescript, "main"));
+    }
+
+    #[test]
+    fn js_ts_vue_define_component_setup_method_detected() {
+        // Vue 推奨の method shorthand 形式
+        let src = r#"
+export default defineComponent({
+    setup() {
+        return {};
+    },
+});
+"#;
+        assert!(check_js_ts_dsl_callback(src, LangId::Typescript, "setup"));
+    }
+
+    #[test]
+    fn js_ts_vite_define_config_method_detected() {
+        let src = r#"
+export default defineConfig({
+    name: "x",
+});
+"#;
+        // この source には method/function symbol が無いため別 case で確認:
+        let src2 = r#"
+export default defineConfig({
+    onPluginInit() {
+        return null;
+    },
+});
+"#;
+        let _ = src;
+        assert!(check_js_ts_dsl_callback(
+            src2,
+            LangId::Typescript,
+            "onPluginInit"
+        ));
+    }
+
+    #[test]
+    fn js_ts_plain_object_method_not_excluded() {
+        // 通常のオブジェクトリテラルの method shorthand は dead 候補のまま (false)
+        let src = r#"
+export const obj = {
+    main() {
+        return 1;
+    },
+};
+"#;
+        assert!(!check_js_ts_dsl_callback(src, LangId::Typescript, "main"));
+    }
+
+    #[test]
+    fn js_ts_unknown_dsl_caller_not_excluded() {
+        // allowlist に含まれない関数の引数 object メソッドは dead 候補のまま
+        let src = r#"
+export default someUnknownFn({
+    main() {
+        return 1;
+    },
+});
+"#;
+        assert!(!check_js_ts_dsl_callback(src, LangId::Typescript, "main"));
+    }
+
+    #[test]
+    fn js_ts_inner_helper_inside_dsl_callback_not_excluded() {
+        // DSL callback (main) 内部で定義された helper は dead 候補のまま
+        let src = r#"
+export default defineContentScript({
+    main() {
+        function helper() {
+            return 1;
+        }
+        return helper();
+    },
+});
+"#;
+        // main は除外対象
+        assert!(check_js_ts_dsl_callback(src, LangId::Typescript, "main"));
+        // helper は対象外 (内部 function は dead 判定の余地を残す)
+        assert!(!check_js_ts_dsl_callback(src, LangId::Typescript, "helper"));
     }
 }
