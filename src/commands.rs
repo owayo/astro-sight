@@ -1179,6 +1179,16 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> HookJsonBuild {
         if change.affected_symbols.is_empty() {
             continue;
         }
+        // hook の `syms` には「実際に cross-file caller を発生させた causal シンボル」だけを残す。
+        // `change.affected_symbols` を丸ごと入れると、is_symbol_exported で cross-file 検索を
+        // 弾かれた非 export const や、隣接 hunk の context に巻き込まれた未変更 export まで
+        // hook 出力に混ざる。`caller.symbols` (cross-file 検索を通過した causal name) と
+        // `affected_symbols` の交差で causal だけを抽出する。
+        let affected_names: std::collections::HashSet<&str> = change
+            .affected_symbols
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
         for caller in &change.impacted_callers {
             let caller_abs = if std::path::Path::new(&caller.path).is_relative() {
                 std::path::Path::new(dir)
@@ -1194,12 +1204,11 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> HookJsonBuild {
             };
             if !in_diff {
                 let entry = unresolved.entry(change.path.clone()).or_default();
-                entry.changed_symbols.extend(
-                    change
-                        .affected_symbols
-                        .iter()
-                        .map(|symbol| symbol.name.clone()),
-                );
+                for sym in &caller.symbols {
+                    if affected_names.contains(sym.as_str()) {
+                        entry.changed_symbols.insert(sym.clone());
+                    }
+                }
                 entry
                     .refs
                     .push((caller.path.clone(), caller.line, caller.symbols.clone()));
@@ -6848,7 +6857,10 @@ def new_public_api():
                         path: "src/main.rs".to_string(),
                         name: "main".to_string(),
                         line: 1,
-                        symbols: vec!["main".to_string()],
+                        // caller.symbols は「この caller が参照している、変更ファイル内の
+                        // シンボル名」(pass3.rs::build_file_impact の構築意図)。
+                        // 呼び出し元関数の名前は ImpactedCaller.name 側に入る。
+                        symbols: vec!["compute".to_string()],
                         confidence: None,
                     }],
                     low_confidence_callers: Vec::new(),
@@ -6875,7 +6887,82 @@ def new_public_api():
         assert_eq!(impacts.len(), 1);
         assert_eq!(impacts[0]["src"], "src/lib.rs");
         assert_eq!(impacts[0]["syms"], serde_json::json!(["compute"]));
-        assert_eq!(impacts[0]["refs"][0]["s"], serde_json::json!(["main"]));
+        assert_eq!(impacts[0]["refs"][0]["s"], serde_json::json!(["compute"]));
+    }
+
+    /// hook の `syms` には cross-file caller を発生させた causal symbol だけを残し、
+    /// 非 export const や本体未変更の export を除外する (Issue 2026-05-14
+    /// private-const-and-unchanged-export-noise)。
+    #[test]
+    fn build_review_hook_json_filters_non_causal_affected_symbols_from_syms() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        fs::write(src_dir.join("a.rs"), "pub fn foo() {}\n").expect("write changed file");
+        fs::write(src_dir.join("b.rs"), "fn caller() { foo(); }\n").expect("write caller");
+
+        // affected_symbols は変更ファイル内で hunk と overlap した全シンボル。
+        // PRIVATE_CONST と unchanged_export は cross-file 検索で is_symbol_exported に
+        // 弾かれて caller.symbols には含まれないため、hook の syms にも出てはならない。
+        let result = ReviewResult {
+            impact: crate::models::impact::ContextResult {
+                changes: vec![crate::models::impact::FileImpact {
+                    path: "src/a.rs".to_string(),
+                    hunks: Vec::new(),
+                    affected_symbols: vec![
+                        crate::models::impact::AffectedSymbol {
+                            name: "foo".to_string(),
+                            kind: "function".to_string(),
+                            change_type: "modified".to_string(),
+                        },
+                        crate::models::impact::AffectedSymbol {
+                            name: "PRIVATE_CONST".to_string(),
+                            kind: "constant".to_string(),
+                            change_type: "modified".to_string(),
+                        },
+                        crate::models::impact::AffectedSymbol {
+                            name: "unchanged_export".to_string(),
+                            kind: "function".to_string(),
+                            change_type: "modified".to_string(),
+                        },
+                    ],
+                    signature_changes: Vec::new(),
+                    impacted_callers: vec![crate::models::impact::ImpactedCaller {
+                        path: "src/b.rs".to_string(),
+                        name: "caller".to_string(),
+                        line: 1,
+                        symbols: vec!["foo".to_string()],
+                        confidence: None,
+                    }],
+                    low_confidence_callers: Vec::new(),
+                }],
+            },
+            missing_cochanges: Vec::new(),
+            api_changes: ApiChanges {
+                added: Vec::new(),
+                removed: Vec::new(),
+                modified: Vec::new(),
+                moved: Vec::new(),
+                property_to_field: Vec::new(),
+            },
+            dead_symbols: Vec::new(),
+            test_only_symbols: Vec::new(),
+        };
+
+        let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
+        let hook_json = build.value.expect("hook json should be generated");
+        assert!(build.is_blocking, "未解決 impact があれば blocking");
+        let impacts = hook_json["impacts"]
+            .as_array()
+            .expect("impacts should be an array");
+        assert_eq!(impacts.len(), 1);
+        assert_eq!(
+            impacts[0]["syms"],
+            serde_json::json!(["foo"]),
+            "syms は cross-file caller を発生させた causal symbol だけになるべき (PRIVATE_CONST と unchanged_export は除外)"
+        );
+        // refs[].s は元々 caller.symbols そのまま (causal の絞り込みは不要)
+        assert_eq!(impacts[0]["refs"][0]["s"], serde_json::json!(["foo"]));
     }
 
     // ------------------------------------------------------------------
