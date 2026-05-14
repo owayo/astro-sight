@@ -312,10 +312,7 @@ impl AstroSightServer {
             exclude_dirs: p.exclude_dirs,
             exclude_globs: p.exclude_globs,
         };
-        Self::to_tool_result(
-            self.service
-                .analyze_context_with_options(&p.diff, &p.dir, &options),
-        )
+        Self::to_tool_result(self.service.analyze_context(&p.diff, &p.dir, &options))
     }
 
     #[tool(

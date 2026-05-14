@@ -63,7 +63,7 @@ fn ci_key(lang: LangId, name: &str) -> String {
     normalize_identifier(lang, name).into_owned()
 }
 
-/// unified diff のワークスペースディレクトリ内での影響を解析する。
+/// unified diff のワークスペースディレクトリ内での影響を解析する streaming API。
 ///
 /// 3 パス方式で cross-file 参照を流し込む：
 ///   Pass 1:  変更ファイルをパースし affected シンボルを収集
@@ -76,29 +76,14 @@ fn ci_key(lang: LangId, name: &str) -> String {
 /// candidate 保持を廃止し per-file で caller_map に即流すことで、worker ローカルの
 /// 中間バッファを `caller_map` のサイズ (数百MB) まで抑え、融合版で発生した
 /// fold 中の 1GB 級バッファ問題を排除する。
-/// `FileImpact` を 1 件生成するごとに `on_file_impact` callback に渡す streaming API。
 ///
-/// `Vec<FileImpact>` を全件 memory に貯めないため、呼び出し側（CLI）で JSON を 1 件ずつ
-/// stdout に flush すれば、最終 `ContextResult.changes` の成長に伴う数 GB 級のピーク RSS を
-/// 排除できる。通常の `analyze_impact` はこの API の薄い wrapper。
-pub fn analyze_impact_streaming<F>(diff_input: &str, dir: &Path, on_file_impact: F) -> Result<()>
-where
-    F: FnMut(FileImpact) -> Result<()>,
-{
-    analyze_impact_streaming_with_options(
-        diff_input,
-        dir,
-        &crate::models::impact::ContextAnalysisOptions::default(),
-        on_file_impact,
-    )
-}
-
-/// `analyze_impact_streaming` のオプション付き版。
+/// `FileImpact` を 1 件生成するごとに `on_file_impact` callback に渡し、`Vec<FileImpact>`
+/// を全件 memory に貯めないため、呼び出し側（CLI）で JSON を 1 件ずつ stdout に flush
+/// すれば、最終 `ContextResult.changes` の成長に伴う数 GB 級のピーク RSS を排除できる。
 ///
-/// `options.exclude_dirs` / `options.exclude_globs` は Pass2 cross-file 検索
-/// から追加で除外したい対象を指定する (固定の `IMPACT_DEFAULT_EXCLUDED_DIRS`
-/// にマージして適用される)。
-pub fn analyze_impact_streaming_with_options<F>(
+/// `options.exclude_dirs` / `options.exclude_globs` は Pass2 cross-file 検索から
+/// 追加で除外したい対象を指定する (固定の `IMPACT_DEFAULT_EXCLUDED_DIRS` にマージして適用)。
+pub fn analyze_impact_streaming<F>(
     diff_input: &str,
     dir: &Path,
     options: &crate::models::impact::ContextAnalysisOptions,

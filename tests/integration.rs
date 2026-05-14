@@ -4093,7 +4093,11 @@ fn sandboxed_service_validates_input_size() {
     // sandboxed は max_input_size = 100MB に設定される。
     // analyze_context で validate_input_size が呼ばれるため、
     // 小さい入力は通ること、巨大入力は別のテスト環境で確認。
-    let result = service.analyze_context("", ".");
+    let result = service.analyze_context(
+        "",
+        ".",
+        &astro_sight::models::impact::ContextAnalysisOptions::default(),
+    );
     assert!(result.is_ok(), "空の diff 入力はサイズ制限を通過するべき");
 }
 
