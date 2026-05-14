@@ -2077,6 +2077,15 @@ pub(crate) fn detect_dead_symbols_from_files(
     // AndroidManifest.xml が存在しないプロジェクトでは空集合が返り副作用なし。
     let xml_refs = crate::engine::xml_refs::collect_xml_symbol_references(&canonical_dir);
 
+    // Angular プロジェクトでは `*.component.html` テンプレートや
+    // `@Component({ template: \`...\` })` の inline template 内の binding 式から
+    // component method/プロパティが参照される。TypeScript AST のみでは追跡できない
+    // ため、テンプレート参照集合に含まれるシンボルは dead から除外する。
+    // angular.json / *.component.ts のどちらも見つからないプロジェクトでは空集合が
+    // 返り副作用なし。
+    let template_refs =
+        crate::engine::angular_template_refs::collect_angular_template_refs(&canonical_dir);
+
     // production 0 / test 0 → dead_symbols
     // production 0 / test > 0 → test_only_symbols (F5)
     // production > 0 → 生存とみなしどちらにも報告しない
@@ -2099,6 +2108,13 @@ pub(crate) fn detect_dead_symbols_from_files(
         // `android:name=".Foo"` 等で Container 側をカバーするケースは qualname でも検査する。
         let bare = bare_name(name);
         if xml_refs.contains(bare) || xml_refs.contains(name.as_str()) {
+            continue;
+        }
+
+        // Angular template 参照 (`(event)="handler()"` 等) は bare name でのみ
+        // 出現するため bare で突き合わせる。`Container.method` 形式の qualname も
+        // 念のため両方確認する。
+        if template_refs.contains(bare) || template_refs.contains(name.as_str()) {
             continue;
         }
 
@@ -4936,6 +4952,148 @@ class B:
         assert!(
             added.contains(&"new_hand"),
             "通常ファイルの API 追加は検出されるべき。got: {added:?}"
+        );
+    }
+
+    /// Angular component の public method が `templateUrl` で紐づく
+    /// `.component.html` から参照されている場合、dead 判定から除外される。
+    ///
+    /// 再現元: astro-sight-bug-reports#4 (framework-template-ref)
+    /// - `@Component({ templateUrl: './foo.component.html' })` で紐づく HTML 内の
+    ///   `(event)="method()"` / `[prop]="method()"` / `[ngStyle]="{ ...: method() }"`
+    ///   等の binding 式で呼ばれている component method が
+    ///   TS AST だけ見ると dead 扱いされる問題を修正。
+    #[test]
+    fn detect_dead_excludes_angular_component_methods_referenced_from_template() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        // Angular プロジェクト標識として angular.json を置く
+        fs::write(repo.join("angular.json"), "{}").expect("write angular.json");
+
+        let component_ts = r#"
+import { Component } from '@angular/core';
+
+@Component({
+    selector: 'app-sample',
+    templateUrl: './sample.component.html',
+})
+export class SampleComponent {
+    public headerCheck: boolean = false;
+
+    public headerCheckChanged(): void {
+    }
+
+    public isHeaderDisabled(): boolean {
+        return false;
+    }
+
+    public reallyUnusedMethod(): void {
+    }
+}
+"#;
+        let component_html = r#"
+<label [ngStyle]="{'display': isHeaderDisabled() ? 'none' : ''}">
+    <input type="checkbox"
+           [(ngModel)]="headerCheck"
+           (ngModelChange)="headerCheckChanged()">
+</label>
+"#;
+        fs::write(repo.join("sample.component.ts"), component_ts).expect("write ts");
+        fs::write(repo.join("sample.component.html"), component_html).expect("write html");
+
+        let files = vec![repo.join("sample.component.ts")];
+        let (dead, _test_only) =
+            detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
+        let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+
+        assert!(
+            !names.iter().any(|n| n.ends_with("headerCheckChanged")),
+            "Angular template から (ngModelChange) で参照される method は dead から除外されるべき。got: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.ends_with("isHeaderDisabled")),
+            "Angular template の [ngStyle] 式から参照される method は dead から除外されるべき。got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.ends_with("reallyUnusedMethod")),
+            "テンプレートからも参照されない method は dead として検出されるべき。got: {names:?}"
+        );
+    }
+
+    /// Angular の inline template (`@Component({ template: \`...\` })`) で参照される
+    /// component method も dead 判定から除外される。
+    #[test]
+    fn detect_dead_excludes_angular_inline_template_method_refs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        fs::write(repo.join("angular.json"), "{}").expect("write angular.json");
+
+        let component_ts = r#"
+import { Component } from '@angular/core';
+
+@Component({
+    selector: 'app-inline',
+    template: `<button (click)="onClick()">{{ greeting }}</button>`,
+})
+export class InlineComponent {
+    public greeting: string = 'hi';
+
+    public onClick(): void {
+    }
+
+    public reallyUnusedInline(): void {
+    }
+}
+"#;
+        fs::write(repo.join("inline.component.ts"), component_ts).expect("write ts");
+
+        let files = vec![repo.join("inline.component.ts")];
+        let (dead, _test_only) =
+            detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
+        let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+
+        assert!(
+            !names.iter().any(|n| n.ends_with("onClick")),
+            "inline template の (click) で参照される method は dead から除外されるべき。got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.ends_with("reallyUnusedInline")),
+            "inline template からも参照されない method は dead として検出されるべき。got: {names:?}"
+        );
+    }
+
+    /// 非 Angular プロジェクトでは `.html` ファイルを参照源としてスキャンしない
+    /// （誤って HTML 内の単語を参照と誤認しないことの確認）。
+    #[test]
+    fn detect_dead_does_not_use_html_in_non_angular_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        // angular.json も *.component.ts もない通常の TS プロジェクト
+        let ts = r#"
+export function ghostHandler(): void {
+}
+"#;
+        fs::write(repo.join("util.ts"), ts).expect("write ts");
+        fs::write(
+            repo.join("page.html"),
+            r#"<button (click)="ghostHandler()">x</button>"#,
+        )
+        .expect("write html");
+
+        let files = vec![repo.join("util.ts")];
+        let (dead, _test_only) =
+            detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
+        let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"ghostHandler"),
+            "Angular マーカーが無い場合は HTML 参照を生存判定に使わない (非 Angular なので) 。got: {names:?}"
         );
     }
 

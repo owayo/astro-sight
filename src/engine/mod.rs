@@ -1,3 +1,4 @@
+pub mod angular_template_refs;
 pub mod calls;
 pub mod cochange;
 pub mod diff;
