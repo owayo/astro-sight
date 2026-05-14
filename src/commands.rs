@@ -2285,12 +2285,74 @@ fn extract_exported_symbols_from_file_inner(
 /// 本体（メソッド本体や private フィールド）の変更でクラス全体の API 変更として
 /// 再検出されるのを避けるため、メンバーの集約はしない。
 /// メンバー個々の変更は method シンボル単独で検出される。
-fn extract_api_signature(sym: &crate::models::symbol::Symbol, lines: &[&str]) -> String {
+///
+/// function / method の場合は tree-sitter ノードで「宣言開始から body 直前まで」を
+/// 抽出し、whitespace を正規化して signature とする。これにより `where` 句や複数行
+/// generics で先頭行が同一でも引数列が変わったケース (Issue
+/// 2026-05-14-rename-and-multiline-signature) を検出できる。
+/// body が無い (interface method / abstract 等) や node 取得失敗時は先頭行を fallback。
+fn extract_api_signature(
+    sym: &crate::models::symbol::Symbol,
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    lines: &[&str],
+) -> String {
+    use crate::models::symbol::SymbolKind;
+    if matches!(sym.kind, SymbolKind::Function | SymbolKind::Method) {
+        let start = tree_sitter::Point {
+            row: sym.range.start.line,
+            column: sym.range.start.column,
+        };
+        let end = tree_sitter::Point {
+            row: sym.range.end.line,
+            column: sym.range.end.column,
+        };
+        if let Some(node) = root.descendant_for_point_range(start, end) {
+            let mut cur = node;
+            loop {
+                match cur.kind() {
+                    "function_item"
+                    | "function_declaration"
+                    | "function_definition"
+                    | "method_declaration"
+                    | "method_definition"
+                    | "function_signature_item" => {
+                        let s = cur.start_byte();
+                        let e = cur
+                            .child_by_field_name("body")
+                            .map(|b| b.start_byte())
+                            .unwrap_or_else(|| cur.end_byte());
+                        if let Some(bytes) = source.get(s..e) {
+                            return normalize_signature_whitespace(bytes);
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+                match cur.parent() {
+                    Some(p) => cur = p,
+                    None => break,
+                }
+            }
+        }
+    }
+
+    // フォールバック: 先頭行のみ
     lines
         .get(sym.range.start.line)
         .unwrap_or(&"")
         .trim()
         .to_string()
+}
+
+/// signature bytes を whitespace で分割して 1 つの space で結合し正規化する。
+/// 改行・タブ・連続スペース・末尾の `{` 直前空白を一括で潰す。
+fn normalize_signature_whitespace(bytes: &[u8]) -> String {
+    std::str::from_utf8(bytes)
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn filter_exported_symbols(
@@ -2470,7 +2532,7 @@ fn filter_exported_symbols(
         {
             continue;
         }
-        let sig = extract_api_signature(sym, &lines);
+        let sig = extract_api_signature(sym, root, source, &lines);
         let qualname = if matches!(sym.kind, SymbolKind::Method | SymbolKind::Function) {
             enclosing_container(sym, &containers)
                 .map(|c| format!("{}.{}", c.name, sym.name))
@@ -3916,10 +3978,85 @@ mod tests {
                 .modified
                 .iter()
                 .any(|change| change.name == "greet"
-                    && change.old_signature.as_deref() == Some("pub fn greet() -> i32 {")
-                    && change.new_signature.as_deref()
-                        == Some("pub fn greet(name: &str) -> i32 {")),
+                    && change.old_signature.as_deref() == Some("pub fn greet() -> i32")
+                    && change.new_signature.as_deref() == Some("pub fn greet(name: &str) -> i32")),
             "rename を含む差分でも関数シグネチャ変更を検出するべき"
+        );
+    }
+
+    /// 宣言の先頭行が同一でも、複数行に跨る引数列が変わった場合は modified として
+    /// 検出される (Issue 2026-05-14-rename-and-multiline-signature の 3a)。
+    /// 旧実装は先頭行のみを signature に使っており、引数列が増えても先頭行
+    /// (`pub fn foo<F>(`) が同じだと false negative になっていた。
+    #[test]
+    fn detect_api_changes_modified_includes_multiline_signature_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let src_dir = repo.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+
+        let before = "pub fn foo<F>(\n    diff: &str,\n    dir: &str,\n    cb: F,\n) -> Result<(), String>\nwhere\n    F: FnMut() -> Result<(), String>,\n{\n    Ok(())\n}\n";
+        fs::write(src_dir.join("foo.rs"), before).expect("write before");
+        assert!(
+            Command::new("git")
+                .args(["add", "src/foo.rs"])
+                .current_dir(repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+
+        // 引数を 1 つ追加した版 (先頭行 `pub fn foo<F>(` は base と完全一致)
+        let after = "pub fn foo<F>(\n    diff: &str,\n    dir: &str,\n    options: &Options,\n    cb: F,\n) -> Result<(), String>\nwhere\n    F: FnMut() -> Result<(), String>,\n{\n    Ok(())\n}\n";
+        fs::write(src_dir.join("foo.rs"), after).expect("write after");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/foo.rs".to_string(),
+            new_path: "src/foo.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 9,
+                new_start: 1,
+                new_count: 10,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let foo_change = api_changes
+            .modified
+            .iter()
+            .find(|c| c.name == "foo")
+            .expect("foo は multi-line signature の変更で modified に出るべき");
+        assert!(
+            foo_change
+                .old_signature
+                .as_deref()
+                .map(|s| s.contains("diff: &str") && !s.contains("options"))
+                .unwrap_or(false),
+            "old_signature は base の引数列のみ含むべき: {:?}",
+            foo_change.old_signature
+        );
+        assert!(
+            foo_change
+                .new_signature
+                .as_deref()
+                .map(|s| s.contains("options: &Options"))
+                .unwrap_or(false),
+            "new_signature は追加された options 引数を含むべき: {:?}",
+            foo_change.new_signature
         );
     }
 
