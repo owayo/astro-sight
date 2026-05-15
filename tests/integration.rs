@@ -4700,6 +4700,62 @@ fn go_refs() {
     assert!(!refs.is_empty(), "Server の参照を検出すべき");
 }
 
+/// PHPUnit の DocBlock `@dataProvider` および PHP attribute `#[DataProvider(...)]`
+/// 経由で参照される method を astro-sight が参照として解決すること
+/// (Issue astro-sight-bug-reports#6)。
+#[test]
+fn phpunit_dataprovider_refs() {
+    let output = cargo_bin()
+        .args([
+            "refs",
+            "--name",
+            "providerForValidateFormat",
+            "--dir",
+            "tests/fixtures",
+            "--glob",
+            "**/sample_phpunit_test.php",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let refs = json["refs"].as_array().expect("refs array");
+    let defs: Vec<&serde_json::Value> = refs.iter().filter(|r| r["kind"] == "def").collect();
+    let non_defs: Vec<&serde_json::Value> = refs.iter().filter(|r| r["kind"] != "def").collect();
+    assert_eq!(defs.len(), 1, "definition 1 件: {refs:?}");
+    assert!(
+        non_defs
+            .iter()
+            .any(|r| r["ctx"].as_str().unwrap_or("").contains("@dataProvider")),
+        "@dataProvider 経由の参照を検出すべき: {refs:?}"
+    );
+
+    // attribute 経由
+    let output2 = cargo_bin()
+        .args([
+            "refs",
+            "--name",
+            "attrProvider",
+            "--dir",
+            "tests/fixtures",
+            "--glob",
+            "**/sample_phpunit_test.php",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output2.status.success());
+    let json2: serde_json::Value = serde_json::from_slice(&output2.stdout).expect("invalid JSON");
+    let refs2 = json2["refs"].as_array().expect("refs array");
+    let non_defs2: Vec<&serde_json::Value> = refs2.iter().filter(|r| r["kind"] != "def").collect();
+    assert!(
+        non_defs2
+            .iter()
+            .any(|r| r["ctx"].as_str().unwrap_or("").contains("DataProvider")),
+        "#[DataProvider(...)] 経由の参照を検出すべき: {refs2:?}"
+    );
+}
+
 /// bash の `trap '<handler>' SIG` 構文の handler 文字列内に書かれた関数呼び出しを
 /// astro-sight が参照として解決すること (Issue #5 / astro-sight-bug-reports#5)。
 #[test]

@@ -5,6 +5,7 @@ use tree_sitter::Node;
 
 use crate::engine::bash_trap_refs::bash_trap_handler_ref_segments;
 use crate::engine::parser;
+use crate::engine::phpunit_refs::phpunit_metadata_ref_segments;
 use crate::language::{LangId, normalize_identifier};
 use crate::models::reference::{RefConfidence, RefKind, SymbolReference};
 
@@ -316,6 +317,21 @@ fn collect_identifier_refs(
 
     // bash の `trap '<handler>' SIG` 内の handler 文字列から関数参照を抽出する。
     for (seg, row, col) in bash_trap_handler_ref_segments(node, source, lang_id) {
+        if normalize_identifier(lang_id, &seg).as_ref() == symbol_name {
+            refs.push(SymbolReference {
+                path: path.to_string(),
+                line: row,
+                column: col,
+                context: Some(extract_line_context(source, row)),
+                kind: Some(RefKind::Reference),
+                confidence: None,
+            });
+        }
+    }
+
+    // PHPUnit の DocBlock (`@dataProvider` / `@depends`) や PHP attribute
+    // (`#[DataProvider('name')]` 等) 経由で参照される method を ref として扱う。
+    for (seg, row, col) in phpunit_metadata_ref_segments(node, source, lang_id) {
         if normalize_identifier(lang_id, &seg).as_ref() == symbol_name {
             refs.push(SymbolReference {
                 path: path.to_string(),
@@ -1320,6 +1336,59 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
         }
     }
 
+    // PHPUnit の DocBlock / attribute 経由で参照される method を ref として扱う。
+    for (seg, row, col) in phpunit_metadata_ref_segments(node, source, lang_id) {
+        if let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, &seg)) {
+            let context = extract_line_context(source, row);
+            for &ix in indices {
+                visitor.on_ref(
+                    ix as u32,
+                    row,
+                    col,
+                    &context,
+                    false,
+                    RefConfidence::ExactOwner,
+                );
+            }
+        }
+    }
+
+    // PHP の callable array `[Foo::class, 'method']` を ref として扱う (N3)。
+    // collect_identifier_refs_indexed / count_identifier_refs と挙動を揃え、
+    // impact streaming Pass でも同じ結果を返すようにする。
+    if let Some((method, row, col)) = php_callable_array_method_segment(node, source, lang_id)
+        && let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, method))
+    {
+        let context = extract_line_context(source, row);
+        for &ix in indices {
+            visitor.on_ref(
+                ix as u32,
+                row,
+                col,
+                &context,
+                false,
+                RefConfidence::ExactOwner,
+            );
+        }
+    }
+
+    // PHP の文字列 callable `'Class@method'` / `Class::class . '@method'` を ref とする (N4)。
+    if let Some((method, row, col)) = php_string_callable_method_segment(node, source, lang_id)
+        && let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, method))
+    {
+        let context = extract_line_context(source, row);
+        for &ix in indices {
+            visitor.on_ref(
+                ix as u32,
+                row,
+                col,
+                &context,
+                false,
+                RefConfidence::ExactOwner,
+            );
+        }
+    }
+
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_refs_and_defs_indexed_cb(
@@ -1621,6 +1690,23 @@ fn collect_identifier_refs_indexed(
         }
     }
 
+    // PHPUnit の DocBlock / attribute 経由で参照される method を ref として扱う。
+    for (seg, row, col) in phpunit_metadata_ref_segments(node, source, lang_id) {
+        if let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, &seg)) {
+            let context = extract_line_context(source, row);
+            for &ix in indices {
+                refs[ix].push(SymbolReference {
+                    path: path.to_string(),
+                    line: row,
+                    column: col,
+                    context: Some(context.clone()),
+                    kind: Some(RefKind::Reference),
+                    confidence: None,
+                });
+            }
+        }
+    }
+
     // PHP の callable array `[Foo::class, 'method']` の string literal を ref として扱う (N3)。
     if let Some((method, row, col)) = php_callable_array_method_segment(node, source, lang_id)
         && let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, method))
@@ -1750,6 +1836,15 @@ fn count_identifier_refs(
 
     // bash の `trap '<handler>' SIG` 内の handler 文字列から関数参照をカウントする。
     for (seg, _row, _col) in bash_trap_handler_ref_segments(node, source, lang_id) {
+        if let Some(ixs) = name_to_ix.get(&normalize_identifier(lang_id, &seg)) {
+            for &ix in ixs {
+                counts[ix] += 1;
+            }
+        }
+    }
+
+    // PHPUnit の DocBlock / attribute 経由で参照される method をカウントする。
+    for (seg, _row, _col) in phpunit_metadata_ref_segments(node, source, lang_id) {
         if let Some(ixs) = name_to_ix.get(&normalize_identifier(lang_id, &seg)) {
             for &ix in ixs {
                 counts[ix] += 1;

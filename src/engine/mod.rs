@@ -10,6 +10,7 @@ pub mod impact;
 pub mod imports;
 pub mod lint;
 pub mod parser;
+pub mod phpunit_refs;
 pub mod refs;
 pub mod sequence;
 pub mod snippet;
