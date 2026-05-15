@@ -3,6 +3,7 @@ use rayon::prelude::*;
 use std::path::Path;
 use tree_sitter::Node;
 
+use crate::engine::bash_trap_refs::bash_trap_handler_ref_segments;
 use crate::engine::parser;
 use crate::language::{LangId, normalize_identifier};
 use crate::models::reference::{RefConfidence, RefKind, SymbolReference};
@@ -302,6 +303,20 @@ fn collect_identifier_refs(
     // Rust の serde 属性文字列値を識別子参照として扱う。
     for (seg, row, col) in rust_attr_string_ref_segments(node, source, lang_id) {
         if normalize_identifier(lang_id, seg).as_ref() == symbol_name {
+            refs.push(SymbolReference {
+                path: path.to_string(),
+                line: row,
+                column: col,
+                context: Some(extract_line_context(source, row)),
+                kind: Some(RefKind::Reference),
+                confidence: None,
+            });
+        }
+    }
+
+    // bash の `trap '<handler>' SIG` 内の handler 文字列から関数参照を抽出する。
+    for (seg, row, col) in bash_trap_handler_ref_segments(node, source, lang_id) {
+        if normalize_identifier(lang_id, &seg).as_ref() == symbol_name {
             refs.push(SymbolReference {
                 path: path.to_string(),
                 line: row,
@@ -1288,6 +1303,23 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
         }
     }
 
+    // bash の `trap '<handler>' SIG` 内の handler 文字列から関数参照を抽出する。
+    for (seg, row, col) in bash_trap_handler_ref_segments(node, source, lang_id) {
+        if let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, &seg)) {
+            let context = extract_line_context(source, row);
+            for &ix in indices {
+                visitor.on_ref(
+                    ix as u32,
+                    row,
+                    col,
+                    &context,
+                    false,
+                    RefConfidence::ExactOwner,
+                );
+            }
+        }
+    }
+
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_refs_and_defs_indexed_cb(
@@ -1572,6 +1604,23 @@ fn collect_identifier_refs_indexed(
         }
     }
 
+    // bash の `trap '<handler>' SIG` 内の handler 文字列から関数参照を抽出する。
+    for (seg, row, col) in bash_trap_handler_ref_segments(node, source, lang_id) {
+        if let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, &seg)) {
+            let context = extract_line_context(source, row);
+            for &ix in indices {
+                refs[ix].push(SymbolReference {
+                    path: path.to_string(),
+                    line: row,
+                    column: col,
+                    context: Some(context.clone()),
+                    kind: Some(RefKind::Reference),
+                    confidence: None,
+                });
+            }
+        }
+    }
+
     // PHP の callable array `[Foo::class, 'method']` の string literal を ref として扱う (N3)。
     if let Some((method, row, col)) = php_callable_array_method_segment(node, source, lang_id)
         && let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, method))
@@ -1693,6 +1742,15 @@ fn count_identifier_refs(
     // Rust の serde 属性文字列値を非 Definition 参照としてカウントする。
     for (seg, _row, _col) in rust_attr_string_ref_segments(node, source, lang_id) {
         if let Some(ixs) = name_to_ix.get(&normalize_identifier(lang_id, seg)) {
+            for &ix in ixs {
+                counts[ix] += 1;
+            }
+        }
+    }
+
+    // bash の `trap '<handler>' SIG` 内の handler 文字列から関数参照をカウントする。
+    for (seg, _row, _col) in bash_trap_handler_ref_segments(node, source, lang_id) {
+        if let Some(ixs) = name_to_ix.get(&normalize_identifier(lang_id, &seg)) {
             for &ix in ixs {
                 counts[ix] += 1;
             }
@@ -2352,5 +2410,90 @@ struct Bar {
             "_ide_helper.php は default で除外されるべき。got names: {names:?}"
         );
         assert!(optout_ide, "opt-out 時は _ide_helper.php も含まれるべき");
+    }
+
+    /// bash の `trap '<handler>' SIG` 内の関数参照が `count_identifier_refs` で
+    /// 非 Definition としてカウントされ、dead-code 判定で生存扱いになることを検証する。
+    /// 旧実装では trap handler 内は文字列扱いで参照ゼロとなり、`cleanup_signal` のような
+    /// シグナルハンドラが false-positive で dead として列挙される回帰があった。
+    #[test]
+    fn bash_trap_handler_counts_as_non_definition_ref() {
+        use std::borrow::Cow;
+        use std::collections::HashMap;
+
+        let source = "cleanup_signal() {\n    exit 1\n}\ntrap 'cleanup_signal 130' INT\ntrap \"cleanup_signal 143\" TERM\n";
+        let tree = parser::parse_source(source.as_bytes(), LangId::Bash).expect("parse");
+        let defs = definition_node_kinds(LangId::Bash);
+        let mut name_to_ix: HashMap<Cow<'_, str>, Vec<usize>> = HashMap::new();
+        name_to_ix.insert(Cow::Borrowed("cleanup_signal"), vec![0]);
+        let mut counts = vec![0usize];
+        count_identifier_refs(
+            tree.root_node(),
+            source.as_bytes(),
+            &name_to_ix,
+            defs,
+            LangId::Bash,
+            &mut counts,
+        );
+        assert_eq!(
+            counts[0], 2,
+            "bash trap handler 内の関数参照は 2 件カウントされるべき (single+double quoted)"
+        );
+    }
+
+    /// `find_references` (CLI の `astro-sight refs --name`) が bash trap handler
+    /// 内の関数参照を返すこと。Issue #5 で報告された再現を回帰テスト化したもの。
+    #[test]
+    fn bash_trap_handler_resolved_in_find_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("update_server.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/bash\ncleanup_signal() {\n    local sig_exit=$1\n    exit \"${sig_exit}\"\n}\ntrap 'cleanup_signal 130' INT\ntrap 'cleanup_signal 143' TERM\n",
+        )
+        .unwrap();
+
+        let refs = find_references("cleanup_signal", dir.path(), None).unwrap();
+        // 期待: 定義 1 件 + trap 経由参照 2 件
+        let defs: Vec<_> = refs
+            .iter()
+            .filter(|r| r.kind == Some(RefKind::Definition))
+            .collect();
+        let non_defs: Vec<_> = refs
+            .iter()
+            .filter(|r| r.kind != Some(RefKind::Definition))
+            .collect();
+        assert_eq!(defs.len(), 1, "definition should be 1, got refs={refs:?}");
+        assert_eq!(
+            non_defs.len(),
+            2,
+            "trap handler refs should be 2, got refs={refs:?}"
+        );
+    }
+
+    /// 引用なし `trap func SIG` (`word` ノード) は通常の identifier 走査で拾われるため、
+    /// bash_trap_handler_ref_segments 側では二重カウントしないことを検証する。
+    #[test]
+    fn bash_trap_unquoted_word_not_double_counted() {
+        use std::borrow::Cow;
+        use std::collections::HashMap;
+
+        let source = "cleanup() { exit 1; }\ntrap cleanup INT\n";
+        let tree = parser::parse_source(source.as_bytes(), LangId::Bash).expect("parse");
+        let defs = definition_node_kinds(LangId::Bash);
+        let mut name_to_ix: HashMap<Cow<'_, str>, Vec<usize>> = HashMap::new();
+        name_to_ix.insert(Cow::Borrowed("cleanup"), vec![0]);
+        let mut counts = vec![0usize];
+        count_identifier_refs(
+            tree.root_node(),
+            source.as_bytes(),
+            &name_to_ix,
+            defs,
+            LangId::Bash,
+            &mut counts,
+        );
+        // 引用なし `trap cleanup INT` は通常の word 走査で 1 件として拾われる。
+        // bash_trap_handler_ref_segments は raw_string/string のみ対象なので加算しない。
+        assert_eq!(counts[0], 1, "unquoted word must not be double-counted");
     }
 }

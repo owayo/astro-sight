@@ -4700,6 +4700,46 @@ fn go_refs() {
     assert!(!refs.is_empty(), "Server の参照を検出すべき");
 }
 
+/// bash の `trap '<handler>' SIG` 構文の handler 文字列内に書かれた関数呼び出しを
+/// astro-sight が参照として解決すること (Issue #5 / astro-sight-bug-reports#5)。
+#[test]
+fn bash_trap_handler_refs() {
+    let output = cargo_bin()
+        .args([
+            "refs",
+            "--name",
+            "cleanup_signal",
+            "--dir",
+            "tests/fixtures",
+            "--glob",
+            "**/*.sh",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let refs = json["refs"].as_array().expect("refs array");
+    // 期待: 定義 1 件 + trap 経由参照 2 件 + 通常呼び出し 1 件 = 4 件
+    let defs: Vec<&serde_json::Value> = refs.iter().filter(|r| r["kind"] == "def").collect();
+    let non_defs: Vec<&serde_json::Value> = refs.iter().filter(|r| r["kind"] != "def").collect();
+    assert_eq!(defs.len(), 1, "definition 1 件: {refs:?}");
+    assert!(
+        non_defs.len() >= 3,
+        "trap 経由 2 件 + 通常呼出 1 件 で少なくとも 3 件: {refs:?}"
+    );
+    // trap 行 (line 16, 17) の参照を含むこと
+    let trap_refs: Vec<&serde_json::Value> = non_defs
+        .iter()
+        .filter(|r| {
+            let ctx = r["ctx"].as_str().unwrap_or("");
+            ctx.contains("trap")
+        })
+        .copied()
+        .collect();
+    assert_eq!(trap_refs.len(), 2, "trap 構文経由の参照は 2 件: {refs:?}");
+}
+
 // ---- review サブコマンドテスト ----
 
 #[test]

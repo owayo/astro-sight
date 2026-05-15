@@ -1,4 +1,5 @@
 pub mod angular_template_refs;
+pub mod bash_trap_refs;
 pub mod calls;
 pub mod cochange;
 pub mod diff;
