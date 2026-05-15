@@ -1,18 +1,18 @@
-//! Configuration loading and generation.
+//! 設定ファイルの読み込みと生成。
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Main configuration structure.
+/// 実行時に使う設定。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Enable debug logging to file
+    /// デバッグログをファイルに出力するかどうか。
     pub debug: bool,
 
-    /// Path to log directory
+    /// ログディレクトリのパス。
     pub log_path: PathBuf,
 }
 
@@ -25,7 +25,13 @@ impl Default for Config {
     }
 }
 
-/// Default log path: ~/.config/astro-sight/logs
+#[derive(Debug, Deserialize)]
+struct RawConfig {
+    debug: Option<bool>,
+    log_path: Option<PathBuf>,
+}
+
+/// デフォルトのログ出力先: ~/.config/astro-sight/logs
 fn default_log_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -34,7 +40,7 @@ fn default_log_path() -> PathBuf {
         .join("logs")
 }
 
-/// Expand leading `~` or `~/` to the user's home directory.
+/// 先頭の `~` または `~/` をユーザーのホームディレクトリへ展開する。
 fn expand_tilde(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     if s == "~" {
@@ -48,11 +54,11 @@ fn expand_tilde(path: &Path) -> PathBuf {
     }
 }
 
-/// Configuration service.
+/// 設定ファイルの読み書きを扱うサービス。
 pub struct ConfigService;
 
 impl ConfigService {
-    /// Get the default configuration file path.
+    /// デフォルトの設定ファイルパスを返す。
     pub fn default_path() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -61,16 +67,16 @@ impl ConfigService {
             .join("config.toml")
     }
 
-    /// Load configuration from file.
+    /// 設定ファイルを読み込む。
     ///
-    /// If `path` is `None`, uses the default path.
-    /// If the file doesn't exist, returns default configuration.
+    /// `path` が `None` の場合はデフォルトパスを使う。
+    /// ファイルが存在しない場合はデフォルト設定を返す。
     pub fn load(path: Option<&Path>) -> Result<Config> {
         let path = path.map(PathBuf::from).unwrap_or_else(Self::default_path);
         let config_dir = path.parent();
 
         if !path.exists() {
-            // Return defaults — don't auto-create
+            // ファイルは自動生成せず、既定値だけを返す。
             let mut config = Config::default();
             if let Some(dir) = config_dir {
                 config.log_path = dir.join("logs");
@@ -81,28 +87,30 @@ impl ConfigService {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-        let mut config: Config = toml::from_str(&content)
+        let raw: RawConfig = toml::from_str(&content)
             .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
 
-        // If log_path was not explicitly set, use config file's directory/logs
-        if config.log_path == default_log_path()
-            && let Some(dir) = config_dir
-        {
-            config.log_path = dir.join("logs");
-        }
+        // log_path は明示指定と未指定を区別する。値の一致で判定すると、
+        // ユーザーが既定パスを明示した場合に未指定扱いしてしまう。
+        let log_path = match raw.log_path {
+            Some(path) => expand_tilde(&path),
+            None => config_dir
+                .map(|dir| dir.join("logs"))
+                .unwrap_or_else(default_log_path),
+        };
 
-        // Expand ~ in log_path
-        config.log_path = expand_tilde(&config.log_path);
-
-        Ok(config)
+        Ok(Config {
+            debug: raw.debug.unwrap_or(false),
+            log_path,
+        })
     }
 
-    /// Generate default configuration file at the default path.
+    /// デフォルトパスに設定ファイルを生成する。
     pub fn generate_default() -> Result<()> {
         Self::generate_at(&Self::default_path())
     }
 
-    /// Generate default configuration file at the specified path.
+    /// 指定パスに設定ファイルを生成する。
     pub fn generate_at(path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| {
@@ -117,15 +125,15 @@ impl ConfigService {
         Ok(())
     }
 
-    /// Generate default configuration content with comments.
+    /// コメント付きのデフォルト設定内容を生成する。
     fn default_config_content() -> String {
-        r#"# astro-sight configuration file
+        r#"# astro-sight 設定ファイル
 # https://github.com/owayo/astro-sight
 
-# Enable debug logging to file (default: false)
+# デバッグログをファイルに出力する (デフォルト: false)
 debug = false
 
-# Path to log directory (default: ~/.config/astro-sight/logs)
+# ログディレクトリのパス (デフォルト: ~/.config/astro-sight/logs)
 # log_path = "~/.config/astro-sight/logs"
 "#
         .to_string()
@@ -182,9 +190,10 @@ mod tests {
 
         let config = ConfigService::load(Some(&config_path)).unwrap();
 
-        // Should return defaults without creating file
+        // ファイルを作らず既定値だけを返す。
         assert!(!config_path.exists());
         assert!(!config.debug);
+        assert_eq!(config.log_path, dir.path().join("logs"));
     }
 
     #[test]
@@ -230,6 +239,35 @@ mod tests {
         let config = ConfigService::load(Some(&config_path)).unwrap();
         assert!(config.debug);
         assert_eq!(config.log_path, PathBuf::from("/tmp/astro-logs"));
+    }
+
+    #[test]
+    fn test_load_missing_log_path_uses_config_dir_logs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("nested").join("config.toml");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+
+        fs::write(&config_path, "debug = true\n").unwrap();
+
+        let config = ConfigService::load(Some(&config_path)).unwrap();
+        assert_eq!(config.log_path, config_path.parent().unwrap().join("logs"));
+    }
+
+    #[test]
+    fn test_load_explicit_default_log_path_is_respected_for_custom_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("nested").join("config.toml");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let explicit = default_log_path();
+
+        fs::write(
+            &config_path,
+            format!("debug = true\nlog_path = \"{}\"\n", explicit.display()),
+        )
+        .unwrap();
+
+        let config = ConfigService::load(Some(&config_path)).unwrap();
+        assert_eq!(config.log_path, explicit);
     }
 
     #[test]

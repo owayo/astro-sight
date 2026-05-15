@@ -39,6 +39,9 @@ allowed-tools: Bash(astro-sight:*)
 - Need to review an **external patch or rename-aware diff file**? → `astro-sight review --dir . --diff-file <patch>`
 - Need to find **dead (unreferenced) exported symbols**? → `astro-sight dead-code --dir .`
 - Need to find **dead code related to a diff**? → `astro-sight dead-code --dir . --git`
+- About to run more than one structural command? → prefer `session` for mixed commands, `refs --names` for symbol-only batches.
+- Writing the same AST/text policy twice? → use `lint` once with a YAML rule instead of ad-hoc searches.
+- Explaining an impact path or call chain? → use `sequence` after `calls` identifies the target.
 
 **Grep is fine for**: error messages, config values, TODO comments, file path patterns — anything that is NOT a code identifier.
 
@@ -115,6 +118,8 @@ echo '{"command":"refs","name":"Sym1","dir":"."}
 - Need to predict **co-change fallout** before missing a related file? → `astro-sight cochange --dir . --git --base <rev>` (or `--paths <file>`) before guessing from filenames alone
 - Need to explain a non-trivial call path after `calls` identifies the target? → `astro-sight sequence --path <file> --function <name>`
 - Reviewing a multi-commit branch? → pass the same `--base <rev>` to `review`, `context`, or `impact`; `review --git --base <rev>` also uses that base for blame-backed `missing_cochanges`.
+
+Adoption guard: if your plan contains `symbols` + `imports`, `symbols` + `calls`, or `calls` + `sequence`, run them through `astro-sight session` unless you only need one command. This keeps process startup low and makes use of currently underused structural tools.
 
 ## Commands
 

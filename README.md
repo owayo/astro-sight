@@ -594,6 +594,20 @@ compact 出力例（ast/symbols）:
 `--full`/`--pretty` で従来のフルフォーマット（`location`, `language`, `hash`, `range` 等）を出力。
 `version` フィールドは `doctor` と MCP `initialize` 応答のみ。
 
+## Configuration
+
+`astro-sight init` は TOML 形式の設定ファイルを生成する。デフォルトの保存先は `~/.config/astro-sight/config.toml`。
+
+```toml
+# デバッグログをファイルに出力する (デフォルト: false)
+debug = false
+
+# ログディレクトリのパス (デフォルト: ~/.config/astro-sight/logs)
+# log_path = "~/.config/astro-sight/logs"
+```
+
+`log_path` を省略した場合は、読み込んだ config ファイルと同じディレクトリの `logs/` を使う。`--config /path/to/config.toml` でカスタム config を使う場合も同じ。`log_path` を明示した場合は、その値がデフォルトパスと同じでも明示指定として尊重する。
+
 ## Cache
 
 単一ファイル `ast` / `symbols` の compact 出力を BLAKE3 ベースで保存するキャッシュ。ファイルが変更されればハッシュが変わるため自動的に無効化される。
