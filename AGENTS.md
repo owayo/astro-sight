@@ -11,7 +11,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - **NDJSON** ストリーミングセッション対応
 - **スマートコンテキスト**（diff→影響分析、単一/バッチ参照検索は fold/reduce でピーク RSS を抑制、バッチ参照検索 O(N+S)）
 - **AST 応答の巨大行抑制**（`ast` の `text` / `snippet` は 256 文字上限で切り詰め、巨大行で応答が肥大化しない）
-- **MCP サーバーモード**（rmcp 1.6 による stdio JSON-RPC 2.0、ワークスペースサンドボックス、11 ツール）
+- **MCP サーバーモード**（rmcp 1.7 による stdio JSON-RPC 2.0、ワークスペースサンドボックス、11 ツール）
 - **デフォルト compact JSON** 出力（`--pretty` で整形出力）
 - **バッチ処理**（`--paths` / `--paths-file` で複数ファイル NDJSON 出力）
 - **JSON エラー出力**（`{"error":{"code":"...","message":"..."}}` を stdout に出力）
@@ -49,6 +49,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/cache/store.rs` - BLAKE3 ベースのキャッシュ保存（~/.cache/astro-sight/、CLI の `ast` / `symbols` は呼び出し側で path 込みハッシュを渡す）
 - `src/session/mod.rs` - NDJSON セッション処理（生行サイズで100MB上限、相対パスは `ASTRO_SIGHT_WORKSPACE` 基準、空文字・非 UTF-8 を含む `ASTRO_SIGHT_WORKSPACE` の不正値は fail-closed）
 - `src/language.rs` - 言語検出（拡張子/shebang）
+- `tools/usage-stats/src/main.rs` - Claude Code / Codex の利用ログ集計（`astro-sight` はシェル上の実行コマンドとして現れた場合のみ採用数に数え、パス文字列やプロンプト内の言及は除外）
 - `tests/fixtures/` - 多言語テストフィクスチャ（sample.rb, sample.py, sample.go, sample.ts）
 
 ## Review Standards

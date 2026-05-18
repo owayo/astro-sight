@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-// ── Types ──
+// ── 型定義 ──
 
 #[derive(serde::Serialize, Clone)]
 struct ToolDetail {
@@ -95,7 +95,7 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-// ── Parsing ──
+// ── パース ──
 
 const KNOWN_SUBCMDS: &[&str] = &[
     "ast",
@@ -118,14 +118,61 @@ const KNOWN_SUBCMDS: &[&str] = &[
 ];
 
 fn extract_astro_subcmd(cmd: &str) -> Option<&str> {
-    let idx = cmd.find("astro-sight")?;
-    let after = &cmd[idx + "astro-sight".len()..];
+    let after = astro_sight_invocation_args(cmd)?;
     let after = skip_flags(after.trim_start());
     let subcmd = after.split_whitespace().next()?;
     KNOWN_SUBCMDS
         .iter()
         .find(|&&known| known == subcmd)
         .copied()
+}
+
+fn astro_sight_invocation_args(cmd: &str) -> Option<&str> {
+    for segment in cmd.split(&[';', '|'][..]).flat_map(|s| s.split("&&")) {
+        for segment in segment.split("||") {
+            if let Some(args) = astro_sight_invocation_args_in_segment(segment) {
+                return Some(args);
+            }
+        }
+    }
+    None
+}
+
+fn astro_sight_invocation_args_in_segment(segment: &str) -> Option<&str> {
+    let mut s = segment.trim_start();
+    loop {
+        s = skip_env_assignments(s);
+        let (token, rest) = first_token_with_rest(s)?;
+        let command = token.rsplit('/').next().unwrap_or(token);
+        match command {
+            "astro-sight" => return Some(rest),
+            "env" | "command" => s = rest,
+            "time" => s = skip_flags(rest),
+            _ => return None,
+        }
+    }
+}
+
+fn skip_env_assignments(mut s: &str) -> &str {
+    loop {
+        let Some((token, rest)) = first_token_with_rest(s) else {
+            return s.trim_start();
+        };
+        if token.contains('=') && !token.starts_with('=') {
+            s = rest;
+        } else {
+            return s.trim_start();
+        }
+    }
+}
+
+fn first_token_with_rest(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    let end = s.find(char::is_whitespace).unwrap_or(s.len());
+    Some((&s[..end], &s[end..]))
 }
 
 fn skip_flags(s: &str) -> &str {
@@ -146,7 +193,7 @@ fn skip_flags(s: &str) -> &str {
 }
 
 fn is_astro_sight_cmd(cmd: &str) -> bool {
-    cmd.contains("astro-sight") && !cmd.contains("cargo")
+    astro_sight_invocation_args(cmd).is_some()
 }
 
 fn extract_bash_category(cmd: &str) -> String {
@@ -155,7 +202,7 @@ fn extract_bash_category(cmd: &str) -> String {
         return "(empty)".to_string();
     }
 
-    // Skip env var prefixes (e.g., RUST_LOG=debug cargo build)
+    // 環境変数プレフィックスを読み飛ばす (例: RUST_LOG=debug cargo build)
     let mut s = trimmed;
     loop {
         let token = match s.split_whitespace().next() {
@@ -169,7 +216,7 @@ fn extract_bash_category(cmd: &str) -> String {
         }
     }
 
-    // Take first command (before && || ; |)
+    // 複合シェルコマンドでは最初のコマンドだけを分類する
     let first_cmd = s
         .split("&&")
         .next()
@@ -182,7 +229,7 @@ fn extract_bash_category(cmd: &str) -> String {
         .unwrap_or(s)
         .trim();
 
-    // Extract the command name (strip path prefix)
+    // パス付き実行ファイルからコマンド名だけを取り出す
     let cmd_name = match first_cmd.split_whitespace().next() {
         Some(name) => name.rsplit('/').next().unwrap_or(name),
         None => return "(empty)".to_string(),
@@ -191,8 +238,17 @@ fn extract_bash_category(cmd: &str) -> String {
     cmd_name.to_string()
 }
 
+fn extract_astro_cmd_from_args(args: &str) -> Option<String> {
+    let mut args_buf = args.as_bytes().to_vec();
+    if let Ok(args_val) = simd_json::to_borrowed_value(&mut args_buf) {
+        let cmd = args_val.get("cmd").and_then(|c| c.as_str()).unwrap_or(args);
+        return is_astro_sight_cmd(cmd).then(|| cmd.to_string());
+    }
+    is_astro_sight_cmd(args).then(|| args.to_string())
+}
+
 fn extract_user_text(val: &simd_json::BorrowedValue) -> String {
-    // message.content can be a string or array of text blocks
+    // message.content は文字列または text ブロック配列になり得る。
     let content = match val.get("message").and_then(|m| m.get("content")) {
         Some(c) => c,
         None => return String::new(),
@@ -254,7 +310,7 @@ fn process_claude_file(path: &Path, project: &str) -> Stats {
         }
 
         if msg_type == "user" {
-            // Flush previous interaction if it had relevant tools
+            // 関連ツールがあった直前のインタラクションを出力する
             if has_relevant_tool && !current_user_prompt.is_empty() {
                 stats.interactions.push(Interaction {
                     source: source.clone(),
@@ -321,7 +377,7 @@ fn process_claude_file(path: &Path, project: &str) -> Stats {
 
             *stats.total_tool_calls.entry(source.clone()).or_default() += 1;
 
-            // Track Grep details
+            // Grep の詳細を記録する
             if tool_name == "Grep" {
                 let pattern = block
                     .get("input")
@@ -397,7 +453,7 @@ fn process_claude_file(path: &Path, project: &str) -> Stats {
         }
     }
 
-    // Flush last interaction
+    // 最後のインタラクションを出力する
     if has_relevant_tool && !current_user_prompt.is_empty() {
         stats.interactions.push(Interaction {
             source: source.clone(),
@@ -473,9 +529,9 @@ fn process_codex_file(path: &Path, exclude_project: Option<&str>) -> Stats {
             None => continue,
         };
 
-        // Capture user prompt from response_item with role=user
+        // role=user の response_item からユーザープロンプトを取得する
         if item_type == "message" && payload.get("role").and_then(|r| r.as_str()) == Some("user") {
-            // Flush previous
+            // 直前のインタラクションを出力する
             if has_relevant_tool && !current_user_prompt.is_empty() {
                 let proj = if project.is_empty() {
                     "unknown"
@@ -494,7 +550,7 @@ fn process_codex_file(path: &Path, exclude_project: Option<&str>) -> Stats {
             }
             has_relevant_tool = false;
 
-            // Extract text from content array
+            // content 配列から text 要素を抽出する
             let mut text_parts = Vec::new();
             if let Some(arr) = payload.get("content").and_then(|c| c.as_array()) {
                 for block in arr {
@@ -506,7 +562,7 @@ fn process_codex_file(path: &Path, exclude_project: Option<&str>) -> Stats {
                 }
             }
             let joined = text_parts.join(" ");
-            // Skip system/instructions content, only keep actual user input
+            // system / instructions 由来の内容は除き、実際のユーザー入力だけを保持する
             if !joined.contains("AGENTS.md instructions") && !joined.is_empty() {
                 current_user_prompt = truncate(joined.trim(), 200);
             }
@@ -550,7 +606,7 @@ fn process_codex_file(path: &Path, exclude_project: Option<&str>) -> Stats {
             .and_then(|a| a.as_str())
             .unwrap_or("");
 
-        // Track grep/rg and bash category in codex exec_command
+        // codex exec_command 内の grep/rg とシェルコマンド分類を記録する
         if func_name == "exec_command" {
             let mut args_buf = args.as_bytes().to_vec();
             if let Ok(args_val) = simd_json::to_borrowed_value(&mut args_buf) {
@@ -582,23 +638,19 @@ fn process_codex_file(path: &Path, exclude_project: Option<&str>) -> Stats {
             }
         }
 
-        if args.contains("astro-sight") && !args.contains("cargo") {
-            let mut args_buf = args.as_bytes().to_vec();
-            if let Ok(args_val) = simd_json::to_borrowed_value(&mut args_buf) {
-                let cmd = args_val.get("cmd").and_then(|c| c.as_str()).unwrap_or(args);
-                pending_tools.push(ToolDetail {
-                    tool: "astro-sight".to_string(),
-                    detail: truncate(cmd, 200),
-                });
-                has_relevant_tool = true;
-                if let Some(subcmd) = extract_astro_subcmd(cmd) {
-                    *stats
-                        .astro_subcmds
-                        .entry(source.clone())
-                        .or_default()
-                        .entry(subcmd.to_string())
-                        .or_default() += 1;
-                }
+        if let Some(cmd) = extract_astro_cmd_from_args(args) {
+            pending_tools.push(ToolDetail {
+                tool: "astro-sight".to_string(),
+                detail: truncate(&cmd, 200),
+            });
+            has_relevant_tool = true;
+            if let Some(subcmd) = extract_astro_subcmd(&cmd) {
+                *stats
+                    .astro_subcmds
+                    .entry(source.clone())
+                    .or_default()
+                    .entry(subcmd.to_string())
+                    .or_default() += 1;
             }
             if !file_date.is_empty() {
                 *stats.astro_daily.entry(file_date.clone()).or_default() += 1;
@@ -606,7 +658,7 @@ fn process_codex_file(path: &Path, exclude_project: Option<&str>) -> Stats {
         }
     }
 
-    // Flush last
+    // 最後のインタラクションを出力する
     if has_relevant_tool && !current_user_prompt.is_empty() {
         let proj = if project.is_empty() {
             "unknown"
@@ -646,9 +698,9 @@ fn extract_date_from_path(path: &Path) -> String {
     String::new()
 }
 
-// ── File Discovery ──
+// ── ファイル探索 ──
 
-/// Cutoff date (inclusive). None means no filtering.
+/// 集計対象に含める最古日。None の場合は日付で絞り込まない。
 fn cutoff_date(days: Option<u32>) -> Option<NaiveDate> {
     days.map(|d| (Local::now() - Duration::days(i64::from(d) - 1)).date_naive())
 }
@@ -701,7 +753,7 @@ fn find_codex_files(cutoff: Option<NaiveDate>) -> Vec<PathBuf> {
     let base = home.join(".codex/sessions");
 
     if let Some(since) = cutoff {
-        // Collect from each day directory in range
+        // 対象期間に含まれる日別ディレクトリから収集する
         let today = Local::now().date_naive();
         let mut files = Vec::new();
         let mut date = since;
@@ -723,7 +775,7 @@ fn find_codex_files(cutoff: Option<NaiveDate>) -> Vec<PathBuf> {
     }
 }
 
-// ── Display ──
+// ── 表示 ──
 
 fn shorten_project_name(name: &str) -> String {
     let parts: Vec<&str> = name.split('-').collect();
@@ -740,7 +792,7 @@ fn print_summary(stats: &Stats, label: &str) {
     println!("║{}║", title);
     println!("╚{}╝\n", "═".repeat(width));
 
-    // Overview
+    // 概要
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
     table.set_header(vec![
@@ -770,7 +822,7 @@ fn print_summary(stats: &Stats, label: &str) {
     }
     println!("## Overview\n{table}\n");
 
-    // Tool distribution (top 20 per source)
+    // ツール分布 (ソースごとに上位20件)
     for src in &["claude-code", "codex"] {
         if let Some(tools) = stats.tool_counts.get(*src) {
             let mut sorted: Vec<_> = tools.iter().collect();
@@ -799,7 +851,7 @@ fn print_summary(stats: &Stats, label: &str) {
             }
             println!("## Tool Distribution [{src}] (top 20)\n{table}\n");
 
-            // Bash breakdown
+            // Bash 内訳
             if let Some(bash_cmds) = stats.bash_cmd_counts.get(*src) {
                 let mut sorted_cmds: Vec<_> = bash_cmds.iter().collect();
                 sorted_cmds.sort_by(|a, b| b.1.cmp(a.1));
@@ -845,7 +897,7 @@ fn print_summary(stats: &Stats, label: &str) {
         }
     }
 
-    // astro-sight subcommand breakdown
+    // astro-sight サブコマンド内訳
     let has_astro = stats.astro_subcmds.values().any(|m| !m.is_empty());
     if has_astro {
         let mut table = Table::new();
@@ -872,7 +924,7 @@ fn print_summary(stats: &Stats, label: &str) {
         println!("## astro-sight Subcommands\n{table}\n");
     }
 
-    // Daily timeline (recent 30 days)
+    // 日別推移 (直近30日)
     if !stats.astro_daily.is_empty() {
         let mut dates: Vec<_> = stats.astro_daily.iter().collect();
         dates.sort_by(|a, b| a.0.cmp(b.0));
@@ -900,7 +952,7 @@ fn print_summary(stats: &Stats, label: &str) {
         }
         println!("## astro-sight Daily Usage (recent 30 days)\n{table}\n");
 
-        // Weekly summary
+        // 週別サマリー
         let mut weekly: HashMap<String, u64> = HashMap::new();
         for (date_str, count) in &stats.astro_daily {
             if let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
@@ -937,7 +989,7 @@ fn print_summary(stats: &Stats, label: &str) {
         }
     }
 
-    // Top projects
+    // 上位プロジェクト
     for src in &["claude-code", "codex"] {
         if let Some(projects) = stats.project_tool_counts.get(*src) {
             let mut proj_totals: Vec<_> = projects
@@ -977,7 +1029,7 @@ fn print_summary(stats: &Stats, label: &str) {
     }
 }
 
-/// Project name to exclude by default (the tool's own project).
+/// デフォルトで除外するプロジェクト名 (このツール自身のプロジェクト)。
 const SELF_PROJECT: &str = "astro-sight";
 
 struct CliArgs {
@@ -1000,7 +1052,7 @@ fn parse_args() -> CliArgs {
         };
     }
 
-    // --days N or -d N
+    // --days N または -d N
     for (i, arg) in args.iter().enumerate() {
         if (arg == "--days" || arg == "-d")
             && i + 1 < args.len()
@@ -1190,7 +1242,7 @@ fn print_json(stats: &Stats, label: &str) {
         });
     }
 
-    // Subcommands
+    // サブコマンド
     let mut subcommands: HashMap<String, Vec<SubcmdEntry>> = HashMap::new();
     for src in &["claude-code", "codex"] {
         if let Some(subcmds) = stats.astro_subcmds.get(*src) {
@@ -1209,7 +1261,7 @@ fn print_json(stats: &Stats, label: &str) {
         }
     }
 
-    // Daily
+    // 日別
     let mut daily: Vec<DailyEntry> = stats
         .astro_daily
         .iter()
@@ -1220,7 +1272,7 @@ fn print_json(stats: &Stats, label: &str) {
         .collect();
     daily.sort_by(|a, b| a.date.cmp(&b.date));
 
-    // Weekly
+    // 週別
     let mut weekly_map: HashMap<String, u64> = HashMap::new();
     for (date_str, count) in &stats.astro_daily {
         if let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
@@ -1347,6 +1399,35 @@ mod tests {
         assert_eq!(
             extract_astro_subcmd("astro-sight --pretty symbols --dir src"),
             Some("symbols")
+        );
+    }
+
+    #[test]
+    fn extract_astro_subcmd_accepts_env_and_wrappers() {
+        assert_eq!(
+            extract_astro_subcmd("RUST_LOG=debug astro-sight --pretty symbols --dir src"),
+            Some("symbols")
+        );
+        assert_eq!(
+            extract_astro_subcmd("/usr/bin/time -l astro-sight review --dir . --git"),
+            Some("review")
+        );
+        assert_eq!(
+            extract_astro_subcmd("git diff | astro-sight context --dir ."),
+            Some("context")
+        );
+    }
+
+    #[test]
+    fn extract_astro_subcmd_ignores_path_mentions_and_prompts() {
+        assert!(!is_astro_sight_cmd(
+            "sed -n '1,220p' ~/.claude/skills/astro-sight/SKILL.md"
+        ));
+        assert_eq!(
+            extract_astro_subcmd(
+                "codex exec \"please inspect whether astro-sight refs should be used\""
+            ),
+            None
         );
     }
 

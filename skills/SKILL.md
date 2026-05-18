@@ -4,7 +4,7 @@ description: "STOP before using Grep for code identifiers (function/class/variab
 when_to_use: |
   - Searching for any code identifier (function, class, variable, type, constant, method) — use `refs --name` / `refs --names` instead of `Grep`
   - Pipe-separated identifier search like `FOO|Bar|baz` — use `refs --names FOO,Bar,baz --dir .`
-  - Reviewing a diff, PR, or recent changes end-to-end — start with `review --dir . --git`
+  - Reviewing a diff, PR, or recent bug-fix changes end-to-end — start with `review --dir . --git` before lower-level commands
   - Before editing code — run `context --dir . --git` to analyze impact
   - After editing code — run `impact --dir . --git` to detect unresolved impacts
   - Touching exported APIs / public modules — add `dead-code --dir . --git` to detect dead symbols
@@ -23,7 +23,7 @@ allowed-tools: Bash(astro-sight:*)
 
 - Searching for a **function, class, variable, type, constant, or method name**? → `astro-sight refs` (NOT Grep)
 - Searching with **pipe-separated identifiers** like `FOO|Bar|baz`? → `astro-sight refs --names FOO,Bar,baz --dir .` (NOT Grep)
-- Asked to **review a diff / PR / recent changes end-to-end**? → `astro-sight review --dir . --git`
+- Asked to **review a diff / PR / recent bug-fix changes end-to-end**? → `astro-sight review --dir . --git` before lower-level commands
 - Need to **understand a file's structure** (functions, classes, structs)? → `astro-sight symbols --path <file>`
 - Need to **understand a directory's structure**? → `astro-sight symbols --dir <dir>`
 - Need to inspect the **exact syntax node at a cursor/range** or debug a parse error? → `astro-sight ast`
@@ -94,7 +94,7 @@ echo '{"command":"refs","name":"Sym1","dir":"."}
 
 ## Review-First Workflow
 
-- Reviewing a diff or PR? Start with `astro-sight review --dir . --git` before splitting into `context`, `impact`, `dead-code`, or `cochange`.
+- Reviewing a diff, PR, or bug-fix branch? Start with `astro-sight review --dir . --git` before splitting into `context`, `impact`, `dead-code`, or `cochange`.
 - Editing code? Run `astro-sight context --dir . --git` first, then `astro-sight impact --dir . --git` after the edit.
 - Touching exported APIs or public modules? Add `astro-sight dead-code --dir . --git` before concluding the change.
 - Repeating the same structural review policy across files? Reach for `astro-sight lint` instead of ad-hoc text search.

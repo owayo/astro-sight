@@ -637,6 +637,15 @@ astro-sight skill-install codex
 登録後は「コールグラフを調べて」「この関数の呼び出し元は？」「diff の影響範囲は？」等の質問で自動的に起動します。
 PR や patch 全体をまとめて見たい場合は、`astro-sight review --dir . --git` まで含めて指示すると一括レビューに入りやすくなります。
 
+### 利用状況の分析
+
+`tools/usage-stats` は Claude Code / Codex の利用ログから astro-sight 採用率とサブコマンド分布を集計する補助ツールです。
+`astro-sight` はシェル上の実行コマンドとして現れた場合だけ採用数に数え、`/skills/astro-sight/SKILL.md` のようなパス文字列やプロンプト内の言及は除外します。
+
+```bash
+cargo run --manifest-path tools/usage-stats/Cargo.toml -- --json --days 1
+```
+
 ### CLAUDE.md/AGENTS.md に追記して確実に使わせる
 
 スキルだけでは Claude Code/Codex が Grep/Read にフォールバックすることがあります。
