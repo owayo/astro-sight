@@ -6761,6 +6761,155 @@ class SampleLogEntityTest {
     }
 }
 
+/// PHP の `ClassName::method()` 形式の cross-file 静的呼び出し
+/// (`scoped_call_expression`) と同一クラス内の `self::method()` / `static::method()` を
+/// dead-code 検出が usage として認識し、PHPUnit テストクラス内の helper が `dead_symbols`
+/// にも `test_only_symbols` にも漏れないことを確認する。
+///
+/// Laravel 風の `test/.../FixtureTest.php` 内 `vo*` helper が
+/// `FixtureControllerTest.php` から `FixtureTest::voXxx()` で呼ばれる構造を最小再現する。
+#[test]
+fn dead_code_php_cross_file_scoped_static_call_keeps_phpunit_helper_alive() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("test/Acme/Models/Fixture/Controllers")).unwrap();
+    // 定義側: PHPUnit テストクラス内に public static helper を並べる。
+    // 同一クラス内では self:: / static:: で互いを参照する。
+    std::fs::write(
+        root.join("test/Acme/Models/Fixture/FixtureTest.php"),
+        r#"<?php
+namespace Acme\Tests\Models\Fixture;
+
+class FixtureTest {
+    public static function voPhoneNumberPrefix(): string {
+        return self::voPhoneNumberPrefix2();
+    }
+
+    public static function voPhoneNumberPrefix2(): string {
+        return static::voRecording();
+    }
+
+    public static function voRecording(): string {
+        return 'rec';
+    }
+
+    public static function voAgc(): string {
+        return 'agc';
+    }
+}
+"#,
+    )
+    .unwrap();
+    // 参照側: 別ディレクトリの別 PHPUnit テストクラスから cross-file で
+    // `FixtureTest::voXxx()` を呼ぶ (scoped_call_expression)。
+    std::fs::write(
+        root.join("test/Acme/Models/Fixture/Controllers/FixtureControllerTest.php"),
+        r#"<?php
+namespace Acme\Tests\Models\Fixture\Controllers;
+
+use Acme\Tests\Models\Fixture\FixtureTest;
+
+class FixtureControllerTest {
+    public function testRouting(): void {
+        $phone = FixtureTest::voPhoneNumberPrefix();
+        $rec = FixtureTest::voRecording();
+        $agc = FixtureTest::voAgc();
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--include-tests",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+
+    let dead_names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let test_only_names: Vec<String> = json["test_only_symbols"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for sym in [
+        "FixtureTest.voPhoneNumberPrefix",
+        "FixtureTest.voPhoneNumberPrefix2",
+        "FixtureTest.voRecording",
+        "FixtureTest.voAgc",
+    ] {
+        assert!(
+            !dead_names.iter().any(|n| n == sym),
+            "{sym} は cross-file `FixtureTest::method()` と self::/static:: 参照があるので dead_symbols に出ないこと: dead={dead_names:?}"
+        );
+        assert!(
+            !test_only_names.iter().any(|n| n == sym),
+            "{sym} は PHPUnit container 内 helper として test_only_symbols からも除外されること: test_only={test_only_names:?}"
+        );
+    }
+}
+
+/// GitLab issue #7 補助テスト: `refs --name` で PHP の `ClassName::method()` 形式の
+/// cross-file 呼び出しが `kind: "ref"` として返ることを確認する。
+/// dead-code の usage 集計はこの refs 経路 (count_non_definition_refs_split → count_refs_in_file)
+/// と同じ AST 走査で行われるため、ここが ref として認識されることが
+/// dead 誤検出回避の前提条件。
+#[test]
+fn refs_php_cross_file_scoped_static_call_is_detected_as_ref() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("AHelper.php"),
+        "<?php\nclass AHelper {\n    public static function voFoo(): string { return 'foo'; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("BConsumer.php"),
+        "<?php\nclass BConsumer {\n    public function doSomething(): void { $x = AHelper::voFoo(); echo $x; }\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["refs", "--name", "voFoo", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let refs = json["refs"].as_array().expect("refs array");
+    let cross_file_refs: Vec<&serde_json::Value> = refs
+        .iter()
+        .filter(|r| {
+            r["kind"].as_str() == Some("ref")
+                && r["path"]
+                    .as_str()
+                    .is_some_and(|p| p.ends_with("BConsumer.php"))
+        })
+        .collect();
+    assert_eq!(
+        cross_file_refs.len(),
+        1,
+        "BConsumer.php からの `AHelper::voFoo()` は 1 件の ref として検出されるべき: refs={refs:?}"
+    );
+}
+
 #[test]
 fn dead_code_python_unittest_conventions_excluded() {
     // Python unittest の規約 (`unittest.TestCase` 派生クラスとそのテストメソッド、
