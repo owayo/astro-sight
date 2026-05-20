@@ -580,6 +580,128 @@ pub fn is_js_ts_framework_dsl_callback(root: Node, source: &[u8], symbol_range: 
     FRAMEWORK_DSL_CALLEES.contains(&text)
 }
 
+/// Angular の class method lifecycle hook 名集合 (Angular v17+ 公式 docs 準拠)。
+///
+/// これらは Angular ランタイムが change detection サイクル等で自動呼出するため、
+/// ユーザコード側に直接の caller が静的解析で見つからないのが正常。
+/// `implements OnInit` 等の interface 実装は Angular の呼出規約では不要なため
+/// 判定材料にしない (Angular はメソッド名 + class decorator で hook を解決する)。
+///
+/// `afterNextRender` / `afterEveryRender` は standalone callback API で
+/// クラスメソッドの lifecycle hook ではないため対象外。
+const ANGULAR_LIFECYCLE_HOOKS: &[&str] = &[
+    "ngOnChanges",
+    "ngOnInit",
+    "ngDoCheck",
+    "ngAfterContentInit",
+    "ngAfterContentChecked",
+    "ngAfterViewInit",
+    "ngAfterViewChecked",
+    "ngOnDestroy",
+];
+
+/// `symbol_range` の method が Angular `@Component` / `@Directive` 装飾クラスの
+/// lifecycle hook かを判定する。
+///
+/// 判定:
+/// 1. メソッド名が [`ANGULAR_LIFECYCLE_HOOKS`] のいずれかに一致
+/// 2. enclosing `class_declaration` に `@Component` または `@Directive` decorator が付与されている
+///
+/// dead-code 検出側で `exclude_framework_entrypoints == true` のとき除外対象に使う想定。
+pub fn is_js_ts_angular_lifecycle_hook(root: Node, source: &[u8], symbol_range: &Range) -> bool {
+    let start = tree_sitter::Point {
+        row: symbol_range.start.line,
+        column: symbol_range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: symbol_range.end.line,
+        column: symbol_range.end.column,
+    };
+    let Some(node) = root.descendant_for_point_range(start, end) else {
+        return false;
+    };
+
+    // method_definition を探す
+    let mut cur = node;
+    let method_node = loop {
+        if cur.kind() == "method_definition" {
+            break cur;
+        }
+        match cur.parent() {
+            Some(p) => cur = p,
+            None => return false,
+        }
+    };
+
+    // メソッド名チェック
+    let Some(name_node) = method_node.child_by_field_name("name") else {
+        return false;
+    };
+    let Ok(name) = name_node.utf8_text(source) else {
+        return false;
+    };
+    if !ANGULAR_LIFECYCLE_HOOKS.contains(&name) {
+        return false;
+    }
+
+    // enclosing class_declaration を探し、@Component / @Directive decorator を確認
+    let mut cur = method_node;
+    while let Some(parent) = cur.parent() {
+        if parent.kind() == "class_declaration" {
+            return class_has_component_or_directive_decorator(parent, source);
+        }
+        cur = parent;
+    }
+    false
+}
+
+/// `class_declaration` ノードに `@Component` / `@Directive` decorator が付与されているかを判定する。
+///
+/// tree-sitter-typescript の AST では decorator は class_declaration の sibling として
+/// **直前** に並ぶ (export 文の中では export_statement の子)。class_declaration の親を
+/// 走査して周辺の decorator ノードを確認する。
+fn class_has_component_or_directive_decorator(class_node: Node, source: &[u8]) -> bool {
+    const ANGULAR_DECORATORS: &[&str] = &["Component", "Directive"];
+
+    // class_declaration の前方兄弟と export_statement 経由の decorator の両方を見る
+    let containers: [Node; 2] = match class_node.parent() {
+        Some(parent) => [parent, class_node],
+        None => [class_node, class_node],
+    };
+    for container in &containers {
+        let mut cursor = container.walk();
+        for child in container.children(&mut cursor) {
+            if child.kind() != "decorator" {
+                continue;
+            }
+            // decorator の中身: `@Foo(...)` の `Foo` 部分が identifier として現れる
+            let mut dcursor = child.walk();
+            for dchild in child.children(&mut dcursor) {
+                // call_expression / identifier いずれにも対応
+                match dchild.kind() {
+                    "identifier" => {
+                        if let Ok(name) = dchild.utf8_text(source)
+                            && ANGULAR_DECORATORS.contains(&name)
+                        {
+                            return true;
+                        }
+                    }
+                    "call_expression" => {
+                        if let Some(callee) = dchild.child_by_field_name("function")
+                            && let Ok(name) = callee.utf8_text(source)
+                            && ANGULAR_DECORATORS.contains(&name)
+                        {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
+}
+
 /// その他: `pytest.mark.<anything>` プレフィックスを pytest test marker として認識。
 pub fn has_framework_entrypoint_decorator_python(
     root: Node,
@@ -2663,5 +2785,109 @@ export default defineContentScript({
         assert!(check_js_ts_dsl_callback(src, LangId::Typescript, "main"));
         // helper は対象外 (内部 function は dead 判定の余地を残す)
         assert!(!check_js_ts_dsl_callback(src, LangId::Typescript, "helper"));
+    }
+
+    // --- is_js_ts_angular_lifecycle_hook テスト ---
+
+    fn check_angular_lifecycle_hook(source: &str, symbol_name: &str) -> bool {
+        let language = LangId::Typescript.ts_language();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+
+        let syms = extract_symbols(root, source.as_bytes(), LangId::Typescript).unwrap();
+        let sym = syms
+            .iter()
+            .find(|s| s.name == symbol_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "symbol '{}' not found in {:?}",
+                    symbol_name,
+                    syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            });
+        is_js_ts_angular_lifecycle_hook(root, source.as_bytes(), &sym.range)
+    }
+
+    /// GitLab issue #8 再現: `@Component` 装飾クラスの `ngAfterViewChecked` は除外対象。
+    #[test]
+    fn angular_component_lifecycle_hook_is_detected() {
+        let src = r#"
+import { Component } from '@angular/core';
+
+@Component({
+    template: '<div>example</div>',
+})
+export class MinimalComponent {
+    public ngAfterViewChecked(): void {
+    }
+}
+"#;
+        assert!(check_angular_lifecycle_hook(src, "ngAfterViewChecked"));
+    }
+
+    /// `@Directive` 装飾クラスの lifecycle hook も除外対象。
+    #[test]
+    fn angular_directive_lifecycle_hook_is_detected() {
+        let src = r#"
+import { Directive } from '@angular/core';
+
+@Directive({ selector: '[appFoo]' })
+export class FooDirective {
+    public ngOnInit(): void {}
+    public ngOnDestroy(): void {}
+}
+"#;
+        assert!(check_angular_lifecycle_hook(src, "ngOnInit"));
+        assert!(check_angular_lifecycle_hook(src, "ngOnDestroy"));
+    }
+
+    /// `implements AfterViewChecked` 等の interface 実装が省略されていても、Angular の
+    /// 呼出規約は decorator + メソッド名で成立する。
+    #[test]
+    fn angular_lifecycle_hook_detected_without_interface_implementation() {
+        let src = r#"
+@Component({ template: '' })
+class WithoutInterface {
+    ngAfterViewChecked() {}
+}
+"#;
+        assert!(check_angular_lifecycle_hook(src, "ngAfterViewChecked"));
+    }
+
+    /// `@Component` / `@Directive` のいずれも持たないクラスのメソッドは Angular hook 扱いしない。
+    #[test]
+    fn non_angular_class_with_same_method_name_not_detected() {
+        let src = r#"
+class PlainClass {
+    ngAfterViewChecked(): void {}
+}
+"#;
+        assert!(!check_angular_lifecycle_hook(src, "ngAfterViewChecked"));
+    }
+
+    /// `@Injectable` 等の他の Angular decorator は対象外 (lifecycle hook を持たないため)。
+    #[test]
+    fn angular_injectable_class_method_not_detected() {
+        let src = r#"
+@Injectable({ providedIn: 'root' })
+class FooService {
+    ngOnInit(): void {}
+}
+"#;
+        assert!(!check_angular_lifecycle_hook(src, "ngOnInit"));
+    }
+
+    /// Angular lifecycle hook 名以外のメソッド (custom method) は除外対象外。
+    #[test]
+    fn angular_component_non_lifecycle_method_not_detected() {
+        let src = r#"
+@Component({ template: '' })
+class Foo {
+    public regularMethod(): void {}
+}
+"#;
+        assert!(!check_angular_lifecycle_hook(src, "regularMethod"));
     }
 }

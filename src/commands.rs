@@ -2568,6 +2568,24 @@ fn filter_exported_symbols(
         {
             continue;
         }
+        // Angular `@Component` / `@Directive` 装飾クラスの lifecycle hook メソッド
+        // (`ngOnInit` / `ngAfterViewChecked` 等) は Angular ランタイムが change detection
+        // サイクルで自動呼出するため、ユーザコード側に直接の caller が静的解析で見えない。
+        // `implements AfterViewChecked` 等の interface 実装は Angular の呼出規約では
+        // 不要なため判定材料にしない (Angular はメソッド名 + class decorator で hook を解決)。
+        // GitLab issue #8 対応。
+        if exclude_framework_entrypoints
+            && matches!(
+                lang_id,
+                crate::language::LangId::Typescript
+                    | crate::language::LangId::Tsx
+                    | crate::language::LangId::Javascript
+            )
+            && matches!(sym.kind, SymbolKind::Method)
+            && crate::engine::symbols::is_js_ts_angular_lifecycle_hook(root, source, &sym.range)
+        {
+            continue;
+        }
         // unittest / pytest のテスト規約シンボル。Python 限定。
         // `class Foo(unittest.TestCase):` 派生クラスとそのメソッド (`test_*`,
         // `setUp` 等)、`test_*.py` / `*_test.py` のトップレベル `test_*` 関数、
@@ -5267,6 +5285,115 @@ export class InlineComponent {
             names.iter().any(|n| n.ends_with("reallyUnusedInline")),
             "inline template からも参照されない method は dead として検出されるべき。got: {names:?}"
         );
+    }
+
+    /// GitLab issue #8 再現: `@Component` / `@Directive` 装飾クラスの Angular ライフサイクル
+    /// フック (`ngAfterViewChecked` 等) は Angular ランタイムが change detection サイクルで
+    /// 自動呼出するため、静的解析で caller が見つからなくても dead 判定しない。
+    #[test]
+    fn detect_dead_excludes_angular_component_lifecycle_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        fs::write(repo.join("angular.json"), "{}").expect("write angular.json");
+
+        let component_ts = r#"
+import { Component } from '@angular/core';
+
+@Component({
+    template: '<div>example</div>',
+})
+export class MinimalComponent {
+    public ngOnInit(): void {}
+    public ngAfterViewChecked(): void {}
+    public ngOnDestroy(): void {}
+
+    public reallyUnused(): void {}
+}
+"#;
+        fs::write(repo.join("minimal.component.ts"), component_ts).expect("write ts");
+
+        let files = vec![repo.join("minimal.component.ts")];
+        let (dead, _test_only) =
+            detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
+        let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+
+        for hook in ["ngOnInit", "ngAfterViewChecked", "ngOnDestroy"] {
+            assert!(
+                !names.iter().any(|n| n.ends_with(hook)),
+                "Angular @Component の lifecycle hook {hook} は dead から除外されるべき。got: {names:?}"
+            );
+        }
+        assert!(
+            names.iter().any(|n| n.ends_with("reallyUnused")),
+            "Angular component の lifecycle hook 以外の未参照 method は引き続き dead として検出されるべき。got: {names:?}"
+        );
+    }
+
+    /// `@Directive` 装飾クラスでも lifecycle hook を dead から除外する。
+    #[test]
+    fn detect_dead_excludes_angular_directive_lifecycle_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        fs::write(repo.join("angular.json"), "{}").expect("write angular.json");
+
+        let directive_ts = r#"
+import { Directive } from '@angular/core';
+
+@Directive({ selector: '[appFoo]' })
+export class FooDirective {
+    public ngOnInit(): void {}
+    public ngOnChanges(): void {}
+}
+"#;
+        fs::write(repo.join("foo.directive.ts"), directive_ts).expect("write ts");
+
+        let files = vec![repo.join("foo.directive.ts")];
+        let (dead, _test_only) =
+            detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
+        let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+
+        for hook in ["ngOnInit", "ngOnChanges"] {
+            assert!(
+                !names.iter().any(|n| n.ends_with(hook)),
+                "Angular @Directive の lifecycle hook {hook} は dead から除外されるべき。got: {names:?}"
+            );
+        }
+    }
+
+    /// `@Component` / `@Directive` のいずれも持たないクラスで同名メソッドを定義した場合は
+    /// dead から除外せず引き続き検出対象とする (誤除外の防止)。
+    #[test]
+    fn detect_dead_keeps_non_angular_class_methods_with_lifecycle_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        // Angular プロジェクトとして認識されるよう angular.json を置く (誤除外の境界確認)
+        fs::write(repo.join("angular.json"), "{}").expect("write angular.json");
+
+        let plain_ts = r#"
+export class PlainClass {
+    public ngOnInit(): void {}
+    public ngAfterViewChecked(): void {}
+}
+"#;
+        fs::write(repo.join("plain.ts"), plain_ts).expect("write ts");
+
+        let files = vec![repo.join("plain.ts")];
+        let (dead, _test_only) =
+            detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
+        let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+
+        for hook in ["ngOnInit", "ngAfterViewChecked"] {
+            assert!(
+                names.iter().any(|n| n.ends_with(hook)),
+                "@Component / @Directive を持たないクラスの {hook} は引き続き dead として検出されるべき。got: {names:?}"
+            );
+        }
     }
 
     /// 非 Angular プロジェクトでは `.html` ファイルを参照源としてスキャンしない
