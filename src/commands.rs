@@ -1817,6 +1817,21 @@ fn detect_api_changes(
             }
         }
 
+        // Rust bin-only crate (`[[bin]]` のみで `[lib]` も `src/lib.rs` も持たない) の
+        // `pub fn` シグネチャ変更は外部公開 API の互換性問題ではなく内部リファクタ。
+        // `api.add` / `api.rm` 側と対称に `api.mod` 側でも除外する
+        // (Issue 2026-05-20-api-mod-callers-updated-in-same-commit 対応)。
+        //
+        // 同コミットで lib → bin / bin → lib に crate type を変えた edge ケースは
+        // どちらかが bin-only と判定された時点で「外部 API 面の変更ではない」と扱う方が
+        // false positive を減らせる (codex 設計相談で「old または new のどちらかが
+        // bin-only なら api.mod から除外」が筋良いと判定)。
+        let is_binary_rust_old_crate_for_mod =
+            is_binary_only_rust_crate_at_base(dir, base, &df.old_path);
+        let is_binary_rust_new_crate_for_mod = is_binary_only_rust_crate(dir, &df.new_path);
+        let skip_mod_for_binary_crate =
+            is_binary_rust_old_crate_for_mod || is_binary_rust_new_crate_for_mod;
+
         // 同一 (file, qualname) の modified を重複排除するためのキーセット
         let mut seen_modified: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
@@ -1825,6 +1840,9 @@ fn detect_api_changes(
                 && old_sig != &new_sig.as_str()
                 && seen_modified.insert((df.new_path.clone(), name.clone()))
             {
+                if skip_mod_for_binary_crate {
+                    continue;
+                }
                 // closed-in-diff: 同一ファイル内でしか呼ばれていない関数のシグネチャ変更は
                 // caller の追随が同一 diff 内で完結するため、api.mod から除外する。
                 // bash エントリポイントのローカル関数や Python CLI スクリプト内部関数の
@@ -6991,6 +7009,248 @@ pub fn unused_helper() -> u32 { 42 }
         assert!(
             !removed.iter().any(|n| n.ends_with("unused_helper")),
             "binary crate のファイル丸ごと削除に含まれる pub fn は api.rm に出してはならない。got: {removed:?}"
+        );
+    }
+
+    /// 2026-05-20 レポート再現: bin-only crate の `pub fn` シグネチャ変更は外部公開 API の
+    /// 互換性問題ではなく内部リファクタなので、`api.mod` 対象外にする (api.add / api.rm と
+    /// 対称な動作)。同コミットで caller も更新済みのケース。
+    #[test]
+    fn detect_api_changes_binary_rust_crate_excludes_pub_method_signature_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let cargo_toml = "\
+[package]
+name = \"demo-bin\"
+version = \"0.1.0\"
+edition = \"2021\"
+
+[dependencies]
+";
+        let store_before = "\
+pub struct CredentialStore;
+
+impl CredentialStore {
+    pub fn get_or_prompt(&mut self, _group: &str, _user: &str, _hint: &str) -> Result<&str, String> {
+        Ok(\"password\")
+    }
+}
+";
+        let main_before = "\
+fn main() {
+    use crate::store::CredentialStore;
+    let mut s = CredentialStore;
+    let _ = s.get_or_prompt(\"g\", \"u\", \"h\");
+}
+
+mod store;
+";
+        git_commit_files(
+            repo,
+            &[
+                ("Cargo.toml", cargo_toml),
+                ("src/store.rs", store_before),
+                ("src/main.rs", main_before),
+            ],
+            "initial",
+        );
+
+        // シグネチャ変更: 戻り値を `&str` → `(&str, &str)` に拡張、caller も同コミットで追随
+        let store_after = "\
+pub struct CredentialStore;
+
+impl CredentialStore {
+    pub fn get_or_prompt(&mut self, _group: &str, _default_user: &str, _hint: &str) -> Result<(&str, &str), String> {
+        Ok((\"user\", \"password\"))
+    }
+}
+";
+        let main_after = "\
+fn main() {
+    use crate::store::CredentialStore;
+    let mut s = CredentialStore;
+    let _ = s.get_or_prompt(\"g\", \"u\", \"h\");
+}
+
+mod store;
+";
+        fs::write(repo.join("src/store.rs"), store_after).expect("write store");
+        fs::write(repo.join("src/main.rs"), main_after).expect("write main");
+
+        let diff_files = vec![
+            crate::models::impact::DiffFile {
+                old_path: "src/store.rs".to_string(),
+                new_path: "src/store.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 7,
+                    new_start: 1,
+                    new_count: 7,
+                }],
+                deleted_old_source: None,
+            },
+            crate::models::impact::DiffFile {
+                old_path: "src/main.rs".to_string(),
+                new_path: "src/main.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 7,
+                    new_start: 1,
+                    new_count: 7,
+                }],
+                deleted_old_source: None,
+            },
+        ];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let modified: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !modified.iter().any(|n| n.ends_with("get_or_prompt")),
+            "binary crate の pub method シグネチャ変更は api.mod に出してはならない。got: {modified:?}"
+        );
+    }
+
+    /// library crate (src/lib.rs あり) の pub fn シグネチャ変更は引き続き `api.mod` に残る。
+    /// binary crate 判定の副作用で library crate まで抑止しないことを保証する。
+    #[test]
+    fn detect_api_changes_library_rust_crate_keeps_pub_signature_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let cargo_toml = "\
+[package]
+name = \"demo-lib\"
+version = \"0.1.0\"
+edition = \"2021\"
+";
+        let lib_before = "pub mod api;\n";
+        let api_before = "\
+pub fn legacy_call(_x: u32) -> u32 { 0 }
+";
+        git_commit_files(
+            repo,
+            &[
+                ("Cargo.toml", cargo_toml),
+                ("src/lib.rs", lib_before),
+                ("src/api.rs", api_before),
+            ],
+            "initial",
+        );
+
+        // シグネチャ変更: 引数追加
+        let api_after = "\
+pub fn legacy_call(_x: u32, _y: u32) -> u32 { 0 }
+";
+        fs::write(repo.join("src/api.rs"), api_after).expect("write api");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/api.rs".to_string(),
+            new_path: "src/api.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let modified: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            modified.iter().any(|n| n.ends_with("legacy_call")),
+            "library crate の pub fn シグネチャ変更は引き続き api.mod に残るべき。got: {modified:?}"
+        );
+    }
+
+    /// base 時点で library crate だったが、新ツリーで `src/lib.rs` を削除して
+    /// シグネチャ変更を行ったケース。`api.mod` は「旧版でも新版でも外部公開 API だった
+    /// symbol」を対象にすべきなので、旧側基準で library 扱いとなり、新側で bin-only
+    /// になっていても旧公開 API のシグネチャ変更は api.mod から除外する
+    /// (codex 設計相談で「old または new のどちらかが bin-only なら除外」採用)。
+    #[test]
+    fn detect_api_changes_lib_to_bin_transition_excludes_pub_signature_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let cargo_toml = "\
+[package]
+name = \"was-lib-now-bin\"
+version = \"0.1.0\"
+edition = \"2021\"
+";
+        let lib_before = "pub mod api;\n";
+        let api_before = "pub fn frob(_x: u32) -> u32 { 0 }\n";
+        git_commit_files(
+            repo,
+            &[
+                ("Cargo.toml", cargo_toml),
+                ("src/lib.rs", lib_before),
+                ("src/api.rs", api_before),
+            ],
+            "initial",
+        );
+
+        // 新ツリーで src/lib.rs を削除 + シグネチャ変更
+        std::fs::remove_file(repo.join("src/lib.rs")).expect("rm lib.rs");
+        fs::write(
+            repo.join("src/api.rs"),
+            "pub fn frob(_x: u32, _y: u32) -> u32 { 0 }\n",
+        )
+        .expect("write api");
+
+        let diff_files = vec![
+            crate::models::impact::DiffFile {
+                old_path: "src/lib.rs".to_string(),
+                new_path: "/dev/null".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 1,
+                    new_start: 0,
+                    new_count: 0,
+                }],
+                deleted_old_source: Some(lib_before.as_bytes().to_vec()),
+            },
+            crate::models::impact::DiffFile {
+                old_path: "src/api.rs".to_string(),
+                new_path: "src/api.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 1,
+                    new_start: 1,
+                    new_count: 1,
+                }],
+                deleted_old_source: None,
+            },
+        ];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let modified: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !modified.iter().any(|n| n.ends_with("frob")),
+            "lib → bin 化 + シグネチャ変更のケースは api.mod に出さない (crate target 変更として扱う)。got: {modified:?}"
         );
     }
 
