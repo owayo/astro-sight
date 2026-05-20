@@ -5823,6 +5823,206 @@ fn dead_code_framework_nextjs_excludes_app_and_pages_routes() {
     );
 }
 
+/// `--framework` 未指定でも `package.json` の `dependencies.next` を検出して nextjs
+/// プリセットを自動適用する。Issue 2026-05-20 で 3 回再発した `app/**/page.tsx` の
+/// default export が dead 判定される問題への対応。
+#[test]
+fn dead_code_auto_detect_nextjs_from_package_json_dependencies() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("src/app/(authenticated)/admin")).unwrap();
+    std::fs::create_dir_all(root.join("src/services")).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "demo", "dependencies": { "next": "^15.0.0", "react": "^19.0.0" } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/app/(authenticated)/admin/page.tsx"),
+        "export default function AdminPage() { return null; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/services/orphan.ts"),
+        "export function unusedService() { return 1; }\n",
+    )
+    .unwrap();
+
+    // --framework 指定なし: package.json の next 依存から自動的に nextjs プリセット適用
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+
+    assert!(
+        !names.iter().any(|n| n == "AdminPage"),
+        "package.json に next 依存があれば --framework 未指定でも AdminPage は除外されるべき: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "unusedService"),
+        "src/services/ 配下は auto-detect でも dead 判定される (誤除外しない): {names:?}"
+    );
+}
+
+/// `devDependencies` 経由の `next` 依存も自動検出対象に含める (Next.js は通常
+/// dependencies に置かれるが、SSG 専用や CLI tooling として dev に置くプロジェクトもある)。
+#[test]
+fn dead_code_auto_detect_nextjs_from_package_json_dev_dependencies() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("app")).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "demo", "devDependencies": { "next": "^15.0.0" } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("app/page.tsx"),
+        "export default function HomePage() { return null; }\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !names.iter().any(|n| n == "HomePage"),
+        "devDependencies.next からも自動検出されるべき: {names:?}"
+    );
+}
+
+/// `package.json` が無いプロジェクトでは auto-detect は発動せず、`app/**/page.tsx` の
+/// default export は dead 判定のまま残る (誤検出しない方向への保守的フォールバック)。
+#[test]
+fn dead_code_auto_detect_skipped_without_package_json() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("src/app")).unwrap();
+    std::fs::write(
+        root.join("src/app/page.tsx"),
+        "export default function NotNextPage() { return null; }\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "NotNextPage"),
+        "package.json が無ければ auto-detect は発動せず、page.tsx の default export は dead 判定のまま: {names:?}"
+    );
+}
+
+/// `peerDependencies` / `optionalDependencies` 経由の `next` は誤爆しやすいため
+/// auto-detect の対象外とする (Next.js ライブラリやテスト fixture 対策)。
+#[test]
+fn dead_code_auto_detect_ignores_peer_dependencies_next() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("src/app")).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "next-helper-lib", "peerDependencies": { "next": ">=13" } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/app/page.tsx"),
+        "export default function PeerOnlyPage() { return null; }\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "PeerOnlyPage"),
+        "peerDependencies のみの next は auto-detect 対象外。page.tsx の default export は dead 判定のまま: {names:?}"
+    );
+}
+
+/// `--framework laravel` 明示指定時は package.json の next 依存があっても nextjs
+/// auto-detect は発動しない (明示指定が常に優先)。
+#[test]
+fn dead_code_explicit_framework_overrides_auto_detect() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("src/app")).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "demo", "dependencies": { "next": "^15.0.0" } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/app/page.tsx"),
+        "export default function OverriddenPage() { return null; }\n",
+    )
+    .unwrap();
+
+    // --framework laravel を明示指定 → next auto-detect は発動せず page.tsx は dead 判定のまま
+    let output = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--framework",
+            "laravel",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "OverriddenPage"),
+        "--framework laravel 明示指定時は nextjs auto-detect が発動しない (明示指定が常に優先): {names:?}"
+    );
+}
+
 #[test]
 fn dead_code_exclude_glob_and_exclude_dir_drop_targets() {
     // --exclude-glob 'app/Legacy/**' と --exclude-dir custom_dir で

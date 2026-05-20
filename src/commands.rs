@@ -952,7 +952,8 @@ pub fn cmd_review(
     extra_exclude_globs: &[String],
 ) -> Result<()> {
     // framework 指定は早期に検証して未知名はここで弾く (dead_symbols 検出に到達する前に)。
-    let framework_globs = resolve_framework_globs(framework)?;
+    // 未指定時は package.json から next 依存を検出して nextjs プリセットを自動適用する。
+    let framework_globs = resolve_framework_globs_with_auto_detect(framework, dir)?;
     // 1. diff 取得（context コマンドと同じ入力方式）
     let diff_input = if let Some(d) = diff {
         d.to_string()
@@ -3216,6 +3217,50 @@ const NEXTJS_PRESET_EXCLUDE_GLOBS: &[&str] = &[
     "**/instrumentation.{js,ts}",
 ];
 
+/// `resolve_framework_globs` の auto-detect 対応版。
+///
+/// 呼び出し側で `framework` が明示指定されていれば従来通り `resolve_framework_globs` に
+/// 委譲する。未指定の場合は `dir` 直下の `package.json` を読んで `next` 依存を検出し、
+/// 見つかれば `"nextjs"` プリセットを適用する。明示指定が auto detect より常に優先される。
+///
+/// 自動検出に失敗した場合 (package.json なし、JSON パース失敗、依存不一致) は空 Vec を
+/// 返す。debug ログを出さない (副作用最小化のため、検出結果は呼び出し側の review JSON 等で
+/// 表現する余地を残す)。
+fn resolve_framework_globs_with_auto_detect(
+    framework: Option<&str>,
+    dir: &str,
+) -> Result<Vec<String>> {
+    if framework.is_some() {
+        return resolve_framework_globs(framework);
+    }
+    match auto_detect_framework(dir) {
+        Some(name) => resolve_framework_globs(Some(name)),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// `dir/package.json` を読んで Next.js プロジェクトかを判定する。
+///
+/// 判定: `package.json` の `dependencies` または `devDependencies` に `next` キーが存在
+/// すること。`peerDependencies` / `optionalDependencies` は Next.js ライブラリやテスト
+/// fixture で誤爆しやすいため対象外。
+///
+/// 失敗時 (ファイル無し / JSON パース失敗 / next 依存なし) は `None` を返す。
+///
+/// モノレポでの workspace 走査は将来対応 (初期実装は root `package.json` のみ)。
+fn auto_detect_framework(dir: &str) -> Option<&'static str> {
+    let pkg_path = std::path::Path::new(dir).join("package.json");
+    let text = std::fs::read_to_string(&pkg_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let has_next = ["dependencies", "devDependencies"].iter().any(|field| {
+        value
+            .get(field)
+            .and_then(|v| v.as_object())
+            .is_some_and(|deps| deps.contains_key("next"))
+    });
+    if has_next { Some("nextjs") } else { None }
+}
+
 /// フレームワーク名から対応する除外 glob プリセットを返す。
 /// 未知のフレームワーク名はエラー。
 ///
@@ -3593,7 +3638,8 @@ pub fn cmd_dead_code(
     }
 
     // glob 除外: フレームワークプリセット + ユーザ指定
-    let framework_globs = resolve_framework_globs(framework)?;
+    // 未指定時は package.json から next 依存を検出して nextjs プリセットを自動適用する。
+    let framework_globs = resolve_framework_globs_with_auto_detect(framework, dir)?;
     let mut combined_globs: Vec<&str> = framework_globs.iter().map(String::as_str).collect();
     for pat in extra_exclude_globs {
         combined_globs.push(pat.as_str());
