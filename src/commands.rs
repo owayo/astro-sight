@@ -1667,7 +1667,17 @@ fn detect_api_changes(
                 // 未 export 関数は外部 API 面ではない。新ツリー全体で参照 0 件なら同一 diff
                 // 内で完結した削除と判断して api.rm から除外する。
                 let is_bash_old_file = is_bash_script_path(&df.old_path);
+                // Rust bin-only crate (`[[bin]]` のみで `[lib]` なし) の `pub fn` は
+                // クレート外から到達できないため、削除されても外部 API の破壊にはならない。
+                // `api.add` 側 (line 1623, 1724) と対称に `api.rm` 側でも除外する。
+                // `api.rm` は旧 API 面の判定なので、`base` リビジョン時点での crate type
+                // を見る (新ツリーで src/lib.rs を削除したケースで誤抑制しないため)。
+                let is_binary_rust_old_crate =
+                    is_binary_only_rust_crate_at_base(dir, base, &df.old_path);
                 for (name, kind, sig) in &old_syms {
+                    if is_binary_rust_old_crate {
+                        continue;
+                    }
                     if is_bash_old_file
                         && !bash_function_is_exported_in_git(dir, base, &df.old_path, name)
                         && is_removed_bash_symbol_unreferenced(dir, name)
@@ -1763,8 +1773,16 @@ fn detect_api_changes(
         // ロジックを純粋削除にも拡張する。`export -f` 済み関数は他リポジトリ消費者向け
         // API として残す。
         let is_bash_old_file = is_bash_script_path(&df.old_path);
+        // Rust bin-only crate (`[[bin]]` のみで `[lib]` なし) の `pub fn` は外部から
+        // 到達できないため、削除されても破壊的 API 変更にはならない。`api.add` 側と対称に
+        // 除外する (Issue 2026-05-19-api-rm-bin-crate-dead-cleanup 対応)。
+        // `api.rm` は旧 API 面の判定なので、`base` リビジョン時点の crate type を見る。
+        let is_binary_rust_old_crate = is_binary_only_rust_crate_at_base(dir, base, &df.old_path);
         for (name, kind, sig) in &old_syms {
             if !new_map.contains_key(name.as_str()) {
+                if is_binary_rust_old_crate {
+                    continue;
+                }
                 // closed-in-diff for api.rm: 同ファイルに新規追加されたシンボルがあり、
                 // 削除されたシンボルが変更後ツリーで 0 件参照なら「rename + 実装置換」
                 // と判断して api.rm から除外する。caller は同一 diff 内で追随済み。
@@ -2655,8 +2673,12 @@ fn is_used_in_diff_paths(
 /// クレート内モジュール境界の役割しか持たないため api.add の対象から除外する。
 ///
 /// 判定方針: `file_path` (dir 相対) から祖先方向に遡って最も近い `Cargo.toml` を
-/// 見つけ、そのディレクトリに `src/lib.rs` が存在しなければ binary-only とみなす。
-/// Rust ファイル以外や `Cargo.toml` が見つからない場合は false を返す。
+/// 見つけ、そのディレクトリで `src/lib.rs` が存在せず、かつ `Cargo.toml` に `[lib]`
+/// セクションも書かれていなければ binary-only とみなす。`[lib] path = "..."` のような
+/// custom path で lib crate を構成しているケースを誤って binary-only と判定しないよう、
+/// TOML の `[lib]` セクション存在も判定に含める。`Cargo.toml` のパースに失敗した場合は
+/// 保守的に false (binary-only ではない) を返す。Rust ファイル以外や `Cargo.toml` が
+/// 見つからない場合も false を返す。
 fn is_binary_only_rust_crate(dir: &str, file_path: &str) -> bool {
     let path = std::path::Path::new(file_path);
     if path.extension().and_then(|s| s.to_str()) != Some("rs") {
@@ -2666,8 +2688,17 @@ fn is_binary_only_rust_crate(dir: &str, file_path: &str) -> bool {
     let dir_canonical = std::fs::canonicalize(dir).ok();
     let mut current = full.parent();
     while let Some(d) = current {
-        if d.join("Cargo.toml").is_file() {
-            return !d.join("src").join("lib.rs").is_file();
+        let cargo_toml = d.join("Cargo.toml");
+        if cargo_toml.is_file() {
+            if d.join("src").join("lib.rs").is_file() {
+                return false;
+            }
+            // Cargo.toml に `[lib]` セクションがあれば custom path の lib crate。
+            // パース失敗時は保守的に lib crate 扱い (false = binary-only ではない)。
+            let Ok(text) = std::fs::read_to_string(&cargo_toml) else {
+                return false;
+            };
+            return !cargo_toml_text_declares_lib(&text);
         }
         // dir より上には探索しない
         if let (Some(root), Ok(canon)) = (dir_canonical.as_ref(), std::fs::canonicalize(d))
@@ -2678,6 +2709,114 @@ fn is_binary_only_rust_crate(dir: &str, file_path: &str) -> bool {
         current = d.parent();
     }
     false
+}
+
+/// `api.rm` 側専用: `base` リビジョン時点での crate type を判定する。
+///
+/// 新ツリーで `src/lib.rs` を削除した、または `Cargo.toml` の `[lib]` セクションを
+/// 同一 diff で消したケースで、旧公開 API の削除まで誤って `api.rm` から除外しないため、
+/// `git show` で旧側の `Cargo.toml` / `src/lib.rs` を取得して判定する。
+///
+/// 判定方針:
+/// - `file_path` (dir 相対) の祖先方向に向けて、`base` リビジョンに存在する最も近い
+///   `Cargo.toml` を探す
+/// - その `Cargo.toml` ディレクトリで base 側に `src/lib.rs` があれば library crate
+/// - `Cargo.toml` を TOML パースし `[lib]` セクションがあれば library crate
+/// - いずれの判定にも失敗 / 該当しない場合 = binary-only
+///
+/// 失敗時は保守的に `false` (library crate 扱い) を返し、`api.rm` を抑制しない方向に倒す。
+fn is_binary_only_rust_crate_at_base(dir: &str, base: &str, file_path: &str) -> bool {
+    let path = std::path::Path::new(file_path);
+    if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+        return false;
+    }
+    if validate_git_revision(base, "--base").is_err() {
+        return false;
+    }
+    // dir 相対パスの祖先を順に辿り、最初に base 時点で存在した Cargo.toml を採用する。
+    let mut ancestor: Option<&std::path::Path> = path.parent();
+    while let Some(rel_dir) = ancestor {
+        let cargo_rel = if rel_dir.as_os_str().is_empty() {
+            std::path::PathBuf::from("Cargo.toml")
+        } else {
+            rel_dir.join("Cargo.toml")
+        };
+        let cargo_rel_str = cargo_rel.to_string_lossy().to_string();
+        if validate_git_revision(&cargo_rel_str, "diff file path").is_err() {
+            return false;
+        }
+        let cargo_output = std::process::Command::new("git")
+            .args(["show", &format!("{base}:{cargo_rel_str}")])
+            .current_dir(dir)
+            .output();
+        if let Ok(out) = cargo_output
+            && out.status.success()
+        {
+            // 同 crate root の base 側 src/lib.rs 存在を git show で判定
+            let lib_rel = if rel_dir.as_os_str().is_empty() {
+                std::path::PathBuf::from("src/lib.rs")
+            } else {
+                rel_dir.join("src/lib.rs")
+            };
+            let lib_rel_str = lib_rel.to_string_lossy().to_string();
+            if validate_git_revision(&lib_rel_str, "diff file path").is_err() {
+                return false;
+            }
+            let lib_output = std::process::Command::new("git")
+                .args(["show", &format!("{base}:{lib_rel_str}")])
+                .current_dir(dir)
+                .output();
+            if matches!(lib_output, Ok(ref o) if o.status.success()) {
+                return false;
+            }
+            let Ok(text) = std::str::from_utf8(&out.stdout) else {
+                return false;
+            };
+            return !cargo_toml_text_declares_lib(text);
+        }
+        // ancestor を一つ上に
+        match rel_dir.parent() {
+            Some(parent) => ancestor = Some(parent),
+            None => break,
+        }
+        if ancestor.is_some_and(|p| p.as_os_str().is_empty()) {
+            // ルート直下まで来たので最後にもう一度だけ Cargo.toml チェックする
+            let last = std::path::PathBuf::from("Cargo.toml");
+            let cargo_rel_str = last.to_string_lossy().to_string();
+            let cargo_output = std::process::Command::new("git")
+                .args(["show", &format!("{base}:{cargo_rel_str}")])
+                .current_dir(dir)
+                .output();
+            if let Ok(out) = cargo_output
+                && out.status.success()
+            {
+                let lib_output = std::process::Command::new("git")
+                    .args(["show", &format!("{base}:src/lib.rs")])
+                    .current_dir(dir)
+                    .output();
+                if matches!(lib_output, Ok(ref o) if o.status.success()) {
+                    return false;
+                }
+                let Ok(text) = std::str::from_utf8(&out.stdout) else {
+                    return false;
+                };
+                return !cargo_toml_text_declares_lib(text);
+            }
+            break;
+        }
+    }
+    false
+}
+
+/// Cargo.toml のテキストから `[lib]` セクションが宣言されているかを判定する。
+///
+/// パース失敗時は **保守的に true (= library 宣言ありとみなす)** を返す。`api.rm` 側で
+/// false negative (公開 API 削除の見逃し) を起こさない方向に倒すための既定値。
+fn cargo_toml_text_declares_lib(text: &str) -> bool {
+    match toml::from_str::<toml::Table>(text) {
+        Ok(parsed) => parsed.contains_key("lib"),
+        Err(_) => true,
+    }
 }
 
 /// `name` が `file_path` 以外のファイルから参照されているかを判定する。
@@ -6451,6 +6590,364 @@ pub struct LibraryApi { pub name: String }
         );
     }
 
+    /// 2026-05-19 レポート再現: binary crate (src/lib.rs なし) で `#[allow(dead_code)]`
+    /// 付き `pub fn` を削除した場合、直前 hook で `dead` 判定されたシンボルを削除した直後
+    /// に同じシンボルが `api.rm` として再警告される矛盾。bin-only crate の `pub fn` は
+    /// crate 外から到達できないため、`api.add` 側と対称に `api.rm` 側でも除外する。
+    #[test]
+    fn detect_api_changes_binary_rust_crate_excludes_pub_removals() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let cargo_toml = "\
+[package]
+name = \"demo-bin\"
+version = \"0.1.0\"
+edition = \"2021\"
+
+[dependencies]
+";
+        let executor_before = "\
+pub struct RusshExecutor;
+
+impl RusshExecutor {
+    pub fn new() -> Self { Self }
+
+    #[allow(dead_code)]
+    pub fn with_known_hosts(self, _path: &str) -> Self { self }
+}
+";
+        let main_before = "\
+use crate::executor::RusshExecutor;
+
+fn main() {
+    let _ = RusshExecutor::new();
+}
+
+mod executor;
+";
+        git_commit_files(
+            repo,
+            &[
+                ("Cargo.toml", cargo_toml),
+                ("src/executor.rs", executor_before),
+                ("src/main.rs", main_before),
+            ],
+            "initial",
+        );
+
+        // dead 判定済みの `with_known_hosts` を削除する
+        let executor_after = "\
+pub struct RusshExecutor;
+
+impl RusshExecutor {
+    pub fn new() -> Self { Self }
+}
+";
+        fs::write(repo.join("src/executor.rs"), executor_after).expect("write executor");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/executor.rs".to_string(),
+            new_path: "src/executor.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 9,
+                new_start: 1,
+                new_count: 5,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !removed.iter().any(|n| n.ends_with("with_known_hosts")),
+            "binary crate (src/lib.rs なし) の pub fn 削除は api.rm に出してはならない。got: {removed:?}"
+        );
+    }
+
+    /// library crate (src/lib.rs あり) の pub fn 削除は引き続き api.rm に残ること。
+    /// binary crate 判定の副作用で library crate の削除まで抑止しないことを保証する。
+    #[test]
+    fn detect_api_changes_library_rust_crate_keeps_pub_removals() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let cargo_toml = "\
+[package]
+name = \"demo-lib\"
+version = \"0.1.0\"
+edition = \"2021\"
+";
+        let lib_before = "pub mod api;\n";
+        let api_before = "\
+pub struct Client;
+
+impl Client {
+    pub fn new() -> Self { Self }
+
+    pub fn legacy_call(&self) {}
+}
+";
+        git_commit_files(
+            repo,
+            &[
+                ("Cargo.toml", cargo_toml),
+                ("src/lib.rs", lib_before),
+                ("src/api.rs", api_before),
+            ],
+            "initial",
+        );
+
+        // 外部公開していた pub fn を削除する
+        let api_after = "\
+pub struct Client;
+
+impl Client {
+    pub fn new() -> Self { Self }
+}
+";
+        fs::write(repo.join("src/api.rs"), api_after).expect("write api");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/api.rs".to_string(),
+            new_path: "src/api.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 7,
+                new_start: 1,
+                new_count: 5,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("legacy_call")),
+            "library crate の pub fn 削除は api.rm に残すべき。got: {removed:?}"
+        );
+    }
+
+    /// 旧ツリーで library crate だったものを同一 diff で `src/lib.rs` 削除 + pub fn 削除に
+    /// する場合、`api.rm` は **旧 API 面** の判定なので base 時点の crate type を採用する。
+    /// 新ツリーが bin-only に見えても、削除された公開 API は引き続き api.rm に残ること。
+    /// (codex pre-commit レビューでの Warning 指摘の回帰テスト)
+    #[test]
+    fn detect_api_changes_lib_rs_removal_keeps_pub_removals_via_base() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let cargo_toml = "\
+[package]
+name = \"was-lib-now-bin\"
+version = \"0.1.0\"
+edition = \"2021\"
+";
+        let lib_before = "pub mod api;\n";
+        let api_before = "\
+pub fn kept() {}
+pub fn removed_api() {}
+";
+        git_commit_files(
+            repo,
+            &[
+                ("Cargo.toml", cargo_toml),
+                ("src/lib.rs", lib_before),
+                ("src/api.rs", api_before),
+            ],
+            "initial",
+        );
+
+        // 新ツリーで src/lib.rs を削除し、同時に pub fn removed_api も消す
+        std::fs::remove_file(repo.join("src/lib.rs")).expect("rm lib.rs");
+        let api_after = "pub fn kept() {}\n";
+        fs::write(repo.join("src/api.rs"), api_after).expect("write api");
+
+        let diff_files = vec![
+            crate::models::impact::DiffFile {
+                old_path: "src/lib.rs".to_string(),
+                new_path: "/dev/null".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 1,
+                    new_start: 0,
+                    new_count: 0,
+                }],
+                deleted_old_source: Some(lib_before.as_bytes().to_vec()),
+            },
+            crate::models::impact::DiffFile {
+                old_path: "src/api.rs".to_string(),
+                new_path: "src/api.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 2,
+                    new_start: 1,
+                    new_count: 1,
+                }],
+                deleted_old_source: None,
+            },
+        ];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("removed_api")),
+            "base 時点で library crate だった場合、新ツリーで src/lib.rs を消しても旧公開 API の削除は api.rm に残すべき。got: {removed:?}"
+        );
+    }
+
+    /// `Cargo.toml` に `[lib] path = "src/api.rs"` のような custom lib path を書いた crate
+    /// では `src/lib.rs` が無くても library crate として扱う。`api.rm` 側で誤って公開 API
+    /// 削除を抑制しないことを保証する (codex pre-commit レビューでの P1 指摘の回帰テスト)。
+    #[test]
+    fn detect_api_changes_custom_lib_path_keeps_pub_removals() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let cargo_toml = "\
+[package]
+name = \"custom-lib\"
+version = \"0.1.0\"
+edition = \"2021\"
+
+[lib]
+path = \"src/api.rs\"
+";
+        let api_before = "\
+pub fn kept() {}
+pub fn removed_api() {}
+";
+        git_commit_files(
+            repo,
+            &[("Cargo.toml", cargo_toml), ("src/api.rs", api_before)],
+            "initial",
+        );
+
+        let api_after = "pub fn kept() {}\n";
+        fs::write(repo.join("src/api.rs"), api_after).expect("write api");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/api.rs".to_string(),
+            new_path: "src/api.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 2,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("removed_api")),
+            "[lib] path = ... で構成される custom path library crate の pub fn 削除は api.rm に残すべき。got: {removed:?}"
+        );
+    }
+
+    /// ファイル丸ごと削除のケースでも、binary crate の pub fn は api.rm 対象外にする。
+    #[test]
+    fn detect_api_changes_binary_rust_crate_excludes_pub_removals_on_file_delete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let cargo_toml = "\
+[package]
+name = \"demo-bin\"
+version = \"0.1.0\"
+edition = \"2021\"
+
+[dependencies]
+";
+        let helper_before = "\
+pub fn unused_helper() -> u32 { 42 }
+";
+        let main_before = "fn main() { println!(\"hi\"); }\nmod helper;\n";
+        git_commit_files(
+            repo,
+            &[
+                ("Cargo.toml", cargo_toml),
+                ("src/helper.rs", helper_before),
+                ("src/main.rs", main_before),
+            ],
+            "initial",
+        );
+
+        // helper.rs を丸ごと削除
+        std::fs::remove_file(repo.join("src/helper.rs")).expect("rm helper");
+        let main_after = "fn main() { println!(\"hi\"); }\n";
+        fs::write(repo.join("src/main.rs"), main_after).expect("write main");
+
+        let diff_files = vec![
+            crate::models::impact::DiffFile {
+                old_path: "src/helper.rs".to_string(),
+                new_path: "/dev/null".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 1,
+                    new_start: 0,
+                    new_count: 0,
+                }],
+                deleted_old_source: Some(helper_before.as_bytes().to_vec()),
+            },
+            crate::models::impact::DiffFile {
+                old_path: "src/main.rs".to_string(),
+                new_path: "src/main.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 2,
+                    new_start: 1,
+                    new_count: 1,
+                }],
+                deleted_old_source: None,
+            },
+        ];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !removed.iter().any(|n| n.ends_with("unused_helper")),
+            "binary crate のファイル丸ごと削除に含まれる pub fn は api.rm に出してはならない。got: {removed:?}"
+        );
+    }
+
     /// lib.rs 有りクレートでも、新規 pub シンボルが同一 diff 内の別ファイルから
     /// 参照されていれば api.add から除外する。
     #[test]
@@ -6665,6 +7162,25 @@ bar() { echo bye; }\n";
         assert!(!is_binary_only_rust_crate(
             repo.to_str().expect("utf-8"),
             "src/main.rs",
+        ));
+    }
+
+    /// `Cargo.toml` に `[lib] path = "..."` を書いて `src/lib.rs` を使わず custom path で
+    /// library crate を構成しているケース。`src/lib.rs` の有無だけ見ると binary-only と
+    /// 誤判定し、本物の公開 API 削除を `api.rm` から除外してしまうため、`[lib]` セクション
+    /// 存在を判定要件に含める。
+    #[test]
+    fn is_binary_only_rust_crate_false_when_cargo_lib_section_with_custom_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        fs::create_dir_all(repo.join("src")).expect("mkdir src");
+        let cargo_toml = "[package]\nname = \"custom\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/api.rs\"\n";
+        fs::write(repo.join("Cargo.toml"), cargo_toml).expect("cargo");
+        fs::write(repo.join("src/api.rs"), "pub fn hello() {}\n").expect("api");
+
+        assert!(!is_binary_only_rust_crate(
+            repo.to_str().expect("utf-8"),
+            "src/api.rs",
         ));
     }
 
