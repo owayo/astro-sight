@@ -7617,6 +7617,160 @@ bar() { echo bye; }\n";
         ));
     }
 
+    // ------------------------------------------------------------------
+    // cargo_toml_text_declares_lib ヘルパー
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cargo_toml_text_declares_lib_true_when_lib_section_present() {
+        let text = "[package]\nname = \"x\"\n\n[lib]\npath = \"src/api.rs\"\n";
+        assert!(cargo_toml_text_declares_lib(text));
+    }
+
+    #[test]
+    fn cargo_toml_text_declares_lib_false_when_lib_section_absent() {
+        let text = "[package]\nname = \"x\"\nversion = \"0.1.0\"\n";
+        assert!(!cargo_toml_text_declares_lib(text));
+    }
+
+    #[test]
+    fn cargo_toml_text_declares_lib_false_when_empty() {
+        // 空 TOML は library 宣言なし
+        assert!(!cargo_toml_text_declares_lib(""));
+    }
+
+    /// 不正な TOML は `api.rm` の見逃しを避けるため保守的に true (= library 扱い) を返す。
+    #[test]
+    fn cargo_toml_text_declares_lib_true_when_invalid_toml() {
+        let text = "this is = not valid = toml\n[unclosed";
+        assert!(cargo_toml_text_declares_lib(text));
+    }
+
+    /// `[[bin]]` セクションだけがあって `[lib]` がない場合は binary-only として扱う。
+    #[test]
+    fn cargo_toml_text_declares_lib_false_when_only_bin_array_section() {
+        let text = "[package]\nname = \"x\"\n\n[[bin]]\nname = \"x\"\npath = \"src/main.rs\"\n";
+        assert!(!cargo_toml_text_declares_lib(text));
+    }
+
+    // ------------------------------------------------------------------
+    // auto_detect_framework ヘルパー
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn auto_detect_framework_returns_none_without_package_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(auto_detect_framework(dir.path().to_str().expect("utf-8")).is_none());
+    }
+
+    #[test]
+    fn auto_detect_framework_returns_nextjs_for_dependencies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies": {"next": "14.0.0", "react": "18.0.0"}}"#,
+        )
+        .expect("pkg");
+        assert_eq!(
+            auto_detect_framework(dir.path().to_str().expect("utf-8")),
+            Some("nextjs")
+        );
+    }
+
+    #[test]
+    fn auto_detect_framework_returns_nextjs_for_dev_dependencies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"devDependencies": {"next": "14.0.0"}}"#,
+        )
+        .expect("pkg");
+        assert_eq!(
+            auto_detect_framework(dir.path().to_str().expect("utf-8")),
+            Some("nextjs")
+        );
+    }
+
+    /// `peerDependencies` / `optionalDependencies` 経由の `next` は library 側の同梱で
+    /// 誤爆しやすいため対象外とする。
+    #[test]
+    fn auto_detect_framework_ignores_peer_dependencies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"peerDependencies": {"next": "14.0.0"}}"#,
+        )
+        .expect("pkg");
+        assert!(auto_detect_framework(dir.path().to_str().expect("utf-8")).is_none());
+    }
+
+    #[test]
+    fn auto_detect_framework_returns_none_for_invalid_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("package.json"), "{not valid json").expect("pkg");
+        assert!(auto_detect_framework(dir.path().to_str().expect("utf-8")).is_none());
+    }
+
+    #[test]
+    fn auto_detect_framework_returns_none_when_no_next_dependency() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies": {"react": "18.0.0"}}"#,
+        )
+        .expect("pkg");
+        assert!(auto_detect_framework(dir.path().to_str().expect("utf-8")).is_none());
+    }
+
+    /// `resolve_framework_globs_with_auto_detect`: 明示指定があれば auto detect は無視する。
+    #[test]
+    fn resolve_framework_globs_with_auto_detect_prefers_explicit_framework() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 明示指定が `laravel` のとき、package.json に next があっても laravel プリセットを返す。
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies": {"next": "14.0.0"}}"#,
+        )
+        .expect("pkg");
+        let globs = resolve_framework_globs_with_auto_detect(
+            Some("laravel"),
+            dir.path().to_str().expect("utf-8"),
+        )
+        .expect("resolve");
+        // Laravel プリセットの代表 glob `**/app/Http/**` が含まれていることだけ確認する。
+        assert!(globs.iter().any(|g| g.contains("Http")));
+    }
+
+    /// auto detect 経由でも明示指定無し時は nextjs プリセットが返ること。
+    #[test]
+    fn resolve_framework_globs_with_auto_detect_uses_auto_when_no_explicit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies": {"next": "14.0.0"}}"#,
+        )
+        .expect("pkg");
+        let globs =
+            resolve_framework_globs_with_auto_detect(None, dir.path().to_str().expect("utf-8"))
+                .expect("resolve");
+        // nextjs プリセットの代表 glob `**/app/**` または `**/pages/**` のどちらかが含まれる。
+        assert!(
+            globs
+                .iter()
+                .any(|g| g.contains("app/**") || g.contains("pages/**"))
+        );
+    }
+
+    /// package.json も `--framework` も無いケースは空 Vec を返す (Ok(Vec::new()))。
+    #[test]
+    fn resolve_framework_globs_with_auto_detect_empty_when_neither() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let globs =
+            resolve_framework_globs_with_auto_detect(None, dir.path().to_str().expect("utf-8"))
+                .expect("resolve");
+        assert!(globs.is_empty());
+    }
+
     #[test]
     fn reconcile_with_moves_pairs_by_signature() {
         // reconcile_with_moves のユニットテスト: 同じ (name,kind,sig) を相殺して

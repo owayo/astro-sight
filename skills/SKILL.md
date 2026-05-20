@@ -353,6 +353,10 @@ astro-sight dead-code --dir . --git --staged
 # FormRequest, Console Commands, GraphQL resolvers, Listeners, Providers, IDE helpers)
 astro-sight dead-code --dir . --framework laravel
 
+# Next.js: `--framework` 未指定でも package.json の dependencies/devDependencies に `next` が
+# あれば自動で nextjs プリセットを適用する (auto-detect)。明示指定は常に優先される。
+astro-sight dead-code --dir . --framework nextjs
+
 # Additional ad-hoc exclusions (directory name or glob pattern)
 astro-sight dead-code --dir . --exclude-dir generated --exclude-glob 'app/Legacy/**'
 ```
@@ -363,6 +367,9 @@ Output: JSON with `dir`, `scanned_files` (count), `dead_symbols` array (`name`, 
 - PHPUnit: `*Test` / `*TestCase` / `*IntegrationTest` / `*FeatureTest` classes, `testXxx` / `setUp` / `tearDown` / `setUpBeforeClass` / `tearDownAfterClass` methods
 - Python unittest: `unittest.TestCase` (and `IsolatedAsyncioTestCase`) subclasses with same-file inheritance chains, plus `test_*` / `setUp` / `tearDown` / `setUpClass` / `tearDownClass` / `addCleanup` / `addClassCleanup` methods
 - Python pytest: top-level `test_*` functions in `test_*.py` / `*_test.py` files, all functions in `conftest.py`
+- Angular: `@Component` / `@Directive` 装飾クラスのライフサイクルフック (`ngOnInit` / `ngOnDestroy` / `ngOnChanges` / `ngDoCheck` / `ngAfterContentInit` / `ngAfterContentChecked` / `ngAfterViewInit` / `ngAfterViewChecked`) は Angular ランタイムが自動呼出するため除外
+
+**API surface diff (`review` の `api_changes`)** は bin-only Rust crate (`src/lib.rs` なし & `Cargo.toml` の `[lib]` セクションなし) の `pub fn` 追加/削除/シグネチャ変更を自動で除外する。bin crate の `pub fn` は crate 外から到達できないため公開 API ではない。判定は新旧両方のリビジョンで行う。
 
 ### `session` — NDJSON Batch Mode
 

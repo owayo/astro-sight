@@ -422,6 +422,21 @@ astro-sight dead-code --dir . --git --staged
 - **Python unittest**: `unittest.TestCase` (および `unittest.IsolatedAsyncioTestCase`) を継承するクラス（同一ファイル内の間接継承も fixed-point で解決）と、その `test_*` / `setUp` / `tearDown` / `setUpClass` / `tearDownClass` / `addCleanup` / `addClassCleanup` メソッド
 - **Python pytest**: `test_*.py` / `*_test.py` ファイルのトップレベル `test_*` 関数と `conftest.py` 内のすべての関数
 - **Python フレームワーク登録デコレータ**: Typer / Click / FastAPI / Flask / Django / Celery / pytest 等の登録デコレータが付いた関数・メソッド・クラス
+- **Angular**: `@Component` / `@Directive` 装飾クラスのライフサイクルフック (`ngOnInit` / `ngOnDestroy` / `ngOnChanges` / `ngDoCheck` / `ngAfterContentInit` / `ngAfterContentChecked` / `ngAfterViewInit` / `ngAfterViewChecked`) は Angular ランタイムが change detection サイクルで自動呼び出しするため除外
+
+#### フレームワーク自動検出 (v26.5.120+)
+
+`--framework` 未指定時でも、`<dir>/package.json` の `dependencies` / `devDependencies` に `next` キーがあれば自動で `nextjs` プリセットを適用する。`peerDependencies` / `optionalDependencies` 経由は誤爆しやすいため対象外。明示指定 (`--framework laravel` 等) は常に auto detect より優先される。
+
+```bash
+# package.json に `next` があれば自動的に nextjs プリセットが適用される
+astro-sight dead-code --dir .
+astro-sight review --dir . --git
+```
+
+#### bin-only Rust crate の API 差分除外
+
+`review` の `api_changes` (`added` / `removed` / `modified`) は、bin-only Rust crate (`src/lib.rs` が無く `Cargo.toml` に `[lib]` セクションも無い) の `pub fn` 変更を自動的に除外する。bin crate の `pub fn` は crate 外から到達できないため、追加・削除・シグネチャ変更いずれも外部公開 API の互換性問題にはならない。新ツリーで `src/lib.rs` を削除した同時 diff でも、base リビジョン側で library crate だった場合は旧公開 API の削除を正しく `removed` に残す。
 
 ### cochange - 共変更パターン検出
 
