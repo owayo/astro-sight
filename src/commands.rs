@@ -2187,23 +2187,40 @@ pub(crate) fn detect_dead_symbols_from_files(
     (dead, test_only)
 }
 
+/// テストディレクトリとみなすセグメント名一覧。
+///
+/// - 言語共通: `tests`, `Tests`, `__tests__`, `spec`, `testdata`
+/// - JVM/Gradle 標準: `test` (`src/test/`), `androidTest`, `sharedTest`, `integrationTest`
+///
+/// `is_test_path` (API 差分検出) と `DEFAULT_DEAD_CODE_EXCLUDES_TESTS` (dead-code 既定除外)
+/// の両側で同じ判定を行うため一元化する。`is_test_path` が `test` 単数形を含む一方で
+/// `DEFAULT_DEAD_CODE_EXCLUDES_TESTS` には含まれない、という履歴的なねじれ
+/// (2026-05-21 の JUnit Kotlin dead 誤検出として顕在化) を解消する。
+const TEST_DIRECTORY_SEGMENTS: &[&str] = &[
+    "tests",
+    "test",
+    "Tests",
+    "__tests__",
+    "spec",
+    "testdata",
+    "androidTest",
+    "sharedTest",
+    "integrationTest",
+];
+
 /// refs カウントを production / test に振り分けるための判定関数。
 ///
 /// - ファイル名規約 (`*_test.go`, `*Test.php`, `*_spec.rb` 等) は既存の
 ///   `is_test_file_path` に委譲する。
-/// - ディレクトリセグメント規約 (`tests/`, `__tests__/`, `spec/`, `testdata/`,
-///   `test/`, `Tests/`) を含むパスも test 配下とみなす。
+/// - ディレクトリセグメント規約は `TEST_DIRECTORY_SEGMENTS` に一元化。
 fn is_test_path(path: &std::path::Path) -> bool {
     if let Some(s) = path.to_str() {
         if crate::engine::impact::test_context::is_test_file_path(s) {
             return true;
         }
-        if s.split('/').any(|seg| {
-            matches!(
-                seg,
-                "tests" | "test" | "Tests" | "__tests__" | "spec" | "testdata"
-            )
-        }) {
+        if s.split('/')
+            .any(|seg| TEST_DIRECTORY_SEGMENTS.contains(&seg))
+        {
             return true;
         }
     }
@@ -3122,7 +3139,9 @@ fn enclosing_container<'a>(
 /// グループ化の意図:
 /// - `vendor`: Composer, Ruby Bundler, Go modules vendor
 /// - `node_modules`, `bower_components`: Node パッケージ
-/// - `tests`, `Tests`, `__tests__`, `spec`, `testdata`: 言語共通のテストディレクトリ
+/// - `tests`, `Tests`, `__tests__`, `spec`, `testdata`,
+///   `test`, `androidTest`, `sharedTest`, `integrationTest`: 言語共通 + JVM/Gradle のテストディレクトリ
+///   (実体は `TEST_DIRECTORY_SEGMENTS` 定数で `is_test_path` と共有)
 /// - `target`, `dist`, `build`, `out`, `_build`, `cmake-build-debug`, `cmake-build-release`: ビルド成果物
 /// - `.venv`, `venv`, `.tox`: Python 仮想環境
 const DEFAULT_DEAD_CODE_EXCLUDES_VENDOR: &[&str] = &[
@@ -3133,8 +3152,9 @@ const DEFAULT_DEAD_CODE_EXCLUDES_VENDOR: &[&str] = &[
     "venv",
     ".tox",
 ];
-const DEFAULT_DEAD_CODE_EXCLUDES_TESTS: &[&str] =
-    &["tests", "Tests", "__tests__", "spec", "testdata"];
+/// dead-code 既定除外のテストディレクトリ。`is_test_path` と同じセグメント集合
+/// (`TEST_DIRECTORY_SEGMENTS`) を使い、API 検出側と dead-code 側のテスト判定を統一する。
+const DEFAULT_DEAD_CODE_EXCLUDES_TESTS: &[&str] = TEST_DIRECTORY_SEGMENTS;
 const DEFAULT_DEAD_CODE_EXCLUDES_BUILD: &[&str] = &[
     "target",
     "dist",
@@ -3372,18 +3392,21 @@ pub(crate) fn filter_diff_files_for_dead_code(
     combined_exclude_globs: &[&str],
     glob: Option<&str>,
 ) -> Result<Vec<std::path::PathBuf>> {
+    // 除外判定は workspace 相対の new_path で行う。canonical_dir に `test` 等の
+    // 親セグメントが含まれているケース (例: `/private/tmp/test/myrepo`) でも、
+    // リポ内の `src/foo.rs` のような non-test ファイルを誤って除外しないようにするため。
     let mut files: Vec<std::path::PathBuf> = diff_files
         .iter()
         .filter(|f| f.new_path != "/dev/null")
         // diff の new_path は信頼境界外。絶対パスやトラバーサル成分を含むパスは
         // canonical_dir.join() で workspace 外を指してしまうため、ここで弾く。
         .filter(|f| crate::engine::impact::is_safe_diff_path(&f.new_path))
+        .filter(|f| !path_is_default_excluded(&f.new_path, excludes))
         .map(|f| canonical_dir.join(&f.new_path))
         .filter(|p| {
             crate::language::LangId::from_path(camino::Utf8Path::new(p.to_str().unwrap_or("")))
                 .is_ok()
         })
-        .filter(|p| !path_is_default_excluded(&p.to_string_lossy(), excludes))
         .collect();
 
     if glob.is_some() || !combined_exclude_globs.is_empty() {
@@ -6101,6 +6124,167 @@ export function testHelper() { return 1 }\n";
         assert!(
             removed.is_empty(),
             "*.test.ts 削除は api.rm に出してはならない。got: {removed:?}"
+        );
+    }
+
+    /// JVM/Gradle 標準の `src/test/` 配下は dead-code 検出から既定で除外される。
+    /// (レポート 2026-05-21-junit-kotlin-test-dead-symbols.md の再現)
+    ///
+    /// 2026-04-29 時点の resolved コメントでは「dead 側は既に `test` セグメントで除外済み」と
+    /// されていたが、当時の `DEFAULT_DEAD_CODE_EXCLUDES_TESTS` に `test` 単数形は無く、
+    /// API 検出側の `is_test_path` のみが `test` を扱っていた。本テストはこのねじれ解消の
+    /// 回帰防止: `test` / `androidTest` / `sharedTest` / `integrationTest` セグメントは
+    /// 共通定数 `TEST_DIRECTORY_SEGMENTS` 経由で dead-code 側でも既定除外されるべき。
+    #[test]
+    fn filter_diff_files_for_dead_code_excludes_jvm_src_test_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join("app/src/test/java/com/example"))
+            .expect("mkdir src/test");
+        std::fs::write(
+            repo.join("app/src/test/java/com/example/FooTest.kt"),
+            "package com.example\nclass FooTest\n",
+        )
+        .expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "app/src/test/java/com/example/FooTest.kt".to_string(),
+            new_path: "app/src/test/java/com/example/FooTest.kt".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 2,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let canonical = std::fs::canonicalize(repo).expect("canonicalize");
+        // --include-tests なし (既定): DEFAULT_DEAD_CODE_EXCLUDES_TESTS を適用
+        let excludes = resolve_dead_code_excludes(false, false, false);
+        let files = filter_diff_files_for_dead_code(&canonical, &diff_files, &excludes, &[], None)
+            .expect("filter");
+
+        assert!(
+            files.is_empty(),
+            "JVM/Gradle 標準の src/test/ 配下は --include-tests なしで dead-code 対象から除外されるべき。got: {files:?}"
+        );
+    }
+
+    /// `--include-tests` を opt-in した場合は JVM の `src/test/` 配下も走査対象に残る。
+    /// (上記 `filter_diff_files_for_dead_code_excludes_jvm_src_test_directory` の対照)
+    #[test]
+    fn filter_diff_files_for_dead_code_includes_jvm_src_test_directory_when_opted_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join("app/src/test/java/com/example"))
+            .expect("mkdir src/test");
+        std::fs::write(
+            repo.join("app/src/test/java/com/example/FooTest.kt"),
+            "package com.example\nclass FooTest\n",
+        )
+        .expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "app/src/test/java/com/example/FooTest.kt".to_string(),
+            new_path: "app/src/test/java/com/example/FooTest.kt".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 2,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let canonical = std::fs::canonicalize(repo).expect("canonicalize");
+        // --include-tests opt-in: DEFAULT_DEAD_CODE_EXCLUDES_TESTS を適用しない
+        let excludes = resolve_dead_code_excludes(false, true, false);
+        let files = filter_diff_files_for_dead_code(&canonical, &diff_files, &excludes, &[], None)
+            .expect("filter");
+
+        assert_eq!(
+            files.len(),
+            1,
+            "--include-tests 時は src/test/ 配下も走査対象に残るべき。got: {files:?}"
+        );
+    }
+
+    /// 親ディレクトリ自体に `test` セグメントが含まれていても、root 配下の通常ファイルは
+    /// 除外されない。`canonical_dir.join(new_path)` 後の絶対パスを判定材料にしていた
+    /// 過去実装では `/private/tmp/test/<repo>/src/lib.rs` が全部除外される false negative
+    /// が出た (2026-05-21 codex コミット前レビュー指摘)。除外判定は workspace 相対の
+    /// `new_path` で行うべき。
+    #[test]
+    fn filter_diff_files_for_dead_code_does_not_misclassify_when_ancestor_dir_contains_test_segment()
+     {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // tempdir 直下にさらに "test" セグメントの親ディレクトリを作って、そこにリポを置く
+        let repo = dir.path().join("test/myrepo");
+        std::fs::create_dir_all(repo.join("src")).expect("mkdir src");
+        std::fs::write(
+            repo.join("src/lib.rs"),
+            "pub fn existing() {}\npub fn newly_dead() {}\n",
+        )
+        .expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/lib.rs".to_string(),
+            new_path: "src/lib.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 2,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let canonical = std::fs::canonicalize(&repo).expect("canonicalize");
+        let excludes = resolve_dead_code_excludes(false, false, false);
+        let files = filter_diff_files_for_dead_code(&canonical, &diff_files, &excludes, &[], None)
+            .expect("filter");
+
+        assert_eq!(
+            files.len(),
+            1,
+            "親パスが `/.../test/myrepo` でも、リポ内 `src/lib.rs` は除外されないべき。got: {files:?}"
+        );
+    }
+
+    /// Android instrumentation tests (`src/androidTest/`) も既定除外。
+    #[test]
+    fn filter_diff_files_for_dead_code_excludes_android_test_source_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join("app/src/androidTest/java/com/example"))
+            .expect("mkdir androidTest");
+        std::fs::write(
+            repo.join("app/src/androidTest/java/com/example/InstrumentedTest.kt"),
+            "package com.example\nclass InstrumentedTest\n",
+        )
+        .expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "app/src/androidTest/java/com/example/InstrumentedTest.kt".to_string(),
+            new_path: "app/src/androidTest/java/com/example/InstrumentedTest.kt".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 2,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let canonical = std::fs::canonicalize(repo).expect("canonicalize");
+        let excludes = resolve_dead_code_excludes(false, false, false);
+        let files = filter_diff_files_for_dead_code(&canonical, &diff_files, &excludes, &[], None)
+            .expect("filter");
+
+        assert!(
+            files.is_empty(),
+            "Android `src/androidTest/` も既定で dead-code 対象から除外されるべき。got: {files:?}"
         );
     }
 

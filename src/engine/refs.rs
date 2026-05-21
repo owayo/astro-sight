@@ -133,8 +133,14 @@ pub fn collect_files_with_excludes(
             continue;
         }
         let path = entry.into_path();
-        if !excluded_dir_names.is_empty() && path_has_excluded_segment(&path, excluded_dir_names) {
-            continue;
+        if !excluded_dir_names.is_empty() {
+            // root (`dir`) からの相対パスでセグメント判定する。`dir` が
+            // `/private/tmp/test/myrepo` のように親パスに除外セグメント名
+            // (例: `test`) を含むと、リポ内全ファイルが誤除外される false negative を防ぐ。
+            let rel = path.strip_prefix(dir).unwrap_or(&path);
+            if path_has_excluded_segment(rel, excluded_dir_names) {
+                continue;
+            }
         }
         // ベンダー / IDE 補助 / `@generated` マーカー付きファイルは
         // ノイズ源になるため refs / impact / dead-code から除外する。
