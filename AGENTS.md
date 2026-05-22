@@ -51,7 +51,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/cache/store.rs` - BLAKE3 ベースのキャッシュ保存（~/.cache/astro-sight/、CLI の `ast` / `symbols` は呼び出し側で path 込みハッシュを渡す）
 - `src/session/mod.rs` - NDJSON セッション処理（生行サイズで100MB上限、相対パスは `ASTRO_SIGHT_WORKSPACE` 基準、空文字・非 UTF-8 を含む `ASTRO_SIGHT_WORKSPACE` の不正値は fail-closed）
 - `src/language.rs` - 言語検出（拡張子/shebang）
-- `tools/usage-stats/src/main.rs` - Claude Code / Codex の利用ログ集計（`astro-sight` はシェル上の実行コマンドとして現れた場合のみ採用数に数え、パス文字列やプロンプト内の言及は除外）
+- `tools/usage-stats/src/main.rs` - Claude Code / Codex の利用ログ集計（`astro-sight` はシェル上の実行コマンドとして現れた場合のみ採用数に数え、パス文字列やプロンプト内の言及は除外。`--config <path>` や `/usr/bin/time -o <file>` 経由でも実サブコマンドを抽出）
 - `tests/fixtures/` - 多言語テストフィクスチャ（sample.rb, sample.py, sample.go, sample.ts）
 
 ## Review Standards

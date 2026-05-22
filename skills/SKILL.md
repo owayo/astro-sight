@@ -115,6 +115,8 @@ echo '{"command":"refs","name":"Sym1","dir":"."}
 - Need the **exact AST node** at a cursor/range, or want to confirm whether a parse error is structural? → `astro-sight ast --path <file> --line <n> --col <n>`
 - Need a **single JSON review** that combines impact, cochange, API surface changes, and dead symbols? → `astro-sight review --dir . --git`
 - Need to check a **repeated rule** like banned APIs, required patterns, or AST-based policy? → `astro-sight lint --path <file> --rules rules.yaml` before writing an ad-hoc text scan
+- Need a reusable syntax-aware check before touching multiple files? → create one small `lint` rule and keep its output as evidence
+- Need to audit exported/public cleanup after parser, dependency, or API-surface work? → run `astro-sight dead-code --dir . --git`; use `--dir .` for a full sweep
 - Need to predict **co-change fallout** before missing a related file? → `astro-sight cochange --dir . --git --base <rev>` (or `--paths <file>`) before guessing from filenames alone
 - Need to explain a non-trivial call path after `calls` identifies the target? → `astro-sight sequence --path <file> --function <name>`
 - Reviewing a multi-commit branch? → pass the same `--base <rev>` to `review`, `context`, or `impact`; `review --git --base <rev>` also uses that base for blame-backed `missing_cochanges`.

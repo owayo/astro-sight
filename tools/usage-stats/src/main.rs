@@ -181,15 +181,39 @@ fn skip_flags(s: &str) -> &str {
         s = s.trim_start();
         if let Some(rest) = s.strip_prefix("--") {
             let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let flag = &rest[..end];
             s = &rest[end..];
+            if long_flag_consumes_value(flag) && !flag.contains('=') {
+                let Some((_, rest)) = first_token_with_rest(s) else {
+                    return "";
+                };
+                s = rest;
+            }
         } else if s.starts_with('-') && s.len() > 1 && s.as_bytes()[1].is_ascii_alphabetic() {
             let end = s[1..].find(char::is_whitespace).unwrap_or(s.len() - 1);
+            let flag = &s[..1 + end];
             s = &s[1 + end..];
+            if short_flag_consumes_value(flag) {
+                let Some((_, rest)) = first_token_with_rest(s) else {
+                    return "";
+                };
+                s = rest;
+            }
         } else {
             break;
         }
     }
     s
+}
+
+fn long_flag_consumes_value(flag: &str) -> bool {
+    // astro-sight のグローバルフラグ。`--config path` をサブコマンド扱いしない。
+    matches!(flag, "config")
+}
+
+fn short_flag_consumes_value(flag: &str) -> bool {
+    // /usr/bin/time -o out astro-sight ... のようなラッパー経由を正しく読む。
+    matches!(flag, "-o")
 }
 
 fn is_astro_sight_cmd(cmd: &str) -> bool {
@@ -1400,6 +1424,14 @@ mod tests {
             extract_astro_subcmd("astro-sight --pretty symbols --dir src"),
             Some("symbols")
         );
+        assert_eq!(
+            extract_astro_subcmd("astro-sight --config /tmp/as.toml --debug refs --name foo"),
+            Some("refs")
+        );
+        assert_eq!(
+            extract_astro_subcmd("astro-sight --config=/tmp/as.toml symbols --dir src"),
+            Some("symbols")
+        );
     }
 
     #[test]
@@ -1411,6 +1443,10 @@ mod tests {
         assert_eq!(
             extract_astro_subcmd("/usr/bin/time -l astro-sight review --dir . --git"),
             Some("review")
+        );
+        assert_eq!(
+            extract_astro_subcmd("/usr/bin/time -o /tmp/time.log astro-sight impact --dir . --git"),
+            Some("impact")
         );
         assert_eq!(
             extract_astro_subcmd("git diff | astro-sight context --dir ."),
