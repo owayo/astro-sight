@@ -249,7 +249,18 @@ fn find_enclosing_declaration(node: Node) -> Option<Node> {
 }
 
 /// JS/TS: 祖先の export_statement または named export { name } をチェック。
+///
+/// TypeScript の class member は accessibility_modifier (`private` / `protected`) を
+/// 持てる。`private` 修飾されたメソッド / フィールド、および ECMAScript `#private`
+/// メンバ (名前が `#` で始まる private_property_identifier) は exported ではない。
+/// (Issue: 2026-05-22-temperature-api-triage の TS private クラスメンバ誤検出)
+/// `protected` は当面保守的に true を返す (TODO: protected を別カテゴリで扱う)。
 fn is_exported_js_ts(node: Node, source: &[u8], root: Node) -> bool {
+    // TypeScript class の private member は外部公開 API ではない (Issue B)。
+    if is_private_class_member_js_ts(node, source) {
+        return false;
+    }
+
     // 祖先に export_statement があるかチェック（関数スコープ境界で停止）。
     // この境界チェックがないと、export された関数内のローカル変数
     // （例: `export function foo()` 内の `const result`）が export_statement の
@@ -273,6 +284,46 @@ fn is_exported_js_ts(node: Node, source: &[u8], root: Node) -> bool {
         return has_named_export(root, source, name);
     }
 
+    false
+}
+
+/// TypeScript / JS の class member ノードが `private` であるかを判定する。
+///
+/// 判定対象:
+/// - `accessibility_modifier` 子が "private" の `method_definition` / `public_field_definition`
+/// - 名前が `private_property_identifier` (= ECMAScript `#private`) のメンバー
+///
+/// 関数本体の境界では停止し、内部関数の中のシンボルは判定対象外とする。
+/// `protected` は意図的に対象外 (保守的に exported 扱い)。
+fn is_private_class_member_js_ts(node: Node, source: &[u8]) -> bool {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        // 関数本体の境界で停止 — 内部関数のローカルは class member ではない
+        if is_js_function_body(n) {
+            return false;
+        }
+        if matches!(n.kind(), "method_definition" | "public_field_definition") {
+            // accessibility_modifier "private" の有無を確認
+            let mut cursor = n.walk();
+            for child in n.children(&mut cursor) {
+                if child.kind() == "accessibility_modifier"
+                    && let Ok(text) = child.utf8_text(source)
+                    && text.trim() == "private"
+                {
+                    return true;
+                }
+            }
+            // ECMAScript `#private`: name が private_property_identifier
+            if let Some(name) = n.child_by_field_name("name")
+                && name.kind() == "private_property_identifier"
+            {
+                return true;
+            }
+            // class member 直下で確定 (上位にはこれ以上関連情報はない)
+            return false;
+        }
+        current = n.parent();
+    }
     false
 }
 
@@ -1912,6 +1963,88 @@ mod tests {
             LangId::Typescript,
             "bar"
         ));
+    }
+
+    /// TypeScript class の `private` メソッドは公開 API ではないことを検証
+    /// (Issue: 2026-05-22-temperature-api-triage の private isLegacyGpt5Model 誤検出)
+    #[test]
+    fn ts_private_class_method_is_not_exported() {
+        let src = r#"export class C {
+    private internal(): boolean { return false; }
+    public callable(): void { this.internal(); }
+}
+"#;
+        assert!(!check_exported(src, LangId::Typescript, "internal"));
+    }
+
+    /// TypeScript class の `public` メソッドは引き続き公開 API として扱われることを検証
+    #[test]
+    fn ts_public_class_method_is_exported() {
+        let src = r#"export class C {
+    public callable(): void {}
+}
+"#;
+        assert!(check_exported(src, LangId::Typescript, "callable"));
+    }
+
+    /// TypeScript class の accessibility なし (=public 相当) メソッドも exported のまま
+    #[test]
+    fn ts_default_class_method_is_exported() {
+        let src = r#"export class C {
+    callable(): void {}
+}
+"#;
+        assert!(check_exported(src, LangId::Typescript, "callable"));
+    }
+
+    /// ECMAScript `#private` メンバを private_class_member 判定で捕捉できることを検証。
+    /// (extract_symbols は現状 `#`-prefixed メンバを symbols として返さないが、
+    /// 仮に抽出された場合に exported 判定を fail-closed にするための保険)
+    #[test]
+    fn ts_hash_private_member_helper_returns_true() {
+        let src = r#"export class C {
+    #secret: number = 0;
+    #helper(): void {}
+}
+"#;
+        let language = LangId::Typescript.ts_language();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+
+        // private_property_identifier ノードを再帰探索し、is_private_class_member_js_ts が true を返すこと
+        fn find_private_property_identifier<'t>(
+            n: tree_sitter::Node<'t>,
+        ) -> Option<tree_sitter::Node<'t>> {
+            if n.kind() == "private_property_identifier" {
+                return Some(n);
+            }
+            let mut c = n.walk();
+            for child in n.children(&mut c) {
+                if let Some(found) = find_private_property_identifier(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let priv_node =
+            find_private_property_identifier(root).expect("private_property_identifier exists");
+        assert!(
+            is_private_class_member_js_ts(priv_node, src.as_bytes()),
+            "#private メンバ ({:?}) は private_class_member として判定されるべき",
+            priv_node.utf8_text(src.as_bytes())
+        );
+    }
+
+    /// `protected` は当面保守的に exported のまま (TODO 扱い)
+    #[test]
+    fn ts_protected_class_method_is_exported() {
+        let src = r#"export class C {
+    protected helper(): void {}
+}
+"#;
+        assert!(check_exported(src, LangId::Typescript, "helper"));
     }
 
     #[test]

@@ -289,6 +289,7 @@ fn collect_identifier_refs(
     if is_identifier_kind(node.kind())
         && let Ok(text) = node.utf8_text(source)
         && normalize_identifier(lang_id, text).as_ref() == symbol_name
+        && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
     {
         let is_def = is_definition_context(node, definition_kinds, lang_id);
         let context = extract_line_context(source, node.start_position().row);
@@ -699,6 +700,63 @@ fn is_identifier_kind(kind: &str) -> bool {
             | "word"
             | "constant"
     )
+}
+
+/// Rust の構造体フィールド系ノードを参照として扱うべきでないかを判定する。
+///
+/// `pub fn redact()` のような関数名と struct field 名 (`pub redact: bool`) が衝突した場合、
+/// `cfg.output.redact` のフィールドアクセスや struct 宣言/初期化が関数の呼び出し位置として
+/// 誤マッチして impact 分析にノイズを生む (Issue: 2026-05-21-redact-impact-triage)。
+///
+/// 関数ではないことが構造的に明らかな以下のケースを除外する:
+/// - `field_declaration` の field_identifier (struct のフィールド宣言)
+/// - `field_initializer` の field 側 field_identifier (`Config { redact: ... }`)
+/// - `field_pattern` の field_identifier (destructuring `let Cfg { redact: v } = ...`)
+/// - `shorthand_field_initializer` 配下の identifier (`Config { redact }`)
+/// - `field_expression` の field_identifier で、祖先 `call_expression.function` でないもの
+///   (純粋なフィールドアクセス `obj.redact`)
+///
+/// 一方、メソッド呼び出し (`obj.method()`) の `method` 部は `field_identifier` ノードだが
+/// 親 `field_expression` がさらに親 `call_expression` の `function` フィールドに位置するため
+/// 関数参照として残す。
+fn is_rust_struct_field_non_callable(node: Node<'_>) -> bool {
+    match node.kind() {
+        "field_identifier" => {
+            let Some(parent) = node.parent() else {
+                return false;
+            };
+            match parent.kind() {
+                // `pub redact: bool` の name
+                "field_declaration" => true,
+                // `Config { redact: ... }` の field 部
+                "field_initializer" => parent
+                    .child_by_field_name("field")
+                    .is_some_and(|n| n.id() == node.id()),
+                // `let Cfg { redact: v } = ...` の destructuring 中の field name 部
+                // (`field_pattern` の field_identifier は常に name 役割で、pattern 部は別ノード)
+                "field_pattern" => true,
+                // `obj.redact` または `obj.redact()` の field 部
+                "field_expression" => {
+                    let Some(grand) = parent.parent() else {
+                        // 祖先なし → 純粋なフィールドアクセスとして除外
+                        return true;
+                    };
+                    // method call (`obj.method()`) の `method` 部は関数参照として残す
+                    let is_method_call = grand.kind() == "call_expression"
+                        && grand
+                            .child_by_field_name("function")
+                            .is_some_and(|n| n.id() == parent.id());
+                    !is_method_call
+                }
+                _ => false,
+            }
+        }
+        // shorthand: `Config { redact }` の `redact`
+        "identifier" => node
+            .parent()
+            .is_some_and(|p| p.kind() == "shorthand_field_initializer"),
+        _ => false,
+    }
 }
 
 /// Rust の属性引数で文字列値を識別子/パス参照として解釈すべきキー。
@@ -1296,6 +1354,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
     if is_identifier_kind(node.kind())
         && let Ok(text) = node.utf8_text(source)
         && let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, text))
+        && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
     {
         let is_def = is_definition_context(node, definition_kinds, lang_id);
         let context = extract_line_context(source, node.start_position().row);
@@ -1639,6 +1698,7 @@ fn collect_identifier_refs_indexed(
     if is_identifier_kind(node.kind())
         && let Ok(text) = node.utf8_text(source)
         && let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, text))
+        && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
     {
         let is_def = is_definition_context(node, definition_kinds, lang_id);
         let context = extract_line_context(source, node.start_position().row);
@@ -1825,6 +1885,7 @@ fn count_identifier_refs(
         && let Ok(text) = node.utf8_text(source)
         && let Some(ixs) = name_to_ix.get(&normalize_identifier(lang_id, text))
         && !is_definition_context(node, definition_kinds, lang_id)
+        && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
     {
         for &ix in ixs {
             counts[ix] += 1;
@@ -2083,6 +2144,145 @@ mod tests {
         assert!(!is_identifier_kind("block"));
         assert!(!is_identifier_kind("string"));
         assert!(!is_identifier_kind("comment"));
+    }
+
+    /// Rust の `pub fn` と struct field が同名のとき、フィールドアクセスや
+    /// struct 宣言・初期化を関数参照として誤マッチしないことを検証
+    /// (Issue: 2026-05-21-redact-impact-triage)
+    #[test]
+    fn find_references_rust_function_excludes_same_name_struct_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rs");
+        std::fs::write(
+            &a,
+            r#"pub struct Cfg {
+    pub redact: bool,
+}
+
+pub fn redact(input: &str) -> String {
+    input.to_string()
+}
+
+fn build(flag: bool) -> Cfg {
+    Cfg { redact: flag }
+}
+
+fn build_short() -> Cfg {
+    let redact = true;
+    Cfg { redact }
+}
+
+fn caller(cfg: &Cfg, data: &str) {
+    if cfg.redact {
+        let _ = redact(data);
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let refs = find_references("redact", dir.path(), Some("**/*.rs")).unwrap();
+        let kinds: Vec<_> = refs.iter().map(|r| (r.line, r.kind)).collect();
+
+        // 期待:
+        // - L4 (`pub fn redact`) — Definition
+        // - L18 (`let _ = redact(data)`) — Reference (関数呼び出し)
+        // それ以外のフィールド系 (L1=struct field 宣言, L9=field_initializer,
+        // L13=`let redact = true;` の binding ではなく、`Cfg { redact }` の shorthand,
+        // L16=`cfg.redact` の field_expression) は含まれないこと
+        assert!(
+            kinds.iter().any(|(_, k)| *k == Some(RefKind::Definition)),
+            "関数定義が含まれること: kinds={kinds:?}"
+        );
+        let refs_text: Vec<&str> = refs.iter().filter_map(|r| r.context.as_deref()).collect();
+        // 関数呼び出しの行は含まれる
+        assert!(
+            refs_text.iter().any(|c| c.contains("redact(data)")),
+            "関数呼び出し redact(data) は含まれるべき: {refs_text:?}"
+        );
+        // 純粋なフィールドアクセス / 宣言 / 初期化系は含まれない
+        assert!(
+            !refs_text.iter().any(|c| c.contains("pub redact: bool")),
+            "struct field 宣言 'pub redact: bool' は除外されるべき: {refs_text:?}"
+        );
+        assert!(
+            !refs_text.iter().any(|c| c.trim() == "redact: flag,"),
+            "field_initializer 'redact: flag' は除外されるべき: {refs_text:?}"
+        );
+        assert!(
+            !refs_text.iter().any(|c| c.contains("Cfg { redact }")),
+            "shorthand 'Cfg {{ redact }}' は除外されるべき: {refs_text:?}"
+        );
+        assert!(
+            !refs_text.iter().any(|c| c.contains("cfg.redact")),
+            "field_expression 'cfg.redact' は除外されるべき: {refs_text:?}"
+        );
+    }
+
+    /// destructuring pattern (`let Cfg { redact: v } = ...`) の field name も
+    /// 関数参照として誤マッチしないことを検証
+    /// (codex コミット前レビューでの追加指摘)
+    #[test]
+    fn find_references_rust_function_excludes_field_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rs");
+        std::fs::write(
+            &a,
+            r#"pub struct Cfg { pub redact: bool }
+pub fn redact(input: &str) -> String { input.to_string() }
+fn caller(cfg: Cfg, data: &str) {
+    let Cfg { redact: value } = cfg;
+    if value {
+        let _ = redact(data);
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let refs = find_references("redact", dir.path(), Some("**/*.rs")).unwrap();
+        let texts: Vec<&str> = refs.iter().filter_map(|r| r.context.as_deref()).collect();
+        assert!(
+            !texts
+                .iter()
+                .any(|c| c.contains("let Cfg { redact: value }")),
+            "field_pattern の name 部は除外されるべき: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|c| c.contains("redact(data)")),
+            "関数呼び出しは残るべき: {texts:?}"
+        );
+    }
+
+    /// メソッド呼び出し `obj.method()` の `method` 部は関数参照として残ることを検証
+    #[test]
+    fn find_references_rust_method_call_field_identifier_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rs");
+        std::fs::write(
+            &a,
+            r#"struct S;
+impl S {
+    fn run(&self) {}
+}
+fn caller(s: &S) {
+    s.run();
+}
+"#,
+        )
+        .unwrap();
+
+        let refs = find_references("run", dir.path(), Some("**/*.rs")).unwrap();
+        let texts: Vec<&str> = refs.iter().filter_map(|r| r.context.as_deref()).collect();
+        // 定義 (`fn run(&self) {}`) + メソッド呼び出し (`s.run();`) の 2 件
+        assert!(
+            texts.iter().any(|c| c.contains("s.run()")),
+            "method call s.run() は関数参照として残るべき: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|c| c.contains("fn run(&self)")),
+            "定義 fn run は残るべき: {texts:?}"
+        );
     }
 
     /// 単一 refs 検索が複数ファイルを横断し、定義を先頭に返すことを検証
