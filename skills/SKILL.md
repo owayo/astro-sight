@@ -101,6 +101,8 @@ echo '{"command":"refs","name":"Sym1","dir":"."}
 - Asking 2+ mixed astro-sight questions in one loop? Use `astro-sight session` instead of paying startup cost for each command.
 - Need a call-flow overview for explanation or review? Use `astro-sight sequence` after `calls` or `symbols` identifies the target function.
 - Need exact syntax around a confusing match or parse error? Escalate from `symbols` to `astro-sight ast --path <file> --line <n> --col <n>`.
+- Checking a multi-file change for hidden coupling? Run `astro-sight cochange --dir . --git --base <rev>` before assuming filenames tell the whole story.
+- Turning a repeated review note into a rule? Write one small `lint` rule and run it, instead of repeating natural-language checks.
 
 ## Escalation Path
 
@@ -119,6 +121,8 @@ echo '{"command":"refs","name":"Sym1","dir":"."}
 - Need to audit exported/public cleanup after parser, dependency, or API-surface work? → run `astro-sight dead-code --dir . --git`; use `--dir .` for a full sweep
 - Need to predict **co-change fallout** before missing a related file? → `astro-sight cochange --dir . --git --base <rev>` (or `--paths <file>`) before guessing from filenames alone
 - Need to explain a non-trivial call path after `calls` identifies the target? → `astro-sight sequence --path <file> --function <name>`
+- Need to verify a generated or minified parse oddity? → `astro-sight ast --path <file> --line <n> --col <n>` and inspect the node kind before changing logic
+- Need to turn a one-off policy into a repeatable check? → `astro-sight lint --path <file> --rules rules.yaml`
 - Reviewing a multi-commit branch? → pass the same `--base <rev>` to `review`, `context`, or `impact`; `review --git --base <rev>` also uses that base for blame-backed `missing_cochanges`.
 
 Adoption guard: if your plan contains `symbols` + `imports`, `symbols` + `calls`, or `calls` + `sequence`, run them through `astro-sight session` unless you only need one command. This keeps process startup low and makes use of currently underused structural tools.

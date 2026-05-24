@@ -71,13 +71,22 @@ pub(crate) fn find_signature_in_lines(
     func_name: &str,
     lang_id: LangId,
 ) -> Option<String> {
+    let func_name = bare_symbol_name(func_name);
     for line in lines {
         let trimmed = line.trim();
-        if text_contains(trimmed, func_name, lang_id) && is_signature_line(trimmed) {
+        if line_has_identifier(trimmed, func_name, lang_id) && is_signature_line(trimmed) {
             return Some(trimmed.to_string());
         }
     }
     None
+}
+
+/// `Type::method` 形式の名前でも、シグネチャ行では末尾の識別子だけを照合する。
+fn bare_symbol_name(symbol_name: &str) -> &str {
+    symbol_name
+        .rsplit(|c: char| !(c == '_' || c.is_alphanumeric()))
+        .find(|part| !part.is_empty())
+        .unwrap_or(symbol_name)
 }
 
 /// ヒューリスティック: 関数定義キーワードを含む行をシグネチャと判定する。
@@ -376,6 +385,28 @@ mod tests {
         }];
         let changes = detect_signature_changes(diff, "src/lib.rs", &affected, LangId::Rust);
         assert!(changes.is_empty());
+    }
+
+    // 対象名を prefix に持つ別関数の変更はシグネチャ変更として扱わない
+    #[test]
+    fn detect_signature_changes_ignores_prefix_function_names() {
+        let diff = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,3 @@
+-fn detect_api_changes_skips_module_declaration() {
++fn detect_api_changes_modified_includes_multiline_signature_change() {
+ }";
+        let affected = vec![AffectedSymbol {
+            name: "detect_api_changes".to_string(),
+            kind: "function".to_string(),
+            change_type: "modified".to_string(),
+        }];
+        let changes = detect_signature_changes(diff, "src/lib.rs", &affected, LangId::Rust);
+        assert!(
+            changes.is_empty(),
+            "prefix が一致するだけの別関数を detect_api_changes のシグネチャ変更として扱わない"
+        );
     }
 
     // 非関数シンボル（struct 等）はスキップされる

@@ -221,6 +221,7 @@ astro-sight refs --names "AppService,AstgenResponse" --dir src/
 ### context - スマートコンテキスト（diff → 影響分析）
 
 unified diff を受け取り、変更の影響範囲を分析する。AI コードレビュー支援機能。
+関数シグネチャ変更は識別子境界で照合するため、`foo` と `foo_bar` のような prefix 名の別関数を混同しない。
 
 ```bash
 # git diff を自動取得して影響分析（推奨）
@@ -267,6 +268,7 @@ astro-sight context --dir . --diff-file /tmp/changes.diff
 ### impact - 未解決の影響検出（stop hook 用）
 
 `context` の結果から、diff に含まれないファイルへの影響を「未解決」と判定する。AI エージェントの stop hook で使用し、未対応の影響先があればブロックして続行を促す。
+シグネチャ変更の判定は `context` と同じく識別子境界一致を使うため、テストヘルパーや派生名の変更が基底名の関数変更として波及しない。
 
 ```bash
 # git diff を自動取得して未解決影響を検出（推奨）

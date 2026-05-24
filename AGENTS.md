@@ -9,7 +9,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - **BLAKE3** ベースのファイルキャッシュ（単一ファイル `ast` / `symbols` は内容ハッシュに canonical path を混ぜ、同一内容の別ファイルや別言語で `path` / `lang` が混線しない）
 - **clap derive** による CLI 引数パーサー
 - **NDJSON** ストリーミングセッション対応
-- **スマートコンテキスト**（diff→影響分析、単一/バッチ参照検索は fold/reduce でピーク RSS を抑制、バッチ参照検索 O(N+S)）
+- **スマートコンテキスト**（diff→影響分析、関数シグネチャ変更は識別子境界で照合して prefix 名の別関数を誤検出しない、単一/バッチ参照検索は fold/reduce でピーク RSS を抑制、バッチ参照検索 O(N+S)）
 - **AST 応答の巨大行抑制**（`ast` の `text` / `snippet` は 256 文字上限で切り詰め、巨大行で応答が肥大化しない）
 - **MCP サーバーモード**（rmcp 1.7 による stdio JSON-RPC 2.0、ワークスペースサンドボックス、11 ツール）
 - **デフォルト compact JSON** 出力（`--pretty` で整形出力）
@@ -41,6 +41,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/engine/refs.rs` - クロスファイル参照検索（ignore + rayon 並列 + fold/reduce 集約 + memchr/memmem 事前フィルタ + Aho-Corasick バッチ検索 + `collect_files` pub ユーティリティ）、CI 言語（Xojo）では正規化キー衝突を `Vec<usize>` で吸収、行コンテキスト抽出は `memchr` で該当行のみ UTF-8 変換
 - `src/engine/diff.rs` - unified diff パーサー
 - `src/engine/impact/mod.rs` - 影響分析オーケストレーター（CI 言語のみの diff は Pass1 前に skip、通常は 3パス方式: collect affected → stream refs → assemble）、`ParsedFile` キャッシュは `SourceBuf` を直接保持し mmap ゼロコピー経路を維持
+- `src/engine/impact/signature.rs` - diff の `+` / `-` 行から関数シグネチャ変更を検出（識別子境界で照合し、`foo` と `foo_bar` のような prefix 名を混同しない）
 - `src/engine/sequence.rs` - コールグラフから Mermaid シーケンス図を生成
 - `src/engine/imports.rs` - ファイル間の import/export 関係を抽出（言語別 tree-sitter クエリ）
 - `src/engine/lint.rs` - YAML ルールによる AST パターンマッチ（tree-sitter クエリ + テキストパターン）
