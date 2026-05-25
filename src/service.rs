@@ -3,8 +3,11 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
 use crate::cache::store::CacheStore;
-use crate::engine::{calls, extractor, impact, imports, lint, parser, refs, snippet, symbols};
+use crate::engine::{
+    calls, extractor, impact, imports, lexer, lint, parser, refs, snippet, symbols,
+};
 use crate::error::{AstroError, ErrorCode};
+use crate::language::{DetectedLang, LangId};
 use crate::models::call::CallGraph;
 use crate::models::cochange::{CoChangeOptions, CoChangeResult};
 use crate::models::impact::ContextResult;
@@ -276,13 +279,45 @@ impl AppService {
     }
 
     /// ソースファイルからシンボルを抽出し、診断情報も返す。
+    ///
+    /// `LangId::is_lexer_only()` な言語 (現状 Xojo) は手書き lexer で抽出する。
+    /// tree-sitter は使わないためメモリ消費は入力サイズに対して線形ではなく定数倍に近い。
     pub fn extract_symbols(&self, path: &str) -> Result<AstgenResponse> {
         debug!(path = path, "extract_symbols called");
         let utf8_path_buf = self.validate_path_utf8(path)?;
         let utf8_path = utf8_path_buf.as_path();
 
         let source = parser::read_file(utf8_path)?;
-        let (tree, lang_id) = parser::parse_file(utf8_path, &source)?;
+
+        // 言語検出 (shebang fallback も考慮)。
+        let lang_id = LangId::from_path(utf8_path).or_else(|_| {
+            let first_line = std::str::from_utf8(&source)
+                .ok()
+                .and_then(|s| s.lines().next())
+                .unwrap_or("");
+            LangId::from_shebang(first_line).ok_or_else(|| {
+                AstroError::unsupported_language(utf8_path.extension().unwrap_or("<none>"))
+            })
+        })?;
+
+        // lexer-only 言語は tree-sitter を使わず手書き lexer で抽出する。
+        if let DetectedLang::LexerOnly(lexer_lang) = lang_id.detected() {
+            let syms = lexer::extract_symbols(&source, lexer_lang);
+            let location = LocationKey::file_only(path);
+            let mut response = AstgenResponse::success(location, lang_id);
+            response.hash = Some(CacheStore::hash(&source));
+            response.symbols = Some(syms);
+            // lexer 経路では tree-sitter 診断 (構文エラー等) は出ない。
+            debug!(
+                path = path,
+                language = ?lang_id,
+                symbols = response.symbols.as_ref().map(|s| s.len()).unwrap_or(0),
+                "extract_symbols completed (lexer)"
+            );
+            return Ok(response);
+        }
+
+        let tree = parser::parse_source(&source, lang_id)?;
         let root = tree.root_node();
 
         let syms = symbols::extract_symbols(root, &source, lang_id)?;

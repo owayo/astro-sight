@@ -979,12 +979,14 @@ pub fn cmd_review(
 
     // 2. impact 分析
     //
-    // diff の全 changed file が case-insensitive 言語 (Xojo 等) のみで構成される場合は
-    // context フェーズ全体を skip する。Xojo は tree-sitter-xojo grammar が
-    // GLR バックトラッキングで指数的にメモリを食うことがあり、`parse_file` 単体で
-    // 数 GB 〜数十 GB を消費する。Phase 5 の pass2 skip では parse は走るため
-    // OOM を防げない。Pass1 (collect_affected_symbols) も呼ばずに空 ContextResult
-    // を返す。`ASTRO_SIGHT_FORCE_CI_LANG_IMPACT=1` で強制的に従来挙動に戻せる。
+    // diff の全 changed file が case-insensitive 言語 (Xojo) のみで構成される場合は
+    // context フェーズを skip する。
+    //
+    // v26.5 まで: tree-sitter-xojo の OOM 防止が主目的の load-bearing fix。
+    // v26.6 以降: tree-sitter-xojo を削除して OOM リスクは解消。だが lexer-only 言語の
+    // cross-file refs は汎用名ノイズが多く実用精度が出ないため引き続き skip する。
+    // 本格的な lexer-only impact 解析は将来の PR で対応予定。
+    // `ASTRO_SIGHT_FORCE_CI_LANG_IMPACT=1` で従来挙動に戻せる (デバッグ用)。
     let pre_diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
     let force_ci = std::env::var("ASTRO_SIGHT_FORCE_CI_LANG_IMPACT")
         .ok()
@@ -1035,9 +1037,10 @@ pub fn cmd_review(
 
     // 5. API surface diff
     //
-    // 全 changed file が CI 言語のみの場合は context と同じ理由で skip する
-    // (detect_api_changes も内部で extract_exported_symbols → tree-sitter parse を
-    // 呼ぶため、Xojo grammar 暴走の影響を受ける)。
+    // 全 changed file が CI 言語 (Xojo) のみの場合は skip する。
+    // v26.5 まで: tree-sitter-xojo OOM 対策。
+    // v26.6 以降: lexer-only 言語の API 差分は signature 抽出精度が tree-sitter 比で
+    // 大幅に劣る (引数列・戻り値型を取れない) ため、誤検出を避けて skip 維持。
     let api_changes = if all_ci_lang && !force_ci {
         log_phase("api_changes.skip_ci_only", "applied", 0);
         ApiChanges {
@@ -2004,29 +2007,10 @@ pub(crate) fn detect_dead_symbols_from_files(
     // case-insensitive 言語 (Xojo 等) のみで構成された files では dead-code 検出を
     // skip する。
     //
-    // CI 言語は `Foo` / `foo` / `FOO` を同じシンボルとして扱うため、汎用名が多用される
-    // プロジェクトでは:
-    // (1) 全 export シンボル × 全リポジトリファイルの AC マッチングで heap が膨張し OOM
-    // (2) 同名シンボルの誤マッチで test_only / dead 判定の精度が低い
-    // という二重の問題があるため、CI 言語のみの diff では dead-code 検出をスキップする。
-    //
-    // 強制的に従来挙動に戻したい場合は `ASTRO_SIGHT_FORCE_CI_LANG_DEAD_CODE=1` を
-    // 設定する。
-    if !files.is_empty()
-        && std::env::var("ASTRO_SIGHT_FORCE_CI_LANG_DEAD_CODE")
-            .ok()
-            .as_deref()
-            != Some("1")
-    {
-        let all_ci = files.iter().all(|p| {
-            p.to_str()
-                .and_then(|s| crate::language::LangId::from_path(camino::Utf8Path::new(s)).ok())
-                .is_some_and(|l| l.is_case_insensitive())
-        });
-        if all_ci {
-            return (Vec::new(), Vec::new());
-        }
-    }
+    // v26.5 まで: CI 言語 (Xojo) は tree-sitter parse が OOM する問題で diff 全体を skip。
+    // v26.6 以降: tree-sitter-xojo を削除し lexer-only に移行。dead-code は lexer 経由で
+    // 動作するため CI skip 機構は不要。`ASTRO_SIGHT_FORCE_CI_LANG_DEAD_CODE` は deprecate
+    // (no-op、警告も出さない)。
 
     // .gitattributes の linguist-generated 指定ファイルは dead-code 検出から除外する
     let gitattrs = crate::engine::gitattributes::GitAttributes::load(&canonical_dir);
@@ -2333,6 +2317,13 @@ fn extract_exported_symbols_from_file_inner(
     let utf8_path = camino::Utf8Path::new(full_path.to_str()?);
     let source = parser::read_file(utf8_path).ok()?;
     let lang_id = crate::language::LangId::from_path(utf8_path).ok()?;
+
+    // lexer-only 言語 (現状 Xojo) は tree-sitter を持たないため、lexer 経由で
+    // export 相当のシンボルを抽出する。
+    if let crate::language::DetectedLang::LexerOnly(lexer_lang) = lang_id.detected() {
+        return Some(extract_lexer_exported_symbols(&source, lexer_lang));
+    }
+
     let tree = parser::parse_source(&source, lang_id).ok()?;
     let root = tree.root_node();
 
@@ -2346,6 +2337,52 @@ fn extract_exported_symbols_from_file_inner(
         exclude_framework_entrypoints,
         Some(file_path),
     ))
+}
+
+/// lexer-only 言語向けの dead-code 候補抽出。
+///
+/// Xojo は Public/Protected/Private 修飾子を持つが、現状の lexer は修飾子の有無を
+/// 記録していない。保守的に全 Class/Module/Function/Method/Property/Const/Enum を
+/// export 候補として返す (refs が 0 件なら dead と判定される)。
+/// signature は空文字 (lexer profile では本格的な signature 抽出をしない)。
+fn extract_lexer_exported_symbols(
+    source: &[u8],
+    lexer_lang: crate::language::LexerLang,
+) -> Vec<(String, String, String)> {
+    use crate::models::symbol::SymbolKind;
+    crate::engine::lexer::extract_symbols(source, lexer_lang)
+        .into_iter()
+        .filter(|s| {
+            matches!(
+                s.kind,
+                SymbolKind::Class
+                    | SymbolKind::Module
+                    | SymbolKind::Function
+                    | SymbolKind::Method
+                    | SymbolKind::Constant
+                    | SymbolKind::Enum
+                    | SymbolKind::Field
+                    | SymbolKind::Interface
+                    | SymbolKind::Struct
+            )
+        })
+        .map(|s| {
+            let kind_str = match s.kind {
+                SymbolKind::Class => "class",
+                SymbolKind::Module => "module",
+                SymbolKind::Function => "function",
+                SymbolKind::Method => "method",
+                SymbolKind::Constant => "constant",
+                SymbolKind::Enum => "enum",
+                SymbolKind::Field => "field",
+                SymbolKind::Interface => "interface",
+                SymbolKind::Struct => "struct",
+                _ => "unknown",
+            }
+            .to_string();
+            (s.name, kind_str, String::new())
+        })
+        .collect()
 }
 
 /// シンボルの種類に応じた API シグネチャを抽出する。

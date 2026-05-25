@@ -7583,7 +7583,6 @@ class MainActivity : AppCompatActivity() {
 // PR3 で lexer 経由の symbols/refs/calls が復活するまで以下のテストは ignore する。
 
 #[test]
-#[ignore = "tree-sitter-xojo removed in PR2; rewrite via lexer in PR3"]
 fn xojo_symbols_from_fixture() {
     let output = cargo_bin()
         .args(["symbols", "--path", "tests/fixtures/sample.xojo_code"])
@@ -7607,24 +7606,25 @@ fn xojo_symbols_from_fixture() {
 }
 
 #[test]
-#[ignore = "tree-sitter-xojo removed in PR2; rewrite via lexer in PR3"]
-fn xojo_calls_detect_method_callee() {
+fn xojo_calls_returns_unsupported() {
+    // v26.6 以降、Xojo は lexer-only バックエンド。calls は tree-sitter Query 必須のため
+    // UNSUPPORTED_LANGUAGE を返す (空結果ではなく明確なエラーで AI エージェントに区別可能)。
     let output = cargo_bin()
         .args(["calls", "--path", "tests/fixtures/sample.xojo_code"])
         .output()
         .expect("failed to run");
-    assert!(output.status.success());
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    assert_eq!(json["lang"], "xojo");
-    let serialized = json.to_string();
     assert!(
-        serialized.contains("Greet") || serialized.contains("Print"),
-        "Greet または Print が callee として検出されるべき: {serialized}"
+        !output.status.success(),
+        "calls は xojo に対して非ゼロ exit すべき"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(
+        json["error"]["code"], "UNSUPPORTED_LANGUAGE",
+        "xojo は lexer-only のため calls は UNSUPPORTED_LANGUAGE を返す"
     );
 }
 
 #[test]
-#[ignore = "tree-sitter-xojo removed in PR2; rewrite via lexer in PR3"]
 fn xojo_refs_case_insensitive_uppercase() {
     // Xojo は識別子が case-insensitive。大文字の `GREET` で小文字定義がヒットすべき。
     let output = cargo_bin()
@@ -7653,7 +7653,6 @@ fn xojo_refs_case_insensitive_uppercase() {
 }
 
 #[test]
-#[ignore = "tree-sitter-xojo removed in PR2; rewrite via lexer in PR3"]
 fn xojo_refs_lowercase_matches_mixedcase_definition() {
     // 小文字 `greet` でも Greet 定義と同件数がヒットすべき。
     let output = cargo_bin()
@@ -7698,7 +7697,6 @@ fn xojo_refs_rust_case_preserved() {
 }
 
 #[test]
-#[ignore = "tree-sitter-xojo removed in PR2; rewrite via lexer in PR3"]
 fn xojo_refs_batch_case_insensitive_collision() {
     // Xojo は case-insensitive。`Greet` と `greet` を同一バッチで渡しても
     // 両方に同じ参照リストが割り当たるべき（正規化キーの衝突で片方が欠落しないこと）。

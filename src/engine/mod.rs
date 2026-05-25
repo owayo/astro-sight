@@ -8,6 +8,7 @@ pub mod generated;
 pub mod gitattributes;
 pub mod impact;
 pub mod imports;
+pub mod lexer;
 pub mod lint;
 pub mod parser;
 pub mod phpunit_refs;

@@ -113,17 +113,18 @@ pub(super) fn stream_caller_maps_and_defs(
     // case-insensitive 言語 (Xojo 等) のみで構成された diff では cross-file 解析を
     // skip する。
     //
-    // CI 言語は識別子の大文字小文字を区別しないため、`Foo` / `foo` / `FOO` がすべて
-    // 同じシンボルになる。これに加えて Xojo 系プロジェクトでは汎用名 (`e` / `row` /
-    // `setting` / イベント引数等) が多用される。結果として、cross-file 影響分析は
-    // (1) 同名シンボルの per-reference fanout で `global_maps` が処理時間に線形蓄積
-    //     して RSS が無制限に膨らむ
-    // (2) ノイズだらけで実用的な精度が出ない
-    // という二重の問題を抱える。CI 言語のみの diff では cross-file 解析を行わず、
-    // 空の結果を返すことで上記を回避する。
+    // v26.5 まで: tree-sitter-xojo の parse_file が 1GB/秒で OOM するため CI 言語 diff
+    // を skip する load-bearing fix だった。
     //
-    // 強制的に従来挙動に戻したい場合は `ASTRO_SIGHT_FORCE_CI_LANG_IMPACT=1` を
-    // 設定する。
+    // v26.6 以降: tree-sitter-xojo を削除し Xojo は lexer-only に移行。OOM リスクは
+    // 完全に排除された。ただし以下の理由から cross-file 解析は **依然として skip** する:
+    // (1) CI 言語の `Foo`/`foo`/`FOO` 同一視 + Xojo 系プロジェクトでの汎用名 (`e`/`row`/
+    //     `setting` 等) の多用により、同名シンボルの per-reference fanout でノイズが
+    //     大量発生し実用精度が出ない。
+    // (2) lexer-only 言語の symbols/refs は PR3 で復活したが、impact 解析 (Pass2/Pass3)
+    //     の lexer 経路は別途設計が必要 (将来の PR)。
+    //
+    // `ASTRO_SIGHT_FORCE_CI_LANG_IMPACT=1` で従来挙動に戻せる (デバッグ用)。
     let all_ci = !file_contexts.is_empty()
         && file_contexts
             .iter()

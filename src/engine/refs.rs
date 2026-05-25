@@ -245,6 +245,9 @@ fn path_has_excluded_segment(path: &Path, excluded: &[&str]) -> bool {
 }
 
 /// 単一ファイル内でシンボル参照を検索する。
+///
+/// lexer-only 言語 (現状 Xojo) は手書き lexer で identifier 列挙する。
+/// tree-sitter 系は従来通り Query + AST 走査で確定検証する。
 fn find_refs_in_file(symbol_name: &str, path: &camino::Utf8Path) -> Result<Vec<SymbolReference>> {
     let source = parser::read_file(path)?;
 
@@ -254,6 +257,13 @@ fn find_refs_in_file(symbol_name: &str, path: &camino::Utf8Path) -> Result<Vec<S
     let is_ci = ext_lang.is_some_and(|l| l.is_case_insensitive());
     if !is_ci && memchr::memmem::find(&source, symbol_name.as_bytes()).is_none() {
         return Ok(Vec::new());
+    }
+
+    // lexer-only 言語は parse_file を呼ばず lexer 経由で identifier 列挙する。
+    if let Some(lang) = ext_lang
+        && let crate::language::DetectedLang::LexerOnly(lexer_lang) = lang.detected()
+    {
+        return Ok(find_refs_via_lexer(symbol_name, &source, path, lexer_lang));
     }
 
     let (tree, lang_id) = parser::parse_file(path, &source)?;
@@ -273,6 +283,154 @@ fn find_refs_in_file(symbol_name: &str, path: &camino::Utf8Path) -> Result<Vec<S
     );
 
     Ok(refs)
+}
+
+/// lexer-only ファイル向けの参照検索。
+///
+/// identifier トークン位置を列挙し、定義ヘッダ行 (Class/Sub/Function 等) と
+/// 一致するものを Definition、それ以外を Reference として返す。
+fn find_refs_via_lexer(
+    symbol_name: &str,
+    source: &[u8],
+    path: &camino::Utf8Path,
+    lexer_lang: crate::language::LexerLang,
+) -> Vec<SymbolReference> {
+    use crate::engine::lexer;
+
+    // 定義ヘッダ位置 (行番号) のセット。lexer profile 経由で抽出。
+    let def_lines: std::collections::HashSet<usize> = lexer::extract_symbols(source, lexer_lang)
+        .iter()
+        .filter(|s| {
+            // 大小無視で名前一致するもののみ抽出 (Xojo は case-insensitive)。
+            let profile = lexer::profile_for(lexer_lang);
+            if profile.case_insensitive {
+                s.name.eq_ignore_ascii_case(symbol_name)
+            } else {
+                s.name == symbol_name
+            }
+        })
+        .map(|s| s.range.start.line)
+        .collect();
+
+    let names = vec![symbol_name.to_string()];
+    let bucket = lexer::find_identifier_refs(source, &names, lexer_lang);
+    let matches = bucket
+        .into_iter()
+        .next()
+        .map(|(_, v)| v)
+        .unwrap_or_default();
+
+    // lexer 経路は 0-indexed line で統一済み (tree-sitter::Point と同じ)。
+    matches
+        .into_iter()
+        .map(|m| {
+            let is_def = def_lines.contains(&m.line);
+            SymbolReference {
+                path: path.as_str().to_string(),
+                line: m.line,
+                column: m.column,
+                context: Some(extract_line_context_bytes(source, m.line)),
+                kind: Some(if is_def {
+                    RefKind::Definition
+                } else {
+                    RefKind::Reference
+                }),
+                confidence: None,
+            }
+        })
+        .collect()
+}
+
+/// batch 経路向け lexer fallback。複数 symbol の参照を一度の走査で集める。
+fn find_refs_batch_via_lexer(
+    symbol_names: &[String],
+    present_indices: &std::collections::HashSet<usize>,
+    source: &[u8],
+    path: &camino::Utf8Path,
+    lexer_lang: crate::language::LexerLang,
+) -> Vec<Vec<SymbolReference>> {
+    use crate::engine::lexer;
+
+    let num = symbol_names.len();
+    let mut result: Vec<Vec<SymbolReference>> = vec![Vec::new(); num];
+
+    // AC で存在を確認できた names のみ走査する (CI 言語でも safe: AC は ASCII CI 構築済)。
+    let active_indices: Vec<usize> = present_indices.iter().copied().collect();
+    if active_indices.is_empty() {
+        return result;
+    }
+
+    let active_names: Vec<String> = active_indices
+        .iter()
+        .map(|&i| symbol_names[i].clone())
+        .collect();
+
+    // 定義ヘッダ行を 1 回だけ抽出してキャッシュする (case_insensitive 正規化キー → 行集合)。
+    let profile = lexer::profile_for(lexer_lang);
+    let normalize = |s: &str| -> String {
+        if profile.case_insensitive {
+            s.to_ascii_lowercase()
+        } else {
+            s.to_string()
+        }
+    };
+    let mut def_lines: std::collections::HashMap<String, std::collections::HashSet<usize>> =
+        std::collections::HashMap::new();
+    for sym in lexer::extract_symbols(source, lexer_lang) {
+        def_lines
+            .entry(normalize(&sym.name))
+            .or_default()
+            .insert(sym.range.start.line);
+    }
+
+    let bucket = lexer::find_identifier_refs(source, &active_names, lexer_lang);
+    for (i, (name, matches)) in active_indices.iter().zip(bucket).enumerate() {
+        let normalized = normalize(&active_names[i]);
+        let def_set = def_lines.get(&normalized).cloned().unwrap_or_default();
+        let path_str = path.as_str().to_string();
+        for m in matches.1 {
+            let is_def = def_set.contains(&m.line);
+            result[*name].push(SymbolReference {
+                path: path_str.clone(),
+                line: m.line,
+                column: m.column,
+                context: Some(extract_line_context_bytes(source, m.line)),
+                kind: Some(if is_def {
+                    RefKind::Definition
+                } else {
+                    RefKind::Reference
+                }),
+                confidence: None,
+            });
+        }
+    }
+
+    result
+}
+
+/// 指定行 (0-indexed) のコンテキスト行を取得する。lexer fallback 経路用の
+/// 軽量実装 (tree-sitter の Node API に依存しない)。
+fn extract_line_context_bytes(source: &[u8], line_0idx: usize) -> String {
+    let mut current = 0usize;
+    let mut start = 0usize;
+    for (i, b) in source.iter().enumerate() {
+        if *b == b'\n' {
+            if current == line_0idx {
+                return std::str::from_utf8(&source[start..i])
+                    .unwrap_or("")
+                    .trim_end_matches('\r')
+                    .to_string();
+            }
+            current += 1;
+            start = i + 1;
+        }
+    }
+    if current == line_0idx {
+        return std::str::from_utf8(&source[start..])
+            .unwrap_or("")
+            .to_string();
+    }
+    String::new()
 }
 
 /// AST を再帰走査し、指定シンボル名に一致する identifier ノードを収集する。
@@ -1653,6 +1811,19 @@ pub(crate) fn find_refs_batch_in_file_indexed(
 
     if present_indices.is_empty() {
         return Ok(vec![Vec::new(); num]);
+    }
+
+    // lexer-only 言語は parse_file を呼ばず lexer 経路で identifier 列挙する。
+    if let Ok(lang) = LangId::from_path(path)
+        && let crate::language::DetectedLang::LexerOnly(lexer_lang) = lang.detected()
+    {
+        return Ok(find_refs_batch_via_lexer(
+            symbol_names,
+            &present_indices,
+            &source,
+            path,
+            lexer_lang,
+        ));
     }
 
     let (tree, lang_id) = parser::parse_file(path, &source)?;
