@@ -57,7 +57,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
 tracing-appender = "0.2.5"
 time = { version = "0.3.47", features = ["formatting", "macros", "local-offset"] }
 tree-sitter-zig = "1.1.2"
-tree-sitter-xojo = { git = "https://github.com/owayo/tree-sitter-xojo.git", branch = "main" }
+# tree-sitter-xojo は OOM の根因のため v26.6 で削除した。
+# Xojo は src/engine/lexer の手書き state machine で解析する (PR3 以降)。
 dhat = { version = "0.3.3", optional = true }
 
 [features]

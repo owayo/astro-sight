@@ -128,6 +128,11 @@ impl LangId {
     }
 
     /// Get the tree-sitter Language for this language ID.
+    ///
+    /// # Panics
+    /// `is_lexer_only()` が true の言語に対しては panic する。呼び出し前に
+    /// 必ず `is_lexer_only()` で振り分けるか、`detected().tree_sitter()` を
+    /// 使うこと。PR2 で Xojo を lexer-only に格下げしたためこの保証を導入した。
     pub fn ts_language(self) -> Language {
         match self {
             Self::Rust => Language::new(tree_sitter_rust::LANGUAGE),
@@ -149,7 +154,9 @@ impl LangId {
             Self::Bash => Language::new(tree_sitter_bash::LANGUAGE),
             Self::Ruby => Language::new(tree_sitter_ruby::LANGUAGE),
             Self::Zig => Language::new(tree_sitter_zig::LANGUAGE),
-            Self::Xojo => Language::new(tree_sitter_xojo::LANGUAGE),
+            Self::Xojo => {
+                panic!("Xojo is lexer-only since v26.6; callers must check is_lexer_only() first")
+            }
         }
     }
 
@@ -158,6 +165,202 @@ impl LangId {
     #[inline]
     pub fn is_case_insensitive(self) -> bool {
         matches!(self, Self::Xojo)
+    }
+
+    /// この言語が tree-sitter ではなく手書き lexer で解析されるかを返す。
+    /// `true` なら `ts_language()` は呼べない。
+    #[inline]
+    pub fn is_lexer_only(self) -> bool {
+        matches!(self, Self::Xojo)
+    }
+
+    /// LangId を新型 DetectedLang に変換する。
+    /// 既存コードは LangId を使い続け、新規コードは DetectedLang を介して
+    /// backend (TreeSitter / LexerOnly) を区別できる。
+    pub fn detected(self) -> DetectedLang {
+        match self {
+            Self::Rust => DetectedLang::TreeSitter(TreeSitterLang::Rust),
+            Self::C => DetectedLang::TreeSitter(TreeSitterLang::C),
+            Self::Cpp => DetectedLang::TreeSitter(TreeSitterLang::Cpp),
+            Self::Python => DetectedLang::TreeSitter(TreeSitterLang::Python),
+            Self::Javascript => DetectedLang::TreeSitter(TreeSitterLang::Javascript),
+            Self::Typescript => DetectedLang::TreeSitter(TreeSitterLang::Typescript),
+            Self::Tsx => DetectedLang::TreeSitter(TreeSitterLang::Tsx),
+            Self::Go => DetectedLang::TreeSitter(TreeSitterLang::Go),
+            Self::Php => DetectedLang::TreeSitter(TreeSitterLang::Php),
+            Self::Java => DetectedLang::TreeSitter(TreeSitterLang::Java),
+            Self::Kotlin => DetectedLang::TreeSitter(TreeSitterLang::Kotlin),
+            Self::Swift => DetectedLang::TreeSitter(TreeSitterLang::Swift),
+            Self::CSharp => DetectedLang::TreeSitter(TreeSitterLang::CSharp),
+            Self::Bash => DetectedLang::TreeSitter(TreeSitterLang::Bash),
+            Self::Ruby => DetectedLang::TreeSitter(TreeSitterLang::Ruby),
+            Self::Zig => DetectedLang::TreeSitter(TreeSitterLang::Zig),
+            Self::Xojo => DetectedLang::LexerOnly(LexerLang::Xojo),
+        }
+    }
+}
+
+/// tree-sitter バックエンドを持つ言語の列挙。
+/// `ts_language()` を呼べるのはこの型だけ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TreeSitterLang {
+    Rust,
+    C,
+    Cpp,
+    Python,
+    Javascript,
+    Typescript,
+    Tsx,
+    Go,
+    Php,
+    Java,
+    Kotlin,
+    Swift,
+    #[serde(rename = "csharp")]
+    CSharp,
+    Bash,
+    Ruby,
+    Zig,
+}
+
+impl TreeSitterLang {
+    /// tree-sitter Language を取得する。
+    pub fn ts_language(self) -> Language {
+        match self {
+            Self::Rust => Language::new(tree_sitter_rust::LANGUAGE),
+            Self::C => Language::new(tree_sitter_c::LANGUAGE),
+            Self::Cpp => Language::new(tree_sitter_cpp::LANGUAGE),
+            Self::Python => Language::new(tree_sitter_python::LANGUAGE),
+            Self::Javascript => Language::new(tree_sitter_javascript::LANGUAGE),
+            Self::Typescript => Language::new(tree_sitter_typescript::LANGUAGE_TYPESCRIPT),
+            Self::Tsx => Language::new(tree_sitter_typescript::LANGUAGE_TSX),
+            Self::Go => Language::new(tree_sitter_go::LANGUAGE),
+            Self::Php => Language::new(tree_sitter_php::LANGUAGE_PHP),
+            Self::Java => Language::new(tree_sitter_java::LANGUAGE),
+            Self::Kotlin => {
+                let ptr = tree_sitter_kotlin().cast::<tree_sitter::ffi::TSLanguage>();
+                unsafe { Language::from_raw(ptr) }
+            }
+            Self::Swift => Language::new(tree_sitter_swift::LANGUAGE),
+            Self::CSharp => Language::new(tree_sitter_c_sharp::LANGUAGE),
+            Self::Bash => Language::new(tree_sitter_bash::LANGUAGE),
+            Self::Ruby => Language::new(tree_sitter_ruby::LANGUAGE),
+            Self::Zig => Language::new(tree_sitter_zig::LANGUAGE),
+        }
+    }
+
+    /// 表示名 (シリアライズ表現と一致)。
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::C => "c",
+            Self::Cpp => "cpp",
+            Self::Python => "python",
+            Self::Javascript => "javascript",
+            Self::Typescript => "typescript",
+            Self::Tsx => "tsx",
+            Self::Go => "go",
+            Self::Php => "php",
+            Self::Java => "java",
+            Self::Kotlin => "kotlin",
+            Self::Swift => "swift",
+            Self::CSharp => "csharp",
+            Self::Bash => "bash",
+            Self::Ruby => "ruby",
+            Self::Zig => "zig",
+        }
+    }
+}
+
+impl std::fmt::Display for TreeSitterLang {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.display_name())
+    }
+}
+
+/// lexer fallback でだけ解析する言語の列挙。
+/// tree-sitter での parse が現実的でない言語（巨大 LR テーブルで OOM になる Xojo 等）や、
+/// まだ tree-sitter grammar が無い言語をここに置く。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LexerLang {
+    /// Xojo: case-insensitive な GLR バックトラッキング系言語。
+    /// tree-sitter-xojo は parse 中に 1GB/秒で線形にメモリ膨張するため v26.6 で削除し、
+    /// 手書き lexer に置換した。
+    Xojo,
+}
+
+impl LexerLang {
+    /// 表示名 (シリアライズ表現と一致)。
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Xojo => "xojo",
+        }
+    }
+
+    /// case-insensitive な識別子を持つ言語かどうか。
+    pub fn case_insensitive(self) -> bool {
+        match self {
+            Self::Xojo => true,
+        }
+    }
+}
+
+impl std::fmt::Display for LexerLang {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.display_name())
+    }
+}
+
+/// 検出された言語と、それを解析するためのバックエンドの組。
+/// `TreeSitter` は tree-sitter Query で解析、`LexerOnly` は手書き lexer で解析する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "backend", content = "lang", rename_all = "lowercase")]
+pub enum DetectedLang {
+    #[serde(rename = "tree_sitter")]
+    TreeSitter(TreeSitterLang),
+    #[serde(rename = "lexer_only")]
+    LexerOnly(LexerLang),
+}
+
+impl DetectedLang {
+    /// case-insensitive な識別子を持つ言語かどうか。
+    /// 現状の TreeSitter 系言語はすべて case-sensitive、LexerLang::Xojo のみ true。
+    pub fn case_insensitive(self) -> bool {
+        match self {
+            Self::TreeSitter(_) => false,
+            Self::LexerOnly(lang) => lang.case_insensitive(),
+        }
+    }
+
+    /// 表示名 (例: "rust", "xojo")。
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::TreeSitter(lang) => lang.display_name(),
+            Self::LexerOnly(lang) => lang.display_name(),
+        }
+    }
+
+    /// tree-sitter バックエンドの場合のみ Some を返す。
+    /// LexerLang は None を返す（呼び出し側は分岐する責務がある）。
+    pub fn tree_sitter(self) -> Option<TreeSitterLang> {
+        match self {
+            Self::TreeSitter(lang) => Some(lang),
+            Self::LexerOnly(_) => None,
+        }
+    }
+
+    /// この言語が手書き lexer で解析されるかを返す。
+    #[inline]
+    pub fn is_lexer_only(self) -> bool {
+        matches!(self, Self::LexerOnly(_))
+    }
+}
+
+impl std::fmt::Display for DetectedLang {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.display_name())
     }
 }
 
@@ -370,5 +573,59 @@ mod tests {
     #[test]
     fn shebang_ssh_not_bash() {
         assert_eq!(LangId::from_shebang("#!/usr/bin/ssh"), None);
+    }
+
+    #[test]
+    fn detected_lang_rust_is_tree_sitter() {
+        let d = LangId::Rust.detected();
+        assert!(matches!(d, DetectedLang::TreeSitter(TreeSitterLang::Rust)));
+        assert_eq!(d.display_name(), "rust");
+        assert!(!d.case_insensitive());
+        assert!(d.tree_sitter().is_some());
+    }
+
+    #[test]
+    fn detected_lang_xojo_is_lexer_only() {
+        let d = LangId::Xojo.detected();
+        assert!(matches!(d, DetectedLang::LexerOnly(LexerLang::Xojo)));
+        assert_eq!(d.display_name(), "xojo");
+        assert!(d.case_insensitive());
+        assert!(d.tree_sitter().is_none());
+        assert!(d.is_lexer_only());
+    }
+
+    #[test]
+    fn lang_id_xojo_is_lexer_only() {
+        assert!(LangId::Xojo.is_lexer_only());
+        assert!(!LangId::Rust.is_lexer_only());
+    }
+
+    #[test]
+    #[should_panic(expected = "Xojo is lexer-only")]
+    fn lang_id_xojo_ts_language_panics() {
+        // ts_language() は LexerOnly 言語に対して panic する。
+        // 呼び出し側は事前に is_lexer_only() で振り分ける義務がある。
+        let _ = LangId::Xojo.ts_language();
+    }
+
+    #[test]
+    fn tree_sitter_lang_provides_language() {
+        // ts_language() は TreeSitterLang のみが持つ (LexerLang は持たない)。
+        let lang = TreeSitterLang::Rust;
+        let _ = lang.ts_language();
+    }
+
+    #[test]
+    fn detected_lang_display_matches_lang_id_display() {
+        // 既存の LangId Display と新型 DetectedLang display_name の互換確認。
+        for lang in [
+            LangId::Rust,
+            LangId::Python,
+            LangId::Typescript,
+            LangId::Xojo,
+            LangId::CSharp,
+        ] {
+            assert_eq!(format!("{lang}"), lang.detected().display_name());
+        }
     }
 }

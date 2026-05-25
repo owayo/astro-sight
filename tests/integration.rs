@@ -7579,8 +7579,11 @@ class MainActivity : AppCompatActivity() {
 }
 
 // ---- Xojo 言語サポートのスモークテスト ----
+// v26.6 で tree-sitter-xojo を削除し lexer-only に移行。
+// PR3 で lexer 経由の symbols/refs/calls が復活するまで以下のテストは ignore する。
 
 #[test]
+#[ignore = "tree-sitter-xojo removed in PR2; rewrite via lexer in PR3"]
 fn xojo_symbols_from_fixture() {
     let output = cargo_bin()
         .args(["symbols", "--path", "tests/fixtures/sample.xojo_code"])
@@ -7604,6 +7607,7 @@ fn xojo_symbols_from_fixture() {
 }
 
 #[test]
+#[ignore = "tree-sitter-xojo removed in PR2; rewrite via lexer in PR3"]
 fn xojo_calls_detect_method_callee() {
     let output = cargo_bin()
         .args(["calls", "--path", "tests/fixtures/sample.xojo_code"])
@@ -7620,6 +7624,7 @@ fn xojo_calls_detect_method_callee() {
 }
 
 #[test]
+#[ignore = "tree-sitter-xojo removed in PR2; rewrite via lexer in PR3"]
 fn xojo_refs_case_insensitive_uppercase() {
     // Xojo は識別子が case-insensitive。大文字の `GREET` で小文字定義がヒットすべき。
     let output = cargo_bin()
@@ -7648,6 +7653,7 @@ fn xojo_refs_case_insensitive_uppercase() {
 }
 
 #[test]
+#[ignore = "tree-sitter-xojo removed in PR2; rewrite via lexer in PR3"]
 fn xojo_refs_lowercase_matches_mixedcase_definition() {
     // 小文字 `greet` でも Greet 定義と同件数がヒットすべき。
     let output = cargo_bin()
@@ -7692,6 +7698,7 @@ fn xojo_refs_rust_case_preserved() {
 }
 
 #[test]
+#[ignore = "tree-sitter-xojo removed in PR2; rewrite via lexer in PR3"]
 fn xojo_refs_batch_case_insensitive_collision() {
     // Xojo は case-insensitive。`Greet` と `greet` を同一バッチで渡しても
     // 両方に同じ参照リストが割り当たるべき（正規化キーの衝突で片方が欠落しないこと）。
@@ -7894,6 +7901,11 @@ fn xojo_doctor_lists_xojo() {
         .iter()
         .find(|l| l["language"] == "xojo")
         .expect("doctor 出力に xojo が含まれるべき");
+    // v26.6 以降、Xojo は lexer-only バックエンドに移行。tree-sitter parser_version は持たない。
     assert_eq!(xojo["available"], true);
-    assert_eq!(xojo["parser_version"], "15");
+    assert_eq!(xojo["backend"], "lexer_only");
+    assert!(
+        xojo.get("parser_version").is_none() || xojo["parser_version"].is_null(),
+        "lexer_only バックエンドは parser_version を持たない"
+    );
 }

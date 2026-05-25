@@ -36,8 +36,18 @@ fn parse_timeout_secs() -> u64 {
 }
 
 /// 既知の言語でソースバイト列をパースする。
+///
+/// `LexerOnly` 言語 (現状 Xojo) は tree-sitter を持たないため `UnsupportedLanguage`
+/// エラーを返す。呼び出し側は事前に `lang_id.is_lexer_only()` で振り分けるべき。
 pub fn parse_source(source: &[u8], lang_id: LangId) -> Result<Tree> {
     use std::time::{Duration, Instant};
+
+    if lang_id.is_lexer_only() {
+        return Err(AstroError::unsupported_language(&format!(
+            "{lang_id} is lexer-only; use lexer module instead of tree-sitter parser"
+        ))
+        .into());
+    }
 
     let mut parser = Parser::new();
     parser
