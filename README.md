@@ -27,7 +27,6 @@
   <img src="https://img.shields.io/badge/Bash-4EAA25?logo=gnubash&logoColor=white" alt="Bash">
   <img src="https://img.shields.io/badge/Ruby-CC342D?logo=ruby&logoColor=white" alt="Ruby">
   <img src="https://img.shields.io/badge/Zig-F7A41D?logo=zig&logoColor=white" alt="Zig">
-  <img src="https://img.shields.io/badge/Xojo-2C77B9?logoColor=white" alt="Xojo">
 </p>
 
 ## Install
@@ -463,7 +462,7 @@ astro-sight cochange --dir . --git --base HEAD~10 --rename --copy
 astro-sight doctor
 ```
 
-`doctor` は Xojo を含む 17 言語の parser 可用性を確認し、利用可能な言語には tree-sitter ABI version も返す。
+`doctor` は対応 16 言語の parser 可用性を確認し、利用可能な言語には tree-sitter ABI version も返す。
 
 ### session - NDJSON ストリーミング
 
@@ -553,7 +552,7 @@ $ astro-sight ast --path nonexistent.rs
 {"error":{"code":"FILE_NOT_FOUND","message":"File not found: nonexistent.rs"}}
 ```
 
-## Supported Languages (17)
+## Supported Languages (16)
 
 | Language | Extension | Crate | Version |
 |----------|-----------|-------|---------|
@@ -573,11 +572,8 @@ $ astro-sight ast --path nonexistent.rs
 | <img src="https://img.shields.io/badge/-4EAA25?logo=gnubash&logoColor=white" height="16"> Bash | `.sh`, `.bash`, `.zsh` | `tree-sitter-bash` | 0.25 |
 | <img src="https://img.shields.io/badge/-CC342D?logo=ruby&logoColor=white" height="16"> Ruby | `.rb`, `.rake`, `.gemspec` | `tree-sitter-ruby` | [owayo/tree-sitter-ruby](https://github.com/owayo/tree-sitter-ruby) |
 | <img src="https://img.shields.io/badge/-F7A41D?logo=zig&logoColor=white" height="16"> Zig | `.zig`, `.zon` | `tree-sitter-zig` | 1.1 |
-| <img src="https://img.shields.io/badge/-2C77B9?logoColor=white" height="16"> Xojo | `.xojo_code`, `.xojo_window`, `.xojo_menu`, `.xojo_toolbar`, `.xojo_report`, `.rbbas` | `tree-sitter-xojo` | [owayo/tree-sitter-xojo](https://github.com/owayo/tree-sitter-xojo) |
 
-全言語で tree-sitter クエリによる精密なシンボル抽出に対応。Xojo は仕様上 case-insensitive な識別子マッチング (`myVar` と `MYVAR` は同一シンボル) を行う。
-
-Xojo など case-insensitive GLR 系言語だけの diff では、`context` / `impact` / `review` / `dead-code --git` が parse 前に空結果を返し、OOM を避ける。削除 diff は `new_path` が `/dev/null` になるため、旧パスで言語判定する。デバッグ時だけ `ASTRO_SIGHT_FORCE_CI_LANG_IMPACT=1` または `ASTRO_SIGHT_FORCE_CI_LANG_DEAD_CODE=1` で従来挙動に戻せる。
+全言語で tree-sitter クエリによる精密なシンボル抽出に対応。
 
 > **\* Kotlin バージョンについて:** `tree-sitter-kotlin` 0.3.8 以降は `links = "tree-sitter"` を宣言しており、コアクレート `tree-sitter` 0.26 と Cargo の native library リンク名が競合してビルドできない。現在は 0.3.5 系を利用している。
 >

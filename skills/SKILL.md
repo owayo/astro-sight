@@ -461,8 +461,7 @@ astro-sight dead-code --dir . --git
 
 ## Notes
 
-- 17 languages: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby, Zig, Xojo
-- Xojo files (`.xojo_code`, `.xojo_window`, `.xojo_menu`, `.xojo_toolbar`, `.xojo_report`, `.rbbas`) use **case-insensitive identifier matching** (`myVar` and `MYVAR` are the same symbol)
+- 16 languages: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby, Zig
 - All output is compact JSON by default (short keys: `lang`, `ln`, `col`, `ctx`, `refs`, `src`, `def`/`ref`, `fn` etc.)
 - Use `--pretty` (global flag) for human-readable formatted JSON output
 - `refs` results include `ctx` (source line) — no need to Read files afterward
@@ -472,7 +471,6 @@ astro-sight dead-code --dir . --git
 - Use `lint` for repeated AST/text policies and `sequence` when you need to explain non-trivial call flow
 - `session` supports `ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange` (note: `review` is CLI-only, not available in session mode)
 - With `ASTRO_SIGHT_WORKSPACE`, session-relative `path` / `dir` values resolve from the workspace root, not the process cwd; invalid workspace values fail closed
-- CI-language-only diffs (currently Xojo) return empty results before parsing in `context` / `impact` / `review` / `dead-code --git` to avoid OOM; deletion diffs use the old path for language detection
 - **Input validation**: Empty `--name`/`--names`, empty `--paths`/`--paths-file` are rejected with `INVALID_REQUEST` error. `--paths-file` is capped at 100MB. `cochange` rejects non-finite/out-of-range `--min-confidence` and non-finite/negative smoothing priors. `--base` for `context`/`impact`/`review` rejects values starting with `-` (blocks option-style injection into `git diff` / `git show` / `git blame`)
 - **Large repositories (10k+ source files)**: `review --dir .` runs `context` + `cochange` + API diff + dead-code in one process and is the heaviest command. On very large monorepos it can exhaust memory. Mitigations:
   - Narrow `--dir` to a module-level subtree (`--dir packages/server` instead of `--dir .`)

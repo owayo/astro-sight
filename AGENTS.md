@@ -5,7 +5,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 ## Architecture
 
 - **AppService 層** — CLI / Session / MCP の統一コアロジック（`src/service.rs`）
-- **tree-sitter** ベースの構文解析エンジン（17言語対応、Xojo は case-insensitive 識別子）
+- **tree-sitter** ベースの構文解析エンジン（16言語対応）
+- **手書き lexer** バックエンド（`src/engine/lexer.rs`）。tree-sitter で OOM する言語向けの fallback として v26.6 で導入。現状 Xojo を lexer-only でサポート（`symbols` / `refs` / `dead-code` のみ動作、`calls` / `imports` / `ast` / `lint` / `sequence` は `UNSUPPORTED_LANGUAGE` を返す）
 - **BLAKE3** ベースのファイルキャッシュ（単一ファイル `ast` / `symbols` は内容ハッシュに canonical path を混ぜ、同一内容の別ファイルや別言語で `path` / `lang` が混線しない）
 - **clap derive** による CLI 引数パーサー
 - **NDJSON** ストリーミングセッション対応
@@ -38,7 +39,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/engine/extractor.rs` - AST ノード抽出
 - `src/engine/symbols.rs` - シンボル抽出（tree-sitter クエリ）+ スコープ判定（is_local_scope_symbol, is_symbol_exported）+ 循環的複雑度（calculate_complexity）+ Python フレームワーク entrypoint デコレータ判定（has_framework_entrypoint_decorator_python）+ Python クラス base 抽出（python_class_base_names）+ Angular ライフサイクルフック判定（is_js_ts_angular_lifecycle_hook: `@Component` / `@Directive` 装飾クラスのメソッドのみ true）
 - `src/engine/calls.rs` - コールグラフ抽出（言語別 call expression クエリ）
-- `src/engine/refs.rs` - クロスファイル参照検索（ignore + rayon 並列 + fold/reduce 集約 + memchr/memmem 事前フィルタ + Aho-Corasick バッチ検索 + `collect_files` pub ユーティリティ）、CI 言語（Xojo）では正規化キー衝突を `Vec<usize>` で吸収、行コンテキスト抽出は `memchr` で該当行のみ UTF-8 変換
+- `src/engine/refs.rs` - クロスファイル参照検索（ignore + rayon 並列 + fold/reduce 集約 + memchr/memmem 事前フィルタ + Aho-Corasick バッチ検索 + `collect_files` pub ユーティリティ）、lexer-only 言語 (Xojo) は `find_refs_via_lexer` / `find_refs_batch_via_lexer` 経由で identifier 走査、行コンテキスト抽出は `memchr` で該当行のみ UTF-8 変換
+- `src/engine/lexer.rs` - 手書き state machine による未サポート言語向け fallback。`LexerProfile` でキーワード/コメント/文字列区切り/定義 keyword を宣言し、`extract_symbols` と `find_identifier_refs` を提供する。Xojo profile を内蔵
 - `src/engine/diff.rs` - unified diff パーサー
 - `src/engine/impact/mod.rs` - 影響分析オーケストレーター（CI 言語のみの diff は Pass1 前に skip、通常は 3パス方式: collect affected → stream refs → assemble）、`ParsedFile` キャッシュは `SourceBuf` を直接保持し mmap ゼロコピー経路を維持
 - `src/engine/impact/signature.rs` - diff の `+` / `-` 行から関数シグネチャ変更を検出（識別子境界で照合し、`foo` と `foo_bar` のような prefix 名を混同しない）
@@ -83,32 +85,34 @@ make help     # 全ターゲット表示
 - tree-sitter 0.26 では Point/Range のフィールドがメソッドではなくパブリックフィールド
 - QueryMatches は StreamingIterator（標準 Iterator ではない）
 
-## CI 言語 (Xojo 等) の OOM 対策（v26.5.108 で導入、load-bearing fix）
+## Lexer-Only バックエンド (v26.6 で導入)
 
 ### 背景
-case-insensitive な GLR バックトラッキング系言語（現状 Xojo のみ）の `parse_file` は、約 10MB の LR table をロードした瞬間から **約 1GB/秒で線形にメモリが膨張**する。実測 (実 Xojo project の `.xojo_code` 4 行 diff, 5GB watchdog 付き):
+tree-sitter で実用的に parse できない言語向けに、手書き lexer による fallback バックエンドを持つ。
+case-insensitive な GLR バックトラッキング系の tree-sitter grammar は parse 中に 1GB/秒級でメモリが線形に膨張する事案 (Xojo 4 行 diff で 30GB OOMKilled の経緯あり) のため、tree-sitter-xojo は v26.6 で Cargo 依存ごと削除した。
 
-| 条件 | Peak RSS | 経過 | 結果 |
-|---|---:|---:|---|
-| skip ON (既定) | 12 MB | 0.1s | OK |
-| `ASTRO_SIGHT_FORCE_CI_LANG_IMPACT=1` で skip 解除 | 5,221 MB | 5.1s | **5GB watchdog で SIGKILL**（防がなければ 30GB+ で OOMKilled） |
+### 言語モデルの分離
+`src/language.rs` で型を 3 つに分けている:
+- `TreeSitterLang` — `ts_language()` を持つのはこの型だけ。Rust/Python/JS 等 16 言語
+- `LexerLang` — 手書き lexer で解析する言語 (現状 `Xojo`)
+- `DetectedLang` — `TreeSitter(TreeSitterLang) | LexerOnly(LexerLang)` の判定結果型
 
-CI 環境で Xojo 1 ファイル変更だけで 30GB OOMKilled が発生した経緯あり。
+`LangId::ts_language()` を呼ぶ前に `is_lexer_only()` で振り分ける義務がある (lexer-only に対する `ts_language()` は panic する)。
 
-### 実装方針
-review / context / impact / dead_code の各フェーズで、diff の **全 changed file が case-insensitive 言語のみ**の場合は parse を起動せずに空結果を返す。削除 diff は `new_path` が `/dev/null` になるため、CI 言語判定では `old_path` を使う:
-- `engine/impact/mod.rs`: context / impact / MCP 経由の影響分析を Pass1 前に skip
-- `commands.rs`: review 内の context / api_changes フェーズで同じ CI 言語判定を再利用
-- `commands.rs` dead_code 検出: CI 言語のみの対象ファイルでは dead-code 検出を skip
-- `engine/impact/pass2.rs`: デバッグ用に強制 skip 解除した場合でも cross-file 解析を最終防衛線として skip
+### コマンド別の挙動
+lexer-only 言語に対する各コマンド:
+- `symbols` / `refs` / `dead-code` — `src/engine/lexer.rs` 経由で動作 (定義ヘッダ列挙 + identifier 走査)
+- `ast` / `calls` / `imports` / `lint` / `sequence` — `UNSUPPORTED_LANGUAGE` エラーを返す
+- `context` / `impact` / `review` — 全 changed file が lexer-only のみの diff では cross-file 解析を skip し空結果を返す (lexer 経路の cross-file refs は汎用名 noise が多いため将来 PR で本格対応)
 
 ### 強制無効化（デバッグ用）
-従来挙動に戻したい場合のみ次の env を指定。本番 CI では絶対に設定しない:
+context / impact / review / dead-code の skip 機構は次の env で解除できる (本番では設定しない):
 - `ASTRO_SIGHT_FORCE_CI_LANG_IMPACT=1` — context / impact / review api_changes / impact pass2 で skip 解除
-- `ASTRO_SIGHT_FORCE_CI_LANG_DEAD_CODE=1` — dead_code で skip 解除
+- `ASTRO_SIGHT_FORCE_CI_LANG_DEAD_CODE=1` — dead_code で skip 解除 (v26.6 では dead-code 自体は lexer 経路で動くため deprecate 扱い)
 
-### tree-sitter-xojo 側の改善は補助
-tree-sitter-xojo の grammar 削減（直近: e14beb6 で parser.c -3.10%, STATE -4.9%）は parse 時の絶対消費量を僅かに下げるだけで、**OOM 防止効果は無い**（実測で確認済み）。CI 復旧の load-bearing fix はあくまで本リポジトリの skip 機構。tree-sitter-xojo 側での解決追求は時間の無駄なので避ける。
-
-### 言語追加時の注意
-新たな case-insensitive GLR 系 grammar を `language.rs` の `LangId::is_case_insensitive` に追加すると自動で skip 対象になる。スキップ範囲が想定より広い場合は `is_case_insensitive` の判定境界を見直す。
+### 言語追加時の手順
+tree-sitter で動かない言語を追加するには:
+1. `language.rs` の `LexerLang` に variant を追加
+2. `LangId` も対応する variant を追加し `detected()` を更新
+3. `src/engine/lexer.rs` に `LexerProfile` を新規追加 (keywords / コメント / 文字列区切り / 定義 keyword)
+4. `profile_for()` の match arm に追加
