@@ -341,6 +341,36 @@ fn find_refs_via_lexer(
         .collect()
 }
 
+/// dead-code 用の count-only lexer fallback。`find_refs_batch_via_lexer` と異なり
+/// `SymbolReference` を作らず `Vec<usize>` だけ返すため、巨大リポでの per-symbol Vec
+/// 確保を避けてピーク RSS を抑える。
+fn count_refs_in_file_via_lexer(
+    symbol_names: &[String],
+    present_indices: &std::collections::HashSet<usize>,
+    source: &[u8],
+    lexer_lang: crate::language::LexerLang,
+) -> Vec<usize> {
+    let num = symbol_names.len();
+    if present_indices.is_empty() {
+        return vec![0; num];
+    }
+    // AC で hit した names だけを lexer 走査対象に絞る。
+    let active_indices: Vec<usize> = present_indices.iter().copied().collect();
+    let active_names: Vec<String> = active_indices
+        .iter()
+        .map(|&i| symbol_names[i].clone())
+        .collect();
+
+    let partial =
+        crate::engine::lexer::count_non_definition_refs(source, &active_names, lexer_lang);
+
+    let mut counts = vec![0usize; num];
+    for (i, &orig_ix) in active_indices.iter().enumerate() {
+        counts[orig_ix] = partial[i];
+    }
+    counts
+}
+
 /// batch 経路向け lexer fallback。複数 symbol の参照を一度の走査で集める。
 fn find_refs_batch_via_lexer(
     symbol_names: &[String],
@@ -2015,6 +2045,22 @@ fn count_refs_in_file(
         return Ok(vec![0; num]);
     }
 
+    // lexer-only 言語 (現状 Xojo) は tree-sitter parse を持たないため、lexer 経路で
+    // 非定義参照のみカウントする。dispatch が漏れると `parse_file` が
+    // `UNSUPPORTED_LANGUAGE` を返して `?` でエラーになり、AC で hit していた count が
+    // 0 になって dead-code 誤検出の温床になる (GitLab #9 で報告された Xojo の大量誤検出
+    // の根本原因)。
+    if let Ok(lang) = LangId::from_path(path)
+        && let crate::language::DetectedLang::LexerOnly(lexer_lang) = lang.detected()
+    {
+        return Ok(count_refs_in_file_via_lexer(
+            symbol_names,
+            &present_indices,
+            &source,
+            lexer_lang,
+        ));
+    }
+
     let (tree, lang_id) = parser::parse_file(path, &source)?;
     let root = tree.root_node();
     let definition_kinds = definition_node_kinds(lang_id);
@@ -2635,14 +2681,6 @@ struct Bar {
             &mut counts,
         );
         assert_eq!(counts[0], 1, "attribute string ref must lift dead-code");
-    }
-
-    /// 正規化キー衝突の挙動は PR3 で lexer 経由のテストに書き直す。
-    /// PR2 で tree-sitter-xojo を削除したため、旧テスト本体は無効化した。
-    #[test]
-    #[ignore = "tree-sitter-xojo removed in PR2; rewrite via lexer in PR3"]
-    fn count_identifier_refs_distributes_to_colliding_indices() {
-        // 旧実装は tree_sitter_xojo::LANGUAGE 直接呼び出し。PR3 で lexer 経由に書き直す。
     }
 
     /// `Option::is_none` のようなパス文字列では最終セグメントもカウントされることを検証

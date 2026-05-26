@@ -98,6 +98,21 @@ impl LangId {
         }
     }
 
+    /// 拡張子からの言語検出に失敗した場合、source の先頭行 shebang を見て再検出する。
+    /// CLI 系コマンドのエントリポイント (`extract_ast` / `extract_symbols` 等) が
+    /// 同じ振る舞いを必要とするため、共通ヘルパーとして公開する。
+    pub fn detect(path: &Utf8Path, source: &[u8]) -> Result<Self, AstroError> {
+        Self::from_path(path).or_else(|_| {
+            let first_line = std::str::from_utf8(source)
+                .ok()
+                .and_then(|s| s.lines().next())
+                .unwrap_or("");
+            Self::from_shebang(first_line).ok_or_else(|| {
+                AstroError::unsupported_language(path.extension().unwrap_or("<none>"))
+            })
+        })
+    }
+
     /// Detect language from shebang line.
     pub fn from_shebang(first_line: &str) -> Option<Self> {
         if !first_line.starts_with("#!") {

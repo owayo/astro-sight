@@ -289,16 +289,8 @@ impl AppService {
 
         let source = parser::read_file(utf8_path)?;
 
-        // 言語検出 (shebang fallback も考慮)。
-        let lang_id = LangId::from_path(utf8_path).or_else(|_| {
-            let first_line = std::str::from_utf8(&source)
-                .ok()
-                .and_then(|s| s.lines().next())
-                .unwrap_or("");
-            LangId::from_shebang(first_line).ok_or_else(|| {
-                AstroError::unsupported_language(utf8_path.extension().unwrap_or("<none>"))
-            })
-        })?;
+        // 言語検出 (shebang fallback も考慮)。共通ヘルパー LangId::detect を利用。
+        let lang_id = LangId::detect(utf8_path, &source)?;
 
         // lexer-only 言語は tree-sitter を使わず手書き lexer で抽出する。
         if let DetectedLang::LexerOnly(lexer_lang) = lang_id.detected() {

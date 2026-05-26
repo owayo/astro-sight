@@ -94,6 +94,9 @@ where
 {
     use crate::commands::log_phase;
     let diff_files = diff::parse_unified_diff(diff_input);
+    // 全 changed file が lexer-only 言語 (Xojo) の場合は cross-file impact 解析を skip。
+    // 理由: lexer 経路の cross-file refs は汎用名 noise が多く実用精度が出ない (本格対応は将来 PR)。
+    // env 名は後方互換のため v26.5 系 `ASTRO_SIGHT_FORCE_CI_LANG_IMPACT` を維持。
     let force_ci = std::env::var("ASTRO_SIGHT_FORCE_CI_LANG_IMPACT")
         .ok()
         .as_deref()

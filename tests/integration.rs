@@ -7907,3 +7907,83 @@ fn xojo_doctor_lists_xojo() {
         "lexer_only バックエンドは parser_version を持たない"
     );
 }
+
+/// GitLab #9 回帰テスト: Xojo dead-code 検出で refs ベースの参照判定が機能することを検証。
+///
+/// 旧実装では `count_refs_in_file` (refs.rs) が tree-sitter 経路だけを呼んでおり、
+/// Xojo は parse_file が UNSUPPORTED_LANGUAGE を返してファイル単位の count が 0 になり、
+/// refs が見つかるシンボルでも dead 判定されていた。lexer-only dispatch を追加して修正。
+///
+/// production-only fixture で検証する (UnitTests/ 配下のテストファイルは PR2 で
+/// 別 fixture に切り出し、Window Event handler / TestGroup *Test 等の framework
+/// entrypoint 認識テストで使う想定)。
+#[test]
+fn dead_code_xojo_excludes_symbols_with_refs() {
+    use std::path::Path;
+
+    let fixture = Path::new("tests/fixtures/xojo_dead_code");
+    assert!(fixture.exists(), "fixture missing: {fixture:?}");
+
+    // dead-code は `tests/` を含むパスを test ディレクトリと判定し、
+    // 全ファイルを test 扱いにする。production 参照判定を正しく検証するため
+    // fixture を tempdir に複製してから走らせる。
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dest_root = tmp.path().join("project");
+    std::fs::create_dir_all(&dest_root).expect("create dest_root");
+    let cp_status = Command::new("cp")
+        .args([
+            "-R",
+            &format!("{}/.", fixture.display()),
+            dest_root.to_str().unwrap(),
+        ])
+        .status()
+        .expect("cp -R");
+    assert!(cp_status.success(), "failed to copy fixture to tempdir");
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", dest_root.to_str().unwrap()])
+        .output()
+        .expect("failed to run dead-code");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead_names: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .expect("dead_symbols 配列")
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    let test_only_names: Vec<&str> = json["test_only_symbols"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|s| s["name"].as_str()).collect())
+        .unwrap_or_default();
+
+    // 中核回帰: refs で参照が見つかるシンボルは `dead_symbols` にも `test_only_symbols`
+    // にも含めない。
+    // - Greeter は Caller.Run() と Main.Open() から参照
+    // - Greet は Caller.Run() から呼び出し
+    // - Caller は Main.Open() で `New Caller` として参照
+    // - Run は Caller インスタンスから呼び出し
+    for name in ["Greeter", "Greet", "Caller", "Run"] {
+        assert!(
+            !dead_names.contains(&name),
+            "{name} は refs で参照されているため dead 判定すべきでない: dead_names={dead_names:?}"
+        );
+        assert!(
+            !test_only_names.contains(&name),
+            "{name} は production 参照があるため test_only にも入れるべきでない: \
+             test_only_names={test_only_names:?}"
+        );
+    }
+
+    // 退行検出: 修正が「Xojo を一律 dead から除外」ではなく
+    // 「参照ベースで正しく判定」していることを保証するため、誰からも呼ばれない
+    // Orphan クラスは dead に残る必要がある。
+    assert!(
+        dead_names.contains(&"Orphan"),
+        "未参照クラス Orphan は dead に残るべき: dead_names={dead_names:?}"
+    );
+}

@@ -3,6 +3,17 @@
 //! tree-sitter が現実的に使えない言語 (現状 Xojo) で symbols / refs を抽出する。
 //! バイト列を一度走査するだけで、識別子トークンと定義ヘッダ行を列挙する。
 //! メモリ消費は入力サイズに対して定数倍 (token Vec のみ)、parse table は保持しない。
+//!
+//! ## モジュール構成
+//! - `mod.rs` (このファイル): 共通ロジック (Scanner, extract_symbols, find_identifier_refs)
+//! - `xojo.rs`: Xojo 言語固有の `LexerProfile` 定義と言語固有テスト
+//!
+//! 新しい lexer-only 言語を追加する際は:
+//! 1. `language.rs` の `LexerLang` に variant 追加
+//! 2. このモジュール直下に `<lang>.rs` を新規作成し `pub static PROFILE` を定義
+//! 3. `profile_for()` に match arm を追加
+
+pub mod xojo;
 
 use crate::language::LexerLang;
 use crate::models::location::{Point, Range};
@@ -201,7 +212,7 @@ impl<'a> Iterator for IdentScanner<'a> {
 }
 
 /// 行ベースで定義ヘッダを抽出する。
-/// 戻り値: (SymbolKind, name, line, column).
+/// 戻り値: (SymbolKind, name, 元行頭からのオフセット).
 fn extract_definition_from_line(
     profile: &LexerProfile,
     line_text: &str,
@@ -246,11 +257,8 @@ fn extract_definition_from_line(
             {
                 return None;
             }
-            // 列番号は元の行頭から見た after_trim の開始位置。
-            let col = leading_ws + (rest.len() - after_trim.len());
-            // ただし rest は trim_start 済みなので、元の line_text 上での position を再計算。
+            // 列番号は元の line_text 上での after_trim の開始位置。
             let original_after_trim_offset = line_text.len() - after_trim.len();
-            let _ = col;
             return Some((*kind, name.to_string(), original_after_trim_offset));
         }
     }
@@ -333,6 +341,57 @@ pub fn find_identifier_refs(
     names.iter().cloned().zip(buckets).collect()
 }
 
+/// dead-code 用の参照カウント (count-only)。
+///
+/// `find_identifier_refs` と同じ識別子列挙ロジックを使うが、戻り値は count のみ。
+/// `Reference` / 位置情報を構築しないため、dead-code の hot path で per-symbol Vec を
+/// 確保せずに済み、PHPUnit などの大規模 monorepo でピーク RSS を抑えられる。
+///
+/// 定義行に出現する identifier も name 一致すれば count に含む点に注意。dead-code 検出側は
+/// 「**非定義参照**の合計」を求めているので、ここでは extract_symbols で得た定義行 (line)
+/// セットを使って定義出現を差し引く。
+///
+/// 戻り値: names と同じ順序の `Vec<usize>`、各 name の **非定義参照** 件数。
+pub fn count_non_definition_refs(source: &[u8], names: &[String], lang: LexerLang) -> Vec<usize> {
+    let profile = profile_for(lang);
+    let normalize = |s: &str| -> String {
+        if profile.case_insensitive {
+            s.to_ascii_lowercase()
+        } else {
+            s.to_string()
+        }
+    };
+    let normalized_keys: Vec<String> = names.iter().map(|n| normalize(n)).collect();
+
+    // 定義行を name (正規化済み) -> 行集合のマップで把握する。
+    // refs 走査時に「line が def_lines[name] に含まれていれば skip」で非定義参照のみ数える。
+    let mut def_lines: std::collections::HashMap<String, std::collections::HashSet<usize>> =
+        std::collections::HashMap::new();
+    for sym in extract_symbols(source, lang) {
+        def_lines
+            .entry(normalize(&sym.name))
+            .or_default()
+            .insert(sym.range.start.line);
+    }
+
+    let mut counts: Vec<usize> = vec![0; names.len()];
+    for token in IdentScanner::new(source, profile) {
+        let key = normalize(token.text);
+        for (i, nk) in normalized_keys.iter().enumerate() {
+            if &key == nk {
+                let is_def = def_lines
+                    .get(nk)
+                    .map(|lines| lines.contains(&token.line))
+                    .unwrap_or(false);
+                if !is_def {
+                    counts[i] += 1;
+                }
+            }
+        }
+    }
+    counts
+}
+
 /// 行を走査して定義ヘッダを Symbol として抽出する。
 /// コメント・文字列内の "Class Foo" 等を誤検出しないよう、行頭の prefix のみ見る。
 pub fn extract_symbols(source: &[u8], lang: LexerLang) -> Vec<Symbol> {
@@ -351,7 +410,6 @@ pub fn extract_symbols(source: &[u8], lang: LexerLang) -> Vec<Symbol> {
         // ブロックコメント継続中ならスキップ。
         if let Some(end) = in_block_comment {
             if let Some(end_pos) = line_clean.find(end) {
-                // 終端後の続きを定義候補として再評価
                 let after = &line_clean[end_pos + end.len()..];
                 in_block_comment = None;
                 if let Some((kind, name, col)) =
@@ -375,17 +433,9 @@ pub fn extract_symbols(source: &[u8], lang: LexerLang) -> Vec<Symbol> {
         let mut effective_line = line_clean;
         for (start, end) in profile.block_comments {
             if let Some(s_pos) = effective_line.find(start) {
-                if let Some(e_pos) = effective_line[s_pos + start.len()..].find(end) {
-                    // 単一行内で閉じる: コメント部分を空白で潰す。
-                    let abs_end = s_pos + start.len() + e_pos + end.len();
-                    let mut buf = String::with_capacity(effective_line.len());
-                    buf.push_str(&effective_line[..s_pos]);
-                    buf.push_str(&" ".repeat(abs_end - s_pos));
-                    buf.push_str(&effective_line[abs_end..]);
-                    // 効果として: コメント部分が空白に置換される
-                    // Note: 簡略化のため、ここではこの単一行ブロックコメントを無視する。
+                if effective_line[s_pos + start.len()..].find(end).is_some() {
+                    // 単一行内で閉じる: コメント部分は無視。
                     effective_line = &line_clean[..s_pos];
-                    let _ = buf;
                     break;
                 } else {
                     // 改行をまたぐブロックコメント開始
@@ -455,165 +505,55 @@ fn single_line_range(line: usize, col: usize) -> Range {
 /// 言語別プロファイル取得。
 pub fn profile_for(lang: LexerLang) -> &'static LexerProfile {
     match lang {
-        LexerLang::Xojo => &XOJO_PROFILE,
+        LexerLang::Xojo => &xojo::PROFILE,
     }
 }
 
-// ---------- Xojo プロファイル ----------
-
-/// Xojo の定義 keyword 一覧。`End Sub` などの closing 行は除外する。
-static XOJO_DEFINITION_KEYWORDS: &[(&str, SymbolKind)] = &[
-    ("Class", SymbolKind::Class),
-    ("Module", SymbolKind::Module),
-    ("Window", SymbolKind::Class),
-    ("Interface", SymbolKind::Interface),
-    ("Structure", SymbolKind::Struct),
-    ("Sub", SymbolKind::Function),
-    ("Function", SymbolKind::Function),
-    ("Property", SymbolKind::Field),
-    ("Const", SymbolKind::Constant),
-    ("Enum", SymbolKind::Enum),
-    ("Event", SymbolKind::Method),
-    ("Constructor", SymbolKind::Method),
-    ("Destructor", SymbolKind::Method),
-];
-
-static XOJO_MODIFIER_KEYWORDS: &[&str] = &[
-    "Public",
-    "Protected",
-    "Private",
-    "Global",
-    "Shared",
-    "Static",
-];
-
-static XOJO_LINE_COMMENT_STARTS: &[&str] = &["'", "//", "REM "];
-
-static XOJO_STRING_DELIMITERS: &[char] = &['"'];
-
-static XOJO_END_PREFIX_KEYWORDS: &[&str] = &["End"];
-
-pub static XOJO_PROFILE: LexerProfile = LexerProfile {
-    lang: LexerLang::Xojo,
-    case_insensitive: true,
-    line_comment_starts: XOJO_LINE_COMMENT_STARTS,
-    block_comments: &[],
-    string_delimiters: XOJO_STRING_DELIMITERS,
-    modifier_keywords: XOJO_MODIFIER_KEYWORDS,
-    definition_keywords: XOJO_DEFINITION_KEYWORDS,
-    end_prefix_keywords: XOJO_END_PREFIX_KEYWORDS,
-};
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const XOJO_SAMPLE: &str = r#"' This is a sample Xojo class
-Class Greeter
-  Const DefaultName as String = "World"
-
-  Property defaultName as String
-
-  Sub Greet(name as String)
-    System.Print("Hello, " + name)
-  End Sub
-
-  Function Counter() as Integer
-    Return 42
-  End Function
-End Class
-
-Module Helpers
-  Sub LogIt(msg as String)
-    System.Print(msg)
-  End Sub
-End Module
-"#;
-
-    #[test]
-    fn xojo_extracts_class_module_and_methods() {
-        let symbols = extract_symbols(XOJO_SAMPLE.as_bytes(), LexerLang::Xojo);
-        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-        for expected in [
-            "Greeter",
-            "DefaultName",
-            "defaultName",
-            "Greet",
-            "Counter",
-            "Helpers",
-            "LogIt",
-        ] {
-            assert!(
-                names.contains(&expected),
-                "expected `{expected}` in {names:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn xojo_does_not_extract_end_lines() {
-        let symbols = extract_symbols(XOJO_SAMPLE.as_bytes(), LexerLang::Xojo);
-        for sym in &symbols {
-            assert_ne!(
-                sym.name, "Sub",
-                "`End Sub` の `Sub` を definition として誤検出している"
-            );
-            assert_ne!(sym.name, "Class");
-        }
-    }
-
-    #[test]
-    fn xojo_assigns_container_to_methods() {
-        let symbols = extract_symbols(XOJO_SAMPLE.as_bytes(), LexerLang::Xojo);
-        let greet = symbols.iter().find(|s| s.name == "Greet").expect("Greet");
-        assert_eq!(greet.container.as_deref(), Some("Greeter"));
-        let log_it = symbols.iter().find(|s| s.name == "LogIt").expect("LogIt");
-        assert_eq!(log_it.container.as_deref(), Some("Helpers"));
-    }
-
-    #[test]
-    fn xojo_ident_scanner_skips_comments_and_strings() {
-        let src = r#"' Class Foo
-Sub Greet()
-  Dim s as String = "Class Bar"
-  ' Sub Baz()
-End Sub
-"#;
-        let tokens: Vec<&str> = IdentScanner::new(src.as_bytes(), &XOJO_PROFILE)
-            .map(|t| t.text)
-            .collect();
-        assert!(
-            !tokens.contains(&"Foo"),
-            "comment 内 Foo を拾ってはいけない"
-        );
-        assert!(!tokens.contains(&"Bar"), "string 内 Bar を拾ってはいけない");
-        assert!(
-            !tokens.contains(&"Baz"),
-            "comment 内 Baz を拾ってはいけない"
-        );
-        assert!(tokens.contains(&"Greet"));
-        assert!(tokens.contains(&"s"));
-    }
-
-    #[test]
-    fn xojo_case_insensitive_identifier_match() {
-        // case_insensitive で `greet` と `GREET` を同一視できる。
-        let src = b"Sub Greet()\n  Call MYFUNC()\nEnd Sub\n";
-        let tokens: Vec<String> = IdentScanner::new(src, &XOJO_PROFILE)
-            .map(|t| t.text.to_ascii_lowercase())
-            .collect();
-        assert!(tokens.contains(&"greet".to_string()));
-        assert!(tokens.contains(&"myfunc".to_string()));
-    }
-
-    #[test]
-    fn xojo_block_comment_continuation_skips_definition() {
-        // Xojo 自体には /* */ ブロックコメントは無いが、profile.block_comments が空でも
-        // 通常の line comment 経路で `Sub` 誤検出を抑制できることを確認。
-        let src = "' Sub Hidden()\nSub Visible()\nEnd Sub\n";
-        let symbols = extract_symbols(src.as_bytes(), LexerLang::Xojo);
-        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"Visible"));
-        assert!(!names.contains(&"Hidden"));
-    }
+/// lexer-only 言語向けの dead-code / API 差分用 export 候補抽出。
+///
+/// 戻り値は `(name, kind_str, signature)` のタプル列。
+/// tree-sitter 経路の `filter_exported_symbols` と入出力形式を揃え、
+/// commands 層から透過的に dispatch できるようにする。
+///
+/// Xojo は Public/Protected/Private 修飾子を持つが、現状の lexer は修飾子の有無を
+/// 記録していない。保守的に全 Class/Module/Function/Method/Property/Const/Enum を
+/// export 候補として返す (refs が 0 件なら dead と判定される)。
+/// signature は空文字 (lexer profile では本格的な signature 抽出をしない)。
+pub fn extract_exported_symbols(
+    source: &[u8],
+    lexer_lang: LexerLang,
+) -> Vec<(String, String, String)> {
+    extract_symbols(source, lexer_lang)
+        .into_iter()
+        .filter(|s| {
+            matches!(
+                s.kind,
+                SymbolKind::Class
+                    | SymbolKind::Module
+                    | SymbolKind::Function
+                    | SymbolKind::Method
+                    | SymbolKind::Constant
+                    | SymbolKind::Enum
+                    | SymbolKind::Field
+                    | SymbolKind::Interface
+                    | SymbolKind::Struct
+            )
+        })
+        .map(|s| {
+            let kind_str = match s.kind {
+                SymbolKind::Class => "class",
+                SymbolKind::Module => "module",
+                SymbolKind::Function => "function",
+                SymbolKind::Method => "method",
+                SymbolKind::Constant => "constant",
+                SymbolKind::Enum => "enum",
+                SymbolKind::Field => "field",
+                SymbolKind::Interface => "interface",
+                SymbolKind::Struct => "struct",
+                _ => "unknown",
+            }
+            .to_string();
+            (s.name, kind_str, String::new())
+        })
+        .collect()
 }

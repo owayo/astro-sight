@@ -2321,7 +2321,9 @@ fn extract_exported_symbols_from_file_inner(
     // lexer-only 言語 (現状 Xojo) は tree-sitter を持たないため、lexer 経由で
     // export 相当のシンボルを抽出する。
     if let crate::language::DetectedLang::LexerOnly(lexer_lang) = lang_id.detected() {
-        return Some(extract_lexer_exported_symbols(&source, lexer_lang));
+        return Some(crate::engine::lexer::extract_exported_symbols(
+            &source, lexer_lang,
+        ));
     }
 
     let tree = parser::parse_source(&source, lang_id).ok()?;
@@ -2337,52 +2339,6 @@ fn extract_exported_symbols_from_file_inner(
         exclude_framework_entrypoints,
         Some(file_path),
     ))
-}
-
-/// lexer-only 言語向けの dead-code 候補抽出。
-///
-/// Xojo は Public/Protected/Private 修飾子を持つが、現状の lexer は修飾子の有無を
-/// 記録していない。保守的に全 Class/Module/Function/Method/Property/Const/Enum を
-/// export 候補として返す (refs が 0 件なら dead と判定される)。
-/// signature は空文字 (lexer profile では本格的な signature 抽出をしない)。
-fn extract_lexer_exported_symbols(
-    source: &[u8],
-    lexer_lang: crate::language::LexerLang,
-) -> Vec<(String, String, String)> {
-    use crate::models::symbol::SymbolKind;
-    crate::engine::lexer::extract_symbols(source, lexer_lang)
-        .into_iter()
-        .filter(|s| {
-            matches!(
-                s.kind,
-                SymbolKind::Class
-                    | SymbolKind::Module
-                    | SymbolKind::Function
-                    | SymbolKind::Method
-                    | SymbolKind::Constant
-                    | SymbolKind::Enum
-                    | SymbolKind::Field
-                    | SymbolKind::Interface
-                    | SymbolKind::Struct
-            )
-        })
-        .map(|s| {
-            let kind_str = match s.kind {
-                SymbolKind::Class => "class",
-                SymbolKind::Module => "module",
-                SymbolKind::Function => "function",
-                SymbolKind::Method => "method",
-                SymbolKind::Constant => "constant",
-                SymbolKind::Enum => "enum",
-                SymbolKind::Field => "field",
-                SymbolKind::Interface => "interface",
-                SymbolKind::Struct => "struct",
-                _ => "unknown",
-            }
-            .to_string();
-            (s.name, kind_str, String::new())
-        })
-        .collect()
 }
 
 /// シンボルの種類に応じた API シグネチャを抽出する。
