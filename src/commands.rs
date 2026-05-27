@@ -1198,10 +1198,16 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> HookJsonBuild {
         // 弾かれた非 export const や、隣接 hunk の context に巻き込まれた未変更 export まで
         // hook 出力に混ざる。`caller.symbols` (cross-file 検索を通過した causal name) と
         // `affected_symbols` の交差で causal だけを抽出する。
-        let affected_names: std::collections::HashSet<&str> = change
+        //
+        // また `change_type == "added"` のシンボルは「同コミットで新規追加され、まだ既存
+        // 呼び出し側を持っていない export」。hook (stop blocking 判定) では「新規依存関係」
+        // として価値はあるが、breaking change ではないため除外する。通常 `review` の
+        // `impact.changes[].impacted_callers` には引き続き残る (情報価値を維持)。
+        // (Issue: 2026-05-27-added-symbol-initial-reference)
+        let affected_change_types: std::collections::HashMap<&str, &str> = change
             .affected_symbols
             .iter()
-            .map(|s| s.name.as_str())
+            .map(|s| (s.name.as_str(), s.change_type.as_str()))
             .collect();
         for caller in &change.impacted_callers {
             let caller_abs = if std::path::Path::new(&caller.path).is_relative() {
@@ -1217,15 +1223,30 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> HookJsonBuild {
                 Err(_) => changed_abs_strs.contains(&caller_abs),
             };
             if !in_diff {
+                // breaking causal シンボル (modified / removed) だけを残す。
+                // `added` 由来は hook blocking から除外する。
+                let causal_syms: Vec<String> = caller
+                    .symbols
+                    .iter()
+                    .filter(|sym| {
+                        matches!(
+                            affected_change_types.get(sym.as_str()).copied(),
+                            Some(ct) if ct != "added"
+                        )
+                    })
+                    .cloned()
+                    .collect();
+                if causal_syms.is_empty() {
+                    // 全 caller.symbols が added 由来 (または affected 外) → blocking しない
+                    continue;
+                }
                 let entry = unresolved.entry(change.path.clone()).or_default();
-                for sym in &caller.symbols {
-                    if affected_names.contains(sym.as_str()) {
-                        entry.changed_symbols.insert(sym.clone());
-                    }
+                for sym in &causal_syms {
+                    entry.changed_symbols.insert(sym.clone());
                 }
                 entry
                     .refs
-                    .push((caller.path.clone(), caller.line, caller.symbols.clone()));
+                    .push((caller.path.clone(), caller.line, causal_syms));
             }
         }
     }
@@ -8660,6 +8681,149 @@ def new_public_api():
         );
         // refs[].s は元々 caller.symbols そのまま (causal の絞り込みは不要)
         assert_eq!(impacts[0]["refs"][0]["s"], serde_json::json!(["foo"]));
+    }
+
+    /// 新規追加 (`change_type=added`) シンボルへの caller のみがある場合、
+    /// hook blocking には含めない。同コミットで新規シンボルと新規参照が
+    /// セットで導入されるのは自然な依存関係で、breaking change ではない
+    /// (Issue 2026-05-27-added-symbol-initial-reference)。
+    #[test]
+    fn build_review_hook_json_added_only_caller_is_not_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        fs::write(src_dir.join("constants.rs"), "pub const FOO: u32 = 1;\n").unwrap();
+        fs::write(
+            src_dir.join("user.rs"),
+            "use crate::constants::FOO; fn x() { let _ = FOO; }\n",
+        )
+        .unwrap();
+
+        let result = ReviewResult {
+            impact: crate::models::impact::ContextResult {
+                changes: vec![crate::models::impact::FileImpact {
+                    path: "src/constants.rs".to_string(),
+                    hunks: Vec::new(),
+                    affected_symbols: vec![crate::models::impact::AffectedSymbol {
+                        name: "FOO".to_string(),
+                        kind: "constant".to_string(),
+                        change_type: "added".to_string(),
+                    }],
+                    signature_changes: Vec::new(),
+                    impacted_callers: vec![crate::models::impact::ImpactedCaller {
+                        path: "src/user.rs".to_string(),
+                        name: "x".to_string(),
+                        line: 1,
+                        symbols: vec!["FOO".to_string()],
+                        confidence: None,
+                    }],
+                    low_confidence_callers: Vec::new(),
+                }],
+            },
+            missing_cochanges: Vec::new(),
+            api_changes: ApiChanges {
+                added: Vec::new(),
+                removed: Vec::new(),
+                modified: Vec::new(),
+                moved: Vec::new(),
+                property_to_field: Vec::new(),
+            },
+            dead_symbols: Vec::new(),
+            test_only_symbols: Vec::new(),
+        };
+
+        let build = build_review_hook_json(&result, dir.path().to_str().unwrap());
+        // 新規追加シンボルへの caller のみ → impacts は空 (blocking 対象外)
+        assert!(
+            build.value.is_none() || {
+                let v = build.value.as_ref().unwrap();
+                v.get("impacts")
+                    .and_then(|i| i.as_array())
+                    .is_none_or(|a| a.is_empty())
+            },
+            "added シンボルのみへの caller は hook impacts から除外されるべき: {:?}",
+            build.value
+        );
+        assert!(
+            !build.is_blocking,
+            "added のみの場合は Stop hook を止めないべき"
+        );
+    }
+
+    /// 同 caller が added と modified の両方を参照している場合、modified だけを
+    /// causal symbol として残し blocking する。
+    #[test]
+    fn build_review_hook_json_mixed_added_and_modified_keeps_only_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        fs::write(
+            src_dir.join("a.rs"),
+            "pub fn modified_fn() {}\npub const NEW_CONST: u32 = 1;\n",
+        )
+        .unwrap();
+        fs::write(
+            src_dir.join("b.rs"),
+            "use crate::a::{modified_fn, NEW_CONST}; fn caller() { modified_fn(); let _ = NEW_CONST; }\n",
+        )
+        .unwrap();
+
+        let result = ReviewResult {
+            impact: crate::models::impact::ContextResult {
+                changes: vec![crate::models::impact::FileImpact {
+                    path: "src/a.rs".to_string(),
+                    hunks: Vec::new(),
+                    affected_symbols: vec![
+                        crate::models::impact::AffectedSymbol {
+                            name: "modified_fn".to_string(),
+                            kind: "function".to_string(),
+                            change_type: "modified".to_string(),
+                        },
+                        crate::models::impact::AffectedSymbol {
+                            name: "NEW_CONST".to_string(),
+                            kind: "constant".to_string(),
+                            change_type: "added".to_string(),
+                        },
+                    ],
+                    signature_changes: Vec::new(),
+                    impacted_callers: vec![crate::models::impact::ImpactedCaller {
+                        path: "src/b.rs".to_string(),
+                        name: "caller".to_string(),
+                        line: 1,
+                        symbols: vec!["modified_fn".to_string(), "NEW_CONST".to_string()],
+                        confidence: None,
+                    }],
+                    low_confidence_callers: Vec::new(),
+                }],
+            },
+            missing_cochanges: Vec::new(),
+            api_changes: ApiChanges {
+                added: Vec::new(),
+                removed: Vec::new(),
+                modified: Vec::new(),
+                moved: Vec::new(),
+                property_to_field: Vec::new(),
+            },
+            dead_symbols: Vec::new(),
+            test_only_symbols: Vec::new(),
+        };
+
+        let build = build_review_hook_json(&result, dir.path().to_str().unwrap());
+        let hook_json = build.value.expect("hook json should be generated");
+        assert!(build.is_blocking, "modified を含むため blocking");
+        let impacts = hook_json["impacts"].as_array().expect("impacts array");
+        assert_eq!(impacts.len(), 1);
+        // syms / refs[].s には modified_fn のみが残り、NEW_CONST (added) は落ちる
+        assert_eq!(
+            impacts[0]["syms"],
+            serde_json::json!(["modified_fn"]),
+            "added 由来の NEW_CONST は syms から除外され modified_fn のみ残るべき"
+        );
+        assert_eq!(
+            impacts[0]["refs"][0]["s"],
+            serde_json::json!(["modified_fn"]),
+            "refs[].s も modified_fn のみに絞られるべき"
+        );
     }
 
     // ------------------------------------------------------------------
