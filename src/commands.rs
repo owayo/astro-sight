@@ -950,6 +950,7 @@ pub fn cmd_review(
     framework: Option<&str>,
     extra_exclude_dirs: &[String],
     extra_exclude_globs: &[String],
+    dead_scope: crate::cli::DeadScope,
 ) -> Result<()> {
     // framework 指定は早期に検証して未知名はここで弾く (dead_symbols 検出に到達する前に)。
     // 未指定時は package.json から next 依存を検出して nextjs プリセットを自動適用する。
@@ -1082,7 +1083,16 @@ pub fn cmd_review(
                 &combined_globs,
                 None,
             )?;
-            detect_dead_symbols_from_files(dir, &files)
+            let (dead_symbols, test_only_symbols) = detect_dead_symbols_from_files(dir, &files);
+            // dead-scope=touched-symbols: 宣言行が diff の `+` 行と重ならない dead を除外。
+            // `--hook` のデフォルトで「changed file 内の元から存在した dead」の
+            // ノイズを抑える (Issue: zod-inferred-types-pre-existing-dead)。
+            let dead_symbols = if matches!(dead_scope, crate::cli::DeadScope::TouchedSymbols) {
+                filter_dead_by_touched_symbols(dir, dead_symbols, &diff_input, &diff_files)
+            } else {
+                dead_symbols
+            };
+            (dead_symbols, test_only_symbols)
         }
         Err(_) => (Vec::new(), Vec::new()),
     };
@@ -2339,6 +2349,84 @@ fn extract_exported_symbols_from_file_inner(
         exclude_framework_entrypoints,
         Some(file_path),
     ))
+}
+
+/// dead_symbols のうち、宣言行が今回の diff の追加行 (`+` 行) と重なるもののみを残す。
+///
+/// `--dead-scope touched-symbols` の実装。`review --hook` のデフォルトとして使われ、
+/// 「changed file 内に元からあった dead」がレビューノイズとして毎回出る UX 問題を
+/// 解消する。
+///
+/// 注意: `HunkInfo` の `new_start` / `new_count` は context 行も含むため
+/// hunk 範囲全体を「touched」と扱うと既存 dead まで残してしまう。ここでは
+/// `extract_changed_new_lines` で **実際に追加された行** だけを set 化して照合する。
+fn filter_dead_by_touched_symbols(
+    dir: &str,
+    dead: Vec<crate::models::review::DeadSymbol>,
+    diff_input: &str,
+    diff_files: &[crate::models::impact::DiffFile],
+) -> Vec<crate::models::review::DeadSymbol> {
+    use std::collections::{HashMap, HashSet};
+
+    // changed file 集合 (削除ファイルは含めない)。
+    let mut changed_files: HashSet<&str> = HashSet::new();
+    for df in diff_files {
+        if df.new_path != "/dev/null" {
+            changed_files.insert(df.new_path.as_str());
+        }
+    }
+
+    // 「ファイル → 追加行 set (0-indexed)」「ファイル → シンボル名→宣言行」を per-file キャッシュ。
+    let mut changed_lines_cache: HashMap<String, HashSet<usize>> = HashMap::new();
+    let mut sym_lines_cache: HashMap<String, HashMap<String, usize>> = HashMap::new();
+
+    dead.into_iter()
+        .filter(|ds| {
+            if !changed_files.contains(ds.file.as_str()) {
+                // diff に含まれないファイル: touched ではないので除外。
+                return false;
+            }
+            let changed_lines = changed_lines_cache
+                .entry(ds.file.clone())
+                .or_insert_with(|| {
+                    crate::engine::diff::extract_changed_new_lines(diff_input, &ds.file)
+                });
+            let line_map = sym_lines_cache
+                .entry(ds.file.clone())
+                .or_insert_with(|| extract_symbol_lines(dir, &ds.file).unwrap_or_default());
+            let Some(&line) = line_map.get(&ds.name) else {
+                // 宣言行が引けない (lexer-only で取り漏れ等) は保守的に touched 扱いで残す。
+                return true;
+            };
+            changed_lines.contains(&line)
+        })
+        .collect()
+}
+
+/// ファイル内シンボルの「名前 → 宣言行 (0-indexed)」マップを返す。
+fn extract_symbol_lines(
+    dir: &str,
+    file_path: &str,
+) -> Option<std::collections::HashMap<String, usize>> {
+    use std::collections::HashMap;
+    let full = std::path::Path::new(dir).join(file_path);
+    let utf8 = camino::Utf8Path::new(full.to_str()?);
+    let source = parser::read_file(utf8).ok()?;
+    let lang_id = crate::language::LangId::from_path(utf8).ok()?;
+
+    let symbols = if let crate::language::DetectedLang::LexerOnly(lexer_lang) = lang_id.detected() {
+        crate::engine::lexer::extract_symbols(&source, lexer_lang)
+    } else {
+        let tree = parser::parse_source(&source, lang_id).ok()?;
+        crate::engine::symbols::extract_symbols(tree.root_node(), &source, lang_id).ok()?
+    };
+
+    let mut map = HashMap::new();
+    for s in symbols {
+        // 同名シンボルが複数ある場合、最初に出現した行を保持する。
+        map.entry(s.name).or_insert(s.range.start.line);
+    }
+    Some(map)
 }
 
 /// シンボルの種類に応じた API シグネチャを抽出する。
@@ -3675,6 +3763,7 @@ pub fn cmd_dead_code(
     extra_exclude_dirs: &[String],
     extra_exclude_globs: &[String],
     pretty: bool,
+    dead_scope: crate::cli::DeadScope,
 ) -> Result<()> {
     let canonical_dir = std::fs::canonicalize(dir)?;
     if !canonical_dir.is_dir() {
@@ -3739,6 +3828,22 @@ pub fn cmd_dead_code(
 
     let scanned_files = files.len();
     let (dead_symbols, test_only_symbols) = detect_dead_symbols_from_files(dir, &files);
+
+    // dead-scope=touched-symbols: --git/--diff 指定時のみ意味を持つ。
+    // diff の追加行情報が必要なので、has_diff のときだけ適用する。
+    let dead_symbols = if has_diff && matches!(dead_scope, crate::cli::DeadScope::TouchedSymbols) {
+        let diff_input = if let Some(d) = diff {
+            d.to_string()
+        } else if let Some(df) = diff_file {
+            read_file_to_string_limited(df, MAX_INPUT_SIZE)?
+        } else {
+            run_git_diff(dir, base, staged)?
+        };
+        let diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
+        filter_dead_by_touched_symbols(dir, dead_symbols, &diff_input, &diff_files)
+    } else {
+        dead_symbols
+    };
 
     let result = DeadCodeResult {
         dir: canonical_dir.to_string_lossy().to_string(),

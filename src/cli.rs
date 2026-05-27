@@ -1,4 +1,16 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// dead_symbols の出力スコープ。`--git/--diff/--diff-file` 指定時のみ意味を持つ。
+///
+/// - `all`: 変更対象ファイル内の dead を全件返す (デフォルト)
+/// - `touched-symbols`: 宣言行が今回の diff hunk と重なる dead だけを返す。`review --hook`
+///   のデフォルトに採用し、stop hook が「changed file 内に元からあった dead」で毎回
+///   ノイズを出す UX 問題を解消する (Issue: zod-inferred-types-pre-existing-dead)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DeadScope {
+    All,
+    TouchedSymbols,
+}
 
 #[derive(Parser)]
 #[command(
@@ -454,6 +466,12 @@ pub enum Commands {
         /// 例: --exclude-glob 'app/Legacy/**' --exclude-glob 'config/*.php'
         #[arg(long = "exclude-glob", value_name = "PATTERN", num_args = 0..)]
         exclude_globs: Vec<String>,
+
+        /// dead_symbols のスコープ。`touched-symbols` は宣言行が diff hunk と重なる
+        /// dead だけを返す。未指定時は `--hook` 有なら `touched-symbols`、無なら `all`。
+        /// `dead-code --dir .` で全 dead を再確認するときは `--dead-scope all` を指定。
+        #[arg(long = "dead-scope", value_enum)]
+        dead_scope: Option<DeadScope>,
     },
 
     /// Detect dead (unreferenced) exported symbols
@@ -516,6 +534,12 @@ pub enum Commands {
         /// 例: --exclude-glob 'app/Legacy/**' --exclude-glob 'config/*.php'
         #[arg(long = "exclude-glob", value_name = "PATTERN", num_args = 0..)]
         exclude_globs: Vec<String>,
+
+        /// dead_symbols のスコープ。`--git/--diff/--diff-file` 指定時のみ意味を持つ。
+        /// 既定は `all` (changed file 内の全 dead を返す)。`touched-symbols` を指定
+        /// すると宣言行が diff hunk と重なる dead のみ返す。
+        #[arg(long = "dead-scope", value_enum, default_value_t = DeadScope::All)]
+        dead_scope: DeadScope,
     },
 
     /// Check tool availability and language support

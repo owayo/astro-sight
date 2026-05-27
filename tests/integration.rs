@@ -7987,3 +7987,112 @@ fn dead_code_xojo_excludes_symbols_with_refs() {
         "未参照クラス Orphan は dead に残るべき: dead_names={dead_names:?}"
     );
 }
+
+/// 2026-05-27 zod-inferred-types-pre-existing-dead 対応: `--dead-scope touched-symbols` の
+/// 回帰テスト。changed file 内に元から存在する dead は除外し、今回の hunk に被るシンボル
+/// だけが返ることを検証。`review --hook` のデフォルト挙動でもある。
+#[test]
+fn dead_scope_touched_symbols_excludes_pre_existing_dead() {
+    use std::path::Path;
+    use std::process::Command;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let src_dir = root.join("src");
+    std::fs::create_dir(&src_dir).expect("create src");
+
+    // lib.rs: 公開 module 宣言だけ。dead 検出の対象は src/foo.rs のシンボル。
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname=\"demo\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[lib]\npath=\"src/lib.rs\"\n").unwrap();
+    std::fs::write(src_dir.join("lib.rs"), "pub mod foo;\n").unwrap();
+    // 初期コミット: ExistingDead と Used が両方未参照 (本来両方 dead 候補)。
+    std::fs::write(
+        src_dir.join("foo.rs"),
+        "pub fn existing_dead() {}\n\npub fn used() {}\n",
+    )
+    .unwrap();
+    let git = |args: &[&str]| {
+        let s = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .unwrap();
+        assert!(s.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "x@y"]);
+    git(&["config", "user.name", "x"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial", "-q"]);
+
+    // 新規 hunk: src/foo.rs の末尾に `new_dead` を追加。`existing_dead` の宣言行には触れない。
+    std::fs::write(
+        src_dir.join("foo.rs"),
+        "pub fn existing_dead() {}\n\npub fn used() {}\n\npub fn new_dead() {}\n",
+    )
+    .unwrap();
+
+    // --dead-scope touched-symbols (= review --hook デフォルト相当): new_dead だけ残る。
+    let out = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--git",
+            "--dead-scope",
+            "touched-symbols",
+        ])
+        .output()
+        .expect("run dead-code");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let dead: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        dead.contains(&"new_dead"),
+        "今回追加した new_dead は touched-symbols スコープで残るべき: {dead:?}"
+    );
+    assert!(
+        !dead.contains(&"existing_dead"),
+        "宣言行が hunk と重ならない existing_dead は touched-symbols スコープから除外されるべき: {dead:?}"
+    );
+
+    // --dead-scope all (デフォルト): existing_dead も new_dead も両方残る (used は参照
+    // されていないが lib crate なら本来 dead 扱い)。
+    let out_all = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--git",
+            "--dead-scope",
+            "all",
+        ])
+        .output()
+        .expect("run dead-code all");
+    let json_all: serde_json::Value = serde_json::from_slice(&out_all.stdout).unwrap();
+    let dead_all: Vec<&str> = json_all["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        dead_all.contains(&"existing_dead"),
+        "all スコープでは元からあった existing_dead も返るべき: {dead_all:?}"
+    );
+    assert!(
+        dead_all.contains(&"new_dead"),
+        "all スコープでも new_dead は返るべき: {dead_all:?}"
+    );
+
+    // 退行ガード: dir パスの問題で std::path::Path を使う警告を避ける。
+    let _ = Path::new(root);
+}

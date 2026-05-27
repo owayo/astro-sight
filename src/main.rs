@@ -329,21 +329,32 @@ fn run(cli: Cli) -> Result<()> {
             framework,
             exclude_dirs,
             exclude_globs,
-        } => cmd_review(
-            &service,
-            &dir,
-            diff.as_deref(),
-            diff_file.as_deref(),
-            git,
-            &base,
-            staged,
-            min_confidence,
-            pretty,
-            hook,
-            framework.as_deref(),
-            &exclude_dirs,
-            &exclude_globs,
-        ),
+            dead_scope,
+        } => {
+            // --hook 指定時、未指定なら touched-symbols に降格して
+            // 「changed file 内の元から存在した dead」のノイズを抑える。
+            let resolved_dead_scope = dead_scope.unwrap_or(if hook {
+                astro_sight::cli::DeadScope::TouchedSymbols
+            } else {
+                astro_sight::cli::DeadScope::All
+            });
+            cmd_review(
+                &service,
+                &dir,
+                diff.as_deref(),
+                diff_file.as_deref(),
+                git,
+                &base,
+                staged,
+                min_confidence,
+                pretty,
+                hook,
+                framework.as_deref(),
+                &exclude_dirs,
+                &exclude_globs,
+                resolved_dead_scope,
+            )
+        }
         Commands::Cochange {
             dir,
             git,
@@ -463,6 +474,7 @@ fn run(cli: Cli) -> Result<()> {
             framework,
             exclude_dirs,
             exclude_globs,
+            dead_scope,
         } => cmd_dead_code(
             &dir,
             glob.as_deref(),
@@ -478,6 +490,7 @@ fn run(cli: Cli) -> Result<()> {
             &exclude_dirs,
             &exclude_globs,
             pretty,
+            dead_scope,
         ),
         Commands::Doctor => cmd_doctor(pretty),
         Commands::Session => cmd_session(),
