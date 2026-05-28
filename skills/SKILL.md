@@ -238,7 +238,9 @@ astro-sight review --dir . --git --exclude-dir generated --exclude-glob 'app/Leg
 
 Output: JSON with `impact` (ContextResult), `missing_cochanges` (files expected to change together but absent from diff), `api_changes` (added/removed/modified public symbols), `dead_symbols` (public symbols with zero non-definition references in changed files).
 
-`--framework` / `--exclude-dir` / `--exclude-glob` narrow the `dead_symbols` portion only; they share semantics with the same flags on `dead-code`. `review` always excludes `vendor/` / `tests/` / build artifacts from `dead_symbols`.
+`--framework` は `dead_symbols` のみを絞り込む。`--exclude-dir` / `--exclude-glob` は impact 解析と `dead_symbols` の両方に作用し、`dead-code` の同名フラグと同じ意味を持つ。`review` は `dead_symbols` から `vendor/` / `tests/` / build artifacts を常に除外する。
+
+全 changed file が Xojo などの lexer-only 言語だけの場合、`review` は `impact` / `api_changes` / `dead_symbols` をすべて空結果で返す。cross-file lexer 解析が実装されるまでは、対象ファイルを `symbols` / `refs` / `dead-code` の単体コマンドで確認する。
 
 When `--git --base <rev>` is set, `review` uses the same base for both the diff and blame-backed `missing_cochanges`. This keeps multi-commit branch reviews aligned with the requested comparison range.
 

@@ -981,25 +981,33 @@ pub fn cmd_review(
     // 2. impact 分析
     //
     // diff の全 changed file が case-insensitive 言語 (Xojo) のみで構成される場合は
-    // context フェーズを skip する。
+    // review 全体を空結果として返す。
     //
-    // v26.5 まで: tree-sitter-xojo の OOM 防止が主目的の load-bearing fix。
+    // v26.5 まで: tree-sitter-xojo の OOM 防止が主目的の重要な回避策。
     // v26.6 以降: tree-sitter-xojo を削除して OOM リスクは解消。だが lexer-only 言語の
-    // cross-file refs は汎用名ノイズが多く実用精度が出ないため引き続き skip する。
-    // 本格的な lexer-only impact 解析は将来の PR で対応予定。
+    // cross-file refs と dead-code review は汎用名ノイズが多く実用精度が出ないため引き続き
+    // skip する。本格的な lexer-only review 解析は将来の PR で対応予定。
     // `ASTRO_SIGHT_FORCE_CI_LANG_IMPACT=1` で従来挙動に戻せる (デバッグ用)。
-    let pre_diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
+    // diff は CI 言語判定 / changed_file_set / api_changes / dead_code filter / touched-symbols
+    // で繰り返し参照するため、ここで一度だけ parse して再利用する。
+    let diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
     let force_ci = std::env::var("ASTRO_SIGHT_FORCE_CI_LANG_IMPACT")
         .ok()
         .as_deref()
         == Some("1");
-    let all_ci_lang = crate::engine::impact::diff_files_all_case_insensitive(&pre_diff_files);
-    let impact = if all_ci_lang && !force_ci {
-        log_phase("context.skip_ci_only", "applied", 0);
-        crate::models::impact::ContextResult {
-            changes: Vec::new(),
+    let all_ci_lang = crate::engine::impact::diff_files_all_case_insensitive(&diff_files);
+    if all_ci_lang && !force_ci {
+        log_phase("review.skip_ci_only", "applied", 0);
+        if hook {
+            return Ok(());
         }
-    } else {
+
+        let result = empty_review_result();
+        let output = serialize_output(&result, pretty)?;
+        println!("{output}");
+        return Ok(());
+    }
+    let impact = {
         log_phase("context", "start", 0);
         let phase_t = std::time::Instant::now();
         // review の `--exclude-dir` / `--exclude-glob` は impact 解析と dead_symbols の
@@ -1014,7 +1022,6 @@ pub fn cmd_review(
     };
 
     // 3. diff に含まれるファイルリストを収集
-    let diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
     let changed_file_set: HashSet<String> = diff_files
         .iter()
         .flat_map(|f| {
@@ -1036,22 +1043,8 @@ pub fn cmd_review(
         detect_missing_cochanges(service, dir, &changed_file_set, min_confidence, Some(base))?;
     log_phase("cochange", "end", phase_t.elapsed().as_millis());
 
-    // 5. API surface diff
-    //
-    // 全 changed file が CI 言語 (Xojo) のみの場合は skip する。
-    // v26.5 まで: tree-sitter-xojo OOM 対策。
-    // v26.6 以降: lexer-only 言語の API 差分は signature 抽出精度が tree-sitter 比で
-    // 大幅に劣る (引数列・戻り値型を取れない) ため、誤検出を避けて skip 維持。
-    let api_changes = if all_ci_lang && !force_ci {
-        log_phase("api_changes.skip_ci_only", "applied", 0);
-        ApiChanges {
-            added: Vec::new(),
-            removed: Vec::new(),
-            modified: Vec::new(),
-            moved: Vec::new(),
-            property_to_field: Vec::new(),
-        }
-    } else {
+    // 5. API 公開面の差分
+    let api_changes = {
         log_phase("api_changes", "start", 0);
         let phase_t = std::time::Instant::now();
         let r = detect_api_changes(dir, base, &diff_files);
@@ -3809,31 +3802,41 @@ pub fn cmd_dead_code(
 
     // diff 指定があれば diff 関連ファイルのみ、なければプロジェクト全体
     let has_diff = diff.is_some() || diff_file.is_some() || git;
-    let files: Vec<std::path::PathBuf> = if has_diff {
-        let diff_input = if let Some(d) = diff {
-            d.to_string()
-        } else if let Some(df) = diff_file {
-            read_file_to_string_limited(df, MAX_INPUT_SIZE)?
+    // diff_input / diff_files は touched-symbols filter でも使うため、ここで一度だけ
+    // 取得・parse して再利用する (旧実装は run_git_diff + parse_unified_diff を 2 回呼んでおり、
+    // --staged 実行中の git add で 2 つの diff が乖離する競合状態があった)。
+    let (diff_input, diff_files): (Option<String>, Option<Vec<crate::models::impact::DiffFile>>) =
+        if has_diff {
+            let input = if let Some(d) = diff {
+                d.to_string()
+            } else if let Some(df) = diff_file {
+                read_file_to_string_limited(df, MAX_INPUT_SIZE)?
+            } else {
+                run_git_diff(dir, base, staged)?
+            };
+
+            if input.trim().is_empty() {
+                let result = DeadCodeResult {
+                    dir: canonical_dir.to_string_lossy().to_string(),
+                    scanned_files: 0,
+                    dead_symbols: Vec::new(),
+                    test_only_symbols: Vec::new(),
+                };
+                let output = serialize_output(&result, pretty)?;
+                println!("{output}");
+                return Ok(());
+            }
+
+            let parsed = crate::engine::diff::parse_unified_diff(&input);
+            (Some(input), Some(parsed))
         } else {
-            run_git_diff(dir, base, staged)?
+            (None, None)
         };
 
-        if diff_input.trim().is_empty() {
-            let result = DeadCodeResult {
-                dir: canonical_dir.to_string_lossy().to_string(),
-                scanned_files: 0,
-                dead_symbols: Vec::new(),
-                test_only_symbols: Vec::new(),
-            };
-            let output = serialize_output(&result, pretty)?;
-            println!("{output}");
-            return Ok(());
-        }
-
-        let diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
+    let files: Vec<std::path::PathBuf> = if let Some(diff_files) = diff_files.as_ref() {
         filter_diff_files_for_dead_code(
             &canonical_dir,
-            &diff_files,
+            diff_files,
             &excludes,
             &combined_globs,
             glob,
@@ -3852,16 +3855,10 @@ pub fn cmd_dead_code(
 
     // dead-scope=touched-symbols: --git/--diff 指定時のみ意味を持つ。
     // diff の追加行情報が必要なので、has_diff のときだけ適用する。
-    let dead_symbols = if has_diff && matches!(dead_scope, crate::cli::DeadScope::TouchedSymbols) {
-        let diff_input = if let Some(d) = diff {
-            d.to_string()
-        } else if let Some(df) = diff_file {
-            read_file_to_string_limited(df, MAX_INPUT_SIZE)?
-        } else {
-            run_git_diff(dir, base, staged)?
-        };
-        let diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
-        filter_dead_by_touched_symbols(dir, dead_symbols, &diff_input, &diff_files)
+    let dead_symbols = if matches!(dead_scope, crate::cli::DeadScope::TouchedSymbols)
+        && let (Some(diff_input), Some(diff_files)) = (diff_input.as_deref(), diff_files.as_ref())
+    {
+        filter_dead_by_touched_symbols(dir, dead_symbols, diff_input, diff_files)
     } else {
         dead_symbols
     };

@@ -345,6 +345,8 @@ astro-sight review --dir . --git \
 
 `--git --base <rev>` を指定した場合、`missing_cochanges` の blame 解析にも同じ base を使う。複数コミット分の PR をまとめてレビューするときも、diff と共変更候補の解析範囲が揃う。
 
+全 changed file が Xojo などの lexer-only 言語だけの場合、`review` は `impact` / `api_changes` / `dead_symbols` をすべて空結果で返す。lexer 経路の cross-file 解析は汎用名ノイズが多いため、`symbols` / `refs` / `dead-code` の単体コマンドで確認する。
+
 ```bash
 # git diff を自動取得してレビュー（推奨）
 astro-sight review --dir . --git

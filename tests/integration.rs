@@ -4823,6 +4823,59 @@ fn make_new_file_diff(path: &str, content: &str) -> String {
 }
 
 #[test]
+fn review_xojo_only_diff_returns_empty_result() {
+    // lexer-only 言語の review は cross-file 解析も dead-code も skip し、hook の
+    // 汎用名ノイズを出さない。Xojo は symbols/dead-code 単体では動くが review では空結果。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    let diff = make_new_file_diff(
+        "Main.xojo_code",
+        "Class App\nEnd Class\n\nClass Orphan\nEnd Class\n",
+    );
+    let diff_path = root.join("changes.patch");
+    std::fs::write(&diff_path, diff).unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "review",
+            "--dir",
+            root.to_str().unwrap(),
+            "--diff-file",
+            diff_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert!(
+        json["impact"]["changes"].as_array().unwrap().is_empty(),
+        "Xojo-only review は impact を空にするべき: {json}"
+    );
+    assert!(
+        json["api_changes"]["added"].as_array().unwrap().is_empty()
+            && json["api_changes"]["removed"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+            && json["api_changes"]["modified"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+        "Xojo-only review は API 差分を空にするべき: {json}"
+    );
+    assert!(
+        json["dead_symbols"].as_array().unwrap().is_empty(),
+        "Xojo-only review は dead_symbols を返すべきでない: {json}"
+    );
+}
+
+#[test]
 fn review_respects_framework_laravel_preset() {
     // review が dead-code と同じ `--framework laravel` プリセットを尊重し、
     // app/Http/Controllers 等を dead_symbols から除外することを検証する。
