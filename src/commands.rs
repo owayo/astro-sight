@@ -1126,6 +1126,7 @@ fn empty_review_result() -> ReviewResult {
             modified: Vec::new(),
             moved: Vec::new(),
             property_to_field: Vec::new(),
+            removed_dead: Vec::new(),
         },
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
@@ -1916,12 +1917,35 @@ fn detect_api_changes(
     // `added` に乗らないケースでも `removed` を相殺できる。
     let (added, removed, moved) = reconcile_with_moves(added, removed, all_new_candidates);
 
+    // removed のうち HEAD ツリーで他ファイル参照 0 件のものを `removed_dead` に振り分け。
+    // 「base 時点で dead だった symbol の整理」だけでなく「base alive → HEAD で関連
+    // caller も削除」も同 diff 内で repo 内到達性 0 になるため同一カテゴリに含む。
+    // 順序は moved > removed_dead (rename/move 相殺を先に行わないと移動が dead 誤分類
+    // される)。codex 設計合意 (Issue
+    // 2026-05-28-meet-virtual-you-gemini-multi-select 対応)。
+    let mut removed_kept: Vec<ApiSymbolCandidate> = Vec::new();
+    let mut removed_dead: Vec<ApiSymbolCandidate> = Vec::new();
+    for candidate in removed {
+        if is_removed_symbol_unreferenced(dir, &candidate.name) {
+            removed_dead.push(candidate);
+        } else {
+            removed_kept.push(candidate);
+        }
+    }
+
     ApiChanges {
         added: added.into_iter().map(|c| c.into_api_symbol()).collect(),
-        removed: removed.into_iter().map(|c| c.into_api_symbol()).collect(),
+        removed: removed_kept
+            .into_iter()
+            .map(|c| c.into_api_symbol())
+            .collect(),
         modified,
         moved,
         property_to_field,
+        removed_dead: removed_dead
+            .into_iter()
+            .map(|c| c.into_api_symbol())
+            .collect(),
     }
 }
 
@@ -6084,6 +6108,7 @@ def main():
         let removed: Vec<&str> = api_changes
             .removed
             .iter()
+            .chain(api_changes.removed_dead.iter())
             .map(|s| s.name.as_str())
             .collect();
         assert!(
@@ -6261,6 +6286,7 @@ def new_public_api():
         let removed: Vec<&str> = api_changes
             .removed
             .iter()
+            .chain(api_changes.removed_dead.iter())
             .map(|s| s.name.as_str())
             .collect();
         assert!(
@@ -6612,6 +6638,7 @@ class Foo:
         let removed_names: std::collections::HashSet<&str> = api_changes
             .removed
             .iter()
+            .chain(api_changes.removed_dead.iter())
             .map(|s| s.name.as_str())
             .collect();
         assert!(
@@ -6671,6 +6698,116 @@ class B:
         assert!(none.is_empty(), "存在しないクラス名は空集合: {none:?}");
     }
 
+    /// 他ファイルから参照されていない exported シンボルを削除した場合、
+    /// `removed` ではなく `removed_dead` カテゴリに振り分けられること
+    /// (Issue 2026-05-28-meet-virtual-you-gemini-multi-select 対応)。
+    /// HEAD ツリーで参照 0 件 = repo 内 dead removal を informational として提示。
+    #[test]
+    fn detect_api_changes_unreferenced_removal_goes_to_removed_dead_not_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        // foo / bar 両方を定義。caller なし (dead-code 想定)。
+        git_commit_files(
+            repo,
+            &[("mod.py", "def foo():\n    pass\n\ndef bar():\n    pass\n")],
+            "initial",
+        );
+        // bar を削除 (HEAD で bar への参照は 0 件)
+        fs::write(repo.join("mod.py"), "def foo():\n    pass\n").expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "mod.py".to_string(),
+            new_path: "mod.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 5,
+                new_start: 1,
+                new_count: 2,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed_dead_names: Vec<&str> = api_changes
+            .removed_dead
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        let removed_names: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed_dead_names.contains(&"bar"),
+            "HEAD で参照 0 件の削除は removed_dead に振り分けられるべき。got removed_dead: {removed_dead_names:?}, removed: {removed_names:?}"
+        );
+        assert!(
+            !removed_names.contains(&"bar"),
+            "removed_dead に振り分けられた symbol は removed には残ってはならない。got: {removed_names:?}"
+        );
+    }
+
+    /// HEAD ツリーで他ファイルから参照されているシンボル (alive) の削除は、
+    /// `removed_dead` ではなく `removed` に残ること (副作用回帰防止)。
+    /// 「破壊的削除」と「dead-code 整理」の区別が機能していることを確認。
+    #[test]
+    fn detect_api_changes_referenced_removal_stays_in_removed_not_dead() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        // foo / bar を定義。caller.py で bar を参照 (alive)。
+        git_commit_files(
+            repo,
+            &[
+                ("mod.py", "def foo():\n    pass\n\ndef bar():\n    pass\n"),
+                ("caller.py", "from mod import bar\nbar()\n"),
+            ],
+            "initial",
+        );
+        // bar を削除 (caller.py はそのままで bar への参照を維持 = 破壊的削除)
+        fs::write(repo.join("mod.py"), "def foo():\n    pass\n").expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "mod.py".to_string(),
+            new_path: "mod.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 5,
+                new_start: 1,
+                new_count: 2,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed_names: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        let removed_dead_names: Vec<&str> = api_changes
+            .removed_dead
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed_names.contains(&"bar"),
+            "HEAD で参照ありのシンボル削除は removed (破壊的削除) に残るべき。got removed: {removed_names:?}, removed_dead: {removed_dead_names:?}"
+        );
+        assert!(
+            !removed_dead_names.contains(&"bar"),
+            "参照ありの削除は removed_dead に振り分けてはならない。got: {removed_dead_names:?}"
+        );
+    }
+
     #[test]
     fn detect_api_changes_still_detects_genuine_removal() {
         // リネームではなく純粋に関数を削除した場合は api.rm が発報される。
@@ -6703,6 +6840,7 @@ class B:
         let removed: Vec<&str> = api_changes
             .removed
             .iter()
+            .chain(api_changes.removed_dead.iter())
             .map(|s| s.name.as_str())
             .collect();
         assert!(
@@ -7715,6 +7853,7 @@ main() {\n    timed echo hi\n}\nmain\n";
         let removed: Vec<&str> = api_changes
             .removed
             .iter()
+            .chain(api_changes.removed_dead.iter())
             .map(|s| s.name.as_str())
             .collect();
         let modified: Vec<&str> = api_changes
@@ -7768,6 +7907,7 @@ export function testHelper() { return 1 }\n";
         let removed: Vec<&str> = api_changes
             .removed
             .iter()
+            .chain(api_changes.removed_dead.iter())
             .map(|s| s.name.as_str())
             .collect();
         assert!(
@@ -8054,6 +8194,7 @@ main() {\n    echo done\n}\nmain\n";
         let removed: Vec<&str> = api_changes
             .removed
             .iter()
+            .chain(api_changes.removed_dead.iter())
             .map(|s| s.name.as_str())
             .collect();
         assert!(
@@ -8101,6 +8242,7 @@ main() {\n    echo hi\n}\nmain\n";
         let removed: Vec<&str> = api_changes
             .removed
             .iter()
+            .chain(api_changes.removed_dead.iter())
             .map(|s| s.name.as_str())
             .collect();
         assert!(
@@ -8151,6 +8293,7 @@ main() {\n    echo hi\n}\nmain\n";
         let removed: Vec<&str> = api_changes
             .removed
             .iter()
+            .chain(api_changes.removed_dead.iter())
             .map(|s| s.name.as_str())
             .collect();
         assert!(
@@ -8211,6 +8354,7 @@ if __name__ == \"__main__\":\n    main()\n";
         let removed: Vec<&str> = api_changes
             .removed
             .iter()
+            .chain(api_changes.removed_dead.iter())
             .map(|s| s.name.as_str())
             .collect();
         assert!(
@@ -8251,6 +8395,7 @@ public_helper() {\n    echo public\n}\nexport -f public_helper\n";
         let removed: Vec<&str> = api_changes
             .removed
             .iter()
+            .chain(api_changes.removed_dead.iter())
             .map(|s| s.name.as_str())
             .collect();
         assert!(
@@ -8449,6 +8594,7 @@ if __name__ == \"__main__\":
         let removed: Vec<&str> = api_changes
             .removed
             .iter()
+            .chain(api_changes.removed_dead.iter())
             .map(|s| s.name.as_str())
             .collect();
         let added: Vec<&str> = api_changes.added.iter().map(|s| s.name.as_str()).collect();
@@ -8689,6 +8835,7 @@ impl RusshExecutor {
         let removed: Vec<&str> = api_changes
             .removed
             .iter()
+            .chain(api_changes.removed_dead.iter())
             .map(|s| s.name.as_str())
             .collect();
         assert!(
@@ -8759,6 +8906,7 @@ impl Client {
         let removed: Vec<&str> = api_changes
             .removed
             .iter()
+            .chain(api_changes.removed_dead.iter())
             .map(|s| s.name.as_str())
             .collect();
         assert!(
@@ -8834,6 +8982,7 @@ pub fn removed_api() {}
         let removed: Vec<&str> = api_changes
             .removed
             .iter()
+            .chain(api_changes.removed_dead.iter())
             .map(|s| s.name.as_str())
             .collect();
         assert!(
@@ -8891,6 +9040,7 @@ pub fn removed_api() {}
         let removed: Vec<&str> = api_changes
             .removed
             .iter()
+            .chain(api_changes.removed_dead.iter())
             .map(|s| s.name.as_str())
             .collect();
         assert!(
@@ -8964,6 +9114,7 @@ pub fn unused_helper() -> u32 { 42 }
         let removed: Vec<&str> = api_changes
             .removed
             .iter()
+            .chain(api_changes.removed_dead.iter())
             .map(|s| s.name.as_str())
             .collect();
         assert!(
@@ -9971,6 +10122,7 @@ def new_public_api():
                 modified: Vec::new(),
                 moved: Vec::new(),
                 property_to_field: Vec::new(),
+                removed_dead: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -10007,6 +10159,7 @@ def new_public_api():
                 modified: Vec::new(),
                 moved: Vec::new(),
                 property_to_field: Vec::new(),
+                removed_dead: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -10040,6 +10193,7 @@ def new_public_api():
                 modified: Vec::new(),
                 moved: Vec::new(),
                 property_to_field: Vec::new(),
+                removed_dead: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -10072,6 +10226,7 @@ def new_public_api():
                 }],
                 moved: Vec::new(),
                 property_to_field: Vec::new(),
+                removed_dead: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -10121,6 +10276,7 @@ def new_public_api():
                 modified: Vec::new(),
                 moved: Vec::new(),
                 property_to_field: Vec::new(),
+                removed_dead: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -10192,6 +10348,7 @@ def new_public_api():
                 modified: Vec::new(),
                 moved: Vec::new(),
                 property_to_field: Vec::new(),
+                removed_dead: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -10257,6 +10414,7 @@ def new_public_api():
                 modified: Vec::new(),
                 moved: Vec::new(),
                 property_to_field: Vec::new(),
+                removed_dead: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -10333,6 +10491,7 @@ def new_public_api():
                 modified: Vec::new(),
                 moved: Vec::new(),
                 property_to_field: Vec::new(),
+                removed_dead: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),

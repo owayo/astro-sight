@@ -36,6 +36,12 @@ pub struct MissingCochange {
 /// `property_to_field` は Python の `@property def x(self) -> T` を `@dataclass` の
 /// インスタンスフィールド `x: T` に置き換えたケース。`obj.x` 属性アクセスとしての
 /// 公開面は維持されているため、破壊的削除ではなく informational として提示する。
+///
+/// `removed_dead` は「削除後 HEAD ツリーで他ファイル参照 0 件」の dead-code 整理。
+/// `removed` (破壊的 API 削除) と区別して informational として提示することで、
+/// レビュー側で「破壊的削除」と「dead-code 掃除」を即座に区別できる。
+/// repo 内到達性 0 を保証するが、外部パッケージ利用者ゼロまでは保証しない
+/// (Issue 2026-05-28-meet-virtual-you-gemini-multi-select 対応)。
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiChanges {
     pub added: Vec<ApiSymbol>,
@@ -45,6 +51,8 @@ pub struct ApiChanges {
     pub moved: Vec<MovedSymbol>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub property_to_field: Vec<PropertyToFieldChange>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub removed_dead: Vec<ApiSymbol>,
 }
 
 /// 公開シンボル情報。
