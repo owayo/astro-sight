@@ -1890,6 +1890,7 @@ fn detect_api_changes(
                     new_sig,
                     dir,
                     base,
+                    &df.old_path,
                     &df.new_path,
                     name,
                 ) {
@@ -2782,27 +2783,31 @@ fn interface_has_extends(decl: tree_sitter::Node<'_>) -> bool {
 /// まで誤って互換扱いするのを防ぐため (codex 設計合意)。
 ///
 /// 条件:
-/// 1. `file_path` の言語が TypeScript / Tsx
+/// 1. `new_path` の言語が TypeScript / Tsx
 /// 2. `new_sig` に `fn_name({}` (destructure normalize 済み) が含まれる
 ///    (早期 reject 用の文字列マッチ)
-/// 3. 旧ツリーのトップレベル関数 `fn_name` の parameters が **AST 上で** 空
-///    (codex 指摘: 文字列 contains だと型注釈内 call signature `{ fn_name(): void }` を
-///    誤検出するため、必ず AST で確認する)
-/// 4. 新ツリーのトップレベル関数 `fn_name` の parameters が省略可能と判定できる
+/// 3. 旧ツリー (`base:old_path`) のトップレベル関数 `fn_name` の parameters が
+///    **AST 上で** 空 (codex 指摘: 文字列 contains だと型注釈内 call signature
+///    `{ fn_name(): void }` を誤検出するため、必ず AST で確認する)
+/// 4. 新ツリー (`new_path`) のトップレベル関数 `fn_name` の parameters が省略
+///    可能と判定できる
+///
+/// `old_path` と `new_path` は rename 差分に対応するため別々に渡す。
 fn is_ts_no_arg_to_optional_destructured_compatible(
     old_sig: &str,
     new_sig: &str,
     dir: &str,
     base: &str,
-    file_path: &str,
+    old_path: &str,
+    new_path: &str,
     fn_name: &str,
 ) -> bool {
-    let full_path = std::path::Path::new(dir).join(file_path);
-    let Some(utf8_str) = full_path.to_str() else {
+    let full_new_path = std::path::Path::new(dir).join(new_path);
+    let Some(utf8_str) = full_new_path.to_str() else {
         return false;
     };
-    let utf8_path = camino::Utf8Path::new(utf8_str);
-    let Ok(lang_id) = crate::language::LangId::from_path(utf8_path) else {
+    let utf8_new_path = camino::Utf8Path::new(utf8_str);
+    let Ok(lang_id) = crate::language::LangId::from_path(utf8_new_path) else {
         return false;
     };
     if !matches!(
@@ -2822,12 +2827,13 @@ fn is_ts_no_arg_to_optional_destructured_compatible(
     if !signature_has_empty_parens_for(old_sig, fn_name) {
         return false;
     }
-    // 旧ツリーで AST 検査: トップレベル関数 fn_name の parameters が実際に空か
-    if !old_top_level_function_has_empty_parameters(dir, base, file_path, lang_id, fn_name) {
+    // 旧ツリーで AST 検査: トップレベル関数 fn_name の parameters が実際に空か。
+    // rename 差分では `df.old_path` を使うため、`old_path` を渡す。
+    if !old_top_level_function_has_empty_parameters(dir, base, old_path, lang_id, fn_name) {
         return false;
     }
 
-    let Ok(source) = parser::read_file(utf8_path) else {
+    let Ok(source) = parser::read_file(utf8_new_path) else {
         return false;
     };
     let Ok(tree) = parser::parse_source(&source, lang_id) else {
@@ -2865,6 +2871,10 @@ fn signature_has_destructured_params_for(sig: &str, fn_name: &str) -> bool {
 ///
 /// signature 文字列の `fn_name()` パターン検査だけでは型注釈内 call signature を
 /// 誤検出するため、最終確認として AST 検査が必要。
+///
+/// `base` / `file_path` は `validate_git_revision` で検証する (codex 指摘: 既存の
+/// `extract_exported_symbols_from_git` と同じ防御を行わないと `--diff` / stdin 経路で
+/// 未検証の `base` がここに到達し得る)。
 fn old_top_level_function_has_empty_parameters(
     dir: &str,
     base: &str,
@@ -2872,6 +2882,11 @@ fn old_top_level_function_has_empty_parameters(
     lang_id: crate::language::LangId,
     fn_name: &str,
 ) -> bool {
+    if validate_git_revision(base, "--base").is_err()
+        || validate_git_revision(file_path, "diff file path").is_err()
+    {
+        return false;
+    }
     let output = std::process::Command::new("git")
         .args(["show", &format!("{base}:{file_path}")])
         .current_dir(dir)
