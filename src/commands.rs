@@ -1889,6 +1889,7 @@ fn detect_api_changes(
                     old_sig,
                     new_sig,
                     dir,
+                    base,
                     &df.new_path,
                     name,
                 ) {
@@ -2782,13 +2783,17 @@ fn interface_has_extends(decl: tree_sitter::Node<'_>) -> bool {
 ///
 /// 条件:
 /// 1. `file_path` の言語が TypeScript / Tsx
-/// 2. `old_sig` に `fn_name()` (parameters なし) が含まれる
-/// 3. `new_sig` に `fn_name({}` (destructure normalize 済み) が含まれる
-/// 4. ファイルを parse し、関数 `fn_name` の parameters が省略可能と判定できる
+/// 2. `new_sig` に `fn_name({}` (destructure normalize 済み) が含まれる
+///    (早期 reject 用の文字列マッチ)
+/// 3. 旧ツリーのトップレベル関数 `fn_name` の parameters が **AST 上で** 空
+///    (codex 指摘: 文字列 contains だと型注釈内 call signature `{ fn_name(): void }` を
+///    誤検出するため、必ず AST で確認する)
+/// 4. 新ツリーのトップレベル関数 `fn_name` の parameters が省略可能と判定できる
 fn is_ts_no_arg_to_optional_destructured_compatible(
     old_sig: &str,
     new_sig: &str,
     dir: &str,
+    base: &str,
     file_path: &str,
     fn_name: &str,
 ) -> bool {
@@ -2807,10 +2812,18 @@ fn is_ts_no_arg_to_optional_destructured_compatible(
         return false;
     }
 
+    // 早期 reject (高速化): 新 sig が destructure 形式でなければ判定不要
+    if !signature_has_destructured_params_for(new_sig, fn_name) {
+        return false;
+    }
+    // 早期 reject (高速化): 旧 sig 文字列に `fn_name()` パターンがなければ判定不要。
+    // 文字列 contains は false-positive あり (型注釈内 call signature) のため、これは
+    // 単なる早期スクリーニング。確実な判定は次の AST 検査で行う。
     if !signature_has_empty_parens_for(old_sig, fn_name) {
         return false;
     }
-    if !signature_has_destructured_params_for(new_sig, fn_name) {
+    // 旧ツリーで AST 検査: トップレベル関数 fn_name の parameters が実際に空か
+    if !old_top_level_function_has_empty_parameters(dir, base, file_path, lang_id, fn_name) {
         return false;
     }
 
@@ -2822,7 +2835,7 @@ fn is_ts_no_arg_to_optional_destructured_compatible(
     };
     let root = tree.root_node();
 
-    let Some(fn_node) = find_function_by_name(root, &source, fn_name) else {
+    let Some(fn_node) = find_top_level_function_by_name(root, &source, fn_name) else {
         return false;
     };
     let Some(params) = fn_node.child_by_field_name("parameters") else {
@@ -2832,6 +2845,9 @@ fn is_ts_no_arg_to_optional_destructured_compatible(
 }
 
 /// signature 文字列に `fn_name()` (parameters なし) パターンが含まれるかを判定。
+/// 注: これは早期 reject 用のスクリーニング。型注釈内の call signature を誤検出する
+/// 可能性があるため、確実な判定には AST 検査 (`old_top_level_function_has_empty_parameters`)
+/// を併用する。
 fn signature_has_empty_parens_for(sig: &str, fn_name: &str) -> bool {
     let needle = format!("{fn_name}()");
     sig.contains(&needle)
@@ -2844,31 +2860,76 @@ fn signature_has_destructured_params_for(sig: &str, fn_name: &str) -> bool {
     sig.contains(&needle)
 }
 
-/// `root` を BFS で走査し、name が一致する関数 / メソッド ノードを返す。
-fn find_function_by_name<'a>(
+/// 旧ツリー (base リビジョン) を `git show` で取得して parse し、トップレベル関数
+/// `fn_name` の parameters が空かを AST で判定する。
+///
+/// signature 文字列の `fn_name()` パターン検査だけでは型注釈内 call signature を
+/// 誤検出するため、最終確認として AST 検査が必要。
+fn old_top_level_function_has_empty_parameters(
+    dir: &str,
+    base: &str,
+    file_path: &str,
+    lang_id: crate::language::LangId,
+    fn_name: &str,
+) -> bool {
+    let output = std::process::Command::new("git")
+        .args(["show", &format!("{base}:{file_path}")])
+        .current_dir(dir)
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let source = output.stdout;
+    let Ok(tree) = parser::parse_source(&source, lang_id) else {
+        return false;
+    };
+    let Some(fn_node) = find_top_level_function_by_name(tree.root_node(), &source, fn_name) else {
+        return false;
+    };
+    let Some(params) = fn_node.child_by_field_name("parameters") else {
+        return false;
+    };
+    let mut cursor = params.walk();
+    params.named_children(&mut cursor).count() == 0
+}
+
+/// `root` のトップレベル (program 直下 / `export_statement` 直下) にある関数 /
+/// メソッド宣言のうち、name が一致するものを返す。ネストしたローカル関数や
+/// 関数式内の同名宣言は対象外 (codex 指摘 6 対応)。
+fn find_top_level_function_by_name<'a>(
     root: tree_sitter::Node<'a>,
     source: &[u8],
     name: &str,
 ) -> Option<tree_sitter::Node<'a>> {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        let kind = node.kind();
-        if matches!(
-            kind,
+    let fn_kinds = |k: &str| {
+        matches!(
+            k,
             "function_declaration"
                 | "function_definition"
                 | "method_definition"
                 | "function_signature_item"
-        ) && let Some(name_node) = node.child_by_field_name("name")
+        )
+    };
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        let candidate = if child.kind() == "export_statement" {
+            let mut sub_cursor = child.walk();
+            child.children(&mut sub_cursor).find(|c| fn_kinds(c.kind()))
+        } else if fn_kinds(child.kind()) {
+            Some(child)
+        } else {
+            None
+        };
+        if let Some(fn_node) = candidate
+            && let Some(name_node) = fn_node.child_by_field_name("name")
             && let Some(bytes) = source.get(name_node.start_byte()..name_node.end_byte())
             && let Ok(decl_name) = std::str::from_utf8(bytes)
             && decl_name == name
         {
-            return Some(node);
-        }
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            stack.push(child);
+            return Some(fn_node);
         }
     }
     None
@@ -5442,6 +5503,162 @@ mod tests {
         assert!(
             mod_names.contains(&"widget"),
             "string property name `\"name?\"` の `?` は optional マーカーではなく required field のはず。api.mod に残すべき。got: {mod_names:?}"
+        );
+    }
+
+    /// 旧関数が型注釈内に同名の call signature を含む場合でも、AST で旧 parameters を
+    /// 検査して誤判定しないこと (codex 指摘 5 への回帰防止)。旧 sig 文字列に
+    /// `foo()` という部分文字列が含まれても、実際の関数 foo は引数を取るので
+    /// api.mod に残るべき。
+    #[test]
+    fn detect_api_changes_tsx_old_signature_contains_inline_call_signature_is_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let src_dir = repo.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+
+        // 旧: 引数あり (引数の型注釈に foo() という inline call signature を含む)
+        let before = concat!(
+            "export function foo(arg: { foo(): void }) {\n",
+            "  arg.foo();\n",
+            "}\n"
+        );
+        fs::write(src_dir.join("foo.ts"), before).expect("write before");
+        fs::write(
+            src_dir.join("user.ts"),
+            "import { foo } from './foo';\nexport const x = foo({ foo: () => {} });\n",
+        )
+        .expect("write user");
+        assert!(
+            Command::new("git")
+                .args(["add", "src/foo.ts", "src/user.ts"])
+                .current_dir(repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+
+        // 新: 引数を destructured + 型注釈に optional のみの inline object に変更
+        let after = concat!(
+            "export function foo({ x }: { x?: string }) {\n",
+            "  return x ?? \"a\";\n",
+            "}\n"
+        );
+        fs::write(src_dir.join("foo.ts"), after).expect("write after");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/foo.ts".to_string(),
+            new_path: "src/foo.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 3,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let mod_names: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            mod_names.contains(&"foo"),
+            "旧関数が引数を取る場合は (型注釈内 call signature があっても) api.mod に残すべき。got: {mod_names:?}"
+        );
+    }
+
+    /// ネストしたローカル同名関数を拾わないこと (codex 指摘 6 への回帰防止)。
+    /// 変更対象の exported 関数 widget は required props だが、関数内ネストに
+    /// 同名 widget があり optional だとしても、トップレベル限定の判定で
+    /// api.mod に残すべき。
+    #[test]
+    fn detect_api_changes_tsx_nested_local_function_does_not_override_top_level_is_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let src_dir = repo.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+
+        let before = concat!(
+            "export function widget() {\n",
+            "  return null;\n",
+            "}\n",
+            "export function caller() { return widget(); }\n"
+        );
+        fs::write(src_dir.join("widget.ts"), before).expect("write before");
+        fs::write(
+            src_dir.join("user.ts"),
+            "import { widget } from './widget';\nexport const x = widget();\n",
+        )
+        .expect("write user");
+        assert!(
+            Command::new("git")
+                .args(["add", "src/widget.ts", "src/user.ts"])
+                .current_dir(repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+
+        // 新: トップレベル widget は required props、ネスト widget は optional のみ
+        let after = concat!(
+            "export function widget({ required }: { required: string }) {\n",
+            "  function widget({ optional }: { optional?: string }) {\n",
+            "    return optional;\n",
+            "  }\n",
+            "  return widget({});\n",
+            "}\n",
+            "export function caller() { return widget({ required: \"x\" }); }\n"
+        );
+        fs::write(src_dir.join("widget.ts"), after).expect("write after");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/widget.ts".to_string(),
+            new_path: "src/widget.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 4,
+                new_start: 1,
+                new_count: 7,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let mod_names: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            mod_names.contains(&"widget"),
+            "トップレベル widget は required props なので、ネスト同名関数に惑わされず api.mod に残すべき。got: {mod_names:?}"
         );
     }
 
