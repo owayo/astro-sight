@@ -2461,6 +2461,7 @@ fn extract_api_signature(
     root: tree_sitter::Node<'_>,
     source: &[u8],
     lines: &[&str],
+    lang_id: crate::language::LangId,
 ) -> String {
     use crate::models::symbol::SymbolKind;
     if matches!(sym.kind, SymbolKind::Function | SymbolKind::Method) {
@@ -2487,6 +2488,18 @@ fn extract_api_signature(
                             .child_by_field_name("body")
                             .map(|b| b.start_byte())
                             .unwrap_or_else(|| cur.end_byte());
+                        // TS/TSX の関数 destructured params (`function foo({ a, b }: T)`) は
+                        // `{ ... }` 内の variable 列が変わっても呼び出し側契約 (`: T` 型注釈)
+                        // に影響しないため、signature 比較から除外する。React の Props
+                        // 拡張 (optional prop 追加 + destructure 受け取り追加) で api.mod に
+                        // 出る false positive を防ぐ (Issue
+                        // 2026-05-28-api-mod-optional-props-additive 対応)。
+                        if matches!(
+                            lang_id,
+                            crate::language::LangId::Typescript | crate::language::LangId::Tsx
+                        ) {
+                            return normalize_typescript_destructure_signature(cur, source, s, e);
+                        }
                         if let Some(bytes) = source.get(s..e) {
                             return normalize_signature_whitespace(bytes);
                         }
@@ -2508,6 +2521,80 @@ fn extract_api_signature(
         .unwrap_or(&"")
         .trim()
         .to_string()
+}
+
+/// TS/TSX 関数の signature を抽出し、parameters 直下の `object_pattern`
+/// (destructured params) を `{}` に正規化する。
+///
+/// `function foo({ a, b, c = 0 }: Props)` と `function foo({ a, b }: Props)` は
+/// どちらも呼び出し側契約は `: Props` のみで、destructure 中身は内部 binding。
+/// 正規化することで Props 拡張に伴う destructure 行の追加が api.mod に出ない。
+///
+/// 型注釈側の inline object type (`function foo({x}: {x: string, y: number})` の
+/// `{x: string, y: number}`) は `type_annotation` 子なので置換対象外。
+fn normalize_typescript_destructure_signature(
+    fn_node: tree_sitter::Node<'_>,
+    source: &[u8],
+    start_byte: usize,
+    end_byte: usize,
+) -> String {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    if let Some(params) = fn_node.child_by_field_name("parameters") {
+        collect_parameter_object_pattern_ranges(params, &mut ranges);
+    }
+    if ranges.is_empty() {
+        if let Some(bytes) = source.get(start_byte..end_byte) {
+            return normalize_signature_whitespace(bytes);
+        }
+        return String::new();
+    }
+    ranges.sort_by_key(|r| r.0);
+
+    let mut buf: Vec<u8> = Vec::with_capacity(end_byte - start_byte);
+    let mut cursor = start_byte;
+    for (op_start, op_end) in &ranges {
+        if *op_start < cursor || *op_end > end_byte {
+            continue;
+        }
+        if let Some(bytes) = source.get(cursor..*op_start) {
+            buf.extend_from_slice(bytes);
+        }
+        buf.extend_from_slice(b"{}");
+        cursor = *op_end;
+    }
+    if let Some(bytes) = source.get(cursor..end_byte) {
+        buf.extend_from_slice(bytes);
+    }
+    normalize_signature_whitespace(&buf)
+}
+
+/// TS/TSX の formal_parameters 直下にある `object_pattern` のバイト範囲を集める。
+///
+/// パラメータの `type_annotation` (inline object type など) には踏み込まないため、
+/// 型注釈側の object type は影響を受けない。required_parameter / optional_parameter の
+/// `pattern` フィールドを直接見て object_pattern かを判定する。
+fn collect_parameter_object_pattern_ranges(
+    params: tree_sitter::Node<'_>,
+    ranges: &mut Vec<(usize, usize)>,
+) {
+    let mut cursor = params.walk();
+    for child in params.children(&mut cursor) {
+        match child.kind() {
+            "required_parameter" | "optional_parameter" => {
+                if let Some(pattern) = child.child_by_field_name("pattern")
+                    && pattern.kind() == "object_pattern"
+                {
+                    ranges.push((pattern.start_byte(), pattern.end_byte()));
+                }
+            }
+            // 無型 JS スタイル: parameter ノードがなく object_pattern が直接子に来る
+            // ケース。安全側に倒して同様に正規化する (TS/TSX に限定済み)。
+            "object_pattern" => {
+                ranges.push((child.start_byte(), child.end_byte()));
+            }
+            _ => {}
+        }
+    }
 }
 
 /// signature bytes を whitespace で分割して 1 つの space で結合し正規化する。
@@ -2715,7 +2802,7 @@ fn filter_exported_symbols(
         {
             continue;
         }
-        let sig = extract_api_signature(sym, root, source, &lines);
+        let sig = extract_api_signature(sym, root, source, &lines, lang_id);
         let qualname = if matches!(sym.kind, SymbolKind::Method | SymbolKind::Function) {
             enclosing_container(sym, &containers)
                 .map(|c| format!("{}.{}", c.name, sym.name))
@@ -4433,6 +4520,298 @@ mod tests {
                 .unwrap_or(false),
             "new_signature は追加された options 引数を含むべき: {:?}",
             foo_change.new_signature
+        );
+    }
+
+    /// TSX 関数コンポーネントの destructured props に optional prop を追加するだけの
+    /// React 後方互換変更は api.mod に出してはならない (Issue
+    /// 2026-05-28-api-mod-optional-props-additive 対応)。
+    #[test]
+    fn detect_api_changes_tsx_destructured_props_optional_addition_not_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let src_dir = repo.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+
+        let before = concat!(
+            "export interface Props { templates: string[]; onSelect: (s: string) => void; className?: string }\n",
+            "export function PromptTemplateSelector({ templates, onSelect, className = \"\" }: Props) {\n",
+            "  return templates;\n",
+            "}\n"
+        );
+        fs::write(src_dir.join("Selector.tsx"), before).expect("write before");
+        assert!(
+            Command::new("git")
+                .args(["add", "src/Selector.tsx"])
+                .current_dir(repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+
+        // interface に optional prop を追加し、関数の destructure 受け取りも追加。
+        // 型注釈 `: Props` 自体は不変。
+        let after = concat!(
+            "export interface Props { templates: string[]; onSelect: (s: string) => void; className?: string; useExistingContent?: boolean; onChange?: (v: boolean) => void }\n",
+            "export function PromptTemplateSelector({ templates, onSelect, className = \"\", useExistingContent = false, onChange }: Props) {\n",
+            "  return templates;\n",
+            "}\n"
+        );
+        fs::write(src_dir.join("Selector.tsx"), after).expect("write after");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/Selector.tsx".to_string(),
+            new_path: "src/Selector.tsx".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 4,
+                new_start: 1,
+                new_count: 4,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let mod_names: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            !mod_names.contains(&"PromptTemplateSelector"),
+            "TSX destructured params の optional 受け取り追加は api.mod に出してはならない。got: {mod_names:?}"
+        );
+    }
+
+    /// TS 関数の destructured params のデフォルト値変更は signature 不変として扱う
+    /// (caller-visible な型契約ではなく binding 時の挙動変更)。
+    #[test]
+    fn detect_api_changes_typescript_destructured_default_value_change_not_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let src_dir = repo.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+
+        let before = concat!(
+            "export interface Opts { x?: number }\n",
+            "export function foo({ x = 0 }: Opts) {\n",
+            "  return x;\n",
+            "}\n"
+        );
+        fs::write(src_dir.join("foo.ts"), before).expect("write before");
+        assert!(
+            Command::new("git")
+                .args(["add", "src/foo.ts"])
+                .current_dir(repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+
+        let after = concat!(
+            "export interface Opts { x?: number }\n",
+            "export function foo({ x = 42 }: Opts) {\n",
+            "  return x;\n",
+            "}\n"
+        );
+        fs::write(src_dir.join("foo.ts"), after).expect("write after");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/foo.ts".to_string(),
+            new_path: "src/foo.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 4,
+                new_start: 1,
+                new_count: 4,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let mod_names: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            !mod_names.contains(&"foo"),
+            "destructured params の default value 変更は api.mod に出してはならない。got: {mod_names:?}"
+        );
+    }
+
+    /// TS 関数の positional 引数追加は destructure ではなく直接の呼び出し契約変更なので
+    /// api.mod に残す (destructure normalize の副作用回帰防止)。
+    #[test]
+    fn detect_api_changes_typescript_positional_param_added_is_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let src_dir = repo.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+
+        let before = concat!(
+            "export function foo(a: number): number {\n",
+            "  return a;\n",
+            "}\n",
+            "export function bar() { return foo(1); }\n"
+        );
+        fs::write(src_dir.join("foo.ts"), before).expect("write before");
+        // 他ファイルからの cross-file 参照を作って closed-in-diff で抑制されないようにする。
+        fs::write(
+            src_dir.join("caller.ts"),
+            "import { foo } from './foo';\nexport const x = foo(1);\n",
+        )
+        .expect("write caller");
+        assert!(
+            Command::new("git")
+                .args(["add", "src/foo.ts", "src/caller.ts"])
+                .current_dir(repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+
+        let after = concat!(
+            "export function foo(a: number, b: number): number {\n",
+            "  return a + b;\n",
+            "}\n",
+            "export function bar() { return foo(1, 2); }\n"
+        );
+        fs::write(src_dir.join("foo.ts"), after).expect("write after");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/foo.ts".to_string(),
+            new_path: "src/foo.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 4,
+                new_start: 1,
+                new_count: 4,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let mod_names: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            mod_names.contains(&"foo"),
+            "positional 引数追加は destructure ではないので api.mod に残すべき。got: {mod_names:?}"
+        );
+    }
+
+    /// TS 関数 destructured params の **inline object type** 注釈変更は signature 変更として
+    /// 残す (型注釈側は呼び出し側に見える契約)。destructure normalize が type_annotation
+    /// に踏み込まないことの回帰防止。
+    #[test]
+    fn detect_api_changes_typescript_inline_object_type_change_is_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let src_dir = repo.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+
+        let before = concat!(
+            "export function foo({ x }: { x: string }): string {\n",
+            "  return x;\n",
+            "}\n",
+            "export function bar() { return foo({ x: 'a' }); }\n"
+        );
+        fs::write(src_dir.join("foo.ts"), before).expect("write before");
+        fs::write(
+            src_dir.join("caller.ts"),
+            "import { foo } from './foo';\nexport const x = foo({ x: 'a' });\n",
+        )
+        .expect("write caller");
+        assert!(
+            Command::new("git")
+                .args(["add", "src/foo.ts", "src/caller.ts"])
+                .current_dir(repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+
+        // inline object type に required な y フィールドを追加 (breaking)
+        let after = concat!(
+            "export function foo({ x, y }: { x: string; y: number }): string {\n",
+            "  return x + y;\n",
+            "}\n",
+            "export function bar() { return foo({ x: 'a', y: 1 }); }\n"
+        );
+        fs::write(src_dir.join("foo.ts"), after).expect("write after");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/foo.ts".to_string(),
+            new_path: "src/foo.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 4,
+                new_start: 1,
+                new_count: 4,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let mod_names: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            mod_names.contains(&"foo"),
+            "inline object type 注釈の構造変更は api.mod に残すべき。got: {mod_names:?}"
         );
     }
 
