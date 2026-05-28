@@ -1881,6 +1881,20 @@ fn detect_api_changes(
                     continue;
                 }
 
+                // TS/TSX で「引数なし `()` → 省略可能 destructured 引数 `({}: T)` /
+                // `({}: T = {})` 追加」は呼び出し側 (`foo()` / `<Foo />`) に影響しない
+                // 後方互換変更のため api.mod から除外する
+                // (Issue 2026-05-28-meet-virtual-you-frontend-modernize 対応)。
+                if is_ts_no_arg_to_optional_destructured_compatible(
+                    old_sig,
+                    new_sig,
+                    dir,
+                    &df.new_path,
+                    name,
+                ) {
+                    continue;
+                }
+
                 modified.push(ApiSymbolChange {
                     name: name.clone(),
                     kind: kind.clone(),
@@ -2498,9 +2512,7 @@ fn extract_api_signature(
                             lang_id,
                             crate::language::LangId::Typescript | crate::language::LangId::Tsx
                         ) {
-                            return normalize_typescript_destructure_signature(
-                                cur, root, source, s, e,
-                            );
+                            return normalize_typescript_destructure_signature(cur, source, s, e);
                         }
                         if let Some(bytes) = source.get(s..e) {
                             return normalize_signature_whitespace(bytes);
@@ -2535,53 +2547,40 @@ fn extract_api_signature(
 /// 型注釈側の inline object type (`function foo({x}: {x: string, y: number})` の
 /// `{x: string, y: number}`) は `type_annotation` 子なので置換対象外。
 ///
-/// 追加正規化: 単一 destructured object parameter が「省略可能」(default 値あり
-/// または 型注釈が全 optional の object type / 同一ファイル内 interface/type alias)
-/// と判定できる場合、parameters 全体を `()` に正規化する。これにより
-/// `function foo()` → `function foo({ x }: { x?: string } = {})` のような
-/// React 関数コンポーネントへの optional props 追加が api.mod に出ない
-/// (Issue 2026-05-28-meet-virtual-you-frontend-modernize 対応)。
+/// 「引数なし `()` から省略可能な destructured 引数追加」の互換性判定は、
+/// signature 単独では行わない (型注釈変更だけ起きるケースを誤って互換扱いする
+/// リスクがあるため)。両側 signature を見て判定するロジックは
+/// [`is_ts_no_arg_to_optional_destructured_compatible`] が detect_api_changes
+/// 経路で行う。
 fn normalize_typescript_destructure_signature(
     fn_node: tree_sitter::Node<'_>,
-    root: tree_sitter::Node<'_>,
     source: &[u8],
     start_byte: usize,
     end_byte: usize,
 ) -> String {
-    let mut substitutions: Vec<(usize, usize, &'static [u8])> = Vec::new();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
     if let Some(params) = fn_node.child_by_field_name("parameters") {
-        if is_optionally_omittable_single_destructured_param(params, root, source) {
-            // 単一 destructured で省略可能 → parameters 全体を `()` に正規化
-            substitutions.push((params.start_byte(), params.end_byte(), b"()"));
-        } else {
-            // 通常: object_pattern を `{}` に正規化
-            let mut ranges: Vec<(usize, usize)> = Vec::new();
-            collect_parameter_object_pattern_ranges(params, &mut ranges);
-            for (s, e) in ranges {
-                substitutions.push((s, e, b"{}"));
-            }
-        }
+        collect_parameter_object_pattern_ranges(params, &mut ranges);
     }
-
-    if substitutions.is_empty() {
+    if ranges.is_empty() {
         if let Some(bytes) = source.get(start_byte..end_byte) {
             return normalize_signature_whitespace(bytes);
         }
         return String::new();
     }
-    substitutions.sort_by_key(|s| s.0);
+    ranges.sort_by_key(|r| r.0);
 
     let mut buf: Vec<u8> = Vec::with_capacity(end_byte - start_byte);
     let mut cursor = start_byte;
-    for (s, e, rep) in &substitutions {
-        if *s < cursor || *e > end_byte {
+    for (op_start, op_end) in &ranges {
+        if *op_start < cursor || *op_end > end_byte {
             continue;
         }
-        if let Some(bytes) = source.get(cursor..*s) {
+        if let Some(bytes) = source.get(cursor..*op_start) {
             buf.extend_from_slice(bytes);
         }
-        buf.extend_from_slice(rep);
-        cursor = *e;
+        buf.extend_from_slice(b"{}");
+        cursor = *op_end;
     }
     if let Some(bytes) = source.get(cursor..end_byte) {
         buf.extend_from_slice(bytes);
@@ -2653,9 +2652,11 @@ fn is_optionally_omittable_single_destructured_param(
         let Ok(name) = std::str::from_utf8(name_bytes) else {
             return false;
         };
-        if let Some(decl) = lookup_type_decl_in_root(root, source, name) {
-            return type_decl_all_optional(decl, source);
-        }
+        let decls = collect_top_level_type_decls(root, source, name);
+        return !decls.is_empty()
+            && decls
+                .iter()
+                .all(|d| single_type_decl_all_optional(*d, source));
     }
     false
 }
@@ -2680,56 +2681,75 @@ fn all_object_type_members_optional(object_type: tree_sitter::Node<'_>, source: 
     true
 }
 
-/// `property_signature` ノードに optional マーカー `?` が付いているかを判定する。
-/// tree-sitter-typescript の grammar では property_signature の child に
-/// 直接 `?` token が出るため、テキストで `name:` の前に `?` があるかを確認する
-/// 単純な方法を使う (型注釈側の `?:` は colon の後ろなので影響しない)。
-fn property_signature_has_optional_marker(prop: tree_sitter::Node<'_>, source: &[u8]) -> bool {
-    let Some(bytes) = source.get(prop.start_byte()..prop.end_byte()) else {
-        return false;
-    };
-    let Ok(s) = std::str::from_utf8(bytes) else {
-        return false;
-    };
-    let Some(colon) = s.find(':') else {
-        return false;
-    };
-    s[..colon].contains('?')
+/// `property_signature` ノードに optional マーカー `?` が付いているかを tree-sitter
+/// の `?` token を直接見て判定する。`"name?": string` のような string property
+/// の名前に `?` を含むケースは誤判定しない。
+fn property_signature_has_optional_marker(prop: tree_sitter::Node<'_>, _source: &[u8]) -> bool {
+    let mut cursor = prop.walk();
+    for child in prop.children(&mut cursor) {
+        match child.kind() {
+            "?" => return true,
+            "type_annotation" => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
-/// `root` を BFS で走査して、`interface_declaration` / `type_alias_declaration` の
-/// うち name フィールドが指定名と一致する最初のものを返す。同一ファイル内のみ。
-fn lookup_type_decl_in_root<'a>(
+/// `root` のトップレベル (program 直下 / `export_statement` 直下) にある
+/// `interface_declaration` / `type_alias_declaration` のうち、name フィールドが
+/// 指定名と一致するものを **すべて** 集める。interface declaration merge 対応の
+/// ために複数返す。
+///
+/// ネストした declaration (関数内 / ブロック内) や import 型の解決はしない。
+/// 関数 scope などローカル scope の declaration を誤って拾わないため、スコープを
+/// トップレベルに限定する (codex 指摘 3 対応)。
+fn collect_top_level_type_decls<'a>(
     root: tree_sitter::Node<'a>,
     source: &[u8],
     name: &str,
-) -> Option<tree_sitter::Node<'a>> {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        let kind = node.kind();
-        if (kind == "interface_declaration" || kind == "type_alias_declaration")
-            && let Some(name_node) = node.child_by_field_name("name")
+) -> Vec<tree_sitter::Node<'a>> {
+    let mut decls = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        let candidate = if child.kind() == "export_statement" {
+            let mut sub_cursor = child.walk();
+            child
+                .children(&mut sub_cursor)
+                .find(|c| matches!(c.kind(), "interface_declaration" | "type_alias_declaration"))
+        } else if matches!(
+            child.kind(),
+            "interface_declaration" | "type_alias_declaration"
+        ) {
+            Some(child)
+        } else {
+            None
+        };
+        if let Some(decl) = candidate
+            && let Some(name_node) = decl.child_by_field_name("name")
             && let Some(bytes) = source.get(name_node.start_byte()..name_node.end_byte())
             && let Ok(decl_name) = std::str::from_utf8(bytes)
             && decl_name == name
         {
-            return Some(node);
-        }
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            stack.push(child);
+            decls.push(decl);
         }
     }
-    None
+    decls
 }
 
-/// `interface_declaration` / `type_alias_declaration` のメンバが全 optional な
-/// object 型かを判定する。type_alias_declaration では value が object_type の
-/// ケースのみ true を返す (union / intersection / generic / conditional 等は
-/// 保守的に false)。
-fn type_decl_all_optional(decl: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+/// 単一の `interface_declaration` / `type_alias_declaration` のメンバが全 optional な
+/// object 型かを判定する。
+///
+/// - `interface_declaration` が `extends_type_clause` を持つ場合は base interface が
+///   required field を持つ可能性があるため保守的に false (codex 指摘 2 対応)
+/// - `type_alias_declaration` は value が `object_type` のケースのみ判定対象。
+///   union / intersection / generic / conditional / mapped 等は保守的に false
+fn single_type_decl_all_optional(decl: tree_sitter::Node<'_>, source: &[u8]) -> bool {
     match decl.kind() {
         "interface_declaration" => {
+            if interface_has_extends(decl) {
+                return false;
+            }
             if let Some(body) = decl.child_by_field_name("body") {
                 return all_object_type_members_optional(body, source);
             }
@@ -2745,6 +2765,113 @@ fn type_decl_all_optional(decl: tree_sitter::Node<'_>, source: &[u8]) -> bool {
         }
         _ => false,
     }
+}
+
+/// `interface_declaration` ノードが `extends_type_clause` を持つかを判定する。
+fn interface_has_extends(decl: tree_sitter::Node<'_>) -> bool {
+    let mut cursor = decl.walk();
+    decl.children(&mut cursor)
+        .any(|c| c.kind() == "extends_type_clause")
+}
+
+/// TS/TSX 関数の「引数なし `()` から省略可能 destructured 引数追加」が
+/// backward-compatible かを判定する。両側 signature を見て判定するため
+/// `detect_api_changes` から呼ぶ。`extract_api_signature` で signature 単独
+/// 正規化に組み込まないのは、optional 型変更 (`{x?:string}` → `{x?:number}`)
+/// まで誤って互換扱いするのを防ぐため (codex 設計合意)。
+///
+/// 条件:
+/// 1. `file_path` の言語が TypeScript / Tsx
+/// 2. `old_sig` に `fn_name()` (parameters なし) が含まれる
+/// 3. `new_sig` に `fn_name({}` (destructure normalize 済み) が含まれる
+/// 4. ファイルを parse し、関数 `fn_name` の parameters が省略可能と判定できる
+fn is_ts_no_arg_to_optional_destructured_compatible(
+    old_sig: &str,
+    new_sig: &str,
+    dir: &str,
+    file_path: &str,
+    fn_name: &str,
+) -> bool {
+    let full_path = std::path::Path::new(dir).join(file_path);
+    let Some(utf8_str) = full_path.to_str() else {
+        return false;
+    };
+    let utf8_path = camino::Utf8Path::new(utf8_str);
+    let Ok(lang_id) = crate::language::LangId::from_path(utf8_path) else {
+        return false;
+    };
+    if !matches!(
+        lang_id,
+        crate::language::LangId::Typescript | crate::language::LangId::Tsx
+    ) {
+        return false;
+    }
+
+    if !signature_has_empty_parens_for(old_sig, fn_name) {
+        return false;
+    }
+    if !signature_has_destructured_params_for(new_sig, fn_name) {
+        return false;
+    }
+
+    let Ok(source) = parser::read_file(utf8_path) else {
+        return false;
+    };
+    let Ok(tree) = parser::parse_source(&source, lang_id) else {
+        return false;
+    };
+    let root = tree.root_node();
+
+    let Some(fn_node) = find_function_by_name(root, &source, fn_name) else {
+        return false;
+    };
+    let Some(params) = fn_node.child_by_field_name("parameters") else {
+        return false;
+    };
+    is_optionally_omittable_single_destructured_param(params, root, &source)
+}
+
+/// signature 文字列に `fn_name()` (parameters なし) パターンが含まれるかを判定。
+fn signature_has_empty_parens_for(sig: &str, fn_name: &str) -> bool {
+    let needle = format!("{fn_name}()");
+    sig.contains(&needle)
+}
+
+/// signature 文字列に destructure normalize 済みの `fn_name({}` パターンが
+/// 含まれるかを判定。
+fn signature_has_destructured_params_for(sig: &str, fn_name: &str) -> bool {
+    let needle = format!("{fn_name}({{}}");
+    sig.contains(&needle)
+}
+
+/// `root` を BFS で走査し、name が一致する関数 / メソッド ノードを返す。
+fn find_function_by_name<'a>(
+    root: tree_sitter::Node<'a>,
+    source: &[u8],
+    name: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let kind = node.kind();
+        if matches!(
+            kind,
+            "function_declaration"
+                | "function_definition"
+                | "method_definition"
+                | "function_signature_item"
+        ) && let Some(name_node) = node.child_by_field_name("name")
+            && let Some(bytes) = source.get(name_node.start_byte()..name_node.end_byte())
+            && let Ok(decl_name) = std::str::from_utf8(bytes)
+            && decl_name == name
+        {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    None
 }
 
 /// TS/TSX の formal_parameters 直下にある `object_pattern` のバイト範囲を集める。
@@ -5000,6 +5127,321 @@ mod tests {
         assert!(
             mod_names.contains(&"widget"),
             "import 型 (同ファイル内 declaration なし) の destructured props 追加は省略可能と断定できないので api.mod に残すべき。got: {mod_names:?}"
+        );
+    }
+
+    /// TS 関数 destructured params の型注釈 (inline object type) で optional field の
+    /// 型を変更した場合 (`{ x?: string }` → `{ x?: number }`) は呼び出し側に見える
+    /// 型契約変更なので api.mod に残すべき。「省略可能 destructured を `()` と
+    /// 同一視する」過剰正規化を防ぐ codex 指摘 1 への回帰防止。
+    #[test]
+    fn detect_api_changes_tsx_optional_field_type_change_in_destructured_is_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let src_dir = repo.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+
+        let before = concat!(
+            "export function foo({ x }: { x?: string }): string {\n",
+            "  return x ?? \"a\";\n",
+            "}\n"
+        );
+        fs::write(src_dir.join("foo.ts"), before).expect("write before");
+        fs::write(
+            src_dir.join("caller.ts"),
+            "import { foo } from './foo';\nexport const x = foo({ x: 'a' });\n",
+        )
+        .expect("write caller");
+        assert!(
+            Command::new("git")
+                .args(["add", "src/foo.ts", "src/caller.ts"])
+                .current_dir(repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+
+        // optional field の型変更 (string → number)
+        let after = concat!(
+            "export function foo({ x }: { x?: number }): string {\n",
+            "  return String(x ?? 0);\n",
+            "}\n"
+        );
+        fs::write(src_dir.join("foo.ts"), after).expect("write after");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/foo.ts".to_string(),
+            new_path: "src/foo.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 3,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let mod_names: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            mod_names.contains(&"foo"),
+            "optional field の型変更は呼び出し側型契約変更なので api.mod に残すべき。got: {mod_names:?}"
+        );
+    }
+
+    /// `interface Props extends Base { ... }` で body のフィールドが全 optional でも、
+    /// base interface が required field を持つ可能性があるため省略可能扱いしない
+    /// (codex 指摘 2 への回帰防止)。
+    #[test]
+    fn detect_api_changes_tsx_interface_with_extends_clause_is_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let src_dir = repo.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+
+        let before = concat!(
+            "export function widget() {\n",
+            "  return null;\n",
+            "}\n",
+            "export function caller() { return widget(); }\n"
+        );
+        fs::write(src_dir.join("widget.ts"), before).expect("write before");
+        fs::write(
+            src_dir.join("user.ts"),
+            "import { widget } from './widget';\nexport const x = widget();\n",
+        )
+        .expect("write user");
+        assert!(
+            Command::new("git")
+                .args(["add", "src/widget.ts", "src/user.ts"])
+                .current_dir(repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+
+        // interface に extends を付けて props を追加 (body は optional だが base が不明)
+        let after = concat!(
+            "interface BaseProps {\n",
+            "  required: string;\n",
+            "}\n",
+            "interface WidgetProps extends BaseProps {\n",
+            "  optional?: number;\n",
+            "}\n",
+            "export function widget({ optional }: WidgetProps) {\n",
+            "  return optional;\n",
+            "}\n",
+            "export function caller() { return widget({ required: \"x\" }); }\n"
+        );
+        fs::write(src_dir.join("widget.ts"), after).expect("write after");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/widget.ts".to_string(),
+            new_path: "src/widget.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 4,
+                new_start: 1,
+                new_count: 10,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let mod_names: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            mod_names.contains(&"widget"),
+            "extends 持ち interface は base 側の required field を否定できないので api.mod に残すべき。got: {mod_names:?}"
+        );
+    }
+
+    /// 同名 interface declaration merge で、片方が required field を含む場合、
+    /// 全体としては省略可能ではないので api.mod に残すべき (codex 指摘 3 への
+    /// 回帰防止)。
+    #[test]
+    fn detect_api_changes_tsx_interface_merge_with_required_field_is_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let src_dir = repo.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+
+        let before = concat!(
+            "export function widget() {\n",
+            "  return null;\n",
+            "}\n",
+            "export function caller() { return widget(); }\n"
+        );
+        fs::write(src_dir.join("widget.ts"), before).expect("write before");
+        fs::write(
+            src_dir.join("user.ts"),
+            "import { widget } from './widget';\nexport const x = widget();\n",
+        )
+        .expect("write user");
+        assert!(
+            Command::new("git")
+                .args(["add", "src/widget.ts", "src/user.ts"])
+                .current_dir(repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+
+        // 同名 interface 宣言が 2 つあり、片方は optional のみ、もう片方は required あり
+        let after = concat!(
+            "interface WidgetProps {\n",
+            "  optional?: number;\n",
+            "}\n",
+            "interface WidgetProps {\n",
+            "  required: string;\n",
+            "}\n",
+            "export function widget({ optional }: WidgetProps) {\n",
+            "  return optional;\n",
+            "}\n",
+            "export function caller() { return widget({ required: \"x\" }); }\n"
+        );
+        fs::write(src_dir.join("widget.ts"), after).expect("write after");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/widget.ts".to_string(),
+            new_path: "src/widget.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 4,
+                new_start: 1,
+                new_count: 10,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let mod_names: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            mod_names.contains(&"widget"),
+            "同名 interface merge で required field があれば省略可能ではないので api.mod に残すべき。got: {mod_names:?}"
+        );
+    }
+
+    /// `"name?": string` のような string property name の `?` を optional マーカーと
+    /// 誤判定しないこと (codex 指摘 4 への回帰防止)。required field を含む型注釈
+    /// なので api.mod に残るべき。
+    #[test]
+    fn detect_api_changes_tsx_string_property_name_with_question_mark_is_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let src_dir = repo.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+
+        let before = concat!(
+            "export function widget() {\n",
+            "  return null;\n",
+            "}\n",
+            "export function caller() { return widget(); }\n"
+        );
+        fs::write(src_dir.join("widget.ts"), before).expect("write before");
+        fs::write(
+            src_dir.join("user.ts"),
+            "import { widget } from './widget';\nexport const x = widget();\n",
+        )
+        .expect("write user");
+        assert!(
+            Command::new("git")
+                .args(["add", "src/widget.ts", "src/user.ts"])
+                .current_dir(repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+
+        // string property name の中に `?` を含む required field を持つ inline object type
+        let after = concat!(
+            "export function widget(props: { \"name?\": string }) {\n",
+            "  return props[\"name?\"];\n",
+            "}\n",
+            "export function caller() { return widget({ \"name?\": \"x\" }); }\n"
+        );
+        fs::write(src_dir.join("widget.ts"), after).expect("write after");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/widget.ts".to_string(),
+            new_path: "src/widget.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 4,
+                new_start: 1,
+                new_count: 4,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let mod_names: Vec<&str> = api_changes
+            .modified
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            mod_names.contains(&"widget"),
+            "string property name `\"name?\"` の `?` は optional マーカーではなく required field のはず。api.mod に残すべき。got: {mod_names:?}"
         );
     }
 
