@@ -1306,14 +1306,15 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> HookJsonBuild {
         hook_obj.insert("cochange".into(), serde_json::Value::Array(cochanges));
     }
 
-    // api: {add,rm,mod,moved,property_to_field} — 空でないセクションのみ
+    // api: {add,rm,mod,moved,property_to_field,rm_dead} — 空でないセクションのみ
     let has_api_changes = !result.api_changes.added.is_empty()
         || !result.api_changes.removed.is_empty()
         || !result.api_changes.modified.is_empty()
         || !result.api_changes.moved.is_empty()
-        || !result.api_changes.property_to_field.is_empty();
-    // api.added / api.moved / api.property_to_field は破壊的変更ではないため Stop hook の
-    // ブロッキング対象から外し informational 扱いにする。api.removed / api.modified は
+        || !result.api_changes.property_to_field.is_empty()
+        || !result.api_changes.removed_dead.is_empty();
+    // api.added / api.moved / api.property_to_field / api.removed_dead は破壊的変更ではないため
+    // Stop hook のブロッキング対象から外し informational 扱いにする。api.removed / api.modified は
     // 破壊的変更の可能性があるため従来どおり blocking。
     let has_api_breaking =
         !result.api_changes.removed.is_empty() || !result.api_changes.modified.is_empty();
@@ -1377,6 +1378,19 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> HookJsonBuild {
                                 "to": m.to,
                             })
                         })
+                        .collect(),
+                ),
+            );
+        }
+        if !result.api_changes.removed_dead.is_empty() {
+            api.insert(
+                "rm_dead".into(),
+                serde_json::Value::Array(
+                    result
+                        .api_changes
+                        .removed_dead
+                        .iter()
+                        .map(|s| serde_json::json!({"n": s.name, "f": s.file}))
                         .collect(),
                 ),
             );
@@ -1923,15 +1937,15 @@ fn detect_api_changes(
     // 順序は moved > removed_dead (rename/move 相殺を先に行わないと移動が dead 誤分類
     // される)。codex 設計合意 (Issue
     // 2026-05-28-meet-virtual-you-gemini-multi-select 対応)。
-    let mut removed_kept: Vec<ApiSymbolCandidate> = Vec::new();
-    let mut removed_dead: Vec<ApiSymbolCandidate> = Vec::new();
-    for candidate in removed {
-        if is_removed_symbol_unreferenced(dir, &candidate.name) {
-            removed_dead.push(candidate);
-        } else {
-            removed_kept.push(candidate);
-        }
-    }
+    //
+    // qualname (`Container.method`) は refs 検索が identifier ノードでマッチするため
+    // 常に 0 件返却となり誤分類するため、bare name で検索する。同名 def が複数残って
+    // いる場合は「部分的削除」or「同名複数定義」の可能性があるため保守的に removed
+    // に残す (codex 指摘 1 対応)。
+    //
+    // 複数候補がある場合、`find_references_batch` で 1 度のリポジトリ走査に集約する
+    // (codex 指摘 3 対応: 候補数 × リポ全体走査の回避)。
+    let (removed_kept, removed_dead) = partition_removed_dead_candidates(dir, removed);
 
     ApiChanges {
         added: added.into_iter().map(|c| c.into_api_symbol()).collect(),
@@ -3485,6 +3499,84 @@ fn has_cross_file_refs(dir: &str, file_path: &str, name: &str) -> bool {
 /// 参照が 0 件であれば同一 diff 内で全 caller が追随済みと判断し、`api.rm` から除外する。
 /// 参照検索に失敗した場合は保守的に false（外部参照ありとみなす）を返し、
 /// レビュー対象として残す（false negative を起こさない方針）。
+/// `removed` 候補のうち、HEAD ツリーで repo 内参照 0 件のものを `removed_dead` に
+/// 振り分ける。残りは `removed` (破壊的削除) として返す。
+///
+/// 実装上の配慮:
+/// - **qualname → bare name**: `Container.method` 形式は refs 検索の identifier
+///   マッチでは常に 0 件になるため、`bare_name` で正規化して検索する
+/// - **batch refs**: 候補ごとに `find_references` を呼ぶと「候補数 × リポ全体走査」と
+///   なる。`find_references_batch` で 1 回の AC + ディレクトリ走査に集約
+/// - **同名複数定義の保守扱い**: 削除後の HEAD で同名 def が 2 件以上残っていれば
+///   「部分削除」「同名複数 export」など破壊的削除の可能性があるため、保守的に
+///   `removed` に残す (false negative より false positive を優先)
+/// - **検索失敗時の保守扱い**: batch refs が `Err` を返した場合、すべて `removed`
+///   に残す (false negative 防止)
+fn partition_removed_dead_candidates(
+    dir: &str,
+    candidates: Vec<ApiSymbolCandidate>,
+) -> (Vec<ApiSymbolCandidate>, Vec<ApiSymbolCandidate>) {
+    use crate::models::reference::RefKind;
+    use std::collections::{HashMap, HashSet};
+
+    if candidates.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    // 候補から bare name を重複排除して集める
+    let mut unique_bare: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for c in &candidates {
+        let bare = bare_name(&c.name).to_string();
+        if seen.insert(bare.clone()) {
+            unique_bare.push(bare);
+        }
+    }
+
+    let service = AppService::new();
+    let batch_result = match service.find_references_batch(&unique_bare, dir, None) {
+        Ok(r) => r,
+        Err(_) => {
+            // 検索失敗時は保守的にすべて removed に残す
+            return (candidates, Vec::new());
+        }
+    };
+
+    // bare_name -> (def_count, ref_count)
+    let mut counts: HashMap<String, (usize, usize)> = HashMap::new();
+    for r in &batch_result {
+        let mut def_count = 0usize;
+        let mut ref_count = 0usize;
+        for x in &r.references {
+            if x.kind == Some(RefKind::Definition) {
+                def_count += 1;
+            } else {
+                ref_count += 1;
+            }
+        }
+        counts.insert(r.symbol.clone(), (def_count, ref_count));
+    }
+
+    let mut removed_kept = Vec::new();
+    let mut removed_dead = Vec::new();
+    for c in candidates {
+        let bare = bare_name(&c.name).to_string();
+        let (def_count, ref_count) = counts.get(&bare).copied().unwrap_or((0, 0));
+        // 同名定義が複数残っている → 保守的に removed に残す
+        if def_count > 1 {
+            removed_kept.push(c);
+            continue;
+        }
+        if ref_count == 0 {
+            removed_dead.push(c);
+        } else {
+            removed_kept.push(c);
+        }
+    }
+
+    (removed_kept, removed_dead)
+}
+
 fn is_removed_symbol_unreferenced(dir: &str, name: &str) -> bool {
     let service = AppService::new();
     let Ok(refs_result) = service.find_references(name, dir, None) else {
@@ -6808,6 +6900,71 @@ class B:
         );
     }
 
+    /// qualname (`Container.method`) 形式の class method 削除でも、別ファイルから
+    /// bare name で参照されていれば破壊的削除として `removed` に残ること
+    /// (codex 指摘 1: qualname 誤分類への回帰防止)。
+    #[test]
+    fn detect_api_changes_qualname_method_with_external_caller_stays_in_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        // class Foo の method bar を削除するが、caller.py で Foo().bar() を呼んでいる
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "foo.py",
+                    "class Foo:\n    def bar(self):\n        return 1\n",
+                ),
+                (
+                    "caller.py",
+                    "from foo import Foo\n\ndef use():\n    return Foo().bar()\n",
+                ),
+            ],
+            "initial",
+        );
+        // method bar を削除
+        fs::write(repo.join("foo.py"), "class Foo:\n    pass\n").expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "foo.py".to_string(),
+            new_path: "foo.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 2,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed_names: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        let removed_dead_names: Vec<&str> = api_changes
+            .removed_dead
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        // bare name 'bar' で検索すると caller.py の Foo().bar() で参照あり
+        // qualname を bare で正規化していなければ常に refs 0 件で removed_dead に
+        // 誤分類される
+        assert!(
+            removed_names.iter().any(|n| n.contains("bar")),
+            "外部 caller がいる qualname method 削除は removed に残るべき。got removed: {removed_names:?}, removed_dead: {removed_dead_names:?}"
+        );
+        assert!(
+            !removed_dead_names.iter().any(|n| n.contains("bar")),
+            "外部 caller がいる qualname method 削除を removed_dead に振り分けてはならない。got: {removed_dead_names:?}"
+        );
+    }
+
     #[test]
     fn detect_api_changes_still_detects_genuine_removal() {
         // リネームではなく純粋に関数を削除した場合は api.rm が発報される。
@@ -9963,10 +10120,18 @@ def new_public_api():
         init_git_repo_for_test(repo);
         git_commit_files(
             repo,
-            &[(
-                "src/old.rs",
-                "pub fn greet() -> i32 {\n    1\n}\n\npub fn farewell() -> i32 {\n    0\n}\n",
-            )],
+            &[
+                (
+                    "src/old.rs",
+                    "pub fn greet() -> i32 {\n    1\n}\n\npub fn farewell() -> i32 {\n    0\n}\n",
+                ),
+                (
+                    // caller を別ファイルに置いて farewell を参照させる (rename 削除でも
+                    // removed_dead ではなく removed として残ることを確認するため)
+                    "src/caller.rs",
+                    "pub fn use_farewell() -> i32 { crate::farewell() }\n",
+                ),
+            ],
             "initial",
         );
 
