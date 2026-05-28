@@ -3577,12 +3577,35 @@ fn partition_removed_dead_candidates(
     (removed_kept, removed_dead)
 }
 
+/// 削除されたシンボル `name` が、変更後のツリー全体のどこからも参照されていないかを判定する。
+/// 参照が 0 件であれば同一 diff 内で全 caller が追随済みと判断し、`api.rm` から除外する。
+/// 参照検索に失敗した場合は保守的に false（外部参照ありとみなす）を返し、
+/// レビュー対象として残す（false negative を起こさない方針）。
+///
+/// qualname (`Container.method`) は refs 検索の identifier マッチでは常に 0 件になるため、
+/// `bare_name` で正規化して検索する。同名定義が HEAD ツリーに 2 件以上残存する場合は
+/// 「部分削除」「同名複数 export」の可能性があるため保守的に false を返す
+/// (codex 指摘: detect_api_changes の早期 continue 経路でも qualname 対応が必要)。
 fn is_removed_symbol_unreferenced(dir: &str, name: &str) -> bool {
+    use crate::models::reference::RefKind;
+    let bare = bare_name(name);
     let service = AppService::new();
-    let Ok(refs_result) = service.find_references(name, dir, None) else {
+    let Ok(refs_result) = service.find_references(bare, dir, None) else {
         return false;
     };
-    refs_result.references.is_empty()
+    let mut def_count = 0usize;
+    let mut ref_count = 0usize;
+    for r in &refs_result.references {
+        if r.kind == Some(RefKind::Definition) {
+            def_count += 1;
+        } else {
+            ref_count += 1;
+        }
+    }
+    if def_count > 1 {
+        return false;
+    }
+    ref_count == 0
 }
 
 /// 削除された bash 関数 `name` が、変更後ツリーの bash 系ファイル内のどこからも
@@ -6897,6 +6920,77 @@ class B:
         assert!(
             !removed_dead_names.contains(&"bar"),
             "参照ありの削除は removed_dead に振り分けてはならない。got: {removed_dead_names:?}"
+        );
+    }
+
+    /// detect_api_changes の早期 continue 経路 (closed-in-diff for api.rm) でも
+    /// qualname 対応が機能すること (codex 2 回目指摘への回帰防止)。
+    /// 「qualname method 削除 + 同ファイルに新規関数追加 + 外部 caller 残存」のケースで
+    /// removed_dead に誤分類されず removed に残る。
+    #[test]
+    fn detect_api_changes_qualname_method_with_inline_addition_and_external_caller_stays_in_removed()
+     {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        // 旧: Foo.bar あり、caller.py で Foo().bar() を参照
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "foo.py",
+                    "class Foo:\n    def bar(self):\n        return 1\n",
+                ),
+                (
+                    "caller.py",
+                    "from foo import Foo\n\ndef use():\n    return Foo().bar()\n",
+                ),
+            ],
+            "initial",
+        );
+        // 新: bar を削除し、同ファイルに新規関数 helper を追加
+        // → new_symbols_in_current_file が空でないので closed-in-diff 早期 continue
+        //   経路に入る (line 1836 周辺)
+        fs::write(
+            repo.join("foo.py"),
+            "class Foo:\n    pass\n\n\ndef helper():\n    return 0\n",
+        )
+        .expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "foo.py".to_string(),
+            new_path: "foo.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 5,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed_names: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        let removed_dead_names: Vec<&str> = api_changes
+            .removed_dead
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        // 早期 continue 経路でも bare name + def_count 判定が効く
+        assert!(
+            removed_names.iter().any(|n| n.contains("bar")),
+            "qualname method 削除 + 同ファイル新規追加 + 外部 caller 残存は removed に残るべき。got removed: {removed_names:?}, removed_dead: {removed_dead_names:?}"
+        );
+        assert!(
+            !removed_dead_names.iter().any(|n| n.contains("bar")),
+            "上記ケースを removed_dead に振り分けてはならない。got: {removed_dead_names:?}"
         );
     }
 
