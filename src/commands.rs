@@ -1892,10 +1892,13 @@ fn detect_api_changes(
         let is_binary_rust_old_crate_for_mod =
             is_binary_only_rust_crate_at_base(dir, base, &df.old_path);
         let is_binary_rust_new_crate_for_mod = is_binary_only_rust_crate(dir, &df.new_path);
-        // private module 配下の pub シンボルは crate 外から到達できないため api.mod も対象外。
+        // api.mod の private module 抑制: new と base 両方で private module 配下なら crate 外
+        // 非到達なので除外する。base で外部公開 (pub mod) だった旧 API の破壊的 signature 変更は
+        // base 側が public 判定となり除外されず blocking を維持する (codex 指摘2)。
         let skip_mod_for_binary_crate = is_binary_rust_old_crate_for_mod
             || is_binary_rust_new_crate_for_mod
-            || is_rust_symbol_in_private_module(dir, &df.new_path);
+            || (is_rust_symbol_in_private_module(dir, &df.new_path)
+                && is_rust_symbol_in_private_module_at_base(dir, base, &df.old_path));
 
         // 同一 (file, qualname) の modified を重複排除するためのキーセット
         let mut seen_modified: std::collections::HashSet<(String, String)> =
@@ -1944,7 +1947,7 @@ fn detect_api_changes(
                 };
                 // 全 cross-file 参照が同一 diff 内の変更 hunk で追随済みなら、呼び出し側は
                 // 同一コミットで更新済み。破壊的でないため informational に降格する。
-                if is_modified_closed_in_diff(dir, name, diff_files) {
+                if is_modified_closed_in_diff(dir, name, base, diff_files) {
                     modified_closed_in_diff.push(change);
                 } else {
                     modified.push(change);
@@ -2003,9 +2006,11 @@ fn detect_api_changes(
 fn is_modified_closed_in_diff(
     dir: &str,
     name: &str,
+    base: &str,
     diff_files: &[crate::models::impact::DiffFile],
 ) -> bool {
     use crate::models::reference::RefKind;
+    use std::collections::{HashMap, HashSet};
     let bare = bare_name(name);
     let refs = match crate::engine::refs::find_references(bare, std::path::Path::new(dir), None) {
         Ok(r) => r,
@@ -2019,37 +2024,76 @@ fn is_modified_closed_in_diff(
     if def_count != 1 {
         return false;
     }
-    // 非定義参照を収集。caller が 1 件も無い場合は「同一 diff で追随済み」とは言えず、
-    // 外部利用者の可能性も排除できないため closed 扱いにしない (通常の api.mod として blocking)。
-    let non_def: Vec<_> = refs
+    // import / use 宣言の参照は signature 変更に追随する必要がない (名前だけの import で、
+    // 通常は変更されず context 行に残る) ため除外し、実際の呼び出し参照のみを対象とする。
+    // 呼び出し参照が 1 件も無ければ (import のみ / 呼び出しが diff 外にある可能性) closed
+    // 扱いにせず blocking。
+    let call_refs: Vec<&crate::models::reference::SymbolReference> = refs
         .iter()
-        .filter(|r| r.kind != Some(RefKind::Definition))
+        .filter(|r| r.kind != Some(RefKind::Definition) && !ref_is_import_line(r))
         .collect();
-    if non_def.is_empty() {
+    if call_refs.is_empty() {
         return false;
     }
-    // 全ての非定義参照が変更 hunk 内にあれば、全 caller が同一 diff 内で追随済みとみなす。
-    non_def
-        .iter()
-        .all(|r| ref_line_in_diff_hunk(&r.path, r.line, diff_files, dir))
+    // 全ての呼び出し参照が、diff 内ファイルかつ実際の追加/変更行 (context 行ではない) にあるか。
+    // HunkInfo の new 範囲は context 行を含むため、git diff から実 `+` 行集合を取得して照合する
+    // (codex 指摘: context 行に古い呼び出しが入ると未更新 caller を誤って closed 判定してしまう)。
+    let mut changed_cache: HashMap<String, HashSet<usize>> = HashMap::new();
+    for r in &call_refs {
+        let Some(df) = diff_files.iter().find(|df| {
+            df.new_path != "/dev/null" && diff_path_matches_ref(&df.new_path, &r.path, dir)
+        }) else {
+            return false; // diff 外ファイルの参照 → 未更新 caller の可能性
+        };
+        let changed = changed_cache
+            .entry(df.new_path.clone())
+            .or_insert_with(|| changed_new_lines_for_file(dir, base, &df.new_path));
+        if !changed.contains(&r.line) {
+            return false; // context 行 (未変更) の参照 → 未更新 caller の可能性
+        }
+    }
+    true
 }
 
-/// 参照 (path, 0-indexed line) が diff_files のいずれかの変更 hunk (new 範囲) 内かを返す。
-fn ref_line_in_diff_hunk(
-    ref_path: &str,
-    ref_line: usize,
-    diff_files: &[crate::models::impact::DiffFile],
+/// 参照行が import / use 宣言 (signature 変更に追随不要) かを行テキストで簡易判定する。
+fn ref_is_import_line(r: &crate::models::reference::SymbolReference) -> bool {
+    r.context
+        .as_deref()
+        .map(|c| {
+            let t = c.trim_start();
+            t.starts_with("use ")
+                || t.starts_with("pub use ")
+                || t.starts_with("import ")
+                || t.starts_with("from ")
+        })
+        .unwrap_or(false)
+}
+
+/// `git diff <base> -- <path>` を解析し、new 側で実際に追加/変更された 0-indexed 行集合を返す。
+/// 取得・解析に失敗した場合は空集合 (= どの参照も追随済みと見なさず blocking 維持) を返す。
+fn changed_new_lines_for_file(
     dir: &str,
-) -> bool {
-    let ln1 = ref_line + 1; // HunkInfo.new_start は 1-indexed
-    diff_files.iter().any(|df| {
-        df.new_path != "/dev/null"
-            && diff_path_matches_ref(&df.new_path, ref_path, dir)
-            && df
-                .hunks
-                .iter()
-                .any(|h| ln1 >= h.new_start && ln1 < h.new_start + h.new_count)
-    })
+    base: &str,
+    path: &str,
+) -> std::collections::HashSet<usize> {
+    use std::collections::HashSet;
+    if validate_git_revision(base, "--base").is_err()
+        || validate_git_revision(path, "diff file path").is_err()
+    {
+        return HashSet::new();
+    }
+    let output = std::process::Command::new("git")
+        .args(["diff", base, "--", path])
+        .current_dir(dir)
+        .output();
+    let Ok(output) = output else {
+        return HashSet::new();
+    };
+    if !output.status.success() {
+        return HashSet::new();
+    }
+    let diff = String::from_utf8_lossy(&output.stdout);
+    crate::engine::diff::extract_changed_new_lines(&diff, path)
 }
 
 /// diff の new_path (dir 相対) と参照 path (dir 相対 or 絶対) が同一ファイルを指すか判定する。
@@ -2081,8 +2125,8 @@ fn diff_path_matches_ref(diff_path: &str, ref_path: &str, dir: &str) -> bool {
 /// 確認する。`pub(crate)` / `pub(super)` 等の制限付き pub や `mod` (private) は外部非到達。
 /// `#[path]` 属性 / inline mod / 宣言未検出など解析できないケースは false を返して保守的に
 /// API 扱い (既存挙動維持) とする。bin-only crate (lib.rs なし) も false。
-fn is_rust_symbol_in_private_module(dir: &str, file_path: &str) -> bool {
-    use std::path::Path;
+fn rust_symbol_in_private_module_inner(dir: &str, file_path: &str, base: Option<&str>) -> bool {
+    use std::path::{Path, PathBuf};
     let rel = Path::new(file_path);
     if rel.extension().and_then(|s| s.to_str()) != Some("rs") {
         return false;
@@ -2091,8 +2135,9 @@ fn is_rust_symbol_in_private_module(dir: &str, file_path: &str) -> bool {
         return false;
     };
     let abs = canonical_dir.join(rel);
-    // crate root: abs の祖先で最も近い Cargo.toml を持つディレクトリ (canonical_dir 境界まで)
-    let mut crate_root: Option<std::path::PathBuf> = None;
+    // crate root: abs の祖先で最も近い Cargo.toml を持つディレクトリ (canonical_dir 境界まで)。
+    // ディレクトリ構造は working tree のものを使う (base で大きく変わるケースは稀)。
+    let mut crate_root: Option<PathBuf> = None;
     let mut anc = abs.parent();
     while let Some(d) = anc {
         if d.join("Cargo.toml").is_file() {
@@ -2108,8 +2153,7 @@ fn is_rust_symbol_in_private_module(dir: &str, file_path: &str) -> bool {
         return false;
     };
     let src_dir = crate_root.join("src");
-    let lib_rs = src_dir.join("lib.rs");
-    if !lib_rs.is_file() {
+    if !src_dir.join("lib.rs").is_file() {
         return false; // library crate でない (bin-only は別経路で処理)
     }
     let Ok(rel_to_src) = abs.strip_prefix(&src_dir) else {
@@ -2119,30 +2163,63 @@ fn is_rust_symbol_in_private_module(dir: &str, file_path: &str) -> bool {
     if segments.is_empty() {
         return false; // root モジュール (lib.rs / main.rs) は常に到達可能
     }
+    let crate_root_rel = crate_root.strip_prefix(&canonical_dir).ok();
+    // src 相対モジュールパス → source。working tree (base=None) は直接読み、base 指定時は
+    // `git show <base>:<crate>/src/<rel>` で旧版を取得する (codex 指摘2: base で外部公開
+    // だった旧 API を誤抑制しないよう old 側でも可視性を確認するため)。
+    let read_module = |module_rel: &Path| -> Option<Vec<u8>> {
+        match base {
+            None => std::fs::read(src_dir.join(module_rel)).ok(),
+            Some(base) => {
+                let crate_rel = crate_root_rel?;
+                let full_rel = crate_rel.join("src").join(module_rel);
+                let full_rel_str = full_rel.to_str()?;
+                if validate_git_revision(base, "--base").is_err()
+                    || validate_git_revision(full_rel_str, "diff file path").is_err()
+                {
+                    return None;
+                }
+                let out = std::process::Command::new("git")
+                    .args(["show", &format!("{base}:{full_rel_str}")])
+                    .current_dir(dir)
+                    .output()
+                    .ok()?;
+                if !out.status.success() {
+                    return None;
+                }
+                Some(out.stdout)
+            }
+        }
+    };
     // lib.rs から mod 宣言チェーンを辿り、いずれかが非 pub なら private 配下。
-    let mut current_dir = src_dir.clone();
-    let mut current_file = lib_rs;
+    // 次モジュールファイルの存在確認は working tree 構造で代用する。
+    let mut current_rel = PathBuf::from("lib.rs");
     for seg in &segments {
-        match module_decl_is_public(&current_file, seg) {
+        let Some(source) = read_module(&current_rel) else {
+            return false;
+        };
+        let Ok(tree) = parser::parse_source(&source, crate::language::LangId::Rust) else {
+            return false;
+        };
+        match find_mod_decl_visibility(tree.root_node(), &source, seg) {
             Some(true) => {
-                // 次のモジュールファイル: <dir>/<seg>/mod.rs を優先、なければ <dir>/<seg>.rs
-                let as_mod = current_dir.join(seg).join("mod.rs");
-                let as_file = current_dir.join(format!("{seg}.rs"));
-                if as_mod.is_file() {
-                    current_dir = current_dir.join(seg);
-                    current_file = as_mod;
-                } else if as_file.is_file() {
-                    current_dir = current_dir.join(seg);
-                    current_file = as_file;
+                let parent = current_rel
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                let as_mod = parent.join(seg).join("mod.rs");
+                let as_file = parent.join(format!("{seg}.rs"));
+                if src_dir.join(&as_mod).is_file() {
+                    current_rel = as_mod;
+                } else if src_dir.join(&as_file).is_file() {
+                    current_rel = as_file;
                 } else {
                     return false; // モジュールファイル解決不能 → 保守的に API 扱い
                 }
             }
             Some(false) => {
-                // private mod でも、同じ親モジュールで `pub use <seg>::...` re-export
-                // されていれば外部到達可能 (codex: root/公開モジュールからの re-export)。
-                // re-export が 1 つでもあればモジュール単位で保守的に除外しない (blocking 維持)。
-                if module_has_pub_use_reexport(&current_file, seg) {
+                // private mod でも `pub use <seg>::...` re-export されていれば外部到達可能。
+                if find_pub_use_reexport(tree.root_node(), &source, seg) {
                     return false;
                 }
                 return true; // private mod 配下 → 外部非到達
@@ -2151,6 +2228,16 @@ fn is_rust_symbol_in_private_module(dir: &str, file_path: &str) -> bool {
         }
     }
     false
+}
+
+/// working tree のシンボルが private module 配下 (crate 外非到達) かを判定する。
+fn is_rust_symbol_in_private_module(dir: &str, file_path: &str) -> bool {
+    rust_symbol_in_private_module_inner(dir, file_path, None)
+}
+
+/// base リビジョン時点でシンボルが private module 配下だったかを判定する (git show 経由)。
+fn is_rust_symbol_in_private_module_at_base(dir: &str, base: &str, file_path: &str) -> bool {
+    rust_symbol_in_private_module_inner(dir, file_path, Some(base))
 }
 
 /// src 相対パスを Rust モジュールセグメント列に変換する。
@@ -2179,23 +2266,18 @@ fn module_path_segments(rel: &std::path::Path) -> Vec<String> {
     segs
 }
 
-/// 親モジュールファイル内の `mod <mod_name>` 宣言が制限なし `pub` かを返す。
-/// `pub mod` → Some(true)、`mod` / `pub(crate) mod` 等の制限付き → Some(false)、
-/// 宣言が見つからない → None。
-fn module_decl_is_public(parent_file: &std::path::Path, mod_name: &str) -> Option<bool> {
-    let source = std::fs::read(parent_file).ok()?;
-    let tree = parser::parse_source(&source, crate::language::LangId::Rust).ok()?;
-    find_mod_decl_visibility(tree.root_node(), &source, mod_name)
-}
-
-/// AST を走査し `mod <mod_name>` 宣言の可視性 (制限なし pub か) を返す。
+/// 親モジュールファイル直下の `mod <mod_name>` 宣言の可視性 (制限なし pub か) を返す。
+///
+/// source_file 直下の `mod_item` のみを見る。inline mod (`mod foo { mod bar; }`) 内の同名
+/// 宣言は別モジュールスコープの宣言なので拾わない (codex 指摘: 再帰探索で別スコープの同名
+/// mod を誤って拾うと可視性判定が壊れる)。
 fn find_mod_decl_visibility(
-    node: tree_sitter::Node<'_>,
+    root: tree_sitter::Node<'_>,
     source: &[u8],
     mod_name: &str,
 ) -> Option<bool> {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
         if child.kind() == "mod_item"
             && child
                 .child_by_field_name("name")
@@ -2208,23 +2290,8 @@ fn find_mod_decl_visibility(
             });
             return Some(is_pub);
         }
-        if let Some(v) = find_mod_decl_visibility(child, source, mod_name) {
-            return Some(v);
-        }
     }
     None
-}
-
-/// 親モジュールファイル内に `pub use <mod_name>::...` の re-export があるか判定する。
-/// private module でも root / 公開モジュールから pub use re-export されていれば外部到達可能。
-fn module_has_pub_use_reexport(file: &std::path::Path, mod_name: &str) -> bool {
-    let Ok(source) = std::fs::read(file) else {
-        return false;
-    };
-    let Ok(tree) = parser::parse_source(&source, crate::language::LangId::Rust) else {
-        return false;
-    };
-    find_pub_use_reexport(tree.root_node(), &source, mod_name)
 }
 
 /// AST を走査し `pub use <mod_name>::...` の re-export を探す (制限なし pub のみ対象)。
@@ -7092,6 +7159,128 @@ def main():
         assert!(
             added.iter().any(|n| n.ends_with("create_detector")),
             "pub use re-export された pub fn は api.add に出る。got: {added:?}"
+        );
+    }
+
+    /// new と base 両方で private module 配下の pub fn の signature 変更は api.mod に出さない。
+    #[test]
+    fn detect_api_changes_private_module_signature_change_excluded_from_mod() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod meeting;\n"),
+                ("src/meeting/mod.rs", "pub mod detector;\n"),
+                (
+                    "src/meeting/detector.rs",
+                    "pub fn create_detector(id: u32) -> u32 {\n    id\n}\n",
+                ),
+            ],
+            "base",
+        );
+        fs::write(
+            repo.join("src/meeting/detector.rs"),
+            "pub fn create_detector(id: u32, extra: bool) -> u32 {\n    id\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/meeting/detector.rs".to_string(),
+            new_path: "src/meeting/detector.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 3,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let flagged = api
+            .modified
+            .iter()
+            .any(|m| m.name.ends_with("create_detector"))
+            || api
+                .modified_closed_in_diff
+                .iter()
+                .any(|m| m.name.ends_with("create_detector"));
+        assert!(
+            !flagged,
+            "new/base 両方 private module 配下の signature 変更は api.mod に出ない。mod={:?}",
+            api.modified.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// base で公開 (pub mod) だったモジュールを同 diff で private 化しつつ配下 pub fn の
+    /// signature を変えた場合、旧 API の破壊的変更なので api.mod に残す (codex 指摘2)。
+    #[test]
+    fn detect_api_changes_module_made_private_in_diff_keeps_mod_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "pub mod meeting;\n"),
+                ("src/meeting/mod.rs", "pub mod detector;\n"),
+                (
+                    "src/meeting/detector.rs",
+                    "pub fn create_detector(id: u32) -> u32 {\n    id\n}\n",
+                ),
+            ],
+            "base",
+        );
+        // meeting を private 化 (pub mod → mod) しつつ create_detector の signature を変更
+        fs::write(repo.join("src/lib.rs"), "mod meeting;\n").expect("write");
+        fs::write(
+            repo.join("src/meeting/detector.rs"),
+            "pub fn create_detector(id: u32, extra: bool) -> u32 {\n    id\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![
+            crate::models::impact::DiffFile {
+                old_path: "src/lib.rs".to_string(),
+                new_path: "src/lib.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 1,
+                    new_start: 1,
+                    new_count: 1,
+                }],
+                deleted_old_source: None,
+            },
+            crate::models::impact::DiffFile {
+                old_path: "src/meeting/detector.rs".to_string(),
+                new_path: "src/meeting/detector.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 3,
+                    new_start: 1,
+                    new_count: 3,
+                }],
+                deleted_old_source: None,
+            },
+        ];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        assert!(
+            api.modified
+                .iter()
+                .any(|m| m.name.ends_with("create_detector")),
+            "base で公開だったモジュールの private 化 + signature 変更は blocking。mod={:?} mod_closed={:?}",
+            api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+            api.modified_closed_in_diff
+                .iter()
+                .map(|m| &m.name)
+                .collect::<Vec<_>>()
         );
     }
 

@@ -212,7 +212,17 @@ fn is_exported_swift(node: Node, source: &[u8]) -> bool {
     let Some(decl) = find_enclosing_declaration(node) else {
         return true; // 保守的: 宣言未検出はエクスポート扱い
     };
-    // modifiers 子の visibility_modifier が public / open のときのみ公開。
+    match swift_explicit_visibility(decl, source) {
+        Some(is_pub) => is_pub,
+        // 明示修飾子なし (デフォルト internal)。ただし public extension のメンバは
+        // デフォルト public なので、コンテナが public extension のときだけ公開扱いにする。
+        None => swift_default_member_is_public(decl, source),
+    }
+}
+
+/// Swift 宣言ノードの明示 visibility_modifier を返す。public/open → Some(true)、
+/// private/fileprivate/internal → Some(false)、明示なし → None。
+fn swift_explicit_visibility(decl: Node, source: &[u8]) -> Option<bool> {
     let mut cursor = decl.walk();
     for child in decl.children(&mut cursor) {
         if child.kind() == "modifiers" {
@@ -222,13 +232,41 @@ fn is_exported_swift(node: Node, source: &[u8]) -> bool {
                     && let Ok(text) = m.utf8_text(source)
                 {
                     let vis = text.trim();
-                    return vis == "public" || vis == "open";
+                    return Some(vis == "public" || vis == "open");
                 }
             }
         }
     }
-    // visibility_modifier が無い = デフォルト internal (外部公開 API ではない)
+    None
+}
+
+/// 明示修飾子のない Swift メンバが public 既定となるコンテナ (public/open extension) 配下かを
+/// 判定する。public extension のメンバはデフォルト public。struct/class/enum 配下や top-level は
+/// internal 既定なので false。protocol requirement は find_enclosing_declaration が
+/// protocol_declaration を直接返すため、本関数ではなく明示 visibility 経路で判定される。
+fn swift_default_member_is_public(decl: Node, source: &[u8]) -> bool {
+    let mut current = decl.parent();
+    while let Some(n) = current {
+        match n.kind() {
+            // extension は class_declaration として現れる ("extension" キーワードで判別)。
+            "class_declaration" if swift_is_extension(n) => {
+                return swift_explicit_visibility(n, source) == Some(true);
+            }
+            // 通常の struct/class/enum はメンバにデフォルト可視性を継承しない (internal)。
+            "class_declaration" | "enum_declaration" => return false,
+            _ => {}
+        }
+        current = n.parent();
+    }
     false
+}
+
+/// class_declaration が extension (`extension Foo {}`) かを判定する。
+fn swift_is_extension(class_decl: Node) -> bool {
+    let mut cursor = class_decl.walk();
+    class_decl
+        .children(&mut cursor)
+        .any(|c| c.kind() == "extension")
 }
 
 /// Java/Kotlin: `private` 修飾子があれば非公開と判定。
@@ -2010,6 +2048,37 @@ mod tests {
             "public struct S {\n    public func run() {}\n}\n",
             LangId::Swift,
             "run"
+        ));
+    }
+
+    #[test]
+    fn swift_public_extension_method_is_exported() {
+        // public extension のメンバは明示修飾子なしでもデフォルト public
+        assert!(check_exported(
+            "public extension Foo {\n    func bar() -> Int { 0 }\n}\n",
+            LangId::Swift,
+            "bar"
+        ));
+    }
+
+    #[test]
+    fn swift_public_protocol_is_exported() {
+        // protocol requirement (`func handle`) 自体は Swift symbols 抽出対象外のため、
+        // public protocol 宣言の公開判定を検証する。
+        assert!(check_exported(
+            "public protocol Service {\n    func handle() -> Int\n}\n",
+            LangId::Swift,
+            "Service"
+        ));
+    }
+
+    #[test]
+    fn swift_plain_extension_method_is_not_exported() {
+        // 修飾子なし extension のメンバは internal (外部公開 API ではない)
+        assert!(!check_exported(
+            "extension Foo {\n    func bar() -> Int { 0 }\n}\n",
+            LangId::Swift,
+            "bar"
         ));
     }
 
