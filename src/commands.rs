@@ -1127,6 +1127,7 @@ fn empty_review_result() -> ReviewResult {
             moved: Vec::new(),
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
+            modified_closed_in_diff: Vec::new(),
         },
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
@@ -1312,7 +1313,8 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> HookJsonBuild {
         || !result.api_changes.modified.is_empty()
         || !result.api_changes.moved.is_empty()
         || !result.api_changes.property_to_field.is_empty()
-        || !result.api_changes.removed_dead.is_empty();
+        || !result.api_changes.removed_dead.is_empty()
+        || !result.api_changes.modified_closed_in_diff.is_empty();
     // api.added / api.moved / api.property_to_field / api.removed_dead は破壊的変更ではないため
     // Stop hook のブロッキング対象から外し informational 扱いにする。api.removed / api.modified は
     // 破壊的変更の可能性があるため従来どおり blocking。
@@ -1357,6 +1359,21 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> HookJsonBuild {
                     result
                         .api_changes
                         .modified
+                        .iter()
+                        .map(|m| serde_json::json!({"n": m.name, "f": m.file}))
+                        .collect(),
+                ),
+            );
+        }
+        // mod_closed: 全 cross-file 参照が同一 diff 内で追随済みの api.mod。informational
+        // (has_api_breaking に含めないため stop hook をブロックしない)。
+        if !result.api_changes.modified_closed_in_diff.is_empty() {
+            api.insert(
+                "mod_closed".into(),
+                serde_json::Value::Array(
+                    result
+                        .api_changes
+                        .modified_closed_in_diff
                         .iter()
                         .map(|m| serde_json::json!({"n": m.name, "f": m.file}))
                         .collect(),
@@ -1607,7 +1624,9 @@ fn detect_api_changes(
 ) -> ApiChanges {
     let mut added: Vec<ApiSymbolCandidate> = Vec::new();
     let mut removed: Vec<ApiSymbolCandidate> = Vec::new();
-    let mut modified = Vec::new();
+    let mut modified: Vec<ApiSymbolChange> = Vec::new();
+    // 全 cross-file 参照が同一 diff 内で追随済みの api.mod (informational)。
+    let mut modified_closed_in_diff: Vec<ApiSymbolChange> = Vec::new();
     // 移動検出用に「フィルタ前の新規側候補」を全件追跡する。`is_used_in_diff_paths` 等で
     // `added` から除外された候補も `removed` との突き合わせには利用したいため、
     // フィルタ適用前の候補を別バケットに溜めておく。module → package 化 (cli.py →
@@ -1661,9 +1680,10 @@ fn detect_api_changes(
 
         if df.old_path == "/dev/null" {
             if let Some(new_syms) = extract_exported_symbols_from_file(dir, &df.new_path) {
-                // Rust binary crate (src/lib.rs が存在しない crate) の pub シンボルは
-                // クレート外から到達できないため api.add の対象外とする。
-                let is_binary_rust_crate = is_binary_only_rust_crate(dir, &df.new_path);
+                // bin-only crate (src/lib.rs なし) の pub シンボル、および private module
+                // 配下の pub シンボルは crate 外から構造的に到達できないため api.add 対象外。
+                let is_binary_rust_crate = is_binary_only_rust_crate(dir, &df.new_path)
+                    || is_rust_symbol_in_private_module(dir, &df.new_path);
                 // 新規ファイルでも、同一ファイル内で呼ばれている関数は内部ヘルパーと
                 // 判断して api.add から除外する。CLI スクリプト (main から内部関数を
                 // 呼び出す構造) を新規追加した時に全関数が api.add に積まれるノイズを防ぐ。
@@ -1772,9 +1792,10 @@ fn detect_api_changes(
         // Python の同一ファイル内で接続済みの private 関数が api.add に出る誤検出対策）。
         let in_file_callees = extract_in_file_callees(dir, &df.new_path);
 
-        // Rust binary crate (src/lib.rs が存在しない crate) の pub シンボルは
-        // クレート外から到達できないため api.add の対象外とする。
-        let is_binary_rust_crate = is_binary_only_rust_crate(dir, &df.new_path);
+        // bin-only crate (src/lib.rs なし) の pub シンボル、および private module 配下の
+        // pub シンボルは crate 外から構造的に到達できないため api.add の対象外とする。
+        let is_binary_rust_crate = is_binary_only_rust_crate(dir, &df.new_path)
+            || is_rust_symbol_in_private_module(dir, &df.new_path);
 
         // rename 検出用: 同ファイル内に新規追加された全シンボル名を追跡する
         // （internally_connected で除外される内部ヘルパーも含む）。削除シンボルと
@@ -1871,8 +1892,10 @@ fn detect_api_changes(
         let is_binary_rust_old_crate_for_mod =
             is_binary_only_rust_crate_at_base(dir, base, &df.old_path);
         let is_binary_rust_new_crate_for_mod = is_binary_only_rust_crate(dir, &df.new_path);
-        let skip_mod_for_binary_crate =
-            is_binary_rust_old_crate_for_mod || is_binary_rust_new_crate_for_mod;
+        // private module 配下の pub シンボルは crate 外から到達できないため api.mod も対象外。
+        let skip_mod_for_binary_crate = is_binary_rust_old_crate_for_mod
+            || is_binary_rust_new_crate_for_mod
+            || is_rust_symbol_in_private_module(dir, &df.new_path);
 
         // 同一 (file, qualname) の modified を重複排除するためのキーセット
         let mut seen_modified: std::collections::HashSet<(String, String)> =
@@ -1912,13 +1935,20 @@ fn detect_api_changes(
                     continue;
                 }
 
-                modified.push(ApiSymbolChange {
+                let change = ApiSymbolChange {
                     name: name.clone(),
                     kind: kind.clone(),
                     file: df.new_path.clone(),
                     old_signature: Some(old_sig.to_string()),
                     new_signature: Some(new_sig.clone()),
-                });
+                };
+                // 全 cross-file 参照が同一 diff 内の変更 hunk で追随済みなら、呼び出し側は
+                // 同一コミットで更新済み。破壊的でないため informational に降格する。
+                if is_modified_closed_in_diff(dir, name, diff_files) {
+                    modified_closed_in_diff.push(change);
+                } else {
+                    modified.push(change);
+                }
             }
         }
     }
@@ -1960,7 +1990,261 @@ fn detect_api_changes(
             .into_iter()
             .map(|c| c.into_api_symbol())
             .collect(),
+        modified_closed_in_diff,
     }
+}
+
+/// modified シンボルの全 cross-file 参照が同一 diff 内の変更 hunk で追随済みかを判定する。
+///
+/// 全ての非定義参照が diff_files の変更 hunk (new 範囲) に収まれば、呼び出し側が同一
+/// コミットで更新済みとみなし closed-in-diff (informational)。同名定義が複数 (別型の同名
+/// メソッド等) / refs 解析失敗 / diff 外 or hunk 外の参照が 1 つでもあれば false を返し、
+/// 保守的に blocking 側 (通常の api.mod) へ倒す。
+fn is_modified_closed_in_diff(
+    dir: &str,
+    name: &str,
+    diff_files: &[crate::models::impact::DiffFile],
+) -> bool {
+    use crate::models::reference::RefKind;
+    let bare = bare_name(name);
+    let refs = match crate::engine::refs::find_references(bare, std::path::Path::new(dir), None) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    // 同名定義が 1 つでなければ曖昧 (別型の同名メソッド等) なので保守的に blocking。
+    let def_count = refs
+        .iter()
+        .filter(|r| r.kind == Some(RefKind::Definition))
+        .count();
+    if def_count != 1 {
+        return false;
+    }
+    // 非定義参照を収集。caller が 1 件も無い場合は「同一 diff で追随済み」とは言えず、
+    // 外部利用者の可能性も排除できないため closed 扱いにしない (通常の api.mod として blocking)。
+    let non_def: Vec<_> = refs
+        .iter()
+        .filter(|r| r.kind != Some(RefKind::Definition))
+        .collect();
+    if non_def.is_empty() {
+        return false;
+    }
+    // 全ての非定義参照が変更 hunk 内にあれば、全 caller が同一 diff 内で追随済みとみなす。
+    non_def
+        .iter()
+        .all(|r| ref_line_in_diff_hunk(&r.path, r.line, diff_files, dir))
+}
+
+/// 参照 (path, 0-indexed line) が diff_files のいずれかの変更 hunk (new 範囲) 内かを返す。
+fn ref_line_in_diff_hunk(
+    ref_path: &str,
+    ref_line: usize,
+    diff_files: &[crate::models::impact::DiffFile],
+    dir: &str,
+) -> bool {
+    let ln1 = ref_line + 1; // HunkInfo.new_start は 1-indexed
+    diff_files.iter().any(|df| {
+        df.new_path != "/dev/null"
+            && diff_path_matches_ref(&df.new_path, ref_path, dir)
+            && df
+                .hunks
+                .iter()
+                .any(|h| ln1 >= h.new_start && ln1 < h.new_start + h.new_count)
+    })
+}
+
+/// diff の new_path (dir 相対) と参照 path (dir 相対 or 絶対) が同一ファイルを指すか判定する。
+fn diff_path_matches_ref(diff_path: &str, ref_path: &str, dir: &str) -> bool {
+    if diff_path == ref_path {
+        return true;
+    }
+    let abs_diff = std::path::Path::new(dir).join(diff_path);
+    let abs_ref = if std::path::Path::new(ref_path).is_absolute() {
+        std::path::PathBuf::from(ref_path)
+    } else {
+        std::path::Path::new(dir).join(ref_path)
+    };
+    match (
+        std::fs::canonicalize(&abs_diff),
+        std::fs::canonicalize(&abs_ref),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Rust シンボルのファイルが crate root (src/lib.rs) から `pub mod` 経路で到達できない
+/// private module 配下にあるかを判定する。private module 配下のシンボルは crate 外から
+/// 構造的に到達できず外部公開 API ではないため、api 差分 (add/mod) の対象外とする
+/// (Issue 2026-05-29-swift-sidecar-api-mod パターンC)。
+///
+/// 軽量実装: lib.rs から mod 宣言チェーンを辿り、各セグメントが制限なし `pub mod` かを
+/// 確認する。`pub(crate)` / `pub(super)` 等の制限付き pub や `mod` (private) は外部非到達。
+/// `#[path]` 属性 / inline mod / 宣言未検出など解析できないケースは false を返して保守的に
+/// API 扱い (既存挙動維持) とする。bin-only crate (lib.rs なし) も false。
+fn is_rust_symbol_in_private_module(dir: &str, file_path: &str) -> bool {
+    use std::path::Path;
+    let rel = Path::new(file_path);
+    if rel.extension().and_then(|s| s.to_str()) != Some("rs") {
+        return false;
+    }
+    let Ok(canonical_dir) = std::fs::canonicalize(dir) else {
+        return false;
+    };
+    let abs = canonical_dir.join(rel);
+    // crate root: abs の祖先で最も近い Cargo.toml を持つディレクトリ (canonical_dir 境界まで)
+    let mut crate_root: Option<std::path::PathBuf> = None;
+    let mut anc = abs.parent();
+    while let Some(d) = anc {
+        if d.join("Cargo.toml").is_file() {
+            crate_root = Some(d.to_path_buf());
+            break;
+        }
+        if d == canonical_dir {
+            break;
+        }
+        anc = d.parent();
+    }
+    let Some(crate_root) = crate_root else {
+        return false;
+    };
+    let src_dir = crate_root.join("src");
+    let lib_rs = src_dir.join("lib.rs");
+    if !lib_rs.is_file() {
+        return false; // library crate でない (bin-only は別経路で処理)
+    }
+    let Ok(rel_to_src) = abs.strip_prefix(&src_dir) else {
+        return false; // src/ 配下でないファイル
+    };
+    let segments = module_path_segments(rel_to_src);
+    if segments.is_empty() {
+        return false; // root モジュール (lib.rs / main.rs) は常に到達可能
+    }
+    // lib.rs から mod 宣言チェーンを辿り、いずれかが非 pub なら private 配下。
+    let mut current_dir = src_dir.clone();
+    let mut current_file = lib_rs;
+    for seg in &segments {
+        match module_decl_is_public(&current_file, seg) {
+            Some(true) => {
+                // 次のモジュールファイル: <dir>/<seg>/mod.rs を優先、なければ <dir>/<seg>.rs
+                let as_mod = current_dir.join(seg).join("mod.rs");
+                let as_file = current_dir.join(format!("{seg}.rs"));
+                if as_mod.is_file() {
+                    current_dir = current_dir.join(seg);
+                    current_file = as_mod;
+                } else if as_file.is_file() {
+                    current_dir = current_dir.join(seg);
+                    current_file = as_file;
+                } else {
+                    return false; // モジュールファイル解決不能 → 保守的に API 扱い
+                }
+            }
+            Some(false) => {
+                // private mod でも、同じ親モジュールで `pub use <seg>::...` re-export
+                // されていれば外部到達可能 (codex: root/公開モジュールからの re-export)。
+                // re-export が 1 つでもあればモジュール単位で保守的に除外しない (blocking 維持)。
+                if module_has_pub_use_reexport(&current_file, seg) {
+                    return false;
+                }
+                return true; // private mod 配下 → 外部非到達
+            }
+            None => return false, // mod 宣言が見つからない → 保守的に API 扱い
+        }
+    }
+    false
+}
+
+/// src 相対パスを Rust モジュールセグメント列に変換する。
+/// `meeting/macos.rs` → `[meeting, macos]`、`meeting/mod.rs` → `[meeting]`、
+/// `lib.rs` / `main.rs` → `[]` (root モジュール)。
+fn module_path_segments(rel: &std::path::Path) -> Vec<String> {
+    let comps: Vec<_> = rel.components().collect();
+    let mut segs: Vec<String> = Vec::new();
+    let last = comps.len().saturating_sub(1);
+    for (i, c) in comps.iter().enumerate() {
+        let name = c.as_os_str().to_string_lossy();
+        if i == last {
+            let stem = std::path::Path::new(name.as_ref())
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string());
+            match stem.as_deref() {
+                // mod.rs / lib.rs / main.rs はそのディレクトリのモジュール自身を表す
+                Some("mod") | Some("lib") | Some("main") => {}
+                Some(s) => segs.push(s.to_string()),
+                None => {}
+            }
+        } else {
+            segs.push(name.to_string());
+        }
+    }
+    segs
+}
+
+/// 親モジュールファイル内の `mod <mod_name>` 宣言が制限なし `pub` かを返す。
+/// `pub mod` → Some(true)、`mod` / `pub(crate) mod` 等の制限付き → Some(false)、
+/// 宣言が見つからない → None。
+fn module_decl_is_public(parent_file: &std::path::Path, mod_name: &str) -> Option<bool> {
+    let source = std::fs::read(parent_file).ok()?;
+    let tree = parser::parse_source(&source, crate::language::LangId::Rust).ok()?;
+    find_mod_decl_visibility(tree.root_node(), &source, mod_name)
+}
+
+/// AST を走査し `mod <mod_name>` 宣言の可視性 (制限なし pub か) を返す。
+fn find_mod_decl_visibility(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    mod_name: &str,
+) -> Option<bool> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "mod_item"
+            && child
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                == Some(mod_name)
+        {
+            let mut mc = child.walk();
+            let is_pub = child.children(&mut mc).any(|c| {
+                c.kind() == "visibility_modifier" && c.utf8_text(source).map(str::trim) == Ok("pub")
+            });
+            return Some(is_pub);
+        }
+        if let Some(v) = find_mod_decl_visibility(child, source, mod_name) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// 親モジュールファイル内に `pub use <mod_name>::...` の re-export があるか判定する。
+/// private module でも root / 公開モジュールから pub use re-export されていれば外部到達可能。
+fn module_has_pub_use_reexport(file: &std::path::Path, mod_name: &str) -> bool {
+    let Ok(source) = std::fs::read(file) else {
+        return false;
+    };
+    let Ok(tree) = parser::parse_source(&source, crate::language::LangId::Rust) else {
+        return false;
+    };
+    find_pub_use_reexport(tree.root_node(), &source, mod_name)
+}
+
+/// AST を走査し `pub use <mod_name>::...` の re-export を探す (制限なし pub のみ対象)。
+fn find_pub_use_reexport(node: tree_sitter::Node<'_>, source: &[u8], mod_name: &str) -> bool {
+    if node.kind() == "use_declaration"
+        && let Ok(text) = node.utf8_text(source)
+    {
+        let t = text.trim_start();
+        // `pub use foo::...` の re-export。`pub(crate) use` 等の制限付きは外部非公開なので除外。
+        if t.starts_with("pub use") && t.contains(&format!("{mod_name}::")) {
+            return true;
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if find_pub_use_reexport(child, source, mod_name) {
+            return true;
+        }
+    }
+    false
 }
 
 /// 同名・同種別・同シグネチャの api.add / api.rm ペアを `moved` として相殺する。
@@ -2554,6 +2838,16 @@ fn extract_api_signature(
                         ) {
                             return normalize_typescript_destructure_signature(cur, source, s, e);
                         }
+                        // Tauri command (`#[tauri::command]` / `#[command]`) の自動注入型引数
+                        // (AppHandle / State / Window 等) は実行時に Tauri が注入し JS 側 invoke()
+                        // の引数には現れないため、signature 比較から除外する
+                        // (Issue 2026-05-29-swift-sidecar-api-mod パターンB)。
+                        if lang_id == crate::language::LangId::Rust
+                            && let Some(sig) =
+                                normalize_rust_tauri_command_signature(cur, source, s, e)
+                        {
+                            return sig;
+                        }
                         if let Some(bytes) = source.get(s..e) {
                             return normalize_signature_whitespace(bytes);
                         }
@@ -2575,6 +2869,115 @@ fn extract_api_signature(
         .unwrap_or(&"")
         .trim()
         .to_string()
+}
+
+/// Tauri command の自動注入型 (実行時に Tauri が注入し JS-facing な invoke() 引数に現れない型)。
+/// `Channel<T>` は JS 側から渡す引数なので含めない (signature 差分の対象に残す)。
+const TAURI_INJECTED_TYPES: &[&str] = &[
+    "AppHandle",
+    "Window",
+    "Webview",
+    "WebviewWindow",
+    "State",
+    "Request",
+    "CommandScope",
+    "GlobalScope",
+];
+
+/// Rust の型ノードから base 名 (パス・参照・ジェネリクスを剥がした末尾型名) を取り出す。
+fn rust_type_base_name(ty: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    match ty.kind() {
+        "type_identifier" => ty.utf8_text(source).ok().map(str::to_string),
+        // tauri::AppHandle → name 子 'AppHandle'
+        "scoped_type_identifier" => ty
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok())
+            .map(str::to_string),
+        // State<'_, T> → base 'State'
+        "generic_type" => ty
+            .child_by_field_name("type")
+            .and_then(|t| rust_type_base_name(t, source)),
+        // &State<...> / &AppHandle → 内側の型
+        "reference_type" => ty
+            .child_by_field_name("type")
+            .and_then(|t| rust_type_base_name(t, source)),
+        _ => None,
+    }
+}
+
+/// function_item が Tauri command 属性 (`#[tauri::command]` / `#[command]`) を持つか判定する。
+/// Rust では属性は function_item の前方兄弟 (attribute_item) に並ぶ。
+fn rust_fn_has_tauri_command_attr(fn_node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut sib = fn_node.prev_sibling();
+    while let Some(s) = sib {
+        match s.kind() {
+            "attribute_item" => {
+                if let Ok(text) = s.utf8_text(source) {
+                    let inner = text
+                        .trim_start_matches("#[")
+                        .trim_start_matches("#![")
+                        .trim_end_matches(']')
+                        .trim();
+                    if inner == "tauri::command"
+                        || inner.starts_with("tauri::command(")
+                        || inner == "command"
+                        || inner.starts_with("command(")
+                    {
+                        return true;
+                    }
+                }
+            }
+            // 属性とコメントは読み飛ばし、それ以外に到達したら属性列の終端
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        sib = s.prev_sibling();
+    }
+    false
+}
+
+/// Tauri command 関数の signature から自動注入型引数を除外して返す。
+/// Tauri command でなければ None を返し、呼び出し側で通常の signature 抽出にフォールバックする。
+fn normalize_rust_tauri_command_signature(
+    fn_node: tree_sitter::Node<'_>,
+    source: &[u8],
+    s: usize,
+    e: usize,
+) -> Option<String> {
+    if !rust_fn_has_tauri_command_attr(fn_node, source) {
+        return None;
+    }
+    let params = fn_node.child_by_field_name("parameters")?;
+    let mut kept: Vec<String> = Vec::new();
+    let mut cursor = params.walk();
+    for child in params.named_children(&mut cursor) {
+        match child.kind() {
+            "parameter" => {
+                let injected = child
+                    .child_by_field_name("type")
+                    .and_then(|t| rust_type_base_name(t, source))
+                    .is_some_and(|n| TAURI_INJECTED_TYPES.contains(&n.as_str()));
+                if !injected && let Ok(t) = child.utf8_text(source) {
+                    kept.push(t.to_string());
+                }
+            }
+            "self_parameter" => {
+                if let Ok(t) = child.utf8_text(source) {
+                    kept.push(t.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    let prefix = source.get(s..params.start_byte())?;
+    let suffix = source.get(params.end_byte()..e)?;
+    let rebuilt = format!(
+        "{}({}){}",
+        String::from_utf8_lossy(prefix),
+        kept.join(", "),
+        String::from_utf8_lossy(suffix)
+    );
+    Some(normalize_signature_whitespace(rebuilt.as_bytes()))
 }
 
 /// TS/TSX 関数の signature を抽出し、parameters 直下の `object_pattern`
@@ -6233,6 +6636,462 @@ def main():
         assert!(
             removed.is_empty(),
             "rename で保持された関数は api.rm に出るべきではない。got: {removed:?}"
+        );
+    }
+
+    /// Tauri command の自動注入型引数 (AppHandle) 追加は JS-facing signature 不変なので
+    /// api.mod / mod_closed のどちらにも出ない (パターンB)。
+    #[test]
+    fn detect_api_changes_tauri_command_injected_arg_addition_not_flagged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "src-tauri/Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src-tauri/src/lib.rs", "pub mod cmd;\n"),
+                (
+                    "src-tauri/src/cmd.rs",
+                    "#[tauri::command]\npub fn get_status(id: u32) -> String {\n    String::new()\n}\n",
+                ),
+            ],
+            "base",
+        );
+        fs::write(
+            repo.join("src-tauri/src/cmd.rs"),
+            "#[tauri::command]\npub fn get_status(app: tauri::AppHandle, id: u32) -> String {\n    String::new()\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src-tauri/src/cmd.rs".to_string(),
+            new_path: "src-tauri/src/cmd.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 4,
+                new_start: 1,
+                new_count: 4,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let flagged = api.modified.iter().any(|m| m.name.ends_with("get_status"))
+            || api
+                .modified_closed_in_diff
+                .iter()
+                .any(|m| m.name.ends_with("get_status"));
+        assert!(
+            !flagged,
+            "Tauri 自動注入引数の追加は signature 差分にしない。mod={:?} mod_closed={:?}",
+            api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+            api.modified_closed_in_diff
+                .iter()
+                .map(|m| &m.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Tauri command でも通常引数の追加は呼び出し契約を変えるため signature 差分として検出される。
+    #[test]
+    fn detect_api_changes_tauri_command_regular_arg_addition_is_flagged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "src-tauri/Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src-tauri/src/lib.rs", "pub mod cmd;\n"),
+                (
+                    "src-tauri/src/cmd.rs",
+                    "#[tauri::command]\npub fn get_status(id: u32) -> String {\n    String::new()\n}\n",
+                ),
+            ],
+            "base",
+        );
+        fs::write(
+            repo.join("src-tauri/src/cmd.rs"),
+            "#[tauri::command]\npub fn get_status(id: u32, verbose: bool) -> String {\n    String::new()\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src-tauri/src/cmd.rs".to_string(),
+            new_path: "src-tauri/src/cmd.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 4,
+                new_start: 1,
+                new_count: 4,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let flagged = api.modified.iter().any(|m| m.name.ends_with("get_status"))
+            || api
+                .modified_closed_in_diff
+                .iter()
+                .any(|m| m.name.ends_with("get_status"));
+        assert!(
+            flagged,
+            "通常引数の追加は signature 差分として検出されるべき"
+        );
+    }
+
+    /// Channel<T> は JS 側から渡す引数なので Tauri 自動注入から除外せず signature 差分に残す。
+    #[test]
+    fn detect_api_changes_tauri_command_channel_arg_is_flagged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "src-tauri/Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src-tauri/src/lib.rs", "pub mod cmd;\n"),
+                (
+                    "src-tauri/src/cmd.rs",
+                    "#[tauri::command]\npub fn watch(id: u32) -> String {\n    String::new()\n}\n",
+                ),
+            ],
+            "base",
+        );
+        fs::write(
+            repo.join("src-tauri/src/cmd.rs"),
+            "#[tauri::command]\npub fn watch(id: u32, on_event: Channel<String>) -> String {\n    String::new()\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src-tauri/src/cmd.rs".to_string(),
+            new_path: "src-tauri/src/cmd.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 4,
+                new_start: 1,
+                new_count: 4,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let flagged = api.modified.iter().any(|m| m.name.ends_with("watch"))
+            || api
+                .modified_closed_in_diff
+                .iter()
+                .any(|m| m.name.ends_with("watch"));
+        assert!(
+            flagged,
+            "Channel<T> 引数は除外せず signature 差分に残すべき"
+        );
+    }
+
+    /// 全 cross-file 参照が同一 diff 内の変更 hunk で追随済みの api.mod は
+    /// modified_closed_in_diff (informational) に降格する (パターンA)。
+    #[test]
+    fn detect_api_changes_modified_with_all_callers_in_diff_is_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "pub mod detector;\npub mod manager;\n"),
+                (
+                    "src/detector.rs",
+                    "pub fn create_detector(id: u32) -> u32 {\n    id\n}\n",
+                ),
+                (
+                    "src/manager.rs",
+                    "use crate::detector::create_detector;\npub fn run() -> u32 {\n    create_detector(1)\n}\n",
+                ),
+            ],
+            "base",
+        );
+        // create_detector に引数追加 + caller (manager.rs) を同一 diff で追随更新
+        fs::write(
+            repo.join("src/detector.rs"),
+            "pub fn create_detector(id: u32, extra: bool) -> u32 {\n    id\n}\n",
+        )
+        .expect("write");
+        fs::write(
+            repo.join("src/manager.rs"),
+            "use crate::detector::create_detector;\npub fn run() -> u32 {\n    create_detector(1, true)\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![
+            crate::models::impact::DiffFile {
+                old_path: "src/detector.rs".to_string(),
+                new_path: "src/detector.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 3,
+                    new_start: 1,
+                    new_count: 3,
+                }],
+                deleted_old_source: None,
+            },
+            crate::models::impact::DiffFile {
+                old_path: "src/manager.rs".to_string(),
+                new_path: "src/manager.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 4,
+                    new_start: 1,
+                    new_count: 4,
+                }],
+                deleted_old_source: None,
+            },
+        ];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        assert!(
+            api.modified_closed_in_diff
+                .iter()
+                .any(|m| m.name.ends_with("create_detector")),
+            "全 caller が同一 diff 内なら modified_closed_in_diff に降格すべき。mod={:?} mod_closed={:?}",
+            api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+            api.modified_closed_in_diff
+                .iter()
+                .map(|m| &m.name)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !api.modified
+                .iter()
+                .any(|m| m.name.ends_with("create_detector")),
+            "closed-in-diff は blocking な modified に残さない"
+        );
+    }
+
+    /// caller が diff 外 (変更 hunk に含まれない) に残る api.mod は blocking な modified のまま。
+    #[test]
+    fn detect_api_changes_modified_with_caller_outside_diff_stays_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "pub mod detector;\npub mod manager;\n"),
+                (
+                    "src/detector.rs",
+                    "pub fn create_detector(id: u32) -> u32 {\n    id\n}\n",
+                ),
+                (
+                    "src/manager.rs",
+                    "use crate::detector::create_detector;\npub fn run() -> u32 {\n    create_detector(1)\n}\n",
+                ),
+            ],
+            "base",
+        );
+        // detector.rs のみシグネチャ変更。manager.rs (caller) は未更新かつ diff にも含めない。
+        fs::write(
+            repo.join("src/detector.rs"),
+            "pub fn create_detector(id: u32, extra: bool) -> u32 {\n    id\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/detector.rs".to_string(),
+            new_path: "src/detector.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 3,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        assert!(
+            api.modified
+                .iter()
+                .any(|m| m.name.ends_with("create_detector")),
+            "diff 外に未更新 caller が残る場合は blocking な modified に残すべき。mod={:?} mod_closed={:?}",
+            api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+            api.modified_closed_in_diff
+                .iter()
+                .map(|m| &m.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Swift の internal 型 (public/open でない) は外部 API ではないため api.add に出さない。
+    /// public 型は引き続き出す (パターンD: sidecar/executable 内部型を api.add に出さない)。
+    #[test]
+    fn detect_api_changes_swift_internal_type_excluded_from_added() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(repo, &[("README.md", "init\n")], "base");
+        fs::write(
+            repo.join("helper.swift"),
+            "enum DetectionError: Error {\n    case failed\n}\npublic struct Detector {\n    public func run() -> Int { 0 }\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "/dev/null".to_string(),
+            new_path: "helper.swift".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 6,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let added: Vec<&str> = api.added.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            !added.iter().any(|n| n.ends_with("DetectionError")),
+            "Swift internal enum は api.add に出ない。got: {added:?}"
+        );
+        assert!(
+            added.iter().any(|n| n.contains("Detector")),
+            "Swift public struct は api.add に出る。got: {added:?}"
+        );
+    }
+
+    /// private module (`mod meeting;`) 配下の新規 pub fn は crate 外から到達できないため
+    /// api.add に出さない (パターンC)。
+    #[test]
+    fn detect_api_changes_private_module_pub_fn_excluded_from_added() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod meeting;\n"),
+                ("src/meeting/mod.rs", "pub mod detector;\n"),
+            ],
+            "base",
+        );
+        fs::write(
+            repo.join("src/meeting/detector.rs"),
+            "pub fn create_detector() -> u32 {\n    0\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "/dev/null".to_string(),
+            new_path: "src/meeting/detector.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 3,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let added: Vec<&str> = api.added.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            !added.iter().any(|n| n.ends_with("create_detector")),
+            "private module 配下の pub fn は api.add に出ない。got: {added:?}"
+        );
+    }
+
+    /// `pub mod` 経路で到達可能なモジュール配下の新規 pub fn は api.add に出る。
+    #[test]
+    fn detect_api_changes_public_module_pub_fn_included_in_added() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "pub mod meeting;\n"),
+                ("src/meeting/mod.rs", "pub mod detector;\n"),
+            ],
+            "base",
+        );
+        fs::write(
+            repo.join("src/meeting/detector.rs"),
+            "pub fn create_detector() -> u32 {\n    0\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "/dev/null".to_string(),
+            new_path: "src/meeting/detector.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 3,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let added: Vec<&str> = api.added.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            added.iter().any(|n| n.ends_with("create_detector")),
+            "pub mod 経路で到達可能な pub fn は api.add に出る。got: {added:?}"
+        );
+    }
+
+    /// private module でも root から `pub use` re-export されていれば外部到達可能なので api.add に出る。
+    #[test]
+    fn detect_api_changes_private_module_with_pub_use_reexport_included() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                (
+                    "src/lib.rs",
+                    "mod meeting;\npub use meeting::detector::create_detector;\n",
+                ),
+                ("src/meeting/mod.rs", "pub mod detector;\n"),
+            ],
+            "base",
+        );
+        fs::write(
+            repo.join("src/meeting/detector.rs"),
+            "pub fn create_detector() -> u32 {\n    0\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "/dev/null".to_string(),
+            new_path: "src/meeting/detector.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 3,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let added: Vec<&str> = api.added.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            added.iter().any(|n| n.ends_with("create_detector")),
+            "pub use re-export された pub fn は api.add に出る。got: {added:?}"
         );
     }
 
@@ -10410,6 +11269,7 @@ def new_public_api():
                 moved: Vec::new(),
                 property_to_field: Vec::new(),
                 removed_dead: Vec::new(),
+                modified_closed_in_diff: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -10447,6 +11307,7 @@ def new_public_api():
                 moved: Vec::new(),
                 property_to_field: Vec::new(),
                 removed_dead: Vec::new(),
+                modified_closed_in_diff: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -10481,6 +11342,7 @@ def new_public_api():
                 moved: Vec::new(),
                 property_to_field: Vec::new(),
                 removed_dead: Vec::new(),
+                modified_closed_in_diff: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -10514,6 +11376,7 @@ def new_public_api():
                 moved: Vec::new(),
                 property_to_field: Vec::new(),
                 removed_dead: Vec::new(),
+                modified_closed_in_diff: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -10564,6 +11427,7 @@ def new_public_api():
                 moved: Vec::new(),
                 property_to_field: Vec::new(),
                 removed_dead: Vec::new(),
+                modified_closed_in_diff: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -10636,6 +11500,7 @@ def new_public_api():
                 moved: Vec::new(),
                 property_to_field: Vec::new(),
                 removed_dead: Vec::new(),
+                modified_closed_in_diff: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -10702,6 +11567,7 @@ def new_public_api():
                 moved: Vec::new(),
                 property_to_field: Vec::new(),
                 removed_dead: Vec::new(),
+                modified_closed_in_diff: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -10779,6 +11645,7 @@ def new_public_api():
                 moved: Vec::new(),
                 property_to_field: Vec::new(),
                 removed_dead: Vec::new(),
+                modified_closed_in_diff: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),

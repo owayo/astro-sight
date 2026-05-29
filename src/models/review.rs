@@ -53,6 +53,11 @@ pub struct ApiChanges {
     pub property_to_field: Vec<PropertyToFieldChange>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub removed_dead: Vec<ApiSymbol>,
+    /// シグネチャ変更だが、全 cross-file 参照が同一 diff 内の変更 hunk で追随済みの api.mod。
+    /// 呼び出し側が同一コミットで更新済みのため破壊的でなく、stop hook をブロックしない
+    /// informational 扱い (Issue 2026-05-29-swift-sidecar-api-mod パターンA)。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub modified_closed_in_diff: Vec<ApiSymbolChange>,
 }
 
 /// 公開シンボル情報。

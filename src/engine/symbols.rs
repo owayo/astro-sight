@@ -149,6 +149,7 @@ pub fn is_symbol_exported(
         LangId::Zig => is_exported_zig(node, source),
         LangId::Python => is_exported_python(node, source, root),
         LangId::Php => is_exported_php(node, source),
+        LangId::Swift => is_exported_swift(node, source),
         _ => true, // 未対応言語は保守的にエクスポートと判定
     }
 }
@@ -203,6 +204,33 @@ fn is_exported_php(node: Node, source: &[u8]) -> bool {
     true
 }
 
+/// Swift: 外部公開 API は `public` / `open` 明示宣言のみ。デフォルト (internal) や
+/// `private` / `fileprivate` は同一モジュール内のみ可視で外部 API ではないため非公開扱い。
+/// これにより sidecar / executable に同梱される internal 型 (例: `enum DetectionError`) を
+/// api 差分に出さない (Issue 2026-05-29-swift-sidecar-api-mod パターンD)。
+fn is_exported_swift(node: Node, source: &[u8]) -> bool {
+    let Some(decl) = find_enclosing_declaration(node) else {
+        return true; // 保守的: 宣言未検出はエクスポート扱い
+    };
+    // modifiers 子の visibility_modifier が public / open のときのみ公開。
+    let mut cursor = decl.walk();
+    for child in decl.children(&mut cursor) {
+        if child.kind() == "modifiers" {
+            let mut mc = child.walk();
+            for m in child.children(&mut mc) {
+                if m.kind() == "visibility_modifier"
+                    && let Ok(text) = m.utf8_text(source)
+                {
+                    let vis = text.trim();
+                    return vis == "public" || vis == "open";
+                }
+            }
+        }
+    }
+    // visibility_modifier が無い = デフォルト internal (外部公開 API ではない)
+    false
+}
+
 /// Java/Kotlin: `private` 修飾子があれば非公開と判定。
 /// デフォルト（修飾子なし）は公開扱い（Java の package-private も cross-file 参照可能）。
 fn is_exported_jvm(node: Node, source: &[u8]) -> bool {
@@ -237,6 +265,8 @@ fn find_enclosing_declaration(node: Node) -> Option<Node> {
         "object_declaration",
         // PHP trait
         "trait_declaration",
+        // Swift protocol
+        "protocol_declaration",
     ];
     let mut current = Some(node);
     while let Some(n) = current {
@@ -1927,6 +1957,60 @@ mod tests {
     #[test]
     fn rust_private_fn_is_not_exported() {
         assert!(!check_exported("fn foo() {}", LangId::Rust, "foo"));
+    }
+
+    #[test]
+    fn swift_public_struct_is_exported() {
+        assert!(check_exported(
+            "public struct Detector {}",
+            LangId::Swift,
+            "Detector"
+        ));
+    }
+
+    #[test]
+    fn swift_internal_enum_is_not_exported() {
+        assert!(!check_exported(
+            "enum DetectionError { case failed }",
+            LangId::Swift,
+            "DetectionError"
+        ));
+    }
+
+    #[test]
+    fn swift_open_class_is_exported() {
+        assert!(check_exported(
+            "open class Service {}",
+            LangId::Swift,
+            "Service"
+        ));
+    }
+
+    #[test]
+    fn swift_private_func_is_not_exported() {
+        assert!(!check_exported(
+            "private func helper() {}",
+            LangId::Swift,
+            "helper"
+        ));
+    }
+
+    #[test]
+    fn swift_internal_method_in_public_struct_is_not_exported() {
+        assert!(!check_exported(
+            "public struct S {\n    func internalMethod() {}\n}\n",
+            LangId::Swift,
+            "internalMethod"
+        ));
+    }
+
+    #[test]
+    fn swift_public_method_is_exported() {
+        assert!(check_exported(
+            "public struct S {\n    public func run() {}\n}\n",
+            LangId::Swift,
+            "run"
+        ));
     }
 
     #[test]
