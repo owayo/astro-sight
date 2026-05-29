@@ -1878,6 +1878,7 @@ fn symbol_query(lang_id: LangId) -> &'static str {
             // tree-sitter-swift は struct/class/enum に class_declaration を使用
             r#"
             (function_declaration name: (simple_identifier) @function.name)
+            (protocol_function_declaration name: (simple_identifier) @function.name)
             (class_declaration name: (type_identifier) @class.name)
             (protocol_declaration name: (type_identifier) @interface.name)
             "#
@@ -2062,13 +2063,22 @@ mod tests {
     }
 
     #[test]
-    fn swift_public_protocol_is_exported() {
-        // protocol requirement (`func handle`) 自体は Swift symbols 抽出対象外のため、
-        // public protocol 宣言の公開判定を検証する。
+    fn swift_public_protocol_requirement_is_exported() {
+        // public protocol の requirement (func handle) は外部公開 API なので exported。
         assert!(check_exported(
             "public protocol Service {\n    func handle() -> Int\n}\n",
             LangId::Swift,
-            "Service"
+            "handle"
+        ));
+    }
+
+    #[test]
+    fn swift_internal_protocol_requirement_is_not_exported() {
+        // internal (修飾子なし) protocol の requirement は外部公開 API ではない。
+        assert!(!check_exported(
+            "protocol Service {\n    func handle() -> Int\n}\n",
+            LangId::Swift,
+            "handle"
         ));
     }
 

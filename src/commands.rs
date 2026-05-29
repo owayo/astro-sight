@@ -2047,7 +2047,7 @@ fn is_modified_closed_in_diff(
         };
         let changed = changed_cache
             .entry(df.new_path.clone())
-            .or_insert_with(|| changed_new_lines_for_file(dir, base, &df.new_path));
+            .or_insert_with(|| changed_new_lines_for_file(dir, base, &df.old_path, &df.new_path));
         if !changed.contains(&r.line) {
             return false; // context 行 (未変更) の参照 → 未更新 caller の可能性
         }
@@ -2069,21 +2069,34 @@ fn ref_is_import_line(r: &crate::models::reference::SymbolReference) -> bool {
         .unwrap_or(false)
 }
 
-/// `git diff <base> -- <path>` を解析し、new 側で実際に追加/変更された 0-indexed 行集合を返す。
-/// 取得・解析に失敗した場合は空集合 (= どの参照も追随済みと見なさず blocking 維持) を返す。
+/// `git diff <base> -M -- <old_path> <new_path>` を解析し、new 側で実際に追加/変更された
+/// 0-indexed 行集合を返す。取得・解析に失敗した場合は空集合 (= どの参照も追随済みと見なさず
+/// blocking 維持) を返す。
 fn changed_new_lines_for_file(
     dir: &str,
     base: &str,
-    path: &str,
+    old_path: &str,
+    new_path: &str,
 ) -> std::collections::HashSet<usize> {
     use std::collections::HashSet;
     if validate_git_revision(base, "--base").is_err()
-        || validate_git_revision(path, "diff file path").is_err()
+        || validate_git_revision(new_path, "diff file path").is_err()
     {
         return HashSet::new();
     }
+    // rename 検出を有効化 (-M)。rename された caller を new_path だけの pathspec で diff すると
+    // Git は「新規ファイル全行追加」として返し、未更新の古い呼び出しまで changed に見えてしまう
+    // (codex 指摘)。old_path も pathspec に含めて rename-aware な diff にする。
+    let mut args: Vec<&str> = vec!["diff", base, "-M", "--"];
+    if old_path != "/dev/null" && old_path != new_path {
+        if validate_git_revision(old_path, "diff file path").is_err() {
+            return HashSet::new();
+        }
+        args.push(old_path);
+    }
+    args.push(new_path);
     let output = std::process::Command::new("git")
-        .args(["diff", base, "--", path])
+        .args(&args)
         .current_dir(dir)
         .output();
     let Ok(output) = output else {
@@ -2093,7 +2106,7 @@ fn changed_new_lines_for_file(
         return HashSet::new();
     }
     let diff = String::from_utf8_lossy(&output.stdout);
-    crate::engine::diff::extract_changed_new_lines(&diff, path)
+    crate::engine::diff::extract_changed_new_lines(&diff, new_path)
 }
 
 /// diff の new_path (dir 相対) と参照 path (dir 相対 or 絶対) が同一ファイルを指すか判定する。
@@ -6996,6 +7009,83 @@ def main():
         );
     }
 
+    /// rename された caller で呼び出しが古いまま残る場合は blocking。closed-in-diff の変更行
+    /// 判定が rename-aware (git diff -M) で、rename を新規全行追加と誤認しないことを検証する
+    /// (codex 指摘: new_path 単独 pathspec だと未更新呼び出しまで changed に見える)。
+    #[test]
+    fn detect_api_changes_renamed_caller_with_unchanged_call_stays_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "pub mod api;\npub mod caller;\n"),
+                (
+                    "src/api.rs",
+                    "pub fn process(id: u32) -> u32 {\n    id\n}\n",
+                ),
+                (
+                    "src/caller.rs",
+                    "use crate::api::process;\npub fn run() -> u32 {\n    process(1)\n}\n",
+                ),
+            ],
+            "base",
+        );
+        // process に引数追加 (signature 変更)
+        fs::write(
+            repo.join("src/api.rs"),
+            "pub fn process(id: u32, extra: bool) -> u32 {\n    id\n}\n",
+        )
+        .expect("write");
+        // caller.rs を caller2.rs に rename + 無関係コメント追加。process(1) 呼び出しは古いまま。
+        std::fs::remove_file(repo.join("src/caller.rs")).expect("rm");
+        fs::write(
+            repo.join("src/caller2.rs"),
+            "use crate::api::process;\n// unrelated comment line\npub fn run() -> u32 {\n    process(1)\n}\n",
+        )
+        .expect("write");
+        fs::write(repo.join("src/lib.rs"), "pub mod api;\npub mod caller2;\n").expect("write");
+        let diff_files = vec![
+            crate::models::impact::DiffFile {
+                old_path: "src/api.rs".to_string(),
+                new_path: "src/api.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 3,
+                    new_start: 1,
+                    new_count: 3,
+                }],
+                deleted_old_source: None,
+            },
+            crate::models::impact::DiffFile {
+                old_path: "src/caller.rs".to_string(),
+                new_path: "src/caller2.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 4,
+                    new_start: 1,
+                    new_count: 5,
+                }],
+                deleted_old_source: None,
+            },
+        ];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        assert!(
+            api.modified.iter().any(|m| m.name.ends_with("process")),
+            "rename + 未更新呼び出しが残る場合は blocking。mod={:?} mod_closed={:?}",
+            api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+            api.modified_closed_in_diff
+                .iter()
+                .map(|m| &m.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// Swift の internal 型 (public/open でない) は外部 API ではないため api.add に出さない。
     /// public 型は引き続き出す (パターンD: sidecar/executable 内部型を api.add に出さない)。
     #[test]
@@ -7029,6 +7119,50 @@ def main():
         assert!(
             added.iter().any(|n| n.contains("Detector")),
             "Swift public struct は api.add に出る。got: {added:?}"
+        );
+    }
+
+    /// Swift の public protocol requirement の signature 変更は外部公開 API 変更なので
+    /// api 差分 (mod / mod_closed) に出る (codex 指摘2 の false negative 回避)。
+    #[test]
+    fn detect_api_changes_swift_public_protocol_requirement_signature_change_is_flagged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[(
+                "Service.swift",
+                "public protocol Service {\n    func handle() -> Int\n}\n",
+            )],
+            "base",
+        );
+        fs::write(
+            repo.join("Service.swift"),
+            "public protocol Service {\n    func handle(_ value: Int) -> Int\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "Service.swift".to_string(),
+            new_path: "Service.swift".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 3,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let flagged = api.modified.iter().any(|m| m.name.ends_with("handle"))
+            || api
+                .modified_closed_in_diff
+                .iter()
+                .any(|m| m.name.ends_with("handle"));
+        assert!(
+            flagged,
+            "public protocol requirement の signature 変更は api.mod に出る。mod={:?}",
+            api.modified.iter().map(|m| &m.name).collect::<Vec<_>>()
         );
     }
 
