@@ -795,19 +795,58 @@ fn php_ref_context_is_case_insensitive(parent: Node<'_>, effective: Node<'_>) ->
         }
         // Foo::$prop — scope(クラス名)のみ case-fold。静的プロパティ ($prop) は variable_name で別ノード。
         "scoped_property_access_expression" => is_scope(),
-        // new Foo() / extends Foo / implements Iface / 名前空間 use / trait use の直接子はクラス系名。
+        // new Foo() / extends Foo / implements Iface / trait use の直接子はクラス系名。
         // 引数等の name は parent が arguments 等になるため誤巻き込みしない。
         "object_creation_expression"
         | "base_clause"
         | "class_interface_clause"
-        | "namespace_use_clause"
         | "use_declaration" => true,
+        // 名前空間 use: クラス / 関数 import は case-insensitive、定数 import (`use const`) は
+        // PHP 定数が case-sensitive なため exact のままにする。
+        "namespace_use_clause" => !php_namespace_use_is_const(parent),
         // 型ヒント `Foo $x` の named_type 内 (variable_name 内の name は _ に落ちて exact)
         "named_type" => true,
         // trait adaptation の trait 名 / 別名 (`use A, B { B::foo insteadof A; A::bar as baz; }`)
         "use_instead_of_clause" | "use_as_clause" => true,
         _ => false,
     }
+}
+
+/// PHP の名前空間 use 文が `use const ...` (定数 import) かを判定する。
+///
+/// 定数は case-sensitive のため case-fold しない。`use` (クラス import) / `use function`
+/// (関数 import) は case-insensitive。group use (`use App\{const FOO, Bar, function baz}`) の
+/// 個別修飾子と、`use const App\{...}` のグループ全体修飾子の両方に対応する。
+/// `const` / `function` は anonymous keyword node として現れる。
+fn php_namespace_use_is_const(clause: Node<'_>) -> bool {
+    // group use の各 clause は自身の先頭に const / function キーワードを持つ場合がある。
+    let mut cursor = clause.walk();
+    for child in clause.children(&mut cursor) {
+        match child.kind() {
+            "const" => return true,
+            "function" => return false,
+            _ => {}
+        }
+    }
+    // 単純 use / group 全体の修飾子は namespace_use_declaration 直下にある。
+    let mut current = clause.parent();
+    while let Some(n) = current {
+        if n.kind() == "namespace_use_declaration" {
+            let mut decl_cursor = n.walk();
+            for child in n.children(&mut decl_cursor) {
+                match child.kind() {
+                    "const" => return true,
+                    "function" => return false,
+                    // clause / group 本体に到達したら宣言レベルの修飾子はない
+                    "namespace_use_clause" | "namespace_use_group" => break,
+                    _ => {}
+                }
+            }
+            return false;
+        }
+        current = n.parent();
+    }
+    false
 }
 
 /// 参照走査で name_to_ix を引くマッチキーを生成する。
@@ -3306,6 +3345,60 @@ struct Bar {
         assert!(
             non_defs >= 2,
             "trait adaptation method refs must resolve case-insensitively, got refs={refs:?}"
+        );
+    }
+
+    /// PHP の `use const` (定数 import) は case-sensitive、`use` (クラス import) は case-insensitive。
+    #[test]
+    fn find_references_php_use_const_is_case_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.php"),
+            "<?php\nnamespace App;\nuse const App\\Config\\MAX_SIZE;\nuse App\\Repo\\UserRepo;\n",
+        )
+        .unwrap();
+
+        // use const の定数名は case-sensitive (大小違いは一致しない)。
+        assert!(
+            find_references("max_size", dir.path(), None)
+                .unwrap()
+                .is_empty(),
+            "use const must be case-sensitive"
+        );
+        // 対照: use (クラス import) は case-insensitive。
+        assert!(
+            !find_references("USERREPO", dir.path(), None)
+                .unwrap()
+                .is_empty(),
+            "use class import must be case-insensitive"
+        );
+    }
+
+    /// PHP の group use 内でも const は case-sensitive、クラス / 関数は case-insensitive。
+    #[test]
+    fn find_references_php_group_use_const_is_case_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.php"),
+            "<?php\nnamespace App;\nuse App\\{ Foo, const MAX_LEN, function helper };\n",
+        )
+        .unwrap();
+
+        assert!(
+            find_references("max_len", dir.path(), None)
+                .unwrap()
+                .is_empty(),
+            "group use const must be case-sensitive"
+        );
+        assert!(
+            !find_references("FOO", dir.path(), None).unwrap().is_empty(),
+            "group use class must be case-insensitive"
+        );
+        assert!(
+            !find_references("HELPER", dir.path(), None)
+                .unwrap()
+                .is_empty(),
+            "group use function must be case-insensitive"
         );
     }
 }
