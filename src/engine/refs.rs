@@ -739,32 +739,73 @@ fn php_name_is_case_insensitive(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
+    // qualified_name (`\App\Foo` 等) の末尾 name は、namespace prefix (namespace_name 配下)
+    // を除き qualified_name 全体を実効ノードとして、その親文脈で判定する。
+    // namespace_name 配下の name (App / Repository) は namespace セグメントなので _ に落ちて exact。
+    if parent.kind() == "qualified_name" {
+        return match parent.parent() {
+            Some(grand) => php_ref_context_is_case_insensitive(grand, parent),
+            None => false,
+        };
+    }
+    php_ref_context_is_case_insensitive(parent, node)
+}
+
+/// 参照ノード `effective` (name または qualified_name) が親 `parent` の文脈で
+/// case-insensitive 照合対象 (関数/メソッド/クラス系の名前) かを判定する。
+fn php_ref_context_is_case_insensitive(parent: Node<'_>, effective: Node<'_>) -> bool {
     let is_field = |field: &str| {
         parent
             .child_by_field_name(field)
-            .is_some_and(|n| n.id() == node.id())
+            .is_some_and(|n| n.id() == effective.id())
+    };
+    // scope 位置判定: tree-sitter-php は scoped_call_expression には field "scope" を付けるが、
+    // class_constant_access_expression / scoped_property_access_expression は positional
+    // (field 名なし) のため、field を優先しつつ named_child(0) に fallback する。
+    let is_scope = || {
+        parent.child_by_field_name("scope").map_or_else(
+            || {
+                parent
+                    .named_child(0)
+                    .is_some_and(|s| s.id() == effective.id())
+            },
+            |s| s.id() == effective.id(),
+        )
     };
     match parent.kind() {
-        // $x->method() のメソッド名。member_access_expression ($x->prop) は下の _ に落ち
-        // exact 照合になるため、プロパティ名は case-fold されない。
+        // $x->method() のメソッド名。member_access_expression ($x->prop) は _ に落ちて exact。
         "member_call_expression" => is_field("name"),
         // func() のグローバル/名前空間関数名
         "function_call_expression" => is_field("function"),
         // Foo::method() — scope(クラス名) も name(メソッド名) も case-fold
-        // (self/static/parent は relative_scope ノードのため scope は name にならない)
-        "scoped_call_expression" => is_field("scope") || is_field("name"),
-        // Foo::CONST / Foo::$prop — scope(クラス名)のみ case-fold。定数名・静的プロパティ名は exact
-        "class_constant_access_expression" | "scoped_property_access_expression" => {
-            is_field("scope")
+        // (self/static/parent は relative_scope ノードのため scope は名前ノードにならない)
+        "scoped_call_expression" => is_scope() || is_field("name"),
+        // Foo::CONST — scope(クラス名)は case-fold、定数 name は exact。
+        // ただし trait adaptation (`A::foo insteadof B` / `A::foo as bar`) 配下の name は
+        // trait メソッド名なので case-fold する。
+        "class_constant_access_expression" => {
+            if is_scope() {
+                true
+            } else {
+                matches!(
+                    parent.parent().map(|g| g.kind()),
+                    Some("use_instead_of_clause") | Some("use_as_clause")
+                )
+            }
         }
-        // new Foo() / extends Foo / implements Iface / use Trait の直接 name 子はクラス系名。
+        // Foo::$prop — scope(クラス名)のみ case-fold。静的プロパティ ($prop) は variable_name で別ノード。
+        "scoped_property_access_expression" => is_scope(),
+        // new Foo() / extends Foo / implements Iface / 名前空間 use / trait use の直接子はクラス系名。
         // 引数等の name は parent が arguments 等になるため誤巻き込みしない。
         "object_creation_expression"
         | "base_clause"
         | "class_interface_clause"
+        | "namespace_use_clause"
         | "use_declaration" => true,
-        // 型ヒント `Foo $x` の named_type 内 name (variable_name 内の name は _ に落ちて exact)
+        // 型ヒント `Foo $x` の named_type 内 (variable_name 内の name は _ に落ちて exact)
         "named_type" => true,
+        // trait adaptation の trait 名 / 別名 (`use A, B { B::foo insteadof A; A::bar as baz; }`)
+        "use_instead_of_clause" | "use_as_clause" => true,
         _ => false,
     }
 }
@@ -3215,6 +3256,56 @@ struct Bar {
         assert_eq!(
             non_defs, 1,
             "batch path must resolve case-different call, got refs={refs:?}"
+        );
+    }
+
+    /// PHP の名前空間付きクラス参照 (`use App\Foo` / 型ヒント / `new \App\Foo()`) も
+    /// case-insensitive に解決される (qualified_name の末尾 name)。
+    #[test]
+    fn find_references_php_namespaced_class_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Foo.php"),
+            "<?php\nnamespace App\\Repo;\nclass UserRepository {\n    public function go(): void {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("use.php"),
+            "<?php\nuse App\\Repo\\USERREPOSITORY;\nfunction make(\\App\\Repo\\Userrepository $r) {\n    return new \\App\\Repo\\userRepository();\n}\n",
+        )
+        .unwrap();
+
+        // 参照: use の USERREPOSITORY / 型ヒント Userrepository / new userRepository (全て case 違い)。
+        let refs = find_references("UserRepository", dir.path(), None).unwrap();
+        let non_defs = refs
+            .iter()
+            .filter(|r| r.kind != Some(RefKind::Definition))
+            .count();
+        assert!(
+            non_defs >= 3,
+            "namespaced class refs must resolve case-insensitively, got refs={refs:?}"
+        );
+    }
+
+    /// PHP の trait adaptation (`insteadof` / `as`) のメソッド名も case-insensitive に解決される。
+    #[test]
+    fn find_references_php_trait_adaptation_method_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("t.php"),
+            "<?php\ntrait A {\n    public function work(): void {}\n}\ntrait B {\n    public function work(): void {}\n}\nclass C {\n    use A, B {\n        B::WORK insteadof A;\n        A::Work as legacyWork;\n    }\n}\n",
+        )
+        .unwrap();
+
+        // B::WORK (insteadof) と A::Work (as) は trait メソッド work の case 違い参照。
+        let refs = find_references("work", dir.path(), None).unwrap();
+        let non_defs = refs
+            .iter()
+            .filter(|r| r.kind != Some(RefKind::Definition))
+            .count();
+        assert!(
+            non_defs >= 2,
+            "trait adaptation method refs must resolve case-insensitively, got refs={refs:?}"
         );
     }
 }
