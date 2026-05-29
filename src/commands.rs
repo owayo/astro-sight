@@ -2900,7 +2900,10 @@ fn extract_api_signature(
                     | "function_definition"
                     | "method_declaration"
                     | "method_definition"
-                    | "function_signature_item" => {
+                    | "function_signature_item"
+                    // Swift protocol requirement (body なしの宣言)。複数行 requirement でも
+                    // 先頭行 fallback でなく AST から signature 全体を抽出する (codex 指摘)。
+                    | "protocol_function_declaration" => {
                         let s = cur.start_byte();
                         let e = cur
                             .child_by_field_name("body")
@@ -7162,6 +7165,51 @@ def main():
         assert!(
             flagged,
             "public protocol requirement の signature 変更は api.mod に出る。mod={:?}",
+            api.modified.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// 複数行の Swift protocol requirement でも signature 変更が AST 抽出で検出される
+    /// (先頭行 fallback では 2 行目以降の型変更を見逃す、codex 指摘)。
+    #[test]
+    fn detect_api_changes_swift_multiline_protocol_requirement_signature_change_is_flagged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[(
+                "Service.swift",
+                "public protocol Service {\n    func handle(\n        _ value: Int\n    ) -> Int\n}\n",
+            )],
+            "base",
+        );
+        // 2 行目の型のみ Int → String に変更 (先頭行 `func handle(` は不変)
+        fs::write(
+            repo.join("Service.swift"),
+            "public protocol Service {\n    func handle(\n        _ value: String\n    ) -> Int\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "Service.swift".to_string(),
+            new_path: "Service.swift".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 6,
+                new_start: 1,
+                new_count: 6,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let flagged = api.modified.iter().any(|m| m.name.ends_with("handle"))
+            || api
+                .modified_closed_in_diff
+                .iter()
+                .any(|m| m.name.ends_with("handle"));
+        assert!(
+            flagged,
+            "複数行 protocol requirement の型変更も api.mod に出る。mod={:?}",
             api.modified.iter().map(|m| &m.name).collect::<Vec<_>>()
         );
     }
