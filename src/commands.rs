@@ -8367,6 +8367,34 @@ export function testHelper() { return 1 }\n";
         );
     }
 
+    /// PHP のメソッド名は case-insensitive。case 違い (`isLocalLInk` 定義 / `isLocalLink`
+    /// 呼び出し) で参照される public メソッドを dead_symbols に出さない (GitLab #10 の再現)。
+    #[test]
+    fn detect_dead_php_case_insensitive_method_call_is_not_dead() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+
+        std::fs::write(
+            repo.join("Vo.php"),
+            "<?php\nclass Vo {\n    public function isLocalLInk(): bool { return true; }\n}\n",
+        )
+        .expect("write");
+        std::fs::write(
+            repo.join("Caller.php"),
+            "<?php\nclass Caller {\n    public function check(Vo $vo): bool { return $vo->isLocalLink(); }\n}\n",
+        )
+        .expect("write");
+
+        let files = vec![repo.join("Vo.php"), repo.join("Caller.php")];
+        let (dead, _test_only) =
+            detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
+        let dead_names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+        assert!(
+            !dead_names.iter().any(|n| n.ends_with("isLocalLInk")),
+            "case 違いで呼ばれる method を dead にしない。got: {dead_names:?}"
+        );
+    }
+
     /// React.memo (named function expression) の関数本体内の lexical const は api.add に出さない。
     /// (レポート 2026-05-04-next-page-and-react-memo-false-positives.md パターン1 の再現)
     /// `export const X = memo(function X() { const inner = ... })` の `inner` は

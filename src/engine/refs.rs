@@ -255,8 +255,18 @@ fn find_refs_in_file(symbol_name: &str, path: &camino::Utf8Path) -> Result<Vec<S
     // (memchr は case-sensitive のため Xojo の `MyVar`/`myvar` 一致を取りこぼす)。
     let ext_lang = LangId::from_path(path).ok();
     let is_ci = ext_lang.is_some_and(|l| l.is_case_insensitive());
-    if !is_ci && memchr::memmem::find(&source, symbol_name.as_bytes()).is_none() {
-        return Ok(Vec::new());
+    if !is_ci {
+        // PHP は関数/メソッド/クラス名が case-insensitive なため、大小無視で事前フィルタして
+        // case 違いの参照を取りこぼさない。他の case-sensitive 言語は従来どおり memmem で弾く。
+        let present = if ext_lang == Some(LangId::Php) {
+            let needle = symbol_name.to_ascii_lowercase();
+            memchr::memmem::find(&source.to_ascii_lowercase(), needle.as_bytes()).is_some()
+        } else {
+            memchr::memmem::find(&source, symbol_name.as_bytes()).is_some()
+        };
+        if !present {
+            return Ok(Vec::new());
+        }
     }
 
     // lexer-only 言語は parse_file を呼ばず lexer 経由で identifier 列挙する。
@@ -476,7 +486,7 @@ fn collect_identifier_refs(
 ) {
     if is_identifier_kind(node.kind())
         && let Ok(text) = node.utf8_text(source)
-        && normalize_identifier(lang_id, text).as_ref() == symbol_name
+        && ident_ref_matches(lang_id, node, text, symbol_name)
         && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
     {
         let is_def = is_definition_context(node, definition_kinds, lang_id);
@@ -498,7 +508,7 @@ fn collect_identifier_refs(
 
     // Rust の serde 属性文字列値を識別子参照として扱う。
     for (seg, row, col) in rust_attr_string_ref_segments(node, source, lang_id) {
-        if normalize_identifier(lang_id, seg).as_ref() == symbol_name {
+        if seg_ref_matches(lang_id, seg, symbol_name) {
             refs.push(SymbolReference {
                 path: path.to_string(),
                 line: row,
@@ -512,7 +522,7 @@ fn collect_identifier_refs(
 
     // bash の `trap '<handler>' SIG` 内の handler 文字列から関数参照を抽出する。
     for (seg, row, col) in bash_trap_handler_ref_segments(node, source, lang_id) {
-        if normalize_identifier(lang_id, &seg).as_ref() == symbol_name {
+        if seg_ref_matches(lang_id, &seg, symbol_name) {
             refs.push(SymbolReference {
                 path: path.to_string(),
                 line: row,
@@ -527,7 +537,7 @@ fn collect_identifier_refs(
     // PHPUnit の DocBlock (`@dataProvider` / `@depends`) や PHP attribute
     // (`#[DataProvider('name')]` 等) 経由で参照される method を ref として扱う。
     for (seg, row, col) in phpunit_metadata_ref_segments(node, source, lang_id) {
-        if normalize_identifier(lang_id, &seg).as_ref() == symbol_name {
+        if seg_ref_matches(lang_id, &seg, symbol_name) {
             refs.push(SymbolReference {
                 path: path.to_string(),
                 line: row,
@@ -541,7 +551,7 @@ fn collect_identifier_refs(
 
     // PHP の callable array `[Foo::class, 'method']` の string literal を ref として扱う (N3)。
     if let Some((method, row, col)) = php_callable_array_method_segment(node, source, lang_id)
-        && normalize_identifier(lang_id, method).as_ref() == symbol_name
+        && seg_ref_matches(lang_id, method, symbol_name)
     {
         refs.push(SymbolReference {
             path: path.to_string(),
@@ -555,7 +565,7 @@ fn collect_identifier_refs(
 
     // PHP の文字列 callable `'Class@method'` / `Class::class . '@method'` を ref として扱う (N4)。
     if let Some((method, row, col)) = php_string_callable_method_segment(node, source, lang_id)
-        && normalize_identifier(lang_id, method).as_ref() == symbol_name
+        && seg_ref_matches(lang_id, method, symbol_name)
     {
         refs.push(SymbolReference {
             path: path.to_string(),
@@ -713,6 +723,115 @@ fn is_php_definition_context(node: Node<'_>) -> bool {
             .child_by_field_name("name")
             .is_some_and(|name| name.id() == node.id()),
         _ => false,
+    }
+}
+
+/// PHP の `name` ノードが case-insensitive 照合すべき文脈にあるか判定する。
+///
+/// PHP は関数名・メソッド名・クラス/interface/trait/enum 名が case-insensitive だが、
+/// 変数・プロパティ・定数は case-sensitive。誤って定数・プロパティ・変数を case-fold
+/// しないよう、ホワイトリスト方式で「関数/メソッド/クラス系の名前」だけ true を返す。
+fn php_name_is_case_insensitive(node: Node<'_>) -> bool {
+    // 定義側 (method/function/class/interface/trait/enum の name フィールド)
+    if is_php_definition_context(node) {
+        return true;
+    }
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    let is_field = |field: &str| {
+        parent
+            .child_by_field_name(field)
+            .is_some_and(|n| n.id() == node.id())
+    };
+    match parent.kind() {
+        // $x->method() のメソッド名。member_access_expression ($x->prop) は下の _ に落ち
+        // exact 照合になるため、プロパティ名は case-fold されない。
+        "member_call_expression" => is_field("name"),
+        // func() のグローバル/名前空間関数名
+        "function_call_expression" => is_field("function"),
+        // Foo::method() — scope(クラス名) も name(メソッド名) も case-fold
+        // (self/static/parent は relative_scope ノードのため scope は name にならない)
+        "scoped_call_expression" => is_field("scope") || is_field("name"),
+        // Foo::CONST / Foo::$prop — scope(クラス名)のみ case-fold。定数名・静的プロパティ名は exact
+        "class_constant_access_expression" | "scoped_property_access_expression" => {
+            is_field("scope")
+        }
+        // new Foo() / extends Foo / implements Iface / use Trait の直接 name 子はクラス系名。
+        // 引数等の name は parent が arguments 等になるため誤巻き込みしない。
+        "object_creation_expression"
+        | "base_clause"
+        | "class_interface_clause"
+        | "use_declaration" => true,
+        // 型ヒント `Foo $x` の named_type 内 name (variable_name 内の name は _ に落ちて exact)
+        "named_type" => true,
+        _ => false,
+    }
+}
+
+/// 参照走査で name_to_ix を引くマッチキーを生成する。
+/// PHP の関数/メソッド/クラス系の名前は case-insensitive に折りたたむ。
+fn node_ref_key<'a>(lang_id: LangId, node: Node<'_>, text: &'a str) -> std::borrow::Cow<'a, str> {
+    if lang_id == LangId::Php && php_name_is_case_insensitive(node) {
+        return std::borrow::Cow::Owned(text.to_ascii_lowercase());
+    }
+    normalize_identifier(lang_id, text)
+}
+
+/// 文字列セグメント由来の参照 (PHPUnit metadata / callable array / `'Class@method'`) の
+/// マッチキーを生成する。PHP のこれらのセグメントは常にメソッド名なので case-insensitive
+/// に折りたたむ。Rust/Bash のセグメントは従来どおり normalize_identifier に従う。
+fn seg_ref_key<'a>(lang_id: LangId, seg: &'a str) -> std::borrow::Cow<'a, str> {
+    if lang_id == LangId::Php {
+        return std::borrow::Cow::Owned(seg.to_ascii_lowercase());
+    }
+    normalize_identifier(lang_id, seg)
+}
+
+/// present_indices のシンボルから name_to_ix を構築する。
+///
+/// PHP では case-insensitive な名前 (関数/メソッド/クラス系) の参照に備え、元キーに加えて
+/// 小文字化キーも登録する (folded == exact の場合は重複登録しない)。1 つの参照ノードは
+/// `node_ref_key` で生成した単一キーのみを引くため、二重登録によるカウント二重化は起きない。
+fn build_name_to_ix<'a>(
+    lang_id: LangId,
+    symbol_names: &'a [String],
+    present_indices: &std::collections::HashSet<usize>,
+) -> std::collections::HashMap<std::borrow::Cow<'a, str>, Vec<usize>> {
+    use std::borrow::Cow;
+    let mut map: std::collections::HashMap<Cow<'a, str>, Vec<usize>> =
+        std::collections::HashMap::with_capacity(present_indices.len());
+    for &i in present_indices {
+        let raw = symbol_names[i].as_str();
+        if lang_id == LangId::Php {
+            let folded = raw.to_ascii_lowercase();
+            if folded != raw {
+                map.entry(Cow::Owned(folded)).or_default().push(i);
+            }
+        }
+        let key = normalize_identifier(lang_id, raw);
+        map.entry(key).or_default().push(i);
+    }
+    map
+}
+
+/// 単一参照検索で identifier ノードのテキストが target に一致するか判定する。
+/// PHP の case-insensitive 文脈では大小無視で比較する。`target` は呼び出し側で
+/// `normalize_identifier` 済み (PHP では原文のまま) を前提とする。
+fn ident_ref_matches(lang_id: LangId, node: Node<'_>, text: &str, target: &str) -> bool {
+    if lang_id == LangId::Php && php_name_is_case_insensitive(node) {
+        text.eq_ignore_ascii_case(target)
+    } else {
+        normalize_identifier(lang_id, text).as_ref() == target
+    }
+}
+
+/// 単一参照検索で文字列セグメント (PHP method 名等) が target に一致するか判定する。
+fn seg_ref_matches(lang_id: LangId, seg: &str, target: &str) -> bool {
+    if lang_id == LangId::Php {
+        seg.eq_ignore_ascii_case(target)
+    } else {
+        normalize_identifier(lang_id, seg).as_ref() == target
     }
 }
 
@@ -1493,12 +1612,7 @@ pub(crate) fn visit_refs_and_defs_in_file_cb<V: RefVisitor>(
     let root = tree.root_node();
     let definition_kinds = definition_node_kinds(lang_id);
 
-    let mut name_to_ix: std::collections::HashMap<std::borrow::Cow<'_, str>, Vec<usize>> =
-        std::collections::HashMap::with_capacity(present_indices.len());
-    for &i in &present_indices {
-        let key = normalize_identifier(lang_id, symbol_names[i].as_str());
-        name_to_ix.entry(key).or_default().push(i);
-    }
+    let name_to_ix = build_name_to_ix(lang_id, symbol_names, &present_indices);
 
     collect_refs_and_defs_indexed_cb(
         root,
@@ -1541,7 +1655,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
 ) {
     if is_identifier_kind(node.kind())
         && let Ok(text) = node.utf8_text(source)
-        && let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, text))
+        && let Some(indices) = name_to_ix.get(&node_ref_key(lang_id, node, text))
         && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
     {
         let is_def = is_definition_context(node, definition_kinds, lang_id);
@@ -1557,7 +1671,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
     }
 
     for (seg, row, col) in rust_attr_string_ref_segments(node, source, lang_id) {
-        if let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, seg)) {
+        if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, seg)) {
             let context = extract_line_context(source, row);
             for &ix in indices {
                 visitor.on_ref(
@@ -1574,7 +1688,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
 
     // bash の `trap '<handler>' SIG` 内の handler 文字列から関数参照を抽出する。
     for (seg, row, col) in bash_trap_handler_ref_segments(node, source, lang_id) {
-        if let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, &seg)) {
+        if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, &seg)) {
             let context = extract_line_context(source, row);
             for &ix in indices {
                 visitor.on_ref(
@@ -1591,7 +1705,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
 
     // PHPUnit の DocBlock / attribute 経由で参照される method を ref として扱う。
     for (seg, row, col) in phpunit_metadata_ref_segments(node, source, lang_id) {
-        if let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, &seg)) {
+        if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, &seg)) {
             let context = extract_line_context(source, row);
             for &ix in indices {
                 visitor.on_ref(
@@ -1610,7 +1724,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
     // collect_identifier_refs_indexed / count_identifier_refs と挙動を揃え、
     // impact streaming Pass でも同じ結果を返すようにする。
     if let Some((method, row, col)) = php_callable_array_method_segment(node, source, lang_id)
-        && let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, method))
+        && let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, method))
     {
         let context = extract_line_context(source, row);
         for &ix in indices {
@@ -1627,7 +1741,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
 
     // PHP の文字列 callable `'Class@method'` / `Class::class . '@method'` を ref とする (N4)。
     if let Some((method, row, col)) = php_string_callable_method_segment(node, source, lang_id)
-        && let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, method))
+        && let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, method))
     {
         let context = extract_line_context(source, row);
         for &ix in indices {
@@ -1860,15 +1974,9 @@ pub(crate) fn find_refs_batch_in_file_indexed(
     let root = tree.root_node();
     let definition_kinds = definition_node_kinds(lang_id);
 
-    // 言語別に正規化済みキーで name_to_ix を再構築する (Xojo では case 違いを吸収)。
-    // CI 言語では `Foo` と `foo` のように正規化後キーが衝突し得るため、
-    // 単一 index ではなく Vec<usize> を値として保持し、全シンボルに参照を配る。
-    let mut name_to_ix: std::collections::HashMap<std::borrow::Cow<'_, str>, Vec<usize>> =
-        std::collections::HashMap::with_capacity(present_indices.len());
-    for &i in &present_indices {
-        let key = normalize_identifier(lang_id, symbol_names[i].as_str());
-        name_to_ix.entry(key).or_default().push(i);
-    }
+    // 言語別に正規化キーで name_to_ix を構築する (Xojo は case 折りたたみ、PHP は
+    // 関数/メソッド/クラス系の case-insensitive 参照に備え folded キーも登録する)。
+    let name_to_ix = build_name_to_ix(lang_id, symbol_names, &present_indices);
 
     let mut result = vec![Vec::new(); num];
     collect_identifier_refs_indexed(
@@ -1898,7 +2006,7 @@ fn collect_identifier_refs_indexed(
 ) {
     if is_identifier_kind(node.kind())
         && let Ok(text) = node.utf8_text(source)
-        && let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, text))
+        && let Some(indices) = name_to_ix.get(&node_ref_key(lang_id, node, text))
         && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
     {
         let is_def = is_definition_context(node, definition_kinds, lang_id);
@@ -1925,7 +2033,7 @@ fn collect_identifier_refs_indexed(
 
     // Rust の serde 属性文字列値を識別子参照として扱う。
     for (seg, row, col) in rust_attr_string_ref_segments(node, source, lang_id) {
-        if let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, seg)) {
+        if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, seg)) {
             let context = extract_line_context(source, row);
             for &ix in indices {
                 refs[ix].push(SymbolReference {
@@ -1942,7 +2050,7 @@ fn collect_identifier_refs_indexed(
 
     // bash の `trap '<handler>' SIG` 内の handler 文字列から関数参照を抽出する。
     for (seg, row, col) in bash_trap_handler_ref_segments(node, source, lang_id) {
-        if let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, &seg)) {
+        if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, &seg)) {
             let context = extract_line_context(source, row);
             for &ix in indices {
                 refs[ix].push(SymbolReference {
@@ -1959,7 +2067,7 @@ fn collect_identifier_refs_indexed(
 
     // PHPUnit の DocBlock / attribute 経由で参照される method を ref として扱う。
     for (seg, row, col) in phpunit_metadata_ref_segments(node, source, lang_id) {
-        if let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, &seg)) {
+        if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, &seg)) {
             let context = extract_line_context(source, row);
             for &ix in indices {
                 refs[ix].push(SymbolReference {
@@ -1976,7 +2084,7 @@ fn collect_identifier_refs_indexed(
 
     // PHP の callable array `[Foo::class, 'method']` の string literal を ref として扱う (N3)。
     if let Some((method, row, col)) = php_callable_array_method_segment(node, source, lang_id)
-        && let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, method))
+        && let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, method))
     {
         let context = extract_line_context(source, row);
         for &ix in indices {
@@ -1993,7 +2101,7 @@ fn collect_identifier_refs_indexed(
 
     // PHP の文字列 callable `'Class@method'` / `Class::class . '@method'` を ref として扱う (N4)。
     if let Some((method, row, col)) = php_string_callable_method_segment(node, source, lang_id)
-        && let Some(indices) = name_to_ix.get(&normalize_identifier(lang_id, method))
+        && let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, method))
     {
         let context = extract_line_context(source, row);
         for &ix in indices {
@@ -2065,14 +2173,9 @@ fn count_refs_in_file(
     let root = tree.root_node();
     let definition_kinds = definition_node_kinds(lang_id);
 
-    // 言語別に正規化キーで name_to_ix を構築。CI 言語 (Xojo) では `Foo` と `foo` の
-    // 正規化キーが衝突し得るため、値は `Vec<usize>` を保持して全シンボルにカウントを配る。
-    let mut name_to_ix: std::collections::HashMap<std::borrow::Cow<'_, str>, Vec<usize>> =
-        std::collections::HashMap::with_capacity(present_indices.len());
-    for &i in &present_indices {
-        let key = normalize_identifier(lang_id, symbol_names[i].as_str());
-        name_to_ix.entry(key).or_default().push(i);
-    }
+    // 言語別に正規化キーで name_to_ix を構築 (Xojo は case 折りたたみ、PHP は関数/メソッド/
+    // クラス系の case-insensitive 参照に備え folded キーも登録)。
+    let name_to_ix = build_name_to_ix(lang_id, symbol_names, &present_indices);
 
     let mut counts = vec![0usize; num];
     count_identifier_refs(
@@ -2100,7 +2203,7 @@ fn count_identifier_refs(
 ) {
     if is_identifier_kind(node.kind())
         && let Ok(text) = node.utf8_text(source)
-        && let Some(ixs) = name_to_ix.get(&normalize_identifier(lang_id, text))
+        && let Some(ixs) = name_to_ix.get(&node_ref_key(lang_id, node, text))
         && !is_definition_context(node, definition_kinds, lang_id)
         && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
     {
@@ -2111,7 +2214,7 @@ fn count_identifier_refs(
 
     // Rust の serde 属性文字列値を非 Definition 参照としてカウントする。
     for (seg, _row, _col) in rust_attr_string_ref_segments(node, source, lang_id) {
-        if let Some(ixs) = name_to_ix.get(&normalize_identifier(lang_id, seg)) {
+        if let Some(ixs) = name_to_ix.get(&seg_ref_key(lang_id, seg)) {
             for &ix in ixs {
                 counts[ix] += 1;
             }
@@ -2120,7 +2223,7 @@ fn count_identifier_refs(
 
     // bash の `trap '<handler>' SIG` 内の handler 文字列から関数参照をカウントする。
     for (seg, _row, _col) in bash_trap_handler_ref_segments(node, source, lang_id) {
-        if let Some(ixs) = name_to_ix.get(&normalize_identifier(lang_id, &seg)) {
+        if let Some(ixs) = name_to_ix.get(&seg_ref_key(lang_id, &seg)) {
             for &ix in ixs {
                 counts[ix] += 1;
             }
@@ -2129,7 +2232,7 @@ fn count_identifier_refs(
 
     // PHPUnit の DocBlock / attribute 経由で参照される method をカウントする。
     for (seg, _row, _col) in phpunit_metadata_ref_segments(node, source, lang_id) {
-        if let Some(ixs) = name_to_ix.get(&normalize_identifier(lang_id, &seg)) {
+        if let Some(ixs) = name_to_ix.get(&seg_ref_key(lang_id, &seg)) {
             for &ix in ixs {
                 counts[ix] += 1;
             }
@@ -2138,7 +2241,7 @@ fn count_identifier_refs(
 
     // PHP の callable array `[Foo::class, 'method']` の string literal を ref とする (N3)。
     if let Some((method, _row, _col)) = php_callable_array_method_segment(node, source, lang_id)
-        && let Some(ixs) = name_to_ix.get(&normalize_identifier(lang_id, method))
+        && let Some(ixs) = name_to_ix.get(&seg_ref_key(lang_id, method))
     {
         for &ix in ixs {
             counts[ix] += 1;
@@ -2147,7 +2250,7 @@ fn count_identifier_refs(
 
     // PHP の文字列 callable `'Class@method'` / `Class::class . '@method'` を ref とする (N4)。
     if let Some((method, _row, _col)) = php_string_callable_method_segment(node, source, lang_id)
-        && let Some(ixs) = name_to_ix.get(&normalize_identifier(lang_id, method))
+        && let Some(ixs) = name_to_ix.get(&seg_ref_key(lang_id, method))
     {
         for &ix in ixs {
             counts[ix] += 1;
@@ -2972,5 +3075,146 @@ struct Bar {
         // 引用なし `trap cleanup INT` は通常の word 走査で 1 件として拾われる。
         // bash_trap_handler_ref_segments は raw_string/string のみ対象なので加算しない。
         assert_eq!(counts[0], 1, "unquoted word must not be double-counted");
+    }
+
+    /// PHP のメソッド呼び出しは case-insensitive に解決される。
+    /// 定義 `isFooBar` と呼び出し `isFoobar` (case 違い) は同一メソッドに解決される。
+    #[test]
+    fn find_references_php_method_call_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Vo.php"),
+            "<?php\nclass Vo {\n    public function isFooBar(): bool { return true; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("Caller.php"),
+            "<?php\nclass Caller {\n    public function check(Vo $vo): bool { return $vo->isFoobar(); }\n}\n",
+        )
+        .unwrap();
+
+        let refs = find_references("isFooBar", dir.path(), None).unwrap();
+        let defs = refs
+            .iter()
+            .filter(|r| r.kind == Some(RefKind::Definition))
+            .count();
+        let non_defs = refs
+            .iter()
+            .filter(|r| r.kind != Some(RefKind::Definition))
+            .count();
+        assert_eq!(defs, 1, "definition should resolve, got refs={refs:?}");
+        assert_eq!(
+            non_defs, 1,
+            "case-different method call must resolve as reference, got refs={refs:?}"
+        );
+    }
+
+    /// PHP の静的メソッド呼び出し (`Foo::bar()`) も case-insensitive に解決される。
+    #[test]
+    fn find_references_php_static_method_call_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.php"),
+            "<?php\nclass Svc {\n    public static function doIt(): void {}\n    public function run(): void { Svc::DOIT(); }\n}\n",
+        )
+        .unwrap();
+
+        let refs = find_references("doIt", dir.path(), None).unwrap();
+        let non_defs = refs
+            .iter()
+            .filter(|r| r.kind != Some(RefKind::Definition))
+            .count();
+        assert_eq!(
+            non_defs, 1,
+            "case-different static call must resolve, got refs={refs:?}"
+        );
+    }
+
+    /// PHP のクラス名は case-insensitive。`new FOO()` / `new Foo()` が定義 `class Foo` に解決される。
+    #[test]
+    fn find_references_php_class_name_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Foo.php"),
+            "<?php\nclass Foo {\n    public function go(): void {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("use.php"),
+            "<?php\nfunction make() {\n    $a = new FOO();\n    $b = new Foo();\n    return $a;\n}\n",
+        )
+        .unwrap();
+
+        let refs = find_references("Foo", dir.path(), None).unwrap();
+        let non_defs = refs
+            .iter()
+            .filter(|r| r.kind != Some(RefKind::Definition))
+            .count();
+        assert_eq!(
+            non_defs, 2,
+            "class name `new FOO`/`new Foo` must resolve case-insensitively, got refs={refs:?}"
+        );
+    }
+
+    /// PHP のプロパティ名は case-sensitive。大小違いの検索は member_access に一致しない。
+    #[test]
+    fn find_references_php_property_access_is_case_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.php"),
+            "<?php\nclass C {\n    public int $myProp = 0;\n    public function f(): int { return $this->myProp; }\n}\n",
+        )
+        .unwrap();
+
+        // case-fold していれば "MYPROP" が "myProp" に誤マッチするが、プロパティは case-sensitive。
+        let refs = find_references("MYPROP", dir.path(), None).unwrap();
+        assert!(
+            refs.is_empty(),
+            "property access is case-sensitive; uppercase search must not match, got refs={refs:?}"
+        );
+    }
+
+    /// PHP のクラス定数は case-sensitive。大小違いの検索は class_constant_access に一致しない。
+    #[test]
+    fn find_references_php_class_constant_is_case_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.php"),
+            "<?php\nclass C {\n    const MyConst = 1;\n    public function f(): int { return self::MyConst; }\n}\n",
+        )
+        .unwrap();
+
+        let refs = find_references("MYCONST", dir.path(), None).unwrap();
+        assert!(
+            refs.is_empty(),
+            "class constant is case-sensitive; uppercase search must not match, got refs={refs:?}"
+        );
+    }
+
+    /// バッチ参照検索 (dead-code / api が使う経路) でも PHP メソッドの case 違いが解決される。
+    #[test]
+    fn find_references_batch_php_method_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Vo.php"),
+            "<?php\nclass Vo {\n    public function isFooBar(): bool { return true; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("Caller.php"),
+            "<?php\nclass Caller {\n    public function check(Vo $vo): bool { return $vo->isFoobar(); }\n}\n",
+        )
+        .unwrap();
+
+        let map = find_references_batch(&["isFooBar".to_string()], dir.path(), None).unwrap();
+        let refs = map.get("isFooBar").cloned().unwrap_or_default();
+        let non_defs = refs
+            .iter()
+            .filter(|r| r.kind != Some(RefKind::Definition))
+            .count();
+        assert_eq!(
+            non_defs, 1,
+            "batch path must resolve case-different call, got refs={refs:?}"
+        );
     }
 }
