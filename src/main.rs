@@ -156,9 +156,13 @@ fn run(cli: Cli) -> Result<()> {
     // Load configuration
     let config = ConfigService::load(cli.config.as_deref())?;
 
-    // Initialize logging if debug mode (CLI flag or config)
-    if cli.debug || config.debug {
-        astro_sight::logger::init(&config)?;
+    // debug モード時（CLI フラグまたは config）のみロギングを初期化する。
+    // 書込不可ディレクトリ等でログ初期化に失敗しても解析本体は止めず、
+    // 警告を出して続行する（debug 有効かつ読み取り専用環境などへの堅牢化）。
+    if (cli.debug || config.debug)
+        && let Err(e) = astro_sight::logger::init(&config)
+    {
+        eprintln!("warning: failed to initialize logging (continuing without it): {e}");
     }
 
     // Handle early-exit commands before creating AppService

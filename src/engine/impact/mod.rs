@@ -510,11 +510,16 @@ fn find_affected_symbols(
             let sym_start = sym.range.start.line;
             let sym_end = sym.range.end.line;
 
-            // オーバーラップチェック（ゼロ幅 hunk は点として境界を含む判定）
+            // オーバーラップチェック。
+            // tree-sitter の range.end.line は包含的（シンボル最終バイトが乗る行）
+            // なので、通常 hunk では sym_end を含めて判定する。これにより単一行
+            // シンボル（start==end）や複数行シンボルの最終行のみの変更も検出する。
+            // ゼロ幅 hunk（pure-delete）は新ファイル側に行が無く、境界一致は
+            // 隣接行の削除を指すため、従来どおり半開区間（< sym_end）で判定する。
             let overlaps = if hunk.new_count == 0 {
                 hunk_start >= sym_start && hunk_start < sym_end
             } else {
-                hunk_start < sym_end && hunk_end > sym_start
+                hunk_start <= sym_end && hunk_end > sym_start
             };
             if overlaps {
                 // context-only overlap の除外: changed_new_lines が Some かつ
@@ -524,7 +529,7 @@ fn find_affected_symbols(
                 // フィルタを適用すると change_type=removed が出なくなる。
                 if let Some(cl) = changed_new_lines
                     && hunk.new_count > 0
-                    && !(sym_start..sym_end).any(|l| cl.contains(&l))
+                    && !(sym_start..=sym_end).any(|l| cl.contains(&l))
                 {
                     continue;
                 }
@@ -569,11 +574,13 @@ fn symbol_overlaps_hunks(sym: &crate::models::symbol::Symbol, hunks: &[HunkInfo]
     hunks.iter().any(|h| {
         let hunk_start = h.new_start.saturating_sub(1);
         let hunk_end = hunk_start.saturating_add(h.new_count);
-        // ゼロ幅 hunk（pure-delete）は点として境界を含む判定
+        // range.end.line は包含的なので通常 hunk は end を含めて判定する
+        // （単一行シンボル・最終行のみの変更を取りこぼさない）。
+        // ゼロ幅 hunk（pure-delete）は従来どおり半開区間で判定する。
         if h.new_count == 0 {
             hunk_start >= sym.range.start.line && hunk_start < sym.range.end.line
         } else {
-            hunk_start < sym.range.end.line && hunk_end > sym.range.start.line
+            hunk_start <= sym.range.end.line && hunk_end > sym.range.start.line
         }
     })
 }
@@ -1097,9 +1104,9 @@ mod tests {
     #[test]
     fn find_affected_symbols_excludes_context_only_overlap() {
         // hunk 領域: line 41-78 (new_start=41, new_count=38) — 隣接 symbol を巻き込む幅
-        // symbol replaceTemplate: line 42-43 (hunk 領域内だが context 行のみ)
-        // changed_new_lines: 44-77 (実 + 行は symbol range 外)
-        let sym = make_sym("replaceTemplate", 42, 43);
+        // symbol replaceTemplate: line 42 (単一行、hunk 領域内だが + 行を含まない context)
+        // changed_new_lines: 0-indexed 43-76 (実 + 行は symbol の line 42 の外)
+        let sym = make_sym("replaceTemplate", 42, 42);
         let hunk = HunkInfo {
             old_start: 41,
             old_count: 3,
@@ -1151,5 +1158,35 @@ mod tests {
         let result = find_affected_symbols(&[sym], &[hunk], Some(&changed));
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].change_type, "removed");
+    }
+
+    /// 単一行シンボル（range.start.line == range.end.line）の変更が検出される。
+    /// tree-sitter の range.end.line は包含的なので、単一行の const/type/1 行関数の
+    /// API 破壊が impact/review から脱落してはならない（回帰: 2026-05-31）。
+    #[test]
+    fn find_affected_detects_single_line_symbol() {
+        // 単一行シンボル: line 0 (start == end == 0)
+        let sym = make_sym("MAX_RETRIES", 0, 0);
+        let hunk = HunkInfo {
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+        };
+        let mut changed = std::collections::HashSet::new();
+        changed.insert(0); // 0-indexed line 0 が実変更行
+        let result = find_affected_symbols(&[sym], &[hunk], Some(&changed));
+        assert_eq!(result.len(), 1, "単一行シンボルの変更が検出されるべき");
+        assert_eq!(result[0].name, "MAX_RETRIES");
+        assert_eq!(result[0].change_type, "modified");
+        // symbol_overlaps_hunks でも同様に単一行の境界を検出する
+        let sym2 = make_sym("MAX_RETRIES", 0, 0);
+        let hunk2 = HunkInfo {
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+        };
+        assert!(symbol_overlaps_hunks(&sym2, &[hunk2]));
     }
 }
