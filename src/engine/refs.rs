@@ -451,24 +451,32 @@ fn find_refs_batch_via_lexer(
 /// 指定行 (0-indexed) のコンテキスト行を取得する。lexer fallback 経路用の
 /// 軽量実装 (tree-sitter の Node API に依存しない)。
 fn extract_line_context_bytes(source: &[u8], line_0idx: usize) -> String {
+    // minified/生成コードの巨大行によるメモリ・出力爆発を防ぐため 256B で切り詰める
+    // (tree-sitter 経路の extract_line_context と同じ上限)。
+    const MAX_CTX: usize = 256;
+    let truncate = |bytes: &[u8]| -> String {
+        let line = std::str::from_utf8(bytes)
+            .unwrap_or("")
+            .trim_end_matches('\r');
+        if line.len() <= MAX_CTX {
+            line.to_string()
+        } else {
+            format!("{}...", &line[..line.floor_char_boundary(MAX_CTX)])
+        }
+    };
     let mut current = 0usize;
     let mut start = 0usize;
     for (i, b) in source.iter().enumerate() {
         if *b == b'\n' {
             if current == line_0idx {
-                return std::str::from_utf8(&source[start..i])
-                    .unwrap_or("")
-                    .trim_end_matches('\r')
-                    .to_string();
+                return truncate(&source[start..i]);
             }
             current += 1;
             start = i + 1;
         }
     }
     if current == line_0idx {
-        return std::str::from_utf8(&source[start..])
-            .unwrap_or("")
-            .to_string();
+        return truncate(&source[start..]);
     }
     String::new()
 }
@@ -2749,6 +2757,44 @@ fn caller(s: &S) {
         let source = format!("x\n{long}");
         let ctx = extract_line_context(source.as_bytes(), 1);
         // UTF-8 境界違反でパニックしないこと
+        assert!(ctx.ends_with("..."));
+        assert!(std::str::from_utf8(ctx.as_bytes()).is_ok());
+    }
+
+    /// lexer 経路 (extract_line_context_bytes) も巨大行を 256 バイトで切り詰めることを検証。
+    /// tree-sitter 非対応言語 (Xojo) の minified/生成行によるメモリ・出力爆発を防ぐ。
+    /// 中間行（改行あり）と最終行（改行なし）の両経路を確認する。
+    #[test]
+    fn extract_line_context_bytes_truncates_long_line() {
+        let long = "a".repeat(500);
+        let source = format!("line0\n{long}\n{long}");
+        let ctx_mid = extract_line_context_bytes(source.as_bytes(), 1);
+        assert!(
+            ctx_mid.ends_with("..."),
+            "256 バイト超は省略記号で終わるべき"
+        );
+        assert!(
+            ctx_mid.len() <= 256 + 3,
+            "256 バイト + '...' 以内に収まるべき"
+        );
+        let ctx_last = extract_line_context_bytes(source.as_bytes(), 2);
+        assert!(
+            ctx_last.ends_with("..."),
+            "最終行（改行なし）も切り詰めるべき"
+        );
+        assert!(ctx_last.len() <= 256 + 3);
+        // 通常行（256 バイト以下）は切り詰めない
+        let ctx0 = extract_line_context_bytes(source.as_bytes(), 0);
+        assert_eq!(ctx0, "line0");
+    }
+
+    /// lexer 経路も UTF-8 境界で安全に切り詰めることを検証（マルチバイト文字の分割禁止）
+    #[test]
+    fn extract_line_context_bytes_utf8_boundary_safe() {
+        let mut long = "a".repeat(254);
+        long.push_str("あいうえお");
+        let source = format!("x\n{long}");
+        let ctx = extract_line_context_bytes(source.as_bytes(), 1);
         assert!(ctx.ends_with("..."));
         assert!(std::str::from_utf8(ctx.as_bytes()).is_ok());
     }

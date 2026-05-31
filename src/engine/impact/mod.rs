@@ -542,9 +542,11 @@ fn find_affected_symbols(
                 // - hunk new_count==0: pure delete なので "removed"。
                 // - それ以外: "modified"。
                 let change_type = if hunk.old_count == 0 {
-                    let sym_line_span = sym_end.saturating_sub(sym_start);
-                    let hunk_covers_symbol =
-                        hunk_start <= sym_start && hunk.new_count >= sym_line_span;
+                    // hunk が sym 全体（包含的な最終行 sym_end を含む）を覆う場合のみ
+                    // "added"。hunk_end は排他的上限なので sym_end を含むには
+                    // hunk_end > sym_end が必要。部分的にしか覆わない場合は既存
+                    // シンボル内への追加なので "modified"（cross-file 探索の対象に残す）。
+                    let hunk_covers_symbol = hunk_start <= sym_start && hunk_end > sym_end;
                     if hunk_covers_symbol {
                         "added"
                     } else {
@@ -1188,5 +1190,26 @@ mod tests {
             new_count: 1,
         };
         assert!(symbol_overlaps_hunks(&sym2, &[hunk2]));
+    }
+
+    /// pure-add (old_count==0) が sym 先頭から始まっても、最終行（包含的な sym_end）を
+    /// 覆わなければ "added" ではなく "modified"。range.end.line は包含的なので full-cover
+    /// 判定には hunk_end > sym_end が必要で、off-by-one で "added" 誤判定すると cross-file
+    /// 探索から脱落して false negative になる（回帰: 2026-05-31）。
+    #[test]
+    fn find_affected_pure_add_not_covering_last_line_is_modified() {
+        let sym = make_sym("partial", 4, 9); // 6 行 (4..=9)
+        let hunk = HunkInfo {
+            old_start: 0,
+            old_count: 0,
+            new_start: 5, // hunk_start = 4 (sym_start と一致)
+            new_count: 5, // hunk_end = 9 → 包含的な sym_end(9) を覆わない
+        };
+        let result = find_affected_symbols(&[sym], &[hunk], None);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].change_type, "modified",
+            "最終行を覆わない pure-add は added ではなく modified"
+        );
     }
 }
