@@ -10,7 +10,7 @@ when_to_use: |
   - Touching exported APIs / public modules — add `dead-code --dir . --git` to detect dead symbols
   - Understanding a file or directory — use `symbols --path <file>` or `symbols --dir <dir>`
   - Call graphs, imports, sequence diagrams, co-change history, or repeated AST/text rules — use the matching command (`calls` / `imports` / `sequence` / `cochange` / `lint`)
-  - Running 2+ mixed astro-sight queries in one process — use `session` (NDJSON)
+  - Running 2+ mixed astro-sight queries in one process — use `session` (NDJSON), especially `symbols` + `imports`, `symbols` + `calls`, or `calls` + `sequence`
   Skip for non-code text searches (error messages, config values, TODO comments, file-path patterns) — Grep handles those.
 allowed-tools: Bash(astro-sight:*)
 ---
@@ -125,7 +125,7 @@ echo '{"command":"refs","name":"Sym1","dir":"."}
 - Need to turn a one-off policy into a repeatable check? → `astro-sight lint --path <file> --rules rules.yaml`
 - Reviewing a multi-commit branch? → pass the same `--base <rev>` to `review`, `context`, or `impact`; `review --git --base <rev>` also uses that base for blame-backed `missing_cochanges`.
 
-Adoption guard: if your plan contains `symbols` + `imports`, `symbols` + `calls`, or `calls` + `sequence`, run them through `astro-sight session` unless you only need one command. This keeps process startup low and makes use of currently underused structural tools.
+Adoption guard: if your plan contains `symbols` + `imports`, `symbols` + `calls`, or `calls` + `sequence`, run them through `astro-sight session` unless you truly only need one command. Avoid launching separate shells for back-to-back structural reads on the same file when one NDJSON session can answer them. This keeps process startup low and makes use of currently underused structural tools.
 
 ## Commands
 

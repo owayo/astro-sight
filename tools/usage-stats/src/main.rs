@@ -217,7 +217,7 @@ fn short_flag_consumes_value(flag: &str) -> bool {
 }
 
 fn is_astro_sight_cmd(cmd: &str) -> bool {
-    astro_sight_invocation_args(cmd).is_some()
+    extract_astro_subcmd(cmd).is_some()
 }
 
 fn extract_bash_category(cmd: &str) -> String {
@@ -439,8 +439,7 @@ fn process_claude_file(path: &Path, project: &str) -> Stats {
                     .entry(category)
                     .or_default() += 1;
 
-                if is_astro_sight_cmd(cmd) {
-                    let subcmd = extract_astro_subcmd(cmd).unwrap_or("unknown");
+                if let Some(subcmd) = extract_astro_subcmd(cmd) {
                     pending_tools.push(ToolDetail {
                         tool: "astro-sight".to_string(),
                         detail: truncate(cmd, 200),
@@ -1023,7 +1022,7 @@ fn print_summary(stats: &Stats, label: &str) {
                     (proj, tools, total)
                 })
                 .collect();
-            proj_totals.sort_by(|a, b| b.2.cmp(&a.2));
+            proj_totals.sort_by_key(|(_, _, total)| std::cmp::Reverse(*total));
 
             let mut table = Table::new();
             table.load_preset(UTF8_FULL_CONDENSED);
@@ -1213,7 +1212,7 @@ fn print_json(stats: &Stats, label: &str) {
                     (proj, tools, total)
                 })
                 .collect();
-            proj_totals.sort_by(|a, b| b.2.cmp(&a.2));
+            proj_totals.sort_by_key(|(_, _, total)| std::cmp::Reverse(*total));
             for (proj, tools, total) in proj_totals.iter().take(15) {
                 let mut sorted_tools: Vec<_> = tools.iter().collect();
                 sorted_tools.sort_by(|a, b| b.1.cmp(a.1));
@@ -1462,6 +1461,23 @@ mod tests {
         assert_eq!(
             extract_astro_subcmd(
                 "codex exec \"please inspect whether astro-sight refs should be used\""
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_astro_subcmd_ignores_non_subcommand_invocations() {
+        assert_eq!(extract_astro_subcmd("astro-sight --version"), None);
+        assert_eq!(extract_astro_subcmd("astro-sight --help"), None);
+        assert!(!is_astro_sight_cmd("ls -la; astro-sight --version"));
+        assert_eq!(
+            extract_astro_cmd_from_args(r#"{"cmd":"astro-sight --version"}"#),
+            None
+        );
+        assert_eq!(
+            extract_astro_cmd_from_args(
+                r#"{"cmd":"sed -n '1,220p' ~/.claude/skills/astro-sight/SKILL.md"}"#
             ),
             None
         );
