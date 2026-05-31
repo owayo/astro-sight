@@ -45,10 +45,10 @@ fn main() {
         }
     }
 
-    #[cfg(feature = "dhat-heap")]
-    let _profiler = dhat::Profiler::new_heap();
-
     let cli = Cli::parse();
+
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = should_start_dhat_heap(&cli.command).then(dhat::Profiler::new_heap);
 
     if let Err(e) = run(cli) {
         let (code, message) = commands::classify_error(&e);
@@ -58,6 +58,15 @@ fn main() {
         println!("{}", serde_json::to_string(&error).unwrap());
         std::process::exit(1);
     }
+}
+
+#[cfg(feature = "dhat-heap")]
+fn should_start_dhat_heap(command: &Commands) -> bool {
+    // hook モードは stop hook の出力契約を優先し、DHAT の stderr 要約を混ぜない。
+    !matches!(
+        command,
+        Commands::Impact { hook: true, .. } | Commands::Review { hook: true, .. }
+    )
 }
 
 // ---------------------------------------------------------------------------
