@@ -1,6 +1,7 @@
 use serde::Serialize;
 
 use super::impact::ContextResult;
+use super::skip::SkipInfo;
 
 /// review コマンドの統合レスポンス。
 ///
@@ -8,7 +9,7 @@ use super::impact::ContextResult;
 /// test/spec 配下からのみ参照される公開シンボル。dead 同等扱いにすると
 /// 「テスト経由で実利用されている API」を誤って除去候補に出してしまうため、
 /// 別バケットに分離してレビュアー判断に委ねる。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ReviewResult {
     pub impact: ContextResult,
     pub missing_cochanges: Vec<MissingCochange>,
@@ -16,6 +17,9 @@ pub struct ReviewResult {
     pub dead_symbols: Vec<DeadSymbol>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub test_only_symbols: Vec<DeadSymbol>,
+    /// git 管理外 dir で `--git` が要求され diff を取得できず skip した場合の理由。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub skipped: Option<SkipInfo>,
 }
 
 /// cochange で検出された「一緒に変更されるはずだが diff に含まれないファイル」。
@@ -42,7 +46,7 @@ pub struct MissingCochange {
 /// レビュー側で「破壊的削除」と「dead-code 掃除」を即座に区別できる。
 /// repo 内到達性 0 を保証するが、外部パッケージ利用者ゼロまでは保証しない
 /// (Issue 2026-05-28-meet-virtual-you-gemini-multi-select 対応)。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ApiChanges {
     pub added: Vec<ApiSymbol>,
     pub removed: Vec<ApiSymbol>,

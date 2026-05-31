@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::skip::SkipInfo;
+
 /// A parsed hunk from a unified diff.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HunkInfo {
@@ -70,9 +72,13 @@ pub struct FileImpact {
 }
 
 /// The context (impact analysis) response envelope.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextResult {
     pub changes: Vec<FileImpact>,
+    /// git 管理外 dir で `--git` が要求され diff を取得できず skip した場合の理由。
+    /// 通常の解析結果では `None` (出力に含まれない・後方互換)。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub skipped: Option<SkipInfo>,
 }
 
 /// `analyze_context` / `analyze_impact_streaming` のオプション。

@@ -47,6 +47,7 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
         return Ok(CoChangeResult {
             entries: Vec::new(),
             commits_analyzed: 0,
+            skipped: None,
         });
     }
     // 起点ファイル数の上限ガード (0 = 無制限)。暴走防止のため超過は明示的に停止する。
@@ -113,6 +114,7 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
         return Ok(CoChangeResult {
             entries: Vec::new(),
             commits_analyzed: 0,
+            skipped: None,
         });
     }
 
@@ -141,6 +143,7 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
             return Ok(CoChangeResult {
                 entries: Vec::new(),
                 commits_analyzed: 0,
+                skipped: None,
             });
         }
     }
@@ -323,6 +326,7 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
     Ok(CoChangeResult {
         entries,
         commits_analyzed: denominator,
+        skipped: None,
     })
 }
 

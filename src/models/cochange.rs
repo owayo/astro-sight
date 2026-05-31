@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::skip::SkipInfo;
+
 /// A pair of files that frequently change together.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoChangeEntry {
@@ -37,11 +39,14 @@ impl CoChangeEntry {
 }
 
 /// Result of co-change analysis.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CoChangeResult {
     pub entries: Vec<CoChangeEntry>,
     /// blame で得たユニークコミット集合 |C| のサイズ。
     pub commits_analyzed: usize,
+    /// git 管理外 dir で `--git` が要求され diff を取得できず skip した場合の理由。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub skipped: Option<SkipInfo>,
 }
 
 /// Options controlling blame-based co-change analysis.

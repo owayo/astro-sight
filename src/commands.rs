@@ -1097,6 +1097,7 @@ pub fn cmd_review(
         api_changes,
         dead_symbols,
         test_only_symbols,
+        skipped: None,
     };
 
     if hook {
@@ -1115,23 +1116,7 @@ pub fn cmd_review(
 }
 
 fn empty_review_result() -> ReviewResult {
-    ReviewResult {
-        impact: crate::models::impact::ContextResult {
-            changes: Vec::new(),
-        },
-        missing_cochanges: Vec::new(),
-        api_changes: ApiChanges {
-            added: Vec::new(),
-            removed: Vec::new(),
-            modified: Vec::new(),
-            moved: Vec::new(),
-            property_to_field: Vec::new(),
-            removed_dead: Vec::new(),
-            modified_closed_in_diff: Vec::new(),
-        },
-        dead_symbols: Vec::new(),
-        test_only_symbols: Vec::new(),
-    }
+    ReviewResult::default()
 }
 
 /// `--hook` の出力判定結果。
@@ -4915,6 +4900,7 @@ pub fn cmd_dead_code(
                     scanned_files: 0,
                     dead_symbols: Vec::new(),
                     test_only_symbols: Vec::new(),
+                    skipped: None,
                 };
                 let output = serialize_output(&result, pretty)?;
                 println!("{output}");
@@ -4962,6 +4948,7 @@ pub fn cmd_dead_code(
         scanned_files,
         dead_symbols,
         test_only_symbols,
+        skipped: None,
     };
 
     let output = serialize_output(&result, pretty)?;

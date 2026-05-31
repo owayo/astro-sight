@@ -508,7 +508,10 @@ impl AppService {
             changes.push(impact);
             Ok(())
         })?;
-        Ok(ContextResult { changes })
+        Ok(ContextResult {
+            changes,
+            skipped: None,
+        })
     }
 
     /// context 解析の入力検証だけを行う。
