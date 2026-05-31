@@ -11439,9 +11439,7 @@ bar() { echo bye; }\n";
             Some("laravel"),
             dir.path().to_str().expect("utf-8"),
         )
-        .expect("resolve") else {
-            panic!("expected Files");
-        };
+        .expect("resolve");
         // Laravel プリセットの代表 glob `**/app/Http/**` が含まれていることだけ確認する。
         assert!(globs.iter().any(|g| g.contains("Http")));
     }
