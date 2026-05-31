@@ -285,6 +285,7 @@ git diff HEAD~1 | astro-sight impact --dir .
 
 - 未解決なし → exit 0（出力なし）
 - 未解決あり → stderr にテキスト出力 + exit 1
+- `--dir` が git 管理外 → exit 0（出力なし。`--hook` 有無を問わず silent skip。下記「git 管理外ディレクトリでの graceful skip」参照）
 
 出力例（exit 1 時）:
 ```
@@ -301,6 +302,19 @@ claw-hooks との連携例（`.claw-hooks.toml`）:
 commands = ["astro-sight impact --git --dir ."]
 condition = { command_exists = "astro-sight" }
 ```
+
+#### git 管理外ディレクトリでの graceful skip
+
+`--git` を受け付けるコマンド（`context` / `impact` / `review` / `dead-code` / `cochange`）を git 管理外ディレクトリで実行した場合、内部の `git diff` 失敗をエラーにせず「解析対象なし」として graceful に skip し、**exit 0** で正常終了する。`~/.config` のような git 管理外ディレクトリで編集する際に Claude Code の Stop hook をブロックしないための挙動。
+
+- `--hook`（`review` / `impact`）→ stdout / stderr ともに無出力で exit 0（silent skip）
+- 通常 CLI → 空の正常結果に機械可読な `skipped` フィールドを付けて exit 0。「差分なし」と「git 管理外」を区別できる
+
+```json
+{ "...": "...", "skipped": { "reason": "not_git_repository", "source": "git", "message": "--git was requested but --dir is not inside a git worktree" } }
+```
+
+判定は `git rev-parse --is-inside-work-tree`（`LC_ALL=C`）で行い、worktree / submodule / bare repo に堅牢。**真のエラー**（`--base` 不正・git 実行不能・壊れた repo・権限不足）は従来どおり `exit 1` を維持する。`--diff` / `--diff-file` / stdin 経路は判定を通らず無影響。
 
 #### デフォルト除外
 

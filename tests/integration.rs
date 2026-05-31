@@ -8149,3 +8149,127 @@ fn dead_scope_touched_symbols_excludes_pre_existing_dead() {
     // 退行ガード: dir パスの問題で std::path::Path を使う警告を避ける。
     let _ = Path::new(root);
 }
+
+// ---------------------------------------------------------------------------
+// git 管理外ディレクトリでの graceful skip (--git)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn non_git_review_hook_silent_exit_zero() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_str().expect("utf-8");
+    let output = cargo_bin()
+        .args(["review", "--dir", path, "--git", "--hook"])
+        .output()
+        .expect("run");
+    assert!(output.status.success(), "非 git の --hook は exit 0");
+    assert!(
+        output.stdout.is_empty(),
+        "stdout は空であるべき: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "stderr は空であるべき: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn non_git_review_emits_skipped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_str().expect("utf-8");
+    let output = cargo_bin()
+        .args(["review", "--dir", path, "--git"])
+        .output()
+        .expect("run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(json["skipped"]["reason"], "not_git_repository");
+    assert_eq!(json["skipped"]["source"], "git");
+    assert!(json["impact"]["changes"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn non_git_impact_hook_silent_exit_zero() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_str().expect("utf-8");
+    let output = cargo_bin()
+        .args(["impact", "--dir", path, "--git", "--hook"])
+        .output()
+        .expect("run");
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn non_git_context_empty_changes_with_skipped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_str().expect("utf-8");
+    let output = cargo_bin()
+        .args(["context", "--dir", path, "--git"])
+        .output()
+        .expect("run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert!(json["changes"].as_array().unwrap().is_empty());
+    assert_eq!(json["skipped"]["reason"], "not_git_repository");
+}
+
+#[test]
+fn non_git_dead_code_emits_skipped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_str().expect("utf-8");
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", path, "--git"])
+        .output()
+        .expect("run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert!(json["dead_symbols"].as_array().unwrap().is_empty());
+    assert_eq!(json["skipped"]["reason"], "not_git_repository");
+}
+
+#[test]
+fn non_git_cochange_emits_skipped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_str().expect("utf-8");
+    let output = cargo_bin()
+        .args(["cochange", "--dir", path, "--git"])
+        .output()
+        .expect("run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert!(json["entries"].as_array().unwrap().is_empty());
+    assert_eq!(json["skipped"]["reason"], "not_git_repository");
+}
+
+#[test]
+fn git_repo_invalid_base_still_errors() {
+    // 正常 repo (プロジェクト自身) で不正 base → exit 1 を維持 (R4)。
+    let output = cargo_bin()
+        .args([
+            "review",
+            "--dir",
+            ".",
+            "--git",
+            "--base",
+            "no-such-ref-xyz-astro",
+        ])
+        .output()
+        .expect("run");
+    assert!(!output.status.success(), "不正 base は exit 1 維持");
+}
+
+#[test]
+fn git_repo_dash_base_rejected() {
+    // 先頭 '-' の base は git 管理下でも入力契約違反で exit 1。
+    let output = cargo_bin()
+        .args(["review", "--dir", ".", "--git", "--base=-x"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(json["error"]["code"], "INVALID_REQUEST");
+}

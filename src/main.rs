@@ -380,14 +380,20 @@ fn run(cli: Cli) -> Result<()> {
             per_source_limit,
             author_unit_window_days,
         } => {
-            let source_files = astro_sight::commands::resolve_blame_source_files(
-                &dir,
-                git,
-                base.as_deref(),
-                paths.as_deref(),
-                paths_file.as_deref(),
-                &exclude_globs,
-            )?;
+            let (source_files, cochange_skip) =
+                match astro_sight::commands::resolve_blame_source_files(
+                    &dir,
+                    git,
+                    base.as_deref(),
+                    paths.as_deref(),
+                    paths_file.as_deref(),
+                    &exclude_globs,
+                )? {
+                    astro_sight::commands::BlameSourceResolution::Files(f) => (f, None),
+                    astro_sight::commands::BlameSourceResolution::Skipped(s) => {
+                        (Vec::new(), Some(s))
+                    }
+                };
             // 既定 true。`--include-merges` で旧挙動 (false) に戻す。
             // `--ignore-merges` は no-op として残しているが互換のため明示 ON も尊重する。
             let defaults = astro_sight::models::cochange::CoChangeOptions::default();
@@ -419,7 +425,7 @@ fn run(cli: Cli) -> Result<()> {
                 per_source_limit,
                 author_unit_window_days,
             };
-            cmd_cochange(&service, &dir, &opts, pretty)
+            cmd_cochange(&service, &dir, &opts, pretty, cochange_skip)
         }
         Commands::Context {
             dir,

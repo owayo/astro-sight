@@ -25,6 +25,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - **循環的複雑度** — symbols 出力に `cx`（cyclomatic complexity）を付加（関数/メソッドのみ、ベース1 + 分岐ノード数、ネスト関数/クロージャは除外）、言語別分岐ノード定義（Rust/JS/TS/Python/Go/Java/Kotlin/Ruby/PHP/C#等）
 - **設定ファイル** — `~/.config/astro-sight/config.toml`（TOML 形式、`astro-sight init` で生成、`log_path` 未指定時は config ファイル隣の `logs/`、明示指定時は同じ値でも尊重）
 - **ロギング** — logroller による日次ローテーション（ローカルタイムゾーン、3日保持）
+- **git 管理外ディレクトリの graceful skip** — `--git` を受けるコマンド（context / impact / review / dead-code / cochange）が git 管理外 dir で実行された場合、`git rev-parse --is-inside-work-tree`（`LC_ALL=C`）で事前判定し「解析対象なし」として **exit 0** で skip。`--hook`（review / impact）は完全無出力（silent skip）、通常 CLI は各結果型に `skipped: Option<SkipInfo>`（`reason="not_git_repository"` / `source="git"` / `message`）を付けた空結果を返し「差分なし」と「git 管理外」を区別可能にする。真のエラー（base 不正・git 実行不能・壊れた repo・権限）は従来どおり exit 1（fail-closed）。判定は `commands.rs` の `resolve_git_diff`（経路A: context/impact/review/dead-code）と `resolve_blame_source_files`→`BlameSourceResolution`（経路B: cochange、`--paths`/`--paths-file` 明示時は管理外でも明示分を尊重）に集約。impact は構造化 JSON 出力を持たないため skip も無出力 exit 0（既存の「差分なし」と一貫）
 
 ## Key Modules
 

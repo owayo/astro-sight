@@ -8,12 +8,13 @@ use crate::cache::store::CacheStore;
 use crate::doctor;
 use crate::engine::parser;
 use crate::error::{AstroError, ErrorCode};
-use crate::models::cochange::CoChangeOptions;
+use crate::models::cochange::{CoChangeOptions, CoChangeResult};
 use crate::models::dead_code::DeadCodeResult;
 use crate::models::review::{
     ApiChanges, ApiSymbol, ApiSymbolChange, DeadSymbol, MissingCochange, MovedSymbol,
     PropertyToFieldChange, ReviewResult,
 };
+use crate::models::skip::SkipInfo;
 use crate::service::{AppService, AstParams};
 
 // ---------------------------------------------------------------------------
@@ -490,7 +491,19 @@ pub fn cmd_cochange(
     dir: &str,
     opts: &CoChangeOptions,
     pretty: bool,
+    skipped: Option<SkipInfo>,
 ) -> Result<()> {
+    if let Some(skip) = skipped {
+        // git 管理外 (起点ファイル無し): 空の entries + skipped を返して exit 0。
+        let result = CoChangeResult {
+            entries: Vec::new(),
+            commits_analyzed: 0,
+            skipped: Some(skip),
+        };
+        let output = serialize_output(&result, pretty)?;
+        println!("{output}");
+        return Ok(());
+    }
     let result = service.analyze_cochange(dir, opts)?;
     let output = serialize_output(&result, pretty)?;
     info!(
@@ -518,6 +531,13 @@ pub fn cmd_cochange(
 /// diff から自動収集した起点ファイルに対してのみ適用する。`--paths` / `--paths-file`
 /// で明示指定された起点はユーザー意図を尊重してフィルタしない (lock ファイル等を
 /// 意図的に分析したいケースを想定)。
+/// `resolve_blame_source_files` の結果。起点ファイルが解決できたか、
+/// git 管理外 (かつ明示 `--paths` / `--paths-file` 無し) で skip かを型で表す。
+pub enum BlameSourceResolution {
+    Files(Vec<String>),
+    Skipped(SkipInfo),
+}
+
 pub fn resolve_blame_source_files(
     dir: &str,
     git: bool,
@@ -525,7 +545,7 @@ pub fn resolve_blame_source_files(
     paths: Option<&str>,
     paths_file: Option<&str>,
     user_exclude_globs: &[String],
-) -> Result<Vec<String>> {
+) -> Result<BlameSourceResolution> {
     use std::collections::BTreeSet;
 
     let mut set: BTreeSet<String> = BTreeSet::new();
@@ -544,6 +564,16 @@ pub fn resolve_blame_source_files(
         }
     }
     if git {
+        // git 管理外: 明示 --paths/--paths-file があればそれで続行、
+        // 無ければ graceful skip (既存の明示優先の優先順位を維持)。
+        if !is_git_work_tree(dir)? {
+            if set.is_empty() {
+                return Ok(BlameSourceResolution::Skipped(
+                    SkipInfo::not_git_repository(),
+                ));
+            }
+            return Ok(BlameSourceResolution::Files(set.into_iter().collect()));
+        }
         let base_rev = base.unwrap_or("HEAD~1");
         validate_git_revision(base_rev, "base")?;
         let output = std::process::Command::new("git")
@@ -584,7 +614,7 @@ pub fn resolve_blame_source_files(
             "blame mode requires source files: pass --git, --paths, or --paths-file".to_string(),
         ));
     }
-    Ok(set.into_iter().collect())
+    Ok(BlameSourceResolution::Files(set.into_iter().collect()))
 }
 
 /// `git diff` / `git show` に渡す revision を検証する。
@@ -611,6 +641,64 @@ fn validate_git_revision(rev: &str, arg_name: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// `--git` 入力解決の結果。diff が取れたか、git 管理外で skip かを型で表す。
+enum GitDiffInput {
+    Diff(String),
+    Skipped(SkipInfo),
+}
+
+/// `dir` が git worktree 内かを `git rev-parse --is-inside-work-tree` で判定する。
+///
+/// 管理外 (`not a git repository`) / worktree 外 (`is-inside-work-tree=false`) は
+/// `Ok(false)` (skip 対象)、壊れた repo / 権限不足 / git 実行不能などの本物の異常は
+/// `Err` (従来どおり `exit 1`)。`git diff` の stderr 解析ではなく事前判定にすることで
+/// worktree / submodule / bare repo に堅牢。`LC_ALL=C` で stderr 文言のロケール依存を
+/// 排除し `"not a git repository"` のマッチを安定させる。
+fn is_git_work_tree(dir: &str) -> Result<bool> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(dir)
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|e| {
+            AstroError::new(ErrorCode::InvalidRequest, format!("Failed to run git: {e}"))
+        })?;
+
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim() == "true");
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    if stderr.contains("not a git repository") {
+        return Ok(false);
+    }
+
+    // 壊れた repo / 権限など本物の異常は従来どおりエラー (fail-closed)。
+    Err(AstroError::new(
+        ErrorCode::InvalidRequest,
+        format!(
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )
+    .into())
+}
+
+/// 経路A (context / impact / review / dead-code) の git diff 入力解決。
+///
+/// git worktree 内なら diff を取得し `Diff`、管理外なら `Skipped` を返す。
+/// `base` 検証を worktree 判定より前に置くのは意図的: base が不正なら git 管理外
+/// でも `exit 1` にする (入力契約違反を skip より優先)。
+fn resolve_git_diff(dir: &str, base: &str, staged: bool) -> Result<GitDiffInput> {
+    validate_git_revision(base, "--base")?;
+
+    if !is_git_work_tree(dir)? {
+        return Ok(GitDiffInput::Skipped(SkipInfo::not_git_repository()));
+    }
+
+    run_git_diff(dir, base, staged).map(GitDiffInput::Diff)
 }
 
 pub fn run_git_diff(dir: &str, base: &str, staged: bool) -> Result<String> {
@@ -695,7 +783,18 @@ pub fn cmd_context(
     } else if let Some(df) = diff_file {
         read_file_to_string_limited(df, MAX_INPUT_SIZE)?
     } else if git {
-        run_git_diff(dir, base, staged)?
+        match resolve_git_diff(dir, base, staged)? {
+            GitDiffInput::Diff(s) => s,
+            GitDiffInput::Skipped(skip) => {
+                // git 管理外: 空の changes + skipped を返して exit 0。
+                let result = crate::models::impact::ContextResult {
+                    changes: Vec::new(),
+                    skipped: Some(skip),
+                };
+                println!("{}", serialize_output(&result, pretty)?);
+                return Ok(());
+            }
+        }
     } else {
         let stdin = std::io::stdin();
         read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?
@@ -765,7 +864,13 @@ pub fn cmd_impact(
     exclude_globs: &[String],
 ) -> Result<()> {
     let diff_input = if git {
-        run_git_diff(dir, base, staged)?
+        match resolve_git_diff(dir, base, staged)? {
+            GitDiffInput::Diff(s) => s,
+            // git 管理外: 既存の「差分なし」と同じく無出力で exit 0。
+            // impact は構造化 JSON 出力を持たず未解決 caller 検出時のみ stderr に
+            // 出力する設計のため、skipped JSON は出さない (hook の有無を問わず silent)。
+            GitDiffInput::Skipped(_) => return Ok(()),
+        }
     } else {
         let stdin = std::io::stdin();
         read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?
@@ -961,7 +1066,22 @@ pub fn cmd_review(
     } else if let Some(df) = diff_file {
         read_file_to_string_limited(df, MAX_INPUT_SIZE)?
     } else if git {
-        run_git_diff(dir, base, staged)?
+        match resolve_git_diff(dir, base, staged)? {
+            GitDiffInput::Diff(s) => s,
+            GitDiffInput::Skipped(skip) => {
+                // git 管理外: hook は完全 silent、通常は空結果 + skipped で exit 0。
+                if hook {
+                    return Ok(());
+                }
+                let result = ReviewResult {
+                    skipped: Some(skip),
+                    ..Default::default()
+                };
+                let output = serialize_output(&result, pretty)?;
+                println!("{output}");
+                return Ok(());
+            }
+        }
     } else {
         let stdin = std::io::stdin();
         read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?
@@ -4891,7 +5011,23 @@ pub fn cmd_dead_code(
             } else if let Some(df) = diff_file {
                 read_file_to_string_limited(df, MAX_INPUT_SIZE)?
             } else {
-                run_git_diff(dir, base, staged)?
+                // git 経路 (diff/diff_file なし + has_diff): 管理外なら
+                // 空の dead_symbols + skipped で exit 0。
+                match resolve_git_diff(dir, base, staged)? {
+                    GitDiffInput::Diff(s) => s,
+                    GitDiffInput::Skipped(skip) => {
+                        let result = DeadCodeResult {
+                            dir: canonical_dir.to_string_lossy().to_string(),
+                            scanned_files: 0,
+                            dead_symbols: Vec::new(),
+                            test_only_symbols: Vec::new(),
+                            skipped: Some(skip),
+                        };
+                        let output = serialize_output(&result, pretty)?;
+                        println!("{output}");
+                        return Ok(());
+                    }
+                }
             };
 
             if input.trim().is_empty() {
@@ -6624,6 +6760,93 @@ mod tests {
                 .expect("git commit")
                 .success()
         );
+    }
+
+    // --- git worktree 判定 & 非 git ディレクトリの graceful skip ---
+
+    #[test]
+    fn is_git_work_tree_true_inside_repo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_git_repo_for_test(dir.path());
+        assert!(
+            is_git_work_tree(dir.path().to_str().expect("utf-8")).expect("rev-parse"),
+            "git init 済み dir は worktree 内"
+        );
+    }
+
+    #[test]
+    fn is_git_work_tree_false_outside_repo() {
+        // git init しない一時 dir は管理外。
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            !is_git_work_tree(dir.path().to_str().expect("utf-8")).expect("rev-parse"),
+            "git 管理外 dir は Ok(false)"
+        );
+    }
+
+    #[test]
+    fn resolve_git_diff_skips_non_git_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        match resolve_git_diff(dir.path().to_str().expect("utf-8"), "HEAD", false).expect("resolve")
+        {
+            GitDiffInput::Skipped(skip) => {
+                assert_eq!(skip.reason.as_str(), "not_git_repository");
+                assert_eq!(skip.source.as_str(), "git");
+            }
+            GitDiffInput::Diff(_) => panic!("非 git dir では Skipped を返すべき"),
+        }
+    }
+
+    #[test]
+    fn resolve_git_diff_rejects_invalid_base_even_when_non_git() {
+        // base 不正は git 管理外でも入力契約違反として弾く (skip より優先)。
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            resolve_git_diff(dir.path().to_str().expect("utf-8"), "-x", false).is_err(),
+            "先頭 '-' の base は非 git でも Err"
+        );
+    }
+
+    #[test]
+    fn resolve_blame_source_files_skips_non_git_without_explicit_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        match resolve_blame_source_files(
+            dir.path().to_str().expect("utf-8"),
+            true,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("resolve")
+        {
+            BlameSourceResolution::Skipped(skip) => {
+                assert_eq!(skip.reason.as_str(), "not_git_repository");
+            }
+            BlameSourceResolution::Files(f) => panic!("非 git + 明示 paths 無しは Skipped: {f:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_blame_source_files_keeps_explicit_paths_when_non_git() {
+        // 管理外でも --paths 明示があれば skip せず明示分を返す (明示優先)。
+        let dir = tempfile::tempdir().expect("tempdir");
+        match resolve_blame_source_files(
+            dir.path().to_str().expect("utf-8"),
+            true,
+            None,
+            Some("a.rs,b.rs"),
+            None,
+            &[],
+        )
+        .expect("resolve")
+        {
+            BlameSourceResolution::Files(f) => {
+                assert!(f.contains(&"a.rs".to_string()));
+                assert!(f.contains(&"b.rs".to_string()));
+            }
+            BlameSourceResolution::Skipped(_) => panic!("明示 paths があれば skip しない"),
+        }
     }
 
     #[test]
@@ -11216,7 +11439,9 @@ bar() { echo bye; }\n";
             Some("laravel"),
             dir.path().to_str().expect("utf-8"),
         )
-        .expect("resolve");
+        .expect("resolve") else {
+            panic!("expected Files");
+        };
         // Laravel プリセットの代表 glob `**/app/Http/**` が含まれていることだけ確認する。
         assert!(globs.iter().any(|g| g.contains("Http")));
     }
@@ -11614,6 +11839,7 @@ def new_public_api():
         let result = ReviewResult {
             impact: crate::models::impact::ContextResult {
                 changes: Vec::new(),
+                skipped: None,
             },
             missing_cochanges: vec![MissingCochange {
                 file: "a.rs".to_string(),
@@ -11631,6 +11857,7 @@ def new_public_api():
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
+            skipped: None,
         };
 
         let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
@@ -11652,6 +11879,7 @@ def new_public_api():
         let result = ReviewResult {
             impact: crate::models::impact::ContextResult {
                 changes: Vec::new(),
+                skipped: None,
             },
             missing_cochanges: Vec::new(),
             api_changes: ApiChanges {
@@ -11669,6 +11897,7 @@ def new_public_api():
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
+            skipped: None,
         };
 
         let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
@@ -11687,6 +11916,7 @@ def new_public_api():
         let result = ReviewResult {
             impact: crate::models::impact::ContextResult {
                 changes: Vec::new(),
+                skipped: None,
             },
             missing_cochanges: Vec::new(),
             api_changes: ApiChanges {
@@ -11704,6 +11934,7 @@ def new_public_api():
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
+            skipped: None,
         };
 
         let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
@@ -11719,6 +11950,7 @@ def new_public_api():
         let result = ReviewResult {
             impact: crate::models::impact::ContextResult {
                 changes: Vec::new(),
+                skipped: None,
             },
             missing_cochanges: Vec::new(),
             api_changes: ApiChanges {
@@ -11738,6 +11970,7 @@ def new_public_api():
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
+            skipped: None,
         };
 
         let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
@@ -11776,6 +12009,7 @@ def new_public_api():
                     }],
                     low_confidence_callers: Vec::new(),
                 }],
+                skipped: None,
             },
             missing_cochanges: Vec::new(),
             api_changes: ApiChanges {
@@ -11789,6 +12023,7 @@ def new_public_api():
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
+            skipped: None,
         };
 
         let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
@@ -11849,6 +12084,7 @@ def new_public_api():
                     }],
                     low_confidence_callers: Vec::new(),
                 }],
+                skipped: None,
             },
             missing_cochanges: Vec::new(),
             api_changes: ApiChanges {
@@ -11862,6 +12098,7 @@ def new_public_api():
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
+            skipped: None,
         };
 
         let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
@@ -11916,6 +12153,7 @@ def new_public_api():
                     }],
                     low_confidence_callers: Vec::new(),
                 }],
+                skipped: None,
             },
             missing_cochanges: Vec::new(),
             api_changes: ApiChanges {
@@ -11929,6 +12167,7 @@ def new_public_api():
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
+            skipped: None,
         };
 
         let build = build_review_hook_json(&result, dir.path().to_str().unwrap());
@@ -11994,6 +12233,7 @@ def new_public_api():
                     }],
                     low_confidence_callers: Vec::new(),
                 }],
+                skipped: None,
             },
             missing_cochanges: Vec::new(),
             api_changes: ApiChanges {
@@ -12007,6 +12247,7 @@ def new_public_api():
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
+            skipped: None,
         };
 
         let build = build_review_hook_json(&result, dir.path().to_str().unwrap());
@@ -12280,7 +12521,7 @@ def new_public_api():
             "next",
         );
 
-        let result = resolve_blame_source_files(
+        let BlameSourceResolution::Files(result) = resolve_blame_source_files(
             repo.to_str().expect("utf-8 path"),
             true,
             Some("HEAD~1"),
@@ -12288,7 +12529,9 @@ def new_public_api():
             None,
             &[],
         )
-        .expect("resolve");
+        .expect("resolve") else {
+            panic!("expected Files");
+        };
 
         assert!(result.contains(&"foo.txt".to_string()), "got: {result:?}");
         assert!(
@@ -12314,7 +12557,7 @@ def new_public_api():
         init_git_repo_for_test(repo);
         git_commit_files(repo, &[("dummy.txt", "x")], "initial");
 
-        let result = resolve_blame_source_files(
+        let BlameSourceResolution::Files(result) = resolve_blame_source_files(
             repo.to_str().expect("utf-8 path"),
             false,
             None,
@@ -12322,7 +12565,9 @@ def new_public_api():
             None,
             &[],
         )
-        .expect("resolve");
+        .expect("resolve") else {
+            panic!("expected Files");
+        };
 
         assert!(result.contains(&"dist/main.js".to_string()));
         assert!(result.contains(&"Cargo.lock".to_string()));
@@ -12346,7 +12591,7 @@ def new_public_api():
             "next",
         );
 
-        let result = resolve_blame_source_files(
+        let BlameSourceResolution::Files(result) = resolve_blame_source_files(
             repo.to_str().expect("utf-8 path"),
             true,
             Some("HEAD~1"),
@@ -12354,7 +12599,9 @@ def new_public_api():
             None,
             &["generated/**".to_string()],
         )
-        .expect("resolve");
+        .expect("resolve") else {
+            panic!("expected Files");
+        };
 
         assert!(result.contains(&"foo.txt".to_string()));
         assert!(result.contains(&"legacy/keep.rs".to_string()));
