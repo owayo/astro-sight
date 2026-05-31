@@ -2133,9 +2133,21 @@ fn is_modified_closed_in_diff(
     // 通常は変更されず context 行に残る) ため除外し、実際の呼び出し参照のみを対象とする。
     // 呼び出し参照が 1 件も無ければ (import のみ / 呼び出しが diff 外にある可能性) closed
     // 扱いにせず blocking。
+    // 行頭テキスト判定 (ref_is_import_line) は複数行 grouped use ブロックの継続行
+    // (`    a, b, cmd_cochange, ...` のように `use ` で始まらない行) を拾えないため、
+    // AST ベースの import 行集合でも除外する。import/use 文内の参照は signature 変更に
+    // 追随する必要がない (api.mod 誤検出 2026-05-31: grouped use 継続行を未更新 caller と
+    // 誤判定して blocking していた問題への対応)。
+    let mut import_lines_cache: HashMap<String, HashSet<usize>> = HashMap::new();
     let call_refs: Vec<&crate::models::reference::SymbolReference> = refs
         .iter()
         .filter(|r| r.kind != Some(RefKind::Definition) && !ref_is_import_line(r))
+        .filter(|r| {
+            let import_lines = import_lines_cache
+                .entry(r.path.clone())
+                .or_insert_with(|| import_statement_lines_for_ref(dir, &r.path));
+            !import_lines.contains(&r.line)
+        })
         .collect();
     if call_refs.is_empty() {
         return false;
@@ -2172,6 +2184,36 @@ fn ref_is_import_line(r: &crate::models::reference::SymbolReference) -> bool {
                 || t.starts_with("from ")
         })
         .unwrap_or(false)
+}
+
+/// 参照ファイルの import/use 文が占める行集合 (0-indexed、`SymbolReference.line` と同基準)
+/// を tree-sitter AST から取得する。複数行 grouped use ブロックの継続行も含む。
+/// parse 不能 (lexer-only 言語 / 拡張子未対応 / 読み込み失敗) の場合は空集合を返し、
+/// 既存の除外挙動を変えない。
+fn import_statement_lines_for_ref(dir: &str, ref_path: &str) -> std::collections::HashSet<usize> {
+    use std::collections::HashSet;
+    let abs = if std::path::Path::new(ref_path).is_absolute() {
+        std::path::PathBuf::from(ref_path)
+    } else {
+        std::path::Path::new(dir).join(ref_path)
+    };
+    let Some(utf8) = camino::Utf8Path::from_path(&abs) else {
+        return HashSet::new();
+    };
+    let Ok(lang) = crate::language::LangId::from_path(utf8) else {
+        return HashSet::new();
+    };
+    // lexer-only 言語 (Xojo) は ts_language() が panic するため parse しない。
+    if lang.is_lexer_only() {
+        return HashSet::new();
+    }
+    let Ok(source) = parser::read_file(utf8) else {
+        return HashSet::new();
+    };
+    let Ok(tree) = parser::parse_source(&source, lang) else {
+        return HashSet::new();
+    };
+    crate::engine::imports::import_statement_lines(tree.root_node())
 }
 
 /// `git diff <base> -M -- <old_path> <new_path>` を解析し、new 側で実際に追加/変更された
@@ -5489,6 +5531,82 @@ mod tests {
         let err =
             validate_git_revision("HEAD\0foo", "--base").expect_err("NUL byte should be rejected");
         assert!(err.to_string().contains("must not contain NUL"));
+    }
+
+    /// 複数行 grouped use ブロックの継続行で import されたシンボルの signature 変更でも、
+    /// 呼び出し側を同一 diff で更新済みなら modified_closed_in_diff (informational) に
+    /// 降格される。grouped use 継続行 (`    a, changed_fn, b,`) を未更新 caller と誤判定して
+    /// blocking しないことを保証する (api.mod 誤検出 2026-05-31 の回帰防止)。
+    #[test]
+    fn detect_api_changes_modified_with_multiline_use_import_is_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        // 旧: changed_fn を複数行 grouped use で import し呼び出す caller。
+        git_commit_files(
+            repo,
+            &[
+                ("src/target.rs", "pub fn changed_fn() -> i32 {\n    1\n}\n"),
+                (
+                    "src/caller.rs",
+                    "use crate::target::{\n    changed_fn,\n    other_helper,\n};\n\npub fn other_helper() {}\n\npub fn run() {\n    let _ = changed_fn();\n}\n",
+                ),
+            ],
+            "initial",
+        );
+
+        // 新: changed_fn の signature 変更 + 呼び出し更新。grouped use 行は不変。
+        let src_dir = repo.join("src");
+        fs::write(
+            src_dir.join("target.rs"),
+            "pub fn changed_fn(x: i32) -> i32 {\n    x\n}\n",
+        )
+        .expect("write new target");
+        fs::write(
+            src_dir.join("caller.rs"),
+            "use crate::target::{\n    changed_fn,\n    other_helper,\n};\n\npub fn other_helper() {}\n\npub fn run() {\n    let _ = changed_fn(1);\n}\n",
+        )
+        .expect("write new caller");
+
+        let diff_files = vec![
+            crate::models::impact::DiffFile {
+                old_path: "src/target.rs".to_string(),
+                new_path: "src/target.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 3,
+                    new_start: 1,
+                    new_count: 3,
+                }],
+                deleted_old_source: None,
+            },
+            crate::models::impact::DiffFile {
+                old_path: "src/caller.rs".to_string(),
+                new_path: "src/caller.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 9,
+                    old_count: 1,
+                    new_start: 9,
+                    new_count: 1,
+                }],
+                deleted_old_source: None,
+            },
+        ];
+
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        assert!(
+            api.modified_closed_in_diff
+                .iter()
+                .any(|c| c.name == "changed_fn"),
+            "grouped use import + 呼び出し更新済みの signature 変更は mod_closed に降格すべき: {api:?}"
+        );
+        assert!(
+            !api.modified.iter().any(|c| c.name == "changed_fn"),
+            "changed_fn を blocking な modified に含めるべきでない: {:?}",
+            api.modified
+        );
     }
 
     #[test]

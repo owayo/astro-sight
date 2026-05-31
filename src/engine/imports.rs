@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::Result;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Query, QueryCursor};
@@ -54,6 +56,43 @@ pub fn extract_imports(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result
     }
 
     Ok(edges)
+}
+
+/// ファイル内の import/use 文が占める行 (0-indexed) の集合を返す。
+///
+/// 複数行 grouped use ブロック (`use foo::{\n  a,\n  b,\n};`) の継続行も含むため、
+/// 行頭テキスト判定では拾えない継続行のシンボル参照を import として識別できる。
+/// `is_modified_closed_in_diff` の closed 判定で「import 行の参照は signature 変更に
+/// 追随不要」と扱うために使う (api.mod 誤検出 2026-05-31 対応)。
+pub fn import_statement_lines(root: Node<'_>) -> HashSet<usize> {
+    let mut lines = HashSet::new();
+    collect_import_statement_lines(root, &mut lines);
+    lines
+}
+
+/// import 系ノードの行範囲を再帰的に集める。import 文の中はさらに潜らない。
+fn collect_import_statement_lines(node: Node<'_>, lines: &mut HashSet<usize>) {
+    // 宣言系のみ対象 (require()/@import 等の呼び出し式は実行コードなので除く)。
+    const IMPORT_STATEMENT_KINDS: &[&str] = &[
+        "use_declaration",
+        "import_statement",
+        "import_from_statement",
+        "import_declaration",
+        "namespace_use_declaration",
+        "using_directive",
+        "import_header",
+        "preproc_include",
+    ];
+    if IMPORT_STATEMENT_KINDS.contains(&node.kind()) {
+        for row in node.start_position().row..=node.end_position().row {
+            lines.insert(row);
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_import_statement_lines(child, lines);
+    }
 }
 
 /// import/use/include 文ノードまで上方走査する。
