@@ -1578,6 +1578,41 @@ fn refs_batch_names() {
     assert!(!second["refs"].as_array().unwrap().is_empty());
 }
 
+/// chunk サイズより多い名前でも、複数 chunk にまたがって入力 names 順の
+/// NDJSON 出力を維持することを検証（cmd_refs_batch の chunk 化回帰: 2026-05-31）。
+#[test]
+fn refs_batch_names_preserves_order_across_chunks() {
+    // ASTRO_SIGHT_REFS_BATCH_CHUNK=2 で 3 名前を chunk [A,B] / [C] に分割させ、
+    // chunk 境界をまたいでも入力順を保つことを確認する。
+    let output = cargo_bin()
+        .env("ASTRO_SIGHT_REFS_BATCH_CHUNK", "2")
+        .args([
+            "refs",
+            "--names",
+            "AppService,AstgenResponse,SymbolReference",
+            "--dir",
+            "src/",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let symbols: Vec<String> = stdout
+        .trim()
+        .lines()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            v["symbol"].as_str().unwrap().to_string()
+        })
+        .collect();
+    assert_eq!(
+        symbols,
+        vec!["AppService", "AstgenResponse", "SymbolReference"],
+        "chunk をまたいでも入力 names 順を維持すべき"
+    );
+}
+
 #[test]
 fn refs_name_or_names_required() {
     let output = cargo_bin()

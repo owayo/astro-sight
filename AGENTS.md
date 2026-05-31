@@ -10,7 +10,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - **BLAKE3** ベースのファイルキャッシュ（単一ファイル `ast` / `symbols` は内容ハッシュに canonical path を混ぜ、同一内容の別ファイルや別言語で `path` / `lang` が混線しない）
 - **clap derive** による CLI 引数パーサー
 - **NDJSON** ストリーミングセッション対応
-- **スマートコンテキスト**（diff→影響分析、関数シグネチャ変更は識別子境界で照合して prefix 名の別関数を誤検出しない、単一/バッチ参照検索は fold/reduce でピーク RSS を抑制、バッチ参照検索 O(N+S)）
+- **スマートコンテキスト**（diff→影響分析、関数シグネチャ変更は識別子境界で照合して prefix 名の別関数を誤検出しない、単一/バッチ参照検索は fold/reduce でピーク RSS を抑制、バッチ参照検索 O(N+S)、CLI の `refs --names` は名前を chunk 単位でまとめて走査=既定 64・`ASTRO_SIGHT_REFS_BATCH_CHUNK` で調整、ディレクトリ走査が名前数倍に退化するのを回避）
 - **AST 応答の巨大行抑制**（`ast` の `text` / `snippet` は 256 文字上限で切り詰め、巨大行で応答が肥大化しない）
 - **MCP サーバーモード**（rmcp 1.7 による stdio JSON-RPC 2.0、ワークスペースサンドボックス、11 ツール）
 - **デフォルト compact JSON** 出力（`--pretty` で整形出力）
@@ -24,7 +24,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - **API 差分検出 (api.add / api.rm / api.mod)** — bin-only Rust crate (`src/lib.rs` なし & `Cargo.toml` の `[lib]` セクションなし) の `pub fn` 追加・削除・シグネチャ変更は外部公開 API ではないため API 差分から除外。`api.rm` 経路は base リビジョン側の `Cargo.toml` / `src/lib.rs` を `git show` で取得して判定し、新ツリーで `src/lib.rs` を削除した同時 diff でも旧公開 API の削除は誤抑制しない
 - **循環的複雑度** — symbols 出力に `cx`（cyclomatic complexity）を付加（関数/メソッドのみ、ベース1 + 分岐ノード数、ネスト関数/クロージャは除外）、言語別分岐ノード定義（Rust/JS/TS/Python/Go/Java/Kotlin/Ruby/PHP/C#等）
 - **設定ファイル** — `~/.config/astro-sight/config.toml`（TOML 形式、`astro-sight init` で生成、`log_path` 未指定時は config ファイル隣の `logs/`、明示指定時は同じ値でも尊重）
-- **ロギング** — logroller による日次ローテーション（ローカルタイムゾーン、3日保持）
+- **ロギング** — logroller による日次ローテーション（ローカルタイムゾーン、3日保持）。debug 時のログ初期化失敗（書込不可ディレクトリ等）は警告に留めて解析本体は継続する（read-only 環境などへの堅牢化）
 - **git 管理外ディレクトリの graceful skip** — `--git` を受けるコマンド（context / impact / review / dead-code / cochange）が git 管理外 dir で実行された場合、`git rev-parse --is-inside-work-tree`（`LC_ALL=C`）で事前判定し「解析対象なし」として **exit 0** で skip。`--hook`（review / impact）は完全無出力（silent skip）、通常 CLI は各結果型に `skipped: Option<SkipInfo>`（`reason="not_git_repository"` / `source="git"` / `message`）を付けた空結果を返し「差分なし」と「git 管理外」を区別可能にする。真のエラー（base 不正・git 実行不能・壊れた repo・権限）は従来どおり exit 1（fail-closed）。判定は `commands.rs` の `resolve_git_diff`（経路A: context/impact/review/dead-code）と `resolve_blame_source_files`→`BlameSourceResolution`（経路B: cochange、`--paths`/`--paths-file` 明示時は管理外でも明示分を尊重）に集約。impact は構造化 JSON 出力を持たないため skip も無出力 exit 0（既存の「差分なし」と一貫）
 
 ## Key Modules
@@ -40,10 +40,10 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/engine/extractor.rs` - AST ノード抽出
 - `src/engine/symbols.rs` - シンボル抽出（tree-sitter クエリ）+ スコープ判定（is_local_scope_symbol, is_symbol_exported）+ 循環的複雑度（calculate_complexity）+ Python フレームワーク entrypoint デコレータ判定（has_framework_entrypoint_decorator_python）+ Python クラス base 抽出（python_class_base_names）+ Angular ライフサイクルフック判定（is_js_ts_angular_lifecycle_hook: `@Component` / `@Directive` 装飾クラスのメソッドのみ true）
 - `src/engine/calls.rs` - コールグラフ抽出（言語別 call expression クエリ）
-- `src/engine/refs.rs` - クロスファイル参照検索（ignore + rayon 並列 + fold/reduce 集約 + memchr/memmem 事前フィルタ + Aho-Corasick バッチ検索 + `collect_files` pub ユーティリティ）、lexer-only 言語 (Xojo) は `find_refs_via_lexer` / `find_refs_batch_via_lexer` 経由で identifier 走査、行コンテキスト抽出は `memchr` で該当行のみ UTF-8 変換
+- `src/engine/refs.rs` - クロスファイル参照検索（ignore + rayon 並列 + fold/reduce 集約 + memchr/memmem 事前フィルタ + Aho-Corasick バッチ検索 + `collect_files` pub ユーティリティ）、lexer-only 言語 (Xojo) は `find_refs_via_lexer` / `find_refs_batch_via_lexer` 経由で identifier 走査、行コンテキスト抽出は `memchr` で該当行のみ UTF-8 変換（tree-sitter 経路の `extract_line_context` と lexer 経路の `extract_line_context_bytes` はともに 256B 上限で巨大行を切り詰め）
 - `src/engine/lexer.rs` - 手書き state machine による未サポート言語向け fallback。`LexerProfile` でキーワード/コメント/文字列区切り/定義 keyword を宣言し、`extract_symbols` と `find_identifier_refs` を提供する。Xojo profile を内蔵
 - `src/engine/diff.rs` - unified diff パーサー
-- `src/engine/impact/mod.rs` - 影響分析オーケストレーター（CI 言語のみの diff は Pass1 前に skip、通常は 3パス方式: collect affected → stream refs → assemble）、`ParsedFile` キャッシュは `SourceBuf` を直接保持し mmap ゼロコピー経路を維持
+- `src/engine/impact/mod.rs` - 影響分析オーケストレーター（CI 言語のみの diff は Pass1 前に skip、通常は 3パス方式: collect affected → stream refs → assemble）、`ParsedFile` キャッシュは `SourceBuf` を直接保持し mmap ゼロコピー経路を維持。affected 判定（`find_affected_symbols` / `symbol_overlaps_hunks`）は `range.end.line` を包含的に扱い、単一行シンボル（`start==end`）や複数行シンボルの最終行のみの変更も取りこぼさない（ゼロ幅 hunk = pure-delete は隣接行削除の過検出を避けるため半開区間を維持、pure-add の全体カバー判定は `hunk_end > sym_end`）
 - `src/engine/impact/signature.rs` - diff の `+` / `-` 行から関数シグネチャ変更を検出（識別子境界で照合し、`foo` と `foo_bar` のような prefix 名を混同しない）
 - `src/engine/sequence.rs` - コールグラフから Mermaid シーケンス図を生成
 - `src/engine/imports.rs` - ファイル間の import/export 関係を抽出（言語別 tree-sitter クエリ）
