@@ -2645,6 +2645,9 @@ pub(crate) fn detect_dead_symbols_from_files(
     // (original_name, kind, file, lang_id) — case-insensitive 言語では lang_id で
     // シンボル名を正規化した比較を行うため lang も保持する。
     let mut all_syms: Vec<(String, String, String, crate::language::LangId)> = Vec::new();
+    // C/C++ の追加 liveness 情報 (file, シンボル名, 追加名リスト, lang)。
+    // enum→列挙子名 / typedef tag→alias 名。後で正規化して liveness_aliases に変換する。
+    let mut liveness_raw: Vec<(String, String, Vec<String>, crate::language::LangId)> = Vec::new();
     for path in files {
         // canonicalize で削除済みファイルをスキップ、dir 外のパスも除外
         let canonical_path = match std::fs::canonicalize(path) {
@@ -2672,6 +2675,17 @@ pub(crate) fn detect_dead_symbols_from_files(
                 all_syms.push((name, kind, rel.clone(), lang));
             }
         }
+        // C/C++ では enum の列挙子・typedef alias を liveness 補助名として集める。
+        // enum 型名が直接使われなくても列挙子が使われていれば live、body あり typedef tag が
+        // alias 名でのみ使われていても live と判定するために使う (Issue #11/#12)。
+        if matches!(
+            lang,
+            crate::language::LangId::C | crate::language::LangId::Cpp
+        ) {
+            for (sym, extras) in collect_cpp_liveness_for_file(dir, &rel, lang) {
+                liveness_raw.push((rel.clone(), sym, extras, lang));
+            }
+        }
     }
 
     if all_syms.is_empty() {
@@ -2694,15 +2708,39 @@ pub(crate) fn detect_dead_symbols_from_files(
         *name_counts.entry(norm_bare(*lang, name)).or_default() += 1;
     }
 
+    // C/C++ の (file, 正規化シンボル名) → 追加 liveness 名 (正規化済み) を構築。
+    // enum 候補は列挙子名、typedef tag 候補は alias 名を介した参照でも live と判定する。
+    let mut liveness_aliases: std::collections::HashMap<(String, String), Vec<String>> =
+        std::collections::HashMap::new();
+    for (file, sym, extras, lang) in &liveness_raw {
+        let key = norm_bare(*lang, sym);
+        let extra_keys: Vec<String> = extras.iter().map(|e| norm_bare(*lang, e)).collect();
+        liveness_aliases
+            .entry((file.clone(), key))
+            .or_default()
+            .extend(extra_keys);
+    }
+
     // 全シンボル名の非 Definition 参照件数をカウント（SymbolReference を確保しない）。
     // 入力も正規化済みキーで渡し、refs 側の HashMap キーと lookup を一致させる。
+    // liveness 補助名 (列挙子 / alias) も検索対象に含め、enum/tag の生存判定に使う。
     let unique_names: Vec<String> = {
         let mut seen = HashSet::new();
-        all_syms
-            .iter()
-            .map(|(name, _, _, lang)| norm_bare(*lang, name))
-            .filter(|n| seen.insert(n.clone()))
-            .collect()
+        let mut names = Vec::new();
+        for (name, _, _, lang) in &all_syms {
+            let k = norm_bare(*lang, name);
+            if seen.insert(k.clone()) {
+                names.push(k);
+            }
+        }
+        for extras in liveness_aliases.values() {
+            for ek in extras {
+                if seen.insert(ek.clone()) {
+                    names.push(ek.clone());
+                }
+            }
+        }
+        names
     };
 
     // production / test 別に refs カウント。test/ 配下のみで参照されるシンボルは
@@ -2745,7 +2783,18 @@ pub(crate) fn detect_dead_symbols_from_files(
             continue;
         }
 
-        let (prod_cnt, test_cnt) = counts.get(&key).copied().unwrap_or((0, 0));
+        let (mut prod_cnt, mut test_cnt) = counts.get(&key).copied().unwrap_or((0, 0));
+        // C/C++ の enum 列挙子 / typedef alias 経由の参照も合算する。enum 型名が直接
+        // 使われなくても列挙子が使われていれば live、body あり typedef tag が alias 名でのみ
+        // 使われていても live と判定する (Issue #11/#12)。
+        if let Some(extra_keys) = liveness_aliases.get(&(file.clone(), key.clone())) {
+            for ek in extra_keys {
+                if let Some((p, t)) = counts.get(ek) {
+                    prod_cnt += p;
+                    test_cnt += t;
+                }
+            }
+        }
         if prod_cnt > 0 {
             continue;
         }
@@ -2795,6 +2844,27 @@ pub(crate) fn detect_dead_symbols_from_files(
     }
 
     (dead, test_only)
+}
+
+/// C/C++ ファイルをパースし、dead-code liveness 補助情報 (enum→列挙子 / typedef tag→alias) を返す。
+/// `detect_dead_symbols_from_files` で enum / typedef tag の生存判定を補強するために使う。
+fn collect_cpp_liveness_for_file(
+    dir: &str,
+    rel: &str,
+    lang: crate::language::LangId,
+) -> Vec<(String, Vec<String>)> {
+    let full = std::path::Path::new(dir).join(rel);
+    let Some(full_str) = full.to_str() else {
+        return Vec::new();
+    };
+    let utf8 = camino::Utf8Path::new(full_str);
+    let Ok(source) = parser::read_file(utf8) else {
+        return Vec::new();
+    };
+    let Ok(tree) = parser::parse_source(&source, lang) else {
+        return Vec::new();
+    };
+    crate::engine::symbols::collect_cpp_dead_liveness_aliases(tree.root_node(), &source, lang)
 }
 
 /// テストディレクトリとみなすセグメント名一覧。
@@ -9121,6 +9191,99 @@ export class SampleComponent {
         assert!(
             names.contains(&"UnusedDefined"),
             "本体を持つ未使用 struct UnusedDefined は dead として検出されるべき: {names:?}"
+        );
+    }
+
+    /// C/C++ の enum は、型名が直接使われなくても列挙子のいずれかが参照されていれば live と
+    /// 判定する。body あり typedef tag も alias 名経由の参照で live と判定する。列挙子も alias も
+    /// 未使用なら dead として検出される (Issue #12 enumerator liveness / Issue #11 typedef alias)。
+    #[test]
+    fn detect_dead_cpp_enum_enumerator_and_typedef_alias_liveness() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let header = "enum StdAgentSatus { POST_WORK = 1, LOGOFF = 10 };\n\
+enum UnusedEnum { UE_A = 1, UE_B = 2 };\n\
+typedef struct st_local { int v; } LocalAlias;\n\
+typedef struct st_unused { int w; } UnusedAlias;\n";
+        let main_cpp = "#include \"svc.h\"\n\
+int useThem() {\n\
+    int x = LOGOFF;\n\
+    LocalAlias la;\n\
+    la.v = 1;\n\
+    return x + la.v;\n\
+}\n";
+        git_commit_files(
+            repo,
+            &[("svc.h", header), ("main.cpp", main_cpp)],
+            "initial",
+        );
+
+        let files = vec![repo.join("svc.h"), repo.join("main.cpp")];
+        let (dead, _test_only) =
+            detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
+        let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+
+        assert!(
+            !names.contains(&"StdAgentSatus"),
+            "列挙子 LOGOFF が使用中の enum StdAgentSatus は dead に出さない: {names:?}"
+        );
+        assert!(
+            !names.contains(&"st_local"),
+            "alias LocalAlias が使用中の typedef tag st_local は dead に出さない: {names:?}"
+        );
+        assert!(
+            names.contains(&"UnusedEnum"),
+            "列挙子も未使用の enum UnusedEnum は dead として検出されるべき: {names:?}"
+        );
+        assert!(
+            names.contains(&"st_unused"),
+            "alias 未使用の typedef tag st_unused は dead として検出されるべき: {names:?}"
+        );
+    }
+
+    /// codex 指摘の回帰: (1) typedef の配列長式で参照される列挙子は def 誤判定されず enum が
+    /// live、(2) 複数 declarator (`typedef S A, *B;`) のいずれかの alias 使用で underlying tag が
+    /// live と判定される (Issue #11/#12)。
+    #[test]
+    fn detect_dead_cpp_typedef_array_size_and_multiple_declarators() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let header = "enum Sz { SZ_VAL = 4 };\n\
+typedef int IntArr[SZ_VAL];\n\
+typedef struct st_multi { int v; } MultiA, *MultiBPtr;\n\
+typedef struct st_solo { int w; } SoloAlias;\n";
+        let main_cpp = "#include \"svc.h\"\n\
+IntArr g_arr;\n\
+int useMulti() {\n\
+    MultiBPtr p = nullptr;\n\
+    return p ? 1 : 0;\n\
+}\n";
+        git_commit_files(
+            repo,
+            &[("svc.h", header), ("main.cpp", main_cpp)],
+            "initial",
+        );
+
+        let files = vec![repo.join("svc.h"), repo.join("main.cpp")];
+        let (dead, _test_only) =
+            detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
+        let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+
+        assert!(
+            !names.contains(&"Sz"),
+            "typedef 配列長 IntArr[SZ_VAL] で参照される列挙子の enum Sz は live: {names:?}"
+        );
+        assert!(
+            !names.contains(&"st_multi"),
+            "複数 declarator の 2 番目 alias MultiBPtr 使用で st_multi は live: {names:?}"
+        );
+        assert!(
+            names.contains(&"st_solo"),
+            "alias SoloAlias 未使用の st_solo は dead として検出されるべき: {names:?}"
         );
     }
 

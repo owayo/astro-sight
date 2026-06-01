@@ -618,6 +618,16 @@ fn is_definition_context(node: Node<'_>, definition_kinds: &[&str], lang_id: Lan
         return is_zig_definition_context(node, definition_kinds);
     }
 
+    // C/C++: type_definition の declarator と enumerator の name のみを Definition とみなす。
+    // typedef の元型 (`typedef MYSQL MyConn;` の MYSQL) や enumerator の value 式内の識別子
+    // (`FOO = BAR` の BAR) は参照として扱う。これにより enumerator / typedef alias の宣言行を
+    // 参照と二重計上せず、宣言名経由の liveness 判定 (Issue #11/#12) を成立させる。
+    if matches!(lang_id, LangId::C | LangId::Cpp)
+        && let Some(is_def) = cpp_typedef_enum_definition_context(node)
+    {
+        return is_def;
+    }
+
     if let Some(parent) = node.parent() {
         // 親ノードが定義ノードかチェック
         if definition_kinds.contains(&parent.kind()) {
@@ -631,6 +641,79 @@ fn is_definition_context(node: Node<'_>, definition_kinds: &[&str], lang_id: Lan
         }
     }
     false
+}
+
+/// C/C++ の type_definition / enumerator に属する識別子の Definition 判定。
+///
+/// - `type_definition` の `declarator` フィールド (typedef alias 名) → Definition
+/// - `enumerator` の `name` フィールド (列挙子名) → Definition
+/// - 上記以外 (typedef の元型、enumerator の value 式内識別子) → 参照 (Some(false))
+/// - type_definition / enumerator のいずれにも属さない → None (汎用判定へ委譲)
+///
+/// enumerator / typedef alias の宣言行を参照と二重計上せず、かつ宣言名 (列挙子名 / alias 名)
+/// 経由の参照を liveness 判定に使えるようにするために使う (Issue #11/#12)。
+fn cpp_typedef_enum_definition_context(node: Node<'_>) -> Option<bool> {
+    let mut cur = node;
+    while let Some(parent) = cur.parent() {
+        match parent.kind() {
+            "type_definition" => {
+                // 全 declarator の alias 名 leaf を集め、node がそのいずれかと一致すれば
+                // Definition。`typedef int (*H)(MYSQL);` の MYSQL (元型参照) や複数 declarator
+                // (`typedef S A, *B;`) も正しく扱い、declarator 配下の型参照は Reference に倒す
+                // (codex 指摘 1/2)。
+                let is_alias = typedef_alias_name_nodes(parent)
+                    .iter()
+                    .any(|leaf| leaf.id() == node.id());
+                return Some(is_alias);
+            }
+            "enumerator" => {
+                let is_name = parent
+                    .child_by_field_name("name")
+                    .is_some_and(|n| n.id() == node.id());
+                return Some(is_name);
+            }
+            // 型/関数の境界に達したら type_definition / enumerator の外。
+            "function_definition"
+            | "struct_specifier"
+            | "class_specifier"
+            | "union_specifier"
+            | "enum_specifier"
+            | "field_declaration_list"
+            | "compound_statement"
+            | "translation_unit"
+            | "preproc_def" => {
+                return None;
+            }
+            _ => {}
+        }
+        cur = parent;
+    }
+    None
+}
+
+/// type_definition の全 declarator フィールドから alias 名の leaf ノードを集める。
+/// `typedef struct S {} A, *B;` のように複数 declarator がある場合は全 alias 名を返す。
+fn typedef_alias_name_nodes<'a>(type_definition: Node<'a>) -> Vec<Node<'a>> {
+    let mut leaves = Vec::new();
+    let mut cursor = type_definition.walk();
+    for decl in type_definition.children_by_field_name("declarator", &mut cursor) {
+        if let Some(leaf) = typedef_declarator_leaf(decl) {
+            leaves.push(leaf);
+        }
+    }
+    leaves
+}
+
+/// declarator (type_identifier / pointer_declarator / function_declarator 等) から
+/// alias 名の leaf identifier を取り出す。pointer/array/function declarator を剥がして
+/// 最終的な名前ノードを返す。
+fn typedef_declarator_leaf(decl: Node<'_>) -> Option<Node<'_>> {
+    match decl.kind() {
+        "type_identifier" | "identifier" => Some(decl),
+        _ => decl
+            .child_by_field_name("declarator")
+            .and_then(typedef_declarator_leaf),
+    }
 }
 
 /// JS/TS/TSX: 識別子が「宣言の `name` フィールド」であるときだけ `Definition` とみなす。

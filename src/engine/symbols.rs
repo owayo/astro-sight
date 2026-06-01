@@ -1351,6 +1351,110 @@ fn cpp_specifier_has_body(specifier: Node) -> bool {
     false
 }
 
+/// C/C++ の dead-code liveness 補助情報を集める。
+///
+/// `(シンボル名, 追加 liveness 名のリスト)` を返す。dead 候補の生存判定で、元のシンボル名に
+/// 加えてこれらの追加名のいずれかが参照されていれば live とみなすために使う (Issue #11/#12)。
+///
+/// - enum 型: enum 名 → 列挙子名のリスト (列挙子のいずれかが参照されていれば enum は live)
+/// - typedef struct/union/enum: underlying tag 名 → alias 名 (alias が参照されていれば tag は live)
+pub(crate) fn collect_cpp_dead_liveness_aliases(
+    root: Node<'_>,
+    source: &[u8],
+    lang_id: LangId,
+) -> Vec<(String, Vec<String>)> {
+    if !matches!(lang_id, LangId::C | LangId::Cpp) {
+        return Vec::new();
+    }
+    let mut result = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "enum_specifier" => {
+                if let Some(name_node) = node.child_by_field_name("name")
+                    && let Ok(enum_name) = name_node.utf8_text(source)
+                {
+                    let enumerators = collect_cpp_enumerator_names(node, source);
+                    if !enumerators.is_empty() {
+                        result.push((enum_name.to_string(), enumerators));
+                    }
+                }
+            }
+            "type_definition" => {
+                if let Some(pair) = extract_cpp_typedef_tag_aliases(node, source) {
+                    result.push(pair);
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    result
+}
+
+/// enum_specifier の body から列挙子名を集める。
+fn collect_cpp_enumerator_names(enum_specifier: Node<'_>, source: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    let Some(body) = enum_specifier.child_by_field_name("body") else {
+        return names;
+    };
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        if child.kind() == "enumerator"
+            && let Some(name_node) = child.child_by_field_name("name")
+            && let Ok(n) = name_node.utf8_text(source)
+        {
+            names.push(n.to_string());
+        }
+    }
+    names
+}
+
+/// type_definition から `(underlying tag 名, alias 名リスト)` を抽出する。
+/// type フィールドが struct/union/enum specifier で name (tag) を持つ場合のみ Some。
+fn extract_cpp_typedef_tag_aliases(
+    type_definition: Node<'_>,
+    source: &[u8],
+) -> Option<(String, Vec<String>)> {
+    let type_node = type_definition.child_by_field_name("type")?;
+    if !matches!(
+        type_node.kind(),
+        "struct_specifier" | "union_specifier" | "enum_specifier"
+    ) {
+        return None;
+    }
+    let tag_name = type_node
+        .child_by_field_name("name")?
+        .utf8_text(source)
+        .ok()?
+        .to_string();
+    // 複数 declarator (`typedef struct S {} A, *B;`) の全 alias 名を集める (codex 指摘 2)。
+    let mut aliases = Vec::new();
+    let mut cursor = type_definition.walk();
+    for decl in type_definition.children_by_field_name("declarator", &mut cursor) {
+        if let Some(alias) = cpp_declarator_name(decl, source) {
+            aliases.push(alias);
+        }
+    }
+    if aliases.is_empty() {
+        return None;
+    }
+    Some((tag_name, aliases))
+}
+
+/// typedef の declarator から alias 名を取り出す (pointer/array declarator を剥がす)。
+fn cpp_declarator_name(decl: Node<'_>, source: &[u8]) -> Option<String> {
+    match decl.kind() {
+        "type_identifier" | "identifier" => decl.utf8_text(source).ok().map(|s| s.to_string()),
+        _ => decl
+            .child_by_field_name("declarator")
+            .and_then(|d| cpp_declarator_name(d, source)),
+    }
+}
+
 /// JS/TS: ノードが関数本体（親が関数系ノードの statement_block）かどうかを判定する。
 fn is_js_function_body(node: Node) -> bool {
     if node.kind() != "statement_block" {
