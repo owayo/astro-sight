@@ -1270,6 +1270,36 @@ pub(crate) fn is_trait_impl_method_rust(root: Node, symbol_range: &Range) -> boo
     false
 }
 
+/// C/C++ で、実関数の本体ブロック (compound_statement) の内側にネストして出現する
+/// function_definition かどうかを判定する。
+///
+/// tree-sitter-cpp はマクロ呼び出し `BOOST_FOREACH(...) { ... }` 等を function_definition
+/// として誤パースすることがあり、それらは実関数 body の内側に偽の関数定義として現れる。
+/// トップレベル / namespace / class・struct 直下の本物の定義は、祖先が translation_unit /
+/// declaration_list / field_declaration_list であって compound_statement ではないため
+/// false を返す。GNU C の nested function を見逃す程度の false negative は許容する。
+pub(crate) fn is_cpp_nested_function(root: Node, symbol_range: &Range) -> bool {
+    let start = tree_sitter::Point {
+        row: symbol_range.start.line,
+        column: symbol_range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: symbol_range.end.line,
+        column: symbol_range.end.column,
+    };
+    let Some(node) = root.descendant_for_point_range(start, end) else {
+        return false;
+    };
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if p.kind() == "compound_statement" {
+            return true;
+        }
+        parent = p.parent();
+    }
+    false
+}
+
 /// JS/TS: ノードが関数本体（親が関数系ノードの statement_block）かどうかを判定する。
 fn is_js_function_body(node: Node) -> bool {
     if node.kind() != "statement_block" {

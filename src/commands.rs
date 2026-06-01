@@ -1907,6 +1907,21 @@ fn detect_api_changes(
             .map(|(name, kind, sig)| (name.as_str(), (kind.as_str(), sig.as_str())))
             .collect();
 
+        // 同名シンボルが旧/新いずれかに複数存在する場合、HashMap<name, sig> は最後の 1 件しか
+        // 保持できず、別のオーバーロードや誤パースされた定義同士を突き合わせて api.mod を
+        // 誤検出する。出現回数を数え、複数あるシンボルは曖昧として modified 判定から除外する
+        // (Issue #13: C++ overload / マクロ誤パースの api.mod 誤検出対策)。
+        let mut old_name_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for (name, _, _) in &old_syms {
+            *old_name_counts.entry(name.as_str()).or_default() += 1;
+        }
+        let mut new_name_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for (name, _, _) in &new_syms {
+            *new_name_counts.entry(name.as_str()).or_default() += 1;
+        }
+
         // 新ファイル内の call 先名を集める。同一ファイル内から呼ばれている新規関数は
         // 「内部ヘルパー」として api.add から除外する（Bash スクリプトのトップレベル関数や
         // Python の同一ファイル内で接続済みの private 関数が api.add に出る誤検出対策）。
@@ -2029,6 +2044,13 @@ fn detect_api_changes(
                 && seen_modified.insert((df.new_path.clone(), name.clone()))
             {
                 if skip_mod_for_binary_crate {
+                    continue;
+                }
+                // 同名が旧/新いずれかに複数あるシンボルは、別の定義同士を突き合わせている
+                // 可能性があり曖昧なので modified から除外する (Issue #13)。
+                if old_name_counts.get(name.as_str()).copied().unwrap_or(0) > 1
+                    || new_name_counts.get(name.as_str()).copied().unwrap_or(0) > 1
+                {
                     continue;
                 }
                 // closed-in-diff: 同一ファイル内でしか呼ばれていない関数のシグネチャ変更は
@@ -3729,6 +3751,19 @@ fn filter_exported_symbols(
         // pub(crate), pub(super) 等はクレート内部APIなので除外
         let decl_line = lines.get(sym.range.start.line).unwrap_or(&"").trim();
         if decl_line.contains("pub(") {
+            continue;
+        }
+        // C/C++ で実関数 body 内にネストした function_definition は、tree-sitter-cpp が
+        // マクロ呼び出し (BOOST_FOREACH 等) を関数定義と誤パースした結果であることが多い。
+        // 本物のトップレベル関数 / クラスメソッドではないため dead-code / API 変更検出の
+        // どちらでも exported シンボルから除外する
+        // (Issue #13: api_changes.modified が差分外の BOOST_FOREACH を拾う誤検出対策)。
+        if matches!(
+            lang_id,
+            crate::language::LangId::C | crate::language::LangId::Cpp
+        ) && matches!(sym.kind, SymbolKind::Function | SymbolKind::Method)
+            && crate::engine::symbols::is_cpp_nested_function(root, &sym.range)
+        {
             continue;
         }
         // Rust の `impl Trait for Type` 配下のメソッドは除外する。
@@ -5783,6 +5818,177 @@ mod tests {
                 .unwrap_or(false),
             "new_signature は追加された options 引数を含むべき: {:?}",
             foo_change.new_signature
+        );
+    }
+
+    /// C++ のマクロ呼び出し `BOOST_FOREACH(...) { ... }` は tree-sitter-cpp が関数定義として
+    /// 誤パースし、実関数 body 内にネストした偽の function_definition として現れる。引数列が
+    /// 変わっても api.mod に出してはならない
+    /// (Issue #13: 差分外の BOOST_FOREACH を api_changes.modified に拾う誤検出対策)。
+    #[test]
+    fn detect_api_changes_cpp_nested_macro_call_not_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let src_dir = repo.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+
+        let before = "void CallInfoManager::Process() {\n    BOOST_FOREACH( const TYPE_CALL_MAP::value_type info, call_inf_map ) {\n        use_it(info.szMyNum);\n    }\n}\n";
+        fs::write(src_dir.join("CallInfoManager.cpp"), before).expect("write before");
+        assert!(
+            Command::new("git")
+                .args(["add", "src/CallInfoManager.cpp"])
+                .current_dir(repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+
+        // BOOST_FOREACH の引数を `call_inf_map` → `this->call_inf_map` に変更しただけ。
+        let after = "void CallInfoManager::Process() {\n    BOOST_FOREACH (const TYPE_CALL_MAP::value_type info, this->call_inf_map) {\n        use_it(info.szMyNum);\n    }\n}\n";
+        fs::write(src_dir.join("CallInfoManager.cpp"), after).expect("write after");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/CallInfoManager.cpp".to_string(),
+            new_path: "src/CallInfoManager.cpp".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 5,
+                new_start: 1,
+                new_count: 5,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        assert!(
+            !api_changes
+                .modified
+                .iter()
+                .any(|c| c.name == "BOOST_FOREACH"),
+            "BOOST_FOREACH (マクロ誤パース) を api.mod に出すべきではない: {:?}",
+            api_changes.modified
+        );
+    }
+
+    /// C++ のオーバーロード (同名・異シグネチャ) は HashMap<name, sig> で最後の 1 件しか
+    /// 残らず、別オーバーロード同士を突き合わせる危険がある。同名が複数あるシンボルは曖昧
+    /// として api.mod から除外する (Issue #13)。
+    #[test]
+    fn detect_api_changes_cpp_overload_excluded_from_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let src_dir = repo.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+
+        let before =
+            "int compute(int x) {\n    return x;\n}\nint compute(double x) {\n    return 0;\n}\n";
+        fs::write(src_dir.join("calc.cpp"), before).expect("write before");
+        assert!(
+            Command::new("git")
+                .args(["add", "src/calc.cpp"])
+                .current_dir(repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+
+        // HashMap 代表となる 2 番目のオーバーロードのシグネチャを変更する。
+        let after = "int compute(int x) {\n    return x;\n}\nint compute(double x, int y) {\n    return 0;\n}\n";
+        fs::write(src_dir.join("calc.cpp"), after).expect("write after");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/calc.cpp".to_string(),
+            new_path: "src/calc.cpp".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 6,
+                new_start: 1,
+                new_count: 6,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        assert!(
+            !api_changes.modified.iter().any(|c| c.name == "compute"),
+            "同名オーバーロード compute は曖昧として modified から除外すべき: {:?}",
+            api_changes.modified
+        );
+    }
+
+    /// 通常の C++ トップレベル関数のシグネチャ変更は #13 の修正後も api.mod に出る。
+    /// nested 除外 / 同名複数除外が正常な検出を巻き込まないことの回帰テスト。
+    #[test]
+    fn detect_api_changes_cpp_real_function_signature_change_is_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let src_dir = repo.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+
+        let before = "int handle(int x) {\n    return x;\n}\n";
+        fs::write(src_dir.join("handler.cpp"), before).expect("write before");
+        assert!(
+            Command::new("git")
+                .args(["add", "src/handler.cpp"])
+                .current_dir(repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+
+        let after = "int handle(int x, int y) {\n    return x + y;\n}\n";
+        fs::write(src_dir.join("handler.cpp"), after).expect("write after");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/handler.cpp".to_string(),
+            new_path: "src/handler.cpp".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 3,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        assert!(
+            api_changes.modified.iter().any(|c| c.name == "handle"),
+            "通常関数 handle の signature 変更は modified に出るべき: {:?}",
+            api_changes.modified
         );
     }
 
