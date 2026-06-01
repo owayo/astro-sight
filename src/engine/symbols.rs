@@ -1300,6 +1300,57 @@ pub(crate) fn is_cpp_nested_function(root: Node, symbol_range: &Range) -> bool {
     false
 }
 
+/// C/C++ の struct/class/union/enum が本体 (フィールド/列挙子リスト) を持たない前方宣言かを
+/// 判定する。
+///
+/// `struct st_mysql;` や `typedef struct st_mysql MYSQL;` の `st_mysql`、`enum E : int;` の
+/// ような opaque タグ / 前方宣言は「定義」ではなく宣言であり、dead-code (未使用定義の検出) や
+/// API 変更の対象にすべきではない。本体 (field_declaration_list / enumerator_list) を持つ
+/// 定義のみを残すために使う (Issue #11: typedef underlying tag の dead 誤検出対策)。
+pub(crate) fn is_cpp_forward_declaration(root: Node, symbol_range: &Range) -> bool {
+    let start = tree_sitter::Point {
+        row: symbol_range.start.line,
+        column: symbol_range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: symbol_range.end.line,
+        column: symbol_range.end.column,
+    };
+    let Some(node) = root.descendant_for_point_range(start, end) else {
+        return false;
+    };
+    // symbol_range は specifier (struct_specifier 等) を指すこともあれば、name identifier を
+    // 指すこともある。specifier ノードを特定する。
+    let specifier = if is_cpp_type_specifier_kind(node.kind()) {
+        Some(node)
+    } else {
+        node.parent()
+            .filter(|p| is_cpp_type_specifier_kind(p.kind()))
+    };
+    match specifier {
+        Some(s) => !cpp_specifier_has_body(s),
+        None => false,
+    }
+}
+
+fn is_cpp_type_specifier_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "struct_specifier" | "class_specifier" | "union_specifier" | "enum_specifier"
+    )
+}
+
+/// C/C++ の型 specifier が本体 (field_declaration_list / enumerator_list) を持つか判定する。
+fn cpp_specifier_has_body(specifier: Node) -> bool {
+    let mut cursor = specifier.walk();
+    for child in specifier.children(&mut cursor) {
+        if matches!(child.kind(), "field_declaration_list" | "enumerator_list") {
+            return true;
+        }
+    }
+    false
+}
+
 /// JS/TS: ノードが関数本体（親が関数系ノードの statement_block）かどうかを判定する。
 fn is_js_function_body(node: Node) -> bool {
     if node.kind() != "statement_block" {

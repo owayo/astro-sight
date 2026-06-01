@@ -3766,6 +3766,20 @@ fn filter_exported_symbols(
         {
             continue;
         }
+        // C/C++ の前方宣言・opaque tag (本体を持たない struct/class/enum) は「定義」ではなく
+        // 宣言であり、dead-code (未使用定義検出) や API 変更の対象にすべきではない。
+        // `typedef struct st_mysql MYSQL;` の st_mysql (外部ライブラリの不透明構造体タグ) を
+        // dead 誤検出する問題への対応 (Issue #11)。
+        if matches!(
+            lang_id,
+            crate::language::LangId::C | crate::language::LangId::Cpp
+        ) && matches!(
+            sym.kind,
+            SymbolKind::Struct | SymbolKind::Class | SymbolKind::Enum
+        ) && crate::engine::symbols::is_cpp_forward_declaration(root, &sym.range)
+        {
+            continue;
+        }
         // Rust の `impl Trait for Type` 配下のメソッドは除外する。
         //   - dead-code 判定: trait dispatch 経由で呼ばれるため cross-file refs で caller を
         //     追跡できず、偽陽性になる。
@@ -9080,6 +9094,33 @@ export class SampleComponent {
         assert!(
             names.iter().any(|n| n.ends_with("reallyUnusedMethod")),
             "テンプレートからも参照されない method は dead として検出されるべき。got: {names:?}"
+        );
+    }
+
+    /// C/C++ の前方宣言・opaque tag (`typedef struct st_mysql MYSQL;` の `st_mysql`) は
+    /// 「定義」ではなく宣言なので dead_symbols に含めない。本体を持つ未使用 struct は
+    /// 引き続き dead として検出される (Issue #11)。
+    #[test]
+    fn detect_dead_cpp_forward_declaration_tag_excluded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let header = "typedef struct st_mysql MYSQL;\nstruct UnusedDefined { int x; };\n";
+        fs::write(repo.join("mysql_service.h"), header).expect("write header");
+
+        let files = vec![repo.join("mysql_service.h")];
+        let (dead, _test_only) =
+            detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
+        let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+
+        assert!(
+            !names.contains(&"st_mysql"),
+            "前方宣言タグ st_mysql は dead に含めない: {names:?}"
+        );
+        assert!(
+            names.contains(&"UnusedDefined"),
+            "本体を持つ未使用 struct UnusedDefined は dead として検出されるべき: {names:?}"
         );
     }
 
