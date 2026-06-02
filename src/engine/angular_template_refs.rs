@@ -84,6 +84,7 @@ fn is_angular_project(dir: &Path) -> bool {
 fn extract_template_refs(content: &str, refs: &mut HashSet<String>) {
     extract_interpolation_refs(content, refs);
     extract_binding_refs(content, refs);
+    extract_control_flow_refs(content, refs);
 }
 
 /// `{{ ... }}` 補間式の中身から識別子を抽出する。
@@ -146,24 +147,41 @@ fn extract_binding_refs(content: &str, refs: &mut HashSet<String>) {
             i = j.max(i + 1);
             continue;
         }
-        j += 1;
-        if j >= bytes.len() || (bytes[j] != b'"' && bytes[j] != b'\'') {
+        j += 1; // `=` の次へ
+        if j >= bytes.len() {
             i = j;
             continue;
         }
-        let quote = bytes[j];
-        j += 1;
-        let start = j;
-        while j < bytes.len() && bytes[j] != quote {
+        if bytes[j] == b'"' || bytes[j] == b'\'' {
+            // 引用符あり: 対応する閉じ引用符まで
+            let quote = bytes[j];
             j += 1;
+            let start = j;
+            while j < bytes.len() && bytes[j] != quote {
+                j += 1;
+            }
+            if j >= bytes.len() {
+                break;
+            }
+            if let Ok(expr) = std::str::from_utf8(&bytes[start..j]) {
+                extract_identifiers(expr, refs);
+            }
+            i = j + 1;
+        } else {
+            // 引用符なし属性値 (`[kana]=userNameForIcon`): 空白 / `>` / `/` まで
+            let start = j;
+            while j < bytes.len()
+                && !is_attr_separator(bytes[j])
+                && bytes[j] != b'>'
+                && bytes[j] != b'/'
+            {
+                j += 1;
+            }
+            if let Ok(expr) = std::str::from_utf8(&bytes[start..j]) {
+                extract_identifiers(expr, refs);
+            }
+            i = j;
         }
-        if j >= bytes.len() {
-            break;
-        }
-        if let Ok(expr) = std::str::from_utf8(&bytes[start..j]) {
-            extract_identifiers(expr, refs);
-        }
-        i = j + 1;
     }
 }
 
@@ -251,6 +269,204 @@ fn extract_inline_template_refs(content: &str, refs: &mut HashSet<String>) {
             extract_template_refs(template_content, refs);
         }
         i = j + 1;
+    }
+}
+
+/// `bytes[open]` が `(` のとき、対応する閉じ `)` の index を返す。
+/// 文字列リテラル (`"` / `'` / `` ` ``) とエスケープを考慮してネストを数える。
+/// 対応が取れない場合は None。
+fn find_matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    let mut in_str: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' | b'`' => in_str = Some(b),
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `haystack` 内で単語境界に囲まれた `keyword` の開始バイト位置を返す。
+/// `items` の中の `of` のような部分一致を弾くため識別子境界を確認する。
+fn find_keyword(haystack: &str, keyword: &str) -> Option<usize> {
+    let hb = haystack.as_bytes();
+    let kb = keyword.as_bytes();
+    if kb.is_empty() || hb.len() < kb.len() {
+        return None;
+    }
+    let mut i = 0;
+    while i + kb.len() <= hb.len() {
+        if &hb[i..i + kb.len()] == kb {
+            let before_ok = i == 0 || !is_ident_continue(hb[i - 1]);
+            let after = i + kb.len();
+            let after_ok = after >= hb.len() || !is_ident_continue(hb[after]);
+            if before_ok && after_ok {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Angular 17+ 制御フローブロック (`@if` / `@else if` / `@for` / `@switch` / `@case` /
+/// `@defer` / `@let`) の条件式・反復式から識別子を抽出する。
+///
+/// テンプレート parser は使わず、`@keyword` の後の balanced parentheses (`@let` は
+/// `=` 後〜`;`) を式として切り出す簡易走査。dead-code の live 補正用途なので多少の
+/// 過剰収集は許容するが、`@for` のループ変数束縛 (`item` / `let i`) は同名 component
+/// member を live と誤判定して dead を取りこぼすため除外する。
+fn extract_control_flow_refs(content: &str, refs: &mut HashSet<String>) {
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'@' {
+            i += 1;
+            continue;
+        }
+        // `@` の前が識別子継続文字 (メールアドレス `a@b` 等) なら制御フローではない
+        if i > 0 && is_ident_continue(bytes[i - 1]) {
+            i += 1;
+            continue;
+        }
+        let kw_start = i + 1;
+        let mut k = kw_start;
+        while k < bytes.len() && bytes[k].is_ascii_alphabetic() {
+            k += 1;
+        }
+        let keyword = &bytes[kw_start..k];
+        // keyword 後の空白を読み飛ばす
+        let mut p = k;
+        while p < bytes.len() && is_attr_separator(bytes[p]) {
+            p += 1;
+        }
+        match keyword {
+            b"if" | b"switch" | b"case" | b"defer" => {
+                if p < bytes.len()
+                    && bytes[p] == b'('
+                    && let Some(end) = find_matching_paren(bytes, p)
+                {
+                    if let Ok(expr) = std::str::from_utf8(&bytes[p + 1..end]) {
+                        extract_identifiers(expr, refs);
+                    }
+                    i = end + 1;
+                    continue;
+                }
+                i = k.max(i + 1);
+            }
+            b"for" => {
+                if p < bytes.len()
+                    && bytes[p] == b'('
+                    && let Some(end) = find_matching_paren(bytes, p)
+                {
+                    if let Ok(expr) = std::str::from_utf8(&bytes[p + 1..end]) {
+                        extract_for_block_refs(expr, refs);
+                    }
+                    i = end + 1;
+                    continue;
+                }
+                i = k.max(i + 1);
+            }
+            b"else" => {
+                // `@else if (cond)` のみ式を持つ (`@else {` は式なし)
+                if bytes[p..].starts_with(b"if") {
+                    let mut q = p + 2;
+                    while q < bytes.len() && is_attr_separator(bytes[q]) {
+                        q += 1;
+                    }
+                    if q < bytes.len()
+                        && bytes[q] == b'('
+                        && let Some(end) = find_matching_paren(bytes, q)
+                    {
+                        if let Ok(expr) = std::str::from_utf8(&bytes[q + 1..end]) {
+                            extract_identifiers(expr, refs);
+                        }
+                        i = end + 1;
+                        continue;
+                    }
+                }
+                i = k.max(i + 1);
+            }
+            b"let" => {
+                // `@let name = expr;` の `=` 後〜`;` を式とする (name はローカル束縛)
+                let mut q = p;
+                while q < bytes.len() && bytes[q] != b'=' && bytes[q] != b';' && bytes[q] != b'\n' {
+                    q += 1;
+                }
+                if q < bytes.len() && bytes[q] == b'=' {
+                    q += 1;
+                    let start = q;
+                    while q < bytes.len() && bytes[q] != b';' {
+                        q += 1;
+                    }
+                    if let Ok(expr) = std::str::from_utf8(&bytes[start..q]) {
+                        extract_identifiers(expr, refs);
+                    }
+                    i = q;
+                    continue;
+                }
+                i = k.max(i + 1);
+            }
+            _ => {
+                i = k.max(i + 1);
+            }
+        }
+    }
+}
+
+/// `@for (item of items; track item.id; let i = $index)` の式から、ループ変数束縛
+/// (`item` / `let i`) と構文キーワードを除いた参照識別子を抽出する。ローカル束縛を
+/// 拾うと同名 component member を live と誤判定して dead を取りこぼすため除外する。
+fn extract_for_block_refs(expr: &str, refs: &mut HashSet<String>) {
+    let mut locals: HashSet<String> = HashSet::new();
+    let mut candidates: HashSet<String> = HashSet::new();
+    for segment in expr.split(';') {
+        let seg = segment.trim();
+        if let Some(rest) = seg.strip_prefix("let ") {
+            // `let i = $index` / `let i = $index, e = $even`: 左辺名はローカル束縛
+            for binding in rest.split(',') {
+                if let Some(lhs) = binding.split('=').next() {
+                    extract_identifiers(lhs, &mut locals);
+                }
+            }
+            continue;
+        }
+        if let Some(of_idx) = find_keyword(seg, "of") {
+            // `item of items`: `of` の左はローカル束縛、右は参照対象
+            extract_identifiers(&seg[..of_idx], &mut locals);
+            extract_identifiers(&seg[of_idx + 2..], &mut candidates);
+            continue;
+        }
+        // track 等のセグメント: keyword を除いて識別子抽出
+        let cleaned = seg.strip_prefix("track ").unwrap_or(seg);
+        extract_identifiers(cleaned, &mut candidates);
+    }
+    for id in candidates {
+        if !locals.contains(&id) {
+            refs.insert(id);
+        }
     }
 }
 
@@ -433,5 +649,110 @@ export class SampleComponent {
         .unwrap();
         let refs = collect_angular_template_refs(dir.path());
         assert!(!refs.contains("shouldNotMatch"));
+    }
+
+    #[test]
+    fn unquoted_property_binding_extracts_member() {
+        // `[kana]=userNameForIcon` のように引用符なしの属性値も拾う (GitLab #14)
+        let html = r#"<bz-default-icon [kana]=userNameForIcon></bz-default-icon>"#;
+        let mut refs = HashSet::new();
+        extract_template_refs(html, &mut refs);
+        assert!(refs.contains("userNameForIcon"));
+    }
+
+    #[test]
+    fn unquoted_binding_stops_at_tag_end() {
+        // 引用符なし属性値はタグ終端 `>` で止まり、後続テキストを巻き込まない
+        let html = r#"<div [hidden]=isCollapsed>body text</div>"#;
+        let mut refs = HashSet::new();
+        extract_template_refs(html, &mut refs);
+        assert!(refs.contains("isCollapsed"));
+        assert!(!refs.contains("body"));
+        assert!(!refs.contains("text"));
+    }
+
+    #[test]
+    fn control_flow_if_extracts_predicate() {
+        // Angular 17+ `@if (predicate())` の述語を拾う (GitLab #14)
+        let html = "@if (isHeaderFeedbackVisible()) {\n  <div>x</div>\n}";
+        let mut refs = HashSet::new();
+        extract_template_refs(html, &mut refs);
+        assert!(refs.contains("isHeaderFeedbackVisible"));
+    }
+
+    #[test]
+    fn control_flow_else_if_extracts_predicate() {
+        let html = "@if (a()) {} @else if (otherPredicate()) {}";
+        let mut refs = HashSet::new();
+        extract_template_refs(html, &mut refs);
+        assert!(refs.contains("otherPredicate"));
+    }
+
+    #[test]
+    fn control_flow_for_extracts_iterable_not_loop_var() {
+        // `@for (item of items; track item.id)`: iterable は拾うが @for 宣言部の
+        // ループ変数束縛 item は拾わない。補間 `{{ item.x }}` 内の item はスコープ
+        // 追跡外で過剰収集を許容するため、ここでは制御フロー宣言部の抽出のみ検証する。
+        let html = "@for (item of menuItems; track item.id) { <li></li> }";
+        let mut refs = HashSet::new();
+        extract_control_flow_refs(html, &mut refs);
+        assert!(refs.contains("menuItems"));
+        assert!(
+            !refs.contains("item"),
+            "@for 宣言部のループ変数 item はローカル束縛なので拾わない"
+        );
+    }
+
+    #[test]
+    fn control_flow_switch_case_extracts_expressions() {
+        let html = "@switch (currentMode()) {\n  @case (computedCase()) { <a></a> }\n}";
+        let mut refs = HashSet::new();
+        extract_template_refs(html, &mut refs);
+        assert!(refs.contains("currentMode"));
+        assert!(refs.contains("computedCase"));
+    }
+
+    #[test]
+    fn control_flow_let_extracts_rhs() {
+        // `@let total = computeTotal();` の右辺を拾う
+        let html = "@let total = computeTotal();";
+        let mut refs = HashSet::new();
+        extract_template_refs(html, &mut refs);
+        assert!(refs.contains("computeTotal"));
+    }
+
+    #[test]
+    fn email_at_sign_not_treated_as_control_flow() {
+        // メールアドレスの `@` を制御フロー keyword と誤認しない (前が識別子継続文字)
+        let html = r#"<a href="mailto:user@ifExample.com">contact</a>"#;
+        let mut refs = HashSet::new();
+        extract_control_flow_refs(html, &mut refs);
+        assert!(!refs.contains("Example"));
+        assert!(!refs.contains("ifExample"));
+    }
+
+    #[test]
+    fn collect_finds_unquoted_and_control_flow_refs_in_angular_project() {
+        // GitLab #14 の統合再現: 引用符なし binding + @if 制御フロー
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("header.component.ts"),
+            r#"
+@Component({ templateUrl: './header.component.html' })
+export class HeaderComponent {
+    get userNameForIcon(): string { return ''; }
+    protected isHeaderFeedbackVisible(): boolean { return false; }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("header.component.html"),
+            "<bz-default-icon [kana]=userNameForIcon></bz-default-icon>\n@if (isHeaderFeedbackVisible()) { <div>x</div> }",
+        )
+        .unwrap();
+        let refs = collect_angular_template_refs(dir.path());
+        assert!(refs.contains("userNameForIcon"));
+        assert!(refs.contains("isHeaderFeedbackVisible"));
     }
 }
