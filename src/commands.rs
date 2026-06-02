@@ -2248,6 +2248,12 @@ fn detect_react_wrapper_compatible_mod(
     if !new_sig_has_react_wrapper(new_sig) {
         return None;
     }
+    // old 側は非 wrapper (function 宣言等) であること。wrapper-to-wrapper の変更
+    // (`forwardRef<HTMLDivElement, P>` → `forwardRef<HTMLButtonElement, P>` 等) は ref 型や
+    // generic の差分を取りこぼすため対象外 (codex 指摘)。
+    if new_sig_has_react_wrapper(old_sig) {
+        return None;
+    }
     // 信頼境界外のパスは多層防御で再チェックする。
     if !crate::engine::impact::is_safe_diff_path(old_path)
         || !crate::engine::impact::is_safe_diff_path(new_path)
@@ -2277,8 +2283,8 @@ fn detect_react_wrapper_compatible_mod(
         return None;
     }
     // 値利用 (呼び出し / typeof / member / new / indexed) が残れば MemoExoticComponent 化で
-    // 壊れ得るため blocking 維持。定義ファイル内の自己参照は除外する。
-    if has_blocking_value_usage(dir, name, new_path) {
+    // 壊れ得るため blocking 維持。
+    if has_blocking_value_usage(dir, name) {
         return None;
     }
     Some(CompatibleApiModification {
@@ -2415,7 +2421,7 @@ fn first_param_type_text(params: tree_sitter::Node, source: &[u8]) -> Option<Str
 /// `name` シンボルが値として利用 (`X(...)` / `new X` / `typeof X` / `X.foo` / `X[...]`)
 /// されている参照があるかを判定する。JSX タグ利用・import/re-export・定義のみなら false
 /// (= 降格可)。解析失敗・判定不能な参照があれば true (= blocking 維持、false negative 回避)。
-fn has_blocking_value_usage(dir: &str, name: &str, def_file: &str) -> bool {
+fn has_blocking_value_usage(dir: &str, name: &str) -> bool {
     use crate::models::reference::RefKind;
     let bare = bare_name(name);
     let refs = match crate::engine::refs::find_references(bare, std::path::Path::new(dir), None) {
@@ -2423,11 +2429,6 @@ fn has_blocking_value_usage(dir: &str, name: &str, def_file: &str) -> bool {
         Err(_) => return true,
     };
     for r in &refs {
-        // 定義ファイル内の参照 (const 名 = named function expression 名 `memo(function X(`
-        // 等) は外部公開契約ではないため除外する。
-        if diff_path_matches_ref(def_file, &r.path, dir) {
-            continue;
-        }
         if r.kind == Some(RefKind::Definition) {
             continue;
         }
@@ -2472,15 +2473,25 @@ fn ctx_usage_is_jsx_or_safe(ctx: &str, name: &str) -> bool {
                 let next_non_ws = ctx[i + nb.len()..].trim_start().as_bytes().first().copied();
                 let is_call = next_non_ws == Some(b'(');
                 let is_member = next_non_ws == Some(b'.') || next_non_ws == Some(b'[');
-                let last_word = ctx[..i].split_whitespace().next_back().unwrap_or("");
-                let is_typeof = last_word == "typeof";
-                let is_new = last_word == "new";
-                if is_call || is_member || is_typeof || is_new {
+                // 直前の識別子トークンを取る (空白だけでなく `(` `=` 等の非識別子文字でも
+                // 区切る)。`memo(function NAME` のように `(` 直後に関数キーワードが来るケースを
+                // 正しく拾うため split_whitespace ではなく識別子境界で分割する。
+                let last_ident = ctx[..i]
+                    .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+                    .find(|s| !s.is_empty())
+                    .unwrap_or("");
+                let is_typeof = last_ident == "typeof";
+                let is_new = last_ident == "new";
+                // 宣言キーワード直後の出現は定義 (変数宣言名 / named function expression 名 /
+                // class 名) であり値利用でない。`export const X = memo(function X(...))` の
+                // `const X` と内側 `function X` の両方がこれに当たる。
+                let is_decl = matches!(last_ident, "const" | "let" | "var" | "function" | "class");
+                if !is_decl && (is_call || is_member || is_typeof || is_new) {
                     return false;
                 }
                 let is_jsx = before == Some(b'<') || (i >= 2 && &bytes[i - 2..i] == b"</");
-                if !is_jsx {
-                    // JSX でも値利用でもない裸の出現は判定不能 → 安全側 (blocking)
+                if !is_jsx && !is_decl {
+                    // JSX でも宣言でも値利用でもない裸の出現は判定不能 → 安全側 (blocking)
                     return false;
                 }
             }
@@ -11329,6 +11340,129 @@ export const TaskKanbanCard = memo(function TaskKanbanCard() {\n\
             extract_component_props_type(no_type, crate::language::LangId::Tsx, "X"),
             None
         );
+    }
+
+    /// 定義ファイル内に named function expression 以外の値利用 (`X({})` 呼び出し) が残る
+    /// 場合は MemoExoticComponent 化で壊れ得るため blocking 維持 (codex 指摘: def_file 全体
+    /// 除外でなく named fn 名だけ safe)。
+    #[test]
+    fn detect_react_wrapper_same_file_value_usage_stays_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[(
+                "ScheduleItem.tsx",
+                "export function ScheduleItem(props: P) {\n  return null;\n}\nconst probe = ScheduleItem({});\n",
+            )],
+            "initial",
+        );
+        fs::write(
+            repo.join("ScheduleItem.tsx"),
+            "import { memo } from 'react';\nexport const ScheduleItem = memo(function ScheduleItem(props: P) {\n  return null;\n});\nconst probe = ScheduleItem({});\n",
+        )
+        .expect("write");
+        let result = detect_react_wrapper_compatible_mod(
+            repo.to_str().expect("utf-8 path"),
+            "HEAD",
+            "ScheduleItem.tsx",
+            "ScheduleItem.tsx",
+            "ScheduleItem",
+            "constant",
+            "old",
+            "new",
+            Some(crate::language::LangId::Tsx),
+        );
+        assert!(
+            result.is_none(),
+            "同一ファイル内の値呼び出し ScheduleItem({{}}) があれば blocking 維持"
+        );
+    }
+
+    /// old 側が既に wrapper (forwardRef) の wrapper-to-wrapper 変更は、ref 型等の差分を
+    /// 取りこぼすため blocking 維持 (codex 指摘)。
+    #[test]
+    fn detect_react_wrapper_old_already_wrapper_stays_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Btn.tsx",
+                    "import { forwardRef } from 'react';\nexport const Btn = forwardRef(function Btn(props: P, ref: RefA) {\n  return null;\n});\n",
+                ),
+                (
+                    "App.tsx",
+                    "import { Btn } from './Btn';\nexport const x = <Btn />;\n",
+                ),
+            ],
+            "initial",
+        );
+        fs::write(
+            repo.join("Btn.tsx"),
+            "import { forwardRef } from 'react';\nexport const Btn = forwardRef(function Btn(props: P, ref: RefB) {\n  return null;\n});\n",
+        )
+        .expect("write");
+        let result = detect_react_wrapper_compatible_mod(
+            repo.to_str().expect("utf-8 path"),
+            "HEAD",
+            "Btn.tsx",
+            "Btn.tsx",
+            "Btn",
+            "constant",
+            "export const Btn = forwardRef(function Btn(props: P, ref: RefA) {",
+            "export const Btn = forwardRef(function Btn(props: P, ref: RefB) {",
+            Some(crate::language::LangId::Tsx),
+        );
+        assert!(
+            result.is_none(),
+            "old が既に wrapper (wrapper-to-wrapper) なら blocking 維持"
+        );
+    }
+
+    /// compatible_modified (mod_compat) のみの api 変更は informational として hook JSON に
+    /// 出すが blocking にはしない。
+    #[test]
+    fn build_review_hook_json_compatible_modified_is_informational() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = ReviewResult {
+            impact: crate::models::impact::ContextResult {
+                changes: Vec::new(),
+                skipped: None,
+            },
+            missing_cochanges: Vec::new(),
+            api_changes: ApiChanges {
+                added: Vec::new(),
+                removed: Vec::new(),
+                modified: Vec::new(),
+                moved: Vec::new(),
+                property_to_field: Vec::new(),
+                removed_dead: Vec::new(),
+                modified_closed_in_diff: Vec::new(),
+                const_value_changes: Vec::new(),
+                compatible_modified: vec![CompatibleApiModification {
+                    name: "ScheduleItem".to_string(),
+                    kind: "constant".to_string(),
+                    file: "ScheduleItem.tsx".to_string(),
+                    old_signature: None,
+                    new_signature: None,
+                    reason: "react_component_wrapper".to_string(),
+                }],
+            },
+            dead_symbols: Vec::new(),
+            test_only_symbols: Vec::new(),
+            skipped: None,
+        };
+        let build =
+            build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
+        assert!(
+            build.value.is_some(),
+            "mod_compat は情報提供として hook JSON に出すべき"
+        );
+        assert!(!build.is_blocking, "mod_compat (互換変更) は非 blocking");
     }
 
     #[test]
