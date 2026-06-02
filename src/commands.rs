@@ -2150,8 +2150,10 @@ fn detect_api_changes(
                 // 変わらないため compatible_modified (informational) に降格する。
                 else if let Some(compat) = detect_react_wrapper_compatible_mod(
                     dir,
-                    name,
+                    base,
+                    &df.old_path,
                     &df.new_path,
+                    name,
                     kind,
                     old_sig,
                     new_sig,
@@ -2227,45 +2229,62 @@ fn detect_api_changes(
 ///
 /// 抽出失敗・型注釈なし・参照解析失敗・判定不能な参照は None を返し blocking を維持する
 /// (false negative 回避)。
+#[allow(clippy::too_many_arguments)]
 fn detect_react_wrapper_compatible_mod(
     dir: &str,
+    base: &str,
+    old_path: &str,
+    new_path: &str,
     name: &str,
-    file: &str,
     kind: &str,
     old_sig: &str,
     new_sig: &str,
     lang_id: Option<crate::language::LangId>,
 ) -> Option<CompatibleApiModification> {
     use crate::language::LangId;
-    if !matches!(
-        lang_id,
-        Some(LangId::Typescript | LangId::Tsx | LangId::Javascript)
-    ) {
-        return None;
-    }
+    let lang =
+        lang_id.filter(|l| matches!(l, LangId::Typescript | LangId::Tsx | LangId::Javascript))?;
     // new 側が memo / forwardRef でラップされていること (単なる function 本体変更は対象外)。
     if !new_sig_has_react_wrapper(new_sig) {
         return None;
     }
-    // old / new 双方の内側 function 引数リストを抽出して正規化比較する。
-    let old_params = extract_function_param_list(old_sig)?;
-    let new_params = extract_function_param_list(new_sig)?;
-    if old_params != new_params {
+    // 信頼境界外のパスは多層防御で再チェックする。
+    if !crate::engine::impact::is_safe_diff_path(old_path)
+        || !crate::engine::impact::is_safe_diff_path(new_path)
+    {
         return None;
     }
-    // 型注釈が無い (props だけ等) と JSX 互換を保証できないため blocking 維持。
-    if !old_params.contains(':') {
+    // old は base リビジョン、new は working tree からソースを再取得して props 型を AST 抽出
+    // する。signature 文字列は const の先頭行 fallback で複数行 destructured props の型注釈を
+    // 取りこぼすため、ソース再パースで比較する (codex 設計合意)。
+    validate_git_revision(base, "--base").ok()?;
+    validate_git_revision(old_path, "diff file path").ok()?;
+    let old_output = std::process::Command::new("git")
+        .args(["show", &format!("{base}:{old_path}")])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !old_output.status.success() {
+        return None;
+    }
+    let new_full = std::path::Path::new(dir).join(new_path);
+    let new_utf8 = camino::Utf8Path::from_path(&new_full)?;
+    let new_source = parser::read_file(new_utf8).ok()?;
+    // old / new 双方の第1引数 (props) の型注釈を抽出して一致を要求する。
+    let old_props = extract_component_props_type(&old_output.stdout, lang, name)?;
+    let new_props = extract_component_props_type(&new_source, lang, name)?;
+    if old_props != new_props {
         return None;
     }
     // 値利用 (呼び出し / typeof / member / new / indexed) が残れば MemoExoticComponent 化で
-    // 壊れ得るため blocking 維持。
-    if has_blocking_value_usage(dir, name) {
+    // 壊れ得るため blocking 維持。定義ファイル内の自己参照は除外する。
+    if has_blocking_value_usage(dir, name, new_path) {
         return None;
     }
     Some(CompatibleApiModification {
         name: name.to_string(),
         kind: kind.to_string(),
-        file: file.to_string(),
+        file: new_path.to_string(),
         old_signature: Some(old_sig.to_string()),
         new_signature: Some(new_sig.to_string()),
         reason: "react_component_wrapper".to_string(),
@@ -2297,76 +2316,106 @@ fn new_sig_has_react_wrapper(sig: &str) -> bool {
     false
 }
 
-/// signature から `function <name>(<params>)` の `<params>` を抽出し whitespace 正規化して
-/// 返す。memo/forwardRef ラップでも内側 `function` 宣言を見る。`function` キーワードが無い
-/// (arrow 等) / paren 対応が取れない場合は None (保守的に blocking)。
-fn extract_function_param_list(sig: &str) -> Option<String> {
-    let bytes = sig.as_bytes();
-    let kw = b"function";
-    let mut i = 0;
-    let mut fn_after = None;
-    while i + kw.len() <= bytes.len() {
-        if &bytes[i..i + kw.len()] == kw {
-            let before_ok = i == 0 || {
-                let p = bytes[i - 1];
-                !(p.is_ascii_alphanumeric() || p == b'_' || p == b'$')
-            };
-            let after = i + kw.len();
-            let after_ok = bytes
-                .get(after)
-                .is_some_and(|&a| a == b' ' || a == b'\t' || a == b'*' || a == b'(');
-            if before_ok && after_ok {
-                fn_after = Some(after);
-                break;
-            }
-        }
-        i += 1;
+/// TS/TSX/JS ソースから、トップレベル exported な `name` のコンポーネント関数の第1引数
+/// (props) の型注釈テキスト (例 `: ScheduleItemProps`、whitespace 正規化済み) を抽出する。
+/// `export function name(p: T)` / `export const name = memo(function(p: T))` /
+/// `forwardRef((p: T, ref) => ...)` に対応し、宣言 subtree の最初の formal_parameters を見る。
+/// 宣言が見つからない / 同名宣言が複数 / 第1引数に型注釈が無い / parse 失敗なら None
+/// (呼び出し側で blocking 維持)。
+fn extract_component_props_type(
+    source: &[u8],
+    lang_id: crate::language::LangId,
+    name: &str,
+) -> Option<String> {
+    let tree = parser::parse_source(source, lang_id).ok()?;
+    let root = tree.root_node();
+    let decls = find_toplevel_decls_named(root, name, source);
+    if decls.len() != 1 {
+        return None;
     }
-    let start = fn_after?;
-    let open = bytes[start..].iter().position(|&b| b == b'(')? + start;
-    let close = find_matching_paren_bytes(bytes, open)?;
-    let params = std::str::from_utf8(bytes.get(open + 1..close)?).ok()?;
-    Some(params.split_whitespace().collect::<Vec<_>>().join(" "))
+    let params = first_descendant_formal_parameters(decls[0])?;
+    first_param_type_text(params, source)
 }
 
-/// `bytes[open]` が `(` のとき対応する `)` の index を返す。文字列リテラルとネストを考慮。
-fn find_matching_paren_bytes(bytes: &[u8], open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut i = open;
-    let mut in_str: Option<u8> = None;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(q) = in_str {
-            if b == b'\\' {
-                i += 2;
-                continue;
+/// program 直下 (export_statement のラップを潜る) で `name` を宣言する function_declaration
+/// または variable_declarator ノードを集める。
+fn find_toplevel_decls_named<'a>(
+    root: tree_sitter::Node<'a>,
+    name: &str,
+    source: &[u8],
+) -> Vec<tree_sitter::Node<'a>> {
+    let mut result = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        let decl = if child.kind() == "export_statement" {
+            match child.named_child(0) {
+                Some(d) => d,
+                None => continue,
             }
-            if b == q {
-                in_str = None;
+        } else {
+            child
+        };
+        match decl.kind() {
+            "function_declaration" | "generator_function_declaration" => {
+                if node_field_name_eq(decl, name, source) {
+                    result.push(decl);
+                }
             }
-            i += 1;
-            continue;
-        }
-        match b {
-            b'"' | b'\'' | b'`' => in_str = Some(b),
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
+            "lexical_declaration" | "variable_declaration" => {
+                let mut c2 = decl.walk();
+                for d in decl.named_children(&mut c2) {
+                    if d.kind() == "variable_declarator" && node_field_name_eq(d, name, source) {
+                        result.push(d);
+                    }
                 }
             }
             _ => {}
         }
-        i += 1;
+    }
+    result
+}
+
+/// ノードの `name` フィールドのテキストが `name` と一致するか。
+fn node_field_name_eq(node: tree_sitter::Node, name: &str, source: &[u8]) -> bool {
+    node.child_by_field_name("name")
+        .and_then(|n| n.utf8_text(source).ok())
+        == Some(name)
+}
+
+/// `node` の subtree を深さ優先で走査し最初の formal_parameters ノードを返す。
+fn first_descendant_formal_parameters(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    if node.kind() == "formal_parameters" {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(found) = first_descendant_formal_parameters(child) {
+            return Some(found);
+        }
     }
     None
+}
+
+/// formal_parameters の第1引数の型注釈テキスト (whitespace 正規化済み) を返す。
+/// 第1引数が required/optional_parameter で `type` フィールドを持つときのみ Some。
+/// 型注釈が無い (JS 風 identifier param 等) / 引数なしなら None。
+fn first_param_type_text(params: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut cursor = params.walk();
+    let first = params.named_children(&mut cursor).next()?;
+    match first.kind() {
+        "required_parameter" | "optional_parameter" => {
+            let type_node = first.child_by_field_name("type")?;
+            let text = type_node.utf8_text(source).ok()?;
+            Some(text.split_whitespace().collect::<Vec<_>>().join(" "))
+        }
+        _ => None,
+    }
 }
 
 /// `name` シンボルが値として利用 (`X(...)` / `new X` / `typeof X` / `X.foo` / `X[...]`)
 /// されている参照があるかを判定する。JSX タグ利用・import/re-export・定義のみなら false
 /// (= 降格可)。解析失敗・判定不能な参照があれば true (= blocking 維持、false negative 回避)。
-fn has_blocking_value_usage(dir: &str, name: &str) -> bool {
+fn has_blocking_value_usage(dir: &str, name: &str, def_file: &str) -> bool {
     use crate::models::reference::RefKind;
     let bare = bare_name(name);
     let refs = match crate::engine::refs::find_references(bare, std::path::Path::new(dir), None) {
@@ -2374,6 +2423,11 @@ fn has_blocking_value_usage(dir: &str, name: &str) -> bool {
         Err(_) => return true,
     };
     for r in &refs {
+        // 定義ファイル内の参照 (const 名 = named function expression 名 `memo(function X(`
+        // 等) は外部公開契約ではないため除外する。
+        if diff_path_matches_ref(def_file, &r.path, dir) {
+            continue;
+        }
         if r.kind == Some(RefKind::Definition) {
             continue;
         }
@@ -11129,28 +11183,46 @@ export const TaskKanbanCard = memo(function TaskKanbanCard() {\n\
     }
 
     /// React.memo ラップで宣言種別が function_declaration → lexical_declaration に変わった
-    /// api.mod は、props 型・JSX 利用互換なら compatible (react_component_wrapper) に降格する。
-    /// (レポート 2026-06-02-react-memo-api-mod.md の再現)
+    /// api.mod は、props 型 (複数行 destructured 含む)・JSX 利用互換なら compatible
+    /// (react_component_wrapper) に降格する。(レポート 2026-06-02-react-memo-api-mod.md の再現)
     #[test]
-    fn detect_react_wrapper_jsx_only_usage_is_compatible() {
+    fn detect_react_wrapper_multiline_destructured_props_is_compatible() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // 参照は import + JSX タグのみ (値利用なし)
-        std::fs::write(
-            dir.path().join("TrayPopup.tsx"),
-            "import { ScheduleItem } from './ScheduleItem';\n\
-export function TrayPopup() {\n  return <ScheduleItem foo={1} />;\n}\n",
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        // old: export function (複数行 destructured props) + JSX のみで参照するファイル
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "ScheduleItem.tsx",
+                    "export function ScheduleItem({\n  a,\n  b,\n}: ScheduleItemProps) {\n  return null;\n}\n",
+                ),
+                (
+                    "TrayPopup.tsx",
+                    "import { ScheduleItem } from './ScheduleItem';\nexport function TrayPopup() {\n  return <ScheduleItem a={1} b={2} />;\n}\n",
+                ),
+            ],
+            "initial",
+        );
+        // new: memo ラップ (working tree)
+        fs::write(
+            repo.join("ScheduleItem.tsx"),
+            "import { memo } from 'react';\nexport const ScheduleItem = memo(function ScheduleItem({\n  a,\n  b,\n}: ScheduleItemProps) {\n  return null;\n});\n",
         )
         .expect("write");
         let result = detect_react_wrapper_compatible_mod(
-            dir.path().to_str().expect("utf-8 path"),
-            "ScheduleItem",
+            repo.to_str().expect("utf-8 path"),
+            "HEAD",
             "ScheduleItem.tsx",
-            "function",
-            "export function ScheduleItem(props: ScheduleItemProps)",
-            "export const ScheduleItem = memo(function ScheduleItem(props: ScheduleItemProps) {",
+            "ScheduleItem.tsx",
+            "ScheduleItem",
+            "constant",
+            "export function ScheduleItem({}: ScheduleItemProps)",
+            "export const ScheduleItem = memo(function ScheduleItem({",
             Some(crate::language::LangId::Tsx),
         );
-        let compat = result.expect("JSX 利用のみ + props 型同一なら compatible");
+        let compat = result.expect("複数行 destructured props でも memo ラップのみなら compatible");
         assert_eq!(compat.reason, "react_component_wrapper");
         assert_eq!(compat.name, "ScheduleItem");
     }
@@ -11160,19 +11232,36 @@ export function TrayPopup() {\n  return <ScheduleItem foo={1} />;\n}\n",
     #[test]
     fn detect_react_wrapper_with_call_usage_stays_blocking() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join("usage.tsx"),
-            "import { ScheduleItem } from './ScheduleItem';\n\
-const rendered = ScheduleItem({ foo: 1 });\n",
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "ScheduleItem.tsx",
+                    "export function ScheduleItem(props: P) {\n  return null;\n}\n",
+                ),
+                (
+                    "usage.tsx",
+                    "import { ScheduleItem } from './ScheduleItem';\nconst rendered = ScheduleItem({});\n",
+                ),
+            ],
+            "initial",
+        );
+        fs::write(
+            repo.join("ScheduleItem.tsx"),
+            "import { memo } from 'react';\nexport const ScheduleItem = memo(function ScheduleItem(props: P) {\n  return null;\n});\n",
         )
         .expect("write");
         let result = detect_react_wrapper_compatible_mod(
-            dir.path().to_str().expect("utf-8 path"),
-            "ScheduleItem",
+            repo.to_str().expect("utf-8 path"),
+            "HEAD",
             "ScheduleItem.tsx",
-            "function",
-            "export function ScheduleItem(props: ScheduleItemProps)",
-            "export const ScheduleItem = memo(function ScheduleItem(props: ScheduleItemProps) {",
+            "ScheduleItem.tsx",
+            "ScheduleItem",
+            "constant",
+            "old",
+            "new",
             Some(crate::language::LangId::Tsx),
         );
         assert!(
@@ -11185,36 +11274,59 @@ const rendered = ScheduleItem({ foo: 1 });\n",
     #[test]
     fn detect_react_wrapper_changed_props_type_stays_blocking() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join("TrayPopup.tsx"),
-            "import { ScheduleItem } from './ScheduleItem';\nexport const x = <ScheduleItem />;\n",
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "ScheduleItem.tsx",
+                    "export function ScheduleItem(props: OldProps) {\n  return null;\n}\n",
+                ),
+                (
+                    "TrayPopup.tsx",
+                    "import { ScheduleItem } from './ScheduleItem';\nexport const x = <ScheduleItem />;\n",
+                ),
+            ],
+            "initial",
+        );
+        fs::write(
+            repo.join("ScheduleItem.tsx"),
+            "import { memo } from 'react';\nexport const ScheduleItem = memo(function ScheduleItem(props: NewProps) {\n  return null;\n});\n",
         )
         .expect("write");
         let result = detect_react_wrapper_compatible_mod(
-            dir.path().to_str().expect("utf-8 path"),
-            "ScheduleItem",
+            repo.to_str().expect("utf-8 path"),
+            "HEAD",
             "ScheduleItem.tsx",
-            "function",
-            "export function ScheduleItem(props: OldProps)",
-            "export const ScheduleItem = memo(function ScheduleItem(props: NewProps) {",
+            "ScheduleItem.tsx",
+            "ScheduleItem",
+            "constant",
+            "old",
+            "new",
             Some(crate::language::LangId::Tsx),
         );
         assert!(result.is_none(), "props 型が変われば blocking 維持");
     }
 
     #[test]
-    fn extract_function_param_list_handles_plain_and_wrapped() {
+    fn extract_component_props_type_handles_function_and_memo_wrapper() {
+        // 複数行 destructured props + function 宣言
+        let func = b"export function X({\n  a,\n  b,\n}: MyProps) { return null; }\n";
         assert_eq!(
-            extract_function_param_list("export function X(props: T)").as_deref(),
-            Some("props: T")
+            extract_component_props_type(func, crate::language::LangId::Tsx, "X").as_deref(),
+            Some(": MyProps")
         );
+        // memo ラップ (内側 function の第1引数を見る)
+        let memo = b"import { memo } from 'react';\nexport const X = memo(function X({\n  a,\n}: MyProps) { return null; });\n";
         assert_eq!(
-            extract_function_param_list("export const X = memo(function X(props: T) {").as_deref(),
-            Some("props: T")
+            extract_component_props_type(memo, crate::language::LangId::Tsx, "X").as_deref(),
+            Some(": MyProps")
         );
-        // arrow function は `function` キーワードが無いので None (保守的に blocking)
+        // 型注釈なしは None (blocking 維持)
+        let no_type = b"export function X(props) { return null; }\n";
         assert_eq!(
-            extract_function_param_list("export const X = memo((props: T) => {"),
+            extract_component_props_type(no_type, crate::language::LangId::Tsx, "X"),
             None
         );
     }
