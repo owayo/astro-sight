@@ -2519,11 +2519,11 @@ fn ctx_usage_is_jsx_or_safe(ctx: &str, name: &str) -> bool {
 /// TS/TSX/JS の exported object (`export const X = { ... }`) のプロパティ削除を互換変更
 /// (`unused_object_members`) として判定する。
 ///
-/// initializer の object literal の shape (top-level + record value のキー集合) を old/new で
-/// 比較し、削除されたキーが無い (追加のみ) か、削除されたキーすべてが repo 全体で member
-/// access (`.key` / `['key']` / `["key"]`) として参照されていない場合に降格する。
-/// spread / computed key / object でない / 抽出不能 / 同名複数宣言 / 削除キーの参照残存は
-/// すべて blocking 維持 (false negative 回避)。
+/// initializer の object literal を flat object または homogeneous record として抽出し、
+/// 削除された schema キーが無い (追加のみ) か、削除された schema キーすべてが repo 全体で
+/// member access (`.key` / `['key']` / `["key"]`) として参照されていない場合に降格する。
+/// 値のみ変更 / spread / computed key / mixed shape / record schema 不揃い / object でない /
+/// 抽出不能 / 同名複数宣言 / 削除キーの参照残存はすべて blocking 維持 (false negative 回避)。
 #[allow(clippy::too_many_arguments)]
 fn detect_object_members_compatible_mod(
     dir: &str,
@@ -2559,9 +2559,35 @@ fn detect_object_members_compatible_mod(
     let new_source = parser::read_file(new_utf8).ok()?;
     let old_keys = extract_object_member_keys(&old_output.stdout, lang, name)?;
     let new_keys = extract_object_member_keys(&new_source, lang, name)?;
-    // 削除されたキー (old にあって new にない)。各キーへの member access が repo 全体で
-    // 残っていれば破壊的なので blocking 維持。
-    for key in old_keys.difference(&new_keys) {
+    if old_keys.record_keys.is_some() != new_keys.record_keys.is_some() {
+        return None;
+    }
+    let has_added_member = new_keys
+        .member_keys
+        .difference(&old_keys.member_keys)
+        .next()
+        .is_some();
+    let has_added_record_entry = match (&old_keys.record_keys, &new_keys.record_keys) {
+        (Some(old_record), Some(new_record)) => {
+            // record entry の削除は dynamic access (`config[id]`) を静的保証できないため blocking。
+            if old_record.difference(new_record).next().is_some() {
+                return None;
+            }
+            new_record.difference(old_record).next().is_some()
+        }
+        (None, None) => false,
+        _ => return None,
+    };
+    let removed_members: Vec<&String> = old_keys
+        .member_keys
+        .difference(&new_keys.member_keys)
+        .collect();
+    if removed_members.is_empty() && !has_added_member && !has_added_record_entry {
+        return None;
+    }
+    // 削除された schema キー (old にあって new にない)。各キーへの member access が repo
+    // 全体で残っていれば破壊的なので blocking 維持。
+    for key in removed_members {
         if key_has_member_access_ref(dir, key) {
             return None;
         }
@@ -2576,16 +2602,27 @@ fn detect_object_members_compatible_mod(
     })
 }
 
+#[derive(Debug, Clone)]
+struct ObjectMemberKeys {
+    member_keys: HashSet<String>,
+    record_keys: Option<HashSet<String>>,
+}
+
 /// TS/TSX/JS ソースから、トップレベル exported な `name` の初期化子 object literal の
-/// プロパティキー集合 (top-level + record value のキー) を抽出する。
+/// member schema を抽出する。
+///
+/// - flat object: top-level key を `member_keys` とする
+/// - homogeneous record: top-level key を `record_keys`、各 value object の共通 key を
+///   `member_keys` とする
+///
 /// `as const` / `satisfies T` は unwrap する。object literal でない / spread / computed key /
-/// 宣言が見つからない / 同名複数なら None (呼び出し側で blocking 維持)。
+/// mixed shape / record schema 不揃い / 宣言が見つからない / 同名複数なら None (呼び出し側で
+/// blocking 維持)。
 fn extract_object_member_keys(
     source: &[u8],
     lang_id: crate::language::LangId,
     name: &str,
-) -> Option<std::collections::HashSet<String>> {
-    use std::collections::HashSet;
+) -> Option<ObjectMemberKeys> {
     let tree = parser::parse_source(source, lang_id).ok()?;
     let root = tree.root_node();
     let decls = find_toplevel_decls_named(root, name, source);
@@ -2594,9 +2631,7 @@ fn extract_object_member_keys(
     }
     let value = decls[0].child_by_field_name("value")?;
     let obj = unwrap_to_object_literal(value)?;
-    let mut keys = HashSet::new();
-    collect_object_keys(obj, source, &mut keys)?;
-    Some(keys)
+    collect_object_keys(obj, source)
 }
 
 /// `expr as const` / `expr satisfies T` をはがして object literal ノードを返す。
@@ -2613,95 +2648,177 @@ fn unwrap_to_object_literal(node: tree_sitter::Node) -> Option<tree_sitter::Node
     }
 }
 
-/// object literal の property キーを再帰的に集める。value が object literal (record 形式) なら
-/// その value のキーも集める。spread (`...x`) / computed key (`[expr]:`) があれば None。
-fn collect_object_keys(
-    obj: tree_sitter::Node,
-    source: &[u8],
-    keys: &mut std::collections::HashSet<String>,
-) -> Option<()> {
+/// object literal の shape を flat / homogeneous record に分類して property キーを集める。
+/// mixed shape / record schema 不揃い / spread (`...x`) / computed key (`[expr]:`) があれば None。
+fn collect_object_keys(obj: tree_sitter::Node, source: &[u8]) -> Option<ObjectMemberKeys> {
+    let mut top_level_keys = HashSet::new();
+    let mut record_member_keys: Option<HashSet<String>> = None;
+    let mut has_object_value = false;
+    let mut has_non_object_value = false;
     let mut cursor = obj.walk();
     for child in obj.named_children(&mut cursor) {
         match child.kind() {
             "pair" => {
                 let key = child.child_by_field_name("key")?;
-                match key.kind() {
-                    "property_identifier" | "shorthand_property_identifier" => {
-                        keys.insert(key.utf8_text(source).ok()?.to_string());
-                    }
-                    "string" => {
-                        let raw = key.utf8_text(source).ok()?;
-                        keys.insert(
-                            raw.trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
-                                .to_string(),
-                        );
-                    }
-                    // computed key は静的解析できないので blocking
-                    _ => return None,
-                }
+                top_level_keys.insert(object_key_text(key, source)?);
                 if let Some(value) = child.child_by_field_name("value")
                     && let Some(nested) = unwrap_to_object_literal(value)
                 {
-                    collect_object_keys(nested, source, keys)?;
+                    has_object_value = true;
+                    let nested_keys = collect_flat_object_keys(nested, source)?;
+                    match &record_member_keys {
+                        Some(existing) if existing != &nested_keys => return None,
+                        Some(_) => {}
+                        None => record_member_keys = Some(nested_keys),
+                    }
+                } else {
+                    has_non_object_value = true;
                 }
             }
             "shorthand_property_identifier" => {
-                keys.insert(child.utf8_text(source).ok()?.to_string());
+                top_level_keys.insert(child.utf8_text(source).ok()?.to_string());
+                has_non_object_value = true;
             }
             // spread は shape を静的確定できないので blocking
             "spread_element" => return None,
             _ => {}
         }
     }
-    Some(())
+    if has_object_value && has_non_object_value {
+        return None;
+    }
+    if has_object_value {
+        return Some(ObjectMemberKeys {
+            member_keys: record_member_keys?,
+            record_keys: Some(top_level_keys),
+        });
+    }
+    Some(ObjectMemberKeys {
+        member_keys: top_level_keys,
+        record_keys: None,
+    })
+}
+
+/// flat object として 1 階層分の property キーだけを抽出する。nested object を再帰しない。
+fn collect_flat_object_keys(obj: tree_sitter::Node, source: &[u8]) -> Option<HashSet<String>> {
+    let mut keys = HashSet::new();
+    let mut cursor = obj.walk();
+    for child in obj.named_children(&mut cursor) {
+        match child.kind() {
+            "pair" => {
+                let key = child.child_by_field_name("key")?;
+                keys.insert(object_key_text(key, source)?);
+            }
+            "shorthand_property_identifier" => {
+                keys.insert(child.utf8_text(source).ok()?.to_string());
+            }
+            "spread_element" => return None,
+            _ => {}
+        }
+    }
+    Some(keys)
+}
+
+fn object_key_text(key: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    match key.kind() {
+        "property_identifier" | "shorthand_property_identifier" => {
+            Some(key.utf8_text(source).ok()?.to_string())
+        }
+        "string" => Some(static_js_string_text(key, source)?.to_string()),
+        // computed key は静的解析できないので blocking
+        _ => None,
+    }
 }
 
 /// `key` への member access (`.key` / `['key']` / `["key"]`) が repo 全体に残っているか。
 /// 解析失敗は保守的に true (残存ありとみなし blocking)。
 fn key_has_member_access_ref(dir: &str, key: &str) -> bool {
-    let refs = match crate::engine::refs::find_references(key, std::path::Path::new(dir), None) {
-        Ok(r) => r,
+    if key.is_empty() {
+        return true;
+    }
+    let files = match crate::engine::refs::collect_files(std::path::Path::new(dir), None) {
+        Ok(files) => files,
         Err(_) => return true,
     };
-    for r in &refs {
-        let Some(ctx) = r.context.as_deref() else {
-            return true;
-        };
-        if ctx_has_member_access(ctx, key) {
-            return true;
-        }
-    }
-    false
+    files
+        .into_par_iter()
+        .any(|path| file_has_member_access_ref(path.as_path(), key).unwrap_or(true))
 }
 
-/// 参照行 `ctx` 内に `key` への member access (`.key` / `['key']` / `["key"]`) があるか。
-fn ctx_has_member_access(ctx: &str, key: &str) -> bool {
-    let bytes = ctx.as_bytes();
-    let kb = key.as_bytes();
-    if kb.is_empty() {
-        return false;
-    }
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
-    let mut i = 0;
-    while i + kb.len() <= bytes.len() {
-        if &bytes[i..i + kb.len()] == kb {
-            let after = bytes.get(i + kb.len()).copied();
-            let after_boundary = after.is_none_or(|b| !is_ident(b));
-            if after_boundary {
-                // `.key` (直前が `.`)
-                if i > 0 && bytes[i - 1] == b'.' {
-                    return true;
+fn file_has_member_access_ref(path: &std::path::Path, key: &str) -> Result<bool> {
+    use crate::language::LangId;
+    let Some(path_str) = path.to_str() else {
+        return Ok(true);
+    };
+    let utf8_path = camino::Utf8Path::new(path_str);
+    let lang = match LangId::from_path(utf8_path) {
+        Ok(lang @ (LangId::Javascript | LangId::Typescript | LangId::Tsx)) => lang,
+        Err(_) if path.extension().is_none() => {
+            let source = parser::read_file(utf8_path)?;
+            return match LangId::detect(utf8_path, source.as_bytes()) {
+                Ok(lang @ (LangId::Javascript | LangId::Typescript | LangId::Tsx)) => {
+                    source_has_member_access_ref(source.as_bytes(), lang, key)
                 }
-                // `['key']` / `["key"]` (直前が引用符でさらに前が `[`)
-                if i >= 2 && (bytes[i - 1] == b'\'' || bytes[i - 1] == b'"') && bytes[i - 2] == b'['
-                {
-                    return true;
-                }
-            }
+                Ok(_) | Err(_) => Ok(false),
+            };
         }
-        i += 1;
+        Ok(_) | Err(_) => return Ok(false),
+    };
+    let source = parser::read_file(utf8_path)?;
+    source_has_member_access_ref(source.as_bytes(), lang, key)
+}
+
+fn source_has_member_access_ref(
+    source: &[u8],
+    lang: crate::language::LangId,
+    key: &str,
+) -> Result<bool> {
+    if memchr::memmem::find(source, key.as_bytes()).is_none() {
+        return Ok(false);
     }
-    false
+    let tree = parser::parse_source(source, lang)?;
+    Ok(ast_has_member_access_ref(tree.root_node(), source, key))
+}
+
+fn ast_has_member_access_ref(node: tree_sitter::Node, source: &[u8], key: &str) -> bool {
+    if node_is_member_access_ref(node, source, key) {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| ast_has_member_access_ref(child, source, key))
+}
+
+fn node_is_member_access_ref(node: tree_sitter::Node, source: &[u8], key: &str) -> bool {
+    match node.kind() {
+        "member_expression" => {
+            node.child_by_field_name("property")
+                .and_then(|property| property.utf8_text(source).ok())
+                == Some(key)
+        }
+        "subscript_expression" => {
+            node.child_by_field_name("index")
+                .filter(|index| index.kind() == "string")
+                .and_then(|index| static_js_string_text(index, source))
+                == Some(key)
+        }
+        _ => false,
+    }
+}
+
+fn static_js_string_text<'a>(node: tree_sitter::Node, source: &'a [u8]) -> Option<&'a str> {
+    let raw = node.utf8_text(source).ok()?;
+    let bytes = raw.as_bytes();
+    if bytes.len() < 2 {
+        return None;
+    }
+    let quote = bytes[0];
+    let end = *bytes.last()?;
+    if matches!(quote, b'\'' | b'"' | b'`') && quote == end {
+        Some(&raw[1..raw.len() - 1])
+    } else {
+        None
+    }
 }
 
 /// modified シンボルの全 cross-file 参照が同一 diff 内の変更 hunk で追随済みかを判定する。
@@ -11754,6 +11871,145 @@ export const TaskKanbanCard = memo(function TaskKanbanCard() {\n\
         );
     }
 
+    /// key 集合が完全一致する initializer 値のみ変更は unused_object_members ではないため
+    /// blocking 維持。
+    #[test]
+    fn detect_object_members_value_only_change_stays_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[("config.tsx", "export const c = { enabled: true };\n")],
+            "initial",
+        );
+        fs::write(
+            repo.join("config.tsx"),
+            "export const c = { enabled: false };\n",
+        )
+        .expect("write");
+        let result = detect_object_members_compatible_mod(
+            repo.to_str().expect("utf-8 path"),
+            "HEAD",
+            "config.tsx",
+            "config.tsx",
+            "c",
+            "constant",
+            "old",
+            "new",
+            Some(crate::language::LangId::Tsx),
+        );
+        assert!(result.is_none(), "値のみ変更は blocking 維持");
+    }
+
+    /// 削除 key なし、追加 key ありの純粋な member 追加は compatible に降格する。
+    #[test]
+    fn detect_object_members_pure_member_addition_is_compatible() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[("config.tsx", "export const c = { enabled: true };\n")],
+            "initial",
+        );
+        fs::write(
+            repo.join("config.tsx"),
+            "export const c = { enabled: true, mode: 'dark' };\n",
+        )
+        .expect("write");
+        let result = detect_object_members_compatible_mod(
+            repo.to_str().expect("utf-8 path"),
+            "HEAD",
+            "config.tsx",
+            "config.tsx",
+            "c",
+            "constant",
+            "old",
+            "new",
+            Some(crate::language::LangId::Tsx),
+        );
+        let compat = result.expect("純粋な member 追加は compatible");
+        assert_eq!(compat.reason, "unused_object_members");
+    }
+
+    /// record value の schema が不揃いなら、同名 key が別 record entry に残っていても
+    /// 削除有無を安全に判断できないため blocking 維持。
+    #[test]
+    fn detect_object_members_record_schema_mismatch_stays_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[(
+                "config.tsx",
+                "export const providerConfig = {\n  google: { label: 'G', bgColor: 'green' },\n  openai: { label: 'O', bgColor: 'blue' },\n};\n",
+            )],
+            "initial",
+        );
+        fs::write(
+            repo.join("config.tsx"),
+            "export const providerConfig = {\n  google: { label: 'G' },\n  openai: { label: 'O', bgColor: 'blue' },\n};\n",
+        )
+        .expect("write");
+        let result = detect_object_members_compatible_mod(
+            repo.to_str().expect("utf-8 path"),
+            "HEAD",
+            "config.tsx",
+            "config.tsx",
+            "providerConfig",
+            "constant",
+            "old",
+            "new",
+            Some(crate::language::LangId::Tsx),
+        );
+        assert!(result.is_none(), "record schema 不揃いは blocking 維持");
+    }
+
+    /// 削除された key が文字列 bracket access (`obj["key"]`) で残存していれば破壊的なので
+    /// blocking 維持。
+    #[test]
+    fn detect_object_members_removed_bracket_string_ref_stays_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "config.tsx",
+                    "export const providerConfig = {\n  google: { label: 'G', bgColor: 'green' },\n};\n",
+                ),
+                (
+                    "App.tsx",
+                    "import { providerConfig } from './config';\nexport const x = providerConfig.google[\"bgColor\"];\n",
+                ),
+            ],
+            "initial",
+        );
+        fs::write(
+            repo.join("config.tsx"),
+            "export const providerConfig = {\n  google: { label: 'G' },\n};\n",
+        )
+        .expect("write");
+        let result = detect_object_members_compatible_mod(
+            repo.to_str().expect("utf-8 path"),
+            "HEAD",
+            "config.tsx",
+            "config.tsx",
+            "providerConfig",
+            "constant",
+            "old",
+            "new",
+            Some(crate::language::LangId::Tsx),
+        );
+        assert!(
+            result.is_none(),
+            "削除キー bgColor が bracket string access で残存 → blocking 維持"
+        );
+    }
+
     /// spread (`...base`) を含む object は shape を静的確定できないため blocking 維持。
     #[test]
     fn detect_object_members_spread_stays_blocking() {
@@ -11786,14 +12042,15 @@ export const TaskKanbanCard = memo(function TaskKanbanCard() {\n\
 
     #[test]
     fn extract_object_member_keys_collects_record_value_keys() {
-        // record 形式: top-level (google/openai) + value object のキー (label/bgColor) を集める
+        // record 形式: top-level は record entry、value object のキー (label/bgColor) を schema とする
         let src = b"export const c = {\n  google: { label: 'G', bgColor: 'green' },\n  openai: { label: 'O', bgColor: 'blue' },\n};\n";
         let keys = extract_object_member_keys(src, crate::language::LangId::Tsx, "c")
             .expect("record keys");
-        assert!(keys.contains("google"));
-        assert!(keys.contains("openai"));
-        assert!(keys.contains("label"));
-        assert!(keys.contains("bgColor"));
+        assert!(keys.member_keys.contains("label"));
+        assert!(keys.member_keys.contains("bgColor"));
+        let record_keys = keys.record_keys.expect("record keys");
+        assert!(record_keys.contains("google"));
+        assert!(record_keys.contains("openai"));
         // spread を含むと None (blocking)
         let spread = b"export const c = { ...base, a: 1 };\n";
         assert!(extract_object_member_keys(spread, crate::language::LangId::Tsx, "c").is_none());
