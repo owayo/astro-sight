@@ -343,6 +343,7 @@ fn run(cli: Cli) -> Result<()> {
             exclude_dirs,
             exclude_globs,
             dead_scope,
+            strict_public_const_values,
         } => {
             // --hook 指定時、未指定なら touched-symbols に降格して
             // 「changed file 内の元から存在した dead」のノイズを抑える。
@@ -366,6 +367,7 @@ fn run(cli: Cli) -> Result<()> {
                 &exclude_dirs,
                 &exclude_globs,
                 resolved_dead_scope,
+                strict_public_const_values,
             )
         }
         Commands::Cochange {

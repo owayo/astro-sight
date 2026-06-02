@@ -62,6 +62,13 @@ pub struct ApiChanges {
     /// informational 扱い (Issue 2026-05-29-swift-sidecar-api-mod パターンA)。
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub modified_closed_in_diff: Vec<ApiSymbolChange>,
+    /// `pub const` / 非 mut `pub static` / `export const` の shape (名前・型・visibility・
+    /// binding kind) は不変で initializer (値) のみ変更されたケース。値変更はコンパイル
+    /// 互換性を壊さないため `modified` (api.mod) とは別カテゴリとして informational に扱い、
+    /// デフォルトでは stop hook をブロックしない。`--strict-public-const-values` 指定時のみ
+    /// blocking に昇格する (Issue 2026-06-02-balance-const-value-changes 対応)。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub const_value_changes: Vec<ApiSymbolChange>,
 }
 
 /// 公開シンボル情報。

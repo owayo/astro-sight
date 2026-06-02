@@ -472,6 +472,12 @@ pub enum Commands {
         /// `dead-code --dir .` で全 dead を再確認するときは `--dead-scope all` を指定。
         #[arg(long = "dead-scope", value_enum)]
         dead_scope: Option<DeadScope>,
+
+        /// `pub const` / 非 mut `pub static` / `export const` の値 (initializer) のみ変更を
+        /// 厳格に扱う。指定時は api.const_value を Stop hook の blocking 対象に昇格する。
+        /// デフォルトでは値のみの変更はコンパイル互換性を壊さないため informational (非 blocking)。
+        #[arg(long = "strict-public-const-values")]
+        strict_public_const_values: bool,
     },
 
     /// Detect dead (unreferenced) exported symbols

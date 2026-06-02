@@ -1071,6 +1071,7 @@ pub fn cmd_review(
     extra_exclude_dirs: &[String],
     extra_exclude_globs: &[String],
     dead_scope: crate::cli::DeadScope,
+    strict_public_const_values: bool,
 ) -> Result<()> {
     // framework 指定は早期に検証して未知名はここで弾く (dead_symbols 検出に到達する前に)。
     // 未指定時は package.json から next 依存を検出して nextjs プリセットを自動適用する。
@@ -1236,7 +1237,7 @@ pub fn cmd_review(
     };
 
     if hook {
-        return review_hook_output(&result, dir);
+        return review_hook_output(&result, dir, strict_public_const_values);
     }
 
     let output = serialize_output(&result, pretty)?;
@@ -1263,7 +1264,11 @@ struct HookJsonBuild {
     is_blocking: bool,
 }
 
-fn build_review_hook_json(result: &ReviewResult, dir: &str) -> HookJsonBuild {
+fn build_review_hook_json(
+    result: &ReviewResult,
+    dir: &str,
+    strict_const_values: bool,
+) -> HookJsonBuild {
     #[derive(Default)]
     struct HookImpactGroup {
         changed_symbols: std::collections::BTreeSet<String>,
@@ -1427,19 +1432,22 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> HookJsonBuild {
         hook_obj.insert("cochange".into(), serde_json::Value::Array(cochanges));
     }
 
-    // api: {add,rm,mod,moved,property_to_field,rm_dead} — 空でないセクションのみ
+    // api: {add,rm,mod,moved,property_to_field,rm_dead,const_value} — 空でないセクションのみ
     let has_api_changes = !result.api_changes.added.is_empty()
         || !result.api_changes.removed.is_empty()
         || !result.api_changes.modified.is_empty()
         || !result.api_changes.moved.is_empty()
         || !result.api_changes.property_to_field.is_empty()
         || !result.api_changes.removed_dead.is_empty()
-        || !result.api_changes.modified_closed_in_diff.is_empty();
-    // api.added / api.moved / api.property_to_field / api.removed_dead は破壊的変更ではないため
-    // Stop hook のブロッキング対象から外し informational 扱いにする。api.removed / api.modified は
-    // 破壊的変更の可能性があるため従来どおり blocking。
-    let has_api_breaking =
-        !result.api_changes.removed.is_empty() || !result.api_changes.modified.is_empty();
+        || !result.api_changes.modified_closed_in_diff.is_empty()
+        || !result.api_changes.const_value_changes.is_empty();
+    // api.added / api.moved / api.property_to_field / api.removed_dead / api.const_value は
+    // 破壊的変更ではないため Stop hook のブロッキング対象から外し informational 扱いにする。
+    // api.removed / api.modified は破壊的変更の可能性があるため従来どおり blocking。
+    // const_value (値のみ変更) は `--strict-public-const-values` 指定時のみ blocking に昇格する。
+    let has_api_breaking = !result.api_changes.removed.is_empty()
+        || !result.api_changes.modified.is_empty()
+        || (strict_const_values && !result.api_changes.const_value_changes.is_empty());
     if has_api_changes {
         if has_api_breaking {
             has_blocking_issues = true;
@@ -1494,6 +1502,22 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> HookJsonBuild {
                     result
                         .api_changes
                         .modified_closed_in_diff
+                        .iter()
+                        .map(|m| serde_json::json!({"n": m.name, "f": m.file}))
+                        .collect(),
+                ),
+            );
+        }
+        // const_value: const / 非 mut static / export const の値のみ変更。shape (名前・型・
+        // visibility) は不変でコンパイル互換性を壊さないため informational
+        // (デフォルト非 blocking、`--strict-public-const-values` 指定時のみ blocking 昇格)。
+        if !result.api_changes.const_value_changes.is_empty() {
+            api.insert(
+                "const_value".into(),
+                serde_json::Value::Array(
+                    result
+                        .api_changes
+                        .const_value_changes
                         .iter()
                         .map(|m| serde_json::json!({"n": m.name, "f": m.file}))
                         .collect(),
@@ -1581,8 +1605,8 @@ fn build_review_hook_json(result: &ReviewResult, dir: &str) -> HookJsonBuild {
 /// --hook 時の review 出力: compact JSON を stderr に出力する。
 /// blocking な検出 (impacts / api / dead) があれば exit 1、
 /// cochange のみの informational な出力は exit 0 にして Stop hook を止めない。
-fn review_hook_output(result: &ReviewResult, dir: &str) -> Result<()> {
-    let build = build_review_hook_json(result, dir);
+fn review_hook_output(result: &ReviewResult, dir: &str, strict_const_values: bool) -> Result<()> {
+    let build = build_review_hook_json(result, dir, strict_const_values);
     let Some(hook_output) = build.value else {
         return Ok(());
     };
@@ -1747,6 +1771,10 @@ fn detect_api_changes(
     let mut modified: Vec<ApiSymbolChange> = Vec::new();
     // 全 cross-file 参照が同一 diff 内で追随済みの api.mod (informational)。
     let mut modified_closed_in_diff: Vec<ApiSymbolChange> = Vec::new();
+    // const / 非 mut static / export const の値 (initializer) のみ変更で shape (名前・型・
+    // visibility) は不変な api.mod。コンパイル互換性を壊さないため別カテゴリに分離する
+    // (Issue 2026-06-02-balance-const-value-changes 対応)。
+    let mut const_value_changes: Vec<ApiSymbolChange> = Vec::new();
     // 移動検出用に「フィルタ前の新規側候補」を全件追跡する。`is_used_in_diff_paths` 等で
     // `added` から除外された候補も `removed` との突き合わせには利用したいため、
     // フィルタ適用前の候補を別バケットに溜めておく。module → package 化 (cli.py →
@@ -2035,6 +2063,10 @@ fn detect_api_changes(
             || (is_rust_symbol_in_private_module(dir, &df.new_path)
                 && is_rust_symbol_in_private_module_at_base(dir, base, &df.old_path));
 
+        // 値バインディングの value-only 変更を const_value_changes へ振り分けるための言語判定。
+        let lang_id_for_file =
+            crate::language::LangId::from_path(camino::Utf8Path::new(df.new_path.as_str())).ok();
+
         // 同一 (file, qualname) の modified を重複排除するためのキーセット
         let mut seen_modified: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
@@ -2087,9 +2119,17 @@ fn detect_api_changes(
                     old_signature: Some(old_sig.to_string()),
                     new_signature: Some(new_sig.clone()),
                 };
+                // const / 非 mut static / export const の値 (initializer) のみ変更で shape
+                // (名前・型・visibility) が不変なら、コンパイル互換性を壊さないため
+                // const_value_changes (informational) に振り分ける。
+                if lang_id_for_file
+                    .is_some_and(|lid| is_const_value_only_change(old_sig, new_sig, kind, lid))
+                {
+                    const_value_changes.push(change);
+                }
                 // 全 cross-file 参照が同一 diff 内の変更 hunk で追随済みなら、呼び出し側は
                 // 同一コミットで更新済み。破壊的でないため informational に降格する。
-                if is_modified_closed_in_diff(dir, name, base, diff_files) {
+                else if is_modified_closed_in_diff(dir, name, base, diff_files) {
                     modified_closed_in_diff.push(change);
                 } else {
                     modified.push(change);
@@ -2136,6 +2176,7 @@ fn detect_api_changes(
             .map(|c| c.into_api_symbol())
             .collect(),
         modified_closed_in_diff,
+        const_value_changes,
     }
 }
 
@@ -3206,6 +3247,222 @@ fn extract_api_signature(
         .unwrap_or(&"")
         .trim()
         .to_string()
+}
+
+/// 値バインディング (const / static / export const) の宣言から抽出した shape 情報。
+/// initializer (= 右辺) を除いた宣言の骨格と、value-only 変更を安全に判定するための補助情報。
+struct BindingShape {
+    /// initializer を除いた正規化済み宣言テキスト (名前・型・visibility・binding kind を含む)。
+    shape: String,
+    /// 不変バインディング (Rust `const` / 非 mut `static`、TS/JS `const`) なら true。
+    /// mutable (`static mut` / `let` / `var`) は false。
+    is_const_binding: bool,
+    /// 型注釈を持つなら true (TS の型注釈なし initializer の安全判定に使う)。
+    has_type_annotation: bool,
+    /// initializer が scalar literal (数値 / 文字列 / 真偽値 / null 等) なら true。
+    /// 関数 / object / array / call 等の複雑な式は false。
+    initializer_is_scalar: bool,
+}
+
+/// `node` を起点に、指定 kind のいずれかに最初に一致する子孫ノードを深さ優先で探す。
+/// signature 文字列は単一宣言なので export_statement 等のラップを潜るために使う。
+fn find_first_descendant_of_kinds<'a>(
+    node: tree_sitter::Node<'a>,
+    kinds: &[&str],
+) -> Option<tree_sitter::Node<'a>> {
+    if kinds.contains(&node.kind()) {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(found) = find_first_descendant_of_kinds(child, kinds) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// value 手前で切った宣言テキストを正規化する。末尾に残る `=` と前後・連続空白を畳む。
+fn normalize_binding_shape_text(bytes: &[u8]) -> String {
+    let s = String::from_utf8_lossy(bytes);
+    let trimmed = s.trim_end();
+    // value の直前で切ると末尾に `= ` が残るため取り除く。
+    let without_eq = trimmed
+        .strip_suffix('=')
+        .map(str::trim_end)
+        .unwrap_or(trimmed);
+    without_eq.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// signature 文字列を AST パースし、値バインディングなら initializer を除いた shape を返す。
+/// 対象外 (関数 / 型 / バインディング以外) や抽出失敗時は None を返し、呼び出し側は保守的に
+/// 従来どおり api.mod へ倒す (codex 設計合意: テキストの `=` 分割ではなく AST ベース)。
+fn extract_binding_shape(sig: &str, lang_id: crate::language::LangId) -> Option<BindingShape> {
+    // lexer-only 言語は tree-sitter を持たないため対象外。
+    if lang_id.is_lexer_only() {
+        return None;
+    }
+    let source = sig.as_bytes();
+    let tree = parser::parse_source(source, lang_id).ok()?;
+    let root = tree.root_node();
+    match lang_id {
+        crate::language::LangId::Rust => {
+            let decl = find_first_descendant_of_kinds(root, &["const_item", "static_item"])?;
+            extract_rust_binding_shape(decl, source)
+        }
+        crate::language::LangId::Typescript
+        | crate::language::LangId::Tsx
+        | crate::language::LangId::Javascript => {
+            let decl = find_first_descendant_of_kinds(
+                root,
+                &["lexical_declaration", "variable_declaration"],
+            )?;
+            extract_js_binding_shape(decl, source)
+        }
+        _ => None,
+    }
+}
+
+/// Rust の const_item / static_item から shape を抽出する。
+fn extract_rust_binding_shape(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<BindingShape> {
+    // static mut は mutable_specifier を子に持つ。const は常に不変。
+    let mut cursor = node.walk();
+    let is_mut = node
+        .children(&mut cursor)
+        .any(|c| c.kind() == "mutable_specifier");
+    let value = node.child_by_field_name("value");
+    let has_type_annotation = node.child_by_field_name("type").is_some();
+    let shape_end = value
+        .map(|v| v.start_byte())
+        .unwrap_or_else(|| node.end_byte());
+    let shape_bytes = source.get(node.start_byte()..shape_end)?;
+    let initializer_is_scalar = value.map(rust_value_is_scalar).unwrap_or(false);
+    Some(BindingShape {
+        shape: normalize_binding_shape_text(shape_bytes),
+        is_const_binding: !is_mut,
+        has_type_annotation,
+        initializer_is_scalar,
+    })
+}
+
+/// TS/JS の lexical_declaration / variable_declaration から shape を抽出する。
+fn extract_js_binding_shape(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<BindingShape> {
+    // binding kind (`const` / `let` / `var`) を最初の anonymous child から判定する。
+    let mut decl_cursor = node.walk();
+    let binding_kw = node
+        .children(&mut decl_cursor)
+        .find(|c| matches!(c.kind(), "const" | "let" | "var"))
+        .map(|c| c.kind());
+    let is_const_binding = binding_kw == Some("const");
+
+    // 複数 declarator (`const a = 1, b = 2;`) は shape 抽出が壊れるため対象外。
+    let mut declarators = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "variable_declarator" {
+            declarators.push(child);
+        }
+    }
+    if declarators.len() != 1 {
+        return None;
+    }
+    let declarator = declarators[0];
+    let value = declarator.child_by_field_name("value");
+    let has_type_annotation = declarator.child_by_field_name("type").is_some();
+
+    // visibility (export) を shape に含めるため、親が export_statement なら起点を遡る。
+    let shape_start = match node.parent() {
+        Some(p) if p.kind() == "export_statement" => p.start_byte(),
+        _ => node.start_byte(),
+    };
+    let shape_end = value
+        .map(|v| v.start_byte())
+        .unwrap_or_else(|| declarator.end_byte());
+    let shape_bytes = source.get(shape_start..shape_end)?;
+    let initializer_is_scalar = value.map(js_value_is_scalar).unwrap_or(false);
+    Some(BindingShape {
+        shape: normalize_binding_shape_text(shape_bytes),
+        is_const_binding,
+        has_type_annotation,
+        initializer_is_scalar,
+    })
+}
+
+/// Rust の値ノードが scalar literal かを判定する (型注釈なし経路の安全弁、誤検出側に倒す)。
+fn rust_value_is_scalar(value: tree_sitter::Node<'_>) -> bool {
+    matches!(
+        value.kind(),
+        "integer_literal"
+            | "float_literal"
+            | "string_literal"
+            | "raw_string_literal"
+            | "char_literal"
+            | "boolean_literal"
+    )
+}
+
+/// JS/TS の値ノードが scalar literal かを判定する。関数 / object / array / call は false。
+fn js_value_is_scalar(value: tree_sitter::Node<'_>) -> bool {
+    matches!(
+        value.kind(),
+        "number" | "string" | "true" | "false" | "null" | "undefined"
+    )
+}
+
+/// old/new signature が「const / 非 mut static / export const の値のみ変更 (shape 不変)」かを
+/// 判定する。true なら api.mod ではなく const_value_changes (informational) に振り分ける。
+///
+/// gate: (1) kind が value binding (constant/variable)、(2) 言語が Rust/TS/TSX/JS、
+/// (3) 両者が不変バインディング、(4) shape 一致、(5) TS で型注釈なしなら両者 scalar literal。
+/// いずれか外れる / 抽出失敗時は false を返し、保守的に api.mod へ倒す。
+fn is_const_value_only_change(
+    old_sig: &str,
+    new_sig: &str,
+    kind: &str,
+    lang_id: crate::language::LangId,
+) -> bool {
+    // 値バインディングの kind のみ (Rust const/static="constant"、TS/JS const="variable")。
+    if !matches!(kind, "constant" | "variable") {
+        return false;
+    }
+    if !matches!(
+        lang_id,
+        crate::language::LangId::Rust
+            | crate::language::LangId::Typescript
+            | crate::language::LangId::Tsx
+            | crate::language::LangId::Javascript
+    ) {
+        return false;
+    }
+    let (Some(old), Some(new)) = (
+        extract_binding_shape(old_sig, lang_id),
+        extract_binding_shape(new_sig, lang_id),
+    ) else {
+        return false;
+    };
+    // mutable バインディング (static mut / let / var) は demote しない。
+    if !old.is_const_binding || !new.is_const_binding {
+        return false;
+    }
+    // shape (名前・型・visibility・binding kind) が変われば破壊的変更の可能性 → api.mod。
+    if old.shape != new.shape {
+        return false;
+    }
+    // TS/JS で型注釈がない場合、関数 / object / array / call initializer は shape 推定が
+    // 危険なため scalar literal 同士のときだけ demote する (codex 指摘)。
+    if matches!(
+        lang_id,
+        crate::language::LangId::Typescript
+            | crate::language::LangId::Tsx
+            | crate::language::LangId::Javascript
+    ) {
+        let both_typed = old.has_type_annotation && new.has_type_annotation;
+        let both_scalar = old.initializer_is_scalar && new.initializer_is_scalar;
+        if !both_typed && !both_scalar {
+            return false;
+        }
+    }
+    true
 }
 
 /// Tauri command の自動注入型 (実行時に Tauri が注入し JS-facing な invoke() 引数に現れない型)。
@@ -5740,6 +5997,204 @@ mod tests {
             !api.modified.iter().any(|c| c.name == "changed_fn"),
             "changed_fn を blocking な modified に含めるべきでない: {:?}",
             api.modified
+        );
+    }
+
+    #[test]
+    fn is_const_value_only_change_rust_const_value_only_is_true() {
+        assert!(is_const_value_only_change(
+            "pub const ENEMY_SPEED: f32 = 80.0;",
+            "pub const ENEMY_SPEED: f32 = 105.0;",
+            "constant",
+            crate::language::LangId::Rust,
+        ));
+    }
+
+    #[test]
+    fn is_const_value_only_change_rust_static_value_only_is_true() {
+        assert!(is_const_value_only_change(
+            "pub static MAX_ALIVE: usize = 200;",
+            "pub static MAX_ALIVE: usize = 280;",
+            "constant",
+            crate::language::LangId::Rust,
+        ));
+    }
+
+    #[test]
+    fn is_const_value_only_change_rust_array_value_only_is_true() {
+        assert!(is_const_value_only_change(
+            "pub const TABLE: [u8; 3] = [1, 2, 3];",
+            "pub const TABLE: [u8; 3] = [4, 5, 6];",
+            "constant",
+            crate::language::LangId::Rust,
+        ));
+    }
+
+    #[test]
+    fn is_const_value_only_change_rust_static_mut_is_not_demoted() {
+        // mutable storage の初期値は状態契約になりやすいため demote しない。
+        assert!(!is_const_value_only_change(
+            "pub static mut COUNT: usize = 1;",
+            "pub static mut COUNT: usize = 2;",
+            "constant",
+            crate::language::LangId::Rust,
+        ));
+    }
+
+    #[test]
+    fn is_const_value_only_change_rust_type_change_stays_api_mod() {
+        // 型変更は shape 変更 → 破壊的の可能性があり api.mod に残す。
+        assert!(!is_const_value_only_change(
+            "pub const X: f32 = 1.0;",
+            "pub const X: f64 = 1.0;",
+            "constant",
+            crate::language::LangId::Rust,
+        ));
+    }
+
+    #[test]
+    fn is_const_value_only_change_ts_typed_value_only_is_true() {
+        assert!(is_const_value_only_change(
+            "export const NAME: string = \"a\";",
+            "export const NAME: string = \"b\";",
+            "variable",
+            crate::language::LangId::Typescript,
+        ));
+    }
+
+    #[test]
+    fn is_const_value_only_change_ts_untyped_scalar_is_true() {
+        assert!(is_const_value_only_change(
+            "export const MAX = 100;",
+            "export const MAX = 200;",
+            "variable",
+            crate::language::LangId::Typescript,
+        ));
+    }
+
+    #[test]
+    fn is_const_value_only_change_ts_untyped_function_stays_api_mod() {
+        // 型注釈なし + 関数 initializer は shape 推定が危険なため api.mod に残す。
+        assert!(!is_const_value_only_change(
+            "export const handler = () => 1;",
+            "export const handler = () => 2;",
+            "variable",
+            crate::language::LangId::Typescript,
+        ));
+    }
+
+    #[test]
+    fn is_const_value_only_change_ts_let_is_not_demoted() {
+        assert!(!is_const_value_only_change(
+            "export let counter = 1;",
+            "export let counter = 2;",
+            "variable",
+            crate::language::LangId::Typescript,
+        ));
+    }
+
+    #[test]
+    fn is_const_value_only_change_non_binding_kind_is_false() {
+        assert!(!is_const_value_only_change(
+            "fn foo() -> i32",
+            "fn foo() -> u32",
+            "function",
+            crate::language::LangId::Rust,
+        ));
+    }
+
+    /// Rust の `pub const` / `pub static` の値 (initializer) のみ変更は破壊的でないため、
+    /// blocking な `modified` ではなく informational な `const_value_changes` に振り分けられる
+    /// (Issue 2026-06-02-balance-const-value-changes 回帰防止)。
+    #[test]
+    fn detect_api_changes_rust_const_value_only_is_demoted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[(
+                "src/constants.rs",
+                "pub const ENEMY_SPEED: f32 = 80.0;\npub static MAX_ALIVE: usize = 200;\n",
+            )],
+            "initial",
+        );
+        // 値のみ変更 (shape 不変)
+        fs::write(
+            repo.join("src/constants.rs"),
+            "pub const ENEMY_SPEED: f32 = 105.0;\npub static MAX_ALIVE: usize = 280;\n",
+        )
+        .expect("write new constants");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/constants.rs".to_string(),
+            new_path: "src/constants.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 2,
+                new_start: 1,
+                new_count: 2,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        assert!(
+            api.modified.is_empty(),
+            "値のみ変更の const/static は blocking modified に出すべきでない: {:?}",
+            api.modified
+        );
+        assert!(
+            api.const_value_changes
+                .iter()
+                .any(|c| c.name == "ENEMY_SPEED"),
+            "const ENEMY_SPEED の値変更は const_value_changes に出すべき: {:?}",
+            api.const_value_changes
+        );
+        assert!(
+            api.const_value_changes
+                .iter()
+                .any(|c| c.name == "MAX_ALIVE"),
+            "static MAX_ALIVE の値変更は const_value_changes に出すべき: {:?}",
+            api.const_value_changes
+        );
+    }
+
+    /// `pub const` の型変更 (shape 変更) は const_value_changes ではなく従来どおり
+    /// blocking な modified に残す。
+    #[test]
+    fn detect_api_changes_rust_const_type_change_stays_modified() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[("src/constants.rs", "pub const LIMIT: u32 = 10;\n")],
+            "initial",
+        );
+        fs::write(
+            repo.join("src/constants.rs"),
+            "pub const LIMIT: u64 = 10;\n",
+        )
+        .expect("write new constants");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/constants.rs".to_string(),
+            new_path: "src/constants.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        assert!(
+            api.modified.iter().any(|c| c.name == "LIMIT"),
+            "型変更は blocking modified に残すべき: {api:?}"
+        );
+        assert!(
+            api.const_value_changes.is_empty(),
+            "型変更は const_value_changes に入れるべきでない: {:?}",
+            api.const_value_changes
         );
     }
 
@@ -12364,6 +12819,7 @@ def new_public_api():
         let build = build_review_hook_json(
             &empty_review_result(),
             dir.path().to_str().expect("utf-8 path"),
+            false,
         );
         assert!(
             build.value.is_none(),
@@ -12395,13 +12851,15 @@ def new_public_api():
                 property_to_field: Vec::new(),
                 removed_dead: Vec::new(),
                 modified_closed_in_diff: Vec::new(),
+                const_value_changes: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
             skipped: None,
         };
 
-        let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
+        let build =
+            build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
         assert!(
             build.value.is_some(),
             "cochange は情報提供として JSON 出力はするべき"
@@ -12435,13 +12893,15 @@ def new_public_api():
                 property_to_field: Vec::new(),
                 removed_dead: Vec::new(),
                 modified_closed_in_diff: Vec::new(),
+                const_value_changes: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
             skipped: None,
         };
 
-        let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
+        let build =
+            build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
         assert!(build.value.is_some(), "api.add は hook JSON に出すべき");
         assert!(
             !build.is_blocking,
@@ -12472,13 +12932,15 @@ def new_public_api():
                 property_to_field: Vec::new(),
                 removed_dead: Vec::new(),
                 modified_closed_in_diff: Vec::new(),
+                const_value_changes: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
             skipped: None,
         };
 
-        let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
+        let build =
+            build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
         assert!(build.value.is_some(), "api.rm は hook JSON に出すべき");
         assert!(build.is_blocking, "api.rm は blocking にすべき");
     }
@@ -12508,15 +12970,94 @@ def new_public_api():
                 property_to_field: Vec::new(),
                 removed_dead: Vec::new(),
                 modified_closed_in_diff: Vec::new(),
+                const_value_changes: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
             skipped: None,
         };
 
-        let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
+        let build =
+            build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
         assert!(build.value.is_some(), "api.mod は hook JSON に出すべき");
         assert!(build.is_blocking, "api.mod は blocking にすべき");
+    }
+
+    #[test]
+    fn build_review_hook_json_const_value_only_is_informational() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = ReviewResult {
+            impact: crate::models::impact::ContextResult {
+                changes: Vec::new(),
+                skipped: None,
+            },
+            missing_cochanges: Vec::new(),
+            api_changes: ApiChanges {
+                added: Vec::new(),
+                removed: Vec::new(),
+                modified: Vec::new(),
+                moved: Vec::new(),
+                property_to_field: Vec::new(),
+                removed_dead: Vec::new(),
+                modified_closed_in_diff: Vec::new(),
+                const_value_changes: vec![ApiSymbolChange {
+                    name: "ENEMY_SPEED".to_string(),
+                    kind: "constant".to_string(),
+                    file: "src/constants.rs".to_string(),
+                    old_signature: Some("pub const ENEMY_SPEED: f32".to_string()),
+                    new_signature: Some("pub const ENEMY_SPEED: f32".to_string()),
+                }],
+            },
+            dead_symbols: Vec::new(),
+            test_only_symbols: Vec::new(),
+            skipped: None,
+        };
+        let build =
+            build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
+        assert!(
+            build.value.is_some(),
+            "const_value 変更は informational として hook JSON に出すべき"
+        );
+        assert!(
+            !build.is_blocking,
+            "const_value のみの変更はデフォルトで blocking にしないべき"
+        );
+    }
+
+    #[test]
+    fn build_review_hook_json_const_value_is_blocking_under_strict() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = ReviewResult {
+            impact: crate::models::impact::ContextResult {
+                changes: Vec::new(),
+                skipped: None,
+            },
+            missing_cochanges: Vec::new(),
+            api_changes: ApiChanges {
+                added: Vec::new(),
+                removed: Vec::new(),
+                modified: Vec::new(),
+                moved: Vec::new(),
+                property_to_field: Vec::new(),
+                removed_dead: Vec::new(),
+                modified_closed_in_diff: Vec::new(),
+                const_value_changes: vec![ApiSymbolChange {
+                    name: "ENEMY_SPEED".to_string(),
+                    kind: "constant".to_string(),
+                    file: "src/constants.rs".to_string(),
+                    old_signature: Some("pub const ENEMY_SPEED: f32".to_string()),
+                    new_signature: Some("pub const ENEMY_SPEED: f32".to_string()),
+                }],
+            },
+            dead_symbols: Vec::new(),
+            test_only_symbols: Vec::new(),
+            skipped: None,
+        };
+        let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), true);
+        assert!(
+            build.is_blocking,
+            "--strict-public-const-values 指定時は const_value を blocking に昇格すべき"
+        );
     }
 
     #[test]
@@ -12561,13 +13102,15 @@ def new_public_api():
                 property_to_field: Vec::new(),
                 removed_dead: Vec::new(),
                 modified_closed_in_diff: Vec::new(),
+                const_value_changes: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
             skipped: None,
         };
 
-        let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
+        let build =
+            build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
         let hook_json = build.value.expect("hook json should be generated");
         assert!(build.is_blocking, "impacts があれば blocking にすべき");
         let impacts = hook_json["impacts"]
@@ -12636,13 +13179,15 @@ def new_public_api():
                 property_to_field: Vec::new(),
                 removed_dead: Vec::new(),
                 modified_closed_in_diff: Vec::new(),
+                const_value_changes: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
             skipped: None,
         };
 
-        let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"));
+        let build =
+            build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
         let hook_json = build.value.expect("hook json should be generated");
         assert!(build.is_blocking, "未解決 impact があれば blocking");
         let impacts = hook_json["impacts"]
@@ -12705,13 +13250,14 @@ def new_public_api():
                 property_to_field: Vec::new(),
                 removed_dead: Vec::new(),
                 modified_closed_in_diff: Vec::new(),
+                const_value_changes: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
             skipped: None,
         };
 
-        let build = build_review_hook_json(&result, dir.path().to_str().unwrap());
+        let build = build_review_hook_json(&result, dir.path().to_str().unwrap(), false);
         // 新規追加シンボルへの caller のみ → impacts は空 (blocking 対象外)
         assert!(
             build.value.is_none() || {
@@ -12785,13 +13331,14 @@ def new_public_api():
                 property_to_field: Vec::new(),
                 removed_dead: Vec::new(),
                 modified_closed_in_diff: Vec::new(),
+                const_value_changes: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
             skipped: None,
         };
 
-        let build = build_review_hook_json(&result, dir.path().to_str().unwrap());
+        let build = build_review_hook_json(&result, dir.path().to_str().unwrap(), false);
         let hook_json = build.value.expect("hook json should be generated");
         assert!(build.is_blocking, "modified を含むため blocking");
         let impacts = hook_json["impacts"].as_array().expect("impacts array");
