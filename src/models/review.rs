@@ -69,6 +69,12 @@ pub struct ApiChanges {
     /// blocking に昇格する (Issue 2026-06-02-balance-const-value-changes 対応)。
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub const_value_changes: Vec<ApiSymbolChange>,
+    /// シグネチャ文字列は変わったが公開契約 (呼び出し側の互換性) が維持される互換 api.mod。
+    /// React component の HOC ラップ (`memo` / `forwardRef`) や、未参照プロパティのみ削除した
+    /// exported object 等。非 blocking の informational 扱い
+    /// (Issue 2026-06-02-react-memo / 2026-06-02-provider-avatar 対応)。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub compatible_modified: Vec<CompatibleApiModification>,
 }
 
 /// 公開シンボル情報。
@@ -89,6 +95,22 @@ pub struct ApiSymbolChange {
     pub old_signature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_signature: Option<String>,
+}
+
+/// 互換性ありと判定された api.mod。シグネチャ文字列は変わったが公開契約 (呼び出し側の
+/// 互換性) は維持されるため、非 blocking の informational 扱いとする。`reason` で互換と
+/// 判定した根拠を示す。
+#[derive(Debug, Clone, Serialize)]
+pub struct CompatibleApiModification {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_signature: Option<String>,
+    /// 互換と判定した根拠 ("react_component_wrapper" / "unused_object_members")。
+    pub reason: String,
 }
 
 /// 参照カウント 0 の公開シンボル。

@@ -11,8 +11,8 @@ use crate::error::{AstroError, ErrorCode};
 use crate::models::cochange::{CoChangeOptions, CoChangeResult};
 use crate::models::dead_code::DeadCodeResult;
 use crate::models::review::{
-    ApiChanges, ApiSymbol, ApiSymbolChange, DeadSymbol, MissingCochange, MovedSymbol,
-    PropertyToFieldChange, ReviewResult,
+    ApiChanges, ApiSymbol, ApiSymbolChange, CompatibleApiModification, DeadSymbol, MissingCochange,
+    MovedSymbol, PropertyToFieldChange, ReviewResult,
 };
 use crate::models::skip::SkipInfo;
 use crate::service::{AppService, AstParams};
@@ -1440,7 +1440,8 @@ fn build_review_hook_json(
         || !result.api_changes.property_to_field.is_empty()
         || !result.api_changes.removed_dead.is_empty()
         || !result.api_changes.modified_closed_in_diff.is_empty()
-        || !result.api_changes.const_value_changes.is_empty();
+        || !result.api_changes.const_value_changes.is_empty()
+        || !result.api_changes.compatible_modified.is_empty();
     // api.added / api.moved / api.property_to_field / api.removed_dead / api.const_value は
     // 破壊的変更ではないため Stop hook のブロッキング対象から外し informational 扱いにする。
     // api.removed / api.modified は破壊的変更の可能性があるため従来どおり blocking。
@@ -1520,6 +1521,21 @@ fn build_review_hook_json(
                         .const_value_changes
                         .iter()
                         .map(|m| serde_json::json!({"n": m.name, "f": m.file}))
+                        .collect(),
+                ),
+            );
+        }
+        // mod_compat: signature 文字列は変わったが公開契約が維持される互換 api.mod
+        // (React HOC ラップ / 未参照プロパティ削除)。informational (非 blocking)。reason 付き。
+        if !result.api_changes.compatible_modified.is_empty() {
+            api.insert(
+                "mod_compat".into(),
+                serde_json::Value::Array(
+                    result
+                        .api_changes
+                        .compatible_modified
+                        .iter()
+                        .map(|m| serde_json::json!({"n": m.name, "f": m.file, "reason": m.reason}))
                         .collect(),
                 ),
             );
@@ -1775,6 +1791,8 @@ fn detect_api_changes(
     // visibility) は不変な api.mod。コンパイル互換性を壊さないため別カテゴリに分離する
     // (Issue 2026-06-02-balance-const-value-changes 対応)。
     let mut const_value_changes: Vec<ApiSymbolChange> = Vec::new();
+    // 互換性ありと判定された api.mod (React HOC ラップ / 未参照プロパティ削除)。非 blocking。
+    let mut compatible_modified: Vec<CompatibleApiModification> = Vec::new();
     // 移動検出用に「フィルタ前の新規側候補」を全件追跡する。`is_used_in_diff_paths` 等で
     // `added` から除外された候補も `removed` との突き合わせには利用したいため、
     // フィルタ適用前の候補を別バケットに溜めておく。module → package 化 (cli.py →
@@ -2127,6 +2145,20 @@ fn detect_api_changes(
                 {
                     const_value_changes.push(change);
                 }
+                // React component を `memo` / `forwardRef` 等の HOC でラップしただけで
+                // export 名・props 型・JSX 利用互換性が維持されるケースは、公開契約が
+                // 変わらないため compatible_modified (informational) に降格する。
+                else if let Some(compat) = detect_react_wrapper_compatible_mod(
+                    dir,
+                    name,
+                    &df.new_path,
+                    kind,
+                    old_sig,
+                    new_sig,
+                    lang_id_for_file,
+                ) {
+                    compatible_modified.push(compat);
+                }
                 // 全 cross-file 参照が同一 diff 内の変更 hunk で追随済みなら、呼び出し側は
                 // 同一コミットで更新済み。破壊的でないため informational に降格する。
                 else if is_modified_closed_in_diff(dir, name, base, diff_files) {
@@ -2177,7 +2209,231 @@ fn detect_api_changes(
             .collect(),
         modified_closed_in_diff,
         const_value_changes,
+        compatible_modified,
     }
+}
+
+/// TS/TSX/JS の exported component を `memo` / `forwardRef` 等の HOC でラップしただけの
+/// api.mod を互換変更 (`react_component_wrapper`) として判定する。
+///
+/// `export function X(props: T) {}` → `export const X = memo(function X(props: T) {})` の
+/// ように宣言種別が変わると signature 文字列が変化して api.mod になるが、export 名・props
+/// 型・JSX 利用互換性が維持されるなら公開契約は不変。次をすべて満たすとき降格する:
+/// - 言語が TS / TSX / JS
+/// - new 側が `memo` / `forwardRef` (`React.*` 含む) でラップされている
+/// - old / new 双方から `function <name>(<params>)` の引数リストを抽出でき正規化一致する
+/// - 引数に型注釈がある (型なしは JSX 互換を保証できないため除外)
+/// - 当該シンボルに値利用参照 (`X(...)` / `new X` / `typeof X` / `X.foo` / `X[...]`) が無い
+///
+/// 抽出失敗・型注釈なし・参照解析失敗・判定不能な参照は None を返し blocking を維持する
+/// (false negative 回避)。
+fn detect_react_wrapper_compatible_mod(
+    dir: &str,
+    name: &str,
+    file: &str,
+    kind: &str,
+    old_sig: &str,
+    new_sig: &str,
+    lang_id: Option<crate::language::LangId>,
+) -> Option<CompatibleApiModification> {
+    use crate::language::LangId;
+    if !matches!(
+        lang_id,
+        Some(LangId::Typescript | LangId::Tsx | LangId::Javascript)
+    ) {
+        return None;
+    }
+    // new 側が memo / forwardRef でラップされていること (単なる function 本体変更は対象外)。
+    if !new_sig_has_react_wrapper(new_sig) {
+        return None;
+    }
+    // old / new 双方の内側 function 引数リストを抽出して正規化比較する。
+    let old_params = extract_function_param_list(old_sig)?;
+    let new_params = extract_function_param_list(new_sig)?;
+    if old_params != new_params {
+        return None;
+    }
+    // 型注釈が無い (props だけ等) と JSX 互換を保証できないため blocking 維持。
+    if !old_params.contains(':') {
+        return None;
+    }
+    // 値利用 (呼び出し / typeof / member / new / indexed) が残れば MemoExoticComponent 化で
+    // 壊れ得るため blocking 維持。
+    if has_blocking_value_usage(dir, name) {
+        return None;
+    }
+    Some(CompatibleApiModification {
+        name: name.to_string(),
+        kind: kind.to_string(),
+        file: file.to_string(),
+        old_signature: Some(old_sig.to_string()),
+        new_signature: Some(new_sig.to_string()),
+        reason: "react_component_wrapper".to_string(),
+    })
+}
+
+/// new 側 signature が `memo(` / `forwardRef(` / `React.memo(` / `React.forwardRef(` で
+/// ラップされているか (identifier 境界を確認し `somememo` 等の部分一致を弾く)。
+fn new_sig_has_react_wrapper(sig: &str) -> bool {
+    let bytes = sig.as_bytes();
+    for kw in ["memo", "forwardRef"] {
+        let kb = kw.as_bytes();
+        let mut i = 0;
+        while i + kb.len() <= bytes.len() {
+            if &bytes[i..i + kb.len()] == kb {
+                let before_ok = i == 0 || {
+                    let p = bytes[i - 1];
+                    // `React.memo` の `.` は許容、識別子継続文字は不可
+                    !(p.is_ascii_alphanumeric() || p == b'_' || p == b'$')
+                };
+                let after = sig[i + kb.len()..].trim_start();
+                if before_ok && after.starts_with('(') {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
+/// signature から `function <name>(<params>)` の `<params>` を抽出し whitespace 正規化して
+/// 返す。memo/forwardRef ラップでも内側 `function` 宣言を見る。`function` キーワードが無い
+/// (arrow 等) / paren 対応が取れない場合は None (保守的に blocking)。
+fn extract_function_param_list(sig: &str) -> Option<String> {
+    let bytes = sig.as_bytes();
+    let kw = b"function";
+    let mut i = 0;
+    let mut fn_after = None;
+    while i + kw.len() <= bytes.len() {
+        if &bytes[i..i + kw.len()] == kw {
+            let before_ok = i == 0 || {
+                let p = bytes[i - 1];
+                !(p.is_ascii_alphanumeric() || p == b'_' || p == b'$')
+            };
+            let after = i + kw.len();
+            let after_ok = bytes
+                .get(after)
+                .is_some_and(|&a| a == b' ' || a == b'\t' || a == b'*' || a == b'(');
+            if before_ok && after_ok {
+                fn_after = Some(after);
+                break;
+            }
+        }
+        i += 1;
+    }
+    let start = fn_after?;
+    let open = bytes[start..].iter().position(|&b| b == b'(')? + start;
+    let close = find_matching_paren_bytes(bytes, open)?;
+    let params = std::str::from_utf8(bytes.get(open + 1..close)?).ok()?;
+    Some(params.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// `bytes[open]` が `(` のとき対応する `)` の index を返す。文字列リテラルとネストを考慮。
+fn find_matching_paren_bytes(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    let mut in_str: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' | b'`' => in_str = Some(b),
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `name` シンボルが値として利用 (`X(...)` / `new X` / `typeof X` / `X.foo` / `X[...]`)
+/// されている参照があるかを判定する。JSX タグ利用・import/re-export・定義のみなら false
+/// (= 降格可)。解析失敗・判定不能な参照があれば true (= blocking 維持、false negative 回避)。
+fn has_blocking_value_usage(dir: &str, name: &str) -> bool {
+    use crate::models::reference::RefKind;
+    let bare = bare_name(name);
+    let refs = match crate::engine::refs::find_references(bare, std::path::Path::new(dir), None) {
+        Ok(r) => r,
+        Err(_) => return true,
+    };
+    for r in &refs {
+        if r.kind == Some(RefKind::Definition) {
+            continue;
+        }
+        let Some(ctx) = r.context.as_deref() else {
+            return true;
+        };
+        let trimmed = ctx.trim_start();
+        // import / re-export specifier は値利用ではない
+        if ref_is_import_line(r)
+            || trimmed.starts_with("export {")
+            || trimmed.starts_with("export type")
+        {
+            continue;
+        }
+        if !ctx_usage_is_jsx_or_safe(ctx, bare) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 参照行 `ctx` 内の `name` 出現がすべて JSX タグ利用 (`<X` / `</X`) かを判定する。
+/// 値利用 (`X(` 呼び出し / `X.` / `X[` / `new X` / `typeof X`) や JSX でない裸の出現を
+/// 含むなら false (= blocking 側に倒す)。
+fn ctx_usage_is_jsx_or_safe(ctx: &str, name: &str) -> bool {
+    let bytes = ctx.as_bytes();
+    let nb = name.as_bytes();
+    if nb.is_empty() {
+        return false;
+    }
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    let mut i = 0;
+    let mut saw_occurrence = false;
+    while i + nb.len() <= bytes.len() {
+        if &bytes[i..i + nb.len()] == nb {
+            let before = if i == 0 { None } else { Some(bytes[i - 1]) };
+            let after = bytes.get(i + nb.len()).copied();
+            let before_boundary = before.is_none_or(|b| !is_ident(b));
+            let after_boundary = after.is_none_or(|b| !is_ident(b));
+            if before_boundary && after_boundary {
+                saw_occurrence = true;
+                let next_non_ws = ctx[i + nb.len()..].trim_start().as_bytes().first().copied();
+                let is_call = next_non_ws == Some(b'(');
+                let is_member = next_non_ws == Some(b'.') || next_non_ws == Some(b'[');
+                let last_word = ctx[..i].split_whitespace().next_back().unwrap_or("");
+                let is_typeof = last_word == "typeof";
+                let is_new = last_word == "new";
+                if is_call || is_member || is_typeof || is_new {
+                    return false;
+                }
+                let is_jsx = before == Some(b'<') || (i >= 2 && &bytes[i - 2..i] == b"</");
+                if !is_jsx {
+                    // JSX でも値利用でもない裸の出現は判定不能 → 安全側 (blocking)
+                    return false;
+                }
+            }
+        }
+        i += 1;
+    }
+    saw_occurrence
 }
 
 /// modified シンボルの全 cross-file 参照が同一 diff 内の変更 hunk で追随済みかを判定する。
@@ -10872,6 +11128,141 @@ export const TaskKanbanCard = memo(function TaskKanbanCard() {\n\
         );
     }
 
+    /// React.memo ラップで宣言種別が function_declaration → lexical_declaration に変わった
+    /// api.mod は、props 型・JSX 利用互換なら compatible (react_component_wrapper) に降格する。
+    /// (レポート 2026-06-02-react-memo-api-mod.md の再現)
+    #[test]
+    fn detect_react_wrapper_jsx_only_usage_is_compatible() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 参照は import + JSX タグのみ (値利用なし)
+        std::fs::write(
+            dir.path().join("TrayPopup.tsx"),
+            "import { ScheduleItem } from './ScheduleItem';\n\
+export function TrayPopup() {\n  return <ScheduleItem foo={1} />;\n}\n",
+        )
+        .expect("write");
+        let result = detect_react_wrapper_compatible_mod(
+            dir.path().to_str().expect("utf-8 path"),
+            "ScheduleItem",
+            "ScheduleItem.tsx",
+            "function",
+            "export function ScheduleItem(props: ScheduleItemProps)",
+            "export const ScheduleItem = memo(function ScheduleItem(props: ScheduleItemProps) {",
+            Some(crate::language::LangId::Tsx),
+        );
+        let compat = result.expect("JSX 利用のみ + props 型同一なら compatible");
+        assert_eq!(compat.reason, "react_component_wrapper");
+        assert_eq!(compat.name, "ScheduleItem");
+    }
+
+    /// memo ラップでもシンボルが関数として直接呼び出されている (`X(...)`) 場合は
+    /// MemoExoticComponent 化で壊れ得るため blocking (api.mod) を維持する。
+    #[test]
+    fn detect_react_wrapper_with_call_usage_stays_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("usage.tsx"),
+            "import { ScheduleItem } from './ScheduleItem';\n\
+const rendered = ScheduleItem({ foo: 1 });\n",
+        )
+        .expect("write");
+        let result = detect_react_wrapper_compatible_mod(
+            dir.path().to_str().expect("utf-8 path"),
+            "ScheduleItem",
+            "ScheduleItem.tsx",
+            "function",
+            "export function ScheduleItem(props: ScheduleItemProps)",
+            "export const ScheduleItem = memo(function ScheduleItem(props: ScheduleItemProps) {",
+            Some(crate::language::LangId::Tsx),
+        );
+        assert!(
+            result.is_none(),
+            "X(...) 直接呼び出しがあれば blocking 維持 (MemoExoticComponent 非互換)"
+        );
+    }
+
+    /// props 型が変わった場合は互換でないため blocking を維持する。
+    #[test]
+    fn detect_react_wrapper_changed_props_type_stays_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("TrayPopup.tsx"),
+            "import { ScheduleItem } from './ScheduleItem';\nexport const x = <ScheduleItem />;\n",
+        )
+        .expect("write");
+        let result = detect_react_wrapper_compatible_mod(
+            dir.path().to_str().expect("utf-8 path"),
+            "ScheduleItem",
+            "ScheduleItem.tsx",
+            "function",
+            "export function ScheduleItem(props: OldProps)",
+            "export const ScheduleItem = memo(function ScheduleItem(props: NewProps) {",
+            Some(crate::language::LangId::Tsx),
+        );
+        assert!(result.is_none(), "props 型が変われば blocking 維持");
+    }
+
+    #[test]
+    fn extract_function_param_list_handles_plain_and_wrapped() {
+        assert_eq!(
+            extract_function_param_list("export function X(props: T)").as_deref(),
+            Some("props: T")
+        );
+        assert_eq!(
+            extract_function_param_list("export const X = memo(function X(props: T) {").as_deref(),
+            Some("props: T")
+        );
+        // arrow function は `function` キーワードが無いので None (保守的に blocking)
+        assert_eq!(
+            extract_function_param_list("export const X = memo((props: T) => {"),
+            None
+        );
+    }
+
+    #[test]
+    fn new_sig_has_react_wrapper_detects_hocs() {
+        assert!(new_sig_has_react_wrapper(
+            "export const X = memo(function X() {"
+        ));
+        assert!(new_sig_has_react_wrapper(
+            "export const X = React.forwardRef(function X() {"
+        ));
+        // 単なる function 宣言や部分一致 (somememo) はラッパーでない
+        assert!(!new_sig_has_react_wrapper("export function X(props: T)"));
+        assert!(!new_sig_has_react_wrapper("export const X = somememo(fn)"));
+    }
+
+    #[test]
+    fn ctx_usage_classification_jsx_vs_value() {
+        // JSX タグ利用は safe
+        assert!(ctx_usage_is_jsx_or_safe(
+            "return <ScheduleItem foo={1} />;",
+            "ScheduleItem"
+        ));
+        assert!(ctx_usage_is_jsx_or_safe(
+            "  </ScheduleItem>",
+            "ScheduleItem"
+        ));
+        // 値利用は blocking 側
+        assert!(!ctx_usage_is_jsx_or_safe(
+            "const x = ScheduleItem({});",
+            "ScheduleItem"
+        ));
+        assert!(!ctx_usage_is_jsx_or_safe(
+            "typeof ScheduleItem",
+            "ScheduleItem"
+        ));
+        assert!(!ctx_usage_is_jsx_or_safe(
+            "ScheduleItem.displayName = 'x';",
+            "ScheduleItem"
+        ));
+        // 裸の代入は判定不能なので blocking 側
+        assert!(!ctx_usage_is_jsx_or_safe(
+            "const Alias = ScheduleItem;",
+            "ScheduleItem"
+        ));
+    }
+
     /// Bash の未 export 関数を caller ごと同一 diff 内で削除した場合は api.rm に出さない。
     /// (レポート 2026-05-01-bash-private-function-removal-flagged-as-api-rm.md の再現)
     /// `dump_shallow_state` / `boundary_is_old_enough` のように、CLI スクリプト内の
@@ -12852,6 +13243,7 @@ def new_public_api():
                 removed_dead: Vec::new(),
                 modified_closed_in_diff: Vec::new(),
                 const_value_changes: Vec::new(),
+                compatible_modified: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -12894,6 +13286,7 @@ def new_public_api():
                 removed_dead: Vec::new(),
                 modified_closed_in_diff: Vec::new(),
                 const_value_changes: Vec::new(),
+                compatible_modified: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -12933,6 +13326,7 @@ def new_public_api():
                 removed_dead: Vec::new(),
                 modified_closed_in_diff: Vec::new(),
                 const_value_changes: Vec::new(),
+                compatible_modified: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -12971,6 +13365,7 @@ def new_public_api():
                 removed_dead: Vec::new(),
                 modified_closed_in_diff: Vec::new(),
                 const_value_changes: Vec::new(),
+                compatible_modified: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -13007,6 +13402,7 @@ def new_public_api():
                     old_signature: Some("pub const ENEMY_SPEED: f32".to_string()),
                     new_signature: Some("pub const ENEMY_SPEED: f32".to_string()),
                 }],
+                compatible_modified: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -13048,6 +13444,7 @@ def new_public_api():
                     old_signature: Some("pub const ENEMY_SPEED: f32".to_string()),
                     new_signature: Some("pub const ENEMY_SPEED: f32".to_string()),
                 }],
+                compatible_modified: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -13103,6 +13500,7 @@ def new_public_api():
                 removed_dead: Vec::new(),
                 modified_closed_in_diff: Vec::new(),
                 const_value_changes: Vec::new(),
+                compatible_modified: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -13180,6 +13578,7 @@ def new_public_api():
                 removed_dead: Vec::new(),
                 modified_closed_in_diff: Vec::new(),
                 const_value_changes: Vec::new(),
+                compatible_modified: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -13251,6 +13650,7 @@ def new_public_api():
                 removed_dead: Vec::new(),
                 modified_closed_in_diff: Vec::new(),
                 const_value_changes: Vec::new(),
+                compatible_modified: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),
@@ -13332,6 +13732,7 @@ def new_public_api():
                 removed_dead: Vec::new(),
                 modified_closed_in_diff: Vec::new(),
                 const_value_changes: Vec::new(),
+                compatible_modified: Vec::new(),
             },
             dead_symbols: Vec::new(),
             test_only_symbols: Vec::new(),

@@ -418,7 +418,27 @@ fn extract_control_flow_refs(content: &str, refs: &mut HashSet<String>) {
                 if q < bytes.len() && bytes[q] == b'=' {
                     q += 1;
                     let start = q;
-                    while q < bytes.len() && bytes[q] != b';' {
+                    // RHS 終端 `;` は文字列リテラル内の `;` を無視して探す
+                    // (`@let x = fn("a;b")` のような式を途中で切らない)
+                    let mut in_str: Option<u8> = None;
+                    while q < bytes.len() {
+                        let b = bytes[q];
+                        if let Some(qt) = in_str {
+                            if b == b'\\' {
+                                q += 2;
+                                continue;
+                            }
+                            if b == qt {
+                                in_str = None;
+                            }
+                            q += 1;
+                            continue;
+                        }
+                        match b {
+                            b'"' | b'\'' | b'`' => in_str = Some(b),
+                            b';' => break,
+                            _ => {}
+                        }
                         q += 1;
                     }
                     if let Ok(expr) = std::str::from_utf8(&bytes[start..q]) {
@@ -454,9 +474,11 @@ fn extract_for_block_refs(expr: &str, refs: &mut HashSet<String>) {
             continue;
         }
         if let Some(of_idx) = find_keyword(seg, "of") {
-            // `item of items`: `of` の左はローカル束縛、右は参照対象
+            // `item of items`: `of` の左 (ループ変数) はローカル束縛として除外集合へ。
+            // 右の iterable 式は `item.children` のように同名 component member を含み得る
+            // ため、locals フィルタを通さず直接参照として扱う (codex 指摘)。
             extract_identifiers(&seg[..of_idx], &mut locals);
-            extract_identifiers(&seg[of_idx + 2..], &mut candidates);
+            extract_identifiers(&seg[of_idx + 2..], refs);
             continue;
         }
         // track 等のセグメント: keyword を除いて識別子抽出
@@ -754,5 +776,29 @@ export class HeaderComponent {
         let refs = collect_angular_template_refs(dir.path());
         assert!(refs.contains("userNameForIcon"));
         assert!(refs.contains("isHeaderFeedbackVisible"));
+    }
+
+    #[test]
+    fn control_flow_for_of_rhs_member_not_filtered_by_loop_var() {
+        // `of` 右辺の `item.children` は同名ループ変数 item があっても member 参照として拾う
+        // (codex 指摘: of 右辺を locals フィルタ対象外にする)
+        let html = "@for (item of item.children; track item.id) { <a></a> }";
+        let mut refs = HashSet::new();
+        extract_control_flow_refs(html, &mut refs);
+        assert!(
+            refs.contains("item"),
+            "of 右辺の item は component member 参照として拾う"
+        );
+        assert!(refs.contains("children"));
+    }
+
+    #[test]
+    fn control_flow_let_rhs_ignores_string_semicolon() {
+        // `@let` RHS の文字列リテラル内 `;` で式を切らない (codex 指摘)
+        let html = r#"@let label = formatPair("a;b", computeTotal());"#;
+        let mut refs = HashSet::new();
+        extract_control_flow_refs(html, &mut refs);
+        assert!(refs.contains("computeTotal"));
+        assert!(refs.contains("formatPair"));
     }
 }
