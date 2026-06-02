@@ -2161,6 +2161,21 @@ fn detect_api_changes(
                 ) {
                     compatible_modified.push(compat);
                 }
+                // exported object のプロパティ削除で、削除されたメンバーへの member-access が
+                // repo 全体で 0 件なら破壊的でないため compatible に降格する。
+                else if let Some(compat) = detect_object_members_compatible_mod(
+                    dir,
+                    base,
+                    &df.old_path,
+                    &df.new_path,
+                    name,
+                    kind,
+                    old_sig,
+                    new_sig,
+                    lang_id_for_file,
+                ) {
+                    compatible_modified.push(compat);
+                }
                 // 全 cross-file 参照が同一 diff 内の変更 hunk で追随済みなら、呼び出し側は
                 // 同一コミットで更新済み。破壊的でないため informational に降格する。
                 else if is_modified_closed_in_diff(dir, name, base, diff_files) {
@@ -2499,6 +2514,194 @@ fn ctx_usage_is_jsx_or_safe(ctx: &str, name: &str) -> bool {
         i += 1;
     }
     saw_occurrence
+}
+
+/// TS/TSX/JS の exported object (`export const X = { ... }`) のプロパティ削除を互換変更
+/// (`unused_object_members`) として判定する。
+///
+/// initializer の object literal の shape (top-level + record value のキー集合) を old/new で
+/// 比較し、削除されたキーが無い (追加のみ) か、削除されたキーすべてが repo 全体で member
+/// access (`.key` / `['key']` / `["key"]`) として参照されていない場合に降格する。
+/// spread / computed key / object でない / 抽出不能 / 同名複数宣言 / 削除キーの参照残存は
+/// すべて blocking 維持 (false negative 回避)。
+#[allow(clippy::too_many_arguments)]
+fn detect_object_members_compatible_mod(
+    dir: &str,
+    base: &str,
+    old_path: &str,
+    new_path: &str,
+    name: &str,
+    kind: &str,
+    old_sig: &str,
+    new_sig: &str,
+    lang_id: Option<crate::language::LangId>,
+) -> Option<CompatibleApiModification> {
+    use crate::language::LangId;
+    let lang =
+        lang_id.filter(|l| matches!(l, LangId::Typescript | LangId::Tsx | LangId::Javascript))?;
+    if !crate::engine::impact::is_safe_diff_path(old_path)
+        || !crate::engine::impact::is_safe_diff_path(new_path)
+    {
+        return None;
+    }
+    validate_git_revision(base, "--base").ok()?;
+    validate_git_revision(old_path, "diff file path").ok()?;
+    let old_output = std::process::Command::new("git")
+        .args(["show", &format!("{base}:{old_path}")])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !old_output.status.success() {
+        return None;
+    }
+    let new_full = std::path::Path::new(dir).join(new_path);
+    let new_utf8 = camino::Utf8Path::from_path(&new_full)?;
+    let new_source = parser::read_file(new_utf8).ok()?;
+    let old_keys = extract_object_member_keys(&old_output.stdout, lang, name)?;
+    let new_keys = extract_object_member_keys(&new_source, lang, name)?;
+    // 削除されたキー (old にあって new にない)。各キーへの member access が repo 全体で
+    // 残っていれば破壊的なので blocking 維持。
+    for key in old_keys.difference(&new_keys) {
+        if key_has_member_access_ref(dir, key) {
+            return None;
+        }
+    }
+    Some(CompatibleApiModification {
+        name: name.to_string(),
+        kind: kind.to_string(),
+        file: new_path.to_string(),
+        old_signature: Some(old_sig.to_string()),
+        new_signature: Some(new_sig.to_string()),
+        reason: "unused_object_members".to_string(),
+    })
+}
+
+/// TS/TSX/JS ソースから、トップレベル exported な `name` の初期化子 object literal の
+/// プロパティキー集合 (top-level + record value のキー) を抽出する。
+/// `as const` / `satisfies T` は unwrap する。object literal でない / spread / computed key /
+/// 宣言が見つからない / 同名複数なら None (呼び出し側で blocking 維持)。
+fn extract_object_member_keys(
+    source: &[u8],
+    lang_id: crate::language::LangId,
+    name: &str,
+) -> Option<std::collections::HashSet<String>> {
+    use std::collections::HashSet;
+    let tree = parser::parse_source(source, lang_id).ok()?;
+    let root = tree.root_node();
+    let decls = find_toplevel_decls_named(root, name, source);
+    if decls.len() != 1 {
+        return None;
+    }
+    let value = decls[0].child_by_field_name("value")?;
+    let obj = unwrap_to_object_literal(value)?;
+    let mut keys = HashSet::new();
+    collect_object_keys(obj, source, &mut keys)?;
+    Some(keys)
+}
+
+/// `expr as const` / `expr satisfies T` をはがして object literal ノードを返す。
+fn unwrap_to_object_literal(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    let mut cur = node;
+    loop {
+        match cur.kind() {
+            "object" => return Some(cur),
+            "as_expression" | "satisfies_expression" => {
+                cur = cur.named_child(0)?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// object literal の property キーを再帰的に集める。value が object literal (record 形式) なら
+/// その value のキーも集める。spread (`...x`) / computed key (`[expr]:`) があれば None。
+fn collect_object_keys(
+    obj: tree_sitter::Node,
+    source: &[u8],
+    keys: &mut std::collections::HashSet<String>,
+) -> Option<()> {
+    let mut cursor = obj.walk();
+    for child in obj.named_children(&mut cursor) {
+        match child.kind() {
+            "pair" => {
+                let key = child.child_by_field_name("key")?;
+                match key.kind() {
+                    "property_identifier" | "shorthand_property_identifier" => {
+                        keys.insert(key.utf8_text(source).ok()?.to_string());
+                    }
+                    "string" => {
+                        let raw = key.utf8_text(source).ok()?;
+                        keys.insert(
+                            raw.trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
+                                .to_string(),
+                        );
+                    }
+                    // computed key は静的解析できないので blocking
+                    _ => return None,
+                }
+                if let Some(value) = child.child_by_field_name("value")
+                    && let Some(nested) = unwrap_to_object_literal(value)
+                {
+                    collect_object_keys(nested, source, keys)?;
+                }
+            }
+            "shorthand_property_identifier" => {
+                keys.insert(child.utf8_text(source).ok()?.to_string());
+            }
+            // spread は shape を静的確定できないので blocking
+            "spread_element" => return None,
+            _ => {}
+        }
+    }
+    Some(())
+}
+
+/// `key` への member access (`.key` / `['key']` / `["key"]`) が repo 全体に残っているか。
+/// 解析失敗は保守的に true (残存ありとみなし blocking)。
+fn key_has_member_access_ref(dir: &str, key: &str) -> bool {
+    let refs = match crate::engine::refs::find_references(key, std::path::Path::new(dir), None) {
+        Ok(r) => r,
+        Err(_) => return true,
+    };
+    for r in &refs {
+        let Some(ctx) = r.context.as_deref() else {
+            return true;
+        };
+        if ctx_has_member_access(ctx, key) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 参照行 `ctx` 内に `key` への member access (`.key` / `['key']` / `["key"]`) があるか。
+fn ctx_has_member_access(ctx: &str, key: &str) -> bool {
+    let bytes = ctx.as_bytes();
+    let kb = key.as_bytes();
+    if kb.is_empty() {
+        return false;
+    }
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    let mut i = 0;
+    while i + kb.len() <= bytes.len() {
+        if &bytes[i..i + kb.len()] == kb {
+            let after = bytes.get(i + kb.len()).copied();
+            let after_boundary = after.is_none_or(|b| !is_ident(b));
+            if after_boundary {
+                // `.key` (直前が `.`)
+                if i > 0 && bytes[i - 1] == b'.' {
+                    return true;
+                }
+                // `['key']` / `["key"]` (直前が引用符でさらに前が `[`)
+                if i >= 2 && (bytes[i - 1] == b'\'' || bytes[i - 1] == b'"') && bytes[i - 2] == b'['
+                {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// modified シンボルの全 cross-file 参照が同一 diff 内の変更 hunk で追随済みかを判定する。
@@ -11463,6 +11666,137 @@ export const TaskKanbanCard = memo(function TaskKanbanCard() {\n\
             "mod_compat は情報提供として hook JSON に出すべき"
         );
         assert!(!build.is_blocking, "mod_compat (互換変更) は非 blocking");
+    }
+
+    /// exported object のプロパティ削除で、削除キーへの member access が repo 全体で 0 件なら
+    /// compatible (unused_object_members) に降格する。(レポート 2026-06-02-provider-avatar の再現)
+    #[test]
+    fn detect_object_members_removed_unreferenced_key_is_compatible() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        // old: record value に bgColor。参照側は label のみ使用 (bgColor は未参照)
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "config.tsx",
+                    "export const providerConfig = {\n  google: { label: 'G', bgColor: 'green' },\n};\n",
+                ),
+                (
+                    "App.tsx",
+                    "import { providerConfig } from './config';\nexport const x = providerConfig.google.label;\n",
+                ),
+            ],
+            "initial",
+        );
+        // new: bgColor 削除 + bgClass 追加
+        fs::write(
+            repo.join("config.tsx"),
+            "export const providerConfig = {\n  google: { label: 'G', bgClass: 'bg-green' },\n};\n",
+        )
+        .expect("write");
+        let result = detect_object_members_compatible_mod(
+            repo.to_str().expect("utf-8 path"),
+            "HEAD",
+            "config.tsx",
+            "config.tsx",
+            "providerConfig",
+            "constant",
+            "old",
+            "new",
+            Some(crate::language::LangId::Tsx),
+        );
+        let compat = result.expect("削除キー bgColor が未参照なら compatible");
+        assert_eq!(compat.reason, "unused_object_members");
+    }
+
+    /// 削除されたキーが member access (`config.google.bgColor`) で残存していれば破壊的なので
+    /// blocking 維持。
+    #[test]
+    fn detect_object_members_removed_referenced_key_stays_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "config.tsx",
+                    "export const providerConfig = {\n  google: { label: 'G', bgColor: 'green' },\n};\n",
+                ),
+                (
+                    "App.tsx",
+                    "import { providerConfig } from './config';\nexport const x = providerConfig.google.bgColor;\n",
+                ),
+            ],
+            "initial",
+        );
+        fs::write(
+            repo.join("config.tsx"),
+            "export const providerConfig = {\n  google: { label: 'G', bgClass: 'bg-green' },\n};\n",
+        )
+        .expect("write");
+        let result = detect_object_members_compatible_mod(
+            repo.to_str().expect("utf-8 path"),
+            "HEAD",
+            "config.tsx",
+            "config.tsx",
+            "providerConfig",
+            "constant",
+            "old",
+            "new",
+            Some(crate::language::LangId::Tsx),
+        );
+        assert!(
+            result.is_none(),
+            "削除キー bgColor が member access で残存 → blocking 維持"
+        );
+    }
+
+    /// spread (`...base`) を含む object は shape を静的確定できないため blocking 維持。
+    #[test]
+    fn detect_object_members_spread_stays_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[("config.tsx", "export const c = { ...base, a: 1 };\n")],
+            "initial",
+        );
+        fs::write(
+            repo.join("config.tsx"),
+            "export const c = { ...base, b: 2 };\n",
+        )
+        .expect("write");
+        let result = detect_object_members_compatible_mod(
+            repo.to_str().expect("utf-8 path"),
+            "HEAD",
+            "config.tsx",
+            "config.tsx",
+            "c",
+            "constant",
+            "old",
+            "new",
+            Some(crate::language::LangId::Tsx),
+        );
+        assert!(result.is_none(), "spread を含む object は blocking 維持");
+    }
+
+    #[test]
+    fn extract_object_member_keys_collects_record_value_keys() {
+        // record 形式: top-level (google/openai) + value object のキー (label/bgColor) を集める
+        let src = b"export const c = {\n  google: { label: 'G', bgColor: 'green' },\n  openai: { label: 'O', bgColor: 'blue' },\n};\n";
+        let keys = extract_object_member_keys(src, crate::language::LangId::Tsx, "c")
+            .expect("record keys");
+        assert!(keys.contains("google"));
+        assert!(keys.contains("openai"));
+        assert!(keys.contains("label"));
+        assert!(keys.contains("bgColor"));
+        // spread を含むと None (blocking)
+        let spread = b"export const c = { ...base, a: 1 };\n";
+        assert!(extract_object_member_keys(spread, crate::language::LangId::Tsx, "c").is_none());
     }
 
     #[test]
