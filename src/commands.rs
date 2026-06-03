@@ -5207,6 +5207,13 @@ fn partition_removed_dead_candidates(
         }
     };
 
+    // 外部パッケージ (package.json deps) から import された同名 binding は、削除した
+    // ローカルシンボルとは別物 (例: tailwindcss の `Config` 型) なので参照カウントから
+    // 除外する。これがないと汎用名の削除が外部同名 import を拾って api.rm に誤分類される
+    // (codex 設計合意。full TS resolver は入れず、証明できる外部 import binding のみ除外)。
+    let external_pkgs = load_external_package_names(dir);
+    let mut external_cache: HashMap<(String, String), bool> = HashMap::new();
+
     // bare_name -> (def_count, ref_count)
     let mut counts: HashMap<String, (usize, usize)> = HashMap::new();
     for r in &batch_result {
@@ -5215,9 +5222,17 @@ fn partition_removed_dead_candidates(
         for x in &r.references {
             if x.kind == Some(RefKind::Definition) {
                 def_count += 1;
-            } else {
-                ref_count += 1;
+                continue;
             }
+            // 外部パッケージ import 由来の同名 binding を持つファイルの参照は数えない。
+            let key = (x.path.clone(), r.symbol.clone());
+            let is_external = *external_cache.entry(key).or_insert_with(|| {
+                ref_binds_symbol_from_external_package(dir, &x.path, &r.symbol, &external_pkgs)
+            });
+            if is_external {
+                continue;
+            }
+            ref_count += 1;
         }
         counts.insert(r.symbol.clone(), (def_count, ref_count));
     }
@@ -5240,6 +5255,148 @@ fn partition_removed_dead_candidates(
     }
 
     (removed_kept, removed_dead)
+}
+
+/// `<dir>/package.json` の dependencies / devDependencies / peerDependencies /
+/// optionalDependencies のキー (外部パッケージ名) を集める。package.json 不在 / パース
+/// 失敗時は空集合 (= 何も除外しない、保守的)。
+fn load_external_package_names(dir: &str) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    let path = std::path::Path::new(dir).join("package.json");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return HashSet::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return HashSet::new();
+    };
+    let mut pkgs = HashSet::new();
+    for key in [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ] {
+        if let Some(obj) = json.get(key).and_then(|v| v.as_object()) {
+            for name in obj.keys() {
+                pkgs.insert(name.clone());
+            }
+        }
+    }
+    pkgs
+}
+
+/// import specifier から npm パッケージ名を取り出す。相対 (`./` `../` `/`) / alias
+/// (`@/` `~/` `#`) は外部パッケージではないため None (保守的に内部扱い)。scoped は
+/// `@scope/pkg`、bare は最初のセグメント。
+fn import_specifier_package_name(spec: &str) -> Option<String> {
+    if spec.is_empty()
+        || spec.starts_with("./")
+        || spec.starts_with("../")
+        || spec.starts_with('/')
+        || spec.starts_with("@/")
+        || spec.starts_with("~/")
+        || spec.starts_with('#')
+    {
+        return None;
+    }
+    if let Some(scoped) = spec.strip_prefix('@') {
+        // @scope/pkg[/sub]
+        let mut parts = scoped.splitn(3, '/');
+        let scope = parts.next()?;
+        let pkg = parts.next()?;
+        if scope.is_empty() || pkg.is_empty() {
+            return None;
+        }
+        return Some(format!("@{scope}/{pkg}"));
+    }
+    spec.split('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// `ref_path` の TS/JS ファイル内で、`symbol` が外部パッケージ (`external_pkgs`) からの
+/// import で束縛されているか。束縛されていれば、そのファイルの `symbol` 参照は削除した
+/// ローカルシンボルとは別物 (別モジュールの同名型) と判断できる。
+/// 非 TS/JS / 読み込み・parse 失敗 / external_pkgs 空は false (除外しない、保守的)。
+fn ref_binds_symbol_from_external_package(
+    dir: &str,
+    ref_path: &str,
+    symbol: &str,
+    external_pkgs: &std::collections::HashSet<String>,
+) -> bool {
+    use crate::language::LangId;
+    if external_pkgs.is_empty() {
+        return false;
+    }
+    let abs = if std::path::Path::new(ref_path).is_absolute() {
+        std::path::PathBuf::from(ref_path)
+    } else {
+        std::path::Path::new(dir).join(ref_path)
+    };
+    let Some(utf8) = camino::Utf8Path::from_path(&abs) else {
+        return false;
+    };
+    let Ok(lang) = LangId::from_path(utf8) else {
+        return false;
+    };
+    if !matches!(lang, LangId::Javascript | LangId::Typescript | LangId::Tsx) {
+        return false;
+    }
+    let Ok(source) = parser::read_file(utf8) else {
+        return false;
+    };
+    let Ok(tree) = parser::parse_source(&source, lang) else {
+        return false;
+    };
+    import_binds_symbol_from_external(tree.root_node(), &source, symbol, external_pkgs)
+}
+
+/// program 直下の import_statement を走査し、external_pkgs からの import で `symbol` を
+/// 束縛するものがあれば true。
+fn import_binds_symbol_from_external(
+    root: tree_sitter::Node,
+    source: &[u8],
+    symbol: &str,
+    external_pkgs: &std::collections::HashSet<String>,
+) -> bool {
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if child.kind() != "import_statement" {
+            continue;
+        }
+        let Some(src_node) = child.child_by_field_name("source") else {
+            continue;
+        };
+        let Some(spec) = static_js_string_text(src_node, source) else {
+            continue;
+        };
+        let Some(pkg) = import_specifier_package_name(spec) else {
+            continue;
+        };
+        if !external_pkgs.contains(&pkg) {
+            continue;
+        }
+        // import_clause subtree に symbol identifier (named import 名 / alias / default /
+        // namespace) があれば、その import がこのファイルの symbol 束縛源。source は string
+        // ノードなので identifier 走査では誤マッチしない。
+        if node_subtree_has_identifier(child, source, symbol) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `node` の subtree に identifier / type_identifier で `name` に一致するものがあるか。
+fn node_subtree_has_identifier(node: tree_sitter::Node, source: &[u8], name: &str) -> bool {
+    if matches!(node.kind(), "identifier" | "type_identifier")
+        && node.utf8_text(source).ok() == Some(name)
+    {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|c| node_subtree_has_identifier(c, source, name))
 }
 
 /// 削除されたシンボル `name` が、変更後のツリー全体のどこからも参照されていないかを判定する。
@@ -9880,6 +10037,149 @@ class B:
             !removed_dead_names.contains(&"bar"),
             "参照ありの削除は removed_dead に振り分けてはならない。got: {removed_dead_names:?}"
         );
+    }
+
+    /// 削除した interface `Config` の唯一の HEAD 参照が外部パッケージ (tailwindcss) の同名
+    /// import 由来なら、別モジュールの型として参照カウントから除外し api.rm ではなく
+    /// api.rm_dead に振り分ける。(レポート 2026-06-03-extension-task-only-cleanup の再現)
+    #[test]
+    fn detect_api_changes_removed_symbol_with_external_import_same_name_is_dead() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "package.json",
+                    "{\n  \"devDependencies\": { \"tailwindcss\": \"^3.4.0\" }\n}\n",
+                ),
+                (
+                    "lib/config.ts",
+                    "export interface Config {\n  url: string;\n}\nexport function getConfig(): Config {\n  return { url: '' };\n}\n",
+                ),
+                (
+                    "tailwind.config.ts",
+                    "import type { Config } from \"tailwindcss\";\nexport default {} satisfies Config;\n",
+                ),
+            ],
+            "initial",
+        );
+        // lib/config.ts から Config / getConfig を削除 (tailwind.config.ts は無関係な別 Config)
+        fs::write(repo.join("lib/config.ts"), "export const VERSION = '1';\n").expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "lib/config.ts".to_string(),
+            new_path: "lib/config.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 6,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        let removed_dead: Vec<&str> = api_changes
+            .removed_dead
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !removed.contains(&"Config"),
+            "外部 import (tailwindcss) の同名 Config は参照に数えず、Config は api.rm に出ない。got removed: {removed:?}"
+        );
+        assert!(
+            removed_dead.contains(&"Config"),
+            "Config は removed_dead に振り分けられるべき。got removed_dead: {removed_dead:?}"
+        );
+    }
+
+    /// 削除シンボルが内部 (相対 import) で実際に参照されている場合は、外部 import 除外の
+    /// 対象外で api.rm (破壊的削除) を維持する (false negative 防止)。
+    #[test]
+    fn detect_api_changes_removed_symbol_with_internal_relative_reference_stays_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "package.json",
+                    "{\n  \"devDependencies\": { \"tailwindcss\": \"^3.4.0\" }\n}\n",
+                ),
+                (
+                    "lib/config.ts",
+                    "export interface Config {\n  url: string;\n}\n",
+                ),
+                (
+                    "app.ts",
+                    "import type { Config } from \"./lib/config\";\nexport const c: Config = { url: '' };\n",
+                ),
+            ],
+            "initial",
+        );
+        // Config を削除するが app.ts は相対 import で参照を維持 (破壊的削除)
+        fs::write(repo.join("lib/config.ts"), "export const X = 1;\n").expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "lib/config.ts".to_string(),
+            new_path: "lib/config.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.contains(&"Config"),
+            "相対 import で内部参照される Config は api.rm を維持すべき。got removed: {removed:?}"
+        );
+    }
+
+    #[test]
+    fn import_specifier_package_name_classifies_internal_and_external() {
+        // 外部パッケージ
+        assert_eq!(
+            import_specifier_package_name("tailwindcss").as_deref(),
+            Some("tailwindcss")
+        );
+        assert_eq!(
+            import_specifier_package_name("tailwindcss/plugin").as_deref(),
+            Some("tailwindcss")
+        );
+        assert_eq!(
+            import_specifier_package_name("@scope/pkg").as_deref(),
+            Some("@scope/pkg")
+        );
+        assert_eq!(
+            import_specifier_package_name("@scope/pkg/sub").as_deref(),
+            Some("@scope/pkg")
+        );
+        // 相対 / alias は None (内部、除外しない)
+        assert_eq!(import_specifier_package_name("./config"), None);
+        assert_eq!(import_specifier_package_name("../lib/config"), None);
+        assert_eq!(import_specifier_package_name("@/config"), None);
+        assert_eq!(import_specifier_package_name("~/config"), None);
+        assert_eq!(import_specifier_package_name("#internal"), None);
     }
 
     /// detect_api_changes の早期 continue 経路 (closed-in-diff for api.rm) でも
