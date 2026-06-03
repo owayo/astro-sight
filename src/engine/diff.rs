@@ -2,6 +2,63 @@ use std::collections::HashSet;
 
 use crate::models::impact::{DiffFile, HunkInfo};
 
+/// hunk 本体の 1 行を分類した結果。
+pub(crate) enum HunkBodyLine<'a> {
+    /// 追加行 (`+`)。先頭の `+` を除いた内容を保持する。
+    Added(&'a str),
+    /// 削除行 (`-`)。先頭の `-` を除いた内容を保持する。
+    Removed(&'a str),
+    /// コンテキスト行 (` ` または空行)。
+    Context,
+    /// `\ No newline at end of file` 等の metadata 行 (行数に数えない)。
+    Metadata,
+}
+
+/// hunk ヘッダで宣言された old/new の残り行数を追跡し、本体行を消費する。
+///
+/// 本体を消費し切る (`is_complete`) まではファイル/hunk ヘッダ判定を行わないことで、
+/// 削除/追加行のコンテンツが `--- a/...` / `+++ b/...` の形でも誤認しない
+/// (hunk 途中で次ファイルヘッダと誤判定し以降の本体が脱落する false negative の防止)。
+pub(crate) struct HunkProgress {
+    old_remaining: usize,
+    new_remaining: usize,
+}
+
+impl HunkProgress {
+    pub(crate) fn new(hunk: &HunkInfo) -> Self {
+        Self {
+            old_remaining: hunk.old_count,
+            new_remaining: hunk.new_count,
+        }
+    }
+
+    /// 本体 1 行を消費して old/new の残数を減らし、行種別を返す。
+    pub(crate) fn consume<'a>(&mut self, line: &'a str) -> HunkBodyLine<'a> {
+        match line.as_bytes().first() {
+            Some(b'+') => {
+                self.new_remaining = self.new_remaining.saturating_sub(1);
+                HunkBodyLine::Added(&line[1..])
+            }
+            Some(b'-') => {
+                self.old_remaining = self.old_remaining.saturating_sub(1);
+                HunkBodyLine::Removed(&line[1..])
+            }
+            // `\ No newline at end of file` は old/new いずれの行数にも数えない。
+            Some(b'\\') => HunkBodyLine::Metadata,
+            _ => {
+                // 先頭スペースの context 行、および末尾の空行を context として扱う。
+                self.old_remaining = self.old_remaining.saturating_sub(1);
+                self.new_remaining = self.new_remaining.saturating_sub(1);
+                HunkBodyLine::Context
+            }
+        }
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        self.old_remaining == 0 && self.new_remaining == 0
+    }
+}
+
 /// 単一ファイルの unified diff から、new 側で実際に追加された行 (`+` 行) の
 /// 0-indexed 行番号 set を抽出する。
 ///
@@ -19,48 +76,46 @@ use crate::models::impact::{DiffFile, HunkInfo};
 pub fn extract_changed_new_lines(input: &str, file_path: &str) -> HashSet<usize> {
     let mut result: HashSet<usize> = HashSet::new();
     let mut in_target_file = false;
-    let mut in_hunk = false;
+    let mut active_hunk: Option<HunkProgress> = None;
     let mut current_new_line: usize = 0;
 
     for line in input.lines() {
+        // hunk 本体を消費中はヘッダに見える行も本体行として扱う。target 外の hunk でも
+        // count を追跡し、本体内の `+++ b/<target>` で対象ファイルへ誤って切り替わるのを防ぐ。
+        if let Some(progress) = active_hunk.as_mut() {
+            let consumed = progress.consume(line);
+            if in_target_file {
+                match consumed {
+                    HunkBodyLine::Added(_) => {
+                        if current_new_line > 0 {
+                            result.insert(current_new_line - 1);
+                        }
+                        current_new_line += 1;
+                    }
+                    HunkBodyLine::Context => {
+                        current_new_line += 1;
+                    }
+                    // 削除行は new 側に存在せず、metadata 行は行数に数えない。
+                    HunkBodyLine::Removed(_) | HunkBodyLine::Metadata => {}
+                }
+            }
+            if progress.is_complete() {
+                active_hunk = None;
+            }
+            continue;
+        }
+
         if line.starts_with("--- ") {
             in_target_file = false;
-            in_hunk = false;
         } else if let Some(path) = line.strip_prefix("+++ b/") {
             in_target_file = path == file_path;
-            in_hunk = false;
         } else if line.starts_with("+++ ") {
             in_target_file = false;
-            in_hunk = false;
-        } else if line.starts_with("@@ ") {
-            if in_target_file && let Some(hunk) = parse_hunk_header(line) {
-                current_new_line = hunk.new_start;
-                in_hunk = true;
-            } else {
-                in_hunk = false;
-            }
-        } else if in_hunk && in_target_file {
-            match line.as_bytes().first() {
-                Some(b'+') => {
-                    if current_new_line > 0 {
-                        result.insert(current_new_line - 1);
-                    }
-                    current_new_line += 1;
-                }
-                Some(b'-') => {
-                    // 削除行は new 側に存在しないため new_line は進めない
-                }
-                Some(b' ') => {
-                    current_new_line += 1;
-                }
-                Some(b'\\') => {
-                    // `\ No newline at end of file` 等の metadata は無視
-                }
-                _ => {
-                    // 空行は context 扱い
-                    current_new_line += 1;
-                }
-            }
+        } else if line.starts_with("@@ ")
+            && let Some(hunk) = parse_hunk_header(line)
+        {
+            current_new_line = hunk.new_start;
+            active_hunk = Some(HunkProgress::new(&hunk));
         }
     }
 
@@ -78,9 +133,27 @@ pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
     let mut current_new_path: Option<String> = None;
     let mut current_hunks: Vec<HunkInfo> = Vec::new();
     let mut current_deleted_lines: Vec<u8> = Vec::new();
-    let mut in_hunk = false;
+    let mut active_hunk: Option<HunkProgress> = None;
 
     for line in input.lines() {
+        // hunk 本体を消費中は、`--- a/...` / `+++ b/...` に見える行も本体行として扱い、
+        // ファイルヘッダ判定へ落とさない (削除/追加行のコンテンツが diff ヘッダと衝突する
+        // ケースで以降の hunk 本体が脱落する false negative を防ぐ)。
+        if let Some(progress) = active_hunk.as_mut() {
+            let consumed = progress.consume(line);
+            if current_new_path.as_deref() == Some("/dev/null")
+                && let HunkBodyLine::Removed(removed) = consumed
+            {
+                // 削除ファイルの hunk 内 `-` 行を旧ソース順で蓄積する。
+                current_deleted_lines.extend_from_slice(removed.as_bytes());
+                current_deleted_lines.push(b'\n');
+            }
+            if progress.is_complete() {
+                active_hunk = None;
+            }
+            continue;
+        }
+
         if let Some(path) = line.strip_prefix("--- a/") {
             // 直前のファイル情報を確定
             flush_file(
@@ -91,7 +164,6 @@ pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
                 &mut current_deleted_lines,
             );
             current_old_path = Some(path.to_string());
-            in_hunk = false;
         } else if line.starts_with("--- /dev/null") {
             flush_file(
                 &mut files,
@@ -101,26 +173,15 @@ pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
                 &mut current_deleted_lines,
             );
             current_old_path = Some("/dev/null".to_string());
-            in_hunk = false;
         } else if let Some(path) = line.strip_prefix("+++ b/") {
             current_new_path = Some(path.to_string());
         } else if line.starts_with("+++ /dev/null") {
             current_new_path = Some("/dev/null".to_string());
-        } else if line.starts_with("@@ ") {
-            if let Some(hunk) = parse_hunk_header(line) {
-                current_hunks.push(hunk);
-                in_hunk = true;
-            } else {
-                in_hunk = false;
-            }
-        } else if in_hunk
-            && current_new_path.as_deref() == Some("/dev/null")
-            && let Some(removed) = line.strip_prefix('-')
+        } else if line.starts_with("@@ ")
+            && let Some(hunk) = parse_hunk_header(line)
         {
-            // 削除ファイルの hunk 内 `-` 行を旧ソース順で蓄積する
-            // (`---` ヘッダは `--- a/` / `--- /dev/null` で先に処理済み)。
-            current_deleted_lines.extend_from_slice(removed.as_bytes());
-            current_deleted_lines.push(b'\n');
+            active_hunk = Some(HunkProgress::new(&hunk));
+            current_hunks.push(hunk);
         }
     }
 
@@ -163,7 +224,7 @@ fn flush_file(
 }
 
 /// `"@@ -10,5 +10,8 @@"` や `"@@ -10,5 +10,8 @@ fn foo()"` の hunk ヘッダを解析する。
-fn parse_hunk_header(line: &str) -> Option<HunkInfo> {
+pub(crate) fn parse_hunk_header(line: &str) -> Option<HunkInfo> {
     // 先頭の `"@@ "` を除去
     let rest = line.strip_prefix("@@ ")?;
     // 終端の `" @@"` の位置を探す
@@ -222,15 +283,16 @@ index abc1234..def5678 100644
 
     #[test]
     fn parse_multi_file_diff() {
+        // 各 hunk の count を本体行数と一致させた簡略 diff (追加 1 行ずつ)。
         let diff = r#"--- a/src/foo.rs
 +++ b/src/foo.rs
-@@ -1,3 +1,4 @@
+@@ -1,0 +1,1 @@
 +use bar;
 --- a/src/bar.rs
 +++ b/src/bar.rs
-@@ -5,2 +5,3 @@
+@@ -5,0 +5,1 @@
 +fn new_fn() {}
-@@ -20,4 +21,6 @@
+@@ -20,0 +21,1 @@
 +// comment
 "#;
         let files = parse_unified_diff(diff);
@@ -352,5 +414,31 @@ index 1234567..0000000
         let mut sorted: Vec<_> = changed.into_iter().collect();
         sorted.sort();
         assert_eq!(sorted, vec![0, 1, 2]);
+    }
+
+    /// hunk 本体の削除/追加行コンテンツが `--- a/...` / `+++ b/...` の形でも、
+    /// ファイルヘッダと誤認せず後続の本体を取りこぼさない (false negative 回帰防止)。
+    #[test]
+    fn parse_unified_diff_body_line_looks_like_header() {
+        // hunk は old=2,new=2。削除行コンテンツが `-- a/x` (diff 行で `--- a/x`)、
+        // 追加行コンテンツが `++ b/x` (diff 行で `+++ b/x`)。
+        let diff = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n--- a/x\n+++ b/x\n";
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 1, "本体行をヘッダ誤認して別ファイル化しない");
+        assert_eq!(files[0].new_path, "src/lib.rs");
+        assert_eq!(files[0].hunks.len(), 1);
+    }
+
+    /// extract_changed_new_lines も hunk 本体の `+++ b/...` 行を追加行として数え、
+    /// ファイルヘッダと誤認しない。
+    #[test]
+    fn extract_changed_new_lines_body_line_looks_like_header() {
+        // target=foo.rs。hunk old=1,new=2。本体に `+++ b/x` (追加行コンテンツ `++ b/x`)。
+        let diff = "--- a/foo.rs\n+++ b/foo.rs\n@@ -1,1 +1,2 @@\n existing\n+++ b/x\n";
+        let changed = extract_changed_new_lines(diff, "foo.rs");
+        // new_start=1: line1 ' existing'(context), line2 '+++ b/x'(added → 0-indexed 1)
+        let mut sorted: Vec<_> = changed.into_iter().collect();
+        sorted.sort();
+        assert_eq!(sorted, vec![1]);
     }
 }

@@ -506,6 +506,17 @@ mod tests {
         assert!(refs.contains("greeting"));
     }
 
+    /// `@let` の文字列リテラルが末尾バックスラッシュで終わっても slice 範囲外パニックしない
+    #[test]
+    fn let_unterminated_string_escape_no_panic() {
+        let mut refs = HashSet::new();
+        // RHS 文字列が末尾 `\` で終わる (エスケープ未完) 入力。
+        // 修正前は q がバッファ長を超え `&bytes[start..q]` でパニックしていた。
+        extract_control_flow_refs("@let x = \"\\", &mut refs);
+        // パニックしないことが目的 (refs 内容は問わない)
+        let _ = refs;
+    }
+
     #[test]
     fn event_binding_extracts_handler() {
         let html = r#"<input (ngModelChange)="onCellCheckChanged()">"#;

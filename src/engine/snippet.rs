@@ -86,6 +86,23 @@ mod tests {
         assert!(snippet.contains(">"));
     }
 
+    /// line がファイル行数を超えても usize 減算アンダーフローでパニックしない
+    /// (修正前は debug ビルドで `end - start` がパニックしていた)
+    #[test]
+    fn snippet_line_beyond_eof_no_underflow() {
+        let source = "only\ntwo\n";
+        let snippet = generate_snippet(source, 999_999, 2);
+        assert!(snippet.is_empty());
+    }
+
+    /// range スニペットも範囲超過で `view_end - view_start` のアンダーフローを起こさない
+    #[test]
+    fn range_snippet_beyond_eof_no_underflow() {
+        let source = "only\ntwo\n";
+        let snippet = generate_range_snippet(source, 999_999, 1_000_000, 2);
+        assert!(snippet.is_empty());
+    }
+
     #[test]
     fn snippet_start_of_file() {
         let source = "first\nsecond\nthird\n";

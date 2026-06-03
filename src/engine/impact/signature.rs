@@ -1,3 +1,4 @@
+use crate::engine::diff::{HunkBodyLine, HunkProgress, parse_hunk_header};
 use crate::language::{LangId, normalize_identifier};
 use crate::models::impact::{AffectedSymbol, SignatureChange};
 
@@ -21,10 +22,28 @@ pub(crate) fn detect_signature_changes(
 ) -> Vec<SignatureChange> {
     let mut changes = Vec::new();
     let mut in_file = false;
+    let mut active_hunk: Option<HunkProgress> = None;
     let mut removed_lines = Vec::new();
     let mut added_lines = Vec::new();
 
     for line in diff_input.lines() {
+        // hunk 本体を消費中はヘッダに見える行も本体行として扱う
+        // (削除/追加行コンテンツが `--- a/...` / `+++ b/...` の形でも誤認しない)。
+        if let Some(progress) = active_hunk.as_mut() {
+            let consumed = progress.consume(line);
+            if in_file {
+                match consumed {
+                    HunkBodyLine::Removed(c) => removed_lines.push(c.to_string()),
+                    HunkBodyLine::Added(c) => added_lines.push(c.to_string()),
+                    HunkBodyLine::Context | HunkBodyLine::Metadata => {}
+                }
+            }
+            if progress.is_complete() {
+                active_hunk = None;
+            }
+            continue;
+        }
+
         if line.starts_with("+++ b/") {
             let path = line.strip_prefix("+++ b/").unwrap_or("");
             in_file = path == file_path;
@@ -32,14 +51,10 @@ pub(crate) fn detect_signature_changes(
                 removed_lines.clear();
                 added_lines.clear();
             }
-        } else if line.starts_with("--- ") {
-            // 次の +++ 行で処理される
-        } else if in_file {
-            if let Some(content) = line.strip_prefix('-') {
-                removed_lines.push(content.to_string());
-            } else if let Some(content) = line.strip_prefix('+') {
-                added_lines.push(content.to_string());
-            }
+        } else if line.starts_with("@@ ")
+            && let Some(hunk) = parse_hunk_header(line)
+        {
+            active_hunk = Some(HunkProgress::new(&hunk));
         }
     }
 
@@ -155,20 +170,37 @@ pub(crate) fn is_definition_header_in_changed_lines(
     };
 
     let mut in_file = false;
+    let mut active_hunk: Option<HunkProgress> = None;
     for line in diff_input.lines() {
-        if line.starts_with("+++ b/") {
-            in_file = line.strip_prefix("+++ b/").unwrap_or("") == file_path;
-        } else if in_file
-            && ((line.starts_with('+') && !line.starts_with("+++"))
-                || (line.starts_with('-') && !line.starts_with("---")))
-        {
-            let content = &line[1..];
-            for kw in keywords {
-                let pattern = format!("{kw} {symbol_name}");
-                if text_contains(content, &pattern, lang_id) {
-                    return true;
+        // hunk 本体を消費中はヘッダに見える行も本体行として扱う (FN 防止)。
+        if let Some(progress) = active_hunk.as_mut() {
+            let consumed = progress.consume(line);
+            if in_file {
+                let content = match consumed {
+                    HunkBodyLine::Added(c) | HunkBodyLine::Removed(c) => Some(c),
+                    HunkBodyLine::Context | HunkBodyLine::Metadata => None,
+                };
+                if let Some(content) = content {
+                    for kw in keywords {
+                        let pattern = format!("{kw} {symbol_name}");
+                        if text_contains(content, &pattern, lang_id) {
+                            return true;
+                        }
+                    }
                 }
             }
+            if progress.is_complete() {
+                active_hunk = None;
+            }
+            continue;
+        }
+
+        if line.starts_with("+++ b/") {
+            in_file = line.strip_prefix("+++ b/").unwrap_or("") == file_path;
+        } else if line.starts_with("@@ ")
+            && let Some(hunk) = parse_hunk_header(line)
+        {
+            active_hunk = Some(HunkProgress::new(&hunk));
         }
     }
 
@@ -186,16 +218,35 @@ pub(crate) fn is_symbol_in_changed_lines(
     lang_id: LangId,
 ) -> bool {
     let mut in_file = false;
+    let mut active_hunk: Option<HunkProgress> = None;
 
     for line in diff_input.lines() {
+        // hunk 本体を消費中はヘッダに見える行も本体行として扱う (FN 防止)。
+        if let Some(progress) = active_hunk.as_mut() {
+            let consumed = progress.consume(line);
+            if in_file {
+                let content = match consumed {
+                    HunkBodyLine::Added(c) | HunkBodyLine::Removed(c) => Some(c),
+                    HunkBodyLine::Context | HunkBodyLine::Metadata => None,
+                };
+                if let Some(content) = content
+                    && line_has_identifier(content, symbol_name, lang_id)
+                {
+                    return true;
+                }
+            }
+            if progress.is_complete() {
+                active_hunk = None;
+            }
+            continue;
+        }
+
         if line.starts_with("+++ b/") {
             in_file = line.strip_prefix("+++ b/").unwrap_or("") == file_path;
-        } else if in_file
-            && ((line.starts_with('+') && !line.starts_with("+++"))
-                || (line.starts_with('-') && !line.starts_with("---")))
-            && line_has_identifier(&line[1..], symbol_name, lang_id)
+        } else if line.starts_with("@@ ")
+            && let Some(hunk) = parse_hunk_header(line)
         {
-            return true;
+            active_hunk = Some(HunkProgress::new(&hunk));
         }
     }
 
@@ -244,6 +295,35 @@ mod tests {
         ));
         assert!(is_signature_line("def handle_request(self):"));
         assert!(is_signature_line("function calculate() {"));
+    }
+
+    /// detect_signature_changes は hunk 本体先頭の `+++ b/x` (追加行コンテンツ) で
+    /// in_file を誤切替せず、後続の signature 変更を取りこぼさない (FN 回帰防止)。
+    #[test]
+    fn detect_signature_changes_body_line_looks_like_header() {
+        // hunk old=1,new=2。本体先頭に `+++ b/x`、その後に foo の signature 変更。
+        let diff = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1,1 +1,2 @@\n+++ b/x\n-fn foo(a: i32) {}\n+fn foo(a: i32, b: i32) {}\n";
+        let affected = vec![AffectedSymbol {
+            name: "foo".to_string(),
+            kind: "function".to_string(),
+            change_type: "modified".to_string(),
+        }];
+        let changes = detect_signature_changes(diff, "lib.rs", &affected, LangId::Rust);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].name, "foo");
+    }
+
+    /// is_symbol_in_changed_lines も hunk 本体の `+++ b/x` を追加行として扱い、
+    /// in_file を誤切替せず、本体先頭以降の参照を取りこぼさない。
+    #[test]
+    fn is_symbol_in_changed_lines_body_line_looks_like_header() {
+        let diff = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1,1 +1,2 @@\n+++ b/x\n-let v = bar;\n+let v = bar();\n";
+        assert!(is_symbol_in_changed_lines(
+            diff,
+            "lib.rs",
+            "bar",
+            LangId::Rust
+        ));
     }
 
     // Xojo の Function/Sub/Event 宣言は case-insensitive に判定される

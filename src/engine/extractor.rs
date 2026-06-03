@@ -272,6 +272,17 @@ mod tests {
         assert!(!result.contains("        line2"));
     }
 
+    /// 多バイト空白 (NBSP) が先頭インデントに混在しても char 境界外 slice でパニックしない
+    #[test]
+    fn dedent_multibyte_whitespace_no_panic() {
+        // line2 先頭は スペース+NBSP (計3バイト)、line3 は NBSP (2バイト)。
+        // min_indent=2 が line2 の NBSP の途中 (char 境界外) に落ちる再現ケース。
+        let input = "head\n \u{a0}second\n\u{a0}third";
+        let result = dedent(input);
+        assert!(result.contains("second"));
+        assert!(result.contains("third"));
+    }
+
     // --- contains_point テスト ---
 
     /// ノードの範囲内のポイントが true を返す

@@ -43,9 +43,9 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/engine/calls.rs` - コールグラフ抽出（言語別 call expression クエリ）
 - `src/engine/refs.rs` - クロスファイル参照検索（ignore + rayon 並列 + fold/reduce 集約 + memchr/memmem 事前フィルタ + Aho-Corasick バッチ検索 + `collect_files` pub ユーティリティ）、lexer-only 言語 (Xojo) は `find_refs_via_lexer` / `find_refs_batch_via_lexer` 経由で identifier 走査、行コンテキスト抽出は `memchr` で該当行のみ UTF-8 変換（tree-sitter 経路の `extract_line_context` と lexer 経路の `extract_line_context_bytes` はともに 256B 上限で巨大行を切り詰め）
 - `src/engine/lexer.rs` - 手書き state machine による未サポート言語向け fallback。`LexerProfile` でキーワード/コメント/文字列区切り/定義 keyword を宣言し、`extract_symbols` と `find_identifier_refs` を提供する。Xojo profile を内蔵
-- `src/engine/diff.rs` - unified diff パーサー
+- `src/engine/diff.rs` - unified diff パーサー（`HunkProgress` で hunk の old/new 行数を厳密追跡し、本体の `--- a/` / `+++ b/` 風コンテンツ行をファイルヘッダと誤認しない＝以降の本体脱落による false negative を防ぐ。`parse_hunk_header` / `HunkProgress` / `HunkBodyLine` は pub(crate) で signature.rs と共用）
 - `src/engine/impact/mod.rs` - 影響分析オーケストレーター（CI 言語のみの diff は Pass1 前に skip、通常は 3パス方式: collect affected → stream refs → assemble）、`ParsedFile` キャッシュは `SourceBuf` を直接保持し mmap ゼロコピー経路を維持。affected 判定（`find_affected_symbols` / `symbol_overlaps_hunks`）は `range.end.line` を包含的に扱い、単一行シンボル（`start==end`）や複数行シンボルの最終行のみの変更も取りこぼさない（ゼロ幅 hunk = pure-delete は隣接行削除の過検出を避けるため半開区間を維持、pure-add の全体カバー判定は `hunk_end > sym_end`）
-- `src/engine/impact/signature.rs` - diff の `+` / `-` 行から関数シグネチャ変更を検出（識別子境界で照合し、`foo` と `foo_bar` のような prefix 名を混同しない）
+- `src/engine/impact/signature.rs` - diff の `+` / `-` 行から関数シグネチャ変更を検出（識別子境界で照合し、`foo` と `foo_bar` のような prefix 名を混同しない）。`detect_signature_changes` / `is_definition_header_in_changed_lines` / `is_symbol_in_changed_lines` はいずれも diff.rs の `HunkProgress` で hunk 行数を追跡し、本体の `+++ b/` 風コンテンツ行をヘッダ誤認しない
 - `src/engine/sequence.rs` - コールグラフから Mermaid シーケンス図を生成
 - `src/engine/imports.rs` - ファイル間の import/export 関係を抽出（言語別 tree-sitter クエリ）
 - `src/engine/lint.rs` - YAML ルールによる AST パターンマッチ（tree-sitter クエリ + テキストパターン）
