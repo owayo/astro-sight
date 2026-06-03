@@ -478,7 +478,7 @@ astro-sight cochange --dir . --git --base HEAD~10 --rename --copy
 astro-sight doctor
 ```
 
-`doctor` は対応 16 言語の parser 可用性を確認し、利用可能な言語には tree-sitter ABI version も返す。
+`doctor` は対応言語（tree-sitter 16 言語 + lexer-only の Xojo、計 17）の可用性を確認し、tree-sitter 言語には ABI version も返す。
 
 ### session - NDJSON ストリーミング
 
@@ -589,7 +589,7 @@ $ astro-sight ast --path nonexistent.rs
 | <img src="https://img.shields.io/badge/-CC342D?logo=ruby&logoColor=white" height="16"> Ruby | `.rb`, `.rake`, `.gemspec` | `tree-sitter-ruby` | [owayo/tree-sitter-ruby](https://github.com/owayo/tree-sitter-ruby) |
 | <img src="https://img.shields.io/badge/-F7A41D?logo=zig&logoColor=white" height="16"> Zig | `.zig`, `.zon` | `tree-sitter-zig` | 1.1 |
 
-全言語で tree-sitter クエリによる精密なシンボル抽出に対応。
+上記 16 言語は tree-sitter クエリによる精密なシンボル抽出に対応。Xojo（`.xojo_code` / `.rbbas` 等）は tree-sitter ではなく手書き lexer による限定サポート（`symbols` / `refs` / `dead-code` のみ。`calls` / `imports` / `ast` / `lint` / `sequence` は非対応）で、`doctor` は Xojo を含めて計 17 言語を報告する。
 
 > **\* Kotlin バージョンについて:** `tree-sitter-kotlin` 0.3.8 以降は `links = "tree-sitter"` を宣言しており、コアクレート `tree-sitter` 0.26 と Cargo の native library リンク名が競合してビルドできない。現在は 0.3.5 系を利用している。
 >
