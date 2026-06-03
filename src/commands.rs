@@ -5212,7 +5212,8 @@ fn partition_removed_dead_candidates(
     // 除外する。これがないと汎用名の削除が外部同名 import を拾って api.rm に誤分類される
     // (codex 設計合意。full TS resolver は入れず、証明できる外部 import binding のみ除外)。
     let external_pkgs = load_external_package_names(dir);
-    let mut external_cache: HashMap<(String, String), bool> = HashMap::new();
+    // (path, symbol) -> (外部 import の local binding が symbol か, 外部 import 元名が symbol の行集合)
+    let mut import_info_cache: HashMap<(String, String), (bool, HashSet<usize>)> = HashMap::new();
 
     // bare_name -> (def_count, ref_count)
     let mut counts: HashMap<String, (usize, usize)> = HashMap::new();
@@ -5224,12 +5225,19 @@ fn partition_removed_dead_candidates(
                 def_count += 1;
                 continue;
             }
-            // 外部パッケージ import 由来の同名 binding を持つファイルの参照は数えない。
             let key = (x.path.clone(), r.symbol.clone());
-            let is_external = *external_cache.entry(key).or_insert_with(|| {
-                ref_binds_symbol_from_external_package(dir, &x.path, &r.symbol, &external_pkgs)
-            });
-            if is_external {
+            let (local_bound, source_name_lines) =
+                import_info_cache.entry(key).or_insert_with(|| {
+                    analyze_external_import_for_symbol(dir, &x.path, &r.symbol, &external_pkgs)
+                });
+            // 外部 import specifier の import 元名そのものの参照 (import 行) は別モジュールの
+            // export 名なので数えない (`import { Config as X } from "pkg"` の `Config`)。
+            if source_name_lines.contains(&x.line) {
+                continue;
+            }
+            // 外部 import の local binding を持つファイルなら、その使用箇所も外部由来として
+            // 数えない (`import { Config } from "pkg"` の local Config 利用)。
+            if *local_bound {
                 continue;
             }
             ref_count += 1;
@@ -5319,15 +5327,27 @@ fn import_specifier_package_name(spec: &str) -> Option<String> {
 /// import で束縛されているか。束縛されていれば、そのファイルの `symbol` 参照は削除した
 /// ローカルシンボルとは別物 (別モジュールの同名型) と判断できる。
 /// 非 TS/JS / 読み込み・parse 失敗 / external_pkgs 空は false (除外しない、保守的)。
-fn ref_binds_symbol_from_external_package(
+/// `ref_path` の TS/JS ファイルを解析し、`symbol` に関する外部パッケージ import 情報を返す。
+/// 戻り値 `(local_bound, source_name_lines)`:
+/// - `local_bound`: 外部パッケージ (`external_pkgs`) からの import で local binding が `symbol`
+///   (`import { Config }` / `import { Foo as Config }` / `import Config` / `import * as Config`)。
+///   この場合ファイル内の `symbol` 利用は外部由来 (使用箇所も除外対象)。
+/// - `source_name_lines`: 外部 import specifier の **import 元名** が `symbol` の行 (0-indexed)。
+///   `import { Config as X } from "pkg"` の `Config` は別モジュールの export 名なので、その
+///   import 行の参照だけを除外する (使用箇所は local binding X で別物)。
+///
+/// 非 TS/JS / 読み込み・parse 失敗 / external_pkgs 空は `(false, 空集合)` (除外しない、保守的)。
+fn analyze_external_import_for_symbol(
     dir: &str,
     ref_path: &str,
     symbol: &str,
     external_pkgs: &std::collections::HashSet<String>,
-) -> bool {
+) -> (bool, std::collections::HashSet<usize>) {
     use crate::language::LangId;
+    use std::collections::HashSet;
+    let empty = (false, HashSet::new());
     if external_pkgs.is_empty() {
-        return false;
+        return empty;
     }
     let abs = if std::path::Path::new(ref_path).is_absolute() {
         std::path::PathBuf::from(ref_path)
@@ -5335,31 +5355,23 @@ fn ref_binds_symbol_from_external_package(
         std::path::Path::new(dir).join(ref_path)
     };
     let Some(utf8) = camino::Utf8Path::from_path(&abs) else {
-        return false;
+        return empty;
     };
     let Ok(lang) = LangId::from_path(utf8) else {
-        return false;
+        return empty;
     };
     if !matches!(lang, LangId::Javascript | LangId::Typescript | LangId::Tsx) {
-        return false;
+        return empty;
     }
     let Ok(source) = parser::read_file(utf8) else {
-        return false;
+        return empty;
     };
     let Ok(tree) = parser::parse_source(&source, lang) else {
-        return false;
+        return empty;
     };
-    import_binds_symbol_from_external(tree.root_node(), &source, symbol, external_pkgs)
-}
-
-/// program 直下の import_statement を走査し、external_pkgs からの import で `symbol` を
-/// 束縛するものがあれば true。
-fn import_binds_symbol_from_external(
-    root: tree_sitter::Node,
-    source: &[u8],
-    symbol: &str,
-    external_pkgs: &std::collections::HashSet<String>,
-) -> bool {
+    let root = tree.root_node();
+    let mut local_bound = false;
+    let mut source_name_lines = HashSet::new();
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
         if child.kind() != "import_statement" {
@@ -5368,7 +5380,7 @@ fn import_binds_symbol_from_external(
         let Some(src_node) = child.child_by_field_name("source") else {
             continue;
         };
-        let Some(spec) = static_js_string_text(src_node, source) else {
+        let Some(spec) = static_js_string_text(src_node, &source) else {
             continue;
         };
         let Some(pkg) = import_specifier_package_name(spec) else {
@@ -5377,32 +5389,32 @@ fn import_binds_symbol_from_external(
         if !external_pkgs.contains(&pkg) {
             continue;
         }
-        // import の local binding (alias があれば alias、無ければ import 名、default /
-        // namespace はその束縛名) が symbol なら、この import がファイルの symbol 束縛源。
-        // `import { Config as X }` の `Config` (import 元名) は local が X なので対象外とし、
-        // 同一ファイルに内部 import の同名 binding が残るケースの false negative を防ぐ。
-        if import_statement_binds_local_name(child, source, symbol) {
-            return true;
-        }
+        collect_external_import_bindings(
+            child,
+            &source,
+            symbol,
+            &mut local_bound,
+            &mut source_name_lines,
+        );
     }
-    false
+    (local_bound, source_name_lines)
 }
 
-/// import_statement の local binding (named import の alias/name、default import、namespace
-/// import) のいずれかが `symbol` に一致するか。`import { Foo as Bar }` の local は Bar、
-/// `import { Foo }` の local は Foo。alias 付き named import の import 元名 (name) は local
-/// binding ではないため対象外 (codex 指摘: 逆 alias の false negative 防止)。
-fn import_statement_binds_local_name(
+/// 外部パッケージ import 文 `import_stmt` を解析し、`symbol` の local binding 有無を
+/// `local_bound` に、import 元名が `symbol` の出現行を `source_name_lines` に記録する。
+fn collect_external_import_bindings(
     import_stmt: tree_sitter::Node,
     source: &[u8],
     symbol: &str,
-) -> bool {
+    local_bound: &mut bool,
+    source_name_lines: &mut std::collections::HashSet<usize>,
+) {
     let mut cursor = import_stmt.walk();
     let Some(clause) = import_stmt
         .named_children(&mut cursor)
         .find(|c| c.kind() == "import_clause")
     else {
-        return false;
+        return;
     };
     let mut clause_cursor = clause.walk();
     for child in clause.named_children(&mut clause_cursor) {
@@ -5410,7 +5422,7 @@ fn import_statement_binds_local_name(
             // default import: `import Config from "..."`
             "identifier" => {
                 if child.utf8_text(source).ok() == Some(symbol) {
-                    return true;
+                    *local_bound = true;
                 }
             }
             // namespace import: `import * as Config from "..."`
@@ -5420,7 +5432,7 @@ fn import_statement_binds_local_name(
                     .named_children(&mut ns)
                     .any(|n| n.kind() == "identifier" && n.utf8_text(source).ok() == Some(symbol))
                 {
-                    return true;
+                    *local_bound = true;
                 }
             }
             // named imports: `import { Foo, Bar as Baz } from "..."`
@@ -5430,19 +5442,23 @@ fn import_statement_binds_local_name(
                     if spec.kind() != "import_specifier" {
                         continue;
                     }
-                    // local binding = alias があれば alias、無ければ name
-                    let local = spec
-                        .child_by_field_name("alias")
-                        .or_else(|| spec.child_by_field_name("name"));
+                    let name_node = spec.child_by_field_name("name");
+                    // import 元名が symbol → その出現行を記録 (別モジュールの export 名)
+                    if let Some(name) = name_node
+                        && name.utf8_text(source).ok() == Some(symbol)
+                    {
+                        source_name_lines.insert(name.start_position().row);
+                    }
+                    // local binding (alias があれば alias、無ければ name) が symbol → 利用も外部
+                    let local = spec.child_by_field_name("alias").or(name_node);
                     if local.and_then(|n| n.utf8_text(source).ok()) == Some(symbol) {
-                        return true;
+                        *local_bound = true;
                     }
                 }
             }
             _ => {}
         }
     }
-    false
 }
 
 /// 削除されたシンボル `name` が、変更後のツリー全体のどこからも参照されていないかを判定する。
@@ -10278,6 +10294,67 @@ class B:
         assert!(
             removed.contains(&"Config"),
             "外部 alias import (Config as TailwindConfig) があっても内部相対 import の Config 参照が残れば api.rm 維持。got removed: {removed:?}"
+        );
+    }
+
+    /// 削除した内部 Config に実参照がなく、別ファイルに外部 alias import の import 元名
+    /// `Config` だけが残る場合 (`import { Config as TailwindConfig } from "tailwindcss"`、
+    /// Config 自体は未使用) は、import 元名を別モジュールの export として除外し removed_dead に
+    /// 振り分ける (codex 指摘: alias-only false positive 防止)。
+    #[test]
+    fn detect_api_changes_removed_symbol_external_alias_only_import_name_is_dead() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "package.json",
+                    "{\n  \"devDependencies\": { \"tailwindcss\": \"^3.4.0\" }\n}\n",
+                ),
+                (
+                    "lib/config.ts",
+                    "export interface Config {\n  url: string;\n}\n",
+                ),
+                (
+                    "app.ts",
+                    "import { Config as TailwindConfig } from \"tailwindcss\";\nexport const t = {} as TailwindConfig;\n",
+                ),
+            ],
+            "initial",
+        );
+        fs::write(repo.join("lib/config.ts"), "export const X = 1;\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "lib/config.ts".to_string(),
+            new_path: "lib/config.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        let removed_dead: Vec<&str> = api_changes
+            .removed_dead
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !removed.contains(&"Config"),
+            "外部 alias import の import 元名のみの Config は api.rm に出ない。got removed: {removed:?}"
+        );
+        assert!(
+            removed_dead.contains(&"Config"),
+            "Config は removed_dead に振り分けられるべき。got removed_dead: {removed_dead:?}"
         );
     }
 
