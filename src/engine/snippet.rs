@@ -6,7 +6,11 @@ pub fn generate_snippet(source: &str, line: usize, context_lines: usize) -> Stri
     }
 
     let start = line.saturating_sub(context_lines);
-    let end = (line + context_lines + 1).min(total_lines);
+    // line は CLI 入力由来で usize::MAX もあり得るため、加算も saturating で overflow を防ぐ。
+    let end = line
+        .saturating_add(context_lines)
+        .saturating_add(1)
+        .min(total_lines);
 
     let width = format!("{end}").len();
 
@@ -38,7 +42,11 @@ pub fn generate_range_snippet(
     }
 
     let view_start = start_line.saturating_sub(context_lines);
-    let view_end = (end_line + context_lines + 1).min(total_lines);
+    // end_line も CLI 入力由来のため加算を saturating にして overflow を防ぐ。
+    let view_end = end_line
+        .saturating_add(context_lines)
+        .saturating_add(1)
+        .min(total_lines);
     let width = format!("{view_end}").len();
 
     let mut result = String::new();
@@ -101,6 +109,18 @@ mod tests {
         let source = "only\ntwo\n";
         let snippet = generate_range_snippet(source, 999_999, 1_000_000, 2);
         assert!(snippet.is_empty());
+    }
+
+    /// `--line` / `--end-line` が usize::MAX でも `line + context + 1` の加算 overflow を
+    /// 起こさない (codex 指摘: 減算だけでなく加算側にも上限が必要)。
+    #[test]
+    fn snippet_usize_max_no_add_overflow() {
+        let source = "only\ntwo\n";
+        let s = generate_snippet(source, usize::MAX, 1);
+        assert!(s.is_empty());
+        // range 版: end_line=usize::MAX でも panic せず view_start..total_lines を出力する。
+        let r = generate_range_snippet(source, 1, usize::MAX, 1);
+        assert!(r.contains("only"));
     }
 
     #[test]
