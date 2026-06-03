@@ -150,7 +150,10 @@ fn dedent(s: &str) -> String {
         if i == 0 {
             result.push_str(line);
         } else if line.len() >= min_indent {
-            result.push_str(&line[min_indent..]);
+            // min_indent はバイト数のため、多バイト空白 (NBSP 等) の途中に落ちると
+            // char 境界外 slice でパニックする。境界へ切り下げてから slice する。
+            let cut = line.floor_char_boundary(min_indent);
+            result.push_str(&line[cut..]);
         } else {
             result.push_str(line.trim_start());
         }

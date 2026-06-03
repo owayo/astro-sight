@@ -83,7 +83,7 @@ make help     # 全ターゲット表示
 
 ## Notes
 
-- tree-sitter-toml 0.20 は旧 API のため、extern C ブリッジで対応
+- tree-sitter-kotlin 0.3.5 は旧 tree-sitter API のため、extern C ブリッジ（`src/language.rs` の `ffi_kotlin`）で対応
 - tree-sitter 0.26 では Point/Range のフィールドがメソッドではなくパブリックフィールド
 - QueryMatches は StreamingIterator（標準 Iterator ではない）
 

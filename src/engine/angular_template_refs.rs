@@ -424,7 +424,9 @@ fn extract_control_flow_refs(content: &str, refs: &mut HashSet<String>) {
                     while q < bytes.len() {
                         let b = bytes[q];
                         if let Some(qt) = in_str {
-                            if b == b'\\' {
+                            // 文字列リテラル末尾が `\` で終わると q がバッファ長を超えて
+                            // 後続の slice (`&bytes[start..q]`) でパニックするため境界を確認する
+                            if b == b'\\' && q + 1 < bytes.len() {
                                 q += 2;
                                 continue;
                             }

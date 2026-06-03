@@ -11,7 +11,12 @@ pub fn generate_snippet(source: &str, line: usize, context_lines: usize) -> Stri
     let width = format!("{end}").len();
 
     let mut result = String::new();
-    for (i, line_text) in source.lines().skip(start).take(end - start).enumerate() {
+    for (i, line_text) in source
+        .lines()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .enumerate()
+    {
         let line_num = start + i;
         let marker = if line_num == line { ">" } else { " " };
         let display = truncate_snippet_line(line_text);
@@ -40,7 +45,7 @@ pub fn generate_range_snippet(
     for (i, line) in source
         .lines()
         .skip(view_start)
-        .take(view_end - view_start)
+        .take(view_end.saturating_sub(view_start))
         .enumerate()
     {
         let line_num = view_start + i;
