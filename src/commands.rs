@@ -5377,26 +5377,72 @@ fn import_binds_symbol_from_external(
         if !external_pkgs.contains(&pkg) {
             continue;
         }
-        // import_clause subtree に symbol identifier (named import 名 / alias / default /
-        // namespace) があれば、その import がこのファイルの symbol 束縛源。source は string
-        // ノードなので identifier 走査では誤マッチしない。
-        if node_subtree_has_identifier(child, source, symbol) {
+        // import の local binding (alias があれば alias、無ければ import 名、default /
+        // namespace はその束縛名) が symbol なら、この import がファイルの symbol 束縛源。
+        // `import { Config as X }` の `Config` (import 元名) は local が X なので対象外とし、
+        // 同一ファイルに内部 import の同名 binding が残るケースの false negative を防ぐ。
+        if import_statement_binds_local_name(child, source, symbol) {
             return true;
         }
     }
     false
 }
 
-/// `node` の subtree に identifier / type_identifier で `name` に一致するものがあるか。
-fn node_subtree_has_identifier(node: tree_sitter::Node, source: &[u8], name: &str) -> bool {
-    if matches!(node.kind(), "identifier" | "type_identifier")
-        && node.utf8_text(source).ok() == Some(name)
-    {
-        return true;
+/// import_statement の local binding (named import の alias/name、default import、namespace
+/// import) のいずれかが `symbol` に一致するか。`import { Foo as Bar }` の local は Bar、
+/// `import { Foo }` の local は Foo。alias 付き named import の import 元名 (name) は local
+/// binding ではないため対象外 (codex 指摘: 逆 alias の false negative 防止)。
+fn import_statement_binds_local_name(
+    import_stmt: tree_sitter::Node,
+    source: &[u8],
+    symbol: &str,
+) -> bool {
+    let mut cursor = import_stmt.walk();
+    let Some(clause) = import_stmt
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "import_clause")
+    else {
+        return false;
+    };
+    let mut clause_cursor = clause.walk();
+    for child in clause.named_children(&mut clause_cursor) {
+        match child.kind() {
+            // default import: `import Config from "..."`
+            "identifier" => {
+                if child.utf8_text(source).ok() == Some(symbol) {
+                    return true;
+                }
+            }
+            // namespace import: `import * as Config from "..."`
+            "namespace_import" => {
+                let mut ns = child.walk();
+                if child
+                    .named_children(&mut ns)
+                    .any(|n| n.kind() == "identifier" && n.utf8_text(source).ok() == Some(symbol))
+                {
+                    return true;
+                }
+            }
+            // named imports: `import { Foo, Bar as Baz } from "..."`
+            "named_imports" => {
+                let mut ni = child.walk();
+                for spec in child.named_children(&mut ni) {
+                    if spec.kind() != "import_specifier" {
+                        continue;
+                    }
+                    // local binding = alias があれば alias、無ければ name
+                    let local = spec
+                        .child_by_field_name("alias")
+                        .or_else(|| spec.child_by_field_name("name"));
+                    if local.and_then(|n| n.utf8_text(source).ok()) == Some(symbol) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
     }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .any(|c| node_subtree_has_identifier(c, source, name))
+    false
 }
 
 /// 削除されたシンボル `name` が、変更後のツリー全体のどこからも参照されていないかを判定する。
@@ -10180,6 +10226,59 @@ class B:
         assert_eq!(import_specifier_package_name("@/config"), None);
         assert_eq!(import_specifier_package_name("~/config"), None);
         assert_eq!(import_specifier_package_name("#internal"), None);
+    }
+
+    /// 外部 alias import (`import { Config as TailwindConfig } from "tailwindcss"`、local は
+    /// TailwindConfig) と内部相対 import の同名 Config が同一ファイルに共存する場合、削除した
+    /// Config は内部参照が残るので api.rm を維持する (codex 指摘: 逆 alias false negative 防止)。
+    #[test]
+    fn detect_api_changes_removed_symbol_external_alias_with_internal_reference_stays_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "package.json",
+                    "{\n  \"devDependencies\": { \"tailwindcss\": \"^3.4.0\" }\n}\n",
+                ),
+                (
+                    "lib/config.ts",
+                    "export interface Config {\n  url: string;\n}\n",
+                ),
+                (
+                    "app.ts",
+                    "import { Config as TailwindConfig } from \"tailwindcss\";\nimport type { Config } from \"./lib/config\";\nexport const c: Config = { url: '' };\nexport const t = {} as TailwindConfig;\n",
+                ),
+            ],
+            "initial",
+        );
+        fs::write(repo.join("lib/config.ts"), "export const X = 1;\n").expect("write");
+
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "lib/config.ts".to_string(),
+            new_path: "lib/config.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api_changes
+            .removed
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.contains(&"Config"),
+            "外部 alias import (Config as TailwindConfig) があっても内部相対 import の Config 参照が残れば api.rm 維持。got removed: {removed:?}"
+        );
     }
 
     /// detect_api_changes の早期 continue 経路 (closed-in-diff for api.rm) でも
