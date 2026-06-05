@@ -8076,6 +8076,136 @@ fn dead_code_xojo_excludes_symbols_with_refs() {
     );
 }
 
+/// GitLab #15 回帰テスト: Xojo の `#tag Event` 配下のイベントハンドラ (Sub/Function) は
+/// ランタイムがイベント駆動で呼ぶ entrypoint のため dead に出ない。`#tag Events <control>`
+/// 配下のハンドラが対象。`#tag Event` で囲まれない通常メソッドは従来どおり dead 判定する。
+#[test]
+fn dead_code_xojo_excludes_event_handlers() {
+    use std::path::Path;
+    use std::process::Command;
+
+    let fixture = Path::new("tests/fixtures/xojo_dead_code");
+    assert!(fixture.exists(), "fixture missing: {fixture:?}");
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dest_root = tmp.path().join("project");
+    std::fs::create_dir_all(&dest_root).expect("create dest_root");
+    let cp_status = Command::new("cp")
+        .args([
+            "-R",
+            &format!("{}/.", fixture.display()),
+            dest_root.to_str().unwrap(),
+        ])
+        .status()
+        .expect("cp -R");
+    assert!(cp_status.success(), "failed to copy fixture to tempdir");
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", dest_root.to_str().unwrap()])
+        .output()
+        .expect("failed to run dead-code");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead_names: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .expect("dead_symbols 配列")
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+
+    // CellAction は Main.xojo_window の `#tag Events Listbox1` > `#tag Event` 配下の
+    // イベントハンドラ。Xojo ランタイムが呼ぶ entrypoint のため dead に出ない。
+    assert!(
+        !dead_names.contains(&"CellAction"),
+        "CellAction (#tag Event 配下のイベントハンドラ) は dead に出すべきでない: \
+         dead_names={dead_names:?}"
+    );
+
+    // 退行検出: entrypoint でない未参照クラス Orphan は従来どおり dead に残る
+    // (「一律除外」ではなく構造ベースで判定していることを保証)。
+    assert!(
+        dead_names.contains(&"Orphan"),
+        "未参照クラス Orphan は dead に残るべき: dead_names={dead_names:?}"
+    );
+}
+
+/// GitLab #16 回帰テスト: `Inherits TestGroup` クラスの引数なし `*Test` / `Setup` /
+/// `TearDown` メソッドは XojoUnit が Introspection で実行する entrypoint のため dead に
+/// 出ない。`#tag Event` 配下の `InitializeTestGroups` も entrypoint。Test で終わらない
+/// 通常メソッド (orphanHelper) は参照0なら dead に残る。
+#[test]
+fn dead_code_xojo_excludes_testgroup_test_methods() {
+    use std::path::Path;
+    use std::process::Command;
+
+    let fixture = Path::new("tests/fixtures/xojo_testgroup");
+    assert!(fixture.exists(), "fixture missing: {fixture:?}");
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dest_root = tmp.path().join("project");
+    std::fs::create_dir_all(&dest_root).expect("create dest_root");
+    let cp_status = Command::new("cp")
+        .args([
+            "-R",
+            &format!("{}/.", fixture.display()),
+            dest_root.to_str().unwrap(),
+        ])
+        .status()
+        .expect("cp -R");
+    assert!(cp_status.success(), "failed to copy fixture to tempdir");
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", dest_root.to_str().unwrap()])
+        .output()
+        .expect("failed to run dead-code");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead_names: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .expect("dead_symbols 配列")
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    let test_only_names: Vec<&str> = json["test_only_symbols"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|s| s["name"].as_str()).collect())
+        .unwrap_or_default();
+
+    // *Test / Setup / TearDown / `#tag Event` 配下の InitializeTestGroups は entrypoint。
+    // dead にも test_only にも出ない。
+    for name in [
+        "enableControlTest",
+        "validateValueTest",
+        "Setup",
+        "secondScenarioTest",
+        "InitializeTestGroups",
+    ] {
+        assert!(
+            !dead_names.contains(&name),
+            "{name} は XojoUnit entrypoint のため dead に出すべきでない: dead_names={dead_names:?}"
+        );
+        assert!(
+            !test_only_names.contains(&name),
+            "{name} は entrypoint のため test_only にも出すべきでない: \
+             test_only_names={test_only_names:?}"
+        );
+    }
+
+    // 退行検出: Test で終わらない通常メソッド orphanHelper は参照0なら dead に残る。
+    assert!(
+        dead_names.contains(&"orphanHelper"),
+        "orphanHelper (通常メソッド, 参照0) は dead に残るべき: dead_names={dead_names:?}"
+    );
+}
+
 /// 2026-05-27 zod-inferred-types-pre-existing-dead 対応: `--dead-scope touched-symbols` の
 /// 回帰テスト。changed file 内に元から存在する dead は除外し、今回の hunk に被るシンボル
 /// だけが返ることを検証。`review --hook` のデフォルト挙動でもある。

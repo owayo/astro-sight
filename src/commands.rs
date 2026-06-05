@@ -3700,7 +3700,9 @@ fn extract_exported_symbols_from_file_inner(
     // export 相当のシンボルを抽出する。
     if let crate::language::DetectedLang::LexerOnly(lexer_lang) = lang_id.detected() {
         return Some(crate::engine::lexer::extract_exported_symbols(
-            &source, lexer_lang,
+            &source,
+            lexer_lang,
+            exclude_framework_entrypoints,
         ));
     }
 

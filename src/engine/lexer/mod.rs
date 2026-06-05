@@ -213,7 +213,7 @@ impl<'a> Iterator for IdentScanner<'a> {
 
 /// 行ベースで定義ヘッダを抽出する。
 /// 戻り値: (SymbolKind, name, 元行頭からのオフセット).
-fn extract_definition_from_line(
+pub(super) fn extract_definition_from_line(
     profile: &LexerProfile,
     line_text: &str,
     _line_num: usize,
@@ -268,7 +268,7 @@ fn extract_definition_from_line(
 
 /// `text` が `keyword` で始まり (case_insensitive オプション)、その直後が単語境界なら
 /// keyword 部分を消費した後の slice を返す。
-fn strip_keyword_prefix<'a>(text: &'a str, keyword: &str, ci: bool) -> Option<&'a str> {
+pub(super) fn strip_keyword_prefix<'a>(text: &'a str, keyword: &str, ci: bool) -> Option<&'a str> {
     let kw_bytes = keyword.as_bytes();
     let text_bytes = text.as_bytes();
     if text_bytes.len() < kw_bytes.len() {
@@ -519,10 +519,24 @@ pub fn profile_for(lang: LexerLang) -> &'static LexerProfile {
 /// 記録していない。保守的に全 Class/Module/Function/Method/Property/Const/Enum を
 /// export 候補として返す (refs が 0 件なら dead と判定される)。
 /// signature は空文字 (lexer profile では本格的な signature 抽出をしない)。
+///
+/// `exclude_runtime_entrypoints` が true (dead-code 経路) のときは、フレームワーク /
+/// ランタイムが暗黙に呼ぶ entrypoint (Xojo の `#tag Event` ハンドラ、XojoUnit の
+/// `TestGroup` 派生クラスの `*Test` メソッド等) を候補から除外する。静的 caller を
+/// 持たないため参照カウントで追跡できず偽陽性源になる。API 差分経路 (false) では
+/// 公開 API 面として残す。
 pub fn extract_exported_symbols(
     source: &[u8],
     lexer_lang: LexerLang,
+    exclude_runtime_entrypoints: bool,
 ) -> Vec<(String, String, String)> {
+    // entrypoint は定義行 (range.start.line) で照合除外する。bare name 除外だと
+    // 汎用名 (Action / KeyDown) で別の通常メソッドまで巻き込むため使わない。
+    let entrypoint_lines = if exclude_runtime_entrypoints {
+        extract_runtime_entrypoints(source, lexer_lang)
+    } else {
+        std::collections::HashSet::new()
+    };
     extract_symbols(source, lexer_lang)
         .into_iter()
         .filter(|s| {
@@ -539,6 +553,7 @@ pub fn extract_exported_symbols(
                     | SymbolKind::Struct
             )
         })
+        .filter(|s| !entrypoint_lines.contains(&s.range.start.line))
         .map(|s| {
             let kind_str = match s.kind {
                 SymbolKind::Class => "class",
@@ -556,4 +571,16 @@ pub fn extract_exported_symbols(
             (s.name, kind_str, String::new())
         })
         .collect()
+}
+
+/// lexer-only 言語の runtime entrypoint (フレームワーク / ランタイムが暗黙に呼ぶため
+/// 静的 caller を持たないシンボル) の **定義行 (0-indexed)** 集合を返す。
+/// dead-code 検出でこれらを候補から除外するのに使う (API 差分検出では使わない)。
+pub fn extract_runtime_entrypoints(
+    source: &[u8],
+    lang: LexerLang,
+) -> std::collections::HashSet<usize> {
+    match lang {
+        LexerLang::Xojo => xojo::runtime_entrypoint_lines(source),
+    }
 }
