@@ -5532,49 +5532,172 @@ fn collect_pub_use_targets(
 }
 
 /// `pub use ...;` のテキストから re-export ターゲットを抽出する。`pub(crate) use` 等の制限付きは
-/// 外部非公開なので除外する。
+/// 外部非公開なので除外する。grouped use (`pub use crate::{wifi::found, wifi::hidden};` や nested
+/// `pub use crate::{a::{b, c}, d};`) を再帰的に展開してフラットなターゲット列に正規化する。
 fn parse_pub_use_targets(text: &str) -> Vec<RustPubUseTarget> {
     let t = text.trim_start();
     let Some(rest) = t.strip_prefix("pub use ") else {
         return Vec::new();
     };
-    let rest = rest.trim().trim_end_matches(';').trim();
-    let rest = rest
-        .strip_prefix("crate::")
-        .or_else(|| rest.strip_prefix("self::"))
-        .unwrap_or(rest);
-    if let Some(prefix) = rest.strip_suffix("::*") {
-        return vec![RustPubUseTarget::Wildcard {
-            path: prefix.split("::").map(str::to_string).collect(),
-        }];
-    }
-    if let Some((prefix, group)) = rest.split_once("::{") {
-        let group = group.trim_end_matches('}');
-        return group
-            .split(',')
-            .filter_map(|item| rust_named_reexport_target(prefix, item.trim()))
-            .collect();
-    }
-    rest.rsplit_once("::")
-        .and_then(|(path, item)| rust_named_reexport_target(path, item.trim()))
-        .into_iter()
-        .collect()
+    let body = rest.trim().trim_end_matches(';').trim();
+    let mut out = Vec::new();
+    expand_rust_use_tree(&[], body, &mut out);
+    out
 }
 
-/// `pub use <path>::<item>` の named ターゲット。`as _` は非公開なので除外、`as <alias>` は元 item 名で照合。
-fn rust_named_reexport_target(path: &str, item: &str) -> Option<RustPubUseTarget> {
-    let item = match item.split_once(" as ") {
-        Some((_original, "_")) => return None,
-        Some((original, _alias)) => original.trim(),
-        None => item,
+/// 親 `path_prefix` (空ベクタで始まる) と `body` を結合して 1 つの use tree を再帰展開する。
+/// `body` は `crate::{a, b}` / `wifi::found` / `wifi::*` / `wifi::{found as bar}` / `self::x` 等。
+fn expand_rust_use_tree(path_prefix: &[String], body: &str, out: &mut Vec<RustPubUseTarget>) {
+    let body = body.trim();
+    if body.is_empty() {
+        return;
+    }
+    // body 全体が `{...}` でくくられた grouped use ならその場で分解。
+    if let Some(inner) = body.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        for part in split_rust_use_group(inner) {
+            expand_rust_use_tree(path_prefix, part.trim(), out);
+        }
+        return;
+    }
+    // 先頭セグメントが `crate` / `self` なら path_prefix に積まず読み飛ばす (外部 path ではなく
+    // 現 crate root 起点を示すだけのアンカー)。`super` は親 module への参照になるため、
+    // 我々の symbol 所属判定では使えないので「判定不能」扱いとして無視する。
+    let mut remainder = body;
+    let mut prefix: Vec<String> = path_prefix.to_vec();
+    while let Some(rest) = remainder.strip_prefix("crate::") {
+        remainder = rest.trim_start();
+    }
+    while let Some(rest) = remainder.strip_prefix("self::") {
+        remainder = rest.trim_start();
+    }
+    if remainder.starts_with("super::") || remainder == "super" {
+        return;
+    }
+    if remainder.is_empty() {
+        return;
+    }
+    // body の末尾が `{...}` なら group。"::" 区切りでネストせず、bracket バランスで本体を分離する。
+    if let Some(group_start) = find_top_level_group_start(remainder) {
+        let head = remainder[..group_start].trim();
+        let head = head.trim_end_matches(':').trim_end_matches(':').trim();
+        let group_body = &remainder[group_start..];
+        let Some(inner) = group_body
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+        else {
+            return; // 不正な構文は無視
+        };
+        let head_segments: Vec<String> = if head.is_empty() {
+            Vec::new()
+        } else {
+            head.split("::")
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        prefix.extend(head_segments);
+        for part in split_rust_use_group(inner) {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            expand_rust_use_tree(&prefix, part, out);
+        }
+        return;
+    }
+    // group なし。末尾が `*` なら wildcard、それ以外は最終セグメントを item として named ターゲット。
+    if let Some(p) = remainder.strip_suffix("::*") {
+        let mut path = prefix.clone();
+        path.extend(p.split("::").filter(|s| !s.is_empty()).map(str::to_string));
+        if !path.is_empty() {
+            out.push(RustPubUseTarget::Wildcard { path });
+        }
+        return;
+    }
+    // alias 解決 (`<original> as <alias>`、`as _` は除外)。
+    let item_text = remainder;
+    let (item_text, _alias_drop) = match item_text.split_once(" as ") {
+        Some((_orig, alias)) if alias.trim() == "_" => return,
+        Some((orig, alias)) => (orig.trim(), Some(alias.trim().to_string())),
+        None => (item_text, None),
     };
+    let (path_part, item) = match item_text.rsplit_once("::") {
+        Some((p, i)) => (p, i),
+        // path なしの単独 item (例: nested grouped use を展開した結果の "found")。
+        // parent から積み上げた `prefix` を path として使う。
+        None => ("", item_text),
+    };
+    let mut path = prefix;
+    path.extend(
+        path_part
+            .split("::")
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    );
+    let item = item.trim();
     if item.is_empty() || path.is_empty() {
+        return;
+    }
+    out.push(RustPubUseTarget::Named {
+        path,
+        item: item.to_string(),
+    });
+}
+
+/// `remainder` の最後に登場するトップレベル `{` のバイト位置を返す。ネストした `{ }` は無視。
+fn find_top_level_group_start(remainder: &str) -> Option<usize> {
+    let bytes = remainder.as_bytes();
+    if bytes.last() != Some(&b'}') {
         return None;
     }
-    Some(RustPubUseTarget::Named {
-        path: path.split("::").map(str::to_string).collect(),
-        item: item.to_string(),
-    })
+    let mut depth: i32 = 0;
+    let mut start: Option<usize> = None;
+    for (i, b) in bytes.iter().enumerate().rev() {
+        match *b {
+            b'}' => depth += 1,
+            b'{' => {
+                depth -= 1;
+                if depth == 0 {
+                    start = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    start
+}
+
+/// grouped use の本体を `{}` のネスト深度を考慮しつつ `,` で分割する。
+fn split_rust_use_group(inner: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth: i32 = 0;
+    let mut buf = String::new();
+    for ch in inner.chars() {
+        match ch {
+            '{' => {
+                depth += 1;
+                buf.push(ch);
+            }
+            '}' => {
+                depth -= 1;
+                buf.push(ch);
+            }
+            ',' if depth == 0 => {
+                let trimmed = buf.trim().to_string();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed);
+                }
+                buf.clear();
+            }
+            _ => buf.push(ch),
+        }
+    }
+    let trimmed = buf.trim().to_string();
+    if !trimmed.is_empty() {
+        parts.push(trimmed);
+    }
+    parts
 }
 
 /// Cargo.toml のテキストから `[lib]` セクションが宣言されているかを判定する。
@@ -10273,6 +10396,163 @@ def main():
         assert!(
             !removed.iter().any(|n| n.ends_with("found")),
             "private prelude (mod prelude) 経由の re-export は外部非公開なので api.rm に出さない。got: {removed:?}"
+        );
+    }
+
+    /// `pub use crate::{wifi::found};` のような top-level grouped use 経由の re-export を
+    /// `parse_pub_use_targets` が取りこぼし false negative になる回帰テスト
+    /// (codex pre-merge レビュー 2 回目の Warning 指摘)。
+    #[test]
+    fn detect_api_changes_private_module_top_level_grouped_reexport_stays_in_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod wifi;\npub mod prelude;\n"),
+                ("src/prelude.rs", "pub use crate::{wifi::found};\n"),
+                ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(repo.join("src/wifi/mod.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "top-level grouped use 経由 re-export の private module pub fn 削除は api.rm に残すべき。got: {removed:?}"
+        );
+    }
+
+    /// `pub use crate::{wifi::found, wifi::hidden};` のような複数要素 grouped use 経由でも
+    /// 各 named ターゲットを正しく抽出して false negative を起こさない回帰テスト。
+    #[test]
+    fn detect_api_changes_private_module_multi_grouped_reexport_stays_in_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod wifi;\npub mod prelude;\n"),
+                (
+                    "src/prelude.rs",
+                    "pub use crate::{wifi::found, wifi::hidden};\n",
+                ),
+                (
+                    "src/wifi/mod.rs",
+                    "pub fn found() -> u32 {\n    0\n}\npub fn hidden() -> u32 {\n    1\n}\n",
+                ),
+            ],
+            "base",
+        );
+        // found だけ削除、hidden は残す
+        fs::write(
+            repo.join("src/wifi/mod.rs"),
+            "pub fn hidden() -> u32 {\n    1\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 0,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "複数要素 top-level grouped use 経由 re-export の削除は api.rm に残すべき。got: {removed:?}"
+        );
+    }
+
+    /// nested grouped use (`pub use crate::{wifi::{found, hidden}};`) も正しく展開して
+    /// 各要素を public ターゲット扱いにする回帰テスト。
+    #[test]
+    fn detect_api_changes_private_module_nested_grouped_reexport_stays_in_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod wifi;\npub mod prelude;\n"),
+                (
+                    "src/prelude.rs",
+                    "pub use crate::{wifi::{found, hidden}};\n",
+                ),
+                (
+                    "src/wifi/mod.rs",
+                    "pub fn found() -> u32 {\n    0\n}\npub fn hidden() -> u32 {\n    1\n}\n",
+                ),
+            ],
+            "base",
+        );
+        fs::write(
+            repo.join("src/wifi/mod.rs"),
+            "pub fn hidden() -> u32 {\n    1\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 0,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "nested grouped use 経由 re-export の削除は api.rm に残すべき。got: {removed:?}"
         );
     }
 
