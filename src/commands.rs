@@ -5540,9 +5540,9 @@ fn collect_pub_use_targets(
                 return Some(());
             }
             let argument = node.child_by_field_name("argument")?;
-            let arg_text = argument.utf8_text(source).ok()?;
-            let stripped = strip_rust_comments_in_use_tree(arg_text);
-            expand_rust_use_tree(&[], current_module, stripped.trim(), targets)?;
+            // AST argument ノードを構造的に walk して whitespace / コメント非依存に解析する。
+            // テキスト分割では `crate :: wifi :: found` や `found\tas\talias` を取りこぼすため。
+            expand_rust_use_tree_ast(argument, source, &[], current_module, targets)?;
         }
         "mod_item" => {
             let name = node
@@ -5596,6 +5596,9 @@ fn rust_use_declaration_is_pub(node: tree_sitter::Node<'_>, source: &[u8]) -> bo
 
 /// Rust の `//` 行コメントと `/* ... */` ブロックコメント (ネスト対応) を **空白に置換** する。
 /// 削除でなく置換にするのは `found/*x*/as alias` のような区切りを潰さないため。
+///
+/// **NOTE**: AST walker に切り替えたためテキスト解析側でしか使わない。旧テキスト経路保守用に残す。
+#[allow(dead_code)]
 fn strip_rust_comments_in_use_tree(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -5638,11 +5641,244 @@ fn strip_rust_comments_in_use_tree(text: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| text.to_string())
 }
 
+/// 構造的に AST を walk して `pub use` re-export ターゲットを抽出する (whitespace / コメント非依存)。
+///
+/// `argument` ノードは tree-sitter-rust の以下のいずれかになる:
+/// - `identifier`: 単一名 `pub use Foo;` (この crate root の Foo を再エクスポート)
+/// - `scoped_identifier`: `path::name` 形式。`path` は field=path、`name` は field=name
+/// - `scoped_use_list`: `path::{...}` 形式。`path` は field=path、`list` は field=list (use_list)
+/// - `use_list`: `{...}` 形式 (path なし、トップでは稀)
+/// - `use_as_clause`: `path as alias` 形式。`path` は field=path、`alias` は field=alias
+/// - `use_wildcard`: `path::*` 形式。`path` は field=path (省略あり)
+/// - `crate` / `self` / `super`: アンカーキーワード (再帰中に処理)
+///
+/// 戻り値 `None` で「判定不能」(root を超える super::、解決不能な anchor) — 呼出元は index を `None` にする。
+fn expand_rust_use_tree_ast(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    path_prefix: &[String],
+    current_module: &[String],
+    out: &mut Vec<RustPubUseTarget>,
+) -> Option<()> {
+    match node.kind() {
+        "scoped_use_list" => {
+            // tree-sitter-rust grammar は scoped_use_list で path/list の field 名を出さないので
+            // named children から kind で判別する。最初の use_list 以前の子が path 相当。
+            let mut path_node: Option<tree_sitter::Node<'_>> = None;
+            let mut list_node: Option<tree_sitter::Node<'_>> = None;
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                match child.kind() {
+                    "use_list" => {
+                        list_node = Some(child);
+                        break;
+                    }
+                    _ => path_node = Some(child),
+                }
+            }
+            let list = list_node?;
+            let resolved_prefix = match path_node {
+                Some(pn) => {
+                    let (prefix, leaf) =
+                        resolve_use_path_node(pn, source, path_prefix, current_module)?;
+                    let mut p = prefix;
+                    if let Some(name) = leaf {
+                        p.push(name);
+                    }
+                    p
+                }
+                None => path_prefix.to_vec(),
+            };
+            expand_use_list(list, source, &resolved_prefix, out)?;
+        }
+        "use_list" => {
+            expand_use_list(node, source, path_prefix, out)?;
+        }
+        "use_as_clause" => {
+            // tree-sitter-rust grammar は use_as_clause で path/alias の field 名を出さない。
+            // named children は [path, alias] の順序 (path は scoped_identifier / identifier、
+            // alias は identifier)。alias は `_` (wildcard 化) の場合に外部非公開で除外する。
+            let mut named: Vec<tree_sitter::Node<'_>> = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                named.push(child);
+            }
+            if named.len() != 2 {
+                return Some(()); // 想定外の構造 (named_children の取りこぼし)
+            }
+            let alias_text = named[1].utf8_text(source).ok()?.trim();
+            if alias_text == "_" {
+                return Some(());
+            }
+            let path_node = named[0];
+            let (resolved_prefix, leaf_name) =
+                resolve_use_path_node(path_node, source, path_prefix, current_module)?;
+            if let Some(item) = leaf_name {
+                if resolved_prefix.is_empty() {
+                    return Some(());
+                }
+                out.push(RustPubUseTarget::Named {
+                    path: resolved_prefix,
+                    item,
+                });
+            }
+        }
+        "use_wildcard" => {
+            // tree-sitter-rust grammar の use_wildcard は named child を 1 つだけ持つ
+            // (path 相当: scoped_identifier / identifier / crate / self / super)。
+            let mut cursor = node.walk();
+            let path_node = node.named_children(&mut cursor).next();
+            if let Some(path_node) = path_node {
+                let (resolved_prefix, leaf_name) =
+                    resolve_use_path_node(path_node, source, path_prefix, current_module)?;
+                let mut path = resolved_prefix;
+                if let Some(name) = leaf_name {
+                    path.push(name);
+                }
+                if !path.is_empty() {
+                    out.push(RustPubUseTarget::Wildcard { path });
+                }
+            }
+        }
+        "scoped_identifier" | "identifier" | "crate" | "self" | "super" => {
+            // path::name 形式の単純 re-export、または anchor 単体。
+            // crate root の単独 identifier は scoped でなく外部参照不能なので捨てる。
+            let (resolved_prefix, leaf_name) =
+                resolve_use_path_node(node, source, path_prefix, current_module)?;
+            if let Some(item) = leaf_name
+                && !resolved_prefix.is_empty()
+            {
+                out.push(RustPubUseTarget::Named {
+                    path: resolved_prefix,
+                    item,
+                });
+            }
+        }
+        _ => {
+            // 知らない kind は子供を再帰 walk (将来の grammar 変更に保守的に対応)。
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.is_named() {
+                    expand_rust_use_tree_ast(child, source, path_prefix, current_module, out)?;
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+/// `use_list` ノード (`{ ... }`) の各要素 (`,` 区切り) を再帰展開する。
+fn expand_use_list(
+    list: tree_sitter::Node<'_>,
+    source: &[u8],
+    path_prefix: &[String],
+    out: &mut Vec<RustPubUseTarget>,
+) -> Option<()> {
+    let mut cursor = list.walk();
+    for child in list.children(&mut cursor) {
+        if !child.is_named() {
+            continue;
+        }
+        // use_list の子要素は use_as_clause / scoped_identifier / scoped_use_list /
+        // use_wildcard / identifier / use_list (ネスト)。それぞれを expand に渡す。
+        // current_module は group 内では継承しない (空)。
+        expand_rust_use_tree_ast(child, source, path_prefix, &[], out)?;
+    }
+    Some(())
+}
+
+/// `path` ノード (scoped_identifier / identifier / crate / self / super) を解決して
+/// `(resolved_prefix, leaf_name)` を返す。anchor (crate/self/super) を current_module で解決し、
+/// scoped_identifier は再帰的に path → name を展開する。
+///
+/// 戻り値:
+/// - `Some((prefix, Some(name)))`: scoped_identifier の終端で name 部分を抽出した
+/// - `Some((prefix, None))`: anchor 単体 (super::, crate:: 等) のみで終わった
+/// - `None`: 判定不能 (root を超える super::、不正な構造)
+fn resolve_use_path_node(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    path_prefix: &[String],
+    current_module: &[String],
+) -> Option<(Vec<String>, Option<String>)> {
+    match node.kind() {
+        "scoped_identifier" => {
+            // tree-sitter-rust grammar は scoped_identifier で path/name の field 名を出さない。
+            // named children は最大 2 つ: [path, name] または [name] のみ (path が省略された
+            // 場合は crate root レベルの単一 identifier 扱い)。
+            let mut named: Vec<tree_sitter::Node<'_>> = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                named.push(child);
+            }
+            match named.as_slice() {
+                [name_node] => {
+                    let name_text = name_node.utf8_text(source).ok()?.trim().to_string();
+                    Some((path_prefix.to_vec(), Some(name_text)))
+                }
+                [path_node, name_node] => {
+                    let name_text = name_node.utf8_text(source).ok()?.trim().to_string();
+                    let (prefix, intermediate_leaf) =
+                        resolve_use_path_node(*path_node, source, path_prefix, current_module)?;
+                    let mut full_prefix = prefix;
+                    if let Some(leaf) = intermediate_leaf {
+                        full_prefix.push(leaf);
+                    }
+                    Some((full_prefix, Some(name_text)))
+                }
+                _ => None, // 想定外の named children 数
+            }
+        }
+        "identifier" => {
+            let text = node.utf8_text(source).ok()?.trim().to_string();
+            Some((path_prefix.to_vec(), Some(text)))
+        }
+        "crate" => {
+            // crate root 起点: 現 prefix を捨ててルート (空) 起点にする。
+            Some((Vec::new(), None))
+        }
+        "self" => {
+            // 現 module 起点。current_module を prefix に積む (まだ何も積んでいない時のみ)。
+            if path_prefix.is_empty() {
+                Some((current_module.to_vec(), None))
+            } else {
+                Some((path_prefix.to_vec(), None))
+            }
+        }
+        "super" => {
+            // 現 module から 1 階層上。
+            let mut effective = if path_prefix.is_empty() {
+                current_module.to_vec()
+            } else {
+                path_prefix.to_vec()
+            };
+            effective.pop()?;
+            Some((effective, None))
+        }
+        _ => {
+            // 知らない kind は子供を再帰 walk して可能な解決を試みる。
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.is_named()
+                    && let Some(result) =
+                        resolve_use_path_node(child, source, path_prefix, current_module)
+                {
+                    return Some(result);
+                }
+            }
+            None
+        }
+    }
+}
+
 /// `argument` (use_declaration の AST 子フィールド) のテキストから re-export ターゲットを抽出する。
 /// `current_module` は file の lib.rs 起点モジュールパス (super:: 解決用)。grouped use
 /// (`crate::{wifi::found, wifi::hidden}` / nested `crate::{wifi::{a, b}}`) を再帰展開する。
 ///
-/// 戻り値: `Some(())` で正常、`None` で「判定不能」(root を超える super::、解決不能な path)。
+/// **NOTE**: 旧テキストベース実装。whitespace 入り (`crate :: wifi :: found`) や tab alias
+/// (`found\tas\talias`) を取りこぼすため、`expand_rust_use_tree_ast` (AST walker) に置き換え済み。
+/// 単体テストおよび旧経路互換のため当面残す。
+#[allow(dead_code)]
 fn expand_rust_use_tree(
     path_prefix: &[String],
     current_module: &[String],
@@ -10966,6 +11202,97 @@ def main():
         assert!(
             !removed.iter().any(|n| n.ends_with("found")),
             "非 pub inline mod 配下の pub use は外部到達不能なので削除は api.rm に残さない。got: {removed:?}"
+        );
+    }
+
+    /// `pub use crate :: wifi :: found;` のように `::` の周囲に whitespace を入れても
+    /// AST argument walker (tree-sitter-rust の scoped_identifier 構造) で正しく解析され、
+    /// found 削除は api.rm に残る (codex pre-merge レビュー 4 回目 Warning #1 回帰テスト)。
+    #[test]
+    fn detect_api_changes_private_module_reexport_with_whitespace_path_stays_in_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod wifi;\npub mod prelude;\n"),
+                ("src/prelude.rs", "pub use crate :: wifi :: found;\n"),
+                ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(repo.join("src/wifi/mod.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "whitespace 入りの :: re-export は AST walker で正規化解決され、削除は api.rm に残るべき。got: {removed:?}"
+        );
+    }
+
+    /// `pub use crate::wifi::found\tas\talias;` のように alias 区切りがタブでも AST walker で
+    /// 解析され、found 削除は api.rm に残る (codex pre-merge レビュー 4 回目 Warning #1b 回帰)。
+    #[test]
+    fn detect_api_changes_private_module_reexport_with_tab_alias_stays_in_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod wifi;\npub mod prelude;\n"),
+                ("src/prelude.rs", "pub use crate::wifi::found\tas\talias;\n"),
+                ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(repo.join("src/wifi/mod.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "タブ区切り as alias の re-export も AST walker で解析され、削除は api.rm に残るべき。got: {removed:?}"
         );
     }
 
