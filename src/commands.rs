@@ -5414,7 +5414,10 @@ fn collect_rust_pub_use_index_at_base(
         let file_str = file.to_str()?;
         let source = read_git_blob_at_base(dir, base, file_str)?;
         let tree = parser::parse_source(&source, crate::language::LangId::Rust).ok()?;
-        collect_pub_use_targets(tree.root_node(), &source, &mut targets);
+        // file 自身のモジュールパス (lib.rs 起点) を super:: 解決に渡す。`mod.rs` /
+        // `lib.rs` / `main.rs` は親 module 自身なので segments のうち末尾の特殊名は剥がされる
+        // (module_path_segments の規約)。
+        collect_pub_use_targets(tree.root_node(), &source, &module_path, 0, &mut targets)?;
     }
     Some(RustPubUseIndex { targets })
 }
@@ -5515,78 +5518,183 @@ fn rust_module_path_is_public_reachable_at_base(
 }
 
 /// AST を走査し `use_declaration` ノードから `pub use` re-export ターゲットを集める。
+///
+/// - `current_module`: lib.rs 起点の current source 所属モジュール (super:: 解決に使う)
+/// - `inline_private_depth`: 非 pub inline `mod foo { ... }` のネスト深度。1以上の間の
+///   `pub use` は外部に届かないので無視する
+/// - 戻り値 `None` = 「判定不能」 (解決不能な super:: や不正な use tree)。呼出元は index 全体を
+///   `None` にして api.rm を残す (false negative より false positive を優先する fail-closed 方針)
 fn collect_pub_use_targets(
     node: tree_sitter::Node<'_>,
     source: &[u8],
+    current_module: &[String],
+    inline_private_depth: u32,
     targets: &mut Vec<RustPubUseTarget>,
-) {
-    if node.kind() == "use_declaration"
-        && let Ok(text) = node.utf8_text(source)
-    {
-        targets.extend(parse_pub_use_targets(text));
+) -> Option<()> {
+    match node.kind() {
+        "use_declaration" => {
+            if inline_private_depth > 0 {
+                return Some(());
+            }
+            if !rust_use_declaration_is_pub(node, source) {
+                return Some(());
+            }
+            let argument = node.child_by_field_name("argument")?;
+            let arg_text = argument.utf8_text(source).ok()?;
+            let stripped = strip_rust_comments_in_use_tree(arg_text);
+            expand_rust_use_tree(&[], current_module, stripped.trim(), targets)?;
+        }
+        "mod_item" => {
+            let name = node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(str::to_string);
+            let is_pub = rust_use_declaration_is_pub(node, source);
+            let depth_delta = if is_pub { 0u32 } else { 1u32 };
+            let mut next_module = current_module.to_vec();
+            if let Some(seg) = name {
+                next_module.push(seg);
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_pub_use_targets(
+                    child,
+                    source,
+                    &next_module,
+                    inline_private_depth + depth_delta,
+                    targets,
+                )?;
+            }
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_pub_use_targets(
+                    child,
+                    source,
+                    current_module,
+                    inline_private_depth,
+                    targets,
+                )?;
+            }
+        }
     }
+    Some(())
+}
+
+/// `use_declaration` / `mod_item` ノードが「制限なし `pub`」 (`pub(crate)` / `pub(super)` 等の
+/// 制限付きや非 pub を除く) かを返す。`visibility_modifier` 子ノードのテキストを厳密に `"pub"` で照合する。
+fn rust_use_declaration_is_pub(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_pub_use_targets(child, source, targets);
+        if child.kind() == "visibility_modifier" {
+            return child.utf8_text(source).map(str::trim) == Ok("pub");
+        }
     }
+    false
 }
 
-/// `pub use ...;` のテキストから re-export ターゲットを抽出する。`pub(crate) use` 等の制限付きは
-/// 外部非公開なので除外する。grouped use (`pub use crate::{wifi::found, wifi::hidden};` や nested
-/// `pub use crate::{a::{b, c}, d};`) を再帰的に展開してフラットなターゲット列に正規化する。
-fn parse_pub_use_targets(text: &str) -> Vec<RustPubUseTarget> {
-    let t = text.trim_start();
-    let Some(rest) = t.strip_prefix("pub use ") else {
-        return Vec::new();
-    };
-    let body = rest.trim().trim_end_matches(';').trim();
-    let mut out = Vec::new();
-    expand_rust_use_tree(&[], body, &mut out);
-    out
+/// Rust の `//` 行コメントと `/* ... */` ブロックコメント (ネスト対応) を **空白に置換** する。
+/// 削除でなく置換にするのは `found/*x*/as alias` のような区切りを潰さないため。
+fn strip_rust_comments_in_use_tree(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let mut block_depth: u32 = 0;
+    while i < bytes.len() {
+        if block_depth == 0 && i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out.push(b' ');
+                i += 1;
+            }
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            block_depth += 1;
+            out.push(b' ');
+            out.push(b' ');
+            i += 2;
+            continue;
+        }
+        if block_depth > 0 && i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+            block_depth -= 1;
+            out.push(b' ');
+            out.push(b' ');
+            i += 2;
+            continue;
+        }
+        if block_depth > 0 {
+            if bytes[i] == b'\n' {
+                out.push(b'\n');
+            } else {
+                out.push(b' ');
+            }
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
 }
 
-/// 親 `path_prefix` (空ベクタで始まる) と `body` を結合して 1 つの use tree を再帰展開する。
-/// `body` は `crate::{a, b}` / `wifi::found` / `wifi::*` / `wifi::{found as bar}` / `self::x` 等。
-fn expand_rust_use_tree(path_prefix: &[String], body: &str, out: &mut Vec<RustPubUseTarget>) {
+/// `argument` (use_declaration の AST 子フィールド) のテキストから re-export ターゲットを抽出する。
+/// `current_module` は file の lib.rs 起点モジュールパス (super:: 解決用)。grouped use
+/// (`crate::{wifi::found, wifi::hidden}` / nested `crate::{wifi::{a, b}}`) を再帰展開する。
+///
+/// 戻り値: `Some(())` で正常、`None` で「判定不能」(root を超える super::、解決不能な path)。
+fn expand_rust_use_tree(
+    path_prefix: &[String],
+    current_module: &[String],
+    body: &str,
+    out: &mut Vec<RustPubUseTarget>,
+) -> Option<()> {
     let body = body.trim();
     if body.is_empty() {
-        return;
+        return Some(());
     }
-    // body 全体が `{...}` でくくられた grouped use ならその場で分解。
-    if let Some(inner) = body.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+    // body 全体が `{...}` でくくられた grouped use なら分解。
+    if let Some(inner) = strip_balanced_braces(body) {
         for part in split_rust_use_group(inner) {
-            expand_rust_use_tree(path_prefix, part.trim(), out);
+            expand_rust_use_tree(path_prefix, current_module, part.trim(), out)?;
         }
-        return;
+        return Some(());
     }
-    // 先頭セグメントが `crate` / `self` なら path_prefix に積まず読み飛ばす (外部 path ではなく
-    // 現 crate root 起点を示すだけのアンカー)。`super` は親 module への参照になるため、
-    // 我々の symbol 所属判定では使えないので「判定不能」扱いとして無視する。
+    // 先頭セグメント正規化: crate:: は無視、self:: は無視、super:: は current_module から pop。
     let mut remainder = body;
     let mut prefix: Vec<String> = path_prefix.to_vec();
-    while let Some(rest) = remainder.strip_prefix("crate::") {
-        remainder = rest.trim_start();
+    let mut effective_current: Vec<String> = current_module.to_vec();
+    let mut anchored_to_crate_root = false;
+    loop {
+        if let Some(rest) = remainder.strip_prefix("crate::") {
+            remainder = rest.trim_start();
+            anchored_to_crate_root = true;
+            effective_current.clear();
+            continue;
+        }
+        if let Some(rest) = remainder.strip_prefix("self::") {
+            remainder = rest.trim_start();
+            continue;
+        }
+        if let Some(rest) = remainder.strip_prefix("super::") {
+            remainder = rest.trim_start();
+            effective_current.pop()?;
+            continue;
+        }
+        break;
     }
-    while let Some(rest) = remainder.strip_prefix("self::") {
-        remainder = rest.trim_start();
-    }
-    if remainder.starts_with("super::") || remainder == "super" {
-        return;
+    // crate root 以外起点で current_module を継承する場合、prefix の先頭に積む。
+    if !anchored_to_crate_root && !effective_current.is_empty() && prefix.is_empty() {
+        prefix = effective_current.clone();
     }
     if remainder.is_empty() {
-        return;
+        return Some(());
     }
-    // body の末尾が `{...}` なら group。"::" 区切りでネストせず、bracket バランスで本体を分離する。
+    // 末尾 `{...}` group を切り出す (head + group)。
     if let Some(group_start) = find_top_level_group_start(remainder) {
-        let head = remainder[..group_start].trim();
-        let head = head.trim_end_matches(':').trim_end_matches(':').trim();
+        let head = remainder[..group_start].trim().trim_end_matches(':').trim();
         let group_body = &remainder[group_start..];
-        let Some(inner) = group_body
-            .strip_prefix('{')
-            .and_then(|s| s.strip_suffix('}'))
-        else {
-            return; // 不正な構文は無視
-        };
+        let inner = strip_balanced_braces(group_body)?;
         let head_segments: Vec<String> = if head.is_empty() {
             Vec::new()
         } else {
@@ -5601,30 +5709,29 @@ fn expand_rust_use_tree(path_prefix: &[String], body: &str, out: &mut Vec<RustPu
             if part.is_empty() {
                 continue;
             }
-            expand_rust_use_tree(&prefix, part, out);
+            // group 内では親 anchor を継承しない (current_module は空で渡す)。
+            expand_rust_use_tree(&prefix, &[], part, out)?;
         }
-        return;
+        return Some(());
     }
-    // group なし。末尾が `*` なら wildcard、それ以外は最終セグメントを item として named ターゲット。
+    // 末尾が `*` なら wildcard。
     if let Some(p) = remainder.strip_suffix("::*") {
         let mut path = prefix.clone();
         path.extend(p.split("::").filter(|s| !s.is_empty()).map(str::to_string));
         if !path.is_empty() {
             out.push(RustPubUseTarget::Wildcard { path });
         }
-        return;
+        return Some(());
     }
-    // alias 解決 (`<original> as <alias>`、`as _` は除外)。
+    // alias 解決 (`<original> as <alias>`、`as _` は外部非公開なので除外)。
     let item_text = remainder;
-    let (item_text, _alias_drop) = match item_text.split_once(" as ") {
-        Some((_orig, alias)) if alias.trim() == "_" => return,
-        Some((orig, alias)) => (orig.trim(), Some(alias.trim().to_string())),
-        None => (item_text, None),
+    let item_text = match item_text.split_once(" as ") {
+        Some((_orig, alias)) if alias.trim() == "_" => return Some(()),
+        Some((orig, _alias)) => orig.trim(),
+        None => item_text,
     };
     let (path_part, item) = match item_text.rsplit_once("::") {
         Some((p, i)) => (p, i),
-        // path なしの単独 item (例: nested grouped use を展開した結果の "found")。
-        // parent から積み上げた `prefix` を path として使う。
         None => ("", item_text),
     };
     let mut path = prefix;
@@ -5636,12 +5743,40 @@ fn expand_rust_use_tree(path_prefix: &[String], body: &str, out: &mut Vec<RustPu
     );
     let item = item.trim();
     if item.is_empty() || path.is_empty() {
-        return;
+        return Some(());
     }
     out.push(RustPubUseTarget::Named {
         path,
         item: item.to_string(),
     });
+    Some(())
+}
+
+/// 文字列が `{` で始まり、対応する1個の `}` で終わっていればその間を返す。`{a}{b}` のような
+/// 複数 group の連結は `None`。
+fn strip_balanced_braces(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'{') || bytes.last() != Some(&b'}') {
+        return None;
+    }
+    let mut depth: i32 = 0;
+    for (i, b) in bytes.iter().enumerate() {
+        match *b {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return if i == bytes.len() - 1 {
+                        std::str::from_utf8(&bytes[1..bytes.len() - 1]).ok()
+                    } else {
+                        None
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `remainder` の最後に登場するトップレベル `{` のバイト位置を返す。ネストした `{ }` は無視。
@@ -10553,6 +10688,284 @@ def main():
         assert!(
             removed.iter().any(|n| n.ends_with("found")),
             "nested grouped use 経由 re-export の削除は api.rm に残すべき。got: {removed:?}"
+        );
+    }
+
+    /// `pub use super::wifi::found;` を prelude.rs に書いたケース。super:: は current module
+    /// (prelude) から 1 つ pop して crate root 起点になり wifi::found に解決される。
+    /// codex pre-merge レビュー 3 回目の Warning 指摘 #1 の回帰テスト。
+    #[test]
+    fn detect_api_changes_private_module_super_reexport_stays_in_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod wifi;\npub mod prelude;\n"),
+                ("src/prelude.rs", "pub use super::wifi::found;\n"),
+                ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(repo.join("src/wifi/mod.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "super:: re-export は current module を pop して解決され、削除は api.rm に残るべき。got: {removed:?}"
+        );
+    }
+
+    /// `pub use crate::{wifi::found /* } */};` のような grouped use 内ブロックコメントの `}` で
+    /// bracket-balance が誤って崩れない (codex pre-merge レビュー 3 回目 Warning 指摘 #2 の回帰)。
+    #[test]
+    fn detect_api_changes_private_module_grouped_reexport_with_block_comment_stays_in_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod wifi;\npub mod prelude;\n"),
+                ("src/prelude.rs", "pub use crate::{wifi::found /* } */};\n"),
+                ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(repo.join("src/wifi/mod.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "grouped use 内のブロックコメントの `{{`}} で bracket-balance を崩さず正しく解析され、削除は api.rm に残るべき。got: {removed:?}"
+        );
+    }
+
+    /// `// 行コメント\npub /* */ use crate::wifi::found;` のように `pub` と `use` の間に
+    /// ブロックコメントがあっても AST argument 経由抽出で取りこぼさない (codex 指摘 #3 の回帰)。
+    #[test]
+    fn detect_api_changes_private_module_reexport_with_pub_use_comment_stays_in_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod wifi;\npub mod prelude;\n"),
+                (
+                    "src/prelude.rs",
+                    "// 行コメント\npub /* mid */ use crate::wifi::found;\n",
+                ),
+                ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(repo.join("src/wifi/mod.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "// コメント先行と pub /* */ use のコメント混在でも AST argument 経由で解析され、削除は api.rm に残るべき。got: {removed:?}"
+        );
+    }
+
+    /// `pub(crate) use crate::wifi::found;` は制限付き visibility で外部公開ではないため、
+    /// found 削除は api.rm に出さない (visibility_modifier 厳密照合の回帰)。
+    #[test]
+    fn detect_api_changes_private_module_pub_crate_reexport_does_not_keep_in_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod wifi;\npub mod prelude;\n"),
+                ("src/prelude.rs", "pub(crate) use crate::wifi::found;\n"),
+                ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(repo.join("src/wifi/mod.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !removed.iter().any(|n| n.ends_with("found")),
+            "pub(crate) use は外部非公開なので削除は api.rm に残さない。got: {removed:?}"
+        );
+    }
+
+    /// inline `pub mod prelude { pub use super::wifi::found; }` (file 内に pub mod inline 定義 +
+    /// 配下に pub use) でも found 削除を api.rm に残す。super:: は prelude から1pop して crate root。
+    #[test]
+    fn detect_api_changes_private_module_inline_pub_mod_reexport_stays_in_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                (
+                    "src/lib.rs",
+                    "mod wifi;\npub mod prelude { pub use super::wifi::found; }\n",
+                ),
+                ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(repo.join("src/wifi/mod.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "inline pub mod 配下の super:: re-export 経由削除は api.rm に残すべき。got: {removed:?}"
+        );
+    }
+
+    /// inline `mod prelude { pub use super::wifi::found; }` (非 pub inline mod) 配下の pub use は
+    /// 外部に届かないので削除は api.rm に残さない (inline_private_depth の回帰テスト)。
+    #[test]
+    fn detect_api_changes_private_module_inline_private_mod_reexport_does_not_keep() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                (
+                    "src/lib.rs",
+                    "mod wifi;\nmod prelude { pub use super::wifi::found; }\n",
+                ),
+                ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(repo.join("src/wifi/mod.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !removed.iter().any(|n| n.ends_with("found")),
+            "非 pub inline mod 配下の pub use は外部到達不能なので削除は api.rm に残さない。got: {removed:?}"
         );
     }
 
