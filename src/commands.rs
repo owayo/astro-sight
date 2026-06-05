@@ -5222,8 +5222,6 @@ struct RustPrivateModuleInfo {
     src_root_rel: std::path::PathBuf,
     /// `file_path` の src 相対モジュールパス (例: `[wifi]` / `[wifi, detector]`)。
     module_segments: Vec<String>,
-    /// lib.rs から辿って最初に private (`mod`、`pub` なし) だった prefix (例: `[wifi]`)。
-    private_prefix_segments: Vec<String>,
 }
 
 /// base 側で `file_path` (dir 相対) の private module 情報を構築する。re-export は考慮しない
@@ -5289,13 +5287,13 @@ fn rust_private_module_info_at_base(
                 }
             }
             Some(false) => {
-                // private mod。ここが private prefix。
-                let private_prefix_segments = segments[..=idx].to_vec();
+                // private mod。Step B では edge graph + 固定点伝播で公開到達性を判定するため、
+                // private prefix の情報は持ち回らない (target_module 完全一致 + alias graph で代用)。
+                let _ = idx;
                 return Some(RustPrivateModuleInfo {
                     crate_root_rel,
                     src_root_rel,
                     module_segments: segments,
-                    private_prefix_segments,
                 });
             }
             None => return None,
@@ -5351,33 +5349,101 @@ impl RustBaseReexportCache {
 }
 
 /// base 側 crate の public-reachable な module 群から集めた `pub use` re-export ターゲット。
+/// re-export edge graph + public-reachable module 集合 + 逆引き map。
+/// `collect_rust_pub_use_index_at_base` で base 側 crate 全体を 1 度走査して構築し、
+/// `exposes_symbol` で削除シンボルから固定点伝播して公開到達性を判定する。
 struct RustPubUseIndex {
-    targets: Vec<RustPubUseTarget>,
+    edges: Vec<RustPubUseEdge>,
+    /// 外部から `crate::<path>` で到達可能な module 集合 (root = `[]`、`pub mod` のみで到達)。
+    public_modules: std::collections::HashSet<Vec<String>>,
+    /// `(target_module, target_item)` → Named edge index。Named 伝播の逆引き。
+    named_by_target: std::collections::HashMap<RustExportKey, Vec<usize>>,
+    /// `target_module` → Wildcard edge index。Wildcard 伝播の逆引き。
+    wildcard_by_target_module: std::collections::HashMap<Vec<String>, Vec<usize>>,
 }
 
-enum RustPubUseTarget {
-    Named { path: Vec<String>, item: String },
-    Wildcard { path: Vec<String> },
+/// 「ある module でこの名前がエクスポートされている」を表す key。固定点計算の単位。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RustExportKey {
+    module: Vec<String>,
+    name: String,
+}
+
+/// `pub use` から生成される re-export edge。Named は `source_module::exported_name` が
+/// `target_module::target_item` を指す。alias の場合 `exported_name = alias`、`target_item = 元名`。
+/// Wildcard は `source_module::* = target_module::*` で名前ごとに伝播する。
+#[derive(Clone, Debug)]
+enum RustPubUseEdge {
+    Named {
+        source_module: Vec<String>,
+        exported_name: String,
+        target_module: Vec<String>,
+        target_item: String,
+    },
+    Wildcard {
+        source_module: Vec<String>,
+        target_module: Vec<String>,
+    },
 }
 
 impl RustPubUseIndex {
-    /// `info` の private module 配下の `symbol_name` が re-export 公開されているか。
+    /// `info` の private module 配下の `symbol_name` が外部公開 API として到達可能かを返す。
+    /// 削除シンボルを seed として live export 集合を固定点伝播し、live ∩ public_modules ≠ ∅ なら true。
     fn exposes_symbol(&self, info: &RustPrivateModuleInfo, symbol_name: &str) -> bool {
-        let item = rust_reexport_item_name(symbol_name);
-        self.targets.iter().any(|target| match target {
-            RustPubUseTarget::Named {
-                path,
-                item: exported,
-            } => path == &info.module_segments && exported == item,
-            RustPubUseTarget::Wildcard { path } => {
-                // 全 wildcard を公開扱いにはしない。対象 private module 自身、または private prefix を
-                // 含み symbol 所属 module にかかる wildcard のみ公開扱い (同一 module 内の未 re-export
-                // を公開扱いにする false positive を避ける)。
-                path == &info.module_segments
-                    || (info.module_segments.starts_with(path.as_slice())
-                        && path.starts_with(info.private_prefix_segments.as_slice()))
+        let item = rust_reexport_item_name(symbol_name).to_string();
+        let seed = RustExportKey {
+            module: info.module_segments.clone(),
+            name: item,
+        };
+        self.propagate_live_exports(seed)
+            .into_iter()
+            .any(|key| self.public_modules.contains(&key.module))
+    }
+
+    /// 削除 seed から逆向きに live export を BFS で伝播。HashSet で重複を防いで循環で停止する。
+    fn propagate_live_exports(
+        &self,
+        seed: RustExportKey,
+    ) -> std::collections::HashSet<RustExportKey> {
+        use std::collections::{HashSet, VecDeque};
+        let mut live: HashSet<RustExportKey> = HashSet::new();
+        let mut queue: VecDeque<RustExportKey> = VecDeque::new();
+        live.insert(seed.clone());
+        queue.push_back(seed);
+        while let Some(key) = queue.pop_front() {
+            if let Some(edge_ids) = self.named_by_target.get(&key) {
+                for &idx in edge_ids {
+                    if let RustPubUseEdge::Named {
+                        source_module,
+                        exported_name,
+                        ..
+                    } = &self.edges[idx]
+                    {
+                        let next = RustExportKey {
+                            module: source_module.clone(),
+                            name: exported_name.clone(),
+                        };
+                        if live.insert(next.clone()) {
+                            queue.push_back(next);
+                        }
+                    }
+                }
             }
-        })
+            if let Some(edge_ids) = self.wildcard_by_target_module.get(&key.module) {
+                for &idx in edge_ids {
+                    if let RustPubUseEdge::Wildcard { source_module, .. } = &self.edges[idx] {
+                        let next = RustExportKey {
+                            module: source_module.clone(),
+                            name: key.name.clone(),
+                        };
+                        if live.insert(next.clone()) {
+                            queue.push_back(next);
+                        }
+                    }
+                }
+            }
+        }
+        live
     }
 }
 
@@ -5391,35 +5457,190 @@ fn rust_reexport_item_name(name: &str) -> &str {
     }
 }
 
-/// base 側 crate の src/ 配下から public-reachable な module だけを parse し `pub use` を集める。
-/// `git ls-tree` / `git show` / parse のいずれかで判定不能になったら `None` を返し、呼び出し側で
-/// api.rm を残す (false negative 回避)。
+/// base 側 crate の src/ 配下を全 .rs 走査して `pub use` を edge として集め、public-reachable module
+/// 集合と逆引き map を構築する。public-reachable filter は collect 段階では外し (private module 内の
+/// pub use も root から `pub use private::x` されれば公開になり得るため)、最終判定は `exposes_symbol`
+/// の固定点伝播で行う。`git ls-tree` / `git show` / parse / path 解決のいずれかで判定不能になったら
+/// `None` を返して `api.rm` を残す (false negative 回避)。
 fn collect_rust_pub_use_index_at_base(
     dir: &str,
     base: &str,
     info: &RustPrivateModuleInfo,
 ) -> Option<RustPubUseIndex> {
     let files = git_ls_tree_rs_files_at_base(dir, base, &info.src_root_rel)?;
-    let mut targets = Vec::new();
+    let mut edges: Vec<RustPubUseEdge> = Vec::new();
     for file in files {
         let Ok(rel_to_src) = file.strip_prefix(&info.src_root_rel) else {
             continue;
         };
         let module_path = module_path_segments(rel_to_src);
-        match rust_module_path_is_public_reachable_at_base(dir, base, info, &module_path) {
-            Some(true) => {}
-            Some(false) => continue,
-            None => return None,
-        }
         let file_str = file.to_str()?;
         let source = read_git_blob_at_base(dir, base, file_str)?;
         let tree = parser::parse_source(&source, crate::language::LangId::Rust).ok()?;
-        // file 自身のモジュールパス (lib.rs 起点) を super:: 解決に渡す。`mod.rs` /
-        // `lib.rs` / `main.rs` は親 module 自身なので segments のうち末尾の特殊名は剥がされる
-        // (module_path_segments の規約)。
-        collect_pub_use_targets(tree.root_node(), &source, &module_path, 0, &mut targets)?;
+        collect_pub_use_edges(tree.root_node(), &source, &module_path, &mut edges)?;
     }
-    Some(RustPubUseIndex { targets })
+    // 逆引き map と public_modules を構築する。
+    let mut named_by_target: std::collections::HashMap<RustExportKey, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut wildcard_by_target_module: std::collections::HashMap<Vec<String>, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (idx, edge) in edges.iter().enumerate() {
+        match edge {
+            RustPubUseEdge::Named {
+                target_module,
+                target_item,
+                ..
+            } => {
+                let key = RustExportKey {
+                    module: target_module.clone(),
+                    name: target_item.clone(),
+                };
+                named_by_target.entry(key).or_default().push(idx);
+            }
+            RustPubUseEdge::Wildcard { target_module, .. } => {
+                wildcard_by_target_module
+                    .entry(target_module.clone())
+                    .or_default()
+                    .push(idx);
+            }
+        }
+    }
+    let public_modules = public_reachable_modules_at_base(dir, base, info)?;
+    Some(RustPubUseIndex {
+        edges,
+        public_modules,
+        named_by_target,
+        wildcard_by_target_module,
+    })
+}
+
+/// base 側で lib.rs (crate root) から `pub mod` 経路 (制限なし pub) で到達できる module 集合を
+/// 構築する。root `[]` は常に含む。inline `pub mod foo { ... }` も再帰的に拾う。`mod foo;`
+/// (制限なし pub なし) は除外する。判定不能 (`#[path]` / モジュールファイル解決失敗 / 解析失敗) は
+/// `None` を返し、呼出元で api.rm を残す。
+fn public_reachable_modules_at_base(
+    dir: &str,
+    base: &str,
+    info: &RustPrivateModuleInfo,
+) -> Option<std::collections::HashSet<Vec<String>>> {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    let mut result: HashSet<Vec<String>> = HashSet::new();
+    result.insert(Vec::new()); // crate root は常に public-reachable
+    // BFS で `pub mod` チェーンを辿る。各 frontier ノードは (module_segments, current_rel)
+    // (current_rel は src 相対モジュールファイル) を持つ。
+    let mut frontier: Vec<(Vec<String>, PathBuf)> = vec![(Vec::new(), PathBuf::from("lib.rs"))];
+    while let Some((segments, current_rel)) = frontier.pop() {
+        let source =
+            read_rust_module_source_at_base(dir, base, &info.crate_root_rel, &current_rel)?;
+        let tree = parser::parse_source(&source, crate::language::LangId::Rust).ok()?;
+        // 子 module (mod_item) を全部列挙する (inline body / 宣言のみ どちらも)。
+        // 各 mod_item の visibility が制限なし `pub` なら子は public-reachable に追加し、
+        // inline body があれば再帰的に辿る、宣言のみなら次のモジュールファイルを解決して frontier に積む。
+        // 非 pub mod は除外。
+        collect_public_pub_mods(
+            tree.root_node(),
+            &source,
+            dir,
+            base,
+            info,
+            &segments,
+            &current_rel,
+            &mut result,
+            &mut frontier,
+        )?;
+    }
+    Some(result)
+}
+
+/// `lib.rs` / 親モジュールファイルから子の `pub mod` を再帰的に集める。inline body は同じファイル
+/// 内で walk 続行、宣言のみは次のモジュールファイルを resolve して frontier に積む。
+#[allow(clippy::too_many_arguments)]
+fn collect_public_pub_mods(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    dir: &str,
+    base: &str,
+    info: &RustPrivateModuleInfo,
+    current_segments: &[String],
+    current_file_rel: &std::path::Path,
+    result: &mut std::collections::HashSet<Vec<String>>,
+    frontier: &mut Vec<(Vec<String>, std::path::PathBuf)>,
+) -> Option<()> {
+    use std::path::Path;
+    match node.kind() {
+        "mod_item" => {
+            let name = node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(str::to_string)?;
+            let is_pub = rust_use_declaration_is_pub(node, source);
+            if !is_pub {
+                return Some(()); // 非 pub mod 配下は public-reachable ではない
+            }
+            let mut child_segments = current_segments.to_vec();
+            child_segments.push(name.clone());
+            result.insert(child_segments.clone());
+            // inline body `mod foo { ... }` を探す: declaration_list 子を再帰 walk
+            let mut has_inline_body = false;
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "declaration_list" {
+                    has_inline_body = true;
+                    let mut inner_cursor = child.walk();
+                    for inner in child.named_children(&mut inner_cursor) {
+                        collect_public_pub_mods(
+                            inner,
+                            source,
+                            dir,
+                            base,
+                            info,
+                            &child_segments,
+                            current_file_rel,
+                            result,
+                            frontier,
+                        )?;
+                    }
+                }
+            }
+            if !has_inline_body {
+                // 宣言のみ。子モジュールファイルを resolve して frontier に積む。
+                let parent_dir = current_file_rel
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                let as_mod = parent_dir.join(&name).join("mod.rs");
+                let as_file = parent_dir.join(format!("{name}.rs"));
+                if read_rust_module_source_at_base(dir, base, &info.crate_root_rel, &as_mod)
+                    .is_some()
+                {
+                    frontier.push((child_segments, as_mod));
+                } else if read_rust_module_source_at_base(dir, base, &info.crate_root_rel, &as_file)
+                    .is_some()
+                {
+                    frontier.push((child_segments, as_file));
+                }
+                // モジュールファイル未解決は無視 (public_modules には登録済み、ただし子 module は辿らない)
+            }
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_public_pub_mods(
+                    child,
+                    source,
+                    dir,
+                    base,
+                    info,
+                    current_segments,
+                    current_file_rel,
+                    result,
+                    frontier,
+                )?;
+            }
+        }
+    }
+    Some(())
 }
 
 /// `git ls-tree -r --name-only <base> -- <src_root_rel>` で `.rs` ファイル一覧 (repo 相対) を取る。
@@ -5469,113 +5690,55 @@ fn read_git_blob_at_base(dir: &str, base: &str, file: &str) -> Option<Vec<u8>> {
     Some(out.stdout)
 }
 
-/// base 側で `module_path` が lib.rs から `pub mod` 経路だけで到達できるか。private mod を経由する
-/// なら `Some(false)`、判定不能なら `None` (呼び出し側で api.rm を残す)。
-fn rust_module_path_is_public_reachable_at_base(
-    dir: &str,
-    base: &str,
-    info: &RustPrivateModuleInfo,
-    module_path: &[String],
-) -> Option<bool> {
-    use std::path::{Path, PathBuf};
-    if module_path.is_empty() {
-        return Some(true); // root モジュール (lib.rs / main.rs)
-    }
-    let mut current_rel = PathBuf::from("lib.rs");
-    let last = module_path.len() - 1;
-    for (i, seg) in module_path.iter().enumerate() {
-        let source =
-            read_rust_module_source_at_base(dir, base, &info.crate_root_rel, &current_rel)?;
-        let tree = parser::parse_source(&source, crate::language::LangId::Rust).ok()?;
-        match find_mod_decl_visibility(tree.root_node(), &source, seg) {
-            Some(true) => {
-                if i == last {
-                    return Some(true);
-                }
-                let parent = current_rel
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_default();
-                let as_mod = parent.join(seg).join("mod.rs");
-                let as_file = parent.join(format!("{seg}.rs"));
-                if read_rust_module_source_at_base(dir, base, &info.crate_root_rel, &as_mod)
-                    .is_some()
-                {
-                    current_rel = as_mod;
-                } else if read_rust_module_source_at_base(dir, base, &info.crate_root_rel, &as_file)
-                    .is_some()
-                {
-                    current_rel = as_file;
-                } else {
-                    return None;
-                }
-            }
-            Some(false) => return Some(false),
-            None => return None,
-        }
-    }
-    Some(true)
-}
-
-/// AST を走査し `use_declaration` ノードから `pub use` re-export ターゲットを集める。
+/// AST を走査し `use_declaration` ノードから `pub use` re-export edge を集める。
 ///
-/// - `current_module`: lib.rs 起点の current source 所属モジュール (super:: 解決に使う)
-/// - `inline_private_depth`: 非 pub inline `mod foo { ... }` のネスト深度。1以上の間の
-///   `pub use` は外部に届かないので無視する
+/// - `current_module`: lib.rs 起点の current source 所属モジュール (super:: 解決 + source_module に使う)
 /// - 戻り値 `None` = 「判定不能」 (解決不能な super:: や不正な use tree)。呼出元は index 全体を
 ///   `None` にして api.rm を残す (false negative より false positive を優先する fail-closed 方針)
-fn collect_pub_use_targets(
+///
+/// **注**: Step A の `collect_pub_use_targets` から「inline_private_depth による pub use 除外」を外した。
+/// 非 pub inline mod 配下の `pub use` でも、root から `pub use private_mod::x` されれば外部公開
+/// 経路になり得るため。最終判定は `RustPubUseIndex::exposes_symbol` の固定点伝播で行う。
+fn collect_pub_use_edges(
     node: tree_sitter::Node<'_>,
     source: &[u8],
     current_module: &[String],
-    inline_private_depth: u32,
-    targets: &mut Vec<RustPubUseTarget>,
+    edges: &mut Vec<RustPubUseEdge>,
 ) -> Option<()> {
     match node.kind() {
         "use_declaration" => {
-            if inline_private_depth > 0 {
-                return Some(());
-            }
             if !rust_use_declaration_is_pub(node, source) {
                 return Some(());
             }
             let argument = node.child_by_field_name("argument")?;
-            // AST argument ノードを構造的に walk して whitespace / コメント非依存に解析する。
-            // テキスト分割では `crate :: wifi :: found` や `found\tas\talias` を取りこぼすため。
-            expand_rust_use_tree_ast(argument, source, &[], current_module, targets)?;
+            expand_rust_use_tree_edges_ast(
+                argument,
+                source,
+                &[],
+                current_module,
+                current_module,
+                None,
+                edges,
+            )?;
         }
         "mod_item" => {
             let name = node
                 .child_by_field_name("name")
                 .and_then(|n| n.utf8_text(source).ok())
                 .map(str::to_string);
-            let is_pub = rust_use_declaration_is_pub(node, source);
-            let depth_delta = if is_pub { 0u32 } else { 1u32 };
             let mut next_module = current_module.to_vec();
             if let Some(seg) = name {
                 next_module.push(seg);
             }
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                collect_pub_use_targets(
-                    child,
-                    source,
-                    &next_module,
-                    inline_private_depth + depth_delta,
-                    targets,
-                )?;
+                collect_pub_use_edges(child, source, &next_module, edges)?;
             }
         }
         _ => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                collect_pub_use_targets(
-                    child,
-                    source,
-                    current_module,
-                    inline_private_depth,
-                    targets,
-                )?;
+                collect_pub_use_edges(child, source, current_module, edges)?;
             }
         }
     }
@@ -5594,53 +5757,6 @@ fn rust_use_declaration_is_pub(node: tree_sitter::Node<'_>, source: &[u8]) -> bo
     false
 }
 
-/// Rust の `//` 行コメントと `/* ... */` ブロックコメント (ネスト対応) を **空白に置換** する。
-/// 削除でなく置換にするのは `found/*x*/as alias` のような区切りを潰さないため。
-///
-/// **NOTE**: AST walker に切り替えたためテキスト解析側でしか使わない。旧テキスト経路保守用に残す。
-#[allow(dead_code)]
-fn strip_rust_comments_in_use_tree(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    let mut block_depth: u32 = 0;
-    while i < bytes.len() {
-        if block_depth == 0 && i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
-            while i < bytes.len() && bytes[i] != b'\n' {
-                out.push(b' ');
-                i += 1;
-            }
-            continue;
-        }
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            block_depth += 1;
-            out.push(b' ');
-            out.push(b' ');
-            i += 2;
-            continue;
-        }
-        if block_depth > 0 && i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
-            block_depth -= 1;
-            out.push(b' ');
-            out.push(b' ');
-            i += 2;
-            continue;
-        }
-        if block_depth > 0 {
-            if bytes[i] == b'\n' {
-                out.push(b'\n');
-            } else {
-                out.push(b' ');
-            }
-            i += 1;
-            continue;
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
-}
-
 /// 構造的に AST を walk して `pub use` re-export ターゲットを抽出する (whitespace / コメント非依存)。
 ///
 /// `argument` ノードは tree-sitter-rust の以下のいずれかになる:
@@ -5653,17 +5769,17 @@ fn strip_rust_comments_in_use_tree(text: &str) -> String {
 /// - `crate` / `self` / `super`: アンカーキーワード (再帰中に処理)
 ///
 /// 戻り値 `None` で「判定不能」(root を超える super::、解決不能な anchor) — 呼出元は index を `None` にする。
-fn expand_rust_use_tree_ast(
+fn expand_rust_use_tree_edges_ast(
     node: tree_sitter::Node<'_>,
     source: &[u8],
     path_prefix: &[String],
     current_module: &[String],
-    out: &mut Vec<RustPubUseTarget>,
+    source_module: &[String],
+    alias_override: Option<&str>,
+    out: &mut Vec<RustPubUseEdge>,
 ) -> Option<()> {
     match node.kind() {
         "scoped_use_list" => {
-            // tree-sitter-rust grammar は scoped_use_list で path/list の field 名を出さないので
-            // named children から kind で判別する。最初の use_list 以前の子が path 相当。
             let mut path_node: Option<tree_sitter::Node<'_>> = None;
             let mut list_node: Option<tree_sitter::Node<'_>> = None;
             let mut cursor = node.walk();
@@ -5689,68 +5805,72 @@ fn expand_rust_use_tree_ast(
                 }
                 None => path_prefix.to_vec(),
             };
-            expand_use_list(list, source, &resolved_prefix, out)?;
+            expand_use_list_edges(list, source, &resolved_prefix, source_module, out)?;
         }
         "use_list" => {
-            expand_use_list(node, source, path_prefix, out)?;
+            expand_use_list_edges(node, source, path_prefix, source_module, out)?;
         }
         "use_as_clause" => {
-            // tree-sitter-rust grammar は use_as_clause で path/alias の field 名を出さない。
-            // named children は [path, alias] の順序 (path は scoped_identifier / identifier、
-            // alias は identifier)。alias は `_` (wildcard 化) の場合に外部非公開で除外する。
+            // [path, alias] 順。alias=`_` は外部非公開なので edge を作らない。
             let mut named: Vec<tree_sitter::Node<'_>> = Vec::new();
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 named.push(child);
             }
             if named.len() != 2 {
-                return Some(()); // 想定外の構造 (named_children の取りこぼし)
+                return Some(());
             }
             let alias_text = named[1].utf8_text(source).ok()?.trim();
             if alias_text == "_" {
                 return Some(());
             }
             let path_node = named[0];
-            let (resolved_prefix, leaf_name) =
-                resolve_use_path_node(path_node, source, path_prefix, current_module)?;
-            if let Some(item) = leaf_name {
-                if resolved_prefix.is_empty() {
-                    return Some(());
-                }
-                out.push(RustPubUseTarget::Named {
-                    path: resolved_prefix,
-                    item,
-                });
-            }
+            // use_as_clause の内側 path には alias がさらに適用されるケースは無いので alias_override
+            // をここで指定して下流の `scoped_identifier` 経路で edge 化する。
+            expand_rust_use_tree_edges_ast(
+                path_node,
+                source,
+                path_prefix,
+                current_module,
+                source_module,
+                Some(alias_text),
+                out,
+            )?;
         }
         "use_wildcard" => {
-            // tree-sitter-rust grammar の use_wildcard は named child を 1 つだけ持つ
-            // (path 相当: scoped_identifier / identifier / crate / self / super)。
+            // named child = [path]
             let mut cursor = node.walk();
             let path_node = node.named_children(&mut cursor).next();
             if let Some(path_node) = path_node {
                 let (resolved_prefix, leaf_name) =
                     resolve_use_path_node(path_node, source, path_prefix, current_module)?;
-                let mut path = resolved_prefix;
+                let mut target_module = resolved_prefix;
                 if let Some(name) = leaf_name {
-                    path.push(name);
+                    target_module.push(name);
                 }
-                if !path.is_empty() {
-                    out.push(RustPubUseTarget::Wildcard { path });
+                if !target_module.is_empty() {
+                    out.push(RustPubUseEdge::Wildcard {
+                        source_module: source_module.to_vec(),
+                        target_module,
+                    });
                 }
             }
         }
         "scoped_identifier" | "identifier" | "crate" | "self" | "super" => {
             // path::name 形式の単純 re-export、または anchor 単体。
-            // crate root の単独 identifier は scoped でなく外部参照不能なので捨てる。
             let (resolved_prefix, leaf_name) =
                 resolve_use_path_node(node, source, path_prefix, current_module)?;
             if let Some(item) = leaf_name
                 && !resolved_prefix.is_empty()
             {
-                out.push(RustPubUseTarget::Named {
-                    path: resolved_prefix,
-                    item,
+                let exported_name = alias_override
+                    .map(str::to_string)
+                    .unwrap_or_else(|| item.clone());
+                out.push(RustPubUseEdge::Named {
+                    source_module: source_module.to_vec(),
+                    exported_name,
+                    target_module: resolved_prefix,
+                    target_item: item,
                 });
             }
         }
@@ -5759,7 +5879,15 @@ fn expand_rust_use_tree_ast(
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if child.is_named() {
-                    expand_rust_use_tree_ast(child, source, path_prefix, current_module, out)?;
+                    expand_rust_use_tree_edges_ast(
+                        child,
+                        source,
+                        path_prefix,
+                        current_module,
+                        source_module,
+                        alias_override,
+                        out,
+                    )?;
                 }
             }
         }
@@ -5767,22 +5895,21 @@ fn expand_rust_use_tree_ast(
     Some(())
 }
 
-/// `use_list` ノード (`{ ... }`) の各要素 (`,` 区切り) を再帰展開する。
-fn expand_use_list(
+/// `use_list` ノード (`{ ... }`) の各要素 (`,` 区切り) を再帰展開して edge を出力する。
+/// group 内では `current_module` は継承しない (空)。
+fn expand_use_list_edges(
     list: tree_sitter::Node<'_>,
     source: &[u8],
     path_prefix: &[String],
-    out: &mut Vec<RustPubUseTarget>,
+    source_module: &[String],
+    out: &mut Vec<RustPubUseEdge>,
 ) -> Option<()> {
     let mut cursor = list.walk();
     for child in list.children(&mut cursor) {
         if !child.is_named() {
             continue;
         }
-        // use_list の子要素は use_as_clause / scoped_identifier / scoped_use_list /
-        // use_wildcard / identifier / use_list (ネスト)。それぞれを expand に渡す。
-        // current_module は group 内では継承しない (空)。
-        expand_rust_use_tree_ast(child, source, path_prefix, &[], out)?;
+        expand_rust_use_tree_edges_ast(child, source, path_prefix, &[], source_module, None, out)?;
     }
     Some(())
 }
@@ -5869,206 +5996,6 @@ fn resolve_use_path_node(
             None
         }
     }
-}
-
-/// `argument` (use_declaration の AST 子フィールド) のテキストから re-export ターゲットを抽出する。
-/// `current_module` は file の lib.rs 起点モジュールパス (super:: 解決用)。grouped use
-/// (`crate::{wifi::found, wifi::hidden}` / nested `crate::{wifi::{a, b}}`) を再帰展開する。
-///
-/// **NOTE**: 旧テキストベース実装。whitespace 入り (`crate :: wifi :: found`) や tab alias
-/// (`found\tas\talias`) を取りこぼすため、`expand_rust_use_tree_ast` (AST walker) に置き換え済み。
-/// 単体テストおよび旧経路互換のため当面残す。
-#[allow(dead_code)]
-fn expand_rust_use_tree(
-    path_prefix: &[String],
-    current_module: &[String],
-    body: &str,
-    out: &mut Vec<RustPubUseTarget>,
-) -> Option<()> {
-    let body = body.trim();
-    if body.is_empty() {
-        return Some(());
-    }
-    // body 全体が `{...}` でくくられた grouped use なら分解。
-    if let Some(inner) = strip_balanced_braces(body) {
-        for part in split_rust_use_group(inner) {
-            expand_rust_use_tree(path_prefix, current_module, part.trim(), out)?;
-        }
-        return Some(());
-    }
-    // 先頭セグメント正規化: crate:: は無視、self:: は無視、super:: は current_module から pop。
-    let mut remainder = body;
-    let mut prefix: Vec<String> = path_prefix.to_vec();
-    let mut effective_current: Vec<String> = current_module.to_vec();
-    let mut anchored_to_crate_root = false;
-    loop {
-        if let Some(rest) = remainder.strip_prefix("crate::") {
-            remainder = rest.trim_start();
-            anchored_to_crate_root = true;
-            effective_current.clear();
-            continue;
-        }
-        if let Some(rest) = remainder.strip_prefix("self::") {
-            remainder = rest.trim_start();
-            continue;
-        }
-        if let Some(rest) = remainder.strip_prefix("super::") {
-            remainder = rest.trim_start();
-            effective_current.pop()?;
-            continue;
-        }
-        break;
-    }
-    // crate root 以外起点で current_module を継承する場合、prefix の先頭に積む。
-    if !anchored_to_crate_root && !effective_current.is_empty() && prefix.is_empty() {
-        prefix = effective_current.clone();
-    }
-    if remainder.is_empty() {
-        return Some(());
-    }
-    // 末尾 `{...}` group を切り出す (head + group)。
-    if let Some(group_start) = find_top_level_group_start(remainder) {
-        let head = remainder[..group_start].trim().trim_end_matches(':').trim();
-        let group_body = &remainder[group_start..];
-        let inner = strip_balanced_braces(group_body)?;
-        let head_segments: Vec<String> = if head.is_empty() {
-            Vec::new()
-        } else {
-            head.split("::")
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect()
-        };
-        prefix.extend(head_segments);
-        for part in split_rust_use_group(inner) {
-            let part = part.trim();
-            if part.is_empty() {
-                continue;
-            }
-            // group 内では親 anchor を継承しない (current_module は空で渡す)。
-            expand_rust_use_tree(&prefix, &[], part, out)?;
-        }
-        return Some(());
-    }
-    // 末尾が `*` なら wildcard。
-    if let Some(p) = remainder.strip_suffix("::*") {
-        let mut path = prefix.clone();
-        path.extend(p.split("::").filter(|s| !s.is_empty()).map(str::to_string));
-        if !path.is_empty() {
-            out.push(RustPubUseTarget::Wildcard { path });
-        }
-        return Some(());
-    }
-    // alias 解決 (`<original> as <alias>`、`as _` は外部非公開なので除外)。
-    let item_text = remainder;
-    let item_text = match item_text.split_once(" as ") {
-        Some((_orig, alias)) if alias.trim() == "_" => return Some(()),
-        Some((orig, _alias)) => orig.trim(),
-        None => item_text,
-    };
-    let (path_part, item) = match item_text.rsplit_once("::") {
-        Some((p, i)) => (p, i),
-        None => ("", item_text),
-    };
-    let mut path = prefix;
-    path.extend(
-        path_part
-            .split("::")
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
-    );
-    let item = item.trim();
-    if item.is_empty() || path.is_empty() {
-        return Some(());
-    }
-    out.push(RustPubUseTarget::Named {
-        path,
-        item: item.to_string(),
-    });
-    Some(())
-}
-
-/// 文字列が `{` で始まり、対応する1個の `}` で終わっていればその間を返す。`{a}{b}` のような
-/// 複数 group の連結は `None`。
-fn strip_balanced_braces(s: &str) -> Option<&str> {
-    let bytes = s.as_bytes();
-    if bytes.first() != Some(&b'{') || bytes.last() != Some(&b'}') {
-        return None;
-    }
-    let mut depth: i32 = 0;
-    for (i, b) in bytes.iter().enumerate() {
-        match *b {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return if i == bytes.len() - 1 {
-                        std::str::from_utf8(&bytes[1..bytes.len() - 1]).ok()
-                    } else {
-                        None
-                    };
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// `remainder` の最後に登場するトップレベル `{` のバイト位置を返す。ネストした `{ }` は無視。
-fn find_top_level_group_start(remainder: &str) -> Option<usize> {
-    let bytes = remainder.as_bytes();
-    if bytes.last() != Some(&b'}') {
-        return None;
-    }
-    let mut depth: i32 = 0;
-    let mut start: Option<usize> = None;
-    for (i, b) in bytes.iter().enumerate().rev() {
-        match *b {
-            b'}' => depth += 1,
-            b'{' => {
-                depth -= 1;
-                if depth == 0 {
-                    start = Some(i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    start
-}
-
-/// grouped use の本体を `{}` のネスト深度を考慮しつつ `,` で分割する。
-fn split_rust_use_group(inner: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut depth: i32 = 0;
-    let mut buf = String::new();
-    for ch in inner.chars() {
-        match ch {
-            '{' => {
-                depth += 1;
-                buf.push(ch);
-            }
-            '}' => {
-                depth -= 1;
-                buf.push(ch);
-            }
-            ',' if depth == 0 => {
-                let trimmed = buf.trim().to_string();
-                if !trimmed.is_empty() {
-                    parts.push(trimmed);
-                }
-                buf.clear();
-            }
-            _ => buf.push(ch),
-        }
-    }
-    let trimmed = buf.trim().to_string();
-    if !trimmed.is_empty() {
-        parts.push(trimmed);
-    }
-    parts
 }
 
 /// Cargo.toml のテキストから `[lib]` セクションが宣言されているかを判定する。
@@ -11293,6 +11220,254 @@ def main():
         assert!(
             removed.iter().any(|n| n.ends_with("found")),
             "タブ区切り as alias の re-export も AST walker で解析され、削除は api.rm に残るべき。got: {removed:?}"
+        );
+    }
+
+    /// 二段 re-export (private prelude を経由) で root 側 `pub use prelude::found;` が公開
+    /// しているケースで、wifi/found 削除は api.rm に残る。codex pre-merge レビュー 4 回目
+    /// Warning #2 の回帰テスト。Step B の re-export edge graph + 固定点伝播で解決される。
+    #[test]
+    fn detect_api_changes_private_module_via_private_prelude_then_root_pub_use_stays_in_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                (
+                    "src/lib.rs",
+                    "mod wifi;\nmod prelude;\npub use prelude::found;\n",
+                ),
+                ("src/prelude.rs", "pub use crate::wifi::found;\n"),
+                ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(repo.join("src/wifi/mod.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "private prelude 経由の二段 re-export で root が公開しているなら削除は api.rm に残るべき。got: {removed:?}"
+        );
+    }
+
+    /// 二段 re-export で各 hop が alias 付き: prelude 内で `pub use crate::wifi::found as
+    /// public_found;`、root で `pub use prelude::public_found;`。wifi/found 削除でも root の
+    /// 公開名 `public_found` まで alias graph が伝播するため api.rm に残る。
+    #[test]
+    fn detect_api_changes_private_module_via_alias_chain_through_prelude_stays_in_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                (
+                    "src/lib.rs",
+                    "mod wifi;\nmod prelude;\npub use prelude::public_found;\n",
+                ),
+                (
+                    "src/prelude.rs",
+                    "pub use crate::wifi::found as public_found;\n",
+                ),
+                ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(repo.join("src/wifi/mod.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "alias chain の二段 re-export 経由削除は api.rm に残るべき。got: {removed:?}"
+        );
+    }
+
+    /// 二段 re-export で root 側が wildcard `pub use prelude::*;`、prelude で `pub use
+    /// crate::wifi::found;` するパターン。wildcard が target_module=prelude にかかり、live
+    /// (prelude, found) が (root, found) に伝播 → public_modules に到達。
+    #[test]
+    fn detect_api_changes_private_module_via_wildcard_chain_through_prelude_stays_in_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                (
+                    "src/lib.rs",
+                    "mod wifi;\nmod prelude;\npub use prelude::*;\n",
+                ),
+                ("src/prelude.rs", "pub use crate::wifi::found;\n"),
+                ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(repo.join("src/wifi/mod.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "wildcard chain の二段 re-export 経由削除は api.rm に残るべき。got: {removed:?}"
+        );
+    }
+
+    /// 二段の経路で wildcard を中間に挟む: prelude で `pub use crate::wifi::*;`、root で
+    /// `pub use prelude::found;`。Wildcard target=[wifi] によって live (wifi, found) が
+    /// (prelude, found) に伝播し、root の named edge で (root, found) に至る。
+    #[test]
+    fn detect_api_changes_private_module_named_then_wildcard_chain_stays_in_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                (
+                    "src/lib.rs",
+                    "mod wifi;\nmod prelude;\npub use prelude::found;\n",
+                ),
+                ("src/prelude.rs", "pub use crate::wifi::*;\n"),
+                ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(repo.join("src/wifi/mod.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "wildcard→named の二段 chain 経由削除は api.rm に残るべき。got: {removed:?}"
+        );
+    }
+
+    /// 循環 re-export (`pub use prelude::found;` 同士で循環) で固定点伝播が無限ループしない
+    /// (HashSet で重複を防止しているため自然停止)。BFS 単体テスト相当を統合テストで確認。
+    #[test]
+    fn detect_api_changes_private_module_cyclic_reexports_terminate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                (
+                    "src/lib.rs",
+                    "mod wifi;\npub mod a;\npub mod b;\npub use a::found;\n",
+                ),
+                ("src/a.rs", "pub use crate::b::found;\n"),
+                ("src/b.rs", "pub use crate::wifi::found;\n"),
+                ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(repo.join("src/wifi/mod.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "循環的な 3 段 re-export chain でも固定点で停止して exposed 判定が成立する。got: {removed:?}"
         );
     }
 
