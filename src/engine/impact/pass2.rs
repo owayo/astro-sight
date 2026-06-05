@@ -240,6 +240,9 @@ pub(super) fn stream_caller_maps_and_defs(
             target_cache: LruCache::new(
                 NonZeroUsize::new(TARGET_FILE_CACHE_SIZE).expect("cache size is non-zero"),
             ),
+            import_facts_cache: LruCache::new(
+                NonZeroUsize::new(TARGET_FILE_CACHE_SIZE).expect("cache size is non-zero"),
+            ),
             ref_hit: vec![false; n_sym],
             ref_events: Vec::new(),
             def_events: Vec::new(),
@@ -271,10 +274,13 @@ pub(super) fn stream_caller_maps_and_defs(
                             local_low_maps,
                             local_def_paths,
                             target_cache,
+                            import_facts_cache,
                             ref_hit,
                             ref_events,
                             def_events,
                         } = &mut state;
+                        let ref_lang = crate::language::LangId::from_path(utf8_path).ok();
+                        let dir_str = dir.to_str().unwrap_or("");
                         let mut collector = ImpactCollector {
                             sym_to_fc: &sym_to_fc,
                             file_contexts,
@@ -289,6 +295,9 @@ pub(super) fn stream_caller_maps_and_defs(
                             ref_hit: ref_hit.as_mut_slice(),
                             ref_events,
                             def_events,
+                            import_facts_cache,
+                            dir: dir_str,
+                            ref_lang,
                         };
                         if refs::visit_refs_and_defs_in_file_cb(
                             all_symbol_names,

@@ -1,5 +1,6 @@
 mod collector;
 mod filters;
+mod import_facts;
 mod pass2;
 mod pass3;
 mod signature;

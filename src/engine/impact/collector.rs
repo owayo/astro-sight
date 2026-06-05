@@ -13,6 +13,10 @@ use lru::LruCache;
 use crate::engine::refs;
 use crate::language::LangId;
 
+use super::import_facts::{
+    RefFileFacts, is_ts_local_shadow_context, lang_is_ts_family, ref_file_directly_imports_source,
+    should_route_ts_importless_ref_low,
+};
 use super::signature::extract_function_from_context;
 use super::test_context::is_ref_in_target_test_context;
 use super::types::{StringPool, SymEntries, TypedCallerMap};
@@ -28,6 +32,11 @@ pub(super) struct WorkerState {
     pub(super) local_low_maps: Vec<TypedCallerMap>,
     pub(super) local_def_paths: Vec<Vec<u32>>,
     pub(super) target_cache: LruCache<String, Option<ParsedFile>>,
+    /// TS/TSX/JS の名前衝突 false positive 抑制用 (Issue
+    /// 2026-06-05-multi-attachment-conversations-fp 対応)。ref file ごとの import specifier
+    /// basename 集合をキャッシュする。fail-closed: 構築失敗時は `None` を格納し、その ref は
+    /// 「直接 import あり」相当として high impact 維持。
+    pub(super) import_facts_cache: LruCache<String, Option<RefFileFacts>>,
     pub(super) ref_hit: Vec<bool>,
     pub(super) ref_events: Vec<RefEventMini>,
     pub(super) def_events: Vec<u32>,
@@ -48,6 +57,11 @@ pub(super) struct RefEventMini {
     /// Phase 4 (impact ルーティング) で `BareNameOnly` + generic name のシンボル参照を
     /// `low_confidence_callers` へ振り分けるために使う。
     pub(super) confidence: u8,
+    /// TS/TSX/JS の context 行で identifier がローカル binding (interface / type / const /
+    /// let / var / function / class / destructured params) で shadow されているか。
+    /// `finish_file` で TS family + 直接 import なし + この hint ありなら `local_low_maps` へ
+    /// routing して名前衝突 FP を抑える (Issue 2026-06-05-multi-attachment-conversations-fp)。
+    pub(super) local_shadow_hint: bool,
 }
 
 /// 汎用すぎてシンボル名だけでは owner を特定できない PHP/JS 系メソッド名。
@@ -113,6 +127,15 @@ pub(super) struct ImpactCollector<'a> {
     pub(super) ref_hit: &'a mut [bool],
     pub(super) ref_events: &'a mut Vec<RefEventMini>,
     pub(super) def_events: &'a mut Vec<u32>,
+    /// TS/TSX/JS 名前衝突 FP 抑制用。`finish_file` 時に ref file (= `path_str`) の
+    /// import specifier basename 集合を参照して high vs low routing を切り替える。
+    pub(super) import_facts_cache: &'a mut LruCache<String, Option<RefFileFacts>>,
+    /// `path_str` が属する workspace dir。`import_facts_cache` の構築で
+    /// `dir/ref_path` を読むために使う。
+    pub(super) dir: &'a str,
+    /// ref file 自身の言語 (`path_str` から導出)。on_ref で都度 `LangId::from_path` するのを
+    /// 避けるため、`new` 相当の初期化時にキャッシュしておく。失敗時は `None`。
+    pub(super) ref_lang: Option<LangId>,
 }
 
 impl<'a> refs::RefVisitor for ImpactCollector<'a> {
@@ -153,6 +176,20 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             crate::models::reference::RefConfidence::BareNameOnly => 2,
         };
 
+        // TS/TSX/JS の context 行で identifier がローカル binding (interface / type / const /
+        // let / var / function / class / destructured params) で shadow されているか判定する。
+        // 軽量 heuristic、非 TS family ではスキップ (Issue 2026-06-05-multi-attachment-conversations-fp)。
+        let local_shadow_hint = if self.ref_lang.is_some_and(lang_is_ts_family) {
+            let symbol_name = self
+                .all_symbol_names
+                .get(ix)
+                .map(String::as_str)
+                .unwrap_or("");
+            is_ts_local_shadow_context(context, symbol_name)
+        } else {
+            false
+        };
+
         self.ref_events.push(RefEventMini {
             sym_ix,
             line: line as u32,
@@ -160,6 +197,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             caller_name_id,
             is_import,
             confidence: confidence_u8,
+            local_shadow_hint,
         });
     }
 }
@@ -206,7 +244,8 @@ impl<'a> ImpactCollector<'a> {
                 .and_then(|pix| self.ref_hit.get(pix))
                 .copied()
                 .unwrap_or(false);
-            let route_low = !filter_disabled && is_low_confidence_caller(&e, self.all_symbol_names);
+            let base_route_low =
+                !filter_disabled && is_low_confidence_caller(&e, self.all_symbol_names);
 
             for &fc_ix_raw in fc_ixs {
                 let fc_ix = fc_ix_raw as usize;
@@ -225,6 +264,30 @@ impl<'a> ImpactCollector<'a> {
                 if has_parent_type && !parent_in_this_file {
                     continue;
                 }
+                // TS/TSX/JS 名前衝突 FP 抑制 (Issue 2026-06-05-multi-attachment-conversations-fp):
+                // ref file の言語と source の言語が両方 TS family、ref file が source module を
+                // 直接 import していない、かつ context にローカル shadow hint があれば
+                // local_low_maps へ routing する。
+                let ts_route_low = if !filter_disabled
+                    && self.ref_lang.is_some_and(lang_is_ts_family)
+                    && lang_is_ts_family(ctx.lang_id)
+                {
+                    let has_direct_import = ref_file_directly_imports_source(
+                        self.dir,
+                        self.path_str,
+                        source_path,
+                        self.import_facts_cache,
+                    );
+                    should_route_ts_importless_ref_low(
+                        true,
+                        true,
+                        has_direct_import,
+                        e.local_shadow_hint,
+                    )
+                } else {
+                    false
+                };
+                let route_low = base_route_low || ts_route_low;
                 if is_ref_in_target_test_context(
                     self.path_str,
                     e.line as usize,
@@ -293,6 +356,7 @@ mod tests {
             caller_name_id: 0,
             is_import: false,
             confidence,
+            local_shadow_hint: false,
         }
     }
 

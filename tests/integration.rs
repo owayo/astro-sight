@@ -8497,3 +8497,164 @@ fn git_repo_dash_base_rejected() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
     assert_eq!(json["error"]["code"], "INVALID_REQUEST");
 }
+
+/// TS/TSX 名前衝突 false positive 抑制 (Issue 2026-06-05-multi-attachment-conversations-fp):
+/// `schema.ts` を import していない `ConversationList.tsx` の props 変数 `conversations`
+/// (Drizzle table と同名) は `impacted_callers` ではなく `low_confidence_callers` に振り分け
+/// られて Stop hook の blocking から外れる。
+#[test]
+fn impact_ts_name_collision_without_direct_import_routed_to_low_confidence() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("lib/db")).unwrap();
+    std::fs::create_dir_all(dir.path().join("components")).unwrap();
+
+    // schema.ts: Drizzle table export
+    let schema_path = dir.path().join("lib/db/schema.ts");
+    std::fs::write(&schema_path, "export const conversations = { id: 0 };\n").unwrap();
+
+    // ConversationList.tsx: schema.ts を import せず、独自の interface + destructured props
+    let tsx_path = dir.path().join("components/ConversationList.tsx");
+    std::fs::write(
+        &tsx_path,
+        r#"interface Conversation { id: number }
+interface Props { conversations: Conversation[] }
+export function ConversationList({ conversations }: Props) {
+    return conversations.length;
+}
+"#,
+    )
+    .unwrap();
+
+    // diff: schema.ts の conversations を変更
+    let diff = r#"--- a/lib/db/schema.ts
++++ b/lib/db/schema.ts
+@@ -1 +1 @@
+-export const conversations = { id: 0 };
++export const conversations = { id: 0, title: "" };
+"#;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["context", "--dir", dir.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn context");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "context failed: {stdout}");
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("JSON");
+    let changes = json
+        .get("changes")
+        .and_then(|c| c.as_array())
+        .expect("changes array");
+    let schema_change = changes
+        .iter()
+        .find(|c| c.get("path").and_then(|p| p.as_str()) == Some("lib/db/schema.ts"))
+        .unwrap_or_else(|| panic!("schema.ts change not found: {stdout}"));
+    let impacted = schema_change
+        .get("impacted_callers")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let low = schema_change
+        .get("low_confidence_callers")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // ConversationList.tsx は schema.ts を import していないため、impacted_callers には
+    // 出さず low_confidence_callers (informational) に振り分けるか、完全に除外されるべき。
+    let tsx_in_impacted = impacted
+        .iter()
+        .any(|c| c.get("path").and_then(|p| p.as_str()) == Some("components/ConversationList.tsx"));
+    assert!(
+        !tsx_in_impacted,
+        "ConversationList.tsx must NOT appear in impacted_callers (no direct import of schema.ts). got: {impacted:?} | low: {low:?}"
+    );
+}
+
+/// 直接 import している場合は high impact (`impacted_callers`) に残る (逆方向の回帰テスト):
+/// `ConversationList.tsx` が `schema.ts` を直接 import している場合は従来通り
+/// `impacted_callers` に出る。
+#[test]
+fn impact_ts_name_collision_with_direct_import_stays_high() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("lib/db")).unwrap();
+    std::fs::create_dir_all(dir.path().join("components")).unwrap();
+
+    let schema_path = dir.path().join("lib/db/schema.ts");
+    std::fs::write(&schema_path, "export const conversations = { id: 0 };\n").unwrap();
+
+    // ConversationList.tsx: schema.ts を直接 import する
+    let tsx_path = dir.path().join("components/ConversationList.tsx");
+    std::fs::write(
+        &tsx_path,
+        r#"import { conversations } from "../lib/db/schema";
+export function getList() {
+    return conversations;
+}
+"#,
+    )
+    .unwrap();
+
+    let diff = r#"--- a/lib/db/schema.ts
++++ b/lib/db/schema.ts
+@@ -1 +1 @@
+-export const conversations = { id: 0 };
++export const conversations = { id: 0, title: "" };
+"#;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .args(["context", "--dir", dir.path().to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn context");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(diff.as_bytes())
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "context failed: {stdout}");
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("JSON");
+    let changes = json
+        .get("changes")
+        .and_then(|c| c.as_array())
+        .expect("changes array");
+    let schema_change = changes
+        .iter()
+        .find(|c| c.get("path").and_then(|p| p.as_str()) == Some("lib/db/schema.ts"))
+        .unwrap_or_else(|| panic!("schema.ts change not found: {stdout}"));
+    let impacted = schema_change
+        .get("impacted_callers")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let tsx_in_impacted = impacted
+        .iter()
+        .any(|c| c.get("path").and_then(|p| p.as_str()) == Some("components/ConversationList.tsx"));
+    assert!(
+        tsx_in_impacted,
+        "ConversationList.tsx は schema.ts を直接 import しているため impacted_callers に出るべき。got: {impacted:?}"
+    );
+}
