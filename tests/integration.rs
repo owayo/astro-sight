@@ -8574,13 +8574,25 @@ export function ConversationList({ conversations }: Props) {
         .unwrap_or_default();
 
     // ConversationList.tsx は schema.ts を import していないため、impacted_callers には
-    // 出さず low_confidence_callers (informational) に振り分けるか、完全に除外されるべき。
+    // 出さず low_confidence_callers (informational) に振り分けるべき。Stop hook blocking から
+    // 外しつつ Information として残す。
     let tsx_in_impacted = impacted
         .iter()
         .any(|c| c.get("path").and_then(|p| p.as_str()) == Some("components/ConversationList.tsx"));
     assert!(
         !tsx_in_impacted,
         "ConversationList.tsx must NOT appear in impacted_callers (no direct import of schema.ts). got: {impacted:?} | low: {low:?}"
+    );
+    // 低 confidence の振り分け先に出ることも assert (codex 助言: low 出力自体を仕様化)。
+    // path は absolute (tempdir) になりうるので末尾マッチで判定する。
+    let tsx_in_low = low.iter().any(|c| {
+        c.get("path")
+            .and_then(|p| p.as_str())
+            .is_some_and(|s| s.ends_with("components/ConversationList.tsx"))
+    });
+    assert!(
+        tsx_in_low,
+        "ConversationList.tsx は low_confidence_callers に出るべき (informational として残す)。got low: {low:?}"
     );
 }
 
