@@ -1804,6 +1804,8 @@ fn detect_api_changes(
     // ケースを informational として残す。`obj.x` の属性 API は維持されるため `removed`
     // からは除外し、`property_to_field` カテゴリに移す。
     let mut property_to_field: Vec<PropertyToFieldChange> = Vec::new();
+    // api.rm の Rust private module 抑制で base 側 re-export index を base+crate 単位に再利用する。
+    let mut rust_reexport_cache = RustBaseReexportCache::default();
 
     // .gitattributes の linguist-generated 指定ファイルは API 変更検出から除外する
     let gitattrs = std::fs::canonicalize(dir)
@@ -1902,10 +1904,14 @@ fn detect_api_changes(
                 // `api.add` (new 側) / `api.mod` (old/new 両側) の private module 抑制と対称に
                 // `api.rm` 側でも除外する。`api.rm` は旧 API 面の判定なので base リビジョン側で
                 // 見る (新ツリーで src/lib.rs や mod 宣言を削除したケースでも誤抑制しないため)。
-                let is_old_non_public_api =
-                    is_rust_old_symbol_outside_public_api_surface(dir, base, &df.old_path);
                 for (name, kind, sig) in &old_syms {
-                    if is_old_non_public_api {
+                    if is_rust_old_symbol_outside_public_api_surface(
+                        dir,
+                        base,
+                        &df.old_path,
+                        name,
+                        &mut rust_reexport_cache,
+                    ) {
                         continue;
                     }
                     if is_bash_old_file
@@ -2024,8 +2030,6 @@ fn detect_api_changes(
         // API 変更にはならない。`api.add` / `api.mod` 側と対称に api.rm でも除外する
         // (Issue 2026-05-19-api-rm-bin-crate-dead-cleanup / 2026-06-05-wifi-module-removal 対応)。
         // `api.rm` は旧 API 面の判定なので、`base` リビジョン時点で見る。
-        let is_old_non_public_api =
-            is_rust_old_symbol_outside_public_api_surface(dir, base, &df.old_path);
         // TS/JS: 新ツリーで `export { name } from "..."` として re-export (forwarding)
         // されているシンボルは、利用者から見た API 面 (import path から取れる名前) が
         // 維持されているため api.rm から除外する。ローカル定義を別モジュールへ移動し
@@ -2033,7 +2037,13 @@ fn detect_api_changes(
         let new_reexports = extract_reexported_names_from_file(dir, &df.new_path);
         for (name, kind, sig) in &old_syms {
             if !new_map.contains_key(name.as_str()) {
-                if is_old_non_public_api {
+                if is_rust_old_symbol_outside_public_api_surface(
+                    dir,
+                    base,
+                    &df.old_path,
+                    name,
+                    &mut rust_reexport_cache,
+                ) {
                     continue;
                 }
                 if new_reexports.contains(name.as_str()) {
@@ -5177,14 +5187,394 @@ fn is_binary_only_rust_crate_at_base(dir: &str, base: &str, file_path: &str) -> 
     false
 }
 
-/// `api.rm` 判定用: 旧 (base) 側で削除されたシンボルが「外部公開 API 面の外」にあるかを返す。
-/// bin-only crate (`src/lib.rs` / `[lib]` なし) の `pub`、または crate-private module
-/// (`mod foo`、`pub mod` 経路で到達不能) 配下の `pub` は crate 外から構造的に到達できないため、
-/// 削除されても破壊的 API 変更ではない。`api.add` (new 側) / `api.mod` (old/new 両側) の private
-/// module 抑制と対称に、`api.rm` は旧 API 面なので base リビジョン側で判定する。
-fn is_rust_old_symbol_outside_public_api_surface(dir: &str, base: &str, old_path: &str) -> bool {
-    is_binary_only_rust_crate_at_base(dir, base, old_path)
-        || is_rust_symbol_in_private_module_at_base(dir, base, old_path)
+/// `api.rm` 判定用: 旧 (base) 側で削除されたシンボル `symbol_name` が「外部公開 API 面の外」に
+/// あるかを返す。bin-only crate の `pub`、または crate-private module (`mod foo`、`pub mod` 経路で
+/// 到達不能) 配下の `pub` は crate 外から構造的に到達できないため、削除されても破壊的変更ではない。
+///
+/// ただし private module 配下でも、別の public-reachable module から `pub use` で re-export 公開
+/// されている (`pub mod prelude;` + prelude.rs に `pub use crate::wifi::found;` 等) 場合は外部公開
+/// API 面に含まれるため抑制しない。`reexport_cache` で base+crate 単位の re-export index を一度だけ
+/// 構築する。`api.add` (new 側) / `api.mod` (old/new 両側) の private module 抑制と対称に base 側で判定する。
+fn is_rust_old_symbol_outside_public_api_surface(
+    dir: &str,
+    base: &str,
+    old_path: &str,
+    symbol_name: &str,
+    reexport_cache: &mut RustBaseReexportCache,
+) -> bool {
+    if is_binary_only_rust_crate_at_base(dir, base, old_path) {
+        return true;
+    }
+    // re-export を考慮しない raw private 判定。public-reachable / 判定不能なら api.rm を残す。
+    let Some(private) = rust_private_module_info_at_base(dir, base, old_path) else {
+        return false;
+    };
+    // index 構築に失敗したら api.rm を残す (false negative 回避優先)。
+    let Some(index) = reexport_cache.index_for(dir, base, &private) else {
+        return false;
+    };
+    !index.exposes_symbol(&private, symbol_name)
+}
+
+/// base 側 crate の private module 情報 (re-export は考慮しない raw 判定の結果)。
+struct RustPrivateModuleInfo {
+    crate_root_rel: std::path::PathBuf,
+    src_root_rel: std::path::PathBuf,
+    /// `file_path` の src 相対モジュールパス (例: `[wifi]` / `[wifi, detector]`)。
+    module_segments: Vec<String>,
+    /// lib.rs から辿って最初に private (`mod`、`pub` なし) だった prefix (例: `[wifi]`)。
+    private_prefix_segments: Vec<String>,
+}
+
+/// base 側で `file_path` (dir 相対) の private module 情報を構築する。re-export は考慮しない
+/// (index 側で扱う)。public-reachable (全 `pub mod`) なら `None`、判定不能 (`#[path]` / inline mod /
+/// 宣言未検出 / モジュールファイル解決不能) も `None` を返し、呼び出し側で api.rm を残す方向に倒す。
+fn rust_private_module_info_at_base(
+    dir: &str,
+    base: &str,
+    file_path: &str,
+) -> Option<RustPrivateModuleInfo> {
+    use std::path::{Path, PathBuf};
+    let rel = Path::new(file_path);
+    if rel.extension().and_then(|s| s.to_str()) != Some("rs") {
+        return None;
+    }
+    let canonical_dir = std::fs::canonicalize(dir).ok()?;
+    let abs = canonical_dir.join(rel);
+    // crate root: abs の祖先で最も近い Cargo.toml を持つディレクトリ (working tree 構造)。
+    let mut crate_root: Option<PathBuf> = None;
+    let mut anc = abs.parent();
+    while let Some(d) = anc {
+        if d.join("Cargo.toml").is_file() {
+            crate_root = Some(d.to_path_buf());
+            break;
+        }
+        if d == canonical_dir {
+            break;
+        }
+        anc = d.parent();
+    }
+    let crate_root = crate_root?;
+    let src_dir = crate_root.join("src");
+    if !src_dir.join("lib.rs").is_file() {
+        return None; // library crate でない (bin-only は別経路)
+    }
+    let rel_to_src = abs.strip_prefix(&src_dir).ok()?;
+    let segments = module_path_segments(rel_to_src);
+    if segments.is_empty() {
+        return None; // root モジュール (lib.rs / main.rs)
+    }
+    let crate_root_rel = crate_root.strip_prefix(&canonical_dir).ok()?.to_path_buf();
+    let src_root_rel = crate_root_rel.join("src");
+    // lib.rs から mod 宣言チェーンを辿り、最初に private だった prefix を探す。
+    let mut current_rel = PathBuf::from("lib.rs");
+    for (idx, seg) in segments.iter().enumerate() {
+        let source = read_rust_module_source_at_base(dir, base, &crate_root_rel, &current_rel)?;
+        let tree = parser::parse_source(&source, crate::language::LangId::Rust).ok()?;
+        match find_mod_decl_visibility(tree.root_node(), &source, seg) {
+            Some(true) => {
+                // pub mod。次のモジュールファイルへ (working tree 構造で解決)。
+                let parent = current_rel
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                let as_mod = parent.join(seg).join("mod.rs");
+                let as_file = parent.join(format!("{seg}.rs"));
+                if src_dir.join(&as_mod).is_file() {
+                    current_rel = as_mod;
+                } else if src_dir.join(&as_file).is_file() {
+                    current_rel = as_file;
+                } else {
+                    return None;
+                }
+            }
+            Some(false) => {
+                // private mod。ここが private prefix。
+                let private_prefix_segments = segments[..=idx].to_vec();
+                return Some(RustPrivateModuleInfo {
+                    crate_root_rel,
+                    src_root_rel,
+                    module_segments: segments,
+                    private_prefix_segments,
+                });
+            }
+            None => return None,
+        }
+    }
+    None // 全 pub mod = public reachable
+}
+
+/// `git show <base>:<crate_root_rel>/src/<module_rel>` で base 側モジュールソースを取得する。
+fn read_rust_module_source_at_base(
+    dir: &str,
+    base: &str,
+    crate_root_rel: &std::path::Path,
+    module_rel: &std::path::Path,
+) -> Option<Vec<u8>> {
+    let full_rel = crate_root_rel.join("src").join(module_rel);
+    let full_rel_str = full_rel.to_str()?;
+    if validate_git_revision(base, "--base").is_err()
+        || validate_git_revision(full_rel_str, "diff file path").is_err()
+    {
+        return None;
+    }
+    let out = std::process::Command::new("git")
+        .args(["show", &format!("{base}:{full_rel_str}")])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(out.stdout)
+}
+
+/// base+crate 単位で `pub use` re-export index を一度だけ構築するキャッシュ。
+#[derive(Default)]
+struct RustBaseReexportCache {
+    by_crate: std::collections::HashMap<(String, std::path::PathBuf), Option<RustPubUseIndex>>,
+}
+
+impl RustBaseReexportCache {
+    fn index_for(
+        &mut self,
+        dir: &str,
+        base: &str,
+        info: &RustPrivateModuleInfo,
+    ) -> Option<&RustPubUseIndex> {
+        let key = (base.to_string(), info.crate_root_rel.clone());
+        self.by_crate
+            .entry(key)
+            .or_insert_with(|| collect_rust_pub_use_index_at_base(dir, base, info))
+            .as_ref()
+    }
+}
+
+/// base 側 crate の public-reachable な module 群から集めた `pub use` re-export ターゲット。
+struct RustPubUseIndex {
+    targets: Vec<RustPubUseTarget>,
+}
+
+enum RustPubUseTarget {
+    Named { path: Vec<String>, item: String },
+    Wildcard { path: Vec<String> },
+}
+
+impl RustPubUseIndex {
+    /// `info` の private module 配下の `symbol_name` が re-export 公開されているか。
+    fn exposes_symbol(&self, info: &RustPrivateModuleInfo, symbol_name: &str) -> bool {
+        let item = rust_reexport_item_name(symbol_name);
+        self.targets.iter().any(|target| match target {
+            RustPubUseTarget::Named {
+                path,
+                item: exported,
+            } => path == &info.module_segments && exported == item,
+            RustPubUseTarget::Wildcard { path } => {
+                // 全 wildcard を公開扱いにはしない。対象 private module 自身、または private prefix を
+                // 含み symbol 所属 module にかかる wildcard のみ公開扱い (同一 module 内の未 re-export
+                // を公開扱いにする false positive を避ける)。
+                path == &info.module_segments
+                    || (info.module_segments.starts_with(path.as_slice())
+                        && path.starts_with(info.private_prefix_segments.as_slice()))
+            }
+        })
+    }
+}
+
+/// re-export item 名。Rust の method は `Container.method` qualname で出るが re-export 対象 item は
+/// container の `Container`。free function / struct 等は bare name。
+fn rust_reexport_item_name(name: &str) -> &str {
+    if let Some((container, _method)) = name.split_once('.') {
+        container
+    } else {
+        bare_name(name)
+    }
+}
+
+/// base 側 crate の src/ 配下から public-reachable な module だけを parse し `pub use` を集める。
+/// `git ls-tree` / `git show` / parse のいずれかで判定不能になったら `None` を返し、呼び出し側で
+/// api.rm を残す (false negative 回避)。
+fn collect_rust_pub_use_index_at_base(
+    dir: &str,
+    base: &str,
+    info: &RustPrivateModuleInfo,
+) -> Option<RustPubUseIndex> {
+    let files = git_ls_tree_rs_files_at_base(dir, base, &info.src_root_rel)?;
+    let mut targets = Vec::new();
+    for file in files {
+        let Ok(rel_to_src) = file.strip_prefix(&info.src_root_rel) else {
+            continue;
+        };
+        let module_path = module_path_segments(rel_to_src);
+        match rust_module_path_is_public_reachable_at_base(dir, base, info, &module_path) {
+            Some(true) => {}
+            Some(false) => continue,
+            None => return None,
+        }
+        let file_str = file.to_str()?;
+        let source = read_git_blob_at_base(dir, base, file_str)?;
+        let tree = parser::parse_source(&source, crate::language::LangId::Rust).ok()?;
+        collect_pub_use_targets(tree.root_node(), &source, &mut targets);
+    }
+    Some(RustPubUseIndex { targets })
+}
+
+/// `git ls-tree -r --name-only <base> -- <src_root_rel>` で `.rs` ファイル一覧 (repo 相対) を取る。
+fn git_ls_tree_rs_files_at_base(
+    dir: &str,
+    base: &str,
+    src_root_rel: &std::path::Path,
+) -> Option<Vec<std::path::PathBuf>> {
+    let src_str = src_root_rel.to_str()?;
+    if validate_git_revision(base, "--base").is_err()
+        || validate_git_revision(src_str, "diff file path").is_err()
+    {
+        return None;
+    }
+    let out = std::process::Command::new("git")
+        .args(["ls-tree", "-r", "--name-only", base, "--", src_str])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = std::str::from_utf8(&out.stdout).ok()?;
+    Some(
+        text.lines()
+            .filter(|l| l.ends_with(".rs"))
+            .map(std::path::PathBuf::from)
+            .collect(),
+    )
+}
+
+/// `git show <base>:<file>` で blob を取る (file は repo 相対)。
+fn read_git_blob_at_base(dir: &str, base: &str, file: &str) -> Option<Vec<u8>> {
+    if validate_git_revision(base, "--base").is_err()
+        || validate_git_revision(file, "diff file path").is_err()
+    {
+        return None;
+    }
+    let out = std::process::Command::new("git")
+        .args(["show", &format!("{base}:{file}")])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(out.stdout)
+}
+
+/// base 側で `module_path` が lib.rs から `pub mod` 経路だけで到達できるか。private mod を経由する
+/// なら `Some(false)`、判定不能なら `None` (呼び出し側で api.rm を残す)。
+fn rust_module_path_is_public_reachable_at_base(
+    dir: &str,
+    base: &str,
+    info: &RustPrivateModuleInfo,
+    module_path: &[String],
+) -> Option<bool> {
+    use std::path::{Path, PathBuf};
+    if module_path.is_empty() {
+        return Some(true); // root モジュール (lib.rs / main.rs)
+    }
+    let mut current_rel = PathBuf::from("lib.rs");
+    let last = module_path.len() - 1;
+    for (i, seg) in module_path.iter().enumerate() {
+        let source =
+            read_rust_module_source_at_base(dir, base, &info.crate_root_rel, &current_rel)?;
+        let tree = parser::parse_source(&source, crate::language::LangId::Rust).ok()?;
+        match find_mod_decl_visibility(tree.root_node(), &source, seg) {
+            Some(true) => {
+                if i == last {
+                    return Some(true);
+                }
+                let parent = current_rel
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                let as_mod = parent.join(seg).join("mod.rs");
+                let as_file = parent.join(format!("{seg}.rs"));
+                if read_rust_module_source_at_base(dir, base, &info.crate_root_rel, &as_mod)
+                    .is_some()
+                {
+                    current_rel = as_mod;
+                } else if read_rust_module_source_at_base(dir, base, &info.crate_root_rel, &as_file)
+                    .is_some()
+                {
+                    current_rel = as_file;
+                } else {
+                    return None;
+                }
+            }
+            Some(false) => return Some(false),
+            None => return None,
+        }
+    }
+    Some(true)
+}
+
+/// AST を走査し `use_declaration` ノードから `pub use` re-export ターゲットを集める。
+fn collect_pub_use_targets(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    targets: &mut Vec<RustPubUseTarget>,
+) {
+    if node.kind() == "use_declaration"
+        && let Ok(text) = node.utf8_text(source)
+    {
+        targets.extend(parse_pub_use_targets(text));
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_pub_use_targets(child, source, targets);
+    }
+}
+
+/// `pub use ...;` のテキストから re-export ターゲットを抽出する。`pub(crate) use` 等の制限付きは
+/// 外部非公開なので除外する。
+fn parse_pub_use_targets(text: &str) -> Vec<RustPubUseTarget> {
+    let t = text.trim_start();
+    let Some(rest) = t.strip_prefix("pub use ") else {
+        return Vec::new();
+    };
+    let rest = rest.trim().trim_end_matches(';').trim();
+    let rest = rest
+        .strip_prefix("crate::")
+        .or_else(|| rest.strip_prefix("self::"))
+        .unwrap_or(rest);
+    if let Some(prefix) = rest.strip_suffix("::*") {
+        return vec![RustPubUseTarget::Wildcard {
+            path: prefix.split("::").map(str::to_string).collect(),
+        }];
+    }
+    if let Some((prefix, group)) = rest.split_once("::{") {
+        let group = group.trim_end_matches('}');
+        return group
+            .split(',')
+            .filter_map(|item| rust_named_reexport_target(prefix, item.trim()))
+            .collect();
+    }
+    rest.rsplit_once("::")
+        .and_then(|(path, item)| rust_named_reexport_target(path, item.trim()))
+        .into_iter()
+        .collect()
+}
+
+/// `pub use <path>::<item>` の named ターゲット。`as _` は非公開なので除外、`as <alias>` は元 item 名で照合。
+fn rust_named_reexport_target(path: &str, item: &str) -> Option<RustPubUseTarget> {
+    let item = match item.split_once(" as ") {
+        Some((_original, "_")) => return None,
+        Some((original, _alias)) => original.trim(),
+        None => item,
+    };
+    if item.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some(RustPubUseTarget::Named {
+        path: path.split("::").map(str::to_string).collect(),
+        item: item.to_string(),
+    })
 }
 
 /// Cargo.toml のテキストから `[lib]` セクションが宣言されているかを判定する。
@@ -9685,6 +10075,204 @@ def main():
         assert!(
             removed.iter().any(|n| n.ends_with("found")),
             "base で pub mod だったモジュールの pub fn 削除は private 化しても api.rm に残すべき。got: {removed:?}"
+        );
+    }
+
+    /// private module 配下の pub fn が別の public module (`pub mod prelude`) 経由で `pub use`
+    /// re-export 公開されている場合、その削除は外部公開 API の破壊なので api.rm に残す
+    /// (codex コミット後レビューで発見した prelude 経由 false negative の回帰防止)。
+    #[test]
+    fn detect_api_changes_private_module_reexported_via_public_prelude_removal_stays_in_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod wifi;\npub mod prelude;\n"),
+                ("src/prelude.rs", "pub use crate::wifi::found;\n"),
+                (
+                    "src/wifi/mod.rs",
+                    "pub fn found() -> u32 {\n    0\n}\npub fn hidden() -> u32 {\n    1\n}\n",
+                ),
+            ],
+            "base",
+        );
+        // found (prelude 経由公開) を削除、hidden は残す
+        fs::write(
+            repo.join("src/wifi/mod.rs"),
+            "pub fn hidden() -> u32 {\n    1\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 0,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "public prelude 経由 re-export された private module の pub fn 削除は api.rm に残すべき。got: {removed:?}"
+        );
+    }
+
+    /// public module から private module への wildcard re-export (`pub use crate::wifi::*`) は
+    /// その module の全 pub を公開するため、配下 pub fn の削除は api.rm に残す。
+    #[test]
+    fn detect_api_changes_private_module_wildcard_reexport_via_public_prelude_removal_stays() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod wifi;\npub mod prelude;\n"),
+                ("src/prelude.rs", "pub use crate::wifi::*;\n"),
+                ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(repo.join("src/wifi/mod.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "wildcard re-export された private module の pub fn 削除は api.rm に残すべき。got: {removed:?}"
+        );
+    }
+
+    /// public prelude が同一 private module 内の別シンボル (found) だけを named re-export している
+    /// 場合、re-export されていない兄弟 (hidden) の削除は外部非公開なので api.rm に出さない
+    /// (named re-export が同一 module の全シンボルを公開扱いにする粗さを防ぐ = false positive 抑止)。
+    #[test]
+    fn detect_api_changes_private_module_unreexported_sibling_removal_excluded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod wifi;\npub mod prelude;\n"),
+                ("src/prelude.rs", "pub use crate::wifi::found;\n"),
+                (
+                    "src/wifi/mod.rs",
+                    "pub fn found() -> u32 {\n    0\n}\npub fn hidden() -> u32 {\n    1\n}\n",
+                ),
+            ],
+            "base",
+        );
+        // hidden (未 re-export) を削除、found は残す
+        fs::write(
+            repo.join("src/wifi/mod.rs"),
+            "pub fn found() -> u32 {\n    0\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 2,
+                old_count: 3,
+                new_start: 2,
+                new_count: 0,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !removed.iter().any(|n| n.ends_with("hidden")),
+            "re-export されていない private module 内シンボルの削除は api.rm に出さない。got: {removed:?}"
+        );
+    }
+
+    /// re-export 元の module 自体が private (`mod prelude`) なら、その `pub use` は外部に届かない。
+    /// private prelude 経由でしか参照されない private module シンボルの削除は api.rm に出さない。
+    #[test]
+    fn detect_api_changes_private_module_via_private_prelude_removal_excluded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod wifi;\nmod prelude;\n"),
+                ("src/prelude.rs", "pub use crate::wifi::found;\n"),
+                ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(repo.join("src/wifi/mod.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !removed.iter().any(|n| n.ends_with("found")),
+            "private prelude (mod prelude) 経由の re-export は外部非公開なので api.rm に出さない。got: {removed:?}"
         );
     }
 
