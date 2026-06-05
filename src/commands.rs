@@ -1896,15 +1896,16 @@ fn detect_api_changes(
                 // 未 export 関数は外部 API 面ではない。新ツリー全体で参照 0 件なら同一 diff
                 // 内で完結した削除と判断して api.rm から除外する。
                 let is_bash_old_file = is_bash_script_path(&df.old_path);
-                // Rust bin-only crate (`[[bin]]` のみで `[lib]` なし) の `pub fn` は
-                // クレート外から到達できないため、削除されても外部 API の破壊にはならない。
-                // `api.add` 側 (line 1623, 1724) と対称に `api.rm` 側でも除外する。
-                // `api.rm` は旧 API 面の判定なので、`base` リビジョン時点での crate type
-                // を見る (新ツリーで src/lib.rs を削除したケースで誤抑制しないため)。
-                let is_binary_rust_old_crate =
-                    is_binary_only_rust_crate_at_base(dir, base, &df.old_path);
+                // Rust bin-only crate (`[[bin]]` のみで `[lib]` なし) の `pub fn`、および
+                // crate-private module (`mod foo`、`pub mod` 経路で到達不能) 配下の `pub fn` は
+                // クレート外から構造的に到達できないため、削除されても外部 API の破壊にはならない。
+                // `api.add` (new 側) / `api.mod` (old/new 両側) の private module 抑制と対称に
+                // `api.rm` 側でも除外する。`api.rm` は旧 API 面の判定なので base リビジョン側で
+                // 見る (新ツリーで src/lib.rs や mod 宣言を削除したケースでも誤抑制しないため)。
+                let is_old_non_public_api =
+                    is_rust_old_symbol_outside_public_api_surface(dir, base, &df.old_path);
                 for (name, kind, sig) in &old_syms {
-                    if is_binary_rust_old_crate {
+                    if is_old_non_public_api {
                         continue;
                     }
                     if is_bash_old_file
@@ -2018,11 +2019,13 @@ fn detect_api_changes(
         // ロジックを純粋削除にも拡張する。`export -f` 済み関数は他リポジトリ消費者向け
         // API として残す。
         let is_bash_old_file = is_bash_script_path(&df.old_path);
-        // Rust bin-only crate (`[[bin]]` のみで `[lib]` なし) の `pub fn` は外部から
-        // 到達できないため、削除されても破壊的 API 変更にはならない。`api.add` 側と対称に
-        // 除外する (Issue 2026-05-19-api-rm-bin-crate-dead-cleanup 対応)。
-        // `api.rm` は旧 API 面の判定なので、`base` リビジョン時点の crate type を見る。
-        let is_binary_rust_old_crate = is_binary_only_rust_crate_at_base(dir, base, &df.old_path);
+        // Rust bin-only crate (`[[bin]]` のみで `[lib]` なし) の `pub fn`、および crate-private
+        // module (`mod foo`) 配下の `pub fn` は外部から到達できないため、削除されても破壊的
+        // API 変更にはならない。`api.add` / `api.mod` 側と対称に api.rm でも除外する
+        // (Issue 2026-05-19-api-rm-bin-crate-dead-cleanup / 2026-06-05-wifi-module-removal 対応)。
+        // `api.rm` は旧 API 面の判定なので、`base` リビジョン時点で見る。
+        let is_old_non_public_api =
+            is_rust_old_symbol_outside_public_api_surface(dir, base, &df.old_path);
         // TS/JS: 新ツリーで `export { name } from "..."` として re-export (forwarding)
         // されているシンボルは、利用者から見た API 面 (import path から取れる名前) が
         // 維持されているため api.rm から除外する。ローカル定義を別モジュールへ移動し
@@ -2030,7 +2033,7 @@ fn detect_api_changes(
         let new_reexports = extract_reexported_names_from_file(dir, &df.new_path);
         for (name, kind, sig) in &old_syms {
             if !new_map.contains_key(name.as_str()) {
-                if is_binary_rust_old_crate {
+                if is_old_non_public_api {
                     continue;
                 }
                 if new_reexports.contains(name.as_str()) {
@@ -5172,6 +5175,16 @@ fn is_binary_only_rust_crate_at_base(dir: &str, base: &str, file_path: &str) -> 
         }
     }
     false
+}
+
+/// `api.rm` 判定用: 旧 (base) 側で削除されたシンボルが「外部公開 API 面の外」にあるかを返す。
+/// bin-only crate (`src/lib.rs` / `[lib]` なし) の `pub`、または crate-private module
+/// (`mod foo`、`pub mod` 経路で到達不能) 配下の `pub` は crate 外から構造的に到達できないため、
+/// 削除されても破壊的 API 変更ではない。`api.add` (new 側) / `api.mod` (old/new 両側) の private
+/// module 抑制と対称に、`api.rm` は旧 API 面なので base リビジョン側で判定する。
+fn is_rust_old_symbol_outside_public_api_surface(dir: &str, base: &str, old_path: &str) -> bool {
+    is_binary_only_rust_crate_at_base(dir, base, old_path)
+        || is_rust_symbol_in_private_module_at_base(dir, base, old_path)
 }
 
 /// Cargo.toml のテキストから `[lib]` セクションが宣言されているかを判定する。
@@ -9456,6 +9469,222 @@ def main():
                 .iter()
                 .map(|m| &m.name)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// crate-private module (`mod wifi`) 配下の pub fn をファイルごと削除しても、crate 外
+    /// 非到達 = 外部 API ではないため api.rm (removed / removed_dead) に出さない
+    /// (Issue 2026-06-05-wifi-module-removal: Tauri アプリの内部 mod 削除誤検出対策)。
+    #[test]
+    fn detect_api_changes_private_module_pub_fn_file_delete_excluded_from_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        let wifi_src = "pub fn found() -> u32 {\n    0\n}\npub fn failed() -> u32 {\n    1\n}\n";
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod wifi;\n"),
+                ("src/wifi/mod.rs", wifi_src),
+            ],
+            "base",
+        );
+        // wifi モジュールを丸ごと削除
+        std::fs::remove_file(repo.join("src/wifi/mod.rs")).expect("rm");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "/dev/null".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 6,
+                new_start: 0,
+                new_count: 0,
+            }],
+            deleted_old_source: Some(wifi_src.as_bytes().to_vec()),
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !removed
+                .iter()
+                .any(|n| n.ends_with("found") || n.ends_with("failed")),
+            "private module 配下の pub fn 削除 (ファイル丸ごと) は api.rm に出ない。got: {removed:?}"
+        );
+    }
+
+    /// crate-private module 配下の pub fn を同一ファイル内で一部だけ削除した場合も、
+    /// (同一 crate 内に caller が残っていても) crate 外非到達なので api.rm に出さない。
+    #[test]
+    fn detect_api_changes_private_module_pub_fn_same_file_removal_excluded_from_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod wifi;\n"),
+                (
+                    "src/wifi/mod.rs",
+                    "pub mod caller;\npub fn found() -> u32 {\n    0\n}\npub fn kept() -> u32 {\n    1\n}\n",
+                ),
+                (
+                    "src/wifi/caller.rs",
+                    "pub fn call() -> u32 {\n    super::found()\n}\n",
+                ),
+            ],
+            "base",
+        );
+        // found だけ削除し kept は残す (caller の super::found() 参照は残存)
+        fs::write(
+            repo.join("src/wifi/mod.rs"),
+            "pub mod caller;\npub fn kept() -> u32 {\n    1\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 2,
+                old_count: 3,
+                new_start: 2,
+                new_count: 0,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !removed.iter().any(|n| n.ends_with("found")),
+            "private module 配下の pub fn 削除 (同一ファイル一部) は api.rm に出ない。got: {removed:?}"
+        );
+    }
+
+    /// private module でも root から `pub use` で re-export していた pub fn は外部公開 API
+    /// 面に含まれるため、削除は api.rm に残す (find_pub_use_reexport で private 判定が解除される)。
+    #[test]
+    fn detect_api_changes_private_module_reexported_pub_fn_removal_stays_in_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod wifi;\npub use wifi::found;\n"),
+                ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        // found を削除 (private mod だが pub use で re-export されている)
+        fs::write(repo.join("src/wifi/mod.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "pub use re-export された private module の pub fn 削除は api.rm に残すべき。got: {removed:?}"
+        );
+    }
+
+    /// base で公開 (pub mod) だったモジュール配下の pub fn を、同一 diff で private 化しつつ
+    /// 削除した場合、旧 API は base 時点で公開だったため api.rm に残す (at_base 判定)。
+    #[test]
+    fn detect_api_changes_module_made_private_in_diff_keeps_removal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "pub mod wifi;\n"),
+                (
+                    "src/wifi/mod.rs",
+                    "pub fn found() -> u32 {\n    0\n}\npub fn kept() -> u32 {\n    1\n}\n",
+                ),
+            ],
+            "base",
+        );
+        // wifi を private 化 (pub mod → mod) しつつ found を削除
+        fs::write(repo.join("src/lib.rs"), "mod wifi;\n").expect("write");
+        fs::write(
+            repo.join("src/wifi/mod.rs"),
+            "pub fn kept() -> u32 {\n    1\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![
+            crate::models::impact::DiffFile {
+                old_path: "src/lib.rs".to_string(),
+                new_path: "src/lib.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 1,
+                    new_start: 1,
+                    new_count: 1,
+                }],
+                deleted_old_source: None,
+            },
+            crate::models::impact::DiffFile {
+                old_path: "src/wifi/mod.rs".to_string(),
+                new_path: "src/wifi/mod.rs".to_string(),
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count: 3,
+                    new_start: 1,
+                    new_count: 1,
+                }],
+                deleted_old_source: None,
+            },
+        ];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "base で pub mod だったモジュールの pub fn 削除は private 化しても api.rm に残すべき。got: {removed:?}"
         );
     }
 
