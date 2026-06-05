@@ -2094,13 +2094,10 @@ fn detect_api_changes(
         let is_binary_rust_old_crate_for_mod =
             is_binary_only_rust_crate_at_base(dir, base, &df.old_path);
         let is_binary_rust_new_crate_for_mod = is_binary_only_rust_crate(dir, &df.new_path);
-        // api.mod の private module 抑制: new と base 両方で private module 配下なら crate 外
-        // 非到達なので除外する。base で外部公開 (pub mod) だった旧 API の破壊的 signature 変更は
-        // base 側が public 判定となり除外されず blocking を維持する (codex 指摘2)。
-        let skip_mod_for_binary_crate = is_binary_rust_old_crate_for_mod
-            || is_binary_rust_new_crate_for_mod
-            || (is_rust_symbol_in_private_module(dir, &df.new_path)
-                && is_rust_symbol_in_private_module_at_base(dir, base, &df.old_path));
+        // bin-only crate (`[[bin]]` のみで `[lib]` も `src/lib.rs` も持たない) の `pub fn`
+        // シグネチャ変更は外部公開 API の互換性問題ではない。ファイル単位で skip を確定できる。
+        let skip_mod_for_binary_crate =
+            is_binary_rust_old_crate_for_mod || is_binary_rust_new_crate_for_mod;
 
         // 値バインディングの value-only 変更を const_value_changes へ振り分けるための言語判定。
         let lang_id_for_file =
@@ -2115,6 +2112,19 @@ fn detect_api_changes(
                 && seen_modified.insert((df.new_path.clone(), name.clone()))
             {
                 if skip_mod_for_binary_crate {
+                    continue;
+                }
+                // private module 抑制: api.rm と同じ re-export edge graph + 固定点伝播で、
+                // 公開到達不能と確定したシンボルのみ api.mod から除外する (codex Warning #4 対応)。
+                // 二段 re-export 経由で外部公開されているシンボルの破壊的 signature 変更は
+                // blocking を維持する。fail-closed: index 構築失敗時は除外せず modified に残す。
+                if is_rust_old_symbol_outside_public_api_surface(
+                    dir,
+                    base,
+                    &df.old_path,
+                    name,
+                    &mut rust_reexport_cache,
+                ) {
                     continue;
                 }
                 // 同名が旧/新いずれかに複数あるシンボルは、別の定義同士を突き合わせている
@@ -3133,11 +3143,6 @@ fn rust_symbol_in_private_module_inner(dir: &str, file_path: &str, base: Option<
 /// working tree のシンボルが private module 配下 (crate 外非到達) かを判定する。
 fn is_rust_symbol_in_private_module(dir: &str, file_path: &str) -> bool {
     rust_symbol_in_private_module_inner(dir, file_path, None)
-}
-
-/// base リビジョン時点でシンボルが private module 配下だったかを判定する (git show 経由)。
-fn is_rust_symbol_in_private_module_at_base(dir: &str, base: &str, file_path: &str) -> bool {
-    rust_symbol_in_private_module_inner(dir, file_path, Some(base))
 }
 
 /// src 相対パスを Rust モジュールセグメント列に変換する。
@@ -11612,6 +11617,100 @@ def main():
         assert!(
             removed.iter().any(|n| n.ends_with("found")),
             "#[path] が削除対象 module 自身に付いていても fail-closed で削除は api.rm に残るべき。got: {removed:?}"
+        );
+    }
+
+    /// private module 配下の `pub fn` が public prelude 経由で re-export 公開されている場合の
+    /// signature 変更は外部互換性破壊なので api.mod に残す (codex pre-merge レビュー 6 回目
+    /// Warning #4 = api.mod 抑制が edge graph を見ない false negative の回帰テスト)。
+    #[test]
+    fn detect_api_changes_private_module_reexported_via_public_prelude_signature_change_stays_in_mod()
+     {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod wifi;\npub mod prelude;\n"),
+                ("src/prelude.rs", "pub use crate::wifi::found;\n"),
+                ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(
+            repo.join("src/wifi/mod.rs"),
+            "pub fn found(x: u32) -> u32 {\n    x\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 3,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        assert!(
+            api.modified.iter().any(|m| m.name.ends_with("found")),
+            "public prelude 経由 re-export された private module の pub fn signature 変更は api.mod に残るべき。mod={:?}",
+            api.modified.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// private module 配下の `pub fn` が二段 re-export (`mod prelude;` + `pub use prelude::found;`)
+    /// 経由で公開されているケースの signature 変更は外部互換性破壊なので api.mod に残す。
+    #[test]
+    fn detect_api_changes_private_module_via_private_prelude_then_root_pub_use_signature_change_stays_in_mod()
+     {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                (
+                    "src/lib.rs",
+                    "mod wifi;\nmod prelude;\npub use prelude::found;\n",
+                ),
+                ("src/prelude.rs", "pub use crate::wifi::found;\n"),
+                ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(
+            repo.join("src/wifi/mod.rs"),
+            "pub fn found(x: u32) -> u32 {\n    x\n}\n",
+        )
+        .expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 3,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        assert!(
+            api.modified.iter().any(|m| m.name.ends_with("found")),
+            "二段 re-export 経由公開シンボルの signature 変更は api.mod に残るべき。mod={:?}",
+            api.modified.iter().map(|m| &m.name).collect::<Vec<_>>()
         );
     }
 
