@@ -2023,9 +2023,17 @@ fn detect_api_changes(
         // 除外する (Issue 2026-05-19-api-rm-bin-crate-dead-cleanup 対応)。
         // `api.rm` は旧 API 面の判定なので、`base` リビジョン時点の crate type を見る。
         let is_binary_rust_old_crate = is_binary_only_rust_crate_at_base(dir, base, &df.old_path);
+        // TS/JS: 新ツリーで `export { name } from "..."` として re-export (forwarding)
+        // されているシンボルは、利用者から見た API 面 (import path から取れる名前) が
+        // 維持されているため api.rm から除外する。ローカル定義を別モジュールへ移動し
+        // re-export を残すリファクタの誤検出対策。`export * from` は名前不明のため対象外。
+        let new_reexports = extract_reexported_names_from_file(dir, &df.new_path);
         for (name, kind, sig) in &old_syms {
             if !new_map.contains_key(name.as_str()) {
                 if is_binary_rust_old_crate {
+                    continue;
+                }
+                if new_reexports.contains(name.as_str()) {
                     continue;
                 }
                 // closed-in-diff for api.rm: 同ファイルに新規追加されたシンボルがあり、
@@ -3719,6 +3727,41 @@ fn extract_exported_symbols_from_file_inner(
         exclude_framework_entrypoints,
         Some(file_path),
     ))
+}
+
+/// 新ツリーのファイルから TS/JS の named re-export 名集合を取得する。api.rm 抑制に使う。
+/// 非 TS/JS、parse 失敗、安全でないパスでは空集合を返す (fail-safe: 抑制しない方向)。
+fn extract_reexported_names_from_file(
+    dir: &str,
+    file_path: &str,
+) -> std::collections::HashSet<String> {
+    if !crate::engine::impact::is_safe_diff_path(file_path) {
+        return std::collections::HashSet::new();
+    }
+    let full_path = std::path::Path::new(dir).join(file_path);
+    let Some(utf8) = full_path.to_str() else {
+        return std::collections::HashSet::new();
+    };
+    let utf8_path = camino::Utf8Path::new(utf8);
+    let Ok(lang_id) = crate::language::LangId::from_path(utf8_path) else {
+        return std::collections::HashSet::new();
+    };
+    // re-export 構文 (`export { x } from "..."`) を持つのは TS/JS のみ。
+    if !matches!(
+        lang_id,
+        crate::language::LangId::Typescript
+            | crate::language::LangId::Tsx
+            | crate::language::LangId::Javascript
+    ) {
+        return std::collections::HashSet::new();
+    }
+    let Ok(source) = parser::read_file(utf8_path) else {
+        return std::collections::HashSet::new();
+    };
+    let Ok(tree) = parser::parse_source(&source, lang_id) else {
+        return std::collections::HashSet::new();
+    };
+    crate::engine::symbols::collect_reexported_names(tree.root_node(), &source)
 }
 
 /// dead_symbols のうち、宣言行が今回の diff の追加行 (`+` 行) と重なるもののみを残す。

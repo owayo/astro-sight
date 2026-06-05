@@ -402,6 +402,12 @@ fn has_named_export(root: Node, source: &[u8], target_name: &str) -> bool {
         if child.kind() != "export_statement" {
             continue;
         }
+        // `export { foo } from "./b"` は別モジュールの forwarding (re-export) であり、
+        // このファイルでの foo のローカル定義 export ではない。from 句 (source) があれば
+        // ローカル export 判定の対象外とする。
+        if child.child_by_field_name("source").is_some() {
+            continue;
+        }
         let mut inner = child.walk();
         for grandchild in child.children(&mut inner) {
             if grandchild.kind() != "export_clause" {
@@ -422,6 +428,53 @@ fn has_named_export(root: Node, source: &[u8], target_name: &str) -> bool {
         }
     }
     false
+}
+
+/// TS/JS の named re-export (`export { foo } from "..."` /
+/// `export { foo as bar } from "..."`) で **このファイルから提供される export 名** の
+/// 集合を返す (alias があれば alias 名)。`export * from "..."` (wildcard) は名前が静的に
+/// 不明なため対象外。
+///
+/// api.rm 抑制に使う: あるシンボルがローカル定義から re-export に置き換わっても、
+/// 利用者から見た export 面 (import path から取れる名前) は維持されているため
+/// 「削除」ではない。
+pub(crate) fn collect_reexported_names(
+    root: Node,
+    source: &[u8],
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() != "export_statement" {
+            continue;
+        }
+        // from 句 (source) がある export のみ re-export。
+        if child.child_by_field_name("source").is_none() {
+            continue;
+        }
+        let mut inner = child.walk();
+        for grandchild in child.children(&mut inner) {
+            if grandchild.kind() != "export_clause" {
+                continue;
+            }
+            let mut spec_cursor = grandchild.walk();
+            for spec in grandchild.children(&mut spec_cursor) {
+                if spec.kind() != "export_specifier" {
+                    continue;
+                }
+                // exported 名: alias (`as bar`) があれば alias、なければ name。
+                let exported = spec
+                    .child_by_field_name("alias")
+                    .or_else(|| spec.child_by_field_name("name"));
+                if let Some(n) = exported
+                    && let Ok(text) = n.utf8_text(source)
+                {
+                    names.insert(text.to_string());
+                }
+            }
+        }
+    }
+    names
 }
 
 /// Rust: visibility_modifier (pub) または impl ブロック所属をチェック。
@@ -2171,6 +2224,50 @@ mod tests {
             LangId::Typescript,
             "foo"
         ));
+    }
+
+    /// re-export 名抽出テスト用ヘルパー。
+    fn collect_reexports(source: &str, lang_id: LangId) -> std::collections::HashSet<String> {
+        let language = lang_id.ts_language();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        super::collect_reexported_names(tree.root_node(), source.as_bytes())
+    }
+
+    #[test]
+    fn ts_reexport_from_clause_is_not_local_export() {
+        // `export { foo } from "./b"` は re-export (別モジュールの forwarding) であり、
+        // ローカル定義 foo があっても from 句付き export はローカル export 判定に使わない。
+        assert!(!check_exported(
+            "function foo() {}\nexport { foo } from \"./b\"",
+            LangId::Typescript,
+            "foo"
+        ));
+    }
+
+    #[test]
+    fn collect_reexported_names_named_and_alias() {
+        let names = collect_reexports(
+            "export { foo, bar as baz } from \"./b\";",
+            LangId::Typescript,
+        );
+        assert!(names.contains("foo"), "foo: {names:?}");
+        assert!(names.contains("baz"), "alias 後の baz: {names:?}");
+        assert!(
+            !names.contains("bar"),
+            "alias 前の bar は含まない: {names:?}"
+        );
+    }
+
+    #[test]
+    fn collect_reexported_names_ignores_local_export() {
+        // from 句のない `export { foo }` は re-export ではない (ローカル export)。
+        let names = collect_reexports("function foo() {}\nexport { foo };", LangId::Typescript);
+        assert!(
+            names.is_empty(),
+            "ローカル export は re-export でない: {names:?}"
+        );
     }
 
     #[test]

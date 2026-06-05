@@ -8340,6 +8340,65 @@ fn non_git_review_hook_silent_exit_zero() {
     );
 }
 
+/// ローカル Issue 2026-06-04-api-rm-false-positive-on-reexport の回帰テスト:
+/// ローカル定義を re-export (`export { foo } from "..."`) に置き換えても、利用者から
+/// 見た export 面は維持されるため api.rm に出さない。move (同一 diff 内の add) でない
+/// 純粋な forwarding でも抑制されることを確認する (b.ts を作らないため reconcile_with_moves
+/// では相殺されず、re-export 抑制ロジックが独立して効くことを保証)。
+#[test]
+fn api_rm_suppressed_for_ts_named_reexport() {
+    use std::process::Command;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path();
+    let path_str = path.to_str().expect("utf-8");
+
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .status()
+            .expect("git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(
+        path.join("a.ts"),
+        "export function foo() {}\nexport function bar() {}\n",
+    )
+    .unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+    // foo を外部モジュールからの re-export に置換 (b.ts を作らない = move でない)。bar は不変。
+    std::fs::write(
+        path.join("a.ts"),
+        "export { foo } from \"./vendor\";\nexport function bar() {}\n",
+    )
+    .unwrap();
+    git(&["add", "-A"]);
+
+    let output = cargo_bin()
+        .args(["review", "--dir", path_str, "--git"])
+        .output()
+        .expect("run review");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    let api_rm: Vec<&str> = json["api"]["rm"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|s| s["n"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        !api_rm.contains(&"foo"),
+        "foo は re-export で forwarding されており api.rm に出すべきでない: api.rm={api_rm:?}"
+    );
+}
+
 #[test]
 fn non_git_review_emits_skipped() {
     let dir = tempfile::tempdir().expect("tempdir");
