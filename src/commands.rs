@@ -3184,6 +3184,12 @@ fn find_mod_decl_visibility(
                 .and_then(|n| n.utf8_text(source).ok())
                 == Some(mod_name)
         {
+            // #[path = "..."] でファイル名と module 名がずれる場合、モジュール解決を諦めて
+            // 「判定不能」(None) を返す。下流 (rust_private_module_info_at_base /
+            // public_reachable_modules_at_base) は api.rm 抑制を諦め、削除を残す方向に倒す。
+            if rust_mod_item_has_path_attribute(child, source) {
+                return None;
+            }
             let mut mc = child.walk();
             let is_pub = child.children(&mut mc).any(|c| {
                 c.kind() == "visibility_modifier" && c.utf8_text(source).map(str::trim) == Ok("pub")
@@ -5570,6 +5576,11 @@ fn collect_public_pub_mods(
     use std::path::Path;
     match node.kind() {
         "mod_item" => {
+            // #[path = "..."] でファイル名と module 名がずれる場合、module の解決が壊れるので
+            // index 全体を None にして api.rm を残す (fail-closed)。
+            if rust_mod_item_has_path_attribute(node, source) {
+                return None;
+            }
             let name = node
                 .child_by_field_name("name")
                 .and_then(|n| n.utf8_text(source).ok())
@@ -5722,6 +5733,11 @@ fn collect_pub_use_edges(
             )?;
         }
         "mod_item" => {
+            // #[path = "..."] でファイル名と module 名がずれる場合、source_module の解決を保守的に
+            // 諦めて index 全体を None にする (codex Warning #3 対応、fail-closed)。
+            if rust_mod_item_has_path_attribute(node, source) {
+                return None;
+            }
             let name = node
                 .child_by_field_name("name")
                 .and_then(|n| n.utf8_text(source).ok())
@@ -5743,6 +5759,41 @@ fn collect_pub_use_edges(
         }
     }
     Some(())
+}
+
+/// `mod_item` の直前の同一スコープ sibling に `#[path = "..."]` attribute があるかを返す。
+/// tree-sitter-rust では attribute_item と mod_item は親 (source_file / declaration_list) の
+/// 子として **隣接 sibling** に並ぶため、prev_sibling を逆方向に辿って attribute_item を集める。
+/// `#[path]` が見つかったら true。
+fn rust_mod_item_has_path_attribute(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut prev = node.prev_named_sibling();
+    while let Some(sib) = prev {
+        if sib.kind() != "attribute_item" {
+            break; // 連続する attribute_item は積み上がるが、他の宣言が出たら終了
+        }
+        if attribute_item_is_path(sib, source) {
+            return true;
+        }
+        prev = sib.prev_named_sibling();
+    }
+    false
+}
+
+/// `attribute_item` の中身が `#[path = ...]` か判定する。
+fn attribute_item_is_path(attr_item: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = attr_item.walk();
+    for child in attr_item.named_children(&mut cursor) {
+        if child.kind() == "attribute" {
+            // attribute の最初の identifier 子 (= attribute path) の text を見る。
+            let mut inner = child.walk();
+            for c in child.named_children(&mut inner) {
+                if c.kind() == "identifier" || c.kind() == "scoped_identifier" {
+                    return c.utf8_text(source).map(str::trim) == Ok("path");
+                }
+            }
+        }
+    }
+    false
 }
 
 /// `use_declaration` / `mod_item` ノードが「制限なし `pub`」 (`pub(crate)` / `pub(super)` 等の
@@ -11468,6 +11519,99 @@ def main():
         assert!(
             removed.iter().any(|n| n.ends_with("found")),
             "循環的な 3 段 re-export chain でも固定点で停止して exposed 判定が成立する。got: {removed:?}"
+        );
+    }
+
+    /// `#[path = "..."]` で module 宣言とファイル名がずれるケースで、re-export 経由公開の
+    /// 削除が誤抑制されないこと (fail-closed: index 全体を `None` にして api.rm に残す)。
+    /// codex pre-merge レビュー 5 回目の Warning #3 (path attribute) 回帰テスト。
+    #[test]
+    fn detect_api_changes_private_module_path_attribute_keeps_removal_in_api_rm() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                (
+                    "src/lib.rs",
+                    "mod wifi;\n#[path = \"hidden.rs\"]\nmod prelude;\npub use prelude::found;\n",
+                ),
+                ("src/hidden.rs", "pub use crate::wifi::found;\n"),
+                ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(repo.join("src/wifi/mod.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi/mod.rs".to_string(),
+            new_path: "src/wifi/mod.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "#[path] 付き module 経由の re-export 削除は判定不能 → fail-closed で api.rm に残すべき。got: {removed:?}"
+        );
+    }
+
+    /// `#[path]` が削除対象 module 自身 (wifi) に付いていても fail-closed で削除は api.rm に残る。
+    /// (private module info 構築失敗 → 上流で抑制せず通常経路に戻る = api.rm 残し)
+    #[test]
+    fn detect_api_changes_private_module_path_attribute_on_target_module_keeps_removal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "#[path = \"wifi_impl.rs\"]\nmod wifi;\n"),
+                ("src/wifi_impl.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(repo.join("src/wifi_impl.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi_impl.rs".to_string(),
+            new_path: "src/wifi_impl.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "#[path] が削除対象 module 自身に付いていても fail-closed で削除は api.rm に残るべき。got: {removed:?}"
         );
     }
 
