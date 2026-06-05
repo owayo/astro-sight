@@ -5119,6 +5119,13 @@ fn is_rust_old_symbol_outside_public_api_surface(
     if is_binary_only_rust_crate_at_base(dir, base, old_path) {
         return true;
     }
+    // symbol が inline `mod_item` 内 (`mod foo { pub fn symbol() }` 形式) で定義されている
+    // 場合、ファイルパス由来の module_segments とずれて edge graph seed が誤合致する。
+    // 範囲限定 fail-closed: false negative を防ぐため `api.rm` 抑制を諦め symbol を残す
+    // (Issue 2026-06-05-rust-api-add-private-module-reexport-edge-graph の codex 指摘)。
+    if rust_symbol_is_inside_inline_mod_at_base(dir, base, old_path, symbol_name) {
+        return false;
+    }
     // re-export を考慮しない raw private 判定。public-reachable / 判定不能なら api.rm を残す。
     let Some(private) = rust_private_module_info_at_base(dir, base, old_path) else {
         return false;
@@ -5233,6 +5240,11 @@ fn is_rust_new_symbol_outside_public_api_surface(
     if is_binary_only_rust_crate(dir, new_path) {
         return true;
     }
+    // symbol が inline `mod_item` 内で定義されている場合、ファイルパス由来の module_segments
+    // とずれて edge graph seed が誤合致するため、fail-closed で `api.add` 抑制を諦める。
+    if rust_symbol_is_inside_inline_mod_at_worktree(dir, new_path, symbol_name) {
+        return false;
+    }
     // raw private 判定 (re-export 考慮なし)。public-reachable / 判定不能なら api.add を残す。
     let Some(private) = rust_private_module_info_at_worktree(dir, new_path) else {
         return false;
@@ -5241,6 +5253,108 @@ fn is_rust_new_symbol_outside_public_api_surface(
         return false; // index 構築失敗 → fail-closed (api.add を残す)
     };
     !index.exposes_symbol(&private, symbol_name)
+}
+
+/// ファイル AST を walk して `symbol_name` の定義が inline `mod_item` (`mod foo { ... }`)
+/// の中にあるかを判定する。working tree 側。`mod_item` を見つけたら、その body 内に
+/// 同名 identifier の定義 (function_item / struct_item / enum_item / type_alias 等の
+/// name field) があるかを確認する。複数経路に同名がある場合は保守的に true (=fail-closed
+/// 側に倒し抑制しない方向)。検出失敗・parse 失敗・ファイル読み込み失敗時は false。
+fn rust_symbol_is_inside_inline_mod_at_worktree(
+    dir: &str,
+    file_path: &str,
+    symbol_name: &str,
+) -> bool {
+    let canonical_dir = match std::fs::canonicalize(dir) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    let full = canonical_dir.join(file_path);
+    let source = match std::fs::read(&full) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    rust_source_has_symbol_in_inline_mod(&source, symbol_name)
+}
+
+/// base 側版。`git show <base>:<file_path>` で取得したソースで判定する。
+fn rust_symbol_is_inside_inline_mod_at_base(
+    dir: &str,
+    base: &str,
+    file_path: &str,
+    symbol_name: &str,
+) -> bool {
+    if validate_git_revision(base, "--base").is_err()
+        || validate_git_revision(file_path, "diff file path").is_err()
+    {
+        return false;
+    }
+    let out = match std::process::Command::new("git")
+        .args(["show", &format!("{base}:{file_path}")])
+        .current_dir(dir)
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+    rust_source_has_symbol_in_inline_mod(&out.stdout, symbol_name)
+}
+
+/// 共通ロジック: source を Rust として parse し、inline `mod_item` の body 内に
+/// `symbol_name` の定義 (name field が一致する `function_item` / `struct_item` /
+/// `enum_item` / `type_item` / `const_item` / `static_item` / `trait_item` / `mod_item`) が
+/// あるか再帰探索する。
+fn rust_source_has_symbol_in_inline_mod(source: &[u8], symbol_name: &str) -> bool {
+    let bare = bare_name(symbol_name);
+    let tree = match parser::parse_source(source, crate::language::LangId::Rust) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    walk_for_inline_mod_containing(tree.root_node(), source, bare, false)
+}
+
+/// 再帰 walk: `inside_inline_mod=true` のスコープに symbol 定義があれば true。
+/// `mod_item` の body (declaration_list) に入ったら `inside_inline_mod=true` で再帰する。
+fn walk_for_inline_mod_containing(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    symbol_name: &str,
+    inside_inline_mod: bool,
+) -> bool {
+    let kind = node.kind();
+    // 対象シンボル定義かを判定 (name field を持つ各種 item)
+    if inside_inline_mod
+        && matches!(
+            kind,
+            "function_item"
+                | "struct_item"
+                | "enum_item"
+                | "type_item"
+                | "const_item"
+                | "static_item"
+                | "trait_item"
+                | "mod_item"
+                | "union_item"
+        )
+        && let Some(name_node) = node.child_by_field_name("name")
+        && name_node.utf8_text(source).map(str::trim) == Ok(symbol_name)
+    {
+        return true;
+    }
+    // 子 node を再帰 walk。`mod_item` の declaration_list (body) に入ったら
+    // inside_inline_mod=true で潜る。`mod foo;` (宣言のみ) は body が無いので追加判定なし。
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        let next_inside = if kind == "mod_item" && child.kind() == "declaration_list" {
+            true
+        } else {
+            inside_inline_mod
+        };
+        if walk_for_inline_mod_containing(child, source, symbol_name, next_inside) {
+            return true;
+        }
+    }
+    false
 }
 
 /// working tree 側で `file_path` (dir 相対) の private module 情報を構築する。`rust_private_module_info_at_base`
@@ -12218,6 +12332,102 @@ def main():
         assert!(
             added.iter().any(|n| n.ends_with("scan")),
             "新規ファイル経路 (/dev/null → new) で re-export 公開された pub fn は api.add に残るべき。got: {added:?}"
+        );
+    }
+
+    /// 削除対象シンボルが file 内 inline `mod_item` の body に定義されている場合、
+    /// ファイルパスベースの module_segments と実 module path がずれて edge graph seed が
+    /// 誤合致するため、fail-closed で抑制を諦め `api.rm` に残す。
+    /// (codex Step B コミット前レビュー 1 回目の Warning 指摘の回帰テスト)
+    #[test]
+    fn detect_api_changes_inline_child_mod_pub_fn_deletion_stays_in_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod wifi;\npub mod prelude;\n"),
+                ("src/prelude.rs", "pub use crate::wifi::scanner::scan;\n"),
+                (
+                    "src/wifi.rs",
+                    "pub mod scanner { pub fn scan() -> u32 { 0 } }\n",
+                ),
+            ],
+            "base",
+        );
+        // scan を削除
+        fs::write(repo.join("src/wifi.rs"), "pub mod scanner {}\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi.rs".to_string(),
+            new_path: "src/wifi.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("scan")),
+            "inline child mod 内の pub fn 削除は fail-closed で api.rm に残すべき。got: {removed:?}"
+        );
+    }
+
+    /// 新規追加シンボルが file 内 inline `mod_item` の body にある場合も fail-closed で
+    /// `api.add` に残す。target 側 inline module の false negative を防ぐ。
+    #[test]
+    fn detect_api_changes_inline_child_mod_pub_fn_addition_stays_in_added() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "mod wifi;\npub mod prelude;\n"),
+                ("src/prelude.rs", "pub use crate::wifi::scanner::scan;\n"),
+                ("src/wifi.rs", "pub mod scanner {}\n"),
+            ],
+            "base",
+        );
+        // scan を inline mod 内に新規追加
+        fs::write(
+            repo.join("src/wifi.rs"),
+            "pub mod scanner { pub fn scan() -> u32 { 0 } }\n",
+        )
+        .expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/wifi.rs".to_string(),
+            new_path: "src/wifi.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let added: Vec<&str> = api.added.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            added.iter().any(|n| n.ends_with("scan")),
+            "inline child mod 内の pub fn 新規追加は fail-closed で api.add に残すべき。got: {added:?}"
         );
     }
 
