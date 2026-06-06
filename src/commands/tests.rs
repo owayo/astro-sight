@@ -1,4 +1,9 @@
 use super::*;
+#[allow(unused_imports)]
+use crate::models::review::{
+    ApiChanges, ApiSymbol, ApiSymbolChange, CompatibleApiModification, MissingCochange,
+    MovedSymbol, PropertyToFieldChange, ReviewResult,
+};
 use std::fs;
 use std::io::Cursor;
 use std::process::Command;

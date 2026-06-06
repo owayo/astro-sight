@@ -7,9 +7,11 @@ use crate::error::{AstroError, ErrorCode};
 use crate::models::dead_code::DeadCodeResult;
 use crate::models::review::DeadSymbol;
 
+use super::api_changes::{
+    bare_name, extract_exported_symbols_from_file_inner, extract_symbol_lines,
+};
 use super::common::{MAX_INPUT_SIZE, read_file_to_string_limited, serialize_output};
 use super::git_input::{GitDiffInput, resolve_git_diff};
-use super::{bare_name, extract_exported_symbols_from_file_inner, extract_symbol_lines};
 
 pub(crate) fn detect_dead_symbols_from_files(
     dir: &str,
