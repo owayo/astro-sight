@@ -5431,32 +5431,180 @@ fn rust_private_module_info_at_worktree(
 
 /// working tree から `<crate_root_rel>/src/<module_rel>` のソースを読み取る。`read_rust_module_source_at_base`
 /// の worktree 版。failures は `None` を返し、呼び出し側で `api.add` 抑制を諦める。
+/// Rust crate のソースツリーをどこから読むかを表す抽象化。
+///
+/// `Worktree` は `std::fs` 経由で working tree を直接読み、`Base { rev }` は `git show <rev>:<path>` /
+/// `git ls-tree <rev>` 経由で base リビジョンを読む。`read_rust_module_source` / `collect_rust_rs_files` /
+/// `RustReexportCache` の API に渡して I/O 差分を吸収する (リファクタ Step 1: I/O 抽象化、
+/// 別 Issue `2026-06-06-refactor-rust-private-module-helpers-with-source-tree-enum.md` 対応)。
+#[derive(Clone, Copy, Debug)]
+enum RustSourceTree<'a> {
+    Worktree,
+    Base { rev: &'a str },
+}
+
+/// `crate_root_rel`/src/`module_rel` を `source` 経由で読む。Worktree なら `std::fs::read`、
+/// Base なら `git show <rev>:<crate_root_rel>/src/<module_rel>`。失敗時は `None`。
+fn read_rust_module_source(
+    source: RustSourceTree<'_>,
+    dir: &str,
+    crate_root_rel: &std::path::Path,
+    module_rel: &std::path::Path,
+) -> Option<Vec<u8>> {
+    match source {
+        RustSourceTree::Worktree => {
+            let canonical_dir = std::fs::canonicalize(dir).ok()?;
+            let full = canonical_dir
+                .join(crate_root_rel)
+                .join("src")
+                .join(module_rel);
+            std::fs::read(full).ok()
+        }
+        RustSourceTree::Base { rev } => {
+            let full_rel = crate_root_rel.join("src").join(module_rel);
+            let full_rel_str = full_rel.to_str()?;
+            if validate_git_revision(rev, "--base").is_err()
+                || validate_git_revision(full_rel_str, "diff file path").is_err()
+            {
+                return None;
+            }
+            let out = std::process::Command::new("git")
+                .args(["show", &format!("{rev}:{full_rel_str}")])
+                .current_dir(dir)
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            Some(out.stdout)
+        }
+    }
+}
+
+/// `src_root_rel` 配下の `.rs` ファイル列 (repo 相対) を `source` 経由で取得する。
+/// Worktree なら `ignore::WalkBuilder`、Base なら `git ls-tree -r --name-only`。
+fn collect_rust_rs_files(
+    source: RustSourceTree<'_>,
+    dir: &str,
+    src_root_rel: &std::path::Path,
+) -> Option<Vec<std::path::PathBuf>> {
+    match source {
+        RustSourceTree::Worktree => {
+            use ignore::WalkBuilder;
+            let canonical_dir = std::fs::canonicalize(dir).ok()?;
+            let src_full = canonical_dir.join(src_root_rel);
+            if !src_full.is_dir() {
+                return None;
+            }
+            let mut files = Vec::new();
+            for entry in WalkBuilder::new(&src_full).hidden(false).build().flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+                    continue;
+                }
+                let rel = match path.strip_prefix(&canonical_dir) {
+                    Ok(r) => r.to_path_buf(),
+                    Err(_) => continue,
+                };
+                files.push(rel);
+            }
+            Some(files)
+        }
+        RustSourceTree::Base { rev } => {
+            let src_str = src_root_rel.to_str()?;
+            if validate_git_revision(rev, "--base").is_err()
+                || validate_git_revision(src_str, "diff file path").is_err()
+            {
+                return None;
+            }
+            let out = std::process::Command::new("git")
+                .args(["ls-tree", "-r", "--name-only", rev, "--", src_str])
+                .current_dir(dir)
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let text = std::str::from_utf8(&out.stdout).ok()?;
+            Some(
+                text.lines()
+                    .filter(|l| l.ends_with(".rs"))
+                    .map(std::path::PathBuf::from)
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// 統合 cache キー (リファクタ Step 2: cache 統合)。`rev = None` で working tree、
+/// `rev = Some(<rev>)` で base リビジョンを表す。型で意図を明確化することで、
+/// `(Option<String>, PathBuf)` の生 tuple よりも事故りにくい。
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct RustSourceTreeKey {
+    rev: Option<String>,
+    crate_root_rel: std::path::PathBuf,
+}
+
+impl RustSourceTreeKey {
+    fn from_source(source: RustSourceTree<'_>, crate_root_rel: std::path::PathBuf) -> Self {
+        let rev = match source {
+            RustSourceTree::Worktree => None,
+            RustSourceTree::Base { rev } => Some(rev.to_string()),
+        };
+        Self {
+            rev,
+            crate_root_rel,
+        }
+    }
+}
+
+/// base / worktree 統合 re-export cache (リファクタ Step 2)。
+/// `RustBaseReexportCache` / `RustWorktreeReexportCache` の本体としても使用される
+/// (これら 2 cache は外部 API 維持のため薄い wrapper として残り、内部は本 cache に転送する)。
+#[derive(Default)]
+struct RustReexportCache {
+    by_key: std::collections::HashMap<RustSourceTreeKey, Option<RustPubUseIndex>>,
+}
+
+impl RustReexportCache {
+    fn index_for(
+        &mut self,
+        source: RustSourceTree<'_>,
+        dir: &str,
+        info: &RustPrivateModuleInfo,
+    ) -> Option<&RustPubUseIndex> {
+        let key = RustSourceTreeKey::from_source(source, info.crate_root_rel.clone());
+        self.by_key
+            .entry(key)
+            .or_insert_with(|| match source {
+                RustSourceTree::Worktree => collect_rust_pub_use_index_at_worktree(dir, info),
+                RustSourceTree::Base { rev } => collect_rust_pub_use_index_at_base(dir, rev, info),
+            })
+            .as_ref()
+    }
+}
+
 fn read_rust_module_source_at_worktree(
     dir: &str,
     crate_root_rel: &std::path::Path,
     module_rel: &std::path::Path,
 ) -> Option<Vec<u8>> {
-    let canonical_dir = std::fs::canonicalize(dir).ok()?;
-    let full = canonical_dir
-        .join(crate_root_rel)
-        .join("src")
-        .join(module_rel);
-    std::fs::read(full).ok()
+    read_rust_module_source(RustSourceTree::Worktree, dir, crate_root_rel, module_rel)
 }
 
-/// working tree 用 re-export cache。base 側と独立。
+/// working tree 用 re-export cache。`api.add` 経路から呼ばれる外部 API を維持しつつ、
+/// 内部は統合 `RustReexportCache` に転送する (リファクタ Step 2: cache 統合)。
 #[derive(Default)]
 struct RustWorktreeReexportCache {
-    by_crate: std::collections::HashMap<std::path::PathBuf, Option<RustPubUseIndex>>,
+    inner: RustReexportCache,
 }
 
 impl RustWorktreeReexportCache {
     fn index_for(&mut self, dir: &str, info: &RustPrivateModuleInfo) -> Option<&RustPubUseIndex> {
-        let key = info.crate_root_rel.clone();
-        self.by_crate
-            .entry(key)
-            .or_insert_with(|| collect_rust_pub_use_index_at_worktree(dir, info))
-            .as_ref()
+        self.inner.index_for(RustSourceTree::Worktree, dir, info)
     }
 }
 
@@ -5513,35 +5661,13 @@ fn collect_rust_pub_use_index_at_worktree(
     })
 }
 
-/// working tree 側で `src/` 配下の `.rs` ファイル列を集める。`git ls-tree` ベースの base 版
-/// と異なり `ignore::WalkBuilder` で `.gitignore` / 隠しファイル除外を尊重する。判定不能なら `None`。
+/// working tree 側で `src/` 配下の `.rs` ファイル列を集める。リファクタ Step 1 で統合
+/// `collect_rust_rs_files(RustSourceTree::Worktree, ...)` への薄い wrapper に置き換えた。
 fn collect_rust_rs_files_at_worktree(
     dir: &str,
     src_root_rel: &std::path::Path,
 ) -> Option<Vec<std::path::PathBuf>> {
-    use ignore::WalkBuilder;
-    let canonical_dir = std::fs::canonicalize(dir).ok()?;
-    let src_full = canonical_dir.join(src_root_rel);
-    if !src_full.is_dir() {
-        return None;
-    }
-    let mut files = Vec::new();
-    for entry in WalkBuilder::new(&src_full).hidden(false).build().flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if path.extension().and_then(|s| s.to_str()) != Some("rs") {
-            continue;
-        }
-        // workspace 境界 (canonical_dir 配下) の確認
-        let rel = match path.strip_prefix(&canonical_dir) {
-            Ok(r) => r.to_path_buf(),
-            Err(_) => continue,
-        };
-        files.push(rel);
-    }
-    Some(files)
+    collect_rust_rs_files(RustSourceTree::Worktree, dir, src_root_rel)
 }
 
 /// working tree 側で `pub mod` 経路で到達可能な module 集合を構築する。
@@ -5658,34 +5784,28 @@ fn collect_public_pub_mods_at_worktree(
 }
 
 /// `git show <base>:<crate_root_rel>/src/<module_rel>` で base 側モジュールソースを取得する。
+/// リファクタ Step 1 で `read_rust_module_source(RustSourceTree::Base { rev: base }, ...)` への
+/// 薄い wrapper に置き換えた (I/O 抽象化)。
 fn read_rust_module_source_at_base(
     dir: &str,
     base: &str,
     crate_root_rel: &std::path::Path,
     module_rel: &std::path::Path,
 ) -> Option<Vec<u8>> {
-    let full_rel = crate_root_rel.join("src").join(module_rel);
-    let full_rel_str = full_rel.to_str()?;
-    if validate_git_revision(base, "--base").is_err()
-        || validate_git_revision(full_rel_str, "diff file path").is_err()
-    {
-        return None;
-    }
-    let out = std::process::Command::new("git")
-        .args(["show", &format!("{base}:{full_rel_str}")])
-        .current_dir(dir)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(out.stdout)
+    read_rust_module_source(
+        RustSourceTree::Base { rev: base },
+        dir,
+        crate_root_rel,
+        module_rel,
+    )
 }
 
 /// base+crate 単位で `pub use` re-export index を一度だけ構築するキャッシュ。
+/// `api.rm` / `api.mod` 経路から呼ばれる外部 API を維持しつつ、内部は統合 `RustReexportCache`
+/// に転送する (リファクタ Step 2: cache 統合)。
 #[derive(Default)]
 struct RustBaseReexportCache {
-    by_crate: std::collections::HashMap<(String, std::path::PathBuf), Option<RustPubUseIndex>>,
+    inner: RustReexportCache,
 }
 
 impl RustBaseReexportCache {
@@ -5695,11 +5815,8 @@ impl RustBaseReexportCache {
         base: &str,
         info: &RustPrivateModuleInfo,
     ) -> Option<&RustPubUseIndex> {
-        let key = (base.to_string(), info.crate_root_rel.clone());
-        self.by_crate
-            .entry(key)
-            .or_insert_with(|| collect_rust_pub_use_index_at_base(dir, base, info))
-            .as_ref()
+        self.inner
+            .index_for(RustSourceTree::Base { rev: base }, dir, info)
     }
 }
 
@@ -6004,32 +6121,14 @@ fn collect_public_pub_mods(
 }
 
 /// `git ls-tree -r --name-only <base> -- <src_root_rel>` で `.rs` ファイル一覧 (repo 相対) を取る。
+/// リファクタ Step 1 で統合 `collect_rust_rs_files(RustSourceTree::Base { rev: base }, ...)` への
+/// 薄い wrapper に置き換えた。
 fn git_ls_tree_rs_files_at_base(
     dir: &str,
     base: &str,
     src_root_rel: &std::path::Path,
 ) -> Option<Vec<std::path::PathBuf>> {
-    let src_str = src_root_rel.to_str()?;
-    if validate_git_revision(base, "--base").is_err()
-        || validate_git_revision(src_str, "diff file path").is_err()
-    {
-        return None;
-    }
-    let out = std::process::Command::new("git")
-        .args(["ls-tree", "-r", "--name-only", base, "--", src_str])
-        .current_dir(dir)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = std::str::from_utf8(&out.stdout).ok()?;
-    Some(
-        text.lines()
-            .filter(|l| l.ends_with(".rs"))
-            .map(std::path::PathBuf::from)
-            .collect(),
-    )
+    collect_rust_rs_files(RustSourceTree::Base { rev: base }, dir, src_root_rel)
 }
 
 /// `git show <base>:<file>` で blob を取る (file は repo 相対)。
