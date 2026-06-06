@@ -5123,11 +5123,17 @@ fn is_rust_old_symbol_outside_public_api_surface(
     // 場合、ファイルパス由来の module_segments とずれて edge graph seed が誤合致する。
     // 範囲限定 fail-closed: false negative を防ぐため `api.rm` 抑制を諦め symbol を残す
     // (Issue 2026-06-05-rust-api-add-private-module-reexport-edge-graph の codex 指摘)。
-    if rust_symbol_is_inside_inline_mod_at_base(dir, base, old_path, symbol_name) {
+    if rust_symbol_is_inside_inline_mod(
+        RustSourceTree::Base { rev: base },
+        dir,
+        old_path,
+        symbol_name,
+    ) {
         return false;
     }
     // re-export を考慮しない raw private 判定。public-reachable / 判定不能なら api.rm を残す。
-    let Some(private) = rust_private_module_info_at_base(dir, base, old_path) else {
+    let Some(private) = rust_private_module_info(RustSourceTree::Base { rev: base }, dir, old_path)
+    else {
         return false;
     };
     // index 構築に失敗したら api.rm を残す (false negative 回避優先)。
@@ -5148,9 +5154,16 @@ struct RustPrivateModuleInfo {
 /// base 側で `file_path` (dir 相対) の private module 情報を構築する。re-export は考慮しない
 /// (index 側で扱う)。public-reachable (全 `pub mod`) なら `None`、判定不能 (`#[path]` / inline mod /
 /// 宣言未検出 / モジュールファイル解決不能) も `None` を返し、呼び出し側で api.rm を残す方向に倒す。
-fn rust_private_module_info_at_base(
+/// `file_path` (dir 相対) の Rust source が属する private module の情報を返す。
+/// `RustSourceTree::Base { rev }` なら base リビジョン、`RustSourceTree::Worktree` なら working
+/// tree のソースを読む (リファクタ Step 3: `_at_base` / `_at_worktree` の本体統合)。
+///
+/// lib.rs から mod 宣言チェーンを辿り、最初に private (`mod` 修飾なし) だった prefix を含む
+/// `RustPrivateModuleInfo` を返す。`#[path]` 属性 / inline mod / 宣言未検出は `None` を返して
+/// 上流で fail-closed する。全 `pub mod` で到達可能なら `None` (public-reachable)。
+fn rust_private_module_info(
+    source: RustSourceTree<'_>,
     dir: &str,
-    base: &str,
     file_path: &str,
 ) -> Option<RustPrivateModuleInfo> {
     use std::path::{Path, PathBuf};
@@ -5160,7 +5173,6 @@ fn rust_private_module_info_at_base(
     }
     let canonical_dir = std::fs::canonicalize(dir).ok()?;
     let abs = canonical_dir.join(rel);
-    // crate root: abs の祖先で最も近い Cargo.toml を持つディレクトリ (working tree 構造)。
     let mut crate_root: Option<PathBuf> = None;
     let mut anc = abs.parent();
     while let Some(d) = anc {
@@ -5176,23 +5188,21 @@ fn rust_private_module_info_at_base(
     let crate_root = crate_root?;
     let src_dir = crate_root.join("src");
     if !src_dir.join("lib.rs").is_file() {
-        return None; // library crate でない (bin-only は別経路)
+        return None;
     }
     let rel_to_src = abs.strip_prefix(&src_dir).ok()?;
     let segments = module_path_segments(rel_to_src);
     if segments.is_empty() {
-        return None; // root モジュール (lib.rs / main.rs)
+        return None;
     }
     let crate_root_rel = crate_root.strip_prefix(&canonical_dir).ok()?.to_path_buf();
     let src_root_rel = crate_root_rel.join("src");
-    // lib.rs から mod 宣言チェーンを辿り、最初に private だった prefix を探す。
     let mut current_rel = PathBuf::from("lib.rs");
     for (idx, seg) in segments.iter().enumerate() {
-        let source = read_rust_module_source_at_base(dir, base, &crate_root_rel, &current_rel)?;
-        let tree = parser::parse_source(&source, crate::language::LangId::Rust).ok()?;
-        match find_mod_decl_visibility(tree.root_node(), &source, seg) {
+        let module_source = read_rust_module_source(source, dir, &crate_root_rel, &current_rel)?;
+        let tree = parser::parse_source(&module_source, crate::language::LangId::Rust).ok()?;
+        match find_mod_decl_visibility(tree.root_node(), &module_source, seg) {
             Some(true) => {
-                // pub mod。次のモジュールファイルへ (working tree 構造で解決)。
                 let parent = current_rel
                     .parent()
                     .map(Path::to_path_buf)
@@ -5208,8 +5218,6 @@ fn rust_private_module_info_at_base(
                 }
             }
             Some(false) => {
-                // private mod。Step B では edge graph + 固定点伝播で公開到達性を判定するため、
-                // private prefix の情報は持ち回らない (target_module 完全一致 + alias graph で代用)。
                 let _ = idx;
                 return Some(RustPrivateModuleInfo {
                     crate_root_rel,
@@ -5220,7 +5228,7 @@ fn rust_private_module_info_at_base(
             None => return None,
         }
     }
-    None // 全 pub mod = public reachable
+    None
 }
 
 /// `api.add` 判定用: 新 (working tree) 側で新規追加されたシンボル `symbol_name` が
@@ -5242,11 +5250,11 @@ fn is_rust_new_symbol_outside_public_api_surface(
     }
     // symbol が inline `mod_item` 内で定義されている場合、ファイルパス由来の module_segments
     // とずれて edge graph seed が誤合致するため、fail-closed で `api.add` 抑制を諦める。
-    if rust_symbol_is_inside_inline_mod_at_worktree(dir, new_path, symbol_name) {
+    if rust_symbol_is_inside_inline_mod(RustSourceTree::Worktree, dir, new_path, symbol_name) {
         return false;
     }
     // raw private 判定 (re-export 考慮なし)。public-reachable / 判定不能なら api.add を残す。
-    let Some(private) = rust_private_module_info_at_worktree(dir, new_path) else {
+    let Some(private) = rust_private_module_info(RustSourceTree::Worktree, dir, new_path) else {
         return false;
     };
     let Some(index) = reexport_cache.index_for(dir, &private) else {
@@ -5260,44 +5268,43 @@ fn is_rust_new_symbol_outside_public_api_surface(
 /// 同名 identifier の定義 (function_item / struct_item / enum_item / type_alias 等の
 /// name field) があるかを確認する。複数経路に同名がある場合は保守的に true (=fail-closed
 /// 側に倒し抑制しない方向)。検出失敗・parse 失敗・ファイル読み込み失敗時は false。
-fn rust_symbol_is_inside_inline_mod_at_worktree(
+/// ファイルソース (`source` 経由) を Rust として parse し、`symbol_name` の定義が inline
+/// `mod_item` body 内にあるかを判定する (リファクタ Step 3: `_at_base` / `_at_worktree` の
+/// 本体統合)。読み込み / parse 失敗時は false (= 抑制しない / shadow なし扱い)。
+fn rust_symbol_is_inside_inline_mod(
+    source: RustSourceTree<'_>,
     dir: &str,
     file_path: &str,
     symbol_name: &str,
 ) -> bool {
-    let canonical_dir = match std::fs::canonicalize(dir) {
-        Ok(d) => d,
-        Err(_) => return false,
+    let source_bytes = match source {
+        RustSourceTree::Worktree => {
+            let Ok(canonical_dir) = std::fs::canonicalize(dir) else {
+                return false;
+            };
+            let full = canonical_dir.join(file_path);
+            match std::fs::read(&full) {
+                Ok(s) => s,
+                Err(_) => return false,
+            }
+        }
+        RustSourceTree::Base { rev } => {
+            if validate_git_revision(rev, "--base").is_err()
+                || validate_git_revision(file_path, "diff file path").is_err()
+            {
+                return false;
+            }
+            match std::process::Command::new("git")
+                .args(["show", &format!("{rev}:{file_path}")])
+                .current_dir(dir)
+                .output()
+            {
+                Ok(o) if o.status.success() => o.stdout,
+                _ => return false,
+            }
+        }
     };
-    let full = canonical_dir.join(file_path);
-    let source = match std::fs::read(&full) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    rust_source_has_symbol_in_inline_mod(&source, symbol_name)
-}
-
-/// base 側版。`git show <base>:<file_path>` で取得したソースで判定する。
-fn rust_symbol_is_inside_inline_mod_at_base(
-    dir: &str,
-    base: &str,
-    file_path: &str,
-    symbol_name: &str,
-) -> bool {
-    if validate_git_revision(base, "--base").is_err()
-        || validate_git_revision(file_path, "diff file path").is_err()
-    {
-        return false;
-    }
-    let out = match std::process::Command::new("git")
-        .args(["show", &format!("{base}:{file_path}")])
-        .current_dir(dir)
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return false,
-    };
-    rust_source_has_symbol_in_inline_mod(&out.stdout, symbol_name)
+    rust_source_has_symbol_in_inline_mod(&source_bytes, symbol_name)
 }
 
 /// 共通ロジック: source を Rust として parse し、inline `mod_item` の body 内に
@@ -5358,77 +5365,6 @@ fn walk_for_inline_mod_containing(
 }
 
 /// working tree 側で `file_path` (dir 相対) の private module 情報を構築する。`rust_private_module_info_at_base`
-/// の working tree 版。`#[path]` 属性付きの mod 宣言が rev=worktree 側に出てきたら `find_mod_decl_visibility`
-/// が `None` を返すので、結果として `None` が伝播し fail-closed になる。
-fn rust_private_module_info_at_worktree(
-    dir: &str,
-    file_path: &str,
-) -> Option<RustPrivateModuleInfo> {
-    use std::path::{Path, PathBuf};
-    let rel = Path::new(file_path);
-    if rel.extension().and_then(|s| s.to_str()) != Some("rs") {
-        return None;
-    }
-    let canonical_dir = std::fs::canonicalize(dir).ok()?;
-    let abs = canonical_dir.join(rel);
-    let mut crate_root: Option<PathBuf> = None;
-    let mut anc = abs.parent();
-    while let Some(d) = anc {
-        if d.join("Cargo.toml").is_file() {
-            crate_root = Some(d.to_path_buf());
-            break;
-        }
-        if d == canonical_dir {
-            break;
-        }
-        anc = d.parent();
-    }
-    let crate_root = crate_root?;
-    let src_dir = crate_root.join("src");
-    if !src_dir.join("lib.rs").is_file() {
-        return None;
-    }
-    let rel_to_src = abs.strip_prefix(&src_dir).ok()?;
-    let segments = module_path_segments(rel_to_src);
-    if segments.is_empty() {
-        return None;
-    }
-    let crate_root_rel = crate_root.strip_prefix(&canonical_dir).ok()?.to_path_buf();
-    let src_root_rel = crate_root_rel.join("src");
-    let mut current_rel = PathBuf::from("lib.rs");
-    for (idx, seg) in segments.iter().enumerate() {
-        let source = read_rust_module_source_at_worktree(dir, &crate_root_rel, &current_rel)?;
-        let tree = parser::parse_source(&source, crate::language::LangId::Rust).ok()?;
-        match find_mod_decl_visibility(tree.root_node(), &source, seg) {
-            Some(true) => {
-                let parent = current_rel
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_default();
-                let as_mod = parent.join(seg).join("mod.rs");
-                let as_file = parent.join(format!("{seg}.rs"));
-                if src_dir.join(&as_mod).is_file() {
-                    current_rel = as_mod;
-                } else if src_dir.join(&as_file).is_file() {
-                    current_rel = as_file;
-                } else {
-                    return None;
-                }
-            }
-            Some(false) => {
-                let _ = idx;
-                return Some(RustPrivateModuleInfo {
-                    crate_root_rel,
-                    src_root_rel,
-                    module_segments: segments,
-                });
-            }
-            None => return None,
-        }
-    }
-    None
-}
-
 /// working tree から `<crate_root_rel>/src/<module_rel>` のソースを読み取る。`read_rust_module_source_at_base`
 /// の worktree 版。failures は `None` を返し、呼び出し側で `api.add` 抑制を諦める。
 /// Rust crate のソースツリーをどこから読むかを表す抽象化。
@@ -5580,19 +5516,12 @@ impl RustReexportCache {
         self.by_key
             .entry(key)
             .or_insert_with(|| match source {
-                RustSourceTree::Worktree => collect_rust_pub_use_index_at_worktree(dir, info),
-                RustSourceTree::Base { rev } => collect_rust_pub_use_index_at_base(dir, rev, info),
+                RustSourceTree::Worktree | RustSourceTree::Base { .. } => {
+                    collect_rust_pub_use_index(source, dir, info)
+                }
             })
             .as_ref()
     }
-}
-
-fn read_rust_module_source_at_worktree(
-    dir: &str,
-    crate_root_rel: &std::path::Path,
-    module_rel: &std::path::Path,
-) -> Option<Vec<u8>> {
-    read_rust_module_source(RustSourceTree::Worktree, dir, crate_root_rel, module_rel)
 }
 
 /// working tree 用 re-export cache。`api.add` 経路から呼ばれる外部 API を維持しつつ、
@@ -5606,198 +5535,6 @@ impl RustWorktreeReexportCache {
     fn index_for(&mut self, dir: &str, info: &RustPrivateModuleInfo) -> Option<&RustPubUseIndex> {
         self.inner.index_for(RustSourceTree::Worktree, dir, info)
     }
-}
-
-/// working tree 側で edge graph + public_modules を構築する。`collect_rust_pub_use_index_at_base`
-/// の worktree 版。`ignore::WalkBuilder` で src/ 配下を走査する。
-fn collect_rust_pub_use_index_at_worktree(
-    dir: &str,
-    info: &RustPrivateModuleInfo,
-) -> Option<RustPubUseIndex> {
-    let files = collect_rust_rs_files_at_worktree(dir, &info.src_root_rel)?;
-    let mut edges: Vec<RustPubUseEdge> = Vec::new();
-    for file in files {
-        let Ok(rel_to_src) = file.strip_prefix(&info.src_root_rel) else {
-            continue;
-        };
-        let module_path = module_path_segments(rel_to_src);
-        let canonical_dir = std::fs::canonicalize(dir).ok()?;
-        let abs = canonical_dir.join(&file);
-        let source = std::fs::read(&abs).ok()?;
-        let tree = parser::parse_source(&source, crate::language::LangId::Rust).ok()?;
-        collect_pub_use_edges(tree.root_node(), &source, &module_path, &mut edges)?;
-    }
-    let mut named_by_target: std::collections::HashMap<RustExportKey, Vec<usize>> =
-        std::collections::HashMap::new();
-    let mut wildcard_by_target_module: std::collections::HashMap<Vec<String>, Vec<usize>> =
-        std::collections::HashMap::new();
-    for (idx, edge) in edges.iter().enumerate() {
-        match edge {
-            RustPubUseEdge::Named {
-                target_module,
-                target_item,
-                ..
-            } => {
-                let key = RustExportKey {
-                    module: target_module.clone(),
-                    name: target_item.clone(),
-                };
-                named_by_target.entry(key).or_default().push(idx);
-            }
-            RustPubUseEdge::Wildcard { target_module, .. } => {
-                wildcard_by_target_module
-                    .entry(target_module.clone())
-                    .or_default()
-                    .push(idx);
-            }
-        }
-    }
-    let public_modules = public_reachable_modules_at_worktree(dir, info)?;
-    Some(RustPubUseIndex {
-        edges,
-        public_modules,
-        named_by_target,
-        wildcard_by_target_module,
-    })
-}
-
-/// working tree 側で `src/` 配下の `.rs` ファイル列を集める。リファクタ Step 1 で統合
-/// `collect_rust_rs_files(RustSourceTree::Worktree, ...)` への薄い wrapper に置き換えた。
-fn collect_rust_rs_files_at_worktree(
-    dir: &str,
-    src_root_rel: &std::path::Path,
-) -> Option<Vec<std::path::PathBuf>> {
-    collect_rust_rs_files(RustSourceTree::Worktree, dir, src_root_rel)
-}
-
-/// working tree 側で `pub mod` 経路で到達可能な module 集合を構築する。
-/// `public_reachable_modules_at_base` の worktree 版。
-fn public_reachable_modules_at_worktree(
-    dir: &str,
-    info: &RustPrivateModuleInfo,
-) -> Option<std::collections::HashSet<Vec<String>>> {
-    use std::collections::HashSet;
-    use std::path::PathBuf;
-    let mut result: HashSet<Vec<String>> = HashSet::new();
-    result.insert(Vec::new());
-    let mut frontier: Vec<(Vec<String>, PathBuf)> = vec![(Vec::new(), PathBuf::from("lib.rs"))];
-    while let Some((segments, current_rel)) = frontier.pop() {
-        let source = read_rust_module_source_at_worktree(dir, &info.crate_root_rel, &current_rel)?;
-        let tree = parser::parse_source(&source, crate::language::LangId::Rust).ok()?;
-        collect_public_pub_mods_at_worktree(
-            tree.root_node(),
-            &source,
-            dir,
-            info,
-            &segments,
-            &current_rel,
-            &mut result,
-            &mut frontier,
-        )?;
-    }
-    Some(result)
-}
-
-/// `collect_public_pub_mods` の worktree 版。次モジュールファイルの解決は working tree で行う。
-#[allow(clippy::too_many_arguments)]
-fn collect_public_pub_mods_at_worktree(
-    node: tree_sitter::Node<'_>,
-    source: &[u8],
-    dir: &str,
-    info: &RustPrivateModuleInfo,
-    current_segments: &[String],
-    current_file_rel: &std::path::Path,
-    result: &mut std::collections::HashSet<Vec<String>>,
-    frontier: &mut Vec<(Vec<String>, std::path::PathBuf)>,
-) -> Option<()> {
-    use std::path::Path;
-    match node.kind() {
-        "mod_item" => {
-            if rust_mod_item_has_path_attribute(node, source) {
-                return None;
-            }
-            let name = node
-                .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(source).ok())
-                .map(str::to_string)?;
-            let is_pub = rust_use_declaration_is_pub(node, source);
-            if !is_pub {
-                return Some(());
-            }
-            let mut child_segments = current_segments.to_vec();
-            child_segments.push(name.clone());
-            result.insert(child_segments.clone());
-            let mut has_inline_body = false;
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                if child.kind() == "declaration_list" {
-                    has_inline_body = true;
-                    let mut inner_cursor = child.walk();
-                    for inner in child.named_children(&mut inner_cursor) {
-                        collect_public_pub_mods_at_worktree(
-                            inner,
-                            source,
-                            dir,
-                            info,
-                            &child_segments,
-                            current_file_rel,
-                            result,
-                            frontier,
-                        )?;
-                    }
-                }
-            }
-            if !has_inline_body {
-                let parent_dir = current_file_rel
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_default();
-                let as_mod = parent_dir.join(&name).join("mod.rs");
-                let as_file = parent_dir.join(format!("{name}.rs"));
-                if read_rust_module_source_at_worktree(dir, &info.crate_root_rel, &as_mod).is_some()
-                {
-                    frontier.push((child_segments, as_mod));
-                } else if read_rust_module_source_at_worktree(dir, &info.crate_root_rel, &as_file)
-                    .is_some()
-                {
-                    frontier.push((child_segments, as_file));
-                }
-            }
-        }
-        _ => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                collect_public_pub_mods_at_worktree(
-                    child,
-                    source,
-                    dir,
-                    info,
-                    current_segments,
-                    current_file_rel,
-                    result,
-                    frontier,
-                )?;
-            }
-        }
-    }
-    Some(())
-}
-
-/// `git show <base>:<crate_root_rel>/src/<module_rel>` で base 側モジュールソースを取得する。
-/// リファクタ Step 1 で `read_rust_module_source(RustSourceTree::Base { rev: base }, ...)` への
-/// 薄い wrapper に置き換えた (I/O 抽象化)。
-fn read_rust_module_source_at_base(
-    dir: &str,
-    base: &str,
-    crate_root_rel: &std::path::Path,
-    module_rel: &std::path::Path,
-) -> Option<Vec<u8>> {
-    read_rust_module_source(
-        RustSourceTree::Base { rev: base },
-        dir,
-        crate_root_rel,
-        module_rel,
-    )
 }
 
 /// base+crate 単位で `pub use` re-export index を一度だけ構築するキャッシュ。
@@ -5934,24 +5671,27 @@ fn rust_reexport_item_name(name: &str) -> &str {
 /// pub use も root から `pub use private::x` されれば公開になり得るため)、最終判定は `exposes_symbol`
 /// の固定点伝播で行う。`git ls-tree` / `git show` / parse / path 解決のいずれかで判定不能になったら
 /// `None` を返して `api.rm` を残す (false negative 回避)。
-fn collect_rust_pub_use_index_at_base(
+/// Rust crate の src/ 配下を `source` 経由で全走査し、`pub use` re-export edge graph と
+/// public-reachable module 集合を構築する (リファクタ Step 3: `_at_base` / `_at_worktree` の
+/// 本体統合)。public-reachable filter は collect 段階では外し、最終判定は
+/// `exposes_symbol` の固定点伝播で行う。`ls-tree` / `read` / parse / path 解決のいずれかが
+/// 失敗したら `None` を返す (`api.rm` / `api.add` を残す方向、false negative 回避)。
+fn collect_rust_pub_use_index(
+    source: RustSourceTree<'_>,
     dir: &str,
-    base: &str,
     info: &RustPrivateModuleInfo,
 ) -> Option<RustPubUseIndex> {
-    let files = git_ls_tree_rs_files_at_base(dir, base, &info.src_root_rel)?;
+    let files = collect_rust_rs_files(source, dir, &info.src_root_rel)?;
     let mut edges: Vec<RustPubUseEdge> = Vec::new();
     for file in files {
         let Ok(rel_to_src) = file.strip_prefix(&info.src_root_rel) else {
             continue;
         };
         let module_path = module_path_segments(rel_to_src);
-        let file_str = file.to_str()?;
-        let source = read_git_blob_at_base(dir, base, file_str)?;
-        let tree = parser::parse_source(&source, crate::language::LangId::Rust).ok()?;
-        collect_pub_use_edges(tree.root_node(), &source, &module_path, &mut edges)?;
+        let file_source = read_rs_blob(source, dir, &file)?;
+        let tree = parser::parse_source(&file_source, crate::language::LangId::Rust).ok()?;
+        collect_pub_use_edges(tree.root_node(), &file_source, &module_path, &mut edges)?;
     }
-    // 逆引き map と public_modules を構築する。
     let mut named_by_target: std::collections::HashMap<RustExportKey, Vec<usize>> =
         std::collections::HashMap::new();
     let mut wildcard_by_target_module: std::collections::HashMap<Vec<String>, Vec<usize>> =
@@ -5977,7 +5717,7 @@ fn collect_rust_pub_use_index_at_base(
             }
         }
     }
-    let public_modules = public_reachable_modules_at_base(dir, base, info)?;
+    let public_modules = public_reachable_modules(source, dir, info)?;
     Some(RustPubUseIndex {
         edges,
         public_modules,
@@ -5986,35 +5726,46 @@ fn collect_rust_pub_use_index_at_base(
     })
 }
 
-/// base 側で lib.rs (crate root) から `pub mod` 経路 (制限なし pub) で到達できる module 集合を
-/// 構築する。root `[]` は常に含む。inline `pub mod foo { ... }` も再帰的に拾う。`mod foo;`
-/// (制限なし pub なし) は除外する。判定不能 (`#[path]` / モジュールファイル解決失敗 / 解析失敗) は
-/// `None` を返し、呼出元で api.rm を残す。
-fn public_reachable_modules_at_base(
+/// `src/` 配下の `.rs` ファイル (file は dir 相対) を `source` 経由で読む。
+/// Worktree なら `std::fs::read(<canonical_dir>/<file>)`、Base なら `git show <rev>:<file>`。
+fn read_rs_blob(source: RustSourceTree<'_>, dir: &str, file: &std::path::Path) -> Option<Vec<u8>> {
+    match source {
+        RustSourceTree::Worktree => {
+            let canonical_dir = std::fs::canonicalize(dir).ok()?;
+            let abs = canonical_dir.join(file);
+            std::fs::read(abs).ok()
+        }
+        RustSourceTree::Base { rev } => {
+            let file_str = file.to_str()?;
+            read_git_blob_at_base(dir, rev, file_str)
+        }
+    }
+}
+
+/// `source` 経由で lib.rs (crate root) から `pub mod` 経路 (制限なし pub) で到達できる
+/// module 集合を構築する (リファクタ Step 3: `_at_base` / `_at_worktree` の本体統合)。root `[]`
+/// は常に含む。inline `pub mod foo { ... }` も再帰的に拾う。`mod foo;` (制限なし pub なし) は
+/// 除外する。判定不能 (`#[path]` / モジュールファイル解決失敗 / 解析失敗) は `None` を返し、
+/// 呼出元で api.rm を残す (fail-closed)。
+fn public_reachable_modules(
+    source: RustSourceTree<'_>,
     dir: &str,
-    base: &str,
     info: &RustPrivateModuleInfo,
 ) -> Option<std::collections::HashSet<Vec<String>>> {
     use std::collections::HashSet;
     use std::path::PathBuf;
     let mut result: HashSet<Vec<String>> = HashSet::new();
-    result.insert(Vec::new()); // crate root は常に public-reachable
-    // BFS で `pub mod` チェーンを辿る。各 frontier ノードは (module_segments, current_rel)
-    // (current_rel は src 相対モジュールファイル) を持つ。
+    result.insert(Vec::new());
     let mut frontier: Vec<(Vec<String>, PathBuf)> = vec![(Vec::new(), PathBuf::from("lib.rs"))];
     while let Some((segments, current_rel)) = frontier.pop() {
-        let source =
-            read_rust_module_source_at_base(dir, base, &info.crate_root_rel, &current_rel)?;
-        let tree = parser::parse_source(&source, crate::language::LangId::Rust).ok()?;
-        // 子 module (mod_item) を全部列挙する (inline body / 宣言のみ どちらも)。
-        // 各 mod_item の visibility が制限なし `pub` なら子は public-reachable に追加し、
-        // inline body があれば再帰的に辿る、宣言のみなら次のモジュールファイルを解決して frontier に積む。
-        // 非 pub mod は除外。
+        let module_source =
+            read_rust_module_source(source, dir, &info.crate_root_rel, &current_rel)?;
+        let tree = parser::parse_source(&module_source, crate::language::LangId::Rust).ok()?;
         collect_public_pub_mods(
+            source,
             tree.root_node(),
-            &source,
+            &module_source,
             dir,
-            base,
             info,
             &segments,
             &current_rel,
@@ -6025,14 +5776,15 @@ fn public_reachable_modules_at_base(
     Some(result)
 }
 
-/// `lib.rs` / 親モジュールファイルから子の `pub mod` を再帰的に集める。inline body は同じファイル
-/// 内で walk 続行、宣言のみは次のモジュールファイルを resolve して frontier に積む。
+/// `lib.rs` / 親モジュールファイルから子の `pub mod` を `source` 経由で再帰的に集める。
+/// inline body は同じファイル内で walk 続行、宣言のみは次のモジュールファイルを resolve して
+/// frontier に積む (リファクタ Step 3: `_at_base` / `_at_worktree` の本体統合)。
 #[allow(clippy::too_many_arguments)]
 fn collect_public_pub_mods(
+    source: RustSourceTree<'_>,
     node: tree_sitter::Node<'_>,
-    source: &[u8],
+    source_bytes: &[u8],
     dir: &str,
-    base: &str,
     info: &RustPrivateModuleInfo,
     current_segments: &[String],
     current_file_rel: &std::path::Path,
@@ -6042,23 +5794,20 @@ fn collect_public_pub_mods(
     use std::path::Path;
     match node.kind() {
         "mod_item" => {
-            // #[path = "..."] でファイル名と module 名がずれる場合、module の解決が壊れるので
-            // index 全体を None にして api.rm を残す (fail-closed)。
-            if rust_mod_item_has_path_attribute(node, source) {
+            if rust_mod_item_has_path_attribute(node, source_bytes) {
                 return None;
             }
             let name = node
                 .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(source).ok())
+                .and_then(|n| n.utf8_text(source_bytes).ok())
                 .map(str::to_string)?;
-            let is_pub = rust_use_declaration_is_pub(node, source);
+            let is_pub = rust_use_declaration_is_pub(node, source_bytes);
             if !is_pub {
-                return Some(()); // 非 pub mod 配下は public-reachable ではない
+                return Some(());
             }
             let mut child_segments = current_segments.to_vec();
             child_segments.push(name.clone());
             result.insert(child_segments.clone());
-            // inline body `mod foo { ... }` を探す: declaration_list 子を再帰 walk
             let mut has_inline_body = false;
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
@@ -6067,10 +5816,10 @@ fn collect_public_pub_mods(
                     let mut inner_cursor = child.walk();
                     for inner in child.named_children(&mut inner_cursor) {
                         collect_public_pub_mods(
-                            inner,
                             source,
+                            inner,
+                            source_bytes,
                             dir,
-                            base,
                             info,
                             &child_segments,
                             current_file_rel,
@@ -6081,33 +5830,29 @@ fn collect_public_pub_mods(
                 }
             }
             if !has_inline_body {
-                // 宣言のみ。子モジュールファイルを resolve して frontier に積む。
                 let parent_dir = current_file_rel
                     .parent()
                     .map(Path::to_path_buf)
                     .unwrap_or_default();
                 let as_mod = parent_dir.join(&name).join("mod.rs");
                 let as_file = parent_dir.join(format!("{name}.rs"));
-                if read_rust_module_source_at_base(dir, base, &info.crate_root_rel, &as_mod)
-                    .is_some()
-                {
+                if read_rust_module_source(source, dir, &info.crate_root_rel, &as_mod).is_some() {
                     frontier.push((child_segments, as_mod));
-                } else if read_rust_module_source_at_base(dir, base, &info.crate_root_rel, &as_file)
+                } else if read_rust_module_source(source, dir, &info.crate_root_rel, &as_file)
                     .is_some()
                 {
                     frontier.push((child_segments, as_file));
                 }
-                // モジュールファイル未解決は無視 (public_modules には登録済み、ただし子 module は辿らない)
             }
         }
         _ => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 collect_public_pub_mods(
-                    child,
                     source,
+                    child,
+                    source_bytes,
                     dir,
-                    base,
                     info,
                     current_segments,
                     current_file_rel,
@@ -6118,17 +5863,6 @@ fn collect_public_pub_mods(
         }
     }
     Some(())
-}
-
-/// `git ls-tree -r --name-only <base> -- <src_root_rel>` で `.rs` ファイル一覧 (repo 相対) を取る。
-/// リファクタ Step 1 で統合 `collect_rust_rs_files(RustSourceTree::Base { rev: base }, ...)` への
-/// 薄い wrapper に置き換えた。
-fn git_ls_tree_rs_files_at_base(
-    dir: &str,
-    base: &str,
-    src_root_rel: &std::path::Path,
-) -> Option<Vec<std::path::PathBuf>> {
-    collect_rust_rs_files(RustSourceTree::Base { rev: base }, dir, src_root_rel)
 }
 
 /// `git show <base>:<file>` で blob を取る (file は repo 相対)。
