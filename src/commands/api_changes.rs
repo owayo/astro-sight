@@ -159,33 +159,441 @@ impl ApiSymbolCandidate {
     }
 }
 
+/// 通常の modified ファイル (old_path / new_path がどちらも `/dev/null` でない) で、
+/// added (新規シンボル) / removed (削除シンボル) / modified (シグネチャ変更) を分類する。
+///
+/// 全ての pub/exported シンボルの組み合わせを評価し、Rust private module 抑制 /
+/// bin-only crate 抑制 / 内部参照 / 同一 diff 内 closed-in-diff / TS optional destructure 等
+/// の各種抑制ルールを適用する。最も複雑な処理パス。
+#[allow(clippy::too_many_arguments)]
+fn process_modified_file(
+    df: &crate::models::impact::DiffFile,
+    dir: &str,
+    base: &str,
+    diff_files: &[crate::models::impact::DiffFile],
+    diff_new_paths: &HashSet<String>,
+    rust_reexport_cache: &mut RustBaseReexportCache,
+    rust_new_reexport_cache: &mut RustWorktreeReexportCache,
+    buckets: &mut ApiChangeBuckets,
+) {
+    // rename 差分では base 側に新パスが存在しないため、旧版は old_path から読む。
+    let old_syms = extract_exported_symbols_from_git(dir, base, &df.old_path);
+    let new_syms = extract_exported_symbols_from_file(dir, &df.new_path);
+
+    let (old_syms, new_syms) = match (old_syms, new_syms) {
+        (Some(o), Some(n)) => (o, n),
+        _ => return,
+    };
+
+    let old_map: std::collections::HashMap<&str, &str> = old_syms
+        .iter()
+        .map(|(name, _kind, sig)| (name.as_str(), sig.as_str()))
+        .collect();
+    let new_map: std::collections::HashMap<&str, (&str, &str)> = new_syms
+        .iter()
+        .map(|(name, kind, sig)| (name.as_str(), (kind.as_str(), sig.as_str())))
+        .collect();
+
+    // 同名シンボルが旧/新いずれかに複数存在する場合、HashMap<name, sig> は最後の 1 件しか
+    // 保持できず、別のオーバーロードや誤パースされた定義同士を突き合わせて api.mod を
+    // 誤検出する。出現回数を数え、複数あるシンボルは曖昧として modified 判定から除外する
+    // (Issue #13: C++ overload / マクロ誤パースの api.mod 誤検出対策)。
+    let mut old_name_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for (name, _, _) in &old_syms {
+        *old_name_counts.entry(name.as_str()).or_default() += 1;
+    }
+    let mut new_name_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for (name, _, _) in &new_syms {
+        *new_name_counts.entry(name.as_str()).or_default() += 1;
+    }
+
+    // 新ファイル内の call 先名を集める。
+    let in_file_callees = extract_in_file_callees(dir, &df.new_path);
+    let is_binary_rust_crate = is_binary_only_rust_crate(dir, &df.new_path);
+
+    // rename 検出用: 同ファイル内に新規追加された全シンボル名を追跡する。
+    let mut new_symbols_in_current_file: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    for (name, kind, sig) in &new_syms {
+        if !old_map.contains_key(name.as_str()) {
+            new_symbols_in_current_file.insert(name.clone());
+            let candidate = ApiSymbolCandidate {
+                name: name.clone(),
+                kind: kind.clone(),
+                file: df.new_path.clone(),
+                signature: sig.clone(),
+            };
+            buckets.all_new_candidates.push(candidate.clone());
+            if is_binary_rust_crate {
+                continue;
+            }
+            if is_rust_new_symbol_outside_public_api_surface(
+                dir,
+                &df.new_path,
+                name,
+                rust_new_reexport_cache,
+            ) {
+                continue;
+            }
+            if is_internally_connected(&in_file_callees, name) {
+                continue;
+            }
+            if is_used_in_diff_paths(dir, name, &df.new_path, diff_new_paths) {
+                continue;
+            }
+            buckets.added.push(candidate);
+        }
+    }
+
+    // Bash スクリプトでは関数定義は `export -f` (または `declare -fx`/`declare -xf`) で
+    // 明示しない限りサブプロセスへ波及しない。
+    let is_bash_old_file = is_bash_script_path(&df.old_path);
+    // TS/JS: 新ツリーで `export { name } from "..."` として re-export されているシンボルは
+    // 利用者から見た API 面が維持されているため api.rm から除外する。
+    let new_reexports = extract_reexported_names_from_file(dir, &df.new_path);
+    for (name, kind, sig) in &old_syms {
+        if !new_map.contains_key(name.as_str()) {
+            if is_rust_old_symbol_outside_public_api_surface(
+                dir,
+                base,
+                &df.old_path,
+                name,
+                rust_reexport_cache,
+            ) {
+                continue;
+            }
+            if new_reexports.contains(name.as_str()) {
+                continue;
+            }
+            // closed-in-diff for api.rm: 同ファイルに新規追加されたシンボルがあり、削除された
+            // シンボルが変更後ツリーで 0 件参照なら「rename + 実装置換」と判断して api.rm から
+            // 除外する。
+            let bash_pure_removal_skip = is_bash_old_file
+                && new_symbols_in_current_file.is_empty()
+                && !bash_function_is_exported_in_git(dir, base, &df.old_path, name);
+            if (!new_symbols_in_current_file.is_empty() || bash_pure_removal_skip)
+                && is_removed_symbol_unreferenced(dir, name)
+            {
+                continue;
+            }
+            // Python の @property → dataclass field 置き換えなら removed 扱いせず
+            // property_to_field に振り替える。
+            if let Some(target_file) = detect_python_property_to_field(dir, name, diff_new_paths) {
+                buckets.property_to_field.push(PropertyToFieldChange {
+                    name: name.clone(),
+                    file: target_file,
+                });
+                continue;
+            }
+            buckets.removed.push(ApiSymbolCandidate {
+                name: name.clone(),
+                kind: kind.clone(),
+                file: df.old_path.clone(),
+                signature: sig.clone(),
+            });
+        }
+    }
+
+    // Rust bin-only crate 判定 (api.mod 抑制用)。lib → bin / bin → lib どちらかが bin-only なら
+    // 外部 API 面の変更ではないとみなす。
+    let is_binary_rust_old_crate_for_mod =
+        is_binary_only_rust_crate_at_base(dir, base, &df.old_path);
+    let is_binary_rust_new_crate_for_mod = is_binary_only_rust_crate(dir, &df.new_path);
+    let skip_mod_for_binary_crate =
+        is_binary_rust_old_crate_for_mod || is_binary_rust_new_crate_for_mod;
+
+    // 値バインディングの value-only 変更を const_value_changes へ振り分けるための言語判定。
+    let lang_id_for_file =
+        crate::language::LangId::from_path(camino::Utf8Path::new(df.new_path.as_str())).ok();
+
+    // 同一 (file, qualname) の modified を重複排除するためのキーセット
+    let mut seen_modified: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    for (name, kind, new_sig) in &new_syms {
+        if let Some(old_sig) = old_map.get(name.as_str())
+            && old_sig != &new_sig.as_str()
+            && seen_modified.insert((df.new_path.clone(), name.clone()))
+        {
+            if skip_mod_for_binary_crate {
+                continue;
+            }
+            // private module 抑制
+            if is_rust_old_symbol_outside_public_api_surface(
+                dir,
+                base,
+                &df.old_path,
+                name,
+                rust_reexport_cache,
+            ) {
+                continue;
+            }
+            // 同名が旧/新いずれかに複数あるシンボルは曖昧として modified から除外
+            if old_name_counts.get(name.as_str()).copied().unwrap_or(0) > 1
+                || new_name_counts.get(name.as_str()).copied().unwrap_or(0) > 1
+            {
+                continue;
+            }
+            // closed-in-diff: 同一ファイル内でしか呼ばれていない関数のシグネチャ変更は除外
+            if is_internally_connected(&in_file_callees, name)
+                && !has_cross_file_refs(dir, &df.new_path, name)
+            {
+                continue;
+            }
+
+            // TS/TSX で「引数なし `()` → 省略可能 destructured 引数」追加は後方互換
+            if is_ts_no_arg_to_optional_destructured_compatible(
+                old_sig,
+                new_sig,
+                dir,
+                base,
+                &df.old_path,
+                &df.new_path,
+                name,
+            ) {
+                continue;
+            }
+
+            let change = ApiSymbolChange {
+                name: name.clone(),
+                kind: kind.clone(),
+                file: df.new_path.clone(),
+                old_signature: Some(old_sig.to_string()),
+                new_signature: Some(new_sig.clone()),
+            };
+            classify_signature_change(
+                change,
+                kind,
+                old_sig,
+                new_sig,
+                dir,
+                base,
+                df,
+                diff_files,
+                lang_id_for_file,
+                buckets,
+            );
+        }
+    }
+}
+
+/// シグネチャ変更を const_value / compatible_modified (React HOC / Object member 削除) /
+/// modified_closed_in_diff / modified のいずれかに分類する。
+#[allow(clippy::too_many_arguments)]
+fn classify_signature_change(
+    change: ApiSymbolChange,
+    kind: &str,
+    old_sig: &str,
+    new_sig: &str,
+    dir: &str,
+    base: &str,
+    df: &crate::models::impact::DiffFile,
+    diff_files: &[crate::models::impact::DiffFile],
+    lang_id_for_file: Option<crate::language::LangId>,
+    buckets: &mut ApiChangeBuckets,
+) {
+    let name = change.name.clone();
+    // const / 非 mut static / export const の値 (initializer) のみ変更は const_value_changes へ
+    if lang_id_for_file.is_some_and(|lid| is_const_value_only_change(old_sig, new_sig, kind, lid)) {
+        buckets.const_value_changes.push(change);
+        return;
+    }
+    // React component を memo / forwardRef 等の HOC でラップしただけは compatible_modified
+    if let Some(compat) = detect_react_wrapper_compatible_mod(
+        dir,
+        base,
+        &df.old_path,
+        &df.new_path,
+        &name,
+        kind,
+        old_sig,
+        new_sig,
+        lang_id_for_file,
+    ) {
+        buckets.compatible_modified.push(compat);
+        return;
+    }
+    // exported object の未参照プロパティ削除も compatible_modified
+    if let Some(compat) = detect_object_members_compatible_mod(
+        dir,
+        base,
+        &df.old_path,
+        &df.new_path,
+        &name,
+        kind,
+        old_sig,
+        new_sig,
+        lang_id_for_file,
+    ) {
+        buckets.compatible_modified.push(compat);
+        return;
+    }
+    // 全 cross-file 参照が同一 diff 内で追随済みなら informational
+    if is_modified_closed_in_diff(dir, &name, base, diff_files) {
+        buckets.modified_closed_in_diff.push(change);
+    } else {
+        buckets.modified.push(change);
+    }
+}
+
+/// 削除ファイル (`new_path == "/dev/null"`) 由来の exported シンボルを `removed` /
+/// `property_to_field` に分類する。
+///
+/// Rust private module / bin-only crate / Bash の未 export 関数 / Python `@property` →
+/// dataclass field 置き換えは `removed` から除外する。
+fn process_deleted_file(
+    df: &crate::models::impact::DiffFile,
+    dir: &str,
+    base: &str,
+    diff_new_paths: &HashSet<String>,
+    rust_reexport_cache: &mut RustBaseReexportCache,
+    buckets: &mut ApiChangeBuckets,
+) {
+    // base が source branch HEAD と同一の場合、`git show base:old_path` は削除済みで
+    // 失敗し None になる。その場合は --diff-file が保持している旧ソース
+    // (deleted_old_source) から AST を組み立てて exported シンボルを抽出する。
+    let old_syms_opt = extract_exported_symbols_from_git(dir, base, &df.old_path).or_else(|| {
+        df.deleted_old_source
+            .as_deref()
+            .and_then(|src| extract_exported_symbols_from_source(&df.old_path, src))
+    });
+    let Some(old_syms) = old_syms_opt else {
+        return;
+    };
+    let is_bash_old_file = is_bash_script_path(&df.old_path);
+    for (name, kind, sig) in &old_syms {
+        if is_rust_old_symbol_outside_public_api_surface(
+            dir,
+            base,
+            &df.old_path,
+            name,
+            rust_reexport_cache,
+        ) {
+            continue;
+        }
+        if is_bash_old_file
+            && !bash_function_is_exported_in_git(dir, base, &df.old_path, name)
+            && is_removed_bash_symbol_unreferenced(dir, name)
+        {
+            continue;
+        }
+        // Python の @property → dataclass field 置き換えなら removed 扱いせず
+        // property_to_field に振り替える。
+        if let Some(target_file) = detect_python_property_to_field(dir, name, diff_new_paths) {
+            buckets.property_to_field.push(PropertyToFieldChange {
+                name: name.clone(),
+                file: target_file,
+            });
+            continue;
+        }
+        buckets.removed.push(ApiSymbolCandidate {
+            name: name.clone(),
+            kind: kind.clone(),
+            file: df.old_path.clone(),
+            signature: sig.clone(),
+        });
+    }
+}
+
+/// 新規ファイル (`old_path == "/dev/null"`) 由来の exported シンボルを `added` /
+/// `all_new_candidates` に分類する。
+///
+/// bin-only crate (`src/lib.rs` なし) / private module / 内部のみ参照 / 同一 diff 内で
+/// 完結したシンボルは `added` から除外する。
+fn process_added_file(
+    df: &crate::models::impact::DiffFile,
+    dir: &str,
+    diff_new_paths: &HashSet<String>,
+    rust_new_reexport_cache: &mut RustWorktreeReexportCache,
+    buckets: &mut ApiChangeBuckets,
+) {
+    let Some(new_syms) = extract_exported_symbols_from_file(dir, &df.new_path) else {
+        return;
+    };
+    let is_binary_rust_crate = is_binary_only_rust_crate(dir, &df.new_path);
+    let in_file_callees = extract_in_file_callees(dir, &df.new_path);
+    for (name, kind, sig) in &new_syms {
+        let candidate = ApiSymbolCandidate {
+            name: name.clone(),
+            kind: kind.clone(),
+            file: df.new_path.clone(),
+            signature: sig.clone(),
+        };
+        buckets.all_new_candidates.push(candidate.clone());
+        if is_binary_rust_crate {
+            continue;
+        }
+        if is_rust_new_symbol_outside_public_api_surface(
+            dir,
+            &df.new_path,
+            name,
+            rust_new_reexport_cache,
+        ) {
+            continue;
+        }
+        if is_internally_connected(&in_file_callees, name) {
+            continue;
+        }
+        if is_used_in_diff_paths(dir, name, &df.new_path, diff_new_paths) {
+            continue;
+        }
+        buckets.added.push(candidate);
+    }
+}
+
+/// API 差分検出から除外すべき diff ファイルかを判定する。
+///
+/// - 信頼境界外のトラバーサルパスを `dir.join()` で読まないよう、絶対パスや `..` を
+///   含むパスは拒否する。
+/// - `.gitattributes` の `linguist-generated` 指定ファイルは検出対象外。
+/// - ファイル先頭の自動生成マーカーコメントが付くファイルも対象外。
+fn should_skip_diff_file(
+    df: &crate::models::impact::DiffFile,
+    gitattrs: &crate::engine::gitattributes::GitAttributes,
+    canonical_dir: Option<&std::path::Path>,
+) -> bool {
+    if df.new_path != "/dev/null" && !crate::engine::impact::is_safe_diff_path(&df.new_path) {
+        return true;
+    }
+    if df.old_path != "/dev/null" && !crate::engine::impact::is_safe_diff_path(&df.old_path) {
+        return true;
+    }
+    if gitattrs.is_generated(&df.new_path) || gitattrs.is_generated(&df.old_path) {
+        return true;
+    }
+    if let Some(root) = canonical_dir
+        && df.new_path != "/dev/null"
+    {
+        let full = root.join(&df.new_path);
+        if crate::engine::generated::is_auto_generated(&full) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `detect_api_changes` の各バケット。`reconcile_with_moves` /
+/// `partition_removed_dead_candidates` で最終分類する前の中間状態。
+#[derive(Default)]
+pub(crate) struct ApiChangeBuckets {
+    pub(crate) added: Vec<ApiSymbolCandidate>,
+    pub(crate) removed: Vec<ApiSymbolCandidate>,
+    pub(crate) modified: Vec<ApiSymbolChange>,
+    pub(crate) modified_closed_in_diff: Vec<ApiSymbolChange>,
+    pub(crate) const_value_changes: Vec<ApiSymbolChange>,
+    pub(crate) compatible_modified: Vec<CompatibleApiModification>,
+    pub(crate) all_new_candidates: Vec<ApiSymbolCandidate>,
+    pub(crate) property_to_field: Vec<PropertyToFieldChange>,
+}
+
 pub(crate) fn detect_api_changes(
     dir: &str,
     base: &str,
     diff_files: &[crate::models::impact::DiffFile],
 ) -> ApiChanges {
-    let mut added: Vec<ApiSymbolCandidate> = Vec::new();
-    let mut removed: Vec<ApiSymbolCandidate> = Vec::new();
-    let mut modified: Vec<ApiSymbolChange> = Vec::new();
-    // 全 cross-file 参照が同一 diff 内で追随済みの api.mod (informational)。
-    let mut modified_closed_in_diff: Vec<ApiSymbolChange> = Vec::new();
-    // const / 非 mut static / export const の値 (initializer) のみ変更で shape (名前・型・
-    // visibility) は不変な api.mod。コンパイル互換性を壊さないため別カテゴリに分離する
-    // (Issue 2026-06-02-balance-const-value-changes 対応)。
-    let mut const_value_changes: Vec<ApiSymbolChange> = Vec::new();
-    // 互換性ありと判定された api.mod (React HOC ラップ / 未参照プロパティ削除)。非 blocking。
-    let mut compatible_modified: Vec<CompatibleApiModification> = Vec::new();
-    // 移動検出用に「フィルタ前の新規側候補」を全件追跡する。`is_used_in_diff_paths` 等で
-    // `added` から除外された候補も `removed` との突き合わせには利用したいため、
-    // フィルタ適用前の候補を別バケットに溜めておく。module → package 化 (cli.py →
-    // cli/__init__.py + cli/_commands/*.py) のように、新規ファイル側のシンボルが
-    // 同 diff 内の別ファイルから参照されて `added` から消える典型ケースで、対応する
-    // `removed` を `moved` として相殺するために使う。
-    let mut all_new_candidates: Vec<ApiSymbolCandidate> = Vec::new();
-    // Python の `@property def x(self)` を `@dataclass` フィールド `x: T` に置き換えた
-    // ケースを informational として残す。`obj.x` の属性 API は維持されるため `removed`
-    // からは除外し、`property_to_field` カテゴリに移す。
-    let mut property_to_field: Vec<PropertyToFieldChange> = Vec::new();
+    let mut buckets = ApiChangeBuckets::default();
     // api.rm の Rust private module 抑制で base 側 re-export index を base+crate 単位に再利用する。
     let mut rust_reexport_cache = RustBaseReexportCache::default();
     // api.add 経路では new (working tree) 側 crate を 1 度走査して edge graph を構築する。
@@ -207,415 +615,43 @@ pub(crate) fn detect_api_changes(
 
     let canonical_dir = std::fs::canonicalize(dir).ok();
     for df in diff_files {
-        // 信頼境界外の diff パスを `dir.join()` で読まないよう、絶対パス・トラバーサル
-        // を含むパスはここで弾く。下流の `extract_exported_symbols_from_file` でも
-        // 多層防御として再チェックしている。
-        if df.new_path != "/dev/null" && !crate::engine::impact::is_safe_diff_path(&df.new_path) {
+        if should_skip_diff_file(df, &gitattrs, canonical_dir.as_deref()) {
             continue;
-        }
-        if df.old_path != "/dev/null" && !crate::engine::impact::is_safe_diff_path(&df.old_path) {
-            continue;
-        }
-        // 新旧いずれかが生成物扱いなら API 変更検出の対象外
-        if gitattrs.is_generated(&df.new_path) || gitattrs.is_generated(&df.old_path) {
-            continue;
-        }
-        // ファイル先頭の自動生成マーカーコメントでも除外する
-        if let Some(root) = &canonical_dir
-            && df.new_path != "/dev/null"
-        {
-            let full = root.join(&df.new_path);
-            if crate::engine::generated::is_auto_generated(&full) {
-                continue;
-            }
         }
 
         if df.old_path == "/dev/null" {
-            if let Some(new_syms) = extract_exported_symbols_from_file(dir, &df.new_path) {
-                // bin-only crate (src/lib.rs なし) の pub シンボルは crate 外から構造的に
-                // 到達できないため api.add 対象外。private module 抑制は symbol 単位 (loop 内)。
-                let is_binary_rust_crate = is_binary_only_rust_crate(dir, &df.new_path);
-                let in_file_callees = extract_in_file_callees(dir, &df.new_path);
-                for (name, kind, sig) in &new_syms {
-                    let candidate = ApiSymbolCandidate {
-                        name: name.clone(),
-                        kind: kind.clone(),
-                        file: df.new_path.clone(),
-                        signature: sig.clone(),
-                    };
-                    // 移動検出には全候補を必要とするので、フィルタ前に積む。
-                    all_new_candidates.push(candidate.clone());
-                    if is_binary_rust_crate {
-                        continue;
-                    }
-                    // private module 配下でも、別の public-reachable module から `pub use` で
-                    // re-export 公開されているシンボルは api.add 対象として残す (Issue
-                    // 2026-06-05-rust-api-add-private-module-reexport-edge-graph 対応)。
-                    // api.rm / api.mod と同じ edge graph + 固定点伝播で判定する。
-                    if is_rust_new_symbol_outside_public_api_surface(
-                        dir,
-                        &df.new_path,
-                        name,
-                        &mut rust_new_reexport_cache,
-                    ) {
-                        continue;
-                    }
-                    if is_internally_connected(&in_file_callees, name) {
-                        continue;
-                    }
-                    // 同一 diff 内の別ファイルから参照されている新規シンボルは
-                    // 「コミット内で完結」として api.add から除外する。
-                    if is_used_in_diff_paths(dir, name, &df.new_path, &diff_new_paths) {
-                        continue;
-                    }
-                    added.push(candidate);
-                }
-            }
+            process_added_file(
+                df,
+                dir,
+                &diff_new_paths,
+                &mut rust_new_reexport_cache,
+                &mut buckets,
+            );
             continue;
         }
 
         if df.new_path == "/dev/null" {
-            // base が source branch HEAD と同一 (例: CI が source branch を checkout した直後で
-            // base コミット引数も HEAD のまま) の場合、`git show base:old_path` は削除済みで
-            // 失敗し None になる。その場合は --diff-file が保持している旧ソース (deleted_old_source)
-            // から AST を組み立てて exported シンボルを抽出するフォールバックを試す。
-            let old_syms_opt =
-                extract_exported_symbols_from_git(dir, base, &df.old_path).or_else(|| {
-                    df.deleted_old_source
-                        .as_deref()
-                        .and_then(|src| extract_exported_symbols_from_source(&df.old_path, src))
-                });
-            if let Some(old_syms) = old_syms_opt {
-                // Bash ファイル丸ごと削除のケース（CLI スクリプトを別言語に書き換え等）でも
-                // 未 export 関数は外部 API 面ではない。新ツリー全体で参照 0 件なら同一 diff
-                // 内で完結した削除と判断して api.rm から除外する。
-                let is_bash_old_file = is_bash_script_path(&df.old_path);
-                // Rust bin-only crate (`[[bin]]` のみで `[lib]` なし) の `pub fn`、および
-                // crate-private module (`mod foo`、`pub mod` 経路で到達不能) 配下の `pub fn` は
-                // クレート外から構造的に到達できないため、削除されても外部 API の破壊にはならない。
-                // `api.add` (new 側) / `api.mod` (old/new 両側) の private module 抑制と対称に
-                // `api.rm` 側でも除外する。`api.rm` は旧 API 面の判定なので base リビジョン側で
-                // 見る (新ツリーで src/lib.rs や mod 宣言を削除したケースでも誤抑制しないため)。
-                for (name, kind, sig) in &old_syms {
-                    if is_rust_old_symbol_outside_public_api_surface(
-                        dir,
-                        base,
-                        &df.old_path,
-                        name,
-                        &mut rust_reexport_cache,
-                    ) {
-                        continue;
-                    }
-                    if is_bash_old_file
-                        && !bash_function_is_exported_in_git(dir, base, &df.old_path, name)
-                        && is_removed_bash_symbol_unreferenced(dir, name)
-                    {
-                        continue;
-                    }
-                    // Python の @property → dataclass field 置き換えなら removed
-                    // 扱いせず property_to_field に振り替える。
-                    if let Some(target_file) =
-                        detect_python_property_to_field(dir, name, &diff_new_paths)
-                    {
-                        property_to_field.push(PropertyToFieldChange {
-                            name: name.clone(),
-                            file: target_file,
-                        });
-                        continue;
-                    }
-                    removed.push(ApiSymbolCandidate {
-                        name: name.clone(),
-                        kind: kind.clone(),
-                        file: df.old_path.clone(),
-                        signature: sig.clone(),
-                    });
-                }
-            }
+            process_deleted_file(
+                df,
+                dir,
+                base,
+                &diff_new_paths,
+                &mut rust_reexport_cache,
+                &mut buckets,
+            );
             continue;
         }
 
-        // rename 差分では base 側に新パスが存在しないため、旧版は old_path から読む。
-        let old_syms = extract_exported_symbols_from_git(dir, base, &df.old_path);
-        let new_syms = extract_exported_symbols_from_file(dir, &df.new_path);
-
-        let (old_syms, new_syms) = match (old_syms, new_syms) {
-            (Some(o), Some(n)) => (o, n),
-            _ => continue,
-        };
-
-        let old_map: std::collections::HashMap<&str, &str> = old_syms
-            .iter()
-            .map(|(name, _kind, sig)| (name.as_str(), sig.as_str()))
-            .collect();
-        let new_map: std::collections::HashMap<&str, (&str, &str)> = new_syms
-            .iter()
-            .map(|(name, kind, sig)| (name.as_str(), (kind.as_str(), sig.as_str())))
-            .collect();
-
-        // 同名シンボルが旧/新いずれかに複数存在する場合、HashMap<name, sig> は最後の 1 件しか
-        // 保持できず、別のオーバーロードや誤パースされた定義同士を突き合わせて api.mod を
-        // 誤検出する。出現回数を数え、複数あるシンボルは曖昧として modified 判定から除外する
-        // (Issue #13: C++ overload / マクロ誤パースの api.mod 誤検出対策)。
-        let mut old_name_counts: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-        for (name, _, _) in &old_syms {
-            *old_name_counts.entry(name.as_str()).or_default() += 1;
-        }
-        let mut new_name_counts: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-        for (name, _, _) in &new_syms {
-            *new_name_counts.entry(name.as_str()).or_default() += 1;
-        }
-
-        // 新ファイル内の call 先名を集める。同一ファイル内から呼ばれている新規関数は
-        // 「内部ヘルパー」として api.add から除外する（Bash スクリプトのトップレベル関数や
-        // Python の同一ファイル内で接続済みの private 関数が api.add に出る誤検出対策）。
-        let in_file_callees = extract_in_file_callees(dir, &df.new_path);
-
-        // bin-only crate (src/lib.rs なし) の pub シンボルは外部到達不能のため api.add 対象外。
-        // private module 抑制は symbol 単位 (loop 内) で edge graph 判定する。
-        let is_binary_rust_crate = is_binary_only_rust_crate(dir, &df.new_path);
-
-        // rename 検出用: 同ファイル内に新規追加された全シンボル名を追跡する
-        // （internally_connected で除外される内部ヘルパーも含む）。削除シンボルと
-        // 組み合わせて「rename + 実装置換」の api.rm ノイズを抑止する。
-        let mut new_symbols_in_current_file: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-
-        for (name, kind, sig) in &new_syms {
-            if !old_map.contains_key(name.as_str()) {
-                new_symbols_in_current_file.insert(name.clone());
-                let candidate = ApiSymbolCandidate {
-                    name: name.clone(),
-                    kind: kind.clone(),
-                    file: df.new_path.clone(),
-                    signature: sig.clone(),
-                };
-                // 移動検出には全候補を必要とするので、フィルタ前に積む。
-                all_new_candidates.push(candidate.clone());
-                if is_binary_rust_crate {
-                    continue;
-                }
-                // private module 配下でも別 public module 経由 re-export なら api.add に残す。
-                if is_rust_new_symbol_outside_public_api_surface(
-                    dir,
-                    &df.new_path,
-                    name,
-                    &mut rust_new_reexport_cache,
-                ) {
-                    continue;
-                }
-                // qualname または bare name が同一ファイル内の call に存在すれば内部参照
-                if is_internally_connected(&in_file_callees, name) {
-                    continue;
-                }
-                // 同一 diff 内の別ファイルから参照されている新規シンボルは
-                // 「コミット内で完結」として api.add から除外する（pub struct の import 等）。
-                if is_used_in_diff_paths(dir, name, &df.new_path, &diff_new_paths) {
-                    continue;
-                }
-                added.push(candidate);
-            }
-        }
-
-        // Bash スクリプトでは関数定義は `export -f` (または `declare -fx`/`declare -xf`) で
-        // 明示しない限りサブプロセスへ波及しない。CLI スクリプト内のローカルヘルパーが
-        // 同一 diff 内で削除されたとき、純粋な関数削除（同ファイルに新規追加なし）でも
-        // api.rm から除外できるよう、bash ファイルかつ未 export 関数のときは closed-in-diff
-        // ロジックを純粋削除にも拡張する。`export -f` 済み関数は他リポジトリ消費者向け
-        // API として残す。
-        let is_bash_old_file = is_bash_script_path(&df.old_path);
-        // Rust bin-only crate (`[[bin]]` のみで `[lib]` なし) の `pub fn`、および crate-private
-        // module (`mod foo`) 配下の `pub fn` は外部から到達できないため、削除されても破壊的
-        // API 変更にはならない。`api.add` / `api.mod` 側と対称に api.rm でも除外する
-        // (Issue 2026-05-19-api-rm-bin-crate-dead-cleanup / 2026-06-05-wifi-module-removal 対応)。
-        // `api.rm` は旧 API 面の判定なので、`base` リビジョン時点で見る。
-        // TS/JS: 新ツリーで `export { name } from "..."` として re-export (forwarding)
-        // されているシンボルは、利用者から見た API 面 (import path から取れる名前) が
-        // 維持されているため api.rm から除外する。ローカル定義を別モジュールへ移動し
-        // re-export を残すリファクタの誤検出対策。`export * from` は名前不明のため対象外。
-        let new_reexports = extract_reexported_names_from_file(dir, &df.new_path);
-        for (name, kind, sig) in &old_syms {
-            if !new_map.contains_key(name.as_str()) {
-                if is_rust_old_symbol_outside_public_api_surface(
-                    dir,
-                    base,
-                    &df.old_path,
-                    name,
-                    &mut rust_reexport_cache,
-                ) {
-                    continue;
-                }
-                if new_reexports.contains(name.as_str()) {
-                    continue;
-                }
-                // closed-in-diff for api.rm: 同ファイルに新規追加されたシンボルがあり、
-                // 削除されたシンボルが変更後ツリーで 0 件参照なら「rename + 実装置換」
-                // と判断して api.rm から除外する。caller は同一 diff 内で追随済み。
-                // 純粋な関数削除（新規追加がない）は api.rm に残す。
-                let bash_pure_removal_skip = is_bash_old_file
-                    && new_symbols_in_current_file.is_empty()
-                    && !bash_function_is_exported_in_git(dir, base, &df.old_path, name);
-                if (!new_symbols_in_current_file.is_empty() || bash_pure_removal_skip)
-                    && is_removed_symbol_unreferenced(dir, name)
-                {
-                    continue;
-                }
-                // Python の @property → dataclass field 置き換えなら removed 扱い
-                // せず property_to_field に振り替える。
-                if let Some(target_file) =
-                    detect_python_property_to_field(dir, name, &diff_new_paths)
-                {
-                    property_to_field.push(PropertyToFieldChange {
-                        name: name.clone(),
-                        file: target_file,
-                    });
-                    continue;
-                }
-                removed.push(ApiSymbolCandidate {
-                    name: name.clone(),
-                    kind: kind.clone(),
-                    // 削除シンボルの出所は旧ファイルパス
-                    file: df.old_path.clone(),
-                    signature: sig.clone(),
-                });
-            }
-        }
-
-        // Rust bin-only crate (`[[bin]]` のみで `[lib]` も `src/lib.rs` も持たない) の
-        // `pub fn` シグネチャ変更は外部公開 API の互換性問題ではなく内部リファクタ。
-        // `api.add` / `api.rm` 側と対称に `api.mod` 側でも除外する
-        // (Issue 2026-05-20-api-mod-callers-updated-in-same-commit 対応)。
-        //
-        // 同コミットで lib → bin / bin → lib に crate type を変えた edge ケースは
-        // どちらかが bin-only と判定された時点で「外部 API 面の変更ではない」と扱う方が
-        // false positive を減らせる (codex 設計相談で「old または new のどちらかが
-        // bin-only なら api.mod から除外」が筋良いと判定)。
-        let is_binary_rust_old_crate_for_mod =
-            is_binary_only_rust_crate_at_base(dir, base, &df.old_path);
-        let is_binary_rust_new_crate_for_mod = is_binary_only_rust_crate(dir, &df.new_path);
-        // bin-only crate (`[[bin]]` のみで `[lib]` も `src/lib.rs` も持たない) の `pub fn`
-        // シグネチャ変更は外部公開 API の互換性問題ではない。ファイル単位で skip を確定できる。
-        let skip_mod_for_binary_crate =
-            is_binary_rust_old_crate_for_mod || is_binary_rust_new_crate_for_mod;
-
-        // 値バインディングの value-only 変更を const_value_changes へ振り分けるための言語判定。
-        let lang_id_for_file =
-            crate::language::LangId::from_path(camino::Utf8Path::new(df.new_path.as_str())).ok();
-
-        // 同一 (file, qualname) の modified を重複排除するためのキーセット
-        let mut seen_modified: std::collections::HashSet<(String, String)> =
-            std::collections::HashSet::new();
-        for (name, kind, new_sig) in &new_syms {
-            if let Some(old_sig) = old_map.get(name.as_str())
-                && old_sig != &new_sig.as_str()
-                && seen_modified.insert((df.new_path.clone(), name.clone()))
-            {
-                if skip_mod_for_binary_crate {
-                    continue;
-                }
-                // private module 抑制: api.rm と同じ re-export edge graph + 固定点伝播で、
-                // 公開到達不能と確定したシンボルのみ api.mod から除外する (codex Warning #4 対応)。
-                // 二段 re-export 経由で外部公開されているシンボルの破壊的 signature 変更は
-                // blocking を維持する。fail-closed: index 構築失敗時は除外せず modified に残す。
-                if is_rust_old_symbol_outside_public_api_surface(
-                    dir,
-                    base,
-                    &df.old_path,
-                    name,
-                    &mut rust_reexport_cache,
-                ) {
-                    continue;
-                }
-                // 同名が旧/新いずれかに複数あるシンボルは、別の定義同士を突き合わせている
-                // 可能性があり曖昧なので modified から除外する (Issue #13)。
-                if old_name_counts.get(name.as_str()).copied().unwrap_or(0) > 1
-                    || new_name_counts.get(name.as_str()).copied().unwrap_or(0) > 1
-                {
-                    continue;
-                }
-                // closed-in-diff: 同一ファイル内でしか呼ばれていない関数のシグネチャ変更は
-                // caller の追随が同一 diff 内で完結するため、api.mod から除外する。
-                // bash エントリポイントのローカル関数や Python CLI スクリプト内部関数の
-                // シグネチャ変更がレビューノイズになる問題への対策。
-                // added 側の `is_internally_connected` フィルタと対称。
-                if is_internally_connected(&in_file_callees, name)
-                    && !has_cross_file_refs(dir, &df.new_path, name)
-                {
-                    continue;
-                }
-
-                // TS/TSX で「引数なし `()` → 省略可能 destructured 引数 `({}: T)` /
-                // `({}: T = {})` 追加」は呼び出し側 (`foo()` / `<Foo />`) に影響しない
-                // 後方互換変更のため api.mod から除外する
-                // (Issue 2026-05-28-meet-virtual-you-frontend-modernize 対応)。
-                if is_ts_no_arg_to_optional_destructured_compatible(
-                    old_sig,
-                    new_sig,
-                    dir,
-                    base,
-                    &df.old_path,
-                    &df.new_path,
-                    name,
-                ) {
-                    continue;
-                }
-
-                let change = ApiSymbolChange {
-                    name: name.clone(),
-                    kind: kind.clone(),
-                    file: df.new_path.clone(),
-                    old_signature: Some(old_sig.to_string()),
-                    new_signature: Some(new_sig.clone()),
-                };
-                // const / 非 mut static / export const の値 (initializer) のみ変更で shape
-                // (名前・型・visibility) が不変なら、コンパイル互換性を壊さないため
-                // const_value_changes (informational) に振り分ける。
-                if lang_id_for_file
-                    .is_some_and(|lid| is_const_value_only_change(old_sig, new_sig, kind, lid))
-                {
-                    const_value_changes.push(change);
-                }
-                // React component を `memo` / `forwardRef` 等の HOC でラップしただけで
-                // export 名・props 型・JSX 利用互換性が維持されるケースは、公開契約が
-                // 変わらないため compatible_modified (informational) に降格する。
-                else if let Some(compat) = detect_react_wrapper_compatible_mod(
-                    dir,
-                    base,
-                    &df.old_path,
-                    &df.new_path,
-                    name,
-                    kind,
-                    old_sig,
-                    new_sig,
-                    lang_id_for_file,
-                ) {
-                    compatible_modified.push(compat);
-                }
-                // exported object のプロパティ削除で、削除されたメンバーへの member-access が
-                // repo 全体で 0 件なら破壊的でないため compatible に降格する。
-                else if let Some(compat) = detect_object_members_compatible_mod(
-                    dir,
-                    base,
-                    &df.old_path,
-                    &df.new_path,
-                    name,
-                    kind,
-                    old_sig,
-                    new_sig,
-                    lang_id_for_file,
-                ) {
-                    compatible_modified.push(compat);
-                }
-                // 全 cross-file 参照が同一 diff 内の変更 hunk で追随済みなら、呼び出し側は
-                // 同一コミットで更新済み。破壊的でないため informational に降格する。
-                else if is_modified_closed_in_diff(dir, name, base, diff_files) {
-                    modified_closed_in_diff.push(change);
-                } else {
-                    modified.push(change);
-                }
-            }
-        }
+        process_modified_file(
+            df,
+            dir,
+            base,
+            diff_files,
+            &diff_new_paths,
+            &mut rust_reexport_cache,
+            &mut rust_new_reexport_cache,
+            &mut buckets,
+        );
     }
 
     // git の rename detection が効かない diff (外部供給 / 非 git 入力 / 設定で無効化された
@@ -624,7 +660,8 @@ pub(crate) fn detect_api_changes(
     // `is_used_in_diff_paths` 等で `added` から外れた候補も含まれるため、module → package
     // 化のように新規ファイル側のシンボルが同 diff 内の `__init__.py` 等から参照されて
     // `added` に乗らないケースでも `removed` を相殺できる。
-    let (added, removed, moved) = reconcile_with_moves(added, removed, all_new_candidates);
+    let (added, removed, moved) =
+        reconcile_with_moves(buckets.added, buckets.removed, buckets.all_new_candidates);
 
     // removed のうち HEAD ツリーで他ファイル参照 0 件のものを `removed_dead` に振り分け。
     // 「base 時点で dead だった symbol の整理」だけでなく「base alive → HEAD で関連
@@ -648,16 +685,16 @@ pub(crate) fn detect_api_changes(
             .into_iter()
             .map(|c| c.into_api_symbol())
             .collect(),
-        modified,
+        modified: buckets.modified,
         moved,
-        property_to_field,
+        property_to_field: buckets.property_to_field,
         removed_dead: removed_dead
             .into_iter()
             .map(|c| c.into_api_symbol())
             .collect(),
-        modified_closed_in_diff,
-        const_value_changes,
-        compatible_modified,
+        modified_closed_in_diff: buckets.modified_closed_in_diff,
+        const_value_changes: buckets.const_value_changes,
+        compatible_modified: buckets.compatible_modified,
     }
 }
 
@@ -3037,7 +3074,6 @@ pub(crate) fn is_used_in_diff_paths(
 mod rust_public;
 
 pub(crate) use rust_public::*;
-
 
 /// `name` が `file_path` 以外のファイルから参照されているかを判定する。
 /// 参照検索に失敗した場合は保守的に true（＝外部参照ありとみなす）を返し、
