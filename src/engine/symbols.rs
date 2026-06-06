@@ -477,6 +477,100 @@ pub(crate) fn collect_reexported_names(
     names
 }
 
+/// Rust の `pub use` 再エクスポート (`pub use sub::name;` / `pub use sub::{A, B};` /
+/// `pub use sub::name as alias;`) で **このファイルから提供される export 名** の集合を返す
+/// (alias があれば alias 名)。`pub use sub::*;` (wildcard) は名前が静的に不明なため対象外。
+/// `pub(crate)` / `pub(super)` 等の制限付き公開は外部利用者から見えないため対象外。
+///
+/// api.rm 抑制に使う: TS/JS の named re-export と同じ思想で、定義を子モジュールへ移動して
+/// 親モジュールで `pub use sub::name;` を残しているケースは、利用者から見た公開 API
+/// (`crate::parent::name`) が維持されているため「削除」ではない。
+pub(crate) fn collect_rust_reexported_names(
+    root: Node,
+    source: &[u8],
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() != "use_declaration" {
+            continue;
+        }
+        // pub のみ (pub(crate) / pub(super) 等は外部公開ではない)
+        if !rust_use_is_public(child, source) {
+            continue;
+        }
+        let Some(argument) = child.child_by_field_name("argument") else {
+            continue;
+        };
+        collect_rust_use_tree_names(argument, source, &mut names);
+    }
+    names
+}
+
+/// `pub use ...` (修飾子なしの `pub`) かを判定する。`pub(crate)` 等は内部公開で対象外。
+fn rust_use_is_public(use_decl: Node, source: &[u8]) -> bool {
+    let mut cursor = use_decl.walk();
+    for child in use_decl.children(&mut cursor) {
+        if child.kind() == "visibility_modifier"
+            && let Ok(text) = child.utf8_text(source)
+        {
+            return text.trim() == "pub";
+        }
+    }
+    false
+}
+
+/// use_tree の各 variant を歩いて、最終的に外部に露出される名前 (末端 identifier または
+/// `as alias` の alias 名) を集める。
+fn collect_rust_use_tree_names(
+    node: Node,
+    source: &[u8],
+    names: &mut std::collections::HashSet<String>,
+) {
+    match node.kind() {
+        // `pub use foo::bar;` → bar が公開される
+        "scoped_identifier" => {
+            if let Some(name) = node.child_by_field_name("name")
+                && let Ok(text) = name.utf8_text(source)
+            {
+                names.insert(text.to_string());
+            }
+        }
+        // `pub use foo;` → foo が公開される
+        "identifier" => {
+            if let Ok(text) = node.utf8_text(source) {
+                names.insert(text.to_string());
+            }
+        }
+        // `pub use foo::bar as baz;` → baz (alias) が公開される
+        "use_as_clause" => {
+            if let Some(alias) = node.child_by_field_name("alias")
+                && let Ok(text) = alias.utf8_text(source)
+            {
+                names.insert(text.to_string());
+            }
+        }
+        // `pub use foo::{A, B as C};` — list 配下の各 item を再帰的に走査
+        "scoped_use_list" => {
+            if let Some(list) = node.child_by_field_name("list") {
+                let mut cursor = list.walk();
+                for child in list.children(&mut cursor) {
+                    collect_rust_use_tree_names(child, source, names);
+                }
+            }
+        }
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_rust_use_tree_names(child, source, names);
+            }
+        }
+        // `pub use foo::*;` — 名前が静的に解決できないため fail-open を避けて対象外
+        "use_wildcard" => {}
+        _ => {}
+    }
+}
+
 /// Rust: visibility_modifier (pub) または impl ブロック所属をチェック。
 ///
 /// - `pub fn` → エクスポート
@@ -2268,6 +2362,88 @@ mod tests {
             names.is_empty(),
             "ローカル export は re-export でない: {names:?}"
         );
+    }
+
+    /// Rust の `pub use` 再エクスポート抽出ヘルパー。
+    fn collect_rust_reexports(source: &str) -> std::collections::HashSet<String> {
+        let language = LangId::Rust.ts_language();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        super::collect_rust_reexported_names(tree.root_node(), source.as_bytes())
+    }
+
+    #[test]
+    fn collect_rust_reexports_single_scoped_identifier() {
+        // `pub use sub::name;` → name が公開される
+        let names = collect_rust_reexports("pub use sub::name;");
+        assert!(names.contains("name"), "got: {names:?}");
+        assert_eq!(names.len(), 1, "他の名前は含まない: {names:?}");
+    }
+
+    #[test]
+    fn collect_rust_reexports_group_use_list() {
+        // `pub use sub::{A, B};` → A, B が公開される
+        let names = collect_rust_reexports("pub use sub::{A, B};");
+        assert!(names.contains("A"), "got: {names:?}");
+        assert!(names.contains("B"), "got: {names:?}");
+        assert_eq!(names.len(), 2, "他の名前は含まない: {names:?}");
+    }
+
+    #[test]
+    fn collect_rust_reexports_use_as_alias() {
+        // `pub use sub::name as alias;` → alias が公開される (name は含まれない)
+        let names = collect_rust_reexports("pub use sub::name as alias;");
+        assert!(names.contains("alias"), "alias を公開: {names:?}");
+        assert!(!names.contains("name"), "元の name は対象外: {names:?}");
+    }
+
+    #[test]
+    fn collect_rust_reexports_group_with_alias() {
+        // `pub use sub::{A, B as C};` → A, C が公開される
+        let names = collect_rust_reexports("pub use sub::{A, B as C};");
+        assert!(names.contains("A"), "got: {names:?}");
+        assert!(names.contains("C"), "alias 後の C: {names:?}");
+        assert!(!names.contains("B"), "alias 前の B は対象外: {names:?}");
+    }
+
+    #[test]
+    fn collect_rust_reexports_wildcard_is_ignored() {
+        // `pub use sub::*;` は名前が静的に解決できないため対象外 (fail-open 回避)
+        let names = collect_rust_reexports("pub use sub::*;");
+        assert!(names.is_empty(), "wildcard は対象外: {names:?}");
+    }
+
+    #[test]
+    fn collect_rust_reexports_pub_crate_is_not_public() {
+        // `pub(crate) use` は内部公開で外部利用者から見えないため対象外
+        let names = collect_rust_reexports("pub(crate) use sub::name;");
+        assert!(names.is_empty(), "pub(crate) は対象外: {names:?}");
+    }
+
+    #[test]
+    fn collect_rust_reexports_private_use_is_ignored() {
+        // `use sub::name;` (private) は import であり re-export ではない
+        let names = collect_rust_reexports("use sub::name;");
+        assert!(names.is_empty(), "private use は対象外: {names:?}");
+    }
+
+    #[test]
+    fn collect_rust_reexports_multiple_declarations() {
+        // 複数の pub use 宣言をまとめて収集する
+        let source = "mod common;\n\
+                      pub use common::{MAX_INPUT_SIZE, classify_error};\n\
+                      pub use common::serialize_output;\n\
+                      pub(crate) use common::internal;\n";
+        let names = collect_rust_reexports(source);
+        assert!(names.contains("MAX_INPUT_SIZE"), "got: {names:?}");
+        assert!(names.contains("classify_error"), "got: {names:?}");
+        assert!(names.contains("serialize_output"), "got: {names:?}");
+        assert!(
+            !names.contains("internal"),
+            "pub(crate) は対象外: {names:?}"
+        );
+        assert_eq!(names.len(), 3, "got: {names:?}");
     }
 
     #[test]

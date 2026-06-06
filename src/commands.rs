@@ -2566,12 +2566,14 @@ fn extract_reexported_names_from_file(
     let Ok(lang_id) = crate::language::LangId::from_path(utf8_path) else {
         return std::collections::HashSet::new();
     };
-    // re-export 構文 (`export { x } from "..."`) を持つのは TS/JS のみ。
+    // 現状 re-export 認識を実装している言語のみ対象 (TS/JS の `export { x } from "..."`,
+    // Rust の `pub use sub::x;`)。他言語は将来対応。
     if !matches!(
         lang_id,
         crate::language::LangId::Typescript
             | crate::language::LangId::Tsx
             | crate::language::LangId::Javascript
+            | crate::language::LangId::Rust
     ) {
         return std::collections::HashSet::new();
     }
@@ -2581,7 +2583,12 @@ fn extract_reexported_names_from_file(
     let Ok(tree) = parser::parse_source(&source, lang_id) else {
         return std::collections::HashSet::new();
     };
-    crate::engine::symbols::collect_reexported_names(tree.root_node(), &source)
+    match lang_id {
+        crate::language::LangId::Rust => {
+            crate::engine::symbols::collect_rust_reexported_names(tree.root_node(), &source)
+        }
+        _ => crate::engine::symbols::collect_reexported_names(tree.root_node(), &source),
+    }
 }
 
 /// dead_symbols のうち、宣言行が今回の diff の追加行 (`+` 行) と重なるもののみを残す。

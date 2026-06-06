@@ -2534,6 +2534,138 @@ fn detect_api_changes_public_module_pub_fn_included_in_added() {
     );
 }
 
+/// commands.rs を子モジュールに分割し、親で `pub use sub::name;` で再エクスポートした
+/// ケース。利用者から見た公開 API (`crate::name`) は維持されているため `api.rm` に出さない。
+/// (2026-06-06 trace report: Rust pub use re-export を api.rm 抑制対象に追加)
+#[test]
+fn detect_api_changes_rust_pub_use_reexport_excludes_api_rm() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    // base: lib.rs に pub fn を直接定義
+    git_commit_files(
+        repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub const MAX_INPUT_SIZE: usize = 100;\npub fn serialize_output() {}\n",
+            ),
+        ],
+        "base",
+    );
+    // new: 定義を子モジュールに移動し、lib.rs で pub use 再エクスポート
+    fs::write(
+        repo.join("src/lib.rs"),
+        "mod common;\n\
+         pub use common::{MAX_INPUT_SIZE, serialize_output};\n",
+    )
+    .expect("write lib.rs");
+    fs::create_dir_all(repo.join("src")).expect("mkdir");
+    fs::write(
+        repo.join("src/common.rs"),
+        "pub const MAX_INPUT_SIZE: usize = 100;\npub fn serialize_output() {}\n",
+    )
+    .expect("write common.rs");
+
+    let diff_files = vec![
+        crate::models::impact::DiffFile {
+            old_path: "src/lib.rs".to_string(),
+            new_path: "src/lib.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 2,
+                new_start: 1,
+                new_count: 2,
+            }],
+            deleted_old_source: None,
+        },
+        crate::models::impact::DiffFile {
+            old_path: "/dev/null".to_string(),
+            new_path: "src/common.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 2,
+            }],
+            deleted_old_source: None,
+        },
+    ];
+
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    let removed: Vec<&str> = api.removed.iter().map(|s| s.name.as_str()).collect();
+    assert!(
+        !removed.iter().any(|n| n == &"MAX_INPUT_SIZE"),
+        "pub use 再エクスポートされた const は api.rm に出さない。got: {removed:?}"
+    );
+    assert!(
+        !removed.iter().any(|n| n == &"serialize_output"),
+        "pub use 再エクスポートされた pub fn は api.rm に出さない。got: {removed:?}"
+    );
+}
+
+/// `pub use sub::name as alias;` 形式の alias 付き再エクスポート。alias 後の名前が
+/// 公開 API として維持されているため、元の名前 → alias 名への変更は api.rm に出さない。
+#[test]
+fn detect_api_changes_rust_pub_use_alias_excludes_api_rm() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+            ),
+            ("src/lib.rs", "pub fn renamed_target() {}\n"),
+        ],
+        "base",
+    );
+    fs::write(
+        repo.join("src/lib.rs"),
+        "mod sub;\npub use sub::actual_name as renamed_target;\n",
+    )
+    .expect("write lib.rs");
+    fs::write(repo.join("src/sub.rs"), "pub fn actual_name() {}\n").expect("write sub.rs");
+
+    let diff_files = vec![
+        crate::models::impact::DiffFile {
+            old_path: "src/lib.rs".to_string(),
+            new_path: "src/lib.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 2,
+            }],
+            deleted_old_source: None,
+        },
+        crate::models::impact::DiffFile {
+            old_path: "/dev/null".to_string(),
+            new_path: "src/sub.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        },
+    ];
+
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    let removed: Vec<&str> = api.removed.iter().map(|s| s.name.as_str()).collect();
+    assert!(
+        !removed.iter().any(|n| n == &"renamed_target"),
+        "alias 後の公開名 (renamed_target) は api.rm に出さない。got: {removed:?}"
+    );
+}
+
 /// private module でも root から `pub use` re-export されていれば外部到達可能なので api.add に出る。
 #[test]
 fn detect_api_changes_private_module_with_pub_use_reexport_included() {
