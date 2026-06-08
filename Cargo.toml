@@ -40,7 +40,7 @@ tree-sitter-go = "0.25"
 tree-sitter-php = "0.24.2"
 tree-sitter-java = "0.23.5"
 tree-sitter-kotlin = "=0.3.5"  # tree-sitter 0.26 と非互換 (0.3.8 以降が >=0.21,<0.23 を要求)
-tree-sitter-swift = "0.7.2"
+tree-sitter-swift = "0.7.3"
 tree-sitter-c-sharp = "0.23.5"
 tree-sitter-bash = "0.25.1"
 tree-sitter-ruby = { git = "https://github.com/owayo/tree-sitter-ruby.git", branch = "master" }

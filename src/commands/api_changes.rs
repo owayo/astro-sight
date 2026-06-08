@@ -430,6 +430,22 @@ fn classify_signature_change(
         buckets.compatible_modified.push(compat);
         return;
     }
+    // TS/TSX の関数末尾へ optional/default 引数を追加しただけなら、既存呼び出しの required
+    // arity は変わらないため compatible_modified として扱う。
+    if let Some(compat) = detect_trailing_optional_params_compatible_mod(
+        dir,
+        base,
+        &df.old_path,
+        &df.new_path,
+        &name,
+        kind,
+        old_sig,
+        new_sig,
+        lang_id_for_file,
+    ) {
+        buckets.compatible_modified.push(compat);
+        return;
+    }
     // 全 cross-file 参照が同一 diff 内で追随済みなら informational
     if is_modified_closed_in_diff(dir, &name, base, diff_files) {
         buckets.modified_closed_in_diff.push(change);
@@ -1070,6 +1086,158 @@ pub(crate) fn detect_object_members_compatible_mod(
         new_signature: Some(new_sig.to_string()),
         reason: "unused_object_members".to_string(),
     })
+}
+
+/// TS/TSX のトップレベル exported function で、末尾 optional/default 引数追加だけを
+/// compatible_modified (`trailing_optional_params`) として判定する。
+///
+/// 次をすべて満たす場合だけ降格する:
+/// - 関数シンボルで、old/new ともトップレベル関数として一意に取得できる
+/// - 関数名・型パラメータ・戻り値など parameters 外の signature が不変
+/// - 既存引数の順序・型・optional/default 指定が不変
+/// - 追加された末尾引数がすべて optional (`?`) または default value 付き
+///
+/// class method / const arrow function / import 型の解決などは対象外にして blocking を維持する。
+/// false negative (破壊的変更の見逃し) を避けるため、AST 取得や git show に失敗した場合も None。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn detect_trailing_optional_params_compatible_mod(
+    dir: &str,
+    base: &str,
+    old_path: &str,
+    new_path: &str,
+    name: &str,
+    kind: &str,
+    old_sig: &str,
+    new_sig: &str,
+    lang_id: Option<crate::language::LangId>,
+) -> Option<CompatibleApiModification> {
+    use crate::language::LangId;
+    let lang = lang_id.filter(|l| matches!(l, LangId::Typescript | LangId::Tsx))?;
+    if kind != "function" || name.contains('.') {
+        return None;
+    }
+    if !crate::engine::impact::is_safe_diff_path(old_path)
+        || !crate::engine::impact::is_safe_diff_path(new_path)
+    {
+        return None;
+    }
+    validate_git_revision(base, "--base").ok()?;
+    validate_git_revision(old_path, "diff file path").ok()?;
+
+    let old_output = std::process::Command::new("git")
+        .args(["show", &format!("{base}:{old_path}")])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !old_output.status.success() {
+        return None;
+    }
+    let old_source = old_output.stdout;
+    let old_tree = parser::parse_source(&old_source, lang).ok()?;
+
+    let new_full = std::path::Path::new(dir).join(new_path);
+    let new_utf8 = camino::Utf8Path::from_path(&new_full)?;
+    let new_source = parser::read_file(new_utf8).ok()?;
+    let new_tree = parser::parse_source(&new_source, lang).ok()?;
+
+    let old_fn = find_top_level_function_by_name(old_tree.root_node(), &old_source, name)?;
+    let new_fn = find_top_level_function_by_name(new_tree.root_node(), &new_source, name)?;
+    let old_parts = ts_function_signature_parts(old_fn, &old_source)?;
+    let new_parts = ts_function_signature_parts(new_fn, &new_source)?;
+
+    if old_parts.head != new_parts.head || old_parts.tail != new_parts.tail {
+        return None;
+    }
+    if !ts_params_prefix_same_with_optional_tail(&old_parts.params, &new_parts.params) {
+        return None;
+    }
+
+    Some(CompatibleApiModification {
+        name: name.to_string(),
+        kind: kind.to_string(),
+        file: new_path.to_string(),
+        old_signature: Some(old_sig.to_string()),
+        new_signature: Some(new_sig.to_string()),
+        reason: "trailing_optional_params".to_string(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TsFunctionParam {
+    normalized: String,
+    omittable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TsFunctionSignatureParts {
+    head: String,
+    tail: String,
+    params: Vec<TsFunctionParam>,
+}
+
+/// function node を head / parameters / tail に分ける。tail には戻り値型や `async` 後続など、
+/// parameters 以降から body 直前までを含める。
+pub(crate) fn ts_function_signature_parts(
+    fn_node: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<TsFunctionSignatureParts> {
+    let params = fn_node.child_by_field_name("parameters")?;
+    let sig_start = fn_node.start_byte();
+    let sig_end = fn_node
+        .child_by_field_name("body")
+        .map(|b| b.start_byte())
+        .unwrap_or_else(|| fn_node.end_byte());
+    let head = normalize_signature_whitespace(source.get(sig_start..params.start_byte())?);
+    let tail = normalize_signature_whitespace(source.get(params.end_byte()..sig_end)?);
+    let params = ts_function_params(params, source)?;
+    Some(TsFunctionSignatureParts { head, tail, params })
+}
+
+/// formal_parameters 直下の実引数ノードを抽出する。判定不能な parameter kind が混ざる場合は
+/// None にして blocking を維持する。
+pub(crate) fn ts_function_params(
+    params: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<Vec<TsFunctionParam>> {
+    let mut result = Vec::new();
+    let mut cursor = params.walk();
+    for child in params.named_children(&mut cursor) {
+        match child.kind() {
+            "required_parameter" | "optional_parameter" | "formal_parameter" | "identifier" => {
+                let text = source.get(child.start_byte()..child.end_byte())?;
+                result.push(TsFunctionParam {
+                    normalized: normalize_signature_whitespace(text),
+                    omittable: ts_param_is_omittable(child),
+                });
+            }
+            // rest parameter の追加は呼び出し側 arity 互換ではあっても型契約の意図を
+            // ここでは保証しないため、互換降格しない。
+            "rest_pattern" => return None,
+            _ => return None,
+        }
+    }
+    Some(result)
+}
+
+/// 引数が呼び出し側から省略可能かを AST 上で判定する。
+pub(crate) fn ts_param_is_omittable(param: tree_sitter::Node<'_>) -> bool {
+    param.kind() == "optional_parameter" || param.child_by_field_name("value").is_some()
+}
+
+/// old の全引数が new の先頭と一致し、new の追加分がすべて省略可能なら true。
+pub(crate) fn ts_params_prefix_same_with_optional_tail(
+    old_params: &[TsFunctionParam],
+    new_params: &[TsFunctionParam],
+) -> bool {
+    if new_params.len() <= old_params.len() {
+        return false;
+    }
+    for (old, new) in old_params.iter().zip(new_params.iter()) {
+        if old != new {
+            return false;
+        }
+    }
+    new_params[old_params.len()..].iter().all(|p| p.omittable)
 }
 
 #[derive(Debug, Clone)]

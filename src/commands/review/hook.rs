@@ -22,6 +22,35 @@ pub(crate) fn build_review_hook_json(
         refs: Vec<(String, usize, Vec<String>)>,
     }
 
+    // api 側で「互換 / 追随済み / 値のみ変更」と判定済みの modified 系シンボルは、
+    // Stop hook の impact でも informational として扱う。ここを揃えないと api.mod_compat
+    // 自体は非 blocking なのに、同じシンボルの参照一覧が impacts として blocking になる。
+    let mut informational_modified_api_symbols: std::collections::HashSet<(&str, &str)> =
+        std::collections::HashSet::new();
+    informational_modified_api_symbols.extend(
+        result
+            .api_changes
+            .compatible_modified
+            .iter()
+            .map(|m| (m.file.as_str(), m.name.as_str())),
+    );
+    informational_modified_api_symbols.extend(
+        result
+            .api_changes
+            .modified_closed_in_diff
+            .iter()
+            .map(|m| (m.file.as_str(), m.name.as_str())),
+    );
+    if !strict_const_values {
+        informational_modified_api_symbols.extend(
+            result
+                .api_changes
+                .const_value_changes
+                .iter()
+                .map(|m| (m.file.as_str(), m.name.as_str())),
+        );
+    }
+
     // 未解決 impact を収集
     let changed_paths: std::collections::HashSet<&str> = result
         .impact
@@ -99,6 +128,8 @@ pub(crate) fn build_review_hook_json(
                         matches!(
                             affected_change_types.get(sym.as_str()).copied(),
                             Some(ct) if ct != "added"
+                                && !informational_modified_api_symbols
+                                    .contains(&(change.path.as_str(), sym.as_str()))
                         )
                     })
                     .cloned()

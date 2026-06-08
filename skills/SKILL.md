@@ -238,6 +238,8 @@ astro-sight review --dir . --git --exclude-dir generated --exclude-glob 'app/Leg
 
 Output: JSON with `impact` (ContextResult), `missing_cochanges` (files expected to change together but absent from diff), `api_changes` (added/removed/modified public symbols), `dead_symbols` (public symbols with zero non-definition references in changed files).
 
+`api_changes.compatible_modified` は、シグネチャ文字列は変わるが既存呼び出しの互換性を保つ変更を出力する。React component の HOC ラップ、未参照 object member 削除、TS/TSX トップレベル関数の末尾 optional/default 引数追加 (`trailing_optional_params`) は informational として扱い、`--hook` の blocking 対象にしない。同じシンボルに紐づく `impacts` も破壊的影響としては出さず、`mod_compat` の情報提供だけに留める。
+
 `--framework` は `dead_symbols` のみを絞り込む。`--exclude-dir` / `--exclude-glob` は impact 解析と `dead_symbols` の両方に作用し、`dead-code` の同名フラグと同じ意味を持つ。`review` は `dead_symbols` から `vendor/` / `tests/` / build artifacts を常に除外する。
 
 全 changed file が Xojo などの lexer-only 言語だけの場合、`review` は `impact` / `api_changes` / `dead_symbols` をすべて空結果で返す。cross-file lexer 解析が実装されるまでは、対象ファイルを `symbols` / `refs` / `dead-code` の単体コマンドで確認する。

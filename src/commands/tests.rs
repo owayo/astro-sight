@@ -7392,6 +7392,333 @@ fn build_review_hook_json_compatible_modified_is_informational() {
     assert!(!build.is_blocking, "mod_compat (互換変更) は非 blocking");
 }
 
+/// mod_compat に分類済みのシンボルに紐づく cross-file impact は、破壊的影響ではなく
+/// 参考情報として扱う。api 側だけ非 blocking でも impacts が残ると Stop hook が
+/// 自己矛盾した blocking 出力になるため、同じシンボルの impacts から除外する。
+#[test]
+fn build_review_hook_json_compatible_modified_impact_is_informational() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    fs::write(
+        dir.path().join("TaskDetailHeader.tsx"),
+        "export const TaskDetailHeader = memo(function TaskDetailHeader() { return null; });\n",
+    )
+    .expect("write changed file");
+    fs::write(
+        dir.path().join("TaskDetailContent.tsx"),
+        "export const view = <TaskDetailHeader />;\n",
+    )
+    .expect("write caller file");
+
+    let result = ReviewResult {
+        impact: crate::models::impact::ContextResult {
+            changes: vec![crate::models::impact::FileImpact {
+                path: "TaskDetailHeader.tsx".to_string(),
+                hunks: Vec::new(),
+                affected_symbols: vec![crate::models::impact::AffectedSymbol {
+                    name: "TaskDetailHeader".to_string(),
+                    kind: "function".to_string(),
+                    change_type: "modified".to_string(),
+                }],
+                signature_changes: Vec::new(),
+                impacted_callers: vec![crate::models::impact::ImpactedCaller {
+                    path: "TaskDetailContent.tsx".to_string(),
+                    name: "TaskDetailContent".to_string(),
+                    line: 1,
+                    symbols: vec!["TaskDetailHeader".to_string()],
+                    confidence: None,
+                }],
+                low_confidence_callers: Vec::new(),
+            }],
+            skipped: None,
+        },
+        missing_cochanges: Vec::new(),
+        api_changes: ApiChanges {
+            added: Vec::new(),
+            removed: Vec::new(),
+            modified: Vec::new(),
+            moved: Vec::new(),
+            property_to_field: Vec::new(),
+            removed_dead: Vec::new(),
+            modified_closed_in_diff: Vec::new(),
+            const_value_changes: Vec::new(),
+            compatible_modified: vec![CompatibleApiModification {
+                name: "TaskDetailHeader".to_string(),
+                kind: "function".to_string(),
+                file: "TaskDetailHeader.tsx".to_string(),
+                old_signature: Some("export function TaskDetailHeader()".to_string()),
+                new_signature: Some(
+                    "export const TaskDetailHeader = memo(function TaskDetailHeader()".to_string(),
+                ),
+                reason: "react_component_wrapper".to_string(),
+            }],
+        },
+        dead_symbols: Vec::new(),
+        test_only_symbols: Vec::new(),
+        skipped: None,
+    };
+
+    let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
+    let hook_json = build.value.expect("hook json should be generated");
+    assert!(
+        !build.is_blocking,
+        "mod_compat 起因の impact だけなら Stop hook を止めないべき"
+    );
+    assert!(
+        hook_json.get("impacts").is_none(),
+        "mod_compat と同じシンボルの impacts は hook の blocking 出力から除外されるべき"
+    );
+    assert_eq!(
+        hook_json["api"]["mod_compat"][0]["reason"],
+        "react_component_wrapper"
+    );
+}
+
+#[test]
+fn build_review_hook_json_mixed_compatible_and_breaking_impact_keeps_breaking_only() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    fs::write(
+        dir.path().join("TaskDetailHeader.tsx"),
+        "export const TaskDetailHeader = memo(function TaskDetailHeader() { return null; });\nexport function loadTask(id: string, required: boolean) {}\n",
+    )
+    .expect("write changed file");
+    fs::write(
+        dir.path().join("TaskDetailContent.tsx"),
+        "export const view = <TaskDetailHeader />;\nloadTask('1');\n",
+    )
+    .expect("write caller file");
+
+    let result = ReviewResult {
+        impact: crate::models::impact::ContextResult {
+            changes: vec![crate::models::impact::FileImpact {
+                path: "TaskDetailHeader.tsx".to_string(),
+                hunks: Vec::new(),
+                affected_symbols: vec![
+                    crate::models::impact::AffectedSymbol {
+                        name: "TaskDetailHeader".to_string(),
+                        kind: "function".to_string(),
+                        change_type: "modified".to_string(),
+                    },
+                    crate::models::impact::AffectedSymbol {
+                        name: "loadTask".to_string(),
+                        kind: "function".to_string(),
+                        change_type: "modified".to_string(),
+                    },
+                ],
+                signature_changes: Vec::new(),
+                impacted_callers: vec![crate::models::impact::ImpactedCaller {
+                    path: "TaskDetailContent.tsx".to_string(),
+                    name: "TaskDetailContent".to_string(),
+                    line: 2,
+                    symbols: vec!["TaskDetailHeader".to_string(), "loadTask".to_string()],
+                    confidence: None,
+                }],
+                low_confidence_callers: Vec::new(),
+            }],
+            skipped: None,
+        },
+        missing_cochanges: Vec::new(),
+        api_changes: ApiChanges {
+            added: Vec::new(),
+            removed: Vec::new(),
+            modified: vec![ApiSymbolChange {
+                name: "loadTask".to_string(),
+                kind: "function".to_string(),
+                file: "TaskDetailHeader.tsx".to_string(),
+                old_signature: Some("export function loadTask(id: string)".to_string()),
+                new_signature: Some(
+                    "export function loadTask(id: string, required: boolean)".to_string(),
+                ),
+            }],
+            moved: Vec::new(),
+            property_to_field: Vec::new(),
+            removed_dead: Vec::new(),
+            modified_closed_in_diff: Vec::new(),
+            const_value_changes: Vec::new(),
+            compatible_modified: vec![CompatibleApiModification {
+                name: "TaskDetailHeader".to_string(),
+                kind: "function".to_string(),
+                file: "TaskDetailHeader.tsx".to_string(),
+                old_signature: Some("export function TaskDetailHeader()".to_string()),
+                new_signature: Some(
+                    "export const TaskDetailHeader = memo(function TaskDetailHeader()".to_string(),
+                ),
+                reason: "react_component_wrapper".to_string(),
+            }],
+        },
+        dead_symbols: Vec::new(),
+        test_only_symbols: Vec::new(),
+        skipped: None,
+    };
+
+    let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
+    let hook_json = build.value.expect("hook json should be generated");
+    assert!(
+        build.is_blocking,
+        "破壊的 api.mod が同じ caller にあれば blocking を維持すべき"
+    );
+    let impacts = hook_json["impacts"].as_array().expect("impacts array");
+    assert_eq!(impacts[0]["syms"], serde_json::json!(["loadTask"]));
+    assert_eq!(impacts[0]["refs"][0]["s"], serde_json::json!(["loadTask"]));
+}
+
+#[test]
+fn detect_api_changes_ts_trailing_optional_param_is_compatible() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/lib/task-progress.ts",
+                "export function computeTaskProgress(phases: string[]): number {\n  return phases.length;\n}\n",
+            ),
+            (
+                "src/components/task-detail.ts",
+                "import { computeTaskProgress } from '../lib/task-progress';\nexport const progress = computeTaskProgress([]);\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("src/lib/task-progress.ts"),
+        "export function computeTaskProgress(phases: string[], description?: string | null): number {\n  return phases.length + (description?.length ?? 0);\n}\n",
+    )
+    .expect("write changed file");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/lib/task-progress.ts".to_string(),
+        new_path: "src/lib/task-progress.ts".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 3,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    assert!(
+        api_changes.modified.is_empty(),
+        "末尾 optional 引数追加は破壊的 api.mod にすべきでない: {:?}",
+        api_changes.modified
+    );
+    let compat = api_changes
+        .compatible_modified
+        .iter()
+        .find(|c| c.name == "computeTaskProgress")
+        .expect("compatible_modified に computeTaskProgress が入るべき");
+    assert_eq!(compat.reason, "trailing_optional_params");
+}
+
+#[test]
+fn detect_api_changes_ts_trailing_default_param_is_compatible() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/lib/task-progress.ts",
+                "export function computeTaskProgress(phases: string[]): number {\n  return phases.length;\n}\n",
+            ),
+            (
+                "src/components/task-detail.ts",
+                "import { computeTaskProgress } from '../lib/task-progress';\nexport const progress = computeTaskProgress([]);\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("src/lib/task-progress.ts"),
+        "export function computeTaskProgress(phases: string[], description: string | null = null): number {\n  return phases.length + (description?.length ?? 0);\n}\n",
+    )
+    .expect("write changed file");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/lib/task-progress.ts".to_string(),
+        new_path: "src/lib/task-progress.ts".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 3,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    assert!(
+        api_changes.modified.is_empty(),
+        "末尾 default 引数追加は破壊的 api.mod にすべきでない: {:?}",
+        api_changes.modified
+    );
+    let compat = api_changes
+        .compatible_modified
+        .iter()
+        .find(|c| c.name == "computeTaskProgress")
+        .expect("compatible_modified に computeTaskProgress が入るべき");
+    assert_eq!(compat.reason, "trailing_optional_params");
+}
+
+#[test]
+fn detect_api_changes_ts_trailing_required_param_stays_modified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/lib/task-progress.ts",
+                "export function computeTaskProgress(phases: string[]): number {\n  return phases.length;\n}\n",
+            ),
+            (
+                "src/components/task-detail.ts",
+                "import { computeTaskProgress } from '../lib/task-progress';\nexport const progress = computeTaskProgress([]);\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("src/lib/task-progress.ts"),
+        "export function computeTaskProgress(phases: string[], description: string): number {\n  return phases.length + description.length;\n}\n",
+    )
+    .expect("write changed file");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/lib/task-progress.ts".to_string(),
+        new_path: "src/lib/task-progress.ts".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 3,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    assert!(
+        api_changes.compatible_modified.is_empty(),
+        "required 引数追加を compatible_modified に降格してはならない: {:?}",
+        api_changes.compatible_modified
+    );
+    assert!(
+        api_changes
+            .modified
+            .iter()
+            .any(|c| c.name == "computeTaskProgress"),
+        "required 引数追加は api.mod に残るべき: {:?}",
+        api_changes.modified
+    );
+}
+
 /// exported object のプロパティ削除で、削除キーへの member access が repo 全体で 0 件なら
 /// compatible (unused_object_members) に降格する。(レポート 2026-06-02-provider-avatar の再現)
 #[test]
