@@ -165,6 +165,10 @@ impl ApiSymbolCandidate {
 /// 全ての pub/exported シンボルの組み合わせを評価し、Rust private module 抑制 /
 /// bin-only crate 抑制 / 内部参照 / 同一 diff 内 closed-in-diff / TS optional destructure 等
 /// の各種抑制ルールを適用する。最も複雑な処理パス。
+///
+/// `old_syms` / `new_syms` / `in_file_callees` は `detect_api_changes` の Phase 0 で
+/// 抽出済みのものを受け取る (rename 差分では base 側に新パスが存在しないため、旧版は
+/// old_path 由来)。cross-file 参照判定は事前構築済みの `ref_index` を参照する。
 #[allow(clippy::too_many_arguments)]
 fn process_modified_file(
     df: &crate::models::impact::DiffFile,
@@ -172,19 +176,14 @@ fn process_modified_file(
     base: &str,
     diff_files: &[crate::models::impact::DiffFile],
     diff_new_paths: &HashSet<String>,
+    old_syms: &[(String, String, String)],
+    new_syms: &[(String, String, String)],
+    in_file_callees: &std::collections::HashSet<String>,
+    ref_index: &ApiRefIndex,
     rust_reexport_cache: &mut RustBaseReexportCache,
     rust_new_reexport_cache: &mut RustWorktreeReexportCache,
     buckets: &mut ApiChangeBuckets,
 ) {
-    // rename 差分では base 側に新パスが存在しないため、旧版は old_path から読む。
-    let old_syms = extract_exported_symbols_from_git(dir, base, &df.old_path);
-    let new_syms = extract_exported_symbols_from_file(dir, &df.new_path);
-
-    let (old_syms, new_syms) = match (old_syms, new_syms) {
-        (Some(o), Some(n)) => (o, n),
-        _ => return,
-    };
-
     let old_map: std::collections::HashMap<&str, &str> = old_syms
         .iter()
         .map(|(name, _kind, sig)| (name.as_str(), sig.as_str()))
@@ -200,24 +199,22 @@ fn process_modified_file(
     // (Issue #13: C++ overload / マクロ誤パースの api.mod 誤検出対策)。
     let mut old_name_counts: std::collections::HashMap<&str, usize> =
         std::collections::HashMap::new();
-    for (name, _, _) in &old_syms {
+    for (name, _, _) in old_syms {
         *old_name_counts.entry(name.as_str()).or_default() += 1;
     }
     let mut new_name_counts: std::collections::HashMap<&str, usize> =
         std::collections::HashMap::new();
-    for (name, _, _) in &new_syms {
+    for (name, _, _) in new_syms {
         *new_name_counts.entry(name.as_str()).or_default() += 1;
     }
 
-    // 新ファイル内の call 先名を集める。
-    let in_file_callees = extract_in_file_callees(dir, &df.new_path);
     let is_binary_rust_crate = is_binary_only_rust_crate(dir, &df.new_path);
 
     // rename 検出用: 同ファイル内に新規追加された全シンボル名を追跡する。
     let mut new_symbols_in_current_file: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
-    for (name, kind, sig) in &new_syms {
+    for (name, kind, sig) in new_syms {
         if !old_map.contains_key(name.as_str()) {
             new_symbols_in_current_file.insert(name.clone());
             let candidate = ApiSymbolCandidate {
@@ -238,10 +235,10 @@ fn process_modified_file(
             ) {
                 continue;
             }
-            if is_internally_connected(&in_file_callees, name) {
+            if is_internally_connected(in_file_callees, name) {
                 continue;
             }
-            if is_used_in_diff_paths(dir, name, &df.new_path, diff_new_paths) {
+            if is_used_in_diff_paths(ref_index, dir, name, &df.new_path, diff_new_paths) {
                 continue;
             }
             buckets.added.push(candidate);
@@ -254,7 +251,7 @@ fn process_modified_file(
     // TS/JS: 新ツリーで `export { name } from "..."` として re-export されているシンボルは
     // 利用者から見た API 面が維持されているため api.rm から除外する。
     let new_reexports = extract_reexported_names_from_file(dir, &df.new_path);
-    for (name, kind, sig) in &old_syms {
+    for (name, kind, sig) in old_syms {
         if !new_map.contains_key(name.as_str()) {
             if is_rust_old_symbol_outside_public_api_surface(
                 dir,
@@ -275,7 +272,7 @@ fn process_modified_file(
                 && new_symbols_in_current_file.is_empty()
                 && !bash_function_is_exported_in_git(dir, base, &df.old_path, name);
             if (!new_symbols_in_current_file.is_empty() || bash_pure_removal_skip)
-                && is_removed_symbol_unreferenced(dir, name)
+                && is_removed_symbol_unreferenced(ref_index, name)
             {
                 continue;
             }
@@ -312,7 +309,7 @@ fn process_modified_file(
     // 同一 (file, qualname) の modified を重複排除するためのキーセット
     let mut seen_modified: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
-    for (name, kind, new_sig) in &new_syms {
+    for (name, kind, new_sig) in new_syms {
         if let Some(old_sig) = old_map.get(name.as_str())
             && old_sig != &new_sig.as_str()
             && seen_modified.insert((df.new_path.clone(), name.clone()))
@@ -337,8 +334,8 @@ fn process_modified_file(
                 continue;
             }
             // closed-in-diff: 同一ファイル内でしか呼ばれていない関数のシグネチャ変更は除外
-            if is_internally_connected(&in_file_callees, name)
-                && !has_cross_file_refs(dir, &df.new_path, name)
+            if is_internally_connected(in_file_callees, name)
+                && !has_cross_file_refs(ref_index, &df.new_path, name)
             {
                 continue;
             }
@@ -373,6 +370,7 @@ fn process_modified_file(
                 df,
                 diff_files,
                 lang_id_for_file,
+                ref_index,
                 buckets,
             );
         }
@@ -392,6 +390,7 @@ fn classify_signature_change(
     df: &crate::models::impact::DiffFile,
     diff_files: &[crate::models::impact::DiffFile],
     lang_id_for_file: Option<crate::language::LangId>,
+    ref_index: &ApiRefIndex,
     buckets: &mut ApiChangeBuckets,
 ) {
     let name = change.name.clone();
@@ -402,6 +401,7 @@ fn classify_signature_change(
     }
     // React component を memo / forwardRef 等の HOC でラップしただけは compatible_modified
     if let Some(compat) = detect_react_wrapper_compatible_mod(
+        ref_index,
         dir,
         base,
         &df.old_path,
@@ -447,7 +447,7 @@ fn classify_signature_change(
         return;
     }
     // 全 cross-file 参照が同一 diff 内で追随済みなら informational
-    if is_modified_closed_in_diff(dir, &name, base, diff_files) {
+    if is_modified_closed_in_diff(ref_index, dir, &name, base, diff_files) {
         buckets.modified_closed_in_diff.push(change);
     } else {
         buckets.modified.push(change);
@@ -518,19 +518,22 @@ fn process_deleted_file(
 ///
 /// bin-only crate (`src/lib.rs` なし) / private module / 内部のみ参照 / 同一 diff 内で
 /// 完結したシンボルは `added` から除外する。
+///
+/// `new_syms` / `in_file_callees` は `detect_api_changes` の Phase 0 で抽出済みのものを
+/// 受け取り、cross-file 参照判定は事前構築済みの `ref_index` を参照する。
+#[allow(clippy::too_many_arguments)]
 fn process_added_file(
     df: &crate::models::impact::DiffFile,
     dir: &str,
     diff_new_paths: &HashSet<String>,
+    new_syms: &[(String, String, String)],
+    in_file_callees: &std::collections::HashSet<String>,
+    ref_index: &ApiRefIndex,
     rust_new_reexport_cache: &mut RustWorktreeReexportCache,
     buckets: &mut ApiChangeBuckets,
 ) {
-    let Some(new_syms) = extract_exported_symbols_from_file(dir, &df.new_path) else {
-        return;
-    };
     let is_binary_rust_crate = is_binary_only_rust_crate(dir, &df.new_path);
-    let in_file_callees = extract_in_file_callees(dir, &df.new_path);
-    for (name, kind, sig) in &new_syms {
+    for (name, kind, sig) in new_syms {
         let candidate = ApiSymbolCandidate {
             name: name.clone(),
             kind: kind.clone(),
@@ -549,10 +552,10 @@ fn process_added_file(
         ) {
             continue;
         }
-        if is_internally_connected(&in_file_callees, name) {
+        if is_internally_connected(in_file_callees, name) {
             continue;
         }
-        if is_used_in_diff_paths(dir, name, &df.new_path, diff_new_paths) {
+        if is_used_in_diff_paths(ref_index, dir, name, &df.new_path, diff_new_paths) {
             continue;
         }
         buckets.added.push(candidate);
@@ -604,6 +607,87 @@ pub(crate) struct ApiChangeBuckets {
     pub(crate) property_to_field: Vec<PropertyToFieldChange>,
 }
 
+/// Phase 0 で抽出した diff ファイルごとの exported シンボル。
+/// 抽出は git show / parse を伴うため 1 回だけ行い、name 収集と process_* で共有する。
+enum PreparedDiffFile {
+    /// `should_skip_diff_file` で除外されたファイル。
+    Skip,
+    /// 新規ファイル (`old_path == "/dev/null"`)。
+    Added {
+        new_syms: Option<Vec<(String, String, String)>>,
+        in_file_callees: std::collections::HashSet<String>,
+    },
+    /// 削除ファイル (`new_path == "/dev/null"`)。cross-file 参照判定を行わないため
+    /// 抽出は従来どおり `process_deleted_file` 内で行う。
+    Deleted,
+    /// 通常の modified ファイル。
+    Modified {
+        old_syms: Option<Vec<(String, String, String)>>,
+        new_syms: Option<Vec<(String, String, String)>>,
+        in_file_callees: std::collections::HashSet<String>,
+    },
+}
+
+/// modified ファイルで cross-file 参照判定の対象になりうる name を `index_names` へ集める。
+/// - 新規追加 (new のみ): `is_used_in_diff_paths` が bare name で検索
+/// - 削除 (old のみ): `is_removed_symbol_unreferenced` が bare name で検索
+/// - シグネチャ変更: `has_cross_file_refs` が exact name、`is_modified_closed_in_diff` /
+///   `has_blocking_value_usage` が bare name で検索
+///
+/// per-symbol 実装の短絡で検索に到達しえない name は収集しない (過剰収集は AC trie の
+/// パターンと事前フィルタのヒット (= parse 対象ファイル) を増やし、小規模 diff で
+/// per-symbol より遅くなる):
+/// - 新規追加: `is_internally_connected` が true なら `is_used_in_diff_paths` 未到達
+/// - シグネチャ変更: exact name (`has_cross_file_refs`) は
+///   `is_internally_connected && !has_cross_file_refs` の短絡により internally connected
+///   のときのみ評価される
+/// - 削除: `(!new_symbols_in_current_file.is_empty() || bash_pure_removal_skip)` が
+///   成立しなければ `is_removed_symbol_unreferenced` 未到達 (bash の git show 判定は
+///   再現せず `is_bash_old_file` で過剰側に倒す)
+///
+/// bin-only crate / private module / 同名複数等の残りの篩いは再現せず過剰側に倒す。
+/// 過剰収集は検索コストが増えるだけで判定結果には影響しない (逆に収集漏れは
+/// `refs_for` が `None` を返して保守側に倒れ、判定が変わりうる)。
+fn collect_modified_file_index_names(
+    old_syms: &[(String, String, String)],
+    new_syms: &[(String, String, String)],
+    in_file_callees: &std::collections::HashSet<String>,
+    is_bash_old_file: bool,
+    index_names: &mut HashSet<String>,
+) {
+    let old_map: std::collections::HashMap<&str, &str> = old_syms
+        .iter()
+        .map(|(name, _kind, sig)| (name.as_str(), sig.as_str()))
+        .collect();
+    let new_names: HashSet<&str> = new_syms.iter().map(|(name, _, _)| name.as_str()).collect();
+    let mut has_new_only_symbol = false;
+    for (name, _kind, sig) in new_syms {
+        match old_map.get(name.as_str()) {
+            None => {
+                has_new_only_symbol = true;
+                if !is_internally_connected(in_file_callees, name) {
+                    index_names.insert(bare_name(name).to_string());
+                }
+            }
+            Some(old_sig) if old_sig != &sig.as_str() => {
+                if is_internally_connected(in_file_callees, name) {
+                    index_names.insert(name.clone());
+                }
+                index_names.insert(bare_name(name).to_string());
+            }
+            Some(_) => {}
+        }
+    }
+    if !(has_new_only_symbol || is_bash_old_file) {
+        return;
+    }
+    for (name, _, _) in old_syms {
+        if !new_names.contains(name.as_str()) {
+            index_names.insert(bare_name(name).to_string());
+        }
+    }
+}
+
 pub(crate) fn detect_api_changes(
     dir: &str,
     base: &str,
@@ -630,44 +714,113 @@ pub(crate) fn detect_api_changes(
         .collect();
 
     let canonical_dir = std::fs::canonicalize(dir).ok();
+
+    // Phase 0: added / modified ファイルの exported シンボルを抽出し、cross-file 参照
+    // 判定の対象になりうる name を集めて ApiRefIndex を構築する。候補シンボルごとの
+    // 全リポジトリ走査 (O(候補数 × 全ファイル)) を chunk 単位の batch 検索に集約する。
+    let mut prepared: Vec<PreparedDiffFile> = Vec::with_capacity(diff_files.len());
+    let mut index_names: HashSet<String> = HashSet::new();
     for df in diff_files {
         if should_skip_diff_file(df, &gitattrs, canonical_dir.as_deref()) {
+            prepared.push(PreparedDiffFile::Skip);
             continue;
         }
-
         if df.old_path == "/dev/null" {
-            process_added_file(
-                df,
-                dir,
-                &diff_new_paths,
-                &mut rust_new_reexport_cache,
-                &mut buckets,
-            );
+            let new_syms = extract_exported_symbols_from_file(dir, &df.new_path);
+            let in_file_callees = extract_in_file_callees(dir, &df.new_path);
+            if let Some(syms) = &new_syms {
+                for (name, _, _) in syms {
+                    // per-symbol 実装と同じ短絡: ファイル内から呼ばれるシンボルは
+                    // `is_used_in_diff_paths` に到達しないため検索対象に入れない。
+                    if !is_internally_connected(&in_file_callees, name) {
+                        index_names.insert(bare_name(name).to_string());
+                    }
+                }
+            }
+            prepared.push(PreparedDiffFile::Added {
+                new_syms,
+                in_file_callees,
+            });
             continue;
         }
-
         if df.new_path == "/dev/null" {
-            process_deleted_file(
-                df,
-                dir,
-                base,
-                &diff_new_paths,
-                &mut rust_reexport_cache,
-                &mut buckets,
-            );
+            prepared.push(PreparedDiffFile::Deleted);
             continue;
         }
+        // rename 差分では base 側に新パスが存在しないため、旧版は old_path から読む。
+        let old_syms = extract_exported_symbols_from_git(dir, base, &df.old_path);
+        let new_syms = extract_exported_symbols_from_file(dir, &df.new_path);
+        let in_file_callees = extract_in_file_callees(dir, &df.new_path);
+        if let (Some(old), Some(new)) = (&old_syms, &new_syms) {
+            collect_modified_file_index_names(
+                old,
+                new,
+                &in_file_callees,
+                is_bash_script_path(&df.old_path),
+                &mut index_names,
+            );
+        }
+        prepared.push(PreparedDiffFile::Modified {
+            old_syms,
+            new_syms,
+            in_file_callees,
+        });
+    }
+    let ref_index = ApiRefIndex::build(dir, &index_names);
 
-        process_modified_file(
-            df,
-            dir,
-            base,
-            diff_files,
-            &diff_new_paths,
-            &mut rust_reexport_cache,
-            &mut rust_new_reexport_cache,
-            &mut buckets,
-        );
+    for (df, prep) in diff_files.iter().zip(&prepared) {
+        match prep {
+            PreparedDiffFile::Skip => {}
+            PreparedDiffFile::Added {
+                new_syms,
+                in_file_callees,
+            } => {
+                if let Some(new_syms) = new_syms {
+                    process_added_file(
+                        df,
+                        dir,
+                        &diff_new_paths,
+                        new_syms,
+                        in_file_callees,
+                        &ref_index,
+                        &mut rust_new_reexport_cache,
+                        &mut buckets,
+                    );
+                }
+            }
+            PreparedDiffFile::Deleted => {
+                process_deleted_file(
+                    df,
+                    dir,
+                    base,
+                    &diff_new_paths,
+                    &mut rust_reexport_cache,
+                    &mut buckets,
+                );
+            }
+            PreparedDiffFile::Modified {
+                old_syms,
+                new_syms,
+                in_file_callees,
+            } => {
+                if let (Some(old_syms), Some(new_syms)) = (old_syms, new_syms) {
+                    process_modified_file(
+                        df,
+                        dir,
+                        base,
+                        diff_files,
+                        &diff_new_paths,
+                        old_syms,
+                        new_syms,
+                        in_file_callees,
+                        &ref_index,
+                        &mut rust_reexport_cache,
+                        &mut rust_new_reexport_cache,
+                        &mut buckets,
+                    );
+                }
+            }
+        }
     }
 
     // git の rename detection が効かない diff (外部供給 / 非 git 入力 / 設定で無効化された
@@ -730,6 +883,7 @@ pub(crate) fn detect_api_changes(
 /// (false negative 回避)。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn detect_react_wrapper_compatible_mod(
+    index: &ApiRefIndex,
     dir: &str,
     base: &str,
     old_path: &str,
@@ -783,7 +937,7 @@ pub(crate) fn detect_react_wrapper_compatible_mod(
     }
     // 値利用 (呼び出し / typeof / member / new / indexed) が残れば MemoExoticComponent 化で
     // 壊れ得るため blocking 維持。
-    if has_blocking_value_usage(dir, name) {
+    if has_blocking_value_usage(index, name) {
         return None;
     }
     Some(CompatibleApiModification {
@@ -922,14 +1076,13 @@ pub(crate) fn first_param_type_text(params: tree_sitter::Node, source: &[u8]) ->
 /// `name` シンボルが値として利用 (`X(...)` / `new X` / `typeof X` / `X.foo` / `X[...]`)
 /// されている参照があるかを判定する。JSX タグ利用・import/re-export・定義のみなら false
 /// (= 降格可)。解析失敗・判定不能な参照があれば true (= blocking 維持、false negative 回避)。
-pub(crate) fn has_blocking_value_usage(dir: &str, name: &str) -> bool {
+pub(crate) fn has_blocking_value_usage(index: &ApiRefIndex, name: &str) -> bool {
     use crate::models::reference::RefKind;
     let bare = bare_name(name);
-    let refs = match crate::engine::refs::find_references(bare, std::path::Path::new(dir), None) {
-        Ok(r) => r,
-        Err(_) => return true,
+    let Some(refs) = index.refs_for(bare) else {
+        return true;
     };
-    for r in &refs {
+    for r in refs {
         if r.kind == Some(RefKind::Definition) {
             continue;
         }
@@ -1475,6 +1628,7 @@ pub(crate) fn static_js_string_text<'a>(
 /// メソッド等) / refs 解析失敗 / diff 外 or hunk 外の参照が 1 つでもあれば false を返し、
 /// 保守的に blocking 側 (通常の api.mod) へ倒す。
 pub(crate) fn is_modified_closed_in_diff(
+    index: &ApiRefIndex,
     dir: &str,
     name: &str,
     base: &str,
@@ -1483,9 +1637,8 @@ pub(crate) fn is_modified_closed_in_diff(
     use crate::models::reference::RefKind;
     use std::collections::{HashMap, HashSet};
     let bare = bare_name(name);
-    let refs = match crate::engine::refs::find_references(bare, std::path::Path::new(dir), None) {
-        Ok(r) => r,
-        Err(_) => return false,
+    let Some(refs) = index.refs_for(bare) else {
+        return false;
     };
     // 同名定義が 1 つでなければ曖昧 (別型の同名メソッド等) なので保守的に blocking。
     let def_count = refs
@@ -3196,6 +3349,7 @@ pub(crate) fn is_internally_connected(
 /// `defining_file` / `diff_new_paths` は `dir` からの相対パスを想定する。
 /// 参照検索に失敗した場合は false を返し、保守的に api.add に残す。
 pub(crate) fn is_used_in_diff_paths(
+    index: &ApiRefIndex,
     dir: &str,
     name: &str,
     defining_file: &str,
@@ -3207,8 +3361,7 @@ pub(crate) fn is_used_in_diff_paths(
     if search_name.is_empty() {
         return false;
     }
-    let service = AppService::new();
-    let Ok(refs_result) = service.find_references(search_name, dir, None) else {
+    let Some(refs) = index.refs_for(search_name) else {
         return false;
     };
     let defining_path = std::path::Path::new(defining_file);
@@ -3217,7 +3370,7 @@ pub(crate) fn is_used_in_diff_paths(
         String,
         std::collections::HashSet<usize>,
     > = std::collections::HashMap::new();
-    refs_result.references.iter().any(|r| {
+    refs.iter().any(|r| {
         if r.kind == Some(RefKind::Definition) {
             return false;
         }
@@ -3243,24 +3396,80 @@ mod rust_public;
 
 pub(crate) use rust_public::*;
 
-/// `name` が `file_path` 以外のファイルから参照されているかを判定する。
-/// 参照検索に失敗した場合は保守的に true（＝外部参照ありとみなす）を返し、
-/// modified の除外を抑止する（false positive を恐れて false negative を起こさない方針）。
+/// API 差分判定用の cross-file 参照インデックス。
 ///
-/// `file_path` は `dir` からの相対パスを想定する。`find_references` の出力も
-/// `dir` 相対なので `Path` 単位で比較する。
-pub(crate) fn has_cross_file_refs(dir: &str, file_path: &str, name: &str) -> bool {
+/// `detect_api_changes` の各判定ヘルパーは候補シンボルごとに `find_references` で
+/// 全リポジトリを走査していた (O(候補数 × 全ファイル))。判定対象になりうる name を
+/// 前段で収集し、`find_references_batch` を chunk 単位で呼んで 1 つのインデックスに
+/// 集約することで、走査回数を O(ceil(候補数 / chunk)) に抑える
+/// (`partition_removed_dead_candidates` と同じ手法)。
+///
+/// 検索に失敗した chunk の name と未収集の name は `refs_for` が `None` を返し、
+/// 各判定ヘルパーが per-symbol 時代の検索失敗時と同じ保守側ポリシーに倒す
+/// (false negative を起こさない)。
+pub(crate) struct ApiRefIndex {
+    /// 検索キー (exact name / bare name) → HEAD ツリー全体の参照 (`dir` 相対パス)。
+    /// batch 検索済みの name は参照 0 件でもエントリを持つ (「未検索」と区別するため)。
+    refs: std::collections::HashMap<String, Vec<crate::models::reference::SymbolReference>>,
+    /// batch 検索に失敗した chunk の name 集合 (保守側判定の対象)。
+    failed: HashSet<String>,
+}
+
+impl ApiRefIndex {
+    /// `names` の参照を chunk 単位の batch 検索で収集する。
+    /// chunk サイズは CLI `refs --names` と同じ (既定 64、`ASTRO_SIGHT_REFS_BATCH_CHUNK`
+    /// で調整可)。AC trie はパターン数に対して非線形にメモリを使うため一括にはしない。
+    pub(crate) fn build(dir: &str, names: &HashSet<String>) -> Self {
+        let mut sorted: Vec<String> = names.iter().filter(|n| !n.is_empty()).cloned().collect();
+        sorted.sort_unstable();
+        let mut index = Self {
+            refs: std::collections::HashMap::new(),
+            failed: HashSet::new(),
+        };
+        if sorted.is_empty() {
+            return index;
+        }
+        let service = AppService::new();
+        for chunk in sorted.chunks(super::refs_batch_chunk_size()) {
+            match service.find_references_batch(chunk, dir, None) {
+                Ok(results) => {
+                    for r in results {
+                        index.refs.insert(r.symbol, r.references);
+                    }
+                }
+                Err(_) => index.failed.extend(chunk.iter().cloned()),
+            }
+        }
+        index
+    }
+
+    /// `name` の参照リスト。検索失敗 / 未収集の name は `None` (呼び出し側で保守側に倒す)。
+    pub(crate) fn refs_for(
+        &self,
+        name: &str,
+    ) -> Option<&[crate::models::reference::SymbolReference]> {
+        if self.failed.contains(name) {
+            return None;
+        }
+        self.refs.get(name).map(|v| v.as_slice())
+    }
+}
+
+/// `name` が `file_path` 以外のファイルから参照されているかを判定する。
+/// 参照の取得に失敗した場合 (index 構築失敗 / 未収集) は保守的に true（＝外部参照あり
+/// とみなす）を返し、modified の除外を抑止する（false positive を恐れて false negative
+/// を起こさない方針）。
+///
+/// `file_path` は `dir` からの相対パスを想定する。index の参照パスも `dir` 相対なので
+/// `Path` 単位で比較する。
+pub(crate) fn has_cross_file_refs(index: &ApiRefIndex, file_path: &str, name: &str) -> bool {
     use std::path::Path;
 
-    let service = AppService::new();
-    let Ok(refs_result) = service.find_references(name, dir, None) else {
+    let Some(refs) = index.refs_for(name) else {
         return true;
     };
     let self_path = Path::new(file_path);
-    refs_result
-        .references
-        .iter()
-        .any(|r| Path::new(r.path.as_str()) != self_path)
+    refs.iter().any(|r| Path::new(r.path.as_str()) != self_path)
 }
 
 /// 削除されたシンボル `name` が、変更後のツリー全体のどこからも参照されていないかを判定する。
@@ -3573,16 +3782,15 @@ pub(crate) fn collect_external_import_bindings(
 /// `bare_name` で正規化して検索する。同名定義が HEAD ツリーに 2 件以上残存する場合は
 /// 「部分削除」「同名複数 export」の可能性があるため保守的に false を返す
 /// (codex 指摘: detect_api_changes の早期 continue 経路でも qualname 対応が必要)。
-pub(crate) fn is_removed_symbol_unreferenced(dir: &str, name: &str) -> bool {
+pub(crate) fn is_removed_symbol_unreferenced(index: &ApiRefIndex, name: &str) -> bool {
     use crate::models::reference::RefKind;
     let bare = bare_name(name);
-    let service = AppService::new();
-    let Ok(refs_result) = service.find_references(bare, dir, None) else {
+    let Some(refs) = index.refs_for(bare) else {
         return false;
     };
     let mut def_count = 0usize;
     let mut ref_count = 0usize;
-    for r in &refs_result.references {
+    for r in refs {
         if r.kind == Some(RefKind::Definition) {
             def_count += 1;
         } else {

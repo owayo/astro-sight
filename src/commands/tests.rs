@@ -7150,7 +7150,12 @@ fn detect_react_wrapper_multiline_destructured_props_is_compatible() {
             "import { memo } from 'react';\nexport const ScheduleItem = memo(function ScheduleItem({\n  a,\n  b,\n}: ScheduleItemProps) {\n  return null;\n});\n",
         )
         .expect("write");
+    let ref_index = ApiRefIndex::build(
+        repo.to_str().expect("utf-8 path"),
+        &HashSet::from(["ScheduleItem".to_string()]),
+    );
     let result = detect_react_wrapper_compatible_mod(
+        &ref_index,
         repo.to_str().expect("utf-8 path"),
         "HEAD",
         "ScheduleItem.tsx",
@@ -7192,7 +7197,12 @@ fn detect_react_wrapper_with_call_usage_stays_blocking() {
             "import { memo } from 'react';\nexport const ScheduleItem = memo(function ScheduleItem(props: P) {\n  return null;\n});\n",
         )
         .expect("write");
+    let ref_index = ApiRefIndex::build(
+        repo.to_str().expect("utf-8 path"),
+        &HashSet::from(["ScheduleItem".to_string()]),
+    );
     let result = detect_react_wrapper_compatible_mod(
+        &ref_index,
         repo.to_str().expect("utf-8 path"),
         "HEAD",
         "ScheduleItem.tsx",
@@ -7234,7 +7244,12 @@ fn detect_react_wrapper_changed_props_type_stays_blocking() {
             "import { memo } from 'react';\nexport const ScheduleItem = memo(function ScheduleItem(props: NewProps) {\n  return null;\n});\n",
         )
         .expect("write");
+    let ref_index = ApiRefIndex::build(
+        repo.to_str().expect("utf-8 path"),
+        &HashSet::from(["ScheduleItem".to_string()]),
+    );
     let result = detect_react_wrapper_compatible_mod(
+        &ref_index,
         repo.to_str().expect("utf-8 path"),
         "HEAD",
         "ScheduleItem.tsx",
@@ -7291,7 +7306,12 @@ fn detect_react_wrapper_same_file_value_usage_stays_blocking() {
             "import { memo } from 'react';\nexport const ScheduleItem = memo(function ScheduleItem(props: P) {\n  return null;\n});\nconst probe = ScheduleItem({});\n",
         )
         .expect("write");
+    let ref_index = ApiRefIndex::build(
+        repo.to_str().expect("utf-8 path"),
+        &HashSet::from(["ScheduleItem".to_string()]),
+    );
     let result = detect_react_wrapper_compatible_mod(
+        &ref_index,
         repo.to_str().expect("utf-8 path"),
         "HEAD",
         "ScheduleItem.tsx",
@@ -7334,7 +7354,12 @@ fn detect_react_wrapper_old_already_wrapper_stays_blocking() {
             "import { forwardRef } from 'react';\nexport const Btn = forwardRef(function Btn(props: P, ref: RefB) {\n  return null;\n});\n",
         )
         .expect("write");
+    let ref_index = ApiRefIndex::build(
+        repo.to_str().expect("utf-8 path"),
+        &HashSet::from(["Btn".to_string()]),
+    );
     let result = detect_react_wrapper_compatible_mod(
+        &ref_index,
         repo.to_str().expect("utf-8 path"),
         "HEAD",
         "Btn.tsx",

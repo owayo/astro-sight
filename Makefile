@@ -40,9 +40,10 @@ test: ## Run tests
 fmt: ## Format code
 	cargo fmt
 
-check: ## Run clippy and check
+check: ## Run clippy, check, and fmt check
 	cargo clippy --all-targets --all-features -- -D warnings
 	cargo check
+	cargo fmt -- --check
 
 clean: ## Clean build artifacts
 	cargo clean
