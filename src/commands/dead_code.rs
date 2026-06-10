@@ -13,6 +13,8 @@ use super::api_changes::{
 use super::common::{MAX_INPUT_SIZE, read_file_to_string_limited, serialize_output};
 use super::git_input::{GitDiffInput, resolve_git_diff};
 
+/// dead-code 検出本体。候補収集 → 名前インデックス構築 → 参照カウント →
+/// アセット参照収集 → 分類の段階パイプラインで (dead_symbols, test_only_symbols) を返す。
 pub(crate) fn detect_dead_symbols_from_files(
     dir: &str,
     files: &[std::path::PathBuf],
@@ -30,15 +32,51 @@ pub(crate) fn detect_dead_symbols_from_files(
     // 動作するため CI skip 機構は不要。`ASTRO_SIGHT_FORCE_CI_LANG_DEAD_CODE` は deprecate
     // (no-op、警告も出さない)。
 
-    // .gitattributes の linguist-generated 指定ファイルは dead-code 検出から除外する
-    let gitattrs = crate::engine::gitattributes::GitAttributes::load(&canonical_dir);
+    let candidates = collect_dead_code_candidates(dir, &canonical_dir, files);
+    if candidates.all_syms.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
 
-    // 全ファイルのエクスポートシンボルを収集（trait impl メソッドは除外）
-    // (original_name, kind, file, lang_id) — case-insensitive 言語では lang_id で
-    // シンボル名を正規化した比較を行うため lang も保持する。
+    let index = build_dead_code_name_index(&candidates);
+
+    // production / test 別に refs カウント。test/ 配下のみで参照されるシンボルは
+    // dead_symbols ではなく test_only_symbols として分離する (F5)。
+    let counts = match crate::engine::refs::count_non_definition_refs_split(
+        &index.unique_names,
+        &canonical_dir,
+        None,
+        is_test_path,
+    ) {
+        Ok(v) => v,
+        Err(_) => return (Vec::new(), Vec::new()),
+    };
+
+    let asset_refs = collect_framework_asset_refs(&canonical_dir);
+
+    classify_dead_symbols(&candidates, &index, &counts, &asset_refs)
+}
+
+/// 候補収集の中間状態。dead-code 候補シンボルと C/C++ liveness 補助情報を保持する。
+struct DeadCodeCandidates {
+    /// 全ファイルのエクスポートシンボル (original_name, kind, file, lang_id)。
+    /// case-insensitive 言語では lang_id でシンボル名を正規化した比較を行うため lang も保持する。
+    all_syms: Vec<(String, String, String, crate::language::LangId)>,
+    /// C/C++ の追加 liveness 情報 (file, シンボル名, 追加名リスト, lang)。
+    /// enum→列挙子名 / typedef tag→alias 名。後段で正規化して liveness_aliases に変換する。
+    liveness_raw: Vec<(String, String, Vec<String>, crate::language::LangId)>,
+}
+
+/// 走査対象ファイルからエクスポートシンボル（trait impl メソッドは除外）と
+/// C/C++ liveness 補助情報を収集する。
+fn collect_dead_code_candidates(
+    dir: &str,
+    canonical_dir: &std::path::Path,
+    files: &[std::path::PathBuf],
+) -> DeadCodeCandidates {
+    // .gitattributes の linguist-generated 指定ファイルは dead-code 検出から除外する
+    let gitattrs = crate::engine::gitattributes::GitAttributes::load(canonical_dir);
+
     let mut all_syms: Vec<(String, String, String, crate::language::LangId)> = Vec::new();
-    // C/C++ の追加 liveness 情報 (file, シンボル名, 追加名リスト, lang)。
-    // enum→列挙子名 / typedef tag→alias 名。後で正規化して liveness_aliases に変換する。
     let mut liveness_raw: Vec<(String, String, Vec<String>, crate::language::LangId)> = Vec::new();
     for path in files {
         // canonicalize で削除済みファイルをスキップ、dir 外のパスも除外
@@ -46,7 +84,7 @@ pub(crate) fn detect_dead_symbols_from_files(
             Ok(p) => p,
             Err(_) => continue,
         };
-        let rel = match canonical_path.strip_prefix(&canonical_dir) {
+        let rel = match canonical_path.strip_prefix(canonical_dir) {
             Ok(p) => p.to_string_lossy().to_string(),
             Err(_) => continue, // dir 外のパスは除外（セキュリティ境界）
         };
@@ -80,33 +118,53 @@ pub(crate) fn detect_dead_symbols_from_files(
         }
     }
 
-    if all_syms.is_empty() {
-        return (Vec::new(), Vec::new());
+    DeadCodeCandidates {
+        all_syms,
+        liveness_raw,
     }
+}
 
-    // refs 検索は AST 上の identifier ノードに対してマッチするため、
-    // `Container.method` 形式の qualname ではマッチせず常に 0 件となってしまう。
-    // そのため検索キーは末尾セグメント（bare name）に統一する。
-    // 同名シンボルが複数箇所にある場合は保守的にスキップする。
-    let norm_bare = |lang: crate::language::LangId, n: &str| -> String {
-        crate::language::normalize_identifier(lang, bare_name(n)).into_owned()
-    };
+/// 検索インデックスの中間状態。正規化済み bare name の同名カウント / liveness alias / 検索対象名。
+struct DeadCodeNameIndex {
+    /// 正規化 bare name → 出現数。同名 export が複数あるシンボルの保守的スキップに使う。
+    name_counts: std::collections::HashMap<String, usize>,
+    /// C/C++ の (file, 正規化シンボル名) → 追加 liveness 名 (正規化済み)。
+    liveness_aliases: std::collections::HashMap<(String, String), Vec<String>>,
+    /// refs 検索対象の正規化済みシンボル名 (重複除去済み、liveness 補助名を含む)。
+    unique_names: Vec<String>,
+}
 
+/// 言語別に正規化した bare name を返す。
+///
+/// refs 検索は AST 上の identifier ノードに対してマッチするため、
+/// `Container.method` 形式の qualname ではマッチせず常に 0 件となってしまう。
+/// そのため検索キーは末尾セグメント（bare name）に統一する。
+fn normalized_bare_name(lang: crate::language::LangId, name: &str) -> String {
+    crate::language::normalize_identifier(lang, bare_name(name)).into_owned()
+}
+
+/// 候補シンボルから同名カウント / liveness alias / refs 検索対象名のインデックスを構築する。
+fn build_dead_code_name_index(candidates: &DeadCodeCandidates) -> DeadCodeNameIndex {
     // 同名 export が複数ファイル/複数コンテナに存在する場合は保守的にスキップ（誤判定防止）。
     // キーは bare name を言語別に正規化したもの (Xojo では `Foo` と `FOO` を同一視)。
     let mut name_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    for (name, _, _, lang) in &all_syms {
-        *name_counts.entry(norm_bare(*lang, name)).or_default() += 1;
+    for (name, _, _, lang) in &candidates.all_syms {
+        *name_counts
+            .entry(normalized_bare_name(*lang, name))
+            .or_default() += 1;
     }
 
     // C/C++ の (file, 正規化シンボル名) → 追加 liveness 名 (正規化済み) を構築。
     // enum 候補は列挙子名、typedef tag 候補は alias 名を介した参照でも live と判定する。
     let mut liveness_aliases: std::collections::HashMap<(String, String), Vec<String>> =
         std::collections::HashMap::new();
-    for (file, sym, extras, lang) in &liveness_raw {
-        let key = norm_bare(*lang, sym);
-        let extra_keys: Vec<String> = extras.iter().map(|e| norm_bare(*lang, e)).collect();
+    for (file, sym, extras, lang) in &candidates.liveness_raw {
+        let key = normalized_bare_name(*lang, sym);
+        let extra_keys: Vec<String> = extras
+            .iter()
+            .map(|e| normalized_bare_name(*lang, e))
+            .collect();
         liveness_aliases
             .entry((file.clone(), key))
             .or_default()
@@ -119,8 +177,8 @@ pub(crate) fn detect_dead_symbols_from_files(
     let unique_names: Vec<String> = {
         let mut seen = HashSet::new();
         let mut names = Vec::new();
-        for (name, _, _, lang) in &all_syms {
-            let k = norm_bare(*lang, name);
+        for (name, _, _, lang) in &candidates.all_syms {
+            let k = normalized_bare_name(*lang, name);
             if seen.insert(k.clone()) {
                 names.push(k);
             }
@@ -135,24 +193,44 @@ pub(crate) fn detect_dead_symbols_from_files(
         names
     };
 
-    // production / test 別に refs カウント。test/ 配下のみで参照されるシンボルは
-    // dead_symbols ではなく test_only_symbols として分離する (F5)。
-    let counts = match crate::engine::refs::count_non_definition_refs_split(
-        &unique_names,
-        &canonical_dir,
-        None,
-        is_test_path,
-    ) {
-        Ok(v) => v,
-        Err(_) => return (Vec::new(), Vec::new()),
-    };
+    DeadCodeNameIndex {
+        name_counts,
+        liveness_aliases,
+        unique_names,
+    }
+}
 
+/// AST の cross-file refs では追跡できないフレームワークアセット由来の参照名集合。
+struct FrameworkAssetRefs {
+    /// AndroidManifest.xml / layout XML から参照されるシンボル名。
+    xml: HashSet<String>,
+    /// Angular テンプレート (`*.component.html` / inline template) から参照される名前。
+    template: HashSet<String>,
+}
+
+impl FrameworkAssetRefs {
+    /// bare name / qualname のいずれかでフレームワークアセットから参照されているか判定する。
+    fn contains_symbol(&self, name: &str) -> bool {
+        // bare name と qualname (Container.method) の両方を突き合わせる。
+        // layout XML の `android:onClick="handler"` や Angular template の
+        // `(event)="handler()"` は単純名でしか書けないため bare で検索し、
+        // `android:name=".Foo"` 等で Container 側をカバーするケースは qualname でも検査する。
+        let bare = bare_name(name);
+        self.xml.contains(bare)
+            || self.xml.contains(name)
+            || self.template.contains(bare)
+            || self.template.contains(name)
+    }
+}
+
+/// Android XML / Angular テンプレートからの参照集合を収集する。
+fn collect_framework_asset_refs(canonical_dir: &std::path::Path) -> FrameworkAssetRefs {
     // Android プロジェクトでは `AndroidManifest.xml` / layout XML から
     // シンボルが参照されうる（`<activity android:name=".MainActivity"/>` 等）。
     // Kotlin/Java AST のみでは追跡できない Android framework 経由の生存判定を補うため、
     // XML 参照集合に含まれるシンボルは dead から除外する。
     // AndroidManifest.xml が存在しないプロジェクトでは空集合が返り副作用なし。
-    let xml_refs = crate::engine::xml_refs::collect_xml_symbol_references(&canonical_dir);
+    let xml = crate::engine::xml_refs::collect_xml_symbol_references(canonical_dir);
 
     // Angular プロジェクトでは `*.component.html` テンプレートや
     // `@Component({ template: \`...\` })` の inline template 内の binding 式から
@@ -160,49 +238,64 @@ pub(crate) fn detect_dead_symbols_from_files(
     // ため、テンプレート参照集合に含まれるシンボルは dead から除外する。
     // angular.json / *.component.ts のどちらも見つからないプロジェクトでは空集合が
     // 返り副作用なし。
-    let template_refs =
-        crate::engine::angular_template_refs::collect_angular_template_refs(&canonical_dir);
+    let template =
+        crate::engine::angular_template_refs::collect_angular_template_refs(canonical_dir);
 
+    FrameworkAssetRefs { xml, template }
+}
+
+/// シンボルの production / test 参照数を返す。
+///
+/// C/C++ では enum 列挙子 / typedef alias (liveness alias) 経由の参照も合算する。
+/// enum 型名が直接使われなくても列挙子が使われていれば live、body あり typedef tag が
+/// alias 名でのみ使われていても live と判定する (Issue #11/#12)。
+fn ref_counts_with_liveness(
+    key: &str,
+    file: &str,
+    index: &DeadCodeNameIndex,
+    counts: &std::collections::HashMap<String, (usize, usize)>,
+) -> (usize, usize) {
+    let (mut prod_cnt, mut test_cnt) = counts.get(key).copied().unwrap_or((0, 0));
+    if let Some(extra_keys) = index
+        .liveness_aliases
+        .get(&(file.to_string(), key.to_string()))
+    {
+        for ek in extra_keys {
+            if let Some((p, t)) = counts.get(ek) {
+                prod_cnt += p;
+                test_cnt += t;
+            }
+        }
+    }
+    (prod_cnt, test_cnt)
+}
+
+/// 参照カウントと各除外規約から dead / test-only シンボルを分類する。
+fn classify_dead_symbols(
+    candidates: &DeadCodeCandidates,
+    index: &DeadCodeNameIndex,
+    counts: &std::collections::HashMap<String, (usize, usize)>,
+    asset_refs: &FrameworkAssetRefs,
+) -> (Vec<DeadSymbol>, Vec<DeadSymbol>) {
     // production 0 / test 0 → dead_symbols
     // production 0 / test > 0 → test_only_symbols (F5)
     // production > 0 → 生存とみなしどちらにも報告しない
     let mut dead = Vec::new();
     let mut test_only = Vec::new();
-    for (name, kind, file, lang) in &all_syms {
-        let key = norm_bare(*lang, name);
+    for (name, kind, file, lang) in &candidates.all_syms {
+        let key = normalized_bare_name(*lang, name);
         // 同名シンボルが複数存在する場合は bare name では区別できないためスキップ
-        if name_counts.get(&key).copied().unwrap_or(0) > 1 {
+        if index.name_counts.get(&key).copied().unwrap_or(0) > 1 {
             continue;
         }
 
-        let (mut prod_cnt, mut test_cnt) = counts.get(&key).copied().unwrap_or((0, 0));
-        // C/C++ の enum 列挙子 / typedef alias 経由の参照も合算する。enum 型名が直接
-        // 使われなくても列挙子が使われていれば live、body あり typedef tag が alias 名でのみ
-        // 使われていても live と判定する (Issue #11/#12)。
-        if let Some(extra_keys) = liveness_aliases.get(&(file.clone(), key.clone())) {
-            for ek in extra_keys {
-                if let Some((p, t)) = counts.get(ek) {
-                    prod_cnt += p;
-                    test_cnt += t;
-                }
-            }
-        }
+        let (prod_cnt, test_cnt) = ref_counts_with_liveness(&key, file, index, counts);
         if prod_cnt > 0 {
             continue;
         }
 
-        // bare name と qualname (Container.method) の両方を XML 参照と突き合わせる。
-        // layout XML の `android:onClick="handler"` は単純名でしか書けないため bare で検索し、
-        // `android:name=".Foo"` 等で Container 側をカバーするケースは qualname でも検査する。
-        let bare = bare_name(name);
-        if xml_refs.contains(bare) || xml_refs.contains(name.as_str()) {
-            continue;
-        }
-
-        // Angular template 参照 (`(event)="handler()"` 等) は bare name でのみ
-        // 出現するため bare で突き合わせる。`Container.method` 形式の qualname も
-        // 念のため両方確認する。
-        if template_refs.contains(bare) || template_refs.contains(name.as_str()) {
+        // Android XML / Angular テンプレート経由で参照されるシンボルは live。
+        if asset_refs.contains_symbol(name) {
             continue;
         }
 
@@ -212,22 +305,9 @@ pub(crate) fn detect_dead_symbols_from_files(
             file: file.clone(),
         };
         if test_cnt > 0 {
-            // PHPUnit テストクラス内のメソッドが test 配下からのみ参照されている場合は
-            // 同一クラス内の self::/static::/$this-> ヘルパー、または @dataProvider /
-            // @depends / #[DataProvider] 経由で reflection 呼び出しされる helper である
-            // 可能性が高く、test_only_symbols としてレポートしてもユーザーには
-            // 「テストランナーが内部で使うだけのノイズ」になる。container 名が PHPUnit
-            // テストクラス規約に合致するメソッドは test_only からも除外する。
-            if matches!(*lang, crate::language::LangId::Php)
-                && let Some((container, _)) = name.rsplit_once('.')
-            {
-                let container_short = container
-                    .rsplit_once('.')
-                    .map(|(_, t)| t)
-                    .unwrap_or(container);
-                if is_phpunit_test_class_name(container_short) {
-                    continue;
-                }
+            // PHPUnit テストクラス内のヘルパーメソッドは test_only からも除外する。
+            if has_phpunit_test_container(name, *lang) {
+                continue;
             }
             test_only.push(sym);
         } else {
@@ -727,6 +807,26 @@ pub(crate) fn is_phpunit_test_class_name(name: &str) -> bool {
         || name.ends_with("TestCase")
         || name.ends_with("IntegrationTest")
         || name.ends_with("FeatureTest")
+}
+
+/// PHP シンボルの qualname container が PHPUnit テストクラス規約に合致するか判定する。
+///
+/// 該当メソッドは同一クラス内の self::/static::/$this-> ヘルパー、または @dataProvider /
+/// @depends / #[DataProvider] 経由で reflection 呼び出しされる helper である可能性が高く、
+/// test_only_symbols としてレポートしても「テストランナーが内部で使うだけのノイズ」になる
+/// ため、test_only からも除外するために使う。
+fn has_phpunit_test_container(name: &str, lang: crate::language::LangId) -> bool {
+    if lang != crate::language::LangId::Php {
+        return false;
+    }
+    let Some((container, _)) = name.rsplit_once('.') else {
+        return false;
+    };
+    let container_short = container
+        .rsplit_once('.')
+        .map(|(_, t)| t)
+        .unwrap_or(container);
+    is_phpunit_test_class_name(container_short)
 }
 
 /// `^test[A-Z_]` で始まるメソッド名かどうか (PHPUnit の testXxx 規約)。

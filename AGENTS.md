@@ -36,6 +36,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/logger.rs` - ロギング（logroller 日次ローテーション、3日保持、tracing-subscriber）
 - `src/cli.rs` - CLI サブコマンド定義（ast, symbols, calls, refs, context, impact, review, dead-code, imports, lint, sequence, cochange, doctor, session, mcp, init）
 - `src/main.rs` - コマンドディスパッチ、キャッシュ層、バッチ処理（全て AppService 経由）、`batch_ndjson` はスコープドスレッド + 順序保持スロットで並列処理と低ピーク RSS を両立
+- `src/commands/api_changes.rs` - API 差分検出（`detect_api_changes`: Phase 0 で exported シンボル抽出 + ApiRefIndex 構築 → process_added/deleted/modified_file）。サブモジュール: `rust_public.rs`（Rust 公開 API 面判定 / re-export edge graph）、`ts_signature.rs`（TS/JS シグネチャ・React HOC / object member / 末尾 optional 互換判定）、`ref_index.rs`（ApiRefIndex + cross-file 参照判定 5 ヘルパー）
+- `src/commands/dead_code.rs` - dead-code 検出（`detect_dead_symbols_from_files` は collect 候補 → name index 構築 → framework asset refs 収集 → classify の 4 ステージ分割、規約除外の追加は classify の述語 1 つで閉じる）
 - `src/mcp/mod.rs` - MCP サーバー（AstroSightServer + AppService::sandboxed(cwd) + 11 ツール、fail-closed: sandbox 生成失敗時はパニック）
 - `src/engine/parser.rs` - tree-sitter パーサー管理（100MB ファイルサイズ上限、SourceBuf によるゼロコピー mmap）
 - `src/engine/extractor.rs` - AST ノード抽出
