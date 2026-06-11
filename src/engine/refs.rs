@@ -59,6 +59,17 @@ pub fn find_references(
             })
     });
 
+    // Angular template (`*.component.html` / inline `template:`) のバインディング式から
+    // の参照を追加する。TS の AST 参照だけでは外部テンプレート経由の呼び出しを取りこぼす
+    // ため (GitLab #18)。非 Angular プロジェクトでは空を返し副作用なし。
+    all_refs.extend(
+        crate::engine::angular_template_refs::find_angular_template_references(
+            symbol_name,
+            dir,
+            glob_pattern,
+        ),
+    );
+
     sort_references(&mut all_refs);
 
     Ok(all_refs)
@@ -1648,6 +1659,18 @@ pub fn find_references_batch(
                 },
             )
     });
+
+    // Angular template バインディング式からの参照を各バケットに統合する (GitLab #18)。
+    // batch 版でテンプレートを名前数分スキャンせず 1 回で全名を引く。
+    let template_refs =
+        crate::engine::angular_template_refs::find_angular_template_references_batch(
+            symbol_names,
+            dir,
+            glob_pattern,
+        );
+    for (bucket, mut t) in buckets.iter_mut().zip(template_refs) {
+        bucket.append(&mut t);
+    }
 
     let mut merged = HashMap::with_capacity(symbol_names.len());
     for (i, name) in symbol_names.iter().enumerate() {

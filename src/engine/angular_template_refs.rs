@@ -15,8 +15,10 @@
 //! identifier トークンを集める。dead-code 判定は false-positive を減らすのが
 //! 目的なので、若干の過剰収集 (例: 式中のキーワード) は許容する。
 
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use crate::models::reference::{RefKind, SymbolReference};
 
 /// テンプレートファイル 1 件あたりの最大サイズ (2MB)。
 /// これを超える HTML/TS（生成物等）はスキップして応答性を保つ。
@@ -494,6 +496,643 @@ fn extract_for_block_refs(expr: &str, refs: &mut HashSet<String>) {
     }
 }
 
+// ============================================================================
+// 位置付き参照検索 (refs コマンド用)
+//
+// dead-code 用の `collect_angular_template_refs` (名前集合・位置なし・過剰収集許容)
+// とは別に、`refs` コマンド向けに Angular template の binding 式に出現するシンボル
+// 参照を path/line/col/context 付きで返す。codex 設計相談 (GitLab #18) の方針:
+//   - 外部 `.html` は `@Component` の `templateUrl` で component に紐付くものだけ走査
+//     (紐付け不能な html は skip し、common method 名のノイズを避ける)
+//   - inline template (`@Component({ template: `...` })`) も対象
+//   - binding の左辺 (event/property 名) は対象外 (式右辺のみ抽出)
+//   - pipe 名 (`| date`)、`$event` 等の Angular local、`*ngFor` の `let`/`as`/`of`
+//     束縛変数、JS 予約語/リテラルは除外
+// dead-code 経路 (上の collect_*) には一切手を入れず、純粋に追加実装する。
+// ============================================================================
+
+/// component に紐付く template の集約結果。
+struct ComponentTemplates {
+    /// `templateUrl` で component に紐付く外部 html の絶対パス (重複除去済み、dir 内)。
+    linked_html: Vec<PathBuf>,
+    /// inline template (component `.ts` 内)。
+    inline: Vec<InlineTemplate>,
+}
+
+/// `.ts` 内の inline template 1 件。
+struct InlineTemplate {
+    /// inline template を含む `.ts` の絶対パス。
+    ts_path: PathBuf,
+    /// template リテラルの中身。
+    content: String,
+    /// `.ts` ファイル内での template 中身先頭の (row, col) (0-indexed, byte col)。
+    base_row: usize,
+    base_col: usize,
+}
+
+/// Angular template から `symbol_name` の参照を位置付きで検索する。
+///
+/// 非 Angular プロジェクト、または該当なしの場合は空 Vec。パスは `dir` 基準の
+/// 絶対パスで返し、呼び出し側 (`find_references`) の `relativize_paths` で相対化される。
+pub fn find_angular_template_references(
+    symbol_name: &str,
+    dir: &Path,
+    glob: Option<&str>,
+) -> Vec<SymbolReference> {
+    let names = [symbol_name.to_string()];
+    find_angular_template_references_batch(&names, dir, glob)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
+
+/// batch 版。複数シンボルを 1 回の template 走査で検索する (`refs --names` 用)。
+/// 戻り値は `symbol_names` と同じ並び・同じ長さの Vec。
+pub fn find_angular_template_references_batch(
+    symbol_names: &[String],
+    dir: &Path,
+    glob: Option<&str>,
+) -> Vec<Vec<SymbolReference>> {
+    let mut out: Vec<Vec<SymbolReference>> = vec![Vec::new(); symbol_names.len()];
+    if symbol_names.is_empty() {
+        return out;
+    }
+    // dir を canonicalize し、以降の templateUrl 解決・境界チェックの基準にする。
+    // symlink を含めた実パスで判定することで、`templateUrl` が symlink 経由で
+    // workspace 外を読むのを防ぐ (fail-closed)。
+    let Ok(dir_canon) = std::fs::canonicalize(dir) else {
+        return out;
+    };
+    let dir = dir_canon.as_path();
+    if !is_angular_project(dir) {
+        return out;
+    }
+    // Angular template の identifier は case-sensitive。名前 → 出力 index。
+    let mut name_to_ix: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, n) in symbol_names.iter().enumerate() {
+        if !n.is_empty() {
+            name_to_ix.entry(n.as_str()).or_default().push(i);
+        }
+    }
+    if name_to_ix.is_empty() {
+        return out;
+    }
+
+    // glob は実ファイルパスで判定する (`src/**/*.html` のようなパス限定 glob にも対応)。
+    let glob_ov = build_glob_override(dir, glob);
+    let model = collect_component_templates(dir, &glob_ov);
+
+    // inline template: component `.ts` 内に式があるので、ts 座標へ変換して emit。
+    for inl in &model.inline {
+        let Ok(ts_content) = std::fs::read_to_string(&inl.ts_path) else {
+            continue;
+        };
+        let path_str = inl.ts_path.to_string_lossy().to_string();
+        scan_template_region_emit(
+            &inl.content,
+            inl.base_row,
+            inl.base_col,
+            &ts_content,
+            &path_str,
+            &name_to_ix,
+            &mut out,
+        );
+    }
+
+    // 外部 html: templateUrl で component に紐付くものだけ走査。
+    for html_path in &model.linked_html {
+        let Ok(content) = std::fs::read_to_string(html_path) else {
+            continue;
+        };
+        let path_str = html_path.to_string_lossy().to_string();
+        scan_template_region_emit(&content, 0, 0, &content, &path_str, &name_to_ix, &mut out);
+    }
+
+    for refs in &mut out {
+        refs.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line.cmp(&b.line)));
+    }
+    out
+}
+
+/// `glob` から override matcher を構築する。`glob` 未指定 / 構築失敗時は `None` (= 全許可)。
+fn build_glob_override(dir: &Path, glob: Option<&str>) -> Option<ignore::overrides::Override> {
+    let g = glob?;
+    let mut ob = ignore::overrides::OverrideBuilder::new(dir);
+    ob.add(g).ok()?;
+    ob.build().ok()
+}
+
+/// `path` が glob にマッチするか。`ov` が `None` (glob 未指定) なら常に true。
+/// 既存 `refs --glob` と揃え、whitelist に明示マッチしたパスのみ許可する。
+fn path_matches_glob(ov: &Option<ignore::overrides::Override>, path: &Path) -> bool {
+    match ov {
+        None => true,
+        Some(o) => o.matched(path, false).is_whitelist(),
+    }
+}
+
+/// `dir` 配下の `.ts` を走査し、`@Component` の `templateUrl` / inline `template` を集める。
+///
+/// glob 指定時は、外部 html / inline を含む `.ts` の実パスが glob にマッチするものだけを残す
+/// (templateUrl の発見自体には `.ts` の読み込みが必要なので、`.ts` の走査自体は glob で
+/// 絞らない)。
+fn collect_component_templates(
+    dir: &Path,
+    glob_ov: &Option<ignore::overrides::Override>,
+) -> ComponentTemplates {
+    let mut linked_html: Vec<PathBuf> = Vec::new();
+    let mut seen_html: HashSet<PathBuf> = HashSet::new();
+    let mut inline: Vec<InlineTemplate> = Vec::new();
+
+    // refs の collect_files と可視性ポリシーを揃える (hidden を除外、.gitignore を尊重)。
+    // 通常の refs が拾わない `.hidden/` 配下のテンプレートから参照が出ないようにする。
+    let walker = ignore::WalkBuilder::new(dir)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .build();
+    for entry in walker.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("ts") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() || meta.len() > MAX_TEMPLATE_FILE_SIZE {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        // component 紐付けの担保: `@Component` を含む .ts のみを対象にする。
+        if !content.contains("@Component") {
+            continue;
+        }
+        // 外部 html: 解決後の実パスが glob にマッチするものだけ採用。
+        for url in extract_template_urls(&content) {
+            if let Some(p) = resolve_template_path(path, &url, dir)
+                && path_matches_glob(glob_ov, &p)
+                && seen_html.insert(p.clone())
+            {
+                linked_html.push(p);
+            }
+        }
+        // inline template: その `.ts` 自体が glob にマッチするときだけ採用。
+        if path_matches_glob(glob_ov, path) {
+            for (tpl, base_row, base_col) in extract_inline_templates_with_pos(&content) {
+                inline.push(InlineTemplate {
+                    ts_path: path.to_path_buf(),
+                    content: tpl,
+                    base_row,
+                    base_col,
+                });
+            }
+        }
+    }
+    ComponentTemplates {
+        linked_html,
+        inline,
+    }
+}
+
+/// `templateUrl: '...'` の文字列値をすべて返す。
+fn extract_template_urls(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = content.as_bytes();
+    let needle = b"templateUrl";
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] != needle {
+            i += 1;
+            continue;
+        }
+        // 前が識別子継続文字なら別シンボル (`myTemplateUrl` 等)。
+        if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+            i += 1;
+            continue;
+        }
+        let mut j = i + needle.len();
+        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b':' {
+            i += needle.len();
+            continue;
+        }
+        j += 1;
+        while j < bytes.len()
+            && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r')
+        {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            break;
+        }
+        let quote = bytes[j];
+        if quote != b'\'' && quote != b'"' && quote != b'`' {
+            i = j;
+            continue;
+        }
+        j += 1;
+        let start = j;
+        while j < bytes.len() && bytes[j] != quote {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            break;
+        }
+        if let Ok(url) = std::str::from_utf8(&bytes[start..j]) {
+            out.push(url.to_string());
+        }
+        i = j + 1;
+    }
+    out
+}
+
+/// inline `template:` の中身を (content, base_row, base_col) で返す。
+/// base_row/base_col は `.ts` ファイル内での template 中身先頭位置 (0-indexed, byte col)。
+fn extract_inline_templates_with_pos(content: &str) -> Vec<(String, usize, usize)> {
+    let mut out = Vec::new();
+    let bytes = content.as_bytes();
+    let needle = b"template:";
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] != needle {
+            i += 1;
+            continue;
+        }
+        // 前が識別子継続文字なら別キー (`templateUrl:` は別途処理済みなので除外)。
+        if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+            i += 1;
+            continue;
+        }
+        let mut j = i + needle.len();
+        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            break;
+        }
+        let quote = bytes[j];
+        if quote != b'`' && quote != b'\'' && quote != b'"' {
+            i = j.max(i + 1);
+            continue;
+        }
+        j += 1;
+        let start = j;
+        while j < bytes.len() && bytes[j] != quote {
+            if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                j += 2;
+            } else {
+                j += 1;
+            }
+        }
+        if j >= bytes.len() {
+            break;
+        }
+        if let Ok(tpl) = std::str::from_utf8(&bytes[start..j]) {
+            let (base_row, base_col) = byte_to_row_col(content, start);
+            out.push((tpl.to_string(), base_row, base_col));
+        }
+        i = j + 1;
+    }
+    out
+}
+
+/// `templateUrl` を `.ts` の親ディレクトリ基準で解決し、canonicalize 後に `dir`
+/// (canonical) 配下の実ファイルなら返す。
+///
+/// canonicalize で symlink を解決するため、`foo.component.html -> /etc/secret` のような
+/// symlink を `templateUrl` にしても workspace 外のファイルを読み出さない (fail-closed)。
+/// `dir` は呼び出し側で canonicalize 済みであることが前提。
+fn resolve_template_path(ts_path: &Path, url: &str, dir: &Path) -> Option<PathBuf> {
+    // 絶対 URL や `http(s):` は対象外。
+    if url.is_empty() || url.starts_with("http://") || url.starts_with("https://") {
+        return None;
+    }
+    let parent = ts_path.parent()?;
+    let joined = parent.join(url);
+    // canonicalize は symlink を解決し、存在しないパスでは Err になる。
+    let canon = std::fs::canonicalize(&joined).ok()?;
+    if !canon.starts_with(dir) {
+        return None;
+    }
+    // 通常ファイルかつサイズ上限内のみ採用 (`.ts` 側と同じく巨大 HTML をスキップして応答性を保つ)。
+    let meta = std::fs::metadata(&canon).ok()?;
+    if !meta.is_file() || meta.len() > MAX_TEMPLATE_FILE_SIZE {
+        return None;
+    }
+    Some(canon)
+}
+
+/// template 領域 (`region`) を走査し、`name_to_ix` に一致する参照を `out` に emit する。
+///
+/// `base_row` / `base_col` は `region` の先頭が属するファイル上の位置 (inline template
+/// なら `.ts` 内、外部 html なら 0,0)。`file_content` は context 行抽出用のファイル全体。
+fn scan_template_region_emit(
+    region: &str,
+    base_row: usize,
+    base_col: usize,
+    file_content: &str,
+    file_path: &str,
+    name_to_ix: &HashMap<&str, Vec<usize>>,
+    out: &mut [Vec<SymbolReference>],
+) {
+    // Pass 1: template 全体の `*ngFor` / `let-` / `as` ローカル束縛名を集める。
+    // ループ変数 (`let item of items` の `item`) は別の式 (`{{ item.name }}`) でも
+    // 使われ得るため、式単位ではなく region 全体でローカル集合を作って除外する。
+    let mut region_locals: HashSet<String> = HashSet::new();
+    for_each_template_expr(region, &mut |expr, _base| {
+        region_locals.extend(template_expr_locals(expr).into_iter().map(str::to_string));
+    });
+
+    // Pass 2: 各式から component member 参照を emit する。
+    let mut sink = |ident: &str, byte_off: usize| {
+        let Some(ixs) = name_to_ix.get(ident) else {
+            return;
+        };
+        let (trow, tcol) = byte_to_row_col(region, byte_off);
+        let frow = base_row + trow;
+        let fcol = if trow == 0 { base_col + tcol } else { tcol };
+        let ctx = file_line_context(file_content, frow);
+        for &ix in ixs {
+            out[ix].push(SymbolReference {
+                path: file_path.to_string(),
+                line: frow,
+                column: fcol,
+                context: Some(ctx.clone()),
+                kind: Some(RefKind::Reference),
+                confidence: None,
+            });
+        }
+    };
+    for_each_template_expr(region, &mut |expr, base| {
+        for_each_expr_member_ref(expr, base, &region_locals, &mut sink);
+    });
+}
+
+/// template 内のすべての binding 式 (`{{ }}` 補間 + 属性 binding 右辺) を
+/// `(expr, content 内 byte 位置)` で `f` に渡す。
+fn for_each_template_expr(content: &str, f: &mut impl FnMut(&str, usize)) {
+    each_interpolation_expr(content, f);
+    each_binding_expr(content, f);
+}
+
+/// `{{ expr }}` 補間式の中身を `(expr, byte 位置)` で `f` に渡す。
+fn each_interpolation_expr(content: &str, f: &mut impl FnMut(&str, usize)) {
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'{' && bytes[i + 1] == b'{' {
+            let start = i + 2;
+            let mut j = start;
+            while j + 1 < bytes.len() && !(bytes[j] == b'}' && bytes[j + 1] == b'}') {
+                j += 1;
+            }
+            if j + 1 >= bytes.len() {
+                break;
+            }
+            if let Ok(expr) = std::str::from_utf8(&bytes[start..j]) {
+                f(expr, start);
+            }
+            i = j + 2;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// `(event)="expr"` / `[prop]="expr"` / `*ngIf="expr"` 等の binding 右辺式を
+/// `(expr, byte 位置)` で `f` に渡す。binding 名 (左辺) は対象外。
+fn each_binding_expr(content: &str, f: &mut impl FnMut(&str, usize)) {
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let prev_is_boundary = i == 0 || is_attr_separator(bytes[i - 1]);
+        if !prev_is_boundary {
+            i += 1;
+            continue;
+        }
+        let starts_binding = matches!(bytes[i], b'(' | b'[' | b'*')
+            || (i + 4 < bytes.len() && &bytes[i..i + 4] == b"let-");
+        if !starts_binding {
+            i += 1;
+            continue;
+        }
+        // 属性名を読み飛ばす: `=` まで進める。
+        let mut j = i;
+        while j < bytes.len() {
+            let b = bytes[j];
+            if b == b'=' || is_attr_separator(b) || b == b'>' || b == b'/' {
+                break;
+            }
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'=' {
+            i = j.max(i + 1);
+            continue;
+        }
+        j += 1; // `=` の次へ
+        if j >= bytes.len() {
+            i = j;
+            continue;
+        }
+        if bytes[j] == b'"' || bytes[j] == b'\'' {
+            let quote = bytes[j];
+            j += 1;
+            let start = j;
+            while j < bytes.len() && bytes[j] != quote {
+                j += 1;
+            }
+            if j >= bytes.len() {
+                break;
+            }
+            if let Ok(expr) = std::str::from_utf8(&bytes[start..j]) {
+                f(expr, start);
+            }
+            i = j + 1;
+        } else {
+            // 引用符なし属性値: 空白 / `>` / `/` まで
+            let start = j;
+            while j < bytes.len()
+                && !is_attr_separator(bytes[j])
+                && bytes[j] != b'>'
+                && bytes[j] != b'/'
+            {
+                j += 1;
+            }
+            if let Ok(expr) = std::str::from_utf8(&bytes[start..j]) {
+                f(expr, start);
+            }
+            i = j;
+        }
+    }
+}
+
+/// 式 `expr` (file 内 byte 位置 `byte_base` から始まる) の component member 参照候補を
+/// `(ident, abs_byte_offset)` で sink に渡す。
+///
+/// 除外: 文字列リテラル (`'...'` / `"..."` / `` `...` ``) 内、`$`-prefix (`$event` 等)、
+/// pipe 名 (`| date` の `date`)、property access の右辺 (`a.b` の `b`)、`locals`
+/// (template 全体の `let`/`as`/`of`/`in` 束縛変数)、JS 予約語/リテラル。
+fn for_each_expr_member_ref(
+    expr: &str,
+    byte_base: usize,
+    locals: &HashSet<String>,
+    sink: &mut impl FnMut(&str, usize),
+) {
+    let bytes = expr.as_bytes();
+    let mut i = 0;
+    // 直前の significant byte 種別: 0=なし, b'.'=member access, b'|'=pipe, その他。
+    let mut prev_sig: u8 = 0;
+    // 文字列リテラル内かどうか (開始引用符)。文字列内の識別子は参照に数えない
+    // (`toast('save')` の `save`、`{'display': ...}` の `display` 等を誤検出しない)。
+    let mut in_str: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            prev_sig = b'"'; // 文字列の後は member access でも pipe でもない
+            i += 1;
+            continue;
+        }
+        if b == b'\'' || b == b'"' || b == b'`' {
+            in_str = Some(b);
+            prev_sig = b'"';
+            i += 1;
+            continue;
+        }
+        if b == b'|' {
+            // `||` (logical or) と単一 `|` (pipe) を区別する。
+            if i + 1 < bytes.len() && bytes[i + 1] == b'|' {
+                prev_sig = b'O';
+                i += 2;
+            } else {
+                prev_sig = b'|';
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'?' && i + 1 < bytes.len() && bytes[i + 1] == b'.' {
+            // optional chaining `a?.b`: `b` は member access。
+            prev_sig = b'.';
+            i += 2;
+            continue;
+        }
+        if is_ident_start(b) {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && is_ident_continue(bytes[i]) {
+                i += 1;
+            }
+            let ident = &expr[start..i];
+            let skip = ident.starts_with('$')
+                || prev_sig == b'|'
+                || prev_sig == b'.'
+                || locals.contains(ident)
+                || is_template_reserved(ident);
+            if !skip {
+                sink(ident, byte_base + start);
+            }
+            prev_sig = b'a'; // identifier (member access でも pipe でもない)
+            continue;
+        }
+        if !b.is_ascii_whitespace() {
+            prev_sig = b;
+        }
+        i += 1;
+    }
+}
+
+/// 式内で `let X` / `as Y` / `X of/in` で束縛されるローカル変数名を集める
+/// (`*ngFor="let item of items"` の `item` 等。component member 参照と誤認しないため)。
+fn template_expr_locals(expr: &str) -> HashSet<&str> {
+    let mut locals = HashSet::new();
+    // ident トークン列を keyword 認識付きで取り出す。
+    let mut toks: Vec<&str> = Vec::new();
+    let bytes = expr.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if is_ident_start(bytes[i]) {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && is_ident_continue(bytes[i]) {
+                i += 1;
+            }
+            toks.push(&expr[start..i]);
+        } else {
+            i += 1;
+        }
+    }
+    for k in 0..toks.len() {
+        match toks[k] {
+            "let" | "as" => {
+                if let Some(name) = toks.get(k + 1) {
+                    locals.insert(*name);
+                }
+            }
+            "of" | "in" if k > 0 => {
+                locals.insert(toks[k - 1]);
+            }
+            _ => {}
+        }
+    }
+    locals
+}
+
+/// template 式で component member 参照とみなさない JS 予約語/リテラル/microsyntax keyword。
+fn is_template_reserved(ident: &str) -> bool {
+    matches!(
+        ident,
+        "true"
+            | "false"
+            | "null"
+            | "undefined"
+            | "this"
+            | "new"
+            | "typeof"
+            | "instanceof"
+            | "void"
+            | "in"
+            | "of"
+            | "as"
+            | "let"
+    )
+}
+
+/// `content` の byte offset を (row, col) (0-indexed, byte col) に変換する。
+fn byte_to_row_col(content: &str, byte: usize) -> (usize, usize) {
+    let bytes = content.as_bytes();
+    let limit = byte.min(bytes.len());
+    let mut row = 0;
+    let mut line_start = 0;
+    for (idx, &b) in bytes.iter().enumerate().take(limit) {
+        if b == b'\n' {
+            row += 1;
+            line_start = idx + 1;
+        }
+    }
+    (row, limit - line_start)
+}
+
+/// `content` の `row` 行目を context として返す (前後空白を trim、256 byte 上限・UTF-8 境界安全)。
+fn file_line_context(content: &str, row: usize) -> String {
+    let line = content.lines().nth(row).unwrap_or("").trim();
+    if line.len() <= 256 {
+        return line.to_string();
+    }
+    let mut end = 256;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    line[..end].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,5 +1452,336 @@ export class HeaderComponent {
         extract_control_flow_refs(html, &mut refs);
         assert!(refs.contains("computeTotal"));
         assert!(refs.contains("formatPair"));
+    }
+
+    // ---- 位置付き参照検索 (refs コマンド用) ----
+
+    fn html_ref_lines(refs: &[SymbolReference], suffix: &str) -> Vec<usize> {
+        refs.iter()
+            .filter(|r| r.path.ends_with(suffix))
+            .map(|r| r.line)
+            .collect()
+    }
+
+    #[test]
+    fn template_refs_finds_external_html_event_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("foo.component.ts"),
+            "@Component({ templateUrl: './foo.component.html' })\nexport class FooComponent { showModal(): void {} }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("foo.component.html"),
+            "<button (click)=\"showModal()\"></button>",
+        )
+        .unwrap();
+        let refs = find_angular_template_references("showModal", dir.path(), None);
+        assert_eq!(
+            html_ref_lines(&refs, "foo.component.html"),
+            vec![0],
+            "{refs:?}"
+        );
+        assert!(refs.iter().all(|r| r.kind == Some(RefKind::Reference)));
+    }
+
+    #[test]
+    fn template_refs_finds_inline_template_with_ts_coordinates() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("foo.component.ts"),
+            "import { Component } from '@angular/core';\n@Component({\n  template: `<b (click)=\"doSave()\"></b>`,\n})\nexport class FooComponent { doSave(): void {} }\n",
+        )
+        .unwrap();
+        let refs = find_angular_template_references("doSave", dir.path(), None);
+        // inline の参照は .ts の template 行 (0-indexed 行2) を指す。
+        assert_eq!(
+            html_ref_lines(&refs, "foo.component.ts"),
+            vec![2],
+            "{refs:?}"
+        );
+    }
+
+    #[test]
+    fn template_refs_excludes_binding_name_left_side() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.component.ts"),
+            "@Component({ templateUrl: './a.component.html' })\nexport class A {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("a.component.html"),
+            "<x (myEvent)=\"handler()\" [myProp]=\"value\"></x>",
+        )
+        .unwrap();
+        // event/property 名 (左辺) は参照に含めない。
+        assert!(find_angular_template_references("myEvent", dir.path(), None).is_empty());
+        assert!(find_angular_template_references("myProp", dir.path(), None).is_empty());
+    }
+
+    #[test]
+    fn template_refs_excludes_dollar_locals_and_pipes_and_member_access() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.component.ts"),
+            "@Component({ templateUrl: './a.component.html' })\nexport class A {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("a.component.html"),
+            "<x (e)=\"sel($event)\">{{ total | date }}{{ user.date }}</x>",
+        )
+        .unwrap();
+        // $event (Angular local)、pipe 名 date、member access (user.date の date) は除外。
+        assert!(find_angular_template_references("event", dir.path(), None).is_empty());
+        assert!(find_angular_template_references("date", dir.path(), None).is_empty());
+        // 一方で式中の関数呼び出しは拾う。
+        assert!(!find_angular_template_references("sel", dir.path(), None).is_empty());
+    }
+
+    #[test]
+    fn template_refs_excludes_ngfor_loop_local_across_expressions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.component.ts"),
+            "@Component({ templateUrl: './a.component.html' })\nexport class A {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("a.component.html"),
+            "<li *ngFor=\"let item of items\">{{ item.label }}</li>",
+        )
+        .unwrap();
+        // ループ変数 item は別式 {{ item.label }} でも参照とみなさない。
+        assert!(find_angular_template_references("item", dir.path(), None).is_empty());
+        // iterable の items は component member 参照として拾う。
+        assert!(!find_angular_template_references("items", dir.path(), None).is_empty());
+    }
+
+    #[test]
+    fn template_refs_skips_unlinked_html() {
+        let dir = tempfile::tempdir().unwrap();
+        // component はあるが、orphan.html を templateUrl で参照していない。
+        std::fs::write(
+            dir.path().join("a.component.ts"),
+            "@Component({ templateUrl: './a.component.html' })\nexport class A { doIt(): void {} }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("a.component.html"), "<b></b>").unwrap();
+        std::fs::write(
+            dir.path().join("orphan.html"),
+            "<button (click)=\"doIt()\"></button>",
+        )
+        .unwrap();
+        let refs = find_angular_template_references("doIt", dir.path(), None);
+        assert!(
+            html_ref_lines(&refs, "orphan.html").is_empty(),
+            "紐付け不能な html は走査しない: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn template_refs_links_shared_template_via_concrete_component() {
+        // GitLab #18 の本質: メソッドは abstract base に定義され、共有 html は
+        // concrete component の templateUrl で紐付く。
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("base.component.ts"),
+            "@Directive()\nexport abstract class Base { protected showFavoriteEditModal(): void {} }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("agent.component.ts"),
+            "@Component({ templateUrl: './layout.html' })\nexport class Agent extends Base {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("layout.html"),
+            "<x (editModalOpenClicked)=\"showFavoriteEditModal()\"></x>",
+        )
+        .unwrap();
+        let refs = find_angular_template_references("showFavoriteEditModal", dir.path(), None);
+        assert_eq!(html_ref_lines(&refs, "layout.html"), vec![0], "{refs:?}");
+    }
+
+    #[test]
+    fn template_refs_empty_for_non_angular_project() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ts"), "export function doIt() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("b.html"),
+            "<button (click)=\"doIt()\"></button>",
+        )
+        .unwrap();
+        assert!(find_angular_template_references("doIt", dir.path(), None).is_empty());
+    }
+
+    #[test]
+    fn template_refs_batch_aligns_results() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.component.ts"),
+            "@Component({ templateUrl: './a.component.html' })\nexport class A {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("a.component.html"),
+            "<x (a)=\"foo()\" (b)=\"bar()\"></x>",
+        )
+        .unwrap();
+        let names = vec!["foo".to_string(), "missing".to_string(), "bar".to_string()];
+        let batch = find_angular_template_references_batch(&names, dir.path(), None);
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].len(), 1, "foo");
+        assert!(batch[1].is_empty(), "missing");
+        assert_eq!(batch[2].len(), 1, "bar");
+    }
+
+    #[test]
+    fn template_refs_glob_scopes_html_vs_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.component.ts"),
+            "@Component({ templateUrl: './a.component.html', template: `<i (x)=\"inlineFn()\"></i>` })\nexport class A {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("a.component.html"),
+            "<x (y)=\"htmlFn()\"></x>",
+        )
+        .unwrap();
+        // --glob '**/*.html' → 外部 html のみ
+        assert!(
+            !find_angular_template_references("htmlFn", dir.path(), Some("**/*.html")).is_empty()
+        );
+        assert!(
+            find_angular_template_references("inlineFn", dir.path(), Some("**/*.html")).is_empty()
+        );
+        // --glob '**/*.ts' → inline のみ
+        assert!(find_angular_template_references("htmlFn", dir.path(), Some("**/*.ts")).is_empty());
+        assert!(
+            !find_angular_template_references("inlineFn", dir.path(), Some("**/*.ts")).is_empty()
+        );
+    }
+
+    #[test]
+    fn template_refs_excludes_string_literals() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.component.ts"),
+            "@Component({ templateUrl: './a.component.html' })\nexport class A {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("a.component.html"),
+            "<x (click)=\"toast('save')\" [ngStyle]=\"{'display': flag ? 'a' : 'b'}\"></x>",
+        )
+        .unwrap();
+        // 文字列リテラル内の `save` / quoted key `'display'` は参照に数えない。
+        assert!(find_angular_template_references("save", dir.path(), None).is_empty());
+        assert!(find_angular_template_references("display", dir.path(), None).is_empty());
+        // 一方で関数呼び出し / 式中の変数は拾う。
+        assert!(!find_angular_template_references("toast", dir.path(), None).is_empty());
+        assert!(!find_angular_template_references("flag", dir.path(), None).is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn template_refs_rejects_symlink_template_url_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            outside.path(),
+            "<button (click)=\"outsideSecret()\"></button>",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("foo.component.ts"),
+            "@Component({ templateUrl: './foo.component.html' })\nexport class Foo { outsideSecret(): void {} }\n",
+        )
+        .unwrap();
+        // foo.component.html を workspace 外の実ファイルへの symlink にする。
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("foo.component.html")).unwrap();
+        let refs = find_angular_template_references("outsideSecret", dir.path(), None);
+        // symlink 経由で workspace 外を読まない (html 参照は 0)。
+        assert!(
+            refs.iter().all(|r| !r.path.ends_with(".html")),
+            "symlink escape を許してはいけない: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn template_refs_respects_path_specific_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/foo.component.ts"),
+            "@Component({ templateUrl: './foo.component.html' })\nexport class Foo { doIt(): void {} }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/foo.component.html"),
+            "<button (click)=\"doIt()\"></button>",
+        )
+        .unwrap();
+        // パス限定 glob でも実パスで判定して html 参照を拾う。
+        for glob in ["src/**/*.html", "**/*.component.html", "**/*.html"] {
+            let refs = find_angular_template_references("doIt", dir.path(), Some(glob));
+            assert_eq!(
+                html_ref_lines(&refs, "foo.component.html"),
+                vec![0],
+                "glob {glob} で html 参照が取れること"
+            );
+        }
+    }
+
+    #[test]
+    fn template_refs_skips_oversized_external_html() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("big.component.ts"),
+            "@Component({ templateUrl: './big.component.html' })\nexport class Big { bigFn(): void {} }\n",
+        )
+        .unwrap();
+        // MAX_TEMPLATE_FILE_SIZE 超の html はスキップする (.ts 側と同じ応答性ポリシー)。
+        let padding = "x".repeat(MAX_TEMPLATE_FILE_SIZE as usize);
+        std::fs::write(
+            dir.path().join("big.component.html"),
+            format!("<button (click)=\"bigFn()\"></button>\n<!-- {padding} -->"),
+        )
+        .unwrap();
+        assert!(find_angular_template_references("bigFn", dir.path(), None).is_empty());
+    }
+
+    #[test]
+    fn template_refs_skips_hidden_dir_like_collect_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // 通常の component (可視) と hidden 配下の component を用意する。
+        std::fs::write(
+            dir.path().join("ok.component.ts"),
+            "@Component({ templateUrl: './ok.component.html' })\nexport class Ok { okFn(): void {} }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("ok.component.html"),
+            "<button (click)=\"okFn()\"></button>",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join(".hidden")).unwrap();
+        std::fs::write(
+            dir.path().join(".hidden/sneaky.component.ts"),
+            "@Component({ templateUrl: './sneaky.component.html' })\nexport class Sneaky { hiddenFn(): void {} }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".hidden/sneaky.component.html"),
+            "<button (click)=\"hiddenFn()\"></button>",
+        )
+        .unwrap();
+        // 可視 component の参照は拾うが、hidden 配下のテンプレートからは拾わない
+        // (refs の collect_files が hidden を除外するのと揃える)。
+        assert!(!find_angular_template_references("okFn", dir.path(), None).is_empty());
+        assert!(find_angular_template_references("hiddenFn", dir.path(), None).is_empty());
     }
 }
