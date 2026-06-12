@@ -162,19 +162,9 @@ fn resolve_paths(
 fn run(cli: Cli) -> Result<()> {
     let pretty = cli.pretty;
 
-    // Load configuration
-    let config = ConfigService::load(cli.config.as_deref())?;
-
-    // debug モード時（CLI フラグまたは config）のみロギングを初期化する。
-    // 書込不可ディレクトリ等でログ初期化に失敗しても解析本体は止めず、
-    // 警告を出して続行する（debug 有効かつ読み取り専用環境などへの堅牢化）。
-    if (cli.debug || config.debug)
-        && let Err(e) = astro_sight::logger::init(&config)
-    {
-        eprintln!("warning: failed to initialize logging (continuing without it): {e}");
-    }
-
-    // Handle early-exit commands before creating AppService
+    // config を読まずに完結する早期終了コマンドを config ロードより前に処理する。
+    // init / skill-install は既存 config を必要としないため、既存 config が壊れて
+    // いても動作すべき（特に init は壊れた config の再生成手段になる）。
     match &cli.command {
         Commands::Init { path } => {
             let config_path = if let Some(p) = path {
@@ -192,6 +182,18 @@ fn run(cli: Cli) -> Result<()> {
             return Ok(());
         }
         _ => {}
+    }
+
+    // 設定をロードする
+    let config = ConfigService::load(cli.config.as_deref())?;
+
+    // debug モード時（CLI フラグまたは config）のみロギングを初期化する。
+    // 書込不可ディレクトリ等でログ初期化に失敗しても解析本体は止めず、
+    // 警告を出して続行する（debug 有効かつ読み取り専用環境などへの堅牢化）。
+    if (cli.debug || config.debug)
+        && let Err(e) = astro_sight::logger::init(&config)
+    {
+        eprintln!("warning: failed to initialize logging (continuing without it): {e}");
     }
 
     // Log command invocation with CWD and input parameters

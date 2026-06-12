@@ -22,6 +22,18 @@ fn bounded_worker_count() -> usize {
         .unwrap_or(4)
 }
 
+/// `find_references_batch` の内部 chunk サイズ。既定 64。
+/// AC trie はパターン数に対して非線形にメモリを使い、fold バケットも名前数分
+/// 確保されるため、名前を chunk 分割して trie / バケットを chunk サイズで上限する。
+/// `ASTRO_SIGHT_REFS_BATCH_CHUNK` で上書き可能。
+fn refs_batch_chunk_size() -> usize {
+    std::env::var("ASTRO_SIGHT_REFS_BATCH_CHUNK")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(64)
+}
+
 /// 指定シンボルへの参照をディレクトリ内のファイルから検索する。
 /// glob パターン（例: "**/*.rs"）によるフィルタも可能。
 pub fn find_references(
@@ -1606,13 +1618,11 @@ pub fn find_references_batch(
         return Ok(HashMap::new());
     }
 
-    // AC は ASCII CI で構築: CI 言語 (Xojo) で case 違いを事前フィルタで取りこぼさないため。
-    // 非 CI 言語では多少の false positive (大文字小文字違い) が発生するが、AST 比較で弾く。
-    let ac = aho_corasick::AhoCorasick::builder()
-        .ascii_case_insensitive(true)
-        .build(symbol_names)
-        .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))?;
-
+    // ディレクトリウォーク + 全ファイルの生成物マーカー読込 (先頭 4KB) は名前数に依らず
+    // 1 回で済ます。以前は呼び出し側が名前を chunk 分割して本関数を chunk 回呼んでいたため
+    // walk が ceil(N / chunk) 回繰り返され、大規模リポでは参照検索の純コストが walk の
+    // 再実行に支配されていた。files / pool を全 chunk で共有して 1 回に集約する
+    // (count_non_definition_refs_split と同じ手法)。
     let files = collect_files(dir, glob_pattern)?;
 
     // rayon のワーカー数を上限付きにする。ワーカー毎に `Vec<Vec<SymbolReference>>` の
@@ -1628,56 +1638,71 @@ pub fn find_references_batch(
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build rayon pool: {e}"))?;
 
-    // fold/reduce: ワーカーごとに Vec<Vec<SymbolReference>> を持ち、直接統合
-    let mut buckets: Vec<Vec<SymbolReference>> = pool.install(|| {
-        files
-            .into_par_iter()
-            .fold(
-                || vec![Vec::new(); symbol_names.len()],
-                |mut local, path| {
-                    let Some(path_str) = path.to_str() else {
-                        return local;
-                    };
-                    let utf8_path = camino::Utf8Path::new(path_str);
-                    if let Ok(per_file) =
-                        find_refs_batch_in_file_indexed(symbol_names, &ac, utf8_path)
-                    {
-                        for (ix, mut refs) in per_file.into_iter().enumerate() {
-                            local[ix].append(&mut refs);
+    // AC trie はパターン数に対して非線形にメモリを使い、fold バケットも名前数分確保される。
+    // 名前を chunk 分割して chunk 毎に trie 構築 → 走査 → drop し、ピーク RSS を chunk
+    // サイズに対して定数で抑える。files / pool は全 chunk で共有する。
+    let mut merged: HashMap<String, Vec<SymbolReference>> =
+        HashMap::with_capacity(symbol_names.len());
+
+    for chunk in symbol_names.chunks(refs_batch_chunk_size()) {
+        // AC は ASCII CI で構築: CI 言語 (Xojo) で case 違いを事前フィルタで取りこぼさない
+        // ため。非 CI 言語では多少の false positive (大文字小文字違い) が発生するが、AST
+        // 比較で弾く。
+        let ac = aho_corasick::AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(chunk)
+            .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))?;
+
+        // fold/reduce: ワーカーごとに Vec<Vec<SymbolReference>> を持ち、直接統合する。
+        // files は借用で共有し、chunk 毎に walk し直さない。
+        let mut buckets: Vec<Vec<SymbolReference>> = pool.install(|| {
+            files
+                .par_iter()
+                .fold(
+                    || vec![Vec::new(); chunk.len()],
+                    |mut local, path| {
+                        let Some(path_str) = path.to_str() else {
+                            return local;
+                        };
+                        let utf8_path = camino::Utf8Path::new(path_str);
+                        if let Ok(per_file) = find_refs_batch_in_file_indexed(chunk, &ac, utf8_path)
+                        {
+                            for (ix, mut refs) in per_file.into_iter().enumerate() {
+                                local[ix].append(&mut refs);
+                            }
                         }
-                    }
-                    local
-                },
-            )
-            .reduce(
-                || vec![Vec::new(); symbol_names.len()],
-                |mut acc, mut local| {
-                    for (acc_refs, local_refs) in acc.iter_mut().zip(local.iter_mut()) {
-                        acc_refs.append(local_refs);
-                    }
-                    acc
-                },
-            )
-    });
+                        local
+                    },
+                )
+                .reduce(
+                    || vec![Vec::new(); chunk.len()],
+                    |mut acc, mut local| {
+                        for (acc_refs, local_refs) in acc.iter_mut().zip(local.iter_mut()) {
+                            acc_refs.append(local_refs);
+                        }
+                        acc
+                    },
+                )
+        });
 
-    // Angular template バインディング式からの参照を各バケットに統合する (GitLab #18)。
-    // batch 版でテンプレートを名前数分スキャンせず 1 回で全名を引く。
-    let template_refs =
-        crate::engine::angular_template_refs::find_angular_template_references_batch(
-            symbol_names,
-            dir,
-            glob_pattern,
-        );
-    for (bucket, mut t) in buckets.iter_mut().zip(template_refs) {
-        bucket.append(&mut t);
-    }
+        // Angular template バインディング式からの参照を chunk 分まとめて統合する (GitLab #18)。
+        // テンプレートを名前数分スキャンせず chunk 単位で全名を 1 回で引く。
+        let template_refs =
+            crate::engine::angular_template_refs::find_angular_template_references_batch(
+                chunk,
+                dir,
+                glob_pattern,
+            );
+        for (bucket, mut t) in buckets.iter_mut().zip(template_refs) {
+            bucket.append(&mut t);
+        }
 
-    let mut merged = HashMap::with_capacity(symbol_names.len());
-    for (i, name) in symbol_names.iter().enumerate() {
-        let mut refs = std::mem::take(&mut buckets[i]);
-        sort_references(&mut refs);
-        if !refs.is_empty() {
-            merged.insert(name.clone(), refs);
+        for (i, name) in chunk.iter().enumerate() {
+            let mut refs = std::mem::take(&mut buckets[i]);
+            sort_references(&mut refs);
+            if !refs.is_empty() {
+                merged.insert(name.clone(), refs);
+            }
         }
     }
 

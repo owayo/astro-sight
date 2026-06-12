@@ -1613,6 +1613,53 @@ fn refs_batch_names_preserves_order_across_chunks() {
     );
 }
 
+/// find_references_batch はディレクトリ走査を 1 回に集約しつつ内部で名前を chunk
+/// 分割するため、chunk サイズを変えても参照集合が完全に一致しなければならない。
+/// 走査集約リファクタが結果を変えていないことを保証する回帰テスト。
+#[test]
+fn refs_batch_results_independent_of_chunk_size() {
+    let names =
+        "find_references_batch,collect_files,extract_symbols,detect_api_changes,SymbolReference";
+    let run = |chunk: &str| -> String {
+        let output = cargo_bin()
+            .env("ASTRO_SIGHT_REFS_BATCH_CHUNK", chunk)
+            .args(["refs", "--names", names, "--dir", "src/"])
+            .output()
+            .expect("failed to run");
+        assert!(output.status.success());
+        // (symbol, 参照件数) を symbol 順に正規化する。chunk 分割で参照が
+        // 取りこぼされたり重複したりすれば件数が変わって検出できる。
+        let mut pairs: Vec<(String, usize)> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                let sym = v["symbol"].as_str().unwrap().to_string();
+                let n = v["refs"].as_array().map(|a| a.len()).unwrap_or(0);
+                (sym, n)
+            })
+            .collect();
+        pairs.sort();
+        format!("{pairs:?}")
+    };
+    let chunk_big = run("64");
+    assert_eq!(
+        run("1"),
+        chunk_big,
+        "chunk=1 と chunk=64 で結果が一致すべき"
+    );
+    assert_eq!(
+        run("2"),
+        chunk_big,
+        "chunk=2 と chunk=64 で結果が一致すべき"
+    );
+    // 全件 0 だと比較が無意味になるため、参照が実際に検出されていることも確認する。
+    assert!(
+        chunk_big.contains("detect_api_changes"),
+        "参照が検出されているべき: {chunk_big}"
+    );
+}
+
 #[test]
 fn refs_name_or_names_required() {
     let output = cargo_bin()
@@ -5327,6 +5374,86 @@ fn c_symbols() {
         symbols.iter().any(|s| s["name"] == "buffer_append"),
         "buffer_append 関数を検出すべき"
     );
+}
+
+/// C/C++ の関数名は `function_declarator` 配下でキャプチャされるため、定義ノードまで
+/// 親を繰り上げないと range が宣言子（シグネチャ行）だけに潰れ、複雑度が常に 1 になり、
+/// impact 分析が関数本体のみの変更を取りこぼす。range が本体まで伸び、分岐を数えた
+/// 複雑度が算出されることを検証する回帰テスト。
+#[test]
+fn c_function_range_and_complexity_cover_body() {
+    let output = cargo_bin()
+        .args([
+            "symbols",
+            "--path",
+            "tests/fixtures/sample.c",
+            "--full",
+            "--no-cache",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let symbols = json["symbols"].as_array().unwrap();
+
+    // buffer_append は本体に if が 1 つあるので base1 + 1 = 2。
+    // 宣言子だけを見ていた頃は本体を走査できず常に 1 だった。
+    let append = symbols
+        .iter()
+        .find(|s| s["name"] == "buffer_append")
+        .expect("buffer_append を検出すべき");
+    assert_eq!(
+        append["complexity"], 2,
+        "buffer_append の複雑度は本体の if を数えて 2 になるべき"
+    );
+    let start = append["range"]["start"]["line"].as_u64().unwrap();
+    let end = append["range"]["end"]["line"].as_u64().unwrap();
+    assert!(
+        end > start,
+        "range は宣言子 1 行ではなく関数本体まで複数行にまたがるべき (start={start}, end={end})"
+    );
+
+    // 分岐の無い関数も range が本体まで伸びる（複雑度は 1）。
+    let main_fn = symbols
+        .iter()
+        .find(|s| s["name"] == "main")
+        .expect("main を検出すべき");
+    assert_eq!(main_fn["complexity"], 1);
+    let m_start = main_fn["range"]["start"]["line"].as_u64().unwrap();
+    let m_end = main_fn["range"]["end"]["line"].as_u64().unwrap();
+    assert!(
+        m_end > m_start,
+        "main の range も本体まで複数行にまたがるべき"
+    );
+}
+
+/// init / skill-install は既存 config を必要としない早期終了コマンドのため、
+/// config ロードより前に処理する。壊れた既存 config を `--config` で指していても
+/// init が成功する（壊れた config の再生成手段になる）ことを検証する回帰テスト。
+#[test]
+fn init_does_not_require_valid_existing_config() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let bad_config = dir.path().join("bad.toml");
+    let out_config = dir.path().join("generated.toml");
+    std::fs::write(&bad_config, "not valid [[[").unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "--config",
+            bad_config.to_str().unwrap(),
+            "init",
+            "--path",
+            out_config.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "壊れた既存 config を指していても init は成功すべき: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(out_config.exists(), "config ファイルを生成すべき");
 }
 
 #[test]

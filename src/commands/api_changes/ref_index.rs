@@ -29,9 +29,9 @@ pub(crate) struct ApiRefIndex {
 }
 
 impl ApiRefIndex {
-    /// `names` の参照を chunk 単位の batch 検索で収集する。
-    /// chunk サイズは CLI `refs --names` と同じ (既定 64、`ASTRO_SIGHT_REFS_BATCH_CHUNK`
-    /// で調整可)。AC trie はパターン数に対して非線形にメモリを使うため一括にはしない。
+    /// `names` の参照を batch 検索で収集する。`find_references_batch` が内部で名前を
+    /// chunk 分割 (既定 64、`ASTRO_SIGHT_REFS_BATCH_CHUNK` で調整、AC trie のメモリ上限)
+    /// しつつディレクトリ走査を 1 回に集約するため、ここでは全名を 1 回で渡す。
     pub(crate) fn build(dir: &str, names: &HashSet<String>) -> Self {
         let mut sorted: Vec<String> = names.iter().filter(|n| !n.is_empty()).cloned().collect();
         sorted.sort_unstable();
@@ -42,16 +42,17 @@ impl ApiRefIndex {
         if sorted.is_empty() {
             return index;
         }
+        // 検索に失敗した場合は全 name を failed に倒し、各判定ヘルパーが per-symbol 時代の
+        // 検索失敗時と同じ保守側ポリシー (cross_file/blocking → true) に倒れる
+        // (false negative を起こさない)。
         let service = AppService::new();
-        for chunk in sorted.chunks(super::super::refs_batch_chunk_size()) {
-            match service.find_references_batch(chunk, dir, None) {
-                Ok(results) => {
-                    for r in results {
-                        index.refs.insert(r.symbol, r.references);
-                    }
+        match service.find_references_batch(&sorted, dir, None) {
+            Ok(results) => {
+                for r in results {
+                    index.refs.insert(r.symbol, r.references);
                 }
-                Err(_) => index.failed.extend(chunk.iter().cloned()),
             }
+            Err(_) => index.failed.extend(sorted),
         }
         index
     }

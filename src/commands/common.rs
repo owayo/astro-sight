@@ -188,5 +188,9 @@ pub(crate) fn cache_hash_for_path(path: &camino::Utf8Path, source: &[u8]) -> Str
         .unwrap_or_else(|| path.as_str().to_string());
 
     // 応答には path/lang が含まれるため、内容が同じ別ファイルとはキャッシュを分離する。
-    CacheStore::hash(format!("{path_key}\0{content_hash}").as_bytes())
+    // さらに astro-sight のバージョンを混ぜ、解析ロジックや出力スキーマが変わった
+    // 新バイナリが旧バージョンのキャッシュ結果を返さないようにする（アップグレード時に
+    // 自動失効）。ファイル内容が不変でも解析結果が変わる場合に stale を防ぐ。
+    let version = env!("CARGO_PKG_VERSION");
+    CacheStore::hash(format!("{version}\0{path_key}\0{content_hash}").as_bytes())
 }

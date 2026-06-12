@@ -262,18 +262,6 @@ pub fn cmd_refs(
     Ok(())
 }
 
-/// refs --names のバッチ chunk サイズ。既定 64。
-/// 大きいほどディレクトリ走査回数が減るが、Xojo の汎用名 (`row` / `e` 等) が
-/// 大量ヒットすると find_references_batch が chunk 分の参照を同時保持して RSS が
-/// 増えるため、既定は控えめにする。ASTRO_SIGHT_REFS_BATCH_CHUNK で上書き可能。
-fn refs_batch_chunk_size() -> usize {
-    std::env::var("ASTRO_SIGHT_REFS_BATCH_CHUNK")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(64)
-}
-
 pub fn cmd_refs_batch(
     service: &AppService,
     names: &[String],
@@ -285,22 +273,15 @@ pub fn cmd_refs_batch(
     let mut out = stdout.lock();
     let mut total_refs = 0usize;
 
-    // 名前を chunk 単位でまとめて検索する。1 名前ごとに呼び出すと
-    // find_references_batch 内部のディレクトリウォーク + 全ファイル読込を名前数 N 回
-    // 繰り返し O(N × ファイル数) に退化する (大規模リポでは数十分規模)。chunk で
-    // まとめると走査回数が ceil(N / chunk) に減る。chunk を大きくしすぎると Xojo の
-    // 汎用名 (`row` / `e` / `setting` 等) の大量ヒット時に find_references_batch が
-    // `Vec<Vec<SymbolReference>>` を chunk 分保持して RSS が線形増大するため、既定は
-    // 控えめ (64) にし env で上書き可能にする。service.find_references_batch は入力順を
-    // 保った `Vec<RefsResult>` を返すため、chunk を names 順に処理すれば全体の NDJSON
-    // 出力も names 順を維持する。
-    for chunk in names.chunks(refs_batch_chunk_size()) {
-        let results = service.find_references_batch(chunk, dir, glob)?;
-        for result in &results {
-            total_refs += result.references.len();
-            let line = serde_json::to_string(result)?;
-            writeln!(out, "{line}")?;
-        }
+    // find_references_batch が内部で名前を chunk 分割しつつディレクトリ走査を 1 回に
+    // 集約するため、ここでは全名を 1 回で渡す（以前は呼び出し側で chunk 分割していたが
+    // chunk 毎に walk し直していた）。service は入力順を保った `Vec<RefsResult>` を返すので
+    // NDJSON 出力も names 順を維持する。
+    let results = service.find_references_batch(names, dir, glob)?;
+    for result in &results {
+        total_refs += result.references.len();
+        let line = serde_json::to_string(result)?;
+        writeln!(out, "{line}")?;
     }
 
     info!(

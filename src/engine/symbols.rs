@@ -1924,7 +1924,16 @@ pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result
                 let name = node.utf8_text(source).unwrap_or("").to_string();
                 if !name.is_empty() {
                     let doc = extract_doc_comment(node, source);
-                    let parent_node = node.parent().unwrap_or(node);
+                    let mut parent_node = node.parent().unwrap_or(node);
+                    // C/C++ は関数名を `function_declarator` 配下でキャプチャするため、
+                    // 親が宣言子なら関数定義ノードまで 1 段繰り上げる。これをしないと
+                    // range が宣言子（シグネチャ行）だけに潰れ、複雑度が常に 1 になり、
+                    // impact 分析が関数本体のみの変更を取りこぼす。
+                    if matches!(lang_id, LangId::C | LangId::Cpp)
+                        && parent_node.kind() == "function_declarator"
+                    {
+                        parent_node = parent_node.parent().unwrap_or(parent_node);
+                    }
                     // 関数/メソッドの場合のみ循環的複雑度を算出
                     let complexity = if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
                         Some(calculate_complexity(parent_node, lang_id))

@@ -203,7 +203,7 @@ astro-sight refs --names "AppService,AstgenResponse" --dir src/
 
 `--name` は空文字を受け付けない。`--names` も空要素のみ（例: `",,,"`）の場合は `INVALID_REQUEST` を返す。`--dir` にはディレクトリのみ指定でき、ファイルパスを渡した場合も `INVALID_REQUEST` を返す。
 
-単一検索と複数シンボル検索はいずれも worker local の fold/reduce で結果を直接統合し、per-file の中間 `Vec` を全ファイル分保持しない。非常に多くの参照が返るシンボルでは出力自体が大きくなるため、`--glob` で対象言語を絞るか、必要に応じて `ASTRO_SIGHT_BATCH_WORKERS` で並列ワーカー数を下げる。複数シンボル検索（`refs --names`）は名前を chunk 単位（既定 64、`ASTRO_SIGHT_REFS_BATCH_CHUNK` で調整）でまとめて走査するため、名前数に比例してディレクトリ走査が繰り返される退化を避けつつ、ピーク RSS は chunk 分に抑える。
+単一検索と複数シンボル検索はいずれも worker local の fold/reduce で結果を直接統合し、per-file の中間 `Vec` を全ファイル分保持しない。非常に多くの参照が返るシンボルでは出力自体が大きくなるため、`--glob` で対象言語を絞るか、必要に応じて `ASTRO_SIGHT_BATCH_WORKERS` で並列ワーカー数を下げる。複数シンボル検索（`refs --names`）はディレクトリ走査と rayon pool を 1 回に集約し、内部で名前を chunk 単位（既定 64、`ASTRO_SIGHT_REFS_BATCH_CHUNK` で調整）に分割して AC trie / fold バケットのメモリを上限化する。名前数を増やしてもディレクトリ走査は 1 回で済み（chunk 毎の再走査が起きない）、chunk サイズに依らず結果は一致する。
 
 `context` / `impact` / `review` の `--base` は `git diff` / `git show` / `git blame` にそのまま渡るため、`-` で始まる値・NUL を含む値・空文字を `INVALID_REQUEST` で拒否する（`--output=/path` 等のオプション誤認識を防ぐ）。
 
@@ -643,10 +643,10 @@ debug = false
 
 ## Cache
 
-単一ファイル `ast` / `symbols` の compact 出力を BLAKE3 ベースで保存するキャッシュ。ファイルが変更されればハッシュが変わるため自動的に無効化される。
+単一ファイル `ast` / `symbols` の compact 出力を BLAKE3 ベースで保存するキャッシュ。ファイル内容または astro-sight のバージョンが変わればハッシュが変わるため自動的に無効化される（バージョン更新時は解析ロジック/出力スキーマの変更に追従し、内容不変でも結果が変わるケースで stale な結果を返さない）。
 
 - **対象コマンド**: `ast`, `symbols`（単一ファイルモードのみ）
-- **キャッシュキー**: `BLAKE3(canonical path + BLAKE3(ファイル内容))` + コマンド固有サフィックス（オプション組み合わせ別）
+- **キャッシュキー**: `BLAKE3(astro-sight バージョン + canonical path + BLAKE3(ファイル内容))` + コマンド固有サフィックス（オプション組み合わせ別）
 - **path/lang の分離**: `ast` / `symbols` の応答には `path` と `lang` が含まれるため、同じ内容でも別ファイル・別拡張子なら別キャッシュとして扱う
 - **保存先**: `~/.cache/astro-sight/`
 - **ディレクトリシャード**: ハッシュの先頭 2 文字でサブディレクトリを分割（例: `ab/cdef1234....symbols.json`）

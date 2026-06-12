@@ -128,14 +128,64 @@ fn extract_astro_subcmd(cmd: &str) -> Option<&str> {
 }
 
 fn astro_sight_invocation_args(cmd: &str) -> Option<&str> {
-    for segment in cmd.split(&[';', '|'][..]).flat_map(|s| s.split("&&")) {
-        for segment in segment.split("||") {
-            if let Some(args) = astro_sight_invocation_args_in_segment(segment) {
-                return Some(args);
-            }
+    for segment in split_top_level_segments(cmd) {
+        if let Some(args) = astro_sight_invocation_args_in_segment(segment) {
+            return Some(args);
         }
     }
     None
+}
+
+/// シェルの引用符 (`'...'` / `"..."`) を尊重し、引用符の外にある区切り
+/// (`;` `|` `||` `&&`) でのみコマンドを分割する。codex exec のプロンプト引数の
+/// ように引用符内へ astro-sight コマンド例が含まれていても、別コマンドとして
+/// 誤検出 (採用数の水増し) しないようにする。区切りはいずれも ASCII 1〜2 バイト
+/// なので、バイト境界で切り出してもマルチバイト文字を分断しない。
+fn split_top_level_segments(cmd: &str) -> Vec<&str> {
+    let bytes = cmd.as_bytes();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            // 引用符の内側: 対応する閉じ引用符が来るまで区切りを無視する
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                }
+                i += 1;
+            }
+            None => match b {
+                b'\'' | b'"' => {
+                    quote = Some(b);
+                    i += 1;
+                }
+                b';' => {
+                    segments.push(&cmd[start..i]);
+                    i += 1;
+                    start = i;
+                }
+                b'|' => {
+                    segments.push(&cmd[start..i]);
+                    i += 1;
+                    if i < bytes.len() && bytes[i] == b'|' {
+                        i += 1; // `||`
+                    }
+                    start = i;
+                }
+                b'&' if i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
+                    segments.push(&cmd[start..i]);
+                    i += 2;
+                    start = i;
+                }
+                _ => i += 1,
+            },
+        }
+    }
+    segments.push(&cmd[start..]);
+    segments
 }
 
 fn astro_sight_invocation_args_in_segment(segment: &str) -> Option<&str> {
@@ -1486,5 +1536,37 @@ mod tests {
     #[test]
     fn extract_astro_subcmd_unknown_returns_none() {
         assert_eq!(extract_astro_subcmd("astro-sight wat"), None);
+    }
+
+    /// 引用符で囲まれた codex プロンプト内にシェル区切り (`&&` / `|` / `;`) と
+    /// astro-sight コマンド例が含まれていても、別コマンドとして誤検出しない。
+    /// セグメント分割が引用符を無視すると採用数を水増しする不具合の回帰テスト。
+    #[test]
+    fn extract_astro_subcmd_ignores_metachars_inside_quoted_prompt() {
+        assert_eq!(
+            extract_astro_subcmd(
+                "codex exec --cd /x \"foo を直して && astro-sight refs --name bar で検証して\""
+            ),
+            None
+        );
+        assert_eq!(
+            extract_astro_subcmd(
+                "codex exec \"git diff | astro-sight context --dir . で影響を見て\""
+            ),
+            None
+        );
+        assert_eq!(
+            extract_astro_subcmd("codex exec 'まず ls; astro-sight symbols を実行'"),
+            None
+        );
+        // 引用符の外にある本物のパイプ/`&&` 経由の呼び出しは従来どおり検出する。
+        assert_eq!(
+            extract_astro_subcmd("git diff | astro-sight context --dir ."),
+            Some("context")
+        );
+        assert_eq!(
+            extract_astro_subcmd("echo \"探索\" && astro-sight refs --name foo --dir ."),
+            Some("refs")
+        );
     }
 }
