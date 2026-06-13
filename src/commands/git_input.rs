@@ -273,10 +273,13 @@ fn append_untracked_added_diffs(dir: &str, diff: &mut String) {
             continue;
         }
         let full = std::path::Path::new(dir).join(&rel_path);
-        // 巨大ファイルは読み込まずに skip (メタデータ len で事前判定)。
-        if let Ok(meta) = std::fs::metadata(&full)
-            && meta.len() as usize > MAX_INPUT_SIZE
-        {
+        // symlink_metadata でリンク自身を見る。symlink は追わない (リンク先が外部の
+        // ソースファイルでも内容を合成 diff に含めないためのパス境界)。regular file 以外
+        // (symlink / dir / fifo 等) は skip。併せて巨大ファイルも読み込まず skip。
+        let Ok(meta) = std::fs::symlink_metadata(&full) else {
+            continue;
+        };
+        if !meta.file_type().is_file() || meta.len() as usize > MAX_INPUT_SIZE {
             continue;
         }
         // 非 UTF-8 / 読込不可は skip (fail-open)。
@@ -297,6 +300,8 @@ fn append_untracked_added_diffs(dir: &str, diff: &mut String) {
 
 /// `git ls-files --others --exclude-standard -z` で未追跡ファイル (gitignore 除外済み) を列挙する。
 /// `-z` で NUL 区切り・クォートなしにし、空白/非 ASCII を含むパスも正しく扱う。
+/// stdout を NUL 区切りの byte slice 単位で UTF-8 検証し、非 UTF-8 パスは要素ごとに skip する
+/// (from_utf8_lossy の置換文字混入を避ける)。
 fn list_untracked_files(dir: &str) -> Result<Vec<String>> {
     let output = std::process::Command::new("git")
         .args(["ls-files", "--others", "--exclude-standard", "-z"])
@@ -309,10 +314,12 @@ fn list_untracked_files(dir: &str) -> Result<Vec<String>> {
         // 取得失敗は fail-open: 未追跡を含めず従来通りの diff で続行する。
         return Ok(Vec::new());
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .split('\0')
-        .filter(|p| !p.is_empty())
-        .map(|p| p.to_string())
+    Ok(output
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|seg| !seg.is_empty())
+        .filter_map(|seg| std::str::from_utf8(seg).ok())
+        .map(|s| s.to_string())
         .collect())
 }
 

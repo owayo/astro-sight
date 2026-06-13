@@ -1986,6 +1986,31 @@ fn impact_includes_untracked_new_files() {
     );
 }
 
+/// 未追跡の symlink は合成しない (パス境界)。symlink_metadata でリンク自身を見て
+/// regular file 以外を除外するため、外部のソースファイルを指す symlink でも内容が
+/// 合成 diff に漏れない (codex レビュー指摘のセキュリティ境界)。
+#[cfg(unix)]
+#[test]
+fn run_git_diff_unstaged_skips_untracked_symlink() {
+    let outside = tempfile::tempdir().expect("outside tempdir");
+    let target = outside.path().join("secret.rs");
+    fs::write(&target, "pub fn secret() {}\n").expect("write external target");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(repo, &[("src/lib.rs", "pub fn existing() {}\n")], "initial");
+    // 外部のソースファイルを指す未追跡 symlink (ソース拡張子)。
+    std::os::unix::fs::symlink(&target, repo.join("link.rs")).expect("symlink");
+
+    let diff =
+        crate::commands::run_git_diff(repo.to_str().expect("utf-8"), "HEAD", false).expect("diff");
+    assert!(
+        !diff.contains("link.rs") && !diff.contains("pub fn secret"),
+        "未追跡 symlink (外部ソースを指す) は合成すべきでない: {diff}"
+    );
+}
+
 #[test]
 fn resolve_blame_source_files_skips_non_git_without_explicit_paths() {
     let dir = tempfile::tempdir().expect("tempdir");
