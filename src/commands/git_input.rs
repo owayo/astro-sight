@@ -230,11 +230,107 @@ pub fn run_git_diff(dir: &str, base: &str, staged: bool) -> Result<String> {
         .into());
     }
 
-    String::from_utf8(stdout_bytes).map_err(|e| {
+    let mut diff = String::from_utf8(stdout_bytes).map_err(|e| {
         AstroError::new(
             ErrorCode::InvalidRequest,
             format!("git diff output is not valid UTF-8: {e}"),
         )
-        .into()
-    })
+    })?;
+
+    // unstaged (`--git`、非 `--staged`) では未追跡の新規ソースファイルを「全行追加の
+    // 新規ファイル」として diff に合成する。git diff は仕様上 untracked を出力しないため、
+    // これを入れないと「同一作業で作成した未追跡 sibling への参照」が impact/context/review で
+    // 「diff 外の未解決影響」と誤報される (ファイル分割リファクタで高頻度)。
+    // staged / `--diff` / `--diff-file` 経路は対象外 (それぞれ明示された範囲を尊重する)。
+    if !staged {
+        append_untracked_added_diffs(dir, &mut diff);
+    }
+    Ok(diff)
+}
+
+/// unstaged 解析用に未追跡の新規ソースファイルを「全行追加の新規ファイル」diff として
+/// `diff` 末尾に合成する。git diff の生成責務に閉じることで、これを経由する
+/// context / impact / review / dead-code が同一の変更範囲を見る。
+/// - `git ls-files --others --exclude-standard -z` で .gitignore 除外済みの未追跡を列挙
+/// - 言語判定できる (= ソースとみなせる) ファイルのみ対象。バイナリ / 非ソースは合成しない
+/// - 100MB 上限 (MAX_INPUT_SIZE) を超えたら打ち切り (既存 git diff と合算)
+///
+/// 未追跡取得失敗や個別ファイル読込失敗は fail-open (合成せず従来通り) とし、解析本体を止めない。
+fn append_untracked_added_diffs(dir: &str, diff: &mut String) {
+    let untracked = match list_untracked_files(dir) {
+        Ok(paths) => paths,
+        Err(_) => return,
+    };
+    let mut total = diff.len();
+    for rel_path in untracked {
+        // パスにNUL/改行を含むものは合成 diff を壊すため除外 (ls-files -z 由来では稀)。
+        if rel_path.contains('\n') || rel_path.contains('\r') {
+            continue;
+        }
+        // 言語判定できないファイル (バイナリ / 非ソース) は impact 解析対象外なので合成しない。
+        let utf8_path = camino::Utf8Path::new(&rel_path);
+        if crate::language::LangId::from_path(utf8_path).is_err() {
+            continue;
+        }
+        let full = std::path::Path::new(dir).join(&rel_path);
+        // 巨大ファイルは読み込まずに skip (メタデータ len で事前判定)。
+        if let Ok(meta) = std::fs::metadata(&full)
+            && meta.len() as usize > MAX_INPUT_SIZE
+        {
+            continue;
+        }
+        // 非 UTF-8 / 読込不可は skip (fail-open)。
+        let Ok(content) = std::fs::read_to_string(&full) else {
+            continue;
+        };
+        if content.is_empty() {
+            continue;
+        }
+        let synth = synthesize_added_file_diff(&rel_path, &content);
+        total = total.saturating_add(synth.len());
+        if total > MAX_INPUT_SIZE {
+            break;
+        }
+        diff.push_str(&synth);
+    }
+}
+
+/// `git ls-files --others --exclude-standard -z` で未追跡ファイル (gitignore 除外済み) を列挙する。
+/// `-z` で NUL 区切り・クォートなしにし、空白/非 ASCII を含むパスも正しく扱う。
+fn list_untracked_files(dir: &str) -> Result<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .current_dir(dir)
+        .output()
+        .map_err(|e| {
+            AstroError::new(ErrorCode::InvalidRequest, format!("Failed to run git: {e}"))
+        })?;
+    if !output.status.success() {
+        // 取得失敗は fail-open: 未追跡を含めず従来通りの diff で続行する。
+        return Ok(Vec::new());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_string())
+        .collect())
+}
+
+/// 1 ファイル分の「全行追加の新規ファイル」unified diff を生成する。
+/// `parse_unified_diff` は `--- /dev/null` + `+++ b/<path>` + `@@ -0,0 +1,N @@` を新規ファイルと
+/// 認識する。`diff --git` / `new file mode` 行はパーサが無視するが、実際の git 出力に合わせて付ける。
+fn synthesize_added_file_diff(rel_path: &str, content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = String::new();
+    out.push_str(&format!("diff --git a/{rel_path} b/{rel_path}\n"));
+    out.push_str("new file mode 100644\n");
+    out.push_str("--- /dev/null\n");
+    out.push_str(&format!("+++ b/{rel_path}\n"));
+    out.push_str(&format!("@@ -0,0 +1,{} @@\n", lines.len()));
+    for line in lines {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }

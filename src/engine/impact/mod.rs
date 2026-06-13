@@ -44,6 +44,11 @@ struct FileContext {
     /// 「modified の Factory.php は include / added の Id.php は exclude」の
     /// ように **per-file 単位で** 振り分けられる。
     cross_file_symbol_keys: HashSet<String>,
+    /// `affected` の `ci_key(lang_id, name)` → 元の name の事前 index。
+    /// on_ref ホットループでの per-ref 線形 `find` + `ci_key` の String 割当を O(1) 参照に
+    /// 置換する (旧実装は ref ごとに `affected.iter().find(|a| ci_key(..)==key)` を実行していた)。
+    /// 同一 ci_key が複数あれば先勝ち (旧 `.find()` の最初一致と挙動一致)。
+    affected_name_by_cikey: HashMap<String, String>,
 }
 
 /// キャッシュされたパース結果: (tree, ソースバッファ, 言語)。
@@ -394,6 +399,13 @@ fn collect_affected_symbols(
             })
             .collect();
 
+        let mut affected_name_by_cikey: HashMap<String, String> = HashMap::new();
+        for a in &affected {
+            affected_name_by_cikey
+                .entry(ci_key(lang_id, &a.name))
+                .or_insert_with(|| a.name.clone());
+        }
+
         file_contexts.push(FileContext {
             new_path: df.new_path.clone(),
             lang_id,
@@ -402,6 +414,7 @@ fn collect_affected_symbols(
             hunks,
             call_edges,
             cross_file_symbol_keys,
+            affected_name_by_cikey,
         });
     }
 
@@ -439,10 +452,11 @@ fn should_include_for_cross_file(
     if sym.kind == "type" || sym.kind == "module" {
         return false;
     }
+    // hunks と重なる定義シンボルは (syms, sym.name, hunks) が不変なので 1 回だけ引く。
+    // Option<&Symbol> は Copy のため以降の各判定で使い回せる (旧実装は 3 回線形スキャンしていた)。
+    let overlapping = find_overlapping_symbol(syms, &sym.name, hunks);
     // 2. テストコンテキスト内のシンボルをスキップ
-    if find_overlapping_symbol(syms, &sym.name, hunks)
-        .is_some_and(|s| is_in_test_context(root, source, &s.range, lang_id, file_path))
-    {
+    if overlapping.is_some_and(|s| is_in_test_context(root, source, &s.range, lang_id, file_path)) {
         return false;
     }
     // 3. ボディのみの変更の関数/メソッドをスキップ
@@ -455,8 +469,7 @@ fn should_include_for_cross_file(
     // 呼ばれるため cross-file caller を追跡できない。親 API のシグネチャは不変なので
     // 下流互換性にも影響せず、本体変更は impl 変更として扱い api.mod から除外する。
     if (sym.kind == "function" || sym.kind == "method")
-        && find_overlapping_symbol(syms, &sym.name, hunks)
-            .is_some_and(|s| symbols::is_override_method(root, source, lang_id, &s.range))
+        && overlapping.is_some_and(|s| symbols::is_override_method(root, source, lang_id, &s.range))
     {
         return false;
     }
@@ -472,9 +485,7 @@ fn should_include_for_cross_file(
         return false;
     }
     // 4. エクスポートされていないシンボルをスキップ
-    if !find_overlapping_symbol(syms, &sym.name, hunks)
-        .is_some_and(|s| symbols::is_symbol_exported(root, source, lang_id, &s.range))
-    {
+    if !overlapping.is_some_and(|s| symbols::is_symbol_exported(root, source, lang_id, &s.range)) {
         return false;
     }
     // 5. 変更行にシンボル名が出現しない場合スキップ

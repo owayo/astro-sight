@@ -1232,6 +1232,29 @@ pub(crate) fn extract_symbol_lines(
 /// 抽出し、whitespace を正規化して signature とする。これにより `where` 句や複数行
 /// generics で先頭行が同一でも引数列が変わったケース (Issue
 /// 2026-05-14-rename-and-multiline-signature) を検出できる。
+/// 関数/メソッドノードの body 開始 byte を返す。tree-sitter の "body" フィールドを優先し、
+/// 取得できない grammar (tree-sitter-kotlin 0.3.5 の `function_declaration` は
+/// `fields: []` でフィールド名を持たず、body は `function_body` 型の直接子) では直接の
+/// named child から既知の body ノード kind を fallback で探す。body を持たない宣言
+/// (Swift protocol requirement / Rust trait fn / Kotlin abstract fun) では None を返し、
+/// 呼び出し側が `end_byte()` (= 宣言全体 = 署名のみ) に倒す。
+/// これを入れないと body フィールドを持たない言語で「関数全体」が署名になり、
+/// body のみ変更が api.mod に誤検出される (Kotlin body-only 変更の false positive 対策)。
+fn function_body_start_byte(node: tree_sitter::Node<'_>) -> Option<usize> {
+    if let Some(body) = node.child_by_field_name("body") {
+        return Some(body.start_byte());
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| {
+            matches!(
+                child.kind(),
+                "function_body" | "block" | "statement_block" | "compound_statement"
+            )
+        })
+        .map(|child| child.start_byte())
+}
+
 /// body が無い (interface method / abstract 等) や node 取得失敗時は先頭行を fallback。
 pub(crate) fn extract_api_signature(
     sym: &crate::models::symbol::Symbol,
@@ -1264,10 +1287,8 @@ pub(crate) fn extract_api_signature(
                     // 先頭行 fallback でなく AST から signature 全体を抽出する (codex 指摘)。
                     | "protocol_function_declaration" => {
                         let s = cur.start_byte();
-                        let e = cur
-                            .child_by_field_name("body")
-                            .map(|b| b.start_byte())
-                            .unwrap_or_else(|| cur.end_byte());
+                        let e =
+                            function_body_start_byte(cur).unwrap_or_else(|| cur.end_byte());
                         // TS/TSX の関数 destructured params (`function foo({ a, b }: T)`) は
                         // `{ ... }` 内の variable 列が変わっても呼び出し側契約 (`: T` 型注釈)
                         // に影響しないため、signature 比較から除外する。React の Props

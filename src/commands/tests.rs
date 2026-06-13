@@ -173,6 +173,64 @@ fn detect_api_changes_modified_with_multiline_use_import_is_closed() {
     );
 }
 
+/// Kotlin の `function_declaration` は tree-sitter-kotlin 0.3.5 で body フィールドを
+/// 持たず (`fields: []`)、body は `function_body` 型の直接子として現れる。
+/// `extract_api_signature` が body フィールドだけを見て切ると関数全体 (body 込み) が
+/// 署名になり、シグネチャ不変で body だけ変えた関数が api.mod に誤検出される。
+/// `function_body_start_byte` の kind fallback でこれを抑止する
+/// (moon-star-link の @Composable / helper 3 件が api.mod blocking した回帰防止)。
+#[test]
+fn kotlin_body_only_change_is_not_api_mod() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    // 旧: シグネチャ A の関数 + シグネチャ B の関数。
+    git_commit_files(
+        repo,
+        &[(
+            "MapZoomUtils.kt",
+            "fun fitCameraToLocations(\n    locations: List<LatLng>,\n    maxZoom: Float = 18f\n) {\n    if (locations.size == 1) {\n        center(locations.first())\n        return\n    }\n    zoomForBounds(locations)\n}\n\nfun renameMe(a: Int): Int {\n    return a + 1\n}\n",
+        )],
+        "initial",
+    );
+
+    // 新: fitCameraToLocations は body のみ変更 (シグネチャ不変)。
+    //     renameMe はシグネチャ変更 (引数追加) — 過剰抑制ガード。
+    fs::write(
+        repo.join("MapZoomUtils.kt"),
+        "fun fitCameraToLocations(\n    locations: List<LatLng>,\n    maxZoom: Float = 18f\n) {\n    if (locations.allSamePosition()) {\n        center(locations.first())\n        return\n    }\n    fitBounds(locations)\n}\n\nfun renameMe(a: Int, b: Int): Int {\n    return a + b\n}\n",
+    )
+    .expect("write new MapZoomUtils.kt");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "MapZoomUtils.kt".to_string(),
+        new_path: "MapZoomUtils.kt".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 14,
+            new_start: 1,
+            new_count: 14,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    assert!(
+        !api.modified
+            .iter()
+            .any(|c| c.name == "fitCameraToLocations"),
+        "body のみ変更 (シグネチャ不変) は api.mod に出すべきでない: {:?}",
+        api.modified
+    );
+    assert!(
+        api.modified.iter().any(|c| c.name == "renameMe"),
+        "シグネチャ変更 (引数追加) は引き続き api.mod に検出すべき (過剰抑制ガード): {:?}",
+        api.modified
+    );
+}
+
 #[test]
 fn is_const_value_only_change_rust_const_value_only_is_true() {
     assert!(is_const_value_only_change(
@@ -1835,6 +1893,96 @@ fn resolve_git_diff_rejects_invalid_base_even_when_non_git() {
     assert!(
         resolve_git_diff(dir.path().to_str().expect("utf-8"), "-x", false).is_err(),
         "先頭 '-' の base は非 git でも Err"
+    );
+}
+
+/// unstaged (`--git`、非 `--staged`) では未追跡の新規ソースファイルを「全行追加の
+/// 新規ファイル」として diff に合成する。git diff は仕様上 untracked を出さないため、
+/// これが無いと「同一作業で作成した未追跡 sibling への参照」が未解決影響と誤報される。
+/// 非ソース (拡張子で言語判定不可) と .gitignore 対象は合成しない。
+#[test]
+fn run_git_diff_unstaged_includes_untracked_source_excludes_binary_and_ignored() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            ("src/lib.rs", "pub fn existing() {}\n"),
+            (".gitignore", "ignored.rs\n"),
+        ],
+        "initial",
+    );
+
+    // 未追跡: ソース (含む) / 非ソース (除外) / gitignore 対象 (除外)。
+    fs::write(repo.join("src/new_helper.rs"), "pub fn helper() {}\n").expect("write untracked src");
+    fs::write(repo.join("data.bin"), "binarylike\n").expect("write untracked bin");
+    fs::write(repo.join("ignored.rs"), "pub fn ignored() {}\n").expect("write ignored");
+
+    let diff =
+        crate::commands::run_git_diff(repo.to_str().expect("utf-8"), "HEAD", false).expect("diff");
+
+    assert!(
+        diff.contains("+++ b/src/new_helper.rs") && diff.contains("+pub fn helper() {}"),
+        "未追跡の新規ソースは全行追加の新規ファイルとして合成されるべき: {diff}"
+    );
+    assert!(
+        !diff.contains("data.bin"),
+        "非ソース (言語判定不可) は合成しない: {diff}"
+    );
+    assert!(
+        !diff.contains("ignored.rs"),
+        ".gitignore 対象 (--exclude-standard) は合成しない: {diff}"
+    );
+}
+
+/// staged モード (`--git --staged`) では未追跡を合成しない (index にある変更のみを尊重)。
+#[test]
+fn run_git_diff_staged_excludes_untracked_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(repo, &[("src/lib.rs", "pub fn existing() {}\n")], "initial");
+    fs::write(repo.join("src/new_helper.rs"), "pub fn helper() {}\n").expect("write untracked src");
+
+    let diff =
+        crate::commands::run_git_diff(repo.to_str().expect("utf-8"), "HEAD", true).expect("diff");
+    assert!(
+        !diff.contains("new_helper.rs"),
+        "staged モードでは未追跡を合成すべきでない: {diff}"
+    );
+}
+
+/// untracked 新規ファイルが diff の「解決済み範囲」に入ることを end-to-end で確認する。
+/// run_git_diff (unstaged) の出力を parse_unified_diff にかけ、未追跡ファイルが
+/// new_path を持つ DiffFile として現れることを検証する (impact 誤検出
+/// 2026-06-12-untracked-new-file-impact の回帰防止)。
+#[test]
+fn impact_includes_untracked_new_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(repo, &[("src/lib.rs", "pub fn existing() {}\n")], "initial");
+
+    // 既存ファイルの可視性変更 (tracked diff) + 参照を含む未追跡 sibling (report の再現パターン)。
+    fs::write(repo.join("src/lib.rs"), "pub(crate) fn existing() {}\n").expect("modify tracked");
+    fs::write(
+        repo.join("src/provider.rs"),
+        "use crate::existing;\npub fn run() { existing(); }\n",
+    )
+    .expect("write untracked sibling");
+
+    let diff =
+        crate::commands::run_git_diff(repo.to_str().expect("utf-8"), "HEAD", false).expect("diff");
+    let files = crate::engine::diff::parse_unified_diff(&diff);
+    assert!(
+        files.iter().any(|f| f.new_path == "src/provider.rs"),
+        "未追跡 sibling が DiffFile (解決済み範囲) に含まれるべき: {:?}",
+        files.iter().map(|f| &f.new_path).collect::<Vec<_>>()
+    );
+    assert!(
+        files.iter().any(|f| f.new_path == "src/lib.rs"),
+        "tracked 変更も従来通り含まれるべき"
     );
 }
 
@@ -10144,6 +10292,58 @@ fn build_review_hook_json_api_modified_is_blocking() {
     let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
     assert!(build.value.is_some(), "api.mod は hook JSON に出すべき");
     assert!(build.is_blocking, "api.mod は blocking にすべき");
+}
+
+/// `rm_dead` (削除前参照ゼロの dead symbol 削除) は破壊的変更ではないため、
+/// 単独では Stop hook を blocking しない (informational)。moon-star-link 報告
+/// (2026-06-13) の「rm_dead が hook failure の原因」は誤診断で、実際の blocking は
+/// 同時に出ていた api.mod (Kotlin body-only 誤検出) が原因だった。rm_dead が
+/// 非 blocking である契約を回帰テストで固定する。
+#[test]
+fn build_review_hook_json_removed_dead_only_is_not_blocking() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let result = ReviewResult {
+        impact: crate::models::impact::ContextResult {
+            changes: Vec::new(),
+            skipped: None,
+        },
+        missing_cochanges: Vec::new(),
+        api_changes: ApiChanges {
+            added: Vec::new(),
+            removed: Vec::new(),
+            modified: Vec::new(),
+            moved: Vec::new(),
+            property_to_field: Vec::new(),
+            removed_dead: vec![
+                ApiSymbol {
+                    name: "MapZoomUtils".to_string(),
+                    kind: "object".to_string(),
+                    file: "MapZoomUtils.kt".to_string(),
+                },
+                ApiSymbol {
+                    name: "MapZoomUtils.zoomForBounds".to_string(),
+                    kind: "function".to_string(),
+                    file: "MapZoomUtils.kt".to_string(),
+                },
+            ],
+            modified_closed_in_diff: Vec::new(),
+            const_value_changes: Vec::new(),
+            compatible_modified: Vec::new(),
+        },
+        dead_symbols: Vec::new(),
+        test_only_symbols: Vec::new(),
+        skipped: None,
+    };
+
+    let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
+    assert!(
+        build.value.is_some(),
+        "rm_dead は informational として hook JSON に出すべき"
+    );
+    assert!(
+        !build.is_blocking,
+        "rm_dead 単独は blocking にすべきでない (informational)"
+    );
 }
 
 #[test]

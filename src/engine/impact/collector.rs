@@ -7,7 +7,6 @@
 //!   文字列コピーを廃して per-file バッファの heap を削減する。
 //! - `ImpactCollector`: `refs::RefVisitor` を実装し、per-file visit の callback を
 //!   直接受け取って `finish_file` で Stage 1-6 (Stage 4b 除く) を適用する。
-use camino::Utf8Path;
 use lru::LruCache;
 
 use crate::engine::refs;
@@ -20,7 +19,7 @@ use super::import_facts::{
 use super::signature::extract_function_from_context;
 use super::test_context::is_ref_in_target_test_context;
 use super::types::{StringPool, SymEntries, TypedCallerMap};
-use super::{FileContext, ParsedFile, ci_key, filters, lang_compat_group};
+use super::{FileContext, ParsedFile, filters, lang_compat_group};
 
 /// per-worker の中間状態。per-file バッファ (`ref_hit` / `ref_events` / `def_events`) は
 /// `finish_file` / `reset_buffers` で再利用されるため、巨大ファイルでも再割当ては発生しない。
@@ -256,7 +255,9 @@ impl<'a> ImpactCollector<'a> {
                 if filters::is_same_source_file(self.path_str, source_path) {
                     continue;
                 }
-                if let Ok(ref_lang) = LangId::from_path(Utf8Path::new(self.path_str))
+                // ref file の言語は `self.ref_lang` に初期化時キャッシュ済み。
+                // ホットループ内で `LangId::from_path` を都度再導出しない (271 行と整合)。
+                if let Some(ref_lang) = self.ref_lang
                     && lang_compat_group(ref_lang) != source_lang_group
                 {
                     continue;
@@ -298,11 +299,11 @@ impl<'a> ImpactCollector<'a> {
                 }
 
                 let sym_key_canonical = &self.all_symbol_names[sym_ix_usize];
+                // 事前 index (ci_key→元名) で O(1) 参照。per-ref の線形 find + ci_key String 割当を排除。
                 let affected_sym_name = ctx
-                    .affected
-                    .iter()
-                    .find(|a| ci_key(ctx.lang_id, &a.name) == *sym_key_canonical)
-                    .map(|a| a.name.clone())
+                    .affected_name_by_cikey
+                    .get(sym_key_canonical.as_str())
+                    .cloned()
                     .unwrap_or_else(|| sym_key_canonical.clone());
 
                 let (path_id, sym_name_id) = {
