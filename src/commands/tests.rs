@@ -7333,7 +7333,8 @@ export const TaskKanbanCard = memo(function TaskKanbanCard() {\n\
     )
     .expect("write");
 
-    let syms = extract_exported_symbols_from_file(repo.to_str().expect("utf-8 path"), "Card.tsx")
+    let syms = extract_new_file_facts(repo.to_str().expect("utf-8 path"), "Card.tsx")
+        .exported
         .expect("symbols");
     let names: Vec<&str> = syms.iter().map(|(n, _, _)| n.as_str()).collect();
     assert!(
@@ -7347,6 +7348,66 @@ export const TaskKanbanCard = memo(function TaskKanbanCard() {\n\
     assert!(
         names.contains(&"TaskKanbanCard"),
         "memo で包んだ exported const 自体は API に含める。got: {names:?}"
+    );
+}
+
+/// perf #2: `extract_new_file_facts` が new_path を 1 回 read+parse して exported / callees /
+/// reexports の 3 facts を正しく導出する。TS の named re-export・local export・呼び出しを
+/// 1 ファイルに含め、3 種が分離して取れることを確認する。
+#[test]
+fn extract_new_file_facts_ts_combines_exported_callees_reexports() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("mod.ts"),
+        "export { Helper } from './helper';\n\
+export const Widget = () => { compute(); };\n\
+function compute() { return 1; }\n",
+    )
+    .expect("write");
+
+    let facts = extract_new_file_facts(dir.path().to_str().expect("utf-8"), "mod.ts");
+    let exported: Vec<&str> = facts
+        .exported
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|(n, _, _)| n.as_str())
+        .collect();
+    assert!(
+        exported.contains(&"Widget"),
+        "local export const は exported に含まれる。got: {exported:?}"
+    );
+    assert!(
+        facts.reexports.contains("Helper"),
+        "named re-export は reexports に含まれる。got: {:?}",
+        facts.reexports
+    );
+    assert!(
+        facts.callees.contains("compute"),
+        "本体内の呼び出しは callees に含まれる。got: {:?}",
+        facts.callees
+    );
+}
+
+/// perf #2: lexer-only (Xojo) でも `extract_new_file_facts` は panic せず、exported は lexer
+/// 経由で取得し callees / reexports は空 (tree-sitter parse を呼ばない)。
+#[test]
+fn extract_new_file_facts_xojo_lexer_only_no_panic() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("Sample.xojo_code"),
+        "Class Sample\nSub Greet()\nEnd Sub\nEnd Class\n",
+    )
+    .expect("write");
+
+    let facts = extract_new_file_facts(dir.path().to_str().expect("utf-8"), "Sample.xojo_code");
+    assert!(
+        facts.exported.is_some(),
+        "lexer-only でも exported は Some (lexer 経由)"
+    );
+    assert!(
+        facts.callees.is_empty() && facts.reexports.is_empty(),
+        "lexer-only では callees / reexports は空 (tree-sitter parse を呼ばない)"
     );
 }
 

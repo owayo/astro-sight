@@ -178,6 +178,7 @@ fn process_modified_file(
     old_syms: &[(String, String, String)],
     new_syms: &[(String, String, String)],
     in_file_callees: &std::collections::HashSet<String>,
+    new_reexports: &std::collections::HashSet<String>,
     ref_index: &ApiRefIndex,
     rust_reexport_cache: &mut RustBaseReexportCache,
     rust_new_reexport_cache: &mut RustWorktreeReexportCache,
@@ -249,7 +250,7 @@ fn process_modified_file(
     let is_bash_old_file = is_bash_script_path(&df.old_path);
     // TS/JS: 新ツリーで `export { name } from "..."` として re-export されているシンボルは
     // 利用者から見た API 面が維持されているため api.rm から除外する。
-    let new_reexports = extract_reexported_names_from_file(dir, &df.new_path);
+    // `new_reexports` は Phase 0 の単一 parse で先取り済み (perf #2: ここでの再 read+parse を排除)。
     for (name, kind, sig) in old_syms {
         if !new_map.contains_key(name.as_str()) {
             if is_rust_old_symbol_outside_public_api_surface(
@@ -624,6 +625,9 @@ enum PreparedDiffFile {
         old_syms: Option<Vec<(String, String, String)>>,
         new_syms: Option<Vec<(String, String, String)>>,
         in_file_callees: std::collections::HashSet<String>,
+        /// new_path の named re-export 名集合 (TS/JS/Rust)。Phase 0 の単一 parse で先取りし、
+        /// process_modified_file が再 read+parse せず使う (perf #2)。
+        new_reexports: std::collections::HashSet<String>,
     },
 }
 
@@ -725,8 +729,10 @@ pub(crate) fn detect_api_changes(
             continue;
         }
         if df.old_path == "/dev/null" {
-            let new_syms = extract_exported_symbols_from_file(dir, &df.new_path);
-            let in_file_callees = extract_in_file_callees(dir, &df.new_path);
+            // new_path を 1 回 read+parse して exported / callees を導出 (perf #2)。
+            let facts = extract_new_file_facts(dir, &df.new_path);
+            let new_syms = facts.exported;
+            let in_file_callees = facts.callees;
             if let Some(syms) = &new_syms {
                 for (name, _, _) in syms {
                     // per-symbol 実装と同じ短絡: ファイル内から呼ばれるシンボルは
@@ -748,8 +754,12 @@ pub(crate) fn detect_api_changes(
         }
         // rename 差分では base 側に新パスが存在しないため、旧版は old_path から読む。
         let old_syms = extract_exported_symbols_from_git(dir, base, &df.old_path);
-        let new_syms = extract_exported_symbols_from_file(dir, &df.new_path);
-        let in_file_callees = extract_in_file_callees(dir, &df.new_path);
+        // new_path を 1 回 read+parse して exported / callees / reexports を導出 (perf #2)。
+        // reexports は process_modified_file が再 parse せず使えるよう PreparedDiffFile に持たせる。
+        let facts = extract_new_file_facts(dir, &df.new_path);
+        let new_syms = facts.exported;
+        let in_file_callees = facts.callees;
+        let new_reexports = facts.reexports;
         if let (Some(old), Some(new)) = (&old_syms, &new_syms) {
             collect_modified_file_index_names(
                 old,
@@ -763,6 +773,7 @@ pub(crate) fn detect_api_changes(
             old_syms,
             new_syms,
             in_file_callees,
+            new_reexports,
         });
     }
     let ref_index = ApiRefIndex::build(dir, &index_names);
@@ -801,6 +812,7 @@ pub(crate) fn detect_api_changes(
                 old_syms,
                 new_syms,
                 in_file_callees,
+                new_reexports,
             } => {
                 if let (Some(old_syms), Some(new_syms)) = (old_syms, new_syms) {
                     process_modified_file(
@@ -812,6 +824,7 @@ pub(crate) fn detect_api_changes(
                         old_syms,
                         new_syms,
                         in_file_callees,
+                        new_reexports,
                         &ref_index,
                         &mut rust_reexport_cache,
                         &mut rust_new_reexport_cache,
@@ -1087,22 +1100,6 @@ pub(crate) fn extract_exported_symbols_from_source(
     ))
 }
 
-pub(crate) fn extract_exported_symbols_from_file(
-    dir: &str,
-    file_path: &str,
-) -> Option<Vec<(String, String, String)>> {
-    // テストファイル配下のシンボルは外部 API 面ではないため、api.add/rm/mod の
-    // 検出対象から外す。Swift Testing (`@Test`/`@Suite`)、JUnit テストメソッド、
-    // *.test.ts、tests/ ディレクトリ等が該当する。
-    if is_test_path(std::path::Path::new(file_path)) {
-        return Some(Vec::new());
-    }
-    // API 変更検出ではフレームワーク登録デコレータ付き関数も「公開 API 面」として
-    // 検出対象に残す (新規 CLI サブコマンドの追加・削除も api.add / api.rm として
-    // 報告したい)。
-    extract_exported_symbols_from_file_inner(dir, file_path, true, false)
-}
-
 pub(crate) fn extract_exported_symbols_from_file_inner(
     dir: &str,
     file_path: &str,
@@ -1144,46 +1141,102 @@ pub(crate) fn extract_exported_symbols_from_file_inner(
     ))
 }
 
-/// 新ツリーのファイルから TS/JS の named re-export 名集合を取得する。api.rm 抑制に使う。
-/// 非 TS/JS、parse 失敗、安全でないパスでは空集合を返す (fail-safe: 抑制しない方向)。
-pub(crate) fn extract_reexported_names_from_file(
-    dir: &str,
-    file_path: &str,
-) -> std::collections::HashSet<String> {
-    if !crate::engine::impact::is_safe_diff_path(file_path) {
-        return std::collections::HashSet::new();
+/// new_path 1 ファイルから API 差分検出に必要な 3 種の facts をまとめて抽出する。
+/// 旧 exported / in_file_callees / reexported の各抽出が同一 new_path をそれぞれ read+parse
+/// していた (TS/JS/Rust で 3 回、他言語で 2 回) のを **1 回の read+parse に集約**する (perf #2)。
+/// 各抽出のガードは元関数と完全に一致させ behavior-preserving とする:
+/// - `exported`: test path は `Some(空)` (parse せず) / 非 test は `is_safe_diff_path` 必須で
+///   None と空を区別 / lexer-only は lexer 経由 / それ以外 tree-sitter parse+filter
+/// - `callees`: test/safe ガードなし、read+parse 失敗時は空 (lexer-only は parse_source が Err→空)
+/// - `reexports`: `is_safe_diff_path` かつ TS/TSX/JS/Rust のみ、それ以外は空
+pub(crate) struct NewFileFacts {
+    pub(crate) exported: Option<Vec<(String, String, String)>>,
+    pub(crate) callees: std::collections::HashSet<String>,
+    pub(crate) reexports: std::collections::HashSet<String>,
+}
+
+pub(crate) fn extract_new_file_facts(dir: &str, file_path: &str) -> NewFileFacts {
+    let mut facts = NewFileFacts {
+        exported: None,
+        callees: std::collections::HashSet::new(),
+        reexports: std::collections::HashSet::new(),
+    };
+    // exported の test path 短絡: parse せず Some(空) を返す (extract_exported_symbols_from_file と一致)。
+    let is_test = is_test_path(std::path::Path::new(file_path));
+    if is_test {
+        facts.exported = Some(Vec::new());
     }
+    // exported (非 test) / reexports は is_safe_diff_path を要求する。callees は要求しない。
+    let safe = crate::engine::impact::is_safe_diff_path(file_path);
+
     let full_path = std::path::Path::new(dir).join(file_path);
     let Some(utf8) = full_path.to_str() else {
-        return std::collections::HashSet::new();
+        return facts;
     };
     let utf8_path = camino::Utf8Path::new(utf8);
     let Ok(lang_id) = crate::language::LangId::from_path(utf8_path) else {
-        return std::collections::HashSet::new();
+        return facts;
     };
-    // 現状 re-export 認識を実装している言語のみ対象 (TS/JS の `export { x } from "..."`,
-    // Rust の `pub use sub::x;`)。他言語は将来対応。
-    if !matches!(
-        lang_id,
-        crate::language::LangId::Typescript
-            | crate::language::LangId::Tsx
-            | crate::language::LangId::Javascript
-            | crate::language::LangId::Rust
-    ) {
-        return std::collections::HashSet::new();
-    }
     let Ok(source) = parser::read_file(utf8_path) else {
-        return std::collections::HashSet::new();
+        return facts;
     };
-    let Ok(tree) = parser::parse_source(&source, lang_id) else {
-        return std::collections::HashSet::new();
-    };
-    match lang_id {
-        crate::language::LangId::Rust => {
-            crate::engine::symbols::collect_rust_reexported_names(tree.root_node(), &source)
+
+    // lexer-only (Xojo): tree-sitter parse は呼ばない (parse_source は Err を返すため callees/
+    // reexports は元実装でも空)。exported のみ lexer 経由 (非 test かつ safe のとき)。
+    if let crate::language::DetectedLang::LexerOnly(lexer_lang) = lang_id.detected() {
+        if !is_test && safe {
+            facts.exported = Some(crate::engine::lexer::extract_exported_symbols(
+                &source, lexer_lang, false,
+            ));
         }
-        _ => crate::engine::symbols::collect_reexported_names(tree.root_node(), &source),
+        return facts;
     }
+
+    let Ok(tree) = parser::parse_source(&source, lang_id) else {
+        return facts;
+    };
+    let root = tree.root_node();
+
+    // callees: test/safe ガードなし (extract_in_file_callees と一致)。
+    facts.callees =
+        crate::engine::calls::extract_all_callees(root, &source, lang_id).unwrap_or_default();
+
+    // exported (非 test かつ safe): extract_symbols → filter_exported_symbols。
+    // extract_symbols 失敗は None のまま (元 _inner の `?` と一致)。
+    if !is_test
+        && safe
+        && let Ok(syms) = crate::engine::symbols::extract_symbols(root, &source, lang_id)
+    {
+        facts.exported = Some(filter_exported_symbols(
+            &syms,
+            root,
+            &source,
+            lang_id,
+            true,
+            false,
+            Some(file_path),
+        ));
+    }
+
+    // reexports: safe かつ TS/TSX/JS/Rust のみ (extract_reexported_names_from_file と一致)。
+    if safe
+        && matches!(
+            lang_id,
+            crate::language::LangId::Typescript
+                | crate::language::LangId::Tsx
+                | crate::language::LangId::Javascript
+                | crate::language::LangId::Rust
+        )
+    {
+        facts.reexports = match lang_id {
+            crate::language::LangId::Rust => {
+                crate::engine::symbols::collect_rust_reexported_names(root, &source)
+            }
+            _ => crate::engine::symbols::collect_reexported_names(root, &source),
+        };
+    }
+
+    facts
 }
 
 /// dead_symbols のうち、宣言行が今回の diff の追加行 (`+` 行) と重なるもののみを残す。
@@ -2011,33 +2064,6 @@ pub(crate) fn filter_exported_symbols(
         result.push((qualname, format!("{:?}", sym.kind).to_lowercase(), sig));
     }
     result
-}
-
-/// 指定ファイル内で発生している全ての callee 名を集合として返す。
-/// `extract_calls` と異なり、トップレベル呼び出し (関数本体外の `main()` や bash の
-/// `timed "..."` 等) も含める。API 変更検出の内部ヘルパー判定用。
-/// 失敗時（読み込み/パース不能）は空集合を返す。
-pub(crate) fn extract_in_file_callees(
-    dir: &str,
-    file_path: &str,
-) -> std::collections::HashSet<String> {
-    let empty = std::collections::HashSet::new();
-    let full_path = std::path::Path::new(dir).join(file_path);
-    let Some(utf8_str) = full_path.to_str() else {
-        return empty;
-    };
-    let utf8_path = camino::Utf8Path::new(utf8_str);
-    let Ok(source) = parser::read_file(utf8_path) else {
-        return empty;
-    };
-    let Ok(lang_id) = crate::language::LangId::from_path(utf8_path) else {
-        return empty;
-    };
-    let Ok(tree) = parser::parse_source(&source, lang_id) else {
-        return empty;
-    };
-    crate::engine::calls::extract_all_callees(tree.root_node(), &source, lang_id)
-        .unwrap_or_default()
 }
 
 /// `qualname` (例: `Class.method` や bare name `foo`) が `callees` に含まれるかを判定する。
