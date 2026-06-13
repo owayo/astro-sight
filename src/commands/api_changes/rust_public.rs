@@ -158,13 +158,14 @@ pub(crate) fn is_rust_old_symbol_outside_public_api_surface(
     symbol_name: &str,
     reexport_cache: &mut RustBaseReexportCache,
 ) -> bool {
-    if is_binary_only_rust_crate_at_base(dir, base, old_path) {
+    if reexport_cache.is_binary_only_at_base(dir, base, old_path) {
         return true;
     }
     // symbol が inline `mod_item` 内 (`mod foo { pub fn symbol() }` 形式) で定義されている
     // 場合、ファイルパス由来の module_segments とずれて edge graph seed が誤合致する。
     // 範囲限定 fail-closed: false negative を防ぐため `api.rm` 抑制を諦め symbol を残す
     // (Issue 2026-06-05-rust-api-add-private-module-reexport-edge-graph の codex 指摘)。
+    // inline_mod は symbol 依存のためメモ化対象外 (今回見送り)。
     if rust_symbol_is_inside_inline_mod(
         RustSourceTree::Base { rev: base },
         dir,
@@ -174,8 +175,8 @@ pub(crate) fn is_rust_old_symbol_outside_public_api_surface(
         return false;
     }
     // re-export を考慮しない raw private 判定。public-reachable / 判定不能なら api.rm を残す。
-    let Some(private) = rust_private_module_info(RustSourceTree::Base { rev: base }, dir, old_path)
-    else {
+    // old_path 単位でメモ化済み (symbol 非依存)。
+    let Some(private) = reexport_cache.private_module_info_at_base(dir, base, old_path) else {
         return false;
     };
     // index 構築に失敗したら api.rm を残す (false negative 回避優先)。
@@ -186,6 +187,7 @@ pub(crate) fn is_rust_old_symbol_outside_public_api_surface(
 }
 
 /// base 側 crate の private module 情報 (re-export は考慮しない raw 判定の結果)。
+#[derive(Clone)]
 pub(crate) struct RustPrivateModuleInfo {
     crate_root_rel: std::path::PathBuf,
     src_root_rel: std::path::PathBuf,
@@ -585,6 +587,13 @@ impl RustWorktreeReexportCache {
 #[derive(Default)]
 pub(crate) struct RustBaseReexportCache {
     inner: RustReexportCache,
+    /// `old_path` → `is_binary_only_rust_crate_at_base` の結果。dir/base は
+    /// `detect_api_changes` 呼び出し内で固定なので old_path 単独 key で十分。per-symbol の
+    /// 多重 `git show base:Cargo.toml`/`src/lib.rs` を排除する (cache は呼び出し単位で閉じる)。
+    binary_crate_memo: std::collections::HashMap<String, bool>,
+    /// `old_path` → base 側 `rust_private_module_info` の結果。`None` (public-reachable /
+    /// 判定不能) もキャッシュして再 `git show` + 再 parse を防ぐ。
+    private_module_memo: std::collections::HashMap<String, Option<RustPrivateModuleInfo>>,
 }
 
 impl RustBaseReexportCache {
@@ -596,6 +605,39 @@ impl RustBaseReexportCache {
     ) -> Option<&RustPubUseIndex> {
         self.inner
             .index_for(RustSourceTree::Base { rev: base }, dir, info)
+    }
+
+    /// `is_binary_only_rust_crate_at_base` を old_path 単位でメモ化する。
+    pub(crate) fn is_binary_only_at_base(
+        &mut self,
+        dir: &str,
+        base: &str,
+        file_path: &str,
+    ) -> bool {
+        if let Some(&cached) = self.binary_crate_memo.get(file_path) {
+            return cached;
+        }
+        let computed = is_binary_only_rust_crate_at_base(dir, base, file_path);
+        self.binary_crate_memo
+            .insert(file_path.to_string(), computed);
+        computed
+    }
+
+    /// base 側 `rust_private_module_info` を old_path 単位でメモ化し、結果を clone で返す。
+    /// `None` も「計算済み」としてキャッシュする (`entry` で未計算と区別)。
+    fn private_module_info_at_base(
+        &mut self,
+        dir: &str,
+        base: &str,
+        file_path: &str,
+    ) -> Option<RustPrivateModuleInfo> {
+        if let Some(cached) = self.private_module_memo.get(file_path) {
+            return cached.clone();
+        }
+        let computed = rust_private_module_info(RustSourceTree::Base { rev: base }, dir, file_path);
+        self.private_module_memo
+            .insert(file_path.to_string(), computed.clone());
+        computed
     }
 }
 

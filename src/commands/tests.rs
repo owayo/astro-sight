@@ -3116,6 +3116,62 @@ fn detect_api_changes_private_module_pub_fn_same_file_removal_excluded_from_remo
     );
 }
 
+/// 同一 old_path に複数の private-module pub fn 削除がある場合でも、全件が api.rm から
+/// 除外される。base 側 crate 判定 (`is_binary_only_at_base` / `private_module_info_at_base`) を
+/// per-symbol で `git show` し直さず old_path 単位でメモ化する perf #1 の behavior-preserving
+/// 回帰テスト (メモ有無で結果が一致することを担保)。
+#[test]
+fn detect_api_changes_private_module_multiple_pub_fn_removal_all_excluded() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+            ),
+            ("src/lib.rs", "mod wifi;\n"),
+            (
+                "src/wifi/mod.rs",
+                "pub fn found() -> u32 {\n    0\n}\npub fn scanned() -> u32 {\n    1\n}\npub fn kept() -> u32 {\n    2\n}\n",
+            ),
+        ],
+        "base",
+    );
+    // found と scanned を削除、kept は残す (同一 old_path で 2 symbol が memo パスを踏む)
+    fs::write(
+        repo.join("src/wifi/mod.rs"),
+        "pub fn kept() -> u32 {\n    2\n}\n",
+    )
+    .expect("write");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/wifi/mod.rs".to_string(),
+        new_path: "src/wifi/mod.rs".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 6,
+            new_start: 1,
+            new_count: 0,
+        }],
+        deleted_old_source: None,
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    let removed: Vec<&str> = api
+        .removed
+        .iter()
+        .chain(api.removed_dead.iter())
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(
+        !removed
+            .iter()
+            .any(|n| n.ends_with("found") || n.ends_with("scanned")),
+        "private module 配下の複数 pub fn 削除は全件 api.rm に出ない。got: {removed:?}"
+    );
+}
+
 /// private module でも root から `pub use` で re-export していた pub fn は外部公開 API
 /// 面に含まれるため、削除は api.rm に残す (find_pub_use_reexport で private 判定が解除される)。
 #[test]

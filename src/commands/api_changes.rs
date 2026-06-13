@@ -296,7 +296,7 @@ fn process_modified_file(
     // Rust bin-only crate 判定 (api.mod 抑制用)。lib → bin / bin → lib どちらかが bin-only なら
     // 外部 API 面の変更ではないとみなす。
     let is_binary_rust_old_crate_for_mod =
-        is_binary_only_rust_crate_at_base(dir, base, &df.old_path);
+        rust_reexport_cache.is_binary_only_at_base(dir, base, &df.old_path);
     let is_binary_rust_new_crate_for_mod = is_binary_only_rust_crate(dir, &df.new_path);
     let skip_mod_for_binary_crate =
         is_binary_rust_old_crate_for_mod || is_binary_rust_new_crate_for_mod;
