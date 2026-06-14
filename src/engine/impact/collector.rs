@@ -13,7 +13,8 @@ use crate::engine::refs;
 use crate::language::LangId;
 
 use super::import_facts::{
-    RefFileFacts, is_ts_local_shadow_context, lang_is_ts_family, ref_file_directly_imports_source,
+    RefFileFacts, is_rust_local_shadow_context, is_ts_local_shadow_context, lang_is_ts_family,
+    ref_file_directly_imports_source, rust_ref_file_has_symbol_evidence, should_route_rust_ref_low,
     should_route_ts_importless_ref_low,
 };
 use super::signature::extract_function_from_context;
@@ -175,9 +176,10 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             crate::models::reference::RefConfidence::BareNameOnly => 2,
         };
 
-        // TS/TSX/JS の context 行で identifier がローカル binding (interface / type / const /
-        // let / var / function / class / destructured params) で shadow されているか判定する。
-        // 軽量 heuristic、非 TS family ではスキップ (Issue 2026-06-05-multi-attachment-conversations-fp)。
+        // context 行で identifier がローカル binding で shadow されているか判定する。軽量 heuristic。
+        // TS/TSX/JS: interface / type / const / let / var / function / class / destructured params
+        // (Issue 2026-06-05-multi-attachment-conversations-fp)。
+        // Rust: `let json` / `let mut json` / `for json in` (Issue 2026-06-13-ai-status-json-symbol-fp)。
         let local_shadow_hint = if self.ref_lang.is_some_and(lang_is_ts_family) {
             let symbol_name = self
                 .all_symbol_names
@@ -185,6 +187,13 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                 .map(String::as_str)
                 .unwrap_or("");
             is_ts_local_shadow_context(context, symbol_name)
+        } else if self.ref_lang == Some(LangId::Rust) {
+            let symbol_name = self
+                .all_symbol_names
+                .get(ix)
+                .map(String::as_str)
+                .unwrap_or("");
+            is_rust_local_shadow_context(context, symbol_name)
         } else {
             false
         };
@@ -288,7 +297,38 @@ impl<'a> ImpactCollector<'a> {
                 } else {
                     false
                 };
-                let route_low = base_route_low || ts_route_low;
+                // Rust 名前衝突 FP 抑制 (Issue 2026-06-13-ai-status-json-symbol-fp):
+                // 別ファイルのローカル変数 (`let json`) が同名の自由関数 (`render::json`) への
+                // cross-file 参照に誤マッチするのを抑える。自由関数 (module-level fn/const/static)
+                // は別モジュールから bare では呼べず `use` / qualified path が必須なので、ref file に
+                // その証拠 (import / `X::json` / glob) がなければ bare `json` は別物 → low。
+                // メソッド (`has_parent_type`) は `foo.bar()` のように bare 呼び出しが正当なため対象外
+                // (親型ロジックで別途処理済み)。fail-closed: 判定不能なら high 維持。
+                let rust_route_low = if !filter_disabled
+                    && !has_parent_type
+                    && self.ref_lang == Some(LangId::Rust)
+                    && ctx.lang_id == LangId::Rust
+                {
+                    let symbol_name = self
+                        .all_symbol_names
+                        .get(sym_ix_usize)
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    match rust_ref_file_has_symbol_evidence(
+                        self.dir,
+                        self.path_str,
+                        symbol_name,
+                        self.import_facts_cache,
+                    ) {
+                        Some(has_evidence) => {
+                            should_route_rust_ref_low(has_evidence, e.local_shadow_hint)
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                let route_low = base_route_low || ts_route_low || rust_route_low;
                 if is_ref_in_target_test_context(
                     self.path_str,
                     e.line as usize,

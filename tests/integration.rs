@@ -1788,6 +1788,72 @@ fn context_git_xojo_only_diff_skips_before_parse() {
 }
 
 #[test]
+fn impact_rust_local_var_not_treated_as_cross_file_ref() {
+    // Issue 2026-06-13-ai-status-json-symbol-fp: 別ファイルのローカル変数 `let json` が
+    // 同名の自由関数 `render::json` への cross-file 参照に誤マッチしないこと。
+    // qualified call (`render::json`) を持つ main.rs は high のまま、`let json` だけの
+    // profiles.rs は未解決影響に出ないことを検証する。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/render.rs"),
+        "pub fn json(value: i32) -> String {\n    format!(\"{}\", value)\n}\n",
+    )
+    .unwrap();
+    // profiles.rs: render::json を import / qualified 参照せず bare `let json` のみ
+    std::fs::write(
+        root.join("src/profiles.rs"),
+        "use std::fs;\npub fn discover() -> i32 {\n    let json = fs::read_to_string(\"x\").unwrap_or_default();\n    json.trim().parse().unwrap_or(0)\n}\n",
+    )
+    .unwrap();
+    // main.rs: render::json を qualified path で呼ぶ実 caller
+    std::fs::write(
+        root.join("src/main.rs"),
+        "mod render;\nmod profiles;\nfn main() {\n    println!(\"{}\", render::json(profiles::discover()));\n}\n",
+    )
+    .unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "astro-sight@example.com"]);
+    git(&["config", "user.name", "astro-sight"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial", "-q"]);
+
+    // render::json のシグネチャを変更 (i32 -> i64)
+    std::fs::write(
+        root.join("src/render.rs"),
+        "pub fn json(value: i64) -> String {\n    format!(\"{}\", value)\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["impact", "--dir", root.to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // main.rs (qualified call) は未解決影響として残る
+    assert!(
+        stderr.contains("main.rs"),
+        "qualified call (render::json) を持つ main.rs は high のまま残るべき: {stderr}"
+    );
+    // profiles.rs (local `let json`) は cross-file 参照ではないので出ない
+    assert!(
+        !stderr.contains("profiles.rs"),
+        "local 変数 `let json` だけの profiles.rs は未解決影響に出るべきでない: {stderr}"
+    );
+}
+
+#[test]
 fn symbols_dir() {
     let output = cargo_bin()
         .args(["symbols", "--dir", "src/engine/"])
