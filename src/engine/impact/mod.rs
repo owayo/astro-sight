@@ -502,6 +502,36 @@ fn should_include_for_cross_file(
     true
 }
 
+/// シンボルの全行 (`sym_start..=sym_end`, 0-indexed) が新規追加行 (`changed_new_lines`)
+/// に含まれるか。全行が `+` 行なら、そのシンボルは純粋な新規追加 (既存行の書き換えでない)。
+fn symbol_lines_all_added(
+    sym_start: usize,
+    sym_end: usize,
+    changed_new_lines: &std::collections::HashSet<usize>,
+) -> bool {
+    (sym_start..=sym_end).all(|l| changed_new_lines.contains(&l))
+}
+
+/// hunk に削除行 (`-` 行) が含まれるかを old/new の行数整合から算術的に導出する。
+/// 純追加 hunk では `new_count == old_count(=context 行数) + added_in_hunk` が成立する。
+/// 削除があると old_count に new 側へ現れない行が含まれ、この等式が崩れる。これにより
+/// 削除本文を持たない `HunkInfo` でも (old 側 parse 不要で) 削除有無を判定できる。
+fn hunk_has_removed_lines(
+    hunk: &HunkInfo,
+    hunk_start: usize,
+    hunk_end: usize,
+    changed_new_lines: &std::collections::HashSet<usize>,
+) -> bool {
+    let added_in_hunk = (hunk_start..hunk_end)
+        .filter(|l| changed_new_lines.contains(l))
+        .count();
+    // old_count は外部 diff 入力 (context --diff / --diff-file / session) では巨大値に
+    // なり得るため saturating_add で overflow を防ぐ。wrap すると削除を見逃して "added" に
+    // 倒れる fail-open になるが、saturate すれば usize::MAX != new_count = 削除あり扱いの
+    // "modified" に倒れて fail-closed になる。
+    hunk.old_count.saturating_add(added_in_hunk) != hunk.new_count
+}
+
 /// hunk をシンボル範囲と照合して affected シンボルを検出する。
 ///
 /// `changed_new_lines` が `Some` のときは、`+` 行が 1 つも symbol range に入らない
@@ -546,14 +576,26 @@ fn find_affected_symbols(
                     continue;
                 }
                 // change_type 判定:
-                // - hunk old_count==0: シンボル全体を hunk が覆う場合のみ "added"
-                //   (新規シンボル定義) と判定。hunk が部分的にしか覆わない場合は
-                //   既存シンボル内への行追加なので "modified" とする。これにより
-                //   既存関数本体への新規行追加が誤って "added" 扱いされ impact
-                //   ノイズになるのを防ぐ。
-                // - hunk new_count==0: pure delete なので "removed"。
+                // - new_count==0: pure delete → "removed"。
+                // - シンボル全行が新規追加行 (changed_new_lines に全行含まれる) かつ
+                //   その hunk に削除行が無い → "added"。既存ファイルの context 込み hunk
+                //   (old_count>0) でも、純追加で挿入された新規シンボルを正しく "added" と
+                //   判定する (Issue: 2026-06-14-antigravity-new-symbol-impact)。削除行の
+                //   有無は old/new の行数整合から算術的に導出する (old 側 parse 不要)。
+                //   近接削除を含む混在 hunk や複数 hunk にまたがるシンボルは all_added が
+                //   崩れるため "modified" に倒れる (fail-closed、false negative を避ける)。
+                // - hunk old_count==0: シンボル全体を hunk が覆う場合のみ "added"。hunk が
+                //   部分的にしか覆わない場合は既存シンボル内への行追加なので "modified"。
                 // - それ以外: "modified"。
-                let change_type = if hunk.old_count == 0 {
+                let all_added_no_removal = changed_new_lines.is_some_and(|cl| {
+                    symbol_lines_all_added(sym_start, sym_end, cl)
+                        && !hunk_has_removed_lines(hunk, hunk_start, hunk_end, cl)
+                });
+                let change_type = if hunk.new_count == 0 {
+                    "removed"
+                } else if all_added_no_removal {
+                    "added"
+                } else if hunk.old_count == 0 {
                     // hunk が sym 全体（包含的な最終行 sym_end を含む）を覆う場合のみ
                     // "added"。hunk_end は排他的上限なので sym_end を含むには
                     // hunk_end > sym_end が必要。部分的にしか覆わない場合は既存
@@ -564,8 +606,6 @@ fn find_affected_symbols(
                     } else {
                         "modified"
                     }
-                } else if hunk.new_count == 0 {
-                    "removed"
                 } else {
                     "modified"
                 };
@@ -1222,6 +1262,92 @@ mod tests {
         assert_eq!(
             result[0].change_type, "modified",
             "最終行を覆わない pure-add は added ではなく modified"
+        );
+    }
+
+    /// 既存ファイルの末尾/途中に新規シンボルを追加すると git diff が context 行を
+    /// hunk に含めて old_count>0 になるが、シンボル全行が `+` 行 (削除なし) なら
+    /// "added" と判定する (Issue: 2026-06-14-antigravity-new-symbol-impact)。
+    /// これにより hook の `change_type != "added"` 除外で誤ブロッキングが消える。
+    #[test]
+    fn find_affected_context_hunk_new_symbol_all_added_no_removals_is_added() {
+        // 新ファイル: 行1-3 既存 AppCfg (context), 行4 空行(+), 行5-8 新規 struct(+)
+        // hunk: @@ -1,3 +1,8 @@ (old_count=3 の context 込み hunk)
+        let sym = make_sym("AntigravityCfg", 4, 7); // 0-indexed 4..=7 (struct 4 行)
+        let hunk = HunkInfo {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 8,
+        };
+        // changed_new_lines: 0-indexed 3..=7 (空行 + struct 全行が +)
+        let mut changed = std::collections::HashSet::new();
+        for l in 3..=7usize {
+            changed.insert(l);
+        }
+        let result = find_affected_symbols(&[sym], &[hunk], Some(&changed));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "AntigravityCfg");
+        assert_eq!(
+            result[0].change_type, "added",
+            "context 込み hunk でも全行 + (削除なし) の新規シンボルは added"
+        );
+    }
+
+    /// シンボル全行が `+` 行でも、その hunk に削除行があれば (全面書き換え) "modified"。
+    /// old/new 行数整合 (old_count + added_in_hunk != new_count) で削除を検出し、
+    /// 既存シンボルの書き換えを "added" と誤判定して cross-file 探索から漏らさない。
+    #[test]
+    fn find_affected_full_rewrite_all_new_lines_but_hunk_has_removals_is_modified() {
+        // hunk: @@ -1,3 +1,4 @@ (old 3 行削除 + new 4 行追加、全行書き換え)
+        // new 側 sym range 0-indexed 0..=3 は全行 + だが、hunk に削除 3 行あり
+        let sym = make_sym("rewritten", 0, 3);
+        let hunk = HunkInfo {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 4,
+        };
+        let mut changed = std::collections::HashSet::new();
+        for l in 0..=3usize {
+            changed.insert(l);
+        }
+        let result = find_affected_symbols(&[sym], &[hunk], Some(&changed));
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].change_type, "modified",
+            "全行 + でも hunk に削除があれば書き換えなので modified (fail-closed)"
+        );
+    }
+
+    /// 近接削除と新規シンボル追加が同一 hunk に混在する場合、新規シンボルが全行 + でも
+    /// hunk に削除があるため "modified" に倒す (fail-closed)。削除が新規シンボルへ
+    /// 影響する可能性を排除できないため保守的に扱い、false negative を避ける。
+    #[test]
+    fn find_affected_new_symbol_in_mixed_hunk_with_removal_is_modified_fail_closed() {
+        // hunk @@ -1,3 +1,5 @@:
+        //   line1 (context, new 行1)
+        //  -old_line (削除)
+        //  +struct NewType { (new 行2)
+        //  +    field: i32,  (new 行3)
+        //  +}                (new 行4)
+        //   line5 (context, new 行5)
+        let sym = make_sym("NewType", 1, 3); // 0-indexed 1..=3 (struct 3 行)
+        let hunk = HunkInfo {
+            old_start: 1,
+            old_count: 3, // context2 + 削除1
+            new_start: 1,
+            new_count: 5, // context2 + 追加3
+        };
+        let mut changed = std::collections::HashSet::new();
+        for l in 1..=3usize {
+            changed.insert(l);
+        }
+        let result = find_affected_symbols(&[sym], &[hunk], Some(&changed));
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].change_type, "modified",
+            "削除を含む混在 hunk の新規シンボルは modified (fail-closed)"
         );
     }
 }
