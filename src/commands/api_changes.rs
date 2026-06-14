@@ -529,7 +529,9 @@ fn base_pyproject_marks_module_as_api(dir: &str, base: &str, stem: &str) -> bool
     ];
     for table in script_tables.into_iter().flatten() {
         let Some(table) = table.as_table() else {
-            continue;
+            // script セクションが存在するが table でない (schema 不正) → 解析不能なので
+            // fail-closed (API 扱い)。codex 指摘: ここを continue にすると安全側から漏れる。
+            return true;
         };
         for v in table.values() {
             let Some(target) = v.as_str() else {

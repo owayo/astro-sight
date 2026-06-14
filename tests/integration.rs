@@ -2076,6 +2076,31 @@ fn review_python_poetry_script_entry_not_excluded() {
 }
 
 #[test]
+fn review_python_malformed_pyproject_scripts_fails_closed() {
+    // 安全性 (codex 指摘): scripts セクションが存在するが table でない schema 不正な pyproject では
+    // 解析不能として fail-closed (script-local 判定を止め、削除を完全除外しない)。
+    let pyproject = "[project]\nname = \"tool\"\nscripts = \"cli:run\"\n";
+    let output = a3_review_hook(
+        |root| {
+            Command::new("git")
+                .args(["rm", "-q", "cli.py"])
+                .current_dir(root)
+                .status()
+                .expect("git rm");
+        },
+        &[
+            ("cli.py", "def run():\n    print(\"hi\")\n"),
+            ("pyproject.toml", pyproject),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("run"),
+        "schema 不正な pyproject は fail-closed で完全除外しないべき: {stderr}"
+    );
+}
+
+#[test]
 fn symbols_dir() {
     let output = cargo_bin()
         .args(["symbols", "--dir", "src/engine/"])
