@@ -1986,6 +1986,62 @@ fn impact_includes_untracked_new_files() {
     );
 }
 
+/// 未追跡 rename (A1): tracked file を削除 (unstaged) + 内容同一の untracked sibling を追加
+/// すると、high-confidence rename として正規化され api.add / api.rm が出ない。さらに内容同一の
+/// 場合は Modified diff を合成しない (hunkless = commit 済みの 100% rename と一致) ので、
+/// 削除元・rename 先のどちらも DiffFile に現れず、dead-code / cochange も commit 済みと一致する。
+#[test]
+fn run_git_diff_untracked_rename_normalizes_and_emits_no_add_or_rm() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[(
+            "src/mod_a.rs",
+            "pub fn foo(name: &str) -> String {\n    name.to_uppercase()\n}\n",
+        )],
+        "initial",
+    );
+
+    // mod_a.rs を削除 (unstaged) + 内容同一の mod_b.rs を untracked 追加 = rename。
+    fs::remove_file(repo.join("src/mod_a.rs")).expect("remove old");
+    fs::write(
+        repo.join("src/mod_b.rs"),
+        "pub fn foo(name: &str) -> String {\n    name.to_uppercase()\n}\n",
+    )
+    .expect("write new");
+
+    let diff =
+        crate::commands::run_git_diff(repo.to_str().expect("utf-8"), "HEAD", false).expect("diff");
+    let diff_files = crate::engine::diff::parse_unified_diff(&diff);
+
+    let api = detect_api_changes(repo.to_str().expect("utf-8"), "HEAD", &diff_files);
+    assert!(
+        api.added.is_empty(),
+        "rename で api.add は出ない: {:?}",
+        api.added
+    );
+    assert!(
+        api.removed.is_empty(),
+        "rename で api.rm は出ない: {:?}",
+        api.removed
+    );
+
+    // 内容同一 rename は Modified diff を合成しない → rename 先も削除元も DiffFile に出ない
+    // (commit 済みの hunkless 100% rename と一致し、dead-code / cochange の乖離を防ぐ)。
+    assert!(
+        !diff_files.iter().any(|f| f.new_path == "src/mod_b.rs"),
+        "内容同一 rename 先は DiffFile に出ない: {:?}",
+        diff_files.iter().map(|f| &f.new_path).collect::<Vec<_>>()
+    );
+    assert!(
+        !diff_files.iter().any(|f| f.old_path == "src/mod_a.rs"),
+        "rename 元の Deleted block は除去される: {:?}",
+        diff_files.iter().map(|f| &f.old_path).collect::<Vec<_>>()
+    );
+}
+
 /// 未追跡の symlink は合成しない (パス境界)。symlink_metadata でリンク自身を見て
 /// regular file 以外を除外するため、外部のソースファイルを指す symlink でも内容が
 /// 合成 diff に漏れない (codex レビュー指摘のセキュリティ境界)。
