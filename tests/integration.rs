@@ -1867,9 +1867,11 @@ fn impact_rust_macro_arg_ident_stays_high() {
     )
     .unwrap();
     // macro が path を補い、caller は bare ident `json` を渡すだけ。
+    // codex 指摘の混在行 (`let json = call_render!(json, 1); json`) も同行に local binding と
+    // macro 引数が混ざるケースとして含め、macro 引数側を取りこぼさないことを検証する。
     std::fs::write(
         root.join("src/caller.rs"),
-        "#[macro_export]\nmacro_rules! call_render {\n    ($name:ident, $arg:expr) => { $crate::render::$name($arg) };\n}\npub fn run() -> String { call_render!(json, 1) }\n",
+        "#[macro_export]\nmacro_rules! call_render {\n    ($name:ident, $arg:expr) => { $crate::render::$name($arg) };\n}\npub fn run() -> String { let json = call_render!(json, 1); json }\n",
     )
     .unwrap();
     std::fs::write(

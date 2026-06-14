@@ -212,9 +212,9 @@ pub(super) fn ref_file_directly_imports_source(
 /// - `use_list` 直下の `identifier` / `type_identifier` (`use a::{json, html}` の各要素)
 /// - `use_as_clause` の alias (`use a::json as j` → `j`)
 ///
-/// 失敗時 (parse 不可) は空集合 + glob=false を返す。呼び出し側が証拠なしと扱うと low 振り分けに
-/// なるが、build 自体の失敗は `build_ref_file_facts` が `None` を返して high 維持にするため、
-/// ここに来る時点では parse 済み。
+/// parse 失敗時は `None` を返す。空 facts (`Some((empty, false))`) を返すと「証拠なし → low」に
+/// 倒れて本物の参照を取りこぼすため、判定不能は呼び出し側で high 維持できるよう `None` にする
+/// (fail-closed)。
 pub(super) fn extract_rust_ref_facts(source: &[u8]) -> Option<(HashSet<String>, bool)> {
     // parse 失敗 (判定不能) は `None` を返し、呼び出し側で high 維持する (fail-closed)。
     // 空 facts を返すと「証拠なし → low」に倒れ、本物の参照を取りこぼす false negative になる。
@@ -503,13 +503,17 @@ pub(super) fn rust_ref_file_has_symbol_evidence(
     Some(facts.rust_has_glob_use || facts.rust_referenced_names.contains(symbol_name))
 }
 
-/// Rust cross-file ref の routing 判定。
-/// - local shadow (`let json` 等) → `true` (low)。明確なローカル束縛なので evidence / macro に
-///   関係なく弱い信号 (B2)。
+/// Rust cross-file ref の routing 判定。優先順は macro > shadow > evidence。
+/// - macro のある行 (`call_render!(json, ..)`) → `false` (high)。macro 展開で `module::json` の
+///   ように path が補われ得るため fail-closed で high 維持 (codex 指摘の false negative 回避)。
+///   shadow より優先するのは、同一行に `let json` と macro 引数が混在しても macro 引数側の
+///   本物の参照を取りこぼさないため (副作用として `let json = vec![..]` のような binding 行は
+///   high 維持されるが、FN より安全側の FP)。context は trim 済みで column と位置が揃わないため
+///   column 精度ではなく行単位で判定する。
+/// - local shadow (`let json` 等) → `true` (low)。明確なローカル束縛 (B2: import 済みでも shadow)。
 /// - 証拠あり (import / qualified path / glob) → `false` (high)。
-/// - 証拠なし → macro 引数 (`call_render!(json, ..)` のように macro が path を補う可能性がある) なら
-///   `false` (high, fail-closed)、そうでなければ `true` (low)。B1: bare identifier は別モジュールの
-///   同名シンボルへの参照ではない。
+/// - いずれも該当なし (証拠なし bare identifier) → `true` (low)。B1: 別モジュールの同名シンボルへの
+///   参照ではない。
 ///
 /// fail-closed: `has_symbol_evidence` が `None` (判定不能) の場合は呼び出し側で high 維持する
 /// (この関数は呼ばない)。
@@ -518,15 +522,16 @@ pub(super) fn should_route_rust_ref_low(
     local_shadow_hint: bool,
     ref_in_macro: bool,
 ) -> bool {
+    if ref_in_macro {
+        return false;
+    }
     if local_shadow_hint {
         return true;
     }
     if has_symbol_evidence {
         return false;
     }
-    // 証拠なし: macro 引数の bare identifier は macro 展開で `module::json` のような path が
-    // 補われ得るため high 維持 (codex 指摘: 単一行 macro 呼び出しの false negative 回避)。
-    !ref_in_macro
+    true
 }
 
 /// context 行に Rust の macro 呼び出し (`ident!(` / `ident![` / `ident!{`) が含まれるかを
@@ -756,11 +761,22 @@ pub fn discover() -> i32 {
     }
 
     #[test]
-    fn extract_rust_ref_facts_parse_failure_is_none() {
-        // 構文崩壊で parse 不能なら None (証拠不明 → high 維持) を返す。
-        // tree-sitter は誤り耐性があるため極端な入力で None を狙う。
-        // 通常ソースは Some を返すことだけ最低限保証する。
+    fn extract_rust_ref_facts_returns_some_for_valid_source() {
+        // 通常の有効ソースは Some を返す (parse 失敗時のみ None で high 維持する設計)。
         assert!(extract_rust_ref_facts(b"fn a() {}\n").is_some());
+    }
+
+    #[test]
+    fn rust_evidence_missing_file_is_none_high() {
+        // read 失敗 (存在しないファイル) → build_ref_file_facts が None → 判定不能で high 維持。
+        let mut cache = LruCache::new(std::num::NonZeroUsize::new(4).unwrap());
+        let r = rust_ref_file_has_symbol_evidence(
+            ".",
+            "definitely/missing_file.rs",
+            "json",
+            &mut cache,
+        );
+        assert_eq!(r, None, "read 失敗は None (呼び出し側で high 維持)");
     }
 
     #[test]
@@ -769,10 +785,11 @@ pub fn discover() -> i32 {
         assert!(should_route_rust_ref_low(false, false, false));
         // 証拠なし + shadow → low
         assert!(should_route_rust_ref_low(false, true, false));
-        // 証拠なし + macro 引数 (shadow でない) → high 維持 (fail-closed, codex 指摘)
+        // macro 引数 (shadow でない) → high 維持 (fail-closed, codex 指摘)
         assert!(!should_route_rust_ref_low(false, false, true));
-        // 証拠なし + macro でも shadow (`let json = m!()`) なら明確なローカル → low
-        assert!(should_route_rust_ref_low(false, true, true));
+        // macro は shadow より優先: 同一行に `let json` と macro 引数が混在しても macro 側を
+        // 取りこぼさないため high (codex 再指摘: 行単位 hint の混在ケース)
+        assert!(!should_route_rust_ref_low(false, true, true));
     }
 
     #[test]
