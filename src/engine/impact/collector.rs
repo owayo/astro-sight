@@ -13,8 +13,9 @@ use crate::engine::refs;
 use crate::language::LangId;
 
 use super::import_facts::{
-    RefFileFacts, is_rust_local_shadow_context, is_ts_local_shadow_context, lang_is_ts_family,
-    ref_file_directly_imports_source, rust_ref_file_has_symbol_evidence, should_route_rust_ref_low,
+    RefFileFacts, context_line_has_macro_invocation, is_rust_local_shadow_context,
+    is_ts_local_shadow_context, lang_is_ts_family, ref_file_directly_imports_source,
+    rust_ref_file_has_symbol_evidence, should_route_rust_ref_low,
     should_route_ts_importless_ref_low,
 };
 use super::signature::extract_function_from_context;
@@ -57,11 +58,13 @@ pub(super) struct RefEventMini {
     /// Phase 4 (impact ルーティング) で `BareNameOnly` + generic name のシンボル参照を
     /// `low_confidence_callers` へ振り分けるために使う。
     pub(super) confidence: u8,
-    /// TS/TSX/JS の context 行で identifier がローカル binding (interface / type / const /
-    /// let / var / function / class / destructured params) で shadow されているか。
-    /// `finish_file` で TS family + 直接 import なし + この hint ありなら `local_low_maps` へ
-    /// routing して名前衝突 FP を抑える (Issue 2026-06-05-multi-attachment-conversations-fp)。
+    /// TS/TSX/JS / Rust の context 行で identifier がローカル binding で shadow されているか。
+    /// `finish_file` の high vs low routing に使う (Issue 2026-06-05-multi-attachment-conversations-fp /
+    /// Issue 2026-06-13-ai-status-json-symbol-fp)。
     pub(super) local_shadow_hint: bool,
+    /// Rust: context 行に macro 呼び出し (`ident!(` 等) があるか。証拠なしの bare identifier でも
+    /// macro 引数なら macro 展開で path が補われ得るため high 維持する (fail-closed)。
+    pub(super) ref_in_macro: bool,
 }
 
 /// 汎用すぎてシンボル名だけでは owner を特定できない PHP/JS 系メソッド名。
@@ -198,6 +201,11 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             false
         };
 
+        // Rust の証拠なし bare identifier を low に落とす際、macro 引数だけは high 維持するため
+        // context 行の macro 呼び出し有無を見ておく (non-Rust では使わないので Rust のみ算出)。
+        let ref_in_macro =
+            self.ref_lang == Some(LangId::Rust) && context_line_has_macro_invocation(context);
+
         self.ref_events.push(RefEventMini {
             sym_ix,
             line: line as u32,
@@ -206,6 +214,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             is_import,
             confidence: confidence_u8,
             local_shadow_hint,
+            ref_in_macro,
         });
     }
 }
@@ -320,9 +329,11 @@ impl<'a> ImpactCollector<'a> {
                         symbol_name,
                         self.import_facts_cache,
                     ) {
-                        Some(has_evidence) => {
-                            should_route_rust_ref_low(has_evidence, e.local_shadow_hint)
-                        }
+                        Some(has_evidence) => should_route_rust_ref_low(
+                            has_evidence,
+                            e.local_shadow_hint,
+                            e.ref_in_macro,
+                        ),
                         None => false,
                     }
                 } else {
@@ -398,6 +409,7 @@ mod tests {
             is_import: false,
             confidence,
             local_shadow_hint: false,
+            ref_in_macro: false,
         }
     }
 

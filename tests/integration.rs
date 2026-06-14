@@ -1854,6 +1854,63 @@ fn impact_rust_local_var_not_treated_as_cross_file_ref() {
 }
 
 #[test]
+fn impact_rust_macro_arg_ident_stays_high() {
+    // Issue 2026-06-13 codex 指摘: `call_render!(json, ..)` のように macro が `crate::render::json`
+    // を補うケースでは、caller に `::json` 証拠がなくても本物の参照なので high 維持すべき
+    // (証拠なし bare identifier の low routing が macro 引数を取りこぼさないこと)。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/render.rs"),
+        "pub fn json(value: i32) -> String {\n    format!(\"{}\", value)\n}\n",
+    )
+    .unwrap();
+    // macro が path を補い、caller は bare ident `json` を渡すだけ。
+    std::fs::write(
+        root.join("src/caller.rs"),
+        "#[macro_export]\nmacro_rules! call_render {\n    ($name:ident, $arg:expr) => { $crate::render::$name($arg) };\n}\npub fn run() -> String { call_render!(json, 1) }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/main.rs"),
+        "#[macro_use]\nmod caller;\nmod render;\nfn main() { let _ = caller::run(); }\n",
+    )
+    .unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "astro-sight@example.com"]);
+    git(&["config", "user.name", "astro-sight"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial", "-q"]);
+
+    std::fs::write(
+        root.join("src/render.rs"),
+        "pub fn json(value: i64) -> String {\n    format!(\"{}\", value)\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["impact", "--dir", root.to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // caller.rs の macro 引数 `json` は high のまま未解決影響に残る (fail-closed)。
+    assert!(
+        stderr.contains("caller.rs"),
+        "macro 引数の bare ident `json` は high 維持されるべき (fail-closed): {stderr}"
+    );
+}
+
+#[test]
 fn symbols_dir() {
     let output = cargo_bin()
         .args(["symbols", "--dir", "src/engine/"])

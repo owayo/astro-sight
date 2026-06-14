@@ -215,7 +215,10 @@ pub(super) fn ref_file_directly_imports_source(
 /// 失敗時 (parse 不可) は空集合 + glob=false を返す。呼び出し側が証拠なしと扱うと low 振り分けに
 /// なるが、build 自体の失敗は `build_ref_file_facts` が `None` を返して high 維持にするため、
 /// ここに来る時点では parse 済み。
-pub(super) fn extract_rust_ref_facts(source: &[u8]) -> (HashSet<String>, bool) {
+pub(super) fn extract_rust_ref_facts(source: &[u8]) -> Option<(HashSet<String>, bool)> {
+    // parse 失敗 (判定不能) は `None` を返し、呼び出し側で high 維持する (fail-closed)。
+    // 空 facts を返すと「証拠なし → low」に倒れ、本物の参照を取りこぼす false negative になる。
+    let tree = parser::parse_source(source, LangId::Rust).ok()?;
     let mut names = HashSet::new();
     let mut has_glob = false;
     // 1) qualified path (`render::json`) の末尾セグメントを raw byte 走査で拾う。tree-sitter は
@@ -225,10 +228,8 @@ pub(super) fn extract_rust_ref_facts(source: &[u8]) -> (HashSet<String>, bool) {
     //    high 維持側で fail-closed)。
     collect_qualified_path_names(source, &mut names);
     // 2) use list (`use a::{json, html}`) の要素・alias と glob (`use a::*`) は AST で拾う。
-    if let Ok(tree) = parser::parse_source(source, LangId::Rust) {
-        walk_for_rust_evidence(tree.root_node(), source, &mut names, &mut has_glob);
-    }
-    (names, has_glob)
+    walk_for_rust_evidence(tree.root_node(), source, &mut names, &mut has_glob);
+    Some((names, has_glob))
 }
 
 /// raw source を走査し、`::` 直後 (空白を挟む可能性も考慮) の ASCII identifier を `names` に集める。
@@ -331,7 +332,8 @@ fn build_ref_file_facts(dir: &str, ref_path: &str) -> Option<RefFileFacts> {
         HashSet::new()
     };
     let (rust_referenced_names, rust_has_glob_use) = if is_rust {
-        extract_rust_ref_facts(&source)
+        // parse 失敗 → `None` を返して high 維持 (fail-closed)。
+        extract_rust_ref_facts(&source)?
     } else {
         (HashSet::new(), false)
     };
@@ -502,21 +504,50 @@ pub(super) fn rust_ref_file_has_symbol_evidence(
 }
 
 /// Rust cross-file ref の routing 判定。
-/// - 証拠なし (import / qualified path / glob いずれもなし) → `true` (low)。B1: bare identifier は
-///   別モジュールの同名シンボルへの参照ではない。
-/// - 証拠あり → この ref が local binding (`let json` 等) の shadow なら `true` (low)、そうでなければ
-///   `false` (high)。B2: import 済みでもローカル束縛で shadow される箇所は弱い信号。
+/// - local shadow (`let json` 等) → `true` (low)。明確なローカル束縛なので evidence / macro に
+///   関係なく弱い信号 (B2)。
+/// - 証拠あり (import / qualified path / glob) → `false` (high)。
+/// - 証拠なし → macro 引数 (`call_render!(json, ..)` のように macro が path を補う可能性がある) なら
+///   `false` (high, fail-closed)、そうでなければ `true` (low)。B1: bare identifier は別モジュールの
+///   同名シンボルへの参照ではない。
 ///
 /// fail-closed: `has_symbol_evidence` が `None` (判定不能) の場合は呼び出し側で high 維持する
 /// (この関数は呼ばない)。
 pub(super) fn should_route_rust_ref_low(
     has_symbol_evidence: bool,
     local_shadow_hint: bool,
+    ref_in_macro: bool,
 ) -> bool {
-    if !has_symbol_evidence {
+    if local_shadow_hint {
         return true;
     }
-    local_shadow_hint
+    if has_symbol_evidence {
+        return false;
+    }
+    // 証拠なし: macro 引数の bare identifier は macro 展開で `module::json` のような path が
+    // 補われ得るため high 維持 (codex 指摘: 単一行 macro 呼び出しの false negative 回避)。
+    !ref_in_macro
+}
+
+/// context 行に Rust の macro 呼び出し (`ident!(` / `ident![` / `ident!{`) が含まれるかを
+/// 軽量 heuristic で判定する。`!=` (比較) や `!(cond)` (否定) と区別するため、`!` の直前が
+/// identifier 継続文字、直後が `(` / `[` / `{` であることを要求する。
+///
+/// 限界: macro 引数が複数行にまたがり ref が `!` と別行にある場合は検出できない (その行には
+/// `!` がない)。単一行の `call_render!(json, ..)` 形を主対象とする fail-closed な heuristic。
+pub(super) fn context_line_has_macro_invocation(context: &str) -> bool {
+    let bytes = context.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] != b'!' {
+            continue;
+        }
+        let prev_ok = i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        let next_ok = i + 1 < bytes.len() && matches!(bytes[i + 1], b'(' | b'[' | b'{');
+        if prev_ok && next_ok {
+            return true;
+        }
+    }
+    false
 }
 
 /// Rust の context 行で identifier がローカル束縛 (`let json` / `let mut json` / `for json in`)
@@ -662,7 +693,7 @@ use crate::render::{html, css};
 use crate::other::value as v;
 fn a() { let x = render::table(); }
 "#;
-        let (names, glob) = extract_rust_ref_facts(src);
+        let (names, glob) = extract_rust_ref_facts(src).expect("parse ok");
         assert!(names.contains("json"), "use 経由 json");
         assert!(names.contains("html"), "use list html");
         assert!(names.contains("css"), "use list css");
@@ -673,7 +704,7 @@ fn a() { let x = render::table(); }
 
     #[test]
     fn extract_rust_ref_facts_detects_glob_use() {
-        let (_, glob) = extract_rust_ref_facts(b"use crate::render::*;\n");
+        let (_, glob) = extract_rust_ref_facts(b"use crate::render::*;\n").expect("parse ok");
         assert!(glob, "glob import を検出");
     }
 
@@ -711,7 +742,7 @@ pub fn discover() -> i32 {
     parsed
 }
 "#;
-        let (names, glob) = extract_rust_ref_facts(src);
+        let (names, glob) = extract_rust_ref_facts(src).expect("parse ok");
         assert!(
             !names.contains("json"),
             "json への import/qualified 証拠なし"
@@ -725,18 +756,43 @@ pub fn discover() -> i32 {
     }
 
     #[test]
+    fn extract_rust_ref_facts_parse_failure_is_none() {
+        // 構文崩壊で parse 不能なら None (証拠不明 → high 維持) を返す。
+        // tree-sitter は誤り耐性があるため極端な入力で None を狙う。
+        // 通常ソースは Some を返すことだけ最低限保証する。
+        assert!(extract_rust_ref_facts(b"fn a() {}\n").is_some());
+    }
+
+    #[test]
     fn should_route_rust_ref_low_b1_no_evidence() {
-        // 証拠なし → shadow hint に関わらず low (B1)
-        assert!(should_route_rust_ref_low(false, false));
-        assert!(should_route_rust_ref_low(false, true));
+        // 証拠なし + macro でない → low (B1)
+        assert!(should_route_rust_ref_low(false, false, false));
+        // 証拠なし + shadow → low
+        assert!(should_route_rust_ref_low(false, true, false));
+        // 証拠なし + macro 引数 (shadow でない) → high 維持 (fail-closed, codex 指摘)
+        assert!(!should_route_rust_ref_low(false, false, true));
+        // 証拠なし + macro でも shadow (`let json = m!()`) なら明確なローカル → low
+        assert!(should_route_rust_ref_low(false, true, true));
     }
 
     #[test]
     fn should_route_rust_ref_low_b2_evidence_with_shadow() {
         // 証拠あり + local shadow → low (B2)
-        assert!(should_route_rust_ref_low(true, true));
+        assert!(should_route_rust_ref_low(true, true, false));
         // 証拠あり + shadow なし → high 維持
-        assert!(!should_route_rust_ref_low(true, false));
+        assert!(!should_route_rust_ref_low(true, false, false));
+    }
+
+    #[test]
+    fn context_line_has_macro_invocation_distinguishes_macro_from_negation() {
+        assert!(context_line_has_macro_invocation("call_render!(json, 1)"));
+        assert!(context_line_has_macro_invocation("let v = vec![1, 2];"));
+        assert!(context_line_has_macro_invocation("json!{ \"a\": 1 }"));
+        // 否定 / 比較は macro ではない
+        assert!(!context_line_has_macro_invocation("if !cond { }"));
+        assert!(!context_line_has_macro_invocation("if !(a && b) { }"));
+        assert!(!context_line_has_macro_invocation("if a != b { }"));
+        assert!(!context_line_has_macro_invocation("render::json(x)"));
     }
 
     #[test]
