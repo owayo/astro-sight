@@ -1912,6 +1912,127 @@ fn impact_rust_macro_arg_ident_stays_high() {
     );
 }
 
+/// A3 用 helper: 1 ファイルの Python root script を commit し、削除 + 任意の untracked package を
+/// 置いた temp git repo を作って `review --git --hook` の stderr (hook JSON) を返す。
+fn a3_review_hook_stderr(
+    setup: impl FnOnce(&std::path::Path),
+    base_files: &[(&str, &str)],
+) -> String {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    for (rel, content) in base_files {
+        let full = root.join(rel);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(full, content).unwrap();
+    }
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "a@b.c"]);
+    git(&["config", "user.name", "t"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "init", "-q"]);
+    setup(root);
+    let output = cargo_bin()
+        .args(["review", "--dir", root.to_str().unwrap(), "--git", "--hook"])
+        .output()
+        .expect("run review");
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn review_python_root_script_move_no_api_rm() {
+    // Issue 2026-06-14-python-script-move-api-rm: root-level の単体スクリプトを package へ移設
+    // すると旧スクリプトの top-level helper が api.rm (blocking) で hook を止める FP。
+    // script-local として api.rm から除外され hook が clean になることを検証する。
+    let script = "def helper():\n    return 1\n\ndef cmd_run(cfg):\n    return helper()\n\ndef main():\n    cmd_run({})\n\nif __name__ == '__main__':\n    main()\n";
+    let pyproject = "[project]\nname = \"tool\"\nversion = \"0.1.0\"\n";
+    let stderr = a3_review_hook_stderr(
+        |root| {
+            // build_font.py 削除 + package 化 (untracked), cmd_run の sig 変更
+            Command::new("git")
+                .args(["rm", "-q", "script.py"])
+                .current_dir(root)
+                .status()
+                .expect("git rm");
+            std::fs::create_dir_all(root.join("src/pkg")).unwrap();
+            std::fs::write(root.join("src/pkg/__init__.py"), "").unwrap();
+            std::fs::write(
+                root.join("src/pkg/__main__.py"),
+                "from pkg.main import main\nmain()\n",
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("src/pkg/main.py"),
+                "def helper():\n    return 1\n\ndef cmd_run(ctx):\n    return helper()\n\ndef main():\n    cmd_run(object())\n",
+            )
+            .unwrap();
+        },
+        &[("script.py", script), ("pyproject.toml", pyproject)],
+    );
+    assert!(
+        !stderr.contains("\"rm\""),
+        "root script の helper は script-local で api.rm にしないべき: {stderr}"
+    );
+}
+
+#[test]
+fn review_python_package_module_removal_keeps_api_rm() {
+    // 安全性: package module (サブディレクトリ配下) の関数削除は従来どおり api.rm として残す
+    // (A3 が real api.rm を隠さない false negative 回避)。
+    let stderr = a3_review_hook_stderr(
+        |root| {
+            Command::new("git")
+                .args(["rm", "-q", "pkg/lib.py"])
+                .current_dir(root)
+                .status()
+                .expect("git rm");
+        },
+        &[
+            ("pkg/__init__.py", ""),
+            ("pkg/lib.py", "def public_api(x):\n    return x + 1\n"),
+            (
+                "app.py",
+                "from pkg.lib import public_api\nprint(public_api(1))\n",
+            ),
+        ],
+    );
+    assert!(
+        stderr.contains("public_api"),
+        "package module の削除は api.rm に残すべき: {stderr}"
+    );
+}
+
+#[test]
+fn review_python_imported_root_module_keeps_api_rm() {
+    // 安全性: root-level でも他ファイルから import されているモジュールの削除は api.rm として残す。
+    let stderr = a3_review_hook_stderr(
+        |root| {
+            Command::new("git")
+                .args(["rm", "-q", "util.py"])
+                .current_dir(root)
+                .status()
+                .expect("git rm");
+        },
+        &[
+            ("util.py", "def helper(x):\n    return x * 2\n"),
+            ("app.py", "import util\nprint(util.helper(3))\n"),
+        ],
+    );
+    assert!(
+        stderr.contains("helper"),
+        "import される root module の削除は api.rm に残すべき: {stderr}"
+    );
+}
+
 #[test]
 fn symbols_dir() {
     let output = cargo_bin()

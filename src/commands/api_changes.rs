@@ -454,11 +454,99 @@ fn classify_signature_change(
     }
 }
 
+/// Python の root-level スクリプト (package 外の単体スクリプト、例: `build_font.py`) の削除/変更
+/// シンボルが公開 API 面外かを判定する (codex 設計合意の厳格版 A3、Issue
+/// 2026-06-14-python-script-move-api-rm)。
+///
+/// 以下を全て満たすとき script-local = true:
+/// - `old_path` が `.py`、path 区切りを含まない (リポジトリルート直下)、`__init__.py` でない
+/// - モジュール名 (stem) が新ツリーの Python ファイルから参照 (import) されていない
+/// - base の pyproject.toml の `[project.scripts]` / `[project.gui-scripts]` が当モジュールを
+///   entrypoint に指定していない
+///
+/// 直接実行されるスクリプトの公開面は「ファイルを実行できること」であって内部 helper の
+/// signature ではないため、これらの削除/シグネチャ変更を api.rm / api.mod にしない。package
+/// module (サブディレクトリ配下) は対象外 = 従来どおり API 扱い (false negative 回避)。判定は
+/// file 単位で 1 度行えば足りる (find_references の全走査は root-level .py 削除時のみ走る)。
+fn is_python_root_script_local_file(dir: &str, base: &str, old_path: &str) -> bool {
+    let path = std::path::Path::new(old_path);
+    if path.extension().and_then(|e| e.to_str()) != Some("py") {
+        return false;
+    }
+    // root-level のみ (package module は API 扱いで安全側に倒す)
+    if old_path.contains('/') {
+        return false;
+    }
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    if stem == "__init__" {
+        return false;
+    }
+    // base の [project.scripts] が当モジュールを entrypoint にしていれば公開面 (keep)
+    if base_pyproject_declares_script_module(dir, base, stem) {
+        return false;
+    }
+    // 新ツリーで stem が参照 (import) されていなければ script-local
+    !python_module_referenced_in_tree(dir, stem)
+}
+
+/// 新ツリーの Python ファイルで `stem` (モジュール名) が identifier として参照されているか。
+/// `import build_font` / `build_font.foo()` 等を 1 件でも見つければ true。判定不能 (検索失敗) は
+/// true (= 参照あり扱いで api.rm を残す fail-closed)。
+fn python_module_referenced_in_tree(dir: &str, stem: &str) -> bool {
+    match crate::engine::refs::find_references(stem, std::path::Path::new(dir), Some("**/*.py")) {
+        Ok(refs) => !refs.is_empty(),
+        Err(_) => true,
+    }
+}
+
+/// base の pyproject.toml の `[project.scripts]` / `[project.gui-scripts]` が `stem` モジュールを
+/// entrypoint (`<stem>:func` または `<stem>.sub:func`) に指定しているか。
+fn base_pyproject_declares_script_module(dir: &str, base: &str, stem: &str) -> bool {
+    let Some(content) = git_show_base_file(dir, base, "pyproject.toml") else {
+        return false;
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&content) else {
+        return false;
+    };
+    let Some(project) = value.get("project") else {
+        return false;
+    };
+    for key in ["scripts", "gui-scripts"] {
+        if let Some(table) = project.get(key).and_then(|t| t.as_table()) {
+            for v in table.values() {
+                if let Some(target) = v.as_str() {
+                    let module = target.split(':').next().unwrap_or("");
+                    if module == stem || module.split('.').next() == Some(stem) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `git show <base>:<rel>` でファイル内容を取得する。失敗時は None。
+fn git_show_base_file(dir: &str, base: &str, rel: &str) -> Option<String> {
+    validate_git_revision(base, "--base").ok()?;
+    let output = std::process::Command::new("git")
+        .args(["show", &format!("{base}:{rel}")])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
 /// 削除ファイル (`new_path == "/dev/null"`) 由来の exported シンボルを `removed` /
 /// `property_to_field` に分類する。
 ///
 /// Rust private module / bin-only crate / Bash の未 export 関数 / Python `@property` →
-/// dataclass field 置き換えは `removed` から除外する。
+/// dataclass field 置き換え / Python root-level スクリプトの helper は `removed` から除外する。
 fn process_deleted_file(
     df: &crate::models::impact::DiffFile,
     dir: &str,
@@ -478,6 +566,12 @@ fn process_deleted_file(
     let Some(old_syms) = old_syms_opt else {
         return;
     };
+    // Python の root-level スクリプト (package 外の単体スクリプト) の top-level helper は公開
+    // API 面外なので api.rm にしない (A3、Issue 2026-06-14-python-script-move-api-rm)。file 単位の
+    // 判定なので全シンボルをまとめて除外する。
+    if is_python_root_script_local_file(dir, base, &df.old_path) {
+        return;
+    }
     let is_bash_old_file = is_bash_script_path(&df.old_path);
     for (name, kind, sig) in &old_syms {
         if is_rust_old_symbol_outside_public_api_surface(
