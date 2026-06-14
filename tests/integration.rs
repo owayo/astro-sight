@@ -1912,12 +1912,12 @@ fn impact_rust_macro_arg_ident_stays_high() {
     );
 }
 
-/// A3 用 helper: 1 ファイルの Python root script を commit し、削除 + 任意の untracked package を
-/// 置いた temp git repo を作って `review --git --hook` の stderr (hook JSON) を返す。
-fn a3_review_hook_stderr(
+/// A3 用 helper: base_files を commit し、`setup` で削除/追加した temp git repo を作って
+/// `review --git --hook` の `Output` (exit code + stderr の hook JSON) を返す。
+fn a3_review_hook(
     setup: impl FnOnce(&std::path::Path),
     base_files: &[(&str, &str)],
-) -> String {
+) -> std::process::Output {
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path();
     let git = |args: &[&str]| {
@@ -1941,11 +1941,10 @@ fn a3_review_hook_stderr(
     git(&["add", "."]);
     git(&["commit", "-m", "init", "-q"]);
     setup(root);
-    let output = cargo_bin()
+    cargo_bin()
         .args(["review", "--dir", root.to_str().unwrap(), "--git", "--hook"])
         .output()
-        .expect("run review");
-    String::from_utf8_lossy(&output.stderr).into_owned()
+        .expect("run review")
 }
 
 #[test]
@@ -1955,7 +1954,7 @@ fn review_python_root_script_move_no_api_rm() {
     // script-local として api.rm から除外され hook が clean になることを検証する。
     let script = "def helper():\n    return 1\n\ndef cmd_run(cfg):\n    return helper()\n\ndef main():\n    cmd_run({})\n\nif __name__ == '__main__':\n    main()\n";
     let pyproject = "[project]\nname = \"tool\"\nversion = \"0.1.0\"\n";
-    let stderr = a3_review_hook_stderr(
+    let output = a3_review_hook(
         |root| {
             // build_font.py 削除 + package 化 (untracked), cmd_run の sig 変更
             Command::new("git")
@@ -1978,6 +1977,12 @@ fn review_python_root_script_move_no_api_rm() {
         },
         &[("script.py", script), ("pyproject.toml", pyproject)],
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // hook は blocking なし → exit 0 (clean)
+    assert!(
+        output.status.success(),
+        "root script move は hook blocking しないべき (exit 0): {stderr}"
+    );
     assert!(
         !stderr.contains("\"rm\""),
         "root script の helper は script-local で api.rm にしないべき: {stderr}"
@@ -1988,7 +1993,7 @@ fn review_python_root_script_move_no_api_rm() {
 fn review_python_package_module_removal_keeps_api_rm() {
     // 安全性: package module (サブディレクトリ配下) の関数削除は従来どおり api.rm として残す
     // (A3 が real api.rm を隠さない false negative 回避)。
-    let stderr = a3_review_hook_stderr(
+    let output = a3_review_hook(
         |root| {
             Command::new("git")
                 .args(["rm", "-q", "pkg/lib.py"])
@@ -2005,6 +2010,12 @@ fn review_python_package_module_removal_keeps_api_rm() {
             ),
         ],
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // api.rm は blocking → exit 1
+    assert!(
+        !output.status.success(),
+        "package module の api.rm は hook を blocking すべき (exit 1): {stderr}"
+    );
     assert!(
         stderr.contains("public_api"),
         "package module の削除は api.rm に残すべき: {stderr}"
@@ -2014,7 +2025,7 @@ fn review_python_package_module_removal_keeps_api_rm() {
 #[test]
 fn review_python_imported_root_module_keeps_api_rm() {
     // 安全性: root-level でも他ファイルから import されているモジュールの削除は api.rm として残す。
-    let stderr = a3_review_hook_stderr(
+    let output = a3_review_hook(
         |root| {
             Command::new("git")
                 .args(["rm", "-q", "util.py"])
@@ -2027,9 +2038,40 @@ fn review_python_imported_root_module_keeps_api_rm() {
             ("app.py", "import util\nprint(util.helper(3))\n"),
         ],
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "import される root module の api.rm は hook を blocking すべき (exit 1): {stderr}"
+    );
     assert!(
         stderr.contains("helper"),
         "import される root module の削除は api.rm に残すべき: {stderr}"
+    );
+}
+
+#[test]
+fn review_python_poetry_script_entry_not_excluded() {
+    // 安全性 (codex 指摘): Poetry `[tool.poetry.scripts]` の entrypoint が指す root script を
+    // 削除しても script-local として完全除外せず、公開 CLI 面として扱う (api.rm/rm_dead に残す)。
+    let pyproject = "[tool.poetry]\nname = \"tool\"\nversion = \"0.1.0\"\n\n[tool.poetry.scripts]\nmytool = \"cli:run\"\n";
+    let output = a3_review_hook(
+        |root| {
+            Command::new("git")
+                .args(["rm", "-q", "cli.py"])
+                .current_dir(root)
+                .status()
+                .expect("git rm");
+        },
+        &[
+            ("cli.py", "def run():\n    print(\"hi\")\n"),
+            ("pyproject.toml", pyproject),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Poetry entrypoint の関数は完全除外されず出力に残る (rm or rm_dead)
+    assert!(
+        stderr.contains("run"),
+        "Poetry script entry の削除は完全除外せず出力に残すべき: {stderr}"
     );
 }
 

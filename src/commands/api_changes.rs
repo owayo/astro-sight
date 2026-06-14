@@ -483,8 +483,9 @@ fn is_python_root_script_local_file(dir: &str, base: &str, old_path: &str) -> bo
     if stem == "__init__" {
         return false;
     }
-    // base の [project.scripts] が当モジュールを entrypoint にしていれば公開面 (keep)
-    if base_pyproject_declares_script_module(dir, base, stem) {
+    // base の pyproject が当モジュールを script entrypoint にしている、または pyproject が
+    // 解析不能なら公開面ありとして扱い script-local 判定を止める (keep, fail-closed)。
+    if base_pyproject_marks_module_as_api(dir, base, stem) {
         return false;
     }
     // 新ツリーで stem が参照 (import) されていなければ script-local
@@ -501,27 +502,43 @@ fn python_module_referenced_in_tree(dir: &str, stem: &str) -> bool {
     }
 }
 
-/// base の pyproject.toml の `[project.scripts]` / `[project.gui-scripts]` が `stem` モジュールを
-/// entrypoint (`<stem>:func` または `<stem>.sub:func`) に指定しているか。
-fn base_pyproject_declares_script_module(dir: &str, base: &str, stem: &str) -> bool {
+/// base の pyproject.toml が `stem` モジュールを script entrypoint に宣言しているか、または
+/// pyproject が存在するが解析不能なら `true` (= 公開 API/CLI 面ありとして script-local 判定を
+/// 止める fail-closed)。pyproject が存在しなければ `false` (script 宣言なし → 参照判定へ進む)。
+///
+/// 対応形式:
+/// - PEP 621 `[project.scripts]` / `[project.gui-scripts]` (`name = "module:func"`)
+/// - Poetry `[tool.poetry.scripts]` (string 形式 `name = "module:func"`)
+///
+/// fail-closed: pyproject 解析失敗、または script 値が string で取れない (Poetry 拡張テーブル
+/// 形式など) 場合は `true` を返し、real な CLI/API 面を誤って隠さない。
+fn base_pyproject_marks_module_as_api(dir: &str, base: &str, stem: &str) -> bool {
     let Some(content) = git_show_base_file(dir, base, "pyproject.toml") else {
         return false;
     };
     let Ok(value) = toml::from_str::<toml::Value>(&content) else {
-        return false;
+        return true; // 存在するが解析不能 → fail-closed (API 扱い)
     };
-    let Some(project) = value.get("project") else {
-        return false;
-    };
-    for key in ["scripts", "gui-scripts"] {
-        if let Some(table) = project.get(key).and_then(|t| t.as_table()) {
-            for v in table.values() {
-                if let Some(target) = v.as_str() {
-                    let module = target.split(':').next().unwrap_or("");
-                    if module == stem || module.split('.').next() == Some(stem) {
-                        return true;
-                    }
-                }
+    let script_tables = [
+        value.get("project").and_then(|p| p.get("scripts")),
+        value.get("project").and_then(|p| p.get("gui-scripts")),
+        value
+            .get("tool")
+            .and_then(|t| t.get("poetry"))
+            .and_then(|p| p.get("scripts")),
+    ];
+    for table in script_tables.into_iter().flatten() {
+        let Some(table) = table.as_table() else {
+            continue;
+        };
+        for v in table.values() {
+            let Some(target) = v.as_str() else {
+                // string で取れない値 (Poetry 拡張テーブル形式など) は解析不能 → fail-closed。
+                return true;
+            };
+            let module = target.split(':').next().unwrap_or("");
+            if module == stem || module.split('.').next() == Some(stem) {
+                return true;
             }
         }
     }
