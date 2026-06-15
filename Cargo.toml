@@ -17,7 +17,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 ahash = "0.8.12"
 aho-corasick = "1.1.4"
 hashbrown = "0.17.1"
-ignore = "0.4.25"
+ignore = "0.4.26"
 lru = "0.18.0"
 memchr = "2.8.1"
 memmap2 = "0.9.10"
