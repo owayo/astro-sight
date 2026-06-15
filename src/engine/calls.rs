@@ -181,10 +181,13 @@ fn find_function_name(node: Node<'_>, source: &[u8], lang_id: LangId) -> Option<
         }
     }
 
-    // C/Rust の function_definition: declarator > function_declarator > declarator (identifier)
+    // C/C++ の function_definition: declarator を辿って末尾の名前ノードを取る。
+    // ポインタ返り (pointer_declarator) や参照返り (reference_declarator) では
+    // function_declarator が宣言子に包まれるため、単純な 2 段では届かず
+    // `foo(args)` のような宣言子テキスト全体を誤って名前にしてしまう。
     if let Some(decl) = node.child_by_field_name("declarator") {
-        if let Some(inner) = decl.child_by_field_name("declarator") {
-            return inner.utf8_text(source).ok().map(|s| s.to_string());
+        if let Some(name) = c_function_name_from_declarator(decl, source) {
+            return Some(name);
         }
         return decl.utf8_text(source).ok().map(|s| s.to_string());
     }
@@ -199,6 +202,44 @@ fn find_function_name(node: Node<'_>, source: &[u8], lang_id: LangId) -> Option<
     }
 
     None
+}
+
+/// C/C++ の宣言子ノードから末尾の関数名 (identifier / field_identifier /
+/// qualified_identifier) を取り出す。pointer_declarator / reference_declarator /
+/// parenthesized_declarator / array_declarator を再帰的に辿る。
+fn c_function_name_from_declarator(decl: Node<'_>, source: &[u8]) -> Option<String> {
+    match decl.kind() {
+        "identifier" | "field_identifier" => decl.utf8_text(source).ok().map(|s| s.to_string()),
+        // Foo::bar の末尾識別子を返す
+        "qualified_identifier" => decl
+            .child_by_field_name("name")
+            .and_then(|n| c_function_name_from_declarator(n, source))
+            .or_else(|| decl.utf8_text(source).ok().map(|s| s.to_string())),
+        "function_declarator"
+        | "pointer_declarator"
+        | "reference_declarator"
+        | "parenthesized_declarator"
+        | "array_declarator" => decl
+            .child_by_field_name("declarator")
+            .or_else(|| {
+                // reference_declarator は declarator フィールドを持たないため子から探す
+                let mut c = decl.walk();
+                decl.children(&mut c).find(|ch| {
+                    matches!(
+                        ch.kind(),
+                        "function_declarator"
+                            | "pointer_declarator"
+                            | "reference_declarator"
+                            | "parenthesized_declarator"
+                            | "identifier"
+                            | "field_identifier"
+                            | "qualified_identifier"
+                    )
+                })
+            })
+            .and_then(|d| c_function_name_from_declarator(d, source)),
+        _ => None,
+    }
 }
 
 /// 言語別の call expression 用 tree-sitter クエリを返す。
@@ -355,6 +396,38 @@ mod tests {
         let tree = parser::parse_source(source, LangId::Javascript).unwrap();
         let edges = extract_calls(tree.root_node(), source, LangId::Javascript, None).unwrap();
         assert!(edges.iter().any(|e| e.callee.name == "helper"));
+    }
+
+    /// C のポインタ返り関数 `Type *foo()` の caller 名が宣言子テキスト全体
+    /// (`foo(args)`) に汚染されず識別子 `foo` になる (回帰)。
+    #[test]
+    fn extract_calls_c_pointer_returning_caller_name() {
+        let source = b"void helper(int n) {}\nint *make(int n) { helper(n); return 0; }";
+        let tree = parser::parse_source(source, LangId::C).unwrap();
+        let edges = extract_calls(tree.root_node(), source, LangId::C, None).unwrap();
+        assert!(
+            edges.iter().any(|e| e.caller.name == "make"),
+            "caller 名が make: {:?}",
+            edges.iter().map(|e| &e.caller.name).collect::<Vec<_>>()
+        );
+        assert!(
+            !edges.iter().any(|e| e.caller.name.contains('(')),
+            "caller 名に宣言子テキストが混入していない"
+        );
+    }
+
+    /// C++ の参照返りメソッド `T& m()` の caller 名も識別子になる (回帰)。
+    #[test]
+    fn extract_calls_cpp_reference_returning_caller_name() {
+        let source =
+            b"int g(int x) { return x; }\nstruct P { int v; int& at() { g(v); return v; } };";
+        let tree = parser::parse_source(source, LangId::Cpp).unwrap();
+        let edges = extract_calls(tree.root_node(), source, LangId::Cpp, None).unwrap();
+        assert!(
+            !edges.iter().any(|e| e.caller.name.contains('(')),
+            "caller 名に宣言子テキストが混入していない: {:?}",
+            edges.iter().map(|e| &e.caller.name).collect::<Vec<_>>()
+        );
     }
 
     /// 空クエリの言語でも空配列を返しパニックしない

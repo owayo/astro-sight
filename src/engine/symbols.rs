@@ -150,7 +150,11 @@ pub fn is_symbol_exported(
         LangId::Python => is_exported_python(node, source, root),
         LangId::Php => is_exported_php(node, source),
         LangId::Swift => is_exported_swift(node, source),
-        _ => true, // 未対応言語は保守的にエクスポートと判定
+        // C++ はクラスメソッドの可視性 (public/protected/private) を判定する。
+        // 非公開メソッドの変更を API 差分の偽陽性にしないため。自由関数・クラス外
+        // 定義は public 扱い。
+        LangId::Cpp => is_exported_cpp(node, source),
+        _ => true, // 未対応言語 (C 等) は保守的にエクスポートと判定
     }
 }
 
@@ -1602,6 +1606,60 @@ fn cpp_declarator_name(decl: Node<'_>, source: &[u8]) -> Option<String> {
     }
 }
 
+/// C/C++ の関数名ノードから、本体を持つ `function_definition` まで繰り上げる。
+/// pointer_declarator / reference_declarator / qualified_identifier を経由する。
+/// 宣言 (`declaration` / `field_declaration` / `parameter_declaration`) に先に
+/// 到達した場合は本体を持たない宣言なので `None` を返す (シンボル非採用)。
+fn cpp_enclosing_function_definition(name_node: Node<'_>) -> Option<Node<'_>> {
+    let mut n = name_node;
+    while let Some(p) = n.parent() {
+        match p.kind() {
+            "function_definition" => return Some(p),
+            "declaration" | "field_declaration" | "parameter_declaration" => return None,
+            _ => {}
+        }
+        n = p;
+    }
+    None
+}
+
+/// C++: メソッドの可視性を `access_specifier` から判定する。
+/// クラス/構造体の外 (namespace / global スコープの自由関数・クラス外定義) は公開扱い。
+/// `class` のデフォルトは private、`struct` のデフォルトは public。
+/// 直近の `public:` / `protected:` 配下は公開、`private:` 配下は非公開。
+fn is_exported_cpp(node: Node<'_>, source: &[u8]) -> bool {
+    // メソッド定義 (function_definition) を起点にする
+    let mut method = node;
+    while method.kind() != "function_definition" {
+        match method.parent() {
+            Some(p) => method = p,
+            None => return true, // 関数定義が見つからない → 保守的に公開
+        }
+    }
+    // 直近の囲い specifier (class/struct) を探す
+    let mut cur = method;
+    let default_public = loop {
+        match cur.parent() {
+            Some(p) => match p.kind() {
+                "class_specifier" => break false, // class: default private
+                "struct_specifier" => break true, // struct: default public
+                _ => cur = p,
+            },
+            None => return true, // クラス外 (自由関数・クラス外定義) は公開
+        }
+    };
+    // method の直前の兄弟を遡って直近の access_specifier を探す
+    let mut sibling = method.prev_sibling();
+    while let Some(s) = sibling {
+        if s.kind() == "access_specifier" {
+            let txt = s.utf8_text(source).unwrap_or("");
+            return txt.starts_with("public") || txt.starts_with("protected");
+        }
+        sibling = s.prev_sibling();
+    }
+    default_public
+}
+
 /// JS/TS: ノードが関数本体（親が関数系ノードの statement_block）かどうかを判定する。
 fn is_js_function_body(node: Node) -> bool {
     if node.kind() != "statement_block" {
@@ -1767,7 +1825,10 @@ fn count_branch_nodes(
     if !is_root && func_kinds.contains(&kind) {
         return;
     }
-    if branch_kinds.contains(&kind) {
+    // named ノードのみ計上する。tree-sitter-ruby では `if` 文ノードと
+    // キーワードトークン `if` が同じ kind 名を持つため、named 制約が無いと
+    // 分岐が二重計上される（他言語の分岐ノードは全て named なので無影響）。
+    if node.is_named() && branch_kinds.contains(&kind) {
         *count += 1;
     }
     let mut cursor = node.walk();
@@ -1926,13 +1987,19 @@ pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result
                     let doc = extract_doc_comment(node, source);
                     let mut parent_node = node.parent().unwrap_or(node);
                     // C/C++ は関数名を `function_declarator` 配下でキャプチャするため、
-                    // 親が宣言子なら関数定義ノードまで 1 段繰り上げる。これをしないと
-                    // range が宣言子（シグネチャ行）だけに潰れ、複雑度が常に 1 になり、
-                    // impact 分析が関数本体のみの変更を取りこぼす。
+                    // 本体を持つ function_definition まで繰り上げる。pointer_declarator /
+                    // reference_declarator / qualified_identifier を経由しても辿れる。
+                    // 繰り上げないと range が宣言子（シグネチャ行）だけに潰れ、複雑度が
+                    // 常に 1 になり、impact 分析が関数本体のみの変更を取りこぼす。
+                    // function_definition に到達しない宣言（プロトタイプ・関数ポインタ）は
+                    // 本体が無いためシンボルとして採用しない。
                     if matches!(lang_id, LangId::C | LangId::Cpp)
-                        && parent_node.kind() == "function_declarator"
+                        && matches!(kind, SymbolKind::Function | SymbolKind::Method)
                     {
-                        parent_node = parent_node.parent().unwrap_or(parent_node);
+                        match cpp_enclosing_function_definition(node) {
+                            Some(def) => parent_node = def,
+                            None => continue,
+                        }
                     }
                     // 関数/メソッドの場合のみ循環的複雑度を算出
                     let complexity = if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
@@ -2142,15 +2209,25 @@ fn symbol_query(lang_id: LangId) -> &'static str {
             "#
         }
         LangId::C => {
+            // function_declarator の名前を直接キャプチャし、本体を持つ
+            // function_definition のみ採用する (extract_symbols の climb で判定)。
+            // これにより `Type *foo()` のようなポインタ返り関数も拾える
+            // (declarator が pointer_declarator に包まれ旧クエリではマッチしなかった)。
             r#"
-            (function_definition declarator: (function_declarator declarator: (identifier) @function.name))
+            (function_declarator declarator: (identifier) @function.name)
             (struct_specifier name: (type_identifier) @struct.name)
             (enum_specifier name: (type_identifier) @enum.name)
             "#
         }
         LangId::Cpp => {
+            // C と同様、function_declarator の名前を直接キャプチャする。
+            // identifier=自由関数、field_identifier=クラス内メソッド、
+            // qualified_identifier=クラス外定義 (Foo::bar)。pointer/reference 返りも
+            // climb で function_definition まで辿るため拾える。
             r#"
-            (function_definition declarator: (function_declarator declarator: (identifier) @function.name))
+            (function_declarator declarator: (identifier) @function.name)
+            (function_declarator declarator: (field_identifier) @method.name)
+            (function_declarator declarator: (qualified_identifier name: (identifier) @method.name))
             (class_specifier name: (type_identifier) @class.name)
             (struct_specifier name: (type_identifier) @struct.name)
             (enum_specifier name: (type_identifier) @enum.name)
@@ -2327,6 +2404,169 @@ mod tests {
             LangId::Typescript,
             "foo"
         ));
+    }
+
+    /// テスト用: ソースからシンボルを抽出する。
+    fn syms_of(source: &str, lang_id: LangId) -> Vec<Symbol> {
+        let language = lang_id.ts_language();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        extract_symbols(tree.root_node(), source.as_bytes(), lang_id).unwrap()
+    }
+
+    /// テスト用: 指定シンボルの循環的複雑度を取得する。
+    fn cx_of(source: &str, lang_id: LangId, name: &str) -> usize {
+        let syms = syms_of(source, lang_id);
+        syms.iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "symbol '{name}' not found in {:?}",
+                    syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            })
+            .complexity
+            .unwrap_or_else(|| panic!("symbol '{name}' has no complexity"))
+    }
+
+    // --- C/C++: ポインタ返り関数・クラスメソッド抽出 (回帰) ---
+
+    #[test]
+    fn c_pointer_returning_function_is_extracted() {
+        // `Type *foo()` は declarator が pointer_declarator に包まれ、旧クエリ
+        // (function_definition > function_declarator 直結) ではマッチしなかった。
+        let syms = syms_of("int *make(int n) { return 0; }", LangId::C);
+        assert!(
+            syms.iter()
+                .any(|s| s.name == "make" && matches!(s.kind, SymbolKind::Function)),
+            "ポインタ返り関数 make が抽出される: {:?}",
+            syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn c_function_prototype_is_not_extracted() {
+        // 本体のない宣言 (プロトタイプ) はシンボルにしない。
+        let syms = syms_of("int foo(void);\nint foo(void) { return 0; }", LangId::C);
+        let count = syms.iter().filter(|s| s.name == "foo").count();
+        assert_eq!(
+            count,
+            1,
+            "定義のみ採用しプロトタイプは除外: {:?}",
+            syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cpp_class_method_is_extracted_with_container() {
+        let src = "class P {\npublic:\n  void add(int x) {}\n  int get() const { return 0; }\n};";
+        let syms = syms_of(src, LangId::Cpp);
+        let add = syms
+            .iter()
+            .find(|s| s.name == "add")
+            .expect("メソッド add が抽出される");
+        assert!(matches!(add.kind, SymbolKind::Method));
+        assert_eq!(add.container.as_deref(), Some("P"));
+        assert!(syms.iter().any(|s| s.name == "get"), "get も抽出される");
+    }
+
+    #[test]
+    fn cpp_reference_returning_method_is_extracted() {
+        let src =
+            "class P {\npublic:\n  const int& at(int i) const { static int z=0; return z; }\n};";
+        let syms = syms_of(src, LangId::Cpp);
+        assert!(
+            syms.iter().any(|s| s.name == "at"),
+            "参照返りメソッド at が抽出される: {:?}",
+            syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    // --- C++: メソッド可視性 (is_exported_cpp) ---
+
+    #[test]
+    fn cpp_public_method_is_exported() {
+        assert!(check_exported(
+            "class P {\npublic:\n  void pub_m() {}\n};",
+            LangId::Cpp,
+            "pub_m"
+        ));
+    }
+
+    #[test]
+    fn cpp_private_method_is_not_exported() {
+        // class のデフォルトは private。private: 配下も非公開。
+        let src = "class P {\n  void hidden() {}\nprivate:\n  void also() {}\n};";
+        assert!(
+            !check_exported(src, LangId::Cpp, "hidden"),
+            "デフォルト private"
+        );
+        assert!(!check_exported(src, LangId::Cpp, "also"), "private: 配下");
+    }
+
+    #[test]
+    fn cpp_protected_method_is_exported() {
+        assert!(
+            check_exported(
+                "class P {\nprotected:\n  void prot_m() {}\n};",
+                LangId::Cpp,
+                "prot_m"
+            ),
+            "protected は継承 API として公開扱い"
+        );
+    }
+
+    #[test]
+    fn cpp_struct_method_default_is_exported() {
+        // struct のデフォルトは public。
+        assert!(check_exported(
+            "struct S {\n  void m() {}\n};",
+            LangId::Cpp,
+            "m"
+        ));
+    }
+
+    #[test]
+    fn cpp_free_function_is_exported() {
+        assert!(check_exported(
+            "int freefn() { return 0; }",
+            LangId::Cpp,
+            "freefn"
+        ));
+    }
+
+    // --- Ruby: 循環的複雑度の二重計上回帰 ---
+
+    #[test]
+    fn ruby_if_else_complexity_no_double_count() {
+        // tree-sitter-ruby は `if` 文ノードとキーワードトークン `if` が同名 kind。
+        // named ガードが無いと二重計上され cx=3。正しくは 2 (ベース1 + if 1)。
+        assert_eq!(
+            cx_of("def f(x)\n  if x then 1 else 2 end\nend", LangId::Ruby, "f"),
+            2,
+            "if/else は分岐 1 つ"
+        );
+    }
+
+    #[test]
+    fn ruby_case_when_complexity_no_double_count() {
+        // case + when×2 = 3 分岐 → cx 4 (二重計上なら 7)。
+        let src = "def f(x)\n  case x\n  when 1 then 1\n  when 2 then 2\n  else 3\n  end\nend";
+        assert_eq!(cx_of(src, LangId::Ruby, "f"), 4);
+    }
+
+    #[test]
+    fn ruby_while_complexity_no_double_count() {
+        assert_eq!(
+            cx_of(
+                "def f(x)\n  while x > 0\n    x -= 1\n  end\nend",
+                LangId::Ruby,
+                "f"
+            ),
+            2,
+            "while は分岐 1 つ"
+        );
     }
 
     /// re-export 名抽出テスト用ヘルパー。
