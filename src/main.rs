@@ -1,5 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
+use std::any::Any;
+use std::io::{self, Write};
 use tracing::info;
 
 use astro_sight::cli::{Cli, Commands};
@@ -45,19 +47,67 @@ fn main() {
         }
     }
 
+    install_broken_pipe_panic_hook();
+
     let cli = Cli::parse();
 
     #[cfg(feature = "dhat-heap")]
     let _profiler = should_start_dhat_heap(&cli.command).then(dhat::Profiler::new_heap);
 
-    if let Err(e) = run(cli) {
-        let (code, message) = commands::classify_error(&e);
-        let error = serde_json::json!({
-            "error": { "code": code, "message": message }
-        });
-        println!("{}", serde_json::to_string(&error).unwrap());
-        std::process::exit(1);
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(cli))) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            let (code, message) = commands::classify_error(&e);
+            let error = serde_json::json!({
+                "error": { "code": code, "message": message }
+            });
+            if let Err(write_error) = write_json_error(&error) {
+                if write_error.kind() == io::ErrorKind::BrokenPipe {
+                    std::process::exit(0);
+                }
+                eprintln!("failed to write error output: {write_error}");
+            }
+            std::process::exit(1);
+        }
+        Err(payload) => {
+            if is_broken_pipe_panic_payload(payload.as_ref()) {
+                std::process::exit(0);
+            }
+            std::panic::resume_unwind(payload);
+        }
     }
+}
+
+fn install_broken_pipe_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if is_broken_pipe_panic_payload(info.payload()) {
+            return;
+        }
+        default_hook(info);
+    }));
+}
+
+fn write_json_error(error: &serde_json::Value) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    let line = serde_json::to_string(error).unwrap_or_else(|_| {
+        r#"{"error":{"code":"INTERNAL_ERROR","message":"failed to serialize error"}}"#.to_string()
+    });
+    writeln!(stdout, "{line}")
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> Option<&str> {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        Some(message)
+    } else {
+        payload.downcast_ref::<String>().map(String::as_str)
+    }
+}
+
+fn is_broken_pipe_panic_payload(payload: &(dyn Any + Send)) -> bool {
+    panic_payload_message(payload).is_some_and(|message| {
+        message.contains("failed printing to stdout") && message.contains("Broken pipe")
+    })
 }
 
 #[cfg(feature = "dhat-heap")]

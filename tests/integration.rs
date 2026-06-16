@@ -1,9 +1,34 @@
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn cargo_bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+}
+
+#[test]
+fn cli_suppresses_broken_pipe_when_stdout_reader_drops() {
+    let mut child = cargo_bin()
+        .args(["symbols", "--dir", "src", "--glob", "**/*.rs"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn command");
+
+    // パイプ先が head 等で先に終了した状況を再現する。
+    drop(child.stdout.take());
+
+    let output = child.wait_with_output().expect("failed to wait command");
+    assert!(
+        output.status.success(),
+        "command should treat broken stdout pipe as success: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("panicked at"),
+        "broken pipe should not print a Rust panic: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

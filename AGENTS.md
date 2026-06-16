@@ -15,7 +15,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - **MCP サーバーモード**（rmcp 1.7 による stdio JSON-RPC 2.0、ワークスペースサンドボックス、11 ツール）
 - **デフォルト compact JSON** 出力（`--pretty` で整形出力）
 - **バッチ処理**（`--paths` / `--paths-file` で複数ファイル NDJSON 出力）
-- **JSON エラー出力**（`{"error":{"code":"...","message":"..."}}` を stdout に出力）
+- **JSON エラー出力**（`{"error":{"code":"...","message":"..."}}` を stdout に出力。stdout pipe が先に閉じた場合は broken pipe panic を出さず exit 0 で終了）
 - **入力検証の強化**（`refs` の空 `name/names` を拒否、`--paths` / `--paths-file` の空リストを拒否、`--paths-file` は 100MB 上限付きで読み込み、`cochange` の `min_confidence` / smoothing prior は有限範囲に制限、`session` の空文字・非 UTF-8・不正パスの `ASTRO_SIGHT_WORKSPACE` を拒否、`--dir` にはディレクトリのみ許可、streaming `context` は JSON prefix 出力前に入力を検証）
 - **セキュリティ** — パス境界チェック（Session/MCP のワークスペースサンドボックス、相対パスはワークスペースルート基準、非 UTF-8 パスは canonicalize 後に fail-closed で拒否、`review --diff` 経由の `detect_api_changes` / `filter_diff_files_for_dead_code` も diff の `new_path` / `old_path` を `is_safe_diff_path` でトラバーサル検証）、ファイル/入力サイズ 100MB 上限（`session` / `context` / `impact` の生入力、`--paths-file` を含む、`parser::read_file` は metadata 取得後に拡大する TOCTOU 経路も `take()` + 読み込み後再検証で阻止）、`git diff` / `git show` / `git blame` に渡す `--base` 等 revision は `-` プレフィクス / NUL / 空文字を拒否（オプション誤認識防止、`cochange --blame` の `--paths` / `--paths-file` 経由でも検証）
 - **トークン最適化** — version フィールド省略（doctor/MCP のみ）、compact キー短縮（`lang`/`ln`/`col`/`ctx`/`refs`/`src`/`def`/`ref`/`fn`/`cx` 等）、calls を caller グルーピング、CompactAstEdge フラット化、refs/context で相対パス出力、symbols デフォルト compact 出力（`--doc` で docstring 付加、`--full` で旧来の完全出力）
@@ -36,7 +36,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - `src/config.rs` - 設定ファイル管理（ConfigService: load/generate、TOML 形式、`log_path` の未指定と明示指定を区別）
 - `src/logger.rs` - ロギング（logroller 日次ローテーション、3日保持、tracing-subscriber）
 - `src/cli.rs` - CLI サブコマンド定義（ast, symbols, calls, refs, context, impact, review, dead-code, imports, lint, sequence, cochange, doctor, session, mcp, init）
-- `src/main.rs` - コマンドディスパッチ、キャッシュ層、バッチ処理（全て AppService 経由）、`batch_ndjson` はスコープドスレッド + 順序保持スロットで並列処理と低ピーク RSS を両立
+- `src/main.rs` - コマンドディスパッチ、キャッシュ層、バッチ処理（全て AppService 経由）、`batch_ndjson` はスコープドスレッド + 順序保持スロットで並列処理と低ピーク RSS を両立。CLI stdout の broken pipe は panic 表示を抑止し、`head` 等の通常パイプ利用を正常終了扱いにする
 - `src/commands/api_changes.rs` - API 差分検出（`detect_api_changes`: Phase 0 で exported シンボル抽出 + ApiRefIndex 構築 → process_added/deleted/modified_file）。Phase 0 は `extract_new_file_facts` で new_path を **1 回だけ read+parse** して exported/callees/reexports の 3 facts を導出（旧実装は同一 new_path を TS/JS/Rust で 3 回・他言語で 2 回 parse、各抽出のガード=test path/`is_safe_diff_path`/lexer-only/言語別 reexport を厳密維持）、reexports は `PreparedDiffFile::Modified` に先取り保持して process_modified_file の再 parse を排除。サブモジュール: `rust_public.rs`（Rust 公開 API 面判定 / re-export edge graph、`RustBaseReexportCache` が base 側 crate 判定 `is_binary_only_rust_crate_at_base` / `rust_private_module_info` を old_path 単位でメモ化し per-symbol の多重 `git show` を排除＝dir/base は detect_api_changes 呼び出し内で固定）、`ts_signature.rs`（TS/JS シグネチャ・React HOC / object member / 末尾 optional 互換判定）、`ref_index.rs`（ApiRefIndex + cross-file 参照判定 5 ヘルパー）
 - `src/commands/dead_code.rs` - dead-code 検出（`detect_dead_symbols_from_files` は collect 候補 → name index 構築 → framework asset refs 収集 → classify の 4 ステージ分割、規約除外の追加は classify の述語 1 つで閉じる）
 - `src/mcp/mod.rs` - MCP サーバー（AstroSightServer + AppService::sandboxed(cwd) + 11 ツール、fail-closed: sandbox 生成失敗時はパニック）
@@ -72,6 +72,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - 公開 API や export を触った変更では `astro-sight dead-code --dir . --git` も併用して死蔵シンボルを確認する
 - 複数の `astro-sight` クエリを連続で投げる場合は `session` を優先し、プロセス起動コストを抑える
 - 繰り返しの構造ルール確認には `astro-sight lint --path <file> --rules <rules.yaml>` を使い、アドホックなテキスト検索で代用しない
+- `symbols` の後に import / caller / call flow まで見る場合は、`imports` / `calls` / `sequence` を続けるか、mixed query を `session` にまとめる
 - 並列集約や大規模リポジトリ向けの変更では `/usr/bin/time -l` でピーク RSS を測定し、`par_iter().collect()` で不要な中間 Vec を全展開していないか確認する
 - コードコメントは必要な箇所にだけ付け、付ける場合は日本語で簡潔に記述する
 

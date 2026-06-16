@@ -103,6 +103,7 @@ echo '{"command":"refs","name":"Sym1","dir":"."}
 - Need exact syntax around a confusing match or parse error? Escalate from `symbols` to `astro-sight ast --path <file> --line <n> --col <n>`.
 - Checking a multi-file change for hidden coupling? Run `astro-sight cochange --dir . --git --base <rev>` before assuming filenames tell the whole story.
 - Turning a repeated review note into a rule? Write one small `lint` rule and run it, instead of repeating natural-language checks.
+- Already used `symbols` and now need imports, callers, or call flow? Continue with `imports` / `calls` / `sequence`, or batch the mixed queries through `session`.
 
 ## Escalation Path
 
@@ -474,6 +475,7 @@ astro-sight dead-code --dir . --git
 - If you will run 2+ different structural commands (`symbols` + `calls`, `imports` + `refs`, etc.), prefer `session` instead of starting separate processes
 - Use `lint` for repeated AST/text policies and `sequence` when you need to explain non-trivial call flow
 - `session` supports `ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange` (note: `review` is CLI-only, not available in session mode)
+- stdout broken pipes are handled gracefully: commands like `astro-sight symbols --dir src | head` exit without printing a Rust panic when the downstream reader closes early
 - With `ASTRO_SIGHT_WORKSPACE`, session-relative `path` / `dir` values resolve from the workspace root, not the process cwd; invalid workspace values fail closed
 - **Input validation**: Empty `--name`/`--names`, empty `--paths`/`--paths-file` are rejected with `INVALID_REQUEST` error. `--paths-file` is capped at 100MB. `cochange` rejects non-finite/out-of-range `--min-confidence` and non-finite/negative smoothing priors. `--base` for `context`/`impact`/`review` rejects values starting with `-` (blocks option-style injection into `git diff` / `git show` / `git blame`)
 - **Large repositories (10k+ source files)**: `review --dir .` runs `context` + `cochange` + API diff + dead-code in one process and is the heaviest command. On very large monorepos it can exhaust memory. Mitigations:

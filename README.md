@@ -571,6 +571,8 @@ $ astro-sight ast --path nonexistent.rs
 {"error":{"code":"FILE_NOT_FOUND","message":"File not found: nonexistent.rs"}}
 ```
 
+`astro-sight symbols --dir src | head` のように、下流コマンドが先に終了して stdout pipe が閉じた場合は panic を表示せず exit 0 で終了する。これは CLI 利用時の通常のページング・サンプリングを壊さないための挙動で、実際の解析エラーは従来どおり JSON エラー + exit code 1 で返す。
+
 ## Supported Languages (16 + 1 lexer-only)
 
 | Language | Extension | Crate | Version |
@@ -669,6 +671,7 @@ astro-sight skill-install codex
 
 登録後は「コールグラフを調べて」「この関数の呼び出し元は？」「diff の影響範囲は？」等の質問で自動的に起動します。
 PR や patch 全体をまとめて見たい場合は、`astro-sight review --dir . --git` まで含めて指示すると一括レビューに入りやすくなります。
+`symbols` だけで構造を読んだあとに import / caller / call flow を確認する流れでは、`imports` / `calls` / `sequence` を続けて使うか、2 個以上の mixed query を `session` にまとめるとプロセス起動を減らせます。
 
 ### 利用状況の分析
 
