@@ -182,6 +182,7 @@ fn process_modified_file(
     ref_index: &ApiRefIndex,
     rust_reexport_cache: &mut RustBaseReexportCache,
     rust_new_reexport_cache: &mut RustWorktreeReexportCache,
+    closure_caches: &mut crate::commands::api_changes::ref_index::ApiClosureCaches,
     buckets: &mut ApiChangeBuckets,
 ) {
     let old_map: std::collections::HashMap<&str, &str> = old_syms
@@ -371,6 +372,7 @@ fn process_modified_file(
                 diff_files,
                 lang_id_for_file,
                 ref_index,
+                closure_caches,
                 buckets,
             );
         }
@@ -391,6 +393,7 @@ fn classify_signature_change(
     diff_files: &[crate::models::impact::DiffFile],
     lang_id_for_file: Option<crate::language::LangId>,
     ref_index: &ApiRefIndex,
+    closure_caches: &mut crate::commands::api_changes::ref_index::ApiClosureCaches,
     buckets: &mut ApiChangeBuckets,
 ) {
     let name = change.name.clone();
@@ -447,7 +450,7 @@ fn classify_signature_change(
         return;
     }
     // 全 cross-file 参照が同一 diff 内で追随済みなら informational
-    if is_modified_closed_in_diff(ref_index, dir, &name, base, diff_files) {
+    if is_modified_closed_in_diff(ref_index, dir, &name, base, diff_files, closure_caches) {
         buckets.modified_closed_in_diff.push(change);
     } else {
         buckets.modified.push(change);
@@ -891,6 +894,12 @@ pub(crate) fn detect_api_changes(
     }
     let ref_index = ApiRefIndex::build(dir, &index_names);
 
+    // process_modified_file → classify_signature_change → is_modified_closed_in_diff の per-file
+    // キャッシュ (import 行集合 / 変更行集合) を detect_api_changes スコープで 1 度確保し、
+    // 全 modified シンボル横断で共有する。per-symbol の git diff 起動 + tree-sitter parse を
+    // unique file 単位に削減 (#perf N+1 改善)。
+    let mut closure_caches = crate::commands::api_changes::ref_index::ApiClosureCaches::default();
+
     for (df, prep) in diff_files.iter().zip(&prepared) {
         match prep {
             PreparedDiffFile::Skip => {}
@@ -941,6 +950,7 @@ pub(crate) fn detect_api_changes(
                         &ref_index,
                         &mut rust_reexport_cache,
                         &mut rust_new_reexport_cache,
+                        &mut closure_caches,
                         &mut buckets,
                     );
                 }

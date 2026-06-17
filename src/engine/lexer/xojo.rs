@@ -328,6 +328,28 @@ End Sub
         assert!(!names.contains(&"Hidden"));
     }
 
+    #[test]
+    fn xojo_extracts_methods_with_multiple_modifiers() {
+        // Xojo は `Public Shared Sub Foo()` のような複数修飾子を併記する記法が標準。
+        // 旧実装は modifier ループが 1 回で break していたため、`Shared` が残って
+        // definition keyword とマッチせず、これらのメソッドが完全に欠落していた。
+        let src = "#tag Class\nProtected Class Helper\n  Sub Plain()\n  End Sub\n  Public Sub OnlyPublic()\n  End Sub\n  Public Shared Sub PublicShared()\n  End Sub\n  Public Static Function PublicStatic() As Integer\n  End Function\n  Protected Shared Sub ProtectedShared()\n  End Sub\nEnd Class\n#tag EndClass\n";
+        let symbols = extract_symbols(src.as_bytes(), LexerLang::Xojo);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        for expected in [
+            "Plain",
+            "OnlyPublic",
+            "PublicShared",
+            "PublicStatic",
+            "ProtectedShared",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "expected `{expected}` in {names:?}"
+            );
+        }
+    }
+
     // ===== runtime entrypoint (dead-code 除外) =====
 
     #[test]

@@ -553,18 +553,27 @@ pub fn find_angular_template_references_batch(
     dir: &Path,
     glob: Option<&str>,
 ) -> Vec<Vec<SymbolReference>> {
+    if symbol_names.is_empty() {
+        return Vec::new();
+    }
+    let Some(ctx) = AngularBatchContext::prepare(dir, glob) else {
+        return vec![Vec::new(); symbol_names.len()];
+    };
+    find_angular_template_references_batch_with_context(symbol_names, &ctx)
+}
+
+/// 事前に組み立てた [`AngularBatchContext`] を再利用してバッチ参照検索を行う。
+///
+/// chunk 分割された大規模 batch (`refs --names`) では、chunk 毎に
+/// `find_angular_template_references_batch` を呼ぶと `is_angular_project` の全ディレクトリ
+/// 走査と `collect_component_templates` の全 `.ts` parse が chunk 数倍走る。コンテキストを
+/// 一度だけ組み立てて使い回すことで chunk 数 → 1 回に減らす。
+pub fn find_angular_template_references_batch_with_context(
+    symbol_names: &[String],
+    ctx: &AngularBatchContext,
+) -> Vec<Vec<SymbolReference>> {
     let mut out: Vec<Vec<SymbolReference>> = vec![Vec::new(); symbol_names.len()];
     if symbol_names.is_empty() {
-        return out;
-    }
-    // dir を canonicalize し、以降の templateUrl 解決・境界チェックの基準にする。
-    // symlink を含めた実パスで判定することで、`templateUrl` が symlink 経由で
-    // workspace 外を読むのを防ぐ (fail-closed)。
-    let Ok(dir_canon) = std::fs::canonicalize(dir) else {
-        return out;
-    };
-    let dir = dir_canon.as_path();
-    if !is_angular_project(dir) {
         return out;
     }
     // Angular template の identifier は case-sensitive。名前 → 出力 index。
@@ -578,12 +587,8 @@ pub fn find_angular_template_references_batch(
         return out;
     }
 
-    // glob は実ファイルパスで判定する (`src/**/*.html` のようなパス限定 glob にも対応)。
-    let glob_ov = build_glob_override(dir, glob);
-    let model = collect_component_templates(dir, &glob_ov);
-
     // inline template: component `.ts` 内に式があるので、ts 座標へ変換して emit。
-    for inl in &model.inline {
+    for inl in &ctx.model.inline {
         let Ok(ts_content) = std::fs::read_to_string(&inl.ts_path) else {
             continue;
         };
@@ -600,7 +605,7 @@ pub fn find_angular_template_references_batch(
     }
 
     // 外部 html: templateUrl で component に紐付くものだけ走査。
-    for html_path in &model.linked_html {
+    for html_path in &ctx.model.linked_html {
         let Ok(content) = std::fs::read_to_string(html_path) else {
             continue;
         };
@@ -612,6 +617,28 @@ pub fn find_angular_template_references_batch(
         refs.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line.cmp(&b.line)));
     }
     out
+}
+
+/// chunk 横断で再利用するための前処理結果。
+/// 非 Angular リポ (`prepare` が `None`) の場合は呼び出し側で template 走査を完全に skip する。
+pub struct AngularBatchContext {
+    model: ComponentTemplates,
+}
+
+impl AngularBatchContext {
+    /// `dir` が Angular プロジェクトでない場合は `None` を返す (chunk 横断で再判定不要)。
+    pub fn prepare(dir: &Path, glob: Option<&str>) -> Option<Self> {
+        // dir を canonicalize し、以降の templateUrl 解決・境界チェックの基準にする。
+        let dir_canon = std::fs::canonicalize(dir).ok()?;
+        let dir = dir_canon.as_path();
+        if !is_angular_project(dir) {
+            return None;
+        }
+        // glob は実ファイルパスで判定する (`src/**/*.html` のようなパス限定 glob にも対応)。
+        let glob_ov = build_glob_override(dir, glob);
+        let model = collect_component_templates(dir, &glob_ov);
+        Some(Self { model })
+    }
 }
 
 /// `glob` から override matcher を構築する。`glob` 未指定 / 構築失敗時は `None` (= 全許可)。

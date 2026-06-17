@@ -117,14 +117,16 @@ pub(crate) fn is_signature_line(line: &str) -> bool {
     }
 
     // Xojo: `Function X(...)`, `Sub X(...)`, `Event X(...)` で宣言する。
-    // 言語仕様上 case-insensitive のため ASCII case-insensitive で判定する。
-    let xojo_keywords = ["function ", "sub ", "event "];
-    let lower_prefix: String = line
-        .chars()
-        .take(40)
-        .flat_map(|c| c.to_lowercase())
-        .collect();
-    if xojo_keywords.iter().any(|kw| lower_prefix.contains(kw)) {
+    // 言語仕様上 case-insensitive のため、行頭から 40 バイト範囲を ASCII case-insensitive で
+    // 走査する (ホットパスのため中間 String を確保しない)。
+    // Xojo の identifier は ASCII のみなので bytes 単位の比較で十分。
+    let bytes = line.as_bytes();
+    let head = &bytes[..bytes.len().min(40)];
+    let xojo_keywords: [&[u8]; 3] = [b"function ", b"sub ", b"event "];
+    if xojo_keywords
+        .iter()
+        .any(|kw| head.windows(kw.len()).any(|w| w.eq_ignore_ascii_case(kw)))
+    {
         return true;
     }
 
@@ -338,6 +340,18 @@ mod tests {
         assert!(is_signature_line(
             "  FUNCTION Compute(x as Double) as Double"
         ));
+    }
+
+    // Xojo キーワードを後段 (40 バイト位置以降) に含む通常コード行は誤検出しない
+    // (バイト先頭 40 バイトに ASCII 大小無視で完全一致するキーワードがある場合のみ true)
+    #[test]
+    fn is_signature_line_xojo_keyword_not_at_head_is_rejected() {
+        // 41 文字目以降にキーワードが現れる行は signature ではない
+        let leading = " ".repeat(41);
+        let line = format!("{leading}Function NotASig() As Integer");
+        assert!(!is_signature_line(&line));
+        // 行頭が `i` で始まる通常代入は誤検出しない (Xojo `i` ではない)
+        assert!(!is_signature_line("    items = function_call()"));
     }
 
     // 通常のコード行はシグネチャ行と判定されない

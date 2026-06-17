@@ -129,9 +129,9 @@ pub(crate) fn is_modified_closed_in_diff(
     name: &str,
     base: &str,
     diff_files: &[crate::models::impact::DiffFile],
+    caches: &mut ApiClosureCaches,
 ) -> bool {
     use crate::models::reference::RefKind;
-    use std::collections::{HashMap, HashSet};
     let bare = bare_name(name);
     let Some(refs) = index.refs_for(bare) else {
         return false;
@@ -153,12 +153,14 @@ pub(crate) fn is_modified_closed_in_diff(
     // AST ベースの import 行集合でも除外する。import/use 文内の参照は signature 変更に
     // 追随する必要がない (api.mod 誤検出 2026-05-31: grouped use 継続行を未更新 caller と
     // 誤判定して blocking していた問題への対応)。
-    let mut import_lines_cache: HashMap<String, HashSet<usize>> = HashMap::new();
+    // 2 つのキャッシュは detect_api_changes スコープで生成して全 modified シンボルで共有する。
+    // per-symbol の git diff サブプロセス起動と tree-sitter parse を unique file 単位に削減する。
     let call_refs: Vec<&crate::models::reference::SymbolReference> = refs
         .iter()
         .filter(|r| r.kind != Some(RefKind::Definition) && !ref_is_import_line(r))
         .filter(|r| {
-            let import_lines = import_lines_cache
+            let import_lines = caches
+                .import_lines
                 .entry(r.path.clone())
                 .or_insert_with(|| import_statement_lines_for_ref(dir, &r.path));
             !import_lines.contains(&r.line)
@@ -170,14 +172,14 @@ pub(crate) fn is_modified_closed_in_diff(
     // 全ての呼び出し参照が、diff 内ファイルかつ実際の追加/変更行 (context 行ではない) にあるか。
     // HunkInfo の new 範囲は context 行を含むため、git diff から実 `+` 行集合を取得して照合する
     // (codex 指摘: context 行に古い呼び出しが入ると未更新 caller を誤って closed 判定してしまう)。
-    let mut changed_cache: HashMap<String, HashSet<usize>> = HashMap::new();
     for r in &call_refs {
         let Some(df) = diff_files.iter().find(|df| {
             df.new_path != "/dev/null" && diff_path_matches_ref(&df.new_path, &r.path, dir)
         }) else {
             return false; // diff 外ファイルの参照 → 未更新 caller の可能性
         };
-        let changed = changed_cache
+        let changed = caches
+            .changed_new_lines
             .entry(df.new_path.clone())
             .or_insert_with(|| changed_new_lines_for_file(dir, base, &df.old_path, &df.new_path));
         if !changed.contains(&r.line) {
@@ -185,6 +187,21 @@ pub(crate) fn is_modified_closed_in_diff(
         }
     }
     true
+}
+
+/// `is_modified_closed_in_diff` で `detect_api_changes` 呼び出し 1 回の間だけ生かす per-file
+/// キャッシュをまとめた構造体。
+///
+/// modified シンボル 1 件毎に再生成すると、refs が走る `unique_file` 数分の `git diff` 起動と
+/// tree-sitter parse が M×F 回走る。`detect_api_changes` で 1 度だけ確保して使い回すことで
+/// unique file 単位の F 回に圧縮する。
+#[derive(Default)]
+pub(crate) struct ApiClosureCaches {
+    /// `import_statement_lines_for_ref` の (ref path → import 行集合) キャッシュ。
+    pub(crate) import_lines: std::collections::HashMap<String, std::collections::HashSet<usize>>,
+    /// `changed_new_lines_for_file` の (new_path → 実際に変更/追加された new 行集合) キャッシュ。
+    pub(crate) changed_new_lines:
+        std::collections::HashMap<String, std::collections::HashSet<usize>>,
 }
 
 /// 参照行が import / use 宣言 (signature 変更に追随不要) かを行テキストで簡易判定する。

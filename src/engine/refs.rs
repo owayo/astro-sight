@@ -1644,6 +1644,12 @@ pub fn find_references_batch(
     let mut merged: HashMap<String, Vec<SymbolReference>> =
         HashMap::with_capacity(symbol_names.len());
 
+    // Angular template scan の前処理 (canonicalize / `is_angular_project` の全 dir 走査 /
+    // `collect_component_templates` の全 `.ts` 走査) は chunk 数に依らず 1 回で済ます。
+    // 非 Angular リポでは `None` となり、chunk ループ内で template scan を完全に skip する。
+    let angular_ctx =
+        crate::engine::angular_template_refs::AngularBatchContext::prepare(dir, glob_pattern);
+
     for chunk in symbol_names.chunks(refs_batch_chunk_size()) {
         // AC は ASCII CI で構築: CI 言語 (Xojo) で case 違いを事前フィルタで取りこぼさない
         // ため。非 CI 言語では多少の false positive (大文字小文字違い) が発生するが、AST
@@ -1687,14 +1693,15 @@ pub fn find_references_batch(
 
         // Angular template バインディング式からの参照を chunk 分まとめて統合する (GitLab #18)。
         // テンプレートを名前数分スキャンせず chunk 単位で全名を 1 回で引く。
-        let template_refs =
-            crate::engine::angular_template_refs::find_angular_template_references_batch(
-                chunk,
-                dir,
-                glob_pattern,
-            );
-        for (bucket, mut t) in buckets.iter_mut().zip(template_refs) {
-            bucket.append(&mut t);
+        // 事前に組み立てた AngularBatchContext を使い、chunk 数倍の全 dir/.ts 走査を避ける。
+        if let Some(ctx) = angular_ctx.as_ref() {
+            let template_refs =
+                crate::engine::angular_template_refs::find_angular_template_references_batch_with_context(
+                    chunk, ctx,
+                );
+            for (bucket, mut t) in buckets.iter_mut().zip(template_refs) {
+                bucket.append(&mut t);
+            }
         }
 
         for (i, name) in chunk.iter().enumerate() {

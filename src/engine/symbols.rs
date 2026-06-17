@@ -1853,7 +1853,11 @@ fn function_boundary_kinds(lang_id: LangId) -> &'static [&'static str] {
         LangId::Python => &["function_definition", "lambda"],
         LangId::Go => &["function_declaration", "method_declaration", "func_literal"],
         LangId::Java => &["method_declaration", "lambda_expression"],
-        LangId::Kotlin => &["function_declaration", "lambda_literal"],
+        LangId::Kotlin => &[
+            "function_declaration",
+            "lambda_literal",
+            "anonymous_function",
+        ],
         LangId::Swift => &["function_declaration", "lambda_literal"],
         LangId::CSharp => &["method_declaration", "lambda_expression"],
         LangId::Php => &[
@@ -1904,7 +1908,7 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
             "type_switch_statement",
             "case_clause",
         ],
-        LangId::Java | LangId::Kotlin => &[
+        LangId::Java => &[
             "if_statement",
             "switch_expression",
             "for_statement",
@@ -1912,6 +1916,19 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
             "while_statement",
             "do_statement",
             "catch_clause",
+        ],
+        // Kotlin の分岐ノードは tree-sitter-kotlin 固有名 (`if_expression` / `when_expression` /
+        // `when_entry` / `do_while_statement` / `catch_block` / `elvis_expression`)。
+        // Java と同じスライスを共用すると一切マッチせず複雑度がベース 1 のまま返る。
+        LangId::Kotlin => &[
+            "if_expression",
+            "when_expression",
+            "when_entry",
+            "for_statement",
+            "while_statement",
+            "do_while_statement",
+            "catch_block",
+            "elvis_expression",
         ],
         LangId::Ruby => &[
             "if", "elsif", "unless", "case", "when", "for", "while", "until", "rescue",
@@ -2567,6 +2584,40 @@ mod tests {
             2,
             "while は分岐 1 つ"
         );
+    }
+
+    // --- Kotlin: 循環的複雑度 (旧実装は Java の分岐ノード名を共用しており常に 1 だった) ---
+
+    #[test]
+    fn kotlin_when_expression_complexity_counts_entries() {
+        // `when` は tree-sitter-kotlin で `when_expression`、ブランチは `when_entry`。
+        // 旧実装は Java の `switch_expression` を流用しており when を取りこぼし cx=1 だった。
+        let src = "fun classify(x: Int): String {\n  return when (x) {\n    0 -> \"zero\"\n    1 -> \"one\"\n    2 -> \"two\"\n    else -> \"other\"\n  }\n}";
+        // ベース 1 + when_expression 1 + when_entry 4 (0/1/2/else) = 6
+        assert_eq!(cx_of(src, LangId::Kotlin, "classify"), 6);
+    }
+
+    #[test]
+    fn kotlin_if_else_complexity_is_counted() {
+        // `if` は tree-sitter-kotlin で `if_expression`。旧実装では cx=1 のままだった。
+        let src = "fun pickIf(a: Int, b: Int): Int {\n  if (a > 0) {\n    if (b > 0) {\n      return a + b\n    } else {\n      return a - b\n    }\n  }\n  return 0\n}";
+        // ベース 1 + if_expression 2 (外側 + 内側) = 3
+        assert_eq!(cx_of(src, LangId::Kotlin, "pickIf"), 3);
+    }
+
+    #[test]
+    fn kotlin_loop_complexity_is_counted() {
+        let src = "fun loopSum(items: List<Int>): Int {\n  var sum = 0\n  for (it in items) {\n    while (sum < 100) {\n      sum += it\n    }\n  }\n  return sum\n}";
+        // ベース 1 + for_statement 1 + while_statement 1 = 3
+        assert_eq!(cx_of(src, LangId::Kotlin, "loopSum"), 3);
+    }
+
+    #[test]
+    fn kotlin_try_catch_complexity_is_counted() {
+        // `catch` は tree-sitter-kotlin で `catch_block`。
+        let src = "fun tryIt(): Int {\n  try {\n    return 1\n  } catch (e: Exception) {\n    return -1\n  }\n}";
+        // ベース 1 + catch_block 1 = 2
+        assert_eq!(cx_of(src, LangId::Kotlin, "tryIt"), 2);
     }
 
     /// re-export 名抽出テスト用ヘルパー。

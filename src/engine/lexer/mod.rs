@@ -231,11 +231,27 @@ pub(super) fn extract_definition_from_line(
         }
     }
 
-    // optional modifier
-    for modifier in profile.modifier_keywords {
-        if let Some(after) = strip_keyword_prefix(rest, modifier, profile.case_insensitive) {
-            rest = after.trim_start();
-            break;
+    // optional modifier (複数修飾子を順番に消費する)。
+    // Xojo の `Public Shared Sub ...` のように可視性修飾子と Shared/Static を併記する記法に
+    // 対応するため、1 修飾子で break せず可能な限り続けて剥がす。
+    // 同一 keyword の重複は consumed で除外 (`Public Public ...` のような病的入力でも
+    // 無限ループにならないように)。
+    let mut consumed: smallvec::SmallVec<[&'static str; 4]> = smallvec::SmallVec::new();
+    loop {
+        let mut matched: Option<&'static str> = None;
+        for modifier in profile.modifier_keywords {
+            if consumed.iter().any(|m| std::ptr::eq(*m, *modifier)) {
+                continue;
+            }
+            if let Some(after) = strip_keyword_prefix(rest, modifier, profile.case_insensitive) {
+                rest = after.trim_start();
+                matched = Some(modifier);
+                break;
+            }
+        }
+        match matched {
+            Some(kw) => consumed.push(kw),
+            None => break,
         }
     }
 
