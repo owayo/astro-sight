@@ -8036,6 +8036,263 @@ fn detect_api_changes_ts_trailing_default_param_is_compatible() {
     assert_eq!(compat.reason, "trailing_optional_params");
 }
 
+/// Python のトップレベル関数に末尾 keyword-only + default 引数を追加した変更は
+/// 既存呼び出しを壊さないため、`compatible_modified` (`trailing_optional_params`) に降格する。
+/// (レポート 2026-06-18-api-mod-backward-compatible-kwarg の再現)
+#[test]
+fn detect_api_changes_python_trailing_kwonly_default_param_is_compatible() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/uploader.py",
+                "def upload_category_spreadsheets(items):\n    return items\n",
+            ),
+            (
+                "src/main.py",
+                "from uploader import upload_category_spreadsheets\n\nresult = upload_category_spreadsheets([])\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("src/uploader.py"),
+        "def upload_category_spreadsheets(items, *, max_spreadsheet_bytes=600_000):\n    return items\n",
+    )
+    .expect("write changed file");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/uploader.py".to_string(),
+        new_path: "src/uploader.py".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 2,
+            new_start: 1,
+            new_count: 2,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    assert!(
+        api_changes.modified.is_empty(),
+        "末尾 kwonly+default 引数追加は破壊的 api.mod にすべきでない: {:?}",
+        api_changes.modified
+    );
+    let compat = api_changes
+        .compatible_modified
+        .iter()
+        .find(|c| c.name == "upload_category_spreadsheets")
+        .expect("compatible_modified に upload_category_spreadsheets が入るべき");
+    assert_eq!(compat.reason, "trailing_optional_params");
+}
+
+/// Python トップレベル関数の末尾 positional default 引数追加も同様に compatible_modified に降格する。
+#[test]
+fn detect_api_changes_python_trailing_default_positional_is_compatible() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[(
+            "src/lib/helpers.py",
+            "def render(items):\n    return items\n",
+        )],
+        "initial",
+    );
+    fs::write(
+        repo.join("src/lib/helpers.py"),
+        "def render(items, limit=10):\n    return items[:limit]\n",
+    )
+    .expect("write changed file");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/lib/helpers.py".to_string(),
+        new_path: "src/lib/helpers.py".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 2,
+            new_start: 1,
+            new_count: 2,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    assert!(
+        api_changes.modified.is_empty(),
+        "末尾 default 引数追加は破壊的 api.mod にすべきでない: {:?}",
+        api_changes.modified
+    );
+    let compat = api_changes
+        .compatible_modified
+        .iter()
+        .find(|c| c.name == "render")
+        .expect("compatible_modified に render が入るべき");
+    assert_eq!(compat.reason, "trailing_optional_params");
+}
+
+/// Python モジュール直下クラスのメソッドに末尾 kwonly+default 引数を追加した変更も
+/// `compatible_modified` (`trailing_optional_params`) に降格する。
+#[test]
+fn detect_api_changes_python_class_method_trailing_kwonly_default_is_compatible() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/svc.py",
+                "class Service:\n    def emit(self, payload):\n        return payload\n",
+            ),
+            (
+                "src/main.py",
+                "from svc import Service\n\nresult = Service().emit({})\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("src/svc.py"),
+        "class Service:\n    def emit(self, payload, *, retry=0):\n        return payload\n",
+    )
+    .expect("write changed file");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/svc.py".to_string(),
+        new_path: "src/svc.py".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 3,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    assert!(
+        api_changes
+            .modified
+            .iter()
+            .all(|c| c.name != "Service.emit"),
+        "末尾 kwonly+default 引数追加は破壊的 api.mod にすべきでない: {:?}",
+        api_changes.modified
+    );
+    let compat = api_changes
+        .compatible_modified
+        .iter()
+        .find(|c| c.name == "Service.emit")
+        .expect("compatible_modified に Service.emit が入るべき");
+    assert_eq!(compat.reason, "trailing_optional_params");
+}
+
+/// Python デコレータが変わった場合 (例: `@staticmethod` → `@classmethod`) は
+/// default 引数追加が併走しても compatible_modified に降格せず modified に残るべき。
+/// (呼び出し時の cls / self bind が変わり既存呼出を壊しうるため)
+#[test]
+fn detect_api_changes_python_decorator_change_with_optional_param_stays_modified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/svc.py",
+                "class Service:\n    @staticmethod\n    def emit(payload):\n        return payload\n",
+            ),
+            (
+                "src/main.py",
+                "from svc import Service\n\nresult = Service.emit({})\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("src/svc.py"),
+        "class Service:\n    @classmethod\n    def emit(cls, payload, *, retry=0):\n        return payload\n",
+    )
+    .expect("write changed file");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/svc.py".to_string(),
+        new_path: "src/svc.py".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 4,
+            new_start: 1,
+            new_count: 4,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    assert!(
+        api_changes
+            .compatible_modified
+            .iter()
+            .all(|c| c.name != "Service.emit"),
+        "デコレータ変更 + default 引数追加は compatible_modified に降格してはならない: {:?}",
+        api_changes.compatible_modified
+    );
+}
+
+/// Python の必須引数 (default 無し) 追加は依然 modified (api.mod) として残るべき。
+#[test]
+fn detect_api_changes_python_trailing_required_param_stays_modified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[(
+            "src/lib/helpers.py",
+            "def render(items):\n    return items\n",
+        )],
+        "initial",
+    );
+    fs::write(
+        repo.join("src/lib/helpers.py"),
+        "def render(items, limit):\n    return items[:limit]\n",
+    )
+    .expect("write changed file");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/lib/helpers.py".to_string(),
+        new_path: "src/lib/helpers.py".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 2,
+            new_start: 1,
+            new_count: 2,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    assert!(
+        api_changes.compatible_modified.is_empty(),
+        "required 引数追加を compatible_modified に降格してはならない: {:?}",
+        api_changes.compatible_modified
+    );
+    assert!(
+        api_changes.modified.iter().any(|c| c.name == "render"),
+        "required 引数追加は api.mod に残るべき: {:?}",
+        api_changes.modified
+    );
+}
+
 #[test]
 fn detect_api_changes_ts_trailing_required_param_stays_modified() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -8679,9 +8936,12 @@ def main() -> int:
         "initial",
     );
 
-    // lib.run のシグネチャを変更（引数追加）。caller.py は diff に含まれない（追随なし）。
+    // lib.run のシグネチャを変更（必須引数追加）。caller.py は diff に含まれない（追随なし）。
+    // 必須引数追加は後方互換でないため compatible_modified に降格せず modified に残るべき。
     let lib_after = "\
-def run(value: int, flag: bool = False) -> int:
+def run(value: int, flag: bool) -> int:
+    if flag:
+        return value
     return value
 
 

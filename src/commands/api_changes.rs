@@ -449,6 +449,23 @@ fn classify_signature_change(
         buckets.compatible_modified.push(compat);
         return;
     }
+    // Python のトップレベル関数 / モジュール直下クラスのメソッドへ末尾 optional/default
+    // 引数 (`*` 後の kwonly+default 含む) を追加しただけなら、既存呼び出しが壊れないため
+    // compatible_modified として扱う。
+    if let Some(compat) = detect_python_trailing_optional_params_compatible_mod(
+        dir,
+        base,
+        &df.old_path,
+        &df.new_path,
+        &name,
+        kind,
+        old_sig,
+        new_sig,
+        lang_id_for_file,
+    ) {
+        buckets.compatible_modified.push(compat);
+        return;
+    }
     // 全 cross-file 参照が同一 diff 内で追随済みなら informational
     if is_modified_closed_in_diff(ref_index, dir, &name, base, diff_files, closure_caches) {
         buckets.modified_closed_in_diff.push(change);
@@ -2208,10 +2225,12 @@ pub(crate) fn is_internally_connected(
     false
 }
 
+mod python_signature;
 mod ref_index;
 mod rust_public;
 mod ts_signature;
 
+pub(crate) use python_signature::*;
 pub(crate) use ref_index::*;
 pub(crate) use rust_public::*;
 pub(crate) use ts_signature::*;
