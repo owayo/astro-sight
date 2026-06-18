@@ -99,6 +99,15 @@ impl JsTsMemberLiveness {
             bare_to_members.entry(m.bare.as_str()).or_default().push(m);
         }
 
+        // Step 2.5: duplicate owner を持つ set がなければ全ファイル収集を skip して早期 return。
+        let has_duplicate_set = bare_to_members.values().any(|v| {
+            let owners: HashSet<&str> = v.iter().map(|m| m.owner.as_str()).collect();
+            owners.len() >= 2
+        });
+        if !has_duplicate_set {
+            return Self { statuses };
+        }
+
         // Step 3: TS/JS ファイル一覧を収集 (一度だけ)。
         let Ok(all_files) = refs::collect_files(canonical_dir, None) else {
             return Self { statuses };
@@ -127,7 +136,14 @@ impl JsTsMemberLiveness {
                 continue;
             }
 
-            let analysis = analyze_duplicate_set(bare, &owners, &ts_js_files, &is_test_path);
+            let analysis = analyze_duplicate_set(
+                bare,
+                &owners,
+                members,
+                &ts_js_files,
+                canonical_dir,
+                &is_test_path,
+            );
 
             match analysis {
                 DuplicateSetResult::Ambiguous => {
@@ -174,23 +190,26 @@ struct MemberCandidate {
     file: String,
 }
 
-enum DuplicateSetResult<'a> {
+enum DuplicateSetResult {
     /// 一意推定が成立し、owner 別の (prod, test) カウントを保持する。
-    Counted(HashMap<&'a str, (usize, usize)>),
+    /// キーは owner 名 (String) で借用ライフタイムから独立させる。
+    Counted(HashMap<String, (usize, usize)>),
     /// 推定不能。呼び出し側で旧スキップへフォールバックする。
     Ambiguous,
 }
 
-fn analyze_duplicate_set<'a, F>(
+fn analyze_duplicate_set<F>(
     bare: &str,
-    owners: &'a HashSet<&str>,
+    owners: &HashSet<&str>,
+    members: &[&MemberCandidate],
     files: &[(std::path::PathBuf, LangId)],
+    canonical_dir: &Path,
     is_test_path: F,
-) -> DuplicateSetResult<'a>
+) -> DuplicateSetResult
 where
     F: Fn(&Path) -> bool,
 {
-    let mut counts: HashMap<&str, (usize, usize)> = HashMap::new();
+    let mut counts: HashMap<String, (usize, usize)> = HashMap::new();
     let owners_vec: Vec<&str> = owners.iter().copied().collect();
 
     for (file_path, lang) in files {
@@ -230,11 +249,35 @@ where
             continue;
         }
 
-        match analysis.imported_owners.len() {
+        // duplicate owner のうち、この **ファイル内** で定義されている owner を集める。
+        // 自ファイル内の `this.member` は `imported_owners` 推定だけで unrelated import 側へ
+        // 誤帰属しうるため、自ファイル定義 owner を effective_owners に統合する
+        // (codex review 指摘の FP 修正)。
+        let file_rel = file_path
+            .strip_prefix(canonical_dir)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut local_defined: Vec<&str> = members
+            .iter()
+            .filter(|m| m.file == file_rel)
+            .map(|m| m.owner.as_str())
+            .collect();
+        local_defined.sort();
+        local_defined.dedup();
+
+        let mut effective_owners: Vec<&str> = analysis.imported_owners.clone();
+        for o in &local_defined {
+            if !effective_owners.contains(o) {
+                effective_owners.push(*o);
+            }
+        }
+
+        match effective_owners.len() {
             1 => {
-                let owner_key = analysis.imported_owners[0];
+                let owner_key = effective_owners[0];
                 let is_test = is_test_path(file_path.as_path());
-                let entry = counts.entry(owner_key).or_insert((0, 0));
+                let entry = counts.entry(owner_key.to_string()).or_insert((0, 0));
                 if is_test {
                     entry.1 = entry.1.saturating_add(analysis.member_access_count);
                 } else {
@@ -242,8 +285,9 @@ where
                 }
             }
             _ => {
-                // imported_owners.len() == 0 (owner import なし) または
-                // imported_owners.len() >= 2 (複数 owner import) は ambiguous。
+                // imported_owners.len() == 0 (owner import なし、local 定義もなし)、
+                // imported_owners.len() >= 2 (複数 owner import)、
+                // local 定義 + unrelated owner import の混在、いずれも ambiguous。
                 return DuplicateSetResult::Ambiguous;
             }
         }

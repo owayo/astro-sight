@@ -8135,6 +8135,62 @@ fn dead_code_ts_same_member_name_string_literal_marks_ambiguous() {
 }
 
 #[test]
+fn dead_code_ts_same_member_name_self_ref_in_owner_file_is_not_misattributed() {
+    // codex pre-commit review 指摘の FP 修正: duplicate owner X の定義ファイルが unrelated
+    // owner Y を型用途で import している場合、ファイル内の `this.member` を Y 側に誤帰属
+    // させてはならない。effective_owners = imported_owners ∪ local_defined_owners が
+    // 2 owner になり ambiguous へ倒れることで、X の dead 誤検出を防ぐ。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("models")).unwrap();
+    std::fs::create_dir_all(root.join("app")).unwrap();
+
+    std::fs::write(
+        root.join("models/bar.model.ts"),
+        "export class BarModel {\n    isReady(): boolean { return true; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("models/foo.model.ts"),
+        "import { BarModel } from \"./bar.model\";\n\
+        export class FooModel {\n\
+        \x20   other?: BarModel;\n\
+        \x20   isReady(): boolean { return true; }\n\
+        \x20   check(): boolean { return this.isReady(); }\n\
+        }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("app/app.ts"),
+        "import { FooModel } from \"../models/foo.model\";\n\
+        console.log(new FooModel().check());\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success(), "dead-code は成功するべき");
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead = json["dead_symbols"].as_array().expect("dead_symbols 配列");
+    let names: Vec<&str> = dead.iter().filter_map(|s| s["name"].as_str()).collect();
+
+    // FooModel.isReady は this.isReady() 経由で内部参照されており、外部から FooModel.check() を
+    // 呼び出すコードもあるため dead に出してはならない (旧スキップ相当の Ambiguous)。
+    assert!(
+        !names.contains(&"FooModel.isReady"),
+        "owner 定義ファイル内の this.member を unrelated import 側に誤帰属して FooModel.isReady を dead と判定してはならない: {names:?}"
+    );
+    assert!(
+        !names.contains(&"BarModel.isReady"),
+        "duplicate set 全体が ambiguous なので BarModel.isReady も旧スキップ維持: {names:?}"
+    );
+}
+
+#[test]
 fn dead_code_ts_same_member_name_namespace_import_marks_ambiguous() {
     // `import * as ns from ...` (namespace import) の場合は ns 経由で任意の owner が
     // アクセスされうるため owner を一意推定できず ambiguous へ倒す (旧スキップ維持)。
