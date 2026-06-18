@@ -69,6 +69,11 @@ pub(crate) fn detect_python_trailing_optional_params_compatible_mod(
     if old_parts.head != new_parts.head || old_parts.tail != new_parts.tail {
         return None;
     }
+    // デコレータの差分は呼び出し互換に影響しうる (`@staticmethod` ↔ `@classmethod` 等)。
+    // 内容まで安全に分類するのは難しいため、差があれば保守的に blocking 維持する。
+    if old_parts.decorators != new_parts.decorators {
+        return None;
+    }
     if !python_params_compatible_addition(&old_parts.parts, &new_parts.parts) {
         return None;
     }
@@ -108,11 +113,14 @@ pub(crate) struct PyFunctionSignatureParts {
     head: String,
     tail: String,
     parts: Vec<PyParamPart>,
+    decorators: Vec<String>,
 }
 
 /// Python の `function_definition` を head (def 〜 `(` 直前) / parameters / tail
-/// (戻り値型 + `:` まで) に分け、body 直前で切る。デコレータは比較対象外
-/// (decorated_definition の親はスコープに含めない)。
+/// (戻り値型 + `:` まで) に分け、body 直前で切る。`decorated_definition` 配下の
+/// `function_definition` を受け取った場合は親のデコレータ列も併せて返し、
+/// `@staticmethod` ↔ `@classmethod` のような呼出側互換に影響する変更を
+/// 降格しないようにする。
 pub(crate) fn python_function_signature_parts(
     fn_node: tree_sitter::Node<'_>,
     source: &[u8],
@@ -123,7 +131,37 @@ pub(crate) fn python_function_signature_parts(
     let head = normalize_signature_whitespace(source.get(sig_start..params.start_byte())?);
     let tail = normalize_signature_whitespace(source.get(params.end_byte()..body.start_byte())?);
     let parts = python_function_params(params, source)?;
-    Some(PyFunctionSignatureParts { head, tail, parts })
+    let decorators = python_collect_decorators(fn_node, source);
+    Some(PyFunctionSignatureParts {
+        head,
+        tail,
+        parts,
+        decorators,
+    })
+}
+
+/// `function_definition` の親が `decorated_definition` の場合、デコレータ各 named child の
+/// 正規化テキストを返す。decorator が無ければ空 Vec。
+pub(crate) fn python_collect_decorators(
+    fn_node: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Vec<String> {
+    let Some(parent) = fn_node.parent() else {
+        return Vec::new();
+    };
+    if parent.kind() != "decorated_definition" {
+        return Vec::new();
+    }
+    let mut decorators = Vec::new();
+    let mut cursor = parent.walk();
+    for child in parent.named_children(&mut cursor) {
+        if child.kind() == "decorator"
+            && let Some(text) = source.get(child.start_byte()..child.end_byte())
+        {
+            decorators.push(normalize_signature_whitespace(text));
+        }
+    }
+    decorators
 }
 
 /// parameters 直下の named child を順番に収集する。判定不能な kind が混ざる場合は
@@ -214,21 +252,36 @@ pub(crate) fn python_params_compatible_addition(
 /// `function_definition` のうち、name が一致するものを返す。
 /// `decorated_definition` 配下の `function_definition` も対象。
 /// ネストしたローカル関数 (関数内 def) は対象外。
+/// 同名候補が複数見つかった場合は `None` を返す (どの定義が `old_sig` / `new_sig` の対象か
+/// 一意に決められず、誤った互換降格を起こすため、blocking を維持する)。
 pub(crate) fn find_python_function_by_name<'a>(
     root: tree_sitter::Node<'a>,
     source: &[u8],
     name: &str,
 ) -> Option<tree_sitter::Node<'a>> {
-    // `name` が `Class.method` 形式ならクラス配下を探索、bare 名ならモジュール直下。
+    let matches = collect_python_function_candidates(root, source, name);
+    if matches.len() == 1 {
+        Some(matches[0])
+    } else {
+        None
+    }
+}
+
+/// `find_python_function_by_name` の内部実装。マッチした全候補を返し、呼び出し側で
+/// 件数を判定する。
+fn collect_python_function_candidates<'a>(
+    root: tree_sitter::Node<'a>,
+    source: &[u8],
+    name: &str,
+) -> Vec<tree_sitter::Node<'a>> {
     let (class_name, fn_name) = match name.split_once('.') {
         Some((cls, fnm)) if !cls.is_empty() && !fnm.is_empty() => (Some(cls), fnm),
         _ => (None, name),
     };
 
-    // module 直下を走査して、対象 (module 直下 fn / class 配下 fn) を 1 つ返す。
+    let mut matches = Vec::new();
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
-        // class 配下の method を探すケース
         if let Some(cls) = class_name {
             let class_node = if child.kind() == "decorated_definition" {
                 child
@@ -252,18 +305,17 @@ pub(crate) fn find_python_function_by_name<'a>(
                     if let Some(fn_node) =
                         python_function_definition_with_name(body_child, source, fn_name)
                     {
-                        return Some(fn_node);
+                        matches.push(fn_node);
                     }
                 }
             }
             continue;
         }
-        // module 直下 fn を探すケース
         if let Some(fn_node) = python_function_definition_with_name(child, source, fn_name) {
-            return Some(fn_node);
+            matches.push(fn_node);
         }
     }
-    None
+    matches
 }
 
 /// `node` 自身またはその直下の `function_definition` で name が一致するなら返す。
@@ -381,5 +433,51 @@ mod tests {
         let src = "@decorator\ndef f(a):\n    return a\n";
         let tree = parse(src);
         assert!(find_python_function_by_name(tree.root_node(), src.as_bytes(), "f").is_some());
+    }
+
+    #[test]
+    fn duplicate_top_level_function_is_ambiguous() {
+        // 同一モジュール内に同名トップレベル関数が複数あるとどの定義が対象か
+        // 確定できないため、blocking 維持 (None) を期待する。
+        let src = "def f(a):\n    return a\n\ndef f(a, b):\n    return a + b\n";
+        let tree = parse(src);
+        assert!(find_python_function_by_name(tree.root_node(), src.as_bytes(), "f").is_none());
+    }
+
+    #[test]
+    fn decorator_diff_is_blocking() {
+        // @staticmethod ↔ @classmethod のようなデコレータ変更は呼び出し互換に影響しうるため、
+        // default 引数追加と同時でも compatible_modified に降格しない。
+        let old_src = "@staticmethod\ndef f(a):\n    return a\n";
+        let new_src = "@classmethod\ndef f(a, b=None):\n    return a\n";
+        let old_tree = parse(old_src);
+        let new_tree = parse(new_src);
+        let old_fn =
+            find_python_function_by_name(old_tree.root_node(), old_src.as_bytes(), "f").unwrap();
+        let new_fn =
+            find_python_function_by_name(new_tree.root_node(), new_src.as_bytes(), "f").unwrap();
+        let old_parts = python_function_signature_parts(old_fn, old_src.as_bytes()).unwrap();
+        let new_parts = python_function_signature_parts(new_fn, new_src.as_bytes()).unwrap();
+        assert_ne!(old_parts.decorators, new_parts.decorators);
+    }
+
+    #[test]
+    fn same_decorator_with_added_default_param_is_compatible() {
+        // 同じデコレータ + default 引数追加なら降格対象。
+        let old_src = "@staticmethod\ndef f(a):\n    return a\n";
+        let new_src = "@staticmethod\ndef f(a, b=None):\n    return a\n";
+        let old_tree = parse(old_src);
+        let new_tree = parse(new_src);
+        let old_fn =
+            find_python_function_by_name(old_tree.root_node(), old_src.as_bytes(), "f").unwrap();
+        let new_fn =
+            find_python_function_by_name(new_tree.root_node(), new_src.as_bytes(), "f").unwrap();
+        let old_parts = python_function_signature_parts(old_fn, old_src.as_bytes()).unwrap();
+        let new_parts = python_function_signature_parts(new_fn, new_src.as_bytes()).unwrap();
+        assert_eq!(old_parts.decorators, new_parts.decorators);
+        assert!(python_params_compatible_addition(
+            &old_parts.parts,
+            &new_parts.parts
+        ));
     }
 }
