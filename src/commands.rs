@@ -820,6 +820,7 @@ pub(crate) use review::hook::review_hook_output;
 
 mod api_changes;
 mod dead_code;
+mod dead_code_member_liveness;
 
 #[cfg(test)]
 pub(crate) use api_changes::*;

@@ -11,6 +11,7 @@ use super::api_changes::{
     bare_name, extract_exported_symbols_from_file_inner, extract_symbol_lines,
 };
 use super::common::{MAX_INPUT_SIZE, read_file_to_string_limited, serialize_output};
+use super::dead_code_member_liveness::{JsTsMemberLiveness, MemberStatus};
 use super::git_input::{GitDiffInput, resolve_git_diff};
 
 /// dead-code 検出本体。候補収集 → 名前インデックス構築 → 参照カウント →
@@ -37,7 +38,7 @@ pub(crate) fn detect_dead_symbols_from_files(
         return (Vec::new(), Vec::new());
     }
 
-    let index = build_dead_code_name_index(&candidates);
+    let index = build_dead_code_name_index(&candidates, &canonical_dir);
 
     // production / test 別に refs カウント。test/ 配下のみで参照されるシンボルは
     // dead_symbols ではなく test_only_symbols として分離する (F5)。
@@ -132,6 +133,11 @@ struct DeadCodeNameIndex {
     liveness_aliases: std::collections::HashMap<(String, String), Vec<String>>,
     /// refs 検索対象の正規化済みシンボル名 (重複除去済み、liveness 補助名を含む)。
     unique_names: Vec<String>,
+    /// TS/JS の duplicate な同名 class member について owner 一意推定で
+    /// dead/test_only/live を再判定するためのインデックス。`name_counts > 1` で
+    /// スキップ対象の候補のうち、本インデックスで `Live` / `TestOnly` / `Dead` が
+    /// 返るものは旧スキップを緩和して通常の dead 判定経路に乗せる。
+    member_liveness: JsTsMemberLiveness,
 }
 
 /// 言語別に正規化した bare name を返す。
@@ -144,7 +150,10 @@ fn normalized_bare_name(lang: crate::language::LangId, name: &str) -> String {
 }
 
 /// 候補シンボルから同名カウント / liveness alias / refs 検索対象名のインデックスを構築する。
-fn build_dead_code_name_index(candidates: &DeadCodeCandidates) -> DeadCodeNameIndex {
+fn build_dead_code_name_index(
+    candidates: &DeadCodeCandidates,
+    canonical_dir: &std::path::Path,
+) -> DeadCodeNameIndex {
     // 同名 export が複数ファイル/複数コンテナに存在する場合は保守的にスキップ（誤判定防止）。
     // キーは bare name を言語別に正規化したもの (Xojo では `Foo` と `FOO` を同一視)。
     let mut name_counts: std::collections::HashMap<String, usize> =
@@ -193,10 +202,17 @@ fn build_dead_code_name_index(candidates: &DeadCodeCandidates) -> DeadCodeNameIn
         names
     };
 
+    // TS/JS の duplicate な同名 class member について owner 一意推定で liveness を再判定する。
+    // `name_counts > 1` で従来スキップされていた候補のうち、安全に owner を一意推定できる
+    // ケースだけ通常の dead/test_only/live 判定経路に乗せる。
+    let member_liveness =
+        JsTsMemberLiveness::build(&candidates.all_syms, canonical_dir, is_test_path);
+
     DeadCodeNameIndex {
         name_counts,
         liveness_aliases,
         unique_names,
+        member_liveness,
     }
 }
 
@@ -270,6 +286,32 @@ fn ref_counts_with_liveness(
     (prod_cnt, test_cnt)
 }
 
+/// qualname `Container.member` を owner/bare に分割し、TS/JS class member の
+/// `JsTsMemberLiveness::status_for` を呼び出す。TS/JS 以外、または owner を
+/// 一意特定できない名前 (bare のみ / 多段 qualname) の場合は `None` を返し、
+/// 呼び出し側は従来の保守的スキップを維持する。
+fn member_status_for_candidate(
+    name: &str,
+    file: &str,
+    lang: crate::language::LangId,
+    liveness: &JsTsMemberLiveness,
+) -> Option<MemberStatus> {
+    if !matches!(
+        lang,
+        crate::language::LangId::Typescript
+            | crate::language::LangId::Javascript
+            | crate::language::LangId::Tsx
+    ) {
+        return None;
+    }
+    let (owner, bare) = name.rsplit_once('.')?;
+    if owner.contains('.') {
+        // 多段 qualname は class.member とみなさない。
+        return None;
+    }
+    liveness.status_for(owner, bare, file)
+}
+
 /// 参照カウントと各除外規約から dead / test-only シンボルを分類する。
 fn classify_dead_symbols(
     candidates: &DeadCodeCandidates,
@@ -284,9 +326,38 @@ fn classify_dead_symbols(
     let mut test_only = Vec::new();
     for (name, kind, file, lang) in &candidates.all_syms {
         let key = normalized_bare_name(*lang, name);
-        // 同名シンボルが複数存在する場合は bare name では区別できないためスキップ
+        // 同名シンボルが複数存在する場合は bare name では区別できないためスキップする。
+        // ただし TS/JS の class member については `JsTsMemberLiveness` で owner 一意推定
+        // が成立した場合のみ、duplicate スキップを緩和して通常判定に乗せる。
         if index.name_counts.get(&key).copied().unwrap_or(0) > 1 {
-            continue;
+            match member_status_for_candidate(name, file, *lang, &index.member_liveness) {
+                Some(MemberStatus::Live) => continue,
+                Some(MemberStatus::TestOnly) => {
+                    // Angular template / Android XML から参照されるシンボルは live。
+                    if asset_refs.contains_symbol(name) {
+                        continue;
+                    }
+                    test_only.push(DeadSymbol {
+                        name: name.clone(),
+                        kind: kind.clone(),
+                        file: file.clone(),
+                    });
+                    continue;
+                }
+                Some(MemberStatus::Dead) => {
+                    // Angular template / Android XML から参照されるシンボルは live。
+                    if asset_refs.contains_symbol(name) {
+                        continue;
+                    }
+                    dead.push(DeadSymbol {
+                        name: name.clone(),
+                        kind: kind.clone(),
+                        file: file.clone(),
+                    });
+                    continue;
+                }
+                Some(MemberStatus::Ambiguous) | None => continue,
+            }
         }
 
         let (prod_cnt, test_cnt) = ref_counts_with_liveness(&key, file, index, counts);

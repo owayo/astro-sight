@@ -7937,6 +7937,248 @@ fn dead_code_same_method_name_in_multiple_classes_skipped() {
 }
 
 #[test]
+fn dead_code_ts_same_member_name_owner_aware_unused_side_is_dead() {
+    // GitLab Issue #19 の再現: TS で同名 getter が別クラスにあり、片方だけが使われている場合に
+    // 未使用側の getter が dead として検出されること。
+    // - VoiceLogSettingModel.isOmnis: 参照 0 件 → dead に出るべき
+    // - VoiceLogModel.isOmnis: 別ファイルで使用中 → live (報告されない)
+    // - VoiceLogSettingModel.isOther: 同名 export が他になく従来通り dead
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("setting/models")).unwrap();
+    std::fs::create_dir_all(root.join("log/models")).unwrap();
+    std::fs::create_dir_all(root.join("log/components")).unwrap();
+
+    std::fs::write(
+        root.join("setting/models/setting.model.ts"),
+        "export class VoiceLogSettingModel {\n\
+        \x20   voice_log_type: number = 1;\n\
+        \x20   get isAmi(): boolean { return this.voice_log_type === 1; }\n\
+        \x20   get isOmnis(): boolean { return this.voice_log_type === 2; }\n\
+        \x20   get isOther(): boolean { return this.voice_log_type === 3; }\n\
+        }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("log/models/log.model.ts"),
+        "export class VoiceLogModel {\n\
+        \x20   type: number = 1;\n\
+        \x20   isOmnis(): boolean { return this.type === 2; }\n\
+        }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("log/components/log.parts.component.ts"),
+        "import { VoiceLogModel } from \"../models/log.model\";\n\
+        const voiceLogs: VoiceLogModel[] = [];\n\
+        console.log(voiceLogs[0].isOmnis());\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success(), "dead-code は成功するべき");
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead = json["dead_symbols"].as_array().expect("dead_symbols 配列");
+    let names: Vec<&str> = dead.iter().filter_map(|s| s["name"].as_str()).collect();
+
+    assert!(
+        names.contains(&"VoiceLogSettingModel.isOmnis"),
+        "owner 一意推定 (import only VoiceLogModel) で未使用側の isOmnis が dead に出るべき: {names:?}"
+    );
+    assert!(
+        !names.contains(&"VoiceLogModel.isOmnis"),
+        "別ファイルで使用中の VoiceLogModel.isOmnis は dead に出るべきでない: {names:?}"
+    );
+    assert!(
+        names.contains(&"VoiceLogSettingModel.isOther"),
+        "従来通り duplicate でない isOther は dead に出るべき: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_ts_same_member_name_ambiguous_when_both_owners_imported() {
+    // duplicate owner を両方 import しているファイルで `.member` が使われている場合は
+    // どちらの owner のメソッドへの参照か owner 一意推定できないため、ambiguous として
+    // 旧スキップを維持する (どちらも dead に出さない)。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("models")).unwrap();
+    std::fs::create_dir_all(root.join("app")).unwrap();
+
+    std::fs::write(
+        root.join("models/foo.model.ts"),
+        "export class FooModel {\n    isReady(): boolean { return true; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("models/bar.model.ts"),
+        "export class BarModel {\n    isReady(): boolean { return true; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("app/app.ts"),
+        "import { FooModel } from \"../models/foo.model\";\n\
+        import { BarModel } from \"../models/bar.model\";\n\
+        function pick(x: FooModel | BarModel): boolean { return x.isReady(); }\n\
+        console.log(pick(new FooModel()));\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success(), "dead-code は成功するべき");
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead = json["dead_symbols"].as_array().expect("dead_symbols 配列");
+    let names: Vec<&str> = dead.iter().filter_map(|s| s["name"].as_str()).collect();
+
+    assert!(
+        !names.iter().any(|n| n.ends_with(".isReady")),
+        "両 owner を同ファイルで import している ambiguous ケースでは旧スキップを維持: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_ts_same_member_name_ambiguous_when_no_import() {
+    // duplicate owner のいずれも import していないファイルで `.member` が使われている場合は
+    // owner 推定できないため ambiguous (旧スキップ維持)。
+    // ローカルクラスや any 型経由の呼び出しを safe に保守する。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("models")).unwrap();
+    std::fs::create_dir_all(root.join("util")).unwrap();
+
+    std::fs::write(
+        root.join("models/foo.model.ts"),
+        "export class FooModel {\n    isReady(): boolean { return true; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("models/bar.model.ts"),
+        "export class BarModel {\n    isReady(): boolean { return true; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("util/helper.ts"),
+        "export function checkReady(x: any): boolean {\n    return x.isReady();\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success(), "dead-code は成功するべき");
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead = json["dead_symbols"].as_array().expect("dead_symbols 配列");
+    let names: Vec<&str> = dead.iter().filter_map(|s| s["name"].as_str()).collect();
+
+    assert!(
+        !names.iter().any(|n| n.ends_with(".isReady")),
+        "owner を import していないファイルで .member が出る ambiguous ケースは旧スキップ維持: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_ts_same_member_name_string_literal_marks_ambiguous() {
+    // bare member 名が文字列リテラルとして出現する場合は computed access の可能性があるため
+    // 全 duplicate candidate を ambiguous へ倒し、旧スキップを維持する (safe-by-default)。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("models")).unwrap();
+    std::fs::create_dir_all(root.join("app")).unwrap();
+
+    std::fs::write(
+        root.join("models/foo.model.ts"),
+        "export class FooModel {\n    isReady(): boolean { return true; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("models/bar.model.ts"),
+        "export class BarModel {\n    isReady(): boolean { return true; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("app/app.ts"),
+        "import { FooModel } from \"../models/foo.model\";\n\
+        const key = \"isReady\";\n\
+        const foo = new FooModel();\n\
+        console.log((foo as any)[key]);\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success(), "dead-code は成功するべき");
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead = json["dead_symbols"].as_array().expect("dead_symbols 配列");
+    let names: Vec<&str> = dead.iter().filter_map(|s| s["name"].as_str()).collect();
+
+    assert!(
+        !names.iter().any(|n| n.ends_with(".isReady")),
+        "string literal で member 名が出る場合は ambiguous で旧スキップ維持: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_ts_same_member_name_namespace_import_marks_ambiguous() {
+    // `import * as ns from ...` (namespace import) の場合は ns 経由で任意の owner が
+    // アクセスされうるため owner を一意推定できず ambiguous へ倒す (旧スキップ維持)。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir_all(root.join("models")).unwrap();
+    std::fs::create_dir_all(root.join("app")).unwrap();
+
+    std::fs::write(
+        root.join("models/foo.model.ts"),
+        "export class FooModel {\n    isReady(): boolean { return true; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("models/bar.model.ts"),
+        "export class BarModel {\n    isReady(): boolean { return true; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("app/app.ts"),
+        "import * as foo from \"../models/foo.model\";\n\
+        const inst = new foo.FooModel();\n\
+        console.log(inst.isReady());\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success(), "dead-code は成功するべき");
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead = json["dead_symbols"].as_array().expect("dead_symbols 配列");
+    let names: Vec<&str> = dead.iter().filter_map(|s| s["name"].as_str()).collect();
+
+    assert!(
+        !names.iter().any(|n| n.ends_with(".isReady")),
+        "namespace import (`import * as ...`) は owner 推定不能で ambiguous 維持: {names:?}"
+    );
+}
+
+#[test]
 fn dead_code_excludes_kotlin_override() {
     // Kotlin の `override` メソッドは親 interface / superclass 経由で呼ばれるため
     // cross-file refs では追跡できず、dead-code 判定で偽陽性になる。
