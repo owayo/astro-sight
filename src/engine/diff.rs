@@ -239,6 +239,15 @@ pub(crate) fn parse_hunk_header(line: &str) -> Option<HunkInfo> {
     let (old_start, old_count) = parse_range_spec(old_part)?;
     let (new_start, new_count) = parse_range_spec(new_part)?;
 
+    // unified diff 仕様: count > 0 のとき start は 1-origin で必ず 1 以上。
+    // start = 0 が正当なのは count = 0 (片側完全空) の hunk のみ。
+    // count > 0 && start = 0 の不正ヘッダ (例: `@@ -1,0 +0,1 @@`) は reject し、
+    // 後段の current_new_line 補正 (`current_new_line > 0` ガード) が黙って
+    // 1 行目の `+` 行を取りこぼす false negative を防ぐ。
+    if (old_count > 0 && old_start == 0) || (new_count > 0 && new_start == 0) {
+        return None;
+    }
+
     Some(HunkInfo {
         old_start,
         old_count,
@@ -427,6 +436,22 @@ index 1234567..0000000
         assert_eq!(files.len(), 1, "本体行をヘッダ誤認して別ファイル化しない");
         assert_eq!(files[0].new_path, "src/lib.rs");
         assert_eq!(files[0].hunks.len(), 1);
+    }
+
+    /// unified diff 仕様違反 (`count > 0 && start == 0`) の hunk header は reject する。
+    /// `@@ -1,0 +0,1 @@` のような malformed hunk header を黙って受理すると、
+    /// `extract_changed_new_lines` の `current_new_line > 0` ガードで最初の `+` 行が
+    /// 取りこぼされる false negative を起こす。回帰防止。
+    #[test]
+    fn parse_hunk_header_rejects_zero_start_with_positive_count() {
+        // new_count > 0 で new_start = 0 は仕様違反
+        assert!(parse_hunk_header("@@ -1,0 +0,1 @@").is_none());
+        // old_count > 0 で old_start = 0 も仕様違反
+        assert!(parse_hunk_header("@@ -0,1 +1,0 @@").is_none());
+        // pure-delete (new_count=0, new_start=0) は正当
+        assert!(parse_hunk_header("@@ -1,3 +0,0 @@").is_some());
+        // pure-add (old_count=0, old_start=0) は正当
+        assert!(parse_hunk_header("@@ -0,0 +1,3 @@").is_some());
     }
 
     /// extract_changed_new_lines も hunk 本体の `+++ b/...` 行を追加行として数え、

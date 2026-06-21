@@ -719,6 +719,15 @@ fn should_skip_diff_file(
         && df.new_path != "/dev/null"
     {
         let full = root.join(&df.new_path);
+        // symlink 経由で workspace 外を指すファイルを on-disk read しないよう、
+        // canonicalize して root 配下にあることを fail-closed で確認する。
+        // is_safe_diff_path は文字列レベルの check のみで、`evil.rs ->
+        // /etc/passwd` のような symlink を検出できないため、実ファイルを読む直前に
+        // canonical 境界判定を入れる (canonicalize 失敗時も skip 側へ倒す)。
+        match std::fs::canonicalize(&full) {
+            Ok(canonical) if canonical.starts_with(root) => {}
+            _ => return true,
+        }
         if crate::engine::generated::is_auto_generated(&full) {
             return true;
         }

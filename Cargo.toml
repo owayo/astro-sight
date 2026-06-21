@@ -1,6 +1,6 @@
 [package]
 name = "astro-sight"
-version = "26.6.111"
+version = "26.6.112"
 edition = "2024"
 authors = ["owayo <yoheiowa@gmail.com>"]
 description = "AI-agent-friendly AST information generation CLI"
@@ -19,14 +19,14 @@ aho-corasick = "1.1.4"
 hashbrown = "0.17.1"
 ignore = "0.4.26"
 lru = "0.18.0"
-memchr = "2.8.1"
+memchr = "2.8.2"
 memmap2 = "0.9.10"
 mimalloc = "0.1.52"
 rayon = "1.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 serde_yaml = "0.9.34"
-smallvec = "1.15.1"
+smallvec = "1.15.2"
 streaming-iterator = "0.1.9"
 tree-sitter = "0.26.9"
 tree-sitter-language = "0.1.7"
@@ -53,7 +53,7 @@ logroller = "0.1.10"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
 tracing-appender = "0.2.5"
-time = { version = "0.3.47", features = ["formatting", "macros", "local-offset"] }
+time = { version = "0.3.49", features = ["formatting", "macros", "local-offset"] }
 tree-sitter-zig = "1.1.2"
 # tree-sitter-xojo は OOM の根因のため v26.6 で削除した。
 # Xojo は src/engine/lexer の手書き state machine で解析する (PR3 以降)。

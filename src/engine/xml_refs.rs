@@ -47,7 +47,31 @@ pub fn collect_xml_symbol_references(dir: &Path) -> HashSet<String> {
 }
 
 /// `dir` 配下に `AndroidManifest.xml` が存在するかを判定する。
+///
+/// 非 Android リポ (Rust モノレポ等) で dead-code 実行のたびに全 dir walk するのを
+/// 避けるため、(a) 標準パスを cheap test、(b) gradle ファイル不在で early-return、
+/// (c) どうしても見つからないマルチモジュール構成のみ walk fallback の順で判定する。
 fn has_android_manifest(dir: &Path) -> bool {
+    const STD_MANIFEST_PATHS: &[&str] = &[
+        "AndroidManifest.xml",
+        "app/src/main/AndroidManifest.xml",
+        "app/AndroidManifest.xml",
+        "src/main/AndroidManifest.xml",
+    ];
+    for cand in STD_MANIFEST_PATHS {
+        if dir.join(cand).is_file() {
+            return true;
+        }
+    }
+    // Android プロジェクトには必ず gradle ファイルがある (build.gradle{,.kts}/settings.gradle)。
+    // どれも無ければ非 Android と判定し、3 万ファイル規模の dir walk を完全に skip する。
+    let has_gradle = dir.join("build.gradle").is_file()
+        || dir.join("build.gradle.kts").is_file()
+        || dir.join("settings.gradle").is_file()
+        || dir.join("settings.gradle.kts").is_file();
+    if !has_gradle {
+        return false;
+    }
     let walker = ignore::WalkBuilder::new(dir).hidden(false).build();
     for entry in walker.flatten() {
         let path = entry.path();
@@ -308,6 +332,40 @@ mod tests {
     fn has_android_manifest_returns_false_without_file() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!has_android_manifest(dir.path()));
+    }
+
+    /// 標準 Android パス (app/src/main/AndroidManifest.xml 等) を cheap test で検出する。
+    #[test]
+    fn has_android_manifest_detects_standard_app_main_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_main = dir.path().join("app/src/main");
+        std::fs::create_dir_all(&app_main).unwrap();
+        std::fs::write(app_main.join("AndroidManifest.xml"), "<manifest/>").unwrap();
+        assert!(has_android_manifest(dir.path()));
+    }
+
+    /// gradle ファイルが無いリポジトリは Android プロジェクトでないと判定し、
+    /// dir walk を skip する (3 万ファイル規模リポでの無駄な walk を防ぐ)。
+    #[test]
+    fn has_android_manifest_returns_false_without_gradle_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        // 深い場所にだけ Manifest を置く: gradle が無いので fallback walk が skip される
+        let nested = dir.path().join("deep/inner");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("AndroidManifest.xml"), "<manifest/>").unwrap();
+        // 標準パスにも無く gradle も無いので false (early-return)
+        assert!(!has_android_manifest(dir.path()));
+    }
+
+    /// gradle がある場合は fallback walk が走り、非標準パスの Manifest も検出する。
+    #[test]
+    fn has_android_manifest_falls_back_to_walk_when_gradle_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("build.gradle"), "").unwrap();
+        let nested = dir.path().join("custom-module/src");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("AndroidManifest.xml"), "<manifest/>").unwrap();
+        assert!(has_android_manifest(dir.path()));
     }
 
     #[test]

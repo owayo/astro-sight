@@ -66,9 +66,18 @@ pub fn collect_angular_template_refs(dir: &Path) -> HashSet<String> {
 /// `dir` が Angular プロジェクトとみなせるかを判定する。
 ///
 /// - `angular.json` または `.angular-cli.json` が存在
-/// - もしくは `.component.ts` で終わるファイルが 1 件以上存在
+/// - もしくは `package.json` に `@angular/core` 依存がある (cheap fast-path)
+/// - もしくは `.component.ts` で終わるファイルが 1 件以上存在 (fallback)
+///
+/// fast-path で先に決着が付くケースは大規模 dir walk を skip できる。
 fn is_angular_project(dir: &Path) -> bool {
     if dir.join("angular.json").is_file() || dir.join(".angular-cli.json").is_file() {
+        return true;
+    }
+    // package.json の `@angular/core` 依存だけで判定できれば dir walk を skip する。
+    if let Ok(pkg_json) = std::fs::read_to_string(dir.join("package.json"))
+        && pkg_json.contains("@angular/core")
+    {
         return true;
     }
     let walker = ignore::WalkBuilder::new(dir).hidden(false).build();
@@ -1299,6 +1308,34 @@ export class SampleComponent {}
     fn is_angular_project_returns_false_without_markers() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.ts"), "export const x = 1;").unwrap();
+        assert!(!is_angular_project(dir.path()));
+    }
+
+    /// package.json の `@angular/core` 依存だけで Angular プロジェクトと判定し、
+    /// .component.ts を探す dir walk を skip する (cheap fast-path)。
+    #[test]
+    fn is_angular_project_detects_via_package_json_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"@angular/core":"^18.0.0"}}"#,
+        )
+        .unwrap();
+        assert!(is_angular_project(dir.path()));
+    }
+
+    /// `@angular/core` を含まない package.json があるリポジトリでは fast-path を素通りし、
+    /// `.component.ts` の有無で判定する (fallback)。
+    #[test]
+    fn is_angular_project_package_json_without_angular_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"react":"^18.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("Foo.tsx"), "export const Foo = () => 1;").unwrap();
+        // .component.ts も無いので false (fallback walk が空)
         assert!(!is_angular_project(dir.path()));
     }
 

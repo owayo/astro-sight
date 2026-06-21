@@ -6106,6 +6106,53 @@ fn detect_api_changes_skips_auto_generated_marker_files() {
     );
 }
 
+/// symlink で workspace 外を指す追加ファイルは API 変更検出の対象外。
+///
+/// 再現シナリオ:
+/// - 攻撃者が PR に `evil.rs -> /etc/passwd` のような外部ファイルへの symlink を追加
+/// - `is_safe_diff_path` は文字列 check (絶対パス / `..` 拒否) のみで symlink を検出できない
+/// - `parser::read_file` は `File::open` でデフォルト follow し、外部ファイルの識別子が
+///   `api_changes.added` の `name` / `signature` に流れ込みリークする
+///
+/// 修正: `should_skip_diff_file` で canonicalize して root 配下かを fail-closed 判定する。
+#[test]
+#[cfg(unix)]
+fn detect_api_changes_skips_symlink_escape_to_outside_workspace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(repo, &[("existing.rs", "pub fn dummy() {}\n")], "initial");
+
+    // workspace 外にシンボリックリンク先のファイルを置く
+    let outside_dir = tempfile::tempdir().expect("outside tempdir");
+    let outside_file = outside_dir.path().join("secret.rs");
+    fs::write(&outside_file, "pub fn SECRET_FROM_OUTSIDE_WORKSPACE() {}\n").expect("write secret");
+
+    // workspace 内に symlink を作成 (.rs 拡張子で言語判定を通す)
+    let evil_link = repo.join("evil.rs");
+    std::os::unix::fs::symlink(&outside_file, &evil_link).expect("symlink");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "/dev/null".to_string(),
+        new_path: "evil.rs".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: 1,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    let added: Vec<&str> = api_changes.added.iter().map(|s| s.name.as_str()).collect();
+
+    assert!(
+        !added.contains(&"SECRET_FROM_OUTSIDE_WORKSPACE"),
+        "symlink 越しの workspace 外シンボルは抽出されてはならない。got: {added:?}"
+    );
+}
+
 /// Angular component の public method が `templateUrl` で紐づく
 /// `.component.html` から参照されている場合、dead 判定から除外される。
 ///
