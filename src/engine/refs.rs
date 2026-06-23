@@ -305,9 +305,12 @@ fn find_refs_in_file(symbol_name: &str, path: &camino::Utf8Path) -> Result<Vec<S
     let mut refs = Vec::new();
     let definition_kinds = definition_node_kinds(lang_id);
     let target = normalize_identifier(lang_id, symbol_name);
+    // 同一 source 内で複数 hit する関数 (例: util / to_string) でも line context 取得を O(1) に。
+    let line_index = LineIndex::new(&source);
     collect_identifier_refs(
         root,
         &source,
+        &line_index,
         target.as_ref(),
         path.as_str(),
         definition_kinds,
@@ -353,6 +356,8 @@ fn find_refs_via_lexer(
         .map(|(_, v)| v)
         .unwrap_or_default();
 
+    // 同一 source 内で M 件の line context を取り出すため、改行 index を 1 度だけ構築する。
+    let line_index = LineIndex::new(source);
     // lexer 経路は 0-indexed line で統一済み (tree-sitter::Point と同じ)。
     matches
         .into_iter()
@@ -362,7 +367,11 @@ fn find_refs_via_lexer(
                 path: path.as_str().to_string(),
                 line: m.line,
                 column: m.column,
-                context: Some(extract_line_context_bytes(source, m.line)),
+                context: Some(extract_line_context_bytes_indexed(
+                    source,
+                    &line_index,
+                    m.line,
+                )),
                 kind: Some(if is_def {
                     RefKind::Definition
                 } else {
@@ -446,6 +455,8 @@ fn find_refs_batch_via_lexer(
             .insert(sym.range.start.line);
     }
 
+    // 同一 source 内で M 件の line context を取り出すため、改行 index を 1 度だけ構築する。
+    let line_index = LineIndex::new(source);
     let bucket = lexer::find_identifier_refs(source, &active_names, lexer_lang);
     for (i, (name, matches)) in active_indices.iter().zip(bucket).enumerate() {
         let normalized = normalize(&active_names[i]);
@@ -457,7 +468,11 @@ fn find_refs_batch_via_lexer(
                 path: path_str.clone(),
                 line: m.line,
                 column: m.column,
-                context: Some(extract_line_context_bytes(source, m.line)),
+                context: Some(extract_line_context_bytes_indexed(
+                    source,
+                    &line_index,
+                    m.line,
+                )),
                 kind: Some(if is_def {
                     RefKind::Definition
                 } else {
@@ -472,43 +487,85 @@ fn find_refs_batch_via_lexer(
 }
 
 /// 指定行 (0-indexed) のコンテキスト行を取得する。lexer fallback 経路用の
-/// 軽量実装 (tree-sitter の Node API に依存しない)。
+/// 軽量実装 (tree-sitter の Node API に依存しない)。1 ファイル内で複数行参照する
+/// 場合は `extract_line_context_bytes_indexed` を使い `LineIndex` を共有する。
+/// 本体経路は indexed 版を直接呼ぶため、この単発 wrapper はテスト専用。
+#[cfg(test)]
 fn extract_line_context_bytes(source: &[u8], line_0idx: usize) -> String {
+    extract_line_context_bytes_indexed(source, &LineIndex::new(source), line_0idx)
+}
+
+/// `LineIndex` を共有して指定行を O(1) で取り出す lexer 経路向け実装。
+/// 1 ファイル内で M 件の参照を処理する場合、O(M × filesize) → O(M + filesize) に削減する。
+fn extract_line_context_bytes_indexed(
+    source: &[u8],
+    index: &LineIndex,
+    line_0idx: usize,
+) -> String {
     // minified/生成コードの巨大行によるメモリ・出力爆発を防ぐため 256B で切り詰める
     // (tree-sitter 経路の extract_line_context と同じ上限)。
     const MAX_CTX: usize = 256;
-    let truncate = |bytes: &[u8]| -> String {
-        let line = std::str::from_utf8(bytes)
-            .unwrap_or("")
-            .trim_end_matches('\r');
-        if line.len() <= MAX_CTX {
-            line.to_string()
-        } else {
-            format!("{}...", &line[..line.floor_char_boundary(MAX_CTX)])
-        }
+    let Some((start, end)) = index.line_bounds(source.len(), line_0idx) else {
+        return String::new();
     };
-    let mut current = 0usize;
-    let mut start = 0usize;
-    for (i, b) in source.iter().enumerate() {
-        if *b == b'\n' {
-            if current == line_0idx {
-                return truncate(&source[start..i]);
-            }
-            current += 1;
-            start = i + 1;
+    let line = std::str::from_utf8(&source[start..end])
+        .unwrap_or("")
+        .trim_end_matches('\r');
+    if line.len() <= MAX_CTX {
+        line.to_string()
+    } else {
+        format!("{}...", &line[..line.floor_char_boundary(MAX_CTX)])
+    }
+}
+
+/// 1 ファイルの改行位置 (0-indexed 行頭 byte offset) をキャッシュする索引。
+/// `extract_line_context*` を O(filesize) の per-call 走査から O(1) の lookup に
+/// 切り替えるため、ファイル単位で 1 度だけ構築して visitor 群に貸し出す。
+pub(crate) struct LineIndex {
+    /// `line_starts[i]` は 0-indexed の i 行目の先頭 byte offset。終端番兵は持たない。
+    line_starts: Vec<u32>,
+}
+
+impl LineIndex {
+    pub(crate) fn new(source: &[u8]) -> Self {
+        // 1 行平均 ~32B 想定で初期 capacity を見積もる
+        let mut line_starts = Vec::with_capacity(source.len() / 32 + 1);
+        line_starts.push(0u32);
+        // 100MB のファイルサイズ上限 (parser::MAX_FILE_SIZE) ≪ u32::MAX のため u32 で十分。
+        for nl in memchr::memchr_iter(b'\n', source) {
+            // 改行直後の byte offset が次行先頭
+            line_starts.push((nl + 1) as u32);
         }
+        Self { line_starts }
     }
-    if current == line_0idx {
-        return truncate(&source[start..]);
+
+    /// 指定行の本体 byte 範囲 `[start, end)` を返す。末尾の `\n` は含めない。
+    /// 行が存在しない場合は `None`。
+    pub(crate) fn line_bounds(&self, source_len: usize, row: usize) -> Option<(usize, usize)> {
+        let start = *self.line_starts.get(row)? as usize;
+        if start > source_len {
+            return None;
+        }
+        // 次の行頭から `\n` 1 バイトを差し引いた位置が現行の末尾。
+        // 最終行 (番兵なし) は source 末尾まで。
+        let end = self
+            .line_starts
+            .get(row + 1)
+            .map(|&n| (n as usize).saturating_sub(1).min(source_len))
+            .unwrap_or(source_len);
+        Some((start, end))
     }
-    String::new()
 }
 
 /// AST を再帰走査し、指定シンボル名に一致する identifier ノードを収集する。
 /// `symbol_name` は言語に応じて正規化済みであることが前提。
+/// `line_index` はファイル単位で 1 度だけ構築し、参照件数 M に対して O(M × filesize)
+/// だった `extract_line_context` 累積コストを O(M + filesize) に抑える。
+#[allow(clippy::too_many_arguments)]
 fn collect_identifier_refs(
     node: Node<'_>,
     source: &[u8],
+    line_index: &LineIndex,
     symbol_name: &str,
     path: &str,
     definition_kinds: &[&str],
@@ -521,7 +578,7 @@ fn collect_identifier_refs(
         && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
     {
         let is_def = is_definition_context(node, definition_kinds, lang_id);
-        let context = extract_line_context(source, node.start_position().row);
+        let context = extract_line_context_indexed(source, line_index, node.start_position().row);
 
         refs.push(SymbolReference {
             path: path.to_string(),
@@ -544,7 +601,7 @@ fn collect_identifier_refs(
                 path: path.to_string(),
                 line: row,
                 column: col,
-                context: Some(extract_line_context(source, row)),
+                context: Some(extract_line_context_indexed(source, line_index, row)),
                 kind: Some(RefKind::Reference),
                 confidence: None,
             });
@@ -558,7 +615,7 @@ fn collect_identifier_refs(
                 path: path.to_string(),
                 line: row,
                 column: col,
-                context: Some(extract_line_context(source, row)),
+                context: Some(extract_line_context_indexed(source, line_index, row)),
                 kind: Some(RefKind::Reference),
                 confidence: None,
             });
@@ -573,7 +630,7 @@ fn collect_identifier_refs(
                 path: path.to_string(),
                 line: row,
                 column: col,
-                context: Some(extract_line_context(source, row)),
+                context: Some(extract_line_context_indexed(source, line_index, row)),
                 kind: Some(RefKind::Reference),
                 confidence: None,
             });
@@ -588,7 +645,7 @@ fn collect_identifier_refs(
             path: path.to_string(),
             line: row,
             column: col,
-            context: Some(extract_line_context(source, row)),
+            context: Some(extract_line_context_indexed(source, line_index, row)),
             kind: Some(RefKind::Reference),
             confidence: None,
         });
@@ -602,7 +659,7 @@ fn collect_identifier_refs(
             path: path.to_string(),
             line: row,
             column: col,
-            context: Some(extract_line_context(source, row)),
+            context: Some(extract_line_context_indexed(source, line_index, row)),
             kind: Some(RefKind::Reference),
             confidence: None,
         });
@@ -614,6 +671,7 @@ fn collect_identifier_refs(
         collect_identifier_refs(
             child,
             source,
+            line_index,
             symbol_name,
             path,
             definition_kinds,
@@ -1567,25 +1625,24 @@ fn is_class_class_expr(node: Node<'_>, source: &[u8]) -> bool {
 }
 
 /// 指定行のソース行をコンテキストとして抽出する。
-/// minified/生成コードの巨大行によるメモリ爆発を防ぐため 256B で切り詰める。
-/// `memchr` で該当行の範囲のみ走査し、ソース全体の UTF-8 検証は行わない。
-/// これにより 1 ファイル内で N 識別子を処理するとき O(N × filesize) → O(N × row + filesize) に削減する。
+/// 後方互換のため `LineIndex` を内部で作る単発呼び出し用。1 ファイル内で複数行を
+/// 取り出す場合は `extract_line_context_indexed` を使い `LineIndex` を共有する。
+/// 本体経路は indexed 版を直接呼ぶため、この単発 wrapper はテスト専用。
+#[cfg(test)]
 fn extract_line_context(source: &[u8], row: usize) -> String {
-    const MAX_CTX: usize = 256;
-    // row 行目の開始位置を memchr で高速に特定する
-    let mut line_start = 0usize;
-    for _ in 0..row {
-        match memchr::memchr(b'\n', &source[line_start..]) {
-            Some(nl) => line_start += nl + 1,
-            None => return String::new(),
-        }
-    }
-    let line_end = memchr::memchr(b'\n', &source[line_start..])
-        .map(|n| line_start + n)
-        .unwrap_or(source.len());
+    extract_line_context_indexed(source, &LineIndex::new(source), row)
+}
 
+/// `LineIndex` を共有して指定行を O(1) で取り出す tree-sitter 経路向け実装。
+/// minified/生成コードの巨大行によるメモリ爆発を防ぐため 256B で切り詰める。
+/// 1 ファイル内で M 件の参照を処理する場合、O(M × filesize) → O(M + filesize) に削減する。
+fn extract_line_context_indexed(source: &[u8], index: &LineIndex, row: usize) -> String {
+    const MAX_CTX: usize = 256;
+    let Some((start, end)) = index.line_bounds(source.len(), row) else {
+        return String::new();
+    };
     // 必要な範囲のみ UTF-8 変換する（失敗時は空コンテキストを返す）
-    let line = std::str::from_utf8(&source[line_start..line_end])
+    let line = std::str::from_utf8(&source[start..end])
         .unwrap_or("")
         .trim();
     if line.len() <= MAX_CTX {
@@ -1840,9 +1897,12 @@ pub(crate) fn visit_refs_and_defs_in_file_cb<V: RefVisitor>(
 
     let name_to_ix = build_name_to_ix(lang_id, symbol_names, &present_indices);
 
+    // 同一 source 内で複数 hit する識別子でも line context 取得を O(1) に。
+    let line_index = LineIndex::new(&source);
     collect_refs_and_defs_indexed_cb(
         root,
         &source,
+        &line_index,
         &name_to_ix,
         definition_kinds,
         lang_id,
@@ -1871,9 +1931,12 @@ pub(crate) trait RefVisitor {
 
 /// `visit_refs_and_defs_in_file_cb` 用の AST 再帰走査。Identifier と Rust attribute 文字列
 /// 参照を発見したら `visitor.on_ref` を直接呼び、`Vec<SymbolReference>` を一切生成しない。
+/// `line_index` はファイル単位で 1 度だけ構築し、参照件数 M に対して O(M × filesize)
+/// だった line context 取得を O(M + filesize) に抑える。
 fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
     node: Node<'_>,
     source: &[u8],
+    line_index: &LineIndex,
     name_to_ix: &std::collections::HashMap<std::borrow::Cow<'_, str>, Vec<usize>>,
     definition_kinds: &[&str],
     lang_id: LangId,
@@ -1885,7 +1948,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
         && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
     {
         let is_def = is_definition_context(node, definition_kinds, lang_id);
-        let context = extract_line_context(source, node.start_position().row);
+        let context = extract_line_context_indexed(source, line_index, node.start_position().row);
         let line = node.start_position().row;
         let column = node.start_position().column;
         // Phase 3 で PHP method ref を receiver-aware に分類する。
@@ -1898,7 +1961,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
 
     for (seg, row, col) in rust_attr_string_ref_segments(node, source, lang_id) {
         if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, seg)) {
-            let context = extract_line_context(source, row);
+            let context = extract_line_context_indexed(source, line_index, row);
             for &ix in indices {
                 visitor.on_ref(
                     ix as u32,
@@ -1915,7 +1978,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
     // bash の `trap '<handler>' SIG` 内の handler 文字列から関数参照を抽出する。
     for (seg, row, col) in bash_trap_handler_ref_segments(node, source, lang_id) {
         if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, &seg)) {
-            let context = extract_line_context(source, row);
+            let context = extract_line_context_indexed(source, line_index, row);
             for &ix in indices {
                 visitor.on_ref(
                     ix as u32,
@@ -1932,7 +1995,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
     // PHPUnit の DocBlock / attribute 経由で参照される method を ref として扱う。
     for (seg, row, col) in phpunit_metadata_ref_segments(node, source, lang_id) {
         if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, &seg)) {
-            let context = extract_line_context(source, row);
+            let context = extract_line_context_indexed(source, line_index, row);
             for &ix in indices {
                 visitor.on_ref(
                     ix as u32,
@@ -1952,7 +2015,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
     if let Some((method, row, col)) = php_callable_array_method_segment(node, source, lang_id)
         && let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, method))
     {
-        let context = extract_line_context(source, row);
+        let context = extract_line_context_indexed(source, line_index, row);
         for &ix in indices {
             visitor.on_ref(
                 ix as u32,
@@ -1969,7 +2032,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
     if let Some((method, row, col)) = php_string_callable_method_segment(node, source, lang_id)
         && let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, method))
     {
-        let context = extract_line_context(source, row);
+        let context = extract_line_context_indexed(source, line_index, row);
         for &ix in indices {
             visitor.on_ref(
                 ix as u32,
@@ -1987,6 +2050,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
         collect_refs_and_defs_indexed_cb(
             child,
             source,
+            line_index,
             name_to_ix,
             definition_kinds,
             lang_id,
@@ -2204,10 +2268,13 @@ pub(crate) fn find_refs_batch_in_file_indexed(
     // 関数/メソッド/クラス系の case-insensitive 参照に備え folded キーも登録する)。
     let name_to_ix = build_name_to_ix(lang_id, symbol_names, &present_indices);
 
+    // 同一 source 内で複数 hit する識別子でも line context 取得を O(1) に。
+    let line_index = LineIndex::new(&source);
     let mut result = vec![Vec::new(); num];
     collect_identifier_refs_indexed(
         root,
         &source,
+        &line_index,
         &name_to_ix,
         path.as_str(),
         definition_kinds,
@@ -2221,9 +2288,13 @@ pub(crate) fn find_refs_batch_in_file_indexed(
 /// AST を再帰走査し、シンボル index ベースの Vec に参照を格納する。
 /// CI 言語（Xojo）で正規化後キーが衝突する場合でも全 index に参照を配るため、
 /// 値は `Vec<usize>` を受け取る。
+/// `line_index` はファイル単位で 1 度だけ構築し、参照件数 M に対して O(M × filesize)
+/// だった line context 取得を O(M + filesize) に抑える。
+#[allow(clippy::too_many_arguments)]
 fn collect_identifier_refs_indexed(
     node: Node<'_>,
     source: &[u8],
+    line_index: &LineIndex,
     name_to_ix: &std::collections::HashMap<std::borrow::Cow<'_, str>, Vec<usize>>,
     path: &str,
     definition_kinds: &[&str],
@@ -2236,7 +2307,7 @@ fn collect_identifier_refs_indexed(
         && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
     {
         let is_def = is_definition_context(node, definition_kinds, lang_id);
-        let context = extract_line_context(source, node.start_position().row);
+        let context = extract_line_context_indexed(source, line_index, node.start_position().row);
         let line = node.start_position().row;
         let column = node.start_position().column;
         let kind = if is_def {
@@ -2260,7 +2331,7 @@ fn collect_identifier_refs_indexed(
     // Rust の serde 属性文字列値を識別子参照として扱う。
     for (seg, row, col) in rust_attr_string_ref_segments(node, source, lang_id) {
         if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, seg)) {
-            let context = extract_line_context(source, row);
+            let context = extract_line_context_indexed(source, line_index, row);
             for &ix in indices {
                 refs[ix].push(SymbolReference {
                     path: path.to_string(),
@@ -2277,7 +2348,7 @@ fn collect_identifier_refs_indexed(
     // bash の `trap '<handler>' SIG` 内の handler 文字列から関数参照を抽出する。
     for (seg, row, col) in bash_trap_handler_ref_segments(node, source, lang_id) {
         if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, &seg)) {
-            let context = extract_line_context(source, row);
+            let context = extract_line_context_indexed(source, line_index, row);
             for &ix in indices {
                 refs[ix].push(SymbolReference {
                     path: path.to_string(),
@@ -2294,7 +2365,7 @@ fn collect_identifier_refs_indexed(
     // PHPUnit の DocBlock / attribute 経由で参照される method を ref として扱う。
     for (seg, row, col) in phpunit_metadata_ref_segments(node, source, lang_id) {
         if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, &seg)) {
-            let context = extract_line_context(source, row);
+            let context = extract_line_context_indexed(source, line_index, row);
             for &ix in indices {
                 refs[ix].push(SymbolReference {
                     path: path.to_string(),
@@ -2312,7 +2383,7 @@ fn collect_identifier_refs_indexed(
     if let Some((method, row, col)) = php_callable_array_method_segment(node, source, lang_id)
         && let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, method))
     {
-        let context = extract_line_context(source, row);
+        let context = extract_line_context_indexed(source, line_index, row);
         for &ix in indices {
             refs[ix].push(SymbolReference {
                 path: path.to_string(),
@@ -2329,7 +2400,7 @@ fn collect_identifier_refs_indexed(
     if let Some((method, row, col)) = php_string_callable_method_segment(node, source, lang_id)
         && let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, method))
     {
-        let context = extract_line_context(source, row);
+        let context = extract_line_context_indexed(source, line_index, row);
         for &ix in indices {
             refs[ix].push(SymbolReference {
                 path: path.to_string(),
@@ -2347,6 +2418,7 @@ fn collect_identifier_refs_indexed(
         collect_identifier_refs_indexed(
             child,
             source,
+            line_index,
             name_to_ix,
             path,
             definition_kinds,
@@ -2997,9 +3069,11 @@ struct Bar {
         let tree = parse_rust(source);
         let defs = definition_node_kinds(LangId::Rust);
         let mut refs = Vec::new();
+        let line_index = LineIndex::new(source.as_bytes());
         collect_identifier_refs(
             tree.root_node(),
             source.as_bytes(),
+            &line_index,
             "serialize_jst",
             "test.rs",
             defs,
@@ -3063,9 +3137,11 @@ struct Bar {
         let tree = parse_rust(source);
         let defs = definition_node_kinds(LangId::Rust);
         let mut refs = Vec::new();
+        let line_index = LineIndex::new(source.as_bytes());
         collect_identifier_refs(
             tree.root_node(),
             source.as_bytes(),
+            &line_index,
             "is_none",
             "test.rs",
             defs,
@@ -3092,9 +3168,11 @@ struct Bar {
         let tree = parse_rust(source);
         let defs = definition_node_kinds(LangId::Rust);
         let mut refs = Vec::new();
+        let line_index = LineIndex::new(source.as_bytes());
         collect_identifier_refs(
             tree.root_node(),
             source.as_bytes(),
+            &line_index,
             "created_at",
             "test.rs",
             defs,
