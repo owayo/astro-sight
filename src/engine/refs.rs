@@ -3009,6 +3009,77 @@ fn caller(s: &S) {
         assert!(std::str::from_utf8(ctx.as_bytes()).is_ok());
     }
 
+    /// `LineIndex::new` が空ソースでも line 0 を空文字として扱えることを検証。
+    #[test]
+    fn line_index_handles_empty_source() {
+        let source: &[u8] = b"";
+        let index = LineIndex::new(source);
+        // 空ソースは line_starts = [0] のみで、line 0 の bounds は (0, 0)。
+        assert_eq!(index.line_bounds(0, 0), Some((0, 0)));
+        // 範囲外行 (>=1) は None。
+        assert_eq!(index.line_bounds(0, 1), None);
+    }
+
+    /// `LineIndex` が末尾改行のあるソースで最終空行を追加で含むことを検証。
+    /// `b"a\n"` は通常 1 行扱い (line 0 = "a") + line 1 = "" の空末尾行。
+    #[test]
+    fn line_index_trailing_newline_creates_empty_last_line() {
+        let source: &[u8] = b"a\n";
+        let index = LineIndex::new(source);
+        // line 0: "a"
+        let (s0, e0) = index.line_bounds(source.len(), 0).unwrap();
+        assert_eq!(&source[s0..e0], b"a");
+        // line 1: 末尾改行直後の空行 (start = 2, end = source.len() = 2)
+        let (s1, e1) = index.line_bounds(source.len(), 1).unwrap();
+        assert_eq!(s1, 2);
+        assert_eq!(e1, 2);
+        // line 2: 範囲外
+        assert_eq!(index.line_bounds(source.len(), 2), None);
+    }
+
+    /// `LineIndex` で連続改行による空行が正しく検出されることを検証。
+    /// `b"a\n\nb"` → line 0 "a", line 1 "", line 2 "b"。
+    #[test]
+    fn line_index_handles_blank_lines() {
+        let source: &[u8] = b"a\n\nb";
+        let index = LineIndex::new(source);
+        let (s0, e0) = index.line_bounds(source.len(), 0).unwrap();
+        assert_eq!(&source[s0..e0], b"a");
+        // line 1 は空行 (start = 2, end = 2)
+        let (s1, e1) = index.line_bounds(source.len(), 1).unwrap();
+        assert_eq!(s1, 2);
+        assert_eq!(e1, 2);
+        // line 2: 改行なしで終わる最終行
+        let (s2, e2) = index.line_bounds(source.len(), 2).unwrap();
+        assert_eq!(&source[s2..e2], b"b");
+        assert_eq!(index.line_bounds(source.len(), 3), None);
+    }
+
+    /// `LineIndex` が改行なしの単一行を最終行として扱えることを検証。
+    #[test]
+    fn line_index_no_trailing_newline_last_line() {
+        let source: &[u8] = b"only";
+        let index = LineIndex::new(source);
+        let (start, end) = index.line_bounds(source.len(), 0).unwrap();
+        assert_eq!(&source[start..end], b"only");
+        assert_eq!(index.line_bounds(source.len(), 1), None);
+    }
+
+    /// `extract_line_context_indexed` が単発 `extract_line_context` と同じ結果を返すことを
+    /// 検証 (LineIndex 経由でも従来挙動が維持される)。
+    #[test]
+    fn extract_line_context_indexed_matches_legacy_path() {
+        let source = b"alpha\n  beta  \ngamma";
+        let index = LineIndex::new(source);
+        for row in 0..4 {
+            assert_eq!(
+                extract_line_context_indexed(source, &index, row),
+                extract_line_context(source, row),
+                "row={row}"
+            );
+        }
+    }
+
     /// Rust の定義ノード種別に function_item と struct_item が含まれることを検証
     #[test]
     fn definition_node_kinds_rust() {
