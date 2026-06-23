@@ -70,9 +70,10 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - diff / PR 全体のレビュー依頼では、個別コマンドを積み上げる前に `astro-sight review --dir . --git` で全体像を確認する
 - diff 全体の一括レビューでは `astro-sight review --dir . --git` も併用し、影響・共変更・API 差分・死蔵シンボルをまとめて確認する
 - 公開 API や export を触った変更では `astro-sight dead-code --dir . --git` も併用して死蔵シンボルを確認する
-- 複数の `astro-sight` クエリを連続で投げる場合は `session` を優先し、プロセス起動コストを抑える
+- 構造確認が 2 手以上続くと分かっている場合（`symbols` → `imports` / `calls` / `sequence` 等）は最初から `session` にまとめ、プロセス起動コストと手順漏れを抑える
+- `symbols` の 1 行情報だけで判断できない構文境界・parse エラー・巨大行の扱いは、Read/Grep ではなく `astro-sight ast --path <file> --line <n> --col <n>` で exact node を確認する
+- 関連ファイルの変更漏れ確認は `review --dir . --git` の `missing_cochanges` または `cochange --dir . --paths <file>` を先に使い、ファイル名の勘だけで判断しない
 - 繰り返しの構造ルール確認には `astro-sight lint --path <file> --rules <rules.yaml>` を使い、アドホックなテキスト検索で代用しない
-- `symbols` の後に import / caller / call flow まで見る場合は、`imports` / `calls` / `sequence` を続けるか、mixed query を `session` にまとめる
 - 並列集約や大規模リポジトリ向けの変更では `/usr/bin/time -l` でピーク RSS を測定し、`par_iter().collect()` で不要な中間 Vec を全展開していないか確認する
 - コードコメントは必要な箇所にだけ付け、付ける場合は日本語で簡潔に記述する
 

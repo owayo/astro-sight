@@ -4681,6 +4681,112 @@ fn session_multiple_commands() {
     }
 }
 
+#[test]
+fn session_mixed_structural_queries_preserve_order() {
+    let input = r#"{"command":"symbols","path":"src/main.rs"}
+{"command":"calls","path":"src/main.rs","function":"main"}
+{"command":"sequence","path":"src/main.rs","function":"main"}
+"#;
+    let output = cargo_bin()
+        .arg("session")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            child.wait_with_output()
+        })
+        .expect("failed to run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 3, "3コマンド → 3行の NDJSON 出力");
+
+    let symbols: serde_json::Value =
+        serde_json::from_str(lines[0]).expect("symbols response should be JSON");
+    assert!(
+        symbols["symbols"]
+            .as_array()
+            .expect("symbols should be an array")
+            .iter()
+            .any(|s| s["name"] == "main"),
+        "先頭行は src/main.rs の symbols 応答であるべき"
+    );
+
+    let calls: serde_json::Value =
+        serde_json::from_str(lines[1]).expect("calls response should be JSON");
+    assert_eq!(calls["lang"], "rust");
+    assert!(
+        calls["calls"]
+            .as_array()
+            .expect("calls should be an array")
+            .iter()
+            .any(|c| c["caller"] == "main"),
+        "2行目は main の calls 応答であるべき"
+    );
+
+    let sequence: serde_json::Value =
+        serde_json::from_str(lines[2]).expect("sequence response should be JSON");
+    assert_eq!(sequence["lang"], "rust");
+    assert!(
+        sequence["diagram"]
+            .as_str()
+            .expect("sequence diagram should be a string")
+            .starts_with("sequenceDiagram"),
+        "3行目は sequence diagram 応答であるべき"
+    );
+}
+
+#[test]
+fn session_review_command_returns_json_error() {
+    let input = r#"{"command":"review","dir":".","git":true}
+"#;
+    let output = cargo_bin()
+        .arg("session")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            child.wait_with_output()
+        })
+        .expect("failed to run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "session は非対応コマンドも JSON エラー 1 行として返す"
+    );
+    let error: serde_json::Value =
+        serde_json::from_str(lines[0]).expect("error response should be JSON");
+    assert_eq!(error["error"]["code"], "INVALID_REQUEST");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .expect("message should be a string")
+            .contains("unknown variant `review`"),
+        "review が session 非対応であることを明示すべき: {error}"
+    );
+}
+
 // ---- sequence バッチ処理テスト ----
 
 #[test]

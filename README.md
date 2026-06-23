@@ -671,7 +671,8 @@ astro-sight skill-install codex
 
 登録後は「コールグラフを調べて」「この関数の呼び出し元は？」「diff の影響範囲は？」等の質問で自動的に起動します。
 PR や patch 全体をまとめて見たい場合は、`astro-sight review --dir . --git` まで含めて指示すると一括レビューに入りやすくなります。
-`symbols` だけで構造を読んだあとに import / caller / call flow を確認する流れでは、`imports` / `calls` / `sequence` を続けて使うか、2 個以上の mixed query を `session` にまとめるとプロセス起動を減らせます。
+`symbols` だけで構造を読んだあとに import / caller / call flow を確認する流れでは、最初から `symbols` + `imports` / `calls` / `sequence` を `session` にまとめると、プロセス起動を減らしつつ手順漏れを防げます。
+レビュー観点が繰り返される場合は `lint` で AST/text ルール化し、関連ファイル漏れは `review` の `missing_cochanges` または `cochange --paths <file>` で先に確認します。
 
 ### 利用状況の分析
 
@@ -729,7 +730,7 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 - **Visualize call flow**: Run `astro-sight sequence --path <file> --function <name>`
 - **Find dead code**: Run `astro-sight dead-code --dir .` or `--git` for diff-scoped
 - **Enforce repeated structural rules**: Run `astro-sight lint --path <file> --rules rules.yaml`
-- **Multiple mixed queries in one run**: Pipe NDJSON requests to `astro-sight session`
+- **Multiple mixed queries in one run**: If `symbols` will be followed by `imports` / `calls` / `sequence`, start with NDJSON `astro-sight session`
 
 ## Command Quick Reference
 

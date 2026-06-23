@@ -9,8 +9,9 @@ when_to_use: |
   - After editing code — run `impact --dir . --git` to detect unresolved impacts
   - Touching exported APIs / public modules — add `dead-code --dir . --git` to detect dead symbols
   - Understanding a file or directory — use `symbols --path <file>` or `symbols --dir <dir>`
+  - Need exact syntax at a cursor/range, parse-error detail, or giant-line behavior — use `ast --path <file> --line <n> --col <n>`
   - Call graphs, imports, sequence diagrams, co-change history, or repeated AST/text rules — use the matching command (`calls` / `imports` / `sequence` / `cochange` / `lint`)
-  - Running 2+ mixed astro-sight queries in one process — use `session` (NDJSON), especially `symbols` + `imports`, `symbols` + `calls`, or `calls` + `sequence`
+  - Running 2+ mixed astro-sight queries in one process — start with `session` (NDJSON), especially `symbols` + `imports`, `symbols` + `calls`, or `calls` + `sequence`
   Skip for non-code text searches (error messages, config values, TODO comments, file-path patterns) — Grep handles those.
 allowed-tools: Bash(astro-sight:*)
 ---
@@ -99,6 +100,7 @@ echo '{"command":"refs","name":"Sym1","dir":"."}
 - Touching exported APIs or public modules? Add `astro-sight dead-code --dir . --git` before concluding the change.
 - Repeating the same structural review policy across files? Reach for `astro-sight lint` instead of ad-hoc text search.
 - Asking 2+ mixed astro-sight questions in one loop? Use `astro-sight session` instead of paying startup cost for each command.
+- If your next step after `symbols` is already `imports`, `calls`, or `sequence`, start with `session` rather than launching one command at a time.
 - Need a call-flow overview for explanation or review? Use `astro-sight sequence` after `calls` or `symbols` identifies the target function.
 - Need exact syntax around a confusing match or parse error? Escalate from `symbols` to `astro-sight ast --path <file> --line <n> --col <n>`.
 - Checking a multi-file change for hidden coupling? Run `astro-sight cochange --dir . --git --base <rev>` before assuming filenames tell the whole story.
