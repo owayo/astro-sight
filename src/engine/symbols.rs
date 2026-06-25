@@ -730,6 +730,263 @@ fn contains_keyword(text: &str, keyword: &str) -> bool {
     false
 }
 
+/// Eloquent リレーションの戻り型 (`Illuminate\Database\Eloquent\Relations\*`)。
+/// public method の戻り型がこれらのいずれかなら、`->with(['name'])` 文字列リテラルや
+/// `$model->name` magic property 経由で Eloquent が呼ぶリレーション定義とみなして
+/// dead-code 除外する (GitLab #21)。
+const ELOQUENT_RELATION_RETURN_TYPES: &[&str] = &[
+    "BelongsTo",
+    "BelongsToMany",
+    "HasMany",
+    "HasOne",
+    "HasManyThrough",
+    "HasOneThrough",
+    "MorphMany",
+    "MorphOne",
+    "MorphTo",
+    "MorphToMany",
+];
+
+/// Laravel framework が contract 経由で呼ぶ既知の (interface 名, メソッド名) ペア。
+/// `implements <interface>` しているクラスでこれらのメソッドは framework runtime が
+/// 呼ぶため、static caller 0 件でも dead ではない (GitLab #22)。
+///
+/// interface 名は単純名 (= `use ... as Foo` の alias) を採用。簡素な実装のため
+/// 末尾セグメント比較。
+const LARAVEL_CONTRACT_METHODS: &[(&str, &[&str])] = &[
+    // Illuminate\Contracts\Auth\CanResetPassword
+    (
+        "CanResetPassword",
+        &["getEmailForPasswordReset", "sendPasswordResetNotification"],
+    ),
+    // alias で `CanResetPassword as CanResetPasswordContract` と書かれることが多いため両方
+    (
+        "CanResetPasswordContract",
+        &["getEmailForPasswordReset", "sendPasswordResetNotification"],
+    ),
+];
+
+/// PHP の Laravel runtime entrypoint メソッドを判定する。
+///
+/// 以下のいずれかなら true:
+/// 1. Eloquent リレーション戻り型を持つ public method (`public function x(): BelongsTo`)
+///    ― `->with(['x'])` 文字列リテラルや magic property `$model->x` 経由で Eloquent が呼ぶ。
+/// 2. Laravel framework が contract 経由で呼ぶ既知のメソッド (`getEmailForPasswordReset` /
+///    `sendPasswordResetNotification`) で、enclosing class が対応 contract を implements する。
+///
+/// 戻り型の判定は末尾名比較 (FQN `\Illuminate\Database\Eloquent\Relations\BelongsTo` でも
+/// 末尾の `BelongsTo` でマッチ)。implements 句の判定も末尾名比較で、`use ... as` の alias
+/// も両方対応した allowlist で吸収する。
+pub fn is_php_laravel_runtime_entrypoint(root: Node, source: &[u8], symbol_range: &Range) -> bool {
+    let start = tree_sitter::Point {
+        row: symbol_range.start.line,
+        column: symbol_range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: symbol_range.end.line,
+        column: symbol_range.end.column,
+    };
+    let Some(node) = root.descendant_for_point_range(start, end) else {
+        return false;
+    };
+    let mut cur = Some(node);
+    let method_node = loop {
+        match cur {
+            Some(n) if n.kind() == "method_declaration" => break n,
+            Some(n) => cur = n.parent(),
+            None => return false,
+        }
+    };
+
+    // (1) Eloquent リレーション戻り型 + public visibility
+    if php_method_is_public(method_node, source)
+        && php_method_return_type_matches(method_node, source, ELOQUENT_RELATION_RETURN_TYPES)
+    {
+        return true;
+    }
+
+    // (2) Laravel contract 既知メソッド
+    let Some(name) = method_node
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(source).ok())
+    else {
+        // child_by_field_name が無い場合は child を走査 (PHP は field 名を使わないことが多い)
+        return php_method_matches_laravel_contract(method_node, source);
+    };
+    let _ = name;
+    php_method_matches_laravel_contract(method_node, source)
+}
+
+/// `method_declaration` ノードの `visibility_modifier` が `public` か判定する。
+/// PHP のメソッドは可視性指定が無い場合 `public` 扱いになる慣例のため、
+/// visibility_modifier ノードがなければ public とみなす (Laravel Eloquent でも省略多用)。
+fn php_method_is_public(method_node: Node, source: &[u8]) -> bool {
+    let mut cursor = method_node.walk();
+    for child in method_node.children(&mut cursor) {
+        if child.kind() == "visibility_modifier" {
+            return matches!(child.utf8_text(source).map(|s| s.trim()), Ok("public"));
+        }
+    }
+    true
+}
+
+/// `method_declaration` の戻り型ノード (`named_type` / `qualified_name` / `primitive_type` /
+/// `union_type` 等) の末尾名が `names` のいずれかにマッチするか判定する。
+fn php_method_return_type_matches(method_node: Node, source: &[u8], names: &[&str]) -> bool {
+    let mut cursor = method_node.walk();
+    let mut after_params = false;
+    for child in method_node.children(&mut cursor) {
+        if child.kind() == "formal_parameters" {
+            after_params = true;
+            continue;
+        }
+        if !after_params {
+            continue;
+        }
+        if matches!(child.kind(), "compound_statement" | ";") {
+            break;
+        }
+        if php_type_node_tail_name_matches(child, source, names) {
+            return true;
+        }
+    }
+    false
+}
+
+/// PHP の型ノードを再帰的に走査し、末尾の `name` が `names` のいずれかにマッチするか判定する。
+/// `named_type` / `qualified_name` / `union_type` / `nullable_type` / `disjunctive_normal_form_type`
+/// 等に対応する。
+fn php_type_node_tail_name_matches(node: Node, source: &[u8], names: &[&str]) -> bool {
+    match node.kind() {
+        "name" => node
+            .utf8_text(source)
+            .ok()
+            .is_some_and(|t| names.contains(&t.trim())),
+        "qualified_name" => {
+            // qualified_name の最後の `name` 子を取る (FQN の末尾セグメント)。
+            let mut last_name: Option<Node> = None;
+            let mut cursor = node.walk();
+            for c in node.children(&mut cursor) {
+                if c.kind() == "name" {
+                    last_name = Some(c);
+                }
+            }
+            last_name.is_some_and(|n| {
+                n.utf8_text(source)
+                    .ok()
+                    .is_some_and(|t| names.contains(&t.trim()))
+            })
+        }
+        _ => {
+            // 型ラッパ (named_type / nullable_type / union_type / intersection_type 等) は
+            // 子を再帰的に走査する。
+            let mut cursor = node.walk();
+            for c in node.children(&mut cursor) {
+                if php_type_node_tail_name_matches(c, source, names) {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+/// `method_declaration` のメソッド名と enclosing class の implements 句を突き合わせ、
+/// `LARAVEL_CONTRACT_METHODS` の (interface, method) ペアに一致するか判定する。
+fn php_method_matches_laravel_contract(method_node: Node, source: &[u8]) -> bool {
+    let Some(name_node) = php_method_name_node(method_node) else {
+        return false;
+    };
+    let Ok(method_name) = name_node.utf8_text(source) else {
+        return false;
+    };
+    let method_name = method_name.trim();
+
+    // どの interface allowlist にメソッド名が含まれるか確認。
+    let candidate_interfaces: Vec<&str> = LARAVEL_CONTRACT_METHODS
+        .iter()
+        .filter_map(|(iface, methods)| {
+            if methods.contains(&method_name) {
+                Some(*iface)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if candidate_interfaces.is_empty() {
+        return false;
+    }
+
+    // enclosing class_declaration を探し、implements 句に candidate_interfaces が含まれるか確認。
+    let mut cur = method_node;
+    while let Some(parent) = cur.parent() {
+        if parent.kind() == "class_declaration" {
+            return php_class_implements_any(parent, source, &candidate_interfaces);
+        }
+        cur = parent;
+    }
+    false
+}
+
+/// `method_declaration` の名前ノードを取り出す。
+/// tree-sitter-php では field 名 `name` は使われないため child を走査する。
+fn php_method_name_node(method_node: Node) -> Option<Node> {
+    if let Some(n) = method_node.child_by_field_name("name") {
+        return Some(n);
+    }
+    let mut cursor = method_node.walk();
+    let mut last_name: Option<Node> = None;
+    for child in method_node.children(&mut cursor) {
+        if child.kind() == "name" {
+            last_name = Some(child);
+            // formal_parameters より前の最初の name がメソッド名。
+            break;
+        }
+    }
+    last_name
+}
+
+/// PHP の `class_declaration` ノードの implements 句に `interfaces` のいずれかが含まれるか判定する。
+/// tree-sitter-php では `class_interface_clause > name` で interface 名が並ぶ。
+fn php_class_implements_any(class_node: Node, source: &[u8], interfaces: &[&str]) -> bool {
+    let mut cursor = class_node.walk();
+    for child in class_node.children(&mut cursor) {
+        if child.kind() != "class_interface_clause" {
+            continue;
+        }
+        let mut inner = child.walk();
+        for grand in child.children(&mut inner) {
+            match grand.kind() {
+                "name" => {
+                    if let Ok(t) = grand.utf8_text(source)
+                        && interfaces.contains(&t.trim())
+                    {
+                        return true;
+                    }
+                }
+                "qualified_name" => {
+                    // FQN の末尾 name を比較
+                    let mut last_name: Option<Node> = None;
+                    let mut gc = grand.walk();
+                    for c in grand.children(&mut gc) {
+                        if c.kind() == "name" {
+                            last_name = Some(c);
+                        }
+                    }
+                    if let Some(n) = last_name
+                        && let Ok(t) = n.utf8_text(source)
+                        && interfaces.contains(&t.trim())
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 /// Java の Flyway Java マイグレーションクラスを判定する。
 ///
 /// 判定基準: クラスの **直接の親型 (extends 句の 1 つ目 / implements 句のそれぞれ)** が
@@ -1347,16 +1604,19 @@ fn is_js_ts_angular_cva_contract_method(root: Node, source: &[u8], symbol_range:
         return false;
     }
 
-    // enclosing class を探し、`implements ControlValueAccessor` または NG_VALUE_ACCESSOR
-    // provider 登録があるか確認。
+    // enclosing class を探し、`@Component` / `@Directive` 装飾されており、かつ
+    // `implements ControlValueAccessor` または NG_VALUE_ACCESSOR provider 登録があるか確認。
+    // class decorator チェックを必須にすることで、非 Angular クラスの dead-code を
+    // 偶然 ControlValueAccessor 同名 interface 経由で誤抑止しないようにする (codex 指摘)。
     let mut cur = method_node;
     while let Some(parent) = cur.parent() {
         if matches!(
             parent.kind(),
             "class_declaration" | "abstract_class_declaration"
         ) {
-            return class_implements_control_value_accessor(parent, source)
-                || class_has_ng_value_accessor_provider(parent, source);
+            return class_has_component_or_directive_decorator(parent, source)
+                && (class_implements_control_value_accessor(parent, source)
+                    || class_has_ng_value_accessor_provider(parent, source));
         }
         cur = parent;
     }
@@ -4483,6 +4743,172 @@ export class PlainComponent {
 }
 "#;
         assert!(!check_angular_runtime_entrypoint(src, "writeValue"));
+    }
+
+    /// `implements ControlValueAccessor` していても、`@Component` / `@Directive` 装飾が
+    /// 無いクラス (素のクラス / `@Injectable()` 装飾クラス等) では除外対象外。Angular runtime
+    /// entrypoint ではない同名 interface 実装の dead-code を誤抑止しないため (codex 指摘 #20)。
+    #[test]
+    fn angular_cva_in_non_angular_decorated_class_not_detected() {
+        let src = r#"
+export class PlainCva implements ControlValueAccessor {
+    writeValue(obj: any) {}
+    registerOnChange(fn: any) {}
+}
+"#;
+        assert!(!check_angular_runtime_entrypoint(src, "writeValue"));
+        assert!(!check_angular_runtime_entrypoint(src, "registerOnChange"));
+    }
+
+    /// `@Injectable` 装飾は対象外 (lifecycle hook と同じ判定方針) ― CVA 規約メソッドが
+    /// あっても dead 抑止しない。
+    #[test]
+    fn angular_cva_in_injectable_class_not_detected() {
+        let src = r#"
+@Injectable({ providedIn: 'root' })
+export class InjectableCva implements ControlValueAccessor {
+    writeValue(obj: any) {}
+}
+"#;
+        assert!(!check_angular_runtime_entrypoint(src, "writeValue"));
+    }
+
+    // --- is_php_laravel_runtime_entrypoint テスト ---
+
+    fn check_php_laravel_runtime_entrypoint(source: &str, symbol_name: &str) -> bool {
+        let language = LangId::Php.ts_language();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        let syms = extract_symbols(root, source.as_bytes(), LangId::Php).unwrap();
+        let sym = syms
+            .iter()
+            .find(|s| s.name == symbol_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "symbol '{}' not found in {:?}",
+                    symbol_name,
+                    syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            });
+        is_php_laravel_runtime_entrypoint(root, source.as_bytes(), &sym.range)
+    }
+
+    /// GitLab issue #21: 戻り型 `BelongsTo` の public method は Eloquent リレーション
+    /// 定義として dead 除外。
+    #[test]
+    fn php_eloquent_relation_belongs_to_method_is_detected() {
+        let src = "<?php
+class QueueEloquent extends Model {
+    public function omataseGuidance(): BelongsTo {
+        return $this->belongsTo(GuidanceEloquent::class);
+    }
+}
+";
+        assert!(check_php_laravel_runtime_entrypoint(src, "omataseGuidance"));
+    }
+
+    /// 他の主要 Eloquent リレーション戻り型 (HasMany / HasOneThrough) も検出される。
+    #[test]
+    fn php_eloquent_relation_other_return_types_are_detected() {
+        let src = "<?php
+class M extends Model {
+    public function items(): HasMany { return $this->hasMany(Item::class); }
+    public function profile(): HasOneThrough { return $this->hasOneThrough(P::class, Q::class); }
+    public function tags(): BelongsToMany { return $this->belongsToMany(Tag::class); }
+}
+";
+        assert!(check_php_laravel_runtime_entrypoint(src, "items"));
+        assert!(check_php_laravel_runtime_entrypoint(src, "profile"));
+        assert!(check_php_laravel_runtime_entrypoint(src, "tags"));
+    }
+
+    /// FQN 戻り型 (`Illuminate\Database\Eloquent\Relations\BelongsTo`) でも末尾名で検出する。
+    #[test]
+    fn php_eloquent_relation_fqcn_return_type_is_detected() {
+        let src = "<?php
+class M extends Model {
+    public function owner(): \\Illuminate\\Database\\Eloquent\\Relations\\BelongsTo {
+        return $this->belongsTo(Owner::class);
+    }
+}
+";
+        assert!(check_php_laravel_runtime_entrypoint(src, "owner"));
+    }
+
+    /// 戻り型が無い / 戻り型が Relation 系でない public method は除外対象外。
+    #[test]
+    fn php_method_without_relation_return_type_not_detected() {
+        let src = "<?php
+class M extends Model {
+    public function helper(): string { return ''; }
+    public function noReturnType() { return 1; }
+}
+";
+        assert!(!check_php_laravel_runtime_entrypoint(src, "helper"));
+        assert!(!check_php_laravel_runtime_entrypoint(src, "noReturnType"));
+    }
+
+    /// `private` / `protected` visibility のメソッドは除外対象外 (Eloquent は public
+    /// relation method のみ呼ぶ)。
+    #[test]
+    fn php_non_public_relation_method_not_detected() {
+        let src = "<?php
+class M extends Model {
+    protected function hidden(): BelongsTo { return $this->belongsTo(X::class); }
+}
+";
+        assert!(!check_php_laravel_runtime_entrypoint(src, "hidden"));
+    }
+
+    /// GitLab issue #22: `implements CanResetPasswordContract` クラスの
+    /// `getEmailForPasswordReset` / `sendPasswordResetNotification` は dead 除外。
+    #[test]
+    fn php_laravel_can_reset_password_contract_methods_are_detected() {
+        let src = "<?php
+class AccountEloquent extends Model implements AuthenticatableContract, CanResetPasswordContract {
+    public function getEmailForPasswordReset(): string { return $this->email; }
+    public function sendPasswordResetNotification($token): void {}
+}
+";
+        assert!(check_php_laravel_runtime_entrypoint(
+            src,
+            "getEmailForPasswordReset"
+        ));
+        assert!(check_php_laravel_runtime_entrypoint(
+            src,
+            "sendPasswordResetNotification"
+        ));
+    }
+
+    /// `CanResetPassword` (alias なし) でも同名メソッドは検出する。
+    #[test]
+    fn php_laravel_can_reset_password_simple_name_methods_are_detected() {
+        let src = "<?php
+class A implements CanResetPassword {
+    public function getEmailForPasswordReset(): string { return ''; }
+}
+";
+        assert!(check_php_laravel_runtime_entrypoint(
+            src,
+            "getEmailForPasswordReset"
+        ));
+    }
+
+    /// 既知 contract を implements しない class で同名メソッドがあっても dead 抑止しない。
+    /// `getEmailForPasswordReset` を自前で生やしただけのクラスは contract と関係ないため。
+    #[test]
+    fn php_laravel_contract_method_in_non_implementing_class_not_detected() {
+        let src = "<?php
+class StandaloneHelper {
+    public function getEmailForPasswordReset(): string { return ''; }
+}
+";
+        assert!(!check_php_laravel_runtime_entrypoint(
+            src,
+            "getEmailForPasswordReset"
+        ));
     }
 
     /// GitLab issue #23: `@HostListener` 付きメソッドは除外対象。

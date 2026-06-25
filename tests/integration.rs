@@ -5756,6 +5756,100 @@ fn dead_code_excludes_flyway_java_migration() {
     );
 }
 
+/// GitLab issue #21: Laravel Eloquent リレーション戻り型 (`BelongsTo` 等) を持つ public
+/// method は dead-code 検出から除外される。`->with('x')` 文字列 / magic property 経由で
+/// Eloquent が呼ぶため、静的 caller が 0 件でも dead ではない。
+#[test]
+fn dead_code_excludes_laravel_eloquent_relation_methods() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("app/Models")).unwrap();
+    let model_src = "<?php
+namespace App\\Models;
+use Illuminate\\Database\\Eloquent\\Relations\\BelongsTo;
+use Illuminate\\Database\\Eloquent\\Relations\\HasMany;
+class QueueModel extends Model {
+    public function omataseGuidance(): BelongsTo { return $this->belongsTo(Guidance::class); }
+    public function tags(): HasMany { return $this->hasMany(Tag::class); }
+    public function plainHelper(): string { return ''; }
+}
+";
+    std::fs::write(root.join("app/Models/QueueModel.php"), model_src).unwrap();
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead_names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    for name in ["omataseGuidance", "tags"] {
+        assert!(
+            !dead_names.iter().any(|n| n.contains(name)),
+            "Eloquent relation メソッド `{name}` は除外されるべき: {dead_names:?}"
+        );
+    }
+    // 戻り型が string の通常メソッドは除外対象外 (回帰担保)。
+    assert!(
+        dead_names.iter().any(|n| n.contains("plainHelper")),
+        "Eloquent relation でない自前 method は dead として残るべき (回帰担保): {dead_names:?}"
+    );
+}
+
+/// GitLab issue #22: `implements CanResetPasswordContract` クラスの
+/// `getEmailForPasswordReset` / `sendPasswordResetNotification` は Laravel framework
+/// (PasswordBroker / Notification) が contract 経由で呼ぶため dead から除外する。
+#[test]
+fn dead_code_excludes_laravel_can_reset_password_contract_methods() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("app/Models")).unwrap();
+    let model_src = "<?php
+namespace App\\Models;
+class AccountEloquent extends Model implements CanResetPasswordContract {
+    public function getEmailForPasswordReset(): string { return $this->email; }
+    public function sendPasswordResetNotification($token): void {}
+    public function someOtherMethod(): string { return ''; }
+}
+";
+    std::fs::write(root.join("app/Models/AccountEloquent.php"), model_src).unwrap();
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead_names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    for name in ["getEmailForPasswordReset", "sendPasswordResetNotification"] {
+        assert!(
+            !dead_names.iter().any(|n| n.contains(name)),
+            "CanResetPasswordContract 実装メソッド `{name}` は除外されるべき: {dead_names:?}"
+        );
+    }
+    // contract 実装ではない自前 method は除外対象外 (回帰担保)。
+    assert!(
+        dead_names.iter().any(|n| n.contains("someOtherMethod")),
+        "contract 実装ではない自前 method は dead として残るべき (回帰担保): {dead_names:?}"
+    );
+}
+
 /// GitLab issue #20: `implements ControlValueAccessor` の Angular 装飾クラスの 4 規約
 /// メソッド (writeValue / registerOnChange / registerOnTouched / setDisabledState) は
 /// dead-code 検出から除外される。Angular Forms ランタイムが NG_VALUE_ACCESSOR provider

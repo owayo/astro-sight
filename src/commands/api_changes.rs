@@ -2175,6 +2175,22 @@ pub(crate) fn filter_exported_symbols(
         {
             continue;
         }
+        // Laravel runtime entrypoint。PHP 限定。
+        // 以下の 2 系統:
+        //   1. Eloquent リレーション (`public function x(): BelongsTo` 等の戻り型)。`->with('x')`
+        //      文字列リテラルや `$model->x` magic property 経由で Eloquent が呼ぶため、
+        //      static caller 0 件でも dead ではない (GitLab issue #21)。
+        //   2. Laravel framework が contract 経由で呼ぶ既知のメソッド名 (`getEmailForPasswordReset`
+        //      / `sendPasswordResetNotification`)。enclosing class が `CanResetPassword(Contract)?`
+        //      を `implements` する場合のみ対象 (GitLab issue #22)。
+        // 文字列リテラル参照 (`with(['x'])`) / magic property 解決は静的解析の本質的限界のため
+        // 別 issue としている (codex 設計判断)。
+        if lang_id == crate::language::LangId::Php
+            && matches!(sym.kind, SymbolKind::Method | SymbolKind::Function)
+            && crate::engine::symbols::is_php_laravel_runtime_entrypoint(root, source, &sym.range)
+        {
+            continue;
+        }
         // Flyway の Java マイグレーションクラスとそのメンバ。Java 限定。
         // `extends BaseJavaMigration` / `implements JavaMigration` のクラスは Flyway が
         // クラスパス走査 + リフレクションで発見・実行するため、アプリコード上に直接参照が
