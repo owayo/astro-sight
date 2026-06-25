@@ -745,6 +745,7 @@ const ELOQUENT_RELATION_RETURN_TYPES: &[&str] = &[
     "MorphOne",
     "MorphTo",
     "MorphToMany",
+    "MorphedByMany",
 ];
 
 /// Laravel framework が contract 経由で呼ぶ既知の (interface 名, メソッド名) ペア。
@@ -4809,7 +4810,8 @@ class QueueEloquent extends Model {
         assert!(check_php_laravel_runtime_entrypoint(src, "omataseGuidance"));
     }
 
-    /// 他の主要 Eloquent リレーション戻り型 (HasMany / HasOneThrough) も検出される。
+    /// 他の主要 Eloquent リレーション戻り型 (HasMany / HasOneThrough / MorphedByMany 等) も
+    /// 検出される。
     #[test]
     fn php_eloquent_relation_other_return_types_are_detected() {
         let src = "<?php
@@ -4817,11 +4819,13 @@ class M extends Model {
     public function items(): HasMany { return $this->hasMany(Item::class); }
     public function profile(): HasOneThrough { return $this->hasOneThrough(P::class, Q::class); }
     public function tags(): BelongsToMany { return $this->belongsToMany(Tag::class); }
+    public function reverse(): MorphedByMany { return $this->morphedByMany(R::class, 'taggable'); }
 }
 ";
         assert!(check_php_laravel_runtime_entrypoint(src, "items"));
         assert!(check_php_laravel_runtime_entrypoint(src, "profile"));
         assert!(check_php_laravel_runtime_entrypoint(src, "tags"));
+        assert!(check_php_laravel_runtime_entrypoint(src, "reverse"));
     }
 
     /// FQN 戻り型 (`Illuminate\Database\Eloquent\Relations\BelongsTo`) でも末尾名で検出する。
