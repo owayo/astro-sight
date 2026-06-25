@@ -2173,11 +2173,14 @@ pub(crate) fn filter_exported_symbols(
         // クラスパス走査 + リフレクションで発見・実行するため、アプリコード上に直接参照が
         // 存在せず dead-code / API 変更検出の両方で false positive 源になる。クラス自体に
         // 加えて配下の `migrate(Context)` 等のメソッドも framework が反射で呼ぶため除外する
-        // (sym.range から class_declaration 祖先まで遡って判定)。
-        // Java symbols 抽出ではクラスメソッドが `SymbolKind::Function` で返る (Method ではない)
-        // ため Function/Method の両方を許容する。GitLab issue #24 対応。
-        if exclude_framework_entrypoints
-            && lang_id == crate::language::LangId::Java
+        // (sym.range から class_declaration 祖先まで遡って判定)。Java symbols 抽出では
+        // クラスメソッドが `SymbolKind::Function` で返る (Method ではない) ため Function/Method
+        // の両方を許容する。本判定は `exclude_framework_entrypoints` フラグに依存させず常に
+        // 効かせる ― API 変更検出の new 側 (`extract_new_file_facts`) / old 側
+        // (`extract_old_exported_symbols`) は flag=false で呼ばれるが、Flyway migration は
+        // 公開 API 面ではない runtime entrypoint なので api.added / api.removed にも出さない
+        // ため。GitLab issue #24 対応。
+        if lang_id == crate::language::LangId::Java
             && matches!(
                 sym.kind,
                 SymbolKind::Class | SymbolKind::Method | SymbolKind::Function

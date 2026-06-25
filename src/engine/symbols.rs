@@ -732,15 +732,28 @@ fn contains_keyword(text: &str, keyword: &str) -> bool {
 
 /// Java の Flyway Java マイグレーションクラスを判定する。
 ///
-/// 判定基準: クラスが `BaseJavaMigration` を継承 (extends) または `JavaMigration` を実装
-/// (implements) しているとき true を返す。Flyway はクラスパス走査 + リフレクションで
-/// migration を発見・実行するため、アプリコード上の直接参照は存在せず、dead-code / API 変更
-/// 検出の両方で false positive 源になる。完全修飾名 (`org.flywaydb.core.api.migration.*`) と
-/// 単純名 (import 経由) のどちらでも判定する。`db/migration/V*__*.java` 命名規約は補助的
-/// シグナルだが、ここでは継承関係を主な判定基準にする (命名だけで除外すると同名の業務クラスを
-/// 巻き込みやすい)。GitLab issue #24 対応。
+/// 判定基準: クラスの **直接の親型 (extends 句の 1 つ目 / implements 句のそれぞれ)** が
+/// 以下のどちらかに一致するとき true を返す:
+///
+/// - 単純名: `BaseJavaMigration` / `JavaMigration` (import 経由のローカル参照)
+/// - 完全修飾名: `org.flywaydb.core.api.migration.BaseJavaMigration` /
+///   `org.flywaydb.core.api.migration.JavaMigration` (import なしの直接参照)
+///
+/// `extends com.example.BaseJavaMigration` のような別 package の同名クラスは
+/// 完全修飾名が一致しないため false (codex 指摘)。`implements Wrapper<JavaMigration>` の
+/// ような generic 型引数も「直接の親型」ではないため false (型引数を再帰走査しない)。
+///
+/// Flyway はクラスパス走査 + リフレクションで migration を発見・実行するため、
+/// アプリコード上の直接参照は存在せず、dead-code / API 変更検出の両方で false positive
+/// 源になる。`db/migration/V*__*.java` 命名規約は補助的シグナルだが、ここでは継承関係を
+/// 主な判定基準にする (命名だけで除外すると同名の業務クラスを巻き込みやすい)。
+/// GitLab issue #24 対応。
 pub fn is_java_flyway_migration_class(root: Node, source: &[u8], symbol_range: &Range) -> bool {
-    const FLYWAY_SUPER_TYPES: &[&str] = &["BaseJavaMigration", "JavaMigration"];
+    const FLYWAY_SIMPLE: &[&str] = &["BaseJavaMigration", "JavaMigration"];
+    const FLYWAY_FQN: &[&str] = &[
+        "org.flywaydb.core.api.migration.BaseJavaMigration",
+        "org.flywaydb.core.api.migration.JavaMigration",
+    ];
 
     let start = tree_sitter::Point {
         row: symbol_range.start.line,
@@ -765,36 +778,86 @@ pub fn is_java_flyway_migration_class(root: Node, source: &[u8], symbol_range: &
     };
 
     // superclass (`extends X`) と super_interfaces (`implements X, Y`) を確認。
+    // 直接の親型ノードだけ (generic_type の base type、型引数は見ない) を集めて判定する。
     let mut cursor = class_node.walk();
     for child in class_node.children(&mut cursor) {
-        if matches!(child.kind(), "superclass" | "super_interfaces")
-            && java_clause_contains_type_name(child, source, FLYWAY_SUPER_TYPES)
-        {
+        match child.kind() {
+            "superclass" => {
+                if java_direct_supertype_matches(child, source, FLYWAY_SIMPLE, FLYWAY_FQN) {
+                    return true;
+                }
+            }
+            "super_interfaces" => {
+                // tree-sitter-java の `super_interfaces` は `implements` + `type_list` で構成
+                // される (`interface_type_list` ではない)。`implements A, B, C` は `type_list`
+                // の各子要素が直接の親型。
+                let mut inner = child.walk();
+                for grand in child.children(&mut inner) {
+                    if grand.kind() == "type_list"
+                        && java_direct_supertype_matches(grand, source, FLYWAY_SIMPLE, FLYWAY_FQN)
+                    {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// 親型節 (`superclass` / `interface_type_list`) の **直接の子要素** から「直接の親型」を
+/// 取り出し、Flyway の simple / FQN いずれかに一致するか判定する。型引数 (`generic_type`
+/// の `type_arguments`) は親型ではないため見ない。
+///
+/// 直接の親型ノードは次のいずれか:
+///   - `type_identifier`: 単純名 (例: `BaseJavaMigration`)
+///   - `scoped_type_identifier`: 完全修飾名 (例: `org.flywaydb.core.api.migration.BaseJavaMigration`)
+///   - `generic_type`: ジェネリクス付き親型。base type 部分のみ評価。
+fn java_direct_supertype_matches(
+    container: Node,
+    source: &[u8],
+    simple_names: &[&str],
+    fqn_names: &[&str],
+) -> bool {
+    let mut cursor = container.walk();
+    for child in container.children(&mut cursor) {
+        if java_type_node_matches(child, source, simple_names, fqn_names) {
             return true;
         }
     }
     false
 }
 
-/// Java の `superclass` / `super_interfaces` ノード配下を再帰的に走査し、`names` のいずれか
-/// に一致する `type_identifier` を探す。`scoped_type_identifier`
-/// (e.g. `org.flywaydb.core.api.migration.BaseJavaMigration`) は末尾の `type_identifier` を見る。
-/// `generic_type` (e.g. `JavaMigration<T>`) も子に `type_identifier` を持つため透過的に扱える。
-fn java_clause_contains_type_name(clause: Node, source: &[u8], names: &[&str]) -> bool {
-    let mut stack: Vec<Node> = vec![clause];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "type_identifier"
-            && let Ok(text) = node.utf8_text(source)
-            && names.contains(&text)
-        {
-            return true;
+/// 「型を表すノード」が指定の simple / FQN にマッチするか判定する。
+/// `generic_type` は最初の子 (= base type) を辿って評価する。
+fn java_type_node_matches(
+    type_node: Node,
+    source: &[u8],
+    simple_names: &[&str],
+    fqn_names: &[&str],
+) -> bool {
+    match type_node.kind() {
+        "type_identifier" => type_node
+            .utf8_text(source)
+            .ok()
+            .is_some_and(|text| simple_names.contains(&text)),
+        "scoped_type_identifier" => type_node
+            .utf8_text(source)
+            .ok()
+            .is_some_and(|text| fqn_names.contains(&text.trim())),
+        "generic_type" => {
+            // base type は通常先頭の named child。`A<B>` の `A` 部分。
+            let mut cursor = type_node.walk();
+            for child in type_node.children(&mut cursor) {
+                if matches!(child.kind(), "type_identifier" | "scoped_type_identifier") {
+                    return java_type_node_matches(child, source, simple_names, fqn_names);
+                }
+            }
+            false
         }
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            stack.push(child);
-        }
+        _ => false,
     }
-    false
 }
 
 /// Python の関数 / メソッド / クラスがフレームワーク登録デコレータ
@@ -4126,5 +4189,34 @@ public class V1__X extends BaseJavaMigration {
 }
 "#;
         assert!(check_java_flyway_class(src, "migrate"));
+    }
+
+    /// `implements MigrationContainer<JavaMigration>` のような generic 型引数として現れる
+    /// `JavaMigration` は「直接の親型」ではないため除外対象にしない (codex 指摘の再帰走査
+    /// 過剰マッチ修正)。
+    #[test]
+    fn java_generic_type_argument_with_flyway_name_not_detected() {
+        let src = r#"
+package app;
+interface MigrationContainer<T> {}
+class JavaMigration {}
+public class Wrapper implements MigrationContainer<JavaMigration> {
+    public void run() {}
+}
+"#;
+        assert!(!check_java_flyway_class(src, "Wrapper"));
+    }
+
+    /// 別 package の `com.example.BaseJavaMigration` は完全修飾名が Flyway のものと
+    /// 一致しないため除外対象にしない (codex 指摘の FQN 末尾名マッチ修正)。
+    #[test]
+    fn java_unrelated_fqcn_base_with_flyway_simple_name_not_detected() {
+        let src = r#"
+package app;
+public class Custom extends com.example.BaseJavaMigration {
+    public void run() {}
+}
+"#;
+        assert!(!check_java_flyway_class(src, "Custom"));
     }
 }

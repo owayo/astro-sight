@@ -5756,6 +5756,53 @@ fn dead_code_excludes_flyway_java_migration() {
     );
 }
 
+/// GitLab issue #24 (codex 指摘 1): review --git の API 変更検出 (`api_changes.added`)
+/// でも Flyway migration クラスとそのメソッドは出さない。dead-code 経路と整合し、Stop
+/// hook が migration 追加のたびに blocking 化しないようにする。
+#[test]
+fn review_excludes_flyway_java_migration_from_api_added() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("db/migration")).unwrap();
+    let migration_src = "package db.migration;\n\
+                         import org.flywaydb.core.api.migration.BaseJavaMigration;\n\
+                         import org.flywaydb.core.api.migration.Context;\n\
+                         public class V1__Init extends BaseJavaMigration {\n\
+                             public void migrate(Context context) throws Exception {}\n\
+                         }\n";
+    std::fs::write(root.join("db/migration/V1__Init.java"), migration_src).unwrap();
+    let diff = make_new_file_diff("db/migration/V1__Init.java", migration_src);
+    let diff_path = root.join("changes.patch");
+    std::fs::write(&diff_path, diff).unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "review",
+            "--dir",
+            root.to_str().unwrap(),
+            "--diff-file",
+            diff_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let added_names: Vec<String> = json["api_changes"]["added"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !added_names.iter().any(|n| n.contains("V1__Init")),
+        "Flyway migration クラスとそのメソッドは API 変更検出にも出さない: {added_names:?}"
+    );
+}
+
 // ---- Kotlin 多言語統合テスト ----
 
 #[test]
