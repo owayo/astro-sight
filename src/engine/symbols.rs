@@ -730,6 +730,73 @@ fn contains_keyword(text: &str, keyword: &str) -> bool {
     false
 }
 
+/// Java の Flyway Java マイグレーションクラスを判定する。
+///
+/// 判定基準: クラスが `BaseJavaMigration` を継承 (extends) または `JavaMigration` を実装
+/// (implements) しているとき true を返す。Flyway はクラスパス走査 + リフレクションで
+/// migration を発見・実行するため、アプリコード上の直接参照は存在せず、dead-code / API 変更
+/// 検出の両方で false positive 源になる。完全修飾名 (`org.flywaydb.core.api.migration.*`) と
+/// 単純名 (import 経由) のどちらでも判定する。`db/migration/V*__*.java` 命名規約は補助的
+/// シグナルだが、ここでは継承関係を主な判定基準にする (命名だけで除外すると同名の業務クラスを
+/// 巻き込みやすい)。GitLab issue #24 対応。
+pub fn is_java_flyway_migration_class(root: Node, source: &[u8], symbol_range: &Range) -> bool {
+    const FLYWAY_SUPER_TYPES: &[&str] = &["BaseJavaMigration", "JavaMigration"];
+
+    let start = tree_sitter::Point {
+        row: symbol_range.start.line,
+        column: symbol_range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: symbol_range.end.line,
+        column: symbol_range.end.column,
+    };
+    let Some(node) = root.descendant_for_point_range(start, end) else {
+        return false;
+    };
+
+    // class_declaration ノードを探す (symbol_range 内 or 祖先)。
+    let mut cur = Some(node);
+    let class_node = loop {
+        match cur {
+            Some(n) if n.kind() == "class_declaration" => break n,
+            Some(n) => cur = n.parent(),
+            None => return false,
+        }
+    };
+
+    // superclass (`extends X`) と super_interfaces (`implements X, Y`) を確認。
+    let mut cursor = class_node.walk();
+    for child in class_node.children(&mut cursor) {
+        if matches!(child.kind(), "superclass" | "super_interfaces")
+            && java_clause_contains_type_name(child, source, FLYWAY_SUPER_TYPES)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Java の `superclass` / `super_interfaces` ノード配下を再帰的に走査し、`names` のいずれか
+/// に一致する `type_identifier` を探す。`scoped_type_identifier`
+/// (e.g. `org.flywaydb.core.api.migration.BaseJavaMigration`) は末尾の `type_identifier` を見る。
+/// `generic_type` (e.g. `JavaMigration<T>`) も子に `type_identifier` を持つため透過的に扱える。
+fn java_clause_contains_type_name(clause: Node, source: &[u8], names: &[&str]) -> bool {
+    let mut stack: Vec<Node> = vec![clause];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "type_identifier"
+            && let Ok(text) = node.utf8_text(source)
+            && names.contains(&text)
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    false
+}
+
 /// Python の関数 / メソッド / クラスがフレームワーク登録デコレータ
 /// (Typer / Click / FastAPI / Flask / pytest 等) で装飾されているかを判定する。
 ///
@@ -3943,5 +4010,121 @@ class Foo {
 }
 "#;
         assert!(!check_angular_lifecycle_hook(src, "regularMethod"));
+    }
+
+    // --- is_java_flyway_migration_class テスト ---
+
+    fn check_java_flyway_class(source: &str, symbol_name: &str) -> bool {
+        let language = LangId::Java.ts_language();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        let syms = extract_symbols(root, source.as_bytes(), LangId::Java).unwrap();
+        let sym = syms
+            .iter()
+            .find(|s| s.name == symbol_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "symbol '{}' not found in {:?}",
+                    symbol_name,
+                    syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            });
+        is_java_flyway_migration_class(root, source.as_bytes(), &sym.range)
+    }
+
+    /// GitLab issue #24 再現: `extends BaseJavaMigration` の class は除外対象。
+    #[test]
+    fn java_flyway_migration_extends_base_class_is_detected() {
+        let src = r#"
+package db.migration;
+
+import org.flywaydb.core.api.migration.BaseJavaMigration;
+import org.flywaydb.core.api.migration.Context;
+
+public class V2021_01_02__Zipcode extends BaseJavaMigration {
+    public void migrate(Context context) throws Exception {
+    }
+}
+"#;
+        assert!(check_java_flyway_class(src, "V2021_01_02__Zipcode"));
+    }
+
+    /// `implements JavaMigration` のクラスも除外対象。
+    #[test]
+    fn java_flyway_migration_implements_interface_is_detected() {
+        let src = r#"
+package db.migration;
+
+import org.flywaydb.core.api.migration.JavaMigration;
+import org.flywaydb.core.api.migration.MigrationVersion;
+
+public class V1__Manual implements JavaMigration {
+    public MigrationVersion getVersion() { return null; }
+    public String getDescription() { return ""; }
+    public Integer getChecksum() { return null; }
+    public boolean isUndo() { return false; }
+    public boolean canExecuteInTransaction() { return true; }
+    public void migrate(org.flywaydb.core.api.migration.Context context) throws Exception {}
+}
+"#;
+        assert!(check_java_flyway_class(src, "V1__Manual"));
+    }
+
+    /// 完全修飾名 (`extends org.flywaydb.core.api.migration.BaseJavaMigration`) でも検出する。
+    #[test]
+    fn java_flyway_migration_fully_qualified_super_is_detected() {
+        let src = r#"
+package db.migration;
+
+public class V2__Fqcn extends org.flywaydb.core.api.migration.BaseJavaMigration {
+    public void migrate(org.flywaydb.core.api.migration.Context context) throws Exception {}
+}
+"#;
+        assert!(check_java_flyway_class(src, "V2__Fqcn"));
+    }
+
+    /// Flyway を継承していない通常のクラスは除外対象外。
+    #[test]
+    fn java_non_flyway_class_not_detected() {
+        let src = r#"
+package app.example;
+
+public class RegularService {
+    public void doWork() {}
+}
+"#;
+        assert!(!check_java_flyway_class(src, "RegularService"));
+    }
+
+    /// 同名でも別 framework (`extends BaseTask` 等) の継承は Flyway と誤判定しない。
+    #[test]
+    fn java_unrelated_super_class_not_detected() {
+        let src = r#"
+package app.batch;
+
+public class V2021_01_02__BatchJob extends app.batch.BaseTask {
+    public void run() {}
+}
+"#;
+        assert!(!check_java_flyway_class(src, "V2021_01_02__BatchJob"));
+    }
+
+    /// Flyway migration class 配下の method (例: `migrate(Context)`) も同じ Flyway 判定で
+    /// true を返す。symbol_range から class_declaration 祖先まで遡る設計のため、Class と
+    /// Method を同じヘルパーで処理できる (dead-code 経路は class 単体 + 配下メソッドの
+    /// 両方を Flyway runtime が反射経由で呼ぶため除外したい)。
+    #[test]
+    fn java_flyway_migration_member_method_is_detected_via_class() {
+        let src = r#"
+package db.migration;
+import org.flywaydb.core.api.migration.BaseJavaMigration;
+import org.flywaydb.core.api.migration.Context;
+public class V1__X extends BaseJavaMigration {
+    public void migrate(Context context) throws Exception {}
+}
+"#;
+        assert!(check_java_flyway_class(src, "migrate"));
     }
 }

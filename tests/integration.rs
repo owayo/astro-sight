@@ -5699,6 +5699,63 @@ fn java_imports() {
     );
 }
 
+/// GitLab issue #24 回帰: Flyway の Java マイグレーションクラス
+/// (`extends BaseJavaMigration`) は dead-code 検出から除外される。
+#[test]
+fn dead_code_excludes_flyway_java_migration() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("app/migration/src/main/java/db/migration")).unwrap();
+
+    // Flyway migration クラス (extends BaseJavaMigration) ─ 除外対象
+    let flyway_class = "package db.migration;\n\
+                        import org.flywaydb.core.api.migration.BaseJavaMigration;\n\
+                        import org.flywaydb.core.api.migration.Context;\n\
+                        public class V2021_01_02__Zipcode extends BaseJavaMigration {\n\
+                            public void migrate(Context context) throws Exception {}\n\
+                        }\n";
+    std::fs::write(
+        root.join("app/migration/src/main/java/db/migration/V2021_01_02__Zipcode.java"),
+        flyway_class,
+    )
+    .unwrap();
+
+    // 通常の Java クラス (Flyway 非継承) ─ 直接参照なしなので dead に残るべき
+    let regular_class = "package app.util;\n\
+                         public class OrphanService {\n\
+                             public void noOp() {}\n\
+                         }\n";
+    std::fs::create_dir_all(root.join("app/util")).unwrap();
+    std::fs::write(root.join("app/util/OrphanService.java"), regular_class).unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead_names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !dead_names
+            .iter()
+            .any(|n| n.contains("V2021_01_02__Zipcode")),
+        "Flyway BaseJavaMigration 継承クラスは framework entrypoint として除外されるべき: {dead_names:?}"
+    );
+    assert!(
+        dead_names.iter().any(|n| n.contains("OrphanService")),
+        "Flyway を継承しない通常の Java クラスは dead として残るべき (回帰担保): {dead_names:?}"
+    );
+}
+
 // ---- Kotlin 多言語統合テスト ----
 
 #[test]
