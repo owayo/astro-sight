@@ -509,6 +509,31 @@ pub(crate) fn filter_dead_by_touched_symbols(
         .collect()
 }
 
+/// 同一 diff で新規 export された (= `api_changes.added` に列挙される) シンボルを
+/// dead 警告から除外する。`review --hook` の既定挙動として「多段実装中に純粋ヘルパーを
+/// 先に追加し、consumer 結線が後続コミットになる」WIP パターンのノイズを抑止するために
+/// 使う。`--include-wip-dead` 指定時は呼び出し側でこの関数を skip し、新規 export も
+/// dead として全件返す。
+///
+/// 突合せキーは `(file, name)` (DeadSymbol と ApiSymbol の共通フィールド)。kind は
+/// 同一シンボルで言語別表記が一致しないケースを避けるため照合対象から外す
+/// (例: `class` vs `struct` の混在は file+name の一致で十分判別できる)。
+pub(crate) fn filter_dead_by_wip_added(
+    dead: Vec<crate::models::review::DeadSymbol>,
+    added: &[crate::models::review::ApiSymbol],
+) -> Vec<crate::models::review::DeadSymbol> {
+    if added.is_empty() {
+        return dead;
+    }
+    let added_set: std::collections::HashSet<(&str, &str)> = added
+        .iter()
+        .map(|a| (a.file.as_str(), a.name.as_str()))
+        .collect();
+    dead.into_iter()
+        .filter(|ds| !added_set.contains(&(ds.file.as_str(), ds.name.as_str())))
+        .collect()
+}
+
 /// `sym` の range を内包する最も内側の container (class/struct/trait/interface/enum) を返す。
 /// `sym` 自身は除外する。
 pub(crate) fn enclosing_container<'a>(

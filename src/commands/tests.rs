@@ -11631,3 +11631,70 @@ fn detect_api_changes_skips_unsafe_diff_paths() {
     assert!(result.removed.is_empty());
     assert!(result.modified.is_empty());
 }
+
+/// `filter_dead_by_wip_added` は同一 diff で新規 export されたシンボルを
+/// dead から除外する。多段実装中の WIP ノイズ抑止のための既定挙動 (Issue
+/// 2026-06-25-wip-dead-symbol-during-incremental-impl 対応)。
+#[test]
+fn filter_dead_by_wip_added_drops_symbols_listed_in_added() {
+    use crate::models::review::{ApiSymbol, DeadSymbol};
+    let dead = vec![
+        DeadSymbol {
+            name: "matchAssigneeName".to_string(),
+            kind: "function".to_string(),
+            file: "src/notes.ts".to_string(),
+        },
+        DeadSymbol {
+            name: "legacyUnused".to_string(),
+            kind: "function".to_string(),
+            file: "src/legacy.ts".to_string(),
+        },
+    ];
+    let added = vec![ApiSymbol {
+        name: "matchAssigneeName".to_string(),
+        kind: "function".to_string(),
+        file: "src/notes.ts".to_string(),
+    }];
+    let filtered = filter_dead_by_wip_added(dead, &added);
+    let names: Vec<&str> = filtered.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["legacyUnused"],
+        "WIP added は dead から除外、既存 dead は残す"
+    );
+}
+
+/// `filter_dead_by_wip_added` は (file, name) ペアで突合せ、同名でもファイルが
+/// 異なれば dead として残す (誤抑制防止)。
+#[test]
+fn filter_dead_by_wip_added_matches_on_file_and_name_pair() {
+    use crate::models::review::{ApiSymbol, DeadSymbol};
+    let dead = vec![DeadSymbol {
+        name: "helper".to_string(),
+        kind: "function".to_string(),
+        file: "src/a.ts".to_string(),
+    }];
+    let added = vec![ApiSymbol {
+        // 同じ name だが別 file の追加 — dead 側 (a.ts) は残るべき。
+        name: "helper".to_string(),
+        kind: "function".to_string(),
+        file: "src/b.ts".to_string(),
+    }];
+    let filtered = filter_dead_by_wip_added(dead, &added);
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].file, "src/a.ts");
+}
+
+/// `filter_dead_by_wip_added` は added が空なら dead を素通しする。
+#[test]
+fn filter_dead_by_wip_added_passes_through_when_added_is_empty() {
+    use crate::models::review::DeadSymbol;
+    let dead = vec![DeadSymbol {
+        name: "foo".to_string(),
+        kind: "function".to_string(),
+        file: "src/foo.rs".to_string(),
+    }];
+    let filtered = filter_dead_by_wip_added(dead.clone(), &[]);
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].name, "foo");
+}

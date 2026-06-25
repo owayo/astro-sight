@@ -478,6 +478,13 @@ pub enum Commands {
         /// デフォルトでは値のみの変更はコンパイル互換性を壊さないため informational (非 blocking)。
         #[arg(long = "strict-public-const-values")]
         strict_public_const_values: bool,
+
+        /// 同一 diff 内で新規 export された (= `api_changes.added` に挙がる) シンボルも
+        /// dead 警告に含める。既定では多段実装中の WIP ノイズ (consumer 結線が後続コミット
+        /// 予定の純粋ヘルパー追加) を抑止するため、新規追加 export は dead から除外する
+        /// (Issue 2026-06-25-wip-dead-symbol-during-incremental-impl 対応)。
+        #[arg(long = "include-wip-dead")]
+        include_wip_dead: bool,
     },
 
     /// Detect dead (unreferenced) exported symbols

@@ -629,6 +629,7 @@ pub fn cmd_review(
     extra_exclude_globs: &[String],
     dead_scope: crate::cli::DeadScope,
     strict_public_const_values: bool,
+    include_wip_dead: bool,
 ) -> Result<()> {
     // framework 指定は早期に検証して未知名はここで弾く (dead_symbols 検出に到達する前に)。
     // 未指定時は package.json から next 依存を検出して nextjs プリセットを自動適用する。
@@ -778,6 +779,15 @@ pub fn cmd_review(
             } else {
                 dead_symbols
             };
+            // WIP dead 抑止: 同一 diff で新規 export された (= api_changes.added に挙がる)
+            // シンボルは「多段実装中に consumer 結線が後続コミット予定」の純粋ヘルパー追加
+            // 等に該当しうるため、デフォルトで dead 警告から外す。`--include-wip-dead` で旧
+            // 挙動 (全 dead を返す) に戻せる (Issue 2026-06-25-wip-dead-symbol-during-incremental-impl)。
+            let dead_symbols = if include_wip_dead {
+                dead_symbols
+            } else {
+                filter_dead_by_wip_added(dead_symbols, &api_changes.added)
+            };
             (dead_symbols, test_only_symbols)
         }
         Err(_) => (Vec::new(), Vec::new()),
@@ -829,7 +839,7 @@ pub use dead_code::cmd_dead_code;
 #[cfg(test)]
 pub(crate) use dead_code::{auto_detect_framework, extract_dead_code_candidates_from_file};
 pub(crate) use dead_code::{
-    detect_dead_symbols_from_files, filter_dead_by_touched_symbols,
+    detect_dead_symbols_from_files, filter_dead_by_touched_symbols, filter_dead_by_wip_added,
     filter_diff_files_for_dead_code, resolve_dead_code_excludes,
     resolve_framework_globs_with_auto_detect,
 };
