@@ -5756,6 +5756,106 @@ fn dead_code_excludes_flyway_java_migration() {
     );
 }
 
+/// GitLab issue #20: `implements ControlValueAccessor` の Angular 装飾クラスの 4 規約
+/// メソッド (writeValue / registerOnChange / registerOnTouched / setDisabledState) は
+/// dead-code 検出から除外される。Angular Forms ランタイムが NG_VALUE_ACCESSOR provider
+/// 経由で ngModel/formControl バインド時に呼ぶため、静的 caller が 0 件でも dead ではない。
+#[test]
+fn dead_code_excludes_angular_control_value_accessor_methods() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/app/shared")).unwrap();
+    let cva_src = "\
+import { Directive } from '@angular/core';
+import { ControlValueAccessor } from '@angular/forms';
+@Directive()
+export abstract class AbstractBaseControl implements ControlValueAccessor {
+    writeValue(obj: any) {}
+    registerOnChange(fn: any) {}
+    registerOnTouched(fn: any) {}
+    setDisabledState(isDisabled: boolean) {}
+    customHelper(): void {}
+}
+";
+    std::fs::write(root.join("src/app/shared/abstract.ts"), cva_src).unwrap();
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead_names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    for name in [
+        "writeValue",
+        "registerOnChange",
+        "registerOnTouched",
+        "setDisabledState",
+    ] {
+        assert!(
+            !dead_names.iter().any(|n| n.contains(name)),
+            "ControlValueAccessor 規約メソッド `{name}` は除外されるべき: {dead_names:?}"
+        );
+    }
+    // CVA 規約名でない自前メソッドは除外対象外 (回帰担保)。
+    assert!(
+        dead_names.iter().any(|n| n.contains("customHelper")),
+        "CVA 規約外の自前メソッドは dead として残るべき (回帰担保): {dead_names:?}"
+    );
+}
+
+/// GitLab issue #23: `@HostListener` 付きメソッドは Angular ランタイムがイベント発火時に
+/// 呼ぶため、静的 caller 0 件でも dead から除外する。
+#[test]
+fn dead_code_excludes_angular_host_listener_method() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/app")).unwrap();
+    let component_src = "\
+import { Component, HostListener } from '@angular/core';
+@Component({ template: '' })
+export class AppComponent {
+    @HostListener('window:beforeunload', ['$event'])
+    beforeUnloadHandler() {}
+    plainHelper() {}
+}
+";
+    std::fs::write(root.join("src/app/app.component.ts"), component_src).unwrap();
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead_names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !dead_names.iter().any(|n| n.contains("beforeUnloadHandler")),
+        "@HostListener 付きメソッドは dead から除外されるべき: {dead_names:?}"
+    );
+    // member decorator が無い通常メソッドは除外対象外 (回帰担保)。
+    assert!(
+        dead_names.iter().any(|n| n.contains("plainHelper")),
+        "member decorator のない通常メソッドは dead として残るべき (回帰担保): {dead_names:?}"
+    );
+}
+
 /// GitLab issue #24 (codex 指摘 1): review --git の API 変更検出 (`api_changes.added`)
 /// でも Flyway migration クラスとそのメソッドは出さない。dead-code 経路と整合し、Stop
 /// hook が migration 追加のたびに blocking 化しないようにする。

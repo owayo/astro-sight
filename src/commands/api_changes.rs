@@ -2150,12 +2150,19 @@ pub(crate) fn filter_exported_symbols(
         {
             continue;
         }
-        // Angular `@Component` / `@Directive` 装飾クラスの lifecycle hook メソッド
-        // (`ngOnInit` / `ngAfterViewChecked` 等) は Angular ランタイムが change detection
-        // サイクルで自動呼出するため、ユーザコード側に直接の caller が静的解析で見えない。
-        // `implements AfterViewChecked` 等の interface 実装は Angular の呼出規約では
-        // 不要なため判定材料にしない (Angular はメソッド名 + class decorator で hook を解決)。
-        // GitLab issue #8 対応。
+        // Angular `@Component` / `@Directive` 装飾クラスの runtime entrypoint メンバー。
+        // 以下の 3 系統を統合判定する (詳細は is_js_ts_angular_runtime_entrypoint):
+        //   1. lifecycle hook メソッド (`ngOnInit` / `ngAfterViewChecked` 等、既存)
+        //      Angular ランタイムが change detection サイクルで自動呼出するため静的 caller が無い。
+        //      GitLab issue #8 対応。
+        //   2. ControlValueAccessor 規約メソッド (`writeValue` / `registerOnChange` /
+        //      `registerOnTouched` / `setDisabledState`)。`implements ControlValueAccessor` または
+        //      decorator metadata 内の `NG_VALUE_ACCESSOR` provider をシグナルとして判定。
+        //      Angular Forms が NG_VALUE_ACCESSOR provider 経由で ngModel/formControl バインド時に
+        //      呼ぶ。GitLab issue #20 対応。
+        //   3. member 単位の Angular decorator (`@HostListener` / `@HostBinding` / `@Input` /
+        //      `@Output` / `@ViewChild` / `@ViewChildren` / `@ContentChild` / `@ContentChildren`)
+        //      が付与された method/property。GitLab issue #23 対応。
         if exclude_framework_entrypoints
             && matches!(
                 lang_id,
@@ -2163,8 +2170,8 @@ pub(crate) fn filter_exported_symbols(
                     | crate::language::LangId::Tsx
                     | crate::language::LangId::Javascript
             )
-            && matches!(sym.kind, SymbolKind::Method)
-            && crate::engine::symbols::is_js_ts_angular_lifecycle_hook(root, source, &sym.range)
+            && matches!(sym.kind, SymbolKind::Method | SymbolKind::Field)
+            && crate::engine::symbols::is_js_ts_angular_runtime_entrypoint(root, source, &sym.range)
         {
             continue;
         }

@@ -831,6 +831,9 @@ fn java_direct_supertype_matches(
 
 /// 「型を表すノード」が指定の simple / FQN にマッチするか判定する。
 /// `generic_type` は最初の子 (= base type) を辿って評価する。
+/// `scoped_type_identifier` は AST 上の識別子セグメントを `.` で連結したものを比較
+/// (raw text ではなく構造ベース) — qualified name の途中に改行・コメント・空白が
+/// 挟まれた valid Java でも検出漏れしないようにする。
 fn java_type_node_matches(
     type_node: Node,
     source: &[u8],
@@ -842,10 +845,18 @@ fn java_type_node_matches(
             .utf8_text(source)
             .ok()
             .is_some_and(|text| simple_names.contains(&text)),
-        "scoped_type_identifier" => type_node
-            .utf8_text(source)
-            .ok()
-            .is_some_and(|text| fqn_names.contains(&text.trim())),
+        "scoped_type_identifier" => {
+            // 再帰的に scoped_type_identifier / type_identifier を辿り、識別子セグメントを
+            // `.` で連結する。これにより `org.flywaydb...\n BaseJavaMigration` のような
+            // 空白入りの valid Java も `org.flywaydb...BaseJavaMigration` として比較できる。
+            let mut segments: Vec<&str> = Vec::new();
+            if java_collect_scoped_type_segments(type_node, source, &mut segments) {
+                let joined = segments.join(".");
+                fqn_names.iter().any(|fqn| joined == *fqn)
+            } else {
+                false
+            }
+        }
         "generic_type" => {
             // base type は通常先頭の named child。`A<B>` の `A` 部分。
             let mut cursor = type_node.walk();
@@ -858,6 +869,32 @@ fn java_type_node_matches(
         }
         _ => false,
     }
+}
+
+/// `scoped_type_identifier` を再帰的に辿り、各識別子セグメントを `segments` に push する。
+/// scoped_type_identifier の構造: `[scoped_type_identifier|scope] "." type_identifier`。
+/// 識別子以外の text (`.` トークンや空白) を比較対象から除くために用いる。
+fn java_collect_scoped_type_segments<'a>(
+    node: Node<'a>,
+    source: &'a [u8],
+    segments: &mut Vec<&'a str>,
+) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "scoped_type_identifier" | "scope" => {
+                if !java_collect_scoped_type_segments(child, source, segments) {
+                    return false;
+                }
+            }
+            "type_identifier" | "identifier" => match child.utf8_text(source) {
+                Ok(text) => segments.push(text),
+                Err(_) => return false,
+            },
+            _ => {}
+        }
+    }
+    !segments.is_empty()
 }
 
 /// Python の関数 / メソッド / クラスがフレームワーク登録デコレータ
@@ -1047,7 +1084,10 @@ pub fn is_js_ts_angular_lifecycle_hook(root: Node, source: &[u8], symbol_range: 
     // enclosing class_declaration を探し、@Component / @Directive decorator を確認
     let mut cur = method_node;
     while let Some(parent) = cur.parent() {
-        if parent.kind() == "class_declaration" {
+        if matches!(
+            parent.kind(),
+            "class_declaration" | "abstract_class_declaration"
+        ) {
             return class_has_component_or_directive_decorator(parent, source);
         }
         cur = parent;
@@ -1097,6 +1137,303 @@ fn class_has_component_or_directive_decorator(class_node: Node, source: &[u8]) -
                     _ => {}
                 }
             }
+        }
+    }
+    false
+}
+
+/// Angular の `ControlValueAccessor` 規約メソッド名。`@Component` / `@Directive` で装飾
+/// された CVA 実装クラスに含まれるとき、Angular Forms ランタイムが NG_VALUE_ACCESSOR
+/// provider 経由で `ngModel` / `formControl` バインド時に呼び出すため、静的 caller が
+/// 0 件でも dead ではない (GitLab #20)。`writeValue` / `registerOnChange` /
+/// `registerOnTouched` / `setDisabledState` の 4 メソッドを対象とする。
+const ANGULAR_CVA_METHODS: &[&str] = &[
+    "writeValue",
+    "registerOnChange",
+    "registerOnTouched",
+    "setDisabledState",
+];
+
+/// メンバー単位の Angular runtime entrypoint デコレータ名。これらが property / accessor /
+/// method に付与されているとき、Angular ランタイムが change detection / event binding /
+/// query 解決経由で呼ぶ・読む・書くため、静的 caller が 0 件でも dead ではない (GitLab #23)。
+///
+/// 対象:
+/// - イベント / バインディング: `@HostListener`, `@HostBinding`
+/// - input / output: `@Input`, `@Output`
+/// - view / content query: `@ViewChild`, `@ViewChildren`, `@ContentChild`, `@ContentChildren`
+const ANGULAR_MEMBER_RUNTIME_DECORATORS: &[&str] = &[
+    "HostListener",
+    "HostBinding",
+    "Input",
+    "Output",
+    "ViewChild",
+    "ViewChildren",
+    "ContentChild",
+    "ContentChildren",
+];
+
+/// `symbol_range` が Angular ランタイムから呼び出される member かを判定する。
+/// `is_js_ts_angular_lifecycle_hook` の上位互換で、`@Component` / `@Directive` 装飾クラスの
+/// 以下の member を `true` とする (静的 caller 0 件でも dead 候補から除外する想定):
+///
+/// 1. 既存: lifecycle hook 名 (`ngOnInit` 等)
+/// 2. (GitLab #20) `ControlValueAccessor` 規約メソッド (`writeValue` / `registerOnChange` /
+///    `registerOnTouched` / `setDisabledState`)。CVA を `implements ControlValueAccessor` で
+///    宣言しているか、または同じ意味の `NG_VALUE_ACCESSOR` provider を decorator metadata に
+///    持つクラスのみ対象。
+/// 3. (GitLab #23) member 単位の Angular decorator (`@HostListener` / `@HostBinding` /
+///    `@Input` / `@Output` / `@ViewChild` / `@ViewChildren` / `@ContentChild` /
+///    `@ContentChildren`) が付与された property / accessor / method。
+pub fn is_js_ts_angular_runtime_entrypoint(
+    root: Node,
+    source: &[u8],
+    symbol_range: &Range,
+) -> bool {
+    if is_js_ts_angular_lifecycle_hook(root, source, symbol_range) {
+        return true;
+    }
+    if is_js_ts_angular_member_decorator_target(root, source, symbol_range) {
+        return true;
+    }
+    if is_js_ts_angular_cva_contract_method(root, source, symbol_range) {
+        return true;
+    }
+    false
+}
+
+/// `symbol_range` の member (property / accessor / method) に Angular の member 単位
+/// runtime decorator (`@HostListener` 等) が付与されているか判定する。
+/// `@Component` / `@Directive` 装飾クラス配下のメンバーのみ対象とする (誤検出回避)。
+fn is_js_ts_angular_member_decorator_target(
+    root: Node,
+    source: &[u8],
+    symbol_range: &Range,
+) -> bool {
+    let start = tree_sitter::Point {
+        row: symbol_range.start.line,
+        column: symbol_range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: symbol_range.end.line,
+        column: symbol_range.end.column,
+    };
+    let Some(node) = root.descendant_for_point_range(start, end) else {
+        return false;
+    };
+
+    // member ノード (method_definition / public_field_definition 等) を探す。
+    // tree-sitter-typescript では @Input() x: string などは `public_field_definition`、
+    // @HostListener(...) f() {} などは `method_definition` として表現される。
+    let member_kinds = [
+        "method_definition",
+        "public_field_definition",
+        "field_definition",
+        "property_signature",
+    ];
+    let mut cur = Some(node);
+    let member_node = loop {
+        match cur {
+            Some(n) if member_kinds.contains(&n.kind()) => break n,
+            Some(n) => cur = n.parent(),
+            None => return false,
+        }
+    };
+
+    // 親が `class_body` で、その先祖 `class_declaration` / `abstract_class_declaration` が
+    // Angular 装飾されているか確認 (export abstract class も abstract_class_declaration になる)。
+    let mut class_cur = member_node;
+    let class_node = loop {
+        match class_cur.parent() {
+            Some(p) if matches!(p.kind(), "class_declaration" | "abstract_class_declaration") => {
+                break p;
+            }
+            Some(p) => class_cur = p,
+            None => return false,
+        }
+    };
+    if !class_has_component_or_directive_decorator(class_node, source) {
+        return false;
+    }
+
+    // member 自身に decorator が付いているか確認。
+    // tree-sitter-typescript では member の直前の child として decorator が並ぶ。
+    let parent = member_node.parent().unwrap_or(member_node);
+    let mut cursor = parent.walk();
+    let mut last_decorator_names: Vec<String> = Vec::new();
+    for child in parent.children(&mut cursor) {
+        if child.kind() == "decorator" {
+            if let Some(name) = decorator_call_name(child, source) {
+                last_decorator_names.push(name);
+            }
+        } else if child.id() == member_node.id() {
+            if last_decorator_names
+                .iter()
+                .any(|n| ANGULAR_MEMBER_RUNTIME_DECORATORS.contains(&n.as_str()))
+            {
+                return true;
+            }
+            last_decorator_names.clear();
+        } else {
+            last_decorator_names.clear();
+        }
+    }
+    false
+}
+
+/// decorator ノードから `@Foo(...)` の `Foo` 部分の識別子名を取り出す。
+fn decorator_call_name(decorator: Node, source: &[u8]) -> Option<String> {
+    let mut cursor = decorator.walk();
+    for child in decorator.children(&mut cursor) {
+        match child.kind() {
+            "identifier" => {
+                if let Ok(t) = child.utf8_text(source) {
+                    return Some(t.to_string());
+                }
+            }
+            "call_expression" => {
+                if let Some(callee) = child.child_by_field_name("function")
+                    && let Ok(t) = callee.utf8_text(source)
+                {
+                    return Some(t.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `symbol_range` の method が Angular CVA 規約メソッド (`writeValue` 等) かつ enclosing
+/// クラスが ControlValueAccessor を実装しているか判定する。
+///
+/// 「実装」の判定:
+/// - `implements ControlValueAccessor` (TS interface 実装節)、または
+/// - `@Component({providers: [{provide: NG_VALUE_ACCESSOR, ...}]})` のような provider 登録
+///   (decorator メタデータ内に `NG_VALUE_ACCESSOR` 識別子が含まれる)
+///
+/// どちらも構文上の手がかりを使う (cross-file 解析や型推論は行わない)。GitLab #20 対応。
+fn is_js_ts_angular_cva_contract_method(root: Node, source: &[u8], symbol_range: &Range) -> bool {
+    let start = tree_sitter::Point {
+        row: symbol_range.start.line,
+        column: symbol_range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: symbol_range.end.line,
+        column: symbol_range.end.column,
+    };
+    let Some(node) = root.descendant_for_point_range(start, end) else {
+        return false;
+    };
+
+    // method_definition を探す。
+    let mut cur = node;
+    let method_node = loop {
+        if cur.kind() == "method_definition" {
+            break cur;
+        }
+        match cur.parent() {
+            Some(p) => cur = p,
+            None => return false,
+        }
+    };
+    let Some(name_node) = method_node.child_by_field_name("name") else {
+        return false;
+    };
+    let Ok(name) = name_node.utf8_text(source) else {
+        return false;
+    };
+    if !ANGULAR_CVA_METHODS.contains(&name) {
+        return false;
+    }
+
+    // enclosing class を探し、`implements ControlValueAccessor` または NG_VALUE_ACCESSOR
+    // provider 登録があるか確認。
+    let mut cur = method_node;
+    while let Some(parent) = cur.parent() {
+        if matches!(
+            parent.kind(),
+            "class_declaration" | "abstract_class_declaration"
+        ) {
+            return class_implements_control_value_accessor(parent, source)
+                || class_has_ng_value_accessor_provider(parent, source);
+        }
+        cur = parent;
+    }
+    false
+}
+
+/// `class X implements ControlValueAccessor [...]` の implements 節を判定する。
+/// `implements` リストに `ControlValueAccessor` 識別子が含まれていれば true。
+fn class_implements_control_value_accessor(class_node: Node, source: &[u8]) -> bool {
+    let mut cursor = class_node.walk();
+    for child in class_node.children(&mut cursor) {
+        if child.kind() != "class_heritage" {
+            continue;
+        }
+        let mut inner = child.walk();
+        for grand in child.children(&mut inner) {
+            if grand.kind() != "implements_clause" {
+                continue;
+            }
+            // implements_clause の中の type 識別子を順次見る。
+            let mut g = grand.walk();
+            for type_node in grand.children(&mut g) {
+                if let Ok(t) = type_node.utf8_text(source)
+                    && t.trim() == "ControlValueAccessor"
+                {
+                    return true;
+                }
+                // generic_type / scoped 等の場合は子の識別子も走査
+                let mut tcur = type_node.walk();
+                for tchild in type_node.children(&mut tcur) {
+                    if let Ok(t) = tchild.utf8_text(source)
+                        && t.trim() == "ControlValueAccessor"
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `@Component({ providers: [{provide: NG_VALUE_ACCESSOR, ...}] })` のように decorator
+/// メタデータ内に `NG_VALUE_ACCESSOR` 識別子が含まれているか判定する。tree-sitter で
+/// 識別子トークン単位の出現を見るだけのざっくり判定 (string literal 内には現れないため
+/// 誤検出は起こりにくい)。
+fn class_has_ng_value_accessor_provider(class_node: Node, source: &[u8]) -> bool {
+    let containers: [Node; 2] = match class_node.parent() {
+        Some(parent) => [parent, class_node],
+        None => [class_node, class_node],
+    };
+    for container in &containers {
+        let mut cursor = container.walk();
+        for child in container.children(&mut cursor) {
+            if child.kind() != "decorator" {
+                continue;
+            }
+            if node_contains_identifier(child, source, "NG_VALUE_ACCESSOR") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `node` 配下の任意の identifier ノードが `target` と一致するかを再帰的に探す。
+fn node_contains_identifier(node: Node, source: &[u8], target: &str) -> bool {
+    if node.kind() == "identifier"
+        && let Ok(t) = node.utf8_text(source)
+        && t == target
+    {
+        return true;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if node_contains_identifier(child, source, target) {
+            return true;
         }
     }
     false
@@ -4075,6 +4412,131 @@ class Foo {
         assert!(!check_angular_lifecycle_hook(src, "regularMethod"));
     }
 
+    // --- is_js_ts_angular_runtime_entrypoint テスト ---
+
+    fn check_angular_runtime_entrypoint(source: &str, symbol_name: &str) -> bool {
+        let language = LangId::Typescript.ts_language();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        let syms = extract_symbols(root, source.as_bytes(), LangId::Typescript).unwrap();
+        let sym = syms
+            .iter()
+            .find(|s| s.name == symbol_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "symbol '{}' not found in {:?}",
+                    symbol_name,
+                    syms.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            });
+        is_js_ts_angular_runtime_entrypoint(root, source.as_bytes(), &sym.range)
+    }
+
+    /// GitLab issue #20: `implements ControlValueAccessor` のクラスの 4 規約メソッドは除外。
+    #[test]
+    fn angular_cva_methods_via_implements_are_detected() {
+        let src = r#"
+@Directive()
+export abstract class AbstractBaseControl implements ControlValueAccessor {
+    writeValue(obj: any) {}
+    registerOnChange(fn: any) {}
+    registerOnTouched(fn: any) {}
+    setDisabledState(isDisabled: boolean) {}
+}
+"#;
+        assert!(check_angular_runtime_entrypoint(src, "writeValue"));
+        assert!(check_angular_runtime_entrypoint(src, "registerOnChange"));
+        assert!(check_angular_runtime_entrypoint(src, "registerOnTouched"));
+        assert!(check_angular_runtime_entrypoint(src, "setDisabledState"));
+    }
+
+    /// GitLab issue #20: `NG_VALUE_ACCESSOR` provider 登録のあるクラス (implements 句なし) でも
+    /// CVA 規約メソッドは除外する。
+    #[test]
+    fn angular_cva_methods_via_ng_value_accessor_provider_are_detected() {
+        let src = r#"
+@Component({
+    selector: 'bz-input',
+    providers: [{ provide: NG_VALUE_ACCESSOR, useExisting: InputControlComponent, multi: true }],
+})
+export class InputControlComponent {
+    writeValue(obj: any) {}
+    registerOnChange(fn: any) {}
+    registerOnTouched(fn: any) {}
+}
+"#;
+        assert!(check_angular_runtime_entrypoint(src, "writeValue"));
+        assert!(check_angular_runtime_entrypoint(src, "registerOnChange"));
+        assert!(check_angular_runtime_entrypoint(src, "registerOnTouched"));
+    }
+
+    /// CVA 規約メソッド名でも `implements ControlValueAccessor` も NG_VALUE_ACCESSOR provider
+    /// もない通常クラスでは除外対象外。
+    #[test]
+    fn angular_cva_method_name_in_non_cva_class_not_detected() {
+        let src = r#"
+@Component({ template: '' })
+export class PlainComponent {
+    writeValue(obj: any) {}
+}
+"#;
+        assert!(!check_angular_runtime_entrypoint(src, "writeValue"));
+    }
+
+    /// GitLab issue #23: `@HostListener` 付きメソッドは除外対象。
+    #[test]
+    fn angular_host_listener_method_is_detected() {
+        let src = r#"
+@Component({ template: '' })
+export class ChatComponent {
+    @HostListener('window:beforeunload', ['$event'])
+    beforeUnloadHandler() {}
+}
+"#;
+        assert!(check_angular_runtime_entrypoint(src, "beforeUnloadHandler"));
+    }
+
+    /// `@HostListener` が付かないメソッドは除外対象外。
+    #[test]
+    fn angular_method_without_host_listener_not_detected() {
+        let src = r#"
+@Component({ template: '' })
+export class ChatComponent {
+    notAHandler() {}
+}
+"#;
+        assert!(!check_angular_runtime_entrypoint(src, "notAHandler"));
+    }
+
+    /// `@HostBinding` 付き method も Angular 経路扱いで除外する (member 単位 decorator
+    /// allowlist の網羅確認)。
+    #[test]
+    fn angular_host_binding_method_is_detected() {
+        let src = r#"
+@Directive({ selector: '[appFoo]' })
+export class FooDirective {
+    @HostBinding('class.active')
+    isActive() { return true; }
+}
+"#;
+        assert!(check_angular_runtime_entrypoint(src, "isActive"));
+    }
+
+    /// `@Component` / `@Directive` を持たないクラスのメンバーは Angular 経路扱いしない
+    /// (member decorator が付いていても class 装飾が無ければ Angular とみなさない)。
+    #[test]
+    fn angular_member_decorator_in_non_angular_class_not_detected() {
+        let src = r#"
+class Plain {
+    @HostListener('click')
+    onClick() {}
+}
+"#;
+        assert!(!check_angular_runtime_entrypoint(src, "onClick"));
+    }
+
     // --- is_java_flyway_migration_class テスト ---
 
     fn check_java_flyway_class(source: &str, symbol_name: &str) -> bool {
@@ -4218,5 +4680,17 @@ public class Custom extends com.example.BaseJavaMigration {
 }
 "#;
         assert!(!check_java_flyway_class(src, "Custom"));
+    }
+
+    /// FQN が改行 (valid Java) で分割されていても、AST 識別子セグメントの連結で比較する
+    /// ため検出漏れしない (codex 指摘の raw text 比較弱点に対する対処)。
+    #[test]
+    fn java_flyway_migration_split_fqn_is_detected() {
+        let src = "package db.migration;\n\
+                   public class V2__SplitFqn extends org.flywaydb.core.api.migration.\n\
+                       BaseJavaMigration {\n\
+                       public void migrate(org.flywaydb.core.api.migration.Context context) throws Exception {}\n\
+                   }\n";
+        assert!(check_java_flyway_class(src, "V2__SplitFqn"));
     }
 }
