@@ -5502,6 +5502,108 @@ fn review_respects_framework_laravel_preset() {
 }
 
 #[test]
+fn review_hook_suppresses_wip_added_dead_by_default() {
+    // `review --hook` の既定: 同一 diff で新規 export されたシンボル (api.added に挙がる)
+    // は WIP の純粋ヘルパー追加とみなして dead 警告から除外する
+    // (Issue 2026-06-25-wip-dead-symbol-during-incremental-impl)。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    let src = "export function matchAssigneeName(input: string) {\n    return input;\n}\n";
+    std::fs::write(root.join("notes.ts"), src).unwrap();
+    let diff = make_new_file_diff("notes.ts", src);
+    let diff_path = root.join("changes.patch");
+    std::fs::write(&diff_path, diff).unwrap();
+
+    // --hook + default (=include_wip_dead 無効): hook exit 0、stdout 無出力
+    let output = cargo_bin()
+        .args([
+            "review",
+            "--dir",
+            root.to_str().unwrap(),
+            "--diff-file",
+            diff_path.to_str().unwrap(),
+            "--hook",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "hook の dead 抑止が効いていれば stdout は空 (= blocking 無し): {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    // --hook --include-wip-dead: 抑止解除 ― WIP 新規追加も dead として出る。
+    // hook は dead を blocking とみなし stderr に JSON を出して exit != 0 を返す
+    // (= caller (Stop hook) に WIP dead を通知)。
+    let output = cargo_bin()
+        .args([
+            "review",
+            "--dir",
+            root.to_str().unwrap(),
+            "--diff-file",
+            diff_path.to_str().unwrap(),
+            "--hook",
+            "--include-wip-dead",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(
+        !output.status.success(),
+        "--include-wip-dead で WIP dead が残れば hook は blocking 検出として exit != 0 を返す"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("matchAssigneeName") && stderr.contains("\"dead\""),
+        "--include-wip-dead で抑止を外せば dead が hook の blocking 出力 (stderr) に現れる: {stderr}"
+    );
+}
+
+#[test]
+fn review_without_hook_keeps_wip_added_dead() {
+    // `review` 単体 (非 hook): WIP dead 抑止は適用しない。レビュアーが api.added と
+    // dead の両者を見て総合判断するため、自動抑止は --hook 経路に限定する設計。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    let src = "export function matchAssigneeName(input: string) {\n    return input;\n}\n";
+    std::fs::write(root.join("notes.ts"), src).unwrap();
+    let diff = make_new_file_diff("notes.ts", src);
+    let diff_path = root.join("changes.patch");
+    std::fs::write(&diff_path, diff).unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "review",
+            "--dir",
+            root.to_str().unwrap(),
+            "--diff-file",
+            diff_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        dead.iter().any(|n| n == "matchAssigneeName"),
+        "非 hook の通常 review は WIP dead を抑止せず従来通り全 dead を返す: {dead:?}"
+    );
+}
+
+#[test]
 fn review_framework_unknown_errors() {
     // 未知の framework 値は cmd_dead_code と同じエラー形式で拒否されること。
     let dir = tempfile::TempDir::new().unwrap();

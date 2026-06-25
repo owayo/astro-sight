@@ -781,12 +781,15 @@ pub fn cmd_review(
             };
             // WIP dead 抑止: 同一 diff で新規 export された (= api_changes.added に挙がる)
             // シンボルは「多段実装中に consumer 結線が後続コミット予定」の純粋ヘルパー追加
-            // 等に該当しうるため、デフォルトで dead 警告から外す。`--include-wip-dead` で旧
-            // 挙動 (全 dead を返す) に戻せる (Issue 2026-06-25-wip-dead-symbol-during-incremental-impl)。
-            let dead_symbols = if include_wip_dead {
-                dead_symbols
-            } else {
+            // 等に該当しうるため、`review --hook` のデフォルトで dead 警告から外す。
+            // `--include-wip-dead` で旧挙動 (全 dead を返す) に戻せる。`--hook` 無しの通常
+            // `review` JSON では従来通り全 dead を残す ― レビュアーが api.added と dead の
+            // 両者を見て総合判断する想定で、自動 hook ノイズ抑止のスコープを外している
+            // (Issue 2026-06-25-wip-dead-symbol-during-incremental-impl)。
+            let dead_symbols = if hook && !include_wip_dead {
                 filter_dead_by_wip_added(dead_symbols, &api_changes.added)
+            } else {
+                dead_symbols
             };
             (dead_symbols, test_only_symbols)
         }
