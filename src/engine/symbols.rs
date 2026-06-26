@@ -1605,19 +1605,26 @@ fn is_js_ts_angular_cva_contract_method(root: Node, source: &[u8], symbol_range:
         return false;
     }
 
-    // enclosing class を探し、`@Component` / `@Directive` 装飾されており、かつ
-    // `implements ControlValueAccessor` または NG_VALUE_ACCESSOR provider 登録があるか確認。
-    // class decorator チェックを必須にすることで、非 Angular クラスの dead-code を
-    // 偶然 ControlValueAccessor 同名 interface 経由で誤抑止しないようにする (codex 指摘)。
+    // enclosing class が `implements ControlValueAccessor` または NG_VALUE_ACCESSOR
+    // provider を持つかで判定する。
+    //
+    // `@Component` / `@Directive` 装飾の有無は **問わない** (GitLab issue #25 対応):
+    // 抽象基底クラスに装飾なしで CVA を実装し、具象子クラスが別ファイルで
+    // `@Component({ providers: [...NG_VALUE_ACCESSOR...] })` を宣言して `extends` する
+    // 構成が広く使われている。装飾を必須にすると基底側 CVA メソッドが dead 判定される。
+    //
+    // 同名 interface を非 Angular プロジェクトで独自定義し、かつ CVA 4 メソッドを同形で
+    // 持つ確率は実用上ゼロと判断 (`ControlValueAccessor` は @angular/forms の専用契約名)。
+    // member decorator (`@HostListener` / `@Input` 等) の判定は引き続き `@Component` /
+    // `@Directive` 装飾を必須に維持し、誤抑止リスクを限定する。
     let mut cur = method_node;
     while let Some(parent) = cur.parent() {
         if matches!(
             parent.kind(),
             "class_declaration" | "abstract_class_declaration"
         ) {
-            return class_has_component_or_directive_decorator(parent, source)
-                && (class_implements_control_value_accessor(parent, source)
-                    || class_has_ng_value_accessor_provider(parent, source));
+            return class_implements_control_value_accessor(parent, source)
+                || class_has_ng_value_accessor_provider(parent, source);
         }
         cur = parent;
     }
@@ -4734,7 +4741,7 @@ export class InputControlComponent {
     }
 
     /// CVA 規約メソッド名でも `implements ControlValueAccessor` も NG_VALUE_ACCESSOR provider
-    /// もない通常クラスでは除外対象外。
+    /// もない通常クラスでは除外対象外 (Angular 装飾があるだけでは不十分。CVA 契約の証拠が必要)。
     #[test]
     fn angular_cva_method_name_in_non_cva_class_not_detected() {
         let src = r#"
@@ -4746,28 +4753,48 @@ export class PlainComponent {
         assert!(!check_angular_runtime_entrypoint(src, "writeValue"));
     }
 
-    /// `implements ControlValueAccessor` していても、`@Component` / `@Directive` 装飾が
-    /// 無いクラス (素のクラス / `@Injectable()` 装飾クラス等) では除外対象外。Angular runtime
-    /// entrypoint ではない同名 interface 実装の dead-code を誤抑止しないため (codex 指摘 #20)。
+    /// GitLab issue #25: `@Directive()` / `@Component` 装飾が無くても、`implements
+    /// ControlValueAccessor` の abstract 基底クラスの CVA 規約メソッドは除外する。
+    /// 具象子クラスが別ファイルで `@Component({...NG_VALUE_ACCESSOR provider...})` を宣言し
+    /// `extends` する Angular の慣用パターンに対応する (codex 設計判断 — `ControlValueAccessor`
+    /// は @angular/forms の専用契約名なので同名衝突は実用上ゼロと評価)。
     #[test]
-    fn angular_cva_in_non_angular_decorated_class_not_detected() {
+    fn angular_cva_in_undecorated_abstract_base_is_detected() {
         let src = r#"
-export class PlainCva implements ControlValueAccessor {
+export abstract class AbstractBaseControl implements ControlValueAccessor {
     writeValue(obj: any) {}
     registerOnChange(fn: any) {}
+    registerOnTouched(fn: any) {}
+    setDisabledState(isDisabled: boolean) {}
 }
 "#;
-        assert!(!check_angular_runtime_entrypoint(src, "writeValue"));
-        assert!(!check_angular_runtime_entrypoint(src, "registerOnChange"));
+        assert!(check_angular_runtime_entrypoint(src, "writeValue"));
+        assert!(check_angular_runtime_entrypoint(src, "registerOnChange"));
+        assert!(check_angular_runtime_entrypoint(src, "registerOnTouched"));
+        assert!(check_angular_runtime_entrypoint(src, "setDisabledState"));
     }
 
-    /// `@Injectable` 装飾は対象外 (lifecycle hook と同じ判定方針) ― CVA 規約メソッドが
-    /// あっても dead 抑止しない。
+    /// `@Injectable` 装飾クラスでも `implements ControlValueAccessor` を伴う場合は除外。
+    /// 装飾なし基底を許す方針 (#25) との一貫性のため、Angular の他装飾でも CVA 契約の証拠が
+    /// あれば抑止する。
     #[test]
-    fn angular_cva_in_injectable_class_not_detected() {
+    fn angular_cva_in_injectable_class_with_implements_is_detected() {
         let src = r#"
 @Injectable({ providedIn: 'root' })
 export class InjectableCva implements ControlValueAccessor {
+    writeValue(obj: any) {}
+}
+"#;
+        assert!(check_angular_runtime_entrypoint(src, "writeValue"));
+    }
+
+    /// `ControlValueAccessor` 以外の interface を implements する class で同名 CVA メソッドが
+    /// あっても除外対象外。誤抑止防止のため interface 名は厳密一致する必要がある。
+    #[test]
+    fn angular_cva_method_in_unrelated_interface_implementation_not_detected() {
+        let src = r#"
+interface SomeOtherContract { writeValue(obj: any): void; }
+export class Other implements SomeOtherContract {
     writeValue(obj: any) {}
 }
 "#;

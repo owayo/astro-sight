@@ -5906,6 +5906,76 @@ export abstract class AbstractBaseControl implements ControlValueAccessor {
     );
 }
 
+/// GitLab issue #25: `@Directive()` / `@Component` 装飾の無い abstract 基底クラスでも
+/// `implements ControlValueAccessor` を伴えば CVA 規約メソッドを dead から除外する。
+/// 具象子クラスが別ファイルで `@Component({...NG_VALUE_ACCESSOR provider...})` を宣言し
+/// `extends` する Angular の慣用パターン (装飾なし AbstractBaseControl 系) に対応。
+#[test]
+fn dead_code_excludes_cva_methods_in_undecorated_abstract_base() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/app/shared")).unwrap();
+    // 抽象基底クラス: Angular デコレータ無し、`implements ControlValueAccessor` のみ
+    let base_src = "\
+import { ControlValueAccessor } from '@angular/forms';
+export abstract class AbstractBaseControlComponent implements ControlValueAccessor {
+    writeValue(obj: any) {}
+    registerOnChange(fn: any) {}
+    registerOnTouched(fn: any) {}
+    customHelper() {}
+}
+";
+    std::fs::write(
+        root.join("src/app/shared/abstract.base.control.component.ts"),
+        base_src,
+    )
+    .unwrap();
+    // 具象子クラス: 別ファイルで @Component + NG_VALUE_ACCESSOR provider、extends 基底
+    let concrete_src = "\
+import { Component } from '@angular/core';
+import { NG_VALUE_ACCESSOR } from '@angular/forms';
+import { AbstractBaseControlComponent } from './abstract.base.control.component';
+@Component({
+    selector: 'bz-input-control',
+    template: '<input />',
+    providers: [{ provide: NG_VALUE_ACCESSOR, useExisting: InputControlComponent, multi: true }],
+})
+export class InputControlComponent extends AbstractBaseControlComponent {}
+";
+    std::fs::write(
+        root.join("src/app/shared/input-control.component.ts"),
+        concrete_src,
+    )
+    .unwrap();
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead_names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    for name in ["writeValue", "registerOnChange", "registerOnTouched"] {
+        assert!(
+            !dead_names.iter().any(|n| n.contains(name)),
+            "装飾なし abstract 基底クラスの CVA 規約メソッド `{name}` は除外されるべき: {dead_names:?}"
+        );
+    }
+    // CVA 規約外の自前メソッド customHelper は除外対象外 (装飾なし基底クラスでも誤抑止しない、回帰担保)。
+    assert!(
+        dead_names.iter().any(|n| n.contains("customHelper")),
+        "CVA 規約外の自前メソッドは dead として残るべき (装飾なし基底でも誤抑止しない、回帰担保): {dead_names:?}"
+    );
+}
+
 /// GitLab issue #23: `@HostListener` 付きメソッドは Angular ランタイムがイベント発火時に
 /// 呼ぶため、静的 caller 0 件でも dead から除外する。
 #[test]
