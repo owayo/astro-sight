@@ -1707,6 +1707,131 @@ fn node_contains_identifier(node: Node, source: &[u8], target: &str) -> bool {
     false
 }
 
+const ANGULAR_PROVIDER_CALLBACK_TOKENS: &[&str] = &["RECAPTCHA_LOADER_OPTIONS"];
+const ANGULAR_PROVIDER_CALLBACK_METHODS: &[&str] = &["onBeforeLoad"];
+
+/// Angular DI provider option に埋め込まれた callback method を runtime entrypoint として判定する。
+///
+/// 例: `providers: [{ provide: RECAPTCHA_LOADER_OPTIONS, useValue: { onBeforeLoad(url) { ... } } }]`
+/// の `onBeforeLoad` は ng-recaptcha 側から呼ばれ、TypeScript 上の caller は現れない。
+pub fn is_js_ts_angular_provider_option_callback(
+    root: Node,
+    source: &[u8],
+    symbol_range: &Range,
+) -> bool {
+    let start = tree_sitter::Point {
+        row: symbol_range.start.line,
+        column: symbol_range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: symbol_range.end.line,
+        column: symbol_range.end.column,
+    };
+    let Some(node) = root.descendant_for_point_range(start, end) else {
+        return false;
+    };
+
+    let mut cur = node;
+    let callback_node = loop {
+        if matches!(
+            cur.kind(),
+            "method_definition" | "function_expression" | "arrow_function"
+        ) {
+            break cur;
+        }
+        match cur.parent() {
+            Some(parent) => cur = parent,
+            None => return false,
+        }
+    };
+
+    let (callback_name, containing_object) = match callback_node.kind() {
+        "method_definition" => {
+            let Some(name_node) = callback_node.child_by_field_name("name") else {
+                return false;
+            };
+            let Ok(name) = name_node.utf8_text(source) else {
+                return false;
+            };
+            let Some(object) = callback_node.parent().filter(|p| p.kind() == "object") else {
+                return false;
+            };
+            (name, object)
+        }
+        "function_expression" | "arrow_function" => {
+            let Some(pair) = callback_node.parent().filter(|p| p.kind() == "pair") else {
+                return false;
+            };
+            let Some(key) = pair.child_by_field_name("key") else {
+                return false;
+            };
+            let Ok(name) = key.utf8_text(source) else {
+                return false;
+            };
+            let Some(object) = pair.parent().filter(|p| p.kind() == "object") else {
+                return false;
+            };
+            (name, object)
+        }
+        _ => return false,
+    };
+
+    if !ANGULAR_PROVIDER_CALLBACK_METHODS.contains(&callback_name) {
+        return false;
+    }
+
+    let Some(provider_object) = angular_provider_object_for_use_value(containing_object, source)
+    else {
+        return false;
+    };
+    angular_provider_object_has_token(provider_object, source)
+}
+
+fn angular_provider_object_for_use_value<'a>(
+    callback_object: Node<'a>,
+    source: &[u8],
+) -> Option<Node<'a>> {
+    let use_value_pair = callback_object.parent().filter(|p| p.kind() == "pair")?;
+    if !pair_key_matches(use_value_pair, source, "useValue") {
+        return None;
+    }
+    if use_value_pair
+        .child_by_field_name("value")
+        .is_none_or(|value| value.id() != callback_object.id())
+    {
+        return None;
+    }
+    use_value_pair.parent().filter(|p| p.kind() == "object")
+}
+
+fn angular_provider_object_has_token(provider_object: Node, source: &[u8]) -> bool {
+    let mut cursor = provider_object.walk();
+    for child in provider_object.children(&mut cursor) {
+        if child.kind() != "pair" || !pair_key_matches(child, source, "provide") {
+            continue;
+        }
+        if let Some(value) = child.child_by_field_name("value")
+            && ANGULAR_PROVIDER_CALLBACK_TOKENS
+                .iter()
+                .any(|token| node_contains_identifier(value, source, token))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn pair_key_matches(pair: Node, source: &[u8], expected: &str) -> bool {
+    let Some(key) = pair.child_by_field_name("key") else {
+        return false;
+    };
+    let Ok(raw) = key.utf8_text(source) else {
+        return false;
+    };
+    let key = raw.trim_matches(|c| c == '\'' || c == '"' || c == '`');
+    key == expected
+}
+
 /// その他: `pytest.mark.<anything>` プレフィックスを pytest test marker として認識。
 pub fn has_framework_entrypoint_decorator_python(
     root: Node,

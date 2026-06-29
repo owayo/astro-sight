@@ -2150,6 +2150,23 @@ pub(crate) fn filter_exported_symbols(
         {
             continue;
         }
+        // Angular DI provider option callback。例: RECAPTCHA_LOADER_OPTIONS の
+        // `useValue: { onBeforeLoad() { ... } }` はライブラリ側から呼ばれるため、
+        // TS 上の直接 caller が無くても dead ではない (GitLab #26)。
+        if exclude_framework_entrypoints
+            && matches!(
+                lang_id,
+                crate::language::LangId::Typescript
+                    | crate::language::LangId::Tsx
+                    | crate::language::LangId::Javascript
+            )
+            && matches!(sym.kind, SymbolKind::Method | SymbolKind::Function)
+            && crate::engine::symbols::is_js_ts_angular_provider_option_callback(
+                root, source, &sym.range,
+            )
+        {
+            continue;
+        }
         // Angular `@Component` / `@Directive` 装飾クラスの runtime entrypoint メンバー。
         // 以下の 3 系統を統合判定する (詳細は is_js_ts_angular_runtime_entrypoint):
         //   1. lifecycle hook メソッド (`ngOnInit` / `ngAfterViewChecked` 等、既存)

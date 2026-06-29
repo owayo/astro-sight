@@ -34,6 +34,8 @@ pub fn collect_angular_template_refs(dir: &Path) -> HashSet<String> {
         return HashSet::new();
     }
     let mut refs = HashSet::new();
+    let mut used_element_selectors = HashSet::new();
+    let mut selector_classes: HashMap<String, Vec<String>> = HashMap::new();
     let walker = ignore::WalkBuilder::new(dir).hidden(false).build();
     for entry in walker.flatten() {
         let path = entry.path();
@@ -48,6 +50,7 @@ pub fn collect_angular_template_refs(dir: &Path) -> HashSet<String> {
             "html" | "htm" => {
                 if let Ok(content) = std::fs::read_to_string(path) {
                     extract_template_refs(&content, &mut refs);
+                    extract_element_selectors(&content, &mut used_element_selectors);
                 }
             }
             "ts" => {
@@ -55,9 +58,24 @@ pub fn collect_angular_template_refs(dir: &Path) -> HashSet<String> {
                 // @Component を使う場合もあるので拡張子のみで一括対応する。
                 if let Ok(content) = std::fs::read_to_string(path) {
                     extract_inline_template_refs(&content, &mut refs);
+                    extract_inline_template_element_selectors(
+                        &content,
+                        &mut used_element_selectors,
+                    );
+                    for (selector, class_name) in extract_component_selector_classes(&content) {
+                        selector_classes
+                            .entry(selector)
+                            .or_default()
+                            .push(class_name);
+                    }
                 }
             }
             _ => {}
+        }
+    }
+    for selector in used_element_selectors {
+        if let Some(classes) = selector_classes.get(&selector) {
+            refs.extend(classes.iter().cloned());
         }
     }
     refs
@@ -96,6 +114,45 @@ fn extract_template_refs(content: &str, refs: &mut HashSet<String>) {
     extract_interpolation_refs(content, refs);
     extract_binding_refs(content, refs);
     extract_control_flow_refs(content, refs);
+}
+
+/// `<bz-popup>` のような Angular component element selector を抽出する。
+/// selector→class 対応は `.ts` 側で別途引くため、ここでは tag 名だけを集める。
+fn extract_element_selectors(content: &str, selectors: &mut HashSet<String>) {
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        if start >= bytes.len()
+            || matches!(bytes[start], b'/' | b'!' | b'?' | b'@')
+            || !is_html_tag_start(bytes[start])
+        {
+            i += 1;
+            continue;
+        }
+        let mut j = start + 1;
+        while j < bytes.len() && is_html_tag_continue(bytes[j]) {
+            j += 1;
+        }
+        if let Ok(tag) = std::str::from_utf8(&bytes[start..j])
+            && tag.contains('-')
+        {
+            selectors.insert(tag.to_ascii_lowercase());
+        }
+        i = j;
+    }
+}
+
+fn is_html_tag_start(b: u8) -> bool {
+    b.is_ascii_alphabetic()
+}
+
+fn is_html_tag_continue(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')
 }
 
 /// `{{ ... }}` 補間式の中身から識別子を抽出する。
@@ -281,6 +338,178 @@ fn extract_inline_template_refs(content: &str, refs: &mut HashSet<String>) {
         }
         i = j + 1;
     }
+}
+
+fn extract_inline_template_element_selectors(content: &str, selectors: &mut HashSet<String>) {
+    for_each_inline_template(content, |template| {
+        extract_element_selectors(template, selectors);
+    });
+}
+
+fn for_each_inline_template(content: &str, mut f: impl FnMut(&str)) {
+    let bytes = content.as_bytes();
+    let needle = b"template:";
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] != needle {
+            i += 1;
+            continue;
+        }
+        if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+            i += 1;
+            continue;
+        }
+        let mut j = i + needle.len();
+        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            break;
+        }
+        let quote = bytes[j];
+        if quote != b'`' && quote != b'\'' && quote != b'"' {
+            i = j.max(i + 1);
+            continue;
+        }
+        j += 1;
+        let start = j;
+        while j < bytes.len() && bytes[j] != quote {
+            if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                j += 2;
+            } else {
+                j += 1;
+            }
+        }
+        if j >= bytes.len() {
+            break;
+        }
+        if let Ok(template_content) = std::str::from_utf8(&bytes[start..j]) {
+            f(template_content);
+        }
+        i = j + 1;
+    }
+}
+
+fn extract_component_selector_classes(content: &str) -> Vec<(String, String)> {
+    let bytes = content.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(rel) = content[i..].find("@Component") {
+        let comp_start = i + rel;
+        let Some(open_rel) = content[comp_start..].find('(') else {
+            break;
+        };
+        let open = comp_start + open_rel;
+        let Some(close) = find_matching_paren(bytes, open) else {
+            break;
+        };
+        let metadata = &content[open + 1..close];
+        let selectors = extract_component_selectors_from_metadata(metadata);
+        if !selectors.is_empty()
+            && let Some(class_name) = find_class_name_after(content, close + 1)
+        {
+            for selector in selectors {
+                out.push((selector, class_name.clone()));
+            }
+        }
+        i = close + 1;
+    }
+    out
+}
+
+fn extract_component_selectors_from_metadata(metadata: &str) -> Vec<String> {
+    let mut selectors = Vec::new();
+    let bytes = metadata.as_bytes();
+    let needle = b"selector";
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] != needle {
+            i += 1;
+            continue;
+        }
+        let before_ok = i == 0 || !is_ident_continue(bytes[i - 1]);
+        let after = i + needle.len();
+        let after_ok = after >= bytes.len() || !is_ident_continue(bytes[after]);
+        if !before_ok || !after_ok {
+            i += 1;
+            continue;
+        }
+        let mut j = after;
+        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n') {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b':' {
+            i += 1;
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n') {
+            j += 1;
+        }
+        if j >= bytes.len() || !matches!(bytes[j], b'\'' | b'"' | b'`') {
+            i = j.max(i + 1);
+            continue;
+        }
+        let quote = bytes[j];
+        j += 1;
+        let start = j;
+        while j < bytes.len() && bytes[j] != quote {
+            if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                j += 2;
+            } else {
+                j += 1;
+            }
+        }
+        if j >= bytes.len() {
+            break;
+        }
+        if let Ok(raw) = std::str::from_utf8(&bytes[start..j]) {
+            selectors.extend(raw.split(',').filter_map(selector_to_element_key));
+        }
+        i = j + 1;
+    }
+    selectors
+}
+
+fn selector_to_element_key(selector: &str) -> Option<String> {
+    let s = selector.trim();
+    if s.is_empty() || s.starts_with('[') || s.starts_with('.') {
+        return None;
+    }
+    let end = s
+        .find(|c: char| c.is_whitespace() || matches!(c, '[' | '.' | ':'))
+        .unwrap_or(s.len());
+    let name = &s[..end];
+    if name.contains('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        Some(name.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+fn find_class_name_after(content: &str, start: usize) -> Option<String> {
+    let tail = content.get(start..)?;
+    let class_pos = find_keyword(tail, "class")?;
+    let bytes = tail.as_bytes();
+    let mut i = class_pos + "class".len();
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n') {
+        i += 1;
+    }
+    if i >= bytes.len() || !is_ident_start(bytes[i]) {
+        return None;
+    }
+    let name_start = i;
+    i += 1;
+    while i < bytes.len() && is_ident_continue(bytes[i]) {
+        i += 1;
+    }
+    std::str::from_utf8(&bytes[name_start..i])
+        .ok()
+        .map(str::to_string)
 }
 
 /// `bytes[open]` が `(` のとき、対応する閉じ `)` の index を返す。

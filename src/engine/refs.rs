@@ -576,6 +576,7 @@ fn collect_identifier_refs(
         && let Ok(text) = node.utf8_text(source)
         && ident_ref_matches(lang_id, node, text, symbol_name)
         && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
+        && !is_ignored_identifier_context(node, lang_id)
     {
         let is_def = is_definition_context(node, definition_kinds, lang_id);
         let context = extract_line_context_indexed(source, line_index, node.start_position().row);
@@ -699,14 +700,8 @@ fn is_definition_context(node: Node<'_>, definition_kinds: &[&str], lang_id: Lan
         return is_zig_definition_context(node, definition_kinds);
     }
 
-    // C/C++: type_definition の declarator と enumerator の name のみを Definition とみなす。
-    // typedef の元型 (`typedef MYSQL MyConn;` の MYSQL) や enumerator の value 式内の識別子
-    // (`FOO = BAR` の BAR) は参照として扱う。これにより enumerator / typedef alias の宣言行を
-    // 参照と二重計上せず、宣言名経由の liveness 判定 (Issue #11/#12) を成立させる。
-    if matches!(lang_id, LangId::C | LangId::Cpp)
-        && let Some(is_def) = cpp_typedef_enum_definition_context(node)
-    {
-        return is_def;
+    if matches!(lang_id, LangId::C | LangId::Cpp) {
+        return is_cpp_definition_context(node);
     }
 
     if let Some(parent) = node.parent() {
@@ -722,6 +717,190 @@ fn is_definition_context(node: Node<'_>, definition_kinds: &[&str], lang_id: Lan
         }
     }
     false
+}
+
+fn is_ignored_identifier_context(node: Node<'_>, lang_id: LangId) -> bool {
+    matches!(lang_id, LangId::C | LangId::Cpp)
+        && is_cpp_standalone_forward_declaration_tag_name(node)
+}
+
+/// C/C++ は `struct X` / `enum X` の型使用が `*_specifier` 配下に現れるため、
+/// 汎用 parent/grandparent 判定だとパラメータ型やローカル変数型まで Definition になる。
+/// body 付き tag 定義・関数本体付き定義の名前だけを Definition として扱う。
+fn is_cpp_definition_context(node: Node<'_>) -> bool {
+    if let Some(is_def) = cpp_typedef_enum_definition_context(node) {
+        return is_def;
+    }
+    if let Some(is_def) = cpp_tag_specifier_definition_context(node) {
+        return is_def;
+    }
+    if let Some(is_def) = cpp_function_definition_context(node) {
+        return is_def;
+    }
+    if let Some(parent) = node.parent()
+        && parent.kind() == "namespace_definition"
+    {
+        return parent
+            .child_by_field_name("name")
+            .is_some_and(|name| name.id() == node.id());
+    }
+    false
+}
+
+/// `struct X;` / `class X;` のような単独 forward declaration は定義でも参照でもない。
+/// 型使用 (`struct X *p`) は declarator を持つ declaration なのでここでは除外しない。
+fn is_cpp_standalone_forward_declaration_tag_name(node: Node<'_>) -> bool {
+    let mut cur = node;
+    while let Some(parent) = cur.parent() {
+        match parent.kind() {
+            "struct_specifier" | "class_specifier" | "union_specifier" | "enum_specifier" => {
+                let is_name = parent
+                    .child_by_field_name("name")
+                    .is_some_and(|name| name.id() == node.id());
+                if !is_name || cpp_tag_specifier_has_body(parent) {
+                    return false;
+                }
+                return cpp_tag_specifier_is_standalone_forward_declaration(parent);
+            }
+            "type_definition"
+            | "function_definition"
+            | "parameter_declaration"
+            | "compound_statement" => return false,
+            _ => {}
+        }
+        cur = parent;
+    }
+    false
+}
+
+fn cpp_tag_specifier_is_standalone_forward_declaration(spec: Node<'_>) -> bool {
+    let Some(parent) = spec.parent() else {
+        return false;
+    };
+    match parent.kind() {
+        "translation_unit" | "namespace_definition" | "type_definition" => true,
+        "declaration" | "field_declaration" => !cpp_declaration_has_declarator(parent),
+        "declaration_list" => parent.parent().is_some_and(|p| {
+            matches!(
+                p.kind(),
+                "translation_unit"
+                    | "namespace_definition"
+                    | "struct_specifier"
+                    | "class_specifier"
+                    | "union_specifier"
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn cpp_declaration_has_declarator(decl: Node<'_>) -> bool {
+    if decl.child_by_field_name("declarator").is_some() {
+        return true;
+    }
+    let mut cursor = decl.walk();
+    decl.children(&mut cursor).any(|child| {
+        matches!(
+            child.kind(),
+            "init_declarator"
+                | "pointer_declarator"
+                | "reference_declarator"
+                | "array_declarator"
+                | "function_declarator"
+                | "parenthesized_declarator"
+                | "identifier"
+                | "field_identifier"
+        )
+    })
+}
+
+/// `struct X {}` / `class X {}` / `enum X {}` の tag 名だけを Definition とする。
+/// `struct X *p` / `sizeof(struct X)` は型参照。forward declaration `struct X;` は別途 skip。
+fn cpp_tag_specifier_definition_context(node: Node<'_>) -> Option<bool> {
+    let mut cur = node;
+    while let Some(parent) = cur.parent() {
+        match parent.kind() {
+            "struct_specifier" | "class_specifier" | "union_specifier" | "enum_specifier" => {
+                let is_name = parent
+                    .child_by_field_name("name")
+                    .is_some_and(|name| name.id() == node.id());
+                return Some(is_name && cpp_tag_specifier_has_body(parent));
+            }
+            "type_definition"
+            | "function_definition"
+            | "declaration"
+            | "field_declaration"
+            | "parameter_declaration"
+            | "compound_statement"
+            | "translation_unit" => return None,
+            _ => {}
+        }
+        cur = parent;
+    }
+    None
+}
+
+fn cpp_tag_specifier_has_body(spec: Node<'_>) -> bool {
+    let mut cursor = spec.walk();
+    spec.children(&mut cursor).any(|child| {
+        matches!(
+            child.kind(),
+            "field_declaration_list" | "enumerator_list" | "declaration_list"
+        )
+    })
+}
+
+/// 本体を持つ C/C++ function_definition の宣言子名だけを Definition とする。
+/// parameter / return type / local declaration の型名は Reference に倒す。
+fn cpp_function_definition_context(node: Node<'_>) -> Option<bool> {
+    let mut cur = node;
+    while let Some(parent) = cur.parent() {
+        match parent.kind() {
+            "function_definition" => {
+                let is_name = parent
+                    .child_by_field_name("declarator")
+                    .and_then(cpp_declarator_name_node)
+                    .is_some_and(|name| name.id() == node.id());
+                return Some(is_name);
+            }
+            "declaration" | "field_declaration" | "parameter_declaration" => return Some(false),
+            _ => {}
+        }
+        cur = parent;
+    }
+    None
+}
+
+fn cpp_declarator_name_node(decl: Node<'_>) -> Option<Node<'_>> {
+    match decl.kind() {
+        "identifier" | "field_identifier" => Some(decl),
+        "qualified_identifier" => decl
+            .child_by_field_name("name")
+            .and_then(cpp_declarator_name_node),
+        "function_declarator"
+        | "pointer_declarator"
+        | "reference_declarator"
+        | "parenthesized_declarator"
+        | "array_declarator" => decl
+            .child_by_field_name("declarator")
+            .or_else(|| {
+                let mut cursor = decl.walk();
+                decl.children(&mut cursor).find(|child| {
+                    matches!(
+                        child.kind(),
+                        "function_declarator"
+                            | "pointer_declarator"
+                            | "reference_declarator"
+                            | "parenthesized_declarator"
+                            | "identifier"
+                            | "field_identifier"
+                            | "qualified_identifier"
+                    )
+                })
+            })
+            .and_then(cpp_declarator_name_node),
+        _ => None,
+    }
 }
 
 /// C/C++ の type_definition / enumerator に属する識別子の Definition 判定。
@@ -1911,22 +2090,25 @@ pub(crate) fn visit_refs_and_defs_in_file_cb<V: RefVisitor>(
     Ok(())
 }
 
+/// `visit_refs_and_defs_in_file_cb` が visitor に渡す最小参照イベント。
+pub(crate) struct RefVisitEvent<'a> {
+    pub(crate) sym_ix: u32,
+    pub(crate) line: usize,
+    pub(crate) column: usize,
+    pub(crate) context: &'a str,
+    pub(crate) is_def: bool,
+    /// receiver-aware 解析の確信度。Phase 3 より前は常に ExactOwner。
+    pub(crate) confidence: RefConfidence,
+    /// Rust macro invocation の callee identifier かどうか。
+    pub(crate) rust_macro_callee: bool,
+}
+
 /// `visit_refs_and_defs_in_file_cb` が内部で呼び出す訪問者 trait。
 /// Xojo の case-insensitive 多重 index (`name_to_ix[key]` が `Vec<usize>`) や
 /// Rust attribute 文字列内参照の場合も、ヒットしたすべての sym_ix について
 /// 1 回ずつ `on_ref` が呼ばれる。
 pub(crate) trait RefVisitor {
-    /// `confidence` は receiver-aware 解析の確信度。
-    /// Phase 3 (PHP receiver-aware) より前は常に `RefConfidence::ExactOwner` を渡す。
-    fn on_ref(
-        &mut self,
-        sym_ix: u32,
-        line: usize,
-        column: usize,
-        context: &str,
-        is_def: bool,
-        confidence: RefConfidence,
-    );
+    fn on_ref(&mut self, event: RefVisitEvent<'_>);
 }
 
 /// `visit_refs_and_defs_in_file_cb` 用の AST 再帰走査。Identifier と Rust attribute 文字列
@@ -1946,6 +2128,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
         && let Ok(text) = node.utf8_text(source)
         && let Some(indices) = name_to_ix.get(&node_ref_key(lang_id, node, text))
         && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
+        && !is_ignored_identifier_context(node, lang_id)
     {
         let is_def = is_definition_context(node, definition_kinds, lang_id);
         let context = extract_line_context_indexed(source, line_index, node.start_position().row);
@@ -1954,8 +2137,17 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
         // Phase 3 で PHP method ref を receiver-aware に分類する。
         // それまでは PHP も含めて ExactOwner を渡し、挙動互換を保つ。
         let confidence = classify_method_ref_confidence(node, source, lang_id, is_def);
+        let rust_macro_callee = is_rust_macro_invocation_callee(node, lang_id);
         for &ix in indices {
-            visitor.on_ref(ix as u32, line, column, &context, is_def, confidence);
+            visitor.on_ref(RefVisitEvent {
+                sym_ix: ix as u32,
+                line,
+                column,
+                context: &context,
+                is_def,
+                confidence,
+                rust_macro_callee,
+            });
         }
     }
 
@@ -1963,14 +2155,15 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
         if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, seg)) {
             let context = extract_line_context_indexed(source, line_index, row);
             for &ix in indices {
-                visitor.on_ref(
-                    ix as u32,
-                    row,
-                    col,
-                    &context,
-                    false,
-                    RefConfidence::ExactOwner,
-                );
+                visitor.on_ref(RefVisitEvent {
+                    sym_ix: ix as u32,
+                    line: row,
+                    column: col,
+                    context: &context,
+                    is_def: false,
+                    confidence: RefConfidence::ExactOwner,
+                    rust_macro_callee: false,
+                });
             }
         }
     }
@@ -1980,14 +2173,15 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
         if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, &seg)) {
             let context = extract_line_context_indexed(source, line_index, row);
             for &ix in indices {
-                visitor.on_ref(
-                    ix as u32,
-                    row,
-                    col,
-                    &context,
-                    false,
-                    RefConfidence::ExactOwner,
-                );
+                visitor.on_ref(RefVisitEvent {
+                    sym_ix: ix as u32,
+                    line: row,
+                    column: col,
+                    context: &context,
+                    is_def: false,
+                    confidence: RefConfidence::ExactOwner,
+                    rust_macro_callee: false,
+                });
             }
         }
     }
@@ -1997,14 +2191,15 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
         if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, &seg)) {
             let context = extract_line_context_indexed(source, line_index, row);
             for &ix in indices {
-                visitor.on_ref(
-                    ix as u32,
-                    row,
-                    col,
-                    &context,
-                    false,
-                    RefConfidence::ExactOwner,
-                );
+                visitor.on_ref(RefVisitEvent {
+                    sym_ix: ix as u32,
+                    line: row,
+                    column: col,
+                    context: &context,
+                    is_def: false,
+                    confidence: RefConfidence::ExactOwner,
+                    rust_macro_callee: false,
+                });
             }
         }
     }
@@ -2017,14 +2212,15 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
     {
         let context = extract_line_context_indexed(source, line_index, row);
         for &ix in indices {
-            visitor.on_ref(
-                ix as u32,
-                row,
-                col,
-                &context,
-                false,
-                RefConfidence::ExactOwner,
-            );
+            visitor.on_ref(RefVisitEvent {
+                sym_ix: ix as u32,
+                line: row,
+                column: col,
+                context: &context,
+                is_def: false,
+                confidence: RefConfidence::ExactOwner,
+                rust_macro_callee: false,
+            });
         }
     }
 
@@ -2034,14 +2230,15 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
     {
         let context = extract_line_context_indexed(source, line_index, row);
         for &ix in indices {
-            visitor.on_ref(
-                ix as u32,
-                row,
-                col,
-                &context,
-                false,
-                RefConfidence::ExactOwner,
-            );
+            visitor.on_ref(RefVisitEvent {
+                sym_ix: ix as u32,
+                line: row,
+                column: col,
+                context: &context,
+                is_def: false,
+                confidence: RefConfidence::ExactOwner,
+                rust_macro_callee: false,
+            });
         }
     }
 
@@ -2057,6 +2254,26 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
             visitor,
         );
     }
+}
+
+fn is_rust_macro_invocation_callee(node: Node<'_>, lang_id: LangId) -> bool {
+    if lang_id != LangId::Rust {
+        return false;
+    }
+    let mut cur = node;
+    while let Some(parent) = cur.parent() {
+        match parent.kind() {
+            // macro 引数は token_tree 配下に入るため callee ではない。
+            "token_tree" => return false,
+            "macro_invocation" => return true,
+            "macro_definition" | "function_item" | "struct_item" | "enum_item" | "source_file" => {
+                return false;
+            }
+            _ => {}
+        }
+        cur = parent;
+    }
+    false
 }
 
 /// receiver-aware な method ref 確信度判定 (Phase 3 で PHP に拡張予定)。
@@ -2305,6 +2522,7 @@ fn collect_identifier_refs_indexed(
         && let Ok(text) = node.utf8_text(source)
         && let Some(indices) = name_to_ix.get(&node_ref_key(lang_id, node, text))
         && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
+        && !is_ignored_identifier_context(node, lang_id)
     {
         let is_def = is_definition_context(node, definition_kinds, lang_id);
         let context = extract_line_context_indexed(source, line_index, node.start_position().row);
@@ -2504,6 +2722,7 @@ fn count_identifier_refs(
         && let Some(ixs) = name_to_ix.get(&node_ref_key(lang_id, node, text))
         && !is_definition_context(node, definition_kinds, lang_id)
         && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
+        && !is_ignored_identifier_context(node, lang_id)
     {
         for &ix in ixs {
             counts[ix] += 1;

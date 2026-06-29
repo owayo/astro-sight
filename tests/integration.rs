@@ -1937,6 +1937,66 @@ fn impact_rust_macro_arg_ident_stays_high() {
     );
 }
 
+#[test]
+fn impact_rust_macro_callee_ident_routes_low() {
+    // Issue 2026-06-27-render-json-vs-serde-json-macro:
+    // `serde_json::json!` の callee 名は同名の Rust function とは別名前空間なので、
+    // `render::json` のシグネチャ変更の未解決 impact にしない。一方で macro 引数は
+    // `impact_rust_macro_arg_ident_stays_high` で high 維持を別途担保する。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/render.rs"),
+        "pub fn json(value: i32) -> String {\n    format!(\"{}\", value)\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/caller.rs"),
+        "use serde_json::json;\npub fn run() {\n    let _payload = json!({ \"ok\": true });\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/main.rs"),
+        "mod caller;\nmod render;\nfn main() { caller::run(); }\n",
+    )
+    .unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "astro-sight@example.com"]);
+    git(&["config", "user.name", "astro-sight"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial", "-q"]);
+
+    std::fs::write(
+        root.join("src/render.rs"),
+        "pub fn json(value: i64) -> String {\n    format!(\"{}\", value)\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["impact", "--dir", root.to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "macro callee だけなら unresolved impact は出ないべき: {stderr}"
+    );
+    assert!(
+        !stderr.contains("caller.rs"),
+        "serde_json::json! の callee 名は render::json の impact caller ではない: {stderr}"
+    );
+}
+
 /// A3 用 helper: base_files を commit し、`setup` で削除/追加した temp git repo を作って
 /// `review --git --hook` の `Output` (exit code + stderr の hook JSON) を返す。
 fn a3_review_hook(
@@ -6020,6 +6080,167 @@ export class AppComponent {
     );
 }
 
+#[test]
+fn dead_code_excludes_angular_component_referenced_by_selector_tag() {
+    // GitLab #26: standalone component class は TS 上の直接参照が無くても、
+    // template の custom element tag (`<bz-popup>`) が selector に一致すれば live。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/app")).unwrap();
+    std::fs::write(
+        root.join("src/app/popup.component.ts"),
+        "\
+import { Component } from '@angular/core';
+@Component({ selector: 'bz-popup', template: '' })
+export class PopupComponent {}
+",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/app/unused.component.ts"),
+        "\
+import { Component } from '@angular/core';
+@Component({ selector: 'bz-unused', template: '' })
+export class UnusedComponent {}
+",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/app/host.component.html"),
+        "<section><bz-popup></bz-popup></section>\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead_names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !dead_names.iter().any(|n| n.contains("PopupComponent")),
+        "template selector `<bz-popup>` に対応する component class は live になるべき: {dead_names:?}"
+    );
+    assert!(
+        dead_names.iter().any(|n| n.contains("UnusedComponent")),
+        "未使用 selector の component は dead として残るべき: {dead_names:?}"
+    );
+}
+
+#[test]
+fn dead_code_excludes_angular_provider_option_callback() {
+    // GitLab #26: RECAPTCHA_LOADER_OPTIONS の useValue callback は ng-recaptcha 側から
+    // 呼ばれるため、直接 caller が 0 件でも dead ではない。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/app")).unwrap();
+    std::fs::write(
+        root.join("src/app/app.component.ts"),
+        "\
+import { Component } from '@angular/core';
+import { RECAPTCHA_LOADER_OPTIONS } from 'ng-recaptcha-2';
+@Component({
+  template: '',
+  providers: [{
+    provide: RECAPTCHA_LOADER_OPTIONS,
+    useValue: {
+      onBeforeLoad(url: URL) { return url; },
+      otherCallback() { return 1; },
+    }
+  }]
+})
+export class AppComponent {}
+",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead_names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !dead_names.iter().any(|n| n.contains("onBeforeLoad")),
+        "RECAPTCHA_LOADER_OPTIONS の onBeforeLoad callback は dead から除外されるべき: {dead_names:?}"
+    );
+    assert!(
+        dead_names.iter().any(|n| n.contains("otherCallback")),
+        "allowlist 外の provider object method は dead として残るべき: {dead_names:?}"
+    );
+}
+
+#[test]
+fn dead_code_does_not_exclude_angular_provider_callback_from_sibling_token() {
+    // codex review: 同じファイルに RECAPTCHA_LOADER_OPTIONS import/provider があっても、
+    // OTHER_TOKEN の provider object にある onBeforeLoad は除外しない。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/app")).unwrap();
+    std::fs::write(
+        root.join("src/app/app.component.ts"),
+        "\
+import { Component } from '@angular/core';
+import { RECAPTCHA_LOADER_OPTIONS } from 'ng-recaptcha-2';
+@Component({
+  template: '',
+  providers: [{
+    provide: RECAPTCHA_LOADER_OPTIONS,
+    useValue: {}
+  }, {
+    provide: OTHER_TOKEN,
+    useValue: {
+      onBeforeLoad(url: URL) { return url; },
+    }
+  }]
+})
+export class AppComponent {}
+",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead_names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        dead_names.iter().any(|n| n.contains("onBeforeLoad")),
+        "RECAPTCHA_LOADER_OPTIONS 以外の provider callback は dead として残るべき: {dead_names:?}"
+    );
+}
+
 /// GitLab issue #24 (codex 指摘 1): review --git の API 変更検出 (`api_changes.added`)
 /// でも Flyway migration クラスとそのメソッドは出さない。dead-code 経路と整合し、Stop
 /// hook が migration 追加のたびに blocking 化しないようにする。
@@ -6339,6 +6560,188 @@ fn c_function_range_and_complexity_cover_body() {
     assert!(
         m_end > m_start,
         "main の range も本体まで複数行にまたがるべき"
+    );
+}
+
+#[test]
+fn c_struct_type_uses_are_refs_not_defs() {
+    // GitLab #27: `struct X` のパラメータ型・ローカル変数型・sizeof/cast は
+    // tag 定義ではなく型参照として数える。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("sample.c"),
+        "\
+struct text_server_data;
+
+struct text_server_data {
+    int command;
+};
+
+static int parse_header(struct text_server_data* header) {
+    header->command = 1;
+    return 0;
+}
+
+void run(void) {
+    struct text_server_data header;
+    void* raw = (void*)sizeof(struct text_server_data);
+    (void)(struct text_server_data*)raw;
+    parse_header(&header);
+}
+",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "refs",
+            "--name",
+            "text_server_data",
+            "--dir",
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let refs = json["refs"].as_array().unwrap();
+    let def_count = refs
+        .iter()
+        .filter(|r| r["kind"].as_str() == Some("def"))
+        .count();
+    let ref_count = refs
+        .iter()
+        .filter(|r| r["kind"].as_str() == Some("ref"))
+        .count();
+    assert_eq!(
+        def_count, 1,
+        "body 付き struct tag 定義だけが def になるべき: {refs:?}"
+    );
+    assert!(
+        ref_count >= 4,
+        "パラメータ型・変数宣言・sizeof・cast は ref になるべき: {refs:?}"
+    );
+    assert!(
+        !refs
+            .iter()
+            .any(|r| r["ctx"].as_str() == Some("struct text_server_data;")),
+        "forward declaration は def/ref のどちらにも数えない: {refs:?}"
+    );
+}
+
+#[test]
+fn c_typedef_forward_tag_is_not_ref() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("sample.c"),
+        "\
+typedef struct forward_alias forward_alias;
+
+struct forward_alias {
+    int value;
+};
+",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "refs",
+            "--name",
+            "forward_alias",
+            "--dir",
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let refs = json["refs"].as_array().unwrap();
+    let ref_count = refs
+        .iter()
+        .filter(|r| r["kind"].as_str() == Some("ref"))
+        .count();
+    assert_eq!(
+        ref_count, 0,
+        "typedef forward declaration の tag 側は non-definition ref にしない: {refs:?}"
+    );
+}
+
+#[test]
+fn dead_code_keeps_c_struct_live_when_used_as_type() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("sample.c"),
+        "\
+struct text_server_data {
+    int command;
+};
+
+struct unused_data {
+    int value;
+};
+
+struct forward_only;
+struct forward_only {
+    int y;
+};
+
+typedef struct forward_alias forward_alias;
+struct forward_alias {
+    int z;
+};
+
+int parse_header(struct text_server_data* header) {
+    struct text_server_data local;
+    local.command = header->command;
+    return local.command;
+}
+",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead_names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !dead_names.iter().any(|n| n == "text_server_data"),
+        "型として使われている struct は dead ではない: {dead_names:?}"
+    );
+    assert!(
+        dead_names.iter().any(|n| n == "unused_data"),
+        "未使用 struct は dead として残るべき: {dead_names:?}"
+    );
+    assert!(
+        dead_names.iter().any(|n| n == "forward_only"),
+        "forward declaration だけでは body 付き struct を live にしない: {dead_names:?}"
+    );
+    assert!(
+        dead_names.iter().any(|n| n == "forward_alias"),
+        "typedef forward declaration だけでは body 付き struct を live にしない: {dead_names:?}"
     );
 }
 

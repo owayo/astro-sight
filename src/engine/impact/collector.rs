@@ -65,6 +65,9 @@ pub(super) struct RefEventMini {
     /// Rust: context 行に macro 呼び出し (`ident!(` 等) があるか。証拠なしの bare identifier でも
     /// macro 引数なら macro 展開で path が補われ得るため high 維持する (fail-closed)。
     pub(super) ref_in_macro: bool,
+    /// Rust: 参照 identifier が `json!()` の callee 名そのものか。通常の関数/値シンボル変更では
+    /// macro callee は別名前空間なので low に落とす一方、macro 引数は `ref_in_macro` で high 維持する。
+    pub(super) rust_macro_callee: bool,
 }
 
 /// 汎用すぎてシンボル名だけでは owner を特定できない PHP/JS 系メソッド名。
@@ -142,15 +145,16 @@ pub(super) struct ImpactCollector<'a> {
 }
 
 impl<'a> refs::RefVisitor for ImpactCollector<'a> {
-    fn on_ref(
-        &mut self,
-        sym_ix: u32,
-        line: usize,
-        column: usize,
-        context: &str,
-        is_def: bool,
-        confidence: crate::models::reference::RefConfidence,
-    ) {
+    fn on_ref(&mut self, event: refs::RefVisitEvent<'_>) {
+        let refs::RefVisitEvent {
+            sym_ix,
+            line,
+            column,
+            context,
+            is_def,
+            confidence,
+            rust_macro_callee,
+        } = event;
         let ix = sym_ix as usize;
         if ix < self.ref_hit.len() {
             self.ref_hit[ix] = true;
@@ -203,8 +207,9 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
 
         // Rust の証拠なし bare identifier を low に落とす際、macro 引数だけは high 維持するため
         // context 行の macro 呼び出し有無を見ておく (non-Rust では使わないので Rust のみ算出)。
-        let ref_in_macro =
-            self.ref_lang == Some(LangId::Rust) && context_line_has_macro_invocation(context);
+        let ref_in_macro = self.ref_lang == Some(LangId::Rust)
+            && context_line_has_macro_invocation(context)
+            && !rust_macro_callee;
 
         self.ref_events.push(RefEventMini {
             sym_ix,
@@ -215,6 +220,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             confidence: confidence_u8,
             local_shadow_hint,
             ref_in_macro,
+            rust_macro_callee,
         });
     }
 }
@@ -323,18 +329,22 @@ impl<'a> ImpactCollector<'a> {
                         .get(sym_ix_usize)
                         .map(String::as_str)
                         .unwrap_or("");
-                    match rust_ref_file_has_symbol_evidence(
-                        self.dir,
-                        self.path_str,
-                        symbol_name,
-                        self.import_facts_cache,
-                    ) {
-                        Some(has_evidence) => should_route_rust_ref_low(
-                            has_evidence,
-                            e.local_shadow_hint,
-                            e.ref_in_macro,
-                        ),
-                        None => false,
+                    if e.rust_macro_callee {
+                        true
+                    } else {
+                        match rust_ref_file_has_symbol_evidence(
+                            self.dir,
+                            self.path_str,
+                            symbol_name,
+                            self.import_facts_cache,
+                        ) {
+                            Some(has_evidence) => should_route_rust_ref_low(
+                                has_evidence,
+                                e.local_shadow_hint,
+                                e.ref_in_macro,
+                            ),
+                            None => false,
+                        }
                     }
                 } else {
                     false
@@ -410,6 +420,7 @@ mod tests {
             confidence,
             local_shadow_hint: false,
             ref_in_macro: false,
+            rust_macro_callee: false,
         }
     }
 
