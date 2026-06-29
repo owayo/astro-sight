@@ -3414,6 +3414,86 @@ struct Bar {
         assert_eq!(counts[0], 1, "attribute string ref must lift dead-code");
     }
 
+    /// C/C++ の tag 名は、本体付き `struct X {}` だけを Definition とし、
+    /// `struct X *p` / `sizeof(struct X)` / 引数型などの型使用は Reference として扱う。
+    /// 単独 forward declaration は ref/def いずれにも含めない。
+    #[test]
+    fn cpp_struct_tag_type_uses_are_refs_not_defs() {
+        use std::borrow::Cow;
+        use std::collections::HashMap;
+
+        let source = "struct buffer_data { int x; };\n\
+struct holder {\n\
+  struct buffer_data* buffer;\n\
+};\n\
+void f(struct buffer_data header) {\n\
+  struct buffer_data local;\n\
+  (void)sizeof(struct buffer_data);\n\
+}\n\
+struct forward_declared;\n";
+        let tree = parser::parse_source(source.as_bytes(), LangId::Cpp).expect("parse");
+        let defs = definition_node_kinds(LangId::Cpp);
+        let line_index = LineIndex::new(source.as_bytes());
+
+        let mut refs = Vec::new();
+        collect_identifier_refs(
+            tree.root_node(),
+            source.as_bytes(),
+            &line_index,
+            "buffer_data",
+            "test.cpp",
+            defs,
+            LangId::Cpp,
+            &mut refs,
+        );
+
+        let def_cnt = refs
+            .iter()
+            .filter(|r| matches!(r.kind, Some(RefKind::Definition)))
+            .count();
+        let ref_cnt = refs
+            .iter()
+            .filter(|r| matches!(r.kind, Some(RefKind::Reference)))
+            .count();
+        assert_eq!(
+            def_cnt, 1,
+            "tag body definition should be captured once: {refs:?}"
+        );
+        assert_eq!(
+            ref_cnt, 4,
+            "member type, parameter type, local type, and sizeof type should be refs: {refs:?}"
+        );
+
+        let mut name_to_ix: HashMap<Cow<'_, str>, Vec<usize>> = HashMap::new();
+        name_to_ix.insert(Cow::Borrowed("buffer_data"), vec![0]);
+        let mut counts = vec![0usize];
+        count_identifier_refs(
+            tree.root_node(),
+            source.as_bytes(),
+            &name_to_ix,
+            defs,
+            LangId::Cpp,
+            &mut counts,
+        );
+        assert_eq!(counts[0], 4, "count-only refs should match visible refs");
+
+        refs.clear();
+        collect_identifier_refs(
+            tree.root_node(),
+            source.as_bytes(),
+            &line_index,
+            "forward_declared",
+            "test.cpp",
+            defs,
+            LangId::Cpp,
+            &mut refs,
+        );
+        assert!(
+            refs.is_empty(),
+            "standalone forward declaration is neither def nor ref: {refs:?}"
+        );
+    }
+
     /// `Option::is_none` のようなパス文字列では最終セグメントもカウントされることを検証
     #[test]
     fn rust_attr_string_ref_path_segments() {

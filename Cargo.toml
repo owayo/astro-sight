@@ -53,7 +53,7 @@ logroller = "0.1.10"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
 tracing-appender = "0.2.5"
-time = { version = "0.3.49", features = ["formatting", "macros", "local-offset"] }
+time = { version = "0.3.51", features = ["formatting", "macros", "local-offset"] }
 tree-sitter-zig = "1.1.2"
 # tree-sitter-xojo は OOM の根因のため v26.6 で削除した。
 # Xojo は src/engine/lexer の手書き state machine で解析する (PR3 以降)。

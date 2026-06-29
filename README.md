@@ -205,6 +205,8 @@ astro-sight refs --names "AppService,AstgenResponse" --dir src/
 
 単一検索と複数シンボル検索はいずれも worker local の fold/reduce で結果を直接統合し、per-file の中間 `Vec` を全ファイル分保持しない。非常に多くの参照が返るシンボルでは出力自体が大きくなるため、`--glob` で対象言語を絞るか、必要に応じて `ASTRO_SIGHT_BATCH_WORKERS` で並列ワーカー数を下げる。複数シンボル検索（`refs --names`）はディレクトリ走査と rayon pool を 1 回に集約し、内部で名前を chunk 単位（既定 64、`ASTRO_SIGHT_REFS_BATCH_CHUNK` で調整）に分割して AC trie / fold バケットのメモリを上限化する。名前数を増やしてもディレクトリ走査は 1 回で済み（chunk 毎の再走査が起きない）、chunk サイズに依らず結果は一致する。
 
+C/C++ の `struct` / `class` / `union` / `enum` tag 名は、本体付き定義だけを Definition とし、`struct X *p`、`sizeof(struct X)`、cast、引数型・メンバ宣言内の `struct X` は Reference として数える。単独 forward declaration は ref/def のどちらにも含めないため、dead-code でも使用中の型 tag を誤って dead にしにくい。
+
 `context` / `impact` / `review` の `--base` は `git diff` / `git show` / `git blame` にそのまま渡るため、`-` で始まる値・NUL を含む値・空文字を `INVALID_REQUEST` で拒否する（`--output=/path` 等のオプション誤認識を防ぐ）。
 
 出力例:
@@ -671,6 +673,7 @@ astro-sight skill-install codex
 
 登録後は「コールグラフを調べて」「この関数の呼び出し元は？」「diff の影響範囲は？」等の質問で自動的に起動します。
 PR や patch 全体をまとめて見たい場合は、`astro-sight review --dir . --git` まで含めて指示すると一括レビューに入りやすくなります。
+`grep` / `rg` で関数名・型名・定数名などの識別子を探しそうになったら、まず `astro-sight refs --name <symbol> --dir .` または `refs --names` に置き換えてください。コメントや文字列の偶然一致を避けられます。
 `symbols` だけで構造を読んだあとに import / caller / call flow を確認する流れでは、最初から `symbols` + `imports` / `calls` / `sequence` を `session` にまとめると、プロセス起動を減らしつつ手順漏れを防げます。
 レビュー観点が繰り返される場合は `lint` で AST/text ルール化し、関連ファイル漏れは `review` の `missing_cochanges` または `cochange --paths <file>` で先に確認します。
 

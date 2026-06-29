@@ -97,6 +97,7 @@ echo '{"command":"refs","name":"Sym1","dir":"."}
 
 - Reviewing a diff, PR, or bug-fix branch? Start with `astro-sight review --dir . --git` before splitting into `context`, `impact`, `dead-code`, or `cochange`.
 - Editing code? Run `astro-sight context --dir . --git` first, then `astro-sight impact --dir . --git` after the edit.
+- About to run `grep` / `rg` for a bare function, class, type, method, variable, or constant name? Stop and use `astro-sight refs --name` or `refs --names` instead.
 - Touching exported APIs or public modules? Add `astro-sight dead-code --dir . --git` before concluding the change.
 - Repeating the same structural review policy across files? Reach for `astro-sight lint` instead of ad-hoc text search.
 - Asking 2+ mixed astro-sight questions in one loop? Use `astro-sight session` instead of paying startup cost for each command.
@@ -123,6 +124,7 @@ echo '{"command":"refs","name":"Sym1","dir":"."}
 - Need a reusable syntax-aware check before touching multiple files? → create one small `lint` rule and keep its output as evidence
 - Need to audit exported/public cleanup after parser, dependency, or API-surface work? → run `astro-sight dead-code --dir . --git`; use `--dir .` for a full sweep
 - Need to predict **co-change fallout** before missing a related file? → `astro-sight cochange --dir . --git --base <rev>` (or `--paths <file>`) before guessing from filenames alone
+- Need to understand whether a file depends on a moved export or module? → `astro-sight imports --path <file>` before writing a text import search
 - Need to explain a non-trivial call path after `calls` identifies the target? → `astro-sight sequence --path <file> --function <name>`
 - Need to verify a generated or minified parse oddity? → `astro-sight ast --path <file> --line <n> --col <n>` and inspect the node kind before changing logic
 - Need to turn a one-off policy into a repeatable check? → `astro-sight lint --path <file> --rules rules.yaml`

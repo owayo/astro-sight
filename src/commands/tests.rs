@@ -6247,6 +6247,63 @@ fn detect_dead_cpp_forward_declaration_tag_excluded() {
     );
 }
 
+/// C/C++ の `struct X` 型使用 (引数型 / 変数宣言 / メンバ宣言 / sizeof / cast) は
+/// tag 名 `X` の非 Definition 参照として数え、使用中 struct を dead に出さない。
+/// GitLab #28 の C/C++ struct 型参照取りこぼしの回帰テスト。
+#[test]
+fn detect_dead_cpp_struct_tag_type_uses_are_live() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let c_source = "struct voice_options { const char* host; int port; };\n\
+struct unused_c_struct { int x; };\n\
+static void load_config_file(struct voice_options* option) {\n\
+    option->port = 8080;\n\
+}\n\
+int main(void) {\n\
+    struct voice_options voice_option = { .host = \"localhost\", .port = 80 };\n\
+    load_config_file(&voice_option);\n\
+    return voice_option.port;\n\
+}\n";
+    let cpp_source = "struct text_server_data { int code; };\n\
+struct buffer_data { int size; };\n\
+struct unused_cpp_struct { int y; };\n\
+class Converter {\n\
+    struct buffer_data* buffer;\n\
+};\n\
+bool read_params_generic(struct text_server_data header) {\n\
+    return header.code > 0;\n\
+}\n\
+int allocate_buffer(void* raw) {\n\
+    struct buffer_data* p = (struct buffer_data*)raw;\n\
+    return p ? (int)sizeof(struct buffer_data) : 0;\n\
+}\n";
+    fs::write(repo.join("app_textserver.c"), c_source).expect("write c");
+    fs::write(repo.join("VoiceToTextConvertServer.cpp"), cpp_source).expect("write cpp");
+
+    let files = vec![
+        repo.join("app_textserver.c"),
+        repo.join("VoiceToTextConvertServer.cpp"),
+    ];
+    let (dead, _test_only) =
+        detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
+    let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+
+    for live in ["voice_options", "text_server_data", "buffer_data"] {
+        assert!(
+            !names.contains(&live),
+            "型として使用中の struct {live} は dead に出さない: {names:?}"
+        );
+    }
+    for unused in ["unused_c_struct", "unused_cpp_struct"] {
+        assert!(
+            names.contains(&unused),
+            "未使用 struct {unused} は引き続き dead として検出されるべき: {names:?}"
+        );
+    }
+}
+
 /// C/C++ の enum は、型名が直接使われなくても列挙子のいずれかが参照されていれば live と
 /// 判定する。body あり typedef tag も alias 名経由の参照で live と判定する。列挙子も alias も
 /// 未使用なら dead として検出される (Issue #12 enumerator liveness / Issue #11 typedef alias)。
