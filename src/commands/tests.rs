@@ -7512,7 +7512,7 @@ export const TaskKanbanCard = memo(function TaskKanbanCard() {\n\
 }
 
 /// perf #2: `extract_new_file_facts` が new_path を 1 回 read+parse して exported / callees /
-/// reexports の 3 facts を正しく導出する。TS の named re-export・local export・呼び出しを
+/// export surface の 3 facts を正しく導出する。TS の named re-export・local export・呼び出しを
 /// 1 ファイルに含め、3 種が分離して取れることを確認する。
 #[test]
 fn extract_new_file_facts_ts_combines_exported_callees_reexports() {
@@ -7538,9 +7538,9 @@ function compute() { return 1; }\n",
         "local export const は exported に含まれる。got: {exported:?}"
     );
     assert!(
-        facts.reexports.contains("Helper"),
-        "named re-export は reexports に含まれる。got: {:?}",
-        facts.reexports
+        facts.export_surface_names.contains("Helper"),
+        "named re-export は export surface に含まれる。got: {:?}",
+        facts.export_surface_names
     );
     assert!(
         facts.callees.contains("compute"),
@@ -7566,8 +7566,8 @@ fn extract_new_file_facts_xojo_lexer_only_no_panic() {
         "lexer-only でも exported は Some (lexer 経由)"
     );
     assert!(
-        facts.callees.is_empty() && facts.reexports.is_empty(),
-        "lexer-only では callees / reexports は空 (tree-sitter parse を呼ばない)"
+        facts.callees.is_empty() && facts.export_surface_names.is_empty(),
+        "lexer-only では callees / export surface は空 (tree-sitter parse を呼ばない)"
     );
 }
 

@@ -178,7 +178,7 @@ fn process_modified_file(
     old_syms: &[(String, String, String)],
     new_syms: &[(String, String, String)],
     in_file_callees: &std::collections::HashSet<String>,
-    new_reexports: &std::collections::HashSet<String>,
+    new_export_surface_names: &std::collections::HashSet<String>,
     ref_index: &ApiRefIndex,
     rust_reexport_cache: &mut RustBaseReexportCache,
     rust_new_reexport_cache: &mut RustWorktreeReexportCache,
@@ -249,9 +249,10 @@ fn process_modified_file(
     // Bash スクリプトでは関数定義は `export -f` (または `declare -fx`/`declare -xf`) で
     // 明示しない限りサブプロセスへ波及しない。
     let is_bash_old_file = is_bash_script_path(&df.old_path);
-    // TS/JS: 新ツリーで `export { name } from "..."` として re-export されているシンボルは
-    // 利用者から見た API 面が維持されているため api.rm から除外する。
-    // `new_reexports` は Phase 0 の単一 parse で先取り済み (perf #2: ここでの再 read+parse を排除)。
+    // TS/JS: 新ツリーで export clause (`export { name } from "..."` / `import ...;
+    // export { name };`) により name が公開され続けているシンボルは、利用者から見た
+    // API 面が維持されているため api.rm から除外する。
+    // `new_export_surface_names` は Phase 0 の単一 parse で先取り済み (perf #2)。
     for (name, kind, sig) in old_syms {
         if !new_map.contains_key(name.as_str()) {
             if is_rust_old_symbol_outside_public_api_surface(
@@ -263,7 +264,7 @@ fn process_modified_file(
             ) {
                 continue;
             }
-            if new_reexports.contains(name.as_str()) {
+            if new_export_surface_names.contains(name.as_str()) {
                 continue;
             }
             // closed-in-diff for api.rm: 同ファイルに新規追加されたシンボルがあり、削除された
@@ -767,9 +768,10 @@ enum PreparedDiffFile {
         old_syms: Option<Vec<(String, String, String)>>,
         new_syms: Option<Vec<(String, String, String)>>,
         in_file_callees: std::collections::HashSet<String>,
-        /// new_path の named re-export 名集合 (TS/JS/Rust)。Phase 0 の単一 parse で先取りし、
-        /// process_modified_file が再 read+parse せず使う (perf #2)。
-        new_reexports: std::collections::HashSet<String>,
+        /// new_path の export clause / `pub use` が公開する名前集合 (TS/JS/Rust)。
+        /// Phase 0 の単一 parse で先取りし、process_modified_file が再 read+parse
+        /// せず使う (perf #2)。
+        new_export_surface_names: std::collections::HashSet<String>,
     },
 }
 
@@ -896,12 +898,13 @@ pub(crate) fn detect_api_changes(
         }
         // rename 差分では base 側に新パスが存在しないため、旧版は old_path から読む。
         let old_syms = extract_exported_symbols_from_git(dir, base, &df.old_path);
-        // new_path を 1 回 read+parse して exported / callees / reexports を導出 (perf #2)。
-        // reexports は process_modified_file が再 parse せず使えるよう PreparedDiffFile に持たせる。
+        // new_path を 1 回 read+parse して exported / callees / export surface を導出 (perf #2)。
+        // export surface は process_modified_file が再 parse せず使えるよう
+        // PreparedDiffFile に持たせる。
         let facts = extract_new_file_facts(dir, &df.new_path);
         let new_syms = facts.exported;
         let in_file_callees = facts.callees;
-        let new_reexports = facts.reexports;
+        let new_export_surface_names = facts.export_surface_names;
         if let (Some(old), Some(new)) = (&old_syms, &new_syms) {
             collect_modified_file_index_names(
                 old,
@@ -915,7 +918,7 @@ pub(crate) fn detect_api_changes(
             old_syms,
             new_syms,
             in_file_callees,
-            new_reexports,
+            new_export_surface_names,
         });
     }
     let ref_index = ApiRefIndex::build(dir, &index_names);
@@ -960,7 +963,7 @@ pub(crate) fn detect_api_changes(
                 old_syms,
                 new_syms,
                 in_file_callees,
-                new_reexports,
+                new_export_surface_names,
             } => {
                 if let (Some(old_syms), Some(new_syms)) = (old_syms, new_syms) {
                     process_modified_file(
@@ -972,7 +975,7 @@ pub(crate) fn detect_api_changes(
                         old_syms,
                         new_syms,
                         in_file_callees,
-                        new_reexports,
+                        new_export_surface_names,
                         &ref_index,
                         &mut rust_reexport_cache,
                         &mut rust_new_reexport_cache,
@@ -1291,24 +1294,26 @@ pub(crate) fn extract_exported_symbols_from_file_inner(
 }
 
 /// new_path 1 ファイルから API 差分検出に必要な 3 種の facts をまとめて抽出する。
-/// 旧 exported / in_file_callees / reexported の各抽出が同一 new_path をそれぞれ read+parse
-/// していた (TS/JS/Rust で 3 回、他言語で 2 回) のを **1 回の read+parse に集約**する (perf #2)。
+/// 旧 exported / in_file_callees / export surface の各抽出が同一 new_path をそれぞれ
+/// read+parse していた (TS/JS/Rust で 3 回、他言語で 2 回) のを **1 回の read+parse に
+/// 集約**する (perf #2)。
 /// 各抽出のガードは元関数と完全に一致させ behavior-preserving とする:
 /// - `exported`: test path は `Some(空)` (parse せず) / 非 test は `is_safe_diff_path` 必須で
 ///   None と空を区別 / lexer-only は lexer 経由 / それ以外 tree-sitter parse+filter
 /// - `callees`: test/safe ガードなし、read+parse 失敗時は空 (lexer-only は parse_source が Err→空)
-/// - `reexports`: `is_safe_diff_path` かつ TS/TSX/JS/Rust のみ、それ以外は空
+/// - `export_surface_names`: `is_safe_diff_path` かつ TS/TSX/JS/Rust のみ、それ以外は空。
+///   TS/JS は named export clause (from 句の有無を問わず)、Rust は `pub use` が公開する名前
 pub(crate) struct NewFileFacts {
     pub(crate) exported: Option<Vec<(String, String, String)>>,
     pub(crate) callees: std::collections::HashSet<String>,
-    pub(crate) reexports: std::collections::HashSet<String>,
+    pub(crate) export_surface_names: std::collections::HashSet<String>,
 }
 
 pub(crate) fn extract_new_file_facts(dir: &str, file_path: &str) -> NewFileFacts {
     let mut facts = NewFileFacts {
         exported: None,
         callees: std::collections::HashSet::new(),
-        reexports: std::collections::HashSet::new(),
+        export_surface_names: std::collections::HashSet::new(),
     };
     // exported の test path 短絡: parse せず Some(空) を返す (extract_exported_symbols_from_file と一致)。
     let is_test = is_test_path(std::path::Path::new(file_path));
@@ -1367,7 +1372,7 @@ pub(crate) fn extract_new_file_facts(dir: &str, file_path: &str) -> NewFileFacts
         ));
     }
 
-    // reexports: safe かつ TS/TSX/JS/Rust のみ (extract_reexported_names_from_file と一致)。
+    // export surface: safe かつ TS/TSX/JS/Rust のみ。
     if safe
         && matches!(
             lang_id,
@@ -1377,11 +1382,11 @@ pub(crate) fn extract_new_file_facts(dir: &str, file_path: &str) -> NewFileFacts
                 | crate::language::LangId::Rust
         )
     {
-        facts.reexports = match lang_id {
+        facts.export_surface_names = match lang_id {
             crate::language::LangId::Rust => {
                 crate::engine::symbols::collect_rust_reexported_names(root, &source)
             }
-            _ => crate::engine::symbols::collect_reexported_names(root, &source),
+            _ => crate::engine::symbols::collect_js_ts_named_export_surface_names(root, &source),
         };
     }
 

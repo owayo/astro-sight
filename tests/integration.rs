@@ -10141,6 +10141,82 @@ fn api_rm_suppressed_for_ts_named_reexport() {
     );
 }
 
+/// ローカル Issue 2026-06-30-teamspirit-message-map-api-triage の回帰テスト:
+/// ローカル型定義を別ファイルへ移動し、元ファイルには from 句なしの
+/// `import type { X } ...; export type { X };` を残すリファクタでも、利用者から見た
+/// export 面 (import path から取れる名前) は維持されるため api.rm に出さない。
+/// 新定義は `keyof MessageMap` で旧定義 (union literal) と signature が異なるため
+/// reconcile_with_moves (name+kind+signature 一致) では相殺されず、from 句なし
+/// export clause の抑制ロジックが独立して効くことを保証する。
+#[test]
+fn api_rm_suppressed_for_ts_from_less_type_reexport() {
+    use std::process::Command;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path();
+    let path_str = path.to_str().expect("utf-8");
+
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .status()
+            .expect("git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(
+        path.join("messaging.ts"),
+        "export type MessageName = \"openTab\" | \"checkTabUrl\";\n\
+export function send(name: MessageName) {}\n",
+    )
+    .unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+    // 定義を messages.ts へ移動 (keyof 派生に変更 = 旧 signature と不一致で move 相殺不可)。
+    // messaging.ts は import + from 句なし re-export で同名を公開し続ける。
+    std::fs::write(
+        path.join("messages.ts"),
+        "export interface MessageMap {\n\
+\topenTab: { body: string };\n\
+\tcheckTabUrl: { body: undefined };\n\
+}\n\
+export type MessageName = keyof MessageMap;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        path.join("messaging.ts"),
+        "import type { MessageName } from \"./messages\";\n\
+\n\
+export type { MessageName };\n\
+\n\
+export function send(name: MessageName) {}\n",
+    )
+    .unwrap();
+    git(&["add", "-A"]);
+
+    let output = cargo_bin()
+        .args(["review", "--dir", path_str, "--git"])
+        .output()
+        .expect("run review");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    let api_rm: Vec<&str> = json["api"]["rm"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|s| s["n"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        !api_rm.contains(&"MessageName"),
+        "MessageName は from 句なし export clause で公開が継続しており api.rm に出すべきでない: api.rm={api_rm:?}"
+    );
+}
+
 #[test]
 fn non_git_review_emits_skipped() {
     let dir = tempfile::tempdir().expect("tempdir");

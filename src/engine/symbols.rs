@@ -399,19 +399,31 @@ fn is_private_class_member_js_ts(node: Node, source: &[u8]) -> bool {
     false
 }
 
-/// トップレベルの export { ... } 文から一致する名前を検索する。
-fn has_named_export(root: Node, source: &[u8], target_name: &str) -> bool {
+/// TS/JS の named export clause specifier 1 件分。
+/// `export { local as exported }` (from 句なし) / `export { name } from "..."` (forwarding)
+/// の両形式を表す。
+struct JsTsExportClauseSpecifier<'a> {
+    /// export 元のローカル名 (`export { A as B }` の A)。
+    local_name: &'a str,
+    /// 利用者から見える公開名 (`export { A as B }` の B、alias なしなら A)。
+    exported_name: &'a str,
+    /// from 句 (`export { X } from "..."`) の有無。
+    has_source: bool,
+}
+
+/// root 直下の export_statement 内の export specifier を列挙して visit に渡す。
+/// `has_named_export` / `collect_js_ts_named_export_surface_names` の共通 AST walk。
+fn visit_js_ts_export_clause_specifiers<'a>(
+    root: Node,
+    source: &'a [u8],
+    mut visit: impl FnMut(JsTsExportClauseSpecifier<'a>),
+) {
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
         if child.kind() != "export_statement" {
             continue;
         }
-        // `export { foo } from "./b"` は別モジュールの forwarding (re-export) であり、
-        // このファイルでの foo のローカル定義 export ではない。from 句 (source) があれば
-        // ローカル export 判定の対象外とする。
-        if child.child_by_field_name("source").is_some() {
-            continue;
-        }
+        let has_source = child.child_by_field_name("source").is_some();
         let mut inner = child.walk();
         for grandchild in child.children(&mut inner) {
             if grandchild.kind() != "export_clause" {
@@ -422,62 +434,58 @@ fn has_named_export(root: Node, source: &[u8], target_name: &str) -> bool {
                 if spec.kind() != "export_specifier" {
                     continue;
                 }
-                let local_name = spec
+                let Some(local_name) = spec
                     .child_by_field_name("name")
-                    .and_then(|n| n.utf8_text(source).ok());
-                if local_name == Some(target_name) {
-                    return true;
-                }
+                    .and_then(|n| n.utf8_text(source).ok())
+                else {
+                    continue;
+                };
+                let exported_name = spec
+                    .child_by_field_name("alias")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or(local_name);
+                visit(JsTsExportClauseSpecifier {
+                    local_name,
+                    exported_name,
+                    has_source,
+                });
             }
         }
     }
-    false
 }
 
-/// TS/JS の named re-export (`export { foo } from "..."` /
-/// `export { foo as bar } from "..."`) で **このファイルから提供される export 名** の
-/// 集合を返す (alias があれば alias 名)。`export * from "..."` (wildcard) は名前が静的に
-/// 不明なため対象外。
+/// トップレベルの export { ... } 文から一致する名前を検索する。
+/// `export { foo } from "./b"` は別モジュールの forwarding (re-export) であり、
+/// このファイルでの foo のローカル定義 export ではないため対象外。
+fn has_named_export(root: Node, source: &[u8], target_name: &str) -> bool {
+    let mut found = false;
+    visit_js_ts_export_clause_specifiers(root, source, |spec| {
+        if !spec.has_source && spec.local_name == target_name {
+            found = true;
+        }
+    });
+    found
+}
+
+/// TS/JS の named export clause (`export { foo }` / `export { foo as bar }` /
+/// `export { foo } from "..."`) が **このファイルから提供する公開 export 名** の集合を
+/// 返す (alias があれば alias 名)。from 句の有無は問わない — `import ...; export { X };`
+/// (from 句なし re-export) も `export { X } from "..."` (forwarding) も、利用者から見た
+/// export 面では同じく X を公開し続ける。`export * from "..."` (wildcard) は名前が
+/// 静的に不明なため対象外。
 ///
-/// api.rm 抑制に使う: あるシンボルがローカル定義から re-export に置き換わっても、
-/// 利用者から見た export 面 (import path から取れる名前) は維持されているため
-/// 「削除」ではない。
-pub(crate) fn collect_reexported_names(
+/// api.rm 抑制に使う: あるシンボルがローカル定義から re-export (from 句の有無を問わず)
+/// に置き換わっても、利用者から見た export 面 (import path から取れる名前) は維持されて
+/// いるため「削除」ではない。ローカル定義付き `export { X }` の X も集合に入るが、その
+/// 場合 X は exported シンボルとして別途抽出され api.rm 候補に上がらないため無害。
+pub(crate) fn collect_js_ts_named_export_surface_names(
     root: Node,
     source: &[u8],
 ) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
-    let mut cursor = root.walk();
-    for child in root.children(&mut cursor) {
-        if child.kind() != "export_statement" {
-            continue;
-        }
-        // from 句 (source) がある export のみ re-export。
-        if child.child_by_field_name("source").is_none() {
-            continue;
-        }
-        let mut inner = child.walk();
-        for grandchild in child.children(&mut inner) {
-            if grandchild.kind() != "export_clause" {
-                continue;
-            }
-            let mut spec_cursor = grandchild.walk();
-            for spec in grandchild.children(&mut spec_cursor) {
-                if spec.kind() != "export_specifier" {
-                    continue;
-                }
-                // exported 名: alias (`as bar`) があれば alias、なければ name。
-                let exported = spec
-                    .child_by_field_name("alias")
-                    .or_else(|| spec.child_by_field_name("name"));
-                if let Some(n) = exported
-                    && let Ok(text) = n.utf8_text(source)
-                {
-                    names.insert(text.to_string());
-                }
-            }
-        }
-    }
+    visit_js_ts_export_clause_specifiers(root, source, |spec| {
+        names.insert(spec.exported_name.to_string());
+    });
     names
 }
 
@@ -3480,13 +3488,13 @@ mod tests {
         assert_eq!(cx_of(src, LangId::Kotlin, "tryIt"), 2);
     }
 
-    /// re-export 名抽出テスト用ヘルパー。
-    fn collect_reexports(source: &str, lang_id: LangId) -> std::collections::HashSet<String> {
+    /// named export surface 名抽出テスト用ヘルパー。
+    fn collect_export_surface(source: &str, lang_id: LangId) -> std::collections::HashSet<String> {
         let language = lang_id.ts_language();
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&language).unwrap();
         let tree = parser.parse(source, None).unwrap();
-        super::collect_reexported_names(tree.root_node(), source.as_bytes())
+        super::collect_js_ts_named_export_surface_names(tree.root_node(), source.as_bytes())
     }
 
     #[test]
@@ -3501,8 +3509,8 @@ mod tests {
     }
 
     #[test]
-    fn collect_reexported_names_named_and_alias() {
-        let names = collect_reexports(
+    fn collect_export_surface_named_and_alias() {
+        let names = collect_export_surface(
             "export { foo, bar as baz } from \"./b\";",
             LangId::Typescript,
         );
@@ -3515,13 +3523,55 @@ mod tests {
     }
 
     #[test]
-    fn collect_reexported_names_ignores_local_export() {
-        // from 句のない `export { foo }` は re-export ではない (ローカル export)。
-        let names = collect_reexports("function foo() {}\nexport { foo };", LangId::Typescript);
+    fn collect_export_surface_includes_from_less_export_clause() {
+        // from 句のない `export { foo }` も公開 export 名として収集する。
+        // ローカル定義付きなら foo は exported シンボルとして別途抽出されるため
+        // api.rm 候補に上がらず、収集しても無害 (doc 参照)。
+        let names =
+            collect_export_surface("function foo() {}\nexport { foo };", LangId::Typescript);
         assert!(
-            names.is_empty(),
-            "ローカル export は re-export でない: {names:?}"
+            names.contains("foo"),
+            "from 句なし export clause も公開面: {names:?}"
         );
+    }
+
+    #[test]
+    fn collect_export_surface_from_less_reexport_of_import() {
+        // Issue 2026-06-30-teamspirit-message-map-api-triage の再現:
+        // `import type { X } from "..."; export type { X };` は from 句付き
+        // `export { X } from "..."` と等価な公開面の維持であり、収集対象。
+        let names = collect_export_surface(
+            "import type { MessageName } from \"./messages\";\nexport type { MessageName };",
+            LangId::Typescript,
+        );
+        assert!(
+            names.contains("MessageName"),
+            "from 句なし re-export も公開面: {names:?}"
+        );
+    }
+
+    #[test]
+    fn collect_export_surface_from_less_alias_uses_public_name() {
+        // `export { Local as Public };` の公開名は Public (Local は含まない)。
+        let names = collect_export_surface(
+            "import { Local } from \"./lib\";\nexport { Local as Public };",
+            LangId::Typescript,
+        );
+        assert!(names.contains("Public"), "alias 後の公開名: {names:?}");
+        assert!(
+            !names.contains("Local"),
+            "alias 前のローカル名は含まない: {names:?}"
+        );
+    }
+
+    #[test]
+    fn collect_export_surface_js_from_less_export_clause() {
+        // JS でも from 句なし export clause を収集する (grammar は TS と同系)。
+        let names = collect_export_surface(
+            "import { helper } from \"./lib\";\nexport { helper };",
+            LangId::Javascript,
+        );
+        assert!(names.contains("helper"), "JS の from 句なし: {names:?}");
     }
 
     /// Rust の `pub use` 再エクスポート抽出ヘルパー。
