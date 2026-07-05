@@ -7,6 +7,18 @@ use crate::language::LangId;
 
 /// ソースファイルをパースし tree-sitter Tree を返す。
 pub fn parse_file(path: &Utf8Path, source: &[u8]) -> Result<(Tree, LangId)> {
+    let lang_id = detect_lang(path, source)?;
+
+    let tree = parse_source(source, lang_id)?;
+    Ok((tree, lang_id))
+}
+
+/// パスとソース内容から解析言語を決定する。
+///
+/// `.h` は既定では C として扱うが、C++ 専用構文を含み、C++ parser の方が明確に
+/// parse error が少ない場合だけ C++ に切り替える。C ヘッダを誤って C++ 扱いしない
+/// ため、拡張子だけではなく parser の実結果で判定する。
+pub fn detect_lang(path: &Utf8Path, source: &[u8]) -> Result<LangId> {
     let lang_id = LangId::from_path(path).or_else(|_| {
         // shebang で言語検出を試行
         let first_line = std::str::from_utf8(source)
@@ -17,8 +29,60 @@ pub fn parse_file(path: &Utf8Path, source: &[u8]) -> Result<(Tree, LangId)> {
             .ok_or_else(|| AstroError::unsupported_language(path.extension().unwrap_or("<none>")))
     })?;
 
-    let tree = parse_source(source, lang_id)?;
-    Ok((tree, lang_id))
+    if lang_id == LangId::C && is_c_header_path(path) && header_should_use_cpp(source) {
+        Ok(LangId::Cpp)
+    } else {
+        Ok(lang_id)
+    }
+}
+
+fn is_c_header_path(path: &Utf8Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("h"))
+}
+
+fn header_should_use_cpp(source: &[u8]) -> bool {
+    if !header_has_cpp_marker(source) {
+        return false;
+    }
+    let Ok(c_tree) = parse_source(source, LangId::C) else {
+        return false;
+    };
+    let c_score = parse_error_score(c_tree.root_node());
+    if c_score == 0 {
+        return false;
+    }
+    let Ok(cpp_tree) = parse_source(source, LangId::Cpp) else {
+        return false;
+    };
+    parse_error_score(cpp_tree.root_node()) < c_score
+}
+
+fn header_has_cpp_marker(source: &[u8]) -> bool {
+    const MARKERS: &[&[u8]] = &[
+        b"class ",
+        b"namespace ",
+        b"template",
+        b"typename ",
+        b"public:",
+        b"private:",
+        b"protected:",
+        b"::",
+        b"virtual ",
+        b"constexpr",
+    ];
+    MARKERS
+        .iter()
+        .any(|marker| memchr::memmem::find(source, marker).is_some())
+}
+
+fn parse_error_score(node: tree_sitter::Node<'_>) -> usize {
+    let mut score = usize::from(node.is_error() || node.is_missing());
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        score += parse_error_score(child);
+    }
+    score
 }
 
 /// パースのタイムアウト秒。デフォルト 30 秒、`ASTRO_SIGHT_PARSE_TIMEOUT_SEC` で上書き、
@@ -211,6 +275,23 @@ mod tests {
         let source = b"def hello():\n    print('hello')\n";
         let tree = parse_source(source, LangId::Python).unwrap();
         assert!(!tree.root_node().has_error());
+    }
+
+    /// `.h` でも C++ 専用構文が C より正しく parse できる場合は C++ と判定する。
+    #[test]
+    fn detect_lang_cpp_header_when_cpp_parse_is_better() {
+        let source =
+            b"template <typename T> struct Base {};\nstruct OmnisError : public Base<OmnisError> {};\n";
+        let lang = detect_lang(camino::Utf8Path::new("error.h"), source).unwrap();
+        assert_eq!(lang, LangId::Cpp);
+    }
+
+    /// C として問題なく parse できる `.h` は C のまま扱う。
+    #[test]
+    fn detect_lang_keeps_plain_c_header_as_c() {
+        let source = b"struct plain_c_header { int value; };\n";
+        let lang = detect_lang(camino::Utf8Path::new("plain.h"), source).unwrap();
+        assert_eq!(lang, LangId::C);
     }
 
     /// SourceBuf::Vec の Deref が正しくバイト列を返す

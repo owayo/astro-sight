@@ -7,11 +7,13 @@ use crate::error::{AstroError, ErrorCode};
 use crate::models::dead_code::DeadCodeResult;
 use crate::models::review::DeadSymbol;
 
+#[cfg(test)]
+use super::api_changes::extract_exported_symbols_from_file_inner;
 use super::api_changes::{
-    bare_name, extract_exported_symbols_from_file_inner, extract_symbol_lines,
+    bare_name, extract_exported_symbols_from_file_inner_with_lang, extract_symbol_lines,
 };
 use super::common::{MAX_INPUT_SIZE, read_file_to_string_limited, serialize_output};
-use super::dead_code_member_liveness::{JsTsMemberLiveness, MemberStatus};
+use super::dead_code_member_liveness::{JsTsMemberLiveness, MemberStatus, PhpMemberLiveness};
 use super::git_input::{GitDiffInput, resolve_git_diff};
 
 /// dead-code 検出本体。候補収集 → 名前インデックス構築 → 参照カウント →
@@ -97,24 +99,22 @@ fn collect_dead_code_candidates(
         if crate::engine::generated::is_auto_generated(&canonical_path) {
             continue;
         }
-        let lang = match crate::language::LangId::from_path(camino::Utf8Path::new(&rel)) {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        if let Some(syms) = extract_dead_code_candidates_from_file(dir, &rel) {
+        if let Some((lang, syms)) =
+            extract_exported_symbols_from_file_inner_with_lang(dir, &rel, true, true)
+        {
             for (name, kind, _sig) in syms {
                 all_syms.push((name, kind, rel.clone(), lang));
             }
-        }
-        // C/C++ では enum の列挙子・typedef alias を liveness 補助名として集める。
-        // enum 型名が直接使われなくても列挙子が使われていれば live、body あり typedef tag が
-        // alias 名でのみ使われていても live と判定するために使う (Issue #11/#12)。
-        if matches!(
-            lang,
-            crate::language::LangId::C | crate::language::LangId::Cpp
-        ) {
-            for (sym, extras) in collect_cpp_liveness_for_file(dir, &rel, lang) {
-                liveness_raw.push((rel.clone(), sym, extras, lang));
+            // C/C++ では enum の列挙子・typedef alias を liveness 補助名として集める。
+            // enum 型名が直接使われなくても列挙子が使われていれば live、body あり typedef tag が
+            // alias 名でのみ使われていても live と判定するために使う (Issue #11/#12)。
+            if matches!(
+                lang,
+                crate::language::LangId::C | crate::language::LangId::Cpp
+            ) {
+                for (sym, extras) in collect_cpp_liveness_for_file(dir, &rel, lang) {
+                    liveness_raw.push((rel.clone(), sym, extras, lang));
+                }
             }
         }
     }
@@ -138,6 +138,9 @@ struct DeadCodeNameIndex {
     /// スキップ対象の候補のうち、本インデックスで `Live` / `TestOnly` / `Dead` が
     /// 返るものは旧スキップを緩和して通常の dead 判定経路に乗せる。
     member_liveness: JsTsMemberLiveness,
+    /// PHP の duplicate な同名 class member について `Owner::member()` などの
+    /// 確定参照だけを使って dead/test_only/live を再判定するためのインデックス。
+    php_member_liveness: PhpMemberLiveness,
 }
 
 /// 言語別に正規化した bare name を返す。
@@ -207,12 +210,15 @@ fn build_dead_code_name_index(
     // ケースだけ通常の dead/test_only/live 判定経路に乗せる。
     let member_liveness =
         JsTsMemberLiveness::build(&candidates.all_syms, canonical_dir, is_test_path);
+    let php_member_liveness =
+        PhpMemberLiveness::build(&candidates.all_syms, canonical_dir, is_test_path);
 
     DeadCodeNameIndex {
         name_counts,
         liveness_aliases,
         unique_names,
         member_liveness,
+        php_member_liveness,
     }
 }
 
@@ -286,30 +292,28 @@ fn ref_counts_with_liveness(
     (prod_cnt, test_cnt)
 }
 
-/// qualname `Container.member` を owner/bare に分割し、TS/JS class member の
-/// `JsTsMemberLiveness::status_for` を呼び出す。TS/JS 以外、または owner を
-/// 一意特定できない名前 (bare のみ / 多段 qualname) の場合は `None` を返し、
-/// 呼び出し側は従来の保守的スキップを維持する。
+/// qualname `Container.member` を owner/bare に分割し、言語別 member liveness を
+/// 呼び出す。対象外言語、または owner を一意特定できない名前 (bare のみ / 多段
+/// qualname) の場合は `None` を返し、呼び出し側は従来の保守的スキップを維持する。
 fn member_status_for_candidate(
     name: &str,
     file: &str,
     lang: crate::language::LangId,
-    liveness: &JsTsMemberLiveness,
+    js_ts_liveness: &JsTsMemberLiveness,
+    php_liveness: &PhpMemberLiveness,
 ) -> Option<MemberStatus> {
-    if !matches!(
-        lang,
-        crate::language::LangId::Typescript
-            | crate::language::LangId::Javascript
-            | crate::language::LangId::Tsx
-    ) {
-        return None;
-    }
     let (owner, bare) = name.rsplit_once('.')?;
     if owner.contains('.') {
         // 多段 qualname は class.member とみなさない。
         return None;
     }
-    liveness.status_for(owner, bare, file)
+    match lang {
+        crate::language::LangId::Typescript
+        | crate::language::LangId::Javascript
+        | crate::language::LangId::Tsx => js_ts_liveness.status_for(owner, bare, file),
+        crate::language::LangId::Php => php_liveness.status_for(owner, bare, file),
+        _ => None,
+    }
 }
 
 /// 参照カウントと各除外規約から dead / test-only シンボルを分類する。
@@ -330,7 +334,13 @@ fn classify_dead_symbols(
         // ただし TS/JS の class member については `JsTsMemberLiveness` で owner 一意推定
         // が成立した場合のみ、duplicate スキップを緩和して通常判定に乗せる。
         if index.name_counts.get(&key).copied().unwrap_or(0) > 1 {
-            match member_status_for_candidate(name, file, *lang, &index.member_liveness) {
+            match member_status_for_candidate(
+                name,
+                file,
+                *lang,
+                &index.member_liveness,
+                &index.php_member_liveness,
+            ) {
                 Some(MemberStatus::Live) => continue,
                 Some(MemberStatus::TestOnly) => {
                     // Angular template / Android XML から参照されるシンボルは live。
@@ -450,6 +460,7 @@ pub(crate) fn is_test_path(path: &std::path::Path) -> bool {
     false
 }
 
+#[cfg(test)]
 pub(crate) fn extract_dead_code_candidates_from_file(
     dir: &str,
     file_path: &str,
@@ -540,17 +551,39 @@ pub(crate) fn enclosing_container<'a>(
     sym: &crate::models::symbol::Symbol,
     containers: &'a [&'a crate::models::symbol::Symbol],
 ) -> Option<&'a crate::models::symbol::Symbol> {
-    let s = sym.range.start.line;
-    let e = sym.range.end.line;
     containers
         .iter()
         .copied()
-        .filter(|c| {
-            let cs = c.range.start.line;
-            let ce = c.range.end.line;
-            cs <= s && ce >= e && !(cs == s && ce == e)
+        .filter(|c| symbol_range_contains(c, sym) && !symbol_range_equal(c, sym))
+        .min_by_key(|c| {
+            (
+                c.range.end.line.saturating_sub(c.range.start.line),
+                c.range.end.column.saturating_sub(c.range.start.column),
+            )
         })
-        .min_by_key(|c| c.range.end.line.saturating_sub(c.range.start.line))
+}
+
+fn symbol_range_contains(
+    outer: &crate::models::symbol::Symbol,
+    inner: &crate::models::symbol::Symbol,
+) -> bool {
+    let starts_before_or_at = outer.range.start.line < inner.range.start.line
+        || (outer.range.start.line == inner.range.start.line
+            && outer.range.start.column <= inner.range.start.column);
+    let ends_after_or_at = outer.range.end.line > inner.range.end.line
+        || (outer.range.end.line == inner.range.end.line
+            && outer.range.end.column >= inner.range.end.column);
+    starts_before_or_at && ends_after_or_at
+}
+
+fn symbol_range_equal(
+    a: &crate::models::symbol::Symbol,
+    b: &crate::models::symbol::Symbol,
+) -> bool {
+    a.range.start.line == b.range.start.line
+        && a.range.start.column == b.range.start.column
+        && a.range.end.line == b.range.end.line
+        && a.range.end.column == b.range.end.column
 }
 
 // ---------------------------------------------------------------------------

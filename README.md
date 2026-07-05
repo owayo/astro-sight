@@ -207,6 +207,8 @@ astro-sight refs --names "AppService,AstgenResponse" --dir src/
 
 C/C++ の `struct` / `class` / `union` / `enum` tag 名は、本体付き定義だけを Definition とし、`struct X *p`、`sizeof(struct X)`、cast、引数型・メンバ宣言内の `struct X` は Reference として数える。単独 forward declaration は ref/def のどちらにも含めないため、dead-code でも使用中の型 tag を誤って dead にしにくい。
 
+`.h` は既定では C ヘッダとして扱うが、C++ 専用構文のマーカーがあり、C++ parser の方が明確に parse error が少ない場合は C++ として解析する。C ヘッダを不用意に C++ 扱いせず、`class Foo { public: ... }` や `struct X : Base<X> {}` のような C++ ヘッダの `symbols` / `review` / `dead-code` 取りこぼしを抑える。
+
 `context` / `impact` / `review` の `--base` は `git diff` / `git show` / `git blame` にそのまま渡るため、`-` で始まる値・NUL を含む値・空文字を `INVALID_REQUEST` で拒否する（`--output=/path` 等のオプション誤認識を防ぐ）。
 
 出力例:
@@ -434,7 +436,7 @@ astro-sight dead-code --dir . --git --staged
 }
 ```
 
-同名シンボルが複数ファイルに存在する場合は誤判定防止のためスキップされる。
+同名シンボルが複数ファイルに存在する場合は誤判定防止のためスキップされる。ただし TS/JS と PHP の class member は、owner を安全に一意推定できる場合だけ例外的に判定する。PHP では `Owner::method()` と同一クラス内の `self::method()` / `static::method()` を確定参照として扱い、`$obj->method()` や callable 文字列など owner を確定できない参照がある場合は従来どおりスキップする。
 
 #### テストフレームワーク規約の自動除外
 
@@ -580,8 +582,8 @@ $ astro-sight ast --path nonexistent.rs
 | Language | Extension | Crate | Version |
 |----------|-----------|-------|---------|
 | <img src="https://img.shields.io/badge/-000000?logo=rust&logoColor=white" height="16"> Rust | `.rs` | `tree-sitter-rust` | 0.24 |
-| <img src="https://img.shields.io/badge/-A8B9CC?logo=c&logoColor=white" height="16"> C | `.c`, `.h` | `tree-sitter-c` | 0.24 |
-| <img src="https://img.shields.io/badge/-00599C?logo=cplusplus&logoColor=white" height="16"> C++ | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx` | `tree-sitter-cpp` | 0.23 |
+| <img src="https://img.shields.io/badge/-A8B9CC?logo=c&logoColor=white" height="16"> C | `.c`, `.h` (既定) | `tree-sitter-c` | 0.24 |
+| <img src="https://img.shields.io/badge/-00599C?logo=cplusplus&logoColor=white" height="16"> C++ | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, `.h` (C++ 構文検出時) | `tree-sitter-cpp` | 0.23 |
 | <img src="https://img.shields.io/badge/-3776AB?logo=python&logoColor=white" height="16"> Python | `.py`, `.pyi` | `tree-sitter-python` | 0.25 |
 | <img src="https://img.shields.io/badge/-F7DF1E?logo=javascript&logoColor=black" height="16"> JavaScript | `.js`, `.mjs`, `.cjs`, `.jsx` | `tree-sitter-javascript` | 0.25 |
 | <img src="https://img.shields.io/badge/-3178C6?logo=typescript&logoColor=white" height="16"> TypeScript | `.ts`, `.mts`, `.cts` | `tree-sitter-typescript` | 0.23 |

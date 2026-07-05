@@ -1,4 +1,4 @@
-//! TS/JS の class member 単位の liveness 解析。
+//! TS/JS と PHP の class member 単位の liveness 解析。
 //!
 //! 同名 bare member (例: `VoiceLogSettingModel.isOmnis` と `VoiceLogModel.isOmnis`) が
 //! 複数 owner クラスに存在する場合、`build_dead_code_name_index` の `name_counts > 1`
@@ -182,6 +182,144 @@ impl JsTsMemberLiveness {
             .get(&(file.to_string(), owner.to_string(), bare.to_string()))
             .copied()
     }
+}
+
+/// PHP class member の owner-aware liveness インデックス。
+///
+/// PHP はメソッド名が case-insensitive で、`new` のような言語キーワードと同じ文字列を
+/// メソッド名として持てる。duplicate bare name では通常の refs count だけでは owner を
+/// 区別できないため、確定的に解決できる `Owner::method()` / 同一クラス内の
+/// `self::method()` / `static::method()` だけを数える。
+#[derive(Debug, Default)]
+pub(crate) struct PhpMemberLiveness {
+    statuses: HashMap<(String, String, String), MemberStatus>,
+}
+
+impl PhpMemberLiveness {
+    pub(crate) fn build<F>(
+        candidates: &[(String, String, String, LangId)],
+        canonical_dir: &Path,
+        is_test_path: F,
+    ) -> Self
+    where
+        F: Fn(&Path) -> bool,
+    {
+        let mut statuses: HashMap<(String, String, String), MemberStatus> = HashMap::new();
+        let php_members = collect_php_member_candidates(candidates);
+        if php_members.is_empty() {
+            return Self { statuses };
+        }
+
+        let bare_to_members = group_php_members_by_bare(&php_members);
+        if !has_duplicate_php_member_set(&bare_to_members) {
+            return Self { statuses };
+        }
+
+        let Some(php_files) = collect_php_files(canonical_dir) else {
+            return Self { statuses };
+        };
+
+        for (bare_key, members) in &bare_to_members {
+            let owners: HashSet<String> = members.iter().map(|m| php_fold_name(&m.owner)).collect();
+            if owners.len() < 2 {
+                continue;
+            }
+            let analysis = analyze_php_duplicate_set(bare_key, &owners, &php_files, &is_test_path);
+
+            match analysis {
+                DuplicateSetResult::Ambiguous => {
+                    for m in members {
+                        statuses.insert(
+                            (
+                                m.file.clone(),
+                                php_fold_name(&m.owner),
+                                php_fold_name(&m.bare),
+                            ),
+                            MemberStatus::Ambiguous,
+                        );
+                    }
+                }
+                DuplicateSetResult::Counted(counts) => {
+                    for m in members {
+                        let owner_key = php_fold_name(&m.owner);
+                        let (prod, tst) = counts.get(&owner_key).copied().unwrap_or((0, 0));
+                        let status = if prod > 0 {
+                            MemberStatus::Live
+                        } else if tst > 0 {
+                            MemberStatus::TestOnly
+                        } else {
+                            MemberStatus::Dead
+                        };
+                        statuses
+                            .insert((m.file.clone(), owner_key, php_fold_name(&m.bare)), status);
+                    }
+                }
+            }
+        }
+
+        Self { statuses }
+    }
+
+    pub(crate) fn status_for(&self, owner: &str, bare: &str, file: &str) -> Option<MemberStatus> {
+        self.statuses
+            .get(&(file.to_string(), php_fold_name(owner), php_fold_name(bare)))
+            .copied()
+    }
+}
+
+fn collect_php_member_candidates(
+    candidates: &[(String, String, String, LangId)],
+) -> Vec<MemberCandidate> {
+    let mut php_members = Vec::new();
+    for (name, kind, file, lang) in candidates {
+        if *lang != LangId::Php || !is_class_member_kind(kind) {
+            continue;
+        }
+        let Some((owner, bare)) = name.rsplit_once('.') else {
+            continue;
+        };
+        if owner.contains('.') {
+            continue;
+        }
+        php_members.push(MemberCandidate {
+            owner: owner.to_string(),
+            bare: bare.to_string(),
+            file: file.clone(),
+        });
+    }
+    php_members
+}
+
+fn group_php_members_by_bare(
+    members: &[MemberCandidate],
+) -> HashMap<String, Vec<&MemberCandidate>> {
+    let mut grouped: HashMap<String, Vec<&MemberCandidate>> = HashMap::new();
+    for m in members {
+        grouped.entry(php_fold_name(&m.bare)).or_default().push(m);
+    }
+    grouped
+}
+
+fn has_duplicate_php_member_set(grouped: &HashMap<String, Vec<&MemberCandidate>>) -> bool {
+    grouped.values().any(|v| {
+        let owners: HashSet<String> = v.iter().map(|m| php_fold_name(&m.owner)).collect();
+        owners.len() >= 2
+    })
+}
+
+fn collect_php_files(canonical_dir: &Path) -> Option<Vec<std::path::PathBuf>> {
+    let files = refs::collect_files(canonical_dir, None).ok()?;
+    Some(
+        files
+            .into_iter()
+            .filter(|p| {
+                let Some(s) = p.to_str() else {
+                    return false;
+                };
+                matches!(LangId::from_path(camino::Utf8Path::new(s)), Ok(LangId::Php))
+            })
+            .collect(),
+    )
 }
 
 struct MemberCandidate {
@@ -399,6 +537,232 @@ fn contains_ambiguous_member_token(source: &[u8], bare: &str) -> bool {
     memchr::memmem::find(source, dq.as_bytes()).is_some()
         || memchr::memmem::find(source, sq.as_bytes()).is_some()
         || memchr::memmem::find(source, bt.as_bytes()).is_some()
+}
+
+fn analyze_php_duplicate_set<F>(
+    bare_key: &str,
+    owners: &HashSet<String>,
+    files: &[std::path::PathBuf],
+    is_test_path: F,
+) -> DuplicateSetResult
+where
+    F: Fn(&Path) -> bool,
+{
+    let mut counts: HashMap<String, (usize, usize)> = HashMap::new();
+
+    for file_path in files {
+        let utf8 = match file_path.to_str() {
+            Some(s) => camino::Utf8Path::new(s),
+            None => continue,
+        };
+        let source = match parser::read_file(utf8) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if !contains_ascii_case_insensitive(source.as_bytes(), bare_key.as_bytes()) {
+            continue;
+        }
+        let tree = match parser::parse_source(&source, LangId::Php) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let mut analysis = PhpFileAnalysis::default();
+        visit_php_node(
+            tree.root_node(),
+            source.as_bytes(),
+            owners,
+            bare_key,
+            None,
+            &mut analysis,
+        );
+        if analysis.ambiguous {
+            return DuplicateSetResult::Ambiguous;
+        }
+        if analysis.scoped_counts.is_empty() {
+            continue;
+        }
+        let is_test = is_test_path(file_path.as_path());
+        for (owner, count) in analysis.scoped_counts {
+            let entry = counts.entry(owner).or_insert((0, 0));
+            if is_test {
+                entry.1 = entry.1.saturating_add(count);
+            } else {
+                entry.0 = entry.0.saturating_add(count);
+            }
+        }
+    }
+
+    DuplicateSetResult::Counted(counts)
+}
+
+#[derive(Default)]
+struct PhpFileAnalysis {
+    scoped_counts: HashMap<String, usize>,
+    ambiguous: bool,
+}
+
+fn visit_php_node(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    owners: &HashSet<String>,
+    bare_key: &str,
+    current_class: Option<&str>,
+    analysis: &mut PhpFileAnalysis,
+) {
+    if analysis.ambiguous {
+        return;
+    }
+
+    let current_class_buf = php_class_context_for_node(node, source, owners);
+    let next_class = current_class_buf.as_deref().or(current_class);
+
+    process_php_liveness_node(node, source, owners, bare_key, next_class, analysis);
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_php_node(child, source, owners, bare_key, next_class, analysis);
+        if analysis.ambiguous {
+            break;
+        }
+    }
+}
+
+fn php_class_context_for_node(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    owners: &HashSet<String>,
+) -> Option<String> {
+    if !is_php_type_declaration(node.kind()) {
+        return None;
+    }
+    node.child_by_field_name("name")
+        .and_then(|name| php_node_key(name, source))
+        .filter(|key| owners.contains(key))
+}
+
+fn process_php_liveness_node(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    owners: &HashSet<String>,
+    bare_key: &str,
+    current_class: Option<&str>,
+    analysis: &mut PhpFileAnalysis,
+) {
+    match node.kind() {
+        "scoped_call_expression" => {
+            if php_call_name_matches(node, source, bare_key) {
+                record_php_scoped_call(node, source, owners, current_class, analysis);
+            }
+        }
+        "member_call_expression" => {
+            if php_call_name_matches(node, source, bare_key) {
+                analysis.ambiguous = true;
+            }
+        }
+        "string_content" => {
+            if let Ok(text) = node.utf8_text(source)
+                && php_string_content_mentions_method(text, bare_key)
+            {
+                analysis.ambiguous = true;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn record_php_scoped_call(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    owners: &HashSet<String>,
+    current_class: Option<&str>,
+    analysis: &mut PhpFileAnalysis,
+) {
+    match php_scoped_call_owner(node, source, owners, current_class) {
+        PhpOwnerResolution::Resolved(owner) => {
+            *analysis.scoped_counts.entry(owner).or_default() += 1;
+        }
+        PhpOwnerResolution::Ambiguous => analysis.ambiguous = true,
+        PhpOwnerResolution::Ignore => {}
+    }
+}
+
+enum PhpOwnerResolution {
+    Resolved(String),
+    Ignore,
+    Ambiguous,
+}
+
+fn php_scoped_call_owner(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    owners: &HashSet<String>,
+    current_class: Option<&str>,
+) -> PhpOwnerResolution {
+    let Some(scope) = node
+        .child_by_field_name("scope")
+        .or_else(|| node.named_child(0))
+    else {
+        return PhpOwnerResolution::Ambiguous;
+    };
+    let Ok(text) = scope.utf8_text(source) else {
+        return PhpOwnerResolution::Ambiguous;
+    };
+    let folded = php_fold_name(
+        text.trim_start_matches('\\')
+            .rsplit('\\')
+            .next()
+            .unwrap_or(text),
+    );
+    match folded.as_str() {
+        "self" | "static" => current_class
+            .map(|owner| PhpOwnerResolution::Resolved(owner.to_string()))
+            .unwrap_or(PhpOwnerResolution::Ambiguous),
+        "parent" => PhpOwnerResolution::Ambiguous,
+        _ if owners.contains(&folded) => PhpOwnerResolution::Resolved(folded),
+        _ if text.starts_with('$') => PhpOwnerResolution::Ambiguous,
+        _ => PhpOwnerResolution::Ignore,
+    }
+}
+
+fn php_call_name_matches(node: tree_sitter::Node<'_>, source: &[u8], bare_key: &str) -> bool {
+    node.child_by_field_name("name")
+        .and_then(|name| php_node_key(name, source))
+        .is_some_and(|key| key == bare_key)
+}
+
+fn php_node_key(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let text = node.utf8_text(source).ok()?;
+    Some(php_fold_name(
+        text.trim_start_matches('\\')
+            .rsplit('\\')
+            .next()
+            .unwrap_or(text),
+    ))
+}
+
+fn php_string_content_mentions_method(text: &str, bare_key: &str) -> bool {
+    let folded = text.trim().to_ascii_lowercase();
+    folded == bare_key
+        || folded.ends_with(&format!("::{bare_key}"))
+        || folded.ends_with(&format!("@{bare_key}"))
+}
+
+fn contains_ascii_case_insensitive(haystack: &[u8], needle_lower: &[u8]) -> bool {
+    !needle_lower.is_empty()
+        && haystack
+            .windows(needle_lower.len())
+            .any(|window| window.eq_ignore_ascii_case(needle_lower))
+}
+
+fn php_fold_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+fn is_php_type_declaration(kind: &str) -> bool {
+    matches!(
+        kind,
+        "class_declaration" | "interface_declaration" | "trait_declaration" | "enum_declaration"
+    )
 }
 
 fn ts_language_for(lang: LangId) -> Option<tree_sitter::Language> {

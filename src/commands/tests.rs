@@ -5972,6 +5972,67 @@ fn detect_api_changes_still_detects_genuine_removal() {
 }
 
 #[test]
+fn detect_api_changes_cpp_h_header_inheritance_redefinition_is_modified_not_removed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    git_commit_files(
+        repo,
+        &[(
+            "error.h",
+            "template <typename T> struct BaseError {};\n\
+struct OmnisError {\n\
+    void set_error(int code);\n\
+    int code;\n\
+};\n",
+        )],
+        "initial",
+    );
+    fs::write(
+        repo.join("error.h"),
+        "template <typename T> struct BaseError {};\n\
+struct OmnisError : public BaseError<OmnisError> {};\n",
+    )
+    .expect("write");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "error.h".to_string(),
+        new_path: "error.h".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 5,
+            new_start: 1,
+            new_count: 2,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    let removed: Vec<&str> = api_changes
+        .removed
+        .iter()
+        .chain(api_changes.removed_dead.iter())
+        .map(|s| s.name.as_str())
+        .collect();
+    let modified: Vec<&str> = api_changes
+        .modified
+        .iter()
+        .chain(api_changes.modified_closed_in_diff.iter())
+        .map(|s| s.name.as_str())
+        .collect();
+
+    assert!(
+        !removed.contains(&"OmnisError"),
+        ".h の C++ 継承付き再定義を api.rm にしてはならない。removed={removed:?}, modified={modified:?}"
+    );
+    assert!(
+        modified.contains(&"OmnisError"),
+        "継承付き再定義は削除ではなく変更として扱うべき。modified={modified:?}"
+    );
+}
+
+#[test]
 fn detect_api_changes_skips_linguist_generated_files() {
     // .gitattributes で linguist-generated 指定されたファイルの API 変更は報告しない。
     let dir = tempfile::tempdir().expect("tempdir");
@@ -6217,6 +6278,137 @@ export class SampleComponent {
     assert!(
         names.iter().any(|n| n.ends_with("reallyUnusedMethod")),
         "テンプレートからも参照されない method は dead として検出されるべき。got: {names:?}"
+    );
+}
+
+#[test]
+fn detect_dead_php_duplicate_static_factory_methods_are_owner_aware() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    fs::write(
+        repo.join("A.php"),
+        "<?php\nclass A {\n    public static function new(): self { return new self(); }\n}\n",
+    )
+    .expect("write A");
+    fs::write(
+        repo.join("B.php"),
+        "<?php\nclass B {\n    public static function new(): self { return new self(); }\n}\n",
+    )
+    .expect("write B");
+    fs::write(
+        repo.join("use.php"),
+        "<?php\nfunction use_classes(): void {\n    $a = new A();\n    $b = new B();\n    A::new();\n}\n",
+    )
+    .expect("write use");
+
+    let files = vec![repo.join("A.php"), repo.join("B.php"), repo.join("use.php")];
+    let (dead, _test_only) =
+        detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
+    let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+
+    assert!(
+        !names.contains(&"A.new"),
+        "A::new() で参照される A.new は dead ではない。got: {names:?}"
+    );
+    assert!(
+        names.contains(&"B.new"),
+        "同名 factory が複数 owner にあっても未参照の B.new は dead として検出する。got: {names:?}"
+    );
+}
+
+#[test]
+fn detect_dead_php_duplicate_static_factory_methods_on_single_line() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    fs::write(
+        repo.join("A.php"),
+        "<?php\nclass A { public static function new(): self { return new self(); } }\n",
+    )
+    .expect("write A");
+    fs::write(
+        repo.join("B.php"),
+        "<?php\nclass B { public static function new(): self { return new self(); } }\n",
+    )
+    .expect("write B");
+    fs::write(
+        repo.join("use.php"),
+        "<?php\nfunction use_classes(): void { $a = new A(); $b = new B(); A::new(); }\n",
+    )
+    .expect("write use");
+
+    let files = vec![repo.join("A.php"), repo.join("B.php"), repo.join("use.php")];
+    let (dead, _test_only) =
+        detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
+    let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+
+    assert!(
+        !names.contains(&"A.new") && names.contains(&"B.new"),
+        "1行 class 定義でも owner-aware に PHP factory method を判定する。got: {names:?}"
+    );
+}
+
+#[test]
+fn detect_dead_php_duplicate_methods_with_dynamic_call_remain_ambiguous() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    fs::write(
+        repo.join("A.php"),
+        "<?php\nclass A {\n    public static function new(): self { return new self(); }\n}\n",
+    )
+    .expect("write A");
+    fs::write(
+        repo.join("B.php"),
+        "<?php\nclass B {\n    public static function new(): self { return new self(); }\n}\n",
+    )
+    .expect("write B");
+    fs::write(
+        repo.join("use.php"),
+        "<?php\nfunction use_classes($factory): void {\n    $a = new A();\n    $b = new B();\n    $factory->new();\n}\n",
+    )
+    .expect("write use");
+
+    let files = vec![repo.join("A.php"), repo.join("B.php"), repo.join("use.php")];
+    let (dead, _test_only) =
+        detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
+    let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+
+    assert!(
+        !names.contains(&"A.new") && !names.contains(&"B.new"),
+        "動的呼び出し $factory->new() は owner を確定できないため旧スキップを維持する。got: {names:?}"
+    );
+}
+
+#[test]
+fn detect_dead_cpp_h_header_class_methods_are_parsed_as_cpp() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    fs::write(
+        repo.join("GenericClient.h"),
+        "class GenericClient {\n\
+public:\n\
+    int getAdditionalHttpHeaders() const { return 0; }\n\
+    int getSetupFormat() const { return 1; }\n\
+};\n",
+    )
+    .expect("write header");
+
+    let files = vec![repo.join("GenericClient.h")];
+    let (dead, _test_only) =
+        detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
+    let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+
+    assert!(
+        names.contains(&"GenericClient.getAdditionalHttpHeaders")
+            && names.contains(&"GenericClient.getSetupFormat"),
+        ".h 内の C++ public getter も dead として検出する。got: {names:?}"
     );
 }
 

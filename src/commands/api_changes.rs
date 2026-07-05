@@ -15,6 +15,9 @@ use super::dead_code::{
 };
 use super::git_input::validate_git_revision;
 
+pub(crate) type ExportedSymbols = Vec<(String, String, String)>;
+type ExportedSymbolsWithLang = (crate::language::LangId, ExportedSymbols);
+
 /// 依存マニフェストとロックファイルの既知ペア。
 /// これらは `cargo update` や `npm install` など片側のみが変更される正規操作が頻繁に発生するため、
 /// missing_cochange 警告から除外する。同一ディレクトリに属するペアのみ除外対象とする（monorepo 配慮）。
@@ -1226,12 +1229,12 @@ pub(crate) fn extract_exported_symbols_from_git(
 pub(crate) fn extract_exported_symbols_from_source(
     file_path: &str,
     source: &[u8],
-) -> Option<Vec<(String, String, String)>> {
+) -> Option<ExportedSymbols> {
     if is_test_path(std::path::Path::new(file_path)) {
         return Some(Vec::new());
     }
     let utf8_path = camino::Utf8Path::new(file_path);
-    let lang_id = crate::language::LangId::from_path(utf8_path).ok()?;
+    let lang_id = parser::detect_lang(utf8_path, source).ok()?;
     let tree = parser::parse_source(source, lang_id).ok()?;
     let root = tree.root_node();
 
@@ -1252,12 +1255,28 @@ pub(crate) fn extract_exported_symbols_from_source(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn extract_exported_symbols_from_file_inner(
     dir: &str,
     file_path: &str,
     exclude_trait_impls: bool,
     exclude_framework_entrypoints: bool,
-) -> Option<Vec<(String, String, String)>> {
+) -> Option<ExportedSymbols> {
+    extract_exported_symbols_from_file_inner_with_lang(
+        dir,
+        file_path,
+        exclude_trait_impls,
+        exclude_framework_entrypoints,
+    )
+    .map(|(_, syms)| syms)
+}
+
+pub(crate) fn extract_exported_symbols_from_file_inner_with_lang(
+    dir: &str,
+    file_path: &str,
+    exclude_trait_impls: bool,
+    exclude_framework_entrypoints: bool,
+) -> Option<ExportedSymbolsWithLang> {
     // diff から得た file_path は信頼境界外。`../etc/passwd` 等のトラバーサルや絶対パスを
     // 拒否し、workspace 外のファイルを誤って読まないようにする。
     if !crate::engine::impact::is_safe_diff_path(file_path) {
@@ -1266,15 +1285,18 @@ pub(crate) fn extract_exported_symbols_from_file_inner(
     let full_path = std::path::Path::new(dir).join(file_path);
     let utf8_path = camino::Utf8Path::new(full_path.to_str()?);
     let source = parser::read_file(utf8_path).ok()?;
-    let lang_id = crate::language::LangId::from_path(utf8_path).ok()?;
+    let lang_id = parser::detect_lang(utf8_path, &source).ok()?;
 
     // lexer-only 言語 (現状 Xojo) は tree-sitter を持たないため、lexer 経由で
     // export 相当のシンボルを抽出する。
     if let crate::language::DetectedLang::LexerOnly(lexer_lang) = lang_id.detected() {
-        return Some(crate::engine::lexer::extract_exported_symbols(
-            &source,
-            lexer_lang,
-            exclude_framework_entrypoints,
+        return Some((
+            lang_id,
+            crate::engine::lexer::extract_exported_symbols(
+                &source,
+                lexer_lang,
+                exclude_framework_entrypoints,
+            ),
         ));
     }
 
@@ -1282,14 +1304,17 @@ pub(crate) fn extract_exported_symbols_from_file_inner(
     let root = tree.root_node();
 
     let syms = crate::engine::symbols::extract_symbols(root, &source, lang_id).ok()?;
-    Some(filter_exported_symbols(
-        &syms,
-        root,
-        &source,
+    Some((
         lang_id,
-        exclude_trait_impls,
-        exclude_framework_entrypoints,
-        Some(file_path),
+        filter_exported_symbols(
+            &syms,
+            root,
+            &source,
+            lang_id,
+            exclude_trait_impls,
+            exclude_framework_entrypoints,
+            Some(file_path),
+        ),
     ))
 }
 
@@ -1328,10 +1353,10 @@ pub(crate) fn extract_new_file_facts(dir: &str, file_path: &str) -> NewFileFacts
         return facts;
     };
     let utf8_path = camino::Utf8Path::new(utf8);
-    let Ok(lang_id) = crate::language::LangId::from_path(utf8_path) else {
+    let Ok(source) = parser::read_file(utf8_path) else {
         return facts;
     };
-    let Ok(source) = parser::read_file(utf8_path) else {
+    let Ok(lang_id) = parser::detect_lang(utf8_path, &source) else {
         return facts;
     };
 
@@ -1410,7 +1435,7 @@ pub(crate) fn extract_symbol_lines(
     let full = std::path::Path::new(dir).join(file_path);
     let utf8 = camino::Utf8Path::new(full.to_str()?);
     let source = parser::read_file(utf8).ok()?;
-    let lang_id = crate::language::LangId::from_path(utf8).ok()?;
+    let lang_id = parser::detect_lang(utf8, &source).ok()?;
 
     let symbols = if let crate::language::DetectedLang::LexerOnly(lexer_lang) = lang_id.detected() {
         crate::engine::lexer::extract_symbols(&source, lexer_lang)

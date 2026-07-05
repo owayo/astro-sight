@@ -7,7 +7,7 @@ use crate::engine::{
     calls, extractor, impact, imports, lexer, lint, parser, refs, snippet, symbols,
 };
 use crate::error::{AstroError, ErrorCode};
-use crate::language::{DetectedLang, LangId};
+use crate::language::DetectedLang;
 use crate::models::call::CallGraph;
 use crate::models::cochange::{CoChangeOptions, CoChangeResult};
 use crate::models::impact::ContextResult;
@@ -289,8 +289,8 @@ impl AppService {
 
         let source = parser::read_file(utf8_path)?;
 
-        // 言語検出 (shebang fallback も考慮)。共通ヘルパー LangId::detect を利用。
-        let lang_id = LangId::detect(utf8_path, &source)?;
+        // 言語検出 (shebang fallback と .h の C/C++ 判定を考慮)。
+        let lang_id = parser::detect_lang(utf8_path, &source)?;
 
         // lexer-only 言語は tree-sitter を使わず手書き lexer で抽出する。
         if let DetectedLang::LexerOnly(lexer_lang) = lang_id.detected() {

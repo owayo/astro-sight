@@ -117,6 +117,8 @@ echo '{"command":"refs","name":"Sym1","dir":"."}
 
 ## Low-Adoption But Useful
 
+Usage signal: if recent work only used `refs` / `symbols`, do not treat that as a complete review. In a git repo with changes, run `review --dir . --git` first; around edits, pair `context --dir . --git` before with `impact --dir . --git` after. Use the lower-level commands to explain or narrow the findings, not as a substitute for the diff-level checks.
+
 - Need **2+ mixed astro-sight queries** in one loop and want to avoid repeated startup cost? → `astro-sight session`
 - Need the **exact AST node** at a cursor/range, or want to confirm whether a parse error is structural? → `astro-sight ast --path <file> --line <n> --col <n>`
 - Need a **single JSON review** that combines impact, cochange, API surface changes, and dead symbols? → `astro-sight review --dir . --git`
