@@ -1,295 +1,147 @@
 ---
 name: astro-sight
-description: "STOP before using Grep for code identifiers (function/class/variable/type/constant/method names, including pipe-separated patterns like FOO|Bar). Use astro-sight `refs` for identifier search, `review` for diff/PR review, `context`/`impact` around edits, `dead-code` for exported symbol cleanup, and `symbols`/`ast`/`calls`/`imports`/`lint`/`cochange`/`sequence`/`session` for structural analysis via tree-sitter AST."
-when_to_use: |
-  - Searching for any code identifier (function, class, variable, type, constant, method) — use `refs --name` / `refs --names` instead of `Grep`
-  - Pipe-separated identifier search like `FOO|Bar|baz` — use `refs --names FOO,Bar,baz --dir .`
-  - Reviewing a diff, PR, or recent bug-fix changes end-to-end — start with `review --dir . --git` before lower-level commands
-  - Before editing code — run `context --dir . --git` to analyze impact
-  - After editing code — run `impact --dir . --git` to detect unresolved impacts
-  - Touching exported APIs / public modules — add `dead-code --dir . --git` to detect dead symbols
-  - Understanding a file or directory — use `symbols --path <file>` or `symbols --dir <dir>`
-  - Need exact syntax at a cursor/range, parse-error detail, or giant-line behavior — use `ast --path <file> --line <n> --col <n>`
-  - Call graphs, imports, sequence diagrams, co-change history, or repeated AST/text rules — use the matching command (`calls` / `imports` / `sequence` / `cochange` / `lint`)
-  - Running 2+ mixed astro-sight queries in one process — start with `session` (NDJSON), especially `symbols` + `imports`, `symbols` + `calls`, or `calls` + `sequence`
-  Skip for non-code text searches (error messages, config values, TODO comments, file-path patterns) — Grep handles those.
+description: >-
+  tree-sitter AST でコード構造を解析する CLI。コード識別子 (関数/クラス/変数/型/メソッド名)
+  を探すときは Grep でなく必ずこれ — refs --name/--names。diff/PR レビューは review
+  --git、編集前後の影響分析は context/impact。dead-code/symbols/calls/imports/
+  sequence/lint/session も提供。識別子検索・シンボル参照・呼び出し関係・構造把握・コードレビューの場面で発動。
 allowed-tools: Bash(astro-sight:*)
 ---
 
 # astro-sight
 
+tree-sitter AST-based code structure CLI. The primary **Grep replacement for code identifiers** (`refs`), plus diff review (`review`), impact analysis (`context` / `impact`), dead-code detection, and structural queries. All output is compact JSON.
+
 ## When to Use (Decision Checklist)
 
-**Before running Grep, ask: "Does my search contain code identifiers?"**
+**Before running Grep, ask: "Does my search contain code identifiers?"** If yes → astro-sight, not Grep.
 
-- Searching for a **function, class, variable, type, constant, or method name**? → `astro-sight refs` (NOT Grep)
-- Searching with **pipe-separated identifiers** like `FOO|Bar|baz`? → `astro-sight refs --names FOO,Bar,baz --dir .` (NOT Grep)
-- Asked to **review a diff / PR / recent bug-fix changes end-to-end**? → `astro-sight review --dir . --git` before lower-level commands
-- Need to **understand a file's structure** (functions, classes, structs)? → `astro-sight symbols --path <file>`
-- Need to **understand a directory's structure**? → `astro-sight symbols --dir <dir>`
-- Need to inspect the **exact syntax node at a cursor/range** or debug a parse error? → `astro-sight ast`
-- Need to know **who calls a function** or **what a function calls**? → `astro-sight calls`
-- Want to know **what a code change breaks**? → `astro-sight context --dir . --git`
-- Want to detect **unresolved impacts after editing**? → `astro-sight impact --dir . --git`
-- Need to see **what a file imports**? → `astro-sight imports`
-- Need to **batch 2+ mixed astro-sight queries** in one process? → `astro-sight session`
-- Need to **check repeated AST/text patterns**? → `astro-sight lint`
-- Need a **visual call flow diagram**? → `astro-sight sequence`
-- Need to find **files that usually change together**? → `astro-sight cochange`
-- Want a **structured one-shot review** of a diff (impact + missing cochanges + API surface diff + dead symbols)? → `astro-sight review`
-- Need to review an **external patch or rename-aware diff file**? → `astro-sight review --dir . --diff-file <patch>`
-- Need to find **dead (unreferenced) exported symbols**? → `astro-sight dead-code --dir .`
-- Need to find **dead code related to a diff**? → `astro-sight dead-code --dir . --git`
-- About to run more than one structural command? → prefer `session` for mixed commands, `refs --names` for symbol-only batches.
-- Writing the same AST/text policy twice? → use `lint` once with a YAML rule instead of ad-hoc searches.
-- Explaining an impact path or call chain? → use `sequence` after `calls` identifies the target.
+| Need | Command |
+|---|---|
+| Find a function / class / variable / type / constant / method name | `refs --name <sym>` (pipe-separated `FOO`/`Bar` → `refs --names FOO,Bar`) |
+| Review a diff / PR / bug-fix end-to-end | `review --dir . --git` (external patch: `--diff-file <patch>`) |
+| What a change breaks (before editing) | `context --dir . --git` |
+| Unresolved impacts (after editing) | `impact --dir . --git` |
+| Dead (unreferenced) exported symbols | `dead-code --dir .` (diff-scoped: `--git`) |
+| File / directory structure | `symbols --path <file>` / `symbols --dir <dir>` |
+| Exact syntax node at a cursor, or parse-error debug | `ast --path <file> --line <n> --col <n>` |
+| Who calls a function / what it calls | `calls --path <file> --function <name>` |
+| What a file imports | `imports --path <file>` |
+| Visual call-flow diagram | `sequence --path <file> --function <name>` |
+| Files that usually change together | `cochange --dir . --paths <file>` |
+| Repeated AST/text policy | `lint --path <file> --rules rules.yaml` |
+| 2+ mixed queries in one process | `session` (NDJSON) |
 
-**Grep is fine for**: error messages, config values, TODO comments, file path patterns — anything that is NOT a code identifier.
+**Grep is fine for**: error messages, config values, TODO comments, file-path patterns — anything that is NOT a code identifier.
 
-## Quick Reference (Start Here)
+## Quick Reference
 
 ```bash
-# 1. Review a diff / PR in one shot
-astro-sight review --dir . --git
-
-# 2. Analyze what a diff breaks before editing
-astro-sight context --dir . --git
-
-# 3. Detect unresolved impacts after edits
-astro-sight impact --dir . --git
-
-# 4. Find dead exported symbols before merge
-astro-sight dead-code --dir . --git
-
-# 5. Find all references to a symbol (REPLACES Grep for identifiers)
-astro-sight refs --name <symbol_name> --dir .
-
-# 6. Batch symbol search (REPLACES Grep "FOO|Bar|baz")
-astro-sight refs --names sym1,sym2,sym3 --dir .
-
-# 7. Understand file structure (functions, classes, structs)
-astro-sight symbols --path <file>
-
-# 8. Show caller/callee relationships
-astro-sight calls --path <file> --function <function_name>
-
-# 9. Extract imports/exports
-astro-sight imports --path <file>
-
-# 10. Inspect exact syntax when structure alone is not enough
-astro-sight ast --path <file> --line <n> --col <n>
-
-# 11. Repeated AST/text checks
-astro-sight lint --path <file> --rules rules.yaml
-
-# 12. Check co-change pairs around the current diff
-astro-sight cochange --dir . --git --base HEAD~5
-
-# 13. Visualize call flow
-astro-sight sequence --path src/main.rs --function main
-
-# 14. Batch operations — multiple queries in one process
-echo '{"command":"refs","name":"Sym1","dir":"."}
-{"command":"symbols","path":"src/main.rs"}' | astro-sight session
+astro-sight review --dir . --git                   # 1. one-shot diff/PR review
+astro-sight context --dir . --git                  # 2. what a change breaks (before editing)
+astro-sight impact --dir . --git                   # 3. unresolved impacts (after editing)
+astro-sight dead-code --dir . --git                # 4. dead exported symbols
+astro-sight refs --name <symbol> --dir .           # 5. references (REPLACES Grep for identifiers)
+astro-sight refs --names sym1,sym2 --dir .         # 6. batch symbol search (REPLACES Grep "FOO|Bar")
+astro-sight symbols --path <file>                  # 7. file structure
+astro-sight calls --path <file> --function <name>  # 8. caller/callee relationships
+astro-sight imports --path <file>                  # 9. imports/exports
+echo '{"command":"refs","name":"S","dir":"."}
+{"command":"symbols","path":"src/main.rs"}' | astro-sight session   # 10. batch mixed queries
 ```
-
-## Review-First Workflow
-
-- Reviewing a diff, PR, or bug-fix branch? Start with `astro-sight review --dir . --git` before splitting into `context`, `impact`, `dead-code`, or `cochange`.
-- Editing code? Run `astro-sight context --dir . --git` first, then `astro-sight impact --dir . --git` after the edit.
-- About to run `grep` / `rg` for a bare function, class, type, method, variable, or constant name? Stop and use `astro-sight refs --name` or `refs --names` instead.
-- Touching exported APIs or public modules? Add `astro-sight dead-code --dir . --git` before concluding the change.
-- Repeating the same structural review policy across files? Reach for `astro-sight lint` instead of ad-hoc text search.
-- Asking 2+ mixed astro-sight questions in one loop? Use `astro-sight session` instead of paying startup cost for each command.
-- If your next step after `symbols` is already `imports`, `calls`, or `sequence`, start with `session` rather than launching one command at a time.
-- Need a call-flow overview for explanation or review? Use `astro-sight sequence` after `calls` or `symbols` identifies the target function.
-- Need exact syntax around a confusing match or parse error? Escalate from `symbols` to `astro-sight ast --path <file> --line <n> --col <n>`.
-- Checking a multi-file change for hidden coupling? Run `astro-sight cochange --dir . --git --base <rev>` before assuming filenames tell the whole story.
-- Turning a repeated review note into a rule? Write one small `lint` rule and run it, instead of repeating natural-language checks.
-- Already used `symbols` and now need imports, callers, or call flow? Continue with `imports` / `calls` / `sequence`, or batch the mixed queries through `session`.
-
-## Escalation Path
-
-- Start with `review`, `context`, or `symbols` for the broad picture.
-- Escalate to `ast` when symbol lists are not enough and you need the exact syntax node at a cursor/range.
-- Escalate to `session` when you already know you will run several mixed queries in sequence.
-- Escalate to `lint` or `cochange` when the problem is repeated policy or historical coupling, not one-off structure lookup.
-
-## Low-Adoption But Useful
-
-Usage signal: if recent work only used `refs` / `symbols`, do not treat that as a complete review. In a git repo with changes, run `review --dir . --git` first; around edits, pair `context --dir . --git` before with `impact --dir . --git` after. Use the lower-level commands to explain or narrow the findings, not as a substitute for the diff-level checks.
-
-- Need **2+ mixed astro-sight queries** in one loop and want to avoid repeated startup cost? → `astro-sight session`
-- Need the **exact AST node** at a cursor/range, or want to confirm whether a parse error is structural? → `astro-sight ast --path <file> --line <n> --col <n>`
-- Need a **single JSON review** that combines impact, cochange, API surface changes, and dead symbols? → `astro-sight review --dir . --git`
-- Need to check a **repeated rule** like banned APIs, required patterns, or AST-based policy? → `astro-sight lint --path <file> --rules rules.yaml` before writing an ad-hoc text scan
-- Need a reusable syntax-aware check before touching multiple files? → create one small `lint` rule and keep its output as evidence
-- Need to audit exported/public cleanup after parser, dependency, or API-surface work? → run `astro-sight dead-code --dir . --git`; use `--dir .` for a full sweep
-- Need to predict **co-change fallout** before missing a related file? → `astro-sight cochange --dir . --git --base <rev>` (or `--paths <file>`) before guessing from filenames alone
-- Need to understand whether a file depends on a moved export or module? → `astro-sight imports --path <file>` before writing a text import search
-- Need to explain a non-trivial call path after `calls` identifies the target? → `astro-sight sequence --path <file> --function <name>`
-- Need to verify a generated or minified parse oddity? → `astro-sight ast --path <file> --line <n> --col <n>` and inspect the node kind before changing logic
-- Need to turn a one-off policy into a repeatable check? → `astro-sight lint --path <file> --rules rules.yaml`
-- Reviewing a multi-commit branch? → pass the same `--base <rev>` to `review`, `context`, or `impact`; `review --git --base <rev>` also uses that base for blame-backed `missing_cochanges`.
-
-Adoption guard: if your plan contains `symbols` + `imports`, `symbols` + `calls`, or `calls` + `sequence`, run them through `astro-sight session` unless you truly only need one command. Avoid launching separate shells for back-to-back structural reads on the same file when one NDJSON session can answer them. This keeps process startup low and makes use of currently underused structural tools.
 
 ## Commands
 
 ### `refs` — Cross-File Symbol Search (Use Instead of Grep)
 
-The primary Grep replacement. Finds all occurrences of a symbol name across a directory using tree-sitter AST parsing. Unlike Grep, it only matches actual identifier nodes — no false positives from comments, strings, or partial matches.
+The primary Grep replacement. Matches only tree-sitter identifier nodes — no false positives from comments, strings, or partial matches.
 
 ```bash
-# Find all references to a symbol
-astro-sight refs --name <symbol_name> --dir <directory>
-
-# Narrow down with a glob pattern
-astro-sight refs --name <symbol_name> --dir <directory> --glob "**/*.rs"
-
-# Multiple symbols at once (NDJSON output, one line per symbol)
-astro-sight refs --names sym1,sym2,sym3 --dir <directory>
+astro-sight refs --name <symbol> --dir <directory>
+astro-sight refs --name <symbol> --dir <directory> --glob "**/*.rs"   # narrow by glob
+astro-sight refs --names sym1,sym2,sym3 --dir <directory>             # multiple symbols (NDJSON, one line each)
 ```
 
-Output: `refs` array with `path`, `ln`, `col`, `ctx` (source line), `kind` (`"def"` or `"ref"`). No need to Read files afterward — `ctx` already shows the source line. Batch mode (`--names`) outputs NDJSON with one `{"symbol":..., "refs":[...]}` per line.
-
-Single-symbol and multi-symbol searches both merge worker-local results directly with fold/reduce instead of retaining a per-file intermediate `Vec` for the whole tree. For very common symbols, still narrow with `--glob` or lower `ASTRO_SIGHT_BATCH_WORKERS` because the final output itself can be large.
+Output: `refs` array with `path`, `ln`, `col`, `ctx` (source line), `kind` (`def`/`ref`). `ctx` shows the source line — no need to Read files afterward. For very common symbols, narrow with `--glob` or lower `ASTRO_SIGHT_BATCH_WORKERS`.
 
 ### `calls` — Call Graph Extraction
 
-Extracts function call relationships from a source file.
-
 ```bash
-# All call edges in a file
-astro-sight calls --path <file>
-
-# Only calls made by a specific function
-astro-sight calls --path <file> --function <function_name>
+astro-sight calls --path <file>                    # all call edges in a file
+astro-sight calls --path <file> --function <name>  # only calls made by one function
 ```
 
-Output (compact): `calls` array grouped by `caller` (string), each with `range` and `callees` array (`name`, `ln`, `col`). Use `--pretty` for full format.
+Output (compact): `calls` array grouped by `caller`, each with `range` and `callees` (`name`, `ln`, `col`). `--pretty` for full format.
 
 ### `context` — Diff Impact Analysis
 
 Reads a unified diff and finds affected symbols, signature changes, and impacted callers. Answers "what does this change break?".
 
 ```bash
-# Auto-run git diff (recommended — no pipe needed)
-astro-sight context --dir . --git
-
-# Analyze staged changes
-astro-sight context --dir . --git --staged
-
-# Custom base ref
-astro-sight context --dir . --git --base HEAD~3
-
-# Inline diff string
-astro-sight context --dir . --diff "$(git diff)"
-
-# Diff file
-astro-sight context --dir . --diff-file changes.patch
-
-# Pipe from git diff (legacy)
-git diff | astro-sight context --dir .
+astro-sight context --dir . --git                      # auto git diff (recommended)
+astro-sight context --dir . --git --staged             # staged changes
+astro-sight context --dir . --git --base HEAD~3        # custom base ref
+astro-sight context --dir . --diff-file changes.patch  # diff file (also: --diff "<str>", or pipe `git diff`)
 ```
 
-Output: `changes` array per file with `affected_symbols`, `signature_changes`, `impacted_callers`.
+Output: `changes` per file with `affected_symbols`, `signature_changes`, `impacted_callers`. Vendor/build-artifact exclusion applies — see Notes.
 
 ### `impact` — Unresolved Impact Detection (Stop Hook)
 
-Detects unresolved impacts after code changes. Uses `context` internally, then checks if impacted callers are in files NOT included in the diff. Designed for AI agent stop hooks.
+Uses `context` internally, then flags impacts whose callers live in files NOT included in the diff. Designed for AI agent stop hooks.
 
 ```bash
-# Auto-run git diff (recommended)
-astro-sight impact --dir . --git
-
-# Staged changes
-astro-sight impact --dir . --git --staged
-
-# AI agent hook mode (appends triage hint on detection)
-astro-sight impact --dir . --git --hook
-
-# Pipe from stdin
-git diff | astro-sight impact --dir .
+astro-sight impact --dir . --git            # auto git diff (recommended)
+astro-sight impact --dir . --git --staged   # staged changes
+astro-sight impact --dir . --git --hook     # appends triage hint on detection
 ```
 
-Exit codes: `0` = no unresolved impacts (silent), `1` = unresolved impacts found (stderr text output). With `--hook`, appends a triage hint for AI agents.
-
-`context` / `impact` / `review` skip cross-file reference search inside vendor / package-manager trees (`vendor/`, `node_modules/`, `.venv/`, `Pods/`, `Carthage/` ...) and build artifacts (`target/`, `build/`, `dist/`, `.build/`, `DerivedData/`, `.next/`, `bin/`, `obj/` ...) by default. This stops generic method names (`new`, `save`, `find`) inside 3rd-party or generated code from flooding `impacted_callers`. Set `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` to opt back in. `.gitignore` / hidden file exclusions are independent and always on.
-
-For repository-specific vendored trees that are not in the default list (e.g. `pjproject-2.15/`, `openssl_64_1.1.1c/`, `third_party/`), pass `--exclude-dir <NAME>` or `--exclude-glob <PATTERN>` (workspace-relative, negative-override semantics). Available on `context`, `impact`, and `review`; for `review` the same flags apply to both impact analysis and `dead_symbols`. Invalid glob syntax fails up-front with `INVALID_REQUEST`.
+Exit codes: `0` = no unresolved impacts (silent), `1` = unresolved impacts found (stderr). `--hook` appends a triage hint for AI agents.
 
 ### `review` — Structured Diff Review (One-Shot)
 
-Integrates `context` (impact analysis), `cochange` (missing co-change detection), API surface diff (added/removed/modified public symbols), and dead symbol detection into a single command. Ideal for PR review or pre-merge checks.
+Integrates `context` (impact) + `cochange` (missing co-change) + API surface diff (added/removed/modified public symbols) + dead symbol detection. Ideal for PR review or pre-merge checks.
 
 ```bash
-# Auto-run git diff (recommended)
 astro-sight review --dir . --git
-
-# Staged changes
-astro-sight review --dir . --git --staged
-
-# Custom base ref
 astro-sight review --dir . --git --base HEAD~3
-
-# External patch file (useful when rename-aware diff is already generated)
-astro-sight review --dir . --diff-file changes.patch
-
-# Laravel project: exclude framework conventions (Controllers, migrations, etc.) from dead_symbols
-astro-sight review --dir . --git --framework laravel
-
-# Additional ad-hoc exclusions for dead_symbols detection
+astro-sight review --dir . --diff-file changes.patch                       # external rename-aware patch
+astro-sight review --dir . --git --framework laravel                       # exclude framework conventions from dead_symbols
 astro-sight review --dir . --git --exclude-dir generated --exclude-glob 'app/Legacy/**'
 ```
 
-Output: JSON with `impact` (ContextResult), `missing_cochanges` (files expected to change together but absent from diff), `api_changes` (added/removed/modified public symbols), `dead_symbols` (public symbols with zero non-definition references in changed files).
+Output: `impact` (ContextResult), `missing_cochanges`, `api_changes` (added/removed/modified public symbols), `dead_symbols`.
 
-`api_changes.compatible_modified` は、シグネチャ文字列は変わるが既存呼び出しの互換性を保つ変更を出力する。React component の HOC ラップ、未参照 object member 削除、TS/TSX トップレベル関数の末尾 optional/default 引数追加 (`trailing_optional_params`)、Python トップレベル関数 / モジュール直下クラスメソッドの末尾 kwonly+default / 末尾 positional default 引数追加 (`trailing_optional_params`、デコレータ差分や同名関数複数定義は保守的に blocking 維持) は informational として扱い、`--hook` の blocking 対象にしない。同じシンボルに紐づく `impacts` も破壊的影響としては出さず、`mod_compat` の情報提供だけに留める。
-
-`--framework` は `dead_symbols` のみを絞り込む。`--exclude-dir` / `--exclude-glob` は impact 解析と `dead_symbols` の両方に作用し、`dead-code` の同名フラグと同じ意味を持つ。`review` は `dead_symbols` から `vendor/` / `tests/` / build artifacts を常に除外する。
-
-全 changed file が Xojo などの lexer-only 言語だけの場合、`review` は `impact` / `api_changes` / `dead_symbols` をすべて空結果で返す。cross-file lexer 解析が実装されるまでは、対象ファイルを `symbols` / `refs` / `dead-code` の単体コマンドで確認する。
-
-When `--git --base <rev>` is set, `review` uses the same base for both the diff and blame-backed `missing_cochanges`. This keeps multi-commit branch reviews aligned with the requested comparison range.
+- `api_changes.compatible_modified`: signature-string changes that keep existing call-site compatibility — React HOC wrap, unreferenced object-member removal, trailing optional/default params on TS/TSX top-level functions, trailing kwonly+default / positional-default params on Python top-level functions & module-level methods (`trailing_optional_params`). Treated as informational, not `--hook` blocking; decorator diffs / duplicate same-name defs stay conservatively blocking.
+- `--framework` filters `dead_symbols` only. `--exclude-dir` / `--exclude-glob` affect both impact and `dead_symbols` (same meaning as on `dead-code`). `review` always excludes vendor / tests / build from `dead_symbols`.
+- `--git --base <rev>` uses the same base for the diff and for blame-backed `missing_cochanges`.
+- If all changed files are lexer-only languages (e.g. Xojo), `impact` / `api_changes` / `dead_symbols` come back empty — use `symbols` / `refs` / `dead-code` per file instead.
+- CLI-only (not available in `session`).
 
 ### `imports` — Import/Export Extraction
 
-Extracts import/export relationships using language-specific tree-sitter queries. 14 languages (Bash excluded).
+Language-specific tree-sitter queries. 14 languages (Bash excluded).
 
 ```bash
 astro-sight imports --path <file>
-
-# Batch mode
-astro-sight imports --paths src/main.rs,src/lib.rs
+astro-sight imports --paths src/main.rs,src/lib.rs   # batch
 ```
 
 Output: `imports` array with `src`, `ln`, `kind` (Import/Use/Include/Require), `ctx`.
 
 ### `symbols` — Symbol Extraction
 
-Lists all function/class/struct/enum definitions in a file or directory. Default output is compact (name, kind, line only — no hash/range/doc) for token efficiency.
+Lists function/class/struct/enum definitions. Compact by default (name, kind, line) for token efficiency.
 
 ```bash
-# Single file (compact: name, kind, line)
-astro-sight symbols --path <file>
-
-# Include docstrings in compact output
-astro-sight symbols --path <file> --doc
-
-# Full legacy output (hash, range, doc)
-astro-sight symbols --path <file> --full
-
-# Directory scan (NDJSON output, compact)
-astro-sight symbols --dir <directory>
-
-# Directory scan with glob filter
+astro-sight symbols --path <file>            # single file
+astro-sight symbols --path <file> --doc      # include docstrings
+astro-sight symbols --path <file> --full     # full legacy output (hash, range, doc)
+astro-sight symbols --dir <directory>        # directory scan (NDJSON)
 astro-sight symbols --dir <directory> --glob "**/*.rs"
 ```
 
 ### `sequence` — Mermaid Sequence Diagram
-
-Generates a Mermaid sequence diagram from a file's call graph.
 
 ```bash
 astro-sight sequence --path <file>
@@ -300,43 +152,22 @@ Output: `diagram` (Mermaid text), `participants` (ordered list).
 
 ### `cochange` — Co-change Analysis
 
-Blame-based co-change analysis. Starts from a set of source files (auto-derived
-from `git diff` or specified explicitly), runs `git blame` on their changed
-lines to obtain the latest-modifying commits, then aggregates co-occurring
-files from each commit's diff-tree.
+Blame-based: starts from source files (auto-derived from `git diff` or explicit), runs `git blame` on changed lines to get the latest-modifying commits, then aggregates co-occurring files from each commit's diff-tree.
 
 ```bash
-# Auto-derive sources from the current diff
-astro-sight cochange --dir . --git --base HEAD~5
-
-# Specify source files explicitly
-astro-sight cochange --dir . --paths src/service.rs
-
-# Track renames/copies for refactor-heavy histories
-astro-sight cochange --dir . --git --base HEAD~10 --rename --copy
-
-# Disable Bayesian smoothing when raw confidence is needed (default prior: alpha=1.0, beta=8.0)
-astro-sight cochange --dir . --git --base HEAD~5 --no-smoothing
+astro-sight cochange --dir . --git --base HEAD~5                   # auto-derive from diff
+astro-sight cochange --dir . --paths src/service.rs               # explicit sources
+astro-sight cochange --dir . --git --base HEAD~10 --rename --copy  # track renames/copies
+astro-sight cochange --dir . --git --base HEAD~5 --no-smoothing    # raw confidence (default prior alpha=1.0, beta=8.0)
 ```
 
-Output: `entries` array with `file_a`, `file_b`, `co_changes`, `confidence`,
-`denominator` (= |C|), and `score` (smoothed). `commits_analyzed` reports |C|.
-
-Requires `--git` or `--paths` / `--paths-file`. Default exclusions skip
-`vendor/`, `node_modules/`, `dist/`, lock files, and minified assets when
-collecting source files via `--git`; explicit `--paths` are kept as-is.
-`--paths-file` is read with the same 100MB input cap as other user-supplied
-file inputs. `--min-confidence` must be finite in `0.0..=1.0`; smoothing
-priors (`--smoothing-alpha` / `--smoothing-beta`) must be finite
-non-negative values.
+Output: `entries` with `file_a`, `file_b`, `co_changes`, `confidence`, `denominator` (|C|), `score` (smoothed); `commits_analyzed` reports |C|. Requires `--git` or `--paths` / `--paths-file`. `--min-confidence` must be finite in `0.0..=1.0`; smoothing priors finite non-negative. Default `--git` source collection skips vendor / node_modules / dist / lock / minified assets; explicit `--paths` are kept as-is.
 
 ### `ast` — AST Fragment Extraction
 
-Extracts the AST at a specific position or range.
-
 ```bash
-astro-sight ast --path <file> --line <n> --col <n>
-astro-sight ast --path <file>  # full file, top-level nodes
+astro-sight ast --path <file> --line <n> --col <n>   # node at position/range
+astro-sight ast --path <file>                        # full file, top-level nodes
 ```
 
 ### `lint` — AST Pattern Matching
@@ -349,95 +180,46 @@ astro-sight lint --path <file> --rules rules.yaml
 
 ### `dead-code` — Dead Code Detection
 
-Finds exported symbols with zero non-definition references. With diff flags, limits scan to diff-related files; without diff, scans the entire project.
-
-By default, package-manager trees (`vendor/`, `node_modules/`, `.venv/` 等), test directories (`tests/`, `Tests/`, `__tests__/`, `spec/`, `testdata/`), and build artifacts (`target/`, `dist/`, `build/`, `out/`) are excluded. Use `--include-vendor` / `--include-tests` / `--include-build` to opt back in.
+Exported symbols with zero non-definition references. Diff flags limit the scan to diff-related files; without a diff, scans the whole project. Package-manager trees, test dirs, and build artifacts are excluded by default (`--include-vendor` / `--include-tests` / `--include-build` to opt back in).
 
 ```bash
-# Full project scan
 astro-sight dead-code --dir .
-
-# Rust files only
 astro-sight dead-code --dir . --glob "**/*.rs"
-
-# Diff-related files only (git diff)
-astro-sight dead-code --dir . --git
-
-# Staged changes only
+astro-sight dead-code --dir . --git                # diff-related files only
 astro-sight dead-code --dir . --git --staged
-
-# Framework preset: Laravel conventions (excludes migrations, Controllers, Middleware,
-# FormRequest, Console Commands, GraphQL resolvers, Listeners, Providers, IDE helpers)
-astro-sight dead-code --dir . --framework laravel
-
-# Next.js: `--framework` 未指定でも package.json の dependencies/devDependencies に `next` が
-# あれば自動で nextjs プリセットを適用する (auto-detect)。明示指定は常に優先される。
-astro-sight dead-code --dir . --framework nextjs
-
-# Additional ad-hoc exclusions (directory name or glob pattern)
+astro-sight dead-code --dir . --framework laravel  # Laravel conventions (migrations, Controllers, Middleware, ...)
+astro-sight dead-code --dir . --framework nextjs   # auto-detected when package.json has a `next` dep
 astro-sight dead-code --dir . --exclude-dir generated --exclude-glob 'app/Legacy/**'
 ```
 
-Output: JSON with `dir`, `scanned_files` (count), `dead_symbols` array (`name`, `kind`, `file`). Symbols with duplicate names across files are conservatively skipped.
-
-**Test framework conventions** are auto-excluded:
-- PHPUnit: `*Test` / `*TestCase` / `*IntegrationTest` / `*FeatureTest` classes, `testXxx` / `setUp` / `tearDown` / `setUpBeforeClass` / `tearDownAfterClass` methods
-- Python unittest: `unittest.TestCase` (and `IsolatedAsyncioTestCase`) subclasses with same-file inheritance chains, plus `test_*` / `setUp` / `tearDown` / `setUpClass` / `tearDownClass` / `addCleanup` / `addClassCleanup` methods
-- Python pytest: top-level `test_*` functions in `test_*.py` / `*_test.py` files, all functions in `conftest.py`
-- Angular: `@Component` / `@Directive` 装飾クラスのライフサイクルフック (`ngOnInit` / `ngOnDestroy` / `ngOnChanges` / `ngDoCheck` / `ngAfterContentInit` / `ngAfterContentChecked` / `ngAfterViewInit` / `ngAfterViewChecked`) は Angular ランタイムが自動呼出するため除外
-
-**API surface diff (`review` の `api_changes`)** は bin-only Rust crate (`src/lib.rs` なし & `Cargo.toml` の `[lib]` セクションなし) の `pub fn` 追加/削除/シグネチャ変更を自動で除外する。bin crate の `pub fn` は crate 外から到達できないため公開 API ではない。判定は新旧両方のリビジョンで行う。
+Output: `dir`, `scanned_files`, `dead_symbols` (`name`, `kind`, `file`). Duplicate-named symbols across files are conservatively skipped. Test-framework conventions (PHPUnit `*Test`/`*TestCase` + `testXxx`/`setUp`; Python unittest/pytest; Angular lifecycle hooks like `ngOnInit`) are auto-excluded. A bin-only Rust crate's `pub fn` is excluded from `review`'s `api_changes` (unreachable from outside the crate).
 
 ### `session` — NDJSON Batch Mode
 
-For multiple queries in one process (avoids repeated startup):
+Multiple queries in one process (avoids repeated startup):
 
 ```bash
 echo '{"command":"refs","name":"MyType","dir":"src/"}
 {"command":"calls","path":"src/main.rs","function":"main"}' | astro-sight session
 ```
 
+Supports `ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange` (note: `review` is CLI-only).
+
 ## Workflow Examples
 
-### "Search for multiple identifiers" (INSTEAD of `Grep "FOO|Bar|baz"`)
-```bash
-astro-sight refs --names FOO,Bar,baz --dir .
-```
-
-### "I need several different astro-sight queries in one request"
-```bash
-echo '{"command":"symbols","path":"src/main.rs"}
-{"command":"calls","path":"src/main.rs","function":"main"}
-{"command":"context","dir":".","diff":"..."}' | astro-sight session
-```
-
-### "Before editing code" (run FIRST)
-```bash
-astro-sight context --dir . --git
-```
-
-### "After editing code" (check unresolved impacts)
-```bash
-astro-sight impact --dir . --git
-```
+Single-command uses are in Quick Reference above; these are multi-command flows.
 
 ### "How does this module work?"
 ```bash
-astro-sight symbols --dir src/engine/       # All files in directory
-astro-sight symbols --path src/engine/parser.rs  # Single file detail
+astro-sight symbols --dir src/engine/               # all files in directory
 astro-sight calls --path src/main.rs --function main
 astro-sight sequence --path src/main.rs --function main
 ```
 
 ### "Is it safe to rename this function?"
 ```bash
-astro-sight refs --name "old_name" --dir .    # See all usages
-astro-sight calls --path file.rs --function old_name  # See callers
-```
-
-### "What does this PR break?"
-```bash
-git diff origin/main | astro-sight context --dir .
+astro-sight refs --name old_name --dir .              # all usages
+astro-sight calls --path file.rs --function old_name  # callers
 ```
 
 ### "What changed together with this file recently?"
@@ -445,49 +227,19 @@ git diff origin/main | astro-sight context --dir .
 astro-sight cochange --dir . --paths src/service.rs
 ```
 
-### "Show me the call flow visually"
+### "Several different queries in one request"
 ```bash
-astro-sight sequence --path src/main.rs --function main
-```
-
-### "I need to enforce a repeated AST/text rule"
-```bash
-astro-sight lint --path src/main.rs --rules rules.yaml
-```
-
-### "Give me a full structured review of this diff"
-```bash
-astro-sight review --dir . --git
-```
-
-### "Find unused exported symbols in the project"
-```bash
-astro-sight dead-code --dir .
-```
-
-### "Are there dead symbols related to my changes?"
-```bash
-astro-sight dead-code --dir . --git
+echo '{"command":"symbols","path":"src/main.rs"}
+{"command":"calls","path":"src/main.rs","function":"main"}
+{"command":"context","dir":".","diff":"..."}' | astro-sight session
 ```
 
 ## Notes
 
-- 16 languages: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby, Zig
-- All output is compact JSON by default (short keys: `lang`, `ln`, `col`, `ctx`, `refs`, `src`, `def`/`ref`, `fn` etc.)
-- Use `--pretty` (global flag) for human-readable formatted JSON output
-- `refs` results include `ctx` (source line) — no need to Read files afterward
-- `refs` respects `.gitignore` and uses bounded parallel scanning with fold/reduce aggregation
-- Multiple symbol searches: use `refs --names` for batching; reserve `session` for mixed commands
-- If you will run 2+ different structural commands (`symbols` + `calls`, `imports` + `refs`, etc.), prefer `session` instead of starting separate processes
-- Use `lint` for repeated AST/text policies and `sequence` when you need to explain non-trivial call flow
-- `session` supports `ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange` (note: `review` is CLI-only, not available in session mode)
-- stdout broken pipes are handled gracefully: commands like `astro-sight symbols --dir src | head` exit without printing a Rust panic when the downstream reader closes early
-- With `ASTRO_SIGHT_WORKSPACE`, session-relative `path` / `dir` values resolve from the workspace root, not the process cwd; invalid workspace values fail closed
-- **Input validation**: Empty `--name`/`--names`, empty `--paths`/`--paths-file` are rejected with `INVALID_REQUEST` error. `--paths-file` is capped at 100MB. `cochange` rejects non-finite/out-of-range `--min-confidence` and non-finite/negative smoothing priors. `--base` for `context`/`impact`/`review` rejects values starting with `-` (blocks option-style injection into `git diff` / `git show` / `git blame`)
-- **Large repositories (10k+ source files)**: `review --dir .` runs `context` + `cochange` + API diff + dead-code in one process and is the heaviest command. On very large monorepos it can exhaust memory. Mitigations:
-  - Narrow `--dir` to a module-level subtree (`--dir packages/server` instead of `--dir .`)
-  - For diff-based commands (`review` / `impact` / `context` / `dead-code --git`), bound the window with `--base HEAD~N`
-  - Prefer `--glob` to restrict to the primary language (e.g. `--glob '**/*.php'`)
-  - Split `review` into per-command runs (`impact` → `dead-code` → `cochange`) if the unified run is too heavy
-  - `refs` avoids per-file intermediate result retention, but very common symbols can still produce huge final output; narrow with `--glob` or lower `ASTRO_SIGHT_BATCH_WORKERS`
-  - `symbols --path` is memory-light for single-file structure checks
+- **16 languages**: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby, Zig.
+- Compact JSON by default (short keys: `ln`, `col`, `ctx`, `refs`, `src`, `def`/`ref`, `fn`...). Use `--pretty` (global) for human-readable output.
+- `refs` respects `.gitignore`; results include `ctx` (source line) so no follow-up Read is needed. Use `refs --names` for symbol-only batches, `session` for mixed commands.
+- **Vendor/build exclusion** (`context` / `impact` / `review`): cross-file ref search skips package-manager trees (`vendor/`, `node_modules/`, `.venv/`, `Pods/`, `Carthage/`...) and build artifacts (`target/`, `build/`, `dist/`, `.build/`, `DerivedData/`, `.next/`, `bin/`, `obj/`...) so generic method names (`new`, `save`, `find`) don't flood `impacted_callers`. `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` opts back in; `.gitignore` / hidden exclusions are independent and always on. For non-default vendored trees (`pjproject-2.15/`, `third_party/`...) pass `--exclude-dir <NAME>` / `--exclude-glob <PATTERN>` (workspace-relative, negative-override); invalid globs fail up-front with `INVALID_REQUEST`.
+- **Input validation**: empty `--name` / `--names` / `--paths` / `--paths-file` rejected with `INVALID_REQUEST`; `--paths-file` capped at 100MB; `cochange` rejects out-of-range `--min-confidence` / negative smoothing priors; `--base` rejects values starting with `-` (blocks git option injection).
+- With `ASTRO_SIGHT_WORKSPACE`, session-relative `path` / `dir` resolve from the workspace root (invalid values fail closed). stdout broken pipes are handled gracefully (`symbols --dir src | head` won't panic).
+- **Large repos (10k+ files)**: `review --dir .` is the heaviest command (context + cochange + API diff + dead-code in one process) and can exhaust memory. Narrow `--dir` to a subtree, bound diff commands with `--base HEAD~N`, restrict with `--glob`, or split `review` into per-command runs (`impact` → `dead-code` → `cochange`). `symbols --path` is memory-light.
