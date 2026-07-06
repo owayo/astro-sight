@@ -84,7 +84,7 @@ astro-sight context --dir . --git --base HEAD~3        # custom base ref
 astro-sight context --dir . --diff-file changes.patch  # diff file (also: --diff "<str>", or pipe `git diff`)
 ```
 
-Output: `changes` per file with `affected_symbols`, `signature_changes`, `impacted_callers`. Vendor/build-artifact exclusion applies — see Notes.
+Output: `changes` per file with `affected_symbols`, `signature_changes`, `impacted_callers` (real call sites — act on these). Low-signal references are split out: `low_confidence_callers` (bare-name / generic-method matches) and `informational_callers` (import / barrel re-export lines — no edit needed while the symbol keeps its name and signature). Vendor/build-artifact exclusion applies — see Notes.
 
 ### `impact` — Unresolved Impact Detection (Stop Hook)
 
@@ -96,7 +96,7 @@ astro-sight impact --dir . --git --staged   # staged changes
 astro-sight impact --dir . --git --hook     # appends triage hint on detection
 ```
 
-Exit codes: `0` = no unresolved impacts (silent), `1` = unresolved impacts found (stderr). `--hook` appends a triage hint for AI agents.
+Exit codes: `0` = no unresolved impacts (silent), `1` = unresolved impacts found (stderr). Only real call-site references count as unresolved — import-only / re-export references never trigger exit 1. `--hook` appends a triage hint for AI agents.
 
 ### `review` — Structured Diff Review (One-Shot)
 
@@ -108,13 +108,16 @@ astro-sight review --dir . --git --base HEAD~3
 astro-sight review --dir . --diff-file changes.patch                       # external rename-aware patch
 astro-sight review --dir . --git --framework laravel                       # exclude framework conventions from dead_symbols
 astro-sight review --dir . --git --exclude-dir generated --exclude-glob 'app/Legacy/**'
+astro-sight review --dir . --git --dead-scope touched-symbols              # only dead symbols whose declaration overlaps the diff
 ```
 
-Output: `impact` (ContextResult), `missing_cochanges`, `api_changes` (added/removed/modified public symbols), `dead_symbols`.
+Output: `impact` (ContextResult), `missing_cochanges`, `api_changes`, `dead_symbols`, `test_only_symbols` (public symbols referenced only from tests — review, don't auto-delete).
 
-- `api_changes.compatible_modified`: signature-string changes that keep existing call-site compatibility — React HOC wrap, unreferenced object-member removal, trailing optional/default params on TS/TSX top-level functions, trailing kwonly+default / positional-default params on Python top-level functions & module-level methods (`trailing_optional_params`). Treated as informational, not `--hook` blocking; decorator diffs / duplicate same-name defs stay conservatively blocking.
+**Blocking vs informational** (what `--hook` blocks on): unresolved `impact` from real call sites, `api_changes.removed` / `.modified`, and `dead_symbols`. Everything else is informational — `api_changes.added` / `.moved` (add/rm pair matched across files) / `.property_to_field` / `.removed_dead` (dead-code cleanup, not breakage) / `.modified_closed_in_diff` (all cross-file refs already updated in the same diff) / `.const_value_changes` (value-only const/static edits; blocking only with `--strict-public-const-values`) / `.compatible_modified` (signature string changed but call sites stay compatible: React HOC wrap, unreferenced object-member removal, trailing optional/default params in TS/Python; `reason` explains why), plus `missing_cochanges` and import-only impact (hook key `impact_info`).
+
 - `--framework` filters `dead_symbols` only. `--exclude-dir` / `--exclude-glob` affect both impact and `dead_symbols` (same meaning as on `dead-code`). `review` always excludes vendor / tests / build from `dead_symbols`.
-- `--git --base <rev>` uses the same base for the diff and for blame-backed `missing_cochanges`.
+- `--dead-scope` defaults to `touched-symbols` with `--hook`, `all` otherwise. With `--hook`, exports newly added in the same diff are excluded from dead warnings (WIP noise); `--include-wip-dead` opts back in.
+- `--git --base <rev>` uses the same base for the diff and for blame-backed `missing_cochanges`. `--min-confidence` (default 0.3) tunes `missing_cochanges` volume.
 - If all changed files are lexer-only languages (e.g. Xojo), `impact` / `api_changes` / `dead_symbols` come back empty — use `symbols` / `refs` / `dead-code` per file instead.
 - CLI-only (not available in `session`).
 
@@ -161,7 +164,9 @@ astro-sight cochange --dir . --git --base HEAD~10 --rename --copy  # track renam
 astro-sight cochange --dir . --git --base HEAD~5 --no-smoothing    # raw confidence (default prior alpha=1.0, beta=8.0)
 ```
 
-Output: `entries` with `file_a`, `file_b`, `co_changes`, `confidence`, `denominator` (|C|), `score` (smoothed); `commits_analyzed` reports |C|. Requires `--git` or `--paths` / `--paths-file`. `--min-confidence` must be finite in `0.0..=1.0`; smoothing priors finite non-negative. Default `--git` source collection skips vendor / node_modules / dist / lock / minified assets; explicit `--paths` are kept as-is.
+Output: `entries` with `file_a`, `file_b`, `co_changes`, `confidence`, `denominator` (|C|), `score` (smoothed); `commits_analyzed` reports |C|. Requires `--git` or `--paths` / `--paths-file` (default `--base` is HEAD~1). `--min-confidence` must be finite in `0.0..=1.0`; smoothing priors finite non-negative. Default `--git` source collection skips vendor / node_modules / dist / lock / minified assets; explicit `--paths` are kept as-is.
+
+Noise-suppression defaults (each has a flag to loosen): top 10 candidates per source file (`--per-source-limit`), pairs need ≥2 shared commits (`--min-samples`), merge commits excluded (`--include-merges` restores), same-author commits within 7 days collapse into one unit (`--author-unit-window-days`), commits touching >100 files skipped (`--max-files-per-commit`). If expected pairs are missing, loosen these before distrusting the data.
 
 ### `ast` — AST Fragment Extraction
 
@@ -190,6 +195,7 @@ astro-sight dead-code --dir . --git --staged
 astro-sight dead-code --dir . --framework laravel  # Laravel conventions (migrations, Controllers, Middleware, ...)
 astro-sight dead-code --dir . --framework nextjs   # auto-detected when package.json has a `next` dep
 astro-sight dead-code --dir . --exclude-dir generated --exclude-glob 'app/Legacy/**'
+astro-sight dead-code --dir . --git --dead-scope touched-symbols   # only dead symbols declared inside diff hunks
 ```
 
 Output: `dir`, `scanned_files`, `dead_symbols` (`name`, `kind`, `file`). Duplicate-named symbols across files are conservatively skipped. Test-framework conventions (PHPUnit `*Test`/`*TestCase` + `testXxx`/`setUp`; Python unittest/pytest; Angular lifecycle hooks like `ngOnInit`) are auto-excluded. A bin-only Rust crate's `pub fn` is excluded from `review`'s `api_changes` (unreachable from outside the crate).
@@ -236,7 +242,7 @@ echo '{"command":"symbols","path":"src/main.rs"}
 
 ## Notes
 
-- **16 languages**: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby, Zig.
+- **16 tree-sitter languages**: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby, Zig — plus Xojo via a lexer-only backend (`symbols` / `refs` / `dead-code` only; `ast` / `calls` / `imports` / `lint` / `sequence` return `UNSUPPORTED_LANGUAGE`).
 - Compact JSON by default (short keys: `ln`, `col`, `ctx`, `refs`, `src`, `def`/`ref`, `fn`...). Use `--pretty` (global) for human-readable output.
 - `refs` respects `.gitignore`; results include `ctx` (source line) so no follow-up Read is needed. Use `refs --names` for symbol-only batches, `session` for mixed commands.
 - **Vendor/build exclusion** (`context` / `impact` / `review`): cross-file ref search skips package-manager trees (`vendor/`, `node_modules/`, `.venv/`, `Pods/`, `Carthage/`...) and build artifacts (`target/`, `build/`, `dist/`, `.build/`, `DerivedData/`, `.next/`, `bin/`, `obj/`...) so generic method names (`new`, `save`, `find`) don't flood `impacted_callers`. `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` opts back in; `.gitignore` / hidden exclusions are independent and always on. For non-default vendored trees (`pjproject-2.15/`, `third_party/`...) pass `--exclude-dir <NAME>` / `--exclude-glob <PATTERN>` (workspace-relative, negative-override); invalid globs fail up-front with `INVALID_REQUEST`.
