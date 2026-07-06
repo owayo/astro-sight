@@ -21,7 +21,7 @@ use super::import_facts::{
 use super::signature::extract_function_from_context;
 use super::test_context::is_ref_in_target_test_context;
 use super::types::{StringPool, SymEntries, TypedCallerMap};
-use super::{FileContext, ParsedFile, filters, lang_compat_group};
+use super::{FileContext, ParsedFile, ci_key, filters, lang_compat_group};
 
 /// per-worker の中間状態。per-file バッファ (`ref_hit` / `ref_events` / `def_events`) は
 /// `finish_file` / `reset_buffers` で再利用されるため、巨大ファイルでも再割当ては発生しない。
@@ -31,6 +31,8 @@ pub(super) struct WorkerState {
     /// `local_maps` と同じ shape (per FileContext) で並走し、`build_file_impact` で
     /// `low_confidence_callers` に変換される。
     pub(super) local_low_maps: Vec<TypedCallerMap>,
+    /// import-only など blocking にはしない情報提供 caller の振り分け先。
+    pub(super) local_informational_maps: Vec<TypedCallerMap>,
     pub(super) local_def_paths: Vec<Vec<u32>>,
     pub(super) target_cache: LruCache<String, Option<ParsedFile>>,
     /// TS/TSX/JS の名前衝突 false positive 抑制用 (Issue
@@ -122,11 +124,16 @@ pub(super) struct ImpactCollector<'a> {
     pub(super) all_symbol_names: &'a [String],
     pub(super) parent_ix_by_sym: &'a [Option<usize>],
     pub(super) pool: &'a std::sync::Mutex<StringPool>,
+    /// 出力・map key 用の workspace 相対 path。
     pub(super) path_str: &'a str,
+    /// ファイル読み込みや AST 判定に使う実ファイル path。
+    pub(super) source_path_str: &'a str,
 
     pub(super) local_maps: &'a mut [TypedCallerMap],
     /// Phase 4: 低確信度 caller の振り分け先 (`WorkerState::local_low_maps` の slice)。
     pub(super) local_low_maps: &'a mut [TypedCallerMap],
+    /// import-only など情報提供 caller の振り分け先。
+    pub(super) local_informational_maps: &'a mut [TypedCallerMap],
     pub(super) local_def_paths: &'a mut [Vec<u32>],
     pub(super) target_cache: &'a mut LruCache<String, Option<ParsedFile>>,
 
@@ -167,7 +174,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
         // Stage 6 (import 行) の判定は文字列のままでないと行えないため、ここで即決する。
         // caller_name も context から抽出し、pool へ intern して ID にしてから push する。
         // これにより `RefEventMini` は固定長で済み、per-file バッファの heap を削減する。
-        let is_import = filters::is_import_context(Some(context));
+        let is_import = filters::is_import_context_at(Some(context), column);
         let caller_name_fallback = || self.all_symbol_names.get(ix).cloned().unwrap_or_default();
         let caller_name =
             extract_function_from_context(context).unwrap_or_else(caller_name_fallback);
@@ -252,10 +259,6 @@ impl<'a> ImpactCollector<'a> {
         // local_low_maps へ振り分け、強い impact 信号を汚染しない。
         let filter_disabled = confidence_filter_disabled();
         for e in self.ref_events.drain(..) {
-            if e.is_import {
-                continue;
-            }
-
             let sym_ix_usize = e.sym_ix as usize;
             let fc_ixs = &self.sym_to_fc[sym_ix_usize];
             if fc_ixs.is_empty() {
@@ -289,69 +292,8 @@ impl<'a> ImpactCollector<'a> {
                 if has_parent_type && !parent_in_this_file {
                     continue;
                 }
-                // TS/TSX/JS 名前衝突 FP 抑制 (Issue 2026-06-05-multi-attachment-conversations-fp):
-                // ref file の言語と source の言語が両方 TS family、ref file が source module を
-                // 直接 import していない、かつ context にローカル shadow hint があれば
-                // local_low_maps へ routing する。
-                let ts_route_low = if !filter_disabled
-                    && self.ref_lang.is_some_and(lang_is_ts_family)
-                    && lang_is_ts_family(ctx.lang_id)
-                {
-                    let has_direct_import = ref_file_directly_imports_source(
-                        self.dir,
-                        self.path_str,
-                        source_path,
-                        self.import_facts_cache,
-                    );
-                    should_route_ts_importless_ref_low(
-                        true,
-                        true,
-                        has_direct_import,
-                        e.local_shadow_hint,
-                    )
-                } else {
-                    false
-                };
-                // Rust 名前衝突 FP 抑制 (Issue 2026-06-13-ai-status-json-symbol-fp):
-                // 別ファイルのローカル変数 (`let json`) が同名の自由関数 (`render::json`) への
-                // cross-file 参照に誤マッチするのを抑える。自由関数 (module-level fn/const/static)
-                // は別モジュールから bare では呼べず `use` / qualified path が必須なので、ref file に
-                // その証拠 (import / `X::json` / glob) がなければ bare `json` は別物 → low。
-                // メソッド (`has_parent_type`) は `foo.bar()` のように bare 呼び出しが正当なため対象外
-                // (親型ロジックで別途処理済み)。fail-closed: 判定不能なら high 維持。
-                let rust_route_low = if !filter_disabled
-                    && !has_parent_type
-                    && self.ref_lang == Some(LangId::Rust)
-                    && ctx.lang_id == LangId::Rust
-                {
-                    let symbol_name = self
-                        .all_symbol_names
-                        .get(sym_ix_usize)
-                        .map(String::as_str)
-                        .unwrap_or("");
-                    if e.rust_macro_callee {
-                        true
-                    } else {
-                        match rust_ref_file_has_symbol_evidence(
-                            self.dir,
-                            self.path_str,
-                            symbol_name,
-                            self.import_facts_cache,
-                        ) {
-                            Some(has_evidence) => should_route_rust_ref_low(
-                                has_evidence,
-                                e.local_shadow_hint,
-                                e.ref_in_macro,
-                            ),
-                            None => false,
-                        }
-                    }
-                } else {
-                    false
-                };
-                let route_low = base_route_low || ts_route_low || rust_route_low;
                 if is_ref_in_target_test_context(
-                    self.path_str,
+                    self.source_path_str,
                     e.line as usize,
                     e.column as usize,
                     self.target_cache,
@@ -360,6 +302,78 @@ impl<'a> ImpactCollector<'a> {
                 }
 
                 let sym_key_canonical = &self.all_symbol_names[sym_ix_usize];
+                let route_informational = e.is_import
+                    && ctx.affected.iter().any(|sym| {
+                        sym.change_type == "modified"
+                            && ci_key(ctx.lang_id, &sym.name) == *sym_key_canonical
+                    });
+                // import-only 参照は、modified シンボルだけ情報提供に分離する。
+                // removed/rename 相当の import は存在破壊になり得るため high 側に残す。
+                let route_low = if e.is_import {
+                    false
+                } else {
+                    // TS/TSX/JS 名前衝突 FP 抑制 (Issue 2026-06-05-multi-attachment-conversations-fp):
+                    // ref file の言語と source の言語が両方 TS family、ref file が source module を
+                    // 直接 import していない、かつ context にローカル shadow hint があれば
+                    // local_low_maps へ routing する。
+                    let ts_route_low = if !filter_disabled
+                        && self.ref_lang.is_some_and(lang_is_ts_family)
+                        && lang_is_ts_family(ctx.lang_id)
+                    {
+                        let has_direct_import = ref_file_directly_imports_source(
+                            self.dir,
+                            self.path_str,
+                            source_path,
+                            self.import_facts_cache,
+                        );
+                        should_route_ts_importless_ref_low(
+                            true,
+                            true,
+                            has_direct_import,
+                            e.local_shadow_hint,
+                        )
+                    } else {
+                        false
+                    };
+                    // Rust 名前衝突 FP 抑制 (Issue 2026-06-13-ai-status-json-symbol-fp):
+                    // 別ファイルのローカル変数 (`let json`) が同名の自由関数 (`render::json`) への
+                    // cross-file 参照に誤マッチするのを抑える。自由関数 (module-level fn/const/static)
+                    // は別モジュールから bare では呼べず `use` / qualified path が必須なので、ref file に
+                    // その証拠 (import / `X::json` / glob) がなければ bare `json` は別物 → low。
+                    // メソッド (`has_parent_type`) は `foo.bar()` のように bare 呼び出しが正当なため対象外
+                    // (親型ロジックで別途処理済み)。fail-closed: 判定不能なら high 維持。
+                    let rust_route_low = if !filter_disabled
+                        && !has_parent_type
+                        && self.ref_lang == Some(LangId::Rust)
+                        && ctx.lang_id == LangId::Rust
+                    {
+                        let symbol_name = self
+                            .all_symbol_names
+                            .get(sym_ix_usize)
+                            .map(String::as_str)
+                            .unwrap_or("");
+                        if e.rust_macro_callee {
+                            true
+                        } else {
+                            match rust_ref_file_has_symbol_evidence(
+                                self.dir,
+                                self.path_str,
+                                symbol_name,
+                                self.import_facts_cache,
+                            ) {
+                                Some(has_evidence) => should_route_rust_ref_low(
+                                    has_evidence,
+                                    e.local_shadow_hint,
+                                    e.ref_in_macro,
+                                ),
+                                None => false,
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    base_route_low || ts_route_low || rust_route_low
+                };
                 // 事前 index (ci_key→元名) で O(1) 参照。per-ref の線形 find + ci_key String 割当を排除。
                 let affected_sym_name = ctx
                     .affected_name_by_cikey
@@ -374,7 +388,9 @@ impl<'a> ImpactCollector<'a> {
 
                 let ix_u32 = e.sym_ix;
                 let key = (path_id, e.line as usize);
-                let target_map = if route_low {
+                let target_map = if route_informational {
+                    &mut self.local_informational_maps[fc_ix]
+                } else if route_low {
                     &mut self.local_low_maps[fc_ix]
                 } else {
                     &mut self.local_maps[fc_ix]

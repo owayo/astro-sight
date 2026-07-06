@@ -67,6 +67,14 @@ const IMPACT_DEFAULT_EXCLUDED_DIRS: &[&str] = &[
     "CMakeFiles",
 ];
 
+pub(super) struct StreamCallerMaps {
+    pub(super) caller_maps: Vec<TypedCallerMap>,
+    pub(super) low_caller_maps: Vec<TypedCallerMap>,
+    pub(super) informational_caller_maps: Vec<TypedCallerMap>,
+    pub(super) def_paths_by_ix: Vec<Vec<u32>>,
+    pub(super) string_pool: StringPool,
+}
+
 /// `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` のとき impact のデフォルト除外を解除する。
 /// (環境変数名は v26.5.115 との後方互換のため `_VENDOR_` のままだが、build artifact
 /// 除外も同じフラグで解除される。)
@@ -101,12 +109,7 @@ pub(super) fn stream_caller_maps_and_defs(
     method_parent_types: &HashMap<String, String>,
     dir: &Path,
     options: &crate::models::impact::ContextAnalysisOptions,
-) -> (
-    Vec<TypedCallerMap>,
-    Vec<TypedCallerMap>,
-    Vec<Vec<u32>>,
-    StringPool,
-) {
+) -> StreamCallerMaps {
     let n_sym = all_symbol_names.len();
     let n_fc = file_contexts.len();
 
@@ -146,12 +149,13 @@ pub(super) fn stream_caller_maps_and_defs(
     );
     if all_ci && !force {
         crate::commands::log_phase("context.pass2.ci_skip", "applied", 0);
-        return (
-            (0..n_fc).map(|_| new_typed_caller_map()).collect(),
-            (0..n_fc).map(|_| new_typed_caller_map()).collect(),
-            vec![Vec::new(); n_sym],
-            StringPool::new(),
-        );
+        return StreamCallerMaps {
+            caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
+            low_caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
+            informational_caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
+            def_paths_by_ix: vec![Vec::new(); n_sym],
+            string_pool: StringPool::new(),
+        };
     }
 
     // sym_to_fc は per-file の `cross_file_symbol_keys` だけを信頼して構築する。
@@ -181,13 +185,12 @@ pub(super) fn stream_caller_maps_and_defs(
         }
     }
 
-    let empty_result = || {
-        (
-            (0..n_fc).map(|_| new_typed_caller_map()).collect(),
-            (0..n_fc).map(|_| new_typed_caller_map()).collect(),
-            vec![Vec::new(); n_sym],
-            StringPool::new(),
-        )
+    let empty_result = || StreamCallerMaps {
+        caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
+        low_caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
+        informational_caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
+        def_paths_by_ix: vec![Vec::new(); n_sym],
+        string_pool: StringPool::new(),
     };
 
     let ac = match refs::build_ac_case_insensitive(all_symbol_names) {
@@ -236,6 +239,7 @@ pub(super) fn stream_caller_maps_and_defs(
         WorkerState {
             local_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
             local_low_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
+            local_informational_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
             local_def_paths: vec![Vec::new(); n_sym],
             target_cache: LruCache::new(
                 NonZeroUsize::new(TARGET_FILE_CACHE_SIZE).expect("cache size is non-zero"),
@@ -252,6 +256,8 @@ pub(super) fn stream_caller_maps_and_defs(
     let mut global_maps: Vec<TypedCallerMap> = (0..n_fc).map(|_| new_typed_caller_map()).collect();
     let mut global_low_maps: Vec<TypedCallerMap> =
         (0..n_fc).map(|_| new_typed_caller_map()).collect();
+    let mut global_informational_maps: Vec<TypedCallerMap> =
+        (0..n_fc).map(|_| new_typed_caller_map()).collect();
     let mut global_defs: Vec<Vec<u32>> = vec![Vec::new(); n_sym];
 
     for chunk in files.chunks(CHUNK_SIZE) {
@@ -264,6 +270,11 @@ pub(super) fn stream_caller_maps_and_defs(
                         return state;
                     };
                     let utf8_path = camino::Utf8Path::new(path_str);
+                    let display_path_str = path
+                        .strip_prefix(dir)
+                        .ok()
+                        .and_then(|p| p.to_str())
+                        .unwrap_or(path_str);
 
                     // 本 per-file の可変バッファを `ImpactCollector` にまとめて borrow し、
                     // `visit_refs_and_defs_in_file_cb` の内部から callback で直接流す。
@@ -272,6 +283,7 @@ pub(super) fn stream_caller_maps_and_defs(
                         let WorkerState {
                             local_maps,
                             local_low_maps,
+                            local_informational_maps,
                             local_def_paths,
                             target_cache,
                             import_facts_cache,
@@ -287,9 +299,11 @@ pub(super) fn stream_caller_maps_and_defs(
                             all_symbol_names,
                             parent_ix_by_sym: &parent_ix_by_sym,
                             pool: &string_pool,
-                            path_str,
+                            path_str: display_path_str,
+                            source_path_str: path_str,
                             local_maps: local_maps.as_mut_slice(),
                             local_low_maps: local_low_maps.as_mut_slice(),
+                            local_informational_maps: local_informational_maps.as_mut_slice(),
                             local_def_paths: local_def_paths.as_mut_slice(),
                             target_cache,
                             ref_hit: ref_hit.as_mut_slice(),
@@ -318,6 +332,10 @@ pub(super) fn stream_caller_maps_and_defs(
                 .reduce(init_state, |mut acc, local| {
                     merge_typed_maps(&mut acc.local_maps, local.local_maps);
                     merge_typed_maps(&mut acc.local_low_maps, local.local_low_maps);
+                    merge_typed_maps(
+                        &mut acc.local_informational_maps,
+                        local.local_informational_maps,
+                    );
                     for (acc_v, local_v) in
                         acc.local_def_paths.iter_mut().zip(local.local_def_paths)
                     {
@@ -330,6 +348,10 @@ pub(super) fn stream_caller_maps_and_defs(
         // chunk 結果を global にマージし、chunk state をスコープ終了で drop させる。
         merge_typed_maps(&mut global_maps, chunk_state.local_maps);
         merge_typed_maps(&mut global_low_maps, chunk_state.local_low_maps);
+        merge_typed_maps(
+            &mut global_informational_maps,
+            chunk_state.local_informational_maps,
+        );
         for (g, c) in global_defs.iter_mut().zip(chunk_state.local_def_paths) {
             g.extend(c);
         }
@@ -338,7 +360,13 @@ pub(super) fn stream_caller_maps_and_defs(
     let pool = string_pool
         .into_inner()
         .expect("string pool mutex poisoned on unwrap");
-    (global_maps, global_low_maps, global_defs, pool)
+    StreamCallerMaps {
+        caller_maps: global_maps,
+        low_caller_maps: global_low_maps,
+        informational_caller_maps: global_informational_maps,
+        def_paths_by_ix: global_defs,
+        string_pool: pool,
+    }
 }
 
 /// 2 つの `Vec<TypedCallerMap>` をエントリ単位で重複排除しつつ merge する。

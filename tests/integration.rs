@@ -4581,6 +4581,118 @@ fn sandboxed_service_validates_input_size() {
     assert!(result.is_ok(), "空の diff 入力はサイズ制限を通過するべき");
 }
 
+#[test]
+fn impact_routes_import_only_refs_to_informational_callers() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src_dir = tmp.path().join("src");
+    std::fs::create_dir_all(&src_dir).expect("create src dir");
+    std::fs::write(
+        src_dir.join("lib.ts"),
+        "export function compute(input: number, offset: number = 0): number {\n  return input + offset;\n}\n",
+    )
+    .expect("write changed file");
+    std::fs::write(
+        src_dir.join("import_only.ts"),
+        "import { compute } from './lib';\nexport const label = 'only import';\n",
+    )
+    .expect("write import-only file");
+    std::fs::write(
+        src_dir.join("barrel.ts"),
+        "import { compute } from './lib';\n  export { compute };\n",
+    )
+    .expect("write barrel file");
+    std::fs::write(
+        src_dir.join("barrel_call.ts"),
+        "import { compute } from './lib';\n  export { compute }; export const value = compute(1);\n",
+    )
+    .expect("write barrel call file");
+    std::fs::write(
+        src_dir.join("caller.ts"),
+        "import { compute } from './lib';\nexport const value = compute(1);\n",
+    )
+    .expect("write caller file");
+
+    let diff = "\
+diff --git a/src/lib.ts b/src/lib.ts\n\
+--- a/src/lib.ts\n\
++++ b/src/lib.ts\n\
+@@ -1,3 +1,3 @@\n\
+-export function compute(input: number): number {\n\
+-  return input;\n\
++export function compute(input: number, offset: number = 0): number {\n\
++  return input + offset;\n\
+ }\n";
+    let service = astro_sight::service::AppService::new();
+    let result = service
+        .analyze_context(
+            diff,
+            tmp.path().to_str().expect("utf-8 path"),
+            &astro_sight::models::impact::ContextAnalysisOptions::default(),
+        )
+        .expect("analyze_context should succeed");
+    let change = result
+        .changes
+        .iter()
+        .find(|c| c.path == "src/lib.ts")
+        .expect("changed file impact should be present");
+
+    assert!(
+        change.impacted_callers.iter().any(|caller| {
+            caller.path.ends_with("src/caller.ts") && caller.symbols == vec!["compute".to_string()]
+        }),
+        "actual call should remain in impacted_callers: {:?}",
+        change.impacted_callers
+    );
+    assert!(
+        change.impacted_callers.iter().any(|caller| {
+            caller.path.ends_with("src/barrel_call.ts")
+                && caller.symbols == vec!["compute".to_string()]
+        }),
+        "same-line call after re-export should remain in impacted_callers: {:?}",
+        change.impacted_callers
+    );
+    assert!(
+        change.informational_callers.iter().any(|caller| {
+            caller.path.ends_with("src/import_only.ts")
+                && caller.symbols == vec!["compute".to_string()]
+                && caller.confidence.as_deref() == Some("informational")
+        }),
+        "import-only ref should be informational: {:?}",
+        change.informational_callers
+    );
+    assert!(
+        change.informational_callers.iter().any(|caller| {
+            caller.path.ends_with("src/barrel.ts")
+                && caller.symbols == vec!["compute".to_string()]
+                && caller.confidence.as_deref() == Some("informational")
+        }),
+        "barrel re-export should be informational: {:?}",
+        change.informational_callers
+    );
+    assert!(
+        change
+            .informational_callers
+            .iter()
+            .all(|caller| std::path::Path::new(&caller.path).is_relative()),
+        "informational paths should stay workspace-relative: {:?}",
+        change.informational_callers
+    );
+    assert!(
+        !change
+            .impacted_callers
+            .iter()
+            .any(|caller| caller.path.ends_with("src/import_only.ts")),
+        "import-only ref must not be mixed into impacted_callers"
+    );
+    assert!(
+        !change
+            .impacted_callers
+            .iter()
+            .any(|caller| caller.path.ends_with("src/barrel.ts")),
+        "barrel re-export must not be mixed into impacted_callers"
+    );
+}
+
 // ---- lint --rules-dir テスト ----
 
 #[test]

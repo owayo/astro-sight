@@ -27,6 +27,10 @@ pub(super) fn is_import_context(context: Option<&str>) -> bool {
     {
         return true;
     }
+    // JS/TS: import 済みシンボルを公開し直す barrel 形式
+    if is_js_ts_export_clause(ctx) {
+        return true;
+    }
     // JS/TS: const { X } = require('...'), require('...')
     if ctx.contains("= require(") || ctx.starts_with("require(") {
         return true;
@@ -67,6 +71,39 @@ pub(super) fn is_import_context(context: Option<&str>) -> bool {
     }
     // Java/Kotlin/Swift/PHP: すでにカバー済み
     // ("import " / "use " で捕捉)
+    false
+}
+
+/// 同一行に複数文がある場合、参照列を含む文だけで import/re-export 文脈を判定する。
+pub(super) fn is_import_context_at(context: Option<&str>, column: usize) -> bool {
+    let Some(ctx) = context else {
+        return false;
+    };
+    let segment = statement_segment_at_column(ctx, column);
+    is_import_context(Some(segment))
+}
+
+fn statement_segment_at_column(ctx: &str, column: usize) -> &str {
+    let mut col = column.min(ctx.len());
+    while col > 0 && !ctx.is_char_boundary(col) {
+        col -= 1;
+    }
+    let start = ctx[..col].rfind(';').map_or(0, |ix| ix + 1);
+    let end = ctx[col..].find(';').map_or(ctx.len(), |ix| col + ix);
+    &ctx[start..end]
+}
+
+fn is_js_ts_export_clause(ctx: &str) -> bool {
+    let Some(rest) = ctx.strip_prefix("export") else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    if rest.starts_with('{') {
+        return true;
+    }
+    if let Some(type_rest) = rest.strip_prefix("type") {
+        return type_rest.trim_start().starts_with('{');
+    }
     false
 }
 
@@ -114,6 +151,19 @@ mod tests {
         assert!(is_import_context(Some(
             "export{ useCommitStore } from './commitStore'"
         )));
+        assert!(is_import_context(Some("export { useCommitStore };")));
+        assert!(is_import_context(Some("export{ useCommitStore };")));
+        assert!(is_import_context(Some("export type { CommitStore };")));
+    }
+
+    #[test]
+    fn import_context_at_uses_statement_containing_column() {
+        let line = "export { useCommitStore }; export const value = useCommitStore();";
+        let reexport_col = line.find("useCommitStore").expect("re-export ref");
+        let call_col = line.rfind("useCommitStore").expect("call ref");
+
+        assert!(is_import_context_at(Some(line), reexport_col));
+        assert!(!is_import_context_at(Some(line), call_col));
     }
 
     #[test]
@@ -146,11 +196,12 @@ mod tests {
     }
 
     #[test]
-    fn import_context_ts_export_without_from() {
+    fn import_context_ts_export_declarations_are_not_reexports() {
         assert!(!is_import_context(Some(
             "export const useCommitStore = create()"
         )));
         assert!(!is_import_context(Some("export function foo() {")));
+        assert!(!is_import_context(Some("export type CommitStore = {}")));
     }
 
     #[test]

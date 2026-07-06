@@ -76,6 +76,7 @@ pub(super) fn build_file_impact(
     ctx: FileContext,
     mut caller_map: CallerMap,
     low_caller_map: CallerMap,
+    informational_caller_map: CallerMap,
 ) -> FileImpact {
     // 同一ファイル内の call_edges をマージ
     for sym in &ctx.affected {
@@ -159,6 +160,38 @@ pub(super) fn build_file_impact(
         .collect();
     low_confidence_callers.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line.cmp(&b.line)));
 
+    let mut low_index: HashMap<(&str, usize), HashSet<&str>> = HashMap::new();
+    for c in &low_confidence_callers {
+        low_index
+            .entry((c.path.as_str(), c.line))
+            .or_default()
+            .extend(c.symbols.iter().map(String::as_str));
+    }
+
+    let mut informational_callers: Vec<ImpactedCaller> = informational_caller_map
+        .into_iter()
+        .filter_map(|((path, line), (name, mut symbols))| {
+            if let Some(impacted_syms) = impacted_index.get(&(path.as_str(), line)) {
+                symbols.retain(|s| !impacted_syms.contains(s.as_str()));
+            }
+            if let Some(low_syms) = low_index.get(&(path.as_str(), line)) {
+                symbols.retain(|s| !low_syms.contains(s.as_str()));
+            }
+            if symbols.is_empty() {
+                return None;
+            }
+            symbols.sort_unstable();
+            Some(ImpactedCaller {
+                path,
+                name,
+                line,
+                symbols,
+                confidence: Some("informational".to_string()),
+            })
+        })
+        .collect();
+    informational_callers.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line.cmp(&b.line)));
+
     FileImpact {
         path: ctx.new_path,
         hunks: ctx.hunks,
@@ -166,6 +199,7 @@ pub(super) fn build_file_impact(
         signature_changes: ctx.sig_changes,
         impacted_callers,
         low_confidence_callers,
+        informational_callers,
     }
 }
 
@@ -211,7 +245,7 @@ mod tests {
         let high = caller_map(vec![("src/Caller.php", 42, "doStuff", vec!["config"])]);
         let low = caller_map(vec![("src/Caller.php", 42, "doStuff", vec!["new"])]);
 
-        let imp = build_file_impact(ctx, high, low);
+        let imp = build_file_impact(ctx, high, low, HashMap::new());
 
         assert_eq!(imp.impacted_callers.len(), 1);
         assert_eq!(imp.impacted_callers[0].symbols, vec!["config".to_string()]);
@@ -234,7 +268,7 @@ mod tests {
         let high = caller_map(vec![("src/Caller.php", 42, "doStuff", vec!["new"])]);
         let low = caller_map(vec![("src/Caller.php", 42, "doStuff", vec!["new"])]);
 
-        let imp = build_file_impact(ctx, high, low);
+        let imp = build_file_impact(ctx, high, low, HashMap::new());
 
         assert_eq!(imp.impacted_callers.len(), 1);
         assert_eq!(imp.impacted_callers[0].symbols, vec!["new".to_string()]);
@@ -254,7 +288,7 @@ mod tests {
             vec!["new", "update"],
         )]);
 
-        let imp = build_file_impact(ctx, high, low);
+        let imp = build_file_impact(ctx, high, low, HashMap::new());
 
         assert_eq!(imp.impacted_callers.len(), 1);
         assert_eq!(imp.impacted_callers[0].symbols, vec!["new".to_string()]);
@@ -272,13 +306,43 @@ mod tests {
         let high: CallerMap = HashMap::new();
         let low = caller_map(vec![("src/Caller.php", 42, "doStuff", vec!["new"])]);
 
-        let imp = build_file_impact(ctx, high, low);
+        let imp = build_file_impact(ctx, high, low, HashMap::new());
 
         assert!(imp.impacted_callers.is_empty());
         assert_eq!(imp.low_confidence_callers.len(), 1);
         assert_eq!(
             imp.low_confidence_callers[0].symbols,
             vec!["new".to_string()]
+        );
+    }
+
+    /// informational caller は high / low より弱い信号として扱う。
+    /// 同じ (path, line, symbol) が high または low にある場合は informational から除外し、
+    /// 同じ行でも別シンボルなら情報提供として残す。
+    #[test]
+    fn build_file_impact_dedupes_informational_after_high_and_low() {
+        let ctx = empty_ctx("src/Caller.php");
+        let high = caller_map(vec![("src/Caller.php", 42, "doStuff", vec!["config"])]);
+        let low = caller_map(vec![("src/Caller.php", 42, "doStuff", vec!["new"])]);
+        let info = caller_map(vec![(
+            "src/Caller.php",
+            42,
+            "doStuff",
+            vec!["config", "new", "readOnlyImport"],
+        )]);
+
+        let imp = build_file_impact(ctx, high, low, info);
+
+        assert_eq!(imp.impacted_callers.len(), 1);
+        assert_eq!(imp.low_confidence_callers.len(), 1);
+        assert_eq!(imp.informational_callers.len(), 1);
+        assert_eq!(
+            imp.informational_callers[0].symbols,
+            vec!["readOnlyImport".to_string()]
+        );
+        assert_eq!(
+            imp.informational_callers[0].confidence.as_deref(),
+            Some("informational")
         );
     }
 }

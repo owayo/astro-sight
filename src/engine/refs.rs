@@ -1833,6 +1833,20 @@ fn extract_line_context_indexed(source: &[u8], index: &LineIndex, row: usize) ->
     }
 }
 
+fn context_column(column: usize, source: &[u8], index: &LineIndex, row: usize) -> usize {
+    column.saturating_sub(line_trim_start_offset(source, index, row))
+}
+
+fn line_trim_start_offset(source: &[u8], index: &LineIndex, row: usize) -> usize {
+    let Some((start, end)) = index.line_bounds(source.len(), row) else {
+        return 0;
+    };
+    let Ok(line) = std::str::from_utf8(&source[start..end]) else {
+        return 0;
+    };
+    line.len() - line.trim_start().len()
+}
+
 // ---------------------------------------------------------------------------
 // バッチ参照検索: O(S × N) ではなく O(N + S) で処理する
 // ---------------------------------------------------------------------------
@@ -2133,7 +2147,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
         let is_def = is_definition_context(node, definition_kinds, lang_id);
         let context = extract_line_context_indexed(source, line_index, node.start_position().row);
         let line = node.start_position().row;
-        let column = node.start_position().column;
+        let column = context_column(node.start_position().column, source, line_index, line);
         // Phase 3 で PHP method ref を receiver-aware に分類する。
         // それまでは PHP も含めて ExactOwner を渡し、挙動互換を保つ。
         let confidence = classify_method_ref_confidence(node, source, lang_id, is_def);
@@ -2158,7 +2172,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
                 visitor.on_ref(RefVisitEvent {
                     sym_ix: ix as u32,
                     line: row,
-                    column: col,
+                    column: context_column(col, source, line_index, row),
                     context: &context,
                     is_def: false,
                     confidence: RefConfidence::ExactOwner,
@@ -2176,7 +2190,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
                 visitor.on_ref(RefVisitEvent {
                     sym_ix: ix as u32,
                     line: row,
-                    column: col,
+                    column: context_column(col, source, line_index, row),
                     context: &context,
                     is_def: false,
                     confidence: RefConfidence::ExactOwner,
@@ -2194,7 +2208,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
                 visitor.on_ref(RefVisitEvent {
                     sym_ix: ix as u32,
                     line: row,
-                    column: col,
+                    column: context_column(col, source, line_index, row),
                     context: &context,
                     is_def: false,
                     confidence: RefConfidence::ExactOwner,
@@ -2215,7 +2229,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
             visitor.on_ref(RefVisitEvent {
                 sym_ix: ix as u32,
                 line: row,
-                column: col,
+                column: context_column(col, source, line_index, row),
                 context: &context,
                 is_def: false,
                 confidence: RefConfidence::ExactOwner,
@@ -2233,7 +2247,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
             visitor.on_ref(RefVisitEvent {
                 sym_ix: ix as u32,
                 line: row,
-                column: col,
+                column: context_column(col, source, line_index, row),
                 context: &context,
                 is_def: false,
                 confidence: RefConfidence::ExactOwner,

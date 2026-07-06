@@ -69,6 +69,11 @@ pub struct FileImpact {
     /// 空の場合は出力に含めない (互換維持)。
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub low_confidence_callers: Vec<ImpactedCaller>,
+    /// import/re-export 行など、存在・名前・シグネチャが維持される限り実装対応不要な参照。
+    /// `impacted_callers` の blocking 信号から分離し、レビュー時の優先度を明確にする。
+    /// 空の場合は出力に含めない (互換維持)。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub informational_callers: Vec<ImpactedCaller>,
 }
 
 /// The context (impact analysis) response envelope.

@@ -148,16 +148,22 @@ where
     // (`typed_low_caller_maps`) へ振り分けて強い impact 信号を汚染しない。
     let t = std::time::Instant::now();
     log_phase("context.pass2", "start", 0);
-    let (mut typed_caller_maps, mut typed_low_caller_maps, def_paths_by_ix, string_pool) =
-        stream_caller_maps_and_defs(
-            &file_contexts,
-            &all_symbol_names,
-            &sym_ix,
-            &method_parent_types,
-            dir,
-            options,
-        );
+    let pass2_maps = stream_caller_maps_and_defs(
+        &file_contexts,
+        &all_symbol_names,
+        &sym_ix,
+        &method_parent_types,
+        dir,
+        options,
+    );
     log_phase("context.pass2", "end", t.elapsed().as_millis());
+    let crate::engine::impact::pass2::StreamCallerMaps {
+        mut caller_maps,
+        mut low_caller_maps,
+        mut informational_caller_maps,
+        def_paths_by_ix,
+        string_pool,
+    } = pass2_maps;
 
     // Stage 4b 判定用: method parent を持つ sym_ix のビットセット
     let has_parent_by_ix = compute_has_parent_by_ix(&sym_ix, &method_parent_types);
@@ -169,8 +175,9 @@ where
     let t = std::time::Instant::now();
     log_phase("context.pass34", "start", 0);
     for (fc_ix, ctx) in file_contexts.into_iter().enumerate() {
-        let typed_map = std::mem::take(&mut typed_caller_maps[fc_ix]);
-        let typed_low_map = std::mem::take(&mut typed_low_caller_maps[fc_ix]);
+        let typed_map = std::mem::take(&mut caller_maps[fc_ix]);
+        let typed_low_map = std::mem::take(&mut low_caller_maps[fc_ix]);
+        let typed_informational_map = std::mem::take(&mut informational_caller_maps[fc_ix]);
         let caller_map = apply_stage4b_single(
             typed_map,
             &def_paths_by_ix,
@@ -185,8 +192,16 @@ where
             &has_parent_by_ix,
             &ctx.new_path,
         );
-        let impact = build_file_impact(ctx, caller_map, low_caller_map);
-        // affected_symbols / impacted_callers / signature_changes / low_confidence_callers が
+        let informational_caller_map = apply_stage4b_single(
+            typed_informational_map,
+            &def_paths_by_ix,
+            &string_pool,
+            &has_parent_by_ix,
+            &ctx.new_path,
+        );
+        let impact = build_file_impact(ctx, caller_map, low_caller_map, informational_caller_map);
+        // affected_symbols / impacted_callers / signature_changes / low_confidence_callers /
+        // informational_callers が
         // すべて空の FileImpact は解析対象外（AST が抽出できなかった minified / dist / 生成物
         // ファイル等）なので出力せずスキップする。大規模リポジトリでは dist/*.js 等で数千件の
         // 空 FileImpact が発生し、stdout への書き出しだけで数 GB に達するのを防ぐ。
@@ -194,14 +209,16 @@ where
             && impact.impacted_callers.is_empty()
             && impact.signature_changes.is_empty()
             && impact.low_confidence_callers.is_empty()
+            && impact.informational_callers.is_empty()
         {
             continue;
         }
         on_file_impact(impact)?;
         // caller_map / typed_map は scope 終了で drop、FileImpact は callback に consume される。
     }
-    drop(typed_caller_maps);
-    drop(typed_low_caller_maps);
+    drop(caller_maps);
+    drop(low_caller_maps);
+    drop(informational_caller_maps);
     drop(string_pool);
     log_phase("context.pass34", "end", t.elapsed().as_millis());
 
@@ -222,6 +239,7 @@ fn assemble_without_cross_file(
             signature_changes: ctx.sig_changes,
             impacted_callers: Vec::new(),
             low_confidence_callers: Vec::new(),
+            informational_callers: Vec::new(),
         })
         .collect()
 }

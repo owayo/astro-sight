@@ -8095,6 +8095,7 @@ fn build_review_hook_json_compatible_modified_impact_is_informational() {
                     confidence: None,
                 }],
                 low_confidence_callers: Vec::new(),
+                informational_callers: Vec::new(),
             }],
             skipped: None,
         },
@@ -8180,6 +8181,7 @@ fn build_review_hook_json_mixed_compatible_and_breaking_impact_keeps_breaking_on
                     confidence: None,
                 }],
                 low_confidence_callers: Vec::new(),
+                informational_callers: Vec::new(),
             }],
             skipped: None,
         },
@@ -10935,6 +10937,79 @@ fn build_review_hook_json_cochange_only_is_informational() {
     );
 }
 
+/// import-only などの informational impact は hook JSON に出すが、blocking にはしない。
+#[test]
+fn build_review_hook_json_impact_info_only_is_informational() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src_dir = dir.path().join("src");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::write(
+        src_dir.join("lib.ts"),
+        "export function compute() { return 1; }\n",
+    )
+    .expect("write changed file");
+    fs::write(
+        src_dir.join("consumer.ts"),
+        "import { compute } from './lib';\n",
+    )
+    .expect("write caller file");
+
+    let result = ReviewResult {
+        impact: crate::models::impact::ContextResult {
+            changes: vec![crate::models::impact::FileImpact {
+                path: "src/lib.ts".to_string(),
+                hunks: Vec::new(),
+                affected_symbols: vec![crate::models::impact::AffectedSymbol {
+                    name: "compute".to_string(),
+                    kind: "function".to_string(),
+                    change_type: "modified".to_string(),
+                }],
+                signature_changes: Vec::new(),
+                impacted_callers: Vec::new(),
+                low_confidence_callers: Vec::new(),
+                informational_callers: vec![crate::models::impact::ImpactedCaller {
+                    path: "src/consumer.ts".to_string(),
+                    name: "compute".to_string(),
+                    line: 1,
+                    symbols: vec!["compute".to_string()],
+                    confidence: Some("informational".to_string()),
+                }],
+            }],
+            skipped: None,
+        },
+        missing_cochanges: Vec::new(),
+        api_changes: ApiChanges {
+            added: Vec::new(),
+            removed: Vec::new(),
+            modified: Vec::new(),
+            moved: Vec::new(),
+            property_to_field: Vec::new(),
+            removed_dead: Vec::new(),
+            modified_closed_in_diff: Vec::new(),
+            const_value_changes: Vec::new(),
+            compatible_modified: Vec::new(),
+        },
+        dead_symbols: Vec::new(),
+        test_only_symbols: Vec::new(),
+        skipped: None,
+    };
+
+    let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
+    let hook_json = build.value.expect("impact_info should be emitted");
+    assert!(
+        !build.is_blocking,
+        "impact_info だけなら Stop hook を止めないべき"
+    );
+    assert!(
+        hook_json.get("impacts").is_none(),
+        "informational impact は blocking impacts には混ぜない"
+    );
+    assert_eq!(
+        hook_json["impact_info"][0]["refs"][0]["s"],
+        serde_json::json!(["compute"])
+    );
+}
+
 /// api.add のみの場合は informational として出力されるが blocking にはしない
 #[test]
 fn build_review_hook_json_api_add_only_is_informational() {
@@ -11208,6 +11283,7 @@ fn build_review_hook_json_uses_changed_symbols_in_summary() {
                     confidence: None,
                 }],
                 low_confidence_callers: Vec::new(),
+                informational_callers: Vec::new(),
             }],
             skipped: None,
         },
@@ -11285,6 +11361,7 @@ fn build_review_hook_json_filters_non_causal_affected_symbols_from_syms() {
                     confidence: None,
                 }],
                 low_confidence_callers: Vec::new(),
+                informational_callers: Vec::new(),
             }],
             skipped: None,
         },
@@ -11356,6 +11433,7 @@ fn build_review_hook_json_added_only_caller_is_not_blocking() {
                     confidence: None,
                 }],
                 low_confidence_callers: Vec::new(),
+                informational_callers: Vec::new(),
             }],
             skipped: None,
         },
@@ -11438,6 +11516,7 @@ fn build_review_hook_json_mixed_added_and_modified_keeps_only_modified() {
                     confidence: None,
                 }],
                 low_confidence_callers: Vec::new(),
+                informational_callers: Vec::new(),
             }],
             skipped: None,
         },

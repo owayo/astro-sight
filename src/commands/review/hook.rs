@@ -85,6 +85,8 @@ pub(crate) fn build_review_hook_json(
 
     let mut unresolved: std::collections::BTreeMap<String, HookImpactGroup> =
         std::collections::BTreeMap::new();
+    let mut informational: std::collections::BTreeMap<String, HookImpactGroup> =
+        std::collections::BTreeMap::new();
     for change in &result.impact.changes {
         if change.affected_symbols.is_empty() {
             continue;
@@ -147,6 +149,43 @@ pub(crate) fn build_review_hook_json(
                     .push((caller.path.clone(), caller.line, causal_syms));
             }
         }
+        for caller in &change.informational_callers {
+            let caller_abs = if std::path::Path::new(&caller.path).is_relative() {
+                std::path::Path::new(dir)
+                    .join(&caller.path)
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                caller.path.clone()
+            };
+            let in_diff = match std::fs::canonicalize(&caller_abs) {
+                Ok(canon) => changed_canonical.contains(&canon),
+                Err(_) => changed_abs_strs.contains(&caller_abs),
+            };
+            if !in_diff {
+                let causal_syms: Vec<String> = caller
+                    .symbols
+                    .iter()
+                    .filter(|sym| {
+                        matches!(
+                            affected_change_types.get(sym.as_str()).copied(),
+                            Some("modified")
+                        )
+                    })
+                    .cloned()
+                    .collect();
+                if causal_syms.is_empty() {
+                    continue;
+                }
+                let entry = informational.entry(change.path.clone()).or_default();
+                for sym in &causal_syms {
+                    entry.changed_symbols.insert(sym.clone());
+                }
+                entry
+                    .refs
+                    .push((caller.path.clone(), caller.line, causal_syms));
+            }
+        }
     }
 
     // 空セクションは省略した compact JSON を構築
@@ -191,6 +230,42 @@ pub(crate) fn build_review_hook_json(
             })
             .collect();
         hook_obj.insert("impacts".into(), serde_json::Value::Array(impacts));
+    }
+
+    // impact_info: import-only など blocking しない低信号 impact。`impacts` と分ける。
+    if !informational.is_empty() {
+        has_any_output = true;
+        let impacts: Vec<serde_json::Value> = informational
+            .iter()
+            .map(|(changed_path, group)| {
+                let refs: Vec<serde_json::Value> = group
+                    .refs
+                    .iter()
+                    .map(|(p, ln, s)| {
+                        let mut r = serde_json::Map::new();
+                        r.insert("p".into(), serde_json::Value::String(p.clone()));
+                        r.insert("ln".into(), serde_json::json!(*ln));
+                        if !s.is_empty() {
+                            r.insert(
+                                "s".into(),
+                                serde_json::Value::Array(
+                                    s.iter()
+                                        .map(|v| serde_json::Value::String(v.clone()))
+                                        .collect(),
+                                ),
+                            );
+                        }
+                        serde_json::Value::Object(r)
+                    })
+                    .collect();
+                serde_json::json!({
+                    "src": changed_path,
+                    "syms": group.changed_symbols.iter().collect::<Vec<_>>(),
+                    "refs": refs,
+                })
+            })
+            .collect();
+        hook_obj.insert("impact_info".into(), serde_json::Value::Array(impacts));
     }
 
     // cochange: [{f,w,c}] — 情報提供のみ。is_blocking にはしない
