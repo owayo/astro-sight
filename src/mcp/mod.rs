@@ -415,7 +415,7 @@ impl AstroSightServer {
         let report = doctor::run_doctor();
         let json = serde_json::to_string(&report)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 }
 
@@ -431,7 +431,7 @@ impl AstroSightServer {
             Ok(value) => {
                 let json = serde_json::to_string(&value)
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                Ok(CallToolResult::success(vec![Content::text(json)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
             }
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }

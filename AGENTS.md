@@ -13,7 +13,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 - **スマートコンテキスト**（diff→影響分析、関数シグネチャ変更は識別子境界で照合して prefix 名の別関数を誤検出しない、単一/バッチ参照検索は fold/reduce でピーク RSS を抑制、バッチ参照検索 O(N+S)、`find_references_batch` はディレクトリ走査と rayon pool を 1 回に集約し内部で名前を chunk 分割=既定 64・`ASTRO_SIGHT_REFS_BATCH_CHUNK` で調整して AC trie / fold バケットのメモリを上限化＝呼び出し側の chunk 毎再走査をなくし、chunk サイズに依らず結果は一致する。Angular テンプレート参照は chunk ループ前に `AngularBatchContext::prepare(dir, glob)` で `is_angular_project` 判定 + `collect_component_templates` を 1 度だけ実行して chunk 横断で再利用する（v26.6.110、chunk 数倍の全 dir/.ts 走査を 1 回に削減。非 Angular リポでは `None` で完全 skip））
 - **AST 応答の巨大行抑制**（`ast` の `text` / `snippet` は 256 文字上限で切り詰め、巨大行で応答が肥大化しない）
 - **`.h` ヘッダの C/C++ 自動判定** — `.h` は既定では C として扱うが、C++ 専用構文マーカーがあり、C++ parser の方が C parser より parse error が少ない場合だけ C++ に切り替える。通常の C ヘッダを不用意に C++ 扱いせず、`class Foo { public: ... }` や `struct X : Base<X> {}` のような C++ ヘッダの `symbols` / `review` / `dead-code` 取りこぼしを抑える
-- **MCP サーバーモード**（rmcp 1.7 による stdio JSON-RPC 2.0、ワークスペースサンドボックス、11 ツール）
+- **MCP サーバーモード**（rmcp 2.2 による stdio JSON-RPC 2.0、ワークスペースサンドボックス、11 ツール。rmcp 2.x では `Content` が `ContentBlock` enum に統合された）
 - **デフォルト compact JSON** 出力（`--pretty` で整形出力）
 - **バッチ処理**（`--paths` / `--paths-file` で複数ファイル NDJSON 出力）
 - **JSON エラー出力**（`{"error":{"code":"...","message":"..."}}` を stdout に出力。stdout pipe が先に閉じた場合は broken pipe panic を出さず exit 0 で終了）
