@@ -1991,6 +1991,22 @@ pub fn count_non_definition_refs_split<F>(
 where
     F: Fn(&Path) -> bool + Sync,
 {
+    count_non_definition_refs_split_with_extra_files(symbol_names, dir, glob_pattern, &[], is_test)
+}
+
+/// dead-code 判定用 (追加ファイル対応版)。通常の workspace walk で得たファイルに、
+/// diff 由来などの明示ファイルを canonical path で追加して参照件数を集計する。
+/// hidden ディレクトリ配下でも候補になったファイル自身の参照を取りこぼさないために使う。
+pub fn count_non_definition_refs_split_with_extra_files<F>(
+    symbol_names: &[String],
+    dir: &Path,
+    glob_pattern: Option<&str>,
+    extra_files: &[std::path::PathBuf],
+    is_test: F,
+) -> Result<std::collections::HashMap<String, (usize, usize)>>
+where
+    F: Fn(&Path) -> bool + Sync,
+{
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1998,7 +2014,25 @@ where
         return Ok(HashMap::new());
     }
 
-    let files = collect_files(dir, glob_pattern)?;
+    let canonical_dir = std::fs::canonicalize(dir)?;
+    let mut files = collect_files(&canonical_dir, glob_pattern)?;
+    if !extra_files.is_empty() {
+        let mut seen: std::collections::HashSet<std::path::PathBuf> =
+            files.iter().cloned().collect();
+        for extra in extra_files {
+            let candidate = if extra.is_absolute() {
+                extra.clone()
+            } else {
+                canonical_dir.join(extra)
+            };
+            let Ok(canonical) = std::fs::canonicalize(candidate) else {
+                continue;
+            };
+            if canonical.starts_with(&canonical_dir) && seen.insert(canonical.clone()) {
+                files.push(canonical);
+            }
+        }
+    }
 
     let n = symbol_names.len();
     // shared atomic counters: rayon の chunk 単位で `(vec![0; n], vec![0; n])` を都度確保せず、
@@ -3833,6 +3867,22 @@ struct Bar {
             non_defs, 1,
             "case-different method call must resolve as reference, got refs={refs:?}"
         );
+    }
+
+    #[test]
+    fn count_non_definition_refs_split_without_extra_files_keeps_existing_api() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("sample.rs"),
+            "pub fn helper() {}\nfn run() { helper(); }\n",
+        )
+        .unwrap();
+
+        let counts =
+            count_non_definition_refs_split(&["helper".to_string()], dir.path(), None, |_| false)
+                .unwrap();
+
+        assert_eq!(counts.get("helper"), Some(&(1, 0)));
     }
 
     /// PHP の静的メソッド呼び出し (`Foo::bar()`) も case-insensitive に解決される。

@@ -7895,6 +7895,58 @@ fn dead_code_refs_scope_not_limited_by_glob() {
 }
 
 #[test]
+fn dead_code_diff_hidden_candidate_files_are_in_ref_scope() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".hidden/scripts")).unwrap();
+    std::fs::write(
+        root.join(".hidden/scripts/tool.sh"),
+        "guard() { return 0; }\nmain() { guard || status=$?; }\nmain\n",
+    )
+    .unwrap();
+    let diff = root.join("change.diff");
+    std::fs::write(
+        &diff,
+        "diff --git a/.hidden/scripts/tool.sh b/.hidden/scripts/tool.sh\n\
+new file mode 100755\n\
+--- /dev/null\n\
++++ b/.hidden/scripts/tool.sh\n\
+@@ -0,0 +1,3 @@\n\
++guard() { return 0; }\n\
++main() { guard || status=$?; }\n\
++main\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--diff-file",
+            diff.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !names.iter().any(|name| name == "guard" || name == "main"),
+        "hidden 配下の diff 候補ファイル内参照も集計されるべき: {names:?}"
+    );
+}
+
+#[test]
 fn dead_code_framework_laravel_covers_renamed_app_dir() {
     // F6 (F1 拡張で代替): Laravel プリセットの `**/X/**` 省略版マッチにより、
     // `app/` を `core/` のようにリネームした独自レイアウトや、

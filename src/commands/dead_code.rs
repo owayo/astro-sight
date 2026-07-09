@@ -44,10 +44,11 @@ pub(crate) fn detect_dead_symbols_from_files(
 
     // production / test 別に refs カウント。test/ 配下のみで参照されるシンボルは
     // dead_symbols ではなく test_only_symbols として分離する (F5)。
-    let counts = match crate::engine::refs::count_non_definition_refs_split(
+    let counts = match crate::engine::refs::count_non_definition_refs_split_with_extra_files(
         &index.unique_names,
         &canonical_dir,
         None,
+        files,
         is_test_path,
     ) {
         Ok(v) => v,
