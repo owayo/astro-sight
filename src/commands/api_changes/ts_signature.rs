@@ -712,6 +712,20 @@ pub(crate) fn node_is_member_access_ref(node: tree_sitter::Node, source: &[u8], 
                 .and_then(|index| static_js_string_text(index, source))
                 == Some(key)
         }
+        // destructuring (`const { beta } = config;`) も member の実利用。
+        // shorthand (`{ beta }` / `{ beta = 1 }` の左辺) は
+        // shorthand_property_identifier_pattern、rename (`{ beta: b }`) は pair_pattern の
+        // key に現れる。見落とすと破壊的な member 削除が unused_object_members に降格する。
+        "shorthand_property_identifier_pattern" => node.utf8_text(source).ok() == Some(key),
+        "pair_pattern" => {
+            let Some(key_node) = node.child_by_field_name("key") else {
+                return false;
+            };
+            match key_node.kind() {
+                "string" => static_js_string_text(key_node, source) == Some(key),
+                _ => key_node.utf8_text(source).ok() == Some(key),
+            }
+        }
         _ => false,
     }
 }

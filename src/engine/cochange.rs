@@ -615,6 +615,9 @@ fn list_merge_commits(dir: &str, shas: &HashSet<String>) -> Result<HashSet<Strin
 fn collect_files_in_commit(dir: &str, sha: &str) -> Result<Vec<String>> {
     let output = Command::new("git")
         .args([
+            // 非 ASCII ファイル名のクォートを無効化 (パス照合を生 UTF-8 名で行うため)
+            "-c",
+            "core.quotepath=off",
             "diff-tree",
             "--root",
             "--no-commit-id",

@@ -283,7 +283,9 @@ fn process_modified_file(
             }
             // Python の @property → dataclass field 置き換えなら removed 扱いせず
             // property_to_field に振り替える。
-            if let Some(target_file) = detect_python_property_to_field(dir, name, diff_new_paths) {
+            if let Some(target_file) =
+                detect_python_property_to_field(dir, &df.old_path, name, diff_new_paths)
+            {
                 buckets.property_to_field.push(PropertyToFieldChange {
                     name: name.clone(),
                     file: target_file,
@@ -634,7 +636,9 @@ fn process_deleted_file(
         }
         // Python の @property → dataclass field 置き換えなら removed 扱いせず
         // property_to_field に振り替える。
-        if let Some(target_file) = detect_python_property_to_field(dir, name, diff_new_paths) {
+        if let Some(target_file) =
+            detect_python_property_to_field(dir, &df.old_path, name, diff_new_paths)
+        {
             buckets.property_to_field.push(PropertyToFieldChange {
                 name: name.clone(),
                 file: target_file,
@@ -820,9 +824,8 @@ fn collect_modified_file_index_names(
                 }
             }
             Some(old_sig) if old_sig != &sig.as_str() => {
-                if is_internally_connected(in_file_callees, name) {
-                    index_names.insert(name.clone());
-                }
+                // has_cross_file_refs も bare 名で照合するため exact 名 (qualname) の
+                // 収集は不要 (identifier ノードに一致せず常に 0 件で AC trie を太らせるだけ)。
                 index_names.insert(bare_name(name).to_string());
             }
             Some(_) => {}
@@ -2044,10 +2047,14 @@ pub(crate) fn filter_exported_symbols(
         if !crate::engine::symbols::is_symbol_exported(root, source, lang_id, &sym.range) {
             continue;
         }
-        // pub(crate), pub(super) 等はクレート内部APIなので除外
-        let decl_line = lines.get(sym.range.start.line).unwrap_or(&"").trim();
-        if decl_line.contains("pub(") {
-            continue;
+        // pub(crate), pub(super) 等はクレート内部APIなので除外。
+        // Rust 限定: 他言語では `pub` という名前の関数呼び出し (`export function pub(...)` 等) が
+        // 宣言行に現れるだけで API 面から消えてしまう (Rust では `pub` は予約語のため識別子不可)。
+        if lang_id == crate::language::LangId::Rust {
+            let decl_line = lines.get(sym.range.start.line).unwrap_or(&"").trim();
+            if decl_line.contains("pub(") {
+                continue;
+            }
         }
         // C/C++ で実関数 body 内にネストした function_definition は、tree-sitter-cpp が
         // マクロ呼び出し (BOOST_FOREACH 等) を関数定義と誤パースした結果であることが多い。
@@ -2812,11 +2819,21 @@ pub(crate) fn collect_python_dataclass_fields(
 /// `qualname` は `Container.member` 形式の文字列。`diff_new_paths` 内のいずれかの新ファイルに
 /// 同名 `Container` クラスが存在し、その中に `member: type` の typed annotation 宣言が
 /// あれば、それが置き換え先のファイルパスであるとして返す。複数候補があれば最初のものを返す。
+///
+/// `old_path` は削除シンボルの元ファイル。Python 以外なら対象外 (他言語の `Container.member`
+/// 削除が、diff 内 .py の偶然の同名 class+field で informational に降格するのを防ぐ)。
 pub(crate) fn detect_python_property_to_field(
     dir: &str,
+    old_path: &str,
     qualname: &str,
     diff_new_paths: &HashSet<String>,
 ) -> Option<String> {
+    if !matches!(
+        crate::language::LangId::from_path(camino::Utf8Path::new(old_path)),
+        Ok(crate::language::LangId::Python)
+    ) {
+        return None;
+    }
     let (container, member) = qualname.split_once('.')?;
     if container.is_empty() || member.is_empty() {
         return None;

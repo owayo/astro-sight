@@ -40,7 +40,7 @@ pub(crate) fn detect_dead_symbols_from_files(
         return (Vec::new(), Vec::new());
     }
 
-    let index = build_dead_code_name_index(&candidates, &canonical_dir);
+    let index = build_dead_code_name_index(&candidates, &canonical_dir, files);
 
     // production / test 別に refs カウント。test/ 配下のみで参照されるシンボルは
     // dead_symbols ではなく test_only_symbols として分離する (F5)。
@@ -154,9 +154,12 @@ fn normalized_bare_name(lang: crate::language::LangId, name: &str) -> String {
 }
 
 /// 候補シンボルから同名カウント / liveness alias / refs 検索対象名のインデックスを構築する。
+/// `candidate_files` は diff 由来の候補ファイル (hidden 配下含む)。member liveness の
+/// 走査集合を count 経路 (`count_non_definition_refs_split_with_extra_files`) と一致させる。
 fn build_dead_code_name_index(
     candidates: &DeadCodeCandidates,
     canonical_dir: &std::path::Path,
+    candidate_files: &[std::path::PathBuf],
 ) -> DeadCodeNameIndex {
     // 同名 export が複数ファイル/複数コンテナに存在する場合は保守的にスキップ（誤判定防止）。
     // キーは bare name を言語別に正規化したもの (Xojo では `Foo` と `FOO` を同一視)。
@@ -209,10 +212,18 @@ fn build_dead_code_name_index(
     // TS/JS の duplicate な同名 class member について owner 一意推定で liveness を再判定する。
     // `name_counts > 1` で従来スキップされていた候補のうち、安全に owner を一意推定できる
     // ケースだけ通常の dead/test_only/live 判定経路に乗せる。
-    let member_liveness =
-        JsTsMemberLiveness::build(&candidates.all_syms, canonical_dir, is_test_path);
-    let php_member_liveness =
-        PhpMemberLiveness::build(&candidates.all_syms, canonical_dir, is_test_path);
+    let member_liveness = JsTsMemberLiveness::build(
+        &candidates.all_syms,
+        canonical_dir,
+        candidate_files,
+        is_test_path,
+    );
+    let php_member_liveness = PhpMemberLiveness::build(
+        &candidates.all_syms,
+        canonical_dir,
+        candidate_files,
+        is_test_path,
+    );
 
     DeadCodeNameIndex {
         name_counts,
@@ -512,7 +523,14 @@ pub(crate) fn filter_dead_by_touched_symbols(
             let line_map = sym_lines_cache
                 .entry(ds.file.clone())
                 .or_insert_with(|| extract_symbol_lines(dir, &ds.file).unwrap_or_default());
-            let Some(&line) = line_map.get(&ds.name) else {
+            // DeadSymbol.name は class member だと qualname (`Container.method`) だが、
+            // `extract_symbol_lines` のキーは bare name。qualname で引けない場合は
+            // 末尾セグメントで再 lookup しないと member が常に「宣言行不明 → touched 扱い」
+            // に落ち、touched-symbols フィルタが no-op になる。
+            let line_lookup = line_map
+                .get(&ds.name)
+                .or_else(|| line_map.get(bare_name(&ds.name)));
+            let Some(&line) = line_lookup else {
                 // 宣言行が引けない (lexer-only で取り漏れ等) は保守的に touched 扱いで残す。
                 return true;
             };

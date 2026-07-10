@@ -1994,6 +1994,34 @@ where
     count_non_definition_refs_split_with_extra_files(symbol_names, dir, glob_pattern, &[], is_test)
 }
 
+/// workspace walk の結果 `files` に、diff 由来などの明示ファイルを canonical path で
+/// 合流させる (workspace 外・解決不能・重複は除外)。hidden ディレクトリ配下でも候補に
+/// なったファイル自身の参照を取りこぼさないための共通ヘルパー
+/// (count 経路と member liveness 経路で走査集合を一致させる)。
+pub fn merge_extra_files(
+    files: &mut Vec<std::path::PathBuf>,
+    canonical_dir: &Path,
+    extra_files: &[std::path::PathBuf],
+) {
+    if extra_files.is_empty() {
+        return;
+    }
+    let mut seen: std::collections::HashSet<std::path::PathBuf> = files.iter().cloned().collect();
+    for extra in extra_files {
+        let candidate = if extra.is_absolute() {
+            extra.clone()
+        } else {
+            canonical_dir.join(extra)
+        };
+        let Ok(canonical) = std::fs::canonicalize(candidate) else {
+            continue;
+        };
+        if canonical.starts_with(canonical_dir) && seen.insert(canonical.clone()) {
+            files.push(canonical);
+        }
+    }
+}
+
 /// dead-code 判定用 (追加ファイル対応版)。通常の workspace walk で得たファイルに、
 /// diff 由来などの明示ファイルを canonical path で追加して参照件数を集計する。
 /// hidden ディレクトリ配下でも候補になったファイル自身の参照を取りこぼさないために使う。
@@ -2016,23 +2044,7 @@ where
 
     let canonical_dir = std::fs::canonicalize(dir)?;
     let mut files = collect_files(&canonical_dir, glob_pattern)?;
-    if !extra_files.is_empty() {
-        let mut seen: std::collections::HashSet<std::path::PathBuf> =
-            files.iter().cloned().collect();
-        for extra in extra_files {
-            let candidate = if extra.is_absolute() {
-                extra.clone()
-            } else {
-                canonical_dir.join(extra)
-            };
-            let Ok(canonical) = std::fs::canonicalize(candidate) else {
-                continue;
-            };
-            if canonical.starts_with(&canonical_dir) && seen.insert(canonical.clone()) {
-                files.push(canonical);
-            }
-        }
-    }
+    merge_extra_files(&mut files, &canonical_dir, extra_files);
 
     let n = symbol_names.len();
     // shared atomic counters: rayon の chunk 単位で `(vec![0; n], vec![0; n])` を都度確保せず、
@@ -2142,7 +2154,12 @@ pub(crate) fn visit_refs_and_defs_in_file_cb<V: RefVisitor>(
 pub(crate) struct RefVisitEvent<'a> {
     pub(crate) sym_ix: u32,
     pub(crate) line: usize,
+    /// ファイル絶対 byte 列 (tree-sitter Point と同じ座標系)。
+    /// AST の point 照合 (test context 判定等) にはこちらを使う。
     pub(crate) column: usize,
+    /// trim 済み `context` 行内の相対列。`context` 文字列に対する
+    /// statement 単位の判定 (import/re-export 分類等) にはこちらを使う。
+    pub(crate) context_column: usize,
     pub(crate) context: &'a str,
     pub(crate) is_def: bool,
     /// receiver-aware 解析の確信度。Phase 3 より前は常に ExactOwner。
@@ -2181,7 +2198,8 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
         let is_def = is_definition_context(node, definition_kinds, lang_id);
         let context = extract_line_context_indexed(source, line_index, node.start_position().row);
         let line = node.start_position().row;
-        let column = context_column(node.start_position().column, source, line_index, line);
+        let column = node.start_position().column;
+        let ctx_col = context_column(column, source, line_index, line);
         // Phase 3 で PHP method ref を receiver-aware に分類する。
         // それまでは PHP も含めて ExactOwner を渡し、挙動互換を保つ。
         let confidence = classify_method_ref_confidence(node, source, lang_id, is_def);
@@ -2191,6 +2209,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
                 sym_ix: ix as u32,
                 line,
                 column,
+                context_column: ctx_col,
                 context: &context,
                 is_def,
                 confidence,
@@ -2206,7 +2225,8 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
                 visitor.on_ref(RefVisitEvent {
                     sym_ix: ix as u32,
                     line: row,
-                    column: context_column(col, source, line_index, row),
+                    column: col,
+                    context_column: context_column(col, source, line_index, row),
                     context: &context,
                     is_def: false,
                     confidence: RefConfidence::ExactOwner,
@@ -2224,7 +2244,8 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
                 visitor.on_ref(RefVisitEvent {
                     sym_ix: ix as u32,
                     line: row,
-                    column: context_column(col, source, line_index, row),
+                    column: col,
+                    context_column: context_column(col, source, line_index, row),
                     context: &context,
                     is_def: false,
                     confidence: RefConfidence::ExactOwner,
@@ -2242,7 +2263,8 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
                 visitor.on_ref(RefVisitEvent {
                     sym_ix: ix as u32,
                     line: row,
-                    column: context_column(col, source, line_index, row),
+                    column: col,
+                    context_column: context_column(col, source, line_index, row),
                     context: &context,
                     is_def: false,
                     confidence: RefConfidence::ExactOwner,
@@ -2263,7 +2285,8 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
             visitor.on_ref(RefVisitEvent {
                 sym_ix: ix as u32,
                 line: row,
-                column: context_column(col, source, line_index, row),
+                column: col,
+                context_column: context_column(col, source, line_index, row),
                 context: &context,
                 is_def: false,
                 confidence: RefConfidence::ExactOwner,
@@ -2281,7 +2304,8 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
             visitor.on_ref(RefVisitEvent {
                 sym_ix: ix as u32,
                 line: row,
-                column: context_column(col, source, line_index, row),
+                column: col,
+                context_column: context_column(col, source, line_index, row),
                 context: &context,
                 is_def: false,
                 confidence: RefConfidence::ExactOwner,
@@ -4096,5 +4120,45 @@ struct Bar {
                 .is_empty(),
             "group use function must be case-insensitive"
         );
+    }
+
+    /// visitor 経由の参照イベントは `column` にファイル絶対列 (tree-sitter Point 座標系)、
+    /// `context_column` に trim 済み context 行内の相対列を運ぶ (インデント行で両者がずれる)。
+    #[test]
+    fn ref_visit_event_carries_absolute_and_context_columns() {
+        struct Recorder {
+            // (line, column, context_column, is_def)
+            events: Vec<(usize, usize, usize, bool)>,
+        }
+        impl RefVisitor for Recorder {
+            fn on_ref(&mut self, event: RefVisitEvent<'_>) {
+                self.events
+                    .push((event.line, event.column, event.context_column, event.is_def));
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.ts");
+        // 参照行は行頭スペース 4 のインデント付き
+        std::fs::write(
+            &path,
+            "function targetFn(): void {}\nfunction run(): void {\n    targetFn();\n}\n",
+        )
+        .unwrap();
+
+        let names = vec!["targetFn".to_string()];
+        let ac = build_ac_case_insensitive(&names).unwrap();
+        let utf8_path = camino::Utf8Path::from_path(&path).expect("utf-8 path");
+        let mut recorder = Recorder { events: Vec::new() };
+        visit_refs_and_defs_in_file_cb(&names, &ac, utf8_path, &mut recorder).unwrap();
+
+        let (line, column, context_column, _) = *recorder
+            .events
+            .iter()
+            .find(|(_, _, _, is_def)| !is_def)
+            .expect("targetFn の参照イベントが 1 件はあるはず");
+        assert_eq!(line, 2, "参照は 3 行目 (0-indexed 2)");
+        assert_eq!(column, 4, "column はファイル絶対列 (インデント 4 込み)");
+        assert_eq!(context_column, 0, "context_column は trim 済み行内の相対列");
     }
 }

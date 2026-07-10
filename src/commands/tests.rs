@@ -12026,3 +12026,145 @@ fn filter_dead_by_wip_added_passes_through_when_added_is_empty() {
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].name, "foo");
 }
+
+/// TS/JS では `pub` という名前の関数を Rust の `pub(...)` 可視性と誤認して API 面から
+/// 落とさない (`pub(` の宣言行チェックは Rust 限定)。
+#[test]
+fn filter_exported_symbols_ts_function_named_pub_is_not_excluded() {
+    let source: &[u8] =
+        b"export function pub(topic: string): void {}\nexport function sub(topic: string): void {}\n";
+    let lang = crate::language::LangId::Typescript;
+    let tree = parser::parse_source(source, lang).expect("parse");
+    let root = tree.root_node();
+    let syms = crate::engine::symbols::extract_symbols(root, source, lang).expect("symbols");
+    let exported = filter_exported_symbols(&syms, root, source, lang, true, false, Some("api.ts"));
+    let names: Vec<&str> = exported.iter().map(|(name, _, _)| name.as_str()).collect();
+    assert!(
+        names.contains(&"pub"),
+        "TS の関数 pub は API 面に残るべき。got: {names:?}"
+    );
+    assert!(
+        names.contains(&"sub"),
+        "sub も従来どおり API 面に残るべき。got: {names:?}"
+    );
+}
+
+/// 対照: Rust の `pub(crate)` はクレート内部 API のため従来どおり除外される。
+#[test]
+fn filter_exported_symbols_rust_pub_crate_is_still_excluded() {
+    let source: &[u8] = b"pub(crate) fn internal() {}\npub fn public_api() {}\n";
+    let lang = crate::language::LangId::Rust;
+    let tree = parser::parse_source(source, lang).expect("parse");
+    let root = tree.root_node();
+    let syms = crate::engine::symbols::extract_symbols(root, source, lang).expect("symbols");
+    let exported =
+        filter_exported_symbols(&syms, root, source, lang, true, false, Some("src/lib.rs"));
+    let names: Vec<&str> = exported.iter().map(|(name, _, _)| name.as_str()).collect();
+    assert!(
+        !names.contains(&"internal"),
+        "pub(crate) fn は API 面から除外されるべき。got: {names:?}"
+    );
+    assert!(
+        names.contains(&"public_api"),
+        "pub fn は従来どおり API 面に残るべき。got: {names:?}"
+    );
+}
+
+/// `has_cross_file_refs` は qualname (`Store.get`) を bare 名 (`get`) に正規化して
+/// index を引き、cross-file 参照を検出する (qualname のままだと恒久的に 0 件になる)。
+#[test]
+fn has_cross_file_refs_qualname_uses_bare_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    fs::write(
+        repo.join("store.ts"),
+        "export class Store {\n  get(k: string): string {\n    return k;\n  }\n}\nexport const local = new Store().get(\"self\");\n",
+    )
+    .expect("write");
+    fs::write(
+        repo.join("caller.ts"),
+        "import { Store } from \"./store\";\nnew Store().get(\"x\");\n",
+    )
+    .expect("write");
+
+    let ref_index = ApiRefIndex::build(
+        repo.to_str().expect("utf-8 path"),
+        &HashSet::from(["get".to_string()]),
+    );
+    // index には bare 名の参照が収集済み (未収集フォールバックの保守的 true と区別する)。
+    assert!(
+        ref_index.refs_for("get").is_some(),
+        "bare 名 get の参照が index に収集されているべき"
+    );
+    assert!(
+        has_cross_file_refs(&ref_index, "store.ts", "Store.get"),
+        "qualname は bare 名照合で caller.ts の cross-file 参照を検出するべき"
+    );
+}
+
+/// `detect_python_property_to_field` は old_path が Python の場合のみ判定する
+/// (他言語の `Container.member` 削除が diff 内 .py の偶然の同名 class+field で
+/// informational に降格しない)。
+#[test]
+fn detect_python_property_to_field_requires_python_old_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    fs::write(
+        dir.path().join("new.py"),
+        "from dataclasses import dataclass\n@dataclass\nclass Container:\n    member: int\n",
+    )
+    .expect("write");
+    let dir_str = dir.path().to_str().expect("utf-8 path");
+    let diff_new_paths: HashSet<String> = HashSet::from(["new.py".to_string()]);
+
+    assert_eq!(
+        detect_python_property_to_field(dir_str, "old.py", "Container.member", &diff_new_paths),
+        Some("new.py".to_string()),
+        "Python の old_path なら置き換え先 new.py を検出する"
+    );
+    assert_eq!(
+        detect_python_property_to_field(dir_str, "old.ts", "Container.member", &diff_new_paths),
+        None,
+        "Python 以外の old_path は言語ガードで対象外"
+    );
+}
+
+/// object destructuring (`const { beta } = config`) も member access 参照として検出する
+/// (shorthand / rename / string キー / パラメータ destructuring)。見落とすと破壊的な
+/// member 削除が unused_object_members に降格する。
+#[test]
+fn member_access_ref_detects_object_destructuring() {
+    let lang = crate::language::LangId::Typescript;
+    // shorthand (`{ beta }`) は shorthand_property_identifier_pattern
+    assert!(
+        source_has_member_access_ref(b"const { beta } = config;", lang, "beta").expect("parse"),
+        "shorthand destructuring は member 参照として検出されるべき"
+    );
+    // rename (`{ beta: renamed }`) は pair_pattern の key
+    assert!(
+        source_has_member_access_ref(b"const { beta: renamed } = config;", lang, "beta")
+            .expect("parse"),
+        "rename destructuring は member 参照として検出されるべき"
+    );
+    // string キー (`{ \"beta\": renamed }`) も pair_pattern の key (string)
+    assert!(
+        source_has_member_access_ref(b"const { \"beta\": renamed } = config;", lang, "beta")
+            .expect("parse"),
+        "string キーの destructuring は member 参照として検出されるべき"
+    );
+    // 別キーのみの destructuring は検出しない
+    assert!(
+        !source_has_member_access_ref(b"const { alpha } = config;", lang, "beta").expect("parse"),
+        "別キーの destructuring は member 参照ではない"
+    );
+    // memmem 事前フィルタを通過しても AST 判定で弾かれる (beta が member 位置に無い)
+    assert!(
+        !source_has_member_access_ref(b"const beta = config.other;", lang, "beta").expect("parse"),
+        "member 位置に無い識別子 beta は member 参照ではない"
+    );
+    // パラメータ destructuring (`function f({ beta }: Opts)`) も同ノードで検出する
+    assert!(
+        source_has_member_access_ref(b"function f({ beta }: Opts) {}", lang, "beta")
+            .expect("parse"),
+        "パラメータ destructuring も member 参照として検出されるべき"
+    );
+}

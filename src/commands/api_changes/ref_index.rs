@@ -74,12 +74,16 @@ impl ApiRefIndex {
 /// とみなす）を返し、modified の除外を抑止する（false positive を恐れて false negative
 /// を起こさない方針）。
 ///
+/// 検索は bare 名で行う。qualname (`Container.method`) は identifier ノードに一致せず
+/// 恒久的に 0 件となり、「自ファイル内で呼ばれているだけ」で除外が成立してしまう。
+/// bare 名の同名他クラスヒットは「参照あり = 除外しない」方向にしか作用しない (保守的)。
+///
 /// `file_path` は `dir` からの相対パスを想定する。index の参照パスも `dir` 相対なので
 /// `Path` 単位で比較する。
 pub(crate) fn has_cross_file_refs(index: &ApiRefIndex, file_path: &str, name: &str) -> bool {
     use std::path::Path;
 
-    let Some(refs) = index.refs_for(name) else {
+    let Some(refs) = index.refs_for(bare_name(name)) else {
         return true;
     };
     let self_path = Path::new(file_path);
@@ -269,7 +273,9 @@ pub(crate) fn changed_new_lines_for_file(
     // rename 検出を有効化 (-M)。rename された caller を new_path だけの pathspec で diff すると
     // Git は「新規ファイル全行追加」として返し、未更新の古い呼び出しまで changed に見えてしまう
     // (codex 指摘)。old_path も pathspec に含めて rename-aware な diff にする。
-    let mut args: Vec<&str> = vec!["diff", base, "-M", "--"];
+    // core.quotepath=off: 非 ASCII 名の `+++ "b/..."` クォートで extract_changed_new_lines の
+    // パス照合が外れ、追随済み参照まで blocking 維持になるのを防ぐ。
+    let mut args: Vec<&str> = vec!["-c", "core.quotepath=off", "diff", base, "-M", "--"];
     if old_path != "/dev/null" && old_path != new_path {
         if validate_git_revision(old_path, "diff file path").is_err() {
             return HashSet::new();

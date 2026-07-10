@@ -157,6 +157,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             sym_ix,
             line,
             column,
+            context_column,
             context,
             is_def,
             confidence,
@@ -174,7 +175,9 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
         // Stage 6 (import 行) の判定は文字列のままでないと行えないため、ここで即決する。
         // caller_name も context から抽出し、pool へ intern して ID にしてから push する。
         // これにより `RefEventMini` は固定長で済み、per-file バッファの heap を削減する。
-        let is_import = filters::is_import_context_at(Some(context), column);
+        // context は trim 済み文字列のため、列は context_column (trim 相対) を渡す
+        // (絶対列 `column` は AST point 照合用で座標系が異なる)。
+        let is_import = filters::is_import_context_at(Some(context), context_column);
         let caller_name_fallback = || self.all_symbol_names.get(ix).cloned().unwrap_or_default();
         let caller_name =
             extract_function_from_context(context).unwrap_or_else(caller_name_fallback);

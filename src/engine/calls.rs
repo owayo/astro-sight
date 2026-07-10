@@ -296,15 +296,18 @@ fn call_query(lang_id: LangId) -> &'static str {
             "#
         }
         LangId::Java => {
+            // name: は object の有無に依らず全 method_invocation を捕捉するため 1 本で足りる
+            // (object 付きの別パターンを併記すると同一呼び出しが二重計上される)。
             r#"
             (method_invocation name: (identifier) @direct.callee)
-            (method_invocation object: (identifier) name: (identifier) @method.callee)
             "#
         }
         LangId::Kotlin => {
+            // メソッド名は navigation_suffix 配下にある (直接子の simple_identifier は
+            // receiver 側で、`repo.save()` の callee が "repo" になってしまう)。
             r#"
             (call_expression (simple_identifier) @direct.callee)
-            (call_expression (navigation_expression (simple_identifier) @method.callee))
+            (call_expression (navigation_expression (navigation_suffix (simple_identifier) @method.callee)))
             "#
         }
         LangId::Swift => {
@@ -525,6 +528,44 @@ mod tests {
         assert!(
             callees.contains("timed"),
             "トップレベルコマンドも callee として扱われるべき。got: {callees:?}"
+        );
+    }
+
+    /// Kotlin のメソッド呼び出し `repo.save()` は receiver ではなくメソッド名を callee に
+    /// 抽出する (navigation_suffix 配下の simple_identifier を捕捉する回帰防止)。
+    #[test]
+    fn kotlin_method_call_captures_method_name_not_receiver() {
+        let source = b"fun run(repo: Repo) {\n    repo.save(\"x\")\n    a.b.c()\n}\n";
+        let tree = parser::parse_source(source, LangId::Kotlin).unwrap();
+        let edges = extract_calls(tree.root_node(), source, LangId::Kotlin, None).unwrap();
+        let callees: Vec<&str> = edges.iter().map(|e| e.callee.name.as_str()).collect();
+        assert!(
+            callees.contains(&"save"),
+            "メソッド名 save が callee になるべき。got: {callees:?}"
+        );
+        assert!(
+            callees.contains(&"c"),
+            "チェーン末尾のメソッド名 c が callee になるべき。got: {callees:?}"
+        );
+        assert!(
+            !callees.contains(&"repo"),
+            "receiver は callee に含めてはならない。got: {callees:?}"
+        );
+    }
+
+    /// Java のメソッド呼び出し `b.work()` は 1 呼び出しにつき edge ちょうど 1 件
+    /// (object 付きパターン併記による同一呼び出しの二重計上の回帰防止)。
+    #[test]
+    fn java_method_call_edge_is_not_duplicated() {
+        let source = b"class A { void run(B b) { b.work(); } }";
+        let tree = parser::parse_source(source, LangId::Java).unwrap();
+        let edges = extract_calls(tree.root_node(), source, LangId::Java, None).unwrap();
+        let work_edges = edges.iter().filter(|e| e.callee.name == "work").count();
+        assert_eq!(
+            work_edges,
+            1,
+            "work の edge はちょうど 1 件であるべき。edges: {:?}",
+            edges.iter().map(|e| &e.callee.name).collect::<Vec<_>>()
         );
     }
 

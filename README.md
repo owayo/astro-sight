@@ -436,7 +436,7 @@ astro-sight dead-code --dir . --git --staged
 }
 ```
 
-同名シンボルが複数ファイルに存在する場合は誤判定防止のためスキップされる。ただし TS/JS と PHP の class member は、owner を安全に一意推定できる場合だけ例外的に判定する。PHP では `Owner::method()` と同一クラス内の `self::method()` / `static::method()` を確定参照として扱い、`$obj->method()` や callable 文字列など owner を確定できない参照がある場合は従来どおりスキップする。
+同名シンボルが複数ファイルに存在する場合は誤判定防止のためスキップされる。ただし TS/JS と PHP の class member は、owner を安全に一意推定できる場合だけ例外的に判定する。PHP では `Owner::method()` と同一クラス内の `self::method()` を確定参照として扱い、`$obj->method()` や callable 文字列など owner を確定できない参照がある場合は従来どおりスキップする（`static::` は遅延静的束縛でサブクラス override に到達し得るため確定解決しない）。trait を `use` する class / trait / enum 経由の静的呼び出しは、一意に到達する trait method に限り参照として数える（合成先が同名の具象メソッドを持つ場合は PHP の解決順により trait 側へ辿らない）。
 
 #### テストフレームワーク規約の自動除外
 

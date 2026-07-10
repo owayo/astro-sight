@@ -636,12 +636,23 @@ fn pretty_output_flag() {
 fn context_diff_file_arg() {
     use std::io::Write;
 
-    let diff = r#"--- a/src/engine/symbols.rs
-+++ b/src/engine/symbols.rs
-@@ -9,7 +9,7 @@
--pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {
-+pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, flag: bool) -> Result<Vec<Symbol>> {
-     let query_src = symbol_query(lang_id);
+    // 自己完結フィクスチャ: diff が実ファイルのシンボル範囲に重なるようにし、
+    // 「空 FileImpact はスキップする」ガードの下でも --diff-file の疎通を検証できる形にする。
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("sample.rs"),
+        "pub fn helper() -> i32 {\n    1\n}\n\npub fn run() -> i32 {\n    helper()\n}\n",
+    )
+    .unwrap();
+
+    let diff = r#"--- a/sample.rs
++++ b/sample.rs
+@@ -1,3 +1,3 @@
+-pub fn helper() -> i32 {
+-    1
++pub fn helper() -> i64 {
++    2
+ }
 "#;
 
     let tmp = std::env::temp_dir().join("astro_sight_test.diff");
@@ -653,7 +664,7 @@ fn context_diff_file_arg() {
         .args([
             "context",
             "--dir",
-            ".",
+            dir.path().to_str().unwrap(),
             "--diff-file",
             tmp.to_str().unwrap(),
         ])
@@ -668,7 +679,14 @@ fn context_diff_file_arg() {
     );
     let changes = json["changes"].as_array().unwrap();
     assert!(!changes.is_empty());
-    assert_eq!(changes[0]["path"], "src/engine/symbols.rs");
+    assert_eq!(changes[0]["path"], "sample.rs");
+    let affected = changes[0]["affected_symbols"].as_array().unwrap();
+    assert!(
+        affected
+            .iter()
+            .any(|s| s["name"].as_str() == Some("helper")),
+        "helper should be affected: {changes:?}"
+    );
 
     let _ = std::fs::remove_file(&tmp);
 }
@@ -3716,11 +3734,17 @@ fn impact_typescript_abstract_class_filters_unrelated_callers() {
     let other_ts = dir.path().join("other.ts");
     let unrelated_ts = dir.path().join("unrelated.ts");
 
-    // base.ts: abstract class scope の method `process`
+    // base.ts: abstract class scope の method `process`。
+    // 本体のない abstract シグネチャは affected symbol にならないため、
+    // 具象メソッドを abstract class 内に置いて parent 認識 (abstract_class_declaration)
+    // を実際に効かせる (空 FileImpact はスキップされるようになったため、
+    // affected が空だとフィルタ検証自体が空振りする)。
     std::fs::write(
         &abs_ts,
         r#"export abstract class Base {
-    abstract process(x: number): number;
+    process(x: number): number {
+        return x;
+    }
 }
 "#,
     )
@@ -3753,10 +3777,12 @@ export function consume(): number {
 
     let diff = r#"--- a/base.ts
 +++ b/base.ts
-@@ -1,3 +1,3 @@
+@@ -1,5 +1,5 @@
  export abstract class Base {
--    abstract process(x: number): number;
-+    abstract process(x: number, y: number): number;
+-    process(x: number): number {
++    process(x: number, y: number): number {
+         return x;
+     }
  }
 "#;
 

@@ -1540,7 +1540,9 @@ fn is_js_ts_angular_member_decorator_target(
                 return true;
             }
             last_decorator_names.clear();
-        } else {
+        } else if child.kind() != "comment" {
+            // decorator と member の間に挟まったコメントで decorator との対応が
+            // 切れないよう、comment は蓄積を維持したまま読み飛ばす。
             last_decorator_names.clear();
         }
     }

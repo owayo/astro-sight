@@ -56,10 +56,13 @@ impl JsTsMemberLiveness {
     ///
     /// `candidates` は `(name, kind, file_rel, lang)` のタプル列。`name` は qualname 形式
     /// (`Container.member`)。`canonical_dir` は走査対象のルート (canonicalize 済み)。
-    /// `is_test_path` は test ディレクトリ判定。
+    /// `extra_files` は hidden ディレクトリ配下などの walk 対象外でも候補になった
+    /// diff 由来ファイル (count 経路と走査集合を一致させる)。`is_test_path` は
+    /// test ディレクトリ判定。
     pub(crate) fn build<F>(
         candidates: &[(String, String, String, LangId)],
         canonical_dir: &Path,
+        extra_files: &[std::path::PathBuf],
         is_test_path: F,
     ) -> Self
     where
@@ -108,10 +111,11 @@ impl JsTsMemberLiveness {
             return Self { statuses };
         }
 
-        // Step 3: TS/JS ファイル一覧を収集 (一度だけ)。
-        let Ok(all_files) = refs::collect_files(canonical_dir, None) else {
+        // Step 3: TS/JS ファイル一覧を収集 (一度だけ)。hidden 配下の diff 候補も合流させる。
+        let Ok(mut all_files) = refs::collect_files(canonical_dir, None) else {
             return Self { statuses };
         };
+        refs::merge_extra_files(&mut all_files, canonical_dir, extra_files);
         let ts_js_files: Vec<(std::path::PathBuf, LangId)> = all_files
             .into_iter()
             .filter_map(|p| {
@@ -199,6 +203,7 @@ impl PhpMemberLiveness {
     pub(crate) fn build<F>(
         candidates: &[(String, String, String, LangId)],
         canonical_dir: &Path,
+        extra_files: &[std::path::PathBuf],
         is_test_path: F,
     ) -> Self
     where
@@ -215,7 +220,7 @@ impl PhpMemberLiveness {
             return Self { statuses };
         }
 
-        let Some(php_files) = collect_php_files(canonical_dir) else {
+        let Some(php_files) = collect_php_files(canonical_dir, extra_files) else {
             return Self { statuses };
         };
         let trait_uses = collect_php_trait_uses(&php_files);
@@ -314,8 +319,13 @@ fn has_duplicate_php_member_set(grouped: &HashMap<String, Vec<&MemberCandidate>>
     })
 }
 
-fn collect_php_files(canonical_dir: &Path) -> Option<Vec<std::path::PathBuf>> {
-    let files = refs::collect_files(canonical_dir, None).ok()?;
+fn collect_php_files(
+    canonical_dir: &Path,
+    extra_files: &[std::path::PathBuf],
+) -> Option<Vec<std::path::PathBuf>> {
+    let mut files = refs::collect_files(canonical_dir, None).ok()?;
+    // hidden 配下の diff 候補も参照・trait use 収集の走査対象に合流させる。
+    refs::merge_extra_files(&mut files, canonical_dir, extra_files);
     Some(
         files
             .into_iter()
@@ -334,6 +344,10 @@ struct PhpTraitUses {
     traits: HashSet<String>,
     has_adaptation: bool,
     ambiguous: bool,
+    /// 本体直下に宣言された**具象**メソッド名 (folded)。PHP の解決順は
+    /// 「自クラス > trait > 親」のため、具象の同名宣言があると trait 側へは到達しない
+    /// (abstract 宣言は trait 実装で満たされるため含めない)。
+    declared_methods: HashSet<String>,
 }
 
 /// PHP の class/trait 本体直下にある trait `use` を owner 名ごとに収集する。
@@ -361,15 +375,36 @@ fn collect_php_trait_uses_from_node(
     source: &[u8],
     uses_by_owner: &mut HashMap<String, PhpTraitUses>,
 ) {
-    if matches!(node.kind(), "class_declaration" | "trait_declaration")
-        && let Some(owner) = node
-            .child_by_field_name("name")
-            .and_then(|name| php_node_key(name, source))
+    // enum (PHP 8.1+) も trait を use できるため収集対象に含める
+    // (name/body フィールドは class と同形)。
+    if matches!(
+        node.kind(),
+        "class_declaration" | "trait_declaration" | "enum_declaration"
+    ) && let Some(owner) = node
+        .child_by_field_name("name")
+        .and_then(|name| php_node_key(name, source))
         && let Some(body) = node.child_by_field_name("body")
     {
         let mut collected = PhpTraitUses::default();
         let mut body_cursor = body.walk();
         for declaration in body.named_children(&mut body_cursor) {
+            if declaration.kind() == "method_declaration" {
+                // 具象メソッドのみ収集 (abstract は trait 実装で満たされ shadow しない)。
+                let is_abstract = {
+                    let mut method_cursor = declaration.walk();
+                    declaration
+                        .named_children(&mut method_cursor)
+                        .any(|c| c.kind() == "abstract_modifier")
+                };
+                if !is_abstract
+                    && let Some(method_name) = declaration
+                        .child_by_field_name("name")
+                        .and_then(|name| php_node_key(name, source))
+                {
+                    collected.declared_methods.insert(method_name);
+                }
+                continue;
+            }
             if declaration.kind() != "use_declaration" {
                 continue;
             }
@@ -704,7 +739,7 @@ fn visit_php_node(
         return;
     }
 
-    let current_class_buf = php_class_context_for_node(node, source, owners, trait_uses);
+    let current_class_buf = php_class_context_for_node(node, source, owners, bare_key, trait_uses);
     let next_class = current_class_buf.as_deref().or(current_class);
 
     process_php_liveness_node(
@@ -726,6 +761,7 @@ fn php_class_context_for_node(
     node: tree_sitter::Node<'_>,
     source: &[u8],
     owners: &HashSet<String>,
+    bare_key: &str,
     trait_uses: &HashMap<String, PhpTraitUses>,
 ) -> Option<String> {
     if !is_php_type_declaration(node.kind()) {
@@ -735,7 +771,7 @@ fn php_class_context_for_node(
         .and_then(|name| php_node_key(name, source))
         .filter(|key| {
             !matches!(
-                php_resolve_trait_dispatch(key, owners, trait_uses),
+                php_resolve_trait_dispatch(key, bare_key, owners, trait_uses),
                 PhpOwnerResolution::Ignore
             )
         })
@@ -753,7 +789,15 @@ fn process_php_liveness_node(
     match node.kind() {
         "scoped_call_expression" => {
             if php_call_name_matches(node, source, bare_key) {
-                record_php_scoped_call(node, source, owners, current_class, trait_uses, analysis);
+                record_php_scoped_call(
+                    node,
+                    source,
+                    owners,
+                    bare_key,
+                    current_class,
+                    trait_uses,
+                    analysis,
+                );
             }
         }
         "member_call_expression" => {
@@ -776,11 +820,12 @@ fn record_php_scoped_call(
     node: tree_sitter::Node<'_>,
     source: &[u8],
     owners: &HashSet<String>,
+    bare_key: &str,
     current_class: Option<&str>,
     trait_uses: &HashMap<String, PhpTraitUses>,
     analysis: &mut PhpFileAnalysis,
 ) {
-    match php_scoped_call_owner(node, source, owners, current_class, trait_uses) {
+    match php_scoped_call_owner(node, source, owners, bare_key, current_class, trait_uses) {
         PhpOwnerResolution::Resolved(owner) => {
             *analysis.scoped_counts.entry(owner).or_default() += 1;
         }
@@ -799,6 +844,7 @@ fn php_scoped_call_owner(
     node: tree_sitter::Node<'_>,
     source: &[u8],
     owners: &HashSet<String>,
+    bare_key: &str,
     current_class: Option<&str>,
     trait_uses: &HashMap<String, PhpTraitUses>,
 ) -> PhpOwnerResolution {
@@ -818,18 +864,23 @@ fn php_scoped_call_owner(
             .unwrap_or(text),
     );
     match folded.as_str() {
-        "self" | "static" => current_class
-            .map(|owner| php_resolve_trait_dispatch(owner, owners, trait_uses))
+        "self" => current_class
+            .map(|owner| php_resolve_trait_dispatch(owner, bare_key, owners, trait_uses))
             .unwrap_or(PhpOwnerResolution::Ambiguous),
-        "parent" => PhpOwnerResolution::Ambiguous,
+        // `static::` は遅延静的束縛 (late static binding) でサブクラス override へ
+        // ディスパッチされ得る。継承グラフを持たない本解析では enclosing class へ
+        // 確定解決するとサブクラス側メソッドの dead 誤検出になるため `parent::` と
+        // 同じく Ambiguous に倒す (duplicate set 全体が旧スキップへフォールバック)。
+        "parent" | "static" => PhpOwnerResolution::Ambiguous,
         _ if owners.contains(&folded) => PhpOwnerResolution::Resolved(folded),
         _ if text.starts_with('$') => PhpOwnerResolution::Ambiguous,
-        _ => php_resolve_trait_dispatch(&folded, owners, trait_uses),
+        _ => php_resolve_trait_dispatch(&folded, bare_key, owners, trait_uses),
     }
 }
 
 fn php_resolve_trait_dispatch(
     dispatch_owner: &str,
+    bare_key: &str,
     owners: &HashSet<String>,
     trait_uses: &HashMap<String, PhpTraitUses>,
 ) -> PhpOwnerResolution {
@@ -838,6 +889,7 @@ fn php_resolve_trait_dispatch(
     let mut ambiguous = false;
     collect_php_trait_dispatch_targets(
         dispatch_owner,
+        bare_key,
         owners,
         trait_uses,
         &mut visiting,
@@ -855,6 +907,7 @@ fn php_resolve_trait_dispatch(
 
 fn collect_php_trait_dispatch_targets(
     dispatch_owner: &str,
+    bare_key: &str,
     owners: &HashSet<String>,
     trait_uses: &HashMap<String, PhpTraitUses>,
     visiting: &mut HashSet<String>,
@@ -868,6 +921,12 @@ fn collect_php_trait_dispatch_targets(
     let Some(composition) = trait_uses.get(dispatch_owner) else {
         return;
     };
+    // 合成先が同名の**具象**メソッドを自己宣言している場合、PHP の解決順
+    // (自クラス > trait) により trait 側へは到達しない。candidate へ辿らず打ち切る
+    // (自己宣言メソッドは candidate ではないため票は入らない = Ignore 方向)。
+    if composition.declared_methods.contains(bare_key) {
+        return;
+    }
     if !visiting.insert(dispatch_owner.to_string()) {
         *ambiguous = true;
         return;
@@ -877,7 +936,7 @@ fn collect_php_trait_dispatch_targets(
     }
     for trait_name in &composition.traits {
         collect_php_trait_dispatch_targets(
-            trait_name, owners, trait_uses, visiting, matching, ambiguous,
+            trait_name, bare_key, owners, trait_uses, visiting, matching, ambiguous,
         );
     }
     visiting.remove(dispatch_owner);

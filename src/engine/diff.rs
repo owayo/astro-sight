@@ -173,10 +173,25 @@ pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
                 &mut current_deleted_lines,
             );
             current_old_path = Some("/dev/null".to_string());
+        } else if line.starts_with("--- ") {
+            // 認識できない旧側ヘッダ (quotepath クォート `--- "a/..."` 等)。
+            // 直前ファイルの state を引きずると以降の hunk が誤帰属するため、
+            // flush して当該ファイルを解析対象から外す (fail-safe)。
+            flush_file(
+                &mut files,
+                &mut current_old_path,
+                &mut current_new_path,
+                &mut current_hunks,
+                &mut current_deleted_lines,
+            );
         } else if let Some(path) = line.strip_prefix("+++ b/") {
             current_new_path = Some(path.to_string());
         } else if line.starts_with("+++ /dev/null") {
             current_new_path = Some("/dev/null".to_string());
+        } else if line.starts_with("+++ ") {
+            // 認識できない新側ヘッダ。片側だけ認識できたペア (`--- a/x` + `+++ "b/..."`) を
+            // 別ファイルの hunk と合成しないよう、新側を未確定に戻す。
+            current_new_path = None;
         } else if line.starts_with("@@ ")
             && let Some(hunk) = parse_hunk_header(line)
         {
@@ -465,5 +480,66 @@ index 1234567..0000000
         let mut sorted: Vec<_> = changed.into_iter().collect();
         sorted.sort();
         assert_eq!(sorted, vec![1]);
+    }
+
+    /// quotepath 形式でクォートされた旧側ヘッダ (`--- "a/..."`) を直前ファイルへ合流させない。
+    /// 未 flush のまま後続の `+++ /dev/null` を拾うと直前ファイルの new_path が /dev/null に
+    /// 化け、削除 hunk まで誤帰属する (回帰防止)。
+    #[test]
+    fn parse_unified_diff_unrecognized_quoted_old_header_does_not_merge_into_previous_file() {
+        // ascii.rs の通常ブロックの後に、非 ASCII 名 (git quotepath) の削除ブロックが続く。
+        let diff = r#"--- a/ascii.rs
++++ b/ascii.rs
+@@ -1,1 +1,2 @@
+ existing
++added
+--- "a/\346\227\245\346\234\254\350\252\236.rs"
++++ /dev/null
+@@ -1,2 +0,0 @@
+-line1
+-line2
+"#;
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 1, "quotepath ブロックはファイル化されない");
+        assert_eq!(files[0].old_path, "ascii.rs");
+        assert_ne!(
+            files[0].new_path, "/dev/null",
+            "後続の +++ /dev/null が ascii.rs に合流しない"
+        );
+        assert_eq!(files[0].new_path, "ascii.rs");
+        assert_eq!(files[0].hunks.len(), 1, "hunk は ascii.rs 自身の 1 個だけ");
+        // 削除ブロックの hunk (old_count=2) ではなく ascii.rs 自身の hunk であること
+        assert_eq!(files[0].hunks[0].old_count, 1);
+        assert_eq!(files[0].hunks[0].new_count, 2);
+    }
+
+    /// 片側だけ認識できたペア (`--- a/x` + quotepath の `+++ "b/..."`、rename 風) は
+    /// files に現れず、後続の正常ブロックは通常どおり解析される。
+    #[test]
+    fn parse_unified_diff_unrecognized_quoted_new_header_drops_pair() {
+        let diff = r#"--- a/ascii.rs
++++ "b/\346\227\245\346\234\254\350\252\236.rs"
+@@ -1,1 +1,1 @@
+-old line
++new line
+--- a/other.rs
++++ b/other.rs
+@@ -1,1 +1,2 @@
+ keep
++added
+"#;
+        let files = parse_unified_diff(diff);
+        assert_eq!(
+            files.len(),
+            1,
+            "新側ヘッダを認識できないペアは files に現れない"
+        );
+        assert!(
+            files.iter().all(|f| f.old_path != "ascii.rs"),
+            "ascii.rs のブロックは別ファイルの hunk と合成されない"
+        );
+        assert_eq!(files[0].new_path, "other.rs");
+        assert_eq!(files[0].hunks.len(), 1);
+        assert_eq!(files[0].hunks[0].new_count, 2);
     }
 }

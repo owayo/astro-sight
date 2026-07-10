@@ -132,6 +132,17 @@ where
         let t = std::time::Instant::now();
         log_phase("context.assemble_no_cross", "start", 0);
         for change in assemble_without_cross_file(file_contexts, &included_symbols) {
+            // streaming 経路 (pass34) と同じ空 FileImpact スキップを適用する。
+            // 片側にしか無いと「全ファイルが候補ゼロ」の diff でだけ空エントリが出力され、
+            // 同一変更の出力有無が同居する他ファイルの内容に依存してしまう。
+            if change.affected_symbols.is_empty()
+                && change.impacted_callers.is_empty()
+                && change.signature_changes.is_empty()
+                && change.low_confidence_callers.is_empty()
+                && change.informational_callers.is_empty()
+            {
+                continue;
+            }
             on_file_impact(change)?;
         }
         log_phase("context.assemble_no_cross", "end", t.elapsed().as_millis());

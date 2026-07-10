@@ -50,8 +50,17 @@ pub fn resolve_blame_source_files(
         }
         let base_rev = base.unwrap_or("HEAD~1");
         validate_git_revision(base_rev, "base")?;
+        // core.quotepath=off: 非 ASCII ファイル名の 8 進クォート (`"\346..."`) を無効化し、
+        // 後段のパス照合・blame pathspec が生の UTF-8 名で一致するようにする。
         let output = std::process::Command::new("git")
-            .args(["diff", "--name-only", base_rev, "HEAD"])
+            .args([
+                "-c",
+                "core.quotepath=off",
+                "diff",
+                "--name-only",
+                base_rev,
+                "HEAD",
+            ])
             .current_dir(dir)
             .output()
             .map_err(|e| {
@@ -180,7 +189,14 @@ pub fn run_git_diff(dir: &str, base: &str, staged: bool) -> Result<String> {
     // git config `diff.renames` がユーザー環境で無効化されていても rename を検出できるよう、
     // 明示的に `--find-renames` を指定する。ファイル rename が api.rm/api.add の誤発報源に
     // なるため、astro-sight 側で強制しておく。
-    let mut args = vec!["diff".to_string(), "--find-renames".to_string()];
+    // core.quotepath=off: 非 ASCII ファイル名が 8 進クォート (`--- "a/\346..."`) で出力されると
+    // parse_unified_diff がヘッダを認識できず、hunk が直前ファイルへ誤帰属する。
+    let mut args = vec![
+        "-c".to_string(),
+        "core.quotepath=off".to_string(),
+        "diff".to_string(),
+        "--find-renames".to_string(),
+    ];
     if staged {
         args.push("--cached".to_string());
     }
