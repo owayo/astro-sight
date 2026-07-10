@@ -8763,6 +8763,128 @@ class FixtureControllerTest {
     }
 }
 
+#[test]
+fn dead_code_php_trait_methods_called_via_using_classes_are_live() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("QueryA.php"),
+        "<?php\ntrait QueryA { public static function findByAccount(): void {} }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("QueryB.php"),
+        "<?php\ntrait QueryB { public static function findByAccount(): void {} }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("RepositoryA.php"),
+        "<?php\nclass RepositoryA { use QueryA; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("RepositoryB.php"),
+        "<?php\nclass RepositoryB { use QueryB; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Caller.php"),
+        "<?php\nRepositoryA::findByAccount();\nRepositoryB::findByAccount();\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|symbol| symbol["name"].as_str())
+        .collect();
+
+    assert!(
+        !names.contains(&"QueryA.findByAccount") && !names.contains(&"QueryB.findByAccount"),
+        "trait use先クラス経由の静的呼び出しはtraitメソッドをliveにするべき: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_php_trait_method_adaptation_remains_ambiguous() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("Traits.php"),
+        "<?php\ntrait QueryA { public static function work(): void {} }\n\
+trait QueryB { public static function work(): void {} }\n\
+class Repository {\n\
+    use QueryA, QueryB { QueryA::work insteadof QueryB; }\n\
+}\n\
+Repository::work();\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|symbol| symbol["name"].as_str())
+        .collect();
+
+    assert!(
+        !names.contains(&"QueryA.work") && !names.contains(&"QueryB.work"),
+        "adaptation付き複数trait dispatchは安全に一意化せずdead判定をskipするべき: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_php_nested_trait_static_dispatch_is_live() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("Nested.php"),
+        "<?php\ntrait QueryA { public static function work(): void {} }\n\
+trait QueryB { public static function work(): void {} }\n\
+trait RepositoryBehaviorA { use QueryA; }\n\
+trait RepositoryBehaviorB { use QueryB; }\n\
+class RepositoryA { use RepositoryBehaviorA; }\n\
+class RepositoryB { use RepositoryBehaviorB; }\n\
+RepositoryA::work();\n\
+RepositoryB::work();\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|symbol| symbol["name"].as_str())
+        .collect();
+
+    assert!(
+        !names.contains(&"QueryA.work") && !names.contains(&"QueryB.work"),
+        "nested trait use経由の一意な静的dispatchもliveにするべき: {names:?}"
+    );
+}
+
 /// GitLab issue #7 補助テスト: `refs --name` で PHP の `ClassName::method()` 形式の
 /// cross-file 呼び出しが `kind: "ref"` として返ることを確認する。
 /// dead-code の usage 集計はこの refs 経路 (count_non_definition_refs_split → count_refs_in_file)

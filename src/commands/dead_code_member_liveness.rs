@@ -218,13 +218,20 @@ impl PhpMemberLiveness {
         let Some(php_files) = collect_php_files(canonical_dir) else {
             return Self { statuses };
         };
+        let trait_uses = collect_php_trait_uses(&php_files);
 
         for (bare_key, members) in &bare_to_members {
             let owners: HashSet<String> = members.iter().map(|m| php_fold_name(&m.owner)).collect();
             if owners.len() < 2 {
                 continue;
             }
-            let analysis = analyze_php_duplicate_set(bare_key, &owners, &php_files, &is_test_path);
+            let analysis = analyze_php_duplicate_set(
+                bare_key,
+                &owners,
+                &php_files,
+                &trait_uses,
+                &is_test_path,
+            );
 
             match analysis {
                 DuplicateSetResult::Ambiguous => {
@@ -320,6 +327,87 @@ fn collect_php_files(canonical_dir: &Path) -> Option<Vec<std::path::PathBuf>> {
             })
             .collect(),
     )
+}
+
+#[derive(Default)]
+struct PhpTraitUses {
+    traits: HashSet<String>,
+    has_adaptation: bool,
+    ambiguous: bool,
+}
+
+/// PHP の class/trait 本体直下にある trait `use` を owner 名ごとに収集する。
+/// 同名 owner の複数宣言や parse 不能な use は dispatch 先を一意に決められないため、
+/// 後段で `Ambiguous` に倒す情報として保持する。
+fn collect_php_trait_uses(files: &[std::path::PathBuf]) -> HashMap<String, PhpTraitUses> {
+    let mut uses_by_owner = HashMap::new();
+    for file_path in files {
+        let Some(path) = file_path.to_str() else {
+            continue;
+        };
+        let Ok(source) = parser::read_file(camino::Utf8Path::new(path)) else {
+            continue;
+        };
+        let Ok(tree) = parser::parse_source(&source, LangId::Php) else {
+            continue;
+        };
+        collect_php_trait_uses_from_node(tree.root_node(), source.as_bytes(), &mut uses_by_owner);
+    }
+    uses_by_owner
+}
+
+fn collect_php_trait_uses_from_node(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    uses_by_owner: &mut HashMap<String, PhpTraitUses>,
+) {
+    if matches!(node.kind(), "class_declaration" | "trait_declaration")
+        && let Some(owner) = node
+            .child_by_field_name("name")
+            .and_then(|name| php_node_key(name, source))
+        && let Some(body) = node.child_by_field_name("body")
+    {
+        let mut collected = PhpTraitUses::default();
+        let mut body_cursor = body.walk();
+        for declaration in body.named_children(&mut body_cursor) {
+            if declaration.kind() != "use_declaration" {
+                continue;
+            }
+            let mut use_cursor = declaration.walk();
+            for child in declaration.named_children(&mut use_cursor) {
+                match child.kind() {
+                    "name" | "qualified_name" => {
+                        if let Some(trait_name) = php_node_key(child, source) {
+                            collected.traits.insert(trait_name);
+                        } else {
+                            collected.ambiguous = true;
+                        }
+                    }
+                    "use_list" => collected.has_adaptation = true,
+                    _ => collected.ambiguous = true,
+                }
+            }
+        }
+        if !collected.traits.is_empty() || collected.has_adaptation || collected.ambiguous {
+            use std::collections::hash_map::Entry;
+            match uses_by_owner.entry(owner) {
+                Entry::Vacant(entry) => {
+                    entry.insert(collected);
+                }
+                Entry::Occupied(mut entry) => {
+                    let existing = entry.get_mut();
+                    existing.traits.extend(collected.traits);
+                    existing.has_adaptation |= collected.has_adaptation;
+                    existing.ambiguous = true;
+                }
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_php_trait_uses_from_node(child, source, uses_by_owner);
+    }
 }
 
 struct MemberCandidate {
@@ -543,6 +631,7 @@ fn analyze_php_duplicate_set<F>(
     bare_key: &str,
     owners: &HashSet<String>,
     files: &[std::path::PathBuf],
+    trait_uses: &HashMap<String, PhpTraitUses>,
     is_test_path: F,
 ) -> DuplicateSetResult
 where
@@ -573,6 +662,7 @@ where
             owners,
             bare_key,
             None,
+            trait_uses,
             &mut analysis,
         );
         if analysis.ambiguous {
@@ -607,20 +697,25 @@ fn visit_php_node(
     owners: &HashSet<String>,
     bare_key: &str,
     current_class: Option<&str>,
+    trait_uses: &HashMap<String, PhpTraitUses>,
     analysis: &mut PhpFileAnalysis,
 ) {
     if analysis.ambiguous {
         return;
     }
 
-    let current_class_buf = php_class_context_for_node(node, source, owners);
+    let current_class_buf = php_class_context_for_node(node, source, owners, trait_uses);
     let next_class = current_class_buf.as_deref().or(current_class);
 
-    process_php_liveness_node(node, source, owners, bare_key, next_class, analysis);
+    process_php_liveness_node(
+        node, source, owners, bare_key, next_class, trait_uses, analysis,
+    );
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        visit_php_node(child, source, owners, bare_key, next_class, analysis);
+        visit_php_node(
+            child, source, owners, bare_key, next_class, trait_uses, analysis,
+        );
         if analysis.ambiguous {
             break;
         }
@@ -631,13 +726,19 @@ fn php_class_context_for_node(
     node: tree_sitter::Node<'_>,
     source: &[u8],
     owners: &HashSet<String>,
+    trait_uses: &HashMap<String, PhpTraitUses>,
 ) -> Option<String> {
     if !is_php_type_declaration(node.kind()) {
         return None;
     }
     node.child_by_field_name("name")
         .and_then(|name| php_node_key(name, source))
-        .filter(|key| owners.contains(key))
+        .filter(|key| {
+            !matches!(
+                php_resolve_trait_dispatch(key, owners, trait_uses),
+                PhpOwnerResolution::Ignore
+            )
+        })
 }
 
 fn process_php_liveness_node(
@@ -646,12 +747,13 @@ fn process_php_liveness_node(
     owners: &HashSet<String>,
     bare_key: &str,
     current_class: Option<&str>,
+    trait_uses: &HashMap<String, PhpTraitUses>,
     analysis: &mut PhpFileAnalysis,
 ) {
     match node.kind() {
         "scoped_call_expression" => {
             if php_call_name_matches(node, source, bare_key) {
-                record_php_scoped_call(node, source, owners, current_class, analysis);
+                record_php_scoped_call(node, source, owners, current_class, trait_uses, analysis);
             }
         }
         "member_call_expression" => {
@@ -675,9 +777,10 @@ fn record_php_scoped_call(
     source: &[u8],
     owners: &HashSet<String>,
     current_class: Option<&str>,
+    trait_uses: &HashMap<String, PhpTraitUses>,
     analysis: &mut PhpFileAnalysis,
 ) {
-    match php_scoped_call_owner(node, source, owners, current_class) {
+    match php_scoped_call_owner(node, source, owners, current_class, trait_uses) {
         PhpOwnerResolution::Resolved(owner) => {
             *analysis.scoped_counts.entry(owner).or_default() += 1;
         }
@@ -697,6 +800,7 @@ fn php_scoped_call_owner(
     source: &[u8],
     owners: &HashSet<String>,
     current_class: Option<&str>,
+    trait_uses: &HashMap<String, PhpTraitUses>,
 ) -> PhpOwnerResolution {
     let Some(scope) = node
         .child_by_field_name("scope")
@@ -715,13 +819,68 @@ fn php_scoped_call_owner(
     );
     match folded.as_str() {
         "self" | "static" => current_class
-            .map(|owner| PhpOwnerResolution::Resolved(owner.to_string()))
+            .map(|owner| php_resolve_trait_dispatch(owner, owners, trait_uses))
             .unwrap_or(PhpOwnerResolution::Ambiguous),
         "parent" => PhpOwnerResolution::Ambiguous,
         _ if owners.contains(&folded) => PhpOwnerResolution::Resolved(folded),
         _ if text.starts_with('$') => PhpOwnerResolution::Ambiguous,
-        _ => PhpOwnerResolution::Ignore,
+        _ => php_resolve_trait_dispatch(&folded, owners, trait_uses),
     }
+}
+
+fn php_resolve_trait_dispatch(
+    dispatch_owner: &str,
+    owners: &HashSet<String>,
+    trait_uses: &HashMap<String, PhpTraitUses>,
+) -> PhpOwnerResolution {
+    let mut visiting = HashSet::new();
+    let mut matching = HashSet::new();
+    let mut ambiguous = false;
+    collect_php_trait_dispatch_targets(
+        dispatch_owner,
+        owners,
+        trait_uses,
+        &mut visiting,
+        &mut matching,
+        &mut ambiguous,
+    );
+    if matching.is_empty() {
+        return PhpOwnerResolution::Ignore;
+    }
+    if ambiguous || matching.len() != 1 {
+        return PhpOwnerResolution::Ambiguous;
+    }
+    PhpOwnerResolution::Resolved(matching.into_iter().next().unwrap())
+}
+
+fn collect_php_trait_dispatch_targets(
+    dispatch_owner: &str,
+    owners: &HashSet<String>,
+    trait_uses: &HashMap<String, PhpTraitUses>,
+    visiting: &mut HashSet<String>,
+    matching: &mut HashSet<String>,
+    ambiguous: &mut bool,
+) {
+    if owners.contains(dispatch_owner) {
+        matching.insert(dispatch_owner.to_string());
+        return;
+    }
+    let Some(composition) = trait_uses.get(dispatch_owner) else {
+        return;
+    };
+    if !visiting.insert(dispatch_owner.to_string()) {
+        *ambiguous = true;
+        return;
+    }
+    if composition.has_adaptation || composition.ambiguous {
+        *ambiguous = true;
+    }
+    for trait_name in &composition.traits {
+        collect_php_trait_dispatch_targets(
+            trait_name, owners, trait_uses, visiting, matching, ambiguous,
+        );
+    }
+    visiting.remove(dispatch_owner);
 }
 
 fn php_call_name_matches(node: tree_sitter::Node<'_>, source: &[u8], bare_key: &str) -> bool {
