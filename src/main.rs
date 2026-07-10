@@ -208,43 +208,45 @@ fn resolve_paths(
 // ---------------------------------------------------------------------------
 // Dispatcher
 // ---------------------------------------------------------------------------
-
-fn run(cli: Cli) -> Result<()> {
-    let pretty = cli.pretty;
-
-    // config を読まずに完結する早期終了コマンドを config ロードより前に処理する。
-    // init / skill-install は既存 config を必要としないため、既存 config が壊れて
-    // いても動作すべき（特に init は壊れた config の再生成手段になる）。
-    match &cli.command {
+fn handle_early_command(command: &Commands) -> Result<bool> {
+    match command {
         Commands::Init { path } => {
-            let config_path = if let Some(p) = path {
-                ConfigService::generate_at(p)?;
-                p.clone()
+            let config_path = if let Some(path) = path {
+                ConfigService::generate_at(path)?;
+                path.clone()
             } else {
                 ConfigService::generate_default()?;
                 ConfigService::default_path()
             };
             eprintln!("Configuration file created at: {}", config_path.display());
-            return Ok(());
+            Ok(true)
         }
         Commands::SkillInstall { target } => {
             astro_sight::skill::install(target)?;
-            return Ok(());
+            Ok(true)
         }
-        _ => {}
+        _ => Ok(false),
     }
+}
 
-    // 設定をロードする
+fn initialize_logging(cli: &Cli) -> Result<()> {
     let config = ConfigService::load(cli.config.as_deref())?;
-
-    // debug モード時（CLI フラグまたは config）のみロギングを初期化する。
-    // 書込不可ディレクトリ等でログ初期化に失敗しても解析本体は止めず、
-    // 警告を出して続行する（debug 有効かつ読み取り専用環境などへの堅牢化）。
     if (cli.debug || config.debug)
-        && let Err(e) = astro_sight::logger::init(&config)
+        && let Err(error) = astro_sight::logger::init(&config)
     {
-        eprintln!("warning: failed to initialize logging (continuing without it): {e}");
+        eprintln!("warning: failed to initialize logging (continuing without it): {error}");
     }
+    Ok(())
+}
+
+fn run(cli: Cli) -> Result<()> {
+    let pretty = cli.pretty;
+
+    if handle_early_command(&cli.command)? {
+        return Ok(());
+    }
+
+    initialize_logging(&cli)?;
 
     // Log command invocation with CWD and input parameters
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -257,7 +259,19 @@ fn run(cli: Cli) -> Result<()> {
     let service = AppService::new();
     let start = std::time::Instant::now();
 
-    let result = match cli.command {
+    let result = dispatch_command(&service, cli.command, pretty);
+
+    let elapsed = start.elapsed();
+    info!(
+        elapsed_ms = elapsed.as_millis() as u64,
+        "⏱️ command finished"
+    );
+
+    result
+}
+
+fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Result<()> {
+    match command {
         Commands::Ast {
             path,
             paths,
@@ -286,9 +300,9 @@ fn run(cli: Cli) -> Result<()> {
                         no_cache,
                         pretty,
                     };
-                    cmd_ast(&service, &opts)
+                    cmd_ast(service, &opts)
                 }
-                PathInput::Batch(ps) => batch_ast(&service, &ps, depth, context, full),
+                PathInput::Batch(ps) => batch_ast(service, &ps, depth, context, full),
             }
         }
         Commands::Symbols {
@@ -303,13 +317,13 @@ fn run(cli: Cli) -> Result<()> {
             no_cache,
         } => {
             if let Some(d) = &dir {
-                cmd_symbols_dir(&service, d, glob.as_deref(), doc, full)
+                cmd_symbols_dir(service, d, glob.as_deref(), doc, full)
             } else {
                 let input =
                     resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
                 match input {
-                    PathInput::Single(p) => cmd_symbols(&service, &p, no_cache, pretty, doc, full),
-                    PathInput::Batch(ps) => batch_symbols(&service, &ps, doc, full, None),
+                    PathInput::Single(p) => cmd_symbols(service, &p, no_cache, pretty, doc, full),
+                    PathInput::Batch(ps) => batch_symbols(service, &ps, doc, full, None),
                 }
             }
         }
@@ -321,8 +335,8 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             let input = resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
             match input {
-                PathInput::Single(p) => cmd_calls(&service, &p, function.as_deref(), pretty),
-                PathInput::Batch(ps) => batch_calls(&service, &ps, function.as_deref()),
+                PathInput::Single(p) => cmd_calls(service, &p, function.as_deref(), pretty),
+                PathInput::Batch(ps) => batch_calls(service, &ps, function.as_deref()),
             }
         }
         Commands::Imports {
@@ -332,8 +346,8 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             let input = resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
             match input {
-                PathInput::Single(p) => cmd_imports(&service, &p, pretty),
-                PathInput::Batch(ps) => batch_imports(&service, &ps),
+                PathInput::Single(p) => cmd_imports(service, &p, pretty),
+                PathInput::Batch(ps) => batch_imports(service, &ps),
             }
         }
         Commands::Lint {
@@ -357,8 +371,8 @@ fn run(cli: Cli) -> Result<()> {
 
             let input = resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
             match input {
-                PathInput::Single(p) => cmd_lint(&service, &p, &loaded_rules, pretty),
-                PathInput::Batch(ps) => batch_lint(&service, &ps, &loaded_rules),
+                PathInput::Single(p) => cmd_lint(service, &p, &loaded_rules, pretty),
+                PathInput::Batch(ps) => batch_lint(service, &ps, &loaded_rules),
             }
         }
         Commands::Sequence {
@@ -369,8 +383,8 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             let input = resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
             match input {
-                PathInput::Single(p) => cmd_sequence(&service, &p, function.as_deref(), pretty),
-                PathInput::Batch(ps) => batch_sequence(&service, &ps, function.as_deref()),
+                PathInput::Single(p) => cmd_sequence(service, &p, function.as_deref(), pretty),
+                PathInput::Batch(ps) => batch_sequence(service, &ps, function.as_deref()),
             }
         }
         Commands::Refs {
@@ -379,8 +393,8 @@ fn run(cli: Cli) -> Result<()> {
             dir,
             glob,
         } => match resolve_names(name.as_deref(), names.as_deref())? {
-            NameInput::Single(n) => cmd_refs(&service, &n, &dir, glob.as_deref(), pretty),
-            NameInput::Batch(ns) => cmd_refs_batch(&service, &ns, &dir, glob.as_deref()),
+            NameInput::Single(n) => cmd_refs(service, &n, &dir, glob.as_deref(), pretty),
+            NameInput::Batch(ns) => cmd_refs_batch(service, &ns, &dir, glob.as_deref()),
         },
         Commands::Review {
             dir,
@@ -406,7 +420,7 @@ fn run(cli: Cli) -> Result<()> {
                 astro_sight::cli::DeadScope::All
             });
             cmd_review(
-                &service,
+                service,
                 &dir,
                 diff.as_deref(),
                 diff_file.as_deref(),
@@ -494,7 +508,7 @@ fn run(cli: Cli) -> Result<()> {
                 per_source_limit,
                 author_unit_window_days,
             };
-            cmd_cochange(&service, &dir, &opts, pretty, cochange_skip)
+            cmd_cochange(service, &dir, &opts, pretty, cochange_skip)
         }
         Commands::Context {
             dir,
@@ -506,7 +520,7 @@ fn run(cli: Cli) -> Result<()> {
             exclude_dirs,
             exclude_globs,
         } => cmd_context(
-            &service,
+            service,
             &dir,
             diff.as_deref(),
             diff_file.as_deref(),
@@ -526,7 +540,7 @@ fn run(cli: Cli) -> Result<()> {
             exclude_dirs,
             exclude_globs,
         } => cmd_impact(
-            &service,
+            service,
             &dir,
             git,
             &base,
@@ -571,13 +585,5 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Session => cmd_session(),
         Commands::Mcp => cmd_mcp(),
         Commands::Init { .. } | Commands::SkillInstall { .. } => unreachable!("handled above"),
-    };
-
-    let elapsed = start.elapsed();
-    info!(
-        elapsed_ms = elapsed.as_millis() as u64,
-        "⏱️ command finished"
-    );
-
-    result
+    }
 }

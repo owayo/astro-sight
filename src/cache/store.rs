@@ -59,7 +59,10 @@ impl CacheStore {
             std::process::id(),
             TMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::write(&tmp_path, data)?;
+        if let Err(error) = fs::write(&tmp_path, data) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(error.into());
+        }
         if let Err(e) = fs::rename(&tmp_path, &path) {
             let _ = fs::remove_file(&tmp_path);
             return Err(e.into());

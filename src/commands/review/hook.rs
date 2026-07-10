@@ -1,6 +1,7 @@
 use anyhow::Result;
+use serde::Serialize;
 
-use crate::models::review::ReviewResult;
+use crate::models::review::{ApiChanges, ReviewResult};
 
 /// `--hook` の出力判定結果。
 /// - `value`: stderr に書き出す JSON (何もなければ None)
@@ -11,17 +12,179 @@ pub(crate) struct HookJsonBuild {
     pub is_blocking: bool,
 }
 
+#[derive(Default)]
+struct HookImpactGroup {
+    changed_symbols: std::collections::BTreeSet<String>,
+    refs: Vec<(String, usize, Vec<String>)>,
+}
+
+#[derive(Serialize)]
+struct HookImpactRef<'a> {
+    p: &'a str,
+    ln: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    s: Option<&'a [String]>,
+}
+
+#[derive(Serialize)]
+struct HookImpact<'a> {
+    src: &'a str,
+    syms: Vec<&'a String>,
+    refs: Vec<HookImpactRef<'a>>,
+}
+
+#[derive(Serialize)]
+struct HookNameFile<'a> {
+    n: &'a str,
+    f: &'a str,
+}
+
+#[derive(Serialize)]
+struct HookCompatibleModification<'a> {
+    n: &'a str,
+    f: &'a str,
+    reason: &'a str,
+}
+
+#[derive(Serialize)]
+struct HookMovedSymbol<'a> {
+    n: &'a str,
+    from: &'a str,
+    to: &'a str,
+}
+
+#[derive(Serialize)]
+struct HookCochange<'a> {
+    f: &'a str,
+    w: &'a str,
+    c: u32,
+}
+
+#[derive(Serialize)]
+struct HookApi<'a> {
+    #[serde(rename = "add", skip_serializing_if = "Vec::is_empty")]
+    added: Vec<HookNameFile<'a>>,
+    #[serde(rename = "rm", skip_serializing_if = "Vec::is_empty")]
+    removed: Vec<HookNameFile<'a>>,
+    #[serde(rename = "mod", skip_serializing_if = "Vec::is_empty")]
+    modified: Vec<HookNameFile<'a>>,
+    #[serde(rename = "mod_closed", skip_serializing_if = "Vec::is_empty")]
+    modified_closed_in_diff: Vec<HookNameFile<'a>>,
+    #[serde(rename = "const_value", skip_serializing_if = "Vec::is_empty")]
+    const_value_changes: Vec<HookNameFile<'a>>,
+    #[serde(rename = "mod_compat", skip_serializing_if = "Vec::is_empty")]
+    compatible_modified: Vec<HookCompatibleModification<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    moved: Vec<HookMovedSymbol<'a>>,
+    #[serde(rename = "rm_dead", skip_serializing_if = "Vec::is_empty")]
+    removed_dead: Vec<HookNameFile<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    property_to_field: Vec<HookNameFile<'a>>,
+}
+
+impl<'a> HookApi<'a> {
+    fn from_api_changes(api: &'a ApiChanges) -> Self {
+        let name_file = |name: &'a String, file: &'a String| HookNameFile {
+            n: name.as_str(),
+            f: file.as_str(),
+        };
+        Self {
+            added: api
+                .added
+                .iter()
+                .map(|change| name_file(&change.name, &change.file))
+                .collect(),
+            removed: api
+                .removed
+                .iter()
+                .map(|change| name_file(&change.name, &change.file))
+                .collect(),
+            modified: api
+                .modified
+                .iter()
+                .map(|change| name_file(&change.name, &change.file))
+                .collect(),
+            modified_closed_in_diff: api
+                .modified_closed_in_diff
+                .iter()
+                .map(|change| name_file(&change.name, &change.file))
+                .collect(),
+            const_value_changes: api
+                .const_value_changes
+                .iter()
+                .map(|change| name_file(&change.name, &change.file))
+                .collect(),
+            compatible_modified: api
+                .compatible_modified
+                .iter()
+                .map(|change| HookCompatibleModification {
+                    n: change.name.as_str(),
+                    f: change.file.as_str(),
+                    reason: change.reason.as_str(),
+                })
+                .collect(),
+            moved: api
+                .moved
+                .iter()
+                .map(|change| HookMovedSymbol {
+                    n: change.name.as_str(),
+                    from: change.from.as_str(),
+                    to: change.to.as_str(),
+                })
+                .collect(),
+            removed_dead: api
+                .removed_dead
+                .iter()
+                .map(|change| name_file(&change.name, &change.file))
+                .collect(),
+            property_to_field: api
+                .property_to_field
+                .iter()
+                .map(|change| name_file(&change.name, &change.file))
+                .collect(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.added.is_empty()
+            && self.removed.is_empty()
+            && self.modified.is_empty()
+            && self.modified_closed_in_diff.is_empty()
+            && self.const_value_changes.is_empty()
+            && self.compatible_modified.is_empty()
+            && self.moved.is_empty()
+            && self.removed_dead.is_empty()
+            && self.property_to_field.is_empty()
+    }
+}
+
+fn impact_groups_value(
+    groups: &std::collections::BTreeMap<String, HookImpactGroup>,
+) -> serde_json::Value {
+    let impacts: Vec<HookImpact<'_>> = groups
+        .iter()
+        .map(|(changed_path, group)| HookImpact {
+            src: changed_path,
+            syms: group.changed_symbols.iter().collect(),
+            refs: group
+                .refs
+                .iter()
+                .map(|(path, line, symbols)| HookImpactRef {
+                    p: path,
+                    ln: *line,
+                    s: (!symbols.is_empty()).then_some(symbols.as_slice()),
+                })
+                .collect(),
+        })
+        .collect();
+    serde_json::to_value(impacts).expect("hook impact DTO should serialize")
+}
+
 pub(crate) fn build_review_hook_json(
     result: &ReviewResult,
     dir: &str,
     strict_const_values: bool,
 ) -> HookJsonBuild {
-    #[derive(Default)]
-    struct HookImpactGroup {
-        changed_symbols: std::collections::BTreeSet<String>,
-        refs: Vec<(String, usize, Vec<String>)>,
-    }
-
     // api 側で「互換 / 追随済み / 値のみ変更」と判定済みの modified 系シンボルは、
     // Stop hook の impact でも informational として扱う。ここを揃えないと api.mod_compat
     // 自体は非 blocking なのに、同じシンボルの参照一覧が impacts として blocking になる。
@@ -199,102 +362,35 @@ pub(crate) fn build_review_hook_json(
     if !unresolved.is_empty() {
         has_blocking_issues = true;
         has_any_output = true;
-        let impacts: Vec<serde_json::Value> = unresolved
-            .iter()
-            .map(|(changed_path, group)| {
-                let refs: Vec<serde_json::Value> = group
-                    .refs
-                    .iter()
-                    .map(|(p, ln, s)| {
-                        let mut r = serde_json::Map::new();
-                        r.insert("p".into(), serde_json::Value::String(p.clone()));
-                        r.insert("ln".into(), serde_json::json!(*ln));
-                        if !s.is_empty() {
-                            r.insert(
-                                "s".into(),
-                                serde_json::Value::Array(
-                                    s.iter()
-                                        .map(|v| serde_json::Value::String(v.clone()))
-                                        .collect(),
-                                ),
-                            );
-                        }
-                        serde_json::Value::Object(r)
-                    })
-                    .collect();
-                serde_json::json!({
-                    "src": changed_path,
-                    "syms": group.changed_symbols.iter().collect::<Vec<_>>(),
-                    "refs": refs,
-                })
-            })
-            .collect();
-        hook_obj.insert("impacts".into(), serde_json::Value::Array(impacts));
+        hook_obj.insert("impacts".into(), impact_groups_value(&unresolved));
     }
 
     // impact_info: import-only など blocking しない低信号 impact。`impacts` と分ける。
     if !informational.is_empty() {
         has_any_output = true;
-        let impacts: Vec<serde_json::Value> = informational
-            .iter()
-            .map(|(changed_path, group)| {
-                let refs: Vec<serde_json::Value> = group
-                    .refs
-                    .iter()
-                    .map(|(p, ln, s)| {
-                        let mut r = serde_json::Map::new();
-                        r.insert("p".into(), serde_json::Value::String(p.clone()));
-                        r.insert("ln".into(), serde_json::json!(*ln));
-                        if !s.is_empty() {
-                            r.insert(
-                                "s".into(),
-                                serde_json::Value::Array(
-                                    s.iter()
-                                        .map(|v| serde_json::Value::String(v.clone()))
-                                        .collect(),
-                                ),
-                            );
-                        }
-                        serde_json::Value::Object(r)
-                    })
-                    .collect();
-                serde_json::json!({
-                    "src": changed_path,
-                    "syms": group.changed_symbols.iter().collect::<Vec<_>>(),
-                    "refs": refs,
-                })
-            })
-            .collect();
-        hook_obj.insert("impact_info".into(), serde_json::Value::Array(impacts));
+        hook_obj.insert("impact_info".into(), impact_groups_value(&informational));
     }
 
     // cochange: [{f,w,c}] — 情報提供のみ。is_blocking にはしない
     if !result.missing_cochanges.is_empty() {
         has_any_output = true;
-        let cochanges: Vec<serde_json::Value> = result
+        let cochanges: Vec<HookCochange<'_>> = result
             .missing_cochanges
             .iter()
-            .map(|mc| {
-                serde_json::json!({
-                    "f": mc.file,
-                    "w": mc.expected_with,
-                    "c": (mc.confidence * 100.0).round() as u32,
-                })
+            .map(|cochange| HookCochange {
+                f: cochange.file.as_str(),
+                w: cochange.expected_with.as_str(),
+                c: (cochange.confidence * 100.0).round() as u32,
             })
             .collect();
-        hook_obj.insert("cochange".into(), serde_json::Value::Array(cochanges));
+        hook_obj.insert(
+            "cochange".into(),
+            serde_json::to_value(cochanges).expect("hook cochange DTO should serialize"),
+        );
     }
 
     // api: {add,rm,mod,moved,property_to_field,rm_dead,const_value} — 空でないセクションのみ
-    let has_api_changes = !result.api_changes.added.is_empty()
-        || !result.api_changes.removed.is_empty()
-        || !result.api_changes.modified.is_empty()
-        || !result.api_changes.moved.is_empty()
-        || !result.api_changes.property_to_field.is_empty()
-        || !result.api_changes.removed_dead.is_empty()
-        || !result.api_changes.modified_closed_in_diff.is_empty()
-        || !result.api_changes.const_value_changes.is_empty()
-        || !result.api_changes.compatible_modified.is_empty();
+    let api = HookApi::from_api_changes(&result.api_changes);
     // api.added / api.moved / api.property_to_field / api.removed_dead / api.const_value は
     // 破壊的変更ではないため Stop hook のブロッキング対象から外し informational 扱いにする。
     // api.removed / api.modified は破壊的変更の可能性があるため従来どおり blocking。
@@ -302,155 +398,33 @@ pub(crate) fn build_review_hook_json(
     let has_api_breaking = !result.api_changes.removed.is_empty()
         || !result.api_changes.modified.is_empty()
         || (strict_const_values && !result.api_changes.const_value_changes.is_empty());
-    if has_api_changes {
+    if !api.is_empty() {
         if has_api_breaking {
             has_blocking_issues = true;
         }
         has_any_output = true;
-        let mut api = serde_json::Map::new();
-        if !result.api_changes.added.is_empty() {
-            api.insert(
-                "add".into(),
-                serde_json::Value::Array(
-                    result
-                        .api_changes
-                        .added
-                        .iter()
-                        .map(|s| serde_json::json!({"n": s.name, "f": s.file}))
-                        .collect(),
-                ),
-            );
-        }
-        if !result.api_changes.removed.is_empty() {
-            api.insert(
-                "rm".into(),
-                serde_json::Value::Array(
-                    result
-                        .api_changes
-                        .removed
-                        .iter()
-                        .map(|s| serde_json::json!({"n": s.name, "f": s.file}))
-                        .collect(),
-                ),
-            );
-        }
-        if !result.api_changes.modified.is_empty() {
-            api.insert(
-                "mod".into(),
-                serde_json::Value::Array(
-                    result
-                        .api_changes
-                        .modified
-                        .iter()
-                        .map(|m| serde_json::json!({"n": m.name, "f": m.file}))
-                        .collect(),
-                ),
-            );
-        }
-        // mod_closed: 全 cross-file 参照が同一 diff 内で追随済みの api.mod。informational
-        // (has_api_breaking に含めないため stop hook をブロックしない)。
-        if !result.api_changes.modified_closed_in_diff.is_empty() {
-            api.insert(
-                "mod_closed".into(),
-                serde_json::Value::Array(
-                    result
-                        .api_changes
-                        .modified_closed_in_diff
-                        .iter()
-                        .map(|m| serde_json::json!({"n": m.name, "f": m.file}))
-                        .collect(),
-                ),
-            );
-        }
-        // const_value: const / 非 mut static / export const の値のみ変更。shape (名前・型・
-        // visibility) は不変でコンパイル互換性を壊さないため informational
-        // (デフォルト非 blocking、`--strict-public-const-values` 指定時のみ blocking 昇格)。
-        if !result.api_changes.const_value_changes.is_empty() {
-            api.insert(
-                "const_value".into(),
-                serde_json::Value::Array(
-                    result
-                        .api_changes
-                        .const_value_changes
-                        .iter()
-                        .map(|m| serde_json::json!({"n": m.name, "f": m.file}))
-                        .collect(),
-                ),
-            );
-        }
-        // mod_compat: signature 文字列は変わったが公開契約が維持される互換 api.mod
-        // (React HOC ラップ / 未参照プロパティ削除)。informational (非 blocking)。reason 付き。
-        if !result.api_changes.compatible_modified.is_empty() {
-            api.insert(
-                "mod_compat".into(),
-                serde_json::Value::Array(
-                    result
-                        .api_changes
-                        .compatible_modified
-                        .iter()
-                        .map(|m| serde_json::json!({"n": m.name, "f": m.file, "reason": m.reason}))
-                        .collect(),
-                ),
-            );
-        }
-        if !result.api_changes.moved.is_empty() {
-            api.insert(
-                "moved".into(),
-                serde_json::Value::Array(
-                    result
-                        .api_changes
-                        .moved
-                        .iter()
-                        .map(|m| {
-                            serde_json::json!({
-                                "n": m.name,
-                                "from": m.from,
-                                "to": m.to,
-                            })
-                        })
-                        .collect(),
-                ),
-            );
-        }
-        if !result.api_changes.removed_dead.is_empty() {
-            api.insert(
-                "rm_dead".into(),
-                serde_json::Value::Array(
-                    result
-                        .api_changes
-                        .removed_dead
-                        .iter()
-                        .map(|s| serde_json::json!({"n": s.name, "f": s.file}))
-                        .collect(),
-                ),
-            );
-        }
-        if !result.api_changes.property_to_field.is_empty() {
-            api.insert(
-                "property_to_field".into(),
-                serde_json::Value::Array(
-                    result
-                        .api_changes
-                        .property_to_field
-                        .iter()
-                        .map(|p| serde_json::json!({"n": p.name, "f": p.file}))
-                        .collect(),
-                ),
-            );
-        }
-        hook_obj.insert("api".into(), serde_json::Value::Object(api));
+        hook_obj.insert(
+            "api".into(),
+            serde_json::to_value(api).expect("hook API DTO should serialize"),
+        );
     }
 
     // dead: [{n,f}]
     if !result.dead_symbols.is_empty() {
         has_blocking_issues = true;
         has_any_output = true;
-        let dead: Vec<serde_json::Value> = result
+        let dead: Vec<HookNameFile<'_>> = result
             .dead_symbols
             .iter()
-            .map(|ds| serde_json::json!({"n": ds.name, "f": ds.file}))
+            .map(|symbol| HookNameFile {
+                n: symbol.name.as_str(),
+                f: symbol.file.as_str(),
+            })
             .collect();
-        hook_obj.insert("dead".into(), serde_json::Value::Array(dead));
+        hook_obj.insert(
+            "dead".into(),
+            serde_json::to_value(dead).expect("hook dead-symbol DTO should serialize"),
+        );
     }
 
     if !has_any_output {
