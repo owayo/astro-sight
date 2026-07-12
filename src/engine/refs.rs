@@ -302,23 +302,28 @@ fn find_refs_in_file(symbol_name: &str, path: &camino::Utf8Path) -> Result<Vec<S
     let (tree, lang_id) = parser::parse_file(path, &source)?;
     let root = tree.root_node();
 
-    let mut refs = Vec::new();
     let definition_kinds = definition_node_kinds(lang_id);
     let target = normalize_identifier(lang_id, symbol_name);
-    // 同一 source 内で複数 hit する関数 (例: util / to_string) でも line context 取得を O(1) に。
-    let line_index = LineIndex::new(&source);
-    collect_identifier_refs(
+    let matcher = SingleMatcher {
+        lang_id,
+        target: target.as_ref(),
+    };
+    // 単一名検索は長さ 1 のバッファへ集約し、SymbolReferenceSink を batch と共用する。
+    let mut buckets = vec![Vec::new()];
+    let mut sink = SymbolReferenceSink {
+        buckets: &mut buckets,
+        path: path.as_str(),
+    };
+    run_ref_walk(
         root,
         &source,
-        &line_index,
-        target.as_ref(),
-        path.as_str(),
-        definition_kinds,
         lang_id,
-        &mut refs,
+        definition_kinds,
+        &matcher,
+        &mut sink,
     );
 
-    Ok(refs)
+    Ok(buckets.into_iter().next().unwrap_or_default())
 }
 
 /// lexer-only ファイル向けの参照検索。
@@ -554,131 +559,6 @@ impl LineIndex {
             .map(|&n| (n as usize).saturating_sub(1).min(source_len))
             .unwrap_or(source_len);
         Some((start, end))
-    }
-}
-
-/// AST を再帰走査し、指定シンボル名に一致する identifier ノードを収集する。
-/// `symbol_name` は言語に応じて正規化済みであることが前提。
-/// `line_index` はファイル単位で 1 度だけ構築し、参照件数 M に対して O(M × filesize)
-/// だった `extract_line_context` 累積コストを O(M + filesize) に抑える。
-#[allow(clippy::too_many_arguments)]
-fn collect_identifier_refs(
-    node: Node<'_>,
-    source: &[u8],
-    line_index: &LineIndex,
-    symbol_name: &str,
-    path: &str,
-    definition_kinds: &[&str],
-    lang_id: LangId,
-    refs: &mut Vec<SymbolReference>,
-) {
-    if is_identifier_kind(node.kind())
-        && let Ok(text) = node.utf8_text(source)
-        && ident_ref_matches(lang_id, node, text, symbol_name)
-        && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
-        && !is_ignored_identifier_context(node, lang_id)
-    {
-        let is_def = is_definition_context(node, definition_kinds, lang_id);
-        let context = extract_line_context_indexed(source, line_index, node.start_position().row);
-
-        refs.push(SymbolReference {
-            path: path.to_string(),
-            line: node.start_position().row,
-            column: node.start_position().column,
-            context: Some(context),
-            kind: Some(if is_def {
-                RefKind::Definition
-            } else {
-                RefKind::Reference
-            }),
-            confidence: None,
-        });
-    }
-
-    // Rust の serde 属性文字列値を識別子参照として扱う。
-    for (seg, row, col) in rust_attr_string_ref_segments(node, source, lang_id) {
-        if seg_ref_matches(lang_id, seg, symbol_name) {
-            refs.push(SymbolReference {
-                path: path.to_string(),
-                line: row,
-                column: col,
-                context: Some(extract_line_context_indexed(source, line_index, row)),
-                kind: Some(RefKind::Reference),
-                confidence: None,
-            });
-        }
-    }
-
-    // bash の `trap '<handler>' SIG` 内の handler 文字列から関数参照を抽出する。
-    for (seg, row, col) in bash_trap_handler_ref_segments(node, source, lang_id) {
-        if seg_ref_matches(lang_id, &seg, symbol_name) {
-            refs.push(SymbolReference {
-                path: path.to_string(),
-                line: row,
-                column: col,
-                context: Some(extract_line_context_indexed(source, line_index, row)),
-                kind: Some(RefKind::Reference),
-                confidence: None,
-            });
-        }
-    }
-
-    // PHPUnit の DocBlock (`@dataProvider` / `@depends`) や PHP attribute
-    // (`#[DataProvider('name')]` 等) 経由で参照される method を ref として扱う。
-    for (seg, row, col) in phpunit_metadata_ref_segments(node, source, lang_id) {
-        if seg_ref_matches(lang_id, &seg, symbol_name) {
-            refs.push(SymbolReference {
-                path: path.to_string(),
-                line: row,
-                column: col,
-                context: Some(extract_line_context_indexed(source, line_index, row)),
-                kind: Some(RefKind::Reference),
-                confidence: None,
-            });
-        }
-    }
-
-    // PHP の callable array `[Foo::class, 'method']` の string literal を ref として扱う (N3)。
-    if let Some((method, row, col)) = php_callable_array_method_segment(node, source, lang_id)
-        && seg_ref_matches(lang_id, method, symbol_name)
-    {
-        refs.push(SymbolReference {
-            path: path.to_string(),
-            line: row,
-            column: col,
-            context: Some(extract_line_context_indexed(source, line_index, row)),
-            kind: Some(RefKind::Reference),
-            confidence: None,
-        });
-    }
-
-    // PHP の文字列 callable `'Class@method'` / `Class::class . '@method'` を ref として扱う (N4)。
-    if let Some((method, row, col)) = php_string_callable_method_segment(node, source, lang_id)
-        && seg_ref_matches(lang_id, method, symbol_name)
-    {
-        refs.push(SymbolReference {
-            path: path.to_string(),
-            line: row,
-            column: col,
-            context: Some(extract_line_context_indexed(source, line_index, row)),
-            kind: Some(RefKind::Reference),
-            confidence: None,
-        });
-    }
-
-    // 子ノードを再帰走査
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_identifier_refs(
-            child,
-            source,
-            line_index,
-            symbol_name,
-            path,
-            definition_kinds,
-            lang_id,
-            refs,
-        );
     }
 }
 
@@ -2136,16 +2016,18 @@ pub(crate) fn visit_refs_and_defs_in_file_cb<V: RefVisitor>(
 
     let name_to_ix = build_name_to_ix(lang_id, symbol_names, &present_indices);
 
-    // 同一 source 内で複数 hit する識別子でも line context 取得を O(1) に。
-    let line_index = LineIndex::new(&source);
-    collect_refs_and_defs_indexed_cb(
+    let matcher = IndexedMatcher {
+        lang_id,
+        name_to_ix: &name_to_ix,
+    };
+    let mut sink = VisitorAdapter { visitor };
+    run_ref_walk(
         root,
         &source,
-        &line_index,
-        &name_to_ix,
-        definition_kinds,
         lang_id,
-        visitor,
+        definition_kinds,
+        &matcher,
+        &mut sink,
     );
     Ok(())
 }
@@ -2197,163 +2079,399 @@ pub(crate) trait RefVisitor {
     fn on_ref(&mut self, event: RefVisitEvent<'_>);
 }
 
-/// `visit_refs_and_defs_in_file_cb` 用の AST 再帰走査。Identifier と Rust attribute 文字列
-/// 参照を発見したら `visitor.on_ref` を直接呼び、`Vec<SymbolReference>` を一切生成しない。
-/// `line_index` はファイル単位で 1 度だけ構築し、参照件数 M に対して O(M × filesize)
-/// だった line context 取得を O(M + filesize) に抑える。
-fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
-    node: Node<'_>,
-    source: &[u8],
-    line_index: &LineIndex,
-    name_to_ix: &std::collections::HashMap<std::borrow::Cow<'_, str>, Vec<usize>>,
-    definition_kinds: &[&str],
+// ---------------------------------------------------------------------------
+// 統合参照ウォーカー
+//
+// 従来 4 本 (collect_identifier_refs / collect_refs_and_defs_indexed_cb /
+// collect_identifier_refs_indexed / count_identifier_refs) にコピペされていた
+// 「identifier ガード + 5 種 synthetic ref 源抽出 + 子への再帰」を 1 本の
+// `walk_refs` に集約する。出力差 (単一 Vec / index 別 Vec / callback / カウント) は
+// `RawRefSink` 実装に、単一名照合と index 照合の差は `RefMatcher` 実装に閉じ込める。
+// ref 源を追加するときは walk_refs 1 箇所だけを編集すればよい。
+// ---------------------------------------------------------------------------
+
+/// 1 hit で一致した「シンボル index 集合」。単一名検索は借用を生まない `One`、
+/// batch 検索は `name_to_ix` の `Vec<usize>` を借用する `Many`。
+enum MatchSet<'idx> {
+    One(usize),
+    Many(&'idx [usize]),
+}
+
+impl MatchSet<'_> {
+    /// 一致した全 index に対して f を呼ぶ (One は 1 回、Many は要素数分)。
+    #[inline]
+    fn for_each_index(&self, mut f: impl FnMut(usize)) {
+        match *self {
+            MatchSet::One(ix) => f(ix),
+            MatchSet::Many(ixs) => {
+                for &ix in ixs {
+                    f(ix);
+                }
+            }
+        }
+    }
+}
+
+/// hit の発生源。identifier ノード由来か、文字列セグメント由来 (synthetic) か。
+/// VisitorAdapter が confidence / usage role / macro callee 判定を行うため、
+/// identifier のときだけ元ノードを保持する。
+enum HitOrigin<'tree> {
+    Identifier(Node<'tree>),
+    Synthetic,
+}
+
+/// walk_refs が sink に渡す最小 hit 情報。context 抽出や列補正は sink 側で
+/// 必要なときだけ行う (count 経路では一切行わない)。
+struct RawRefHit<'idx, 'tree> {
+    matches: MatchSet<'idx>,
+    origin: HitOrigin<'tree>,
+    line: usize,
+    column: usize,
+    is_def: bool,
+}
+
+/// walk 中に sink が共有参照する読み取り専用コンテキスト。`line_index` は context を
+/// 必要とする sink (NEEDS_LINE_INDEX=true) のときだけ `Some`。count 経路では `None` で、
+/// LineIndex 構築自体を省く。
+struct RefEnvironment<'a> {
+    source: &'a [u8],
+    line_index: Option<&'a LineIndex>,
     lang_id: LangId,
-    visitor: &mut V,
-) {
-    if is_identifier_kind(node.kind())
-        && let Ok(text) = node.utf8_text(source)
-        && let Some(indices) = name_to_ix.get(&node_ref_key(lang_id, node, text))
-        && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
-        && !is_ignored_identifier_context(node, lang_id)
-    {
-        let is_def = is_definition_context(node, definition_kinds, lang_id);
-        let context = extract_line_context_indexed(source, line_index, node.start_position().row);
-        let line = node.start_position().row;
-        let column = node.start_position().column;
-        let ctx_col = context_column(column, source, line_index, line);
-        // Phase 3 で PHP method ref を receiver-aware に分類する。
-        // それまでは PHP も含めて ExactOwner を渡し、挙動互換を保つ。
-        let confidence = classify_method_ref_confidence(node, source, lang_id, is_def);
-        let rust_macro_callee = is_rust_macro_invocation_callee(node, lang_id);
-        let usage = classify_ref_usage_role(node, lang_id);
-        for &ix in indices {
-            visitor.on_ref(RefVisitEvent {
+}
+
+impl RefEnvironment<'_> {
+    /// 指定行の trim 済み context 文字列を返す (line_index を必要とする sink 専用)。
+    #[inline]
+    fn line_context(&self, row: usize) -> String {
+        match self.line_index {
+            Some(idx) => extract_line_context_indexed(self.source, idx, row),
+            None => String::new(),
+        }
+    }
+
+    /// context 行内の相対列を返す (インデント分を差し引く)。
+    #[inline]
+    fn ctx_column(&self, column: usize, row: usize) -> usize {
+        match self.line_index {
+            Some(idx) => context_column(column, self.source, idx, row),
+            None => column,
+        }
+    }
+}
+
+/// identifier / segment を対象シンボルに照合する戦略。単一名検索 (テキスト比較) と
+/// batch 検索 (name_to_ix lookup) の差をここに閉じ込める。
+trait RefMatcher {
+    fn identifier_matches(&self, node: Node<'_>, text: &str) -> Option<MatchSet<'_>>;
+    fn segment_matches(&self, segment: &str) -> Option<MatchSet<'_>>;
+}
+
+/// 単一名検索用 matcher。`refs --name` の小規模検索で HashMap を作らずテキスト比較で
+/// 照合する (1 要素 HashMap 化による退行を避ける)。一致時の index は常に 0。
+struct SingleMatcher<'a> {
+    lang_id: LangId,
+    target: &'a str,
+}
+
+impl RefMatcher for SingleMatcher<'_> {
+    #[inline]
+    fn identifier_matches(&self, node: Node<'_>, text: &str) -> Option<MatchSet<'_>> {
+        if ident_ref_matches(self.lang_id, node, text, self.target) {
+            Some(MatchSet::One(0))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn segment_matches(&self, segment: &str) -> Option<MatchSet<'_>> {
+        if seg_ref_matches(self.lang_id, segment, self.target) {
+            Some(MatchSet::One(0))
+        } else {
+            None
+        }
+    }
+}
+
+/// batch 検索用 matcher。正規化キーで name_to_ix を引き、一致した全 index を返す。
+struct IndexedMatcher<'map, 'name> {
+    lang_id: LangId,
+    name_to_ix: &'map std::collections::HashMap<std::borrow::Cow<'name, str>, Vec<usize>>,
+}
+
+impl RefMatcher for IndexedMatcher<'_, '_> {
+    #[inline]
+    fn identifier_matches(&self, node: Node<'_>, text: &str) -> Option<MatchSet<'_>> {
+        // `&str` で引くことで返り値スライスの寿命を name_to_ix (`'map`) だけに縛り、
+        // 一時 Cow キー (text 借用) と切り離す。
+        self.name_to_ix
+            .get(&*node_ref_key(self.lang_id, node, text))
+            .map(|ixs| MatchSet::Many(ixs.as_slice()))
+    }
+
+    #[inline]
+    fn segment_matches(&self, segment: &str) -> Option<MatchSet<'_>> {
+        self.name_to_ix
+            .get(&*seg_ref_key(self.lang_id, segment))
+            .map(|ixs| MatchSet::Many(ixs.as_slice()))
+    }
+}
+
+/// walk_refs が hit ごとに呼ぶ出力先。context を必要とするか (NEEDS_LINE_INDEX) を
+/// 型レベルで宣言し、不要な sink (CountSink) では呼び出し側が LineIndex 構築を省ける。
+trait RawRefSink {
+    const NEEDS_LINE_INDEX: bool;
+    fn on_hit(&mut self, hit: RawRefHit<'_, '_>, env: &RefEnvironment<'_>);
+}
+
+/// hit を index 別の `Vec<SymbolReference>` に積む sink。単一名検索は長さ 1、
+/// batch 検索は長さ num のバッファを渡すことで両者を兼ねる。
+struct SymbolReferenceSink<'a> {
+    buckets: &'a mut [Vec<SymbolReference>],
+    path: &'a str,
+}
+
+impl RawRefSink for SymbolReferenceSink<'_> {
+    const NEEDS_LINE_INDEX: bool = true;
+
+    fn on_hit(&mut self, hit: RawRefHit<'_, '_>, env: &RefEnvironment<'_>) {
+        let kind = Some(if hit.is_def {
+            RefKind::Definition
+        } else {
+            RefKind::Reference
+        });
+        // context は 1 hit につき 1 回だけ抽出し、複数 index には clone で配る。
+        let context = env.line_context(hit.line);
+        match hit.matches {
+            MatchSet::One(ix) => {
+                self.buckets[ix].push(SymbolReference {
+                    path: self.path.to_string(),
+                    line: hit.line,
+                    column: hit.column,
+                    context: Some(context),
+                    kind,
+                    confidence: None,
+                });
+            }
+            MatchSet::Many(ixs) => {
+                for &ix in ixs {
+                    self.buckets[ix].push(SymbolReference {
+                        path: self.path.to_string(),
+                        line: hit.line,
+                        column: hit.column,
+                        context: Some(context.clone()),
+                        kind,
+                        confidence: None,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// hit を既存 `RefVisitEvent` に変換して `RefVisitor` へ流す sink。context_column /
+/// confidence / macro callee / usage role の計算はこの adapter 内だけで行う。
+struct VisitorAdapter<'v, V: RefVisitor> {
+    visitor: &'v mut V,
+}
+
+impl<V: RefVisitor> RawRefSink for VisitorAdapter<'_, V> {
+    const NEEDS_LINE_INDEX: bool = true;
+
+    fn on_hit(&mut self, hit: RawRefHit<'_, '_>, env: &RefEnvironment<'_>) {
+        let context = env.line_context(hit.line);
+        let context_column = env.ctx_column(hit.column, hit.line);
+        // identifier 由来のときだけ receiver-aware 分類 / macro callee / usage role を計算。
+        // synthetic (文字列セグメント) は従来どおり ExactOwner / false / Other 固定。
+        let (confidence, rust_macro_callee, usage) = match hit.origin {
+            HitOrigin::Identifier(node) => (
+                classify_method_ref_confidence(node, env.source, env.lang_id, hit.is_def),
+                is_rust_macro_invocation_callee(node, env.lang_id),
+                classify_ref_usage_role(node, env.lang_id),
+            ),
+            HitOrigin::Synthetic => (RefConfidence::ExactOwner, false, RefUsageRole::Other),
+        };
+        hit.matches.for_each_index(|ix| {
+            self.visitor.on_ref(RefVisitEvent {
                 sym_ix: ix as u32,
-                line,
-                column,
-                context_column: ctx_col,
+                line: hit.line,
+                column: hit.column,
+                context_column,
                 context: &context,
-                is_def,
+                is_def: hit.is_def,
                 confidence,
                 rust_macro_callee,
                 usage,
             });
-        }
+        });
     }
+}
 
-    for (seg, row, col) in rust_attr_string_ref_segments(node, source, lang_id) {
-        if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, seg)) {
-            let context = extract_line_context_indexed(source, line_index, row);
-            for &ix in indices {
-                visitor.on_ref(RefVisitEvent {
-                    sym_ix: ix as u32,
-                    line: row,
-                    column: col,
-                    context_column: context_column(col, source, line_index, row),
-                    context: &context,
-                    is_def: false,
-                    confidence: RefConfidence::ExactOwner,
-                    rust_macro_callee: false,
-                    usage: RefUsageRole::Other,
-                });
-            }
+/// 非 Definition 参照の件数のみ index 別に加算する sink。context を作らないため
+/// NEEDS_LINE_INDEX=false で、呼び出し側の LineIndex 構築を省ける。
+struct CountSink<'a> {
+    counts: &'a mut [usize],
+}
+
+impl RawRefSink for CountSink<'_> {
+    const NEEDS_LINE_INDEX: bool = false;
+
+    fn on_hit(&mut self, hit: RawRefHit<'_, '_>, _env: &RefEnvironment<'_>) {
+        // Definition は count 対象外 (旧 count_identifier_refs の guard 相当)。
+        if hit.is_def {
+            return;
         }
+        hit.matches.for_each_index(|ix| self.counts[ix] += 1);
     }
+}
 
-    // bash の `trap '<handler>' SIG` 内の handler 文字列から関数参照を抽出する。
-    for (seg, row, col) in bash_trap_handler_ref_segments(node, source, lang_id) {
-        if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, &seg)) {
-            let context = extract_line_context_indexed(source, line_index, row);
-            for &ix in indices {
-                visitor.on_ref(RefVisitEvent {
-                    sym_ix: ix as u32,
-                    line: row,
-                    column: col,
-                    context_column: context_column(col, source, line_index, row),
-                    context: &context,
-                    is_def: false,
-                    confidence: RefConfidence::ExactOwner,
-                    rust_macro_callee: false,
-                    usage: RefUsageRole::Other,
-                });
-            }
-        }
-    }
+// count 経路 (CountSink) は context を作らないため LineIndex 不要 = false を
+// コンパイル時に固定する。`run_ref_walk` は NEEDS_LINE_INDEX=false のとき
+// `LineIndex::new` を呼ばない (`bool::then` の意味論) ので、この不変条件により
+// count 経路で LineIndex / context String が一切生成されないことが保証される。
+// 対照的に context を返す SymbolReferenceSink は LineIndex を必要とする。
+const _: () = assert!(!<CountSink<'static> as RawRefSink>::NEEDS_LINE_INDEX);
+const _: () = assert!(<SymbolReferenceSink<'static> as RawRefSink>::NEEDS_LINE_INDEX);
 
-    // PHPUnit の DocBlock / attribute 経由で参照される method を ref として扱う。
-    for (seg, row, col) in phpunit_metadata_ref_segments(node, source, lang_id) {
-        if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, &seg)) {
-            let context = extract_line_context_indexed(source, line_index, row);
-            for &ix in indices {
-                visitor.on_ref(RefVisitEvent {
-                    sym_ix: ix as u32,
-                    line: row,
-                    column: col,
-                    context_column: context_column(col, source, line_index, row),
-                    context: &context,
-                    is_def: false,
-                    confidence: RefConfidence::ExactOwner,
-                    rust_macro_callee: false,
-                    usage: RefUsageRole::Other,
-                });
-            }
-        }
-    }
+/// 統合参照ウォーカー。各ノードで「identifier → 5 種 synthetic 源 → 子」の順に
+/// 走査し、一致するたび `sink.on_hit` を呼ぶ。DFS 順は旧 4 walker と同一。
+fn walk_refs<M: RefMatcher, S: RawRefSink>(
+    node: Node<'_>,
+    matcher: &M,
+    sink: &mut S,
+    env: &RefEnvironment<'_>,
+    definition_kinds: &[&str],
+) {
+    let source = env.source;
+    let lang_id = env.lang_id;
 
-    // PHP の callable array `[Foo::class, 'method']` を ref として扱う (N3)。
-    // collect_identifier_refs_indexed / count_identifier_refs と挙動を揃え、
-    // impact streaming Pass でも同じ結果を返すようにする。
-    if let Some((method, row, col)) = php_callable_array_method_segment(node, source, lang_id)
-        && let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, method))
+    // (1) identifier ノード。ガード順 (matches → struct field 除外 → ignored 除外) は
+    //     旧 collect 経路と同一。is_def は sink 側で用途が分かれるため常に算出する
+    //     (count は Definition を弾き、collect/visitor は kind に反映)。
+    if is_identifier_kind(node.kind())
+        && let Ok(text) = node.utf8_text(source)
+        && let Some(matches) = matcher.identifier_matches(node, text)
+        && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
+        && !is_ignored_identifier_context(node, lang_id)
     {
-        let context = extract_line_context_indexed(source, line_index, row);
-        for &ix in indices {
-            visitor.on_ref(RefVisitEvent {
-                sym_ix: ix as u32,
-                line: row,
-                column: col,
-                context_column: context_column(col, source, line_index, row),
-                context: &context,
-                is_def: false,
-                confidence: RefConfidence::ExactOwner,
-                rust_macro_callee: false,
-                usage: RefUsageRole::Other,
-            });
-        }
-    }
-
-    // PHP の文字列 callable `'Class@method'` / `Class::class . '@method'` を ref とする (N4)。
-    if let Some((method, row, col)) = php_string_callable_method_segment(node, source, lang_id)
-        && let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, method))
-    {
-        let context = extract_line_context_indexed(source, line_index, row);
-        for &ix in indices {
-            visitor.on_ref(RefVisitEvent {
-                sym_ix: ix as u32,
-                line: row,
-                column: col,
-                context_column: context_column(col, source, line_index, row),
-                context: &context,
-                is_def: false,
-                confidence: RefConfidence::ExactOwner,
-                rust_macro_callee: false,
-                usage: RefUsageRole::Other,
-            });
-        }
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_refs_and_defs_indexed_cb(
-            child,
-            source,
-            line_index,
-            name_to_ix,
-            definition_kinds,
-            lang_id,
-            visitor,
+        let is_def = is_definition_context(node, definition_kinds, lang_id);
+        let pos = node.start_position();
+        sink.on_hit(
+            RawRefHit {
+                matches,
+                origin: HitOrigin::Identifier(node),
+                line: pos.row,
+                column: pos.column,
+                is_def,
+            },
+            env,
         );
     }
+
+    // (2) Rust serde 属性文字列値
+    for (seg, row, col) in rust_attr_string_ref_segments(node, source, lang_id) {
+        if let Some(matches) = matcher.segment_matches(seg) {
+            sink.on_hit(
+                RawRefHit {
+                    matches,
+                    origin: HitOrigin::Synthetic,
+                    line: row,
+                    column: col,
+                    is_def: false,
+                },
+                env,
+            );
+        }
+    }
+
+    // (3) bash `trap '<handler>' SIG` の handler 文字列
+    for (seg, row, col) in bash_trap_handler_ref_segments(node, source, lang_id) {
+        if let Some(matches) = matcher.segment_matches(&seg) {
+            sink.on_hit(
+                RawRefHit {
+                    matches,
+                    origin: HitOrigin::Synthetic,
+                    line: row,
+                    column: col,
+                    is_def: false,
+                },
+                env,
+            );
+        }
+    }
+
+    // (4) PHPUnit DocBlock / attribute metadata
+    for (seg, row, col) in phpunit_metadata_ref_segments(node, source, lang_id) {
+        if let Some(matches) = matcher.segment_matches(&seg) {
+            sink.on_hit(
+                RawRefHit {
+                    matches,
+                    origin: HitOrigin::Synthetic,
+                    line: row,
+                    column: col,
+                    is_def: false,
+                },
+                env,
+            );
+        }
+    }
+
+    // (5) PHP callable array `[Foo::class, 'method']`
+    if let Some((method, row, col)) = php_callable_array_method_segment(node, source, lang_id)
+        && let Some(matches) = matcher.segment_matches(method)
+    {
+        sink.on_hit(
+            RawRefHit {
+                matches,
+                origin: HitOrigin::Synthetic,
+                line: row,
+                column: col,
+                is_def: false,
+            },
+            env,
+        );
+    }
+
+    // (6) PHP 文字列 callable `'Class@method'`
+    if let Some((method, row, col)) = php_string_callable_method_segment(node, source, lang_id)
+        && let Some(matches) = matcher.segment_matches(method)
+    {
+        sink.on_hit(
+            RawRefHit {
+                matches,
+                origin: HitOrigin::Synthetic,
+                line: row,
+                column: col,
+                is_def: false,
+            },
+            env,
+        );
+    }
+
+    // (7) 子ノードへ再帰
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_refs(child, matcher, sink, env, definition_kinds);
+    }
+}
+
+/// walk_refs の呼び出しラッパー。sink が context を必要とする場合のみ LineIndex を
+/// 構築する (count 経路では構築を完全に省く)。
+fn run_ref_walk<M: RefMatcher, S: RawRefSink>(
+    root: Node<'_>,
+    source: &[u8],
+    lang_id: LangId,
+    definition_kinds: &[&str],
+    matcher: &M,
+    sink: &mut S,
+) {
+    let line_index = S::NEEDS_LINE_INDEX.then(|| LineIndex::new(source));
+    let env = RefEnvironment {
+        source,
+        line_index: line_index.as_ref(),
+        lang_id,
+    };
+    walk_refs(root, matcher, sink, &env, definition_kinds);
 }
 
 fn is_rust_macro_invocation_callee(node: Node<'_>, lang_id: LangId) -> bool {
@@ -2682,165 +2800,25 @@ pub(crate) fn find_refs_batch_in_file_indexed(
     // 関数/メソッド/クラス系の case-insensitive 参照に備え folded キーも登録する)。
     let name_to_ix = build_name_to_ix(lang_id, symbol_names, &present_indices);
 
-    // 同一 source 内で複数 hit する識別子でも line context 取得を O(1) に。
-    let line_index = LineIndex::new(&source);
     let mut result = vec![Vec::new(); num];
-    collect_identifier_refs_indexed(
+    let matcher = IndexedMatcher {
+        lang_id,
+        name_to_ix: &name_to_ix,
+    };
+    let mut sink = SymbolReferenceSink {
+        buckets: &mut result,
+        path: path.as_str(),
+    };
+    run_ref_walk(
         root,
         &source,
-        &line_index,
-        &name_to_ix,
-        path.as_str(),
-        definition_kinds,
         lang_id,
-        &mut result,
+        definition_kinds,
+        &matcher,
+        &mut sink,
     );
 
     Ok(result)
-}
-
-/// AST を再帰走査し、シンボル index ベースの Vec に参照を格納する。
-/// CI 言語（Xojo）で正規化後キーが衝突する場合でも全 index に参照を配るため、
-/// 値は `Vec<usize>` を受け取る。
-/// `line_index` はファイル単位で 1 度だけ構築し、参照件数 M に対して O(M × filesize)
-/// だった line context 取得を O(M + filesize) に抑える。
-#[allow(clippy::too_many_arguments)]
-fn collect_identifier_refs_indexed(
-    node: Node<'_>,
-    source: &[u8],
-    line_index: &LineIndex,
-    name_to_ix: &std::collections::HashMap<std::borrow::Cow<'_, str>, Vec<usize>>,
-    path: &str,
-    definition_kinds: &[&str],
-    lang_id: LangId,
-    refs: &mut [Vec<SymbolReference>],
-) {
-    if is_identifier_kind(node.kind())
-        && let Ok(text) = node.utf8_text(source)
-        && let Some(indices) = name_to_ix.get(&node_ref_key(lang_id, node, text))
-        && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
-        && !is_ignored_identifier_context(node, lang_id)
-    {
-        let is_def = is_definition_context(node, definition_kinds, lang_id);
-        let context = extract_line_context_indexed(source, line_index, node.start_position().row);
-        let line = node.start_position().row;
-        let column = node.start_position().column;
-        let kind = if is_def {
-            RefKind::Definition
-        } else {
-            RefKind::Reference
-        };
-
-        for &ix in indices {
-            refs[ix].push(SymbolReference {
-                path: path.to_string(),
-                line,
-                column,
-                context: Some(context.clone()),
-                kind: Some(kind),
-                confidence: None,
-            });
-        }
-    }
-
-    // Rust の serde 属性文字列値を識別子参照として扱う。
-    for (seg, row, col) in rust_attr_string_ref_segments(node, source, lang_id) {
-        if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, seg)) {
-            let context = extract_line_context_indexed(source, line_index, row);
-            for &ix in indices {
-                refs[ix].push(SymbolReference {
-                    path: path.to_string(),
-                    line: row,
-                    column: col,
-                    context: Some(context.clone()),
-                    kind: Some(RefKind::Reference),
-                    confidence: None,
-                });
-            }
-        }
-    }
-
-    // bash の `trap '<handler>' SIG` 内の handler 文字列から関数参照を抽出する。
-    for (seg, row, col) in bash_trap_handler_ref_segments(node, source, lang_id) {
-        if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, &seg)) {
-            let context = extract_line_context_indexed(source, line_index, row);
-            for &ix in indices {
-                refs[ix].push(SymbolReference {
-                    path: path.to_string(),
-                    line: row,
-                    column: col,
-                    context: Some(context.clone()),
-                    kind: Some(RefKind::Reference),
-                    confidence: None,
-                });
-            }
-        }
-    }
-
-    // PHPUnit の DocBlock / attribute 経由で参照される method を ref として扱う。
-    for (seg, row, col) in phpunit_metadata_ref_segments(node, source, lang_id) {
-        if let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, &seg)) {
-            let context = extract_line_context_indexed(source, line_index, row);
-            for &ix in indices {
-                refs[ix].push(SymbolReference {
-                    path: path.to_string(),
-                    line: row,
-                    column: col,
-                    context: Some(context.clone()),
-                    kind: Some(RefKind::Reference),
-                    confidence: None,
-                });
-            }
-        }
-    }
-
-    // PHP の callable array `[Foo::class, 'method']` の string literal を ref として扱う (N3)。
-    if let Some((method, row, col)) = php_callable_array_method_segment(node, source, lang_id)
-        && let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, method))
-    {
-        let context = extract_line_context_indexed(source, line_index, row);
-        for &ix in indices {
-            refs[ix].push(SymbolReference {
-                path: path.to_string(),
-                line: row,
-                column: col,
-                context: Some(context.clone()),
-                kind: Some(RefKind::Reference),
-                confidence: None,
-            });
-        }
-    }
-
-    // PHP の文字列 callable `'Class@method'` / `Class::class . '@method'` を ref として扱う (N4)。
-    if let Some((method, row, col)) = php_string_callable_method_segment(node, source, lang_id)
-        && let Some(indices) = name_to_ix.get(&seg_ref_key(lang_id, method))
-    {
-        let context = extract_line_context_indexed(source, line_index, row);
-        for &ix in indices {
-            refs[ix].push(SymbolReference {
-                path: path.to_string(),
-                line: row,
-                column: col,
-                context: Some(context.clone()),
-                kind: Some(RefKind::Reference),
-                confidence: None,
-            });
-        }
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_identifier_refs_indexed(
-            child,
-            source,
-            line_index,
-            name_to_ix,
-            path,
-            definition_kinds,
-            lang_id,
-            refs,
-        );
-    }
 }
 
 /// 単一ファイル内の非 Definition 参照件数をカウントする（SymbolReference を確保しない）。
@@ -2891,95 +2869,72 @@ fn count_refs_in_file(
     let name_to_ix = build_name_to_ix(lang_id, symbol_names, &present_indices);
 
     let mut counts = vec![0usize; num];
-    count_identifier_refs(
+    let matcher = IndexedMatcher {
+        lang_id,
+        name_to_ix: &name_to_ix,
+    };
+    let mut sink = CountSink {
+        counts: &mut counts,
+    };
+    // CountSink::NEEDS_LINE_INDEX = false のため run_ref_walk は LineIndex を構築せず、
+    // context 文字列も一切生成しない (軽量 count 経路)。
+    run_ref_walk(
         root,
         &source,
-        &name_to_ix,
-        definition_kinds,
         lang_id,
-        &mut counts,
+        definition_kinds,
+        &matcher,
+        &mut sink,
     );
 
     Ok(counts)
 }
 
-/// AST を再帰走査し、非 Definition 参照の件数のみカウントする。
-/// CI 言語 (Xojo) で正規化後キーが衝突する場合でも全 index にカウントを配るため、
-/// 値は `Vec<usize>` を受け取る。
-fn count_identifier_refs(
-    node: Node<'_>,
-    source: &[u8],
-    name_to_ix: &std::collections::HashMap<std::borrow::Cow<'_, str>, Vec<usize>>,
-    definition_kinds: &[&str],
-    lang_id: LangId,
-    counts: &mut [usize],
-) {
-    if is_identifier_kind(node.kind())
-        && let Ok(text) = node.utf8_text(source)
-        && let Some(ixs) = name_to_ix.get(&node_ref_key(lang_id, node, text))
-        && !is_definition_context(node, definition_kinds, lang_id)
-        && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
-        && !is_ignored_identifier_context(node, lang_id)
-    {
-        for &ix in ixs {
-            counts[ix] += 1;
-        }
-    }
-
-    // Rust の serde 属性文字列値を非 Definition 参照としてカウントする。
-    for (seg, _row, _col) in rust_attr_string_ref_segments(node, source, lang_id) {
-        if let Some(ixs) = name_to_ix.get(&seg_ref_key(lang_id, seg)) {
-            for &ix in ixs {
-                counts[ix] += 1;
-            }
-        }
-    }
-
-    // bash の `trap '<handler>' SIG` 内の handler 文字列から関数参照をカウントする。
-    for (seg, _row, _col) in bash_trap_handler_ref_segments(node, source, lang_id) {
-        if let Some(ixs) = name_to_ix.get(&seg_ref_key(lang_id, &seg)) {
-            for &ix in ixs {
-                counts[ix] += 1;
-            }
-        }
-    }
-
-    // PHPUnit の DocBlock / attribute 経由で参照される method をカウントする。
-    for (seg, _row, _col) in phpunit_metadata_ref_segments(node, source, lang_id) {
-        if let Some(ixs) = name_to_ix.get(&seg_ref_key(lang_id, &seg)) {
-            for &ix in ixs {
-                counts[ix] += 1;
-            }
-        }
-    }
-
-    // PHP の callable array `[Foo::class, 'method']` の string literal を ref とする (N3)。
-    if let Some((method, _row, _col)) = php_callable_array_method_segment(node, source, lang_id)
-        && let Some(ixs) = name_to_ix.get(&seg_ref_key(lang_id, method))
-    {
-        for &ix in ixs {
-            counts[ix] += 1;
-        }
-    }
-
-    // PHP の文字列 callable `'Class@method'` / `Class::class . '@method'` を ref とする (N4)。
-    if let Some((method, _row, _col)) = php_string_callable_method_segment(node, source, lang_id)
-        && let Some(ixs) = name_to_ix.get(&seg_ref_key(lang_id, method))
-    {
-        for &ix in ixs {
-            counts[ix] += 1;
-        }
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        count_identifier_refs(child, source, name_to_ix, definition_kinds, lang_id, counts);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// テスト用: 単一名の in-memory 参照収集 (SingleMatcher + SymbolReferenceSink)。
+    /// 旧 `collect_identifier_refs` を直接叩いていた単体テストの置き換え。
+    fn collect_single_refs_for_test(
+        root: Node<'_>,
+        source: &[u8],
+        target: &str,
+        path: &str,
+        definition_kinds: &[&str],
+        lang_id: LangId,
+    ) -> Vec<SymbolReference> {
+        let matcher = SingleMatcher { lang_id, target };
+        let mut buckets = vec![Vec::new()];
+        let mut sink = SymbolReferenceSink {
+            buckets: &mut buckets,
+            path,
+        };
+        run_ref_walk(root, source, lang_id, definition_kinds, &matcher, &mut sink);
+        buckets.into_iter().next().unwrap_or_default()
+    }
+
+    /// テスト用: index ベースの非 Definition 参照カウント (IndexedMatcher + CountSink)。
+    /// 旧 `count_identifier_refs` を直接叩いていた単体テストの置き換え。
+    fn count_refs_for_test(
+        root: Node<'_>,
+        source: &[u8],
+        name_to_ix: &std::collections::HashMap<std::borrow::Cow<'_, str>, Vec<usize>>,
+        definition_kinds: &[&str],
+        lang_id: LangId,
+        num: usize,
+    ) -> Vec<usize> {
+        let matcher = IndexedMatcher {
+            lang_id,
+            name_to_ix,
+        };
+        let mut counts = vec![0usize; num];
+        let mut sink = CountSink {
+            counts: &mut counts,
+        };
+        run_ref_walk(root, source, lang_id, definition_kinds, &matcher, &mut sink);
+        counts
+    }
 
     /// PHP の callable array `[Class::class, 'method']` で string ノードの中身が
     /// method ref として返されることを検証 (N3 unit-level)。
@@ -3555,17 +3510,13 @@ struct Bar {
 "#;
         let tree = parse_rust(source);
         let defs = definition_node_kinds(LangId::Rust);
-        let mut refs = Vec::new();
-        let line_index = LineIndex::new(source.as_bytes());
-        collect_identifier_refs(
+        let refs = collect_single_refs_for_test(
             tree.root_node(),
             source.as_bytes(),
-            &line_index,
             "serialize_jst",
             "test.rs",
             defs,
             LangId::Rust,
-            &mut refs,
         );
 
         // 定義 1 件 + 属性文字列内参照 1 件
@@ -3599,14 +3550,13 @@ struct Bar {
         let defs = definition_node_kinds(LangId::Rust);
         let mut name_to_ix: HashMap<Cow<'_, str>, Vec<usize>> = HashMap::new();
         name_to_ix.insert(Cow::Borrowed("serialize_jst"), vec![0]);
-        let mut counts = vec![0usize];
-        count_identifier_refs(
+        let counts = count_refs_for_test(
             tree.root_node(),
             source.as_bytes(),
             &name_to_ix,
             defs,
             LangId::Rust,
-            &mut counts,
+            1,
         );
         assert_eq!(counts[0], 1, "attribute string ref must lift dead-code");
     }
@@ -3630,18 +3580,13 @@ void f(struct buffer_data header) {\n\
 struct forward_declared;\n";
         let tree = parser::parse_source(source.as_bytes(), LangId::Cpp).expect("parse");
         let defs = definition_node_kinds(LangId::Cpp);
-        let line_index = LineIndex::new(source.as_bytes());
-
-        let mut refs = Vec::new();
-        collect_identifier_refs(
+        let refs = collect_single_refs_for_test(
             tree.root_node(),
             source.as_bytes(),
-            &line_index,
             "buffer_data",
             "test.cpp",
             defs,
             LangId::Cpp,
-            &mut refs,
         );
 
         let def_cnt = refs
@@ -3663,27 +3608,23 @@ struct forward_declared;\n";
 
         let mut name_to_ix: HashMap<Cow<'_, str>, Vec<usize>> = HashMap::new();
         name_to_ix.insert(Cow::Borrowed("buffer_data"), vec![0]);
-        let mut counts = vec![0usize];
-        count_identifier_refs(
+        let counts = count_refs_for_test(
             tree.root_node(),
             source.as_bytes(),
             &name_to_ix,
             defs,
             LangId::Cpp,
-            &mut counts,
+            1,
         );
         assert_eq!(counts[0], 4, "count-only refs should match visible refs");
 
-        refs.clear();
-        collect_identifier_refs(
+        let refs = collect_single_refs_for_test(
             tree.root_node(),
             source.as_bytes(),
-            &line_index,
             "forward_declared",
             "test.cpp",
             defs,
             LangId::Cpp,
-            &mut refs,
         );
         assert!(
             refs.is_empty(),
@@ -3703,17 +3644,13 @@ struct Bar {
 "#;
         let tree = parse_rust(source);
         let defs = definition_node_kinds(LangId::Rust);
-        let mut refs = Vec::new();
-        let line_index = LineIndex::new(source.as_bytes());
-        collect_identifier_refs(
+        let refs = collect_single_refs_for_test(
             tree.root_node(),
             source.as_bytes(),
-            &line_index,
             "is_none",
             "test.rs",
             defs,
             LangId::Rust,
-            &mut refs,
         );
         assert_eq!(
             refs.len(),
@@ -3734,17 +3671,13 @@ struct Bar {
 "#;
         let tree = parse_rust(source);
         let defs = definition_node_kinds(LangId::Rust);
-        let mut refs = Vec::new();
-        let line_index = LineIndex::new(source.as_bytes());
-        collect_identifier_refs(
+        let refs = collect_single_refs_for_test(
             tree.root_node(),
             source.as_bytes(),
-            &line_index,
             "created_at",
             "test.rs",
             defs,
             LangId::Rust,
-            &mut refs,
         );
         assert!(
             refs.is_empty(),
@@ -3901,7 +3834,7 @@ struct Bar {
         assert!(optout_ide, "opt-out 時は _ide_helper.php も含まれるべき");
     }
 
-    /// bash の `trap '<handler>' SIG` 内の関数参照が `count_identifier_refs` で
+    /// bash の `trap '<handler>' SIG` 内の関数参照が count 経路 (CountSink) で
     /// 非 Definition としてカウントされ、dead-code 判定で生存扱いになることを検証する。
     /// 旧実装では trap handler 内は文字列扱いで参照ゼロとなり、`cleanup_signal` のような
     /// シグナルハンドラが false-positive で dead として列挙される回帰があった。
@@ -3915,14 +3848,13 @@ struct Bar {
         let defs = definition_node_kinds(LangId::Bash);
         let mut name_to_ix: HashMap<Cow<'_, str>, Vec<usize>> = HashMap::new();
         name_to_ix.insert(Cow::Borrowed("cleanup_signal"), vec![0]);
-        let mut counts = vec![0usize];
-        count_identifier_refs(
+        let counts = count_refs_for_test(
             tree.root_node(),
             source.as_bytes(),
             &name_to_ix,
             defs,
             LangId::Bash,
-            &mut counts,
+            1,
         );
         assert_eq!(
             counts[0], 2,
@@ -3972,14 +3904,13 @@ struct Bar {
         let defs = definition_node_kinds(LangId::Bash);
         let mut name_to_ix: HashMap<Cow<'_, str>, Vec<usize>> = HashMap::new();
         name_to_ix.insert(Cow::Borrowed("cleanup"), vec![0]);
-        let mut counts = vec![0usize];
-        count_identifier_refs(
+        let counts = count_refs_for_test(
             tree.root_node(),
             source.as_bytes(),
             &name_to_ix,
             defs,
             LangId::Bash,
-            &mut counts,
+            1,
         );
         // 引用なし `trap cleanup INT` は通常の word 走査で 1 件として拾われる。
         // bash_trap_handler_ref_segments は raw_string/string のみ対象なので加算しない。
@@ -4359,5 +4290,170 @@ struct Bar {
             ],
             "roles: {roles:?}"
         );
+    }
+
+    /// リファクタ後も single / batch Vec / callback / count の 4 経路が一致し続けることを
+    /// 担保する同値性テスト。5 種 synthetic ref 源 (rust_attr / bash_trap /
+    /// phpunit_metadata / php_callable_array / php_string_callable) + 通常 identifier を
+    /// 言語別 fixture で網羅し、実際に synthetic 参照が発火していることも確認する。
+    #[test]
+    fn ref_walkers_agree_across_all_paths() {
+        let rust_src = r#"fn serialize_jst() {}
+fn helper() {}
+#[derive(Serialize)]
+struct Bar {
+    #[serde(serialize_with = "serialize_jst")]
+    time: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    opt: Option<i64>,
+}
+fn run() { helper(); let _ = serialize_jst; }
+"#;
+        let bash_src = r#"cleanup_signal() {
+    exit 1
+}
+cleanup_exit() {
+    echo bye
+}
+trap 'cleanup_signal 130' INT
+trap "cleanup_signal 143" TERM
+trap 'cleanup_exit' EXIT
+cleanup_signal 0
+"#;
+        let php_src = r#"<?php
+class Ctrl {
+    /**
+     * @dataProvider provideData
+     */
+    public function testThing(): void {
+        $this->handle();
+    }
+
+    #[DataProvider('attrData')]
+    public function testAttr(): void {}
+
+    public function provideData(): array { return []; }
+    public function attrData(): array { return []; }
+    public function handle(): void {}
+
+    public function routes(): void {
+        $r = [Ctrl::class, 'handle'];
+        $s = 'Ctrl@handle';
+    }
+}
+"#;
+
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                "equiv.rs",
+                rust_src,
+                &["serialize_jst", "helper", "is_none"],
+            ),
+            ("equiv.sh", bash_src, &["cleanup_signal", "cleanup_exit"]),
+            (
+                "equiv.php",
+                php_src,
+                &["provideData", "attrData", "handle", "testThing"],
+            ),
+        ];
+
+        for (fname, source, names) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(fname);
+            std::fs::write(&path, source).unwrap();
+            let utf8_path = camino::Utf8Path::from_path(&path).expect("utf-8 path");
+            let name_vec: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+            let ac = build_ac_case_insensitive(&name_vec).unwrap();
+
+            // 経路 B: batch Vec
+            let batch = find_refs_batch_in_file_indexed(&name_vec, &ac, utf8_path).unwrap();
+
+            // 経路 C: callback (index 別に (line, column, is_def) を収集)
+            struct Rec {
+                per_ix: Vec<Vec<(usize, usize, bool)>>,
+            }
+            impl RefVisitor for Rec {
+                fn on_ref(&mut self, e: RefVisitEvent<'_>) {
+                    self.per_ix[e.sym_ix as usize].push((e.line, e.column, e.is_def));
+                }
+            }
+            let mut rec = Rec {
+                per_ix: vec![Vec::new(); name_vec.len()],
+            };
+            visit_refs_and_defs_in_file_cb(&name_vec, &ac, utf8_path, &mut rec).unwrap();
+
+            // 経路 D: count (非 Definition のみ)
+            let counts = count_refs_in_file(&name_vec, &ac, utf8_path).unwrap();
+
+            for (ix, name) in name_vec.iter().enumerate() {
+                // 経路 A: single
+                let single = find_refs_in_file(name, utf8_path).unwrap();
+
+                // A == B: (行, 列, 種別, context) 列が完全一致
+                let a_key: Vec<_> = single
+                    .iter()
+                    .map(|r| (r.line, r.column, r.kind, r.context.clone()))
+                    .collect();
+                let b_key: Vec<_> = batch[ix]
+                    .iter()
+                    .map(|r| (r.line, r.column, r.kind, r.context.clone()))
+                    .collect();
+                assert_eq!(a_key, b_key, "single vs batch: {name} in {fname}");
+
+                // B == C: (行, 列, is_def) 列が一致
+                let b_events: Vec<_> = batch[ix]
+                    .iter()
+                    .map(|r| (r.line, r.column, r.kind == Some(RefKind::Definition)))
+                    .collect();
+                assert_eq!(
+                    rec.per_ix[ix], b_events,
+                    "callback vs batch: {name} in {fname}"
+                );
+
+                // D == 非 Definition 件数
+                let non_def = batch[ix]
+                    .iter()
+                    .filter(|r| r.kind != Some(RefKind::Definition))
+                    .count();
+                assert_eq!(counts[ix], non_def, "count vs batch: {name} in {fname}");
+            }
+
+            // synthetic 源が実際に発火していること (テストが空振り一致でないこと) を担保。
+            let count_of = |n: &str| -> usize {
+                name_vec
+                    .iter()
+                    .position(|x| x == n)
+                    .map(|i| counts[i])
+                    .unwrap_or(0)
+            };
+            match *fname {
+                // is_none は属性文字列内にのみ出現するので、非定義参照 = rust_attr 発火。
+                "equiv.rs" => assert!(count_of("is_none") >= 1, "rust_attr synthetic must fire"),
+                // cleanup_exit は trap 内にのみ出現するので、非定義参照 = bash_trap 発火。
+                "equiv.sh" => {
+                    assert!(
+                        count_of("cleanup_exit") >= 1,
+                        "bash_trap synthetic must fire"
+                    )
+                }
+                // provideData/attrData は phpunit metadata 経由でのみ参照される。
+                // handle は member_call(1) + callable_array(1) + string_callable(1) = 3。
+                "equiv.php" => {
+                    assert!(
+                        count_of("provideData") >= 1,
+                        "phpunit docblock synthetic must fire"
+                    );
+                    assert!(
+                        count_of("attrData") >= 1,
+                        "phpunit attribute synthetic must fire"
+                    );
+                    assert!(
+                        count_of("handle") >= 3,
+                        "php callable_array + string_callable synthetics must fire"
+                    );
+                }
+                _ => {}
+            }
+        }
     }
 }
