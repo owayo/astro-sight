@@ -11402,3 +11402,123 @@ fn dead_code_ts_unrelated_namespace_import_does_not_suppress_set() {
         "無関係 namespace import で set を Ambiguous 化せず、未参照の Beta.fmt は dead: {names:?}"
     );
 }
+
+#[test]
+fn impact_fn_typed_tuple_ref_stays_blocking() {
+    // codex 再レビュー指摘 (重大1): `let handlers: (fn(u32),) = (my_system,);` のように
+    // タプル/配列の外側に明示型注釈がある場合、要素は fn ポインタ型に固定され
+    // シグネチャ変更 (arity 不変でも) でコンパイルエラーになる。informational へ
+    // 格下げせず blocking を維持する。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"typedtuple-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub mod sys;\npub mod reg;\n").unwrap();
+    std::fs::write(
+        root.join("src/sys.rs"),
+        "pub fn my_system(x: u32) {\n    let _ = x;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/reg.rs"),
+        "use crate::sys::my_system;\n\npub fn setup() {\n    let handlers: (fn(u32),) = (my_system,);\n    let _ = handlers;\n}\n",
+    )
+    .unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "astro-sight@example.com"]);
+    git(&["config", "user.name", "astro-sight"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial", "-q"]);
+
+    // u32 -> String (arity 不変の型のみ変更) — fn ポインタ型固定のため壊れる
+    std::fs::write(
+        root.join("src/sys.rs"),
+        "pub fn my_system(x: String) {\n    let _ = x;\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["impact", "--dir", root.to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run");
+    assert!(
+        !output.status.success(),
+        "明示型付きタプル要素の関数値渡しは blocking (exit 1) を維持すべき"
+    );
+}
+
+#[test]
+fn api_changes_rust_inline_module_hierarchy_reexport_detected() {
+    // codex 再レビュー指摘 (重大2): inline module 配下の外部 mod 宣言
+    // (`mod internal { pub mod api; }` の api) は `internal/api.rs` に解決される。
+    // 基準 dir を inline 階層に追随させないと `api.rs` を誤探索し、
+    // その先の公開階層の破壊的 API 変更を取りこぼす。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/internal")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"inlinemod-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "mod internal {\n    pub mod api;\n}\npub use internal::api;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/internal/api.rs"),
+        "pub fn f() -> bool {\n    true\n}\n",
+    )
+    .unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "astro-sight@example.com"]);
+    git(&["config", "user.name", "astro-sight"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial", "-q"]);
+
+    std::fs::write(
+        root.join("src/internal/api.rs"),
+        "pub fn f(strict: bool) -> bool {\n    strict\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["review", "--dir", root.to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let modified: Vec<&str> = json["api_changes"]["modified"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        modified.contains(&"f"),
+        "inline module 配下の外部 mod 経由の公開 API 変更も api.modified に出るべき: {json}"
+    );
+}

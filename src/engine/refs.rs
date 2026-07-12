@@ -2410,8 +2410,16 @@ fn classify_ref_usage_role(node: Node<'_>, lang_id: LangId) -> RefUsageRole {
         // AST だけでは渡し先シグネチャを解決できないため blocking (Other) を維持する。
         // タプル/配列要素は fn ポインタを直接取る API がほぼ存在せず (型パラメータ
         // 経由のトレイト境界になる)、Bevy `add_systems(Update, (a, b, c))` パターンを
-        // 安全に informational 化できる。
-        "tuple_expression" | "array_expression" => RefUsageRole::FunctionValue,
+        // 安全に informational 化できる。ただし `let h: (fn(u32),) = (my_system,);` の
+        // ように外側へ明示型注釈が付く場合は fn ポインタ型固定でシグネチャ変更が
+        // コンパイルエラーになるため blocking を維持する。
+        "tuple_expression" | "array_expression" => {
+            if tuple_or_array_has_explicit_type(parent) {
+                RefUsageRole::Other
+            } else {
+                RefUsageRole::FunctionValue
+            }
+        }
         "field_expression" => {
             if parent
                 .child_by_field_name("value")
@@ -2452,6 +2460,26 @@ fn classify_ref_usage_role(node: Node<'_>, lang_id: LangId) -> RefUsageRole {
         }
         _ => RefUsageRole::Other,
     }
+}
+
+/// タプル/配列リテラルが明示型注釈付きの束縛・cast に直接使われているかを返す。
+/// ネストしたタプル/配列は透過して外側を確認する。`let h: (fn(u32),) = (my_system,);`
+/// のような外側明示型は要素の fn 参照を型固定するため、informational 格下げ対象から外す。
+fn tuple_or_array_has_explicit_type(tuple_or_array: Node<'_>) -> bool {
+    let mut cur = tuple_or_array;
+    while let Some(parent) = cur.parent() {
+        match parent.kind() {
+            "tuple_expression" | "array_expression" => cur = parent,
+            "let_declaration" | "const_item" | "static_item" | "type_cast_expression" => {
+                let is_value = parent
+                    .child_by_field_name("value")
+                    .is_some_and(|v| v.id() == cur.id());
+                return is_value && parent.child_by_field_name("type").is_some();
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// receiver-aware な method ref 確信度判定 (Phase 3 で PHP に拡張予定)。
@@ -4269,7 +4297,7 @@ struct Bar {
     }
 
     /// Rust の参照 usage role 分類 (Issue 2026-07-12-bevy-systemparam-optional-res-impact-fp)。
-    /// callee / タプル値渡し / 直接引数値渡し / fn 型固定 let を区別する。
+    /// callee / タプル値渡し / 直接引数値渡し / fn 型固定 let / 型付きタプルを区別する。
     #[test]
     fn classify_rust_ref_usage_roles() {
         let source = b"fn my_system(x: u32) { let _ = x; }\n\
@@ -4280,6 +4308,12 @@ struct Bar {
                            register(my_system);\n\
                            let pinned: fn(u32) = my_system;\n\
                            let _ = pinned;\n\
+                           let typed_tuple: (fn(u32),) = (my_system,);\n\
+                           let _ = typed_tuple;\n\
+                           let typed_arr: [fn(u32); 1] = [my_system];\n\
+                           let _ = typed_arr;\n\
+                           let untyped = (my_system,);\n\
+                           let _ = untyped;\n\
                        }\n";
         let tree = crate::engine::parser::parse_source(source, LangId::Rust).unwrap();
 
@@ -4312,6 +4346,11 @@ struct Bar {
                 // (`fn accept(_: fn(u32))`) の場合に型変更で壊れるため blocking 維持
                 (5, RefUsageRole::Other),
                 (6, RefUsageRole::TypeConstrainedValue), // let pinned: fn(u32) = my_system
+                // 明示型付きタプル/配列の要素は fn ポインタ型固定なので blocking 維持
+                (8, RefUsageRole::Other), // let typed_tuple: (fn(u32),) = (my_system,)
+                (10, RefUsageRole::Other), // let typed_arr: [fn(u32); 1] = [my_system]
+                // 型注釈なしは fn item 型に推論され変更へ追随するため格下げ可
+                (12, RefUsageRole::FunctionValue), // let untyped = (my_system,)
             ],
             "roles: {roles:?}"
         );

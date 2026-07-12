@@ -927,6 +927,7 @@ pub(crate) fn collect_all_modules(
         let module_source =
             read_rust_module_source(source, dir, &info.crate_root_rel, &current_rel)?;
         let tree = parser::parse_source(&module_source, crate::language::LangId::Rust).ok()?;
+        let base_dir = child_module_base_dir(&current_rel);
         collect_modules_with_visibility(
             source,
             tree.root_node(),
@@ -934,7 +935,7 @@ pub(crate) fn collect_all_modules(
             dir,
             info,
             &segments,
-            &current_rel,
+            &base_dir,
             &mut result,
             &mut frontier,
         )?;
@@ -944,6 +945,9 @@ pub(crate) fn collect_all_modules(
 
 /// `collect_public_pub_mods` の全 module 版。private mod にも潜って module 集合を作り、
 /// pub な子 module 名だけを親エントリに記録する。
+/// `base_dir` は子 `mod name;` 宣言のファイル解決基準 dir で、inline module
+/// (`mod internal { pub mod api; }`) へ潜るたびに module 名を積む — inline 階層内の
+/// 外部 mod 宣言は `internal/api.rs` を指すため。
 #[allow(clippy::too_many_arguments)]
 fn collect_modules_with_visibility(
     source: RustSourceTree<'_>,
@@ -952,7 +956,7 @@ fn collect_modules_with_visibility(
     dir: &str,
     info: &RustPrivateModuleInfo,
     current_segments: &[String],
-    current_file_rel: &std::path::Path,
+    base_dir: &std::path::Path,
     result: &mut std::collections::HashMap<Vec<String>, Vec<String>>,
     frontier: &mut Vec<(Vec<String>, std::path::PathBuf)>,
 ) -> Option<()> {
@@ -980,6 +984,7 @@ fn collect_modules_with_visibility(
             for child in node.children(&mut cursor) {
                 if child.kind() == "declaration_list" {
                     has_inline_body = true;
+                    let inline_base = base_dir.join(&name);
                     let mut inner_cursor = child.walk();
                     for inner in child.named_children(&mut inner_cursor) {
                         collect_modules_with_visibility(
@@ -989,7 +994,7 @@ fn collect_modules_with_visibility(
                             dir,
                             info,
                             &child_segments,
-                            current_file_rel,
+                            &inline_base,
                             result,
                             frontier,
                         )?;
@@ -997,7 +1002,6 @@ fn collect_modules_with_visibility(
                 }
             }
             if !has_inline_body {
-                let base_dir = child_module_base_dir(current_file_rel);
                 let as_mod = base_dir.join(&name).join("mod.rs");
                 let as_file = base_dir.join(format!("{name}.rs"));
                 if read_rust_module_source(source, dir, &info.crate_root_rel, &as_mod).is_some() {
@@ -1019,7 +1023,7 @@ fn collect_modules_with_visibility(
                     dir,
                     info,
                     current_segments,
-                    current_file_rel,
+                    base_dir,
                     result,
                     frontier,
                 )?;
@@ -1068,6 +1072,7 @@ pub(crate) fn public_reachable_modules(
         let module_source =
             read_rust_module_source(source, dir, &info.crate_root_rel, &current_rel)?;
         let tree = parser::parse_source(&module_source, crate::language::LangId::Rust).ok()?;
+        let base_dir = child_module_base_dir(&current_rel);
         collect_public_pub_mods(
             source,
             tree.root_node(),
@@ -1075,7 +1080,7 @@ pub(crate) fn public_reachable_modules(
             dir,
             info,
             &segments,
-            &current_rel,
+            &base_dir,
             &mut result,
             &mut frontier,
         )?;
@@ -1086,6 +1091,8 @@ pub(crate) fn public_reachable_modules(
 /// `lib.rs` / 親モジュールファイルから子の `pub mod` を `source` 経由で再帰的に集める。
 /// inline body は同じファイル内で walk 続行、宣言のみは次のモジュールファイルを resolve して
 /// frontier に積む (リファクタ Step 3: `_at_base` / `_at_worktree` の本体統合)。
+/// `base_dir` は子 `mod name;` のファイル解決基準 dir (inline module へ潜るたびに
+/// module 名を積む — `mod internal { pub mod api; }` の api は `internal/api.rs`)。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_public_pub_mods(
     source: RustSourceTree<'_>,
@@ -1094,7 +1101,7 @@ pub(crate) fn collect_public_pub_mods(
     dir: &str,
     info: &RustPrivateModuleInfo,
     current_segments: &[String],
-    current_file_rel: &std::path::Path,
+    base_dir: &std::path::Path,
     result: &mut std::collections::HashSet<Vec<String>>,
     frontier: &mut Vec<(Vec<String>, std::path::PathBuf)>,
 ) -> Option<()> {
@@ -1119,6 +1126,7 @@ pub(crate) fn collect_public_pub_mods(
             for child in node.children(&mut cursor) {
                 if child.kind() == "declaration_list" {
                     has_inline_body = true;
+                    let inline_base = base_dir.join(&name);
                     let mut inner_cursor = child.walk();
                     for inner in child.named_children(&mut inner_cursor) {
                         collect_public_pub_mods(
@@ -1128,7 +1136,7 @@ pub(crate) fn collect_public_pub_mods(
                             dir,
                             info,
                             &child_segments,
-                            current_file_rel,
+                            &inline_base,
                             result,
                             frontier,
                         )?;
@@ -1136,7 +1144,6 @@ pub(crate) fn collect_public_pub_mods(
                 }
             }
             if !has_inline_body {
-                let base_dir = child_module_base_dir(current_file_rel);
                 let as_mod = base_dir.join(&name).join("mod.rs");
                 let as_file = base_dir.join(format!("{name}.rs"));
                 if read_rust_module_source(source, dir, &info.crate_root_rel, &as_mod).is_some() {
@@ -1158,7 +1165,7 @@ pub(crate) fn collect_public_pub_mods(
                     dir,
                     info,
                     current_segments,
-                    current_file_rel,
+                    base_dir,
                     result,
                     frontier,
                 )?;
