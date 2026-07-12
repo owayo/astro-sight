@@ -477,6 +477,7 @@ fn classify_signature_change(
         ref_index,
         dir,
         &name,
+        kind,
         base,
         &df.new_path,
         diff_files,

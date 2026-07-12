@@ -2618,6 +2618,59 @@ fn detect_api_changes_ts_shadowed_local_fn_with_caller_outside_diff_stays_modifi
     );
 }
 
+/// shadow 除外で全参照が消える (対象 API 自体は未使用で、別ファイルの同名ローカル関数と
+/// その呼び出ししか無い) 場合は closed にしない — 対象 caller の追随を 1 件も確認して
+/// いないため blocking を維持する (codex レビュー指摘の fail-open 回帰テスト)。
+#[test]
+fn detect_api_changes_ts_all_refs_shadowed_stays_modified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/lib/capture.ts",
+                "export function startRecording(options: {\n    fps: number;\n}): string {\n    return `rec:${options.fps}`;\n}\n",
+            ),
+            (
+                "src/tap.ts",
+                "function startRecording(p: number): number {\n    return p * 2;\n}\nwindow.addEventListener(\"message\", () => {\n    const res = startRecording(1);\n    console.log(res);\n});\n",
+            ),
+        ],
+        "base",
+    );
+    // 対象 API のみシグネチャ変更。対象 API への呼び出しはリポジトリに存在しない。
+    fs::write(
+        repo.join("src/lib/capture.ts"),
+        "export function startRecording(options: {\n    fps: number;\n    cursor: boolean;\n}): string {\n    return `rec:${options.fps}:${options.cursor}`;\n}\n",
+    )
+    .expect("write");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/lib/capture.ts".to_string(),
+        new_path: "src/lib/capture.ts".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 5,
+            new_start: 1,
+            new_count: 6,
+        }],
+        deleted_old_source: None,
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        !api.modified_closed_in_diff
+            .iter()
+            .any(|m| m.name.ends_with("startRecording")),
+        "shadow 除外で参照 0 件なら closed に降格しない。mod={:?} mod_closed={:?}",
+        api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+        api.modified_closed_in_diff
+            .iter()
+            .map(|m| &m.name)
+            .collect::<Vec<_>>()
+    );
+}
+
 /// `obj.startRecording()` (property 位置) の diff 外参照は shadow 除外できず blocking 維持
 /// (member 経由は対象 API への参照か静的に判定できないため fail-closed)。
 #[test]

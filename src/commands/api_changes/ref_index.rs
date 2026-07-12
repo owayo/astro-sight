@@ -139,6 +139,7 @@ pub(crate) fn is_modified_closed_in_diff(
     index: &ApiRefIndex,
     dir: &str,
     name: &str,
+    kind: &str,
     base: &str,
     target_new_path: &str,
     diff_files: &[crate::models::impact::DiffFile],
@@ -161,13 +162,15 @@ pub(crate) fn is_modified_closed_in_diff(
     if target_def_count != 1 {
         return false;
     }
-    // 他ファイルの同名定義がある場合、JS/TS/TSX のトップレベル関数 (bare 名 = `.` なし)
-    // のみ shadow resolver での参照単位除外に進む。それ以外は従来どおり blocking。
+    // 他ファイルの同名定義がある場合、JS/TS/TSX の**トップレベル関数** (bare 名かつ
+    // kind=function) のみ shadow resolver での参照単位除外に進む。class / const /
+    // type alias 等や method qualname、他言語は従来どおり blocking。
     let has_foreign_defs = defs.len() > target_def_count;
     let target_lang =
         crate::language::LangId::from_path(camino::Utf8Path::new(target_new_path)).ok();
     if has_foreign_defs
         && (name.contains('.')
+            || kind != "function"
             || !matches!(
                 target_lang,
                 Some(
@@ -207,6 +210,9 @@ pub(crate) fn is_modified_closed_in_diff(
     // 全ての呼び出し参照が、diff 内ファイルかつ実際の追加/変更行 (context 行ではない) にあるか。
     // HunkInfo の new 範囲は context 行を含むため、git diff から実 `+` 行集合を取得して照合する
     // (codex 指摘: context 行に古い呼び出しが入ると未更新 caller を誤って closed 判定してしまう)。
+    // shadow 除外で全参照が消えた場合は「対象 API の caller を 1 件も確認できていない」
+    // ため closed にしない (除外前の空チェックだけだと fail-open になる)。
+    let mut effective_call_refs = 0usize;
     for r in &call_refs {
         // 他ファイルの同名定義がある場合: 変更対象ファイル以外の参照で、lexical scope が
         // 同一ファイルの function_declaration に束縛されるものは対象 API と無関係な
@@ -219,6 +225,7 @@ pub(crate) fn is_modified_closed_in_diff(
         {
             continue;
         }
+        effective_call_refs += 1;
         let Some(df) = diff_files.iter().find(|df| {
             df.new_path != "/dev/null" && diff_path_matches_ref(&df.new_path, &r.path, dir)
         }) else {
@@ -243,7 +250,7 @@ pub(crate) fn is_modified_closed_in_diff(
             }
         }
     }
-    true
+    effective_call_refs > 0
 }
 
 /// 参照ファイルを parse (キャッシュ) して shadow binding を解決する。
@@ -263,12 +270,18 @@ fn resolve_ref_shadow_binding(
     )
 }
 
-/// 参照ファイルの parse 結果 (キャッシュ付き) を返す。
+/// 参照ファイルの parse 結果 (キャッシュ付き) を返す。読み込みは `parser::read_file`
+/// (100MB 上限 + TOCTOU 対策 + mmap ゼロコピー) を通し、`std::fs::read` の無制限読み込みを
+/// 迂回経路にしない。
 fn parsed_ref_file<'a>(
     dir: &str,
     ref_path: &str,
     caches: &'a mut ApiClosureCaches,
-) -> Option<&'a (Vec<u8>, tree_sitter::Tree, crate::language::LangId)> {
+) -> Option<&'a (
+    crate::engine::parser::SourceBuf,
+    tree_sitter::Tree,
+    crate::language::LangId,
+)> {
     caches
         .parsed_refs
         .entry(ref_path.to_string())
@@ -278,8 +291,9 @@ fn parsed_ref_file<'a>(
             } else {
                 std::path::Path::new(dir).join(ref_path)
             };
+            let abs_utf8 = camino::Utf8PathBuf::from_path_buf(abs).ok()?;
             let lang = crate::language::LangId::from_path(camino::Utf8Path::new(ref_path)).ok()?;
-            let source = std::fs::read(&abs).ok()?;
+            let source = crate::engine::parser::read_file(&abs_utf8).ok()?;
             let tree = crate::engine::parser::parse_source(&source, lang).ok()?;
             Some((source, tree, lang))
         })
@@ -349,7 +363,11 @@ pub(crate) struct ApiClosureCaches {
     #[allow(clippy::type_complexity)]
     pub(crate) parsed_refs: std::collections::HashMap<
         String,
-        Option<(Vec<u8>, tree_sitter::Tree, crate::language::LangId)>,
+        Option<(
+            crate::engine::parser::SourceBuf,
+            tree_sitter::Tree,
+            crate::language::LangId,
+        )>,
     >,
 }
 

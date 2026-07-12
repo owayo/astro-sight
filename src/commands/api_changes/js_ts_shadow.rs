@@ -139,29 +139,58 @@ fn find_binding_in_scope(scope: Node<'_>, source: &[u8], name: &str) -> Option<B
     }
 
     let body = scope.child_by_field_name("body").unwrap_or(scope);
-    find_binding_in_subtree(body, source, name)
+    find_binding_in_subtree(body, source, name, false)
 }
 
-/// `node` 配下 (ネスト scope の内側は除く) の宣言 binding を探す。
-fn find_binding_in_subtree(node: Node<'_>, source: &[u8], name: &str) -> Option<BindingKind> {
+/// `node` 配下の宣言 binding を探す。
+///
+/// `in_nested_block = false` は現 scope 直下 (lexical binding = function / class /
+/// let / const / import / var 全部が有効)。`true` はネストした block 内 (module /
+/// strict mode の block-level function・let・const は block scope なので現 scope の
+/// binding にならない — `var` だけが関数 scope へ hoist されるため拾う)。
+/// これを分けないと `if (flag) { function startRecording() {} }` の block 内宣言を
+/// 外側の呼び出しの binding と誤認し、未更新 caller を誤って closed にする fail-open
+/// になる (codex レビュー指摘)。
+fn find_binding_in_subtree(
+    node: Node<'_>,
+    source: &[u8],
+    name: &str,
+    in_nested_block: bool,
+) -> Option<BindingKind> {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
             "function_declaration" | "generator_function_declaration" => {
-                if child
-                    .child_by_field_name("name")
-                    .is_some_and(|n| n.utf8_text(source).ok() == Some(name))
+                if !in_nested_block
+                    && child
+                        .child_by_field_name("name")
+                        .is_some_and(|n| n.utf8_text(source).ok() == Some(name))
                 {
                     return Some(BindingKind::FunctionDeclaration);
                 }
                 // 内側 (parameters / body) はネスト scope なので潜らない。
             }
             "class_declaration" => {
-                if child
-                    .child_by_field_name("name")
-                    .is_some_and(|n| n.utf8_text(source).ok() == Some(name))
+                if !in_nested_block
+                    && child
+                        .child_by_field_name("name")
+                        .is_some_and(|n| n.utf8_text(source).ok() == Some(name))
                 {
                     return Some(BindingKind::Other);
+                }
+            }
+            // let / const は block scope: ネスト block 内の宣言は現 scope の binding でない。
+            "lexical_declaration" => {
+                if !in_nested_block
+                    && let Some(found) = find_binding_in_subtree(child, source, name, false)
+                {
+                    return Some(found);
+                }
+            }
+            // var は関数 scope に hoist されるため、ネスト block 内でも拾う。
+            "variable_declaration" => {
+                if let Some(found) = find_binding_in_subtree(child, source, name, in_nested_block) {
+                    return Some(found);
                 }
             }
             "variable_declarator" => {
@@ -173,21 +202,19 @@ fn find_binding_in_subtree(node: Node<'_>, source: &[u8], name: &str) -> Option<
                 // 初期化子内はさらに探索 (ネスト scope は下で打ち切られる)。
                 if let Some(value) = child.child_by_field_name("value")
                     && !is_scope_node(value.kind())
-                    && let Some(found) = find_binding_in_subtree(value, source, name)
+                    && let Some(found) =
+                        find_binding_in_subtree(value, source, name, in_nested_block)
                 {
                     return Some(found);
                 }
             }
             "import_statement" => {
-                if import_binds_name(child, source, name) {
+                if !in_nested_block && import_binds_name(child, source, name) {
                     return Some(BindingKind::Other);
                 }
             }
-            // ネスト scope の内側の宣言はその scope のもの (var hoisting は関数 scope 単位
-            // なので、function 系だけが真の境界。statement_block は scope ノードだが、
-            // var は block を貫通するため潜って拾う — let/const を過剰に拾っても
-            // Other = 除外しない方向なので安全)。
             _ => {
+                // ネストした function 系 / class body の内側はその scope の宣言なので潜らない。
                 if matches!(
                     child.kind(),
                     "function_expression"
@@ -198,7 +225,10 @@ fn find_binding_in_subtree(node: Node<'_>, source: &[u8], name: &str) -> Option<
                 ) {
                     continue;
                 }
-                if let Some(found) = find_binding_in_subtree(child, source, name) {
+                // statement_block (および制御構造の中身) へ潜る際は nested block 扱いに
+                // 切り替え、以降は var 由来の binding だけを拾う。
+                let nested = in_nested_block || child.kind() == "statement_block";
+                if let Some(found) = find_binding_in_subtree(child, source, name, nested) {
                     return Some(found);
                 }
             }
@@ -349,6 +379,17 @@ mod tests {
         let src = "function startRecording() {}\nfunction outer({ startRecording }: { startRecording: () => void }) {\n    startRecording();\n}\n";
         assert_eq!(
             resolve_at(src, "startRecording", 2, 4),
+            LocalResolution::OtherOrAmbiguous
+        );
+    }
+
+    /// block-level function はネスト block の scope に閉じる (module/strict mode)。
+    /// 外側の呼び出しはそれに束縛されず import に束縛されるため Other (codex 指摘)。
+    #[test]
+    fn block_level_function_does_not_shadow_outer_call() {
+        let src = "import { startRecording } from \"./capture\";\nfunction caller(flag: boolean) {\n    if (flag) {\n        function startRecording() {}\n    }\n    startRecording({ fps: 30 });\n}\n";
+        assert_eq!(
+            resolve_at(src, "startRecording", 5, 4),
             LocalResolution::OtherOrAmbiguous
         );
     }
