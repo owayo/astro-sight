@@ -2694,6 +2694,84 @@ fn detect_api_changes_ts_switch_scoped_fn_does_not_shadow_unupdated_caller() {
     );
 }
 
+/// for-of の loop 変数は for scope の binding: 同名 loop 変数経由の呼び出し (中身は alias
+/// import した対象 API かもしれない) を、外側の同名ローカル関数への束縛と誤解決して shadow
+/// 除外しない — 未追随の可能性がある限り blocking を維持する (for ヘッダ binding 対応)。
+#[test]
+fn detect_api_changes_ts_for_of_loop_variable_does_not_shadow_unupdated_caller() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/lib/capture.ts",
+                "export function startRecording(options: {\n    fps: number;\n}): string {\n    return `rec:${options.fps}`;\n}\n",
+            ),
+            // ローカル同名関数 + alias import した対象 API を loop 変数 (同名) 経由で呼ぶ。
+            // loop 変数への呼び出しはローカル関数に束縛されない (for scope の binding)。
+            (
+                "src/tap.ts",
+                "import { startRecording as rec } from \"./lib/capture\";\nfunction startRecording() {}\nexport function caller() {\n    for (const startRecording of [rec]) {\n        startRecording({ fps: 30 });\n    }\n    return startRecording;\n}\n",
+            ),
+            (
+                "src/content.ts",
+                "import { startRecording } from \"./lib/capture\";\n\nexport function onStart() {\n    return startRecording({ fps: 30 });\n}\n",
+            ),
+        ],
+        "base",
+    );
+    // 対象 API 変更 + content.ts (更新済み caller) のみ追随。tap.ts の loop 変数呼び出しは
+    // 未更新・diff 外のまま。
+    fs::write(
+        repo.join("src/lib/capture.ts"),
+        "export function startRecording(options: {\n    fps: number;\n    cursor: boolean;\n}): string {\n    return `rec:${options.fps}:${options.cursor}`;\n}\n",
+    )
+    .expect("write");
+    fs::write(
+        repo.join("src/content.ts"),
+        "import { startRecording } from \"./lib/capture\";\n\nexport function onStart() {\n    return startRecording({ fps: 30, cursor: true });\n}\n",
+    )
+    .expect("write");
+    let diff_files = vec![
+        crate::models::impact::DiffFile {
+            old_path: "src/lib/capture.ts".to_string(),
+            new_path: "src/lib/capture.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 5,
+                new_start: 1,
+                new_count: 6,
+            }],
+            deleted_old_source: None,
+        },
+        crate::models::impact::DiffFile {
+            old_path: "src/content.ts".to_string(),
+            new_path: "src/content.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 4,
+                old_count: 1,
+                new_start: 4,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        },
+    ];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.modified
+            .iter()
+            .any(|m| m.name.ends_with("startRecording")),
+        "loop 変数呼び出しは shadow 除外せず、未更新 caller (tap.ts) がある限り blocking 維持。mod={:?} mod_closed={:?}",
+        api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+        api.modified_closed_in_diff
+            .iter()
+            .map(|m| &m.name)
+            .collect::<Vec<_>>()
+    );
+}
+
 /// shadow 除外で全参照が消える (対象 API 自体は未使用で、別ファイルの同名ローカル関数と
 /// その呼び出ししか無い) 場合は closed にしない — 対象 caller の追随を 1 件も確認して
 /// いないため blocking を維持する (codex レビュー指摘の fail-open 回帰テスト)。

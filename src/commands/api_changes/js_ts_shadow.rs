@@ -138,6 +138,15 @@ fn find_binding_in_scope(scope: Node<'_>, source: &[u8], name: &str) -> Option<B
     {
         return Some(BindingKind::Other);
     }
+    // for-of / for-in の loop 変数 (`for (const x of xs)`) は left field の bare pattern
+    // (lexical_declaration に包まれない) のため body 探索では見えない。ここで拾わないと
+    // loop 変数への参照を外側の同名 function_declaration へ誤解決する (fail-open)。
+    if scope.kind() == "for_in_statement"
+        && let Some(left) = scope.child_by_field_name("left")
+        && pattern_binds_name(left, source, name)
+    {
+        return Some(BindingKind::Other);
+    }
 
     let body = scope.child_by_field_name("body").unwrap_or(scope);
     find_binding_in_subtree(body, source, name, false)
@@ -225,6 +234,18 @@ fn find_binding_in_subtree(
                         | "class_body"
                 ) {
                     continue;
+                }
+                // `for (var x of xs)` の var ヘッダ binding は関数 scope へ hoist される。
+                // left は variable_declaration に包まれない bare pattern のため専用処理
+                // (let/const は for scope 限りなので拾わない)。
+                if child.kind() == "for_in_statement"
+                    && child
+                        .child_by_field_name("kind")
+                        .is_some_and(|k| k.kind() == "var")
+                    && let Some(left) = child.child_by_field_name("left")
+                    && pattern_binds_name(left, source, name)
+                {
+                    return Some(BindingKind::Other);
                 }
                 // statement_block / switch_body (および制御構造の中身) へ潜る際は
                 // nested block 扱いに切り替え、以降は var 由来の binding だけを拾う。
@@ -402,6 +423,59 @@ mod tests {
         let src = "import { startRecording } from \"./capture\";\nfunction caller(x: number) {\n    switch (x) {\n        case 1:\n            function startRecording() {}\n    }\n    startRecording({ fps: 30 });\n}\n";
         assert_eq!(
             resolve_at(src, "startRecording", 6, 4),
+            LocalResolution::OtherOrAmbiguous
+        );
+    }
+
+    /// for-of の loop 変数が同名の場合、その参照は loop 変数に束縛される。
+    /// ヘッダ binding を見ずに外側の function_declaration へ誤解決しない (fail-open 防止)。
+    #[test]
+    fn for_of_loop_variable_shadows_same_file_function() {
+        let src = "function startRecording() {}\nfunction caller(recorders: Array<() => void>) {\n    for (const startRecording of recorders) {\n        startRecording();\n    }\n}\n";
+        assert_eq!(
+            resolve_at(src, "startRecording", 3, 8),
+            LocalResolution::OtherOrAmbiguous
+        );
+    }
+
+    /// 単文 body の for-of (enclosing scope が for_in_statement 自体) でも
+    /// loop 変数 binding を拾う。
+    #[test]
+    fn for_of_single_statement_body_loop_variable_is_ambiguous() {
+        let src = "function startRecording() {}\nfunction caller(recorders: Array<() => void>) {\n    for (const startRecording of recorders) startRecording();\n}\n";
+        assert_eq!(
+            resolve_at(src, "startRecording", 2, 44),
+            LocalResolution::OtherOrAmbiguous
+        );
+    }
+
+    /// destructuring の loop 変数 (`for (const { name } of xs)`) も binding。
+    #[test]
+    fn for_of_destructured_loop_variable_is_ambiguous() {
+        let src = "function startRecording() {}\nfunction caller(items: Array<{ startRecording: () => void }>) {\n    for (const { startRecording } of items) {\n        startRecording();\n    }\n}\n";
+        assert_eq!(
+            resolve_at(src, "startRecording", 3, 8),
+            LocalResolution::OtherOrAmbiguous
+        );
+    }
+
+    /// for 初期化子 (`for (let f = ...;;)`) の binding も for scope の binding。
+    #[test]
+    fn for_initializer_binding_shadows_same_file_function() {
+        let src = "function startRecording() {}\nfunction caller(fns: Array<() => void>) {\n    for (let startRecording = fns[0], i = 0; i < 1; i++) {\n        startRecording();\n    }\n}\n";
+        assert_eq!(
+            resolve_at(src, "startRecording", 3, 8),
+            LocalResolution::OtherOrAmbiguous
+        );
+    }
+
+    /// `for (var x of xs)` の var ヘッダ binding は関数 scope へ hoist され、
+    /// for の外側の参照も shadow する。
+    #[test]
+    fn hoisted_var_for_of_header_is_ambiguous() {
+        let src = "function startRecording() {}\nfunction caller(recorders: Array<() => void>) {\n    for (var startRecording of recorders) {\n    }\n    startRecording();\n}\n";
+        assert_eq!(
+            resolve_at(src, "startRecording", 4, 4),
             LocalResolution::OtherOrAmbiguous
         );
     }
