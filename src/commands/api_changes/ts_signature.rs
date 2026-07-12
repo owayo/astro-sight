@@ -1116,3 +1116,42 @@ pub(crate) fn find_top_level_function_by_name<'a>(
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::language::LangId;
+
+    fn keys(src: &str, name: &str) -> Option<ObjectMemberKeys> {
+        extract_object_member_keys(src.as_bytes(), LangId::Typescript, name)
+    }
+
+    /// 冗長括弧付き object literal `({ ... })` も unwrap して member schema を取れる (B-4)。
+    /// 透過しないと unused object member 削除の互換降格が効かず blocking のまま残っていた。
+    #[test]
+    fn parenthesized_object_literal_is_unwrapped() {
+        let src = "export const config = ({ a: 1, b: 2 });\n";
+        let r = keys(src, "config").expect("括弧付き object literal を抽出できるべき");
+        let expected: HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(r.member_keys, expected);
+        assert!(r.record_keys.is_none());
+    }
+
+    /// 括弧 + `as const` の組み合わせ `({ ... } as const)` も透過できる。
+    #[test]
+    fn parenthesized_with_as_const_is_unwrapped() {
+        let src = "export const config = ({ a: 1 } as const);\n";
+        let r = keys(src, "config").expect("括弧 + as const を抽出できるべき");
+        let expected: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(r.member_keys, expected);
+    }
+
+    /// 括弧なしの通常 object literal は従来どおり抽出できる (回帰確認)。
+    #[test]
+    fn plain_object_literal_is_unwrapped() {
+        let src = "export const config = { a: 1 };\n";
+        let r = keys(src, "config").expect("通常 object literal を抽出できるべき");
+        let expected: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(r.member_keys, expected);
+    }
+}
