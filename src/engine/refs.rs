@@ -2150,6 +2150,25 @@ pub(crate) fn visit_refs_and_defs_in_file_cb<V: RefVisitor>(
     Ok(())
 }
 
+/// 参照 identifier の AST 上の使われ方 (Rust のみ分類、他言語は `Other`)。
+///
+/// シグネチャのみ変更された関数への `FunctionValue` 参照 (高階 API への値渡し) は
+/// トレイト境界 (Bevy `IntoSystem` 等) に吸収されコンパイルが通ることが多く、
+/// blocking impact ではなく informational へ格下げする材料になる。
+/// `fn(...)` 型へ固定される `TypeConstrainedValue` はシグネチャ変更で壊れるため
+/// blocking 維持。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefUsageRole {
+    /// `foo(...)` の callee 位置。
+    CallCallee,
+    /// arguments / tuple / array 要素・メソッドレシーバとしての関数値渡し。
+    FunctionValue,
+    /// `let x: fn(..) = foo;` / `foo as fn(..)` のような fn ポインタ型固定の値。
+    TypeConstrainedValue,
+    /// それ以外 (型位置・通常の変数参照・分類対象外言語)。
+    Other,
+}
+
 /// `visit_refs_and_defs_in_file_cb` が visitor に渡す最小参照イベント。
 pub(crate) struct RefVisitEvent<'a> {
     pub(crate) sym_ix: u32,
@@ -2166,6 +2185,8 @@ pub(crate) struct RefVisitEvent<'a> {
     pub(crate) confidence: RefConfidence,
     /// Rust macro invocation の callee identifier かどうか。
     pub(crate) rust_macro_callee: bool,
+    /// 参照の AST 上の使われ方 (identifier 経路のみ分類、他経路は `Other`)。
+    pub(crate) usage: RefUsageRole,
 }
 
 /// `visit_refs_and_defs_in_file_cb` が内部で呼び出す訪問者 trait。
@@ -2204,6 +2225,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
         // それまでは PHP も含めて ExactOwner を渡し、挙動互換を保つ。
         let confidence = classify_method_ref_confidence(node, source, lang_id, is_def);
         let rust_macro_callee = is_rust_macro_invocation_callee(node, lang_id);
+        let usage = classify_ref_usage_role(node, lang_id);
         for &ix in indices {
             visitor.on_ref(RefVisitEvent {
                 sym_ix: ix as u32,
@@ -2214,6 +2236,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
                 is_def,
                 confidence,
                 rust_macro_callee,
+                usage,
             });
         }
     }
@@ -2231,6 +2254,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
                     is_def: false,
                     confidence: RefConfidence::ExactOwner,
                     rust_macro_callee: false,
+                    usage: RefUsageRole::Other,
                 });
             }
         }
@@ -2250,6 +2274,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
                     is_def: false,
                     confidence: RefConfidence::ExactOwner,
                     rust_macro_callee: false,
+                    usage: RefUsageRole::Other,
                 });
             }
         }
@@ -2269,6 +2294,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
                     is_def: false,
                     confidence: RefConfidence::ExactOwner,
                     rust_macro_callee: false,
+                    usage: RefUsageRole::Other,
                 });
             }
         }
@@ -2291,6 +2317,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
                 is_def: false,
                 confidence: RefConfidence::ExactOwner,
                 rust_macro_callee: false,
+                usage: RefUsageRole::Other,
             });
         }
     }
@@ -2310,6 +2337,7 @@ fn collect_refs_and_defs_indexed_cb<V: RefVisitor>(
                 is_def: false,
                 confidence: RefConfidence::ExactOwner,
                 rust_macro_callee: false,
+                usage: RefUsageRole::Other,
             });
         }
     }
@@ -2346,6 +2374,79 @@ fn is_rust_macro_invocation_callee(node: Node<'_>, lang_id: LangId) -> bool {
         cur = parent;
     }
     false
+}
+
+/// Rust の参照 identifier の使われ方を分類する (他言語は `Other`)。
+/// `scoped_identifier` (`path::name`) / `generic_function` (`f::<T>`) のラッパーは
+/// 登ってから直上の親で判定する。
+fn classify_ref_usage_role(node: Node<'_>, lang_id: LangId) -> RefUsageRole {
+    if lang_id != LangId::Rust {
+        return RefUsageRole::Other;
+    }
+    let mut cur = node;
+    while let Some(parent) = cur.parent() {
+        match parent.kind() {
+            "scoped_identifier" | "generic_function" => cur = parent,
+            _ => break,
+        }
+    }
+    let Some(parent) = cur.parent() else {
+        return RefUsageRole::Other;
+    };
+    match parent.kind() {
+        "call_expression" => {
+            if parent
+                .child_by_field_name("function")
+                .is_some_and(|f| f.id() == cur.id())
+            {
+                RefUsageRole::CallCallee
+            } else {
+                RefUsageRole::Other
+            }
+        }
+        // 関数値としての受け渡し位置。call の実引数は `arguments` 配下、
+        // タプル/配列要素、`my_system.after(..)` のようなメソッドレシーバも含む。
+        "arguments" | "tuple_expression" | "array_expression" => RefUsageRole::FunctionValue,
+        "field_expression" => {
+            if parent
+                .child_by_field_name("value")
+                .is_some_and(|v| v.id() == cur.id())
+            {
+                RefUsageRole::FunctionValue
+            } else {
+                RefUsageRole::Other
+            }
+        }
+        // `let x: fn(..) = foo;` / `static X: fn(..) = foo;` / `foo as fn(..)` は
+        // fn ポインタ型に固定されるためシグネチャ変更で壊れる。
+        "let_declaration" | "const_item" | "static_item" => {
+            let is_value = parent
+                .child_by_field_name("value")
+                .is_some_and(|v| v.id() == cur.id());
+            let is_fn_type = parent
+                .child_by_field_name("type")
+                .is_some_and(|t| t.kind() == "function_type");
+            if is_value && is_fn_type {
+                RefUsageRole::TypeConstrainedValue
+            } else {
+                RefUsageRole::Other
+            }
+        }
+        "type_cast_expression" => {
+            let is_value = parent
+                .child_by_field_name("value")
+                .is_some_and(|v| v.id() == cur.id());
+            let is_fn_type = parent
+                .child_by_field_name("type")
+                .is_some_and(|t| t.kind() == "function_type");
+            if is_value && is_fn_type {
+                RefUsageRole::TypeConstrainedValue
+            } else {
+                RefUsageRole::Other
+            }
+        }
+        _ => RefUsageRole::Other,
+    }
 }
 
 /// receiver-aware な method ref 確信度判定 (Phase 3 で PHP に拡張予定)。
@@ -4160,5 +4261,52 @@ struct Bar {
         assert_eq!(line, 2, "参照は 3 行目 (0-indexed 2)");
         assert_eq!(column, 4, "column はファイル絶対列 (インデント 4 込み)");
         assert_eq!(context_column, 0, "context_column は trim 済み行内の相対列");
+    }
+
+    /// Rust の参照 usage role 分類 (Issue 2026-07-12-bevy-systemparam-optional-res-impact-fp)。
+    /// callee / タプル値渡し / 直接引数値渡し / fn 型固定 let を区別する。
+    #[test]
+    fn classify_rust_ref_usage_roles() {
+        let source = b"fn my_system(x: u32) { let _ = x; }\n\
+                       fn register<F>(_f: F) {}\n\
+                       fn setup() {\n\
+                           my_system(1);\n\
+                           register((1, my_system, 2));\n\
+                           register(my_system);\n\
+                           let pinned: fn(u32) = my_system;\n\
+                           let _ = pinned;\n\
+                       }\n";
+        let tree = crate::engine::parser::parse_source(source, LangId::Rust).unwrap();
+
+        // (行, 期待 role) — my_system の参照出現行 (0-indexed)
+        let mut roles: Vec<(usize, RefUsageRole)> = Vec::new();
+        fn walk(node: Node<'_>, source: &[u8], roles: &mut Vec<(usize, RefUsageRole)>) {
+            if node.kind() == "identifier"
+                && node.utf8_text(source).ok() == Some("my_system")
+                && node.start_position().row >= 3
+            {
+                roles.push((
+                    node.start_position().row,
+                    classify_ref_usage_role(node, LangId::Rust),
+                ));
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                walk(child, source, roles);
+            }
+        }
+        walk(tree.root_node(), source, &mut roles);
+        roles.sort_by_key(|(row, _)| *row);
+
+        assert_eq!(
+            roles,
+            vec![
+                (3, RefUsageRole::CallCallee),           // my_system(1)
+                (4, RefUsageRole::FunctionValue),        // (1, my_system, 2) タプル要素
+                (5, RefUsageRole::FunctionValue),        // register(my_system) 直接引数
+                (6, RefUsageRole::TypeConstrainedValue), // let pinned: fn(u32) = my_system
+            ],
+            "roles: {roles:?}"
+        );
     }
 }

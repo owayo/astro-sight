@@ -34,9 +34,18 @@ pub fn extract_imports(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result
             }
 
             // ソーステキストをクリーンアップ（文字列リテラルの引用符を除去）
-            let clean_source = source_text
+            let mut clean_source = source_text
                 .trim_matches(|c| c == '"' || c == '\'' || c == '`')
                 .to_string();
+
+            // PHP grouped use: `use App\Services\{Mailer, Logger};` の clause は宣言側の
+            // namespace prefix を含まないため、単独 use (`App\Services\Mailer`) と同じ
+            // 完全修飾形式に合成する。
+            if lang_id == LangId::Php
+                && let Some(prefix) = php_group_use_prefix(node, source)
+            {
+                clean_source = format!("{prefix}\\{clean_source}");
+            }
 
             // コンテキスト: import 文の全テキストを取得
             // import 文ノードまで上方走査
@@ -95,6 +104,31 @@ fn collect_import_statement_lines(node: Node<'_>, lines: &mut HashSet<usize>) {
     }
 }
 
+/// PHP grouped use の clause 内 capture に対し、宣言側の namespace prefix を返す。
+/// 親 chain に `namespace_use_group` が無い (単独 use) 場合は `None`。
+fn php_group_use_prefix(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let mut in_group = false;
+    let mut cur = node.parent()?;
+    loop {
+        match cur.kind() {
+            "namespace_use_group" => in_group = true,
+            "namespace_use_declaration" => break,
+            _ => {}
+        }
+        cur = cur.parent()?;
+    }
+    if !in_group {
+        return None;
+    }
+    let mut cursor = cur.walk();
+    for child in cur.named_children(&mut cursor) {
+        if child.kind() == "namespace_name" {
+            return child.utf8_text(source).ok().map(str::to_string);
+        }
+    }
+    None
+}
+
 /// import/use/include 文ノードまで上方走査する。
 fn find_import_statement(node: Node<'_>) -> Node<'_> {
     let import_kinds = [
@@ -146,7 +180,9 @@ fn import_query(lang_id: LangId) -> (&'static str, ImportKind) {
         LangId::Python => (
             r#"
             (import_statement name: (dotted_name) @import.source)
+            (import_statement name: (aliased_import name: (dotted_name) @import.source))
             (import_from_statement module_name: (dotted_name) @import.source)
+            (import_from_statement module_name: (relative_import) @import.source)
             "#,
             ImportKind::Import,
         ),
@@ -188,6 +224,10 @@ fn import_query(lang_id: LangId) -> (&'static str, ImportKind) {
             (namespace_use_declaration
               (namespace_use_clause
                 [(qualified_name) (name)] @import.source))
+            (namespace_use_declaration
+              (namespace_use_group
+                (namespace_use_clause
+                  [(qualified_name) (name)] @import.source)))
             "#,
             ImportKind::Use,
         ),
@@ -389,5 +429,28 @@ echo not_source\n";
             determine_kind(LangId::Rust, 1, ImportKind::Use),
             ImportKind::Use
         );
+    }
+
+    /// Python の aliased import / relative import を取りこぼさない
+    /// (Issue 2026-07-10-imports-python-alias-relative-php-group)。
+    #[test]
+    fn python_aliased_and_relative_imports_extracted() {
+        let source = b"import numpy as np\nimport a.b.c as abc\nfrom . import sibling\nfrom .relative import helper\nfrom ..pkg import thing\n";
+        let tree = crate::engine::parser::parse_source(source, LangId::Python).unwrap();
+        let edges = extract_imports(tree.root_node(), source, LangId::Python).unwrap();
+        let sources: Vec<&str> = edges.iter().map(|e| e.source.as_str()).collect();
+        assert_eq!(sources, vec!["numpy", "a.b.c", ".", ".relative", "..pkg"]);
+    }
+
+    /// PHP grouped use は宣言側 prefix と合成して完全修飾で出力する。
+    #[test]
+    fn php_grouped_use_extracted_with_prefix() {
+        let source = b"<?php\nuse App\\Services\\{Mailer, Logger};\nuse Single\\Plain;\n";
+        let tree = crate::engine::parser::parse_source(source, LangId::Php).unwrap();
+        let edges = extract_imports(tree.root_node(), source, LangId::Php).unwrap();
+        let sources: Vec<&str> = edges.iter().map(|e| e.source.as_str()).collect();
+        assert!(sources.contains(&"App\\Services\\Mailer"), "{sources:?}");
+        assert!(sources.contains(&"App\\Services\\Logger"), "{sources:?}");
+        assert!(sources.contains(&"Single\\Plain"), "{sources:?}");
     }
 }

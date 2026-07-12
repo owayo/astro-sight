@@ -110,14 +110,19 @@ pub fn extract_all_callees(
     Ok(callees)
 }
 
-/// AST を上方走査し、最も近い関数定義を見つける。
+/// AST を上方走査し、最も近い「名前を解決できる」関数定義を見つける。
+///
+/// 匿名 callback (binding の無い arrow/function expression) は名前解決に失敗するが、
+/// そこで打ち切らず外側の named function へ climb を続ける。即 None にすると
+/// 匿名 callback 内の呼び出し edge が丸ごと消失する。
 fn find_enclosing_function(node: Node<'_>, source: &[u8], lang_id: LangId) -> Option<CallEndpoint> {
     let func_kinds = function_node_kinds(lang_id);
     let mut current = node.parent();
 
     while let Some(n) = current {
-        if func_kinds.contains(&n.kind()) {
-            let name = find_function_name(n, source, lang_id)?;
+        if func_kinds.contains(&n.kind())
+            && let Some(name) = find_function_name(n, source, lang_id)
+        {
             return Some(CallEndpoint {
                 name,
                 range: Range::from(n.range()),
@@ -139,11 +144,13 @@ fn function_node_kinds(lang_id: LangId) -> &'static [&'static str] {
             "function_declaration",
             "method_definition",
             "arrow_function",
+            "function_expression",
         ],
         LangId::Typescript | LangId::Tsx => &[
             "function_declaration",
             "method_definition",
             "arrow_function",
+            "function_expression",
         ],
         LangId::Go => &["function_declaration", "method_declaration"],
         LangId::Php => &["function_definition", "method_declaration"],
@@ -166,6 +173,18 @@ fn function_node_kinds(lang_id: LangId) -> &'static [&'static str] {
 
 /// 関数ノードの名前を抽出する。
 fn find_function_name(node: Node<'_>, source: &[u8], lang_id: LangId) -> Option<String> {
+    // JS/TS の arrow/function expression は自身の "name" では外部から参照できない
+    // (named function expression の name は内部スコープ専用)。親の binding 名を
+    // caller 名とし、binding が無い匿名 callback では偽名 (最初の identifier 子 =
+    // 引数名) を作らず None を返して呼び出し元の climb 継続に委ねる。
+    if matches!(
+        lang_id,
+        LangId::Javascript | LangId::Typescript | LangId::Tsx
+    ) && matches!(node.kind(), "arrow_function" | "function_expression")
+    {
+        return js_ts_binding_name_for_function(node, source);
+    }
+
     // まず "name" フィールドを試行（多くの言語で共通）
     if let Some(name_node) = node.child_by_field_name("name") {
         return name_node.utf8_text(source).ok().map(|s| s.to_string());
@@ -202,6 +221,35 @@ fn find_function_name(node: Node<'_>, source: &[u8], lang_id: LangId) -> Option<
     }
 
     None
+}
+
+/// JS/TS の arrow/function expression の binding 名を親ノードから解決する。
+/// `const f = () => {}` → f / `{ handler: () => {} }` → handler /
+/// `class C { f = () => {} }` → f / `obj.f = () => {}` → f。
+/// binding が無い場合のみ named function expression 自身の name (IIFE 等) に fallback。
+fn js_ts_binding_name_for_function(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let from_parent = node.parent().and_then(|parent| match parent.kind() {
+        "variable_declarator" => parent.child_by_field_name("name"),
+        "pair" => parent.child_by_field_name("key"),
+        "public_field_definition" | "field_definition" => parent
+            .child_by_field_name("name")
+            .or_else(|| parent.child_by_field_name("property")),
+        "assignment_expression" => {
+            let left = parent.child_by_field_name("left")?;
+            match left.kind() {
+                // `module.exports.foo = () => {}` / `this.foo = () => {}` は末尾 property を採る
+                "member_expression" => left.child_by_field_name("property"),
+                _ => Some(left),
+            }
+        }
+        _ => None,
+    });
+    if let Some(name_node) = from_parent {
+        return name_node.utf8_text(source).ok().map(str::to_string);
+    }
+    node.child_by_field_name("name")
+        .and_then(|n| n.utf8_text(source).ok())
+        .map(str::to_string)
 }
 
 /// C/C++ の宣言子ノードから末尾の関数名 (identifier / field_identifier /
@@ -599,5 +647,59 @@ mod tests {
                 lang
             );
         }
+    }
+
+    /// TS の arrow function / function expression の caller は親の binding 名で解決する。
+    /// 単一引数 arrow (`x => ...`) が引数名 "x" に誤帰属したり、`(req) =>` 形や
+    /// function expression の edge が消失したりしない
+    /// (Issue 2026-07-10-ts-arrow-function-caller-attribution)。
+    #[test]
+    fn ts_arrow_and_function_expression_caller_binding_names() {
+        let source = b"function target() {}\n\
+                       export const single = x => { target(); return x; };\n\
+                       export const handler = (req) => { target(); return req; };\n\
+                       function outer() {\n\
+                           const inner = (a, b) => { target(); return a + b; };\n\
+                           return inner;\n\
+                       }\n\
+                       const f = function named() { target(); };\n";
+        let tree = parser::parse_source(source, LangId::Typescript).unwrap();
+        let edges = extract_calls(tree.root_node(), source, LangId::Typescript, None).unwrap();
+        let callers: Vec<&str> = edges
+            .iter()
+            .filter(|e| e.callee.name == "target")
+            .map(|e| e.caller.name.as_str())
+            .collect();
+        assert!(callers.contains(&"single"), "callers: {callers:?}");
+        assert!(callers.contains(&"handler"), "callers: {callers:?}");
+        assert!(callers.contains(&"inner"), "callers: {callers:?}");
+        assert!(callers.contains(&"f"), "callers: {callers:?}");
+        assert!(
+            !callers.contains(&"x"),
+            "arrow の引数名を caller にしない: {callers:?}"
+        );
+    }
+
+    /// object literal の pair (`{ handler: () => {} }`) は key を caller 名にし、
+    /// 匿名 callback (binding 無し) 内の呼び出しは外側の named function へ climb する。
+    #[test]
+    fn ts_pair_key_and_anonymous_callback_climb() {
+        let source = b"function target() {}\n\
+                       export const obj = { onDone: () => { target(); } };\n\
+                       function wrapper() {\n\
+                           [1].map(function () { target(); });\n\
+                       }\n";
+        let tree = parser::parse_source(source, LangId::Typescript).unwrap();
+        let edges = extract_calls(tree.root_node(), source, LangId::Typescript, None).unwrap();
+        let callers: Vec<&str> = edges
+            .iter()
+            .filter(|e| e.callee.name == "target")
+            .map(|e| e.caller.name.as_str())
+            .collect();
+        assert!(callers.contains(&"onDone"), "callers: {callers:?}");
+        assert!(
+            callers.contains(&"wrapper"),
+            "匿名 callback は外側 named function へ帰属: {callers:?}"
+        );
     }
 }

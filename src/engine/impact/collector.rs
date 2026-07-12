@@ -18,7 +18,7 @@ use super::import_facts::{
     rust_ref_file_has_symbol_evidence, should_route_rust_ref_low,
     should_route_ts_importless_ref_low,
 };
-use super::signature::extract_function_from_context;
+use super::signature::{extract_function_from_context, same_top_level_arity};
 use super::test_context::is_ref_in_target_test_context;
 use super::types::{StringPool, SymEntries, TypedCallerMap};
 use super::{FileContext, ParsedFile, ci_key, filters, lang_compat_group};
@@ -70,6 +70,10 @@ pub(super) struct RefEventMini {
     /// Rust: 参照 identifier が `json!()` の callee 名そのものか。通常の関数/値シンボル変更では
     /// macro callee は別名前空間なので low に落とす一方、macro 引数は `ref_in_macro` で high 維持する。
     pub(super) rust_macro_callee: bool,
+    /// Rust: 参照が callee でない関数値渡し (`register((a, my_system, b))` のタプル要素等)。
+    /// シグネチャのみ変更 (arity 不変) の場合、トレイト境界に吸収されコンパイルが通る
+    /// ことが多いため informational へ格下げする (Issue 2026-07-12 Bevy systemparam FP)。
+    pub(super) fn_value_ref: bool,
 }
 
 /// 汎用すぎてシンボル名だけでは owner を特定できない PHP/JS 系メソッド名。
@@ -162,6 +166,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             is_def,
             confidence,
             rust_macro_callee,
+            usage,
         } = event;
         let ix = sym_ix as usize;
         if ix < self.ref_hit.len() {
@@ -231,6 +236,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             local_shadow_hint,
             ref_in_macro,
             rust_macro_callee,
+            fn_value_ref: usage == refs::RefUsageRole::FunctionValue,
         });
     }
 }
@@ -305,11 +311,21 @@ impl<'a> ImpactCollector<'a> {
                 }
 
                 let sym_key_canonical = &self.all_symbol_names[sym_ix_usize];
-                let route_informational = e.is_import
-                    && ctx.affected.iter().any(|sym| {
-                        sym.change_type == "modified"
-                            && ci_key(ctx.lang_id, &sym.name) == *sym_key_canonical
+                // callee でない関数値渡し参照 (`register((a, my_system, b))` のタプル要素等) は、
+                // シグネチャのみ変更 (arity 不変) ならトレイト境界に吸収されコンパイルが通る
+                // ことが多いため informational へ。arity 変更は高階 API でも壊れ得るため、
+                // また removed (存在破壊) は sig_changes に載らないため、どちらも blocking 維持。
+                let fn_value_informational = e.fn_value_ref
+                    && ctx.sig_changes.iter().any(|sc| {
+                        ci_key(ctx.lang_id, &sc.name) == *sym_key_canonical
+                            && same_top_level_arity(&sc.old_signature, &sc.new_signature)
                     });
+                let route_informational = fn_value_informational
+                    || (e.is_import
+                        && ctx.affected.iter().any(|sym| {
+                            sym.change_type == "modified"
+                                && ci_key(ctx.lang_id, &sym.name) == *sym_key_canonical
+                        }));
                 // import-only 参照は、modified シンボルだけ情報提供に分離する。
                 // removed/rename 相当の import は存在破壊になり得るため high 側に残す。
                 let route_low = if e.is_import {
@@ -440,6 +456,7 @@ mod tests {
             local_shadow_hint: false,
             ref_in_macro: false,
             rust_macro_callee: false,
+            fn_value_ref: false,
         }
     }
 

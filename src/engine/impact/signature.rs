@@ -285,6 +285,43 @@ pub(crate) fn extract_function_from_context(context: &str) -> Option<String> {
     None
 }
 
+/// old/new signature のトップレベル引数の個数が同じかを返す。
+/// どちらかの個数を数えられない (括弧が見つからない等) 場合は保守的に false
+/// (= arity が変わった扱いで blocking 維持)。
+pub(crate) fn same_top_level_arity(old_sig: &str, new_sig: &str) -> bool {
+    match (
+        top_level_param_count(old_sig),
+        top_level_param_count(new_sig),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// signature 文字列の最初の `(...)` 内トップレベル引数個数を数える。
+/// generics / ネスト括弧のカンマは深さ追跡で除外する (`fn f(a: HashMap<K, V>)` は 1)。
+fn top_level_param_count(sig: &str) -> Option<usize> {
+    let open = sig.find('(')?;
+    let mut depth = 0usize;
+    let mut count = 0usize;
+    let mut has_any = false;
+    for ch in sig[open..].chars() {
+        match ch {
+            '(' | '<' | '[' | '{' => depth += 1,
+            ')' | '>' | ']' | '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    break;
+                }
+            }
+            ',' if depth == 1 => count += 1,
+            c if !c.is_whitespace() && depth >= 1 => has_any = true,
+            _ => {}
+        }
+    }
+    Some(if has_any { count + 1 } else { 0 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,5 +622,35 @@ mod tests {
             "function",
             LangId::Rust
         ));
+    }
+
+    /// arity 比較: generics / ネスト括弧内のカンマはトップレベル引数として数えない。
+    #[test]
+    fn same_top_level_arity_ignores_nested_commas() {
+        // 型のみ変更 (arity 1 のまま)
+        assert!(same_top_level_arity(
+            "pub fn my_system(r: Res<u32>)",
+            "pub fn my_system(r: Option<Res<u32>>)"
+        ));
+        // generics 内カンマは数えない
+        assert!(same_top_level_arity(
+            "fn f(a: HashMap<K, V>)",
+            "fn f(a: BTreeMap<K, V>)"
+        ));
+        // 引数追加 (arity 1 → 2) は不一致
+        assert!(!same_top_level_arity(
+            "fn f(a: u32)",
+            "fn f(a: u32, b: bool)"
+        ));
+        // 引数なし ↔ あり
+        assert!(!same_top_level_arity("fn f()", "fn f(a: u32)"));
+        assert!(same_top_level_arity("fn f()", "fn f()"));
+        // ネスト fn 型 / 戻り値の `->` に惑わされない
+        assert!(same_top_level_arity(
+            "fn f(cb: fn(u32) -> bool) -> Vec<u8>",
+            "fn f(cb: fn(i64) -> bool) -> Vec<u8>"
+        ));
+        // 括弧が無い signature は保守的に不一致 (blocking 維持)
+        assert!(!same_top_level_arity("const X: u32", "const X: u64"));
     }
 }

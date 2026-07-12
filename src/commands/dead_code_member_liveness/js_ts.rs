@@ -109,14 +109,7 @@ impl JsTsMemberLiveness {
                 continue;
             }
 
-            let analysis = analyze_duplicate_set(
-                bare,
-                &owners,
-                members,
-                &ts_js_files,
-                canonical_dir,
-                &is_test_path,
-            );
+            let analysis = analyze_duplicate_set(bare, &owners, &ts_js_files, &is_test_path);
 
             match analysis {
                 DuplicateSetResult::Ambiguous => {
@@ -154,9 +147,7 @@ impl JsTsMemberLiveness {
 fn analyze_duplicate_set<F>(
     bare: &str,
     owners: &HashSet<&str>,
-    members: &[&MemberCandidate],
     files: &[(std::path::PathBuf, LangId)],
-    canonical_dir: &Path,
     is_test_path: F,
 ) -> DuplicateSetResult
 where
@@ -198,50 +189,23 @@ where
             *lang,
         );
 
-        if analysis.member_access_count == 0 {
+        // receiver を owner へ静的に辿れない access (factory / DI / 関数戻り値・
+        // 引数経由のインスタンス等) が 1 件でもあれば、票の行き先を import 有無で
+        // 推測せず duplicate set 全体を Ambiguous に倒す (旧スキップへフォールバック)。
+        if analysis.has_unresolved_access {
+            return DuplicateSetResult::Ambiguous;
+        }
+        if analysis.resolved_counts.is_empty() {
             continue;
         }
 
-        // duplicate owner のうち、この **ファイル内** で定義されている owner を集める。
-        // 自ファイル内の `this.member` は `imported_owners` 推定だけで unrelated import 側へ
-        // 誤帰属しうるため、自ファイル定義 owner を effective_owners に統合する
-        // (codex review 指摘の FP 修正)。
-        let file_rel = file_path
-            .strip_prefix(canonical_dir)
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let mut local_defined: Vec<&str> = members
-            .iter()
-            .filter(|m| m.file == file_rel)
-            .map(|m| m.owner.as_str())
-            .collect();
-        local_defined.sort();
-        local_defined.dedup();
-
-        let mut effective_owners: Vec<&str> = analysis.imported_owners.clone();
-        for o in &local_defined {
-            if !effective_owners.contains(o) {
-                effective_owners.push(*o);
-            }
-        }
-
-        match effective_owners.len() {
-            1 => {
-                let owner_key = effective_owners[0];
-                let is_test = is_test_path(file_path.as_path());
-                let entry = counts.entry(owner_key.to_string()).or_insert((0, 0));
-                if is_test {
-                    entry.1 = entry.1.saturating_add(analysis.member_access_count);
-                } else {
-                    entry.0 = entry.0.saturating_add(analysis.member_access_count);
-                }
-            }
-            _ => {
-                // imported_owners.len() == 0 (owner import なし、local 定義もなし)、
-                // imported_owners.len() >= 2 (複数 owner import)、
-                // local 定義 + unrelated owner import の混在、いずれも ambiguous。
-                return DuplicateSetResult::Ambiguous;
+        let is_test = is_test_path(file_path.as_path());
+        for (owner, count) in analysis.resolved_counts {
+            let entry = counts.entry(owner).or_insert((0, 0));
+            if is_test {
+                entry.1 = entry.1.saturating_add(count);
+            } else {
+                entry.0 = entry.0.saturating_add(count);
             }
         }
     }
@@ -249,29 +213,42 @@ where
     DuplicateSetResult::Counted(counts)
 }
 
-/// ファイル内 1 つの bare member について import と property access を集計する。
-struct FileAnalysis<'a> {
-    /// 当該ファイル内で対象 owner のうちどれが import されているか (重複なし、入力順)。
-    imported_owners: Vec<&'a str>,
-    /// `obj.member` 形式の property access の出現回数 (`?.` 含む)。
-    member_access_count: usize,
+/// ファイル内 1 つの bare member について receiver 解決済み access を集計する。
+struct FileAnalysis {
+    /// receiver が owner へ静的に辿れた access の owner 別出現回数 (production/test 区別前)。
+    resolved_counts: HashMap<String, usize>,
+    /// receiver を owner へ静的に辿れない access があったか。
+    has_unresolved_access: bool,
 }
 
-fn analyze_file<'a>(
+/// ローカル変数 / パラメータの owner 束縛。
+enum VarBinding {
+    /// `const a = new Alpha()` / `a: Alpha` のように単一 owner へ辿れる。
+    Owner(String),
+    /// `const xs: Alpha[] = ...` のように owner の配列型。`xs[i].member` で owner に辿れる。
+    ElementOwner(String),
+    /// factory 戻り値・非 owner 型・同名バインディング複数などで辿れない。
+    Unresolvable,
+}
+
+fn analyze_file(
     root: tree_sitter::Node<'_>,
     source: &[u8],
-    target_owners: &[&'a str],
+    target_owners: &[&str],
     target_member: &str,
     lang: LangId,
-) -> FileAnalysis<'a> {
+) -> FileAnalysis {
     let mut analysis = FileAnalysis {
-        imported_owners: Vec::new(),
-        member_access_count: 0,
+        resolved_counts: HashMap::new(),
+        has_unresolved_access: false,
     };
-
-    // Owner import の集計。
     let owners_set: HashSet<&str> = target_owners.iter().copied().collect();
-    let mut imported: HashSet<&str> = HashSet::new();
+
+    // 1. クラス名として使えるローカル名 → owner のマップを作る。
+    //    - import (default / named / alias): `import { Alpha as A }` → A → Alpha
+    //    - 同ファイル内 class 定義: class Alpha {} → Alpha → Alpha
+    //    `import * as ns` は ns.Alpha 経由の静的解決ができないため不解決材料にする。
+    let mut local_to_owner: HashMap<String, String> = HashMap::new();
     let mut has_namespace_import = false;
     if let Some(language) = ts_language_for(lang)
         && let Ok(query) = Query::new(&language, IMPORT_QUERY)
@@ -279,51 +256,51 @@ fn analyze_file<'a>(
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&query, root, source);
         while let Some(m) = matches.next() {
+            let mut import_name: Option<&str> = None;
+            let mut import_alias: Option<&str> = None;
             for cap in m.captures {
                 let Ok(text) = cap.node.utf8_text(source) else {
                     continue;
                 };
                 let cap_name = &query.capture_names()[cap.index as usize];
                 match *cap_name {
-                    "default_name" | "import_name" => {
-                        if let Some(&owner) = owners_set.get(text) {
-                            imported.insert(owner);
+                    "default_name" => {
+                        if owners_set.contains(text) {
+                            local_to_owner.insert(text.to_string(), text.to_string());
                         }
                     }
-                    "import_alias" => {
-                        // alias の場合は元名ではなく alias の名前を見るが、aliased が owner の
-                        // 元名を持つかは別 capture (import_name) を参照。alias を使うと
-                        // ローカル名は alias になるため、property access の `obj` 側で
-                        // alias 名が出てくる可能性があるが、owner 推定は import_name で行う。
-                        // → alias は単独で owner 一致を判定しない。
-                    }
-                    "namespace_name" => {
-                        // `import * as ns from ...` は ns.Foo 経由でアクセスされうるが、
-                        // 静的に名前を解決できないため ambiguous へ倒す材料にする。
-                        has_namespace_import = true;
-                    }
+                    "import_name" => import_name = Some(text),
+                    "import_alias" => import_alias = Some(text),
+                    "namespace_name" => has_namespace_import = true,
                     _ => {}
                 }
+            }
+            if let Some(name) = import_name
+                && owners_set.contains(name)
+            {
+                let local = import_alias.unwrap_or(name);
+                local_to_owner.insert(local.to_string(), name.to_string());
             }
         }
     }
     if has_namespace_import {
-        // namespace import + duplicate owner は安全側で「複数 owner 同時 import 状態」と
-        // みなすため、当該ファイルは imported_owners >= 2 相当とする。
-        let mut owners_vec: Vec<&str> = target_owners.to_vec();
-        owners_vec.sort();
-        owners_vec.dedup();
-        analysis.imported_owners = owners_vec;
-    } else {
-        // 元順 (target_owners 順) で安定化。
-        for &o in target_owners {
-            if imported.contains(o) {
-                analysis.imported_owners.push(o);
-            }
-        }
+        // `ns.Alpha` 経由のアクセスがあり得るため、このファイルの access は静的解決不能。
+        analysis.has_unresolved_access = true;
+        return analysis;
     }
+    collect_local_class_definitions(root, source, &owners_set, &mut local_to_owner);
 
-    // property access (`obj.member` / `obj?.member`) の集計。
+    // 2. ローカル変数 / パラメータの owner 束縛マップ。
+    let mut var_bindings: HashMap<String, VarBinding> = HashMap::new();
+    collect_var_bindings(
+        root,
+        source,
+        &local_to_owner,
+        &owners_set,
+        &mut var_bindings,
+    );
+
+    // 3. `obj.member` / `obj?.member` の receiver を分類して票を入れる。
     if let Some(language) = ts_language_for(lang)
         && let Ok(query) = Query::new(&language, MEMBER_ACCESS_QUERY)
     {
@@ -331,17 +308,247 @@ fn analyze_file<'a>(
         let mut matches = cursor.matches(&query, root, source);
         while let Some(m) = matches.next() {
             for cap in m.captures {
-                let Ok(text) = cap.node.utf8_text(source) else {
+                let node = cap.node;
+                let Ok(text) = node.utf8_text(source) else {
                     continue;
                 };
-                if text == target_member {
-                    analysis.member_access_count = analysis.member_access_count.saturating_add(1);
+                if text != target_member {
+                    continue;
+                }
+                let Some(member_expr) = node.parent() else {
+                    continue;
+                };
+                match resolve_member_receiver(
+                    member_expr,
+                    source,
+                    &local_to_owner,
+                    &var_bindings,
+                    &owners_set,
+                ) {
+                    Some(owner) => {
+                        *analysis.resolved_counts.entry(owner).or_default() += 1;
+                    }
+                    None => {
+                        analysis.has_unresolved_access = true;
+                        return analysis;
+                    }
                 }
             }
         }
     }
 
     analysis
+}
+
+/// 同ファイル内の class 定義名 (owner に一致するもの) をクラス名マップへ加える。
+fn collect_local_class_definitions(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    owners_set: &HashSet<&str>,
+    local_to_owner: &mut HashMap<String, String>,
+) {
+    if matches!(node.kind(), "class_declaration" | "class")
+        && let Some(name) = node.child_by_field_name("name")
+        && let Ok(text) = name.utf8_text(source)
+        && owners_set.contains(text)
+    {
+        local_to_owner.insert(text.to_string(), text.to_string());
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_local_class_definitions(child, source, owners_set, local_to_owner);
+    }
+}
+
+/// `variable_declarator` / パラメータの型注釈から変数 → owner の束縛を集める。
+/// 同名バインディングが複数回現れた場合はスコープ解決をせず `Unresolvable` に落とす。
+fn collect_var_bindings(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    local_to_owner: &HashMap<String, String>,
+    owners_set: &HashSet<&str>,
+    bindings: &mut HashMap<String, VarBinding>,
+) {
+    let binding = match node.kind() {
+        "variable_declarator" => {
+            let name = node
+                .child_by_field_name("name")
+                .filter(|n| n.kind() == "identifier")
+                .and_then(|n| n.utf8_text(source).ok());
+            if let Some(name) = name {
+                // 型注釈が最優先 (`const a: Alpha = ...`)、次に `= new Alpha()`。
+                let owner = node
+                    .child_by_field_name("type")
+                    .and_then(|t| type_annotation_owner(t, source, local_to_owner, owners_set))
+                    .or_else(|| {
+                        node.child_by_field_name("value")
+                            .and_then(|v| {
+                                new_expression_owner(v, source, local_to_owner, owners_set)
+                            })
+                            .map(VarBinding::Owner)
+                    });
+                Some((name.to_string(), owner))
+            } else {
+                None
+            }
+        }
+        "required_parameter" | "optional_parameter" => {
+            let name = node
+                .child_by_field_name("pattern")
+                .filter(|n| n.kind() == "identifier")
+                .and_then(|n| n.utf8_text(source).ok());
+            if let Some(name) = name {
+                let owner = node
+                    .child_by_field_name("type")
+                    .and_then(|t| type_annotation_owner(t, source, local_to_owner, owners_set));
+                Some((name.to_string(), owner))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some((name, owner)) = binding {
+        use std::collections::hash_map::Entry;
+        let value = owner.unwrap_or(VarBinding::Unresolvable);
+        match bindings.entry(name) {
+            Entry::Vacant(e) => {
+                e.insert(value);
+            }
+            // 同名バインディング複数 (shadow / 別スコープ) は一意解決を諦める。
+            Entry::Occupied(mut e) => {
+                e.insert(VarBinding::Unresolvable);
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_var_bindings(child, source, local_to_owner, owners_set, bindings);
+    }
+}
+
+/// `type_annotation` 配下の型名を owner へ解決する。
+/// `Alpha` → `Owner`、`Alpha[]` → `ElementOwner` (subscript access 用)。
+fn type_annotation_owner(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    local_to_owner: &HashMap<String, String>,
+    owners_set: &HashSet<&str>,
+) -> Option<VarBinding> {
+    let ty = node.named_child(0)?;
+    match ty.kind() {
+        "type_identifier" => {
+            let text = ty.utf8_text(source).ok()?;
+            resolve_class_name(text, local_to_owner, owners_set).map(VarBinding::Owner)
+        }
+        "array_type" => {
+            let elem = ty.named_child(0)?;
+            if elem.kind() != "type_identifier" {
+                return None;
+            }
+            let text = elem.utf8_text(source).ok()?;
+            resolve_class_name(text, local_to_owner, owners_set).map(VarBinding::ElementOwner)
+        }
+        _ => None,
+    }
+}
+
+/// `new Alpha(...)` の constructor 名を owner へ解決する。
+fn new_expression_owner(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    local_to_owner: &HashMap<String, String>,
+    owners_set: &HashSet<&str>,
+) -> Option<String> {
+    if node.kind() != "new_expression" {
+        return None;
+    }
+    let ctor = node.child_by_field_name("constructor")?;
+    if ctor.kind() != "identifier" {
+        return None;
+    }
+    let text = ctor.utf8_text(source).ok()?;
+    resolve_class_name(text, local_to_owner, owners_set)
+}
+
+/// クラス名テキストを import alias / 直接名経由で owner へ解決する。
+fn resolve_class_name(
+    text: &str,
+    local_to_owner: &HashMap<String, String>,
+    owners_set: &HashSet<&str>,
+) -> Option<String> {
+    if let Some(owner) = local_to_owner.get(text) {
+        return Some(owner.clone());
+    }
+    if owners_set.contains(text) {
+        return Some(text.to_string());
+    }
+    None
+}
+
+/// `member_expression` の receiver (object 側) を owner へ静的に解決する。
+/// 解決対象: owner 名の static access / `new Owner().m()` / owner 束縛済み変数 /
+/// class 内 `this.m()` (enclosing class が owner の場合)。それ以外は `None` (不解決)。
+fn resolve_member_receiver(
+    member_expr: tree_sitter::Node<'_>,
+    source: &[u8],
+    local_to_owner: &HashMap<String, String>,
+    var_bindings: &HashMap<String, VarBinding>,
+    owners_set: &HashSet<&str>,
+) -> Option<String> {
+    let object = member_expr.child_by_field_name("object")?;
+    match object.kind() {
+        "identifier" => {
+            let text = object.utf8_text(source).ok()?;
+            // クラス名 (static access / import alias) を変数より優先する。
+            if let Some(owner) = resolve_class_name(text, local_to_owner, owners_set) {
+                return Some(owner);
+            }
+            match var_bindings.get(text) {
+                Some(VarBinding::Owner(owner)) => Some(owner.clone()),
+                _ => None,
+            }
+        }
+        "new_expression" => new_expression_owner(object, source, local_to_owner, owners_set),
+        // `xs[i].member`: xs が owner 配列型 (`Alpha[]`) に束縛されていれば要素は owner。
+        "subscript_expression" => {
+            let array = object.child_by_field_name("object")?;
+            if array.kind() != "identifier" {
+                return None;
+            }
+            let text = array.utf8_text(source).ok()?;
+            match var_bindings.get(text) {
+                Some(VarBinding::ElementOwner(owner)) => Some(owner.clone()),
+                _ => None,
+            }
+        }
+        "this" => {
+            let class_name = enclosing_class_name(member_expr, source)?;
+            if owners_set.contains(class_name.as_str()) {
+                Some(class_name)
+            } else {
+                // enclosing class が owner でない `this.m()` は継承経由で owner へ
+                // 到達し得るため、推測せず不解決に倒す。
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// ノードを囲む class 宣言の名前を返す。
+fn enclosing_class_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if matches!(n.kind(), "class_declaration" | "class") {
+            return n
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(source).ok())
+                .map(str::to_string);
+        }
+        cur = n.parent();
+    }
+    None
 }
 
 /// 推定不能な access (computed property / 文字列リテラル) が含まれるかをバイトレベルで検出する。

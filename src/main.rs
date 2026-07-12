@@ -311,19 +311,23 @@ fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Re
             paths_file,
             dir,
             glob,
-            query: _,
+            query,
             doc,
             full,
             no_cache,
         } => {
             if let Some(d) = &dir {
-                cmd_symbols_dir(service, d, glob.as_deref(), doc, full)
+                cmd_symbols_dir(service, d, glob.as_deref(), doc, full, query.as_deref())
             } else {
                 let input =
                     resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
                 match input {
-                    PathInput::Single(p) => cmd_symbols(service, &p, no_cache, pretty, doc, full),
-                    PathInput::Batch(ps) => batch_symbols(service, &ps, doc, full, None),
+                    PathInput::Single(p) => {
+                        cmd_symbols(service, &p, no_cache, pretty, doc, full, query.as_deref())
+                    }
+                    PathInput::Batch(ps) => {
+                        batch_symbols(service, &ps, doc, full, None, query.as_deref())
+                    }
                 }
             }
         }

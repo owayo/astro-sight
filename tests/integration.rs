@@ -9429,8 +9429,8 @@ fn dead_code_ts_same_member_name_string_literal_marks_ambiguous() {
 fn dead_code_ts_same_member_name_self_ref_in_owner_file_is_not_misattributed() {
     // codex pre-commit review 指摘の FP 修正: duplicate owner X の定義ファイルが unrelated
     // owner Y を型用途で import している場合、ファイル内の `this.member` を Y 側に誤帰属
-    // させてはならない。effective_owners = imported_owners ∪ local_defined_owners が
-    // 2 owner になり ambiguous へ倒れることで、X の dead 誤検出を防ぐ。
+    // させてはならない。receiver-aware 帰属では `this.isReady()` が enclosing class
+    // (FooModel) へ確定票として入り、FooModel の dead 誤検出を防ぐ。
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path();
 
@@ -9470,14 +9470,16 @@ fn dead_code_ts_same_member_name_self_ref_in_owner_file_is_not_misattributed() {
     let names: Vec<&str> = dead.iter().filter_map(|s| s["name"].as_str()).collect();
 
     // FooModel.isReady は this.isReady() 経由で内部参照されており、外部から FooModel.check() を
-    // 呼び出すコードもあるため dead に出してはならない (旧スキップ相当の Ambiguous)。
+    // 呼び出すコードもあるため dead に出してはならない。
     assert!(
         !names.contains(&"FooModel.isReady"),
         "owner 定義ファイル内の this.member を unrelated import 側に誤帰属して FooModel.isReady を dead と判定してはならない: {names:?}"
     );
+    // receiver-aware 帰属では `this.isReady()` が FooModel へ確定解決されるため、
+    // set は Ambiguous に倒れず、真に未参照の BarModel.isReady は正確に dead と出る。
     assert!(
-        !names.contains(&"BarModel.isReady"),
-        "duplicate set 全体が ambiguous なので BarModel.isReady も旧スキップ維持: {names:?}"
+        names.contains(&"BarModel.isReady"),
+        "未参照の BarModel.isReady は receiver-aware 帰属で dead に出るべき: {names:?}"
     );
 }
 
@@ -10813,4 +10815,316 @@ mod integration {
     #[path = "review_dead_scope.rs"]
     mod review_dead_scope;
     mod support;
+}
+
+#[test]
+fn dead_code_ts_factory_receiver_marks_set_ambiguous() {
+    // Issue 2026-07-10-jsts-member-liveness-factory-attribution:
+    // duplicate member (Alpha.fmt / Beta.fmt) で consumer が import { Alpha } +
+    // factory 経由 (`const beta = getBeta(); beta.fmt();`) の場合、receiver を
+    // 静的に辿れない access があるため set 全体を Ambiguous に倒し、
+    // import 有無ベースの誤帰属 (Beta.fmt の dead 誤検出) をしない。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("alpha.ts"),
+        "export class Alpha {\n  fmt() { return \"alpha\"; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("beta.ts"),
+        "export class Beta {\n  fmt() { return \"beta\"; }\n}\nexport function getBeta(): Beta { return new Beta(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("consumer.ts"),
+        "import { Alpha } from \"./alpha\";\nimport { getBeta } from \"./beta\";\nexport function run() {\n  const beta = getBeta();\n  beta.fmt();\n  return new Alpha();\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"Beta.fmt"),
+        "factory 経由で実際に呼ばれる Beta.fmt を dead にしない: {names:?}"
+    );
+    assert!(
+        !names.contains(&"Alpha.fmt"),
+        "unresolved access がある set は Ambiguous (旧スキップ) 維持: {names:?}"
+    );
+}
+
+#[test]
+fn api_changes_rust_module_reexport_detects_modified_signature() {
+    // Issue 2026-07-10-rust-module-reexport-api-suppression:
+    // `mod wifi; pub use self::wifi as wifi_api;` のモジュール再エクスポート経由で
+    // 公開されている pub fn のシグネチャ変更が api.modified (blocking) に出る。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"reexport-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "mod wifi;\npub use self::wifi as wifi_api;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/wifi.rs"),
+        "pub fn found() -> bool {\n    true\n}\n",
+    )
+    .unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "astro-sight@example.com"]);
+    git(&["config", "user.name", "astro-sight"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial", "-q"]);
+
+    std::fs::write(
+        root.join("src/wifi.rs"),
+        "pub fn found(strict: bool) -> bool {\n    strict\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["review", "--dir", root.to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let modified: Vec<&str> = json["api_changes"]["modified"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        modified.contains(&"found"),
+        "module 再エクスポート経由の公開 API シグネチャ変更は api.modified に出るべき: {json}"
+    );
+}
+
+#[test]
+fn api_changes_rust_private_module_without_reexport_stays_suppressed() {
+    // 対照: 再エクスポートの無い private module の pub fn は API 面でない (回帰確認)。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"noexport-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "mod hidden;\npub fn public_entry() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/hidden.rs"),
+        "pub fn secret() -> bool {\n    true\n}\n",
+    )
+    .unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "astro-sight@example.com"]);
+    git(&["config", "user.name", "astro-sight"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial", "-q"]);
+
+    std::fs::write(
+        root.join("src/hidden.rs"),
+        "pub fn secret(strict: bool) -> bool {\n    strict\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["review", "--dir", root.to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let modified = json["api_changes"]["modified"].as_array().unwrap();
+    assert!(
+        modified.is_empty(),
+        "再エクスポートの無い private module の pub fn は api.modified に出ない: {json}"
+    );
+}
+
+#[test]
+fn impact_fn_value_passed_ref_is_informational_for_signature_only_change() {
+    // Issue 2026-07-12-bevy-systemparam-optional-res-impact-fp:
+    // pub fn の引数型のみ変更 (arity 不変) のとき、タプル要素として値渡しされる
+    // だけの参照 (callee でない) は unresolved impact に出ない (informational 格下げ)。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"sysparam-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub mod sys;\npub mod reg;\n").unwrap();
+    std::fs::write(
+        root.join("src/sys.rs"),
+        "pub struct Res<T>(pub T);\npub fn my_system(r: Res<u32>) {\n    let _ = r;\n}\npub fn other_a() {}\npub fn other_b() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/reg.rs"),
+        "use crate::sys::{my_system, other_a, other_b};\n\npub fn register<F>(_f: F) {}\n\npub fn setup() {\n    register((other_a, my_system, other_b));\n}\n",
+    )
+    .unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "astro-sight@example.com"]);
+    git(&["config", "user.name", "astro-sight"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial", "-q"]);
+
+    // Res<u32> -> Option<Res<u32>> (arity 不変の型のみ変更)
+    std::fs::write(
+        root.join("src/sys.rs"),
+        "pub struct Res<T>(pub T);\npub fn my_system(r: Option<Res<u32>>) {\n    let _ = r;\n}\npub fn other_a() {}\npub fn other_b() {}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["impact", "--dir", root.to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "値渡し参照のみなら unresolved impact を出さず exit 0: {stderr}"
+    );
+}
+
+#[test]
+fn impact_fn_callee_ref_stays_blocking_for_signature_change() {
+    // 対照: callee として呼び出している参照はシグネチャ変更で blocking のまま。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"callee-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub mod sys;\npub mod caller;\n").unwrap();
+    std::fs::write(
+        root.join("src/sys.rs"),
+        "pub struct Res<T>(pub T);\npub fn my_system(r: Res<u32>) {\n    let _ = r;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/caller.rs"),
+        "use crate::sys::{Res, my_system};\n\npub fn drive() {\n    my_system(Res(1));\n}\n",
+    )
+    .unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "astro-sight@example.com"]);
+    git(&["config", "user.name", "astro-sight"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial", "-q"]);
+
+    std::fs::write(
+        root.join("src/sys.rs"),
+        "pub struct Res<T>(pub T);\npub fn my_system(r: Option<Res<u32>>) {\n    let _ = r;\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["impact", "--dir", root.to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run");
+    assert!(
+        !output.status.success(),
+        "callee 参照はシグネチャ変更で blocking (exit 1) のまま"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("caller.rs:4"),
+        "人間向け表示はエディタと同じ 1-indexed 行番号: {stderr}"
+    );
+}
+
+#[test]
+fn symbols_cache_returns_fresh_result_after_content_change() {
+    // Issue 2026-07-10-ast-symbols-cache-hash-double-read の周辺検証:
+    // cache key は内容 hash 由来のため、内容変更後に古い結果を返さない。
+    // (TOCTOU race そのものは決定的に再現できないため、put ガードの前提となる
+    //  「解析結果と key の整合」を連続実行で確認する)
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    let file = root.join("t.rs");
+    std::fs::write(&file, "pub fn first() {}\n").unwrap();
+
+    let run = || {
+        let output = cargo_bin()
+            .args(["symbols", "--path", file.to_str().unwrap()])
+            .output()
+            .expect("failed to run");
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let out1 = run();
+    assert!(out1.contains("first"), "{out1}");
+    let out2 = run();
+    assert!(out2.contains("first"), "cache hit でも同じ結果: {out2}");
+
+    std::fs::write(&file, "pub fn second() {}\n").unwrap();
+    let out3 = run();
+    assert!(
+        out3.contains("second") && !out3.contains("first"),
+        "内容変更後は新しい解析結果が返る: {out3}"
+    );
 }

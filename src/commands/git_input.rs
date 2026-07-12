@@ -446,15 +446,44 @@ struct UntrackedRenamePair {
 /// 削除候補と未追跡を内容類似度でペアリングする。構造 gate (同一言語・サイズ比・exported
 /// symbol 集合一致) を通る (deleted, untracked) エッジのうち、**両端とも degree 1** の
 /// 一意対応のみ採用する (ambiguous は fail-closed で pair しない)。
+///
+/// exported symbol の抽出 (tree-sitter parse) は per-file の `RenameFacts` として
+/// D+U 回だけ事前計算する。旧実装は D×U の全組合せで gate 内フルパースしており、
+/// ディレクトリ移動 (D=U=200) で数万回の再パースが起きていた。edges 列挙は facts の
+/// 比較のみで、出力 (採用ペア) は旧実装と完全一致する。
 fn pair_untracked_renames(
     deleted: &[DeletedRenameCandidate],
     untracked: &[UntrackedSourceFile],
 ) -> Vec<UntrackedRenamePair> {
-    // 構造 gate を通るエッジを収集。
+    // Phase 1: per-file facts を 1 回ずつ計算する。相手側集合に同じ言語が無い
+    // ファイルは言語 gate で必ず落ちるため、exported symbol の parse 自体を省く。
+    // (言語は高々十数種なので Vec + 線形 contains で十分)
+    let mut d_langs: Vec<crate::language::LangId> = deleted
+        .iter()
+        .filter_map(|d| crate::language::LangId::from_path(camino::Utf8Path::new(&d.old_path)).ok())
+        .collect();
+    d_langs.dedup();
+    let mut u_langs: Vec<crate::language::LangId> = untracked
+        .iter()
+        .filter_map(|u| crate::language::LangId::from_path(camino::Utf8Path::new(&u.rel_path)).ok())
+        .collect();
+    u_langs.dedup();
+    let d_facts: Vec<Option<RenameFacts>> = deleted
+        .iter()
+        .map(|d| rename_facts(&d.old_path, &d.old_source, &u_langs))
+        .collect();
+    let u_facts: Vec<Option<RenameFacts>> = untracked
+        .iter()
+        .map(|u| rename_facts(&u.rel_path, u.content.as_bytes(), &d_langs))
+        .collect();
+
+    // Phase 2: 構造 gate を通るエッジを facts の比較だけで収集。
     let mut edges: Vec<(usize, usize)> = Vec::new();
-    for (di, d) in deleted.iter().enumerate() {
-        for (ui, u) in untracked.iter().enumerate() {
-            if rename_gate_passes(d, u) {
+    for (di, df) in d_facts.iter().enumerate() {
+        let Some(df) = df else { continue };
+        for (ui, uf) in u_facts.iter().enumerate() {
+            let Some(uf) = uf else { continue };
+            if rename_facts_gate_passes(df, uf) {
                 edges.push((di, ui));
             }
         }
@@ -483,28 +512,46 @@ fn pair_untracked_renames(
     pairs
 }
 
+/// rename gate 用の per-file facts。exported symbol の抽出はファイルごとに 1 回だけ行う。
+struct RenameFacts {
+    lang: crate::language::LangId,
+    size: usize,
+    exports: Option<Vec<(String, String, String)>>,
+}
+
+/// per-file の rename gate facts を計算する。言語判定できないファイルは gate 候補外
+/// なので `None`。相手側集合 (`peer_langs`) に同じ言語が無ければ言語 gate で必ず
+/// 落ちるため、exported symbol の parse を省略する (その場合 exports は参照されない)。
+fn rename_facts(
+    path: &str,
+    source: &[u8],
+    peer_langs: &[crate::language::LangId],
+) -> Option<RenameFacts> {
+    let lang = crate::language::LangId::from_path(camino::Utf8Path::new(path)).ok()?;
+    let exports = if peer_langs.contains(&lang) {
+        crate::commands::api_changes::extract_exported_symbols_from_source(path, source)
+    } else {
+        None
+    };
+    Some(RenameFacts {
+        lang,
+        size: source.len(),
+        exports,
+    })
+}
+
 /// 削除候補と未追跡が high-confidence rename pair か判定する構造 gate。
 /// - 同一言語 (拡張子由来)
 /// - サイズ比 2 倍以内
 /// - exported symbol 集合 ((name,kind,signature)) が一致し非空
-fn rename_gate_passes(d: &DeletedRenameCandidate, u: &UntrackedSourceFile) -> bool {
-    let d_lang = crate::language::LangId::from_path(camino::Utf8Path::new(&d.old_path)).ok();
-    let u_lang = crate::language::LangId::from_path(camino::Utf8Path::new(&u.rel_path)).ok();
-    if d_lang.is_none() || d_lang != u_lang {
+fn rename_facts_gate_passes(d: &RenameFacts, u: &RenameFacts) -> bool {
+    if d.lang != u.lang {
         return false;
     }
-    if !size_ratio_ok(d.old_source.len(), u.content.len()) {
+    if !size_ratio_ok(d.size, u.size) {
         return false;
     }
-    let d_syms = crate::commands::api_changes::extract_exported_symbols_from_source(
-        &d.old_path,
-        &d.old_source,
-    );
-    let u_syms = crate::commands::api_changes::extract_exported_symbols_from_source(
-        &u.rel_path,
-        u.content.as_bytes(),
-    );
-    exported_symbols_match(&d_syms, &u_syms)
+    exported_symbols_match(&d.exports, &u.exports)
 }
 
 /// 2 ファイルのサイズ比が 2 倍以内か (どちらも非空)。
@@ -846,5 +893,50 @@ mod tests {
             ("foo".to_string(), "function".to_string(), "sig".to_string()),
         ]);
         assert!(!exported_symbols_match(&dup, &dup));
+    }
+
+    /// facts 事前計算方式 (O(D+U) parse) でも degree 1:1 とサイズ比 gate の出力は
+    /// 旧 O(D×U) parse 実装と一致する (Issue 2026-07-10-untracked-rename-gate-quadratic-parse)。
+    /// 同一 exports の deleted 2 × untracked 1 は ambiguous (degree>1) で pair しない。
+    #[test]
+    fn pair_untracked_renames_ambiguous_degree_not_paired() {
+        let src = "pub fn foo(name: &str) -> String {\n    name.to_uppercase()\n}\n";
+        let deleted = vec![
+            DeletedRenameCandidate {
+                old_path: "src/a1.rs".to_string(),
+                old_source: src.as_bytes().to_vec(),
+                block_text: String::new(),
+            },
+            DeletedRenameCandidate {
+                old_path: "src/a2.rs".to_string(),
+                old_source: src.as_bytes().to_vec(),
+                block_text: String::new(),
+            },
+        ];
+        let untracked = vec![UntrackedSourceFile {
+            rel_path: "src/b.rs".to_string(),
+            content: src.to_string(),
+        }];
+        let pairs = pair_untracked_renames(&deleted, &untracked);
+        assert!(pairs.is_empty(), "degree>1 は fail-closed で pair しない");
+    }
+
+    /// 相手側に同一言語が無いファイルは言語 gate で落ちる (facts の exports parse は
+    /// 省略されるが結果は不変)。
+    #[test]
+    fn pair_untracked_renames_language_mismatch_not_paired() {
+        let rust_src = "pub fn foo() -> bool {\n    true\n}\n";
+        let py_src = "def foo():\n    return True\n";
+        let deleted = vec![DeletedRenameCandidate {
+            old_path: "src/a.rs".to_string(),
+            old_source: rust_src.as_bytes().to_vec(),
+            block_text: String::new(),
+        }];
+        let untracked = vec![UntrackedSourceFile {
+            rel_path: "src/b.py".to_string(),
+            content: py_src.to_string(),
+        }];
+        let pairs = pair_untracked_renames(&deleted, &untracked);
+        assert!(pairs.is_empty(), "言語不一致は pair しない");
     }
 }

@@ -39,7 +39,8 @@ pub struct CmdAstOpts<'a> {
 pub fn cmd_ast(service: &AppService, opts: &CmdAstOpts<'_>) -> Result<()> {
     let utf8_path = camino::Utf8Path::new(opts.path);
     let source = parser::read_file(utf8_path)?;
-    let hash = cache_hash_for_path(utf8_path, &source);
+    let content_hash = CacheStore::hash(&source);
+    let hash = cache_hash_for_path(utf8_path, &content_hash);
     let use_cache = !opts.no_cache && !opts.pretty;
 
     fn opt_key(v: Option<usize>) -> String {
@@ -100,7 +101,14 @@ pub fn cmd_ast(service: &AppService, opts: &CmdAstOpts<'_>) -> Result<()> {
         "command completed"
     );
 
-    if use_cache && let Ok(cache) = CacheStore::new() {
+    // TOCTOU ガード: cache key の hash は最初の read の内容から計算しているが、
+    // service は同じファイルを再 read して解析する。2 回の read の間に更新が入ると
+    // hash(旧内容) → output(新内容) の組で cache が汚染されるため、service が実際に
+    // 解析した内容の hash (response.hash) が一致する場合のみ put する。
+    if use_cache
+        && response.hash.as_deref() == Some(content_hash.as_str())
+        && let Ok(cache) = CacheStore::new()
+    {
         let _ = cache.put(&hash, &cache_key, output.as_bytes());
     }
 
@@ -114,6 +122,7 @@ pub fn cmd_symbols_dir(
     glob: Option<&str>,
     doc: bool,
     full: bool,
+    query: Option<&str>,
 ) -> Result<()> {
     let canonical_dir = std::fs::canonicalize(dir)?;
     let files = crate::engine::refs::collect_files(&canonical_dir, glob)?;
@@ -121,7 +130,7 @@ pub fn cmd_symbols_dir(
         .iter()
         .filter_map(|p| p.to_str().map(|s| s.to_string()))
         .collect();
-    batch_symbols(service, &file_paths, doc, full, Some(&canonical_dir))
+    batch_symbols(service, &file_paths, doc, full, Some(&canonical_dir), query)
 }
 
 pub fn cmd_symbols(
@@ -131,20 +140,29 @@ pub fn cmd_symbols(
     pretty: bool,
     doc: bool,
     full: bool,
+    query: Option<&str>,
 ) -> Result<()> {
     let utf8_path = camino::Utf8Path::new(path);
     let source = parser::read_file(utf8_path)?;
-    let hash = cache_hash_for_path(utf8_path, &source);
+    let content_hash = CacheStore::hash(&source);
+    let hash = cache_hash_for_path(utf8_path, &content_hash);
     let use_cache = !no_cache && !pretty;
 
     // v3_: Symbol に enclosing container フィールド追加 (compact では `cn` キー)
-    let cache_key = if full {
+    // custom query は結果集合が変わるため query hash を key へ混ぜる
+    // (default query の cache key は従来のまま不変)。
+    let base_key = if full {
         "v3_symbols_full"
     } else if doc {
         "v3_symbols_doc"
     } else {
         "v3_symbols"
     };
+    let cache_key = match query {
+        Some(q) => format!("{base_key}_q{}", &CacheStore::hash(q.as_bytes())[..16]),
+        None => base_key.to_string(),
+    };
+    let cache_key = cache_key.as_str();
 
     if use_cache
         && let Ok(cache) = CacheStore::new()
@@ -161,7 +179,8 @@ pub fn cmd_symbols(
         return Ok(());
     }
 
-    let response = service.extract_symbols(path)?;
+    let response = service.extract_symbols_with_query(path, query)?;
+    let analyzed_hash = response.hash.clone();
 
     let mut output = if full {
         serialize_output(&response, pretty)?
@@ -178,7 +197,12 @@ pub fn cmd_symbols(
         "command completed"
     );
 
-    if use_cache && let Ok(cache) = CacheStore::new() {
+    // TOCTOU ガード: cmd_ast と同様、service が実際に解析した内容の hash が
+    // cache key の元になった read 内容と一致する場合のみ put する。
+    if use_cache
+        && analyzed_hash.as_deref() == Some(content_hash.as_str())
+        && let Ok(cache) = CacheStore::new()
+    {
         let _ = cache.put(&hash, cache_key, output.as_bytes());
     }
 
@@ -548,14 +572,16 @@ pub fn cmd_impact(
             changed_path,
             all_symbols.into_iter().collect::<Vec<_>>().join(", ")
         );
+        // 内部の line は tree-sitter 由来の 0-indexed。人間向け表示 (path:line) だけ
+        // エディタと同じ 1-indexed に補正する (JSON 出力の基準は変えない)。
         for caller in callers {
             if caller.symbols.is_empty() {
-                eprintln!("  → {}:{}", caller.path, caller.line);
+                eprintln!("  → {}:{}", caller.path, caller.line + 1);
             } else {
                 eprintln!(
                     "  → {}:{} [{}]",
                     caller.path,
-                    caller.line,
+                    caller.line + 1,
                     caller.symbols.join(", ")
                 );
             }

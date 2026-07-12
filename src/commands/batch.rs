@@ -114,23 +114,27 @@ pub fn batch_symbols(
     doc: bool,
     full: bool,
     dir: Option<&std::path::Path>,
+    query: Option<&str>,
 ) -> Result<()> {
-    batch_ndjson(paths, |p| match service.extract_symbols(p) {
-        Ok(mut response) => {
-            // dir 指定時に絶対パスを相対パスに変換
-            if let Some(base) = dir
-                && let Ok(rel) = std::path::Path::new(&response.location.path).strip_prefix(base)
-            {
-                response.location.path = rel.to_string_lossy().to_string();
+    batch_ndjson(paths, |p| {
+        match service.extract_symbols_with_query(p, query) {
+            Ok(mut response) => {
+                // dir 指定時に絶対パスを相対パスに変換
+                if let Some(base) = dir
+                    && let Ok(rel) =
+                        std::path::Path::new(&response.location.path).strip_prefix(base)
+                {
+                    response.location.path = rel.to_string_lossy().to_string();
+                }
+                if full {
+                    serde_json::to_string(&response).unwrap_or_else(|e| make_error_line(&e.into()))
+                } else {
+                    let compact = response.to_compact_symbols(doc);
+                    serde_json::to_string(&compact).unwrap_or_else(|e| make_error_line(&e.into()))
+                }
             }
-            if full {
-                serde_json::to_string(&response).unwrap_or_else(|e| make_error_line(&e.into()))
-            } else {
-                let compact = response.to_compact_symbols(doc);
-                serde_json::to_string(&compact).unwrap_or_else(|e| make_error_line(&e.into()))
-            }
+            Err(e) => make_error_line(&e),
         }
-        Err(e) => make_error_line(&e),
     })
 }
 

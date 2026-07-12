@@ -2506,20 +2506,31 @@ fn is_exported_cpp(node: Node<'_>, source: &[u8]) -> bool {
             None => return true, // 関数定義が見つからない → 保守的に公開
         }
     }
-    // 直近の囲い specifier (class/struct) を探す
+    // 直近の囲い specifier (class/struct) を探す。access_specifier は
+    // field_declaration_list の直接子なので、走査中に「parent が
+    // field_declaration_list である祖先」(直接メンバなら method 自身、template
+    // メンバなら template_declaration) を member_anchor として保持する。
+    // method 自身から prev_sibling を辿ると template メンバで access_specifier に
+    // 届かず class デフォルト private に誤判定する。
     let mut cur = method;
+    let mut member_anchor = method;
     let default_public = loop {
         match cur.parent() {
             Some(p) => match p.kind() {
                 "class_specifier" => break false, // class: default private
                 "struct_specifier" => break true, // struct: default public
-                _ => cur = p,
+                _ => {
+                    if p.kind() == "field_declaration_list" {
+                        member_anchor = cur;
+                    }
+                    cur = p;
+                }
             },
             None => return true, // クラス外 (自由関数・クラス外定義) は公開
         }
     };
-    // method の直前の兄弟を遡って直近の access_specifier を探す
-    let mut sibling = method.prev_sibling();
+    // member_anchor の直前の兄弟を遡って直近の access_specifier を探す
+    let mut sibling = member_anchor.prev_sibling();
     while let Some(s) = sibling {
         if s.kind() == "access_specifier" {
             let txt = s.utf8_text(source).unwrap_or("");
@@ -2800,6 +2811,20 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
             "catch_block",
             "elvis_expression",
         ],
+        // Swift の分岐ノードも tree-sitter-swift 固有名を含む。汎用スライスには
+        // `guard_statement` / `switch_entry` / `repeat_while_statement` / `catch_block` が
+        // 無く、guard や case arm が計上されない (Kotlin 専用スライス化 v26.6.110 と同型)。
+        LangId::Swift => &[
+            "if_statement",
+            "guard_statement",
+            "switch_statement",
+            "switch_entry",
+            "for_statement",
+            "while_statement",
+            "repeat_while_statement",
+            "catch_block",
+            "ternary_expression",
+        ],
         LangId::Ruby => &[
             "if", "elsif", "unless", "case", "when", "for", "while", "until", "rescue",
         ],
@@ -2855,7 +2880,62 @@ pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result
     if query_src.is_empty() {
         return Ok(fallback_symbols(root, source));
     }
+    run_symbol_query(root, source, lang_id, query_src)
+}
 
+/// カスタム tree-sitter クエリでシンボルを抽出する (`symbols --query`)。
+/// built-in クエリを置換する。capture 名は built-in と同じ語彙
+/// (`function.name` / `class.name` 等 = `capture_name_to_kind` が解決できる名前) に
+/// 限定し、不正なクエリ・未知 capture・有効 capture なしは `INVALID_REQUEST` を返す
+/// (従来の silent no-op を廃止)。
+pub fn extract_symbols_with_custom_query(
+    root: Node<'_>,
+    source: &[u8],
+    lang_id: LangId,
+    custom_query: &str,
+) -> Result<Vec<Symbol>> {
+    use crate::error::{AstroError, ErrorCode};
+
+    let language = lang_id.ts_language();
+    let query = Query::new(&language, custom_query).map_err(|e| {
+        AstroError::new(
+            ErrorCode::InvalidRequest,
+            format!("invalid --query for {lang_id}: {e}"),
+        )
+    })?;
+    let unknown: Vec<&str> = query
+        .capture_names()
+        .iter()
+        .filter(|name| capture_name_to_kind(name).is_none())
+        .copied()
+        .collect();
+    if !unknown.is_empty() {
+        return Err(AstroError::new(
+            ErrorCode::InvalidRequest,
+            format!(
+                "--query uses unsupported capture(s) {:?}; supported captures map to symbol kinds like function.name / class.name / method.name",
+                unknown
+            ),
+        )
+        .into());
+    }
+    if query.capture_names().is_empty() {
+        return Err(AstroError::new(
+            ErrorCode::InvalidRequest,
+            "--query has no captures; add e.g. @function.name to select symbols",
+        )
+        .into());
+    }
+    run_symbol_query(root, source, lang_id, custom_query)
+}
+
+/// symbol クエリ本体の実行 (built-in / custom 共通)。
+fn run_symbol_query(
+    root: Node<'_>,
+    source: &[u8],
+    lang_id: LangId,
+    query_src: &str,
+) -> Result<Vec<Symbol>> {
     let language = lang_id.ts_language();
     let query = Query::new(&language, query_src)?;
     let mut cursor = QueryCursor::new();
@@ -2871,7 +2951,6 @@ pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result
             if let Some(kind) = kind {
                 let name = node.utf8_text(source).unwrap_or("").to_string();
                 if !name.is_empty() {
-                    let doc = extract_doc_comment(node, source);
                     let mut parent_node = node.parent().unwrap_or(node);
                     // C/C++ は関数名を `function_declarator` 配下でキャプチャするため、
                     // 本体を持つ function_definition まで繰り上げる。pointer_declarator /
@@ -2880,14 +2959,39 @@ pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result
                     // 常に 1 になり、impact 分析が関数本体のみの変更を取りこぼす。
                     // function_definition に到達しない宣言（プロトタイプ・関数ポインタ）は
                     // 本体が無いためシンボルとして採用しない。
+                    let mut promoted_to_definition = false;
                     if matches!(lang_id, LangId::C | LangId::Cpp)
                         && matches!(kind, SymbolKind::Function | SymbolKind::Method)
                     {
                         match cpp_enclosing_function_definition(node) {
-                            Some(def) => parent_node = def,
+                            Some(def) => {
+                                parent_node = def;
+                                promoted_to_definition = true;
+                            }
                             None => continue,
                         }
                     }
+                    // Ruby の `class A::B` / `module A::B` は name capture が scope_resolution
+                    // 内の末尾 constant で、parent が scope_resolution 止まりだと range が
+                    // 名前部分に潰れ、配下メソッドの container 帰属・impact の class 帰属が
+                    // 壊れる。class / module ノードまで昇格して本体全体を range にする。
+                    if lang_id == LangId::Ruby
+                        && parent_node.kind() == "scope_resolution"
+                        && let Some(scoped_decl) = parent_node.parent()
+                        && matches!(scoped_decl.kind(), "class" | "module")
+                    {
+                        parent_node = scoped_decl;
+                        promoted_to_definition = true;
+                    }
+                    // C/C++ の関数は name の親が function_declarator で、その prev sibling は
+                    // 戻り型になり doc comment に到達しない (Ruby の scoped class も同様に
+                    // scope_resolution の prev sibling は comment でない)。昇格した定義ノード
+                    // 自身の直前コメントを doc として拾う。
+                    let doc = if promoted_to_definition {
+                        collect_preceding_comments(parent_node, source)
+                    } else {
+                        extract_doc_comment(node, source)
+                    };
                     // 関数/メソッドの場合のみ循環的複雑度を算出
                     let complexity = if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
                         Some(calculate_complexity(parent_node, lang_id))
@@ -2999,7 +3103,12 @@ fn capture_name_to_kind(name: &str) -> Option<SymbolKind> {
 
 fn extract_doc_comment(node: Node<'_>, source: &[u8]) -> Option<String> {
     let parent = node.parent()?;
-    let mut prev = parent.prev_named_sibling();
+    collect_preceding_comments(parent, source)
+}
+
+/// node 自身の直前に連続する comment ノードを集めて doc として返す。
+fn collect_preceding_comments(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let mut prev = node.prev_named_sibling();
 
     let mut comments = Vec::new();
     while let Some(p) = prev {
@@ -5326,5 +5435,144 @@ public class Custom extends com.example.BaseJavaMigration {
                        public void migrate(org.flywaydb.core.api.migration.Context context) throws Exception {}\n\
                    }\n";
         assert!(check_java_flyway_class(src, "V2__SplitFqn"));
+    }
+
+    /// Swift の cx は tree-sitter-swift 固有の分岐ノード
+    /// (guard_statement / switch_entry / repeat_while_statement / ternary_expression) も
+    /// 計上する (Issue 2026-07-10-swift-complexity-guard-switch-entry)。
+    /// base1 + if1 + guard1 + switch1 + entry3 + for1 + while1 = 9。
+    #[test]
+    fn swift_complexity_counts_guard_and_switch_entry() {
+        let src = r#"
+func complexFn(x: Int?) -> Int {
+    var total = 0
+    if x == nil { total += 1 }
+    guard let v = x else { return -1 }
+    switch v {
+    case 1: total += 1
+    case 2: total += 2
+    default: total += 0
+    }
+    for i in 0..<v { total += i }
+    while total > 100 { total -= 1 }
+    return total
+}
+"#;
+        assert_eq!(cx_of(src, LangId::Swift, "complexFn"), 9);
+    }
+
+    /// Swift の ternary / catch / repeat-while も分岐として数える。
+    /// base1 + ternary1 + catch1 + repeat1 = 4。
+    #[test]
+    fn swift_complexity_counts_ternary_catch_repeat() {
+        let src = r#"
+func risky() throws {}
+func extraFn(x: Int?) -> Int {
+    let v = x != nil ? 1 : 0
+    do { try risky() } catch { return -1 }
+    repeat { print("hi") } while v > 2
+    return v
+}
+"#;
+        assert_eq!(cx_of(src, LangId::Swift, "extraFn"), 4);
+    }
+
+    /// C の関数直前の block comment を doc として抽出する
+    /// (Issue 2026-07-10-c-cpp-doc-comment-extraction)。name capture の親
+    /// (function_declarator) の prev sibling は戻り型で comment に届かないため、
+    /// 昇格した function_definition 基準で拾う。
+    #[test]
+    fn c_function_doc_comment_extracted_from_definition() {
+        let src = "/* adds two numbers */\nint add(int a, int b) {\n    return a + b;\n}\n";
+        let syms = syms_of(src, LangId::C);
+        let add = syms.iter().find(|s| s.name == "add").expect("add symbol");
+        assert_eq!(add.doc.as_deref(), Some("/* adds two numbers */"));
+    }
+
+    /// C++ メソッド (ポインタ返り含む) でも定義直前の連続コメントを doc として拾う。
+    #[test]
+    fn cpp_method_doc_comment_extracted() {
+        let src = "class W {\npublic:\n    // line one\n    // line two\n    void m() {}\n};\n";
+        let syms = syms_of(src, LangId::Cpp);
+        let m = syms.iter().find(|s| s.name == "m").expect("m symbol");
+        assert_eq!(m.doc.as_deref(), Some("// line one\n// line two"));
+    }
+
+    /// C++ の template メンバ関数は `field_declaration_list > template_declaration >
+    /// function_definition` 構造で access_specifier が template_declaration の兄弟になる。
+    /// member_anchor から遡ることで public template メンバを公開と判定する
+    /// (Issue 2026-07-10-cpp-template-member-visibility)。
+    #[test]
+    fn cpp_template_member_visibility_respects_access_specifier() {
+        let src = "class Widget {\npublic:\n    template<typename T> void render(T v) { (void)v; }\n    void plain() {}\nprivate:\n    template<typename T> void hidden(T v) { (void)v; }\n};\n";
+        let language = LangId::Cpp.ts_language();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+        let syms = syms_of(src, LangId::Cpp);
+        let vis: std::collections::HashMap<&str, bool> = syms
+            .iter()
+            .map(|s| {
+                (
+                    s.name.as_str(),
+                    is_symbol_exported(root, src.as_bytes(), LangId::Cpp, &s.range),
+                )
+            })
+            .collect();
+        assert_eq!(vis.get("render"), Some(&true), "public template member");
+        assert_eq!(vis.get("plain"), Some(&true), "public plain member");
+        assert_eq!(vis.get("hidden"), Some(&false), "private template member");
+    }
+
+    /// Ruby の `class A::B` は name capture が scope_resolution 内で range が名前に潰れる。
+    /// class ノードまで昇格して本体全体を range にし、配下メソッドの container 帰属を
+    /// 成立させる (Issue 2026-07-10-ruby-scoped-class-range)。
+    #[test]
+    fn ruby_scoped_class_range_spans_body_and_assigns_container() {
+        let src = "class Admin::UsersController\n  def index\n    render\n  end\nend\n";
+        let syms = syms_of(src, LangId::Ruby);
+        let class_sym = syms
+            .iter()
+            .find(|s| s.name == "UsersController")
+            .expect("class symbol");
+        assert_eq!(class_sym.range.start.line, 0);
+        assert_eq!(class_sym.range.end.line, 4, "range spans to `end`");
+        let index = syms.iter().find(|s| s.name == "index").expect("index");
+        assert_eq!(index.container.as_deref(), Some("UsersController"));
+    }
+
+    /// カスタムクエリ (`symbols --query`) は built-in を置換し、未知 capture は
+    /// INVALID_REQUEST を返す (Issue 2026-07-10-symbols-query-flag-silent-noop)。
+    #[test]
+    fn custom_query_replaces_builtin_and_validates_captures() {
+        let src = "function target() {}\nexport const single = (x: number) => x;\n";
+        let language = LangId::Typescript.ts_language();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+
+        // 有効クエリ: function_declaration のみ抽出される
+        let syms = extract_symbols_with_custom_query(
+            root,
+            src.as_bytes(),
+            LangId::Typescript,
+            "(function_declaration name: (identifier) @function.name)",
+        )
+        .expect("valid custom query");
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "target");
+
+        // 不正クエリ / 未知 capture は INVALID_REQUEST
+        for bad in ["(invalid_query", "(function_declaration) @bogus.capture"] {
+            let err =
+                extract_symbols_with_custom_query(root, src.as_bytes(), LangId::Typescript, bad)
+                    .expect_err("must be rejected");
+            let ae = err
+                .downcast_ref::<crate::error::AstroError>()
+                .expect("AstroError");
+            assert_eq!(ae.code, crate::error::ErrorCode::InvalidRequest);
+        }
     }
 }

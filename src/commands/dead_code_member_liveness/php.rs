@@ -279,13 +279,20 @@ where
             Ok(s) => s,
             Err(_) => continue,
         };
-        if !contains_ascii_case_insensitive(source.as_bytes(), bare_key.as_bytes()) {
+        // `__construct` set の参照源は `new Foo()` で、ソースに `__construct` 文字列が
+        // 現れないため bare 名の prefilter では素通りできない。`new` を含むファイルも
+        // parse 対象に残す (過剰マッチは parse が走るだけで無害)。
+        if !contains_ascii_case_insensitive(source.as_bytes(), bare_key.as_bytes())
+            && !(bare_key == "__construct"
+                && contains_ascii_case_insensitive(source.as_bytes(), b"new"))
+        {
             continue;
         }
         let tree = match parser::parse_source(&source, LangId::Php) {
             Ok(t) => t,
             Err(_) => continue,
         };
+        let aliases = collect_php_file_aliases(tree.root_node(), source.as_bytes());
         let mut analysis = PhpFileAnalysis::default();
         visit_php_node(
             tree.root_node(),
@@ -294,6 +301,7 @@ where
             bare_key,
             None,
             trait_uses,
+            &aliases,
             &mut analysis,
         );
         if analysis.ambiguous {
@@ -322,6 +330,105 @@ struct PhpFileAnalysis {
     ambiguous: bool,
 }
 
+/// ファイル単位の `use X\Y as Z;` alias 情報。
+///
+/// - `resolved`: alias 名 (folded) → 対象クラス末尾名 (folded)。単一 namespace かつ
+///   alias 名の競合が無く一意解決できた場合のみ `Some`。
+/// - `alias_names`: ファイル内に現れた全 use 名 (folded、implicit alias 含む)。
+///   `resolved` が `None` (multi-namespace 等で不完全) のとき、alias 名への scoped call
+///   を Ambiguous に倒す判定に使う (silent Ignore による dead 誤検出を防ぐ)。
+#[derive(Default)]
+struct PhpFileAliases {
+    resolved: Option<HashMap<String, String>>,
+    alias_names: HashSet<String>,
+}
+
+/// ファイル内の `use` 宣言 (grouped 含む) から alias マップを収集する。
+/// PSR-4 の 1 ファイル 1 namespace ではファイル全体マップで正しく解決できる。
+/// namespace ブロックが複数ある場合は scope 追跡をせず `resolved: None` に倒す。
+fn collect_php_file_aliases(root: tree_sitter::Node<'_>, source: &[u8]) -> PhpFileAliases {
+    let mut map: HashMap<String, String> = HashMap::new();
+    let mut alias_names: HashSet<String> = HashSet::new();
+    let mut conflicted = false;
+    let mut namespace_count = 0usize;
+    collect_php_aliases_from_node(
+        root,
+        source,
+        &mut map,
+        &mut alias_names,
+        &mut conflicted,
+        &mut namespace_count,
+    );
+    let resolved = if conflicted || namespace_count > 1 {
+        None
+    } else {
+        Some(map)
+    };
+    PhpFileAliases {
+        resolved,
+        alias_names,
+    }
+}
+
+fn collect_php_aliases_from_node(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    map: &mut HashMap<String, String>,
+    alias_names: &mut HashSet<String>,
+    conflicted: &mut bool,
+    namespace_count: &mut usize,
+) {
+    match node.kind() {
+        "namespace_definition" => *namespace_count += 1,
+        "namespace_use_declaration" => {
+            collect_php_use_clause_aliases(node, source, map, alias_names, conflicted);
+            // use 文の中はこれ以上潜らない (clause は上で処理済み)。
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_php_aliases_from_node(child, source, map, alias_names, conflicted, namespace_count);
+    }
+}
+
+/// `namespace_use_declaration` 配下の clause (grouped use 含む) から
+/// alias 名 → 対象末尾クラス名を登録する。同一 alias 名の再定義は競合として記録する。
+fn collect_php_use_clause_aliases(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    map: &mut HashMap<String, String>,
+    alias_names: &mut HashSet<String>,
+    conflicted: &mut bool,
+) {
+    if node.kind() == "namespace_use_clause" {
+        let mut cursor = node.walk();
+        let named: Vec<tree_sitter::Node<'_>> = node.named_children(&mut cursor).collect();
+        // clause = [target(qualified_name|name), alias(name)?]
+        let Some(target) = named.first() else {
+            return;
+        };
+        let Some(target_key) = php_node_key(*target, source) else {
+            *conflicted = true;
+            return;
+        };
+        let alias_key = named
+            .get(1)
+            .and_then(|alias| php_node_key(*alias, source))
+            .unwrap_or_else(|| target_key.clone());
+        alias_names.insert(alias_key.clone());
+        if map.insert(alias_key, target_key).is_some() {
+            *conflicted = true;
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_php_use_clause_aliases(child, source, map, alias_names, conflicted);
+    }
+}
+
+#[expect(clippy::too_many_arguments)]
 fn visit_php_node(
     node: tree_sitter::Node<'_>,
     source: &[u8],
@@ -329,6 +436,7 @@ fn visit_php_node(
     bare_key: &str,
     current_class: Option<&str>,
     trait_uses: &HashMap<String, PhpTraitUses>,
+    aliases: &PhpFileAliases,
     analysis: &mut PhpFileAnalysis,
 ) {
     if analysis.ambiguous {
@@ -339,13 +447,13 @@ fn visit_php_node(
     let next_class = current_class_buf.as_deref().or(current_class);
 
     process_php_liveness_node(
-        node, source, owners, bare_key, next_class, trait_uses, analysis,
+        node, source, owners, bare_key, next_class, trait_uses, aliases, analysis,
     );
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         visit_php_node(
-            child, source, owners, bare_key, next_class, trait_uses, analysis,
+            child, source, owners, bare_key, next_class, trait_uses, aliases, analysis,
         );
         if analysis.ambiguous {
             break;
@@ -373,6 +481,7 @@ fn php_class_context_for_node(
         })
 }
 
+#[expect(clippy::too_many_arguments)]
 fn process_php_liveness_node(
     node: tree_sitter::Node<'_>,
     source: &[u8],
@@ -380,6 +489,7 @@ fn process_php_liveness_node(
     bare_key: &str,
     current_class: Option<&str>,
     trait_uses: &HashMap<String, PhpTraitUses>,
+    aliases: &PhpFileAliases,
     analysis: &mut PhpFileAnalysis,
 ) {
     match node.kind() {
@@ -392,6 +502,23 @@ fn process_php_liveness_node(
                     bare_key,
                     current_class,
                     trait_uses,
+                    aliases,
+                    analysis,
+                );
+            }
+        }
+        // `__construct` の参照源はメソッド呼び出しではなく `new Foo()`。
+        // constructor set のときだけ object creation をクラス名票として数える。
+        "object_creation_expression" => {
+            if bare_key == "__construct" {
+                record_php_object_creation(
+                    node,
+                    source,
+                    owners,
+                    bare_key,
+                    current_class,
+                    trait_uses,
+                    aliases,
                     analysis,
                 );
             }
@@ -412,6 +539,7 @@ fn process_php_liveness_node(
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 fn record_php_scoped_call(
     node: tree_sitter::Node<'_>,
     source: &[u8],
@@ -419,9 +547,63 @@ fn record_php_scoped_call(
     bare_key: &str,
     current_class: Option<&str>,
     trait_uses: &HashMap<String, PhpTraitUses>,
+    aliases: &PhpFileAliases,
     analysis: &mut PhpFileAnalysis,
 ) {
-    match php_scoped_call_owner(node, source, owners, bare_key, current_class, trait_uses) {
+    match php_scoped_call_owner(
+        node,
+        source,
+        owners,
+        bare_key,
+        current_class,
+        trait_uses,
+        aliases,
+    ) {
+        PhpOwnerResolution::Resolved(owner) => {
+            *analysis.scoped_counts.entry(owner).or_default() += 1;
+        }
+        PhpOwnerResolution::Ambiguous => analysis.ambiguous = true,
+        PhpOwnerResolution::Ignore => {}
+    }
+}
+
+/// `new Foo()` を `Foo::__construct` への確定参照として数える。
+/// `new self()` は enclosing class、`new static()` / `new parent()` / `new $var()` は
+/// Ambiguous、anonymous class 等の非 name 対象は Ignore。
+#[expect(clippy::too_many_arguments)]
+fn record_php_object_creation(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    owners: &HashSet<String>,
+    bare_key: &str,
+    current_class: Option<&str>,
+    trait_uses: &HashMap<String, PhpTraitUses>,
+    aliases: &PhpFileAliases,
+    analysis: &mut PhpFileAnalysis,
+) {
+    let Some(target) = node.named_child(0) else {
+        return;
+    };
+    let resolution = match target.kind() {
+        "name" | "qualified_name" => {
+            let Some(folded) = php_node_key(target, source) else {
+                return;
+            };
+            php_resolve_scope_name(
+                &folded,
+                bare_key,
+                owners,
+                current_class,
+                trait_uses,
+                aliases,
+            )
+        }
+        // `new $cls()` は動的クラス名で owner を静的解決できない。
+        "variable_name" => PhpOwnerResolution::Ambiguous,
+        // anonymous class (`new class {...}`) 等は candidate と無関係。
+        _ => PhpOwnerResolution::Ignore,
+    };
+    match resolution {
         PhpOwnerResolution::Resolved(owner) => {
             *analysis.scoped_counts.entry(owner).or_default() += 1;
         }
@@ -443,6 +625,7 @@ fn php_scoped_call_owner(
     bare_key: &str,
     current_class: Option<&str>,
     trait_uses: &HashMap<String, PhpTraitUses>,
+    aliases: &PhpFileAliases,
 ) -> PhpOwnerResolution {
     let Some(scope) = node
         .child_by_field_name("scope")
@@ -453,13 +636,36 @@ fn php_scoped_call_owner(
     let Ok(text) = scope.utf8_text(source) else {
         return PhpOwnerResolution::Ambiguous;
     };
+    if text.starts_with('$') {
+        return PhpOwnerResolution::Ambiguous;
+    }
     let folded = php_fold_name(
         text.trim_start_matches('\\')
             .rsplit('\\')
             .next()
             .unwrap_or(text),
     );
-    match folded.as_str() {
+    php_resolve_scope_name(
+        &folded,
+        bare_key,
+        owners,
+        current_class,
+        trait_uses,
+        aliases,
+    )
+}
+
+/// scope 名 (folded 済み) を candidate owner へ解決する。scoped call (`X::m()`) と
+/// object creation (`new X()`) で共用する。
+fn php_resolve_scope_name(
+    folded: &str,
+    bare_key: &str,
+    owners: &HashSet<String>,
+    current_class: Option<&str>,
+    trait_uses: &HashMap<String, PhpTraitUses>,
+    aliases: &PhpFileAliases,
+) -> PhpOwnerResolution {
+    match folded {
         "self" => current_class
             .map(|owner| php_resolve_trait_dispatch(owner, bare_key, owners, trait_uses))
             .unwrap_or(PhpOwnerResolution::Ambiguous),
@@ -468,9 +674,21 @@ fn php_scoped_call_owner(
         // 確定解決するとサブクラス側メソッドの dead 誤検出になるため `parent::` と
         // 同じく Ambiguous に倒す (duplicate set 全体が旧スキップへフォールバック)。
         "parent" | "static" => PhpOwnerResolution::Ambiguous,
-        _ if owners.contains(&folded) => PhpOwnerResolution::Resolved(folded),
-        _ if text.starts_with('$') => PhpOwnerResolution::Ambiguous,
-        _ => php_resolve_trait_dispatch(&folded, bare_key, owners, trait_uses),
+        _ if owners.contains(folded) => PhpOwnerResolution::Resolved(folded.to_string()),
+        _ => {
+            // `use X\Y as Z; Z::m()` / `new Z()` の alias を実クラス名へ解決してから
+            // trait dispatch を含む通常解決へ流す。alias マップが不完全 (multi-namespace /
+            // 競合) な場合、alias 名への参照だけ Ambiguous に倒す (silent Ignore による
+            // dead 誤検出を防ぐ)。
+            if let Some(map) = &aliases.resolved {
+                if let Some(target) = map.get(folded) {
+                    return php_resolve_trait_dispatch(target, bare_key, owners, trait_uses);
+                }
+            } else if aliases.alias_names.contains(folded) {
+                return PhpOwnerResolution::Ambiguous;
+            }
+            php_resolve_trait_dispatch(folded, bare_key, owners, trait_uses)
+        }
     }
 }
 

@@ -283,7 +283,18 @@ impl AppService {
     /// `LangId::is_lexer_only()` な言語 (現状 Xojo) は手書き lexer で抽出する。
     /// tree-sitter は使わないためメモリ消費は入力サイズに対して線形ではなく定数倍に近い。
     pub fn extract_symbols(&self, path: &str) -> Result<AstgenResponse> {
-        debug!(path = path, "extract_symbols called");
+        self.extract_symbols_with_query(path, None)
+    }
+
+    /// カスタム tree-sitter クエリ付きのシンボル抽出 (`symbols --query` / session の
+    /// `query` フィールド)。`query` が `None` なら built-in クエリ (従来動作)。
+    /// 不正なクエリ・未知 capture は `INVALID_REQUEST` を返し、silent no-op にしない。
+    pub fn extract_symbols_with_query(
+        &self,
+        path: &str,
+        query: Option<&str>,
+    ) -> Result<AstgenResponse> {
+        debug!(path = path, query = ?query, "extract_symbols called");
         let utf8_path_buf = self.validate_path_utf8(path)?;
         let utf8_path = utf8_path_buf.as_path();
 
@@ -294,6 +305,13 @@ impl AppService {
 
         // lexer-only 言語は tree-sitter を使わず手書き lexer で抽出する。
         if let DetectedLang::LexerOnly(lexer_lang) = lang_id.detected() {
+            if query.is_some() {
+                return Err(crate::error::AstroError::new(
+                    crate::error::ErrorCode::InvalidRequest,
+                    format!("--query is not supported for lexer-only language: {lang_id}"),
+                )
+                .into());
+            }
             let syms = lexer::extract_symbols(&source, lexer_lang);
             let location = LocationKey::file_only(path);
             let mut response = AstgenResponse::success(location, lang_id);
@@ -312,7 +330,10 @@ impl AppService {
         let tree = parser::parse_source(&source, lang_id)?;
         let root = tree.root_node();
 
-        let syms = symbols::extract_symbols(root, &source, lang_id)?;
+        let syms = match query {
+            Some(q) => symbols::extract_symbols_with_custom_query(root, &source, lang_id, q)?,
+            None => symbols::extract_symbols(root, &source, lang_id)?,
+        };
 
         let location = LocationKey::file_only(path);
         let mut response = AstgenResponse::success(location, lang_id);

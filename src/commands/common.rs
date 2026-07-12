@@ -180,8 +180,7 @@ pub fn read_paths_file_limited(path: &str, max_bytes: usize) -> Result<Vec<Strin
         .collect())
 }
 
-pub(crate) fn cache_hash_for_path(path: &camino::Utf8Path, source: &[u8]) -> String {
-    let content_hash = CacheStore::hash(source);
+pub(crate) fn cache_hash_for_path(path: &camino::Utf8Path, content_hash: &str) -> String {
     let path_key = std::fs::canonicalize(path.as_std_path())
         .ok()
         .and_then(|p| p.to_str().map(ToOwned::to_owned))

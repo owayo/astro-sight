@@ -123,3 +123,153 @@ fn dead_code_php_trait_shadowed_by_own_concrete_method_reports_dead_trait() {
         "abstract 宣言は trait 実装で満たされるため QueryA2.work2 は dead に出ないべき: {names:?}"
     );
 }
+
+/// `__construct` の duplicate set では `new Foo()` (object_creation_expression) が
+/// 参照源になる。owner 確定票として数え、両 constructor の dead 誤検出を防ぐ
+/// (Issue 2026-07-10-php-magic-construct-duplicate-dead-fp)。
+#[test]
+fn dead_code_php_construct_duplicate_counts_object_creation() {
+    let repo = TestRepo::new();
+
+    repo.write(
+        "Foo.php",
+        "<?php\nclass Foo { public function __construct() {} }\n",
+    );
+    repo.write(
+        "Bar.php",
+        "<?php\nclass Bar { public function __construct() {} }\n",
+    );
+    repo.write("Use.php", "<?php\n$f = new Foo();\n$b = new Bar();\n");
+
+    let names = dead_names(&repo);
+    assert!(
+        !contains(&names, "Foo.__construct") && !contains(&names, "Bar.__construct"),
+        "new Foo() / new Bar() が constructor への確定参照として数えられるべき: {names:?}"
+    );
+}
+
+/// `new Foo()` の無い側の `__construct` は正確に dead と出る (prefilter が `new` を
+/// 含むファイルを parse 対象に残すことの検証も兼ねる)。
+#[test]
+fn dead_code_php_construct_duplicate_unused_side_is_dead() {
+    let repo = TestRepo::new();
+
+    repo.write(
+        "Foo.php",
+        "<?php\nclass Foo { public function __construct() {} }\n",
+    );
+    repo.write(
+        "Bar.php",
+        "<?php\nclass Bar { public function __construct() {} }\n",
+    );
+    repo.write("Use.php", "<?php\n$f = new Foo();\n");
+
+    let names = dead_names(&repo);
+    assert!(
+        !contains(&names, "Foo.__construct"),
+        "new Foo() があるため Foo.__construct は live: {names:?}"
+    );
+    assert!(
+        contains(&names, "Bar.__construct"),
+        "new されない Bar.__construct は dead に出るべき: {names:?}"
+    );
+}
+
+/// `new $var()` (動的クラス名) は owner を静的解決できないため Ambiguous に倒し、
+/// duplicate set 全体を旧スキップへフォールバックさせる。
+#[test]
+fn dead_code_php_construct_dynamic_new_stays_ambiguous() {
+    let repo = TestRepo::new();
+
+    repo.write(
+        "Foo.php",
+        "<?php\nclass Foo { public function __construct() {} }\n",
+    );
+    repo.write(
+        "Bar.php",
+        "<?php\nclass Bar { public function __construct() {} }\n",
+    );
+    repo.write("Use.php", "<?php\n$cls = 'Foo';\n$f = new $cls();\n");
+
+    let names = dead_names(&repo);
+    assert!(
+        !contains(&names, "Foo.__construct") && !contains(&names, "Bar.__construct"),
+        "動的 new は Ambiguous に倒して両 constructor を旧スキップ維持: {names:?}"
+    );
+}
+
+/// `use Lib\Beta as B; B::fmt();` の alias 経由静的呼び出しを実クラスへ解決して
+/// 票を入れる (Issue 2026-07-10-php-use-alias-static-call-dead-fp)。
+#[test]
+fn dead_code_php_use_alias_static_call_counts_target_owner() {
+    let repo = TestRepo::new();
+
+    repo.write(
+        "Alpha.php",
+        "<?php\nnamespace Lib;\nclass Alpha { public function fmt() { return 'a'; } }\n",
+    );
+    repo.write(
+        "Beta.php",
+        "<?php\nnamespace Lib;\nclass Beta { public static function fmt() { return 'b'; } }\n",
+    );
+    repo.write("Consumer.php", "<?php\nuse Lib\\Beta as B;\nB::fmt();\n");
+
+    let names = dead_names(&repo);
+    assert!(
+        !contains(&names, "Beta.fmt"),
+        "B::fmt() は alias 解決で Beta.fmt への確定参照になるべき: {names:?}"
+    );
+    assert!(
+        contains(&names, "Alpha.fmt"),
+        "未参照の Alpha.fmt は dead のまま: {names:?}"
+    );
+}
+
+/// grouped use (`use Lib\{Beta as B};`) の alias も解決される。
+#[test]
+fn dead_code_php_grouped_use_alias_static_call_counts_target_owner() {
+    let repo = TestRepo::new();
+
+    repo.write(
+        "Alpha.php",
+        "<?php\nnamespace Lib;\nclass Alpha { public function fmt() { return 'a'; } }\n",
+    );
+    repo.write(
+        "Beta.php",
+        "<?php\nnamespace Lib;\nclass Beta { public static function fmt() { return 'b'; } }\n",
+    );
+    repo.write("Consumer.php", "<?php\nuse Lib\\{Beta as B};\nB::fmt();\n");
+
+    let names = dead_names(&repo);
+    assert!(
+        !contains(&names, "Beta.fmt"),
+        "grouped use の alias 経由 B::fmt() も Beta.fmt への確定参照になるべき: {names:?}"
+    );
+}
+
+/// 同一 alias 名が競合するファイルでは alias 解決を諦め、alias 名への呼び出しを
+/// Ambiguous に倒す (誤帰属より旧スキップ)。
+#[test]
+fn dead_code_php_conflicting_alias_stays_ambiguous() {
+    let repo = TestRepo::new();
+
+    repo.write(
+        "Alpha.php",
+        "<?php\nnamespace Lib;\nclass Alpha { public function fmt() { return 'a'; } }\n",
+    );
+    repo.write(
+        "Beta.php",
+        "<?php\nnamespace Lib;\nclass Beta { public static function fmt() { return 'b'; } }\n",
+    );
+    // 実 PHP ではコンパイルエラーだが、防御的に競合 alias は解決不能として扱う
+    repo.write(
+        "Consumer.php",
+        "<?php\nuse Lib\\Beta as B;\nuse Other\\Thing as B;\nB::fmt();\n",
+    );
+
+    let names = dead_names(&repo);
+    assert!(
+        !contains(&names, "Beta.fmt") && !contains(&names, "Alpha.fmt"),
+        "競合 alias は Ambiguous に倒して両 owner を旧スキップ維持: {names:?}"
+    );
+}

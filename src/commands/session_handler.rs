@@ -26,7 +26,7 @@ pub fn handle_request(
             Ok(serde_json::to_value(response)?)
         }
         Command::Symbols => {
-            let response = service.extract_symbols(&req.path)?;
+            let response = service.extract_symbols_with_query(&req.path, req.query.as_deref())?;
             let compact = response.to_compact_symbols(false);
             Ok(serde_json::to_value(compact)?)
         }

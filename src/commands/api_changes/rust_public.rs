@@ -647,8 +647,10 @@ impl RustBaseReexportCache {
 /// `exposes_symbol` で削除シンボルから固定点伝播して公開到達性を判定する。
 pub(crate) struct RustPubUseIndex {
     edges: Vec<RustPubUseEdge>,
-    /// 外部から `crate::<path>` で到達可能な module 集合 (root = `[]`、`pub mod` のみで到達)。
-    public_modules: std::collections::HashSet<Vec<String>>,
+    /// 外部から到達可能な module 集合。`pub mod` 経路 (root = `[]`) を seed に、
+    /// module 再エクスポート (`pub use internal::wifi;` / `pub use self::wifi as api;`)
+    /// で到達可能になる module とその pub 子孫を固定点で加えたもの。
+    reachable_modules: std::collections::HashSet<Vec<String>>,
     /// `(target_module, target_item)` → Named edge index。Named 伝播の逆引き。
     named_by_target: std::collections::HashMap<RustExportKey, Vec<usize>>,
     /// `target_module` → Wildcard edge index。Wildcard 伝播の逆引き。
@@ -681,7 +683,10 @@ pub(crate) enum RustPubUseEdge {
 
 impl RustPubUseIndex {
     /// `info` の private module 配下の `symbol_name` が外部公開 API として到達可能かを返す。
-    /// 削除シンボルを seed として live export 集合を固定点伝播し、live ∩ public_modules ≠ ∅ なら true。
+    /// 削除シンボルを seed として live export 集合を固定点伝播し、
+    /// live ∩ reachable_modules ≠ ∅ なら true。reachable_modules は `pub mod` 経路に
+    /// module 再エクスポート由来の到達 module を加えた集合のため、seed の module 自体が
+    /// `pub use self::wifi as api;` で公開されているケースも item 伝播なしで検出できる。
     fn exposes_symbol(&self, info: &RustPrivateModuleInfo, symbol_name: &str) -> bool {
         let item = rust_reexport_item_name(symbol_name).to_string();
         let seed = RustExportKey {
@@ -690,7 +695,7 @@ impl RustPubUseIndex {
         };
         self.propagate_live_exports(seed)
             .into_iter()
-            .any(|key| self.public_modules.contains(&key.module))
+            .any(|key| self.reachable_modules.contains(&key.module))
     }
 
     /// 削除 seed から逆向きに live export を BFS で伝播。HashSet で重複を防いで循環で停止する。
@@ -802,12 +807,194 @@ pub(crate) fn collect_rust_pub_use_index(
         }
     }
     let public_modules = public_reachable_modules(source, dir, info)?;
+    let all_modules = collect_all_modules(source, dir, info)?;
+    let reachable_modules =
+        compute_reexport_reachable_modules(&edges, &public_modules, &all_modules);
     Some(RustPubUseIndex {
         edges,
-        public_modules,
+        reachable_modules,
         named_by_target,
         wildcard_by_target_module,
     })
+}
+
+/// module 再エクスポート (`pub use path::to::module;`) による外部到達可能 module 集合を
+/// 固定点計算する。seed は `pub mod` 経路の `public_modules`。Named edge の source module
+/// が到達可能なら、target path が実在する module の場合に限りその module も到達可能になり、
+/// pub 子孫 module も連鎖する。private child module は親が公開されても外部から辿れない
+/// ため含めない (単純な prefix 判定だと private 子まで誤って公開扱いになる)。
+fn compute_reexport_reachable_modules(
+    edges: &[RustPubUseEdge],
+    public_modules: &std::collections::HashSet<Vec<String>>,
+    all_modules: &std::collections::HashMap<Vec<String>, Vec<String>>,
+) -> std::collections::HashSet<Vec<String>> {
+    let mut reachable = public_modules.clone();
+    loop {
+        let mut changed = false;
+        for edge in edges {
+            let RustPubUseEdge::Named {
+                source_module,
+                target_module,
+                target_item,
+                ..
+            } = edge
+            else {
+                continue;
+            };
+            if !reachable.contains(source_module) {
+                continue;
+            }
+            let mut candidate = target_module.clone();
+            candidate.push(target_item.clone());
+            if !all_modules.contains_key(&candidate) || reachable.contains(&candidate) {
+                continue;
+            }
+            reachable.insert(candidate.clone());
+            changed = true;
+            // 到達可能になった module の pub 子孫 module を連鎖登録する。
+            let mut stack = vec![candidate];
+            while let Some(m) = stack.pop() {
+                if let Some(pub_children) = all_modules.get(&m) {
+                    for c in pub_children {
+                        let mut child = m.clone();
+                        child.push(c.clone());
+                        if reachable.insert(child.clone()) {
+                            stack.push(child);
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    reachable
+}
+
+/// crate 内の**全 module** (可視性問わず) を walk し、
+/// module 絶対 path → 「`pub` と宣言された子 module 名のリスト」を返す。
+/// module 再エクスポートの到達性固定点で「target が module か」
+/// 「reachable module の pub 子孫」の判定に使う。判定不能 (`#[path]` 等) は
+/// `None` (呼出元で index 全体を諦めて api.rm を残す fail-closed)。
+pub(crate) fn collect_all_modules(
+    source: RustSourceTree<'_>,
+    dir: &str,
+    info: &RustPrivateModuleInfo,
+) -> Option<std::collections::HashMap<Vec<String>, Vec<String>>> {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    let mut result: HashMap<Vec<String>, Vec<String>> = HashMap::new();
+    result.insert(Vec::new(), Vec::new());
+    let mut frontier: Vec<(Vec<String>, PathBuf)> = vec![(Vec::new(), PathBuf::from("lib.rs"))];
+    while let Some((segments, current_rel)) = frontier.pop() {
+        let module_source =
+            read_rust_module_source(source, dir, &info.crate_root_rel, &current_rel)?;
+        let tree = parser::parse_source(&module_source, crate::language::LangId::Rust).ok()?;
+        collect_modules_with_visibility(
+            source,
+            tree.root_node(),
+            &module_source,
+            dir,
+            info,
+            &segments,
+            &current_rel,
+            &mut result,
+            &mut frontier,
+        )?;
+    }
+    Some(result)
+}
+
+/// `collect_public_pub_mods` の全 module 版。private mod にも潜って module 集合を作り、
+/// pub な子 module 名だけを親エントリに記録する。
+#[allow(clippy::too_many_arguments)]
+fn collect_modules_with_visibility(
+    source: RustSourceTree<'_>,
+    node: tree_sitter::Node<'_>,
+    source_bytes: &[u8],
+    dir: &str,
+    info: &RustPrivateModuleInfo,
+    current_segments: &[String],
+    current_file_rel: &std::path::Path,
+    result: &mut std::collections::HashMap<Vec<String>, Vec<String>>,
+    frontier: &mut Vec<(Vec<String>, std::path::PathBuf)>,
+) -> Option<()> {
+    use std::path::Path;
+    match node.kind() {
+        "mod_item" => {
+            if rust_mod_item_has_path_attribute(node, source_bytes) {
+                return None;
+            }
+            let name = node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source_bytes).ok())
+                .map(str::to_string)?;
+            let is_pub = rust_use_declaration_is_pub(node, source_bytes);
+            let mut child_segments = current_segments.to_vec();
+            child_segments.push(name.clone());
+            if is_pub {
+                result
+                    .entry(current_segments.to_vec())
+                    .or_default()
+                    .push(name.clone());
+            }
+            result.entry(child_segments.clone()).or_default();
+            let mut has_inline_body = false;
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "declaration_list" {
+                    has_inline_body = true;
+                    let mut inner_cursor = child.walk();
+                    for inner in child.named_children(&mut inner_cursor) {
+                        collect_modules_with_visibility(
+                            source,
+                            inner,
+                            source_bytes,
+                            dir,
+                            info,
+                            &child_segments,
+                            current_file_rel,
+                            result,
+                            frontier,
+                        )?;
+                    }
+                }
+            }
+            if !has_inline_body {
+                let parent_dir = current_file_rel
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                let as_mod = parent_dir.join(&name).join("mod.rs");
+                let as_file = parent_dir.join(format!("{name}.rs"));
+                if read_rust_module_source(source, dir, &info.crate_root_rel, &as_mod).is_some() {
+                    frontier.push((child_segments, as_mod));
+                } else if read_rust_module_source(source, dir, &info.crate_root_rel, &as_file)
+                    .is_some()
+                {
+                    frontier.push((child_segments, as_file));
+                }
+            }
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_modules_with_visibility(
+                    source,
+                    child,
+                    source_bytes,
+                    dir,
+                    info,
+                    current_segments,
+                    current_file_rel,
+                    result,
+                    frontier,
+                )?;
+            }
+        }
+    }
+    Some(())
 }
 
 /// `src/` 配下の `.rs` ファイル (file は dir 相対) を `source` 経由で読む。
@@ -1181,9 +1368,12 @@ pub(crate) fn expand_rust_use_tree_edges_ast(
             // path::name 形式の単純 re-export、または anchor 単体。
             let (resolved_prefix, leaf_name) =
                 resolve_use_path_node(node, source, path_prefix, current_module)?;
-            if let Some(item) = leaf_name
-                && !resolved_prefix.is_empty()
-            {
+            if let Some(item) = leaf_name {
+                // resolved_prefix が空 (crate root 直下の item / module) でも edge を
+                // 生成する。旧実装は silent drop しており、`pub use self::wifi as api;`
+                // のような root 直下モジュールの再エクスポートが API 面判定から漏れて
+                // pub fn の削除・変更が無音になっていた (モジュール到達性は
+                // compute_reexport_reachable_modules 側で固定点計算する)。
                 let exported_name = alias_override
                     .map(str::to_string)
                     .unwrap_or_else(|| item.clone());
