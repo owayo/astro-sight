@@ -735,7 +735,10 @@ mod tests {
             &["Alpha", "Beta"],
             "fmt",
         );
-        assert!(a.has_unresolved_access, "loop 変数 shadow は不解決に倒すべき");
+        assert!(
+            a.has_unresolved_access,
+            "loop 変数 shadow は不解決に倒すべき"
+        );
         assert_eq!(count_for(&a, "Alpha"), 0);
     }
 
@@ -762,7 +765,10 @@ mod tests {
             &["Alpha", "Beta"],
             "fmt",
         );
-        assert!(a.has_unresolved_access, "catch param shadow は不解決に倒すべき");
+        assert!(
+            a.has_unresolved_access,
+            "catch param shadow は不解決に倒すべき"
+        );
         assert_eq!(count_for(&a, "Alpha"), 0);
     }
 
@@ -775,7 +781,10 @@ mod tests {
             &["Alpha", "Beta"],
             "fmt",
         );
-        assert!(a.has_unresolved_access, "bare arrow param shadow は不解決に倒すべき");
+        assert!(
+            a.has_unresolved_access,
+            "bare arrow param shadow は不解決に倒すべき"
+        );
         assert_eq!(count_for(&a, "Alpha"), 0);
     }
 
@@ -788,7 +797,10 @@ mod tests {
             &["Alpha", "Beta"],
             "fmt",
         );
-        assert!(a.has_unresolved_access, "destructuring shadow は不解決に倒すべき");
+        assert!(
+            a.has_unresolved_access,
+            "destructuring shadow は不解決に倒すべき"
+        );
         assert_eq!(count_for(&a, "Alpha"), 0);
     }
 
@@ -801,7 +813,10 @@ mod tests {
             &["Alpha", "Beta"],
             "fmt",
         );
-        assert!(a.has_unresolved_access, "JS bare param shadow は不解決に倒すべき");
+        assert!(
+            a.has_unresolved_access,
+            "JS bare param shadow は不解決に倒すべき"
+        );
         assert_eq!(count_for(&a, "Alpha"), 0);
     }
 
@@ -815,7 +830,10 @@ mod tests {
             &["Alpha", "Beta"],
             "fmt",
         );
-        assert!(a.has_unresolved_access, "関数宣言名 shadow は不解決に倒すべき");
+        assert!(
+            a.has_unresolved_access,
+            "関数宣言名 shadow は不解決に倒すべき"
+        );
         assert_eq!(count_for(&a, "Alpha"), 0);
     }
 

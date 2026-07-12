@@ -1586,18 +1586,11 @@ fn is_js_ts_angular_cva_contract_method(root: Node, source: &[u8], symbol_range:
     // 持つ確率は実用上ゼロと判断 (`ControlValueAccessor` は @angular/forms の専用契約名)。
     // member decorator (`@HostListener` / `@Input` 等) の判定は引き続き `@Component` /
     // `@Directive` 装飾を必須に維持し、誤抑止リスクを限定する。
-    let mut cur = method_node;
-    while let Some(parent) = cur.parent() {
-        if matches!(
-            parent.kind(),
-            "class_declaration" | "abstract_class_declaration"
-        ) {
-            return class_implements_control_value_accessor(parent, source)
-                || class_has_ng_value_accessor_provider(parent, source);
-        }
-        cur = parent;
-    }
-    false
+    let Some(class_node) = enclosing_of_kind(method_node, JS_TS_CLASS_DECLARATION_KINDS) else {
+        return false;
+    };
+    class_implements_control_value_accessor(class_node, source)
+        || class_has_ng_value_accessor_provider(class_node, source)
 }
 
 /// `class X implements ControlValueAccessor [...]` の implements 節を判定する。
@@ -1688,30 +1681,15 @@ pub fn is_js_ts_angular_provider_option_callback(
     source: &[u8],
     symbol_range: &Range,
 ) -> bool {
-    let start = tree_sitter::Point {
-        row: symbol_range.start.line,
-        column: symbol_range.start.column,
-    };
-    let end = tree_sitter::Point {
-        row: symbol_range.end.line,
-        column: symbol_range.end.column,
-    };
-    let Some(node) = root.descendant_for_point_range(start, end) else {
+    let Some(node) = node_for_symbol_range(root, symbol_range) else {
         return false;
     };
 
-    let mut cur = node;
-    let callback_node = loop {
-        if matches!(
-            cur.kind(),
-            "method_definition" | "function_expression" | "arrow_function"
-        ) {
-            break cur;
-        }
-        match cur.parent() {
-            Some(parent) => cur = parent,
-            None => return false,
-        }
+    let Some(callback_node) = enclosing_of_kind(
+        node,
+        &["method_definition", "function_expression", "arrow_function"],
+    ) else {
+        return false;
     };
 
     let (callback_name, containing_object) = match callback_node.kind() {
