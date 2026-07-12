@@ -2469,7 +2469,8 @@ fn tuple_or_array_has_explicit_type(tuple_or_array: Node<'_>) -> bool {
     let mut cur = tuple_or_array;
     while let Some(parent) = cur.parent() {
         match parent.kind() {
-            "tuple_expression" | "array_expression" => cur = parent,
+            // 冗長括弧 (`((my_system,))`) も透過して外側の束縛を確認する。
+            "tuple_expression" | "array_expression" | "parenthesized_expression" => cur = parent,
             "let_declaration" | "const_item" | "static_item" | "type_cast_expression" => {
                 let is_value = parent
                     .child_by_field_name("value")
@@ -4314,6 +4315,8 @@ struct Bar {
                            let _ = typed_arr;\n\
                            let untyped = (my_system,);\n\
                            let _ = untyped;\n\
+                           let parens: (fn(u32),) = ((my_system,));\n\
+                           let _ = parens;\n\
                        }\n";
         let tree = crate::engine::parser::parse_source(source, LangId::Rust).unwrap();
 
@@ -4351,6 +4354,8 @@ struct Bar {
                 (10, RefUsageRole::Other), // let typed_arr: [fn(u32); 1] = [my_system]
                 // 型注釈なしは fn item 型に推論され変更へ追随するため格下げ可
                 (12, RefUsageRole::FunctionValue), // let untyped = (my_system,)
+                // 冗長括弧付きでも外側の明示型を透過検出して blocking 維持
+                (14, RefUsageRole::Other), // let parens: (fn(u32),) = ((my_system,))
             ],
             "roles: {roles:?}"
         );
