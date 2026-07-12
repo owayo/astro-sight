@@ -2404,9 +2404,14 @@ fn classify_ref_usage_role(node: Node<'_>, lang_id: LangId) -> RefUsageRole {
                 RefUsageRole::Other
             }
         }
-        // 関数値としての受け渡し位置。call の実引数は `arguments` 配下、
-        // タプル/配列要素、`my_system.after(..)` のようなメソッドレシーバも含む。
-        "arguments" | "tuple_expression" | "array_expression" => RefUsageRole::FunctionValue,
+        // 関数値としての受け渡し位置のうち、タプル/配列の**要素**のみ格下げ対象。
+        // 直接引数 (`arguments` 直下、`accept(my_system)`) は呼び出し先が
+        // `fn(fn(u32))` のような具体 fn ポインタ引数を取る場合に型変更で壊れるが、
+        // AST だけでは渡し先シグネチャを解決できないため blocking (Other) を維持する。
+        // タプル/配列要素は fn ポインタを直接取る API がほぼ存在せず (型パラメータ
+        // 経由のトレイト境界になる)、Bevy `add_systems(Update, (a, b, c))` パターンを
+        // 安全に informational 化できる。
+        "tuple_expression" | "array_expression" => RefUsageRole::FunctionValue,
         "field_expression" => {
             if parent
                 .child_by_field_name("value")
@@ -4301,9 +4306,11 @@ struct Bar {
         assert_eq!(
             roles,
             vec![
-                (3, RefUsageRole::CallCallee),           // my_system(1)
-                (4, RefUsageRole::FunctionValue),        // (1, my_system, 2) タプル要素
-                (5, RefUsageRole::FunctionValue),        // register(my_system) 直接引数
+                (3, RefUsageRole::CallCallee),    // my_system(1)
+                (4, RefUsageRole::FunctionValue), // (1, my_system, 2) タプル要素
+                // register(my_system) の直接引数は、渡し先が fn ポインタ引数
+                // (`fn accept(_: fn(u32))`) の場合に型変更で壊れるため blocking 維持
+                (5, RefUsageRole::Other),
                 (6, RefUsageRole::TypeConstrainedValue), // let pinned: fn(u32) = my_system
             ],
             "roles: {roles:?}"

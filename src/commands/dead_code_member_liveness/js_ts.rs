@@ -247,9 +247,11 @@ fn analyze_file(
     // 1. クラス名として使えるローカル名 → owner のマップを作る。
     //    - import (default / named / alias): `import { Alpha as A }` → A → Alpha
     //    - 同ファイル内 class 定義: class Alpha {} → Alpha → Alpha
-    //    `import * as ns` は ns.Alpha 経由の静的解決ができないため不解決材料にする。
+    //    `import * as ns` 経由のアクセス (`ns.Alpha.fmt()`) は receiver が
+    //    member_expression になり通常の分類で不解決に落ちるため、namespace import の
+    //    存在だけでファイル全体を Ambiguous にはしない (対象 member への access が
+    //    無いファイルまで巻き込むのを避ける)。
     let mut local_to_owner: HashMap<String, String> = HashMap::new();
-    let mut has_namespace_import = false;
     if let Some(language) = ts_language_for(lang)
         && let Ok(query) = Query::new(&language, IMPORT_QUERY)
     {
@@ -271,7 +273,6 @@ fn analyze_file(
                     }
                     "import_name" => import_name = Some(text),
                     "import_alias" => import_alias = Some(text),
-                    "namespace_name" => has_namespace_import = true,
                     _ => {}
                 }
             }
@@ -282,11 +283,6 @@ fn analyze_file(
                 local_to_owner.insert(local.to_string(), name.to_string());
             }
         }
-    }
-    if has_namespace_import {
-        // `ns.Alpha` 経由のアクセスがあり得るため、このファイルの access は静的解決不能。
-        analysis.has_unresolved_access = true;
-        return analysis;
     }
     collect_local_class_definitions(root, source, &owners_set, &mut local_to_owner);
 
@@ -471,19 +467,15 @@ fn new_expression_owner(
     resolve_class_name(text, local_to_owner, owners_set)
 }
 
-/// クラス名テキストを import alias / 直接名経由で owner へ解決する。
+/// クラス名テキストを owner へ解決する。import (alias 含む) または同一ファイル内
+/// class 定義に限定する — 単なる owner 名一致での確定は `const Alpha = getBeta();`
+/// のような owner と同名の変数を class と誤認するため行わない。
 fn resolve_class_name(
     text: &str,
     local_to_owner: &HashMap<String, String>,
-    owners_set: &HashSet<&str>,
+    _owners_set: &HashSet<&str>,
 ) -> Option<String> {
-    if let Some(owner) = local_to_owner.get(text) {
-        return Some(owner.clone());
-    }
-    if owners_set.contains(text) {
-        return Some(text.to_string());
-    }
-    None
+    local_to_owner.get(text).cloned()
 }
 
 /// `member_expression` の receiver (object 側) を owner へ静的に解決する。
@@ -500,14 +492,16 @@ fn resolve_member_receiver(
     match object.kind() {
         "identifier" => {
             let text = object.utf8_text(source).ok()?;
-            // クラス名 (static access / import alias) を変数より優先する。
-            if let Some(owner) = resolve_class_name(text, local_to_owner, owners_set) {
-                return Some(owner);
+            // 同名のローカル binding があれば shadow とみなし変数として判定する
+            // (`const Alpha = getBeta(); Alpha.fmt()` を class static access と
+            // 誤認しない)。binding が無い場合のみ import / 同一ファイル class 名。
+            if let Some(binding) = var_bindings.get(text) {
+                return match binding {
+                    VarBinding::Owner(owner) => Some(owner.clone()),
+                    _ => None,
+                };
             }
-            match var_bindings.get(text) {
-                Some(VarBinding::Owner(owner)) => Some(owner.clone()),
-                _ => None,
-            }
+            resolve_class_name(text, local_to_owner, owners_set)
         }
         "new_expression" => new_expression_owner(object, source, local_to_owner, owners_set),
         // `xs[i].member`: xs が owner 配列型 (`Alpha[]`) に束縛されていれば要素は owner。

@@ -10868,14 +10868,142 @@ fn dead_code_ts_factory_receiver_marks_set_ambiguous() {
 #[test]
 fn api_changes_rust_module_reexport_detects_modified_signature() {
     // Issue 2026-07-10-rust-module-reexport-api-suppression:
-    // `mod wifi; pub use self::wifi as wifi_api;` のモジュール再エクスポート経由で
-    // 公開されている pub fn のシグネチャ変更が api.modified (blocking) に出る。
+    // private module 内の pub mod を `pub use internal::wifi as wifi_api;` で
+    // 再エクスポートしている (valid な) 構成で、公開 pub fn のシグネチャ変更が
+    // api.modified (blocking) に出る。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/internal")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"reexport-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "mod internal;\npub use internal::wifi as wifi_api;\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/internal.rs"), "pub mod wifi;\n").unwrap();
+    std::fs::write(
+        root.join("src/internal/wifi.rs"),
+        "pub fn found() -> bool {\n    true\n}\n",
+    )
+    .unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "astro-sight@example.com"]);
+    git(&["config", "user.name", "astro-sight"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial", "-q"]);
+
+    std::fs::write(
+        root.join("src/internal/wifi.rs"),
+        "pub fn found(strict: bool) -> bool {\n    strict\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["review", "--dir", root.to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let modified: Vec<&str> = json["api_changes"]["modified"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        modified.contains(&"found"),
+        "module 再エクスポート経由の公開 API シグネチャ変更は api.modified に出るべき: {json}"
+    );
+}
+
+#[test]
+fn api_changes_rust_file_style_module_hierarchy_reexport_detected() {
+    // file-style module (`internal.rs`) 内の `pub mod api;` は `internal/api.rs` に
+    // 解決される (Rust 2018+)。この階層 (`internal/api.rs` 内の `pub mod v1;` →
+    // `internal/api/v1.rs`) を経由した公開 API の変更も検出する
+    // (子 module 解決を parent dir 固定にしていた旧実装は取りこぼす)。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/internal/api")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"hier-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "mod internal;\npub use internal::api;\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/internal.rs"), "pub mod api;\n").unwrap();
+    std::fs::write(root.join("src/internal/api.rs"), "pub mod v1;\n").unwrap();
+    std::fs::write(
+        root.join("src/internal/api/v1.rs"),
+        "pub fn f() -> bool {\n    true\n}\n",
+    )
+    .unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "astro-sight@example.com"]);
+    git(&["config", "user.name", "astro-sight"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial", "-q"]);
+
+    std::fs::write(
+        root.join("src/internal/api/v1.rs"),
+        "pub fn f(strict: bool) -> bool {\n    strict\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["review", "--dir", root.to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let modified: Vec<&str> = json["api_changes"]["modified"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        modified.contains(&"f"),
+        "file-style module 階層経由の公開 API 変更も api.modified に出るべき: {json}"
+    );
+}
+
+#[test]
+fn api_changes_rust_private_module_reexport_is_not_public_surface() {
+    // `mod wifi;` (private) を `pub use self::wifi as api;` する構成は rustc では
+    // E0365 で無効。API 面として扱わない (親の pub_children 条件で弾く)。
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path();
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(
         root.join("Cargo.toml"),
-        "[package]\nname = \"reexport-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+        "[package]\nname = \"e0365-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
     )
     .unwrap();
     std::fs::write(
@@ -10915,15 +11043,10 @@ fn api_changes_rust_module_reexport_detects_modified_signature() {
         .expect("failed to run");
     assert!(output.status.success());
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
-    let modified: Vec<&str> = json["api_changes"]["modified"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|s| s["name"].as_str())
-        .collect();
+    let modified = json["api_changes"]["modified"].as_array().unwrap();
     assert!(
-        modified.contains(&"found"),
-        "module 再エクスポート経由の公開 API シグネチャ変更は api.modified に出るべき: {json}"
+        modified.is_empty(),
+        "E0365 相当の private module 再エクスポートは公開 API 面にしない: {json}"
     );
 }
 
@@ -11126,5 +11249,156 @@ fn symbols_cache_returns_fresh_result_after_content_change() {
     assert!(
         out3.contains("second") && !out3.contains("first"),
         "内容変更後は新しい解析結果が返る: {out3}"
+    );
+}
+
+#[test]
+fn impact_fn_direct_argument_ref_stays_blocking() {
+    // codex レビュー指摘 (重大1): 直接引数 (`accept(my_system)`) は呼び出し先が
+    // `fn accept(_: fn(u32))` のような fn ポインタ引数を取る場合に型変更で壊れる。
+    // AST だけでは渡し先シグネチャを解決できないため、タプル/配列要素と違い
+    // blocking を維持する。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"directarg-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub mod sys;\npub mod reg;\n").unwrap();
+    std::fs::write(
+        root.join("src/sys.rs"),
+        "pub fn my_system(x: u32) {\n    let _ = x;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/reg.rs"),
+        "use crate::sys::my_system;\n\npub fn accept(_f: fn(u32)) {}\n\npub fn setup() {\n    accept(my_system);\n}\n",
+    )
+    .unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "astro-sight@example.com"]);
+    git(&["config", "user.name", "astro-sight"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial", "-q"]);
+
+    // u32 -> String (arity 不変の型のみ変更) — fn ポインタ引数へ渡しているため壊れる
+    std::fs::write(
+        root.join("src/sys.rs"),
+        "pub fn my_system(x: String) {\n    let _ = x;\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["impact", "--dir", root.to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run");
+    assert!(
+        !output.status.success(),
+        "直接引数の関数値渡しは blocking (exit 1) を維持すべき"
+    );
+}
+
+#[test]
+fn dead_code_ts_owner_named_variable_is_not_class_access() {
+    // codex レビュー指摘 (警告4): owner と同名のローカル変数 (`const Alpha = getBeta();`)
+    // を class static access と誤認して確定票を入れない。binding が Unresolvable なので
+    // set 全体が Ambiguous に倒れる。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("alpha.ts"),
+        "export class Alpha {\n  fmt() { return \"alpha\"; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("beta.ts"),
+        "export class Beta {\n  fmt() { return \"beta\"; }\n}\nexport function getBeta(): Beta { return new Beta(); }\n",
+    )
+    .unwrap();
+    // Alpha は import せず、同名変数に factory 戻り値を束縛して .fmt() を呼ぶ
+    std::fs::write(
+        root.join("consumer.ts"),
+        "import { getBeta } from \"./beta\";\nexport function run() {\n  const Alpha = getBeta();\n  Alpha.fmt();\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"Beta.fmt"),
+        "同名変数経由で実際に呼ばれる Beta.fmt を dead にしない (Ambiguous 維持): {names:?}"
+    );
+    assert!(
+        !names.contains(&"Alpha.fmt"),
+        "owner 同名変数を class access と誤認して Alpha へ票を入れない: {names:?}"
+    );
+}
+
+#[test]
+fn dead_code_ts_unrelated_namespace_import_does_not_suppress_set() {
+    // codex レビュー指摘 (警告5): 無関係な `import * as ns` があるだけで
+    // duplicate set 全体を Ambiguous にしない。対象 member への access が
+    // 静的に解決できる別ファイルの票は生きる。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("alpha.ts"),
+        // 無関係の namespace import を持つ owner 定義ファイル
+        "import * as path from \"path\";\nexport class Alpha {\n  fmt() { return path.sep; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("beta.ts"),
+        "export class Beta {\n  fmt() { return \"beta\"; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("consumer.ts"),
+        "import { Alpha } from \"./alpha\";\nexport function run() {\n  new Alpha().fmt();\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"Alpha.fmt"),
+        "new Alpha().fmt() の確定票で Alpha.fmt は live: {names:?}"
+    );
+    assert!(
+        names.contains(&"Beta.fmt"),
+        "無関係 namespace import で set を Ambiguous 化せず、未参照の Beta.fmt は dead: {names:?}"
     );
 }

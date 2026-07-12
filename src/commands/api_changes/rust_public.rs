@@ -820,9 +820,12 @@ pub(crate) fn collect_rust_pub_use_index(
 
 /// module 再エクスポート (`pub use path::to::module;`) による外部到達可能 module 集合を
 /// 固定点計算する。seed は `pub mod` 経路の `public_modules`。Named edge の source module
-/// が到達可能なら、target path が実在する module の場合に限りその module も到達可能になり、
-/// pub 子孫 module も連鎖する。private child module は親が公開されても外部から辿れない
-/// ため含めない (単純な prefix 判定だと private 子まで誤って公開扱いになる)。
+/// が到達可能なら、target path が実在する **pub 宣言された** module の場合に限り
+/// その module も到達可能になり、pub 子孫 module も連鎖する。private child module は
+/// 親が公開されても外部から辿れないため含めない (単純な prefix 判定だと private 子まで
+/// 誤って公開扱いになる)。private module 自体の再エクスポート (`mod wifi;` +
+/// `pub use self::wifi as api;`) は rustc では E0365 で無効なため、親の pub_children に
+/// 含まれない target は reachable 化しない。
 fn compute_reexport_reachable_modules(
     edges: &[RustPubUseEdge],
     public_modules: &std::collections::HashSet<Vec<String>>,
@@ -849,6 +852,14 @@ fn compute_reexport_reachable_modules(
             if !all_modules.contains_key(&candidate) || reachable.contains(&candidate) {
                 continue;
             }
+            // E0365: private module は公開再エクスポートできない。candidate 自体が
+            // 親 module で `pub mod` と宣言されている場合のみ到達可能にする。
+            let declared_pub = all_modules
+                .get(target_module)
+                .is_some_and(|pub_children| pub_children.contains(target_item));
+            if !declared_pub {
+                continue;
+            }
             reachable.insert(candidate.clone());
             changed = true;
             // 到達可能になった module の pub 子孫 module を連鎖登録する。
@@ -870,6 +881,31 @@ fn compute_reexport_reachable_modules(
         }
     }
     reachable
+}
+
+/// module ファイル内の子 `mod name;` 宣言が指すファイルの基準ディレクトリ。
+/// `lib.rs` / `main.rs` / `mod.rs` は自身と同じディレクトリ、file-style module
+/// (`internal.rs`) は `internal/` 配下に子を持つ (Rust 2018+ のモジュール解決)。
+/// 旧実装は常に parent dir を使い、`internal.rs` 内の `pub mod api;` を
+/// `api.rs` と誤解決して階層 module の到達性を取りこぼしていた。
+fn child_module_base_dir(current_file_rel: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Path;
+    let parent = current_file_rel
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let file_name = current_file_rel
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if matches!(file_name, "lib.rs" | "main.rs" | "mod.rs") {
+        parent
+    } else {
+        match current_file_rel.file_stem().and_then(|s| s.to_str()) {
+            Some(stem) => parent.join(stem),
+            None => parent,
+        }
+    }
 }
 
 /// crate 内の**全 module** (可視性問わず) を walk し、
@@ -920,7 +956,6 @@ fn collect_modules_with_visibility(
     result: &mut std::collections::HashMap<Vec<String>, Vec<String>>,
     frontier: &mut Vec<(Vec<String>, std::path::PathBuf)>,
 ) -> Option<()> {
-    use std::path::Path;
     match node.kind() {
         "mod_item" => {
             if rust_mod_item_has_path_attribute(node, source_bytes) {
@@ -962,12 +997,9 @@ fn collect_modules_with_visibility(
                 }
             }
             if !has_inline_body {
-                let parent_dir = current_file_rel
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_default();
-                let as_mod = parent_dir.join(&name).join("mod.rs");
-                let as_file = parent_dir.join(format!("{name}.rs"));
+                let base_dir = child_module_base_dir(current_file_rel);
+                let as_mod = base_dir.join(&name).join("mod.rs");
+                let as_file = base_dir.join(format!("{name}.rs"));
                 if read_rust_module_source(source, dir, &info.crate_root_rel, &as_mod).is_some() {
                     frontier.push((child_segments, as_mod));
                 } else if read_rust_module_source(source, dir, &info.crate_root_rel, &as_file)
@@ -1066,7 +1098,6 @@ pub(crate) fn collect_public_pub_mods(
     result: &mut std::collections::HashSet<Vec<String>>,
     frontier: &mut Vec<(Vec<String>, std::path::PathBuf)>,
 ) -> Option<()> {
-    use std::path::Path;
     match node.kind() {
         "mod_item" => {
             if rust_mod_item_has_path_attribute(node, source_bytes) {
@@ -1105,12 +1136,9 @@ pub(crate) fn collect_public_pub_mods(
                 }
             }
             if !has_inline_body {
-                let parent_dir = current_file_rel
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_default();
-                let as_mod = parent_dir.join(&name).join("mod.rs");
-                let as_file = parent_dir.join(format!("{name}.rs"));
+                let base_dir = child_module_base_dir(current_file_rel);
+                let as_mod = base_dir.join(&name).join("mod.rs");
+                let as_file = base_dir.join(format!("{name}.rs"));
                 if read_rust_module_source(source, dir, &info.crate_root_rel, &as_mod).is_some() {
                     frontier.push((child_segments, as_mod));
                 } else if read_rust_module_source(source, dir, &info.crate_root_rel, &as_file)
