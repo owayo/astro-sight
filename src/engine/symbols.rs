@@ -1303,6 +1303,45 @@ const ANGULAR_LIFECYCLE_HOOKS: &[&str] = &[
     "ngOnDestroy",
 ];
 
+/// TS/JS の class 宣言ノード種別。`export abstract class` も
+/// `abstract_class_declaration` として現れるため両方を対象にする。
+const JS_TS_CLASS_DECLARATION_KINDS: &[&str] = &["class_declaration", "abstract_class_declaration"];
+
+/// `symbol_range` を tree-sitter の Point 範囲へ変換し、対応する最小の子孫ノードを返す。
+/// Angular/JS-TS の member 判定群に共通の入口処理。
+fn node_for_symbol_range<'a>(root: Node<'a>, symbol_range: &Range) -> Option<Node<'a>> {
+    let start = tree_sitter::Point {
+        row: symbol_range.start.line,
+        column: symbol_range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: symbol_range.end.line,
+        column: symbol_range.end.column,
+    };
+    root.descendant_for_point_range(start, end)
+}
+
+/// `node` 自身から祖先方向へ走査し、`kinds` のいずれかの kind を持つ最初のノードを返す。
+/// method_definition や class_declaration など「囲む特定種別ノード」を辿る用途。
+fn enclosing_of_kind<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        if kinds.contains(&n.kind()) {
+            return Some(n);
+        }
+        cur = n.parent();
+    }
+    None
+}
+
+/// `method_definition` ノードの name フィールドを UTF-8 文字列として取り出す。
+fn js_ts_method_name<'a>(method_node: Node, source: &'a [u8]) -> Option<&'a str> {
+    method_node
+        .child_by_field_name("name")?
+        .utf8_text(source)
+        .ok()
+}
+
 /// `symbol_range` の method が Angular `@Component` / `@Directive` 装飾クラスの
 /// lifecycle hook かを判定する。
 ///
@@ -1312,35 +1351,17 @@ const ANGULAR_LIFECYCLE_HOOKS: &[&str] = &[
 ///
 /// dead-code 検出側で `exclude_framework_entrypoints == true` のとき除外対象に使う想定。
 pub fn is_js_ts_angular_lifecycle_hook(root: Node, source: &[u8], symbol_range: &Range) -> bool {
-    let start = tree_sitter::Point {
-        row: symbol_range.start.line,
-        column: symbol_range.start.column,
-    };
-    let end = tree_sitter::Point {
-        row: symbol_range.end.line,
-        column: symbol_range.end.column,
-    };
-    let Some(node) = root.descendant_for_point_range(start, end) else {
+    let Some(node) = node_for_symbol_range(root, symbol_range) else {
         return false;
     };
 
     // method_definition を探す
-    let mut cur = node;
-    let method_node = loop {
-        if cur.kind() == "method_definition" {
-            break cur;
-        }
-        match cur.parent() {
-            Some(p) => cur = p,
-            None => return false,
-        }
+    let Some(method_node) = enclosing_of_kind(node, &["method_definition"]) else {
+        return false;
     };
 
     // メソッド名チェック
-    let Some(name_node) = method_node.child_by_field_name("name") else {
-        return false;
-    };
-    let Ok(name) = name_node.utf8_text(source) else {
+    let Some(name) = js_ts_method_name(method_node, source) else {
         return false;
     };
     if !ANGULAR_LIFECYCLE_HOOKS.contains(&name) {
@@ -1348,17 +1369,10 @@ pub fn is_js_ts_angular_lifecycle_hook(root: Node, source: &[u8], symbol_range: 
     }
 
     // enclosing class_declaration を探し、@Component / @Directive decorator を確認
-    let mut cur = method_node;
-    while let Some(parent) = cur.parent() {
-        if matches!(
-            parent.kind(),
-            "class_declaration" | "abstract_class_declaration"
-        ) {
-            return class_has_component_or_directive_decorator(parent, source);
-        }
-        cur = parent;
-    }
-    false
+    let Some(class_node) = enclosing_of_kind(method_node, JS_TS_CLASS_DECLARATION_KINDS) else {
+        return false;
+    };
+    class_has_component_or_directive_decorator(class_node, source)
 }
 
 /// `class_declaration` ノードに `@Component` / `@Directive` decorator が付与されているかを判定する。
@@ -1380,28 +1394,11 @@ fn class_has_component_or_directive_decorator(class_node: Node, source: &[u8]) -
             if child.kind() != "decorator" {
                 continue;
             }
-            // decorator の中身: `@Foo(...)` の `Foo` 部分が identifier として現れる
-            let mut dcursor = child.walk();
-            for dchild in child.children(&mut dcursor) {
-                // call_expression / identifier いずれにも対応
-                match dchild.kind() {
-                    "identifier" => {
-                        if let Ok(name) = dchild.utf8_text(source)
-                            && ANGULAR_DECORATORS.contains(&name)
-                        {
-                            return true;
-                        }
-                    }
-                    "call_expression" => {
-                        if let Some(callee) = dchild.child_by_field_name("function")
-                            && let Ok(name) = callee.utf8_text(source)
-                            && ANGULAR_DECORATORS.contains(&name)
-                        {
-                            return true;
-                        }
-                    }
-                    _ => {}
-                }
+            // `@Foo(...)` / `@Foo` の `Foo` を取り出し Angular decorator 名と照合する
+            if let Some(name) = decorator_call_name(child, source)
+                && ANGULAR_DECORATORS.contains(&name.as_str())
+            {
+                return true;
             }
         }
     }
@@ -1476,15 +1473,7 @@ fn is_js_ts_angular_member_decorator_target(
     source: &[u8],
     symbol_range: &Range,
 ) -> bool {
-    let start = tree_sitter::Point {
-        row: symbol_range.start.line,
-        column: symbol_range.start.column,
-    };
-    let end = tree_sitter::Point {
-        row: symbol_range.end.line,
-        column: symbol_range.end.column,
-    };
-    let Some(node) = root.descendant_for_point_range(start, end) else {
+    let Some(node) = node_for_symbol_range(root, symbol_range) else {
         return false;
     };
 
@@ -1497,26 +1486,14 @@ fn is_js_ts_angular_member_decorator_target(
         "field_definition",
         "property_signature",
     ];
-    let mut cur = Some(node);
-    let member_node = loop {
-        match cur {
-            Some(n) if member_kinds.contains(&n.kind()) => break n,
-            Some(n) => cur = n.parent(),
-            None => return false,
-        }
+    let Some(member_node) = enclosing_of_kind(node, &member_kinds) else {
+        return false;
     };
 
-    // 親が `class_body` で、その先祖 `class_declaration` / `abstract_class_declaration` が
-    // Angular 装飾されているか確認 (export abstract class も abstract_class_declaration になる)。
-    let mut class_cur = member_node;
-    let class_node = loop {
-        match class_cur.parent() {
-            Some(p) if matches!(p.kind(), "class_declaration" | "abstract_class_declaration") => {
-                break p;
-            }
-            Some(p) => class_cur = p,
-            None => return false,
-        }
+    // member を囲む `class_declaration` / `abstract_class_declaration` が Angular 装飾されて
+    // いるか確認する (export abstract class も abstract_class_declaration になる)。
+    let Some(class_node) = enclosing_of_kind(member_node, JS_TS_CLASS_DECLARATION_KINDS) else {
+        return false;
     };
     if !class_has_component_or_directive_decorator(class_node, source) {
         return false;
@@ -1582,33 +1559,15 @@ fn decorator_call_name(decorator: Node, source: &[u8]) -> Option<String> {
 ///
 /// どちらも構文上の手がかりを使う (cross-file 解析や型推論は行わない)。GitLab #20 対応。
 fn is_js_ts_angular_cva_contract_method(root: Node, source: &[u8], symbol_range: &Range) -> bool {
-    let start = tree_sitter::Point {
-        row: symbol_range.start.line,
-        column: symbol_range.start.column,
-    };
-    let end = tree_sitter::Point {
-        row: symbol_range.end.line,
-        column: symbol_range.end.column,
-    };
-    let Some(node) = root.descendant_for_point_range(start, end) else {
+    let Some(node) = node_for_symbol_range(root, symbol_range) else {
         return false;
     };
 
     // method_definition を探す。
-    let mut cur = node;
-    let method_node = loop {
-        if cur.kind() == "method_definition" {
-            break cur;
-        }
-        match cur.parent() {
-            Some(p) => cur = p,
-            None => return false,
-        }
-    };
-    let Some(name_node) = method_node.child_by_field_name("name") else {
+    let Some(method_node) = enclosing_of_kind(node, &["method_definition"]) else {
         return false;
     };
-    let Ok(name) = name_node.utf8_text(source) else {
+    let Some(name) = js_ts_method_name(method_node, source) else {
         return false;
     };
     if !ANGULAR_CVA_METHODS.contains(&name) {

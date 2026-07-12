@@ -356,8 +356,65 @@ fn collect_local_class_definitions(
     }
 }
 
+/// binding マップへ 1 件登録する。同名バインディングが複数回現れた場合は
+/// スコープ解決をせず `Unresolvable` に落とす (shadow / 別スコープの一意解決を諦める)。
+fn register_binding(bindings: &mut HashMap<String, VarBinding>, name: String, value: VarBinding) {
+    use std::collections::hash_map::Entry;
+    match bindings.entry(name) {
+        Entry::Vacant(e) => {
+            e.insert(value);
+        }
+        Entry::Occupied(mut e) => {
+            e.insert(VarBinding::Unresolvable);
+        }
+    }
+}
+
+/// binding パターン (identifier / destructuring / rest / default) 配下の束縛名を
+/// すべて `Unresolvable` として登録する。中身の型は静的に辿れないため owner 推論は
+/// しない。収集漏れは shadow 見逃し → import owner への誤帰属 (fail-open) になる
+/// ため、未知の構造は全 named children を辿って leaf の identifier を漏らさない。
+fn register_pattern_bindings(
+    pattern: tree_sitter::Node<'_>,
+    source: &[u8],
+    bindings: &mut HashMap<String, VarBinding>,
+) {
+    match pattern.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            if let Ok(name) = pattern.utf8_text(source) {
+                register_binding(bindings, name.to_string(), VarBinding::Unresolvable);
+            }
+        }
+        // `{ key: alias }` の key 側は binding ではないため value 側のみ辿る。
+        "pair_pattern" => {
+            if let Some(v) = pattern.child_by_field_name("value") {
+                register_pattern_bindings(v, source, bindings);
+            }
+        }
+        // default 値の右辺 (`{ a = expr }` / `(x = expr)`) は参照であって binding
+        // ではないため left のみ辿る。
+        "assignment_pattern" | "object_assignment_pattern" => {
+            if let Some(l) = pattern.child_by_field_name("left") {
+                register_pattern_bindings(l, source, bindings);
+            }
+        }
+        _ => {
+            let mut cursor = pattern.walk();
+            for child in pattern.named_children(&mut cursor) {
+                register_pattern_bindings(child, source, bindings);
+            }
+        }
+    }
+}
+
 /// `variable_declarator` / パラメータの型注釈から変数 → owner の束縛を集める。
-/// 同名バインディングが複数回現れた場合はスコープ解決をせず `Unresolvable` に落とす。
+///
+/// owner への静的解決を試みるのは「単純 identifier + 型注釈 / `new` 初期化子」の
+/// 経路のみ。それ以外の binding 導入構文 (destructuring / for-of・for-in の宣言付き
+/// loop 変数 / catch / bare arrow・JS パラメータ / 関数宣言・named 式の名前) は
+/// `Unresolvable` として登録する — 収集しないと receiver 解決が import 由来の
+/// class static access へフォールバックし、shadow された名前の票を owner へ誤計上
+/// する (dead-code の fail-open)。
 fn collect_var_bindings(
     node: tree_sitter::Node<'_>,
     source: &[u8],
@@ -365,57 +422,105 @@ fn collect_var_bindings(
     owners_set: &HashSet<&str>,
     bindings: &mut HashMap<String, VarBinding>,
 ) {
-    let binding = match node.kind() {
+    match node.kind() {
         "variable_declarator" => {
-            let name = node
-                .child_by_field_name("name")
-                .filter(|n| n.kind() == "identifier")
-                .and_then(|n| n.utf8_text(source).ok());
-            if let Some(name) = name {
-                // 型注釈が最優先 (`const a: Alpha = ...`)、次に `= new Alpha()`。
-                let owner = node
-                    .child_by_field_name("type")
-                    .and_then(|t| type_annotation_owner(t, source, local_to_owner, owners_set))
-                    .or_else(|| {
-                        node.child_by_field_name("value")
-                            .and_then(|v| {
-                                new_expression_owner(v, source, local_to_owner, owners_set)
+            if let Some(name_node) = node.child_by_field_name("name") {
+                if name_node.kind() == "identifier" {
+                    if let Ok(name) = name_node.utf8_text(source) {
+                        // 型注釈が最優先 (`const a: Alpha = ...`)、次に `= new Alpha()`。
+                        let owner = node
+                            .child_by_field_name("type")
+                            .and_then(|t| {
+                                type_annotation_owner(t, source, local_to_owner, owners_set)
                             })
-                            .map(VarBinding::Owner)
-                    });
-                Some((name.to_string(), owner))
-            } else {
-                None
+                            .or_else(|| {
+                                node.child_by_field_name("value")
+                                    .and_then(|v| {
+                                        new_expression_owner(v, source, local_to_owner, owners_set)
+                                    })
+                                    .map(VarBinding::Owner)
+                            });
+                        register_binding(
+                            bindings,
+                            name.to_string(),
+                            owner.unwrap_or(VarBinding::Unresolvable),
+                        );
+                    }
+                } else {
+                    // destructuring (`const { a } = ...`) は要素の型を辿れない。
+                    register_pattern_bindings(name_node, source, bindings);
+                }
             }
         }
         "required_parameter" | "optional_parameter" => {
-            let name = node
-                .child_by_field_name("pattern")
-                .filter(|n| n.kind() == "identifier")
-                .and_then(|n| n.utf8_text(source).ok());
-            if let Some(name) = name {
-                let owner = node
-                    .child_by_field_name("type")
-                    .and_then(|t| type_annotation_owner(t, source, local_to_owner, owners_set));
-                Some((name.to_string(), owner))
-            } else {
-                None
+            if let Some(pat) = node.child_by_field_name("pattern") {
+                if pat.kind() == "identifier" {
+                    if let Ok(name) = pat.utf8_text(source) {
+                        let owner = node.child_by_field_name("type").and_then(|t| {
+                            type_annotation_owner(t, source, local_to_owner, owners_set)
+                        });
+                        register_binding(
+                            bindings,
+                            name.to_string(),
+                            owner.unwrap_or(VarBinding::Unresolvable),
+                        );
+                    }
+                } else {
+                    register_pattern_bindings(pat, source, bindings);
+                }
             }
         }
-        _ => None,
-    };
-    if let Some((name, owner)) = binding {
-        use std::collections::hash_map::Entry;
-        let value = owner.unwrap_or(VarBinding::Unresolvable);
-        match bindings.entry(name) {
-            Entry::Vacant(e) => {
-                e.insert(value);
-            }
-            // 同名バインディング複数 (shadow / 別スコープ) は一意解決を諦める。
-            Entry::Occupied(mut e) => {
-                e.insert(VarBinding::Unresolvable);
+        // JS の関数パラメータは formal_parameters 直下に bare pattern で並ぶ
+        // (TS は required/optional_parameter に包まれ上の arm が処理する)。
+        "formal_parameters" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if !matches!(child.kind(), "required_parameter" | "optional_parameter") {
+                    register_pattern_bindings(child, source, bindings);
+                }
             }
         }
+        // arrow の単独パラメータ (`x => ...`) は formal_parameters に包まれない。
+        "arrow_function" => {
+            if let Some(p) = node.child_by_field_name("parameter") {
+                register_pattern_bindings(p, source, bindings);
+            }
+        }
+        // for-of / for-in の宣言付き loop 変数 (`for (const x of xs)`)。left は
+        // lexical_declaration に包まれない bare pattern のため専用処理が要る。
+        // kind (var/let/const) の無い `for (x of xs)` は既存変数への代入であって
+        // 新規 binding ではないため対象外。
+        "for_in_statement" => {
+            if node.child_by_field_name("kind").is_some()
+                && let Some(left) = node.child_by_field_name("left")
+            {
+                register_pattern_bindings(left, source, bindings);
+            }
+        }
+        // catch (e) の e。
+        "catch_clause" => {
+            if let Some(p) = node.child_by_field_name("parameter") {
+                register_pattern_bindings(p, source, bindings);
+            }
+        }
+        // 関数宣言 / named function・class 式の名前も値 binding
+        // (`function Alpha() {} Alpha.fmt()` は関数オブジェクトへの access)。
+        // class_declaration は collect_local_class_definitions が owner 一致時に
+        // 正票の源として登録するため対象外。named class **式** の名前は内部スコープ
+        // 限定なので、同名の外部 access を owner へ誤帰属しないようこちらで登録する。
+        "function_declaration"
+        | "generator_function_declaration"
+        | "function_expression"
+        | "generator_function"
+        | "class" => {
+            if let Some(n) = node.child_by_field_name("name")
+                && n.kind() == "identifier"
+                && let Ok(text) = n.utf8_text(source)
+            {
+                register_binding(bindings, text.to_string(), VarBinding::Unresolvable);
+            }
+        }
+        _ => {}
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -488,7 +593,12 @@ fn resolve_member_receiver(
     var_bindings: &HashMap<String, VarBinding>,
     owners_set: &HashSet<&str>,
 ) -> Option<String> {
-    let object = member_expr.child_by_field_name("object")?;
+    let mut object = member_expr.child_by_field_name("object")?;
+    // 冗長括弧 (`(new Owner()).member` / `(alpha).member`) は剥がして実 receiver で
+    // 判定する (剥がさないと Ambiguous に落ちて duplicate set の検出力が下がる)。
+    while object.kind() == "parenthesized_expression" {
+        object = object.named_child(0)?;
+    }
     match object.kind() {
         "identifier" => {
             let text = object.utf8_text(source).ok()?;
@@ -588,3 +698,151 @@ const MEMBER_ACCESS_QUERY: &str = r#"
 (member_expression
   property: (property_identifier) @prop)
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn analyze(src: &str, lang: LangId, owners: &[&str], member: &str) -> FileAnalysis {
+        let tree = parser::parse_source(src.as_bytes(), lang).unwrap();
+        analyze_file(tree.root_node(), src.as_bytes(), owners, member, lang)
+    }
+
+    fn count_for(analysis: &FileAnalysis, owner: &str) -> usize {
+        analysis.resolved_counts.get(owner).copied().unwrap_or(0)
+    }
+
+    /// 対照: import + 素の static access は owner へ票が入る。
+    #[test]
+    fn plain_static_access_resolves_to_owner() {
+        let a = analyze(
+            "import { Alpha } from \"./alpha\";\nAlpha.fmt();\n",
+            LangId::Typescript,
+            &["Alpha", "Beta"],
+            "fmt",
+        );
+        assert!(!a.has_unresolved_access);
+        assert_eq!(count_for(&a, "Alpha"), 1);
+    }
+
+    /// for-of の宣言付き loop 変数は owner クラス名を shadow する:
+    /// `Alpha.fmt()` を import 由来の static access と誤認して票を入れない。
+    #[test]
+    fn for_of_loop_variable_shadow_is_unresolved() {
+        let a = analyze(
+            "import { Alpha } from \"./alpha\";\nimport { Beta } from \"./beta\";\nexport function run(items: Beta[]) {\n  for (const Alpha of items) {\n    Alpha.fmt();\n  }\n}\n",
+            LangId::Typescript,
+            &["Alpha", "Beta"],
+            "fmt",
+        );
+        assert!(a.has_unresolved_access, "loop 変数 shadow は不解決に倒すべき");
+        assert_eq!(count_for(&a, "Alpha"), 0);
+    }
+
+    /// kind の無い `for (x of xs)` は代入であって新規 binding ではない:
+    /// import owner への static access は引き続き票が入る (過剰 shadow しない)。
+    #[test]
+    fn for_of_assignment_left_does_not_shadow() {
+        let a = analyze(
+            "import { Alpha } from \"./alpha\";\nlet x: number;\nexport function run(xs: number[]) {\n  for (x of xs) {\n    Alpha.fmt();\n  }\n}\n",
+            LangId::Typescript,
+            &["Alpha", "Beta"],
+            "fmt",
+        );
+        assert!(!a.has_unresolved_access);
+        assert_eq!(count_for(&a, "Alpha"), 1);
+    }
+
+    /// catch パラメータも owner 名を shadow する。
+    #[test]
+    fn catch_parameter_shadow_is_unresolved() {
+        let a = analyze(
+            "import { Alpha } from \"./alpha\";\nexport function run() {\n  try {\n    work();\n  } catch (Alpha) {\n    Alpha.fmt();\n  }\n}\n",
+            LangId::Typescript,
+            &["Alpha", "Beta"],
+            "fmt",
+        );
+        assert!(a.has_unresolved_access, "catch param shadow は不解決に倒すべき");
+        assert_eq!(count_for(&a, "Alpha"), 0);
+    }
+
+    /// bare arrow パラメータ (`Alpha => ...`) も shadow する。
+    #[test]
+    fn bare_arrow_parameter_shadow_is_unresolved() {
+        let a = analyze(
+            "import { Alpha } from \"./alpha\";\nexport const run = (xs: unknown[]) => xs.map(Alpha => Alpha.fmt());\n",
+            LangId::Typescript,
+            &["Alpha", "Beta"],
+            "fmt",
+        );
+        assert!(a.has_unresolved_access, "bare arrow param shadow は不解決に倒すべき");
+        assert_eq!(count_for(&a, "Alpha"), 0);
+    }
+
+    /// destructuring binding (`const { Alpha } = ...`) も shadow する。
+    #[test]
+    fn destructuring_binding_shadow_is_unresolved() {
+        let a = analyze(
+            "import { Alpha } from \"./alpha\";\nexport function run(bag: { Alpha: unknown }) {\n  const { Alpha } = bag;\n  Alpha.fmt();\n}\n",
+            LangId::Typescript,
+            &["Alpha", "Beta"],
+            "fmt",
+        );
+        assert!(a.has_unresolved_access, "destructuring shadow は不解決に倒すべき");
+        assert_eq!(count_for(&a, "Alpha"), 0);
+    }
+
+    /// JS の bare 関数パラメータ (formal_parameters 直下 identifier) も shadow する。
+    #[test]
+    fn js_bare_function_parameter_shadow_is_unresolved() {
+        let a = analyze(
+            "import { Alpha } from \"./alpha\";\nexport function run(Alpha) {\n  Alpha.fmt();\n}\n",
+            LangId::Javascript,
+            &["Alpha", "Beta"],
+            "fmt",
+        );
+        assert!(a.has_unresolved_access, "JS bare param shadow は不解決に倒すべき");
+        assert_eq!(count_for(&a, "Alpha"), 0);
+    }
+
+    /// 関数宣言名 (`function Alpha() {}`) は関数オブジェクトへの access であり
+    /// owner クラスへの票にしない。
+    #[test]
+    fn function_declaration_name_shadow_is_unresolved() {
+        let a = analyze(
+            "import { Beta } from \"./beta\";\nfunction Alpha() {}\nAlpha.fmt();\n",
+            LangId::Typescript,
+            &["Alpha", "Beta"],
+            "fmt",
+        );
+        assert!(a.has_unresolved_access, "関数宣言名 shadow は不解決に倒すべき");
+        assert_eq!(count_for(&a, "Alpha"), 0);
+    }
+
+    /// 冗長括弧付き receiver (`(new Alpha()).fmt()` / `(alpha).fmt()`) は括弧を
+    /// 剥がして実 receiver で解決する (Ambiguous への過剰倒れを防ぐ)。
+    #[test]
+    fn parenthesized_receiver_is_unwrapped() {
+        let a = analyze(
+            "import { Alpha } from \"./alpha\";\n(new Alpha()).fmt();\nconst alpha: Alpha = new Alpha();\n(alpha).fmt();\n",
+            LangId::Typescript,
+            &["Alpha", "Beta"],
+            "fmt",
+        );
+        assert!(!a.has_unresolved_access);
+        assert_eq!(count_for(&a, "Alpha"), 2);
+    }
+
+    /// 型注釈付きの単純 identifier は従来どおり owner へ解決される (回帰確認)。
+    #[test]
+    fn typed_variable_still_resolves_to_owner() {
+        let a = analyze(
+            "import { Alpha } from \"./alpha\";\nexport function run(alpha: Alpha) {\n  alpha.fmt();\n}\n",
+            LangId::Typescript,
+            &["Alpha", "Beta"],
+            "fmt",
+        );
+        assert!(!a.has_unresolved_access);
+        assert_eq!(count_for(&a, "Alpha"), 1);
+    }
+}
