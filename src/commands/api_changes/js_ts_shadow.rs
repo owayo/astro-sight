@@ -94,6 +94,7 @@ fn is_scope_node(kind: &str) -> bool {
             | "class_static_block"
             | "for_statement"
             | "for_in_statement"
+            | "switch_body"
             | "catch_clause"
     )
 }
@@ -225,9 +226,10 @@ fn find_binding_in_subtree(
                 ) {
                     continue;
                 }
-                // statement_block (および制御構造の中身) へ潜る際は nested block 扱いに
-                // 切り替え、以降は var 由来の binding だけを拾う。
-                let nested = in_nested_block || child.kind() == "statement_block";
+                // statement_block / switch_body (および制御構造の中身) へ潜る際は
+                // nested block 扱いに切り替え、以降は var 由来の binding だけを拾う。
+                let nested =
+                    in_nested_block || matches!(child.kind(), "statement_block" | "switch_body");
                 if let Some(found) = find_binding_in_subtree(child, source, name, nested) {
                     return Some(found);
                 }
@@ -390,6 +392,16 @@ mod tests {
         let src = "import { startRecording } from \"./capture\";\nfunction caller(flag: boolean) {\n    if (flag) {\n        function startRecording() {}\n    }\n    startRecording({ fps: 30 });\n}\n";
         assert_eq!(
             resolve_at(src, "startRecording", 5, 4),
+            LocalResolution::OtherOrAmbiguous
+        );
+    }
+
+    /// switch body 内の block-level function も外側の呼び出しを shadow しない (codex 指摘)。
+    #[test]
+    fn switch_body_function_does_not_shadow_outer_call() {
+        let src = "import { startRecording } from \"./capture\";\nfunction caller(x: number) {\n    switch (x) {\n        case 1:\n            function startRecording() {}\n    }\n    startRecording({ fps: 30 });\n}\n";
+        assert_eq!(
+            resolve_at(src, "startRecording", 6, 4),
             LocalResolution::OtherOrAmbiguous
         );
     }

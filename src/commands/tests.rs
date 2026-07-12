@@ -2618,6 +2618,82 @@ fn detect_api_changes_ts_shadowed_local_fn_with_caller_outside_diff_stays_modifi
     );
 }
 
+/// switch body 内の block-level 同名関数は外側の呼び出しを shadow しない: 更新済み caller と
+/// 「switch 内同名関数を持つファイルの未更新 caller」が併存する場合、後者を shadow 除外せず
+/// blocking を維持する (codex レビュー指摘の switch_body scope 対応)。
+#[test]
+fn detect_api_changes_ts_switch_scoped_fn_does_not_shadow_unupdated_caller() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/lib/capture.ts",
+                "export function startRecording(options: {\n    fps: number;\n}): string {\n    return `rec:${options.fps}`;\n}\n",
+            ),
+            // switch 内に block-level 同名関数 + その外に対象 API への未更新呼び出し
+            (
+                "src/tap.ts",
+                "import { startRecording } from \"./lib/capture\";\nexport function caller(x: number) {\n    switch (x) {\n        case 1:\n            function startRecording() {}\n    }\n    return startRecording({ fps: 30 });\n}\n",
+            ),
+            (
+                "src/content.ts",
+                "import { startRecording } from \"./lib/capture\";\n\nexport function onStart() {\n    return startRecording({ fps: 30 });\n}\n",
+            ),
+        ],
+        "base",
+    );
+    // 対象 API 変更 + content.ts (更新済み caller) のみ追随。tap.ts の呼び出しは未更新・diff 外。
+    fs::write(
+        repo.join("src/lib/capture.ts"),
+        "export function startRecording(options: {\n    fps: number;\n    cursor: boolean;\n}): string {\n    return `rec:${options.fps}:${options.cursor}`;\n}\n",
+    )
+    .expect("write");
+    fs::write(
+        repo.join("src/content.ts"),
+        "import { startRecording } from \"./lib/capture\";\n\nexport function onStart() {\n    return startRecording({ fps: 30, cursor: true });\n}\n",
+    )
+    .expect("write");
+    let diff_files = vec![
+        crate::models::impact::DiffFile {
+            old_path: "src/lib/capture.ts".to_string(),
+            new_path: "src/lib/capture.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 5,
+                new_start: 1,
+                new_count: 6,
+            }],
+            deleted_old_source: None,
+        },
+        crate::models::impact::DiffFile {
+            old_path: "src/content.ts".to_string(),
+            new_path: "src/content.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 4,
+                old_count: 1,
+                new_start: 4,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        },
+    ];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.modified
+            .iter()
+            .any(|m| m.name.ends_with("startRecording")),
+        "switch 内関数は shadow にならず、未更新 caller (tap.ts) がある限り blocking 維持。mod={:?} mod_closed={:?}",
+        api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+        api.modified_closed_in_diff
+            .iter()
+            .map(|m| &m.name)
+            .collect::<Vec<_>>()
+    );
+}
+
 /// shadow 除外で全参照が消える (対象 API 自体は未使用で、別ファイルの同名ローカル関数と
 /// その呼び出ししか無い) 場合は closed にしない — 対象 caller の追随を 1 件も確認して
 /// いないため blocking を維持する (codex レビュー指摘の fail-open 回帰テスト)。
