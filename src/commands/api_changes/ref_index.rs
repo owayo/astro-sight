@@ -135,6 +135,7 @@ pub(crate) fn has_blocking_value_usage(index: &ApiRefIndex, name: &str) -> bool 
 /// から除外する (Issue 2026-07-12-api-mod-same-diff-informational: export 関数と
 /// 別ファイルのローカル同名関数の併存で closed 判定が全滅していた)。method qualname
 /// (`Container.method`) と JS/TS 以外の言語は従来ガード (即 blocking) を維持する。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn is_modified_closed_in_diff(
     index: &ApiRefIndex,
     dir: &str,
