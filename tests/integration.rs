@@ -10866,6 +10866,54 @@ fn dead_code_ts_factory_receiver_marks_set_ambiguous() {
 }
 
 #[test]
+fn dead_code_ts_for_of_loop_variable_shadow_marks_set_ambiguous() {
+    // for-of の loop 変数が owner クラス名と同名の場合、`Alpha.fmt()` は loop 変数
+    // (中身は Beta インスタンス) への access であり、import 由来の class static
+    // access と誤認して Alpha へ票を計上しない。binding 収集が for-of/for-in の
+    // left (bare pattern) を見落とすと Beta.fmt が票を失い dead 誤検出 (fail-open)
+    // になる回帰テスト。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("alpha.ts"),
+        "export class Alpha {\n  fmt() { return \"alpha\"; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("beta.ts"),
+        "export class Beta {\n  fmt() { return \"beta\"; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("consumer.ts"),
+        "import { Alpha } from \"./alpha\";\nimport { Beta } from \"./beta\";\nexport function run(items: Beta[]) {\n  for (const Alpha of items) {\n    Alpha.fmt();\n  }\n  return new Alpha();\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"Beta.fmt"),
+        "loop 変数経由で実際に呼ばれる Beta.fmt を dead にしない: {names:?}"
+    );
+    assert!(
+        !names.contains(&"Alpha.fmt"),
+        "loop 変数 shadow がある set は Ambiguous (旧スキップ) 維持: {names:?}"
+    );
+}
+
+#[test]
 fn api_changes_rust_module_reexport_detects_modified_signature() {
     // Issue 2026-07-10-rust-module-reexport-api-suppression:
     // private module 内の pub mod を `pub use internal::wifi as wifi_api;` で

@@ -319,19 +319,32 @@ fn enclosing_call_line_range(
     ) {
         return None;
     }
-    let point = tree_sitter::Point {
-        row: r.line,
-        column: r.column,
-    };
+    callee_call_line_range(tree, source, bare, r.line, r.column)
+}
+
+/// `(line, column)` の identifier が call の callee を成すなら、その call_expression /
+/// new_expression 全体の行範囲を返す純粋ロジック。ファイル I/O を分離してユニットテスト
+/// 可能にした部分。callee でない参照は `None`。
+fn callee_call_line_range(
+    tree: &tree_sitter::Tree,
+    source: &[u8],
+    bare: &str,
+    line: usize,
+    column: usize,
+) -> Option<(usize, usize)> {
+    let point = tree_sitter::Point { row: line, column };
     let node = tree
         .root_node()
         .descendant_for_point_range(point, point)
         .filter(|n| n.kind() == "identifier" && n.utf8_text(source).ok() == Some(bare))?;
-    // callee 位置まで member_expression を透過して登る (`ns.startRecording({...})` 等)。
+    // callee 位置まで透過して登る。member_expression は `ns.startRecording({...})` の
+    // receiver、parenthesized_expression は冗長括弧付き callee `(foo)(...)` を通すため
+    // (括弧を挟むと call_expression の function フィールドは最外の括弧ノードになるので、
+    // cur を透過で登らせておけば id が一致する)。
     let mut cur = node;
     while let Some(parent) = cur.parent() {
         match parent.kind() {
-            "member_expression" => cur = parent,
+            "member_expression" | "parenthesized_expression" => cur = parent,
             "call_expression" | "new_expression" => {
                 let is_callee = parent
                     .child_by_field_name("function")
@@ -565,4 +578,49 @@ pub(crate) fn is_removed_symbol_unreferenced(index: &ApiRefIndex, name: &str) ->
         return false;
     }
     ref_count == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::parser;
+    use crate::language::LangId;
+
+    fn call_range_at(src: &str, bare: &str, line: usize, column: usize) -> Option<(usize, usize)> {
+        let tree = parser::parse_source(src.as_bytes(), LangId::Typescript).unwrap();
+        callee_call_line_range(&tree, src.as_bytes(), bare, line, column)
+    }
+
+    /// 括弧なしの複数行呼び出しは従来どおり call_expression 全体の行範囲を返す。
+    #[test]
+    fn plain_multiline_callee_returns_call_range() {
+        // `foo` は line0 col10
+        let src = "const a = foo(\n  changedArg,\n);\n";
+        assert_eq!(call_range_at(src, "foo", 0, 10), Some((0, 2)));
+    }
+
+    /// 冗長括弧付き callee `(foo)(...)` でも call_expression 全体の行範囲を返す (B-3)。
+    /// 括弧を透過しないと function フィールドの括弧ノードと id 照合できず None になっていた。
+    #[test]
+    fn parenthesized_callee_returns_call_range() {
+        // `foo` は line0 col11
+        let src = "const a = (foo)(\n  changedArg,\n);\n";
+        assert_eq!(call_range_at(src, "foo", 0, 11), Some((0, 2)));
+    }
+
+    /// 二重括弧 `((foo))(...)` も透過して行範囲を返す。
+    #[test]
+    fn double_parenthesized_callee_returns_call_range() {
+        // `foo` は line0 col12
+        let src = "const a = ((foo))(\n  changedArg,\n);\n";
+        assert_eq!(call_range_at(src, "foo", 0, 12), Some((0, 2)));
+    }
+
+    /// 括弧付きでも callee でない (単なる `(foo)` 値参照) なら None のまま = 過検出しない。
+    #[test]
+    fn parenthesized_non_callee_is_none() {
+        // `foo` は line0 col11
+        let src = "const a = (foo) + 1;\n";
+        assert_eq!(call_range_at(src, "foo", 0, 11), None);
+    }
 }

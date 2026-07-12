@@ -2377,8 +2377,8 @@ fn is_rust_macro_invocation_callee(node: Node<'_>, lang_id: LangId) -> bool {
 }
 
 /// Rust の参照 identifier の使われ方を分類する (他言語は `Other`)。
-/// `scoped_identifier` (`path::name`) / `generic_function` (`f::<T>`) のラッパーは
-/// 登ってから直上の親で判定する。
+/// `scoped_identifier` (`path::name`) / `generic_function` (`f::<T>`) のラッパーと
+/// 冗長括弧 (`(my_system).after(x)`) は透過してから直上の親で判定する。
 fn classify_ref_usage_role(node: Node<'_>, lang_id: LangId) -> RefUsageRole {
     if lang_id != LangId::Rust {
         return RefUsageRole::Other;
@@ -2386,7 +2386,9 @@ fn classify_ref_usage_role(node: Node<'_>, lang_id: LangId) -> RefUsageRole {
     let mut cur = node;
     while let Some(parent) = cur.parent() {
         match parent.kind() {
-            "scoped_identifier" | "generic_function" => cur = parent,
+            // 冗長括弧も透過し、field_expression の value 等の実文脈で判定する
+            // (`(my_system).after(x)` の receiver を Other に誤格上げしない)。
+            "scoped_identifier" | "generic_function" | "parenthesized_expression" => cur = parent,
             _ => break,
         }
     }
@@ -2431,21 +2433,9 @@ fn classify_ref_usage_role(node: Node<'_>, lang_id: LangId) -> RefUsageRole {
             }
         }
         // `let x: fn(..) = foo;` / `static X: fn(..) = foo;` / `foo as fn(..)` は
-        // fn ポインタ型に固定されるためシグネチャ変更で壊れる。
-        "let_declaration" | "const_item" | "static_item" => {
-            let is_value = parent
-                .child_by_field_name("value")
-                .is_some_and(|v| v.id() == cur.id());
-            let is_fn_type = parent
-                .child_by_field_name("type")
-                .is_some_and(|t| t.kind() == "function_type");
-            if is_value && is_fn_type {
-                RefUsageRole::TypeConstrainedValue
-            } else {
-                RefUsageRole::Other
-            }
-        }
-        "type_cast_expression" => {
+        // fn ポインタ型に固定されるためシグネチャ変更で壊れる。いずれも value/type の
+        // フィールド名が共通なので同一アームで判定する。
+        "let_declaration" | "const_item" | "static_item" | "type_cast_expression" => {
             let is_value = parent
                 .child_by_field_name("value")
                 .is_some_and(|v| v.id() == cur.id());
@@ -4298,7 +4288,8 @@ struct Bar {
     }
 
     /// Rust の参照 usage role 分類 (Issue 2026-07-12-bevy-systemparam-optional-res-impact-fp)。
-    /// callee / タプル値渡し / 直接引数値渡し / fn 型固定 let / 型付きタプルを区別する。
+    /// callee / タプル値渡し / 直接引数値渡し / fn 型固定 let / 型付きタプル /
+    /// 冗長括弧付き method receiver (B-1) を区別する。
     #[test]
     fn classify_rust_ref_usage_roles() {
         let source = b"fn my_system(x: u32) { let _ = x; }\n\
@@ -4317,6 +4308,10 @@ struct Bar {
                            let _ = untyped;\n\
                            let parens: (fn(u32),) = ((my_system,));\n\
                            let _ = parens;\n\
+                           (my_system).after(1);\n\
+                           my_system.after(1);\n\
+                           let paren_pinned: fn(u32) = (my_system);\n\
+                           let _ = paren_pinned;\n\
                        }\n";
         let tree = crate::engine::parser::parse_source(source, LangId::Rust).unwrap();
 
@@ -4356,6 +4351,11 @@ struct Bar {
                 (12, RefUsageRole::FunctionValue), // let untyped = (my_system,)
                 // 冗長括弧付きでも外側の明示型を透過検出して blocking 維持
                 (14, RefUsageRole::Other), // let parens: (fn(u32),) = ((my_system,))
+                // 冗長括弧付き method receiver も透過して FunctionValue に格下げ (B-1)
+                (16, RefUsageRole::FunctionValue), // (my_system).after(1)
+                (17, RefUsageRole::FunctionValue), // my_system.after(1)
+                // 冗長括弧付き fn 型固定 let も透過して blocking (TypeConstrainedValue)
+                (18, RefUsageRole::TypeConstrainedValue), // let paren_pinned: fn(u32) = (my_system)
             ],
             "roles: {roles:?}"
         );

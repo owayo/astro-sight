@@ -538,13 +538,16 @@ pub(crate) fn extract_object_member_keys(
     collect_object_keys(obj, source)
 }
 
-/// `expr as const` / `expr satisfies T` をはがして object literal ノードを返す。
+/// `expr as const` / `expr satisfies T` / 冗長括弧 `(expr)` をはがして object literal
+/// ノードを返す。
 pub(crate) fn unwrap_to_object_literal(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
     let mut cur = node;
     loop {
         match cur.kind() {
             "object" => return Some(cur),
-            "as_expression" | "satisfies_expression" => {
+            // parenthesized_expression: `({ a: 1 })` の冗長括弧。as/satisfies と同じく
+            // named_child(0) が内側の式なので 1 段剥がす (`({ a: 1 } as const)` も透過)。
+            "as_expression" | "satisfies_expression" | "parenthesized_expression" => {
                 cur = cur.named_child(0)?;
             }
             _ => return None,

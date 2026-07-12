@@ -8,6 +8,7 @@ use crate::error::{AstroError, ErrorCode};
 use crate::models::cochange::{
     BLAME_DEFAULT_EXCLUDE_GLOBS, CoChangeEntry, CoChangeOptions, CoChangeResult,
 };
+use crate::models::skip::SkipInfo;
 
 /// `git diff` / `git blame` 等に渡す revision を検証する。
 /// 先頭が `-` の値はオプションとして解釈されるため拒否する
@@ -34,6 +35,16 @@ fn validate_revision(rev: &str, arg_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// entries なし・commits_analyzed 0 の空結果を返す。起点なし / blame 集合が空 /
+/// マージ除外後に空、の各早期 return で共用し、構築の重複を避ける。
+fn empty_cochange_result(skipped: Option<SkipInfo>) -> CoChangeResult {
+    CoChangeResult {
+        entries: Vec::new(),
+        commits_analyzed: 0,
+        skipped,
+    }
+}
+
 /// blame ベースの共変更解析。
 ///
 /// 起点ファイル `source_files` の **変更行** に対して `git blame -L` を当て、
@@ -44,11 +55,7 @@ fn validate_revision(rev: &str, arg_name: &str) -> Result<()> {
 /// 大規模リポでも履歴全体を舐めずに済む。
 pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeResult> {
     if opts.source_files.is_empty() {
-        return Ok(CoChangeResult {
-            entries: Vec::new(),
-            commits_analyzed: 0,
-            skipped: None,
-        });
+        return Ok(empty_cochange_result(None));
     }
     // 起点ファイル数の上限ガード (0 = 無制限)。暴走防止のため超過は明示的に停止する。
     if opts.max_source_files > 0 && opts.source_files.len() > opts.max_source_files {
@@ -111,11 +118,7 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
         }
     }
     if commit_set.is_empty() {
-        return Ok(CoChangeResult {
-            entries: Vec::new(),
-            commits_analyzed: 0,
-            skipped: None,
-        });
+        return Ok(empty_cochange_result(None));
     }
 
     // SHA 集合の上限ガード (0 = 無制限)。
@@ -140,11 +143,7 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
         let merge_set = list_merge_commits(dir, &commit_set)?;
         commit_set.retain(|s| !merge_set.contains(s));
         if commit_set.is_empty() {
-            return Ok(CoChangeResult {
-                entries: Vec::new(),
-                commits_analyzed: 0,
-                skipped: None,
-            });
+            return Ok(empty_cochange_result(None));
         }
     }
     // blame 結果からも同 SHA を除外して per-source 集計と整合させる。
