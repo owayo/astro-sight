@@ -2481,6 +2481,222 @@ fn detect_api_changes_modified_with_caller_outside_diff_stays_modified() {
     );
 }
 
+/// TS で export 関数と同名のローカル関数が別ファイルにあっても、shadow 解決で
+/// ローカル呼び出しを除外し、対象 caller (複数行呼び出しの引数内のみ変更) が追随済みなら
+/// closed-in-diff に降格する (Issue 2026-07-12-api-mod-same-diff-informational の完全再現)。
+#[test]
+fn detect_api_changes_ts_shadowed_local_fn_and_multiline_call_is_closed_in_diff() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/lib/capture.ts",
+                "export function startRecording(options: {\n    fps: number;\n    audio: boolean;\n}): string {\n    return `rec:${options.fps}`;\n}\n",
+            ),
+            (
+                "src/tap.ts",
+                "function startRecording(p: number): number {\n    return p * 2;\n}\nwindow.addEventListener(\"message\", () => {\n    const res = startRecording(1);\n    console.log(res);\n});\n",
+            ),
+            (
+                "src/content.ts",
+                "import { startRecording } from \"./lib/capture\";\n\nexport function onStart() {\n    return startRecording({\n        fps: 30,\n        audio: true,\n    });\n}\n",
+            ),
+        ],
+        "base",
+    );
+    // capture.ts: シグネチャに cursor を追加 / content.ts: 複数行呼び出しの引数内にだけ
+    // 追随行を追加 (識別子行 `startRecording({` 自体は未変更) / tap.ts は触らない。
+    fs::write(
+        repo.join("src/lib/capture.ts"),
+        "export function startRecording(options: {\n    fps: number;\n    audio: boolean;\n    cursor: boolean;\n}): string {\n    return `rec:${options.fps}:${options.cursor}`;\n}\n",
+    )
+    .expect("write");
+    fs::write(
+        repo.join("src/content.ts"),
+        "import { startRecording } from \"./lib/capture\";\n\nexport function onStart() {\n    return startRecording({\n        fps: 30,\n        audio: true,\n        cursor: true,\n    });\n}\n",
+    )
+    .expect("write");
+    let diff_files = vec![
+        crate::models::impact::DiffFile {
+            old_path: "src/lib/capture.ts".to_string(),
+            new_path: "src/lib/capture.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 6,
+                new_start: 1,
+                new_count: 7,
+            }],
+            deleted_old_source: None,
+        },
+        crate::models::impact::DiffFile {
+            old_path: "src/content.ts".to_string(),
+            new_path: "src/content.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 4,
+                old_count: 4,
+                new_start: 4,
+                new_count: 5,
+            }],
+            deleted_old_source: None,
+        },
+    ];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.modified_closed_in_diff
+            .iter()
+            .any(|m| m.name.ends_with("startRecording")),
+        "同名ローカル関数の shadow 除外 + 複数行呼び出しの引数内変更で closed に降格すべき。mod={:?} mod_closed={:?}",
+        api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+        api.modified_closed_in_diff
+            .iter()
+            .map(|m| &m.name)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !api.modified
+            .iter()
+            .any(|m| m.name.ends_with("startRecording")),
+        "closed-in-diff は blocking な modified に残さない"
+    );
+}
+
+/// 同名ローカル関数の shadow があっても、対象 caller が diff 外なら従来どおり blocking。
+#[test]
+fn detect_api_changes_ts_shadowed_local_fn_with_caller_outside_diff_stays_modified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/lib/capture.ts",
+                "export function startRecording(options: {\n    fps: number;\n}): string {\n    return `rec:${options.fps}`;\n}\n",
+            ),
+            (
+                "src/tap.ts",
+                "function startRecording(p: number): number {\n    return p * 2;\n}\nwindow.addEventListener(\"message\", () => {\n    const res = startRecording(1);\n    console.log(res);\n});\n",
+            ),
+            (
+                "src/content.ts",
+                "import { startRecording } from \"./lib/capture\";\n\nexport function onStart() {\n    return startRecording({ fps: 30 });\n}\n",
+            ),
+        ],
+        "base",
+    );
+    // capture.ts のみ変更。content.ts (対象 caller) は未更新かつ diff 外。
+    fs::write(
+        repo.join("src/lib/capture.ts"),
+        "export function startRecording(options: {\n    fps: number;\n    cursor: boolean;\n}): string {\n    return `rec:${options.fps}:${options.cursor}`;\n}\n",
+    )
+    .expect("write");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/lib/capture.ts".to_string(),
+        new_path: "src/lib/capture.ts".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 5,
+            new_start: 1,
+            new_count: 6,
+        }],
+        deleted_old_source: None,
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.modified
+            .iter()
+            .any(|m| m.name.ends_with("startRecording")),
+        "対象 caller が diff 外なら blocking な modified のまま。mod={:?} mod_closed={:?}",
+        api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+        api.modified_closed_in_diff
+            .iter()
+            .map(|m| &m.name)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// `obj.startRecording()` (property 位置) の diff 外参照は shadow 除外できず blocking 維持
+/// (member 経由は対象 API への参照か静的に判定できないため fail-closed)。
+#[test]
+fn detect_api_changes_ts_member_call_outside_diff_stays_modified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/lib/capture.ts",
+                "export function startRecording(options: {\n    fps: number;\n}): string {\n    return `rec:${options.fps}`;\n}\n",
+            ),
+            (
+                "src/tap.ts",
+                "function startRecording(p: number): number {\n    return p * 2;\n}\nexport const api = { run: startRecording };\n",
+            ),
+            (
+                "src/content.ts",
+                "import { startRecording } from \"./lib/capture\";\n\nexport function onStart() {\n    return startRecording({ fps: 30 });\n}\n",
+            ),
+            (
+                "src/other.ts",
+                "const recorder = { startRecording: (n: number) => n };\nexport function misc() {\n    return recorder.startRecording(1);\n}\n",
+            ),
+        ],
+        "base",
+    );
+    // capture.ts + content.ts (対象 caller) を変更。other.ts の `recorder.startRecording(1)`
+    // (property 位置、diff 外) が shadow 除外されず blocking に倒すことを確認する。
+    fs::write(
+        repo.join("src/lib/capture.ts"),
+        "export function startRecording(options: {\n    fps: number;\n    cursor: boolean;\n}): string {\n    return `rec:${options.fps}:${options.cursor}`;\n}\n",
+    )
+    .expect("write");
+    fs::write(
+        repo.join("src/content.ts"),
+        "import { startRecording } from \"./lib/capture\";\n\nexport function onStart() {\n    return startRecording({ fps: 30, cursor: true });\n}\n",
+    )
+    .expect("write");
+    let diff_files = vec![
+        crate::models::impact::DiffFile {
+            old_path: "src/lib/capture.ts".to_string(),
+            new_path: "src/lib/capture.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 5,
+                new_start: 1,
+                new_count: 6,
+            }],
+            deleted_old_source: None,
+        },
+        crate::models::impact::DiffFile {
+            old_path: "src/content.ts".to_string(),
+            new_path: "src/content.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 4,
+                old_count: 1,
+                new_start: 4,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        },
+    ];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.modified
+            .iter()
+            .any(|m| m.name.ends_with("startRecording")),
+        "property 位置の diff 外参照は除外できないため blocking 維持。mod={:?} mod_closed={:?}",
+        api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+        api.modified_closed_in_diff
+            .iter()
+            .map(|m| &m.name)
+            .collect::<Vec<_>>()
+    );
+}
+
 /// rename された caller で呼び出しが古いまま残る場合は blocking。closed-in-diff の変更行
 /// 判定が rename-aware (git diff -M) で、rename を新規全行追加と誤認しないことを検証する
 /// (codex 指摘: new_path 単独 pathspec だと未更新呼び出しまで changed に見える)。

@@ -124,14 +124,23 @@ pub(crate) fn has_blocking_value_usage(index: &ApiRefIndex, name: &str) -> bool 
 /// modified シンボルの全 cross-file 参照が同一 diff 内の変更 hunk で追随済みかを判定する。
 ///
 /// 全ての非定義参照が diff_files の変更 hunk (new 範囲) に収まれば、呼び出し側が同一
-/// コミットで更新済みとみなし closed-in-diff (informational)。同名定義が複数 (別型の同名
-/// メソッド等) / refs 解析失敗 / diff 外 or hunk 外の参照が 1 つでもあれば false を返し、
-/// 保守的に blocking 側 (通常の api.mod) へ倒す。
+/// コミットで更新済みとみなし closed-in-diff (informational)。refs 解析失敗 /
+/// diff 外 or hunk 外の参照が 1 つでもあれば false を返し、保守的に blocking 側
+/// (通常の api.mod) へ倒す。
+///
+/// 同名定義が複数ある場合: 変更対象ファイル (`target_new_path`) 内の定義が 1 つに
+/// 特定できなければ従来どおり false。他ファイルの同名定義は、JS/TS/TSX のトップレベル
+/// 関数 (bare 名) に限り `js_ts_shadow::resolve_reference_binding` で参照単位に解決し、
+/// 「同一ファイルの function_declaration に束縛されるローカル呼び出し」だけを判定対象
+/// から除外する (Issue 2026-07-12-api-mod-same-diff-informational: export 関数と
+/// 別ファイルのローカル同名関数の併存で closed 判定が全滅していた)。method qualname
+/// (`Container.method`) と JS/TS 以外の言語は従来ガード (即 blocking) を維持する。
 pub(crate) fn is_modified_closed_in_diff(
     index: &ApiRefIndex,
     dir: &str,
     name: &str,
     base: &str,
+    target_new_path: &str,
     diff_files: &[crate::models::impact::DiffFile],
     caches: &mut ApiClosureCaches,
 ) -> bool {
@@ -140,12 +149,34 @@ pub(crate) fn is_modified_closed_in_diff(
     let Some(refs) = index.refs_for(bare) else {
         return false;
     };
-    // 同名定義が 1 つでなければ曖昧 (別型の同名メソッド等) なので保守的に blocking。
-    let def_count = refs
+    // 変更対象ファイル内の定義が 1 つに特定できなければ曖昧なので保守的に blocking。
+    let defs: Vec<&crate::models::reference::SymbolReference> = refs
         .iter()
         .filter(|r| r.kind == Some(RefKind::Definition))
+        .collect();
+    let target_def_count = defs
+        .iter()
+        .filter(|r| diff_path_matches_ref(target_new_path, &r.path, dir))
         .count();
-    if def_count != 1 {
+    if target_def_count != 1 {
+        return false;
+    }
+    // 他ファイルの同名定義がある場合、JS/TS/TSX のトップレベル関数 (bare 名 = `.` なし)
+    // のみ shadow resolver での参照単位除外に進む。それ以外は従来どおり blocking。
+    let has_foreign_defs = defs.len() > target_def_count;
+    let target_lang =
+        crate::language::LangId::from_path(camino::Utf8Path::new(target_new_path)).ok();
+    if has_foreign_defs
+        && (name.contains('.')
+            || !matches!(
+                target_lang,
+                Some(
+                    crate::language::LangId::Javascript
+                        | crate::language::LangId::Typescript
+                        | crate::language::LangId::Tsx
+                )
+            ))
+    {
         return false;
     }
     // import / use 宣言の参照は signature 変更に追随する必要がない (名前だけの import で、
@@ -177,6 +208,17 @@ pub(crate) fn is_modified_closed_in_diff(
     // HunkInfo の new 範囲は context 行を含むため、git diff から実 `+` 行集合を取得して照合する
     // (codex 指摘: context 行に古い呼び出しが入ると未更新 caller を誤って closed 判定してしまう)。
     for r in &call_refs {
+        // 他ファイルの同名定義がある場合: 変更対象ファイル以外の参照で、lexical scope が
+        // 同一ファイルの function_declaration に束縛されるものは対象 API と無関係な
+        // ローカル呼び出しなので除外する。解決失敗・property 位置・function 以外の
+        // binding は OtherOrAmbiguous = 除外せず下の diff 実変更行チェックに掛かる。
+        if has_foreign_defs
+            && !diff_path_matches_ref(target_new_path, &r.path, dir)
+            && resolve_ref_shadow_binding(dir, r, bare, caches)
+                == crate::commands::api_changes::js_ts_shadow::LocalResolution::SameFileFunction
+        {
+            continue;
+        }
         let Some(df) = diff_files.iter().find(|df| {
             df.new_path != "/dev/null" && diff_path_matches_ref(&df.new_path, &r.path, dir)
         }) else {
@@ -187,10 +229,105 @@ pub(crate) fn is_modified_closed_in_diff(
             .entry(df.new_path.clone())
             .or_insert_with(|| changed_new_lines_for_file(dir, base, &df.old_path, &df.new_path));
         if !changed.contains(&r.line) {
-            return false; // context 行 (未変更) の参照 → 未更新 caller の可能性
+            // 複数行呼び出し (`startRecording({\n  fps,\n  cursor,\n})`) では識別子行は
+            // 未変更のまま実引数のプロパティ行だけが変わる。JS/TS/TSX で参照が call の
+            // callee を成す場合に限り、enclosing call_expression の行範囲まで広げて
+            // 実変更行との交差を確認する (交差しなければ従来どおり未更新 caller 扱い)。
+            let call_range = enclosing_call_line_range(dir, r, bare, caches);
+            let intersects = call_range.is_some_and(|(start, end)| {
+                let changed = caches.changed_new_lines.get(&df.new_path);
+                changed.is_some_and(|c| (start..=end).any(|line| c.contains(&line)))
+            });
+            if !intersects {
+                return false; // context 行 (未変更) の参照 → 未更新 caller の可能性
+            }
         }
     }
     true
+}
+
+/// 参照ファイルを parse (キャッシュ) して shadow binding を解決する。
+/// read / parse / 言語判定に失敗した場合は `OtherOrAmbiguous` (除外しない)。
+fn resolve_ref_shadow_binding(
+    dir: &str,
+    r: &crate::models::reference::SymbolReference,
+    bare: &str,
+    caches: &mut ApiClosureCaches,
+) -> crate::commands::api_changes::js_ts_shadow::LocalResolution {
+    use crate::commands::api_changes::js_ts_shadow::LocalResolution;
+    let Some((source, tree, lang)) = parsed_ref_file(dir, &r.path, caches) else {
+        return LocalResolution::OtherOrAmbiguous;
+    };
+    crate::commands::api_changes::js_ts_shadow::resolve_reference_binding(
+        tree, source, *lang, bare, r.line, r.column,
+    )
+}
+
+/// 参照ファイルの parse 結果 (キャッシュ付き) を返す。
+fn parsed_ref_file<'a>(
+    dir: &str,
+    ref_path: &str,
+    caches: &'a mut ApiClosureCaches,
+) -> Option<&'a (Vec<u8>, tree_sitter::Tree, crate::language::LangId)> {
+    caches
+        .parsed_refs
+        .entry(ref_path.to_string())
+        .or_insert_with(|| {
+            let abs = if std::path::Path::new(ref_path).is_absolute() {
+                std::path::PathBuf::from(ref_path)
+            } else {
+                std::path::Path::new(dir).join(ref_path)
+            };
+            let lang = crate::language::LangId::from_path(camino::Utf8Path::new(ref_path)).ok()?;
+            let source = std::fs::read(&abs).ok()?;
+            let tree = crate::engine::parser::parse_source(&source, lang).ok()?;
+            Some((source, tree, lang))
+        })
+        .as_ref()
+}
+
+/// JS/TS/TSX の参照が call の callee (直接または `obj.name(...)` の member 経由) を成す
+/// 場合、その call_expression / new_expression 全体の行範囲 (0-indexed、両端含む) を返す。
+/// callee でない参照・他言語・parse 失敗は `None` (従来の単一行判定に留める)。
+fn enclosing_call_line_range(
+    dir: &str,
+    r: &crate::models::reference::SymbolReference,
+    bare: &str,
+    caches: &mut ApiClosureCaches,
+) -> Option<(usize, usize)> {
+    let (source, tree, lang) = parsed_ref_file(dir, &r.path, caches)?;
+    if !matches!(
+        lang,
+        crate::language::LangId::Javascript
+            | crate::language::LangId::Typescript
+            | crate::language::LangId::Tsx
+    ) {
+        return None;
+    }
+    let point = tree_sitter::Point {
+        row: r.line,
+        column: r.column,
+    };
+    let node = tree
+        .root_node()
+        .descendant_for_point_range(point, point)
+        .filter(|n| n.kind() == "identifier" && n.utf8_text(source).ok() == Some(bare))?;
+    // callee 位置まで member_expression を透過して登る (`ns.startRecording({...})` 等)。
+    let mut cur = node;
+    while let Some(parent) = cur.parent() {
+        match parent.kind() {
+            "member_expression" => cur = parent,
+            "call_expression" | "new_expression" => {
+                let is_callee = parent
+                    .child_by_field_name("function")
+                    .or_else(|| parent.child_by_field_name("constructor"))
+                    .is_some_and(|f| f.id() == cur.id());
+                return is_callee.then(|| (parent.start_position().row, parent.end_position().row));
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// `is_modified_closed_in_diff` で `detect_api_changes` 呼び出し 1 回の間だけ生かす per-file
@@ -206,6 +343,14 @@ pub(crate) struct ApiClosureCaches {
     /// `changed_new_lines_for_file` の (new_path → 実際に変更/追加された new 行集合) キャッシュ。
     pub(crate) changed_new_lines:
         std::collections::HashMap<String, std::collections::HashSet<usize>>,
+    /// shadow binding 解決用の (ref path → parse 結果) キャッシュ。`None` = read/parse
+    /// 失敗 (毎回再試行しない)。同名定義が複数ある modified シンボルが多数あっても、
+    /// 参照ファイル単位で 1 回だけ parse する。
+    #[allow(clippy::type_complexity)]
+    pub(crate) parsed_refs: std::collections::HashMap<
+        String,
+        Option<(Vec<u8>, tree_sitter::Tree, crate::language::LangId)>,
+    >,
 }
 
 /// 参照行が import / use 宣言 (signature 変更に追随不要) かを行テキストで簡易判定する。

@@ -11522,3 +11522,134 @@ fn api_changes_rust_inline_module_hierarchy_reexport_detected() {
         "inline module 配下の外部 mod 経由の公開 API 変更も api.modified に出るべき: {json}"
     );
 }
+
+#[test]
+fn review_hook_ts_shadowed_local_fn_closed_in_diff_exits_zero() {
+    // Issue 2026-07-12-api-mod-same-diff-informational の E2E:
+    // export 関数のシグネチャ変更 + 対象 caller (複数行呼び出しの引数内のみ変更) 追随済み +
+    // 別ファイルに同名ローカル関数、の構成で Stop hook が exit 0 (informational) になる。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/lib")).unwrap();
+    std::fs::write(
+        root.join("src/lib/capture.ts"),
+        "export function startRecording(options: {\n    fps: number;\n    audio: boolean;\n}): string {\n    return `rec:${options.fps}`;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/tap.ts"),
+        "function startRecording(p: number): number {\n    return p * 2;\n}\nwindow.addEventListener(\"message\", () => {\n    const res = startRecording(1);\n    console.log(res);\n});\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/content.ts"),
+        "import { startRecording } from \"./lib/capture\";\n\nexport function onStart() {\n    return startRecording({\n        fps: 30,\n        audio: true,\n    });\n}\n",
+    )
+    .unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "astro-sight@example.com"]);
+    git(&["config", "user.name", "astro-sight"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial", "-q"]);
+
+    std::fs::write(
+        root.join("src/lib/capture.ts"),
+        "export function startRecording(options: {\n    fps: number;\n    audio: boolean;\n    cursor: boolean;\n}): string {\n    return `rec:${options.fps}:${options.cursor}`;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/content.ts"),
+        "import { startRecording } from \"./lib/capture\";\n\nexport function onStart() {\n    return startRecording({\n        fps: 30,\n        audio: true,\n        cursor: true,\n    });\n}\n",
+    )
+    .unwrap();
+
+    // JSON 出力でバケットを確認
+    let output = cargo_bin()
+        .args(["review", "--dir", root.to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let closed: Vec<&str> = json["api_changes"]["modified_closed_in_diff"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        closed.contains(&"startRecording"),
+        "closed-in-diff に降格されるべき: {json}"
+    );
+
+    // hook は informational のみなので exit 0
+    let hook = cargo_bin()
+        .args(["review", "--dir", root.to_str().unwrap(), "--git", "--hook"])
+        .output()
+        .expect("failed to run");
+    assert!(
+        hook.status.success(),
+        "closed-in-diff のみの diff は hook exit 0: stderr={}",
+        String::from_utf8_lossy(&hook.stderr)
+    );
+}
+
+#[test]
+fn review_hook_ts_shadowed_local_fn_unupdated_caller_exits_nonzero() {
+    // 対照: 同名ローカル関数があっても、対象 caller が未更新 (diff 外) なら blocking (exit 1)。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/lib")).unwrap();
+    std::fs::write(
+        root.join("src/lib/capture.ts"),
+        "export function startRecording(options: {\n    fps: number;\n}): string {\n    return `rec:${options.fps}`;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/tap.ts"),
+        "function startRecording(p: number): number {\n    return p * 2;\n}\nwindow.addEventListener(\"message\", () => {\n    const res = startRecording(1);\n    console.log(res);\n});\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/content.ts"),
+        "import { startRecording } from \"./lib/capture\";\n\nexport function onStart() {\n    return startRecording({ fps: 30 });\n}\n",
+    )
+    .unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("failed to run git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "astro-sight@example.com"]);
+    git(&["config", "user.name", "astro-sight"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial", "-q"]);
+
+    std::fs::write(
+        root.join("src/lib/capture.ts"),
+        "export function startRecording(options: {\n    fps: number;\n    cursor: boolean;\n}): string {\n    return `rec:${options.fps}:${options.cursor}`;\n}\n",
+    )
+    .unwrap();
+
+    let hook = cargo_bin()
+        .args(["review", "--dir", root.to_str().unwrap(), "--git", "--hook"])
+        .output()
+        .expect("failed to run");
+    assert!(
+        !hook.status.success(),
+        "対象 caller 未更新なら blocking (exit 1) のまま"
+    );
+}

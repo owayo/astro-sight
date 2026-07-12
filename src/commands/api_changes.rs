@@ -473,7 +473,15 @@ fn classify_signature_change(
         return;
     }
     // 全 cross-file 参照が同一 diff 内で追随済みなら informational
-    if is_modified_closed_in_diff(ref_index, dir, &name, base, diff_files, closure_caches) {
+    if is_modified_closed_in_diff(
+        ref_index,
+        dir,
+        &name,
+        base,
+        &df.new_path,
+        diff_files,
+        closure_caches,
+    ) {
         buckets.modified_closed_in_diff.push(change);
     } else {
         buckets.modified.push(change);
@@ -2332,6 +2340,7 @@ pub(crate) fn is_internally_connected(
     false
 }
 
+mod js_ts_shadow;
 mod python_signature;
 mod ref_index;
 mod rust_public;
