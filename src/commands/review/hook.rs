@@ -1,6 +1,8 @@
 use anyhow::Result;
 use serde::Serialize;
 
+use crate::commands::ChangedFileSet;
+use crate::models::impact::ImpactedCaller;
 use crate::models::review::{ApiChanges, ReviewResult};
 
 /// `--hook` の出力判定結果。
