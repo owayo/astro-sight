@@ -7,9 +7,10 @@
 BINARY_NAME := astro-sight
 INSTALL_PATH := /usr/local/bin
 
-# macOS: classic linker を使用（Xcode 15+ のリンカーは ar アーカイブの
-# 8-byte alignment を厳格にチェックし tree-sitter-kotlin がリンク失敗する）
-export RUSTFLAGS ?= -C link-arg=-Wl,-ld_classic
+# macOS: cc crate と rustc のデプロイメントターゲットを揃える
+# 未指定だと tree-sitter-swift の parser.o がホスト SDK (例: 26.5) でビルドされ、
+# rustc の aarch64-apple-darwin デフォルト (11.0) と齟齬になり linker が警告を出す。
+export MACOSX_DEPLOYMENT_TARGET ?= 11.0
 
 # macOS: GNU ar を使用（Xcode の ar は -D フラグ非対応で warning が出る）
 AR_GNU := $(wildcard /opt/homebrew/opt/binutils/bin/ar)
