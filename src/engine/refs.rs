@@ -22,6 +22,22 @@ fn bounded_worker_count() -> usize {
         .unwrap_or(4)
 }
 
+/// `find_references` / `find_references_batch` 共通の上限付き rayon プールを構築する。
+///
+/// ワーカー毎に fold バケット (`Vec<SymbolReference>` / `Vec<Vec<SymbolReference>>`) を
+/// 抱えるため、物理コア数をそのまま使うと大規模リポで RSS が線形に膨張し OOM を招く。
+/// 物理コア数と `bounded_worker_count()` の小さい方でワーカー数を制限する。
+fn build_bounded_pool() -> Result<rayon::ThreadPool> {
+    let worker_limit = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(bounded_worker_count());
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_limit)
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build rayon pool: {e}"))
+}
+
 /// `find_references_batch` の内部 chunk サイズ。既定 64。
 /// AC trie はパターン数に対して非線形にメモリを使い、fold バケットも名前数分
 /// 確保されるため、名前を chunk 分割して trie / バケットを chunk サイズで上限する。
@@ -34,6 +50,24 @@ fn refs_batch_chunk_size() -> usize {
         .unwrap_or(64)
 }
 
+/// AC マルチパターン事前フィルタ。`source` を走査して出現した name index の集合を返す。
+/// `num_names` 個すべて出現した時点で走査を打ち切る (超集合フィルタ、AC は ASCII CI 構築前提)。
+/// 空集合の場合は呼び出し側が各々の早期 return (空結果) を行う。
+fn ac_present_indices(
+    ac: &aho_corasick::AhoCorasick,
+    source: &[u8],
+    num_names: usize,
+) -> std::collections::HashSet<usize> {
+    let mut present_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for mat in ac.find_overlapping_iter(source) {
+        present_indices.insert(mat.pattern().as_usize());
+        if present_indices.len() == num_names {
+            break;
+        }
+    }
+    present_indices
+}
+
 /// 指定シンボルへの参照をディレクトリ内のファイルから検索する。
 /// glob パターン（例: "**/*.rs"）によるフィルタも可能。
 pub fn find_references(
@@ -43,14 +77,7 @@ pub fn find_references(
 ) -> Result<Vec<SymbolReference>> {
     let files = collect_files(dir, glob_pattern)?;
 
-    let worker_limit = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(bounded_worker_count());
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(worker_limit)
-        .build()
-        .map_err(|e| anyhow::anyhow!("Failed to build rayon pool: {e}"))?;
+    let pool = build_bounded_pool()?;
 
     // per-file Vec を全ファイル分保持せず、worker local の Vec へ直接統合する。
     let mut all_refs: Vec<SymbolReference> = pool.install(|| {
@@ -338,12 +365,13 @@ fn find_refs_via_lexer(
 ) -> Vec<SymbolReference> {
     use crate::engine::lexer;
 
+    // profile はシンボル毎に不変なのでループ外で 1 度だけ引く (batch 版と同形)。
+    let profile = lexer::profile_for(lexer_lang);
     // 定義ヘッダ位置 (行番号) のセット。lexer profile 経由で抽出。
     let def_lines: std::collections::HashSet<usize> = lexer::extract_symbols(source, lexer_lang)
         .iter()
         .filter(|s| {
             // 大小無視で名前一致するもののみ抽出 (Xojo は case-insensitive)。
-            let profile = lexer::profile_for(lexer_lang);
             if profile.case_insensitive {
                 s.name.eq_ignore_ascii_case(symbol_name)
             } else {
@@ -1755,18 +1783,8 @@ pub fn find_references_batch(
     // (count_non_definition_refs_split と同じ手法)。
     let files = collect_files(dir, glob_pattern)?;
 
-    // rayon のワーカー数を上限付きにする。ワーカー毎に `Vec<Vec<SymbolReference>>` の
-    // fold バケットが生成されるため、大規模リポジトリではワーカー数 × 参照件数に比例して
-    // ピーク RSS が線形増大する。
-    // 物理コア数と上限のうち小さい方を採用し、バケット総量を押さえつつ並列性を維持する。
-    let worker_limit = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(bounded_worker_count());
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(worker_limit)
-        .build()
-        .map_err(|e| anyhow::anyhow!("Failed to build rayon pool: {e}"))?;
+    // rayon のワーカー数を上限付きにする (バケットのピーク RSS 抑制、詳細は build_bounded_pool)。
+    let pool = build_bounded_pool()?;
 
     // AC trie はパターン数に対して非線形にメモリを使い、fold バケットも名前数分確保される。
     // 名前を chunk 分割して chunk 毎に trie 構築 → 走査 → drop し、ピーク RSS を chunk
@@ -1994,18 +2012,10 @@ pub(crate) fn visit_refs_and_defs_in_file_cb<V: RefVisitor>(
     path: &camino::Utf8Path,
     visitor: &mut V,
 ) -> Result<()> {
-    use std::collections::HashSet;
-
     let num = symbol_names.len();
     let source = parser::read_file(path)?;
 
-    let mut present_indices: HashSet<usize> = HashSet::new();
-    for mat in ac.find_overlapping_iter(source.as_bytes()) {
-        present_indices.insert(mat.pattern().as_usize());
-        if present_indices.len() == num {
-            break;
-        }
-    }
+    let present_indices = ac_present_indices(ac, source.as_bytes(), num);
     if present_indices.is_empty() {
         return Ok(());
     }
@@ -2333,6 +2343,32 @@ impl RawRefSink for CountSink<'_> {
 const _: () = assert!(!<CountSink<'static> as RawRefSink>::NEEDS_LINE_INDEX);
 const _: () = assert!(<SymbolReferenceSink<'static> as RawRefSink>::NEEDS_LINE_INDEX);
 
+/// synthetic 参照源 (文字列セグメント由来) 共通の hit 送出。segment が対象シンボルに
+/// 一致すれば `HitOrigin::Synthetic` の hit を sink に流す。5 種の source ループは
+/// walk_refs 内にそのまま残し、この 1 関数で送出処理だけを共有する。
+#[inline]
+fn emit_synthetic_hit<M: RefMatcher, S: RawRefSink>(
+    segment: &str,
+    row: usize,
+    column: usize,
+    matcher: &M,
+    sink: &mut S,
+    env: &RefEnvironment<'_>,
+) {
+    if let Some(matches) = matcher.segment_matches(segment) {
+        sink.on_hit(
+            RawRefHit {
+                matches,
+                origin: HitOrigin::Synthetic,
+                line: row,
+                column,
+                is_def: false,
+            },
+            env,
+        );
+    }
+}
+
 /// 統合参照ウォーカー。各ノードで「identifier → 5 種 synthetic 源 → 子」の順に
 /// 走査し、一致するたび `sink.on_hit` を呼ぶ。DFS 順は旧 4 walker と同一。
 fn walk_refs<M: RefMatcher, S: RawRefSink>(
@@ -2370,82 +2406,27 @@ fn walk_refs<M: RefMatcher, S: RawRefSink>(
 
     // (2) Rust serde 属性文字列値
     for (seg, row, col) in rust_attr_string_ref_segments(node, source, lang_id) {
-        if let Some(matches) = matcher.segment_matches(seg) {
-            sink.on_hit(
-                RawRefHit {
-                    matches,
-                    origin: HitOrigin::Synthetic,
-                    line: row,
-                    column: col,
-                    is_def: false,
-                },
-                env,
-            );
-        }
+        emit_synthetic_hit(seg, row, col, matcher, sink, env);
     }
 
     // (3) bash `trap '<handler>' SIG` の handler 文字列
     for (seg, row, col) in bash_trap_handler_ref_segments(node, source, lang_id) {
-        if let Some(matches) = matcher.segment_matches(&seg) {
-            sink.on_hit(
-                RawRefHit {
-                    matches,
-                    origin: HitOrigin::Synthetic,
-                    line: row,
-                    column: col,
-                    is_def: false,
-                },
-                env,
-            );
-        }
+        emit_synthetic_hit(&seg, row, col, matcher, sink, env);
     }
 
     // (4) PHPUnit DocBlock / attribute metadata
     for (seg, row, col) in phpunit_metadata_ref_segments(node, source, lang_id) {
-        if let Some(matches) = matcher.segment_matches(&seg) {
-            sink.on_hit(
-                RawRefHit {
-                    matches,
-                    origin: HitOrigin::Synthetic,
-                    line: row,
-                    column: col,
-                    is_def: false,
-                },
-                env,
-            );
-        }
+        emit_synthetic_hit(&seg, row, col, matcher, sink, env);
     }
 
     // (5) PHP callable array `[Foo::class, 'method']`
-    if let Some((method, row, col)) = php_callable_array_method_segment(node, source, lang_id)
-        && let Some(matches) = matcher.segment_matches(method)
-    {
-        sink.on_hit(
-            RawRefHit {
-                matches,
-                origin: HitOrigin::Synthetic,
-                line: row,
-                column: col,
-                is_def: false,
-            },
-            env,
-        );
+    if let Some((method, row, col)) = php_callable_array_method_segment(node, source, lang_id) {
+        emit_synthetic_hit(method, row, col, matcher, sink, env);
     }
 
     // (6) PHP 文字列 callable `'Class@method'`
-    if let Some((method, row, col)) = php_string_callable_method_segment(node, source, lang_id)
-        && let Some(matches) = matcher.segment_matches(method)
-    {
-        sink.on_hit(
-            RawRefHit {
-                matches,
-                origin: HitOrigin::Synthetic,
-                line: row,
-                column: col,
-                is_def: false,
-            },
-            env,
-        );
+    if let Some((method, row, col)) = php_string_callable_method_segment(node, source, lang_id) {
+        emit_synthetic_hit(method, row, col, matcher, sink, env);
     }
 
     // (7) 子ノードへ再帰
@@ -2761,20 +2742,11 @@ pub(crate) fn find_refs_batch_in_file_indexed(
     ac: &aho_corasick::AhoCorasick,
     path: &camino::Utf8Path,
 ) -> Result<Vec<Vec<SymbolReference>>> {
-    use std::collections::HashSet;
-
     let num = symbol_names.len();
     let source = parser::read_file(path)?;
 
     // マルチパターン事前フィルタ (AC は ASCII CI で構築済、超集合フィルタ)
-    let mut present_indices: HashSet<usize> = HashSet::new();
-    for mat in ac.find_overlapping_iter(source.as_bytes()) {
-        present_indices.insert(mat.pattern().as_usize());
-        if present_indices.len() == num {
-            break;
-        }
-    }
-
+    let present_indices = ac_present_indices(ac, source.as_bytes(), num);
     if present_indices.is_empty() {
         return Ok(vec![Vec::new(); num]);
     }
@@ -2827,19 +2799,10 @@ fn count_refs_in_file(
     ac: &aho_corasick::AhoCorasick,
     path: &camino::Utf8Path,
 ) -> Result<Vec<usize>> {
-    use std::collections::HashSet;
-
     let num = symbol_names.len();
     let source = parser::read_file(path)?;
 
-    let mut present_indices: HashSet<usize> = HashSet::new();
-    for mat in ac.find_overlapping_iter(source.as_bytes()) {
-        present_indices.insert(mat.pattern().as_usize());
-        if present_indices.len() == num {
-            break;
-        }
-    }
-
+    let present_indices = ac_present_indices(ac, source.as_bytes(), num);
     if present_indices.is_empty() {
         return Ok(vec![0; num]);
     }

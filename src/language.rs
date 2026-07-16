@@ -27,26 +27,8 @@ pub enum LangId {
 
 impl std::fmt::Display for LangId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            Self::Rust => "rust",
-            Self::C => "c",
-            Self::Cpp => "cpp",
-            Self::Python => "python",
-            Self::Javascript => "javascript",
-            Self::Typescript => "typescript",
-            Self::Tsx => "tsx",
-            Self::Go => "go",
-            Self::Php => "php",
-            Self::Java => "java",
-            Self::Kotlin => "kotlin",
-            Self::Swift => "swift",
-            Self::CSharp => "csharp",
-            Self::Bash => "bash",
-            Self::Ruby => "ruby",
-            Self::Zig => "zig",
-            Self::Xojo => "xojo",
-        };
-        write!(f, "{s}")
+        // 表示名は DetectedLang 側に一本化し二重管理を避ける
+        write!(f, "{}", self.detected().display_name())
     }
 }
 
@@ -149,27 +131,11 @@ impl LangId {
     /// 必ず `is_lexer_only()` で振り分けるか、`detected().tree_sitter()` を
     /// 使うこと。PR2 で Xojo を lexer-only に格下げしたためこの保証を導入した。
     pub fn ts_language(self) -> Language {
-        match self {
-            Self::Rust => Language::new(tree_sitter_rust::LANGUAGE),
-            Self::C => Language::new(tree_sitter_c::LANGUAGE),
-            Self::Cpp => Language::new(tree_sitter_cpp::LANGUAGE),
-            Self::Python => Language::new(tree_sitter_python::LANGUAGE),
-            Self::Javascript => Language::new(tree_sitter_javascript::LANGUAGE),
-            Self::Typescript => Language::new(tree_sitter_typescript::LANGUAGE_TYPESCRIPT),
-            Self::Tsx => Language::new(tree_sitter_typescript::LANGUAGE_TSX),
-            Self::Go => Language::new(tree_sitter_go::LANGUAGE),
-            Self::Php => Language::new(tree_sitter_php::LANGUAGE_PHP),
-            Self::Java => Language::new(tree_sitter_java::LANGUAGE),
-            Self::Kotlin => {
-                let ptr = tree_sitter_kotlin().cast::<tree_sitter::ffi::TSLanguage>();
-                unsafe { Language::from_raw(ptr) }
-            }
-            Self::Swift => Language::new(tree_sitter_swift::LANGUAGE),
-            Self::CSharp => Language::new(tree_sitter_c_sharp::LANGUAGE),
-            Self::Bash => Language::new(tree_sitter_bash::LANGUAGE),
-            Self::Ruby => Language::new(tree_sitter_ruby::LANGUAGE),
-            Self::Zig => Language::new(tree_sitter_zig::LANGUAGE),
-            Self::Xojo => {
+        // 実体は TreeSitterLang::ts_language に委譲し、言語 arm の二重メンテを避ける。
+        // lexer-only (Xojo) は tree-sitter を持たないため従来どおり panic する。
+        match self.detected().tree_sitter() {
+            Some(lang) => lang.ts_language(),
+            None => {
                 panic!("Xojo is lexer-only since v26.6; callers must check is_lexer_only() first")
             }
         }

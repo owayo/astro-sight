@@ -602,100 +602,115 @@ fn extract_control_flow_refs(content: &str, refs: &mut HashSet<String>) {
         while p < bytes.len() && is_attr_separator(bytes[p]) {
             p += 1;
         }
-        match keyword {
-            b"if" | b"switch" | b"case" | b"defer" => {
-                if p < bytes.len()
-                    && bytes[p] == b'('
-                    && let Some(end) = find_matching_paren(bytes, p)
-                {
-                    if let Ok(expr) = std::str::from_utf8(&bytes[p + 1..end]) {
-                        extract_identifiers(expr, refs);
-                    }
-                    i = end + 1;
-                    continue;
-                }
-                i = k.max(i + 1);
-            }
-            b"for" => {
-                if p < bytes.len()
-                    && bytes[p] == b'('
-                    && let Some(end) = find_matching_paren(bytes, p)
-                {
-                    if let Ok(expr) = std::str::from_utf8(&bytes[p + 1..end]) {
-                        extract_for_block_refs(expr, refs);
-                    }
-                    i = end + 1;
-                    continue;
-                }
-                i = k.max(i + 1);
-            }
-            b"else" => {
-                // `@else if (cond)` のみ式を持つ (`@else {` は式なし)
-                if bytes[p..].starts_with(b"if") {
-                    let mut q = p + 2;
-                    while q < bytes.len() && is_attr_separator(bytes[q]) {
-                        q += 1;
-                    }
-                    if q < bytes.len()
-                        && bytes[q] == b'('
-                        && let Some(end) = find_matching_paren(bytes, q)
-                    {
-                        if let Ok(expr) = std::str::from_utf8(&bytes[q + 1..end]) {
-                            extract_identifiers(expr, refs);
-                        }
-                        i = end + 1;
-                        continue;
-                    }
-                }
-                i = k.max(i + 1);
-            }
-            b"let" => {
-                // `@let name = expr;` の `=` 後〜`;` を式とする (name はローカル束縛)
-                let mut q = p;
-                while q < bytes.len() && bytes[q] != b'=' && bytes[q] != b';' && bytes[q] != b'\n' {
-                    q += 1;
-                }
-                if q < bytes.len() && bytes[q] == b'=' {
-                    q += 1;
-                    let start = q;
-                    // RHS 終端 `;` は文字列リテラル内の `;` を無視して探す
-                    // (`@let x = fn("a;b")` のような式を途中で切らない)
-                    let mut in_str: Option<u8> = None;
-                    while q < bytes.len() {
-                        let b = bytes[q];
-                        if let Some(qt) = in_str {
-                            // 文字列リテラル末尾が `\` で終わると q がバッファ長を超えて
-                            // 後続の slice (`&bytes[start..q]`) でパニックするため境界を確認する
-                            if b == b'\\' && q + 1 < bytes.len() {
-                                q += 2;
-                                continue;
-                            }
-                            if b == qt {
-                                in_str = None;
-                            }
-                            q += 1;
-                            continue;
-                        }
-                        match b {
-                            b'"' | b'\'' | b'`' => in_str = Some(b),
-                            b';' => break,
-                            _ => {}
-                        }
-                        q += 1;
-                    }
-                    if let Ok(expr) = std::str::from_utf8(&bytes[start..q]) {
-                        extract_identifiers(expr, refs);
-                    }
-                    i = q;
-                    continue;
-                }
-                i = k.max(i + 1);
-            }
-            _ => {
-                i = k.max(i + 1);
-            }
-        }
+        // 各 keyword を「成功時の次走査位置」を返すハンドラへ dispatch する。
+        // ハンドラが None (式なし / 対応括弧が取れない) を返した場合は、keyword 末尾
+        // (最低でも `@` の次) へ前進する既存の fallback 規約を適用する。
+        let next = match keyword {
+            b"if" | b"switch" | b"case" | b"defer" => handle_paren_expr(bytes, p, refs),
+            b"for" => handle_for_expr(bytes, p, refs),
+            b"else" => handle_else_expr(bytes, p, refs),
+            b"let" => handle_let_expr(bytes, p, refs),
+            _ => None,
+        };
+        i = next.unwrap_or_else(|| k.max(i + 1));
     }
+}
+
+/// `bytes[p]` が `(` のとき対応する `)` を探し、`(括弧内の式, 次走査位置 = end + 1)` を返す。
+/// `(` でない / 対応括弧が取れない場合は `None`。括弧内が非 UTF-8 のときは `Some((None, _))`
+/// を返し、呼び出し側は識別子抽出を skip しつつ位置だけ前進する (旧実装の挙動を維持)。
+fn balanced_paren_expr(bytes: &[u8], p: usize) -> Option<(Option<&str>, usize)> {
+    if p >= bytes.len() || bytes[p] != b'(' {
+        return None;
+    }
+    let end = find_matching_paren(bytes, p)?;
+    let expr = std::str::from_utf8(&bytes[p + 1..end]).ok();
+    Some((expr, end + 1))
+}
+
+/// `@if` / `@switch` / `@case` / `@defer` の `(式)` から識別子を抽出する。
+fn handle_paren_expr(bytes: &[u8], p: usize, refs: &mut HashSet<String>) -> Option<usize> {
+    let (expr, next) = balanced_paren_expr(bytes, p)?;
+    if let Some(expr) = expr {
+        extract_identifiers(expr, refs);
+    }
+    Some(next)
+}
+
+/// `@for (item of items; track ...)` の反復式からループ変数束縛を除いた識別子を抽出する。
+fn handle_for_expr(bytes: &[u8], p: usize, refs: &mut HashSet<String>) -> Option<usize> {
+    let (expr, next) = balanced_paren_expr(bytes, p)?;
+    if let Some(expr) = expr {
+        extract_for_block_refs(expr, refs);
+    }
+    Some(next)
+}
+
+/// `@else if (cond)` の条件式から識別子を抽出する。`@else {` は式を持たないため `None`。
+fn handle_else_expr(bytes: &[u8], p: usize, refs: &mut HashSet<String>) -> Option<usize> {
+    // `@else if (cond)` のみ式を持つ (`@else {` は式なし)
+    if !bytes[p..].starts_with(b"if") {
+        return None;
+    }
+    let mut q = p + 2;
+    while q < bytes.len() && is_attr_separator(bytes[q]) {
+        q += 1;
+    }
+    let (expr, next) = balanced_paren_expr(bytes, q)?;
+    if let Some(expr) = expr {
+        extract_identifiers(expr, refs);
+    }
+    Some(next)
+}
+
+/// `@let name = expr;` の `=` 後〜`;` を式として識別子を抽出する (name はローカル束縛)。
+/// `=` が現れない (`@let x` のみ等) 場合は `None` を返し fallback 前進に委ねる。
+fn handle_let_expr(bytes: &[u8], p: usize, refs: &mut HashSet<String>) -> Option<usize> {
+    // `=` / `;` / 改行のいずれかまで読み進め、`=` に達したときだけ RHS を式とみなす。
+    let mut q = p;
+    while q < bytes.len() && bytes[q] != b'=' && bytes[q] != b';' && bytes[q] != b'\n' {
+        q += 1;
+    }
+    if q >= bytes.len() || bytes[q] != b'=' {
+        return None;
+    }
+    let start = q + 1;
+    let end = scan_let_rhs_end(bytes, start);
+    if let Ok(expr) = std::str::from_utf8(&bytes[start..end]) {
+        extract_identifiers(expr, refs);
+    }
+    Some(end)
+}
+
+/// `@let name = <RHS>` の RHS 終端位置を返す。`start` は `=` の次のバイト位置。終端は
+/// 文字列リテラル外の `;`、無ければ `bytes.len()`。文字列リテラル (`'` / `"` / `` ` ``) 内の
+/// `;` は終端とみなさず読み飛ばす (`@let x = fn("a;b")` のような式を途中で切らない)。
+fn scan_let_rhs_end(bytes: &[u8], start: usize) -> usize {
+    let mut q = start;
+    let mut in_str: Option<u8> = None;
+    while q < bytes.len() {
+        let b = bytes[q];
+        if let Some(qt) = in_str {
+            // 文字列リテラル末尾が `\` で終わると q がバッファ長を超えて
+            // 後続の slice (`&bytes[start..q]`) でパニックするため境界を確認する
+            if b == b'\\' && q + 1 < bytes.len() {
+                q += 2;
+                continue;
+            }
+            if b == qt {
+                in_str = None;
+            }
+            q += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' | b'`' => in_str = Some(b),
+            b';' => break,
+            _ => {}
+        }
+        q += 1;
+    }
+    q
 }
 
 /// `@for (item of items; track item.id; let i = $index)` の式から、ループ変数束縛
@@ -1745,6 +1760,88 @@ export class HeaderComponent {
         extract_control_flow_refs(html, &mut refs);
         assert!(refs.contains("computeTotal"));
         assert!(refs.contains("formatPair"));
+    }
+
+    #[test]
+    fn control_flow_if_unterminated_paren_no_panic() {
+        // 対応する `)` が無い `@if` は式を切り出せず fallback 前進のみ。panic しない。
+        let mut refs = HashSet::new();
+        extract_control_flow_refs("@if (canShow()", &mut refs);
+        assert!(refs.is_empty(), "対応括弧が無ければ何も抽出しない");
+    }
+
+    #[test]
+    fn control_flow_let_unterminated_double_quote_no_panic() {
+        // RHS の `"` が閉じないまま EOF でも in_str state machine が末尾で安全に停止する。
+        let mut refs = HashSet::new();
+        extract_control_flow_refs("@let d = handler + \"tail", &mut refs);
+        assert!(refs.contains("handler"));
+    }
+
+    #[test]
+    fn control_flow_let_unterminated_single_quote_no_panic() {
+        // シングルクォート版。閉じない `'` でも panic しない。
+        let mut refs = HashSet::new();
+        extract_control_flow_refs("@let s = handler + 'tail", &mut refs);
+        assert!(refs.contains("handler"));
+    }
+
+    #[test]
+    fn control_flow_let_unterminated_backtick_no_panic() {
+        // バッククォート (テンプレートリテラル) 版。閉じない `` ` `` でも panic しない。
+        let mut refs = HashSet::new();
+        extract_control_flow_refs("@let t = handler + `tail", &mut refs);
+        assert!(refs.contains("handler"));
+    }
+
+    #[test]
+    fn control_flow_let_empty_rhs_no_panic() {
+        // `=` 直後に式が無い (`@let x =` で EOF) 場合でも空スライスで panic しない。
+        let mut refs = HashSet::new();
+        extract_control_flow_refs("@let placeholder =", &mut refs);
+        assert!(
+            refs.is_empty(),
+            "RHS が空なら識別子は拾わない (束縛名も除外)"
+        );
+    }
+
+    #[test]
+    fn control_flow_multibyte_input_no_panic() {
+        // マルチバイト文字を含む式でも byte 境界で slice せず panic しない。
+        // `@if` の括弧内・`@let` の RHS 双方でマルチバイトを跨ぐ。
+        let mut refs = HashSet::new();
+        extract_control_flow_refs(
+            "@if (ロール && canEdit()) {}\n@let 名前 = displayName();",
+            &mut refs,
+        );
+        assert!(refs.contains("canEdit"));
+        assert!(refs.contains("displayName"));
+    }
+
+    #[test]
+    fn scan_let_rhs_end_stops_at_semicolon() {
+        // 文字列外の `;` で停止する。
+        assert_eq!(scan_let_rhs_end(b"foo();rest", 0), 5);
+    }
+
+    #[test]
+    fn scan_let_rhs_end_ignores_semicolon_in_string() {
+        // 文字列リテラル内の `;` は無視し、閉じた後の `;` で停止する。
+        assert_eq!(scan_let_rhs_end(b"fn(\"a;b\");x", 0), 9);
+    }
+
+    #[test]
+    fn scan_let_rhs_end_no_semicolon_reaches_end() {
+        // 終端 `;` が無ければ末尾まで走査する。
+        let s = b"a + b()";
+        assert_eq!(scan_let_rhs_end(s, 0), s.len());
+    }
+
+    #[test]
+    fn scan_let_rhs_end_trailing_backslash_no_panic() {
+        // 文字列末尾の `\` が EOF に達しても境界チェックで panic しない (実績のある fix)。
+        let s = b"\"\\";
+        assert_eq!(scan_let_rhs_end(s, 0), s.len());
     }
 
     // ---- 位置付き参照検索 (refs コマンド用) ----

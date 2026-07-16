@@ -17,16 +17,7 @@ pub fn is_local_scope_symbol(
     lang_id: LangId,
     symbol_range: &Range,
 ) -> bool {
-    let start = tree_sitter::Point {
-        row: symbol_range.start.line,
-        column: symbol_range.start.column,
-    };
-    let end = tree_sitter::Point {
-        row: symbol_range.end.line,
-        column: symbol_range.end.column,
-    };
-
-    let Some(node) = root.descendant_for_point_range(start, end) else {
+    let Some(node) = node_for_symbol_range(root, symbol_range) else {
         return false; // 保守的: ノード未検出はローカルと判定しない
     };
 
@@ -126,16 +117,7 @@ pub fn is_symbol_exported(
     lang_id: LangId,
     symbol_range: &Range,
 ) -> bool {
-    let start = tree_sitter::Point {
-        row: symbol_range.start.line,
-        column: symbol_range.start.column,
-    };
-    let end = tree_sitter::Point {
-        row: symbol_range.end.line,
-        column: symbol_range.end.column,
-    };
-
-    let Some(node) = root.descendant_for_point_range(start, end) else {
+    let Some(node) = node_for_symbol_range(root, symbol_range) else {
         return true; // 保守的: ノード未検出時はエクスポートと判定
     };
 
@@ -622,15 +604,7 @@ pub fn is_override_method(
     lang_id: LangId,
     symbol_range: &Range,
 ) -> bool {
-    let start = tree_sitter::Point {
-        row: symbol_range.start.line,
-        column: symbol_range.start.column,
-    };
-    let end = tree_sitter::Point {
-        row: symbol_range.end.line,
-        column: symbol_range.end.column,
-    };
-    let Some(node) = root.descendant_for_point_range(start, end) else {
+    let Some(node) = node_for_symbol_range(root, symbol_range) else {
         return false;
     };
     let Some(decl) = find_method_declaration_for_override(node) else {
@@ -789,15 +763,7 @@ const LARAVEL_CONTRACT_METHODS: &[(&str, &[&str])] = &[
 /// 末尾の `BelongsTo` でマッチ)。implements 句の判定も末尾名比較で、`use ... as` の alias
 /// も両方対応した allowlist で吸収する。
 pub fn is_php_laravel_runtime_entrypoint(root: Node, source: &[u8], symbol_range: &Range) -> bool {
-    let start = tree_sitter::Point {
-        row: symbol_range.start.line,
-        column: symbol_range.start.column,
-    };
-    let end = tree_sitter::Point {
-        row: symbol_range.end.line,
-        column: symbol_range.end.column,
-    };
-    let Some(node) = root.descendant_for_point_range(start, end) else {
+    let Some(node) = node_for_symbol_range(root, symbol_range) else {
         return false;
     };
     let mut cur = Some(node);
@@ -1023,15 +989,7 @@ pub fn is_java_flyway_migration_class(root: Node, source: &[u8], symbol_range: &
         "org.flywaydb.core.api.migration.JavaMigration",
     ];
 
-    let start = tree_sitter::Point {
-        row: symbol_range.start.line,
-        column: symbol_range.start.column,
-    };
-    let end = tree_sitter::Point {
-        row: symbol_range.end.line,
-        column: symbol_range.end.column,
-    };
-    let Some(node) = root.descendant_for_point_range(start, end) else {
+    let Some(node) = node_for_symbol_range(root, symbol_range) else {
         return false;
     };
 
@@ -1231,15 +1189,7 @@ pub fn is_js_ts_framework_dsl_callback(root: Node, source: &[u8], symbol_range: 
         "defineNuxtConfig",
     ];
 
-    let start = tree_sitter::Point {
-        row: symbol_range.start.line,
-        column: symbol_range.start.column,
-    };
-    let end = tree_sitter::Point {
-        row: symbol_range.end.line,
-        column: symbol_range.end.column,
-    };
-    let Some(node) = root.descendant_for_point_range(start, end) else {
+    let Some(node) = node_for_symbol_range(root, symbol_range) else {
         return false;
     };
 
@@ -1310,7 +1260,8 @@ const ANGULAR_LIFECYCLE_HOOKS: &[&str] = &[
 const JS_TS_CLASS_DECLARATION_KINDS: &[&str] = &["class_declaration", "abstract_class_declaration"];
 
 /// `symbol_range` を tree-sitter の Point 範囲へ変換し、対応する最小の子孫ノードを返す。
-/// Angular/JS-TS の member 判定群に共通の入口処理。
+/// symbols.rs 全域の symbol 判定 (スコープ/エクスポート/フレームワーク/言語別ヘルパー) が
+/// 共通で使う汎用入口処理。
 fn node_for_symbol_range<'a>(root: Node<'a>, symbol_range: &Range) -> Option<Node<'a>> {
     let start = tree_sitter::Point {
         row: symbol_range.start.line,
@@ -1787,15 +1738,7 @@ pub fn has_framework_entrypoint_decorator_python(
     source: &[u8],
     symbol_range: &Range,
 ) -> bool {
-    let start = tree_sitter::Point {
-        row: symbol_range.start.line,
-        column: symbol_range.start.column,
-    };
-    let end = tree_sitter::Point {
-        row: symbol_range.end.line,
-        column: symbol_range.end.column,
-    };
-    let Some(node) = root.descendant_for_point_range(start, end) else {
+    let Some(node) = node_for_symbol_range(root, symbol_range) else {
         return false;
     };
 
@@ -1912,15 +1855,7 @@ fn decorator_matches_framework_pattern_python(decorator: Node, source: &[u8]) ->
 /// dead-code 判定で同一ファイル内の継承チェーンを fixed-point で解決するための低レベル
 /// helper。クロスファイル継承解析や引数 (`metaclass=...`) の解釈は行わない。
 pub fn python_class_base_names(root: Node, source: &[u8], symbol_range: &Range) -> Vec<String> {
-    let start = tree_sitter::Point {
-        row: symbol_range.start.line,
-        column: symbol_range.start.column,
-    };
-    let end = tree_sitter::Point {
-        row: symbol_range.end.line,
-        column: symbol_range.end.column,
-    };
-    let Some(node) = root.descendant_for_point_range(start, end) else {
+    let Some(node) = node_for_symbol_range(root, symbol_range) else {
         return Vec::new();
     };
 
@@ -1988,15 +1923,7 @@ pub fn is_php_pseudo_enum_method(
     symbol_range: &Range,
     method_name: &str,
 ) -> bool {
-    let start = tree_sitter::Point {
-        row: symbol_range.start.line,
-        column: symbol_range.start.column,
-    };
-    let end = tree_sitter::Point {
-        row: symbol_range.end.line,
-        column: symbol_range.end.column,
-    };
-    let Some(node) = root.descendant_for_point_range(start, end) else {
+    let Some(node) = node_for_symbol_range(root, symbol_range) else {
         return false;
     };
 
@@ -2208,15 +2135,7 @@ pub fn php_doc_has_runtime_annotation(doc: &str) -> bool {
 /// trait impl メソッドは trait dispatch 経由で呼ばれるため、cross-file refs
 /// 検索では caller を追跡できず、dead-code 判定でスキップする必要がある。
 pub(crate) fn is_trait_impl_method_rust(root: Node, symbol_range: &Range) -> bool {
-    let start = tree_sitter::Point {
-        row: symbol_range.start.line,
-        column: symbol_range.start.column,
-    };
-    let end = tree_sitter::Point {
-        row: symbol_range.end.line,
-        column: symbol_range.end.column,
-    };
-    let Some(node) = root.descendant_for_point_range(start, end) else {
+    let Some(node) = node_for_symbol_range(root, symbol_range) else {
         return false;
     };
 
@@ -2239,15 +2158,7 @@ pub(crate) fn is_trait_impl_method_rust(root: Node, symbol_range: &Range) -> boo
 /// declaration_list / field_declaration_list であって compound_statement ではないため
 /// false を返す。GNU C の nested function を見逃す程度の false negative は許容する。
 pub(crate) fn is_cpp_nested_function(root: Node, symbol_range: &Range) -> bool {
-    let start = tree_sitter::Point {
-        row: symbol_range.start.line,
-        column: symbol_range.start.column,
-    };
-    let end = tree_sitter::Point {
-        row: symbol_range.end.line,
-        column: symbol_range.end.column,
-    };
-    let Some(node) = root.descendant_for_point_range(start, end) else {
+    let Some(node) = node_for_symbol_range(root, symbol_range) else {
         return false;
     };
     let mut parent = node.parent();
@@ -2268,15 +2179,7 @@ pub(crate) fn is_cpp_nested_function(root: Node, symbol_range: &Range) -> bool {
 /// API 変更の対象にすべきではない。本体 (field_declaration_list / enumerator_list) を持つ
 /// 定義のみを残すために使う (Issue #11: typedef underlying tag の dead 誤検出対策)。
 pub(crate) fn is_cpp_forward_declaration(root: Node, symbol_range: &Range) -> bool {
-    let start = tree_sitter::Point {
-        row: symbol_range.start.line,
-        column: symbol_range.start.column,
-    };
-    let end = tree_sitter::Point {
-        row: symbol_range.end.line,
-        column: symbol_range.end.column,
-    };
-    let Some(node) = root.descendant_for_point_range(start, end) else {
+    let Some(node) = node_for_symbol_range(root, symbol_range) else {
         return false;
     };
     // symbol_range は specifier (struct_specifier 等) を指すこともあれば、name identifier を
@@ -2888,7 +2791,7 @@ fn run_symbol_query(
             let kind = capture_name_to_kind(capture_name);
 
             if let Some(kind) = kind {
-                let name = node.utf8_text(source).unwrap_or("").to_string();
+                let name = node.utf8_text(source).unwrap_or("");
                 if !name.is_empty() {
                     let mut parent_node = node.parent().unwrap_or(node);
                     // C/C++ は関数名を `function_declarator` 配下でキャプチャするため、
@@ -2938,7 +2841,7 @@ fn run_symbol_query(
                         None
                     };
                     symbols.push(Symbol {
-                        name,
+                        name: name.to_string(),
                         kind,
                         range: Range::from(parent_node.range()),
                         doc,

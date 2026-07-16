@@ -36,13 +36,71 @@ pub struct CmdAstOpts<'a> {
     pub pretty: bool,
 }
 
-pub fn cmd_ast(service: &AppService, opts: &CmdAstOpts<'_>) -> Result<()> {
-    let utf8_path = camino::Utf8Path::new(opts.path);
+/// 単一ファイル系コマンド (ast / symbols) の共通キャッシュ機構。
+/// read_file → content_hash → cache_hash_for_path → use_cache 判定 → get →
+/// ヒット時 raw 書出 → miss 時 produce で serialize → TOCTOU ガード → put の流れを共通化する。
+///
+/// `produce` は cache miss 時のみ呼ばれ、`(改行付き serialize 済み出力, service が実際に解析した
+/// 内容の hash)` を返す。ast と symbols で response の借用期間が違うため serialize は produce 側に
+/// 閉じる。pretty 時は get も put もしない (`use_cache = !no_cache && !pretty`)。cache 初期化・
+/// get・put の失敗は解析失敗に昇格させず黙殺する。
+fn run_cached_file_command<F>(
+    command: &str,
+    path: &str,
+    no_cache: bool,
+    pretty: bool,
+    cache_key: &str,
+    produce: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<(String, Option<String>)>,
+{
+    let utf8_path = camino::Utf8Path::new(path);
     let source = parser::read_file(utf8_path)?;
     let content_hash = CacheStore::hash(&source);
     let hash = cache_hash_for_path(utf8_path, &content_hash);
-    let use_cache = !opts.no_cache && !opts.pretty;
+    let use_cache = !no_cache && !pretty;
 
+    if use_cache
+        && let Ok(cache) = CacheStore::new()
+        && let Some(cached) = cache.get(&hash, cache_key)
+    {
+        info!(
+            command = command,
+            path = path,
+            output_bytes = cached.len(),
+            cached = true,
+            "💾 cache hit"
+        );
+        std::io::Write::write_all(&mut std::io::stdout(), &cached)?;
+        return Ok(());
+    }
+
+    let (output, analyzed_hash) = produce()?;
+
+    info!(
+        command = command,
+        path = path,
+        output_bytes = output.len(),
+        "command completed"
+    );
+
+    // TOCTOU ガード: cache key の hash は最初の read の内容から計算しているが、service は
+    // 同じファイルを再 read して解析する。2 回の read の間に更新が入ると hash(旧内容) →
+    // output(新内容) の組で cache が汚染されるため、service が実際に解析した内容の hash
+    // (analyzed_hash) が最初の read 内容と一致する場合のみ put する。
+    if use_cache
+        && analyzed_hash.as_deref() == Some(content_hash.as_str())
+        && let Ok(cache) = CacheStore::new()
+    {
+        let _ = cache.put(&hash, cache_key, output.as_bytes());
+    }
+
+    print!("{output}");
+    Ok(())
+}
+
+pub fn cmd_ast(service: &AppService, opts: &CmdAstOpts<'_>) -> Result<()> {
     fn opt_key(v: Option<usize>) -> String {
         match v {
             Some(n) => n.to_string(),
@@ -61,59 +119,36 @@ pub fn cmd_ast(service: &AppService, opts: &CmdAstOpts<'_>) -> Result<()> {
         mode
     );
 
-    if use_cache
-        && let Ok(cache) = CacheStore::new()
-        && let Some(cached) = cache.get(&hash, &cache_key)
-    {
-        info!(
-            command = "ast",
-            path = opts.path,
-            output_bytes = cached.len(),
-            cached = true,
-            "💾 cache hit"
-        );
-        std::io::Write::write_all(&mut std::io::stdout(), &cached)?;
-        return Ok(());
-    }
+    run_cached_file_command(
+        "ast",
+        opts.path,
+        opts.no_cache,
+        opts.pretty,
+        &cache_key,
+        || {
+            let params = AstParams {
+                path: opts.path,
+                line: opts.line,
+                col: opts.col,
+                end_line: opts.end_line,
+                end_col: opts.end_col,
+                depth: opts.depth,
+                context_lines: opts.context_lines,
+            };
+            let response = service.extract_ast(&params)?;
 
-    let params = AstParams {
-        path: opts.path,
-        line: opts.line,
-        col: opts.col,
-        end_line: opts.end_line,
-        end_col: opts.end_col,
-        depth: opts.depth,
-        context_lines: opts.context_lines,
-    };
-    let response = service.extract_ast(&params)?;
+            let mut output = if opts.full {
+                serialize_output(&response, opts.pretty)?
+            } else {
+                serialize_output(&response.to_compact_ast(), opts.pretty)?
+            };
+            output.push('\n');
 
-    let mut output = if opts.full {
-        serialize_output(&response, opts.pretty)?
-    } else {
-        serialize_output(&response.to_compact_ast(), opts.pretty)?
-    };
-    output.push('\n');
-
-    info!(
-        command = "ast",
-        path = opts.path,
-        output_bytes = output.len(),
-        "command completed"
-    );
-
-    // TOCTOU ガード: cache key の hash は最初の read の内容から計算しているが、
-    // service は同じファイルを再 read して解析する。2 回の read の間に更新が入ると
-    // hash(旧内容) → output(新内容) の組で cache が汚染されるため、service が実際に
-    // 解析した内容の hash (response.hash) が一致する場合のみ put する。
-    if use_cache
-        && response.hash.as_deref() == Some(content_hash.as_str())
-        && let Ok(cache) = CacheStore::new()
-    {
-        let _ = cache.put(&hash, &cache_key, output.as_bytes());
-    }
-
-    print!("{output}");
-    Ok(())
+            // response の借用期間が symbols と異なるため、解析済み hash はここで clone して返す。
+            let analyzed_hash = response.hash.clone();
+            Ok((output, analyzed_hash))
+        },
+    )
 }
 
 pub fn cmd_symbols_dir(
@@ -142,12 +177,6 @@ pub fn cmd_symbols(
     full: bool,
     query: Option<&str>,
 ) -> Result<()> {
-    let utf8_path = camino::Utf8Path::new(path);
-    let source = parser::read_file(utf8_path)?;
-    let content_hash = CacheStore::hash(&source);
-    let hash = cache_hash_for_path(utf8_path, &content_hash);
-    let use_cache = !no_cache && !pretty;
-
     // v3_: Symbol に enclosing container フィールド追加 (compact では `cn` キー)
     // custom query は結果集合が変わるため query hash を key へ混ぜる
     // (default query の cache key は従来のまま不変)。
@@ -162,52 +191,21 @@ pub fn cmd_symbols(
         Some(q) => format!("{base_key}_q{}", &CacheStore::hash(q.as_bytes())[..16]),
         None => base_key.to_string(),
     };
-    let cache_key = cache_key.as_str();
 
-    if use_cache
-        && let Ok(cache) = CacheStore::new()
-        && let Some(cached) = cache.get(&hash, cache_key)
-    {
-        info!(
-            command = "symbols",
-            path = path,
-            output_bytes = cached.len(),
-            cached = true,
-            "💾 cache hit"
-        );
-        std::io::Write::write_all(&mut std::io::stdout(), &cached)?;
-        return Ok(());
-    }
+    run_cached_file_command("symbols", path, no_cache, pretty, &cache_key, || {
+        let response = service.extract_symbols_with_query(path, query)?;
+        let analyzed_hash = response.hash.clone();
 
-    let response = service.extract_symbols_with_query(path, query)?;
-    let analyzed_hash = response.hash.clone();
+        let mut output = if full {
+            serialize_output(&response, pretty)?
+        } else {
+            let compact = response.to_compact_symbols(doc);
+            serialize_output(&compact, pretty)?
+        };
+        output.push('\n');
 
-    let mut output = if full {
-        serialize_output(&response, pretty)?
-    } else {
-        let compact = response.to_compact_symbols(doc);
-        serialize_output(&compact, pretty)?
-    };
-    output.push('\n');
-
-    info!(
-        command = "symbols",
-        path = path,
-        output_bytes = output.len(),
-        "command completed"
-    );
-
-    // TOCTOU ガード: cmd_ast と同様、service が実際に解析した内容の hash が
-    // cache key の元になった read 内容と一致する場合のみ put する。
-    if use_cache
-        && analyzed_hash.as_deref() == Some(content_hash.as_str())
-        && let Ok(cache) = CacheStore::new()
-    {
-        let _ = cache.put(&hash, cache_key, output.as_bytes());
-    }
-
-    print!("{output}");
-    Ok(())
+        Ok((output, analyzed_hash))
+    })
 }
 
 pub fn cmd_calls(
