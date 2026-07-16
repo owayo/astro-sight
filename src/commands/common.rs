@@ -193,3 +193,72 @@ pub(crate) fn cache_hash_for_path(path: &camino::Utf8Path, content_hash: &str) -
     let version = env!("CARGO_PKG_VERSION");
     CacheStore::hash(format!("{version}\0{path_key}\0{content_hash}").as_bytes())
 }
+
+/// diff に含まれる変更ファイル集合。caller のパスが変更ファイルに含まれるか
+/// (= 影響が diff 内で解決済みか) を canonicalize ベースで判定する。
+///
+/// canonicalize が成功したパスは `canonical` 集合、失敗したパスは文字列 fallback として
+/// `abs_strs` 集合に持つ。判定時も **canonicalize 成功なら canonical 集合だけ / 失敗なら
+/// 文字列集合だけ** を見る (両集合の OR を取ると挙動が変わるため、この分岐を維持する)。
+pub(crate) struct ChangedFileSet {
+    canonical: std::collections::HashSet<std::path::PathBuf>,
+    abs_strs: std::collections::HashSet<String>,
+}
+
+impl ChangedFileSet {
+    /// 変更ファイルの (相対または絶対) パス列から集合を構築する。相対パスは `dir` 基準で
+    /// 絶対化する。事前に `HashSet<&str>` で重複を除いてから canonicalize することで
+    /// syscall 回数を抑える (O(M) syscall)。
+    pub(crate) fn build<'a, I>(dir: &str, paths: I) -> Self
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let changed_paths: std::collections::HashSet<&str> = paths.into_iter().collect();
+        let canonical: std::collections::HashSet<std::path::PathBuf> = changed_paths
+            .iter()
+            .filter_map(|cp| {
+                let abs = if std::path::Path::new(cp).is_relative() {
+                    std::path::Path::new(dir).join(cp)
+                } else {
+                    std::path::PathBuf::from(cp)
+                };
+                std::fs::canonicalize(&abs).ok()
+            })
+            .collect();
+        // canonicalize 失敗時のフォールバック用に文字列セットも保持する。
+        let abs_strs: std::collections::HashSet<String> = changed_paths
+            .iter()
+            .map(|cp| {
+                if std::path::Path::new(cp).is_relative() {
+                    std::path::Path::new(dir)
+                        .join(cp)
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    cp.to_string()
+                }
+            })
+            .collect();
+        Self {
+            canonical,
+            abs_strs,
+        }
+    }
+
+    /// `caller_path` が変更ファイル集合に含まれるかを判定する。相対パスは `dir` 基準で
+    /// 絶対化し、canonicalize 成功時は canonical 集合だけ、失敗時は文字列集合だけを参照する。
+    pub(crate) fn contains_caller(&self, dir: &str, caller_path: &str) -> bool {
+        let caller_abs = if std::path::Path::new(caller_path).is_relative() {
+            std::path::Path::new(dir)
+                .join(caller_path)
+                .to_string_lossy()
+                .to_string()
+        } else {
+            caller_path.to_string()
+        };
+        match std::fs::canonicalize(&caller_abs) {
+            Ok(canon) => self.canonical.contains(&canon),
+            Err(_) => self.abs_strs.contains(&caller_abs),
+        }
+    }
+}

@@ -14,10 +14,11 @@ mod common;
 
 #[cfg(test)]
 pub(crate) use common::read_bytes_limited_and_drain;
-pub use common::{MAX_INPUT_SIZE, classify_error, read_paths_file_limited, serialize_output};
 pub(crate) use common::{
-    cache_hash_for_path, log_phase, read_file_to_string_limited, read_to_string_limited,
+    ChangedFileSet, cache_hash_for_path, log_phase, read_file_to_string_limited,
+    read_to_string_limited,
 };
+pub use common::{MAX_INPUT_SIZE, classify_error, read_paths_file_limited, serialize_output};
 
 // ---------------------------------------------------------------------------
 // 単一ファイル系コマンド（キャッシュ・pretty 対応）
