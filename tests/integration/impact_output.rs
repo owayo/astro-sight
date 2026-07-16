@@ -39,6 +39,17 @@ fn context_docblock_class_mention_does_not_propagate_class_refs() {
         .iter()
         .find(|c| c["path"].as_str() == Some("SipUserId.php"))
         .expect("SipUserId.php の change が検出されるべき");
+    // SipUserId クラス自体が affected_symbols に居ることを確認する (ゲート未到達で
+    // negative アサートが素通りするのを防ぐ、codex 指摘)。
+    let sip_class_affected = sip_change["affected_symbols"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|s| s["name"].as_str() == Some("SipUserId") && s["kind"].as_str() == Some("class"));
+    assert!(
+        sip_class_affected,
+        "SipUserId クラスが affected_symbols に含まれるべき (ゲート到達確認): {json}"
+    );
     let has_to_eloquent_sig = sip_change["signature_changes"]
         .as_array()
         .into_iter()
