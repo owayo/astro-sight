@@ -79,9 +79,6 @@ fn dead_code_diff_hidden_candidate_member_liveness_sees_hidden_refs_ts() {
     );
 }
 
-/// decorator とメソッド定義の間にコメント行が挟まると decorator 蓄積がクリアされ、
-/// `@HostListener` 付きメソッドが dead 誤検出されていた回帰テスト
-/// (comment ノードは蓄積を維持したまま読み飛ばす)。
 /// GitLab #36: 外部パッケージの抽象クラスを継承した `public override` メソッドは
 /// framework (基底クラス側) が動的 dispatch するため、リポジトリ内に静的 caller が
 /// 無くても dead ではない。tree-sitter-typescript の override キーワード (kind =
@@ -123,6 +120,9 @@ export const logger = new Logger({ logFormatter: new MyFormatter() });
     );
 }
 
+/// decorator とメソッド定義の間にコメント行が挟まると decorator 蓄積がクリアされ、
+/// `@HostListener` 付きメソッドが dead 誤検出されていた回帰テスト
+/// (comment ノードは蓄積を維持したまま読み飛ばす)。
 #[test]
 fn dead_code_angular_decorator_with_comment_between_is_excluded() {
     let repo = TestRepo::new();

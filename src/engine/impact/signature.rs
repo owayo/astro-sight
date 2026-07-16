@@ -149,12 +149,33 @@ pub(crate) fn is_signature_line(line: &str) -> bool {
     false
 }
 
+/// 変更行の内容がコメント由来かをヒューリスティックに判定する (定義ヘッダ照合のスキップ用)。
+///
+/// 行コメント (`//`) / ブロックコメント開始 (`/*`) / docblock 継続 (`*`) / `#` 行コメント
+/// (Python / Ruby / PHP) で始まる行は、`class Foo` 等のテキストを含んでいても型定義ヘッダ
+/// ではない。ただし `#[` は PHP 8 attribute / Rust attribute の実コード行
+/// (`#[Attr] class Foo {}` の単一行形) であり得るためコメント扱いしない。
+/// 実際の型定義行がこれらの prefix で始まることはないため、スキップによる false negative
+/// (ヘッダ変更の見逃し) は実質発生しない。
+fn is_comment_like_content_line(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || (trimmed.starts_with('#') && !trimmed.starts_with("#["))
+}
+
 /// 型シンボルの定義ヘッダが変更行(+/-)に出現するか確認する。
 ///
 /// trait/struct/class/interface/enum シンボルについて、宣言キーワードに続くシンボル名
 /// （例: `trait GuestMemory`, `struct Foo`）が変更行に存在するかを検査する。
 /// シンボル名が他のシンボルのシグネチャ（例: `fn read_obj(m: &impl GuestMemory)`）
 /// にのみ出現する場合の偽陽性を防止する。
+///
+/// コメント行 (docblock の `* class SipUserId` 等) はヘッダ照合の対象から除外する。
+/// 除外しないと「メソッドの型注釈のみ変更 + クラス docblock のコメント修正」の diff で
+/// クラスが「ヘッダ変更あり」と誤判定され、`new SipUserId(...)` のようなクラス参照全件が
+/// impacted_callers に過剰列挙される (GitLab #35)。
 pub(crate) fn is_definition_header_in_changed_lines(
     diff_input: &str,
     file_path: &str,
@@ -182,7 +203,9 @@ pub(crate) fn is_definition_header_in_changed_lines(
                     HunkBodyLine::Added(c) | HunkBodyLine::Removed(c) => Some(c),
                     HunkBodyLine::Context | HunkBodyLine::Metadata => None,
                 };
-                if let Some(content) = content {
+                if let Some(content) = content
+                    && !is_comment_like_content_line(content)
+                {
                     for kw in keywords {
                         let pattern = format!("{kw} {symbol_name}");
                         if text_contains(content, &pattern, lang_id) {
