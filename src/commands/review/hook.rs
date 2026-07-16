@@ -252,36 +252,7 @@ pub(crate) fn build_review_hook_json(
     }
 
     // 未解決 impact を収集
-    let changed_paths: std::collections::HashSet<&str> = result
-        .impact
-        .changes
-        .iter()
-        .map(|c| c.path.as_str())
-        .collect();
-    let changed_canonical: std::collections::HashSet<std::path::PathBuf> = changed_paths
-        .iter()
-        .filter_map(|cp| {
-            let abs = if std::path::Path::new(cp).is_relative() {
-                std::path::Path::new(dir).join(cp)
-            } else {
-                std::path::PathBuf::from(cp)
-            };
-            std::fs::canonicalize(&abs).ok()
-        })
-        .collect();
-    let changed_abs_strs: std::collections::HashSet<String> = changed_paths
-        .iter()
-        .map(|cp| {
-            if std::path::Path::new(cp).is_relative() {
-                std::path::Path::new(dir)
-                    .join(cp)
-                    .to_string_lossy()
-                    .to_string()
-            } else {
-                cp.to_string()
-            }
-        })
-        .collect();
+    let changed = ChangedFileSet::build(dir, result.impact.changes.iter().map(|c| c.path.as_str()));
 
     let mut unresolved: std::collections::BTreeMap<String, HookImpactGroup> =
         std::collections::BTreeMap::new();
@@ -307,85 +278,32 @@ pub(crate) fn build_review_hook_json(
             .iter()
             .map(|s| (s.name.as_str(), s.change_type.as_str()))
             .collect();
-        for caller in &change.impacted_callers {
-            let caller_abs = if std::path::Path::new(&caller.path).is_relative() {
-                std::path::Path::new(dir)
-                    .join(&caller.path)
-                    .to_string_lossy()
-                    .to_string()
-            } else {
-                caller.path.clone()
-            };
-            let in_diff = match std::fs::canonicalize(&caller_abs) {
-                Ok(canon) => changed_canonical.contains(&canon),
-                Err(_) => changed_abs_strs.contains(&caller_abs),
-            };
-            if !in_diff {
-                // breaking causal シンボル (modified / removed) だけを残す。
-                // `added` 由来は hook blocking から除外する。
-                let causal_syms: Vec<String> = caller
-                    .symbols
-                    .iter()
-                    .filter(|sym| {
-                        matches!(
-                            affected_change_types.get(sym.as_str()).copied(),
-                            Some(ct) if ct != "added"
-                                && !informational_modified_api_symbols
-                                    .contains(&(change.path.as_str(), sym.as_str()))
-                        )
-                    })
-                    .cloned()
-                    .collect();
-                if causal_syms.is_empty() {
-                    // 全 caller.symbols が added 由来 (または affected 外) → blocking しない
-                    continue;
-                }
-                let entry = unresolved.entry(change.path.clone()).or_default();
-                for sym in &causal_syms {
-                    entry.changed_symbols.insert(sym.clone());
-                }
-                entry
-                    .refs
-                    .push((caller.path.clone(), caller.line, causal_syms));
-            }
-        }
-        for caller in &change.informational_callers {
-            let caller_abs = if std::path::Path::new(&caller.path).is_relative() {
-                std::path::Path::new(dir)
-                    .join(&caller.path)
-                    .to_string_lossy()
-                    .to_string()
-            } else {
-                caller.path.clone()
-            };
-            let in_diff = match std::fs::canonicalize(&caller_abs) {
-                Ok(canon) => changed_canonical.contains(&canon),
-                Err(_) => changed_abs_strs.contains(&caller_abs),
-            };
-            if !in_diff {
-                let causal_syms: Vec<String> = caller
-                    .symbols
-                    .iter()
-                    .filter(|sym| {
-                        matches!(
-                            affected_change_types.get(sym.as_str()).copied(),
-                            Some("modified")
-                        )
-                    })
-                    .cloned()
-                    .collect();
-                if causal_syms.is_empty() {
-                    continue;
-                }
-                let entry = informational.entry(change.path.clone()).or_default();
-                for sym in &causal_syms {
-                    entry.changed_symbols.insert(sym.clone());
-                }
-                entry
-                    .refs
-                    .push((caller.path.clone(), caller.line, causal_syms));
-            }
-        }
+        // impacted: breaking causal シンボル (modified / removed) だけを残す。
+        // `added` 由来と informational 扱いの modified api シンボルは hook blocking から除外する。
+        accumulate_hook_impacts(
+            &mut unresolved,
+            &change.path,
+            &change.impacted_callers,
+            &changed,
+            dir,
+            |sym| {
+                matches!(
+                    affected_change_types.get(sym).copied(),
+                    Some(ct) if ct != "added"
+                        && !informational_modified_api_symbols
+                            .contains(&(change.path.as_str(), sym))
+                )
+            },
+        );
+        // informational: modified 由来のみを低信号として残す。
+        accumulate_hook_impacts(
+            &mut informational,
+            &change.path,
+            &change.informational_callers,
+            &changed,
+            dir,
+            |sym| matches!(affected_change_types.get(sym).copied(), Some("modified")),
+        );
     }
 
     // 空セクションは省略した compact JSON を構築
