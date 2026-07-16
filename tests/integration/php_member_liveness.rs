@@ -76,6 +76,31 @@ fn dead_code_php_trait_self_call_keeps_override_live() {
     );
 }
 
+/// GitLab #34 の object creation 経路: trait 本体内の `new self()` も合成先ホストの
+/// 文脈で解決されるため、`__construct` duplicate set の owner 確定票にせず Ambiguous に
+/// 倒す (scoped call と同じ理由。codex レビュー指摘の直接保護テスト)。
+#[test]
+fn dead_code_php_trait_new_self_keeps_constructor_override_live() {
+    let repo = TestRepo::new();
+
+    repo.write(
+        "BaseTraitC.php",
+        "<?php\ntrait BaseTraitC {\n    public function __construct() {}\n    public static function make(): object {\n        return new self();\n    }\n}\n",
+    );
+    repo.write(
+        "ChildTraitC.php",
+        "<?php\ntrait ChildTraitC {\n    use BaseTraitC;\n    public function __construct() {}\n}\n",
+    );
+    repo.write("HostC.php", "<?php\nclass HostC { use ChildTraitC; }\n");
+    repo.write("mainC.php", "<?php\nHostC::make();\n");
+
+    let names = dead_names(&repo);
+    assert!(
+        !contains(&names, "ChildTraitC.__construct") && !contains(&names, "BaseTraitC.__construct"),
+        "trait 内 new self() は合成先ホスト依存なので constructor override を dead 判定しないべき: {names:?}"
+    );
+}
+
 /// class 本体内の `self::helper()` は宣言クラスへ静的束縛されるため、従来どおり
 /// enclosing class への確定票として解決し、無関係な同名メソッドの dead 検出精度を
 /// 維持する (GitLab #34 修正が class の self:: を巻き込まない回帰担保)。
