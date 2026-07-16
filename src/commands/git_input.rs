@@ -3,7 +3,10 @@ use anyhow::{Result, anyhow, bail};
 use crate::error::{AstroError, ErrorCode};
 use crate::models::skip::SkipInfo;
 
-use super::common::{MAX_INPUT_SIZE, read_bytes_limited_and_drain, read_paths_file_limited};
+use super::common::{
+    MAX_INPUT_SIZE, read_bytes_limited_and_drain, read_file_to_string_limited,
+    read_paths_file_limited,
+};
 
 /// `resolve_blame_source_files` の結果。起点ファイルが解決できたか、
 /// git 管理外 (かつ明示 `--paths` / `--paths-file` 無し) で skip かを型で表す。
@@ -182,6 +185,42 @@ pub(crate) fn resolve_git_diff(dir: &str, base: &str, staged: bool) -> Result<Gi
     }
 
     run_git_diff(dir, base, staged).map(GitDiffInput::Diff)
+}
+
+/// 経路A (context / impact / review / dead-code) の diff 入力ソースを **解決のみ** 行う。
+/// 優先順は inline (`--diff`) → `--diff-file` → `--git`。どれも指定されなければ `NotRequested`
+/// を返し、stdin 読み取り / 全体走査への振り分けは各 handler の責務として残す
+/// (context/review=stdin、impact=該当なし、dead-code=全体走査)。
+/// `--diff-file` は 100MB 上限 (`read_file_to_string_limited`) 付きで読む。
+pub(crate) enum DiffSourceResolution {
+    Diff(String),
+    Skipped(SkipInfo),
+    NotRequested,
+}
+
+pub(crate) fn resolve_diff_source(
+    dir: &str,
+    inline: Option<&str>,
+    file: Option<&str>,
+    git: bool,
+    base: &str,
+    staged: bool,
+) -> Result<DiffSourceResolution> {
+    if let Some(d) = inline {
+        Ok(DiffSourceResolution::Diff(d.to_string()))
+    } else if let Some(df) = file {
+        Ok(DiffSourceResolution::Diff(read_file_to_string_limited(
+            df,
+            MAX_INPUT_SIZE,
+        )?))
+    } else if git {
+        match resolve_git_diff(dir, base, staged)? {
+            GitDiffInput::Diff(s) => Ok(DiffSourceResolution::Diff(s)),
+            GitDiffInput::Skipped(skip) => Ok(DiffSourceResolution::Skipped(skip)),
+        }
+    } else {
+        Ok(DiffSourceResolution::NotRequested)
+    }
 }
 
 pub fn run_git_diff(dir: &str, base: &str, staged: bool) -> Result<String> {

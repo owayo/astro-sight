@@ -442,78 +442,7 @@ fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Re
                 include_wip_dead,
             )
         }
-        Commands::Cochange {
-            dir,
-            git,
-            base,
-            paths,
-            paths_file,
-            min_confidence,
-            min_samples,
-            max_files_per_commit,
-            commit_size_pivot,
-            exclude_globs,
-            max_source_files,
-            rename,
-            copy,
-            ignore_merges,
-            include_merges,
-            max_blame_commits,
-            timeout_secs,
-            no_smoothing,
-            smoothing_alpha,
-            smoothing_beta,
-            min_denominator,
-            per_source_limit,
-            author_unit_window_days,
-        } => {
-            let (source_files, cochange_skip) =
-                match astro_sight::commands::resolve_blame_source_files(
-                    &dir,
-                    git,
-                    base.as_deref(),
-                    paths.as_deref(),
-                    paths_file.as_deref(),
-                    &exclude_globs,
-                )? {
-                    astro_sight::commands::BlameSourceResolution::Files(f) => (f, None),
-                    astro_sight::commands::BlameSourceResolution::Skipped(s) => {
-                        (Vec::new(), Some(s))
-                    }
-                };
-            // 既定 true。`--include-merges` で旧挙動 (false) に戻す。
-            // `--ignore-merges` は no-op として残しているが互換のため明示 ON も尊重する。
-            let defaults = astro_sight::models::cochange::CoChangeOptions::default();
-            let resolved_ignore_merges = if include_merges {
-                false
-            } else if ignore_merges {
-                true
-            } else {
-                defaults.ignore_merges
-            };
-            let opts = astro_sight::models::cochange::CoChangeOptions {
-                source_files,
-                base,
-                min_confidence,
-                min_samples,
-                max_files_per_commit,
-                commit_size_pivot,
-                exclude_globs,
-                max_source_files,
-                rename,
-                copy,
-                ignore_merges: resolved_ignore_merges,
-                max_blame_commits,
-                timeout_secs,
-                smoothing_alpha,
-                smoothing_beta,
-                disable_smoothing: no_smoothing,
-                min_denominator,
-                per_source_limit,
-                author_unit_window_days,
-            };
-            cmd_cochange(service, &dir, &opts, pretty, cochange_skip)
-        }
+        cmd @ Commands::Cochange { .. } => dispatch_cochange(service, cmd, pretty),
         Commands::Context {
             dir,
             diff,
@@ -590,4 +519,78 @@ fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Re
         Commands::Mcp => cmd_mcp(),
         Commands::Init { .. } | Commands::SkillInstall { .. } => unreachable!("handled above"),
     }
+}
+
+/// `cochange` サブコマンドの処理。`BlameSourceResolution` の解決、`ignore_merges` の等価簡約、
+/// 21 フィールドの `CoChangeOptions` 構築を担う。`dispatch_command` の 1 arm が肥大化するのを
+/// 避けるため variant ごと受け取り内部で destructure する。
+fn dispatch_cochange(service: &AppService, command: Commands, pretty: bool) -> Result<()> {
+    let Commands::Cochange {
+        dir,
+        git,
+        base,
+        paths,
+        paths_file,
+        min_confidence,
+        min_samples,
+        max_files_per_commit,
+        commit_size_pivot,
+        exclude_globs,
+        max_source_files,
+        rename,
+        copy,
+        // `--ignore-merges` は `--include-merges` と conflicts_with で排他、かつ
+        // `CoChangeOptions::default().ignore_merges == true` のため、下の `resolved_ignore_merges`
+        // は `!include_merges` に等価簡約できる。フラグ値自体は使わない。
+        ignore_merges: _,
+        include_merges,
+        max_blame_commits,
+        timeout_secs,
+        no_smoothing,
+        smoothing_alpha,
+        smoothing_beta,
+        min_denominator,
+        per_source_limit,
+        author_unit_window_days,
+    } = command
+    else {
+        unreachable!("dispatch_cochange must be called with Commands::Cochange");
+    };
+
+    let (source_files, cochange_skip) = match astro_sight::commands::resolve_blame_source_files(
+        &dir,
+        git,
+        base.as_deref(),
+        paths.as_deref(),
+        paths_file.as_deref(),
+        &exclude_globs,
+    )? {
+        astro_sight::commands::BlameSourceResolution::Files(f) => (f, None),
+        astro_sight::commands::BlameSourceResolution::Skipped(s) => (Vec::new(), Some(s)),
+    };
+    // 既定 true。`--include-merges` で旧挙動 (false) に戻す。`--ignore-merges` は既定値と同値の
+    // no-op かつ `--include-merges` と排他なので、resolved 値は `!include_merges` で表現できる。
+    let resolved_ignore_merges = !include_merges;
+    let opts = astro_sight::models::cochange::CoChangeOptions {
+        source_files,
+        base,
+        min_confidence,
+        min_samples,
+        max_files_per_commit,
+        commit_size_pivot,
+        exclude_globs,
+        max_source_files,
+        rename,
+        copy,
+        ignore_merges: resolved_ignore_merges,
+        max_blame_commits,
+        timeout_secs,
+        smoothing_alpha,
+        smoothing_beta,
+        disable_smoothing: no_smoothing,
+        min_denominator,
+        per_source_limit,
+        author_unit_window_days,
+    };
+    cmd_cochange(service, &dir, &opts, pretty, cochange_skip)
 }

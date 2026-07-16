@@ -13041,3 +13041,148 @@ fn member_access_ref_detects_object_destructuring() {
         "パラメータ destructuring も member 参照として検出されるべき"
     );
 }
+
+/// `cochange` の `--ignore-merges` / `--include-merges` の CLI パーサ挙動と、
+/// dispatch 側の `resolved_ignore_merges = !include_merges` への等価簡約を固定する。
+/// (main.rs `dispatch_cochange` はバイナリクレート側でテストから直接呼べないため、
+/// パーサ結果と旧 3 分岐ロジックの一致で等価性を担保する)
+mod cochange_ignore_merges {
+    use crate::cli::{Cli, Commands};
+    use crate::models::cochange::CoChangeOptions;
+    use clap::Parser;
+
+    /// パース結果から `(ignore_merges, include_merges)` を取り出す。
+    fn parse_flags(args: &[&str]) -> (bool, bool) {
+        let cli = Cli::try_parse_from(args).expect("cochange args should parse");
+        match cli.command {
+            Commands::Cochange {
+                ignore_merges,
+                include_merges,
+                ..
+            } => (ignore_merges, include_merges),
+            other => panic!("expected Cochange, got {other:?}"),
+        }
+    }
+
+    /// 旧 3 分岐ロジック (等価性判定の基準)。
+    fn legacy_resolved(ignore_merges: bool, include_merges: bool) -> bool {
+        let defaults = CoChangeOptions::default();
+        if include_merges {
+            false
+        } else if ignore_merges {
+            true
+        } else {
+            defaults.ignore_merges
+        }
+    }
+
+    #[test]
+    fn default_resolves_ignore_merges_true() {
+        let (ignore_merges, include_merges) = parse_flags(&["astro-sight", "cochange"]);
+        assert!(!ignore_merges);
+        assert!(!include_merges);
+        let resolved = !include_merges;
+        assert_eq!(resolved, legacy_resolved(ignore_merges, include_merges));
+        assert!(resolved, "既定は merge 除外 (ignore_merges=true)");
+    }
+
+    #[test]
+    fn ignore_merges_flag_resolves_true() {
+        let (ignore_merges, include_merges) =
+            parse_flags(&["astro-sight", "cochange", "--ignore-merges"]);
+        assert!(ignore_merges);
+        assert!(!include_merges);
+        let resolved = !include_merges;
+        assert_eq!(resolved, legacy_resolved(ignore_merges, include_merges));
+        assert!(resolved);
+    }
+
+    #[test]
+    fn include_merges_flag_resolves_false() {
+        let (ignore_merges, include_merges) =
+            parse_flags(&["astro-sight", "cochange", "--include-merges"]);
+        assert!(!ignore_merges);
+        assert!(include_merges);
+        let resolved = !include_merges;
+        assert_eq!(resolved, legacy_resolved(ignore_merges, include_merges));
+        assert!(
+            !resolved,
+            "include-merges 指定で merge を含める (ignore_merges=false)"
+        );
+    }
+
+    #[test]
+    fn both_flags_conflict_is_parse_error() {
+        let result = Cli::try_parse_from([
+            "astro-sight",
+            "cochange",
+            "--ignore-merges",
+            "--include-merges",
+        ]);
+        assert!(
+            result.is_err(),
+            "conflicts_with により両フラグ同時指定は parse エラー"
+        );
+    }
+}
+
+/// `ChangedFileSet` の caller 照合を、相対/絶対パス・canonicalize 失敗の各ケースで固定する。
+/// canonicalize 成功時は canonical 集合、失敗時は文字列 fallback 集合だけを見る分岐を検証する。
+mod changed_file_set {
+    use crate::commands::ChangedFileSet;
+    use std::fs;
+
+    #[test]
+    fn relative_path_matches_via_canonical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_str = dir.path().to_str().expect("utf-8 path");
+        fs::write(dir.path().join("a.rs"), "fn a() {}\n").expect("write a");
+        fs::write(dir.path().join("b.rs"), "fn b() {}\n").expect("write b");
+
+        // 相対パスで構築 (dir 基準で絶対化 + canonicalize されて canonical 集合に入る)。
+        let set = ChangedFileSet::build(dir_str, ["a.rs"]);
+        assert!(
+            set.contains_caller(dir_str, "a.rs"),
+            "同一相対 caller は一致"
+        );
+        assert!(
+            !set.contains_caller(dir_str, "b.rs"),
+            "集合に無い既存ファイルは不一致"
+        );
+    }
+
+    #[test]
+    fn absolute_path_matches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_str = dir.path().to_str().expect("utf-8 path");
+        let abs = dir.path().join("a.rs");
+        fs::write(&abs, "fn a() {}\n").expect("write a");
+        let abs_str = abs.to_str().expect("utf-8 path");
+
+        // 絶対パスで構築。絶対 caller も、同一ファイルに解決される相対 caller も
+        // canonical 集合経由で一致する。
+        let set = ChangedFileSet::build(dir_str, [abs_str]);
+        assert!(set.contains_caller(dir_str, abs_str), "絶対 caller は一致");
+        assert!(
+            set.contains_caller(dir_str, "a.rs"),
+            "同一ファイルに解決される相対 caller も canonical 経由で一致"
+        );
+    }
+
+    #[test]
+    fn nonexistent_path_falls_back_to_string_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_str = dir.path().to_str().expect("utf-8 path");
+
+        // canonicalize 失敗 (存在しないファイル) は文字列 fallback 集合で照合する。
+        let set = ChangedFileSet::build(dir_str, ["ghost.rs"]);
+        assert!(
+            set.contains_caller(dir_str, "ghost.rs"),
+            "存在しないファイルは文字列 fallback で一致"
+        );
+        assert!(
+            !set.contains_caller(dir_str, "other_ghost.rs"),
+            "別の存在しないファイルは不一致"
+        );
+    }
+}

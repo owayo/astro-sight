@@ -12,9 +12,9 @@ use super::api_changes::extract_exported_symbols_from_file_inner;
 use super::api_changes::{
     bare_name, extract_exported_symbols_from_file_inner_with_lang, extract_symbol_lines,
 };
-use super::common::{MAX_INPUT_SIZE, read_file_to_string_limited, serialize_output};
+use super::common::serialize_output;
 use super::dead_code_member_liveness::{JsTsMemberLiveness, MemberStatus, PhpMemberLiveness};
-use super::git_input::{GitDiffInput, resolve_git_diff};
+use super::git_input::{DiffSourceResolution, resolve_diff_source};
 
 /// dead-code 検出本体。候補収集 → 名前インデックス構築 → 参照カウント →
 /// アセット参照収集 → 分類の段階パイプラインで (dead_symbols, test_only_symbols) を返す。
@@ -1205,54 +1205,44 @@ pub fn cmd_dead_code(
         combined_globs.push(pat.as_str());
     }
 
-    // diff 指定があれば diff 関連ファイルのみ、なければプロジェクト全体
-    let has_diff = diff.is_some() || diff_file.is_some() || git;
+    // diff 指定があれば diff 関連ファイルのみ、なければプロジェクト全体。
     // diff_input / diff_files は touched-symbols filter でも使うため、ここで一度だけ
     // 取得・parse して再利用する (旧実装は run_git_diff + parse_unified_diff を 2 回呼んでおり、
     // --staged 実行中の git add で 2 つの diff が乖離する競合状態があった)。
+    // NotRequested (diff/diff_file/git いずれも未指定) は全体走査に振り分ける。
     let (diff_input, diff_files): (Option<String>, Option<Vec<crate::models::impact::DiffFile>>) =
-        if has_diff {
-            let input = if let Some(d) = diff {
-                d.to_string()
-            } else if let Some(df) = diff_file {
-                read_file_to_string_limited(df, MAX_INPUT_SIZE)?
-            } else {
-                // git 経路 (diff/diff_file なし + has_diff): 管理外なら
-                // 空の dead_symbols + skipped で exit 0。
-                match resolve_git_diff(dir, base, staged)? {
-                    GitDiffInput::Diff(s) => s,
-                    GitDiffInput::Skipped(skip) => {
-                        let result = DeadCodeResult {
-                            dir: canonical_dir.to_string_lossy().to_string(),
-                            scanned_files: 0,
-                            dead_symbols: Vec::new(),
-                            test_only_symbols: Vec::new(),
-                            skipped: Some(skip),
-                        };
-                        let output = serialize_output(&result, pretty)?;
-                        println!("{output}");
-                        return Ok(());
-                    }
+        match resolve_diff_source(dir, diff, diff_file, git, base, staged)? {
+            DiffSourceResolution::Diff(input) => {
+                if input.trim().is_empty() {
+                    let result = DeadCodeResult {
+                        dir: canonical_dir.to_string_lossy().to_string(),
+                        scanned_files: 0,
+                        dead_symbols: Vec::new(),
+                        test_only_symbols: Vec::new(),
+                        skipped: None,
+                    };
+                    let output = serialize_output(&result, pretty)?;
+                    println!("{output}");
+                    return Ok(());
                 }
-            };
 
-            if input.trim().is_empty() {
+                let parsed = crate::engine::diff::parse_unified_diff(&input);
+                (Some(input), Some(parsed))
+            }
+            DiffSourceResolution::Skipped(skip) => {
+                // git 管理外: 空の dead_symbols + skipped で exit 0。
                 let result = DeadCodeResult {
                     dir: canonical_dir.to_string_lossy().to_string(),
                     scanned_files: 0,
                     dead_symbols: Vec::new(),
                     test_only_symbols: Vec::new(),
-                    skipped: None,
+                    skipped: Some(skip),
                 };
                 let output = serialize_output(&result, pretty)?;
                 println!("{output}");
                 return Ok(());
             }
-
-            let parsed = crate::engine::diff::parse_unified_diff(&input);
-            (Some(input), Some(parsed))
-        } else {
-            (None, None)
+            DiffSourceResolution::NotRequested => (None, None),
         };
 
     let files: Vec<std::path::PathBuf> = if let Some(diff_files) = diff_files.as_ref() {

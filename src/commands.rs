@@ -14,10 +14,7 @@ mod common;
 
 #[cfg(test)]
 pub(crate) use common::read_bytes_limited_and_drain;
-pub(crate) use common::{
-    ChangedFileSet, cache_hash_for_path, log_phase, read_file_to_string_limited,
-    read_to_string_limited,
-};
+pub(crate) use common::{ChangedFileSet, cache_hash_for_path, log_phase, read_to_string_limited};
 pub use common::{MAX_INPUT_SIZE, classify_error, read_paths_file_limited, serialize_output};
 
 // ---------------------------------------------------------------------------
@@ -356,9 +353,13 @@ pub fn cmd_cochange(
 mod git_input;
 
 pub use git_input::{BlameSourceResolution, resolve_blame_source_files, run_git_diff};
-pub(crate) use git_input::{GitDiffInput, resolve_git_diff};
+pub(crate) use git_input::{DiffSourceResolution, resolve_diff_source};
+// GitDiffInput / resolve_git_diff は Task 4 で resolve_diff_source に内包され、
+// 非テストコードからの直接参照は無くなった。tests.rs のみが `super::*` 経由で使う。
 #[cfg(test)]
-pub(crate) use git_input::{is_git_work_tree, validate_git_revision};
+pub(crate) use git_input::{
+    GitDiffInput, is_git_work_tree, resolve_git_diff, validate_git_revision,
+};
 
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_context(
@@ -373,26 +374,21 @@ pub fn cmd_context(
     exclude_dirs: &[String],
     exclude_globs: &[String],
 ) -> Result<()> {
-    let diff_input = if let Some(d) = diff {
-        d.to_string()
-    } else if let Some(df) = diff_file {
-        read_file_to_string_limited(df, MAX_INPUT_SIZE)?
-    } else if git {
-        match resolve_git_diff(dir, base, staged)? {
-            GitDiffInput::Diff(s) => s,
-            GitDiffInput::Skipped(skip) => {
-                // git 管理外: 空の changes + skipped を返して exit 0。
-                let result = crate::models::impact::ContextResult {
-                    changes: Vec::new(),
-                    skipped: Some(skip),
-                };
-                println!("{}", serialize_output(&result, pretty)?);
-                return Ok(());
-            }
+    let diff_input = match resolve_diff_source(dir, diff, diff_file, git, base, staged)? {
+        DiffSourceResolution::Diff(s) => s,
+        DiffSourceResolution::Skipped(skip) => {
+            // git 管理外: 空の changes + skipped を返して exit 0。
+            let result = crate::models::impact::ContextResult {
+                changes: Vec::new(),
+                skipped: Some(skip),
+            };
+            println!("{}", serialize_output(&result, pretty)?);
+            return Ok(());
         }
-    } else {
-        let stdin = std::io::stdin();
-        read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?
+        DiffSourceResolution::NotRequested => {
+            let stdin = std::io::stdin();
+            read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?
+        }
     };
 
     let options = crate::models::impact::ContextAnalysisOptions {
@@ -458,17 +454,17 @@ pub fn cmd_impact(
     exclude_dirs: &[String],
     exclude_globs: &[String],
 ) -> Result<()> {
-    let diff_input = if git {
-        match resolve_git_diff(dir, base, staged)? {
-            GitDiffInput::Diff(s) => s,
-            // git 管理外: 既存の「差分なし」と同じく無出力で exit 0。
-            // impact は構造化 JSON 出力を持たず未解決 caller 検出時のみ stderr に
-            // 出力する設計のため、skipped JSON は出さない (hook の有無を問わず silent)。
-            GitDiffInput::Skipped(_) => return Ok(()),
+    // impact に inline `--diff` / `--diff-file` は無いため resolver へは None を渡す。
+    let diff_input = match resolve_diff_source(dir, None, None, git, base, staged)? {
+        DiffSourceResolution::Diff(s) => s,
+        // git 管理外: 既存の「差分なし」と同じく無出力で exit 0。
+        // impact は構造化 JSON 出力を持たず未解決 caller 検出時のみ stderr に
+        // 出力する設計のため、skipped JSON は出さない (hook の有無を問わず silent)。
+        DiffSourceResolution::Skipped(_) => return Ok(()),
+        DiffSourceResolution::NotRequested => {
+            let stdin = std::io::stdin();
+            read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?
         }
-    } else {
-        let stdin = std::io::stdin();
-        read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?
     };
 
     if diff_input.trim().is_empty() {
@@ -619,30 +615,25 @@ pub fn cmd_review(
     // 未指定時は package.json から next 依存を検出して nextjs プリセットを自動適用する。
     let framework_globs = resolve_framework_globs_with_auto_detect(framework, dir)?;
     // 1. diff 取得（context コマンドと同じ入力方式）
-    let diff_input = if let Some(d) = diff {
-        d.to_string()
-    } else if let Some(df) = diff_file {
-        read_file_to_string_limited(df, MAX_INPUT_SIZE)?
-    } else if git {
-        match resolve_git_diff(dir, base, staged)? {
-            GitDiffInput::Diff(s) => s,
-            GitDiffInput::Skipped(skip) => {
-                // git 管理外: hook は完全 silent、通常は空結果 + skipped で exit 0。
-                if hook {
-                    return Ok(());
-                }
-                let result = ReviewResult {
-                    skipped: Some(skip),
-                    ..Default::default()
-                };
-                let output = serialize_output(&result, pretty)?;
-                println!("{output}");
+    let diff_input = match resolve_diff_source(dir, diff, diff_file, git, base, staged)? {
+        DiffSourceResolution::Diff(s) => s,
+        DiffSourceResolution::Skipped(skip) => {
+            // git 管理外: hook は完全 silent、通常は空結果 + skipped で exit 0。
+            if hook {
                 return Ok(());
             }
+            let result = ReviewResult {
+                skipped: Some(skip),
+                ..Default::default()
+            };
+            let output = serialize_output(&result, pretty)?;
+            println!("{output}");
+            return Ok(());
         }
-    } else {
-        let stdin = std::io::stdin();
-        read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?
+        DiffSourceResolution::NotRequested => {
+            let stdin = std::io::stdin();
+            read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?
+        }
     };
 
     if diff_input.trim().is_empty() {
