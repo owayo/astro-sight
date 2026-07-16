@@ -182,6 +182,41 @@ fn impact_groups_value(
     serde_json::to_value(impacts).expect("hook impact DTO should serialize")
 }
 
+/// diff 外の caller を `HookImpactGroup` に集約する共通ループ。
+/// impacted / informational の 2 経路は「caller を走査し、diff 外の caller の symbols を
+/// 述語で絞って `BTreeMap<changed_path, group>` に積む」構造が同一で、残す symbol の条件
+/// (`keep_symbol`) だけが異なるため、述語を渡して共通化する。
+fn accumulate_hook_impacts(
+    target: &mut std::collections::BTreeMap<String, HookImpactGroup>,
+    change_path: &str,
+    callers: &[ImpactedCaller],
+    changed: &ChangedFileSet,
+    dir: &str,
+    keep_symbol: impl Fn(&str) -> bool,
+) {
+    for caller in callers {
+        if changed.contains_caller(dir, &caller.path) {
+            continue;
+        }
+        let causal_syms: Vec<String> = caller
+            .symbols
+            .iter()
+            .filter(|sym| keep_symbol(sym.as_str()))
+            .cloned()
+            .collect();
+        if causal_syms.is_empty() {
+            continue;
+        }
+        let entry = target.entry(change_path.to_string()).or_default();
+        for sym in &causal_syms {
+            entry.changed_symbols.insert(sym.clone());
+        }
+        entry
+            .refs
+            .push((caller.path.clone(), caller.line, causal_syms));
+    }
+}
+
 pub(crate) fn build_review_hook_json(
     result: &ReviewResult,
     dir: &str,
