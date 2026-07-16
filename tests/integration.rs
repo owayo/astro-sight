@@ -504,16 +504,16 @@ fn context_with_diff() {
     use std::process::Stdio;
 
     // 合成 diff: extract_symbols のシグネチャ変更。行番号は実コードから動的に取得する。
-    let symbols_src =
-        std::fs::read_to_string("src/engine/symbols.rs").expect("read src/engine/symbols.rs");
+    let symbols_src = std::fs::read_to_string("src/engine/symbols/mod.rs")
+        .expect("read src/engine/symbols/mod.rs");
     let extract_line_idx = symbols_src
         .lines()
         .position(|l| l.starts_with("pub fn extract_symbols("))
         .expect("extract_symbols 関数が見つからない");
     let line_no = extract_line_idx + 1;
     let diff = format!(
-        "--- a/src/engine/symbols.rs\n\
-         +++ b/src/engine/symbols.rs\n\
+        "--- a/src/engine/symbols/mod.rs\n\
+         +++ b/src/engine/symbols/mod.rs\n\
          @@ -{line_no},7 +{line_no},7 @@\n\
          -pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {{\n\
          +pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, include_refs: bool) -> Result<Vec<Symbol>> {{\n\
@@ -546,7 +546,7 @@ fn context_with_diff() {
 
     let changes = json["changes"].as_array().unwrap();
     assert!(!changes.is_empty(), "Should have changes");
-    assert_eq!(changes[0]["path"], "src/engine/symbols.rs");
+    assert_eq!(changes[0]["path"], "src/engine/symbols/mod.rs");
 
     let affected = changes[0]["affected_symbols"].as_array().unwrap();
     assert!(!affected.is_empty(), "Should have affected symbols");
@@ -1214,16 +1214,16 @@ fn context_batch_refs_consistency() {
 
     // batch refs アプローチでの context 出力が従来通り一貫していることを確認する。
     // 行番号は実コードから動的に取得する。
-    let symbols_src =
-        std::fs::read_to_string("src/engine/symbols.rs").expect("read src/engine/symbols.rs");
+    let symbols_src = std::fs::read_to_string("src/engine/symbols/mod.rs")
+        .expect("read src/engine/symbols/mod.rs");
     let extract_line_idx = symbols_src
         .lines()
         .position(|l| l.starts_with("pub fn extract_symbols("))
         .expect("extract_symbols 関数が見つからない");
     let line_no = extract_line_idx + 1;
     let diff = format!(
-        "--- a/src/engine/symbols.rs\n\
-         +++ b/src/engine/symbols.rs\n\
+        "--- a/src/engine/symbols/mod.rs\n\
+         +++ b/src/engine/symbols/mod.rs\n\
          @@ -{line_no},7 +{line_no},7 @@\n\
          -pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {{\n\
          +pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, flag: bool) -> Result<Vec<Symbol>> {{\n\
@@ -2395,16 +2395,16 @@ fn impact_with_unresolved() {
 
     // diff: extract_symbols のシグネチャを変更 → 他ファイルの caller が未解決になる
     // 行番号は実コードから動的に取得する。
-    let symbols_src =
-        std::fs::read_to_string("src/engine/symbols.rs").expect("read src/engine/symbols.rs");
+    let symbols_src = std::fs::read_to_string("src/engine/symbols/mod.rs")
+        .expect("read src/engine/symbols/mod.rs");
     let extract_line_idx = symbols_src
         .lines()
         .position(|l| l.starts_with("pub fn extract_symbols("))
         .expect("extract_symbols 関数が見つからない");
     let line_no = extract_line_idx + 1;
     let diff = format!(
-        "--- a/src/engine/symbols.rs\n\
-         +++ b/src/engine/symbols.rs\n\
+        "--- a/src/engine/symbols/mod.rs\n\
+         +++ b/src/engine/symbols/mod.rs\n\
          @@ -{line_no},7 +{line_no},7 @@\n\
          -pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result<Vec<Symbol>> {{\n\
          +pub fn extract_symbols(root: Node<'_>, source: &[u8], lang_id: LangId, flag: bool) -> Result<Vec<Symbol>> {{\n\
