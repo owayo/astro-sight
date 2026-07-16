@@ -2461,23 +2461,29 @@ pub(crate) fn partition_removed_dead_candidates(
         }
     }
 
-    // 第 2 パス: `Owner.member` 形式の removed 候補は、同一 file の型 owner が第 1 パスで
-    // removed_dead (= owner 名の新ツリー参照 0 件) に分類されていれば member も追従して
-    // removed_dead へ移す。owner 型がリポジトリ内のどこからも参照されない以上、その owner
-    // 経由で member へ到達する静的経路も存在しない。member の bare name カウントだけでは、
-    // 同一 diff 内で切替先の別クラスが持つ同名メソッド (`listEvents` 等) への参照を「削除
-    // メソッドへの残存参照」と誤認し、owner は informational (rm_dead) なのに member だけ
-    // blocking (rm) に残って hook を止めていた
-    // (Issue 2026-07-15-ts-add-refactor-delete-chain-api-rm-fp)。
+    // 第 2 パス: `Owner.member` 形式の removed 候補は、同一 file の型 owner が新ツリーから
+    // 完全に消滅している (定義 0 件 かつ 参照 0 件) 場合に限り member も追従して removed_dead
+    // へ移す。owner 型がリポジトリ内のどこにも存在しない以上、その owner を import / 生成して
+    // member へ到達する静的経路も存在しない。member の bare name カウントだけでは、同一 diff
+    // 内で切替先の別クラスが持つ同名メソッド (`listEvents` 等) への参照を「削除メソッドへの
+    // 残存参照」と誤認し、owner は informational (rm_dead) なのに member だけ blocking (rm) に
+    // 残って hook を止めていた (Issue 2026-07-15-ts-add-refactor-delete-chain-api-rm-fp)。
+    //
+    // 条件は「owner が removed_dead に居る」だけでは不十分。第 1 パスは def_count <= 1 かつ
+    // ref_count == 0 を removed_dead にするため、partial class / open class / extension で
+    // 新ツリーに owner の別定義が 1 つ残る (def_count == 1) ケースも removed_dead に入りうる。
+    // その場合 owner 型は生存しており member 削除は破壊的変更なので降格してはならない。
+    // よって counts が厳密に (0, 0) の owner だけを対象にする。counts に owner が無い
+    // (参照検索の欠落) 場合も fail-closed で除外する (codex レビュー指摘)。
     // owner は型 kind (class/struct/trait/interface/enum) に限定し、同名の削除済み関数など
-    // による誤降格を防ぐ (codex 設計指摘)。
+    // による誤降格を防ぐ。
     let dead_type_owner_keys: HashSet<(String, String)> = removed_dead
         .iter()
         .filter(|c| {
             matches!(
                 c.kind.as_str(),
                 "class" | "struct" | "trait" | "interface" | "enum"
-            )
+            ) && counts.get(bare_name(&c.name)).copied() == Some((0, 0))
         })
         .map(|c| (c.file.clone(), c.name.clone()))
         .collect();

@@ -3764,6 +3764,55 @@ fn detect_api_changes_deleted_member_with_live_owner_stays_removed() {
     );
 }
 
+/// 負ケース (codex レビュー指摘): owner 型の別定義が新ツリーに残る (定義 1・参照 0) 場合、
+/// owner は第 1 パスで removed_dead に入るが型は生存しているため、member を removed_dead へ
+/// 降格してはならない。partial class / open class / extension を模した構成で、削除ファイルの
+/// `Svc` と同名の `Svc` が別ファイルに残り、削除メソッド名 `doWork` は別コードから参照される。
+#[test]
+fn detect_api_changes_deleted_member_with_surviving_owner_definition_stays_removed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let gone_src = "export class Svc {\n    doWork(): void {}\n}\n";
+    git_commit_files(
+        repo,
+        &[
+            ("src/gone.ts", gone_src),
+            // 同名 Svc の別定義 (新ツリーに残る = owner の def_count を 1 に押し上げる)。
+            // Svc 名は誰からも参照されないため ref_count は 0。
+            (
+                "src/keep.ts",
+                "export class Svc {\n    other(): void {}\n}\n",
+            ),
+            // 削除される member 名 `doWork` への参照だけを残す (owner Svc は参照しない)。
+            (
+                "src/consumer.ts",
+                "export function run(r: any): void {\n    r.doWork();\n}\n",
+            ),
+        ],
+        "base",
+    );
+    std::fs::remove_file(repo.join("src/gone.ts")).expect("rm");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/gone.ts".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 3,
+            new_start: 0,
+            new_count: 0,
+        }],
+        deleted_old_source: Some(gone_src.as_bytes().to_vec()),
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.removed.iter().any(|s| s.name == "Svc.doWork"),
+        "owner 型の別定義が新ツリーに残る場合、member は blocking な removed を維持すべき。removed={:?} removed_dead={:?}",
+        api.removed.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+}
+
 /// crate-private module 配下の pub fn を同一ファイル内で一部だけ削除した場合も、
 /// (同一 crate 内に caller が残っていても) crate 外非到達なので api.rm に出さない。
 #[test]
