@@ -482,33 +482,7 @@ pub fn cmd_impact(
     let result = service.analyze_context(&diff_input, dir, &options)?;
 
     // 変更されたファイルパスを事前に canonicalize してキャッシュ（O(M) syscall に削減）
-    let changed_paths: std::collections::HashSet<&str> =
-        result.changes.iter().map(|c| c.path.as_str()).collect();
-    let changed_canonical: std::collections::HashSet<std::path::PathBuf> = changed_paths
-        .iter()
-        .filter_map(|cp| {
-            let abs = if std::path::Path::new(cp).is_relative() {
-                std::path::Path::new(dir).join(cp)
-            } else {
-                std::path::PathBuf::from(cp)
-            };
-            std::fs::canonicalize(&abs).ok()
-        })
-        .collect();
-    // canonicalize 失敗時のフォールバック用に文字列セットも保持
-    let changed_abs_strs: std::collections::HashSet<String> = changed_paths
-        .iter()
-        .map(|cp| {
-            if std::path::Path::new(cp).is_relative() {
-                std::path::Path::new(dir)
-                    .join(cp)
-                    .to_string_lossy()
-                    .to_string()
-            } else {
-                cp.to_string()
-            }
-        })
-        .collect();
+    let changed = ChangedFileSet::build(dir, result.changes.iter().map(|c| c.path.as_str()));
 
     // 未解決の影響をグループ化: diff に含まれないファイルの caller
     // caller ごとに影響シンボルを追跡
@@ -526,23 +500,8 @@ pub fn cmd_impact(
         }
 
         for caller in &change.impacted_callers {
-            // 比較のため相対パスを dir を基準に解決
-            let caller_abs = if std::path::Path::new(&caller.path).is_relative() {
-                std::path::Path::new(dir)
-                    .join(&caller.path)
-                    .to_string_lossy()
-                    .to_string()
-            } else {
-                caller.path.clone()
-            };
-
-            // caller のファイルが変更ファイルに含まれていないかチェック（キャッシュ参照で O(1)）
-            let in_diff = match std::fs::canonicalize(&caller_abs) {
-                Ok(canon) => changed_canonical.contains(&canon),
-                Err(_) => changed_abs_strs.contains(&caller_abs),
-            };
-
-            if !in_diff {
+            // caller のファイルが変更ファイルに含まれていないか（= diff 内で未解決か）を判定
+            if !changed.contains_caller(dir, &caller.path) {
                 unresolved
                     .entry(change.path.clone())
                     .or_default()
