@@ -21,9 +21,7 @@ use crate::models::symbol::SymbolKind;
 
 use pass2::stream_caller_maps_and_defs;
 use pass3::{apply_stage4b_single, build_file_impact, compute_has_parent_by_ix};
-use signature::{
-    detect_signature_changes, is_definition_header_in_changed_lines, is_symbol_in_changed_lines,
-};
+use signature::{detect_signature_changes, is_symbol_in_changed_lines};
 use test_context::is_in_test_context;
 
 struct FileContext {
@@ -394,6 +392,7 @@ fn collect_affected_symbols(
                 root,
                 &source,
                 lang_id,
+                &changed_new_lines,
             ) {
                 continue;
             }
@@ -474,6 +473,7 @@ fn should_include_for_cross_file(
     root: tree_sitter::Node,
     source: &[u8],
     lang_id: LangId,
+    changed_new_lines: &std::collections::HashSet<usize>,
 ) -> bool {
     // 1. impl ブロックの型名とモジュール宣言をスキップ
     // モジュール宣言（例: `pub mod tensor`）は API サーフェスを変更しない。
@@ -502,15 +502,20 @@ fn should_include_for_cross_file(
     {
         return false;
     }
-    // 3b. 定義ヘッダが変更されていない型シンボルをスキップ。
-    // 例: `trait GuestMemory` 行自体が変更されていなければ、
-    // 他の変更行（フリー関数のシグネチャ等）に名前が出現しても伝播しない。
+    // 3b. 宣言ヘッダ行が変更されていない型シンボルをスキップ。
+    // 型宣言ノードの開始行 (= シンボル range の開始行) が新側変更行に含まれない場合は、
+    // body 内の変更や、名前を言及する docblock コメント (`* class Foo`) / 文字列の変更が
+    // あっても他ファイルのクラス参照へ伝播しない。docblock コメントは AST 上の型宣言ノードに
+    // 含まれない別ノードなので、宣言開始行と変更行の交差で判定すればコメント/文字列の名前
+    // 言及を確実に除外できる (GitLab #35: クラス参照の過剰列挙、テキスト照合の誤マッチを排除)。
+    // 宣言開始行のみを見るため `trait GuestMemory` のような単一行ヘッダにも、フリー関数の
+    // シグネチャ行に型名が出現するだけのケースにも正しく作用する。
     if matches!(
         sym.kind.as_str(),
         "trait" | "struct" | "class" | "interface" | "enum"
-    ) && !is_definition_header_in_changed_lines(
-        diff_input, file_path, &sym.name, &sym.kind, lang_id,
-    ) {
+    ) && let Some(s) = overlapping
+        && !changed_new_lines.contains(&s.range.start.line)
+    {
         return false;
     }
     // 4. エクスポートされていないシンボルをスキップ
