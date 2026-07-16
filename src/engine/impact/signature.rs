@@ -149,20 +149,51 @@ pub(crate) fn is_signature_line(line: &str) -> bool {
     false
 }
 
-/// 変更行の内容がコメント由来かをヒューリスティックに判定する (定義ヘッダ照合のスキップ用)。
+/// 変更行の先頭コメントを取り除き、型定義ヘッダ照合の対象となるコード部分を返す。
 ///
-/// 行コメント (`//`) / ブロックコメント開始 (`/*`) / docblock 継続 (`*`) / `#` 行コメント
-/// (Python / Ruby / PHP) で始まる行は、`class Foo` 等のテキストを含んでいても型定義ヘッダ
-/// ではない。ただし `#[` は PHP 8 attribute / Rust attribute の実コード行
-/// (`#[Attr] class Foo {}` の単一行形) であり得るためコメント扱いしない。
-/// 実際の型定義行がこれらの prefix で始まることはないため、スキップによる false negative
-/// (ヘッダ変更の見逃し) は実質発生しない。
-fn is_comment_like_content_line(content: &str) -> bool {
+/// 行全体がコメントなら `None`。先頭にインラインコメントがあり、その後ろに実コードが続く
+/// 場合は後続コード部分を返す (`/** doc */ class Foo` の `class Foo` を取りこぼさない)。
+///
+/// コメント判定:
+/// - `//` 始まり: 行コメント。以降すべてコメントなので `None`。
+/// - `/*` / docblock 継続 `*` 始まり: 対応する `*/` を探し、その後ろに非空白コードが
+///   あればそれを返す (FN 回避)。閉じが無ければコメント継続で `None`。
+/// - `#` 始まり: 言語別に判定する。
+///   - Python / Ruby / Bash: `#` は常に行コメント → `None`。
+///   - PHP: `#[` は attribute (実コード) なので照合対象。それ以外の `#` は行コメント → `None`。
+///   - その他 (Rust / C / C++ 等): `#` は attribute / プリプロセッサディレクティブなので
+///     照合対象として残す (`#[repr(C)] struct Foo` を誤除外しない)。
+/// - それ以外: 行全体を照合対象として返す。
+///
+/// 実際の型定義行は行頭がコメント prefix にならないため、行コメント/継続コメントの
+/// スキップによる false negative (ヘッダ変更の見逃し) は実質発生しない。
+fn code_after_leading_comment(content: &str, lang_id: LangId) -> Option<&str> {
     let trimmed = content.trim_start();
-    trimmed.starts_with("//")
-        || trimmed.starts_with("/*")
-        || trimmed.starts_with('*')
-        || (trimmed.starts_with('#') && !trimmed.starts_with("#["))
+    if trimmed.starts_with("//") {
+        return None;
+    }
+    if trimmed.starts_with("/*") || trimmed.starts_with('*') {
+        // 先頭ブロックコメント / docblock 継続。閉じ `*/` の後ろに実コードがあれば照合する。
+        return match trimmed.find("*/") {
+            Some(end) => {
+                let rest = trimmed[end + 2..].trim_start();
+                (!rest.is_empty()).then_some(rest)
+            }
+            None => None,
+        };
+    }
+    if trimmed.starts_with('#') {
+        let is_line_comment = match lang_id {
+            LangId::Python | LangId::Ruby | LangId::Bash => true,
+            LangId::Php => !trimmed.starts_with("#["),
+            // Rust / C / C++ 等の `#` は attribute / preprocessor で実コード。
+            _ => false,
+        };
+        if is_line_comment {
+            return None;
+        }
+    }
+    Some(content)
 }
 
 /// 型シンボルの定義ヘッダが変更行(+/-)に出現するか確認する。
@@ -204,11 +235,11 @@ pub(crate) fn is_definition_header_in_changed_lines(
                     HunkBodyLine::Context | HunkBodyLine::Metadata => None,
                 };
                 if let Some(content) = content
-                    && !is_comment_like_content_line(content)
+                    && let Some(code) = code_after_leading_comment(content, lang_id)
                 {
                     for kw in keywords {
                         let pattern = format!("{kw} {symbol_name}");
-                        if text_contains(content, &pattern, lang_id) {
+                        if text_contains(code, &pattern, lang_id) {
                             return true;
                         }
                     }
@@ -732,6 +763,64 @@ mod tests {
             "SipUserId",
             "class",
             LangId::Php
+        ));
+    }
+
+    /// codex 指摘: 先頭インラインブロックコメントの後に実ヘッダが続く行 (`/** doc */ struct Foo`)
+    /// は、コメント部を除去した後続コードでヘッダ変更として検出する (行全体スキップによる
+    /// false negative を防ぐ)。
+    #[test]
+    fn is_definition_header_detects_header_after_inline_block_comment() {
+        let diff = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,1 +1,1 @@
+-/** docs */ pub struct Widget { x: i32 }
++/** docs */ pub struct Widget { x: i32, y: i32 }";
+        assert!(is_definition_header_in_changed_lines(
+            diff,
+            "src/lib.rs",
+            "Widget",
+            "struct",
+            LangId::Rust
+        ));
+    }
+
+    /// codex 指摘: Rust の `#[derive(...)] struct Foo` は attribute 付き実ヘッダ。
+    /// `#` を一律コメント扱いすると見逃すため、Rust では `#` 行を照合対象に残す。
+    #[test]
+    fn is_definition_header_keeps_rust_attribute_line() {
+        let diff = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,1 +1,1 @@
+-#[derive(Debug)] pub struct Widget { x: i32 }
++#[derive(Debug, Clone)] pub struct Widget { x: i32 }";
+        assert!(is_definition_header_in_changed_lines(
+            diff,
+            "src/lib.rs",
+            "Widget",
+            "struct",
+            LangId::Rust
+        ));
+    }
+
+    /// codex 指摘: Python には attribute 構文が無く `#` は常に行コメント。
+    /// `#[note] class Foo` も PHP と違いコメントなのでヘッダ変更として扱わない。
+    #[test]
+    fn is_definition_header_ignores_python_hash_bracket_comment() {
+        let diff = "\
+--- a/app.py
++++ b/app.py
+@@ -1,2 +1,2 @@
+-#[note] class Widget old
++#[note] class Widget new";
+        assert!(!is_definition_header_in_changed_lines(
+            diff,
+            "app.py",
+            "Widget",
+            "class",
+            LangId::Python
         ));
     }
 

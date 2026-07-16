@@ -33,6 +33,22 @@ fn context_docblock_class_mention_does_not_propagate_class_refs() {
 
     let json = repo.run_json_with_stdin("context", &[], diff.as_bytes());
     let changes = json["changes"].as_array().expect("changes array");
+    // まず対象ファイルの変更と toEloquent の signature 変更が実際に検出されていることを
+    // 確認する (空結果で negative アサートが素通りするのを防ぐ、codex 指摘)。
+    let sip_change = changes
+        .iter()
+        .find(|c| c["path"].as_str() == Some("SipUserId.php"))
+        .expect("SipUserId.php の change が検出されるべき");
+    let has_to_eloquent_sig = sip_change["signature_changes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|sc| sc["name"].as_str() == Some("toEloquent"));
+    assert!(
+        has_to_eloquent_sig,
+        "toEloquent の signature 変更が検出されるべき: {json}"
+    );
+    // そのうえで、クラス参照 (`new SipUserId(...)`) が impacted_callers に載っていないこと。
     for change in changes {
         if let Some(callers) = change["impacted_callers"].as_array() {
             for caller in callers {
