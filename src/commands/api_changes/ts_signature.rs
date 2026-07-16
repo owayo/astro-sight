@@ -354,17 +354,21 @@ pub(crate) fn detect_object_members_compatible_mod(
     })
 }
 
-/// TS/TSX のトップレベル exported function で、末尾 optional/default 引数追加だけを
-/// compatible_modified (`trailing_optional_params`) として判定する。
+/// TS/TSX のトップレベル exported function / class method で、末尾 optional/default
+/// 引数追加だけを compatible_modified (`trailing_optional_params`) として判定する。
 ///
 /// 次をすべて満たす場合だけ降格する:
-/// - 関数シンボルで、old/new ともトップレベル関数として一意に取得できる
-/// - 関数名・型パラメータ・戻り値など parameters 外の signature が不変
+/// - 関数シンボル (bare 名) はトップレベル関数として old/new とも一意に取得できる
+/// - method シンボル (`Class.method` qualname) はトップレベル (export 文直下含む) の
+///   class 宣言が一意で、class body 直下の同名 callable member が method_definition
+///   1 件のみ (overload signature / abstract signature を含め同名複数なら不成立)
+/// - 関数名・型パラメータ・戻り値・modifier など parameters 外の signature が不変
 /// - 既存引数の順序・型・optional/default 指定が不変
 /// - 追加された末尾引数がすべて optional (`?`) または default value 付き
 ///
-/// class method / const arrow function / import 型の解決などは対象外にして blocking を維持する。
-/// false negative (破壊的変更の見逃し) を避けるため、AST 取得や git show に失敗した場合も None。
+/// const arrow function / nested class / import 型の解決などは対象外にして blocking を
+/// 維持する。false negative (破壊的変更の見逃し) を避けるため、AST 取得や git show に
+/// 失敗した場合も None。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn detect_trailing_optional_params_compatible_mod(
     dir: &str,
@@ -379,9 +383,12 @@ pub(crate) fn detect_trailing_optional_params_compatible_mod(
 ) -> Option<CompatibleApiModification> {
     use crate::language::LangId;
     let lang = lang_id.filter(|l| matches!(l, LangId::Typescript | LangId::Tsx))?;
-    if kind != "function" || name.contains('.') {
-        return None;
-    }
+    // 対象は「bare 名のトップレベル関数」または「Class.method の 2 要素 qualname メソッド」。
+    let class_method = match kind {
+        "function" if !name.contains('.') => None,
+        "method" => Some(split_two_segment_qualname(name)?),
+        _ => return None,
+    };
     if !crate::engine::impact::is_safe_diff_path(old_path)
         || !crate::engine::impact::is_safe_diff_path(new_path)
     {
@@ -406,8 +413,26 @@ pub(crate) fn detect_trailing_optional_params_compatible_mod(
     let new_source = parser::read_file(new_utf8).ok()?;
     let new_tree = parser::parse_source(&new_source, lang).ok()?;
 
-    let old_fn = find_top_level_function_by_name(old_tree.root_node(), &old_source, name)?;
-    let new_fn = find_top_level_function_by_name(new_tree.root_node(), &new_source, name)?;
+    let (old_fn, new_fn) = match class_method {
+        None => (
+            find_top_level_function_by_name(old_tree.root_node(), &old_source, name)?,
+            find_top_level_function_by_name(new_tree.root_node(), &new_source, name)?,
+        ),
+        Some((class_name, method_name)) => (
+            find_unique_top_level_class_method(
+                old_tree.root_node(),
+                &old_source,
+                class_name,
+                method_name,
+            )?,
+            find_unique_top_level_class_method(
+                new_tree.root_node(),
+                &new_source,
+                class_name,
+                method_name,
+            )?,
+        ),
+    };
     let old_parts = ts_function_signature_parts(old_fn, &old_source)?;
     let new_parts = ts_function_signature_parts(new_fn, &new_source)?;
 
@@ -426,6 +451,91 @@ pub(crate) fn detect_trailing_optional_params_compatible_mod(
         new_signature: Some(new_sig.to_string()),
         reason: "trailing_optional_params".to_string(),
     })
+}
+
+/// `Class.method` 形式の 2 要素 qualname を分解する。3 要素以上 (nested class 等) は
+/// 解決対象外として None。
+fn split_two_segment_qualname(name: &str) -> Option<(&str, &str)> {
+    let (class_name, method_name) = name.split_once('.')?;
+    if class_name.is_empty() || method_name.is_empty() || method_name.contains('.') {
+        return None;
+    }
+    Some((class_name, method_name))
+}
+
+/// トップレベル (または export 文直下) の class 宣言 `class_name` を一意に解決し、
+/// その body 直下の method `method_name` を返す。
+///
+/// blocking 維持 (None) にするケース:
+/// - 同名 class がトップレベルに複数ある (どちらの変更か特定できない)
+/// - class body 直下に同名 member が複数ある (overload signature / abstract signature /
+///   同名 field 等。単一 `method_definition` に絞れない)
+/// - 唯一の同名 member が method_definition でない (arrow function field 等)
+///
+/// nested class / class expression は走査対象にしない (トップレベル children のみ)。
+/// computed name (`["x"]`) は name テキストが一致しないため自然に不成立。
+fn find_unique_top_level_class_method<'a>(
+    root: tree_sitter::Node<'a>,
+    source: &[u8],
+    class_name: &str,
+    method_name: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    let class_kinds = |k: &str| matches!(k, "class_declaration" | "abstract_class_declaration");
+    let mut found_class: Option<tree_sitter::Node<'a>> = None;
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        let candidate = if child.kind() == "export_statement" {
+            let mut sub_cursor = child.walk();
+            child
+                .children(&mut sub_cursor)
+                .find(|c| class_kinds(c.kind()))
+        } else if class_kinds(child.kind()) {
+            Some(child)
+        } else {
+            None
+        };
+        if let Some(class_node) = candidate
+            && let Some(name_node) = class_node.child_by_field_name("name")
+            && let Some(bytes) = source.get(name_node.start_byte()..name_node.end_byte())
+            && let Ok(decl_name) = std::str::from_utf8(bytes)
+            && decl_name == class_name
+        {
+            if found_class.is_some() {
+                // 同名 class が複数 → 曖昧なので不成立
+                return None;
+            }
+            found_class = Some(class_node);
+        }
+    }
+    let body = found_class?.child_by_field_name("body")?;
+
+    let mut found_method: Option<tree_sitter::Node<'a>> = None;
+    let mut matches = 0usize;
+    let mut cursor = body.walk();
+    for member in body.named_children(&mut cursor) {
+        let Some(name_node) = member.child_by_field_name("name") else {
+            continue;
+        };
+        let Some(bytes) = source.get(name_node.start_byte()..name_node.end_byte()) else {
+            continue;
+        };
+        let Ok(member_name) = std::str::from_utf8(bytes) else {
+            continue;
+        };
+        if member_name != method_name {
+            continue;
+        }
+        matches += 1;
+        if member.kind() == "method_definition" {
+            found_method = Some(member);
+        }
+    }
+    // overload signature / abstract signature / 同名 field が併存する場合は単一の
+    // method_definition へ安全に対応付けられないため不成立。
+    if matches != 1 {
+        return None;
+    }
+    found_method
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

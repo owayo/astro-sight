@@ -8982,6 +8982,182 @@ fn detect_api_changes_ts_trailing_default_param_is_compatible() {
     assert_eq!(compat.reason, "trailing_optional_params");
 }
 
+/// Issue 2026-07-12-ts-class-method-trailing-optional-param-api-mod: TS class method への
+/// 末尾 optional 引数追加も compatible_modified へ降格する。同名 standalone 関数が別
+/// ファイルにあっても `Class.method` qualname で一意解決できるため成立する。
+#[test]
+fn detect_api_changes_ts_class_method_trailing_optional_param_is_compatible() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/widget.ts",
+                "export class Widget {\n  handle(a: string, b: number): void {\n    console.log(a, b);\n  }\n}\n",
+            ),
+            (
+                "src/user.ts",
+                "import { Widget } from './widget';\n\nexport function run(w: Widget) {\n  w.handle(\"x\", 1);\n}\n",
+            ),
+            (
+                "src/other/standalone.ts",
+                "export function handle(msg: string): void {\n  console.log(msg);\n}\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("src/widget.ts"),
+        "export class Widget {\n  handle(a: string, b: number, c?: readonly number[]): void {\n    console.log(a, b, c);\n  }\n}\n",
+    )
+    .expect("write changed file");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/widget.ts".to_string(),
+        new_path: "src/widget.ts".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 5,
+            new_start: 1,
+            new_count: 5,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    assert!(
+        !api_changes
+            .modified
+            .iter()
+            .any(|m| m.name == "Widget.handle"),
+        "class method への末尾 optional 引数追加は破壊的 api.mod にすべきでない: {:?}",
+        api_changes.modified
+    );
+    let compat = api_changes
+        .compatible_modified
+        .iter()
+        .find(|c| c.name == "Widget.handle")
+        .expect("compatible_modified に Widget.handle が入るべき");
+    assert_eq!(compat.reason, "trailing_optional_params");
+}
+
+/// 負ケース: class method へ追加した末尾引数が required なら従来どおり blocking。
+#[test]
+fn detect_api_changes_ts_class_method_trailing_required_param_stays_modified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/widget.ts",
+                "export class Widget {\n  handle(a: string, b: number): void {\n    console.log(a, b);\n  }\n}\n",
+            ),
+            (
+                "src/user.ts",
+                "import { Widget } from './widget';\n\nexport function run(w: Widget) {\n  w.handle(\"x\", 1);\n}\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("src/widget.ts"),
+        "export class Widget {\n  handle(a: string, b: number, c: readonly number[]): void {\n    console.log(a, b, c);\n  }\n}\n",
+    )
+    .expect("write changed file");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/widget.ts".to_string(),
+        new_path: "src/widget.ts".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 5,
+            new_start: 1,
+            new_count: 5,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    assert!(
+        api_changes
+            .modified
+            .iter()
+            .any(|m| m.name == "Widget.handle"),
+        "required 引数の追加は blocking な modified を維持すべき: modified={:?} compat={:?}",
+        api_changes
+            .modified
+            .iter()
+            .map(|m| &m.name)
+            .collect::<Vec<_>>(),
+        api_changes
+            .compatible_modified
+            .iter()
+            .map(|c| &c.name)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// 負ケース: 新側に同名 overload signature が併存する場合は単一 method_definition へ
+/// 安全に対応付けられないため blocking を維持する。
+#[test]
+fn detect_api_changes_ts_class_method_with_overload_signature_stays_modified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/widget.ts",
+                "export class Widget {\n  handle(a: string, b: number): void {\n    console.log(a, b);\n  }\n}\n",
+            ),
+            (
+                "src/user.ts",
+                "import { Widget } from './widget';\n\nexport function run(w: Widget) {\n  w.handle(\"x\", 1);\n}\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("src/widget.ts"),
+        "export class Widget {\n  handle(a: string, b: number): void;\n  handle(a: string, b: number, c?: readonly number[]): void;\n  handle(a: string, b: number, c?: readonly number[]): void {\n    console.log(a, b, c);\n  }\n}\n",
+    )
+    .expect("write changed file");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/widget.ts".to_string(),
+        new_path: "src/widget.ts".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 5,
+            new_start: 1,
+            new_count: 7,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    assert!(
+        !api_changes
+            .compatible_modified
+            .iter()
+            .any(|c| c.name == "Widget.handle"),
+        "overload signature 併存時は互換降格しない: compat={:?}",
+        api_changes
+            .compatible_modified
+            .iter()
+            .map(|c| &c.name)
+            .collect::<Vec<_>>()
+    );
+}
+
 /// Python のトップレベル関数に末尾 keyword-only + default 引数を追加した変更は
 /// 既存呼び出しを壊さないため、`compatible_modified` (`trailing_optional_params`) に降格する。
 /// (レポート 2026-06-18-api-mod-backward-compatible-kwarg の再現)
