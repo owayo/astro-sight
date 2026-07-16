@@ -3645,6 +3645,125 @@ fn detect_api_changes_private_module_pub_fn_file_delete_excluded_from_removed() 
     );
 }
 
+/// Issue 2026-07-15-ts-add-refactor-delete-chain-api-rm-fp: クラスをファイルごと削除し
+/// 呼び出し側を別クラスへ切替えた diff で、owner クラス (`GwsCalendarClient`) は参照 0 件で
+/// removed_dead (informational) になるのに、メソッド (`GwsCalendarClient.listEvents`) は
+/// bare name カウントが切替先クラスの同名メソッド参照を拾って removed (blocking) に残って
+/// いた。owner 型が removed_dead なら member も追従して removed_dead へ移す。
+#[test]
+fn detect_api_changes_deleted_class_member_follows_dead_owner_to_removed_dead() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let gws_src = "export class GwsCalendarClient {\n    async listEvents(day: string): Promise<string[]> {\n        return [day];\n    }\n}\n";
+    git_commit_files(
+        repo,
+        &[
+            ("src/services/gwsCalendar.ts", gws_src),
+            (
+                "src/services/googleCalendar.ts",
+                "export class GoogleCalendarClient {\n    async listEvents(day: string): Promise<string[]> {\n        return [\"g:\" + day];\n    }\n}\n",
+            ),
+            (
+                "src/index.ts",
+                "import { GwsCalendarClient } from './services/gwsCalendar';\n\nexport async function main() {\n    const client = new GwsCalendarClient();\n    return client.listEvents(\"2026-07-15\");\n}\n",
+            ),
+        ],
+        "base",
+    );
+    // gws 実装をファイルごと削除し、呼び出し側は google 実装へ切替
+    std::fs::remove_file(repo.join("src/services/gwsCalendar.ts")).expect("rm");
+    fs::write(
+        repo.join("src/index.ts"),
+        "import { GoogleCalendarClient } from './services/googleCalendar';\n\nexport async function main() {\n    const client = new GoogleCalendarClient();\n    return client.listEvents(\"2026-07-15\");\n}\n",
+    )
+    .expect("write");
+    let diff_files = vec![
+        crate::models::impact::DiffFile {
+            old_path: "src/services/gwsCalendar.ts".to_string(),
+            new_path: "/dev/null".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 5,
+                new_start: 0,
+                new_count: 0,
+            }],
+            deleted_old_source: Some(gws_src.as_bytes().to_vec()),
+        },
+        crate::models::impact::DiffFile {
+            old_path: "src/index.ts".to_string(),
+            new_path: "src/index.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 6,
+                new_start: 1,
+                new_count: 6,
+            }],
+            deleted_old_source: None,
+        },
+    ];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.removed_dead
+            .iter()
+            .any(|s| s.name == "GwsCalendarClient.listEvents"),
+        "owner クラスが removed_dead なら member も removed_dead に追従すべき。removed={:?} removed_dead={:?}",
+        api.removed.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+    assert!(
+        !api.removed
+            .iter()
+            .any(|s| s.name == "GwsCalendarClient.listEvents"),
+        "member を blocking な removed に残さない。removed={:?}",
+        api.removed.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+}
+
+/// 負ケース: owner クラス名への参照が新ツリーに残っている (owner が removed_kept) 場合、
+/// member は従来どおり removed (blocking) に残す — owner 経由の到達経路が残り得るため。
+#[test]
+fn detect_api_changes_deleted_member_with_live_owner_stays_removed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let gws_src = "export class GwsCalendarClient {\n    async listEvents(day: string): Promise<string[]> {\n        return [day];\n    }\n}\n";
+    git_commit_files(
+        repo,
+        &[
+            ("src/services/gwsCalendar.ts", gws_src),
+            (
+                "src/index.ts",
+                "import { GwsCalendarClient } from './services/gwsCalendar';\n\nexport async function main() {\n    const client = new GwsCalendarClient();\n    return client.listEvents(\"2026-07-15\");\n}\n",
+            ),
+        ],
+        "base",
+    );
+    // クラスファイルだけ削除し、呼び出し側 (owner 名への参照) は残したまま
+    std::fs::remove_file(repo.join("src/services/gwsCalendar.ts")).expect("rm");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/services/gwsCalendar.ts".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 5,
+            new_start: 0,
+            new_count: 0,
+        }],
+        deleted_old_source: Some(gws_src.as_bytes().to_vec()),
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.removed
+            .iter()
+            .any(|s| s.name == "GwsCalendarClient.listEvents")
+            && api.removed.iter().any(|s| s.name == "GwsCalendarClient"),
+        "owner への参照が残る削除は owner / member とも blocking な removed を維持する。removed={:?} removed_dead={:?}",
+        api.removed.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+}
+
 /// crate-private module 配下の pub fn を同一ファイル内で一部だけ削除した場合も、
 /// (同一 crate 内に caller が残っていても) crate 外非到達なので api.rm に出さない。
 #[test]

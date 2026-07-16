@@ -2461,6 +2461,38 @@ pub(crate) fn partition_removed_dead_candidates(
         }
     }
 
+    // 第 2 パス: `Owner.member` 形式の removed 候補は、同一 file の型 owner が第 1 パスで
+    // removed_dead (= owner 名の新ツリー参照 0 件) に分類されていれば member も追従して
+    // removed_dead へ移す。owner 型がリポジトリ内のどこからも参照されない以上、その owner
+    // 経由で member へ到達する静的経路も存在しない。member の bare name カウントだけでは、
+    // 同一 diff 内で切替先の別クラスが持つ同名メソッド (`listEvents` 等) への参照を「削除
+    // メソッドへの残存参照」と誤認し、owner は informational (rm_dead) なのに member だけ
+    // blocking (rm) に残って hook を止めていた
+    // (Issue 2026-07-15-ts-add-refactor-delete-chain-api-rm-fp)。
+    // owner は型 kind (class/struct/trait/interface/enum) に限定し、同名の削除済み関数など
+    // による誤降格を防ぐ (codex 設計指摘)。
+    let dead_type_owner_keys: HashSet<(String, String)> = removed_dead
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.kind.as_str(),
+                "class" | "struct" | "trait" | "interface" | "enum"
+            )
+        })
+        .map(|c| (c.file.clone(), c.name.clone()))
+        .collect();
+    if !dead_type_owner_keys.is_empty() {
+        let (follow, kept): (Vec<ApiSymbolCandidate>, Vec<ApiSymbolCandidate>) =
+            removed_kept.into_iter().partition(|c| {
+                matches!(c.kind.as_str(), "method" | "function")
+                    && c.name.rsplit_once('.').is_some_and(|(owner, _member)| {
+                        dead_type_owner_keys.contains(&(c.file.clone(), owner.to_string()))
+                    })
+            });
+        removed_kept = kept;
+        removed_dead.extend(follow);
+    }
+
     (removed_kept, removed_dead)
 }
 
