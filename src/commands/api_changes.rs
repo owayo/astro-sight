@@ -2238,7 +2238,8 @@ pub(crate) fn filter_exported_symbols(
         {
             continue;
         }
-        // Laravel runtime entrypoint。PHP 限定。
+        // Laravel runtime entrypoint。PHP 限定。dead-code 経路のみ
+        // (`exclude_framework_entrypoints=true`) で除外する。
         // 以下の 2 系統:
         //   1. Eloquent リレーション (`public function x(): BelongsTo` 等の戻り型)。`->with('x')`
         //      文字列リテラルや `$model->x` magic property 経由で Eloquent が呼ぶため、
@@ -2248,7 +2249,13 @@ pub(crate) fn filter_exported_symbols(
         //      を `implements` する場合のみ対象 (GitLab issue #22)。
         // 文字列リテラル参照 (`with(['x'])`) / magic property 解決は静的解析の本質的限界のため
         // 別 issue としている (codex 設計判断)。
-        if lang_id == crate::language::LangId::Php
+        //
+        // API 差分経路 (`exclude_framework_entrypoints=false`) では除外しない。判定が戻り型
+        // ベースのため、戻り型なし旧版 (`function x() {`) は残り戻り型付き新版 (`(): HasOne`)
+        // だけ除外される非対称が起き、実在メソッドの返り型付与が api.rm に誤分類されていた
+        // (GitLab issue #33)。公開メソッドである以上シグネチャ差分は api.mod として扱う。
+        if exclude_framework_entrypoints
+            && lang_id == crate::language::LangId::Php
             && matches!(sym.kind, SymbolKind::Method | SymbolKind::Function)
             && crate::engine::symbols::is_php_laravel_runtime_entrypoint(root, source, &sym.range)
         {

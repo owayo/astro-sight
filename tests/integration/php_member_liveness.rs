@@ -49,6 +49,61 @@ fn dead_code_php_enum_trait_use_counts_static_dispatch() {
     );
 }
 
+/// GitLab #34: trait 本体内の `self::hook()` は合成先ホストの文脈で解決され、
+/// 入れ子合成 (Host uses ChildTrait uses BaseTrait) ではホストへ展開された
+/// ChildTrait 側 override が優先して呼ばれる。定義元 BaseTrait への確定票にすると
+/// override の `ChildTrait.hook` が参照 0 件で dead 誤検出になるため、trait 内
+/// `self::` は Ambiguous に倒して duplicate set 全体を live に保つ。
+#[test]
+fn dead_code_php_trait_self_call_keeps_override_live() {
+    let repo = TestRepo::new();
+
+    repo.write(
+        "BaseTrait.php",
+        "<?php\ntrait BaseTrait {\n    public static function run(): string {\n        return self::hook();\n    }\n    public static function hook(): string { return 'base'; }\n}\n",
+    );
+    repo.write(
+        "ChildTrait.php",
+        "<?php\ntrait ChildTrait {\n    use BaseTrait;\n    public static function hook(): string { return 'child'; }\n}\n",
+    );
+    repo.write("Host.php", "<?php\nclass Host { use ChildTrait; }\n");
+    repo.write("main.php", "<?php\necho Host::run();\n");
+
+    let names = dead_names(&repo);
+    assert!(
+        !contains(&names, "ChildTrait.hook") && !contains(&names, "BaseTrait.hook"),
+        "trait 内 self:: は合成先ホスト依存なので override を dead 判定しないべき: {names:?}"
+    );
+}
+
+/// class 本体内の `self::helper()` は宣言クラスへ静的束縛されるため、従来どおり
+/// enclosing class への確定票として解決し、無関係な同名メソッドの dead 検出精度を
+/// 維持する (GitLab #34 修正が class の self:: を巻き込まない回帰担保)。
+#[test]
+fn dead_code_php_class_self_call_still_resolves_to_declaring_class() {
+    let repo = TestRepo::new();
+
+    repo.write(
+        "Base.php",
+        "<?php\nclass Base {\n    public static function helper(): void {}\n    public static function go(): void { self::helper(); }\n}\n",
+    );
+    repo.write(
+        "Other.php",
+        "<?php\nclass Other { public static function helper(): void {} }\n",
+    );
+    repo.write("Caller.php", "<?php\nBase::go();\n");
+
+    let names = dead_names(&repo);
+    assert!(
+        !contains(&names, "Base.helper"),
+        "class 内 self:: は宣言クラスへの確定票として数えるべき: {names:?}"
+    );
+    assert!(
+        contains(&names, "Other.helper"),
+        "無関係な同名メソッドは引き続き dead として検出すべき (精度回帰担保): {names:?}"
+    );
+}
+
 /// `static::helper()` は遅延静的束縛 (late static binding) でサブクラス override へ
 /// dispatch されうる。enclosing class へ確定解決すると `Child.helper` が dead 誤検出に
 /// なるため、Ambiguous に倒して duplicate set 全体を旧スキップへフォールバックさせる。

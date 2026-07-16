@@ -680,11 +680,13 @@ fn declaration_has_override_modifier(decl: Node, source: &[u8]) -> bool {
             return true;
         }
     }
-    // Kotlin の `override` は `modifiers` 経由以外に、TS では個別 `override` キーワード
-    // 子ノードとして現れる場合もあるため、全子ノードの kind もチェックする。
+    // `modifiers` コンテナを経由しない言語は method 宣言の直接子キーワードとして現れる。
+    // tree-sitter-typescript の `override` キーワードは kind = "override_modifier"
+    // (`"override"` ではない) のため両方を照合する (GitLab #36: TS の
+    // `public override formatAttributes()` が dead 誤検出されていた)。
     let mut cursor = decl.walk();
     for child in decl.children(&mut cursor) {
-        if child.kind() == "override" {
+        if matches!(child.kind(), "override" | "override_modifier") {
             return true;
         }
     }
@@ -4257,6 +4259,39 @@ function foo() {
     fn java_plain_method_is_not_override() {
         let src = "class A { public void foo() {} }";
         assert!(!check_override(src, LangId::Java, "foo"));
+    }
+
+    /// GitLab #36: tree-sitter-typescript の override キーワードは kind =
+    /// "override_modifier" のため、旧実装 (`kind == "override"` のみ照合) では
+    /// 検出できず dead-code / API 差分の両方で誤検出源になっていた。
+    #[test]
+    fn ts_override_method_is_detected() {
+        let src = r#"export class MyFormatter extends LogFormatter {
+    public override formatAttributes(attrs: Attrs, additional: Attrs): LogItem {
+        return new LogItem(attrs);
+    }
+}"#;
+        assert!(check_override(src, LangId::Typescript, "formatAttributes"));
+    }
+
+    #[test]
+    fn ts_plain_method_is_not_override() {
+        let src = r#"export class MyFormatter extends LogFormatter {
+    public formatAttributes(attrs: Attrs): LogItem {
+        return new LogItem(attrs);
+    }
+}"#;
+        assert!(!check_override(src, LangId::Typescript, "formatAttributes"));
+    }
+
+    #[test]
+    fn tsx_override_method_is_detected() {
+        let src = r#"export class Panel extends BasePanel {
+    override render() {
+        return <div />;
+    }
+}"#;
+        assert!(check_override(src, LangId::Tsx, "render"));
     }
 
     #[test]

@@ -428,13 +428,21 @@ fn collect_php_use_clause_aliases(
     }
 }
 
+/// `self::` / `new self()` 解決に使う enclosing type 情報。trait 本体内の `self` は
+/// 合成先ホストの文脈で解決される (PHP 意味論) ため、名前に加えて宣言種別
+/// (trait か否か) も伝播する (GitLab #34)。
+struct PhpEnclosingType {
+    name: String,
+    is_trait: bool,
+}
+
 #[expect(clippy::too_many_arguments)]
 fn visit_php_node(
     node: tree_sitter::Node<'_>,
     source: &[u8],
     owners: &HashSet<String>,
     bare_key: &str,
-    current_class: Option<&str>,
+    current_type: Option<&PhpEnclosingType>,
     trait_uses: &HashMap<String, PhpTraitUses>,
     aliases: &PhpFileAliases,
     analysis: &mut PhpFileAnalysis,
@@ -443,17 +451,17 @@ fn visit_php_node(
         return;
     }
 
-    let current_class_buf = php_class_context_for_node(node, source, owners, bare_key, trait_uses);
-    let next_class = current_class_buf.as_deref().or(current_class);
+    let current_type_buf = php_class_context_for_node(node, source, owners, bare_key, trait_uses);
+    let next_type = current_type_buf.as_ref().or(current_type);
 
     process_php_liveness_node(
-        node, source, owners, bare_key, next_class, trait_uses, aliases, analysis,
+        node, source, owners, bare_key, next_type, trait_uses, aliases, analysis,
     );
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         visit_php_node(
-            child, source, owners, bare_key, next_class, trait_uses, aliases, analysis,
+            child, source, owners, bare_key, next_type, trait_uses, aliases, analysis,
         );
         if analysis.ambiguous {
             break;
@@ -467,10 +475,13 @@ fn php_class_context_for_node(
     owners: &HashSet<String>,
     bare_key: &str,
     trait_uses: &HashMap<String, PhpTraitUses>,
-) -> Option<String> {
+) -> Option<PhpEnclosingType> {
     if !is_php_type_declaration(node.kind()) {
         return None;
     }
+    // trait 判定は宣言ノード種別で行う。`trait_uses.contains_key()` は「別 trait を
+    // use しない trait」を含まず「trait を use する class/enum」を含むため使えない。
+    let is_trait = node.kind() == "trait_declaration";
     node.child_by_field_name("name")
         .and_then(|name| php_node_key(name, source))
         .filter(|key| {
@@ -479,6 +490,7 @@ fn php_class_context_for_node(
                 PhpOwnerResolution::Ignore
             )
         })
+        .map(|name| PhpEnclosingType { name, is_trait })
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -487,7 +499,7 @@ fn process_php_liveness_node(
     source: &[u8],
     owners: &HashSet<String>,
     bare_key: &str,
-    current_class: Option<&str>,
+    current_type: Option<&PhpEnclosingType>,
     trait_uses: &HashMap<String, PhpTraitUses>,
     aliases: &PhpFileAliases,
     analysis: &mut PhpFileAnalysis,
@@ -500,7 +512,7 @@ fn process_php_liveness_node(
                     source,
                     owners,
                     bare_key,
-                    current_class,
+                    current_type,
                     trait_uses,
                     aliases,
                     analysis,
@@ -516,7 +528,7 @@ fn process_php_liveness_node(
                     source,
                     owners,
                     bare_key,
-                    current_class,
+                    current_type,
                     trait_uses,
                     aliases,
                     analysis,
@@ -545,7 +557,7 @@ fn record_php_scoped_call(
     source: &[u8],
     owners: &HashSet<String>,
     bare_key: &str,
-    current_class: Option<&str>,
+    current_type: Option<&PhpEnclosingType>,
     trait_uses: &HashMap<String, PhpTraitUses>,
     aliases: &PhpFileAliases,
     analysis: &mut PhpFileAnalysis,
@@ -555,7 +567,7 @@ fn record_php_scoped_call(
         source,
         owners,
         bare_key,
-        current_class,
+        current_type,
         trait_uses,
         aliases,
     ) {
@@ -576,7 +588,7 @@ fn record_php_object_creation(
     source: &[u8],
     owners: &HashSet<String>,
     bare_key: &str,
-    current_class: Option<&str>,
+    current_type: Option<&PhpEnclosingType>,
     trait_uses: &HashMap<String, PhpTraitUses>,
     aliases: &PhpFileAliases,
     analysis: &mut PhpFileAnalysis,
@@ -589,14 +601,7 @@ fn record_php_object_creation(
             let Some(folded) = php_node_key(target, source) else {
                 return;
             };
-            php_resolve_scope_name(
-                &folded,
-                bare_key,
-                owners,
-                current_class,
-                trait_uses,
-                aliases,
-            )
+            php_resolve_scope_name(&folded, bare_key, owners, current_type, trait_uses, aliases)
         }
         // `new $cls()` は動的クラス名で owner を静的解決できない。
         "variable_name" => PhpOwnerResolution::Ambiguous,
@@ -623,7 +628,7 @@ fn php_scoped_call_owner(
     source: &[u8],
     owners: &HashSet<String>,
     bare_key: &str,
-    current_class: Option<&str>,
+    current_type: Option<&PhpEnclosingType>,
     trait_uses: &HashMap<String, PhpTraitUses>,
     aliases: &PhpFileAliases,
 ) -> PhpOwnerResolution {
@@ -645,14 +650,7 @@ fn php_scoped_call_owner(
             .next()
             .unwrap_or(text),
     );
-    php_resolve_scope_name(
-        &folded,
-        bare_key,
-        owners,
-        current_class,
-        trait_uses,
-        aliases,
-    )
+    php_resolve_scope_name(&folded, bare_key, owners, current_type, trait_uses, aliases)
 }
 
 /// scope 名 (folded 済み) を candidate owner へ解決する。scoped call (`X::m()`) と
@@ -661,14 +659,22 @@ fn php_resolve_scope_name(
     folded: &str,
     bare_key: &str,
     owners: &HashSet<String>,
-    current_class: Option<&str>,
+    current_type: Option<&PhpEnclosingType>,
     trait_uses: &HashMap<String, PhpTraitUses>,
     aliases: &PhpFileAliases,
 ) -> PhpOwnerResolution {
     match folded {
-        "self" => current_class
-            .map(|owner| php_resolve_trait_dispatch(owner, bare_key, owners, trait_uses))
-            .unwrap_or(PhpOwnerResolution::Ambiguous),
+        // trait 本体内の `self::` / `new self()` は合成先ホストの文脈で解決され、
+        // ホスト側 (または解決順で優先される別合成 trait) の同名 override が呼ばれ得る。
+        // 定義元 trait への確定票にすると override 側が参照 0 件になり dead 誤検出する
+        // (GitLab #34) ため Ambiguous に倒し、duplicate set 全体を旧スキップへ
+        // フォールバックさせる。class/enum 本体の `self` は宣言クラスへ静的束縛される
+        // ため従来どおり確定解決する (LSB は `static::` で別途 Ambiguous 済み)。
+        "self" => match current_type {
+            Some(ctx) if ctx.is_trait => PhpOwnerResolution::Ambiguous,
+            Some(ctx) => php_resolve_trait_dispatch(&ctx.name, bare_key, owners, trait_uses),
+            None => PhpOwnerResolution::Ambiguous,
+        },
         // `static::` は遅延静的束縛 (late static binding) でサブクラス override へ
         // ディスパッチされ得る。継承グラフを持たない本解析では enclosing class へ
         // 確定解決するとサブクラス側メソッドの dead 誤検出になるため `parent::` と

@@ -2563,6 +2563,112 @@ fn detect_api_changes_ts_shadowed_local_fn_and_multiline_call_is_closed_in_diff(
     );
 }
 
+/// GitLab #33: PHP メソッドへの Eloquent リレーション戻り型付与 (`monitorLogs()` →
+/// `monitorLogs(): HasOne`) は removed ではなく modified。Laravel entrypoint 除外が
+/// API 差分経路 (exclude_framework_entrypoints=false) に効いて新側だけ除外され、
+/// 実在メソッドが api.rm に誤分類されていた。
+#[test]
+fn detect_api_changes_php_eloquent_relation_return_type_added_is_modified_not_removed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/Models/VoiceLogSummaryEloquent.php",
+                "<?php\n\nclass VoiceLogSummaryEloquent extends AbstractEloquent {\n    public function monitorLogs() {\n        return $this->hasMany(MonitorLogEloquent::class, 'request_id', 'request_id');\n    }\n}\n",
+            ),
+            (
+                "src/Repositories/VoiceLogSummaryRepositoryQuery.php",
+                "<?php\n\nclass VoiceLogSummaryRepositoryQuery {\n    public function fetch($eloquent) {\n        $monitorLog = $eloquent->monitorLogs;\n        return $monitorLog;\n    }\n}\n",
+            ),
+        ],
+        "base",
+    );
+    fs::write(
+        repo.join("src/Models/VoiceLogSummaryEloquent.php"),
+        "<?php\n\nuse Illuminate\\Database\\Eloquent\\Relations\\HasOne;\n\nclass VoiceLogSummaryEloquent extends AbstractEloquent {\n    public function monitorLogs(): HasOne {\n        return $this->hasOne(MonitorLogEloquent::class, 'request_id', 'request_id');\n    }\n}\n",
+    )
+    .expect("write");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/Models/VoiceLogSummaryEloquent.php".to_string(),
+        new_path: "src/Models/VoiceLogSummaryEloquent.php".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 7,
+            new_start: 1,
+            new_count: 9,
+        }],
+        deleted_old_source: None,
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        !api.removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .any(|s| s.name.ends_with("monitorLogs")),
+        "実在メソッドの返り型付与を removed/removed_dead に分類しない。removed={:?} removed_dead={:?}",
+        api.removed.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+    assert!(
+        api.modified
+            .iter()
+            .any(|m| m.name == "VoiceLogSummaryEloquent.monitorLogs"),
+        "返り型付与はシグネチャ変更として modified に分類する。modified={:?}",
+        api.modified.iter().map(|m| &m.name).collect::<Vec<_>>()
+    );
+}
+
+/// GitLab #33 の裏面: Eloquent リレーションメソッドの実削除は api.rm として検出する
+/// (旧実装は old 側抽出でも entrypoint 除外され silent false negative だった)。
+#[test]
+fn detect_api_changes_php_eloquent_relation_removed_is_reported() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/Models/VoiceLogSummaryEloquent.php",
+                "<?php\n\nuse Illuminate\\Database\\Eloquent\\Relations\\HasOne;\n\nclass VoiceLogSummaryEloquent extends AbstractEloquent {\n    public function monitorLogs(): HasOne {\n        return $this->hasOne(MonitorLogEloquent::class, 'request_id', 'request_id');\n    }\n\n    public function keepMe() {\n        return 1;\n    }\n}\n",
+            ),
+            (
+                "src/Repositories/VoiceLogSummaryRepositoryQuery.php",
+                "<?php\n\nclass VoiceLogSummaryRepositoryQuery {\n    public function fetch($eloquent) {\n        $monitorLog = $eloquent->monitorLogs;\n        return $monitorLog;\n    }\n}\n",
+            ),
+        ],
+        "base",
+    );
+    fs::write(
+        repo.join("src/Models/VoiceLogSummaryEloquent.php"),
+        "<?php\n\nclass VoiceLogSummaryEloquent extends AbstractEloquent {\n    public function keepMe() {\n        return 1;\n    }\n}\n",
+    )
+    .expect("write");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/Models/VoiceLogSummaryEloquent.php".to_string(),
+        new_path: "src/Models/VoiceLogSummaryEloquent.php".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 13,
+            new_start: 1,
+            new_count: 7,
+        }],
+        deleted_old_source: None,
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.removed
+            .iter()
+            .any(|s| s.name == "VoiceLogSummaryEloquent.monitorLogs"),
+        "参照が残る Eloquent リレーションメソッドの削除は removed として報告する。removed={:?} removed_dead={:?}",
+        api.removed.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+}
+
 /// 同名ローカル関数の shadow があっても、対象 caller が diff 外なら従来どおり blocking。
 #[test]
 fn detect_api_changes_ts_shadowed_local_fn_with_caller_outside_diff_stays_modified() {
