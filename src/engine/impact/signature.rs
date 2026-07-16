@@ -647,6 +647,94 @@ mod tests {
         ));
     }
 
+    /// GitLab #35: docblock コメント内の `class SipUserId` テキストをヘッダ変更と
+    /// 誤認しない。誤認するとクラス参照全件が impacted_callers に過剰列挙される。
+    #[test]
+    fn is_definition_header_ignores_docblock_comment_lines() {
+        let diff = "\
+--- a/src/SipUserId.php
++++ b/src/SipUserId.php
+@@ -3,3 +3,3 @@
+- * class SipUserSipUserId
++ * class SipUserId
+  */";
+        assert!(!is_definition_header_in_changed_lines(
+            diff,
+            "src/SipUserId.php",
+            "SipUserId",
+            "class",
+            LangId::Php
+        ));
+    }
+
+    /// 行コメント (`//` / `#`) 内の型名記載もヘッダ変更として扱わない。
+    #[test]
+    fn is_definition_header_ignores_line_comment_lines() {
+        let diff = "\
+--- a/src/lib.ts
++++ b/src/lib.ts
+@@ -1,2 +1,2 @@
+-// class Widget handles clicks
++// class Widget handles clicks and keys";
+        assert!(!is_definition_header_in_changed_lines(
+            diff,
+            "src/lib.ts",
+            "Widget",
+            "class",
+            LangId::Typescript
+        ));
+        let diff_py = "\
+--- a/app.py
++++ b/app.py
+@@ -1,2 +1,2 @@
+-# class Widget legacy note
++# class Widget updated note";
+        assert!(!is_definition_header_in_changed_lines(
+            diff_py,
+            "app.py",
+            "Widget",
+            "class",
+            LangId::Python
+        ));
+    }
+
+    /// PHP 8 attribute の単一行形 (`#[Attr] class Foo {}`) は実コード行なので
+    /// コメント扱いせずヘッダ変更として検出する。
+    #[test]
+    fn is_definition_header_keeps_php_attribute_line() {
+        let diff = "\
+--- a/src/SipUserId.php
++++ b/src/SipUserId.php
+@@ -3,3 +3,3 @@
+-#[Immutable] class SipUserId extends A {
++#[Immutable] class SipUserId extends B {";
+        assert!(is_definition_header_in_changed_lines(
+            diff,
+            "src/SipUserId.php",
+            "SipUserId",
+            "class",
+            LangId::Php
+        ));
+    }
+
+    /// 実際の型定義ヘッダ行の変更は従来どおり検出する (コメントスキップの回帰担保)。
+    #[test]
+    fn is_definition_header_detects_real_class_header_change() {
+        let diff = "\
+--- a/src/SipUserId.php
++++ b/src/SipUserId.php
+@@ -6,2 +6,2 @@
+-class SipUserId extends AbstractValueObjectId {
++class SipUserId extends OtherBase {";
+        assert!(is_definition_header_in_changed_lines(
+            diff,
+            "src/SipUserId.php",
+            "SipUserId",
+            "class",
+            LangId::Php
+        ));
+    }
+
     /// arity 比較: generics / ネスト括弧内のカンマはトップレベル引数として数えない。
     #[test]
     fn same_top_level_arity_ignores_nested_commas() {
