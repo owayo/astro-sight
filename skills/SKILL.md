@@ -15,6 +15,7 @@ tree-sitter AST-based code structure CLI. The primary **Grep replacement for cod
 ## When to Use (Decision Checklist)
 
 **Before running Grep, ask: "Does my search contain code identifiers?"** If yes → astro-sight, not Grep.
+The same rule applies inside shell commands: wrapping `grep` / `rg` in Bash is not an exception.
 
 | Need | Command |
 |---|---|
@@ -37,12 +38,12 @@ tree-sitter AST-based code structure CLI. The primary **Grep replacement for cod
 ## Quick Reference
 
 ```bash
-astro-sight review --dir . --git                   # 1. one-shot diff/PR review
-astro-sight context --dir . --git                  # 2. what a change breaks (before editing)
-astro-sight impact --dir . --git                   # 3. unresolved impacts (after editing)
-astro-sight dead-code --dir . --git                # 4. dead exported symbols
-astro-sight refs --name <symbol> --dir .           # 5. references (REPLACES Grep for identifiers)
-astro-sight refs --names sym1,sym2 --dir .         # 6. batch symbol search (REPLACES Grep "FOO|Bar")
+astro-sight refs --name <symbol> --dir .           # 1. references (REPLACES Grep for identifiers)
+astro-sight refs --names sym1,sym2 --dir .         # 2. batch symbol search (REPLACES Grep "FOO|Bar")
+astro-sight review --dir . --git                   # 3. one-shot diff/PR review
+astro-sight context --dir . --git                  # 4. what a change breaks (before editing)
+astro-sight impact --dir . --git                   # 5. unresolved impacts (after editing)
+astro-sight dead-code --dir . --git                # 6. dead exported symbols
 astro-sight symbols --path <file>                  # 7. file structure
 astro-sight calls --path <file> --function <name>  # 8. caller/callee relationships
 astro-sight imports --path <file>                  # 9. imports/exports
