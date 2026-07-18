@@ -269,6 +269,8 @@ astro-sight context --dir . --diff-file /tmp/changes.diff
 }
 ```
 
+呼び出し元は確信度と破壊性で3系統に分かれる。`impacted_callers` は実際の呼び出し位置で、diff 外に残れば `impact` の blocking 対象になる。owner を確定できない汎用名や、直接 import の証拠がない TS/Rust の同名参照は `low_confidence_callers` に分離する。名前と引数個数を保った関数値参照や、名前を保った modified シンボルの import 行は `informational_callers` に分離し、blocking 対象にしない。削除、引数個数の変更、判定不能な参照は通常側へ残す。
+
 ### impact - 未解決の影響検出（stop hook 用）
 
 `context` の結果から、diff に含まれないファイルへの影響を「未解決」と判定する。AI エージェントの stop hook で使用し、未対応の影響先があればブロックして続行を促す。
@@ -367,6 +369,8 @@ astro-sight review --dir . --git \
 全 changed file が Xojo などの lexer-only 言語だけの場合、`review` は `impact` / `api_changes` / `dead_symbols` をすべて空結果で返す。lexer 経路の cross-file 解析は汎用名ノイズが多いため、`symbols` / `refs` / `dead-code` の単体コマンドで確認する。
 
 `api_changes.compatible_modified` には、シグネチャ文字列は変わるが既存呼び出しの互換性を保つ変更を出力する。React component の HOC ラップ、未参照 object member 削除、TS/TSX トップレベル関数の末尾 optional/default 引数追加 (`trailing_optional_params`)、Python トップレベル関数 / モジュール直下クラスメソッドの末尾 kwonly+default / 末尾 positional default 引数追加 (`trailing_optional_params`、デコレータ差分や同名関数複数定義は保守的に blocking 維持) は informational として扱い、`--hook` の blocking 対象にしない。同じシンボルに紐づく `impacts` も破壊的影響としては出さず、`mod_compat` の情報提供だけに留める。
+
+実行時に暗黙呼び出しされるシンボルの除外範囲は API 差分と dead-code で異なる。PHPUnit 規約、TS/JS の constructor、Flyway migration はどちらの公開面からも除外する。一方、Laravel relation や Angular lifecycle hook は dead-code では除外するが、外部公開シグネチャの変更を見逃さないよう API 差分には残す。`--framework` は dead-code 規約の選択であり、この API 差分境界を一律には変更しない。
 
 ```bash
 # git diff を自動取得してレビュー（推奨）

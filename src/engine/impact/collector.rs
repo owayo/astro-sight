@@ -119,6 +119,116 @@ fn confidence_filter_disabled() -> bool {
         == Some("1")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallerRoute {
+    Normal,
+    Low,
+    Informational,
+}
+
+/// 参照1件を出力バケットへ振り分ける際に、ファイル全体で共有する情報。
+/// 集約mapや文字列poolは持たず、判定に必要なimport事実キャッシュだけを更新する。
+struct RouteDecisionContext<'a> {
+    filter_disabled: bool,
+    ref_lang: Option<LangId>,
+    dir: &'a str,
+    path_str: &'a str,
+    import_facts_cache: &'a mut LruCache<String, Option<RefFileFacts>>,
+}
+
+impl RouteDecisionContext<'_> {
+    fn decide(
+        &mut self,
+        event: &RefEventMini,
+        file_context: &FileContext,
+        symbol_name: &str,
+        has_parent_type: bool,
+        base_route_low: bool,
+    ) -> CallerRoute {
+        // callee でない関数値渡し参照 (`register((a, my_system, b))` のタプル要素等) は、
+        // シグネチャのみ変更 (arity 不変) ならトレイト境界に吸収されコンパイルが通る
+        // ことが多いため informational へ。arity 変更は高階 API でも壊れ得るため、
+        // また removed (存在破壊) は sig_changes に載らないため、どちらも blocking 維持。
+        let fn_value_informational = event.fn_value_ref
+            && file_context.sig_changes.iter().any(|change| {
+                ci_key(file_context.lang_id, &change.name) == symbol_name
+                    && same_top_level_arity(&change.old_signature, &change.new_signature)
+            });
+        let route_informational = fn_value_informational
+            || (event.is_import
+                && file_context.affected.iter().any(|symbol| {
+                    symbol.change_type == "modified"
+                        && ci_key(file_context.lang_id, &symbol.name) == symbol_name
+                }));
+
+        // import-only 参照は modified シンボルだけ情報提供に分離する。
+        // removed/rename 相当の import は存在破壊になり得るため通常側に残す。
+        let route_low = if event.is_import {
+            false
+        } else {
+            // TS/TSX/JS 名前衝突の誤検出抑制:
+            // 参照元と変更元がTS系で、変更元moduleの直接importがなければlowへ振り分ける。
+            let ts_route_low = if !self.filter_disabled
+                && self.ref_lang.is_some_and(lang_is_ts_family)
+                && lang_is_ts_family(file_context.lang_id)
+            {
+                let has_direct_import = ref_file_directly_imports_source(
+                    self.dir,
+                    self.path_str,
+                    &file_context.new_path,
+                    self.import_facts_cache,
+                );
+                should_route_ts_importless_ref_low(
+                    true,
+                    true,
+                    has_direct_import,
+                    event.local_shadow_hint,
+                )
+            } else {
+                false
+            };
+
+            // Rust 名前衝突の誤検出抑制:
+            // 自由関数は別moduleからbareで呼べないため、import/qualified path/globの証拠が
+            // なければlowへ振り分ける。メソッドはbare呼び出しが正当なので対象外。
+            let rust_route_low = if !self.filter_disabled
+                && !has_parent_type
+                && self.ref_lang == Some(LangId::Rust)
+                && file_context.lang_id == LangId::Rust
+            {
+                if event.rust_macro_callee {
+                    true
+                } else {
+                    match rust_ref_file_has_symbol_evidence(
+                        self.dir,
+                        self.path_str,
+                        symbol_name,
+                        self.import_facts_cache,
+                    ) {
+                        Some(has_evidence) => should_route_rust_ref_low(
+                            has_evidence,
+                            event.local_shadow_hint,
+                            event.ref_in_macro,
+                        ),
+                        None => false,
+                    }
+                }
+            } else {
+                false
+            };
+            base_route_low || ts_route_low || rust_route_low
+        };
+
+        if route_informational {
+            CallerRoute::Informational
+        } else if route_low {
+            CallerRoute::Low
+        } else {
+            CallerRoute::Normal
+        }
+    }
+}
+
 /// `RefVisitor` の実装: per-file の ref 走査中は最小限の buffering だけ行い、
 /// ファイル走査完了後に `finish_file` で Stage 1-6 (Stage 4b 除く) の filter を適用して
 /// `local_maps` / `local_def_paths` へ流す。`SymbolReference` の Vec は生成しない。
@@ -267,6 +377,13 @@ impl<'a> ImpactCollector<'a> {
         // Phase 4: confidence == BareNameOnly + シンボル名が generic (new/update/...) なら
         // local_low_maps へ振り分け、強い impact 信号を汚染しない。
         let filter_disabled = confidence_filter_disabled();
+        let mut route_context = RouteDecisionContext {
+            filter_disabled,
+            ref_lang: self.ref_lang,
+            dir: self.dir,
+            path_str: self.path_str,
+            import_facts_cache: self.import_facts_cache,
+        };
         for e in self.ref_events.drain(..) {
             let sym_ix_usize = e.sym_ix as usize;
             let fc_ixs = &self.sym_to_fc[sym_ix_usize];
@@ -311,88 +428,13 @@ impl<'a> ImpactCollector<'a> {
                 }
 
                 let sym_key_canonical = &self.all_symbol_names[sym_ix_usize];
-                // callee でない関数値渡し参照 (`register((a, my_system, b))` のタプル要素等) は、
-                // シグネチャのみ変更 (arity 不変) ならトレイト境界に吸収されコンパイルが通る
-                // ことが多いため informational へ。arity 変更は高階 API でも壊れ得るため、
-                // また removed (存在破壊) は sig_changes に載らないため、どちらも blocking 維持。
-                let fn_value_informational = e.fn_value_ref
-                    && ctx.sig_changes.iter().any(|sc| {
-                        ci_key(ctx.lang_id, &sc.name) == *sym_key_canonical
-                            && same_top_level_arity(&sc.old_signature, &sc.new_signature)
-                    });
-                let route_informational = fn_value_informational
-                    || (e.is_import
-                        && ctx.affected.iter().any(|sym| {
-                            sym.change_type == "modified"
-                                && ci_key(ctx.lang_id, &sym.name) == *sym_key_canonical
-                        }));
-                // import-only 参照は、modified シンボルだけ情報提供に分離する。
-                // removed/rename 相当の import は存在破壊になり得るため high 側に残す。
-                let route_low = if e.is_import {
-                    false
-                } else {
-                    // TS/TSX/JS 名前衝突 FP 抑制 (Issue 2026-06-05-multi-attachment-conversations-fp):
-                    // ref file の言語と source の言語が両方 TS family、ref file が source module を
-                    // 直接 import していない、かつ context にローカル shadow hint があれば
-                    // local_low_maps へ routing する。
-                    let ts_route_low = if !filter_disabled
-                        && self.ref_lang.is_some_and(lang_is_ts_family)
-                        && lang_is_ts_family(ctx.lang_id)
-                    {
-                        let has_direct_import = ref_file_directly_imports_source(
-                            self.dir,
-                            self.path_str,
-                            source_path,
-                            self.import_facts_cache,
-                        );
-                        should_route_ts_importless_ref_low(
-                            true,
-                            true,
-                            has_direct_import,
-                            e.local_shadow_hint,
-                        )
-                    } else {
-                        false
-                    };
-                    // Rust 名前衝突 FP 抑制 (Issue 2026-06-13-ai-status-json-symbol-fp):
-                    // 別ファイルのローカル変数 (`let json`) が同名の自由関数 (`render::json`) への
-                    // cross-file 参照に誤マッチするのを抑える。自由関数 (module-level fn/const/static)
-                    // は別モジュールから bare では呼べず `use` / qualified path が必須なので、ref file に
-                    // その証拠 (import / `X::json` / glob) がなければ bare `json` は別物 → low。
-                    // メソッド (`has_parent_type`) は `foo.bar()` のように bare 呼び出しが正当なため対象外
-                    // (親型ロジックで別途処理済み)。fail-closed: 判定不能なら high 維持。
-                    let rust_route_low = if !filter_disabled
-                        && !has_parent_type
-                        && self.ref_lang == Some(LangId::Rust)
-                        && ctx.lang_id == LangId::Rust
-                    {
-                        let symbol_name = self
-                            .all_symbol_names
-                            .get(sym_ix_usize)
-                            .map(String::as_str)
-                            .unwrap_or("");
-                        if e.rust_macro_callee {
-                            true
-                        } else {
-                            match rust_ref_file_has_symbol_evidence(
-                                self.dir,
-                                self.path_str,
-                                symbol_name,
-                                self.import_facts_cache,
-                            ) {
-                                Some(has_evidence) => should_route_rust_ref_low(
-                                    has_evidence,
-                                    e.local_shadow_hint,
-                                    e.ref_in_macro,
-                                ),
-                                None => false,
-                            }
-                        }
-                    } else {
-                        false
-                    };
-                    base_route_low || ts_route_low || rust_route_low
-                };
+                let route = route_context.decide(
+                    &e,
+                    ctx,
+                    sym_key_canonical,
+                    has_parent_type,
+                    base_route_low,
+                );
                 // 事前 index (ci_key→元名) で O(1) 参照。per-ref の線形 find + ci_key String 割当を排除。
                 let affected_sym_name = ctx
                     .affected_name_by_cikey
@@ -407,12 +449,10 @@ impl<'a> ImpactCollector<'a> {
 
                 let ix_u32 = e.sym_ix;
                 let key = (path_id, e.line as usize);
-                let target_map = if route_informational {
-                    &mut self.local_informational_maps[fc_ix]
-                } else if route_low {
-                    &mut self.local_low_maps[fc_ix]
-                } else {
-                    &mut self.local_maps[fc_ix]
+                let target_map = match route {
+                    CallerRoute::Normal => &mut self.local_maps[fc_ix],
+                    CallerRoute::Low => &mut self.local_low_maps[fc_ix],
+                    CallerRoute::Informational => &mut self.local_informational_maps[fc_ix],
                 };
                 let entry = target_map
                     .entry(key)
@@ -444,6 +484,7 @@ impl<'a> ImpactCollector<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::impact::{AffectedSymbol, SignatureChange};
 
     fn ev(sym_ix: u32, confidence: u8) -> RefEventMini {
         RefEventMini {
@@ -494,5 +535,88 @@ mod tests {
         assert!(!is_low_confidence_caller(&ev(0, 1), &names));
         // sym_ix が範囲外 → false (panic させない)
         assert!(!is_low_confidence_caller(&ev(99, 2), &names));
+    }
+
+    fn file_context(
+        affected: Vec<AffectedSymbol>,
+        sig_changes: Vec<SignatureChange>,
+    ) -> FileContext {
+        FileContext {
+            new_path: "src/changed.rs".to_string(),
+            lang_id: LangId::Rust,
+            affected,
+            sig_changes,
+            hunks: Vec::new(),
+            call_edges: Vec::new(),
+            cross_file_symbol_keys: Default::default(),
+            affected_name_by_cikey: Default::default(),
+        }
+    }
+
+    fn decide_route(event: &RefEventMini, context: &FileContext, base_low: bool) -> CallerRoute {
+        let mut cache = LruCache::unbounded();
+        RouteDecisionContext {
+            // TS/Rust のファイル解析を伴う補正は既存の import_facts テストに任せ、
+            // ここでは3バケットの優先順位だけを固定する。
+            filter_disabled: true,
+            ref_lang: None,
+            dir: ".",
+            path_str: "src/caller.rs",
+            import_facts_cache: &mut cache,
+        }
+        .decide(event, context, "target", false, base_low)
+    }
+
+    /// informational は low より優先し、import は modified 以外を low に落とさない。
+    #[test]
+    fn route_decision_preserves_bucket_priority_and_import_boundary() {
+        let empty = file_context(Vec::new(), Vec::new());
+        assert_eq!(decide_route(&ev(0, 0), &empty, false), CallerRoute::Normal);
+        assert_eq!(decide_route(&ev(0, 0), &empty, true), CallerRoute::Low);
+
+        let mut import = ev(0, 0);
+        import.is_import = true;
+        assert_eq!(decide_route(&import, &empty, true), CallerRoute::Normal);
+
+        let modified = file_context(
+            vec![AffectedSymbol {
+                name: "target".to_string(),
+                kind: "function".to_string(),
+                change_type: "modified".to_string(),
+            }],
+            Vec::new(),
+        );
+        assert_eq!(
+            decide_route(&import, &modified, true),
+            CallerRoute::Informational
+        );
+
+        let mut function_value = ev(0, 0);
+        function_value.fn_value_ref = true;
+        let same_arity = file_context(
+            Vec::new(),
+            vec![SignatureChange {
+                name: "target".to_string(),
+                old_signature: "fn target(a: i32)".to_string(),
+                new_signature: "fn target(a: i64)".to_string(),
+            }],
+        );
+        assert_eq!(
+            decide_route(&function_value, &same_arity, true),
+            CallerRoute::Informational
+        );
+
+        let changed_arity = file_context(
+            Vec::new(),
+            vec![SignatureChange {
+                name: "target".to_string(),
+                old_signature: "fn target(a: i32)".to_string(),
+                new_signature: "fn target(a: i32, b: i32)".to_string(),
+            }],
+        );
+        assert_eq!(
+            decide_route(&function_value, &changed_arity, false),
+            CallerRoute::Normal
+        );
     }
 }

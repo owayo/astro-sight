@@ -12943,6 +12943,117 @@ fn filter_exported_symbols_rust_pub_crate_is_still_excluded() {
     );
 }
 
+/// framework の実行時入口は、API 差分と dead-code で除外条件が異なる。
+/// Flyway は両経路で除外する一方、Laravel relation と Angular lifecycle hook は
+/// API 面に残す。この非対称性を一律のフラグ判定へまとめると、過去の誤検出が再発する。
+#[test]
+fn filter_exported_symbols_framework_flag_matrix_is_pinned() {
+    struct Case {
+        lang: crate::language::LangId,
+        source: &'static [u8],
+        path: &'static str,
+        symbol: &'static str,
+        api_surface: bool,
+        dead_code_surface: bool,
+    }
+
+    let cases = [
+        Case {
+            lang: crate::language::LangId::Php,
+            source: b"<?php\nclass FooTest { public function testBar(): void {} }\n",
+            path: "tests/FooTest.php",
+            symbol: "FooTest.testBar",
+            api_surface: false,
+            dead_code_surface: false,
+        },
+        Case {
+            lang: crate::language::LangId::Java,
+            source: b"public class V1__Init extends BaseJavaMigration { public void migrate(Context context) {} }\n",
+            path: "db/migration/V1__Init.java",
+            symbol: "V1__Init",
+            api_surface: false,
+            dead_code_surface: false,
+        },
+        Case {
+            lang: crate::language::LangId::Php,
+            source: b"<?php\nclass Model { public function posts(): HasOne { return $this->hasOne(Post::class); } }\n",
+            path: "app/Models/Model.php",
+            symbol: "Model.posts",
+            api_surface: true,
+            dead_code_surface: false,
+        },
+        Case {
+            lang: crate::language::LangId::Typescript,
+            source: b"export class Item { constructor(value: number) {} }\n",
+            path: "src/item.ts",
+            symbol: "Item.constructor",
+            api_surface: false,
+            dead_code_surface: false,
+        },
+        Case {
+            lang: crate::language::LangId::Typescript,
+            source: b"@Component({})\nexport class Widget { ngOnInit(): void {} }\n",
+            path: "src/widget.component.ts",
+            symbol: "Widget.ngOnInit",
+            api_surface: true,
+            dead_code_surface: false,
+        },
+    ];
+
+    for case in cases {
+        let tree = parser::parse_source(case.source, case.lang).expect("parse");
+        let root = tree.root_node();
+        let syms =
+            crate::engine::symbols::extract_symbols(root, case.source, case.lang).expect("symbols");
+
+        for (exclude_framework_entrypoints, expected) in
+            [(false, case.api_surface), (true, case.dead_code_surface)]
+        {
+            let exported = filter_exported_symbols(
+                &syms,
+                root,
+                case.source,
+                case.lang,
+                true,
+                exclude_framework_entrypoints,
+                Some(case.path),
+            );
+            let names: Vec<&str> = exported.iter().map(|(name, _, _)| name.as_str()).collect();
+            assert_eq!(
+                names.contains(&case.symbol),
+                expected,
+                "lang={:?} path={} exclude_framework_entrypoints={} symbol={} names={:?}",
+                case.lang,
+                case.path,
+                exclude_framework_entrypoints,
+                case.symbol,
+                names
+            );
+        }
+    }
+}
+
+/// PHPUnit 規約判定は qualname の末尾へ正規化するため、bare name と
+/// `Container.name` の結果が一致する。この前提が変わった場合は、公開面の最終判定も
+/// 合わせて再検討する必要がある。
+#[test]
+fn phpunit_test_symbol_is_invariant_to_qualname_prefix() {
+    use crate::commands::dead_code::is_phpunit_test_symbol;
+    use crate::models::symbol::SymbolKind;
+
+    for (bare, qualname) in [
+        ("testBar", "FooTest.testBar"),
+        ("setUp", "FooTest.setUp"),
+        ("helper", "FooTest.helper"),
+    ] {
+        assert_eq!(
+            is_phpunit_test_symbol(bare, SymbolKind::Method, crate::language::LangId::Php),
+            is_phpunit_test_symbol(qualname, SymbolKind::Method, crate::language::LangId::Php),
+            "bare={bare} qualname={qualname}"
+        );
+    }
+}
+
 /// `has_cross_file_refs` は qualname (`Store.get`) を bare 名 (`get`) に正規化して
 /// index を引き、cross-file 参照を検出する (qualname のままだと恒久的に 0 件になる)。
 #[test]

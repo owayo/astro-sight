@@ -47,8 +47,10 @@ astro-sight dead-code --dir . --git                # 6. dead exported symbols
 astro-sight symbols --path <file>                  # 7. file structure
 astro-sight calls --path <file> --function <name>  # 8. caller/callee relationships
 astro-sight imports --path <file>                  # 9. imports/exports
-echo '{"command":"refs","name":"S","dir":"."}
-{"command":"symbols","path":"src/main.rs"}' | astro-sight session   # 10. batch mixed queries
+printf '%s\n' \
+  '{"command":"refs","name":"S","dir":"."}' \
+  '{"command":"symbols","path":"src/main.rs"}' \
+  | astro-sight session                                  # 10. batch mixed queries
 ```
 
 ## Commands
@@ -206,8 +208,10 @@ Output: `dir`, `scanned_files`, `dead_symbols` (`name`, `kind`, `file`). Duplica
 Multiple queries in one process (avoids repeated startup):
 
 ```bash
-echo '{"command":"refs","name":"MyType","dir":"src/"}
-{"command":"calls","path":"src/main.rs","function":"main"}' | astro-sight session
+printf '%s\n' \
+  '{"command":"refs","name":"MyType","dir":"src/"}' \
+  '{"command":"calls","path":"src/main.rs","function":"main"}' \
+  | astro-sight session
 ```
 
 Supports `ast`, `symbols`, `doctor`, `calls`, `refs`, `context`, `imports`, `lint`, `sequence`, `cochange` (note: `review` is CLI-only).
@@ -236,9 +240,11 @@ astro-sight cochange --dir . --paths src/service.rs
 
 ### "Several different queries in one request"
 ```bash
-echo '{"command":"symbols","path":"src/main.rs"}
-{"command":"calls","path":"src/main.rs","function":"main"}
-{"command":"context","dir":".","diff":"..."}' | astro-sight session
+printf '%s\n' \
+  '{"command":"symbols","path":"src/main.rs"}' \
+  '{"command":"calls","path":"src/main.rs","function":"main"}' \
+  '{"command":"context","dir":".","diff":"..."}' \
+  | astro-sight session
 ```
 
 ## Notes
