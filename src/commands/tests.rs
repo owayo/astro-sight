@@ -9372,6 +9372,159 @@ fn detect_api_changes_ts_object_prop_type_change_stays_modified() {
     );
 }
 
+/// Issue 2026-07-20-react-rsc-async-component-impact-classification: React Server Component
+/// の async 化 (async キーワード追加のみ、Props 不変) で参照が JSX タグ利用のみなら、
+/// 呼び出し側の書き換えが不要なため compatible_modified (`async_jsx_component`) に降格する。
+#[test]
+fn detect_api_changes_tsx_async_jsx_component_is_compatible() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "web/components/SiteHeader.tsx",
+                "export type SiteHeaderProps = { user: string };\n\nexport function SiteHeader(props: SiteHeaderProps) {\n  return <header>{props.user}</header>;\n}\n",
+            ),
+            (
+                "web/app/layout.tsx",
+                "import { SiteHeader } from \"../components/SiteHeader\";\n\nexport default async function RootLayout({ children }: { children: any }) {\n  return (\n    <html>\n      <body>\n        <SiteHeader user=\"alice\" />\n        {children}\n      </body>\n    </html>\n  );\n}\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("web/components/SiteHeader.tsx"),
+        "export type SiteHeaderProps = { user: string };\n\nasync function fetchGreeting(): Promise<string> {\n  return \"hi\";\n}\n\nexport async function SiteHeader(props: SiteHeaderProps) {\n  const greeting = await fetchGreeting();\n  return <header>{props.user}{greeting}</header>;\n}\n",
+    )
+    .expect("write changed file");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "web/components/SiteHeader.tsx".to_string(),
+        new_path: "web/components/SiteHeader.tsx".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 5,
+            new_start: 1,
+            new_count: 10,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    assert!(
+        !api_changes.modified.iter().any(|m| m.name == "SiteHeader"),
+        "JSX 利用のみの RSC async 化は破壊的 api.mod にすべきでない: {:?}",
+        api_changes.modified
+    );
+    let compat = api_changes
+        .compatible_modified
+        .iter()
+        .find(|c| c.name == "SiteHeader")
+        .expect("compatible_modified に SiteHeader が入るべき");
+    assert_eq!(compat.reason, "async_jsx_component");
+}
+
+/// 負ケース: async 化されたコンポーネントが関数として直接呼び出されている場合、戻り値が
+/// Promise になり await が必要になるため blocking な api.mod を維持する。
+#[test]
+fn detect_api_changes_tsx_async_component_with_call_usage_stays_modified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "web/components/SiteHeader.tsx",
+                "export type SiteHeaderProps = { user: string };\n\nexport function SiteHeader(props: SiteHeaderProps) {\n  return <header>{props.user}</header>;\n}\n",
+            ),
+            (
+                "web/app/layout.tsx",
+                "import { SiteHeader } from \"../components/SiteHeader\";\n\nexport default async function RootLayout({ children }: { children: any }) {\n  const rendered = SiteHeader({ user: \"alice\" });\n  return (\n    <html>\n      <body>\n        {rendered}\n        {children}\n      </body>\n    </html>\n  );\n}\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("web/components/SiteHeader.tsx"),
+        "export type SiteHeaderProps = { user: string };\n\nexport async function SiteHeader(props: SiteHeaderProps) {\n  return <header>{props.user}</header>;\n}\n",
+    )
+    .expect("write changed file");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "web/components/SiteHeader.tsx".to_string(),
+        new_path: "web/components/SiteHeader.tsx".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 5,
+            new_start: 1,
+            new_count: 5,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    assert!(
+        api_changes.modified.iter().any(|m| m.name == "SiteHeader"),
+        "関数呼び出し利用が残る async 化は blocking を維持すべき: modified={:?} compat={:?}",
+        api_changes.modified,
+        api_changes.compatible_modified
+    );
+}
+
+/// 負ケース: `"use client"` directive を持つ Client Component の async 化は React の
+/// ランタイムエラーになる破壊的変更のため blocking な api.mod を維持する。
+#[test]
+fn detect_api_changes_tsx_async_use_client_component_stays_modified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "web/components/SiteHeader.tsx",
+                "\"use client\";\n\nexport type SiteHeaderProps = { user: string };\n\nexport function SiteHeader(props: SiteHeaderProps) {\n  return <header>{props.user}</header>;\n}\n",
+            ),
+            (
+                "web/app/layout.tsx",
+                "import { SiteHeader } from \"../components/SiteHeader\";\n\nexport default async function RootLayout({ children }: { children: any }) {\n  return (\n    <html>\n      <body>\n        <SiteHeader user=\"alice\" />\n        {children}\n      </body>\n    </html>\n  );\n}\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("web/components/SiteHeader.tsx"),
+        "\"use client\";\n\nexport type SiteHeaderProps = { user: string };\n\nexport async function SiteHeader(props: SiteHeaderProps) {\n  return <header>{props.user}</header>;\n}\n",
+    )
+    .expect("write changed file");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "web/components/SiteHeader.tsx".to_string(),
+        new_path: "web/components/SiteHeader.tsx".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 7,
+            new_start: 1,
+            new_count: 7,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    assert!(
+        api_changes.modified.iter().any(|m| m.name == "SiteHeader"),
+        "use client コンポーネントの async 化は blocking を維持すべき: modified={:?} compat={:?}",
+        api_changes.modified,
+        api_changes.compatible_modified
+    );
+}
+
 /// Issue 2026-07-12-ts-class-method-trailing-optional-param-api-mod: TS class method への
 /// 末尾 optional 引数追加も compatible_modified へ降格する。同名 standalone 関数が別
 /// ファイルにあっても `Class.method` qualname で一意解決できるため成立する。

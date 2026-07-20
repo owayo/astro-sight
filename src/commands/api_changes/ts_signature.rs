@@ -498,6 +498,125 @@ pub(crate) fn detect_optional_object_props_compatible_mod(
     })
 }
 
+/// TSX/TS の exported function component へ `async` キーワードを追加しただけの変更を
+/// compatible_modified (`async_jsx_component`) として判定する
+/// (Issue 2026-07-20-react-rsc-async-component-impact-classification)。
+///
+/// React Server Component 規約 (Next.js App Router 等) では、async server component も
+/// 同期 component も `<Foo />` の JSX 記法で呼び出され、async 化しても呼び出し側の
+/// 書き換えは不要。次をすべて満たす場合だけ降格する:
+/// - トップレベル関数 (bare 名) が old/new とも一意に解決できる
+/// - 変更が `async` キーワードの追加のみ (params / 戻り値型など他の signature は不変)
+/// - 変更後ファイルに `"use client"` directive が無い (Client Component の async 化は
+///   React ランタイムエラーになる破壊的変更のため blocking 維持)
+/// - repo 内の参照が JSX タグ利用 / import / re-export / 定義のみ (関数呼び出し
+///   `Foo()` は戻り値が Promise になり await が必要になるため blocking 維持)
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn detect_async_jsx_component_compatible_mod(
+    index: &ApiRefIndex,
+    dir: &str,
+    base: &str,
+    old_path: &str,
+    new_path: &str,
+    name: &str,
+    kind: &str,
+    old_sig: &str,
+    new_sig: &str,
+    lang_id: Option<crate::language::LangId>,
+) -> Option<CompatibleApiModification> {
+    // class method は RSC の関数コンポーネント規約外なので対象にしない。
+    if kind != "function" || name.contains('.') {
+        return None;
+    }
+    with_resolved_ts_fn_pair(
+        dir,
+        base,
+        old_path,
+        new_path,
+        name,
+        kind,
+        lang_id,
+        |old_fn, old_source, new_fn, new_source| {
+            let old_parts = ts_function_signature_parts(old_fn, old_source)?;
+            let new_parts = ts_function_signature_parts(new_fn, new_source)?;
+            if old_parts.params != new_parts.params || old_parts.tail != new_parts.tail {
+                return None;
+            }
+            if !head_is_async_addition(&old_parts.head, &new_parts.head) {
+                return None;
+            }
+            // 変更後が Client Component なら async 化は破壊的変更。
+            if ts_module_has_use_client_directive(module_root(new_fn), new_source) {
+                return None;
+            }
+            Some(())
+        },
+    )?;
+    // 値利用 (`Foo()` / `Foo.x` / `new Foo` 等) や判定不能な参照が残れば blocking 維持。
+    if has_blocking_value_usage(index, name) {
+        return None;
+    }
+    Some(CompatibleApiModification {
+        name: name.to_string(),
+        kind: kind.to_string(),
+        file: new_path.to_string(),
+        old_signature: Some(old_sig.to_string()),
+        new_signature: Some(new_sig.to_string()),
+        reason: "async_jsx_component".to_string(),
+    })
+}
+
+/// `new_head` から `async ` を 1 箇所取り除くと `old_head` に一致するか
+/// (= 変更が async キーワード追加のみか)。head は whitespace 正規化済み前提。
+fn head_is_async_addition(old_head: &str, new_head: &str) -> bool {
+    let Some(pos) = new_head.find("async ") else {
+        return false;
+    };
+    // `async` が識別子の一部 (`myasync` 等) でないことを確認する。
+    if pos > 0 {
+        let before = new_head.as_bytes()[pos - 1];
+        if before.is_ascii_alphanumeric() || before == b'_' || before == b'$' {
+            return false;
+        }
+    }
+    let stripped = format!("{}{}", &new_head[..pos], &new_head[pos + "async ".len()..]);
+    stripped == old_head
+}
+
+/// ノードから module root (program ノード) まで遡る。
+fn module_root(mut node: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+    while let Some(parent) = node.parent() {
+        node = parent;
+    }
+    node
+}
+
+/// module 先頭の directive prologue に `"use client"` があるか。
+fn ts_module_has_use_client_directive(root: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        match child.kind() {
+            "comment" => continue,
+            "expression_statement" => {
+                let mut inner = child.walk();
+                let Some(string_node) = child
+                    .named_children(&mut inner)
+                    .find(|n| n.kind() == "string")
+                else {
+                    return false; // directive prologue 終了
+                };
+                let text = string_node.utf8_text(source).unwrap_or("");
+                if text.trim_matches(|c| c == '"' || c == '\'') == "use client" {
+                    return true;
+                }
+                // "use strict" 等の他 directive は読み飛ばして続行
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// TS/TSX の compatible 判定で共通の「old/new 両ツリーから対象関数ノードを一意解決する」
 /// 前段。`check` に解決済みノードとソースを渡し、その結果を返す。解決不能 (git show 失敗 /
 /// parse 失敗 / シンボル非一意) は None = blocking 維持。
