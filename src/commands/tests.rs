@@ -9219,6 +9219,159 @@ fn detect_api_changes_ts_trailing_default_param_is_compatible() {
     assert_eq!(compat.reason, "trailing_optional_params");
 }
 
+/// Issue 2026-07-20-api-mod-additive-optional-param-overreport: 引数の inline object type
+/// literal へ optional プロパティを追加しただけの変更 (本体変更同時可) は後方互換のため、
+/// blocking な api.mod ではなく compatible_modified (`optional_object_props`) に降格する。
+#[test]
+fn detect_api_changes_ts_optional_object_prop_addition_is_compatible() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/domain/decide.ts",
+                "export type Result = { ok: boolean };\n\nexport function decide(input: { a: number; b: number }): Result {\n  return { ok: true };\n}\n",
+            ),
+            (
+                "src/caller.ts",
+                "import { decide } from './domain/decide';\nexport const outcome = decide({ a: 1, b: 2 });\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("src/domain/decide.ts"),
+        "export type Result = { ok: boolean };\n\nexport function decide(input: {\n  a: number;\n  b: number;\n  cap?: number;\n}): Result {\n  const { a, cap = 100 } = input;\n  if (a > cap) return { ok: false };\n  return { ok: true };\n}\n",
+    )
+    .expect("write changed file");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/domain/decide.ts".to_string(),
+        new_path: "src/domain/decide.ts".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 5,
+            new_start: 1,
+            new_count: 11,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    assert!(
+        !api_changes.modified.iter().any(|m| m.name == "decide"),
+        "object type への optional プロパティ追加は破壊的 api.mod にすべきでない: {:?}",
+        api_changes.modified
+    );
+    let compat = api_changes
+        .compatible_modified
+        .iter()
+        .find(|c| c.name == "decide")
+        .expect("compatible_modified に decide が入るべき");
+    assert_eq!(compat.reason, "optional_object_props");
+}
+
+/// 負ケース: 引数 object type への必須プロパティ追加は既存呼び出しを壊すため
+/// blocking な api.mod を維持する。
+#[test]
+fn detect_api_changes_ts_required_object_prop_addition_stays_modified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/domain/decide.ts",
+                "export type Result = { ok: boolean };\n\nexport function decide(input: { a: number; b: number }): Result {\n  return { ok: true };\n}\n",
+            ),
+            (
+                "src/caller.ts",
+                "import { decide } from './domain/decide';\nexport const outcome = decide({ a: 1, b: 2 });\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("src/domain/decide.ts"),
+        "export type Result = { ok: boolean };\n\nexport function decide(input: { a: number; b: number; cap: number }): Result {\n  return { ok: input.a > input.cap };\n}\n",
+    )
+    .expect("write changed file");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/domain/decide.ts".to_string(),
+        new_path: "src/domain/decide.ts".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 5,
+            new_start: 1,
+            new_count: 5,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    assert!(
+        api_changes.modified.iter().any(|m| m.name == "decide"),
+        "必須プロパティ追加は blocking な api.mod を維持すべき: modified={:?} compat={:?}",
+        api_changes.modified,
+        api_changes.compatible_modified
+    );
+}
+
+/// 負ケース: optional プロパティ追加と同時に既存プロパティの型を変更した場合は
+/// 既存呼び出しが壊れ得るため blocking な api.mod を維持する。
+#[test]
+fn detect_api_changes_ts_object_prop_type_change_stays_modified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/domain/decide.ts",
+                "export type Result = { ok: boolean };\n\nexport function decide(input: { a: number; b: number }): Result {\n  return { ok: true };\n}\n",
+            ),
+            (
+                "src/caller.ts",
+                "import { decide } from './domain/decide';\nexport const outcome = decide({ a: 1, b: 2 });\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("src/domain/decide.ts"),
+        "export type Result = { ok: boolean };\n\nexport function decide(input: { a: string; b: number; cap?: number }): Result {\n  return { ok: true };\n}\n",
+    )
+    .expect("write changed file");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/domain/decide.ts".to_string(),
+        new_path: "src/domain/decide.ts".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 5,
+            new_start: 1,
+            new_count: 5,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    assert!(
+        api_changes.modified.iter().any(|m| m.name == "decide"),
+        "既存プロパティの型変更は blocking な api.mod を維持すべき: modified={:?} compat={:?}",
+        api_changes.modified,
+        api_changes.compatible_modified
+    );
+}
+
 /// Issue 2026-07-12-ts-class-method-trailing-optional-param-api-mod: TS class method への
 /// 末尾 optional 引数追加も compatible_modified へ降格する。同名 standalone 関数が別
 /// ファイルにあっても `Class.method` qualname で一意解決できるため成立する。

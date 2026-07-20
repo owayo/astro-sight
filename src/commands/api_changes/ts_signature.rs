@@ -381,6 +381,137 @@ pub(crate) fn detect_trailing_optional_params_compatible_mod(
     new_sig: &str,
     lang_id: Option<crate::language::LangId>,
 ) -> Option<CompatibleApiModification> {
+    with_resolved_ts_fn_pair(
+        dir,
+        base,
+        old_path,
+        new_path,
+        name,
+        kind,
+        lang_id,
+        |old_fn, old_source, new_fn, new_source| {
+            let old_parts = ts_function_signature_parts(old_fn, old_source)?;
+            let new_parts = ts_function_signature_parts(new_fn, new_source)?;
+
+            if old_parts.head != new_parts.head || old_parts.tail != new_parts.tail {
+                return None;
+            }
+            if !ts_params_prefix_same_with_optional_tail(&old_parts.params, &new_parts.params) {
+                return None;
+            }
+            Some(())
+        },
+    )?;
+
+    Some(CompatibleApiModification {
+        name: name.to_string(),
+        kind: kind.to_string(),
+        file: new_path.to_string(),
+        old_signature: Some(old_sig.to_string()),
+        new_signature: Some(new_sig.to_string()),
+        reason: "trailing_optional_params".to_string(),
+    })
+}
+
+/// TS/TSX のトップレベル exported function / class method で、引数の inline object type
+/// literal へ optional プロパティを追加しただけの変更を compatible_modified
+/// (`optional_object_props`) として判定する
+/// (Issue 2026-07-20-api-mod-additive-optional-param-overreport)。
+///
+/// `decide(input: { a: number })` → `decide(input: { a: number; cap?: number })` のような
+/// 変更は、引数 (反変) 位置の受理集合を広げるだけで既存呼び出しを壊さない。
+///
+/// 次をすべて満たす場合だけ降格する:
+/// - シンボル解決条件は trailing_optional_params と同一 (トップレベル関数 / class method
+///   が old/new とも一意)
+/// - 関数名・型パラメータ・戻り値・modifier など parameters 外の signature が不変
+/// - 引数の個数が不変で、各引数はテキスト不変、または「引数名・default 値が不変で
+///   type annotation が object type literal 同士、既存メンバーがテキスト完全一致で残り、
+///   追加メンバーがすべて optional (`?`) の property_signature」
+///
+/// ネストした object type の内部変更は既存メンバーのテキスト不一致になるため対象外
+/// (第一階層の追加のみ許容)。メンバー削除・型変更・必須メンバー追加は blocking を維持する。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn detect_optional_object_props_compatible_mod(
+    dir: &str,
+    base: &str,
+    old_path: &str,
+    new_path: &str,
+    name: &str,
+    kind: &str,
+    old_sig: &str,
+    new_sig: &str,
+    lang_id: Option<crate::language::LangId>,
+) -> Option<CompatibleApiModification> {
+    with_resolved_ts_fn_pair(
+        dir,
+        base,
+        old_path,
+        new_path,
+        name,
+        kind,
+        lang_id,
+        |old_fn, old_source, new_fn, new_source| {
+            let old_parts = ts_function_signature_parts(old_fn, old_source)?;
+            let new_parts = ts_function_signature_parts(new_fn, new_source)?;
+            if old_parts.head != new_parts.head || old_parts.tail != new_parts.tail {
+                return None;
+            }
+
+            let old_params_node = old_fn.child_by_field_name("parameters")?;
+            let new_params_node = new_fn.child_by_field_name("parameters")?;
+            let mut old_cursor = old_params_node.walk();
+            let old_children: Vec<tree_sitter::Node> =
+                old_params_node.named_children(&mut old_cursor).collect();
+            let mut new_cursor = new_params_node.walk();
+            let new_children: Vec<tree_sitter::Node> =
+                new_params_node.named_children(&mut new_cursor).collect();
+            if old_children.len() != new_children.len() {
+                return None;
+            }
+
+            let mut any_extension = false;
+            for (old_param, new_param) in old_children.iter().zip(new_children.iter()) {
+                let old_text = node_normalized_text(*old_param, old_source)?;
+                let new_text = node_normalized_text(*new_param, new_source)?;
+                if old_text == new_text {
+                    continue;
+                }
+                if !ts_param_pair_is_optional_object_extension(
+                    *old_param, old_source, *new_param, new_source,
+                ) {
+                    return None;
+                }
+                any_extension = true;
+            }
+            any_extension.then_some(())
+        },
+    )?;
+
+    Some(CompatibleApiModification {
+        name: name.to_string(),
+        kind: kind.to_string(),
+        file: new_path.to_string(),
+        old_signature: Some(old_sig.to_string()),
+        new_signature: Some(new_sig.to_string()),
+        reason: "optional_object_props".to_string(),
+    })
+}
+
+/// TS/TSX の compatible 判定で共通の「old/new 両ツリーから対象関数ノードを一意解決する」
+/// 前段。`check` に解決済みノードとソースを渡し、その結果を返す。解決不能 (git show 失敗 /
+/// parse 失敗 / シンボル非一意) は None = blocking 維持。
+#[allow(clippy::too_many_arguments)]
+fn with_resolved_ts_fn_pair<T>(
+    dir: &str,
+    base: &str,
+    old_path: &str,
+    new_path: &str,
+    name: &str,
+    kind: &str,
+    lang_id: Option<crate::language::LangId>,
+    check: impl FnOnce(tree_sitter::Node<'_>, &[u8], tree_sitter::Node<'_>, &[u8]) -> Option<T>,
+) -> Option<T> {
     use crate::language::LangId;
     let lang = lang_id.filter(|l| matches!(l, LangId::Typescript | LangId::Tsx))?;
     // 対象は「bare 名のトップレベル関数」または「Class.method の 2 要素 qualname メソッド」。
@@ -433,24 +564,111 @@ pub(crate) fn detect_trailing_optional_params_compatible_mod(
             )?,
         ),
     };
-    let old_parts = ts_function_signature_parts(old_fn, &old_source)?;
-    let new_parts = ts_function_signature_parts(new_fn, &new_source)?;
+    check(old_fn, &old_source, new_fn, &new_source)
+}
 
-    if old_parts.head != new_parts.head || old_parts.tail != new_parts.tail {
-        return None;
-    }
-    if !ts_params_prefix_same_with_optional_tail(&old_parts.params, &new_parts.params) {
-        return None;
-    }
+/// ノードのソーステキストを whitespace 正規化して返す。
+fn node_normalized_text(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    source
+        .get(node.start_byte()..node.end_byte())
+        .map(normalize_signature_whitespace)
+}
 
-    Some(CompatibleApiModification {
-        name: name.to_string(),
-        kind: kind.to_string(),
-        file: new_path.to_string(),
-        old_signature: Some(old_sig.to_string()),
-        new_signature: Some(new_sig.to_string()),
-        reason: "trailing_optional_params".to_string(),
+/// 引数ペアが「inline object type literal への optional プロパティ追加だけ」の互換拡張かを
+/// 判定する。引数の kind (required/optional)・名前 (pattern)・default 値は不変であること。
+fn ts_param_pair_is_optional_object_extension(
+    old_param: tree_sitter::Node<'_>,
+    old_source: &[u8],
+    new_param: tree_sitter::Node<'_>,
+    new_source: &[u8],
+) -> bool {
+    if old_param.kind() != new_param.kind()
+        || !matches!(
+            old_param.kind(),
+            "required_parameter" | "optional_parameter"
+        )
+    {
+        return false;
+    }
+    let (Some(old_pattern), Some(new_pattern)) = (
+        old_param.child_by_field_name("pattern"),
+        new_param.child_by_field_name("pattern"),
+    ) else {
+        return false;
+    };
+    if node_normalized_text(old_pattern, old_source)
+        != node_normalized_text(new_pattern, new_source)
+    {
+        return false;
+    }
+    let old_value = old_param
+        .child_by_field_name("value")
+        .and_then(|n| node_normalized_text(n, old_source));
+    let new_value = new_param
+        .child_by_field_name("value")
+        .and_then(|n| node_normalized_text(n, new_source));
+    if old_value != new_value {
+        return false;
+    }
+    let (Some(old_ty), Some(new_ty)) = (
+        ts_param_object_type(old_param),
+        ts_param_object_type(new_param),
+    ) else {
+        return false;
+    };
+    ts_object_type_members_optional_superset(old_ty, old_source, new_ty, new_source)
+}
+
+/// 引数の type annotation が inline object type literal (`{ ... }`) ならそのノードを返す。
+fn ts_param_object_type(param: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    let annotation = param.child_by_field_name("type")?;
+    let mut cursor = annotation.walk();
+    let ty = annotation.named_children(&mut cursor).next()?;
+    (ty.kind() == "object_type").then_some(ty)
+}
+
+/// old object_type の全メンバーが new にテキスト一致で残り、new の追加メンバーがすべて
+/// optional (`?`) の property_signature なら true。メンバー削除・変更は false。
+fn ts_object_type_members_optional_superset(
+    old_ty: tree_sitter::Node<'_>,
+    old_source: &[u8],
+    new_ty: tree_sitter::Node<'_>,
+    new_source: &[u8],
+) -> bool {
+    use std::collections::HashMap;
+    // normalized text -> 出現ノード列 (同一テキストの重複は TS エラーだが multiset で保守)
+    let mut new_members: HashMap<String, Vec<tree_sitter::Node>> = HashMap::new();
+    let mut cursor = new_ty.walk();
+    for member in new_ty.named_children(&mut cursor) {
+        let Some(text) = node_normalized_text(member, new_source) else {
+            return false;
+        };
+        new_members.entry(text).or_default().push(member);
+    }
+    let mut cursor = old_ty.walk();
+    for member in old_ty.named_children(&mut cursor) {
+        let Some(text) = node_normalized_text(member, old_source) else {
+            return false;
+        };
+        // 既存メンバーは new 側で 1 つ消費できなければ削除/変更あり → 不成立
+        match new_members.get_mut(&text) {
+            Some(nodes) if !nodes.is_empty() => {
+                nodes.pop();
+            }
+            _ => return false,
+        }
+    }
+    // 残った new 側メンバー = 追加分。すべて optional property_signature であること。
+    new_members.values().flatten().all(|member| {
+        member.kind() == "property_signature" && ts_property_signature_is_optional(*member)
     })
+}
+
+/// property_signature が optional (`?` トークン付き) か。`?` は named child に現れない
+/// anonymous token のため全 child を走査する。
+fn ts_property_signature_is_optional(prop: tree_sitter::Node<'_>) -> bool {
+    let mut cursor = prop.walk();
+    prop.children(&mut cursor).any(|c| c.kind() == "?")
 }
 
 /// `Class.method` 形式の 2 要素 qualname を分解する。3 要素以上 (nested class 等) は

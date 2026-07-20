@@ -456,6 +456,22 @@ fn classify_signature_change(
         buckets.compatible_modified.push(compat);
         return;
     }
+    // TS/TSX の引数 object type literal へ optional プロパティを追加しただけなら、
+    // 既存呼び出しが渡す object はそのまま受理されるため compatible_modified として扱う。
+    if let Some(compat) = detect_optional_object_props_compatible_mod(
+        dir,
+        base,
+        &df.old_path,
+        &df.new_path,
+        &name,
+        kind,
+        old_sig,
+        new_sig,
+        lang_id_for_file,
+    ) {
+        buckets.compatible_modified.push(compat);
+        return;
+    }
     // Python のトップレベル関数 / モジュール直下クラスのメソッドへ末尾 optional/default
     // 引数 (`*` 後の kwonly+default 含む) を追加しただけなら、既存呼び出しが壊れないため
     // compatible_modified として扱う。
