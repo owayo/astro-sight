@@ -2475,11 +2475,13 @@ pub(crate) fn is_internally_connected(
 mod js_ts_shadow;
 mod python_signature;
 mod ref_index;
+mod removed_attribution;
 mod rust_public;
 mod ts_signature;
 
 pub(crate) use python_signature::*;
 pub(crate) use ref_index::*;
+pub(crate) use removed_attribution::*;
 pub(crate) use rust_public::*;
 pub(crate) use ts_signature::*;
 
@@ -2535,50 +2537,78 @@ pub(crate) fn partition_removed_dead_candidates(
     // 除外する。これがないと汎用名の削除が外部同名 import を拾って api.rm に誤分類される
     // (codex 設計合意。full TS resolver は入れず、証明できる外部 import binding のみ除外)。
     let external_pkgs = load_external_package_names(dir);
-    // (path, symbol) -> (外部 import の local binding が symbol か, 外部 import 元名が symbol の行集合)
-    let mut import_info_cache: HashMap<(String, String), (bool, HashSet<usize>)> = HashMap::new();
+    // (path, symbol) -> ファイル解析結果 (外部 import 事実 + 参照帰属の素材)
+    let mut facts_cache: HashMap<(String, String), RefAttributionFacts> = HashMap::new();
 
-    // bare_name -> (def_count, ref_count)
-    let mut counts: HashMap<String, (usize, usize)> = HashMap::new();
+    // Pass 1: bare_name ごとの残存定義ファイル集合。参照帰属の照合先になる。
+    let mut definition_paths: HashMap<String, HashSet<String>> = HashMap::new();
     for r in &batch_result {
+        let entry = definition_paths.entry(r.symbol.clone()).or_default();
+        for x in &r.references {
+            if x.kind == Some(RefKind::Definition) {
+                entry.insert(x.path.clone());
+            }
+        }
+    }
+
+    // Pass 2: bare_name -> (def_count, 参照ごとの帰属分類)
+    let mut counts: HashMap<String, (usize, Vec<RefAttribution>)> = HashMap::new();
+    for r in &batch_result {
+        let residual_defs = definition_paths.get(&r.symbol).cloned().unwrap_or_default();
         let mut def_count = 0usize;
-        let mut ref_count = 0usize;
+        let mut attributions: Vec<RefAttribution> = Vec::new();
         for x in &r.references {
             if x.kind == Some(RefKind::Definition) {
                 def_count += 1;
                 continue;
             }
             let key = (x.path.clone(), r.symbol.clone());
-            let (local_bound, source_name_lines) =
-                import_info_cache.entry(key).or_insert_with(|| {
-                    analyze_external_import_for_symbol(dir, &x.path, &r.symbol, &external_pkgs)
-                });
+            let facts = facts_cache.entry(key).or_insert_with(|| {
+                analyze_ref_attribution_facts(dir, &x.path, &r.symbol, &external_pkgs)
+            });
             // 外部 import specifier の import 元名そのものの参照 (import 行) は別モジュールの
             // export 名なので数えない (`import { Config as X } from "pkg"` の `Config`)。
-            if source_name_lines.contains(&x.line) {
+            if facts.external_source_name_lines.contains(&x.line) {
                 continue;
             }
             // 外部 import の local binding を持つファイルなら、その使用箇所も外部由来として
             // 数えない (`import { Config } from "pkg"` の local Config 利用)。
-            if *local_bound {
+            if facts.external_local_bound {
                 continue;
             }
-            ref_count += 1;
+            attributions.push(attribution_for_ref(facts, &x.path, &residual_defs));
         }
-        counts.insert(r.symbol.clone(), (def_count, ref_count));
+        counts.insert(r.symbol.clone(), (def_count, attributions));
     }
 
+    let empty_defs: HashSet<String> = HashSet::new();
+    let empty_attrs: (usize, Vec<RefAttribution>) = (0, Vec::new());
     let mut removed_kept = Vec::new();
     let mut removed_dead = Vec::new();
     for c in candidates {
         let bare = bare_name(&c.name).to_string();
-        let (def_count, ref_count) = counts.get(&bare).copied().unwrap_or((0, 0));
+        let (def_count, attributions) = counts.get(&bare).unwrap_or(&empty_attrs);
+        let residual_defs = definition_paths.get(&bare).unwrap_or(&empty_defs);
+        // 全参照が「削除ファイル c.file ではなく残存シンボル由来」と証明できた候補は、
+        // 削除シンボルへの残存参照ゼロとして removed_dead (informational) に降格する。
+        // 同名定義が複数残る場合 (従来は無条件 kept) も、帰属証明があれば bare name
+        // カウントの誤認 (Issue 2026-07-19-bulk-subsystem-removal の shell `usage` /
+        // mjs `loadEnvFiles`) を解消できる。証明できない参照が 1 件でもあれば従来どおり
+        // removed (blocking) に残す (fail-closed)。
+        if !attributions.is_empty()
+            && attributions
+                .iter()
+                .all(|a| proves_survivor_origin(a, &c.file, residual_defs))
+        {
+            removed_dead.push(c);
+            continue;
+        }
         // 同名定義が複数残っている → 保守的に removed に残す
-        if def_count > 1 {
+        if *def_count > 1 {
             removed_kept.push(c);
             continue;
         }
-        if ref_count == 0 {
+        if attributions.is_empty() {
             removed_dead.push(c);
         } else {
             removed_kept.push(c);
@@ -2607,7 +2637,9 @@ pub(crate) fn partition_removed_dead_candidates(
             matches!(
                 c.kind.as_str(),
                 "class" | "struct" | "trait" | "interface" | "enum"
-            ) && counts.get(bare_name(&c.name)).copied() == Some((0, 0))
+            ) && counts
+                .get(bare_name(&c.name))
+                .is_some_and(|(def_count, attributions)| *def_count == 0 && attributions.is_empty())
         })
         .map(|c| (c.file.clone(), c.name.clone()))
         .collect();
@@ -2682,83 +2714,6 @@ pub(crate) fn import_specifier_package_name(spec: &str) -> Option<String> {
         .next()
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-}
-
-/// `ref_path` の TS/JS ファイル内で、`symbol` が外部パッケージ (`external_pkgs`) からの
-/// import で束縛されているか。束縛されていれば、そのファイルの `symbol` 参照は削除した
-/// ローカルシンボルとは別物 (別モジュールの同名型) と判断できる。
-/// 非 TS/JS / 読み込み・parse 失敗 / external_pkgs 空は false (除外しない、保守的)。
-/// `ref_path` の TS/JS ファイルを解析し、`symbol` に関する外部パッケージ import 情報を返す。
-/// 戻り値 `(local_bound, source_name_lines)`:
-/// - `local_bound`: 外部パッケージ (`external_pkgs`) からの import で local binding が `symbol`
-///   (`import { Config }` / `import { Foo as Config }` / `import Config` / `import * as Config`)。
-///   この場合ファイル内の `symbol` 利用は外部由来 (使用箇所も除外対象)。
-/// - `source_name_lines`: 外部 import specifier の **import 元名** が `symbol` の行 (0-indexed)。
-///   `import { Config as X } from "pkg"` の `Config` は別モジュールの export 名なので、その
-///   import 行の参照だけを除外する (使用箇所は local binding X で別物)。
-///
-/// 非 TS/JS / 読み込み・parse 失敗 / external_pkgs 空は `(false, 空集合)` (除外しない、保守的)。
-pub(crate) fn analyze_external_import_for_symbol(
-    dir: &str,
-    ref_path: &str,
-    symbol: &str,
-    external_pkgs: &std::collections::HashSet<String>,
-) -> (bool, std::collections::HashSet<usize>) {
-    use crate::language::LangId;
-    use std::collections::HashSet;
-    let empty = (false, HashSet::new());
-    if external_pkgs.is_empty() {
-        return empty;
-    }
-    let abs = if std::path::Path::new(ref_path).is_absolute() {
-        std::path::PathBuf::from(ref_path)
-    } else {
-        std::path::Path::new(dir).join(ref_path)
-    };
-    let Some(utf8) = camino::Utf8Path::from_path(&abs) else {
-        return empty;
-    };
-    let Ok(lang) = LangId::from_path(utf8) else {
-        return empty;
-    };
-    if !matches!(lang, LangId::Javascript | LangId::Typescript | LangId::Tsx) {
-        return empty;
-    }
-    let Ok(source) = parser::read_file(utf8) else {
-        return empty;
-    };
-    let Ok(tree) = parser::parse_source(&source, lang) else {
-        return empty;
-    };
-    let root = tree.root_node();
-    let mut local_bound = false;
-    let mut source_name_lines = HashSet::new();
-    let mut cursor = root.walk();
-    for child in root.named_children(&mut cursor) {
-        if child.kind() != "import_statement" {
-            continue;
-        }
-        let Some(src_node) = child.child_by_field_name("source") else {
-            continue;
-        };
-        let Some(spec) = static_js_string_text(src_node, &source) else {
-            continue;
-        };
-        let Some(pkg) = import_specifier_package_name(spec) else {
-            continue;
-        };
-        if !external_pkgs.contains(&pkg) {
-            continue;
-        }
-        collect_external_import_bindings(
-            child,
-            &source,
-            symbol,
-            &mut local_bound,
-            &mut source_name_lines,
-        );
-    }
-    (local_bound, source_name_lines)
 }
 
 /// 外部パッケージ import 文 `import_stmt` を解析し、`symbol` の local binding 有無を

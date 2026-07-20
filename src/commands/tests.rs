@@ -3813,6 +3813,194 @@ fn detect_api_changes_deleted_member_with_surviving_owner_definition_stays_remov
     );
 }
 
+/// Issue 2026-07-19-bulk-subsystem-removal: 削除された bash 関数と同名のローカル関数が
+/// 複数の残存スクリプトに定義され、参照がすべて各定義ファイル内で閉じている場合、bare
+/// name カウントは def_count > 1 + ref_count > 0 で従来 blocking に残していた。参照の
+/// 帰属確認 (同ファイル定義 = 削除ファイルが消えても未定義にならない) により
+/// removed_dead (informational) へ降格する。
+#[test]
+fn detect_api_changes_bulk_removal_bash_same_name_local_functions_demoted_to_removed_dead() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let deleted_src = "#!/bin/bash\nusage() {\n  echo \"usage: deleted-tool\"\n}\nusage\n";
+    git_commit_files(
+        repo,
+        &[
+            ("scripts/deleted-tool.sh", deleted_src),
+            (
+                "scripts/keep-a.sh",
+                "#!/bin/bash\nusage() {\n  echo \"usage: keep-a\"\n}\nusage\n",
+            ),
+            (
+                "scripts/keep-b.sh",
+                "#!/bin/bash\nusage() {\n  echo \"usage: keep-b\"\n}\nif [ -z \"$1\" ]; then usage >&2; fi\n",
+            ),
+        ],
+        "base",
+    );
+    std::fs::remove_file(repo.join("scripts/deleted-tool.sh")).expect("rm");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "scripts/deleted-tool.sh".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 5,
+            new_start: 0,
+            new_count: 0,
+        }],
+        deleted_old_source: Some(deleted_src.as_bytes().to_vec()),
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.removed_dead.iter().any(|s| s.name == "usage"),
+        "同名ローカル関数へ帰属確認できた削除は removed_dead に降格すべき。removed={:?} removed_dead={:?}",
+        api.removed.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+    assert!(
+        !api.removed.iter().any(|s| s.name == "usage"),
+        "blocking な removed に残さない。removed={:?}",
+        api.removed.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+}
+
+/// Issue 2026-07-19-bulk-subsystem-removal: 削除された mjs export と同名の独立シンボルが
+/// 残存し、参照が残存側への相対 import で束縛されている場合、bare name カウントは
+/// 「削除シンボルへの残存参照」と誤認して blocking に残していた。import specifier の
+/// 相対解決で残存定義ファイルへの帰属を証明し removed_dead へ降格する。
+#[test]
+fn detect_api_changes_bulk_removal_import_attributed_to_survivor_demoted_to_removed_dead() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let deleted_src =
+        "export function loadEnvFiles(dir) {\n  return { dir };\n}\nloadEnvFiles(\".\");\n";
+    git_commit_files(
+        repo,
+        &[
+            ("plugins/setup.mjs", deleted_src),
+            (
+                "api/src/config.ts",
+                "export function loadEnvFiles(baseDir = \".\", env = {}) {\n  return { baseDir, env };\n}\n",
+            ),
+            (
+                "api/test/config.test.ts",
+                "import { loadEnvFiles } from \"../src/config\";\n\nexport function testConfig() {\n  return loadEnvFiles(\".\", {});\n}\n",
+            ),
+        ],
+        "base",
+    );
+    std::fs::remove_file(repo.join("plugins/setup.mjs")).expect("rm");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "plugins/setup.mjs".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 4,
+            new_start: 0,
+            new_count: 0,
+        }],
+        deleted_old_source: Some(deleted_src.as_bytes().to_vec()),
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.removed_dead.iter().any(|s| s.name == "loadEnvFiles"),
+        "残存定義への import で帰属確認できた削除は removed_dead に降格すべき。removed={:?} removed_dead={:?}",
+        api.removed.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+    assert!(
+        !api.removed.iter().any(|s| s.name == "loadEnvFiles"),
+        "blocking な removed に残さない。removed={:?}",
+        api.removed.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+}
+
+/// 負ケース: 参照ファイルの import specifier が削除ファイル自身に解決される場合は、
+/// 同名の残存定義があっても破壊的削除として blocking な removed を維持する。
+#[test]
+fn detect_api_changes_removed_function_imported_from_deleted_file_stays_removed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let deleted_src = "export function doWork() {\n  return 1;\n}\n";
+    git_commit_files(
+        repo,
+        &[
+            ("src/deleted.ts", deleted_src),
+            (
+                "src/keep.ts",
+                "export function doWork() {\n  return 2;\n}\n",
+            ),
+            (
+                "src/caller.ts",
+                "import { doWork } from \"./deleted\";\n\nexport function run() {\n  return doWork();\n}\n",
+            ),
+        ],
+        "base",
+    );
+    std::fs::remove_file(repo.join("src/deleted.ts")).expect("rm");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/deleted.ts".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 3,
+            new_start: 0,
+            new_count: 0,
+        }],
+        deleted_old_source: Some(deleted_src.as_bytes().to_vec()),
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.removed.iter().any(|s| s.name == "doWork"),
+        "削除ファイルへの import が残る削除は blocking な removed を維持すべき。removed={:?} removed_dead={:?}",
+        api.removed.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+}
+
+/// 負ケース: 参照スクリプト自身に同名関数が定義されていても、リテラル `source` が
+/// 削除ファイルを指している (削除実装への明示依存が残る) 場合は blocking を維持する。
+#[test]
+fn detect_api_changes_bash_literal_source_of_deleted_file_stays_removed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let deleted_src = "#!/bin/bash\nhelper() {\n  echo \"deleted helper\"\n}\n";
+    git_commit_files(
+        repo,
+        &[
+            ("src/deleted-lib.sh", deleted_src),
+            (
+                "src/runner.sh",
+                "#!/bin/bash\nhelper() {\n  echo \"local fallback\"\n}\nsource ./deleted-lib.sh\nhelper\n",
+            ),
+        ],
+        "base",
+    );
+    std::fs::remove_file(repo.join("src/deleted-lib.sh")).expect("rm");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/deleted-lib.sh".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 4,
+            new_start: 0,
+            new_count: 0,
+        }],
+        deleted_old_source: Some(deleted_src.as_bytes().to_vec()),
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.removed.iter().any(|s| s.name == "helper"),
+        "削除ファイルをリテラル source する参照が残る削除は blocking を維持すべき。removed={:?} removed_dead={:?}",
+        api.removed.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+}
+
 /// crate-private module 配下の pub fn を同一ファイル内で一部だけ削除した場合も、
 /// (同一 crate 内に caller が残っていても) crate 外非到達なので api.rm に出さない。
 #[test]
