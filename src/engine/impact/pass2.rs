@@ -75,6 +75,137 @@ pub(super) struct StreamCallerMaps {
     pub(super) string_pool: StringPool,
 }
 
+/// Pass 2 の走査で使う sym_ix ベースの索引 2 本。どちらも入力から純粋に導出される。
+struct SymIndexes {
+    /// sym_ix → そのシンボルを cross-file 検索対象に含めた FileContext の index 列。
+    sym_to_fc: Vec<Vec<u32>>,
+    /// sym_ix → 親型の sym_ix (method のみ、Stage 4b 判定用)。
+    parent_ix_by_sym: Vec<Option<usize>>,
+}
+
+/// Pass 2 の走査開始前に 1 度だけ用意する構築物。いずれか 1 つでも構築に失敗したら
+/// 走査自体を行わない (呼び出し側は空結果を返す)。
+struct Pass2Scan {
+    ac: aho_corasick::AhoCorasick,
+    files: Vec<std::path::PathBuf>,
+    pool: rayon::ThreadPool,
+}
+
+/// Pass 2 の入力 `file_contexts` が全て case-insensitive 言語 (Xojo 等) かを判定する。
+///
+/// **`diff_files_all_case_insensitive` (mod.rs / commands.rs) とは意図的に入力集合が
+/// 異なる**: `file_contexts` は Pass 1 の「ファイル存在 / ワークスペース境界 /
+/// parse 成功」フィルタを通過した diff エントリだけを含むため、mod.rs の事前判定が
+/// skip しなかった diff でも Pass 2 ではここで skip し得る (多層防御)。
+/// 「重複だから」と `diff_files_all_case_insensitive` に統合してはいけない。
+fn all_file_contexts_case_insensitive(file_contexts: &[FileContext]) -> bool {
+    !file_contexts.is_empty()
+        && file_contexts
+            .iter()
+            .all(|fc| fc.lang_id.is_case_insensitive())
+}
+
+/// `sym_to_fc` / `parent_ix_by_sym` を構築する。
+///
+/// `sym_to_fc` は per-file の `cross_file_symbol_keys` だけを信頼して構築する。
+///
+/// 重要: グローバルな `included_symbols` を contains 判定に使ってはいけない。
+/// 同名シンボル (例: 異なる class の `new`) が複数ファイルにある場合、
+/// 「modified の Factory.php は include / added の Id.php は exclude」のような
+/// per-file 判定の差異が、global set の OR 判定で潰されてしまう。
+/// 詳しくは `FileContext::cross_file_symbol_keys` の docstring を参照。
+fn build_sym_indexes(
+    file_contexts: &[FileContext],
+    sym_ix: &HashMap<String, usize>,
+    method_parent_types: &HashMap<String, String>,
+    n_sym: usize,
+) -> SymIndexes {
+    let mut sym_to_fc: Vec<Vec<u32>> = vec![Vec::new(); n_sym];
+    for (fc_ix, ctx) in file_contexts.iter().enumerate() {
+        for sym in &ctx.affected {
+            let sym_key = ci_key(ctx.lang_id, &sym.name);
+            if !ctx.cross_file_symbol_keys.contains(&sym_key) {
+                continue;
+            }
+            if let Some(&ix) = sym_ix.get(&sym_key) {
+                sym_to_fc[ix].push(fc_ix as u32);
+            }
+        }
+    }
+
+    let mut parent_ix_by_sym: Vec<Option<usize>> = vec![None; n_sym];
+    for (sym_key, parent_key) in method_parent_types {
+        if let (Some(&ix), Some(&pix)) = (sym_ix.get(sym_key), sym_ix.get(parent_key)) {
+            parent_ix_by_sym[ix] = Some(pix);
+        }
+    }
+
+    SymIndexes {
+        sym_to_fc,
+        parent_ix_by_sym,
+    }
+}
+
+/// AC 事前フィルタ / 走査対象ファイル / rayon pool を構築する。
+/// どれか 1 つでも失敗したら `None` (呼び出し側は cross-file 解析を打ち切る)。
+fn prepare_scan(
+    all_symbol_names: &[String],
+    dir: &Path,
+    options: &crate::models::impact::ContextAnalysisOptions,
+) -> Option<Pass2Scan> {
+    let ac = refs::build_ac_case_insensitive(all_symbol_names).ok()?;
+
+    // vendor / node_modules / build artifact 等を impact のデフォルト除外にする。
+    // 同名メソッドが大量にある 3rd-party 依存や生成物を含めると cross-file 参照が
+    // 万件単位で偽陽性を生む (実測: Laravel/DDD 系で `new` 3,148 件のうち
+    // 大半が vendor)。`ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` で再取込可能。
+    //
+    // ユーザー指定の `options.exclude_dirs` / `options.exclude_globs` は
+    // デフォルト除外に **追加** で適用される (`INCLUDE_VENDOR=1` 時はデフォルトだけ
+    // 解除され、ユーザー指定は引き続き効く)。
+    let mut excluded_dirs: Vec<&str> = if impact_include_vendor() {
+        Vec::new()
+    } else {
+        IMPACT_DEFAULT_EXCLUDED_DIRS.to_vec()
+    };
+    excluded_dirs.extend(options.exclude_dirs.iter().map(String::as_str));
+    excluded_dirs.sort_unstable();
+    excluded_dirs.dedup();
+    let excluded_globs: Vec<&str> = options.exclude_globs.iter().map(String::as_str).collect();
+    let files =
+        refs::collect_files_with_excludes(dir, None, &excluded_dirs, &excluded_globs).ok()?;
+
+    // rayon fold/reduce は worker local 集約 + reduce acc 併存でピーク RSS が 2x まで
+    // 膨らむため、デフォルトは 1 worker (= fold バケット 1 個、ピーク 2x も小さい) とする。
+    // 並列性を使いたい CI 環境などでは `ASTRO_SIGHT_IMPACT_WORKERS` で上書きできる。
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(impact_worker_count())
+        .build()
+        .ok()?;
+
+    Some(Pass2Scan { ac, files, pool })
+}
+
+/// `TARGET_FILE_CACHE_SIZE` 上限の per-worker LRU キャッシュを作る。
+fn new_target_file_cache<V>() -> LruCache<String, V> {
+    LruCache::new(NonZeroUsize::new(TARGET_FILE_CACHE_SIZE).expect("cache size is non-zero"))
+}
+
+/// rayon fold の初期 worker local state。
+fn new_worker_state(n_fc: usize, n_sym: usize) -> WorkerState {
+    WorkerState {
+        local_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
+        local_low_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
+        local_informational_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
+        local_def_paths: vec![Vec::new(); n_sym],
+        target_cache: new_target_file_cache(),
+        import_facts_cache: new_target_file_cache(),
+        ref_hit: vec![false; n_sym],
+        ref_events: Vec::new(),
+        def_events: Vec::new(),
+    }
+}
+
 /// `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` のとき impact のデフォルト除外を解除する。
 /// (環境変数名は v26.5.115 との後方互換のため `_VENDOR_` のままだが、build artifact
 /// 除外も同じフラグで解除される。)
@@ -113,6 +244,15 @@ pub(super) fn stream_caller_maps_and_defs(
     let n_sym = all_symbol_names.len();
     let n_fc = file_contexts.len();
 
+    // 解析を打ち切るときに返す空結果。CI 言語 skip と事前構築失敗の両方で使う。
+    let empty_result = || StreamCallerMaps {
+        caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
+        low_caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
+        informational_caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
+        def_paths_by_ix: vec![Vec::new(); n_sym],
+        string_pool: StringPool::new(),
+    };
+
     // case-insensitive 言語 (Xojo 等) のみで構成された diff では cross-file 解析を
     // skip する。
     //
@@ -128,10 +268,7 @@ pub(super) fn stream_caller_maps_and_defs(
     //     の lexer 経路は別途設計が必要 (将来の PR)。
     //
     // `ASTRO_SIGHT_FORCE_CI_LANG_IMPACT=1` で従来挙動に戻せる (デバッグ用)。
-    let all_ci = !file_contexts.is_empty()
-        && file_contexts
-            .iter()
-            .all(|fc| fc.lang_id.is_case_insensitive());
+    let all_ci = all_file_contexts_case_insensitive(file_contexts);
     let force = std::env::var("ASTRO_SIGHT_FORCE_CI_LANG_IMPACT")
         .ok()
         .as_deref()
@@ -149,109 +286,27 @@ pub(super) fn stream_caller_maps_and_defs(
     );
     if all_ci && !force {
         crate::commands::log_phase("context.pass2.ci_skip", "applied", 0);
-        return StreamCallerMaps {
-            caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
-            low_caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
-            informational_caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
-            def_paths_by_ix: vec![Vec::new(); n_sym],
-            string_pool: StringPool::new(),
-        };
+        return empty_result();
     }
 
-    // sym_to_fc は per-file の `cross_file_symbol_keys` だけを信頼して構築する。
-    //
-    // 重要: グローバルな `included_symbols` を contains 判定に使ってはいけない。
-    // 同名シンボル (例: 異なる class の `new`) が複数ファイルにある場合、
-    // 「modified の Factory.php は include / added の Id.php は exclude」のような
-    // per-file 判定の差異が、global set の OR 判定で潰されてしまう。
-    // 詳しくは `FileContext::cross_file_symbol_keys` の docstring を参照。
-    let mut sym_to_fc: Vec<Vec<u32>> = vec![Vec::new(); n_sym];
-    for (fc_ix, ctx) in file_contexts.iter().enumerate() {
-        for sym in &ctx.affected {
-            let sym_key = ci_key(ctx.lang_id, &sym.name);
-            if !ctx.cross_file_symbol_keys.contains(&sym_key) {
-                continue;
-            }
-            if let Some(&ix) = sym_ix.get(&sym_key) {
-                sym_to_fc[ix].push(fc_ix as u32);
-            }
-        }
-    }
+    let SymIndexes {
+        sym_to_fc,
+        parent_ix_by_sym,
+    } = build_sym_indexes(file_contexts, sym_ix, method_parent_types, n_sym);
 
-    let mut parent_ix_by_sym: Vec<Option<usize>> = vec![None; n_sym];
-    for (sym_key, parent_key) in method_parent_types {
-        if let (Some(&ix), Some(&pix)) = (sym_ix.get(sym_key), sym_ix.get(parent_key)) {
-            parent_ix_by_sym[ix] = Some(pix);
-        }
-    }
-
-    let empty_result = || StreamCallerMaps {
-        caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
-        low_caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
-        informational_caller_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
-        def_paths_by_ix: vec![Vec::new(); n_sym],
-        string_pool: StringPool::new(),
-    };
-
-    let ac = match refs::build_ac_case_insensitive(all_symbol_names) {
-        Ok(a) => a,
-        Err(_) => return empty_result(),
-    };
-    // vendor / node_modules / build artifact 等を impact のデフォルト除外にする。
-    // 同名メソッドが大量にある 3rd-party 依存や生成物を含めると cross-file 参照が
-    // 万件単位で偽陽性を生む (実測: Laravel/DDD 系で `new` 3,148 件のうち
-    // 大半が vendor)。`ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` で再取込可能。
-    //
-    // ユーザー指定の `options.exclude_dirs` / `options.exclude_globs` は
-    // デフォルト除外に **追加** で適用される (`INCLUDE_VENDOR=1` 時はデフォルトだけ
-    // 解除され、ユーザー指定は引き続き効く)。
-    let mut excluded_dirs: Vec<&str> = if impact_include_vendor() {
-        Vec::new()
-    } else {
-        IMPACT_DEFAULT_EXCLUDED_DIRS.to_vec()
-    };
-    excluded_dirs.extend(options.exclude_dirs.iter().map(String::as_str));
-    excluded_dirs.sort_unstable();
-    excluded_dirs.dedup();
-    let excluded_globs: Vec<&str> = options.exclude_globs.iter().map(String::as_str).collect();
-    let files = match refs::collect_files_with_excludes(dir, None, &excluded_dirs, &excluded_globs)
-    {
-        Ok(f) => f,
-        Err(_) => return empty_result(),
-    };
-
-    // rayon fold/reduce は worker local 集約 + reduce acc 併存でピーク RSS が 2x まで
-    // 膨らむため、デフォルトは 1 worker (= fold バケット 1 個、ピーク 2x も小さい) とする。
-    // 並列性を使いたい CI 環境などでは `ASTRO_SIGHT_IMPACT_WORKERS` で上書きできる。
-    let worker_limit = impact_worker_count();
-    let rayon_pool = match rayon::ThreadPoolBuilder::new()
-        .num_threads(worker_limit)
-        .build()
-    {
-        Ok(p) => p,
-        Err(_) => return empty_result(),
+    let Some(Pass2Scan {
+        ac,
+        files,
+        pool: rayon_pool,
+    }) = prepare_scan(all_symbol_names, dir, options)
+    else {
+        return empty_result();
     };
 
     // 全 chunk を通して 1 つの StringPool を共有する。workers=1 なら lock 競合は発生しない。
     let string_pool = std::sync::Mutex::new(StringPool::new());
 
-    let init_state = || -> WorkerState {
-        WorkerState {
-            local_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
-            local_low_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
-            local_informational_maps: (0..n_fc).map(|_| new_typed_caller_map()).collect(),
-            local_def_paths: vec![Vec::new(); n_sym],
-            target_cache: LruCache::new(
-                NonZeroUsize::new(TARGET_FILE_CACHE_SIZE).expect("cache size is non-zero"),
-            ),
-            import_facts_cache: LruCache::new(
-                NonZeroUsize::new(TARGET_FILE_CACHE_SIZE).expect("cache size is non-zero"),
-            ),
-            ref_hit: vec![false; n_sym],
-            ref_events: Vec::new(),
-            def_events: Vec::new(),
-        }
-    };
+    let init_state = || new_worker_state(n_fc, n_sym);
 
     let mut global_maps: Vec<TypedCallerMap> = (0..n_fc).map(|_| new_typed_caller_map()).collect();
     let mut global_low_maps: Vec<TypedCallerMap> =
@@ -384,5 +439,50 @@ fn merge_typed_maps(dst: &mut [TypedCallerMap], src: Vec<TypedCallerMap>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::language::LangId;
+
+    fn file_context(new_path: &str, lang_id: LangId) -> FileContext {
+        FileContext {
+            new_path: new_path.to_string(),
+            lang_id,
+            affected: Vec::new(),
+            sig_changes: Vec::new(),
+            hunks: Vec::new(),
+            call_edges: Vec::new(),
+            cross_file_symbol_keys: std::collections::HashSet::new(),
+            affected_name_by_cikey: HashMap::new(),
+        }
+    }
+
+    // Pass 1 が 1 件も FileContext を残さなかった場合は skip しない (通常経路へ)
+    #[test]
+    fn all_file_contexts_case_insensitive_empty_is_false() {
+        assert!(!all_file_contexts_case_insensitive(&[]));
+    }
+
+    // 全件が CI 言語 (Xojo) なら skip 対象
+    #[test]
+    fn all_file_contexts_case_insensitive_all_xojo() {
+        let fcs = vec![
+            file_context("a.xojo_code", LangId::Xojo),
+            file_context("b.xojo_code", LangId::Xojo),
+        ];
+        assert!(all_file_contexts_case_insensitive(&fcs));
+    }
+
+    // CI 言語と通常言語が混在する diff では skip しない
+    #[test]
+    fn all_file_contexts_case_insensitive_mixed_is_false() {
+        let fcs = vec![
+            file_context("a.xojo_code", LangId::Xojo),
+            file_context("b.rs", LangId::Rust),
+        ];
+        assert!(!all_file_contexts_case_insensitive(&fcs));
     }
 }

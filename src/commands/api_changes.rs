@@ -14,7 +14,7 @@ use super::dead_code::{
     collect_python_unittest_classes, enclosing_container, is_phpunit_test_symbol,
     is_python_test_symbol, is_test_path,
 };
-use super::git_input::validate_git_revision;
+use super::git_input::git_show_blob;
 
 pub(crate) type ExportedSymbols = Vec<(String, String, String)>;
 type ExportedSymbolsWithLang = (crate::language::LangId, ExportedSymbols);
@@ -409,100 +409,52 @@ fn classify_signature_change(
         buckets.const_value_changes.push(change);
         return;
     }
-    // React component を memo / forwardRef 等の HOC でラップしただけは compatible_modified
-    if let Some(compat) = detect_react_wrapper_compatible_mod(
-        ref_index,
+    // 以降の互換判定器はすべて同じ現場情報を見る。old/new ソースは最初に必要になった
+    // 判定器で 1 度だけ取得して使い回す (旧実装は判定器ごとに git show を起動していた)。
+    let site = CompatibleModSite {
         dir,
         base,
-        &df.old_path,
-        &df.new_path,
-        &name,
+        old_path: &df.old_path,
+        new_path: &df.new_path,
+        name: &name,
         kind,
         old_sig,
         new_sig,
-        lang_id_for_file,
-    ) {
+        lang_id: lang_id_for_file,
+    };
+    let sources = &mut SignatureSourceCache::default();
+    // React component を memo / forwardRef 等の HOC でラップしただけは compatible_modified
+    if let Some(compat) = detect_react_wrapper_compatible_mod(ref_index, &site, sources) {
         buckets.compatible_modified.push(compat);
         return;
     }
     // exported object の未参照プロパティ削除も compatible_modified
-    if let Some(compat) = detect_object_members_compatible_mod(
-        dir,
-        base,
-        &df.old_path,
-        &df.new_path,
-        &name,
-        kind,
-        old_sig,
-        new_sig,
-        lang_id_for_file,
-    ) {
+    if let Some(compat) = detect_object_members_compatible_mod(&site, sources) {
         buckets.compatible_modified.push(compat);
         return;
     }
     // TS/TSX の関数末尾へ optional/default 引数を追加しただけなら、既存呼び出しの required
     // arity は変わらないため compatible_modified として扱う。
-    if let Some(compat) = detect_trailing_optional_params_compatible_mod(
-        dir,
-        base,
-        &df.old_path,
-        &df.new_path,
-        &name,
-        kind,
-        old_sig,
-        new_sig,
-        lang_id_for_file,
-    ) {
+    if let Some(compat) = detect_trailing_optional_params_compatible_mod(&site, sources) {
         buckets.compatible_modified.push(compat);
         return;
     }
     // TS/TSX の引数 object type literal へ optional プロパティを追加しただけなら、
     // 既存呼び出しが渡す object はそのまま受理されるため compatible_modified として扱う。
-    if let Some(compat) = detect_optional_object_props_compatible_mod(
-        dir,
-        base,
-        &df.old_path,
-        &df.new_path,
-        &name,
-        kind,
-        old_sig,
-        new_sig,
-        lang_id_for_file,
-    ) {
+    if let Some(compat) = detect_optional_object_props_compatible_mod(&site, sources) {
         buckets.compatible_modified.push(compat);
         return;
     }
     // React Server Component の async 化 (async キーワード追加のみ + 全参照が JSX タグ利用)
     // は呼び出し側の書き換えが不要なため compatible_modified として扱う。
-    if let Some(compat) = detect_async_jsx_component_compatible_mod(
-        ref_index,
-        dir,
-        base,
-        &df.old_path,
-        &df.new_path,
-        &name,
-        kind,
-        old_sig,
-        new_sig,
-        lang_id_for_file,
-    ) {
+    if let Some(compat) = detect_async_jsx_component_compatible_mod(ref_index, &site, sources) {
         buckets.compatible_modified.push(compat);
         return;
     }
     // Python のトップレベル関数 / モジュール直下クラスのメソッドへ末尾 optional/default
     // 引数 (`*` 後の kwonly+default 含む) を追加しただけなら、既存呼び出しが壊れないため
     // compatible_modified として扱う。
-    if let Some(compat) = detect_python_trailing_optional_params_compatible_mod(
-        dir,
-        base,
-        &df.old_path,
-        &df.new_path,
-        &name,
-        kind,
-        old_sig,
-        new_sig,
-        lang_id_for_file,
-    ) {
+    if let Some(compat) = detect_python_trailing_optional_params_compatible_mod(&site, sources) {
         buckets.compatible_modified.push(compat);
         return;
     }
@@ -616,18 +568,9 @@ fn base_pyproject_marks_module_as_api(dir: &str, base: &str, stem: &str) -> bool
     false
 }
 
-/// `git show <base>:<rel>` でファイル内容を取得する。失敗時は None。
+/// `git show <base>:<rel>` でファイル内容を UTF-8 文字列として取得する。失敗時は None。
 fn git_show_base_file(dir: &str, base: &str, rel: &str) -> Option<String> {
-    validate_git_revision(base, "--base").ok()?;
-    let output = std::process::Command::new("git")
-        .args(["show", &format!("{base}:{rel}")])
-        .current_dir(dir)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout).ok()
+    String::from_utf8(git_show_blob(dir, base, rel)?).ok()
 }
 
 /// 削除ファイル (`new_path == "/dev/null"`) 由来の exported シンボルを `removed` /
@@ -1252,20 +1195,9 @@ pub(crate) fn extract_exported_symbols_from_git(
     if is_test_path(std::path::Path::new(file_path)) {
         return Some(Vec::new());
     }
-    // `base` と `file_path` はオプション誤認識を避けるため先頭が `-` のものを拒否する
-    validate_git_revision(base, "--base").ok()?;
-    validate_git_revision(file_path, "diff file path").ok()?;
-    let output = std::process::Command::new("git")
-        .args(["show", &format!("{base}:{file_path}")])
-        .current_dir(dir)
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    extract_exported_symbols_from_source(file_path, &output.stdout)
+    // revision / path の検証は git_show_blob 側で強制される
+    let old_source = git_show_blob(dir, base, file_path)?;
+    extract_exported_symbols_from_source(file_path, &old_source)
 }
 
 /// 与えられた旧側ソースから export シンボル一覧を抽出する。
@@ -2510,20 +2442,19 @@ mod python_signature;
 mod ref_index;
 mod removed_attribution;
 mod rust_public;
+mod source_pair;
 mod ts_signature;
 
 pub(crate) use python_signature::*;
 pub(crate) use ref_index::*;
 pub(crate) use removed_attribution::*;
 pub(crate) use rust_public::*;
+pub(crate) use source_pair::{CompatibleModSite, SignatureSourceCache};
 pub(crate) use ts_signature::*;
 
-/// 削除されたシンボル `name` が、変更後のツリー全体のどこからも参照されていないかを判定する。
-/// 参照が 0 件であれば同一 diff 内で全 caller が追随済みと判断し、`api.rm` から除外する。
-/// 参照検索に失敗した場合は保守的に false（外部参照ありとみなす）を返し、
-/// レビュー対象として残す（false negative を起こさない方針）。
 /// `removed` 候補のうち、HEAD ツリーで repo 内参照 0 件のものを `removed_dead` に
 /// 振り分ける。残りは `removed` (破壊的削除) として返す。
+/// 参照が 0 件であれば同一 diff 内で全 caller が追随済みと判断し、`api.rm` から除外する。
 ///
 /// 実装上の配慮:
 /// - **qualname → bare name**: `Container.method` 形式は refs 検索の identifier
@@ -2842,22 +2773,10 @@ pub(crate) fn bash_function_is_exported_in_git(
     file_path: &str,
     name: &str,
 ) -> bool {
-    if validate_git_revision(base, "--base").is_err()
-        || validate_git_revision(file_path, "diff file path").is_err()
-    {
-        return false;
-    }
-    let Ok(output) = std::process::Command::new("git")
-        .args(["show", &format!("{base}:{file_path}")])
-        .current_dir(dir)
-        .output()
-    else {
+    let Some(blob) = git_show_blob(dir, base, file_path) else {
         return false;
     };
-    if !output.status.success() {
-        return false;
-    }
-    let Ok(text) = std::str::from_utf8(&output.stdout) else {
+    let Ok(text) = std::str::from_utf8(&blob) else {
         return false;
     };
     bash_has_export_f(text, name)

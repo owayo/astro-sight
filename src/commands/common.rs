@@ -45,6 +45,25 @@ pub(crate) fn log_phase(phase: &str, status: &str, elapsed_ms: u128) {
     eprintln!("[as] phase={phase} status={status} rss={rss_str} elapsed={elapsed_ms}ms");
 }
 
+/// `log_phase(start)` → 処理 → `log_phase(end, 経過ms)` の定型を包む (無謬処理用)。
+pub(crate) fn timed<T>(phase: &str, f: impl FnOnce() -> T) -> T {
+    log_phase(phase, "start", 0);
+    let phase_t = std::time::Instant::now();
+    let r = f();
+    log_phase(phase, "end", phase_t.elapsed().as_millis());
+    r
+}
+
+/// `timed` の失敗しうる処理版。**エラー時は `end` ログを出さずに伝播する**ため、
+/// `start` だけが残ったフェーズが失敗箇所を指す (計測完了 = 成功を意味する)。
+pub(crate) fn timed_ok<T>(phase: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    log_phase(phase, "start", 0);
+    let phase_t = std::time::Instant::now();
+    let r = f()?;
+    log_phase(phase, "end", phase_t.elapsed().as_millis());
+    Ok(r)
+}
+
 pub fn classify_error(e: &anyhow::Error) -> (String, String) {
     if let Some(ae) = e.downcast_ref::<AstroError>() {
         (ae.code.to_string(), ae.message.clone())
@@ -260,5 +279,28 @@ impl ChangedFileSet {
             Ok(canon) => self.canonical.contains(&canon),
             Err(_) => self.abs_strs.contains(&caller_abs),
         }
+    }
+}
+
+#[cfg(test)]
+mod common_tests {
+    use super::*;
+
+    #[test]
+    fn timed_returns_inner_value() {
+        assert_eq!(timed("unit_test_phase", || 7), 7);
+    }
+
+    #[test]
+    fn timed_ok_returns_inner_value() {
+        let v = timed_ok("unit_test_phase", || Ok(3)).expect("closure succeeds");
+        assert_eq!(v, 3);
+    }
+
+    #[test]
+    fn timed_ok_propagates_error() {
+        let err = timed_ok::<()>("unit_test_phase", || Err(anyhow::anyhow!("boom")))
+            .expect_err("error should propagate");
+        assert!(err.to_string().contains("boom"));
     }
 }

@@ -4422,6 +4422,102 @@ fn detect_api_changes_private_module_via_private_prelude_removal_excluded() {
     );
 }
 
+/// `pub mod` の階層 (`pub mod outer;` + `outer.rs` 内 `pub mod inner;`) 配下の pub fn 削除は
+/// 外部公開 API の削除なので api.rm に残す。
+///
+/// pub 到達 module 集合は `collect_all_modules` の pub 子リストから導出する
+/// (旧実装は pub 経路専用の walk を別に持ち、file-style module の子解決を
+/// 片方だけ直して階層 module を取りこぼした経緯がある)。この経路の回帰テスト。
+#[test]
+fn detect_api_changes_nested_pub_mod_file_style_removal_stays_in_removed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+            ),
+            ("src/lib.rs", "pub mod outer;\n"),
+            // file-style module: outer.rs の子は outer/ 配下を指す
+            ("src/outer.rs", "pub mod inner;\n"),
+            ("src/outer/inner.rs", "pub fn deep() -> u32 {\n    0\n}\n"),
+        ],
+        "base",
+    );
+    fs::write(repo.join("src/outer/inner.rs"), "\n").expect("write");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/outer/inner.rs".to_string(),
+        new_path: "src/outer/inner.rs".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 1,
+        }],
+        deleted_old_source: None,
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    let removed: Vec<&str> = api
+        .removed
+        .iter()
+        .chain(api.removed_dead.iter())
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(
+        removed.iter().any(|n| n.ends_with("deep")),
+        "pub mod 階層 (file-style module) 配下の pub fn 削除は外部公開 API の削除。got: {removed:?}"
+    );
+}
+
+/// private な中間 module (`mod outer;`) 配下の pub fn 削除は外部到達不能なので api.rm から外す。
+/// pub 到達性の導出が「pub 子リストのみを辿る」ことの回帰テスト
+/// (親が private なら子が `pub mod` でも到達不能)。
+#[test]
+fn detect_api_changes_pub_mod_under_private_parent_removal_excluded() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+            ),
+            ("src/lib.rs", "mod outer;\n"),
+            ("src/outer.rs", "pub mod inner;\n"),
+            ("src/outer/inner.rs", "pub fn deep() -> u32 {\n    0\n}\n"),
+        ],
+        "base",
+    );
+    fs::write(repo.join("src/outer/inner.rs"), "\n").expect("write");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/outer/inner.rs".to_string(),
+        new_path: "src/outer/inner.rs".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 1,
+        }],
+        deleted_old_source: None,
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    let removed: Vec<&str> = api
+        .removed
+        .iter()
+        .chain(api.removed_dead.iter())
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(
+        !removed.iter().any(|n| n.ends_with("deep")),
+        "private 親 module 配下は pub mod でも外部到達不能なので api.rm に出さない。got: {removed:?}"
+    );
+}
+
 /// `pub use crate::{wifi::found};` のような top-level grouped use 経由の re-export を
 /// `parse_pub_use_targets` が取りこぼし false negative になる回帰テスト
 /// (codex pre-merge レビュー 2 回目の Warning 指摘)。
@@ -8683,15 +8779,18 @@ fn detect_react_wrapper_multiline_destructured_props_is_compatible() {
     );
     let result = detect_react_wrapper_compatible_mod(
         &ref_index,
-        repo.to_str().expect("utf-8 path"),
-        "HEAD",
-        "ScheduleItem.tsx",
-        "ScheduleItem.tsx",
-        "ScheduleItem",
-        "constant",
-        "export function ScheduleItem({}: ScheduleItemProps)",
-        "export const ScheduleItem = memo(function ScheduleItem({",
-        Some(crate::language::LangId::Tsx),
+        &CompatibleModSite {
+            dir: repo.to_str().expect("utf-8 path"),
+            base: "HEAD",
+            old_path: "ScheduleItem.tsx",
+            new_path: "ScheduleItem.tsx",
+            name: "ScheduleItem",
+            kind: "constant",
+            old_sig: "export function ScheduleItem({}: ScheduleItemProps)",
+            new_sig: "export const ScheduleItem = memo(function ScheduleItem({",
+            lang_id: Some(crate::language::LangId::Tsx),
+        },
+        &mut SignatureSourceCache::default(),
     );
     let compat = result.expect("複数行 destructured props でも memo ラップのみなら compatible");
     assert_eq!(compat.reason, "react_component_wrapper");
@@ -8730,15 +8829,18 @@ fn detect_react_wrapper_with_call_usage_stays_blocking() {
     );
     let result = detect_react_wrapper_compatible_mod(
         &ref_index,
-        repo.to_str().expect("utf-8 path"),
-        "HEAD",
-        "ScheduleItem.tsx",
-        "ScheduleItem.tsx",
-        "ScheduleItem",
-        "constant",
-        "old",
-        "new",
-        Some(crate::language::LangId::Tsx),
+        &CompatibleModSite {
+            dir: repo.to_str().expect("utf-8 path"),
+            base: "HEAD",
+            old_path: "ScheduleItem.tsx",
+            new_path: "ScheduleItem.tsx",
+            name: "ScheduleItem",
+            kind: "constant",
+            old_sig: "old",
+            new_sig: "new",
+            lang_id: Some(crate::language::LangId::Tsx),
+        },
+        &mut SignatureSourceCache::default(),
     );
     assert!(
         result.is_none(),
@@ -8777,15 +8879,18 @@ fn detect_react_wrapper_changed_props_type_stays_blocking() {
     );
     let result = detect_react_wrapper_compatible_mod(
         &ref_index,
-        repo.to_str().expect("utf-8 path"),
-        "HEAD",
-        "ScheduleItem.tsx",
-        "ScheduleItem.tsx",
-        "ScheduleItem",
-        "constant",
-        "old",
-        "new",
-        Some(crate::language::LangId::Tsx),
+        &CompatibleModSite {
+            dir: repo.to_str().expect("utf-8 path"),
+            base: "HEAD",
+            old_path: "ScheduleItem.tsx",
+            new_path: "ScheduleItem.tsx",
+            name: "ScheduleItem",
+            kind: "constant",
+            old_sig: "old",
+            new_sig: "new",
+            lang_id: Some(crate::language::LangId::Tsx),
+        },
+        &mut SignatureSourceCache::default(),
     );
     assert!(result.is_none(), "props 型が変われば blocking 維持");
 }
@@ -8839,15 +8944,18 @@ fn detect_react_wrapper_same_file_value_usage_stays_blocking() {
     );
     let result = detect_react_wrapper_compatible_mod(
         &ref_index,
-        repo.to_str().expect("utf-8 path"),
-        "HEAD",
-        "ScheduleItem.tsx",
-        "ScheduleItem.tsx",
-        "ScheduleItem",
-        "constant",
-        "old",
-        "new",
-        Some(crate::language::LangId::Tsx),
+        &CompatibleModSite {
+            dir: repo.to_str().expect("utf-8 path"),
+            base: "HEAD",
+            old_path: "ScheduleItem.tsx",
+            new_path: "ScheduleItem.tsx",
+            name: "ScheduleItem",
+            kind: "constant",
+            old_sig: "old",
+            new_sig: "new",
+            lang_id: Some(crate::language::LangId::Tsx),
+        },
+        &mut SignatureSourceCache::default(),
     );
     assert!(
         result.is_none(),
@@ -8887,15 +8995,18 @@ fn detect_react_wrapper_old_already_wrapper_stays_blocking() {
     );
     let result = detect_react_wrapper_compatible_mod(
         &ref_index,
-        repo.to_str().expect("utf-8 path"),
-        "HEAD",
-        "Btn.tsx",
-        "Btn.tsx",
-        "Btn",
-        "constant",
-        "export const Btn = forwardRef(function Btn(props: P, ref: RefA) {",
-        "export const Btn = forwardRef(function Btn(props: P, ref: RefB) {",
-        Some(crate::language::LangId::Tsx),
+        &CompatibleModSite {
+            dir: repo.to_str().expect("utf-8 path"),
+            base: "HEAD",
+            old_path: "Btn.tsx",
+            new_path: "Btn.tsx",
+            name: "Btn",
+            kind: "constant",
+            old_sig: "export const Btn = forwardRef(function Btn(props: P, ref: RefA) {",
+            new_sig: "export const Btn = forwardRef(function Btn(props: P, ref: RefB) {",
+            lang_id: Some(crate::language::LangId::Tsx),
+        },
+        &mut SignatureSourceCache::default(),
     );
     assert!(
         result.is_none(),
@@ -10041,15 +10152,18 @@ fn detect_object_members_removed_unreferenced_key_is_compatible() {
     )
     .expect("write");
     let result = detect_object_members_compatible_mod(
-        repo.to_str().expect("utf-8 path"),
-        "HEAD",
-        "config.tsx",
-        "config.tsx",
-        "providerConfig",
-        "constant",
-        "old",
-        "new",
-        Some(crate::language::LangId::Tsx),
+        &CompatibleModSite {
+            dir: repo.to_str().expect("utf-8 path"),
+            base: "HEAD",
+            old_path: "config.tsx",
+            new_path: "config.tsx",
+            name: "providerConfig",
+            kind: "constant",
+            old_sig: "old",
+            new_sig: "new",
+            lang_id: Some(crate::language::LangId::Tsx),
+        },
+        &mut SignatureSourceCache::default(),
     );
     let compat = result.expect("削除キー bgColor が未参照なら compatible");
     assert_eq!(compat.reason, "unused_object_members");
@@ -10082,15 +10196,18 @@ fn detect_object_members_removed_referenced_key_stays_blocking() {
     )
     .expect("write");
     let result = detect_object_members_compatible_mod(
-        repo.to_str().expect("utf-8 path"),
-        "HEAD",
-        "config.tsx",
-        "config.tsx",
-        "providerConfig",
-        "constant",
-        "old",
-        "new",
-        Some(crate::language::LangId::Tsx),
+        &CompatibleModSite {
+            dir: repo.to_str().expect("utf-8 path"),
+            base: "HEAD",
+            old_path: "config.tsx",
+            new_path: "config.tsx",
+            name: "providerConfig",
+            kind: "constant",
+            old_sig: "old",
+            new_sig: "new",
+            lang_id: Some(crate::language::LangId::Tsx),
+        },
+        &mut SignatureSourceCache::default(),
     );
     assert!(
         result.is_none(),
@@ -10116,15 +10233,18 @@ fn detect_object_members_value_only_change_stays_blocking() {
     )
     .expect("write");
     let result = detect_object_members_compatible_mod(
-        repo.to_str().expect("utf-8 path"),
-        "HEAD",
-        "config.tsx",
-        "config.tsx",
-        "c",
-        "constant",
-        "old",
-        "new",
-        Some(crate::language::LangId::Tsx),
+        &CompatibleModSite {
+            dir: repo.to_str().expect("utf-8 path"),
+            base: "HEAD",
+            old_path: "config.tsx",
+            new_path: "config.tsx",
+            name: "c",
+            kind: "constant",
+            old_sig: "old",
+            new_sig: "new",
+            lang_id: Some(crate::language::LangId::Tsx),
+        },
+        &mut SignatureSourceCache::default(),
     );
     assert!(result.is_none(), "値のみ変更は blocking 維持");
 }
@@ -10146,15 +10266,18 @@ fn detect_object_members_pure_member_addition_is_compatible() {
     )
     .expect("write");
     let result = detect_object_members_compatible_mod(
-        repo.to_str().expect("utf-8 path"),
-        "HEAD",
-        "config.tsx",
-        "config.tsx",
-        "c",
-        "constant",
-        "old",
-        "new",
-        Some(crate::language::LangId::Tsx),
+        &CompatibleModSite {
+            dir: repo.to_str().expect("utf-8 path"),
+            base: "HEAD",
+            old_path: "config.tsx",
+            new_path: "config.tsx",
+            name: "c",
+            kind: "constant",
+            old_sig: "old",
+            new_sig: "new",
+            lang_id: Some(crate::language::LangId::Tsx),
+        },
+        &mut SignatureSourceCache::default(),
     );
     let compat = result.expect("純粋な member 追加は compatible");
     assert_eq!(compat.reason, "unused_object_members");
@@ -10181,15 +10304,18 @@ fn detect_object_members_record_schema_mismatch_stays_blocking() {
         )
         .expect("write");
     let result = detect_object_members_compatible_mod(
-        repo.to_str().expect("utf-8 path"),
-        "HEAD",
-        "config.tsx",
-        "config.tsx",
-        "providerConfig",
-        "constant",
-        "old",
-        "new",
-        Some(crate::language::LangId::Tsx),
+        &CompatibleModSite {
+            dir: repo.to_str().expect("utf-8 path"),
+            base: "HEAD",
+            old_path: "config.tsx",
+            new_path: "config.tsx",
+            name: "providerConfig",
+            kind: "constant",
+            old_sig: "old",
+            new_sig: "new",
+            lang_id: Some(crate::language::LangId::Tsx),
+        },
+        &mut SignatureSourceCache::default(),
     );
     assert!(result.is_none(), "record schema 不揃いは blocking 維持");
 }
@@ -10221,15 +10347,18 @@ fn detect_object_members_removed_bracket_string_ref_stays_blocking() {
     )
     .expect("write");
     let result = detect_object_members_compatible_mod(
-        repo.to_str().expect("utf-8 path"),
-        "HEAD",
-        "config.tsx",
-        "config.tsx",
-        "providerConfig",
-        "constant",
-        "old",
-        "new",
-        Some(crate::language::LangId::Tsx),
+        &CompatibleModSite {
+            dir: repo.to_str().expect("utf-8 path"),
+            base: "HEAD",
+            old_path: "config.tsx",
+            new_path: "config.tsx",
+            name: "providerConfig",
+            kind: "constant",
+            old_sig: "old",
+            new_sig: "new",
+            lang_id: Some(crate::language::LangId::Tsx),
+        },
+        &mut SignatureSourceCache::default(),
     );
     assert!(
         result.is_none(),
@@ -10254,15 +10383,18 @@ fn detect_object_members_spread_stays_blocking() {
     )
     .expect("write");
     let result = detect_object_members_compatible_mod(
-        repo.to_str().expect("utf-8 path"),
-        "HEAD",
-        "config.tsx",
-        "config.tsx",
-        "c",
-        "constant",
-        "old",
-        "new",
-        Some(crate::language::LangId::Tsx),
+        &CompatibleModSite {
+            dir: repo.to_str().expect("utf-8 path"),
+            base: "HEAD",
+            old_path: "config.tsx",
+            new_path: "config.tsx",
+            name: "c",
+            kind: "constant",
+            old_sig: "old",
+            new_sig: "new",
+            lang_id: Some(crate::language::LangId::Tsx),
+        },
+        &mut SignatureSourceCache::default(),
     );
     assert!(result.is_none(), "spread を含む object は blocking 維持");
 }

@@ -20,6 +20,7 @@
 use tree_sitter::Node;
 
 use crate::engine::parser;
+use crate::engine::refs::absolute_position;
 use crate::language::LangId;
 
 /// `command` ノードを受け取り、trap handler 内の参照候補を抽出して返す。
@@ -161,22 +162,16 @@ fn collect_command_names(
 
 /// 内側 AST 内の (row, col) を、ファイル全体での (row, col) に変換する。
 ///
-/// 外側 quote 開始位置 (outer_row, outer_col) はクォート文字 `'` / `"` 自体の位置。
-/// 内側 1 バイト目はファイル上で `(outer_row, outer_col + 1)` に対応する。
-/// 内側に改行がある場合、行頭からの列は内側オフセットそのままになる。
+/// 外側 quote 開始位置 (outer_row, outer_col) はクォート文字 `'` / `"` 自体の位置なので、
+/// 内側 1 バイト目 = 領域先頭は `(outer_row, outer_col + 1)`。あとは埋め込み領域共通の
+/// 規約 ([`absolute_position`]: 1 行目だけ base 列を加算) に従う。
 fn translate_position(
     inner_row: usize,
     inner_col: usize,
     outer_row: usize,
     outer_col: usize,
 ) -> (usize, usize) {
-    if inner_row == 0 {
-        // 同一行: outer_col + 1 (opening quote) + inner_col
-        (outer_row, outer_col + 1 + inner_col)
-    } else {
-        // 改行を跨いだ後: row を相対加算、col は内側オフセットのまま
-        (outer_row + inner_row, inner_col)
-    }
+    absolute_position((outer_row, outer_col + 1), (inner_row, inner_col))
 }
 
 #[cfg(test)]
@@ -296,6 +291,31 @@ mod tests {
         // root (program) ノードを渡しても何も返さない
         let segs = bash_trap_handler_ref_segments(tree.root_node(), &bytes, LangId::Bash);
         assert!(segs.is_empty(), "{segs:?}");
+    }
+
+    /// handler 文字列が改行を跨ぐ場合、2 行目以降の col は quote 開始列を加算しない
+    /// (埋め込み領域共通の `absolute_position` 規約)。
+    #[test]
+    fn multiline_trap_handler_position_is_absolute() {
+        // 1 行目に quote 開始、2 行目に handler 内コマンド。
+        let src = "trap 'first_cleanup\n  second_cleanup' EXIT\n";
+        let (tree, bytes) = parse_bash(src);
+        let trap = find_first_trap_command(tree.root_node(), &bytes).expect("trap node");
+        let segs = bash_trap_handler_ref_segments(trap, &bytes, LangId::Bash);
+        let first = segs
+            .iter()
+            .find(|(n, _, _)| n == "first_cleanup")
+            .expect("first_cleanup");
+        // 1 行目: quote 位置 5 + 1
+        assert_eq!((first.1, first.2), (0, 6), "{segs:?}");
+        let second = segs
+            .iter()
+            .find(|(n, _, _)| n == "second_cleanup")
+            .expect("second_cleanup");
+        // 2 行目: 行頭からの列そのまま (quote 列は足さない)
+        assert_eq!((second.1, second.2), (1, 2), "{segs:?}");
+        let line = src.split('\n').nth(second.1).unwrap();
+        assert!(line[second.2..].starts_with("second_cleanup"), "{line:?}");
     }
 
     #[test]

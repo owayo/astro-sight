@@ -129,6 +129,28 @@ pub(crate) fn validate_git_revision(rev: &str, arg_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// `git show <rev>:<path>` で blob を取得する単一のチョークポイント。
+///
+/// revision と path は必ず `validate_git_revision` を通してから git に渡すため、
+/// 呼び出し側が検証を書き忘れてオプション誤認識 (`-` 始まり) を通すことがない。
+///
+/// 次のいずれも `None` に畳む: 検証失敗 / git 実行失敗 / 当該リビジョンに
+/// ファイルが存在しない。呼び出し側はどのケースでも「旧側を確認できなかった」
+/// として保守側 (API 差分を抑制しない = blocking 維持) に倒すため、区別しない。
+pub(crate) fn git_show_blob(dir: &str, rev: &str, path: &str) -> Option<Vec<u8>> {
+    validate_git_revision(rev, "git revision").ok()?;
+    validate_git_revision(path, "diff file path").ok()?;
+    let output = std::process::Command::new("git")
+        .args(["show", &format!("{rev}:{path}")])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(output.stdout)
+}
+
 /// `--git` 入力解決の結果。diff が取れたか、git 管理外で skip かを型で表す。
 pub(crate) enum GitDiffInput {
     Diff(String),

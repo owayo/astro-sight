@@ -8,8 +8,22 @@ use std::collections::HashSet;
 use crate::engine::parser;
 use crate::models::review::CompatibleApiModification;
 
-use super::super::git_input::validate_git_revision;
+use super::super::git_input::git_show_blob;
+use super::source_pair::{CompatibleModSite, SignatureSourceCache};
 use super::{ApiRefIndex, has_blocking_value_usage, normalize_signature_whitespace};
+
+/// TS/TSX/JS 全体を対象にする判定器の言語ゲート。
+const TS_JS_LANGS: &[crate::language::LangId] = &[
+    crate::language::LangId::Typescript,
+    crate::language::LangId::Tsx,
+    crate::language::LangId::Javascript,
+];
+
+/// トップレベル関数 / class method の AST 解決を要する判定器の言語ゲート (JS を含まない)。
+const TS_ONLY_LANGS: &[crate::language::LangId] = &[
+    crate::language::LangId::Typescript,
+    crate::language::LangId::Tsx,
+];
 
 /// TS/TSX/JS の exported component を `memo` / `forwardRef` 等の HOC でラップしただけの
 /// api.mod を互換変更 (`react_component_wrapper`) として判定する。
@@ -25,73 +39,38 @@ use super::{ApiRefIndex, has_blocking_value_usage, normalize_signature_whitespac
 ///
 /// 抽出失敗・型注釈なし・参照解析失敗・判定不能な参照は None を返し blocking を維持する
 /// (false negative 回避)。
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn detect_react_wrapper_compatible_mod(
     index: &ApiRefIndex,
-    dir: &str,
-    base: &str,
-    old_path: &str,
-    new_path: &str,
-    name: &str,
-    kind: &str,
-    old_sig: &str,
-    new_sig: &str,
-    lang_id: Option<crate::language::LangId>,
+    site: &CompatibleModSite<'_>,
+    sources: &mut SignatureSourceCache,
 ) -> Option<CompatibleApiModification> {
-    use crate::language::LangId;
-    let lang =
-        lang_id.filter(|l| matches!(l, LangId::Typescript | LangId::Tsx | LangId::Javascript))?;
+    let lang = site.lang_in(TS_JS_LANGS)?;
     // new 側が memo / forwardRef でラップされていること (単なる function 本体変更は対象外)。
-    if !new_sig_has_react_wrapper(new_sig) {
+    if !new_sig_has_react_wrapper(site.new_sig) {
         return None;
     }
     // old 側は非 wrapper (function 宣言等) であること。wrapper-to-wrapper の変更
     // (`forwardRef<HTMLDivElement, P>` → `forwardRef<HTMLButtonElement, P>` 等) は ref 型や
     // generic の差分を取りこぼすため対象外 (codex 指摘)。
-    if new_sig_has_react_wrapper(old_sig) {
-        return None;
-    }
-    // 信頼境界外のパスは多層防御で再チェックする。
-    if !crate::engine::impact::is_safe_diff_path(old_path)
-        || !crate::engine::impact::is_safe_diff_path(new_path)
-    {
+    if new_sig_has_react_wrapper(site.old_sig) {
         return None;
     }
     // old は base リビジョン、new は working tree からソースを再取得して props 型を AST 抽出
     // する。signature 文字列は const の先頭行 fallback で複数行 destructured props の型注釈を
     // 取りこぼすため、ソース再パースで比較する (codex 設計合意)。
-    validate_git_revision(base, "--base").ok()?;
-    validate_git_revision(old_path, "diff file path").ok()?;
-    let old_output = std::process::Command::new("git")
-        .args(["show", &format!("{base}:{old_path}")])
-        .current_dir(dir)
-        .output()
-        .ok()?;
-    if !old_output.status.success() {
-        return None;
-    }
-    let new_full = std::path::Path::new(dir).join(new_path);
-    let new_utf8 = camino::Utf8Path::from_path(&new_full)?;
-    let new_source = parser::read_file(new_utf8).ok()?;
+    let src = sources.get(site)?;
     // old / new 双方の第1引数 (props) の型注釈を抽出して一致を要求する。
-    let old_props = extract_component_props_type(&old_output.stdout, lang, name)?;
-    let new_props = extract_component_props_type(&new_source, lang, name)?;
+    let old_props = extract_component_props_type(&src.old, lang, site.name)?;
+    let new_props = extract_component_props_type(&src.new, lang, site.name)?;
     if old_props != new_props {
         return None;
     }
     // 値利用 (呼び出し / typeof / member / new / indexed) が残れば MemoExoticComponent 化で
     // 壊れ得るため blocking 維持。
-    if has_blocking_value_usage(index, name) {
+    if has_blocking_value_usage(index, site.name) {
         return None;
     }
-    Some(CompatibleApiModification {
-        name: name.to_string(),
-        kind: kind.to_string(),
-        file: new_path.to_string(),
-        old_signature: Some(old_sig.to_string()),
-        new_signature: Some(new_sig.to_string()),
-        reason: "react_component_wrapper".to_string(),
-    })
+    Some(site.compatible("react_component_wrapper"))
 }
 
 /// new 側 signature が `memo(` / `forwardRef(` / `React.memo(` / `React.forwardRef(` で
@@ -276,41 +255,14 @@ pub(crate) fn ctx_usage_is_jsx_or_safe(ctx: &str, name: &str) -> bool {
 /// member access (`.key` / `['key']` / `["key"]`) として参照されていない場合に降格する。
 /// 値のみ変更 / spread / computed key / mixed shape / record schema 不揃い / object でない /
 /// 抽出不能 / 同名複数宣言 / 削除キーの参照残存はすべて blocking 維持 (false negative 回避)。
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn detect_object_members_compatible_mod(
-    dir: &str,
-    base: &str,
-    old_path: &str,
-    new_path: &str,
-    name: &str,
-    kind: &str,
-    old_sig: &str,
-    new_sig: &str,
-    lang_id: Option<crate::language::LangId>,
+    site: &CompatibleModSite<'_>,
+    sources: &mut SignatureSourceCache,
 ) -> Option<CompatibleApiModification> {
-    use crate::language::LangId;
-    let lang =
-        lang_id.filter(|l| matches!(l, LangId::Typescript | LangId::Tsx | LangId::Javascript))?;
-    if !crate::engine::impact::is_safe_diff_path(old_path)
-        || !crate::engine::impact::is_safe_diff_path(new_path)
-    {
-        return None;
-    }
-    validate_git_revision(base, "--base").ok()?;
-    validate_git_revision(old_path, "diff file path").ok()?;
-    let old_output = std::process::Command::new("git")
-        .args(["show", &format!("{base}:{old_path}")])
-        .current_dir(dir)
-        .output()
-        .ok()?;
-    if !old_output.status.success() {
-        return None;
-    }
-    let new_full = std::path::Path::new(dir).join(new_path);
-    let new_utf8 = camino::Utf8Path::from_path(&new_full)?;
-    let new_source = parser::read_file(new_utf8).ok()?;
-    let old_keys = extract_object_member_keys(&old_output.stdout, lang, name)?;
-    let new_keys = extract_object_member_keys(&new_source, lang, name)?;
+    let lang = site.lang_in(TS_JS_LANGS)?;
+    let src = sources.get(site)?;
+    let old_keys = extract_object_member_keys(&src.old, lang, site.name)?;
+    let new_keys = extract_object_member_keys(&src.new, lang, site.name)?;
     if old_keys.record_keys.is_some() != new_keys.record_keys.is_some() {
         return None;
     }
@@ -340,18 +292,11 @@ pub(crate) fn detect_object_members_compatible_mod(
     // 削除された schema キー (old にあって new にない)。各キーへの member access が repo
     // 全体で残っていれば破壊的なので blocking 維持。
     for key in removed_members {
-        if key_has_member_access_ref(dir, key) {
+        if key_has_member_access_ref(site.dir, key) {
             return None;
         }
     }
-    Some(CompatibleApiModification {
-        name: name.to_string(),
-        kind: kind.to_string(),
-        file: new_path.to_string(),
-        old_signature: Some(old_sig.to_string()),
-        new_signature: Some(new_sig.to_string()),
-        reason: "unused_object_members".to_string(),
-    })
+    Some(site.compatible("unused_object_members"))
 }
 
 /// TS/TSX のトップレベル exported function / class method で、末尾 optional/default
@@ -369,48 +314,24 @@ pub(crate) fn detect_object_members_compatible_mod(
 /// const arrow function / nested class / import 型の解決などは対象外にして blocking を
 /// 維持する。false negative (破壊的変更の見逃し) を避けるため、AST 取得や git show に
 /// 失敗した場合も None。
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn detect_trailing_optional_params_compatible_mod(
-    dir: &str,
-    base: &str,
-    old_path: &str,
-    new_path: &str,
-    name: &str,
-    kind: &str,
-    old_sig: &str,
-    new_sig: &str,
-    lang_id: Option<crate::language::LangId>,
+    site: &CompatibleModSite<'_>,
+    sources: &mut SignatureSourceCache,
 ) -> Option<CompatibleApiModification> {
-    with_resolved_ts_fn_pair(
-        dir,
-        base,
-        old_path,
-        new_path,
-        name,
-        kind,
-        lang_id,
-        |old_fn, old_source, new_fn, new_source| {
-            let old_parts = ts_function_signature_parts(old_fn, old_source)?;
-            let new_parts = ts_function_signature_parts(new_fn, new_source)?;
+    with_resolved_ts_fn_pair(site, sources, |old_fn, old_source, new_fn, new_source| {
+        let old_parts = ts_function_signature_parts(old_fn, old_source)?;
+        let new_parts = ts_function_signature_parts(new_fn, new_source)?;
 
-            if old_parts.head != new_parts.head || old_parts.tail != new_parts.tail {
-                return None;
-            }
-            if !ts_params_prefix_same_with_optional_tail(&old_parts.params, &new_parts.params) {
-                return None;
-            }
-            Some(())
-        },
-    )?;
+        if old_parts.head != new_parts.head || old_parts.tail != new_parts.tail {
+            return None;
+        }
+        if !ts_params_prefix_same_with_optional_tail(&old_parts.params, &new_parts.params) {
+            return None;
+        }
+        Some(())
+    })?;
 
-    Some(CompatibleApiModification {
-        name: name.to_string(),
-        kind: kind.to_string(),
-        file: new_path.to_string(),
-        old_signature: Some(old_sig.to_string()),
-        new_signature: Some(new_sig.to_string()),
-        reason: "trailing_optional_params".to_string(),
-    })
+    Some(site.compatible("trailing_optional_params"))
 }
 
 /// TS/TSX のトップレベル exported function / class method で、引数の inline object type
@@ -431,71 +352,47 @@ pub(crate) fn detect_trailing_optional_params_compatible_mod(
 ///
 /// ネストした object type の内部変更は既存メンバーのテキスト不一致になるため対象外
 /// (第一階層の追加のみ許容)。メンバー削除・型変更・必須メンバー追加は blocking を維持する。
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn detect_optional_object_props_compatible_mod(
-    dir: &str,
-    base: &str,
-    old_path: &str,
-    new_path: &str,
-    name: &str,
-    kind: &str,
-    old_sig: &str,
-    new_sig: &str,
-    lang_id: Option<crate::language::LangId>,
+    site: &CompatibleModSite<'_>,
+    sources: &mut SignatureSourceCache,
 ) -> Option<CompatibleApiModification> {
-    with_resolved_ts_fn_pair(
-        dir,
-        base,
-        old_path,
-        new_path,
-        name,
-        kind,
-        lang_id,
-        |old_fn, old_source, new_fn, new_source| {
-            let old_parts = ts_function_signature_parts(old_fn, old_source)?;
-            let new_parts = ts_function_signature_parts(new_fn, new_source)?;
-            if old_parts.head != new_parts.head || old_parts.tail != new_parts.tail {
+    with_resolved_ts_fn_pair(site, sources, |old_fn, old_source, new_fn, new_source| {
+        let old_parts = ts_function_signature_parts(old_fn, old_source)?;
+        let new_parts = ts_function_signature_parts(new_fn, new_source)?;
+        if old_parts.head != new_parts.head || old_parts.tail != new_parts.tail {
+            return None;
+        }
+
+        let old_params_node = old_fn.child_by_field_name("parameters")?;
+        let new_params_node = new_fn.child_by_field_name("parameters")?;
+        let mut old_cursor = old_params_node.walk();
+        let old_children: Vec<tree_sitter::Node> =
+            old_params_node.named_children(&mut old_cursor).collect();
+        let mut new_cursor = new_params_node.walk();
+        let new_children: Vec<tree_sitter::Node> =
+            new_params_node.named_children(&mut new_cursor).collect();
+        if old_children.len() != new_children.len() {
+            return None;
+        }
+
+        let mut any_extension = false;
+        for (old_param, new_param) in old_children.iter().zip(new_children.iter()) {
+            let old_text = node_normalized_text(*old_param, old_source)?;
+            let new_text = node_normalized_text(*new_param, new_source)?;
+            if old_text == new_text {
+                continue;
+            }
+            if !ts_param_pair_is_optional_object_extension(
+                *old_param, old_source, *new_param, new_source,
+            ) {
                 return None;
             }
+            any_extension = true;
+        }
+        any_extension.then_some(())
+    })?;
 
-            let old_params_node = old_fn.child_by_field_name("parameters")?;
-            let new_params_node = new_fn.child_by_field_name("parameters")?;
-            let mut old_cursor = old_params_node.walk();
-            let old_children: Vec<tree_sitter::Node> =
-                old_params_node.named_children(&mut old_cursor).collect();
-            let mut new_cursor = new_params_node.walk();
-            let new_children: Vec<tree_sitter::Node> =
-                new_params_node.named_children(&mut new_cursor).collect();
-            if old_children.len() != new_children.len() {
-                return None;
-            }
-
-            let mut any_extension = false;
-            for (old_param, new_param) in old_children.iter().zip(new_children.iter()) {
-                let old_text = node_normalized_text(*old_param, old_source)?;
-                let new_text = node_normalized_text(*new_param, new_source)?;
-                if old_text == new_text {
-                    continue;
-                }
-                if !ts_param_pair_is_optional_object_extension(
-                    *old_param, old_source, *new_param, new_source,
-                ) {
-                    return None;
-                }
-                any_extension = true;
-            }
-            any_extension.then_some(())
-        },
-    )?;
-
-    Some(CompatibleApiModification {
-        name: name.to_string(),
-        kind: kind.to_string(),
-        file: new_path.to_string(),
-        old_signature: Some(old_sig.to_string()),
-        new_signature: Some(new_sig.to_string()),
-        reason: "optional_object_props".to_string(),
-    })
+    Some(site.compatible("optional_object_props"))
 }
 
 /// TSX/TS の exported function component へ `async` キーワードを追加しただけの変更を
@@ -511,59 +408,35 @@ pub(crate) fn detect_optional_object_props_compatible_mod(
 ///   React ランタイムエラーになる破壊的変更のため blocking 維持)
 /// - repo 内の参照が JSX タグ利用 / import / re-export / 定義のみ (関数呼び出し
 ///   `Foo()` は戻り値が Promise になり await が必要になるため blocking 維持)
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn detect_async_jsx_component_compatible_mod(
     index: &ApiRefIndex,
-    dir: &str,
-    base: &str,
-    old_path: &str,
-    new_path: &str,
-    name: &str,
-    kind: &str,
-    old_sig: &str,
-    new_sig: &str,
-    lang_id: Option<crate::language::LangId>,
+    site: &CompatibleModSite<'_>,
+    sources: &mut SignatureSourceCache,
 ) -> Option<CompatibleApiModification> {
     // class method は RSC の関数コンポーネント規約外なので対象にしない。
-    if kind != "function" || name.contains('.') {
+    if site.kind != "function" || site.name.contains('.') {
         return None;
     }
-    with_resolved_ts_fn_pair(
-        dir,
-        base,
-        old_path,
-        new_path,
-        name,
-        kind,
-        lang_id,
-        |old_fn, old_source, new_fn, new_source| {
-            let old_parts = ts_function_signature_parts(old_fn, old_source)?;
-            let new_parts = ts_function_signature_parts(new_fn, new_source)?;
-            if old_parts.params != new_parts.params || old_parts.tail != new_parts.tail {
-                return None;
-            }
-            if !head_is_async_addition(&old_parts.head, &new_parts.head) {
-                return None;
-            }
-            // 変更後が Client Component なら async 化は破壊的変更。
-            if ts_module_has_use_client_directive(module_root(new_fn), new_source) {
-                return None;
-            }
-            Some(())
-        },
-    )?;
+    with_resolved_ts_fn_pair(site, sources, |old_fn, old_source, new_fn, new_source| {
+        let old_parts = ts_function_signature_parts(old_fn, old_source)?;
+        let new_parts = ts_function_signature_parts(new_fn, new_source)?;
+        if old_parts.params != new_parts.params || old_parts.tail != new_parts.tail {
+            return None;
+        }
+        if !head_is_async_addition(&old_parts.head, &new_parts.head) {
+            return None;
+        }
+        // 変更後が Client Component なら async 化は破壊的変更。
+        if ts_module_has_use_client_directive(module_root(new_fn), new_source) {
+            return None;
+        }
+        Some(())
+    })?;
     // 値利用 (`Foo()` / `Foo.x` / `new Foo` 等) や判定不能な参照が残れば blocking 維持。
-    if has_blocking_value_usage(index, name) {
+    if has_blocking_value_usage(index, site.name) {
         return None;
     }
-    Some(CompatibleApiModification {
-        name: name.to_string(),
-        kind: kind.to_string(),
-        file: new_path.to_string(),
-        old_signature: Some(old_sig.to_string()),
-        new_signature: Some(new_sig.to_string()),
-        reason: "async_jsx_component".to_string(),
-    })
+    Some(site.compatible("async_jsx_component"))
 }
 
 /// `new_head` から `async ` を 1 箇所取り除くと `old_head` に一致するか
@@ -620,70 +493,42 @@ fn ts_module_has_use_client_directive(root: tree_sitter::Node<'_>, source: &[u8]
 /// TS/TSX の compatible 判定で共通の「old/new 両ツリーから対象関数ノードを一意解決する」
 /// 前段。`check` に解決済みノードとソースを渡し、その結果を返す。解決不能 (git show 失敗 /
 /// parse 失敗 / シンボル非一意) は None = blocking 維持。
-#[allow(clippy::too_many_arguments)]
 fn with_resolved_ts_fn_pair<T>(
-    dir: &str,
-    base: &str,
-    old_path: &str,
-    new_path: &str,
-    name: &str,
-    kind: &str,
-    lang_id: Option<crate::language::LangId>,
+    site: &CompatibleModSite<'_>,
+    sources: &mut SignatureSourceCache,
     check: impl FnOnce(tree_sitter::Node<'_>, &[u8], tree_sitter::Node<'_>, &[u8]) -> Option<T>,
 ) -> Option<T> {
-    use crate::language::LangId;
-    let lang = lang_id.filter(|l| matches!(l, LangId::Typescript | LangId::Tsx))?;
+    let lang = site.lang_in(TS_ONLY_LANGS)?;
     // 対象は「bare 名のトップレベル関数」または「Class.method の 2 要素 qualname メソッド」。
-    let class_method = match kind {
-        "function" if !name.contains('.') => None,
-        "method" => Some(split_two_segment_qualname(name)?),
+    let class_method = match site.kind {
+        "function" if !site.name.contains('.') => None,
+        "method" => Some(split_two_segment_qualname(site.name)?),
         _ => return None,
     };
-    if !crate::engine::impact::is_safe_diff_path(old_path)
-        || !crate::engine::impact::is_safe_diff_path(new_path)
-    {
-        return None;
-    }
-    validate_git_revision(base, "--base").ok()?;
-    validate_git_revision(old_path, "diff file path").ok()?;
-
-    let old_output = std::process::Command::new("git")
-        .args(["show", &format!("{base}:{old_path}")])
-        .current_dir(dir)
-        .output()
-        .ok()?;
-    if !old_output.status.success() {
-        return None;
-    }
-    let old_source = old_output.stdout;
-    let old_tree = parser::parse_source(&old_source, lang).ok()?;
-
-    let new_full = std::path::Path::new(dir).join(new_path);
-    let new_utf8 = camino::Utf8Path::from_path(&new_full)?;
-    let new_source = parser::read_file(new_utf8).ok()?;
-    let new_tree = parser::parse_source(&new_source, lang).ok()?;
+    let src = sources.get(site)?;
+    let (old_tree, new_tree) = src.parse_pair(lang)?;
 
     let (old_fn, new_fn) = match class_method {
         None => (
-            find_top_level_function_by_name(old_tree.root_node(), &old_source, name)?,
-            find_top_level_function_by_name(new_tree.root_node(), &new_source, name)?,
+            find_top_level_function_by_name(old_tree.root_node(), &src.old, site.name)?,
+            find_top_level_function_by_name(new_tree.root_node(), &src.new, site.name)?,
         ),
         Some((class_name, method_name)) => (
             find_unique_top_level_class_method(
                 old_tree.root_node(),
-                &old_source,
+                &src.old,
                 class_name,
                 method_name,
             )?,
             find_unique_top_level_class_method(
                 new_tree.root_node(),
-                &new_source,
+                &src.new,
                 class_name,
                 method_name,
             )?,
         ),
     };
-    check(old_fn, &old_source, new_fn, &new_source)
+    check(old_fn, &src.old, new_fn, &src.new)
 }
 
 /// ノードのソーステキストを whitespace 正規化して返す。
@@ -1486,7 +1331,7 @@ pub(crate) fn signature_has_destructured_params_for(sig: &str, fn_name: &str) ->
 /// signature 文字列の `fn_name()` パターン検査だけでは型注釈内 call signature を
 /// 誤検出するため、最終確認として AST 検査が必要。
 ///
-/// `base` / `file_path` は `validate_git_revision` で検証する (codex 指摘: 既存の
+/// `base` / `file_path` の検証は `git_show_blob` 側で強制される (codex 指摘: 既存の
 /// `extract_exported_symbols_from_git` と同じ防御を行わないと `--diff` / stdin 経路で
 /// 未検証の `base` がここに到達し得る)。
 pub(crate) fn old_top_level_function_has_empty_parameters(
@@ -1496,22 +1341,9 @@ pub(crate) fn old_top_level_function_has_empty_parameters(
     lang_id: crate::language::LangId,
     fn_name: &str,
 ) -> bool {
-    if validate_git_revision(base, "--base").is_err()
-        || validate_git_revision(file_path, "diff file path").is_err()
-    {
-        return false;
-    }
-    let output = std::process::Command::new("git")
-        .args(["show", &format!("{base}:{file_path}")])
-        .current_dir(dir)
-        .output();
-    let Ok(output) = output else {
+    let Some(source) = git_show_blob(dir, base, file_path) else {
         return false;
     };
-    if !output.status.success() {
-        return false;
-    }
-    let source = output.stdout;
     let Ok(tree) = parser::parse_source(&source, lang_id) else {
         return false;
     };

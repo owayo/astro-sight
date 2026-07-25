@@ -1,9 +1,127 @@
-//! impact streaming Pass で使う純粋なフィルタ関数群。
+//! impact streaming Pass で使うフィルタ群。
 //!
 //! ここにまとめる理由:
-//!   - どれも `&str` を受け取って `bool` を返すだけの純粋関数で、state を持たない。
+//!   - import 文判定などは `&str` を受け取って `bool` を返すだけの純粋関数で、state を持たない。
 //!   - Pass 2 / Pass 3 の両方から呼ばれる共通ユーティリティ。
 //!   - テストを同居させておくと import 文の言語別バリエーションを追加しやすい。
+//!
+//! Pass 1 の cross-file 収録判定 (`CrossFileFilterContext`) も、判定材料が per-file 定数
+//! だけで副作用を持たない同種のフィルタなのでここに置く。
+use std::collections::HashSet;
+
+use crate::engine::symbols;
+use crate::language::LangId;
+use crate::models::impact::{AffectedSymbol, HunkInfo, SignatureChange};
+use crate::models::symbol::Symbol;
+
+use super::find_overlapping_symbol;
+use super::signature::is_symbol_in_changed_lines;
+use super::test_context::is_in_test_context;
+
+/// Pass 1 の cross-file 収録判定に必要な per-file 定数をまとめた借用コンテキスト。
+///
+/// `should_include_for_cross_file` は affected シンボル 1 件ごとに呼ばれるが、判定材料の
+/// うち変化するのは `sym` だけで、残りはすべて「その diff ファイル」に固定された値。
+/// ファイルごとに 1 度だけ組み立てて affected ループから使い回す。
+pub(super) struct CrossFileFilterContext<'a> {
+    /// 変更ファイルから抽出した全シンボル。
+    pub(super) syms: &'a [Symbol],
+    pub(super) hunks: &'a [HunkInfo],
+    pub(super) sig_changes: &'a [SignatureChange],
+    /// diff 全体のテキスト (シンボル名が変更行に出現するかの照合に使う)。
+    pub(super) diff_input: &'a str,
+    /// diff の新側パス。
+    pub(super) file_path: &'a str,
+    pub(super) root: tree_sitter::Node<'a>,
+    pub(super) source: &'a [u8],
+    pub(super) lang_id: LangId,
+    /// 新側の実変更行 (`+` 行、0-indexed)。
+    pub(super) changed_new_lines: &'a HashSet<usize>,
+}
+
+impl CrossFileFilterContext<'_> {
+    /// affected シンボルを cross-file 参照検索に含めるべきか判定する。
+    ///
+    /// 5段階のフィルタを適用する：
+    /// 1. impl ブロックの型名をスキップ（API に影響しない）
+    /// 2. テストコンテキスト内のシンボルをスキップ
+    /// 3. ボディのみの変更（シグネチャ変更なし）の関数/メソッドをスキップ
+    /// 4. エクスポートされていないシンボルをスキップ
+    /// 5. 変更された diff 行にシンボル名が出現しない場合スキップ
+    pub(super) fn should_include_for_cross_file(&self, sym: &AffectedSymbol) -> bool {
+        // 1. impl ブロックの型名とモジュール宣言をスキップ
+        // モジュール宣言（例: `pub mod tensor`）は API サーフェスを変更しない。
+        // 実際の内容変更は diff 内のモジュール自身のファイルから検出される。
+        if sym.kind == "type" || sym.kind == "module" {
+            return false;
+        }
+        // hunks と重なる定義シンボルは (syms, sym.name, hunks) が不変なので 1 回だけ引く。
+        // Option<&Symbol> は Copy のため以降の各判定で使い回せる (旧実装は 3 回線形スキャンしていた)。
+        let overlapping = find_overlapping_symbol(self.syms, &sym.name, self.hunks);
+        // 2. テストコンテキスト内のシンボルをスキップ
+        if overlapping.is_some_and(|s| {
+            is_in_test_context(
+                self.root,
+                self.source,
+                &s.range,
+                self.lang_id,
+                self.file_path,
+            )
+        }) {
+            return false;
+        }
+        // 3. ボディのみの変更の関数/メソッドをスキップ
+        if (sym.kind == "function" || sym.kind == "method")
+            && !self.sig_changes.iter().any(|sc| sc.name == sym.name)
+        {
+            return false;
+        }
+        // 3a. Kotlin/Java/Swift/TS/C# の `override` メソッドは親 interface/class から
+        // 呼ばれるため cross-file caller を追跡できない。親 API のシグネチャは不変なので
+        // 下流互換性にも影響せず、本体変更は impl 変更として扱い api.mod から除外する。
+        if (sym.kind == "function" || sym.kind == "method")
+            && overlapping.is_some_and(|s| {
+                symbols::is_override_method(self.root, self.source, self.lang_id, &s.range)
+            })
+        {
+            return false;
+        }
+        // 3b. 宣言ヘッダ行が変更されていない型シンボルをスキップ。
+        // 型宣言ノードの開始行 (= シンボル range の開始行) が新側変更行に含まれない場合は、
+        // body 内の変更や、名前を言及する docblock コメント (`* class Foo`) / 文字列の変更が
+        // あっても他ファイルのクラス参照へ伝播しない。docblock コメントは AST 上の型宣言ノードに
+        // 含まれない別ノードなので、宣言開始行と変更行の交差で判定すればコメント/文字列の名前
+        // 言及を確実に除外できる (GitLab #35: クラス参照の過剰列挙、テキスト照合の誤マッチを排除)。
+        // 宣言開始行のみを見るため `trait GuestMemory` のような単一行ヘッダにも、フリー関数の
+        // シグネチャ行に型名が出現するだけのケースにも正しく作用する。
+        if matches!(
+            sym.kind.as_str(),
+            "trait" | "struct" | "class" | "interface" | "enum"
+        ) && let Some(s) = overlapping
+            && !self.changed_new_lines.contains(&s.range.start.line)
+        {
+            return false;
+        }
+        // 4. エクスポートされていないシンボルをスキップ
+        if !overlapping.is_some_and(|s| {
+            symbols::is_symbol_exported(self.root, self.source, self.lang_id, &s.range)
+        }) {
+            return false;
+        }
+        // 5. 変更行にシンボル名が出現しない場合スキップ
+        if !is_symbol_in_changed_lines(self.diff_input, self.file_path, &sym.name, self.lang_id) {
+            return false;
+        }
+        // 6. 新規追加シンボル (change_type == "added") は cross-file caller がまだない
+        //    ため検索対象から除外する。同一 commit 内で追加された caller は他ファイルの
+        //    シンボル変更経由で別途検出されるため、本シンボル単独の cross-file 探索は
+        //    ノイズだけが残る。新規ファイルの全シンボルがここで除外される。
+        if sym.change_type == "added" {
+            return false;
+        }
+        true
+    }
+}
 
 /// 同一ファイル判定。サフィックスマッチで偽陽性を出さないよう、完全一致 or パス区切り付き
 /// （`ref_path.ends_with("/{source_path}")`）で判定する。
@@ -110,6 +228,146 @@ fn is_js_ts_export_clause(ctx: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- CrossFileFilterContext::should_include_for_cross_file ---
+
+    /// `src/lib.rs` の 1 行目 (0-indexed 0) を書き換えた unified diff を作る。
+    fn one_line_diff(new_line: &str) -> String {
+        format!("--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,1 @@\n-// old\n+{new_line}\n",)
+    }
+
+    fn affected(name: &str, kind: &str, change_type: &str) -> AffectedSymbol {
+        AffectedSymbol {
+            name: name.to_string(),
+            kind: kind.to_string(),
+            change_type: change_type.to_string(),
+        }
+    }
+
+    /// 1 行目全体を hunk とみなす per-file 定数を組み立ててから判定を実行する。
+    fn include_for_rust(
+        source: &str,
+        sym: &AffectedSymbol,
+        sig_changes: &[SignatureChange],
+        changed_lines: &[usize],
+    ) -> bool {
+        let bytes = source.as_bytes();
+        let tree = crate::engine::parser::parse_source(bytes, LangId::Rust).expect("parse");
+        let root = tree.root_node();
+        let syms = symbols::extract_symbols(root, bytes, LangId::Rust).expect("symbols");
+        let hunks = vec![HunkInfo {
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+        }];
+        let diff_input = one_line_diff(source.lines().next().unwrap_or_default());
+        let changed_new_lines: HashSet<usize> = changed_lines.iter().copied().collect();
+        let ctx = CrossFileFilterContext {
+            syms: &syms,
+            hunks: &hunks,
+            sig_changes,
+            diff_input: &diff_input,
+            file_path: "src/lib.rs",
+            root,
+            source: bytes,
+            lang_id: LangId::Rust,
+            changed_new_lines: &changed_new_lines,
+        };
+        ctx.should_include_for_cross_file(sym)
+    }
+
+    fn sig_change(name: &str) -> SignatureChange {
+        SignatureChange {
+            name: name.to_string(),
+            old_signature: "fn foo()".to_string(),
+            new_signature: "fn foo(a: usize)".to_string(),
+        }
+    }
+
+    // 1. impl ブロックの型名 / モジュール宣言は AST を見る前に除外される
+    #[test]
+    fn cross_file_filter_skips_type_and_module_kind() {
+        let source = "pub fn foo(a: usize) -> usize { a }\n";
+        assert!(!include_for_rust(
+            source,
+            &affected("Foo", "type", "modified"),
+            &[sig_change("Foo")],
+            &[0]
+        ));
+        assert!(!include_for_rust(
+            source,
+            &affected("foo", "module", "modified"),
+            &[sig_change("foo")],
+            &[0]
+        ));
+    }
+
+    // シグネチャ変更のある exported fn は cross-file 検索に含める
+    #[test]
+    fn cross_file_filter_includes_exported_fn_with_signature_change() {
+        let source = "pub fn foo(a: usize) -> usize { a }\n";
+        assert!(include_for_rust(
+            source,
+            &affected("foo", "function", "modified"),
+            &[sig_change("foo")],
+            &[0]
+        ));
+    }
+
+    // 3. シグネチャ変更が無い (= ボディのみ変更) 関数は除外
+    #[test]
+    fn cross_file_filter_skips_body_only_change() {
+        let source = "pub fn foo(a: usize) -> usize { a }\n";
+        assert!(!include_for_rust(
+            source,
+            &affected("foo", "function", "modified"),
+            &[],
+            &[0]
+        ));
+    }
+
+    // 4. 非 export (pub なし) の関数は除外
+    #[test]
+    fn cross_file_filter_skips_non_exported_fn() {
+        let source = "fn foo(a: usize) -> usize { a }\n";
+        assert!(!include_for_rust(
+            source,
+            &affected("foo", "function", "modified"),
+            &[sig_change("foo")],
+            &[0]
+        ));
+    }
+
+    // 6. 新規追加シンボルは cross-file caller がまだ無いため除外
+    #[test]
+    fn cross_file_filter_skips_added_symbol() {
+        let source = "pub fn foo(a: usize) -> usize { a }\n";
+        assert!(!include_for_rust(
+            source,
+            &affected("foo", "function", "added"),
+            &[sig_change("foo")],
+            &[0]
+        ));
+    }
+
+    // 3b. 宣言ヘッダ行が変更行に含まれない型シンボルは除外 (body/コメントのみ変更)
+    #[test]
+    fn cross_file_filter_skips_struct_with_unchanged_header() {
+        let source = "pub struct Foo {\n    pub a: usize,\n}\n";
+        assert!(include_for_rust(
+            source,
+            &affected("Foo", "struct", "modified"),
+            &[],
+            &[0]
+        ));
+        assert!(!include_for_rust(
+            source,
+            &affected("Foo", "struct", "modified"),
+            &[],
+            &[1]
+        ));
+    }
 
     // --- is_same_source_file ---
 

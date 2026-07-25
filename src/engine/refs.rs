@@ -572,6 +572,19 @@ impl LineIndex {
         Self { line_starts }
     }
 
+    /// byte offset を `(row, col)` (0-indexed, byte col) に変換する。
+    /// 行頭索引を二分探索するため 1 件あたり O(log 行数)。
+    /// `byte` が `source_len` を超える場合は末尾にクランプする。
+    pub(crate) fn row_col(&self, source_len: usize, byte: usize) -> (usize, usize) {
+        let limit = byte.min(source_len);
+        // line_starts は昇順かつ先頭が 0 なので、limit 以下の要素は必ず 1 つ以上ある。
+        let row = self
+            .line_starts
+            .partition_point(|&start| start as usize <= limit)
+            - 1;
+        (row, limit - self.line_starts[row] as usize)
+    }
+
     /// 指定行の本体 byte 範囲 `[start, end)` を返す。末尾の `\n` は含めない。
     /// 行が存在しない場合は `None`。
     pub(crate) fn line_bounds(&self, source_len: usize, row: usize) -> Option<(usize, usize)> {
@@ -587,6 +600,38 @@ impl LineIndex {
             .map(|&n| (n as usize).saturating_sub(1).min(source_len))
             .unwrap_or(source_len);
         Some((start, end))
+    }
+}
+
+/// `text` 内の byte offset を `(row, col)` (0-indexed, byte col) に変換する。
+///
+/// 同じ `text` から複数箇所引く場合は [`LineIndex`] を 1 度作って
+/// [`LineIndex::row_col`] を使う (per-call の O(offset) 走査を避けられる)。
+pub(crate) fn byte_offset_to_row_col(text: &str, byte_offset: usize) -> (usize, usize) {
+    let bytes = text.as_bytes();
+    let limit = byte_offset.min(bytes.len());
+    let mut row = 0;
+    let mut line_start = 0;
+    for nl in memchr::memchr_iter(b'\n', &bytes[..limit]) {
+        row += 1;
+        line_start = nl + 1;
+    }
+    (row, limit - line_start)
+}
+
+/// 埋め込み領域内の相対位置を、ファイル全体での絶対位置へ変換する。
+///
+/// `base` は領域先頭 (相対 `(0, 0)`) が対応するファイル上の `(row, col)`。
+/// 領域 1 行目だけは領域先頭が行頭ではないので base 列を加算し、2 行目以降は
+/// 行頭がファイルの行頭と一致するため相対列をそのまま使う。この規約は Angular
+/// inline template / PHPUnit DocBlock・attribute / bash trap handler で共通。
+pub(crate) fn absolute_position(base: (usize, usize), rel: (usize, usize)) -> (usize, usize) {
+    let (base_row, base_col) = base;
+    let (rel_row, rel_col) = rel;
+    if rel_row == 0 {
+        (base_row, base_col + rel_col)
+    } else {
+        (base_row + rel_row, rel_col)
     }
 }
 
@@ -1873,23 +1918,6 @@ pub(crate) fn build_ac_case_insensitive(
         .ascii_case_insensitive(true)
         .build(symbol_names)
         .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))
-}
-
-/// dead-code 判定用 (test-only 分類版): 各シンボルの非 Definition 参照件数を
-/// production と test それぞれ別カウントで返す。
-///
-/// `is_test` predicate は呼び出し側から渡す (例: `is_test_path` / ディレクトリセグメント判定)。
-/// 戻り値は `HashMap<symbol_name, (production_count, test_count)>`。
-pub fn count_non_definition_refs_split<F>(
-    symbol_names: &[String],
-    dir: &Path,
-    glob_pattern: Option<&str>,
-    is_test: F,
-) -> Result<std::collections::HashMap<String, (usize, usize)>>
-where
-    F: Fn(&Path) -> bool + Sync,
-{
-    count_non_definition_refs_split_with_extra_files(symbol_names, dir, glob_pattern, &[], is_test)
 }
 
 /// workspace walk の結果 `files` に、diff 由来などの明示ファイルを canonical path で
@@ -3399,6 +3427,49 @@ fn caller(s: &S) {
         assert_eq!(index.line_bounds(source.len(), 1), None);
     }
 
+    /// `LineIndex::row_col` が単発走査版 `byte_offset_to_row_col` と全 offset で一致すること。
+    /// 埋め込み領域の位置計算はこの 2 経路を混在して使うため、ズレると `path:line:col` が壊れる。
+    #[test]
+    fn line_index_row_col_matches_single_shot_scan() {
+        for text in ["", "a", "a\n", "a\nbb\n\nccc", "\n\n", "あ\nいい"] {
+            let index = LineIndex::new(text.as_bytes());
+            // 末尾 +2 まで見て、範囲外 offset のクランプ挙動も一致させる。
+            for byte in 0..=text.len() + 2 {
+                assert_eq!(
+                    index.row_col(text.len(), byte),
+                    byte_offset_to_row_col(text, byte),
+                    "text={text:?} byte={byte}"
+                );
+            }
+        }
+    }
+
+    /// `byte_offset_to_row_col` の基本形: 改行数が row、直前行頭からの byte 数が col。
+    #[test]
+    fn byte_offset_to_row_col_counts_rows_and_byte_columns() {
+        let text = "ab\ncde\n";
+        assert_eq!(byte_offset_to_row_col(text, 0), (0, 0));
+        assert_eq!(byte_offset_to_row_col(text, 2), (0, 2));
+        // 改行直後は次行の col 0
+        assert_eq!(byte_offset_to_row_col(text, 3), (1, 0));
+        assert_eq!(byte_offset_to_row_col(text, 5), (1, 2));
+        assert_eq!(byte_offset_to_row_col(text, 7), (2, 0));
+        // 範囲外は末尾にクランプ
+        assert_eq!(byte_offset_to_row_col(text, 999), (2, 0));
+        // col は byte 単位 (多バイト文字を 1 と数えない)
+        assert_eq!(byte_offset_to_row_col("あa", 3), (0, 3));
+    }
+
+    /// `absolute_position` の規約: 領域 1 行目のみ base 列を加算し、2 行目以降は加算しない。
+    #[test]
+    fn absolute_position_adds_base_column_only_on_first_row() {
+        assert_eq!(absolute_position((10, 5), (0, 0)), (10, 5));
+        assert_eq!(absolute_position((10, 5), (0, 3)), (10, 8));
+        // 2 行目以降は行頭がファイルの行頭と一致するため col はそのまま
+        assert_eq!(absolute_position((10, 5), (1, 0)), (11, 0));
+        assert_eq!(absolute_position((10, 5), (2, 7)), (12, 7));
+    }
+
     /// `extract_line_context_indexed` が単発 `extract_line_context` と同じ結果を返すことを
     /// 検証 (LineIndex 経由でも従来挙動が維持される)。
     #[test]
@@ -3912,6 +3983,7 @@ struct Bar {
         );
     }
 
+    /// 追加ファイルなし (`extra_files` 空) の場合は通常の workspace walk と同じ件数になる。
     #[test]
     fn count_non_definition_refs_split_without_extra_files_keeps_existing_api() {
         let dir = tempfile::tempdir().unwrap();
@@ -3921,9 +3993,14 @@ struct Bar {
         )
         .unwrap();
 
-        let counts =
-            count_non_definition_refs_split(&["helper".to_string()], dir.path(), None, |_| false)
-                .unwrap();
+        let counts = count_non_definition_refs_split_with_extra_files(
+            &["helper".to_string()],
+            dir.path(),
+            None,
+            &[],
+            |_| false,
+        )
+        .unwrap();
 
         assert_eq!(counts.get("helper"), Some(&(1, 0)));
     }

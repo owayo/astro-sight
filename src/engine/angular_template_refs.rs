@@ -18,6 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::engine::refs::{LineIndex, absolute_position};
 use crate::models::reference::{RefKind, SymbolReference};
 
 /// テンプレートファイル 1 件あたりの最大サイズ (2MB)。
@@ -110,9 +111,14 @@ fn is_angular_project(dir: &Path) -> bool {
 }
 
 /// HTML テンプレートから Angular binding 式内の識別子を抽出する。
+///
+/// 補間 (`{{ }}`) と属性 binding の走査は位置付き参照検索と同じ `for_each_template_expr`
+/// を使い、ここでは位置を捨てて識別子だけ集める。制御フローブロック (`@if` / `@for` /
+/// `@let`) は dead-code 経路のみが扱う (位置付き経路は未対応)。
 fn extract_template_refs(content: &str, refs: &mut HashSet<String>) {
-    extract_interpolation_refs(content, refs);
-    extract_binding_refs(content, refs);
+    for_each_template_expr(content, &mut |expr, _base| {
+        extract_identifiers(expr, refs);
+    });
     extract_control_flow_refs(content, refs);
 }
 
@@ -155,104 +161,6 @@ fn is_html_tag_continue(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')
 }
 
-/// `{{ ... }}` 補間式の中身から識別子を抽出する。
-fn extract_interpolation_refs(content: &str, refs: &mut HashSet<String>) {
-    let bytes = content.as_bytes();
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        if bytes[i] == b'{' && bytes[i + 1] == b'{' {
-            let start = i + 2;
-            let mut j = start;
-            while j + 1 < bytes.len() && !(bytes[j] == b'}' && bytes[j + 1] == b'}') {
-                j += 1;
-            }
-            if j + 1 >= bytes.len() {
-                break;
-            }
-            if let Ok(expr) = std::str::from_utf8(&bytes[start..j]) {
-                extract_identifiers(expr, refs);
-            }
-            i = j + 2;
-        } else {
-            i += 1;
-        }
-    }
-}
-
-/// Angular の属性バインディングの右辺式から識別子を抽出する。
-///
-/// 対象パターン:
-///   - `(event)="expr"`     event binding
-///   - `[prop]="expr"`      property binding
-///   - `[(ngModel)]="expr"` two-way binding
-///   - `*ngIf="expr"` 等    structural directive
-///   - `let-x="expr"`       template input variable
-fn extract_binding_refs(content: &str, refs: &mut HashSet<String>) {
-    let bytes = content.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let prev_is_boundary = i == 0 || is_attr_separator(bytes[i - 1]);
-        if !prev_is_boundary {
-            i += 1;
-            continue;
-        }
-        let starts_binding = matches!(bytes[i], b'(' | b'[' | b'*')
-            || (i + 4 < bytes.len() && &bytes[i..i + 4] == b"let-");
-        if !starts_binding {
-            i += 1;
-            continue;
-        }
-        // 属性名を読む: `=` まで進める
-        let mut j = i;
-        while j < bytes.len() {
-            let b = bytes[j];
-            if b == b'=' || is_attr_separator(b) || b == b'>' || b == b'/' {
-                break;
-            }
-            j += 1;
-        }
-        if j >= bytes.len() || bytes[j] != b'=' {
-            i = j.max(i + 1);
-            continue;
-        }
-        j += 1; // `=` の次へ
-        if j >= bytes.len() {
-            i = j;
-            continue;
-        }
-        if bytes[j] == b'"' || bytes[j] == b'\'' {
-            // 引用符あり: 対応する閉じ引用符まで
-            let quote = bytes[j];
-            j += 1;
-            let start = j;
-            while j < bytes.len() && bytes[j] != quote {
-                j += 1;
-            }
-            if j >= bytes.len() {
-                break;
-            }
-            if let Ok(expr) = std::str::from_utf8(&bytes[start..j]) {
-                extract_identifiers(expr, refs);
-            }
-            i = j + 1;
-        } else {
-            // 引用符なし属性値 (`[kana]=userNameForIcon`): 空白 / `>` / `/` まで
-            let start = j;
-            while j < bytes.len()
-                && !is_attr_separator(bytes[j])
-                && bytes[j] != b'>'
-                && bytes[j] != b'/'
-            {
-                j += 1;
-            }
-            if let Ok(expr) = std::str::from_utf8(&bytes[start..j]) {
-                extract_identifiers(expr, refs);
-            }
-            i = j;
-        }
-    }
-}
-
 /// 属性区切り文字 (空白・タブ・改行) かを判定する。
 fn is_attr_separator(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r')
@@ -293,60 +201,23 @@ fn is_ident_continue(b: u8) -> bool {
 
 /// TypeScript ファイル内の `@Component({ template: \`...\` })` 形式の inline
 /// template から識別子を抽出する。
-///
-/// `template:` キーの直後の `` ` `` / `'` / `"` 文字列リテラルを抽出し、
-/// その中身を HTML テンプレートと同じく走査する。
 fn extract_inline_template_refs(content: &str, refs: &mut HashSet<String>) {
-    let bytes = content.as_bytes();
-    let needle = b"template:";
-    let mut i = 0;
-    while i + needle.len() <= bytes.len() {
-        if &bytes[i..i + needle.len()] != needle {
-            i += 1;
-            continue;
-        }
-        if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
-            i += 1;
-            continue;
-        }
-        let mut j = i + needle.len();
-        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
-            j += 1;
-        }
-        if j >= bytes.len() {
-            break;
-        }
-        let quote = bytes[j];
-        if quote != b'`' && quote != b'\'' && quote != b'"' {
-            i = j.max(i + 1);
-            continue;
-        }
-        j += 1;
-        let start = j;
-        while j < bytes.len() && bytes[j] != quote {
-            if bytes[j] == b'\\' && j + 1 < bytes.len() {
-                j += 2;
-            } else {
-                j += 1;
-            }
-        }
-        if j >= bytes.len() {
-            break;
-        }
-        if let Ok(template_content) = std::str::from_utf8(&bytes[start..j]) {
-            extract_template_refs(template_content, refs);
-        }
-        i = j + 1;
-    }
+    for_each_inline_template(content, |template, _start| {
+        extract_template_refs(template, refs);
+    });
 }
 
 fn extract_inline_template_element_selectors(content: &str, selectors: &mut HashSet<String>) {
-    for_each_inline_template(content, |template| {
+    for_each_inline_template(content, |template, _start| {
         extract_element_selectors(template, selectors);
     });
 }
 
-fn for_each_inline_template(content: &str, mut f: impl FnMut(&str)) {
+/// inline template (`template:` キー直後の `` ` `` / `'` / `"` 文字列リテラル) の中身を
+/// `(template, content 内の中身先頭 byte 位置)` で `f` に渡す。
+///
+/// `templateUrl:` は `template` の後が識別子継続文字なので needle に一致せず除外される。
+fn for_each_inline_template(content: &str, mut f: impl FnMut(&str, usize)) {
     let bytes = content.as_bytes();
     let needle = b"template:";
     let mut i = 0;
@@ -355,6 +226,7 @@ fn for_each_inline_template(content: &str, mut f: impl FnMut(&str)) {
             i += 1;
             continue;
         }
+        // 前が識別子継続文字なら別キー (`myTemplate:` 等)。
         if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
             i += 1;
             continue;
@@ -384,7 +256,7 @@ fn for_each_inline_template(content: &str, mut f: impl FnMut(&str)) {
             break;
         }
         if let Ok(template_content) = std::str::from_utf8(&bytes[start..j]) {
-            f(template_content);
+            f(template_content, start);
         }
         i = j + 1;
     }
@@ -761,7 +633,12 @@ fn extract_for_block_refs(expr: &str, refs: &mut HashSet<String>) {
 //   - binding の左辺 (event/property 名) は対象外 (式右辺のみ抽出)
 //   - pipe 名 (`| date`)、`$event` 等の Angular local、`*ngFor` の `let`/`as`/`of`
 //     束縛変数、JS 予約語/リテラルは除外
-// dead-code 経路 (上の collect_*) には一切手を入れず、純粋に追加実装する。
+//
+// 走査そのもの (`for_each_template_expr` / `for_each_inline_template`) は dead-code 経路
+// (上の `collect_*`) と共有し、位置を使うか捨てるかだけが違う。ただし制御フローブロック
+// (`@if` / `@for` / `@let`) の `extract_control_flow_refs` は dead-code 経路のみが呼ぶ:
+// `@for` のループ変数除外が両経路で別方式 (`extract_for_block_refs` の 2 集合方式 vs
+// region 全体の `template_expr_locals`) のため、位置付き経路への接続は別途設計が必要。
 // ============================================================================
 
 /// component に紐付く template の集約結果。
@@ -1031,50 +908,13 @@ fn extract_template_urls(content: &str) -> Vec<String> {
 /// inline `template:` の中身を (content, base_row, base_col) で返す。
 /// base_row/base_col は `.ts` ファイル内での template 中身先頭位置 (0-indexed, byte col)。
 fn extract_inline_templates_with_pos(content: &str) -> Vec<(String, usize, usize)> {
+    // template が複数ある .ts でも行頭索引は 1 度だけ作る。
+    let index = LineIndex::new(content.as_bytes());
     let mut out = Vec::new();
-    let bytes = content.as_bytes();
-    let needle = b"template:";
-    let mut i = 0;
-    while i + needle.len() <= bytes.len() {
-        if &bytes[i..i + needle.len()] != needle {
-            i += 1;
-            continue;
-        }
-        // 前が識別子継続文字なら別キー (`templateUrl:` は別途処理済みなので除外)。
-        if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
-            i += 1;
-            continue;
-        }
-        let mut j = i + needle.len();
-        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
-            j += 1;
-        }
-        if j >= bytes.len() {
-            break;
-        }
-        let quote = bytes[j];
-        if quote != b'`' && quote != b'\'' && quote != b'"' {
-            i = j.max(i + 1);
-            continue;
-        }
-        j += 1;
-        let start = j;
-        while j < bytes.len() && bytes[j] != quote {
-            if bytes[j] == b'\\' && j + 1 < bytes.len() {
-                j += 2;
-            } else {
-                j += 1;
-            }
-        }
-        if j >= bytes.len() {
-            break;
-        }
-        if let Ok(tpl) = std::str::from_utf8(&bytes[start..j]) {
-            let (base_row, base_col) = byte_to_row_col(content, start);
-            out.push((tpl.to_string(), base_row, base_col));
-        }
-        i = j + 1;
-    }
+    for_each_inline_template(content, |tpl, start| {
+        let (base_row, base_col) = index.row_col(content.len(), start);
+        out.push((tpl.to_string(), base_row, base_col));
+    });
     out
 }
 
@@ -1126,14 +966,24 @@ fn scan_template_region_emit(
     });
 
     // Pass 2: 各式から component member 参照を emit する。
+    // 行頭索引は region / file それぞれ最大 1 度だけ構築する (hit 毎に offset 0 から
+    // 走査すると O(hit 数 × ファイルサイズ) になる)。hit ゼロの template では
+    // 索引自体を作らないので、該当なしファイルの走査コストは従来どおり。
+    let mut region_index: Option<LineIndex> = None;
+    let mut file_index: Option<LineIndex> = None;
     let mut sink = |ident: &str, byte_off: usize| {
         let Some(ixs) = name_to_ix.get(ident) else {
             return;
         };
-        let (trow, tcol) = byte_to_row_col(region, byte_off);
-        let frow = base_row + trow;
-        let fcol = if trow == 0 { base_col + tcol } else { tcol };
-        let ctx = file_line_context(file_content, frow);
+        let rel = region_index
+            .get_or_insert_with(|| LineIndex::new(region.as_bytes()))
+            .row_col(region.len(), byte_off);
+        let (frow, fcol) = absolute_position((base_row, base_col), rel);
+        let ctx = file_line_context(
+            file_content,
+            file_index.get_or_insert_with(|| LineIndex::new(file_content.as_bytes())),
+            frow,
+        );
         for &ix in ixs {
             out[ix].push(SymbolReference {
                 path: file_path.to_string(),
@@ -1181,8 +1031,16 @@ fn each_interpolation_expr(content: &str, f: &mut impl FnMut(&str, usize)) {
     }
 }
 
-/// `(event)="expr"` / `[prop]="expr"` / `*ngIf="expr"` 等の binding 右辺式を
-/// `(expr, byte 位置)` で `f` に渡す。binding 名 (左辺) は対象外。
+/// 属性 binding の右辺式を `(expr, byte 位置)` で `f` に渡す。binding 名 (左辺) は対象外。
+///
+/// 対象パターン:
+///   - `(event)="expr"`     event binding
+///   - `[prop]="expr"`      property binding
+///   - `[(ngModel)]="expr"` two-way binding
+///   - `*ngIf="expr"` 等    structural directive
+///   - `let-x="expr"`       template input variable
+///
+/// 引用符なし属性値 (`[kana]=userNameForIcon`) も空白 / `>` / `/` までを式として扱う。
 fn each_binding_expr(content: &str, f: &mut impl FnMut(&str, usize)) {
     let bytes = content.as_bytes();
     let mut i = 0;
@@ -1385,24 +1243,16 @@ fn is_template_reserved(ident: &str) -> bool {
     )
 }
 
-/// `content` の byte offset を (row, col) (0-indexed, byte col) に変換する。
-fn byte_to_row_col(content: &str, byte: usize) -> (usize, usize) {
-    let bytes = content.as_bytes();
-    let limit = byte.min(bytes.len());
-    let mut row = 0;
-    let mut line_start = 0;
-    for (idx, &b) in bytes.iter().enumerate().take(limit) {
-        if b == b'\n' {
-            row += 1;
-            line_start = idx + 1;
-        }
-    }
-    (row, limit - line_start)
-}
-
 /// `content` の `row` 行目を context として返す (前後空白を trim、256 byte 上限・UTF-8 境界安全)。
-fn file_line_context(content: &str, row: usize) -> String {
-    let line = content.lines().nth(row).unwrap_or("").trim();
+///
+/// `index` は `content` の行頭索引 (hit 毎の `lines().nth(row)` 走査を避けるため共有する)。
+/// refs.rs の `extract_line_context` と違い切り詰めマーカー (`...`) は付けない (既存出力互換)。
+fn file_line_context(content: &str, index: &LineIndex, row: usize) -> String {
+    let line = index
+        .line_bounds(content.len(), row)
+        .and_then(|(start, end)| content.get(start..end))
+        .unwrap_or("")
+        .trim();
     if line.len() <= 256 {
         return line.to_string();
     }
@@ -2142,6 +1992,98 @@ export class HeaderComponent {
         )
         .unwrap();
         assert!(find_angular_template_references("bigFn", dir.path(), None).is_empty());
+    }
+
+    /// `(line, column, context)` を固定値で押さえる回帰テスト。
+    /// inline template は 1 行目だけ base_col を足し、2 行目以降は足さない規約なので、
+    /// 同一 template 内の複数 hit を跨いで位置計算が変わっていないことを確認する。
+    #[test]
+    fn template_refs_inline_multi_hit_positions_and_context_are_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("foo.component.ts"),
+            "import { Component } from '@angular/core';\n@Component({\n  template: `<b (click)=\"doSave()\">{{ doSave() }}</b>\n<span (x)=\"doSave()\">{{ label }}</span>`,\n})\nexport class FooComponent { doSave(): void {} }\n",
+        )
+        .unwrap();
+        let refs = find_angular_template_references("doSave", dir.path(), None);
+        let got: Vec<(usize, usize, &str)> = refs
+            .iter()
+            .map(|r| (r.line, r.column, r.context.as_deref().unwrap_or("")))
+            .collect();
+        // template 中身の先頭は行 2 の col 13。region 1 行目の hit は base_col 13 が乗り、
+        // region 2 行目 (= 行 3) の hit は行頭からの列そのまま。
+        assert_eq!(
+            got,
+            vec![
+                (
+                    2,
+                    38,
+                    "template: `<b (click)=\"doSave()\">{{ doSave() }}</b>"
+                ),
+                (
+                    2,
+                    25,
+                    "template: `<b (click)=\"doSave()\">{{ doSave() }}</b>"
+                ),
+                (3, 11, "<span (x)=\"doSave()\">{{ label }}</span>`,"),
+            ],
+            "{refs:?}"
+        );
+    }
+
+    /// 外部 html の複数行・複数 hit で位置と context 行が不変であることを押さえる。
+    /// context は 256 byte 上限で切り詰めるが、refs.rs 側と違い `...` マーカーは付けない。
+    #[test]
+    fn template_refs_html_multi_hit_positions_and_context_are_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.component.ts"),
+            "@Component({ templateUrl: './a.component.html' })\nexport class A {}\n",
+        )
+        .unwrap();
+        // 3 行目は 256 byte 超で、byte 255 から 3 byte の多バイト文字が跨ぐ長さにする。
+        let pad = "y".repeat(238);
+        std::fs::write(
+            dir.path().join("a.component.html"),
+            format!(
+                "<div>\n  <b (click)=\"hitFn()\">{{{{ hitFn() }}}}</b>\n  <i [x]=\"hitFn()\">{pad}あいう</i>\n</div>\n"
+            ),
+        )
+        .unwrap();
+        let refs = find_angular_template_references("hitFn", dir.path(), None);
+        let positions: Vec<(usize, usize)> = refs.iter().map(|r| (r.line, r.column)).collect();
+        assert_eq!(positions, vec![(1, 26), (1, 14), (2, 10)], "{refs:?}");
+        let line1_ctx = "<b (click)=\"hitFn()\">{{ hitFn() }}</b>";
+        assert_eq!(refs[0].context.as_deref(), Some(line1_ctx));
+        assert_eq!(refs[1].context.as_deref(), Some(line1_ctx));
+        // 切り詰め: UTF-8 境界まで戻すので 256 ではなく 255 byte、マーカーなし。
+        let truncated = refs[2].context.as_deref().unwrap();
+        assert_eq!(truncated, &format!("<i [x]=\"hitFn()\">{pad}")[..255]);
+        assert_eq!(truncated.len(), 255);
+        assert!(!truncated.ends_with("..."), "{truncated:?}");
+    }
+
+    /// 同一 template 内に大量 hit があっても位置計算が hit 数 × ファイルサイズにならないこと。
+    /// 修正前は 1 hit ごとに offset 0 からの行走査 + `lines().nth(row)` で二次オーダーだった。
+    #[test]
+    fn template_refs_many_hits_stay_linear() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.component.ts"),
+            "@Component({ templateUrl: './a.component.html' })\nexport class A {}\n",
+        )
+        .unwrap();
+        // 1 行 1 hit × 12000 行 (~300KB)。二次オーダーだと debug ビルドで数十秒かかる。
+        let body = "<b (click)=\"hitFn()\">{{ hitFn() }}</b>\n".repeat(12_000);
+        std::fs::write(dir.path().join("a.component.html"), body).unwrap();
+        let started = std::time::Instant::now();
+        let refs = find_angular_template_references("hitFn", dir.path(), None);
+        let elapsed = started.elapsed();
+        assert_eq!(refs.len(), 24_000, "hit 数");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "24000 hit の位置計算が線形でない: {elapsed:?}"
+        );
     }
 
     #[test]

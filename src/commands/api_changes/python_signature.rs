@@ -1,11 +1,10 @@
 //! Python 固有のシグネチャ解析と互換 API 変更判定ヘルパー (末尾 optional/default 引数追加)。
 
-use crate::engine::parser;
 use crate::language::LangId;
 use crate::models::review::CompatibleApiModification;
 
-use super::super::git_input::validate_git_revision;
 use super::normalize_signature_whitespace;
+use super::source_pair::{CompatibleModSite, SignatureSourceCache};
 
 /// Python のトップレベル関数 / モジュール直下のクラスメソッドで、
 /// 末尾 keyword-only / default 引数追加だけを `trailing_optional_params` として降格する。
@@ -21,50 +20,21 @@ use super::normalize_signature_whitespace;
 ///
 /// 抽出失敗・rest 引数の混入・既存 `**kwargs` の前に新規 kwonly 引数を差し込む形は None を返し
 /// blocking を維持する (false negative 回避)。
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn detect_python_trailing_optional_params_compatible_mod(
-    dir: &str,
-    base: &str,
-    old_path: &str,
-    new_path: &str,
-    name: &str,
-    kind: &str,
-    old_sig: &str,
-    new_sig: &str,
-    lang_id: Option<LangId>,
+    site: &CompatibleModSite<'_>,
+    sources: &mut SignatureSourceCache,
 ) -> Option<CompatibleApiModification> {
-    let lang = lang_id.filter(|l| matches!(l, LangId::Python))?;
-    if kind != "function" && kind != "method" {
+    let lang = site.lang_in(&[LangId::Python])?;
+    if site.kind != "function" && site.kind != "method" {
         return None;
     }
-    if !crate::engine::impact::is_safe_diff_path(old_path)
-        || !crate::engine::impact::is_safe_diff_path(new_path)
-    {
-        return None;
-    }
-    validate_git_revision(base, "--base").ok()?;
-    validate_git_revision(old_path, "diff file path").ok()?;
+    let src = sources.get(site)?;
+    let (old_tree, new_tree) = src.parse_pair(lang)?;
 
-    let old_output = std::process::Command::new("git")
-        .args(["show", &format!("{base}:{old_path}")])
-        .current_dir(dir)
-        .output()
-        .ok()?;
-    if !old_output.status.success() {
-        return None;
-    }
-    let old_source = old_output.stdout;
-    let old_tree = parser::parse_source(&old_source, lang).ok()?;
-
-    let new_full = std::path::Path::new(dir).join(new_path);
-    let new_utf8 = camino::Utf8Path::from_path(&new_full)?;
-    let new_source = parser::read_file(new_utf8).ok()?;
-    let new_tree = parser::parse_source(&new_source, lang).ok()?;
-
-    let old_fn = find_python_function_by_name(old_tree.root_node(), &old_source, name)?;
-    let new_fn = find_python_function_by_name(new_tree.root_node(), &new_source, name)?;
-    let old_parts = python_function_signature_parts(old_fn, &old_source)?;
-    let new_parts = python_function_signature_parts(new_fn, &new_source)?;
+    let old_fn = find_python_function_by_name(old_tree.root_node(), &src.old, site.name)?;
+    let new_fn = find_python_function_by_name(new_tree.root_node(), &src.new, site.name)?;
+    let old_parts = python_function_signature_parts(old_fn, &src.old)?;
+    let new_parts = python_function_signature_parts(new_fn, &src.new)?;
 
     if old_parts.head != new_parts.head || old_parts.tail != new_parts.tail {
         return None;
@@ -78,14 +48,7 @@ pub(crate) fn detect_python_trailing_optional_params_compatible_mod(
         return None;
     }
 
-    Some(CompatibleApiModification {
-        name: name.to_string(),
-        kind: kind.to_string(),
-        file: new_path.to_string(),
-        old_signature: Some(old_sig.to_string()),
-        new_signature: Some(new_sig.to_string()),
-        reason: "trailing_optional_params".to_string(),
-    })
+    Some(site.compatible("trailing_optional_params"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,6 +309,7 @@ fn python_function_definition_with_name<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::parser;
     use crate::language::LangId;
 
     fn parse(src: &str) -> tree_sitter::Tree {

@@ -1,14 +1,16 @@
 use anyhow::Result;
-use std::collections::HashSet;
 use tracing::info;
 
 use crate::cache::store::CacheStore;
 use crate::doctor;
 use crate::engine::parser;
 use crate::models::cochange::{CoChangeOptions, CoChangeResult};
-use crate::models::review::ReviewResult;
 use crate::models::skip::SkipInfo;
 use crate::service::{AppService, AstParams};
+
+// tests.rs が `use super::*` 経由で bare `HashSet` を参照するため cfg(test) で残す。
+#[cfg(test)]
+use std::collections::HashSet;
 
 mod common;
 
@@ -588,223 +590,14 @@ pub fn cmd_mcp() -> Result<()> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Review コマンド: impact / cochange / API surface diff / dead symbol 統合
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::too_many_arguments)]
-pub fn cmd_review(
-    service: &AppService,
-    dir: &str,
-    diff: Option<&str>,
-    diff_file: Option<&str>,
-    git: bool,
-    base: &str,
-    staged: bool,
-    min_confidence: f64,
-    pretty: bool,
-    hook: bool,
-    framework: Option<&str>,
-    extra_exclude_dirs: &[String],
-    extra_exclude_globs: &[String],
-    dead_scope: crate::cli::DeadScope,
-    strict_public_const_values: bool,
-    include_wip_dead: bool,
-) -> Result<()> {
-    // framework 指定は早期に検証して未知名はここで弾く (dead_symbols 検出に到達する前に)。
-    // 未指定時は package.json から next 依存を検出して nextjs プリセットを自動適用する。
-    let framework_globs = resolve_framework_globs_with_auto_detect(framework, dir)?;
-    // 1. diff 取得（context コマンドと同じ入力方式）
-    let diff_input = match resolve_diff_source(dir, diff, diff_file, git, base, staged)? {
-        DiffSourceResolution::Diff(s) => s,
-        DiffSourceResolution::Skipped(skip) => {
-            // git 管理外: hook は完全 silent、通常は空結果 + skipped で exit 0。
-            if hook {
-                return Ok(());
-            }
-            let result = ReviewResult {
-                skipped: Some(skip),
-                ..Default::default()
-            };
-            let output = serialize_output(&result, pretty)?;
-            println!("{output}");
-            return Ok(());
-        }
-        DiffSourceResolution::NotRequested => {
-            let stdin = std::io::stdin();
-            read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?
-        }
-    };
-
-    if diff_input.trim().is_empty() {
-        if hook {
-            return Ok(());
-        }
-
-        let result = empty_review_result();
-        let output = serialize_output(&result, pretty)?;
-        println!("{output}");
-        return Ok(());
-    }
-
-    // 2. impact 分析
-    //
-    // diff の全 changed file が case-insensitive 言語 (Xojo) のみで構成される場合は
-    // review 全体を空結果として返す。
-    //
-    // v26.5 まで: tree-sitter-xojo の OOM 防止が主目的の重要な回避策。
-    // v26.6 以降: tree-sitter-xojo を削除して OOM リスクは解消。だが lexer-only 言語の
-    // cross-file refs と dead-code review は汎用名ノイズが多く実用精度が出ないため引き続き
-    // skip する。本格的な lexer-only review 解析は将来の PR で対応予定。
-    // `ASTRO_SIGHT_FORCE_CI_LANG_IMPACT=1` で従来挙動に戻せる (デバッグ用)。
-    // diff は CI 言語判定 / changed_file_set / api_changes / dead_code filter / touched-symbols
-    // で繰り返し参照するため、ここで一度だけ parse して再利用する。
-    let diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
-    let force_ci = std::env::var("ASTRO_SIGHT_FORCE_CI_LANG_IMPACT")
-        .ok()
-        .as_deref()
-        == Some("1");
-    let all_ci_lang = crate::engine::impact::diff_files_all_case_insensitive(&diff_files);
-    if all_ci_lang && !force_ci {
-        log_phase("review.skip_ci_only", "applied", 0);
-        if hook {
-            return Ok(());
-        }
-
-        let result = empty_review_result();
-        let output = serialize_output(&result, pretty)?;
-        println!("{output}");
-        return Ok(());
-    }
-    let impact = {
-        log_phase("context", "start", 0);
-        let phase_t = std::time::Instant::now();
-        // review の `--exclude-dir` / `--exclude-glob` は impact 解析と dead_symbols の
-        // 両方に作用させる (v26.5.117 で挙動を統一)。
-        let context_options = crate::models::impact::ContextAnalysisOptions {
-            exclude_dirs: extra_exclude_dirs.to_vec(),
-            exclude_globs: extra_exclude_globs.to_vec(),
-        };
-        let r = service.analyze_context(&diff_input, dir, &context_options)?;
-        log_phase("context", "end", phase_t.elapsed().as_millis());
-        r
-    };
-
-    // 3. diff に含まれるファイルリストを収集
-    let changed_file_set: HashSet<String> = diff_files
-        .iter()
-        .flat_map(|f| {
-            let mut s = Vec::new();
-            if f.new_path != "/dev/null" {
-                s.push(f.new_path.clone());
-            }
-            if f.old_path != "/dev/null" {
-                s.push(f.old_path.clone());
-            }
-            s
-        })
-        .collect();
-
-    // 4. cochange 分析 → missing_cochanges 検出
-    log_phase("cochange", "start", 0);
-    let phase_t = std::time::Instant::now();
-    let missing_cochanges =
-        detect_missing_cochanges(service, dir, &changed_file_set, min_confidence, Some(base))?;
-    log_phase("cochange", "end", phase_t.elapsed().as_millis());
-
-    // 5. API 公開面の差分
-    let api_changes = {
-        log_phase("api_changes", "start", 0);
-        let phase_t = std::time::Instant::now();
-        let r = detect_api_changes(dir, base, &diff_files);
-        log_phase("api_changes", "end", phase_t.elapsed().as_millis());
-        r
-    };
-
-    // 6. dead symbol 検出 (framework プリセット + ユーザ指定 exclude を適用)
-    //    review では vendor / tests / build を常に除外する固定挙動。
-    //    必要になった段階で dead-code と同様の --include-* オプションを追加する。
-    log_phase("dead_code", "start", 0);
-    let phase_t = std::time::Instant::now();
-    let (dead_symbols, test_only_symbols) = match std::fs::canonicalize(dir) {
-        Ok(canonical_dir) => {
-            let default_excludes = resolve_dead_code_excludes(false, false, false);
-            let mut excludes: Vec<&str> = default_excludes.to_vec();
-            for name in extra_exclude_dirs {
-                excludes.push(name.as_str());
-            }
-            let mut combined_globs: Vec<&str> =
-                framework_globs.iter().map(String::as_str).collect();
-            for pat in extra_exclude_globs {
-                combined_globs.push(pat.as_str());
-            }
-            let files = filter_diff_files_for_dead_code(
-                &canonical_dir,
-                &diff_files,
-                &excludes,
-                &combined_globs,
-                None,
-            )?;
-            let (dead_symbols, test_only_symbols) = detect_dead_symbols_from_files(dir, &files);
-            // dead-scope=touched-symbols: 宣言行が diff の `+` 行と重ならない dead を除外。
-            // `--hook` のデフォルトで「changed file 内の元から存在した dead」の
-            // ノイズを抑える (Issue: zod-inferred-types-pre-existing-dead)。
-            let dead_symbols = if matches!(dead_scope, crate::cli::DeadScope::TouchedSymbols) {
-                filter_dead_by_touched_symbols(dir, dead_symbols, &diff_input, &diff_files)
-            } else {
-                dead_symbols
-            };
-            // WIP dead 抑止: 同一 diff で新規 export された (= api_changes.added に挙がる)
-            // シンボルは「多段実装中に consumer 結線が後続コミット予定」の純粋ヘルパー追加
-            // 等に該当しうるため、`review --hook` のデフォルトで dead 警告から外す。
-            // `--include-wip-dead` で旧挙動 (全 dead を返す) に戻せる。`--hook` 無しの通常
-            // `review` JSON では従来通り全 dead を残す ― レビュアーが api.added と dead の
-            // 両者を見て総合判断する想定で、自動 hook ノイズ抑止のスコープを外している
-            // (Issue 2026-06-25-wip-dead-symbol-during-incremental-impl)。
-            let dead_symbols = if hook && !include_wip_dead {
-                filter_dead_by_wip_added(dead_symbols, &api_changes.added)
-            } else {
-                dead_symbols
-            };
-            (dead_symbols, test_only_symbols)
-        }
-        Err(_) => (Vec::new(), Vec::new()),
-    };
-    log_phase("dead_code", "end", phase_t.elapsed().as_millis());
-
-    let result = ReviewResult {
-        impact,
-        missing_cochanges,
-        api_changes,
-        dead_symbols,
-        test_only_symbols,
-        skipped: None,
-    };
-
-    if hook {
-        return review_hook_output(&result, dir, strict_public_const_values);
-    }
-
-    let output = serialize_output(&result, pretty)?;
-    info!(
-        command = "review",
-        dir = dir,
-        output_bytes = output.len(),
-        "command completed"
-    );
-    println!("{output}");
-    Ok(())
-}
-
-fn empty_review_result() -> ReviewResult {
-    ReviewResult::default()
-}
-
 mod review;
 
+pub use review::cmd_review;
+// tests.rs が `use super::*` 経由で参照する review 内部シンボル。
+#[cfg(test)]
+pub(crate) use review::empty_review_result;
 #[cfg(test)]
 pub(crate) use review::hook::build_review_hook_json;
-pub(crate) use review::hook::review_hook_output;
 
 mod api_changes;
 mod dead_code;
@@ -812,13 +605,14 @@ mod dead_code_member_liveness;
 
 #[cfg(test)]
 pub(crate) use api_changes::*;
-pub(crate) use api_changes::{detect_api_changes, detect_missing_cochanges};
 pub use dead_code::cmd_dead_code;
+// tests.rs が `use super::*` 経由で参照する dead_code 内部シンボル。
+// (production 側の唯一の利用者だった cmd_review は review モジュールへ移動し、
+//  そこから `super::dead_code::…` を直接参照している)
 #[cfg(test)]
-pub(crate) use dead_code::{auto_detect_framework, extract_dead_code_candidates_from_file};
 pub(crate) use dead_code::{
-    detect_dead_symbols_from_files, filter_dead_by_touched_symbols, filter_dead_by_wip_added,
-    filter_diff_files_for_dead_code, resolve_dead_code_excludes,
+    auto_detect_framework, detect_dead_symbols_from_files, extract_dead_code_candidates_from_file,
+    filter_dead_by_wip_added, filter_diff_files_for_dead_code, resolve_dead_code_excludes,
     resolve_framework_globs_with_auto_detect,
 };
 

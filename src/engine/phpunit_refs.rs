@@ -27,6 +27,7 @@
 
 use tree_sitter::Node;
 
+use crate::engine::refs::{absolute_position, byte_offset_to_row_col};
 use crate::language::LangId;
 
 /// `method_declaration` ノードに紐づく PHPUnit metadata から
@@ -131,12 +132,8 @@ fn parse_docblock_tags(
             }
 
             let name_col_in_line = value_start_in_line + method_in_token_offset;
-            let row = doc_start_row + line_idx;
-            let col = if line_idx == 0 {
-                doc_start_col + name_col_in_line
-            } else {
-                name_col_in_line
-            };
+            let (row, col) =
+                absolute_position((doc_start_row, doc_start_col), (line_idx, name_col_in_line));
 
             out.push((name.to_string(), row, col));
         }
@@ -275,13 +272,9 @@ fn parse_attribute_text(
                     {
                         let name_bytes = &bytes[inner_start..j];
                         if let Ok(name_str) = std::str::from_utf8(name_bytes) {
-                            let (rel_row, rel_col) = byte_offset_to_row_col(text, inner_start);
-                            let row = attr_start_row + rel_row;
-                            let col = if rel_row == 0 {
-                                attr_start_col + rel_col
-                            } else {
-                                rel_col
-                            };
+                            let rel = byte_offset_to_row_col(text, inner_start);
+                            let (row, col) =
+                                absolute_position((attr_start_row, attr_start_col), rel);
                             out.push((name_str.to_string(), row, col));
                         }
                     }
@@ -320,24 +313,6 @@ fn parse_attribute_text(
         }
         // それ以外は fallthrough (想定外形式)。次反復で `#[` を再度探す。
     }
-}
-
-/// `text` 内の byte offset を `(row, col)` に変換する。
-/// `\n` を行区切りとして数える。
-fn byte_offset_to_row_col(text: &str, byte_offset: usize) -> (usize, usize) {
-    let bytes = text.as_bytes();
-    let mut row = 0;
-    let mut col = 0;
-    let limit = byte_offset.min(bytes.len());
-    for &b in &bytes[..limit] {
-        if b == b'\n' {
-            row += 1;
-            col = 0;
-        } else {
-            col += 1;
-        }
-    }
-    (row, col)
 }
 
 #[cfg(test)]
@@ -619,6 +594,64 @@ class T extends TestCase {
         assert!(
             !names.contains(&"farProvider"),
             "non-PHPDoc comment should block DocBlock lookup: {names:?}"
+        );
+    }
+
+    /// DocBlock 由来の参照位置がファイル全体での (row, col) になっていること。
+    /// DocBlock 2 行目以降の tag なので、comment の開始列は加算されない。
+    #[test]
+    fn phpunit_docblock_ref_position_is_absolute() {
+        let src = "<?php\nclass T extends TestCase {\n    /**\n     * @dataProvider providerOne\n     */\n    public function testValidations() {}\n}\n";
+        let segs = segments_for_first_method(src);
+        let (name, row, col) = segs.first().cloned().expect("1 件以上");
+        assert_eq!(name, "providerOne");
+        // `     * @dataProvider providerOne` の provider 名は 0-indexed 行 3 / 列 21。
+        assert_eq!((row, col), (3, 21), "{segs:?}");
+        let line = src.split('\n').nth(row).unwrap();
+        assert!(line[col..].starts_with("providerOne"), "{line:?}");
+    }
+
+    /// DocBlock の 1 行目に tag が同居する場合は comment 開始列を加算する
+    /// (埋め込み領域の「1 行目だけ base 列を足す」規約の境界)。
+    #[test]
+    fn phpunit_docblock_same_line_ref_position_adds_comment_column() {
+        let src = "<?php\nclass T extends TestCase {\n    /** @dataProvider inlineProvider */\n    public function testValidations() {}\n}\n";
+        let segs = segments_for_first_method(src);
+        let (name, row, col) = segs.first().cloned().expect("1 件以上");
+        assert_eq!(name, "inlineProvider");
+        assert_eq!(row, 2, "{segs:?}");
+        let line = src.split('\n').nth(row).unwrap();
+        assert!(
+            line[col..].starts_with("inlineProvider"),
+            "{line:?} col={col}"
+        );
+    }
+
+    /// attribute 由来の参照位置が、複数行 attribute でもファイル絶対座標になっていること。
+    #[test]
+    fn phpunit_attribute_ref_position_is_absolute_across_lines() {
+        let src = "<?php\nclass T extends TestCase {\n    #[DataProviderExternal(\n        Foo::class,\n        'multiLineProvider'\n    )]\n    public function testThird() {}\n}\n";
+        let segs = segments_for_first_method(src);
+        let (name, row, col) = segs.first().cloned().expect("1 件以上");
+        assert_eq!(name, "multiLineProvider");
+        // attribute 2 行目以降なので attribute 開始列は加算されない。
+        assert_eq!((row, col), (4, 9), "{segs:?}");
+        let line = src.split('\n').nth(row).unwrap();
+        assert!(line[col..].starts_with("multiLineProvider"), "{line:?}");
+    }
+
+    /// 単一行 attribute では attribute 開始列が加算されること。
+    #[test]
+    fn phpunit_attribute_ref_position_same_line_adds_attribute_column() {
+        let src = "<?php\nclass T extends TestCase {\n    #[DataProvider('sameLineProvider')]\n    public function testThird() {}\n}\n";
+        let segs = segments_for_first_method(src);
+        let (name, row, col) = segs.first().cloned().expect("1 件以上");
+        assert_eq!(name, "sameLineProvider");
+        assert_eq!(row, 2, "{segs:?}");
+        let line = src.split('\n').nth(row).unwrap();
+        assert!(
+            line[col..].starts_with("sameLineProvider"),
+            "{line:?} col={col}"
         );
     }
 }

@@ -21,7 +21,7 @@ use crate::models::symbol::SymbolKind;
 
 use pass2::stream_caller_maps_and_defs;
 use pass3::{apply_stage4b_single, build_file_impact, compute_has_parent_by_ix};
-use signature::{detect_signature_changes, is_symbol_in_changed_lines};
+use signature::detect_signature_changes;
 use test_context::is_in_test_context;
 
 struct FileContext {
@@ -101,6 +101,10 @@ where
     // 全 changed file が lexer-only 言語 (Xojo) の場合は cross-file impact 解析を skip。
     // 理由: lexer 経路の cross-file refs は汎用名 noise が多く実用精度が出ない (本格対応は将来 PR)。
     // env 名は後方互換のため v26.5 系 `ASTRO_SIGHT_FORCE_CI_LANG_IMPACT` を維持。
+    //
+    // Pass 2 は `all_file_contexts_case_insensitive` で同じ趣旨の判定を **別の入力集合**
+    // (Pass 1 の存在/境界/parse フィルタ通過後の FileContext) に対して再度行う。
+    // 判定対象が違うので片方に寄せて統合しないこと (多層防御)。
     let force_ci = std::env::var("ASTRO_SIGHT_FORCE_CI_LANG_IMPACT")
         .ok()
         .as_deref()
@@ -379,21 +383,24 @@ fn collect_affected_symbols(
         // per-file の cross-file ルーティング対象集合。
         // 同名シンボルでも他の FileContext と独立に判定する必要があるため、
         // `symbol_name_set.contains` で early-skip してはいけない（codex 分析）。
+        //
+        // 判定材料のうち sym 以外は本ファイルに固定なので、コンテキストは
+        // ループの外で 1 度だけ組み立てる。
+        let cross_file_filter = filters::CrossFileFilterContext {
+            syms: &syms,
+            hunks: &df.hunks,
+            sig_changes: &sig_changes,
+            diff_input,
+            file_path: &df.new_path,
+            root,
+            source: &source,
+            lang_id,
+            changed_new_lines: &changed_new_lines,
+        };
         let mut cross_file_symbol_keys: HashSet<String> = HashSet::new();
         for sym in &affected {
             let sym_key = ci_key(lang_id, &sym.name);
-            if !should_include_for_cross_file(
-                sym,
-                &syms,
-                &df.hunks,
-                &sig_changes,
-                diff_input,
-                &df.new_path,
-                root,
-                &source,
-                lang_id,
-                &changed_new_lines,
-            ) {
+            if !cross_file_filter.should_include_for_cross_file(sym) {
                 continue;
             }
             // この FileContext にとっての cross-file 検索対象に追加。
@@ -452,88 +459,6 @@ fn collect_affected_symbols(
         method_parent_types,
         included_symbols,
     )
-}
-
-/// affected シンボルを cross-file 参照検索に含めるべきか判定する。
-///
-/// 5段階のフィルタを適用する：
-/// 1. impl ブロックの型名をスキップ（API に影響しない）
-/// 2. テストコンテキスト内のシンボルをスキップ
-/// 3. ボディのみの変更（シグネチャ変更なし）の関数/メソッドをスキップ
-/// 4. エクスポートされていないシンボルをスキップ
-/// 5. 変更された diff 行にシンボル名が出現しない場合スキップ
-#[allow(clippy::too_many_arguments)]
-fn should_include_for_cross_file(
-    sym: &AffectedSymbol,
-    syms: &[crate::models::symbol::Symbol],
-    hunks: &[HunkInfo],
-    sig_changes: &[SignatureChange],
-    diff_input: &str,
-    file_path: &str,
-    root: tree_sitter::Node,
-    source: &[u8],
-    lang_id: LangId,
-    changed_new_lines: &std::collections::HashSet<usize>,
-) -> bool {
-    // 1. impl ブロックの型名とモジュール宣言をスキップ
-    // モジュール宣言（例: `pub mod tensor`）は API サーフェスを変更しない。
-    // 実際の内容変更は diff 内のモジュール自身のファイルから検出される。
-    if sym.kind == "type" || sym.kind == "module" {
-        return false;
-    }
-    // hunks と重なる定義シンボルは (syms, sym.name, hunks) が不変なので 1 回だけ引く。
-    // Option<&Symbol> は Copy のため以降の各判定で使い回せる (旧実装は 3 回線形スキャンしていた)。
-    let overlapping = find_overlapping_symbol(syms, &sym.name, hunks);
-    // 2. テストコンテキスト内のシンボルをスキップ
-    if overlapping.is_some_and(|s| is_in_test_context(root, source, &s.range, lang_id, file_path)) {
-        return false;
-    }
-    // 3. ボディのみの変更の関数/メソッドをスキップ
-    if (sym.kind == "function" || sym.kind == "method")
-        && !sig_changes.iter().any(|sc| sc.name == sym.name)
-    {
-        return false;
-    }
-    // 3a. Kotlin/Java/Swift/TS/C# の `override` メソッドは親 interface/class から
-    // 呼ばれるため cross-file caller を追跡できない。親 API のシグネチャは不変なので
-    // 下流互換性にも影響せず、本体変更は impl 変更として扱い api.mod から除外する。
-    if (sym.kind == "function" || sym.kind == "method")
-        && overlapping.is_some_and(|s| symbols::is_override_method(root, source, lang_id, &s.range))
-    {
-        return false;
-    }
-    // 3b. 宣言ヘッダ行が変更されていない型シンボルをスキップ。
-    // 型宣言ノードの開始行 (= シンボル range の開始行) が新側変更行に含まれない場合は、
-    // body 内の変更や、名前を言及する docblock コメント (`* class Foo`) / 文字列の変更が
-    // あっても他ファイルのクラス参照へ伝播しない。docblock コメントは AST 上の型宣言ノードに
-    // 含まれない別ノードなので、宣言開始行と変更行の交差で判定すればコメント/文字列の名前
-    // 言及を確実に除外できる (GitLab #35: クラス参照の過剰列挙、テキスト照合の誤マッチを排除)。
-    // 宣言開始行のみを見るため `trait GuestMemory` のような単一行ヘッダにも、フリー関数の
-    // シグネチャ行に型名が出現するだけのケースにも正しく作用する。
-    if matches!(
-        sym.kind.as_str(),
-        "trait" | "struct" | "class" | "interface" | "enum"
-    ) && let Some(s) = overlapping
-        && !changed_new_lines.contains(&s.range.start.line)
-    {
-        return false;
-    }
-    // 4. エクスポートされていないシンボルをスキップ
-    if !overlapping.is_some_and(|s| symbols::is_symbol_exported(root, source, lang_id, &s.range)) {
-        return false;
-    }
-    // 5. 変更行にシンボル名が出現しない場合スキップ
-    if !is_symbol_in_changed_lines(diff_input, file_path, &sym.name, lang_id) {
-        return false;
-    }
-    // 6. 新規追加シンボル (change_type == "added") は cross-file caller がまだない
-    //    ため検索対象から除外する。同一 commit 内で追加された caller は他ファイルの
-    //    シンボル変更経由で別途検出されるため、本シンボル単独の cross-file 探索は
-    //    ノイズだけが残る。新規ファイルの全シンボルがここで除外される。
-    if sym.change_type == "added" {
-        return false;
-    }
-    true
 }
 
 /// シンボルの全行 (`sym_start..=sym_end`, 0-indexed) が新規追加行 (`changed_new_lines`)

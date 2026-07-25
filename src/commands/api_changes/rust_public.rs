@@ -1,6 +1,6 @@
 use crate::engine::parser;
 
-use super::super::git_input::validate_git_revision;
+use super::super::git_input::{git_show_blob, validate_git_revision};
 use super::{bare_name, find_mod_decl_visibility, module_path_segments};
 
 /// `file_path` が属する Rust crate が binary-only (`src/lib.rs` を持たず外部から
@@ -65,80 +65,32 @@ pub(crate) fn is_binary_only_rust_crate_at_base(dir: &str, base: &str, file_path
     if path.extension().and_then(|s| s.to_str()) != Some("rs") {
         return false;
     }
-    if validate_git_revision(base, "--base").is_err() {
+    // 祖先から導出する `<dir>/Cargo.toml` も同じ検証対象になるため、起点の file_path を
+    // ここで弾いておく (先頭 `-` の dir を含む場合は導出パスも必ず不正になる)。
+    if validate_git_revision(base, "--base").is_err()
+        || validate_git_revision(file_path, "diff file path").is_err()
+    {
         return false;
     }
     // dir 相対パスの祖先を順に辿り、最初に base 時点で存在した Cargo.toml を採用する。
     let mut ancestor: Option<&std::path::Path> = path.parent();
     while let Some(rel_dir) = ancestor {
-        let cargo_rel = if rel_dir.as_os_str().is_empty() {
-            std::path::PathBuf::from("Cargo.toml")
-        } else {
-            rel_dir.join("Cargo.toml")
-        };
-        let cargo_rel_str = cargo_rel.to_string_lossy().to_string();
-        if validate_git_revision(&cargo_rel_str, "diff file path").is_err() {
-            return false;
-        }
-        let cargo_output = std::process::Command::new("git")
-            .args(["show", &format!("{base}:{cargo_rel_str}")])
-            .current_dir(dir)
-            .output();
-        if let Ok(out) = cargo_output
-            && out.status.success()
-        {
+        let cargo_rel = rel_dir.join("Cargo.toml");
+        if let Some(cargo_src) = git_show_blob(dir, base, &cargo_rel.to_string_lossy()) {
             // 同 crate root の base 側 src/lib.rs 存在を git show で判定
-            let lib_rel = if rel_dir.as_os_str().is_empty() {
-                std::path::PathBuf::from("src/lib.rs")
-            } else {
-                rel_dir.join("src/lib.rs")
-            };
-            let lib_rel_str = lib_rel.to_string_lossy().to_string();
-            if validate_git_revision(&lib_rel_str, "diff file path").is_err() {
+            let lib_rel = rel_dir.join("src/lib.rs");
+            if git_show_blob(dir, base, &lib_rel.to_string_lossy()).is_some() {
                 return false;
             }
-            let lib_output = std::process::Command::new("git")
-                .args(["show", &format!("{base}:{lib_rel_str}")])
-                .current_dir(dir)
-                .output();
-            if matches!(lib_output, Ok(ref o) if o.status.success()) {
-                return false;
-            }
-            let Ok(text) = std::str::from_utf8(&out.stdout) else {
+            let Ok(text) = std::str::from_utf8(&cargo_src) else {
                 return false;
             };
             return !cargo_toml_text_declares_lib(text);
         }
-        // ancestor を一つ上に
-        match rel_dir.parent() {
-            Some(parent) => ancestor = Some(parent),
-            None => break,
-        }
-        if ancestor.is_some_and(|p| p.as_os_str().is_empty()) {
-            // ルート直下まで来たので最後にもう一度だけ Cargo.toml チェックする
-            let last = std::path::PathBuf::from("Cargo.toml");
-            let cargo_rel_str = last.to_string_lossy().to_string();
-            let cargo_output = std::process::Command::new("git")
-                .args(["show", &format!("{base}:{cargo_rel_str}")])
-                .current_dir(dir)
-                .output();
-            if let Ok(out) = cargo_output
-                && out.status.success()
-            {
-                let lib_output = std::process::Command::new("git")
-                    .args(["show", &format!("{base}:src/lib.rs")])
-                    .current_dir(dir)
-                    .output();
-                if matches!(lib_output, Ok(ref o) if o.status.success()) {
-                    return false;
-                }
-                let Ok(text) = std::str::from_utf8(&out.stdout) else {
-                    return false;
-                };
-                return !cargo_toml_text_declares_lib(text);
-            }
-            break;
-        }
+        // ancestor を一つ上に。リポジトリルート (空パス) もループ本体が
+        // `Cargo.toml` / `src/lib.rs` として扱えるため特別扱いせず、
+        // `Path::new("").parent() == None` で自然に終端する。
+        ancestor = rel_dir.parent();
     }
     false
 }
@@ -332,21 +284,10 @@ pub(crate) fn rust_symbol_is_inside_inline_mod(
                 Err(_) => return false,
             }
         }
-        RustSourceTree::Base { rev } => {
-            if validate_git_revision(rev, "--base").is_err()
-                || validate_git_revision(file_path, "diff file path").is_err()
-            {
-                return false;
-            }
-            match std::process::Command::new("git")
-                .args(["show", &format!("{rev}:{file_path}")])
-                .current_dir(dir)
-                .output()
-            {
-                Ok(o) if o.status.success() => o.stdout,
-                _ => return false,
-            }
-        }
+        RustSourceTree::Base { rev } => match git_show_blob(dir, rev, file_path) {
+            Some(blob) => blob,
+            None => return false,
+        },
     };
     rust_source_has_symbol_in_inline_mod(&source_bytes, symbol_name)
 }
@@ -442,21 +383,7 @@ pub(crate) fn read_rust_module_source(
         }
         RustSourceTree::Base { rev } => {
             let full_rel = crate_root_rel.join("src").join(module_rel);
-            let full_rel_str = full_rel.to_str()?;
-            if validate_git_revision(rev, "--base").is_err()
-                || validate_git_revision(full_rel_str, "diff file path").is_err()
-            {
-                return None;
-            }
-            let out = std::process::Command::new("git")
-                .args(["show", &format!("{rev}:{full_rel_str}")])
-                .current_dir(dir)
-                .output()
-                .ok()?;
-            if !out.status.success() {
-                return None;
-            }
-            Some(out.stdout)
+            git_show_blob(dir, rev, full_rel.to_str()?)
         }
     }
 }
@@ -806,8 +733,8 @@ pub(crate) fn collect_rust_pub_use_index(
             }
         }
     }
-    let public_modules = public_reachable_modules(source, dir, info)?;
     let all_modules = collect_all_modules(source, dir, info)?;
+    let public_modules = pub_reachable_modules(&all_modules);
     let reachable_modules =
         compute_reexport_reachable_modules(&edges, &public_modules, &all_modules);
     Some(RustPubUseIndex {
@@ -863,23 +790,51 @@ fn compute_reexport_reachable_modules(
             reachable.insert(candidate.clone());
             changed = true;
             // 到達可能になった module の pub 子孫 module を連鎖登録する。
-            let mut stack = vec![candidate];
-            while let Some(m) = stack.pop() {
-                if let Some(pub_children) = all_modules.get(&m) {
-                    for c in pub_children {
-                        let mut child = m.clone();
-                        child.push(c.clone());
-                        if reachable.insert(child.clone()) {
-                            stack.push(child);
-                        }
-                    }
-                }
-            }
+            insert_pub_descendants(&mut reachable, all_modules, candidate);
         }
         if !changed {
             break;
         }
     }
+    reachable
+}
+
+/// `all_modules` の pub 子リストを辿り、`start` の pub 子孫 module を `reachable` に登録する。
+/// `start` 自身は登録済みである前提。
+fn insert_pub_descendants(
+    reachable: &mut std::collections::HashSet<Vec<String>>,
+    all_modules: &std::collections::HashMap<Vec<String>, Vec<String>>,
+    start: Vec<String>,
+) {
+    let mut stack = vec![start];
+    while let Some(m) = stack.pop() {
+        if let Some(pub_children) = all_modules.get(&m) {
+            for c in pub_children {
+                let mut child = m.clone();
+                child.push(c.clone());
+                if reachable.insert(child.clone()) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+}
+
+/// crate root から `pub mod` 経路のみで到達できる module 集合を `all_modules`
+/// (全 module → pub 宣言された子 module 名) から導出する。root `[]` は常に含む。
+///
+/// 旧実装は同じ module ツリー walk を「pub 経路のみ版」(`public_reachable_modules` +
+/// `collect_public_pub_mods`) と「全 module 版」(`collect_all_modules` +
+/// `collect_modules_with_visibility`) の 2 本持ちで、module ファイル解決の修正を
+/// 両方へ入れる必要があった (片方だけ直して階層 module を取りこぼした経緯あり)。
+/// 全 module 版は各 module の pub 子リストを持つため pub 経路の到達性はここで導出でき、
+/// module ツリーの読み込み + parse も 1 回で済む。
+fn pub_reachable_modules(
+    all_modules: &std::collections::HashMap<Vec<String>, Vec<String>>,
+) -> std::collections::HashSet<Vec<String>> {
+    let mut reachable = std::collections::HashSet::new();
+    reachable.insert(Vec::new());
+    insert_pub_descendants(&mut reachable, all_modules, Vec::new());
     reachable
 }
 
@@ -1053,144 +1008,9 @@ pub(crate) fn read_rs_blob(
     }
 }
 
-/// `source` 経由で lib.rs (crate root) から `pub mod` 経路 (制限なし pub) で到達できる
-/// module 集合を構築する (リファクタ Step 3: `_at_base` / `_at_worktree` の本体統合)。root `[]`
-/// は常に含む。inline `pub mod foo { ... }` も再帰的に拾う。`mod foo;` (制限なし pub なし) は
-/// 除外する。判定不能 (`#[path]` / モジュールファイル解決失敗 / 解析失敗) は `None` を返し、
-/// 呼出元で api.rm を残す (fail-closed)。
-pub(crate) fn public_reachable_modules(
-    source: RustSourceTree<'_>,
-    dir: &str,
-    info: &RustPrivateModuleInfo,
-) -> Option<std::collections::HashSet<Vec<String>>> {
-    use std::collections::HashSet;
-    use std::path::PathBuf;
-    let mut result: HashSet<Vec<String>> = HashSet::new();
-    result.insert(Vec::new());
-    let mut frontier: Vec<(Vec<String>, PathBuf)> = vec![(Vec::new(), PathBuf::from("lib.rs"))];
-    while let Some((segments, current_rel)) = frontier.pop() {
-        let module_source =
-            read_rust_module_source(source, dir, &info.crate_root_rel, &current_rel)?;
-        let tree = parser::parse_source(&module_source, crate::language::LangId::Rust).ok()?;
-        let base_dir = child_module_base_dir(&current_rel);
-        collect_public_pub_mods(
-            source,
-            tree.root_node(),
-            &module_source,
-            dir,
-            info,
-            &segments,
-            &base_dir,
-            &mut result,
-            &mut frontier,
-        )?;
-    }
-    Some(result)
-}
-
-/// `lib.rs` / 親モジュールファイルから子の `pub mod` を `source` 経由で再帰的に集める。
-/// inline body は同じファイル内で walk 続行、宣言のみは次のモジュールファイルを resolve して
-/// frontier に積む (リファクタ Step 3: `_at_base` / `_at_worktree` の本体統合)。
-/// `base_dir` は子 `mod name;` のファイル解決基準 dir (inline module へ潜るたびに
-/// module 名を積む — `mod internal { pub mod api; }` の api は `internal/api.rs`)。
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn collect_public_pub_mods(
-    source: RustSourceTree<'_>,
-    node: tree_sitter::Node<'_>,
-    source_bytes: &[u8],
-    dir: &str,
-    info: &RustPrivateModuleInfo,
-    current_segments: &[String],
-    base_dir: &std::path::Path,
-    result: &mut std::collections::HashSet<Vec<String>>,
-    frontier: &mut Vec<(Vec<String>, std::path::PathBuf)>,
-) -> Option<()> {
-    match node.kind() {
-        "mod_item" => {
-            if rust_mod_item_has_path_attribute(node, source_bytes) {
-                return None;
-            }
-            let name = node
-                .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(source_bytes).ok())
-                .map(str::to_string)?;
-            let is_pub = rust_use_declaration_is_pub(node, source_bytes);
-            if !is_pub {
-                return Some(());
-            }
-            let mut child_segments = current_segments.to_vec();
-            child_segments.push(name.clone());
-            result.insert(child_segments.clone());
-            let mut has_inline_body = false;
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                if child.kind() == "declaration_list" {
-                    has_inline_body = true;
-                    let inline_base = base_dir.join(&name);
-                    let mut inner_cursor = child.walk();
-                    for inner in child.named_children(&mut inner_cursor) {
-                        collect_public_pub_mods(
-                            source,
-                            inner,
-                            source_bytes,
-                            dir,
-                            info,
-                            &child_segments,
-                            &inline_base,
-                            result,
-                            frontier,
-                        )?;
-                    }
-                }
-            }
-            if !has_inline_body {
-                let as_mod = base_dir.join(&name).join("mod.rs");
-                let as_file = base_dir.join(format!("{name}.rs"));
-                if read_rust_module_source(source, dir, &info.crate_root_rel, &as_mod).is_some() {
-                    frontier.push((child_segments, as_mod));
-                } else if read_rust_module_source(source, dir, &info.crate_root_rel, &as_file)
-                    .is_some()
-                {
-                    frontier.push((child_segments, as_file));
-                }
-            }
-        }
-        _ => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                collect_public_pub_mods(
-                    source,
-                    child,
-                    source_bytes,
-                    dir,
-                    info,
-                    current_segments,
-                    base_dir,
-                    result,
-                    frontier,
-                )?;
-            }
-        }
-    }
-    Some(())
-}
-
 /// `git show <base>:<file>` で blob を取る (file は repo 相対)。
 pub(crate) fn read_git_blob_at_base(dir: &str, base: &str, file: &str) -> Option<Vec<u8>> {
-    if validate_git_revision(base, "--base").is_err()
-        || validate_git_revision(file, "diff file path").is_err()
-    {
-        return None;
-    }
-    let out = std::process::Command::new("git")
-        .args(["show", &format!("{base}:{file}")])
-        .current_dir(dir)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(out.stdout)
+    git_show_blob(dir, base, file)
 }
 
 /// AST を走査し `use_declaration` ノードから `pub use` re-export edge を集める。
