@@ -8,10 +8,6 @@ use crate::models::cochange::{CoChangeOptions, CoChangeResult};
 use crate::models::skip::SkipInfo;
 use crate::service::{AppService, AstParams};
 
-// tests.rs が `use super::*` 経由で bare `HashSet` を参照するため cfg(test) で残す。
-#[cfg(test)]
-use std::collections::HashSet;
-
 mod common;
 
 #[cfg(test)]
@@ -363,19 +359,33 @@ pub(crate) use git_input::{
     GitDiffInput, is_git_work_tree, resolve_git_diff, validate_git_revision,
 };
 
-#[allow(clippy::too_many_arguments)]
-pub fn cmd_context(
-    service: &AppService,
-    dir: &str,
-    diff: Option<&str>,
-    diff_file: Option<&str>,
-    git: bool,
-    base: &str,
-    staged: bool,
-    pretty: bool,
-    exclude_dirs: &[String],
-    exclude_globs: &[String],
-) -> Result<()> {
+/// `cmd_context` の引数一式。`diff`/`diff_file` と `git`/`staged`/`pretty` のような
+/// 隣接同型引数の取り違えを型と名前で防ぐ (`CmdAstOpts` / `CmdReviewOpts` と同じ流儀)。
+pub struct CmdContextOpts<'a> {
+    pub dir: &'a str,
+    pub diff: Option<&'a str>,
+    pub diff_file: Option<&'a str>,
+    pub git: bool,
+    pub base: &'a str,
+    pub staged: bool,
+    pub pretty: bool,
+    pub exclude_dirs: &'a [String],
+    pub exclude_globs: &'a [String],
+}
+
+pub fn cmd_context(service: &AppService, opts: &CmdContextOpts<'_>) -> Result<()> {
+    // 本体は従来の局所変数名のまま使うためここで一括分解する (全フィールド Copy)。
+    let &CmdContextOpts {
+        dir,
+        diff,
+        diff_file,
+        git,
+        base,
+        staged,
+        pretty,
+        exclude_dirs,
+        exclude_globs,
+    } = opts;
     let diff_input = match resolve_diff_source(dir, diff, diff_file, git, base, staged)? {
         DiffSourceResolution::Diff(s) => s,
         DiffSourceResolution::Skipped(skip) => {
@@ -445,17 +455,29 @@ pub fn cmd_context(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn cmd_impact(
-    service: &AppService,
-    dir: &str,
-    git: bool,
-    base: &str,
-    staged: bool,
-    hook: bool,
-    exclude_dirs: &[String],
-    exclude_globs: &[String],
-) -> Result<()> {
+/// `cmd_impact` の引数一式。隣接する `bool` 3 連 (`git`/`staged`/`hook`) の取り違えを
+/// 型と名前で防ぐ (`CmdAstOpts` / `CmdReviewOpts` と同じ流儀)。
+pub struct CmdImpactOpts<'a> {
+    pub dir: &'a str,
+    pub git: bool,
+    pub base: &'a str,
+    pub staged: bool,
+    pub hook: bool,
+    pub exclude_dirs: &'a [String],
+    pub exclude_globs: &'a [String],
+}
+
+pub fn cmd_impact(service: &AppService, opts: &CmdImpactOpts<'_>) -> Result<()> {
+    // 本体は従来の局所変数名のまま使うためここで一括分解する (全フィールド Copy)。
+    let &CmdImpactOpts {
+        dir,
+        git,
+        base,
+        staged,
+        hook,
+        exclude_dirs,
+        exclude_globs,
+    } = opts;
     // impact に inline `--diff` / `--diff-file` は無いため resolver へは None を渡す。
     let diff_input = match resolve_diff_source(dir, None, None, git, base, staged)? {
         DiffSourceResolution::Diff(s) => s,
@@ -592,12 +614,9 @@ pub fn cmd_mcp() -> Result<()> {
 
 mod review;
 
-pub use review::cmd_review;
-// tests.rs が `use super::*` 経由で参照する review 内部シンボル。
-#[cfg(test)]
-pub(crate) use review::empty_review_result;
 #[cfg(test)]
 pub(crate) use review::hook::build_review_hook_json;
+pub use review::{CmdReviewOpts, cmd_review};
 
 mod api_changes;
 mod dead_code;

@@ -105,11 +105,7 @@ where
     // Pass 2 は `all_file_contexts_case_insensitive` で同じ趣旨の判定を **別の入力集合**
     // (Pass 1 の存在/境界/parse フィルタ通過後の FileContext) に対して再度行う。
     // 判定対象が違うので片方に寄せて統合しないこと (多層防御)。
-    let force_ci = std::env::var("ASTRO_SIGHT_FORCE_CI_LANG_IMPACT")
-        .ok()
-        .as_deref()
-        == Some("1");
-    if diff_files_all_case_insensitive(&diff_files) && !force_ci {
+    if should_skip_ci_only_diff(&diff_files) {
         log_phase("context.skip_ci_only", "applied", 0);
         return Ok(());
     }
@@ -801,6 +797,27 @@ fn diff_file_path_for_language(df: &DiffFile) -> &str {
     } else {
         &df.new_path
     }
+}
+
+/// lexer-only (case-insensitive) 言語だけの diff を skip すべきかを判定する。
+///
+/// `diff_files_all_case_insensitive` の結果と、デバッグ用の強制無効化 env
+/// `ASTRO_SIGHT_FORCE_CI_LANG_IMPACT=1` の読み取りを 1 箇所にまとめる。
+/// context (`analyze_impact_streaming`) と review (`cmd_review`) が同じ入力
+/// (`parse_unified_diff` の結果) に対して同じ判定をするため、env 名や条件が
+/// 片方だけ変わって挙動が食い違うのを防ぐ。
+///
+/// Pass 2 の `all_file_contexts_case_insensitive` は同じ趣旨だが **入力集合が違う**
+/// (Pass 1 の存在/境界/parse フィルタ通過後の FileContext)。多層防御として意図的に
+/// 別判定のままにしており、ここへ寄せて統合してはいけない。
+pub(crate) fn should_skip_ci_only_diff(diff_files: &[DiffFile]) -> bool {
+    if !diff_files_all_case_insensitive(diff_files) {
+        return false;
+    }
+    std::env::var("ASTRO_SIGHT_FORCE_CI_LANG_IMPACT")
+        .ok()
+        .as_deref()
+        != Some("1")
 }
 
 /// diff の解析対象が case-insensitive 言語だけかどうかを判定する。

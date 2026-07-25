@@ -2080,8 +2080,12 @@ export class HeaderComponent {
         let refs = find_angular_template_references("hitFn", dir.path(), None);
         let elapsed = started.elapsed();
         assert_eq!(refs.len(), 24_000, "hit 数");
+        // 上限は「二次オーダー実装との差」で決める。この入力では二次実装が実測 ~490 秒、
+        // 線形実装は release ~1 秒 / debug でも数秒。10 秒だと並列 cargo 実行下の
+        // 負荷スパイクで偽陽性になったため、二次オーダーとは 8 倍以上離れたまま
+        // 負荷耐性を持たせる 60 秒にする (回帰は 490 秒側に出るので検出力は落ちない)。
         assert!(
-            elapsed < std::time::Duration::from_secs(10),
+            elapsed < std::time::Duration::from_secs(60),
             "24000 hit の位置計算が線形でない: {elapsed:?}"
         );
     }

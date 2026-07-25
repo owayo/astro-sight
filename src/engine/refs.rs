@@ -2693,9 +2693,14 @@ fn enclosing_function_body<'a>(node: Node<'a>) -> Option<Node<'a>> {
     let mut current = node.parent();
     while let Some(n) = current {
         match n.kind() {
+            // `anonymous_function` は tree-sitter-php 0.24 での
+            // `anonymous_function_creation_expression` からの改称後の名前。
+            // 旧名だけだと closure 内の `$obj->m()` が InferredOwner に上がらず
+            // BareNameOnly に落ちる。移行期の互換のため旧名も残す。
             "method_declaration"
             | "function_definition"
             | "function_static_declaration"
+            | "anonymous_function"
             | "anonymous_function_creation_expression"
             | "arrow_function" => {
                 return n.child_by_field_name("body");

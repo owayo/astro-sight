@@ -4,6 +4,7 @@ use crate::models::review::{
     ApiChanges, ApiSymbol, ApiSymbolChange, CompatibleApiModification, MissingCochange,
     MovedSymbol, PropertyToFieldChange, ReviewResult,
 };
+use std::collections::HashSet;
 use std::fs;
 use std::io::Cursor;
 use std::process::Command;
@@ -12383,7 +12384,7 @@ fn build_review_hook_json_returns_none_when_no_issues() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let build = build_review_hook_json(
-        &empty_review_result(),
+        &ReviewResult::default(),
         dir.path().to_str().expect("utf-8 path"),
         false,
     );

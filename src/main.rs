@@ -6,10 +6,10 @@ use tracing::info;
 
 use astro_sight::cli::{Cli, Commands};
 use astro_sight::commands::{
-    self, CmdAstOpts, batch_ast, batch_calls, batch_imports, batch_lint, batch_sequence,
-    batch_symbols, cmd_ast, cmd_calls, cmd_cochange, cmd_context, cmd_dead_code, cmd_doctor,
-    cmd_impact, cmd_imports, cmd_lint, cmd_mcp, cmd_refs, cmd_refs_batch, cmd_review, cmd_sequence,
-    cmd_session, cmd_symbols, cmd_symbols_dir,
+    self, CmdAstOpts, CmdContextOpts, CmdImpactOpts, CmdReviewOpts, batch_ast, batch_calls,
+    batch_imports, batch_lint, batch_sequence, batch_symbols, cmd_ast, cmd_calls, cmd_cochange,
+    cmd_context, cmd_dead_code, cmd_doctor, cmd_impact, cmd_imports, cmd_lint, cmd_mcp, cmd_refs,
+    cmd_refs_batch, cmd_review, cmd_sequence, cmd_session, cmd_symbols, cmd_symbols_dir,
 };
 use astro_sight::config::ConfigService;
 use astro_sight::error::{AstroError, ErrorCode};
@@ -423,24 +423,24 @@ fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Re
             } else {
                 astro_sight::cli::DeadScope::All
             });
-            cmd_review(
-                service,
-                &dir,
-                diff.as_deref(),
-                diff_file.as_deref(),
+            let opts = CmdReviewOpts {
+                dir: &dir,
+                diff: diff.as_deref(),
+                diff_file: diff_file.as_deref(),
                 git,
-                &base,
+                base: &base,
                 staged,
                 min_confidence,
                 pretty,
                 hook,
-                framework.as_deref(),
-                &exclude_dirs,
-                &exclude_globs,
-                resolved_dead_scope,
+                framework: framework.as_deref(),
+                extra_exclude_dirs: &exclude_dirs,
+                extra_exclude_globs: &exclude_globs,
+                dead_scope: resolved_dead_scope,
                 strict_public_const_values,
                 include_wip_dead,
-            )
+            };
+            cmd_review(service, &opts)
         }
         cmd @ Commands::Cochange { .. } => dispatch_cochange(service, cmd, pretty),
         Commands::Context {
@@ -454,15 +454,17 @@ fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Re
             exclude_globs,
         } => cmd_context(
             service,
-            &dir,
-            diff.as_deref(),
-            diff_file.as_deref(),
-            git,
-            &base,
-            staged,
-            pretty,
-            &exclude_dirs,
-            &exclude_globs,
+            &CmdContextOpts {
+                dir: &dir,
+                diff: diff.as_deref(),
+                diff_file: diff_file.as_deref(),
+                git,
+                base: &base,
+                staged,
+                pretty,
+                exclude_dirs: &exclude_dirs,
+                exclude_globs: &exclude_globs,
+            },
         ),
         Commands::Impact {
             dir,
@@ -474,13 +476,15 @@ fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Re
             exclude_globs,
         } => cmd_impact(
             service,
-            &dir,
-            git,
-            &base,
-            staged,
-            hook,
-            &exclude_dirs,
-            &exclude_globs,
+            &CmdImpactOpts {
+                dir: &dir,
+                git,
+                base: &base,
+                staged,
+                hook,
+                exclude_dirs: &exclude_dirs,
+                exclude_globs: &exclude_globs,
+            },
         ),
         Commands::DeadCode {
             dir,

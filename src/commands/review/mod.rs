@@ -24,25 +24,46 @@ pub mod hook;
 // Review コマンド: impact / cochange / API surface diff / dead symbol 統合
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-pub fn cmd_review(
-    service: &AppService,
-    dir: &str,
-    diff: Option<&str>,
-    diff_file: Option<&str>,
-    git: bool,
-    base: &str,
-    staged: bool,
-    min_confidence: f64,
-    pretty: bool,
-    hook: bool,
-    framework: Option<&str>,
-    extra_exclude_dirs: &[String],
-    extra_exclude_globs: &[String],
-    dead_scope: crate::cli::DeadScope,
-    strict_public_const_values: bool,
-    include_wip_dead: bool,
-) -> Result<()> {
+/// `cmd_review` の引数一式。`CmdAstOpts` と同じく、隣接する同型引数
+/// (`diff`/`diff_file`、`git`/`staged`/`hook`) の取り違えを型と名前で防ぐ。
+pub struct CmdReviewOpts<'a> {
+    pub dir: &'a str,
+    pub diff: Option<&'a str>,
+    pub diff_file: Option<&'a str>,
+    pub git: bool,
+    pub base: &'a str,
+    pub staged: bool,
+    pub min_confidence: f64,
+    pub pretty: bool,
+    pub hook: bool,
+    pub framework: Option<&'a str>,
+    pub extra_exclude_dirs: &'a [String],
+    pub extra_exclude_globs: &'a [String],
+    pub dead_scope: crate::cli::DeadScope,
+    pub strict_public_const_values: bool,
+    pub include_wip_dead: bool,
+}
+
+pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> {
+    // 本体は従来の局所変数名のまま使うため、ここで一括分解する
+    // (全フィールド Copy。本体側の書き換えゼロ = 引数取り違えの余地ゼロ)。
+    let &CmdReviewOpts {
+        dir,
+        diff,
+        diff_file,
+        git,
+        base,
+        staged,
+        min_confidence,
+        pretty,
+        hook,
+        framework,
+        extra_exclude_dirs,
+        extra_exclude_globs,
+        dead_scope,
+        strict_public_const_values,
+        include_wip_dead,
+    } = opts;
     // framework 指定は早期に検証して未知名はここで弾く (dead_symbols 検出に到達する前に)。
     // 未指定時は package.json から next 依存を検出して nextjs プリセットを自動適用する。
     let framework_globs = resolve_framework_globs_with_auto_detect(framework, dir)?;
@@ -76,12 +97,7 @@ pub fn cmd_review(
     // diff は CI 言語判定 / changed_file_set / api_changes / dead_code filter / touched-symbols
     // で繰り返し参照するため、ここで一度だけ parse して再利用する。
     let diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
-    let force_ci = std::env::var("ASTRO_SIGHT_FORCE_CI_LANG_IMPACT")
-        .ok()
-        .as_deref()
-        == Some("1");
-    let all_ci_lang = crate::engine::impact::diff_files_all_case_insensitive(&diff_files);
-    if all_ci_lang && !force_ci {
+    if crate::engine::impact::should_skip_ci_only_diff(&diff_files) {
         log_phase("review.skip_ci_only", "applied", 0);
         return emit_review_short_circuit(hook, pretty, None);
     }
@@ -243,13 +259,6 @@ fn review_dead_symbols(
     };
 
     Ok((dead_symbols, test_only_symbols))
-}
-
-/// 空の `ReviewResult`。本体は `emit_review_short_circuit` に統合済みで、
-/// `tests.rs` の hook JSON 生成テストからのみ使う。
-#[cfg(test)]
-pub(crate) fn empty_review_result() -> ReviewResult {
-    ReviewResult::default()
 }
 
 #[cfg(test)]

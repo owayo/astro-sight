@@ -210,6 +210,80 @@ fn ruby_while_complexity_no_double_count() {
     );
 }
 
+/// ネスト関数 / クロージャ内の分岐は外側関数の cx に混入しない。
+///
+/// `function_boundary_kinds` に言語アームが無い (`_ => &[]` に落ちる) か、
+/// ノード名が grammar の改称に追随していないと外側の cx が膨らむ。
+/// 実測で C++ ラムダ / PHP closure / Ruby `do...end` / bash ネスト関数 /
+/// Zig ネスト fn の 5 言語が誤っていた回帰テスト。
+#[test]
+fn nested_function_branches_excluded_from_outer_complexity() {
+    // C++: ラムダ本体の分岐 2 つは outer に入らない
+    assert_eq!(
+        cx_of(
+            "int outer() {\n    auto f = [](int x) {\n        if (x > 0) { return 1; }\n        if (x < 0) { return 2; }\n        return 0;\n    };\n    return f(1);\n}\n",
+            LangId::Cpp,
+            "outer"
+        ),
+        1,
+        "C++ ラムダ内の分岐は outer の cx に含めない"
+    );
+    // PHP: tree-sitter-php 0.24 の `anonymous_function` (旧 `..._creation_expression`)
+    assert_eq!(
+        cx_of(
+            "<?php\nfunction outer() {\n    $f = function ($x) {\n        if ($x > 0) { return 1; }\n        if ($x < 0) { return 2; }\n        return 0;\n    };\n    return 42;\n}\n",
+            LangId::Php,
+            "outer"
+        ),
+        1,
+        "PHP closure 内の分岐は outer の cx に含めない"
+    );
+    // Ruby: `do ... end` は `block` ではなく `do_block`
+    assert_eq!(
+        cx_of(
+            "def outer\n  [1, 2].each do |x|\n    if x > 0\n      puts x\n    end\n  end\n  42\nend\n",
+            LangId::Ruby,
+            "outer"
+        ),
+        1,
+        "Ruby do...end ブロック内の分岐は outer の cx に含めない"
+    );
+    // bash: 関数内に関数を定義できる
+    assert_eq!(
+        cx_of(
+            "outer() {\n  inner() {\n    if [ \"$1\" -gt 0 ]; then echo pos; fi\n    if [ \"$1\" -lt 0 ]; then echo neg; fi\n  }\n  echo done\n}\n",
+            LangId::Bash,
+            "outer"
+        ),
+        1,
+        "bash ネスト関数内の分岐は outer の cx に含めない"
+    );
+    // Zig: struct 内のネスト fn
+    assert_eq!(
+        cx_of(
+            "pub fn outer() u32 {\n    const f = struct {\n        fn call(x: u32) u32 {\n            if (x > 0) return 1;\n            if (x < 2) return 2;\n            return 0;\n        }\n    }.call;\n    return f(1);\n}\n",
+            LangId::Zig,
+            "outer"
+        ),
+        1,
+        "Zig ネスト fn 内の分岐は outer の cx に含めない"
+    );
+}
+
+/// ネスト側 (内側) の関数自身の cx は従来どおり自分の分岐を数える。
+#[test]
+fn nested_function_keeps_own_complexity() {
+    assert_eq!(
+        cx_of(
+            "outer() {\n  inner() {\n    if [ \"$1\" -gt 0 ]; then echo pos; fi\n    if [ \"$1\" -lt 0 ]; then echo neg; fi\n  }\n  echo done\n}\n",
+            LangId::Bash,
+            "inner"
+        ),
+        3,
+        "inner 自身は分岐 2 つ + ベース 1"
+    );
+}
+
 // --- Kotlin: 循環的複雑度 (旧実装は Java の分岐ノード名を共用しており常に 1 だった) ---
 
 #[test]

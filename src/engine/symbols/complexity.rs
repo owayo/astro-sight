@@ -61,13 +61,24 @@ fn function_boundary_kinds(lang_id: LangId) -> &'static [&'static str] {
         ],
         LangId::Swift => &["function_declaration", "lambda_literal"],
         LangId::CSharp => &["method_declaration", "lambda_expression"],
+        // tree-sitter-php 0.24 で `anonymous_function_creation_expression` →
+        // `anonymous_function` に改称された。旧名のままだと closure 内の分岐が
+        // 外側関数の cx に混入する。
         LangId::Php => &[
             "function_definition",
             "method_declaration",
-            "anonymous_function_creation_expression",
+            "anonymous_function",
+            "arrow_function",
         ],
-        LangId::Ruby => &["method", "singleton_method", "lambda", "block"],
-        _ => &[],
+        // `do ... end` は `do_block`、`{ ... }` は `block`。前者が漏れていた。
+        LangId::Ruby => &["method", "singleton_method", "lambda", "block", "do_block"],
+        LangId::C => &["function_definition"],
+        // C++ のラムダ本体は `lambda_expression` 配下に入る。
+        LangId::Cpp => &["function_definition", "lambda_expression"],
+        // bash は関数内に関数を定義できる。
+        LangId::Bash => &["function_definition"],
+        LangId::Zig => &["function_declaration", "test_declaration"],
+        LangId::Xojo => &[],
     }
 }
 
