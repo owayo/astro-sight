@@ -12549,6 +12549,71 @@ fn build_review_hook_json_api_add_only_is_informational() {
     );
 }
 
+/// api.add には抽出条件の自己記述 `add_scope` が付き、`add` が空なら付かない。
+/// これが無いと「載らない新規 export = 検出漏れ」と誤認したトリアージが走る
+/// (Issue 2026-07-27-api-add-scope-not-visible)
+#[test]
+fn build_review_hook_json_api_add_carries_extraction_scope() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let empty_api = || ApiChanges {
+        added: Vec::new(),
+        removed: Vec::new(),
+        modified: Vec::new(),
+        moved: Vec::new(),
+        property_to_field: Vec::new(),
+        removed_dead: Vec::new(),
+        modified_closed_in_diff: Vec::new(),
+        const_value_changes: Vec::new(),
+        compatible_modified: Vec::new(),
+    };
+    let review_with = |api_changes: ApiChanges| ReviewResult {
+        impact: crate::models::impact::ContextResult {
+            changes: Vec::new(),
+            skipped: None,
+        },
+        missing_cochanges: Vec::new(),
+        api_changes,
+        dead_symbols: Vec::new(),
+        test_only_symbols: Vec::new(),
+        skipped: None,
+    };
+
+    let with_add = review_with(ApiChanges {
+        added: vec![ApiSymbol {
+            name: "foo".to_string(),
+            kind: "function".to_string(),
+            file: "a.rs".to_string(),
+        }],
+        ..empty_api()
+    });
+    let build = build_review_hook_json(&with_add, dir.path().to_str().expect("utf-8 path"), false);
+    let api = build.value.expect("hook JSON")["api"].clone();
+    assert_eq!(
+        api["add_scope"], "unreferenced_in_diff",
+        "api.add の抽出条件を出力から読めるようにする"
+    );
+
+    // `add` が空なら `add_scope` も出さない (無意味なトークンを増やさない)
+    let without_add = review_with(ApiChanges {
+        removed: vec![ApiSymbol {
+            name: "bar".to_string(),
+            kind: "function".to_string(),
+            file: "a.rs".to_string(),
+        }],
+        ..empty_api()
+    });
+    let build = build_review_hook_json(
+        &without_add,
+        dir.path().to_str().expect("utf-8 path"),
+        false,
+    );
+    let api = build.value.expect("hook JSON")["api"].clone();
+    assert!(
+        api.get("add_scope").is_none(),
+        "add が空なら add_scope も省略する"
+    );
+}
+
 /// api.removed は破壊的変更の可能性があるため blocking になる
 #[test]
 fn build_review_hook_json_api_removed_is_blocking() {

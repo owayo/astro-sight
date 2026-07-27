@@ -66,6 +66,12 @@ struct HookCochange<'a> {
 struct HookApi<'a> {
     #[serde(rename = "add", skip_serializing_if = "Vec::is_empty")]
     added: Vec<HookNameFile<'a>>,
+    /// `add` の抽出条件の自己記述。`add` には「新規 export のうち同一 diff 内でまだ
+    /// どこからも参照されていないもの」だけが載る (diff 内で既に他ファイルから使われる
+    /// 新規 export は載らない)。この条件が出力から読めないと、載らない新規 export を
+    /// 検出漏れと誤認してトリアージが走る (Issue 2026-07-27-api-add-scope-not-visible)。
+    #[serde(rename = "add_scope", skip_serializing_if = "Option::is_none")]
+    added_scope: Option<&'static str>,
     #[serde(rename = "rm", skip_serializing_if = "Vec::is_empty")]
     removed: Vec<HookNameFile<'a>>,
     #[serde(rename = "mod", skip_serializing_if = "Vec::is_empty")]
@@ -90,12 +96,15 @@ impl<'a> HookApi<'a> {
             n: name.as_str(),
             f: file.as_str(),
         };
+        let added: Vec<HookNameFile<'a>> = api
+            .added
+            .iter()
+            .map(|change| name_file(&change.name, &change.file))
+            .collect();
+        let added_scope = (!added.is_empty()).then_some("unreferenced_in_diff");
         Self {
-            added: api
-                .added
-                .iter()
-                .map(|change| name_file(&change.name, &change.file))
-                .collect(),
+            added,
+            added_scope,
             removed: api
                 .removed
                 .iter()
