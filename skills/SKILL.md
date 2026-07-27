@@ -14,7 +14,7 @@ tree-sitter AST-based code structure CLI. The primary **Grep replacement for cod
 
 ## When to Use (Decision Checklist)
 
-**Before running Grep, ask: "Does my search contain code identifiers?"** If yes → astro-sight, not Grep.
+**Immediately before every Grep call, ask: "Does my search contain code identifiers?"** If yes → astro-sight, not Grep. Classify the search pattern itself; do not infer from the file type or the surrounding task.
 The same rule applies inside shell commands: wrapping `grep` / `rg` in Bash is not an exception.
 
 | Need | Command |
@@ -28,7 +28,7 @@ The same rule applies inside shell commands: wrapping `grep` / `rg` in Bash is n
 | Exact syntax node at a cursor, or parse-error debug | `ast --path <file> --line <n> --col <n>` |
 | Who calls a function / what it calls | `calls --path <file> --function <name>` |
 | What a file imports | `imports --path <file>` |
-| Visual call-flow diagram | `sequence --path <file> --function <name>` |
+| Understand ordered call flow, especially 3+ interactions | `sequence --path <file> --function <name>` |
 | Files that usually change together | `cochange --dir . --paths <file>` |
 | Repeated AST/text policy | `lint --path <file> --rules rules.yaml` |
 | 2+ mixed queries in one process | `session` (NDJSON) |
@@ -148,6 +148,8 @@ astro-sight symbols --dir <directory> --glob "**/*.rs"
 ```
 
 ### `sequence` — Mermaid Sequence Diagram
+
+Use this after `calls` when execution order matters or the flow spans three or more caller/callee interactions; the diagram makes branches and hand-offs easier to verify.
 
 ```bash
 astro-sight sequence --path <file>

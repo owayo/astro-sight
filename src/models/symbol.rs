@@ -20,7 +20,7 @@ pub enum SymbolKind {
     Parameter,
 }
 
-/// A symbol definition extracted from source code.
+/// ソースコードから抽出したシンボル定義。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Symbol {
     pub name: String,
@@ -39,7 +39,7 @@ pub struct Symbol {
     pub children: Vec<Symbol>,
 }
 
-/// Compact symbol for token-optimized output.
+/// トークン最適化出力用の compact シンボル。
 #[derive(Debug, Clone, Serialize)]
 pub struct CompactSymbol {
     pub name: String,
@@ -98,7 +98,7 @@ impl Symbol {
     }
 }
 
-/// A reference to a symbol.
+/// シンボルへの参照。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reference {
     pub name: String,

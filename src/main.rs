@@ -29,7 +29,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // ---------------------------------------------------------------------------
-// Entry point
+// エントリーポイント
 // ---------------------------------------------------------------------------
 
 fn main() {
@@ -120,7 +120,7 @@ fn should_start_dhat_heap(command: &Commands) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Input resolution helpers
+// 入力解決ヘルパー
 // ---------------------------------------------------------------------------
 
 enum PathInput {
@@ -206,7 +206,7 @@ fn resolve_paths(
 }
 
 // ---------------------------------------------------------------------------
-// Dispatcher
+// コマンドディスパッチ
 // ---------------------------------------------------------------------------
 fn handle_early_command(command: &Commands) -> Result<bool> {
     match command {
@@ -248,7 +248,7 @@ fn run(cli: Cli) -> Result<()> {
 
     initialize_logging(&cli)?;
 
-    // Log command invocation with CWD and input parameters
+    // カレントディレクトリと入力パラメータを含めてコマンド実行を記録する
     let cwd = std::env::current_dir().unwrap_or_default();
     info!(
         command = ?cli.command,

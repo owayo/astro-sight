@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// A request to the astro-sight engine.
+/// astro-sight エンジンへのリクエスト。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AstgenRequest {
     pub command: Command,
@@ -20,40 +20,40 @@ pub struct AstgenRequest {
     pub context_lines: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
-    /// Function name filter (for calls command)
+    /// 関数名フィルタ（calls コマンド用）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function: Option<String>,
-    /// Symbol name to search (for refs command, single mode)
+    /// 検索するシンボル名（refs コマンドの単一検索用）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Symbol names for batch refs search
+    /// refs バッチ検索用のシンボル名
     #[serde(skip_serializing_if = "Option::is_none")]
     pub names: Option<Vec<String>>,
-    /// Directory to search in (for refs/context commands)
+    /// 検索対象ディレクトリ（refs/context コマンド用）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dir: Option<String>,
-    /// Glob pattern filter (for refs command)
+    /// glob パターンフィルタ（refs コマンド用）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub glob: Option<String>,
-    /// Diff input (for context command via session)
+    /// diff 入力（session 経由の context コマンド用）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
-    /// Lint rules (for lint command via session)
+    /// lint ルール（session 経由の lint コマンド用）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rules: Option<Vec<crate::models::lint::Rule>>,
-    /// Minimum confidence for co-change analysis (blame mode)
+    /// 共変更分析に必要な最小確信度（blame モード）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_confidence: Option<f64>,
-    /// Minimum shared commit count for co-change analysis (blame mode)
+    /// 共変更分析に必要な最小共有コミット数（blame モード）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_samples: Option<usize>,
-    /// Commits touching more files than this threshold are skipped (blame mode)
+    /// 変更ファイル数がこの閾値を超えるコミットは除外する（blame モード）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_files_per_commit: Option<usize>,
-    /// Source files for blame-based co-change analysis (relative to repo root)
+    /// blame ベースの共変更分析で起点にするファイル（リポジトリルート相対）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_files: Option<Vec<String>>,
-    /// Base revision for blame-based co-change analysis (defaults to HEAD~1)
+    /// blame ベースの共変更分析の基準 revision（既定値: HEAD~1）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
     /// 追加で除外するディレクトリ名 (context コマンドの impact cross-file 解析で適用)

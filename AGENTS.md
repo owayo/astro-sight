@@ -80,11 +80,13 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 - 修正対象は再現可能で根拠を示せる不具合に限る。推測や好みに基づく変更は行わない
 - セキュリティ境界は fail-open にしない。設定値やサンドボックスが不正なら明示的に失敗させる
+- Grep / `grep` / `rg` を呼ぶ直前に検索パターン自体を確認し、関数・クラス・変数・型・定数・メソッド名を 1 つでも含む場合は `astro-sight refs --name/--names` を使う。ファイル種別や周辺タスクだけで判断しない
 - コード変更の前には `astro-sight context --dir . --git`、変更後には `astro-sight impact --dir . --git` を実行する
 - diff / PR 全体のレビュー依頼では、個別コマンドを積み上げる前に `astro-sight review --dir . --git` で全体像を確認する
 - diff 全体の一括レビューでは `astro-sight review --dir . --git` も併用し、影響・共変更・API 差分・死蔵シンボルをまとめて確認する
 - 公開 API や export を触った変更では `astro-sight dead-code --dir . --git` も併用して死蔵シンボルを確認する
 - 構造確認が 2 手以上続くと分かっている場合（`symbols` → `imports` / `calls` / `sequence` 等）は最初から `session` にまとめ、プロセス起動コストと手順漏れを抑える
+- 呼び出し順序が重要、または caller/callee の連鎖が 3 段以上になる場合は、`calls` の一覧だけで終えず `astro-sight sequence --path <file> --function <name>` で流れを可視化する
 - `symbols` の 1 行情報だけで判断できない構文境界・parse エラー・巨大行の扱いは、Read/Grep ではなく `astro-sight ast --path <file> --line <n> --col <n>` で exact node を確認する
 - 関連ファイルの変更漏れ確認は `review --dir . --git` の `missing_cochanges` または `cochange --dir . --paths <file>` を先に使い、ファイル名の勘だけで判断しない
 - 繰り返しの構造ルール確認には `astro-sight lint --path <file> --rules <rules.yaml>` を使い、アドホックなテキスト検索で代用しない

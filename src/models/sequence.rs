@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// Result of sequence diagram generation.
+/// シーケンス図の生成結果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SequenceDiagramResult {
     #[serde(rename = "lang")]

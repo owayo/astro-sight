@@ -6,7 +6,7 @@ use crate::error::ErrorCode;
 use crate::language::LangId;
 use serde::{Deserialize, Serialize};
 
-/// The response envelope for all commands.
+/// 全コマンド共通のレスポンスエンベロープ。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AstgenResponse {
     pub location: LocationKey,
@@ -89,7 +89,7 @@ impl AstgenResponse {
     }
 }
 
-/// Schema hint for compact AST output.
+/// compact AST 出力のスキーマ情報。
 #[derive(Debug, Clone, Serialize)]
 pub struct AstSchema {
     pub range: &'static str,
@@ -103,7 +103,7 @@ impl Default for AstSchema {
     }
 }
 
-/// Token-optimized response for ast command.
+/// ast コマンド用のトークン最適化レスポンス。
 #[derive(Debug, Clone, Serialize)]
 pub struct CompactAstResponse {
     pub path: String,
@@ -114,7 +114,7 @@ pub struct CompactAstResponse {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// Token-optimized response for symbols command.
+/// symbols コマンド用のトークン最適化レスポンス。
 #[derive(Debug, Clone, Serialize)]
 pub struct CompactSymbolsResponse {
     pub path: String,

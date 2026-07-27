@@ -1,4 +1,4 @@
-//! Logging system with daily rotation using local timezone.
+//! ローカルタイムゾーンに基づく日次ローテーション対応のログシステム。
 
 use anyhow::Result;
 use logroller::{LogRollerBuilder, Rotation, RotationAge, TimeZone};
@@ -12,18 +12,18 @@ use tracing_subscriber::prelude::*;
 
 use crate::config::Config;
 
-/// Initialize the logging system.
+/// ログシステムを初期化する。
 pub fn init(config: &Config) -> Result<()> {
-    // Create log directory if needed
+    // 必要に応じてログディレクトリを作成する
     if !config.log_path.exists() {
         fs::create_dir_all(&config.log_path)?;
     }
 
-    // Clean up old logs
+    // 古いログを削除する
     cleanup_old_logs(&config.log_path)?;
 
-    // Create rolling file appender with daily rotation using local timezone
-    // File naming: astro-sight.YYYY-MM-DD (e.g., astro-sight.2026-02-28)
+    // ローカルタイムゾーンで日次ローテーションするファイル appender を作成する
+    // ファイル名: astro-sight.YYYY-MM-DD（例: astro-sight.2026-02-28）
     let appender = LogRollerBuilder::new(config.log_path.as_path(), Path::new("astro-sight"))
         .rotation(Rotation::AgeBased(RotationAge::Daily))
         .time_zone(TimeZone::Local)
@@ -33,12 +33,12 @@ pub fn init(config: &Config) -> Result<()> {
 
     let (non_blocking, _guard) = tracing_appender::non_blocking(appender);
 
-    // Use local timezone for timestamps
+    // タイムスタンプにはローカルタイムゾーンを使用する
     let time_format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
     let local_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
     let timer = OffsetTime::new(local_offset, time_format);
 
-    // Set up subscriber with file output
+    // ファイル出力用の subscriber を設定する
     let subscriber = tracing_subscriber::registry()
         .with(EnvFilter::from_default_env().add_directive(tracing::Level::DEBUG.into()))
         .with(
@@ -61,7 +61,7 @@ pub fn init(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Clean up log files older than 3 days.
+/// 3 日より古いログファイルを削除する。
 pub fn cleanup_old_logs(log_path: &Path) -> Result<()> {
     use std::time::{Duration, SystemTime};
 
@@ -85,7 +85,7 @@ pub fn cleanup_old_logs(log_path: &Path) -> Result<()> {
             None => continue,
         };
 
-        // Only process astro-sight log files
+        // astro-sight のログファイルだけを処理する
         if !filename.starts_with("astro-sight") {
             continue;
         }
@@ -132,13 +132,13 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let log_path = dir.path();
 
-        // Create an old log file (4 days ago)
+        // 4 日前の古いログファイルを作成する
         let old_file = log_path.join("astro-sight.2020-01-01");
         fs::write(&old_file, "old log").unwrap();
         let four_days_ago = SystemTime::now() - Duration::from_secs(4 * 24 * 60 * 60);
         set_file_modified_time(&old_file, four_days_ago).unwrap();
 
-        // Create a recent log file
+        // 新しいログファイルを作成する
         let recent_file = log_path.join("astro-sight.2026-02-28");
         fs::write(&recent_file, "recent log").unwrap();
 

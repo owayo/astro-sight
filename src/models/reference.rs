@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// The kind of a reference (definition or usage).
+/// 参照の種類（定義または利用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RefKind {
     #[serde(rename = "def")]
@@ -28,7 +28,7 @@ pub enum RefConfidence {
     BareNameOnly,
 }
 
-/// A single reference to a symbol in a file.
+/// ファイル内にあるシンボルへの単一参照。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolReference {
     pub path: String,
@@ -45,7 +45,7 @@ pub struct SymbolReference {
     pub confidence: Option<RefConfidence>,
 }
 
-/// The refs response envelope.
+/// refs のレスポンスエンベロープ。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefsResult {
     pub symbol: String,

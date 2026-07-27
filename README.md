@@ -111,7 +111,7 @@ astro-sight refs --name "AppService" --dir src/
 # 4. exact node が欲しいときだけ ast へ上げる
 astro-sight ast --path src/main.rs --line 10 --col 0
 
-# 5. 繰り返しの構造ルールは lint、呼び出しの流れは sequence で確認する
+# 5. 繰り返しの構造ルールは lint、順序が重要または 3 段以上の呼び出しは sequence で確認する
 astro-sight lint --path src/main.rs --rules rules.yaml
 astro-sight sequence --path src/main.rs --function main
 
@@ -679,8 +679,9 @@ astro-sight skill-install codex
 
 登録後は「コールグラフを調べて」「この関数の呼び出し元は？」「diff の影響範囲は？」等の質問で自動的に起動します。
 PR や patch 全体をまとめて見たい場合は、`astro-sight review --dir . --git` まで含めて指示すると一括レビューに入りやすくなります。
-`grep` / `rg` で関数名・型名・定数名などの識別子を探しそうになったら、まず `astro-sight refs --name <symbol> --dir .` または `refs --names` に置き換えてください。コメントや文字列の偶然一致を避けられます。
+`grep` / `rg` を呼ぶ直前に検索パターン自体を確認し、関数名・型名・定数名などの識別子を 1 つでも含む場合は、`astro-sight refs --name <symbol> --dir .` または `refs --names` に置き換えてください。ファイル種別や周辺タスクだけで判断せず、コメントや文字列の偶然一致を避けます。
 `symbols` だけで構造を読んだあとに import / caller / call flow を確認する流れでは、最初から `symbols` + `imports` / `calls` / `sequence` を `session` にまとめると、プロセス起動を減らしつつ手順漏れを防げます。
+呼び出し順序が重要、または caller/callee の連鎖が 3 段以上になる場合は、`calls` の一覧に加えて `sequence --path <file> --function <name>` で分岐と受け渡し順を確認します。
 レビュー観点が繰り返される場合は `lint` で AST/text ルール化し、関連ファイル漏れは `review` の `missing_cochanges` または `cochange --paths <file>` で先に確認します。
 
 ### 利用状況の分析
@@ -703,7 +704,7 @@ cargo run --manifest-path tools/usage-stats/Cargo.toml -- --json --days 1
 
 ## STOP-AND-CHECK Rule (CRITICAL: Check BEFORE every Grep/grep/rg call)
 
-**Before calling Grep, `grep`, or `rg`, ask yourself**: "Does my search target contain code identifiers (function/class/variable/type/constant/method names)?"
+**Immediately before every Grep, `grep`, or `rg` call, ask yourself**: "Does my search target contain code identifiers (function/class/variable/type/constant/method names)?" Classify the search pattern itself; do not infer from the file type or the surrounding task.
 - **YES → Use `astro-sight refs`** (Grep, `grep`, `rg` ALL FORBIDDEN)
 - **NO → Grep OK** (error messages, config values, TODOs, file paths, etc.)
 
@@ -738,7 +739,7 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 - **Who calls this function?**: Run `astro-sight calls --path <file> --function <name>`
 - **What does this file import?**: Run `astro-sight imports --path <file>`
 - **Files that change together**: Run `astro-sight cochange --dir . --paths <file>` (or `--git --base <rev>` to derive from a diff)
-- **Visualize call flow**: Run `astro-sight sequence --path <file> --function <name>`
+- **Visualize call flow**: When execution order matters or the flow spans 3+ caller/callee interactions, run `astro-sight sequence --path <file> --function <name>`
 - **Find dead code**: Run `astro-sight dead-code --dir .` or `--git` for diff-scoped
 - **Enforce repeated structural rules**: Run `astro-sight lint --path <file> --rules rules.yaml`
 - **Multiple mixed queries in one run**: If `symbols` will be followed by `imports` / `calls` / `sequence`, start with NDJSON `astro-sight session`

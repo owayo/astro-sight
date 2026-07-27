@@ -1,7 +1,7 @@
 use super::location::Range;
 use serde::{Deserialize, Serialize};
 
-/// An AST node representation.
+/// AST ノードの表現。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AstNode {
     pub id: usize,
@@ -15,7 +15,7 @@ pub struct AstNode {
     pub children: Vec<AstEdge>,
 }
 
-/// An edge from parent to child in the AST.
+/// AST の親から子へのエッジ。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AstEdge {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -23,10 +23,11 @@ pub struct AstEdge {
     pub node: AstNode,
 }
 
-// ── Compact (token-optimized) variants ──
+// ── compact（トークン最適化）形式 ──
 
-/// Token-optimized AST node: no id/named, range as [startLine, startCol, endLine, endCol].
-/// field is inlined from the former CompactAstEdge for flatter output.
+/// トークン最適化した AST ノード。id/named を省き、
+/// range は [startLine, startCol, endLine, endCol] で表す。
+/// 出力を平坦化するため、旧 CompactAstEdge の field をインライン化している。
 #[derive(Debug, Clone, Serialize)]
 pub struct CompactAstNode {
     pub kind: String,

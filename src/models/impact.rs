@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use super::skip::SkipInfo;
 
-/// A parsed hunk from a unified diff.
+/// unified diff から解析した hunk。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HunkInfo {
     pub old_start: usize,
@@ -11,7 +11,7 @@ pub struct HunkInfo {
     pub new_count: usize,
 }
 
-/// A symbol affected by a change.
+/// 変更の影響を受けるシンボル。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AffectedSymbol {
     pub name: String,
@@ -19,7 +19,7 @@ pub struct AffectedSymbol {
     pub change_type: String,
 }
 
-/// A detected signature change.
+/// 検出されたシグネチャ変更。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignatureChange {
     pub name: String,
@@ -27,7 +27,7 @@ pub struct SignatureChange {
     pub new_signature: String,
 }
 
-/// A caller impacted by a change.
+/// 変更の影響を受ける呼び出し元。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImpactedCaller {
     pub path: String,
@@ -41,7 +41,7 @@ pub struct ImpactedCaller {
     pub confidence: Option<String>,
 }
 
-/// A parsed diff file entry with change and hunk info.
+/// 変更内容と hunk 情報を含む解析済み diff ファイル。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiffFile {
     pub old_path: String,
@@ -54,7 +54,7 @@ pub struct DiffFile {
     pub deleted_old_source: Option<Vec<u8>>,
 }
 
-/// The impact analysis for a single changed file.
+/// 単一の変更ファイルに対する影響分析。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileImpact {
     pub path: String,
@@ -76,7 +76,7 @@ pub struct FileImpact {
     pub informational_callers: Vec<ImpactedCaller>,
 }
 
-/// The context (impact analysis) response envelope.
+/// context（影響分析）のレスポンスエンベロープ。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextResult {
     pub changes: Vec<FileImpact>,

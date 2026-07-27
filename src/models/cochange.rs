@@ -2,23 +2,23 @@ use serde::{Deserialize, Serialize};
 
 use super::skip::SkipInfo;
 
-/// A pair of files that frequently change together.
+/// 頻繁に同時変更されるファイルの組。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoChangeEntry {
     pub file_a: String,
     pub file_b: String,
-    /// Number of commits where both files changed.
+    /// 両方のファイルが変更されたコミット数。
     pub co_changes: usize,
-    /// Total changes for file_a.
+    /// file_a の総変更回数。
     pub total_changes_a: usize,
-    /// Total changes for file_b.
+    /// file_b の総変更回数。
     pub total_changes_b: usize,
-    /// Confidence score: `co_changes / |C|` (|C| = blame で得たユニークコミット数)。
+    /// 確信度: `co_changes / |C|`（|C| = blame で得たユニークコミット数）。
     pub confidence: f64,
     /// 起点ファイル変更行に関わる過去コミット集合 |C| の大きさ。
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub denominator: Option<usize>,
-    /// Smoothed ranking score。
+    /// 平滑化したランキングスコア。
     ///
     /// - 既定 (smoothing 有効): `(co + α) / (denom + α + β)` で小サンプルを過信しない
     /// - `--no-smoothing` 指定時: `confidence` と同値 (互換のため必ず Some)
@@ -38,7 +38,7 @@ impl CoChangeEntry {
     }
 }
 
-/// Result of co-change analysis.
+/// 共変更分析の結果。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CoChangeResult {
     pub entries: Vec<CoChangeEntry>,
@@ -49,7 +49,7 @@ pub struct CoChangeResult {
     pub skipped: Option<SkipInfo>,
 }
 
-/// Options controlling blame-based co-change analysis.
+/// blame ベースの共変更分析を制御するオプション。
 ///
 /// astro-sight v26.6.0 で旧 lookback モード (`git log` ベース) は廃止され、
 /// blame モード (起点ファイルの変更行に `git blame` を当て、最終修正コミット

@@ -2,21 +2,21 @@ use super::location::Range;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// A call site location (line and column, 0-indexed).
+/// 呼び出し位置（行と列は 0 始まり）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallSite {
     pub line: usize,
     pub column: usize,
 }
 
-/// A caller or callee descriptor.
+/// 呼び出し元または呼び出し先の記述。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallEndpoint {
     pub name: String,
     pub range: Range,
 }
 
-/// A single call edge: caller → callee at a specific call site.
+/// 特定の呼び出し位置における単一の呼び出しエッジ（caller → callee）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallEdge {
     pub caller: CallEndpoint,
@@ -24,16 +24,16 @@ pub struct CallEdge {
     pub call_site: CallSite,
 }
 
-/// The call graph response for a single file (full mode).
+/// 単一ファイルのコールグラフレスポンス（full モード）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallGraph {
     pub language: String,
     pub calls: Vec<CallEdge>,
 }
 
-// ── Compact (token-optimized) variants ──
+// ── compact（トークン最適化）形式 ──
 
-/// A callee in compact format.
+/// compact 形式の呼び出し先。
 #[derive(Debug, Clone, Serialize)]
 pub struct CompactCallee {
     pub name: String,
@@ -41,7 +41,7 @@ pub struct CompactCallee {
     pub col: usize,
 }
 
-/// A group of calls from the same caller.
+/// 同じ呼び出し元からの呼び出しグループ。
 #[derive(Debug, Clone, Serialize)]
 pub struct CompactCallGroup {
     pub caller: String,
@@ -49,7 +49,7 @@ pub struct CompactCallGroup {
     pub callees: Vec<CompactCallee>,
 }
 
-/// Token-optimized call graph: calls grouped by caller.
+/// 呼び出し元ごとにグループ化したトークン最適化コールグラフ。
 #[derive(Debug, Clone, Serialize)]
 pub struct CompactCallGraph {
     pub lang: String,
@@ -58,7 +58,7 @@ pub struct CompactCallGraph {
 
 impl CallGraph {
     pub fn to_compact(&self) -> CompactCallGraph {
-        // Group by caller name, preserving first-seen order
+        // 初出順を維持しながら呼び出し元名でグループ化する
         let mut order: Vec<String> = Vec::new();
         let mut groups: HashMap<String, CompactCallGroup> = HashMap::new();
 

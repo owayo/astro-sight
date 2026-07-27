@@ -958,6 +958,97 @@ fn mcp_tools_call_symbols() {
 }
 
 #[test]
+fn mcp_tools_call_refs_search() {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "refs_search",
+            "arguments": {
+                "name": "Config",
+                "dir": "tests/fixtures",
+                "glob": "**/*.py"
+            }
+        }
+    })
+    .to_string();
+    let stdout = mcp_send_after_init(&[&request]);
+
+    let result_line = stdout
+        .lines()
+        .find(|line| line.contains("\"id\":2"))
+        .expect("refs_search レスポンスが必要");
+    let json: serde_json::Value = serde_json::from_str(result_line).expect("valid JSON-RPC");
+    let content = json["result"]["content"]
+        .as_array()
+        .expect("content 配列が必要");
+    let text = content[0]["text"].as_str().expect("text フィールドが必要");
+    let refs: serde_json::Value =
+        serde_json::from_str(text).expect("refs JSON がパース可能であるべき");
+
+    assert_eq!(refs["symbol"], "Config");
+    assert!(
+        refs["refs"]
+            .as_array()
+            .is_some_and(|references| references.iter().any(|reference| {
+                reference["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("sample.py"))
+            })),
+        "sample.py 内の Config 参照が必要: {refs}"
+    );
+}
+
+#[test]
+fn mcp_tools_call_context_analyze() {
+    let diff = "\
+diff --git a/tests/fixtures/sample.py b/tests/fixtures/sample.py\n\
+--- a/tests/fixtures/sample.py\n\
++++ b/tests/fixtures/sample.py\n\
+@@ -28,1 +28,1 @@\n\
+-def create_config(path: str) -> Config:\n\
++def create_config(path: str, strict: bool = False) -> Config:\n";
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "context_analyze",
+            "arguments": {
+                "diff": diff,
+                "dir": "."
+            }
+        }
+    })
+    .to_string();
+    let stdout = mcp_send_after_init(&[&request]);
+
+    let result_line = stdout
+        .lines()
+        .find(|line| line.contains("\"id\":2"))
+        .expect("context_analyze レスポンスが必要");
+    let json: serde_json::Value = serde_json::from_str(result_line).expect("valid JSON-RPC");
+    let content = json["result"]["content"]
+        .as_array()
+        .expect("content 配列が必要");
+    let text = content[0]["text"].as_str().expect("text フィールドが必要");
+    let context: serde_json::Value =
+        serde_json::from_str(text).expect("context JSON がパース可能であるべき");
+
+    assert!(
+        context["changes"]
+            .as_array()
+            .is_some_and(|changes| changes.iter().any(|change| {
+                change["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("tests/fixtures/sample.py"))
+            })),
+        "sample.py の変更影響が必要: {context}"
+    );
+}
+
+#[test]
 fn mcp_tools_call_path_traversal() {
     let stdout = mcp_send_after_init(&[
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"symbols_extract","arguments":{"path":"/etc/hosts"}}}"#,

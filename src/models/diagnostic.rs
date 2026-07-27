@@ -8,7 +8,7 @@ pub enum Severity {
     Info,
 }
 
-/// A diagnostic message (parse error, etc.).
+/// パースエラーなどの診断メッセージ。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub severity: Severity,

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// The kind of import statement.
+/// import 文の種類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ImportKind {
@@ -10,23 +10,23 @@ pub enum ImportKind {
     Require,
 }
 
-/// A single import edge extracted from source.
+/// ソースから抽出した単一の import エッジ。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportEdge {
-    /// The imported module/path/package
+    /// import されたモジュール、パス、またはパッケージ
     #[serde(rename = "src")]
     pub source: String,
-    /// Line number (0-indexed)
+    /// 行番号（0 始まり）
     #[serde(rename = "ln")]
     pub line: usize,
-    /// Kind of import
+    /// import の種類
     pub kind: ImportKind,
-    /// The source text of the import statement
+    /// import 文のソーステキスト
     #[serde(rename = "ctx")]
     pub context: String,
 }
 
-/// Result of import extraction for a single file.
+/// 単一ファイルの import 抽出結果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportsResult {
     #[serde(rename = "lang")]

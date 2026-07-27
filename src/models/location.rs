@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// A point in a source file (0-indexed line and column).
+/// ソースファイル内の位置（行と列は 0 始まり）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Point {
     pub line: usize,
@@ -16,7 +16,7 @@ impl From<tree_sitter::Point> for Point {
     }
 }
 
-/// A range in a source file.
+/// ソースファイル内の範囲。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Range {
     pub start: Point,
@@ -32,7 +32,7 @@ impl From<tree_sitter::Range> for Range {
     }
 }
 
-/// A location key identifying a position in a file.
+/// ファイル内の位置を識別するキー。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocationKey {
     pub path: String,

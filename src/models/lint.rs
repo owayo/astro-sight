@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// Severity level for a lint rule.
+/// lint ルールの重大度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
@@ -9,49 +9,49 @@ pub enum Severity {
     Info,
 }
 
-/// A lint rule definition (loaded from YAML).
+/// YAML から読み込む lint ルール定義。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
-    /// Unique rule identifier
+    /// 一意なルール識別子
     pub id: String,
-    /// Target language (e.g. "rust", "javascript")
+    /// 対象言語（例: "rust", "javascript"）
     pub language: String,
-    /// Severity level
+    /// 重大度
     pub severity: Severity,
-    /// Human-readable message
+    /// 人が読めるメッセージ
     pub message: String,
-    /// tree-sitter S-expression query (mutually exclusive with pattern)
+    /// tree-sitter の S 式クエリ（pattern とは排他）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
-    /// Simple text pattern to match against identifiers (mutually exclusive with query)
+    /// 識別子と照合する単純なテキストパターン（query とは排他）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
 }
 
-/// A single pattern match result.
+/// 単一のパターン一致結果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PatternMatch {
-    /// Rule ID that matched
+    /// 一致したルール ID
     pub rule_id: String,
-    /// Severity
+    /// 重大度
     pub severity: Severity,
-    /// Message
+    /// メッセージ
     pub message: String,
-    /// Line number (0-indexed)
+    /// 行番号（0 始まり）
     pub line: usize,
-    /// Column number (0-indexed)
+    /// 列番号（0 始まり）
     pub column: usize,
-    /// Matched text
+    /// 一致したテキスト
     pub matched_text: String,
 }
 
-/// Result of linting a single file.
+/// 単一ファイルの lint 結果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LintResult {
     #[serde(rename = "lang")]
     pub language: String,
     pub matches: Vec<PatternMatch>,
-    /// Warnings about skipped or invalid rules
+    /// 除外または不正なルールに関する警告
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
