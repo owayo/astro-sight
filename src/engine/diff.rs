@@ -122,6 +122,65 @@ pub fn extract_changed_new_lines(input: &str, file_path: &str) -> HashSet<usize>
     result
 }
 
+/// 指定ファイルの unified diff に、new 側の行範囲 `[start_line, end_line]` (0-indexed)
+/// 内で発生した削除 (`-` 行) があるかを判定する。
+///
+/// 削除行自体は new 側に存在しないため、「削除が起きた位置」は直後に続く new 側行の
+/// 0-indexed 行番号で近似する。**厳密な行対応ではなく近似判定専用**で、範囲境界ぎわの削除は
+/// 保守側 (true = 削除あり) に倒れる。フォーマッタの再整形やコメント行の削除でも true になるが、
+/// 呼び出し側 (impact のオブジェクトリテラル変数「メンバー追加のみ」判定 = フィルタ 3c) では
+/// true = 「フィルタを適用せず従来どおり cross-file 検索する」なので検出漏れ側には倒れない。
+/// この非対称性 (false 側だけが検索を省く) に依存しない用途へ転用しないこと。
+pub(crate) fn has_deletion_in_new_range(
+    input: &str,
+    file_path: &str,
+    start_line: usize,
+    end_line: usize,
+) -> bool {
+    let mut in_target_file = false;
+    let mut active_hunk: Option<HunkProgress> = None;
+    // 1-indexed: 次に出力される new 側行番号
+    let mut current_new_line: usize = 0;
+
+    for line in input.lines() {
+        // hunk 本体を消費中はヘッダに見える行も本体行として扱う (extract_changed_new_lines と同じ規約)。
+        if let Some(progress) = active_hunk.as_mut() {
+            let consumed = progress.consume(line);
+            if in_target_file {
+                match consumed {
+                    HunkBodyLine::Added(_) | HunkBodyLine::Context => {
+                        current_new_line += 1;
+                    }
+                    HunkBodyLine::Removed(_) => {
+                        let pos = current_new_line.saturating_sub(1);
+                        if pos >= start_line && pos <= end_line {
+                            return true;
+                        }
+                    }
+                    HunkBodyLine::Metadata => {}
+                }
+            }
+            if progress.is_complete() {
+                active_hunk = None;
+            }
+            continue;
+        }
+        if line.starts_with("--- ") {
+            in_target_file = false;
+        } else if let Some(path) = line.strip_prefix("+++ b/") {
+            in_target_file = path == file_path;
+        } else if line.starts_with("+++ ") {
+            in_target_file = false;
+        } else if line.starts_with("@@ ")
+            && let Some(hunk) = parse_hunk_header(line)
+        {
+            current_new_line = hunk.new_start;
+            active_hunk = Some(HunkProgress::new(&hunk));
+        }
+    }
+    false
+}
+
 /// unified diff 文字列を `DiffFile` の配列に変換する。
 ///
 /// 削除ファイル (`+++ /dev/null`) の hunk 内 `-` 行は旧ソース復元用に蓄積し、
@@ -438,6 +497,38 @@ index 1234567..0000000
         let mut sorted: Vec<_> = changed.into_iter().collect();
         sorted.sort();
         assert_eq!(sorted, vec![0, 1, 2]);
+    }
+
+    /// 追加のみ (削除行なし) の hunk では has_deletion_in_new_range は false。
+    #[test]
+    fn has_deletion_in_new_range_pure_add_returns_false() {
+        // 0-indexed 6..=9 のオブジェクトリテラルに 1 行追加 (new 側 8 行目 = 0-indexed 7)
+        let diff = "--- a/mod.ts\n+++ b/mod.ts\n@@ -6,4 +6,5 @@\n export const api = {\n   alpha,\n+  gamma,\n   beta,\n };\n";
+        assert!(!has_deletion_in_new_range(diff, "mod.ts", 5, 10));
+    }
+
+    /// 範囲内で行が削除 (書き換え含む) されていれば true。
+    #[test]
+    fn has_deletion_in_new_range_detects_removal_inside_range() {
+        let diff = "--- a/mod.ts\n+++ b/mod.ts\n@@ -6,4 +6,4 @@\n export const api = {\n   alpha,\n-  beta,\n+  beta: betaV2,\n };\n";
+        assert!(has_deletion_in_new_range(diff, "mod.ts", 5, 9));
+    }
+
+    /// 範囲外の削除は false (対象シンボルの range に閉じて判定する)。
+    #[test]
+    fn has_deletion_in_new_range_ignores_removal_outside_range() {
+        let diff = "--- a/mod.ts\n+++ b/mod.ts\n@@ -1,3 +1,2 @@\n line1\n-removed\n line3\n";
+        // 削除位置は 0-indexed 1 付近 → 範囲 [5,10] の外
+        assert!(!has_deletion_in_new_range(diff, "mod.ts", 5, 10));
+        assert!(has_deletion_in_new_range(diff, "mod.ts", 0, 2));
+    }
+
+    /// 他ファイルの削除行は対象ファイルの判定に影響しない。
+    #[test]
+    fn has_deletion_in_new_range_skips_other_files() {
+        let diff = "--- a/other.ts\n+++ b/other.ts\n@@ -1,2 +1,1 @@\n keep\n-removed\n--- a/mod.ts\n+++ b/mod.ts\n@@ -1,1 +1,2 @@\n keep\n+added\n";
+        assert!(!has_deletion_in_new_range(diff, "mod.ts", 0, 5));
+        assert!(has_deletion_in_new_range(diff, "other.ts", 0, 5));
     }
 
     /// hunk 本体の削除/追加行コンテンツが `--- a/...` / `+++ b/...` の形でも、

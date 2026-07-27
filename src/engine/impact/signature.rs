@@ -404,6 +404,39 @@ mod tests {
         ));
     }
 
+    // 定義行でシンボル名が `.` の直後に来る形 (Ruby の特異メソッド `def self.create`) でも
+    // シグネチャ変更を検出する。`line_has_identifier` に「`.` 直後はプロパティ位置なので
+    // 不採用」という規則を入れると、`def self.create(a)` → `def self.create(a, b)` の
+    // 必須引数追加 (破壊的変更) が完全に無検出になる。プロパティ位置の除外は共有ヘルパーでは
+    // なく呼び出し元限定で行う必要がある (Issue 2026-07-27-namespace-object-impact-granularity
+    // の実装検討で踏んだ検出漏れの回帰防止)
+    #[test]
+    fn ruby_singleton_method_signature_change_is_detected() {
+        let diff = "\
+--- a/svc.rb
++++ b/svc.rb
+@@ -1,5 +1,5 @@
+ class Svc
+-  def self.create(a)
++  def self.create(a, b)
+     a
+   end
+ end";
+        assert!(
+            is_symbol_in_changed_lines(diff, "svc.rb", "create", LangId::Ruby),
+            "`def self.create` の変更行はシンボル `create` の変更として扱う"
+        );
+        let affected = vec![AffectedSymbol {
+            name: "create".to_string(),
+            kind: "method".to_string(),
+            change_type: "modified".to_string(),
+        }];
+        let changes = detect_signature_changes(diff, "svc.rb", &affected, LangId::Ruby);
+        assert_eq!(changes.len(), 1, "必須引数追加を検出すべき");
+        assert!(changes[0].old_signature.contains("create(a)"));
+        assert!(changes[0].new_signature.contains("create(a, b)"));
+    }
+
     // detect_signature_changes がシグネチャ変更を正しく検出する
     #[test]
     fn detect_signature_changes_detects_change() {

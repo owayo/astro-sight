@@ -102,6 +102,25 @@ impl CrossFileFilterContext<'_> {
         {
             return false;
         }
+        // 3c. オブジェクトリテラル変数の「メンバー追加のみ」変更をスキップ。
+        // `export const ns = { fnA, fnB }` 形式のファサードへ新メンバーを追加しても、
+        // 既存メンバーだけを使う参照側は壊れない (追加は後方互換)。宣言ヘッダ行が不変で、
+        // シンボル range 内の変更に削除 (`-` 行) を含まない場合は cross-file 検索から外す。
+        // メンバー削除・書き換え (`-` 行が range 内に出る) は従来どおり blocking 側に残す
+        // (Issue 2026-07-27-namespace-object-impact-granularity)。
+        if sym.kind == "variable"
+            && let Some(s) = overlapping
+            && !self.changed_new_lines.contains(&s.range.start.line)
+            && is_js_ts_object_literal_variable(self.root, self.lang_id, &s.range)
+            && !crate::engine::diff::has_deletion_in_new_range(
+                self.diff_input,
+                self.file_path,
+                s.range.start.line,
+                s.range.end.line,
+            )
+        {
+            return false;
+        }
         // 4. エクスポートされていないシンボルをスキップ
         if !overlapping.is_some_and(|s| {
             symbols::is_symbol_exported(self.root, self.source, self.lang_id, &s.range)
@@ -121,6 +140,48 @@ impl CrossFileFilterContext<'_> {
         }
         true
     }
+}
+
+/// variable シンボルの range (variable_declarator 全体) が JS/TS のオブジェクトリテラル
+/// 初期化子 (`const ns = { ... }`) を持つか判定する。フィルタ 3c の適用対象判定に使う。
+/// 対象言語外・ノード不一致・value 欠落はすべて false (= 従来どおり cross-file 検索) に倒す。
+///
+/// `as const` / `satisfies` 付き (`const ns = { ... } as const;`) は value が `as_expression` /
+/// `satisfies_expression` になるため false になり、フィルタは適用されず従来検索に落ちる。
+/// 検出漏れ側には倒れないため現状は unwrap しない。
+fn is_js_ts_object_literal_variable(
+    root: tree_sitter::Node<'_>,
+    lang_id: LangId,
+    range: &crate::models::location::Range,
+) -> bool {
+    if !matches!(
+        lang_id,
+        LangId::Javascript | LangId::Typescript | LangId::Tsx
+    ) {
+        return false;
+    }
+    let start = tree_sitter::Point {
+        row: range.start.line,
+        column: range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: range.end.line,
+        column: range.end.column,
+    };
+    let Some(node) = root.descendant_for_point_range(start, end) else {
+        return false;
+    };
+    // variable シンボルの range は variable_declarator 全体を指す。念のため祖先方向にも辿る。
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        if n.kind() == "variable_declarator" {
+            return n
+                .child_by_field_name("value")
+                .is_some_and(|v| v.kind() == "object");
+        }
+        cur = n.parent();
+    }
+    false
 }
 
 /// 同一ファイル判定。サフィックスマッチで偽陽性を出さないよう、完全一致 or パス区切り付き
@@ -348,6 +409,93 @@ mod tests {
             &affected("foo", "function", "added"),
             &[sig_change("foo")],
             &[0]
+        ));
+    }
+
+    /// TS ソース + 指定 diff で `should_include_for_cross_file` を評価する (3c フィルタ用)。
+    fn include_for_ts(
+        source: &str,
+        sym: &AffectedSymbol,
+        diff_input: &str,
+        changed_lines: &[usize],
+        hunks: Vec<HunkInfo>,
+    ) -> bool {
+        let bytes = source.as_bytes();
+        let tree = crate::engine::parser::parse_source(bytes, LangId::Typescript).expect("parse");
+        let root = tree.root_node();
+        let syms = symbols::extract_symbols(root, bytes, LangId::Typescript).expect("symbols");
+        let changed_new_lines: HashSet<usize> = changed_lines.iter().copied().collect();
+        let ctx = CrossFileFilterContext {
+            syms: &syms,
+            hunks: &hunks,
+            sig_changes: &[],
+            diff_input,
+            file_path: "mod.ts",
+            root,
+            source: bytes,
+            lang_id: LangId::Typescript,
+            changed_new_lines: &changed_new_lines,
+        };
+        ctx.should_include_for_cross_file(sym)
+    }
+
+    // 3c. オブジェクトリテラル変数への「メンバー追加のみ」変更は cross-file 検索から除外
+    #[test]
+    fn cross_file_filter_skips_object_literal_member_addition_only() {
+        let source = "export function alpha(): number {\n  return 1;\n}\nexport const api = {\n  alpha,\n  gamma,\n};\n";
+        let diff = "--- a/mod.ts\n+++ b/mod.ts\n@@ -4,3 +4,4 @@\n export const api = {\n   alpha,\n+  gamma,\n };\n";
+        let hunks = vec![HunkInfo {
+            old_start: 4,
+            old_count: 3,
+            new_start: 4,
+            new_count: 4,
+        }];
+        assert!(!include_for_ts(
+            source,
+            &affected("api", "variable", "modified"),
+            diff,
+            &[5],
+            hunks
+        ));
+    }
+
+    // 3c. メンバーの書き換え (`-` 行が range 内) を含む場合は従来どおり cross-file 検索に含める
+    #[test]
+    fn cross_file_filter_keeps_object_literal_member_rewrite() {
+        let source = "export function alpha(): number {\n  return 1;\n}\nexport const api = {\n  alpha,\n  beta: betaV2, // api member rewrite\n};\n";
+        let diff = "--- a/mod.ts\n+++ b/mod.ts\n@@ -4,4 +4,4 @@\n export const api = {\n   alpha,\n-  beta,\n+  beta: betaV2, // api member rewrite\n };\n";
+        let hunks = vec![HunkInfo {
+            old_start: 4,
+            old_count: 4,
+            new_start: 4,
+            new_count: 4,
+        }];
+        assert!(include_for_ts(
+            source,
+            &affected("api", "variable", "modified"),
+            diff,
+            &[5],
+            hunks
+        ));
+    }
+
+    // 3c. 宣言ヘッダ行自体が変更された場合は除外しない (署名変更の可能性)
+    #[test]
+    fn cross_file_filter_keeps_object_literal_with_changed_header() {
+        let source = "export function alpha(): number {\n  return 1;\n}\nexport const api = {\n  alpha,\n  gamma,\n};\n";
+        let diff = "--- a/mod.ts\n+++ b/mod.ts\n@@ -4,3 +4,4 @@\n-export const api2 = {\n+export const api = {\n   alpha,\n+  gamma,\n };\n";
+        let hunks = vec![HunkInfo {
+            old_start: 4,
+            old_count: 3,
+            new_start: 4,
+            new_count: 4,
+        }];
+        assert!(include_for_ts(
+            source,
+            &affected("api", "variable", "modified"),
+            diff,
+            &[3, 5],
+            hunks
         ));
     }
 
