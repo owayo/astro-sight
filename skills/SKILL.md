@@ -3,8 +3,9 @@ name: astro-sight
 description: >-
   tree-sitter AST でコード構造を解析する CLI。コード識別子 (関数/クラス/変数/型/メソッド名)
   を探すときは Grep でなく必ずこれ — refs --name/--names。diff/PR レビューは review
-  --git、編集前後の影響分析は context/impact。dead-code/symbols/calls/imports/
-  sequence/lint/session も提供。識別子検索・シンボル参照・呼び出し関係・構造把握・コードレビューの場面で発動。
+  --git、編集前後の影響分析は context/impact、構文ノードの特定・parse エラー調査は ast。
+  dead-code/symbols/calls/imports/sequence/lint/session も提供。
+  識別子検索・シンボル参照・呼び出し関係・構造把握・構文確認・コードレビューの場面で発動。
 allowed-tools: Bash(astro-sight:*)
 ---
 
