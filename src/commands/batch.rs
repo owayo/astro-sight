@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use rayon::prelude::*;
 use tracing::info;
 
@@ -10,71 +10,53 @@ fn batch_ndjson<F>(paths: &[String], process: F) -> Result<()>
 where
     F: Fn(&str) -> String + Sync,
 {
-    use std::io::Write;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::mpsc;
+    let stdout = std::io::stdout();
+    let out = std::io::BufWriter::new(stdout.lock());
+    let written = batch_ndjson_to(paths, process, out)?;
+    info!(
+        batch_size = paths.len(),
+        output_bytes = written,
+        "batch completed"
+    );
+    Ok(())
+}
 
-    if paths.is_empty() {
-        return Ok(());
+fn batch_ndjson_to<F, W>(paths: &[String], process: F, out: W) -> Result<usize>
+where
+    F: Fn(&str) -> String + Sync,
+    W: std::io::Write,
+{
+    // 全スレッドを飽和させながら、未排出の解析結果をワーカー数の定数倍に制限する。
+    let window_size = rayon::current_num_threads().saturating_mul(8).max(1);
+    batch_ndjson_to_windowed(paths, process, out, window_size)
+}
+
+fn batch_ndjson_to_windowed<F, W>(
+    paths: &[String],
+    process: F,
+    mut out: W,
+    window_size: usize,
+) -> Result<usize>
+where
+    F: Fn(&str) -> String + Sync,
+    W: std::io::Write,
+{
+    let window_size = window_size.max(1);
+    let mut bytes = 0usize;
+
+    for chunk in paths.chunks(window_size) {
+        // IndexedParallelIterator の collect は入力順を保つため、chunk 間も含めて
+        // 呼び出し元が指定したパス順の NDJSON を維持できる。
+        let lines: Vec<String> = chunk.par_iter().map(|p| process(p)).collect();
+        for line in lines {
+            bytes += line.len() + 1;
+            writeln!(out, "{line}")?;
+        }
+        // broken pipe 等を chunk 境界で検出し、残りの解析を早期に打ち切る。
+        out.flush()?;
     }
 
-    let batch_size = paths.len();
-    // 各スロットは排出時に `take` されるため Mutex<Option<String>>
-    let slots: Vec<Mutex<Option<String>>> = (0..batch_size).map(|_| Mutex::new(None)).collect();
-    let (tx, rx) = mpsc::channel::<usize>();
-    let next_to_write = AtomicUsize::new(0);
-
-    std::thread::scope(|scope| -> Result<()> {
-        let slots_ref = &slots;
-        let next_to_write_ref = &next_to_write;
-
-        let writer = scope.spawn(move || -> Result<usize> {
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            let mut bytes = 0usize;
-            // 完了通知を受け取り、次に書くべきインデックスが揃っている間は順次排出する
-            for _ in rx {
-                loop {
-                    let cur = next_to_write_ref.load(Ordering::Acquire);
-                    if cur >= batch_size {
-                        break;
-                    }
-                    let taken = {
-                        let mut guard = slots_ref[cur].lock().expect("slot mutex poisoned");
-                        guard.take()
-                    };
-                    if let Some(line) = taken {
-                        bytes += line.len() + 1;
-                        writeln!(out, "{line}")?;
-                        next_to_write_ref.store(cur + 1, Ordering::Release);
-                    } else {
-                        break;
-                    }
-                }
-            }
-            Ok(bytes)
-        });
-
-        paths
-            .par_iter()
-            .enumerate()
-            .for_each_with(tx, |tx, (i, p)| {
-                let line = process(p);
-                *slots_ref[i].lock().expect("slot mutex poisoned") = Some(line);
-                let _ = tx.send(i);
-            });
-
-        let written = writer
-            .join()
-            .map_err(|_| anyhow!("batch_ndjson writer thread panicked"))??;
-        info!(
-            batch_size = batch_size,
-            output_bytes = written,
-            "batch completed"
-        );
-        Ok(())
-    })
+    Ok(bytes)
 }
 
 pub fn batch_ast(
@@ -179,4 +161,84 @@ pub fn batch_sequence(
             Err(e) => make_error_line(&e),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{self, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::batch_ndjson_to_windowed;
+
+    #[test]
+    fn batch_ndjson_windowed_preserves_order_and_byte_count() {
+        let paths = (0..5).map(|i| i.to_string()).collect::<Vec<_>>();
+        let mut output = Vec::new();
+
+        let bytes =
+            batch_ndjson_to_windowed(&paths, |path| format!("result-{path}"), &mut output, 2)
+                .expect("batch should succeed");
+
+        assert_eq!(
+            String::from_utf8(output.clone()).expect("valid UTF-8"),
+            "result-0\nresult-1\nresult-2\nresult-3\nresult-4\n"
+        );
+        assert_eq!(bytes, output.len());
+    }
+
+    #[test]
+    fn batch_ndjson_windowed_empty_input_does_not_call_processor() {
+        let calls = AtomicUsize::new(0);
+        let mut output = Vec::new();
+
+        let bytes = batch_ndjson_to_windowed(
+            &[],
+            |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                String::new()
+            },
+            &mut output,
+            2,
+        )
+        .expect("empty batch should succeed");
+
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(bytes, 0);
+        assert!(output.is_empty());
+    }
+
+    struct BrokenPipeWriter;
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn batch_ndjson_windowed_writer_error_stops_before_next_window() {
+        let paths = (0..5).map(|i| i.to_string()).collect::<Vec<_>>();
+        let calls = AtomicUsize::new(0);
+
+        let error = batch_ndjson_to_windowed(
+            &paths,
+            |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                "result".to_string()
+            },
+            BrokenPipeWriter,
+            2,
+        )
+        .expect_err("broken pipe should be propagated");
+
+        assert_eq!(
+            error.downcast_ref::<io::Error>().expect("I/O error").kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
 }

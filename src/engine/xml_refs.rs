@@ -12,6 +12,8 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use crate::engine::bounded_read::read_utf8_file_limited;
+
 /// XML スキャン対象 1 ファイルあたりの最大サイズ (1MB)。
 /// これを超える XML（生成物や画像埋め込み等）はスキップして応答性を保つ。
 const MAX_XML_FILE_SIZE: u64 = 1_048_576;
@@ -39,7 +41,7 @@ pub fn collect_xml_symbol_references(dir: &Path) -> HashSet<String> {
         if !meta.is_file() || meta.len() > MAX_XML_FILE_SIZE {
             continue;
         }
-        if let Ok(content) = std::fs::read_to_string(path) {
+        if let Some(content) = read_utf8_file_limited(path, MAX_XML_FILE_SIZE) {
             extract_android_refs(&content, &mut refs);
         }
     }

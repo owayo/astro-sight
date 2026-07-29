@@ -1,5 +1,6 @@
 pub mod angular_template_refs;
 pub mod bash_trap_refs;
+pub(crate) mod bounded_read;
 pub mod calls;
 pub mod cochange;
 pub mod diff;

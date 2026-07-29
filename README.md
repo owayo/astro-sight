@@ -205,6 +205,8 @@ astro-sight refs --names "AppService,AstgenResponse" --dir src/
 
 単一検索と複数シンボル検索はいずれも worker local の fold/reduce で結果を直接統合し、per-file の中間 `Vec` を全ファイル分保持しない。非常に多くの参照が返るシンボルでは出力自体が大きくなるため、`--glob` で対象言語を絞るか、必要に応じて `ASTRO_SIGHT_BATCH_WORKERS` で並列ワーカー数を下げる。複数シンボル検索（`refs --names`）はディレクトリ走査と rayon pool を 1 回に集約し、内部で名前を chunk 単位（既定 64、`ASTRO_SIGHT_REFS_BATCH_CHUNK` で調整）に分割して AC trie / fold バケットのメモリを上限化する。名前数を増やしてもディレクトリ走査は 1 回で済み（chunk 毎の再走査が起きない）、chunk サイズに依らず結果は一致する。
 
+Angular テンプレートと Android XML の補助参照スキャンは、各ファイルをそれぞれ 2MB / 1MB に制限する。metadata 確認後にファイルが拡大した場合も、上限 + 1 byte で読み込みを止めてスキップする。
+
 C/C++ の `struct` / `class` / `union` / `enum` tag 名は、本体付き定義だけを Definition とし、`struct X *p`、`sizeof(struct X)`、cast、引数型・メンバ宣言内の `struct X` は Reference として数える。単独 forward declaration は ref/def のどちらにも含めないため、dead-code でも使用中の型 tag を誤って dead にしにくい。
 
 `.h` は既定では C ヘッダとして扱うが、C++ 専用構文のマーカーがあり、C++ parser の方が明確に parse error が少ない場合は C++ として解析する。C ヘッダを不用意に C++ 扱いせず、`class Foo { public: ... }` や `struct X : Base<X> {}` のような C++ ヘッダの `symbols` / `review` / `dead-code` 取りこぼしを抑える。
@@ -512,9 +514,9 @@ echo '{"command":"context","dir":".","diff":"--- a/src/main.rs\n+++ b/src/main.r
 
 `refs` を session で使う場合も `name` または `names` の指定が必須（空文字不可）。
 
-### バッチ処理（ast, symbols, calls）
+### バッチ処理（ast, symbols, calls, imports, lint, sequence）
 
-複数ファイルを一度に処理し、NDJSON（1ファイル1行）で出力。rayon による並列処理。
+複数ファイルを一度に処理し、NDJSON（1ファイル1行）で出力。rayon で並列処理しつつ入力順を維持する。未排出結果はワーカー数の8倍までの窓に制限するため、入力件数に比例してピーク RSS が増えない。stdout が閉じた場合は現在の窓で停止し、残りのファイルを解析しない。
 
 ```bash
 # カンマ区切りで複数ファイルを指定
@@ -524,9 +526,11 @@ astro-sight symbols --paths src/lib.rs,src/cli.rs,src/main.rs
 find src -name '*.rs' > /tmp/files.txt
 astro-sight symbols --paths-file /tmp/files.txt
 
-# バッチ ast / calls も同様
+# バッチ ast / calls / imports / lint / sequence も同様
 astro-sight ast --paths src/lib.rs,src/main.rs --depth 2
 astro-sight calls --paths src/lib.rs,src/main.rs
+astro-sight imports --paths src/lib.rs,src/main.rs
+astro-sight sequence --paths src/lib.rs,src/main.rs --function main
 ```
 
 `--paths` / `--paths-file` は 1 件以上の有効なパスが必要。空リストは `INVALID_REQUEST` を返す。`--paths-file` は 100MB 上限付きで読み込まれる。

@@ -48,10 +48,13 @@ astro-sight dead-code --dir . --git                # 6. dead exported symbols
 astro-sight symbols --path <file>                  # 7. file structure
 astro-sight calls --path <file> --function <name>  # 8. caller/callee relationships
 astro-sight imports --path <file>                  # 9. imports/exports
+astro-sight sequence --path <file> --function <name> # 10. ordered call flow (3+ interactions)
+astro-sight cochange --dir . --paths <file>        # 11. files that usually change together
+astro-sight lint --path <file> --rules rules.yaml  # 12. repeated structural policy
 printf '%s\n' \
   '{"command":"refs","name":"S","dir":"."}' \
   '{"command":"symbols","path":"src/main.rs"}' \
-  | astro-sight session                                  # 10. batch mixed queries
+  | astro-sight session                                  # 13. batch mixed queries
 ```
 
 ## Commands
@@ -116,6 +119,8 @@ astro-sight review --dir . --git --dead-scope touched-symbols              # onl
 ```
 
 Output: `impact` (ContextResult), `missing_cochanges`, `api_changes`, `dead_symbols`, `test_only_symbols` (public symbols referenced only from tests — review, don't auto-delete).
+
+Review in dependency order: contracts/types → implementation → callers → tests. Treat a finding as actionable only after AST evidence and a concrete failing scenario verify it; keep unverified concerns informational.
 
 **Blocking vs informational** (what `--hook` blocks on): unresolved `impact` from real call sites, `api_changes.removed` / `.modified`, and `dead_symbols`. Everything else is informational — `api_changes.added` / `.moved` (add/rm pair matched across files) / `.property_to_field` / `.removed_dead` (dead-code cleanup, not breakage) / `.modified_closed_in_diff` (all cross-file refs already updated in the same diff) / `.const_value_changes` (value-only const/static edits; blocking only with `--strict-public-const-values`) / `.compatible_modified` (signature string changed but call sites stay compatible: React HOC wrap, unreferenced object-member removal, trailing optional/default params in TS/Python; `reason` explains why), plus `missing_cochanges` and import-only impact (hook key `impact_info`).
 
@@ -257,5 +262,6 @@ printf '%s\n' \
 - `refs` respects `.gitignore`; results include `ctx` (source line) so no follow-up Read is needed. Use `refs --names` for symbol-only batches, `session` for mixed commands.
 - **Vendor/build exclusion** (`context` / `impact` / `review`): cross-file ref search skips package-manager trees (`vendor/`, `node_modules/`, `.venv/`, `Pods/`, `Carthage/`...) and build artifacts (`target/`, `build/`, `dist/`, `.build/`, `DerivedData/`, `.next/`, `bin/`, `obj/`...) so generic method names (`new`, `save`, `find`) don't flood `impacted_callers`. `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` opts back in; `.gitignore` / hidden exclusions are independent and always on. For non-default vendored trees (`pjproject-2.15/`, `third_party/`...) pass `--exclude-dir <NAME>` / `--exclude-glob <PATTERN>` (workspace-relative, negative-override); invalid globs fail up-front with `INVALID_REQUEST`.
 - **Input validation**: empty `--name` / `--names` / `--paths` / `--paths-file` rejected with `INVALID_REQUEST`; `--paths-file` capped at 100MB; `cochange` rejects out-of-range `--min-confidence` / negative smoothing priors; `--base` rejects values starting with `-` (blocks git option injection).
+- Batch `--paths` output preserves input order while retaining only `8 × rayon workers` pending results. A closed stdout stops processing at the current window instead of analyzing the remaining paths.
 - With `ASTRO_SIGHT_WORKSPACE`, session-relative `path` / `dir` resolve from the workspace root (invalid values fail closed). stdout broken pipes are handled gracefully (`symbols --dir src | head` won't panic).
 - **Large repos (10k+ files)**: `review --dir .` is the heaviest command (context + cochange + API diff + dead-code in one process) and can exhaust memory. Narrow `--dir` to a subtree, bound diff commands with `--base HEAD~N`, restrict with `--glob`, or split `review` into per-command runs (`impact` → `dead-code` → `cochange`). `symbols --path` is memory-light.

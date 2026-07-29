@@ -18,6 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::engine::bounded_read::read_utf8_file_limited;
 use crate::engine::refs::{LineIndex, absolute_position};
 use crate::models::reference::{RefKind, SymbolReference};
 
@@ -49,7 +50,7 @@ pub fn collect_angular_template_refs(dir: &Path) -> HashSet<String> {
         }
         match ext {
             "html" | "htm" => {
-                if let Ok(content) = std::fs::read_to_string(path) {
+                if let Some(content) = read_utf8_file_limited(path, MAX_TEMPLATE_FILE_SIZE) {
                     extract_template_refs(&content, &mut refs);
                     extract_element_selectors(&content, &mut used_element_selectors);
                 }
@@ -57,7 +58,7 @@ pub fn collect_angular_template_refs(dir: &Path) -> HashSet<String> {
             "ts" => {
                 // Angular component は `.component.ts` が標準だが、別名で
                 // @Component を使う場合もあるので拡張子のみで一括対応する。
-                if let Ok(content) = std::fs::read_to_string(path) {
+                if let Some(content) = read_utf8_file_limited(path, MAX_TEMPLATE_FILE_SIZE) {
                     extract_inline_template_refs(&content, &mut refs);
                     extract_inline_template_element_selectors(
                         &content,
@@ -94,7 +95,8 @@ fn is_angular_project(dir: &Path) -> bool {
         return true;
     }
     // package.json の `@angular/core` 依存だけで判定できれば dir walk を skip する。
-    if let Ok(pkg_json) = std::fs::read_to_string(dir.join("package.json"))
+    if let Some(pkg_json) =
+        read_utf8_file_limited(&dir.join("package.json"), MAX_TEMPLATE_FILE_SIZE)
         && pkg_json.contains("@angular/core")
     {
         return true;
@@ -719,7 +721,7 @@ pub fn find_angular_template_references_batch_with_context(
 
     // inline template: component `.ts` 内に式があるので、ts 座標へ変換して emit。
     for inl in &ctx.model.inline {
-        let Ok(ts_content) = std::fs::read_to_string(&inl.ts_path) else {
+        let Some(ts_content) = read_utf8_file_limited(&inl.ts_path, MAX_TEMPLATE_FILE_SIZE) else {
             continue;
         };
         let path_str = inl.ts_path.to_string_lossy().to_string();
@@ -736,7 +738,7 @@ pub fn find_angular_template_references_batch_with_context(
 
     // 外部 html: templateUrl で component に紐付くものだけ走査。
     for html_path in &ctx.model.linked_html {
-        let Ok(content) = std::fs::read_to_string(html_path) else {
+        let Some(content) = read_utf8_file_limited(html_path, MAX_TEMPLATE_FILE_SIZE) else {
             continue;
         };
         let path_str = html_path.to_string_lossy().to_string();
@@ -817,7 +819,7 @@ fn collect_component_templates(
         if !meta.is_file() || meta.len() > MAX_TEMPLATE_FILE_SIZE {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(path) else {
+        let Some(content) = read_utf8_file_limited(path, MAX_TEMPLATE_FILE_SIZE) else {
             continue;
         };
         // component 紐付けの担保: `@Component` を含む .ts のみを対象にする。
