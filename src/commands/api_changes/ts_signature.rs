@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use rayon::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::engine::parser;
 use crate::models::review::CompatibleApiModification;
@@ -288,6 +288,18 @@ pub(crate) fn detect_object_members_compatible_mod(
         .collect();
     if removed_members.is_empty() && !has_added_member && !has_added_record_entry {
         return None;
+    }
+    // 両側に残存するキーの値が変わっていれば破壊的なので blocking 維持。
+    // キー集合の差分だけを見ていると、`{a: () => {}}` → `{a: 42, b: () => {}}` のように
+    // 「既存キーの値の差し替え」と「無関係なキー追加」が同一 diff に同居した場合に
+    // 追加のみの変更として降格してしまう (呼び出し側の `a()` が実行時に壊れる)。
+    // 片側にしか無いキーは追加/削除であり、その可否は別途 removed_members 側で判定する。
+    for (key, old_value) in &old_keys.entry_values {
+        if let Some(new_value) = new_keys.entry_values.get(key)
+            && new_value != old_value
+        {
+            return None;
+        }
     }
     // 削除された schema キー (old にあって new にない)。各キーへの member access が repo
     // 全体で残っていれば破壊的なので blocking 維持。
@@ -802,6 +814,36 @@ pub(crate) fn ts_params_prefix_same_with_optional_tail(
 pub(crate) struct ObjectMemberKeys {
     pub(crate) member_keys: HashSet<String>,
     pub(crate) record_keys: Option<HashSet<String>>,
+    /// flat object のとき: top-level key → 値の正規化テキスト (空白を 1 個に畳んだもの)。
+    /// record のとき: (record key, member key) → nested 値の正規化テキスト。
+    ///
+    /// キー集合だけでは「既存キーの値が別物に差し替わった」破壊的変更
+    /// (`{a: () => {}}` → `{a: 42, b: () => {}}`) を検出できないため、
+    /// 両側に残存するキーの値同一性を照合する用途で持つ。
+    pub(crate) entry_values: HashMap<ObjectEntryKey, String>,
+}
+
+/// `entry_values` のキー。flat は top-level key 単独、record は (record key, member key)。
+pub(crate) type ObjectEntryKey = (String, Option<String>);
+
+/// 値ノードのソーステキストを、空白の連なりを 1 個の空白に畳んで正規化する。
+/// 整形 (prettier 等) の差分だけで破壊的変更と誤判定しないための最小限の正規化。
+fn normalized_value_text(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let raw = node.utf8_text(source).ok()?;
+    let mut out = String::with_capacity(raw.len());
+    let mut in_ws = false;
+    for ch in raw.chars() {
+        if ch.is_whitespace() {
+            in_ws = true;
+            continue;
+        }
+        if in_ws && !out.is_empty() {
+            out.push(' ');
+        }
+        in_ws = false;
+        out.push(ch);
+    }
+    Some(out)
 }
 
 /// TS/TSX/JS ソースから、トップレベル exported な `name` の初期化子 object literal の
@@ -854,6 +896,7 @@ pub(crate) fn collect_object_keys(
     source: &[u8],
 ) -> Option<ObjectMemberKeys> {
     let mut top_level_keys = HashSet::new();
+    let mut entry_values: HashMap<ObjectEntryKey, String> = HashMap::new();
     let mut record_member_keys: Option<HashSet<String>> = None;
     let mut has_object_value = false;
     let mut has_non_object_value = false;
@@ -862,12 +905,16 @@ pub(crate) fn collect_object_keys(
         match child.kind() {
             "pair" => {
                 let key = child.child_by_field_name("key")?;
-                top_level_keys.insert(object_key_text(key, source)?);
-                if let Some(value) = child.child_by_field_name("value")
-                    && let Some(nested) = unwrap_to_object_literal(value)
-                {
+                let key_text = object_key_text(key, source)?;
+                top_level_keys.insert(key_text.clone());
+                let value = child.child_by_field_name("value")?;
+                if let Some(nested) = unwrap_to_object_literal(value) {
                     has_object_value = true;
                     let nested_keys = collect_flat_object_keys(nested, source)?;
+                    // record は nested の member 単位で値を持つ。entry 全体をまとめて
+                    // 比較すると member キーの追加/削除だけで差分になり、本判定の
+                    // 目的 (未参照 member キーの削除を降格する) が成立しなくなる。
+                    collect_flat_object_values(nested, source, &key_text, &mut entry_values)?;
                     match &record_member_keys {
                         Some(existing) if existing != &nested_keys => return None,
                         Some(_) => {}
@@ -875,10 +922,14 @@ pub(crate) fn collect_object_keys(
                     }
                 } else {
                     has_non_object_value = true;
+                    entry_values.insert((key_text, None), normalized_value_text(value, source)?);
                 }
             }
             "shorthand_property_identifier" => {
-                top_level_keys.insert(child.utf8_text(source).ok()?.to_string());
+                // `{ foo }` は値が識別子そのもの。キー名と同一テキストになる。
+                let key_text = child.utf8_text(source).ok()?.to_string();
+                top_level_keys.insert(key_text.clone());
+                entry_values.insert((key_text.clone(), None), key_text);
                 has_non_object_value = true;
             }
             // spread は shape を静的確定できないので blocking
@@ -893,12 +944,45 @@ pub(crate) fn collect_object_keys(
         return Some(ObjectMemberKeys {
             member_keys: record_member_keys?,
             record_keys: Some(top_level_keys),
+            entry_values,
         });
     }
     Some(ObjectMemberKeys {
         member_keys: top_level_keys,
         record_keys: None,
+        entry_values,
     })
+}
+
+/// record の 1 entry (nested object) から (record key, member key) → 値テキストを集める。
+/// nested object は再帰しない (`collect_flat_object_keys` と同じ 1 階層のみ)。
+fn collect_flat_object_values(
+    obj: tree_sitter::Node,
+    source: &[u8],
+    record_key: &str,
+    out: &mut HashMap<ObjectEntryKey, String>,
+) -> Option<()> {
+    let mut cursor = obj.walk();
+    for child in obj.named_children(&mut cursor) {
+        match child.kind() {
+            "pair" => {
+                let key = child.child_by_field_name("key")?;
+                let member = object_key_text(key, source)?;
+                let value = child.child_by_field_name("value")?;
+                out.insert(
+                    (record_key.to_string(), Some(member)),
+                    normalized_value_text(value, source)?,
+                );
+            }
+            "shorthand_property_identifier" => {
+                let member = child.utf8_text(source).ok()?.to_string();
+                out.insert((record_key.to_string(), Some(member.clone())), member);
+            }
+            "spread_element" => return None,
+            _ => {}
+        }
+    }
+    Some(())
 }
 
 /// flat object として 1 階層分の property キーだけを抽出する。nested object を再帰しない。

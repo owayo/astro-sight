@@ -10216,6 +10216,145 @@ fn detect_object_members_removed_referenced_key_stays_blocking() {
     );
 }
 
+/// flat object で「既存キーの値の差し替え」と「無関係なキー追加」が同一 diff に同居する
+/// ケース。キー集合の差分だけを見ていると追加のみの変更として降格され、呼び出し側の
+/// `handlers.onSave()` が実行時に壊れる (false negative)。
+#[test]
+fn detect_object_members_value_change_with_added_key_stays_blocking() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "handlers.ts",
+                "export const handlers = { onSave: () => save() };\nfunction save() {}\n",
+            ),
+            (
+                "user.ts",
+                "import { handlers } from './handlers';\nhandlers.onSave();\n",
+            ),
+        ],
+        "initial",
+    );
+    // onSave が function → number に差し替わり、同時に無関係な onLoad が増える
+    fs::write(
+        repo.join("handlers.ts"),
+        "export const handlers = { onSave: 42, onLoad: () => load() };\nfunction save() {}\nfunction load() {}\n",
+    )
+    .expect("write");
+    let result = detect_object_members_compatible_mod(
+        &CompatibleModSite {
+            dir: repo.to_str().expect("utf-8 path"),
+            base: "HEAD",
+            old_path: "handlers.ts",
+            new_path: "handlers.ts",
+            name: "handlers",
+            kind: "constant",
+            old_sig: "old",
+            new_sig: "new",
+            lang_id: Some(crate::language::LangId::Typescript),
+        },
+        &mut SignatureSourceCache::default(),
+    );
+    assert!(
+        result.is_none(),
+        "残存キー onSave の値が変わっている → キー追加が同居していても blocking 維持"
+    );
+}
+
+/// record でも、両側に残存する (record key, member key) の値が変わっていれば blocking。
+/// `google.label` は参照されており、callable → 数値の差し替えは破壊的。
+#[test]
+fn detect_object_members_record_retained_member_value_change_stays_blocking() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "config.tsx",
+                "export const providerConfig = {\n  google: { label: () => 'G', bgColor: 'green' },\n};\n",
+            ),
+            (
+                "App.tsx",
+                "import { providerConfig } from './config';\nexport const x = providerConfig.google.label();\n",
+            ),
+        ],
+        "initial",
+    );
+    // label が callable → 数値。同時に record entry を 1 件追加する
+    fs::write(
+        repo.join("config.tsx"),
+        "export const providerConfig = {\n  google: { label: 42, bgColor: 'green' },\n  github: { label: () => 'H', bgColor: 'black' },\n};\n",
+    )
+    .expect("write");
+    let result = detect_object_members_compatible_mod(
+        &CompatibleModSite {
+            dir: repo.to_str().expect("utf-8 path"),
+            base: "HEAD",
+            old_path: "config.tsx",
+            new_path: "config.tsx",
+            name: "providerConfig",
+            kind: "constant",
+            old_sig: "old",
+            new_sig: "new",
+            lang_id: Some(crate::language::LangId::Tsx),
+        },
+        &mut SignatureSourceCache::default(),
+    );
+    assert!(
+        result.is_none(),
+        "残存 record entry google.label の値が変わっている → blocking 維持"
+    );
+}
+
+/// record entry の純粋追加 (既存 entry の値は不変) は従来どおり降格する。
+/// 上の値変更テストと対で、値照合が過剰に blocking へ倒れていないことを固定する。
+#[test]
+fn detect_object_members_record_pure_entry_addition_is_compatible() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "config.tsx",
+                "export const providerConfig = {\n  google: { label: 'G' },\n};\n",
+            ),
+            (
+                "App.tsx",
+                "import { providerConfig } from './config';\nexport const x = providerConfig.google.label;\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("config.tsx"),
+        "export const providerConfig = {\n  google: { label: 'G' },\n  github: { label: 'H' },\n};\n",
+    )
+    .expect("write");
+    let result = detect_object_members_compatible_mod(
+        &CompatibleModSite {
+            dir: repo.to_str().expect("utf-8 path"),
+            base: "HEAD",
+            old_path: "config.tsx",
+            new_path: "config.tsx",
+            name: "providerConfig",
+            kind: "constant",
+            old_sig: "old",
+            new_sig: "new",
+            lang_id: Some(crate::language::LangId::Tsx),
+        },
+        &mut SignatureSourceCache::default(),
+    );
+    let compat = result.expect("既存 entry が不変なら record entry 追加は compatible");
+    assert_eq!(compat.reason, "unused_object_members");
+}
+
 /// key 集合が完全一致する initializer 値のみ変更は unused_object_members ではないため
 /// blocking 維持。
 #[test]
@@ -12086,6 +12225,64 @@ fn reconcile_with_moves_pairs_by_signature() {
     assert_eq!(moved[0].name, "foo");
     assert_eq!(moved[0].from, "old.py");
     assert_eq!(moved[0].to, "new.py");
+}
+
+/// `kept_removed` は入力順を保つ。以前は removed を HashMap にバケット化して
+/// `into_values()` で回収していたため、RandomState の反復順がそのまま
+/// `api.rm` / `removed_dead` の並びになり、実行ごとに順序が変わっていた
+/// (snapshot 比較とトリアージ結果の再現性が壊れる)。
+#[test]
+fn reconcile_with_moves_preserves_removed_input_order() {
+    let names = [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+    ];
+    let removed: Vec<ApiSymbolCandidate> = names
+        .iter()
+        .map(|n| ApiSymbolCandidate {
+            name: (*n).into(),
+            kind: "function".into(),
+            file: "lib.ts".into(),
+            signature: format!("export function {n}()"),
+        })
+        .collect();
+
+    // ペアになる add が無いので全件 kept_removed に残り、順序は入力どおりであるべき。
+    // HashMap 反復順に依存していると 1 プロセス内でも実行ごとに変わりうるため、
+    // 同一プロセス内で繰り返し呼んで安定性も見る。
+    for _ in 0..8 {
+        let (_, kept_removed, moved) =
+            reconcile_with_moves(Vec::new(), removed.clone(), Vec::new());
+        assert!(moved.is_empty());
+        let got: Vec<&str> = kept_removed.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(got, names, "kept_removed は removed の入力順を保つべき");
+    }
+}
+
+/// ペア化された removed だけが除外され、残りは入力順のまま残る。
+#[test]
+fn reconcile_with_moves_preserves_order_around_matched_entries() {
+    let removed: Vec<ApiSymbolCandidate> = ["a", "b", "c", "d"]
+        .iter()
+        .map(|n| ApiSymbolCandidate {
+            name: (*n).into(),
+            kind: "function".into(),
+            file: "old.ts".into(),
+            signature: format!("export function {n}()"),
+        })
+        .collect();
+    // 真ん中の `b` だけが移動先で見つかる
+    let added = vec![ApiSymbolCandidate {
+        name: "b".into(),
+        kind: "function".into(),
+        file: "new.ts".into(),
+        signature: "export function b()".into(),
+    }];
+
+    let (_, kept_removed, moved) = reconcile_with_moves(added.clone(), removed, added);
+    assert_eq!(moved.len(), 1);
+    assert_eq!(moved[0].name, "b");
+    let got: Vec<&str> = kept_removed.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(got, ["a", "c", "d"], "相殺分だけ抜けて順序は保たれる");
 }
 
 #[test]

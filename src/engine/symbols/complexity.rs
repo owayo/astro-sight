@@ -105,6 +105,8 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
             "ternary_expression",
             "catch_clause",
         ],
+        // `match` 文 (PEP 634) は `match_statement` + arm ごとの `case_clause`。
+        // 双方欠けていたため match だけを持つ関数がベース 1 のまま返っていた。
         LangId::Python => &[
             "if_statement",
             "elif_clause",
@@ -112,13 +114,24 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
             "while_statement",
             "except_clause",
             "conditional_expression",
+            "match_statement",
+            "case_clause",
         ],
+        // tree-sitter-go の switch は種別ごとにノード名が分かれる
+        // (`expression_switch_statement` / `type_switch_statement` / `select_statement`) で、
+        // arm も `expression_case` / `type_case` / `communication_case` と別名。
+        // 旧テーブルの `case_clause` は Go に存在せず (Python 側のノード名)、
+        // 最も一般的な plain switch は文自体も arm も 0 計上だった。
+        // `default_case` は暗黙の fall-through 経路なので JS/PHP/Ruby と同様に数えない。
         LangId::Go => &[
             "if_statement",
             "for_statement",
-            "select_statement",
+            "expression_switch_statement",
             "type_switch_statement",
-            "case_clause",
+            "select_statement",
+            "expression_case",
+            "type_case",
+            "communication_case",
         ],
         LangId::Java => &[
             "if_statement",
@@ -190,17 +203,30 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
             "catch_expression",
             "else_clause",
         ],
-        // 汎用パターン（C, C++, Swift, Bash 等）
-        _ => &[
+        // C/C++ は `do ... while` が `do_statement`、三項演算子が `conditional_expression`。
+        // 旧汎用スライスはどちらも持たず、これらだけを持つ関数がベース 1 のまま返っていた。
+        LangId::C | LangId::Cpp => &[
             "if_statement",
-            "if_expression",
             "for_statement",
-            "for_expression",
             "while_statement",
-            "while_expression",
+            "do_statement",
             "switch_statement",
             "case_statement",
+            "conditional_expression",
             "catch_clause",
         ],
+        // bash の `elif` は `elif_clause`、`case` の arm は `case_item`。
+        // 旧汎用スライスはどちらも持たず過小計上だった (`until` は `while_statement`
+        // として既に計上される)。`else_clause` は Python 同様に数えない。
+        LangId::Bash => &[
+            "if_statement",
+            "elif_clause",
+            "for_statement",
+            "while_statement",
+            "case_statement",
+            "case_item",
+        ],
+        // lexer-only 言語は AST を持たず calculate_complexity へ到達しない。
+        LangId::Xojo => &[],
     }
 }

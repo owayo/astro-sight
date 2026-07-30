@@ -143,7 +143,7 @@ Output: `imports` array with `src`, `ln`, `kind` (Import/Use/Include/Require), `
 
 ### `symbols` — Symbol Extraction
 
-Lists function/class/struct/enum definitions. Compact by default (name, kind, line) for token efficiency.
+Lists function/class/struct/enum definitions. Compact by default for token efficiency: `name`, `kind` (short form), `ln` (0-indexed), plus `cx` (cyclomatic complexity, functions/methods only) and `cn` (enclosing container name) when applicable.
 
 ```bash
 astro-sight symbols --path <file>            # single file
@@ -175,7 +175,7 @@ astro-sight cochange --dir . --git --base HEAD~10 --rename --copy  # track renam
 astro-sight cochange --dir . --git --base HEAD~5 --no-smoothing    # raw confidence (default prior alpha=1.0, beta=8.0)
 ```
 
-Output: `entries` with `file_a`, `file_b`, `co_changes`, `confidence`, `denominator` (|C|), `score` (smoothed); `commits_analyzed` reports |C|. Requires `--git` or `--paths` / `--paths-file` (default `--base` is HEAD~1). `--min-confidence` must be finite in `0.0..=1.0`; smoothing priors finite non-negative. Default `--git` source collection skips vendor / node_modules / dist / lock / minified assets; explicit `--paths` are kept as-is.
+Output: `entries` with `file_a`, `file_b`, `co_changes`, `confidence`, `denominator` (|C|), `score` (smoothed); `commits_analyzed` reports |C|. Requires `--git` or `--paths` / `--paths-file` (default `--base` is HEAD~1). `--min-confidence` must be finite in `0.0..=1.0`; smoothing priors finite non-negative. Default `--git` source collection skips vendor / node_modules / dist / lock / minified assets; explicit `--paths` are kept as-is. Source paths must stay under `--dir` — `..`, absolute, and drive-qualified paths are rejected with `PATH_OUT_OF_BOUNDS`.
 
 Noise-suppression defaults (each has a flag to loosen): top 10 candidates per source file (`--per-source-limit`), pairs need ≥2 shared commits (`--min-samples`), merge commits excluded (`--include-merges` restores), same-author commits within 7 days collapse into one unit (`--author-unit-window-days`), commits touching >100 files skipped (`--max-files-per-commit`). If expected pairs are missing, loosen these before distrusting the data.
 

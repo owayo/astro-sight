@@ -977,6 +977,113 @@ fn struct_has_no_complexity() {
     assert_eq!(get_complexity("struct Foo {}", LangId::Rust, "Foo"), None);
 }
 
+#[test]
+fn python_match_statement_complexity_counts_cases() {
+    // `match` (PEP 634) は match_statement=1 + case_clause=3 → 1+4=5。
+    // 旧テーブルは双方欠けており match だけの関数がベース 1 を返していた。
+    let src = r#"
+def only_match(x):
+    match x:
+        case 1: return "a"
+        case 2: return "b"
+        case _: return "c"
+"#;
+    assert_eq!(get_complexity(src, LangId::Python, "only_match"), Some(5));
+}
+
+#[test]
+fn go_expression_switch_complexity_counts_cases() {
+    // tree-sitter-go の plain switch は `expression_switch_statement` + `expression_case`。
+    // 旧テーブルは switch 自体を持たず、arm 名も Python の `case_clause` を誤って
+    // 書いていたため、switch だけの関数がベース 1 を返していた。
+    // switch=1 + case 2 件=2 (default_case は数えない) → 1+3=4
+    let src = r#"
+package main
+func beta(x int) int {
+	switch x {
+	case 1:
+		return 1
+	case 2:
+		return 2
+	default:
+		return 3
+	}
+}
+"#;
+    assert_eq!(get_complexity(src, LangId::Go, "beta"), Some(4));
+}
+
+#[test]
+fn go_type_switch_and_select_complexity_counts_arms() {
+    // type switch: type_switch_statement=1 + type_case=2 → 1+3=4
+    let type_switch = r#"
+package main
+func ts(i interface{}) {
+	switch i.(type) {
+	case int:
+		_ = i
+	case string:
+		_ = i
+	}
+}
+"#;
+    assert_eq!(get_complexity(type_switch, LangId::Go, "ts"), Some(4));
+
+    // select: select_statement=1 + communication_case=2 → 1+3=4
+    let select = r#"
+package main
+func sel(a chan int, b chan int) {
+	select {
+	case <-a:
+	case <-b:
+	default:
+	}
+}
+"#;
+    assert_eq!(get_complexity(select, LangId::Go, "sel"), Some(4));
+}
+
+#[test]
+fn c_do_while_and_ternary_complexity_is_counted() {
+    // 旧汎用スライスは `do_statement` / `conditional_expression` を持たず、
+    // これらだけを含む関数がベース 1 を返していた。
+    let do_while = "int only_do(int x) { do { x--; } while (x > 0); return x; }";
+    assert_eq!(get_complexity(do_while, LangId::C, "only_do"), Some(2));
+
+    let ternary = "int only_ternary(int x) { return x > 5 ? 1 : 2; }";
+    assert_eq!(get_complexity(ternary, LangId::C, "only_ternary"), Some(2));
+}
+
+#[test]
+fn cpp_do_while_and_ternary_complexity_is_counted() {
+    let src = "int f(int x) { do { x--; } while (x > 0); return x > 5 ? 1 : 2; }";
+    // do_statement=1 + conditional_expression=1 → 1+2=3
+    assert_eq!(get_complexity(src, LangId::Cpp, "f"), Some(3));
+}
+
+#[test]
+fn bash_elif_and_case_item_complexity_is_counted() {
+    // 旧汎用スライスは `elif_clause` / `case_item` を持たず過小計上だった。
+    // if=1 + elif=1 + case=1 + case_item 2 件=2 + while=1 + for=1 + until(=while_statement)=1
+    // → 1+8=9 (else_clause は Python 同様に数えない)
+    let src = r#"
+f() {
+  if [ "$1" = a ]; then echo a
+  elif [ "$1" = b ]; then echo b
+  else echo c
+  fi
+  case "$2" in
+    x) echo x ;;
+    y) echo y ;;
+  esac
+  while true; do break; done
+  for i in 1 2; do echo $i; done
+  until false; do break; done
+}
+"#;
+    assert_eq!(get_complexity(src, LangId::Bash, "f"), Some(9));
+}
+
 // --- is_override_method テスト ---
 
 fn check_override(source: &str, lang_id: LangId, symbol_name: &str) -> bool {

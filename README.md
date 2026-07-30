@@ -143,7 +143,7 @@ astro-sight ast --path src/main.rs --line 10 --col 0 --depth 5 --context 5
 ### symbols - シンボル抽出
 
 ```bash
-# ファイル内の関数・構造体・クラス等を一覧（compact: name, kind(短縮形), ln のみ）
+# ファイル内の関数・構造体・クラス等を一覧（compact 出力）
 astro-sight symbols --path src/main.rs
 
 # docstring 付き compact 出力
@@ -158,6 +158,27 @@ astro-sight symbols --dir src/
 # glob でフィルタ
 astro-sight symbols --dir src/ --glob "**/*.rs"
 ```
+
+compact 出力例:
+```json
+{
+  "path": "src/service.rs",
+  "lang": "rust",
+  "symbols": [
+    { "name": "AppService", "kind": "struct", "ln": 23 },
+    { "name": "default", "kind": "fn", "ln": 40, "cx": 1, "cn": "AppService" }
+  ]
+}
+```
+
+| フィールド | 意味 |
+|---|---|
+| `name` | シンボル名 |
+| `kind` | 種別の短縮形（`fn` / `method` / `class` / `struct` / `enum` / `iface` / `trait` / `var` / `const` / `mod` / `import` / `type` / `field` / `param`） |
+| `ln` | 定義行（0-indexed） |
+| `cx` | 循環的複雑度。関数/メソッドのみ付与（ベース 1 + 分岐ノード数、ネスト関数/クロージャの分岐は除外） |
+| `cn` | enclosing container 名。`impl Default for AppService` の中のメソッドなら `AppService`。同名メソッドの見分けに使う |
+| `doc` | docstring（`--doc` 指定時のみ） |
 
 ### calls - コールグラフ抽出
 
@@ -483,7 +504,7 @@ astro-sight cochange --dir . --paths src/service.rs
 astro-sight cochange --dir . --git --base HEAD~10 --rename --copy
 ```
 
-`--paths-file` は 100MB 上限付きで読み込まれ、空リストは `INVALID_REQUEST` を返す。`--min-confidence` は有限な `0.0..=1.0`、`--smoothing-alpha` / `--smoothing-beta` は有限な非負値のみ受け付ける。
+`--paths-file` は 100MB 上限付きで読み込まれ、空リストは `INVALID_REQUEST` を返す。`--min-confidence` は有限な `0.0..=1.0`、`--smoothing-alpha` / `--smoothing-beta` は有限な非負値のみ受け付ける。`--paths` / `--paths-file` で渡すソースファイルは `--dir` 配下の相対パスである必要があり、`..` を含むパス・絶対パス・Windows のドライブ修飾パスは `PATH_OUT_OF_BOUNDS` で拒否される。
 
 ### doctor - 対応言語チェック
 

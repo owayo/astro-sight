@@ -132,12 +132,17 @@ pub(crate) fn detect_missing_cochanges(
         }
     }
 
-    // confidence 降順でソートし最大10件に制限
+    // confidence 降順でソートし最大10件に制限。
+    // confidence は量子化されるため同値が並びやすく、confidence だけの stable sort だと
+    // HashMap (RandomState) の反復順が同値グループ内にそのまま残る。truncate(10) が
+    // 実行ごとに違う部分集合を落とすことになるので、file / expected_with で全順序にする。
     let mut missing: Vec<MissingCochange> = best.into_values().collect();
     missing.sort_by(|a, b| {
         b.confidence
             .partial_cmp(&a.confidence)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.expected_with.cmp(&b.expected_with))
     });
     missing.truncate(10);
     Ok(missing)
@@ -1106,14 +1111,18 @@ pub(crate) fn reconcile_with_moves(
     use std::collections::VecDeque;
 
     // 1) removed を (name, kind, signature) でバケット化。
-    let mut removed_bucket: HashMap<(String, String, String), VecDeque<ApiSymbolCandidate>> =
-        HashMap::new();
-    for sym in removed {
+    //    バケットには候補そのものではなく `removed` 内の index を積む。値を持たせて
+    //    最後に `into_values()` で回収すると HashMap (RandomState) の反復順がそのまま
+    //    出力順になり、api.rm / removed_dead の並びが実行ごとに変わってしまう
+    //    (決定論的出力の前提が崩れ、snapshot 比較とトリアージ結果の再現性が壊れる)。
+    let mut removed_bucket: HashMap<(String, String, String), VecDeque<usize>> = HashMap::new();
+    for (i, sym) in removed.iter().enumerate() {
         removed_bucket
             .entry((sym.name.clone(), sym.kind.clone(), sym.signature.clone()))
             .or_default()
-            .push_back(sym);
+            .push_back(i);
     }
+    let mut removed_matched = vec![false; removed.len()];
 
     // 2) 新規候補を順に走査して removed と突き合わせ、`moved` を組み立てる。
     //    同じ (name, kind, signature, file) の重複候補は最初の 1 件だけ扱う。
@@ -1139,16 +1148,18 @@ pub(crate) fn reconcile_with_moves(
         }
         let bucket_key = (new.name.clone(), new.kind.clone(), new.signature.clone());
         if let Some(bucket) = removed_bucket.get_mut(&bucket_key)
-            && let Some(rm) = bucket.pop_front()
+            && let Some(rm_ix) = bucket.pop_front()
         {
+            let rm = &removed[rm_ix];
+            removed_matched[rm_ix] = true;
             matched_new_files
                 .entry(bucket_key)
                 .or_default()
                 .insert(new.file.clone());
             moved.push(MovedSymbol {
-                name: rm.name,
-                kind: rm.kind,
-                from: rm.file,
+                name: rm.name.clone(),
+                kind: rm.kind.clone(),
+                from: rm.file.clone(),
                 to: new.file.clone(),
             });
         }
@@ -1166,10 +1177,11 @@ pub(crate) fn reconcile_with_moves(
         })
         .collect();
 
-    // 4) ペア化されなかった `removed` を集める。
-    let kept_removed: Vec<ApiSymbolCandidate> = removed_bucket
-        .into_values()
-        .flat_map(|bucket| bucket.into_iter())
+    // 4) ペア化されなかった `removed` を、入力順のまま集める。
+    let kept_removed: Vec<ApiSymbolCandidate> = removed
+        .into_iter()
+        .zip(removed_matched)
+        .filter_map(|(sym, matched)| (!matched).then_some(sym))
         .collect();
 
     (kept_added, kept_removed, moved)
@@ -2928,7 +2940,12 @@ pub(crate) fn detect_python_property_to_field(
     if member.contains('.') {
         return None;
     }
-    for new_path in diff_new_paths {
+    // 複数の新規ファイルが同名クラス・同名フィールドを持つ場合に「最初の 1 件」を
+    // 決めるため、パス昇順で走査する。`diff_new_paths` は HashSet なので、そのまま
+    // 反復すると実行ごとに違うファイルが報告先になる。
+    let mut candidates: Vec<&String> = diff_new_paths.iter().collect();
+    candidates.sort_unstable();
+    for new_path in candidates {
         if !std::path::Path::new(new_path)
             .extension()
             .and_then(|s| s.to_str())

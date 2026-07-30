@@ -651,6 +651,23 @@ impl AppService {
         }
 
         let canonical_dir = self.validate_dir(dir)?;
+
+        // source_files は git の pathspec として `--` の後ろに渡るためオプション注入は
+        // 起きないが、`../` を含むと canonical_dir (= サンドボックス配下に検証済み) の
+        // 外にある同一リポジトリ内のファイルを blame できてしまう。dir 検証と同じ場所で
+        // 「dir 配下の相対パス」に閉じる (他のパス系 API と検証系列を揃える)。
+        for f in &opts.source_files {
+            if !is_contained_relative(f) {
+                bail!(AstroError::new(
+                    ErrorCode::PathOutOfBounds,
+                    format!(
+                        "source_files must be a relative path under --dir \
+                         (no '..', no absolute or drive-qualified prefix): {f}"
+                    ),
+                ));
+            }
+        }
+
         let dir_str = canonical_dir.to_string_lossy();
 
         let result = crate::engine::cochange::analyze_cochange(&dir_str, opts)?;
@@ -667,6 +684,23 @@ impl AppService {
 // ---------------------------------------------------------------------------
 // 入力検証ヘルパー
 // ---------------------------------------------------------------------------
+
+/// `--dir` 基準の相対パスとして安全かを字句レベルで判定する。
+///
+/// `..` (ParentDir) / `/` (RootDir) / Windows のドライブ修飾 (Prefix, `C:foo` 含む) を
+/// `Path::components()` の 1 判定でまとめて弾く。文字列 prefix 判定では
+/// `C:foo` のような drive-relative 形式を取りこぼすため components を使う。
+///
+/// blame は base リビジョン側の履歴を辿るので、working tree に実体が無い
+/// (base 時点にしか存在しない) ファイルも正当な入力になる。したがって
+/// canonicalize による実在確認は行わない。
+fn is_contained_relative(p: &str) -> bool {
+    use std::path::Component;
+    !p.is_empty()
+        && Path::new(p)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
 
 /// `--exclude-glob` の構文を `ignore::overrides::OverrideBuilder` で先行検証する。
 ///
@@ -756,6 +790,64 @@ fn collect_error_nodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_contained_relative_accepts_plain_relative_paths() {
+        assert!(is_contained_relative("src/main.rs"));
+        assert!(is_contained_relative("main.rs"));
+        // `./` 始まりは CurDir コンポーネントなので許可する
+        assert!(is_contained_relative("./src/main.rs"));
+        assert!(is_contained_relative("a/./b.rs"));
+        // 名前に `..` を含むだけのパスは ParentDir ではない
+        assert!(is_contained_relative("src/..hidden.rs"));
+        assert!(is_contained_relative("src/a..b.rs"));
+    }
+
+    #[test]
+    fn is_contained_relative_rejects_escapes() {
+        // 空文字
+        assert!(!is_contained_relative(""));
+        // 親ディレクトリ参照 (先頭・途中いずれも)
+        assert!(!is_contained_relative(".."));
+        assert!(!is_contained_relative("../secret.rs"));
+        assert!(!is_contained_relative("src/../../secret.rs"));
+        // POSIX 絶対パス
+        assert!(!is_contained_relative("/etc/passwd"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn is_contained_relative_rejects_windows_drive_paths() {
+        // ドライブ修飾は Prefix コンポーネントになる。`C:foo` (drive-relative) も
+        // Path::join が self を置換するため拒否する必要がある。
+        assert!(!is_contained_relative(r"C:\Windows\System32"));
+        assert!(!is_contained_relative("C:/Windows/System32"));
+        assert!(!is_contained_relative("C:foo"));
+        assert!(!is_contained_relative(r"\\server\share\x"));
+    }
+
+    /// sandbox 内から `../` で外部ファイルを blame できてしまう抜け道を塞ぐ。
+    /// dir だけを検証していた頃は git の pathspec が cwd 基準で解決され、
+    /// dir の外にある同一リポジトリ内ファイルの存在有無・共変更が漏れていた。
+    #[test]
+    fn cochange_rejects_source_files_outside_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let service = AppService::sandboxed(sub.clone()).unwrap();
+        let opts = crate::models::cochange::CoChangeOptions {
+            source_files: vec!["../outside.rs".to_string()],
+            ..Default::default()
+        };
+        let err = service
+            .analyze_cochange(".", &opts)
+            .expect_err("../ を含む source_files は拒否されるべき");
+        assert!(
+            err.to_string().contains("PATH_OUT_OF_BOUNDS"),
+            "PathOutOfBounds で失敗すべき: {err}"
+        );
+    }
 
     /// 制限なしサービスの生成
     #[test]
