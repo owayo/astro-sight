@@ -177,6 +177,15 @@ fn cpp_free_function_is_exported() {
     ));
 }
 
+#[test]
+fn ruby_simple_case_fold_unicode_identifiers_are_extracted() {
+    let symbols = syms_of("def claſs\n  1\nend\n\ndef breaK\n  2\nend\n", LangId::Ruby);
+    let names: Vec<&str> = symbols.iter().map(|symbol| symbol.name.as_str()).collect();
+
+    assert!(names.contains(&"claſs"));
+    assert!(names.contains(&"breaK"));
+}
+
 // --- Ruby: 循環的複雑度の二重計上回帰 ---
 
 #[test]

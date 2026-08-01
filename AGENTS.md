@@ -6,6 +6,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 - **AppService 層** — CLI / Session / MCP の統一コアロジック（`src/service.rs`）
 - **tree-sitter** ベースの構文解析エンジン（16言語対応）
+- **Ruby Unicode 識別子** — simple case folding の対象となる `ſ` / `K` などを含むメソッド名を tree-sitter で正しく抽出する
 - **手書き lexer** バックエンド（`src/engine/lexer.rs`）。tree-sitter で OOM する言語向けの fallback として v26.6 で導入。現状 Xojo を lexer-only でサポート（`symbols` / `refs` / `dead-code` のみ動作、`calls` / `imports` / `ast` / `lint` / `sequence` は `UNSUPPORTED_LANGUAGE` を返す）。modifier ループは複数修飾子を順番に消費する（`Public Shared Sub Foo()` のような可視性 + Shared/Static 併記の標準記法を `Shared` 消費後に定義 keyword と突き合わせる、v26.6.110）。同一 keyword の重複は consumed リストで除外して病的入力でも無限ループしない
 - **BLAKE3** ベースのファイルキャッシュ（単一ファイル `ast` / `symbols` は内容ハッシュに canonical path と astro-sight バージョンを混ぜ、同一内容の別ファイルや別言語で `path` / `lang` が混線せず、バージョン更新時は解析ロジック/出力スキーマの変更に追従して旧キャッシュが自動失効する＝内容不変でも結果が変わるケースで stale を防ぐ。書き込みは同一ディレクトリ temp + rename の atomic 方式で、kill / 電源断でも truncated JSON が残らない。読み出しは末尾 `}` の軽量検証付きで、不正エントリは miss 扱い + 自己削除。`cmd_ast` / `cmd_symbols` は put 前に service が実際に解析した内容の hash (`response.hash`) と cache key の元になった read 内容の hash を照合し、2 回の read の間にファイルが更新された場合は put しない＝hash(旧内容)→output(新内容) の TOCTOU キャッシュ汚染を防ぐ）
 - **clap derive** による CLI 引数パーサー

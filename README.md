@@ -628,7 +628,7 @@ $ astro-sight ast --path nonexistent.rs
 | <img src="https://img.shields.io/badge/-F7A41D?logo=zig&logoColor=white" height="16"> Zig | `.zig`, `.zon` | `tree-sitter-zig` | 1.1 |
 | Xojo (lexer-only) | `.xojo_code`, `.xojo_window`, `.xojo_menu`, `.xojo_toolbar`, `.xojo_report`, `.rbbas` | 手書き lexer（built-in、v26.6 で導入） | - |
 
-上記 16 言語は tree-sitter クエリによる精密なシンボル抽出に対応。Xojo は tree-sitter ではなく手書き lexer による限定サポート: `symbols` / `refs` / `dead-code` のみ動作し、`calls` / `imports` / `ast` / `lint` / `sequence` は `UNSUPPORTED_LANGUAGE` エラーを返す。`context` / `impact` / `review` は changed file が Xojo のみの diff では cross-file 解析を skip する。`doctor` は Xojo を含めて計 17 言語を報告する。
+上記 16 言語は tree-sitter クエリによる精密なシンボル抽出に対応。Ruby は Unicode 識別子に対応し、simple case folding の対象となる `ſ` / `K` などを含むメソッド名も欠落なく抽出する。Xojo は tree-sitter ではなく手書き lexer による限定サポート: `symbols` / `refs` / `dead-code` のみ動作し、`calls` / `imports` / `ast` / `lint` / `sequence` は `UNSUPPORTED_LANGUAGE` エラーを返す。`context` / `impact` / `review` は changed file が Xojo のみの diff では cross-file 解析を skip する。`doctor` は Xojo を含めて計 17 言語を報告する。
 
 > **\* Kotlin バージョンについて:** `tree-sitter-kotlin` 0.3.8 以降は `links = "tree-sitter"` を宣言しており、コアクレート `tree-sitter` 0.26 と Cargo の native library リンク名が競合してビルドできない。現在は 0.3.5 系を利用している。
 >
