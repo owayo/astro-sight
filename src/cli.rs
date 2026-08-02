@@ -311,9 +311,18 @@ pub enum Commands {
         #[arg(long)]
         paths_file: Option<String>,
 
-        /// Minimum confidence threshold (0.0 to 1.0). Default: 0.3.
+        /// Minimum confidence threshold (0.0 to 1.0), applied to the raw
+        /// `co_changes / denominator` ratio. Default: 0.3.
         #[arg(short, long, default_value = "0.3")]
         min_confidence: f64,
+
+        /// Minimum smoothed `score` required per pair (0.0 = disabled, the default).
+        /// `score` is a shrinkage estimate used for ranking; gate on it only when you
+        /// explicitly want small-sample pairs suppressed. Note the ceiling is
+        /// `(denom + alpha) / (denom + alpha + beta)`, so with the default beta=8 a
+        /// source with 2 evidence commits can never exceed 0.27.
+        #[arg(long, default_value = "0.0")]
+        min_score: f64,
 
         /// Minimum shared commit count required per pair (default: 2)
         #[arg(long, default_value = "2")]
@@ -393,10 +402,18 @@ pub enum Commands {
         #[arg(long, default_value = "8.0")]
         smoothing_beta: f64,
 
-        /// Skip source files whose blame commit set is smaller than this.
+        /// Skip source files whose evidence commit set is smaller than this.
         /// 0/1 = disabled (legacy behaviour). Default 2.
         #[arg(long, default_value = "2")]
         min_denominator: usize,
+
+        /// Fall back to `git log <base> -n N -- <file>` when changed-line blame cannot
+        /// produce `--min-denominator` commits for a source file (no diff against base,
+        /// pure-addition hunks only, or a single blame commit). `0` disables the fallback
+        /// and keeps blame-only behaviour. Default 20. Note this window is also the
+        /// confidence denominator for fallback sources, so widening it dilutes coupling.
+        #[arg(long, default_value = "20")]
+        history_limit: usize,
 
         /// Limit candidates per source file to top N (0 = unlimited).
         /// Default 10 to keep output focused.

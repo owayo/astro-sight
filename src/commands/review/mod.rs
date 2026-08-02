@@ -128,7 +128,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
         .collect();
 
     // 4. cochange 分析 → missing_cochanges 検出
-    let missing_cochanges = timed_ok("cochange", || {
+    let cochange_report = timed_ok("cochange", || {
         detect_missing_cochanges(service, dir, &changed_file_set, min_confidence, Some(base))
     })?;
 
@@ -153,7 +153,8 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
 
     let result = ReviewResult {
         impact,
-        missing_cochanges,
+        missing_cochanges: cochange_report.missing,
+        cochange_diagnostics: cochange_report.diagnostics,
         api_changes,
         dead_symbols,
         test_only_symbols,

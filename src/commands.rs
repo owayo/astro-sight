@@ -323,6 +323,8 @@ pub fn cmd_cochange(
         let result = CoChangeResult {
             entries: Vec::new(),
             commits_analyzed: 0,
+            // 解析自体を行っていないので診断は空 (出力からも省略される)。
+            diagnostics: Default::default(),
             skipped: Some(skip),
         };
         let output = serialize_output(&result, pretty)?;

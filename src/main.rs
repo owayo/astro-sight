@@ -526,7 +526,7 @@ fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Re
 }
 
 /// `cochange` サブコマンドの処理。`BlameSourceResolution` の解決、`ignore_merges` の等価簡約、
-/// 21 フィールドの `CoChangeOptions` 構築を担う。`dispatch_command` の 1 arm が肥大化するのを
+/// 23 フィールドの `CoChangeOptions` 構築を担う。`dispatch_command` の 1 arm が肥大化するのを
 /// 避けるため variant ごと受け取り内部で destructure する。
 fn dispatch_cochange(service: &AppService, command: Commands, pretty: bool) -> Result<()> {
     let Commands::Cochange {
@@ -536,6 +536,7 @@ fn dispatch_cochange(service: &AppService, command: Commands, pretty: bool) -> R
         paths,
         paths_file,
         min_confidence,
+        min_score,
         min_samples,
         max_files_per_commit,
         commit_size_pivot,
@@ -554,6 +555,7 @@ fn dispatch_cochange(service: &AppService, command: Commands, pretty: bool) -> R
         smoothing_alpha,
         smoothing_beta,
         min_denominator,
+        history_limit,
         per_source_limit,
         author_unit_window_days,
     } = command
@@ -579,6 +581,7 @@ fn dispatch_cochange(service: &AppService, command: Commands, pretty: bool) -> R
         source_files,
         base,
         min_confidence,
+        min_score,
         min_samples,
         max_files_per_commit,
         commit_size_pivot,
@@ -593,6 +596,7 @@ fn dispatch_cochange(service: &AppService, command: Commands, pretty: bool) -> R
         smoothing_beta,
         disable_smoothing: no_smoothing,
         min_denominator,
+        history_limit,
         per_source_limit,
         author_unit_window_days,
     };

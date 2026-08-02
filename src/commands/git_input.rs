@@ -94,12 +94,17 @@ pub fn resolve_blame_source_files(
         }
     }
 
-    if set.is_empty() {
+    if set.is_empty() && !git {
+        // 起点の指定手段が 1 つも無い = 利用者の入力エラー。
         anyhow::bail!(crate::error::AstroError::new(
             crate::error::ErrorCode::InvalidRequest,
             "blame mode requires source files: pass --git, --paths, or --paths-file".to_string(),
         ));
     }
+    // `--git` があって空になるのは「差分が無い」か「差分が全て除外 glob (vendor/dist/
+    // ロック等) に該当した」ケース。どちらも入力エラーではなく解析対象なしなので、
+    // exit 1 ではなく空結果 (entries: [], commits_analyzed: 0) に倒す。
+    // 生成物だけを触ったコミットで review / cochange 全体が落ちるのを防ぐ。
     Ok(BlameSourceResolution::Files(set.into_iter().collect()))
 }
 

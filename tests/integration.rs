@@ -1615,6 +1615,107 @@ fn cochange_blame_runs_with_explicit_paths() {
     assert!(json["commits_analyzed"].as_u64().is_some());
 }
 
+/// CLI 表面: `--min-score` / `--history-limit` が受理され、`diagnostics` が
+/// JSON に出ること。0 件でも「共変更なし」と「解析できなかった」を区別できる。
+#[test]
+fn cochange_cli_exposes_min_score_history_limit_and_diagnostics() {
+    let output = cargo_bin()
+        .args([
+            "cochange",
+            "--dir",
+            ".",
+            "--paths",
+            "src/main.rs",
+            "--min-score",
+            "0.0",
+            "--history-limit",
+            "5",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let diag = &json["diagnostics"];
+    assert_eq!(
+        diag["sources_requested"].as_u64(),
+        Some(1),
+        "起点 1 件が診断に出ること: {json}"
+    );
+    // history_limit=5 の fallback が効いて証拠が作られる (CI の shallow clone では
+    // 履歴が浅く 0 件もあり得るため、キーの存在だけを固定する)
+    assert!(diag["sources_with_history_evidence"].as_u64().is_some());
+    assert!(diag["sources_with_blame_evidence"].as_u64().is_some());
+}
+
+/// `--min-score` は 0.0..=1.0 の範囲外を拒否する (min_confidence と同じ検証系列)。
+#[test]
+fn cochange_rejects_out_of_range_min_score() {
+    let output = cargo_bin()
+        .args([
+            "cochange",
+            "--dir",
+            ".",
+            "--paths",
+            "src/main.rs",
+            "--min-score",
+            "1.5",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(!output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let msg = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("min_score"),
+        "min_score の範囲エラーが返るべき: {msg}"
+    );
+}
+
+/// `--git` 指定で差分が全て除外 glob (vendor/dist 等) に該当した場合は、
+/// 入力エラーではなく「解析対象なし」として exit 0 + 空結果を返す。
+/// 生成物だけを触ったコミットで cochange / review 全体が落ちないようにする。
+#[test]
+fn cochange_git_with_only_excluded_files_returns_empty_not_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(repo.join("seed.rs"), "// seed\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "seed"]);
+    // HEAD で vendor/ 配下だけを変更 (既定除外 glob に全件該当)
+    std::fs::create_dir_all(repo.join("vendor")).unwrap();
+    std::fs::write(repo.join("vendor/lib.php"), "<?php\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "vendor only"]);
+
+    let output = cargo_bin()
+        .args(["cochange", "--dir", repo.to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "全件除外は exit 0 であるべき。stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["entries"].as_array().map(Vec::len), Some(0));
+    assert_eq!(json["commits_analyzed"].as_u64(), Some(0));
+}
+
 #[test]
 fn cochange_rejects_missing_source_files() {
     // --git / --paths のいずれも指定しない場合は InvalidRequest で拒否される。

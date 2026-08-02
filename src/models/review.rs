@@ -1,5 +1,6 @@
 use serde::Serialize;
 
+use super::cochange::CoChangeDiagnostics;
 use super::impact::ContextResult;
 use super::skip::SkipInfo;
 
@@ -13,6 +14,11 @@ use super::skip::SkipInfo;
 pub struct ReviewResult {
     pub impact: ContextResult,
     pub missing_cochanges: Vec<MissingCochange>,
+    /// cochange 解析の内訳。`missing_cochanges` が空のとき「変更漏れが無い」のか
+    /// 「起点の証拠を作れなかった / 閾値で落ちた」のかを区別するために付ける。
+    /// 解析自体を行わなかった場合は省略される。
+    #[serde(skip_serializing_if = "CoChangeDiagnostics::is_empty", default)]
+    pub cochange_diagnostics: CoChangeDiagnostics,
     pub api_changes: ApiChanges,
     pub dead_symbols: Vec<DeadSymbol>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]

@@ -55,19 +55,30 @@ pub(crate) fn is_dependency_manifest_pair(file_a: &str, file_b: &str) -> bool {
         .any(|(a, b)| (base_a == *a && base_b == *b) || (base_a == *b && base_b == *a))
 }
 
+/// `detect_missing_cochanges` の結果。0 件の理由を呼び出し側 (review) に伝えるため、
+/// 検出結果と解析の内訳を一緒に返す。
+#[derive(Debug)]
+pub(crate) struct MissingCochangeReport {
+    pub(crate) missing: Vec<MissingCochange>,
+    pub(crate) diagnostics: crate::models::cochange::CoChangeDiagnostics,
+}
+
 pub(crate) fn detect_missing_cochanges(
     service: &AppService,
     dir: &str,
     changed_files: &HashSet<String>,
     min_confidence: f64,
     base: Option<&str>,
-) -> Result<Vec<MissingCochange>> {
+) -> Result<MissingCochangeReport> {
     // review では blame モードで cochange を解析する。
     // 起点ファイル = 差分に登場したファイル。
     // ただし起点が無い (差分が空) ときは何もせず空を返す。
     let source_files: Vec<String> = changed_files.iter().cloned().collect();
     if source_files.is_empty() {
-        return Ok(Vec::new());
+        return Ok(MissingCochangeReport {
+            missing: Vec::new(),
+            diagnostics: Default::default(),
+        });
     }
     // review の差分取得で使った base を blame 解析にも渡し、複数コミット範囲の
     // review でも同じ変更範囲を対象にする。base 解決失敗や git 不在は engine 側で
@@ -89,7 +100,10 @@ pub(crate) fn detect_missing_cochanges(
             {
                 return Err(err);
             }
-            return Ok(Vec::new());
+            return Ok(MissingCochangeReport {
+                missing: Vec::new(),
+                diagnostics: Default::default(),
+            });
         }
     };
 
@@ -145,7 +159,10 @@ pub(crate) fn detect_missing_cochanges(
             .then_with(|| a.expected_with.cmp(&b.expected_with))
     });
     missing.truncate(10);
-    Ok(missing)
+    Ok(MissingCochangeReport {
+        missing,
+        diagnostics: cochange_result.diagnostics,
+    })
 }
 
 /// 内部用: reconcile のために signature を保持する一時構造。

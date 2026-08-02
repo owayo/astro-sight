@@ -9026,6 +9026,7 @@ fn build_review_hook_json_compatible_modified_is_informational() {
             skipped: None,
         },
         missing_cochanges: Vec::new(),
+        cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             added: Vec::new(),
             removed: Vec::new(),
@@ -9097,6 +9098,7 @@ fn build_review_hook_json_compatible_modified_impact_is_informational() {
             skipped: None,
         },
         missing_cochanges: Vec::new(),
+        cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             added: Vec::new(),
             removed: Vec::new(),
@@ -9183,6 +9185,7 @@ fn build_review_hook_json_mixed_compatible_and_breaking_impact_keeps_breaking_on
             skipped: None,
         },
         missing_cochanges: Vec::new(),
+        cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             added: Vec::new(),
             removed: Vec::new(),
@@ -12607,6 +12610,7 @@ fn build_review_hook_json_cochange_only_is_informational() {
             expected_with: "b.rs".to_string(),
             confidence: 0.9,
         }],
+        cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             added: Vec::new(),
             removed: Vec::new(),
@@ -12675,6 +12679,7 @@ fn build_review_hook_json_impact_info_only_is_informational() {
             skipped: None,
         },
         missing_cochanges: Vec::new(),
+        cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             added: Vec::new(),
             removed: Vec::new(),
@@ -12718,6 +12723,7 @@ fn build_review_hook_json_api_add_only_is_informational() {
             skipped: None,
         },
         missing_cochanges: Vec::new(),
+        cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             added: vec![ApiSymbol {
                 name: "foo".to_string(),
@@ -12769,6 +12775,7 @@ fn build_review_hook_json_api_add_carries_extraction_scope() {
             skipped: None,
         },
         missing_cochanges: Vec::new(),
+        cochange_diagnostics: Default::default(),
         api_changes,
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
@@ -12822,6 +12829,7 @@ fn build_review_hook_json_api_removed_is_blocking() {
             skipped: None,
         },
         missing_cochanges: Vec::new(),
+        cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             added: Vec::new(),
             removed: vec![ApiSymbol {
@@ -12858,6 +12866,7 @@ fn build_review_hook_json_api_modified_is_blocking() {
             skipped: None,
         },
         missing_cochanges: Vec::new(),
+        cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             added: Vec::new(),
             removed: Vec::new(),
@@ -12899,6 +12908,7 @@ fn build_review_hook_json_removed_dead_only_is_not_blocking() {
             skipped: None,
         },
         missing_cochanges: Vec::new(),
+        cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             added: Vec::new(),
             removed: Vec::new(),
@@ -12946,6 +12956,7 @@ fn build_review_hook_json_const_value_only_is_informational() {
             skipped: None,
         },
         missing_cochanges: Vec::new(),
+        cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             added: Vec::new(),
             removed: Vec::new(),
@@ -12987,6 +12998,7 @@ fn build_review_hook_json_const_value_is_blocking_under_strict() {
             skipped: None,
         },
         missing_cochanges: Vec::new(),
+        cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             added: Vec::new(),
             removed: Vec::new(),
@@ -13050,6 +13062,7 @@ fn build_review_hook_json_uses_changed_symbols_in_summary() {
             skipped: None,
         },
         missing_cochanges: Vec::new(),
+        cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             added: Vec::new(),
             removed: Vec::new(),
@@ -13128,6 +13141,7 @@ fn build_review_hook_json_filters_non_causal_affected_symbols_from_syms() {
             skipped: None,
         },
         missing_cochanges: Vec::new(),
+        cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             added: Vec::new(),
             removed: Vec::new(),
@@ -13200,6 +13214,7 @@ fn build_review_hook_json_added_only_caller_is_not_blocking() {
             skipped: None,
         },
         missing_cochanges: Vec::new(),
+        cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             added: Vec::new(),
             removed: Vec::new(),
@@ -13283,6 +13298,7 @@ fn build_review_hook_json_mixed_added_and_modified_keeps_only_modified() {
             skipped: None,
         },
         missing_cochanges: Vec::new(),
+        cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             added: Vec::new(),
             removed: Vec::new(),
@@ -13424,7 +13440,8 @@ fn detect_missing_cochanges_excludes_cargo_manifest_lock_pair() {
         0.3,
         None,
     )
-    .expect("detect_missing_cochanges should succeed");
+    .expect("detect_missing_cochanges should succeed")
+    .missing;
 
     assert!(
         missing.iter().all(|m| m.file != "Cargo.toml"),
@@ -13512,7 +13529,8 @@ fn detect_missing_cochanges_uses_review_base_for_multi_commit_ranges() {
         0.0,
         Some("HEAD~2"),
     )
-    .expect("detect_missing_cochanges should succeed");
+    .expect("detect_missing_cochanges should succeed")
+    .missing;
 
     assert!(
         missing.iter().any(|m| m.file == "b.rs"),

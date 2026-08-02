@@ -6,7 +6,8 @@ use rayon::prelude::*;
 
 use crate::error::{AstroError, ErrorCode};
 use crate::models::cochange::{
-    BLAME_DEFAULT_EXCLUDE_GLOBS, CoChangeEntry, CoChangeOptions, CoChangeResult,
+    BLAME_DEFAULT_EXCLUDE_GLOBS, CoChangeDiagnosticReason, CoChangeDiagnostics, CoChangeEntry,
+    CoChangeEvidence, CoChangeOptions, CoChangeResult,
 };
 use crate::models::skip::SkipInfo;
 
@@ -35,12 +36,17 @@ fn validate_revision(rev: &str, arg_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// entries なし・commits_analyzed 0 の空結果を返す。起点なし / blame 集合が空 /
+/// entries なし・commits_analyzed 0 の空結果を返す。起点なし / 証拠集合が空 /
 /// マージ除外後に空、の各早期 return で共用し、構築の重複を避ける。
-fn empty_cochange_result(skipped: Option<SkipInfo>) -> CoChangeResult {
+fn empty_cochange_result(
+    skipped: Option<SkipInfo>,
+    mut diagnostics: CoChangeDiagnostics,
+) -> CoChangeResult {
+    diagnostics.finalize();
     CoChangeResult {
         entries: Vec::new(),
         commits_analyzed: 0,
+        diagnostics,
         skipped,
     }
 }
@@ -53,9 +59,14 @@ fn empty_cochange_result(skipped: Option<SkipInfo>) -> CoChangeResult {
 ///
 /// 起点ファイルに密結合なペアだけが浮上するため、lookback 系より文脈依存性が高い。
 /// 大規模リポでも履歴全体を舐めずに済む。
+///
+/// 変更行 blame で `min_denominator` 分の証拠が作れない起点 (diff が無い / 純粋追加
+/// hunk のみ / 変更行が 1 コミットにしか遡れない) は、`history_limit > 0` のとき
+/// `git log <base> -n <limit> -- <file>` のファイル履歴を代替証拠にフォールバックする。
+/// base 側に存在しない新規追加ファイルは履歴が無いため起点にならない (診断に記録する)。
 pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeResult> {
     if opts.source_files.is_empty() {
-        return Ok(empty_cochange_result(None));
+        return Ok(empty_cochange_result(None, CoChangeDiagnostics::default()));
     }
     // 起点ファイル数の上限ガード (0 = 無制限)。暴走防止のため超過は明示的に停止する。
     if opts.max_source_files > 0 && opts.source_files.len() > opts.max_source_files {
@@ -98,27 +109,54 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
     // resolve_blame_source_files の検証を迂回しても安全側に倒れる。
     validate_revision(base_rev, "--base")?;
 
-    // Phase 1: 起点ファイルごとに blame で base コミット側の変更行 SHA を集める。
+    let mut diag = CoChangeDiagnostics {
+        sources_requested: opts.source_files.len(),
+        ..Default::default()
+    };
+    let min_denom = opts.min_denominator.max(1);
+
+    // Phase 1: 起点ファイルごとに証拠コミット集合を作る。
+    //          第一選択は変更行 blame、証拠が min_denominator に満たなければ履歴 fallback。
     //          ファイル単位で rayon 並列化する。
     check_timeout("phase1_blame_setup")?;
-    let blame_per_file: Vec<HashMap<String, BlameInfo>> = opts
+    let evidence_per_file: Vec<SourceEvidence> = opts
         .source_files
         .par_iter()
-        .map(|f| {
-            collect_blame_commits_for_file(dir, f, base_rev, opts.rename, opts.copy)
-                .unwrap_or_default()
-        })
+        .map(|f| collect_evidence_for_file(dir, f, base_rev, min_denom, opts))
         .collect();
     check_timeout("phase1_blame_collected")?;
 
+    for ev in &evidence_per_file {
+        if ev.git_failed {
+            diag.add_reason(CoChangeDiagnosticReason::GitCommandFailed);
+        }
+        if ev.no_changed_old_lines {
+            diag.add_reason(CoChangeDiagnosticReason::NoChangedOldLines);
+        }
+        if ev.commits.is_empty() {
+            diag.sources_without_evidence += 1;
+            if ev.new_file {
+                diag.new_files_without_history += 1;
+                diag.add_reason(CoChangeDiagnosticReason::NewFileHasNoPriorHistory);
+            } else {
+                diag.add_reason(CoChangeDiagnosticReason::NoCommitEvidence);
+            }
+            continue;
+        }
+        match ev.mode {
+            CoChangeEvidence::Blame => diag.sources_with_blame_evidence += 1,
+            CoChangeEvidence::History => diag.sources_with_history_evidence += 1,
+        }
+    }
+
     let mut commit_set: HashSet<String> = HashSet::new();
-    for s in &blame_per_file {
-        for k in s.keys() {
+    for ev in &evidence_per_file {
+        for k in ev.commits.keys() {
             commit_set.insert(k.clone());
         }
     }
     if commit_set.is_empty() {
-        return Ok(empty_cochange_result(None));
+        return Ok(empty_cochange_result(None, diag));
     }
 
     // SHA 集合の上限ガード (0 = 無制限)。
@@ -143,21 +181,20 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
         let merge_set = list_merge_commits(dir, &commit_set)?;
         commit_set.retain(|s| !merge_set.contains(s));
         if commit_set.is_empty() {
-            return Ok(empty_cochange_result(None));
+            return Ok(empty_cochange_result(None, diag));
         }
     }
-    // blame 結果からも同 SHA を除外して per-source 集計と整合させる。
-    let blame_per_file: Vec<HashMap<String, BlameInfo>> = if opts.ignore_merges {
-        blame_per_file
+    // 起点別の証拠集合からも同 SHA を除外して per-source 集計と整合させる。
+    let evidence_per_file: Vec<SourceEvidence> = if opts.ignore_merges {
+        evidence_per_file
             .into_iter()
-            .map(|s| {
-                s.into_iter()
-                    .filter(|(sha, _)| commit_set.contains(sha))
-                    .collect()
+            .map(|mut ev| {
+                ev.commits.retain(|sha, _| commit_set.contains(sha));
+                ev
             })
             .collect()
     } else {
-        blame_per_file
+        evidence_per_file
     };
     check_timeout("phase3_diff_tree_setup")?;
 
@@ -166,8 +203,8 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
     // 「この SHA にヒットする起点ファイルは誰か」を引けるようにしておく。
     let mut sha_to_sources: HashMap<String, Vec<usize>> = HashMap::new();
     let mut sha_to_info: HashMap<String, BlameInfo> = HashMap::new();
-    for (i, blame_map) in blame_per_file.iter().enumerate() {
-        for (sha, info) in blame_map {
+    for (i, ev) in evidence_per_file.iter().enumerate() {
+        for (sha, info) in &ev.commits {
             sha_to_sources.entry(sha.clone()).or_default().push(i);
             // 起点間で同じ SHA の info があれば最初に見たものを採用する
             sha_to_info
@@ -217,6 +254,11 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
                 }
                 let unit = unit_key_for(sha);
                 for &i in sources {
+                    // confidence の分母は「実際に集計対象となったコミット数」。
+                    // weight 0 (max_files_per_commit 超過) のコミットは上で return 済みなので
+                    // ここに到達したものだけを数える。証拠集合サイズをそのまま分母にすると
+                    // co (超過コミットを含まない) と母数がずれ confidence が過小評価になる。
+                    acc.counted_denom[i] += 1;
                     acc.weighted_denom[i] += weight;
                     if let Some(u) = unit.as_ref() {
                         acc.denom_units[i].insert(u.clone());
@@ -257,30 +299,53 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
 
     // Phase 4: 各起点に対して CoChangeEntry を構築する。stats は streaming で
     // すでに per-source 集計済みなので、ここでは閾値フィルタとランキングのみ行う。
+    //
+    // 閾値は raw `confidence` (と、明示指定時のみ `min_score`) に対して適用する。
+    // 平滑化した `score` はランキング専用。score は分母が小さいほど 0 に引き寄せられる
+    // shrinkage 推定値なので、閾値と突き合わせると「変更行 blame の分母が小さい起点は
+    // 100% 共変更でも構造的に出力されない」(既定 β=8 では分母 2 で上限 0.27 < 0.3) 。
     let smoothing_on = !opts.disable_smoothing;
-    let min_denom = opts.min_denominator.max(1);
     let alpha = opts.smoothing_alpha;
     let beta = opts.smoothing_beta;
     let author_unit_active = author_window_days > 0;
+    let score_gate_on = opts.min_score > 0.0;
 
     let mut entries: Vec<CoChangeEntry> = Vec::new();
     for (i, source) in opts.source_files.iter().enumerate() {
-        let blame_set_len = blame_per_file[i].len();
-        if blame_set_len < min_denom {
+        let evidence_set_len = evidence_per_file[i].commits.len();
+        let counted_denom = stats.counted_denom[i];
+        if counted_denom < min_denom {
+            if evidence_set_len > 0 {
+                diag.skipped_min_denominator += 1;
+                diag.add_reason(CoChangeDiagnosticReason::BelowMinDenominator);
+            }
             continue;
         }
-        let local_denom_raw = blame_set_len as f64;
+        let local_denom_raw = counted_denom as f64;
         let weighted_denom = stats.weighted_denom[i];
         let raw = &stats.per_source_raw[i];
         let weighted = &stats.per_source_weighted[i];
+        // blame 由来か履歴 fallback 由来かをエントリに引き継ぐ (既定 Blame は省略)。
+        let evidence = match evidence_per_file[i].mode {
+            CoChangeEvidence::Blame => None,
+            CoChangeEvidence::History => Some(CoChangeEvidence::History),
+        };
 
         let mut per_source_entries: Vec<CoChangeEntry> = Vec::new();
         for (cand, co) in raw {
             let co = *co;
+            diag.candidate_pairs += 1;
             if co < opts.min_samples {
+                diag.filtered_min_samples += 1;
+                diag.add_reason(CoChangeDiagnosticReason::BelowMinSamples);
                 continue;
             }
             let confidence = co as f64 / local_denom_raw;
+            if confidence < opts.min_confidence {
+                diag.filtered_min_confidence += 1;
+                diag.add_reason(CoChangeDiagnosticReason::BelowMinConfidence);
+                continue;
+            }
             // author_unit_window_days > 0 のとき、score は unit ベース
             // (|co_units| + α) / (|denom_units| + α + β) で計算する。
             // unit が空 (author 情報を取れなかった SHA のみ) のとき raw weighted にフォールバック。
@@ -297,23 +362,26 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
             } else {
                 confidence
             };
-            let entry = CoChangeEntry {
+            if score_gate_on && score < opts.min_score {
+                diag.filtered_min_score += 1;
+                diag.add_reason(CoChangeDiagnosticReason::BelowMinScore);
+                continue;
+            }
+            per_source_entries.push(CoChangeEntry {
                 file_a: source.clone(),
                 file_b: cand.clone(),
                 co_changes: co,
-                total_changes_a: blame_set_len,
+                total_changes_a: evidence_set_len,
                 total_changes_b: *stats.co_counts.get(cand).unwrap_or(&0),
                 confidence,
-                denominator: Some(blame_set_len),
+                denominator: Some(counted_denom),
                 score: Some(score),
-            };
-            if entry.ranking_value(smoothing_on) < opts.min_confidence {
-                continue;
-            }
-            per_source_entries.push(entry);
+                evidence,
+            });
         }
         per_source_entries.sort_by(|a, b| compare_entries_by_ranking(a, b, smoothing_on));
-        if opts.per_source_limit > 0 {
+        if opts.per_source_limit > 0 && per_source_entries.len() > opts.per_source_limit {
+            diag.truncated_per_source_limit += per_source_entries.len() - opts.per_source_limit;
             per_source_entries.truncate(opts.per_source_limit);
         }
         entries.extend(per_source_entries);
@@ -321,16 +389,19 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
 
     // 全体 ranking。smoothing 有効なら score 降順、無効なら confidence 降順。
     entries.sort_by(|a, b| compare_entries_by_ranking(a, b, smoothing_on));
+    diag.finalize();
 
     Ok(CoChangeResult {
         entries,
         commits_analyzed: denominator,
+        diagnostics: diag,
         skipped: None,
     })
 }
 
 /// streaming 集計用のスレッドローカル統計。fold/reduce でマージされる。
 /// - `per_source_raw` / `per_source_weighted` / `weighted_denom`: commit-size weighting の集計
+/// - `counted_denom`: 実際に集計対象となったコミット数 (= confidence の分母)
 /// - `denom_units` / `co_units`: author_unit_window_days > 0 のとき (author, time_bucket) 単位で
 ///   起点ファイル別の unique unit と候補別の unique unit を保持する
 /// - `co_counts`: グローバル候補出現数 (= `CoChangeEntry.total_changes_b` の元)
@@ -338,6 +409,7 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
 struct ShardStats {
     per_source_raw: Vec<HashMap<String, usize>>,
     per_source_weighted: Vec<HashMap<String, f64>>,
+    counted_denom: Vec<usize>,
     weighted_denom: Vec<f64>,
     denom_units: Vec<HashSet<(String, i64)>>,
     co_units: Vec<HashMap<String, HashSet<(String, i64)>>>,
@@ -349,6 +421,7 @@ impl ShardStats {
         Self {
             per_source_raw: (0..n_sources).map(|_| HashMap::new()).collect(),
             per_source_weighted: (0..n_sources).map(|_| HashMap::new()).collect(),
+            counted_denom: vec![0; n_sources],
             weighted_denom: vec![0.0; n_sources],
             denom_units: (0..n_sources).map(|_| HashSet::new()).collect(),
             co_units: (0..n_sources).map(|_| HashMap::new()).collect(),
@@ -367,6 +440,9 @@ impl ShardStats {
             for (k, v) in m {
                 *a.per_source_raw[i].entry(k).or_insert(0) += v;
             }
+        }
+        for (i, c) in b.counted_denom.into_iter().enumerate() {
+            a.counted_denom[i] += c;
         }
         for (i, m) in b.per_source_weighted.into_iter().enumerate() {
             for (k, v) in m {
@@ -409,9 +485,11 @@ fn commit_size_weight(file_count: usize, pivot: usize, hard_max: usize) -> f64 {
 }
 
 /// CoChangeEntry を ranking 値で降順比較する。
-/// 同値時は co_changes (実共起数) 降順 → confidence 降順 → path 昇順の順で安定化する。
+/// 同値時は co_changes (実共起数) 降順 → confidence 降順 → blame 証拠優先 →
+/// path 昇順の順で安定化する。
 /// ranking value (score / confidence) が同点でも、より多くのコミットで一緒に変更された
 /// ペアを優先することで、低 score 帯でのランキング品質を体感的に改善する。
+/// blame 証拠 (起点の変更行に直結) は履歴 fallback 証拠より密結合なので同点なら先に出す。
 fn compare_entries_by_ranking(
     a: &CoChangeEntry,
     b: &CoChangeEntry,
@@ -426,14 +504,136 @@ fn compare_entries_by_ranking(
                 .partial_cmp(&a.confidence)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
+        .then_with(|| a.is_history_evidence().cmp(&b.is_history_evidence()))
         .then_with(|| a.file_a.cmp(&b.file_a))
         .then_with(|| a.file_b.cmp(&b.file_b))
 }
 
+/// 起点 1 ファイル分のコミット証拠。
+///
+/// `mode` が `Blame` なら起点の**変更行**を最後に触ったコミット集合、`History` なら
+/// ファイル自身の履歴。`commits` が空なら証拠を作れなかったことを意味し、`new_file` /
+/// `no_changed_old_lines` / `git_failed` がその理由を伝える (診断出力に使う)。
+struct SourceEvidence {
+    commits: HashMap<String, BlameInfo>,
+    mode: CoChangeEvidence,
+    /// blame 可能な変更行が 1 行も無かった (diff が空 / 純粋追加 hunk のみ)。
+    no_changed_old_lines: bool,
+    /// base..HEAD で新規追加されたファイル (base 側に履歴が無い)。
+    new_file: bool,
+    /// git コマンドが失敗した (証拠なしと区別するため保持する)。
+    git_failed: bool,
+}
+
+impl SourceEvidence {
+    fn empty(mode: CoChangeEvidence) -> Self {
+        Self {
+            commits: HashMap::new(),
+            mode,
+            no_changed_old_lines: false,
+            new_file: false,
+            git_failed: false,
+        }
+    }
+}
+
+/// 起点 1 ファイルの証拠コミット集合を作る。
+///
+/// 第一選択は変更行 blame。得られた集合が `min_denom` に満たない場合
+/// (diff が無い / 純粋追加のみ / 変更行が 1 コミットにしか遡れない) は、
+/// `history_limit > 0` ならファイル履歴へフォールバックする。
+///
+/// 履歴は `git log <base>` から取るため、base 側に存在しない新規追加ファイルでは
+/// 空になる。新規ファイルの「追加コミット = 今レビュー中の diff そのもの」を証拠に
+/// してしまうと、同一コミットの全ファイルが confidence 1.0 の共変更として並ぶだけで
+/// 情報量がゼロになるため、これは意図した挙動。
+fn collect_evidence_for_file(
+    dir: &str,
+    file: &str,
+    base: &str,
+    min_denom: usize,
+    opts: &CoChangeOptions,
+) -> SourceEvidence {
+    let changed = collect_changed_old_ranges(dir, file, base).unwrap_or(ChangedOldRanges {
+        git_failed: true,
+        ..Default::default()
+    });
+
+    let mut ev = SourceEvidence::empty(CoChangeEvidence::Blame);
+    ev.new_file = changed.new_file;
+    ev.git_failed = changed.git_failed;
+    ev.no_changed_old_lines = changed.ranges.is_empty();
+
+    if !changed.ranges.is_empty() {
+        match collect_blame_commits_for_file(
+            dir,
+            file,
+            base,
+            &changed.ranges,
+            opts.rename,
+            opts.copy,
+        ) {
+            Ok(commits) => ev.commits = commits,
+            Err(_) => ev.git_failed = true,
+        }
+    }
+
+    // blame 証拠が分母の下限に届かないときだけ履歴へ広げる。
+    // blame で十分な証拠が取れている起点は、より密結合な blame 側を維持する。
+    if ev.commits.len() >= min_denom || opts.history_limit == 0 {
+        return ev;
+    }
+    match collect_history_commits_for_file(dir, file, base, opts) {
+        Ok(history) => {
+            if history.len() > ev.commits.len() {
+                ev.commits = history;
+                ev.mode = CoChangeEvidence::History;
+            }
+        }
+        Err(_) => ev.git_failed = true,
+    }
+    ev
+}
+
+/// `collect_changed_old_ranges` の結果。同型の bool を位置引数で返すと
+/// 取り違えてもコンパイルが通るため構造体で束ねる。
+#[derive(Default)]
+struct ChangedOldRanges {
+    /// blame 対象にする hunk 旧側 (start, count)。純粋追加 hunk は含まない。
+    ranges: Vec<(u64, u64)>,
+    /// base 側にファイルが無い (= base..HEAD で新規追加された)。
+    new_file: bool,
+    /// git コマンドが失敗した。
+    git_failed: bool,
+}
+
+/// `git diff --unified=0 <base> HEAD -- <file>` から hunk 旧側 range を抽出する。
+///
+/// `new_file` は diff ヘッダの `--- /dev/null` で判定する
+/// (base 側にファイルが無い = 新規追加 = 履歴 fallback も効かない)。
+fn collect_changed_old_ranges(dir: &str, file: &str, base: &str) -> Result<ChangedOldRanges> {
+    let diff_output = Command::new("git")
+        .args(["diff", "--unified=0", base, "HEAD", "--", file])
+        .current_dir(dir)
+        .output()
+        .map_err(|e| AstroError::new(ErrorCode::IoError, format!("Failed to run git: {e}")))?;
+    if !diff_output.status.success() {
+        return Ok(ChangedOldRanges {
+            git_failed: true,
+            ..Default::default()
+        });
+    }
+    let diff_text = String::from_utf8_lossy(&diff_output.stdout);
+    Ok(ChangedOldRanges {
+        ranges: parse_hunk_old_ranges(&diff_text),
+        new_file: diff_text.lines().any(|l| l == "--- /dev/null"),
+        git_failed: false,
+    })
+}
+
 /// 1 ファイルの diff hunk 群を 1 回の `git blame -L S,+C [-L S,+C]...` にまとめて
 /// 最終修正コミット SHA 集合を取得する。
-/// - 純粋追加 hunk (old_count = 0) は blame 不要なのでスキップする。
-/// - 全 hunk が純粋追加だった場合は空集合を返す。
+/// - 純粋追加 hunk (old_count = 0) は呼び出し側の `parse_hunk_old_ranges` で除外済み。
 /// - blame の失敗 (binary / non-existent in base) は空集合を返して継続。
 ///
 /// 戻り値は SHA → BlameInfo (`author_mail` / `author_time`) の map。
@@ -443,22 +643,10 @@ fn collect_blame_commits_for_file(
     dir: &str,
     file: &str,
     base: &str,
+    ranges: &[(u64, u64)],
     rename: bool,
     copy: bool,
 ) -> Result<HashMap<String, BlameInfo>> {
-    // diff --unified=0 で hunk header を取得
-    let diff_output = Command::new("git")
-        .args(["diff", "--unified=0", base, "HEAD", "--", file])
-        .current_dir(dir)
-        .output()
-        .map_err(|e| AstroError::new(ErrorCode::IoError, format!("Failed to run git: {e}")))?;
-    if !diff_output.status.success() {
-        return Ok(HashMap::new());
-    }
-    let diff_text = String::from_utf8_lossy(&diff_output.stdout);
-
-    // hunk 旧側 (start, count) を抽出
-    let ranges: Vec<(u64, u64)> = parse_hunk_old_ranges(&diff_text);
     if ranges.is_empty() {
         return Ok(HashMap::new());
     }
@@ -473,7 +661,7 @@ fn collect_blame_commits_for_file(
     if copy {
         args.push("-C".into());
     }
-    for (start, count) in &ranges {
+    for (start, count) in ranges {
         args.push("-L".into());
         args.push(format!("{},+{}", start, count));
     }
@@ -540,6 +728,69 @@ fn parse_blame_porcelain(blame_text: &str) -> Result<HashMap<String, BlameInfo>>
 struct BlameInfo {
     author_mail: Option<String>,
     author_time: Option<i64>,
+}
+
+/// 履歴 fallback: `git log <base> -n <limit> -- <file>` でファイル自身のコミット集合を取る。
+///
+/// 変更行 blame が使えない起点 (diff が無い / 純粋追加のみ) や、blame 集合が小さすぎて
+/// `min_denominator` を満たさない起点の代替証拠。`%H%x00%ae%x00%at` で SHA・author mail・
+/// author time を 1 起動でまとめて取り、blame 経路と同じ `BlameInfo` を組み立てる。
+///
+/// - `<base>` を起点にするため、レビュー対象コミット自身は含まれない。
+/// - `ignore_merges` のときは `--no-merges` を付ける。後段の一括マージ除外でも落ちるが、
+///   ここで除外しておかないと limit 件がマージだけで埋まって実質 0 件になり得る。
+/// - `rename` のときは `--follow` を付けてリネーム境界を越える。
+/// - git の失敗 (base に存在しないパス等) は Err ではなく空集合を返して継続する。
+fn collect_history_commits_for_file(
+    dir: &str,
+    file: &str,
+    base: &str,
+    opts: &CoChangeOptions,
+) -> Result<HashMap<String, BlameInfo>> {
+    if opts.history_limit == 0 {
+        return Ok(HashMap::new());
+    }
+    let mut args: Vec<String> = vec![
+        "log".into(),
+        "--format=%H%x00%ae%x00%at".into(),
+        format!("-n{}", opts.history_limit),
+    ];
+    if opts.ignore_merges {
+        args.push("--no-merges".into());
+    }
+    if opts.rename {
+        args.push("--follow".into());
+    }
+    args.push(base.to_string());
+    args.push("--".into());
+    args.push(file.to_string());
+
+    let output = Command::new("git")
+        .args(&args)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| AstroError::new(ErrorCode::IoError, format!("Failed to run git: {e}")))?;
+    if !output.status.success() {
+        return Ok(HashMap::new());
+    }
+    let mut out: HashMap<String, BlameInfo> = HashMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.split('\0');
+        let Some(sha) = parts.next() else { continue };
+        if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let mail = parts.next().unwrap_or("").trim();
+        let time = parts.next().unwrap_or("").trim();
+        out.insert(
+            sha.to_string(),
+            BlameInfo {
+                author_mail: (!mail.is_empty()).then(|| mail.to_string()),
+                author_time: time.parse::<i64>().ok(),
+            },
+        );
+    }
+    Ok(out)
 }
 
 /// `@@ -OLDSTART[,OLDCOUNT] +NEWSTART[,NEWCOUNT] @@` の OLDSTART/OLDCOUNT を抽出する。
@@ -842,10 +1093,14 @@ mod tests {
         }
     }
 
-    /// 純粋追加 hunk (旧 count=0) しかないファイルは blame 対象がなく、
-    /// 起点に紐づく blame コミット集合は空になり entries も空になる。
+    /// base 側に存在しない新規追加ファイルは起点にできない。
+    ///
+    /// blame 対象行が無く、`git log <base> -- <file>` も空 (base 時点でファイルが
+    /// 存在しない) なので履歴 fallback も効かない。追加コミット自身を証拠にすると
+    /// 「同じコミットの全ファイルが confidence 1.0」になるだけで情報量が無いため、
+    /// これは意図した挙動。理由は diagnostics に残す。
     #[test]
-    fn analyze_cochange_blame_pure_addition_yields_no_entries() {
+    fn analyze_cochange_new_file_has_no_evidence_and_reports_diagnostics() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         init_repo(repo);
@@ -864,7 +1119,251 @@ mod tests {
         let result = analyze_cochange(repo.to_str().unwrap(), &opts).unwrap();
         assert!(
             result.entries.is_empty() && result.commits_analyzed == 0,
-            "pure-addition source should yield empty result, got: {result:?}"
+            "new-file source should yield empty result, got: {result:?}"
+        );
+        assert_eq!(result.diagnostics.sources_requested, 1);
+        assert_eq!(result.diagnostics.sources_without_evidence, 1);
+        assert_eq!(result.diagnostics.new_files_without_history, 1);
+        assert!(
+            result
+                .diagnostics
+                .reasons
+                .contains(&CoChangeDiagnosticReason::NewFileHasNoPriorHistory)
+        );
+    }
+
+    /// 既存ファイルへの純粋追加 (旧 count=0 hunk のみ) は blame 行が取れないが、
+    /// 履歴 fallback がファイル自身のコミット履歴を代替証拠にして共変更を出す。
+    ///
+    /// 「新しいフィールド/メソッドを 1 個足す」という最も頻度の高い変更形が
+    /// まるごと不可視だったのを塞ぐ。
+    #[test]
+    fn analyze_cochange_pure_addition_falls_back_to_file_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+
+        // a.rs と b.rs を 3 回同時変更して履歴を作る
+        for i in 0..3 {
+            commit_files(
+                repo,
+                &[
+                    ("a.rs", &format!("fn a() {{ {i} }}\n")),
+                    ("b.rs", &format!("fn b() {{ {i} }}\n")),
+                ],
+                &format!("pair {i}"),
+            );
+        }
+        // HEAD で a.rs に**行を足すだけ** (旧 count=0 の純粋追加 hunk)
+        commit_files(
+            repo,
+            &[("a.rs", "fn a() { 2 }\nfn added() {}\n")],
+            "append a",
+        );
+
+        let opts = opts_with(|o| {
+            o.source_files = vec!["a.rs".to_string()];
+            o.base = Some("HEAD~1".to_string());
+        });
+        let result = analyze_cochange(repo.to_str().unwrap(), &opts).unwrap();
+
+        assert!(
+            result.entries.iter().any(|e| e.file_b == "b.rs"),
+            "純粋追加でも履歴 fallback で b.rs が出るべき: {:?}",
+            result.entries
+        );
+        assert!(
+            result
+                .entries
+                .iter()
+                .all(|e| e.evidence == Some(CoChangeEvidence::History)),
+            "fallback 由来のエントリは history と識別できるべき: {:?}",
+            result.entries
+        );
+        assert_eq!(result.diagnostics.sources_with_history_evidence, 1);
+        assert_eq!(result.diagnostics.sources_with_blame_evidence, 0);
+        assert!(
+            result
+                .diagnostics
+                .reasons
+                .contains(&CoChangeDiagnosticReason::NoChangedOldLines)
+        );
+    }
+
+    /// `--paths <file>` で base..HEAD に差分の無いファイルを指定しても、
+    /// 履歴 fallback で「このファイルと一緒に変わるファイル」が返る。
+    ///
+    /// これがドキュメント記載の主用途 (Files that change together) だが、
+    /// 旧実装は変更行が無いと必ず空を返していた。
+    #[test]
+    fn analyze_cochange_unchanged_paths_falls_back_to_file_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+
+        for i in 0..3 {
+            commit_files(
+                repo,
+                &[
+                    ("a.rs", &format!("fn a() {{ {i} }}\n")),
+                    ("b.rs", &format!("fn b() {{ {i} }}\n")),
+                ],
+                &format!("pair {i}"),
+            );
+        }
+        // HEAD は a.rs / b.rs に触らない
+        commit_files(repo, &[("unrelated.rs", "// x")], "unrelated");
+
+        let opts = opts_with(|o| {
+            o.source_files = vec!["a.rs".to_string()];
+            // base..HEAD に a.rs の差分は無い
+            o.base = Some("HEAD~1".to_string());
+        });
+        let result = analyze_cochange(repo.to_str().unwrap(), &opts).unwrap();
+        assert!(
+            result.entries.iter().any(|e| e.file_b == "b.rs"),
+            "差分の無い --paths でも履歴から共変更が返るべき: {:?}",
+            result.entries
+        );
+        assert_eq!(result.diagnostics.sources_with_history_evidence, 1);
+    }
+
+    /// `history_limit = 0` で fallback を無効化すると旧挙動 (blame のみ) に戻る。
+    #[test]
+    fn analyze_cochange_history_limit_zero_disables_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+
+        for i in 0..3 {
+            commit_files(
+                repo,
+                &[
+                    ("a.rs", &format!("fn a() {{ {i} }}\n")),
+                    ("b.rs", &format!("fn b() {{ {i} }}\n")),
+                ],
+                &format!("pair {i}"),
+            );
+        }
+        commit_files(repo, &[("unrelated.rs", "// x")], "unrelated");
+
+        let opts = opts_with(|o| {
+            o.source_files = vec!["a.rs".to_string()];
+            o.base = Some("HEAD~1".to_string());
+            o.history_limit = 0;
+        });
+        let result = analyze_cochange(repo.to_str().unwrap(), &opts).unwrap();
+        assert!(
+            result.entries.is_empty() && result.commits_analyzed == 0,
+            "history_limit=0 では fallback せず空: {result:?}"
+        );
+        assert_eq!(result.diagnostics.sources_without_evidence, 1);
+        assert!(
+            result
+                .diagnostics
+                .reasons
+                .contains(&CoChangeDiagnosticReason::NoCommitEvidence)
+        );
+    }
+
+    /// blame で十分な証拠が取れている起点は fallback せず blame を維持する
+    /// (fallback は「証拠が足りないときだけ」の補完であることの固定)。
+    #[test]
+    fn analyze_cochange_sufficient_blame_evidence_skips_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+
+        for i in 0..3 {
+            commit_files(
+                repo,
+                &[
+                    ("a.rs", &format!("fn a() {{ {i} }}\nfn a2() {{ {i} }}\n")),
+                    ("b.rs", &format!("fn b() {{ {i} }}\n")),
+                ],
+                &format!("pair {i}"),
+            );
+        }
+        // 既存 2 行をどちらも書き換える → blame 対象行あり
+        commit_files(
+            repo,
+            &[("a.rs", "fn a() { 99 }\nfn a2() { 99 }\n")],
+            "edit a",
+        );
+
+        let opts = opts_with(|o| {
+            o.source_files = vec!["a.rs".to_string()];
+            o.base = Some("HEAD~1".to_string());
+            o.min_denominator = 1;
+        });
+        let result = analyze_cochange(repo.to_str().unwrap(), &opts).unwrap();
+        assert!(!result.entries.is_empty(), "blame 由来の候補が出ること");
+        assert!(
+            result.entries.iter().all(|e| e.evidence.is_none()),
+            "blame 証拠が足りているので fallback しない: {:?}",
+            result.entries
+        );
+        assert_eq!(result.diagnostics.sources_with_blame_evidence, 1);
+        assert_eq!(result.diagnostics.sources_with_history_evidence, 0);
+    }
+
+    /// `max_files_per_commit` 超過でスキップしたコミットは confidence の分母からも外す。
+    ///
+    /// 旧実装は分母に証拠集合サイズをそのまま使っていたため、co (超過コミットを
+    /// 含まない) と母数がずれ confidence が系統的に過小評価されていた。
+    #[test]
+    fn confidence_denominator_excludes_oversized_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+
+        // 通常コミット 2 回 (a.rs + b.rs)
+        for i in 0..2 {
+            commit_files(
+                repo,
+                &[
+                    ("a.rs", &format!("fn a() {{ {i} }}\nfn a2() {{ {i} }}\n")),
+                    ("b.rs", &format!("fn b() {{ {i} }}\n")),
+                ],
+                &format!("pair {i}"),
+            );
+        }
+        // 巨大コミット 1 回 (a.rs の別行 + 大量ファイル) → max_files_per_commit で除外させる
+        let mut big: Vec<(String, String)> = vec![(
+            "a.rs".to_string(),
+            "fn a() { 1 }\nfn a2() { 9 }\n".to_string(),
+        )];
+        for i in 0..12 {
+            big.push((format!("bulk{i}.rs"), format!("// {i}\n")));
+        }
+        let big_refs: Vec<(&str, &str)> =
+            big.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
+        commit_files(repo, &big_refs, "bulk");
+        // HEAD で a.rs の 2 行とも書き換え、blame が上記 3 コミットに散るようにする
+        commit_files(repo, &[("a.rs", "fn a() { x }\nfn a2() { x }\n")], "edit a");
+
+        let opts = opts_with(|o| {
+            o.source_files = vec!["a.rs".to_string()];
+            o.base = Some("HEAD~1".to_string());
+            // 13 ファイルの bulk コミットを除外する
+            o.max_files_per_commit = 5;
+        });
+        let result = analyze_cochange(repo.to_str().unwrap(), &opts).unwrap();
+        let entry = result
+            .entries
+            .iter()
+            .find(|e| e.file_b == "b.rs")
+            .unwrap_or_else(|| panic!("b.rs が候補に出るべき: {:?}", result.entries));
+        // bulk コミットは分母から外れるので denominator は blame 集合サイズより小さい
+        assert!(
+            entry.denominator.unwrap() < entry.total_changes_a,
+            "除外コミットの分だけ実効分母が小さくなるべき: denom={:?} evidence_set={}",
+            entry.denominator,
+            entry.total_changes_a
+        );
+        assert!(
+            (entry.confidence - 1.0).abs() < 1e-9,
+            "集計対象コミットでは常に共変更しているので confidence=1.0: {entry:?}"
         );
     }
 
@@ -1493,10 +1992,15 @@ mod tests {
         assert_eq!(commit_size_weight(101, 0, 100), 0.0); // hard cap は効く
     }
 
-    /// production デフォルト (β=8) では co=2/denom=2 の小サンプルは
-    /// score=(2+1)/(2+1+8)≈0.273 となり、min_confidence=0.3 で除外される。
+    /// co=2/denom=2 (confidence 1.0) は production デフォルトで**出力される**。
+    ///
+    /// 旧実装は min_confidence を smoothing 済み score と突き合わせており、
+    /// score=(2+1)/(2+1+8)≈0.273 < 0.3 で 100% 共変更しているペアを落としていた。
+    /// score の上限は `(d+α)/(d+α+β)` なので、既定 β=8 では分母 3 未満の起点が
+    /// 構造的に出力不能になる (実リポジトリでは変更行 blame の分母は 1〜4 が大半)。
+    /// 閾値は raw confidence に、score はランキングに、と役割を分離した。
     #[test]
-    fn default_beta_filters_small_sample_pairs() {
+    fn small_sample_pair_is_emitted_by_default_and_gated_by_min_score() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         init_repo(repo);
@@ -1520,11 +2024,124 @@ mod tests {
             ..CoChangeOptions::default()
         };
         let result = analyze_cochange(repo.to_str().unwrap(), &opts).unwrap();
-        // β=8 のとき co=2/denom=2 の score < 0.3 なので b.rs は出ない
+        assert_eq!(
+            result.entries.len(),
+            1,
+            "confidence=1.0 のペアは既定で出力されるべき: {:?}",
+            result.entries
+        );
+        let entry = &result.entries[0];
+        assert_eq!(entry.file_b, "b.rs");
+        assert!((entry.confidence - 1.0).abs() < 1e-9);
+        // score はランキング用の shrinkage 値として残る (0.3 未満だが出力は止めない)
+        let score = entry.score.expect("score は常に付く");
+        assert!(score < 0.3, "既定 β=8 では score は 0.3 未満: {score}");
+
+        // score ゲートを明示的に有効にしたときだけ落ちる
+        let gated = analyze_cochange(
+            repo.to_str().unwrap(),
+            &CoChangeOptions {
+                min_score: 0.3,
+                ..opts.clone()
+            },
+        )
+        .unwrap();
+        assert!(
+            gated.entries.is_empty(),
+            "--min-score 0.3 では score<0.3 のペアが落ちる: {:?}",
+            gated.entries
+        );
+        assert_eq!(gated.diagnostics.filtered_min_score, 1);
+        assert!(
+            gated
+                .diagnostics
+                .reasons
+                .contains(&CoChangeDiagnosticReason::BelowMinScore)
+        );
+    }
+
+    /// confidence が閾値未満のペアは既定でも落ちる (閾値の意味が raw 比率であること)。
+    #[test]
+    fn low_confidence_pair_is_filtered_by_min_confidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        // a.rs は 5 commit、うち b.rs と同時変更は 1 commit だけ → confidence 0.2
+        commit_files(
+            repo,
+            &[("a.rs", "fn a() { 0 }\n"), ("b.rs", "fn b() { 0 }\n")],
+            "pair 0",
+        );
+        for i in 1..5 {
+            commit_files(repo, &[("a.rs", &format!("fn a() {{ {i} }}\n"))], "solo");
+        }
+        commit_files(repo, &[("a.rs", "fn a() { 99 }\n")], "edit a");
+
+        let opts = CoChangeOptions {
+            source_files: vec!["a.rs".to_string()],
+            base: Some("HEAD~1".to_string()),
+            // co=1 でも候補に上がるようにして、落ちる理由を min_confidence に限定する
+            min_samples: 1,
+            ..CoChangeOptions::default()
+        };
+        let result = analyze_cochange(repo.to_str().unwrap(), &opts).unwrap();
         assert!(
             result.entries.is_empty(),
-            "co=2/denom=2 should be filtered by default min_confidence=0.3 (β=8): {:?}",
+            "confidence 0.2 < 0.3 は落ちるべき: {:?}",
             result.entries
+        );
+        assert!(result.diagnostics.filtered_min_confidence >= 1);
+        assert!(
+            result
+                .diagnostics
+                .reasons
+                .contains(&CoChangeDiagnosticReason::BelowMinConfidence)
+        );
+    }
+
+    /// smoothing の on/off は**候補集合を変えず順序だけ**を変える。
+    /// (旧実装は smoothing が閾値そのものを動かしていた)
+    #[test]
+    fn smoothing_toggle_changes_order_not_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        for i in 0..3 {
+            commit_files(
+                repo,
+                &[
+                    ("a.rs", &format!("fn a() {{ {i} }}\n")),
+                    ("b.rs", &format!("fn b() {{ {i} }}\n")),
+                    ("c.rs", &format!("fn c() {{ {i} }}\n")),
+                ],
+                &format!("pair {i}"),
+            );
+        }
+        commit_files(repo, &[("a.rs", "fn a() { 99 }\n")], "edit a");
+
+        let base_opts = CoChangeOptions {
+            source_files: vec!["a.rs".to_string()],
+            base: Some("HEAD~1".to_string()),
+            ..CoChangeOptions::default()
+        };
+        let on = analyze_cochange(repo.to_str().unwrap(), &base_opts).unwrap();
+        let off = analyze_cochange(
+            repo.to_str().unwrap(),
+            &CoChangeOptions {
+                disable_smoothing: true,
+                ..base_opts.clone()
+            },
+        )
+        .unwrap();
+
+        let mut on_files: Vec<&str> = on.entries.iter().map(|e| e.file_b.as_str()).collect();
+        let mut off_files: Vec<&str> = off.entries.iter().map(|e| e.file_b.as_str()).collect();
+        on_files.sort_unstable();
+        off_files.sort_unstable();
+        assert!(!on_files.is_empty(), "候補が出ること: {:?}", on.entries);
+        assert_eq!(
+            on_files, off_files,
+            "smoothing の on/off で候補集合は変わらない"
         );
     }
 
@@ -1662,6 +2279,7 @@ mod tests {
             confidence: 0.5,
             denominator: Some(20),
             score: Some(0.5),
+            evidence: None,
         };
         let low_co = CoChangeEntry {
             file_a: "a.rs".into(),
@@ -1672,6 +2290,7 @@ mod tests {
             confidence: 0.5,
             denominator: Some(4),
             score: Some(0.5),
+            evidence: None,
         };
 
         // smoothing on/off の両方で同じ tie-break が効くことを確認
@@ -1834,6 +2453,7 @@ filename a.rs
             confidence: 1.0,
             denominator: Some(5),
             score: Some(0.4),
+            evidence: None,
         };
         let low_conf = CoChangeEntry {
             file_a: "a.rs".into(),
@@ -1844,6 +2464,7 @@ filename a.rs
             confidence: 0.5,
             denominator: Some(10),
             score: Some(0.4),
+            evidence: None,
         };
 
         let mut entries = [low_conf.clone(), high_conf.clone()];

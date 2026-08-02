@@ -625,6 +625,15 @@ impl AppService {
                 ),
             ));
         }
+        if !opts.min_score.is_finite() || !(0.0..=1.0).contains(&opts.min_score) {
+            bail!(AstroError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "min_score must be a finite value in [0.0, 1.0], got {}",
+                    opts.min_score
+                ),
+            ));
+        }
         if opts.max_files_per_commit == 0 {
             bail!(AstroError::new(
                 ErrorCode::InvalidRequest,

@@ -120,7 +120,7 @@ astro-sight review --dir . --git --exclude-dir generated --exclude-glob 'app/Leg
 astro-sight review --dir . --git --dead-scope touched-symbols              # only dead symbols whose declaration overlaps the diff
 ```
 
-Output: `impact` (ContextResult), `missing_cochanges`, `api_changes`, `dead_symbols`, `test_only_symbols` (public symbols referenced only from tests — review, don't auto-delete).
+Output: `impact` (ContextResult), `missing_cochanges`, `cochange_diagnostics` (why `missing_cochanges` is empty — see `cochange`), `api_changes`, `dead_symbols`, `test_only_symbols` (public symbols referenced only from tests — review, don't auto-delete).
 
 Review in dependency order: contracts/types → implementation → callers → tests. Treat a finding as actionable only after AST evidence and a concrete failing scenario verify it; keep unverified concerns informational.
 
@@ -168,18 +168,24 @@ Output: `diagram` (Mermaid text), `participants` (ordered list).
 
 ### `cochange` — Co-change Analysis
 
-Blame-based: starts from source files (auto-derived from `git diff` or explicit), runs `git blame` on changed lines to get the latest-modifying commits, then aggregates co-occurring files from each commit's diff-tree.
+Blame-based: starts from source files (auto-derived from `git diff` or explicit), runs `git blame` on changed lines to get the latest-modifying commits, then aggregates co-occurring files from each commit's diff-tree. When changed-line blame cannot produce enough evidence, the source falls back to its own file history.
 
 ```bash
 astro-sight cochange --dir . --git --base HEAD~5                   # auto-derive from diff
-astro-sight cochange --dir . --paths src/service.rs               # explicit sources
+astro-sight cochange --dir . --paths src/service.rs               # explicit sources (history fallback)
 astro-sight cochange --dir . --git --base HEAD~10 --rename --copy  # track renames/copies
-astro-sight cochange --dir . --git --base HEAD~5 --no-smoothing    # raw confidence (default prior alpha=1.0, beta=8.0)
+astro-sight cochange --dir . --git --base HEAD~5 --no-smoothing    # rank by raw confidence
 ```
 
-Output: `entries` with `file_a`, `file_b`, `co_changes`, `confidence`, `denominator` (|C|), `score` (smoothed); `commits_analyzed` reports |C|. Requires `--git` or `--paths` / `--paths-file` (default `--base` is HEAD~1). `--min-confidence` must be finite in `0.0..=1.0`; smoothing priors finite non-negative. Default `--git` source collection skips vendor / node_modules / dist / lock / minified assets; explicit `--paths` are kept as-is. Source paths must stay under `--dir` — `..`, absolute, and drive-qualified paths are rejected with `PATH_OUT_OF_BOUNDS`.
+Output: `entries` with `file_a`, `file_b`, `co_changes`, `confidence`, `denominator` (|C|), `score` (smoothed, ranking-only), and `evidence: "history"` when the pair came from the history fallback (absent = changed-line blame); `commits_analyzed` reports |C|. Requires `--git` or `--paths` / `--paths-file` (default `--base` is HEAD~1). `--min-confidence` / `--min-score` must be finite in `0.0..=1.0`; smoothing priors finite non-negative. Default `--git` source collection skips vendor / node_modules / dist / lock / minified assets; explicit `--paths` are kept as-is (a `--git` diff that is entirely excluded returns an empty result, not an error). Source paths must stay under `--dir` — `..`, absolute, and drive-qualified paths are rejected with `PATH_OUT_OF_BOUNDS`.
 
-Noise-suppression defaults (each has a flag to loosen): top 10 candidates per source file (`--per-source-limit`), pairs need ≥2 shared commits (`--min-samples`), merge commits excluded (`--include-merges` restores), same-author commits within 7 days collapse into one unit (`--author-unit-window-days`), commits touching >100 files skipped (`--max-files-per-commit`). If expected pairs are missing, loosen these before distrusting the data.
+**Thresholds vs ranking**: `--min-confidence` (default 0.3) gates on the raw `co_changes / denominator` ratio. The smoothed `score` is used only for ordering — gating on it would make small-evidence sources structurally unreportable, since its ceiling is `(denom + alpha) / (denom + alpha + beta)` (with the default beta=8, a source with 2 evidence commits caps at 0.27). Use `--min-score` if you explicitly want a shrinkage gate on top.
+
+**History fallback**: a source whose changed-line blame yields fewer than `--min-denominator` commits (no diff against base, pure-addition hunks only, or a single blame commit) falls back to `git log <base> -n 20 -- <file>`. This is what makes `--paths <file>` on an unmodified file work at all, and it covers the very common "add a new field/method" shape. Tune with `--history-limit` (`0` disables it; note the window is also the confidence denominator for fallback sources, so widening it dilutes coupling). Files newly added against `--base` have no prior history and cannot be sources — `diagnostics.new_files_without_history` records them.
+
+**Diagnostics**: `diagnostics` explains an empty or short result — how many sources were requested, how many got blame vs history evidence, how many had none, and how many candidate pairs each filter dropped (`filtered_min_samples` / `filtered_min_confidence` / `filtered_min_score` / `skipped_min_denominator`), plus a sorted `reasons` enum. Check it before concluding "no co-change".
+
+Noise-suppression defaults (each has a flag to loosen): top 10 candidates per source file (`--per-source-limit`), pairs need ≥2 shared commits (`--min-samples`), merge commits excluded (`--include-merges` restores), same-author commits within 7 days collapse into one unit (`--author-unit-window-days`), commits touching >100 files skipped (`--max-files-per-commit`, and those commits are excluded from the confidence denominator too). If expected pairs are missing, read `diagnostics` first, then loosen these.
 
 ### `ast` — AST Fragment Extraction
 
