@@ -1988,6 +1988,57 @@ fn impact_rust_local_var_not_treated_as_cross_file_ref() {
 }
 
 #[test]
+fn impact_kotlin_nested_function_is_not_cross_file_origin() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("Local.kt"),
+        "fun outer() {\n    fun parseLocal(value: Int): Int = value\n    parseLocal(1)\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Consumer.kt"),
+        "fun unrelated() {\n    parseLocal(\"unrelated\")\n}\n",
+    )
+    .unwrap();
+
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("git の起動に失敗");
+        assert!(status.success(), "git {args:?} が失敗");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "astro-sight@example.com"]);
+    git(&["config", "user.name", "astro-sight"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial", "-q"]);
+
+    std::fs::write(
+        root.join("Local.kt"),
+        "fun outer() {\n    fun parseLocal(value: Long): Long = value\n    parseLocal(1)\n}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["impact", "--dir", root.to_str().unwrap(), "--git"])
+        .output()
+        .expect("impact の起動に失敗");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "ローカル関数の変更だけなら未解決影響を報告すべきでない: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Consumer.kt"),
+        "別ファイルの同名呼び出しをローカル関数の利用箇所にすべきでない: {stderr}"
+    );
+}
+
+#[test]
 fn impact_rust_macro_arg_ident_stays_high() {
     // Issue 2026-06-13 codex 指摘: `call_render!(json, ..)` のように macro が `crate::render::json`
     // を補うケースでは、caller に `::json` 証拠がなくても本物の参照なので high 維持すべき

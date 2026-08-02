@@ -344,10 +344,8 @@ fn collect_affected_symbols(
                     if is_in_test_context(root, &source, &s.range, lang_id, &df.new_path) {
                         return false;
                     }
-                    // 関数内ローカル変数/定数を除外
-                    if matches!(sym.kind.as_str(), "variable" | "constant")
-                        && symbols::is_local_scope_symbol(root, &source, lang_id, &s.range)
-                    {
+                    // 関数内で宣言されたローカルシンボルを除外する。
+                    if symbols::is_local_scope_symbol(root, &source, lang_id, &s.range) {
                         return false;
                     }
                 }

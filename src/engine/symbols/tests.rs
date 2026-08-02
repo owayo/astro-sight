@@ -886,6 +886,60 @@ fn ts_non_export_top_level_var_is_not_local_scope() {
     ));
 }
 
+#[test]
+fn rust_function_local_const_is_local_scope() {
+    assert!(check_local_scope(
+        "pub fn outer() { const LOCAL_RUST: usize = 1; }",
+        LangId::Rust,
+        "LOCAL_RUST"
+    ));
+}
+
+#[test]
+fn python_nested_function_is_local_scope() {
+    assert!(check_local_scope(
+        "def outer():\n    def inner():\n        return 1\n    return inner()\n",
+        LangId::Python,
+        "inner"
+    ));
+}
+
+#[test]
+fn go_function_local_type_is_local_scope() {
+    assert!(check_local_scope(
+        "package demo\nfunc outer() {\n    type LocalGo struct{}\n    _ = LocalGo{}\n}\n",
+        LangId::Go,
+        "LocalGo"
+    ));
+}
+
+#[test]
+fn java_method_local_class_is_local_scope() {
+    assert!(check_local_scope(
+        "class Outer { void outer() { class LocalJava {} new LocalJava(); } }",
+        LangId::Java,
+        "LocalJava"
+    ));
+}
+
+#[test]
+fn kotlin_nested_function_is_local_scope() {
+    assert!(check_local_scope(
+        "fun outer() { fun localKotlin() = 1; localKotlin() }",
+        LangId::Kotlin,
+        "localKotlin"
+    ));
+}
+
+#[test]
+fn kotlin_top_level_function_is_not_local_scope() {
+    assert!(!check_local_scope(
+        "fun topLevel() = 1",
+        LangId::Kotlin,
+        "topLevel"
+    ));
+}
+
 // --- calculate_complexity テスト ---
 
 fn get_complexity(source: &str, lang_id: LangId, symbol_name: &str) -> Option<usize> {

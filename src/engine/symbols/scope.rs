@@ -27,7 +27,8 @@ pub fn is_local_scope_symbol(
         LangId::Rust => has_enclosing_function_body_rust(node),
         LangId::Python => has_enclosing_function_body_python(node),
         LangId::Go => has_enclosing_function_body_go(node),
-        LangId::Java | LangId::Kotlin => has_enclosing_function_body_jvm(node),
+        LangId::Java => has_enclosing_function_body_java(node),
+        LangId::Kotlin => has_enclosing_function_body_kotlin(node),
         _ => false, // 未対応言語は保守的にローカルと判定しない
     }
 }
@@ -87,8 +88,23 @@ fn has_enclosing_function_body_go(node: Node) -> bool {
     false
 }
 
-/// Java/Kotlin: 祖先に method/constructor の block があるかチェック。
-fn has_enclosing_function_body_jvm(node: Node) -> bool {
+/// Kotlin: 祖先に関数本体 (`function_body`) があるか確認する。
+fn has_enclosing_function_body_kotlin(node: Node) -> bool {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if n.kind() == "function_body"
+            && n.parent()
+                .is_some_and(|p| p.kind() == "function_declaration")
+        {
+            return true;
+        }
+        current = n.parent();
+    }
+    false
+}
+
+/// Java: 祖先にメソッドまたはコンストラクタのブロックがあるか確認する。
+fn has_enclosing_function_body_java(node: Node) -> bool {
     let mut current = node.parent();
     while let Some(n) = current {
         if n.kind() == "block"

@@ -298,6 +298,7 @@ astro-sight context --dir . --diff-file /tmp/changes.diff
 
 `context` の結果から、diff に含まれないファイルへの影響を「未解決」と判定する。AI エージェントの stop hook で使用し、未対応の影響先があればブロックして続行を促す。
 シグネチャ変更の判定は `context` と同じく識別子境界一致を使うため、テストヘルパーや派生名の変更が基底名の関数変更として波及しない。
+関数内で宣言されたローカルシンボルはファイル間影響の起点から除外する。TypeScript/JavaScript、Rust、Python、Go、Java、Kotlin に対応し、Kotlin のネスト関数もトップレベルの同名関数と区別する。
 
 ```bash
 # git diff を自動取得して未解決影響を検出（推奨）
