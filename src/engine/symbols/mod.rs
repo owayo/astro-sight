@@ -219,13 +219,23 @@ fn run_symbol_query(
                     } else {
                         None
                     };
+                    // Go のメソッドはレシーバ型が container だが、宣言はトップレベルに
+                    // 並ぶため range 内包ベースの `assign_enclosing_containers` では
+                    // 引き当てられない。ここでレシーバから直接解決しておく
+                    // (未設定のままだと `Alpha.Value` / `Beta.Value` が両方 bare `Value` に
+                    // なり、dead-code の同名スキップで両方とも判定対象から外れる)。
+                    let container = if lang_id == LangId::Go && kind == SymbolKind::Method {
+                        go_receiver_type_name(parent_node, source)
+                    } else {
+                        None
+                    };
                     symbols.push(Symbol {
                         name: name.to_string(),
                         kind,
                         range: Range::from(parent_node.range()),
                         doc,
                         complexity,
-                        container: None,
+                        container,
                         children: Vec::new(),
                     });
                 }
@@ -235,6 +245,39 @@ fn run_symbol_query(
 
     assign_enclosing_containers(&mut symbols);
     Ok(symbols)
+}
+
+/// Go の `method_declaration` からレシーバ型名を取り出す。
+///
+/// `func (b Box) Area() int` / `func (b *Box) Area() int` のどちらも `Box` を返す。
+/// ジェネリクス (`func (s *Stack[T]) Push(...)`) は型名部分だけを返す。
+/// レシーバを解決できない場合は `None` (container 未設定 = 従来挙動)。
+fn go_receiver_type_name(method_node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let receiver = method_node.child_by_field_name("receiver")?;
+    let mut cursor = receiver.walk();
+    for param in receiver.named_children(&mut cursor) {
+        if param.kind() != "parameter_declaration" {
+            continue;
+        }
+        let ty = param.child_by_field_name("type")?;
+        // `*Box` は pointer_type、`Box[T]` は generic_type。いずれも内側の
+        // type_identifier まで降りて素の型名を取る。
+        let mut node = ty;
+        loop {
+            match node.kind() {
+                "type_identifier" => {
+                    return node.utf8_text(source).ok().map(str::to_string);
+                }
+                "pointer_type" | "generic_type" | "parenthesized_type" => {
+                    let mut inner = node.walk();
+                    let next = node.named_children(&mut inner).next()?;
+                    node = next;
+                }
+                _ => return None,
+            }
+        }
+    }
+    None
 }
 
 /// 同一ファイル内の symbols について、各 method/function に enclosing container 名を付与する。
@@ -265,6 +308,10 @@ fn assign_enclosing_containers(symbols: &mut [Symbol]) {
     for i in 0..symbols.len() {
         let s = &symbols[i];
         if !matches!(s.kind, SymbolKind::Function | SymbolKind::Method) {
+            continue;
+        }
+        // 抽出時に container が確定しているもの (Go のレシーバ等) は上書きしない。
+        if s.container.is_some() {
             continue;
         }
         let target = s.range;
@@ -544,10 +591,16 @@ fn symbol_query(lang_id: LangId) -> &'static str {
             "#
         }
         LangId::Zig => {
-            // Zig: 型は const X = struct/enum/union {} で定義されるため variable_declaration 経由
+            // Zig: 型は const X = struct/enum/union {} で定義されるため variable_declaration 経由。
+            //
+            // `const` / `var` キーワードを先頭アンカーで必須にする。tree-sitter-zig は
+            // 代入式 `scratch += total;` も `variable_declaration` として parse するため、
+            // キーワードを要求しないと (a) 代入先が宣言として二重に出る (b) 直下の
+            // identifier を全て拾うので右辺の `total` まで宣言扱いになる、の 2 つが起きる。
+            // 宣言は必ず `const` / `var` で始まり、代入は始まらないので識別できる。
             r#"
             (function_declaration name: (identifier) @function.name)
-            (variable_declaration (identifier) @variable.name)
+            (variable_declaration . ["const" "var"] . (identifier) @variable.name)
             (test_declaration (identifier) @function.name)
             (test_declaration (string) @function.name)
             "#

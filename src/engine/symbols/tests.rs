@@ -201,9 +201,10 @@ fn ruby_if_else_complexity_no_double_count() {
 
 #[test]
 fn ruby_case_when_complexity_no_double_count() {
-    // case + when×2 = 3 分岐 → cx 4 (二重計上なら 7)。
+    // when×2 = 判定点 2 → cx 3。`case` 本体は判定点ではないので数えない
+    // (else も暗黙経路として数えない)。named ガードが無いと二重計上で 7 になる。
     let src = "def f(x)\n  case x\n  when 1 then 1\n  when 2 then 2\n  else 3\n  end\nend";
-    assert_eq!(cx_of(src, LangId::Ruby, "f"), 4);
+    assert_eq!(cx_of(src, LangId::Ruby, "f"), 3);
 }
 
 #[test]
@@ -300,8 +301,9 @@ fn kotlin_when_expression_complexity_counts_entries() {
     // `when` は tree-sitter-kotlin で `when_expression`、ブランチは `when_entry`。
     // 旧実装は Java の `switch_expression` を流用しており when を取りこぼし cx=1 だった。
     let src = "fun classify(x: Int): String {\n  return when (x) {\n    0 -> \"zero\"\n    1 -> \"one\"\n    2 -> \"two\"\n    else -> \"other\"\n  }\n}";
-    // ベース 1 + when_expression 1 + when_entry 4 (0/1/2/else) = 6
-    assert_eq!(cx_of(src, LangId::Kotlin, "classify"), 6);
+    // ベース 1 + when_entry 4 (0/1/2/else) = 5。`when_expression` 本体は
+    // 判定点ではないので数えない (他言語の switch と揃える)。
+    assert_eq!(cx_of(src, LangId::Kotlin, "classify"), 5);
 }
 
 #[test]
@@ -984,8 +986,9 @@ fn foo() {
     }
 }
 "#;
-    // if_expression=1, else_clause=1, match_expression=1, match_arm=2 → 1+5=6
-    assert_eq!(get_complexity(src, LangId::Rust, "foo"), Some(6));
+    // if_expression=1, match_arm=2 → 1+3=4。plain `else_clause` と
+    // `match_expression` 本体は判定点ではないので数えない。
+    assert_eq!(get_complexity(src, LangId::Rust, "foo"), Some(4));
 }
 
 #[test]
@@ -1042,8 +1045,8 @@ fn struct_has_no_complexity() {
 
 #[test]
 fn python_match_statement_complexity_counts_cases() {
-    // `match` (PEP 634) は match_statement=1 + case_clause=3 → 1+4=5。
-    // 旧テーブルは双方欠けており match だけの関数がベース 1 を返していた。
+    // `match` (PEP 634) の arm は case_clause=3 → 1+3=4。本体 `match_statement` は
+    // 判定点ではないので数えない。旧テーブルは双方欠けており cx=1 を返していた。
     let src = r#"
 def only_match(x):
     match x:
@@ -1051,7 +1054,7 @@ def only_match(x):
         case 2: return "b"
         case _: return "c"
 "#;
-    assert_eq!(get_complexity(src, LangId::Python, "only_match"), Some(5));
+    assert_eq!(get_complexity(src, LangId::Python, "only_match"), Some(4));
 }
 
 #[test]
@@ -1059,7 +1062,7 @@ fn go_expression_switch_complexity_counts_cases() {
     // tree-sitter-go の plain switch は `expression_switch_statement` + `expression_case`。
     // 旧テーブルは switch 自体を持たず、arm 名も Python の `case_clause` を誤って
     // 書いていたため、switch だけの関数がベース 1 を返していた。
-    // switch=1 + case 2 件=2 (default_case は数えない) → 1+3=4
+    // case 2 件=2 (switch 本体と default_case は数えない) → 1+2=3
     let src = r#"
 package main
 func beta(x int) int {
@@ -1073,12 +1076,12 @@ func beta(x int) int {
 	}
 }
 "#;
-    assert_eq!(get_complexity(src, LangId::Go, "beta"), Some(4));
+    assert_eq!(get_complexity(src, LangId::Go, "beta"), Some(3));
 }
 
 #[test]
 fn go_type_switch_and_select_complexity_counts_arms() {
-    // type switch: type_switch_statement=1 + type_case=2 → 1+3=4
+    // type switch: type_case=2 (本体は数えない) → 1+2=3
     let type_switch = r#"
 package main
 func ts(i interface{}) {
@@ -1090,9 +1093,9 @@ func ts(i interface{}) {
 	}
 }
 "#;
-    assert_eq!(get_complexity(type_switch, LangId::Go, "ts"), Some(4));
+    assert_eq!(get_complexity(type_switch, LangId::Go, "ts"), Some(3));
 
-    // select: select_statement=1 + communication_case=2 → 1+3=4
+    // select: communication_case=2 (本体は数えない) → 1+2=3
     let select = r#"
 package main
 func sel(a chan int, b chan int) {
@@ -1103,7 +1106,7 @@ func sel(a chan int, b chan int) {
 	}
 }
 "#;
-    assert_eq!(get_complexity(select, LangId::Go, "sel"), Some(4));
+    assert_eq!(get_complexity(select, LangId::Go, "sel"), Some(3));
 }
 
 #[test]
@@ -1144,7 +1147,9 @@ f() {
   until false; do break; done
 }
 "#;
-    assert_eq!(get_complexity(src, LangId::Bash, "f"), Some(9));
+    // if 1 + elif 1 + case_item 2 + while 1 + for 1 + until 1 = 7 → cx 8。
+    // `case_statement` 本体と `else_clause` は判定点ではないので数えない。
+    assert_eq!(get_complexity(src, LangId::Bash, "f"), Some(8));
 }
 
 // --- is_override_method テスト ---
@@ -2379,7 +2384,9 @@ func complexFn(x: Int?) -> Int {
     return total
 }
 "#;
-    assert_eq!(cx_of(src, LangId::Swift, "complexFn"), 9);
+    // if 1 + guard 1 + switch_entry 3 (case1/case2/default) + for 1 + while 1 = 7 → cx 8。
+    // `switch_statement` 本体は判定点ではないので数えない。
+    assert_eq!(cx_of(src, LangId::Swift, "complexFn"), 8);
 }
 
 /// Swift の ternary / catch / repeat-while も分岐として数える。
@@ -2494,4 +2501,603 @@ fn custom_query_replaces_builtin_and_validates_captures() {
             .expect("AstroError");
         assert_eq!(ae.code, crate::error::ErrorCode::InvalidRequest);
     }
+}
+
+// --- 循環的複雑度: 言語横断の等価性契約 ---
+//
+// 同じロジックが言語によって違う cx になると、しきい値 (`cx > 10` 等) での判断も
+// polyglot リポジトリでの比較も成立しない。branch_node_kinds は言語ごとに手書きの
+// ノード名テーブルで、汎用スライスの流用や grammar の改称に追随できていないと
+// 「1 つもマッチせず cx=1 のまま」という**エラーにならない壊れ方**をする。
+// 実測で 9 系統の不整合 (同じ 3 分岐 switch が 2〜5 にばらつく等) が見つかったため、
+// 論理的に等価なコードを全 tree-sitter 言語で並べて期待値に固定する。
+//
+// 期待値は McCabe (1 + 判定点数)。詳細な計上規約は `complexity.rs` の
+// `branch_node_kinds` の doc コメントを参照。
+
+/// 各言語の (LangId, 関数名, ソース) と McCabe 期待値のケース。
+struct CxCase {
+    lang: LangId,
+    label: &'static str,
+    src: &'static str,
+}
+
+fn assert_cx_cases(expected: usize, cases: &[CxCase]) {
+    let mut mismatches: Vec<String> = Vec::new();
+    for c in cases {
+        let got = cx_of(c.src, c.lang, "f");
+        if got != expected {
+            mismatches.push(format!(
+                "{:?}/{}: got {got}, want {expected}",
+                c.lang, c.label
+            ));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "言語間で cx が一致していない:\n  {}",
+        mismatches.join("\n  ")
+    );
+}
+
+/// `if` 1 個 = 判定点 1 → cx 2。
+#[test]
+fn cx_if_only_is_two_in_every_language() {
+    assert_cx_cases(
+        2,
+        &[
+            CxCase {
+                lang: LangId::Rust,
+                label: "if",
+                src: "fn f(a: i32) -> i32 { if a > 0 { return 1; } 0 }",
+            },
+            CxCase {
+                lang: LangId::C,
+                label: "if",
+                src: "int f(int a) { if (a > 0) { return 1; } return 0; }",
+            },
+            CxCase {
+                lang: LangId::Cpp,
+                label: "if",
+                src: "int f(int a) { if (a > 0) { return 1; } return 0; }",
+            },
+            CxCase {
+                lang: LangId::Python,
+                label: "if",
+                src: "def f(a):\n    if a > 0:\n        return 1\n    return 0\n",
+            },
+            CxCase {
+                lang: LangId::Javascript,
+                label: "if",
+                src: "function f(a) { if (a > 0) { return 1; } return 0; }",
+            },
+            CxCase {
+                lang: LangId::Typescript,
+                label: "if",
+                src: "function f(a: number): number { if (a > 0) { return 1; } return 0; }",
+            },
+            CxCase {
+                lang: LangId::Go,
+                label: "if",
+                src: "package p\nfunc f(a int) int { if a > 0 { return 1 }\n return 0 }",
+            },
+            CxCase {
+                lang: LangId::Php,
+                label: "if",
+                src: "<?php\nfunction f($a) { if ($a > 0) { return 1; } return 0; }",
+            },
+            CxCase {
+                lang: LangId::Java,
+                label: "if",
+                src: "class C { int f(int a) { if (a > 0) { return 1; } return 0; } }",
+            },
+            CxCase {
+                lang: LangId::Kotlin,
+                label: "if",
+                src: "fun f(a: Int): Int { if (a > 0) { return 1 }\n return 0 }",
+            },
+            CxCase {
+                lang: LangId::Swift,
+                label: "if",
+                src: "func f(a: Int) -> Int {\n    if a > 0 {\n        return 1\n    }\n    return 0\n}",
+            },
+            CxCase {
+                lang: LangId::CSharp,
+                label: "if",
+                src: "class C { int f(int a) { if (a > 0) { return 1; } return 0; } }",
+            },
+            CxCase {
+                lang: LangId::Bash,
+                label: "if",
+                src: "f() {\n  if [ \"$1\" -gt 0 ]; then echo 1; fi\n}",
+            },
+            CxCase {
+                lang: LangId::Ruby,
+                label: "if",
+                src: "def f(a)\n  if a > 0 then return 1 end\n  0\nend",
+            },
+            CxCase {
+                lang: LangId::Zig,
+                label: "if",
+                src: "pub fn f(a: i32) i32 {\n    if (a > 0) { return 1; }\n    return 0;\n}",
+            },
+        ],
+    );
+}
+
+/// plain `else` は判定点ではない → `if/else` も cx 2。
+///
+/// Rust / Zig だけ `else_clause` を分岐計上しており cx 3 を返していた。
+#[test]
+fn cx_plain_else_is_not_a_decision_point() {
+    assert_cx_cases(
+        2,
+        &[
+            CxCase {
+                lang: LangId::Rust,
+                label: "if_else",
+                src: "fn f(a: i32) -> i32 { if a > 0 { 1 } else { 0 } }",
+            },
+            CxCase {
+                lang: LangId::C,
+                label: "if_else",
+                src: "int f(int a) { if (a > 0) { return 1; } else { return 0; } }",
+            },
+            CxCase {
+                lang: LangId::Python,
+                label: "if_else",
+                src: "def f(a):\n    if a > 0:\n        return 1\n    else:\n        return 0\n",
+            },
+            CxCase {
+                lang: LangId::Javascript,
+                label: "if_else",
+                src: "function f(a) { if (a > 0) { return 1; } else { return 0; } }",
+            },
+            CxCase {
+                lang: LangId::Go,
+                label: "if_else",
+                src: "package p\nfunc f(a int) int { if a > 0 { return 1 } else { return 0 } }",
+            },
+            CxCase {
+                lang: LangId::Php,
+                label: "if_else",
+                src: "<?php\nfunction f($a) { if ($a > 0) { return 1; } else { return 0; } }",
+            },
+            CxCase {
+                lang: LangId::Java,
+                label: "if_else",
+                src: "class C { int f(int a) { if (a > 0) { return 1; } else { return 0; } } }",
+            },
+            CxCase {
+                lang: LangId::Kotlin,
+                label: "if_else",
+                src: "fun f(a: Int): Int { if (a > 0) { return 1 } else { return 0 } }",
+            },
+            CxCase {
+                lang: LangId::Swift,
+                label: "if_else",
+                src: "func f(a: Int) -> Int {\n    if a > 0 {\n        return 1\n    } else {\n        return 0\n    }\n}",
+            },
+            CxCase {
+                lang: LangId::CSharp,
+                label: "if_else",
+                src: "class C { int f(int a) { if (a > 0) { return 1; } else { return 0; } } }",
+            },
+            CxCase {
+                lang: LangId::Bash,
+                label: "if_else",
+                src: "f() {\n  if [ \"$1\" -gt 0 ]; then echo 1; else echo 0; fi\n}",
+            },
+            CxCase {
+                lang: LangId::Ruby,
+                label: "if_else",
+                src: "def f(a)\n  if a > 0 then 1 else 0 end\nend",
+            },
+            CxCase {
+                lang: LangId::Zig,
+                label: "if_else",
+                src: "pub fn f(a: i32) i32 {\n    if (a > 0) { return 1; } else { return 0; }\n}",
+            },
+        ],
+    );
+}
+
+/// `if / else if / else` = 判定点 2 → cx 3。
+///
+/// PHP は `else_if_clause` が未登録で cx 2 (過小)、Rust / Zig は `else_clause` の
+/// 二重計上で cx 5 (過大) だった。
+#[test]
+fn cx_else_if_chain_counts_only_the_nested_conditions() {
+    assert_cx_cases(
+        3,
+        &[
+            CxCase {
+                lang: LangId::Rust,
+                label: "elif",
+                src: "fn f(a: i32) -> i32 { if a > 0 { 1 } else if a < 0 { 2 } else { 0 } }",
+            },
+            CxCase {
+                lang: LangId::C,
+                label: "elif",
+                src: "int f(int a) { if (a>0) { return 1; } else if (a<0) { return 2; } else { return 0; } }",
+            },
+            CxCase {
+                lang: LangId::Python,
+                label: "elif",
+                src: "def f(a):\n    if a > 0:\n        return 1\n    elif a < 0:\n        return 2\n    else:\n        return 0\n",
+            },
+            CxCase {
+                lang: LangId::Javascript,
+                label: "elif",
+                src: "function f(a) { if (a>0) { return 1; } else if (a<0) { return 2; } else { return 0; } }",
+            },
+            CxCase {
+                lang: LangId::Go,
+                label: "elif",
+                src: "package p\nfunc f(a int) int { if a > 0 { return 1 } else if a < 0 { return 2 } else { return 0 } }",
+            },
+            CxCase {
+                lang: LangId::Php,
+                label: "elseif",
+                src: "<?php\nfunction f($a) { if ($a>0) { return 1; } elseif ($a<0) { return 2; } else { return 0; } }",
+            },
+            CxCase {
+                lang: LangId::Java,
+                label: "elif",
+                src: "class C { int f(int a) { if (a>0) { return 1; } else if (a<0) { return 2; } else { return 0; } } }",
+            },
+            CxCase {
+                lang: LangId::Kotlin,
+                label: "elif",
+                src: "fun f(a: Int): Int { if (a>0) { return 1 } else if (a<0) { return 2 } else { return 0 } }",
+            },
+            CxCase {
+                lang: LangId::CSharp,
+                label: "elif",
+                src: "class C { int f(int a) { if (a>0) { return 1; } else if (a<0) { return 2; } else { return 0; } } }",
+            },
+            CxCase {
+                lang: LangId::Bash,
+                label: "elif",
+                src: "f() {\n  if [ \"$1\" -gt 0 ]; then echo 1; elif [ \"$1\" -lt 0 ]; then echo 2; else echo 0; fi\n}",
+            },
+            CxCase {
+                lang: LangId::Ruby,
+                label: "elsif",
+                src: "def f(a)\n  if a > 0 then 1 elsif a < 0 then 2 else 0 end\nend",
+            },
+            CxCase {
+                lang: LangId::Zig,
+                label: "elif",
+                src: "pub fn f(a: i32) i32 {\n    if (a > 0) { return 1; } else if (a < 0) { return 2; } else { return 0; }\n}",
+            },
+        ],
+    );
+}
+
+/// switch/match の arm 3 個 = 判定点 3 → cx 4。**構文本体は数えない**。
+///
+/// 旧実装では本体 + arm の二重計上で 5 になる言語が 10、逆に Java は arm を
+/// 1 つも数えず 2 だった (3 分岐が cx 2 という実態と逆の値)。
+#[test]
+fn cx_switch_counts_arms_not_the_construct() {
+    assert_cx_cases(
+        4,
+        &[
+            CxCase {
+                lang: LangId::Rust,
+                label: "match",
+                src: "fn f(a: i32) -> i32 { match a { 1 => 1, 2 => 2, _ => 3 } }",
+            },
+            CxCase {
+                lang: LangId::C,
+                label: "switch",
+                src: "int f(int a) { switch (a) { case 1: return 1; case 2: return 2; case 3: return 3; } return 0; }",
+            },
+            CxCase {
+                lang: LangId::Cpp,
+                label: "switch",
+                src: "int f(int a) { switch (a) { case 1: return 1; case 2: return 2; case 3: return 3; } return 0; }",
+            },
+            CxCase {
+                lang: LangId::Python,
+                label: "match",
+                src: "def f(a):\n    match a:\n        case 1: return 1\n        case 2: return 2\n        case _: return 3\n",
+            },
+            CxCase {
+                lang: LangId::Javascript,
+                label: "switch",
+                src: "function f(a) { switch (a) { case 1: return 1; case 2: return 2; case 3: return 3; } return 0; }",
+            },
+            CxCase {
+                lang: LangId::Typescript,
+                label: "switch",
+                src: "function f(a: number): number { switch (a) { case 1: return 1; case 2: return 2; case 3: return 3; } return 0; }",
+            },
+            CxCase {
+                lang: LangId::Go,
+                label: "switch",
+                src: "package p\nfunc f(a int) int { switch a { case 1: return 1; case 2: return 2; case 3: return 3 }\n return 0 }",
+            },
+            CxCase {
+                lang: LangId::Php,
+                label: "switch",
+                src: "<?php\nfunction f($a) { switch ($a) { case 1: return 1; case 2: return 2; case 3: return 3; } return 0; }",
+            },
+            CxCase {
+                lang: LangId::Java,
+                label: "switch",
+                src: "class C { int f(int a) { switch (a) { case 1: return 1; case 2: return 2; case 3: return 3; } return 0; } }",
+            },
+            CxCase {
+                lang: LangId::Kotlin,
+                label: "when",
+                src: "fun f(a: Int): Int { return when (a) { 1 -> 1; 2 -> 2; else -> 3 } }",
+            },
+            CxCase {
+                lang: LangId::Swift,
+                label: "switch",
+                src: "func f(a: Int) -> Int {\n    switch a {\n    case 1:\n        return 1\n    case 2:\n        return 2\n    default:\n        return 3\n    }\n}",
+            },
+            CxCase {
+                lang: LangId::CSharp,
+                label: "switch",
+                src: "class C { int f(int a) { switch (a) { case 1: return 1; case 2: return 2; case 3: return 3; } return 0; } }",
+            },
+            CxCase {
+                lang: LangId::Bash,
+                label: "case",
+                src: "f() {\n  case \"$1\" in 1) echo 1;; 2) echo 2;; 3) echo 3;; esac\n}",
+            },
+            CxCase {
+                lang: LangId::Ruby,
+                label: "case",
+                src: "def f(a)\n  case a when 1 then 1 when 2 then 2 when 3 then 3 end\nend",
+            },
+            CxCase {
+                lang: LangId::Zig,
+                label: "switch",
+                src: "pub fn f(a: i32) i32 {\n    return switch (a) {\n        1 => 1,\n        2 => 2,\n        else => 3,\n    };\n}",
+            },
+        ],
+    );
+}
+
+/// Java の arrow 構文 switch (Java 14+) も colon 構文と同じ arm 数で数える。
+/// `switch_label` は両構文に共通して 1 arm = 1 個現れる。
+#[test]
+fn cx_java_arrow_switch_matches_colon_switch() {
+    let arrow = "class C { int f(int a) { return switch (a) { case 1 -> 1; case 2 -> 2; default -> 0; }; } }";
+    assert_eq!(cx_of(arrow, LangId::Java, "f"), 4);
+}
+
+/// Java の fall-through は label 数 = 進入経路数で数える。
+#[test]
+fn cx_java_fallthrough_counts_each_label() {
+    let src =
+        "class C { int f(int a) { switch (a) { case 1: case 2: return 1; default: return 0; } } }";
+    // label 3 個 (case 1 / case 2 / default) → cx 4
+    assert_eq!(cx_of(src, LangId::Java, "f"), 4);
+}
+
+/// 三項演算子は判定点 → cx 2。PHP / Java / C# / Ruby で欠落していた。
+#[test]
+fn cx_ternary_is_counted_in_every_language_that_has_one() {
+    assert_cx_cases(
+        2,
+        &[
+            CxCase {
+                lang: LangId::C,
+                label: "ternary",
+                src: "int f(int a) { return a > 0 ? 1 : 0; }",
+            },
+            CxCase {
+                lang: LangId::Cpp,
+                label: "ternary",
+                src: "int f(int a) { return a > 0 ? 1 : 0; }",
+            },
+            CxCase {
+                lang: LangId::Python,
+                label: "ternary",
+                src: "def f(a):\n    return 1 if a > 0 else 0\n",
+            },
+            CxCase {
+                lang: LangId::Javascript,
+                label: "ternary",
+                src: "function f(a) { return a > 0 ? 1 : 0; }",
+            },
+            CxCase {
+                lang: LangId::Typescript,
+                label: "ternary",
+                src: "function f(a: number): number { return a > 0 ? 1 : 0; }",
+            },
+            CxCase {
+                lang: LangId::Php,
+                label: "ternary",
+                src: "<?php\nfunction f($a) { return $a > 0 ? 1 : 0; }",
+            },
+            CxCase {
+                lang: LangId::Java,
+                label: "ternary",
+                src: "class C { int f(int a) { return a > 0 ? 1 : 0; } }",
+            },
+            CxCase {
+                lang: LangId::CSharp,
+                label: "ternary",
+                src: "class C { int f(int a) { return a > 0 ? 1 : 0; } }",
+            },
+            CxCase {
+                lang: LangId::Swift,
+                label: "ternary",
+                src: "func f(a: Int) -> Int {\n    return a > 0 ? 1 : 0\n}",
+            },
+            CxCase {
+                lang: LangId::Ruby,
+                label: "ternary",
+                src: "def f(a)\n  a > 0 ? 1 : 0\nend",
+            },
+        ],
+    );
+}
+
+/// C# の `foreach` は `foreach_statement` (旧テーブルの `for_each_statement` は
+/// 存在しないノード名で 1 つもマッチせず cx=1 のままだった)。
+#[test]
+fn cx_csharp_foreach_is_counted() {
+    let src = "class C { int f(int a) { foreach (var z in new int[]{1}) { a += z; } return a; } }";
+    assert_eq!(cx_of(src, LangId::CSharp, "f"), 2);
+}
+
+/// ループは全言語で判定点 1 → cx 2。
+#[test]
+fn cx_loop_is_two_in_every_language() {
+    assert_cx_cases(
+        2,
+        &[
+            CxCase {
+                lang: LangId::Rust,
+                label: "for",
+                src: "fn f(a: i32) -> i32 { for _ in 0..3 {} a }",
+            },
+            CxCase {
+                lang: LangId::C,
+                label: "for",
+                src: "int f(int a) { for (int i=0;i<3;i++) {} return a; }",
+            },
+            CxCase {
+                lang: LangId::Python,
+                label: "for",
+                src: "def f(a):\n    for i in range(3):\n        pass\n    return a\n",
+            },
+            CxCase {
+                lang: LangId::Javascript,
+                label: "for",
+                src: "function f(a) { for (let i=0;i<3;i++) {} return a; }",
+            },
+            CxCase {
+                lang: LangId::Go,
+                label: "for",
+                src: "package p\nfunc f(a int) int { for i:=0;i<3;i++ {}\n return a }",
+            },
+            CxCase {
+                lang: LangId::Php,
+                label: "foreach",
+                src: "<?php\nfunction f($a) { foreach ([1] as $z) {} return $a; }",
+            },
+            CxCase {
+                lang: LangId::Java,
+                label: "for",
+                src: "class C { int f(int a) { for (int i=0;i<3;i++) {} return a; } }",
+            },
+            CxCase {
+                lang: LangId::Kotlin,
+                label: "for",
+                src: "fun f(a: Int): Int { for (i in 0..2) {}\n return a }",
+            },
+            CxCase {
+                lang: LangId::Swift,
+                label: "for",
+                src: "func f(a: Int) -> Int {\n    for _ in 0..<3 {}\n    return a\n}",
+            },
+            CxCase {
+                lang: LangId::CSharp,
+                label: "for",
+                src: "class C { int f(int a) { for (int i=0;i<3;i++) {} return a; } }",
+            },
+            CxCase {
+                lang: LangId::Bash,
+                label: "for",
+                src: "f() {\n  for i in 1 2 3; do echo \"$i\"; done\n}",
+            },
+            CxCase {
+                lang: LangId::Ruby,
+                label: "while",
+                src: "def f(a)\n  while a > 0 do break end\n  a\nend",
+            },
+            CxCase {
+                lang: LangId::Zig,
+                label: "while",
+                src: "pub fn f(a: i32) i32 {\n    var i: usize = 0;\n    while (i < 3) : (i += 1) {}\n    return a;\n}",
+            },
+        ],
+    );
+}
+
+// --- Zig: 宣言と代入の区別 / ローカルスコープ ---
+
+/// tree-sitter-zig は代入式 `x += y;` も `variable_declaration` として parse する。
+/// `const` / `var` キーワードを先頭アンカーで要求しないと、代入先が宣言として
+/// 二重に出るうえ、直下 identifier を全て拾うので右辺まで宣言扱いになる。
+#[test]
+fn zig_assignment_is_not_extracted_as_declaration() {
+    let src = "pub fn add(a: i32, b: i32) i32 {\n    const total = a + b;\n    var scratch: i32 = 0;\n    scratch += total;\n    return scratch;\n}\n";
+    let syms = syms_of(src, LangId::Zig);
+    let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["add", "total", "scratch"],
+        "代入行 `scratch += total;` から宣言シンボルを作らない: {names:?}"
+    );
+}
+
+/// Zig の関数内 `const` / `var` はローカルスコープと判定する
+/// (impact のクロスファイル起点から除外するため)。
+#[test]
+fn zig_function_local_variable_is_local_scope() {
+    let src = "const TOP: i32 = 1;\npub fn add(a: i32) i32 {\n    const inner = a + 1;\n    return inner;\n}\n";
+    let language = LangId::Zig.ts_language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).unwrap();
+    let tree = parser.parse(src, None).unwrap();
+    let root = tree.root_node();
+    let syms = extract_symbols(root, src.as_bytes(), LangId::Zig).unwrap();
+
+    let inner = syms.iter().find(|s| s.name == "inner").expect("inner");
+    assert!(
+        is_local_scope_symbol(root, src.as_bytes(), LangId::Zig, &inner.range),
+        "関数内の const はローカル"
+    );
+    let top = syms.iter().find(|s| s.name == "TOP").expect("TOP");
+    assert!(
+        !is_local_scope_symbol(root, src.as_bytes(), LangId::Zig, &top.range),
+        "ファイルトップレベルの const はローカルではない"
+    );
+}
+
+// --- Go: メソッドのレシーバ型を container にする ---
+
+/// Go のメソッドはレシーバ型が container だが、宣言はトップレベルに並ぶため
+/// range 内包ベースの `assign_enclosing_containers` では引き当てられない。
+/// container が空だと同名メソッドが全て bare 名に潰れ、api 差分の突き合わせや
+/// dead-code の帰属が壊れる。
+#[test]
+fn go_method_receiver_becomes_container() {
+    let src = "package p\n\ntype Alpha struct{ v int }\ntype Beta struct{ v int }\n\nfunc (a Alpha) Value() int { return a.v }\nfunc (b *Beta) Value() int { return b.v }\nfunc Free() int { return 0 }\n";
+    let syms = syms_of(src, LangId::Go);
+    let containers: Vec<(&str, Option<&str>)> = syms
+        .iter()
+        .filter(|s| matches!(s.kind, SymbolKind::Method | SymbolKind::Function))
+        .map(|s| (s.name.as_str(), s.container.as_deref()))
+        .collect();
+    assert!(
+        containers.contains(&("Value", Some("Alpha"))),
+        "値レシーバの container は Alpha: {containers:?}"
+    );
+    assert!(
+        containers.contains(&("Value", Some("Beta"))),
+        "ポインタレシーバでも container は Beta (`*` を剥がす): {containers:?}"
+    );
+    assert!(
+        containers.contains(&("Free", None)),
+        "レシーバの無い関数は container なし: {containers:?}"
+    );
+}
+
+/// ジェネリックなレシーバ (`*Stack[T]`) でも型名だけを container にする。
+#[test]
+fn go_generic_receiver_container_strips_type_params() {
+    let src = "package p\n\ntype Stack[T any] struct{ items []T }\n\nfunc (s *Stack[T]) Push(x T) { s.items = append(s.items, x) }\n";
+    let syms = syms_of(src, LangId::Go);
+    let push = syms.iter().find(|s| s.name == "Push").expect("Push");
+    assert_eq!(push.container.as_deref(), Some("Stack"));
 }

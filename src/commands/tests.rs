@@ -13751,11 +13751,13 @@ fn filter_dead_by_wip_added_drops_symbols_listed_in_added() {
             name: "matchAssigneeName".to_string(),
             kind: "function".to_string(),
             file: "src/notes.ts".to_string(),
+            line: None,
         },
         DeadSymbol {
             name: "legacyUnused".to_string(),
             kind: "function".to_string(),
             file: "src/legacy.ts".to_string(),
+            line: None,
         },
     ];
     let added = vec![ApiSymbol {
@@ -13781,6 +13783,7 @@ fn filter_dead_by_wip_added_matches_on_file_and_name_pair() {
         name: "helper".to_string(),
         kind: "function".to_string(),
         file: "src/a.ts".to_string(),
+        line: None,
     }];
     let added = vec![ApiSymbol {
         // 同じ name だが別 file の追加 — dead 側 (a.ts) は残るべき。
@@ -13801,6 +13804,7 @@ fn filter_dead_by_wip_added_passes_through_when_added_is_empty() {
         name: "foo".to_string(),
         kind: "function".to_string(),
         file: "src/foo.rs".to_string(),
+        line: None,
     }];
     let filtered = filter_dead_by_wip_added(dead.clone(), &[]);
     assert_eq!(filtered.len(), 1);

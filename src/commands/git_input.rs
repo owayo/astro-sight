@@ -8,6 +8,15 @@ use super::common::{
     read_paths_file_limited,
 };
 
+/// cochange の既定 base。context / impact / review / dead-code と揃えて
+/// 「未コミットの作業ツリー変更」を既定の解析対象にする。
+///
+/// 旧既定は `HEAD~1` (直前コミット) だったが、`git diff <base> HEAD` という
+/// 2 revision 形式と組み合わさって「`--git` を付けても未コミット変更を一切見ない」
+/// 状態になっていた。同じ `--git` で review と cochange が別の diff を見るのは
+/// ツール群として一貫しないため、単一 revision 形式 + 既定 HEAD に揃える。
+pub const DEFAULT_BLAME_BASE: &str = "HEAD";
+
 /// `resolve_blame_source_files` の結果。起点ファイルが解決できたか、
 /// git 管理外 (かつ明示 `--paths` / `--paths-file` 無し) で skip かを型で表す。
 pub enum BlameSourceResolution {
@@ -51,19 +60,17 @@ pub fn resolve_blame_source_files(
             }
             return Ok(BlameSourceResolution::Files(set.into_iter().collect()));
         }
-        let base_rev = base.unwrap_or("HEAD~1");
+        let base_rev = base.unwrap_or(DEFAULT_BLAME_BASE);
         validate_git_revision(base_rev, "base")?;
         // core.quotepath=off: 非 ASCII ファイル名の 8 進クォート (`"\346..."`) を無効化し、
         // 後段のパス照合・blame pathspec が生の UTF-8 名で一致するようにする。
+        //
+        // revision は `<base>` 単独で渡す (`<base> HEAD` ではない)。2 revision 形式は
+        // コミット間の差分しか見ないため、**未コミットの作業ツリー変更が起点に入らない**。
+        // context / impact / review / dead-code は `run_git_diff` が `git diff <base>` を
+        // 使っており、cochange だけ意味が違うと同じ `--git` でも解析対象がずれる。
         let output = std::process::Command::new("git")
-            .args([
-                "-c",
-                "core.quotepath=off",
-                "diff",
-                "--name-only",
-                base_rev,
-                "HEAD",
-            ])
+            .args(["-c", "core.quotepath=off", "diff", "--name-only", base_rev])
             .current_dir(dir)
             .output()
             .map_err(|e| {

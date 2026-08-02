@@ -299,7 +299,9 @@ pub enum Commands {
         #[arg(long)]
         git: bool,
 
-        /// Base revision for diff/blame (default: HEAD~1)
+        /// Base revision for diff/blame (default: HEAD, i.e. uncommitted working-tree
+        /// changes — same as context / impact / review / dead-code). Evaluated as
+        /// `git diff <base>`, so `HEAD~1` means "last commit plus uncommitted changes".
         #[arg(long)]
         base: Option<String>,
 
@@ -346,9 +348,12 @@ pub enum Commands {
         #[arg(long = "exclude-glob")]
         exclude_globs: Vec<String>,
 
-        /// Maximum number of source files allowed (0 = unlimited).
-        /// Exceeding this limit aborts with InvalidRequest to prevent runaway blame cost.
-        #[arg(long, default_value = "0")]
+        /// Maximum number of source files allowed (0 = unlimited). Default 500.
+        /// Exceeding this limit aborts with InvalidRequest to prevent runaway blame cost:
+        /// `--git` collects sources via `git diff <base>` (working-tree comparison), so a
+        /// degenerate tree (no-checkout worktree, mid-rebase mass deletion) would otherwise
+        /// turn every tracked file into a blame target.
+        #[arg(long, default_value = "500")]
         max_source_files: usize,
 
         /// Track file rename/move via `git blame -M`.

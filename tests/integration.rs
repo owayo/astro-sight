@@ -11944,3 +11944,132 @@ fn review_hook_ts_shadowed_local_fn_unupdated_caller_exits_nonzero() {
         "対象 caller 未更新なら blocking (exit 1) のまま"
     );
 }
+
+/// dead-code の検出結果には宣言行を含める。
+///
+/// `file` だけだと利用者が結局シンボルを探し直すことになり、
+/// 「識別子検索を AST に置き換える」というツールの目的と噛み合わない。
+#[test]
+fn dead_code_reports_declaration_line() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    std::fs::write(
+        repo.join("lib.ts"),
+        "export function usedFn() {\n  return 1;\n}\n\nexport function unusedFn() {\n  return 2;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("main.ts"),
+        "import { usedFn } from './lib';\nusedFn();\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", repo.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead = json["dead_symbols"].as_array().expect("dead_symbols");
+    let entry = dead
+        .iter()
+        .find(|d| d["name"] == "unusedFn")
+        .unwrap_or_else(|| panic!("unusedFn が dead に出るべき: {json}"));
+    assert_eq!(
+        entry["line"].as_u64(),
+        Some(4),
+        "宣言行 (0-indexed) が付くこと: {entry}"
+    );
+    assert!(
+        !dead.iter().any(|d| d["name"] == "usedFn"),
+        "参照のある usedFn は dead ではない: {json}"
+    );
+}
+
+/// `cochange --git` は未コミットの作業ツリー変更を起点にする。
+///
+/// 旧実装は `git diff --name-only <base> HEAD` (2 revision 形式) で起点を集めており、
+/// 既定 base=HEAD~1 と合わせて「`--git` を付けても未コミット変更を一切見ない」状態だった。
+/// context / impact / review / dead-code はいずれも `git diff <base>` (作業ツリー比較) で
+/// 未コミット変更を見るため、同じ `--git` でも cochange だけ解析対象がずれていた。
+#[test]
+fn cochange_git_picks_up_uncommitted_working_tree_changes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+
+    // a.rs と b.rs を 3 回同時変更して履歴を作る
+    for i in 0..3 {
+        std::fs::write(repo.join("a.rs"), format!("fn a() {{ {i} }}\n")).unwrap();
+        std::fs::write(repo.join("b.rs"), format!("fn b() {{ {i} }}\n")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "pair"]);
+    }
+    // a.rs を未コミットで書き換える (コミットしない)
+    std::fs::write(repo.join("a.rs"), "fn a() { 99 }\n").unwrap();
+
+    let output = cargo_bin()
+        .args(["cochange", "--dir", repo.to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let diag = &json["diagnostics"];
+    assert_eq!(
+        diag["sources_requested"].as_u64(),
+        Some(1),
+        "未コミットの a.rs が起点になること: {json}"
+    );
+    let entries = json["entries"].as_array().expect("entries");
+    assert!(
+        entries.iter().any(|e| e["file_b"] == "b.rs"),
+        "共変更相手 b.rs が出ること: {json}"
+    );
+}
+
+/// 作業ツリーがクリーンなら `cochange --git` は空を返す (review / impact と同じ既定)。
+#[test]
+fn cochange_git_is_empty_on_clean_worktree() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(repo.join("a.rs"), "fn a() {}\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "init"]);
+
+    let output = cargo_bin()
+        .args(["cochange", "--dir", repo.to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["entries"].as_array().map(Vec::len), Some(0));
+    assert_eq!(json["commits_analyzed"].as_u64(), Some(0));
+}

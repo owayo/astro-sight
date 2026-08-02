@@ -168,7 +168,9 @@ pub struct CoChangeOptions {
     /// 起点ファイル (リポジトリ相対パス)。`--git` 経由で diff から自動収集するか
     /// `--paths` / `--paths-file` で明示指定する。
     pub source_files: Vec<String>,
-    /// 基準 revision (None のとき `HEAD~1` を既定とする)。
+    /// 基準 revision (None のとき `HEAD` を既定とする = 未コミットの作業ツリー変更)。
+    /// `git diff <base>` の単一 revision 形式で評価するため、`HEAD~1` を指定すると
+    /// 「直前コミット + 未コミット変更」が対象になる。
     pub base: Option<String>,
     /// pair を出すために必要な最小 confidence (0.0..=1.0)。
     ///
@@ -186,6 +188,11 @@ pub struct CoChangeOptions {
     /// 候補ファイルから除外する glob パターン (BLAME_DEFAULT_EXCLUDE_GLOBS と OR で適用)。
     pub exclude_globs: Vec<String>,
     /// 起点ファイル数の上限。0 = 無制限。超過時は InvalidRequest で停止する。
+    ///
+    /// 既定 500。`--git` の起点収集は `git diff <base>` (作業ツリー比較) なので、
+    /// 退化した作業ツリー (no-checkout worktree、大量削除の途中状態など) では
+    /// 追跡ファイル全件が起点に化けて blame が扇形展開する。実レビューの diff は
+    /// 数十ファイル規模なので 500 は十分に緩く、暴走だけを止める。
     pub max_source_files: usize,
     /// 1 コミットあたりの変更ファイル数の上限。これを超えるコミット (大量生成
     /// / squash-merge 等) は共起カウントから除外する。
@@ -242,7 +249,9 @@ impl Default for CoChangeOptions {
             min_score: 0.0,
             min_samples: 2,
             exclude_globs: Vec::new(),
-            max_source_files: 0,
+            // 暴走ガード。実レビューの diff (数十ファイル) には当たらない緩さで、
+            // 作業ツリーが退化しているときの全件 blame だけを止める。
+            max_source_files: 500,
             // hard cap は緩めにし、実際の抑制は size weighting に任せる。
             max_files_per_commit: 100,
             commit_size_pivot: 8,

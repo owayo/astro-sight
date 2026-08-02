@@ -41,6 +41,17 @@ struct HookNameFile<'a> {
     f: &'a str,
 }
 
+/// dead シンボル用 DTO。`HookNameFile` と分けるのは、宣言行を持つのが
+/// dead / test_only だけで、api 系シンボル (add/rm/mod) は行を持たないため。
+#[derive(Serialize)]
+struct HookDeadSymbol<'a> {
+    n: &'a str,
+    f: &'a str,
+    /// 宣言行 (0-indexed)。解決できなかった場合のみ省略。
+    #[serde(rename = "l", skip_serializing_if = "Option::is_none")]
+    line: Option<usize>,
+}
+
 #[derive(Serialize)]
 struct HookCompatibleModification<'a> {
     n: &'a str,
@@ -373,16 +384,17 @@ pub(crate) fn build_review_hook_json(
         );
     }
 
-    // dead: [{n,f}]
+    // dead: [{n,f,l}]
     if !result.dead_symbols.is_empty() {
         has_blocking_issues = true;
         has_any_output = true;
-        let dead: Vec<HookNameFile<'_>> = result
+        let dead: Vec<HookDeadSymbol<'_>> = result
             .dead_symbols
             .iter()
-            .map(|symbol| HookNameFile {
+            .map(|symbol| HookDeadSymbol {
                 n: symbol.name.as_str(),
                 f: symbol.file.as_str(),
+                line: symbol.line,
             })
             .collect();
         hook_obj.insert(

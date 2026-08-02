@@ -57,7 +57,32 @@ pub(crate) fn detect_dead_symbols_from_files(
 
     let asset_refs = collect_framework_asset_refs(&canonical_dir);
 
-    classify_dead_symbols(&candidates, &index, &counts, &asset_refs)
+    let (mut dead, mut test_only) =
+        classify_dead_symbols(&candidates, &index, &counts, &asset_refs);
+    attach_declaration_lines(dir, &mut dead, &mut test_only);
+    (dead, test_only)
+}
+
+/// 検出済み dead / test-only シンボルに宣言行を付与する。
+///
+/// `file` だけの報告は結局利用者が対象を探し直すことになるため行まで返す。
+/// `extract_symbol_lines` は per-file で 1 度だけ呼び、対象ファイル数ぶんの parse に
+/// 抑える (dead が 0 件のファイルは parse しない)。
+fn attach_declaration_lines(dir: &str, dead: &mut [DeadSymbol], test_only: &mut [DeadSymbol]) {
+    use std::collections::HashMap;
+    let mut cache: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    for sym in dead.iter_mut().chain(test_only.iter_mut()) {
+        let line_map = cache
+            .entry(sym.file.clone())
+            .or_insert_with(|| extract_symbol_lines(dir, &sym.file).unwrap_or_default());
+        // class member の name は qualname (`Container.method`) だが
+        // `extract_symbol_lines` のキーは bare name なので末尾セグメントでも引く
+        // (`filter_dead_by_touched_symbols` と同じ fallback)。
+        sym.line = line_map
+            .get(&sym.name)
+            .or_else(|| line_map.get(bare_name(&sym.name)))
+            .copied();
+    }
 }
 
 /// 候補収集の中間状態。dead-code 候補シンボルと C/C++ liveness 補助情報を保持する。
@@ -363,6 +388,9 @@ fn classify_dead_symbols(
                         name: name.clone(),
                         kind: kind.clone(),
                         file: file.clone(),
+                        // 宣言行は attach_declaration_lines で後付けする
+                        // (per-file の parse を 1 回に集約するため)。
+                        line: None,
                     });
                     continue;
                 }
@@ -375,6 +403,9 @@ fn classify_dead_symbols(
                         name: name.clone(),
                         kind: kind.clone(),
                         file: file.clone(),
+                        // 宣言行は attach_declaration_lines で後付けする
+                        // (per-file の parse を 1 回に集約するため)。
+                        line: None,
                     });
                     continue;
                 }
@@ -396,6 +427,7 @@ fn classify_dead_symbols(
             name: name.clone(),
             kind: kind.clone(),
             file: file.clone(),
+            line: None,
         };
         if test_cnt > 0 {
             // PHPUnit テストクラス内のヘルパーメソッドは test_only からも除外する。

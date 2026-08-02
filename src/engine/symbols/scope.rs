@@ -29,6 +29,7 @@ pub fn is_local_scope_symbol(
         LangId::Go => has_enclosing_function_body_go(node),
         LangId::Java => has_enclosing_function_body_java(node),
         LangId::Kotlin => has_enclosing_function_body_kotlin(node),
+        LangId::Zig => has_enclosing_function_body_zig(node),
         _ => false, // 未対応言語は保守的にローカルと判定しない
     }
 }
@@ -93,6 +94,25 @@ fn has_enclosing_function_body_kotlin(node: Node) -> bool {
     let mut current = node.parent();
     while let Some(n) = current {
         if n.kind() == "function_body"
+            && n.parent()
+                .is_some_and(|p| p.kind() == "function_declaration")
+        {
+            return true;
+        }
+        current = n.parent();
+    }
+    false
+}
+
+/// Zig: 祖先に function_declaration の block があるかチェック。
+///
+/// Zig は `const` / `var` が関数本体でもファイルトップレベルでも同じ
+/// `variable_declaration` になるため、これが無いと関数内のローカル変数が
+/// impact のクロスファイル起点に混ざる (他言語で対処済みの既知 FP と同型)。
+fn has_enclosing_function_body_zig(node: Node) -> bool {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if n.kind() == "block"
             && n.parent()
                 .is_some_and(|p| p.kind() == "function_declaration")
         {

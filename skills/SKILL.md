@@ -24,7 +24,7 @@ The same rule applies inside shell commands: wrapping `grep` / `rg` in Bash is n
 | Review a diff / PR / bug-fix end-to-end | `review --dir . --git` (external patch: `--diff-file <patch>`) |
 | What a change breaks (before editing) | `context --dir . --git` |
 | Unresolved impacts (after editing) | `impact --dir . --git` |
-| Dead (unreferenced) exported symbols | `dead-code --dir .` (diff-scoped: `--git`) |
+| Dead (unreferenced) exported symbols | `dead-code --dir .` (diff-scoped: `--git`) — results carry `line` |
 | File / directory structure | `symbols --path <file>` / `symbols --dir <dir>` |
 | Exact syntax node at a cursor, or parse-error debug | `ast --path <file> --line <n> --col <n>` |
 | Who calls a function / what it calls | `calls --path <file> --function <name>` |
@@ -147,6 +147,10 @@ Output: `imports` array with `src`, `ln`, `kind` (Import/Use/Include/Require), `
 
 Lists function/class/struct/enum definitions. Compact by default for token efficiency: `name`, `kind` (short form), `ln` (0-indexed), plus `cx` (cyclomatic complexity, functions/methods only) and `cn` (enclosing container name) when applicable.
 
+`cx` follows McCabe and is **comparable across languages**: base 1 plus one per decision point. switch/match counts each arm but not the construct itself (a 3-way switch is 4); a plain `else` is not a decision point (`if/else` is 2, `if/else if/else` is 3); ternaries count. Whether a catch-all arm (`default:` / `_ =>`) counts is grammar-dependent, so expect ±1 there. Nested functions and closures keep their own `cx` and do not inflate the enclosing function's.
+
+`cn` is the enclosing container; for Go methods it is the receiver type (`func (b *Box) Area()` → `cn: "Box"`).
+
 ```bash
 astro-sight symbols --path <file>            # single file
 astro-sight symbols --path <file> --doc      # include docstrings
@@ -171,13 +175,14 @@ Output: `diagram` (Mermaid text), `participants` (ordered list).
 Blame-based: starts from source files (auto-derived from `git diff` or explicit), runs `git blame` on changed lines to get the latest-modifying commits, then aggregates co-occurring files from each commit's diff-tree. When changed-line blame cannot produce enough evidence, the source falls back to its own file history.
 
 ```bash
-astro-sight cochange --dir . --git --base HEAD~5                   # auto-derive from diff
+astro-sight cochange --dir . --git                                 # uncommitted changes (same default as review)
+astro-sight cochange --dir . --git --base HEAD~5                   # last 5 commits plus uncommitted
 astro-sight cochange --dir . --paths src/service.rs               # explicit sources (history fallback)
 astro-sight cochange --dir . --git --base HEAD~10 --rename --copy  # track renames/copies
 astro-sight cochange --dir . --git --base HEAD~5 --no-smoothing    # rank by raw confidence
 ```
 
-Output: `entries` with `file_a`, `file_b`, `co_changes`, `confidence`, `denominator` (|C|), `score` (smoothed, ranking-only), and `evidence: "history"` when the pair came from the history fallback (absent = changed-line blame); `commits_analyzed` reports |C|. Requires `--git` or `--paths` / `--paths-file` (default `--base` is HEAD~1). `--min-confidence` / `--min-score` must be finite in `0.0..=1.0`; smoothing priors finite non-negative. Default `--git` source collection skips vendor / node_modules / dist / lock / minified assets; explicit `--paths` are kept as-is (a `--git` diff that is entirely excluded returns an empty result, not an error). Source paths must stay under `--dir` — `..`, absolute, and drive-qualified paths are rejected with `PATH_OUT_OF_BOUNDS`.
+Output: `entries` with `file_a`, `file_b`, `co_changes`, `confidence`, `denominator` (|C|), `score` (smoothed, ranking-only), and `evidence: "history"` when the pair came from the history fallback (absent = changed-line blame); `commits_analyzed` reports |C|. Requires `--git` or `--paths` / `--paths-file`. `--base` defaults to `HEAD` and is evaluated as `git diff <base>` — same as `context` / `impact` / `review` / `dead-code`, so plain `--git` means "my uncommitted changes" and `--base HEAD~5` means "last 5 commits plus uncommitted". `--min-confidence` / `--min-score` must be finite in `0.0..=1.0`; smoothing priors finite non-negative. Default `--git` source collection skips vendor / node_modules / dist / lock / minified assets; explicit `--paths` are kept as-is (a `--git` diff that is entirely excluded returns an empty result, not an error). Source paths must stay under `--dir` — `..`, absolute, and drive-qualified paths are rejected with `PATH_OUT_OF_BOUNDS`.
 
 **Thresholds vs ranking**: `--min-confidence` (default 0.3) gates on the raw `co_changes / denominator` ratio. The smoothed `score` is used only for ordering — gating on it would make small-evidence sources structurally unreportable, since its ceiling is `(denom + alpha) / (denom + alpha + beta)` (with the default beta=8, a source with 2 evidence commits caps at 0.27). Use `--min-score` if you explicitly want a shrinkage gate on top.
 

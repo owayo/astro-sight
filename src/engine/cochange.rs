@@ -103,7 +103,10 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
         Ok(())
     };
 
-    let base_rev: &str = opts.base.as_deref().unwrap_or("HEAD~1");
+    let base_rev: &str = opts
+        .base
+        .as_deref()
+        .unwrap_or(crate::commands::DEFAULT_BLAME_BASE);
     // base は git diff / git blame に直接渡されるため、`-` プレフィクス等の
     // オプション誤認識を防ぐ revision 検証を必ず通す。--paths/--paths-file 経由で
     // resolve_blame_source_files の検証を迂回しても安全側に倒れる。
@@ -612,8 +615,11 @@ struct ChangedOldRanges {
 /// `new_file` は diff ヘッダの `--- /dev/null` で判定する
 /// (base 側にファイルが無い = 新規追加 = 履歴 fallback も効かない)。
 fn collect_changed_old_ranges(dir: &str, file: &str, base: &str) -> Result<ChangedOldRanges> {
+    // revision は `<base>` 単独 (`<base> HEAD` ではない)。2 revision 形式では
+    // 未コミットの作業ツリー変更が hunk に現れず、pre-commit レビュー時に
+    // 変更行 blame の証拠が常に空になる (他の --git コマンドと意味を揃える)。
     let diff_output = Command::new("git")
-        .args(["diff", "--unified=0", base, "HEAD", "--", file])
+        .args(["diff", "--unified=0", base, "--", file])
         .current_dir(dir)
         .output()
         .map_err(|e| AstroError::new(ErrorCode::IoError, format!("Failed to run git: {e}")))?;

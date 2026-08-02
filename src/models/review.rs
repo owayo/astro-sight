@@ -125,6 +125,11 @@ pub struct DeadSymbol {
     pub name: String,
     pub kind: String,
     pub file: String,
+    /// 宣言行 (0-indexed)。`file` だけでは利用者が結局シンボルを探し直す必要があり、
+    /// 「識別子検索を AST に置き換える」という本ツールの目的と噛み合わないため付ける。
+    /// 宣言行を解決できなかった場合のみ省略される。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub line: Option<usize>,
 }
 
 /// 別ファイルへ移動された公開シンボル。

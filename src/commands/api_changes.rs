@@ -2381,6 +2381,12 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
 
     fn qualname(&self, sym: &Symbol) -> String {
         if matches!(sym.kind, SymbolKind::Method | SymbolKind::Function) {
+            // 抽出器が container を確定させている場合はそれを優先する。
+            // Go のメソッドはレシーバ型が container だが宣言はトップレベルに並ぶため、
+            // range 内包ベースの `enclosing_container` では引き当てられない。
+            if let Some(container) = sym.container.as_deref() {
+                return format!("{container}.{}", sym.name);
+            }
             enclosing_container(sym, &self.containers)
                 .map(|c| format!("{}.{}", c.name, sym.name))
                 .unwrap_or_else(|| sym.name.clone())

@@ -352,7 +352,9 @@ pub fn cmd_cochange(
 
 mod git_input;
 
-pub use git_input::{BlameSourceResolution, resolve_blame_source_files, run_git_diff};
+pub use git_input::{
+    BlameSourceResolution, DEFAULT_BLAME_BASE, resolve_blame_source_files, run_git_diff,
+};
 pub(crate) use git_input::{DiffSourceResolution, resolve_diff_source};
 // GitDiffInput / resolve_git_diff は Task 4 で resolve_diff_source に内包され、
 // 非テストコードからの直接参照は無くなった。tests.rs のみが `super::*` 経由で使う。

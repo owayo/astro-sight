@@ -84,15 +84,39 @@ fn function_boundary_kinds(lang_id: LangId) -> &'static [&'static str] {
 
 /// 言語別の分岐ノード種別を返す。
 /// 静的スライスを返すことで毎回の Vec アロケーションを回避する。
+///
+/// # 計上規約 (McCabe に揃える。言語をまたいで同じ値になることが要件)
+///
+/// 同じロジックが言語によって違う cx になると、しきい値 (例 `cx > 10`) での判断も
+/// polyglot リポジトリでの比較も成立しない。次の 3 点を全言語で守る:
+///
+/// 1. **switch/match は arm だけを数え、構文本体は数えない**。`switch (a) { case 1..3 }`
+///    は判定点 3 個なので cx=4。本体ノードも数えると 5 になり 1 つ過大。
+///    (旧実装は C/C++/Go/PHP/Python/Kotlin/Swift/Ruby/bash/Zig/Rust が二重計上、
+///    Java は逆に arm を 1 つも数えず 3 分岐が cx=2 になっていた)
+/// 2. **plain `else` は数えない**。分岐の「もう一方の経路」であって判定点ではない。
+///    `else if` はネストした `if` として自然に +1 される。
+///    (旧実装は Rust/Zig だけ `else_clause` を数え if/else が cx=3 になっていた)
+/// 3. **三項演算子は数える**。判定点そのもの。
+///    (旧実装は PHP/Java/C#/Ruby で欠落していた)
+///
+/// catch-all arm (`default:` / `_ =>` / `else ->`) を数えるかは文法依存で残る:
+/// 別ノードを持つ文法 (Go の `default_case`、JS の `switch_default`、PHP の
+/// `default_statement`、Ruby の `else`) では数えず、arm と同一ノードになる文法
+/// (Rust/Kotlin/Python/Swift/Java/C#/C) では数える。ノード種別だけで判別できないため、
+/// ここは ±1 のぶれとして許容する (実在の複雑度ツール間でも解釈が分かれる)。
+///
+/// テーブルを触るときは必ず `astro-sight ast` で実ノード名をダンプして照合すること。
+/// 汎用スライスの流用は「1 つもマッチせず cx=1 のまま」という無害に見える壊れ方をする。
 fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
     match lang_id {
+        // `match_expression` 本体と plain `else_clause` は判定点ではないため数えない
+        // (`match_arm` / ネストした `if_expression` 側で計上される)。
         LangId::Rust => &[
             "if_expression",
-            "match_expression",
             "for_expression",
             "while_expression",
             "loop_expression",
-            "else_clause",
             "match_arm",
         ],
         LangId::Javascript | LangId::Typescript | LangId::Tsx => &[
@@ -105,8 +129,8 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
             "ternary_expression",
             "catch_clause",
         ],
-        // `match` 文 (PEP 634) は `match_statement` + arm ごとの `case_clause`。
-        // 双方欠けていたため match だけを持つ関数がベース 1 のまま返っていた。
+        // `match` 文 (PEP 634) の arm は `case_clause`。本体 `match_statement` は
+        // 判定点ではないので数えない (旧実装は本体も数えて 1 つ過大だった)。
         LangId::Python => &[
             "if_statement",
             "elif_clause",
@@ -114,40 +138,42 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
             "while_statement",
             "except_clause",
             "conditional_expression",
-            "match_statement",
             "case_clause",
         ],
-        // tree-sitter-go の switch は種別ごとにノード名が分かれる
-        // (`expression_switch_statement` / `type_switch_statement` / `select_statement`) で、
-        // arm も `expression_case` / `type_case` / `communication_case` と別名。
-        // 旧テーブルの `case_clause` は Go に存在せず (Python 側のノード名)、
-        // 最も一般的な plain switch は文自体も arm も 0 計上だった。
-        // `default_case` は暗黙の fall-through 経路なので JS/PHP/Ruby と同様に数えない。
+        // tree-sitter-go の switch は種別ごとに arm 名が分かれる
+        // (`expression_case` / `type_case` / `communication_case`)。旧テーブルの
+        // `case_clause` は Go に存在せず (Python 側のノード名) plain switch が 0 計上だった。
+        // 本体 (`expression_switch_statement` 等) は判定点ではないので数えない。
+        // `default_case` は暗黙の fall-through 経路なので数えない。
         LangId::Go => &[
             "if_statement",
             "for_statement",
-            "expression_switch_statement",
-            "type_switch_statement",
-            "select_statement",
             "expression_case",
             "type_case",
             "communication_case",
         ],
+        // tree-sitter-java は switch 文も式も `switch_expression` 1 種で、arm は
+        // colon 構文が `switch_block_statement_group`、arrow 構文 (Java 14+) が
+        // `switch_rule` と分かれる。両構文に共通して 1 arm = 1 個現れるのは
+        // `switch_label` なのでこれを arm カウンタに使う (fall-through の
+        // `case 1: case 2:` も label 数 = 進入経路数で正しく 2 になる)。
+        // 旧テーブルは本体 `switch_expression` だけを数えており、3 分岐 switch が
+        // cx=2 という実態と逆の値を返していた。三項演算子も欠落していた。
         LangId::Java => &[
             "if_statement",
-            "switch_expression",
+            "switch_label",
             "for_statement",
             "enhanced_for_statement",
             "while_statement",
             "do_statement",
             "catch_clause",
+            "ternary_expression",
         ],
         // Kotlin の分岐ノードは tree-sitter-kotlin 固有名 (`if_expression` / `when_expression` /
         // `when_entry` / `do_while_statement` / `catch_block` / `elvis_expression`)。
         // Java と同じスライスを共用すると一切マッチせず複雑度がベース 1 のまま返る。
         LangId::Kotlin => &[
             "if_expression",
-            "when_expression",
             "when_entry",
             "for_statement",
             "while_statement",
@@ -161,7 +187,6 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
         LangId::Swift => &[
             "if_statement",
             "guard_statement",
-            "switch_statement",
             "switch_entry",
             "for_statement",
             "while_statement",
@@ -169,28 +194,49 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
             "catch_block",
             "ternary_expression",
         ],
+        // 三項演算子は tree-sitter-ruby では `conditional` (他言語の
+        // `conditional_expression` / `ternary_expression` ではない)。欠落していた。
+        // `case` 本体は判定点ではないので数えない (`when` 側で計上)。
         LangId::Ruby => &[
-            "if", "elsif", "unless", "case", "when", "for", "while", "until", "rescue",
+            "if",
+            "elsif",
+            "unless",
+            "when",
+            "for",
+            "while",
+            "until",
+            "rescue",
+            "conditional",
         ],
+        // `elseif` は `else_if_clause`、三項演算子は `conditional_expression`。
+        // どちらも欠落しており、`if/elseif/else` が cx=2、三項のみの関数が cx=1 だった。
+        // `switch_statement` 本体は判定点ではないので数えない (`case_statement` 側で計上)。
         LangId::Php => &[
             "if_statement",
-            "switch_statement",
+            "else_if_clause",
             "case_statement",
             "for_statement",
             "foreach_statement",
             "while_statement",
             "do_statement",
             "catch_clause",
+            "conditional_expression",
         ],
+        // tree-sitter-c-sharp の foreach は `foreach_statement` (アンダースコア無し)。
+        // 旧テーブルの `for_each_statement` は存在しないノード名で 1 つもマッチせず、
+        // foreach だけの関数が cx=1 のまま返っていた。三項も欠落していた。
         LangId::CSharp => &[
             "if_statement",
             "switch_section",
             "for_statement",
-            "for_each_statement",
+            "foreach_statement",
             "while_statement",
             "do_statement",
             "catch_clause",
+            "conditional_expression",
         ],
+        // `switch_expression` 本体と plain `else_clause` は判定点ではないので数えない
+        // (`switch_case` / ネストした `if` 側で計上される)。
         LangId::Zig => &[
             "if_expression",
             "if_statement",
@@ -198,19 +244,18 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
             "for_statement",
             "while_expression",
             "while_statement",
-            "switch_expression",
             "switch_case",
             "catch_expression",
-            "else_clause",
         ],
         // C/C++ は `do ... while` が `do_statement`、三項演算子が `conditional_expression`。
         // 旧汎用スライスはどちらも持たず、これらだけを持つ関数がベース 1 のまま返っていた。
+        // `switch_statement` 本体は判定点ではないので数えない (`case_statement` 側で計上。
+        // tree-sitter-c では `default:` も `case_statement` なので catch-all も 1 計上される)。
         LangId::C | LangId::Cpp => &[
             "if_statement",
             "for_statement",
             "while_statement",
             "do_statement",
-            "switch_statement",
             "case_statement",
             "conditional_expression",
             "catch_clause",
@@ -223,7 +268,6 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
             "elif_clause",
             "for_statement",
             "while_statement",
-            "case_statement",
             "case_item",
         ],
         // lexer-only 言語は AST を持たず calculate_complexity へ到達しない。
