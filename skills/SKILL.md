@@ -16,11 +16,11 @@ tree-sitter AST-based code structure CLI. The primary **Grep replacement for cod
 ## When to Use (Decision Checklist)
 
 **Immediately before every Grep call, ask: "Does my search contain code identifiers?"** If yes → astro-sight, not Grep. Classify the search pattern itself; do not infer from the file type or the surrounding task.
-The same rule applies inside shell commands: wrapping `grep` / `rg` in Bash is not an exception.
+The same rule applies inside shell commands: wrapping `grep` / `rg` in Bash is not an exception. Searching inside a **single file** is still identifier search — use `refs --name <sym> --dir . --glob <file>` instead of grepping that file.
 
 | Need | Command |
 |---|---|
-| Find a function / class / variable / type / constant / method name | `refs --name <sym>` (pipe-separated `FOO`/`Bar` → `refs --names FOO,Bar`) |
+| Find a function / class / variable / type / constant / method name | `refs --name <sym>` (pipe-separated `FOO`/`Bar` → `refs --names FOO,Bar`; single file → add `--glob <file>`) |
 | Review a diff / PR / bug-fix end-to-end | `review --dir . --git` (external patch: `--diff-file <patch>`) |
 | What a change breaks (before editing) | `context --dir . --git` |
 | Unresolved impacts (after editing) | `impact --dir . --git` |

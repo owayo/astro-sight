@@ -80,6 +80,25 @@ pub(crate) fn detect_missing_cochanges(
             diagnostics: Default::default(),
         });
     }
+    // 起点過多 (退化した作業ツリー等で diff が全追跡ファイルに化けたケース) では
+    // cochange フェーズだけを skip し、impact / API 差分 / dead 検出は継続する。
+    // analyze_cochange に渡すと max_source_files ガードが InvalidRequest を返し、
+    // 下の伝播フィルタが review 全体を exit 1 に落としてしまう (review には
+    // 上限を制御するフラグが無く、ユーザーには回避手段が無い)。
+    let max_source_files = CoChangeOptions::default().max_source_files;
+    if max_source_files > 0 && source_files.len() > max_source_files {
+        let mut diagnostics = crate::models::cochange::CoChangeDiagnostics {
+            sources_requested: source_files.len(),
+            ..Default::default()
+        };
+        diagnostics
+            .add_reason(crate::models::cochange::CoChangeDiagnosticReason::SourceFilesExceedLimit);
+        diagnostics.finalize();
+        return Ok(MissingCochangeReport {
+            missing: Vec::new(),
+            diagnostics,
+        });
+    }
     // review の差分取得で使った base を blame 解析にも渡し、複数コミット範囲の
     // review でも同じ変更範囲を対象にする。base 解決失敗や git 不在は engine 側で
     // 空集合を返すので最終的に Vec::new() に落ちる。

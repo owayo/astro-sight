@@ -89,6 +89,10 @@ pub enum CoChangeDiagnosticReason {
     BelowMinScore,
     /// git コマンドが失敗した (証拠なしと区別する)。
     GitCommandFailed,
+    /// 起点ファイル数が `max_source_files` を超えたため解析をスキップした。
+    /// review 経路では起点過多 (退化した作業ツリー等) で cochange フェーズだけを
+    /// 諦め、impact / API 差分 / dead 検出は継続する。
+    SourceFilesExceedLimit,
 }
 
 /// 共変更分析の内訳。`entries` が空のときに「共変更が無い」のか

@@ -53,7 +53,7 @@ pub struct AstgenRequest {
     /// blame ベースの共変更分析で起点にするファイル（リポジトリルート相対）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_files: Option<Vec<String>>,
-    /// blame ベースの共変更分析の基準 revision（既定値: HEAD~1）
+    /// blame ベースの共変更分析の基準 revision（既定値: HEAD = 未コミットの作業ツリー変更）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
     /// 追加で除外するディレクトリ名 (context コマンドの impact cross-file 解析で適用)

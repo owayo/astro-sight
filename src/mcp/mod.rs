@@ -144,7 +144,7 @@ pub struct CochangeAnalyzeParams {
     pub dir: String,
     /// Source files for blame-based co-change analysis (relative to repo root)
     pub source_files: Vec<String>,
-    /// Base revision for diff/blame (default: HEAD~1)
+    /// Base revision for diff/blame (default: HEAD = uncommitted working-tree changes)
     #[serde(default)]
     pub base: Option<String>,
     /// Minimum confidence threshold (default: 0.3)

@@ -13568,6 +13568,49 @@ fn detect_missing_cochanges_propagates_invalid_request_error() {
     assert_eq!(astro_err.code, crate::error::ErrorCode::InvalidRequest);
 }
 
+/// 起点ファイル数が `max_source_files` を超えても review 経路は InvalidRequest で
+/// 落ちず、cochange フェーズだけを skip して `SourceFilesExceedLimit` 診断付きの
+/// 空レポートを返す回帰テスト。退化した作業ツリー (no-checkout worktree 等) で
+/// diff が全追跡ファイルに化けたとき、review には上限を制御するフラグが無いため
+/// analyze_cochange のガードをそのまま伝播すると review 全体が exit 1 になる。
+#[test]
+fn detect_missing_cochanges_skips_cochange_when_sources_exceed_limit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(repo, &[("a.rs", "v1")], "initial");
+
+    let service = AppService::new();
+    // ガードは analyze_cochange 呼び出し前に効くため、実ファイルは不要。
+    let limit = crate::models::cochange::CoChangeOptions::default().max_source_files;
+    assert!(limit > 0, "既定の max_source_files は正の値のはず");
+    let changed_files: HashSet<String> = (0..=limit).map(|i| format!("src/file_{i}.rs")).collect();
+
+    let report = detect_missing_cochanges(
+        &service,
+        repo.to_str().expect("utf-8 path"),
+        &changed_files,
+        0.3,
+        None,
+    )
+    .expect("exceeding max_source_files must not fail the review pipeline");
+
+    assert!(
+        report.missing.is_empty(),
+        "cochange 解析を skip したので missing は空のはず。got: {:?}",
+        report.missing
+    );
+    assert!(
+        report
+            .diagnostics
+            .reasons
+            .contains(&crate::models::cochange::CoChangeDiagnosticReason::SourceFilesExceedLimit),
+        "skip 理由が diagnostics.reasons に載るはず。got: {:?}",
+        report.diagnostics.reasons
+    );
+    assert_eq!(report.diagnostics.sources_requested, changed_files.len());
+}
+
 #[test]
 fn resolve_blame_source_files_filters_default_excludes_for_git_only() {
     // --git 経由で diff から起点ファイルを取得する場合、
