@@ -532,6 +532,8 @@ impl AppService {
         Ok(ContextResult {
             changes,
             skipped: None,
+            // 打ち切りは diff 取得層 (git_input) が持つ情報なので、CLI 側で結果に載せる。
+            truncations: Vec::new(),
         })
     }
 

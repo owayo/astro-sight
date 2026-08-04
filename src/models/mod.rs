@@ -14,3 +14,4 @@ pub mod review;
 pub mod sequence;
 pub mod skip;
 pub mod symbol;
+pub mod truncation;

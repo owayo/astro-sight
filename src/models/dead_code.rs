@@ -19,4 +19,7 @@ pub struct DeadCodeResult {
     /// git 管理外 dir で `--git` が要求され diff を取得できず skip した場合の理由。
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub skipped: Option<SkipInfo>,
+    /// 解析対象から意図的に外したもの (未追跡の巨大ファイル等)。空なら出力に含まれない。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub truncations: Vec<crate::models::truncation::TruncationInfo>,
 }

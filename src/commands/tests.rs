@@ -2018,7 +2018,7 @@ fn resolve_git_diff_skips_non_git_dir() {
             assert_eq!(skip.reason.as_str(), "not_git_repository");
             assert_eq!(skip.source.as_str(), "git");
         }
-        GitDiffInput::Diff(_) => panic!("非 git dir では Skipped を返すべき"),
+        GitDiffInput::Diff { .. } => panic!("非 git dir では Skipped を返すべき"),
     }
 }
 
@@ -2029,6 +2029,173 @@ fn resolve_git_diff_rejects_invalid_base_even_when_non_git() {
     assert!(
         resolve_git_diff(dir.path().to_str().expect("utf-8"), "-x", false).is_err(),
         "先頭 '-' の base は非 git でも Err"
+    );
+}
+
+/// テストヘルパー: `resolve_git_diff` から diff と打ち切り情報を取り出す。
+fn resolve_git_diff_parts(
+    repo: &std::path::Path,
+) -> (String, Vec<crate::models::truncation::TruncationInfo>) {
+    match resolve_git_diff(repo.to_str().expect("utf-8"), "HEAD", false).expect("resolve") {
+        GitDiffInput::Diff { diff, truncations } => (diff, truncations),
+        GitDiffInput::Skipped(_) => panic!("git リポでは Diff を返すべき"),
+    }
+}
+
+/// 行数上限を超える未追跡ファイルは合成 diff に含めず `truncations` に記録する。
+///
+/// 生成物 (数万行 / 数万 `pub fn`) を合成すると全 exported symbol が api.add 候補になり、
+/// `detect_api_changes` の Phase 0 が数万 name を ApiRefIndex に渡して review が数十分かかり、
+/// Stop hook が 120 秒でタイムアウトして沈黙する (実測 1.75 秒 → 10 分超)。
+/// 除外を silent にすると「全部レビュー済み」と読めるため必ず報告する
+/// (Issue 2026-08-04-review-git-untracked-huge-file-blowup)
+#[test]
+fn resolve_git_diff_excludes_untracked_over_line_limit_and_reports_truncation() {
+    use crate::commands::git_input::MAX_UNTRACKED_FILE_LINES;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(repo, &[("src/lib.rs", "pub fn existing() {}\n")], "initial");
+
+    // 1 行が短いためサイズ上限には達しないが行数上限を超える生成物風ファイル。
+    let generated: String = (0..=MAX_UNTRACKED_FILE_LINES)
+        .map(|i| format!("pub fn f{i}() {{}}\n"))
+        .collect();
+    fs::write(repo.join("generated.rs"), &generated).expect("write oversized untracked");
+    // 上限内の未追跡は従来どおり合成されること (巻き込みがないこと) も同時に確認する。
+    fs::write(repo.join("src/new_helper.rs"), "pub fn helper() {}\n").expect("write small");
+
+    let (diff, truncations) = resolve_git_diff_parts(repo);
+
+    assert!(
+        !diff.contains("generated.rs"),
+        "行数上限超過の未追跡は合成しない: {diff}"
+    );
+    assert!(
+        diff.contains("+++ b/src/new_helper.rs"),
+        "上限内の未追跡は従来どおり合成する: {diff}"
+    );
+    let reported = truncations
+        .iter()
+        .find(|t| t.path.as_deref() == Some("generated.rs"))
+        .unwrap_or_else(|| panic!("除外した未追跡は truncations に載せるべき: {truncations:?}"));
+    assert_eq!(
+        reported.reason,
+        crate::models::truncation::TruncationReason::UntrackedFileTooLarge
+    );
+    assert!(
+        reported.message.contains("lines"),
+        "超過した上限の種類を message に含めるべき: {}",
+        reported.message
+    );
+}
+
+/// サイズ上限を超える未追跡ファイルも同様に除外して報告する (read 前に metadata で弾く)。
+#[test]
+fn resolve_git_diff_excludes_untracked_over_size_limit_and_reports_truncation() {
+    use crate::commands::git_input::MAX_UNTRACKED_FILE_SIZE;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(repo, &[("src/lib.rs", "pub fn existing() {}\n")], "initial");
+
+    // 行数は少ないがサイズ上限を超えるファイル (長い文字列リテラル 1 本)。
+    let padding = "x".repeat(MAX_UNTRACKED_FILE_SIZE);
+    fs::write(
+        repo.join("blob.rs"),
+        format!("pub fn big() -> &'static str {{ \"{padding}\" }}\n"),
+    )
+    .expect("write oversized untracked");
+
+    let (diff, truncations) = resolve_git_diff_parts(repo);
+
+    assert!(
+        !diff.contains("blob.rs"),
+        "サイズ上限超過の未追跡は合成しない: {}",
+        &diff[..diff.len().min(400)]
+    );
+    let reported = truncations
+        .iter()
+        .find(|t| t.path.as_deref() == Some("blob.rs"))
+        .unwrap_or_else(|| panic!("除外した未追跡は truncations に載せるべき: {truncations:?}"));
+    assert!(
+        reported.message.contains("size"),
+        "超過した上限の種類を message に含めるべき: {}",
+        reported.message
+    );
+}
+
+/// 上限超過ファイルへの rename は削除 block を除去して api.rm / rm_dead を出さない。
+///
+/// 上限超過を「無かったこと」にして deleted 側だけ残すと、巨大ファイルを rename した
+/// だけで旧ファイルの全 exported symbol が api.rm / rm_dead に流れ込む (実測 5,001 個 /
+/// 135KB の hook 出力)。rename 相手としては残し、中身 (Modified diff) だけ合成しないことで
+/// 「rename は認識するが中身は見ない」挙動にする
+/// (Issue 2026-08-04-review-git-untracked-huge-file-blowup のリグレッション防止)
+#[test]
+fn resolve_git_diff_oversized_untracked_rename_suppresses_deletion_block() {
+    use crate::commands::git_input::MAX_UNTRACKED_FILE_LINES;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    // 行数上限を超える生成物風ファイルを commit しておく。
+    let generated: String = (0..=MAX_UNTRACKED_FILE_LINES)
+        .map(|i| format!("pub fn f{i}() {{}}\n"))
+        .collect();
+    git_commit_files(repo, &[("generated.rs", &generated)], "initial");
+
+    // rename: 削除 + 同内容の未追跡 (git は untracked を diff に出さないので合成対象)。
+    fs::rename(repo.join("generated.rs"), repo.join("renamed.rs")).expect("rename");
+
+    let (diff, truncations) = resolve_git_diff_parts(repo);
+
+    assert!(
+        !diff.contains("--- a/generated.rs"),
+        "rename 元の削除 block は除去すべき (api.rm / rm_dead ノイズを出さない): {}",
+        &diff[..diff.len().min(400)]
+    );
+    assert!(
+        !diff.contains("renamed.rs"),
+        "上限超過の rename 先は中身を合成しない: {}",
+        &diff[..diff.len().min(400)]
+    );
+    assert!(
+        truncations
+            .iter()
+            .any(|t| t.path.as_deref() == Some("renamed.rs")),
+        "中身を見ていないことは報告する: {truncations:?}"
+    );
+
+    // 削除 block が残っていない = api.rm / rm_dead が発生しないことを検出側でも確認する。
+    let diff_files = crate::engine::diff::parse_unified_diff(&diff);
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.removed.is_empty() && api.removed_dead.is_empty(),
+        "上限超過ファイルの rename で削除 API を報告してはいけない: removed={:?} removed_dead={:?}",
+        api.removed.len(),
+        api.removed_dead.len()
+    );
+}
+
+/// 上限内の未追跡ファイルだけなら `truncations` は空 (通常時に余計な出力を出さない)。
+#[test]
+fn resolve_git_diff_reports_no_truncation_for_normal_untracked() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(repo, &[("src/lib.rs", "pub fn existing() {}\n")], "initial");
+    fs::write(repo.join("src/new_helper.rs"), "pub fn helper() {}\n").expect("write small");
+
+    let (diff, truncations) = resolve_git_diff_parts(repo);
+
+    assert!(
+        diff.contains("+++ b/src/new_helper.rs"),
+        "通常サイズの未追跡は合成する: {diff}"
+    );
+    assert!(
+        truncations.is_empty(),
+        "上限内なら打ち切りは報告しない: {truncations:?}"
     );
 }
 
@@ -9159,6 +9326,7 @@ fn build_review_hook_json_compatible_modified_is_informational() {
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
+            truncations: Vec::new(),
         },
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
@@ -9183,6 +9351,7 @@ fn build_review_hook_json_compatible_modified_is_informational() {
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
         skipped: None,
+        truncations: Vec::new(),
     };
     let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
     assert!(
@@ -9231,6 +9400,7 @@ fn build_review_hook_json_compatible_modified_impact_is_informational() {
                 informational_callers: Vec::new(),
             }],
             skipped: None,
+            truncations: Vec::new(),
         },
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
@@ -9257,6 +9427,7 @@ fn build_review_hook_json_compatible_modified_impact_is_informational() {
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
         skipped: None,
+        truncations: Vec::new(),
     };
 
     let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
@@ -9318,6 +9489,7 @@ fn build_review_hook_json_mixed_compatible_and_breaking_impact_keeps_breaking_on
                 informational_callers: Vec::new(),
             }],
             skipped: None,
+            truncations: Vec::new(),
         },
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
@@ -9352,6 +9524,7 @@ fn build_review_hook_json_mixed_compatible_and_breaking_impact_keeps_breaking_on
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
         skipped: None,
+        truncations: Vec::new(),
     };
 
     let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
@@ -12739,6 +12912,7 @@ fn build_review_hook_json_cochange_only_is_informational() {
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
+            truncations: Vec::new(),
         },
         missing_cochanges: vec![MissingCochange {
             file: "a.rs".to_string(),
@@ -12760,6 +12934,7 @@ fn build_review_hook_json_cochange_only_is_informational() {
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
         skipped: None,
+        truncations: Vec::new(),
     };
 
     let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
@@ -12812,6 +12987,7 @@ fn build_review_hook_json_impact_info_only_is_informational() {
                 }],
             }],
             skipped: None,
+            truncations: Vec::new(),
         },
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
@@ -12829,6 +13005,7 @@ fn build_review_hook_json_impact_info_only_is_informational() {
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
         skipped: None,
+        truncations: Vec::new(),
     };
 
     let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
@@ -12856,6 +13033,7 @@ fn build_review_hook_json_api_add_only_is_informational() {
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
+            truncations: Vec::new(),
         },
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
@@ -12878,6 +13056,7 @@ fn build_review_hook_json_api_add_only_is_informational() {
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
         skipped: None,
+        truncations: Vec::new(),
     };
 
     let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
@@ -12909,6 +13088,7 @@ fn build_review_hook_json_api_add_carries_extraction_scope() {
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
+            truncations: Vec::new(),
         },
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
@@ -12916,6 +13096,7 @@ fn build_review_hook_json_api_add_carries_extraction_scope() {
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
         skipped: None,
+        truncations: Vec::new(),
     };
 
     let with_add = review_with(ApiChanges {
@@ -12967,6 +13148,7 @@ fn build_review_hook_json_api_add_carries_internal_ref_count() {
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
+            truncations: Vec::new(),
         },
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
@@ -12977,6 +13159,7 @@ fn build_review_hook_json_api_add_carries_internal_ref_count() {
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
         skipped: None,
+        truncations: Vec::new(),
     };
 
     // 同一ファイル内に実利用参照が 2 件 → `ri: 2` を出して refs 再実行を不要にする
@@ -13016,6 +13199,48 @@ fn build_review_hook_json_api_add_carries_internal_ref_count() {
     );
 }
 
+/// 打ち切り (未追跡の巨大ファイル除外) は hook 出力の `trunc` に載り、blocking にはしない。
+/// hook で沈黙させると「レビュー範囲が欠けたこと」に気付けず「全部見た」と読める
+/// (Issue 2026-08-04-review-git-untracked-huge-file-blowup)
+#[test]
+fn build_review_hook_json_reports_truncations_without_blocking() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let result = ReviewResult {
+        truncations: vec![
+            crate::models::truncation::TruncationInfo::untracked_file_too_large(
+                "generated.rs",
+                "lines",
+                80_000,
+                5_000,
+            ),
+        ],
+        ..Default::default()
+    };
+
+    let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
+    let value = build.value.expect("打ち切りだけでも hook 出力を出すべき");
+    assert_eq!(
+        value["trunc"][0]["f"], "generated.rs",
+        "除外したファイルを hook にも出すべき: {value}"
+    );
+    assert_eq!(
+        value["trunc"][0]["r"], "untracked_file_too_large",
+        "打ち切り理由を機械可読キーで出すべき: {value}"
+    );
+    assert!(
+        !build.is_blocking,
+        "打ち切りは検出ではなく解析範囲の申告なので Stop hook を止めない"
+    );
+
+    // 打ち切りが無ければ `trunc` キー自体を出さない (compact 規約)。
+    let clean = ReviewResult::default();
+    let build = build_review_hook_json(&clean, dir.path().to_str().expect("utf-8 path"), false);
+    assert!(
+        build.value.is_none(),
+        "検出も打ち切りも無ければ hook は無出力"
+    );
+}
+
 /// api.removed は破壊的変更の可能性があるため blocking になる
 #[test]
 fn build_review_hook_json_api_removed_is_blocking() {
@@ -13025,6 +13250,7 @@ fn build_review_hook_json_api_removed_is_blocking() {
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
+            truncations: Vec::new(),
         },
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
@@ -13047,6 +13273,7 @@ fn build_review_hook_json_api_removed_is_blocking() {
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
         skipped: None,
+        truncations: Vec::new(),
     };
 
     let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
@@ -13063,6 +13290,7 @@ fn build_review_hook_json_api_modified_is_blocking() {
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
+            truncations: Vec::new(),
         },
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
@@ -13086,6 +13314,7 @@ fn build_review_hook_json_api_modified_is_blocking() {
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
         skipped: None,
+        truncations: Vec::new(),
     };
 
     let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
@@ -13105,6 +13334,7 @@ fn build_review_hook_json_removed_dead_only_is_not_blocking() {
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
+            truncations: Vec::new(),
         },
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
@@ -13135,6 +13365,7 @@ fn build_review_hook_json_removed_dead_only_is_not_blocking() {
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
         skipped: None,
+        truncations: Vec::new(),
     };
 
     let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
@@ -13155,6 +13386,7 @@ fn build_review_hook_json_const_value_only_is_informational() {
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
+            truncations: Vec::new(),
         },
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
@@ -13178,6 +13410,7 @@ fn build_review_hook_json_const_value_only_is_informational() {
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
         skipped: None,
+        truncations: Vec::new(),
     };
     let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
     assert!(
@@ -13197,6 +13430,7 @@ fn build_review_hook_json_const_value_is_blocking_under_strict() {
         impact: crate::models::impact::ContextResult {
             changes: Vec::new(),
             skipped: None,
+            truncations: Vec::new(),
         },
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
@@ -13220,6 +13454,7 @@ fn build_review_hook_json_const_value_is_blocking_under_strict() {
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
         skipped: None,
+        truncations: Vec::new(),
     };
     let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), true);
     assert!(
@@ -13261,6 +13496,7 @@ fn build_review_hook_json_uses_changed_symbols_in_summary() {
                 informational_callers: Vec::new(),
             }],
             skipped: None,
+            truncations: Vec::new(),
         },
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
@@ -13278,6 +13514,7 @@ fn build_review_hook_json_uses_changed_symbols_in_summary() {
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
         skipped: None,
+        truncations: Vec::new(),
     };
 
     let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
@@ -13340,6 +13577,7 @@ fn build_review_hook_json_filters_non_causal_affected_symbols_from_syms() {
                 informational_callers: Vec::new(),
             }],
             skipped: None,
+            truncations: Vec::new(),
         },
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
@@ -13357,6 +13595,7 @@ fn build_review_hook_json_filters_non_causal_affected_symbols_from_syms() {
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
         skipped: None,
+        truncations: Vec::new(),
     };
 
     let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
@@ -13413,6 +13652,7 @@ fn build_review_hook_json_added_only_caller_is_not_blocking() {
                 informational_callers: Vec::new(),
             }],
             skipped: None,
+            truncations: Vec::new(),
         },
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
@@ -13430,6 +13670,7 @@ fn build_review_hook_json_added_only_caller_is_not_blocking() {
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
         skipped: None,
+        truncations: Vec::new(),
     };
 
     let build = build_review_hook_json(&result, dir.path().to_str().unwrap(), false);
@@ -13497,6 +13738,7 @@ fn build_review_hook_json_mixed_added_and_modified_keeps_only_modified() {
                 informational_callers: Vec::new(),
             }],
             skipped: None,
+            truncations: Vec::new(),
         },
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
@@ -13514,6 +13756,7 @@ fn build_review_hook_json_mixed_added_and_modified_keeps_only_modified() {
         dead_symbols: Vec::new(),
         test_only_symbols: Vec::new(),
         skipped: None,
+        truncations: Vec::new(),
     };
 
     let build = build_review_hook_json(&result, dir.path().to_str().unwrap(), false);

@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow, bail};
 
 use crate::error::{AstroError, ErrorCode};
 use crate::models::skip::SkipInfo;
+use crate::models::truncation::TruncationInfo;
 
 use super::common::{
     MAX_INPUT_SIZE, read_bytes_limited_and_drain, read_file_to_string_limited,
@@ -164,8 +165,14 @@ pub(crate) fn git_show_blob(dir: &str, rev: &str, path: &str) -> Option<Vec<u8>>
 }
 
 /// `--git` 入力解決の結果。diff が取れたか、git 管理外で skip かを型で表す。
+///
+/// `Diff` は合成時に対象外にした未追跡ファイルの `truncations` を同時に運ぶ。out-param に
+/// せず値で返すのは、伝播を忘れたら型エラーになるようにするため (打ち切りの黙殺を防ぐ)。
 pub(crate) enum GitDiffInput {
-    Diff(String),
+    Diff {
+        diff: String,
+        truncations: Vec<TruncationInfo>,
+    },
     Skipped(SkipInfo),
 }
 
@@ -218,7 +225,9 @@ pub(crate) fn resolve_git_diff(dir: &str, base: &str, staged: bool) -> Result<Gi
         return Ok(GitDiffInput::Skipped(SkipInfo::not_git_repository()));
     }
 
-    run_git_diff(dir, base, staged).map(GitDiffInput::Diff)
+    let mut truncations = Vec::new();
+    let diff = run_git_diff_collecting_truncations(dir, base, staged, &mut truncations)?;
+    Ok(GitDiffInput::Diff { diff, truncations })
 }
 
 /// 経路A (context / impact / review / dead-code) の diff 入力ソースを **解決のみ** 行う。
@@ -227,7 +236,12 @@ pub(crate) fn resolve_git_diff(dir: &str, base: &str, staged: bool) -> Result<Gi
 /// (context/review=stdin、impact=該当なし、dead-code=全体走査)。
 /// `--diff-file` は 100MB 上限 (`read_file_to_string_limited`) 付きで読む。
 pub(crate) enum DiffSourceResolution {
-    Diff(String),
+    Diff {
+        diff: String,
+        /// `--git` 経路で合成対象外にした未追跡ファイルの打ち切り情報。
+        /// inline (`--diff`) / `--diff-file` は明示範囲を尊重するため常に空。
+        truncations: Vec<TruncationInfo>,
+    },
     Skipped(SkipInfo),
     NotRequested,
 }
@@ -241,15 +255,20 @@ pub(crate) fn resolve_diff_source(
     staged: bool,
 ) -> Result<DiffSourceResolution> {
     if let Some(d) = inline {
-        Ok(DiffSourceResolution::Diff(d.to_string()))
+        Ok(DiffSourceResolution::Diff {
+            diff: d.to_string(),
+            truncations: Vec::new(),
+        })
     } else if let Some(df) = file {
-        Ok(DiffSourceResolution::Diff(read_file_to_string_limited(
-            df,
-            MAX_INPUT_SIZE,
-        )?))
+        Ok(DiffSourceResolution::Diff {
+            diff: read_file_to_string_limited(df, MAX_INPUT_SIZE)?,
+            truncations: Vec::new(),
+        })
     } else if git {
         match resolve_git_diff(dir, base, staged)? {
-            GitDiffInput::Diff(s) => Ok(DiffSourceResolution::Diff(s)),
+            GitDiffInput::Diff { diff, truncations } => {
+                Ok(DiffSourceResolution::Diff { diff, truncations })
+            }
             GitDiffInput::Skipped(skip) => Ok(DiffSourceResolution::Skipped(skip)),
         }
     } else {
@@ -257,7 +276,18 @@ pub(crate) fn resolve_diff_source(
     }
 }
 
+/// 未追跡合成の打ち切り情報を捨てて diff だけ返す従来インタフェース。
+/// 打ち切りを結果に載せる必要がない呼び出し元 (cochange の blame source 解決など) 用。
 pub fn run_git_diff(dir: &str, base: &str, staged: bool) -> Result<String> {
+    run_git_diff_collecting_truncations(dir, base, staged, &mut Vec::new())
+}
+
+fn run_git_diff_collecting_truncations(
+    dir: &str,
+    base: &str,
+    staged: bool,
+    truncations: &mut Vec<TruncationInfo>,
+) -> Result<String> {
     validate_git_revision(base, "--base")?;
     // git config `diff.renames` がユーザー環境で無効化されていても rename を検出できるよう、
     // 明示的に `--find-renames` を指定する。ファイル rename が api.rm/api.add の誤発報源に
@@ -332,7 +362,7 @@ pub fn run_git_diff(dir: &str, base: &str, staged: bool) -> Result<String> {
     // 「diff 外の未解決影響」と誤報される (ファイル分割リファクタで高頻度)。
     // staged / `--diff` / `--diff-file` 経路は対象外 (それぞれ明示された範囲を尊重する)。
     if !staged {
-        append_untracked_added_diffs(dir, &mut diff);
+        append_untracked_added_diffs(dir, &mut diff, truncations);
     }
     Ok(diff)
 }
@@ -348,8 +378,12 @@ pub fn run_git_diff(dir: &str, base: &str, staged: bool) -> Result<String> {
 /// - 100MB 上限 (MAX_INPUT_SIZE) を超えたら打ち切り (既存 git diff と合算)
 ///
 /// 未追跡取得失敗や個別ファイル読込失敗は fail-open (合成せず従来通り) とし、解析本体を止めない。
-fn append_untracked_added_diffs(dir: &str, diff: &mut String) {
-    let untracked = collect_untracked_source_files(dir);
+fn append_untracked_added_diffs(
+    dir: &str,
+    diff: &mut String,
+    truncations: &mut Vec<TruncationInfo>,
+) {
+    let untracked = collect_untracked_source_files(dir, truncations);
     if untracked.is_empty() {
         return;
     }
@@ -363,15 +397,28 @@ fn append_untracked_added_diffs(dir: &str, diff: &mut String) {
     // api.rm が消える fail-open になるため、予測してから一括反映する)。synth=None は内容同一
     // rename で、削除 block 除去のみ行い Modified を合成しない (commit 済みの hunkless 100%
     // rename と一致させ dead-code / cochange の乖離を防ぐ)。
+    // 取り込み上限超過の未追跡は rename 相手としてだけ使い、中身 (Modified diff) は合成しない。
+    let oversized_untracked: std::collections::HashSet<&str> = untracked
+        .iter()
+        .filter(|u| u.oversized)
+        .map(|u| u.rel_path.as_str())
+        .collect();
     let mut projected = diff.len();
     let mut planned: Vec<(&UntrackedRenamePair, Option<String>)> = Vec::new();
     for pair in &pairs {
-        let synth = synthesize_modified_file_diff(
-            &pair.old_path,
-            &pair.new_path,
-            &pair.old_source,
-            &pair.new_source,
-        );
+        // 上限超過ファイルへの rename は削除 block 除去のみ (synth=None) にして
+        // 「rename は認識するが中身は見ない」挙動にする。除外して deleted を残すと
+        // 旧ファイルの全 exported symbol が api.rm / rm_dead に流れ込む。
+        let synth = if oversized_untracked.contains(pair.new_path.as_str()) {
+            None
+        } else {
+            synthesize_modified_file_diff(
+                &pair.old_path,
+                &pair.new_path,
+                &pair.old_source,
+                &pair.new_source,
+            )
+        };
         let synth_len = synth.as_ref().map_or(0, String::len);
         let next = projected
             .saturating_sub(pair.block_text.len())
@@ -398,9 +445,10 @@ fn append_untracked_added_diffs(dir: &str, diff: &mut String) {
     }
 
     // 未 pair の未追跡は従来通り「全行追加の新規ファイル」として合成する。
+    // 取り込み上限超過は合成しない (truncations に記録済み)。
     let mut total = diff.len();
     for u in &untracked {
-        if paired_untracked.contains(u.rel_path.as_str()) {
+        if paired_untracked.contains(u.rel_path.as_str()) || u.oversized {
             continue;
         }
         let synth = synthesize_added_file_diff(&u.rel_path, &u.content);
@@ -416,11 +464,43 @@ fn append_untracked_added_diffs(dir: &str, diff: &mut String) {
 struct UntrackedSourceFile {
     rel_path: String,
     content: String,
+    /// 取り込み上限 (`MAX_UNTRACKED_FILE_SIZE` / `MAX_UNTRACKED_FILE_LINES`) 超過。
+    ///
+    /// 合成 diff には**中身を一切入れない**が、rename ペアリングの相手としては残す。
+    /// 除外して deleted 側だけを残すと「巨大ファイルを rename しただけ」で旧ファイルの
+    /// 全 exported symbol が api.rm / rm_dead に流れ込む (実測 5,001 シンボル / 135KB の
+    /// hook 出力)。ペア成立時は削除 block の除去だけ行い Modified も合成しないため
+    /// 「rename は認識するが中身は見ない」挙動になる。
+    oversized: bool,
 }
+
+/// 未追跡ファイル 1 個あたりの取り込みサイズ上限。
+///
+/// これを超える未追跡ファイルは合成 diff に含めない。手書きソースで単一ファイルが
+/// 256KB / 5,000 行を超えるのは稀で、超えるものは大半が生成物 (コード生成器の出力 /
+/// 巨大 fixture / ダンプ) である。生成物の全 exported symbol が api.add 候補になると
+/// `detect_api_changes` の Phase 0 が数万 name を ApiRefIndex に渡し、review が数十分
+/// かかって Stop hook がタイムアウトする (実測: 未追跡 22,000 `pub fn` で 1.75 秒 →
+/// 10 分超。Issue 2026-08-04-review-git-untracked-huge-file-blowup)。
+///
+/// tracked ファイルには適用しない: commit / add 済みは意図的にレビュー対象に入れたものと
+/// 見なせる。未追跡は「まだ add していない」= コミット対象か不明で、巨大なら生成物の
+/// 可能性が高い。`append_untracked_added_diffs` 自体が既に「unstaged のみ / staged や
+/// `--diff-file` は対象外」という非対称を持っており、その延長にある。
+pub(crate) const MAX_UNTRACKED_FILE_SIZE: usize = 256 * 1024;
+/// 未追跡ファイル 1 個あたりの取り込み行数上限 (`MAX_UNTRACKED_FILE_SIZE` と OR 条件)。
+/// 1 行が短い生成コードはサイズ上限に達しないまま数万シンボルを持ちうるため、行数でも切る。
+pub(crate) const MAX_UNTRACKED_FILE_LINES: usize = 5_000;
 
 /// 未追跡ファイルのうち言語判定できる regular file を読み込んで返す。symlink / 巨大 /
 /// 非 UTF-8 / 空 / NUL・改行を含むパスは除外 (従来の合成フィルタと同一基準)。
-fn collect_untracked_source_files(dir: &str) -> Vec<UntrackedSourceFile> {
+///
+/// 取り込み上限 (`MAX_UNTRACKED_FILE_SIZE` / `MAX_UNTRACKED_FILE_LINES`) を超えたファイルは
+/// `truncations` に理由付きで記録する (No silent caps: 解析対象から外したことを出力に残す)。
+fn collect_untracked_source_files(
+    dir: &str,
+    truncations: &mut Vec<TruncationInfo>,
+) -> Vec<UntrackedSourceFile> {
     let untracked = match list_untracked_files(dir) {
         Ok(paths) => paths,
         Err(_) => return Vec::new(),
@@ -445,6 +525,19 @@ fn collect_untracked_source_files(dir: &str) -> Vec<UntrackedSourceFile> {
         if !meta.file_type().is_file() || meta.len() as usize > MAX_INPUT_SIZE {
             continue;
         }
+        // 取り込み上限超過は「解析対象から外した」ことを記録する。リストからは落とさず
+        // `oversized` で印を付けるだけにするのは、rename ペアリングの相手として残すため
+        // (詳細は `UntrackedSourceFile::oversized`)。
+        let size = meta.len() as usize;
+        let mut oversized = size > MAX_UNTRACKED_FILE_SIZE;
+        if oversized {
+            truncations.push(TruncationInfo::untracked_file_too_large(
+                &rel_path,
+                "size",
+                size,
+                MAX_UNTRACKED_FILE_SIZE,
+            ));
+        }
         // 非 UTF-8 / 読込不可 / 空は skip (fail-open)。
         let Ok(content) = std::fs::read_to_string(&full) else {
             continue;
@@ -452,11 +545,28 @@ fn collect_untracked_source_files(dir: &str) -> Vec<UntrackedSourceFile> {
         if content.is_empty() {
             continue;
         }
-        out.push(UntrackedSourceFile { rel_path, content });
+        // 1 行が短い生成コードはサイズ上限に達しないまま数万シンボルを持つため行数でも切る。
+        // サイズ超過で既に報告済みなら二重報告しない。
+        if !oversized {
+            let lines = content.lines().count();
+            if lines > MAX_UNTRACKED_FILE_LINES {
+                truncations.push(TruncationInfo::untracked_file_too_large(
+                    &rel_path,
+                    "lines",
+                    lines,
+                    MAX_UNTRACKED_FILE_LINES,
+                ));
+                oversized = true;
+            }
+        }
+        out.push(UntrackedSourceFile {
+            rel_path,
+            content,
+            oversized,
+        });
     }
     out
 }
-
 /// rename ペア検出用の削除ファイル候補。元 diff 内の block 原文を保持し、ペア成立時に
 /// その block を diff から除去する。
 struct DeletedRenameCandidate {
@@ -853,6 +963,7 @@ mod tests {
         let untracked = vec![UntrackedSourceFile {
             rel_path: "src/b.rs".to_string(),
             content: src.to_string(),
+            oversized: false,
         }];
         let pairs = pair_untracked_renames(&deleted, &untracked);
         assert_eq!(pairs.len(), 1);
@@ -872,6 +983,7 @@ mod tests {
         let untracked = vec![UntrackedSourceFile {
             rel_path: "src/b.rs".to_string(),
             content: new_src.to_string(),
+            oversized: false,
         }];
         let pairs = pair_untracked_renames(&deleted, &untracked);
         assert!(
@@ -892,6 +1004,7 @@ mod tests {
         let untracked = vec![UntrackedSourceFile {
             rel_path: "src/b.py".to_string(),
             content: new_src.to_string(),
+            oversized: false,
         }];
         let pairs = pair_untracked_renames(&deleted, &untracked);
         assert!(pairs.is_empty(), "Python signature 違いも pair しない");
@@ -907,6 +1020,7 @@ mod tests {
         let untracked = vec![UntrackedSourceFile {
             rel_path: "src/b.py".to_string(),
             content: "def foo():\n    pass\n".to_string(),
+            oversized: false,
         }];
         let pairs = pair_untracked_renames(&deleted, &untracked);
         assert!(pairs.is_empty(), "異言語は pair しない");
@@ -925,10 +1039,12 @@ mod tests {
             UntrackedSourceFile {
                 rel_path: "src/b.rs".to_string(),
                 content: src.to_string(),
+                oversized: false,
             },
             UntrackedSourceFile {
                 rel_path: "src/c.rs".to_string(),
                 content: src.to_string(),
+                oversized: false,
             },
         ];
         let pairs = pair_untracked_renames(&deleted, &untracked);
@@ -989,6 +1105,7 @@ mod tests {
         let untracked = vec![UntrackedSourceFile {
             rel_path: "src/b.rs".to_string(),
             content: src.to_string(),
+            oversized: false,
         }];
         let pairs = pair_untracked_renames(&deleted, &untracked);
         assert!(pairs.is_empty(), "degree>1 は fail-closed で pair しない");
@@ -1008,6 +1125,7 @@ mod tests {
         let untracked = vec![UntrackedSourceFile {
             rel_path: "src/b.py".to_string(),
             content: py_src.to_string(),
+            oversized: false,
         }];
         let pairs = pair_untracked_renames(&deleted, &untracked);
         assert!(pairs.is_empty(), "言語不一致は pair しない");

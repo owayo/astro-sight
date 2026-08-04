@@ -347,6 +347,20 @@ condition = { command_exists = "astro-sight" }
 
 判定は `git rev-parse --is-inside-work-tree`（`LC_ALL=C`）で行い、worktree / submodule / bare repo に堅牢。**真のエラー**（`--base` 不正・git 実行不能・壊れた repo・権限不足）は従来どおり `exit 1` を維持する。`--diff` / `--diff-file` / stdin 経路は判定を通らず無影響。
 
+#### 未追跡ファイルの取り込み上限
+
+`--git`（非 `--staged`）は未追跡のソースファイルを「新規ファイル」として解析対象に含める（同一作業で作った未追跡ファイルへの参照が「diff 外の未解決影響」と誤報されるのを防ぐため）。ただし **1 ファイル 256KB または 5,000 行を超える未追跡ファイルは対象外**にする。コード生成器の出力や巨大 fixture のような生成物を取り込むと、その全 exported symbol が API 差分の候補になり `review` が数十分かかって Stop hook がタイムアウトするため（実測: 未追跡 22,000 個の `pub fn` で 1.75 秒 → 10 分超）。
+
+tracked ファイルには適用しない。commit / add 済みは意図的にレビュー対象に入れたものと見なせる一方、未追跡は「まだ add していない」= コミット対象か不明で、巨大なら生成物の可能性が高い。
+
+対象外にしたファイルは黙って落とさず `truncations` に出力する（「レビュー済み」と誤読させないため）:
+
+```json
+{ "...": "...", "truncations": [{ "path": "generated.rs", "reason": "untracked_file_too_large", "message": "untracked file excluded from --git analysis: lines 80000 exceeds limit 5000" }] }
+```
+
+`--hook` では `trunc: [{"f": "generated.rs", "r": "untracked_file_too_large"}]` として出力する（検出ではなく解析範囲の申告なので exit 1 にはしない）。`impact` は構造化 JSON を持たないため stderr の `note:` 行で出す。`--staged` / `--diff` / `--diff-file` は明示された範囲を尊重するため未追跡の取り込み自体を行わない。
+
 #### デフォルト除外
 
 `context` / `impact` / `review` の影響分析は、cross-file 参照検索時にサードパーティ依存と build artifact をデフォルトで除外する。`new` / `save` / `find` / `update` などの汎用メソッド名が 3rd-party / generated コードから大量に流入し、影響先を万件単位の偽陽性で埋めるのを防ぐ。

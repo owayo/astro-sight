@@ -26,6 +26,10 @@ pub struct ReviewResult {
     /// git 管理外 dir で `--git` が要求され diff を取得できず skip した場合の理由。
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub skipped: Option<SkipInfo>,
+    /// 解析対象から意図的に外したもの (未追跡の巨大ファイル等)。
+    /// `impact.truncations` には入れず review 直下に集約する (二重報告を避ける)。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub truncations: Vec<crate::models::truncation::TruncationInfo>,
 }
 
 /// cochange で検出された「一緒に変更されるはずだが diff に含まれないファイル」。

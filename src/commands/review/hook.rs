@@ -91,6 +91,16 @@ struct HookCochange<'a> {
     c: u32,
 }
 
+/// 打ち切り (解析対象から外したもの) の hook 用 DTO。
+/// 未追跡の巨大ファイルを除外した場合など「レビュー範囲が欠けた」ことを hook でも伝える。
+/// blocking にはしない (検出ではなく解析範囲の申告) が、沈黙させると「全部見た」と読める。
+#[derive(Serialize)]
+struct HookTruncation<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    f: Option<&'a str>,
+    r: &'a str,
+}
+
 #[derive(Serialize)]
 struct HookApi<'a> {
     #[serde(rename = "add", skip_serializing_if = "Vec::is_empty")]
@@ -403,6 +413,27 @@ pub(crate) fn build_review_hook_json(
         hook_obj.insert(
             "api".into(),
             serde_json::to_value(api).expect("hook API DTO should serialize"),
+        );
+    }
+
+    // trunc: [{f,r}] — 解析対象から外したものの申告。情報提供のみ (blocking にしない)。
+    if !result.truncations.is_empty() {
+        has_any_output = true;
+        let truncs: Vec<HookTruncation<'_>> = result
+            .truncations
+            .iter()
+            .map(|t| HookTruncation {
+                f: t.path.as_deref(),
+                r: match t.reason {
+                    crate::models::truncation::TruncationReason::UntrackedFileTooLarge => {
+                        "untracked_file_too_large"
+                    }
+                },
+            })
+            .collect();
+        hook_obj.insert(
+            "trunc".into(),
+            serde_json::to_value(truncs).expect("hook truncation DTO should serialize"),
         );
     }
 

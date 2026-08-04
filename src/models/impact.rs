@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::skip::SkipInfo;
+use super::truncation::TruncationInfo;
 
 /// unified diff から解析した hunk。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +85,11 @@ pub struct ContextResult {
     /// 通常の解析結果では `None` (出力に含まれない・後方互換)。
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub skipped: Option<SkipInfo>,
+    /// 解析対象から意図的に外したもの (未追跡の巨大ファイル等)。`skipped` が
+    /// 「コマンド全体を解析しなかった」大域 skip なのに対し、これは部分的な打ち切り。
+    /// 空なら出力に含まれない (compact 規約)。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub truncations: Vec<TruncationInfo>,
 }
 
 /// `analyze_context` / `analyze_impact_streaming` のオプション。

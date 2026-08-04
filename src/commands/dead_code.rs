@@ -1242,40 +1242,48 @@ pub fn cmd_dead_code(
     // 取得・parse して再利用する (旧実装は run_git_diff + parse_unified_diff を 2 回呼んでおり、
     // --staged 実行中の git add で 2 つの diff が乖離する競合状態があった)。
     // NotRequested (diff/diff_file/git いずれも未指定) は全体走査に振り分ける。
-    let (diff_input, diff_files): (Option<String>, Option<Vec<crate::models::impact::DiffFile>>) =
-        match resolve_diff_source(dir, diff, diff_file, git, base, staged)? {
-            DiffSourceResolution::Diff(input) => {
-                if input.trim().is_empty() {
-                    let result = DeadCodeResult {
-                        dir: canonical_dir.to_string_lossy().to_string(),
-                        scanned_files: 0,
-                        dead_symbols: Vec::new(),
-                        test_only_symbols: Vec::new(),
-                        skipped: None,
-                    };
-                    let output = serialize_output(&result, pretty)?;
-                    println!("{output}");
-                    return Ok(());
-                }
-
-                let parsed = crate::engine::diff::parse_unified_diff(&input);
-                (Some(input), Some(parsed))
-            }
-            DiffSourceResolution::Skipped(skip) => {
-                // git 管理外: 空の dead_symbols + skipped で exit 0。
+    #[allow(clippy::type_complexity)]
+    let (diff_input, diff_files, truncations): (
+        Option<String>,
+        Option<Vec<crate::models::impact::DiffFile>>,
+        Vec<crate::models::truncation::TruncationInfo>,
+    ) = match resolve_diff_source(dir, diff, diff_file, git, base, staged)? {
+        DiffSourceResolution::Diff { diff, truncations } => {
+            if diff.trim().is_empty() {
+                // 未追跡の巨大ファイルを除外した結果 diff が空になった場合も、
+                // 何を対象外にしたかを報告する (空結果と打ち切りを混同させない)。
                 let result = DeadCodeResult {
                     dir: canonical_dir.to_string_lossy().to_string(),
                     scanned_files: 0,
                     dead_symbols: Vec::new(),
                     test_only_symbols: Vec::new(),
-                    skipped: Some(skip),
+                    skipped: None,
+                    truncations,
                 };
                 let output = serialize_output(&result, pretty)?;
                 println!("{output}");
                 return Ok(());
             }
-            DiffSourceResolution::NotRequested => (None, None),
-        };
+
+            let parsed = crate::engine::diff::parse_unified_diff(&diff);
+            (Some(diff), Some(parsed), truncations)
+        }
+        DiffSourceResolution::Skipped(skip) => {
+            // git 管理外: 空の dead_symbols + skipped で exit 0。
+            let result = DeadCodeResult {
+                dir: canonical_dir.to_string_lossy().to_string(),
+                scanned_files: 0,
+                dead_symbols: Vec::new(),
+                test_only_symbols: Vec::new(),
+                skipped: Some(skip),
+                truncations: Vec::new(),
+            };
+            let output = serialize_output(&result, pretty)?;
+            println!("{output}");
+            return Ok(());
+        }
+        DiffSourceResolution::NotRequested => (None, None, Vec::new()),
+    };
 
     let files: Vec<std::path::PathBuf> = if let Some(diff_files) = diff_files.as_ref() {
         filter_diff_files_for_dead_code(
@@ -1313,6 +1321,7 @@ pub fn cmd_dead_code(
         dead_symbols,
         test_only_symbols,
         skipped: None,
+        truncations,
     };
 
     let output = serialize_output(&result, pretty)?;

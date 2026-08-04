@@ -68,20 +68,24 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
     // 未指定時は package.json から next 依存を検出して nextjs プリセットを自動適用する。
     let framework_globs = resolve_framework_globs_with_auto_detect(framework, dir)?;
     // 1. diff 取得（context コマンドと同じ入力方式）
-    let diff_input = match resolve_diff_source(dir, diff, diff_file, git, base, staged)? {
-        DiffSourceResolution::Diff(s) => s,
-        // git 管理外: hook は完全 silent、通常は空結果 + skipped で exit 0。
-        DiffSourceResolution::Skipped(skip) => {
-            return emit_review_short_circuit(hook, pretty, Some(skip));
-        }
-        DiffSourceResolution::NotRequested => {
-            let stdin = std::io::stdin();
-            read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?
-        }
-    };
+    let (diff_input, truncations) =
+        match resolve_diff_source(dir, diff, diff_file, git, base, staged)? {
+            DiffSourceResolution::Diff { diff, truncations } => (diff, truncations),
+            // git 管理外: hook は完全 silent、通常は空結果 + skipped で exit 0。
+            DiffSourceResolution::Skipped(skip) => {
+                return emit_review_short_circuit(hook, pretty, Some(skip), Vec::new());
+            }
+            DiffSourceResolution::NotRequested => {
+                let stdin = std::io::stdin();
+                (
+                    read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?,
+                    Vec::new(),
+                )
+            }
+        };
 
     if diff_input.trim().is_empty() {
-        return emit_review_short_circuit(hook, pretty, None);
+        return emit_review_short_circuit(hook, pretty, None, truncations);
     }
 
     // 2. impact 分析
@@ -99,7 +103,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
     let diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
     if crate::engine::impact::should_skip_ci_only_diff(&diff_files) {
         log_phase("review.skip_ci_only", "applied", 0);
-        return emit_review_short_circuit(hook, pretty, None);
+        return emit_review_short_circuit(hook, pretty, None, truncations);
     }
 
     let impact = timed_ok("context", || {
@@ -159,6 +163,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
         dead_symbols,
         test_only_symbols,
         skipped: None,
+        truncations,
     };
 
     if hook {
@@ -178,15 +183,24 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
 
 /// 解析へ進まず空結果で打ち切る共通処理 (git 管理外 / 空 diff / CI 言語のみ の 3 経路)。
 ///
-/// `--hook` は完全 silent (無出力)、通常時は `skipped` 以外すべて既定値の `ReviewResult`
-/// を 1 行出力して exit 0 とする。
-fn emit_review_short_circuit(hook: bool, pretty: bool, skipped: Option<SkipInfo>) -> Result<()> {
+/// `--hook` は完全 silent (無出力)、通常時は `skipped` / `truncations` 以外すべて既定値の
+/// `ReviewResult` を 1 行出力して exit 0 とする。
+///
+/// `truncations` を受けるのは、未追跡の巨大ファイルを除外した結果 diff が空になった場合でも
+/// 「対象外にしたファイルがある」ことを報告するため (空結果と打ち切りを混同させない)。
+fn emit_review_short_circuit(
+    hook: bool,
+    pretty: bool,
+    skipped: Option<SkipInfo>,
+    truncations: Vec<crate::models::truncation::TruncationInfo>,
+) -> Result<()> {
     if hook {
         return Ok(());
     }
 
     let result = ReviewResult {
         skipped,
+        truncations,
         ..Default::default()
     };
     let output = serialize_output(&result, pretty)?;
@@ -269,8 +283,9 @@ mod review_command_tests {
     /// `--hook` の短絡は 3 経路 (git 管理外 / 空 diff / CI 言語のみ) すべてで無出力 Ok。
     #[test]
     fn short_circuit_is_silent_under_hook() {
-        emit_review_short_circuit(true, false, None).expect("hook short-circuit must succeed");
-        emit_review_short_circuit(true, true, Some(SkipInfo::not_git_repository()))
+        emit_review_short_circuit(true, false, None, Vec::new())
+            .expect("hook short-circuit must succeed");
+        emit_review_short_circuit(true, true, Some(SkipInfo::not_git_repository()), Vec::new())
             .expect("hook short-circuit must succeed");
     }
 

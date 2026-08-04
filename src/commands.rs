@@ -390,22 +390,27 @@ pub fn cmd_context(service: &AppService, opts: &CmdContextOpts<'_>) -> Result<()
         exclude_dirs,
         exclude_globs,
     } = opts;
-    let diff_input = match resolve_diff_source(dir, diff, diff_file, git, base, staged)? {
-        DiffSourceResolution::Diff(s) => s,
-        DiffSourceResolution::Skipped(skip) => {
-            // git 管理外: 空の changes + skipped を返して exit 0。
-            let result = crate::models::impact::ContextResult {
-                changes: Vec::new(),
-                skipped: Some(skip),
-            };
-            println!("{}", serialize_output(&result, pretty)?);
-            return Ok(());
-        }
-        DiffSourceResolution::NotRequested => {
-            let stdin = std::io::stdin();
-            read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?
-        }
-    };
+    let (diff_input, truncations) =
+        match resolve_diff_source(dir, diff, diff_file, git, base, staged)? {
+            DiffSourceResolution::Diff { diff, truncations } => (diff, truncations),
+            DiffSourceResolution::Skipped(skip) => {
+                // git 管理外: 空の changes + skipped を返して exit 0。
+                let result = crate::models::impact::ContextResult {
+                    changes: Vec::new(),
+                    skipped: Some(skip),
+                    truncations: Vec::new(),
+                };
+                println!("{}", serialize_output(&result, pretty)?);
+                return Ok(());
+            }
+            DiffSourceResolution::NotRequested => {
+                let stdin = std::io::stdin();
+                (
+                    read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?,
+                    Vec::new(),
+                )
+            }
+        };
 
     let options = crate::models::impact::ContextAnalysisOptions {
         exclude_dirs: exclude_dirs.to_vec(),
@@ -415,7 +420,8 @@ pub fn cmd_context(service: &AppService, opts: &CmdContextOpts<'_>) -> Result<()
     if pretty {
         // pretty 出力は人間向けで整形が必要なため、従来どおり全 FileImpact を集約してから
         // 一括 serialize する。数 GB 級リポでは compact 出力推奨。
-        let result = service.analyze_context(&diff_input, dir, &options)?;
+        let mut result = service.analyze_context(&diff_input, dir, &options)?;
+        result.truncations = truncations;
         let output = serialize_output(&result, pretty)?;
         info!(
             command = "context",
@@ -448,12 +454,20 @@ pub fn cmd_context(service: &AppService, opts: &CmdContextOpts<'_>) -> Result<()
         changes_count += 1;
         Ok(())
     })?;
-    out.write_all(b"]}\n")?;
+    out.write_all(b"]")?;
+    // 打ち切りがあれば streaming 出力にも載せる (No silent caps)。空なら従来どおり省略。
+    if !truncations.is_empty() {
+        out.write_all(b",\"truncations\":")?;
+        serde_json::to_writer(&mut out, &truncations)
+            .map_err(|e| anyhow::anyhow!("json serialization failed: {e}"))?;
+    }
+    out.write_all(b"}\n")?;
     info!(
         command = "context",
         dir = dir,
         diff_bytes = diff_input.len(),
         changes = changes_count,
+        truncations = truncations.len(),
         "command completed (streaming)"
     );
     Ok(())
@@ -483,17 +497,29 @@ pub fn cmd_impact(service: &AppService, opts: &CmdImpactOpts<'_>) -> Result<()> 
         exclude_globs,
     } = opts;
     // impact に inline `--diff` / `--diff-file` は無いため resolver へは None を渡す。
-    let diff_input = match resolve_diff_source(dir, None, None, git, base, staged)? {
-        DiffSourceResolution::Diff(s) => s,
+    let (diff_input, truncations) = match resolve_diff_source(dir, None, None, git, base, staged)? {
+        DiffSourceResolution::Diff { diff, truncations } => (diff, truncations),
         // git 管理外: 既存の「差分なし」と同じく無出力で exit 0。
         // impact は構造化 JSON 出力を持たず未解決 caller 検出時のみ stderr に
         // 出力する設計のため、skipped JSON は出さない (hook の有無を問わず silent)。
         DiffSourceResolution::Skipped(_) => return Ok(()),
         DiffSourceResolution::NotRequested => {
             let stdin = std::io::stdin();
-            read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?
+            (
+                read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?,
+                Vec::new(),
+            )
         }
     };
+    // impact は構造化 JSON を持たないため、打ち切りは人間向け stderr 行として出す
+    // (解析範囲が欠けたことを黙って落とさない)。hook 経路でも同じ行が出る。
+    for t in &truncations {
+        eprintln!(
+            "note: {} ({})",
+            t.message,
+            t.path.as_deref().unwrap_or("(global)")
+        );
+    }
 
     if diff_input.trim().is_empty() {
         return Ok(());
