@@ -385,6 +385,76 @@ pub(crate) struct ApiClosureCaches {
     >,
 }
 
+/// 参照行が named export clause (`export { X }` / `export type { X }`) かを判定する。
+/// re-export は公開エクスポート経路であり実利用ではないため、内部参照数から除外する。
+///
+/// `export type Foo = Bar` のような型エイリアス定義は除外しない (`Bar` は実利用)。
+/// 判定は `export` の後に (`type` を挟んで) `{` が来るかで行い、波括弧の有無で
+/// re-export と定義を切り分ける。
+fn ref_is_export_clause_line(r: &crate::models::reference::SymbolReference) -> bool {
+    r.context
+        .as_deref()
+        .map(|c| {
+            let Some(rest) = c.trim_start().strip_prefix("export ") else {
+                return false;
+            };
+            let rest = rest.trim_start();
+            let rest = rest
+                .strip_prefix("type ")
+                .map_or(rest, |after_type| after_type.trim_start());
+            rest.starts_with('{')
+        })
+        .unwrap_or(false)
+}
+
+/// `name` の同一ファイル (`file`) 内の実利用参照数を数える。
+///
+/// 定義行と import / re-export 行は実利用ではないため除外する
+/// (`is_used_in_diff_paths` の他ファイル判定と同じ除外規約)。api.add の抽出条件は
+/// 「同一ファイル内の**呼び出し**参照が無い」+「同一 diff の他ファイルからの実利用参照が
+/// 無い」の合成で、TS の型注釈のように呼び出しではない参照は条件に現れない。内部参照数を
+/// 出力に添えることで「同一ファイル内では使われているが他ファイルからは参照されていない」
+/// と「完全に未参照」を利用者が区別でき、`refs` の再実行が不要になる
+/// (Issue 2026-08-04-review-add-scope-naming)。
+///
+/// 検索失敗 / 未収集の name は 0 を返す (出力から省略され「情報なし」と同義になる)。
+/// 複数行 export clause の継続行は行テキストから re-export と判定できず実利用として
+/// 数えるが、過大側 (= 内部参照あり = export を残す判断) に倒れるため安全側。
+pub(crate) fn count_internal_refs(
+    index: &ApiRefIndex,
+    dir: &str,
+    file: &str,
+    name: &str,
+    caches: &mut ApiClosureCaches,
+) -> usize {
+    use crate::models::reference::RefKind;
+    let Some(refs) = index.refs_for(bare_name(name)) else {
+        return 0;
+    };
+    let self_path = std::path::Path::new(file);
+    let mut count = 0usize;
+    for r in refs {
+        if r.kind == Some(RefKind::Definition) {
+            continue;
+        }
+        if std::path::Path::new(r.path.as_str()) != self_path {
+            continue;
+        }
+        if ref_is_import_line(r) || ref_is_export_clause_line(r) {
+            continue;
+        }
+        let import_lines = caches
+            .import_lines
+            .entry(r.path.clone())
+            .or_insert_with(|| import_statement_lines_for_ref(dir, &r.path));
+        if import_lines.contains(&r.line) {
+            continue;
+        }
+        count += 1;
+    }
+    count
+}
+
 /// 参照行が import / use 宣言 (signature 変更に追随不要) かを行テキストで簡易判定する。
 pub(crate) fn ref_is_import_line(r: &crate::models::reference::SymbolReference) -> bool {
     r.context

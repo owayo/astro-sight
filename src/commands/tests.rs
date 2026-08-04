@@ -1808,6 +1808,141 @@ fn detect_api_changes_typescript_inline_object_type_change_is_modified() {
     );
 }
 
+/// 新規 export 型が同一ファイル内の型注釈からのみ参照される場合、api.add に載せつつ
+/// 同一ファイル内の実利用参照数 (`refs_internal`) を添える。
+///
+/// api.add の抽出条件は「同一ファイル内の**呼び出し**参照が無い」+「同一 diff の他ファイル
+/// からの実利用参照が無い」の合成で、TS の型注釈は呼び出しではないため条件に現れない。
+/// 参照数を添えないと `refs` を別途実行するまで「同一ファイル内には参照がある」と分からず、
+/// トリアージが「完全に未参照 = デッドコード」と読み違える
+/// (Issue 2026-08-04-review-add-scope-naming)
+#[test]
+fn detect_api_changes_ts_new_export_type_counts_internal_annotation_refs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    git_commit_files(
+        repo,
+        &[
+            (
+                "module.ts",
+                "export interface ShareRow {\n  id: string;\n}\n\nexport async function fetchShare(id: string): Promise<ShareRow[]> {\n  return [{ id }];\n}\n",
+            ),
+            (
+                "caller.ts",
+                "import { fetchShare } from \"./module\";\n\nexport async function render(id: string): Promise<number> {\n  const rows = await fetchShare(id);\n  return rows.length;\n}\n",
+            ),
+        ],
+        "initial",
+    );
+
+    // 新: TypeObservation を追加し、同一ファイル内の型注釈 2 箇所 (ShareResult の
+    // フィールド型 / const の型注釈) からのみ参照する。ShareResult は caller.ts が
+    // import するため api.add には載らない (同一 diff 内の他ファイル参照あり)。
+    fs::write(
+        repo.join("module.ts"),
+        "export interface ShareRow {\n  id: string;\n}\n\nexport interface TypeObservation {\n  at: string;\n}\n\nexport interface ShareResult {\n  rows: ShareRow[];\n  recentObservation: TypeObservation | null;\n}\n\nexport async function fetchShare(id: string): Promise<ShareResult> {\n  const recentObservation: TypeObservation | null = null;\n  return { rows: [{ id }], recentObservation };\n}\n",
+    )
+    .expect("write module.ts");
+    fs::write(
+        repo.join("caller.ts"),
+        "import { fetchShare, type ShareResult } from \"./module\";\n\nexport async function render(id: string): Promise<number> {\n  const result: ShareResult = await fetchShare(id);\n  return result.rows.length;\n}\n",
+    )
+    .expect("write caller.ts");
+
+    let diff_files = vec![
+        crate::models::impact::DiffFile {
+            old_path: "module.ts".to_string(),
+            new_path: "module.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 7,
+                new_start: 1,
+                new_count: 17,
+            }],
+            deleted_old_source: None,
+        },
+        crate::models::impact::DiffFile {
+            old_path: "caller.ts".to_string(),
+            new_path: "caller.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 6,
+                new_start: 1,
+                new_count: 6,
+            }],
+            deleted_old_source: None,
+        },
+    ];
+
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    let observation = api
+        .added
+        .iter()
+        .find(|s| s.name == "TypeObservation")
+        .unwrap_or_else(|| panic!("TypeObservation は api.add に載るべき: {:?}", api.added));
+    assert_eq!(
+        observation.refs_internal, 2,
+        "同一ファイル内の型注釈参照 2 件を数えるべき: {observation:?}"
+    );
+    assert!(
+        !api.added.iter().any(|s| s.name == "ShareResult"),
+        "他ファイルから import される ShareResult は api.add に載らない: {:?}",
+        api.added
+    );
+}
+
+/// 定義行と re-export 行しか無い新規 export は `refs_internal` が 0 になる。
+/// `export type { X }` は公開エクスポート経路であり実利用ではないため数えない
+/// (これを数えると「参照あり」に見え、`refs_internal` で未参照を判別できなくなる)
+#[test]
+fn detect_api_changes_ts_reexport_only_symbol_has_zero_internal_refs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    git_commit_files(
+        repo,
+        &[("module.ts", "export interface Kept {\n  id: string;\n}\n")],
+        "initial",
+    );
+
+    // Orphan: 参照ゼロ。Local: 同一ファイル内の `export type { Local }` のみ。
+    fs::write(
+        repo.join("module.ts"),
+        "export interface Kept {\n  id: string;\n}\n\nexport interface Orphan {\n  at: string;\n}\n\ninterface Local {\n  v: number;\n}\nexport type { Local };\n",
+    )
+    .expect("write module.ts");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "module.ts".to_string(),
+        new_path: "module.ts".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 12,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    for name in ["Orphan", "Local"] {
+        let symbol = api
+            .added
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("{name} は api.add に載るべき: {:?}", api.added));
+        assert_eq!(
+            symbol.refs_internal, 0,
+            "定義 / re-export だけの参照は実利用として数えない: {symbol:?}"
+        );
+    }
+}
+
 /// テストヘルパー: 一時 git リポジトリを初期化する。
 fn init_git_repo_for_test(repo: &std::path::Path) {
     for args in [
@@ -12729,6 +12864,7 @@ fn build_review_hook_json_api_add_only_is_informational() {
                 name: "foo".to_string(),
                 kind: "function".to_string(),
                 file: "a.rs".to_string(),
+                refs_internal: 0,
             }],
             removed: Vec::new(),
             modified: Vec::new(),
@@ -12787,6 +12923,7 @@ fn build_review_hook_json_api_add_carries_extraction_scope() {
             name: "foo".to_string(),
             kind: "function".to_string(),
             file: "a.rs".to_string(),
+            refs_internal: 0,
         }],
         ..empty_api()
     });
@@ -12803,6 +12940,7 @@ fn build_review_hook_json_api_add_carries_extraction_scope() {
             name: "bar".to_string(),
             kind: "function".to_string(),
             file: "a.rs".to_string(),
+            refs_internal: 0,
         }],
         ..empty_api()
     });
@@ -12815,6 +12953,66 @@ fn build_review_hook_json_api_add_carries_extraction_scope() {
     assert!(
         api.get("add_scope").is_none(),
         "add が空なら add_scope も省略する"
+    );
+}
+
+/// api.add の各シンボルには同一ファイル内の実利用参照数 `ri` が付き、0 なら省略される。
+/// `add_scope` は「同一 diff の他ファイルから参照されていない」抽出範囲しか表せず、
+/// 同一ファイル内の型注釈参照があるケースを「完全に未参照」と読み違えたトリアージが
+/// 走った (Issue 2026-08-04-review-add-scope-naming)
+#[test]
+fn build_review_hook_json_api_add_carries_internal_ref_count() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let review_with_added = |added: Vec<ApiSymbol>| ReviewResult {
+        impact: crate::models::impact::ContextResult {
+            changes: Vec::new(),
+            skipped: None,
+        },
+        missing_cochanges: Vec::new(),
+        cochange_diagnostics: Default::default(),
+        api_changes: ApiChanges {
+            added,
+            ..Default::default()
+        },
+        dead_symbols: Vec::new(),
+        test_only_symbols: Vec::new(),
+        skipped: None,
+    };
+
+    // 同一ファイル内に実利用参照が 2 件 → `ri: 2` を出して refs 再実行を不要にする
+    let with_internal_refs = review_with_added(vec![ApiSymbol {
+        name: "TypeObservation".to_string(),
+        kind: "interface".to_string(),
+        file: "module.ts".to_string(),
+        refs_internal: 2,
+    }]);
+    let build = build_review_hook_json(
+        &with_internal_refs,
+        dir.path().to_str().expect("utf-8 path"),
+        false,
+    );
+    let api = build.value.expect("hook JSON")["api"].clone();
+    assert_eq!(
+        api["add"][0]["ri"], 2,
+        "同一ファイル内の実利用参照数を api.add に添えるべき: {api}"
+    );
+
+    // 完全に未参照なら `ri` は省略する (compact 規約: 0 は出さない)
+    let without_internal_refs = review_with_added(vec![ApiSymbol {
+        name: "Orphan".to_string(),
+        kind: "interface".to_string(),
+        file: "module.ts".to_string(),
+        refs_internal: 0,
+    }]);
+    let build = build_review_hook_json(
+        &without_internal_refs,
+        dir.path().to_str().expect("utf-8 path"),
+        false,
+    );
+    let api = build.value.expect("hook JSON")["api"].clone();
+    assert!(
+        api["add"][0].get("ri").is_none(),
+        "参照 0 件なら ri を省略する (トークンを増やさない): {api}"
     );
 }
 
@@ -12836,6 +13034,7 @@ fn build_review_hook_json_api_removed_is_blocking() {
                 name: "foo".to_string(),
                 kind: "function".to_string(),
                 file: "a.rs".to_string(),
+                refs_internal: 0,
             }],
             modified: Vec::new(),
             moved: Vec::new(),
@@ -12920,11 +13119,13 @@ fn build_review_hook_json_removed_dead_only_is_not_blocking() {
                     name: "MapZoomUtils".to_string(),
                     kind: "object".to_string(),
                     file: "MapZoomUtils.kt".to_string(),
+                    refs_internal: 0,
                 },
                 ApiSymbol {
                     name: "MapZoomUtils.zoomForBounds".to_string(),
                     kind: "function".to_string(),
                     file: "MapZoomUtils.kt".to_string(),
+                    refs_internal: 0,
                 },
             ],
             modified_closed_in_diff: Vec::new(),
@@ -13807,6 +14008,7 @@ fn filter_dead_by_wip_added_drops_symbols_listed_in_added() {
         name: "matchAssigneeName".to_string(),
         kind: "function".to_string(),
         file: "src/notes.ts".to_string(),
+        refs_internal: 0,
     }];
     let filtered = filter_dead_by_wip_added(dead, &added);
     let names: Vec<&str> = filtered.iter().map(|d| d.name.as_str()).collect();
@@ -13833,6 +14035,7 @@ fn filter_dead_by_wip_added_matches_on_file_and_name_pair() {
         name: "helper".to_string(),
         kind: "function".to_string(),
         file: "src/b.ts".to_string(),
+        refs_internal: 0,
     }];
     let filtered = filter_dead_by_wip_added(dead, &added);
     assert_eq!(filtered.len(), 1);

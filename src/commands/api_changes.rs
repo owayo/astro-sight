@@ -199,6 +199,15 @@ impl ApiSymbolCandidate {
             name: self.name,
             kind: self.kind,
             file: self.file,
+            refs_internal: 0,
+        }
+    }
+
+    /// 同一ファイル内参照数を添えて `ApiSymbol` にする (api.add 専用)。
+    fn into_added_api_symbol(self, refs_internal: usize) -> ApiSymbol {
+        ApiSymbol {
+            refs_internal,
+            ..self.into_api_symbol()
         }
     }
 }
@@ -1045,8 +1054,21 @@ pub(crate) fn detect_api_changes(
     // (codex 指摘 3 対応: 候補数 × リポ全体走査の回避)。
     let (removed_kept, removed_dead) = partition_removed_dead_candidates(dir, removed);
 
+    // api.add に確定した候補にだけ同一ファイル内参照数を添える。move 相殺 (`moved`) で
+    // 抜けた候補には算出しないよう、reconcile 後のこの位置で 1 度だけ数える
+    // (Issue 2026-08-04-review-add-scope-naming)。参照集合は既に構築済みの ref_index から
+    // 引くため追加のディレクトリ走査は発生しない。
+    let added: Vec<ApiSymbol> = added
+        .into_iter()
+        .map(|c| {
+            let refs_internal =
+                count_internal_refs(&ref_index, dir, &c.file, &c.name, &mut closure_caches);
+            c.into_added_api_symbol(refs_internal)
+        })
+        .collect();
+
     ApiChanges {
-        added: added.into_iter().map(|c| c.into_api_symbol()).collect(),
+        added,
         removed: removed_kept
             .into_iter()
             .map(|c| c.into_api_symbol())

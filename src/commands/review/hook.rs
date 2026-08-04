@@ -41,6 +41,24 @@ struct HookNameFile<'a> {
     f: &'a str,
 }
 
+/// api.add 用 DTO。`HookNameFile` と分けるのは、同一ファイル内参照数を持つのが added だけで、
+/// 他の api バケット (rm / mod / mod_closed / const_value / rm_dead) は算出していないため
+/// (`HookDeadSymbol` を宣言行のために分けているのと同じ理由)。
+#[derive(Serialize)]
+struct HookAddedSymbol<'a> {
+    n: &'a str,
+    f: &'a str,
+    /// 同一ファイル内の実利用参照数 (定義 / import・re-export 行を除く)。
+    /// `add_scope` は「同一 diff の他ファイルから参照されていない」抽出範囲しか表せず、
+    /// 同一ファイル内の型注釈参照などは読み取れないため、シンボル単位で補う
+    /// (Issue 2026-08-04-review-add-scope-naming)。0 のときは省略する。
+    #[serde(
+        rename = "ri",
+        skip_serializing_if = "crate::models::review::is_zero_usize"
+    )]
+    refs_internal: usize,
+}
+
 /// dead シンボル用 DTO。`HookNameFile` と分けるのは、宣言行を持つのが
 /// dead / test_only だけで、api 系シンボル (add/rm/mod) は行を持たないため。
 #[derive(Serialize)]
@@ -76,7 +94,7 @@ struct HookCochange<'a> {
 #[derive(Serialize)]
 struct HookApi<'a> {
     #[serde(rename = "add", skip_serializing_if = "Vec::is_empty")]
-    added: Vec<HookNameFile<'a>>,
+    added: Vec<HookAddedSymbol<'a>>,
     /// `add` の抽出条件の自己記述。`add` には「新規 export のうち同一 diff 内でまだ
     /// どこからも参照されていないもの」だけが載る (diff 内で既に他ファイルから使われる
     /// 新規 export は載らない)。この条件が出力から読めないと、載らない新規 export を
@@ -107,10 +125,14 @@ impl<'a> HookApi<'a> {
             n: name.as_str(),
             f: file.as_str(),
         };
-        let added: Vec<HookNameFile<'a>> = api
+        let added: Vec<HookAddedSymbol<'a>> = api
             .added
             .iter()
-            .map(|change| name_file(&change.name, &change.file))
+            .map(|change| HookAddedSymbol {
+                n: change.name.as_str(),
+                f: change.file.as_str(),
+                refs_internal: change.refs_internal,
+            })
             .collect();
         let added_scope = (!added.is_empty()).then_some("unreferenced_in_diff");
         Self {

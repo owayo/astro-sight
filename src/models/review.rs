@@ -89,6 +89,23 @@ pub struct ApiSymbol {
     pub name: String,
     pub kind: String,
     pub file: String,
+    /// 同一ファイル内の実利用参照数 (定義行 / import・re-export 行を除く)。
+    ///
+    /// `api.add` の抽出条件は「同一ファイル内の**呼び出し**参照が無い」+「同一 diff 内の
+    /// 他ファイルからの実利用参照が無い」の合成で、TS の型注釈のように呼び出しではない
+    /// 参照は条件に現れない。そのため出力だけでは「同一ファイル内に参照があるのか」
+    /// 「完全に未参照なのか」を区別できず、トリアージ側が `refs` を再実行していた
+    /// (Issue 2026-08-04-review-add-scope-naming)。
+    ///
+    /// `added` 経路でのみ算出する。他バケット (`removed` / `removed_dead`) は 0 のままで、
+    /// 0 は JSON 出力から省略される (compact 規約)。
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub refs_internal: usize,
+}
+
+/// `serde(skip_serializing_if)` 用: 参照数 0 は出力から省略する (compact 規約)。
+pub(crate) fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 /// シグネチャが変更された公開シンボル。
