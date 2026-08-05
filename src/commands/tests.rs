@@ -2994,6 +2994,284 @@ fn detect_api_changes_ts_shadowed_local_fn_and_multiline_call_is_closed_in_diff(
     );
 }
 
+/// テストヘルパー: 「object 型引数へ必須プロパティ追加 + 呼び出し側は共有 const を渡すだけ」
+/// の diff を組み立てる (Issue 2026-08-05-api-mod-callers-updated-indirectly パターン C)。
+///
+/// `caller_after` で呼び出し側ファイルの変更後内容を差し替えることで、共有 const の更新有無 /
+/// binding 形態のバリエーションを 1 つのシナリオ骨格で表現する。
+fn ts_shared_const_arg_api_changes(
+    repo: &std::path::Path,
+    caller_before: &str,
+    caller_after: &str,
+) -> ApiChanges {
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/build.ts",
+                "export function buildSql(deps: {\n\tevents: string;\n\tusers: string;\n}): string {\n\treturn `${deps.events}:${deps.users}`;\n}\n",
+            ),
+            ("src/build.test.ts", caller_before),
+        ],
+        "base",
+    );
+    // 必須プロパティ `groups` を追加。呼び出し式 `buildSql(SHARED_DEPS)` は無変更で、
+    // 追随は SHARED_DEPS の定義側で行われる。
+    fs::write(
+        repo.join("src/build.ts"),
+        "export function buildSql(deps: {\n\tevents: string;\n\tusers: string;\n\tgroups: string;\n}): string {\n\treturn `${deps.events}:${deps.users}:${deps.groups}`;\n}\n",
+    )
+    .expect("write build.ts");
+    fs::write(repo.join("src/build.test.ts"), caller_after).expect("write caller");
+    let diff_files = vec![
+        crate::models::impact::DiffFile {
+            old_path: "src/build.ts".to_string(),
+            new_path: "src/build.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 6,
+                new_start: 1,
+                new_count: 7,
+            }],
+            deleted_old_source: None,
+        },
+        crate::models::impact::DiffFile {
+            old_path: "src/build.test.ts".to_string(),
+            new_path: "src/build.test.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 8,
+                new_start: 1,
+                new_count: 9,
+            }],
+            deleted_old_source: None,
+        },
+    ];
+    detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files)
+}
+
+const TS_SHARED_CONST_CALLER_BEFORE: &str = "import { buildSql } from \"./build\";\n\nconst SHARED_DEPS = {\n\tevents: \"e\",\n\tusers: \"u\",\n};\n\nexport function run(): string {\n\treturn buildSql(SHARED_DEPS);\n}\n";
+
+/// 呼び出し式は無変更でも、渡している共有 `const` の定義側に同一 diff 内で当該必須
+/// プロパティが追加されていれば closed-in-diff (informational) に降格する。
+///
+/// 旧実装は「参照行 / enclosing call_expression の行範囲が実変更行と交差するか」でしか
+/// 見ておらず、`buildSql(SHARED_DEPS)` のように呼び出し式そのものが無変更のケースを
+/// 未更新 caller として blocking にしていた。
+#[test]
+fn detect_api_changes_ts_shared_const_arg_updated_in_diff_is_closed_in_diff() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let api = ts_shared_const_arg_api_changes(
+        dir.path(),
+        TS_SHARED_CONST_CALLER_BEFORE,
+        "import { buildSql } from \"./build\";\n\nconst SHARED_DEPS = {\n\tevents: \"e\",\n\tusers: \"u\",\n\tgroups: \"g\",\n};\n\nexport function run(): string {\n\treturn buildSql(SHARED_DEPS);\n}\n",
+    );
+    assert!(
+        api.modified_closed_in_diff
+            .iter()
+            .any(|m| m.name.ends_with("buildSql")),
+        "共有 const の定義側が同一 diff で更新済みなら closed に降格すべき。mod={:?} mod_closed={:?}",
+        api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+        api.modified_closed_in_diff
+            .iter()
+            .map(|m| &m.name)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !api.modified.iter().any(|m| m.name.ends_with("buildSql")),
+        "closed-in-diff は blocking な modified に残さない"
+    );
+}
+
+/// 共有 `const` の定義が更新されていなければ従来どおり blocking (本当に未更新の caller)。
+#[test]
+fn detect_api_changes_ts_shared_const_arg_not_updated_stays_modified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // 呼び出し側は無関係な行だけ変更し、SHARED_DEPS に groups を足さない。
+    let api = ts_shared_const_arg_api_changes(
+        dir.path(),
+        TS_SHARED_CONST_CALLER_BEFORE,
+        "import { buildSql } from \"./build\";\n\nconst SHARED_DEPS = {\n\tevents: \"e2\",\n\tusers: \"u\",\n};\n\nexport function run(): string {\n\treturn buildSql(SHARED_DEPS);\n}\n",
+    );
+    assert!(
+        api.modified.iter().any(|m| m.name.ends_with("buildSql")),
+        "必須プロパティが共有 const に足されていなければ blocking を維持すべき。mod={:?} mod_closed={:?}",
+        api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+        api.modified_closed_in_diff
+            .iter()
+            .map(|m| &m.name)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// リポジトリ内に呼び出し参照が 1 件も無い exported 関数のシグネチャ変更は、
+/// **blocking な api.mod のまま**で `no_resolved_internal_callers` フラグだけ立てる。
+///
+/// 参照 0 件は「未使用」ではなく「静的に解決できた内部参照が 0 件」でしかなく、外部リポジトリ
+/// からの利用・動的呼び出し・文字列参照と区別できない (公開ライブラリではむしろ最重要の
+/// 破壊的変更)。カテゴリ分離も blocking 解除もせず、トリアージが「呼び出し側を探す」段階を
+/// 省けるようにするだけ (Issue 2026-08-05-api-mod-callers-updated-indirectly パターン B)。
+#[test]
+fn detect_api_changes_ts_modified_without_callers_is_flagged_but_still_modified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[(
+            "src/actions.ts",
+            "export function submitToggle(id: string): void {\n\tconsole.log(id);\n}\n",
+        )],
+        "base",
+    );
+    // 呼び出し側はリポジトリ内に 1 件も無い (UI 側は過去に削除済み) 状態で引数を追加する。
+    fs::write(
+        repo.join("src/actions.ts"),
+        "export function submitToggle(id: string, force: boolean): void {\n\tconsole.log(id, force);\n}\n",
+    )
+    .expect("write");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/actions.ts".to_string(),
+        new_path: "src/actions.ts".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 3,
+        }],
+        deleted_old_source: None,
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    let change = api
+        .modified
+        .iter()
+        .find(|m| m.name.ends_with("submitToggle"))
+        .unwrap_or_else(|| {
+            panic!(
+                "呼び出し側 0 件でも api.mod は blocking のまま維持すべき。mod={:?} mod_closed={:?}",
+                api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+                api.modified_closed_in_diff
+                    .iter()
+                    .map(|m| &m.name)
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        change.no_resolved_internal_callers,
+        "解決できた呼び出し参照が 0 件ならフラグを立てるべき: {change:?}"
+    );
+}
+
+/// 呼び出し参照があるシンボルにはフラグを立てない (フラグが常時 true にならないことの固定)。
+#[test]
+fn detect_api_changes_ts_modified_with_callers_is_not_flagged() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/actions.ts",
+                "export function submitToggle(id: string): void {\n\tconsole.log(id);\n}\n",
+            ),
+            (
+                "src/ui.ts",
+                "import { submitToggle } from \"./actions\";\n\nexport function onClick(): void {\n\tsubmitToggle(\"a\");\n}\n",
+            ),
+        ],
+        "base",
+    );
+    fs::write(
+        repo.join("src/actions.ts"),
+        "export function submitToggle(id: string, force: boolean): void {\n\tconsole.log(id, force);\n}\n",
+    )
+    .expect("write");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/actions.ts".to_string(),
+        new_path: "src/actions.ts".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 3,
+        }],
+        deleted_old_source: None,
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    let change = api
+        .modified
+        .iter()
+        .find(|m| m.name.ends_with("submitToggle"))
+        .expect("未更新 caller があるので blocking な api.mod に残る");
+    assert!(
+        !change.no_resolved_internal_callers,
+        "呼び出し参照があるシンボルにはフラグを立てない: {change:?}"
+    );
+}
+
+/// 引数が `const` ではなく `let` の場合は再代入されうるため降格しない (fail-closed)。
+#[test]
+fn detect_api_changes_ts_shared_let_arg_stays_modified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let api = ts_shared_const_arg_api_changes(
+        dir.path(),
+        "import { buildSql } from \"./build\";\n\nlet SHARED_DEPS = {\n\tevents: \"e\",\n\tusers: \"u\",\n};\n\nexport function run(): string {\n\treturn buildSql(SHARED_DEPS);\n}\n",
+        "import { buildSql } from \"./build\";\n\nlet SHARED_DEPS = {\n\tevents: \"e\",\n\tusers: \"u\",\n\tgroups: \"g\",\n};\n\nexport function run(): string {\n\treturn buildSql(SHARED_DEPS);\n}\n",
+    );
+    assert!(
+        api.modified.iter().any(|m| m.name.ends_with("buildSql")),
+        "let 束縛は再代入されうるので降格しない。mod={:?} mod_closed={:?}",
+        api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+        api.modified_closed_in_diff
+            .iter()
+            .map(|m| &m.name)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// 同名 binding が他にもある (shadow の可能性) 場合は降格しない (fail-closed)。
+/// 呼び出し位置で実際に渡る値を静的に決められないため。
+#[test]
+fn detect_api_changes_ts_shadowed_const_arg_stays_modified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let api = ts_shared_const_arg_api_changes(
+        dir.path(),
+        "import { buildSql } from \"./build\";\n\nconst SHARED_DEPS = {\n\tevents: \"e\",\n\tusers: \"u\",\n};\n\nexport function run(SHARED_DEPS: { events: string; users: string }): string {\n\treturn buildSql(SHARED_DEPS);\n}\n",
+        "import { buildSql } from \"./build\";\n\nconst SHARED_DEPS = {\n\tevents: \"e\",\n\tusers: \"u\",\n\tgroups: \"g\",\n};\n\nexport function run(SHARED_DEPS: { events: string; users: string }): string {\n\treturn buildSql(SHARED_DEPS);\n}\n",
+    );
+    assert!(
+        api.modified.iter().any(|m| m.name.ends_with("buildSql")),
+        "同名 binding が複数あれば shadow の可能性があり降格しない。mod={:?} mod_closed={:?}",
+        api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+        api.modified_closed_in_diff
+            .iter()
+            .map(|m| &m.name)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// spread を含む object literal はキー集合を静的に確定できないため降格しない (fail-closed)。
+#[test]
+fn detect_api_changes_ts_spread_const_arg_stays_modified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let api = ts_shared_const_arg_api_changes(
+        dir.path(),
+        "import { buildSql } from \"./build\";\n\nconst BASE = { users: \"u\" };\nconst SHARED_DEPS = {\n\t...BASE,\n\tevents: \"e\",\n};\n\nexport function run(): string {\n\treturn buildSql(SHARED_DEPS);\n}\n",
+        "import { buildSql } from \"./build\";\n\nconst BASE = { users: \"u\" };\nconst SHARED_DEPS = {\n\t...BASE,\n\tevents: \"e\",\n\tgroups: \"g\",\n};\n\nexport function run(): string {\n\treturn buildSql(SHARED_DEPS);\n}\n",
+    );
+    assert!(
+        api.modified.iter().any(|m| m.name.ends_with("buildSql")),
+        "spread 混じりの object はキー集合を確定できないため降格しない。mod={:?} mod_closed={:?}",
+        api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+        api.modified_closed_in_diff
+            .iter()
+            .map(|m| &m.name)
+            .collect::<Vec<_>>()
+    );
+}
+
 /// 同名ローカル関数の shadow があっても、対象 caller が diff 外なら従来どおり blocking。
 #[test]
 fn detect_api_changes_ts_shadowed_local_fn_with_caller_outside_diff_stays_modified() {
@@ -9632,6 +9910,7 @@ fn build_review_hook_json_mixed_compatible_and_breaking_impact_keeps_breaking_on
                 new_signature: Some(
                     "export function loadTask(id: string, required: boolean)".to_string(),
                 ),
+                no_resolved_internal_callers: false,
             }],
             moved: Vec::new(),
             property_to_field: Vec::new(),
@@ -13431,6 +13710,7 @@ fn build_review_hook_json_api_modified_is_blocking() {
                 file: "a.rs".to_string(),
                 old_signature: Some("fn foo()".to_string()),
                 new_signature: Some("fn foo(x: u32)".to_string()),
+                no_resolved_internal_callers: false,
             }],
             moved: Vec::new(),
             property_to_field: Vec::new(),
@@ -13446,8 +13726,64 @@ fn build_review_hook_json_api_modified_is_blocking() {
     };
 
     let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
-    assert!(build.value.is_some(), "api.mod は hook JSON に出すべき");
+    let hook_json = build.value.expect("api.mod は hook JSON に出すべき");
     assert!(build.is_blocking, "api.mod は blocking にすべき");
+    assert!(
+        hook_json["api"]["mod"][0].get("no_callers").is_none(),
+        "呼び出し参照ありなら no_callers は省略される: {hook_json}"
+    );
+}
+
+/// 解決できた呼び出し参照が 0 件の api.mod には `no_callers` を添える。
+/// 分類 (`api.mod`) も blocking も変えず、トリアージ用の情報だけ足す
+/// (Issue 2026-08-05-api-mod-callers-updated-indirectly のパターン B)。
+#[test]
+fn build_review_hook_json_api_modified_without_callers_is_flagged_but_still_blocking() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let result = ReviewResult {
+        impact: crate::models::impact::ContextResult {
+            changes: Vec::new(),
+            skipped: None,
+            truncations: Vec::new(),
+        },
+        missing_cochanges: Vec::new(),
+        cochange_diagnostics: Default::default(),
+        api_changes: ApiChanges {
+            added: Vec::new(),
+            removed: Vec::new(),
+            modified: vec![ApiSymbolChange {
+                name: "foo".to_string(),
+                kind: "function".to_string(),
+                file: "a.rs".to_string(),
+                old_signature: Some("fn foo()".to_string()),
+                new_signature: Some("fn foo(x: u32)".to_string()),
+                no_resolved_internal_callers: true,
+            }],
+            moved: Vec::new(),
+            property_to_field: Vec::new(),
+            removed_dead: Vec::new(),
+            modified_closed_in_diff: Vec::new(),
+            const_value_changes: Vec::new(),
+            compatible_modified: Vec::new(),
+        },
+        dead_symbols: Vec::new(),
+        test_only_symbols: Vec::new(),
+        skipped: None,
+        truncations: Vec::new(),
+    };
+
+    let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
+    let hook_json = build.value.expect("api.mod は hook JSON に出すべき");
+    assert_eq!(
+        hook_json["api"]["mod"][0]["no_callers"],
+        serde_json::json!(true),
+        "呼び出し参照 0 件は no_callers で示す: {hook_json}"
+    );
+    assert!(
+        build.is_blocking,
+        "呼び出し参照 0 件でも api.mod は blocking のまま (外部利用・動的呼び出しと区別できない)"
+    );
 }
 
 /// `rm_dead` (削除前参照ゼロの dead symbol 削除) は破壊的変更ではないため、
@@ -13532,6 +13868,7 @@ fn build_review_hook_json_const_value_only_is_informational() {
                 file: "src/constants.rs".to_string(),
                 old_signature: Some("pub const ENEMY_SPEED: f32".to_string()),
                 new_signature: Some("pub const ENEMY_SPEED: f32".to_string()),
+                no_resolved_internal_callers: false,
             }],
             compatible_modified: Vec::new(),
         },
@@ -13576,6 +13913,7 @@ fn build_review_hook_json_const_value_is_blocking_under_strict() {
                 file: "src/constants.rs".to_string(),
                 old_signature: Some("pub const ENEMY_SPEED: f32".to_string()),
                 new_signature: Some("pub const ENEMY_SPEED: f32".to_string()),
+                no_resolved_internal_callers: false,
             }],
             compatible_modified: Vec::new(),
         },

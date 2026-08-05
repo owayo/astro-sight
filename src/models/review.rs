@@ -112,6 +112,11 @@ pub(crate) fn is_zero_usize(value: &usize) -> bool {
     *value == 0
 }
 
+/// `serde(skip_serializing_if)` 用: false のフラグは出力から省略する (compact 規約)。
+pub(crate) fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// シグネチャが変更された公開シンボル。
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiSymbolChange {
@@ -122,6 +127,21 @@ pub struct ApiSymbolChange {
     pub old_signature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_signature: Option<String>,
+    /// リポジトリ内に解決できた呼び出し参照が 1 件も無い (定義・import/use 行を除く)。
+    ///
+    /// `api.mod` は「未更新の呼び出し側があるかもしれない」という警告だが、呼び出し参照が
+    /// 0 件のシンボルでは更新すべき呼び出し側が存在せず、出力だけではその区別がつかない
+    /// (Issue 2026-08-05-api-mod-callers-updated-indirectly のパターン B)。
+    ///
+    /// **カテゴリ分離も blocking 解除もしない**: 参照 0 件は「未使用」ではなく
+    /// 「astro-sight が解決できる内部参照が 0 件」でしかなく、外部リポジトリからの利用・
+    /// 動的呼び出し・フレームワーク経由・文字列参照と区別できない。公開ライブラリでは
+    /// むしろ最重要の破壊的変更になる。トリアージが「呼び出し側を探す」段階を飛ばせる
+    /// ようフラグだけ添える (`ApiSymbol::refs_internal` と同じ方針)。
+    ///
+    /// `modified` 経路でのみ算出する。他バケットは false のままで JSON からは省略される。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_resolved_internal_callers: bool,
 }
 
 /// 互換性ありと判定された api.mod。シグネチャ文字列は変わったが公開契約 (呼び出し側の

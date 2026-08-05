@@ -407,6 +407,161 @@ pub(crate) fn detect_optional_object_props_compatible_mod(
     Some(site.compatible("optional_object_props"))
 }
 
+/// 「object type literal 引数へ**必須**プロパティを追加しただけ」の signature 変更で、
+/// 追加された必須プロパティ名と対象引数の位置を返す。
+///
+/// これは互換変更**ではない** (呼び出し側は必ず新プロパティを渡す必要がある) ので
+/// `compatible_modified` には使わない。用途は `is_modified_closed_in_diff` の追加証拠で、
+/// 「呼び出し式は無変更だが、渡している共有 const の定義側に同一 diff 内で当該プロパティが
+/// 追加されている」= 呼び出し側は追随済み、を判定するための入力になる
+/// (Issue 2026-08-05-api-mod-callers-updated-indirectly のパターン C)。
+///
+/// 次をすべて満たす場合だけ `Some` を返す (それ以外は None = 追加証拠を使わない):
+/// - シンボル解決条件は他の TS 判定器と同一 (トップレベル関数 / class method が old/new とも一意)
+/// - 関数名・型パラメータ・戻り値・modifier など parameters 外の signature が不変
+/// - 引数の個数が不変で、**テキストが変わった引数はちょうど 1 つ**
+/// - その引数は名前・default 値・required/optional の別が不変で、type annotation が
+///   object type literal 同士、既存メンバーがテキスト完全一致で残り、追加メンバーが
+///   すべて**非** optional の `property_signature` (= 必須プロパティ追加のみ)
+pub(crate) struct AddedRequiredObjectProps {
+    /// テキストが変わった引数の 0-indexed 位置。
+    pub(crate) param_index: usize,
+    /// 新たに必須になったプロパティ名。
+    pub(crate) names: Vec<String>,
+}
+
+pub(crate) fn detect_added_required_object_props(
+    site: &CompatibleModSite<'_>,
+    sources: &mut SignatureSourceCache,
+) -> Option<AddedRequiredObjectProps> {
+    with_resolved_ts_fn_pair(site, sources, |old_fn, old_source, new_fn, new_source| {
+        let old_parts = ts_function_signature_parts(old_fn, old_source)?;
+        let new_parts = ts_function_signature_parts(new_fn, new_source)?;
+        if old_parts.head != new_parts.head || old_parts.tail != new_parts.tail {
+            return None;
+        }
+
+        let old_params_node = old_fn.child_by_field_name("parameters")?;
+        let new_params_node = new_fn.child_by_field_name("parameters")?;
+        let mut old_cursor = old_params_node.walk();
+        let old_children: Vec<tree_sitter::Node> =
+            old_params_node.named_children(&mut old_cursor).collect();
+        let mut new_cursor = new_params_node.walk();
+        let new_children: Vec<tree_sitter::Node> =
+            new_params_node.named_children(&mut new_cursor).collect();
+        if old_children.len() != new_children.len() {
+            return None;
+        }
+
+        let mut changed: Option<(usize, Vec<String>)> = None;
+        for (ix, (old_param, new_param)) in old_children.iter().zip(new_children.iter()).enumerate()
+        {
+            let old_text = node_normalized_text(*old_param, old_source)?;
+            let new_text = node_normalized_text(*new_param, new_source)?;
+            if old_text == new_text {
+                continue;
+            }
+            // 変更された引数が 2 つ以上あると「どの引数の追加プロパティか」を一意に
+            // 決められないので追加証拠に使わない (blocking 維持)。
+            if changed.is_some() {
+                return None;
+            }
+            let names = ts_param_pair_added_required_prop_names(
+                *old_param, old_source, *new_param, new_source,
+            )?;
+            changed = Some((ix, names));
+        }
+        let (param_index, names) = changed?;
+        (!names.is_empty()).then_some(AddedRequiredObjectProps { param_index, names })
+    })
+}
+
+/// 引数ペアが「inline object type literal への**必須**プロパティ追加だけ」かを判定し、
+/// 追加された必須プロパティ名を返す。引数の kind (required/optional)・名前 (pattern)・
+/// default 値は不変であること。既存メンバーの削除・変更、optional プロパティの追加が
+/// 混ざっていれば None (追加証拠に使わない = blocking 維持)。
+fn ts_param_pair_added_required_prop_names(
+    old_param: tree_sitter::Node<'_>,
+    old_source: &[u8],
+    new_param: tree_sitter::Node<'_>,
+    new_source: &[u8],
+) -> Option<Vec<String>> {
+    if old_param.kind() != new_param.kind()
+        || !matches!(
+            old_param.kind(),
+            "required_parameter" | "optional_parameter"
+        )
+    {
+        return None;
+    }
+    let (old_pattern, new_pattern) = (
+        old_param.child_by_field_name("pattern")?,
+        new_param.child_by_field_name("pattern")?,
+    );
+    if node_normalized_text(old_pattern, old_source)
+        != node_normalized_text(new_pattern, new_source)
+    {
+        return None;
+    }
+    let old_value = old_param
+        .child_by_field_name("value")
+        .and_then(|n| node_normalized_text(n, old_source));
+    let new_value = new_param
+        .child_by_field_name("value")
+        .and_then(|n| node_normalized_text(n, new_source));
+    if old_value != new_value {
+        return None;
+    }
+    let (old_ty, new_ty) = (
+        ts_param_object_type(old_param)?,
+        ts_param_object_type(new_param)?,
+    );
+    ts_object_type_added_required_members(old_ty, old_source, new_ty, new_source)
+}
+
+/// old object_type の全メンバーが new にテキスト一致で残り、new の追加メンバーがすべて
+/// 必須 (`?` なし) の property_signature なら、その名前一覧を返す。
+/// メンバー削除・変更、optional 追加の混在は None。
+fn ts_object_type_added_required_members(
+    old_ty: tree_sitter::Node<'_>,
+    old_source: &[u8],
+    new_ty: tree_sitter::Node<'_>,
+    new_source: &[u8],
+) -> Option<Vec<String>> {
+    use std::collections::HashMap;
+    let mut new_members: HashMap<String, Vec<tree_sitter::Node>> = HashMap::new();
+    let mut cursor = new_ty.walk();
+    for member in new_ty.named_children(&mut cursor) {
+        new_members
+            .entry(node_normalized_text(member, new_source)?)
+            .or_default()
+            .push(member);
+    }
+    let mut cursor = old_ty.walk();
+    for member in old_ty.named_children(&mut cursor) {
+        let text = node_normalized_text(member, old_source)?;
+        match new_members.get_mut(&text) {
+            Some(nodes) if !nodes.is_empty() => {
+                nodes.pop();
+            }
+            // 既存メンバーの削除・変更があれば「必須プロパティ追加のみ」ではない
+            _ => return None,
+        }
+    }
+    // 出力順を決定論的にするため、追加メンバーはソース上の出現順に並べる。
+    let mut added: Vec<tree_sitter::Node> = new_members.values().flatten().copied().collect();
+    added.sort_by_key(tree_sitter::Node::start_byte);
+    let mut names = Vec::with_capacity(added.len());
+    for member in added {
+        if member.kind() != "property_signature" || ts_property_signature_is_optional(member) {
+            return None;
+        }
+        let key = member.child_by_field_name("name")?;
+        names.push(object_key_text(key, new_source)?);
+    }
+    Some(names)
+}
+
 /// TSX/TS の exported function component へ `async` キーワードを追加しただけの変更を
 /// compatible_modified (`async_jsx_component`) として判定する
 /// (Issue 2026-07-20-react-rsc-async-component-impact-classification)。

@@ -417,6 +417,8 @@ fn process_modified_file(
                 file: df.new_path.clone(),
                 old_signature: Some(old_sig.to_string()),
                 new_signature: Some(new_sig.clone()),
+                // blocking な api.mod に確定した時点でのみ算出する (classify_signature_change)。
+                no_resolved_internal_callers: false,
             };
             classify_signature_change(
                 change,
@@ -508,6 +510,10 @@ fn classify_signature_change(
         buckets.compatible_modified.push(compat);
         return;
     }
+    // object type literal 引数への必須プロパティ追加のみの変更なら、閉包判定へ追加証拠として
+    // 渡す (呼び出し式が無変更でも共有 const の定義側が同一 diff で更新されていれば追随済み)。
+    // 互換変更ではないので compatible_modified には入れず、あくまで closed 判定の入力。
+    let added_required_props = detect_added_required_object_props(&site, sources);
     // 全 cross-file 参照が同一 diff 内で追随済みなら informational
     if is_modified_closed_in_diff(
         ref_index,
@@ -517,10 +523,16 @@ fn classify_signature_change(
         base,
         &df.new_path,
         diff_files,
+        added_required_props.as_ref(),
         closure_caches,
     ) {
         buckets.modified_closed_in_diff.push(change);
     } else {
+        // blocking な api.mod にだけ「解決できた呼び出し参照ゼロ」フラグを添える。
+        // 分類も blocking 判定も変えず、トリアージが「呼び出し側を探す」段階を省けるようにする。
+        let mut change = change;
+        change.no_resolved_internal_callers =
+            has_no_resolved_internal_callers(ref_index, dir, &name, closure_caches);
         buckets.modified.push(change);
     }
 }
@@ -2519,6 +2531,7 @@ mod ref_index;
 mod removed_attribution;
 mod rust_public;
 mod source_pair;
+mod ts_const_arg;
 mod ts_signature;
 
 pub(crate) use python_signature::*;

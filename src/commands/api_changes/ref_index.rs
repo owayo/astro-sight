@@ -135,6 +135,11 @@ pub(crate) fn has_blocking_value_usage(index: &ApiRefIndex, name: &str) -> bool 
 /// から除外する (Issue 2026-07-12-api-mod-same-diff-informational: export 関数と
 /// 別ファイルのローカル同名関数の併存で closed 判定が全滅していた)。method qualname
 /// (`Container.method`) と JS/TS 以外の言語は従来ガード (即 blocking) を維持する。
+///
+/// `added_required_props` は「object type literal 引数への必須プロパティ追加のみ」の signature
+/// 変更のときだけ `Some`。呼び出し式が無変更でも、渡している共有 `const` の定義側に同一 diff で
+/// 当該プロパティが追加されていれば追随済みとみなす追加証拠に使う
+/// (`closed_via_local_const_argument`、Issue 2026-08-05-api-mod-callers-updated-indirectly)。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn is_modified_closed_in_diff(
     index: &ApiRefIndex,
@@ -144,6 +149,9 @@ pub(crate) fn is_modified_closed_in_diff(
     base: &str,
     target_new_path: &str,
     diff_files: &[crate::models::impact::DiffFile],
+    added_required_props: Option<
+        &crate::commands::api_changes::ts_signature::AddedRequiredObjectProps,
+    >,
     caches: &mut ApiClosureCaches,
 ) -> bool {
     use crate::models::reference::RefKind;
@@ -194,17 +202,7 @@ pub(crate) fn is_modified_closed_in_diff(
     // 誤判定して blocking していた問題への対応)。
     // 2 つのキャッシュは detect_api_changes スコープで生成して全 modified シンボルで共有する。
     // per-symbol の git diff サブプロセス起動と tree-sitter parse を unique file 単位に削減する。
-    let call_refs: Vec<&crate::models::reference::SymbolReference> = refs
-        .iter()
-        .filter(|r| r.kind != Some(RefKind::Definition) && !ref_is_import_line(r))
-        .filter(|r| {
-            let import_lines = caches
-                .import_lines
-                .entry(r.path.clone())
-                .or_insert_with(|| import_statement_lines_for_ref(dir, &r.path));
-            !import_lines.contains(&r.line)
-        })
-        .collect();
+    let call_refs = collect_call_refs(refs, dir, caches);
     if call_refs.is_empty() {
         return false;
     }
@@ -247,7 +245,24 @@ pub(crate) fn is_modified_closed_in_diff(
                 changed.is_some_and(|c| (start..=end).any(|line| c.contains(&line)))
             });
             if !intersects {
-                return false; // context 行 (未変更) の参照 → 未更新 caller の可能性
+                // 呼び出し式が完全に無変更でも、引数に渡している共有 const の定義側に
+                // 同一 diff で必須プロパティが追加されていれば追随済み
+                // (`buildX(SHARED_DEPS)` のまま SHARED_DEPS 側だけ更新されるパターン)。
+                let changed_lines = caches
+                    .changed_new_lines
+                    .get(&df.new_path)
+                    .cloned()
+                    .unwrap_or_default();
+                if !closed_via_local_const_argument(
+                    dir,
+                    r,
+                    bare,
+                    added_required_props,
+                    &changed_lines,
+                    caches,
+                ) {
+                    return false; // context 行 (未変更) の参照 → 未更新 caller の可能性
+                }
             }
         }
     }
@@ -356,6 +371,104 @@ fn callee_call_line_range(
         }
     }
     None
+}
+
+/// 定義・import/use 行を除いた「実際の呼び出し参照」だけを抜き出す。
+///
+/// 行頭テキスト判定 (`ref_is_import_line`) は複数行 grouped use ブロックの継続行
+/// (`    a, b, cmd_cochange, ...` のように `use ` で始まらない行) を拾えないため、AST ベースの
+/// import 行集合でも除外する (api.mod 誤検出 2026-05-31)。
+fn collect_call_refs<'a>(
+    refs: &'a [crate::models::reference::SymbolReference],
+    dir: &str,
+    caches: &mut ApiClosureCaches,
+) -> Vec<&'a crate::models::reference::SymbolReference> {
+    use crate::models::reference::RefKind;
+    refs.iter()
+        .filter(|r| r.kind != Some(RefKind::Definition) && !ref_is_import_line(r))
+        .filter(|r| {
+            let import_lines = caches
+                .import_lines
+                .entry(r.path.clone())
+                .or_insert_with(|| import_statement_lines_for_ref(dir, &r.path));
+            !import_lines.contains(&r.line)
+        })
+        .collect()
+}
+
+/// リポジトリ内に解決できた呼び出し参照が 1 件も無いか (定義・import/use 行を除く)。
+///
+/// `api.mod` に残ったシンボルへ添えるトリアージ用フラグの算出。参照集合を引けない
+/// (index 未収集 / batch 失敗) 場合は `false` = 「参照ありかもしれない」に倒す
+/// (「呼び出し側が無い」と断定して読み手を誤らせない保守側)。
+///
+/// **分類や blocking 判定には使わない** — 参照 0 件は「未使用」ではなく「静的に解決できた
+/// 内部参照が 0 件」でしかない (外部リポジトリ / 動的呼び出し / 文字列参照を区別できない)。
+pub(crate) fn has_no_resolved_internal_callers(
+    index: &ApiRefIndex,
+    dir: &str,
+    name: &str,
+    caches: &mut ApiClosureCaches,
+) -> bool {
+    let Some(refs) = index.refs_for(bare_name(name)) else {
+        return false;
+    };
+    collect_call_refs(refs, dir, caches).is_empty()
+}
+
+/// 参照 (call の callee) が「引数に渡している共有 `const` の定義側が同一 diff 内で更新済み」
+/// によって追随しているかを判定する。
+///
+/// 呼び出し式そのものが無変更 (`buildX(SHARED_DEPS)`) で、実際の追随が `SHARED_DEPS` の定義側で
+/// 行われているケースを未更新 caller と誤判定しないための追加証拠。ガードは
+/// `ts_const_arg` 側に集約している (TS/TSX 限定 / 裸 identifier 引数 / 同一ファイル内の一意な
+/// `const` object literal / 追加必須プロパティが実変更行にあること)。
+/// `added` が `None` (= 必須プロパティ追加以外の signature 変更) なら常に false。
+fn closed_via_local_const_argument(
+    dir: &str,
+    r: &crate::models::reference::SymbolReference,
+    bare: &str,
+    added: Option<&crate::commands::api_changes::ts_signature::AddedRequiredObjectProps>,
+    changed_lines: &std::collections::HashSet<usize>,
+    caches: &mut ApiClosureCaches,
+) -> bool {
+    let Some(added) = added else {
+        return false;
+    };
+    let Some((source, tree, lang)) = parsed_ref_file(dir, &r.path, caches) else {
+        return false;
+    };
+    let point = tree_sitter::Point {
+        row: r.line,
+        column: r.column,
+    };
+    let Some(node) = tree
+        .root_node()
+        .descendant_for_point_range(point, point)
+        .filter(|n| n.kind() == "identifier" && n.utf8_text(source).ok() == Some(bare))
+    else {
+        return false;
+    };
+    // 直接の callee (`foo(...)`) のみを対象にする。member 経由 (`ns.foo(...)`) は receiver の
+    // 解決が別問題になるため対象外。
+    let Some(call_node) = node
+        .parent()
+        .filter(|p| p.kind() == "call_expression")
+        .filter(|p| {
+            p.child_by_field_name("function")
+                .is_some_and(|f| f.id() == node.id())
+        })
+    else {
+        return false;
+    };
+    crate::commands::api_changes::ts_const_arg::closed_via_local_const_argument(
+        *lang,
+        tree.root_node(),
+        source,
+        call_node,
+        added,
+        changed_lines,
+    )
 }
 
 /// `is_modified_closed_in_diff` で `detect_api_changes` 呼び出し 1 回の間だけ生かす per-file

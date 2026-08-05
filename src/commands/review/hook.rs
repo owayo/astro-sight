@@ -59,6 +59,25 @@ struct HookAddedSymbol<'a> {
     refs_internal: usize,
 }
 
+/// api.mod 用 DTO。`HookNameFile` と分けるのは、「解決できた呼び出し参照ゼロ」フラグを
+/// 持つのが blocking な modified だけで、他バケット (rm / mod_closed / const_value / rm_dead)
+/// では算出していないため (`HookAddedSymbol` の `ri` と同じ理由)。
+#[derive(Serialize)]
+struct HookModifiedSymbol<'a> {
+    n: &'a str,
+    f: &'a str,
+    /// リポジトリ内に解決できた呼び出し参照が 1 件も無い。`api.mod` は「未更新の呼び出し側が
+    /// あるかもしれない」警告だが、呼び出し参照 0 件では更新すべき呼び出し側が存在せず、
+    /// 出力だけではその区別がつかない (Issue 2026-08-05-api-mod-callers-updated-indirectly)。
+    /// 分類も blocking も変えず、トリアージが呼び出し側を探す段階を省けるようにするだけ。
+    /// false のときは省略する。
+    #[serde(
+        rename = "no_callers",
+        skip_serializing_if = "crate::models::review::is_false"
+    )]
+    no_resolved_internal_callers: bool,
+}
+
 /// dead シンボル用 DTO。`HookNameFile` と分けるのは、宣言行を持つのが
 /// dead / test_only だけで、api 系シンボル (add/rm/mod) は行を持たないため。
 #[derive(Serialize)]
@@ -114,7 +133,7 @@ struct HookApi<'a> {
     #[serde(rename = "rm", skip_serializing_if = "Vec::is_empty")]
     removed: Vec<HookNameFile<'a>>,
     #[serde(rename = "mod", skip_serializing_if = "Vec::is_empty")]
-    modified: Vec<HookNameFile<'a>>,
+    modified: Vec<HookModifiedSymbol<'a>>,
     #[serde(rename = "mod_closed", skip_serializing_if = "Vec::is_empty")]
     modified_closed_in_diff: Vec<HookNameFile<'a>>,
     #[serde(rename = "const_value", skip_serializing_if = "Vec::is_empty")]
@@ -156,7 +175,11 @@ impl<'a> HookApi<'a> {
             modified: api
                 .modified
                 .iter()
-                .map(|change| name_file(&change.name, &change.file))
+                .map(|change| HookModifiedSymbol {
+                    n: change.name.as_str(),
+                    f: change.file.as_str(),
+                    no_resolved_internal_callers: change.no_resolved_internal_callers,
+                })
                 .collect(),
             modified_closed_in_diff: api
                 .modified_closed_in_diff
