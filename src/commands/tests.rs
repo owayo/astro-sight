@@ -3252,6 +3252,88 @@ fn detect_api_changes_ts_shadowed_const_arg_stays_modified() {
     );
 }
 
+/// 各種 shadow 構文で降格しないこと (binding 検出漏れ = shadow 見逃し = fail-open の回帰防止)。
+///
+/// identifier の親 field 名だけで binding を判定していると、bare arrow パラメータ・catch
+/// パラメータ・renamed destructuring・配列/rest destructuring を取りこぼし、実際に渡るのは
+/// 更新されていないローカル値なのにトップレベル const を見て降格してしまう。
+/// いずれのケースもトップレベルに「更新済みの `const SHARED_DEPS`」を置いたうえで、
+/// 呼び出し位置ではそれが shadow されている形にしてある。
+#[test]
+fn detect_api_changes_ts_shadowing_binding_forms_stay_modified() {
+    // (ケース名, 呼び出し側ファイルの本体。SHARED_DEPS を shadow する binding を含む)
+    // 実引数はいずれも**裸の identifier** にする (`X as never` のような cast を挟むと
+    // 「bare identifier ではない」という別の理由で不成立になり、shadow ガードを検証できない)。
+    let cases: [(&str, &str); 5] = [
+        (
+            "bare arrow parameter",
+            "export const run = (SHARED_DEPS) => buildSql(SHARED_DEPS);\n",
+        ),
+        (
+            "catch parameter",
+            "export function run(): string {\n\ttry {\n\t\treturn \"\";\n\t} catch (SHARED_DEPS) {\n\t\treturn buildSql(SHARED_DEPS);\n\t}\n}\n",
+        ),
+        (
+            "renamed destructuring",
+            "export function run(input): string {\n\tconst { deps: SHARED_DEPS } = input;\n\treturn buildSql(SHARED_DEPS);\n}\n",
+        ),
+        (
+            "array destructuring",
+            "export function run(input): string {\n\tconst [SHARED_DEPS] = input;\n\treturn buildSql(SHARED_DEPS);\n}\n",
+        ),
+        (
+            "rest parameter",
+            "export function run(...SHARED_DEPS): string {\n\treturn buildSql(SHARED_DEPS);\n}\n",
+        ),
+    ];
+    for (label, body) in cases {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 変更前後で共通の「トップレベル const」部分。after 側では groups を追加済みにして、
+        // shadow を見逃したら降格してしまう状況を作る。
+        let before = format!(
+            "import {{ buildSql }} from \"./build\";\n\nconst SHARED_DEPS = {{\n\tevents: \"e\",\n\tusers: \"u\",\n}};\n\nexport const unused = SHARED_DEPS;\n\n{body}"
+        );
+        let after = format!(
+            "import {{ buildSql }} from \"./build\";\n\nconst SHARED_DEPS = {{\n\tevents: \"e\",\n\tusers: \"u\",\n\tgroups: \"g\",\n}};\n\nexport const unused = SHARED_DEPS;\n\n{body}"
+        );
+        let api = ts_shared_const_arg_api_changes(dir.path(), &before, &after);
+        assert!(
+            api.modified.iter().any(|m| m.name.ends_with("buildSql")),
+            "{label}: shadow された binding は静的に値を決められないので降格しない。mod={:?} mod_closed={:?}",
+            api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+            api.modified_closed_in_diff
+                .iter()
+                .map(|m| &m.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // 対照ケース: 上と同じ骨格で shadow だけ取り除く (パラメータ名を変える) と降格する。
+    // これが無いと「そもそも降格し得ない形だから modified のまま」でも上の assert が通り、
+    // shadow ガードのテストとして成立しない。
+    let dir = tempfile::tempdir().expect("tempdir");
+    let control_body = "export const run = (other) => buildSql(SHARED_DEPS) + other;\n";
+    let control_before = format!(
+        "import {{ buildSql }} from \"./build\";\n\nconst SHARED_DEPS = {{\n\tevents: \"e\",\n\tusers: \"u\",\n}};\n\nexport const unused = SHARED_DEPS;\n\n{control_body}"
+    );
+    let control_after = format!(
+        "import {{ buildSql }} from \"./build\";\n\nconst SHARED_DEPS = {{\n\tevents: \"e\",\n\tusers: \"u\",\n\tgroups: \"g\",\n}};\n\nexport const unused = SHARED_DEPS;\n\n{control_body}"
+    );
+    let api = ts_shared_const_arg_api_changes(dir.path(), &control_before, &control_after);
+    assert!(
+        api.modified_closed_in_diff
+            .iter()
+            .any(|m| m.name.ends_with("buildSql")),
+        "対照ケース (shadow なし) は降格するはず。降格しないなら上の shadow テストが\
+         shadow ガードを検証できていない。mod={:?} mod_closed={:?}",
+        api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+        api.modified_closed_in_diff
+            .iter()
+            .map(|m| &m.name)
+            .collect::<Vec<_>>()
+    );
+}
+
 /// spread を含む object literal はキー集合を静的に確定できないため降格しない (fail-closed)。
 #[test]
 fn detect_api_changes_ts_spread_const_arg_stays_modified() {

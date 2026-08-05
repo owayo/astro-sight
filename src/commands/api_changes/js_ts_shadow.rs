@@ -261,7 +261,9 @@ fn find_binding_in_subtree(
 }
 
 /// binding パターン (identifier / destructuring / rest / default) が `name` を束縛するか。
-fn pattern_binds_name(pattern: Node<'_>, source: &[u8], name: &str) -> bool {
+/// `ts_const_arg` の binding 列挙とロジックを共有する (検出漏れ = shadow 見逃し =
+/// fail-open になるため、実装を 2 箇所に分けない)。
+pub(crate) fn pattern_binds_name(pattern: Node<'_>, source: &[u8], name: &str) -> bool {
     match pattern.kind() {
         "identifier" | "shorthand_property_identifier_pattern" => {
             pattern.utf8_text(source).ok() == Some(name)
@@ -280,7 +282,7 @@ fn pattern_binds_name(pattern: Node<'_>, source: &[u8], name: &str) -> bool {
 }
 
 /// import 文が `name` をローカル binding として導入するか (default / named / alias / namespace)。
-fn import_binds_name(import_stmt: Node<'_>, source: &[u8], name: &str) -> bool {
+pub(crate) fn import_binds_name(import_stmt: Node<'_>, source: &[u8], name: &str) -> bool {
     fn walk(node: Node<'_>, source: &[u8], name: &str) -> bool {
         match node.kind() {
             "import_specifier" => {

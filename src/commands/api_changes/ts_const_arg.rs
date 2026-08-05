@@ -51,17 +51,29 @@ fn bare_identifier_argument<'a>(
     arg.utf8_text(source).ok()
 }
 
-/// ファイル内で `name` を束縛している identifier ノードを列挙する。
+/// ファイル内で `name` を束縛している **binding コンテナ** を列挙する。
 ///
-/// 「binding かどうか」は親の field 名 (`name` / `pattern` / `left`) と親の kind
-/// (import 系) で**過剰気味に**判定する。取りこぼす (= binding を見逃す) と shadow を
-/// 見落として fail-open になるため、迷ったら binding 扱いにして候補数を増やし、
-/// 一意性チェックで不成立に倒す。
+/// 走査の単位を「identifier とその親の field 名」ではなく「binding を導入する構文ノード」に
+/// している理由: identifier の親 field だけを見ると bare arrow パラメータ (`X => ...` の
+/// `parameter` field)・catch パラメータ・renamed destructuring (`{ deps: X }` の
+/// `pair_pattern` value)・配列/rest destructuring (`[X]` / `...X`) を取りこぼし、
+/// **shadow を見逃して blocking を解除する fail-open** になる。
+///
+/// パターン内部の再帰 (destructuring / rest / default) と import binding の判定は
+/// `js_ts_shadow` の `pattern_binds_name` / `import_binds_name` をそのまま共有する
+/// (同じロジックを 2 箇所に持つと片方だけ直る形でドリフトするため)。
+///
+/// 同じ binding が複数のコンテナ経由で二重に数えられることはある (`formal_parameters` と
+/// その子 `required_parameter` など) が、過大側 = 一意性チェックで不成立 = blocking 維持
+/// なので安全側に倒れる。本判定が成立してほしいケース (トップレベルの `const NAME = {...}`)
+/// は `variable_declarator` 1 個だけで数えられ、二重計上は起きない。
 fn collect_bindings_named<'tree>(
     root: tree_sitter::Node<'tree>,
     source: &[u8],
     name: &str,
 ) -> Vec<tree_sitter::Node<'tree>> {
+    use crate::commands::api_changes::js_ts_shadow::{import_binds_name, pattern_binds_name};
+
     let mut found = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
@@ -69,24 +81,45 @@ fn collect_bindings_named<'tree>(
         for child in node.named_children(&mut cursor) {
             stack.push(child);
         }
-        if node.kind() != "identifier" && node.kind() != "shorthand_property_identifier_pattern" {
-            continue;
-        }
-        if node.utf8_text(source).ok() != Some(name) {
-            continue;
-        }
-        let Some(parent) = node.parent() else {
-            continue;
+        let binds = match node.kind() {
+            "variable_declarator" => node
+                .child_by_field_name("name")
+                .is_some_and(|n| pattern_binds_name(n, source, name)),
+            // TS の型注釈付きパラメータ。
+            "required_parameter" | "optional_parameter" => node
+                .child_by_field_name("pattern")
+                .is_some_and(|n| pattern_binds_name(n, source, name)),
+            // `catch (X)` / bare arrow `X => ...` はどちらも `parameter` field。
+            "catch_clause" | "arrow_function" => node
+                .child_by_field_name("parameter")
+                .is_some_and(|n| pattern_binds_name(n, source, name)),
+            // JS 形式の formal_parameters 直下の bare pattern
+            // (`function f(X)` / `function f({ deps: X })` / `function f(...X)`)。
+            "formal_parameters" => {
+                let mut c = node.walk();
+                node.named_children(&mut c)
+                    .any(|child| pattern_binds_name(child, source, name))
+            }
+            // `for (const X of xs)` / `for (X of xs)` の loop 変数 (bare pattern)。
+            "for_in_statement" => node
+                .child_by_field_name("left")
+                .is_some_and(|n| pattern_binds_name(n, source, name)),
+            // 値空間に名前を導入する宣言 (enum / namespace は値としても参照できる)。
+            "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "class_declaration"
+            | "class"
+            | "enum_declaration"
+            | "internal_module"
+            | "module" => node
+                .child_by_field_name("name")
+                .is_some_and(|n| n.utf8_text(source).ok() == Some(name)),
+            "import_statement" => import_binds_name(node, source, name),
+            _ => false,
         };
-        let is_import_binding = parent.kind().starts_with("import")
-            || parent.kind() == "namespace_import"
-            || parent.kind() == "namespace_export";
-        let is_field_binding = ["name", "pattern", "left"]
-            .iter()
-            .any(|field| parent.child_by_field_name(field) == Some(node));
-        // destructuring pattern 内の shorthand (`const { X } = y`) は field を持たない。
-        let is_pattern_shorthand = node.kind() == "shorthand_property_identifier_pattern";
-        if is_import_binding || is_field_binding || is_pattern_shorthand {
+        if binds {
             found.push(node);
         }
     }
@@ -142,12 +175,12 @@ pub(crate) fn closed_via_local_const_argument(
     };
     let bindings = collect_bindings_named(root, source, const_name);
     // 同名 binding が複数 = shadow の可能性があり、どの値が渡るか静的に決められない。
-    let [binding] = bindings.as_slice() else {
+    // 唯一の binding が `const` の variable_declarator でなければ (パラメータ / import /
+    // 関数宣言 / let・var) 対象外。
+    let [declarator] = bindings.as_slice() else {
         return false;
     };
-    let Some(declarator) = binding.parent() else {
-        return false;
-    };
+    let declarator = *declarator;
     if declarator.kind() != "variable_declarator" || !declarator_is_const(declarator) {
         return false;
     }
