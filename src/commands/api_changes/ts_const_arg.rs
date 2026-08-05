@@ -120,28 +120,53 @@ fn collect_bindings_named<'tree>(
                 .child_by_field_name("left")
                 .is_some_and(|n| pattern_binds_name(n, source, name)),
             "import_statement" => import_binds_name(node, source, name),
-            // `import X = Legacy.Value;` (TS の import alias)。`name` field を持たず、
-            // ローカル名は**先頭の named child**。右辺 (nested_identifier) まで名前照合すると
-            // 別物を binding と誤認するため先頭 child だけを見る。
-            "import_alias" => node
-                .named_child(0)
-                .is_some_and(|n| n.utf8_text(source).ok() == Some(name)),
+            // `name` field を持たず**先頭 named child がローカル名**になる import 系:
+            // `import X = Legacy.Value;` (import_alias) と
+            // `import X = require("./m");` (import_require_clause)。
+            // 右辺 (nested_identifier / string) まで名前照合すると別物を binding と誤認するため
+            // 先頭 child だけを見る。
+            "import_alias" | "import_require_clause" => {
+                node.named_child(0)
+                    .and_then(|n| leftmost_identifier_text(n, source))
+                    == Some(name)
+            }
             // 名前を導入するその他の構文は **`name` field を持つノード**として構造的に拾う。
             // kind の列挙 (`*_declaration` / `class` / `internal_module` / ...) を維持すると
-            // 文法の増分に追随できず、`abstract_class_declaration` や
+            // 文法の増分に追随できず、`abstract_class_declaration` /
             // `function_signature` (`declare function X()`) のような取りこぼし
-            // = shadow 見逃し = fail-open を繰り返す (実際に 2 度踏んだ)。
+            // = shadow 見逃し = fail-open を繰り返す (実際に 3 度踏んだ)。
             // 型空間だけの宣言 (interface / type alias) や class member まで数える過剰検出に
             // なるが、過剰側は一意性チェックで不成立 = blocking 維持に倒れるだけで安全。
-            _ => node
-                .child_by_field_name("name")
-                .is_some_and(|n| n.utf8_text(source).ok() == Some(name)),
+            //
+            // 照合は `name` field 全体のテキストではなく**左端 identifier** で行う。
+            // `namespace X.Legacy {}` の name は `nested_identifier` で、完全一致だと
+            // ローカルに導入される `X` を取りこぼす。
+            _ => {
+                node.child_by_field_name("name")
+                    .and_then(|n| leftmost_identifier_text(n, source))
+                    == Some(name)
+            }
         };
         if binds {
             found.push(node);
         }
     }
     found
+}
+
+/// 名前ノードの**左端 identifier** のテキストを返す。
+///
+/// `namespace X.Legacy {}` の `name` は `nested_identifier` で、ローカルに導入されるのは
+/// 左端の `X` だけ。完全一致で照合すると取りこぼす (= shadow 見逃し = fail-open)。
+/// identifier / type_identifier などの葉はそのまま返す。
+fn leftmost_identifier_text<'a>(node: tree_sitter::Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    let mut cur = node;
+    loop {
+        match cur.named_child(0) {
+            Some(child) => cur = child,
+            None => return cur.utf8_text(source).ok(),
+        }
+    }
 }
 
 /// `variable_declarator` が `const` 宣言かを判定する。`let` / `var` は再代入されうるため
