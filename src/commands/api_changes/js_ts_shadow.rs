@@ -272,6 +272,13 @@ pub(crate) fn pattern_binds_name(pattern: Node<'_>, source: &[u8], name: &str) -
         "pair_pattern" => pattern
             .child_by_field_name("value")
             .is_some_and(|v| pattern_binds_name(v, source, name)),
+        // default 値 (`{ a = X }` / `(a = X)` の右辺) は binding ではなく参照なので left のみ辿る。
+        // 右辺まで辿ると `function f(other = SHARED_DEPS)` の SHARED_DEPS を parameter binding と
+        // 誤認する (shadow 判定では「除外しない」方向の保守側だが、binding 一意性を見る
+        // `ts_const_arg` では降格できるケースを取り逃す false positive になる)。
+        "assignment_pattern" | "object_assignment_pattern" => pattern
+            .child_by_field_name("left")
+            .is_some_and(|l| pattern_binds_name(l, source, name)),
         _ => {
             let mut cursor = pattern.walk();
             pattern

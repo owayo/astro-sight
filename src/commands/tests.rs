@@ -3264,7 +3264,7 @@ fn detect_api_changes_ts_shadowing_binding_forms_stay_modified() {
     // (ケース名, 呼び出し側ファイルの本体。SHARED_DEPS を shadow する binding を含む)
     // 実引数はいずれも**裸の identifier** にする (`X as never` のような cast を挟むと
     // 「bare identifier ではない」という別の理由で不成立になり、shadow ガードを検証できない)。
-    let cases: [(&str, &str); 5] = [
+    let cases: [(&str, &str); 7] = [
         (
             "bare arrow parameter",
             "export const run = (SHARED_DEPS) => buildSql(SHARED_DEPS);\n",
@@ -3284,6 +3284,17 @@ fn detect_api_changes_ts_shadowing_binding_forms_stay_modified() {
         (
             "rest parameter",
             "export function run(...SHARED_DEPS): string {\n\treturn buildSql(SHARED_DEPS);\n}\n",
+        ),
+        // `using X = ...` は tree-sitter-typescript では匿名 `using` トークン付きの
+        // assignment_expression になり専用ノードが無い (実ノードを to_sexp で確認済み)。
+        (
+            "using declaration",
+            "export function run(): string {\n\tusing SHARED_DEPS = acquire();\n\treturn buildSql(SHARED_DEPS);\n}\n",
+        ),
+        // `abstract class` は `abstract_class_declaration` (name は type_identifier)。
+        (
+            "abstract class",
+            "export function run(): string {\n\tabstract class SHARED_DEPS {}\n\treturn buildSql(SHARED_DEPS);\n}\n",
         ),
     ];
     for (label, body) in cases {
@@ -3326,6 +3337,34 @@ fn detect_api_changes_ts_shadowing_binding_forms_stay_modified() {
             .any(|m| m.name.ends_with("buildSql")),
         "対照ケース (shadow なし) は降格するはず。降格しないなら上の shadow テストが\
          shadow ガードを検証できていない。mod={:?} mod_closed={:?}",
+        api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+        api.modified_closed_in_diff
+            .iter()
+            .map(|m| &m.name)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// パラメータの **default 値**に共有 const が現れても、それは binding ではなく参照なので
+/// shadow とみなさず降格する (`pattern_binds_name` が `assignment_pattern` の右辺まで辿ると
+/// `function run(other = SHARED_DEPS)` を parameter binding と誤認し、降格できるはずのケースを
+/// blocking に残す false positive になる)。
+#[test]
+fn detect_api_changes_ts_const_arg_in_default_value_is_not_a_shadow() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let body = "export function run(other = SHARED_DEPS): string {\n\treturn buildSql(SHARED_DEPS) + String(other);\n}\n";
+    let before = format!(
+        "import {{ buildSql }} from \"./build\";\n\nconst SHARED_DEPS = {{\n\tevents: \"e\",\n\tusers: \"u\",\n}};\n\n{body}"
+    );
+    let after = format!(
+        "import {{ buildSql }} from \"./build\";\n\nconst SHARED_DEPS = {{\n\tevents: \"e\",\n\tusers: \"u\",\n\tgroups: \"g\",\n}};\n\n{body}"
+    );
+    let api = ts_shared_const_arg_api_changes(dir.path(), &before, &after);
+    assert!(
+        api.modified_closed_in_diff
+            .iter()
+            .any(|m| m.name.ends_with("buildSql")),
+        "default 値の参照は binding ではないので shadow 扱いせず降格すべき。mod={:?} mod_closed={:?}",
         api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
         api.modified_closed_in_diff
             .iter()

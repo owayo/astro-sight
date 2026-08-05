@@ -95,28 +95,49 @@ fn collect_bindings_named<'tree>(
                 .is_some_and(|n| pattern_binds_name(n, source, name)),
             // JS 形式の formal_parameters 直下の bare pattern
             // (`function f(X)` / `function f({ deps: X })` / `function f(...X)`)。
+            // TS の wrapper (`required_parameter` / `optional_parameter`) は上の arm が
+            // pattern field だけを見るので、ここで重ねて全体を走査しない — 走査すると
+            // default 値 (`function f(other = X)` の `value` field) まで binding と誤認して
+            // 降格できるはずのケースを blocking に残す false positive になる。
             "formal_parameters" => {
                 let mut c = node.walk();
                 node.named_children(&mut c)
+                    .filter(|child| {
+                        !matches!(child.kind(), "required_parameter" | "optional_parameter")
+                    })
                     .any(|child| pattern_binds_name(child, source, name))
             }
             // `for (const X of xs)` / `for (X of xs)` の loop 変数 (bare pattern)。
             "for_in_statement" => node
                 .child_by_field_name("left")
                 .is_some_and(|n| pattern_binds_name(n, source, name)),
-            // 値空間に名前を導入する宣言 (enum / namespace は値としても参照できる)。
-            "function_declaration"
-            | "generator_function_declaration"
-            | "function_expression"
-            | "generator_function"
-            | "class_declaration"
-            | "class"
-            | "enum_declaration"
-            | "internal_module"
-            | "module" => node
-                .child_by_field_name("name")
-                .is_some_and(|n| n.utf8_text(source).ok() == Some(name)),
+            // `using X = acquire()` / `await using X = ...` は tree-sitter-typescript では
+            // 匿名 `using` トークン付きの assignment_expression になり、専用ノードを持たない。
+            // 素の再代入 (`X = v`) も左辺の値が静的に決まらなくなる点は同じなので、
+            // どちらも binding 扱いにして不成立へ倒す (const への再代入は TS では起こらないため
+            // 本判定を成立させたいケースには当たらない)。
+            "assignment_expression" | "augmented_assignment_expression" => node
+                .child_by_field_name("left")
+                .is_some_and(|n| pattern_binds_name(n, source, name)),
             "import_statement" => import_binds_name(node, source, name),
+            // 値空間に名前を導入する宣言。`abstract class` (`abstract_class_declaration`) や
+            // `declare` 付きの各種宣言のように kind が増えても取りこぼさないよう、
+            // 「`_declaration` で終わる kind の `name` field」を包括的に拾う
+            // (取りこぼし = shadow 見逃し = fail-open。過剰検出は不成立に倒れるだけ)。
+            // 接尾辞に載らない値 binding 導入ノード (class 式 / 名前付き関数式 / namespace) は個別指定。
+            kind if kind.ends_with("_declaration")
+                || matches!(
+                    kind,
+                    "class"
+                        | "function_expression"
+                        | "generator_function"
+                        | "internal_module"
+                        | "module"
+                ) =>
+            {
+                node.child_by_field_name("name")
+                    .is_some_and(|n| n.utf8_text(source).ok() == Some(name))
+            }
             _ => false,
         };
         if binds {
