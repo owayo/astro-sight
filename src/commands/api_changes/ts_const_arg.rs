@@ -120,25 +120,22 @@ fn collect_bindings_named<'tree>(
                 .child_by_field_name("left")
                 .is_some_and(|n| pattern_binds_name(n, source, name)),
             "import_statement" => import_binds_name(node, source, name),
-            // 値空間に名前を導入する宣言。`abstract class` (`abstract_class_declaration`) や
-            // `declare` 付きの各種宣言のように kind が増えても取りこぼさないよう、
-            // 「`_declaration` で終わる kind の `name` field」を包括的に拾う
-            // (取りこぼし = shadow 見逃し = fail-open。過剰検出は不成立に倒れるだけ)。
-            // 接尾辞に載らない値 binding 導入ノード (class 式 / 名前付き関数式 / namespace) は個別指定。
-            kind if kind.ends_with("_declaration")
-                || matches!(
-                    kind,
-                    "class"
-                        | "function_expression"
-                        | "generator_function"
-                        | "internal_module"
-                        | "module"
-                ) =>
-            {
-                node.child_by_field_name("name")
-                    .is_some_and(|n| n.utf8_text(source).ok() == Some(name))
-            }
-            _ => false,
+            // `import X = Legacy.Value;` (TS の import alias)。`name` field を持たず、
+            // ローカル名は**先頭の named child**。右辺 (nested_identifier) まで名前照合すると
+            // 別物を binding と誤認するため先頭 child だけを見る。
+            "import_alias" => node
+                .named_child(0)
+                .is_some_and(|n| n.utf8_text(source).ok() == Some(name)),
+            // 名前を導入するその他の構文は **`name` field を持つノード**として構造的に拾う。
+            // kind の列挙 (`*_declaration` / `class` / `internal_module` / ...) を維持すると
+            // 文法の増分に追随できず、`abstract_class_declaration` や
+            // `function_signature` (`declare function X()`) のような取りこぼし
+            // = shadow 見逃し = fail-open を繰り返す (実際に 2 度踏んだ)。
+            // 型空間だけの宣言 (interface / type alias) や class member まで数える過剰検出に
+            // なるが、過剰側は一意性チェックで不成立 = blocking 維持に倒れるだけで安全。
+            _ => node
+                .child_by_field_name("name")
+                .is_some_and(|n| n.utf8_text(source).ok() == Some(name)),
         };
         if binds {
             found.push(node);

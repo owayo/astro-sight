@@ -3264,7 +3264,7 @@ fn detect_api_changes_ts_shadowing_binding_forms_stay_modified() {
     // (ケース名, 呼び出し側ファイルの本体。SHARED_DEPS を shadow する binding を含む)
     // 実引数はいずれも**裸の identifier** にする (`X as never` のような cast を挟むと
     // 「bare identifier ではない」という別の理由で不成立になり、shadow ガードを検証できない)。
-    let cases: [(&str, &str); 7] = [
+    let cases: [(&str, &str); 9] = [
         (
             "bare arrow parameter",
             "export const run = (SHARED_DEPS) => buildSql(SHARED_DEPS);\n",
@@ -3295,6 +3295,17 @@ fn detect_api_changes_ts_shadowing_binding_forms_stay_modified() {
         (
             "abstract class",
             "export function run(): string {\n\tabstract class SHARED_DEPS {}\n\treturn buildSql(SHARED_DEPS);\n}\n",
+        ),
+        // TS の import alias は `import_alias` で `name` field を持たず先頭 named child が
+        // ローカル名。ブロック内の無関係な const だけを一意 binding と誤認しないこと。
+        (
+            "import alias",
+            "namespace Legacy {\n\texport const Value = { events: \"e\", users: \"u\" };\n}\nimport SHARED_DEPS = Legacy.Value;\nexport function run(): string {\n\treturn buildSql(SHARED_DEPS);\n}\n",
+        ),
+        // `declare function X()` は `function_signature` (kind が `_declaration` で終わらない)。
+        (
+            "declare function signature",
+            "declare function SHARED_DEPS(a: number): void;\nexport function run(): string {\n\treturn buildSql(SHARED_DEPS);\n}\n",
         ),
     ];
     for (label, body) in cases {
