@@ -241,7 +241,7 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
     // 大規模 diff (commits 数百〜千超) でもピーク RSS が線形以下に収まる。
     let sha_entries: Vec<(String, Vec<usize>)> = sha_to_sources.into_iter().collect();
     // SHA ごとに `git rev-parse` を起動しないよう、ワークスペース prefix は 1 度だけ解決する。
-    let workspace_prefix = workspace_prefix_for(dir);
+    let workspace_prefix = workspace_prefix_for(dir)?;
 
     let stats: ShardStats = sha_entries
         .par_iter()
@@ -939,19 +939,26 @@ fn collect_files_in_commit(dir: &str, sha: &str, workspace_prefix: &str) -> Resu
 }
 
 /// `dir` のリポジトリルートからの相対 prefix (`"backend/"` 形式、ルートなら空) を返す。
-/// 解決できない場合は空文字 = 従来どおりリポジトリルート相対として扱う (fail-open)。
-fn workspace_prefix_for(dir: &str) -> String {
-    let Ok(output) = Command::new("git")
+///
+/// 解決失敗は **fail-closed** (エラー伝播)。空文字にフォールバックすると、サブディレクトリ
+/// 実行なのに全ルート相対パスが `workspace_files` に入り、配下外ファイルが候補に漏れる /
+/// `source_set` の起点除外と `exclude_matcher` が別基準で評価される (起点自身が `app/a.rs`
+/// として候補化しうる) ため、統一したはずのパス基準がここだけ破れる。
+/// 「成功かつ空出力」= リポジトリルートのときだけ空 prefix として扱う。
+fn workspace_prefix_for(dir: &str) -> Result<String> {
+    let output = Command::new("git")
         .args(["rev-parse", "--show-prefix"])
         .current_dir(dir)
         .output()
-    else {
-        return String::new();
-    };
+        .map_err(|e| AstroError::new(ErrorCode::IoError, format!("Failed to run git: {e}")))?;
     if !output.status.success() {
-        return String::new();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(AstroError::new(
+            ErrorCode::IoError,
+            format!("git rev-parse --show-prefix failed: {stderr}"),
+        ));
     }
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// 除外 glob マッチャ。
@@ -1506,6 +1513,14 @@ mod tests {
                 .iter()
                 .any(|e| e.file_b.starts_with("outside/") || e.file_b.starts_with("app/")),
             "--dir 配下外は候補にせず、配下は prefix を剥がすべき: {:?}",
+            result.entries
+        );
+        // 起点自身が候補に出ない = source_set (dir 相対) と候補パスの基準が一致している。
+        // prefix を剥がし損ねると起点は `app/a.rs` になり source_set の `a.rs` と一致せず、
+        // 自分自身を共変更相手として返してしまう。
+        assert!(
+            !result.entries.iter().any(|e| e.file_b == "a.rs"),
+            "起点自身は共変更相手にならないべき (source_set と候補の基準一致): {:?}",
             result.entries
         );
     }
