@@ -240,15 +240,23 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
     // 直接畳み込む。`commit_files: Vec<Vec<String>>` を全保持しないため、
     // 大規模 diff (commits 数百〜千超) でもピーク RSS が線形以下に収まる。
     let sha_entries: Vec<(String, Vec<usize>)> = sha_to_sources.into_iter().collect();
+    // SHA ごとに `git rev-parse` を起動しないよう、ワークスペース prefix は 1 度だけ解決する。
+    let workspace_prefix = workspace_prefix_for(dir);
 
     let stats: ShardStats = sha_entries
         .par_iter()
         .fold(
             || ShardStats::new(n_sources),
             |mut acc, (sha, sources)| {
-                let files = collect_files_in_commit(dir, sha).unwrap_or_default();
+                let commit =
+                    collect_files_in_commit(dir, sha, &workspace_prefix).unwrap_or(CommitFiles {
+                        total_files: 0,
+                        workspace_files: Vec::new(),
+                    });
+                let files = commit.workspace_files;
+                // 規模判定はコミット全体のファイル数で行う (ワークスペース内の件数ではない)。
                 let weight = commit_size_weight(
-                    files.len(),
+                    commit.total_files,
                     opts.commit_size_pivot,
                     opts.max_files_per_commit,
                 );
@@ -869,19 +877,29 @@ fn list_merge_commits(dir: &str, shas: &HashSet<String>) -> Result<HashSet<Strin
 /// その SHA が拾われた場合に共変更が検出できない。`max_files_per_commit` で巨大な
 /// 初期 import は除外されるので、`--root` を有効にしておく方が常に正しい。
 ///
-/// `--relative` で出力を `dir` 相対に揃える。起点ファイル (`source_files`) は
-/// `is_contained_relative` で `dir` 相対に閉じているため、共変更相手だけリポジトリルート
-/// 相対で返ると同一エントリ内で基準が混ざる (`--dir` = リポジトリルートでは無変化)。
-/// `dir` 配下外のファイルは共変更相手から落ちるが、これは `--dir` = ワークスペースという
-/// 規約どおりの挙動 (そもそも配下外は参照解決・ファイル読み込みができない)。
-fn collect_files_in_commit(dir: &str, sha: &str) -> Result<Vec<String>> {
+/// **`--relative` は使わない。** `--relative` は `dir` 配下外を git 側で落とすため、
+/// `total_files` (コミット規模) まで「ワークスペース内の変更ファイル数」に変わってしまい、
+/// `max_files_per_commit` によるノイズ除外と `commit_size_weight` の意味が壊れる
+/// (リポジトリ全体 500 ファイルの一括更新が、ワークスペース内 2 ファイルの集中コミットとして
+/// 高スコアを作りうる)。リポジトリルート相対で全件受け取り、規模はその件数で評価したまま、
+/// 共変更相手として返すパスだけ `workspace_prefix` を剥がして `dir` 相対に揃える
+/// (起点 `source_files` は `is_contained_relative` で `dir` 相対に閉じているため、
+/// 相手側だけルート相対だと同一エントリ内で基準が混ざる)。
+/// `--dir` = リポジトリルートでは prefix が空で従来と完全に同一。
+struct CommitFiles {
+    /// コミット全体の変更ファイル数 (リポジトリルート基準、規模評価用)。
+    total_files: usize,
+    /// `dir` 配下の変更ファイル (`dir` 相対、共変更相手の候補)。
+    workspace_files: Vec<String>,
+}
+
+fn collect_files_in_commit(dir: &str, sha: &str, workspace_prefix: &str) -> Result<CommitFiles> {
     let output = Command::new("git")
         .args([
             // 非 ASCII ファイル名のクォートを無効化 (パス照合を生 UTF-8 名で行うため)
             "-c",
             "core.quotepath=off",
             "diff-tree",
-            "--relative",
             "--root",
             "--no-commit-id",
             "--name-only",
@@ -892,14 +910,48 @@ fn collect_files_in_commit(dir: &str, sha: &str) -> Result<Vec<String>> {
         .output()
         .map_err(|e| AstroError::new(ErrorCode::IoError, format!("Failed to run git: {e}")))?;
     if !output.status.success() {
-        return Ok(Vec::new());
+        return Ok(CommitFiles {
+            total_files: 0,
+            workspace_files: Vec::new(),
+        });
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout
+    let all: Vec<&str> = stdout
         .lines()
-        .map(|l| l.trim().to_string())
+        .map(str::trim)
         .filter(|l| !l.is_empty())
-        .collect())
+        .collect();
+    let workspace_files = all
+        .iter()
+        .filter_map(|p| {
+            if workspace_prefix.is_empty() {
+                Some((*p).to_string())
+            } else {
+                p.strip_prefix(workspace_prefix).map(str::to_string)
+            }
+        })
+        .filter(|p| !p.is_empty())
+        .collect();
+    Ok(CommitFiles {
+        total_files: all.len(),
+        workspace_files,
+    })
+}
+
+/// `dir` のリポジトリルートからの相対 prefix (`"backend/"` 形式、ルートなら空) を返す。
+/// 解決できない場合は空文字 = 従来どおりリポジトリルート相対として扱う (fail-open)。
+fn workspace_prefix_for(dir: &str) -> String {
+    let Ok(output) = Command::new("git")
+        .args(["rev-parse", "--show-prefix"])
+        .current_dir(dir)
+        .output()
+    else {
+        return String::new();
+    };
+    if !output.status.success() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 /// 除外 glob マッチャ。
@@ -1377,6 +1429,84 @@ mod tests {
         assert!(
             (entry.confidence - 1.0).abs() < 1e-9,
             "集計対象コミットでは常に共変更しているので confidence=1.0: {entry:?}"
+        );
+    }
+
+    /// `--dir` がサブディレクトリのとき、共変更相手のパスは `dir` 相対に揃うが、
+    /// **コミット規模の判定はリポジトリ全体のファイル数**で行う。
+    ///
+    /// `git diff-tree --relative` で配下外を git 側に落とさせると、「リポジトリ全体では
+    /// 巨大だがワークスペース内では数ファイル」の一括更新コミットが `max_files_per_commit`
+    /// をすり抜け、集中コミットとして高い共変更スコアを作ってしまう。
+    #[test]
+    fn cochange_from_subdirectory_uses_repo_wide_commit_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+
+        // app/ 配下 (ワークスペース) と外側の両方を持つ構成。
+        // 通常コミット 2 回: app/a.rs + app/b.rs だけを触る。
+        for i in 0..2 {
+            commit_files(
+                repo,
+                &[
+                    (
+                        "app/a.rs",
+                        &format!("fn a() {{ {i} }}\nfn a2() {{ {i} }}\n"),
+                    ),
+                    ("app/b.rs", &format!("fn b() {{ {i} }}\n")),
+                ],
+                &format!("pair {i}"),
+            );
+        }
+        // 一括更新コミット: ワークスペース内は app/a.rs + app/noise.rs の 2 ファイルだけだが、
+        // リポジトリ全体では 14 ファイル。--relative で配下外を落とすと 2 ファイルの
+        // 集中コミットに見えてしまう。
+        let mut bulk: Vec<(String, String)> = vec![
+            (
+                "app/a.rs".to_string(),
+                "fn a() { 1 }\nfn a2() { 9 }\n".to_string(),
+            ),
+            ("app/noise.rs".to_string(), "// noise\n".to_string()),
+        ];
+        for i in 0..12 {
+            bulk.push((format!("outside/bulk{i}.rs"), format!("// {i}\n")));
+        }
+        let bulk_refs: Vec<(&str, &str)> =
+            bulk.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
+        commit_files(repo, &bulk_refs, "repo-wide bulk");
+        commit_files(
+            repo,
+            &[("app/a.rs", "fn a() { x }\nfn a2() { x }\n")],
+            "edit a",
+        );
+
+        let app_dir = repo.join("app");
+        let opts = opts_with(|o| {
+            o.source_files = vec!["a.rs".to_string()];
+            o.base = Some("HEAD~1".to_string());
+            // ワークスペース内 2 ファイル < 5 < リポジトリ全体 14 ファイル。
+            o.max_files_per_commit = 5;
+        });
+        let result = analyze_cochange(app_dir.to_str().unwrap(), &opts).unwrap();
+
+        assert!(
+            result.entries.iter().any(|e| e.file_b == "b.rs"),
+            "共変更相手は --dir 相対で返るべき (app/b.rs ではなく b.rs): {:?}",
+            result.entries
+        );
+        assert!(
+            !result.entries.iter().any(|e| e.file_b == "noise.rs"),
+            "リポジトリ全体で 14 ファイルの一括更新は規模超過として除外されるべき: {:?}",
+            result.entries
+        );
+        assert!(
+            !result
+                .entries
+                .iter()
+                .any(|e| e.file_b.starts_with("outside/") || e.file_b.starts_with("app/")),
+            "--dir 配下外は候補にせず、配下は prefix を剥がすべき: {:?}",
+            result.entries
         );
     }
 
