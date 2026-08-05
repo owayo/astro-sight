@@ -522,7 +522,18 @@ pub(crate) fn changed_new_lines_for_file(
     // (codex 指摘)。old_path も pathspec に含めて rename-aware な diff にする。
     // core.quotepath=off: 非 ASCII 名の `+++ "b/..."` クォートで extract_changed_new_lines の
     // パス照合が外れ、追随済み参照まで blocking 維持になるのを防ぐ。
-    let mut args: Vec<&str> = vec!["-c", "core.quotepath=off", "diff", base, "-M", "--"];
+    // --relative: `old_path` / `new_path` は `dir` 相対 (pathspec も cwd 基準) なので、
+    // 出力ヘッダも `dir` 相対に揃えないと `extract_changed_new_lines` の new_path 照合が
+    // サブディレクトリ実行で外れる。`--dir` = リポジトリルートでは無変化。
+    let mut args: Vec<&str> = vec![
+        "-c",
+        "core.quotepath=off",
+        "diff",
+        "--relative",
+        base,
+        "-M",
+        "--",
+    ];
     if old_path != "/dev/null" && old_path != new_path {
         if validate_git_revision(old_path, "diff file path").is_err() {
             return HashSet::new();

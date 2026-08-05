@@ -868,6 +868,12 @@ fn list_merge_commits(dir: &str, shas: &HashSet<String>) -> Result<HashSet<Strin
 /// `--root` を付けないとルート (初期) コミットは parent がないため空が返り、blame で
 /// その SHA が拾われた場合に共変更が検出できない。`max_files_per_commit` で巨大な
 /// 初期 import は除外されるので、`--root` を有効にしておく方が常に正しい。
+///
+/// `--relative` で出力を `dir` 相対に揃える。起点ファイル (`source_files`) は
+/// `is_contained_relative` で `dir` 相対に閉じているため、共変更相手だけリポジトリルート
+/// 相対で返ると同一エントリ内で基準が混ざる (`--dir` = リポジトリルートでは無変化)。
+/// `dir` 配下外のファイルは共変更相手から落ちるが、これは `--dir` = ワークスペースという
+/// 規約どおりの挙動 (そもそも配下外は参照解決・ファイル読み込みができない)。
 fn collect_files_in_commit(dir: &str, sha: &str) -> Result<Vec<String>> {
     let output = Command::new("git")
         .args([
@@ -875,6 +881,7 @@ fn collect_files_in_commit(dir: &str, sha: &str) -> Result<Vec<String>> {
             "-c",
             "core.quotepath=off",
             "diff-tree",
+            "--relative",
             "--root",
             "--no-commit-id",
             "--name-only",

@@ -10698,6 +10698,114 @@ fn api_rm_suppressed_for_ts_named_reexport() {
     );
 }
 
+/// ローカル Issue 2026-08-05-moved-name-only-match-and-path-mismatch (パターン B) の回帰テスト:
+/// `--dir` がリポジトリルートのサブディレクトリ (2 プロジェクト構成の backend 側など) のとき、
+/// `api.moved` の `from` (削除側 = git diff 由来) と `to` (追加側 = 未追跡合成由来) が
+/// 別々の基準ディレクトリになり、`to` がリポジトリルートから見て実在しないパスになっていた。
+///
+/// 不変条件: 同一レコードの `from` / `to` は同じ基準 (`--dir` 相対) で、いずれも `--dir` 配下に
+/// 実在すること (`to` は移動先なので working tree に、`from` は base 側に存在する)。
+#[test]
+fn moved_paths_share_workspace_basis_from_subdirectory() {
+    use std::process::Command;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    // ルート直下にも src/ を持つ 2 プロジェクト構成 (frontend + backend/)。
+    let app = root.join("backend");
+    std::fs::create_dir_all(app.join("src/old_mod")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(root.join("src/frontend.ts"), "export const ui = 1;\n").unwrap();
+    std::fs::write(
+        app.join("Cargo.toml"),
+        "[package]\nname = \"backend\"\n\n[lib]\nname = \"backend\"\npath = \"src/lib.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(app.join("src/lib.rs"), "pub mod old_mod;\n").unwrap();
+    std::fs::write(app.join("src/old_mod/mod.rs"), "pub mod cache;\n").unwrap();
+    std::fs::write(
+        app.join("src/old_mod/cache.rs"),
+        "pub const DEFAULT_TTL_SECS: u64 = 30;\n\npub fn ttl_for(n: u64) -> u64 {\n    n * DEFAULT_TTL_SECS\n}\n",
+    )
+    .unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+
+    // 旧モジュールを削除し、同名・同シグネチャのシンボルを持つ新モジュールを未追跡で追加する。
+    // 新側にだけ `extra_helper` を足して exported symbol 集合をずらすのは、集合が完全一致すると
+    // `pair_untracked_renames` が high-confidence rename として先に相殺してしまい
+    // `reconcile_with_moves` (= 本テストの対象) まで届かないため。
+    std::fs::remove_dir_all(app.join("src/old_mod")).unwrap();
+    std::fs::create_dir_all(app.join("src/new_mod")).unwrap();
+    std::fs::write(app.join("src/new_mod/mod.rs"), "pub mod store;\n").unwrap();
+    std::fs::write(
+        app.join("src/new_mod/store.rs"),
+        "pub const DEFAULT_TTL_SECS: u64 = 30;\n\npub fn ttl_for(n: u64) -> u64 {\n    n * DEFAULT_TTL_SECS\n}\n\npub fn extra_helper() -> bool {\n    true\n}\n",
+    )
+    .unwrap();
+    std::fs::write(app.join("src/lib.rs"), "pub mod new_mod;\n").unwrap();
+
+    let app_str = app.to_str().expect("utf-8");
+    let output = cargo_bin()
+        .args(["review", "--dir", app_str, "--git"])
+        .output()
+        .expect("run review");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    let moved = json["api_changes"]["moved"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !moved.is_empty(),
+        "同名・同シグネチャのモジュール移動は moved として検出されるべき: {json}"
+    );
+    for m in &moved {
+        let from = m["from"].as_str().expect("from");
+        let to = m["to"].as_str().expect("to");
+        // 同一基準であること = どちらも --dir 配下の相対パスとして解決できること。
+        assert!(
+            !from.starts_with("backend/") && !to.starts_with("backend/"),
+            "from/to は --dir 相対であるべき (リポジトリルート相対が混ざっている): from={from} to={to}"
+        );
+        assert!(
+            app.join(to).exists(),
+            "to は --dir 基準で実在するパスであるべき: to={to}"
+        );
+        assert!(
+            from == "src/old_mod/cache.rs" && to == "src/new_mod/store.rs",
+            "from/to は移動元・移動先を指すべき: from={from} to={to}"
+        );
+    }
+    let moved_names: Vec<&str> = moved.iter().filter_map(|m| m["name"].as_str()).collect();
+    assert!(
+        moved_names.contains(&"DEFAULT_TTL_SECS") && moved_names.contains(&"ttl_for"),
+        "同名・同シグネチャのシンボルは moved に集約されるべき: {moved_names:?}"
+    );
+    // ワークスペース外 (リポジトリルート直下の frontend) は解析対象に含めない。
+    assert!(
+        !output.stdout.windows(8).any(|w| w == b"frontend"),
+        "--dir 配下外のファイルは出力に現れないべき: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
 /// ローカル Issue 2026-06-30-teamspirit-message-map-api-triage の回帰テスト:
 /// ローカル型定義を別ファイルへ移動し、元ファイルには from 句なしの
 /// `import type { X } ...; export type { X };` を残すリファクタでも、利用者から見た

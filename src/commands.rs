@@ -359,6 +359,8 @@ pub(crate) use git_input::{DiffSourceResolution, resolve_diff_source};
 // GitDiffInput / resolve_git_diff は Task 4 で resolve_diff_source に内包され、
 // 非テストコードからの直接参照は無くなった。tests.rs のみが `super::*` 経由で使う。
 #[cfg(test)]
+pub(crate) use git_input::git_show_blob;
+#[cfg(test)]
 pub(crate) use git_input::{
     GitDiffInput, is_git_work_tree, resolve_git_diff, validate_git_revision,
 };

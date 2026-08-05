@@ -2239,6 +2239,134 @@ fn run_git_diff_unstaged_includes_untracked_source_excludes_binary_and_ignored()
     );
 }
 
+/// テストヘルパー: リポジトリルート直下と `app/` サブディレクトリの 2 プロジェクト構成を作る。
+/// `app/` を `--dir` に渡すサブディレクトリ実行のパス基準テスト用。
+fn init_subproject_repo_for_test(repo: &std::path::Path) {
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            // frontend 相当 (リポジトリルート直下の src/)
+            ("src/root_side.rs", "pub fn root_side() {}\n"),
+            // backend 相当 (app/src/)
+            ("app/src/lib.rs", "pub mod kept;\n"),
+            ("app/src/kept.rs", "pub fn kept() -> i32 {\n    1\n}\n"),
+        ],
+        "initial",
+    );
+}
+
+/// `--dir` がリポジトリルートのサブディレクトリのとき、tracked diff と未追跡合成の
+/// パス基準が一致することを保証する。
+///
+/// `git diff` は既定でリポジトリルート相対、`git ls-files --others` は cwd 相対を返すため、
+/// `--relative` を付けないと同じ diff の中で 2 つの基準が混ざる。astro-sight の内部規約は
+/// 一貫して `dir` 相対 (`Path::new(dir).join(..)` でファイルを読む) なので diff 側を揃える。
+/// (Issue 2026-08-05-moved-name-only-match-and-path-mismatch のパターン B)
+#[test]
+fn run_git_diff_from_subdirectory_uses_workspace_relative_paths() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_subproject_repo_for_test(repo);
+
+    // tracked 変更 (app 配下) + 未追跡追加 (app 配下) + app 外の tracked 変更。
+    fs::write(
+        repo.join("app/src/kept.rs"),
+        "pub fn kept() -> i64 {\n    1\n}\n",
+    )
+    .expect("modify tracked");
+    fs::write(repo.join("app/src/added.rs"), "pub fn added() {}\n").expect("write untracked");
+    fs::write(
+        repo.join("src/root_side.rs"),
+        "pub fn root_side() -> u8 {\n    0\n}\n",
+    )
+    .expect("modify outside workspace");
+
+    let app_dir = repo.join("app");
+    let diff = crate::commands::run_git_diff(app_dir.to_str().expect("utf-8"), "HEAD", false)
+        .expect("diff");
+
+    assert!(
+        diff.contains("+++ b/src/kept.rs"),
+        "tracked diff のパスは --dir 相対であるべき (app/ prefix が付かない): {diff}"
+    );
+    assert!(
+        diff.contains("+++ b/src/added.rs"),
+        "未追跡合成のパスも --dir 相対であるべき: {diff}"
+    );
+    assert!(
+        !diff.contains("app/src/"),
+        "リポジトリルート相対のパスが混ざってはいけない: {diff}"
+    );
+    assert!(
+        !diff.contains("root_side"),
+        "--dir 配下外の変更はワークスペース外なので含めない: {diff}"
+    );
+}
+
+/// `--dir` = リポジトリルートでは `--relative` は no-op で、従来どおりの出力になる。
+/// (サブディレクトリ対応が既存の主運用を変えていないことの固定)
+#[test]
+fn run_git_diff_at_repo_root_keeps_repository_relative_paths() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_subproject_repo_for_test(repo);
+
+    fs::write(
+        repo.join("app/src/kept.rs"),
+        "pub fn kept() -> i64 {\n    1\n}\n",
+    )
+    .expect("modify tracked");
+    fs::write(repo.join("app/src/added.rs"), "pub fn added() {}\n").expect("write untracked");
+
+    let diff =
+        crate::commands::run_git_diff(repo.to_str().expect("utf-8"), "HEAD", false).expect("diff");
+
+    assert!(
+        diff.contains("+++ b/app/src/kept.rs"),
+        "リポジトリルート実行では従来どおりルート相対: {diff}"
+    );
+    assert!(
+        diff.contains("+++ b/app/src/added.rs"),
+        "未追跡合成も従来どおりルート相対: {diff}"
+    );
+}
+
+/// `git_show_blob` は `dir` 相対パスを受け取る規約なので、サブディレクトリ実行でも
+/// そのワークスペース側の blob を引けること。`git show <rev>:<path>` は既定でリポジトリ
+/// ルート相対に解決するため、`<rev>:./<path>` 形式で cwd 基準に固定している。
+#[test]
+fn git_show_blob_resolves_paths_relative_to_workspace_dir() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_subproject_repo_for_test(repo);
+    // 同名パスをルート側にも置き、基準を取り違えたら別ファイルを読むようにする。
+    git_commit_files(
+        repo,
+        &[("src/kept.rs", "pub fn root_kept() {}\n")],
+        "add root sibling",
+    );
+
+    let app_dir = repo.join("app");
+    let blob =
+        crate::commands::git_show_blob(app_dir.to_str().expect("utf-8"), "HEAD", "src/kept.rs")
+            .expect("blob should be readable from subdirectory workspace");
+    let text = String::from_utf8(blob).expect("utf-8");
+    assert!(
+        text.contains("pub fn kept()"),
+        "--dir 配下の blob を読むべき (ルート側の同名ファイルではない): {text}"
+    );
+
+    let root_blob =
+        crate::commands::git_show_blob(repo.to_str().expect("utf-8"), "HEAD", "src/kept.rs")
+            .expect("blob should be readable from repo root");
+    let root_text = String::from_utf8(root_blob).expect("utf-8");
+    assert!(
+        root_text.contains("pub fn root_kept()"),
+        "リポジトリルート実行では従来どおりルート相対で解決すべき: {root_text}"
+    );
+}
+
 /// staged モード (`--git --staged`) では未追跡を合成しない (index にある変更のみを尊重)。
 #[test]
 fn run_git_diff_staged_excludes_untracked_source() {

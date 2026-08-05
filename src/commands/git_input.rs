@@ -70,8 +70,20 @@ pub fn resolve_blame_source_files(
         // コミット間の差分しか見ないため、**未コミットの作業ツリー変更が起点に入らない**。
         // context / impact / review / dead-code は `run_git_diff` が `git diff <base>` を
         // 使っており、cochange だけ意味が違うと同じ `--git` でも解析対象がずれる。
+        // --relative: 出力パスを `dir` 相対に揃える。git diff は既定でリポジトリルート
+        // 相対を返すため、`--dir` がサブディレクトリだと `is_contained_relative` /
+        // blame pathspec (cwd 相対) と基準がずれる (パス基準統一、Issue
+        // 2026-08-05-moved-name-only-match-and-path-mismatch)。`--dir` = リポジトリルート
+        // なら prefix が空で従来と同一出力。
         let output = std::process::Command::new("git")
-            .args(["-c", "core.quotepath=off", "diff", "--name-only", base_rev])
+            .args([
+                "-c",
+                "core.quotepath=off",
+                "diff",
+                "--relative",
+                "--name-only",
+                base_rev,
+            ])
             .current_dir(dir)
             .output()
             .map_err(|e| {
@@ -150,11 +162,16 @@ pub(crate) fn validate_git_revision(rev: &str, arg_name: &str) -> Result<()> {
 /// 次のいずれも `None` に畳む: 検証失敗 / git 実行失敗 / 当該リビジョンに
 /// ファイルが存在しない。呼び出し側はどのケースでも「旧側を確認できなかった」
 /// として保守側 (API 差分を抑制しない = blocking 維持) に倒すため、区別しない。
+///
+/// `path` は `dir` 相対で受け取る (astro-sight の内部パス規約)。`git show <rev>:<path>` は
+/// 既定でリポジトリルート相対に解決するため、`<rev>:./<path>` 形式で cwd (= `dir`) 基準に
+/// 明示する。`--dir` がリポジトリルートなら `./` の有無で結果は変わらず、サブディレクトリ
+/// でも prefix を別途解決せずに正しい blob を引ける。
 pub(crate) fn git_show_blob(dir: &str, rev: &str, path: &str) -> Option<Vec<u8>> {
     validate_git_revision(rev, "git revision").ok()?;
     validate_git_revision(path, "diff file path").ok()?;
     let output = std::process::Command::new("git")
-        .args(["show", &format!("{rev}:{path}")])
+        .args(["show", &format!("{rev}:{}", cwd_relative_git_path(path))])
         .current_dir(dir)
         .output()
         .ok()?;
@@ -162,6 +179,17 @@ pub(crate) fn git_show_blob(dir: &str, rev: &str, path: &str) -> Option<Vec<u8>>
         return None;
     }
     Some(output.stdout)
+}
+
+/// `git show <rev>:<path>` の `<path>` を cwd 基準に明示した形へ正規化する。
+///
+/// 既に `./` / `../` で始まるものと絶対パスはそのまま返す (二重の `./` を作らない。
+/// 絶対パスは元から tree に存在せず `None` に倒れるため挙動を変えない)。
+fn cwd_relative_git_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if path.starts_with('/') || path.starts_with("./") || path.starts_with("../") {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    std::borrow::Cow::Owned(format!("./{path}"))
 }
 
 /// `--git` 入力解決の結果。diff が取れたか、git 管理外で skip かを型で表す。
@@ -294,10 +322,18 @@ fn run_git_diff_collecting_truncations(
     // なるため、astro-sight 側で強制しておく。
     // core.quotepath=off: 非 ASCII ファイル名が 8 進クォート (`--- "a/\346..."`) で出力されると
     // parse_unified_diff がヘッダを認識できず、hunk が直前ファイルへ誤帰属する。
+    // --relative: diff ヘッダのパスを `dir` 相対に揃える。astro-sight の内部パス規約は
+    // 一貫して `dir` 相対 (参照 index / `Path::new(dir).join(..)` のファイル読み込み /
+    // `git ls-files` 由来の未追跡パス / JSON 出力) だが、git diff だけが既定で
+    // リポジトリルート相対を返すため、`--dir` がサブディレクトリのとき同一レコード内で
+    // 基準が混ざる (`api.moved` の `from` = ルート相対 / `to` = dir 相対で `to` が実在しない
+    // パスになる。Issue 2026-08-05-moved-name-only-match-and-path-mismatch)。
+    // `--dir` = リポジトリルートなら prefix が空なので従来と完全に同一の出力になる。
     let mut args = vec![
         "-c".to_string(),
         "core.quotepath=off".to_string(),
         "diff".to_string(),
+        "--relative".to_string(),
         "--find-renames".to_string(),
     ];
     if staged {
