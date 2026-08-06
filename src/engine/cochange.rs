@@ -51,6 +51,42 @@ fn empty_cochange_result(
     }
 }
 
+/// 解析全体のタイムアウト判定 (`timeout_secs = 0` で無制限)。
+///
+/// 各フェーズ入口で `check` を呼ぶ。既に走行中の subprocess (git blame / diff-tree) は
+/// kill しないため、直近の 1 起動の完了までは待つ実装 (実用上の許容範囲)。
+struct Deadline {
+    started: std::time::Instant,
+    timeout_secs: u64,
+}
+
+impl Deadline {
+    fn new(timeout_secs: u64) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            timeout_secs,
+        }
+    }
+
+    /// 超過していれば停止する。`phase` はどこで超過したかの申告用。
+    fn check(&self, phase: &str) -> Result<()> {
+        if self.timeout_secs == 0 {
+            return Ok(());
+        }
+        let elapsed = self.started.elapsed().as_secs();
+        if elapsed >= self.timeout_secs {
+            bail!(AstroError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "blame analysis exceeded --timeout-secs {} during {phase} (elapsed {elapsed}s)",
+                    self.timeout_secs,
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// blame ベースの共変更解析。
 ///
 /// 起点ファイル `source_files` の **変更行** に対して `git blame -L` を当て、
@@ -81,27 +117,7 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
         ));
     }
 
-    // 全体タイムアウト用のチェックポイント (0 = 無制限)。
-    // 各 Phase 入口で elapsed を確認し、超過なら InvalidRequest で停止する。
-    // 既に走行中の subprocess (git blame / diff-tree) は kill しないため、
-    // 直近の 1 起動の完了までは待つ実装 (実用上の許容範囲)。
-    let started = std::time::Instant::now();
-    let check_timeout = |phase: &str| -> Result<()> {
-        if opts.timeout_secs == 0 {
-            return Ok(());
-        }
-        let elapsed = started.elapsed().as_secs();
-        if elapsed >= opts.timeout_secs {
-            bail!(AstroError::new(
-                ErrorCode::InvalidRequest,
-                format!(
-                    "blame analysis exceeded --timeout-secs {} during {phase} (elapsed {elapsed}s)",
-                    opts.timeout_secs,
-                ),
-            ));
-        }
-        Ok(())
-    };
+    let deadline = Deadline::new(opts.timeout_secs);
 
     let base_rev: &str = opts
         .base
@@ -118,18 +134,118 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
     };
     let min_denom = opts.min_denominator.max(1);
 
-    // Phase 1: 起点ファイルごとに証拠コミット集合を作る。
-    //          第一選択は変更行 blame、証拠が min_denominator に満たなければ履歴 fallback。
-    //          ファイル単位で rayon 並列化する。
-    check_timeout("phase1_blame_setup")?;
-    let evidence_per_file: Vec<SourceEvidence> = opts
+    let index = build_evidence_index(dir, base_rev, min_denom, opts, &deadline, &mut diag)?;
+    if index.is_empty() {
+        return Ok(empty_cochange_result(None, diag));
+    }
+    // 証拠として集めたユニークコミット集合 |C| のサイズ。集計に入る前の値なので、
+    // 後段で diff-tree に失敗したコミットもここには含まれる (下の commit_scan_failures 参照)。
+    let commits_analyzed = index.sha_to_sources.len();
+
+    deadline.check("phase3_diff_tree_setup")?;
+    let stats = aggregate_commits(dir, &index, opts)?;
+    if stats.failed_commits > 0 {
+        // git 失敗を「変更ファイル 0 件」に畳んだまま黙っていると、「解析できなかった」が
+        // 「共変更が無かった」と区別できなくなる (0 件の理由を返すという診断の趣旨に反する)。
+        //
+        // `commits_analyzed` からは差し引かない。これは「証拠として集めたユニークコミット
+        // 集合 |C| のサイズ」という別の量で、実際に集計対象となった件数は per-source の
+        // `entry.denominator` が持つ。失敗分を引くと 3 つ目の意味を持つ数字になり、
+        // 既存出力の意味も変わってしまうため、失敗件数は別フィールドで申告する。
+        // なお失敗コミットは「変更 0 件のコミット」として実効分母には入る (挙動は据え置き)。
+        diag.commit_scan_failures = stats.failed_commits;
+        diag.add_reason(CoChangeDiagnosticReason::CommitScanFailed);
+    }
+
+    deadline.check("phase4_assemble")?;
+
+    let entries = assemble_entries(opts, &index, &stats, min_denom, &mut diag);
+    diag.finalize();
+
+    Ok(CoChangeResult {
+        entries,
+        commits_analyzed,
+        diagnostics: diag,
+        skipped: None,
+    })
+}
+
+/// 起点別の証拠コミット集合と、その SHA 逆引き index。
+///
+/// `per_source[i]` は `opts.source_files[i]` に対応する (入力順を保持する)。
+/// `sha_to_sources` は「この SHA を証拠に持つ起点は誰か」の逆引きで、diff-tree の結果を
+/// 全保持せずに SHA 1 件ずつ per-source 集計へ畳み込むために使う。
+struct EvidenceIndex {
+    per_source: Vec<SourceEvidence>,
+    sha_to_sources: HashMap<String, Vec<usize>>,
+    sha_to_info: HashMap<String, BlameInfo>,
+}
+
+impl EvidenceIndex {
+    /// 集計対象のコミットが 1 件も無い (証拠を作れなかった / マージ除外で全滅した)。
+    fn is_empty(&self) -> bool {
+        self.sha_to_sources.is_empty()
+    }
+}
+
+/// 起点ごとに証拠コミット集合を作り、SHA 逆引き index に畳む。
+///
+/// 1. 起点ファイル単位で rayon 並列に blame (不足時は履歴 fallback) を実行する
+/// 2. 証拠の内訳を診断へ反映する
+/// 3. 上限ガードとマージ除外で集計対象 SHA を確定する
+/// 4. SHA → 起点 index / BlameInfo の逆引きを作る
+///
+/// 集計対象が 0 件のときは空の index を返す (呼び出し側が空結果へ倒す)。
+fn build_evidence_index(
+    dir: &str,
+    base: &str,
+    min_denom: usize,
+    opts: &CoChangeOptions,
+    deadline: &Deadline,
+    diag: &mut CoChangeDiagnostics,
+) -> Result<EvidenceIndex> {
+    deadline.check("phase1_blame_setup")?;
+    let mut per_source: Vec<SourceEvidence> = opts
         .source_files
         .par_iter()
-        .map(|f| collect_evidence_for_file(dir, f, base_rev, min_denom, opts))
+        .map(|f| collect_evidence_for_file(dir, f, base, min_denom, opts))
         .collect();
-    check_timeout("phase1_blame_collected")?;
+    deadline.check("phase1_blame_collected")?;
+    record_evidence_diagnostics(&per_source, diag);
 
-    for ev in &evidence_per_file {
+    let commit_set = resolve_target_commits(dir, &mut per_source, opts, deadline)?;
+    if commit_set.is_empty() {
+        return Ok(EvidenceIndex {
+            per_source,
+            sha_to_sources: HashMap::new(),
+            sha_to_info: HashMap::new(),
+        });
+    }
+
+    let mut sha_to_sources: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut sha_to_info: HashMap<String, BlameInfo> = HashMap::new();
+    for (i, ev) in per_source.iter().enumerate() {
+        for (sha, info) in &ev.commits {
+            sha_to_sources.entry(sha.clone()).or_default().push(i);
+            // 起点間で同じ SHA の info があれば最初に見たものを採用する
+            sha_to_info
+                .entry(sha.clone())
+                .or_insert_with(|| info.clone());
+        }
+    }
+    Ok(EvidenceIndex {
+        per_source,
+        sha_to_sources,
+        sha_to_info,
+    })
+}
+
+/// 証拠収集の結果を診断へ反映する。
+///
+/// 「共変更が無い」のか「証拠を作れなかった」のかを呼び出し側が区別できるよう、
+/// 起点ごとの内訳 (git 失敗 / 変更行なし / 新規ファイル / blame・履歴の別) を残す。
+fn record_evidence_diagnostics(per_source: &[SourceEvidence], diag: &mut CoChangeDiagnostics) {
+    for ev in per_source {
         if ev.git_failed {
             diag.add_reason(CoChangeDiagnosticReason::GitCommandFailed);
         }
@@ -151,15 +267,27 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
             CoChangeEvidence::History => diag.sources_with_history_evidence += 1,
         }
     }
+}
 
+/// 全起点の証拠 SHA の和集合から、集計対象のコミット集合を確定する。
+///
+/// 上限ガード (`max_blame_commits`) を掛け、`ignore_merges` ならマージコミットを除外する。
+/// 除外した SHA は `per_source` 側の証拠集合からも落とし、per-source 集計と整合させる。
+/// 戻り値が空なら集計対象のコミットが 1 件も無い。
+fn resolve_target_commits(
+    dir: &str,
+    per_source: &mut [SourceEvidence],
+    opts: &CoChangeOptions,
+    deadline: &Deadline,
+) -> Result<HashSet<String>> {
     let mut commit_set: HashSet<String> = HashSet::new();
-    for ev in &evidence_per_file {
+    for ev in per_source.iter() {
         for k in ev.commits.keys() {
             commit_set.insert(k.clone());
         }
     }
     if commit_set.is_empty() {
-        return Ok(empty_cochange_result(None, diag));
+        return Ok(commit_set);
     }
 
     // SHA 集合の上限ガード (0 = 無制限)。
@@ -175,239 +303,257 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
             ),
         ));
     }
+    if !opts.ignore_merges {
+        return Ok(commit_set);
+    }
 
-    // 必要に応じてマージコミットを除外する。
     // git rev-list --no-walk --merges <SHA>... は引数の SHA のうちマージのみを返すので、
     // 一括問い合わせで効率良く判定できる (ARG_MAX 超過対策で chunk 化)。
-    if opts.ignore_merges {
-        check_timeout("phase2_merge_filter")?;
-        let merge_set = list_merge_commits(dir, &commit_set)?;
-        commit_set.retain(|s| !merge_set.contains(s));
-        if commit_set.is_empty() {
-            return Ok(empty_cochange_result(None, diag));
-        }
+    deadline.check("phase2_merge_filter")?;
+    let merge_set = list_merge_commits(dir, &commit_set)?;
+    commit_set.retain(|s| !merge_set.contains(s));
+    for ev in per_source.iter_mut() {
+        ev.commits.retain(|sha, _| commit_set.contains(sha));
     }
-    // 起点別の証拠集合からも同 SHA を除外して per-source 集計と整合させる。
-    let evidence_per_file: Vec<SourceEvidence> = if opts.ignore_merges {
-        evidence_per_file
-            .into_iter()
-            .map(|mut ev| {
-                ev.commits.retain(|sha, _| commit_set.contains(sha));
-                ev
-            })
-            .collect()
-    } else {
-        evidence_per_file
-    };
-    check_timeout("phase3_diff_tree_setup")?;
+    Ok(commit_set)
+}
 
-    // Phase 2: SHA → 起点ファイル indices の逆引きを作り、SHA → BlameInfo もマージする。
-    // diff-tree 結果を全保持せず、各 SHA を 1-pass で per-source 集計に畳み込むため、
-    // 「この SHA にヒットする起点ファイルは誰か」を引けるようにしておく。
-    let mut sha_to_sources: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut sha_to_info: HashMap<String, BlameInfo> = HashMap::new();
-    for (i, ev) in evidence_per_file.iter().enumerate() {
-        for (sha, info) in &ev.commits {
-            sha_to_sources.entry(sha.clone()).or_default().push(i);
-            // 起点間で同じ SHA の info があれば最初に見たものを採用する
-            sha_to_info
-                .entry(sha.clone())
-                .or_insert_with(|| info.clone());
-        }
-    }
-    let denominator = sha_to_sources.len();
-    let n_sources = opts.source_files.len();
-    let source_set: HashSet<&str> = opts.source_files.iter().map(String::as_str).collect();
-    let exclude_matcher = build_exclude_matcher(&opts.exclude_globs)?;
+/// コミットを跨いで不変な集計入力。fold の各シャードから共有参照で読む。
+struct CommitScanContext<'a> {
+    dir: &'a str,
+    /// リポジトリルート相対のパスを `dir` 相対へ直す prefix (`dir` がルートなら空)。
+    workspace_prefix: String,
+    opts: &'a CoChangeOptions,
+    /// 起点自身は共変更相手にしない。
+    source_set: HashSet<&'a str>,
+    exclude: CoChangeExclude,
+    sha_to_info: &'a HashMap<String, BlameInfo>,
+}
 
-    // author_unit_window_days > 0 のとき、各 SHA を「(author_mail, time_bucket)」の unit に
-    // 圧縮することで、同一 author の連続 commit を 1 knowledge unit として扱う。
-    // window=0 (旧挙動) のとき unit_key は常に None で、raw weighted 集計のみが有効。
-    let author_window_days = opts.author_unit_window_days;
-    let unit_key_for = |sha: &str| -> Option<(String, i64)> {
-        if author_window_days == 0 {
+impl CommitScanContext<'_> {
+    /// SHA を「(author_mail, time_bucket)」の knowledge unit に圧縮したキー。
+    ///
+    /// 同一 author の連続 commit を 1 unit として扱い、短時間 burst による偽陽性を抑える。
+    /// `author_unit_window_days = 0` (旧挙動) では常に None で、raw weighted 集計のみが有効。
+    fn unit_key(&self, sha: &str) -> Option<(String, i64)> {
+        let window_days = self.opts.author_unit_window_days;
+        if window_days == 0 {
             return None;
         }
-        let info = sha_to_info.get(sha)?;
+        let info = self.sha_to_info.get(sha)?;
         let mail = info.author_mail.as_ref()?;
         let time = info.author_time?;
-        let bucket_seconds = (author_window_days as i64) * 86_400;
+        let bucket_seconds = (window_days as i64) * 86_400;
         Some((mail.clone(), time / bucket_seconds))
-    };
+    }
 
-    // Phase 3 (streaming): 各 SHA について diff-tree 取得 → サイズ重み計算 →
-    // per-source 集計 (raw / weighted / units) と global co_counts を rayon の fold/reduce で
-    // 直接畳み込む。`commit_files: Vec<Vec<String>>` を全保持しないため、
-    // 大規模 diff (commits 数百〜千超) でもピーク RSS が線形以下に収まる。
-    let sha_entries: Vec<(String, Vec<usize>)> = sha_to_sources.into_iter().collect();
+    /// 共変更候補として数えるパスか (起点自身と除外 glob を落とす)。
+    fn is_candidate(&self, path: &str) -> bool {
+        !self.source_set.contains(path) && !self.exclude.is_match(path)
+    }
+}
+
+/// 証拠コミットを 1 件ずつ diff-tree に掛け、per-source 集計へ畳み込む。
+///
+/// 各 SHA について diff-tree 取得 → サイズ重み計算 → per-source 集計 (raw / weighted /
+/// units) と global co_counts を rayon の fold/reduce で直接畳み込む。
+/// `commit_files: Vec<Vec<String>>` を全保持しないため、大規模 diff (commits 数百〜千超)
+/// でもピーク RSS が線形以下に収まる。
+fn aggregate_commits(
+    dir: &str,
+    index: &EvidenceIndex,
+    opts: &CoChangeOptions,
+) -> Result<ShardStats> {
+    let exclude = build_exclude_matcher(&opts.exclude_globs)?;
     // SHA ごとに `git rev-parse` を起動しないよう、ワークスペース prefix は 1 度だけ解決する。
     let workspace_prefix = workspace_prefix_for(dir)?;
+    let ctx = CommitScanContext {
+        dir,
+        workspace_prefix,
+        opts,
+        source_set: opts.source_files.iter().map(String::as_str).collect(),
+        exclude,
+        sha_to_info: &index.sha_to_info,
+    };
 
-    let stats: ShardStats = sha_entries
+    let n_sources = opts.source_files.len();
+    let sha_entries: Vec<(&String, &Vec<usize>)> = index.sha_to_sources.iter().collect();
+    Ok(sha_entries
         .par_iter()
         .fold(
             || ShardStats::new(n_sources),
-            |mut acc, (sha, sources)| {
-                let commit =
-                    collect_files_in_commit(dir, sha, &workspace_prefix).unwrap_or(CommitFiles {
-                        total_files: 0,
-                        workspace_files: Vec::new(),
-                    });
-                let files = commit.workspace_files;
-                // 規模判定はコミット全体のファイル数で行う (ワークスペース内の件数ではない)。
-                let weight = commit_size_weight(
-                    commit.total_files,
-                    opts.commit_size_pivot,
-                    opts.max_files_per_commit,
-                );
-                if weight <= 0.0 {
-                    return acc;
-                }
-                let unit = unit_key_for(sha);
-                for &i in sources {
-                    // confidence の分母は「実際に集計対象となったコミット数」。
-                    // weight 0 (max_files_per_commit 超過) のコミットは上で return 済みなので
-                    // ここに到達したものだけを数える。証拠集合サイズをそのまま分母にすると
-                    // co (超過コミットを含まない) と母数がずれ confidence が過小評価になる。
-                    acc.counted_denom[i] += 1;
-                    acc.weighted_denom[i] += weight;
-                    if let Some(u) = unit.as_ref() {
-                        acc.denom_units[i].insert(u.clone());
-                    }
-                }
-                let mut seen: HashSet<&str> = HashSet::new();
-                for f in &files {
-                    let path = f.as_str();
-                    if !seen.insert(path) {
-                        continue;
-                    }
-                    if source_set.contains(path) {
-                        continue;
-                    }
-                    if exclude_matcher.is_match(path) {
-                        continue;
-                    }
-                    *acc.co_counts.entry(path.to_string()).or_insert(0) += 1;
-                    for &i in sources {
-                        *acc.per_source_raw[i].entry(path.to_string()).or_insert(0) += 1;
-                        *acc.per_source_weighted[i]
-                            .entry(path.to_string())
-                            .or_insert(0.0) += weight;
-                        if let Some(u) = unit.as_ref() {
-                            acc.co_units[i]
-                                .entry(path.to_string())
-                                .or_default()
-                                .insert(u.clone());
-                        }
-                    }
-                }
+            |mut acc, &(sha, sources)| {
+                accumulate_commit(&mut acc, &ctx, sha, sources);
                 acc
             },
         )
-        .reduce(|| ShardStats::new(n_sources), ShardStats::merge);
+        .reduce(|| ShardStats::new(n_sources), ShardStats::merge))
+}
 
-    check_timeout("phase4_assemble")?;
+/// SHA 1 件分の変更ファイルを取得し、per-source 集計へ畳み込む。
+///
+/// `git diff-tree` の失敗は「変更ファイル 0 件」と同じ扱いで解析を続行しつつ、件数を
+/// `failed_commits` へ持ち上げる。黙って 0 件に畳むと「解析できなかったコミット」が
+/// 「共変更が無かったコミット」と区別できなくなるため (呼び出し側が診断で申告する)。
+fn accumulate_commit(
+    acc: &mut ShardStats,
+    ctx: &CommitScanContext<'_>,
+    sha: &str,
+    sources: &[usize],
+) {
+    let commit = match collect_files_in_commit(ctx.dir, sha, &ctx.workspace_prefix) {
+        Ok(commit) => commit,
+        Err(_) => {
+            acc.failed_commits += 1;
+            CommitFiles::default()
+        }
+    };
+    // 規模判定はコミット全体のファイル数で行う (ワークスペース内の件数ではない)。
+    let weight = commit_size_weight(
+        commit.total_files,
+        ctx.opts.commit_size_pivot,
+        ctx.opts.max_files_per_commit,
+    );
+    if weight <= 0.0 {
+        return;
+    }
+    let unit = ctx.unit_key(sha);
+    for &i in sources {
+        // confidence の分母は「実際に集計対象となったコミット数」。
+        // weight 0 (max_files_per_commit 超過) のコミットは上で return 済みなので
+        // ここに到達したものだけを数える。証拠集合サイズをそのまま分母にすると
+        // co (超過コミットを含まない) と母数がずれ confidence が過小評価になる。
+        acc.counted_denom[i] += 1;
+        acc.weighted_denom[i] += weight;
+        if let Some(u) = unit.as_ref() {
+            acc.denom_units[i].insert(u.clone());
+        }
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for f in &commit.workspace_files {
+        let path = f.as_str();
+        if !seen.insert(path) {
+            continue;
+        }
+        if !ctx.is_candidate(path) {
+            continue;
+        }
+        *acc.co_counts.entry(path.to_string()).or_insert(0) += 1;
+        for &i in sources {
+            *acc.per_source_raw[i].entry(path.to_string()).or_insert(0) += 1;
+            *acc.per_source_weighted[i]
+                .entry(path.to_string())
+                .or_insert(0.0) += weight;
+            if let Some(u) = unit.as_ref() {
+                acc.co_units[i]
+                    .entry(path.to_string())
+                    .or_default()
+                    .insert(u.clone());
+            }
+        }
+    }
+}
 
-    // Phase 4: 各起点に対して CoChangeEntry を構築する。stats は streaming で
-    // すでに per-source 集計済みなので、ここでは閾値フィルタとランキングのみ行う。
-    //
-    // 閾値は raw `confidence` (と、明示指定時のみ `min_score`) に対して適用する。
-    // 平滑化した `score` はランキング専用。score は分母が小さいほど 0 に引き寄せられる
-    // shrinkage 推定値なので、閾値と突き合わせると「変更行 blame の分母が小さい起点は
-    // 100% 共変更でも構造的に出力されない」(既定 β=8 では分母 2 で上限 0.27 < 0.3) 。
+/// 起点ごとに `CoChangeEntry` を構築し、全体ランキング順に並べて返す。
+///
+/// 集計は `stats` で完了しているので、ここでは閾値フィルタとランキングだけを行う。
+fn assemble_entries(
+    opts: &CoChangeOptions,
+    index: &EvidenceIndex,
+    stats: &ShardStats,
+    min_denom: usize,
+    diag: &mut CoChangeDiagnostics,
+) -> Vec<CoChangeEntry> {
     let smoothing_on = !opts.disable_smoothing;
-    let alpha = opts.smoothing_alpha;
-    let beta = opts.smoothing_beta;
-    let author_unit_active = author_window_days > 0;
-    let score_gate_on = opts.min_score > 0.0;
-
     let mut entries: Vec<CoChangeEntry> = Vec::new();
     for (i, source) in opts.source_files.iter().enumerate() {
-        let evidence_set_len = evidence_per_file[i].commits.len();
-        let counted_denom = stats.counted_denom[i];
-        if counted_denom < min_denom {
-            if evidence_set_len > 0 {
+        let evidence = &index.per_source[i];
+        if stats.counted_denom[i] < min_denom {
+            // 証拠が 1 件も無い起点は sources_without_evidence 側で数えているため、
+            // ここでは「証拠はあったが分母が足りなかった」起点だけを数える。
+            if !evidence.commits.is_empty() {
                 diag.skipped_min_denominator += 1;
                 diag.add_reason(CoChangeDiagnosticReason::BelowMinDenominator);
             }
             continue;
         }
-        let local_denom_raw = counted_denom as f64;
-        let weighted_denom = stats.weighted_denom[i];
-        let raw = &stats.per_source_raw[i];
-        let weighted = &stats.per_source_weighted[i];
-        // blame 由来か履歴 fallback 由来かをエントリに引き継ぐ (既定 Blame は省略)。
-        let evidence = match evidence_per_file[i].mode {
-            CoChangeEvidence::Blame => None,
-            CoChangeEvidence::History => Some(CoChangeEvidence::History),
-        };
-
-        let mut per_source_entries: Vec<CoChangeEntry> = Vec::new();
-        for (cand, co) in raw {
-            let co = *co;
-            diag.candidate_pairs += 1;
-            if co < opts.min_samples {
-                diag.filtered_min_samples += 1;
-                diag.add_reason(CoChangeDiagnosticReason::BelowMinSamples);
-                continue;
-            }
-            let confidence = co as f64 / local_denom_raw;
-            if confidence < opts.min_confidence {
-                diag.filtered_min_confidence += 1;
-                diag.add_reason(CoChangeDiagnosticReason::BelowMinConfidence);
-                continue;
-            }
-            // author_unit_window_days > 0 のとき、score は unit ベース
-            // (|co_units| + α) / (|denom_units| + α + β) で計算する。
-            // unit が空 (author 情報を取れなかった SHA のみ) のとき raw weighted にフォールバック。
-            let score = if smoothing_on {
-                if author_unit_active && !stats.denom_units[i].is_empty() {
-                    let denom_units_n = stats.denom_units[i].len() as f64;
-                    let co_units_n =
-                        stats.co_units[i].get(cand).map(|s| s.len()).unwrap_or(0) as f64;
-                    (co_units_n + alpha) / (denom_units_n + alpha + beta)
-                } else {
-                    let weighted_co = *weighted.get(cand).unwrap_or(&0.0);
-                    (weighted_co + alpha) / (weighted_denom + alpha + beta)
-                }
-            } else {
-                confidence
-            };
-            if score_gate_on && score < opts.min_score {
-                diag.filtered_min_score += 1;
-                diag.add_reason(CoChangeDiagnosticReason::BelowMinScore);
-                continue;
-            }
-            per_source_entries.push(CoChangeEntry {
-                file_a: source.clone(),
-                file_b: cand.clone(),
-                co_changes: co,
-                total_changes_a: evidence_set_len,
-                total_changes_b: *stats.co_counts.get(cand).unwrap_or(&0),
-                confidence,
-                denominator: Some(counted_denom),
-                score: Some(score),
-                evidence,
-            });
-        }
-        per_source_entries.sort_by(|a, b| compare_entries_by_ranking(a, b, smoothing_on));
-        if opts.per_source_limit > 0 && per_source_entries.len() > opts.per_source_limit {
-            diag.truncated_per_source_limit += per_source_entries.len() - opts.per_source_limit;
-            per_source_entries.truncate(opts.per_source_limit);
-        }
-        entries.extend(per_source_entries);
+        entries.extend(entries_for_source(i, source, evidence, stats, opts, diag));
     }
 
     // 全体 ranking。smoothing 有効なら score 降順、無効なら confidence 降順。
     entries.sort_by(|a, b| compare_entries_by_ranking(a, b, smoothing_on));
-    diag.finalize();
+    entries
+}
 
-    Ok(CoChangeResult {
-        entries,
-        commits_analyzed: denominator,
-        diagnostics: diag,
-        skipped: None,
-    })
+/// 起点 1 件分の候補を閾値でふるい、ランキングして `per_source_limit` で切り詰める。
+///
+/// 閾値は raw `confidence` (と、明示指定時のみ `min_score`) に対して適用する。
+/// 平滑化した `score` はランキング専用。score は分母が小さいほど 0 に引き寄せられる
+/// shrinkage 推定値なので、閾値と突き合わせると「変更行 blame の分母が小さい起点は
+/// 100% 共変更でも構造的に出力されない」(既定 β=8 では分母 2 で上限 0.27 < 0.3) 。
+fn entries_for_source(
+    i: usize,
+    source: &str,
+    evidence: &SourceEvidence,
+    stats: &ShardStats,
+    opts: &CoChangeOptions,
+    diag: &mut CoChangeDiagnostics,
+) -> Vec<CoChangeEntry> {
+    let smoothing_on = !opts.disable_smoothing;
+    let author_unit_active = opts.author_unit_window_days > 0;
+    let score_gate_on = opts.min_score > 0.0;
+    let counted_denom = stats.counted_denom[i];
+    let local_denom_raw = counted_denom as f64;
+    let evidence_set_len = evidence.commits.len();
+    // blame 由来か履歴 fallback 由来かをエントリに引き継ぐ (既定 Blame は省略)。
+    let evidence_kind = match evidence.mode {
+        CoChangeEvidence::Blame => None,
+        CoChangeEvidence::History => Some(CoChangeEvidence::History),
+    };
+
+    let mut out: Vec<CoChangeEntry> = Vec::new();
+    for (cand, co) in &stats.per_source_raw[i] {
+        let co = *co;
+        diag.candidate_pairs += 1;
+        if co < opts.min_samples {
+            diag.filtered_min_samples += 1;
+            diag.add_reason(CoChangeDiagnosticReason::BelowMinSamples);
+            continue;
+        }
+        let confidence = co as f64 / local_denom_raw;
+        if confidence < opts.min_confidence {
+            diag.filtered_min_confidence += 1;
+            diag.add_reason(CoChangeDiagnosticReason::BelowMinConfidence);
+            continue;
+        }
+        let score = if smoothing_on {
+            stats.smoothed_score(i, cand, opts, author_unit_active)
+        } else {
+            confidence
+        };
+        if score_gate_on && score < opts.min_score {
+            diag.filtered_min_score += 1;
+            diag.add_reason(CoChangeDiagnosticReason::BelowMinScore);
+            continue;
+        }
+        out.push(CoChangeEntry {
+            file_a: source.to_string(),
+            file_b: cand.clone(),
+            co_changes: co,
+            total_changes_a: evidence_set_len,
+            total_changes_b: *stats.co_counts.get(cand).unwrap_or(&0),
+            confidence,
+            denominator: Some(counted_denom),
+            score: Some(score),
+            evidence: evidence_kind,
+        });
+    }
+    out.sort_by(|a, b| compare_entries_by_ranking(a, b, smoothing_on));
+    if opts.per_source_limit > 0 && out.len() > opts.per_source_limit {
+        diag.truncated_per_source_limit += out.len() - opts.per_source_limit;
+        out.truncate(opts.per_source_limit);
+    }
+    out
 }
 
 /// streaming 集計用のスレッドローカル統計。fold/reduce でマージされる。
@@ -416,6 +562,7 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
 /// - `denom_units` / `co_units`: author_unit_window_days > 0 のとき (author, time_bucket) 単位で
 ///   起点ファイル別の unique unit と候補別の unique unit を保持する
 /// - `co_counts`: グローバル候補出現数 (= `CoChangeEntry.total_changes_b` の元)
+/// - `failed_commits`: diff-tree に失敗して変更ファイルを取得できなかったコミット数
 #[derive(Default)]
 struct ShardStats {
     per_source_raw: Vec<HashMap<String, usize>>,
@@ -425,6 +572,7 @@ struct ShardStats {
     denom_units: Vec<HashSet<(String, i64)>>,
     co_units: Vec<HashMap<String, HashSet<(String, i64)>>>,
     co_counts: HashMap<String, usize>,
+    failed_commits: usize,
 }
 
 impl ShardStats {
@@ -437,14 +585,20 @@ impl ShardStats {
             denom_units: (0..n_sources).map(|_| HashSet::new()).collect(),
             co_units: (0..n_sources).map(|_| HashMap::new()).collect(),
             co_counts: HashMap::new(),
+            failed_commits: 0,
         }
     }
 
     fn merge(mut a: Self, b: Self) -> Self {
+        // per-source ベクタを持たない側 (n_sources = 0 の identity) でも、
+        // failed_commits だけは取りこぼさずに合算する。
         if a.weighted_denom.is_empty() {
+            let mut b = b;
+            b.failed_commits += a.failed_commits;
             return b;
         }
         if b.weighted_denom.is_empty() {
+            a.failed_commits += b.failed_commits;
             return a;
         }
         for (i, m) in b.per_source_raw.into_iter().enumerate() {
@@ -474,7 +628,33 @@ impl ShardStats {
         for (k, v) in b.co_counts {
             *a.co_counts.entry(k).or_insert(0) += v;
         }
+        a.failed_commits += b.failed_commits;
         a
+    }
+
+    /// 起点 `i` における候補 `cand` の平滑化スコア。
+    ///
+    /// `author_unit_active` かつ unit が取れているときは unit ベース
+    /// `(|co_units| + α) / (|denom_units| + α + β)` で計算し、同一 author の短時間 burst を
+    /// 1 票に圧縮する。unit が空 (author 情報を取れなかった SHA のみ) のときは
+    /// raw weighted へフォールバックする。
+    fn smoothed_score(
+        &self,
+        i: usize,
+        cand: &str,
+        opts: &CoChangeOptions,
+        author_unit_active: bool,
+    ) -> f64 {
+        let alpha = opts.smoothing_alpha;
+        let beta = opts.smoothing_beta;
+        if author_unit_active && !self.denom_units[i].is_empty() {
+            let denom_units_n = self.denom_units[i].len() as f64;
+            let co_units_n = self.co_units[i].get(cand).map(|s| s.len()).unwrap_or(0) as f64;
+            (co_units_n + alpha) / (denom_units_n + alpha + beta)
+        } else {
+            let weighted_co = *self.per_source_weighted[i].get(cand).unwrap_or(&0.0);
+            (weighted_co + alpha) / (self.weighted_denom[i] + alpha + beta)
+        }
     }
 }
 
@@ -886,6 +1066,7 @@ fn list_merge_commits(dir: &str, shas: &HashSet<String>) -> Result<HashSet<Strin
 /// (起点 `source_files` は `is_contained_relative` で `dir` 相対に閉じているため、
 /// 相手側だけルート相対だと同一エントリ内で基準が混ざる)。
 /// `--dir` = リポジトリルートでは prefix が空で従来と完全に同一。
+#[derive(Default)]
 struct CommitFiles {
     /// コミット全体の変更ファイル数 (リポジトリルート基準、規模評価用)。
     total_files: usize,
@@ -893,6 +1074,9 @@ struct CommitFiles {
     workspace_files: Vec<String>,
 }
 
+/// git の失敗 (起動失敗 / 非 0 終了) は `Err` を返す。呼び出し側が「変更 0 件のコミット」と
+/// 区別して件数を申告できるようにするため、空集合には畳まない (黙って畳むと
+/// 「解析できなかったコミット」が「共変更が無かったコミット」に化ける)。
 fn collect_files_in_commit(dir: &str, sha: &str, workspace_prefix: &str) -> Result<CommitFiles> {
     let output = Command::new("git")
         .args([
@@ -910,10 +1094,11 @@ fn collect_files_in_commit(dir: &str, sha: &str, workspace_prefix: &str) -> Resu
         .output()
         .map_err(|e| AstroError::new(ErrorCode::IoError, format!("Failed to run git: {e}")))?;
     if !output.status.success() {
-        return Ok(CommitFiles {
-            total_files: 0,
-            workspace_files: Vec::new(),
-        });
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(AstroError::new(
+            ErrorCode::IoError,
+            format!("git diff-tree failed for {sha}: {}", stderr.trim()),
+        ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let all: Vec<&str> = stdout
@@ -1522,6 +1707,115 @@ mod tests {
             !result.entries.iter().any(|e| e.file_b == "a.rs"),
             "起点自身は共変更相手にならないべき (source_set と候補の基準一致): {:?}",
             result.entries
+        );
+    }
+
+    /// テスト用のヘルパー。`<rev>` の `sub/` tree オブジェクトを壊し、`git diff-tree` だけを
+    /// 失敗させる。blame は pathspec でルート直下のファイルしか辿らず `sub/` に降りないため、
+    /// blame は成功したまま `diff-tree -r` (全体を再帰する) だけが落ちる。
+    fn corrupt_subtree_object(repo: &std::path::Path, rev: &str) {
+        let spec = format!("{rev}^{{tree}}:sub");
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", &spec])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "rev-parse {spec} に失敗: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(oid.len(), 40, "SHA-1 リポジトリを前提にしている: {oid}");
+        let path = repo.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+        // loose object は読み取り専用 (444) で作られるため、上書きではなく置き換える。
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"corrupted").unwrap();
+    }
+
+    /// `git diff-tree` の失敗を「変更ファイル 0 件」に畳んで黙殺しない。
+    ///
+    /// 失敗コミットは共起を 1 件も出せないまま実効分母にだけ入るため、黙っていると
+    /// 「解析できなかった」が「共変更が無かった」と区別できなくなる (診断の趣旨に反する)。
+    /// 件数と理由を診断へ載せ、`commits_analyzed` (証拠集合 |C| のサイズ) は変えない。
+    #[test]
+    fn analyze_cochange_reports_commit_scan_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+
+        for i in 0..3 {
+            commit_files(
+                repo,
+                &[
+                    ("a.rs", &format!("fn a() {{ {i} }}\n")),
+                    ("b.rs", &format!("fn b() {{ {i} }}\n")),
+                    ("sub/x.rs", &format!("fn x() {{ {i} }}\n")),
+                ],
+                &format!("pair {i}"),
+            );
+        }
+        commit_files(repo, &[("a.rs", "fn a() { 99 }\n")], "edit a");
+
+        let opts = opts_with(|o| {
+            o.source_files = vec!["a.rs".to_string()];
+            o.base = Some("HEAD~1".to_string());
+        });
+
+        // 対照ケース: 壊す前は失敗 0 件で、共変更もちゃんと出る。
+        // これが無いと「別の理由で entries が空」になったときにテストが素通りする。
+        let baseline = analyze_cochange(repo.to_str().unwrap(), &opts).unwrap();
+        assert_eq!(
+            baseline.diagnostics.commit_scan_failures, 0,
+            "健全なリポでは失敗 0 件であるべき: {:?}",
+            baseline.diagnostics
+        );
+        assert!(
+            !baseline.entries.is_empty(),
+            "対照ケースでは共変更が出るべき: {baseline:?}"
+        );
+
+        corrupt_subtree_object(repo, "HEAD~1");
+        let result = analyze_cochange(repo.to_str().unwrap(), &opts).unwrap();
+
+        assert!(
+            result.diagnostics.sources_with_blame_evidence >= 1,
+            "blame 側は成功したままでないと diff-tree 失敗の検証にならない: {:?}",
+            result.diagnostics
+        );
+        assert!(
+            result.diagnostics.commit_scan_failures > 0,
+            "diff-tree の失敗が件数として申告されるべき: {:?}",
+            result.diagnostics
+        );
+        assert!(
+            result
+                .diagnostics
+                .reasons
+                .contains(&CoChangeDiagnosticReason::CommitScanFailed),
+            "0 件の理由として CommitScanFailed が載るべき: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(
+            result.commits_analyzed, baseline.commits_analyzed,
+            "commits_analyzed は証拠集合 |C| のサイズなので失敗分は差し引かない"
+        );
+    }
+
+    /// 追加した診断フィールドは 0 のとき JSON に出さない (既存の消費側を壊さない)。
+    #[test]
+    fn commit_scan_failures_is_omitted_from_json_when_zero() {
+        let mut diag = CoChangeDiagnostics::default();
+        let json = serde_json::to_string(&diag).unwrap();
+        assert!(
+            !json.contains("commit_scan_failures"),
+            "0 のときは出力から省略されるべき: {json}"
+        );
+        diag.commit_scan_failures = 2;
+        let json = serde_json::to_string(&diag).unwrap();
+        assert!(
+            json.contains("\"commit_scan_failures\":2"),
+            "非 0 のときは出力されるべき: {json}"
         );
     }
 

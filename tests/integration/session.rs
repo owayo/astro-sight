@@ -1,0 +1,472 @@
+//! NDJSON セッションモードの統合テスト。
+
+#[allow(unused_imports)]
+use super::support::*;
+#[allow(unused_imports)]
+use std::process::{Command, Stdio};
+
+#[test]
+fn session_ndjson() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .arg("session")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn session");
+
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(stdin, r#"{{"command":"symbols","path":"src/main.rs"}}"#).unwrap();
+    writeln!(stdin, r#"{{"command":"doctor","path":"."}}"#).unwrap();
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("failed to wait");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 2, "Should have 2 NDJSON lines");
+
+    // First line should be symbols response
+    let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert!(first["symbols"].is_array());
+
+    // Second line should be doctor response
+    let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert!(second["languages"].is_array());
+}
+
+#[test]
+fn session_ndjson_calls() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .arg("session")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn session");
+
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        r#"{{"command":"calls","path":"src/main.rs","function":"main"}}"#
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        r#"{{"command":"refs","name":"AstgenResponse","dir":"src/"}}"#
+    )
+    .unwrap();
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("failed to wait");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 2, "Should have 2 NDJSON response lines");
+
+    // First: calls response (compact: grouped by caller)
+    let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert!(first["calls"].is_array());
+
+    // Second: refs response
+    let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert!(second["refs"].is_array());
+}
+
+#[test]
+fn session_rejects_invalid_workspace_env() {
+    let missing = std::env::temp_dir().join(format!(
+        "astro-sight-missing-workspace-{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("session")
+    ));
+
+    let output = cargo_bin()
+        .arg("session")
+        .env("ASTRO_SIGHT_WORKSPACE", &missing)
+        .output()
+        .expect("failed to run session");
+
+    assert!(
+        !output.status.success(),
+        "不正なワークスペース環境変数では失敗するべき"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["error"]["code"], "INVALID_REQUEST");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("ASTRO_SIGHT_WORKSPACE"),
+        "エラーに環境変数名が含まれるべき"
+    );
+}
+
+#[test]
+fn session_rejects_empty_workspace_env() {
+    let output = cargo_bin()
+        .arg("session")
+        .env("ASTRO_SIGHT_WORKSPACE", "")
+        .output()
+        .expect("failed to run session");
+
+    assert!(
+        !output.status.success(),
+        "空文字のワークスペース環境変数では失敗するべき"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["error"]["code"], "INVALID_REQUEST");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("must not be empty"),
+        "空文字は fail-closed で拒否されるべき"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn session_rejects_non_utf8_workspace_env() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let output = cargo_bin()
+        .arg("session")
+        .env("ASTRO_SIGHT_WORKSPACE", OsStr::from_bytes(&[0xff]))
+        .output()
+        .expect("failed to run session");
+
+    assert!(
+        !output.status.success(),
+        "非 UTF-8 のワークスペース環境変数では失敗するべき"
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["error"]["code"], "INVALID_REQUEST");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not valid UTF-8"),
+        "非 UTF-8 値は fail-closed で拒否されるべき"
+    );
+}
+
+#[test]
+fn session_workspace_relative_paths_are_resolved_from_workspace() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let src_dir = workspace.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(src_dir.join("lib.rs"), "pub fn workspace_symbol() {}\n").unwrap();
+
+    let mut child = cargo_bin()
+        .arg("session")
+        .env("ASTRO_SIGHT_WORKSPACE", workspace.path())
+        .current_dir(cwd.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to run session");
+
+    {
+        let stdin = child.stdin.as_mut().expect("stdin should be available");
+        writeln!(stdin, r#"{{"command":"symbols","path":"src/lib.rs"}}"#).unwrap();
+    }
+
+    let output = child.wait_with_output().expect("failed to wait session");
+    assert!(
+        output.status.success(),
+        "session should succeed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("session output should be JSON");
+    assert!(
+        json.get("error").is_none(),
+        "workspace-relative path should not error: {json}"
+    );
+    let symbols = json["symbols"]
+        .as_array()
+        .expect("symbols array is required");
+    assert!(
+        symbols.iter().any(|s| s["name"] == "workspace_symbol"),
+        "workspace relative symbols should be extracted: {json}"
+    );
+}
+
+#[test]
+fn session_ast_includes_diagnostics() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // Session の AST 応答には snippet と diagnostics が含まれる。
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .arg("session")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn session");
+
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        r#"{{"command":"ast","path":"src/lib.rs","line":0,"column":0}}"#
+    )
+    .unwrap();
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("failed to wait");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("should be valid JSON");
+    // snippet が含まれることを確認する。
+    assert!(
+        json.get("snippet").is_some(),
+        "Session AST response should include snippet field"
+    );
+    // hash も含まれることを確認する。
+    assert!(json.get("hash").is_some());
+}
+
+#[test]
+fn session_refs_requires_name_or_names() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .arg("session")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn session");
+
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(stdin, r#"{{"command":"refs","dir":"src/"}}"#).unwrap();
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("failed to wait");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let line = stdout.lines().next().expect("should have one line");
+    let json: serde_json::Value = serde_json::from_str(line).expect("invalid JSON");
+    assert_eq!(json["error"]["code"], "IO_ERROR");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("name or names is required")
+    );
+}
+
+// ---- Session 異常系テスト ----
+
+#[test]
+fn session_invalid_json_returns_error() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .arg("session")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn session");
+
+    let stdin = child.stdin.as_mut().unwrap();
+    // 不正な JSON を送信
+    writeln!(stdin, "{{this is not valid json}}").unwrap();
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("failed to wait");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("should return error JSON");
+    assert_eq!(
+        json["error"]["code"], "INVALID_REQUEST",
+        "不正な JSON は INVALID_REQUEST エラーを返すべき"
+    );
+}
+
+#[test]
+fn session_empty_input_exits_cleanly() {
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+        .arg("session")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn session");
+
+    // stdin を即閉じ（空入力）
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("failed to wait");
+    assert!(output.status.success(), "空入力で session は正常終了すべき");
+    assert!(
+        output.stdout.is_empty(),
+        "空入力で session は出力なしで終了すべき"
+    );
+}
+
+// ---- session: 複数コマンドの連続処理テスト ----
+
+#[test]
+fn session_multiple_commands() {
+    let input = r#"{"command":"doctor","path":"."}
+{"command":"symbols","path":"src/main.rs"}
+"#;
+    let output = cargo_bin()
+        .arg("session")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            child.wait_with_output()
+        })
+        .expect("failed to run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 2, "2コマンド → 2行の NDJSON 出力");
+
+    // 各行が有効な JSON であること
+    for line in &lines {
+        let _: serde_json::Value =
+            serde_json::from_str(line).expect("各行が有効な JSON であるべき");
+    }
+}
+
+#[test]
+fn session_mixed_structural_queries_preserve_order() {
+    let input = r#"{"command":"symbols","path":"src/main.rs"}
+{"command":"calls","path":"src/main.rs","function":"main"}
+{"command":"sequence","path":"src/main.rs","function":"main"}
+"#;
+    let output = cargo_bin()
+        .arg("session")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            child.wait_with_output()
+        })
+        .expect("failed to run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 3, "3コマンド → 3行の NDJSON 出力");
+
+    let symbols: serde_json::Value =
+        serde_json::from_str(lines[0]).expect("symbols response should be JSON");
+    assert!(
+        symbols["symbols"]
+            .as_array()
+            .expect("symbols should be an array")
+            .iter()
+            .any(|s| s["name"] == "main"),
+        "先頭行は src/main.rs の symbols 応答であるべき"
+    );
+
+    let calls: serde_json::Value =
+        serde_json::from_str(lines[1]).expect("calls response should be JSON");
+    assert_eq!(calls["lang"], "rust");
+    assert!(
+        calls["calls"]
+            .as_array()
+            .expect("calls should be an array")
+            .iter()
+            .any(|c| c["caller"] == "main"),
+        "2行目は main の calls 応答であるべき"
+    );
+
+    let sequence: serde_json::Value =
+        serde_json::from_str(lines[2]).expect("sequence response should be JSON");
+    assert_eq!(sequence["lang"], "rust");
+    assert!(
+        sequence["diagram"]
+            .as_str()
+            .expect("sequence diagram should be a string")
+            .starts_with("sequenceDiagram"),
+        "3行目は sequence diagram 応答であるべき"
+    );
+}
+
+#[test]
+fn session_review_command_returns_json_error() {
+    let input = r#"{"command":"review","dir":".","git":true}
+"#;
+    let output = cargo_bin()
+        .arg("session")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            child.wait_with_output()
+        })
+        .expect("failed to run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "session は非対応コマンドも JSON エラー 1 行として返す"
+    );
+    let error: serde_json::Value =
+        serde_json::from_str(lines[0]).expect("error response should be JSON");
+    assert_eq!(error["error"]["code"], "INVALID_REQUEST");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .expect("message should be a string")
+            .contains("unknown variant `review`"),
+        "review が session 非対応であることを明示すべき: {error}"
+    );
+}

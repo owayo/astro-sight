@@ -89,6 +89,8 @@ pub enum CoChangeDiagnosticReason {
     BelowMinScore,
     /// git コマンドが失敗した (証拠なしと区別する)。
     GitCommandFailed,
+    /// 証拠コミットの `git diff-tree` に失敗し、そのコミットの共変更を数えられなかった。
+    CommitScanFailed,
     /// 起点ファイル数が `max_source_files` を超えたため解析をスキップした。
     /// review 経路では起点過多 (退化した作業ツリー等) で cochange フェーズだけを
     /// 諦め、impact / API 差分 / dead 検出は継続する。
@@ -123,6 +125,15 @@ pub struct CoChangeDiagnostics {
     pub filtered_min_score: usize,
     /// `per_source_limit` で切り捨てた候補ペア数。
     pub truncated_per_source_limit: usize,
+    /// 証拠コミットのうち `git diff-tree` に失敗して変更ファイルを取得できなかった数。
+    ///
+    /// 失敗コミットは「変更 0 件のコミット」として集計を続行する (= confidence の実効分母
+    /// には入るが共起は 1 件も数えられない) ため、黙っていると「共変更が無かった」と
+    /// 区別できない。`commits_analyzed` は証拠集合 |C| のサイズなのでこの分は引かれない。
+    ///
+    /// 追加専用フィールドのため 0 のときは出力しない (既存 JSON 消費側への影響を避ける)。
+    #[serde(default, skip_serializing_if = "crate::models::review::is_zero_usize")]
+    pub commit_scan_failures: usize,
     /// 0 件 / 少数になった理由 (ソート済み・重複なし)。
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub reasons: Vec<CoChangeDiagnosticReason>,

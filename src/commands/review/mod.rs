@@ -6,7 +6,7 @@ use crate::models::review::{ApiSymbol, DeadSymbol, ReviewResult};
 use crate::models::skip::SkipInfo;
 use crate::service::AppService;
 
-use super::api_changes::{detect_api_changes, detect_missing_cochanges};
+use super::api_changes::detect_api_changes;
 use super::common::{
     MAX_INPUT_SIZE, log_phase, read_to_string_limited, serialize_output, timed, timed_ok,
 };
@@ -17,8 +17,10 @@ use super::dead_code::{
 };
 use super::git_input::{DiffSourceResolution, resolve_diff_source};
 use hook::review_hook_output;
+use missing_cochange::detect_missing_cochanges;
 
 pub mod hook;
+pub(crate) mod missing_cochange;
 
 // ---------------------------------------------------------------------------
 // Review コマンド: impact / cochange / API surface diff / dead symbol 統合
