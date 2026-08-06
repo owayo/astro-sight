@@ -5,7 +5,7 @@ use crate::engine::parser;
 use crate::language::LangId;
 
 use super::{
-    DuplicateSetResult, MemberCandidate, MemberStatus, collect_source_files, is_class_member_kind,
+    MemberCandidate, MemberStatus, SetAccum, collect_source_files, is_class_member_kind,
     status_from_counts,
 };
 
@@ -28,7 +28,7 @@ impl PhpMemberLiveness {
         is_test_path: F,
     ) -> Self
     where
-        F: Fn(&Path) -> bool,
+        F: Fn(&Path) -> bool + Sync,
     {
         let mut statuses: HashMap<(String, String, String), MemberStatus> = HashMap::new();
         let php_members = collect_php_member_candidates(candidates);
@@ -46,40 +46,42 @@ impl PhpMemberLiveness {
         };
         let trait_uses = collect_php_trait_uses(&php_files);
 
-        for (bare_key, members) in &bare_to_members {
-            let owners: HashSet<String> = members.iter().map(|m| php_fold_name(&m.owner)).collect();
-            if owners.len() < 2 {
-                continue;
-            }
-            let analysis = analyze_php_duplicate_set(
-                bare_key,
-                &owners,
-                &php_files,
-                &trait_uses,
-                &is_test_path,
-            );
-
-            match analysis {
-                DuplicateSetResult::Ambiguous => {
-                    for m in members {
-                        statuses.insert(
-                            (
-                                m.file.clone(),
-                                php_fold_name(&m.owner),
-                                php_fold_name(&m.bare),
-                            ),
-                            MemberStatus::Ambiguous,
-                        );
-                    }
+        // duplicate set を先に確定し、ファイル毎に 1 回だけ read + parse して全 set を
+        // まとめて解析する (ループ反転、js_ts 側と同じ構成)。旧実装は set 毎に全 PHP
+        // ファイルを read + parse しており、set 数 × ファイル数の再パースになっていた。
+        let sets: Vec<(&str, HashSet<String>)> = bare_to_members
+            .iter()
+            .filter_map(|(bare_key, members)| {
+                let owners: HashSet<String> =
+                    members.iter().map(|m| php_fold_name(&m.owner)).collect();
+                if owners.len() < 2 {
+                    return None;
                 }
-                DuplicateSetResult::Counted(counts) => {
-                    for m in members {
-                        let owner_key = php_fold_name(&m.owner);
-                        let (prod, tst) = counts.get(&owner_key).copied().unwrap_or((0, 0));
-                        let status = status_from_counts(prod, tst);
-                        statuses
-                            .insert((m.file.clone(), owner_key, php_fold_name(&m.bare)), status);
-                    }
+                Some((bare_key.as_str(), owners))
+            })
+            .collect();
+
+        let accums = analyze_php_sets_over_files(&sets, &php_files, &trait_uses, &is_test_path);
+
+        for ((bare_key, _owners), accum) in sets.iter().zip(accums) {
+            let members = &bare_to_members[*bare_key];
+            if accum.ambiguous {
+                for m in members {
+                    statuses.insert(
+                        (
+                            m.file.clone(),
+                            php_fold_name(&m.owner),
+                            php_fold_name(&m.bare),
+                        ),
+                        MemberStatus::Ambiguous,
+                    );
+                }
+            } else {
+                for m in members {
+                    let owner_key = php_fold_name(&m.owner);
+                    let (prod, tst) = accum.counts.get(&owner_key).copied().unwrap_or((0, 0));
+                    let status = status_from_counts(prod, tst);
+                    statuses.insert((m.file.clone(), owner_key, php_fold_name(&m.bare)), status);
                 }
             }
         }
@@ -167,20 +169,65 @@ struct PhpTraitUses {
 /// 同名 owner の複数宣言や parse 不能な use は dispatch 先を一意に決められないため、
 /// 後段で `Ambiguous` に倒す情報として保持する。
 fn collect_php_trait_uses(files: &[std::path::PathBuf]) -> HashMap<String, PhpTraitUses> {
+    use rayon::prelude::*;
+
+    // ファイル毎の収集は独立なので並列化する。owner 重複時のマージ規則
+    // (`merge_php_trait_use_entry`) が逐次実装と同じくファイル順で適用されるよう、
+    // 順序保存の collect 後に入力順で統合する。
+    let per_file: Vec<HashMap<String, PhpTraitUses>> = files
+        .par_iter()
+        .map(|file_path| {
+            let mut uses_in_file = HashMap::new();
+            let Some(path) = file_path.to_str() else {
+                return uses_in_file;
+            };
+            let Ok(source) = parser::read_file(camino::Utf8Path::new(path)) else {
+                return uses_in_file;
+            };
+            let Ok(tree) = parser::parse_source(&source, LangId::Php) else {
+                return uses_in_file;
+            };
+            collect_php_trait_uses_from_node(
+                tree.root_node(),
+                source.as_bytes(),
+                &mut uses_in_file,
+            );
+            uses_in_file
+        })
+        .collect();
+
     let mut uses_by_owner = HashMap::new();
-    for file_path in files {
-        let Some(path) = file_path.to_str() else {
-            continue;
-        };
-        let Ok(source) = parser::read_file(camino::Utf8Path::new(path)) else {
-            continue;
-        };
-        let Ok(tree) = parser::parse_source(&source, LangId::Php) else {
-            continue;
-        };
-        collect_php_trait_uses_from_node(tree.root_node(), source.as_bytes(), &mut uses_by_owner);
+    for file_map in per_file {
+        for (owner, collected) in file_map {
+            merge_php_trait_use_entry(&mut uses_by_owner, owner, collected);
+        }
     }
     uses_by_owner
+}
+
+/// owner 単位の trait use 情報をマージ規則付きで登録する。
+/// 同名 owner の再定義 (同一ファイル内・ファイル間とも) は traits を合算し、
+/// declared_methods は先着を保持したまま ambiguous に倒す。
+fn merge_php_trait_use_entry(
+    uses_by_owner: &mut HashMap<String, PhpTraitUses>,
+    owner: String,
+    collected: PhpTraitUses,
+) {
+    if collected.traits.is_empty() && !collected.has_adaptation && !collected.ambiguous {
+        return;
+    }
+    use std::collections::hash_map::Entry;
+    match uses_by_owner.entry(owner) {
+        Entry::Vacant(entry) => {
+            entry.insert(collected);
+        }
+        Entry::Occupied(mut entry) => {
+            let existing = entry.get_mut();
+            existing.traits.extend(collected.traits);
+            existing.has_adaptation |= collected.has_adaptation;
+            existing.ambiguous = true;
+        }
+    }
 }
 
 fn collect_php_trait_uses_from_node(
@@ -236,20 +283,7 @@ fn collect_php_trait_uses_from_node(
                 }
             }
         }
-        if !collected.traits.is_empty() || collected.has_adaptation || collected.ambiguous {
-            use std::collections::hash_map::Entry;
-            match uses_by_owner.entry(owner) {
-                Entry::Vacant(entry) => {
-                    entry.insert(collected);
-                }
-                Entry::Occupied(mut entry) => {
-                    let existing = entry.get_mut();
-                    existing.traits.extend(collected.traits);
-                    existing.has_adaptation |= collected.has_adaptation;
-                    existing.ambiguous = true;
-                }
-            }
-        }
+        merge_php_trait_use_entry(uses_by_owner, owner, collected);
     }
 
     let mut cursor = node.walk();
@@ -258,41 +292,94 @@ fn collect_php_trait_uses_from_node(
     }
 }
 
-fn analyze_php_duplicate_set<F>(
-    bare_key: &str,
-    owners: &HashSet<String>,
+/// 全 duplicate set を、ファイル毎 1 回の read + parse で並列に集計する。
+///
+/// 旧 `analyze_php_duplicate_set` は set 毎に全ファイルを read + parse していた。
+/// ループを反転し、1 ファイルを 1 回だけ parse + alias 収集して出現する全 set を解析
+/// する。旧実装の「ambiguous 確定後は残りファイルを見ない」短絡は worker 局所の
+/// ambiguous フラグでファイル単位に再現する (結果は同一で走査量だけ最大 worker 数分
+/// 増える)。集計は可換なので rayon の fold/reduce 順に依らず結果は決定的。
+fn analyze_php_sets_over_files<F>(
+    sets: &[(&str, HashSet<String>)],
     files: &[std::path::PathBuf],
     trait_uses: &HashMap<String, PhpTraitUses>,
-    is_test_path: F,
-) -> DuplicateSetResult
+    is_test_path: &F,
+) -> Vec<SetAccum>
 where
+    F: Fn(&Path) -> bool + Sync,
+{
+    use rayon::prelude::*;
+
+    if sets.is_empty() {
+        return Vec::new();
+    }
+
+    files
+        .par_iter()
+        .fold(
+            || vec![SetAccum::default(); sets.len()],
+            |mut acc, file_path| {
+                analyze_php_file_into(sets, file_path, trait_uses, is_test_path, &mut acc);
+                acc
+            },
+        )
+        .reduce(
+            || vec![SetAccum::default(); sets.len()],
+            |mut merged, local| {
+                for (m, l) in merged.iter_mut().zip(local) {
+                    m.merge(l);
+                }
+                merged
+            },
+        )
+}
+
+/// 1 ファイルを解析して該当する全 set の accum を更新する。parse と alias 収集は
+/// 最初に必要になった set の時点で 1 回だけ行い、以降の set は同じ結果を使い回す。
+fn analyze_php_file_into<F>(
+    sets: &[(&str, HashSet<String>)],
+    file_path: &Path,
+    trait_uses: &HashMap<String, PhpTraitUses>,
+    is_test_path: &F,
+    acc: &mut [SetAccum],
+) where
     F: Fn(&Path) -> bool,
 {
-    let mut counts: HashMap<String, (usize, usize)> = HashMap::new();
+    let Some(path_str) = file_path.to_str() else {
+        return;
+    };
+    let Ok(source) = parser::read_file(camino::Utf8Path::new(path_str)) else {
+        return;
+    };
 
-    for file_path in files {
-        let utf8 = match file_path.to_str() {
-            Some(s) => camino::Utf8Path::new(s),
-            None => continue,
-        };
-        let source = match parser::read_file(utf8) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+    let mut parsed: Option<Option<(tree_sitter::Tree, PhpFileAliases)>> = None;
+    let mut is_test: Option<bool> = None;
+
+    for ((bare_key, owners), set_acc) in sets.iter().zip(acc.iter_mut()) {
+        // この worker で既に ambiguous 確定した set は解析しない (sticky のため結果不変)。
+        if set_acc.ambiguous {
+            continue;
+        }
         // `__construct` set の参照源は `new Foo()` で、ソースに `__construct` 文字列が
         // 現れないため bare 名の prefilter では素通りできない。`new` を含むファイルも
         // parse 対象に残す (過剰マッチは parse が走るだけで無害)。
         if !contains_ascii_case_insensitive(source.as_bytes(), bare_key.as_bytes())
-            && !(bare_key == "__construct"
+            && !(*bare_key == "__construct"
                 && contains_ascii_case_insensitive(source.as_bytes(), b"new"))
         {
             continue;
         }
-        let tree = match parser::parse_source(&source, LangId::Php) {
-            Ok(t) => t,
-            Err(_) => continue,
+        let file_parse = parsed.get_or_insert_with(|| {
+            parser::parse_source(&source, LangId::Php).ok().map(|tree| {
+                let aliases = collect_php_file_aliases(tree.root_node(), source.as_bytes());
+                (tree, aliases)
+            })
+        });
+        let Some((tree, aliases)) = file_parse else {
+            // parse 失敗は 1 回で確定し、旧実装の per-set continue と同じく
+            // このファイル全体をスキップする。
+            return;
         };
-        let aliases = collect_php_file_aliases(tree.root_node(), source.as_bytes());
         let mut analysis = PhpFileAnalysis::default();
         visit_php_node(
             tree.root_node(),
@@ -301,18 +388,19 @@ where
             bare_key,
             None,
             trait_uses,
-            &aliases,
+            aliases,
             &mut analysis,
         );
         if analysis.ambiguous {
-            return DuplicateSetResult::Ambiguous;
+            set_acc.ambiguous = true;
+            continue;
         }
         if analysis.scoped_counts.is_empty() {
             continue;
         }
-        let is_test = is_test_path(file_path.as_path());
+        let is_test = *is_test.get_or_insert_with(|| is_test_path(file_path));
         for (owner, count) in analysis.scoped_counts {
-            let entry = counts.entry(owner).or_insert((0, 0));
+            let entry = set_acc.counts.entry(owner).or_insert((0, 0));
             if is_test {
                 entry.1 = entry.1.saturating_add(count);
             } else {
@@ -320,8 +408,6 @@ where
             }
         }
     }
-
-    DuplicateSetResult::Counted(counts)
 }
 
 #[derive(Default)]

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Node, Query, QueryCursor};
+use tree_sitter::{Node, QueryCursor};
 
 use crate::language::LangId;
 use crate::models::lint::{PatternMatch, Rule};
@@ -49,7 +49,6 @@ pub fn lint_file(
     rules: &[Rule],
 ) -> Result<(Vec<PatternMatch>, Vec<String>)> {
     let lang_name = lang_id.to_string();
-    let language = lang_id.ts_language();
     let mut matches = Vec::new();
     let mut warnings = Vec::new();
 
@@ -76,7 +75,7 @@ pub fn lint_file(
 
         if let Some(query_src) = &rule.query {
             // モード 1: tree-sitter クエリ
-            match Query::new(&language, query_src) {
+            match crate::engine::query_cache::cached_query(lang_id, query_src) {
                 Ok(query) => {
                     let mut cursor = QueryCursor::new();
                     let mut query_matches = cursor.matches(&query, root, source);

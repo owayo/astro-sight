@@ -12,11 +12,12 @@ INSTALL_PATH := /usr/local/bin
 # rustc の aarch64-apple-darwin デフォルト (11.0) と齟齬になり linker が警告を出す。
 export MACOSX_DEPLOYMENT_TARGET ?= 11.0
 
-# macOS: GNU ar を使用（Xcode の ar は -D フラグ非対応で warning が出る）
-AR_GNU := $(wildcard /opt/homebrew/opt/binutils/bin/ar)
-ifdef AR_GNU
-export AR := $(AR_GNU)
-endif
+# macOS: ar は Apple 純正 (/usr/bin/ar) を使う。以前は -D フラグ warning 回避のため
+# GNU binutils の ar を export していたが、GNU ar 2.46 が生成する静的アーカイブを
+# 新しい Apple ld (ld-1267 以降) が「member not 8-byte aligned」で拒否し、
+# make 経由のリンクが全滅する。また AR は cc crate のビルド指紋に入るため、
+# make (GNU ar) と素の cargo (Apple ar) で build script の再実行がピンポンする
+# 副作用もあった。warning 回避より実害が大きいため override を撤去。
 
 ## Build Commands
 

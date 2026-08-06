@@ -269,9 +269,10 @@ public function routes(): void {
         let utf8_path = camino::Utf8Path::from_path(&path).expect("utf-8 path");
         let name_vec: Vec<String> = names.iter().map(|s| s.to_string()).collect();
         let ac = build_ac_case_insensitive(&name_vec).unwrap();
+        let acs = vec![(0usize, ac.clone())];
 
         // 経路 B: batch Vec
-        let batch = find_refs_batch_in_file_indexed(&name_vec, &ac, utf8_path).unwrap();
+        let batch = find_refs_batch_in_file_indexed(&name_vec, &acs, utf8_path).unwrap();
 
         // 経路 C: callback (index 別に (line, column, is_def) を収集)
         struct Rec {
@@ -288,11 +289,12 @@ public function routes(): void {
         visit_refs_and_defs_in_file_cb(&name_vec, &ac, utf8_path, &mut rec).unwrap();
 
         // 経路 D: count (非 Definition のみ)
-        let counts = count_refs_in_file(&name_vec, &ac, utf8_path).unwrap();
+        let counts = count_refs_in_file(&name_vec, &acs, utf8_path).unwrap();
 
         for (ix, name) in name_vec.iter().enumerate() {
             // 経路 A: single
-            let single = find_refs_in_file(name, utf8_path).unwrap();
+            let prefilter = SingleNamePrefilter::new(name).unwrap();
+            let single = find_refs_in_file(name, utf8_path, &prefilter).unwrap();
 
             // A == B: (行, 列, 種別, context) 列が完全一致
             let a_key: Vec<_> = single

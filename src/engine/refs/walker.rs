@@ -398,9 +398,9 @@ fn emit_synthetic_hit<M: RefMatcher, S: RawRefSink>(
     }
 }
 
-/// 統合参照ウォーカー。各ノードで「identifier → 5 種 synthetic 源 → 子」の順に
-/// 走査し、一致するたび `sink.on_hit` を呼ぶ。DFS 順は旧 4 walker と同一。
-fn walk_refs<M: RefMatcher, S: RawRefSink>(
+/// 1 ノード分の参照判定。「identifier → 5 種 synthetic 源」の順に照合し、
+/// 一致するたび `sink.on_hit` を呼ぶ。
+fn visit_ref_node<M: RefMatcher, S: RawRefSink>(
     node: Node<'_>,
     matcher: &M,
     sink: &mut S,
@@ -457,11 +457,39 @@ fn walk_refs<M: RefMatcher, S: RawRefSink>(
     if let Some((method, row, col)) = php_string_callable_method_segment(node, source, lang_id) {
         emit_synthetic_hit(method, row, col, matcher, sink, env);
     }
+}
 
-    // (7) 子ノードへ再帰
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk_refs(child, matcher, sink, env, definition_kinds);
+/// 統合参照ウォーカー。単一 TreeCursor の反復 pre-order 走査で全ノードを
+/// `visit_ref_node` に通す。訪問順 (親 → 子を宣言順) は旧再帰実装と同一。
+///
+/// 旧実装はノード毎に `node.walk()` で TreeCursor を C 側 malloc しており、
+/// ノード数分の確保/解放と再帰の呼び出しオーバーヘッドが積み上がっていた。
+/// depth ガードにより、subtree root で呼ばれても root の兄弟ノードへは進まない。
+fn walk_refs<M: RefMatcher, S: RawRefSink>(
+    root: Node<'_>,
+    matcher: &M,
+    sink: &mut S,
+    env: &RefEnvironment<'_>,
+    definition_kinds: &[&str],
+) {
+    let mut cursor = root.walk();
+    let mut depth = 0usize;
+    loop {
+        visit_ref_node(cursor.node(), matcher, sink, env, definition_kinds);
+        if cursor.goto_first_child() {
+            depth += 1;
+            continue;
+        }
+        loop {
+            if depth == 0 {
+                return;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            cursor.goto_parent();
+            depth -= 1;
+        }
     }
 }
 

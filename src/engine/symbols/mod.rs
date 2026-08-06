@@ -1,6 +1,6 @@
 use anyhow::Result;
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Node, Query, QueryCursor};
+use tree_sitter::{Node, QueryCursor};
 
 use crate::language::LangId;
 use crate::models::location::Range;
@@ -117,8 +117,7 @@ pub fn extract_symbols_with_custom_query(
 ) -> Result<Vec<Symbol>> {
     use crate::error::{AstroError, ErrorCode};
 
-    let language = lang_id.ts_language();
-    let query = Query::new(&language, custom_query).map_err(|e| {
+    let query = crate::engine::query_cache::cached_query(lang_id, custom_query).map_err(|e| {
         AstroError::new(
             ErrorCode::InvalidRequest,
             format!("invalid --query for {lang_id}: {e}"),
@@ -157,8 +156,7 @@ fn run_symbol_query(
     lang_id: LangId,
     query_src: &str,
 ) -> Result<Vec<Symbol>> {
-    let language = lang_id.ts_language();
-    let query = Query::new(&language, query_src)?;
+    let query = crate::engine::query_cache::cached_query(lang_id, query_src)?;
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, root, source);
 

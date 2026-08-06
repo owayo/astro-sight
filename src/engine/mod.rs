@@ -13,6 +13,7 @@ pub mod lexer;
 pub mod lint;
 pub mod parser;
 pub mod phpunit_refs;
+pub mod query_cache;
 pub mod refs;
 pub mod sequence;
 pub mod snippet;

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::collections::HashSet;
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Node, Query, QueryCursor};
+use tree_sitter::{Node, QueryCursor};
 
 use crate::language::LangId;
 use crate::models::call::{CallEdge, CallEndpoint, CallSite};
@@ -20,8 +20,7 @@ pub fn extract_calls(
         return Ok(Vec::new());
     }
 
-    let language = lang_id.ts_language();
-    let query = Query::new(&language, query_src)?;
+    let query = crate::engine::query_cache::cached_query(lang_id, query_src)?;
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, root, source);
 
@@ -87,8 +86,7 @@ pub fn extract_all_callees(
         return Ok(HashSet::new());
     }
 
-    let language = lang_id.ts_language();
-    let query = Query::new(&language, query_src)?;
+    let query = crate::engine::query_cache::cached_query(lang_id, query_src)?;
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, root, source);
 

@@ -2,13 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Query, QueryCursor};
+use tree_sitter::QueryCursor;
 
 use crate::engine::parser;
 use crate::language::LangId;
 
 use super::{
-    DuplicateSetResult, MemberCandidate, MemberStatus, collect_source_files, is_class_member_kind,
+    MemberCandidate, MemberStatus, SetAccum, collect_source_files, is_class_member_kind,
     status_from_counts,
 };
 
@@ -36,7 +36,7 @@ impl JsTsMemberLiveness {
         is_test_path: F,
     ) -> Self
     where
-        F: Fn(&Path) -> bool,
+        F: Fn(&Path) -> bool + Sync,
     {
         let mut statuses: HashMap<(String, String, String), MemberStatus> = HashMap::new();
 
@@ -98,37 +98,52 @@ impl JsTsMemberLiveness {
             })
             .collect();
 
-        // Step 4: 各 duplicate set ごとに解析。
-        for (bare, members) in &bare_to_members {
-            // 同 owner で同 member 名を 2 回 export するケースは通常ないため、
-            // owner 単位の uniq に正規化する。
-            let owners: HashSet<&str> = members.iter().map(|m| m.owner.as_str()).collect();
-            if owners.len() < 2 {
-                // duplicate owner でない場合は対象外 (`name_counts > 1` も発生しない想定だが、
-                // 同じ owner が複数ファイルに同名 export を持つ稀ケースは旧スキップに任せる)。
-                continue;
-            }
-
-            let analysis = analyze_duplicate_set(bare, &owners, &ts_js_files, &is_test_path);
-
-            match analysis {
-                DuplicateSetResult::Ambiguous => {
-                    for m in members {
-                        statuses.insert(
-                            (m.file.clone(), m.owner.clone(), (*bare).to_string()),
-                            MemberStatus::Ambiguous,
-                        );
-                    }
+        // Step 4: duplicate set を先に確定し、ファイル毎に 1 回だけ read + parse して
+        // 全 set をまとめて解析する (ループ反転)。旧実装は set 毎に全 TS/JS ファイルを
+        // read + parse + クエリ実行しており、set 数 × ファイル数の再パースが dead-code
+        // 全体の支配的コストだった。ファイル間の集計は可換 (counts の加算 / ambiguous の
+        // OR) なので rayon 並列でも結果は入力順に依存しない。
+        let sets: Vec<(&str, Vec<&str>)> = bare_to_members
+            .iter()
+            .filter_map(|(bare, members)| {
+                // 同 owner で同 member 名を 2 回 export するケースは通常ないため、
+                // owner 単位の uniq に正規化する。
+                let owners: HashSet<&str> = members.iter().map(|m| m.owner.as_str()).collect();
+                if owners.len() < 2 {
+                    // duplicate owner でない場合は対象外 (`name_counts > 1` も発生しない
+                    // 想定だが、同じ owner が複数ファイルに同名 export を持つ稀ケースは
+                    // 旧スキップに任せる)。
+                    return None;
                 }
-                DuplicateSetResult::Counted(counts) => {
-                    for m in members {
-                        let (prod, tst) = counts.get(m.owner.as_str()).copied().unwrap_or((0, 0));
-                        let status = status_from_counts(prod, tst);
-                        statuses.insert(
-                            (m.file.clone(), m.owner.clone(), (*bare).to_string()),
-                            status,
-                        );
-                    }
+                let mut owners: Vec<&str> = owners.into_iter().collect();
+                owners.sort_unstable();
+                Some((*bare, owners))
+            })
+            .collect();
+
+        let accums = analyze_sets_over_files(&sets, &ts_js_files, &is_test_path);
+
+        for ((bare, _owners), accum) in sets.iter().zip(accums) {
+            let members = &bare_to_members[bare];
+            if accum.ambiguous {
+                for m in members {
+                    statuses.insert(
+                        (m.file.clone(), m.owner.clone(), (*bare).to_string()),
+                        MemberStatus::Ambiguous,
+                    );
+                }
+            } else {
+                for m in members {
+                    let (prod, tst) = accum
+                        .counts
+                        .get(m.owner.as_str())
+                        .copied()
+                        .unwrap_or((0, 0));
+                    let status = status_from_counts(prod, tst);
+                    statuses.insert(
+                        (m.file.clone(), m.owner.clone(), (*bare).to_string()),
+                        status,
+                    );
                 }
             }
         }
@@ -144,28 +159,76 @@ impl JsTsMemberLiveness {
     }
 }
 
-fn analyze_duplicate_set<F>(
-    bare: &str,
-    owners: &HashSet<&str>,
+/// 全 duplicate set を、ファイル毎 1 回の read + parse で並列に集計する。
+///
+/// 旧 `analyze_duplicate_set` は set 毎に全ファイルを read + parse していた
+/// (set 数 × ファイル数の再パース)。本関数はループを反転し、1 ファイルを 1 回だけ
+/// parse して出現する全 set を解析する。ambiguous の OR と counts の加算は可換なので、
+/// rayon の fold/reduce 順に依らず結果は決定的。旧実装の「ambiguous 確定後は残り
+/// ファイルを見ない」短絡は、worker 局所の ambiguous フラグでファイル単位に再現する
+/// (worker を跨ぐ短絡はしないが、結果は同一で走査量だけ最大 worker 数分増える)。
+fn analyze_sets_over_files<F>(
+    sets: &[(&str, Vec<&str>)],
     files: &[(std::path::PathBuf, LangId)],
-    is_test_path: F,
-) -> DuplicateSetResult
+    is_test_path: &F,
+) -> Vec<SetAccum>
 where
+    F: Fn(&Path) -> bool + Sync,
+{
+    use rayon::prelude::*;
+
+    if sets.is_empty() {
+        return Vec::new();
+    }
+
+    files
+        .par_iter()
+        .fold(
+            || vec![SetAccum::default(); sets.len()],
+            |mut acc, (file_path, lang)| {
+                analyze_one_file_into(sets, file_path, *lang, is_test_path, &mut acc);
+                acc
+            },
+        )
+        .reduce(
+            || vec![SetAccum::default(); sets.len()],
+            |mut merged, local| {
+                for (m, l) in merged.iter_mut().zip(local) {
+                    m.merge(l);
+                }
+                merged
+            },
+        )
+}
+
+/// 1 ファイルを解析して該当する全 set の accum を更新する。parse は最初に必要になった
+/// set の時点で 1 回だけ行い、以降の set は同じ tree を使い回す。
+fn analyze_one_file_into<F>(
+    sets: &[(&str, Vec<&str>)],
+    file_path: &Path,
+    lang: LangId,
+    is_test_path: &F,
+    acc: &mut [SetAccum],
+) where
     F: Fn(&Path) -> bool,
 {
-    let mut counts: HashMap<String, (usize, usize)> = HashMap::new();
-    let owners_vec: Vec<&str> = owners.iter().copied().collect();
+    let Some(path_str) = file_path.to_str() else {
+        return;
+    };
+    let Ok(source) = parser::read_file(camino::Utf8Path::new(path_str)) else {
+        return;
+    };
 
-    for (file_path, lang) in files {
-        let utf8 = match file_path.to_str() {
-            Some(s) => camino::Utf8Path::new(s),
-            None => continue,
-        };
-        let source = match parser::read_file(utf8) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+    // parse は該当 set が 1 つでもあるときに 1 回だけ。失敗も 1 回で確定させ、
+    // 以降の set は旧実装の per-set continue と同じくこのファイルをスキップする。
+    let mut parsed: Option<Option<tree_sitter::Tree>> = None;
+    let mut is_test: Option<bool> = None;
 
+    for ((bare, owners), set_acc) in sets.iter().zip(acc.iter_mut()) {
+        // この worker で既に ambiguous 確定した set は解析しない (sticky のため結果不変)。
+        if set_acc.ambiguous {
+            continue;
+        }
         // バイトレベルで bare member が含まれないファイルは parse skip (高速化)。
         if memchr::memmem::find(source.as_bytes(), bare.as_bytes()).is_none() {
             continue;
@@ -173,35 +236,31 @@ where
 
         // ambiguous source の早期検出 (string literal / computed access)。
         if contains_ambiguous_member_token(source.as_bytes(), bare) {
-            return DuplicateSetResult::Ambiguous;
+            set_acc.ambiguous = true;
+            continue;
         }
 
-        let tree = match parser::parse_source(&source, *lang) {
-            Ok(t) => t,
-            Err(_) => continue,
+        let tree = parsed.get_or_insert_with(|| parser::parse_source(&source, lang).ok());
+        let Some(tree) = tree else {
+            return;
         };
 
-        let analysis = analyze_file(
-            tree.root_node(),
-            source.as_bytes(),
-            &owners_vec,
-            bare,
-            *lang,
-        );
+        let analysis = analyze_file(tree.root_node(), source.as_bytes(), owners, bare, lang);
 
         // receiver を owner へ静的に辿れない access (factory / DI / 関数戻り値・
         // 引数経由のインスタンス等) が 1 件でもあれば、票の行き先を import 有無で
         // 推測せず duplicate set 全体を Ambiguous に倒す (旧スキップへフォールバック)。
         if analysis.has_unresolved_access {
-            return DuplicateSetResult::Ambiguous;
+            set_acc.ambiguous = true;
+            continue;
         }
         if analysis.resolved_counts.is_empty() {
             continue;
         }
 
-        let is_test = is_test_path(file_path.as_path());
+        let is_test = *is_test.get_or_insert_with(|| is_test_path(file_path));
         for (owner, count) in analysis.resolved_counts {
-            let entry = counts.entry(owner).or_insert((0, 0));
+            let entry = set_acc.counts.entry(owner).or_insert((0, 0));
             if is_test {
                 entry.1 = entry.1.saturating_add(count);
             } else {
@@ -209,8 +268,6 @@ where
             }
         }
     }
-
-    DuplicateSetResult::Counted(counts)
 }
 
 /// ファイル内 1 つの bare member について receiver 解決済み access を集計する。
@@ -252,8 +309,8 @@ fn analyze_file(
     //    存在だけでファイル全体を Ambiguous にはしない (対象 member への access が
     //    無いファイルまで巻き込むのを避ける)。
     let mut local_to_owner: HashMap<String, String> = HashMap::new();
-    if let Some(language) = ts_language_for(lang)
-        && let Ok(query) = Query::new(&language, IMPORT_QUERY)
+    if ts_language_for(lang).is_some()
+        && let Ok(query) = crate::engine::query_cache::cached_query(lang, IMPORT_QUERY)
     {
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&query, root, source);
@@ -297,8 +354,8 @@ fn analyze_file(
     );
 
     // 3. `obj.member` / `obj?.member` の receiver を分類して票を入れる。
-    if let Some(language) = ts_language_for(lang)
-        && let Ok(query) = Query::new(&language, MEMBER_ACCESS_QUERY)
+    if ts_language_for(lang).is_some()
+        && let Ok(query) = crate::engine::query_cache::cached_query(lang, MEMBER_ACCESS_QUERY)
     {
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&query, root, source);

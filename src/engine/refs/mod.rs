@@ -37,22 +37,24 @@ use walker::{
 
 /// `find_references` / `find_references_batch` 用の最大並列ワーカー数。
 ///
-/// 数万ファイル級の大規模リポジトリでは rayon fold バケットがワーカー数に比例して
-/// `Vec<SymbolReference>` を抱えるため、物理コア数をそのまま使うと RSS が線形に膨張し
-/// OOM を招く。`ASTRO_SIGHT_BATCH_WORKERS` で上書き可能。
+/// 既定は available_parallelism (取得不能時 4)。旧実装は fold バケットと chunk 毎の
+/// AC trie のピーク RSS を抑えるため 4 固定だったが、AC を単一化してファイル走査を
+/// 1 回に集約した現構成では worker 毎の保持は fold バケットだけで、コア数分並列でも
+/// RSS は問題にならない。低メモリ環境向けに `ASTRO_SIGHT_BATCH_WORKERS` で上書き可能。
 fn bounded_worker_count() -> usize {
     std::env::var("ASTRO_SIGHT_BATCH_WORKERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(4)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        })
 }
 
-/// `find_references` / `find_references_batch` 共通の上限付き rayon プールを構築する。
-///
-/// ワーカー毎に fold バケット (`Vec<SymbolReference>` / `Vec<Vec<SymbolReference>>`) を
-/// 抱えるため、物理コア数をそのまま使うと大規模リポで RSS が線形に膨張し OOM を招く。
-/// 物理コア数と `bounded_worker_count()` の小さい方でワーカー数を制限する。
+/// `find_references` / `find_references_batch` 共通の rayon プールを構築する。
+/// ワーカー数は物理コア数と `bounded_worker_count()` の小さい方。
 fn build_bounded_pool() -> Result<rayon::ThreadPool> {
     let worker_limit = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -64,16 +66,37 @@ fn build_bounded_pool() -> Result<rayon::ThreadPool> {
         .map_err(|e| anyhow::anyhow!("Failed to build rayon pool: {e}"))
 }
 
-/// `find_references_batch` の内部 chunk サイズ。既定 64。
-/// AC trie はパターン数に対して非線形にメモリを使い、fold バケットも名前数分
-/// 確保されるため、名前を chunk 分割して trie / バケットを chunk サイズで上限する。
-/// `ASTRO_SIGHT_REFS_BATCH_CHUNK` で上書き可能。
-fn refs_batch_chunk_size() -> usize {
+/// 1 つの AC オートマトンに載せる最大パターン数。既定 100,000。
+///
+/// aho-corasick 1.1 の AC trie はパターン数にほぼ線形で、実測 5 万パターン ≈ 8MB /
+/// 20 万パターン ≈ 30MB (`ascii_case_insensitive` 込み)。通常入力は 1 個の AC に収まり、
+/// この上限を超える病的な入力だけ AC を分割してビルドメモリを上限化する。分割しても
+/// ファイル走査と parse は 1 回のまま (旧実装のような chunk 毎の全リポ再走査はしない)。
+/// `ASTRO_SIGHT_REFS_BATCH_CHUNK` で上書き可能 (旧 chunk 設定との後方互換)。
+fn refs_ac_split_size() -> usize {
     std::env::var("ASTRO_SIGHT_REFS_BATCH_CHUNK")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(64)
+        .unwrap_or(100_000)
+}
+
+/// バッチ検索用の AC 群を構築する。返り値は (グローバル index オフセット, AC) の列で、
+/// パターン数が `refs_ac_split_size()` 以下なら常に 1 要素。
+fn build_batch_acs(symbol_names: &[String]) -> Result<Vec<(usize, aho_corasick::AhoCorasick)>> {
+    let split = refs_ac_split_size();
+    let mut acs = Vec::with_capacity(symbol_names.len().div_ceil(split));
+    for (chunk_ix, chunk) in symbol_names.chunks(split).enumerate() {
+        // AC は ASCII CI で構築: CI 言語 (Xojo/PHP) で case 違いを事前フィルタで
+        // 取りこぼさないため。非 CI 言語では多少の false positive (大文字小文字違い)
+        // が発生するが、AST 比較で弾く。
+        let ac = aho_corasick::AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(chunk)
+            .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))?;
+        acs.push((chunk_ix * split, ac));
+    }
+    Ok(acs)
 }
 
 /// AC マルチパターン事前フィルタ。`source` を走査して出現した name index の集合を返す。
@@ -94,6 +117,46 @@ fn ac_present_indices(
     present_indices
 }
 
+/// `build_batch_acs` が返す AC 群での事前フィルタ。パターン index は各 AC のオフセットを
+/// 加算してグローバル index (symbol_names 上の位置) に揃える。全名出現で早期打ち切り。
+fn ac_present_indices_multi(
+    acs: &[(usize, aho_corasick::AhoCorasick)],
+    source: &[u8],
+    num_names: usize,
+) -> std::collections::HashSet<usize> {
+    let mut present_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    'outer: for (offset, ac) in acs {
+        for mat in ac.find_overlapping_iter(source) {
+            present_indices.insert(offset + mat.pattern().as_usize());
+            if present_indices.len() == num_names {
+                break 'outer;
+            }
+        }
+    }
+    present_indices
+}
+
+/// `find_references` の per-file 事前フィルタ。検索開始時に 1 回だけ構築して全ファイルで
+/// 共有する。`exact` は case-sensitive 言語用の memmem Finder、`ci` は PHP (関数/メソッド/
+/// クラス名が case-insensitive) 用の ASCII CI searcher。旧実装は PHP ファイル毎に
+/// source 全文の `to_ascii_lowercase` コピーを確保していた。
+struct SingleNamePrefilter<'n> {
+    exact: memchr::memmem::Finder<'n>,
+    ci: aho_corasick::AhoCorasick,
+}
+
+impl<'n> SingleNamePrefilter<'n> {
+    fn new(symbol_name: &'n str) -> Result<Self> {
+        Ok(Self {
+            exact: memchr::memmem::Finder::new(symbol_name.as_bytes()),
+            ci: aho_corasick::AhoCorasick::builder()
+                .ascii_case_insensitive(true)
+                .build([symbol_name])
+                .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))?,
+        })
+    }
+}
+
 /// 指定シンボルへの参照をディレクトリ内のファイルから検索する。
 /// glob パターン（例: "**/*.rs"）によるフィルタも可能。
 pub fn find_references(
@@ -104,6 +167,7 @@ pub fn find_references(
     let files = collect_files(dir, glob_pattern)?;
 
     let pool = build_bounded_pool()?;
+    let prefilter = SingleNamePrefilter::new(symbol_name)?;
 
     // per-file Vec を全ファイル分保持せず、worker local の Vec へ直接統合する。
     let mut all_refs: Vec<SymbolReference> = pool.install(|| {
@@ -112,7 +176,7 @@ pub fn find_references(
             .fold(Vec::new, |mut local, path| {
                 if let Some(path_str) = path.to_str() {
                     let utf8_path = camino::Utf8Path::new(path_str);
-                    if let Ok(mut refs) = find_refs_in_file(symbol_name, utf8_path) {
+                    if let Ok(mut refs) = find_refs_in_file(symbol_name, utf8_path, &prefilter) {
                         local.append(&mut refs);
                     }
                 }
@@ -158,7 +222,11 @@ fn sort_references(refs: &mut [SymbolReference]) {
 ///
 /// lexer-only 言語 (現状 Xojo) は手書き lexer で identifier 列挙する。
 /// tree-sitter 系は従来通り Query + AST 走査で確定検証する。
-fn find_refs_in_file(symbol_name: &str, path: &camino::Utf8Path) -> Result<Vec<SymbolReference>> {
+fn find_refs_in_file(
+    symbol_name: &str,
+    path: &camino::Utf8Path,
+    prefilter: &SingleNamePrefilter<'_>,
+) -> Result<Vec<SymbolReference>> {
     let source = parser::read_file(path)?;
 
     // ファイル言語を拡張子から先読みし、CI 言語ではバイト事前フィルタを skip
@@ -169,10 +237,9 @@ fn find_refs_in_file(symbol_name: &str, path: &camino::Utf8Path) -> Result<Vec<S
         // PHP は関数/メソッド/クラス名が case-insensitive なため、大小無視で事前フィルタして
         // case 違いの参照を取りこぼさない。他の case-sensitive 言語は従来どおり memmem で弾く。
         let present = if ext_lang == Some(LangId::Php) {
-            let needle = symbol_name.to_ascii_lowercase();
-            memchr::memmem::find(&source.to_ascii_lowercase(), needle.as_bytes()).is_some()
+            prefilter.ci.is_match(source.as_bytes())
         } else {
-            memchr::memmem::find(&source, symbol_name.as_bytes()).is_some()
+            prefilter.exact.find(&source).is_some()
         };
         if !present {
             return Ok(Vec::new());
@@ -221,8 +288,13 @@ fn find_refs_in_file(symbol_name: &str, path: &camino::Utf8Path) -> Result<Vec<S
 /// シンボル名→参照リストのマップを返す。
 /// Aho-Corasick オートマトンによる効率的なマルチパターン事前フィルタを使用。
 ///
-/// fold/reduce でワーカー局所バケットに直接統合し、
-/// per_file Vec + merged HashMap の二重保持を回避する。
+/// ディレクトリウォーク・AC 走査・parse はすべて名前数に依らずファイル毎 1 回。
+/// 旧実装は名前を chunk (既定 64) に分割して chunk 毎に全ファイルを再読込・再パース
+/// しており、名前数に比例して全リポ走査が繰り返されていた (実測: 全ファイルにヒット
+/// する名前構成で chunk 2 個 = wall 2 倍)。AC trie は aho-corasick 1.1 でパターン数に
+/// ほぼ線形 (実測 5 万パターン ≈ 8MB) のため、単一 AC 化で chunk の根拠は消えている。
+/// fold/reduce でワーカー局所バケットに直接統合し、per_file Vec + merged HashMap の
+/// 二重保持を回避する。
 pub fn find_references_batch(
     symbol_names: &[String],
     dir: &Path,
@@ -234,88 +306,66 @@ pub fn find_references_batch(
         return Ok(HashMap::new());
     }
 
-    // ディレクトリウォーク + 全ファイルの生成物マーカー読込 (先頭 4KB) は名前数に依らず
-    // 1 回で済ます。以前は呼び出し側が名前を chunk 分割して本関数を chunk 回呼んでいたため
-    // walk が ceil(N / chunk) 回繰り返され、大規模リポでは参照検索の純コストが walk の
-    // 再実行に支配されていた。files / pool を全 chunk で共有して 1 回に集約する
-    // (count_non_definition_refs_split と同じ手法)。
     let files = collect_files(dir, glob_pattern)?;
-
-    // rayon のワーカー数を上限付きにする (バケットのピーク RSS 抑制、詳細は build_bounded_pool)。
     let pool = build_bounded_pool()?;
-
-    // AC trie はパターン数に対して非線形にメモリを使い、fold バケットも名前数分確保される。
-    // 名前を chunk 分割して chunk 毎に trie 構築 → 走査 → drop し、ピーク RSS を chunk
-    // サイズに対して定数で抑える。files / pool は全 chunk で共有する。
-    let mut merged: HashMap<String, Vec<SymbolReference>> =
-        HashMap::with_capacity(symbol_names.len());
+    let acs = build_batch_acs(symbol_names)?;
 
     // Angular template scan の前処理 (canonicalize / `is_angular_project` の全 dir 走査 /
-    // `collect_component_templates` の全 `.ts` 走査) は chunk 数に依らず 1 回で済ます。
-    // 非 Angular リポでは `None` となり、chunk ループ内で template scan を完全に skip する。
+    // `collect_component_templates` の全 `.ts` 走査) も 1 回で済ます。
+    // 非 Angular リポでは `None` となり、template scan を完全に skip する。
     let angular_ctx =
         crate::engine::angular_template_refs::AngularBatchContext::prepare(dir, glob_pattern);
 
-    for chunk in symbol_names.chunks(refs_batch_chunk_size()) {
-        // AC は ASCII CI で構築: CI 言語 (Xojo) で case 違いを事前フィルタで取りこぼさない
-        // ため。非 CI 言語では多少の false positive (大文字小文字違い) が発生するが、AST
-        // 比較で弾く。
-        let ac = aho_corasick::AhoCorasick::builder()
-            .ascii_case_insensitive(true)
-            .build(chunk)
-            .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))?;
-
-        // fold/reduce: ワーカーごとに Vec<Vec<SymbolReference>> を持ち、直接統合する。
-        // files は借用で共有し、chunk 毎に walk し直さない。
-        let mut buckets: Vec<Vec<SymbolReference>> = pool.install(|| {
-            files
-                .par_iter()
-                .fold(
-                    || vec![Vec::new(); chunk.len()],
-                    |mut local, path| {
-                        let Some(path_str) = path.to_str() else {
-                            return local;
-                        };
-                        let utf8_path = camino::Utf8Path::new(path_str);
-                        if let Ok(per_file) = find_refs_batch_in_file_indexed(chunk, &ac, utf8_path)
-                        {
-                            for (ix, mut refs) in per_file.into_iter().enumerate() {
-                                local[ix].append(&mut refs);
-                            }
+    // fold/reduce: ワーカーごとに Vec<Vec<SymbolReference>> を持ち、直接統合する。
+    let mut buckets: Vec<Vec<SymbolReference>> = pool.install(|| {
+        files
+            .par_iter()
+            .fold(
+                || vec![Vec::new(); symbol_names.len()],
+                |mut local, path| {
+                    let Some(path_str) = path.to_str() else {
+                        return local;
+                    };
+                    let utf8_path = camino::Utf8Path::new(path_str);
+                    if let Ok(per_file) =
+                        find_refs_batch_in_file_indexed(symbol_names, &acs, utf8_path)
+                    {
+                        for (ix, mut refs) in per_file.into_iter().enumerate() {
+                            local[ix].append(&mut refs);
                         }
-                        local
-                    },
-                )
-                .reduce(
-                    || vec![Vec::new(); chunk.len()],
-                    |mut acc, mut local| {
-                        for (acc_refs, local_refs) in acc.iter_mut().zip(local.iter_mut()) {
-                            acc_refs.append(local_refs);
-                        }
-                        acc
-                    },
-                )
-        });
+                    }
+                    local
+                },
+            )
+            .reduce(
+                || vec![Vec::new(); symbol_names.len()],
+                |mut acc, mut local| {
+                    for (acc_refs, local_refs) in acc.iter_mut().zip(local.iter_mut()) {
+                        acc_refs.append(local_refs);
+                    }
+                    acc
+                },
+            )
+    });
 
-        // Angular template バインディング式からの参照を chunk 分まとめて統合する (GitLab #18)。
-        // テンプレートを名前数分スキャンせず chunk 単位で全名を 1 回で引く。
-        // 事前に組み立てた AngularBatchContext を使い、chunk 数倍の全 dir/.ts 走査を避ける。
-        if let Some(ctx) = angular_ctx.as_ref() {
-            let template_refs =
-                crate::engine::angular_template_refs::find_angular_template_references_batch_with_context(
-                    chunk, ctx,
-                );
-            for (bucket, mut t) in buckets.iter_mut().zip(template_refs) {
-                bucket.append(&mut t);
-            }
+    // Angular template バインディング式からの参照を全名まとめて統合する (GitLab #18)。
+    if let Some(ctx) = angular_ctx.as_ref() {
+        let template_refs =
+            crate::engine::angular_template_refs::find_angular_template_references_batch_with_context(
+                symbol_names, ctx,
+            );
+        for (bucket, mut t) in buckets.iter_mut().zip(template_refs) {
+            bucket.append(&mut t);
         }
+    }
 
-        for (i, name) in chunk.iter().enumerate() {
-            let mut refs = std::mem::take(&mut buckets[i]);
-            sort_references(&mut refs);
-            if !refs.is_empty() {
-                merged.insert(name.clone(), refs);
-            }
+    let mut merged: HashMap<String, Vec<SymbolReference>> =
+        HashMap::with_capacity(symbol_names.len());
+    for (i, name) in symbol_names.iter().enumerate() {
+        let mut refs = std::mem::take(&mut buckets[i]);
+        sort_references(&mut refs);
+        if !refs.is_empty() {
+            merged.insert(name.clone(), refs);
         }
     }
 
@@ -358,48 +408,36 @@ where
     merge_extra_files(&mut files, &canonical_dir, extra_files);
 
     let n = symbol_names.len();
-    // shared atomic counters: rayon の chunk 単位で `(vec![0; n], vec![0; n])` を都度確保せず、
-    // n × 16 bytes 一定のメモリで全 worker から fetch_add する。
-    // dead-code は unique_names が大規模リポジトリで数万〜数十万件に達するため、
-    // fold の per-chunk Vec が同時確保されると数 GB の bursty allocation を招いていた。
+    // shared atomic counters: rayon の fold バケットで `(vec![0; n], vec![0; n])` を
+    // worker 毎に確保せず、n × 16 bytes 一定のメモリで全 worker から fetch_add する
+    // (dead-code は unique_names が大規模リポジトリで数万〜数十万件に達するため)。
     let prod_counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
     let test_counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
 
-    // AC trie はパターン数に対して非線形にメモリを食う。dead-code 経路で
-    // unique_names が数万件まで膨らむと trie 自体が GB 級になり、起動直後の
-    // 一括確保で OOM の主因になっていた。chunk 単位で構築 → 走査 → drop して
-    // ピーク RSS を AC_CHUNK_SIZE に対して定数で抑える。
-    const AC_CHUNK_SIZE: usize = 1024;
-    for (chunk_offset, chunk_start) in (0..n).step_by(AC_CHUNK_SIZE).enumerate() {
-        let chunk_end = (chunk_start + AC_CHUNK_SIZE).min(n);
-        let chunk = &symbol_names[chunk_start..chunk_end];
-        let base_idx = chunk_offset * AC_CHUNK_SIZE;
+    // AC は原則 1 個 (aho-corasick 1.1 で数万パターン ≈ 数 MB、詳細は refs_ac_split_size)。
+    // ファイル走査と parse は名前数に依らず 1 回で済む。旧実装は 1024 名 chunk 毎に
+    // 全ファイルを再読込・再パースしており、dead-code の名前数に比例して全リポ走査が
+    // 繰り返されていた。
+    let acs = build_batch_acs(symbol_names)?;
 
-        let ac = aho_corasick::AhoCorasick::builder()
-            .ascii_case_insensitive(true)
-            .build(chunk)
-            .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))?;
-
-        files.par_iter().for_each(|path| {
-            let Some(path_str) = path.to_str() else {
-                return;
+    files.par_iter().for_each(|path| {
+        let Some(path_str) = path.to_str() else {
+            return;
+        };
+        let utf8_path = camino::Utf8Path::new(path_str);
+        if let Ok(per_file) = count_refs_in_file(symbol_names, &acs, utf8_path) {
+            let bucket = if is_test(path) {
+                &test_counts
+            } else {
+                &prod_counts
             };
-            let utf8_path = camino::Utf8Path::new(path_str);
-            if let Ok(per_file) = count_refs_in_file(chunk, &ac, utf8_path) {
-                let bucket = if is_test(path) {
-                    &test_counts
-                } else {
-                    &prod_counts
-                };
-                for (local_ix, cnt) in per_file.into_iter().enumerate() {
-                    if cnt != 0 {
-                        bucket[base_idx + local_ix].fetch_add(cnt, Ordering::Relaxed);
-                    }
+            for (ix, cnt) in per_file.into_iter().enumerate() {
+                if cnt != 0 {
+                    bucket[ix].fetch_add(cnt, Ordering::Relaxed);
                 }
             }
-        });
-        // ac はここで drop され、次 chunk まで AC trie のメモリは解放される
-    }
+        }
+    });
 
     let mut out = HashMap::with_capacity(n);
     for (i, name) in symbol_names.iter().enumerate() {
@@ -456,17 +494,17 @@ pub(crate) fn visit_refs_and_defs_in_file_cb<V: RefVisitor>(
 }
 
 /// 単一ファイル内で複数シンボルの参照を index ベースの Vec に格納する。
-/// find_references_batch の fold/reduce および impact analyze の streaming Pass から呼ばれる。
+/// find_references_batch の fold/reduce から呼ばれる。
 pub(crate) fn find_refs_batch_in_file_indexed(
     symbol_names: &[String],
-    ac: &aho_corasick::AhoCorasick,
+    acs: &[(usize, aho_corasick::AhoCorasick)],
     path: &camino::Utf8Path,
 ) -> Result<Vec<Vec<SymbolReference>>> {
     let num = symbol_names.len();
     let source = parser::read_file(path)?;
 
     // マルチパターン事前フィルタ (AC は ASCII CI で構築済、超集合フィルタ)
-    let present_indices = ac_present_indices(ac, source.as_bytes(), num);
+    let present_indices = ac_present_indices_multi(acs, source.as_bytes(), num);
     if present_indices.is_empty() {
         return Ok(vec![Vec::new(); num]);
     }
@@ -516,13 +554,13 @@ pub(crate) fn find_refs_batch_in_file_indexed(
 /// 単一ファイル内の非 Definition 参照件数をカウントする（SymbolReference を確保しない）。
 fn count_refs_in_file(
     symbol_names: &[String],
-    ac: &aho_corasick::AhoCorasick,
+    acs: &[(usize, aho_corasick::AhoCorasick)],
     path: &camino::Utf8Path,
 ) -> Result<Vec<usize>> {
     let num = symbol_names.len();
     let source = parser::read_file(path)?;
 
-    let present_indices = ac_present_indices(ac, source.as_bytes(), num);
+    let present_indices = ac_present_indices_multi(acs, source.as_bytes(), num);
     if present_indices.is_empty() {
         return Ok(vec![0; num]);
     }

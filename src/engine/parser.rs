@@ -99,6 +99,17 @@ fn parse_timeout_secs() -> u64 {
         .unwrap_or(30)
 }
 
+thread_local! {
+    /// 言語別 Parser の thread-local 再利用プール。
+    ///
+    /// `Parser::new` + `set_language` はファイル毎に呼ぶと C 側の malloc と文法設定が
+    /// ファイル数分積み上がるため、スレッド毎に言語別インスタンスを使い回す。Parser は
+    /// parse 中の内部状態を持つため static 共有はせず thread-local に閉じる。エントリは
+    /// 言語数 (16) が上限で、常駐プロセス (MCP/session) でも増え続けない。
+    static PARSER_POOL: std::cell::RefCell<std::collections::HashMap<LangId, Parser>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 /// 既知の言語でソースバイト列をパースする。
 ///
 /// `LexerOnly` 言語 (現状 Xojo) は tree-sitter を持たないため `UnsupportedLanguage`
@@ -113,34 +124,49 @@ pub fn parse_source(source: &[u8], lang_id: LangId) -> Result<Tree> {
         .into());
     }
 
-    let mut parser = Parser::new();
-    parser
-        .set_language(&lang_id.ts_language())
-        .context("Failed to set parser language")?;
-
-    let timeout_secs = parse_timeout_secs();
-    let tree = if timeout_secs > 0 {
-        use std::ops::ControlFlow;
-        let start = Instant::now();
-        let limit = Duration::from_secs(timeout_secs);
-        let mut callback = |_state: &tree_sitter::ParseState| {
-            if start.elapsed() > limit {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
+    PARSER_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let parser = match pool.entry(lang_id) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let mut parser = Parser::new();
+                parser
+                    .set_language(&lang_id.ts_language())
+                    .context("Failed to set parser language")?;
+                entry.insert(parser)
             }
         };
-        let options = ParseOptions::new().progress_callback(&mut callback);
-        parser.parse_with_options(
-            &mut |byte, _| &source[byte.min(source.len())..],
-            None,
-            Some(options),
-        )
-    } else {
-        parser.parse(source, None)
-    };
 
-    tree.ok_or_else(|| AstroError::parse_error("<source>").into())
+        let timeout_secs = parse_timeout_secs();
+        let tree = if timeout_secs > 0 {
+            use std::ops::ControlFlow;
+            let start = Instant::now();
+            let limit = Duration::from_secs(timeout_secs);
+            let mut callback = |_state: &tree_sitter::ParseState| {
+                if start.elapsed() > limit {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            };
+            let options = ParseOptions::new().progress_callback(&mut callback);
+            parser.parse_with_options(
+                &mut |byte, _| &source[byte.min(source.len())..],
+                None,
+                Some(options),
+            )
+        } else {
+            parser.parse(source, None)
+        };
+
+        if tree.is_none() {
+            // タイムアウト等で halt した Parser は resume 状態を保持し、次の parse が
+            // 前回の途中から再開されてしまう。再利用プールに戻す前に必ず reset する。
+            parser.reset();
+        }
+
+        tree.ok_or_else(|| AstroError::parse_error("<source>").into())
+    })
 }
 
 /// ファイルサイズ上限: 100 MB。

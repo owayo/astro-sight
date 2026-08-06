@@ -224,7 +224,7 @@ astro-sight refs --names "AppService,AstgenResponse" --dir src/
 
 `--name` は空文字を受け付けない。`--names` も空要素のみ（例: `",,,"`）の場合は `INVALID_REQUEST` を返す。`--dir` にはディレクトリのみ指定でき、ファイルパスを渡した場合も `INVALID_REQUEST` を返す。
 
-単一検索と複数シンボル検索はいずれも worker local の fold/reduce で結果を直接統合し、per-file の中間 `Vec` を全ファイル分保持しない。非常に多くの参照が返るシンボルでは出力自体が大きくなるため、`--glob` で対象言語を絞るか、必要に応じて `ASTRO_SIGHT_BATCH_WORKERS` で並列ワーカー数を下げる。複数シンボル検索（`refs --names`）はディレクトリ走査と rayon pool を 1 回に集約し、内部で名前を chunk 単位（既定 64、`ASTRO_SIGHT_REFS_BATCH_CHUNK` で調整）に分割して AC trie / fold バケットのメモリを上限化する。名前数を増やしてもディレクトリ走査は 1 回で済み（chunk 毎の再走査が起きない）、chunk サイズに依らず結果は一致する。
+単一検索と複数シンボル検索はいずれも worker local の fold/reduce で結果を直接統合し、per-file の中間 `Vec` を全ファイル分保持しない。非常に多くの参照が返るシンボルでは出力自体が大きくなるため、`--glob` で対象言語を絞るか、必要に応じて `ASTRO_SIGHT_BATCH_WORKERS` で並列ワーカー数を下げる（既定は論理コア数）。複数シンボル検索（`refs --names`）はディレクトリ走査・Aho-Corasick 走査・parse をすべて名前数に依らずファイル毎 1 回に集約し、パターンは原則 1 個の AC オートマトンに載せる（実測 5 万パターン ≈ 8MB とパターン数にほぼ線形）。`ASTRO_SIGHT_REFS_BATCH_CHUNK`（既定 100,000）を超える大規模入力だけ AC を分割するが、その場合もファイル走査と parse は 1 回のままで、分割サイズに依らず結果は一致する。
 
 Angular テンプレートと Android XML の補助参照スキャンは、各ファイルをそれぞれ 2MB / 1MB に制限する。metadata 確認後にファイルが拡大した場合も、上限 + 1 byte で読み込みを止めてスキップする。
 

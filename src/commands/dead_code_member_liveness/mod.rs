@@ -33,11 +33,26 @@ struct MemberCandidate {
     file: String,
 }
 
-enum DuplicateSetResult {
-    /// 一意推定が成立し、owner 別の (production, test) カウントを保持する。
-    Counted(HashMap<String, (usize, usize)>),
-    /// 推定不能。呼び出し側で従来のスキップへフォールバックする。
-    Ambiguous,
+/// duplicate set 1 つ分のファイル横断集計 (ループ反転後の共有アキュムレータ)。
+/// `ambiguous` は 1 ファイルでも ambiguous 判定が出たら true (sticky)、
+/// `counts` は owner 別 (production, test) 参照数。ambiguous の OR と counts の加算は
+/// 可換なので、rayon の fold/reduce 順に依らず結果は決定的。
+#[derive(Debug, Default, Clone)]
+struct SetAccum {
+    ambiguous: bool,
+    counts: HashMap<String, (usize, usize)>,
+}
+
+impl SetAccum {
+    /// 2 worker の局所アキュムレータをマージする (reduce 用)。
+    fn merge(&mut self, other: SetAccum) {
+        self.ambiguous |= other.ambiguous;
+        for (owner, (prod, tst)) in other.counts {
+            let entry = self.counts.entry(owner).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(prod);
+            entry.1 = entry.1.saturating_add(tst);
+        }
+    }
 }
 
 fn collect_source_files(canonical_dir: &Path, extra_files: &[PathBuf]) -> Option<Vec<PathBuf>> {
