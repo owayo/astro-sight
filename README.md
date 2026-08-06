@@ -239,8 +239,8 @@ C/C++ の `struct` / `class` / `union` / `enum` tag 名は、本体付き定義�
 {
   "symbol": "extract_symbols",
   "refs": [
-    { "path": "src/engine/symbols.rs", "ln": 9, "col": 7, "ctx": "pub fn extract_symbols(...)", "kind": "def" },
-    { "path": "src/main.rs", "ln": 156, "col": 24, "ctx": "let syms = symbols::extract_symbols(...)", "kind": "ref" }
+    { "path": "src/engine/symbols/mod.rs", "ln": 98, "col": 7, "ctx": "pub fn extract_symbols(...)", "kind": "def" },
+    { "path": "src/service.rs", "ln": 284, "col": 11, "ctx": "pub fn extract_symbols(&self, path: &str) -> Result<AstgenResponse> {", "kind": "def" }
   ]
 }
 ```
@@ -276,7 +276,7 @@ astro-sight context --dir . --diff-file /tmp/changes.diff
 {
   "changes": [
     {
-      "path": "src/engine/symbols.rs",
+      "path": "src/engine/symbols/mod.rs",
       "hunks": [{ "old_start": 10, "old_count": 5, "new_start": 10, "new_count": 8 }],
       "affected_symbols": [
         { "name": "extract_symbols", "kind": "function", "change_type": "modified" }
@@ -285,7 +285,7 @@ astro-sight context --dir . --diff-file /tmp/changes.diff
         { "name": "extract_symbols", "old_signature": "fn extract_symbols(...)", "new_signature": "fn extract_symbols(..., include_refs: bool)" }
       ],
       "impacted_callers": [
-        { "path": "src/main.rs", "name": "cmd_symbols", "line": 154 }
+        { "path": "src/commands.rs", "name": "cmd_symbols", "line": 166 }
       ]
     }
   ]
@@ -322,9 +322,9 @@ git diff HEAD~1 | astro-sight impact --dir .
 ```
 Unresolved impacts found:
 
-src/engine/symbols.rs changed [extract_symbols]:
-  → src/service.rs:89
-  → src/main.rs:42
+src/engine/symbols/mod.rs changed [extract_symbols]:
+  → src/service.rs:284
+  → src/commands/api_changes/exported.rs:45
 ```
 
 claw-hooks との連携例（`.claw-hooks.toml`）:
