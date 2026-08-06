@@ -16,7 +16,15 @@ use crate::language::LangId;
 /// 参照 1 件の帰属解決結果。candidate (削除元 old_path) 非依存の事実を保持し、
 /// `proves_survivor_origin` で old_path / 残存定義ファイル集合と照合する。
 #[derive(Clone)]
-pub(crate) enum RefAttribution {
+pub(crate) struct RefAttribution {
+    /// 参照ファイルの言語。解決できない場合は None (言語による証明はしない = fail-closed)。
+    pub(crate) ref_lang: Option<LangId>,
+    pub(crate) origin: RefOrigin,
+}
+
+/// 参照が「残存シンボル由来」であることの根拠。
+#[derive(Clone)]
+pub(crate) enum RefOrigin {
     /// 参照ファイル自身に同名定義が残存している (TS/JS/bash)。TS/JS は削除ファイルからの
     /// 同名 import が同ファイル定義と共存できない (duplicate declaration) ため、bash は
     /// 削除ファイルが消えても同ファイル定義が残り未定義呼び出しにならないため、削除
@@ -30,27 +38,82 @@ pub(crate) enum RefAttribution {
     /// 出現し、その specifier の解決候補が `candidates`。残存定義ファイルへ解決できれば
     /// 「残存シンボルへの束縛」と証明できる。
     ImportResolved { candidates: Rc<HashSet<String>> },
+    /// Python: symbol の出現がすべて属性アクセス (`re.search` / `self.search`) で、
+    /// レシーバの実効モジュール名が `receiver_module_names`。モジュールレベルの自由関数 /
+    /// クラスは `<module>.<name>` 形式でしか属性アクセス経由に到達できないため、
+    /// レシーバ名の中に削除モジュール名が無ければ残存シンボル由来と証明できる。
+    PythonAttributeAccess {
+        receiver_module_names: Rc<HashSet<String>>,
+    },
     /// 証明不能。従来どおり残存参照として数える。
     Unproven,
 }
 
-/// `attr` が「削除ファイル `old_path` のシンボルではなく残存シンボル由来」と証明できるか。
-/// `residual_def_paths` は同 bare name の残存定義ファイル集合 (repo 相対)。
+/// `proves_survivor_origin` の照合対象となる削除候補。同型 `&str` の `old_path` / `name` /
+/// `kind` を位置引数で渡すと取り違えてもコンパイルが通るため構造体で束ねる。
+pub(crate) struct RemovedCandidateRef<'a> {
+    /// 削除元ファイル (repo 相対)。
+    pub(crate) old_path: &'a str,
+    /// 削除シンボル名。qualname (`BM25.fit`) はメソッドを表す。
+    pub(crate) name: &'a str,
+    /// 削除シンボルの kind (`function` / `method` / `class` ...)。
+    pub(crate) kind: &'a str,
+}
+
+/// `attr` が「削除ファイル `candidate.old_path` のシンボルではなく残存シンボル由来」と
+/// 証明できるか。`residual_def_paths` は同 bare name の残存定義ファイル集合 (repo 相対)。
 pub(crate) fn proves_survivor_origin(
     attr: &RefAttribution,
-    old_path: &str,
+    candidate: &RemovedCandidateRef<'_>,
     residual_def_paths: &HashSet<String>,
 ) -> bool {
-    match attr {
-        RefAttribution::SelfDefined { sourced_candidates } => sourced_candidates
+    // 参照ファイルの言語から削除ファイルの言語へ識別子束縛の経路が無いなら、同名でも
+    // 別物と断言できる。polyglot リポジトリでは汎用名 (`search` / `init`) の bare name
+    // 参照の大半がこれに当たる (Issue 2026-08-06-api-rm-atomic-module-deletion では
+    // 2,522 件中 2,521 件が Python 削除に対する PHP / C / JS / TS の同名参照だった)。
+    if let (Some(ref_lang), Some(old_lang)) = (attr.ref_lang, path_lang(candidate.old_path))
+        && !ref_lang.can_reference_definition_in(old_lang)
+    {
+        return true;
+    }
+    match &attr.origin {
+        RefOrigin::SelfDefined { sourced_candidates } => sourced_candidates
             .as_ref()
-            .is_none_or(|sourced| !sourced.contains(old_path)),
-        RefAttribution::ImportResolved { candidates } => {
-            !candidates.contains(old_path)
+            .is_none_or(|sourced| !sourced.contains(candidate.old_path)),
+        RefOrigin::ImportResolved { candidates } => {
+            !candidates.contains(candidate.old_path)
                 && candidates.iter().any(|c| residual_def_paths.contains(c))
         }
-        RefAttribution::Unproven => false,
+        RefOrigin::PythonAttributeAccess {
+            receiver_module_names,
+        } => {
+            // メソッド削除 (`BM25.fit`) では属性アクセスこそが正当な参照形なので証明しない。
+            // qualname でなくとも kind が method なら同様に fail-closed に倒す。
+            if candidate.kind == "method" || candidate.name.contains('.') {
+                return false;
+            }
+            let Some(module) = python_module_name(candidate.old_path) else {
+                return false;
+            };
+            !receiver_module_names.contains(&module)
+        }
+        RefOrigin::Unproven => false,
     }
+}
+
+/// 削除元 Python ファイルのモジュール名。`pkg/core.py` → `core`、
+/// `pkg/__init__.py` → `pkg` (パッケージ名で参照されるため)。
+fn python_module_name(old_path: &str) -> Option<String> {
+    let path = std::path::Path::new(old_path);
+    let stem = path.file_stem()?.to_str()?;
+    if stem == "__init__" {
+        return path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(str::to_string);
+    }
+    Some(stem.to_string())
 }
 
 /// (ref_path, symbol) 単位のファイル解析結果。参照ループでキャッシュされ、
@@ -69,6 +132,11 @@ pub(crate) struct RefAttributionFacts {
     pub has_unresolvable_import_binding: bool,
     /// bash のみ Some: リテラル source の解決候補。
     pub bash_sourced_candidates: Option<Rc<HashSet<String>>>,
+    /// Python のみ Some: symbol の非定義出現がすべて属性アクセスだった場合の、
+    /// レシーバの実効モジュール名集合。1 件でも bare identifier 出現があれば None。
+    pub python_attribute_receivers: Option<Rc<HashSet<String>>>,
+    /// 参照ファイルの言語。解決できなければ None。
+    pub ref_lang: Option<LangId>,
     /// ファイルが TS/JS 系か。
     pub is_js_ts: bool,
     /// ファイルが bash 系か。
@@ -83,6 +151,8 @@ impl RefAttributionFacts {
             local_import_candidates: None,
             has_unresolvable_import_binding: false,
             bash_sourced_candidates: None,
+            python_attribute_receivers: None,
+            ref_lang: None,
             is_js_ts: false,
             is_bash: false,
         }
@@ -96,31 +166,47 @@ pub(crate) fn attribution_for_ref(
     ref_path: &str,
     residual_def_paths: &HashSet<String>,
 ) -> RefAttribution {
+    RefAttribution {
+        ref_lang: facts.ref_lang,
+        origin: ref_origin_for(facts, ref_path, residual_def_paths),
+    }
+}
+
+fn ref_origin_for(
+    facts: &RefAttributionFacts,
+    ref_path: &str,
+    residual_def_paths: &HashSet<String>,
+) -> RefOrigin {
     if facts.is_js_ts {
         if facts.has_unresolvable_import_binding {
-            return RefAttribution::Unproven;
+            return RefOrigin::Unproven;
         }
         // from 句付き文で束縛 / 再輸出されている場合は同ファイル定義より優先して
         // import 解決で判定する (`export { x } from './deleted'` は同ファイル定義と
         // 共存でき、削除で壊れるため SelfDefined で証明してはならない)。
         if let Some(candidates) = &facts.local_import_candidates {
-            return RefAttribution::ImportResolved {
+            return RefOrigin::ImportResolved {
                 candidates: Rc::clone(candidates),
             };
         }
         if residual_def_paths.contains(ref_path) {
-            return RefAttribution::SelfDefined {
+            return RefOrigin::SelfDefined {
                 sourced_candidates: None,
             };
         }
-        return RefAttribution::Unproven;
+        return RefOrigin::Unproven;
     }
     if facts.is_bash && residual_def_paths.contains(ref_path) {
-        return RefAttribution::SelfDefined {
+        return RefOrigin::SelfDefined {
             sourced_candidates: facts.bash_sourced_candidates.clone(),
         };
     }
-    RefAttribution::Unproven
+    if let Some(receivers) = &facts.python_attribute_receivers {
+        return RefOrigin::PythonAttributeAccess {
+            receiver_module_names: Rc::clone(receivers),
+        };
+    }
+    RefOrigin::Unproven
 }
 
 /// `ref_path` のファイルを 1 回だけ parse し、外部 import 事実 (従来) と参照帰属の素材を
@@ -140,16 +226,163 @@ pub(crate) fn analyze_ref_attribution_facts(
     let Some(utf8) = camino::Utf8Path::from_path(&abs) else {
         return RefAttributionFacts::opaque();
     };
-    let Ok(lang) = LangId::from_path(utf8) else {
+    let Some(lang) = file_lang(utf8) else {
         return RefAttributionFacts::opaque();
     };
-    match lang {
+    let mut facts = match lang {
         LangId::Javascript | LangId::Typescript | LangId::Tsx => {
             analyze_js_ts_facts(utf8, lang, ref_path, symbol, external_pkgs)
         }
         LangId::Bash => analyze_bash_facts(utf8, ref_path),
+        LangId::Python => analyze_python_facts(utf8, symbol),
         _ => RefAttributionFacts::opaque(),
+    };
+    facts.ref_lang = Some(lang);
+    facts
+}
+
+/// 参照ファイルの言語。拡張子で決まらない場合は shebang まで見る
+/// (`scripts/install_prereq` のような拡張子なしシェルスクリプトも参照元になり得る)。
+fn file_lang(utf8: &camino::Utf8Path) -> Option<LangId> {
+    if let Ok(lang) = LangId::from_path(utf8) {
+        return Some(lang);
     }
+    // Angular テンプレート。astro-sight が `.html` から参照を出すのは component template
+    // 走査経路だけで、その識別子は TS component クラスのメンバに解決される。
+    if matches!(
+        utf8.extension().map(str::to_ascii_lowercase).as_deref(),
+        Some("html") | Some("htm")
+    ) {
+        return Some(LangId::Typescript);
+    }
+    let source = parser::read_file(utf8).ok()?;
+    let first_line = source.split(|b| *b == b'\n').next()?;
+    LangId::from_shebang(std::str::from_utf8(first_line).ok()?)
+}
+
+/// 削除元ファイルの言語。削除済みで実体を読めないため拡張子だけで判定する。
+fn path_lang(path: &str) -> Option<LangId> {
+    LangId::from_path(camino::Utf8Path::new(path)).ok()
+}
+
+/// Python の参照ファイルを解析し、symbol の非定義出現がすべて属性アクセス
+/// (`re.search` / `self.search` / `pkg.mod.search`) かどうかを判定する。
+///
+/// すべて属性アクセスなら、レシーバの「実効モジュール名」集合を返す。実効モジュール名は
+/// レシーバ式の末尾識別子を、そのファイルの `as` 別名 (`import pkg.core as c` / `from pkg
+/// import core as c`) で解決したもの。モジュールレベルの自由関数・クラスへ属性アクセスで
+/// 到達する経路は `<module>.<name>` だけなので、この集合に削除モジュール名が無ければ
+/// 削除シンボル由来ではないと言える。
+///
+/// bare identifier としての出現が 1 件でもあれば None を返し従来どおり残存参照として数える
+/// (`from core import search` の import 行や `search()` の直接呼び出しがこれに当たる)。
+fn analyze_python_facts(utf8: &camino::Utf8Path, symbol: &str) -> RefAttributionFacts {
+    let Ok(source) = parser::read_file(utf8) else {
+        return RefAttributionFacts::opaque();
+    };
+    let Ok(tree) = parser::parse_source(&source, LangId::Python) else {
+        return RefAttributionFacts::opaque();
+    };
+    let root = tree.root_node();
+    let aliases = collect_python_import_aliases(root, &source);
+    let mut receivers: HashSet<String> = HashSet::new();
+    if !collect_python_attribute_receivers(root, &source, symbol, &aliases, &mut receivers) {
+        return RefAttributionFacts::opaque();
+    }
+    RefAttributionFacts {
+        python_attribute_receivers: Some(Rc::new(receivers)),
+        ..RefAttributionFacts::opaque()
+    }
+}
+
+/// `import pkg.core as c` / `from pkg import core as c` の別名 → 実モジュール名 (末尾segment)。
+/// 別名を持たない import は識別子がそのままモジュール名になるため収集不要。
+fn collect_python_import_aliases(
+    node: tree_sitter::Node,
+    source: &[u8],
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    fn walk(
+        node: tree_sitter::Node,
+        source: &[u8],
+        out: &mut std::collections::HashMap<String, String>,
+    ) {
+        if node.kind() == "aliased_import"
+            && let Some(name) = node.child_by_field_name("name")
+            && let Some(alias) = node.child_by_field_name("alias")
+            && let Ok(alias_text) = alias.utf8_text(source)
+            && let Ok(name_text) = name.utf8_text(source)
+        {
+            let module = name_text.rsplit('.').next().unwrap_or(name_text);
+            out.insert(alias_text.to_string(), module.to_string());
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            walk(child, source, out);
+        }
+    }
+    walk(node, source, &mut out);
+    out
+}
+
+/// symbol の出現を走査し、すべてが属性アクセスなら true を返してレシーバの実効モジュール名を
+/// `out` に積む。bare identifier としての出現を 1 件でも見つけたら false (証明不能)。
+fn collect_python_attribute_receivers(
+    node: tree_sitter::Node,
+    source: &[u8],
+    symbol: &str,
+    aliases: &std::collections::HashMap<String, String>,
+    out: &mut HashSet<String>,
+) -> bool {
+    if matches!(node.kind(), "string" | "comment") {
+        return true;
+    }
+    if node.kind() == "identifier" && node.utf8_text(source).ok() == Some(symbol) {
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        // `OBJ.symbol` の attribute 位置のみ属性アクセスとして扱う。
+        // `symbol.attr` の object 位置は bare identifier 参照。
+        if parent.kind() != "attribute"
+            || parent.child_by_field_name("attribute").map(|n| n.id()) != Some(node.id())
+        {
+            return false;
+        }
+        let Some(object) = parent.child_by_field_name("object") else {
+            return false;
+        };
+        if let Some(name) = python_receiver_effective_name(object, source, aliases) {
+            out.insert(name);
+        } else {
+            // レシーバの末尾識別子が取れない (添字・呼び出し結果など)。モジュール参照では
+            // ないため証明を妨げないが、判定材料にもしない。
+        }
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .all(|child| collect_python_attribute_receivers(child, source, symbol, aliases, out))
+}
+
+/// レシーバ式の実効モジュール名。`re` → `re`、`pkg.core` → `core`、`c` (別名) → `core`。
+/// 添字・関数呼び出しなど識別子で終わらない式は None。
+fn python_receiver_effective_name(
+    object: tree_sitter::Node,
+    source: &[u8],
+    aliases: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let last = match object.kind() {
+        "identifier" => object,
+        "attribute" => object.child_by_field_name("attribute")?,
+        _ => return None,
+    };
+    let text = last.utf8_text(source).ok()?;
+    Some(
+        aliases
+            .get(text)
+            .cloned()
+            .unwrap_or_else(|| text.to_string()),
+    )
 }
 
 fn analyze_js_ts_facts(
@@ -466,11 +699,29 @@ mod tests {
         assert!(c.contains("src/b.util.ts"));
     }
 
+    /// 言語による証明を挟まない (= 従来ロジックのみを見る) ための helper。
+    /// `ref_lang` を None にすると `proves_survivor_origin` の言語判定を必ず素通りする。
+    fn attr(origin: RefOrigin) -> RefAttribution {
+        RefAttribution {
+            ref_lang: None,
+            origin,
+        }
+    }
+
+    fn candidate<'a>(old_path: &'a str, name: &'a str, kind: &'a str) -> RemovedCandidateRef<'a> {
+        RemovedCandidateRef {
+            old_path,
+            name,
+            kind,
+        }
+    }
+
     #[test]
     fn proves_survivor_origin_matrix() {
         let defs: HashSet<String> = ["api/src/config.ts".to_string()].into();
+        let deleted = candidate("plugins/setup.mjs", "helper", "function");
         // 残存定義への import 解決 → 証明
-        let attr = RefAttribution::ImportResolved {
+        let a = attr(RefOrigin::ImportResolved {
             candidates: Rc::new(
                 [
                     "api/src/config.ts".to_string(),
@@ -478,34 +729,196 @@ mod tests {
                 ]
                 .into(),
             ),
-        };
-        assert!(proves_survivor_origin(&attr, "plugins/setup.mjs", &defs));
+        });
+        assert!(proves_survivor_origin(&a, &deleted, &defs));
         // 候補に old_path が含まれる → 証明失敗 (削除ファイルへの残存参照)
-        let attr = RefAttribution::ImportResolved {
+        let a = attr(RefOrigin::ImportResolved {
             candidates: Rc::new(["plugins/setup.mjs".to_string()].into()),
-        };
-        assert!(!proves_survivor_origin(&attr, "plugins/setup.mjs", &defs));
+        });
+        assert!(!proves_survivor_origin(&a, &deleted, &defs));
         // 候補が残存定義と交差しない (re-export barrel 等) → 証明失敗
-        let attr = RefAttribution::ImportResolved {
+        let a = attr(RefOrigin::ImportResolved {
             candidates: Rc::new(["lib/barrel.ts".to_string()].into()),
-        };
-        assert!(!proves_survivor_origin(&attr, "plugins/setup.mjs", &defs));
+        });
+        assert!(!proves_survivor_origin(&a, &deleted, &defs));
         // 同ファイル定義 (TS/JS) → 証明
-        let attr = RefAttribution::SelfDefined {
+        let a = attr(RefOrigin::SelfDefined {
             sourced_candidates: None,
-        };
-        assert!(proves_survivor_origin(&attr, "plugins/setup.mjs", &defs));
+        });
+        assert!(proves_survivor_origin(&a, &deleted, &defs));
         // bash: リテラル source が old_path を指す → 証明失敗
-        let attr = RefAttribution::SelfDefined {
+        let a = attr(RefOrigin::SelfDefined {
             sourced_candidates: Some(Rc::new(["scripts/deleted.sh".to_string()].into())),
-        };
-        assert!(!proves_survivor_origin(&attr, "scripts/deleted.sh", &defs));
-        assert!(proves_survivor_origin(&attr, "scripts/other.sh", &defs));
-        // 証明不能は常に false
+        });
         assert!(!proves_survivor_origin(
-            &RefAttribution::Unproven,
-            "x",
+            &a,
+            &candidate("scripts/deleted.sh", "helper", "function"),
             &defs
         ));
+        assert!(proves_survivor_origin(
+            &a,
+            &candidate("scripts/other.sh", "helper", "function"),
+            &defs
+        ));
+        // 証明不能は常に false
+        assert!(!proves_survivor_origin(
+            &attr(RefOrigin::Unproven),
+            &candidate("x.ts", "helper", "function"),
+            &defs
+        ));
+    }
+
+    /// 言語が非互換なら origin が Unproven でも証明が成立する。互換なら従来どおり従う。
+    #[test]
+    fn proves_survivor_origin_uses_cross_language_incompatibility() {
+        let defs: HashSet<String> = HashSet::new();
+        let deleted = candidate("scripts/core.py", "search", "function");
+        for lang in [
+            LangId::Php,
+            LangId::C,
+            LangId::Javascript,
+            LangId::Typescript,
+            LangId::Tsx,
+            LangId::Rust,
+            LangId::Java,
+        ] {
+            let a = RefAttribution {
+                ref_lang: Some(lang),
+                origin: RefOrigin::Unproven,
+            };
+            assert!(
+                proves_survivor_origin(&a, &deleted, &defs),
+                "{lang:?} は Python 定義へ識別子束縛できないので証明成立すべき"
+            );
+        }
+        // 同一言語 (Python) の bare 参照は従来どおり証明不能 = blocking 維持
+        let same_lang = RefAttribution {
+            ref_lang: Some(LangId::Python),
+            origin: RefOrigin::Unproven,
+        };
+        assert!(!proves_survivor_origin(&same_lang, &deleted, &defs));
+        // 言語が判らない参照 (Android XML 等) も fail-closed
+        let unknown = RefAttribution {
+            ref_lang: None,
+            origin: RefOrigin::Unproven,
+        };
+        assert!(!proves_survivor_origin(&unknown, &deleted, &defs));
+        // 削除側が C ABI を公開する言語なら、ctypes/cinterop 経由で束縛され得るため証明しない
+        let c_deleted = candidate("native/lib.c", "search", "function");
+        for lang in [LangId::Python, LangId::Kotlin, LangId::Php, LangId::Ruby] {
+            let a = RefAttribution {
+                ref_lang: Some(lang),
+                origin: RefOrigin::Unproven,
+            };
+            assert!(
+                !proves_survivor_origin(&a, &c_deleted, &defs),
+                "{lang:?} は C ABI シンボルを識別子として取り込み得るので blocking 維持すべき"
+            );
+        }
+    }
+
+    /// Python の属性アクセスのみの参照は、レシーバが削除モジュールでなければ証明成立。
+    /// メソッド削除では属性アクセスが正当な参照形なので証明しない。
+    #[test]
+    fn proves_survivor_origin_python_attribute_access() {
+        let defs: HashSet<String> = HashSet::new();
+        let receivers = |names: &[&str]| {
+            attr(RefOrigin::PythonAttributeAccess {
+                receiver_module_names: Rc::new(
+                    names
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect::<HashSet<_>>(),
+                ),
+            })
+        };
+        // `re.search(...)` のみ → 削除した core.py の search とは無関係
+        assert!(proves_survivor_origin(
+            &receivers(&["re", "self"]),
+            &candidate("scripts/core.py", "search", "function"),
+            &defs
+        ));
+        // `core.search(...)` → 削除モジュールへの残存参照
+        assert!(!proves_survivor_origin(
+            &receivers(&["re", "core"]),
+            &candidate("scripts/core.py", "search", "function"),
+            &defs
+        ));
+        // `pkg/__init__.py` の削除はパッケージ名 `pkg` で参照される
+        assert!(!proves_survivor_origin(
+            &receivers(&["pkg"]),
+            &candidate("pkg/__init__.py", "search", "function"),
+            &defs
+        ));
+        // メソッド削除は属性アクセスこそが正当な参照形 → 証明しない (fail-closed)
+        assert!(!proves_survivor_origin(
+            &receivers(&["re"]),
+            &candidate("scripts/core.py", "BM25.fit", "method"),
+            &defs
+        ));
+        assert!(!proves_survivor_origin(
+            &receivers(&["re"]),
+            &candidate("scripts/core.py", "fit", "method"),
+            &defs
+        ));
+    }
+
+    #[test]
+    fn python_module_name_uses_package_name_for_init() {
+        assert_eq!(
+            python_module_name("scripts/core.py").as_deref(),
+            Some("core")
+        );
+        assert_eq!(
+            python_module_name("pkg/__init__.py").as_deref(),
+            Some("pkg")
+        );
+        assert_eq!(python_module_name("core.py").as_deref(), Some("core"));
+    }
+
+    fn python_facts_for(src: &str, symbol: &str) -> RefAttributionFacts {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ref.py");
+        std::fs::write(&path, src).expect("write");
+        let utf8 = camino::Utf8Path::from_path(&path).expect("utf8");
+        analyze_python_facts(utf8, symbol)
+    }
+
+    /// 属性アクセスだけのファイルはレシーバ名を集め、bare 出現があれば証明を諦める。
+    #[test]
+    fn analyze_python_facts_detects_attribute_only_usage() {
+        let facts = python_facts_for(
+            "import re\n\ndef check(pw):\n    return re.search('x', pw)\n",
+            "search",
+        );
+        let receivers = facts.python_attribute_receivers.expect("attribute only");
+        assert!(receivers.contains("re"), "receivers={receivers:?}");
+
+        // 別名 import はモジュール実名へ解決する
+        let facts = python_facts_for(
+            "import scripts.core as c\n\ndef run():\n    return c.search(1)\n",
+            "search",
+        );
+        let receivers = facts.python_attribute_receivers.expect("attribute only");
+        assert!(receivers.contains("core"), "receivers={receivers:?}");
+
+        // ドット連鎖は直前の segment を実効モジュール名にする
+        let facts = python_facts_for(
+            "import scripts\n\ndef run():\n    return scripts.core.search(1)\n",
+            "search",
+        );
+        let receivers = facts.python_attribute_receivers.expect("attribute only");
+        assert!(receivers.contains("core"), "receivers={receivers:?}");
+
+        // bare 呼び出しが混ざれば証明不能
+        let facts = python_facts_for(
+            "import re\n\ndef run(pw):\n    if re.search('x', pw):\n        return search(pw)\n    return None\n",
+            "search",
+        );
+        assert!(facts.python_attribute_receivers.is_none());
+
+        // from import の識別子出現も bare なので証明不能
+        let facts = python_facts_for("from core import search\n", "search");
+        assert!(facts.python_attribute_receivers.is_none());
     }
 }

@@ -2648,10 +2648,15 @@ pub(crate) fn partition_removed_dead_candidates(
         // カウントの誤認 (Issue 2026-07-19-bulk-subsystem-removal の shell `usage` /
         // mjs `loadEnvFiles`) を解消できる。証明できない参照が 1 件でもあれば従来どおり
         // removed (blocking) に残す (fail-closed)。
+        let candidate_ref = RemovedCandidateRef {
+            old_path: &c.file,
+            name: &c.name,
+            kind: &c.kind,
+        };
         if !attributions.is_empty()
             && attributions
                 .iter()
-                .all(|a| proves_survivor_origin(a, &c.file, residual_defs))
+                .all(|a| proves_survivor_origin(a, &candidate_ref, residual_defs))
         {
             removed_dead.push(c);
             continue;

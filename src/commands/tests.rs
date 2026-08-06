@@ -4768,6 +4768,99 @@ fn detect_api_changes_bulk_removal_import_attributed_to_survivor_demoted_to_remo
     );
 }
 
+/// Python モジュールをアトミックに削除するシナリオを組み立て、削除された `search` が
+/// blocking な removed に残ったかどうかを返す。`surviving_python` は残存する .py の中身。
+fn removed_names_after_atomic_python_module_deletion(
+    surviving_python: &str,
+) -> (Vec<String>, Vec<String>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let deleted_src = "def search(query):\n    return [query]\n";
+    git_commit_files(
+        repo,
+        &[
+            ("scripts/core.py", deleted_src),
+            // 削除した Python 関数とは無関係な、他言語の同名シンボル群
+            (
+                "web/app.php",
+                "<?php\nfunction search($q) {\n    return $q;\n}\nfunction run() {\n    return search(\"x\");\n}\n",
+            ),
+            (
+                "web/util.js",
+                "export function search(q) {\n  return q;\n}\nexport function go() {\n  return search(\"y\");\n}\n",
+            ),
+            (
+                "native/lib.c",
+                "int search(int q) { return q; }\nint run(void) { return search(1); }\n",
+            ),
+            ("tools/check.py", surviving_python),
+        ],
+        "base",
+    );
+    std::fs::remove_file(repo.join("scripts/core.py")).expect("rm");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "scripts/core.py".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 2,
+            new_start: 0,
+            new_count: 0,
+        }],
+        deleted_old_source: Some(deleted_src.as_bytes().to_vec()),
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    (
+        api.removed.iter().map(|s| s.name.clone()).collect(),
+        api.removed_dead.iter().map(|s| s.name.clone()).collect(),
+    )
+}
+
+/// Issue 2026-08-06-api-rm-atomic-module-deletion: Python モジュールを呼び出し元ごと
+/// アトミックに削除しても、polyglot リポジトリでは無関係な他言語の同名シンボル
+/// (PHP / JS / C の `search`) への参照が bare name カウントに混入し、blocking な
+/// api.rm に残っていた。参照ファイルの言語から削除ファイルの言語へ識別子束縛の経路が
+/// 無いことを証明し、残る同一言語の参照も属性アクセス (`re.search`) と判れば
+/// removed_dead (informational) へ降格する。
+#[test]
+fn detect_api_changes_atomic_python_module_deletion_demoted_to_removed_dead() {
+    let (removed, removed_dead) = removed_names_after_atomic_python_module_deletion(
+        "import re\n\ndef check(pw):\n    return re.search(\"x\", pw)\n",
+    );
+    assert!(
+        removed_dead.iter().any(|n| n == "search"),
+        "他言語の同名参照と stdlib 属性アクセスしか残らない削除は removed_dead へ降格すべき。removed={removed:?} removed_dead={removed_dead:?}"
+    );
+    assert!(
+        !removed.iter().any(|n| n == "search"),
+        "blocking な removed に残さない。removed={removed:?}"
+    );
+}
+
+/// 上の降格は fail-closed を保つ。同一言語 (Python) から削除モジュールへ到達する参照が
+/// 残っていれば、他言語ノイズが同居していても blocking な api.rm に残す。
+#[test]
+fn detect_api_changes_atomic_python_module_deletion_keeps_blocking_on_residual_python_ref() {
+    // モジュール修飾呼び出し: レシーバ `core` が削除モジュール名と一致する
+    let (removed, removed_dead) = removed_names_after_atomic_python_module_deletion(
+        "import core\n\ndef check(pw):\n    return core.search(pw)\n",
+    );
+    assert!(
+        removed.iter().any(|n| n == "search"),
+        "削除モジュールを修飾した属性アクセスが残る場合は blocking を維持すべき。removed={removed:?} removed_dead={removed_dead:?}"
+    );
+
+    // bare 呼び出し: 属性アクセスではないので証明できない
+    let (removed, removed_dead) = removed_names_after_atomic_python_module_deletion(
+        "from core import search\n\ndef check(pw):\n    return search(pw)\n",
+    );
+    assert!(
+        removed.iter().any(|n| n == "search"),
+        "削除モジュールからの import + bare 呼び出しが残る場合は blocking を維持すべき。removed={removed:?} removed_dead={removed_dead:?}"
+    );
+}
+
 /// 負ケース: 参照ファイルの import specifier が削除ファイル自身に解決される場合は、
 /// 同名の残存定義があっても破壊的削除として blocking な removed を維持する。
 #[test]

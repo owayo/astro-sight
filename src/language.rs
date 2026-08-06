@@ -155,6 +155,88 @@ impl LangId {
         matches!(self, Self::Xojo)
     }
 
+    /// この言語のソースが「識別子として」参照を解決し得るエコシステム。
+    /// 同一エコシステム内でのみ、あるファイルの識別子が別ファイルの定義へ静的に束縛される
+    /// (JS/TS/TSX は相互に import でき、C/C++ はヘッダ経由で同じ名前空間を共有する)。
+    ///
+    /// `_` catch-all を置かず全 variant を列挙する。言語追加時にコンパイルエラーで
+    /// 気付けるようにするため (未分類の言語が黙って「どことも互換なし」に倒れると、
+    /// 破壊的削除を informational へ降格する false negative になる)。
+    #[inline]
+    fn ecosystem(self) -> Ecosystem {
+        match self {
+            Self::Javascript | Self::Typescript | Self::Tsx => Ecosystem::JsTs,
+            Self::C | Self::Cpp => Ecosystem::CFamily,
+            Self::Java | Self::Kotlin => Ecosystem::Jvm,
+            Self::Rust => Ecosystem::Rust,
+            Self::Go => Ecosystem::Go,
+            Self::Zig => Ecosystem::Zig,
+            Self::Swift => Ecosystem::Swift,
+            Self::CSharp => Ecosystem::CSharp,
+            Self::Python => Ecosystem::Python,
+            Self::Php => Ecosystem::Php,
+            Self::Ruby => Ecosystem::Ruby,
+            Self::Bash => Ecosystem::Bash,
+            Self::Xojo => Ecosystem::Xojo,
+        }
+    }
+
+    /// この言語で書かれた定義が C ABI シンボルとして公開され得るか。
+    /// 公開され得る言語の定義は、他言語から `extern` 宣言 / cinterop 経由で
+    /// **識別子として**参照され得る。
+    #[inline]
+    fn exports_c_abi(self) -> bool {
+        match self {
+            // extern "C" / //export / export fn / @cdecl 等で C ABI シンボルを公開できる
+            Self::C | Self::Cpp | Self::Rust | Self::Go | Self::Zig | Self::Swift => true,
+            // ライブラリとしてビルドし C ABI を公開し得る (保守的に true)
+            Self::CSharp | Self::Xojo => true,
+            // 実行時に名前を解決する動的言語 / シェルは C ABI シンボルを公開しない
+            Self::Python | Self::Php | Self::Ruby | Self::Bash => false,
+            // JNI は `Java_<pkg>_<class>_<method>` へマングルされるため元の識別子では公開されない
+            Self::Java | Self::Kotlin => false,
+            Self::Javascript | Self::Typescript | Self::Tsx => false,
+        }
+    }
+
+    /// この言語のソースが C ABI シンボルを **識別子として** 取り込み得るか。
+    /// 文字列名で解決する仕組み (JNI の `RegisterNatives`、Java FFM の `find("name")`、
+    /// Ruby Fiddle の `handle["name"]`、`dlsym`) は識別子束縛ではないため対象外。
+    #[inline]
+    fn imports_c_abi(self) -> bool {
+        match self {
+            Self::C | Self::Cpp | Self::Rust | Self::Go | Self::Zig | Self::Swift => true,
+            // C# の `[DllImport] static extern foo();` は識別子で束縛する
+            Self::CSharp => true,
+            // Xojo の `Declare Function foo Lib "x"` は識別子で束縛する
+            Self::Xojo => true,
+            // Kotlin/Native の cinterop は C 関数を識別子として直接呼べる
+            Self::Kotlin => true,
+            // Python ctypes (`lib.foo()`) / PHP FFI (`$ffi->foo()`) は識別子で束縛する。
+            // Ruby は ffi gem の `attach_function :foo` がシンボルリテラルのため保守的に true
+            Self::Python | Self::Php | Self::Ruby => true,
+            // JNI / FFM はいずれもマングル名・文字列名で解決する
+            Self::Java => false,
+            Self::Bash => false,
+            Self::Javascript | Self::Typescript | Self::Tsx => false,
+        }
+    }
+
+    /// このファイル (`self` の言語) にある識別子が、`def_lang` で書かれたファイルの定義へ
+    /// 静的に束縛され得るかを返す。`false` なら「同名でも別物」と断言できる。
+    ///
+    /// 判定は方向を持つ (参照側 → 定義側)。Python の ctypes は C の定義を識別子として
+    /// 呼べるが、その逆に C から Python のモジュールレベル関数を識別子で呼ぶ経路は無い
+    /// (CPython 埋め込み API は文字列名で解決する)。対称な「言語グループ一致」で判定すると
+    /// この非対称を潰してしまい、Python 削除に対する C の同名参照まで互換扱いになる。
+    pub fn can_reference_definition_in(self, def_lang: LangId) -> bool {
+        if self.ecosystem() == def_lang.ecosystem() {
+            return true;
+        }
+        // 異なるエコシステムをまたぐ唯一の識別子束縛経路が C ABI。
+        def_lang.exports_c_abi() && self.imports_c_abi()
+    }
+
     /// LangId を新型 DetectedLang に変換する。
     /// 既存コードは LangId を使い続け、新規コードは DetectedLang を介して
     /// backend (TreeSitter / LexerOnly) を区別できる。
@@ -179,6 +261,26 @@ impl LangId {
             Self::Xojo => DetectedLang::LexerOnly(LexerLang::Xojo),
         }
     }
+}
+
+/// 識別子解決を共有する言語エコシステム。同一エコシステムの 2 言語は、一方のファイルの
+/// 識別子が他方のファイルの定義へ束縛され得る (JS/TS/TSX の import、C/C++ のヘッダ共有、
+/// Java/Kotlin の相互呼び出し)。`LangId::can_reference_definition_in` の一次判定に使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ecosystem {
+    JsTs,
+    CFamily,
+    Jvm,
+    Rust,
+    Go,
+    Zig,
+    Swift,
+    CSharp,
+    Python,
+    Php,
+    Ruby,
+    Bash,
+    Xojo,
 }
 
 /// tree-sitter バックエンドを持つ言語の列挙。
