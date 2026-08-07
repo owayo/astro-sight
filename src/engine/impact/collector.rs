@@ -134,6 +134,7 @@ struct RouteDecisionContext<'a> {
     dir: &'a str,
     path_str: &'a str,
     import_facts_cache: &'a mut LruCache<String, Option<RefFileFacts>>,
+    reexport_moves: &'a super::reexport_move::ReexportMoveIndex,
 }
 
 impl RouteDecisionContext<'_> {
@@ -154,7 +155,18 @@ impl RouteDecisionContext<'_> {
                 ci_key(file_context.lang_id, &change.name) == symbol_name
                     && same_top_level_arity(&change.old_signature, &change.new_signature)
             });
+        // 定義が影響元ファイルへ移動し、この参照ファイルが旧公開パスを `pub use` で
+        // 維持している場合、参照は同一 diff 内で新定義へ解決済みなので修正箇所は無い。
+        // 成立条件 (自前定義の削除 + 再輸出の追加 + 移動先の定義追加 + パス解決) は
+        // `ReexportMoveIndex` 側で連言として検証する。
+        let reexport_move_informational = self.ref_lang == Some(LangId::Rust)
+            && file_context.lang_id == LangId::Rust
+            && self
+                .reexport_moves
+                .covers(self.path_str, symbol_name, &file_context.new_path);
+
         let route_informational = fn_value_informational
+            || reexport_move_informational
             || (event.is_import
                 && file_context.affected.iter().any(|symbol| {
                     symbol.change_type == "modified"
@@ -263,6 +275,9 @@ pub(super) struct ImpactCollector<'a> {
     /// ref file 自身の言語 (`path_str` から導出)。on_ref で都度 `LangId::from_path` するのを
     /// 避けるため、`new` 相当の初期化時にキャッシュしておく。失敗時は `None`。
     pub(super) ref_lang: Option<LangId>,
+    /// 「定義を別モジュールへ移動し旧公開パスを `pub use` で維持した」変更の索引。
+    /// 旧パス側に残る未変更参照を informational へ降格するために参照する。
+    pub(super) reexport_moves: &'a super::reexport_move::ReexportMoveIndex,
 }
 
 impl<'a> refs::RefVisitor for ImpactCollector<'a> {
@@ -383,6 +398,7 @@ impl<'a> ImpactCollector<'a> {
             dir: self.dir,
             path_str: self.path_str,
             import_facts_cache: self.import_facts_cache,
+            reexport_moves: self.reexport_moves,
         };
         for e in self.ref_events.drain(..) {
             let sym_ix_usize = e.sym_ix as usize;
@@ -555,6 +571,9 @@ mod tests {
 
     fn decide_route(event: &RefEventMini, context: &FileContext, base_low: bool) -> CallerRoute {
         let mut cache = LruCache::unbounded();
+        // 再輸出移動の索引は空 = 降格なし。本テストは3バケットの優先順位だけを固定する
+        // (再輸出移動の判定は `reexport_move` のユニットテストと E2E が担当)。
+        let reexport_moves = super::super::reexport_move::ReexportMoveIndex::build("");
         RouteDecisionContext {
             // TS/Rust のファイル解析を伴う補正は既存の import_facts テストに任せ、
             // ここでは3バケットの優先順位だけを固定する。
@@ -563,6 +582,7 @@ mod tests {
             dir: ".",
             path_str: "src/caller.rs",
             import_facts_cache: &mut cache,
+            reexport_moves: &reexport_moves,
         }
         .decide(event, context, "target", false, base_low)
     }

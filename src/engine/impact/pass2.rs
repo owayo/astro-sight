@@ -240,6 +240,7 @@ pub(super) fn stream_caller_maps_and_defs(
     method_parent_types: &HashMap<String, String>,
     dir: &Path,
     options: &crate::models::impact::ContextAnalysisOptions,
+    reexport_moves: &super::reexport_move::ReexportMoveIndex,
 ) -> StreamCallerMaps {
     let n_sym = all_symbol_names.len();
     let n_fc = file_contexts.len();
@@ -367,6 +368,7 @@ pub(super) fn stream_caller_maps_and_defs(
                             import_facts_cache,
                             dir: dir_str,
                             ref_lang,
+                            reexport_moves,
                         };
                         if refs::visit_refs_and_defs_in_file_cb(
                             all_symbol_names,

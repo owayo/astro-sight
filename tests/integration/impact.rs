@@ -2641,3 +2641,135 @@ fn impact_fn_typed_tuple_ref_stays_blocking() {
         "明示型付きタプル要素の関数値渡しは blocking (exit 1) を維持すべき"
     );
 }
+
+/// Issue 2026-08-07-reexport-treated-as-unresolved-impact:
+/// 定義を別モジュールへ移動し、旧公開パスを `pub use` で維持すると、旧パス側に残る
+/// **未変更の利用行**が「未解決の影響」として blocking 報告されていた。
+/// 同一 diff 内で名前解決が完結しているため informational へ降格する。
+#[test]
+fn review_hook_reexport_move_is_informational_not_blocking() {
+    let base_background = "pub const BASE_Y: f32 = -70.0;\npub const BAND_H: f32 = 30.0;\n\npub fn draw() -> f32 {\n    BASE_Y + BAND_H\n}\n";
+    // consumer が CONST_A を自前で定義し、同ファイル内で利用している。
+    let base_consumer = "pub const CONST_A: f32 = -50.0;\n\npub struct Item {\n    pub size: f32,\n}\n\nimpl Item {\n    pub fn placement(&self) -> f32 {\n        CONST_A + self.size * 0.5\n    }\n}\n";
+
+    let output = a3_review_hook(
+        |root| {
+            // CONST_A の定義を background へ移動。BAND_H の値も同時に変更することで
+            // 「削除行を含む混在 hunk」になり、CONST_A は added ではなく modified 判定になる
+            // (これが Pass1 のフィルタ 6 をすり抜けて cross-file 探索に載る条件)。
+            std::fs::write(
+                root.join("src/game/background.rs"),
+                "pub const BASE_Y: f32 = -70.0;\npub const BAND_H: f32 = 40.0;\npub const CONST_A: f32 = BASE_Y + BAND_H * 0.5;\n\npub fn draw() -> f32 {\n    BASE_Y + BAND_H\n}\n",
+            )
+            .unwrap();
+            // 旧公開パスは再輸出で維持。利用行 (placement) は無変更。
+            std::fs::write(
+                root.join("src/game/consumer.rs"),
+                "pub use super::background::CONST_A;\n\npub struct Item {\n    pub size: f32,\n}\n\nimpl Item {\n    pub fn placement(&self) -> f32 {\n        CONST_A + self.size * 0.5\n    }\n}\n",
+            )
+            .unwrap();
+        },
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/lib.rs", "pub mod game;\n"),
+            (
+                "src/game/mod.rs",
+                "pub mod background;\npub mod consumer;\n",
+            ),
+            ("src/game/background.rs", base_background),
+            ("src/game/consumer.rs", base_consumer),
+        ],
+    );
+
+    // `review --hook` の JSON は stderr に出る。
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "再輸出で解決済みの移動は hook を落とすべきではない (exit 0 期待)\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.trim().is_empty(),
+        "hook 出力が空 (解析自体が skip された可能性)"
+    );
+    let json: serde_json::Value = serde_json::from_str(stderr.trim()).expect("hook json");
+    assert!(
+        json.get("impacts").is_none(),
+        "blocking な impacts は空であるべき: {stderr}"
+    );
+    // 情報としては残す (完全な沈黙にはしない)。移動元の未変更利用行も含めて
+    // informational へ回っていることを確認する。
+    let info = json
+        .get("impact_info")
+        .and_then(|v| v.as_array())
+        .expect("informational として報告は残すべき");
+    let refs = info[0]["refs"].as_array().expect("refs");
+    assert!(
+        refs.iter()
+            .any(|r| r["p"] == "src/game/consumer.rs" && r["ln"] == 8),
+        "無変更の利用行 (consumer.rs:8) が informational に含まれるべき: {stderr}"
+    );
+}
+
+/// 対照ケース: 上の抑制が効きすぎていないことの確認。
+/// **`review_hook_reexport_move_is_informational_not_blocking` と diff の形を揃え、
+/// 移動先の宣言の型だけを `f32` → `f64` に変える**。再輸出があっても参照側の式は
+/// 型不一致で壊れるため blocking を維持しなければならない。
+///
+/// 対照を「引数を増やした関数の移動」にしてはいけない: 関数はフィルタ 3
+/// (同一ファイル内で `-`/`+` 両方のシグネチャ行が要る `sig_changes` 判定) で
+/// cross-file 探索から落ち、抑制の有無に関わらず impact が出ない = 別の理由で
+/// テストが通ってしまう。
+#[test]
+fn review_hook_reexport_move_with_type_change_stays_blocking() {
+    let base_background = "pub const BASE_Y: f32 = -70.0;\npub const BAND_H: f32 = 30.0;\n\npub fn draw() -> f32 {\n    BASE_Y + BAND_H\n}\n";
+    let base_consumer = "pub const CONST_A: f32 = -50.0;\n\npub struct Item {\n    pub size: f32,\n}\n\nimpl Item {\n    pub fn placement(&self) -> f32 {\n        CONST_A + self.size * 0.5\n    }\n}\n";
+
+    let output = a3_review_hook(
+        |root| {
+            // 移動先の宣言の型が f32 → f64 に変わる (宣言ヘッダが不一致)。
+            std::fs::write(
+                root.join("src/game/background.rs"),
+                "pub const BASE_Y: f32 = -70.0;\npub const BAND_H: f32 = 40.0;\npub const CONST_A: f64 = -50.0;\n\npub fn draw() -> f32 {\n    BASE_Y + BAND_H\n}\n",
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("src/game/consumer.rs"),
+                "pub use super::background::CONST_A;\n\npub struct Item {\n    pub size: f32,\n}\n\nimpl Item {\n    pub fn placement(&self) -> f32 {\n        CONST_A + self.size * 0.5\n    }\n}\n",
+            )
+            .unwrap();
+        },
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/lib.rs", "pub mod game;\n"),
+            (
+                "src/game/mod.rs",
+                "pub mod background;\npub mod consumer;\n",
+            ),
+            ("src/game/background.rs", base_background),
+            ("src/game/consumer.rs", base_consumer),
+        ],
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "型が変わった移動は blocking を維持すべき (exit 1 期待)\nstderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(stderr.trim()).expect("hook json");
+    let impacts = json
+        .get("impacts")
+        .and_then(|v| v.as_array())
+        .expect("blocking な impacts が残るべき");
+    let refs = impacts[0]["refs"].as_array().expect("refs");
+    assert!(
+        refs.iter()
+            .any(|r| r["p"] == "src/game/consumer.rs" && r["ln"] == 8),
+        "未変更の利用行が blocking 側に残るべき: {stderr}"
+    );
+}

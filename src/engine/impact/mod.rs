@@ -3,6 +3,7 @@ mod filters;
 mod import_facts;
 mod pass2;
 mod pass3;
+mod reexport_move;
 mod signature;
 pub(crate) mod test_context;
 mod types;
@@ -21,6 +22,7 @@ use crate::models::symbol::SymbolKind;
 
 use pass2::stream_caller_maps_and_defs;
 use pass3::{apply_stage4b_single, build_file_impact, compute_has_parent_by_ix};
+use reexport_move::ReexportMoveIndex;
 use signature::detect_signature_changes;
 use test_context::is_in_test_context;
 
@@ -155,6 +157,11 @@ where
     // Pass 2: per-file で Definition 集合と References を同時収集し、caller_maps に即流す。
     // Phase 4: 低確信度 caller (BareNameOnly + generic name) は別バケット
     // (`typed_low_caller_maps`) へ振り分けて強い impact 信号を汚染しない。
+    // 「定義を別モジュールへ移動し旧公開パスを `pub use` で維持した」変更の索引。
+    // diff 全体から 1 度だけ構築し、Pass 2 の routing で旧パス側の未変更参照を
+    // informational へ降格するために使う。
+    let reexport_moves = ReexportMoveIndex::build(diff_input);
+
     let t = std::time::Instant::now();
     log_phase("context.pass2", "start", 0);
     let pass2_maps = stream_caller_maps_and_defs(
@@ -164,6 +171,7 @@ where
         &method_parent_types,
         dir,
         options,
+        &reexport_moves,
     );
     log_phase("context.pass2", "end", t.elapsed().as_millis());
     let crate::engine::impact::pass2::StreamCallerMaps {
