@@ -298,7 +298,7 @@ mod review_command_tests {
             Some(SkipInfo::not_git_repository()),
             Vec::new(),
         )
-            .expect("hook short-circuit must succeed");
+        .expect("hook short-circuit must succeed");
     }
 
     /// dir を canonicalize できない場合、dead 検出はエラーではなく空結果で返す。

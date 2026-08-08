@@ -10,11 +10,11 @@ use crate::service::{AppService, AstParams};
 
 mod common;
 
+pub use crate::output::{OutputFormat, OutputOptions, serialize_document};
 #[cfg(test)]
 pub(crate) use common::read_bytes_limited_and_drain;
 pub(crate) use common::{ChangedFileSet, cache_hash_for_path, log_phase, read_to_string_limited};
 pub use common::{MAX_INPUT_SIZE, classify_error, read_paths_file_limited};
-pub use crate::output::{OutputFormat, OutputOptions, serialize_document};
 
 // ---------------------------------------------------------------------------
 // 単一ファイル系コマンド（キャッシュ・出力フォーマット対応）

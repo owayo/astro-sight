@@ -12,9 +12,9 @@ use super::api_changes::extract_exported_symbols_from_file_inner;
 use super::api_changes::{
     bare_name, extract_exported_symbols_from_file_inner_with_lang, extract_symbol_lines,
 };
-use crate::output::{OutputOptions, serialize_document};
 use super::dead_code_member_liveness::{JsTsMemberLiveness, MemberStatus, PhpMemberLiveness};
 use super::git_input::{DiffSourceResolution, resolve_diff_source};
+use crate::output::{OutputOptions, serialize_document};
 
 /// dead-code 検出本体。候補収集 → 名前インデックス構築 → 参照カウント →
 /// アセット参照収集 → 分類の段階パイプラインで (dead_symbols, test_only_symbols) を返す。

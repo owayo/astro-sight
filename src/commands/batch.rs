@@ -36,10 +36,7 @@ fn build_batch_pool() -> Result<rayon::ThreadPool> {
 ///
 /// - JSON: 従来どおり 1 行の compact JSON (NDJSON の 1 レコード)
 /// - TOON: ルート配列の list item (`  - ...`、複数行になりうる)
-pub(crate) fn render_batch_record<T: serde::Serialize>(
-    value: &T,
-    output: OutputOptions,
-) -> String {
+pub(crate) fn render_batch_record<T: serde::Serialize>(value: &T, output: OutputOptions) -> String {
     if output.is_toon() {
         return serialize_toon_list_item(value)
             .unwrap_or_else(|e| render_batch_error(&anyhow::anyhow!(e.to_string()), output));
@@ -207,11 +204,7 @@ pub fn batch_calls(
     })
 }
 
-pub fn batch_imports(
-    service: &AppService,
-    paths: &[String],
-    output: OutputOptions,
-) -> Result<()> {
+pub fn batch_imports(service: &AppService, paths: &[String], output: OutputOptions) -> Result<()> {
     batch_ndjson(paths, output, |p| match service.extract_imports(p) {
         Ok(result) => render_batch_record(&result, output),
         Err(e) => render_batch_error(&e, output),

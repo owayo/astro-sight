@@ -319,7 +319,15 @@ fn dispatch_command(service: &AppService, command: Commands, output: OutputOptio
             no_cache,
         } => {
             if let Some(d) = &dir {
-                cmd_symbols_dir(service, d, glob.as_deref(), doc, full, query.as_deref(), output)
+                cmd_symbols_dir(
+                    service,
+                    d,
+                    glob.as_deref(),
+                    doc,
+                    full,
+                    query.as_deref(),
+                    output,
+                )
             } else {
                 let input =
                     resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
