@@ -95,6 +95,27 @@ struct DeadCodeCandidates {
     liveness_raw: Vec<(String, String, Vec<String>, crate::language::LangId)>,
 }
 
+/// workspace 相対パスの区切り文字を `/` に正規化する。
+///
+/// `DeadSymbol.file` は unified diff 由来のパス (`DiffFile.new_path` /
+/// `ApiSymbol.file`) と突き合わせるが、diff のパスは常に `/` 区切りである一方
+/// `Path::to_string_lossy` は Windows で `\` を返す。正規化しないと
+/// `filter_dead_by_touched_symbols` / `filter_dead_by_wip_added` の突合せが
+/// Windows で常に不一致になり、前者は dead を全件落とし (= `review --hook` の
+/// 既定スコープで dead 検出が丸ごと消える)、後者は WIP 抑止が効かなくなる。
+/// review JSON 内の他のパス項目 (`impact.changes[].path` /
+/// `missing_cochanges[].file` 等) との表記統一も兼ねる。
+///
+/// Unix ではバックスラッシュがファイル名の正当な文字なので、`MAIN_SEPARATOR` が
+/// `/` のプラットフォームでは何も置換しない。
+fn normalize_workspace_separators(path: &str) -> String {
+    if std::path::MAIN_SEPARATOR == '/' {
+        path.to_string()
+    } else {
+        path.replace(std::path::MAIN_SEPARATOR, "/")
+    }
+}
+
 /// 走査対象ファイルからエクスポートシンボル（trait impl メソッドは除外）と
 /// C/C++ liveness 補助情報を収集する。
 fn collect_dead_code_candidates(
@@ -113,8 +134,9 @@ fn collect_dead_code_candidates(
             Ok(p) => p,
             Err(_) => continue,
         };
+        // diff 由来のパス (常に `/` 区切り) と突き合わせるため区切り文字を正規化する。
         let rel = match canonical_path.strip_prefix(canonical_dir) {
-            Ok(p) => p.to_string_lossy().to_string(),
+            Ok(p) => normalize_workspace_separators(&p.to_string_lossy()),
             Err(_) => continue, // dir 外のパスは除外（セキュリティ境界）
         };
         if gitattrs.is_generated(&rel) {
@@ -490,18 +512,24 @@ pub(crate) const TEST_DIRECTORY_SEGMENTS: &[&str] = &[
 /// - ファイル名規約 (`*_test.go`, `*Test.php`, `*_spec.rb` 等) は既存の
 ///   `is_test_file_path` に委譲する。
 /// - ディレクトリセグメント規約は `TEST_DIRECTORY_SEGMENTS` に一元化。
+///
+/// 引数はファイルシステム上の絶対パスなので、区切り文字はプラットフォーム依存
+/// (Windows では `\`)。文字列を `/` 前提で分解すると Windows でどちらの規約にも
+/// マッチせず、テストからの参照が production 参照として数えられてしまう
+/// (`test_only_symbols` が常に空になり、テスト専用シンボルが live 扱いになる)。
+/// そのため `Path::file_name` / `Path::components` で分解してから判定する。
 pub(crate) fn is_test_path(path: &std::path::Path) -> bool {
-    if let Some(s) = path.to_str() {
-        if crate::engine::impact::test_context::is_test_file_path(s) {
-            return true;
-        }
-        if s.split('/')
-            .any(|seg| TEST_DIRECTORY_SEGMENTS.contains(&seg))
-        {
-            return true;
-        }
+    if let Some(name) = path.file_name().and_then(|s| s.to_str())
+        && crate::engine::impact::test_context::is_test_file_path(name)
+    {
+        return true;
     }
-    false
+    path.components().any(|c| {
+        matches!(c, std::path::Component::Normal(_))
+            && c.as_os_str()
+                .to_str()
+                .is_some_and(|seg| TEST_DIRECTORY_SEGMENTS.contains(&seg))
+    })
 }
 
 #[cfg(test)]
