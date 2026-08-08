@@ -188,14 +188,22 @@ fn toon_refs_batch_becomes_a_single_document() {
 // auto (json / toon のうち短い方)
 // ---------------------------------------------------------------------------
 
+/// `auto` の判定指標 (`output::size_metric` と同じ規則)。
+/// 素の文字数ではなく「文字数 + 3 × 改行数」— BPE では改行 + インデントが
+/// 1 行あたり約 1 トークンを消費するため。
+fn size_metric(text: &str) -> usize {
+    text.chars().count() + 3 * text.bytes().filter(|b| *b == b'\n').count()
+}
+
 #[test]
-fn auto_picks_whichever_is_shorter() {
+fn auto_picks_the_smaller_estimate() {
     let repo = sample_repo();
     for args in [
         vec!["symbols", "--path", "a.rs"],
         vec!["refs", "--name", "alpha", "--dir", "."],
         vec!["imports", "--path", "a.rs"],
         vec!["calls", "--path", "a.rs"],
+        vec!["ast", "--path", "a.rs", "--line", "1", "--col", "0"],
     ] {
         let json = stdout_of(&run(&repo, &args));
         let mut toon_args = args.clone();
@@ -205,18 +213,51 @@ fn auto_picks_whichever_is_shorter() {
         auto_args.extend(["--format", "auto"]);
         let auto = stdout_of(&run(&repo, &auto_args));
 
-        let shorter = if toon.chars().count() < json.chars().count() {
+        let expected = if size_metric(&toon) < size_metric(&json) {
             &toon
         } else {
             &json
         };
         assert_eq!(
-            &auto, shorter,
-            "auto should pick the shorter one for {args:?}"
+            &auto, expected,
+            "auto should pick the smaller estimate for {args:?}"
         );
-        assert!(auto.chars().count() <= json.chars().count());
-        assert!(auto.chars().count() <= toon.chars().count());
+        assert!(size_metric(&auto) <= size_metric(&json));
+        assert!(size_metric(&auto) <= size_metric(&toon));
     }
+}
+
+#[test]
+fn auto_uses_the_line_penalty_not_raw_char_count() {
+    // 実トークナイザで裏を取ったケース (o200k_base / cl100k_base 共通):
+    //   json 25 文字 / 17 tokens、toon 19 文字 / 19 tokens
+    // 素の文字数で選ぶと TOON を選んで損をする。auto は JSON を選ぶ。
+    let repo = TestRepo::new();
+    repo.write("t.rs", "pub const A: usize = 1;\n");
+
+    let json = stdout_of(&run(&repo, &["imports", "--path", "t.rs"]));
+    let toon = stdout_of(&run(
+        &repo,
+        &["imports", "--path", "t.rs", "--format", "toon"],
+    ));
+    let auto = stdout_of(&run(
+        &repo,
+        &["imports", "--path", "t.rs", "--format", "auto"],
+    ));
+
+    // このフィクスチャでは TOON の方が文字数は少ないが行数が多い。
+    assert!(
+        toon.chars().count() < json.chars().count(),
+        "fixture must favour TOON on raw chars: {json:?} / {toon:?}"
+    );
+    assert_eq!(
+        auto,
+        if size_metric(&toon) < size_metric(&json) {
+            toon.clone()
+        } else {
+            json.clone()
+        }
+    );
 }
 
 #[test]

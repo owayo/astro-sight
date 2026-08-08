@@ -148,7 +148,8 @@ debug = false
 # 既定の出力フォーマット: "json" | "toon" | "auto" (デフォルト: json)
 # toon = Token-Oriented Object Notation v4.1 (https://toonformat.dev/)。
 #        同じ内容を少ないトークン数で表現でき、LLM へ渡す用途に向く。
-# auto = json と toon のうち、その出力で文字数が少ない方を自動で選ぶ。
+# auto = json と toon のうち、その出力で推定トークン数が小さい方を自動で選ぶ
+#        (文字数 + 行数罰則。BPE では改行とインデントが 1 行あたり 1 トークンほど掛かる)。
 # CLI の --format はこの設定より優先される。
 # session / review --hook / impact --hook / エラー出力は行指向 JSON の契約が
 # あるため、この設定に関わらず常に JSON。

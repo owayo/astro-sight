@@ -2,7 +2,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use tracing::info;
 
-use crate::output::{OutputFormat, OutputOptions, serialize_toon_list_item, toon};
+use crate::output::{OutputFormat, OutputOptions, estimated_size, serialize_toon_list_item, toon};
 use crate::service::{AppService, AstParams};
 
 use super::common::{classify_error, make_error_line};
@@ -53,14 +53,16 @@ impl BatchRendered {
         }
     }
 
-    /// `auto` の集計用。`(json 側の文字数, toon 側の文字数)`。
-    fn char_lens(&self) -> (usize, usize) {
+    /// `auto` の集計用。`(json 側の推定サイズ, toon 側の推定サイズ)`。
+    /// 単位は `output::estimated_size` (文字数 + 行罰則) で、単一ドキュメント側の
+    /// 判定と同じ物差しを使う。
+    fn size_metrics(&self) -> (usize, usize) {
         match self {
             BatchRendered::One(text) => {
-                let n = text.chars().count();
+                let n = estimated_size(text);
                 (n, n)
             }
-            BatchRendered::Both { json, toon } => (json.chars().count(), toon.chars().count()),
+            BatchRendered::Both { json, toon } => (estimated_size(json), estimated_size(toon)),
         }
     }
 }
@@ -151,12 +153,13 @@ where
 /// バッチ全体へ引き伸ばしてから比較する (両辺に window 件数を掛けて整数のまま扱う)。
 /// 1 window で収まる入力ではこの引き伸ばしが恒等変換になり、比較は厳密になる。
 ///
-/// レコードごとの改行は両形式で同数なので相殺され、比較には現れない。
+/// 各長さは `output::estimated_size` (文字数 + 行罰則) の単位。レコードを区切る改行は
+/// 両形式で同数なので相殺され、比較には現れない。
 /// 同点は JSON (既定フォーマットで消費側の互換性が高い)。
 fn decide_batch_format(
     json_len: usize,
     toon_len: usize,
-    header_len: usize,
+    header_size: usize,
     window_records: usize,
     total_records: usize,
 ) -> OutputFormat {
@@ -164,8 +167,8 @@ fn decide_batch_format(
     let total_records = total_records.max(1) as u128;
 
     let json_total = json_len as u128 * total_records;
-    // ヘッダ本体 + 改行 1 個。window 件数を掛けているのは両辺のスケールを合わせるため。
-    let toon_total = toon_len as u128 * total_records + (header_len as u128 + 1) * window_records;
+    // ヘッダは 1 回きりのコスト。window 件数を掛けているのは両辺のスケールを合わせるため。
+    let toon_total = toon_len as u128 * total_records + header_size as u128 * window_records;
 
     if toon_total < json_total {
         OutputFormat::Toon
@@ -220,17 +223,14 @@ where
                 // 解析結果を全件保持する必要があり、ピーク RSS の要件を壊すため
                 // 「同じコマンドの実データによる標本」で近似する (決定的)。
                 let (json_len, toon_len) = rendered.iter().fold((0, 0), |(j, t), r| {
-                    let (rj, rt) = r.char_lens();
+                    let (rj, rt) = r.size_metrics();
                     (j + rj, t + rt)
                 });
                 let header = toon::streaming_array_header(paths.len());
-                let winner = decide_batch_format(
-                    json_len,
-                    toon_len,
-                    header.chars().count(),
-                    chunk.len(),
-                    paths.len(),
-                );
+                // ヘッダ行も本文と同じ物差しで測る (末尾の改行 1 個を含める)。
+                let header_size = estimated_size(&header) + estimated_size("\n");
+                let winner =
+                    decide_batch_format(json_len, toon_len, header_size, chunk.len(), paths.len());
                 let opts = output.with_format(winner);
                 resolved = Some(opts);
                 if winner == OutputFormat::Toon {
@@ -485,16 +485,16 @@ mod tests {
 
         // 1 window で収まる入力: ヘッダ込みで厳密に比較する。
         // json=100, toon=100 → 同点 + ヘッダ分で JSON。
-        assert_eq!(decide_batch_format(100, 100, 4, 10, 10), OutputFormat::Json);
-        // json=100, toon=90 → ヘッダ 5 文字を足しても TOON が短い。
-        assert_eq!(decide_batch_format(100, 90, 4, 10, 10), OutputFormat::Toon);
-        // json=100, toon=96 → ヘッダ 5 文字でひっくり返って JSON。
-        assert_eq!(decide_batch_format(100, 96, 4, 10, 10), OutputFormat::Json);
+        assert_eq!(decide_batch_format(100, 100, 5, 10, 10), OutputFormat::Json);
+        // json=100, toon=90 → ヘッダ 5 を足しても TOON が短い。
+        assert_eq!(decide_batch_format(100, 90, 5, 10, 10), OutputFormat::Toon);
+        // json=100, toon=96 → ヘッダ 5 でひっくり返って JSON。
+        assert_eq!(decide_batch_format(100, 96, 5, 10, 10), OutputFormat::Json);
 
         // window が全体の一部なら、ヘッダは 1 回きりのコストとして薄まる。
         // 同じ window 実測値 (json=100, toon=96) でも、全体 1000 件なら TOON が勝つ。
         assert_eq!(
-            decide_batch_format(100, 96, 10, 4, 1000),
+            decide_batch_format(100, 96, 11, 4, 1000),
             OutputFormat::Toon
         );
     }

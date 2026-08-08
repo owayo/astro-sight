@@ -55,7 +55,7 @@ printf '%s\n' \
   '{"command":"refs","name":"S","dir":"."}' \
   '{"command":"symbols","path":"src/main.rs"}' \
   | astro-sight session                                  # 13. batch mixed queries
-astro-sight <command> --format auto                # 14. json/toon whichever is shorter (17-60% fewer tokens)
+astro-sight <command> --format auto                # 14. json/toon whichever costs fewer tokens
 ```
 
 ## Commands
@@ -274,7 +274,7 @@ printf '%s\n' \
 - **16 tree-sitter languages**: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby, Zig — plus Xojo via a lexer-only backend (`symbols` / `refs` / `dead-code` only; `ast` / `calls` / `imports` / `lint` / `sequence` return `UNSUPPORTED_LANGUAGE`). Ruby methods may use Unicode identifiers, including simple case-fold characters such as `ſ` and `K`.
 - Compact JSON by default (short keys: `ln`, `col`, `ctx`, `refs`, `src`, `def`/`ref`, `fn`...). Use `--pretty` (global) for human-readable output.
 - **`--format json|toon|auto`** (global) switches the output format; the default is `json`, and `format` in `~/.config/astro-sight/config.toml` sets a different default (CLI `--format` wins). TOON ([v4.1](https://toonformat.dev/)) encodes the same data with indentation and tables instead of repeated keys, measuring 17-60% smaller than compact JSON across commands. `--pretty` is JSON-only and ignored for TOON.
-- **`--format auto`** encodes both and emits whichever has fewer characters (ties go to JSON), so it is never longer than either candidate. The choice is deterministic for a given input. For batch modes the winner is decided from the first window of records and applied to the rest, since results are streamed rather than fully buffered.
+- **`--format auto`** encodes both and emits whichever is estimated to use fewer tokens (character count plus a per-line penalty, since BPE spends roughly one token per newline+indent; ties go to JSON), so it is never worse than either candidate. The choice is deterministic for a given input. For batch modes the winner is decided from the first window of records and applied to the rest, since results are streamed rather than fully buffered.
 - **Always JSON regardless of `--format`**: `session` (line-oriented NDJSON protocol), `review --hook` / `impact --hook` (Stop hook contract), and the `{"error":{...}}` envelope. Passing `--format toon` explicitly to those is an `INVALID_REQUEST`; a config-file default silently falls back to JSON so setting `format = "toon"` never breaks hooks. `--format auto` is accepted there and simply yields JSON.
 - With `--format toon`, batch modes (`--paths` / `--paths-file` / `--dir`) emit **one root-array document** (`[N]:` followed by `- ` items) instead of NDJSON. Optional fields that compact JSON omits (e.g. `cx`) appear as explicit `null` cells so uniform tables stay possible.
 - `refs` respects `.gitignore`; results include `ctx` (source line) so no follow-up Read is needed. Use `refs --names` for symbol-only batches, `session` for mixed commands.
