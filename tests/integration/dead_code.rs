@@ -499,6 +499,115 @@ fn dead_scope_touched_symbols_excludes_pre_existing_dead() {
     let _ = Path::new(root);
 }
 
+/// `dead_symbols[].file` は常に `/` 区切りで返す。
+///
+/// このパスは `filter_dead_by_touched_symbols` / `filter_dead_by_wip_added` で
+/// unified diff 由来のパス (`DiffFile.new_path` / `ApiSymbol.file`、常に `/` 区切り)
+/// と突き合わせるほか、review JSON では `impact.changes[].path` /
+/// `missing_cochanges[].file` と同じ文書内に並ぶ。`Path::to_string_lossy` の値を
+/// そのまま使うと Windows で `\` 区切りになり、突合せが常に不一致になる。
+#[test]
+fn dead_code_reports_forward_slash_paths() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    std::fs::create_dir_all(repo.join("src/nested")).expect("create nested dir");
+    std::fs::write(
+        repo.join("src/nested/lib.ts"),
+        "export function neverUsed(): void {}\n",
+    )
+    .expect("write lib.ts");
+
+    let out = cargo_bin()
+        .args(["dead-code", "--dir", repo.to_str().unwrap()])
+        .output()
+        .expect("run dead-code");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("invalid JSON");
+    let dead = json["dead_symbols"].as_array().expect("dead_symbols 配列");
+    let files: Vec<&str> = dead.iter().filter_map(|s| s["file"].as_str()).collect();
+
+    assert!(
+        files.contains(&"src/nested/lib.ts"),
+        "dead_symbols[].file は `/` 区切りの workspace 相対パスであるべき: {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.contains('\\')),
+        "dead_symbols[].file にプラットフォーム固有の区切り文字を含めてはいけない: {files:?}"
+    );
+}
+
+/// `--dead-scope touched-symbols` はネストしたディレクトリのファイルでも機能する。
+///
+/// `dead_scope_touched_symbols_excludes_pre_existing_dead` の姉妹テスト。
+/// 突合せキーであるパスの区切り文字が diff 側と揃っていないと、changed file 判定が
+/// 常に外れて dead が 0 件になる (`review --hook` の既定スコープで検出が消える)。
+#[test]
+fn dead_scope_touched_symbols_matches_nested_paths() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src/deep/nest")).expect("create nested dir");
+    std::fs::write(
+        root.join("src/deep/nest/mod.ts"),
+        "export const KEEP = 1;\n",
+    )
+    .unwrap();
+
+    let git = |args: &[&str]| {
+        let s = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .unwrap();
+        assert!(s.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "astro-sight@example.com"]);
+    git(&["config", "user.name", "astro-sight-tests"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial", "-q"]);
+
+    // 未参照の export を追加。宣言行が diff hunk に含まれる。
+    std::fs::write(
+        root.join("src/deep/nest/mod.ts"),
+        "export const KEEP = 1;\n\nexport function addedDead(): void {}\n",
+    )
+    .unwrap();
+
+    let out = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--git",
+            "--dead-scope",
+            "touched-symbols",
+        ])
+        .output()
+        .expect("run dead-code");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let dead: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        dead.contains(&"addedDead"),
+        "ネストしたパスでも touched-symbols スコープで検出されるべき: {dead:?}"
+    );
+}
+
 /// dead-code の検出結果には宣言行を含める。
 ///
 /// `file` だけだと利用者が結局シンボルを探し直すことになり、
