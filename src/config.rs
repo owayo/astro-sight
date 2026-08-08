@@ -17,7 +17,8 @@ pub struct Config {
     /// ログディレクトリのパス。
     pub log_path: PathBuf,
 
-    /// 既定の出力フォーマット。CLI の `--format` が指定されればそちらが優先される。
+    /// 既定の出力フォーマット (`json` / `toon` / `auto`)。
+    /// CLI の `--format` が指定されればそちらが優先される。
     pub format: OutputFormat,
 }
 
@@ -144,9 +145,10 @@ debug = false
 # ログディレクトリのパス (デフォルト: ~/.config/astro-sight/logs)
 # log_path = "~/.config/astro-sight/logs"
 
-# 既定の出力フォーマット: "json" | "toon" (デフォルト: json)
+# 既定の出力フォーマット: "json" | "toon" | "auto" (デフォルト: json)
 # toon = Token-Oriented Object Notation v4.1 (https://toonformat.dev/)。
-# 同じ内容を少ないトークン数で表現でき、LLM へ渡す用途に向く。
+#        同じ内容を少ないトークン数で表現でき、LLM へ渡す用途に向く。
+# auto = json と toon のうち、その出力で文字数が少ない方を自動で選ぶ。
 # CLI の --format はこの設定より優先される。
 # session / review --hook / impact --hook / エラー出力は行指向 JSON の契約が
 # あるため、この設定に関わらず常に JSON。
@@ -249,6 +251,16 @@ mod tests {
 
         let config = ConfigService::load(Some(&config_path)).unwrap();
         assert_eq!(config.format, OutputFormat::Toon);
+    }
+
+    #[test]
+    fn test_load_format_auto() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "format = \"auto\"\n").unwrap();
+
+        let config = ConfigService::load(Some(&config_path)).unwrap();
+        assert_eq!(config.format, OutputFormat::Auto);
     }
 
     #[test]

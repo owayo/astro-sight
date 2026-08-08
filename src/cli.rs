@@ -26,7 +26,7 @@ pub struct Cli {
     #[arg(long, global = true, value_enum)]
     pub format: Option<crate::output::OutputFormat>,
 
-    /// Pretty-print JSON output (default: compact). JSON only; ignored for `--format toon`
+    /// Pretty-print JSON output (default: compact). Applies only when JSON is emitted
     #[arg(long, global = true)]
     pub pretty: bool,
 

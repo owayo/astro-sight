@@ -182,6 +182,162 @@ fn toon_refs_batch_becomes_a_single_document() {
 }
 
 // ---------------------------------------------------------------------------
+// auto (json / toon のうち短い方)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn auto_picks_whichever_is_shorter() {
+    let repo = sample_repo();
+    for args in [
+        vec!["symbols", "--path", "a.rs"],
+        vec!["refs", "--name", "alpha", "--dir", "."],
+        vec!["imports", "--path", "a.rs"],
+        vec!["calls", "--path", "a.rs"],
+    ] {
+        let json = stdout_of(&run(&repo, &args));
+        let mut toon_args = args.clone();
+        toon_args.extend(["--format", "toon"]);
+        let toon = stdout_of(&run(&repo, &toon_args));
+        let mut auto_args = args.clone();
+        auto_args.extend(["--format", "auto"]);
+        let auto = stdout_of(&run(&repo, &auto_args));
+
+        let shorter = if toon.chars().count() < json.chars().count() {
+            &toon
+        } else {
+            &json
+        };
+        assert_eq!(
+            &auto, shorter,
+            "auto should pick the shorter one for {args:?}"
+        );
+        assert!(auto.chars().count() <= json.chars().count());
+        assert!(auto.chars().count() <= toon.chars().count());
+    }
+}
+
+#[test]
+fn auto_batch_emits_exactly_one_valid_format() {
+    let repo = sample_repo();
+    let auto = stdout_of(&run(
+        &repo,
+        &[
+            "symbols", "--dir", ".", "--glob", "**/*.rs", "--format", "auto",
+        ],
+    ));
+
+    if auto.starts_with('[') {
+        // TOON を選んだ場合: ヘッダの要素数と item 数が一致すること。
+        let header = auto.lines().next().expect("header line");
+        let declared: usize = header
+            .trim_start_matches('[')
+            .trim_end_matches("]:")
+            .parse()
+            .expect("array length in header");
+        let items = auto.lines().filter(|l| l.starts_with("  - ")).count();
+        assert_eq!(
+            declared, items,
+            "header length must match item count: {auto}"
+        );
+    } else {
+        // JSON を選んだ場合: 全行が独立した JSON ドキュメントであること。
+        for line in auto.lines() {
+            serde_json::from_str::<serde_json::Value>(line).expect("each line is a JSON document");
+        }
+    }
+
+    // どちらを選んだにせよ、両候補以下の長さになる。
+    let json = stdout_of(&run(&repo, &["symbols", "--dir", ".", "--glob", "**/*.rs"]));
+    let toon = stdout_of(&run(
+        &repo,
+        &[
+            "symbols", "--dir", ".", "--glob", "**/*.rs", "--format", "toon",
+        ],
+    ));
+    assert!(auto.chars().count() <= json.chars().count());
+    assert!(auto.chars().count() <= toon.chars().count());
+}
+
+#[test]
+fn auto_never_mixes_the_two_formats_in_one_document() {
+    // バッチは window 単位で描画するため、途中でフォーマットが切り替わると
+    // どちらの decoder でも読めない出力になる。1 本に統一されていることを固定する。
+    let repo = TestRepo::new();
+    for i in 0..40 {
+        repo.write(
+            format!("f{i}.rs"),
+            format!(
+                "pub const C{i}: usize = {i};
+pub fn f{i}() -> usize {{
+    C{i}
+}}
+"
+            ),
+        );
+    }
+    let auto = stdout_of(&run(
+        &repo,
+        &[
+            "symbols", "--dir", ".", "--glob", "**/*.rs", "--format", "auto",
+        ],
+    ));
+
+    let json_lines = auto
+        .lines()
+        .filter(|l| l.starts_with('{') && l.ends_with('}'))
+        .count();
+    let toon_items = auto.lines().filter(|l| l.starts_with("  - ")).count();
+    assert!(
+        json_lines == 0 || toon_items == 0,
+        "output mixes NDJSON and TOON items: {auto}"
+    );
+}
+
+#[test]
+fn auto_config_default_works_and_cli_overrides_it() {
+    let repo = sample_repo();
+    repo.write("astro-sight.toml", "format = \"auto\"\n");
+    let config = repo.path("astro-sight.toml");
+    let config = config.to_str().expect("utf-8 path");
+
+    let auto = stdout_of(&run(
+        &repo,
+        &["--config", config, "symbols", "--path", "a.rs"],
+    ));
+    let explicit_auto = stdout_of(&run(
+        &repo,
+        &["symbols", "--path", "a.rs", "--format", "auto"],
+    ));
+    assert_eq!(auto, explicit_auto);
+
+    // CLI の明示指定が config より優先される。
+    let json = stdout_of(&run(
+        &repo,
+        &[
+            "--config", config, "symbols", "--path", "a.rs", "--format", "json",
+        ],
+    ));
+    assert!(json.starts_with('{'), "unexpected: {json}");
+}
+
+#[test]
+fn auto_is_accepted_on_json_protocol_surfaces() {
+    // `auto` は「TOON で出せ」という要求ではないので、session でもエラーにしない。
+    let repo = sample_repo();
+    let session = cargo_bin()
+        .args(["session", "--format", "auto"])
+        .current_dir(repo.root())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run session");
+    assert!(
+        session.status.success(),
+        "session must accept --format auto: {}",
+        String::from_utf8_lossy(&session.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // プロトコル面は JSON 固定
 // ---------------------------------------------------------------------------
 

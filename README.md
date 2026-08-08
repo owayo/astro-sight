@@ -95,9 +95,12 @@ astro-sight symbols --pretty --path src/main.rs
 
 # TOON 出力（同じ内容をより少ないトークンで）
 astro-sight symbols --path src/main.rs --format toon
+
+# json / toon のうち出力文字数が少ない方を自動選択
+astro-sight symbols --path src/main.rs --format auto
 ```
 
-`--format json|toon` で出力形式を切り替える。既定は `json` で、`config.toml` の `format` でも既定値を変えられる（優先順位は **CLI `--format` > `config.toml` > `json`**）。詳細は [Output Format](#output-format)。
+`--format json|toon|auto` で出力形式を切り替える。既定は `json` で、`config.toml` の `format` でも既定値を変えられる（優先順位は **CLI `--format` > `config.toml` > `json`**）。詳細は [Output Format](#output-format)。
 
 ### エージェント向けレビュー手順
 
@@ -684,14 +687,14 @@ compact 出力例（ast/symbols）:
 
 ## Output Format
 
-`--format json|toon` で出力形式を切り替える。既定は `json`。
+`--format json|toon|auto` で出力形式を切り替える。既定は `json`。
 
-| | JSON | TOON |
-|---|---|---|
-| 既定 | ✅ | |
-| 仕様 | RFC 8259 | [TOON v4.1](https://toonformat.dev/) |
-| `--pretty` | 有効 | 無視（TOON は元からインデント構造） |
-| キャッシュ | compact のみ利用 | 利用しない |
+| | JSON | TOON | auto |
+|---|---|---|---|
+| 既定 | ✅ | | |
+| 仕様 | RFC 8259 | [TOON v4.1](https://toonformat.dev/) | どちらか |
+| `--pretty` | 有効 | 無視（TOON は元からインデント構造） | JSON が選ばれた場合のみ有効 |
+| キャッシュ | compact のみ利用 | 利用しない | 利用しない |
 
 ### TOON とは
 
@@ -732,9 +735,25 @@ astro-sight のリポジトリ (`src/` 全体) での実測値:
 
 出力はリファレンス実装 ([`@toon-format/toon`](https://www.npmjs.com/package/@toon-format/toon) v4.1) の **strict モード** で decode できることを確認している。
 
+### auto — 短い方を自動選択
+
+`--format auto` は、その出力について **compact JSON と TOON を両方エンコードし、文字数が少ない方**を選ぶ。同点なら JSON（既定フォーマットで消費側の互換性が高いため）。
+
+```bash
+astro-sight symbols --path src/main.rs --format auto
+```
+
+- **常に両候補以下の長さになる**（どちらかを選ぶだけなので、片方より長くなることはない）
+- 選択は入力内容だけで決まるので**決定的**。同じ入力・同じバージョンなら常に同じ形式になる
+- `--pretty` は「選ばれた JSON をどう描画するか」だけを決める。比較そのものは常に compact JSON と TOON で行うため、TOON が勝った場合は `--pretty` の指定は効かない
+- 空 object（`{}`）は TOON では空ドキュメント＝無出力になるため、auto は JSON を選ぶ。「結果が空」と「何も出力されなかった」を利用者が区別できなくなるのを避けるため（明示的な `--format toon` は仕様どおり空ドキュメントを出す）
+- プロトコル面（下記）では `auto` はエラーにならず JSON になる。「TOON で出せ」という満たせない要求ではなく、JSON を選ぶことも auto の正当な結果のため
+
+**バッチでの近似**: `--paths` / `--paths-file` / `--dir` は解析結果を全件バッファしない設計のため、全レコードを見てから勝者を決められない。**最初の window（既定でワーカー数 × 8 件）を両形式で描画し、その実測値で勝者を決めて以降の window に適用する**。二重エンコードのコストは先頭 window ぶんだけで、解析自体はどの経路でもパス 1 回きり。出力が途中で混ざることはない。
+
 ### 常に JSON のままの出力
 
-次の 3 つは相手側が JSON を前提とする契約のため、`--format` の対象外。
+次の 3 つは相手側が JSON を前提とする契約のため、`--format json|toon` の対象外（`auto` は JSON を選ぶだけなのでエラーにならない）。
 
 | 出力面 | 理由 |
 |---|---|
@@ -787,7 +806,7 @@ debug = false
 # ログディレクトリのパス (デフォルト: ~/.config/astro-sight/logs)
 # log_path = "~/.config/astro-sight/logs"
 
-# 既定の出力フォーマット: "json" | "toon" (デフォルト: json)
+# 既定の出力フォーマット: "json" | "toon" | "auto" (デフォルト: json)
 format = "json"
 ```
 

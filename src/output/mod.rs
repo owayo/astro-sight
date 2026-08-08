@@ -34,6 +34,8 @@ pub enum OutputFormat {
     Json,
     /// TOON v4.1 - same data, fewer tokens (https://toonformat.dev/)
     Toon,
+    /// Whichever of json/toon produces fewer characters for this output
+    Auto,
 }
 
 impl OutputFormat {
@@ -41,8 +43,20 @@ impl OutputFormat {
         match self {
             OutputFormat::Json => "json",
             OutputFormat::Toon => "toon",
+            OutputFormat::Auto => "auto",
         }
     }
+}
+
+/// `auto` の比較単位。文字数 (Unicode スカラー値の個数) で比べる。
+///
+/// バイト長ではなく文字数にするのは、日本語 docstring のようなマルチバイト文字が
+/// 「1 文字 = 3 バイト」で重み付けされるのを避けるため。両形式が運ぶ本文は同一なので
+/// 実際には勝敗が変わることはまずないが、「出力文字数が少ない方」という規則を
+/// そのまま実装しておく方が説明と一致する。
+/// 同点のときは常に JSON 側へ倒す (既定フォーマットで消費側の互換性が最も高いため)。
+fn char_len(text: &str) -> usize {
+    text.chars().count()
 }
 
 /// JSON の整形スタイル。`--pretty` は JSON 固有の設定で、TOON には対応概念が無い
@@ -110,6 +124,22 @@ impl OutputOptions {
         self.format == OutputFormat::Toon
     }
 
+    pub fn is_auto(&self) -> bool {
+        self.format == OutputFormat::Auto
+    }
+
+    /// 「1 行 1 レコードの compact JSON をそのまま流せる」状態か。
+    /// streaming 経路 (`context` の逐次出力) に乗せてよいかの判定に使う。
+    /// `auto` は両形式を比べるまで結果が決まらないので false。
+    pub fn streams_compact_json(&self) -> bool {
+        self.format == OutputFormat::Json && self.json_style == JsonStyle::Compact
+    }
+
+    /// `auto` の判定が済んだ後に、確定したフォーマットで options を作り直す。
+    pub fn with_format(self, format: OutputFormat) -> Self {
+        Self { format, ..self }
+    }
+
     /// `--pretty` が実際に効く状態か。TOON には整形の概念が無いので常に false。
     /// `calls` のように `--pretty` が DTO 選択も兼ねている既存分岐で使う。
     pub fn is_pretty_json(&self) -> bool {
@@ -128,6 +158,8 @@ impl OutputOptions {
     ///
     /// CLI で明示された `--format toon` は満たせない要求なのでエラー、config 由来の
     /// 既定値は JSON へ暗黙フォールバックさせる (`Ok`)。
+    /// (`auto` はエラーにしない — JSON を選ぶことも `auto` の正当な結果であり、
+    /// 「TOON で出せ」という満たせない要求ではないため。)
     pub fn ensure_json_protocol(&self, surface: &str) -> Result<()> {
         if self.format == OutputFormat::Toon && self.explicit_format {
             return Err(AstroError::new(
@@ -153,6 +185,23 @@ pub fn serialize_document<T: serde::Serialize + ?Sized>(
             JsonStyle::Pretty => Ok(serde_json::to_string_pretty(value)?),
         },
         OutputFormat::Toon => to_toon(value, toon::encode_value),
+        OutputFormat::Auto => {
+            // 比較は常に compact JSON と TOON で行う (どちらも「短く出す」形)。
+            // JSON が勝った場合だけ `--pretty` を適用する = auto は形式を選び、
+            // `--pretty` は選ばれた JSON の描画方法を決める、という役割分担。
+            let compact = serde_json::to_string(value)?;
+            let toon = to_toon(value, toon::encode_value)?;
+            // 空 object は TOON では「空ドキュメント」= 無出力になる (§8)。仕様上は正しいが、
+            // auto で選ぶと「結果が空」と「コマンドが何も出さなかった」を利用者が区別できない。
+            // 明示的な `--format toon` は仕様どおりの挙動を維持し、auto だけ JSON へ倒す。
+            if !toon.is_empty() && char_len(&toon) < char_len(&compact) {
+                return Ok(toon);
+            }
+            match output.json_style {
+                JsonStyle::Compact => Ok(compact),
+                JsonStyle::Pretty => Ok(serde_json::to_string_pretty(value)?),
+            }
+        }
     }
 }
 
@@ -369,9 +418,100 @@ mod tests {
     }
 
     #[test]
+    fn auto_picks_the_shorter_of_json_and_toon() {
+        let auto = OutputOptions::new(OutputFormat::Auto, JsonStyle::Compact);
+        let json = OutputOptions::new(OutputFormat::Json, JsonStyle::Compact);
+        let toon = OutputOptions::new(OutputFormat::Toon, JsonStyle::Compact);
+
+        // object 主体の出力では、引用符と波括弧が消えるぶん TOON が勝つ。
+        let doc = mixed_doc();
+        assert_eq!(
+            serialize_document(&doc, auto).unwrap(),
+            serialize_document(&doc, toon).unwrap()
+        );
+
+        // プリミティブ配列は JSON の方が短い (`[1,2,3]` < `[3]: 1,2,3`)。
+        let flat = vec![1u32, 2, 3];
+        assert_eq!(
+            serialize_document(&flat, auto).unwrap(),
+            serialize_document(&flat, json).unwrap()
+        );
+    }
+
+    #[test]
+    fn auto_never_exceeds_either_candidate() {
+        // auto は「短い方」なので、常に両候補以下になる。
+        let auto = OutputOptions::new(OutputFormat::Auto, JsonStyle::Compact);
+        let json = OutputOptions::new(OutputFormat::Json, JsonStyle::Compact);
+        let toon = OutputOptions::new(OutputFormat::Toon, JsonStyle::Compact);
+
+        for probe in [
+            serde_json::json!({"a": 1}),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!({"rows": [{"a": 1, "b": 2}, {"a": 3, "b": 4}]}),
+            serde_json::json!({"rows": [{"a": 1}, {"b": 2}]}),
+            serde_json::json!("plain"),
+            serde_json::json!([]),
+        ] {
+            let n = |o| serialize_document(&probe, o).unwrap().chars().count();
+            assert!(n(auto) <= n(json), "auto longer than json for {probe}");
+            assert!(n(auto) <= n(toon), "auto longer than toon for {probe}");
+        }
+    }
+
+    #[test]
+    fn auto_does_not_choose_an_empty_toon_document() {
+        // 空 object は TOON では無出力になる。auto がそれを選ぶと「結果が空」と
+        // 「何も出力されなかった」を区別できなくなるため JSON へ倒す。
+        #[derive(serde::Serialize)]
+        struct Empty {}
+        let auto = OutputOptions::new(OutputFormat::Auto, JsonStyle::Compact);
+        assert_eq!(serialize_document(&Empty {}, auto).unwrap(), "{}");
+
+        // 明示的な `--format toon` は仕様どおり空ドキュメントのまま。
+        let toon = OutputOptions::new(OutputFormat::Toon, JsonStyle::Compact);
+        assert_eq!(serialize_document(&Empty {}, toon).unwrap(), "");
+    }
+
+    #[test]
+    fn auto_applies_pretty_only_when_json_wins() {
+        // auto は「形式」を選び、`--pretty` は選ばれた JSON の描画方法を決める。
+        // 比較そのものは常に compact JSON と TOON で行う。
+        let auto_pretty = OutputOptions::new(OutputFormat::Auto, JsonStyle::Pretty);
+
+        let flat = vec![1u32, 2, 3];
+        assert_eq!(
+            serialize_document(&flat, auto_pretty).unwrap(),
+            serde_json::to_string_pretty(&flat).unwrap()
+        );
+
+        // TOON が勝つ入力では `--pretty` は効かない (TOON に整形の概念が無いため)。
+        let doc = mixed_doc();
+        assert_eq!(
+            serialize_document(&doc, auto_pretty).unwrap(),
+            serialize_document(
+                &doc,
+                OutputOptions::new(OutputFormat::Toon, JsonStyle::Compact)
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn auto_is_allowed_on_json_protocol_surfaces() {
+        // `auto` は「TOON で出せ」という要求ではないので、プロトコル面でもエラーにしない
+        // (JSON を選ぶことも auto の正当な結果)。
+        let explicit = OutputOptions::resolve(Some(OutputFormat::Auto), OutputFormat::Json, false);
+        assert!(explicit.ensure_json_protocol("session").is_ok());
+    }
+
+    #[test]
     fn only_compact_json_is_cacheable() {
         assert!(OutputOptions::new(OutputFormat::Json, JsonStyle::Compact).cacheable());
         assert!(!OutputOptions::new(OutputFormat::Json, JsonStyle::Pretty).cacheable());
         assert!(!OutputOptions::new(OutputFormat::Toon, JsonStyle::Compact).cacheable());
+        // auto は内容によって出力形式が変わるうえ、キャッシュの truncation 検査が
+        // 末尾 `}` 前提なので対象外。
+        assert!(!OutputOptions::new(OutputFormat::Auto, JsonStyle::Compact).cacheable());
     }
 }

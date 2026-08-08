@@ -317,12 +317,30 @@ pub fn cmd_refs_batch(
     // この経路は元々全件を `Vec` で保持しているため、TOON では NDJSON ではなく
     // 1 個のルート配列ドキュメントとして出す (ストリーミング要件が無いので、
     // tabular 判定まで効く canonical なエンコードが使える)。
-    if output.is_toon() {
-        writeln!(out, "{}", serialize_document(&results, output)?)?;
-    } else {
-        for result in &results {
-            let line = serde_json::to_string(result)?;
-            writeln!(out, "{line}")?;
+    // auto も全件を持っているぶん近似が要らず、NDJSON 全体と TOON ドキュメントを
+    // 実際に組み立てて短い方を選べる。
+    match output.format() {
+        OutputFormat::Json => {
+            for result in &results {
+                let line = serde_json::to_string(result)?;
+                writeln!(out, "{line}")?;
+            }
+        }
+        OutputFormat::Toon => {
+            writeln!(out, "{}", serialize_document(&results, output)?)?;
+        }
+        OutputFormat::Auto => {
+            let mut ndjson = String::new();
+            for result in &results {
+                ndjson.push_str(&serde_json::to_string(result)?);
+                ndjson.push('\n');
+            }
+            let toon = serialize_document(&results, output.with_format(OutputFormat::Toon))?;
+            if toon.chars().count() + 1 < ndjson.chars().count() {
+                writeln!(out, "{toon}")?;
+            } else {
+                write!(out, "{ndjson}")?;
+            }
         }
     }
 
@@ -443,11 +461,11 @@ pub fn cmd_context(service: &AppService, opts: &CmdContextOpts<'_>) -> Result<()
         exclude_globs: exclude_globs.to_vec(),
     };
 
-    // pretty JSON と TOON は「ドキュメント全体の形」が決まらないと出力できない
-    // (pretty は整形、TOON はルート配列の要素数 `[N]` が解析完了まで確定しない) ため、
-    // 全 FileImpact を集約してから一括 serialize する。数 GB 級リポでは
+    // 逐次出力できるのは compact JSON だけ。pretty は整形が要り、TOON はルート配列の
+    // 要素数 `[N]` が解析完了まで確定せず、auto は両形式を比べ終えるまで勝者が決まらない。
+    // いずれも全 FileImpact を集約してから一括 serialize する。数 GB 級リポでは
     // 既定の compact JSON (下の streaming 経路) を使うこと。
-    if output.is_pretty_json() || output.is_toon() {
+    if !output.streams_compact_json() {
         let mut result = service.analyze_context(&diff_input, dir, &options)?;
         result.truncations = truncations;
         let text = serialize_document(&result, output)?;
