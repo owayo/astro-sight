@@ -301,12 +301,14 @@ pub(crate) fn detect_object_members_compatible_mod(
             return None;
         }
     }
-    // 削除された schema キー (old にあって new にない)。各キーへの member access が repo
-    // 全体で残っていれば破壊的なので blocking 維持。
-    for key in removed_members {
-        if key_has_member_access_ref(site.dir, key) {
-            return None;
-        }
+    // 削除された schema キー (old にあって new にない)。いずれかへの member access が repo
+    // 全体で残っていれば破壊的なので blocking 維持。キーごとに全ファイルを再走査すると
+    // O(削除キー数 × ファイル数) になるため、対象キーを 1 個の AC と HashSet にまとめ、
+    // 各ファイルの read / parse / AST walk を最大 1 回に集約する。
+    let removed_member_set: HashSet<&str> =
+        removed_members.iter().map(|key| key.as_str()).collect();
+    if member_access_keys_have_ref(site.dir, &removed_member_set) {
+        return None;
     }
     Some(site.compatible("unused_object_members"))
 }
@@ -1174,22 +1176,30 @@ pub(crate) fn object_key_text(key: tree_sitter::Node, source: &[u8]) -> Option<S
     }
 }
 
-/// `key` への member access (`.key` / `['key']` / `["key"]`) が repo 全体に残っているか。
-/// 解析失敗は保守的に true (残存ありとみなし blocking)。
-pub(crate) fn key_has_member_access_ref(dir: &str, key: &str) -> bool {
-    if key.is_empty() {
-        return true;
+/// `keys` のいずれかへの member access (`.key` / `['key']` / `["key"]`) が repo 全体に
+/// 残っているか。解析失敗は保守的に true (残存ありとみなし blocking)。
+fn member_access_keys_have_ref(dir: &str, keys: &HashSet<&str>) -> bool {
+    if keys.is_empty() {
+        return false;
     }
+    let ac = match aho_corasick::AhoCorasick::new(keys.iter().copied()) {
+        Ok(ac) => ac,
+        Err(_) => return true,
+    };
     let files = match crate::engine::refs::collect_files(std::path::Path::new(dir), None) {
         Ok(files) => files,
         Err(_) => return true,
     };
     files
         .into_par_iter()
-        .any(|path| file_has_member_access_ref(path.as_path(), key).unwrap_or(true))
+        .any(|path| file_has_any_member_access_ref(path.as_path(), keys, &ac).unwrap_or(true))
 }
 
-pub(crate) fn file_has_member_access_ref(path: &std::path::Path, key: &str) -> Result<bool> {
+fn file_has_any_member_access_ref(
+    path: &std::path::Path,
+    keys: &HashSet<&str>,
+    ac: &aho_corasick::AhoCorasick,
+) -> Result<bool> {
     use crate::language::LangId;
     let Some(path_str) = path.to_str() else {
         return Ok(true);
@@ -1201,7 +1211,7 @@ pub(crate) fn file_has_member_access_ref(path: &std::path::Path, key: &str) -> R
             let source = parser::read_file(utf8_path)?;
             return match LangId::detect(utf8_path, source.as_bytes()) {
                 Ok(lang @ (LangId::Javascript | LangId::Typescript | LangId::Tsx)) => {
-                    source_has_member_access_ref(source.as_bytes(), lang, key)
+                    source_has_any_member_access_ref_with_ac(source.as_bytes(), lang, keys, ac)
                 }
                 Ok(_) | Err(_) => Ok(false),
             };
@@ -1209,9 +1219,10 @@ pub(crate) fn file_has_member_access_ref(path: &std::path::Path, key: &str) -> R
         Ok(_) | Err(_) => return Ok(false),
     };
     let source = parser::read_file(utf8_path)?;
-    source_has_member_access_ref(source.as_bytes(), lang, key)
+    source_has_any_member_access_ref_with_ac(source.as_bytes(), lang, keys, ac)
 }
 
+#[cfg(test)]
 pub(crate) fn source_has_member_access_ref(
     source: &[u8],
     lang: crate::language::LangId,
@@ -1224,6 +1235,38 @@ pub(crate) fn source_has_member_access_ref(
     Ok(ast_has_member_access_ref(tree.root_node(), source, key))
 }
 
+/// 複数キー版の source 判定。テストから batch 経路の意味論を直接固定するため公開する。
+#[cfg(test)]
+pub(crate) fn source_has_any_member_access_ref(
+    source: &[u8],
+    lang: crate::language::LangId,
+    keys: &HashSet<&str>,
+) -> Result<bool> {
+    if keys.is_empty() {
+        return Ok(false);
+    }
+    let ac = aho_corasick::AhoCorasick::new(keys.iter().copied())?;
+    source_has_any_member_access_ref_with_ac(source, lang, keys, &ac)
+}
+
+fn source_has_any_member_access_ref_with_ac(
+    source: &[u8],
+    lang: crate::language::LangId,
+    keys: &HashSet<&str>,
+    ac: &aho_corasick::AhoCorasick,
+) -> Result<bool> {
+    if !ac.is_match(source) {
+        return Ok(false);
+    }
+    let tree = parser::parse_source(source, lang)?;
+    Ok(ast_has_any_member_access_ref(
+        tree.root_node(),
+        source,
+        keys,
+    ))
+}
+
+#[cfg(test)]
 pub(crate) fn ast_has_member_access_ref(node: tree_sitter::Node, source: &[u8], key: &str) -> bool {
     if node_is_member_access_ref(node, source, key) {
         return true;
@@ -1233,34 +1276,46 @@ pub(crate) fn ast_has_member_access_ref(node: tree_sitter::Node, source: &[u8], 
         .any(|child| ast_has_member_access_ref(child, source, key))
 }
 
+fn ast_has_any_member_access_ref(
+    node: tree_sitter::Node,
+    source: &[u8],
+    keys: &HashSet<&str>,
+) -> bool {
+    if member_access_ref_key(node, source).is_some_and(|key| keys.contains(key)) {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| ast_has_any_member_access_ref(child, source, keys))
+}
+
+#[cfg(test)]
 pub(crate) fn node_is_member_access_ref(node: tree_sitter::Node, source: &[u8], key: &str) -> bool {
+    member_access_ref_key(node, source) == Some(key)
+}
+
+fn member_access_ref_key<'a>(node: tree_sitter::Node, source: &'a [u8]) -> Option<&'a str> {
     match node.kind() {
-        "member_expression" => {
-            node.child_by_field_name("property")
-                .and_then(|property| property.utf8_text(source).ok())
-                == Some(key)
-        }
-        "subscript_expression" => {
-            node.child_by_field_name("index")
-                .filter(|index| index.kind() == "string")
-                .and_then(|index| static_js_string_text(index, source))
-                == Some(key)
-        }
+        "member_expression" => node
+            .child_by_field_name("property")
+            .and_then(|property| property.utf8_text(source).ok()),
+        "subscript_expression" => node
+            .child_by_field_name("index")
+            .filter(|index| index.kind() == "string")
+            .and_then(|index| static_js_string_text(index, source)),
         // destructuring (`const { beta } = config;`) も member の実利用。
         // shorthand (`{ beta }` / `{ beta = 1 }` の左辺) は
         // shorthand_property_identifier_pattern、rename (`{ beta: b }`) は pair_pattern の
         // key に現れる。見落とすと破壊的な member 削除が unused_object_members に降格する。
-        "shorthand_property_identifier_pattern" => node.utf8_text(source).ok() == Some(key),
+        "shorthand_property_identifier_pattern" => node.utf8_text(source).ok(),
         "pair_pattern" => {
-            let Some(key_node) = node.child_by_field_name("key") else {
-                return false;
-            };
+            let key_node = node.child_by_field_name("key")?;
             match key_node.kind() {
-                "string" => static_js_string_text(key_node, source) == Some(key),
-                _ => key_node.utf8_text(source).ok() == Some(key),
+                "string" => static_js_string_text(key_node, source),
+                _ => key_node.utf8_text(source).ok(),
             }
         }
-        _ => false,
+        _ => None,
     }
 }
 

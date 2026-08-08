@@ -6,6 +6,31 @@ use crate::service::{AppService, AstParams};
 
 use super::common::make_error_line;
 
+/// AST バッチコマンドの worker 数。tree-sitter Parser は大きな生成物を解析すると
+/// thread-local の作業領域を保持するため、論理 CPU 数まで増やすとピーク RSS が worker 数に
+/// 応じて膨らむ。既定を最大 4 に抑え、明示設定時だけ上限を引き上げる。
+fn batch_worker_count() -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let configured = std::env::var("ASTRO_SIGHT_BATCH_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+    effective_batch_worker_count(available, configured)
+}
+
+fn effective_batch_worker_count(available: usize, configured: Option<usize>) -> usize {
+    let configured = configured.filter(|&n| n > 0).unwrap_or(4);
+    available.max(1).min(configured)
+}
+
+fn build_batch_pool() -> Result<rayon::ThreadPool> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(batch_worker_count())
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build batch rayon pool: {e}"))
+}
+
 fn batch_ndjson<F>(paths: &[String], process: F) -> Result<()>
 where
     F: Fn(&str) -> String + Sync,
@@ -27,7 +52,7 @@ where
     W: std::io::Write,
 {
     // 全スレッドを飽和させながら、未排出の解析結果をワーカー数の定数倍に制限する。
-    let window_size = rayon::current_num_threads().saturating_mul(8).max(1);
+    let window_size = batch_worker_count().saturating_mul(8).max(1);
     batch_ndjson_to_windowed(paths, process, out, window_size)
 }
 
@@ -42,12 +67,13 @@ where
     W: std::io::Write,
 {
     let window_size = window_size.max(1);
+    let pool = build_batch_pool()?;
     let mut bytes = 0usize;
 
     for chunk in paths.chunks(window_size) {
         // IndexedParallelIterator の collect は入力順を保つため、chunk 間も含めて
         // 呼び出し元が指定したパス順の NDJSON を維持できる。
-        let lines: Vec<String> = chunk.par_iter().map(|p| process(p)).collect();
+        let lines: Vec<String> = pool.install(|| chunk.par_iter().map(|p| process(p)).collect());
         for line in lines {
             bytes += line.len() + 1;
             writeln!(out, "{line}")?;
@@ -168,7 +194,20 @@ mod tests {
     use std::io::{self, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::batch_ndjson_to_windowed;
+    use super::{batch_ndjson_to_windowed, effective_batch_worker_count};
+
+    #[test]
+    fn batch_worker_count_defaults_to_at_most_four() {
+        assert_eq!(effective_batch_worker_count(16, None), 4);
+        assert_eq!(effective_batch_worker_count(2, None), 2);
+    }
+
+    #[test]
+    fn batch_worker_count_honors_valid_override_and_rejects_zero() {
+        assert_eq!(effective_batch_worker_count(16, Some(8)), 8);
+        assert_eq!(effective_batch_worker_count(4, Some(0)), 4);
+        assert_eq!(effective_batch_worker_count(0, None), 1);
+    }
 
     #[test]
     fn batch_ndjson_windowed_preserves_order_and_byte_count() {

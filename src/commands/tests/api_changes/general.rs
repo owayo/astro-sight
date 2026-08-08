@@ -1507,3 +1507,34 @@ fn member_access_ref_detects_object_destructuring() {
         "パラメータ destructuring も member 参照として検出されるべき"
     );
 }
+
+/// 複数の削除キーを 1 回の AST walk で照合しても、単一キー版と同じ member 位置だけを
+/// 参照として扱う。候補名が通常の変数位置にあるだけでは一致させない。
+#[test]
+fn member_access_ref_batch_detects_any_requested_member() {
+    let lang = crate::language::LangId::Typescript;
+    let keys = HashSet::from(["alpha", "beta"]);
+    assert!(
+        source_has_any_member_access_ref(
+            b"const alpha = 1; export const value = config.beta;",
+            lang,
+            &keys,
+        )
+        .expect("parse"),
+        "候補の beta が member 位置にあれば検出するべき"
+    );
+    assert!(
+        !source_has_any_member_access_ref(
+            b"const alpha = 1; export const beta = config.gamma;",
+            lang,
+            &keys,
+        )
+        .expect("parse"),
+        "候補名が通常の変数位置にあるだけなら member 参照ではない"
+    );
+    assert!(
+        !source_has_any_member_access_ref(b"config.alpha;", lang, &HashSet::new())
+            .expect("empty keys"),
+        "空の候補集合は参照なしとして扱う"
+    );
+}

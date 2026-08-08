@@ -406,7 +406,7 @@ astro-sight review --dir . --git \
 
 全 changed file が Xojo などの lexer-only 言語だけの場合、`review` は `impact` / `api_changes` / `dead_symbols` をすべて空結果で返す。lexer 経路の cross-file 解析は汎用名ノイズが多いため、`symbols` / `refs` / `dead-code` の単体コマンドで確認する。
 
-`api_changes.compatible_modified` には、シグネチャ文字列は変わるが既存呼び出しの互換性を保つ変更を出力する。React component の HOC ラップ、未参照 object member 削除、TS/TSX トップレベル関数の末尾 optional/default 引数追加 (`trailing_optional_params`)、Python トップレベル関数 / モジュール直下クラスメソッドの末尾 kwonly+default / 末尾 positional default 引数追加 (`trailing_optional_params`、デコレータ差分や同名関数複数定義は保守的に blocking 維持) は informational として扱い、`--hook` の blocking 対象にしない。同じシンボルに紐づく `impacts` も破壊的影響としては出さず、`mod_compat` の情報提供だけに留める。
+`api_changes.compatible_modified` には、シグネチャ文字列は変わるが既存呼び出しの互換性を保つ変更を出力する。React component の HOC ラップ、未参照 object member 削除、TS/TSX トップレベル関数の末尾 optional/default 引数追加 (`trailing_optional_params`)、Python トップレベル関数 / モジュール直下クラスメソッドの末尾 kwonly+default / 末尾 positional default 引数追加 (`trailing_optional_params`、デコレータ差分や同名関数複数定義は保守的に blocking 維持) は informational として扱い、`--hook` の blocking 対象にしない。同じシンボルに紐づく `impacts` も破壊的影響としては出さず、`mod_compat` の情報提供だけに留める。未参照 object member の判定では削除キーを 1 個ずつ全リポジトリ検索せず、Aho-Corasick で一括事前抽出して各 JS/TS ファイルを最大 1 回だけ parse する。ファイル収集・読み込み・parse の失敗時は互換扱いへ降格せず、従来どおり blocking を維持する。
 
 実行時に暗黙呼び出しされるシンボルの除外範囲は API 差分と dead-code で異なる。PHPUnit 規約、TS/JS の constructor、Flyway migration はどちらの公開面からも除外する。一方、Laravel relation や Angular lifecycle hook は dead-code では除外するが、外部公開シグネチャの変更を見逃さないよう API 差分には残す。`--framework` は dead-code 規約の選択であり、この API 差分境界を一律には変更しない。
 
@@ -552,7 +552,7 @@ echo '{"command":"context","dir":".","diff":"--- a/src/main.rs\n+++ b/src/main.r
 
 ### バッチ処理（ast, symbols, calls, imports, lint, sequence）
 
-複数ファイルを一度に処理し、NDJSON（1ファイル1行）で出力。rayon で並列処理しつつ入力順を維持する。未排出結果はワーカー数の8倍までの窓に制限するため、入力件数に比例してピーク RSS が増えない。stdout が閉じた場合は現在の窓で停止し、残りのファイルを解析しない。
+複数ファイルを一度に処理し、NDJSON（1ファイル1行）で出力。専用の rayon pool で並列処理しつつ入力順を維持する。tree-sitter Parser が巨大ファイルの作業領域を thread-local に保持してもピーク RSS が論理 CPU 数に比例しないよう、ワーカー数は既定で利用可能 CPU 数と 4 の小さい方に制限する。`ASTRO_SIGHT_BATCH_WORKERS` に正の整数を指定すれば、利用可能 CPU 数を上限に並列度を変更できる。未排出結果はワーカー数の8倍までの窓に制限するため、入力件数に比例してピーク RSS が増えない。stdout が閉じた場合は現在の窓で停止し、残りのファイルを解析しない。
 
 ```bash
 # カンマ区切りで複数ファイルを指定

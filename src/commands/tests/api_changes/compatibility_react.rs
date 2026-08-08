@@ -419,6 +419,52 @@ fn detect_object_members_removed_referenced_key_stays_blocking() {
     );
 }
 
+/// 複数キーを同時に削除したときも、いずれか 1 個の参照が残っていれば blocking を維持する。
+/// member 参照検索をキー単位の全リポジトリ走査から batch 走査へ変えた回帰テスト。
+#[test]
+fn detect_object_members_multiple_removed_keys_with_one_reference_stays_blocking() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "config.ts",
+                "export const config = { alpha: 1, beta: 2, stable: 3 };\n",
+            ),
+            (
+                "user.ts",
+                "import { config } from './config';\nexport const value = config.beta;\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("config.ts"),
+        "export const config = { stable: 3 };\n",
+    )
+    .expect("write");
+    let result = detect_object_members_compatible_mod(
+        &CompatibleModSite {
+            dir: repo.to_str().expect("utf-8 path"),
+            base: "HEAD",
+            old_path: "config.ts",
+            new_path: "config.ts",
+            name: "config",
+            kind: "constant",
+            old_sig: "old",
+            new_sig: "new",
+            lang_id: Some(crate::language::LangId::Typescript),
+        },
+        &mut SignatureSourceCache::default(),
+    );
+    assert!(
+        result.is_none(),
+        "削除キー beta の参照が残るため、alpha が未参照でも blocking を維持する"
+    );
+}
+
 /// flat object で「既存キーの値の差し替え」と「無関係なキー追加」が同一 diff に同居する
 /// ケース。キー集合の差分だけを見ていると追加のみの変更として降格され、呼び出し側の
 /// `handlers.onSave()` が実行時に壊れる (false negative)。
