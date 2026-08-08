@@ -13,10 +13,11 @@ mod common;
 #[cfg(test)]
 pub(crate) use common::read_bytes_limited_and_drain;
 pub(crate) use common::{ChangedFileSet, cache_hash_for_path, log_phase, read_to_string_limited};
-pub use common::{MAX_INPUT_SIZE, classify_error, read_paths_file_limited, serialize_output};
+pub use common::{MAX_INPUT_SIZE, classify_error, read_paths_file_limited};
+pub use crate::output::{OutputFormat, OutputOptions, serialize_document};
 
 // ---------------------------------------------------------------------------
-// 単一ファイル系コマンド（キャッシュ・pretty 対応）
+// 単一ファイル系コマンド（キャッシュ・出力フォーマット対応）
 // ---------------------------------------------------------------------------
 
 pub struct CmdAstOpts<'a> {
@@ -29,7 +30,7 @@ pub struct CmdAstOpts<'a> {
     pub context_lines: usize,
     pub full: bool,
     pub no_cache: bool,
-    pub pretty: bool,
+    pub output: OutputOptions,
 }
 
 /// 単一ファイル系コマンド (ast / symbols) の共通キャッシュ機構。
@@ -38,13 +39,14 @@ pub struct CmdAstOpts<'a> {
 ///
 /// `produce` は cache miss 時のみ呼ばれ、`(改行付き serialize 済み出力, service が実際に解析した
 /// 内容の hash)` を返す。ast と symbols で response の借用期間が違うため serialize は produce 側に
-/// 閉じる。pretty 時は get も put もしない (`use_cache = !no_cache && !pretty`)。cache 初期化・
+/// 閉じる。JSON compact 以外 (pretty / TOON) では get も put もしない
+/// (`use_cache = !no_cache && output.cacheable()`)。cache 初期化・
 /// get・put の失敗は解析失敗に昇格させず黙殺する。
 fn run_cached_file_command<F>(
     command: &str,
     path: &str,
     no_cache: bool,
-    pretty: bool,
+    output: OutputOptions,
     cache_key: &str,
     produce: F,
 ) -> Result<()>
@@ -55,7 +57,7 @@ where
     let source = parser::read_file(utf8_path)?;
     let content_hash = CacheStore::hash(&source);
     let hash = cache_hash_for_path(utf8_path, &content_hash);
-    let use_cache = !no_cache && !pretty;
+    let use_cache = !no_cache && output.cacheable();
 
     if use_cache
         && let Ok(cache) = CacheStore::new()
@@ -72,12 +74,12 @@ where
         return Ok(());
     }
 
-    let (output, analyzed_hash) = produce()?;
+    let (text, analyzed_hash) = produce()?;
 
     info!(
         command = command,
         path = path,
-        output_bytes = output.len(),
+        output_bytes = text.len(),
         "command completed"
     );
 
@@ -89,10 +91,10 @@ where
         && analyzed_hash.as_deref() == Some(content_hash.as_str())
         && let Ok(cache) = CacheStore::new()
     {
-        let _ = cache.put(&hash, cache_key, output.as_bytes());
+        let _ = cache.put(&hash, cache_key, text.as_bytes());
     }
 
-    print!("{output}");
+    print!("{text}");
     Ok(())
 }
 
@@ -119,7 +121,7 @@ pub fn cmd_ast(service: &AppService, opts: &CmdAstOpts<'_>) -> Result<()> {
         "ast",
         opts.path,
         opts.no_cache,
-        opts.pretty,
+        opts.output,
         &cache_key,
         || {
             let params = AstParams {
@@ -134,9 +136,9 @@ pub fn cmd_ast(service: &AppService, opts: &CmdAstOpts<'_>) -> Result<()> {
             let response = service.extract_ast(&params)?;
 
             let mut output = if opts.full {
-                serialize_output(&response, opts.pretty)?
+                serialize_document(&response, opts.output)?
             } else {
-                serialize_output(&response.to_compact_ast(), opts.pretty)?
+                serialize_document(&response.to_compact_ast(), opts.output)?
             };
             output.push('\n');
 
@@ -154,6 +156,7 @@ pub fn cmd_symbols_dir(
     doc: bool,
     full: bool,
     query: Option<&str>,
+    output: OutputOptions,
 ) -> Result<()> {
     let canonical_dir = std::fs::canonicalize(dir)?;
     let files = crate::engine::refs::collect_files(&canonical_dir, glob)?;
@@ -161,14 +164,22 @@ pub fn cmd_symbols_dir(
         .iter()
         .filter_map(|p| p.to_str().map(|s| s.to_string()))
         .collect();
-    batch_symbols(service, &file_paths, doc, full, Some(&canonical_dir), query)
+    batch_symbols(
+        service,
+        &file_paths,
+        doc,
+        full,
+        Some(&canonical_dir),
+        query,
+        output,
+    )
 }
 
 pub fn cmd_symbols(
     service: &AppService,
     path: &str,
     no_cache: bool,
-    pretty: bool,
+    output: OutputOptions,
     doc: bool,
     full: bool,
     query: Option<&str>,
@@ -188,19 +199,19 @@ pub fn cmd_symbols(
         None => base_key.to_string(),
     };
 
-    run_cached_file_command("symbols", path, no_cache, pretty, &cache_key, || {
+    run_cached_file_command("symbols", path, no_cache, output, &cache_key, || {
         let response = service.extract_symbols_with_query(path, query)?;
         let analyzed_hash = response.hash.clone();
 
-        let mut output = if full {
-            serialize_output(&response, pretty)?
+        let mut text = if full {
+            serialize_document(&response, output)?
         } else {
             let compact = response.to_compact_symbols(doc);
-            serialize_output(&compact, pretty)?
+            serialize_document(&compact, output)?
         };
-        output.push('\n');
+        text.push('\n');
 
-        Ok((output, analyzed_hash))
+        Ok((text, analyzed_hash))
     })
 }
 
@@ -208,29 +219,31 @@ pub fn cmd_calls(
     service: &AppService,
     path: &str,
     function: Option<&str>,
-    pretty: bool,
+    output: OutputOptions,
 ) -> Result<()> {
     let result = service.extract_calls(path, function)?;
-    let output = if pretty {
-        serialize_output(&result, true)?
+    // `--pretty` は整形だけでなく full / compact DTO の選択も兼ねている (既存仕様)。
+    // TOON には pretty の概念が無いため既定の compact DTO を使う。
+    let text = if output.is_pretty_json() {
+        serialize_document(&result, output)?
     } else {
-        serialize_output(&result.to_compact(), false)?
+        serialize_document(&result.to_compact(), output)?
     };
-    info!(command = "calls", path = path, function = ?function, output_bytes = output.len(), "command completed");
-    println!("{output}");
+    info!(command = "calls", path = path, function = ?function, output_bytes = text.len(), "command completed");
+    println!("{text}");
     Ok(())
 }
 
-pub fn cmd_imports(service: &AppService, path: &str, pretty: bool) -> Result<()> {
+pub fn cmd_imports(service: &AppService, path: &str, output: OutputOptions) -> Result<()> {
     let result = service.extract_imports(path)?;
-    let output = serialize_output(&result, pretty)?;
+    let text = serialize_document(&result, output)?;
     info!(
         command = "imports",
         path = path,
-        output_bytes = output.len(),
+        output_bytes = text.len(),
         "command completed"
     );
-    println!("{output}");
+    println!("{text}");
     Ok(())
 }
 
@@ -238,18 +251,18 @@ pub fn cmd_lint(
     service: &AppService,
     path: &str,
     rules: &[crate::models::lint::Rule],
-    pretty: bool,
+    output: OutputOptions,
 ) -> Result<()> {
     let result = service.lint_file(path, rules)?;
-    let output = serialize_output(&result, pretty)?;
+    let text = serialize_document(&result, output)?;
     info!(
         command = "lint",
         path = path,
         rules_count = rules.len(),
-        output_bytes = output.len(),
+        output_bytes = text.len(),
         "command completed"
     );
-    println!("{output}");
+    println!("{text}");
     Ok(())
 }
 
@@ -257,12 +270,12 @@ pub fn cmd_sequence(
     service: &AppService,
     path: &str,
     function: Option<&str>,
-    pretty: bool,
+    output: OutputOptions,
 ) -> Result<()> {
     let result = service.generate_sequence(path, function)?;
-    let output = serialize_output(&result, pretty)?;
-    info!(command = "sequence", path = path, function = ?function, output_bytes = output.len(), "command completed");
-    println!("{output}");
+    let text = serialize_document(&result, output)?;
+    info!(command = "sequence", path = path, function = ?function, output_bytes = text.len(), "command completed");
+    println!("{text}");
     Ok(())
 }
 
@@ -271,12 +284,12 @@ pub fn cmd_refs(
     name: &str,
     dir: &str,
     glob: Option<&str>,
-    pretty: bool,
+    output: OutputOptions,
 ) -> Result<()> {
     let result = service.find_references(name, dir, glob)?;
-    let output = serialize_output(&result, pretty)?;
-    info!(command = "refs", name = name, dir = dir, glob = ?glob, output_bytes = output.len(), "command completed");
-    println!("{output}");
+    let text = serialize_document(&result, output)?;
+    info!(command = "refs", name = name, dir = dir, glob = ?glob, output_bytes = text.len(), "command completed");
+    println!("{text}");
     Ok(())
 }
 
@@ -285,6 +298,7 @@ pub fn cmd_refs_batch(
     names: &[String],
     dir: &str,
     glob: Option<&str>,
+    output: OutputOptions,
 ) -> Result<()> {
     use std::io::Write;
     let stdout = std::io::stdout();
@@ -298,8 +312,18 @@ pub fn cmd_refs_batch(
     let results = service.find_references_batch(names, dir, glob)?;
     for result in &results {
         total_refs += result.references.len();
-        let line = serde_json::to_string(result)?;
-        writeln!(out, "{line}")?;
+    }
+
+    // この経路は元々全件を `Vec` で保持しているため、TOON では NDJSON ではなく
+    // 1 個のルート配列ドキュメントとして出す (ストリーミング要件が無いので、
+    // tabular 判定まで効く canonical なエンコードが使える)。
+    if output.is_toon() {
+        writeln!(out, "{}", serialize_document(&results, output)?)?;
+    } else {
+        for result in &results {
+            let line = serde_json::to_string(result)?;
+            writeln!(out, "{line}")?;
+        }
     }
 
     info!(
@@ -315,7 +339,7 @@ pub fn cmd_cochange(
     service: &AppService,
     dir: &str,
     opts: &CoChangeOptions,
-    pretty: bool,
+    output: OutputOptions,
     skipped: Option<SkipInfo>,
 ) -> Result<()> {
     if let Some(skip) = skipped {
@@ -327,12 +351,12 @@ pub fn cmd_cochange(
             diagnostics: Default::default(),
             skipped: Some(skip),
         };
-        let output = serialize_output(&result, pretty)?;
-        println!("{output}");
+        let text = serialize_document(&result, output)?;
+        println!("{text}");
         return Ok(());
     }
     let result = service.analyze_cochange(dir, opts)?;
-    let output = serialize_output(&result, pretty)?;
+    let text = serialize_document(&result, output)?;
     info!(
         command = "cochange",
         dir = dir,
@@ -343,10 +367,10 @@ pub fn cmd_cochange(
         max_files_per_commit = opts.max_files_per_commit,
         rename = opts.rename,
         ignore_merges = opts.ignore_merges,
-        output_bytes = output.len(),
+        output_bytes = text.len(),
         "command completed"
     );
-    println!("{output}");
+    println!("{text}");
     Ok(())
 }
 
@@ -365,7 +389,7 @@ pub(crate) use git_input::{
     GitDiffInput, is_git_work_tree, resolve_git_diff, validate_git_revision,
 };
 
-/// `cmd_context` の引数一式。`diff`/`diff_file` と `git`/`staged`/`pretty` のような
+/// `cmd_context` の引数一式。`diff`/`diff_file` と `git`/`staged` のような
 /// 隣接同型引数の取り違えを型と名前で防ぐ (`CmdAstOpts` / `CmdReviewOpts` と同じ流儀)。
 pub struct CmdContextOpts<'a> {
     pub dir: &'a str,
@@ -374,7 +398,7 @@ pub struct CmdContextOpts<'a> {
     pub git: bool,
     pub base: &'a str,
     pub staged: bool,
-    pub pretty: bool,
+    pub output: OutputOptions,
     pub exclude_dirs: &'a [String],
     pub exclude_globs: &'a [String],
 }
@@ -388,7 +412,7 @@ pub fn cmd_context(service: &AppService, opts: &CmdContextOpts<'_>) -> Result<()
         git,
         base,
         staged,
-        pretty,
+        output,
         exclude_dirs,
         exclude_globs,
     } = opts;
@@ -402,7 +426,7 @@ pub fn cmd_context(service: &AppService, opts: &CmdContextOpts<'_>) -> Result<()
                     skipped: Some(skip),
                     truncations: Vec::new(),
                 };
-                println!("{}", serialize_output(&result, pretty)?);
+                println!("{}", serialize_document(&result, output)?);
                 return Ok(());
             }
             DiffSourceResolution::NotRequested => {
@@ -419,20 +443,22 @@ pub fn cmd_context(service: &AppService, opts: &CmdContextOpts<'_>) -> Result<()
         exclude_globs: exclude_globs.to_vec(),
     };
 
-    if pretty {
-        // pretty 出力は人間向けで整形が必要なため、従来どおり全 FileImpact を集約してから
-        // 一括 serialize する。数 GB 級リポでは compact 出力推奨。
+    // pretty JSON と TOON は「ドキュメント全体の形」が決まらないと出力できない
+    // (pretty は整形、TOON はルート配列の要素数 `[N]` が解析完了まで確定しない) ため、
+    // 全 FileImpact を集約してから一括 serialize する。数 GB 級リポでは
+    // 既定の compact JSON (下の streaming 経路) を使うこと。
+    if output.is_pretty_json() || output.is_toon() {
         let mut result = service.analyze_context(&diff_input, dir, &options)?;
         result.truncations = truncations;
-        let output = serialize_output(&result, pretty)?;
+        let text = serialize_document(&result, output)?;
         info!(
             command = "context",
             dir = dir,
             diff_bytes = diff_input.len(),
-            output_bytes = output.len(),
+            output_bytes = text.len(),
             "command completed"
         );
-        println!("{output}");
+        println!("{text}");
         return Ok(());
     }
 
@@ -483,6 +509,7 @@ pub struct CmdImpactOpts<'a> {
     pub base: &'a str,
     pub staged: bool,
     pub hook: bool,
+    pub output: OutputOptions,
     pub exclude_dirs: &'a [String],
     pub exclude_globs: &'a [String],
 }
@@ -495,9 +522,13 @@ pub fn cmd_impact(service: &AppService, opts: &CmdImpactOpts<'_>) -> Result<()> 
         base,
         staged,
         hook,
+        output,
         exclude_dirs,
         exclude_globs,
     } = opts;
+    // impact は構造化 JSON 出力を持たず、`--hook` 出力は Stop hook の JSON 契約。
+    // 明示的な `--format toon` は満たせないのでここで弾く (config 由来なら JSON に倒す)。
+    output.ensure_json_protocol("impact")?;
     // impact に inline `--diff` / `--diff-file` は無いため resolver へは None を渡す。
     let (diff_input, truncations) = match resolve_diff_source(dir, None, None, git, base, staged)? {
         DiffSourceResolution::Diff { diff, truncations } => (diff, truncations),
@@ -608,28 +639,33 @@ pub fn cmd_impact(service: &AppService, opts: &CmdImpactOpts<'_>) -> Result<()> 
     std::process::exit(1);
 }
 
-pub fn cmd_doctor(pretty: bool) -> Result<()> {
+pub fn cmd_doctor(output: OutputOptions) -> Result<()> {
     let report = doctor::run_doctor();
-    let output = serialize_output(&report, pretty)?;
+    let text = serialize_document(&report, output)?;
     info!(
         command = "doctor",
-        output_bytes = output.len(),
+        output_bytes = text.len(),
         "command completed"
     );
-    println!("{output}");
+    println!("{text}");
     Ok(())
 }
 
-pub fn cmd_session() -> Result<()> {
+pub fn cmd_session(output: OutputOptions) -> Result<()> {
+    // session は「1 行 = 1 リクエスト / 1 レスポンス」の NDJSON プロトコル。
+    // 複数行になる TOON は載せられないため JSON 固定。
+    output.ensure_json_protocol("session")?;
     let service = AppService::from_env()?;
     crate::session::run_session(|req| handle_request(&service, req))
 }
 
-pub fn cmd_mcp() -> Result<()> {
+pub fn cmd_mcp(output: OutputOptions) -> Result<()> {
     use rmcp::ServiceExt;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let server = crate::mcp::AstroSightServer::new();
+        // JSON-RPC transport 自体は常に JSON。`output` はツール結果の
+        // text content をどちらで返すかだけを決める。
+        let server = crate::mcp::AstroSightServer::new(output);
         let router = server.into_router();
         let transport = rmcp::transport::io::stdio();
         let service = router

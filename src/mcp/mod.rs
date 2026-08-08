@@ -8,6 +8,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::doctor;
+use crate::output::{OutputOptions, serialize_document};
 use crate::service::{AppService, AstParams};
 
 // ---------------------------------------------------------------------------
@@ -179,17 +180,20 @@ fn default_max_files_per_commit() -> usize {
 pub struct AstroSightServer {
     tool_router: ToolRouter<Self>,
     service: std::sync::Arc<AppService>,
+    /// ツール結果の text content をどの形式で返すか。JSON-RPC transport 自体は
+    /// 常に JSON で、ここは payload の表現だけを決める。
+    output: OutputOptions,
 }
 
 impl Default for AstroSightServer {
     fn default() -> Self {
-        Self::new()
+        Self::new(OutputOptions::default())
     }
 }
 
 #[tool_router]
 impl AstroSightServer {
-    pub fn new() -> Self {
+    pub fn new(output: OutputOptions) -> Self {
         // cwd 取得またはサンドボックス生成に失敗した場合は制限なしにフォールバックせず即座にパニック（fail-closed）
         let cwd = std::env::current_dir().expect("MCP server requires a valid current directory");
         let service = AppService::sandboxed(cwd)
@@ -197,6 +201,7 @@ impl AstroSightServer {
         Self {
             tool_router: Self::tool_router(),
             service: std::sync::Arc::new(service),
+            output,
         }
     }
 
@@ -218,7 +223,7 @@ impl AstroSightServer {
             depth: p.depth,
             context_lines: p.context_lines,
         };
-        Self::to_tool_result(
+        self.to_tool_result(
             self.service
                 .extract_ast(&ast_params)
                 .map(|r| r.to_compact_ast()),
@@ -233,7 +238,7 @@ impl AstroSightServer {
         &self,
         params: Parameters<SymbolsExtractParams>,
     ) -> Result<CallToolResult, McpError> {
-        Self::to_tool_result(self.service.extract_symbols(&params.0.path))
+        self.to_tool_result(self.service.extract_symbols(&params.0.path))
     }
 
     #[tool(
@@ -245,7 +250,7 @@ impl AstroSightServer {
         params: Parameters<CallsExtractParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        Self::to_tool_result(
+        self.to_tool_result(
             self.service
                 .extract_calls(&p.path, p.function.as_deref())
                 .map(|r| r.to_compact()),
@@ -265,7 +270,7 @@ impl AstroSightServer {
         if name.is_empty() {
             return Err(McpError::invalid_params("name must not be empty", None));
         }
-        Self::to_tool_result(
+        self.to_tool_result(
             self.service
                 .find_references(name, &p.dir, p.glob.as_deref()),
         )
@@ -292,7 +297,7 @@ impl AstroSightServer {
                 None,
             ));
         }
-        Self::to_tool_result(self.service.find_references_batch(
+        self.to_tool_result(self.service.find_references_batch(
             &filtered,
             &p.dir,
             p.glob.as_deref(),
@@ -312,7 +317,7 @@ impl AstroSightServer {
             exclude_dirs: p.exclude_dirs,
             exclude_globs: p.exclude_globs,
         };
-        Self::to_tool_result(self.service.analyze_context(&p.diff, &p.dir, &options))
+        self.to_tool_result(self.service.analyze_context(&p.diff, &p.dir, &options))
     }
 
     #[tool(
@@ -323,7 +328,7 @@ impl AstroSightServer {
         &self,
         params: Parameters<ImportsExtractParams>,
     ) -> Result<CallToolResult, McpError> {
-        Self::to_tool_result(self.service.extract_imports(&params.0.path))
+        self.to_tool_result(self.service.extract_imports(&params.0.path))
     }
 
     #[tool(
@@ -361,7 +366,7 @@ impl AstroSightServer {
             })
             .collect();
         let rules = rules?;
-        Self::to_tool_result(self.service.lint_file(&p.path, &rules))
+        self.to_tool_result(self.service.lint_file(&p.path, &rules))
     }
 
     #[tool(
@@ -373,7 +378,7 @@ impl AstroSightServer {
         params: Parameters<SequenceDiagramParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        Self::to_tool_result(
+        self.to_tool_result(
             self.service
                 .generate_sequence(&p.path, p.function.as_deref()),
         )
@@ -394,7 +399,7 @@ impl AstroSightServer {
                 "cochange_analyze requires source_files".to_string(),
             )
             .into();
-            return Self::to_tool_result::<crate::models::cochange::CoChangeResult>(Err(err));
+            return self.to_tool_result::<crate::models::cochange::CoChangeResult>(Err(err));
         }
         let opts = crate::models::cochange::CoChangeOptions {
             source_files: p.source_files,
@@ -404,7 +409,7 @@ impl AstroSightServer {
             max_files_per_commit: p.max_files_per_commit,
             ..Default::default()
         };
-        Self::to_tool_result(self.service.analyze_cochange(&p.dir, &opts))
+        self.to_tool_result(self.service.analyze_cochange(&p.dir, &opts))
     }
 
     #[tool(
@@ -412,10 +417,7 @@ impl AstroSightServer {
         description = "Check tool availability and supported languages"
     )]
     async fn doctor_tool(&self) -> Result<CallToolResult, McpError> {
-        let report = doctor::run_doctor();
-        let json = serde_json::to_string(&report)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+        self.to_tool_result(Ok(doctor::run_doctor()))
     }
 }
 
@@ -425,13 +427,14 @@ impl AstroSightServer {
 
 impl AstroSightServer {
     fn to_tool_result<T: serde::Serialize>(
+        &self,
         result: anyhow::Result<T>,
     ) -> Result<CallToolResult, McpError> {
         match result {
             Ok(value) => {
-                let json = serde_json::to_string(&value)
+                let text = serialize_document(&value, self.output)
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
             }
             Err(e) => Err(McpError::internal_error(e.to_string(), None)),
         }

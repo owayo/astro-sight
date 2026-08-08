@@ -72,14 +72,6 @@ pub fn classify_error(e: &anyhow::Error) -> (String, String) {
     }
 }
 
-pub fn serialize_output(value: &impl serde::Serialize, pretty: bool) -> Result<String> {
-    if pretty {
-        Ok(serde_json::to_string_pretty(value)?)
-    } else {
-        Ok(serde_json::to_string(value)?)
-    }
-}
-
 pub(crate) fn make_error_line(e: &anyhow::Error) -> String {
     let (code, message) = classify_error(e);
     let obj = serde_json::json!({ "error": { "code": code, "message": message } });

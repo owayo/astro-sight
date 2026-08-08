@@ -13,6 +13,7 @@ use astro_sight::commands::{
 };
 use astro_sight::config::ConfigService;
 use astro_sight::error::{AstroError, ErrorCode};
+use astro_sight::output::OutputOptions;
 use astro_sight::service::AppService;
 
 // dhat-heap feature 有効時のみヒーププロファイラを差し込む。
@@ -229,10 +230,9 @@ fn handle_early_command(command: &Commands) -> Result<bool> {
     }
 }
 
-fn initialize_logging(cli: &Cli) -> Result<()> {
-    let config = ConfigService::load(cli.config.as_deref())?;
+fn initialize_logging(cli: &Cli, config: &astro_sight::config::Config) -> Result<()> {
     if (cli.debug || config.debug)
-        && let Err(error) = astro_sight::logger::init(&config)
+        && let Err(error) = astro_sight::logger::init(config)
     {
         eprintln!("warning: failed to initialize logging (continuing without it): {error}");
     }
@@ -240,13 +240,15 @@ fn initialize_logging(cli: &Cli) -> Result<()> {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let pretty = cli.pretty;
-
     if handle_early_command(&cli.command)? {
         return Ok(());
     }
 
-    initialize_logging(&cli)?;
+    // 設定は 1 度だけ読み、ログ初期化と出力フォーマット解決の両方に使う。
+    let config = ConfigService::load(cli.config.as_deref())?;
+    initialize_logging(&cli, &config)?;
+    // 優先順位: CLI `--format` > config.toml の `format` > json。
+    let output = OutputOptions::resolve(cli.format, config.format, cli.pretty);
 
     // カレントディレクトリと入力パラメータを含めてコマンド実行を記録する
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -259,7 +261,7 @@ fn run(cli: Cli) -> Result<()> {
     let service = AppService::new();
     let start = std::time::Instant::now();
 
-    let result = dispatch_command(&service, cli.command, pretty);
+    let result = dispatch_command(&service, cli.command, output);
 
     let elapsed = start.elapsed();
     info!(
@@ -270,7 +272,7 @@ fn run(cli: Cli) -> Result<()> {
     result
 }
 
-fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Result<()> {
+fn dispatch_command(service: &AppService, command: Commands, output: OutputOptions) -> Result<()> {
     match command {
         Commands::Ast {
             path,
@@ -298,11 +300,11 @@ fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Re
                         context_lines: context,
                         full,
                         no_cache,
-                        pretty,
+                        output,
                     };
                     cmd_ast(service, &opts)
                 }
-                PathInput::Batch(ps) => batch_ast(service, &ps, depth, context, full),
+                PathInput::Batch(ps) => batch_ast(service, &ps, depth, context, full, output),
             }
         }
         Commands::Symbols {
@@ -317,16 +319,16 @@ fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Re
             no_cache,
         } => {
             if let Some(d) = &dir {
-                cmd_symbols_dir(service, d, glob.as_deref(), doc, full, query.as_deref())
+                cmd_symbols_dir(service, d, glob.as_deref(), doc, full, query.as_deref(), output)
             } else {
                 let input =
                     resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
                 match input {
                     PathInput::Single(p) => {
-                        cmd_symbols(service, &p, no_cache, pretty, doc, full, query.as_deref())
+                        cmd_symbols(service, &p, no_cache, output, doc, full, query.as_deref())
                     }
                     PathInput::Batch(ps) => {
-                        batch_symbols(service, &ps, doc, full, None, query.as_deref())
+                        batch_symbols(service, &ps, doc, full, None, query.as_deref(), output)
                     }
                 }
             }
@@ -339,8 +341,8 @@ fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Re
         } => {
             let input = resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
             match input {
-                PathInput::Single(p) => cmd_calls(service, &p, function.as_deref(), pretty),
-                PathInput::Batch(ps) => batch_calls(service, &ps, function.as_deref()),
+                PathInput::Single(p) => cmd_calls(service, &p, function.as_deref(), output),
+                PathInput::Batch(ps) => batch_calls(service, &ps, function.as_deref(), output),
             }
         }
         Commands::Imports {
@@ -350,8 +352,8 @@ fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Re
         } => {
             let input = resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
             match input {
-                PathInput::Single(p) => cmd_imports(service, &p, pretty),
-                PathInput::Batch(ps) => batch_imports(service, &ps),
+                PathInput::Single(p) => cmd_imports(service, &p, output),
+                PathInput::Batch(ps) => batch_imports(service, &ps, output),
             }
         }
         Commands::Lint {
@@ -375,8 +377,8 @@ fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Re
 
             let input = resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
             match input {
-                PathInput::Single(p) => cmd_lint(service, &p, &loaded_rules, pretty),
-                PathInput::Batch(ps) => batch_lint(service, &ps, &loaded_rules),
+                PathInput::Single(p) => cmd_lint(service, &p, &loaded_rules, output),
+                PathInput::Batch(ps) => batch_lint(service, &ps, &loaded_rules, output),
             }
         }
         Commands::Sequence {
@@ -387,8 +389,8 @@ fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Re
         } => {
             let input = resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
             match input {
-                PathInput::Single(p) => cmd_sequence(service, &p, function.as_deref(), pretty),
-                PathInput::Batch(ps) => batch_sequence(service, &ps, function.as_deref()),
+                PathInput::Single(p) => cmd_sequence(service, &p, function.as_deref(), output),
+                PathInput::Batch(ps) => batch_sequence(service, &ps, function.as_deref(), output),
             }
         }
         Commands::Refs {
@@ -397,8 +399,8 @@ fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Re
             dir,
             glob,
         } => match resolve_names(name.as_deref(), names.as_deref())? {
-            NameInput::Single(n) => cmd_refs(service, &n, &dir, glob.as_deref(), pretty),
-            NameInput::Batch(ns) => cmd_refs_batch(service, &ns, &dir, glob.as_deref()),
+            NameInput::Single(n) => cmd_refs(service, &n, &dir, glob.as_deref(), output),
+            NameInput::Batch(ns) => cmd_refs_batch(service, &ns, &dir, glob.as_deref(), output),
         },
         Commands::Review {
             dir,
@@ -431,7 +433,7 @@ fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Re
                 base: &base,
                 staged,
                 min_confidence,
-                pretty,
+                output,
                 hook,
                 framework: framework.as_deref(),
                 extra_exclude_dirs: &exclude_dirs,
@@ -442,7 +444,7 @@ fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Re
             };
             cmd_review(service, &opts)
         }
-        cmd @ Commands::Cochange { .. } => dispatch_cochange(service, cmd, pretty),
+        cmd @ Commands::Cochange { .. } => dispatch_cochange(service, cmd, output),
         Commands::Context {
             dir,
             diff,
@@ -461,7 +463,7 @@ fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Re
                 git,
                 base: &base,
                 staged,
-                pretty,
+                output,
                 exclude_dirs: &exclude_dirs,
                 exclude_globs: &exclude_globs,
             },
@@ -482,6 +484,7 @@ fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Re
                 base: &base,
                 staged,
                 hook,
+                output,
                 exclude_dirs: &exclude_dirs,
                 exclude_globs: &exclude_globs,
             },
@@ -515,12 +518,12 @@ fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Re
             framework.as_deref(),
             &exclude_dirs,
             &exclude_globs,
-            pretty,
+            output,
             dead_scope,
         ),
-        Commands::Doctor => cmd_doctor(pretty),
-        Commands::Session => cmd_session(),
-        Commands::Mcp => cmd_mcp(),
+        Commands::Doctor => cmd_doctor(output),
+        Commands::Session => cmd_session(output),
+        Commands::Mcp => cmd_mcp(output),
         Commands::Init { .. } | Commands::SkillInstall { .. } => unreachable!("handled above"),
     }
 }
@@ -528,7 +531,7 @@ fn dispatch_command(service: &AppService, command: Commands, pretty: bool) -> Re
 /// `cochange` サブコマンドの処理。`BlameSourceResolution` の解決、`ignore_merges` の等価簡約、
 /// 23 フィールドの `CoChangeOptions` 構築を担う。`dispatch_command` の 1 arm が肥大化するのを
 /// 避けるため variant ごと受け取り内部で destructure する。
-fn dispatch_cochange(service: &AppService, command: Commands, pretty: bool) -> Result<()> {
+fn dispatch_cochange(service: &AppService, command: Commands, output: OutputOptions) -> Result<()> {
     let Commands::Cochange {
         dir,
         git,
@@ -600,5 +603,5 @@ fn dispatch_cochange(service: &AppService, command: Commands, pretty: bool) -> R
         per_source_limit,
         author_unit_window_days,
     };
-    cmd_cochange(service, &dir, &opts, pretty, cochange_skip)
+    cmd_cochange(service, &dir, &opts, output, cochange_skip)
 }

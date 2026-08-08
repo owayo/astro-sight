@@ -5,6 +5,8 @@ use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::output::OutputFormat;
+
 /// 実行時に使う設定。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -14,6 +16,9 @@ pub struct Config {
 
     /// ログディレクトリのパス。
     pub log_path: PathBuf,
+
+    /// 既定の出力フォーマット。CLI の `--format` が指定されればそちらが優先される。
+    pub format: OutputFormat,
 }
 
 impl Default for Config {
@@ -21,6 +26,7 @@ impl Default for Config {
         Self {
             debug: false,
             log_path: default_log_path(),
+            format: OutputFormat::Json,
         }
     }
 }
@@ -29,6 +35,7 @@ impl Default for Config {
 struct RawConfig {
     debug: Option<bool>,
     log_path: Option<PathBuf>,
+    format: Option<OutputFormat>,
 }
 
 /// デフォルトのログ出力先: ~/.config/astro-sight/logs
@@ -102,6 +109,7 @@ impl ConfigService {
         Ok(Config {
             debug: raw.debug.unwrap_or(false),
             log_path,
+            format: raw.format.unwrap_or_default(),
         })
     }
 
@@ -135,6 +143,14 @@ debug = false
 
 # ログディレクトリのパス (デフォルト: ~/.config/astro-sight/logs)
 # log_path = "~/.config/astro-sight/logs"
+
+# 既定の出力フォーマット: "json" | "toon" (デフォルト: json)
+# toon = Token-Oriented Object Notation v4.1 (https://toonformat.dev/)。
+# 同じ内容を少ないトークン数で表現でき、LLM へ渡す用途に向く。
+# CLI の --format はこの設定より優先される。
+# session / review --hook / impact --hook / エラー出力は行指向 JSON の契約が
+# あるため、この設定に関わらず常に JSON。
+format = "json"
 "#
         .to_string()
     }
@@ -205,6 +221,56 @@ mod tests {
 
         let config = ConfigService::load(Some(&config_path)).unwrap();
         assert!(config.debug);
+    }
+
+    #[test]
+    fn test_format_defaults_to_json() {
+        assert_eq!(Config::default().format, OutputFormat::Json);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "debug = false\n").unwrap();
+        let config = ConfigService::load(Some(&config_path)).unwrap();
+        assert_eq!(config.format, OutputFormat::Json);
+
+        // ファイル自体が無い場合も既定は json。
+        let missing = dir.path().join("missing.toml");
+        assert_eq!(
+            ConfigService::load(Some(&missing)).unwrap().format,
+            OutputFormat::Json
+        );
+    }
+
+    #[test]
+    fn test_load_format_toon() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "format = \"toon\"\n").unwrap();
+
+        let config = ConfigService::load(Some(&config_path)).unwrap();
+        assert_eq!(config.format, OutputFormat::Toon);
+    }
+
+    #[test]
+    fn test_load_unknown_format_returns_error() {
+        // 未知の値を黙って json に倒すと、設定したつもりの形式で出ない事故になる。
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "format = \"yaml\"\n").unwrap();
+
+        assert!(ConfigService::load(Some(&config_path)).is_err());
+    }
+
+    #[test]
+    fn test_generated_config_round_trips() {
+        // 生成した既定設定がそのまま読み戻せること (コメント例が構文エラーでない)。
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        ConfigService::generate_at(&config_path).unwrap();
+
+        let config = ConfigService::load(Some(&config_path)).unwrap();
+        assert_eq!(config.format, OutputFormat::Json);
+        assert!(!config.debug);
     }
 
     #[test]

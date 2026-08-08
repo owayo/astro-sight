@@ -11,6 +11,9 @@ pub enum ErrorCode {
     IoError,
     InvalidRequest,
     PathOutOfBounds,
+    /// 内部不変条件の違反。`main.rs` の直列化失敗フォールバックが既に
+    /// `INTERNAL_ERROR` を出しており、その語彙に合わせる。
+    InternalError,
 }
 
 impl fmt::Display for ErrorCode {
@@ -24,6 +27,7 @@ impl fmt::Display for ErrorCode {
             Self::IoError => write!(f, "IO_ERROR"),
             Self::InvalidRequest => write!(f, "INVALID_REQUEST"),
             Self::PathOutOfBounds => write!(f, "PATH_OUT_OF_BOUNDS"),
+            Self::InternalError => write!(f, "INTERNAL_ERROR"),
         }
     }
 }

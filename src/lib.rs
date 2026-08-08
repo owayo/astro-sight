@@ -9,6 +9,7 @@ pub mod language;
 pub mod logger;
 pub mod mcp;
 pub mod models;
+pub mod output;
 pub mod service;
 pub mod session;
 pub mod skill;

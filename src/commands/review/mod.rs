@@ -7,9 +7,9 @@ use crate::models::skip::SkipInfo;
 use crate::service::AppService;
 
 use super::api_changes::detect_api_changes;
-use super::common::{
-    MAX_INPUT_SIZE, log_phase, read_to_string_limited, serialize_output, timed, timed_ok,
-};
+use crate::output::{OutputOptions, serialize_document};
+
+use super::common::{MAX_INPUT_SIZE, log_phase, read_to_string_limited, timed, timed_ok};
 use super::dead_code::{
     detect_dead_symbols_from_files, filter_dead_by_touched_symbols, filter_dead_by_wip_added,
     filter_diff_files_for_dead_code, resolve_dead_code_excludes,
@@ -36,7 +36,7 @@ pub struct CmdReviewOpts<'a> {
     pub base: &'a str,
     pub staged: bool,
     pub min_confidence: f64,
-    pub pretty: bool,
+    pub output: OutputOptions,
     pub hook: bool,
     pub framework: Option<&'a str>,
     pub extra_exclude_dirs: &'a [String],
@@ -57,7 +57,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
         base,
         staged,
         min_confidence,
-        pretty,
+        output,
         hook,
         framework,
         extra_exclude_dirs,
@@ -66,6 +66,11 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
         strict_public_const_values,
         include_wip_dead,
     } = opts;
+    // `--hook` の出力は Claude Code の Stop hook が消費する compact JSON 契約。
+    // 明示的な `--format toon` は満たせないのでここで弾く (config 由来なら JSON に倒す)。
+    if hook {
+        output.ensure_json_protocol("review --hook")?;
+    }
     // framework 指定は早期に検証して未知名はここで弾く (dead_symbols 検出に到達する前に)。
     // 未指定時は package.json から next 依存を検出して nextjs プリセットを自動適用する。
     let framework_globs = resolve_framework_globs_with_auto_detect(framework, dir)?;
@@ -75,7 +80,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
             DiffSourceResolution::Diff { diff, truncations } => (diff, truncations),
             // git 管理外: hook は完全 silent、通常は空結果 + skipped で exit 0。
             DiffSourceResolution::Skipped(skip) => {
-                return emit_review_short_circuit(hook, pretty, Some(skip), Vec::new());
+                return emit_review_short_circuit(hook, output, Some(skip), Vec::new());
             }
             DiffSourceResolution::NotRequested => {
                 let stdin = std::io::stdin();
@@ -87,7 +92,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
         };
 
     if diff_input.trim().is_empty() {
-        return emit_review_short_circuit(hook, pretty, None, truncations);
+        return emit_review_short_circuit(hook, output, None, truncations);
     }
 
     // 2. impact 分析
@@ -105,7 +110,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
     let diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
     if crate::engine::impact::should_skip_ci_only_diff(&diff_files) {
         log_phase("review.skip_ci_only", "applied", 0);
-        return emit_review_short_circuit(hook, pretty, None, truncations);
+        return emit_review_short_circuit(hook, output, None, truncations);
     }
 
     let impact = timed_ok("context", || {
@@ -172,14 +177,14 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
         return review_hook_output(&result, dir, strict_public_const_values);
     }
 
-    let output = serialize_output(&result, pretty)?;
+    let text = serialize_document(&result, output)?;
     info!(
         command = "review",
         dir = dir,
-        output_bytes = output.len(),
+        output_bytes = text.len(),
         "command completed"
     );
-    println!("{output}");
+    println!("{text}");
     Ok(())
 }
 
@@ -192,7 +197,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
 /// 「対象外にしたファイルがある」ことを報告するため (空結果と打ち切りを混同させない)。
 fn emit_review_short_circuit(
     hook: bool,
-    pretty: bool,
+    output: OutputOptions,
     skipped: Option<SkipInfo>,
     truncations: Vec<crate::models::truncation::TruncationInfo>,
 ) -> Result<()> {
@@ -205,8 +210,8 @@ fn emit_review_short_circuit(
         truncations,
         ..Default::default()
     };
-    let output = serialize_output(&result, pretty)?;
-    println!("{output}");
+    let text = serialize_document(&result, output)?;
+    println!("{text}");
     Ok(())
 }
 
@@ -285,9 +290,14 @@ mod review_command_tests {
     /// `--hook` の短絡は 3 経路 (git 管理外 / 空 diff / CI 言語のみ) すべてで無出力 Ok。
     #[test]
     fn short_circuit_is_silent_under_hook() {
-        emit_review_short_circuit(true, false, None, Vec::new())
+        emit_review_short_circuit(true, OutputOptions::default(), None, Vec::new())
             .expect("hook short-circuit must succeed");
-        emit_review_short_circuit(true, true, Some(SkipInfo::not_git_repository()), Vec::new())
+        emit_review_short_circuit(
+            true,
+            OutputOptions::default(),
+            Some(SkipInfo::not_git_repository()),
+            Vec::new(),
+        )
             .expect("hook short-circuit must succeed");
     }
 

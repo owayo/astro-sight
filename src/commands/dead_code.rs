@@ -12,7 +12,7 @@ use super::api_changes::extract_exported_symbols_from_file_inner;
 use super::api_changes::{
     bare_name, extract_exported_symbols_from_file_inner_with_lang, extract_symbol_lines,
 };
-use super::common::serialize_output;
+use crate::output::{OutputOptions, serialize_document};
 use super::dead_code_member_liveness::{JsTsMemberLiveness, MemberStatus, PhpMemberLiveness};
 use super::git_input::{DiffSourceResolution, resolve_diff_source};
 
@@ -1213,7 +1213,7 @@ pub fn cmd_dead_code(
     framework: Option<&str>,
     extra_exclude_dirs: &[String],
     extra_exclude_globs: &[String],
-    pretty: bool,
+    output: OutputOptions,
     dead_scope: crate::cli::DeadScope,
 ) -> Result<()> {
     let canonical_dir = std::fs::canonicalize(dir)?;
@@ -1260,8 +1260,7 @@ pub fn cmd_dead_code(
                     skipped: None,
                     truncations,
                 };
-                let output = serialize_output(&result, pretty)?;
-                println!("{output}");
+                println!("{}", serialize_document(&result, output)?);
                 return Ok(());
             }
 
@@ -1278,8 +1277,7 @@ pub fn cmd_dead_code(
                 skipped: Some(skip),
                 truncations: Vec::new(),
             };
-            let output = serialize_output(&result, pretty)?;
-            println!("{output}");
+            println!("{}", serialize_document(&result, output)?);
             return Ok(());
         }
         DiffSourceResolution::NotRequested => (None, None, Vec::new()),
@@ -1324,7 +1322,7 @@ pub fn cmd_dead_code(
         truncations,
     };
 
-    let output = serialize_output(&result, pretty)?;
+    let text = serialize_document(&result, output)?;
     info!(
         command = "dead-code",
         dir = dir,
@@ -1332,6 +1330,6 @@ pub fn cmd_dead_code(
         dead_count = result.dead_symbols.len(),
         "command completed"
     );
-    println!("{output}");
+    println!("{text}");
     Ok(())
 }

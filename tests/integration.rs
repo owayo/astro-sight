@@ -21,6 +21,7 @@ mod integration {
     mod impact_output;
     mod languages;
     mod mcp;
+    mod output_format;
     mod php_member_liveness;
     mod refs;
     mod review;

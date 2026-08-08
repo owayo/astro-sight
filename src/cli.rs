@@ -22,7 +22,11 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 
-    /// Pretty-print JSON output (default: compact)
+    /// Output format (default: json, or `format` in config.toml)
+    #[arg(long, global = true, value_enum)]
+    pub format: Option<crate::output::OutputFormat>,
+
+    /// Pretty-print JSON output (default: compact). JSON only; ignored for `--format toon`
     #[arg(long, global = true)]
     pub pretty: bool,
 
