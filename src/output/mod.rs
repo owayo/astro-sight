@@ -160,6 +160,13 @@ impl OutputOptions {
     /// 既定値は JSON へ暗黙フォールバックさせる (`Ok`)。
     /// (`auto` はエラーにしない — JSON を選ぶことも `auto` の正当な結果であり、
     /// 「TOON で出せ」という満たせない要求ではないため。)
+    ///
+    /// **不変条件**: この検証を通す出力面は JSON を直接書く (`serde_json` / `Value` の
+    /// `Display`) こと。`serialize_document(value, output)` を通してはならない —
+    /// `auto` はここを `Ok` で抜けるため、通すと TOON が選ばれて**黙って**プロトコルが
+    /// 壊れる (明示 `toon` と違いエラーで気付けない)。現在の session / hook / エラー行は
+    /// いずれも `OutputOptions` を経由せず JSON を直接書いており、
+    /// `protocol_surfaces_stay_json_under_auto` がその挙動を固定している。
     pub fn ensure_json_protocol(&self, surface: &str) -> Result<()> {
         if self.format == OutputFormat::Toon && self.explicit_format {
             return Err(AstroError::new(

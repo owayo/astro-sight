@@ -151,9 +151,12 @@ fn toon_batch_emits_one_root_array_document() {
 fn json_batch_stays_ndjson() {
     let repo = sample_repo();
     let json = stdout_of(&run(&repo, &["symbols", "--dir", ".", "--glob", "**/*.rs"]));
-    for line in json.lines() {
-        serde_json::from_str::<serde_json::Value>(line).expect("each line is a JSON document");
-    }
+    // 件数まで固定する。行を回すだけだと空出力でも素通りしてしまう。
+    let docs: Vec<serde_json::Value> = json
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each line is a JSON document"))
+        .collect();
+    assert_eq!(docs.len(), 2, "two source files expected: {json}");
 }
 
 #[test]
@@ -239,11 +242,14 @@ fn auto_batch_emits_exactly_one_valid_format() {
             declared, items,
             "header length must match item count: {auto}"
         );
+        assert_eq!(declared, 2, "two source files expected: {auto}");
     } else {
-        // JSON を選んだ場合: 全行が独立した JSON ドキュメントであること。
-        for line in auto.lines() {
-            serde_json::from_str::<serde_json::Value>(line).expect("each line is a JSON document");
-        }
+        // JSON を選んだ場合: 全行が独立した JSON ドキュメントで、件数も合うこと。
+        let docs: Vec<serde_json::Value> = auto
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line is a JSON document"))
+            .collect();
+        assert_eq!(docs.len(), 2, "two source files expected: {auto}");
     }
 
     // どちらを選んだにせよ、両候補以下の長さになる。
@@ -420,18 +426,48 @@ fn config_file_sets_the_default_format() {
     assert!(json.starts_with('{'), "unexpected: {json}");
 }
 
+/// hook 出力が必ず出る差分を作る: `alpha` のシグネチャを変え、diff 外の `c.rs` に
+/// 呼び出しを残す。これで impact が未解決 caller を検出し、hook が blocking になる。
+fn repo_with_blocking_hook_output() -> TestRepo {
+    let repo = TestRepo::new();
+    repo.write("a.rs", "pub fn alpha(x: usize) -> usize {\n    x\n}\n");
+    repo.write(
+        "c.rs",
+        "use crate::a::alpha;\npub fn caller() -> usize {\n    alpha(1)\n}\n",
+    );
+    repo.init_git();
+    repo.commit_all("init");
+    repo.write(
+        "a.rs",
+        "pub fn alpha(x: usize, y: usize) -> usize {\n    x + y\n}\n",
+    );
+    repo
+}
+
+/// hook 出力 (stderr) を取り出す。出力が空ならテストの前提が壊れているので落とす
+/// (条件付きで検証を飛ばすと、hook が何も出さなくなった退行を見逃す)。
+fn hook_stderr(output: &std::process::Output) -> String {
+    assert!(
+        output.stdout.is_empty(),
+        "hook writes to stderr only, stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8(output.stderr.clone()).expect("stderr is not UTF-8");
+    assert!(
+        !stderr.trim().is_empty(),
+        "fixture must produce blocking hook output"
+    );
+    stderr
+}
+
 #[test]
 fn config_sourced_toon_does_not_break_protocol_surfaces() {
     // `format = "toon"` を設定しただけで session / hook が全滅しないこと
     // (明示指定と違い、config 由来の既定値はプロトコル面では JSON に倒す)。
-    let repo = sample_repo();
+    let repo = repo_with_blocking_hook_output();
     repo.write("astro-sight.toml", "format = \"toon\"\n");
     let config = repo.path("astro-sight.toml");
     let config = config.to_str().expect("utf-8 path");
-
-    repo.init_git();
-    repo.commit_all("init");
-    repo.write("b.rs", "pub fn gamma() -> usize {\n    3\n}\n");
 
     let output = run(
         &repo,
@@ -439,12 +475,9 @@ fn config_sourced_toon_does_not_break_protocol_surfaces() {
             "--config", config, "review", "--dir", ".", "--git", "--hook",
         ],
     );
-    // hook は blocking 時 exit 1 になりうるので、成否ではなく「JSON であること」を見る。
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.trim().is_empty() {
-        serde_json::from_str::<serde_json::Value>(stderr.trim())
-            .expect("hook output stays JSON even with config format = toon");
-    }
+    let stderr = hook_stderr(&output);
+    serde_json::from_str::<serde_json::Value>(stderr.trim())
+        .expect("hook output stays JSON even with config format = toon");
 
     let session = cargo_bin()
         .args(["--config", config, "session"])
@@ -457,6 +490,50 @@ fn config_sourced_toon_does_not_break_protocol_surfaces() {
         "session must not fail on a config-sourced toon default: {}",
         String::from_utf8_lossy(&session.stderr)
     );
+}
+
+#[test]
+fn protocol_surfaces_stay_json_under_auto() {
+    // `auto` はプロトコル面でエラーにならない = 検証をすり抜ける。そのぶん、実際の出力が
+    // JSON のままであることをここで固定する
+    // (`OutputOptions::ensure_json_protocol` の不変条件のリグレッションテスト)。
+    let repo = repo_with_blocking_hook_output();
+
+    let stderr = hook_stderr(&run(
+        &repo,
+        &[
+            "review", "--dir", ".", "--git", "--hook", "--format", "auto",
+        ],
+    ));
+    let value: serde_json::Value =
+        serde_json::from_str(stderr.trim()).expect("hook output stays JSON under --format auto");
+    assert!(value.is_object(), "unexpected hook payload: {stderr}");
+
+    // session: 1 行 1 レスポンスの NDJSON が保たれること。
+    let mut child = cargo_bin()
+        .args(["session", "--format", "auto"])
+        .current_dir(repo.root())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn session");
+    {
+        use std::io::Write;
+        let stdin = child.stdin.as_mut().expect("missing child stdin");
+        stdin
+            .write_all(b"{\"command\":\"symbols\",\"path\":\"a.rs\"}\n")
+            .expect("failed to write session request");
+    }
+    drop(child.stdin.take());
+    let out = child
+        .wait_with_output()
+        .expect("failed to wait for session");
+    let stdout = String::from_utf8(out.stdout).expect("stdout is not UTF-8");
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 1, "one response line expected: {stdout}");
+    serde_json::from_str::<serde_json::Value>(lines[0])
+        .expect("session response stays JSON under --format auto");
 }
 
 #[test]

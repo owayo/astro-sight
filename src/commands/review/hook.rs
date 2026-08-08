@@ -498,6 +498,11 @@ pub(crate) fn build_review_hook_json(
 }
 
 /// --hook 時の review 出力: compact JSON を stderr に出力する。
+///
+/// ここは Stop hook の JSON 契約なので、`OutputOptions` を受け取らず
+/// `serde_json::Value` の `Display` (= compact JSON) で直接書く。
+/// `serialize_document` を通すと `--format auto` で TOON が選ばれ、黙って契約が壊れる
+/// (`OutputOptions::ensure_json_protocol` の不変条件を参照)。
 /// blocking な検出 (impacts / api / dead) があれば exit 1、
 /// cochange のみの informational な出力は exit 0 にして Stop hook を止めない。
 pub(crate) fn review_hook_output(
