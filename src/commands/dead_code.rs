@@ -14,7 +14,7 @@ use super::api_changes::{
 };
 use super::dead_code_member_liveness::{JsTsMemberLiveness, MemberStatus, PhpMemberLiveness};
 use super::git_input::{DiffSourceResolution, resolve_diff_source};
-use crate::output::{OutputOptions, serialize_document};
+use crate::output::{OutputOptions, serialize_cli_document};
 
 /// dead-code 検出本体。候補収集 → 名前インデックス構築 → 参照カウント →
 /// アセット参照収集 → 分類の段階パイプラインで (dead_symbols, test_only_symbols) を返す。
@@ -1288,7 +1288,7 @@ pub fn cmd_dead_code(
                     skipped: None,
                     truncations,
                 };
-                println!("{}", serialize_document(&result, output)?);
+                print!("{}", serialize_cli_document(&result, output)?);
                 return Ok(());
             }
 
@@ -1305,7 +1305,7 @@ pub fn cmd_dead_code(
                 skipped: Some(skip),
                 truncations: Vec::new(),
             };
-            println!("{}", serialize_document(&result, output)?);
+            print!("{}", serialize_cli_document(&result, output)?);
             return Ok(());
         }
         DiffSourceResolution::NotRequested => (None, None, Vec::new()),
@@ -1350,7 +1350,7 @@ pub fn cmd_dead_code(
         truncations,
     };
 
-    let text = serialize_document(&result, output)?;
+    let text = serialize_cli_document(&result, output)?;
     info!(
         command = "dead-code",
         dir = dir,
@@ -1358,6 +1358,6 @@ pub fn cmd_dead_code(
         dead_count = result.dead_symbols.len(),
         "command completed"
     );
-    println!("{text}");
+    print!("{text}");
     Ok(())
 }

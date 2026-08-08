@@ -27,7 +27,7 @@ fn context_with_diff() {
              let query_src = symbol_query(lang_id);\n"
     );
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["context", "--dir", "."])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -144,7 +144,7 @@ fn context_batch_refs_consistency() {
              let query_src = symbol_query(lang_id);\n"
     );
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["context", "--dir", "."])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -251,7 +251,7 @@ fn context_empty_diff_returns_empty_changes() {
     use std::io::Write;
     use std::process::Stdio;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["context", "--dir", "."])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -305,7 +305,7 @@ fn context_diff_referencing_nonexistent_file() {
 
     let dir = tempfile::tempdir().expect("tempdir");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["context", "--dir", dir.path().to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -7,7 +7,7 @@ use crate::models::skip::SkipInfo;
 use crate::service::AppService;
 
 use super::api_changes::detect_api_changes;
-use crate::output::{OutputOptions, serialize_document};
+use crate::output::{OutputOptions, serialize_cli_document};
 
 use super::common::{MAX_INPUT_SIZE, log_phase, read_to_string_limited, timed, timed_ok};
 use super::dead_code::{
@@ -177,14 +177,14 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
         return review_hook_output(&result, dir, strict_public_const_values);
     }
 
-    let text = serialize_document(&result, output)?;
+    let text = serialize_cli_document(&result, output)?;
     info!(
         command = "review",
         dir = dir,
         output_bytes = text.len(),
         "command completed"
     );
-    println!("{text}");
+    print!("{text}");
     Ok(())
 }
 
@@ -210,8 +210,8 @@ fn emit_review_short_circuit(
         truncations,
         ..Default::default()
     };
-    let text = serialize_document(&result, output)?;
-    println!("{text}");
+    let text = serialize_cli_document(&result, output)?;
+    print!("{text}");
     Ok(())
 }
 

@@ -1146,6 +1146,77 @@ pub fn python_class_base_names(root: Node, source: &[u8], symbol_range: &Range) 
     bases
 }
 
+/// Python ランタイムが名前規約で呼び出すフレームワークメソッドかを判定する。
+///
+/// メソッド名だけでは通常クラスの同名メソッドを巻き込むため、既知の直接基底クラスとの
+/// 組み合わせが確認できた場合に限って runtime entrypoint とみなす。
+pub fn is_python_dynamic_protocol_method(
+    root: Node,
+    source: &[u8],
+    symbol_range: &Range,
+    method_name: &str,
+) -> bool {
+    let bases = python_class_base_names(root, source, symbol_range);
+    let inherits_any = |expected: &[&str]| {
+        bases.iter().any(|base| {
+            let tail = base.rsplit('.').next().unwrap_or(base);
+            expected.contains(&tail)
+        })
+    };
+
+    const URL_HANDLER_BASES: &[&str] = &[
+        "BaseHandler",
+        "AbstractHTTPHandler",
+        "AbstractBasicAuthHandler",
+        "AbstractDigestAuthHandler",
+        "HTTPHandler",
+        "HTTPSHandler",
+        "HTTPBasicAuthHandler",
+        "ProxyBasicAuthHandler",
+        "HTTPDigestAuthHandler",
+        "ProxyDigestAuthHandler",
+        "HTTPErrorProcessor",
+        "FileHandler",
+        "FTPHandler",
+        "CacheFTPHandler",
+        "DataHandler",
+        "UnknownHandler",
+        "HTTPDefaultErrorHandler",
+        "HTTPRedirectHandler",
+        "ProxyHandler",
+        "HTTPCookieProcessor",
+    ];
+    let is_url_callback = method_name == "default_open"
+        || method_name == "unknown_open"
+        || method_name == "http_error_default"
+        || method_name.starts_with("http_error_")
+        || method_name.ends_with("_open")
+        || method_name.ends_with("_error")
+        || method_name.ends_with("_request")
+        || method_name.ends_with("_response");
+    if is_url_callback && inherits_any(URL_HANDLER_BASES) {
+        return true;
+    }
+
+    const WATCHDOG_HANDLER_BASES: &[&str] = &[
+        "FileSystemEventHandler",
+        "PatternMatchingEventHandler",
+        "RegexMatchingEventHandler",
+        "LoggingEventHandler",
+    ];
+    const WATCHDOG_CALLBACKS: &[&str] = &[
+        "on_any_event",
+        "on_moved",
+        "on_created",
+        "on_deleted",
+        "on_modified",
+        "on_closed",
+        "on_closed_no_write",
+        "on_opened",
+    ];
+    WATCHDOG_CALLBACKS.contains(&method_name) && inherits_any(WATCHDOG_HANDLER_BASES)
+}
+
 /// PHP の擬似 enum (Java enum 風 static factory) パターンを判定する。
 ///
 /// 擬似 enum とは次の形のメソッドを指す。Laravel / DDD 系プロジェクトで

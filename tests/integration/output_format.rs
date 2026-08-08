@@ -5,7 +5,7 @@
 //! 2. TOON がデータ面 (単一ドキュメント / バッチ / MCP text content) で有効なこと
 //! 3. プロトコル面 (session / hook / エラー) が JSON 固定であること
 
-use super::support::{TestRepo, cargo_bin};
+use super::support::{TestRepo, cargo_bin, cargo_bin_with_explicit_config};
 
 fn sample_repo() -> TestRepo {
     let repo = TestRepo::new();
@@ -20,7 +20,12 @@ fn sample_repo() -> TestRepo {
 }
 
 fn run(repo: &TestRepo, args: &[&str]) -> std::process::Output {
-    cargo_bin()
+    let mut command = if args.contains(&"--config") {
+        cargo_bin_with_explicit_config()
+    } else {
+        cargo_bin()
+    };
+    command
         .args(args)
         .current_dir(repo.root())
         .output()
@@ -94,9 +99,8 @@ fn toon_single_document_is_indentation_based() {
     assert!(toon.starts_with("path: a.rs\n"), "unexpected: {toon}");
     assert!(toon.contains("lang: rust\n"), "unexpected: {toon}");
     assert!(toon.contains("symbols[3]"), "unexpected: {toon}");
-    // stdout は行指向ツールとの相互運用のため改行 1 個で終端する。
-    assert!(toon.ends_with('\n'));
-    assert!(!toon.ends_with("\n\n"));
+    // TOON v4.1 の canonical encoder は文書末尾の改行を禁止する。
+    assert!(!toon.ends_with('\n'));
     for line in toon.lines() {
         assert_eq!(line, line.trim_end(), "trailing whitespace: {line:?}");
         assert!(!line.contains('\t'), "tab in indentation: {line:?}");
@@ -145,6 +149,10 @@ fn toon_batch_emits_one_root_array_document() {
         "header length must match item count: {toon}"
     );
     assert_eq!(declared, 2, "two source files expected: {toon}");
+    assert!(
+        !toon.ends_with('\n'),
+        "TOON must not have a trailing newline"
+    );
 }
 
 #[test]
@@ -182,6 +190,10 @@ fn toon_refs_batch_becomes_a_single_document() {
         ],
     ));
     assert!(toon.starts_with("[2]"), "unexpected: {toon}");
+    assert!(
+        !toon.ends_with('\n'),
+        "TOON must not have a trailing newline"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +213,7 @@ fn auto_picks_the_smaller_estimate() {
     for args in [
         vec!["symbols", "--path", "a.rs"],
         vec!["refs", "--name", "alpha", "--dir", "."],
+        vec!["refs", "--names", "alpha,gamma", "--dir", "."],
         vec!["imports", "--path", "a.rs"],
         vec!["calls", "--path", "a.rs"],
         vec!["ast", "--path", "a.rs", "--line", "1", "--col", "0"],
@@ -284,6 +297,10 @@ fn auto_batch_emits_exactly_one_valid_format() {
             "header length must match item count: {auto}"
         );
         assert_eq!(declared, 2, "two source files expected: {auto}");
+        assert!(
+            !auto.ends_with('\n'),
+            "auto-selected TOON must not have a trailing newline"
+        );
     } else {
         // JSON を選んだ場合: 全行が独立した JSON ドキュメントで、件数も合うこと。
         let docs: Vec<serde_json::Value> = auto
@@ -520,7 +537,7 @@ fn config_sourced_toon_does_not_break_protocol_surfaces() {
     serde_json::from_str::<serde_json::Value>(stderr.trim())
         .expect("hook output stays JSON even with config format = toon");
 
-    let session = cargo_bin()
+    let session = cargo_bin_with_explicit_config()
         .args(["--config", config, "session"])
         .current_dir(repo.root())
         .stdin(std::process::Stdio::null())

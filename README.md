@@ -488,14 +488,15 @@ astro-sight dead-code --dir . --git --staged
 
 同名シンボルが複数ファイルに存在する場合は誤判定防止のためスキップされる。ただし TS/JS と PHP の class member は、owner を安全に一意推定できる場合だけ例外的に判定する。PHP では `Owner::method()` と同一クラス内の `self::method()` を確定参照として扱い、`$obj->method()` や callable 文字列など owner を確定できない参照がある場合は従来どおりスキップする（`static::` は遅延静的束縛でサブクラス override に到達し得るため確定解決しない）。trait を `use` する class / trait / enum 経由の静的呼び出しは、一意に到達する trait method に限り参照として数える（合成先が同名の具象メソッドを持つ場合は PHP の解決順により trait 側へ辿らない）。
 
-#### テストフレームワーク規約の自動除外
+#### 実行時規約の自動除外
 
-テストランナーがリフレクションで動的 discover するシンボルは、識別子レベルの cross-file refs では caller を追跡できず誤検出になるため、以下の規約は自動的に dead-code から除外される:
+フレームワークやテストランナーが名前規約・リフレクションで動的に呼び出すシンボルは、識別子レベルの cross-file refs では caller を追跡できず誤検出になるため、以下の規約は自動的に dead-code から除外される:
 
 - **PHPUnit**: `*Test` / `*TestCase` / `*IntegrationTest` / `*FeatureTest` クラスと `testXxx` / `setUp` / `tearDown` / `setUpBeforeClass` / `tearDownAfterClass` メソッド
 - **Python unittest**: `unittest.TestCase` (および `unittest.IsolatedAsyncioTestCase`) を継承するクラス（同一ファイル内の間接継承も fixed-point で解決）と、その `test_*` / `setUp` / `tearDown` / `setUpClass` / `tearDownClass` / `addCleanup` / `addClassCleanup` メソッド
 - **Python pytest**: `test_*.py` / `*_test.py` ファイルのトップレベル `test_*` 関数と `conftest.py` 内のすべての関数
 - **Python フレームワーク登録デコレータ**: Typer / Click / FastAPI / Flask / Django / Celery / pytest 等の登録デコレータが付いた関数・メソッド・クラス
+- **Python 動的プロトコルメソッド**: `urllib.request.BaseHandler` 系の `*_open` / `*_request` / `*_response` / `http_error_*` と、watchdog の `FileSystemEventHandler` 系 `on_*` callback。いずれも既知の基底クラスを直接継承するメソッドだけを除外する
 - **Angular**: `@Component` / `@Directive` 装飾クラスのライフサイクルフック (`ngOnInit` / `ngOnDestroy` / `ngOnChanges` / `ngDoCheck` / `ngAfterContentInit` / `ngAfterContentChecked` / `ngAfterViewInit` / `ngAfterViewChecked`) は Angular ランタイムが change detection サイクルで自動呼び出しするため除外
 
 #### フレームワーク自動検出 (v26.5.120+)
@@ -733,7 +734,7 @@ astro-sight のリポジトリ (`src/` 全体) での実測値:
 | `review --git` | 2,727 B | 2,119 B | -22% |
 | `doctor` | 1,435 B | 578 B | -60% |
 
-出力はリファレンス実装 ([`@toon-format/toon`](https://www.npmjs.com/package/@toon-format/toon) v4.1) の **strict モード** で decode できることを確認している。
+出力はリファレンス実装 ([`@toon-format/toon`](https://www.npmjs.com/package/@toon-format/toon) v4.1) の **strict モード** で decode できることを確認している。canonical encoder の要件に合わせ、単一出力・バッチ出力・`auto` で選ばれた TOON のいずれも文書末尾に改行を付けない（JSON / NDJSON の改行終端は従来どおり）。
 
 ### auto — トークン数が少ない方を自動選択
 
@@ -871,6 +872,7 @@ PR や patch 全体をまとめて見たい場合は、`astro-sight review --dir
 `tools/usage-stats` は Claude Code / Codex の利用ログから astro-sight 採用率とサブコマンド分布を集計する補助ツールです。
 `astro-sight` はシェル上の実行コマンドとして現れ、かつ既知サブコマンドを抽出できた場合だけ採用数に数えます。`/skills/astro-sight/SKILL.md` のようなパス文字列、プロンプト内の言及、`astro-sight --version` / `astro-sight --help` のようなサブコマンドなしの確認起動は除外します。
 `--pretty` / `--debug` / `--config <path>` などのグローバルフラグや、`/usr/bin/time -o <file> astro-sight ...` のようなラッパー経由でも、実際に実行されたサブコマンドを抽出します。
+Codex の従来形式 (`function_call` / `exec_command`) と現行形式 (`custom_tool_call` / `exec` 内の `tools.exec_command`) の双方を解析します。JavaScript の文字列・コメント内に埋め込まれたコマンド例は実行として数えません。
 
 ```bash
 cargo run --manifest-path tools/usage-stats/Cargo.toml -- --json --days 1

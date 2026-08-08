@@ -117,6 +117,21 @@ fn parse_json_output(output: Output) -> serde_json::Value {
 pub(super) const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub(super) fn cargo_bin() -> Command {
+    let missing_config = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/.astro-sight-test-config-does-not-exist.toml");
+    assert!(
+        !missing_config.exists(),
+        "テスト隔離用の設定パスが存在しています: {}",
+        missing_config.display()
+    );
+
+    let mut command = cargo_bin_with_explicit_config();
+    // 開発者の実設定に format = "toon" / "auto" があっても、JSON 契約のテストへ漏らさない。
+    command.arg("--config").arg(missing_config);
+    command
+}
+
+pub(super) fn cargo_bin_with_explicit_config() -> Command {
     Command::new(env!("CARGO_BIN_EXE_astro-sight"))
 }
 
@@ -125,7 +140,7 @@ pub(super) fn mcp_send_after_init(extra_messages: &[&str]) -> String {
     use std::io::{BufRead, BufReader, Write};
     use std::process::Stdio;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .arg("mcp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

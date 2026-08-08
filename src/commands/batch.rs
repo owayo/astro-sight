@@ -205,8 +205,8 @@ where
         && opts.is_toon()
     {
         let header = toon::streaming_array_header(paths.len());
-        bytes += header.len() + 1;
-        writeln!(out, "{header}")?;
+        bytes += header.len();
+        write!(out, "{header}")?;
     }
 
     for chunk in paths.chunks(window_size) {
@@ -227,15 +227,15 @@ where
                     (j + rj, t + rt)
                 });
                 let header = toon::streaming_array_header(paths.len());
-                // ヘッダ行も本文と同じ物差しで測る (末尾の改行 1 個を含める)。
+                // ヘッダと最初の item の区切り改行も本文と同じ物差しで測る。
                 let header_size = estimated_size(&header) + estimated_size("\n");
                 let winner =
                     decide_batch_format(json_len, toon_len, header_size, chunk.len(), paths.len());
                 let opts = output.with_format(winner);
                 resolved = Some(opts);
                 if winner == OutputFormat::Toon {
-                    bytes += header.len() + 1;
-                    writeln!(out, "{header}")?;
+                    bytes += header.len();
+                    write!(out, "{header}")?;
                 }
                 opts
             }
@@ -244,7 +244,11 @@ where
         for record in rendered {
             let line = record.take(opts.format());
             bytes += line.len() + 1;
-            writeln!(out, "{line}")?;
+            if opts.is_toon() {
+                write!(out, "\n{line}")?;
+            } else {
+                writeln!(out, "{line}")?;
+            }
         }
         // broken pipe 等を chunk 境界で検出し、残りの解析を早期に打ち切る。
         out.flush()?;
@@ -522,7 +526,7 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(output.clone()).expect("valid UTF-8"),
-            "[3]:\n  - p: f0.rs\n  - p: f1.rs\n  - p: f2.rs\n"
+            "[3]:\n  - p: f0.rs\n  - p: f1.rs\n  - p: f2.rs"
         );
         assert_eq!(bytes, output.len());
     }

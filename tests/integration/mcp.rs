@@ -3,14 +3,14 @@
 #[allow(unused_imports)]
 use super::support::*;
 #[allow(unused_imports)]
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 #[test]
 fn mcp_initialize() {
     use std::io::Write;
     use std::process::Stdio;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .arg("mcp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

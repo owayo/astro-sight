@@ -321,6 +321,229 @@ fn extract_astro_cmd_from_args(args: &str) -> Option<String> {
     is_astro_sight_cmd(args).then(|| args.to_string())
 }
 
+/// Codex の custom_tool_call が持つ JavaScript から exec_command の cmd を抽出する。
+fn extract_custom_exec_commands(input: &str) -> Vec<String> {
+    fn skip_quoted(bytes: &[u8], mut cursor: usize, quote: u8) -> usize {
+        cursor += 1;
+        while cursor < bytes.len() {
+            if bytes[cursor] == b'\\' {
+                cursor = (cursor + 2).min(bytes.len());
+            } else if bytes[cursor] == quote {
+                return cursor + 1;
+            } else {
+                cursor += 1;
+            }
+        }
+        cursor
+    }
+
+    fn skip_comment(bytes: &[u8], cursor: usize) -> Option<usize> {
+        match bytes.get(cursor + 1) {
+            Some(b'/') => Some(
+                bytes[cursor + 2..]
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map_or(bytes.len(), |offset| cursor + 3 + offset),
+            ),
+            Some(b'*') => Some(
+                bytes[cursor + 2..]
+                    .windows(2)
+                    .position(|pair| pair == b"*/")
+                    .map_or(bytes.len(), |offset| cursor + 4 + offset),
+            ),
+            _ => None,
+        }
+    }
+
+    fn parse_command_object(input: &str, mut cursor: usize) -> Option<String> {
+        let bytes = input.as_bytes();
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'(') {
+            return None;
+        }
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'{') {
+            return None;
+        }
+
+        let mut depth = 1_u32;
+        cursor += 1;
+        while cursor < bytes.len() && depth > 0 {
+            match bytes[cursor] {
+                b'\'' | b'"' | 96 => {
+                    cursor = skip_quoted(bytes, cursor, bytes[cursor]);
+                }
+                b'/' => {
+                    if let Some(next) = skip_comment(bytes, cursor) {
+                        cursor = next;
+                    } else {
+                        cursor += 1;
+                    }
+                }
+                b'{' => {
+                    depth += 1;
+                    cursor += 1;
+                }
+                b'}' => {
+                    depth -= 1;
+                    cursor += 1;
+                }
+                b'c' if depth == 1 && input[cursor..].starts_with("cmd") => {
+                    let key_end = cursor + 3;
+                    let next_is_identifier = key_end < bytes.len()
+                        && (bytes[key_end].is_ascii_alphanumeric() || bytes[key_end] == b'_');
+                    if next_is_identifier {
+                        cursor = key_end;
+                        continue;
+                    }
+                    let mut value_start = key_end;
+                    while bytes.get(value_start).is_some_and(u8::is_ascii_whitespace) {
+                        value_start += 1;
+                    }
+                    if bytes.get(value_start) != Some(&b':') {
+                        cursor = key_end;
+                        continue;
+                    }
+                    value_start += 1;
+                    while bytes.get(value_start).is_some_and(u8::is_ascii_whitespace) {
+                        value_start += 1;
+                    }
+                    if bytes.get(value_start) != Some(&b'"') {
+                        return None;
+                    }
+                    return serde_json::Deserializer::from_str(&input[value_start..])
+                        .into_iter::<String>()
+                        .next()
+                        .and_then(Result::ok);
+                }
+                _ => cursor += 1,
+            }
+        }
+        None
+    }
+
+    const CALL: &str = "tools.exec_command";
+    let bytes = input.as_bytes();
+    let mut commands = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\'' | b'"' | 96 => cursor = skip_quoted(bytes, cursor, bytes[cursor]),
+            b'/' => {
+                if let Some(next) = skip_comment(bytes, cursor) {
+                    cursor = next;
+                } else {
+                    cursor += 1;
+                }
+            }
+            b't' if input[cursor..].starts_with(CALL) => {
+                if let Some(command) = parse_command_object(input, cursor + CALL.len()) {
+                    commands.push(command);
+                }
+                cursor += CALL.len();
+            }
+            _ => cursor += 1,
+        }
+    }
+    commands
+}
+
+fn extract_shell_commands(tool_name: &str, args: &str) -> Vec<String> {
+    match tool_name {
+        "exec_command" => {
+            let mut args_buf = args.as_bytes().to_vec();
+            simd_json::to_borrowed_value(&mut args_buf)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("cmd")
+                        .and_then(|cmd| cmd.as_str())
+                        .map(str::to_owned)
+                })
+                .into_iter()
+                .collect()
+        }
+        "exec" => extract_custom_exec_commands(args),
+        _ => Vec::new(),
+    }
+}
+
+fn record_astro_command(
+    stats: &mut Stats,
+    source: &str,
+    file_date: &str,
+    pending_tools: &mut Vec<ToolDetail>,
+    has_relevant_tool: &mut bool,
+    command: &str,
+) {
+    pending_tools.push(ToolDetail {
+        tool: "astro-sight".to_string(),
+        detail: truncate(command, 200),
+    });
+    *has_relevant_tool = true;
+    if let Some(subcommand) = extract_astro_subcmd(command) {
+        *stats
+            .astro_subcmds
+            .entry(source.to_string())
+            .or_default()
+            .entry(subcommand.to_string())
+            .or_default() += 1;
+    }
+    if !file_date.is_empty() {
+        *stats.astro_daily.entry(file_date.to_string()).or_default() += 1;
+    }
+}
+
+fn record_shell_command(
+    stats: &mut Stats,
+    source: &str,
+    file_date: &str,
+    pending_tools: &mut Vec<ToolDetail>,
+    has_relevant_tool: &mut bool,
+    command: &str,
+) {
+    let is_astro_sight = is_astro_sight_cmd(command);
+    let category = if is_astro_sight {
+        "astro-sight".to_string()
+    } else {
+        extract_bash_category(command)
+    };
+    *stats
+        .bash_cmd_counts
+        .entry(source.to_string())
+        .or_default()
+        .entry(category)
+        .or_default() += 1;
+
+    if command.starts_with("grep ")
+        || command.starts_with("rg ")
+        || command.contains("| grep")
+        || command.contains("| rg")
+    {
+        pending_tools.push(ToolDetail {
+            tool: "grep/rg".to_string(),
+            detail: truncate(command, 200),
+        });
+        *has_relevant_tool = true;
+    }
+
+    if is_astro_sight {
+        record_astro_command(
+            stats,
+            source,
+            file_date,
+            pending_tools,
+            has_relevant_tool,
+            command,
+        );
+    }
+}
+
 fn extract_user_text(val: &simd_json::BorrowedValue) -> String {
     // message.content は文字列または text ブロック配列になり得る。
     let content = match val.get("message").and_then(|m| m.get("content")) {
@@ -642,7 +865,7 @@ fn process_codex_file(path: &Path, exclude_project: Option<&str>) -> Stats {
             continue;
         }
 
-        if item_type != "function_call" {
+        if item_type != "function_call" && item_type != "custom_tool_call" {
             continue;
         }
 
@@ -674,60 +897,41 @@ fn process_codex_file(path: &Path, exclude_project: Option<&str>) -> Stats {
 
         *stats.total_tool_calls.entry(source.clone()).or_default() += 1;
 
+        let args_field = if item_type == "custom_tool_call" {
+            "input"
+        } else {
+            "arguments"
+        };
         let args = payload
-            .get("arguments")
+            .get(args_field)
             .and_then(|a| a.as_str())
             .unwrap_or("");
 
-        // codex exec_command 内の grep/rg とシェルコマンド分類を記録する
-        if func_name == "exec_command" {
-            let mut args_buf = args.as_bytes().to_vec();
-            if let Ok(args_val) = simd_json::to_borrowed_value(&mut args_buf) {
-                let cmd = args_val.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
-
-                let category = if is_astro_sight_cmd(cmd) {
-                    "astro-sight".to_string()
-                } else {
-                    extract_bash_category(cmd)
-                };
-                *stats
-                    .bash_cmd_counts
-                    .entry(source.clone())
-                    .or_default()
-                    .entry(category)
-                    .or_default() += 1;
-
-                if cmd.starts_with("grep ")
-                    || cmd.starts_with("rg ")
-                    || cmd.contains("| grep")
-                    || cmd.contains("| rg")
-                {
-                    pending_tools.push(ToolDetail {
-                        tool: "grep/rg".to_string(),
-                        detail: truncate(cmd, 200),
-                    });
-                    has_relevant_tool = true;
-                }
-            }
+        // 旧 function_call と現行 custom_tool_call のシェル実行を同じ粒度で集計する。
+        let shell_commands = extract_shell_commands(&func_name, args);
+        for command in &shell_commands {
+            record_shell_command(
+                &mut stats,
+                &source,
+                &file_date,
+                &mut pending_tools,
+                &mut has_relevant_tool,
+                command,
+            );
         }
 
-        if let Some(cmd) = extract_astro_cmd_from_args(args) {
-            pending_tools.push(ToolDetail {
-                tool: "astro-sight".to_string(),
-                detail: truncate(&cmd, 200),
-            });
-            has_relevant_tool = true;
-            if let Some(subcmd) = extract_astro_subcmd(&cmd) {
-                *stats
-                    .astro_subcmds
-                    .entry(source.clone())
-                    .or_default()
-                    .entry(subcmd.to_string())
-                    .or_default() += 1;
-            }
-            if !file_date.is_empty() {
-                *stats.astro_daily.entry(file_date.clone()).or_default() += 1;
-            }
+        if shell_commands.is_empty()
+            && func_name != "exec"
+            && let Some(cmd) = extract_astro_cmd_from_args(args)
+        {
+            record_astro_command(
+                &mut stats,
+                &source,
+                &file_date,
+                &mut pending_tools,
+                &mut has_relevant_tool,
+                &cmd,
+            );
         }
     }
 
@@ -1568,5 +1772,75 @@ mod tests {
             extract_astro_subcmd("echo \"探索\" && astro-sight refs --name foo --dir ."),
             Some("refs")
         );
+    }
+
+    #[test]
+    fn custom_exec_commands_extracts_escaped_command() {
+        let input = r#"const result = await tools.exec_command({
+            cmd: "astro-sight refs --name \"Foo\" --dir .\n",
+            workdir: "/tmp"
+        }); text(result.output);"#;
+
+        assert_eq!(
+            extract_custom_exec_commands(input),
+            vec!["astro-sight refs --name \"Foo\" --dir .\n"]
+        );
+    }
+
+    #[test]
+    fn custom_exec_commands_extracts_multiple_calls_only() {
+        let input = r#"const first = await tools.exec_command({cmd: "cargo test", max_output_tokens: 1000});
+            const command_name = "cmd";
+            const sample = "tools.exec_command({cmd: \"false positive\"})";
+            // tools.exec_command({cmd: "comment"})
+            const second = await tools.exec_command({ cmd : "rg \"TODO\" src" });"#;
+
+        assert_eq!(
+            extract_custom_exec_commands(input),
+            vec!["cargo test", "rg \"TODO\" src"]
+        );
+    }
+
+    #[test]
+    fn process_codex_file_counts_custom_tool_call() {
+        let path = std::env::temp_dir().join(format!(
+            "astro-sight-usage-stats-custom-tool-{}.jsonl",
+            std::process::id()
+        ));
+        let input = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": "const result = await tools.exec_command({cmd:\"astro-sight refs --name Foo --dir .\"}); text(result.output);"
+            }
+        });
+        let patch_input = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": "const patch = \"astro-sight refs --name FalsePositive --dir .\"; text(await tools.apply_patch(patch));"
+            }
+        });
+        let legacy_input = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"astro-sight refs --name Legacy --dir .\"}"
+            }
+        });
+        std::fs::write(&path, format!("{input}\n{patch_input}\n{legacy_input}\n"))
+            .expect("一時ログを書き込めること");
+
+        let stats = process_codex_file(&path, None);
+        std::fs::remove_file(&path).expect("一時ログを削除できること");
+
+        assert_eq!(stats.total_tool_calls["codex"], 3);
+        assert_eq!(stats.tool_counts["codex"]["exec"], 2);
+        assert_eq!(stats.tool_counts["codex"]["exec_command"], 1);
+        assert_eq!(stats.bash_cmd_counts["codex"]["astro-sight"], 2);
+        assert_eq!(stats.astro_subcmds["codex"]["refs"], 2);
     }
 }

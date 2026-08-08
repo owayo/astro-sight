@@ -487,6 +487,19 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
         // `conftest.py` 内の関数はテストランナーから動的 discover されるため、
         // 識別子レベルの cross-file refs では caller を追跡できない。
         if self.exclude_framework_entrypoints
+            && self.lang_id == crate::language::LangId::Python
+            && matches!(sym.kind, SymbolKind::Method | SymbolKind::Function)
+            && crate::engine::symbols::is_python_dynamic_protocol_method(
+                self.root,
+                self.source,
+                &sym.range,
+                &sym.name,
+            )
+        {
+            return true;
+        }
+
+        if self.exclude_framework_entrypoints
             && is_python_test_symbol(
                 &sym.name,
                 sym.kind,

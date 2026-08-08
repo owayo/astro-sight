@@ -245,7 +245,7 @@ fn init_does_not_require_valid_existing_config() {
     let out_config = dir.path().join("generated.toml");
     std::fs::write(&bad_config, "not valid [[[").unwrap();
 
-    let output = cargo_bin()
+    let output = cargo_bin_with_explicit_config()
         .args([
             "--config",
             bad_config.to_str().unwrap(),

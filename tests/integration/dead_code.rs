@@ -652,3 +652,54 @@ fn dead_code_reports_declaration_line() {
         "参照のある usedFn は dead ではない: {json}"
     );
 }
+
+#[test]
+fn dead_code_excludes_python_dynamic_protocol_callbacks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    std::fs::write(
+        repo.join("handlers.py"),
+        concat!(
+            "class UrlCallback(urllib.request.HTTPHandler):\n",
+            "    def http_open(self, request):\n",
+            "        return request\n",
+            "    def helper(self):\n",
+            "        return None\n",
+            "\n",
+            "class WatchCallback(FileSystemEventHandler):\n",
+            "    def on_any_event(self, event):\n",
+            "        return event\n",
+        ),
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", repo.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead = json["dead_symbols"].as_array().expect("dead_symbols");
+    assert!(
+        !dead
+            .iter()
+            .any(|entry| entry["name"] == "UrlCallback.http_open"),
+        "URL ハンドラの動的メソッドは dead ではない: {json}"
+    );
+    assert!(
+        !dead
+            .iter()
+            .any(|entry| entry["name"] == "WatchCallback.on_any_event"),
+        "ファイル監視の動的メソッドは dead ではない: {json}"
+    );
+    assert!(
+        dead.iter()
+            .any(|entry| entry["name"] == "UrlCallback.helper"),
+        "規約外の未参照メソッドは dead のままにする: {json}"
+    );
+}

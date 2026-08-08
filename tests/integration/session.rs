@@ -3,14 +3,14 @@
 #[allow(unused_imports)]
 use super::support::*;
 #[allow(unused_imports)]
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 #[test]
 fn session_ndjson() {
     use std::io::Write;
     use std::process::Stdio;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .arg("session")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -43,7 +43,7 @@ fn session_ndjson_calls() {
     use std::io::Write;
     use std::process::Stdio;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .arg("session")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -214,7 +214,7 @@ fn session_ast_includes_diagnostics() {
     use std::process::Stdio;
 
     // Session の AST 応答には snippet と diagnostics が含まれる。
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .arg("session")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -249,7 +249,7 @@ fn session_refs_requires_name_or_names() {
     use std::io::Write;
     use std::process::Stdio;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .arg("session")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -282,7 +282,7 @@ fn session_invalid_json_returns_error() {
     use std::io::Write;
     use std::process::Stdio;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .arg("session")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -310,7 +310,7 @@ fn session_invalid_json_returns_error() {
 fn session_empty_input_exits_cleanly() {
     use std::process::Stdio;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .arg("session")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

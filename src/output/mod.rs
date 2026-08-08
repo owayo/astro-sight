@@ -207,12 +207,35 @@ pub fn serialize_document<T: serde::Serialize + ?Sized>(
     value: &T,
     output: OutputOptions,
 ) -> Result<String> {
+    Ok(serialize_document_with_format(value, output)?.0)
+}
+
+/// CLI の単一ドキュメントを直列化する。
+///
+/// JSON は従来の行指向契約を保つため末尾改行を付ける。一方、TOON v4.1 の canonical
+/// encoder は末尾改行を禁止しているため、明示指定だけでなく `auto` で TOON が選ばれた
+/// 場合も改行を付けない。
+pub fn serialize_cli_document<T: serde::Serialize + ?Sized>(
+    value: &T,
+    output: OutputOptions,
+) -> Result<String> {
+    let (mut text, selected) = serialize_document_with_format(value, output)?;
+    if selected != OutputFormat::Toon {
+        text.push('\n');
+    }
+    Ok(text)
+}
+
+fn serialize_document_with_format<T: serde::Serialize + ?Sized>(
+    value: &T,
+    output: OutputOptions,
+) -> Result<(String, OutputFormat)> {
     match output.format {
         OutputFormat::Json => match output.json_style {
-            JsonStyle::Compact => Ok(serde_json::to_string(value)?),
-            JsonStyle::Pretty => Ok(serde_json::to_string_pretty(value)?),
+            JsonStyle::Compact => Ok((serde_json::to_string(value)?, OutputFormat::Json)),
+            JsonStyle::Pretty => Ok((serde_json::to_string_pretty(value)?, OutputFormat::Json)),
         },
-        OutputFormat::Toon => to_toon(value, toon::encode_value),
+        OutputFormat::Toon => Ok((to_toon(value, toon::encode_value)?, OutputFormat::Toon)),
         OutputFormat::Auto => {
             // 比較は常に compact JSON と TOON で行う (どちらも「短く出す」形)。
             // JSON が勝った場合だけ `--pretty` を適用する = auto は形式を選び、
@@ -223,11 +246,11 @@ pub fn serialize_document<T: serde::Serialize + ?Sized>(
             // auto で選ぶと「結果が空」と「コマンドが何も出さなかった」を利用者が区別できない。
             // 明示的な `--format toon` は仕様どおりの挙動を維持し、auto だけ JSON へ倒す。
             if !toon.is_empty() && size_metric(&toon) < size_metric(&compact) {
-                return Ok(toon);
+                return Ok((toon, OutputFormat::Toon));
             }
             match output.json_style {
-                JsonStyle::Compact => Ok(compact),
-                JsonStyle::Pretty => Ok(serde_json::to_string_pretty(value)?),
+                JsonStyle::Compact => Ok((compact, OutputFormat::Json)),
+                JsonStyle::Pretty => Ok((serde_json::to_string_pretty(value)?, OutputFormat::Json)),
             }
         }
     }
@@ -328,6 +351,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(toon, "name: foo\ncount: 2");
+    }
+
+    #[test]
+    fn cli_document_uses_a_newline_only_for_selected_json() {
+        let json = OutputOptions::new(OutputFormat::Json, JsonStyle::Compact);
+        assert_eq!(
+            serialize_cli_document(&sample(), json).unwrap(),
+            "{\"name\":\"foo\",\"count\":2}\n"
+        );
+
+        let toon = OutputOptions::new(OutputFormat::Toon, JsonStyle::Compact);
+        assert_eq!(
+            serialize_cli_document(&sample(), toon).unwrap(),
+            "name: foo\ncount: 2"
+        );
+
+        // `auto` でも実際に選ばれた形式に従う。sample は TOON、平坦な短い object は
+        // 改行ペナルティにより JSON が勝つため、両分岐を固定する。
+        let auto = OutputOptions::new(OutputFormat::Auto, JsonStyle::Compact);
+        assert_eq!(
+            serialize_cli_document(&sample(), auto).unwrap(),
+            "name: foo\ncount: 2"
+        );
+        let flat = serde_json::json!({ "a": 1, "b": 2, "c": 3, "d": 4 });
+        assert_eq!(
+            serialize_cli_document(&flat, auto).unwrap(),
+            "{\"a\":1,\"b\":2,\"c\":3,\"d\":4}\n"
+        );
     }
 
     #[test]

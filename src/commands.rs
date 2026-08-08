@@ -10,7 +10,7 @@ use crate::service::{AppService, AstParams};
 
 mod common;
 
-pub use crate::output::{OutputFormat, OutputOptions, serialize_document};
+pub use crate::output::{OutputFormat, OutputOptions, serialize_cli_document, serialize_document};
 #[cfg(test)]
 pub(crate) use common::read_bytes_limited_and_drain;
 pub(crate) use common::{ChangedFileSet, cache_hash_for_path, log_phase, read_to_string_limited};
@@ -135,12 +135,11 @@ pub fn cmd_ast(service: &AppService, opts: &CmdAstOpts<'_>) -> Result<()> {
             };
             let response = service.extract_ast(&params)?;
 
-            let mut output = if opts.full {
-                serialize_document(&response, opts.output)?
+            let output = if opts.full {
+                serialize_cli_document(&response, opts.output)?
             } else {
-                serialize_document(&response.to_compact_ast(), opts.output)?
+                serialize_cli_document(&response.to_compact_ast(), opts.output)?
             };
-            output.push('\n');
 
             // response の借用期間が symbols と異なるため、解析済み hash はここで clone して返す。
             let analyzed_hash = response.hash.clone();
@@ -203,13 +202,12 @@ pub fn cmd_symbols(
         let response = service.extract_symbols_with_query(path, query)?;
         let analyzed_hash = response.hash.clone();
 
-        let mut text = if full {
-            serialize_document(&response, output)?
+        let text = if full {
+            serialize_cli_document(&response, output)?
         } else {
             let compact = response.to_compact_symbols(doc);
-            serialize_document(&compact, output)?
+            serialize_cli_document(&compact, output)?
         };
-        text.push('\n');
 
         Ok((text, analyzed_hash))
     })
@@ -225,25 +223,25 @@ pub fn cmd_calls(
     // `--pretty` は整形だけでなく full / compact DTO の選択も兼ねている (既存仕様)。
     // TOON には pretty の概念が無いため既定の compact DTO を使う。
     let text = if output.is_pretty_json() {
-        serialize_document(&result, output)?
+        serialize_cli_document(&result, output)?
     } else {
-        serialize_document(&result.to_compact(), output)?
+        serialize_cli_document(&result.to_compact(), output)?
     };
     info!(command = "calls", path = path, function = ?function, output_bytes = text.len(), "command completed");
-    println!("{text}");
+    print!("{text}");
     Ok(())
 }
 
 pub fn cmd_imports(service: &AppService, path: &str, output: OutputOptions) -> Result<()> {
     let result = service.extract_imports(path)?;
-    let text = serialize_document(&result, output)?;
+    let text = serialize_cli_document(&result, output)?;
     info!(
         command = "imports",
         path = path,
         output_bytes = text.len(),
         "command completed"
     );
-    println!("{text}");
+    print!("{text}");
     Ok(())
 }
 
@@ -254,7 +252,7 @@ pub fn cmd_lint(
     output: OutputOptions,
 ) -> Result<()> {
     let result = service.lint_file(path, rules)?;
-    let text = serialize_document(&result, output)?;
+    let text = serialize_cli_document(&result, output)?;
     info!(
         command = "lint",
         path = path,
@@ -262,7 +260,7 @@ pub fn cmd_lint(
         output_bytes = text.len(),
         "command completed"
     );
-    println!("{text}");
+    print!("{text}");
     Ok(())
 }
 
@@ -273,9 +271,9 @@ pub fn cmd_sequence(
     output: OutputOptions,
 ) -> Result<()> {
     let result = service.generate_sequence(path, function)?;
-    let text = serialize_document(&result, output)?;
+    let text = serialize_cli_document(&result, output)?;
     info!(command = "sequence", path = path, function = ?function, output_bytes = text.len(), "command completed");
-    println!("{text}");
+    print!("{text}");
     Ok(())
 }
 
@@ -287,9 +285,9 @@ pub fn cmd_refs(
     output: OutputOptions,
 ) -> Result<()> {
     let result = service.find_references(name, dir, glob)?;
-    let text = serialize_document(&result, output)?;
+    let text = serialize_cli_document(&result, output)?;
     info!(command = "refs", name = name, dir = dir, glob = ?glob, output_bytes = text.len(), "command completed");
-    println!("{text}");
+    print!("{text}");
     Ok(())
 }
 
@@ -327,7 +325,7 @@ pub fn cmd_refs_batch(
             }
         }
         OutputFormat::Toon => {
-            writeln!(out, "{}", serialize_document(&results, output)?)?;
+            write!(out, "{}", serialize_document(&results, output)?)?;
         }
         OutputFormat::Auto => {
             let mut ndjson = String::new();
@@ -336,8 +334,8 @@ pub fn cmd_refs_batch(
                 ndjson.push('\n');
             }
             let toon = serialize_document(&results, output.with_format(OutputFormat::Toon))?;
-            if toon.chars().count() + 1 < ndjson.chars().count() {
-                writeln!(out, "{toon}")?;
+            if crate::output::estimated_size(&toon) < crate::output::estimated_size(&ndjson) {
+                write!(out, "{toon}")?;
             } else {
                 write!(out, "{ndjson}")?;
             }
@@ -369,12 +367,12 @@ pub fn cmd_cochange(
             diagnostics: Default::default(),
             skipped: Some(skip),
         };
-        let text = serialize_document(&result, output)?;
-        println!("{text}");
+        let text = serialize_cli_document(&result, output)?;
+        print!("{text}");
         return Ok(());
     }
     let result = service.analyze_cochange(dir, opts)?;
-    let text = serialize_document(&result, output)?;
+    let text = serialize_cli_document(&result, output)?;
     info!(
         command = "cochange",
         dir = dir,
@@ -388,7 +386,7 @@ pub fn cmd_cochange(
         output_bytes = text.len(),
         "command completed"
     );
-    println!("{text}");
+    print!("{text}");
     Ok(())
 }
 
@@ -444,7 +442,7 @@ pub fn cmd_context(service: &AppService, opts: &CmdContextOpts<'_>) -> Result<()
                     skipped: Some(skip),
                     truncations: Vec::new(),
                 };
-                println!("{}", serialize_document(&result, output)?);
+                print!("{}", serialize_cli_document(&result, output)?);
                 return Ok(());
             }
             DiffSourceResolution::NotRequested => {
@@ -468,7 +466,7 @@ pub fn cmd_context(service: &AppService, opts: &CmdContextOpts<'_>) -> Result<()
     if !output.streams_compact_json() {
         let mut result = service.analyze_context(&diff_input, dir, &options)?;
         result.truncations = truncations;
-        let text = serialize_document(&result, output)?;
+        let text = serialize_cli_document(&result, output)?;
         info!(
             command = "context",
             dir = dir,
@@ -476,7 +474,7 @@ pub fn cmd_context(service: &AppService, opts: &CmdContextOpts<'_>) -> Result<()
             output_bytes = text.len(),
             "command completed"
         );
-        println!("{text}");
+        print!("{text}");
         return Ok(());
     }
 
@@ -659,13 +657,13 @@ pub fn cmd_impact(service: &AppService, opts: &CmdImpactOpts<'_>) -> Result<()> 
 
 pub fn cmd_doctor(output: OutputOptions) -> Result<()> {
     let report = doctor::run_doctor();
-    let text = serialize_document(&report, output)?;
+    let text = serialize_cli_document(&report, output)?;
     info!(
         command = "doctor",
         output_bytes = text.len(),
         "command completed"
     );
-    println!("{text}");
+    print!("{text}");
     Ok(())
 }
 

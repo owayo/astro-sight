@@ -19,8 +19,8 @@ pub use framework::{
     has_framework_entrypoint_decorator_python, is_java_flyway_migration_class,
     is_js_ts_angular_lifecycle_hook, is_js_ts_angular_provider_option_callback,
     is_js_ts_angular_runtime_entrypoint, is_js_ts_framework_dsl_callback,
-    is_php_laravel_runtime_entrypoint, is_php_pseudo_enum_method, php_doc_has_runtime_annotation,
-    python_class_base_names,
+    is_php_laravel_runtime_entrypoint, is_php_pseudo_enum_method,
+    is_python_dynamic_protocol_method, php_doc_has_runtime_annotation, python_class_base_names,
 };
 pub use overrides::is_override_method;
 pub use scope::is_local_scope_symbol;

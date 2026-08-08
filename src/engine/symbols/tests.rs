@@ -1532,6 +1532,80 @@ fn python_class_base_names_skips_keyword_arguments() {
     assert_eq!(bases, vec!["Bar".to_string()]);
 }
 
+/// Python の動的プロトコルメソッド判定を、抽出済みシンボルの range で呼び出す。
+fn check_python_dynamic_protocol(src: &str, method_name: &str) -> bool {
+    let language = LangId::Python.ts_language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).unwrap();
+    let tree = parser.parse(src, None).unwrap();
+    let root = tree.root_node();
+    let syms = extract_symbols(root, src.as_bytes(), LangId::Python).unwrap();
+    let method = syms
+        .iter()
+        .find(|symbol| symbol.name == method_name)
+        .expect("対象メソッドを抽出できること");
+    is_python_dynamic_protocol_method(root, src.as_bytes(), &method.range, method_name)
+}
+
+#[test]
+fn python_url_handler_protocol_methods_are_detected() {
+    let src = concat!(
+        "class Guard(urllib.request.HTTPHandler):\n",
+        "    def http_open(self, request):\n",
+        "        return request\n",
+        "    def helper(self):\n",
+        "        return None\n",
+    );
+
+    assert!(check_python_dynamic_protocol(src, "http_open"));
+    assert!(!check_python_dynamic_protocol(src, "helper"));
+}
+
+#[test]
+fn python_url_auth_and_error_processor_callbacks_are_detected() {
+    let auth = concat!(
+        "class Auth(urllib.request.HTTPBasicAuthHandler):\n",
+        "    def http_error_401(self, request, response, code, message, headers):\n",
+        "        return response\n",
+    );
+    let processor = concat!(
+        "class Processor(urllib.request.HTTPErrorProcessor):\n",
+        "    def http_response(self, request, response):\n",
+        "        return response\n",
+        "    def https_response(self, request, response):\n",
+        "        return response\n",
+    );
+
+    assert!(check_python_dynamic_protocol(auth, "http_error_401"));
+    assert!(check_python_dynamic_protocol(processor, "http_response"));
+    assert!(check_python_dynamic_protocol(processor, "https_response"));
+}
+
+#[test]
+fn python_watchdog_callbacks_are_detected() {
+    let src = concat!(
+        "class Handler(watchdog.events.FileSystemEventHandler):\n",
+        "    def on_any_event(self, event):\n",
+        "        return event\n",
+    );
+
+    assert!(check_python_dynamic_protocol(src, "on_any_event"));
+}
+
+#[test]
+fn python_protocol_method_names_require_known_base_class() {
+    let src = concat!(
+        "class OrdinaryHandler:\n",
+        "    def http_open(self, request):\n",
+        "        return request\n",
+        "    def on_any_event(self, event):\n",
+        "        return event\n",
+    );
+
+    assert!(!check_python_dynamic_protocol(src, "http_open"));
+    assert!(!check_python_dynamic_protocol(src, "on_any_event"));
+}
+
 /// PHP 擬似 enum パターンの判定 (Laravel/DDD 系の AbstractValueObject 派生)
 #[test]
 fn is_php_pseudo_enum_method_detects_value_object_factory() {

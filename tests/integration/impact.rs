@@ -251,7 +251,7 @@ fn impact_clean_pass() {
     use std::process::Stdio;
 
     // Empty diff → exit 0, no output
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["impact", "--dir", "."])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -294,7 +294,7 @@ fn impact_with_unresolved() {
              let query_src = symbol_query(lang_id);\n"
     );
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["impact", "--dir", "."])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -389,7 +389,7 @@ mod tests {
      x + 1
 "#;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["impact", "--dir", dir.path().to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -516,7 +516,7 @@ pub fn run() -> String {
 +}
 "#;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["impact", "--dir", dir.path().to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -595,7 +595,7 @@ function App() { return null; }
  }
 "#;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["impact", "--dir", dir.path().to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -682,7 +682,7 @@ class DnsPacketTest {
  }
 "#;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["impact", "--dir", dir.path().to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -750,7 +750,7 @@ pub use inner::do_work;
  }
 "#;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["impact", "--dir", dir.path().to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -820,7 +820,7 @@ fn normalize_line() -> Vec<u8> { vec![] }
 +pub mod tensor;
 "#;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["impact", "--dir", dir.path().to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -902,7 +902,7 @@ pub fn process(mem: &dyn GuestMemory) {
      mem.read(addr, &mut buf);
 "#;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["impact", "--dir", dir.path().to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1012,7 +1012,7 @@ pub fn run() -> i32 {
      }
 "#;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["impact", "--dir", dir.path().to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1113,7 +1113,7 @@ pub fn dispatch(dev: &mut dyn Device, offset: u64, value: u64) {
          let addr = self.base + offset;
 "#;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["impact", "--dir", dir.path().to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1181,7 +1181,7 @@ pub mod tensor;
 +pub mod tensor;
 "#;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["impact", "--dir", dir.path().to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1287,7 +1287,7 @@ pub fn use_existing(e: &Existing) -> u32 {
 +}
 "#;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["context", "--dir", dir.path().to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1420,7 +1420,7 @@ class Consumer {
  }
 "#;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["context", "--dir", dir.path().to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1545,7 +1545,7 @@ pub fn consume() {
  }
 "#;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["context", "--dir", dir.path().to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1669,7 +1669,7 @@ export function consume(): number {
  }
 "#;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["context", "--dir", dir.path().to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1784,7 +1784,7 @@ function consume_vendor(): void {
  }
 "#;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["context", "--dir", dir.path().to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1903,7 +1903,7 @@ function consume_custom(): void {
 "#;
 
     // ユーザーが --exclude-dir pjproject-2.15 を渡せば、impact からも除外される。
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args([
             "context",
             "--dir",
@@ -1990,7 +1990,7 @@ fn impact_invalid_exclude_glob_returns_error() {
 +fn x(y: i32) {}
 "#;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args([
             "context",
             "--dir",
@@ -2040,7 +2040,7 @@ fn impact_rejects_path_traversal_in_diff() {
 
     let dir = tempfile::tempdir().expect("tempdir");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["context", "--dir", dir.path().to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2278,7 +2278,7 @@ export function ConversationList({ conversations }: Props) {
 +export const conversations = { id: 0, title: "" };
 "#;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["context", "--dir", dir.path().to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2372,7 +2372,7 @@ export function getList() {
 +export const conversations = { id: 0, title: "" };
 "#;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_astro-sight"))
+    let mut child = cargo_bin()
         .args(["context", "--dir", dir.path().to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
