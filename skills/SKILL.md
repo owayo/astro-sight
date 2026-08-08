@@ -55,6 +55,7 @@ printf '%s\n' \
   '{"command":"refs","name":"S","dir":"."}' \
   '{"command":"symbols","path":"src/main.rs"}' \
   | astro-sight session                                  # 13. batch mixed queries
+astro-sight <command> --format toon                # 14. TOON output (17-60% fewer tokens)
 ```
 
 ## Commands
@@ -272,6 +273,9 @@ printf '%s\n' \
 
 - **16 tree-sitter languages**: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby, Zig — plus Xojo via a lexer-only backend (`symbols` / `refs` / `dead-code` only; `ast` / `calls` / `imports` / `lint` / `sequence` return `UNSUPPORTED_LANGUAGE`). Ruby methods may use Unicode identifiers, including simple case-fold characters such as `ſ` and `K`.
 - Compact JSON by default (short keys: `ln`, `col`, `ctx`, `refs`, `src`, `def`/`ref`, `fn`...). Use `--pretty` (global) for human-readable output.
+- **`--format json|toon`** (global) switches the output format; the default is `json`, and `format` in `~/.config/astro-sight/config.toml` sets a different default (CLI `--format` wins). TOON ([v4.1](https://toonformat.dev/)) encodes the same data with indentation and tables instead of repeated keys, measuring 17-60% smaller than compact JSON across commands. `--pretty` is JSON-only and ignored for TOON.
+- **Always JSON regardless of `--format`**: `session` (line-oriented NDJSON protocol), `review --hook` / `impact --hook` (Stop hook contract), and the `{"error":{...}}` envelope. Passing `--format toon` explicitly to those is an `INVALID_REQUEST`; a config-file default silently falls back to JSON so setting `format = "toon"` never breaks hooks.
+- With `--format toon`, batch modes (`--paths` / `--paths-file` / `--dir`) emit **one root-array document** (`[N]:` followed by `- ` items) instead of NDJSON. Optional fields that compact JSON omits (e.g. `cx`) appear as explicit `null` cells so uniform tables stay possible.
 - `refs` respects `.gitignore`; results include `ctx` (source line) so no follow-up Read is needed. Use `refs --names` for symbol-only batches, `session` for mixed commands.
 - A zero-result identifier query is still an AST analysis result; do not repeat the same search with Grep/rg.
 - **Vendor/build exclusion** (`context` / `impact` / `review`): cross-file ref search skips package-manager trees (`vendor/`, `node_modules/`, `.venv/`, `Pods/`, `Carthage/`...) and build artifacts (`target/`, `build/`, `dist/`, `.build/`, `DerivedData/`, `.next/`, `bin/`, `obj/`...) so generic method names (`new`, `save`, `find`) don't flood `impacted_callers`. `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` opts back in; `.gitignore` / hidden exclusions are independent and always on. For non-default vendored trees (`pjproject-2.15/`, `third_party/`...) pass `--exclude-dir <NAME>` / `--exclude-glob <PATTERN>` (workspace-relative, negative-override); invalid globs fail up-front with `INVALID_REQUEST`.

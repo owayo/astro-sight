@@ -72,6 +72,6 @@ pub fn streaming_array_header(len: usize) -> String {
 
 /// ストリーミング出力用: ルート配列の要素 1 件を list item として書き出す。
 /// 末尾改行は付かない。
-pub fn streaming_array_item<T: serde::Serialize + ?Sized>(value: &T) -> Result<String, ToonError> {
-    encode::encode_list_item_at(&to_toon_value(value)?, 1)
+pub fn encode_list_item(value: &ToonValue) -> Result<String, ToonError> {
+    encode::encode_list_item_at(value, 1)
 }

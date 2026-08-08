@@ -213,6 +213,12 @@ fn explicit_toon_is_rejected_for_hook_output() {
     ] {
         let output = run(&repo, &args);
         assert!(!output.status.success(), "should reject: {args:?}");
+        // hook は blocking 検出でも exit 1 になるため、終了コードだけでは
+        // 「拒否された」ことの証拠にならない。エラー封筒まで確認する。
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let value: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("error output stays JSON");
+        assert_eq!(value["error"]["code"], "INVALID_REQUEST", "args: {args:?}");
     }
 }
 

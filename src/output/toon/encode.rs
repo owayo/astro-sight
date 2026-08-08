@@ -37,7 +37,7 @@ pub fn encode_document(value: &ToonValue) -> Result<String, ToonError> {
         }
         ToonValue::Array(items) => write_array_body(None, items, 0, &mut out)?,
         primitive => {
-            write_primitive(primitive, &mut out);
+            write_primitive(primitive, &mut out)?;
             out.push('\n');
         }
     }
@@ -51,7 +51,13 @@ pub fn encode_document(value: &ToonValue) -> Result<String, ToonError> {
 
 /// ストリーミング用のルート配列ヘッダ (list form, §9.4)。要素数だけ先に分かっていれば
 /// 本体を溜めずに出せる。
+///
+/// 要素数 0 のときは `[]` を返す — §9.1 は「ルート位置の空配列は `[]` を出す。legacy の
+/// `[0]:` 形式は **出してはならない**」と定めている (decoder は両方受け付ける)。
 pub fn list_form_array_header(len: usize) -> String {
+    if len == 0 {
+        return "[]".to_string();
+    }
     format!("[{len}]:")
 }
 
@@ -109,7 +115,7 @@ fn write_field(
             write_indent(depth, out);
             scalar::write_key(key, out);
             out.push_str(": ");
-            write_primitive(primitive, out);
+            write_primitive(primitive, out)?;
             out.push('\n');
         }
     }
@@ -145,7 +151,7 @@ fn write_array_body(
     if items.iter().all(ToonValue::is_primitive) {
         write_array_header(key, items.len(), None, out);
         out.push(' ');
-        write_cells_joined(items, out);
+        write_cells_joined(items, out)?;
         out.push('\n');
         return Ok(());
     }
@@ -223,7 +229,7 @@ fn write_list_item(value: &ToonValue, depth: usize, out: &mut String) -> Result<
                 out.push_str(":\n");
             } else if items.iter().all(ToonValue::is_primitive) {
                 out.push_str(": ");
-                write_cells_joined(items, out);
+                write_cells_joined(items, out)?;
                 out.push('\n');
             } else {
                 out.push_str(":\n");
@@ -235,7 +241,7 @@ fn write_list_item(value: &ToonValue, depth: usize, out: &mut String) -> Result<
         primitive => {
             write_indent(depth, out);
             out.push_str("- ");
-            write_primitive(primitive, out);
+            write_primitive(primitive, out)?;
             out.push('\n');
         }
     }
@@ -411,7 +417,7 @@ fn write_row_cells_inner(
                     out.push(DELIMITER);
                 }
                 *first = false;
-                write_primitive(value, out);
+                write_primitive(value, out)?;
             }
             Field::Group(key, nested_columns) => {
                 let nested = lookup(object, key)
@@ -426,16 +432,20 @@ fn write_row_cells_inner(
     Ok(())
 }
 
-fn write_cells_joined(items: &[ToonValue], out: &mut String) {
+fn write_cells_joined(items: &[ToonValue], out: &mut String) -> Result<(), ToonError> {
     for (i, item) in items.iter().enumerate() {
         if i > 0 {
             out.push(DELIMITER);
         }
-        write_primitive(item, out);
+        write_primitive(item, out)?;
     }
+    Ok(())
 }
 
-fn write_primitive(value: &ToonValue, out: &mut String) {
+/// プリミティブ 1 個を書く。配列 / object が来るのは呼び出し側の不変条件違反なので、
+/// `null` へ落として黙って値を捨てず **エラーにする** (壊れたドキュメントを出すより、
+/// 上位のエラー封筒で失敗を報告する方が安全)。
+fn write_primitive(value: &ToonValue, out: &mut String) -> Result<(), ToonError> {
     match value {
         ToonValue::Null => out.push_str("null"),
         ToonValue::Bool(true) => out.push_str("true"),
@@ -444,10 +454,13 @@ fn write_primitive(value: &ToonValue, out: &mut String) {
         ToonValue::UInt(v) => out.push_str(&v.to_string()),
         ToonValue::Float(v) => scalar::write_f64(*v, out),
         ToonValue::Str(s) => scalar::write_string(s, out),
-        // 呼び出し側が primitive であることを保証しているが、万一到達しても
-        // ドキュメントを壊さない値へ落とす。
-        ToonValue::Array(_) | ToonValue::Object(_) => out.push_str("null"),
+        ToonValue::Array(_) | ToonValue::Object(_) => {
+            return Err(ToonError::Encode(
+                "expected a primitive value in a cell position".into(),
+            ));
+        }
     }
+    Ok(())
 }
 
 fn write_indent(depth: usize, out: &mut String) {

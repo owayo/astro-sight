@@ -3,7 +3,7 @@
 //! 各テストは仕様の節番号を明記し、「その節が要求する形」を期待値に固定する。
 
 use super::value::ToonValue;
-use super::{encode, encode_value, streaming_array_header, streaming_array_item};
+use super::{encode, encode_list_item, encode_value, streaming_array_header, to_toon_value};
 
 fn obj(fields: &[(&str, ToonValue)]) -> ToonValue {
     ToonValue::Object(
@@ -512,7 +512,7 @@ fn streaming_pieces_assemble_into_the_same_document_as_list_form() {
     let mut assembled = streaming_array_header(records.len());
     for record in &records {
         assembled.push('\n');
-        assembled.push_str(&streaming_array_item(record).unwrap());
+        assembled.push_str(&encode_list_item(&to_toon_value(record).unwrap()).unwrap());
     }
 
     assert_eq!(
@@ -522,7 +522,14 @@ fn streaming_pieces_assemble_into_the_same_document_as_list_form() {
 }
 
 #[test]
+fn streaming_header_uses_the_empty_array_literal_for_zero_items() {
+    // §9.1: ルート位置の空配列は `[]`。legacy の `[0]:` は encoder が出してはならない。
+    assert_eq!(streaming_array_header(0), "[]");
+    assert_eq!(streaming_array_header(1), "[1]:");
+}
+
+#[test]
 fn streaming_items_are_indented_for_depth_one() {
-    let item = streaming_array_item(&serde_json::json!({"a": 1})).unwrap();
+    let item = encode_list_item(&to_toon_value(&serde_json::json!({"a": 1})).unwrap()).unwrap();
     assert!(item.starts_with("  - "), "unexpected item: {item:?}");
 }

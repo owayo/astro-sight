@@ -2,7 +2,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use tracing::info;
 
-use crate::output::{OutputOptions, toon};
+use crate::output::{OutputOptions, serialize_toon_list_item, toon};
 use crate::service::{AppService, AstParams};
 
 use super::common::{classify_error, make_error_line};
@@ -41,7 +41,7 @@ pub(crate) fn render_batch_record<T: serde::Serialize>(
     output: OutputOptions,
 ) -> String {
     if output.is_toon() {
-        return toon::streaming_array_item(value)
+        return serialize_toon_list_item(value)
             .unwrap_or_else(|e| render_batch_error(&anyhow::anyhow!(e.to_string()), output));
     }
     serde_json::to_string(value).unwrap_or_else(|e| make_error_line(&e.into()))
@@ -54,7 +54,7 @@ pub(crate) fn render_batch_error(e: &anyhow::Error, output: OutputOptions) -> St
         let (code, message) = classify_error(e);
         let value = serde_json::json!({ "error": { "code": code, "message": message } });
         // ここで失敗すると要素数が合わなくなるので、最低限の妥当な list item に倒す。
-        return toon::streaming_array_item(&value)
+        return serialize_toon_list_item(&value)
             .unwrap_or_else(|_| "  - error: encoding failed".to_string());
     }
     make_error_line(e)

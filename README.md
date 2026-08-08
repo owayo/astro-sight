@@ -90,9 +90,14 @@ Download `astro-sight-x86_64-pc-windows-msvc.zip` from [Releases](https://github
 # デフォルトは compact JSON（1行出力、AI エージェント向け）
 astro-sight symbols --path src/main.rs
 
-# 人間向け整形出力
+# 人間向け整形出力（JSON のみ）
 astro-sight symbols --pretty --path src/main.rs
+
+# TOON 出力（同じ内容をより少ないトークンで）
+astro-sight symbols --path src/main.rs --format toon
 ```
+
+`--format json|toon` で出力形式を切り替える。既定は `json` で、`config.toml` の `format` でも既定値を変えられる（優先順位は **CLI `--format` > `config.toml` > `json`**）。詳細は [Output Format](#output-format)。
 
 ### エージェント向けレビュー手順
 
@@ -656,9 +661,9 @@ $ astro-sight ast --path nonexistent.rs
 > Only one package in the dependency graph may specify the same links value.
 > ```
 
-## Output Format
+## JSON Compact Keys
 
-全コマンドの出力はデフォルト compact JSON（`--pretty` で整形）。compact モードではトークン削減のためキー名を短縮:
+JSON 出力はデフォルト compact（`--pretty` で整形）。compact モードではトークン削減のためキー名を短縮:
 
 - `language` → `lang`（calls, imports, lint, sequence, compact ast/symbols）
 - `location` → `path`（compact ast/symbols）
@@ -677,6 +682,100 @@ compact 出力例（ast/symbols）:
 `--full`/`--pretty` で従来のフルフォーマット（`location`, `language`, `hash`, `range` 等）を出力。
 `version` フィールドは `doctor` と MCP `initialize` 応答のみ。
 
+## Output Format
+
+`--format json|toon` で出力形式を切り替える。既定は `json`。
+
+| | JSON | TOON |
+|---|---|---|
+| 既定 | ✅ | |
+| 仕様 | RFC 8259 | [TOON v4.1](https://toonformat.dev/) |
+| `--pretty` | 有効 | 無視（TOON は元からインデント構造） |
+| キャッシュ | compact のみ利用 | 利用しない |
+
+### TOON とは
+
+[TOON](https://toonformat.dev/) (Token-Oriented Object Notation) は JSON と同じデータモデルを、インデントと表形式で表現するフォーマット。同じ内容をより少ないトークンで LLM に渡せる。
+
+```bash
+astro-sight symbols --path src/main.rs --format toon
+```
+
+```toon
+path: src/main.rs
+lang: rust
+symbols[19]{name,kind,ln,cx}:
+  DELIMITER,const,8,null
+  needs_quoting,fn,11,6
+  is_numeric_like,fn,46,11
+```
+
+同じ内容の JSON は次のようになる。キー名が要素ごとに繰り返される分が削減される。
+
+```json
+{"path":"src/main.rs","lang":"rust","symbols":[{"name":"DELIMITER","kind":"const","ln":8},{"name":"needs_quoting","kind":"fn","ln":11,"cx":6},...]}
+```
+
+astro-sight のリポジトリ (`src/` 全体) での実測値:
+
+| コマンド | JSON | TOON | 削減 |
+|---|---:|---:|---:|
+| `symbols --dir src` | 223,435 B | 160,702 B | -28% |
+| `symbols --path <file>` | 1,804 B | 1,124 B | -38% |
+| `calls --path <file>` | 9,756 B | 6,887 B | -29% |
+| `refs --name <sym> --dir .` | 1,924 B | 1,382 B | -28% |
+| `imports --path <file>` | 3,878 B | 3,215 B | -17% |
+| `dead-code --dir <dir>` | 330 B | 243 B | -26% |
+| `cochange --git` | 11,342 B | 5,355 B | -53% |
+| `review --git` | 2,727 B | 2,119 B | -22% |
+| `doctor` | 1,435 B | 578 B | -60% |
+
+出力はリファレンス実装 ([`@toon-format/toon`](https://www.npmjs.com/package/@toon-format/toon) v4.1) の **strict モード** で decode できることを確認している。
+
+### 常に JSON のままの出力
+
+次の 3 つは相手側が JSON を前提とする契約のため、`--format` の対象外。
+
+| 出力面 | 理由 |
+|---|---|
+| `session` | 「1 行 = 1 リクエスト / 1 レスポンス」の NDJSON プロトコル |
+| `review --hook` / `impact --hook` | Claude Code の Stop hook が消費する JSON 契約 |
+| エラー出力 `{"error":{...}}` | 既存スクリプトが parse する機械可読契約 |
+
+CLI で明示的に `--format toon` を渡した場合は「満たせない要求」としてエラーにする。`config.toml` の `format = "toon"` は全コマンドの既定表示形式でしかないため、これらの出力面では黙って JSON に倒す（設定しただけで hook や session が壊れないようにするため）。
+
+### バッチ出力の形
+
+`--paths` / `--paths-file` / `--dir` は JSON では NDJSON（1 行 1 レコード）、TOON では**ルート配列 1 個のドキュメント**になる。
+
+```toon
+[2]:
+  - path: a.rs
+    lang: rust
+    symbols[3]{name,kind,ln}:
+      MAX,const,1
+      alpha,fn,2
+      beta,fn,5
+  - path: b.rs
+    lang: rust
+    symbols[1]{name,kind,ln}:
+      gamma,fn,1
+```
+
+外側の配列は list form（`- ` 項目）で、tabular form にはしない。tabular 化には全要素を見てからでないと決まらない情報が要り、解析結果を全件バッファしない（ピーク RSS を入力件数から独立させる）という設計要件と両立しないため。要素数 `[N]` は入力パス数から先に分かるので、ヘッダだけは先出しできる。内側の配列は従来どおり tabular form になり、削減量の大半はそちらから来る。
+
+### nullable 列の正規化
+
+astro-sight の compact JSON は `cx`（循環的複雑度）のような値を持たないフィールドをキーごと省略する。一方 TOON の tabular form は配列内の全要素が**同じキー集合**を持つことを要求するため、素直にエンコードすると symbols のような出力が list form へ落ちて **JSON より冗長になる**（実測 +33%）。
+
+そのため astro-sight は、配列内 object のキーが「欠けているだけ」で揃うとき、欠損キーを `null` で補って tabular 形を成立させる。適用は**厳密エンコードより短くなる場合だけ**（同点なら厳密側）なので、TOON が JSON より長くなることは構造的に起きない。
+
+- 補完対象は全要素が非空 object で、全ての値がプリミティブの配列だけ。object を含む列は対象外。
+- 列順は要素を順に走査したときのキー初出順で固定する（決定的）。
+- **JSON 表現との構造的 round-trip は保証しない**。decode すると JSON が省略していたキーが `null` として現れる。DTO としての意味（`Option<T>` の `None`）は保存される。
+
+この正規化は astro-sight が自分の DTO について行う判断で、`--format toon` のエンコーダ自体は仕様どおりの純粋な実装になっている（任意の JSON に対して欠損キーを null 補完すると、「明示的な null」と「未設定」を区別できなくしてしまうため）。
+
 ## Configuration
 
 `astro-sight init` は TOML 形式の設定ファイルを生成する。デフォルトの保存先は `~/.config/astro-sight/config.toml`。
@@ -687,6 +786,9 @@ debug = false
 
 # ログディレクトリのパス (デフォルト: ~/.config/astro-sight/logs)
 # log_path = "~/.config/astro-sight/logs"
+
+# 既定の出力フォーマット: "json" | "toon" (デフォルト: json)
+format = "json"
 ```
 
 `log_path` を省略した場合は、読み込んだ config ファイルと同じディレクトリの `logs/` を使う。`--config /path/to/config.toml` でカスタム config を使う場合も同じ。`log_path` を明示した場合は、その値がデフォルトパスと同じでも明示指定として尊重する。

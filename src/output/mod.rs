@@ -15,6 +15,7 @@
 //! そうしないと `format = "toon"` を設定しただけで `session` や Stop hook が
 //! 全滅する (設定として使い物にならない)。
 
+mod nullable;
 pub mod toon;
 
 use anyhow::Result;
@@ -27,10 +28,11 @@ use crate::error::{AstroError, ErrorCode};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
-    /// JSON (既定)。
+    // 以下の doc コメントは `--help` にそのまま出るため、他の CLI ヘルプに合わせて英語で書く。
+    /// JSON (default)
     #[default]
     Json,
-    /// TOON v4.1。
+    /// TOON v4.1 - same data, fewer tokens (https://toonformat.dev/)
     Toon,
 }
 
@@ -150,9 +152,41 @@ pub fn serialize_document<T: serde::Serialize + ?Sized>(
             JsonStyle::Compact => Ok(serde_json::to_string(value)?),
             JsonStyle::Pretty => Ok(serde_json::to_string_pretty(value)?),
         },
-        OutputFormat::Toon => toon::encode(value)
-            .map_err(|e| AstroError::new(ErrorCode::InternalError, e.to_string()).into()),
+        OutputFormat::Toon => to_toon(value, toon::encode_value),
     }
+}
+
+/// TOON ルート配列の list item 1 件。バッチ (`--paths` / `--dir`) の 1 レコードに使う。
+pub fn serialize_toon_list_item<T: serde::Serialize + ?Sized>(value: &T) -> Result<String> {
+    to_toon(value, toon::encode_list_item)
+}
+
+/// TOON エンコードの共通経路。
+///
+/// 厳密 (spec どおり) の結果をまず作り、`nullable` の正規化が何かを変えた場合だけ
+/// 2 本目を作って **短い方**を採る (同点は厳密側)。これにより
+/// 「TOON にしたら JSON より長くなる」という逆効果が構造的に起きない。
+/// 正規化が何も変えなければ 2 回目のエンコードは走らない (uniform なデータでは常にこの経路)。
+fn to_toon<T, F>(value: &T, encode: F) -> Result<String>
+where
+    T: serde::Serialize + ?Sized,
+    F: Fn(&toon::ToonValue) -> std::result::Result<String, toon::ToonError>,
+{
+    let to_error = |e: toon::ToonError| -> anyhow::Error {
+        AstroError::new(ErrorCode::InternalError, e.to_string()).into()
+    };
+
+    let mut toon_value = toon::to_toon_value(value).map_err(to_error)?;
+    let strict = encode(&toon_value).map_err(to_error)?;
+    if !nullable::fill_optional_columns(&mut toon_value) {
+        return Ok(strict);
+    }
+    let normalized = encode(&toon_value).map_err(to_error)?;
+    Ok(if normalized.len() < strict.len() {
+        normalized
+    } else {
+        strict
+    })
 }
 
 #[cfg(test)]
@@ -247,6 +281,91 @@ mod tests {
         // `format = "toon"` を設定しただけで session / hook が全滅しないこと。
         let from_config = OutputOptions::resolve(None, OutputFormat::Toon, false);
         assert!(from_config.ensure_json_protocol("session").is_ok());
+    }
+
+    #[derive(serde::Serialize)]
+    struct Row {
+        name: &'static str,
+        kind: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cx: Option<u32>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct Doc {
+        path: &'static str,
+        symbols: Vec<Row>,
+    }
+
+    fn mixed_doc() -> Doc {
+        Doc {
+            path: "a.rs",
+            symbols: vec![
+                Row {
+                    name: "MAX",
+                    kind: "const",
+                    cx: None,
+                },
+                Row {
+                    name: "alpha",
+                    kind: "fn",
+                    cx: Some(3),
+                },
+                Row {
+                    name: "beta",
+                    kind: "fn",
+                    cx: Some(1),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn missing_nullable_columns_are_filled_to_reach_tabular_form() {
+        // `skip_serializing_if` でキーが欠けた配列も tabular に畳む。畳まないと
+        // list form になり JSON より冗長 (= TOON を選ぶ意味が無くなる)。
+        let toon = serialize_document(
+            &mixed_doc(),
+            OutputOptions::new(OutputFormat::Toon, JsonStyle::Compact),
+        )
+        .unwrap();
+        assert_eq!(
+            toon,
+            "path: a.rs\nsymbols[3]{name,kind,cx}:\n  MAX,const,null\n  alpha,fn,3\n  beta,fn,1"
+        );
+    }
+
+    #[test]
+    fn normalization_is_rejected_when_it_would_be_longer() {
+        // 各要素が別々のキーだけを持つと union が広がり、null セルだらけの table が
+        // list form より長くなる。実サイズ比較でこれを弾く (never worse の保証)。
+        #[derive(serde::Serialize)]
+        struct Sparse {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            alpha_column_name: Option<u32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            bravo_column_name: Option<u32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            delta_column_name: Option<u32>,
+        }
+        fn row(i: usize) -> Sparse {
+            Sparse {
+                alpha_column_name: (i == 0).then_some(1),
+                bravo_column_name: (i == 1).then_some(2),
+                delta_column_name: (i == 2).then_some(3),
+            }
+        }
+        let sparse: Vec<Sparse> = (0..3).map(row).collect();
+
+        let toon = OutputOptions::new(OutputFormat::Toon, JsonStyle::Compact);
+        let normalized = serialize_document(&sparse, toon).unwrap();
+        let strict = toon::encode(&sparse).unwrap();
+
+        assert_eq!(
+            normalized, strict,
+            "should keep the strict list form when filling would be longer"
+        );
+        assert!(normalized.starts_with("[3]:\n  - alpha_column_name: 1"));
     }
 
     #[test]
