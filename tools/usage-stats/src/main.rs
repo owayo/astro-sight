@@ -270,6 +270,11 @@ fn is_astro_sight_cmd(cmd: &str) -> bool {
     extract_astro_subcmd(cmd).is_some()
 }
 
+/// 自動継続の待機はコード分析や編集の選択ではないため、採用率の分母から除外する。
+fn counts_toward_adoption(tool_name: &str) -> bool {
+    tool_name != "wait"
+}
+
 fn extract_bash_category(cmd: &str) -> String {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
@@ -873,6 +878,10 @@ fn process_codex_file(path: &Path, exclude_project: Option<&str>) -> Stats {
             Some(n) => n.to_string(),
             None => continue,
         };
+
+        if !counts_toward_adoption(&func_name) {
+            continue;
+        }
 
         *stats
             .tool_counts
@@ -1842,5 +1851,37 @@ mod tests {
         assert_eq!(stats.tool_counts["codex"]["exec_command"], 1);
         assert_eq!(stats.bash_cmd_counts["codex"]["astro-sight"], 2);
         assert_eq!(stats.astro_subcmds["codex"]["refs"], 2);
+    }
+
+    #[test]
+    fn process_codex_file_excludes_passive_wait_from_adoption() {
+        let path = std::env::temp_dir().join(format!(
+            "astro-sight-usage-stats-passive-wait-{}.jsonl",
+            std::process::id()
+        ));
+        let wait = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "wait",
+                "input": "{\"cell_id\":\"1\"}"
+            }
+        });
+        let exec = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": "const result = await tools.exec_command({cmd:\"cargo test\"}); text(result.output);"
+            }
+        });
+        std::fs::write(&path, format!("{wait}\n{exec}\n")).expect("一時ログを書き込めること");
+
+        let stats = process_codex_file(&path, None);
+        std::fs::remove_file(&path).expect("一時ログを削除できること");
+
+        assert_eq!(stats.total_tool_calls["codex"], 1);
+        assert_eq!(stats.tool_counts["codex"]["exec"], 1);
+        assert!(!stats.tool_counts["codex"].contains_key("wait"));
     }
 }

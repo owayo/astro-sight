@@ -873,6 +873,7 @@ PR や patch 全体をまとめて見たい場合は、`astro-sight review --dir
 `astro-sight` はシェル上の実行コマンドとして現れ、かつ既知サブコマンドを抽出できた場合だけ採用数に数えます。`/skills/astro-sight/SKILL.md` のようなパス文字列、プロンプト内の言及、`astro-sight --version` / `astro-sight --help` のようなサブコマンドなしの確認起動は除外します。
 `--pretty` / `--debug` / `--config <path>` などのグローバルフラグや、`/usr/bin/time -o <file> astro-sight ...` のようなラッパー経由でも、実際に実行されたサブコマンドを抽出します。
 Codex の従来形式 (`function_call` / `exec_command`) と現行形式 (`custom_tool_call` / `exec` 内の `tools.exec_command`) の双方を解析します。JavaScript の文字列・コメント内に埋め込まれたコマンド例は実行として数えません。
+自動継続に使われる `wait` はコード分析や編集の選択ではないため、採用率の分母とツール分布から除外します。
 
 ```bash
 cargo run --manifest-path tools/usage-stats/Cargo.toml -- --json --days 1
