@@ -536,6 +536,11 @@ fn find_enclosing_declaration_zig(node: Node) -> Option<Node> {
 /// Python: PEP8 の `_` プレフィックスを private 慣習として扱い、
 /// モジュール先頭に `__all__` があればそのリストを優先して判定する。
 fn is_exported_python(node: Node, source: &[u8], root: Node) -> bool {
+    // 関数 / lambda の内部で宣言されたシンボルは module 属性にならないため公開 API 面に出ない。
+    if is_python_lexically_local(node) {
+        return false;
+    }
+
     let name = node
         .child_by_field_name("name")
         .and_then(|n| n.utf8_text(source).ok())
@@ -558,6 +563,42 @@ fn is_exported_python(node: Node, source: &[u8], root: Node) -> bool {
 
     // デフォルト: `_` プレフィックスは private
     !name.starts_with('_')
+}
+
+/// Python: 対象シンボルが関数 / lambda の内側 (字句ローカル) で宣言されているかを判定する。
+///
+/// dead-code は「公開 (exported) シンボルの未参照検出」だが、Python の export 判定は
+/// 名前の `_` 規約と `__all__` しか見ておらず字句スコープを見ていなかった。このため
+/// 関数内のネスト関数 (クロージャ・デコレータ登録されるハンドラ・コールバック) が
+/// 公開シンボル候補に漏れ、repo-wide の bare-name 参照検索で dead と誤報されていた。
+///
+/// ネスト定義は外から名前で参照できず、返り値・登録・コールバックとして渡される経路も
+/// 追えないため、スコープ解析を持たない現在の liveness 判定の対象にすべきではない。
+/// `symbols` コマンドでは従来どおり列挙される (公開 API 面の判定にだけ効く)。
+///
+/// 判定は「自身の定義ノードより外側に `function_definition` / `lambda` があるか」。
+/// class 直下の method は class_definition しか挟まないため従来どおり公開候補に残る。
+fn is_python_lexically_local(node: Node) -> bool {
+    // symbol_range 由来のノードは name identifier のこともあるため、まず自身の
+    // 定義ノードまで繰り上げる (繰り上げないと自分自身を「外側の関数」と数えてしまう)。
+    let mut own_definition = node;
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if matches!(n.kind(), "function_definition" | "class_definition") {
+            own_definition = n;
+            break;
+        }
+        current = n.parent();
+    }
+
+    let mut ancestor = own_definition.parent();
+    while let Some(n) = ancestor {
+        if matches!(n.kind(), "function_definition" | "lambda") {
+            return true;
+        }
+        ancestor = n.parent();
+    }
+    false
 }
 
 /// Python モジュールのトップレベル `__all__` 定義を解析し、収録された

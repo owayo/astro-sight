@@ -39,6 +39,128 @@ fn definition_node_kinds_python() {
     assert!(kinds.contains(&"class_definition"));
 }
 
+/// Python の型注釈位置 (戻り値型・基底クラス・引数型) は Reference として数える。
+///
+/// 汎用の parent/grandparent 走査では `function_definition > type > identifier` と
+/// `class_definition > argument_list > identifier` が祖父ノード経由で Definition と
+/// 誤判定され、dead-code で基底クラスや戻り値型専用のクラスが dead と報告されていた。
+/// single refs と count-only (dead-code 経路) で分類が一致することも固定する。
+#[test]
+fn python_type_positions_are_refs_not_defs() {
+    use std::borrow::Cow;
+    use std::collections::HashMap;
+
+    let source = "class Base:\n\
+    pass\n\
+\n\
+class Derived(Base):\n\
+    pass\n\
+\n\
+def f() -> Base:\n\
+    return None\n\
+\n\
+def g(p: Base) -> None:\n\
+    return None\n\
+\n\
+def h() -> list[Base]:\n\
+    return []\n";
+    let tree = parser::parse_source(source.as_bytes(), LangId::Python).expect("parse");
+    let defs = definition_node_kinds(LangId::Python);
+    let refs = collect_single_refs_for_test(
+        tree.root_node(),
+        source.as_bytes(),
+        "Base",
+        "test.py",
+        defs,
+        LangId::Python,
+    );
+
+    let def_cnt = refs
+        .iter()
+        .filter(|r| matches!(r.kind, Some(RefKind::Definition)))
+        .count();
+    let ref_cnt = refs
+        .iter()
+        .filter(|r| matches!(r.kind, Some(RefKind::Reference)))
+        .count();
+    assert_eq!(def_cnt, 1, "class 宣言だけが定義: {refs:?}");
+    assert_eq!(
+        ref_cnt, 4,
+        "基底クラス / 戻り値型 / 引数型 / ジェネリック引数はいずれも参照: {refs:?}"
+    );
+
+    let mut name_to_ix: HashMap<Cow<'_, str>, Vec<usize>> = HashMap::new();
+    name_to_ix.insert(Cow::Borrowed("Base"), vec![0]);
+    let counts = count_refs_for_test(
+        tree.root_node(),
+        source.as_bytes(),
+        &name_to_ix,
+        defs,
+        LangId::Python,
+        1,
+    );
+    assert_eq!(counts[0], 4, "count-only 経路も同じ分類になること");
+}
+
+/// `def f(x)` の bare パラメータ名は従来どおり Definition のまま
+/// (型注釈位置の修正がパラメータ宣言まで巻き込んでいないことの対照)。
+#[test]
+fn python_bare_parameter_name_stays_definition() {
+    let source = "def k(x):\n    return x\n";
+    let tree = parser::parse_source(source.as_bytes(), LangId::Python).expect("parse");
+    let defs = definition_node_kinds(LangId::Python);
+    let refs = collect_single_refs_for_test(
+        tree.root_node(),
+        source.as_bytes(),
+        "x",
+        "test.py",
+        defs,
+        LangId::Python,
+    );
+
+    let def_cnt = refs
+        .iter()
+        .filter(|r| matches!(r.kind, Some(RefKind::Definition)))
+        .count();
+    let ref_cnt = refs
+        .iter()
+        .filter(|r| matches!(r.kind, Some(RefKind::Reference)))
+        .count();
+    assert_eq!(def_cnt, 1, "パラメータ宣言は定義: {refs:?}");
+    assert_eq!(ref_cnt, 1, "本体での使用は参照: {refs:?}");
+}
+
+/// 関数名 / クラス名そのものは Definition のまま
+/// (name フィールド一致の判定が宣言名を落としていないことの対照)。
+#[test]
+fn python_declaration_names_stay_definitions() {
+    let source =
+        "class Widget:\n    def render(self):\n        pass\n\ndef build():\n    return Widget()\n";
+    let tree = parser::parse_source(source.as_bytes(), LangId::Python).expect("parse");
+    let defs = definition_node_kinds(LangId::Python);
+
+    for (name, want_def, want_ref) in [("Widget", 1, 1), ("build", 1, 0), ("render", 1, 0)] {
+        let refs = collect_single_refs_for_test(
+            tree.root_node(),
+            source.as_bytes(),
+            name,
+            "test.py",
+            defs,
+            LangId::Python,
+        );
+        let def_cnt = refs
+            .iter()
+            .filter(|r| matches!(r.kind, Some(RefKind::Definition)))
+            .count();
+        let ref_cnt = refs
+            .iter()
+            .filter(|r| matches!(r.kind, Some(RefKind::Reference)))
+            .count();
+        assert_eq!(def_cnt, want_def, "{name} の定義数: {refs:?}");
+        assert_eq!(ref_cnt, want_ref, "{name} の参照数: {refs:?}");
+    }
+}
+
 /// C/C++ の tag 名は、本体付き `struct X {}` だけを Definition とし、
 /// `struct X *p` / `sizeof(struct X)` / 引数型などの型使用は Reference として扱う。
 /// 単独 forward declaration は ref/def いずれにも含めない。

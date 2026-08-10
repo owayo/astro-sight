@@ -764,6 +764,60 @@ fn python_underscore_class_is_not_exported() {
     ));
 }
 
+/// class 直下の method は従来どおり公開シンボル候補に残る (下のネスト系テストの対照)。
+#[test]
+fn python_class_method_is_exported() {
+    assert!(check_exported(
+        "class C:\n    def handle(self):\n        pass\n",
+        LangId::Python,
+        "handle"
+    ));
+}
+
+/// 関数内のネスト定義は module 属性にならず、外から名前で参照できないため
+/// 公開 API 面 (dead-code / API 差分) に出さない。
+///
+/// 字句スコープを見ずに `_` 規約だけで公開判定していた頃は、クロージャや
+/// デコレータで登録されるハンドラが repo-wide の bare-name 参照検索にかけられ、
+/// 「呼び出し式が無い」という理由だけで dead と誤報されていた。
+#[test]
+fn python_nested_function_is_not_exported() {
+    let src = "def outer():\n    def inner():\n        pass\n    return inner\n";
+    // 外側は従来どおり公開候補 (対照)
+    assert!(check_exported(src, LangId::Python, "outer"));
+    assert!(!check_exported(src, LangId::Python, "inner"));
+}
+
+#[test]
+fn python_nested_class_is_not_exported() {
+    let src = "def factory():\n    class Inner:\n        pass\n    return Inner\n";
+    assert!(check_exported(src, LangId::Python, "factory"));
+    assert!(!check_exported(src, LangId::Python, "Inner"));
+}
+
+#[test]
+fn python_nested_function_in_method_is_not_exported() {
+    let src = "class C:\n    def handle(self):\n        def helper():\n            pass\n        return helper\n";
+    assert!(check_exported(src, LangId::Python, "handle"));
+    assert!(!check_exported(src, LangId::Python, "helper"));
+}
+
+/// デコレータでフレームワークへ登録されるネスト関数も、ネストである時点で
+/// 公開シンボル候補から外れる (登録デコレータの網羅に依存しない)。
+#[test]
+fn python_decorated_nested_function_is_not_exported() {
+    let src = r#"
+def make_app(registry):
+    @registry.handler(name="ping")
+    async def ping() -> str:
+        return "pong"
+
+    return registry
+"#;
+    assert!(check_exported(src, LangId::Python, "make_app"));
+    assert!(!check_exported(src, LangId::Python, "ping"));
+}
+
 #[test]
 fn python_dunder_all_limits_exports_to_list() {
     let src = r#"
@@ -1421,6 +1475,54 @@ def my_view(request):
     return None
 "#;
     assert!(check_python_framework_decorator(src, "my_view"));
+}
+
+/// 汎用の登録デコレータ (MCP の `@server.tool(...)`、イベントバスの
+/// `@bus.subscribe(...)` 等) はランタイムがハンドラを呼ぶ入口なので runtime entrypoint。
+#[test]
+fn python_generic_registration_decorators_detected() {
+    for (src, name) in [
+        (
+            "@server.tool(name=\"ping\")\ndef ping():\n    return \"pong\"\n",
+            "ping",
+        ),
+        (
+            "@registry.handler(\"evt\")\ndef on_evt():\n    pass\n",
+            "on_evt",
+        ),
+        (
+            "@bus.subscribe(\"topic\")\ndef consume():\n    pass\n",
+            "consume",
+        ),
+        ("@emitter.listener()\ndef on_tick():\n    pass\n", "on_tick"),
+    ] {
+        assert!(
+            check_python_framework_decorator(src, name),
+            "登録デコレータとして扱うべき: {src}"
+        );
+    }
+}
+
+/// 「関数を変換するだけ」のデコレータは登録入口ではない。これらまで live に倒すと
+/// 真の dead を恒久的に見逃す (対照ケース)。
+#[test]
+fn python_wrapping_decorators_not_detected() {
+    for (src, name) in [
+        (
+            "from functools import lru_cache\n\n@lru_cache(maxsize=None)\ndef compute():\n    return 1\n",
+            "compute",
+        ),
+        (
+            "import functools\n\n@functools.wraps(inner)\ndef wrapper():\n    pass\n",
+            "wrapper",
+        ),
+        ("@retry(times=3)\ndef flaky():\n    pass\n", "flaky"),
+    ] {
+        assert!(
+            !check_python_framework_decorator(src, name),
+            "登録入口として扱ってはならない: {src}"
+        );
+    }
 }
 
 #[test]

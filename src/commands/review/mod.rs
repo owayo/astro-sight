@@ -36,6 +36,9 @@ pub struct CmdReviewOpts<'a> {
     pub base: &'a str,
     pub staged: bool,
     pub min_confidence: f64,
+    /// missing_cochanges が要求する最小共変更回数
+    /// (0 = review 既定 `REVIEW_COCHANGE_MIN_SAMPLES` に倒す。engine 既定の 2 ではない)。
+    pub cochange_min_samples: usize,
     pub output: OutputOptions,
     pub hook: bool,
     pub framework: Option<&'a str>,
@@ -57,6 +60,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
         base,
         staged,
         min_confidence,
+        cochange_min_samples,
         output,
         hook,
         framework,
@@ -140,7 +144,14 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
 
     // 4. cochange 分析 → missing_cochanges 検出
     let cochange_report = timed_ok("cochange", || {
-        detect_missing_cochanges(service, dir, &changed_file_set, min_confidence, Some(base))
+        detect_missing_cochanges(
+            service,
+            dir,
+            &changed_file_set,
+            min_confidence,
+            cochange_min_samples,
+            Some(base),
+        )
     })?;
 
     // 5. API 公開面の差分

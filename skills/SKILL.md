@@ -129,7 +129,7 @@ Review in dependency order: contracts/types → implementation → callers → t
 
 - `--framework` filters `dead_symbols` only. `--exclude-dir` / `--exclude-glob` affect both impact and `dead_symbols` (same meaning as on `dead-code`). `review` always excludes vendor / tests / build from `dead_symbols`.
 - `--dead-scope` defaults to `touched-symbols` with `--hook`, `all` otherwise. With `--hook`, exports newly added in the same diff are excluded from dead warnings (WIP noise); `--include-wip-dead` opts back in.
-- `--git --base <rev>` uses the same base for the diff and for blame-backed `missing_cochanges`. `--min-confidence` (default 0.3) tunes `missing_cochanges` volume.
+- `--git --base <rev>` uses the same base for the diff and for blame-backed `missing_cochanges`. `--min-confidence` (default 0.3) tunes `missing_cochanges` volume. `--cochange-min-samples` (default 3, stricter than the standalone `cochange` default of 2) requires a pair to have changed together at least that many times: with changed-line blame a source often has only 2 evidence commits, so a pair that co-changed once reaches confidence 1.0 and dominates the report. Pass 2 to see small-sample candidates.
 - If all changed files are lexer-only languages (e.g. Xojo), `impact` / `api_changes` / `dead_symbols` come back empty — use `symbols` / `refs` / `dead-code` per file instead.
 - CLI-only (not available in `session`).
 

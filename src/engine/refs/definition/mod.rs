@@ -40,6 +40,9 @@ pub(crate) fn is_definition_context(
     ) {
         return is_js_ts_definition_context(node, definition_kinds);
     }
+    if lang_id == LangId::Python {
+        return is_python_definition_context(node, definition_kinds);
+    }
     if lang_id == LangId::Zig {
         return is_zig_definition_context(node, definition_kinds);
     }
@@ -102,6 +105,53 @@ fn is_js_ts_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> boo
     {
         return true;
     }
+    false
+}
+
+/// Python: 宣言の `name` フィールドと、`parameters` 直下の bare パラメータ名だけを
+/// `Definition` とみなす。
+///
+/// 汎用の parent/grandparent 走査では、型注釈位置の識別子が祖父ノード経由で def と
+/// 誤判定される:
+/// - `def f() -> Base:` → `function_definition > type > identifier` (祖父が定義ノード)
+/// - `class Derived(Base):` → `class_definition > argument_list > identifier` (同上)
+///
+/// これらが def になると参照として数えられないため、dead-code で「基底クラス」
+/// 「戻り値型でしか使われないクラス」が dead と報告され、`api.add` の `refs_internal`
+/// も過小になる。JS/TS・Zig と同じく name フィールド一致を要求し、型注釈位置は ref
+/// として分類する。
+///
+/// パラメータ名 (`def f(x)` の `x`) は宣言なので def のまま維持する。型付き
+/// パラメータ (`def f(x: int)` の `x`) は `typed_parameter` を挟むため従来から def に
+/// ならず、この非対称は本修正の対象外 (揃えるなら Python の binding 分類を
+/// まとめて再設計する必要がある)。
+///
+/// `global x` / `nonlocal x` / `except E as e` / walrus / match capture /
+/// lambda 引数 / PEP 695 の型パラメータは、いずれも parent・grandparent が定義ノードに
+/// ならないため従来どおり ref のまま (本修正で分類は変わらない)。
+fn is_python_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+
+    // `def foo` / `class Foo` の名前位置のみ def。return_type や superclasses は ref。
+    if definition_kinds.contains(&parent.kind()) {
+        return parent
+            .child_by_field_name("name")
+            .is_some_and(|name| name.id() == node.id());
+    }
+
+    // `def f(x)` の直接パラメータ。`parameters` フィールド経由であることまで確認する。
+    if parent.kind() == "parameters"
+        && let Some(function) = parent.parent()
+        && function.kind() == "function_definition"
+        && function
+            .child_by_field_name("parameters")
+            .is_some_and(|params| params.id() == parent.id())
+    {
+        return true;
+    }
+
     false
 }
 

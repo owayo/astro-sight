@@ -46,6 +46,21 @@ pub(crate) fn is_dependency_manifest_pair(file_a: &str, file_b: &str) -> bool {
         .any(|(a, b)| (base_a == *a && base_b == *b) || (base_a == *b && base_b == *a))
 }
 
+/// review の missing_cochanges が要求する既定の最小共変更回数。
+///
+/// standalone の `cochange` は探索的な履歴分析なので既定 2 のままにし、review だけ 3 を
+/// 要求する。confidence は raw の `co / 実効分母` なので、変更行 blame で分母が 2 しか
+/// 作れない起点では「1 回だけ一緒に変わった」ペアが co=2/denom=2 = confidence 1.0 として
+/// 最上位に並ぶ。review は「その変更で直し忘れている相方」を出す場所で、履歴 1〜2 回の
+/// 相関を必須共変更として提示すると毎回同じ FP が出てトリアージが空振りする
+/// (実測: 実リポジトリの missing_cochanges 6 件がすべて confidence 1.0 の FP)。
+///
+/// 閾値を smoothed `score` 側へ移さないのは意図的。score は分母が小さいほど 0 に
+/// 引き寄せられる shrinkage 推定値で、既定 β=8 では分母 2 の上限が 0.27 となり
+/// 「変更行 blame の起点は 100% 共変更でも構造的に出力不能」という以前の穴に戻る。
+/// support の要求は分子 (co_changes) の下限で表す。
+pub(crate) const REVIEW_COCHANGE_MIN_SAMPLES: usize = 3;
+
 /// `detect_missing_cochanges` の結果。0 件の理由を呼び出し側 (review) に伝えるため、
 /// 検出結果と解析の内訳を一緒に返す。
 #[derive(Debug)]
@@ -59,6 +74,7 @@ pub(crate) fn detect_missing_cochanges(
     dir: &str,
     changed_files: &HashSet<String>,
     min_confidence: f64,
+    min_samples: usize,
     base: Option<&str>,
 ) -> Result<MissingCochangeReport> {
     // review では blame モードで cochange を解析する。
@@ -97,6 +113,13 @@ pub(crate) fn detect_missing_cochanges(
         source_files,
         base: base.map(str::to_string),
         min_confidence,
+        // review だけ standalone cochange より強い support を要求する
+        // (呼び出し側が 0 を渡した場合は review の既定 policy に倒す)。
+        min_samples: if min_samples == 0 {
+            REVIEW_COCHANGE_MIN_SAMPLES
+        } else {
+            min_samples
+        },
         ..CoChangeOptions::default()
     };
     let cochange_result = match service.analyze_cochange(dir, &opts) {

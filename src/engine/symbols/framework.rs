@@ -1099,6 +1099,16 @@ fn decorator_matches_framework_pattern_python(decorator: Node, source: &[u8]) ->
         "fixture",
         "parametrize",
         "usefixtures",
+        // 汎用の登録デコレータ (MCP `@server.tool(...)`, イベントバス `@bus.subscribe(...)` 等)。
+        // 「関数を変換するだけ」のデコレータ (`lru_cache` / `wraps` / `dataclass` / retry /
+        // validation 系) は真の dead を隠すため入れない。登録先へハンドラを預ける意味が
+        // 名前から明確なものだけに絞る。
+        "handler",
+        "tool",
+        "listener",
+        "subscriber",
+        "subscribe",
+        "consumer",
     ];
     TAIL_DECORATORS.contains(&last)
 }

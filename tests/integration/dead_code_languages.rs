@@ -1517,3 +1517,114 @@ fn dead_code_ts_unrelated_namespace_import_does_not_suppress_set() {
         "無関係 namespace import で set を Ambiguous 化せず、未参照の Beta.fmt は dead: {names:?}"
     );
 }
+
+/// Python: 型注釈位置でしか使われないクラス (基底クラス / 戻り値型) を dead にしない。
+///
+/// 汎用の parent/grandparent 走査が `class Derived(Base)` と `def f() -> Base` の
+/// `Base` を定義と誤分類していたため、参照として数えられず dead と報告されていた。
+/// 真に未参照な `Derived` は引き続き dead になること (対照) も同時に固定する。
+#[test]
+fn dead_code_python_type_annotation_only_classes_are_live() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("sample.py"),
+        "class OnlyBase:\n\
+    pass\n\
+\n\
+\n\
+class OnlyReturn:\n\
+    pass\n\
+\n\
+\n\
+class Derived(OnlyBase):\n\
+    pass\n\
+\n\
+\n\
+def build() -> OnlyReturn:\n\
+    return None\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+
+    assert!(
+        !dead.iter().any(|n| n == "OnlyBase"),
+        "基底クラスとして参照されている OnlyBase は dead にしない: {dead:?}"
+    );
+    assert!(
+        !dead.iter().any(|n| n == "OnlyReturn"),
+        "戻り値型として参照されている OnlyReturn は dead にしない: {dead:?}"
+    );
+    assert!(
+        dead.iter().any(|n| n == "Derived"),
+        "どこからも参照されない Derived は引き続き dead (対照): {dead:?}"
+    );
+}
+
+/// Python: 関数内のネスト定義は公開シンボルではないため dead 候補に出さない。
+///
+/// デコレータでフレームワークへ登録されるハンドラ・クロージャとして返される関数は
+/// ソース中に直接の呼び出し式を持たないのが設計どおりで、字句スコープを見ない
+/// repo-wide の bare-name 参照検索では生死を判定できない。モジュール直下の未参照
+/// 関数は引き続き dead になること (対照) も固定する。
+#[test]
+fn dead_code_python_nested_definitions_are_not_reported() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("sample.py"),
+        "def make_app(registry):\n\
+    @registry.handler(name=\"ping\")\n\
+    async def ping() -> str:\n\
+        return \"pong\"\n\
+\n\
+    def plain_nested() -> str:\n\
+        return \"local\"\n\
+\n\
+    class Inner:\n\
+        pass\n\
+\n\
+    return (registry, plain_nested, Inner)\n\
+\n\
+\n\
+def module_level_unused():\n\
+    return None\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+
+    for nested in ["ping", "plain_nested", "Inner"] {
+        assert!(
+            !dead.iter().any(|n| n == nested),
+            "ネスト定義 {nested} は公開シンボルではないので dead に出さない: {dead:?}"
+        );
+    }
+    assert!(
+        dead.iter().any(|n| n == "module_level_unused"),
+        "モジュール直下の未参照関数は引き続き dead (対照): {dead:?}"
+    );
+}

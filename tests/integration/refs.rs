@@ -535,3 +535,41 @@ fn refs_php_cross_file_scoped_static_call_is_detected_as_ref() {
         "BConsumer.php からの `AHelper::voFoo()` は 1 件の ref として検出されるべき: refs={refs:?}"
     );
 }
+
+/// Python の型注釈位置は CLI 出力でも `ref` として現れる。
+///
+/// 戻り値型が `def` に分類されていたため、`api.add` に添える同一ファイル内実利用参照数
+/// (`refs_internal`) が 0 になり「未参照の新規公開 API」と誤って警告されていた。
+/// 宣言名は `def` のままであること (対照) も同時に確認する。
+#[test]
+fn refs_python_return_type_annotation_is_reference() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("mod.py"),
+        "class Payload:\n\
+    pass\n\
+\n\
+\n\
+def build() -> Payload:\n\
+    return Payload()\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["refs", "--name", "Payload", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let refs = json["refs"].as_array().unwrap();
+
+    let defs: Vec<_> = refs.iter().filter(|r| r["kind"] == "def").collect();
+    let uses: Vec<_> = refs.iter().filter(|r| r["kind"] == "ref").collect();
+    assert_eq!(defs.len(), 1, "class 宣言だけが def: {refs:?}");
+    assert_eq!(
+        uses.len(),
+        2,
+        "戻り値型注釈と本体のコンストラクタ呼び出しが ref: {refs:?}"
+    );
+}

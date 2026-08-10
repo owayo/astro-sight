@@ -470,6 +470,14 @@ pub enum Commands {
         #[arg(long, default_value = "0.3")]
         min_confidence: f64,
 
+        /// Minimum shared commit count required for a `missing_cochanges` pair.
+        /// Default 3 (stricter than the standalone `cochange` default of 2): with
+        /// changed-line blame a source often has only 2 evidence commits, so a pair
+        /// that changed together once reaches confidence 1.0 and dominates the
+        /// report. Pass 2 to restore the previous behaviour.
+        #[arg(long, default_value = "3")]
+        cochange_min_samples: usize,
+
         /// Append triage hint for AI agent hooks
         #[arg(long)]
         hook: bool,

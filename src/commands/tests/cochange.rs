@@ -125,6 +125,7 @@ fn detect_missing_cochanges_excludes_cargo_manifest_lock_pair() {
         repo.to_str().expect("utf-8 path"),
         &changed_files,
         0.3,
+        REVIEW_COCHANGE_MIN_SAMPLES,
         None,
     )
     .expect("detect_missing_cochanges should succeed")
@@ -209,11 +210,14 @@ fn detect_missing_cochanges_uses_review_base_for_multi_commit_ranges() {
     // score=(2+1)/(2+1+8)=0.27 となり、production の min_confidence=0.3
     // からは弾かれる。本テストは「base が blame 解析に正しく渡る」を
     // 確かめるのが目的なので、閾値を 0.0 に下げて信号の有無だけ見る。
+    // support 要求も engine 既定 (2) に下げる。review の既定 3 では co=2 のこの
+    // フィクスチャが落ち、検証したい「base の伝播」に到達しないため。
     let missing = detect_missing_cochanges(
         &service,
         repo.to_str().expect("utf-8 path"),
         &changed_files,
         0.0,
+        crate::models::cochange::CoChangeOptions::default().min_samples,
         Some("HEAD~2"),
     )
     .expect("detect_missing_cochanges should succeed")
@@ -245,6 +249,7 @@ fn detect_missing_cochanges_propagates_invalid_request_error() {
         repo.to_str().expect("utf-8 path"),
         &changed_files,
         f64::NAN,
+        REVIEW_COCHANGE_MIN_SAMPLES,
         None,
     );
 
@@ -278,6 +283,7 @@ fn detect_missing_cochanges_skips_cochange_when_sources_exceed_limit() {
         repo.to_str().expect("utf-8 path"),
         &changed_files,
         0.3,
+        REVIEW_COCHANGE_MIN_SAMPLES,
         None,
     )
     .expect("exceeding max_source_files must not fail the review pipeline");
@@ -296,6 +302,202 @@ fn detect_missing_cochanges_skips_cochange_when_sources_exceed_limit() {
         report.diagnostics.reasons
     );
     assert_eq!(report.diagnostics.sources_requested, changed_files.len());
+}
+
+/// review の missing_cochanges は standalone `cochange` より強い support を要求する。
+///
+/// 変更行 blame は分母が 2 程度になる起点が普通にあるため、「1 回だけ一緒に変わった」
+/// ペアが co=2/denom=2 = confidence 1.0 として最上位に並び、レビューのたびに同じ
+/// 誤検出が出ていた。engine 既定 (2) では出るペアが review 既定 (3) では落ちることを、
+/// 同一フィクスチャの対照で固定する (閾値を上げただけで全部落ちる、の取り違えを防ぐ)。
+#[test]
+fn detect_missing_cochanges_review_policy_drops_small_support_pairs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    git_commit_files(
+        repo,
+        &[
+            (
+                "a.rs",
+                "fn a() {\n    let first = 0;\n    let second = 0;\n}\n",
+            ),
+            (
+                "b.rs",
+                "fn b() {\n    let first = 0;\n    let second = 0;\n}\n",
+            ),
+        ],
+        "initial",
+    );
+    git_commit_files(
+        repo,
+        &[
+            (
+                "a.rs",
+                "fn a() {\n    let first = 1;\n    let second = 0;\n}\n",
+            ),
+            (
+                "b.rs",
+                "fn b() {\n    let first = 1;\n    let second = 0;\n}\n",
+            ),
+        ],
+        "pair 1",
+    );
+    git_commit_files(
+        repo,
+        &[
+            (
+                "a.rs",
+                "fn a() {\n    let first = 1;\n    let second = 2;\n}\n",
+            ),
+            (
+                "b.rs",
+                "fn b() {\n    let first = 1;\n    let second = 2;\n}\n",
+            ),
+        ],
+        "pair 2",
+    );
+    git_commit_files(
+        repo,
+        &[(
+            "a.rs",
+            "fn a() {\n    let first = 10;\n    let second = 2;\n}\n",
+        )],
+        "a only 1",
+    );
+    git_commit_files(
+        repo,
+        &[(
+            "a.rs",
+            "fn a() {\n    let first = 10;\n    let second = 20;\n}\n",
+        )],
+        "a only 2",
+    );
+
+    let service = AppService::new();
+    let mut changed_files = HashSet::new();
+    changed_files.insert("a.rs".to_string());
+    let repo_path = repo.to_str().expect("utf-8 path");
+
+    // 対照: engine 既定 (min_samples=2) なら co=2 のペアが missing として出る。
+    let lenient = detect_missing_cochanges(
+        &service,
+        repo_path,
+        &changed_files,
+        0.0,
+        crate::models::cochange::CoChangeOptions::default().min_samples,
+        Some("HEAD~2"),
+    )
+    .expect("detect_missing_cochanges should succeed")
+    .missing;
+    assert!(
+        lenient.iter().any(|m| m.file == "b.rs"),
+        "engine 既定では小標本ペアが出るはず (対照が壊れるとこのテストは無意味になる)。got: {lenient:?}"
+    );
+
+    // review 既定 (3) では同じペアが落ちる。
+    let strict = detect_missing_cochanges(
+        &service,
+        repo_path,
+        &changed_files,
+        0.0,
+        REVIEW_COCHANGE_MIN_SAMPLES,
+        Some("HEAD~2"),
+    )
+    .expect("detect_missing_cochanges should succeed")
+    .missing;
+    assert!(
+        strict.iter().all(|m| m.file != "b.rs"),
+        "review policy では co=2 のペアを出さない。got: {strict:?}"
+    );
+    assert!(
+        strict.is_empty(),
+        "このフィクスチャで残る候補は無いはず。got: {strict:?}"
+    );
+}
+
+/// review 既定を満たす support (co >= 3) のペアは従来どおり検出される。
+/// 上のテストと合わせて「厳しくしすぎて何も出ない」状態でないことを固定する。
+#[test]
+fn detect_missing_cochanges_review_policy_keeps_well_supported_pairs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let a_of = |first: u32, second: u32, third: u32| {
+        format!(
+            "fn a() {{\n    let first = {first};\n    let second = {second};\n    let third = {third};\n}}\n"
+        )
+    };
+    let b_of = |first: u32, second: u32, third: u32| {
+        format!(
+            "fn b() {{\n    let first = {first};\n    let second = {second};\n    let third = {third};\n}}\n"
+        )
+    };
+
+    git_commit_files(
+        repo,
+        &[("a.rs", &a_of(0, 0, 0)), ("b.rs", &b_of(0, 0, 0))],
+        "initial",
+    );
+    // 3 回の共変更で co=3 を作る。
+    for (i, (a, b)) in [
+        (a_of(1, 0, 0), b_of(1, 0, 0)),
+        (a_of(1, 2, 0), b_of(1, 2, 0)),
+        (a_of(1, 2, 3), b_of(1, 2, 3)),
+    ]
+    .iter()
+    .enumerate()
+    {
+        git_commit_files(
+            repo,
+            &[("a.rs", a.as_str()), ("b.rs", b.as_str())],
+            &format!("pair {i}"),
+        );
+    }
+    // a.rs だけを変更した状態を review 対象にする。
+    git_commit_files(repo, &[("a.rs", &a_of(10, 2, 3))], "a only 1");
+    git_commit_files(repo, &[("a.rs", &a_of(10, 20, 3))], "a only 2");
+    git_commit_files(repo, &[("a.rs", &a_of(10, 20, 30))], "a only 3");
+
+    let service = AppService::new();
+    let mut changed_files = HashSet::new();
+    changed_files.insert("a.rs".to_string());
+
+    let missing = detect_missing_cochanges(
+        &service,
+        repo.to_str().expect("utf-8 path"),
+        &changed_files,
+        0.0,
+        REVIEW_COCHANGE_MIN_SAMPLES,
+        Some("HEAD~3"),
+    )
+    .expect("detect_missing_cochanges should succeed")
+    .missing;
+
+    assert!(
+        missing.iter().any(|m| m.file == "b.rs"),
+        "co>=3 の十分な履歴があるペアは review でも検出されるべき。got: {missing:?}"
+    );
+}
+
+/// `review --cochange-min-samples` の CLI 既定が review policy の定数と一致することを固定する。
+/// (CLI は文字列リテラルで既定を持つため、定数だけ変えると黙ってずれる)
+#[test]
+fn review_cli_cochange_min_samples_default_matches_policy() {
+    use crate::cli::{Cli, Commands};
+    use clap::Parser;
+
+    let cli = Cli::try_parse_from(["astro-sight", "review", "--dir", "."])
+        .expect("review args should parse");
+    match cli.command {
+        Commands::Review {
+            cochange_min_samples,
+            ..
+        } => assert_eq!(cochange_min_samples, REVIEW_COCHANGE_MIN_SAMPLES),
+        other => panic!("expected Review, got {other:?}"),
+    }
 }
 
 /// `cochange` の `--ignore-merges` / `--include-merges` の CLI パーサ挙動と、

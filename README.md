@@ -424,6 +424,8 @@ astro-sight review --dir . --git \
 
 `--git --base <rev>` を指定した場合、`missing_cochanges` の blame 解析にも同じ base を使う。複数コミット分の PR をまとめてレビューするときも、diff と共変更候補の解析範囲が揃う。
 
+`missing_cochanges` は共変更が 3 回以上あるペアだけを候補にする (`--cochange-min-samples`、既定 3)。変更行 blame では証拠コミットが 2 件しかない起点が珍しくなく、「1 回だけ一緒に変わった」ペアが confidence 1.0 として上位に並ぶため。探索的に小標本まで見たい場合は `--cochange-min-samples 2` を指定する (単体の `cochange` コマンドは従来どおり既定 2)。
+
 全 changed file が Xojo などの lexer-only 言語だけの場合、`review` は `impact` / `api_changes` / `dead_symbols` をすべて空結果で返す。lexer 経路の cross-file 解析は汎用名ノイズが多いため、`symbols` / `refs` / `dead-code` の単体コマンドで確認する。
 
 `api_changes.compatible_modified` には、シグネチャ文字列は変わるが既存呼び出しの互換性を保つ変更を出力する。React component の HOC ラップ、未参照 object member 削除、TS/TSX トップレベル関数の末尾 optional/default 引数追加 (`trailing_optional_params`)、Python トップレベル関数 / モジュール直下クラスメソッドの末尾 kwonly+default / 末尾 positional default 引数追加 (`trailing_optional_params`、デコレータ差分や同名関数複数定義は保守的に blocking 維持) は informational として扱い、`--hook` の blocking 対象にしない。同じシンボルに紐づく `impacts` も破壊的影響としては出さず、`mod_compat` の情報提供だけに留める。未参照 object member の判定では削除キーを 1 個ずつ全リポジトリ検索せず、Aho-Corasick で一括事前抽出して各 JS/TS ファイルを最大 1 回だけ parse する。ファイル収集・読み込み・parse の失敗時は互換扱いへ降格せず、従来どおり blocking を維持する。
