@@ -31,6 +31,10 @@ pub fn extract_imports(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result
             if source_text.is_empty() {
                 continue;
             }
+            if node.kind() == "template_string" && template_has_substitution(node) {
+                // `${expr}` を含む template literal は静的な依存先を確定できない。
+                continue;
+            }
 
             // ソーステキストをクリーンアップ（文字列リテラルの引用符を除去）
             let mut clean_source = source_text
@@ -51,7 +55,7 @@ pub fn extract_imports(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result
             let import_node = find_import_statement(node);
             let context = import_node.utf8_text(source).unwrap_or("").to_string();
 
-            // Determine the actual kind based on the pattern index
+            // クエリのパターン番号から実際の import 種別を決定する。
             let actual_kind = determine_kind(lang_id, m.pattern_index, kind);
 
             edges.push(ImportEdge {
@@ -64,6 +68,13 @@ pub fn extract_imports(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result
     }
 
     Ok(edges)
+}
+
+/// template literal が `${expr}` のような置換を含むかを AST で判定する。
+fn template_has_substitution(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| child.kind() == "template_substitution")
 }
 
 /// ファイル内の import/use 文が占める行 (0-indexed) の集合を返す。
@@ -156,9 +167,9 @@ fn find_import_statement(node: Node<'_>) -> Node<'_> {
 /// 言語とパターンに基づき実際の ImportKind を決定する。
 fn determine_kind(lang_id: LangId, pattern_index: usize, default: ImportKind) -> ImportKind {
     match lang_id {
-        // JS/TS: パターン 0 = Import 文、パターン 1 = require()
+        // JS/TS: パターン 0 = import 文、1 = require()、2 = 動的 import()。
         LangId::Javascript | LangId::Typescript | LangId::Tsx => {
-            if pattern_index >= 1 {
+            if pattern_index == 1 {
                 ImportKind::Require
             } else {
                 ImportKind::Import
@@ -190,8 +201,11 @@ fn import_query(lang_id: LangId) -> (&'static str, ImportKind) {
             (import_statement source: (string) @import.source)
             (call_expression
               function: (identifier) @fn_name
-              arguments: (arguments (string) @import.source)
+              arguments: (arguments . (string) @import.source)
               (#eq? @fn_name "require"))
+            (call_expression
+              function: (import)
+              arguments: (arguments . [(string) (template_string)] @import.source))
             "#,
             ImportKind::Import,
         ),
@@ -200,8 +214,11 @@ fn import_query(lang_id: LangId) -> (&'static str, ImportKind) {
             (import_statement source: (string) @import.source)
             (call_expression
               function: (identifier) @fn_name
-              arguments: (arguments (string) @import.source)
+              arguments: (arguments . (string) @import.source)
               (#eq? @fn_name "require"))
+            (call_expression
+              function: (import)
+              arguments: (arguments . [(string) (template_string)] @import.source))
             "#,
             ImportKind::Import,
         ),
@@ -323,6 +340,38 @@ mod tests {
         assert_eq!(imports[1].kind, ImportKind::Require);
     }
 
+    /// JS/TS/TSX の動的 import は静的に確定できる文字列だけを抽出する。
+    #[test]
+    fn extract_imports_js_ts_dynamic_imports_static_sources_only() {
+        let source = br#"import { value } from "./static";
+const boot = import("./boot", "./ignored-dynamic");
+export function outer() {
+    async function inner() {
+        return await import(`./dep`);
+    }
+    return inner;
+}
+const skipped = import(`./${name}`);
+const fake = fooimport("./fake");
+// import("./commented");
+const lodash = require("lodash", "ignored-require");
+"#;
+
+        for lang in [LangId::Javascript, LangId::Typescript, LangId::Tsx] {
+            let tree = parser::parse_source(source, lang).unwrap();
+            let imports = extract_imports(tree.root_node(), source, lang).unwrap();
+            let sources: Vec<&str> = imports.iter().map(|edge| edge.source.as_str()).collect();
+
+            assert_eq!(sources, vec!["./static", "./boot", "./dep", "lodash"]);
+            assert_eq!(imports[0].kind, ImportKind::Import);
+            assert_eq!(imports[1].kind, ImportKind::Import);
+            assert_eq!(imports[2].kind, ImportKind::Import);
+            assert_eq!(imports[3].kind, ImportKind::Require);
+            assert_eq!(imports[1].line, 1);
+            assert_eq!(imports[2].line, 4);
+        }
+    }
+
     /// Bash の `source <file>` と `. <file>` をファイル読み込み import として抽出する
     #[test]
     fn extract_imports_bash_source_and_dot() {
@@ -409,7 +458,7 @@ echo not_source\n";
         }
     }
 
-    /// determine_kind が JS/TS でパターンインデックスに応じた正しい種別を返す
+    /// determine_kind が JS/TS でパターンインデックスに応じた正しい種別を返す。
     #[test]
     fn determine_kind_js_patterns() {
         assert_eq!(
@@ -419,6 +468,10 @@ echo not_source\n";
         assert_eq!(
             determine_kind(LangId::Javascript, 1, ImportKind::Import),
             ImportKind::Require
+        );
+        assert_eq!(
+            determine_kind(LangId::Javascript, 2, ImportKind::Import),
+            ImportKind::Import
         );
         // 非 JS/TS 言語はデフォルトを返す
         assert_eq!(

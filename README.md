@@ -217,6 +217,18 @@ compact 出力例（caller でグルーピング）:
 
 `--pretty` で従来のフルフォーマット（caller/callee オブジェクト + call_site）を出力。
 
+### imports - import 依存抽出
+
+```bash
+# ファイルが参照するモジュールを抽出
+astro-sight imports --path src/main.ts
+
+# 複数ファイルを入力順に処理
+astro-sight imports --paths src/main.ts,src/worker.ts
+```
+
+Xojo を除く16言語の import / use / include / require を tree-sitter AST から抽出し、`src`、`ln`、`kind`、`ctx` を返す。JavaScript / TypeScript / TSX は通常の import 文と `require()` に加えて、`import("./module")` および置換を含まない `` import(`./module`) `` も認識する。`${expr}` を含む template literal は依存先を静的に確定できないため除外し、呼び出し形式では第1引数だけを依存先として扱う。
+
 ### refs - クロスファイル参照検索
 
 ```bash

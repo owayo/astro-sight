@@ -394,10 +394,49 @@ fn imports_on_own_source() {
     let imports = json["imports"].as_array().unwrap();
     assert!(!imports.is_empty(), "Should find imports in main.rs");
 
-    // All imports should be 'use' kind for Rust
+    // Rust の import はすべて use 種別になる。
     for imp in imports {
         assert_eq!(imp["kind"], "use");
     }
+}
+
+#[test]
+fn imports_typescript_dynamic_imports_static_sources_only() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let source_path = tmp.path().join("dynamic.ts");
+    std::fs::write(
+        &source_path,
+        r#"import { value } from "./static";
+const boot = import("./boot", "./ignored-dynamic");
+export function outer() {
+    async function inner() {
+        return import(`./dep`);
+    }
+    return inner;
+}
+const skipped = import(`./${name}`);
+const fake = fooimport("./fake");
+// import("./commented");
+"#,
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["imports", "--path", source_path.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let imports = json["imports"].as_array().unwrap();
+    let sources: Vec<&str> = imports
+        .iter()
+        .map(|item| item["src"].as_str().unwrap())
+        .collect();
+    assert_eq!(sources, vec!["./static", "./boot", "./dep"]);
+    assert!(imports.iter().all(|item| item["kind"] == "import"));
+    assert_eq!(imports[1]["ln"], 1);
+    assert_eq!(imports[2]["ln"], 4);
 }
 
 #[test]

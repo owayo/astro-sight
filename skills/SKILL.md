@@ -11,7 +11,7 @@ allowed-tools: Bash(astro-sight:*)
 
 # astro-sight
 
-tree-sitter AST-based code structure CLI. The primary **Grep replacement for code identifiers** (`refs`), plus diff review (`review`), impact analysis (`context` / `impact`), dead-code detection, and structural queries. All output is compact JSON.
+tree-sitter AST-based code structure CLI. The primary **Grep replacement for code identifiers** (`refs`), plus diff review (`review`), impact analysis (`context` / `impact`), dead-code detection, and structural queries. Output defaults to compact JSON, with TOON and automatic token-size selection available on data commands.
 
 ## When to Use (Decision Checklist)
 
@@ -135,7 +135,7 @@ Review in dependency order: contracts/types → implementation → callers → t
 
 ### `imports` — Import/Export Extraction
 
-Language-specific tree-sitter queries. 14 languages (Bash excluded).
+Language-specific tree-sitter queries for all 16 tree-sitter languages (Xojo is lexer-only and excluded). JavaScript, TypeScript, and TSX include static imports, `require()`, and dynamic `import()` whose first argument is a plain string or an interpolation-free template literal. Only the first argument is used as the dependency target. Interpolated template literals are omitted because their dependency cannot be determined statically.
 
 ```bash
 astro-sight imports --path <file>
