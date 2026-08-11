@@ -65,6 +65,73 @@ pub(crate) fn is_rust_struct_field_non_callable(node: Node<'_>) -> bool {
     }
 }
 
+/// closure のパラメータが束縛している名前の識別子か (束縛位置・closure 本体の使用の両方)。
+///
+/// `refs` は名前一致だけで参照を数えるため、`|(_, tail)| tail` のようにローカル束縛が
+/// 同名の関数をシャドーイングしていると、本番参照ゼロの関数が「参照あり」に見える。
+/// これは dead-code の fail-open (死蔵コードを live と誤認) になる。
+/// 実例では 7 件の参照のうち本番参照が 0 件だった。
+///
+/// スコープを closure に限定するのは、`let` shadowing / match arm / `for` ループまで
+/// 広げると宣言順と scope boundary の追跡が必要になり、判定の確度が落ちるため。
+/// closure は「パラメータが body 全体をシャドーイングする」ことが構文だけで確定する。
+pub(crate) fn is_rust_closure_bound_identifier(node: Node<'_>, name: &str, source: &[u8]) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "closure_expression"
+            && let Some(params) = parent.child_by_field_name("parameters")
+            && rust_pattern_binds_name(params, name, source)
+        {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+/// Rust のパターンノードが `name` を束縛しているか。
+///
+/// binding だと構文上確定できる位置だけを辿る。`tuple_struct_pattern` / `struct_pattern`
+/// の `type:` と `field_pattern` の `name:` は型名・フィールド名であって束縛ではないので
+/// 辿らない。未知のパターン種別は辿らず `false` を返す (= 参照として残す安全側。
+/// 束縛の取りこぼしは従来どおりの過大計上に戻るだけだが、逆に非束縛を束縛と誤れば
+/// 本物の参照を消してしまう)。
+fn rust_pattern_binds_name(node: Node<'_>, name: &str, source: &[u8]) -> bool {
+    let matches_name = |n: Node<'_>| n.utf8_text(source).is_ok_and(|text| text == name);
+    match node.kind() {
+        // `|tail|` / `|(_, tail)|` の束縛位置、`Foo { tail }` の shorthand
+        "identifier" | "shorthand_field_identifier" => matches_name(node),
+        // `Foo(tail)` / `Foo { .. }` の `type:` は型参照なので飛ばす
+        "tuple_struct_pattern" | "struct_pattern" => {
+            let type_node = node.child_by_field_name("type");
+            let mut cursor = node.walk();
+            node.children(&mut cursor).any(|child| {
+                type_node.is_none_or(|t| t.id() != child.id())
+                    && rust_pattern_binds_name(child, name, source)
+            })
+        }
+        // `Foo { key: tail }` は `pattern:` 側だけが束縛。shorthand なら `name:` が束縛
+        "field_pattern" => match node.child_by_field_name("pattern") {
+            Some(pattern) => rust_pattern_binds_name(pattern, name, source),
+            None => node
+                .child_by_field_name("name")
+                .is_some_and(|n| n.kind() == "shorthand_field_identifier" && matches_name(n)),
+        },
+        // `|tail: u8|` は `parameter pattern: (identifier) type: (primitive_type)`
+        "parameter" => node
+            .child_by_field_name("pattern")
+            .is_some_and(|pattern| rust_pattern_binds_name(pattern, name, source)),
+        // 束縛を包むだけのパターン。子をそのまま辿る
+        "closure_parameters" | "tuple_pattern" | "slice_pattern" | "reference_pattern"
+        | "ref_pattern" | "mut_pattern" | "captured_pattern" | "or_pattern" => {
+            let mut cursor = node.walk();
+            node.children(&mut cursor)
+                .any(|child| rust_pattern_binds_name(child, name, source))
+        }
+        _ => false,
+    }
+}
+
 /// Rust の属性引数で文字列値を識別子/パス参照として解釈すべきキー。
 /// serde 系の `#[serde(serialize_with = "path::to::fn")]` 形式を想定する。
 const RUST_ATTR_STRING_REF_KEYS: &[&str] = &[

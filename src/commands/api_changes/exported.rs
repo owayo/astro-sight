@@ -195,6 +195,54 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
         self.is_non_definition(sym) || self.is_non_api_item(sym) || self.is_runtime_entrypoint(sym)
     }
 
+    /// Rust: メソッドのレシーバ型がクレート外から到達できない場合、`pub fn` でも
+    /// 外部公開 API ではないと判定する (実効可視性 = min(宣言, 所有型, モジュール))。
+    ///
+    /// `pub(crate) struct Holder` の inherent impl 内 `pub fn value()` はクレート外から
+    /// `Holder` に到達できない以上呼べないが、宣言の `pub` だけを見ていたため
+    /// 内部リファクタのたびに blocking な `api.mod` が出て、本当に外部 API を壊した
+    /// ときの信号が埋もれていた。
+    ///
+    /// レシーバ型の宣言が同一ファイルに無い (別ファイルの型への inherent impl)、
+    /// 同名の型宣言が複数ある、trait impl である場合は fail-closed で公開扱いを維持する。
+    /// モジュール階層と `pub use` 経路の到達性は既存の `rust_public.rs` が別途見る。
+    fn rust_owner_type_is_crate_internal(&self, sym: &Symbol, qualname: &str) -> bool {
+        if self.lang_id != crate::language::LangId::Rust {
+            return false;
+        }
+        if !matches!(sym.kind, SymbolKind::Method | SymbolKind::Function) {
+            return false;
+        }
+        // bare name (トップレベル関数) はレシーバ型を持たない
+        let Some((owner, _)) = qualname.rsplit_once('.') else {
+            return false;
+        };
+
+        // 型宣言だけを候補にする。`impl Holder` ブロック自体も同名の container として
+        // 収集されるが (kind = Type)、`impl` 行に `pub` は書けないため候補に混ぜると
+        // すべての inherent impl メソッドが内部扱いに落ちる (過剰抑制)。
+        let mut decls = self.containers.iter().filter(|c| {
+            c.name == owner
+                && matches!(
+                    c.kind,
+                    SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Class
+                )
+        });
+        let Some(owner_decl) = decls.next() else {
+            return false; // 別ファイルの型 → fail-closed
+        };
+        if decls.next().is_some() {
+            return false; // 同名の型宣言が複数 → fail-closed
+        }
+
+        // trait impl のメソッドは trait の可視性を継承するので所有型では判断しない。
+        // trait 名は qualname に現れないため、レシーバ型の宣言可視性だけで判定する。
+        let Some(decl_line) = self.lines.get(owner_decl.range.start.line) else {
+            return false;
+        };
+        rust_declaration_line_is_crate_internal(decl_line)
+    }
+
     /// 定義または公開シンボルとして扱えない要素を除外する。
     fn is_non_definition(&self, sym: &Symbol) -> bool {
         // モジュール宣言 (`pub mod foo;`) はファイル構成の整理であり、
@@ -582,11 +630,28 @@ pub(crate) fn filter_exported_symbols(
         if context.is_excluded_by_qualname(sym, &qualname) {
             continue;
         }
+        if context.rust_owner_type_is_crate_internal(sym, &qualname) {
+            continue;
+        }
         // 除外判定後に署名を作り、不要な文字列構築を避ける。
         let sig = extract_api_signature(sym, root, source, &context.lines, lang_id);
         result.push((qualname, format!("{:?}", sym.kind).to_lowercase(), sig));
     }
     result
+}
+
+/// Rust の宣言行が「外部公開されない可視性」かを判定する。
+///
+/// `pub(crate)` / `pub(super)` / `pub(in path)` は crate 内部、修飾なしは module 内部。
+/// 判定は `is_non_definition` の `pub(` テキスト判定と同じ粒度に揃える。
+fn rust_declaration_line_is_crate_internal(decl_line: &str) -> bool {
+    let trimmed = decl_line.trim_start();
+    if trimmed.contains("pub(") {
+        return true;
+    }
+    // `pub struct` / `pub enum` のように無修飾 `pub` で始まるものだけが外部公開候補。
+    // 属性行やコメント行が宣言行として渡ることは無い (Symbol.range は宣言本体を指す)。
+    !trimmed.starts_with("pub ")
 }
 
 /// `qualname` (例: `Class.method` や bare name `foo`) が `callees` に含まれるかを判定する。

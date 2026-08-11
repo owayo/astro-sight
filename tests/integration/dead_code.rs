@@ -703,3 +703,47 @@ fn dead_code_excludes_python_dynamic_protocol_callbacks() {
         "規約外の未参照メソッドは dead のままにする: {json}"
     );
 }
+
+/// closure パラメータのシャドーイングだけで「参照あり」に見えていた関数が dead になる。
+///
+/// `refs` が名前一致だけで数えるため、`|(_, tail)| tail` のようなローカル束縛が
+/// 同名関数への参照として計上され、本番参照ゼロの関数が live と誤認されていた
+/// (dead-code の fail-open)。実際に参照されている関数が dead に出ないこと (対照) も固定する。
+#[test]
+fn dead_code_rust_closure_shadowing_does_not_keep_symbol_alive() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("lib.rs"),
+        "pub fn shadowed_only(path: &str) -> &str {\n\
+    path.rsplit_once('/').map_or(path, |(_, shadowed_only)| shadowed_only)\n\
+}\n\
+\n\
+pub fn really_used() -> u8 { 1 }\n\
+\n\
+pub fn caller() -> u8 { really_used() }\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+
+    assert!(
+        dead.iter().any(|n| n == "shadowed_only"),
+        "closure 束縛にシャドーイングされているだけの関数は dead: {dead:?}"
+    );
+    assert!(
+        !dead.iter().any(|n| n == "really_used"),
+        "実際に呼ばれている関数は dead ではない (対照): {dead:?}"
+    );
+}

@@ -335,3 +335,126 @@ fn collect_all_attr_segments<'a>(
     }
     out
 }
+
+/// closure パラメータが束縛する名前は、束縛位置も closure 本体の使用も参照ではない。
+///
+/// `refs` は名前一致だけで数えるため、`|(_, tail)| tail` のようなローカル束縛が
+/// 同名の関数をシャドーイングしていると本番参照ゼロの関数が「参照あり」に見え、
+/// dead-code が死蔵コードを live と誤認していた (fail-open)。
+/// single refs と count-only (dead-code 経路) の分類一致まで固定する。
+#[test]
+fn rust_closure_bound_identifiers_are_not_references() {
+    use std::borrow::Cow;
+    use std::collections::HashMap;
+
+    // (説明, ソース, 期待 def 数, 期待 ref 数)
+    let cases: &[(&str, &str, usize, usize)] = &[
+        (
+            "tuple pattern",
+            "pub fn tail(path: &str) -> &str {\n    path.rsplit_once('/').map_or(path, |(_, tail)| tail)\n}\n",
+            1,
+            0,
+        ),
+        (
+            "plain pattern",
+            "pub fn tail() -> u8 { 0 }\npub fn run(xs: &[u8]) -> u8 { xs.iter().map(|tail| *tail).max().unwrap_or(0) }\n",
+            1,
+            0,
+        ),
+        (
+            "reference pattern",
+            "pub fn tail() -> u8 { 0 }\npub fn run(xs: &[u8]) -> u8 { xs.iter().map(|&tail| tail).max().unwrap_or(0) }\n",
+            1,
+            0,
+        ),
+        (
+            "typed parameter",
+            "pub fn tail() -> u8 { 0 }\npub fn run() -> u8 { let f = |tail: u8| tail; f(1) }\n",
+            1,
+            0,
+        ),
+        (
+            "struct shorthand pattern",
+            "pub fn tail() -> u8 { 0 }\npub struct P { tail: u8 }\npub fn run(p: P) -> u8 { Some(p).map(|P { tail }| tail).unwrap_or(0) }\n",
+            1,
+            0,
+        ),
+        (
+            "struct renamed pattern binds the value side only",
+            "pub fn tail() -> u8 { 0 }\npub struct P { key: u8 }\npub fn run(p: P) -> u8 { Some(p).map(|P { key: tail }| tail).unwrap_or(0) }\n",
+            1,
+            0,
+        ),
+        (
+            "nested closure inherits the outer binding",
+            "pub fn tail() -> u8 { 0 }\npub fn run() -> u8 { let f = |tail: u8| (move || tail)(); f(1) }\n",
+            1,
+            0,
+        ),
+        // 対照: closure の外にある同名参照は従来どおり数える
+        (
+            "call outside the closure stays a reference",
+            "pub fn tail() -> u8 { 0 }\npub fn run() -> u8 { let f = |x: u8| x; f(tail()) }\n",
+            1,
+            1,
+        ),
+        // 対照: 束縛していない名前は closure 内でも参照のまま
+        (
+            "unbound name inside a closure stays a reference",
+            "pub fn tail() -> u8 { 0 }\npub fn run() -> u8 { let f = |x: u8| x + tail(); f(1) }\n",
+            1,
+            1,
+        ),
+        // 対照: パターンの型名は束縛ではないので参照のまま (引数型 + パターン型名の 2 件)
+        (
+            "tuple struct pattern type name stays a reference",
+            "pub struct Tail(u8);\npub fn run(t: Tail) -> u8 { Some(t).map(|Tail(v)| v).unwrap_or(0) }\n",
+            1,
+            2,
+        ),
+    ];
+
+    for (label, source, want_def, want_ref) in cases {
+        let name = if label.starts_with("tuple struct pattern type") {
+            "Tail"
+        } else {
+            "tail"
+        };
+        let tree = parser::parse_source(source.as_bytes(), LangId::Rust).expect("parse");
+        let defs = definition_node_kinds(LangId::Rust);
+        let refs = collect_single_refs_for_test(
+            tree.root_node(),
+            source.as_bytes(),
+            name,
+            "test.rs",
+            defs,
+            LangId::Rust,
+        );
+
+        let def_cnt = refs
+            .iter()
+            .filter(|r| matches!(r.kind, Some(RefKind::Definition)))
+            .count();
+        let ref_cnt = refs
+            .iter()
+            .filter(|r| matches!(r.kind, Some(RefKind::Reference)))
+            .count();
+        assert_eq!(def_cnt, *want_def, "{label}: 定義数: {refs:?}");
+        assert_eq!(ref_cnt, *want_ref, "{label}: 参照数: {refs:?}");
+
+        let mut name_to_ix: HashMap<Cow<'_, str>, Vec<usize>> = HashMap::new();
+        name_to_ix.insert(Cow::Borrowed(name), vec![0]);
+        let counts = count_refs_for_test(
+            tree.root_node(),
+            source.as_bytes(),
+            &name_to_ix,
+            defs,
+            LangId::Rust,
+            1,
+        );
+        assert_eq!(
+            counts[0], *want_ref,
+            "{label}: count-only 経路も同じ分類になること"
+        );
+    }
+}

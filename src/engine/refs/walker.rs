@@ -15,7 +15,10 @@ use super::definition::php::php_name_is_case_insensitive;
 use super::definition::php::{
     php_callable_array_method_segment, php_string_callable_method_segment,
 };
-use super::definition::rust::{is_rust_struct_field_non_callable, rust_attr_string_ref_segments};
+use super::definition::rust::{
+    is_rust_closure_bound_identifier, is_rust_struct_field_non_callable,
+    rust_attr_string_ref_segments,
+};
 use super::definition::{is_definition_context, is_identifier_kind, is_ignored_identifier_context};
 use super::line_index::{LineIndex, context_column, extract_line_context_indexed};
 use super::role::{
@@ -417,6 +420,9 @@ fn visit_ref_node<M: RefMatcher, S: RawRefSink>(
         && let Ok(text) = node.utf8_text(source)
         && let Some(matches) = matcher.identifier_matches(node, text)
         && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
+        // closure パラメータが同名を束縛していれば、その配下の識別子は外側シンボルの
+        // 参照ではない (シャドーイング)。参照として数えると dead-code が fail-open する。
+        && !(lang_id == LangId::Rust && is_rust_closure_bound_identifier(node, text, source))
         && !is_ignored_identifier_context(node, lang_id)
     {
         let is_def = is_definition_context(node, definition_kinds, lang_id);

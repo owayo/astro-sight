@@ -74,7 +74,9 @@ pub(crate) fn is_ignored_identifier_context(node: Node<'_>, lang_id: LangId) -> 
 }
 
 /// 定義ノードが `name` フィールドを持つ文法で、識別子が「宣言の `name` フィールド」
-/// であるときだけ `Definition` とみなす。JS/TS/TSX・Go・Java・Swift・C# が使う。
+/// であるときだけ `Definition` とみなす。JS/TS/TSX・Go・Java・C# が使う
+/// (Swift は `name` フィールドが宣言名と戻り値型で重複するため専用の
+/// [`is_swift_definition_context`])。
 ///
 /// 単純な parent/grandparent 走査では `function parseExcel(): ExcelParseResult {}` の
 /// `ExcelParseResult` (戻り値型) や `class A extends B {}` の `B` が grandparent
@@ -88,8 +90,6 @@ pub(crate) fn is_ignored_identifier_context(node: Node<'_>, lang_id: LangId) -> 
 /// - Go: `function_declaration` / `method_declaration` の `result:` が直接子
 /// - Java: `method_declaration` の `type:` が直接子、`class_declaration` の
 ///   `superclass:` は `superclass` ノードを挟む
-/// - Swift: `function_declaration` の戻り値型も `name:` フィールド名で現れるが、
-///   `child_by_field_name` は最初の `name` (関数名) を返すため一致しない
 /// - C#: `method_declaration` の `returns:` が直接子、`class_declaration` の基底型は
 ///   `base_list` を挟む
 fn is_name_field_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bool {
