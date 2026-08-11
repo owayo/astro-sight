@@ -231,3 +231,19 @@ struct forward_declared;\n";
         "standalone forward declaration is neither def nor ref: {refs:?}"
     );
 }
+
+#[test]
+fn tmp_dump_sexp_five_languages() {
+    use crate::engine::parser;
+    let cases: &[(LangId, &str)] = &[
+        (LangId::Go, "package main\n\ntype Base struct{}\n\nfunc mk(param Base) Base {\n\tvar x Base\n\treturn x\n}\n\nfunc (r Base) m(q Base) Base { return r }\n"),
+        (LangId::Java, "class Base {}\nclass Impl extends Base implements Iface {\n    Base make(Base param) { return new Base(); }\n}\ninterface Iface {}\nenum Color { RED }\n"),
+        (LangId::Kotlin, "open class Base\nclass Impl : Base()\nfun make(param: Base): Base { return Base() }\nobject Single\n"),
+        (LangId::Swift, "class Base {}\nclass Impl: Base {}\nfunc make(param: Base) -> Base { return Base() }\nprotocol Proto {}\n"),
+        (LangId::CSharp, "namespace App {\n    class Base { }\n    class Impl : Base {\n        Base Make(Base param) { return new Base(); }\n    }\n    struct SVal { }\n    interface IFace { }\n    enum Color { Red }\n}\n"),
+    ];
+    for (lang, src) in cases {
+        let tree = parser::parse_source(src.as_bytes(), *lang).expect("parse");
+        eprintln!("=== {:?} ===\n{}\n", lang, tree.root_node().to_sexp());
+    }
+}

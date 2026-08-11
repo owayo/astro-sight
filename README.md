@@ -907,6 +907,8 @@ cargo run --manifest-path tools/usage-stats/Cargo.toml -- --json --days 1
 - **YES → Use `astro-sight refs`** (Grep, `grep`, `rg` ALL FORBIDDEN)
 - **NO → Grep OK** (error messages, config values, TODOs, file paths, etc.)
 
+This applies to EVERY supported language — including Xojo (`.xojo_code`), Zig, Swift, C#, Ruby. Never assume a language is unsupported and fall back to Grep.
+
 This rule also applies inside shell commands: wrapping `grep` / `rg` in Bash is not an exception.
 
 ⚠️ **Pipe-separated patterns**: `Grep "FOO|Bar|baz"` with code identifiers is also FORBIDDEN. Use `refs --names` instead.
