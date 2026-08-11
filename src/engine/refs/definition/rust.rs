@@ -76,6 +76,11 @@ pub(crate) fn is_rust_struct_field_non_callable(node: Node<'_>) -> bool {
 /// 広げると宣言順と scope boundary の追跡が必要になり、判定の確度が落ちるため。
 /// closure は「パラメータが body 全体をシャドーイングする」ことが構文だけで確定する。
 pub(crate) fn is_rust_closure_bound_identifier(node: Node<'_>, name: &str, source: &[u8]) -> bool {
+    // 修飾参照・メソッド名・型位置はローカル束縛にシャドーイングされない。
+    // 先に弾くことで、祖先走査とパターン再走査のコストも大半の識別子で回避する。
+    if !is_rust_shadowable_value_identifier(node) {
+        return false;
+    }
     let mut current = node;
     while let Some(parent) = current.parent() {
         if parent.kind() == "closure_expression"
@@ -89,6 +94,31 @@ pub(crate) fn is_rust_closure_bound_identifier(node: Node<'_>, name: &str, sourc
     false
 }
 
+/// closure 束縛によるシャドーイングの対象になり得る識別子か。
+///
+/// 対象外にするもの (いずれも同名のローカル束縛があっても外側シンボルを指し続ける。
+/// 除外すると live symbol を dead と誤判定する逆向きの事故になる):
+/// - `crate::tail()` / `Type::tail()` の `scoped_identifier` 構成要素
+/// - `obj.tail()` のメソッド名 (`field_identifier` — kind で弾かれる)
+/// - 型位置の識別子 (`type_identifier` / ジェネリック引数 — kind と親で弾かれる)
+fn is_rust_shadowable_value_identifier(node: Node<'_>) -> bool {
+    if node.kind() != "identifier" {
+        return false;
+    }
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    !matches!(
+        parent.kind(),
+        "scoped_identifier"
+            | "scoped_type_identifier"
+            | "scoped_use_list"
+            | "generic_type"
+            | "type_arguments"
+            | "type_binding"
+    )
+}
+
 /// Rust のパターンノードが `name` を束縛しているか。
 ///
 /// binding だと構文上確定できる位置だけを辿る。`tuple_struct_pattern` / `struct_pattern`
@@ -99,8 +129,16 @@ pub(crate) fn is_rust_closure_bound_identifier(node: Node<'_>, name: &str, sourc
 fn rust_pattern_binds_name(node: Node<'_>, name: &str, source: &[u8]) -> bool {
     let matches_name = |n: Node<'_>| n.utf8_text(source).is_ok_and(|text| text == name);
     match node.kind() {
-        // `|tail|` / `|(_, tail)|` の束縛位置、`Foo { tail }` の shorthand
-        "identifier" | "shorthand_field_identifier" => matches_name(node),
+        // `|tail|` / `|(_, tail)|` の束縛位置。
+        //
+        // パターン中の bare identifier は必ずしも束縛ではない — 単位構造体 (`|Unit| ()`)
+        // や定数 (`|MAX| ()`) との照合も同じノードになり、こちらは束縛ではなく参照。
+        // 構文だけでは区別できないため命名規約で保守側に倒す (束縛は snake_case、
+        // 単位構造体・定数・enum variant は大文字始まり)。大文字始まりを束縛と誤れば
+        // 本物の参照を消すことになるので、取りこぼし側 (従来どおりの過大計上) を選ぶ。
+        "identifier" => matches_name(node) && rust_pattern_name_is_binding_style(node, source),
+        // `Foo { tail }` の shorthand。フィールド名は常に束縛なので命名規約の制約は不要
+        "shorthand_field_identifier" => matches_name(node),
         // `Foo(tail)` / `Foo { .. }` の `type:` は型参照なので飛ばす
         "tuple_struct_pattern" | "struct_pattern" => {
             let type_node = node.child_by_field_name("type");
@@ -130,6 +168,20 @@ fn rust_pattern_binds_name(node: Node<'_>, name: &str, source: &[u8]) -> bool {
         }
         _ => false,
     }
+}
+
+/// パターン中の識別子が「束縛の命名規約」に従っているか (先頭が大文字でない)。
+///
+/// Rust では単位構造体パターン (`|Unit| ()`) や定数パターン (`|MAX| ()`) も bare
+/// identifier になるが、これらは束縛ではなく既存シンボルへの参照。tree-sitter の
+/// 構文情報だけでは名前解決なしに区別できないため、`non_snake_case` / `non_upper_case_globals`
+/// lint が事実上強制している命名規約で判定する。
+fn rust_pattern_name_is_binding_style(node: Node<'_>, source: &[u8]) -> bool {
+    node.utf8_text(source).is_ok_and(|text| {
+        text.chars()
+            .next()
+            .is_some_and(|first| !first.is_uppercase())
+    })
 }
 
 /// Rust の属性引数で文字列値を識別子/パス参照として解釈すべきキー。

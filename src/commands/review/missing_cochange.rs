@@ -157,12 +157,16 @@ pub(crate) fn detect_missing_cochanges(
                 file: entry.file_b.clone(),
                 expected_with: entry.file_a.clone(),
                 confidence: entry.confidence,
+                co_changes: entry.co_changes,
+                denominator: entry.denominator,
             })
         } else if b_in_diff && !a_in_diff {
             Some(MissingCochange {
                 file: entry.file_a.clone(),
                 expected_with: entry.file_b.clone(),
                 confidence: entry.confidence,
+                co_changes: entry.co_changes,
+                denominator: entry.denominator,
             })
         } else {
             None

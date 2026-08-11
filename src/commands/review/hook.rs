@@ -103,11 +103,21 @@ struct HookMovedSymbol<'a> {
     to: &'a str,
 }
 
+/// missing_cochange の hook 用 DTO。
+///
+/// `c` (confidence %) だけでは 1/1 と 5/5 が同じ 100 になり、標本の大きさが読めない。
+/// トリアージが「100% 共変更」の表示だけで判断して空振りするため、分子 `n` と分母 `d` を
+/// 併記する (追加フィールドなので既存 consumer の JSON パースは壊れない)。
 #[derive(Serialize)]
 struct HookCochange<'a> {
     f: &'a str,
     w: &'a str,
     c: u32,
+    /// 両方のファイルが変更されたコミット数 (confidence の分子)。
+    n: usize,
+    /// 集計対象となったコミット数 (confidence の分母)。算出できない場合は省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    d: Option<usize>,
 }
 
 /// 打ち切り (解析対象から外したもの) の hook 用 DTO。
@@ -124,10 +134,16 @@ struct HookTruncation<'a> {
 struct HookApi<'a> {
     #[serde(rename = "add", skip_serializing_if = "Vec::is_empty")]
     added: Vec<HookAddedSymbol<'a>>,
-    /// `add` の抽出条件の自己記述。`add` には「新規 export のうち同一 diff 内でまだ
-    /// どこからも参照されていないもの」だけが載る (diff 内で既に他ファイルから使われる
+    /// `add` の抽出条件の自己記述。`add` には「新規 export のうち同一 diff の**他ファイル**
+    /// から実利用参照されていないもの」だけが載る (diff 内で既に他ファイルから使われる
     /// 新規 export は載らない)。この条件が出力から読めないと、載らない新規 export を
     /// 検出漏れと誤認してトリアージが走る (Issue 2026-07-27-api-add-scope-not-visible)。
+    ///
+    /// 旧値は `unreferenced_in_diff` だったが、同一ファイル内の参照数 `ri` が非ゼロでも
+    /// `unreferenced_` を名乗るため「astro-sight が参照を数え損ねた」のか「定義ファイル外
+    /// からの参照が無いという意味」なのか区別できず、トリアージが 2 度空振りした
+    /// (2026-08-10 / 2026-08-11 に再発報告)。キー名は既存 consumer の JSON パースを
+    /// 壊さないよう維持し、値だけを実態に合わせた。
     #[serde(rename = "add_scope", skip_serializing_if = "Option::is_none")]
     added_scope: Option<&'static str>,
     #[serde(rename = "rm", skip_serializing_if = "Vec::is_empty")]
@@ -163,7 +179,7 @@ impl<'a> HookApi<'a> {
                 refs_internal: change.refs_internal,
             })
             .collect();
-        let added_scope = (!added.is_empty()).then_some("unreferenced_in_diff");
+        let added_scope = (!added.is_empty()).then_some("no_cross_file_refs_in_diff");
         Self {
             added,
             added_scope,

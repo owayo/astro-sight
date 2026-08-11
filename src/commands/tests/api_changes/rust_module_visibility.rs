@@ -693,3 +693,126 @@ pub fn hello() {}
         "既存 pub mod も api.add に出してはならない。got: {added:?}"
     );
 }
+
+/// `pub(crate) struct` の inherent impl 内 `pub fn` のシグネチャ変更は外部公開 API の
+/// 変更ではない (実効可視性 = min(宣言, 所有型, モジュール))。
+///
+/// レシーバ型がクレート外から到達できない以上メソッドも呼べないが、宣言の `pub` だけを
+/// 見ていたため内部リファクタのたびに blocking な api.mod が出ていた。
+/// 同名メソッドを持つ別の型を置いて `is_modified_closed_in_diff` の
+/// 「同名複数定義 → 即 blocking」ガードを通過させ、実効可視性の判定だけを検証する。
+/// owner が `pub struct` の場合は blocking のまま残ること (対照) も固定する。
+#[test]
+fn detect_api_changes_crate_internal_owner_type_excludes_method_from_mod() {
+    // (owner の可視性修飾, api.mod に出るべきか)
+    for (owner_vis, expect_flagged) in [("pub(crate) ", false), ("pub ", true)] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        let holder_before = format!(
+            "{owner_vis}struct Holder;\n\n\
+impl Holder {{\n    pub fn value(&self, key: &str) -> u8 {{\n        key.len() as u8\n    }}\n}}\n\n\
+pub fn entry() -> u8 {{\n    Holder.value(\"a\")\n}}\n"
+        );
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "pub mod holder;\npub mod twin;\n"),
+                // 同名メソッドを別の型にも置き、qualname の同名複数定義ガードを通す
+                (
+                    "src/twin.rs",
+                    "pub struct Twin;\n\nimpl Twin {\n    pub fn value(&self) -> u8 { 0 }\n}\n",
+                ),
+                ("src/holder.rs", holder_before.as_str()),
+            ],
+            "base",
+        );
+        let holder_after = format!(
+            "{owner_vis}struct Holder;\n\n\
+impl Holder {{\n    pub fn value(&self, key: &str, extra: u8) -> u8 {{\n        key.len() as u8 + extra\n    }}\n}}\n\n\
+pub fn entry() -> u8 {{\n    Holder.value(\"a\", 1)\n}}\n"
+        );
+        fs::write(repo.join("src/holder.rs"), &holder_after).expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/holder.rs".to_string(),
+            new_path: "src/holder.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 10,
+                new_start: 1,
+                new_count: 10,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let flagged = api.modified.iter().any(|m| m.name.ends_with("value"));
+        assert_eq!(
+            flagged,
+            expect_flagged,
+            "owner が `{owner_vis}struct` のとき api.mod に出るか: {:?}",
+            api.modified.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// レシーバ型の宣言が同一ファイルに無い (別ファイルの型への inherent impl) 場合は、
+/// 実効可視性を確定できないため fail-closed で公開扱いを維持する。
+#[test]
+fn detect_api_changes_owner_type_in_another_file_keeps_mod_blocking() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub mod types;\npub mod ext;\npub mod twin;\n",
+            ),
+            ("src/types.rs", "pub(crate) struct Holder;\n"),
+            (
+                "src/twin.rs",
+                "pub struct Twin;\n\nimpl Twin {\n    pub fn value(&self) -> u8 { 0 }\n}\n",
+            ),
+            (
+                "src/ext.rs",
+                "use crate::types::Holder;\n\n\
+impl Holder {\n    pub fn value(&self, key: &str) -> u8 {\n        key.len() as u8\n    }\n}\n\n\
+pub fn entry() -> u8 {\n    Holder.value(\"a\")\n}\n",
+            ),
+        ],
+        "base",
+    );
+    fs::write(
+        repo.join("src/ext.rs"),
+        "use crate::types::Holder;\n\n\
+impl Holder {\n    pub fn value(&self, key: &str, extra: u8) -> u8 {\n        key.len() as u8 + extra\n    }\n}\n\n\
+pub fn entry() -> u8 {\n    Holder.value(\"a\", 1)\n}\n",
+    )
+    .expect("write");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/ext.rs".to_string(),
+        new_path: "src/ext.rs".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 10,
+            new_start: 1,
+            new_count: 10,
+        }],
+        deleted_old_source: None,
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api.modified.iter().any(|m| m.name.ends_with("value")),
+        "owner 型が別ファイルなら実効可視性を確定できないので blocking 維持: {:?}",
+        api.modified.iter().map(|m| &m.name).collect::<Vec<_>>()
+    );
+}

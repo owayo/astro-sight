@@ -412,13 +412,42 @@ fn rust_closure_bound_identifiers_are_not_references() {
             1,
             2,
         ),
+        // 対照: 修飾パス経由の呼び出しはローカル束縛にシャドーイングされない。
+        // ここを消すと live symbol を dead と誤判定する (逆向きの事故)。
+        (
+            "crate-qualified call inside the closure stays a reference",
+            "pub fn tail() -> u8 { 0 }\npub fn run() -> u8 { let f = |tail: u8| tail + crate::tail(); f(1) }\n",
+            1,
+            1,
+        ),
+        // 対照: メソッド呼び出しの名前 (field_identifier) も束縛の対象外
+        (
+            "method call inside the closure stays a reference",
+            "pub struct H;\nimpl H { pub fn tail(&self) -> u8 { 0 } }\npub fn run(h: H) -> u8 { let f = |tail: u8| tail + h.tail(); f(1) }\n",
+            1,
+            1,
+        ),
+        // 対照: 型注釈位置の識別子も束縛の対象外 (型と値で名前空間が別)
+        (
+            "type annotation with the same name stays a reference",
+            "pub struct tail;\npub fn run() -> u8 { let f = |tail: tail| { let _ = tail; 0u8 }; f(tail) }\n",
+            1,
+            2,
+        ),
+        // 対照: 単位構造体パターンは束縛ではないので参照のまま
+        (
+            "unit struct pattern stays a reference",
+            "pub struct Unit;\npub fn run() { let _f = |Unit| (); }\n",
+            1,
+            1,
+        ),
     ];
 
     for (label, source, want_def, want_ref) in cases {
-        let name = if label.starts_with("tuple struct pattern type") {
-            "Tail"
-        } else {
-            "tail"
+        let name = match *label {
+            l if l.starts_with("tuple struct pattern type") => "Tail",
+            l if l.starts_with("unit struct pattern") => "Unit",
+            _ => "tail",
         };
         let tree = parser::parse_source(source.as_bytes(), LangId::Rust).expect("parse");
         let defs = definition_node_kinds(LangId::Rust);

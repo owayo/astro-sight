@@ -33,11 +33,23 @@ pub struct ReviewResult {
 }
 
 /// cochange で検出された「一緒に変更されるはずだが diff に含まれないファイル」。
+///
+/// `confidence` は raw ratio (`co_changes / denominator`) なので、1/1 と 5/5 が
+/// どちらも 1.0 になる。標本の大きさが出力から読めないと「100% 共変更」という
+/// 表示だけが独り歩きしてトリアージが空振りするため、分子・分母も併記する
+/// (review 経路では `REVIEW_COCHANGE_MIN_SAMPLES` で分子の下限を課しているが、
+/// それでも 3/3 と 20/20 では判断が変わる)。
 #[derive(Debug, Clone, Serialize)]
 pub struct MissingCochange {
     pub file: String,
     pub expected_with: String,
     pub confidence: f64,
+    /// 両方のファイルが変更されたコミット数 (`confidence` の分子)。
+    pub co_changes: usize,
+    /// 実際に集計対象となったコミット数 (`confidence` の分母)。
+    /// 算出できなかった場合は省略する。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub denominator: Option<usize>,
 }
 
 /// 公開シンボルの変更サマリ。

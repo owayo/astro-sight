@@ -464,8 +464,8 @@ fn build_review_hook_json_api_add_carries_extraction_scope() {
     let build = build_review_hook_json(&with_add, dir.path().to_str().expect("utf-8 path"), false);
     let api = build.value.expect("hook JSON")["api"].clone();
     assert_eq!(
-        api["add_scope"], "unreferenced_in_diff",
-        "api.add の抽出条件を出力から読めるようにする"
+        api["add_scope"], "no_cross_file_refs_in_diff",
+        "api.add の抽出条件 (同一 diff の他ファイルから実利用参照なし) を出力から読めるようにする"
     );
 
     // `add` が空なら `add_scope` も出さない (無意味なトークンを増やさない)
