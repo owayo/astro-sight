@@ -75,7 +75,12 @@ pub(crate) fn is_rust_struct_field_non_callable(node: Node<'_>) -> bool {
 /// スコープを closure に限定するのは、`let` shadowing / match arm / `for` ループまで
 /// 広げると宣言順と scope boundary の追跡が必要になり、判定の確度が落ちるため。
 /// closure は「パラメータが body 全体をシャドーイングする」ことが構文だけで確定する。
-pub(crate) fn is_rust_closure_bound_identifier(node: Node<'_>, name: &str, source: &[u8]) -> bool {
+pub(crate) fn is_rust_closure_bound_identifier(
+    node: Node<'_>,
+    name: &str,
+    source: &[u8],
+    cache: &RustPatternBindingCache,
+) -> bool {
     // 修飾参照・メソッド名・型位置はローカル束縛にシャドーイングされない。
     // 先に弾くことで、祖先走査とパターン再走査のコストも大半の識別子で回避する。
     if !is_rust_shadowable_value_identifier(node) {
@@ -85,7 +90,7 @@ pub(crate) fn is_rust_closure_bound_identifier(node: Node<'_>, name: &str, sourc
     while let Some(parent) = current.parent() {
         if parent.kind() == "closure_expression"
             && let Some(params) = parent.child_by_field_name("parameters")
-            && rust_pattern_binds_name(params, name, source)
+            && rust_pattern_binds_name(params, name, source, cache)
         {
             return true;
         }
@@ -130,14 +135,21 @@ fn is_rust_shadowable_value_identifier(node: Node<'_>) -> bool {
 /// 辿らない。未知のパターン種別は辿らず `false` を返す (= 参照として残す安全側。
 /// 束縛の取りこぼしは従来どおりの過大計上に戻るだけだが、逆に非束縛を束縛と誤れば
 /// 本物の参照を消してしまう)。
-fn rust_pattern_binds_name(node: Node<'_>, name: &str, source: &[u8]) -> bool {
+fn rust_pattern_binds_name(
+    node: Node<'_>,
+    name: &str,
+    source: &[u8],
+    cache: &RustPatternBindingCache,
+) -> bool {
     let matches_name = |n: Node<'_>| n.utf8_text(source).is_ok_and(|text| text == name);
     match node.kind() {
         // `|tail|` / `|(_, tail)|` の束縛位置。
         //
         // パターン中の bare identifier は必ずしも束縛ではない — 単位構造体 (`|Unit| ()`)
         // や定数 (`|MAX| ()`) との照合も同じノードになり、こちらは束縛ではなく参照。
-        "identifier" => matches_name(node) && rust_pattern_name_is_binding(node, name, source),
+        "identifier" => {
+            matches_name(node) && rust_pattern_name_is_binding(node, name, source, cache)
+        }
         // `Foo { tail }` の shorthand。フィールド名は常に束縛なので命名規約の制約は不要
         "shorthand_field_identifier" => matches_name(node),
         // `Foo(tail)` / `Foo { .. }` の `type:` は型参照なので飛ばす
@@ -146,12 +158,12 @@ fn rust_pattern_binds_name(node: Node<'_>, name: &str, source: &[u8]) -> bool {
             let mut cursor = node.walk();
             node.children(&mut cursor).any(|child| {
                 type_node.is_none_or(|t| t.id() != child.id())
-                    && rust_pattern_binds_name(child, name, source)
+                    && rust_pattern_binds_name(child, name, source, cache)
             })
         }
         // `Foo { key: tail }` は `pattern:` 側だけが束縛。shorthand なら `name:` が束縛
         "field_pattern" => match node.child_by_field_name("pattern") {
-            Some(pattern) => rust_pattern_binds_name(pattern, name, source),
+            Some(pattern) => rust_pattern_binds_name(pattern, name, source, cache),
             None => node
                 .child_by_field_name("name")
                 .is_some_and(|n| n.kind() == "shorthand_field_identifier" && matches_name(n)),
@@ -159,13 +171,13 @@ fn rust_pattern_binds_name(node: Node<'_>, name: &str, source: &[u8]) -> bool {
         // `|tail: u8|` は `parameter pattern: (identifier) type: (primitive_type)`
         "parameter" => node
             .child_by_field_name("pattern")
-            .is_some_and(|pattern| rust_pattern_binds_name(pattern, name, source)),
+            .is_some_and(|pattern| rust_pattern_binds_name(pattern, name, source, cache)),
         // 束縛を包むだけのパターン。子をそのまま辿る
         "closure_parameters" | "tuple_pattern" | "slice_pattern" | "reference_pattern"
         | "ref_pattern" | "mut_pattern" | "captured_pattern" | "or_pattern" => {
             let mut cursor = node.walk();
             node.children(&mut cursor)
-                .any(|child| rust_pattern_binds_name(child, name, source))
+                .any(|child| rust_pattern_binds_name(child, name, source, cache))
         }
         _ => false,
     }
@@ -191,55 +203,46 @@ fn rust_pattern_binds_name(node: Node<'_>, name: &str, source: &[u8]) -> bool {
 /// 限定的)、マクロ展開で生成される `const` (展開後の AST は持たない)。これらは
 /// 束縛と誤判定して参照を消す可能性が残る。ファイル横断の名前解決が要るため
 /// 現状の走査範囲では扱わない。
-fn rust_pattern_name_is_binding(node: Node<'_>, name: &str, source: &[u8]) -> bool {
+fn rust_pattern_name_is_binding(
+    node: Node<'_>,
+    name: &str,
+    source: &[u8],
+    cache: &RustPatternBindingCache,
+) -> bool {
     if !rust_pattern_name_is_binding_style(node, source) {
         return false;
     }
     let Some(root) = rust_file_root(node) else {
         return false;
     };
-    !file_declares_non_binding_name_cached(root, name, source)
+    !cache.declares_non_binding_name(root, name, source)
 }
 
-/// `rust_file_declares_non_binding_name` のファイル単位メモ。
+/// `rust_file_declares_non_binding_name` の名前別メモ。
 ///
 /// 判定は closure 配下の同名識別子ごとに走るため、素朴に呼ぶと
 /// 「大きな closure 内で同じパラメータを多数使う」ケースでファイル全走査が
-/// 参照数だけ繰り返され最悪 O(N²) になる。walker はファイル単位で順に処理するので、
-/// 直近 1 ファイル分の (source 位置, 名前 → 判定結果) を持てば十分ヒットする。
-/// rayon 並列のため thread_local に置く。
-struct NonBindingMemo {
-    /// source スライスの位置と長さ。ファイルが変わったら破棄する。
-    source_key: (usize, usize),
-    results: std::collections::HashMap<String, bool>,
+/// 参照数だけ繰り返され最悪 O(N²) になる。
+///
+/// **寿命は 1 回の walk (= 1 ファイル) に閉じる**。`source` のポインタや長さを
+/// キーにした thread_local だと、allocator / mmap が同サイズの次ファイルへ同じ
+/// アドレスを再利用したときに前ファイルの判定を誤用し、「glob import が無い」と
+/// 記録された結果を glob import のあるファイルで使ってしまう (今回塞いだ経路が
+/// そのまま復活する)。walk のスコープに持たせれば ABA を構造的に排除できる。
+#[derive(Default)]
+pub(crate) struct RustPatternBindingCache {
+    results: std::cell::RefCell<std::collections::HashMap<String, bool>>,
 }
 
-thread_local! {
-    static NON_BINDING_MEMO: std::cell::RefCell<Option<NonBindingMemo>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-fn file_declares_non_binding_name_cached(root: Node<'_>, name: &str, source: &[u8]) -> bool {
-    let source_key = (source.as_ptr() as usize, source.len());
-    NON_BINDING_MEMO.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        let memo = match slot.as_mut() {
-            Some(memo) if memo.source_key == source_key => memo,
-            _ => {
-                *slot = Some(NonBindingMemo {
-                    source_key,
-                    results: std::collections::HashMap::new(),
-                });
-                slot.as_mut().expect("just inserted")
-            }
-        };
-        if let Some(hit) = memo.results.get(name) {
+impl RustPatternBindingCache {
+    fn declares_non_binding_name(&self, root: Node<'_>, name: &str, source: &[u8]) -> bool {
+        if let Some(hit) = self.results.borrow().get(name) {
             return *hit;
         }
         let result = rust_file_declares_non_binding_name(root, name, source);
-        memo.results.insert(name.to_string(), result);
+        self.results.borrow_mut().insert(name.to_string(), result);
         result
-    })
+    }
 }
 
 /// パターン中の識別子が「束縛の命名規約」に従っているか (先頭の実文字が大文字でない)。

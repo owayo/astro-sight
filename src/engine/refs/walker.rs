@@ -16,7 +16,7 @@ use super::definition::php::{
     php_callable_array_method_segment, php_string_callable_method_segment,
 };
 use super::definition::rust::{
-    is_rust_closure_bound_identifier, is_rust_struct_field_non_callable,
+    RustPatternBindingCache, is_rust_closure_bound_identifier, is_rust_struct_field_non_callable,
     rust_attr_string_ref_segments,
 };
 use super::definition::{is_definition_context, is_identifier_kind, is_ignored_identifier_context};
@@ -178,6 +178,9 @@ pub(crate) struct RefEnvironment<'a> {
     source: &'a [u8],
     line_index: Option<&'a LineIndex>,
     lang_id: LangId,
+    /// Rust の closure 束縛判定で使う名前別メモ。walk 1 回 (= 1 ファイル) の寿命に
+    /// 閉じることで、ポインタ再利用による前ファイル結果の誤用を構造的に防ぐ。
+    rust_binding_cache: RustPatternBindingCache,
 }
 
 impl RefEnvironment<'_> {
@@ -422,7 +425,8 @@ fn visit_ref_node<M: RefMatcher, S: RawRefSink>(
         && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
         // closure パラメータが同名を束縛していれば、その配下の識別子は外側シンボルの
         // 参照ではない (シャドーイング)。参照として数えると dead-code が fail-open する。
-        && !(lang_id == LangId::Rust && is_rust_closure_bound_identifier(node, text, source))
+        && !(lang_id == LangId::Rust
+            && is_rust_closure_bound_identifier(node, text, source, &env.rust_binding_cache))
         && !is_ignored_identifier_context(node, lang_id)
     {
         let is_def = is_definition_context(node, definition_kinds, lang_id);
@@ -514,6 +518,7 @@ pub(crate) fn run_ref_walk<M: RefMatcher, S: RawRefSink>(
         source,
         line_index: line_index.as_ref(),
         lang_id,
+        rust_binding_cache: RustPatternBindingCache::default(),
     };
     walk_refs(root, matcher, sink, &env, definition_kinds);
 }

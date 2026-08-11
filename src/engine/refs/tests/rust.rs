@@ -538,3 +538,56 @@ fn rust_closure_bound_identifiers_are_not_references() {
         );
     }
 }
+
+/// 束縛判定のメモが walk を跨いで再利用されない (前ファイルの判定を誤用しない)。
+///
+/// 判定結果を `source` のポインタ+長さでキャッシュすると、allocator が同サイズの
+/// 次ファイルへ同じアドレスを再利用したときに前ファイルの結果を引いてしまい、
+/// 「glob import が無い」と記録された判定を glob import のあるファイルに適用して
+/// 本物の参照を消す。メモは walk 1 回の寿命に閉じる必要がある。
+///
+/// 同一の `Vec<u8>` バッファを同じ長さの 2 ソースで上書きして別々に walk し、
+/// glob なし → glob あり / glob あり → glob なし の両順で検証する。
+#[test]
+fn rust_pattern_binding_memo_does_not_leak_across_walks() {
+    // 同じ長さ・同じ名前 `tail` を含み、glob import の有無だけが違う 2 ソース。
+    let with_glob =
+        "use crate::o::*;\npub fn run() { let f = |tail| { let _ = tail; }; f(tail); }\n";
+    let no_glob = "use crate::o::t;\npub fn run() { let f = |tail| { let _ = tail; }; f(tail); }\n";
+    assert_eq!(
+        with_glob.len(),
+        no_glob.len(),
+        "同じバッファ長で上書きするテスト前提"
+    );
+
+    // glob あり: 束縛判定を諦めるので closure 内の 2 件も参照に残る (計 3)
+    // glob なし: `tail` の宣言も名前付き use も無いので束縛と判定し、closure 外の 1 件のみ
+    let expected = |src: &str| if src == with_glob { 3 } else { 1 };
+
+    for order in [[no_glob, with_glob], [with_glob, no_glob]] {
+        // 同一バッファを使い回してアドレス再利用の状況を作る
+        let mut buf: Vec<u8> = vec![0; with_glob.len()];
+        for src in order {
+            buf.copy_from_slice(src.as_bytes());
+            let tree = parser::parse_source(&buf, LangId::Rust).expect("parse");
+            let defs = definition_node_kinds(LangId::Rust);
+            let refs = collect_single_refs_for_test(
+                tree.root_node(),
+                &buf,
+                "tail",
+                "test.rs",
+                defs,
+                LangId::Rust,
+            );
+            let ref_cnt = refs
+                .iter()
+                .filter(|r| matches!(r.kind, Some(RefKind::Reference)))
+                .count();
+            assert_eq!(
+                ref_cnt,
+                expected(src),
+                "同一バッファを使い回しても前の walk の判定を引き継がない (src={src:?}): {refs:?}"
+            );
+        }
+    }
+}
