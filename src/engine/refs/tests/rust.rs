@@ -473,6 +473,14 @@ fn rust_closure_bound_identifiers_are_not_references() {
             0,
             4,
         ),
+        // 対照: glob import は持ち込む名前が AST に現れないため、対象名が定数パターン
+        // でないことを確定できない。ファイル内に宣言も名前付き use も無い形で再現する。
+        (
+            "glob import makes pattern names unresolvable",
+            "use crate::other::*;\npub fn run() { let f = |tail| { let _ = tail; }; f(tail); }\n",
+            0,
+            3,
+        ),
         // 対照: マクロ名は値とは別の名前空間なので値束縛にシャドーイングされない。
         // `macro_rules!` は Rust の definition_node_kinds に無いため定義は 0 件で、
         // 宣言名と `tail!()` 呼び出しの 2 件が参照として残る (closure 束縛の

@@ -181,8 +181,16 @@ fn rust_pattern_binds_name(node: Node<'_>, name: &str, source: &[u8]) -> bool {
 ///
 /// 束縛と確定できない次のケースは束縛と判定しない (= 参照として残す安全側):
 /// - 先頭の実文字が大文字 (慣習上ほぼ確実に定数・単位構造体・enum variant)
-/// - 同一ファイル内に同名の const / static / 単位構造体 / use import がある
+/// - 同一ファイル内に同名の const / static / 単位構造体 / 名前付き `use` がある
+/// - 同一ファイルに glob import (`use foo::*;`) がある — 持ち込まれる名前が AST に
+///   現れないため、ファイル内の情報だけでは定数パターンでないと確定できない
 /// - ファイルルートを辿れない (判定不能)
+///
+/// **扱えない範囲**: 別ファイルにしか宣言が無く名前付き `use` も glob も無い経路
+/// (`crate::other::tail` をフルパスで書かずに使うことは Rust ではできないので実害は
+/// 限定的)、マクロ展開で生成される `const` (展開後の AST は持たない)。これらは
+/// 束縛と誤判定して参照を消す可能性が残る。ファイル横断の名前解決が要るため
+/// 現状の走査範囲では扱わない。
 fn rust_pattern_name_is_binding(node: Node<'_>, name: &str, source: &[u8]) -> bool {
     if !rust_pattern_name_is_binding_style(node, source) {
         return false;
@@ -190,7 +198,48 @@ fn rust_pattern_name_is_binding(node: Node<'_>, name: &str, source: &[u8]) -> bo
     let Some(root) = rust_file_root(node) else {
         return false;
     };
-    !rust_file_declares_non_binding_name(root, name, source)
+    !file_declares_non_binding_name_cached(root, name, source)
+}
+
+/// `rust_file_declares_non_binding_name` のファイル単位メモ。
+///
+/// 判定は closure 配下の同名識別子ごとに走るため、素朴に呼ぶと
+/// 「大きな closure 内で同じパラメータを多数使う」ケースでファイル全走査が
+/// 参照数だけ繰り返され最悪 O(N²) になる。walker はファイル単位で順に処理するので、
+/// 直近 1 ファイル分の (source 位置, 名前 → 判定結果) を持てば十分ヒットする。
+/// rayon 並列のため thread_local に置く。
+struct NonBindingMemo {
+    /// source スライスの位置と長さ。ファイルが変わったら破棄する。
+    source_key: (usize, usize),
+    results: std::collections::HashMap<String, bool>,
+}
+
+thread_local! {
+    static NON_BINDING_MEMO: std::cell::RefCell<Option<NonBindingMemo>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn file_declares_non_binding_name_cached(root: Node<'_>, name: &str, source: &[u8]) -> bool {
+    let source_key = (source.as_ptr() as usize, source.len());
+    NON_BINDING_MEMO.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let memo = match slot.as_mut() {
+            Some(memo) if memo.source_key == source_key => memo,
+            _ => {
+                *slot = Some(NonBindingMemo {
+                    source_key,
+                    results: std::collections::HashMap::new(),
+                });
+                slot.as_mut().expect("just inserted")
+            }
+        };
+        if let Some(hit) = memo.results.get(name) {
+            return *hit;
+        }
+        let result = rust_file_declares_non_binding_name(root, name, source);
+        memo.results.insert(name.to_string(), result);
+        result
+    })
 }
 
 /// パターン中の識別子が「束縛の命名規約」に従っているか (先頭の実文字が大文字でない)。
@@ -218,12 +267,18 @@ fn rust_file_root(node: Node<'_>) -> Option<Node<'_>> {
 /// 同一ファイル内に `name` を「パターン位置で束縛ではなくする」宣言があるか。
 ///
 /// const / static / 単位構造体 (body を持たない `struct X;`) はパターン位置で
-/// 定数パターンになる。`use` で持ち込まれた名前も同様 (外部の const / unit struct /
-/// enum variant かもしれず、ファイル内では確定できない)。
+/// 定数パターンになる。名前付き `use` で持ち込まれた名前も同様 (外部の const /
+/// unit struct / enum variant かもしれず、ファイル内では確定できない)。
+/// **glob import (`use foo::*;`) はファイル内に該当名が一切現れないまま定数を
+/// 持ち込むため、存在するだけで全ての名前について判定を諦める** (テストモジュールの
+/// `use super::*;` で広く該当するが、安全側 = 従来どおりの過大計上に戻るだけ)。
 /// いずれかに該当したら束縛判定を諦める (fail-closed)。
 fn rust_file_declares_non_binding_name(root: Node<'_>, name: &str, source: &[u8]) -> bool {
     fn walk(node: Node<'_>, name: &str, source: &[u8]) -> bool {
         match node.kind() {
+            // `use foo::*;` は持ち込む名前が AST に現れないため、対象名が定数パターン
+            // でないことを確定できない。
+            "use_wildcard" => return true,
             "const_item" | "static_item" => {
                 if node
                     .child_by_field_name("name")
