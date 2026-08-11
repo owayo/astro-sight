@@ -427,6 +427,8 @@ pub(crate) fn build_review_hook_json(
                 f: cochange.file.as_str(),
                 w: cochange.expected_with.as_str(),
                 c: (cochange.confidence * 100.0).round() as u32,
+                n: cochange.co_changes,
+                d: cochange.denominator,
             })
             .collect();
         hook_obj.insert(

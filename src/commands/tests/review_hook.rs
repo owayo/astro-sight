@@ -271,6 +271,8 @@ fn build_review_hook_json_cochange_only_is_informational() {
             file: "a.rs".to_string(),
             expected_with: "b.rs".to_string(),
             confidence: 0.9,
+            co_changes: 9,
+            denominator: Some(10),
         }],
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
@@ -298,6 +300,58 @@ fn build_review_hook_json_cochange_only_is_informational() {
     assert!(
         !build.is_blocking,
         "cochange のみの場合は Stop hook を止めないべき"
+    );
+
+    // 標本の大きさを出力から読めるようにする。`c` (confidence %) だけでは 1/1 と 9/10 の
+    // 区別がつかず、「共変更 90%」の表示だけでトリアージが判断してしまう。
+    let entry = build.value.expect("hook JSON")["cochange"][0].clone();
+    assert_eq!(entry["c"], 90, "confidence は百分率");
+    assert_eq!(entry["n"], 9, "共変更コミット数 (分子) を併記する");
+    assert_eq!(entry["d"], 10, "集計対象コミット数 (分母) を併記する");
+}
+
+/// 分母が算出できなかった missing_cochange では `d` を省略する
+/// (存在しない値を 0 として出すと「分母 0」と読めてしまう)。
+#[test]
+fn build_review_hook_json_cochange_omits_denominator_when_unknown() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let result = ReviewResult {
+        impact: crate::models::impact::ContextResult {
+            changes: Vec::new(),
+            skipped: None,
+            truncations: Vec::new(),
+        },
+        missing_cochanges: vec![MissingCochange {
+            file: "a.rs".to_string(),
+            expected_with: "b.rs".to_string(),
+            confidence: 1.0,
+            co_changes: 3,
+            denominator: None,
+        }],
+        cochange_diagnostics: Default::default(),
+        api_changes: ApiChanges {
+            added: Vec::new(),
+            removed: Vec::new(),
+            modified: Vec::new(),
+            moved: Vec::new(),
+            property_to_field: Vec::new(),
+            removed_dead: Vec::new(),
+            modified_closed_in_diff: Vec::new(),
+            const_value_changes: Vec::new(),
+            compatible_modified: Vec::new(),
+        },
+        dead_symbols: Vec::new(),
+        test_only_symbols: Vec::new(),
+        skipped: None,
+        truncations: Vec::new(),
+    };
+
+    let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
+    let entry = build.value.expect("hook JSON")["cochange"][0].clone();
+    assert_eq!(entry["n"], 3, "分子は常に出す");
+    assert!(
+        entry.get("d").is_none(),
+        "分母が不明なら省略する: {entry:?}"
     );
 }
 
