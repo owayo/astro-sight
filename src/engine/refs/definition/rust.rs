@@ -101,6 +101,7 @@ pub(crate) fn is_rust_closure_bound_identifier(node: Node<'_>, name: &str, sourc
 /// - `crate::tail()` / `Type::tail()` の `scoped_identifier` 構成要素
 /// - `obj.tail()` のメソッド名 (`field_identifier` — kind で弾かれる)
 /// - 型位置の識別子 (`type_identifier` / ジェネリック引数 — kind と親で弾かれる)
+/// - `tail!()` のマクロ名 — マクロは値とは別の名前空間で、値束縛にシャドーイングされない
 fn is_rust_shadowable_value_identifier(node: Node<'_>) -> bool {
     if node.kind() != "identifier" {
         return false;
@@ -116,6 +117,9 @@ fn is_rust_shadowable_value_identifier(node: Node<'_>) -> bool {
             | "generic_type"
             | "type_arguments"
             | "type_binding"
+            | "macro_invocation"
+            | "macro_definition"
+            | "attribute"
     )
 }
 
@@ -178,8 +182,12 @@ fn rust_pattern_binds_name(node: Node<'_>, name: &str, source: &[u8]) -> bool {
 /// lint が事実上強制している命名規約で判定する。
 fn rust_pattern_name_is_binding_style(node: Node<'_>, source: &[u8]) -> bool {
     node.utf8_text(source).is_ok_and(|text| {
+        // 先頭の `_` は「未使用」を示す接頭辞で名前空間を変えないため読み飛ばす。
+        // `_Unit` のような leading underscore 付きの単位構造体パターンを束縛と誤れば
+        // 本物の参照を消す (先頭 1 文字だけを見ると `_` が小文字扱いになる)。
+        // すべて `_` の名前は実文字が無いので束縛と判定しない (安全側)。
         text.chars()
-            .next()
+            .find(|c| *c != '_')
             .is_some_and(|first| !first.is_uppercase())
     })
 }

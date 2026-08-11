@@ -3277,3 +3277,41 @@ fn go_generic_receiver_container_strips_type_params() {
     let push = syms.iter().find(|s| s.name == "Push").expect("Push");
     assert_eq!(push.container.as_deref(), Some("Stack"));
 }
+
+/// generic inherent impl (`impl<T> Holder<T>`) 配下のメソッドにも container が付く。
+///
+/// 型名の parent が `generic_type` 止まりだと range が型名部分に潰れ、
+/// `assign_enclosing_containers` の range 内包判定で引き当てられず qualname が
+/// bare 名になる。同名メソッドの取り違えと、レシーバ型の可視性を使った公開 API 判定の
+/// 失敗を招くため、impl_item まで昇格する。非 generic impl (対照) も併せて固定する。
+#[test]
+fn rust_generic_impl_methods_get_container() {
+    let source = "pub(crate) struct Holder<T>(T);\n\
+\n\
+impl<T> Holder<T> {\n\
+    pub fn value(&self) -> u8 { 0 }\n\
+}\n\
+\n\
+pub struct Plain;\n\
+\n\
+impl Plain {\n\
+    pub fn value(&self) -> u8 { 1 }\n\
+}\n";
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&LangId::Rust.ts_language())
+        .expect("load rust language");
+    let tree = parser.parse(source, None).expect("parse");
+    let syms = extract_symbols(tree.root_node(), source.as_bytes(), LangId::Rust).expect("symbols");
+
+    let containers: Vec<Option<String>> = syms
+        .iter()
+        .filter(|s| s.name == "value")
+        .map(|s| s.container.clone())
+        .collect();
+    assert_eq!(
+        containers,
+        vec![Some("Holder".to_string()), Some("Plain".to_string())],
+        "generic / 非 generic のどちらの impl でもレシーバ型が container になる: {syms:?}"
+    );
+}

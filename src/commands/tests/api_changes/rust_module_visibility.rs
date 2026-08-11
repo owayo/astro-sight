@@ -816,3 +816,79 @@ pub fn entry() -> u8 {\n    Holder.value(\"a\", 1)\n}\n",
         api.modified.iter().map(|m| &m.name).collect::<Vec<_>>()
     );
 }
+
+/// レシーバ型の可視性は宣言行のテキストではなく AST の `visibility_modifier` で判定する。
+///
+/// Rust ではトークン間の改行やコメントが有効なため、`pub\nstruct Holder;` の宣言行は
+/// `"pub"`、`pub /* c */ struct Holder;` は `"pub /*"` になる。行テキストの
+/// `starts_with("pub ")` で判定すると、これらを crate 内部型と誤判定して公開 API の
+/// 変更を取りこぼす (fail-closed 要件と逆方向の false negative)。
+/// generic owner (`impl<T> Holder<T>`) でも実効可視性の判定が働くことも併せて固定する。
+#[test]
+fn detect_api_changes_owner_visibility_uses_ast_not_line_text() {
+    // (owner 宣言, api.mod に出るべきか)
+    let cases: &[(&str, bool)] = &[
+        // 改行・コメントを挟んだ `pub` は外部公開 → blocking 維持
+        ("pub\nstruct Holder;", true),
+        ("pub /* exported */ struct Holder;", true),
+        // 改行を挟んだ `pub(crate)` は crate 内部 → 抑制
+        ("pub(crate)\nstruct Holder;", false),
+        // generic owner でも実効可視性が効く
+        ("pub(crate) struct Holder<T>(pub T);", false),
+        ("pub struct Holder<T>(pub T);", true),
+    ];
+
+    for (owner_decl, expect_flagged) in cases {
+        let generic = owner_decl.contains('<');
+        let (impl_header, ctor) = if generic {
+            ("impl<T> Holder<T>", "Holder(0u8)")
+        } else {
+            ("impl Holder", "Holder")
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        let before = format!(
+            "{owner_decl}\n\n{impl_header} {{\n    pub fn value(&self, key: &str) -> u8 {{\n        key.len() as u8\n    }}\n}}\n\npub fn entry() -> u8 {{\n    {ctor}.value(\"a\")\n}}\n"
+        );
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", "pub mod holder;\npub mod twin;\n"),
+                (
+                    "src/twin.rs",
+                    "pub struct Twin;\n\nimpl Twin {\n    pub fn value(&self) -> u8 { 0 }\n}\n",
+                ),
+                ("src/holder.rs", before.as_str()),
+            ],
+            "base",
+        );
+        let after = format!(
+            "{owner_decl}\n\n{impl_header} {{\n    pub fn value(&self, key: &str, extra: u8) -> u8 {{\n        key.len() as u8 + extra\n    }}\n}}\n\npub fn entry() -> u8 {{\n    {ctor}.value(\"a\", 1)\n}}\n"
+        );
+        fs::write(repo.join("src/holder.rs"), &after).expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/holder.rs".to_string(),
+            new_path: "src/holder.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 12,
+                new_start: 1,
+                new_count: 12,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let flagged = api.modified.iter().any(|m| m.name.ends_with("value"));
+        assert_eq!(
+            flagged,
+            *expect_flagged,
+            "owner 宣言 `{owner_decl}` のとき api.mod に出るか: {:?}",
+            api.modified.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+    }
+}

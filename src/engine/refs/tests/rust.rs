@@ -441,12 +441,31 @@ fn rust_closure_bound_identifiers_are_not_references() {
             1,
             1,
         ),
+        // 対照: leading underscore 付きの単位構造体も束縛ではない。
+        // 先頭 1 文字だけを見ると `_` が小文字扱いになり、参照を消してしまう。
+        (
+            "underscore-prefixed unit struct pattern stays a reference",
+            "pub struct _Unit;\npub fn run() { let _f = |_Unit| (); }\n",
+            1,
+            1,
+        ),
+        // 対照: マクロ名は値とは別の名前空間なので値束縛にシャドーイングされない。
+        // `macro_rules!` は Rust の definition_node_kinds に無いため定義は 0 件で、
+        // 宣言名と `tail!()` 呼び出しの 2 件が参照として残る (closure 束縛の
+        // `|tail: u8|` とその使用だけが除外される)。
+        (
+            "macro invocation inside the closure stays a reference",
+            "#[macro_export]\nmacro_rules! tail { () => { 0u8 } }\npub fn run() -> u8 { let f = |tail: u8| tail + tail!(); f(1) }\n",
+            0,
+            2,
+        ),
     ];
 
     for (label, source, want_def, want_ref) in cases {
         let name = match *label {
             l if l.starts_with("tuple struct pattern type") => "Tail",
             l if l.starts_with("unit struct pattern") => "Unit",
+            l if l.starts_with("underscore-prefixed unit struct") => "_Unit",
             _ => "tail",
         };
         let tree = parser::parse_source(source.as_bytes(), LangId::Rust).expect("parse");

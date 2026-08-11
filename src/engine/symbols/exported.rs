@@ -653,3 +653,30 @@ fn parse_python_dunder_all(root: Node, source: &[u8]) -> Option<Vec<String>> {
     }
     None
 }
+
+/// Rust: 宣言が「無修飾 `pub`」で外部公開されているかを AST から判定する。
+///
+/// `pub(crate)` / `pub(super)` / `pub(in path)` は制限付きなので `false`。
+/// `visibility_modifier` を持たない宣言 (module private) も `false`。
+/// 該当ノードを引けない場合は `None` を返し、呼び出し側で fail-closed に倒す。
+///
+/// 宣言行のテキストで判定してはならない — Rust ではトークン間の改行やコメントが有効で、
+/// `pub\nstruct Holder;` の宣言行は `"pub"`、`pub /* exported */ struct Holder;` は
+/// `"pub /*"` になり、どちらも「無修飾 pub でない」と誤判定して公開 API 変更を
+/// 取りこぼす (fail-closed 要件と逆方向の false negative)。
+pub fn is_rust_declaration_unrestricted_pub(
+    root: Node,
+    source: &[u8],
+    symbol_range: &Range,
+) -> Option<bool> {
+    let node = node_for_symbol_range(root, symbol_range)?;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "visibility_modifier" {
+            let text = child.utf8_text(source).ok()?;
+            // `pub(crate)` / `pub (crate)` / `pub(in path)` はいずれも括弧を伴う
+            return Some(!text.contains('('));
+        }
+    }
+    Some(false)
+}

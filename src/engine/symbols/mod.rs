@@ -14,7 +14,7 @@ mod overrides;
 mod scope;
 
 pub use complexity::calculate_complexity;
-pub use exported::is_symbol_exported;
+pub use exported::{is_rust_declaration_unrestricted_pub, is_symbol_exported};
 pub use framework::{
     has_framework_entrypoint_decorator_python, is_java_flyway_migration_class,
     is_js_ts_angular_lifecycle_hook, is_js_ts_angular_provider_option_callback,
@@ -201,6 +201,19 @@ fn run_symbol_query(
                     {
                         parent_node = scoped_decl;
                         promoted_to_definition = true;
+                    }
+                    // Rust の generic inherent impl (`impl<T> Holder<T>`) は型名の parent が
+                    // `generic_type` 止まりで range が型名部分に潰れ、配下メソッドの
+                    // container 帰属 (`assign_enclosing_containers` の range 内包) が
+                    // 成立しない。qualname が bare 名になると同名メソッドの取り違えと、
+                    // レシーバ型の可視性を使った公開 API 判定の失敗を招く。
+                    // 非 generic の `impl Plain` は parent が既に impl_item なので対象外。
+                    if lang_id == LangId::Rust
+                        && parent_node.kind() == "generic_type"
+                        && let Some(impl_item) = parent_node.parent()
+                        && impl_item.kind() == "impl_item"
+                    {
+                        parent_node = impl_item;
                     }
                     // C/C++ の関数は name の親が function_declarator で、その prev sibling は
                     // 戻り型になり doc comment に到達しない (Ruby の scoped class も同様に
@@ -464,6 +477,10 @@ fn symbol_query(lang_id: LangId) -> &'static str {
             (enum_item name: (type_identifier) @enum.name)
             (trait_item name: (type_identifier) @trait.name)
             (impl_item type: (type_identifier) @type.name)
+            ; generic inherent impl (`impl<T> Holder<T>`) の型名。`generic_type` を
+            ; 透過しないと配下メソッドの container が解決できず qualname が bare 名に
+            ; 潰れる (同名メソッドの取り違えと、レシーバ型の可視性判定の失敗を招く)。
+            (impl_item type: (generic_type type: (type_identifier) @type.name))
             (const_item name: (identifier) @constant.name)
             (static_item name: (identifier) @constant.name)
             (type_item name: (type_identifier) @type.name)

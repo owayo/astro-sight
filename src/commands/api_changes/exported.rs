@@ -235,12 +235,18 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
             return false; // 同名の型宣言が複数 → fail-closed
         }
 
-        // trait impl のメソッドは trait の可視性を継承するので所有型では判断しない。
-        // trait 名は qualname に現れないため、レシーバ型の宣言可視性だけで判定する。
-        let Some(decl_line) = self.lines.get(owner_decl.range.start.line) else {
-            return false;
-        };
-        rust_declaration_line_is_crate_internal(decl_line)
+        // 可視性は宣言行のテキストではなく AST の `visibility_modifier` で判定する
+        // (`pub\nstruct Holder;` や `pub /* c */ struct Holder;` を crate 内部と
+        // 誤判定すると、公開 API の変更を取りこぼす false negative になる)。
+        // 判定不能なら fail-closed で公開扱いを維持する。
+        match crate::engine::symbols::is_rust_declaration_unrestricted_pub(
+            self.root,
+            self.source,
+            &owner_decl.range,
+        ) {
+            Some(unrestricted_pub) => !unrestricted_pub,
+            None => false,
+        }
     }
 
     /// 定義または公開シンボルとして扱えない要素を除外する。
@@ -638,20 +644,6 @@ pub(crate) fn filter_exported_symbols(
         result.push((qualname, format!("{:?}", sym.kind).to_lowercase(), sig));
     }
     result
-}
-
-/// Rust の宣言行が「外部公開されない可視性」かを判定する。
-///
-/// `pub(crate)` / `pub(super)` / `pub(in path)` は crate 内部、修飾なしは module 内部。
-/// 判定は `is_non_definition` の `pub(` テキスト判定と同じ粒度に揃える。
-fn rust_declaration_line_is_crate_internal(decl_line: &str) -> bool {
-    let trimmed = decl_line.trim_start();
-    if trimmed.contains("pub(") {
-        return true;
-    }
-    // `pub struct` / `pub enum` のように無修飾 `pub` で始まるものだけが外部公開候補。
-    // 属性行やコメント行が宣言行として渡ることは無い (Symbol.range は宣言本体を指す)。
-    !trimmed.starts_with("pub ")
 }
 
 /// `qualname` (例: `Class.method` や bare name `foo`) が `callees` に含まれるかを判定する。
