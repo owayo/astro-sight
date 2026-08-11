@@ -1628,3 +1628,65 @@ def module_level_unused():\n\
         "モジュール直下の未参照関数は引き続き dead (対照): {dead:?}"
     );
 }
+
+/// 型注釈位置 (基底クラス・戻り値型) でのみ使われる型は dead ではない。
+///
+/// `is_definition_context` の汎用 grandparent 走査が `class_declaration > superclass`
+/// や `method_declaration > type:` の識別子を def と分類していたため、参照として
+/// 数えられず dead と誤報されていた (Java / C# で実測)。同名重複によるスキップと
+/// 区別できるよう型名は言語ごとに分け、真に未参照の型が dead に出ること (対照) も固定する。
+#[test]
+fn dead_code_type_only_usage_is_live_in_java_and_csharp() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("J.java"),
+        "public class J {\n\
+    static class JOnlyBase {}\n\
+    static class JOnlyReturn {}\n\
+    static class JNeverUsed {}\n\
+    static class JDerived extends JOnlyBase {}\n\
+    JOnlyReturn make() { return null; }\n\
+    void use() { make(); new JDerived(); }\n\
+}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("C.cs"),
+        "class CsOnlyBase { }\n\
+class CsOnlyReturn { }\n\
+class CsNeverUsed { }\n\
+class CsDerived : CsOnlyBase { }\n\
+class CsApp {\n\
+    CsOnlyReturn Make() { return null; }\n\
+    void Use() { Make(); new CsDerived(); }\n\
+}\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+
+    for live in ["JOnlyBase", "JOnlyReturn", "CsOnlyBase", "CsOnlyReturn"] {
+        assert!(
+            !dead.iter().any(|n| n == live),
+            "型注釈位置で使われている {live} は dead ではない: {dead:?}"
+        );
+    }
+    for unused in ["JNeverUsed", "CsNeverUsed"] {
+        assert!(
+            dead.iter().any(|n| n == unused),
+            "真に未参照の {unused} は引き続き dead (対照): {dead:?}"
+        );
+    }
+}

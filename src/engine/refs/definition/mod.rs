@@ -23,56 +23,49 @@ use php::is_php_definition_context;
 use ruby::is_ruby_definition_context;
 
 /// この identifier ノードが定義コンテキストにあるかを判定する。
+///
+/// `LangId` を全列挙し `_` catch-all を置かない。言語追加時にコンパイルエラーで
+/// 「どの判定に載せるか」を必ず決めさせるため (`definition_node_kinds` と同じ方針)。
 pub(crate) fn is_definition_context(
     node: Node<'_>,
     definition_kinds: &[&str],
     lang_id: LangId,
 ) -> bool {
-    if lang_id == LangId::Ruby {
-        return is_ruby_definition_context(node);
-    }
-    if lang_id == LangId::Php {
-        return is_php_definition_context(node);
-    }
-    if matches!(
-        lang_id,
-        LangId::Typescript | LangId::Tsx | LangId::Javascript
-    ) {
-        return is_name_field_definition_context(node, definition_kinds);
-    }
-    if lang_id == LangId::Python {
-        return is_python_definition_context(node, definition_kinds);
-    }
-    if lang_id == LangId::Zig {
-        return is_zig_definition_context(node, definition_kinds);
-    }
-    if lang_id == LangId::Go {
-        return is_go_definition_context(node, definition_kinds);
-    }
-    if matches!(lang_id, LangId::Java | LangId::Swift | LangId::CSharp) {
-        return is_name_field_definition_context(node, definition_kinds);
-    }
-    if lang_id == LangId::Kotlin {
-        return is_kotlin_definition_context(node, definition_kinds);
-    }
-
-    if matches!(lang_id, LangId::C | LangId::Cpp) {
-        return is_cpp_definition_context(node);
-    }
-
-    if let Some(parent) = node.parent() {
-        // 親ノードが定義ノードかチェック
-        if definition_kinds.contains(&parent.kind()) {
-            return true;
+    match lang_id {
+        LangId::Ruby => is_ruby_definition_context(node),
+        LangId::Php => is_php_definition_context(node),
+        LangId::Typescript | LangId::Tsx | LangId::Javascript => {
+            is_name_field_definition_context(node, definition_kinds)
         }
-        // 祖父ノードもチェック（例: function_declarator > identifier）
-        if let Some(grandparent) = parent.parent()
-            && definition_kinds.contains(&grandparent.kind())
-        {
-            return true;
+        LangId::Python => is_python_definition_context(node, definition_kinds),
+        LangId::Zig => is_zig_definition_context(node, definition_kinds),
+        LangId::C | LangId::Cpp => is_cpp_definition_context(node),
+        LangId::Go => is_go_definition_context(node, definition_kinds),
+        LangId::Java | LangId::CSharp => is_name_field_definition_context(node, definition_kinds),
+        LangId::Swift => is_swift_definition_context(node, definition_kinds),
+        LangId::Kotlin => is_kotlin_definition_context(node, definition_kinds),
+        // 未移行: 汎用の parent/grandparent 走査。型注釈位置の識別子を def と誤判定する
+        // 既知の欠陥を持つが、言語ごとに実ノード名とフィールド構成を確認するまで倒さない。
+        LangId::Rust | LangId::Bash | LangId::Xojo => {
+            is_ancestor_kind_definition_context(node, definition_kinds)
         }
     }
-    false
+}
+
+/// 未移行言語向けの汎用判定 (親または祖父が定義ノードなら def)。
+///
+/// 型注釈位置 (戻り値型・基底クラス) の識別子を祖父ノード経由で def と誤判定するため、
+/// 言語ごとの実ノード名を確認しながら順次 name 一致方式へ置き換えていく。
+fn is_ancestor_kind_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if definition_kinds.contains(&parent.kind()) {
+        return true;
+    }
+    parent
+        .parent()
+        .is_some_and(|grandparent| definition_kinds.contains(&grandparent.kind()))
 }
 
 pub(crate) fn is_ignored_identifier_context(node: Node<'_>, lang_id: LangId) -> bool {
@@ -154,6 +147,27 @@ fn is_go_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bool {
         return first_identifier_child_matches(parent, node);
     }
     is_name_field_definition_context(node, definition_kinds)
+}
+
+/// Swift: 宣言名は「`name` フィールドのうち identifier 系のノード」で判定する。
+///
+/// tree-sitter-swift の `function_declaration` は関数名と戻り値型の**双方**を `name`
+/// フィールドで返す:
+/// `(function_declaration name: (simple_identifier) … name: (user_type (type_identifier)))`
+/// `child_by_field_name` は最初の一致を返すため結果的に関数名へ当たるが、その順序依存に
+/// 頼らず kind まで確認する (戻り値型は `user_type` で identifier 系ではない)。
+fn is_swift_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if !definition_kinds.contains(&parent.kind()) {
+        return false;
+    }
+    let mut cursor = parent.walk();
+    parent
+        .children_by_field_name("name", &mut cursor)
+        .find(|child| is_identifier_kind(child.kind()))
+        .is_some_and(|name| name.id() == node.id())
 }
 
 /// Kotlin: tree-sitter-kotlin の宣言ノードは `name` フィールドを持たず、最初の

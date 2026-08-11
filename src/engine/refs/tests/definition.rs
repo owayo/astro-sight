@@ -391,6 +391,15 @@ fn declaration_names_stay_definitions_in_every_language() {
             1,
             0,
         ),
+        // Swift は関数名と戻り値型の双方が `name` フィールドに現れる。関数名側だけが
+        // def になり、戻り値型は ref に落ちること (順序依存に頼らない判定の対照)。
+        (
+            LangId::Swift,
+            "class Widget {}\nfunc build() -> Widget { return Widget() }\n",
+            "build",
+            1,
+            0,
+        ),
         (
             LangId::CSharp,
             "namespace App {\n    struct SVal { }\n    interface IFace { }\n    enum Color { Red }\n}\n",
