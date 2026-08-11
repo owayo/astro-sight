@@ -427,10 +427,12 @@ fn rust_closure_bound_identifiers_are_not_references() {
             1,
             1,
         ),
-        // 対照: 型注釈位置の識別子も束縛の対象外 (型と値で名前空間が別)
+        // 対照: 型注釈位置の識別子も束縛の対象外 (型と値で名前空間が別)。
+        // フィールドを持つ struct にするのは、単位構造体だとパターン位置で定数パターンに
+        // なり得て束縛判定自体が諦められ、型注釈の検証にならないため。
         (
             "type annotation with the same name stays a reference",
-            "pub struct tail;\npub fn run() -> u8 { let f = |tail: tail| { let _ = tail; 0u8 }; f(tail) }\n",
+            "pub struct tail { v: u8 }\npub fn run() -> u8 { let f = |tail: tail| { let _ = tail; 0u8 }; f(tail { v: 0 }) }\n",
             1,
             2,
         ),
@@ -448,6 +450,28 @@ fn rust_closure_bound_identifiers_are_not_references() {
             "pub struct _Unit;\npub fn run() { let _f = |_Unit| (); }\n",
             1,
             1,
+        ),
+        // 対照: 小文字名の定数パターン。命名 lint は強制ではないので大小文字だけでは
+        // 束縛と証明できない。同一ファイルに同名 const があれば束縛判定を諦める。
+        (
+            "lowercase const pattern stays a reference",
+            "#![allow(non_upper_case_globals)]\npub const tail: () = ();\npub fn run() { let f = |tail: ()| (); f(()); }\n",
+            1,
+            1,
+        ),
+        // 対照: 小文字名の単位構造体も同様
+        (
+            "lowercase unit struct pattern stays a reference",
+            "pub struct tail;\npub fn run() { let f = |tail| { let _ = tail; }; f(tail); }\n",
+            1,
+            3,
+        ),
+        // 対照: `use` で持ち込まれた名前は外部の const / unit struct かもしれない
+        (
+            "imported name in a pattern stays a reference",
+            "use crate::other::tail;\npub fn run() { let f = |tail| { let _ = tail; }; f(tail); }\n",
+            0,
+            4,
         ),
         // 対照: マクロ名は値とは別の名前空間なので値束縛にシャドーイングされない。
         // `macro_rules!` は Rust の definition_node_kinds に無いため定義は 0 件で、

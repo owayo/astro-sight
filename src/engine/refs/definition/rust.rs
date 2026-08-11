@@ -137,10 +137,7 @@ fn rust_pattern_binds_name(node: Node<'_>, name: &str, source: &[u8]) -> bool {
         //
         // パターン中の bare identifier は必ずしも束縛ではない — 単位構造体 (`|Unit| ()`)
         // や定数 (`|MAX| ()`) との照合も同じノードになり、こちらは束縛ではなく参照。
-        // 構文だけでは区別できないため命名規約で保守側に倒す (束縛は snake_case、
-        // 単位構造体・定数・enum variant は大文字始まり)。大文字始まりを束縛と誤れば
-        // 本物の参照を消すことになるので、取りこぼし側 (従来どおりの過大計上) を選ぶ。
-        "identifier" => matches_name(node) && rust_pattern_name_is_binding_style(node, source),
+        "identifier" => matches_name(node) && rust_pattern_name_is_binding(node, name, source),
         // `Foo { tail }` の shorthand。フィールド名は常に束縛なので命名規約の制約は不要
         "shorthand_field_identifier" => matches_name(node),
         // `Foo(tail)` / `Foo { .. }` の `type:` は型参照なので飛ばす
@@ -174,12 +171,29 @@ fn rust_pattern_binds_name(node: Node<'_>, name: &str, source: &[u8]) -> bool {
     }
 }
 
-/// パターン中の識別子が「束縛の命名規約」に従っているか (先頭が大文字でない)。
+/// パターン中の bare identifier が「束縛」か「定数・単位構造体パターン」かを判定する。
 ///
-/// Rust では単位構造体パターン (`|Unit| ()`) や定数パターン (`|MAX| ()`) も bare
-/// identifier になるが、これらは束縛ではなく既存シンボルへの参照。tree-sitter の
-/// 構文情報だけでは名前解決なしに区別できないため、`non_snake_case` / `non_upper_case_globals`
-/// lint が事実上強制している命名規約で判定する。
+/// Rust の単一 identifier パターンは名前解決後に const / static / 単位構造体 /
+/// enum variant を指し得る (irrefutable path pattern)。`non_snake_case` /
+/// `non_upper_case_globals` は lint であって強制ではないため、命名規約だけでは
+/// 証明できない — `#![allow(non_upper_case_globals)] pub const tail: () = ();` に対する
+/// `|tail: ()| ()` は束縛ではなく定数パターンで、束縛と誤れば本物の参照を消す。
+///
+/// 束縛と確定できない次のケースは束縛と判定しない (= 参照として残す安全側):
+/// - 先頭の実文字が大文字 (慣習上ほぼ確実に定数・単位構造体・enum variant)
+/// - 同一ファイル内に同名の const / static / 単位構造体 / use import がある
+/// - ファイルルートを辿れない (判定不能)
+fn rust_pattern_name_is_binding(node: Node<'_>, name: &str, source: &[u8]) -> bool {
+    if !rust_pattern_name_is_binding_style(node, source) {
+        return false;
+    }
+    let Some(root) = rust_file_root(node) else {
+        return false;
+    };
+    !rust_file_declares_non_binding_name(root, name, source)
+}
+
+/// パターン中の識別子が「束縛の命名規約」に従っているか (先頭の実文字が大文字でない)。
 fn rust_pattern_name_is_binding_style(node: Node<'_>, source: &[u8]) -> bool {
     node.utf8_text(source).is_ok_and(|text| {
         // 先頭の `_` は「未使用」を示す接頭辞で名前空間を変えないため読み飛ばす。
@@ -190,6 +204,65 @@ fn rust_pattern_name_is_binding_style(node: Node<'_>, source: &[u8]) -> bool {
             .find(|c| *c != '_')
             .is_some_and(|first| !first.is_uppercase())
     })
+}
+
+/// `node` が属するファイルのルート (`source_file`) を返す。
+fn rust_file_root(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        current = parent;
+    }
+    (current.kind() == "source_file").then_some(current)
+}
+
+/// 同一ファイル内に `name` を「パターン位置で束縛ではなくする」宣言があるか。
+///
+/// const / static / 単位構造体 (body を持たない `struct X;`) はパターン位置で
+/// 定数パターンになる。`use` で持ち込まれた名前も同様 (外部の const / unit struct /
+/// enum variant かもしれず、ファイル内では確定できない)。
+/// いずれかに該当したら束縛判定を諦める (fail-closed)。
+fn rust_file_declares_non_binding_name(root: Node<'_>, name: &str, source: &[u8]) -> bool {
+    fn walk(node: Node<'_>, name: &str, source: &[u8]) -> bool {
+        match node.kind() {
+            "const_item" | "static_item" => {
+                if node
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    == Some(name)
+                {
+                    return true;
+                }
+            }
+            "struct_item" => {
+                // 単位構造体 (`struct X;`) だけがパターン位置で定数パターンになる。
+                // フィールドを持つ struct はパターンに `X { .. }` / `X(..)` が要る。
+                let is_unit = node.child_by_field_name("body").is_none();
+                if is_unit
+                    && node
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(source).ok())
+                        == Some(name)
+                {
+                    return true;
+                }
+            }
+            // `use foo::tail;` で持ち込まれた名前は外部の const / unit struct / variant
+            // かもしれず、ファイル内では確定できない。
+            "use_declaration"
+                if node.utf8_text(source).is_ok_and(|text| {
+                    text.split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .any(|seg| seg == name)
+                }) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        node.children(&mut cursor)
+            .any(|child| walk(child, name, source))
+    }
+    walk(root, name, source)
 }
 
 /// Rust の属性引数で文字列値を識別子/パス参照として解釈すべきキー。
