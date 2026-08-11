@@ -38,13 +38,22 @@ pub(crate) fn is_definition_context(
         lang_id,
         LangId::Typescript | LangId::Tsx | LangId::Javascript
     ) {
-        return is_js_ts_definition_context(node, definition_kinds);
+        return is_name_field_definition_context(node, definition_kinds);
     }
     if lang_id == LangId::Python {
         return is_python_definition_context(node, definition_kinds);
     }
     if lang_id == LangId::Zig {
         return is_zig_definition_context(node, definition_kinds);
+    }
+    if lang_id == LangId::Go {
+        return is_go_definition_context(node, definition_kinds);
+    }
+    if matches!(lang_id, LangId::Java | LangId::Swift | LangId::CSharp) {
+        return is_name_field_definition_context(node, definition_kinds);
+    }
+    if lang_id == LangId::Kotlin {
+        return is_kotlin_definition_context(node, definition_kinds);
     }
 
     if matches!(lang_id, LangId::C | LangId::Cpp) {
@@ -71,7 +80,8 @@ pub(crate) fn is_ignored_identifier_context(node: Node<'_>, lang_id: LangId) -> 
         && is_cpp_standalone_forward_declaration_tag_name(node)
 }
 
-/// JS/TS/TSX: 識別子が「宣言の `name` フィールド」であるときだけ `Definition` とみなす。
+/// 定義ノードが `name` フィールドを持つ文法で、識別子が「宣言の `name` フィールド」
+/// であるときだけ `Definition` とみなす。JS/TS/TSX・Go・Java・Swift・C# が使う。
 ///
 /// 単純な parent/grandparent 走査では `function parseExcel(): ExcelParseResult {}` の
 /// `ExcelParseResult` (戻り値型) や `class A extends B {}` の `B` が grandparent
@@ -80,7 +90,16 @@ pub(crate) fn is_ignored_identifier_context(node: Node<'_>, lang_id: LangId) -> 
 /// 発生する (例: `excel-service.ts` で戻り値型 `ExcelParseResult` が dead 扱いになる)。
 /// PHP と同じく `name` フィールドの一致を要求し、return_type / extends_clause 等の中の
 /// 識別子は ref として分類する。
-fn is_js_ts_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bool {
+///
+/// 各言語で戻り値型・基底クラスがぶら下がる位置 (`astro-sight ast` で確認済み):
+/// - Go: `function_declaration` / `method_declaration` の `result:` が直接子
+/// - Java: `method_declaration` の `type:` が直接子、`class_declaration` の
+///   `superclass:` は `superclass` ノードを挟む
+/// - Swift: `function_declaration` の戻り値型も `name:` フィールド名で現れるが、
+///   `child_by_field_name` は最初の `name` (関数名) を返すため一致しない
+/// - C#: `method_declaration` の `returns:` が直接子、`class_declaration` の基底型は
+///   `base_list` を挟む
+fn is_name_field_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -106,6 +125,52 @@ fn is_js_ts_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> boo
         return true;
     }
     false
+}
+
+/// `parent` の最初の identifier 系の子が `node` かどうかを返す。
+///
+/// `name` フィールドを持たない宣言ノード (Kotlin の各宣言、Go の `package_clause`) で
+/// 宣言名の位置を特定する。素朴な `name` 一致判定だけだと、これらの宣言名そのものが
+/// def から漏れて「定義が 1 つも無い」という逆向きの誤りになる。
+fn first_identifier_child_matches(parent: Node<'_>, node: Node<'_>) -> bool {
+    let mut cursor = parent.walk();
+    for child in parent.children(&mut cursor) {
+        if is_identifier_kind(child.kind()) {
+            return child.id() == node.id();
+        }
+    }
+    false
+}
+
+/// Go: 宣言の `name` フィールド一致を要求する。
+///
+/// `package_clause` (`package main` の `main`) だけは `name` フィールドを持たず
+/// `package_identifier` が直接ぶら下がるため、最初の identifier 子を名前位置とする
+/// (Zig の `variable_declaration` と同型の例外)。
+fn is_go_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bool {
+    if let Some(parent) = node.parent()
+        && parent.kind() == "package_clause"
+    {
+        return first_identifier_child_matches(parent, node);
+    }
+    is_name_field_definition_context(node, definition_kinds)
+}
+
+/// Kotlin: tree-sitter-kotlin の宣言ノードは `name` フィールドを持たず、最初の
+/// identifier 系の子が宣言名になる (`class_declaration (modifiers) (type_identifier)` /
+/// `function_declaration (simple_identifier) …`)。
+///
+/// 戻り値型は `function_declaration` 直下の `user_type` を挟むため parent が定義ノードに
+/// ならず ref に落ちる。継承 (`class Impl : Base()`) も `delegation_specifier >
+/// constructor_invocation > user_type` と深いため従来から ref で、本判定でも変わらない。
+fn is_kotlin_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if !definition_kinds.contains(&parent.kind()) {
+        return false;
+    }
+    first_identifier_child_matches(parent, node)
 }
 
 /// Python: 宣言の `name` フィールドと、`parameters` 直下の bare パラメータ名だけを

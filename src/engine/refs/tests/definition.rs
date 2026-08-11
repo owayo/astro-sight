@@ -232,18 +232,205 @@ struct forward_declared;\n";
     );
 }
 
+/// 型注釈位置 (戻り値型・基底クラス・引数型) は Definition ではなく Reference。
+///
+/// Python と同型の誤分類が汎用パスに落ちる Go / Java / Kotlin / Swift / C# でも
+/// 起きていた (`is_definition_context` の grandparent 走査が
+/// `function_declaration > result: type_identifier` 等を def と判定していた)。
+/// これにより基底クラス・戻り値型でしか使われない型が dead-code で dead と誤報され、
+/// `api.add` の `refs_internal` も過小になっていた。
+/// single refs と count-only (dead-code 経路) で分類が一致することも固定する。
 #[test]
-fn tmp_dump_sexp_five_languages() {
-    use crate::engine::parser;
-    let cases: &[(LangId, &str)] = &[
-        (LangId::Go, "package main\n\ntype Base struct{}\n\nfunc mk(param Base) Base {\n\tvar x Base\n\treturn x\n}\n\nfunc (r Base) m(q Base) Base { return r }\n"),
-        (LangId::Java, "class Base {}\nclass Impl extends Base implements Iface {\n    Base make(Base param) { return new Base(); }\n}\ninterface Iface {}\nenum Color { RED }\n"),
-        (LangId::Kotlin, "open class Base\nclass Impl : Base()\nfun make(param: Base): Base { return Base() }\nobject Single\n"),
-        (LangId::Swift, "class Base {}\nclass Impl: Base {}\nfunc make(param: Base) -> Base { return Base() }\nprotocol Proto {}\n"),
-        (LangId::CSharp, "namespace App {\n    class Base { }\n    class Impl : Base {\n        Base Make(Base param) { return new Base(); }\n    }\n    struct SVal { }\n    interface IFace { }\n    enum Color { Red }\n}\n"),
+fn type_positions_are_refs_not_defs_in_every_language() {
+    use std::borrow::Cow;
+    use std::collections::HashMap;
+
+    // (言語, ソース, 期待 def 数, 期待 ref 数)
+    let cases: &[(LangId, &str, usize, usize)] = &[
+        // 宣言 1 / 引数型・戻り値型・var 型・戻り式で 4 参照
+        (
+            LangId::Go,
+            "package main\n\ntype Base struct{}\n\nfunc mk(param Base) Base {\n\tvar x Base\n\treturn Base{}\n}\n",
+            1,
+            4,
+        ),
+        // 宣言 1 / extends・戻り値型・引数型・new で 4 参照
+        (
+            LangId::Java,
+            "class Base {}\nclass Impl extends Base {\n    Base make(Base param) { return new Base(); }\n}\n",
+            1,
+            4,
+        ),
+        // 宣言 1 / 継承・引数型・戻り値型・コンストラクタ呼び出しで 4 参照
+        (
+            LangId::Kotlin,
+            "open class Base\nclass Impl : Base()\nfun make(param: Base): Base { return Base() }\n",
+            1,
+            4,
+        ),
+        // 宣言 1 / 継承・引数型・戻り値型・イニシャライザ呼び出しで 4 参照
+        (
+            LangId::Swift,
+            "class Base {}\nclass Impl: Base {}\nfunc make(param: Base) -> Base { return Base() }\n",
+            1,
+            4,
+        ),
+        // 宣言 1 / 基底型・戻り値型・引数型・new で 4 参照
+        (
+            LangId::CSharp,
+            "class Base { }\nclass Impl : Base {\n    Base Make(Base param) { return new Base(); }\n}\n",
+            1,
+            4,
+        ),
     ];
-    for (lang, src) in cases {
-        let tree = parser::parse_source(src.as_bytes(), *lang).expect("parse");
-        eprintln!("=== {:?} ===\n{}\n", lang, tree.root_node().to_sexp());
+
+    for (lang, source, want_def, want_ref) in cases {
+        let tree = parser::parse_source(source.as_bytes(), *lang).expect("parse");
+        let defs = definition_node_kinds(*lang);
+        let refs = collect_single_refs_for_test(
+            tree.root_node(),
+            source.as_bytes(),
+            "Base",
+            "test.src",
+            defs,
+            *lang,
+        );
+
+        let def_cnt = refs
+            .iter()
+            .filter(|r| matches!(r.kind, Some(RefKind::Definition)))
+            .count();
+        let ref_cnt = refs
+            .iter()
+            .filter(|r| matches!(r.kind, Some(RefKind::Reference)))
+            .count();
+        assert_eq!(
+            def_cnt, *want_def,
+            "{lang:?}: 型宣言だけが定義になること: {refs:?}"
+        );
+        assert_eq!(
+            ref_cnt, *want_ref,
+            "{lang:?}: 型注釈位置はすべて参照になること: {refs:?}"
+        );
+
+        let mut name_to_ix: HashMap<Cow<'_, str>, Vec<usize>> = HashMap::new();
+        name_to_ix.insert(Cow::Borrowed("Base"), vec![0]);
+        let counts = count_refs_for_test(
+            tree.root_node(),
+            source.as_bytes(),
+            &name_to_ix,
+            defs,
+            *lang,
+            1,
+        );
+        assert_eq!(
+            counts[0], *want_ref,
+            "{lang:?}: count-only 経路も同じ分類になること"
+        );
+    }
+}
+
+/// 宣言名そのものは Definition のまま (name 一致判定が宣言名を落としていない対照)。
+///
+/// `name` フィールドを持たない Kotlin の各宣言と Go の `package_clause` は
+/// 「最初の identifier 子」で名前位置を特定するため、ここが崩れると定義が
+/// 1 件も見つからないという逆向きの誤りになる。
+#[test]
+fn declaration_names_stay_definitions_in_every_language() {
+    // (言語, ソース, 探す名前, 期待 def 数, 期待 ref 数)
+    let cases: &[(LangId, &str, &str, usize, usize)] = &[
+        // package_clause は name フィールドを持たない
+        (LangId::Go, "package main\n\nfunc mk() {}\n", "main", 1, 0),
+        (
+            LangId::Go,
+            "package p\n\ntype Widget struct{}\n\nfunc build() Widget { return Widget{} }\n",
+            "Widget",
+            1,
+            2,
+        ),
+        (
+            LangId::Java,
+            "class Widget {\n    void render() {}\n}\n",
+            "render",
+            1,
+            0,
+        ),
+        // Kotlin の宣言はすべて name フィールドを持たない
+        (
+            LangId::Kotlin,
+            "class Widget\nobject Single\n",
+            "Widget",
+            1,
+            0,
+        ),
+        (
+            LangId::Kotlin,
+            "class Widget\nobject Single\n",
+            "Single",
+            1,
+            0,
+        ),
+        (
+            LangId::Kotlin,
+            "fun build() {}\nfun run2() { build() }\n",
+            "build",
+            1,
+            1,
+        ),
+        (
+            LangId::Swift,
+            "class Widget {}\nprotocol Proto {}\nfunc build() {}\n",
+            "Widget",
+            1,
+            0,
+        ),
+        (
+            LangId::Swift,
+            "class Widget {}\nprotocol Proto {}\nfunc build() {}\n",
+            "Proto",
+            1,
+            0,
+        ),
+        (
+            LangId::CSharp,
+            "namespace App {\n    struct SVal { }\n    interface IFace { }\n    enum Color { Red }\n}\n",
+            "SVal",
+            1,
+            0,
+        ),
+        (
+            LangId::CSharp,
+            "namespace App {\n    struct SVal { }\n    interface IFace { }\n}\n",
+            "IFace",
+            1,
+            0,
+        ),
+    ];
+
+    for (lang, source, name, want_def, want_ref) in cases {
+        let tree = parser::parse_source(source.as_bytes(), *lang).expect("parse");
+        let defs = definition_node_kinds(*lang);
+        let refs = collect_single_refs_for_test(
+            tree.root_node(),
+            source.as_bytes(),
+            name,
+            "test.src",
+            defs,
+            *lang,
+        );
+
+        let def_cnt = refs
+            .iter()
+            .filter(|r| matches!(r.kind, Some(RefKind::Definition)))
+            .count();
+        let ref_cnt = refs
+            .iter()
+            .filter(|r| matches!(r.kind, Some(RefKind::Reference)))
+            .count();
+        assert_eq!(
+            def_cnt, *want_def,
+            "{lang:?} {name}: 宣言名は定義: {refs:?}"
+        );
+        assert_eq!(ref_cnt, *want_ref, "{lang:?} {name}: 参照数: {refs:?}");
     }
 }
