@@ -123,6 +123,55 @@ fn ruby_ast() {
     assert!(!json["ast"].as_array().unwrap().is_empty());
 }
 
+#[test]
+fn ruby_updated_parser_handles_ambiguous_syntax_without_errors() {
+    let output = cargo_bin()
+        .args([
+            "ast",
+            "--path",
+            "tests/fixtures/ruby_ambiguities.rb",
+            "--depth",
+            "64",
+        ])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    json["ast"].as_array().expect("ast should be an array");
+
+    fn count_kind(value: &serde_json::Value, expected: &str) -> usize {
+        match value {
+            serde_json::Value::Object(map) => {
+                usize::from(map.get("kind").and_then(serde_json::Value::as_str) == Some(expected))
+                    + map
+                        .values()
+                        .map(|child| count_kind(child, expected))
+                        .sum::<usize>()
+            }
+            serde_json::Value::Array(values) => {
+                values.iter().map(|child| count_kind(child, expected)).sum()
+            }
+            _ => 0,
+        }
+    }
+
+    // ERROR が無いだけでなく、曖昧な各構文が意図したノードへ確定したことを固定する。
+    for (kind, expected) in [
+        ("ERROR", 0),
+        ("element_reference", 1),
+        ("lambda", 1),
+        ("block", 2),
+        ("regex", 2),
+        ("range", 1),
+        ("match_pattern", 1),
+        ("heredoc_beginning", 1),
+        ("heredoc_body", 1),
+    ] {
+        assert_eq!(count_kind(&json["ast"], kind), expected, "kind={kind}");
+    }
+}
+
 // ---- Python 多言語テスト ----
 
 #[test]
