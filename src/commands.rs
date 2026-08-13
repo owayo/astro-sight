@@ -708,7 +708,7 @@ mod dead_code_member_liveness;
 
 #[cfg(test)]
 pub(crate) use api_changes::*;
-pub use dead_code::cmd_dead_code;
+pub use dead_code::{CmdDeadCodeOpts, cmd_dead_code};
 // tests.rs が `use super::*` 経由で参照する dead_code 内部シンボル。
 // (production 側の唯一の利用者だった cmd_review は review モジュールへ移動し、
 //  そこから `super::dead_code::…` を直接参照している)

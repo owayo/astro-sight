@@ -7,7 +7,7 @@ use crate::engine::{
     calls, extractor, impact, imports, lexer, lint, parser, refs, snippet, symbols,
 };
 use crate::error::{AstroError, ErrorCode};
-use crate::language::DetectedLang;
+use crate::language::{DetectedLang, LangId};
 use crate::models::call::CallGraph;
 use crate::models::cochange::{CoChangeOptions, CoChangeResult};
 use crate::models::impact::ContextResult;
@@ -35,6 +35,15 @@ pub struct AstParams<'a> {
     pub end_col: Option<usize>,
     pub depth: usize,
     pub context_lines: usize,
+}
+
+/// `AppService` の tree-sitter 系操作が共有する、検証・読み込み・parse 済み入力。
+///
+/// パス境界チェックと 100MB 上限を各操作が個別実装しないよう、生成経路を 1 箇所に閉じる。
+struct ParsedFile {
+    source: parser::SourceBuf,
+    tree: tree_sitter::Tree,
+    lang_id: LangId,
 }
 
 impl Default for AppService {
@@ -206,6 +215,18 @@ impl AppService {
         Ok(())
     }
 
+    /// tree-sitter を使う単一ファイル操作の共通ロード処理。
+    fn load_parsed_file(&self, path: &str) -> Result<ParsedFile> {
+        let utf8_path = self.validate_path_utf8(path)?;
+        let source = parser::read_file(&utf8_path)?;
+        let (tree, lang_id) = parser::parse_file(&utf8_path, &source)?;
+        Ok(ParsedFile {
+            source,
+            tree,
+            lang_id,
+        })
+    }
+
     // -----------------------------------------------------------------------
     // コア操作
     // -----------------------------------------------------------------------
@@ -221,11 +242,11 @@ impl AppService {
             depth = p.depth,
             "extract_ast called"
         );
-        let utf8_path_buf = self.validate_path_utf8(p.path)?;
-        let utf8_path = utf8_path_buf.as_path();
-
-        let source = parser::read_file(utf8_path)?;
-        let (tree, lang_id) = parser::parse_file(utf8_path, &source)?;
+        let ParsedFile {
+            source,
+            tree,
+            lang_id,
+        } = self.load_parsed_file(p.path)?;
         let root = tree.root_node();
 
         // 利用者が見やすいよう、レスポンスの location には元のパス表記を残す。
@@ -353,11 +374,11 @@ impl AppService {
     /// ソースファイルからコールグラフを抽出する。
     pub fn extract_calls(&self, path: &str, function: Option<&str>) -> Result<CallGraph> {
         debug!(path = path, function = ?function, "extract_calls called");
-        let utf8_path_buf = self.validate_path_utf8(path)?;
-        let utf8_path = utf8_path_buf.as_path();
-
-        let source = parser::read_file(utf8_path)?;
-        let (tree, lang_id) = parser::parse_file(utf8_path, &source)?;
+        let ParsedFile {
+            source,
+            tree,
+            lang_id,
+        } = self.load_parsed_file(path)?;
         let root = tree.root_node();
 
         let edges = calls::extract_calls(root, &source, lang_id, function)?;
@@ -382,17 +403,9 @@ impl AppService {
         function: Option<&str>,
     ) -> Result<SequenceDiagramResult> {
         debug!(path = path, function = ?function, "generate_sequence called");
-        let utf8_path_buf = self.validate_path_utf8(path)?;
-        let utf8_path = utf8_path_buf.as_path();
-
-        let source = parser::read_file(utf8_path)?;
-        let (tree, lang_id) = parser::parse_file(utf8_path, &source)?;
-        let root = tree.root_node();
-
-        let edges = calls::extract_calls(root, &source, lang_id, function)?;
-        let language = lang_id.to_string();
-
-        let result = crate::engine::sequence::generate_sequence_diagram(&edges, &language);
+        let graph = self.extract_calls(path, function)?;
+        let result =
+            crate::engine::sequence::generate_sequence_diagram(&graph.calls, &graph.language);
         debug!(
             path = path,
             participants = result.participants.len(),
@@ -404,11 +417,11 @@ impl AppService {
     /// ソースファイルから import/export 依存関係を抽出する。
     pub fn extract_imports(&self, path: &str) -> Result<ImportsResult> {
         debug!(path = path, "extract_imports called");
-        let utf8_path_buf = self.validate_path_utf8(path)?;
-        let utf8_path = utf8_path_buf.as_path();
-
-        let source = parser::read_file(utf8_path)?;
-        let (tree, lang_id) = parser::parse_file(utf8_path, &source)?;
+        let ParsedFile {
+            source,
+            tree,
+            lang_id,
+        } = self.load_parsed_file(path)?;
         let root = tree.root_node();
 
         let edges = imports::extract_imports(root, &source, lang_id)?;
@@ -433,11 +446,11 @@ impl AppService {
         rules: &[crate::models::lint::Rule],
     ) -> Result<crate::models::lint::LintResult> {
         debug!(path = path, rules = rules.len(), "lint_file called");
-        let utf8_path_buf = self.validate_path_utf8(path)?;
-        let utf8_path = utf8_path_buf.as_path();
-
-        let source = parser::read_file(utf8_path)?;
-        let (tree, lang_id) = parser::parse_file(utf8_path, &source)?;
+        let ParsedFile {
+            source,
+            tree,
+            lang_id,
+        } = self.load_parsed_file(path)?;
         let root = tree.root_node();
 
         let (matches, warnings) = lint::lint_file(root, &source, lang_id, rules)?;

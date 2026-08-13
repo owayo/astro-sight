@@ -808,7 +808,10 @@ fn php_resolve_trait_dispatch(
     if ambiguous || matching.len() != 1 {
         return PhpOwnerResolution::Ambiguous;
     }
-    PhpOwnerResolution::Resolved(matching.into_iter().next().unwrap())
+    let Some(owner) = matching.into_iter().next() else {
+        return PhpOwnerResolution::Ignore;
+    };
+    PhpOwnerResolution::Resolved(owner)
 }
 
 fn collect_php_trait_dispatch_targets(

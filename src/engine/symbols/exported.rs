@@ -389,7 +389,7 @@ pub(crate) fn collect_rust_reexported_names(
             continue;
         }
         // pub のみ (pub(crate) / pub(super) 等は外部公開ではない)
-        if !rust_use_is_public(child, source) {
+        if !rust_node_has_unrestricted_pub_visibility(child, source) {
             continue;
         }
         let Some(argument) = child.child_by_field_name("argument") else {
@@ -400,10 +400,10 @@ pub(crate) fn collect_rust_reexported_names(
     names
 }
 
-/// `pub use ...` (修飾子なしの `pub`) かを判定する。`pub(crate)` 等は内部公開で対象外。
-fn rust_use_is_public(use_decl: Node, source: &[u8]) -> bool {
-    let mut cursor = use_decl.walk();
-    for child in use_decl.children(&mut cursor) {
+/// Rust 宣言ノードが制限なし `pub` を持つか判定する。`pub(crate)` 等は内部公開で対象外。
+pub(crate) fn rust_node_has_unrestricted_pub_visibility(node: Node, source: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
         if child.kind() == "visibility_modifier"
             && let Ok(text) = child.utf8_text(source)
         {

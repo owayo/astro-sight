@@ -140,21 +140,33 @@ pub(crate) fn has_blocking_value_usage(index: &ApiRefIndex, name: &str) -> bool 
 /// 変更のときだけ `Some`。呼び出し式が無変更でも、渡している共有 `const` の定義側に同一 diff で
 /// 当該プロパティが追加されていれば追随済みとみなす追加証拠に使う
 /// (`closed_via_local_const_argument`、Issue 2026-08-05-api-mod-callers-updated-indirectly)。
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct ModifiedClosureInput<'a> {
+    pub(crate) index: &'a ApiRefIndex,
+    pub(crate) dir: &'a str,
+    pub(crate) name: &'a str,
+    pub(crate) kind: &'a str,
+    pub(crate) base: &'a str,
+    pub(crate) target_new_path: &'a str,
+    pub(crate) diff_files: &'a [crate::models::impact::DiffFile],
+    pub(crate) added_required_props:
+        Option<&'a crate::commands::api_changes::ts_signature::AddedRequiredObjectProps>,
+}
+
 pub(crate) fn is_modified_closed_in_diff(
-    index: &ApiRefIndex,
-    dir: &str,
-    name: &str,
-    kind: &str,
-    base: &str,
-    target_new_path: &str,
-    diff_files: &[crate::models::impact::DiffFile],
-    added_required_props: Option<
-        &crate::commands::api_changes::ts_signature::AddedRequiredObjectProps,
-    >,
+    input: ModifiedClosureInput<'_>,
     caches: &mut ApiClosureCaches,
 ) -> bool {
     use crate::models::reference::RefKind;
+    let ModifiedClosureInput {
+        index,
+        dir,
+        name,
+        kind,
+        base,
+        target_new_path,
+        diff_files,
+        added_required_props,
+    } = input;
     let bare = bare_name(name);
     let Some(refs) = index.refs_for(bare) else {
         return false;
@@ -278,12 +290,23 @@ fn resolve_ref_shadow_binding(
     caches: &mut ApiClosureCaches,
 ) -> crate::commands::api_changes::js_ts_shadow::LocalResolution {
     use crate::commands::api_changes::js_ts_shadow::LocalResolution;
-    let Some((source, tree, lang)) = parsed_ref_file(dir, &r.path, caches) else {
+    let Some(parsed) = parsed_ref_file(dir, &r.path, caches) else {
         return LocalResolution::OtherOrAmbiguous;
     };
     crate::commands::api_changes::js_ts_shadow::resolve_reference_binding(
-        tree, source, *lang, bare, r.line, r.column,
+        &parsed.tree,
+        &parsed.source,
+        parsed.lang_id,
+        bare,
+        r.line,
+        r.column,
     )
+}
+
+struct ParsedRefFile {
+    source: crate::engine::parser::SourceBuf,
+    tree: tree_sitter::Tree,
+    lang_id: crate::language::LangId,
 }
 
 /// 参照ファイルの parse 結果 (キャッシュ付き) を返す。読み込みは `parser::read_file`
@@ -293,11 +316,7 @@ fn parsed_ref_file<'a>(
     dir: &str,
     ref_path: &str,
     caches: &'a mut ApiClosureCaches,
-) -> Option<&'a (
-    crate::engine::parser::SourceBuf,
-    tree_sitter::Tree,
-    crate::language::LangId,
-)> {
+) -> Option<&'a ParsedRefFile> {
     caches
         .parsed_refs
         .entry(ref_path.to_string())
@@ -311,7 +330,11 @@ fn parsed_ref_file<'a>(
             let lang = crate::language::LangId::from_path(camino::Utf8Path::new(ref_path)).ok()?;
             let source = crate::engine::parser::read_file(&abs_utf8).ok()?;
             let tree = crate::engine::parser::parse_source(&source, lang).ok()?;
-            Some((source, tree, lang))
+            Some(ParsedRefFile {
+                source,
+                tree,
+                lang_id: lang,
+            })
         })
         .as_ref()
 }
@@ -325,16 +348,16 @@ fn enclosing_call_line_range(
     bare: &str,
     caches: &mut ApiClosureCaches,
 ) -> Option<(usize, usize)> {
-    let (source, tree, lang) = parsed_ref_file(dir, &r.path, caches)?;
+    let parsed = parsed_ref_file(dir, &r.path, caches)?;
     if !matches!(
-        lang,
+        parsed.lang_id,
         crate::language::LangId::Javascript
             | crate::language::LangId::Typescript
             | crate::language::LangId::Tsx
     ) {
         return None;
     }
-    callee_call_line_range(tree, source, bare, r.line, r.column)
+    callee_call_line_range(&parsed.tree, &parsed.source, bare, r.line, r.column)
 }
 
 /// `(line, column)` の identifier が call の callee を成すなら、その call_expression /
@@ -435,17 +458,18 @@ fn closed_via_local_const_argument(
     let Some(added) = added else {
         return false;
     };
-    let Some((source, tree, lang)) = parsed_ref_file(dir, &r.path, caches) else {
+    let Some(parsed) = parsed_ref_file(dir, &r.path, caches) else {
         return false;
     };
     let point = tree_sitter::Point {
         row: r.line,
         column: r.column,
     };
-    let Some(node) = tree
+    let Some(node) = parsed
+        .tree
         .root_node()
         .descendant_for_point_range(point, point)
-        .filter(|n| n.kind() == "identifier" && n.utf8_text(source).ok() == Some(bare))
+        .filter(|n| n.kind() == "identifier" && n.utf8_text(&parsed.source).ok() == Some(bare))
     else {
         return false;
     };
@@ -462,9 +486,9 @@ fn closed_via_local_const_argument(
         return false;
     };
     crate::commands::api_changes::ts_const_arg::closed_via_local_const_argument(
-        *lang,
-        tree.root_node(),
-        source,
+        parsed.lang_id,
+        parsed.tree.root_node(),
+        &parsed.source,
         call_node,
         added,
         changed_lines,
@@ -487,15 +511,7 @@ pub(crate) struct ApiClosureCaches {
     /// shadow binding 解決用の (ref path → parse 結果) キャッシュ。`None` = read/parse
     /// 失敗 (毎回再試行しない)。同名定義が複数ある modified シンボルが多数あっても、
     /// 参照ファイル単位で 1 回だけ parse する。
-    #[allow(clippy::type_complexity)]
-    pub(crate) parsed_refs: std::collections::HashMap<
-        String,
-        Option<(
-            crate::engine::parser::SourceBuf,
-            tree_sitter::Tree,
-            crate::language::LangId,
-        )>,
-    >,
+    parsed_refs: std::collections::HashMap<String, Option<ParsedRefFile>>,
 }
 
 /// 参照行が named export clause (`export { X }` / `export type { X }`) かを判定する。

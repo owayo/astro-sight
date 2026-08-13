@@ -6,10 +6,11 @@ use tracing::info;
 
 use astro_sight::cli::{Cli, Commands};
 use astro_sight::commands::{
-    self, CmdAstOpts, CmdContextOpts, CmdImpactOpts, CmdReviewOpts, batch_ast, batch_calls,
-    batch_imports, batch_lint, batch_sequence, batch_symbols, cmd_ast, cmd_calls, cmd_cochange,
-    cmd_context, cmd_dead_code, cmd_doctor, cmd_impact, cmd_imports, cmd_lint, cmd_mcp, cmd_refs,
-    cmd_refs_batch, cmd_review, cmd_sequence, cmd_session, cmd_symbols, cmd_symbols_dir,
+    self, CmdAstOpts, CmdContextOpts, CmdDeadCodeOpts, CmdImpactOpts, CmdReviewOpts, batch_ast,
+    batch_calls, batch_imports, batch_lint, batch_sequence, batch_symbols, cmd_ast, cmd_calls,
+    cmd_cochange, cmd_context, cmd_dead_code, cmd_doctor, cmd_impact, cmd_imports, cmd_lint,
+    cmd_mcp, cmd_refs, cmd_refs_batch, cmd_review, cmd_sequence, cmd_session, cmd_symbols,
+    cmd_symbols_dir,
 };
 use astro_sight::config::ConfigService;
 use astro_sight::error::{AstroError, ErrorCode};
@@ -514,23 +515,23 @@ fn dispatch_command(service: &AppService, command: Commands, output: OutputOptio
             exclude_dirs,
             exclude_globs,
             dead_scope,
-        } => cmd_dead_code(
-            &dir,
-            glob.as_deref(),
-            diff.as_deref(),
-            diff_file.as_deref(),
+        } => cmd_dead_code(&CmdDeadCodeOpts {
+            dir: &dir,
+            glob: glob.as_deref(),
+            diff: diff.as_deref(),
+            diff_file: diff_file.as_deref(),
             git,
-            &base,
+            base: &base,
             staged,
             include_vendor,
             include_tests,
             include_build,
-            framework.as_deref(),
-            &exclude_dirs,
-            &exclude_globs,
+            framework: framework.as_deref(),
+            extra_exclude_dirs: &exclude_dirs,
+            extra_exclude_globs: &exclude_globs,
             output,
             dead_scope,
-        ),
+        }),
         Commands::Doctor => cmd_doctor(output),
         Commands::Session => cmd_session(output),
         Commands::Mcp => cmd_mcp(output),

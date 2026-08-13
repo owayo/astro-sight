@@ -1,4 +1,5 @@
 use crate::engine::parser;
+use crate::engine::symbols::rust_node_has_unrestricted_pub_visibility;
 
 use super::super::git_input::{git_show_blob, validate_git_revision};
 use super::{bare_name, find_mod_decl_visibility, module_path_segments};
@@ -883,17 +884,14 @@ pub(crate) fn collect_all_modules(
             read_rust_module_source(source, dir, &info.crate_root_rel, &current_rel)?;
         let tree = parser::parse_source(&module_source, crate::language::LangId::Rust).ok()?;
         let base_dir = child_module_base_dir(&current_rel);
-        collect_modules_with_visibility(
+        let mut collector = ModuleVisibilityCollector {
             source,
-            tree.root_node(),
-            &module_source,
             dir,
             info,
-            &segments,
-            &base_dir,
-            &mut result,
-            &mut frontier,
-        )?;
+            result: &mut result,
+            frontier: &mut frontier,
+        };
+        collector.collect(tree.root_node(), &module_source, &segments, &base_dir)?;
     }
     Some(result)
 }
@@ -903,89 +901,86 @@ pub(crate) fn collect_all_modules(
 /// `base_dir` は子 `mod name;` 宣言のファイル解決基準 dir で、inline module
 /// (`mod internal { pub mod api; }`) へ潜るたびに module 名を積む — inline 階層内の
 /// 外部 mod 宣言は `internal/api.rs` を指すため。
-#[allow(clippy::too_many_arguments)]
-fn collect_modules_with_visibility(
-    source: RustSourceTree<'_>,
-    node: tree_sitter::Node<'_>,
-    source_bytes: &[u8],
-    dir: &str,
-    info: &RustPrivateModuleInfo,
-    current_segments: &[String],
-    base_dir: &std::path::Path,
-    result: &mut std::collections::HashMap<Vec<String>, Vec<String>>,
-    frontier: &mut Vec<(Vec<String>, std::path::PathBuf)>,
-) -> Option<()> {
-    match node.kind() {
-        "mod_item" => {
-            if rust_mod_item_has_path_attribute(node, source_bytes) {
-                return None;
-            }
-            let name = node
-                .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(source_bytes).ok())
-                .map(str::to_string)?;
-            let is_pub = rust_use_declaration_is_pub(node, source_bytes);
-            let mut child_segments = current_segments.to_vec();
-            child_segments.push(name.clone());
-            if is_pub {
-                result
-                    .entry(current_segments.to_vec())
-                    .or_default()
-                    .push(name.clone());
-            }
-            result.entry(child_segments.clone()).or_default();
-            let mut has_inline_body = false;
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                if child.kind() == "declaration_list" {
-                    has_inline_body = true;
-                    let inline_base = base_dir.join(&name);
-                    let mut inner_cursor = child.walk();
-                    for inner in child.named_children(&mut inner_cursor) {
-                        collect_modules_with_visibility(
-                            source,
-                            inner,
-                            source_bytes,
-                            dir,
-                            info,
-                            &child_segments,
-                            &inline_base,
-                            result,
-                            frontier,
-                        )?;
+struct ModuleVisibilityCollector<'a, 'b> {
+    source: RustSourceTree<'a>,
+    dir: &'a str,
+    info: &'a RustPrivateModuleInfo,
+    result: &'b mut std::collections::HashMap<Vec<String>, Vec<String>>,
+    frontier: &'b mut Vec<(Vec<String>, std::path::PathBuf)>,
+}
+
+impl ModuleVisibilityCollector<'_, '_> {
+    fn collect(
+        &mut self,
+        node: tree_sitter::Node<'_>,
+        source_bytes: &[u8],
+        current_segments: &[String],
+        base_dir: &std::path::Path,
+    ) -> Option<()> {
+        match node.kind() {
+            "mod_item" => {
+                if rust_mod_item_has_path_attribute(node, source_bytes) {
+                    return None;
+                }
+                let name = node
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source_bytes).ok())
+                    .map(str::to_string)?;
+                let is_pub = rust_node_has_unrestricted_pub_visibility(node, source_bytes);
+                let mut child_segments = current_segments.to_vec();
+                child_segments.push(name.clone());
+                if is_pub {
+                    self.result
+                        .entry(current_segments.to_vec())
+                        .or_default()
+                        .push(name.clone());
+                }
+                self.result.entry(child_segments.clone()).or_default();
+                let mut has_inline_body = false;
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "declaration_list" {
+                        has_inline_body = true;
+                        let inline_base = base_dir.join(&name);
+                        let mut inner_cursor = child.walk();
+                        for inner in child.named_children(&mut inner_cursor) {
+                            self.collect(inner, source_bytes, &child_segments, &inline_base)?;
+                        }
+                    }
+                }
+                if !has_inline_body {
+                    let as_mod = base_dir.join(&name).join("mod.rs");
+                    let as_file = base_dir.join(format!("{name}.rs"));
+                    if read_rust_module_source(
+                        self.source,
+                        self.dir,
+                        &self.info.crate_root_rel,
+                        &as_mod,
+                    )
+                    .is_some()
+                    {
+                        self.frontier.push((child_segments, as_mod));
+                    } else if read_rust_module_source(
+                        self.source,
+                        self.dir,
+                        &self.info.crate_root_rel,
+                        &as_file,
+                    )
+                    .is_some()
+                    {
+                        self.frontier.push((child_segments, as_file));
                     }
                 }
             }
-            if !has_inline_body {
-                let as_mod = base_dir.join(&name).join("mod.rs");
-                let as_file = base_dir.join(format!("{name}.rs"));
-                if read_rust_module_source(source, dir, &info.crate_root_rel, &as_mod).is_some() {
-                    frontier.push((child_segments, as_mod));
-                } else if read_rust_module_source(source, dir, &info.crate_root_rel, &as_file)
-                    .is_some()
-                {
-                    frontier.push((child_segments, as_file));
+            _ => {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    self.collect(child, source_bytes, current_segments, base_dir)?;
                 }
             }
         }
-        _ => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                collect_modules_with_visibility(
-                    source,
-                    child,
-                    source_bytes,
-                    dir,
-                    info,
-                    current_segments,
-                    base_dir,
-                    result,
-                    frontier,
-                )?;
-            }
-        }
+        Some(())
     }
-    Some(())
 }
 
 /// `src/` 配下の `.rs` ファイル (file は dir 相対) を `source` 経由で読む。
@@ -1030,7 +1025,7 @@ pub(crate) fn collect_pub_use_edges(
 ) -> Option<()> {
     match node.kind() {
         "use_declaration" => {
-            if !rust_use_declaration_is_pub(node, source) {
+            if !rust_node_has_unrestricted_pub_visibility(node, source) {
                 return Some(());
             }
             let argument = node.child_by_field_name("argument")?;
@@ -1103,18 +1098,6 @@ pub(crate) fn attribute_item_is_path(attr_item: tree_sitter::Node<'_>, source: &
                     return c.utf8_text(source).map(str::trim) == Ok("path");
                 }
             }
-        }
-    }
-    false
-}
-
-/// `use_declaration` / `mod_item` ノードが「制限なし `pub`」 (`pub(crate)` / `pub(super)` 等の
-/// 制限付きや非 pub を除く) かを返す。`visibility_modifier` 子ノードのテキストを厳密に `"pub"` で照合する。
-pub(crate) fn rust_use_declaration_is_pub(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "visibility_modifier" {
-            return child.utf8_text(source).map(str::trim) == Ok("pub");
         }
     }
     false

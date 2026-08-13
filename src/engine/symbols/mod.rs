@@ -31,6 +31,7 @@ pub(crate) use cpp::{
 };
 pub(crate) use exported::{
     collect_js_ts_named_export_surface_names, collect_rust_reexported_names,
+    rust_node_has_unrestricted_pub_visibility,
 };
 
 use cpp::cpp_enclosing_function_definition;

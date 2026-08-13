@@ -437,14 +437,16 @@ pub(crate) fn classify_signature_change(
     let added_required_props = detect_added_required_object_props(&site, sources);
     // 全 cross-file 参照が同一 diff 内で追随済みなら informational
     if is_modified_closed_in_diff(
-        ref_index,
-        dir,
-        &name,
-        kind,
-        base,
-        &df.new_path,
-        diff_files,
-        added_required_props.as_ref(),
+        ModifiedClosureInput {
+            index: ref_index,
+            dir,
+            name: &name,
+            kind,
+            base,
+            target_new_path: &df.new_path,
+            diff_files,
+            added_required_props: added_required_props.as_ref(),
+        },
         state.closure_caches,
     ) {
         state.buckets.modified_closed_in_diff.push(change);

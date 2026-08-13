@@ -1226,24 +1226,51 @@ pub(crate) fn is_python_test_symbol(
     false
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn cmd_dead_code(
-    dir: &str,
-    glob: Option<&str>,
-    diff: Option<&str>,
-    diff_file: Option<&str>,
-    git: bool,
-    base: &str,
-    staged: bool,
-    include_vendor: bool,
-    include_tests: bool,
-    include_build: bool,
-    framework: Option<&str>,
-    extra_exclude_dirs: &[String],
-    extra_exclude_globs: &[String],
-    output: OutputOptions,
-    dead_scope: crate::cli::DeadScope,
-) -> Result<()> {
+/// `dead-code` CLI の入力一式。
+///
+/// 個数の多い同型引数を位置で渡すと、フラグ追加時に CLI 層と実行層の対応を崩しやすい。
+/// 他の複合コマンド (`review` / `context` / `impact`) と同じく名前付きの options に閉じる。
+pub struct CmdDeadCodeOpts<'a> {
+    pub dir: &'a str,
+    pub glob: Option<&'a str>,
+    pub diff: Option<&'a str>,
+    pub diff_file: Option<&'a str>,
+    pub git: bool,
+    pub base: &'a str,
+    pub staged: bool,
+    pub include_vendor: bool,
+    pub include_tests: bool,
+    pub include_build: bool,
+    pub framework: Option<&'a str>,
+    pub extra_exclude_dirs: &'a [String],
+    pub extra_exclude_globs: &'a [String],
+    pub output: OutputOptions,
+    pub dead_scope: crate::cli::DeadScope,
+}
+
+struct ResolvedDeadCodeDiff {
+    input: Option<String>,
+    files: Option<Vec<crate::models::impact::DiffFile>>,
+    truncations: Vec<crate::models::truncation::TruncationInfo>,
+}
+
+pub fn cmd_dead_code(opts: &CmdDeadCodeOpts<'_>) -> Result<()> {
+    let dir = opts.dir;
+    let glob = opts.glob;
+    let diff = opts.diff;
+    let diff_file = opts.diff_file;
+    let git = opts.git;
+    let base = opts.base;
+    let staged = opts.staged;
+    let include_vendor = opts.include_vendor;
+    let include_tests = opts.include_tests;
+    let include_build = opts.include_build;
+    let framework = opts.framework;
+    let extra_exclude_dirs = opts.extra_exclude_dirs;
+    let extra_exclude_globs = opts.extra_exclude_globs;
+    let output = opts.output;
+    let dead_scope = opts.dead_scope;
+
     let canonical_dir = std::fs::canonicalize(dir)?;
     if !canonical_dir.is_dir() {
         return Err(
@@ -1270,12 +1297,7 @@ pub fn cmd_dead_code(
     // 取得・parse して再利用する (旧実装は run_git_diff + parse_unified_diff を 2 回呼んでおり、
     // --staged 実行中の git add で 2 つの diff が乖離する競合状態があった)。
     // NotRequested (diff/diff_file/git いずれも未指定) は全体走査に振り分ける。
-    #[allow(clippy::type_complexity)]
-    let (diff_input, diff_files, truncations): (
-        Option<String>,
-        Option<Vec<crate::models::impact::DiffFile>>,
-        Vec<crate::models::truncation::TruncationInfo>,
-    ) = match resolve_diff_source(dir, diff, diff_file, git, base, staged)? {
+    let resolved_diff = match resolve_diff_source(dir, diff, diff_file, git, base, staged)? {
         DiffSourceResolution::Diff { diff, truncations } => {
             if diff.trim().is_empty() {
                 // 未追跡の巨大ファイルを除外した結果 diff が空になった場合も、
@@ -1293,7 +1315,11 @@ pub fn cmd_dead_code(
             }
 
             let parsed = crate::engine::diff::parse_unified_diff(&diff);
-            (Some(diff), Some(parsed), truncations)
+            ResolvedDeadCodeDiff {
+                input: Some(diff),
+                files: Some(parsed),
+                truncations,
+            }
         }
         DiffSourceResolution::Skipped(skip) => {
             // git 管理外: 空の dead_symbols + skipped で exit 0。
@@ -1308,10 +1334,14 @@ pub fn cmd_dead_code(
             print!("{}", serialize_cli_document(&result, output)?);
             return Ok(());
         }
-        DiffSourceResolution::NotRequested => (None, None, Vec::new()),
+        DiffSourceResolution::NotRequested => ResolvedDeadCodeDiff {
+            input: None,
+            files: None,
+            truncations: Vec::new(),
+        },
     };
 
-    let files: Vec<std::path::PathBuf> = if let Some(diff_files) = diff_files.as_ref() {
+    let files: Vec<std::path::PathBuf> = if let Some(diff_files) = resolved_diff.files.as_ref() {
         filter_diff_files_for_dead_code(
             &canonical_dir,
             diff_files,
@@ -1334,7 +1364,8 @@ pub fn cmd_dead_code(
     // dead-scope=touched-symbols: --git/--diff 指定時のみ意味を持つ。
     // diff の追加行情報が必要なので、has_diff のときだけ適用する。
     let dead_symbols = if matches!(dead_scope, crate::cli::DeadScope::TouchedSymbols)
-        && let (Some(diff_input), Some(diff_files)) = (diff_input.as_deref(), diff_files.as_ref())
+        && let (Some(diff_input), Some(diff_files)) =
+            (resolved_diff.input.as_deref(), resolved_diff.files.as_ref())
     {
         filter_dead_by_touched_symbols(dir, dead_symbols, diff_input, diff_files)
     } else {
@@ -1347,7 +1378,7 @@ pub fn cmd_dead_code(
         dead_symbols,
         test_only_symbols,
         skipped: None,
-        truncations,
+        truncations: resolved_diff.truncations,
     };
 
     let text = serialize_cli_document(&result, output)?;
