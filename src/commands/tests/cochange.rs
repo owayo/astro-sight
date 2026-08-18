@@ -1099,10 +1099,14 @@ fn detect_missing_cochanges_shebang_probe_survives_multibyte_boundary() {
 
 /// 途中に不正バイトを含むファイルは shebang 判定の対象にしない (言語解決しない)。
 ///
-/// `valid_up_to()` の prefix を無条件に使うと `#!/usr/bin/env python3\xff...` の
-/// `\xff` より前が `from_shebang` に渡って Python と判定され、通常の言語検出が不正 UTF-8 を
-/// 拒否する挙動と食い違う。加えて manifest ↔ source 警告を誤って抑制する。
-/// 256 バイト境界での**未完のマルチバイト列** (`error_len() == None`) だけを許容する。
+/// `valid_up_to()` の prefix を使うと `#!/usr/bin/env python3\xff...` の `\xff` より前が
+/// `from_shebang` に渡って Python と判定され、通常の言語検出が不正 UTF-8 を拒否する挙動と
+/// 食い違う。加えて manifest ↔ source 警告を誤って抑制する。
+///
+/// `error_len() == None` (末尾で列が未完) だけを許す条件も不十分で、`error_len()` は
+/// 「上限で切ったせい」ではなく「渡したスライス末尾で列が未完」しか示さないため、
+/// 256 バイト未満の実 EOF 未完列まで受理してしまう。よって**先頭行の不正 UTF-8 は
+/// すべて拒否する**。ここでは `error_len()` の両経路 (Some / None) を固定する。
 #[test]
 fn resolve_source_lang_rejects_invalid_utf8_in_first_line() {
     let dir = tempfile::tempdir().expect("tempdir");
