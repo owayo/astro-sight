@@ -1022,6 +1022,149 @@ fn detect_missing_cochanges_treats_shebang_script_as_source() {
     );
 }
 
+/// shebang 判定の読み込みが、256 バイト境界にマルチバイト文字が来ても壊れないことを固定する。
+///
+/// 256 バイト全体を `from_utf8` に通す実装では、shebang 自体は正しい ASCII なのに
+/// 境界が日本語コメントの途中に落ちるだけで判定が `None` になり、`pyproject.toml ↔ bin/tool`
+/// の誤検出が復活する。先頭行だけを UTF-8 化することで防ぐ。
+#[test]
+fn detect_missing_cochanges_shebang_probe_survives_multibyte_boundary() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let manifest_of = |deps: &str| format!("[project]\nname = \"demo\"\ndependencies = [{deps}]\n");
+    // 先頭行は ASCII の shebang。2 行目以降に日本語を敷き詰めて、256 バイト境界が
+    // マルチバイト文字の**途中**に落ちるようにする (「あ」= UTF-8 3 バイト)。
+    //
+    // 境界計算: shebang 行 "#!/usr/bin/env python3\n" = 23 バイト、続く "#" = 1 バイトで
+    // プレフィックス 24 バイト。256 - 24 = 232 で 232 % 3 == 1 なので、256 バイト目は
+    // 「あ」の 2 バイト目に落ちる。ここを "# " (2 バイト) にすると 231 % 3 == 0 で
+    // ちょうど文字境界に一致してしまい、旧実装でもテストが通ってしまう (実際に踏んだ)。
+    let tool_of = |body: &str| {
+        let padding = "あ".repeat(120); // 360 バイト (256 バイト境界を確実に跨ぐ)
+        format!("#!/usr/bin/env python3\n#{padding}\n\ndef main():\n{body}\n")
+    };
+
+    git_commit_files(
+        repo,
+        &[
+            ("pyproject.toml", &manifest_of("")),
+            ("bin/tool", &tool_of("    return 1")),
+        ],
+        "initial",
+    );
+    let deps = [
+        "\"alpha\"",
+        "\"alpha\", \"beta\"",
+        "\"alpha\", \"beta\", \"gamma\"",
+    ];
+    for (i, dep) in deps.iter().enumerate() {
+        git_commit_files(
+            repo,
+            &[
+                ("pyproject.toml", &manifest_of(dep)),
+                ("bin/tool", &tool_of(&format!("    return {}", i + 2))),
+            ],
+            &format!("feat: dep {i}"),
+        );
+    }
+
+    std::fs::write(
+        repo.join("bin/tool"),
+        tool_of("    total = 0\n    for i in range(3):\n        total += i\n    return total"),
+    )
+    .expect("write bin/tool");
+
+    let service = AppService::new();
+    let mut changed_files = HashSet::new();
+    changed_files.insert("bin/tool".to_string());
+
+    let missing = detect_missing_cochanges(
+        &service,
+        repo.to_str().expect("utf-8 path"),
+        &changed_files,
+        0.0,
+        REVIEW_COCHANGE_MIN_SAMPLES,
+        None,
+    )
+    .expect("detect_missing_cochanges should succeed")
+    .missing;
+
+    assert!(
+        missing.iter().all(|m| m.file != "pyproject.toml"),
+        "マルチバイト境界があっても shebang 判定は成立すべき。got: {missing:?}"
+    );
+}
+
+/// symlink 経由のソースは shebang 判定の対象にしないことを固定する。
+///
+/// `symlink_metadata` で確認してから `File::open` する実装ではその間に実体を差し替えられる
+/// (TOCTOU)。`O_NOFOLLOW` で開くため symlink は開けず、判定は「除外しない」に倒れる。
+/// symlink 自体を辿らないので、リンク先が regular file でも source 扱いしない。
+#[cfg(unix)]
+#[test]
+fn detect_missing_cochanges_does_not_follow_symlinked_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let manifest_of = |deps: &str| format!("[project]\nname = \"demo\"\ndependencies = [{deps}]\n");
+    let real_of = |body: &str| format!("#!/usr/bin/env python3\n\ndef main():\n{body}\n");
+
+    // real/tool を実体にし、bin/tool を symlink にする
+    std::fs::create_dir_all(repo.join("real")).expect("mkdir real");
+    std::fs::create_dir_all(repo.join("bin")).expect("mkdir bin");
+    std::fs::write(repo.join("real/tool"), real_of("    return 1")).expect("write real/tool");
+    std::os::unix::fs::symlink("../real/tool", repo.join("bin/tool")).expect("symlink");
+    git_commit_files(repo, &[("pyproject.toml", &manifest_of(""))], "initial");
+
+    let deps = [
+        "\"alpha\"",
+        "\"alpha\", \"beta\"",
+        "\"alpha\", \"beta\", \"gamma\"",
+    ];
+    for (i, dep) in deps.iter().enumerate() {
+        std::fs::write(
+            repo.join("real/tool"),
+            real_of(&format!("    return {}", i + 2)),
+        )
+        .expect("write real/tool");
+        git_commit_files(
+            repo,
+            &[("pyproject.toml", &manifest_of(dep))],
+            &format!("dep {i}"),
+        );
+    }
+
+    let service = AppService::new();
+    let mut changed_files = HashSet::new();
+    changed_files.insert("bin/tool".to_string());
+
+    // symlink は source と判定されないため、除外は成立せず (= 従来どおりの挙動)。
+    // ここでは panic せず結果が返ることと、symlink を辿った判定になっていないことを確認する。
+    let report = detect_missing_cochanges(
+        &service,
+        repo.to_str().expect("utf-8 path"),
+        &changed_files,
+        0.0,
+        REVIEW_COCHANGE_MIN_SAMPLES,
+        None,
+    )
+    .expect("detect_missing_cochanges should succeed");
+    // symlink を Python と誤認していないこと = 除外が成立していないことを、
+    // 内部判定関数で直接固定する (cochange の履歴条件に依存しない形で)。
+    assert!(
+        resolve_source_lang_for_test(repo.to_str().expect("utf-8 path"), "bin/tool").is_none(),
+        "symlink は O_NOFOLLOW で開けないため言語解決しない"
+    );
+    assert!(
+        resolve_source_lang_for_test(repo.to_str().expect("utf-8 path"), "real/tool").is_some(),
+        "実体のスクリプトは shebang から言語解決できる (対照)"
+    );
+    let _ = report;
+}
+
 /// ロックファイルだけを変更した diff (依存更新コマンドの実行) を起点にしても、
 /// 依存追加コミットで一緒に変わっていたソースを共変更相手として要求しないことを固定する。
 ///

@@ -99,9 +99,9 @@ fn is_nearest_declaration(
 
 /// shebang 行の読み込み上限 (バイト)。
 ///
-/// `read_line` は改行までいくらでも `String` を伸ばすため、改行を含まない巨大ファイル
-/// (minified bundle / バイナリ相当の生成物) を掴むとメモリを大きく食う。shebang は
-/// `#!/usr/bin/env python3` 程度なので 256 バイトで十分。
+/// 改行までいくらでも読むと、改行を含まない巨大ファイル (minified bundle / バイナリ相当の
+/// 生成物) を掴んだときにメモリを大きく食う。shebang は `#!/usr/bin/env python3` 程度なので
+/// 256 バイトで十分。
 const SHEBANG_PROBE_BYTES: u64 = 256;
 
 /// ソースファイルの言語を解決する。拡張子で決まらない場合だけ先頭の shebang を見る。
@@ -118,21 +118,61 @@ fn resolve_source_lang(dir: &str, source: &str) -> Option<crate::language::LangI
     }
     // 拡張子で決まらないものだけディスクを見る。cochange の候補数は per_source_limit で
     // 絞られており、読むのは先頭 256 バイトまで。
-    use std::io::Read;
     let full = std::path::Path::new(dir).join(source);
-    // symlink 経由で FIFO / デバイスファイル等を開くと read が返らない可能性があるため、
-    // 辿らずに regular file であることを確認する。
-    if !std::fs::symlink_metadata(&full)
-        .map(|m| m.file_type().is_file())
-        .unwrap_or(false)
+    let head = read_probe_head(&full)?;
+    // **先頭行だけを** UTF-8 化する。256 バイト全体を `from_utf8` に通すと、shebang 自体は
+    // 正しい ASCII なのに 256 バイト境界がマルチバイト文字 (日本語コメント等) の途中に来た
+    // だけで判定が失敗する。改行位置で切り、それでも末尾が壊れていれば valid prefix を使う。
+    let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
+    let line_bytes = &head[..line_end];
+    let first_line = match std::str::from_utf8(line_bytes) {
+        Ok(text) => text,
+        Err(err) => std::str::from_utf8(&line_bytes[..err.valid_up_to()]).unwrap_or(""),
+    };
+    crate::language::LangId::from_shebang(first_line.trim_end())
+}
+
+/// shebang 判定用に先頭バイト列を読む。
+///
+/// **open と検証を一体化する**のが要点。`symlink_metadata` で確認してから `File::open` すると
+/// その間に通常ファイルを symlink / FIFO へ差し替えられ、open がパスを再解決してしまう
+/// (TOCTOU)。ここでは Unix では `O_NOFOLLOW | O_NONBLOCK` で開いて symlink を拒否し
+/// FIFO でブロックしないようにしたうえで、**開いた descriptor 自身**の metadata で
+/// regular file を確認する。非 Unix でも descriptor 経由で確認する。
+///
+/// 失敗はすべて `None` = 「除外しない」に倒す。
+fn read_probe_head(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NOFOLLOW: symlink 自体を開こうとしてエラーにする (差し替えを検出)
+        // O_NONBLOCK: FIFO / デバイスを開く際に無期限ブロックしない
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    // descriptor 自身の型を見るのでパス再解決による差し替えを受けない。
+    if !file.metadata().ok()?.file_type().is_file() {
         return None;
     }
-    let file = std::fs::File::open(&full).ok()?;
     let mut head = Vec::new();
     file.take(SHEBANG_PROBE_BYTES).read_to_end(&mut head).ok()?;
-    let text = std::str::from_utf8(&head).ok()?;
-    crate::language::LangId::from_shebang(text.lines().next().unwrap_or(""))
+    Some(head)
+}
+
+/// テストから `resolve_source_lang` を直接叩くためのアクセサ。
+///
+/// symlink / マルチバイト境界の扱いは cochange の履歴条件に依存せず固定したいので、
+/// 判定関数そのものを検証する経路を用意する。
+#[cfg(test)]
+pub(crate) fn resolve_source_lang_for_test(
+    dir: &str,
+    source: &str,
+) -> Option<crate::language::LangId> {
+    resolve_source_lang(dir, source)
 }
 
 /// review の missing_cochanges が要求する既定の最小共変更回数。

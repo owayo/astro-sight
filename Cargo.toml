@@ -19,7 +19,10 @@ clap = { version = "4.6.5", features = ["derive"] }
 dhat = { version = "0.3.3", optional = true }
 dirs = "6.0.0"
 hashbrown = "0.17.1"
-ignore = "0.4.32"
+ignore = "0.4.33"
+# Unix の O_NOFOLLOW / O_NONBLOCK を指定して symlink 差し替え (TOCTOU) と
+# FIFO の open ブロックを避けるために使う (dev-dependencies から昇格)。
+libc = "0.2.189"
 logroller = "0.1.12"
 lru = "0.18.2"
 memchr = "2.8.3"
@@ -64,7 +67,6 @@ dhat-heap = ["dep:dhat"]
 
 [dev-dependencies]
 tempfile = "3.27.0"
-libc = "0.2.189"
 
 [profile.release]
 lto = true
