@@ -1188,3 +1188,102 @@ fn review_hook_ts_shadowed_local_fn_unupdated_caller_exits_nonzero() {
         "対象 caller 未更新なら blocking (exit 1) のまま"
     );
 }
+
+/// Issue 2026-08-18-cochange-lockfile-without-new-import: 依存追加を繰り返した履歴を持つ
+/// リポジトリで、import を 1 行も増減させない本体変更に対して manifest / lock の共変更を
+/// 要求しないことを CLI 全体 (通常 JSON 出力) で固定する。
+///
+/// 修正前は `uv.lock` が engine の候補除外 glob に無く (Cargo.lock 等だけが列挙されていた)、
+/// `pyproject.toml` も条件付き相関のまま出ていたため、confidence 100% の警告 2 件が出ていた。
+#[test]
+fn review_cochange_omits_dependency_manifest_without_import_change() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    let manifest_of = |deps: &str| format!("[project]\nname = \"demo\"\ndependencies = [{deps}]\n");
+    let lock_of = |n: usize| format!("# lock revision {n}\n");
+    let app_of = |imports: &str, body: &str| format!("{imports}\n\ndef run():\n{body}\n");
+    let helper_of = |n: usize| format!("def helper():\n    return {n}\n");
+
+    let write = |rel: &str, content: &str| {
+        let full = root.join(rel);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(full, content).unwrap();
+    };
+
+    write("pyproject.toml", &manifest_of(""));
+    write("uv.lock", &lock_of(0));
+    write("pkg/app.py", &app_of("", "    return 1"));
+    write("pkg/helper.py", &helper_of(0));
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "a@b.c"]);
+    git(&["config", "user.name", "t"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "init", "-q"]);
+
+    // 依存追加を 3 回。manifest / lock / app / helper が毎回一緒に変わる履歴を作る。
+    let deps = [
+        "\"alpha\"",
+        "\"alpha\", \"beta\"",
+        "\"alpha\", \"beta\", \"gamma\"",
+    ];
+    let imports = [
+        "import alpha",
+        "import alpha\nimport beta",
+        "import alpha\nimport beta\nimport gamma",
+    ];
+    for i in 0..3 {
+        write("pyproject.toml", &manifest_of(deps[i]));
+        write("uv.lock", &lock_of(i + 1));
+        write("pkg/app.py", &app_of(imports[i], "    return 1"));
+        write("pkg/helper.py", &helper_of(i + 1));
+        git(&["add", "."]);
+        git(&["commit", "-m", &format!("feat: dep {i}"), "-q"]);
+    }
+
+    // 未コミット: app.py の関数本体だけ変更 (import 行の増減なし)。
+    write(
+        "pkg/app.py",
+        &app_of(
+            imports[2],
+            "    total = 0\n    for i in range(10):\n        total += i\n    return total",
+        ),
+    );
+
+    let output = cargo_bin()
+        .args(["review", "--dir", root.to_str().unwrap(), "--git"])
+        .output()
+        .expect("run review");
+    assert!(output.status.success(), "review should exit 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("review JSON");
+    let missing = json["missing_cochanges"]
+        .as_array()
+        .expect("missing_cochanges array");
+    let files: Vec<&str> = missing
+        .iter()
+        .map(|m| m["file"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        !files.contains(&"pyproject.toml"),
+        "import 増減の無い本体変更で pyproject.toml を要求してはならない。got: {files:?}"
+    );
+    assert!(
+        !files.contains(&"uv.lock"),
+        "import 増減の無い本体変更で uv.lock を要求してはならない。got: {files:?}"
+    );
+    // 対照: ソース同士の共変更は引き続き出る (除外が広すぎないことの確認)
+    assert!(
+        files.contains(&"pkg/helper.py"),
+        "ソース同士の共変更は検出されるべき。got: {files:?}"
+    );
+}

@@ -299,7 +299,13 @@ impl Default for CoChangeOptions {
     }
 }
 
-/// blame モードの既定除外 glob (生成物 / ロック / vendored)。
+/// blame モードの既定除外 glob (生成物ディレクトリ / minified)。
+///
+/// ロックファイルはここに列挙しない。glob を手で並べると
+/// `crate::models::dependency_files::DEPENDENCY_MANIFEST_LOCK_PAIRS` との乖離が起きて
+/// 「Cargo.lock は除外されるが uv.lock は残る」形で言語ごとに挙動が変わるため、
+/// `CoChangeExclude::is_match` が正本テーブルで意味判定する
+/// (`is_dependency_lock_path`)。ここは純粋な glob 規則だけを持つ。
 pub const BLAME_DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
     "vendor/**",
     "**/vendor/**",
@@ -311,11 +317,6 @@ pub const BLAME_DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
     "**/build/**",
     "target/**",
     "**/target/**",
-    "**/composer.lock",
-    "**/package-lock.json",
-    "**/yarn.lock",
-    "**/pnpm-lock.yaml",
-    "**/Cargo.lock",
     "**/*.min.js",
     "**/*.min.css",
 ];

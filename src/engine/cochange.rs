@@ -1184,6 +1184,12 @@ impl CoChangeExclude {
     }
 
     pub(crate) fn is_match(&self, path: &str) -> bool {
+        // ロックファイルは glob ではなく正本テーブルで意味判定する。glob 側に列挙すると
+        // ペア表との乖離で「Cargo.lock は除外されるが uv.lock は残る」という言語依存の
+        // 非一貫性が生まれるため (ペアを 1 行足せば除外も追随する形にしておく)。
+        if crate::models::dependency_files::is_dependency_lock_path(path) {
+            return true;
+        }
         // `!pattern` で登録 → match すると Match::Ignore が返る (= 除外対象)
         self.inner.matched(path, false).is_ignore()
     }

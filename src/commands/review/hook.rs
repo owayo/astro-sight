@@ -118,6 +118,12 @@ struct HookCochange<'a> {
     /// 集計対象となったコミット数 (confidence の分母)。算出できない場合は省略。
     #[serde(skip_serializing_if = "Option::is_none")]
     d: Option<usize>,
+    /// 証拠の作り方。既定の変更行 blame では省略し、ファイル履歴 fallback のときだけ
+    /// `"history"` を出す。同じ `c` / `n` / `d` でも、変更行 blame (今回触った行の履歴) と
+    /// ファイル履歴 (今回の変更内容と無関係な共変更も含む) では証拠の強さが違うため、
+    /// トリアージがそこを読めるようにする。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    e: Option<&'static str>,
 }
 
 /// 打ち切り (解析対象から外したもの) の hook 用 DTO。
@@ -429,6 +435,11 @@ pub(crate) fn build_review_hook_json(
                 c: (cochange.confidence * 100.0).round() as u32,
                 n: cochange.co_changes,
                 d: cochange.denominator,
+                e: match cochange.evidence {
+                    Some(crate::models::cochange::CoChangeEvidence::History) => Some("history"),
+                    // blame は既定なので省略して出力を短く保つ (フィールドが無ければ blame)。
+                    Some(crate::models::cochange::CoChangeEvidence::Blame) | None => None,
+                },
             })
             .collect();
         hook_obj.insert(

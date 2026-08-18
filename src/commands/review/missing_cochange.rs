@@ -10,40 +10,39 @@ use crate::models::cochange::CoChangeOptions;
 use crate::models::review::MissingCochange;
 use crate::service::AppService;
 
-/// 依存マニフェストとロックファイルの既知ペア。
-/// これらは `cargo update` や `npm install` など片側のみが変更される正規操作が頻繁に発生するため、
-/// missing_cochange 警告から除外する。同一ディレクトリに属するペアのみ除外対象とする（monorepo 配慮）。
-pub(crate) const DEPENDENCY_MANIFEST_LOCK_PAIRS: &[(&str, &str)] = &[
-    ("Cargo.toml", "Cargo.lock"),
-    ("package.json", "package-lock.json"),
-    ("package.json", "pnpm-lock.yaml"),
-    ("package.json", "yarn.lock"),
-    ("pyproject.toml", "uv.lock"),
-    ("pyproject.toml", "poetry.lock"),
-    ("pyproject.toml", "pdm.lock"),
-    ("Gemfile", "Gemfile.lock"),
-    ("composer.json", "composer.lock"),
-    ("go.mod", "go.sum"),
-    ("mix.exs", "mix.lock"),
-];
+// 依存マニフェスト/ロックの正本テーブルは `models::dependency_files` にある
+// (cochange エンジンの候補除外と同じ集合を使うため)。ここでは判定関数を再エクスポートして
+// 既存の呼び出し側・テストのパスを保つ。
+pub(crate) use crate::models::dependency_files::is_dependency_manifest_pair;
+use crate::models::dependency_files::{is_dependency_lock_path, is_dependency_manifest_path};
 
-/// 2 つのパスが既知の依存マニフェスト/ロックペアであれば true を返す。
-/// monorepo 誤判定を避けるため、親ディレクトリが一致する場合のみ真。
-pub(crate) fn is_dependency_manifest_pair(file_a: &str, file_b: &str) -> bool {
-    let path_a = std::path::Path::new(file_a);
-    let path_b = std::path::Path::new(file_b);
-    let (Some(base_a), Some(base_b)) = (
-        path_a.file_name().and_then(|s| s.to_str()),
-        path_b.file_name().and_then(|s| s.to_str()),
-    ) else {
-        return false;
+/// 「依存宣言ファイル ↔ その言語のソースファイル」の履歴相関を warning から外すか判定する。
+///
+/// 依存を追加するコミットでは manifest / lock とソースが必ず一緒に変わるため、依存追加を
+/// 数回繰り返したリポジトリでは両者の共変更率が 100% になる。しかしこの相関は
+/// 「依存を追加したとき」という条件付きのもので、既存関数の本体だけを書き換える変更
+/// (import を 1 行も増減させない) には因果が無い。それでも履歴頻度だけを根拠に
+/// 「manifest も直せ」と要求していた (実測: import 増減ゼロの差分で confidence 100%)。
+///
+/// standalone `cochange` は「過去に一緒に変更された」という事実を出す探索的な用途なので
+/// 除外しない。review の `missing_cochanges` は「今回も変更すべき」という推奨へ変換する
+/// 場所なので、因果の弱いペアはここで落とす (責務分離)。
+///
+/// 「依存を追加したのに manifest を更新し忘れた」の検出は履歴相関の仕事ではなく、
+/// import と依存宣言を突き合わせる別の解析が担うべき問題。差分から「新規の外部 import が
+/// あるか」を全 16 言語で判定する案は採らない — import 名と配布パッケージ名は一致せず
+/// (Python)、標準ライブラリ判定は処理系バージョンに依存し、feature / plugin / build 依存は
+/// import に現れず、既存 import を新たな実行経路へ載せる変更も拾えないため、
+/// 「net-new import が無い」は依存が変わっていないことの証明にならない。
+fn is_dependency_declaration_vs_source(file_a: &str, file_b: &str) -> bool {
+    let is_dep = |p: &str| is_dependency_manifest_path(p) || is_dependency_lock_path(p);
+    let is_source = |p: &str| {
+        crate::language::LangId::from_path(camino::Utf8Path::new(p)).is_ok()
+            // manifest 自体が解析対象言語 (pyproject.toml など) に解決されることはないが、
+            // 将来の言語追加で重なっても依存宣言側の判定を優先する。
+            && !is_dep(p)
     };
-    if path_a.parent() != path_b.parent() {
-        return false;
-    }
-    DEPENDENCY_MANIFEST_LOCK_PAIRS
-        .iter()
-        .any(|(a, b)| (base_a == *a && base_b == *b) || (base_a == *b && base_b == *a))
+    (is_dep(file_a) && is_source(file_b)) || (is_dep(file_b) && is_source(file_a))
 }
 
 /// review の missing_cochanges が要求する既定の最小共変更回数。
@@ -80,7 +79,16 @@ pub(crate) fn detect_missing_cochanges(
     // review では blame モードで cochange を解析する。
     // 起点ファイル = 差分に登場したファイル。
     // ただし起点が無い (差分が空) ときは何もせず空を返す。
-    let source_files: Vec<String> = changed_files.iter().cloned().collect();
+    //
+    // ロックファイルは起点にしない。生成物なので「lock を変えたなら X も変えろ」という
+    // 推奨に意味が無く (依存更新コマンドの副産物)、依存追加コミットで一緒に変わった
+    // ソースを軒並み相方として引き当てるだけになる。engine 側の候補除外
+    // (`CoChangeExclude`) は相方側にしか効かないため、起点側はここで落とす。
+    let source_files: Vec<String> = changed_files
+        .iter()
+        .filter(|f| !is_dependency_lock_path(f))
+        .cloned()
+        .collect();
     if source_files.is_empty() {
         return Ok(MissingCochangeReport {
             missing: Vec::new(),
@@ -148,6 +156,11 @@ pub(crate) fn detect_missing_cochanges(
         if is_dependency_manifest_pair(&entry.file_a, &entry.file_b) {
             continue;
         }
+        // 依存宣言ファイル ↔ ソースの履歴相関は「依存を追加したとき」限定の条件付き相関で、
+        // 本体だけの変更には因果が無いため review の推奨からは外す。
+        if is_dependency_declaration_vs_source(&entry.file_a, &entry.file_b) {
+            continue;
+        }
 
         let a_in_diff = changed_files.contains(&entry.file_a);
         let b_in_diff = changed_files.contains(&entry.file_b);
@@ -159,6 +172,7 @@ pub(crate) fn detect_missing_cochanges(
                 confidence: entry.confidence,
                 co_changes: entry.co_changes,
                 denominator: entry.denominator,
+                evidence: entry.evidence,
             })
         } else if b_in_diff && !a_in_diff {
             Some(MissingCochange {
@@ -167,6 +181,7 @@ pub(crate) fn detect_missing_cochanges(
                 confidence: entry.confidence,
                 co_changes: entry.co_changes,
                 denominator: entry.denominator,
+                evidence: entry.evidence,
             })
         } else {
             None

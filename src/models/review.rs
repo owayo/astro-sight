@@ -50,6 +50,14 @@ pub struct MissingCochange {
     /// 算出できなかった場合は省略する。
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub denominator: Option<usize>,
+    /// この証拠がどう作られたか。既定の `Blame` (変更行 blame) では省略し、
+    /// ファイル履歴 fallback (`History`) のときだけ出す。
+    ///
+    /// 変更行 blame は「その変更が触った行を誰が最後に書いたか」なので相関が今回の変更に
+    /// 紐づくが、history fallback は「ファイル全体の直近コミット」なので今回の変更内容とは
+    /// 無関係な共変更まで含む。同じ `c` / `n` / `d` でも証拠の強さが違うため区別できるようにする。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub evidence: Option<crate::models::cochange::CoChangeEvidence>,
 }
 
 /// 公開シンボルの変更サマリ。

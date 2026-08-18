@@ -7,6 +7,10 @@ use crate::commands::tests::common::*;
 #[allow(unused_imports)]
 use crate::commands::*;
 #[allow(unused_imports)]
+use crate::engine::cochange::CoChangeExclude;
+#[allow(unused_imports)]
+use crate::models::dependency_files::DEPENDENCY_MANIFEST_LOCK_PAIRS;
+#[allow(unused_imports)]
 use crate::models::review::{
     ApiChanges, ApiSymbol, ApiSymbolChange, CompatibleApiModification, MissingCochange,
     MovedSymbol, PropertyToFieldChange, ReviewResult,
@@ -89,6 +93,49 @@ fn is_dependency_manifest_pair_accepts_same_directory_pairs() {
         "crates/foo/Cargo.toml",
         "crates/foo/Cargo.lock"
     ));
+}
+
+// ------------------------------------------------------------------
+// 正本テーブルと cochange 候補除外の整合
+// ------------------------------------------------------------------
+
+/// 正本テーブル (`DEPENDENCY_MANIFEST_LOCK_PAIRS`) の全ロックファイルが cochange の
+/// 候補除外に一致することを固定する。
+///
+/// 除外を glob 文字列で手並べしていた時代は `uv.lock` / `poetry.lock` / `pdm.lock` /
+/// `Gemfile.lock` / `go.sum` / `mix.lock` の 6 個が抜けており、「Rust / npm では lock の
+/// 誤検出が出ないが Python / Ruby / Go / Elixir では出る」という言語依存の非一貫性に
+/// なっていた。ペアを 1 行足したら除外も追随することをテストで保証する。
+#[test]
+fn cochange_exclude_matches_every_dependency_lock_in_canonical_table() {
+    let exclude = CoChangeExclude::build(&[]).expect("build exclude matcher");
+    for pair in DEPENDENCY_MANIFEST_LOCK_PAIRS {
+        assert!(
+            exclude.is_match(pair.lock),
+            "{} は共変更候補から除外されるべき",
+            pair.lock
+        );
+        // monorepo のサブディレクトリに置かれていても生成物であることは変わらない
+        let nested = format!("apps/web/{}", pair.lock);
+        assert!(exclude.is_match(&nested), "{nested} も除外されるべき");
+    }
+}
+
+/// manifest 自身は engine の候補除外に**含めない**ことを固定する。
+///
+/// manifest は生成物ではなく人が書く宣言なので、standalone `cochange` は
+/// 「過去に一緒に変更された」という事実として出し続ける。review の推奨から外すのは
+/// `detect_missing_cochanges` の policy filter の役割 (責務分離)。
+#[test]
+fn cochange_exclude_keeps_dependency_manifests_as_candidates() {
+    let exclude = CoChangeExclude::build(&[]).expect("build exclude matcher");
+    for pair in DEPENDENCY_MANIFEST_LOCK_PAIRS {
+        assert!(
+            !exclude.is_match(pair.manifest),
+            "{} は engine の候補には残すべき (review 側で落とす)",
+            pair.manifest
+        );
+    }
 }
 
 // ------------------------------------------------------------------
@@ -479,6 +526,160 @@ fn detect_missing_cochanges_review_policy_keeps_well_supported_pairs() {
     assert!(
         missing.iter().any(|m| m.file == "b.rs"),
         "co>=3 の十分な履歴があるペアは review でも検出されるべき。got: {missing:?}"
+    );
+}
+
+// ------------------------------------------------------------------
+// detect_missing_cochanges: 依存宣言ファイル ↔ ソースの条件付き相関を除外する
+// ------------------------------------------------------------------
+
+/// 依存追加を繰り返した履歴を持つリポジトリで、import を 1 行も増減させない
+/// 「関数本体だけの変更」に対して manifest / lock の共変更を要求しないことを固定する。
+///
+/// 依存を追加するコミットでは manifest / lock / ソースが必ず一緒に変わるため履歴相関は
+/// 100% になるが、その相関は「依存を追加したとき」限定の条件付きのもので、本体だけの
+/// 変更には因果が無い (レポート 2026-08-18-cochange-lockfile-without-new-import)。
+///
+/// 対照として、同じ差分で「ソース ↔ ソース」の共変更は引き続き検出されることも
+/// 同時に固定する。除外が広すぎて cochange 全体が黙る状態と区別するため
+/// (対照が無いと「全部落ちている」テストが素通りする)。
+#[test]
+fn detect_missing_cochanges_drops_dependency_manifest_when_only_body_changed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    // 依存宣言 + ロック + ソース + ヘルパーの初期状態。
+    // ヘルパーは「ソース ↔ ソース」の対照ペアを作るために毎回一緒に変更する。
+    let manifest_of = |deps: &str| format!("[project]\nname = \"demo\"\ndependencies = [{deps}]\n");
+    let lock_of = |n: usize| format!("# lock revision {n}\n");
+    let app_of = |imports: &str, body: &str| format!("{imports}\n\ndef run():\n{body}\n");
+    let helper_of = |n: usize| format!("def helper():\n    return {n}\n");
+
+    git_commit_files(
+        repo,
+        &[
+            ("pyproject.toml", &manifest_of("")),
+            ("uv.lock", &lock_of(0)),
+            ("pkg/app.py", &app_of("", "    return 1")),
+            ("pkg/helper.py", &helper_of(0)),
+        ],
+        "initial",
+    );
+
+    // 依存追加を 3 回。毎回 manifest / lock / app / helper が一緒に変わる。
+    let deps = [
+        "\"alpha\"",
+        "\"alpha\", \"beta\"",
+        "\"alpha\", \"beta\", \"gamma\"",
+    ];
+    let imports = [
+        "import alpha",
+        "import alpha\nimport beta",
+        "import alpha\nimport beta\nimport gamma",
+    ];
+    for i in 0..3 {
+        git_commit_files(
+            repo,
+            &[
+                ("pyproject.toml", &manifest_of(deps[i])),
+                ("uv.lock", &lock_of(i + 1)),
+                ("pkg/app.py", &app_of(imports[i], "    return 1")),
+                ("pkg/helper.py", &helper_of(i + 1)),
+            ],
+            &format!("feat: add dependency {i}"),
+        );
+    }
+
+    // 4 つ目の変更 (未コミット): app.py の関数本体だけを書き換える。
+    // import 行は 1 行も増減しないので、依存宣言を触る理由が無い。
+    std::fs::write(
+        repo.join("pkg/app.py"),
+        app_of(
+            imports[2],
+            "    total = 0\n    for i in range(10):\n        total += i\n    return total",
+        ),
+    )
+    .expect("write app.py");
+
+    let service = AppService::new();
+    let mut changed_files = HashSet::new();
+    changed_files.insert("pkg/app.py".to_string());
+
+    let missing = detect_missing_cochanges(
+        &service,
+        repo.to_str().expect("utf-8 path"),
+        &changed_files,
+        0.0,
+        REVIEW_COCHANGE_MIN_SAMPLES,
+        None,
+    )
+    .expect("detect_missing_cochanges should succeed")
+    .missing;
+
+    assert!(
+        missing.iter().all(|m| m.file != "pyproject.toml"),
+        "import 増減の無い本体変更で pyproject.toml を要求してはならない。got: {missing:?}"
+    );
+    assert!(
+        missing.iter().all(|m| m.file != "uv.lock"),
+        "import 増減の無い本体変更で uv.lock を要求してはならない。got: {missing:?}"
+    );
+    // 対照: ソース ↔ ソースの共変更は落とさない
+    assert!(
+        missing.iter().any(|m| m.file == "pkg/helper.py"),
+        "ソース同士の共変更は引き続き検出されるべき (除外が広すぎないことの対照)。got: {missing:?}"
+    );
+}
+
+/// ロックファイルだけを変更した diff (依存更新コマンドの実行) を起点にしても、
+/// 依存追加コミットで一緒に変わっていたソースを共変更相手として要求しないことを固定する。
+///
+/// lock は生成物なので「lock を変えたなら X も変えろ」という推奨に意味が無い。
+/// engine 側の候補除外は相方側にしか効かないため、起点側は review policy で落とす。
+#[test]
+fn detect_missing_cochanges_ignores_lockfile_only_sources() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let lock_of = |n: usize| format!("# lock revision {n}\n");
+    let app_of = |n: usize| format!("def run():\n    return {n}\n");
+
+    git_commit_files(
+        repo,
+        &[("uv.lock", &lock_of(0)), ("pkg/app.py", &app_of(0))],
+        "initial",
+    );
+    for i in 1..=3 {
+        git_commit_files(
+            repo,
+            &[("uv.lock", &lock_of(i)), ("pkg/app.py", &app_of(i))],
+            &format!("feat: dep {i}"),
+        );
+    }
+
+    // uv.lock だけを変更した状態 (uv lock --upgrade 相当)。
+    std::fs::write(repo.join("uv.lock"), lock_of(99)).expect("write uv.lock");
+
+    let service = AppService::new();
+    let mut changed_files = HashSet::new();
+    changed_files.insert("uv.lock".to_string());
+
+    let report = detect_missing_cochanges(
+        &service,
+        repo.to_str().expect("utf-8 path"),
+        &changed_files,
+        0.0,
+        REVIEW_COCHANGE_MIN_SAMPLES,
+        None,
+    )
+    .expect("detect_missing_cochanges should succeed");
+
+    assert!(
+        report.missing.is_empty(),
+        "lock のみの変更では共変更を要求しない。got: {:?}",
+        report.missing
     );
 }
 

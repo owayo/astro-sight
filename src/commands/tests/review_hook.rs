@@ -273,6 +273,7 @@ fn build_review_hook_json_cochange_only_is_informational() {
             confidence: 0.9,
             co_changes: 9,
             denominator: Some(10),
+            evidence: None,
         }],
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
@@ -308,6 +309,60 @@ fn build_review_hook_json_cochange_only_is_informational() {
     assert_eq!(entry["c"], 90, "confidence は百分率");
     assert_eq!(entry["n"], 9, "共変更コミット数 (分子) を併記する");
     assert_eq!(entry["d"], 10, "集計対象コミット数 (分母) を併記する");
+    assert!(
+        entry.get("e").is_none(),
+        "変更行 blame (既定) では証拠種別を省略して出力を短く保つ"
+    );
+}
+
+/// ファイル履歴 fallback で作った証拠は `e: "history"` として区別できるようにする。
+///
+/// 変更行 blame は「今回触った行の履歴」なので相関が今回の変更に紐づくが、history
+/// fallback は「ファイル全体の直近コミット」なので今回の変更内容と無関係な共変更まで
+/// 含む。同じ `c` / `n` / `d` でも証拠の強さが違うため、トリアージがそこを読めるようにする。
+#[test]
+fn build_review_hook_json_cochange_marks_history_evidence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let result = ReviewResult {
+        impact: crate::models::impact::ContextResult {
+            changes: Vec::new(),
+            skipped: None,
+            truncations: Vec::new(),
+        },
+        missing_cochanges: vec![MissingCochange {
+            file: "a.rs".to_string(),
+            expected_with: "b.rs".to_string(),
+            confidence: 1.0,
+            co_changes: 3,
+            denominator: Some(3),
+            evidence: Some(crate::models::cochange::CoChangeEvidence::History),
+        }],
+        cochange_diagnostics: Default::default(),
+        api_changes: ApiChanges {
+            added: Vec::new(),
+            removed: Vec::new(),
+            modified: Vec::new(),
+            moved: Vec::new(),
+            property_to_field: Vec::new(),
+            removed_dead: Vec::new(),
+            modified_closed_in_diff: Vec::new(),
+            const_value_changes: Vec::new(),
+            compatible_modified: Vec::new(),
+        },
+        dead_symbols: Vec::new(),
+        test_only_symbols: Vec::new(),
+        skipped: None,
+        truncations: Vec::new(),
+    };
+
+    let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
+    let entry = build.value.expect("hook JSON")["cochange"][0].clone();
+    assert_eq!(
+        entry["e"], "history",
+        "履歴 fallback 由来の証拠は e で区別できるべき"
+    );
+    assert!(!build.is_blocking, "cochange は informational のまま");
 }
 
 /// 分母が算出できなかった missing_cochange では `d` を省略する
@@ -327,6 +382,7 @@ fn build_review_hook_json_cochange_omits_denominator_when_unknown() {
             confidence: 1.0,
             co_changes: 3,
             denominator: None,
+            evidence: None,
         }],
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
