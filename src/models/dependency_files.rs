@@ -1,4 +1,4 @@
-//! 依存宣言ファイル (manifest) とロックファイルの正本テーブル。
+//! 依存宣言ファイル (manifest) / ロックファイル / 対象言語の正本テーブル。
 //!
 //! 同じ集合を 2 箇所で持つと片方だけ更新されて「言語によって挙動が違う」形で静かに
 //! 壊れる。実際に `BLAME_DEFAULT_EXCLUDE_GLOBS` (cochange エンジンの候補除外) と
@@ -8,65 +8,68 @@
 //! Python / Ruby / Go / Elixir だけ出るという非一貫性)。
 //!
 //! このモジュールを唯一の正本とし、glob 文字列ではなく「ファイルの意味」で判定する。
-//! ペアを 1 行足せば候補除外もペア判定も同時に追随する。
+//! ecosystem を 1 行足せば候補除外・ペア判定・review policy が同時に追随する。
 
-/// 依存宣言ファイルと、それに対応するロックファイルの組。
+use crate::language::LangId;
+
+/// 1 つのパッケージ管理エコシステム。
+///
+/// `langs` は「その manifest が依存を宣言する対象言語」。依存宣言ファイルとソースの
+/// 共変更を評価するときに ecosystem をまたいだ組 (`Cargo.toml` ↔ `tools/release.py` 等) を
+/// 弾くために使う。astro-sight が解析しない言語のエコシステム (Elixir 等) は空スライスで、
+/// その場合ソース側の判定が成立しないため組は作られない。
 #[derive(Debug, Clone, Copy)]
-pub struct DependencyManifestLock {
+pub struct DependencyEcosystem {
     /// 人が編集する依存宣言ファイル (`Cargo.toml` / `pyproject.toml` 等)。
     pub manifest: &'static str,
-    /// パッケージマネージャが生成するロックファイル (`Cargo.lock` / `uv.lock` 等)。
-    pub lock: &'static str,
+    /// パッケージマネージャが生成するロックファイル。同一 manifest に複数あり得る
+    /// (`package.json` に対する npm / pnpm / yarn)。
+    pub locks: &'static [&'static str],
+    /// この manifest が依存を宣言する対象言語。
+    pub langs: &'static [LangId],
 }
 
-/// 依存マニフェストとロックファイルの既知ペア。
+/// 依存マニフェスト / ロックファイル / 対象言語の既知エコシステム。
 ///
-/// `cargo update` や `npm install` のように片側のみが変更される正規操作が頻繁に発生するため、
-/// 共変更の警告対象としては扱わない。
-pub const DEPENDENCY_MANIFEST_LOCK_PAIRS: &[DependencyManifestLock] = &[
-    DependencyManifestLock {
+/// lock は `cargo update` や `npm install` のように片側のみが変更される正規操作が頻繁に
+/// 発生するため、共変更の警告対象としては扱わない。
+pub const DEPENDENCY_ECOSYSTEMS: &[DependencyEcosystem] = &[
+    DependencyEcosystem {
         manifest: "Cargo.toml",
-        lock: "Cargo.lock",
+        locks: &["Cargo.lock"],
+        langs: &[LangId::Rust],
     },
-    DependencyManifestLock {
+    DependencyEcosystem {
         manifest: "package.json",
-        lock: "package-lock.json",
+        locks: &["package-lock.json", "pnpm-lock.yaml", "yarn.lock"],
+        langs: &[LangId::Javascript, LangId::Typescript, LangId::Tsx],
     },
-    DependencyManifestLock {
-        manifest: "package.json",
-        lock: "pnpm-lock.yaml",
-    },
-    DependencyManifestLock {
-        manifest: "package.json",
-        lock: "yarn.lock",
-    },
-    DependencyManifestLock {
+    DependencyEcosystem {
         manifest: "pyproject.toml",
-        lock: "uv.lock",
+        locks: &["uv.lock", "poetry.lock", "pdm.lock"],
+        langs: &[LangId::Python],
     },
-    DependencyManifestLock {
-        manifest: "pyproject.toml",
-        lock: "poetry.lock",
-    },
-    DependencyManifestLock {
-        manifest: "pyproject.toml",
-        lock: "pdm.lock",
-    },
-    DependencyManifestLock {
+    DependencyEcosystem {
         manifest: "Gemfile",
-        lock: "Gemfile.lock",
+        locks: &["Gemfile.lock"],
+        langs: &[LangId::Ruby],
     },
-    DependencyManifestLock {
+    DependencyEcosystem {
         manifest: "composer.json",
-        lock: "composer.lock",
+        locks: &["composer.lock"],
+        langs: &[LangId::Php],
     },
-    DependencyManifestLock {
+    DependencyEcosystem {
         manifest: "go.mod",
-        lock: "go.sum",
+        locks: &["go.sum"],
+        langs: &[LangId::Go],
     },
-    DependencyManifestLock {
+    DependencyEcosystem {
+        // Elixir は astro-sight の解析対象外なので langs は空。
+        // lock の候補除外だけが効く (mix.lock は生成物なので言語に依らず除外して良い)。
         manifest: "mix.exs",
-        lock: "mix.lock",
+        locks: &["mix.lock"],
+        langs: &[],
     },
 ];
 
@@ -85,9 +88,9 @@ pub fn is_dependency_lock_path(path: &str) -> bool {
     let Some(base) = base_name(path) else {
         return false;
     };
-    DEPENDENCY_MANIFEST_LOCK_PAIRS
+    DEPENDENCY_ECOSYSTEMS
         .iter()
-        .any(|p| p.lock == base)
+        .any(|eco| eco.locks.contains(&base))
 }
 
 /// パスが依存宣言ファイル (人が編集する manifest) なら true。
@@ -95,9 +98,15 @@ pub fn is_dependency_manifest_path(path: &str) -> bool {
     let Some(base) = base_name(path) else {
         return false;
     };
-    DEPENDENCY_MANIFEST_LOCK_PAIRS
+    DEPENDENCY_ECOSYSTEMS.iter().any(|eco| eco.manifest == base)
+}
+
+/// パスが属するエコシステムを返す。manifest でも lock でもなければ `None`。
+pub fn ecosystem_for_path(path: &str) -> Option<&'static DependencyEcosystem> {
+    let base = base_name(path)?;
+    DEPENDENCY_ECOSYSTEMS
         .iter()
-        .any(|p| p.manifest == base)
+        .find(|eco| eco.manifest == base || eco.locks.contains(&base))
 }
 
 /// 2 つのパスが既知の依存マニフェスト/ロックペアであれば true を返す。
@@ -116,7 +125,20 @@ pub fn is_dependency_manifest_pair(file_a: &str, file_b: &str) -> bool {
     if path_a.parent() != path_b.parent() {
         return false;
     }
-    DEPENDENCY_MANIFEST_LOCK_PAIRS.iter().any(|p| {
-        (base_a == p.manifest && base_b == p.lock) || (base_a == p.lock && base_b == p.manifest)
+    DEPENDENCY_ECOSYSTEMS.iter().any(|eco| {
+        (base_a == eco.manifest && eco.locks.contains(&base_b))
+            || (base_b == eco.manifest && eco.locks.contains(&base_a))
     })
+}
+
+/// 依存宣言ファイル (manifest / lock) が、そのソースファイルを配下に持つ位置にあるか。
+///
+/// monorepo で `apps/web/package.json` と `apps/api/src/main.ts` のように別プロジェクトの
+/// 組が作られるのを防ぐ。manifest がリポジトリルートにある場合 (parent が空) は
+/// 全ソースの祖先として扱う。
+pub fn declaration_covers_source(declaration_path: &str, source_path: &str) -> bool {
+    let Some(dir) = std::path::Path::new(declaration_path).parent() else {
+        return false;
+    };
+    std::path::Path::new(source_path).starts_with(dir)
 }

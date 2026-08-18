@@ -14,13 +14,15 @@ use crate::service::AppService;
 // (cochange エンジンの候補除外と同じ集合を使うため)。ここでは判定関数を再エクスポートして
 // 既存の呼び出し側・テストのパスを保つ。
 pub(crate) use crate::models::dependency_files::is_dependency_manifest_pair;
-use crate::models::dependency_files::{is_dependency_lock_path, is_dependency_manifest_path};
+use crate::models::dependency_files::{
+    declaration_covers_source, ecosystem_for_path, is_dependency_lock_path,
+};
 
 /// 「依存宣言ファイル ↔ その言語のソースファイル」の履歴相関を warning から外すか判定する。
 ///
 /// 依存を追加するコミットでは manifest / lock とソースが必ず一緒に変わるため、依存追加を
 /// 数回繰り返したリポジトリでは両者の共変更率が 100% になる。しかしこの相関は
-/// 「依存を追加したとき」という条件付きのもので、既存関数の本体だけを書き換える変更
+/// 「依存を追加したとき」限定のもので、既存関数の本体だけを書き換える変更
 /// (import を 1 行も増減させない) には因果が無い。それでも履歴頻度だけを根拠に
 /// 「manifest も直せ」と要求していた (実測: import 増減ゼロの差分で confidence 100%)。
 ///
@@ -28,21 +30,59 @@ use crate::models::dependency_files::{is_dependency_lock_path, is_dependency_man
 /// 除外しない。review の `missing_cochanges` は「今回も変更すべき」という推奨へ変換する
 /// 場所なので、因果の弱いペアはここで落とす (責務分離)。
 ///
+/// 除外はエコシステムとプロジェクト境界の**両方**が一致する組に限る:
+/// - ソースの言語が manifest の宣言対象言語に含まれること
+///   (`Cargo.toml` ↔ `tools/release.py` のような別 ecosystem 間の相関は暗黙の結合かも
+///   しれないので落とさない)
+/// - manifest がそのソースを配下に持つ位置にあること
+///   (monorepo の `apps/web/package.json` ↔ `apps/api/src/main.ts` は別プロジェクト)
+///
 /// 「依存を追加したのに manifest を更新し忘れた」の検出は履歴相関の仕事ではなく、
 /// import と依存宣言を突き合わせる別の解析が担うべき問題。差分から「新規の外部 import が
 /// あるか」を全 16 言語で判定する案は採らない — import 名と配布パッケージ名は一致せず
 /// (Python)、標準ライブラリ判定は処理系バージョンに依存し、feature / plugin / build 依存は
 /// import に現れず、既存 import を新たな実行経路へ載せる変更も拾えないため、
 /// 「net-new import が無い」は依存が変わっていないことの証明にならない。
-fn is_dependency_declaration_vs_source(file_a: &str, file_b: &str) -> bool {
-    let is_dep = |p: &str| is_dependency_manifest_path(p) || is_dependency_lock_path(p);
-    let is_source = |p: &str| {
-        crate::language::LangId::from_path(camino::Utf8Path::new(p)).is_ok()
-            // manifest 自体が解析対象言語 (pyproject.toml など) に解決されることはないが、
-            // 将来の言語追加で重なっても依存宣言側の判定を優先する。
-            && !is_dep(p)
+fn is_dependency_declaration_vs_source(dir: &str, file_a: &str, file_b: &str) -> bool {
+    let paired = |declaration: &str, source: &str| {
+        let Some(eco) = ecosystem_for_path(declaration) else {
+            return false;
+        };
+        // 依存宣言ファイル同士 (manifest ↔ lock、または別 ecosystem の manifest 同士) は
+        // ここでは扱わない (前段の `is_dependency_manifest_pair` の担当)。
+        if ecosystem_for_path(source).is_some() {
+            return false;
+        }
+        let Some(lang) = resolve_source_lang(dir, source) else {
+            return false;
+        };
+        eco.langs.contains(&lang) && declaration_covers_source(declaration, source)
     };
-    (is_dep(file_a) && is_source(file_b)) || (is_dep(file_b) && is_source(file_a))
+    paired(file_a, file_b) || paired(file_b, file_a)
+}
+
+/// ソースファイルの言語を解決する。拡張子で決まらない場合だけ先頭行の shebang を見る。
+///
+/// `bin/tool` のような拡張子なしスクリプトは astro-sight の通常解析では shebang から
+/// Python / Bash として扱われる。ここで拡張子だけを見ると source と認識できず、
+/// 同じ依存追加履歴を持つ `pyproject.toml ↔ bin/tool` の誤検出が残る。
+/// 読み込み失敗は `None` = 「除外しない」に倒す (従来どおり警告が出るだけで、
+/// 警告を消す方向へは倒さない)。
+fn resolve_source_lang(dir: &str, source: &str) -> Option<crate::language::LangId> {
+    let path = camino::Utf8Path::new(source);
+    if let Ok(lang) = crate::language::LangId::from_path(path) {
+        return Some(lang);
+    }
+    // 拡張子で決まらないものだけディスクを見る。cochange の候補数は
+    // per_source_limit で絞られており、読むのは先頭 1 行だけ。
+    use std::io::BufRead;
+    let full = std::path::Path::new(dir).join(source);
+    let file = std::fs::File::open(full).ok()?;
+    let mut first_line = String::new();
+    std::io::BufReader::new(file)
+        .read_line(&mut first_line)
+        .ok()?;
+    crate::language::LangId::from_shebang(first_line.trim_end())
 }
 
 /// review の missing_cochanges が要求する既定の最小共変更回数。
@@ -158,7 +198,7 @@ pub(crate) fn detect_missing_cochanges(
         }
         // 依存宣言ファイル ↔ ソースの履歴相関は「依存を追加したとき」限定の条件付き相関で、
         // 本体だけの変更には因果が無いため review の推奨からは外す。
-        if is_dependency_declaration_vs_source(&entry.file_a, &entry.file_b) {
+        if is_dependency_declaration_vs_source(dir, &entry.file_a, &entry.file_b) {
             continue;
         }
 

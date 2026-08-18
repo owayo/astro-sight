@@ -9,7 +9,7 @@ use crate::commands::*;
 #[allow(unused_imports)]
 use crate::engine::cochange::CoChangeExclude;
 #[allow(unused_imports)]
-use crate::models::dependency_files::DEPENDENCY_MANIFEST_LOCK_PAIRS;
+use crate::models::dependency_files::DEPENDENCY_ECOSYSTEMS;
 #[allow(unused_imports)]
 use crate::models::review::{
     ApiChanges, ApiSymbol, ApiSymbolChange, CompatibleApiModification, MissingCochange,
@@ -109,15 +109,21 @@ fn is_dependency_manifest_pair_accepts_same_directory_pairs() {
 #[test]
 fn cochange_exclude_matches_every_dependency_lock_in_canonical_table() {
     let exclude = CoChangeExclude::build(&[]).expect("build exclude matcher");
-    for pair in DEPENDENCY_MANIFEST_LOCK_PAIRS {
+    for eco in DEPENDENCY_ECOSYSTEMS {
         assert!(
-            exclude.is_match(pair.lock),
-            "{} は共変更候補から除外されるべき",
-            pair.lock
+            !eco.locks.is_empty(),
+            "{} に lock が 1 つも無いのは表の記述漏れ",
+            eco.manifest
         );
-        // monorepo のサブディレクトリに置かれていても生成物であることは変わらない
-        let nested = format!("apps/web/{}", pair.lock);
-        assert!(exclude.is_match(&nested), "{nested} も除外されるべき");
+        for lock in eco.locks {
+            assert!(
+                exclude.is_match(lock),
+                "{lock} は共変更候補から除外されるべき"
+            );
+            // monorepo のサブディレクトリに置かれていても生成物であることは変わらない
+            let nested = format!("apps/web/{lock}");
+            assert!(exclude.is_match(&nested), "{nested} も除外されるべき");
+        }
     }
 }
 
@@ -129,11 +135,34 @@ fn cochange_exclude_matches_every_dependency_lock_in_canonical_table() {
 #[test]
 fn cochange_exclude_keeps_dependency_manifests_as_candidates() {
     let exclude = CoChangeExclude::build(&[]).expect("build exclude matcher");
-    for pair in DEPENDENCY_MANIFEST_LOCK_PAIRS {
+    for eco in DEPENDENCY_ECOSYSTEMS {
         assert!(
-            !exclude.is_match(pair.manifest),
+            !exclude.is_match(eco.manifest),
             "{} は engine の候補には残すべき (review 側で落とす)",
-            pair.manifest
+            eco.manifest
+        );
+    }
+}
+
+/// 解析対象言語を持つエコシステムでは `langs` が空でないことを固定する。
+///
+/// `langs` が空だと「依存宣言 ↔ ソース」の除外が成立しないため、記述漏れは
+/// 「除外が効かない = 誤検出が残る」という無害に見える壊れ方をする。astro-sight が
+/// 解析しない言語 (Elixir の mix.exs) だけを空の例外として明示する。
+#[test]
+fn dependency_ecosystems_declare_target_langs_except_unsupported() {
+    for eco in DEPENDENCY_ECOSYSTEMS {
+        if eco.manifest == "mix.exs" {
+            assert!(
+                eco.langs.is_empty(),
+                "Elixir は解析対象外なので langs は空のまま"
+            );
+            continue;
+        }
+        assert!(
+            !eco.langs.is_empty(),
+            "{} は対象言語を宣言すべき (空だと依存宣言↔ソースの除外が効かない)",
+            eco.manifest
         );
     }
 }
@@ -629,6 +658,208 @@ fn detect_missing_cochanges_drops_dependency_manifest_when_only_body_changed() {
     assert!(
         missing.iter().any(|m| m.file == "pkg/helper.py"),
         "ソース同士の共変更は引き続き検出されるべき (除外が広すぎないことの対照)。got: {missing:?}"
+    );
+}
+
+/// 別エコシステムの依存宣言 ↔ ソースの相関は落とさないことを固定する。
+///
+/// `Cargo.toml`(Rust の依存宣言) と `tools/release.py`(Python) が毎回一緒に変わっているのは
+/// 依存追加による交絡ではなく、別種の暗黙の結合 (リリース手順とバージョン定義など) の可能性が
+/// ある。ecosystem 一致を要求せずに落とすと、cochange 本来の目的
+/// (呼び出し規約以外の暗黙の結合を拾う) を構造的に削ってしまう。
+#[test]
+fn detect_missing_cochanges_keeps_cross_ecosystem_manifest_pairs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let manifest_of = |v: usize| format!("[package]\nname = \"demo\"\nversion = \"0.{v}.0\"\n");
+    let script_of =
+        |v: usize| format!("VERSION = \"0.{v}.0\"\n\n\ndef release():\n    return VERSION\n");
+    let lib_of = |n: usize| format!("pub fn run() -> i32 {{\n    {n}\n}}\n");
+
+    git_commit_files(
+        repo,
+        &[
+            ("Cargo.toml", &manifest_of(0)),
+            ("tools/release.py", &script_of(0)),
+            ("src/lib.rs", &lib_of(0)),
+        ],
+        "initial",
+    );
+    // Cargo.toml と tools/release.py が 3 回一緒に変わる (src/lib.rs も起点として動かす)
+    for i in 1..=3 {
+        git_commit_files(
+            repo,
+            &[
+                ("Cargo.toml", &manifest_of(i)),
+                ("tools/release.py", &script_of(i)),
+                ("src/lib.rs", &lib_of(i)),
+            ],
+            &format!("release 0.{i}.0"),
+        );
+    }
+
+    std::fs::write(repo.join("src/lib.rs"), lib_of(99)).expect("write lib.rs");
+
+    let service = AppService::new();
+    let mut changed_files = HashSet::new();
+    changed_files.insert("src/lib.rs".to_string());
+
+    let missing = detect_missing_cochanges(
+        &service,
+        repo.to_str().expect("utf-8 path"),
+        &changed_files,
+        0.0,
+        REVIEW_COCHANGE_MIN_SAMPLES,
+        None,
+    )
+    .expect("detect_missing_cochanges should succeed")
+    .missing;
+
+    // Cargo.toml (Rust の依存宣言) ↔ src/lib.rs (Rust) は同一 ecosystem なので落ちる
+    assert!(
+        missing.iter().all(|m| m.file != "Cargo.toml"),
+        "同一 ecosystem の manifest は落とす。got: {missing:?}"
+    );
+    // tools/release.py は Rust の依存宣言と ecosystem が違うので残る
+    assert!(
+        missing.iter().any(|m| m.file == "tools/release.py"),
+        "別 ecosystem のファイルとの相関は残すべき。got: {missing:?}"
+    );
+}
+
+/// monorepo で別プロジェクトの manifest ↔ ソースの組を落とさないことを固定する。
+///
+/// `apps/web/package.json` は `apps/api/` 配下のソースの依存を宣言していないため、
+/// 両者の相関は依存追加による交絡ではない (別プロジェクトが同時にリリースされる等の
+/// 別の結合)。祖先ディレクトリ制約が無いと ecosystem が一致するだけで落ちてしまう。
+#[test]
+fn detect_missing_cochanges_keeps_manifest_outside_source_project() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let manifest_of =
+        |v: usize| format!("{{\n  \"name\": \"web\",\n  \"version\": \"0.{v}.0\"\n}}\n");
+    let api_of = |n: usize| format!("export function handler(): number {{\n  return {n};\n}}\n");
+
+    git_commit_files(
+        repo,
+        &[
+            ("apps/web/package.json", &manifest_of(0)),
+            ("apps/api/src/main.ts", &api_of(0)),
+        ],
+        "initial",
+    );
+    for i in 1..=3 {
+        git_commit_files(
+            repo,
+            &[
+                ("apps/web/package.json", &manifest_of(i)),
+                ("apps/api/src/main.ts", &api_of(i)),
+            ],
+            &format!("bump {i}"),
+        );
+    }
+
+    std::fs::write(repo.join("apps/api/src/main.ts"), api_of(99)).expect("write main.ts");
+
+    let service = AppService::new();
+    let mut changed_files = HashSet::new();
+    changed_files.insert("apps/api/src/main.ts".to_string());
+
+    let missing = detect_missing_cochanges(
+        &service,
+        repo.to_str().expect("utf-8 path"),
+        &changed_files,
+        0.0,
+        REVIEW_COCHANGE_MIN_SAMPLES,
+        None,
+    )
+    .expect("detect_missing_cochanges should succeed")
+    .missing;
+
+    assert!(
+        missing.iter().any(|m| m.file == "apps/web/package.json"),
+        "別プロジェクトの manifest との相関は残すべき (祖先でないため)。got: {missing:?}"
+    );
+}
+
+/// 拡張子を持たない shebang スクリプトも「ソース」として扱い、manifest の共変更要求を
+/// 落とすことを固定する。
+///
+/// `bin/tool` のような拡張子なし Python スクリプトは astro-sight の通常解析では shebang から
+/// Python として扱われる。拡張子だけで判定すると source と認識できず、同じ依存追加履歴を
+/// 持つ `pyproject.toml ↔ bin/tool` の誤検出が残る。
+#[test]
+fn detect_missing_cochanges_treats_shebang_script_as_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let manifest_of = |deps: &str| format!("[project]\nname = \"demo\"\ndependencies = [{deps}]\n");
+    let tool_of = |imports: &str, body: &str| {
+        format!("#!/usr/bin/env python3\n{imports}\n\ndef main():\n{body}\n")
+    };
+
+    git_commit_files(
+        repo,
+        &[
+            ("pyproject.toml", &manifest_of("")),
+            ("bin/tool", &tool_of("", "    return 1")),
+        ],
+        "initial",
+    );
+    let deps = [
+        "\"alpha\"",
+        "\"alpha\", \"beta\"",
+        "\"alpha\", \"beta\", \"gamma\"",
+    ];
+    let imports = [
+        "import alpha",
+        "import alpha\nimport beta",
+        "import alpha\nimport beta\nimport gamma",
+    ];
+    for i in 0..3 {
+        git_commit_files(
+            repo,
+            &[
+                ("pyproject.toml", &manifest_of(deps[i])),
+                ("bin/tool", &tool_of(imports[i], "    return 1")),
+            ],
+            &format!("feat: dep {i}"),
+        );
+    }
+
+    // 本体だけ変更 (import 行の増減なし)
+    std::fs::write(
+        repo.join("bin/tool"),
+        tool_of(
+            imports[2],
+            "    total = 0\n    for i in range(3):\n        total += i\n    return total",
+        ),
+    )
+    .expect("write bin/tool");
+
+    let service = AppService::new();
+    let mut changed_files = HashSet::new();
+    changed_files.insert("bin/tool".to_string());
+
+    let missing = detect_missing_cochanges(
+        &service,
+        repo.to_str().expect("utf-8 path"),
+        &changed_files,
+        0.0,
+        REVIEW_COCHANGE_MIN_SAMPLES,
+        None,
+    )
+    .expect("detect_missing_cochanges should succeed")
+    .missing;
+
+    assert!(
+        missing.iter().all(|m| m.file != "pyproject.toml"),
+        "shebang スクリプトもソースとして扱い manifest を要求しない。got: {missing:?}"
     );
 }
 
