@@ -1097,6 +1097,38 @@ fn detect_missing_cochanges_shebang_probe_survives_multibyte_boundary() {
     );
 }
 
+/// 途中に不正バイトを含むファイルは shebang 判定の対象にしない (言語解決しない)。
+///
+/// `valid_up_to()` の prefix を無条件に使うと `#!/usr/bin/env python3\xff...` の
+/// `\xff` より前が `from_shebang` に渡って Python と判定され、通常の言語検出が不正 UTF-8 を
+/// 拒否する挙動と食い違う。加えて manifest ↔ source 警告を誤って抑制する。
+/// 256 バイト境界での**未完のマルチバイト列** (`error_len() == None`) だけを許容する。
+#[test]
+fn resolve_source_lang_rejects_invalid_utf8_in_first_line() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+
+    // 先頭行の途中に不正バイト 0xff を置く (境界切断ではなく本当に壊れている)
+    let mut broken = b"#!/usr/bin/env python3".to_vec();
+    broken.push(0xff);
+    broken.extend_from_slice(b" tail\n\nprint(1)\n");
+    std::fs::write(repo.join("broken"), &broken).expect("write broken");
+    // 対照: 同じ shebang で不正バイトが無いもの
+    std::fs::write(repo.join("valid"), b"#!/usr/bin/env python3\n\nprint(1)\n")
+        .expect("write valid");
+
+    let dir_str = repo.to_str().expect("utf-8 path");
+    assert!(
+        resolve_source_lang_for_test(dir_str, "broken").is_none(),
+        "先頭行の途中に不正バイトがあるファイルは言語解決しない"
+    );
+    assert_eq!(
+        resolve_source_lang_for_test(dir_str, "valid"),
+        Some(crate::language::LangId::Python),
+        "不正バイトが無ければ shebang から解決できる (対照)"
+    );
+}
+
 /// symlink 経由のソースは shebang 判定の対象にしないことを固定する。
 ///
 /// `symlink_metadata` で確認してから `File::open` する実装ではその間に実体を差し替えられる

@@ -127,7 +127,15 @@ fn resolve_source_lang(dir: &str, source: &str) -> Option<crate::language::LangI
     let line_bytes = &head[..line_end];
     let first_line = match std::str::from_utf8(line_bytes) {
         Ok(text) => text,
-        Err(err) => std::str::from_utf8(&line_bytes[..err.valid_up_to()]).unwrap_or(""),
+        // `error_len() == None` は「入力の末尾でマルチバイト列が未完」= 256 バイトで切った
+        // せいで壊れたケースなので、valid prefix を使って判定を続ける。
+        // `Some(_)` は列の途中に不正バイトがある本当に壊れたファイルなので `None` に倒す
+        // (`#!/usr/bin/env python3\xff...` を Python と判定してしまうと、通常の言語検出が
+        // 不正 UTF-8 を拒否する挙動と食い違い、manifest↔source 警告を誤って抑制する)。
+        Err(err) if err.error_len().is_none() => {
+            std::str::from_utf8(&line_bytes[..err.valid_up_to()]).unwrap_or("")
+        }
+        Err(_) => return None,
     };
     crate::language::LangId::from_shebang(first_line.trim_end())
 }
@@ -136,9 +144,9 @@ fn resolve_source_lang(dir: &str, source: &str) -> Option<crate::language::LangI
 ///
 /// **open と検証を一体化する**のが要点。`symlink_metadata` で確認してから `File::open` すると
 /// その間に通常ファイルを symlink / FIFO へ差し替えられ、open がパスを再解決してしまう
-/// (TOCTOU)。ここでは Unix では `O_NOFOLLOW | O_NONBLOCK` で開いて symlink を拒否し
-/// FIFO でブロックしないようにしたうえで、**開いた descriptor 自身**の metadata で
-/// regular file を確認する。非 Unix でも descriptor 経由で確認する。
+/// (TOCTOU)。Unix では `O_NOFOLLOW | O_NONBLOCK`、Windows では
+/// `FILE_FLAG_OPEN_REPARSE_POINT` で「リンクを辿らずに開く」ことを指定したうえで、
+/// **開いた descriptor 自身**の metadata で regular file を確認する。
 ///
 /// 失敗はすべて `None` = 「除外しない」に倒す。
 fn read_probe_head(path: &std::path::Path) -> Option<Vec<u8>> {
@@ -151,7 +159,21 @@ fn read_probe_head(path: &std::path::Path) -> Option<Vec<u8>> {
         use std::os::unix::fs::OpenOptionsExt;
         // O_NOFOLLOW: symlink 自体を開こうとしてエラーにする (差し替えを検出)
         // O_NONBLOCK: FIFO / デバイスを開く際に無期限ブロックしない
+        //
+        // 拒否できるのは**最終コンポーネント**の symlink だけ。祖先ディレクトリの symlink まで
+        // 弾くには component-wise な `openat` が必要だが、ここで扱うパスは git 由来かつ
+        // `dir` 配下に制限された相対パスなので、その範囲は要件に含めない。
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT (0x0020_0000): reparse point (symlink / junction) を
+        // 辿らずそれ自体を開く。付けないと通常の open がリンク先を解決してしまい、
+        // 後段の descriptor metadata 検査もリンク先を見るため symlink を受理してしまう。
+        // 開けた場合も metadata の file_type が regular file にならないので下で弾かれる。
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = options.open(path).ok()?;
     // descriptor 自身の型を見るのでパス再解決による差し替えを受けない。

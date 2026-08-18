@@ -20,9 +20,6 @@ dhat = { version = "0.3.3", optional = true }
 dirs = "6.0.0"
 hashbrown = "0.17.1"
 ignore = "0.4.33"
-# Unix の O_NOFOLLOW / O_NONBLOCK を指定して symlink 差し替え (TOCTOU) と
-# FIFO の open ブロックを避けるために使う (dev-dependencies から昇格)。
-libc = "0.2.189"
 logroller = "0.1.12"
 lru = "0.18.2"
 memchr = "2.8.3"
@@ -59,6 +56,12 @@ tree-sitter-rust = "0.24.2"
 tree-sitter-swift = "0.7.3"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-zig = "1.1.2"
+
+# `O_NOFOLLOW` / `O_NONBLOCK` を指定して symlink 差し替え (TOCTOU) と FIFO の open ブロックを
+# 避けるために使う。Windows は `FILE_FLAG_OPEN_REPARSE_POINT` を自前定義するので不要なため、
+# 全ターゲット依存にはしない。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
 
 [features]
 # `cargo run --release --features dhat-heap -- <args>` でヒーププロファイルを
