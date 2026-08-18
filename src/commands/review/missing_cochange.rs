@@ -34,8 +34,11 @@ use crate::models::dependency_files::{
 /// - ソースの言語が manifest の宣言対象言語に含まれること
 ///   (`Cargo.toml` ↔ `tools/release.py` のような別 ecosystem 間の相関は暗黙の結合かも
 ///   しれないので落とさない)
-/// - manifest がそのソースを配下に持つ位置にあること
-///   (monorepo の `apps/web/package.json` ↔ `apps/api/src/main.ts` は別プロジェクト)
+/// - manifest がそのソースにとって**最も近い**宣言元であること
+///   (monorepo の `apps/web/package.json` ↔ `apps/api/src/main.ts` は祖先でないので別プロジェクト。
+///   さらにルート `package.json` と `apps/api/package.json` が併存する場合、
+///   `apps/api/src/main.ts` の宣言元は近い方だけ＝ルート manifest との相関は本物の暗黙の結合
+///   かもしれないので落とさない)
 ///
 /// 「依存を追加したのに manifest を更新し忘れた」の検出は履歴相関の仕事ではなく、
 /// import と依存宣言を突き合わせる別の解析が担うべき問題。差分から「新規の外部 import が
@@ -56,12 +59,52 @@ fn is_dependency_declaration_vs_source(dir: &str, file_a: &str, file_b: &str) ->
         let Some(lang) = resolve_source_lang(dir, source) else {
             return false;
         };
-        eco.langs.contains(&lang) && declaration_covers_source(declaration, source)
+        eco.langs.contains(&lang)
+            && declaration_covers_source(declaration, source)
+            && is_nearest_declaration(dir, eco, declaration, source)
     };
     paired(file_a, file_b) || paired(file_b, file_a)
 }
 
-/// ソースファイルの言語を解決する。拡張子で決まらない場合だけ先頭行の shebang を見る。
+/// 依存宣言ファイルが、そのソースにとって「最も近い」宣言元かを判定する。
+///
+/// 祖先であることだけを条件にすると、ルート `package.json` と `apps/api/package.json` が
+/// 併存する monorepo で、ルート manifest を `apps/api/src/main.ts` の宣言元として扱ってしまう。
+/// その結果ルート manifest との**本物の**暗黙の結合 (workspace 全体のツール設定変更など) まで
+/// 消える。ソースのディレクトリから上へ辿り、最初に見つかった同一 ecosystem の manifest が
+/// 与えられた declaration と同じ階層にあるときだけ真とする。
+///
+/// manifest が実在しない (削除済み / lock だけが残っている) 場合は false = 「除外しない」に
+/// 倒す＝警告を消す方向へは倒さない。
+fn is_nearest_declaration(
+    dir: &str,
+    eco: &crate::models::dependency_files::DependencyEcosystem,
+    declaration: &str,
+    source: &str,
+) -> bool {
+    let root = std::path::Path::new(dir);
+    let decl_dir = std::path::Path::new(declaration).parent();
+    let mut cur = std::path::Path::new(source).parent();
+    while let Some(d) = cur {
+        if root.join(d).join(eco.manifest).is_file() {
+            return Some(d) == decl_dir;
+        }
+        if d.as_os_str().is_empty() {
+            break;
+        }
+        cur = d.parent();
+    }
+    false
+}
+
+/// shebang 行の読み込み上限 (バイト)。
+///
+/// `read_line` は改行までいくらでも `String` を伸ばすため、改行を含まない巨大ファイル
+/// (minified bundle / バイナリ相当の生成物) を掴むとメモリを大きく食う。shebang は
+/// `#!/usr/bin/env python3` 程度なので 256 バイトで十分。
+const SHEBANG_PROBE_BYTES: u64 = 256;
+
+/// ソースファイルの言語を解決する。拡張子で決まらない場合だけ先頭の shebang を見る。
 ///
 /// `bin/tool` のような拡張子なしスクリプトは astro-sight の通常解析では shebang から
 /// Python / Bash として扱われる。ここで拡張子だけを見ると source と認識できず、
@@ -73,16 +116,23 @@ fn resolve_source_lang(dir: &str, source: &str) -> Option<crate::language::LangI
     if let Ok(lang) = crate::language::LangId::from_path(path) {
         return Some(lang);
     }
-    // 拡張子で決まらないものだけディスクを見る。cochange の候補数は
-    // per_source_limit で絞られており、読むのは先頭 1 行だけ。
-    use std::io::BufRead;
+    // 拡張子で決まらないものだけディスクを見る。cochange の候補数は per_source_limit で
+    // 絞られており、読むのは先頭 256 バイトまで。
+    use std::io::Read;
     let full = std::path::Path::new(dir).join(source);
-    let file = std::fs::File::open(full).ok()?;
-    let mut first_line = String::new();
-    std::io::BufReader::new(file)
-        .read_line(&mut first_line)
-        .ok()?;
-    crate::language::LangId::from_shebang(first_line.trim_end())
+    // symlink 経由で FIFO / デバイスファイル等を開くと read が返らない可能性があるため、
+    // 辿らずに regular file であることを確認する。
+    if !std::fs::symlink_metadata(&full)
+        .map(|m| m.file_type().is_file())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let file = std::fs::File::open(&full).ok()?;
+    let mut head = Vec::new();
+    file.take(SHEBANG_PROBE_BYTES).read_to_end(&mut head).ok()?;
+    let text = std::str::from_utf8(&head).ok()?;
+    crate::language::LangId::from_shebang(text.lines().next().unwrap_or(""))
 }
 
 /// review の missing_cochanges が要求する既定の最小共変更回数。

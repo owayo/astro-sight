@@ -144,25 +144,45 @@ fn cochange_exclude_keeps_dependency_manifests_as_candidates() {
     }
 }
 
-/// 解析対象言語を持つエコシステムでは `langs` が空でないことを固定する。
+/// 各エコシステムの `manifest` → `langs` の対応を期待値で固定する。
 ///
-/// `langs` が空だと「依存宣言 ↔ ソース」の除外が成立しないため、記述漏れは
-/// 「除外が効かない = 誤検出が残る」という無害に見える壊れ方をする。astro-sight が
-/// 解析しない言語 (Elixir の mix.exs) だけを空の例外として明示する。
+/// 「空でない」ことだけを見るテストでは誤った `LangId` の割り当て
+/// (`pyproject.toml` に `LangId::Ruby` を書く等) を検出できない。`langs` の誤りは
+/// 「除外が効かない = 誤検出が残る」または「別 ecosystem を落とす」という
+/// どちらの方向にも倒れるため、対応表そのものを固定する。
+/// astro-sight が解析しない Elixir の `mix.exs` だけ空スライス (lock の候補除外のみ効く)。
 #[test]
-fn dependency_ecosystems_declare_target_langs_except_unsupported() {
-    for eco in DEPENDENCY_ECOSYSTEMS {
-        if eco.manifest == "mix.exs" {
-            assert!(
-                eco.langs.is_empty(),
-                "Elixir は解析対象外なので langs は空のまま"
-            );
-            continue;
-        }
-        assert!(
-            !eco.langs.is_empty(),
-            "{} は対象言語を宣言すべき (空だと依存宣言↔ソースの除外が効かない)",
-            eco.manifest
+fn dependency_ecosystems_map_manifests_to_expected_langs() {
+    use crate::language::LangId;
+
+    let want: Vec<(&str, Vec<LangId>)> = vec![
+        ("Cargo.toml", vec![LangId::Rust]),
+        (
+            "package.json",
+            vec![LangId::Javascript, LangId::Typescript, LangId::Tsx],
+        ),
+        ("pyproject.toml", vec![LangId::Python]),
+        ("Gemfile", vec![LangId::Ruby]),
+        ("composer.json", vec![LangId::Php]),
+        ("go.mod", vec![LangId::Go]),
+        // Elixir は解析対象外なので空のまま
+        ("mix.exs", vec![]),
+    ];
+
+    assert_eq!(
+        DEPENDENCY_ECOSYSTEMS.len(),
+        want.len(),
+        "エコシステムを追加したらこの照合表も更新すること"
+    );
+    for (manifest, langs) in &want {
+        let eco = DEPENDENCY_ECOSYSTEMS
+            .iter()
+            .find(|e| e.manifest == *manifest)
+            .unwrap_or_else(|| panic!("{manifest} のエコシステム定義が無い"));
+        assert_eq!(
+            eco.langs,
+            langs.as_slice(),
+            "{manifest} の対象言語が期待と違う"
         );
     }
 }
@@ -783,6 +803,145 @@ fn detect_missing_cochanges_keeps_manifest_outside_source_project() {
     assert!(
         missing.iter().any(|m| m.file == "apps/web/package.json"),
         "別プロジェクトの manifest との相関は残すべき (祖先でないため)。got: {missing:?}"
+    );
+}
+
+/// ルート manifest と入れ子 manifest が併存する monorepo で、ルート manifest との相関を
+/// 落とさないことを固定する。
+///
+/// `apps/api/src/main.ts` の依存を宣言しているのは `apps/api/package.json` であって
+/// ルートの `package.json` ではない。祖先であることだけを条件にするとルート manifest まで
+/// 「依存追加による交絡」として落ち、workspace 全体のツール設定変更のような**本物の**
+/// 暗黙の結合が消える。
+#[test]
+fn detect_missing_cochanges_keeps_root_manifest_when_nested_manifest_exists() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let root_manifest = |v: usize| {
+        format!(
+            "{{\n  \"name\": \"root\",\n  \"workspaces\": [\"apps/*\"],\n  \"version\": \"0.{v}.0\"\n}}\n"
+        )
+    };
+    let api_manifest = "{\n  \"name\": \"api\"\n}\n";
+    let api_of = |n: usize| format!("export function handler(): number {{\n  return {n};\n}}\n");
+
+    git_commit_files(
+        repo,
+        &[
+            ("package.json", &root_manifest(0)),
+            ("apps/api/package.json", api_manifest),
+            ("apps/api/src/main.ts", &api_of(0)),
+        ],
+        "initial",
+    );
+    // ルート manifest と api のソースが 3 回一緒に変わる (入れ子 manifest は据え置き)
+    for i in 1..=3 {
+        git_commit_files(
+            repo,
+            &[
+                ("package.json", &root_manifest(i)),
+                ("apps/api/src/main.ts", &api_of(i)),
+            ],
+            &format!("workspace tooling {i}"),
+        );
+    }
+
+    std::fs::write(repo.join("apps/api/src/main.ts"), api_of(99)).expect("write main.ts");
+
+    let service = AppService::new();
+    let mut changed_files = HashSet::new();
+    changed_files.insert("apps/api/src/main.ts".to_string());
+
+    let missing = detect_missing_cochanges(
+        &service,
+        repo.to_str().expect("utf-8 path"),
+        &changed_files,
+        0.0,
+        REVIEW_COCHANGE_MIN_SAMPLES,
+        None,
+    )
+    .expect("detect_missing_cochanges should succeed")
+    .missing;
+
+    assert!(
+        missing.iter().any(|m| m.file == "package.json"),
+        "入れ子 manifest がある場合、ルート manifest との相関は残すべき。got: {missing:?}"
+    );
+}
+
+/// 入れ子 manifest 自身との相関は (最も近い宣言元なので) 落とすことを固定する。
+/// 上のテストと対にして、「近い方だけを落とす」判定が両方向で効いていることを示す。
+#[test]
+fn detect_missing_cochanges_drops_nearest_nested_manifest() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let api_manifest =
+        |deps: &str| format!("{{\n  \"name\": \"api\",\n  \"dependencies\": {{{deps}}}\n}}\n");
+    let api_of = |imports: &str, body: &str| {
+        format!("{imports}\nexport function handler(): number {{\n{body}\n}}\n")
+    };
+
+    git_commit_files(
+        repo,
+        &[
+            ("package.json", "{\n  \"name\": \"root\"\n}\n"),
+            ("apps/api/package.json", &api_manifest("")),
+            ("apps/api/src/main.ts", &api_of("", "  return 1;")),
+        ],
+        "initial",
+    );
+    let deps = [
+        "\"alpha\": \"1\"",
+        "\"alpha\": \"1\", \"beta\": \"1\"",
+        "\"alpha\": \"1\", \"beta\": \"1\", \"gamma\": \"1\"",
+    ];
+    let imports = [
+        "import \"alpha\";",
+        "import \"alpha\";\nimport \"beta\";",
+        "import \"alpha\";\nimport \"beta\";\nimport \"gamma\";",
+    ];
+    for i in 0..3 {
+        git_commit_files(
+            repo,
+            &[
+                ("apps/api/package.json", &api_manifest(deps[i])),
+                ("apps/api/src/main.ts", &api_of(imports[i], "  return 1;")),
+            ],
+            &format!("feat: dep {i}"),
+        );
+    }
+
+    std::fs::write(
+        repo.join("apps/api/src/main.ts"),
+        api_of(
+            imports[2],
+            "  let t = 0;\n  for (let i = 0; i < 3; i++) t += i;\n  return t;",
+        ),
+    )
+    .expect("write main.ts");
+
+    let service = AppService::new();
+    let mut changed_files = HashSet::new();
+    changed_files.insert("apps/api/src/main.ts".to_string());
+
+    let missing = detect_missing_cochanges(
+        &service,
+        repo.to_str().expect("utf-8 path"),
+        &changed_files,
+        0.0,
+        REVIEW_COCHANGE_MIN_SAMPLES,
+        None,
+    )
+    .expect("detect_missing_cochanges should succeed")
+    .missing;
+
+    assert!(
+        missing.iter().all(|m| m.file != "apps/api/package.json"),
+        "最も近い宣言元の manifest は落とすべき。got: {missing:?}"
     );
 }
 
