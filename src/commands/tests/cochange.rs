@@ -1108,11 +1108,17 @@ fn resolve_source_lang_rejects_invalid_utf8_in_first_line() {
     let dir = tempfile::tempdir().expect("tempdir");
     let repo = dir.path();
 
-    // 先頭行の途中に不正バイト 0xff を置く (境界切断ではなく本当に壊れている)
+    // (a) 先頭行の途中に不正バイト 0xff (error_len() == Some(1) の経路)
     let mut broken = b"#!/usr/bin/env python3".to_vec();
     broken.push(0xff);
     broken.extend_from_slice(b" tail\n\nprint(1)\n");
     std::fs::write(repo.join("broken"), &broken).expect("write broken");
+    // (b) 実 EOF で未完のマルチバイト列 (error_len() == None の経路)。
+    //     256 バイト未満なので「上限で切ったせい」ではなく本当に壊れている。
+    //     `error_len().is_none()` だけを許す条件ではこれを Python と誤判定してしまう。
+    let mut truncated = b"#!/usr/bin/env python3".to_vec();
+    truncated.push(0xE3); // 3 バイト列の 1 バイト目だけ
+    std::fs::write(repo.join("truncated"), &truncated).expect("write truncated");
     // 対照: 同じ shebang で不正バイトが無いもの
     std::fs::write(repo.join("valid"), b"#!/usr/bin/env python3\n\nprint(1)\n")
         .expect("write valid");
@@ -1121,6 +1127,10 @@ fn resolve_source_lang_rejects_invalid_utf8_in_first_line() {
     assert!(
         resolve_source_lang_for_test(dir_str, "broken").is_none(),
         "先頭行の途中に不正バイトがあるファイルは言語解決しない"
+    );
+    assert!(
+        resolve_source_lang_for_test(dir_str, "truncated").is_none(),
+        "実 EOF で未完のマルチバイト列があるファイルも言語解決しない"
     );
     assert_eq!(
         resolve_source_lang_for_test(dir_str, "valid"),

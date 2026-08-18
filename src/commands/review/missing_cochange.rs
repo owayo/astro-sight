@@ -122,21 +122,17 @@ fn resolve_source_lang(dir: &str, source: &str) -> Option<crate::language::LangI
     let head = read_probe_head(&full)?;
     // **先頭行だけを** UTF-8 化する。256 バイト全体を `from_utf8` に通すと、shebang 自体は
     // 正しい ASCII なのに 256 バイト境界がマルチバイト文字 (日本語コメント等) の途中に来た
-    // だけで判定が失敗する。改行位置で切り、それでも末尾が壊れていれば valid prefix を使う。
+    // だけで判定が失敗する (実際に踏んだ)。改行位置で切ってから変換すればこれは起きない。
+    //
+    // 切り出した先頭行の不正 UTF-8 は valid prefix で救わず**すべて拒否**する。
+    // `valid_up_to()` の prefix を使う実装は `#!/usr/bin/env python3\xff...` を Python と
+    // 判定してしまい、通常の言語検出が不正 UTF-8 を拒否する挙動と食い違ったうえで
+    // manifest↔source 警告を誤って抑制する。`error_len().is_none()` (末尾で列が未完) だけを
+    // 許す条件も不十分で、`#!/usr/bin/env python3` + 単独の 0xE3 で EOF のような
+    // 256 バイト未満のファイルまで受理してしまう。shebang 行は ASCII で 30 バイト程度なので、
+    // 先頭行が 256 バイトを超えて切れることはそもそも shebang ではない = 救う必要が無い。
     let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
-    let line_bytes = &head[..line_end];
-    let first_line = match std::str::from_utf8(line_bytes) {
-        Ok(text) => text,
-        // `error_len() == None` は「入力の末尾でマルチバイト列が未完」= 256 バイトで切った
-        // せいで壊れたケースなので、valid prefix を使って判定を続ける。
-        // `Some(_)` は列の途中に不正バイトがある本当に壊れたファイルなので `None` に倒す
-        // (`#!/usr/bin/env python3\xff...` を Python と判定してしまうと、通常の言語検出が
-        // 不正 UTF-8 を拒否する挙動と食い違い、manifest↔source 警告を誤って抑制する)。
-        Err(err) if err.error_len().is_none() => {
-            std::str::from_utf8(&line_bytes[..err.valid_up_to()]).unwrap_or("")
-        }
-        Err(_) => return None,
-    };
+    let first_line = std::str::from_utf8(&head[..line_end]).ok()?;
     crate::language::LangId::from_shebang(first_line.trim_end())
 }
 
