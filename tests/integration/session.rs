@@ -138,6 +138,46 @@ fn session_refs_reports_generated_skips_and_honors_opt_in() {
 }
 
 #[test]
+fn session_batch_refs_keeps_array_shape_and_reports_skips_once() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        workspace.path().join("generated.rb"),
+        "# @generated\ndef hidden_name; end\n",
+    )
+    .unwrap();
+    std::fs::write(workspace.path().join("real.rb"), "def visible_name; end\n").unwrap();
+
+    let mut child = cargo_bin()
+        .arg("session")
+        .env("ASTRO_SIGHT_WORKSPACE", workspace.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn session");
+    {
+        let stdin = child.stdin.as_mut().expect("stdin should be available");
+        writeln!(
+            stdin,
+            r#"{{"command":"refs","names":["hidden_name","visible_name"],"dir":"."}}"#
+        )
+        .unwrap();
+    }
+
+    let output = child.wait_with_output().expect("failed to wait session");
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let results = response
+        .as_array()
+        .expect("batch response must retain its array shape");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["skipped"]["generated"], 1);
+    assert!(results[1].get("skipped").is_none());
+}
+
+#[test]
 fn session_rejects_invalid_workspace_env() {
     let missing = std::env::temp_dir().join(format!(
         "astro-sight-missing-workspace-{}-{}",

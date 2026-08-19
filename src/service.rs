@@ -516,19 +516,21 @@ impl AppService {
         dir: &str,
         glob: Option<&str>,
     ) -> Result<Vec<RefsResult>> {
-        Ok(self
-            .find_references_batch_with_generated(names, dir, glob, false)?
-            .0)
+        self.find_references_batch_with_generated(names, dir, glob, false)
     }
 
     /// Batch reference search with shared generated-file omission metadata.
+    ///
+    /// The metadata is attached once to the first result. This preserves the
+    /// existing array/NDJSON shape and avoids repeating the same path list for
+    /// every requested symbol.
     pub fn find_references_batch_with_generated(
         &self,
         names: &[String],
         dir: &str,
         glob: Option<&str>,
         include_generated: bool,
-    ) -> Result<(Vec<RefsResult>, Option<crate::models::skip::SkippedFiles>)> {
+    ) -> Result<Vec<RefsResult>> {
         debug!(names = ?names, dir = dir, glob = ?glob, "find_references_batch called");
         let canonical_dir = self.validate_dir(dir)?;
 
@@ -540,7 +542,7 @@ impl AppService {
         )?;
 
         // 入力順を保ったまま `Vec<RefsResult>` に変換し、パスも相対化する。
-        let results: Vec<RefsResult> = names
+        let mut results: Vec<RefsResult> = names
             .iter()
             .map(|name| {
                 let references = batch.get(name).cloned().unwrap_or_default();
@@ -552,6 +554,9 @@ impl AppService {
                 }
             })
             .collect();
+        if let Some(first) = results.first_mut() {
+            first.skipped = skipped;
+        }
 
         debug!(
             names = ?names,
@@ -559,7 +564,7 @@ impl AppService {
             total_refs = results.iter().map(|r| r.references.len()).sum::<usize>(),
             "find_references_batch completed"
         );
-        Ok((results, skipped))
+        Ok(results)
     }
 
     /// unified diff がコードベースへ与える影響を解析する。

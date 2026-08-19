@@ -305,22 +305,12 @@ impl AstroSightServer {
                 None,
             ));
         }
-        self.to_tool_result(
-            self.service
-                .find_references_batch_with_generated(
-                    &filtered,
-                    &p.dir,
-                    p.glob.as_deref(),
-                    p.include_generated,
-                )
-                .and_then(|(results, skipped)| {
-                    let mut response = serde_json::json!({ "results": results });
-                    if let Some(skipped) = skipped {
-                        response["skipped"] = serde_json::to_value(skipped)?;
-                    }
-                    Ok(response)
-                }),
-        )
+        self.to_tool_result(self.service.find_references_batch_with_generated(
+            &filtered,
+            &p.dir,
+            p.glob.as_deref(),
+            p.include_generated,
+        ))
     }
 
     #[tool(

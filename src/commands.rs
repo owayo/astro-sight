@@ -322,7 +322,7 @@ pub fn cmd_refs_batch(
     // 集約するため、ここでは全名を 1 回で渡す（以前は呼び出し側で chunk 分割していたが
     // chunk 毎に walk し直していた）。service は入力順を保った `Vec<RefsResult>` を返すので
     // NDJSON 出力も names 順を維持する。
-    let (results, skipped) =
+    let results =
         service.find_references_batch_with_generated(names, dir, glob, include_generated)?;
     for result in &results {
         total_refs += result.references.len();
@@ -339,21 +339,9 @@ pub fn cmd_refs_batch(
                 let line = serde_json::to_string(result)?;
                 writeln!(out, "{line}")?;
             }
-            if let Some(skipped) = &skipped {
-                writeln!(out, "{}", serde_json::json!({ "skipped": skipped }))?;
-            }
         }
         OutputFormat::Toon => {
-            if let Some(skipped) = &skipped {
-                let mut records: Vec<serde_json::Value> = results
-                    .iter()
-                    .map(serde_json::to_value)
-                    .collect::<std::result::Result<_, _>>()?;
-                records.push(serde_json::json!({ "skipped": skipped }));
-                write!(out, "{}", serialize_document(&records, output)?)?;
-            } else {
-                write!(out, "{}", serialize_document(&results, output)?)?;
-            }
+            write!(out, "{}", serialize_document(&results, output)?)?;
         }
         OutputFormat::Auto => {
             let mut ndjson = String::new();
@@ -361,22 +349,7 @@ pub fn cmd_refs_batch(
                 ndjson.push_str(&serde_json::to_string(result)?);
                 ndjson.push('\n');
             }
-            if let Some(skipped) = &skipped {
-                ndjson.push_str(&serde_json::to_string(
-                    &serde_json::json!({ "skipped": skipped }),
-                )?);
-                ndjson.push('\n');
-            }
-            let toon = if let Some(skipped) = &skipped {
-                let mut records: Vec<serde_json::Value> = results
-                    .iter()
-                    .map(serde_json::to_value)
-                    .collect::<std::result::Result<_, _>>()?;
-                records.push(serde_json::json!({ "skipped": skipped }));
-                serialize_document(&records, output.with_format(OutputFormat::Toon))?
-            } else {
-                serialize_document(&results, output.with_format(OutputFormat::Toon))?
-            };
+            let toon = serialize_document(&results, output.with_format(OutputFormat::Toon))?;
             if crate::output::estimated_size(&toon) < crate::output::estimated_size(&ndjson) {
                 write!(out, "{toon}")?;
             } else {

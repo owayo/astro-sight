@@ -204,8 +204,10 @@ compact 出力例:
 {"symbol":"foo","refs":[],"skipped":{"generated":2,"paths":["gen/a.rs","gen/b.rs"]}}
 ```
 
-`symbols --dir` と複数名の `refs --names` は NDJSON なので、同じ `skipped` object を持つ
-control record を末尾に 1 行追加する。TOON のルート配列要素数にもこの 1 件を含める。
+`symbols --dir` は NDJSON なので、同じ `skipped` object を持つ control record を末尾に
+1 行追加する。複数名の `refs --names` は既存の「1 シンボル 1 レコード」を維持し、共有の
+`skipped` を先頭レコードへ 1 回だけ追加する。session / MCP の batch 応答も従来どおり
+ルート配列を維持する。
 
 除外せず走査する場合はグローバルオプションを指定する。
 

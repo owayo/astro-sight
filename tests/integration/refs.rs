@@ -155,7 +155,7 @@ fn refs_batch_names() {
 }
 
 #[test]
-fn refs_batch_appends_one_generated_skip_control_record() {
+fn refs_batch_reports_generated_skip_without_changing_record_count() {
     let dir = tempfile::TempDir::new().unwrap();
     std::fs::write(
         dir.path().join("generated.rb"),
@@ -175,11 +175,12 @@ fn refs_batch_appends_one_generated_skip_control_record() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(records.len(), 3, "two results plus one control record");
+    assert_eq!(records.len(), 2, "one record per requested symbol");
     assert_eq!(records[0]["symbol"], "hidden_name");
+    assert_eq!(records[0]["skipped"]["generated"], 1);
+    assert_eq!(records[0]["skipped"]["paths"][0], "generated.rb");
     assert_eq!(records[1]["symbol"], "visible_name");
-    assert_eq!(records[2]["skipped"]["generated"], 1);
-    assert_eq!(records[2]["skipped"]["paths"][0], "generated.rb");
+    assert!(records[1].get("skipped").is_none());
 }
 
 /// chunk サイズより多い名前でも、複数 chunk にまたがって入力 names 順の

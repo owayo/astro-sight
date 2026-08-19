@@ -53,17 +53,13 @@ pub fn handle_request(
                     )
                     .into());
                 }
-                let (results, skipped) = service.find_references_batch_with_generated(
+                let results = service.find_references_batch_with_generated(
                     &filtered,
                     dir,
                     req.glob.as_deref(),
                     req.include_generated,
                 )?;
-                let mut response = serde_json::json!({ "results": results });
-                if let Some(skipped) = skipped {
-                    response["skipped"] = serde_json::to_value(skipped)?;
-                }
-                Ok(response)
+                Ok(serde_json::to_value(results)?)
             } else if let Some(name) = req.name.as_deref().map(str::trim).filter(|n| !n.is_empty())
             {
                 let result = service.find_references_with_generated(
