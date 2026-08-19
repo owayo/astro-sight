@@ -63,58 +63,27 @@ fn is_generated_file_detects_do_not_edit_marker() {
 
 #[test]
 fn collect_files_handles_generated_exclusion() {
-    // 並列テストで env を共有するため 1 つのテストに集約してシリアル化する。
-    // (1) デフォルトで _ide_helper.php が除外される
-    // (2) ASTRO_SIGHT_NO_GENERATED_EXCLUSION=1 で opt-out できる
-    let prev = std::env::var("ASTRO_SIGHT_NO_GENERATED_EXCLUSION").ok();
-    // 念のため事前に unset して default 動作を保証する
-    // SAFETY: Rust 2024 Edition では set_var/remove_var は unsafe 扱い。
-    // env を読む他テストは存在しない (検索済み) ため本テスト内のみ操作する。
-    unsafe {
-        std::env::remove_var("ASTRO_SIGHT_NO_GENERATED_EXCLUSION");
-    }
-
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(dir.path().join("_ide_helper.php"), "<?php class X {}\n").expect("write");
     std::fs::write(dir.path().join("real.php"), "<?php class Real {}\n").expect("write");
 
-    // (1) default: _ide_helper.php は除外、real.php は含まれる
+    // Process-global な環境変数を unit test 内で変更すると、並列実行中の
+    // generated scan と競合する。legacy env の opt-out は子プロセスを使う
+    // integration test で検証し、ここでは default の純粋な挙動だけを固定する。
     let files = super::collect_files(dir.path(), None).expect("collect");
     let names: Vec<_> = files
         .iter()
         .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
         .collect();
-    let default_real = names.contains(&"real.php");
-    let default_ide = names.contains(&"_ide_helper.php");
-
-    // (2) opt-out: env="1" で _ide_helper.php も含まれる
-    // SAFETY: Rust 2024 で unsafe。テスト終了時に restore する。
-    unsafe {
-        std::env::set_var("ASTRO_SIGHT_NO_GENERATED_EXCLUSION", "1");
-    }
-    let files = super::collect_files(dir.path(), None).expect("collect");
-    let optout_ide = files
-        .iter()
-        .any(|p| p.file_name().and_then(|n| n.to_str()) == Some("_ide_helper.php"));
-
-    // restore
-    // SAFETY: テスト終了処理。
-    unsafe {
-        match prev {
-            Some(v) => std::env::set_var("ASTRO_SIGHT_NO_GENERATED_EXCLUSION", v),
-            None => std::env::remove_var("ASTRO_SIGHT_NO_GENERATED_EXCLUSION"),
-        }
-    }
 
     assert!(
-        default_real,
+        names.contains(&"real.php"),
         "通常ファイルは default で含まれるべき。got names: {names:?}"
     );
     assert!(
-        !default_ide,
+        !names.contains(&"_ide_helper.php"),
         "_ide_helper.php は default で除外されるべき。got names: {names:?}"
     );
-    assert!(optout_ide, "opt-out 時は _ide_helper.php も含まれるべき");
 }
 
 #[test]
