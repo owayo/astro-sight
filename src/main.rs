@@ -6,11 +6,11 @@ use tracing::info;
 
 use astro_sight::cli::{Cli, Commands};
 use astro_sight::commands::{
-    self, CmdAstOpts, CmdContextOpts, CmdDeadCodeOpts, CmdImpactOpts, CmdReviewOpts, batch_ast,
-    batch_calls, batch_imports, batch_lint, batch_sequence, batch_symbols, cmd_ast, cmd_calls,
-    cmd_cochange, cmd_context, cmd_dead_code, cmd_doctor, cmd_impact, cmd_imports, cmd_lint,
-    cmd_mcp, cmd_refs, cmd_refs_batch, cmd_review, cmd_sequence, cmd_session, cmd_symbols,
-    cmd_symbols_dir,
+    self, BatchSymbolsOpts, CmdAstOpts, CmdContextOpts, CmdDeadCodeOpts, CmdImpactOpts,
+    CmdReviewOpts, CmdSymbolsDirOpts, batch_ast, batch_calls, batch_imports, batch_lint,
+    batch_sequence, batch_symbols, cmd_ast, cmd_calls, cmd_cochange, cmd_context, cmd_dead_code,
+    cmd_doctor, cmd_impact, cmd_imports, cmd_lint, cmd_mcp, cmd_refs, cmd_refs_batch, cmd_review,
+    cmd_sequence, cmd_session, cmd_symbols, cmd_symbols_dir,
 };
 use astro_sight::config::ConfigService;
 use astro_sight::error::{AstroError, ErrorCode};
@@ -250,6 +250,9 @@ fn run(cli: Cli) -> Result<()> {
     initialize_logging(&cli, &config)?;
     // 優先順位: CLI `--format` > config.toml の `format` > json。
     let output = OutputOptions::resolve(cli.format, config.format, cli.pretty);
+    // CLI opt-in wins over the config default. The legacy environment opt-out is
+    // still honoured inside the file collector for backward compatibility.
+    let include_generated = cli.include_generated || !config.skip_generated;
 
     // カレントディレクトリと入力パラメータを含めてコマンド実行を記録する
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -262,7 +265,7 @@ fn run(cli: Cli) -> Result<()> {
     let service = AppService::new();
     let start = std::time::Instant::now();
 
-    let result = dispatch_command(&service, cli.command, output);
+    let result = dispatch_command(&service, cli.command, output, include_generated);
 
     let elapsed = start.elapsed();
     info!(
@@ -273,7 +276,12 @@ fn run(cli: Cli) -> Result<()> {
     result
 }
 
-fn dispatch_command(service: &AppService, command: Commands, output: OutputOptions) -> Result<()> {
+fn dispatch_command(
+    service: &AppService,
+    command: Commands,
+    output: OutputOptions,
+    include_generated: bool,
+) -> Result<()> {
     match command {
         Commands::Ast {
             path,
@@ -320,15 +328,16 @@ fn dispatch_command(service: &AppService, command: Commands, output: OutputOptio
             no_cache,
         } => {
             if let Some(d) = &dir {
-                cmd_symbols_dir(
-                    service,
-                    d,
-                    glob.as_deref(),
+                let opts = CmdSymbolsDirOpts {
+                    dir: d,
+                    glob: glob.as_deref(),
+                    include_generated,
                     doc,
                     full,
-                    query.as_deref(),
+                    query: query.as_deref(),
                     output,
-                )
+                };
+                cmd_symbols_dir(service, &opts)
             } else {
                 let input =
                     resolve_paths(path.as_deref(), paths.as_deref(), paths_file.as_deref())?;
@@ -336,9 +345,18 @@ fn dispatch_command(service: &AppService, command: Commands, output: OutputOptio
                     PathInput::Single(p) => {
                         cmd_symbols(service, &p, no_cache, output, doc, full, query.as_deref())
                     }
-                    PathInput::Batch(ps) => {
-                        batch_symbols(service, &ps, doc, full, None, query.as_deref(), output)
-                    }
+                    PathInput::Batch(ps) => batch_symbols(
+                        service,
+                        &ps,
+                        BatchSymbolsOpts {
+                            doc,
+                            full,
+                            dir: None,
+                            skipped: None,
+                            query: query.as_deref(),
+                            output,
+                        },
+                    ),
                 }
             }
         }
@@ -408,8 +426,22 @@ fn dispatch_command(service: &AppService, command: Commands, output: OutputOptio
             dir,
             glob,
         } => match resolve_names(name.as_deref(), names.as_deref())? {
-            NameInput::Single(n) => cmd_refs(service, &n, &dir, glob.as_deref(), output),
-            NameInput::Batch(ns) => cmd_refs_batch(service, &ns, &dir, glob.as_deref(), output),
+            NameInput::Single(n) => cmd_refs(
+                service,
+                &n,
+                &dir,
+                glob.as_deref(),
+                include_generated,
+                output,
+            ),
+            NameInput::Batch(ns) => cmd_refs_batch(
+                service,
+                &ns,
+                &dir,
+                glob.as_deref(),
+                include_generated,
+                output,
+            ),
         },
         Commands::Review {
             dir,

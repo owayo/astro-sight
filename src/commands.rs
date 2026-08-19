@@ -33,6 +33,16 @@ pub struct CmdAstOpts<'a> {
     pub output: OutputOptions,
 }
 
+pub struct CmdSymbolsDirOpts<'a> {
+    pub dir: &'a str,
+    pub glob: Option<&'a str>,
+    pub include_generated: bool,
+    pub doc: bool,
+    pub full: bool,
+    pub query: Option<&'a str>,
+    pub output: OutputOptions,
+}
+
 /// 単一ファイル系コマンド (ast / symbols) の共通キャッシュ機構。
 /// read_file → content_hash → cache_hash_for_path → use_cache 判定 → get →
 /// ヒット時 raw 書出 → miss 時 produce で serialize → TOCTOU ガード → put の流れを共通化する。
@@ -148,29 +158,32 @@ pub fn cmd_ast(service: &AppService, opts: &CmdAstOpts<'_>) -> Result<()> {
     )
 }
 
-pub fn cmd_symbols_dir(
-    service: &AppService,
-    dir: &str,
-    glob: Option<&str>,
-    doc: bool,
-    full: bool,
-    query: Option<&str>,
-    output: OutputOptions,
-) -> Result<()> {
-    let canonical_dir = std::fs::canonicalize(dir)?;
-    let files = crate::engine::refs::collect_files(&canonical_dir, glob)?;
-    let file_paths: Vec<String> = files
+pub fn cmd_symbols_dir(service: &AppService, opts: &CmdSymbolsDirOpts<'_>) -> Result<()> {
+    let canonical_dir = std::fs::canonicalize(opts.dir)?;
+    let collection = crate::engine::refs::collect_files_scan(
+        &canonical_dir,
+        opts.glob,
+        crate::engine::refs::FileScanOptions {
+            include_generated: opts.include_generated,
+        },
+    )?;
+    let skipped = collection.skipped(&canonical_dir);
+    let file_paths: Vec<String> = collection
+        .files
         .iter()
         .filter_map(|p| p.to_str().map(|s| s.to_string()))
         .collect();
     batch_symbols(
         service,
         &file_paths,
-        doc,
-        full,
-        Some(&canonical_dir),
-        query,
-        output,
+        crate::commands::batch::BatchSymbolsOpts {
+            doc: opts.doc,
+            full: opts.full,
+            dir: Some(&canonical_dir),
+            skipped,
+            query: opts.query,
+            output: opts.output,
+        },
     )
 }
 
@@ -282,9 +295,10 @@ pub fn cmd_refs(
     name: &str,
     dir: &str,
     glob: Option<&str>,
+    include_generated: bool,
     output: OutputOptions,
 ) -> Result<()> {
-    let result = service.find_references(name, dir, glob)?;
+    let result = service.find_references_with_generated(name, dir, glob, include_generated)?;
     let text = serialize_cli_document(&result, output)?;
     info!(command = "refs", name = name, dir = dir, glob = ?glob, output_bytes = text.len(), "command completed");
     print!("{text}");
@@ -296,6 +310,7 @@ pub fn cmd_refs_batch(
     names: &[String],
     dir: &str,
     glob: Option<&str>,
+    include_generated: bool,
     output: OutputOptions,
 ) -> Result<()> {
     use std::io::Write;
@@ -307,7 +322,8 @@ pub fn cmd_refs_batch(
     // 集約するため、ここでは全名を 1 回で渡す（以前は呼び出し側で chunk 分割していたが
     // chunk 毎に walk し直していた）。service は入力順を保った `Vec<RefsResult>` を返すので
     // NDJSON 出力も names 順を維持する。
-    let results = service.find_references_batch(names, dir, glob)?;
+    let results =
+        service.find_references_batch_with_generated(names, dir, glob, include_generated)?;
     for result in &results {
         total_refs += result.references.len();
     }
@@ -722,7 +738,10 @@ pub(crate) use dead_code::{
 mod batch;
 mod session_handler;
 
-pub use batch::{batch_ast, batch_calls, batch_imports, batch_lint, batch_sequence, batch_symbols};
+pub use batch::{
+    BatchSymbolsOpts, batch_ast, batch_calls, batch_imports, batch_lint, batch_sequence,
+    batch_symbols,
+};
 pub use session_handler::handle_request;
 
 #[cfg(test)]

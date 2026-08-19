@@ -147,6 +147,40 @@ fn mcp_tools_call_refs_search() {
 }
 
 #[test]
+fn mcp_tools_call_refs_batch_search_keeps_array_response() {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "refs_batch_search",
+            "arguments": {
+                "names": ["Config", "UserService"],
+                "dir": "tests/fixtures",
+                "glob": "**/*.py"
+            }
+        }
+    })
+    .to_string();
+    let stdout = mcp_send_after_init(&[&request]);
+
+    let result_line = stdout
+        .lines()
+        .find(|line| line.contains("\"id\":2"))
+        .expect("refs_batch_search レスポンスが必要");
+    let json: serde_json::Value = serde_json::from_str(result_line).expect("valid JSON-RPC");
+    let text = json["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text フィールドが必要");
+    let refs: serde_json::Value = serde_json::from_str(text).expect("refs JSON が必要");
+    assert!(
+        refs.is_array(),
+        "batch response must retain its array shape: {refs}"
+    );
+    assert_eq!(refs.as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn mcp_tools_call_context_analyze() {
     let diff = "\
 diff --git a/tests/fixtures/sample.py b/tests/fixtures/sample.py\n\

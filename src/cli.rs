@@ -37,6 +37,10 @@ pub struct Cli {
     /// Path to configuration file
     #[arg(long, global = true)]
     pub config: Option<std::path::PathBuf>,
+
+    /// Include files detected as generated (default: skip and report them)
+    #[arg(long, global = true)]
+    pub include_generated: bool,
 }
 
 #[derive(Subcommand, Debug)]

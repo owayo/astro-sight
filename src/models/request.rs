@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// astro-sight エンジンへのリクエスト。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AstgenRequest {
@@ -35,6 +39,9 @@ pub struct AstgenRequest {
     /// glob パターンフィルタ（refs コマンド用）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub glob: Option<String>,
+    /// generated 判定されたファイルも refs の走査対象に含める。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_generated: bool,
     /// diff 入力（session 経由の context コマンド用）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,

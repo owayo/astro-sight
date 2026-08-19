@@ -1,5 +1,24 @@
 use serde::{Deserialize, Serialize};
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Directory scans that omitted generated files.
+///
+/// `generated` is always the complete count. `paths` is a bounded, sorted sample
+/// so callers can diagnose the omission without making output size depend on a
+/// repository's generated-file count. A missing `skipped` field means zero files
+/// were omitted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkippedFiles {
+    pub generated: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub paths: Vec<String>,
+    #[serde(skip_serializing_if = "is_false", default)]
+    pub truncated: bool,
+}
+
 /// `--git` 指定だが解析対象の diff を取得できずスキップした理由を機械可読に伝える。
 ///
 /// git 管理外ディレクトリ (または worktree 外) で `--git` が要求されたケースを

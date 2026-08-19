@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::skip::SkippedFiles;
+
 /// 参照の種類（定義または利用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RefKind {
@@ -51,4 +53,7 @@ pub struct RefsResult {
     pub symbol: String,
     #[serde(rename = "refs")]
     pub references: Vec<SymbolReference>,
+    /// Generated files omitted from the directory scan. Missing means zero.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub skipped: Option<SkippedFiles>,
 }

@@ -20,6 +20,9 @@ pub struct Config {
     /// 既定の出力フォーマット (`json` / `toon` / `auto`)。
     /// CLI の `--format` が指定されればそちらが優先される。
     pub format: OutputFormat,
+
+    /// Directory scans omit files declared as generated unless explicitly included.
+    pub skip_generated: bool,
 }
 
 impl Default for Config {
@@ -28,6 +31,7 @@ impl Default for Config {
             debug: false,
             log_path: default_log_path(),
             format: OutputFormat::Json,
+            skip_generated: true,
         }
     }
 }
@@ -37,6 +41,7 @@ struct RawConfig {
     debug: Option<bool>,
     log_path: Option<PathBuf>,
     format: Option<OutputFormat>,
+    skip_generated: Option<bool>,
 }
 
 /// デフォルトのログ出力先: ~/.config/astro-sight/logs
@@ -111,6 +116,7 @@ impl ConfigService {
             debug: raw.debug.unwrap_or(false),
             log_path,
             format: raw.format.unwrap_or_default(),
+            skip_generated: raw.skip_generated.unwrap_or(true),
         })
     }
 
@@ -154,6 +160,11 @@ debug = false
 # session / review --hook / impact --hook / エラー出力は行指向 JSON の契約が
 # あるため、この設定に関わらず常に JSON。
 format = "json"
+
+# 生成ファイルをディレクトリ走査から除外する (デフォルト: true)。
+# 除外件数は refs / symbols --dir の skipped フィールドに出力される。
+# CLI の --include-generated はこの設定より優先される。
+skip_generated = true
 "#
         .to_string()
     }
@@ -284,6 +295,7 @@ mod tests {
         let config = ConfigService::load(Some(&config_path)).unwrap();
         assert_eq!(config.format, OutputFormat::Json);
         assert!(!config.debug);
+        assert!(config.skip_generated);
     }
 
     #[test]
@@ -302,6 +314,17 @@ mod tests {
         let content = ConfigService::default_config_content();
         assert!(content.contains("debug = false"));
         assert!(content.contains("log_path"));
+        assert!(content.contains("skip_generated = true"));
+    }
+
+    #[test]
+    fn test_load_skip_generated_false() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, "skip_generated = false\n").unwrap();
+
+        let config = ConfigService::load(Some(&config_path)).unwrap();
+        assert!(!config.skip_generated);
     }
 
     #[test]

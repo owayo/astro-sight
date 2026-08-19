@@ -2,6 +2,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use tracing::info;
 
+use crate::models::skip::SkippedFiles;
 use crate::output::{OutputFormat, OutputOptions, estimated_size, serialize_toon_list_item, toon};
 use crate::service::{AppService, AstParams};
 
@@ -131,6 +132,36 @@ where
     Ok(())
 }
 
+fn batch_ndjson_with_trailer<F>(
+    paths: &[String],
+    trailer: Option<serde_json::Value>,
+    output: OutputOptions,
+    process: F,
+) -> Result<()>
+where
+    F: Fn(&str, OutputOptions) -> BatchRendered + Sync,
+{
+    let stdout = std::io::stdout();
+    let out = std::io::BufWriter::new(stdout.lock());
+    let total_records = paths.len() + usize::from(trailer.is_some());
+    let written = batch_ndjson_to_windowed_with_trailer(
+        paths,
+        trailer,
+        output,
+        process,
+        out,
+        batch_worker_count().saturating_mul(8).max(1),
+    )?;
+    info!(
+        batch_size = paths.len(),
+        total_records,
+        output_bytes = written,
+        format = output.format().as_str(),
+        "batch completed"
+    );
+    Ok(())
+}
+
 fn batch_ndjson_to<F, W>(
     paths: &[String],
     output: OutputOptions,
@@ -181,6 +212,21 @@ fn batch_ndjson_to_windowed<F, W>(
     paths: &[String],
     output: OutputOptions,
     process: F,
+    out: W,
+    window_size: usize,
+) -> Result<usize>
+where
+    F: Fn(&str, OutputOptions) -> BatchRendered + Sync,
+    W: std::io::Write,
+{
+    batch_ndjson_to_windowed_with_trailer(paths, None, output, process, out, window_size)
+}
+
+fn batch_ndjson_to_windowed_with_trailer<F, W>(
+    paths: &[String],
+    trailer: Option<serde_json::Value>,
+    output: OutputOptions,
+    process: F,
     mut out: W,
     window_size: usize,
 ) -> Result<usize>
@@ -191,20 +237,22 @@ where
     let window_size = window_size.max(1);
     let pool = build_batch_pool()?;
     let mut bytes = 0usize;
+    let total_records = paths.len() + usize::from(trailer.is_some());
 
     // `auto` は最初の window を両形式で描画してから勝者を決める。以降の window は
     // 勝者だけを描画するので、二重エンコードのコストは先頭 window 分だけで済む
     // (解析自体はどちらの経路でもパス 1 回きり)。
     let mut resolved = if output.is_auto() { None } else { Some(output) };
 
-    // TOON はルート配列を list form (§9.4) で開く。要素数は入力パス数と 1:1 なので
-    // 解析結果を溜めずにヘッダを先出しでき、ピーク RSS を入力件数から独立させたまま
+    // TOON はルート配列を list form (§9.4) で開く。要素数は入力パス数に任意の
+    // control record 1 件を加えた値として先に確定できるため、解析結果を溜めずに
+    // ヘッダを先出しでき、ピーク RSS を入力件数から独立させたまま
     // 1 個の妥当な TOON ドキュメントになる。外側配列を tabular form (§9.3) にするには
     // 全要素を見る必要があり、この streaming 要件と両立しないため list form を使う。
     if let Some(opts) = resolved
         && opts.is_toon()
     {
-        let header = toon::streaming_array_header(paths.len());
+        let header = toon::streaming_array_header(total_records);
         bytes += header.len();
         write!(out, "{header}")?;
     }
@@ -226,11 +274,16 @@ where
                     let (rj, rt) = r.size_metrics();
                     (j + rj, t + rt)
                 });
-                let header = toon::streaming_array_header(paths.len());
+                let header = toon::streaming_array_header(total_records);
                 // ヘッダと最初の item の区切り改行も本文と同じ物差しで測る。
                 let header_size = estimated_size(&header) + estimated_size("\n");
-                let winner =
-                    decide_batch_format(json_len, toon_len, header_size, chunk.len(), paths.len());
+                let winner = decide_batch_format(
+                    json_len,
+                    toon_len,
+                    header_size,
+                    chunk.len(),
+                    total_records,
+                );
                 let opts = output.with_format(winner);
                 resolved = Some(opts);
                 if winner == OutputFormat::Toon {
@@ -251,6 +304,38 @@ where
             }
         }
         // broken pipe 等を chunk 境界で検出し、残りの解析を早期に打ち切る。
+        out.flush()?;
+    }
+
+    if let Some(trailer) = trailer {
+        let rendered = render_batch_record(&trailer, resolved.unwrap_or(output));
+        let opts = match resolved {
+            Some(opts) => opts,
+            None => {
+                let (json_size, toon_size) = rendered.size_metrics();
+                let header = toon::streaming_array_header(total_records);
+                let winner = if toon_size + estimated_size(&header) + estimated_size("\n")
+                    < json_size + estimated_size("\n")
+                {
+                    OutputFormat::Toon
+                } else {
+                    OutputFormat::Json
+                };
+                let opts = output.with_format(winner);
+                if opts.is_toon() {
+                    bytes += header.len();
+                    write!(out, "{header}")?;
+                }
+                opts
+            }
+        };
+        let line = rendered.take(opts.format());
+        bytes += line.len() + 1;
+        if opts.is_toon() {
+            write!(out, "\n{line}")?;
+        } else {
+            writeln!(out, "{line}")?;
+        }
         out.flush()?;
     }
 
@@ -288,29 +373,37 @@ pub fn batch_ast(
     })
 }
 
+pub struct BatchSymbolsOpts<'a> {
+    pub doc: bool,
+    pub full: bool,
+    pub dir: Option<&'a std::path::Path>,
+    pub skipped: Option<SkippedFiles>,
+    pub query: Option<&'a str>,
+    pub output: OutputOptions,
+}
+
 pub fn batch_symbols(
     service: &AppService,
     paths: &[String],
-    doc: bool,
-    full: bool,
-    dir: Option<&std::path::Path>,
-    query: Option<&str>,
-    output: OutputOptions,
+    opts: BatchSymbolsOpts<'_>,
 ) -> Result<()> {
-    batch_ndjson(paths, output, |p, output| {
-        match service.extract_symbols_with_query(p, query) {
+    let trailer = opts
+        .skipped
+        .map(|skipped| serde_json::json!({ "skipped": skipped }));
+    batch_ndjson_with_trailer(paths, trailer, opts.output, |p, output| {
+        match service.extract_symbols_with_query(p, opts.query) {
             Ok(mut response) => {
                 // dir 指定時に絶対パスを相対パスに変換
-                if let Some(base) = dir
+                if let Some(base) = opts.dir
                     && let Ok(rel) =
                         std::path::Path::new(&response.location.path).strip_prefix(base)
                 {
                     response.location.path = rel.to_string_lossy().to_string();
                 }
-                if full {
+                if opts.full {
                     render_batch_record(&response, output)
                 } else {
-                    render_batch_record(&response.to_compact_symbols(doc), output)
+                    render_batch_record(&response.to_compact_symbols(opts.doc), output)
                 }
             }
             Err(e) => render_batch_error(&e, output),
