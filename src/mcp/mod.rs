@@ -71,6 +71,9 @@ pub struct RefsSearchParams {
     /// Glob pattern to filter files (e.g. "**/*.rs")
     #[serde(default)]
     pub glob: Option<String>,
+    /// Include files detected as generated
+    #[serde(default)]
+    pub include_generated: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -82,6 +85,9 @@ pub struct RefsBatchSearchParams {
     /// Glob pattern to filter files (e.g. "**/*.rs")
     #[serde(default)]
     pub glob: Option<String>,
+    /// Include files detected as generated
+    #[serde(default)]
+    pub include_generated: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -270,10 +276,12 @@ impl AstroSightServer {
         if name.is_empty() {
             return Err(McpError::invalid_params("name must not be empty", None));
         }
-        self.to_tool_result(
-            self.service
-                .find_references(name, &p.dir, p.glob.as_deref()),
-        )
+        self.to_tool_result(self.service.find_references_with_generated(
+            name,
+            &p.dir,
+            p.glob.as_deref(),
+            p.include_generated,
+        ))
     }
 
     #[tool(
@@ -297,11 +305,22 @@ impl AstroSightServer {
                 None,
             ));
         }
-        self.to_tool_result(self.service.find_references_batch(
-            &filtered,
-            &p.dir,
-            p.glob.as_deref(),
-        ))
+        self.to_tool_result(
+            self.service
+                .find_references_batch_with_generated(
+                    &filtered,
+                    &p.dir,
+                    p.glob.as_deref(),
+                    p.include_generated,
+                )
+                .and_then(|(results, skipped)| {
+                    let mut response = serde_json::json!({ "results": results });
+                    if let Some(skipped) = skipped {
+                        response["skipped"] = serde_json::to_value(skipped)?;
+                    }
+                    Ok(response)
+                }),
+        )
     }
 
     #[tool(

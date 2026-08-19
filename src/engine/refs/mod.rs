@@ -22,8 +22,12 @@ use std::path::Path;
 use crate::engine::parser;
 use crate::language::{LangId, normalize_identifier};
 use crate::models::reference::{RefKind, SymbolReference};
+use crate::models::skip::SkippedFiles;
 
-pub use files::{collect_files, collect_files_with_excludes, merge_extra_files};
+pub use files::{
+    FileCollection, FileScanOptions, collect_files, collect_files_scan,
+    collect_files_with_excludes, merge_extra_files,
+};
 pub(crate) use line_index::{LineIndex, absolute_position, byte_offset_to_row_col};
 pub(crate) use role::RefUsageRole;
 pub(crate) use walker::{RefVisitEvent, RefVisitor};
@@ -164,7 +168,19 @@ pub fn find_references(
     dir: &Path,
     glob_pattern: Option<&str>,
 ) -> Result<Vec<SymbolReference>> {
-    let files = collect_files(dir, glob_pattern)?;
+    Ok(find_references_with_scan(symbol_name, dir, glob_pattern, FileScanOptions::default())?.0)
+}
+
+/// Reference search with generated-file omission metadata for user-facing scans.
+pub fn find_references_with_scan(
+    symbol_name: &str,
+    dir: &Path,
+    glob_pattern: Option<&str>,
+    options: FileScanOptions,
+) -> Result<(Vec<SymbolReference>, Option<SkippedFiles>)> {
+    let collection = collect_files_scan(dir, glob_pattern, options)?;
+    let skipped = collection.skipped(dir);
+    let files = collection.files;
 
     let pool = build_bounded_pool()?;
     let prefilter = SingleNamePrefilter::new(symbol_name)?;
@@ -201,7 +217,7 @@ pub fn find_references(
 
     sort_references(&mut all_refs);
 
-    Ok(all_refs)
+    Ok((all_refs, skipped))
 }
 
 fn sort_references(refs: &mut [SymbolReference]) {
@@ -300,13 +316,33 @@ pub fn find_references_batch(
     dir: &Path,
     glob_pattern: Option<&str>,
 ) -> Result<std::collections::HashMap<String, Vec<SymbolReference>>> {
+    Ok(find_references_batch_with_scan(
+        symbol_names,
+        dir,
+        glob_pattern,
+        FileScanOptions::default(),
+    )?
+    .0)
+}
+
+type ReferenceBatchMap = std::collections::HashMap<String, Vec<SymbolReference>>;
+
+/// Batch reference search with generated-file omission metadata.
+pub fn find_references_batch_with_scan(
+    symbol_names: &[String],
+    dir: &Path,
+    glob_pattern: Option<&str>,
+    options: FileScanOptions,
+) -> Result<(ReferenceBatchMap, Option<SkippedFiles>)> {
     use std::collections::HashMap;
 
     if symbol_names.is_empty() {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), None));
     }
 
-    let files = collect_files(dir, glob_pattern)?;
+    let collection = collect_files_scan(dir, glob_pattern, options)?;
+    let skipped = collection.skipped(dir);
+    let files = collection.files;
     let pool = build_bounded_pool()?;
     let acs = build_batch_acs(symbol_names)?;
 
@@ -369,7 +405,7 @@ pub fn find_references_batch(
         }
     }
 
-    Ok(merged)
+    Ok((merged, skipped))
 }
 
 /// impact analyze 用: symbol_names を AC 事前フィルタで 1 回構築して返す。

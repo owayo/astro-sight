@@ -471,10 +471,26 @@ impl AppService {
 
     /// 複数ファイルを横断してシンボル参照を検索する。
     pub fn find_references(&self, name: &str, dir: &str, glob: Option<&str>) -> Result<RefsResult> {
+        self.find_references_with_generated(name, dir, glob, false)
+    }
+
+    /// Reference search with an explicit generated-file policy.
+    pub fn find_references_with_generated(
+        &self,
+        name: &str,
+        dir: &str,
+        glob: Option<&str>,
+        include_generated: bool,
+    ) -> Result<RefsResult> {
         debug!(name = name, dir = dir, glob = ?glob, "find_references called");
         let canonical_dir = self.validate_dir(dir)?;
 
-        let references = refs::find_references(name, &canonical_dir, glob)?;
+        let (references, skipped) = refs::find_references_with_scan(
+            name,
+            &canonical_dir,
+            glob,
+            refs::FileScanOptions { include_generated },
+        )?;
 
         // 絶対パスを `dir` 基準の相対パスへ変換する。
         let references = relativize_paths(references, &canonical_dir);
@@ -482,6 +498,7 @@ impl AppService {
         let result = RefsResult {
             symbol: name.to_string(),
             references,
+            skipped,
         };
         debug!(
             name = name,
@@ -499,10 +516,28 @@ impl AppService {
         dir: &str,
         glob: Option<&str>,
     ) -> Result<Vec<RefsResult>> {
+        Ok(self
+            .find_references_batch_with_generated(names, dir, glob, false)?
+            .0)
+    }
+
+    /// Batch reference search with shared generated-file omission metadata.
+    pub fn find_references_batch_with_generated(
+        &self,
+        names: &[String],
+        dir: &str,
+        glob: Option<&str>,
+        include_generated: bool,
+    ) -> Result<(Vec<RefsResult>, Option<crate::models::skip::SkippedFiles>)> {
         debug!(names = ?names, dir = dir, glob = ?glob, "find_references_batch called");
         let canonical_dir = self.validate_dir(dir)?;
 
-        let batch = refs::find_references_batch(names, &canonical_dir, glob)?;
+        let (batch, skipped) = refs::find_references_batch_with_scan(
+            names,
+            &canonical_dir,
+            glob,
+            refs::FileScanOptions { include_generated },
+        )?;
 
         // 入力順を保ったまま `Vec<RefsResult>` に変換し、パスも相対化する。
         let results: Vec<RefsResult> = names
@@ -513,6 +548,7 @@ impl AppService {
                 RefsResult {
                     symbol: name.clone(),
                     references,
+                    skipped: None,
                 }
             })
             .collect();
@@ -523,7 +559,7 @@ impl AppService {
             total_refs = results.iter().map(|r| r.references.len()).sum::<usize>(),
             "find_references_batch completed"
         );
-        Ok(results)
+        Ok((results, skipped))
     }
 
     /// unified diff がコードベースへ与える影響を解析する。

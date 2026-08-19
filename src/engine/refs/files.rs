@@ -7,10 +7,70 @@ use anyhow::Result;
 use std::path::Path;
 
 use crate::language::LangId;
+use crate::models::skip::SkippedFiles;
+
+const SKIPPED_PATHS_CAP: usize = 50;
+
+/// Generated-file handling for a directory scan.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileScanOptions {
+    /// Include files that would otherwise be identified as generated.
+    pub include_generated: bool,
+}
+
+/// Files selected for parsing plus generated files intentionally omitted.
+#[derive(Debug, Default)]
+pub struct FileCollection {
+    pub files: Vec<std::path::PathBuf>,
+    skipped_generated: Vec<std::path::PathBuf>,
+}
+
+impl FileCollection {
+    /// Build bounded, deterministic metadata for machine-readable command output.
+    pub fn skipped(&self, dir: &Path) -> Option<SkippedFiles> {
+        if self.skipped_generated.is_empty() {
+            return None;
+        }
+        let generated = self.skipped_generated.len();
+        let mut paths: Vec<String> = self
+            .skipped_generated
+            .iter()
+            .map(|path| {
+                path.strip_prefix(dir)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        paths.sort();
+        paths.truncate(SKIPPED_PATHS_CAP);
+        Some(SkippedFiles {
+            generated,
+            truncated: generated > paths.len(),
+            paths,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateDecision {
+    Keep,
+    SkipGenerated,
+    Ignore,
+}
 
 /// ignore クレートでファイルを収集する（.gitignore 対応）。
 pub fn collect_files(dir: &Path, glob_pattern: Option<&str>) -> Result<Vec<std::path::PathBuf>> {
-    collect_files_with_excludes(dir, glob_pattern, &[], &[])
+    Ok(collect_files_scan(dir, glob_pattern, FileScanOptions::default())?.files)
+}
+
+/// Collect parseable files and report generated files omitted from the scan.
+pub fn collect_files_scan(
+    dir: &Path,
+    glob_pattern: Option<&str>,
+    options: FileScanOptions,
+) -> Result<FileCollection> {
+    collect_files_scan_with_excludes(dir, glob_pattern, &[], &[], options)
 }
 
 /// ignore クレートでファイルを収集し、ディレクトリ名またはネガティブ glob で除外する。
@@ -28,6 +88,23 @@ pub fn collect_files_with_excludes(
     excluded_dir_names: &[&str],
     excluded_globs: &[&str],
 ) -> Result<Vec<std::path::PathBuf>> {
+    Ok(collect_files_scan_with_excludes(
+        dir,
+        glob_pattern,
+        excluded_dir_names,
+        excluded_globs,
+        FileScanOptions::default(),
+    )?
+    .files)
+}
+
+fn collect_files_scan_with_excludes(
+    dir: &Path,
+    glob_pattern: Option<&str>,
+    excluded_dir_names: &[&str],
+    excluded_globs: &[&str],
+    options: FileScanOptions,
+) -> Result<FileCollection> {
     use ignore::WalkBuilder;
 
     let mut builder = WalkBuilder::new(dir);
@@ -83,13 +160,31 @@ pub fn collect_files_with_excludes(
     // 通すことで parse 対象になり得ないファイル (.png 等) の open を丸ごと省く。
     // par_iter + collect は入力順を保つため、出力順は逐次実装と一致する。
     use rayon::prelude::*;
-    let exclude_generated = !is_generated_exclusion_disabled();
-    let files: Vec<std::path::PathBuf> = candidates
+    let exclude_generated = !options.include_generated
+        && !is_generated_exclusion_disabled()
+        && !glob_names_explicit_file(glob_pattern);
+    let decisions: Vec<(std::path::PathBuf, CandidateDecision)> = candidates
         .into_par_iter()
-        .filter(|path| keep_candidate(path, exclude_generated))
+        .map(|path| {
+            let decision = classify_candidate(&path, exclude_generated);
+            (path, decision)
+        })
         .collect();
 
-    Ok(files)
+    let mut files = Vec::new();
+    let mut skipped_generated = Vec::new();
+    for (path, decision) in decisions {
+        match decision {
+            CandidateDecision::Keep => files.push(path),
+            CandidateDecision::SkipGenerated => skipped_generated.push(path),
+            CandidateDecision::Ignore => {}
+        }
+    }
+
+    Ok(FileCollection {
+        files,
+        skipped_generated,
+    })
 }
 
 /// 収集候補 1 ファイルを最終集合に残すかの判定。
@@ -100,23 +195,31 @@ pub fn collect_files_with_excludes(
 ///   shebang から言語推定する (CLI ツール / ビルドスクリプトで shebang 命名は一般的)。
 /// - 拡張子なしファイルは先頭 4KB を 1 回だけ読み、generated マーカー判定と shebang
 ///   判定を同じバッファで行う (旧実装は 2 回 open していた)。
-fn keep_candidate(path: &Path, exclude_generated: bool) -> bool {
+fn classify_candidate(path: &Path, exclude_generated: bool) -> CandidateDecision {
     if exclude_generated && is_generated_by_name(path) {
-        return false;
+        return CandidateDecision::SkipGenerated;
     }
     if LangId::from_path(camino::Utf8Path::new(path.to_str().unwrap_or(""))).is_ok() {
-        return !(exclude_generated && has_generated_marker(path));
+        return if exclude_generated && has_generated_marker(path) {
+            CandidateDecision::SkipGenerated
+        } else {
+            CandidateDecision::Keep
+        };
     }
     if path.extension().is_some() {
-        return false;
+        return CandidateDecision::Ignore;
     }
     let Some(head) = read_head_4k(path) else {
-        return false;
+        return CandidateDecision::Ignore;
     };
     if exclude_generated && head_has_generated_marker(&head) {
-        return false;
+        return CandidateDecision::SkipGenerated;
     }
-    detect_lang_from_shebang_head(&head).is_some()
+    if detect_lang_from_shebang_head(&head).is_some() {
+        CandidateDecision::Keep
+    } else {
+        CandidateDecision::Ignore
+    }
 }
 
 /// `ASTRO_SIGHT_NO_GENERATED_EXCLUSION=1` のときだけ generated ファイル除外を抑止する。
@@ -125,6 +228,19 @@ fn is_generated_exclusion_disabled() -> bool {
         .ok()
         .filter(|v| !v.is_empty() && v != "0")
         .is_some()
+}
+
+/// A glob explicitly names files when its final path segment has no glob meta.
+/// `**/parser.c` is explicit; `**/*.c` remains a directory-wide filtered scan.
+fn glob_names_explicit_file(glob_pattern: Option<&str>) -> bool {
+    let Some(pattern) = glob_pattern else {
+        return false;
+    };
+    let basename = pattern.rsplit('/').next().unwrap_or(pattern);
+    !basename.is_empty()
+        && !basename
+            .chars()
+            .any(|ch| matches!(ch, '*' | '?' | '[' | ']' | '{' | '}'))
 }
 
 /// IDE 補助 / minified / `@generated` マーカー付きのファイル単位 generated 判定。
@@ -180,11 +296,7 @@ fn has_generated_marker(path: &Path) -> bool {
 /// 読み込み済み先頭バッファに対する generated マーカー判定。マーカー文字列は UTF-8
 /// 妥当性を問わずバイト列としてマッチさせる (memchr::memmem)。
 fn head_has_generated_marker(head: &[u8]) -> bool {
-    memchr::memmem::find(head, b"@generated").is_some()
-        || memchr::memmem::find(head, b"DO NOT EDIT").is_some()
-        || memchr::memmem::find(head, b"Code generated by").is_some()
-        || memchr::memmem::find(head, b"This file is auto-generated").is_some()
-        || memchr::memmem::find(head, b"automatically generated").is_some()
+    crate::engine::generated::head_declares_generated(head)
 }
 
 /// 読み込み済み先頭バッファの shebang 行から言語を判定する。

@@ -53,11 +53,25 @@ pub fn handle_request(
                     )
                     .into());
                 }
-                let results = service.find_references_batch(&filtered, dir, req.glob.as_deref())?;
-                Ok(serde_json::to_value(results)?)
+                let (results, skipped) = service.find_references_batch_with_generated(
+                    &filtered,
+                    dir,
+                    req.glob.as_deref(),
+                    req.include_generated,
+                )?;
+                let mut response = serde_json::json!({ "results": results });
+                if let Some(skipped) = skipped {
+                    response["skipped"] = serde_json::to_value(skipped)?;
+                }
+                Ok(response)
             } else if let Some(name) = req.name.as_deref().map(str::trim).filter(|n| !n.is_empty())
             {
-                let result = service.find_references(name, dir, req.glob.as_deref())?;
+                let result = service.find_references_with_generated(
+                    name,
+                    dir,
+                    req.glob.as_deref(),
+                    req.include_generated,
+                )?;
                 Ok(serde_json::to_value(result)?)
             } else {
                 Err(AstroError::new(
