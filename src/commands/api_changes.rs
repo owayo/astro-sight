@@ -344,6 +344,8 @@ pub(crate) mod prepare;
 pub(crate) mod removed;
 pub(crate) mod signature;
 
+mod python_contract;
+
 mod python_signature;
 
 mod ref_index;
@@ -361,6 +363,7 @@ mod ts_signature;
 pub(crate) use diff_processing::*;
 pub(crate) use exported::*;
 pub(crate) use prepare::*;
+pub(crate) use python_contract::*;
 pub(crate) use python_signature::*;
 pub(crate) use removed::*;
 pub(crate) use signature::*;

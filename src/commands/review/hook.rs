@@ -76,6 +76,11 @@ struct HookModifiedSymbol<'a> {
         skip_serializing_if = "crate::models::review::is_false"
     )]
     no_resolved_internal_callers: bool,
+    /// 型契約変更として種別が確定した場合の内訳 (`kind` / `breaks`)。hook 出力は専用 DTO の
+    /// ため、`ApiSymbolChange` に足しただけでは載らない。既存キーは変えず値を足すだけなので
+    /// 既存 consumer の JSON パースは壊れない。分類できない変更では省略される。
+    #[serde(rename = "contract", skip_serializing_if = "Option::is_none")]
+    contract_change: Option<crate::models::review::ApiContractChange>,
 }
 
 /// dead シンボル用 DTO。`HookNameFile` と分けるのは、宣言行を持つのが
@@ -201,6 +206,7 @@ impl<'a> HookApi<'a> {
                     n: change.name.as_str(),
                     f: change.file.as_str(),
                     no_resolved_internal_callers: change.no_resolved_internal_callers,
+                    contract_change: change.contract_change,
                 })
                 .collect(),
             modified_closed_in_diff: api

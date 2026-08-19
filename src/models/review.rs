@@ -162,6 +162,60 @@ pub struct ApiSymbolChange {
     /// `modified` 経路でのみ算出する。他バケットは false のままで JSON からは省略される。
     #[serde(default, skip_serializing_if = "is_false")]
     pub no_resolved_internal_callers: bool,
+    /// 言語固有の型契約変更として種別が確定した場合の内訳 (Issue
+    /// 2026-08-18-python-typeddict-contract-change-classification)。
+    ///
+    /// **severity は一切変えない**。`api.mod` は「シグネチャが変わった」までしか言えず、
+    /// トリアージは「引数が増えたのか / 型が狭まったのか / キーが必須化したのか」を毎回
+    /// ソースまで見に行っていた。種別と「壊れる側」を添えて調査経路だけを短くする
+    /// (`no_resolved_internal_callers` と同じ方針)。
+    ///
+    /// 分類できた変更は降格経路 (`compatible_modified` / `modified_closed_in_diff`) に
+    /// 載せず、必ず blocking な `modified` に残す。リポジトリ内の参照が同一 diff で
+    /// 更新済みでも、外部リポジトリ / 動的生成された dict は静的に追えないため。
+    ///
+    /// 分類できない変更は `None` のまま従来どおり素の `api.mod` になる (網羅性は前提にしない)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_change: Option<ApiContractChange>,
+}
+
+/// 型契約変更の内訳。`kind` (何が変わったか) と `breaks` (どちら側が壊れるか) を組で持つ。
+///
+/// `kind` 単体にせず `breaks` を独立フィールドにしているのは、consumer 側に
+/// 「種別 → 壊れる側」の対応表を持たせないため。将来 variant が増えても、古い consumer が
+/// `breaks` だけを読んで方向を判断できる。逆に 2 つを `ApiSymbolChange` 直下へ並べると
+/// 「片方だけ存在する」不正状態が表現できてしまうため、Option の構造体 1 つにまとめる。
+///
+/// `severity` は持たせない。severity の正本はバケット (`modified` = blocking) であり、
+/// フィールドと二重管理にしない。
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ApiContractChange {
+    pub kind: ApiContractChangeKind,
+    pub breaks: ApiContractSide,
+}
+
+/// 型契約変更の種別。将来 TypeScript の類似分類 (optional property の必須化等) も
+/// 同じ enum に variant を足して載せられるよう、言語名を接頭辞に含めない命名にはしない
+/// (`typed_dict_` のように構造名で始める)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiContractChangeKind {
+    /// `class X(TypedDict, total=False)` → `class X(TypedDict)`。
+    /// 省略可だったキーが必須化する。
+    TypedDictTotalFalseRemoved,
+    /// `class X(TypedDict)` → `class X(TypedDict, total=False)`。
+    /// 必須だったキーが省略可になる。
+    TypedDictTotalFalseAdded,
+}
+
+/// 契約変更で壊れる側。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiContractSide {
+    /// 値を作る側 (dict literal を組み立てる呼び出し側)。キーの必須化で壊れる。
+    Producer,
+    /// 値を読む側。キーが省略可になる / 値集合が広がることで壊れる。
+    Consumer,
 }
 
 /// 互換性ありと判定された api.mod。シグネチャ文字列は変わったが公開契約 (呼び出し側の

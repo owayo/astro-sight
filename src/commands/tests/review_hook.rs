@@ -206,6 +206,7 @@ fn build_review_hook_json_mixed_compatible_and_breaking_impact_keeps_breaking_on
                     "export function loadTask(id: string, required: boolean)".to_string(),
                 ),
                 no_resolved_internal_callers: false,
+                contract_change: None,
             }],
             moved: Vec::new(),
             property_to_field: Vec::new(),
@@ -767,6 +768,7 @@ fn build_review_hook_json_api_modified_is_blocking() {
                 old_signature: Some("fn foo()".to_string()),
                 new_signature: Some("fn foo(x: u32)".to_string()),
                 no_resolved_internal_callers: false,
+                contract_change: None,
             }],
             moved: Vec::new(),
             property_to_field: Vec::new(),
@@ -787,6 +789,65 @@ fn build_review_hook_json_api_modified_is_blocking() {
     assert!(
         hook_json["api"]["mod"][0].get("no_callers").is_none(),
         "呼び出し参照ありなら no_callers は省略される: {hook_json}"
+    );
+}
+
+/// 型契約変更として分類された api.mod には hook 出力にも `contract` を添える。
+/// `ApiSymbolChange` に足しただけでは hook 専用 DTO には載らないため、実出力で検証する
+/// (Issue 2026-08-18-python-typeddict-contract-change-classification)。
+#[test]
+fn build_review_hook_json_api_modified_carries_contract_change() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let result = ReviewResult {
+        impact: crate::models::impact::ContextResult {
+            changes: Vec::new(),
+            skipped: None,
+            truncations: Vec::new(),
+        },
+        missing_cochanges: Vec::new(),
+        cochange_diagnostics: Default::default(),
+        api_changes: ApiChanges {
+            added: Vec::new(),
+            removed: Vec::new(),
+            modified: vec![ApiSymbolChange {
+                name: "Payload".to_string(),
+                kind: "class".to_string(),
+                file: "models.py".to_string(),
+                old_signature: Some("class Payload(TypedDict, total=False):".to_string()),
+                new_signature: Some("class Payload(TypedDict):".to_string()),
+                no_resolved_internal_callers: false,
+                contract_change: Some(crate::models::review::ApiContractChange {
+                    kind: crate::models::review::ApiContractChangeKind::TypedDictTotalFalseRemoved,
+                    breaks: crate::models::review::ApiContractSide::Producer,
+                }),
+            }],
+            moved: Vec::new(),
+            property_to_field: Vec::new(),
+            removed_dead: Vec::new(),
+            modified_closed_in_diff: Vec::new(),
+            const_value_changes: Vec::new(),
+            compatible_modified: Vec::new(),
+        },
+        dead_symbols: Vec::new(),
+        test_only_symbols: Vec::new(),
+        skipped: None,
+        truncations: Vec::new(),
+    };
+
+    let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
+    let hook_json = build.value.expect("api.mod は hook JSON に出すべき");
+    assert!(
+        build.is_blocking,
+        "分類しても blocking は変えない: {hook_json}"
+    );
+    assert_eq!(
+        hook_json["api"]["mod"][0]["contract"]["kind"], "typed_dict_total_false_removed",
+        "{hook_json}"
+    );
+    assert_eq!(
+        hook_json["api"]["mod"][0]["contract"]["breaks"], "producer",
+        "{hook_json}"
     );
 }
 
@@ -815,6 +876,7 @@ fn build_review_hook_json_api_modified_without_callers_is_flagged_but_still_bloc
                 old_signature: Some("fn foo()".to_string()),
                 new_signature: Some("fn foo(x: u32)".to_string()),
                 no_resolved_internal_callers: true,
+                contract_change: None,
             }],
             moved: Vec::new(),
             property_to_field: Vec::new(),
@@ -925,6 +987,7 @@ fn build_review_hook_json_const_value_only_is_informational() {
                 old_signature: Some("pub const ENEMY_SPEED: f32".to_string()),
                 new_signature: Some("pub const ENEMY_SPEED: f32".to_string()),
                 no_resolved_internal_callers: false,
+                contract_change: None,
             }],
             compatible_modified: Vec::new(),
         },
@@ -970,6 +1033,7 @@ fn build_review_hook_json_const_value_is_blocking_under_strict() {
                 old_signature: Some("pub const ENEMY_SPEED: f32".to_string()),
                 new_signature: Some("pub const ENEMY_SPEED: f32".to_string()),
                 no_resolved_internal_callers: false,
+                contract_change: None,
             }],
             compatible_modified: Vec::new(),
         },

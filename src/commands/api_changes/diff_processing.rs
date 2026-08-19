@@ -309,9 +309,16 @@ fn collect_modified_symbols(
             {
                 continue;
             }
-            // closed-in-diff: 同一ファイル内でしか呼ばれていない関数のシグネチャ変更は除外
-            if is_internally_connected(in_file_callees, name)
-                && !has_cross_file_refs(ref_index, &df.new_path, name)
+            // closed-in-diff: 同一ファイル内でしか呼ばれていない関数のシグネチャ変更は除外。
+            //
+            // ただし Python の TypedDict `total=` 変更候補だけはここで落とさない。
+            // 落とすと契約変更の 3 値判定に到達できず、「キーが必須化する破壊的変更」が
+            // api.mod にすら出なくなる。判定が `NotApplicable` なら
+            // `classify_signature_change` 側で従来どおり捨てる。
+            let internally_closed = is_internally_connected(in_file_callees, name)
+                && !has_cross_file_refs(ref_index, &df.new_path, name);
+            if internally_closed
+                && !may_be_python_typed_dict_total_change(kind, old_sig, new_sig, lang_id_for_file)
             {
                 continue;
             }
@@ -337,6 +344,8 @@ fn collect_modified_symbols(
                 new_signature: Some(new_sig.clone()),
                 // blocking な api.mod に確定した時点でのみ算出する (classify_signature_change)。
                 no_resolved_internal_callers: false,
+                // 型契約変更として種別が確定した時点で埋める (classify_signature_change)。
+                contract_change: None,
             };
             classify_signature_change(
                 inputs,
@@ -348,6 +357,7 @@ fn collect_modified_symbols(
                     old_sig,
                     new_sig,
                     lang_id: lang_id_for_file,
+                    internally_closed,
                 },
             );
         }
@@ -375,6 +385,7 @@ pub(crate) fn classify_signature_change(
         old_sig,
         new_sig,
         lang_id: lang_id_for_file,
+        internally_closed,
     } = site;
     let name = change.name.clone();
     // const / 非 mut static / export const の値 (initializer) のみ変更は const_value_changes へ
@@ -396,6 +407,39 @@ pub(crate) fn classify_signature_change(
         lang_id: lang_id_for_file,
     };
     let sources = &mut SignatureSourceCache::default();
+    // Python の TypedDict で `total=` が絡む変更は blocking な api.mod に確定させる。
+    // 互換判定器や closed-in-diff 判定より**前**に置くのが要点で、「リポジトリ内の参照が
+    // 同一 diff で更新済み」でも降格させないため (外部リポジトリ / 動的生成された dict は
+    // 静的に追えない。Issue 2026-08-18-python-typeddict-contract-change-classification)。
+    //
+    // **種別を確定できなくても降格させない**。分類できないことは「破壊的でない」証明では
+    // ないため (`NotRequired` 同居で分類を諦めたケースでも bare フィールドの requiredness は
+    // 実際に反転する)。ラベル (`contract_change`) は確定したときだけ添える。
+    match detect_python_typed_dict_total_change(&site, sources) {
+        // TypedDict の `total=` 変更だと**証明できなかった**ので、同一ファイル内でしか
+        // 使われていないシンボルは従来どおり api.mod に出さない (上の早期 continue の続き)。
+        // 証明できないケースまで出すと、`class X(Base, total=False)` のような無関係な
+        // Python class を新たに blocking にしてしまう。この早期除外そのものの是非は
+        // 言語横断の既存ルールなので本 Issue では触らない。
+        PythonContractDetection::NotApplicable => {
+            if internally_closed {
+                return;
+            }
+        }
+        PythonContractDetection::PotentialBreakingChange if internally_closed => {
+            return;
+        }
+        detection => {
+            let mut change = change;
+            if let PythonContractDetection::Classified(contract) = detection {
+                change.contract_change = Some(contract);
+            }
+            change.no_resolved_internal_callers =
+                has_no_resolved_internal_callers(ref_index, dir, &name, state.closure_caches);
+            state.buckets.modified.push(change);
+            return;
+        }
+    }
     // React component を memo / forwardRef 等の HOC でラップしただけは compatible_modified
     if let Some(compat) = detect_react_wrapper_compatible_mod(ref_index, &site, sources) {
         state.buckets.compatible_modified.push(compat);

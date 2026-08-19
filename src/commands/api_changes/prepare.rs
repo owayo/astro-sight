@@ -99,6 +99,15 @@ pub(crate) struct SignatureChangeSite<'a> {
     pub(crate) old_sig: &'a str,
     pub(crate) new_sig: &'a str,
     pub(crate) lang_id: Option<crate::language::LangId>,
+    /// 同一ファイル内でしか使われておらず、cross-file 参照が 1 件も無い。
+    ///
+    /// 通常はこの時点で api.mod から落とすが、Python の TypedDict `total=` 変更候補だけは
+    /// 契約変更の 3 値判定に必ず通す必要があるため落とさずここまで運び、
+    /// **種別を確定できたときだけ**残して他は従来どおり捨てる
+    /// (Issue 2026-08-18-python-typeddict-contract-change-classification)。
+    /// 証明できないケースまで残すと、`class X(Base, total=False)` のような無関係な
+    /// Python class を新たに blocking にしてしまうため。
+    pub(crate) internally_closed: bool,
 }
 
 /// Phase 0 で抽出した diff ファイルごとの exported シンボル。
