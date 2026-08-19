@@ -91,6 +91,42 @@ fn refs_reports_generated_skips_and_supports_opt_in_and_explicit_glob() {
 }
 
 #[test]
+fn refs_legacy_generated_env_optout_is_process_isolated() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("_ide_helper.php"),
+        "<?php\nfunction legacy_env_needle() {}\nlegacy_env_needle();\n",
+    )
+    .unwrap();
+
+    let mut default_command = cargo_bin();
+    let default = default_command
+        .args(["refs", "--name", "legacy_env_needle", "--dir"])
+        .arg(dir.path())
+        .args(["--glob", "**/*.php"])
+        .env_remove("ASTRO_SIGHT_NO_GENERATED_EXCLUSION")
+        .output()
+        .expect("run refs with default generated exclusion");
+    assert!(default.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&default.stdout).unwrap();
+    assert!(json["refs"].as_array().unwrap().is_empty());
+    assert_eq!(json["skipped"]["generated"], 1);
+
+    let mut optout_command = cargo_bin();
+    let optout = optout_command
+        .args(["refs", "--name", "legacy_env_needle", "--dir"])
+        .arg(dir.path())
+        .args(["--glob", "**/*.php"])
+        .env("ASTRO_SIGHT_NO_GENERATED_EXCLUSION", "1")
+        .output()
+        .expect("run refs with legacy generated exclusion opt-out");
+    assert!(optout.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&optout.stdout).unwrap();
+    assert!(!json["refs"].as_array().unwrap().is_empty());
+    assert!(json.get("skipped").is_none());
+}
+
+#[test]
 fn refs_generated_marker_rejects_prose_and_string_literals() {
     let dir = tempfile::TempDir::new().unwrap();
     std::fs::write(
