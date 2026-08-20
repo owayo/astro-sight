@@ -458,7 +458,7 @@ astro-sight review --dir . --git \
 
 `--git --base <rev>` を指定した場合、`missing_cochanges` の blame 解析にも同じ base を使う。複数コミット分の PR をまとめてレビューするときも、diff と共変更候補の解析範囲が揃う。
 
-`missing_cochanges` は共変更が 3 回以上あるペアだけを候補にする (`--cochange-min-samples`、既定 3)。変更行 blame では証拠コミットが 2 件しかない起点が珍しくなく、「1 回だけ一緒に変わった」ペアが confidence 1.0 として上位に並ぶため。探索的に小標本まで見たい場合は `--cochange-min-samples 2` を指定する (単体の `cochange` コマンドは従来どおり既定 2)。
+`missing_cochanges` は共変更が 3 回以上あるペアだけを候補にする (`--cochange-min-samples`、既定 3)。変更行 blame では証拠コミットが 2 件しかない起点が珍しくなく、「1 回だけ一緒に変わった」ペアが confidence 1.0 として上位に並ぶため。探索的に小標本まで見たい場合は `--cochange-min-samples 2` を指定する (単体の `cochange` コマンドは従来どおり既定 2)。候補の重複排除と上位 10 件の選択には、単体コマンドと同じ平滑化済み `score` を使う。raw confidence は証拠の表示・閾値判定に残しつつ、3/3 の小標本が 30/40 のような十分な標本より機械的に上位へ来ることを防ぐ。
 
 依存宣言ファイル (`Cargo.toml` / `package.json` / `pyproject.toml` 等) とロックファイルは `missing_cochanges` の候補にしない。依存を追加するコミットではこれらとソースが必ず一緒に変わるため履歴相関が 100% になるが、その相関は「依存を追加したとき」限定で、import を 1 行も増減させない本体変更には因果が無い。単体の `cochange` コマンドは「過去に一緒に変更された」事実としてマニフェストを出し続ける (ロックファイルは生成物なので両方で除外)。
 
@@ -551,10 +551,10 @@ astro-sight dead-code --dir . --git --staged
 
 #### フレームワーク自動検出 (v26.5.120+)
 
-`--framework` 未指定時でも、`<dir>/package.json` の `dependencies` / `devDependencies` に `next` キーがあれば自動で `nextjs` プリセットを適用する。`peerDependencies` / `optionalDependencies` 経由は誤爆しやすいため対象外。明示指定 (`--framework laravel` 等) は常に auto detect より優先される。
+`--framework` 未指定時でも、`<dir>` 直下またはモノレポ配下の `package.json` の `dependencies` / `devDependencies` に `next` キーがあれば、自動で `nextjs` プリセットを適用する。自動検出した規約 glob は各 Next.js workspace からの相対パスへ限定するため、非 Next.js の兄弟 workspace にある `app/**/page.tsx` は除外しない。`node_modules`・生成物・symlink は探索対象外で、`peerDependencies` / `optionalDependencies` 経由も誤爆しやすいため対象外。明示指定 (`--framework laravel` 等) は常に auto detect より優先される。
 
 ```bash
-# package.json に `next` があれば自動的に nextjs プリセットが適用される
+# ルートまたは配下 workspace の package.json に `next` があれば自動適用される
 astro-sight dead-code --dir .
 astro-sight review --dir . --git
 ```

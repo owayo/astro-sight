@@ -730,8 +730,9 @@ pub use dead_code::{CmdDeadCodeOpts, cmd_dead_code};
 //  そこから `super::dead_code::…` を直接参照している)
 #[cfg(test)]
 pub(crate) use dead_code::{
-    auto_detect_framework, detect_dead_symbols_from_files, extract_dead_code_candidates_from_file,
-    filter_dead_by_wip_added, filter_diff_files_for_dead_code, resolve_dead_code_excludes,
+    auto_detect_framework_roots, detect_dead_symbols_from_files,
+    extract_dead_code_candidates_from_file, filter_dead_by_wip_added,
+    filter_diff_files_for_dead_code, resolve_dead_code_excludes,
     resolve_framework_globs_with_auto_detect,
 };
 

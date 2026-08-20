@@ -1075,13 +1075,13 @@ fn is_internally_connected_does_not_match_disjoint() {
 }
 
 // ------------------------------------------------------------------
-// auto_detect_framework ヘルパー
+// auto_detect_framework_roots ヘルパー
 // ------------------------------------------------------------------
 
 #[test]
-fn auto_detect_framework_returns_none_without_package_json() {
+fn auto_detect_framework_returns_empty_without_package_json() {
     let dir = tempfile::tempdir().expect("tempdir");
-    assert!(auto_detect_framework(dir.path().to_str().expect("utf-8")).is_none());
+    assert!(auto_detect_framework_roots(dir.path().to_str().expect("utf-8")).is_empty());
 }
 
 #[test]
@@ -1093,8 +1093,8 @@ fn auto_detect_framework_returns_nextjs_for_dependencies() {
     )
     .expect("pkg");
     assert_eq!(
-        auto_detect_framework(dir.path().to_str().expect("utf-8")),
-        Some("nextjs")
+        auto_detect_framework_roots(dir.path().to_str().expect("utf-8")),
+        vec![std::path::PathBuf::new()]
     );
 }
 
@@ -1107,9 +1107,50 @@ fn auto_detect_framework_returns_nextjs_for_dev_dependencies() {
     )
     .expect("pkg");
     assert_eq!(
-        auto_detect_framework(dir.path().to_str().expect("utf-8")),
-        Some("nextjs")
+        auto_detect_framework_roots(dir.path().to_str().expect("utf-8")),
+        vec![std::path::PathBuf::new()]
     );
+}
+
+#[test]
+fn auto_detect_framework_finds_nextjs_in_monorepo_package() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app_dir = dir.path().join("apps/site");
+    let admin_dir = dir.path().join("packages/admin");
+    fs::create_dir_all(&app_dir).expect("app dir");
+    fs::create_dir_all(&admin_dir).expect("admin dir");
+    fs::write(
+        app_dir.join("package.json"),
+        r#"{"dependencies": {"next": "15.0.0"}}"#,
+    )
+    .expect("pkg");
+    fs::write(
+        admin_dir.join("package.json"),
+        r#"{"devDependencies": {"next": "15.0.0"}}"#,
+    )
+    .expect("admin pkg");
+
+    assert_eq!(
+        auto_detect_framework_roots(dir.path().to_str().expect("utf-8")),
+        vec![
+            std::path::PathBuf::from("apps/site"),
+            std::path::PathBuf::from("packages/admin")
+        ]
+    );
+}
+
+#[test]
+fn auto_detect_framework_ignores_nextjs_inside_node_modules() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dependency_dir = dir.path().join("node_modules/example");
+    fs::create_dir_all(&dependency_dir).expect("dependency dir");
+    fs::write(
+        dependency_dir.join("package.json"),
+        r#"{"dependencies": {"next": "15.0.0"}}"#,
+    )
+    .expect("pkg");
+
+    assert!(auto_detect_framework_roots(dir.path().to_str().expect("utf-8")).is_empty());
 }
 
 /// `peerDependencies` / `optionalDependencies` 経由の `next` は library 側の同梱で
@@ -1122,14 +1163,14 @@ fn auto_detect_framework_ignores_peer_dependencies() {
         r#"{"peerDependencies": {"next": "14.0.0"}}"#,
     )
     .expect("pkg");
-    assert!(auto_detect_framework(dir.path().to_str().expect("utf-8")).is_none());
+    assert!(auto_detect_framework_roots(dir.path().to_str().expect("utf-8")).is_empty());
 }
 
 #[test]
 fn auto_detect_framework_returns_none_for_invalid_json() {
     let dir = tempfile::tempdir().expect("tempdir");
     fs::write(dir.path().join("package.json"), "{not valid json").expect("pkg");
-    assert!(auto_detect_framework(dir.path().to_str().expect("utf-8")).is_none());
+    assert!(auto_detect_framework_roots(dir.path().to_str().expect("utf-8")).is_empty());
 }
 
 #[test]
@@ -1140,7 +1181,7 @@ fn auto_detect_framework_returns_none_when_no_next_dependency() {
         r#"{"dependencies": {"react": "18.0.0"}}"#,
     )
     .expect("pkg");
-    assert!(auto_detect_framework(dir.path().to_str().expect("utf-8")).is_none());
+    assert!(auto_detect_framework_roots(dir.path().to_str().expect("utf-8")).is_empty());
 }
 
 /// `resolve_framework_globs_with_auto_detect`: 明示指定があれば auto detect は無視する。
@@ -1179,6 +1220,23 @@ fn resolve_framework_globs_with_auto_detect_uses_auto_when_no_explicit() {
             .iter()
             .any(|g| g.contains("app/**") || g.contains("pages/**"))
     );
+}
+
+#[test]
+fn resolve_framework_globs_with_auto_detect_scopes_monorepo_globs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app_dir = dir.path().join("apps/site");
+    fs::create_dir_all(&app_dir).expect("app dir");
+    fs::write(
+        app_dir.join("package.json"),
+        r#"{"dependencies": {"next": "14.0.0"}}"#,
+    )
+    .expect("pkg");
+
+    let globs = resolve_framework_globs_with_auto_detect(None, dir.path().to_str().expect("utf-8"))
+        .expect("resolve");
+    assert!(!globs.is_empty());
+    assert!(globs.iter().all(|glob| glob.starts_with("apps/site/")));
 }
 
 /// package.json も `--framework` も無いケースは空 Vec を返す (Ok(Vec::new()))。

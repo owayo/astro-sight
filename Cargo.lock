@@ -134,6 +134,7 @@ dependencies = [
  "clap",
  "dhat",
  "dirs",
+ "globset",
  "hashbrown",
  "ignore",
  "libc",

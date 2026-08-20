@@ -129,7 +129,7 @@ Review in dependency order: contracts/types → implementation → callers → t
 
 - `--framework` filters `dead_symbols` only. `--exclude-dir` / `--exclude-glob` affect both impact and `dead_symbols` (same meaning as on `dead-code`). `review` always excludes vendor / tests / build from `dead_symbols`.
 - `--dead-scope` defaults to `touched-symbols` with `--hook`, `all` otherwise. With `--hook`, exports newly added in the same diff are excluded from dead warnings (WIP noise); `--include-wip-dead` opts back in.
-- `--git --base <rev>` uses the same base for the diff and for blame-backed `missing_cochanges`. `--min-confidence` (default 0.3) tunes `missing_cochanges` volume. `--cochange-min-samples` (default 3, stricter than the standalone `cochange` default of 2) requires a pair to have changed together at least that many times: with changed-line blame a source often has only 2 evidence commits, so a pair that co-changed once reaches confidence 1.0 and dominates the report. Pass 2 to see small-sample candidates. Dependency manifests (`Cargo.toml` / `package.json` / `pyproject.toml`, ...) and lockfiles are never reported as missing co-changes: dependency-adding commits always touch them together with sources, so the historical correlation hits 100% even though a body-only edit that adds no imports has no causal link to them (the standalone `cochange` command still reports manifests as historical fact; lockfiles are excluded there too as generated files). Each entry carries `n` (co-change count) / `d` (denominator) and `e: "history"` when the evidence came from file-history fallback rather than changed-line blame.
+- `--git --base <rev>` uses the same base for the diff and for blame-backed `missing_cochanges`. `--min-confidence` (default 0.3) tunes `missing_cochanges` volume. `--cochange-min-samples` (default 3, stricter than the standalone `cochange` default of 2) requires a pair to have changed together at least that many times: with changed-line blame a source often has only 2 evidence commits, so a pair that co-changed once reaches confidence 1.0 and dominates the report. Pass 2 to see small-sample candidates. Deduplication and the final top-10 selection preserve the standalone command's smoothed `score`; raw confidence remains the filter and displayed evidence. Dependency manifests (`Cargo.toml` / `package.json` / `pyproject.toml`, ...) and lockfiles are never reported as missing co-changes: dependency-adding commits always touch them together with sources, so the historical correlation hits 100% even though a body-only edit that adds no imports has no causal link to them (the standalone `cochange` command still reports manifests as historical fact; lockfiles are excluded there too as generated files). Each entry carries `n` (co-change count) / `d` (denominator) and `e: "history"` when the evidence came from file-history fallback rather than changed-line blame.
 - If all changed files are lexer-only languages (e.g. Xojo), `impact` / `api_changes` / `dead_symbols` come back empty — use `symbols` / `refs` / `dead-code` per file instead.
 - CLI-only (not available in `session`).
 
@@ -213,12 +213,11 @@ astro-sight lint --path <file> --rules rules.yaml
 Exported symbols with zero non-definition references. Diff flags limit the scan to diff-related files; without a diff, scans the whole project. Package-manager trees, test dirs, and build artifacts are excluded by default (`--include-vendor` / `--include-tests` / `--include-build` to opt back in).
 
 ```bash
-astro-sight dead-code --dir .
+astro-sight dead-code --dir .                       # auto-detects each monorepo workspace with a `next` dependency
 astro-sight dead-code --dir . --glob "**/*.rs"
 astro-sight dead-code --dir . --git                # diff-related files only
 astro-sight dead-code --dir . --git --staged
 astro-sight dead-code --dir . --framework laravel  # Laravel conventions (migrations, Controllers, Middleware, ...)
-astro-sight dead-code --dir . --framework nextjs   # auto-detected when package.json has a `next` dep
 astro-sight dead-code --dir . --exclude-dir generated --exclude-glob 'app/Legacy/**'
 astro-sight dead-code --dir . --git --dead-scope touched-symbols   # only dead symbols declared inside diff hunks
 ```

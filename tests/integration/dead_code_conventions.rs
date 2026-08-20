@@ -1028,6 +1028,70 @@ fn dead_code_auto_detect_nextjs_from_package_json_dependencies() {
     );
 }
 
+/// ルートに manifest がないモノレポでも、配下の Next.js workspace を自動検出する。
+#[test]
+fn dead_code_auto_detect_nextjs_from_monorepo_package() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    let app = root.join("apps/site");
+    let sibling = root.join("apps/api");
+
+    std::fs::create_dir_all(app.join("src/app/dashboard")).unwrap();
+    std::fs::create_dir_all(app.join("src/services")).unwrap();
+    std::fs::create_dir_all(sibling.join("app/admin")).unwrap();
+    std::fs::write(
+        app.join("package.json"),
+        r#"{ "name": "site", "dependencies": { "next": "^15.0.0" } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("src/app/dashboard/page.tsx"),
+        "export default function DashboardPage() { return null; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("src/services/orphan.ts"),
+        "export function unusedService() { return 1; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        sibling.join("package.json"),
+        r#"{ "name": "api", "dependencies": { "react": "^19.0.0" } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        sibling.join("app/admin/page.tsx"),
+        "export default function SiblingPage() { return null; }\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+
+    assert!(
+        !names.iter().any(|n| n == "DashboardPage"),
+        "monorepo 配下の package.json で Next.js を検出し、規約ページを除外する: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "unusedService"),
+        "同じ workspace 内でも規約外 export は dead のままにする: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "SiblingPage"),
+        "Next.js ではない兄弟 workspace の規約風ファイルは除外しない: {names:?}"
+    );
+}
+
 /// `devDependencies` 経由の `next` 依存も自動検出対象に含める (Next.js は通常
 /// dependencies に置かれるが、SSG 専用や CLI tooling として dev に置くプロジェクトもある)。
 #[test]

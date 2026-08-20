@@ -18,6 +18,7 @@ camino = { version = "1.2.5", features = ["serde1"] }
 clap = { version = "4.6.5", features = ["derive"] }
 dhat = { version = "0.3.3", optional = true }
 dirs = "6.0.0"
+globset = "0.4.19"
 hashbrown = "0.17.1"
 ignore = "0.4.33"
 logroller = "0.1.12"

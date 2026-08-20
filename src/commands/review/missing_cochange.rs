@@ -4,9 +4,10 @@
 //! API 差分検出 (`api_changes`) ではなく review 側の責務のためここに置く。
 
 use anyhow::Result;
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
-use crate::models::cochange::CoChangeOptions;
+use crate::models::cochange::{CoChangeEntry, CoChangeOptions};
 use crate::models::review::MissingCochange;
 use crate::service::AppService;
 
@@ -216,6 +217,58 @@ pub(crate) struct MissingCochangeReport {
     pub(crate) diagnostics: crate::models::cochange::CoChangeDiagnostics,
 }
 
+/// `MissingCochange` の公開形式を変えず、cochange エンジンが計算したランキング情報を
+/// review の重複排除・上位 10 件選択まで保持する。
+#[derive(Debug, Clone)]
+struct RankedMissingCochange {
+    item: MissingCochange,
+    ranking: f64,
+    is_history_evidence: bool,
+}
+
+impl RankedMissingCochange {
+    fn new(item: MissingCochange, entry: &CoChangeEntry, smoothing_on: bool) -> Self {
+        Self {
+            item,
+            ranking: entry.ranking_value(smoothing_on),
+            is_history_evidence: entry.is_history_evidence(),
+        }
+    }
+}
+
+/// cochange エンジンと同じ基準で候補を比較する。
+///
+/// raw confidence だけで比較すると、3/3 の小標本が 30/40 の十分な標本より上位になり、
+/// エンジン側で計算した Bayesian smoothing の順位を review が壊してしまう。
+fn compare_ranked_missing(a: &RankedMissingCochange, b: &RankedMissingCochange) -> Ordering {
+    b.ranking
+        .partial_cmp(&a.ranking)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| b.item.co_changes.cmp(&a.item.co_changes))
+        .then_with(|| {
+            b.item
+                .confidence
+                .partial_cmp(&a.item.confidence)
+                .unwrap_or(Ordering::Equal)
+        })
+        .then_with(|| a.is_history_evidence.cmp(&b.is_history_evidence))
+        .then_with(|| a.item.file.cmp(&b.item.file))
+        .then_with(|| a.item.expected_with.cmp(&b.item.expected_with))
+}
+
+fn insert_best_missing(
+    best: &mut HashMap<String, RankedMissingCochange>,
+    candidate: RankedMissingCochange,
+) {
+    best.entry(candidate.item.file.clone())
+        .and_modify(|existing| {
+            if compare_ranked_missing(&candidate, existing).is_lt() {
+                *existing = candidate.clone();
+            }
+        })
+        .or_insert(candidate);
+}
+
 pub(crate) fn detect_missing_cochanges(
     service: &AppService,
     dir: &str,
@@ -278,6 +331,7 @@ pub(crate) fn detect_missing_cochanges(
         },
         ..CoChangeOptions::default()
     };
+    let smoothing_on = !opts.disable_smoothing;
     let cochange_result = match service.analyze_cochange(dir, &opts) {
         Ok(r) => r,
         Err(err) => {
@@ -296,9 +350,8 @@ pub(crate) fn detect_missing_cochanges(
         }
     };
 
-    // 各 missing file につき最も confidence が高いペアのみ残す
-    let mut best: std::collections::HashMap<String, MissingCochange> =
-        std::collections::HashMap::new();
+    // 各 missing file につき、エンジンと同じランキングで最良のペアのみ残す。
+    let mut best: HashMap<String, RankedMissingCochange> = HashMap::new();
     for entry in &cochange_result.entries {
         // 依存マニフェスト/ロックペアは片側変更が正規操作として頻発するためスキップ
         if is_dependency_manifest_pair(&entry.file_a, &entry.file_b) {
@@ -335,32 +388,66 @@ pub(crate) fn detect_missing_cochanges(
             None
         };
 
-        if let Some(c) = candidate {
-            best.entry(c.file.clone())
-                .and_modify(|existing| {
-                    if c.confidence > existing.confidence {
-                        *existing = c.clone();
-                    }
-                })
-                .or_insert(c);
+        if let Some(candidate) = candidate {
+            insert_best_missing(
+                &mut best,
+                RankedMissingCochange::new(candidate, entry, smoothing_on),
+            );
         }
     }
 
-    // confidence 降順でソートし最大10件に制限。
-    // confidence は量子化されるため同値が並びやすく、confidence だけの stable sort だと
-    // HashMap (RandomState) の反復順が同値グループ内にそのまま残る。truncate(10) が
-    // 実行ごとに違う部分集合を落とすことになるので、file / expected_with で全順序にする。
-    let mut missing: Vec<MissingCochange> = best.into_values().collect();
-    missing.sort_by(|a, b| {
-        b.confidence
-            .partial_cmp(&a.confidence)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.file.cmp(&b.file))
-            .then_with(|| a.expected_with.cmp(&b.expected_with))
-    });
-    missing.truncate(10);
+    // エンジンの順位を保ったまま最大 10 件へ絞る。path まで含む全順序なので、
+    // HashMap (RandomState) の反復順に左右されず出力は決定的になる。
+    let mut ranked: Vec<RankedMissingCochange> = best.into_values().collect();
+    ranked.sort_by(compare_ranked_missing);
+    ranked.truncate(10);
+    let missing = ranked.into_iter().map(|candidate| candidate.item).collect();
     Ok(MissingCochangeReport {
         missing,
         diagnostics: cochange_result.diagnostics,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(
+        file: &str,
+        expected_with: &str,
+        confidence: f64,
+        co_changes: usize,
+        ranking: f64,
+    ) -> RankedMissingCochange {
+        RankedMissingCochange {
+            item: MissingCochange {
+                file: file.to_string(),
+                expected_with: expected_with.to_string(),
+                confidence,
+                co_changes,
+                denominator: Some(co_changes),
+                evidence: None,
+            },
+            ranking,
+            is_history_evidence: false,
+        }
+    }
+
+    #[test]
+    fn smoothed_ranking_is_preserved_for_deduplication_and_sorting() {
+        let small_sample = candidate("missing.rs", "small.rs", 1.0, 3, 0.33);
+        let sufficient_sample = candidate("missing.rs", "stable.rs", 0.75, 30, 0.64);
+        let another = candidate("another.rs", "source.rs", 0.9, 9, 0.5);
+
+        let mut best = HashMap::new();
+        insert_best_missing(&mut best, small_sample);
+        insert_best_missing(&mut best, sufficient_sample);
+        insert_best_missing(&mut best, another);
+
+        let mut ranked: Vec<_> = best.into_values().collect();
+        ranked.sort_by(compare_ranked_missing);
+
+        assert_eq!(ranked[0].item.expected_with, "stable.rs");
+        assert_eq!(ranked[1].item.file, "another.rs");
+    }
 }

@@ -816,8 +816,8 @@ pub(crate) const NEXTJS_PRESET_EXCLUDE_GLOBS: &[&str] = &[
 /// `resolve_framework_globs` の auto-detect 対応版。
 ///
 /// 呼び出し側で `framework` が明示指定されていれば従来通り `resolve_framework_globs` に
-/// 委譲する。未指定の場合は `dir` 直下の `package.json` を読んで `next` 依存を検出し、
-/// 見つかれば `"nextjs"` プリセットを適用する。明示指定が auto detect より常に優先される。
+/// 委譲する。未指定の場合は `dir` 配下の `package.json` を調べ、`next` 依存を持つ
+/// workspace ごとに相対化したプリセットを適用する。明示指定が auto detect より常に優先される。
 ///
 /// 自動検出に失敗した場合 (package.json なし、JSON パース失敗、依存不一致) は空 Vec を
 /// 返す。debug ログを出さない (副作用最小化のため、検出結果は呼び出し側の review JSON 等で
@@ -829,32 +829,122 @@ pub(crate) fn resolve_framework_globs_with_auto_detect(
     if framework.is_some() {
         return resolve_framework_globs(framework);
     }
-    match auto_detect_framework(dir) {
-        Some(name) => resolve_framework_globs(Some(name)),
-        None => Ok(Vec::new()),
+
+    let mut globs = Vec::new();
+    for workspace in auto_detect_framework_roots(dir) {
+        let Some(prefix) = workspace.to_str() else {
+            // glob は UTF-8 文字列なので、表現できない workspace は誤って別パスを除外するより
+            // 検出しない側へ倒す。
+            continue;
+        };
+        if prefix.is_empty() {
+            globs.extend(
+                NEXTJS_PRESET_EXCLUDE_GLOBS
+                    .iter()
+                    .map(|glob| (*glob).to_string()),
+            );
+            continue;
+        }
+        let escaped_prefix = globset::escape(&prefix.replace(std::path::MAIN_SEPARATOR, "/"));
+        globs.extend(
+            NEXTJS_PRESET_EXCLUDE_GLOBS
+                .iter()
+                .map(|glob| format!("{escaped_prefix}/{glob}")),
+        );
     }
+    globs.sort_unstable();
+    globs.dedup();
+    Ok(globs)
 }
 
-/// `dir/package.json` を読んで Next.js プロジェクトかを判定する。
+/// Next.js プロジェクトとして判定できた workspace の、`dir` からの相対パスを返す。
 ///
 /// 判定: `package.json` の `dependencies` または `devDependencies` に `next` キーが存在
 /// すること。`peerDependencies` / `optionalDependencies` は Next.js ライブラリやテスト
 /// fixture で誤爆しやすいため対象外。
 ///
-/// 失敗時 (ファイル無し / JSON パース失敗 / next 依存なし) は `None` を返す。
+/// ルートとモノレポ配下を有界走査し、有効な `package.json` が無い場合や Next.js 依存が
+/// 見つからない場合は `None` を返す。個別 manifest の読み込み・JSON 解析失敗はその候補だけを
+/// 無視し、ほかの workspace 候補を引き続き調べる。
+const FRAMEWORK_PACKAGE_JSON_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const FRAMEWORK_SCAN_MAX_DEPTH: usize = 4;
+
+/// 自動検出で探索しない依存物・生成物ディレクトリ。
 ///
-/// モノレポでの workspace 走査は将来対応 (初期実装は root `package.json` のみ)。
-pub(crate) fn auto_detect_framework(dir: &str) -> Option<&'static str> {
-    let pkg_path = std::path::Path::new(dir).join("package.json");
-    let text = std::fs::read_to_string(&pkg_path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let has_next = ["dependencies", "devDependencies"].iter().any(|field| {
+/// `node_modules` 配下の package.json を見ると、対象プロジェクト自身が Next.js を使って
+/// いなくても推移的依存に含まれる `next` を拾う。生成物も同じ manifest を複製しうるため、
+/// ワークスペース候補から明示的に外す。
+const FRAMEWORK_SCAN_SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    "vendor",
+    "dist",
+    "build",
+    "target",
+    "out",
+    ".next",
+    "coverage",
+];
+
+fn package_json_has_next(path: &std::path::Path) -> bool {
+    let Some(text) =
+        crate::engine::bounded_read::read_utf8_file_limited(path, FRAMEWORK_PACKAGE_JSON_MAX_BYTES)
+    else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    ["dependencies", "devDependencies"].iter().any(|field| {
         value
             .get(field)
             .and_then(|v| v.as_object())
             .is_some_and(|deps| deps.contains_key("next"))
-    });
-    if has_next { Some("nextjs") } else { None }
+    })
+}
+
+fn should_visit_framework_scan_entry(entry: &ignore::DirEntry) -> bool {
+    if entry.depth() == 0 {
+        return true;
+    }
+    let Some(file_type) = entry.file_type() else {
+        return false;
+    };
+    if file_type.is_symlink() {
+        return false;
+    }
+    !file_type.is_dir()
+        || !FRAMEWORK_SCAN_SKIP_DIRS
+            .iter()
+            .any(|name| entry.file_name() == *name)
+}
+
+pub(crate) fn auto_detect_framework_roots(dir: &str) -> Vec<std::path::PathBuf> {
+    let root = std::path::Path::new(dir);
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .follow_links(false)
+        .max_depth(Some(FRAMEWORK_SCAN_MAX_DEPTH))
+        .filter_entry(should_visit_framework_scan_entry);
+
+    let mut workspaces: Vec<std::path::PathBuf> = builder
+        .build()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_type().is_some_and(|kind| kind.is_file())
+                && entry.file_name() == "package.json"
+                && package_json_has_next(entry.path())
+        })
+        .filter_map(|entry| {
+            entry
+                .path()
+                .parent()
+                .and_then(|parent| parent.strip_prefix(root).ok())
+                .map(std::path::Path::to_path_buf)
+        })
+        .collect();
+    workspaces.sort_unstable();
+    workspaces.dedup();
+    workspaces
 }
 
 /// フレームワーク名から対応する除外 glob プリセットを返す。
