@@ -9,7 +9,7 @@ rayon = "1.12.0"
 glob = "0.3.4"
 chrono = { version = "0.4.45", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
-comfy-table = "7.2.2"
+comfy-table = "8.0.0"
 serde_json = "1.0.151"
 dirs = "6"
 

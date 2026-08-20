@@ -1080,7 +1080,7 @@ fn print_summary(stats: &Stats, label: &str) {
 
     // 概要
     let mut table = Table::new();
-    table.load_preset(UTF8_FULL_CONDENSED);
+    table.load_style(UTF8_FULL_CONDENSED);
     table.set_header(vec![
         Cell::new("Source").add_attribute(Attribute::Bold),
         Cell::new("Files").add_attribute(Attribute::Bold),
@@ -1115,7 +1115,7 @@ fn print_summary(stats: &Stats, label: &str) {
             sorted.sort_by(|a, b| b.1.cmp(a.1));
 
             let mut table = Table::new();
-            table.load_preset(UTF8_FULL_CONDENSED);
+            table.load_style(UTF8_FULL_CONDENSED);
             table.set_header(vec![
                 Cell::new("Tool").add_attribute(Attribute::Bold),
                 Cell::new("Count").add_attribute(Attribute::Bold),
@@ -1149,7 +1149,7 @@ fn print_summary(stats: &Stats, label: &str) {
                 let other_count = bash_total - shown_sum;
 
                 let mut bash_table = Table::new();
-                bash_table.load_preset(UTF8_FULL_CONDENSED);
+                bash_table.load_style(UTF8_FULL_CONDENSED);
                 bash_table.set_header(vec![
                     Cell::new("Command").add_attribute(Attribute::Bold),
                     Cell::new("Count").add_attribute(Attribute::Bold),
@@ -1187,7 +1187,7 @@ fn print_summary(stats: &Stats, label: &str) {
     let has_astro = stats.astro_subcmds.values().any(|m| !m.is_empty());
     if has_astro {
         let mut table = Table::new();
-        table.load_preset(UTF8_FULL_CONDENSED);
+        table.load_style(UTF8_FULL_CONDENSED);
         table.set_header(vec![
             Cell::new("Source").add_attribute(Attribute::Bold),
             Cell::new("Subcommand").add_attribute(Attribute::Bold),
@@ -1219,7 +1219,7 @@ fn print_summary(stats: &Stats, label: &str) {
         let recent = &dates[start..];
 
         let mut table = Table::new();
-        table.load_preset(UTF8_FULL_CONDENSED);
+        table.load_style(UTF8_FULL_CONDENSED);
         table.set_header(vec![
             Cell::new("Date").add_attribute(Attribute::Bold),
             Cell::new("Calls").add_attribute(Attribute::Bold),
@@ -1254,7 +1254,7 @@ fn print_summary(stats: &Stats, label: &str) {
             let recent_weeks = &weeks[start..];
 
             let mut table = Table::new();
-            table.load_preset(UTF8_FULL_CONDENSED);
+            table.load_style(UTF8_FULL_CONDENSED);
             table.set_header(vec![
                 Cell::new("Week").add_attribute(Attribute::Bold),
                 Cell::new("Calls").add_attribute(Attribute::Bold),
@@ -1288,7 +1288,7 @@ fn print_summary(stats: &Stats, label: &str) {
             proj_totals.sort_by_key(|(_, _, total)| std::cmp::Reverse(*total));
 
             let mut table = Table::new();
-            table.load_preset(UTF8_FULL_CONDENSED);
+            table.load_style(UTF8_FULL_CONDENSED);
             table.set_header(vec![
                 Cell::new("Project").add_attribute(Attribute::Bold),
                 Cell::new("Tool Calls").add_attribute(Attribute::Bold),
