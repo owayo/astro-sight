@@ -16,12 +16,29 @@ use super::*;
 ///   `removed` に残す (false negative より false positive を優先)
 /// - **検索失敗時の保守扱い**: batch refs が `Err` を返した場合、すべて `removed`
 ///   に残す (false negative 防止)
+/// - **対応付け不能な削除は区分を揃える**: `ambiguous_relation_keys`
+///   (`reconcile_with_moves` が「追加側に同一キーがあるのに move 認定できなかった」と
+///   判定したキー) の候補は、1 件でも `removed` (blocking) に落ちたらグループ全体を
+///   `removed` へ揃える。降格判定 (`proves_survivor_origin`) は候補ごとの `old_path` /
+///   言語 / kind に依存するため、N→1 集約で同質な削除が並んでいても片方だけ
+///   `removed_dead` へ落ちうる — 実測では `pkg/alpha.py` と `pkg/beta.py` の同名クラスを
+///   集約し HEAD に `alpha.Store()` だけが残るケースで、Python 属性帰属が alpha 側を
+///   blocking、beta 側を informational に振り分けた。集約の非対称を解消するという本 Issue の
+///   目的がここで破れるため、保守側 (blocking) で揃える
+///   (Issue 2026-08-21-api-consolidation-many-to-one-move)。
+///
+///   **一律 blocking 固定にはしない**。グループ全員が「残存参照ゼロ」で一致した場合まで
+///   blocking に上げると、重複解消リファクタのたびに Stop hook が止まる。その一致は
+///   通常の削除と同じ per-candidate 判定が全員について出した結論なので、揃っている限り
+///   従来どおり informational を尊重する (元 Issue のトリアージも「移設でも旧パスからは
+///   import できなくなる」を**情報提供**と結論している)。揃わないときだけ保守側へ倒す
 pub(crate) fn partition_removed_dead_candidates(
     dir: &str,
     candidates: Vec<ApiSymbolCandidate>,
+    ambiguous_relation_keys: &HashSet<ApiRelationKey>,
 ) -> (Vec<ApiSymbolCandidate>, Vec<ApiSymbolCandidate>) {
     use crate::models::reference::RefKind;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     if candidates.is_empty() {
         return (Vec::new(), Vec::new());
@@ -172,6 +189,24 @@ pub(crate) fn partition_removed_dead_candidates(
             });
         removed_kept = kept;
         removed_dead.extend(follow);
+    }
+
+    // 第 3 パス: 対応付け不能な削除グループの区分を揃える。
+    // 同一キーの候補が blocking と informational に割れていたら、保守側 (blocking) へ寄せる。
+    // 全員が informational で一致しているグループは触らない (上記 doc 参照)。
+    if !ambiguous_relation_keys.is_empty() {
+        let split_keys: HashSet<ApiRelationKey> = removed_kept
+            .iter()
+            .map(api_relation_key)
+            .filter(|key| ambiguous_relation_keys.contains(key))
+            .collect();
+        if !split_keys.is_empty() {
+            let (promote, stay): (Vec<ApiSymbolCandidate>, Vec<ApiSymbolCandidate>) = removed_dead
+                .into_iter()
+                .partition(|c| split_keys.contains(&api_relation_key(c)));
+            removed_dead = stay;
+            removed_kept.extend(promote);
+        }
     }
 
     (removed_kept, removed_dead)

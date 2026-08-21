@@ -677,7 +677,7 @@ fn reconcile_with_moves_pairs_by_signature() {
     ];
     let all_new_candidates = added.clone();
 
-    let (kept_added, kept_removed, moved) =
+    let (kept_added, kept_removed, moved, _) =
         reconcile_with_moves(added, removed, all_new_candidates);
     assert_eq!(kept_added.len(), 1);
     assert_eq!(kept_added[0].name, "new_api");
@@ -712,7 +712,7 @@ fn reconcile_with_moves_preserves_removed_input_order() {
     // HashMap 反復順に依存していると 1 プロセス内でも実行ごとに変わりうるため、
     // 同一プロセス内で繰り返し呼んで安定性も見る。
     for _ in 0..8 {
-        let (_, kept_removed, moved) =
+        let (_, kept_removed, moved, _) =
             reconcile_with_moves(Vec::new(), removed.clone(), Vec::new());
         assert!(moved.is_empty());
         let got: Vec<&str> = kept_removed.iter().map(|c| c.name.as_str()).collect();
@@ -740,7 +740,7 @@ fn reconcile_with_moves_preserves_order_around_matched_entries() {
         signature: "export function b()".into(),
     }];
 
-    let (_, kept_removed, moved) = reconcile_with_moves(added.clone(), removed, added);
+    let (_, kept_removed, moved, _) = reconcile_with_moves(added.clone(), removed, added);
     assert_eq!(moved.len(), 1);
     assert_eq!(moved[0].name, "b");
     let got: Vec<&str> = kept_removed.iter().map(|c| c.name.as_str()).collect();
@@ -764,7 +764,7 @@ fn reconcile_with_moves_keeps_different_signatures() {
     }];
     let all_new_candidates = added.clone();
 
-    let (kept_added, kept_removed, moved) =
+    let (kept_added, kept_removed, moved, _) =
         reconcile_with_moves(added, removed, all_new_candidates);
     assert_eq!(kept_added.len(), 1);
     assert_eq!(kept_removed.len(), 1);
@@ -792,7 +792,7 @@ fn reconcile_with_moves_uses_filtered_new_candidates_for_pairing() {
         signature: "def rotate_command(name: str):".into(),
     }];
 
-    let (kept_added, kept_removed, moved) =
+    let (kept_added, kept_removed, moved, _) =
         reconcile_with_moves(added, removed, all_new_candidates);
     assert!(
         kept_added.is_empty(),
@@ -806,6 +806,406 @@ fn reconcile_with_moves_uses_filtered_new_candidates_for_pairing() {
     assert_eq!(moved[0].name, "rotate_command");
     assert_eq!(moved[0].from, "src/cli.py");
     assert_eq!(moved[0].to, "src/cli/_commands/rotate.py");
+}
+
+/// N→1 集約 (重複していた同名クラスを共有パッケージへ 1 本化するリファクタ) では、
+/// 同質な削除のうち 1 件だけを `moved` に相殺してはならない。
+///
+/// 旧実装は FIFO で先頭の削除だけを消費していたため、どちらが `moved` になり
+/// どちらが `api.rm` に残るかが diff の並び順という無関係な要因で決まっていた
+/// (Issue 2026-08-21-api-consolidation-many-to-one-move)。
+///
+/// **対照ケースを同一テスト内に持つ** — 削除が 1 件だけなら従来どおり `moved` に
+/// なることを先に固定しないと、「常に moved が空」でもこのテストは通ってしまう。
+#[test]
+fn reconcile_with_moves_keeps_all_removals_for_many_to_one_consolidation() {
+    let destination = ApiSymbolCandidate {
+        name: "Store".into(),
+        kind: "class".into(),
+        file: "shared/store.py".into(),
+        signature: "class Store:".into(),
+    };
+    let removed_a = ApiSymbolCandidate {
+        name: "Store".into(),
+        kind: "class".into(),
+        file: "pkg_a/store.py".into(),
+        signature: "class Store:".into(),
+    };
+    let removed_b = ApiSymbolCandidate {
+        name: "Store".into(),
+        kind: "class".into(),
+        file: "pkg_b/store.py".into(),
+        signature: "class Store:".into(),
+    };
+
+    // 対照: 削除が 1 件なら対応付けは一意なので従来どおり moved になる。
+    let (_, kept_removed, moved, _) = reconcile_with_moves(
+        vec![destination.clone()],
+        vec![removed_a.clone()],
+        vec![destination.clone()],
+    );
+    assert_eq!(
+        moved.len(),
+        1,
+        "1 対 1 の move 相殺は維持されるべき (対照が壊れるとこのテストは無意味になる)"
+    );
+    assert_eq!(moved[0].from, "pkg_a/store.py");
+    assert!(kept_removed.is_empty(), "got: {kept_removed:?}");
+
+    // 対照: 追加側に同一キーが 1 件も無い純粋な削除は「対応付け不能」ではない。
+    // ここを ambiguous に含めると、通常の削除まで removed_dead へ降格できなくなる。
+    let (_, _, _, ambiguous) =
+        reconcile_with_moves(Vec::new(), vec![removed_a.clone()], Vec::new());
+    assert!(
+        ambiguous.is_empty(),
+        "対応先の無い削除は ambiguous にしない。got: {ambiguous:?}"
+    );
+
+    // 本題: 同質な削除が 2 件あるとどちらが移動元か決められないので、
+    // 1 件も相殺せず両方 removed に残す。
+    let (kept_added, kept_removed, moved, ambiguous) = reconcile_with_moves(
+        vec![destination.clone()],
+        vec![removed_a.clone(), removed_b.clone()],
+        vec![destination.clone()],
+    );
+    assert!(
+        moved.is_empty(),
+        "2→1 集約では対応付けが一意にならないので moved を作らない。got: {moved:?}"
+    );
+    let kept: Vec<&str> = kept_removed.iter().map(|c| c.file.as_str()).collect();
+    assert_eq!(
+        kept,
+        ["pkg_a/store.py", "pkg_b/store.py"],
+        "同質な削除は片方だけ消さず、入力順のまま両方残す"
+    );
+    assert_eq!(
+        kept_added.len(),
+        1,
+        "相殺しなかったので追加側も残る。got: {kept_added:?}"
+    );
+    assert!(
+        ambiguous.contains(&crate::commands::api_changes::api_relation_key(&removed_a)),
+        "対応付け不能なキーは blocking 固定のため申告する。got: {ambiguous:?}"
+    );
+}
+
+/// 対応付けの可否はバケットの中身だけで決まるので、`removed` の並び順を入れ替えても
+/// 結果は変わらない。旧 FIFO 実装ではここで `moved[0].from` が入れ替わっていた。
+#[test]
+fn reconcile_with_moves_many_to_one_result_is_independent_of_input_order() {
+    let destination = ApiSymbolCandidate {
+        name: "Store".into(),
+        kind: "class".into(),
+        file: "shared/store.py".into(),
+        signature: "class Store:".into(),
+    };
+    let make = |file: &str| ApiSymbolCandidate {
+        name: "Store".into(),
+        kind: "class".into(),
+        file: file.into(),
+        signature: "class Store:".into(),
+    };
+
+    for order in [
+        ["pkg_a/store.py", "pkg_b/store.py"],
+        ["pkg_b/store.py", "pkg_a/store.py"],
+    ] {
+        let removed: Vec<ApiSymbolCandidate> = order.iter().map(|f| make(f)).collect();
+        let (_, kept_removed, moved, _) = reconcile_with_moves(
+            vec![destination.clone()],
+            removed,
+            vec![destination.clone()],
+        );
+        assert!(
+            moved.is_empty(),
+            "並び順に依らず moved は作らない。order={order:?} got: {moved:?}"
+        );
+        let kept: Vec<&str> = kept_removed.iter().map(|c| c.file.as_str()).collect();
+        assert_eq!(kept, order, "kept_removed は入力順を保つ");
+    }
+}
+
+/// 移動先が一意でない (同一キーの追加が複数ファイルにある) 場合も対応付け不能として
+/// 削除を残す。1→2 は N→1 と同じく「どちらへ移動したか」を決められない。
+#[test]
+fn reconcile_with_moves_keeps_removal_when_destination_is_ambiguous() {
+    let removed = ApiSymbolCandidate {
+        name: "Store".into(),
+        kind: "class".into(),
+        file: "pkg_a/store.py".into(),
+        signature: "class Store:".into(),
+    };
+    let dest_one = ApiSymbolCandidate {
+        name: "Store".into(),
+        kind: "class".into(),
+        file: "shared/store.py".into(),
+        signature: "class Store:".into(),
+    };
+    let dest_two = ApiSymbolCandidate {
+        file: "other/store.py".into(),
+        ..dest_one.clone()
+    };
+
+    // 対照: 移動先が 1 ファイルなら moved になる。
+    let (_, _, moved, _) = reconcile_with_moves(
+        vec![dest_one.clone()],
+        vec![removed.clone()],
+        vec![dest_one.clone()],
+    );
+    assert_eq!(moved.len(), 1, "移動先が一意なら従来どおり相殺する");
+
+    // 本題: 移動先候補が 2 ファイルあると決められない。
+    let (kept_added, kept_removed, moved, _) = reconcile_with_moves(
+        vec![dest_one.clone(), dest_two.clone()],
+        vec![removed.clone()],
+        vec![dest_one, dest_two],
+    );
+    assert!(
+        moved.is_empty(),
+        "移動先が一意でなければ moved を作らない。got: {moved:?}"
+    );
+    assert_eq!(kept_removed.len(), 1, "削除は残る。got: {kept_removed:?}");
+    assert_eq!(kept_added.len(), 2, "追加も残る。got: {kept_added:?}");
+}
+
+/// 同一 (name, kind, signature, file) の重複候補は 1 件として数える。
+/// 重複を移動先 2 件と数えてしまうと、正当な 1 対 1 の move まで相殺できなくなる。
+#[test]
+fn reconcile_with_moves_treats_duplicate_new_candidates_in_same_file_as_one() {
+    let destination = ApiSymbolCandidate {
+        name: "Store".into(),
+        kind: "class".into(),
+        file: "shared/store.py".into(),
+        signature: "class Store:".into(),
+    };
+    let removed = ApiSymbolCandidate {
+        name: "Store".into(),
+        kind: "class".into(),
+        file: "pkg_a/store.py".into(),
+        signature: "class Store:".into(),
+    };
+
+    let (kept_added, kept_removed, moved, _) = reconcile_with_moves(
+        vec![destination.clone()],
+        vec![removed],
+        // 同じファイルの同じシンボルが 2 度候補に上がっても移動先は 1 ファイル。
+        vec![destination.clone(), destination],
+    );
+    assert_eq!(moved.len(), 1, "重複候補で移動先が増えてはならない");
+    assert_eq!(moved[0].to, "shared/store.py");
+    assert!(kept_removed.is_empty(), "got: {kept_removed:?}");
+    assert!(kept_added.is_empty(), "got: {kept_added:?}");
+}
+
+/// E2E: 重複していた同名クラスを共有パッケージへ集約すると、両方の削除が同じ区分で
+/// 報告される。対応付けが一意なシンボル (集約先にしか無い `ping`) は従来どおり
+/// `moved` に相殺されることも同時に固定する。
+#[test]
+fn detect_api_changes_many_to_one_consolidation_reports_both_removals() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let store_a = "\
+\"\"\"service-a store.\"\"\"
+
+
+class Store:
+    def open(self):
+        return 1
+
+    def close(self):
+        return 2
+
+    def ping(self):
+        return 3
+";
+    let store_b = "\
+\"\"\"service-b store.\"\"\"
+
+
+class Store:
+    def open(self):
+        return 1
+
+    def close(self):
+        return 2
+";
+    git_commit_files(
+        repo,
+        &[("pkg_a/store.py", store_a), ("pkg_b/store.py", store_b)],
+        "duplicated",
+    );
+
+    // 両方を削除して共有パッケージへ 1 本化する。
+    fs::remove_file(repo.join("pkg_a/store.py")).expect("rm a");
+    fs::remove_file(repo.join("pkg_b/store.py")).expect("rm b");
+    let shared = repo.join("shared/store.py");
+    fs::create_dir_all(shared.parent().expect("parent")).expect("mkdir");
+    fs::write(&shared, store_a).expect("write shared");
+
+    let diff_files = vec![
+        crate::models::impact::DiffFile {
+            old_path: "pkg_a/store.py".to_string(),
+            new_path: "/dev/null".to_string(),
+            hunks: Vec::new(),
+            deleted_old_source: Some(store_a.as_bytes().to_vec()),
+        },
+        crate::models::impact::DiffFile {
+            old_path: "pkg_b/store.py".to_string(),
+            new_path: "/dev/null".to_string(),
+            hunks: Vec::new(),
+            deleted_old_source: Some(store_b.as_bytes().to_vec()),
+        },
+        crate::models::impact::DiffFile {
+            old_path: "/dev/null".to_string(),
+            new_path: "shared/store.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 13,
+            }],
+            deleted_old_source: None,
+        },
+    ];
+
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    let moved_names: Vec<(&str, &str)> = api
+        .moved
+        .iter()
+        .map(|m| (m.name.as_str(), m.from.as_str()))
+        .collect();
+    // 対照: 集約先にしか存在しない `ping` は対応付けが一意なので moved のまま。
+    assert!(
+        moved_names.contains(&("Store.ping", "pkg_a/store.py")),
+        "一意に対応付く移動は従来どおり moved になるべき (対照)。got: {moved_names:?}"
+    );
+
+    // 本題: 2 ファイルに重複していた Store / open / close は片方だけ moved にしない。
+    //
+    // `removed` (blocking) と `removed_dead` (informational) は**別々に**検証する。
+    // 合流させて比較すると「片方が blocking / もう片方が informational」でも通ってしまい、
+    // 本 Issue が解消したかった非対称をまさに見逃す (codex レビュー指摘)。
+    //
+    // このフィクスチャには削除シンボルへの残存参照が無いので、全員が informational で
+    // 一致する = 区分は揃っているため保守側への引き上げは起きない。
+    for name in ["Store", "Store.open", "Store.close"] {
+        assert!(
+            !api.moved.iter().any(|m| m.name == name),
+            "重複していた {name} は対応付け不能なので moved にしてはならない。got: {moved_names:?}"
+        );
+        let blocking: Vec<&str> = api
+            .removed
+            .iter()
+            .filter(|s| s.name == name)
+            .map(|s| s.file.as_str())
+            .collect();
+        let informational: Vec<&str> = api
+            .removed_dead
+            .iter()
+            .filter(|s| s.name == name)
+            .map(|s| s.file.as_str())
+            .collect();
+        assert_eq!(
+            informational,
+            ["pkg_a/store.py", "pkg_b/store.py"],
+            "{name} は両方の削除元が同じ区分 (removed_dead) に揃うべき。\
+             removed={blocking:?} removed_dead={informational:?}"
+        );
+        assert!(
+            blocking.is_empty(),
+            "残存参照ゼロで一致しているグループを blocking へ引き上げてはならない。got: {blocking:?}"
+        );
+    }
+}
+
+/// 対応付け不能な削除を blocking へ固定しないと、`removed_dead` への降格判定が
+/// 候補ごとの `old_path` に依存するせいで**同質な削除が別区分に割れる**。
+///
+/// `pkg/alpha.py` と `pkg/beta.py` の同名クラスを共有パッケージへ集約し、HEAD に
+/// `alpha.Store()` という属性アクセスだけが残るケースでは、Python 属性帰属
+/// (`RefOrigin::PythonAttributeAccess`) が受信側モジュール名を削除元ファイル名と
+/// 突き合わせるため、alpha 側だけ「残存参照あり = blocking」、beta 側は
+/// 「残存参照なし = informational」になっていた (codex レビューで指摘され実測で確認)。
+#[test]
+fn detect_api_changes_ambiguous_consolidation_does_not_split_across_removed_buckets() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let store = "\
+class Store:
+    def open(self):
+        return 1
+";
+    // `alpha.Store()` を呼ぶ利用側は HEAD にそのまま残す (追随漏れの再現)。
+    git_commit_files(
+        repo,
+        &[
+            ("pkg/__init__.py", ""),
+            ("pkg/alpha.py", store),
+            ("pkg/beta.py", store),
+            (
+                "app.py",
+                "from pkg import alpha\n\n\ndef run():\n    return alpha.Store()\n",
+            ),
+        ],
+        "duplicated",
+    );
+
+    fs::remove_file(repo.join("pkg/alpha.py")).expect("rm alpha");
+    fs::remove_file(repo.join("pkg/beta.py")).expect("rm beta");
+    let shared = repo.join("shared/store.py");
+    fs::create_dir_all(shared.parent().expect("parent")).expect("mkdir");
+    fs::write(&shared, store).expect("write shared");
+
+    let deleted = |path: &str| crate::models::impact::DiffFile {
+        old_path: path.to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: Vec::new(),
+        deleted_old_source: Some(store.as_bytes().to_vec()),
+    };
+    let diff_files = vec![
+        deleted("pkg/alpha.py"),
+        deleted("pkg/beta.py"),
+        crate::models::impact::DiffFile {
+            old_path: "/dev/null".to_string(),
+            new_path: "shared/store.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 3,
+            }],
+            deleted_old_source: None,
+        },
+    ];
+
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    let blocking: Vec<&str> = api
+        .removed
+        .iter()
+        .filter(|s| s.name == "Store")
+        .map(|s| s.file.as_str())
+        .collect();
+    let informational: Vec<&str> = api
+        .removed_dead
+        .iter()
+        .filter(|s| s.name == "Store")
+        .map(|s| s.file.as_str())
+        .collect();
+    assert_eq!(
+        blocking,
+        ["pkg/alpha.py", "pkg/beta.py"],
+        "同質な削除は両方 blocking に揃うべき。removed={blocking:?} removed_dead={informational:?}"
+    );
+    assert!(
+        informational.is_empty(),
+        "帰属判定の差で片方だけ informational へ落としてはならない。got: {informational:?}"
+    );
 }
 
 #[test]

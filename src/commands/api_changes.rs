@@ -187,7 +187,7 @@ pub(crate) fn detect_api_changes(
     // `is_used_in_diff_paths` 等で `added` から外れた候補も含まれるため、module → package
     // 化のように新規ファイル側のシンボルが同 diff 内の `__init__.py` 等から参照されて
     // `added` に乗らないケースでも `removed` を相殺できる。
-    let (added, removed, moved) =
+    let (added, removed, moved, ambiguous_relation_keys) =
         reconcile_with_moves(buckets.added, buckets.removed, buckets.all_new_candidates);
 
     // removed のうち HEAD ツリーで他ファイル参照 0 件のものを `removed_dead` に振り分け。
@@ -204,7 +204,13 @@ pub(crate) fn detect_api_changes(
     //
     // 複数候補がある場合、`find_references_batch` で 1 度のリポジトリ走査に集約する
     // (codex 指摘 3 対応: 候補数 × リポ全体走査の回避)。
-    let (removed_kept, removed_dead) = partition_removed_dead_candidates(dir, removed);
+    //
+    // `ambiguous_relation_keys` の候補は区分を揃える。N→1 集約のように対応付けが一意に
+    // ならなかった削除は、`old_path` 依存の帰属判定で片方だけ `removed_dead` へ落ちうる
+    // ため、blocking と informational に割れたときだけ保守側 (blocking) へ寄せる
+    // (揃っているグループは触らない。Issue 2026-08-21-api-consolidation-many-to-one-move)。
+    let (removed_kept, removed_dead) =
+        partition_removed_dead_candidates(dir, removed, &ambiguous_relation_keys);
 
     // api.add に確定した候補にだけ同一ファイル内参照数を添える。move 相殺 (`moved`) で
     // 抜けた候補には算出しないよう、reconcile 後のこの位置で 1 度だけ数える
@@ -238,16 +244,57 @@ pub(crate) fn detect_api_changes(
     }
 }
 
+/// `(name, kind, signature)` — 削除側と追加側を突き合わせる対応付けキー。
+///
+/// `reconcile_with_moves` の move 認定と `partition_removed_dead_candidates` の
+/// 区分揃えで**同じキー定義を共有する**必要があるため、モジュールレベルに置く
+/// (片方だけ定義がずれると、対応付け不能と判定した削除に区分揃えが掛からない)。
+pub(crate) type ApiRelationKey = (String, String, String);
+
+/// 候補から `ApiRelationKey` を作る。
+pub(crate) fn api_relation_key(sym: &ApiSymbolCandidate) -> ApiRelationKey {
+    (sym.name.clone(), sym.kind.clone(), sym.signature.clone())
+}
+
 /// 同名・同種別・同シグネチャの api.add / api.rm ペアを `moved` として相殺する。
 ///
 /// `all_new_candidates` は `added` フィルタ適用前の新規側候補一覧（`added` の上位集合）。
 /// `is_used_in_diff_paths` などで `added` から落ちた候補も `removed` との突き合わせに
 /// 利用するため、別系統で渡す。
 ///
+/// **move 認定は `(name, kind, signature)` キーの両側が「削除 1 件・追加先 1 ファイル」の
+/// ときだけ成立する** (対応付けが一意な場合に限る)。2→1 / 1→2 / 2→2 のような複数候補は
+/// 対応付け不能として扱い、削除側は 1 件も相殺せず全件 `kept_removed` に残す。
+///
+/// 旧実装は removed バケットを FIFO で 1 件ずつ消費していたため、重複していた同名クラスを
+/// 共有パッケージへ集約する N→1 リファクタで**同質な削除のうち先頭 1 件だけが `moved` に
+/// 化け、残りが `api.rm` に残る**という順序依存の非対称が起きていた (どちらが `moved` に
+/// なるかは diff の並び順という無関係な要因で決まる)。利用者からは「片方だけ壊れた」ように
+/// 見え、実測でも 4 シンボルが誤って削除として報告された
+/// (Issue 2026-08-21-api-consolidation-many-to-one-move)。
+///
+/// 残った削除を「全て同じ `to` への複数 `moved`」にする案は採らない。`moved` は hook で
+/// informational (非 blocking) のため、移動と証明できていない削除まで `moved` に倒すと
+/// 「旧 import パスが失われた」事実を隠し、破壊的変更の false negative になる。集約を
+/// 独立カテゴリとして表現するなら、実体の関係 (moved / renamed / consolidated) と
+/// 互換性 (旧公開面が維持されたか) の 2 軸を持つ API relation として設計し直す必要があり、
+/// ラベルだけ足しても blocking 判定が決まらない。
+///
 /// 戻り値:
 /// - `kept_added`: `moved` で相殺されなかった追加シンボル
 /// - `kept_removed`: `moved` で相殺されなかった削除シンボル
 /// - `moved`: `from`/`to` のペアにまとめた移動シンボル
+/// - `ambiguous_relation_keys`: 追加側に同一キーの候補があるのに対応付けが一意にならず
+///   move 認定できなかったキー。`partition_removed_dead_candidates` がこのキーの削除候補の
+///   区分を揃えるために使う (blocking と informational に割れたときだけ保守側へ寄せる。下記参照)。
+///
+/// **`ambiguous_relation_keys` が必要な理由**: 対応付け不能に落ちた削除同士は bare 名が
+/// 同じでも、`removed_dead` への降格判定 (`proves_survivor_origin`) が候補ごとの `old_path` /
+/// 言語 / kind に依存するため、片方だけ informational へ落ちうる。実測では
+/// `pkg/alpha.py` と `pkg/beta.py` の同名クラスを共有パッケージへ集約し HEAD に
+/// `alpha.Store()` だけが残るケースで、Python 属性帰属が alpha 側を `removed` (blocking)、
+/// beta 側を `removed_dead` (informational) に振り分けた。これでは本 Issue が解消したかった
+/// 「同質な削除が別区分になる非対称」がそのまま残る。
 pub(crate) fn reconcile_with_moves(
     added: Vec<ApiSymbolCandidate>,
     removed: Vec<ApiSymbolCandidate>,
@@ -256,36 +303,29 @@ pub(crate) fn reconcile_with_moves(
     Vec<ApiSymbolCandidate>,
     Vec<ApiSymbolCandidate>,
     Vec<MovedSymbol>,
+    std::collections::HashSet<ApiRelationKey>,
 ) {
     use std::collections::HashMap;
-    use std::collections::VecDeque;
+    use std::collections::HashSet;
 
-    // 1) removed を (name, kind, signature) でバケット化。
-    //    バケットには候補そのものではなく `removed` 内の index を積む。値を持たせて
-    //    最後に `into_values()` で回収すると HashMap (RandomState) の反復順がそのまま
-    //    出力順になり、api.rm / removed_dead の並びが実行ごとに変わってしまう
-    //    (決定論的出力の前提が崩れ、snapshot 比較とトリアージ結果の再現性が壊れる)。
-    let mut removed_bucket: HashMap<(String, String, String), VecDeque<usize>> = HashMap::new();
+    // 1) removed を対応付けキーでバケット化。バケットには候補そのものではなく
+    //    `removed` 内の index を積む。値を持たせて最後に `into_values()` で回収すると
+    //    HashMap (RandomState) の反復順がそのまま出力順になり、api.rm / removed_dead の
+    //    並びが実行ごとに変わってしまう (決定論的出力の前提が崩れ、snapshot 比較と
+    //    トリアージ結果の再現性が壊れる)。
+    let mut removed_bucket: HashMap<ApiRelationKey, Vec<usize>> = HashMap::new();
     for (i, sym) in removed.iter().enumerate() {
         removed_bucket
-            .entry((sym.name.clone(), sym.kind.clone(), sym.signature.clone()))
+            .entry(api_relation_key(sym))
             .or_default()
-            .push_back(i);
+            .push(i);
     }
-    let mut removed_matched = vec![false; removed.len()];
 
-    // 2) 新規候補を順に走査して removed と突き合わせ、`moved` を組み立てる。
-    //    同じ (name, kind, signature, file) の重複候補は最初の 1 件だけ扱う。
-    //    (name, kind, signature) を共有する複数 add が同じ removed と組まないように、
-    //    一度マッチした new 側は `matched_new_files` に記録しておき、後で `added` から
-    //    除外する。
-    let mut moved: Vec<MovedSymbol> = Vec::new();
-    let mut seen_new_keys: std::collections::HashSet<(String, String, String, String)> =
-        std::collections::HashSet::new();
-    let mut matched_new_files: HashMap<
-        (String, String, String),
-        std::collections::HashSet<String>,
-    > = HashMap::new();
+    // 2) 追加側も同じキーで「相異なる移動先ファイル数」を数える。同じ
+    //    (name, kind, signature, file) の重複候補は 1 件として扱う (同一ファイル内の
+    //    重複検出で移動先が 2 つあると誤判定しないため)。
+    let mut new_files: HashMap<ApiRelationKey, HashSet<String>> = HashMap::new();
+    let mut seen_new_keys: HashSet<(String, String, String, String)> = HashSet::new();
     for new in &all_new_candidates {
         let dedup_key = (
             new.name.clone(),
@@ -296,45 +336,77 @@ pub(crate) fn reconcile_with_moves(
         if !seen_new_keys.insert(dedup_key) {
             continue;
         }
-        let bucket_key = (new.name.clone(), new.kind.clone(), new.signature.clone());
-        if let Some(bucket) = removed_bucket.get_mut(&bucket_key)
-            && let Some(rm_ix) = bucket.pop_front()
-        {
-            let rm = &removed[rm_ix];
-            removed_matched[rm_ix] = true;
-            matched_new_files
-                .entry(bucket_key)
-                .or_default()
-                .insert(new.file.clone());
-            moved.push(MovedSymbol {
-                name: rm.name.clone(),
-                kind: rm.kind.clone(),
-                from: rm.file.clone(),
-                to: new.file.clone(),
-            });
-        }
+        new_files
+            .entry(api_relation_key(new))
+            .or_default()
+            .insert(new.file.clone());
     }
 
-    // 3) `moved` で相殺された候補は `added` からも除外する。
-    let kept_added: Vec<ApiSymbolCandidate> = added
-        .into_iter()
-        .filter(|a| {
-            let key = (a.name.clone(), a.kind.clone(), a.signature.clone());
-            !matched_new_files
-                .get(&key)
-                .map(|files| files.contains(&a.file))
-                .unwrap_or(false)
-        })
+    // 3) 削除 1 件・追加先 1 ファイルのキーだけを move 認定する。
+    //    走査順は `all_new_candidates` の Vec 順なので、`moved` の並びは決定的。
+    //    バケットの中身 (削除件数・移動先ファイル数) だけで可否が決まるため、
+    //    `removed` / `all_new_candidates` の並び順を入れ替えても結果は変わらない。
+    let mut moved: Vec<MovedSymbol> = Vec::new();
+    let mut removed_matched = vec![false; removed.len()];
+    let mut matched_new_files: HashMap<ApiRelationKey, String> = HashMap::new();
+    for new in &all_new_candidates {
+        let bucket_key = api_relation_key(new);
+        if matched_new_files.contains_key(&bucket_key) {
+            continue;
+        }
+        let Some(rm_ixs) = removed_bucket.get(&bucket_key) else {
+            continue;
+        };
+        // 同一キーの削除が複数 = どの削除がこの追加に対応するか決められない。
+        if rm_ixs.len() != 1 {
+            continue;
+        }
+        // 同一キーの移動先が複数 = どのファイルへ移動したか決められない。
+        if new_files
+            .get(&bucket_key)
+            .map(HashSet::len)
+            .unwrap_or_default()
+            != 1
+        {
+            continue;
+        }
+        let rm_ix = rm_ixs[0];
+        let rm = &removed[rm_ix];
+        removed_matched[rm_ix] = true;
+        matched_new_files.insert(bucket_key, new.file.clone());
+        moved.push(MovedSymbol {
+            name: rm.name.clone(),
+            kind: rm.kind.clone(),
+            from: rm.file.clone(),
+            to: new.file.clone(),
+        });
+    }
+
+    // 4) 追加側に同一キーの候補があるのに move 認定できなかったキー = 対応付け不能。
+    //    このキーの削除候補は `partition_removed_dead_candidates` で区分を揃える
+    //    (blocking と informational に割れたときだけ保守側へ寄せる。上記 doc 参照)。
+    //    追加側に同一キーが 1 件も無い削除は「対応先の無い純粋な削除」なので対象外＝
+    //    従来どおり参照検索の結果で removed / removed_dead に分かれる。
+    let ambiguous_relation_keys: HashSet<ApiRelationKey> = removed_bucket
+        .keys()
+        .filter(|key| new_files.contains_key(*key) && !matched_new_files.contains_key(*key))
+        .cloned()
         .collect();
 
-    // 4) ペア化されなかった `removed` を、入力順のまま集める。
+    // 5) `moved` で相殺された候補は `added` からも除外する。
+    let kept_added: Vec<ApiSymbolCandidate> = added
+        .into_iter()
+        .filter(|a| matched_new_files.get(&api_relation_key(a)) != Some(&a.file))
+        .collect();
+
+    // 6) ペア化されなかった `removed` を、入力順のまま集める。
     let kept_removed: Vec<ApiSymbolCandidate> = removed
         .into_iter()
         .zip(removed_matched)
         .filter_map(|(sym, matched)| (!matched).then_some(sym))
         .collect();
 
-    (kept_added, kept_removed, moved)
+    (kept_added, kept_removed, moved, ambiguous_relation_keys)
 }
 
 pub(crate) mod diff_processing;
