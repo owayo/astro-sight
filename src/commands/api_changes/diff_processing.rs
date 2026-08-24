@@ -462,6 +462,13 @@ pub(crate) fn classify_signature_change(
         state.buckets.compatible_modified.push(compat);
         return;
     }
+    // 同一ファイル内で有限 literal union の値集合が old/new 同値と証明できる type alias
+    // 変更は、表記・alias 経路だけの変更なので compatible_modified とする。
+    // import 越し・循環・非 literal・集合差分ありは判定器が None に倒し blocking を維持する。
+    if let Some(compat) = detect_equivalent_literal_union_alias_compatible_mod(&site, sources) {
+        state.buckets.compatible_modified.push(compat);
+        return;
+    }
     // React Server Component の async 化 (async キーワード追加のみ + 全参照が JSX タグ利用)
     // は呼び出し側の書き換えが不要なため compatible_modified として扱う。
     if let Some(compat) = detect_async_jsx_component_compatible_mod(ref_index, &site, sources) {

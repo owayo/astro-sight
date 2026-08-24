@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::engine::parser;
 use crate::models::review::CompatibleApiModification;
@@ -24,6 +24,132 @@ const TS_ONLY_LANGS: &[crate::language::LangId] = &[
     crate::language::LangId::Typescript,
     crate::language::LangId::Tsx,
 ];
+
+/// TypeScript の有限 literal union を決定的な集合へ正規化するための値。
+///
+/// string / number は raw token を保持する。`"x"` と `'x'`、`1` と `1.0` のような
+/// 実行上は同値になりうる表記まで同一視すると escape / 数値正規化が必要になるため、
+/// 現段階では保守的に別値として扱う。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum TsLiteralValue {
+    String(String),
+    Number(String),
+    Boolean(bool),
+    Null,
+}
+
+/// 同一ファイル内の `type` alias を有限 literal 集合へ評価する。
+///
+/// 対応範囲は literal / union / 冗長括弧 / 同一ファイル内の一意な alias chain のみ。
+/// import 越し、非 literal、循環、多重宣言、parse error は `None` に倒し、呼び出し側が
+/// blocking な `api.mod` を維持できるようにする。
+fn eval_named_literal_union(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    name: &str,
+) -> Option<BTreeSet<TsLiteralValue>> {
+    let value = unique_top_level_type_alias_value(root, source, name)?;
+    let mut visiting = BTreeSet::new();
+    visiting.insert(name.to_string());
+    eval_literal_union(value, root, source, &mut visiting, 0)
+}
+
+fn eval_literal_union(
+    node: tree_sitter::Node<'_>,
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    visiting: &mut BTreeSet<String>,
+    depth: usize,
+) -> Option<BTreeSet<TsLiteralValue>> {
+    const MAX_ALIAS_DEPTH: usize = 32;
+    if depth > MAX_ALIAS_DEPTH {
+        return None;
+    }
+
+    match node.kind() {
+        "parenthesized_type" => {
+            let inner = node.named_child(0)?;
+            eval_literal_union(inner, root, source, visiting, depth)
+        }
+        "union_type" => {
+            let mut values = BTreeSet::new();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                values.extend(eval_literal_union(
+                    child,
+                    root,
+                    source,
+                    visiting,
+                    depth + 1,
+                )?);
+            }
+            (!values.is_empty()).then_some(values)
+        }
+        "literal_type" => {
+            let literal = node.named_child(0)?;
+            let value = match literal.kind() {
+                "string" => TsLiteralValue::String(literal.utf8_text(source).ok()?.to_string()),
+                "number" => TsLiteralValue::Number(literal.utf8_text(source).ok()?.to_string()),
+                "true" => TsLiteralValue::Boolean(true),
+                "false" => TsLiteralValue::Boolean(false),
+                "null" => TsLiteralValue::Null,
+                _ => return None,
+            };
+            Some(BTreeSet::from([value]))
+        }
+        "type_identifier" => {
+            let alias = node.utf8_text(source).ok()?.to_string();
+            if !visiting.insert(alias.clone()) {
+                return None;
+            }
+            let value = unique_top_level_type_alias_value(root, source, &alias)?;
+            let result = eval_literal_union(value, root, source, visiting, depth + 1);
+            visiting.remove(&alias);
+            result
+        }
+        _ => None,
+    }
+}
+
+/// トップレベルに同名の `type_alias_declaration` がちょうど 1 件ある場合だけ RHS を返す。
+/// interface merge や同名多重宣言、import された alias は解決しない。
+fn unique_top_level_type_alias_value<'a>(
+    root: tree_sitter::Node<'a>,
+    source: &[u8],
+    name: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    let decls = collect_top_level_type_decls(root, source, name);
+    let [decl] = decls.as_slice() else {
+        return None;
+    };
+    if decl.kind() != "type_alias_declaration" {
+        return None;
+    }
+    decl.child_by_field_name("value")
+}
+
+/// TypeScript / TSX の公開 type alias が、同一ファイル内で証明できる有限 literal 集合として
+/// old/new 同値なら `compatible_modified` へ降格する。
+///
+/// 値集合の拡大・縮小・置換、import 越し alias、generic / conditional / intersection 等は
+/// 一切降格せず、従来どおり blocking な `api.mod` を維持する。
+pub(crate) fn detect_equivalent_literal_union_alias_compatible_mod(
+    site: &CompatibleModSite<'_>,
+    sources: &mut SignatureSourceCache,
+) -> Option<CompatibleApiModification> {
+    let lang = site.lang_in(TS_ONLY_LANGS)?;
+    if site.kind != "type" {
+        return None;
+    }
+    let src = sources.get(site)?;
+    let (old_tree, new_tree) = src.parse_pair(lang)?;
+    if old_tree.root_node().has_error() || new_tree.root_node().has_error() {
+        return None;
+    }
+    let old_values = eval_named_literal_union(old_tree.root_node(), &src.old, site.name)?;
+    let new_values = eval_named_literal_union(new_tree.root_node(), &src.new, site.name)?;
+    (old_values == new_values).then(|| site.compatible("equivalent_literal_union_alias"))
+}
 
 /// TS/TSX/JS の exported component を `memo` / `forwardRef` 等の HOC でラップしただけの
 /// api.mod を互換変更 (`react_component_wrapper`) として判定する。
@@ -1726,5 +1852,55 @@ mod tests {
         let r = keys(src, "config").expect("通常 object literal を抽出できるべき");
         let expected: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
         assert_eq!(r.member_keys, expected);
+    }
+
+    fn literal_values(source: &str, name: &str) -> Option<BTreeSet<TsLiteralValue>> {
+        let tree =
+            parser::parse_source(source.as_bytes(), LangId::Typescript).expect("parse TypeScript");
+        assert!(!tree.root_node().has_error(), "fixture must parse");
+        eval_named_literal_union(tree.root_node(), source.as_bytes(), name)
+    }
+
+    #[test]
+    fn literal_union_alias_chain_is_order_and_duplicate_insensitive() {
+        let direct = literal_values(r#"type Category = "x" | "y";"#, "Category");
+        let aliased = literal_values(
+            concat!(
+                "type Base = \"y\" | \"x\" | \"x\";\n",
+                "type Category = (Base);\n"
+            ),
+            "Category",
+        );
+        assert_eq!(direct, aliased);
+        assert!(direct.is_some(), "finite literal union must be evaluable");
+    }
+
+    #[test]
+    fn literal_union_value_change_is_not_equivalent() {
+        let old = literal_values(r#"type Category = "x" | "y";"#, "Category");
+        let widened = literal_values(r#"type Category = "x" | "y" | "z";"#, "Category");
+        assert_ne!(old, widened);
+    }
+
+    #[test]
+    fn literal_union_import_cycle_and_non_literal_are_not_evaluable() {
+        assert!(
+            literal_values(
+                concat!(
+                    "import type { Base } from \"./base\";\n",
+                    "type Category = Base;\n"
+                ),
+                "Category"
+            )
+            .is_none()
+        );
+        assert!(
+            literal_values(
+                concat!("type Base = Category;\n", "type Category = Base;\n"),
+                "Category"
+            )
+            .is_none()
+        );
+        assert!(literal_values("type Category = string;", "Category").is_none());
     }
 }

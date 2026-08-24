@@ -1937,3 +1937,143 @@ fn detect_api_changes_ts_member_call_outside_diff_stays_modified() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn detect_api_changes_ts_equivalent_literal_union_alias_is_compatible() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let src_dir = repo.join("src");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+
+    let before = concat!(
+        "export type Base = \"x\" | \"y\";\n",
+        "export type Category = \"x\" | \"y\";\n"
+    );
+    fs::write(src_dir.join("types.ts"), before).expect("write before");
+    assert!(
+        Command::new("git")
+            .args(["add", "src/types.ts"])
+            .current_dir(repo)
+            .status()
+            .expect("git add")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(repo)
+            .status()
+            .expect("git commit")
+            .success()
+    );
+
+    let after = concat!(
+        "export type Base = \"y\" | \"x\" | \"x\";\n",
+        "export type Category = (Base);\n"
+    );
+    fs::write(src_dir.join("types.ts"), after).expect("write after");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/types.ts".to_string(),
+        new_path: "src/types.ts".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 2,
+            new_start: 1,
+            new_count: 2,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        api_changes
+            .modified
+            .iter()
+            .all(|change| change.name != "Category"),
+        "値集合が同値な alias 化は blocking に残してはならない: {:?}",
+        api_changes.modified
+    );
+    let compatible = api_changes
+        .compatible_modified
+        .iter()
+        .find(|change| change.name == "Category")
+        .expect("Category must be classified as compatible");
+    assert_eq!(compatible.reason, "equivalent_literal_union_alias");
+}
+
+#[test]
+fn detect_api_changes_ts_literal_union_widening_and_import_alias_stay_modified() {
+    for (case, before, after) in [
+        (
+            "widening",
+            "export type Category = \"x\" | \"y\";\n",
+            "export type Category = \"x\" | \"y\" | \"z\";\n",
+        ),
+        (
+            "import alias",
+            "export type Category = \"x\" | \"y\";\n",
+            concat!(
+                "import type { Base } from \"./shared\";\n",
+                "export type Category = Base;\n"
+            ),
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        let src_dir = repo.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        fs::write(src_dir.join("types.ts"), before).expect("write before");
+        fs::write(
+            src_dir.join("shared.ts"),
+            "export type Base = \"x\" | \"y\";\n",
+        )
+        .expect("write shared");
+        assert!(
+            Command::new("git")
+                .args(["add", "src/types.ts", "src/shared.ts"])
+                .current_dir(repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+        fs::write(src_dir.join("types.ts"), after).expect("write after");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/types.ts".to_string(),
+            new_path: "src/types.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: after.lines().count(),
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        assert!(
+            api_changes
+                .modified
+                .iter()
+                .any(|change| change.name == "Category"),
+            "{case} は証明範囲外なので blocking を維持する: {api_changes:?}"
+        );
+        assert!(
+            api_changes
+                .compatible_modified
+                .iter()
+                .all(|change| change.name != "Category"),
+            "{case} を互換変更へ誤降格してはならない: {api_changes:?}"
+        );
+    }
+}
