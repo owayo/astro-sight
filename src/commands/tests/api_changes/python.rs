@@ -782,3 +782,99 @@ def build() -> Payload:
         api.modified.iter().map(|c| &c.name).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn detect_api_changes_python_implicit_string_concat_is_compatible() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let before = concat!(
+        "def describe(value: str) -> str:\n",
+        "    return value\n\n",
+        "def handler(label: str = describe(\"alpha beta gamma\")) -> None:\n",
+        "    pass\n"
+    );
+    let caller = "from api import handler\nhandler()\n";
+    git_commit_files(
+        repo,
+        &[("api.py", before), ("caller.py", caller)],
+        "initial",
+    );
+
+    let after = concat!(
+        "def describe(value: str) -> str:\n",
+        "    return value\n\n",
+        "def handler(\n",
+        "    label: str = describe(\n",
+        "        \"alpha \"\n",
+        "        \"beta \"\n",
+        "        \"gamma\"\n",
+        "    ),\n",
+        ") -> None:\n",
+        "    pass\n"
+    );
+    fs::write(repo.join("api.py"), after).expect("write");
+
+    let api = detect_api_changes(
+        repo.to_str().expect("utf-8 path"),
+        "HEAD",
+        &[whole_file_diff("api.py", 11)],
+    );
+    assert!(
+        !api.modified.iter().any(|change| change.name == "handler"),
+        "同値な暗黙文字列連結は blocking に残さない: {api:?}"
+    );
+    assert!(api.compatible_modified.iter().any(|change| {
+        change.name == "handler" && change.reason == "equivalent_implicit_string_concat"
+    }));
+}
+
+#[test]
+fn detect_api_changes_python_implicit_string_concat_counterexamples_stay_modified() {
+    let cases = [
+        (
+            "def handler(value: str = \"alpha beta\") -> None:\n    pass\n",
+            "def handler(value: str = (\"alpha\" \"beta\")) -> None:\n    pass\n",
+        ),
+        (
+            "def handler(value: str = f\"alpha {name}\") -> None:\n    pass\n",
+            "def handler(value: str = f\"alpha {other}\") -> None:\n    pass\n",
+        ),
+        (
+            "def handler(value: str = \"alpha beta\") -> None:\n    pass\n",
+            "def handler(value: str = \"different\") -> None:\n    pass\n",
+        ),
+    ];
+
+    for (before, after) in cases {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                ("api.py", before),
+                ("caller.py", "from api import handler\nhandler()\n"),
+            ],
+            "initial",
+        );
+        fs::write(repo.join("api.py"), after).expect("write");
+
+        let api = detect_api_changes(
+            repo.to_str().expect("utf-8 path"),
+            "HEAD",
+            &[whole_file_diff("api.py", 2)],
+        );
+        assert!(
+            api.modified.iter().any(|change| change.name == "handler"),
+            "値変更・f-string・別 default は blocking を維持する: {api:?}"
+        );
+        assert!(
+            !api.compatible_modified
+                .iter()
+                .any(|change| change.name == "handler"),
+            "反例を compatible_modified へ降格しない: {api:?}"
+        );
+    }
+}

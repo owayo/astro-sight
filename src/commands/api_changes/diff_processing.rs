@@ -482,6 +482,13 @@ pub(crate) fn classify_signature_change(
         state.buckets.compatible_modified.push(compat);
         return;
     }
+    // Python のデフォルト値・型注釈にある純粋な隣接文字列リテラルを分割・結合しただけで、
+    // 正規化後のシグネチャ全体が同一なら compatible_modified とする。f-string、escape、
+    // 演算子、異種 prefix 等を含む場合は判定器が None に倒し blocking を維持する。
+    if let Some(compat) = detect_python_implicit_string_concat_compatible_mod(&site, sources) {
+        state.buckets.compatible_modified.push(compat);
+        return;
+    }
     // object type literal 引数への必須プロパティ追加のみの変更なら、閉包判定へ追加証拠として
     // 渡す (呼び出し式が無変更でも共有 const の定義側が同一 diff で更新されていれば追随済み)。
     // 互換変更ではないので compatible_modified には入れず、あくまで closed 判定の入力。

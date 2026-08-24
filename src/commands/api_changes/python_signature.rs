@@ -51,6 +51,255 @@ pub(crate) fn detect_python_trailing_optional_params_compatible_mod(
     Some(site.compatible("trailing_optional_params"))
 }
 
+/// Python の関数シグネチャ内で、純粋な隣接文字列リテラルの分割・結合だけが行われた
+/// 変更を `equivalent_implicit_string_concat` として降格する。
+///
+/// AST の leaf token 列を比較し、`string` / `concatenated_string` だけを同じ canonical
+/// value token へ置換する。f-string、escape、異種 prefix、演算子や参照を含む式は評価せず
+/// blocking を維持する。少なくとも片側に暗黙連結が実在するときだけ適用するため、他の
+/// Python シグネチャ変更をこの判定器が横取りしない。
+pub(crate) fn detect_python_implicit_string_concat_compatible_mod(
+    site: &CompatibleModSite<'_>,
+    sources: &mut SignatureSourceCache,
+) -> Option<CompatibleApiModification> {
+    let lang = site.lang_in(&[LangId::Python])?;
+    if site.kind != "function" && site.kind != "method" {
+        return None;
+    }
+    let src = sources.get(site)?;
+    let (old_tree, new_tree) = src.parse_pair(lang)?;
+    if old_tree.root_node().has_error() || new_tree.root_node().has_error() {
+        return None;
+    }
+
+    let old_fn = find_python_function_by_name(old_tree.root_node(), &src.old, site.name)?;
+    let new_fn = find_python_function_by_name(new_tree.root_node(), &src.new, site.name)?;
+    let old_sig = canonical_python_function_signature(old_fn, &src.old)?;
+    let new_sig = canonical_python_function_signature(new_fn, &src.new)?;
+
+    if old_sig.decorators != new_sig.decorators
+        || old_sig.tokens != new_sig.tokens
+        || !(old_sig.had_implicit_concat || new_sig.had_implicit_concat)
+    {
+        return None;
+    }
+    Some(site.compatible("equivalent_implicit_string_concat"))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CanonicalPythonSignature {
+    tokens: Vec<u8>,
+    decorators: Vec<String>,
+    had_implicit_concat: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PythonLiteralValue {
+    prefix: Vec<u8>,
+    content: Vec<u8>,
+    had_implicit_concat: bool,
+}
+
+/// body を除く function_definition の全 leaf token を、境界衝突しない長さ付き形式へ直す。
+/// 走査は反復式とし、病的に深いシグネチャでも Rust stack を消費しない。
+fn canonical_python_function_signature(
+    fn_node: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<CanonicalPythonSignature> {
+    const MAX_SIGNATURE_NODES: usize = 100_000;
+
+    let body = fn_node.child_by_field_name("body")?;
+    let decorators = python_collect_decorators(fn_node, source);
+    let mut tokens = Vec::new();
+    let mut had_implicit_concat = false;
+    let mut visited = 0usize;
+    let mut stack = Vec::new();
+    for index in (0..fn_node.child_count()).rev() {
+        let child = fn_node.child(u32::try_from(index).ok()?)?;
+        if !same_node(child, body) {
+            stack.push(child);
+        }
+    }
+
+    while let Some(node) = stack.pop() {
+        visited += 1;
+        if visited > MAX_SIGNATURE_NODES {
+            return None;
+        }
+
+        if matches!(
+            node.kind(),
+            "string" | "concatenated_string" | "parenthesized_expression"
+        ) && let Some(value) = evaluate_python_literal(node, source, 0)
+        {
+            had_implicit_concat |= value.had_implicit_concat;
+            push_canonical_token(&mut tokens, "python_string_prefix", &value.prefix);
+            push_canonical_token(&mut tokens, "python_string_value", &value.content);
+            continue;
+        }
+        // string 系 node を安全に評価できない場合は、部分的に子だけを正規化せず全体を諦める。
+        // 特に f-string の interpolation を leaf token 比較へ流して互換扱いしないためのガード。
+        if matches!(node.kind(), "string" | "concatenated_string") {
+            return None;
+        }
+
+        if node.child_count() == 0 {
+            if node.kind() == "," && is_python_trailing_comma(node) {
+                continue;
+            }
+            let text = source.get(node.start_byte()..node.end_byte())?;
+            push_canonical_token(&mut tokens, node.kind(), text);
+            continue;
+        }
+        for index in (0..node.child_count()).rev() {
+            stack.push(node.child(u32::try_from(index).ok()?)?);
+        }
+    }
+
+    Some(CanonicalPythonSignature {
+        tokens,
+        decorators,
+        had_implicit_concat,
+    })
+}
+
+/// 複数行整形で付く末尾カンマだけを無視する。tuple/list/dict のカンマや、引数間の
+/// カンマは意味・arity に関わるため対象外。
+fn is_python_trailing_comma(node: tree_sitter::Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if !matches!(parent.kind(), "parameters" | "argument_list") {
+        return false;
+    }
+    let count = parent.named_child_count();
+    let Some(last_index) = count
+        .checked_sub(1)
+        .and_then(|value| u32::try_from(value).ok())
+    else {
+        return false;
+    };
+    parent
+        .named_child(last_index)
+        .is_some_and(|last| node.start_byte() >= last.end_byte())
+}
+
+fn same_node(left: tree_sitter::Node<'_>, right: tree_sitter::Node<'_>) -> bool {
+    left.kind() == right.kind()
+        && left.start_byte() == right.start_byte()
+        && left.end_byte() == right.end_byte()
+}
+
+fn push_canonical_token(out: &mut Vec<u8>, kind: &str, value: &[u8]) {
+    out.extend_from_slice(kind.len().to_string().as_bytes());
+    out.push(b':');
+    out.extend_from_slice(kind.as_bytes());
+    out.push(b'=');
+    out.extend_from_slice(value.len().to_string().as_bytes());
+    out.push(b':');
+    out.extend_from_slice(value);
+    out.push(b';');
+}
+
+fn evaluate_python_literal(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    depth: usize,
+) -> Option<PythonLiteralValue> {
+    const MAX_LITERAL_DEPTH: usize = 32;
+    if depth > MAX_LITERAL_DEPTH {
+        return None;
+    }
+
+    match node.kind() {
+        "string" => parse_python_string_literal(node, source),
+        "concatenated_string" => {
+            let mut prefix: Option<Vec<u8>> = None;
+            let mut content = Vec::new();
+            let mut count = 0usize;
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() != "string" {
+                    return None;
+                }
+                let value = evaluate_python_literal(child, source, depth + 1)?;
+                if let Some(expected) = &prefix {
+                    if expected != &value.prefix {
+                        return None;
+                    }
+                } else {
+                    prefix = Some(value.prefix);
+                }
+                content.extend(value.content);
+                count += 1;
+            }
+            (count >= 2).then_some(PythonLiteralValue {
+                prefix: prefix?,
+                content,
+                had_implicit_concat: true,
+            })
+        }
+        "parenthesized_expression" => {
+            let mut cursor = node.walk();
+            let named = node.named_children(&mut cursor).collect::<Vec<_>>();
+            let [inner] = named.as_slice() else {
+                return None;
+            };
+            evaluate_python_literal(*inner, source, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+/// escape / interpolation を持たない文字列だけを byte 値として読む。quote の種類は値に
+/// 影響しないため除外し、prefix は小文字化して str / bytes / raw の混同を防ぐ。
+fn parse_python_string_literal(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<PythonLiteralValue> {
+    let mut prefix = None;
+    let mut content = Vec::new();
+    let mut saw_end = false;
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "string_start" if prefix.is_none() => {
+                let start = source.get(child.start_byte()..child.end_byte())?;
+                prefix = Some(python_string_prefix(start)?);
+            }
+            "string_content" => {
+                if child.child_count() != 0 {
+                    return None;
+                }
+                content.extend_from_slice(source.get(child.start_byte()..child.end_byte())?);
+            }
+            "string_end" if !saw_end => saw_end = true,
+            // escape_sequence / interpolation / 不明 node は評価しない。
+            _ => return None,
+        }
+    }
+    Some(PythonLiteralValue {
+        prefix: prefix.filter(|_| saw_end)?,
+        content,
+        had_implicit_concat: false,
+    })
+}
+
+fn python_string_prefix(start: &[u8]) -> Option<Vec<u8>> {
+    let quote_at = start.iter().position(|byte| matches!(byte, b'\'' | b'"'))?;
+    let quotes = start.get(quote_at..)?;
+    let quote = *quotes.first()?;
+    if !(quotes.len() == 1 || quotes.len() == 3) || quotes.iter().any(|byte| *byte != quote) {
+        return None;
+    }
+    let prefix = start
+        .get(..quote_at)?
+        .iter()
+        .map(u8::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    matches!(prefix.as_slice(), b"" | b"u" | b"r" | b"b" | b"br" | b"rb").then_some(prefix)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PyParamPart {
     /// 通常の引数 (identifier / typed_parameter / default_parameter / typed_default_parameter)
@@ -322,6 +571,53 @@ mod tests {
         python_function_signature_parts(fn_node, src.as_bytes())
             .unwrap()
             .parts
+    }
+
+    fn canonical(src: &str, name: &str) -> Option<CanonicalPythonSignature> {
+        let tree = parse(src);
+        let fn_node = find_python_function_by_name(tree.root_node(), src.as_bytes(), name)?;
+        canonical_python_function_signature(fn_node, src.as_bytes())
+    }
+
+    #[test]
+    fn implicit_concat_is_canonicalized_in_defaults_and_annotations() {
+        let old_default = canonical(
+            "def f(value: str = describe(\"alpha beta\")) -> None:\n    pass\n",
+            "f",
+        )
+        .unwrap();
+        let new_default = canonical(
+            concat!(
+                "def f(\n",
+                "    value: str = describe((\"alpha \" \"beta\")),\n",
+                ") -> None:\n",
+                "    pass\n"
+            ),
+            "f",
+        )
+        .unwrap();
+        assert_eq!(old_default.tokens, new_default.tokens);
+        assert!(new_default.had_implicit_concat);
+
+        let old_annotation = canonical(
+            "def f(value: \"AlphaBeta\") -> \"GammaDelta\":\n    pass\n",
+            "f",
+        )
+        .unwrap();
+        let new_annotation = canonical(
+            "def f(value: \"Alpha\" \"Beta\") -> \"Gamma\" \"Delta\":\n    pass\n",
+            "f",
+        )
+        .unwrap();
+        assert_eq!(old_annotation.tokens, new_annotation.tokens);
+        assert!(new_annotation.had_implicit_concat);
+    }
+
+    #[test]
+    fn implicit_concat_rejects_fstrings_escapes_and_mixed_prefixes() {
+        assert!(canonical("def f(value=f\"a{x}\" f\"b{y}\"):\n    pass\n", "f").is_none());
+        assert!(canonical("def f(value=\"a\\n\" \"b\"):\n    pass\n", "f").is_none());
+        assert!(canonical("def f(value=b\"a\" \"b\"):\n    pass\n", "f").is_none());
     }
 
     #[test]
