@@ -69,7 +69,7 @@ fn eval_literal_union(
     match node.kind() {
         "parenthesized_type" => {
             let inner = node.named_child(0)?;
-            eval_literal_union(inner, root, source, visiting, depth)
+            eval_literal_union(inner, root, source, visiting, depth + 1)
         }
         "union_type" => {
             let mut values = BTreeSet::new();
@@ -1902,5 +1902,11 @@ mod tests {
             .is_none()
         );
         assert!(literal_values("type Category = string;", "Category").is_none());
+    }
+
+    #[test]
+    fn literal_union_deep_parentheses_stop_at_depth_limit() {
+        let nested = format!("type Category = {}\"x\"{};", "(".repeat(64), ")".repeat(64));
+        assert!(literal_values(&nested, "Category").is_none());
     }
 }
