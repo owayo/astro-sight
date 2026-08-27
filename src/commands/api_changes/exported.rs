@@ -265,14 +265,24 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
         ) {
             return true;
         }
-        // pub(crate), pub(super) 等はクレート内部APIなので除外。
-        // Rust 限定: 他言語では `pub` という名前の関数呼び出し (`export function pub(...)` 等) が
-        // 宣言行に現れるだけで API 面から消えてしまう (Rust では `pub` は予約語のため識別子不可)。
-        if self.lang_id == crate::language::LangId::Rust {
-            let decl_line = self.lines.get(sym.range.start.line).unwrap_or(&"").trim();
-            if decl_line.contains("pub(") {
-                return true;
-            }
+        // pub(crate), pub(super) 等はクレート内部 API なので除外。
+        //
+        // 可視性は宣言行のテキストではなく AST の `visibility_modifier` で判定する
+        // (`rust_owner_type_is_crate_internal` と同じ規約)。旧実装は宣言行に `"pub("` が
+        // 含まれるかの**部分一致**だったため、`pub struct S { pub(crate) a: u32 }` のように
+        // フィールドだけが制限付きの公開型や、`pub fn to_epub()` のように名前がたまたま
+        // `pub(` を含む関数まで公開 API 面から消えていた
+        // (api.add / api.rm / api.mod / dead-code の 4 経路が同時に沈黙する)。
+        // 判定不能なら fail-closed で公開扱いを維持する。
+        if self.lang_id == crate::language::LangId::Rust
+            && crate::engine::symbols::is_rust_declaration_restricted_pub(
+                self.root,
+                self.source,
+                &sym.range,
+            )
+            .unwrap_or(false)
+        {
+            return true;
         }
         // C/C++ で実関数 body 内にネストした function_definition は、tree-sitter-cpp が
         // マクロ呼び出し (BOOST_FOREACH 等) を関数定義と誤パースした結果であることが多い。

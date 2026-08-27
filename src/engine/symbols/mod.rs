@@ -14,7 +14,9 @@ mod overrides;
 mod scope;
 
 pub use complexity::calculate_complexity;
-pub use exported::{is_rust_declaration_unrestricted_pub, is_symbol_exported};
+pub use exported::{
+    is_rust_declaration_restricted_pub, is_rust_declaration_unrestricted_pub, is_symbol_exported,
+};
 pub use framework::{
     has_framework_entrypoint_decorator_python, is_java_flyway_migration_class,
     is_js_ts_angular_lifecycle_hook, is_js_ts_angular_provider_option_callback,

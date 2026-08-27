@@ -65,7 +65,14 @@ where
 
     Some(match result {
         Ok(value) => value,
-        Err(e) => make_error("IO_ERROR", format!("{e}")),
+        Err(e) => {
+            // CLI / batch と同じ機械可読コードを返す。すべてを "IO_ERROR" に潰すと
+            // サンドボックス拒否 (PATH_OUT_OF_BOUNDS) まで I/O エラーとして報告される。
+            // また `format!("{e}")` は AstroError の Display が `[CODE] message` を出すため、
+            // message 側にもコードが二重に入っていた (他経路は ae.message を使うので付かない)。
+            let (code, message) = crate::commands::classify_error(&e);
+            make_error(&code, message)
+        }
     })
 }
 
@@ -211,6 +218,38 @@ mod tests {
                 .as_str()
                 .expect("message should be string")
                 .contains("handler failed")
+        );
+    }
+
+    /// `AstroError` は CLI / batch と同じ機械可読コードで返し、message にコードを重ねない。
+    ///
+    /// 旧実装は全ハンドラエラーを `IO_ERROR` に潰していたため、サンドボックス拒否
+    /// (`PATH_OUT_OF_BOUNDS`) まで I/O エラーとして報告されていた。さらに
+    /// `format!("{e}")` は `AstroError` の Display (`[CODE] message`) を通るため、
+    /// session だけ message に `[CODE] ` が二重に入っていた。
+    #[test]
+    fn process_line_preserves_astro_error_code_without_duplicating_it_in_message() {
+        let line = r#"{"command":"doctor","path":"."}"#;
+        let failing = |_req: AstgenRequest| -> Result<serde_json::Value> {
+            Err(crate::error::AstroError::new(
+                crate::error::ErrorCode::PathOutOfBounds,
+                "Path outside workspace boundary: /etc/hosts",
+            )
+            .into())
+        };
+        let result = process_line(line, 1024, &failing).expect("should produce an error JSON");
+
+        assert_eq!(result["error"]["code"], "PATH_OUT_OF_BOUNDS");
+        let message = result["error"]["message"]
+            .as_str()
+            .expect("message should be string");
+        assert!(
+            !message.contains("[PATH_OUT_OF_BOUNDS]"),
+            "message must not repeat the code: {message}"
+        );
+        assert!(
+            message.contains("/etc/hosts"),
+            "unexpected message: {message}"
         );
     }
 

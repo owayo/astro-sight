@@ -21,6 +21,22 @@ fn is_identifier_kind_rejects_non_identifier() {
     assert!(!is_identifier_kind("comment"));
 }
 
+/// JS/TS の object literal shorthand は「値の参照」、destructuring shorthand は「束縛」。
+///
+/// `{ handler }` (`shorthand_property_identifier`) は `handler` を読み出す参照なので
+/// identifier として走査対象に入れる。これが無いと walk_refs の identifier ガードに
+/// 弾かれ、レジストリ / DI / `module.exports = { a, b }` のような JS/TS で最も一般的な
+/// 参照形が 1 件も数えられず、生きているシンボルが dead-code に出る。
+///
+/// 一方 `const { picked } = obj` (`shorthand_property_identifier_pattern`) は束縛なので
+/// **入れてはならない** — 束縛を参照として数えると dead-code が fail-open する。
+/// 2 つは別ノード種別なので、片方だけを対象にできる。
+#[test]
+fn is_identifier_kind_accepts_shorthand_value_but_not_binding_pattern() {
+    assert!(is_identifier_kind("shorthand_property_identifier"));
+    assert!(!is_identifier_kind("shorthand_property_identifier_pattern"));
+}
+
 /// Rust の定義ノード種別に function_item と struct_item が含まれることを検証
 #[test]
 fn definition_node_kinds_rust() {

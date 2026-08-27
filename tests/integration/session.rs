@@ -364,12 +364,16 @@ fn session_refs_requires_name_or_names() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let line = stdout.lines().next().expect("should have one line");
     let json: serde_json::Value = serde_json::from_str(line).expect("invalid JSON");
-    assert_eq!(json["error"]["code"], "IO_ERROR");
+    // 入力検証エラーは CLI / batch と同じ `INVALID_REQUEST` を返す。
+    // 旧実装は session のハンドラエラーを一律 `IO_ERROR` へ潰しており、
+    // このテストはその不具合をそのまま固定していた。
+    assert_eq!(json["error"]["code"], "INVALID_REQUEST");
+    let message = json["error"]["message"].as_str().unwrap();
+    assert!(message.contains("name or names is required"));
+    // message にコードを重ねない (`AstroError` の Display は `[CODE] msg` を出す)
     assert!(
-        json["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("name or names is required")
+        !message.contains("[INVALID_REQUEST]"),
+        "message must not repeat the code: {message}"
     );
 }
 

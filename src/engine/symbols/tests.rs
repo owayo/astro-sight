@@ -3315,3 +3315,147 @@ impl Plain {\n\
         "generic / 非 generic のどちらの impl でもレシーバ型が container になる: {syms:?}"
     );
 }
+
+/// 式形の分岐 (C# の switch 式 / PHP の match) も文形と同じ値になる。
+///
+/// `switch_expression_arm` / `match_conditional_expression` を列挙していなかったため、
+/// C# の switch 式は cx=1 (等価な Rust `match` は 4)、PHP は同一ファイル内で
+/// `match` 版 1 / `switch` 版 3 という「書き方で値が変わる」不整合になっていた。
+#[test]
+fn cx_expression_switch_counts_arms_like_statement_switch() {
+    assert_cx_cases(
+        4,
+        &[
+            CxCase {
+                lang: LangId::CSharp,
+                label: "switch expression",
+                src: "class C { int f(int a) { return a switch { 1 => 1, 2 => 2, _ => 3 }; } }",
+            },
+            CxCase {
+                lang: LangId::Php,
+                label: "match",
+                src: "<?php\nfunction f($a) { return match($a) { 1 => 1, 2 => 2, 3 => 3 }; }",
+            },
+            CxCase {
+                lang: LangId::Rust,
+                label: "match (control)",
+                src: "fn f(a: i32) -> i32 { match a { 1 => 1, 2 => 2, _ => 3 } }",
+            },
+        ],
+    );
+}
+
+/// Ruby の修飾子形ガード節 (`return 0 if x`) も判定点として数える。
+///
+/// `if_modifier` 等は `if` とは別ノードなので、列挙しないと 1 つも計上されない。
+/// 修飾子形は Ruby で最も一般的なガード節記法のため、実質「Ruby の cx は常に過小」だった。
+#[test]
+fn cx_ruby_guard_clause_modifiers_are_counted() {
+    assert_cx_cases(
+        3,
+        &[
+            CxCase {
+                lang: LangId::Ruby,
+                label: "modifier guards",
+                src: "def f(a)\n  return 0 if a.nil?\n  return 1 unless a > 0\n  2\nend\n",
+            },
+            CxCase {
+                lang: LangId::Python,
+                label: "block guards (control)",
+                src: "def f(a):\n    if a is None:\n        return 0\n    if not a > 0:\n        return 1\n    return 2\n",
+            },
+        ],
+    );
+}
+
+/// range-for / C スタイル for も通常の for と同じ値になる。
+///
+/// C++11 の `for_range_loop` と bash の `c_style_for_statement` は専用ノードなので、
+/// 列挙しないとそれぞれ cx=1 になり、等価な Java for-each / C for (2) と食い違う。
+#[test]
+fn cx_range_and_c_style_for_match_plain_for() {
+    assert_cx_cases(
+        2,
+        &[
+            CxCase {
+                lang: LangId::Cpp,
+                label: "range-for",
+                src: "int f() { int s = 0; for (int x : {1,2,3}) { s += x; } return s; }",
+            },
+            CxCase {
+                lang: LangId::Bash,
+                label: "c-style for",
+                src: "f() { for ((i=0;i<3;i++)); do echo $i; done; }\n",
+            },
+            CxCase {
+                lang: LangId::Java,
+                label: "for-each (control)",
+                src: "class C { int f(int[] xs) { int s = 0; for (int x : xs) { s += x; } return s; } }",
+            },
+            CxCase {
+                lang: LangId::C,
+                label: "indexed for (control)",
+                src: "int f(void) { int s = 0; for (int i = 0; i < 3; i++) { s += i; } return s; }",
+            },
+        ],
+    );
+}
+
+/// C# のローカル関数と Rust の `async` ブロックはネスト関数として扱い、
+/// 中の分岐を外側関数の cx に加算しない。
+///
+/// `local_function_statement` / `async_block` が境界テーブルに無かったため、
+/// C# だけが他 12 言語と違ってネスト関数の分岐を吸い上げ、Rust では同じロジックでも
+/// closure なら 1・`async move` なら 2 という同一言語内の非対称が出ていた。
+#[test]
+fn cx_nested_function_branches_excluded_in_csharp_and_rust_async() {
+    assert_cx_cases(
+        1,
+        &[
+            CxCase {
+                lang: LangId::CSharp,
+                label: "local function",
+                src: "class C { int f(int a) { int inner(int x) { if (x > 0) { return 1; } return 0; } return inner(a); } }",
+            },
+            CxCase {
+                lang: LangId::Rust,
+                label: "async block",
+                src: "fn f() { let _h = async move { if true { 1 } else { 2 } }; }",
+            },
+            CxCase {
+                lang: LangId::Rust,
+                label: "closure (control)",
+                src: "fn f() { let _h = || { if true { 1 } else { 2 } }; }",
+            },
+        ],
+    );
+}
+
+/// null 合体演算子はどの言語でも判定点として数えない。
+///
+/// JS/TS の `??`・Swift の `??`・PHP の `??` は `binary_expression` に潰れてノード名で
+/// 判別できないため、Kotlin の `elvis_expression` だけを計上すると「同じロジックが
+/// 言語をまたいで同じ値になる」という本テーブルの要件を破る。
+#[test]
+fn cx_null_coalescing_is_not_counted_in_any_language() {
+    assert_cx_cases(
+        1,
+        &[
+            CxCase {
+                lang: LangId::Kotlin,
+                label: "elvis",
+                src: "fun f(a: Int?): Int { return a ?: 0 }",
+            },
+            CxCase {
+                lang: LangId::Typescript,
+                label: "??",
+                src: "function f(a: number | null): number { return a ?? 0; }",
+            },
+            CxCase {
+                lang: LangId::Php,
+                label: "??",
+                src: "<?php\nfunction f($a) { return $a ?? 0; }",
+            },
+        ],
+    );
+}

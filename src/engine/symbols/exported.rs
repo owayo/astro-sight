@@ -680,3 +680,29 @@ pub fn is_rust_declaration_unrestricted_pub(
     }
     Some(false)
 }
+
+/// Rust: 宣言に **制限付き** の `pub(...)` 可視性修飾子が付いているかを AST から判定する。
+///
+/// `is_rust_declaration_unrestricted_pub` の否定では代用できない — あちらは
+/// 「修飾子なし」も `Some(false)` を返すため、否定すると trait impl のメソッドのように
+/// 可視性修飾子を書けない宣言まで「制限付き = crate 内部」と誤判定してしまう。
+///
+/// 宣言行のテキストに `"pub("` が含まれるかで代用してもならない。部分一致なので
+/// `pub struct S { pub(crate) a: u32 }` のように**フィールドだけ**が制限付きの公開型や、
+/// `pub fn to_epub()` のように名前がたまたま `pub(` を含む関数まで公開 API 面から
+/// 消える (api.add / api.rm / api.mod / dead-code の 4 経路が同時に沈黙する)。
+pub fn is_rust_declaration_restricted_pub(
+    root: Node,
+    source: &[u8],
+    symbol_range: &Range,
+) -> Option<bool> {
+    let node = node_for_symbol_range(root, symbol_range)?;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "visibility_modifier" {
+            let text = child.utf8_text(source).ok()?;
+            return Some(text.contains('('));
+        }
+    }
+    Some(false)
+}

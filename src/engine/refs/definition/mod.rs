@@ -110,8 +110,16 @@ fn is_name_field_definition_context(node: Node<'_>, definition_kinds: &[&str]) -
     // grandparent が定義ノード: parent 経由で name フィールドに到達するときのみ def 扱い
     // (例: `variable_declarator > identifier` の identifier は def、
     //      `function_declaration > return_type > type_identifier` は ref)
+    //
+    // `computed_property_name` だけは除外する。`name_node.id() == parent.id()` は
+    // 分割代入パターンのように「束縛を包むノード」を想定した条件だが、
+    // `class A { [SOME_KEY]() {} }` の method_definition も name フィールドが
+    // computed_property_name になるため該当してしまう。これは束縛を包むノードではなく
+    // **定数を読む式**なので、中の識別子は Reference。
+    // (同じ class の `[OTHER_KEY] = 2` は field_definition 側の経路を通り元から ref)
     if let Some(grandparent) = parent.parent()
         && definition_kinds.contains(&grandparent.kind())
+        && parent.kind() != "computed_property_name"
         && let Some(name_node) = grandparent.child_by_field_name("name")
         && (name_node.id() == node.id() || name_node.id() == parent.id())
     {
@@ -396,6 +404,13 @@ pub(crate) fn is_identifier_kind(kind: &str) -> bool {
             | "type_identifier"
             | "field_identifier"
             | "property_identifier"
+            // JS/TS の object literal shorthand (`{ handler }`) は値の読み出し = 参照。
+            // レジストリ / DI / `export default { setup, data }` / `module.exports = { a, b }`
+            // は JS/TS で最も一般的な参照形なのに、ここに無いせいで walk_refs の
+            // identifier ガードに弾かれ、生きているシンボルが dead-code に出ていた。
+            // 束縛側の `shorthand_property_identifier_pattern` (`const { x } = obj`) は
+            // 別ノードなので入れない — 束縛を参照として数えると dead-code が fail-open する。
+            | "shorthand_property_identifier"
             | "simple_identifier"
             | "namespace_identifier"
             | "package_identifier"

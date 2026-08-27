@@ -1288,6 +1288,37 @@ fn detect_api_changes_ts_shared_const_arg_not_updated_stays_modified() {
     );
 }
 
+/// 実引数の直前にコメントがあっても分類は変わらない。
+///
+/// `comment` は `arguments` の named child なので、除外せずに index すると
+/// `foo(/* c */ A, B)` で実引数の位置が仮引数の位置から 1 つずれ、別の引数を
+/// 共有 const として検査してしまう。結果として `/* c */` の有無だけで
+/// blocking (`api.mod`) と informational (`mod_closed`) が反転していた。
+#[test]
+fn detect_api_changes_ts_comment_in_call_arguments_does_not_change_classification() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let api = ts_shared_const_arg_api_changes(
+        dir.path(),
+        TS_SHARED_CONST_CALLER_BEFORE,
+        "import { buildSql } from \"./build\";\n\nconst SHARED_DEPS = {\n\tevents: \"e\",\n\tusers: \"u\",\n\tgroups: \"g\",\n};\n\nexport function run(): string {\n\treturn buildSql(/* deps */ SHARED_DEPS);\n}\n",
+    );
+    assert!(
+        api.modified_closed_in_diff
+            .iter()
+            .any(|m| m.name.ends_with("buildSql")),
+        "引数直前のコメントは分類を変えてはならない。mod={:?} mod_closed={:?}",
+        api.modified.iter().map(|m| &m.name).collect::<Vec<_>>(),
+        api.modified_closed_in_diff
+            .iter()
+            .map(|m| &m.name)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !api.modified.iter().any(|m| m.name.ends_with("buildSql")),
+        "コメント付き呼び出しが blocking な modified に残ってはならない"
+    );
+}
+
 /// リポジトリ内に呼び出し参照が 1 件も無い exported 関数のシグネチャ変更は、
 /// **blocking な api.mod のまま**で `no_resolved_internal_callers` フラグだけ立てる。
 ///

@@ -235,6 +235,10 @@ pub(super) fn is_exported_cpp(node: Node<'_>, source: &[u8]) -> bool {
             Some(p) => match p.kind() {
                 "class_specifier" => break false, // class: default private
                 "struct_specifier" => break true, // struct: default public
+                // union も struct と同じく default public。列挙しないと union のメンバが
+                // translation_unit まで抜けて `None => return true` に落ち、
+                // access_specifier の走査自体が行われず `private:` 配下も公開扱いになる。
+                "union_specifier" => break true,
                 _ => {
                     if p.kind() == "field_declaration_list" {
                         member_anchor = cur;

@@ -184,7 +184,7 @@ compact 出力例:
 | `name` | シンボル名 |
 | `kind` | 種別の短縮形（`fn` / `method` / `class` / `struct` / `enum` / `iface` / `trait` / `var` / `const` / `mod` / `import` / `type` / `field` / `param`） |
 | `ln` | 定義行（0-indexed） |
-| `cx` | 循環的複雑度。関数/メソッドのみ付与（ベース 1 + 分岐ノード数、ネスト関数/クロージャの分岐は除外） |
+| `cx` | 循環的複雑度。関数/メソッドのみ付与（ベース 1 + 分岐ノード数、ネスト関数/クロージャ・ローカル関数・`async` ブロックの分岐は除外）。計上規約は McCabe に揃えてあり、**同じロジックなら言語をまたいで同じ値になる**（switch/match は arm だけを数え構文本体は数えない、plain `else` は数えない、三項演算子は数える、null 合体演算子は数えない）。式形の分岐（C# の switch 式、PHP の `match`）や Ruby の修飾子形ガード節（`return 0 if x`）も文形と同じ値になる |
 | `cn` | enclosing container 名。`impl Default for AppService` の中のメソッドなら `AppService`。同名メソッドの見分けに使う |
 | `doc` | docstring（`--doc` 指定時のみ） |
 

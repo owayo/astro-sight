@@ -43,7 +43,10 @@ fn count_branch_nodes(
 /// 静的スライスを返すことで毎回の Vec アロケーションを回避する。
 fn function_boundary_kinds(lang_id: LangId) -> &'static [&'static str] {
     match lang_id {
-        LangId::Rust => &["function_item", "closure_expression"],
+        // `async move { ... }` (`async_block`) も独立した実行単位。境界にしないと
+        // `tokio::spawn(async move { ... })` の中身が外側関数の cx へ加算され、
+        // 同じロジックを closure で書いた場合と値が食い違う (同一言語内の非対称)。
+        LangId::Rust => &["function_item", "closure_expression", "async_block"],
         LangId::Javascript | LangId::Typescript | LangId::Tsx => &[
             "function_declaration",
             "function_expression",
@@ -60,7 +63,15 @@ fn function_boundary_kinds(lang_id: LangId) -> &'static [&'static str] {
             "anonymous_function",
         ],
         LangId::Swift => &["function_declaration", "lambda_literal"],
-        LangId::CSharp => &["method_declaration", "lambda_expression"],
+        // ローカル関数 (`int inner(int x) { ... }` をメソッド本体に書く C# の機能) と
+        // `delegate(int x) { ... }` も関数境界。列挙しないと中身の分岐が外側メソッドへ
+        // 加算され、他 12 言語がネスト関数を除外するのに C# だけ吸い上げる状態になる。
+        LangId::CSharp => &[
+            "method_declaration",
+            "local_function_statement",
+            "lambda_expression",
+            "anonymous_method_expression",
+        ],
         // tree-sitter-php 0.24 で `anonymous_function_creation_expression` →
         // `anonymous_function` に改称された。旧名のままだと closure 内の分岐が
         // 外側関数の cx に混入する。
@@ -170,8 +181,11 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
             "ternary_expression",
         ],
         // Kotlin の分岐ノードは tree-sitter-kotlin 固有名 (`if_expression` / `when_expression` /
-        // `when_entry` / `do_while_statement` / `catch_block` / `elvis_expression`)。
+        // `when_entry` / `do_while_statement` / `catch_block`)。
         // Java と同じスライスを共用すると一切マッチせず複雑度がベース 1 のまま返る。
+        // null 合体演算子 (`elvis_expression`) は**数えない** — JS/TS の `??`・Swift の `??`・
+        // PHP の `??` は `binary_expression` に潰れてノード名で判別できないため、Kotlin だけ
+        // 計上すると「同じロジックが言語をまたいで同じ値になる」という本テーブルの要件を破る。
         LangId::Kotlin => &[
             "if_expression",
             "when_entry",
@@ -179,7 +193,6 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
             "while_statement",
             "do_while_statement",
             "catch_block",
-            "elvis_expression",
         ],
         // Swift の分岐ノードも tree-sitter-swift 固有名を含む。汎用スライスには
         // `guard_statement` / `switch_entry` / `repeat_while_statement` / `catch_block` が
@@ -196,25 +209,40 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
         ],
         // 三項演算子は tree-sitter-ruby では `conditional` (他言語の
         // `conditional_expression` / `ternary_expression` ではない)。欠落していた。
-        // `case` 本体は判定点ではないので数えない (`when` 側で計上)。
+        // `case` 本体は判定点ではないので数えない (`when` / `in_clause` 側で計上)。
+        // 修飾子形 (`return 0 if x.nil?` 等) は Ruby で最も一般的なガード節記法だが、
+        // `if` 等とは別ノード (`if_modifier`) なので個別に列挙しないと 1 つも計上されず、
+        // 「Ruby の cx はほぼ常に過小」という状態になっていた。
         LangId::Ruby => &[
             "if",
             "elsif",
             "unless",
             "when",
+            "in_clause",
             "for",
             "while",
             "until",
             "rescue",
             "conditional",
+            "if_modifier",
+            "unless_modifier",
+            "while_modifier",
+            "until_modifier",
+            "rescue_modifier",
         ],
         // `elseif` は `else_if_clause`、三項演算子は `conditional_expression`。
         // どちらも欠落しており、`if/elseif/else` が cx=2、三項のみの関数が cx=1 だった。
         // `switch_statement` 本体は判定点ではないので数えない (`case_statement` 側で計上)。
+        // PHP 8 の `match` は `switch` と別ノード。arm (`match_conditional_expression`) を
+        // 列挙しないと同一ファイル内で `match` 版が cx=1、`switch` 版が cx=3 という
+        // 「同じロジックなのに書き方で値が変わる」不整合になる。catch-all の
+        // `match_default_expression` は別ノードなので、`default_statement` を数えない
+        // 既存規約に揃えて数えない。
         LangId::Php => &[
             "if_statement",
             "else_if_clause",
             "case_statement",
+            "match_conditional_expression",
             "for_statement",
             "foreach_statement",
             "while_statement",
@@ -225,9 +253,14 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
         // tree-sitter-c-sharp の foreach は `foreach_statement` (アンダースコア無し)。
         // 旧テーブルの `for_each_statement` は存在しないノード名で 1 つもマッチせず、
         // foreach だけの関数が cx=1 のまま返っていた。三項も欠落していた。
+        // C# 8 の switch **式** は `switch_section` ではなく `switch_expression_arm`。
+        // 列挙しないと `a switch { 1 => 10, 2 => 20, _ => 0 }` が cx=1 になり、
+        // 等価な Rust `match` / Kotlin `when` / Java arrow switch (いずれも 4) と食い違う。
+        // catch-all (`_ =>`) も同じノードなので、arm と同一ノードの言語は数える既存規約に従う。
         LangId::CSharp => &[
             "if_statement",
             "switch_section",
+            "switch_expression_arm",
             "for_statement",
             "foreach_statement",
             "while_statement",
@@ -251,9 +284,13 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
         // 旧汎用スライスはどちらも持たず、これらだけを持つ関数がベース 1 のまま返っていた。
         // `switch_statement` 本体は判定点ではないので数えない (`case_statement` 側で計上。
         // tree-sitter-c では `default:` も `case_statement` なので catch-all も 1 計上される)。
+        // C++11 の range-for は `for_statement` ではなく `for_range_loop` (C 文法には
+        // 存在しないノードなので C 側の値は変わらない)。列挙しないと range-for だけの
+        // 関数が cx=1 になり、等価な Java / C# / JS の for-each (いずれも 2) と食い違う。
         LangId::C | LangId::Cpp => &[
             "if_statement",
             "for_statement",
+            "for_range_loop",
             "while_statement",
             "do_statement",
             "case_statement",
@@ -263,10 +300,13 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
         // bash の `elif` は `elif_clause`、`case` の arm は `case_item`。
         // 旧汎用スライスはどちらも持たず過小計上だった (`until` は `while_statement`
         // として既に計上される)。`else_clause` は Python 同様に数えない。
+        // `for ((i=0;i<n;i++))` は `for_statement` ではなく `c_style_for_statement`。
+        // 列挙しないと C の等価ループ (cx=2) に対して cx=1 になる。
         LangId::Bash => &[
             "if_statement",
             "elif_clause",
             "for_statement",
+            "c_style_for_statement",
             "while_statement",
             "case_item",
         ],

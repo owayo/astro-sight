@@ -1690,3 +1690,114 @@ class CsApp {\n\
         );
     }
 }
+
+/// C++ の `union` メンバにも可視性判定 (`access_specifier`) を効かせる。
+///
+/// `is_exported_cpp` が `class_specifier` / `struct_specifier` しか列挙していなかったため、
+/// union のメンバは祖先走査が translation_unit まで抜けて「クラス外 = 公開」に落ち、
+/// access_specifier を 1 度も見ずに `private:` 配下まで公開扱いになっていた。
+///
+/// **対照ケースを内蔵する**: union は struct と同じく default public なので、
+/// 修飾子なしと `public:` 配下は引き続き公開 API 面に残る。ここまで固定しないと
+/// 「union を丸ごと非公開にする」逆方向の修正でもテストが通ってしまう。
+#[test]
+fn dead_code_cpp_union_respects_access_specifier() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("u.cpp"),
+        "union Tagged {\n\
+         public:\n\
+         \x20 void unionPublic() {}\n\
+         private:\n\
+         \x20 void unionPrivate() {}\n\
+         };\n\
+         union Bare {\n\
+         \x20 void bareDefault() {}\n\
+         };\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+
+    assert!(
+        !dead.iter().any(|n| n == "unionPrivate"),
+        "`private:` 配下の union メンバは公開 API 面ではない: {dead:?}"
+    );
+    // 対照: union は default public なので、公開メンバは従来どおり報告される
+    for public_member in ["unionPublic", "bareDefault"] {
+        assert!(
+            dead.iter().any(|n| n == public_member),
+            "union の公開メンバ {public_member} は引き続き dead 候補 (対照): {dead:?}"
+        );
+    }
+}
+
+/// Rust の制限付き可視性 (`pub(crate)` 等) は AST の `visibility_modifier` で判定する。
+///
+/// 旧実装は宣言行に `"pub("` が含まれるかの**部分一致**だったため、
+/// (a) フィールドだけが制限付きの公開型 (`pub struct S { pub(crate) a: u32 }`)、
+/// (b) 名前がたまたま `pub(` を含む関数 (`pub fn to_epub()`) が公開 API 面から消え、
+/// api.add / api.rm / api.mod / dead-code の 4 経路が同時に沈黙していた。
+///
+/// **対照ケースを内蔵する**: 本当に `pub(crate)` / `pub(super)` な宣言は引き続き除外する。
+/// これが無いと「Rust の可視性チェックを丸ごと外す」修正でもテストが通ってしまう。
+#[test]
+fn dead_code_rust_restricted_visibility_uses_ast_not_line_substring() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("lib.rs"),
+        "pub struct PlainPublic { pub a: u32 }\n\
+         pub struct FieldRestricted { pub(crate) a: u32 }\n\
+         pub struct TupleRestricted(pub(super) u32);\n\
+         pub fn to_epub() {}\n\
+         pub(crate) fn internal_fn() {}\n\
+         pub(super) struct InternalStruct { pub a: u32 }\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead: Vec<String> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect();
+
+    // 型・関数自体は無修飾 pub なので公開 API 面に残る
+    for public in [
+        "PlainPublic",
+        "FieldRestricted",
+        "TupleRestricted",
+        "to_epub",
+    ] {
+        assert!(
+            dead.iter().any(|n| n == public),
+            "無修飾 pub の {public} は公開 API 面に残るべき: {dead:?}"
+        );
+    }
+    // 対照: 本当に制限付きの宣言は従来どおり crate 内部として除外される
+    for restricted in ["internal_fn", "InternalStruct"] {
+        assert!(
+            !dead.iter().any(|n| n == restricted),
+            "制限付き可視性の {restricted} は公開 API 面ではない (対照): {dead:?}"
+        );
+    }
+}

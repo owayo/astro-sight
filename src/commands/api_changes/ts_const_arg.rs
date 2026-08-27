@@ -39,7 +39,13 @@ fn bare_identifier_argument<'a>(
 ) -> Option<&'a str> {
     let args = call_node.child_by_field_name("arguments")?;
     let mut cursor = args.walk();
-    let children: Vec<tree_sitter::Node> = args.named_children(&mut cursor).collect();
+    // `comment` は `arguments` の named child なので、除外しないと `foo(/* c */ A, B)` で
+    // 実引数の位置が仮引数の位置から 1 つずれ、別の引数を共有 const として検査してしまう
+    // (コメントの有無だけで api.mod が blocking / informational に反転する)。
+    let children: Vec<tree_sitter::Node> = args
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() != "comment")
+        .collect();
     // spread が混ざると実引数と仮引数の対応が崩れるため不成立。
     if children.iter().any(|c| c.kind() == "spread_element") {
         return None;

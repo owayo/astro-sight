@@ -31,6 +31,137 @@ fn refs_finds_symbol() {
     assert!(!defs.is_empty(), "Should find definition of AstgenResponse");
 }
 
+/// JS/TS の object literal shorthand (`{ handler }`) を参照として数え、
+/// destructuring の shorthand (`const { picked } = ...`) は数えないことを固定する。
+///
+/// 旧実装は `shorthand_property_identifier` を identifier として扱わなかったため、
+/// レジストリ / DI / `module.exports = { a, b }` のような JS/TS で最も一般的な参照形が
+/// 1 件も数えられず、**使われている関数が dead-code に出ていた**。
+/// 束縛側 (`shorthand_property_identifier_pattern`) を数えてしまう逆方向の事故を防ぐため、
+/// 「shorthand が ref になる」ことと「束縛が ref にならない」ことを同じテストで固定する。
+#[test]
+fn refs_counts_object_shorthand_value_but_not_destructuring_binding() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("registry.ts"),
+        "export function handler() { return 1; }\n\
+         export const registry = { handler };\n\
+         function source() { return { picked: 1 }; }\n\
+         const { picked } = source();\n\
+         export const out = picked;\n",
+    )
+    .expect("write fixture");
+    let dir_arg = dir.path().to_str().expect("utf-8 path");
+
+    let refs_of = |name: &str| -> Vec<serde_json::Value> {
+        let output = cargo_bin()
+            .args(["refs", "--name", name, "--dir", dir_arg])
+            .output()
+            .expect("failed to run");
+        assert!(output.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+        json["refs"].as_array().cloned().unwrap_or_default()
+    };
+
+    // `{ handler }` は値の読み出しなので ref として数える
+    let handler = refs_of("handler");
+    assert!(
+        handler.iter().any(|r| r["kind"] == "ref" && r["ln"] == 1),
+        "object shorthand `{{ handler }}` should be counted as a reference: {handler:?}"
+    );
+
+    // `const { picked } = ...` は束縛なので ref にしない (数えると dead-code が fail-open する)
+    let picked = refs_of("picked");
+    assert!(
+        !picked.iter().any(|r| r["ln"] == 3),
+        "destructuring binding should not be counted as a reference: {picked:?}"
+    );
+
+    // shorthand で参照されている関数が dead に出ないこと (本来の症状)
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", dir_arg])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|s| s["name"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        !dead.contains(&"handler"),
+        "`handler` is referenced via object shorthand and must not be dead: {dead:?}"
+    );
+}
+
+/// TS の computed member 名 `class A { [SOME_KEY]() {} }` は定数への**参照**であって
+/// 定義ではないことを固定する。
+///
+/// 旧実装は「grandparent が定義ノードで、その name フィールドが parent と同一なら def」
+/// という判定 (分割代入パターン向け) を持っており、method_definition の name フィールドが
+/// `computed_property_name` になる TS でこの条件に該当してしまっていた。結果として
+/// 同一ファイル内で使われている定数が dead-code に出ていた。
+///
+/// **対照ケースを内蔵する**: 通常のメソッド名 (`plain()`) は従来どおり def のまま。
+/// これが無いと「computed を ref にする」修正が通常のメソッド定義まで ref に落とす
+/// 逆方向の事故 (定義が 1 つも無くなる) を検出できない。
+#[test]
+fn refs_treats_computed_member_name_as_reference_not_definition() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("keys.ts"),
+        "export const SOME_KEY = \"s\";\n\
+         export class A {\n\
+         \x20 [SOME_KEY]() { return 1; }\n\
+         \x20 plain() { return 2; }\n\
+         }\n",
+    )
+    .expect("write fixture");
+    let dir_arg = dir.path().to_str().expect("utf-8 path");
+
+    let refs_of = |name: &str| -> Vec<serde_json::Value> {
+        let output = cargo_bin()
+            .args(["refs", "--name", name, "--dir", dir_arg])
+            .output()
+            .expect("failed to run");
+        assert!(output.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+        json["refs"].as_array().cloned().unwrap_or_default()
+    };
+
+    let some_key = refs_of("SOME_KEY");
+    let computed = some_key
+        .iter()
+        .find(|r| r["ln"] == 2)
+        .unwrap_or_else(|| panic!("computed member name not found in refs: {some_key:?}"));
+    assert_eq!(
+        computed["kind"], "ref",
+        "`[SOME_KEY]()` reads the constant, so it is a reference: {some_key:?}"
+    );
+
+    // 対照: 通常のメソッド名は定義のまま
+    let plain = refs_of("plain");
+    assert!(
+        plain.iter().any(|r| r["kind"] == "def"),
+        "a normal method name must stay a definition: {plain:?}"
+    );
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", dir_arg])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let dead: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|s| s["name"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        !dead.contains(&"SOME_KEY"),
+        "`SOME_KEY` is used as a computed member name and must not be dead: {dead:?}"
+    );
+}
+
 #[test]
 fn refs_with_glob_filter() {
     let output = cargo_bin()
