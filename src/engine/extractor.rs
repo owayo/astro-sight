@@ -13,9 +13,10 @@ pub fn extract_at_point(
     let point = Point::new(line, column);
     let node = find_deepest_node_at(root, point);
 
+    let mut next_id = 0;
     match node {
-        Some(n) => vec![node_to_ast(n, source, depth)],
-        None => vec![node_to_ast(root, source, depth.min(2))],
+        Some(n) => vec![node_to_ast(n, source, depth, &mut next_id)],
+        None => vec![node_to_ast(root, source, depth.min(2), &mut next_id)],
     }
 }
 
@@ -33,12 +34,13 @@ pub fn extract_range(
     let end = Point::new(end_line, end_col);
 
     let mut results = Vec::new();
-    collect_nodes_in_range(root, source, start, end, depth, &mut results);
+    let mut next_id = 0;
+    collect_nodes_in_range(root, source, start, end, depth, &mut results, &mut next_id);
 
     if results.is_empty() {
         // フォールバック: start 位置の最深ノードを返す
         if let Some(n) = find_deepest_node_at(root, start) {
-            results.push(node_to_ast(n, source, depth));
+            results.push(node_to_ast(n, source, depth, &mut next_id));
         }
     }
 
@@ -49,9 +51,10 @@ pub fn extract_range(
 pub fn extract_full(root: Node<'_>, source: &[u8], depth: usize) -> Vec<AstNode> {
     let mut results = Vec::new();
     let mut cursor = root.walk();
+    let mut next_id = 0;
     for child in root.children(&mut cursor) {
         if child.is_named() {
-            results.push(node_to_ast(child, source, depth));
+            results.push(node_to_ast(child, source, depth, &mut next_id));
         }
     }
     results
@@ -95,6 +98,7 @@ fn collect_nodes_in_range(
     end: Point,
     depth: usize,
     results: &mut Vec<AstNode>,
+    next_id: &mut usize,
 ) {
     let node_start = node.start_position();
     let node_end = node.end_position();
@@ -109,14 +113,14 @@ fn collect_nodes_in_range(
 
     // ノードが範囲内に完全に含まれる場合は収集
     if node.is_named() && is_within(node_start, node_end, start, end) {
-        results.push(node_to_ast(node, source, depth));
+        results.push(node_to_ast(node, source, depth, next_id));
         return;
     }
 
     // 含まれない場合は子ノードを再帰走査
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_nodes_in_range(child, source, start, end, depth, results);
+        collect_nodes_in_range(child, source, start, end, depth, results, next_id);
     }
 }
 
@@ -198,7 +202,22 @@ fn normalize_ast_text(s: &str) -> String {
     }
 }
 
-fn node_to_ast(node: Node<'_>, source: &[u8], remaining_depth: usize) -> AstNode {
+/// tree-sitter ノードを `AstNode` へ変換する。
+///
+/// `id` は **抽出単位ごとの pre-order 通し番号**で、`node.id()` (tree-sitter の内部
+/// ポインタ値) は使わない。ポインタは実行のたびに変わるため、同じ入力に対して
+/// `--full` の出力が毎回変わり、「出力は決定論的に保つ」という規約に反していた。
+/// キャッシュされる JSON と、キャッシュ対象外の TOON とで同じ入力に別の値が出る
+/// 問題も併発していた。
+fn node_to_ast(
+    node: Node<'_>,
+    source: &[u8],
+    remaining_depth: usize,
+    next_id: &mut usize,
+) -> AstNode {
+    let id = *next_id;
+    *next_id += 1;
+
     let text = if node.child_count() == 0 || remaining_depth == 0 {
         node.utf8_text(source).ok().map(normalize_ast_text)
     } else {
@@ -218,7 +237,7 @@ fn node_to_ast(node: Node<'_>, source: &[u8], remaining_depth: usize) -> AstNode
                 named_index += 1;
                 AstEdge {
                     field,
-                    node: node_to_ast(child, source, remaining_depth - 1),
+                    node: node_to_ast(child, source, remaining_depth - 1, next_id),
                 }
             })
             .collect()
@@ -227,7 +246,7 @@ fn node_to_ast(node: Node<'_>, source: &[u8], remaining_depth: usize) -> AstNode
     };
 
     AstNode {
-        id: node.id(),
+        id,
         kind: node.kind().to_string(),
         named: Some(node.is_named()),
         range: Range::from(node.range()),
@@ -466,8 +485,23 @@ mod tests {
         let tree = parse_rust_source(source);
         let root = tree.root_node();
         let func = root.child(0).unwrap(); // function_item
-        let ast = super::node_to_ast(func, source.as_bytes(), 3);
+        let mut next_id = 0;
+        let ast = super::node_to_ast(func, source.as_bytes(), 3, &mut next_id);
         assert_eq!(ast.kind, "function_item");
         assert!(!ast.children.is_empty());
+        // pre-order なので親が 0、子はそれ以降に採番される
+        assert_eq!(ast.id, 0);
+        assert_eq!(ast.children[0].node.id, 1);
+        // 1 ノードにつき 1 つ採番するので、消費した id 数 = 出力ノード総数
+        assert_eq!(next_id, count_nodes(&ast));
+    }
+
+    /// `AstNode` 以下のノード総数 (自分を含む) を数える。
+    fn count_nodes(node: &AstNode) -> usize {
+        1 + node
+            .children
+            .iter()
+            .map(|e| count_nodes(&e.node))
+            .sum::<usize>()
     }
 }

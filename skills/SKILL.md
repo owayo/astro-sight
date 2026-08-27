@@ -16,7 +16,7 @@ tree-sitter AST-based code structure CLI. The primary **Grep replacement for cod
 ## When to Use (Decision Checklist)
 
 **Immediately before every Grep call, ask: "Does my search contain code identifiers?"** If yes → astro-sight, not Grep. Classify the search pattern itself; do not infer from the file type or the surrounding task.
-The same rule applies inside shell commands: wrapping `grep` / `rg` in Bash is not an exception. Searching inside a **single file** is still identifier search — use `refs --name <sym> --dir . --glob <file>` instead of grepping that file.
+The same rule applies inside shell commands: wrapping `grep` / `rg` in Bash is not an exception. Searching inside a **single file** is still identifier search — use `refs --name <sym> --dir . --glob <file>` instead of grepping that file. Wanting the surrounding lines (`grep -A 20 <sym>`) is not an exception either — run `refs` for the exact hit lines, then Read those offsets.
 
 | Need | Command |
 |---|---|

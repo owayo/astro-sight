@@ -855,6 +855,12 @@ CLI で明示的に `--format toon` を渡した場合は「満たせない要�
 
 外側の配列は list form（`- ` 項目）で、tabular form にはしない。tabular 化には全要素を見てからでないと決まらない情報が要り、解析結果を全件バッファしない（ピーク RSS を入力件数から独立させる）という設計要件と両立しないため。要素数 `[N]` は入力パス数から先に分かるので、ヘッダだけは先出しできる。内側の配列は従来どおり tabular form になり、削減量の大半はそちらから来る。
 
+なお **TOON v4.1 §9.3 は「tabular 条件を満たす配列には tabular form を使う」ことを MUST としている**ため、外側配列が tabular 条件を満たしたときのこの list form は仕様非適合になる。ストリーミング要件を優先した意図的な選択で、影響は次のとおり限定される。
+
+- 発現するのは**バッチの全レコードが同一キー集合かつ全列が primitive / nested-uniform** のときだけ。通常のレコード（`symbols` / `ast` / `calls` / `imports` / `sequence` / `lint`）は必ず配列列を持つので tabular 不適格になり、実質「全パスが解析失敗したバッチ」に限られる
+- decode は壊れない。リファレンス実装の strict モードで decode でき、その結果は仕様どおり tabular で書いた場合の decode 結果と一致する
+- 損をするのはトークン量だけ（実測: 全 12 パスが `UNSUPPORTED_LANGUAGE` になるバッチで、本来 compact JSON 比 −27% のところ +14%）。ただし `--format auto` はこのとき正しく JSON を選ぶため、**auto 利用時に JSON より悪化することはない**（`--format toon` を明示したときだけ該当する）
+
 ### nullable 列の正規化
 
 astro-sight の compact JSON は `cx`（循環的複雑度）のような値を持たないフィールドをキーごと省略する。一方 TOON の tabular form は配列内の全要素が**同じキー集合**を持つことを要求するため、素直にエンコードすると symbols のような出力が list form へ落ちて **JSON より冗長になる**（実測 +33%）。
@@ -960,6 +966,9 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 | `Grep "MY_CONST\|OtherVar"` | ❌ → `astro-sight refs --names MY_CONST,OtherVar --dir .` | Pipe-separated identifiers |
 | `Grep "import.*module"` | ❌ → `astro-sight imports --path file` | Import analysis |
 | `grep/rg "identifier"` | ❌ → `astro-sight refs` | CLI grep/rg is also forbidden for identifiers |
+| `grep "name" one/file.ts` (single file) | ❌ → `astro-sight refs --name name --dir . --glob one/file.ts` | Single-file identifier search is still identifier search |
+| `grep -rn "Foo" src/`, `grep -rn "Foo" --include=*.tsx .` | ❌ → `astro-sight refs --name Foo --dir . --glob 'src/**'` | Recursive identifier search |
+| `grep -n "Foo" -A 20 file.ts` (wants surrounding lines) | ❌ → `refs` for the exact hit lines, then Read those offsets | `-A`/`-B` is not a reason to fall back to grep |
 | `Grep "TODO"` | ✅ Grep OK | Non-code search |
 | `Grep "error message text"` | ✅ Grep OK | String literal search |
 | `Grep "config_key"` | ✅ Grep OK | Config value search |
@@ -997,6 +1006,7 @@ astro-sight dead-code --dir . --git                # Find dead/unreferenced expo
 astro-sight imports --path <file>                  # Import relationships
 astro-sight sequence --path <file>                 # Call flow visualization
 astro-sight cochange --dir .                       # Co-change patterns
+astro-sight lint --path <file> --rules rules.yaml  # Enforce repeated structural rules
 astro-sight session                                # NDJSON multi-query batch (stdin→stdout)
 ```
 
@@ -1004,7 +1014,8 @@ astro-sight session                                # NDJSON multi-query batch (s
 - **`refs` results include `context` (source line)** → No need for additional Read/Grep
 - **Batch multiple symbol searches with `refs --names`** (simpler than session)
 - **For very common symbols, combine `--glob` with `ASTRO_SIGHT_BATCH_WORKERS`** to keep output size and peak RSS bounded
-- **Use Read for surrounding context when editing** (astro-sight shows 1 line only)
+- **Need surrounding lines (the `grep -A/-B` habit)?** → run `refs` first, then Read at the hit lines (astro-sight shows 1 line only)
+- **Do not repeat a zero-result identifier search with Grep/rg**; a zero-result AST query is still an analysis result
 ````
 
 ### MCP サーバーとして登録

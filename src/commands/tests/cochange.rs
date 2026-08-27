@@ -9,7 +9,9 @@ use crate::commands::*;
 #[allow(unused_imports)]
 use crate::engine::cochange::CoChangeExclude;
 #[allow(unused_imports)]
-use crate::models::dependency_files::DEPENDENCY_ECOSYSTEMS;
+use crate::models::dependency_files::{
+    DEPENDENCY_ECOSYSTEMS, is_dependency_lock_path, is_dependency_manifest_path,
+};
 #[allow(unused_imports)]
 use crate::models::review::{
     ApiChanges, ApiSymbol, ApiSymbolChange, CompatibleApiModification, MissingCochange,
@@ -140,6 +142,48 @@ fn cochange_exclude_keeps_dependency_manifests_as_candidates() {
             !exclude.is_match(eco.manifest),
             "{} は engine の候補には残すべき (review 側で落とす)",
             eco.manifest
+        );
+    }
+}
+
+/// `is_dependency_manifest_path` が正本テーブルの manifest だけを真とすることを固定する。
+///
+/// `is_dependency_lock_path` と対になる公開 API だが呼び出し側が無く、
+/// テストからも参照されていなかったため dead-code 検出に上がっていた。
+/// 判定は basename だけで行う (monorepo でどこに置かれても manifest である事実は
+/// 変わらない) 規約なので、入れ子パスでも真になることを併せて固定する。
+/// lock との排他性も見る — 同じ basename が両方で真になるとエコシステム表の
+/// 定義ミスを意味する。
+#[test]
+fn is_dependency_manifest_path_matches_only_canonical_manifests() {
+    for eco in DEPENDENCY_ECOSYSTEMS {
+        assert!(
+            is_dependency_manifest_path(eco.manifest),
+            "{} は manifest として判定されるべき",
+            eco.manifest
+        );
+        assert!(
+            is_dependency_manifest_path(&format!("apps/web/{}", eco.manifest)),
+            "{} はネストしていても manifest として判定されるべき",
+            eco.manifest
+        );
+        assert!(
+            !is_dependency_lock_path(eco.manifest),
+            "{} が lock 側でも真になっている (エコシステム表の定義ミス)",
+            eco.manifest
+        );
+        for lock in eco.locks {
+            assert!(
+                !is_dependency_manifest_path(lock),
+                "{lock} は lock であって manifest ではない"
+            );
+        }
+    }
+
+    for path in ["src/main.rs", "README.md", "package.json.bak", "Cargo", ""] {
+        assert!(
+            !is_dependency_manifest_path(path),
+            "{path} は manifest ではない"
         );
     }
 }

@@ -53,6 +53,71 @@ fn ast_full_output() {
     assert!(first["range"]["start"]["line"].is_number());
 }
 
+/// `--full` の `id` が実行をまたいで同じ値になり、pre-order の通し番号であることを固定する。
+///
+/// 旧実装は tree-sitter の `node.id()` (内部ポインタ値) をそのまま出していたため、
+/// 同じ入力でも実行のたびに違う値になっていた。キャッシュされる JSON と
+/// キャッシュ対象外の TOON とで同じ入力に別の値が出る形でも露見する。
+/// 「実行ごとに変わらない」だけを見ると、たまたま同じアドレスが再利用された回に
+/// 通ってしまうため、**0 から始まる連番であること**まで固定する
+/// (ポインタ由来ではこの条件は満たせない)。
+#[test]
+fn ast_full_ids_are_deterministic_preorder_indices() {
+    let run = || {
+        let output = cargo_bin()
+            .args([
+                "ast",
+                "--path",
+                "src/main.rs",
+                "--line",
+                "0",
+                "--col",
+                "0",
+                "--full",
+                "--no-cache",
+            ])
+            .output()
+            .expect("failed to run");
+        assert!(output.status.success());
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("invalid JSON")
+    };
+
+    fn collect_ids(value: &serde_json::Value, acc: &mut Vec<u64>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(id) = map.get("id").and_then(|v| v.as_u64()) {
+                    acc.push(id);
+                }
+                for v in map.values() {
+                    collect_ids(v, acc);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for v in items {
+                    collect_ids(v, acc);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let first = run();
+    let second = run();
+    assert_eq!(
+        first, second,
+        "同じ入力に対する --full 出力が実行ごとに違う"
+    );
+
+    let mut ids = Vec::new();
+    collect_ids(&first, &mut ids);
+    assert!(!ids.is_empty(), "--full なのに id が 1 つも出ていない");
+    let expected: Vec<u64> = (0..ids.len() as u64).collect();
+    assert_eq!(
+        ids, expected,
+        "id は抽出単位ごとの pre-order 通し番号であるべき"
+    );
+}
+
 #[test]
 fn ast_full_file() {
     let output = cargo_bin()
