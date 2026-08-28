@@ -1287,3 +1287,90 @@ fn review_cochange_omits_dependency_manifest_without_import_change() {
         "ソース同士の共変更は検出されるべき。got: {files:?}"
     );
 }
+
+/// `review --git --hook` が打ち切り (truncations) を申告すること。
+///
+/// 未追跡の巨大ファイルは合成 diff に取り込まれない (`MAX_UNTRACKED_FILE_LINES` 超過)。
+/// その結果 diff が空になり `emit_review_short_circuit` へ落ちるが、旧実装は
+/// `if hook { return Ok(()); }` で truncations ごと捨てていた。**doc コメントの目的と
+/// 正反対**で、同じ入力に対し `impact --hook` は `note:` 行で申告するので非対称でもあった。
+/// truncation 機能が防ぐはずだった「全部見た」と読める沈黙が hook 経路で再現していた。
+///
+/// 既存の単体テストは `build_review_hook_json` を直接叩くため `cmd_review` の短絡に
+/// 到達せず、この乖離を検出できていなかった。
+#[test]
+fn review_git_hook_reports_truncations_on_empty_diff() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.write("seed.ts", "export const seed = 1;\n");
+    repo.commit_all("init");
+
+    // 未追跡かつ行数上限 (5,000) 超過 → 合成 diff から除外され truncation が立つ。
+    // 他に変更が無いので diff は空になり、短絡経路へ落ちる。
+    let huge: String = (0..5_001)
+        .map(|i| format!("export const generated{i} = {i};\n"))
+        .collect();
+    repo.write("generated.ts", huge);
+
+    let output = cargo_bin()
+        .args(["review", "--dir"])
+        .arg(repo.root())
+        .args(["--git", "--hook"])
+        .output()
+        .expect("failed to run review --git --hook");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "打ち切りの申告は informational なので exit 0 のままであること: {stderr}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "--hook は stdout を使わない: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains("\"trunc\""),
+        "解析対象から外したファイルを hook 出力で申告すること: {stderr}"
+    );
+    assert!(
+        stderr.contains("untracked_file_too_large"),
+        "打ち切り理由を添えること: {stderr}"
+    );
+    assert!(
+        stderr.contains("generated.ts"),
+        "打ち切ったファイル名を添えること: {stderr}"
+    );
+    // 対照: 打ち切りは blocking な検出ではないので api / dead は出ない。
+    assert!(
+        !stderr.contains("\"dead\"") && !stderr.contains("\"api\""),
+        "打ち切りの申告だけで blocking 検出を作らないこと: {stderr}"
+    );
+}
+
+/// 対照: 打ち切りが無い空 diff では `--hook` は従来どおり完全 silent。
+///
+/// `trunc` を出すようにした副作用で、git 管理外や「変更なし」のたびに hook が
+/// 出力してしまう退行を防ぐ。
+#[test]
+fn review_git_hook_stays_silent_without_truncations() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.write("seed.ts", "export const seed = 1;\n");
+    repo.commit_all("init");
+
+    let output = cargo_bin()
+        .args(["review", "--dir"])
+        .arg(repo.root())
+        .args(["--git", "--hook"])
+        .output()
+        .expect("failed to run review --git --hook");
+
+    assert!(output.status.success());
+    assert!(
+        output.stdout.is_empty() && output.stderr.is_empty(),
+        "打ち切りが無ければ完全 silent: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

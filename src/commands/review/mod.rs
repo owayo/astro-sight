@@ -84,7 +84,14 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
             DiffSourceResolution::Diff { diff, truncations } => (diff, truncations),
             // git 管理外: hook は完全 silent、通常は空結果 + skipped で exit 0。
             DiffSourceResolution::Skipped(skip) => {
-                return emit_review_short_circuit(hook, output, Some(skip), Vec::new());
+                return emit_review_short_circuit(
+                    hook,
+                    output,
+                    dir,
+                    strict_public_const_values,
+                    Some(skip),
+                    Vec::new(),
+                );
             }
             DiffSourceResolution::NotRequested => {
                 let stdin = std::io::stdin();
@@ -96,7 +103,14 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
         };
 
     if diff_input.trim().is_empty() {
-        return emit_review_short_circuit(hook, output, None, truncations);
+        return emit_review_short_circuit(
+            hook,
+            output,
+            dir,
+            strict_public_const_values,
+            None,
+            truncations,
+        );
     }
 
     // 2. impact 分析
@@ -114,7 +128,14 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
     let diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
     if crate::engine::impact::should_skip_ci_only_diff(&diff_files) {
         log_phase("review.skip_ci_only", "applied", 0);
-        return emit_review_short_circuit(hook, output, None, truncations);
+        return emit_review_short_circuit(
+            hook,
+            output,
+            dir,
+            strict_public_const_values,
+            None,
+            truncations,
+        );
     }
 
     let impact = timed_ok("context", || {
@@ -201,26 +222,32 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
 
 /// 解析へ進まず空結果で打ち切る共通処理 (git 管理外 / 空 diff / CI 言語のみ の 3 経路)。
 ///
-/// `--hook` は完全 silent (無出力)、通常時は `skipped` / `truncations` 以外すべて既定値の
-/// `ReviewResult` を 1 行出力して exit 0 とする。
+/// `--hook` は通常経路と同じ `review_hook_output` へ通す。`truncations` が空なら
+/// `build_review_hook_json` が `None` を返すため従来どおり完全 silent、打ち切りが
+/// あったときだけ `trunc` を申告する (informational なので blocking にはならない)。
+/// 通常時は `skipped` / `truncations` 以外すべて既定値の `ReviewResult` を 1 行出力する。
 ///
-/// `truncations` を受けるのは、未追跡の巨大ファイルを除外した結果 diff が空になった場合でも
-/// 「対象外にしたファイルがある」ことを報告するため (空結果と打ち切りを混同させない)。
+/// **`--hook` で早期 return して truncations を捨ててはいけない**: 未追跡の巨大ファイルを
+/// 除外した結果 diff が空になった場合に「全部見た」と読める沈黙になる。同じ入力で
+/// `impact --hook` は `note:` 行で申告するので非対称でもあった。
 fn emit_review_short_circuit(
     hook: bool,
     output: OutputOptions,
+    dir: &str,
+    strict_const_values: bool,
     skipped: Option<SkipInfo>,
     truncations: Vec<crate::models::truncation::TruncationInfo>,
 ) -> Result<()> {
-    if hook {
-        return Ok(());
-    }
-
     let result = ReviewResult {
         skipped,
         truncations,
         ..Default::default()
     };
+
+    if hook {
+        return review_hook_output(&result, dir, strict_const_values);
+    }
+
     let text = serialize_cli_document(&result, output)?;
     print!("{text}");
     Ok(())
@@ -301,11 +328,13 @@ mod review_command_tests {
     /// `--hook` の短絡は 3 経路 (git 管理外 / 空 diff / CI 言語のみ) すべてで無出力 Ok。
     #[test]
     fn short_circuit_is_silent_under_hook() {
-        emit_review_short_circuit(true, OutputOptions::default(), None, Vec::new())
+        emit_review_short_circuit(true, OutputOptions::default(), ".", false, None, Vec::new())
             .expect("hook short-circuit must succeed");
         emit_review_short_circuit(
             true,
             OutputOptions::default(),
+            ".",
+            false,
             Some(SkipInfo::not_git_repository()),
             Vec::new(),
         )
