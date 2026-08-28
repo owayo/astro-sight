@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::Command;
 
 use anyhow::{Result, bail};
@@ -437,7 +437,9 @@ fn accumulate_commit(
         // ここに到達したものだけを数える。証拠集合サイズをそのまま分母にすると
         // co (超過コミットを含まない) と母数がずれ confidence が過小評価になる。
         acc.counted_denom[i] += 1;
-        acc.weighted_denom[i] += weight;
+        *acc.denom_weight_hist[i]
+            .entry(commit.total_files)
+            .or_insert(0) += 1;
         if let Some(u) = unit.as_ref() {
             acc.denom_units[i].insert(u.clone());
         }
@@ -454,9 +456,11 @@ fn accumulate_commit(
         *acc.co_counts.entry(path.to_string()).or_insert(0) += 1;
         for &i in sources {
             *acc.per_source_raw[i].entry(path.to_string()).or_insert(0) += 1;
-            *acc.per_source_weighted[i]
+            *acc.per_source_weight_hist[i]
                 .entry(path.to_string())
-                .or_insert(0.0) += weight;
+                .or_default()
+                .entry(commit.total_files)
+                .or_insert(0) += 1;
             if let Some(u) = unit.as_ref() {
                 acc.co_units[i]
                     .entry(path.to_string())
@@ -570,7 +574,19 @@ fn entries_for_source(
 }
 
 /// streaming 集計用のスレッドローカル統計。fold/reduce でマージされる。
-/// - `per_source_raw` / `per_source_weighted` / `weighted_denom`: commit-size weighting の集計
+///
+/// commit-size weighting の集計は **f64 を足し込まず、コミットのファイル数ごとの度数
+/// (ヒストグラム) を整数で持つ**。weight は `commit_size_weight(file_count, pivot, hard_max)`
+/// で file_count だけから決まるので、度数さえ保てば後から同じ値を再構成できる。
+///
+/// f64 で足し込むと、`sha_to_sources` (HashMap) の反復順と rayon の reduce 順によって
+/// 加算順が実行ごとに変わり、非結合な f64 加算の結果が最終桁でぶれる (実測: 実際の
+/// weight 12 個で 6 通りの異なる和)。`score` はそのまま出力されるので
+/// 「出力は決定論的に保つ」規約に反する。整数の度数なら加算は結合的で順序に依存しない。
+///
+/// 固定小数点へ量子化する案は採らない。`score` の定義 (`sqrt(pivot/file_count)` の総和) を
+/// 変えてしまい、scale 値が新たな暗黙仕様になるため。
+/// - `per_source_raw` / `per_source_weight_hist` / `denom_weight_hist`: commit-size weighting の集計
 /// - `counted_denom`: 実際に集計対象となったコミット数 (= confidence の分母)
 /// - `denom_units` / `co_units`: author_unit_window_days > 0 のとき (author, time_bucket) 単位で
 ///   起点ファイル別の unique unit と候補別の unique unit を保持する
@@ -579,9 +595,11 @@ fn entries_for_source(
 #[derive(Default)]
 struct ShardStats {
     per_source_raw: Vec<HashMap<String, usize>>,
-    per_source_weighted: Vec<HashMap<String, f64>>,
+    /// 起点 i → 候補パス → (コミットのファイル数 → 度数)。
+    per_source_weight_hist: Vec<HashMap<String, BTreeMap<usize, u64>>>,
     counted_denom: Vec<usize>,
-    weighted_denom: Vec<f64>,
+    /// 起点 i → (コミットのファイル数 → 度数)。分母側の weight ヒストグラム。
+    denom_weight_hist: Vec<BTreeMap<usize, u64>>,
     denom_units: Vec<HashSet<(String, i64)>>,
     co_units: Vec<HashMap<String, HashSet<(String, i64)>>>,
     co_counts: HashMap<String, usize>,
@@ -592,9 +610,9 @@ impl ShardStats {
     fn new(n_sources: usize) -> Self {
         Self {
             per_source_raw: (0..n_sources).map(|_| HashMap::new()).collect(),
-            per_source_weighted: (0..n_sources).map(|_| HashMap::new()).collect(),
+            per_source_weight_hist: (0..n_sources).map(|_| HashMap::new()).collect(),
             counted_denom: vec![0; n_sources],
-            weighted_denom: vec![0.0; n_sources],
+            denom_weight_hist: (0..n_sources).map(|_| BTreeMap::new()).collect(),
             denom_units: (0..n_sources).map(|_| HashSet::new()).collect(),
             co_units: (0..n_sources).map(|_| HashMap::new()).collect(),
             co_counts: HashMap::new(),
@@ -605,12 +623,12 @@ impl ShardStats {
     fn merge(mut a: Self, b: Self) -> Self {
         // per-source ベクタを持たない側 (n_sources = 0 の identity) でも、
         // failed_commits だけは取りこぼさずに合算する。
-        if a.weighted_denom.is_empty() {
+        if a.denom_weight_hist.is_empty() {
             let mut b = b;
             b.failed_commits += a.failed_commits;
             return b;
         }
-        if b.weighted_denom.is_empty() {
+        if b.denom_weight_hist.is_empty() {
             a.failed_commits += b.failed_commits;
             return a;
         }
@@ -622,13 +640,18 @@ impl ShardStats {
         for (i, c) in b.counted_denom.into_iter().enumerate() {
             a.counted_denom[i] += c;
         }
-        for (i, m) in b.per_source_weighted.into_iter().enumerate() {
-            for (k, v) in m {
-                *a.per_source_weighted[i].entry(k).or_insert(0.0) += v;
+        for (i, m) in b.per_source_weight_hist.into_iter().enumerate() {
+            for (k, hist) in m {
+                let dst = a.per_source_weight_hist[i].entry(k).or_default();
+                for (file_count, n) in hist {
+                    *dst.entry(file_count).or_insert(0) += n;
+                }
             }
         }
-        for (i, w) in b.weighted_denom.into_iter().enumerate() {
-            a.weighted_denom[i] += w;
+        for (i, hist) in b.denom_weight_hist.into_iter().enumerate() {
+            for (file_count, n) in hist {
+                *a.denom_weight_hist[i].entry(file_count).or_insert(0) += n;
+            }
         }
         for (i, set) in b.denom_units.into_iter().enumerate() {
             a.denom_units[i].extend(set);
@@ -665,8 +688,26 @@ impl ShardStats {
             let co_units_n = self.co_units[i].get(cand).map(|s| s.len()).unwrap_or(0) as f64;
             (co_units_n + alpha) / (denom_units_n + alpha + beta)
         } else {
-            let weighted_co = *self.per_source_weighted[i].get(cand).unwrap_or(&0.0);
-            (weighted_co + alpha) / (self.weighted_denom[i] + alpha + beta)
+            // ヒストグラムから weight 総和を再構成する。BTreeMap なので file_count 昇順の
+            // 固定した順序で畳まれ、加算順が実行ごとに変わらない。
+            let sum_weights = |hist: &BTreeMap<usize, u64>| -> f64 {
+                hist.iter()
+                    .map(|(&file_count, &n)| {
+                        n as f64
+                            * commit_size_weight(
+                                file_count,
+                                opts.commit_size_pivot,
+                                opts.max_files_per_commit,
+                            )
+                    })
+                    .sum()
+            };
+            let weighted_co = self.per_source_weight_hist[i]
+                .get(cand)
+                .map(sum_weights)
+                .unwrap_or(0.0);
+            let weighted_denom = sum_weights(&self.denom_weight_hist[i]);
+            (weighted_co + alpha) / (weighted_denom + alpha + beta)
         }
     }
 }
@@ -1250,6 +1291,88 @@ mod tests {
             .current_dir(repo)
             .output()
             .unwrap();
+    }
+
+    /// commit-size weighting の集計が **加算順に依存しない**こと。
+    ///
+    /// 旧実装は `weighted_denom` / `per_source_weighted` に f64 を直接足し込んでいた。
+    /// 加算元は `sha_to_sources` (HashMap) の反復順と rayon の reduce 順で決まるため
+    /// 実行ごとに順序が変わり、非結合な f64 加算の結果が最終桁でぶれる。`score` は
+    /// そのまま出力されるので「出力は決定論的に保つ」規約に反する。
+    ///
+    /// ヒストグラム (file_count → 度数、整数) で持てば加算は結合的になり、
+    /// スコア再構成時は BTreeMap の file_count 昇順という固定順序で畳まれる。
+    #[test]
+    fn shard_stats_weighted_score_is_order_independent() {
+        // 実際の commit_size_weight (= sqrt(pivot/file_count)) が無理数になるサイズを選ぶ。
+        let file_counts: Vec<usize> = vec![11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53];
+        let opts = CoChangeOptions {
+            commit_size_pivot: 8,
+            max_files_per_commit: 0, // 上限無効 (weight 0 での除外を起こさない)
+            smoothing_alpha: 1.0,
+            smoothing_beta: 8.0,
+            ..CoChangeOptions::default()
+        };
+
+        // 対照: **旧実装の集計方式** (weight を f64 で直接足し込む) を再現すると、同じ入力でも
+        // 集計順で score が変わる。これが再現しなければ本テストは空振りなので、
+        // テスト内で明示的に確認する。
+        let weights: Vec<f64> = file_counts
+            .iter()
+            .map(|&n| commit_size_weight(n, opts.commit_size_pivot, opts.max_files_per_commit))
+            .collect();
+        let legacy_score = |order: &[f64]| -> f64 {
+            let denom = order.iter().fold(0.0, |a, w| a + w);
+            let co = order.iter().fold(0.0, |a, w| a + w);
+            (co + opts.smoothing_alpha) / (denom + opts.smoothing_alpha + opts.smoothing_beta)
+        };
+        let mut reversed_weights = weights.clone();
+        reversed_weights.reverse();
+        assert_ne!(
+            legacy_score(&weights).to_bits(),
+            legacy_score(&reversed_weights).to_bits(),
+            "前提確認: 旧方式 (f64 直接加算) ではこの入力で score が順序依存になること"
+        );
+
+        // ヒストグラム集計を 2 通りの順で組み立てる。
+        let build = |order: &[usize]| -> ShardStats {
+            let mut stats = ShardStats::new(1);
+            for &file_count in order {
+                *stats.denom_weight_hist[0].entry(file_count).or_insert(0) += 1;
+                *stats.per_source_weight_hist[0]
+                    .entry("cand.rs".to_string())
+                    .or_default()
+                    .entry(file_count)
+                    .or_insert(0) += 1;
+            }
+            stats
+        };
+        let mut reversed = file_counts.clone();
+        reversed.reverse();
+
+        let a = build(&file_counts).smoothed_score(0, "cand.rs", &opts, false);
+        let b = build(&reversed).smoothed_score(0, "cand.rs", &opts, false);
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "集計順が変わっても score はビット単位で一致すること (a={a:?} b={b:?})"
+        );
+
+        // merge 経路も同じ不変条件を満たすこと (rayon の reduce 順に相当)。
+        let merged_lr = ShardStats::merge(build(&file_counts[..6]), build(&file_counts[6..]))
+            .smoothed_score(0, "cand.rs", &opts, false);
+        let merged_rl = ShardStats::merge(build(&file_counts[6..]), build(&file_counts[..6]))
+            .smoothed_score(0, "cand.rs", &opts, false);
+        assert_eq!(
+            merged_lr.to_bits(),
+            merged_rl.to_bits(),
+            "merge 順が変わっても score はビット単位で一致すること"
+        );
+        assert_eq!(
+            merged_lr.to_bits(),
+            a.to_bits(),
+            "merge 経由でも単一 shard と同じ score になること"
+        );
     }
 
     fn opts_with(mutator: impl FnOnce(&mut CoChangeOptions)) -> CoChangeOptions {
