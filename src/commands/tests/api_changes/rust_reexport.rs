@@ -751,6 +751,93 @@ fn detect_api_changes_multi_level_super_reexport_resolves() {
     );
 }
 
+/// glob 再エクスポート (`pub use internal::*;`) 経由の公開 API 変更が検出されること。
+///
+/// 旧実装は `compute_reexport_reachable_modules` が `RustPubUseEdge::Named` 以外を
+/// `else { continue; }` で捨てていたため Wildcard 辺が module 到達性の計算から全部落ちていた。
+///
+/// **target module の直下**にある item は `propagate_live_exports` の exact-match wildcard 伝播
+/// (`wildcard_by_target_module.get(&key.module)`) が拾うため従来も検出できていた。落ちていたのは
+/// **pub 子 module 配下**の item で、seed の module (`internal::api`) が wildcard の target
+/// (`internal`) と一致しないため伝播が止まり、`internal::api` も reachable_modules に無いので
+/// 公開 API 面から外れていた。`S::api::found` で外から到達できるのに無音になる。
+///
+/// 到達性は「target module + その **pub 子孫**」に閉じる必要がある。prefix 一致で伝播すると
+/// private 子 module 配下まで公開扱いになるので、3 ケース目に対照を持たせる。
+#[test]
+fn detect_api_changes_wildcard_reexport_exposes_module_and_pub_descendants() {
+    for (case, extra_files, target, want_reported) in [
+        // 直下 module の pub fn
+        (
+            "glob 直下",
+            vec![("src/internal/mod.rs", "pub fn found() -> u32 {\n    0\n}\n")],
+            "src/internal/mod.rs",
+            true,
+        ),
+        // pub 子 module 配下の pub fn (`S::api::found` で外から到達できる)
+        (
+            "glob + pub 子 module",
+            vec![
+                ("src/internal/mod.rs", "pub mod api;\n"),
+                ("src/internal/api.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "src/internal/api.rs",
+            true,
+        ),
+        // 対照: private 子 module 配下は外から到達できないので公開 API ではない
+        (
+            "glob + private 子 module",
+            vec![
+                ("src/internal/mod.rs", "mod api;\n"),
+                ("src/internal/api.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "src/internal/api.rs",
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        let mut files: Vec<(&str, &str)> = vec![
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+            ),
+            ("src/lib.rs", "mod internal;\npub use internal::*;\n"),
+        ];
+        files.extend(extra_files.iter().copied());
+        git_commit_files(repo, &files, "base");
+
+        fs::write(repo.join(target), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: target.to_string(),
+            new_path: target.to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        // 残存参照が無い fixture なので removed_dead 側に入る。ここで見たいのは
+        // 「公開 API 面として認識されたか」なので両バケットの和で判定する。
+        let reported = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .any(|s| s.name.ends_with("found"));
+        assert_eq!(
+            reported,
+            want_reported,
+            "{case}: api.rm への計上が期待と異なる (removed={:?} removed_dead={:?})",
+            api.removed.iter().map(|s| &s.name).collect::<Vec<_>>(),
+            api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+}
+
 /// grouped trailing `self` (`pub use outer::m::{self};`) が直接形と同じ edge を作ること。
 ///
 /// list 経路では単独の `self` が path_prefix = ["outer","m"] を積んだ状態で届くため、

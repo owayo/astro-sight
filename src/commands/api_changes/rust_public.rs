@@ -747,13 +747,23 @@ pub(crate) fn collect_rust_pub_use_index(
 }
 
 /// module 再エクスポート (`pub use path::to::module;`) による外部到達可能 module 集合を
-/// 固定点計算する。seed は `pub mod` 経路の `public_modules`。Named edge の source module
-/// が到達可能なら、target path が実在する **pub 宣言された** module の場合に限り
-/// その module も到達可能になり、pub 子孫 module も連鎖する。private child module は
-/// 親が公開されても外部から辿れないため含めない (単純な prefix 判定だと private 子まで
-/// 誤って公開扱いになる)。private module 自体の再エクスポート (`mod wifi;` +
-/// `pub use self::wifi as api;`) は rustc では E0365 で無効なため、親の pub_children に
-/// 含まれない target は reachable 化しない。
+/// 固定点計算する。seed は `pub mod` 経路の `public_modules`。
+///
+/// - **Named edge** (`pub use path::to::module;`): source module が到達可能なら、target path が
+///   実在する **pub 宣言された** module の場合に限りその module も到達可能になり、pub 子孫 module
+///   も連鎖する。private module 自体の再エクスポート (`mod wifi;` + `pub use self::wifi as api;`)
+///   は rustc では E0365 で無効なため、親の pub_children に含まれない target は reachable 化しない。
+/// - **Wildcard edge** (`pub use internal::*;`): source module が到達可能なら target module 自体を
+///   到達可能にする。glob は module ではなく**中身**を再エクスポートするので target が private
+///   module でも有効で (E0365 は module 自体を名前として再エクスポートする場合の制限)、
+///   `declared_pub` は要求しない。旧実装は Named 以外を `else { continue; }` で捨てていたため、
+///   `mod internal; pub use internal::*;` 構成で **pub 子 module 配下**の公開 API 変更が無音に
+///   なっていた (target 直下の item は `propagate_live_exports` の exact-match wildcard 伝播が
+///   拾うので従来も検出できていた。落ちるのは seed の module が wildcard の target と一致しない
+///   子 module 配下)。
+///
+/// どちらの経路でも private child module は親が公開されても外部から辿れないため含めない
+/// (単純な prefix 判定だと private 子まで誤って公開扱いになる)。
 fn compute_reexport_reachable_modules(
     edges: &[RustPubUseEdge],
     public_modules: &std::collections::HashSet<Vec<String>>,
@@ -763,18 +773,42 @@ fn compute_reexport_reachable_modules(
     loop {
         let mut changed = false;
         for edge in edges {
-            let RustPubUseEdge::Named {
-                source_module,
-                target_module,
-                target_item,
-                ..
-            } = edge
-            else {
-                continue;
+            let (source_module, target_module, target_item) = match edge {
+                RustPubUseEdge::Named {
+                    source_module,
+                    target_module,
+                    target_item,
+                    ..
+                } => (source_module, target_module, Some(target_item)),
+                // glob 再エクスポート (`pub use internal::*;`) は target module の pub item を
+                // source namespace へ持ち込む。**item ではなく module 自体を到達可能化する**のが
+                // 正しい: `internal` 直下の pub item は `S::x` で、pub 子 module `c` 配下の item は
+                // `S::c::x` で外から到達できるので、「target module + その pub 子孫」が
+                // ちょうど外部到達可能な集合になる。private 子 module は `pub mod` で宣言されて
+                // いないので `insert_pub_descendants` が含めない (prefix 一致で伝播すると
+                // private 子まで公開扱いになる)。
+                //
+                // Named と違い `declared_pub` を要求しない。glob は module 自体ではなく
+                // **中身**を再エクスポートするので、`mod internal; pub use internal::*;` の
+                // ように target が private module でも有効 (E0365 は module 自体を名前として
+                // 再エクスポートする場合の制限)。
+                RustPubUseEdge::Wildcard {
+                    source_module,
+                    target_module,
+                } => (source_module, target_module, None),
             };
             if !reachable.contains(source_module) {
                 continue;
             }
+            let Some(target_item) = target_item else {
+                if !all_modules.contains_key(target_module) || reachable.contains(target_module) {
+                    continue;
+                }
+                reachable.insert(target_module.clone());
+                changed = true;
+                insert_pub_descendants(&mut reachable, all_modules, target_module.clone());
+                continue;
+            };
             let mut candidate = target_module.clone();
             candidate.push(target_item.clone());
             if !all_modules.contains_key(&candidate) || reachable.contains(&candidate) {
