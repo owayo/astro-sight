@@ -43,19 +43,58 @@ fn collect_single_refs_for_test(
     buckets.into_iter().next().unwrap_or_default()
 }
 
+/// テスト用: index ベースの参照収集 (IndexedMatcher + SymbolReferenceSink)。
+/// single 経路 (`collect_single_refs_for_test`) との突き合わせに使う。
+fn collect_batch_refs_for_test(
+    root: Node<'_>,
+    source: &[u8],
+    symbol_names: &[String],
+    path: &str,
+    definition_kinds: &[&str],
+    lang_id: LangId,
+) -> Vec<Vec<SymbolReference>> {
+    let present: std::collections::HashSet<usize> = (0..symbol_names.len()).collect();
+    let name_index = super::walker::build_name_index(lang_id, symbol_names, &present);
+    let matcher = IndexedMatcher {
+        name_index: &name_index,
+    };
+    let mut buckets = vec![Vec::new(); symbol_names.len()];
+    let mut sink = SymbolReferenceSink {
+        buckets: &mut buckets,
+        path,
+    };
+    run_ref_walk(root, source, lang_id, definition_kinds, &matcher, &mut sink);
+    buckets
+}
+
+/// テスト用: 参照リストを (line, column, kind) の順序付き集合へ畳む。
+/// single / batch の突き合わせで件数だけでなく位置と分類まで比較するために使う。
+fn ref_fingerprints(refs: &[SymbolReference]) -> Vec<(usize, usize, String)> {
+    let mut v: Vec<_> = refs
+        .iter()
+        .map(|r| (r.line, r.column, format!("{:?}", r.kind)))
+        .collect();
+    v.sort();
+    v
+}
+
 /// テスト用: index ベースの非 Definition 参照カウント (IndexedMatcher + CountSink)。
 /// 旧 `count_identifier_refs` を直接叩いていた単体テストの置き換え。
+///
+/// `symbol_names` から `build_name_index` で実 index を組む (map を手で作ると照合ドメインの
+/// 分離を迂回してしまい、batch 経路の回帰を検出できない)。
 fn count_refs_for_test(
     root: Node<'_>,
     source: &[u8],
-    name_to_ix: &std::collections::HashMap<std::borrow::Cow<'_, str>, Vec<usize>>,
+    symbol_names: &[String],
     definition_kinds: &[&str],
     lang_id: LangId,
     num: usize,
 ) -> Vec<usize> {
+    let present: std::collections::HashSet<usize> = (0..symbol_names.len()).collect();
+    let name_index = super::walker::build_name_index(lang_id, symbol_names, &present);
     let matcher = IndexedMatcher {
-        lang_id,
-        name_to_ix,
+        name_index: &name_index,
     };
     let mut counts = vec![0usize; num];
     let mut sink = CountSink {

@@ -6,18 +6,14 @@ use super::*;
 /// シグナルハンドラが false-positive で dead として列挙される回帰があった。
 #[test]
 fn bash_trap_handler_counts_as_non_definition_ref() {
-    use std::borrow::Cow;
-    use std::collections::HashMap;
-
     let source = "cleanup_signal() {\n    exit 1\n}\ntrap 'cleanup_signal 130' INT\ntrap \"cleanup_signal 143\" TERM\n";
     let tree = parser::parse_source(source.as_bytes(), LangId::Bash).expect("parse");
     let defs = definition_node_kinds(LangId::Bash);
-    let mut name_to_ix: HashMap<Cow<'_, str>, Vec<usize>> = HashMap::new();
-    name_to_ix.insert(Cow::Borrowed("cleanup_signal"), vec![0]);
+    let symbol_names = vec!["cleanup_signal".to_string()];
     let counts = count_refs_for_test(
         tree.root_node(),
         source.as_bytes(),
-        &name_to_ix,
+        &symbol_names,
         defs,
         LangId::Bash,
         1,
@@ -62,18 +58,14 @@ fn bash_trap_handler_resolved_in_find_references() {
 /// bash_trap_handler_ref_segments 側では二重カウントしないことを検証する。
 #[test]
 fn bash_trap_unquoted_word_not_double_counted() {
-    use std::borrow::Cow;
-    use std::collections::HashMap;
-
     let source = "cleanup() { exit 1; }\ntrap cleanup INT\n";
     let tree = parser::parse_source(source.as_bytes(), LangId::Bash).expect("parse");
     let defs = definition_node_kinds(LangId::Bash);
-    let mut name_to_ix: HashMap<Cow<'_, str>, Vec<usize>> = HashMap::new();
-    name_to_ix.insert(Cow::Borrowed("cleanup"), vec![0]);
+    let symbol_names = vec!["cleanup".to_string()];
     let counts = count_refs_for_test(
         tree.root_node(),
         source.as_bytes(),
-        &name_to_ix,
+        &symbol_names,
         defs,
         LangId::Bash,
         1,

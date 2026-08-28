@@ -26,69 +26,118 @@ use super::role::{
     is_rust_macro_invocation_callee,
 };
 
-/// 参照走査で name_to_ix を引くマッチキーを生成する。
-/// PHP の関数/メソッド/クラス系の名前は case-insensitive に折りたたむ。
-fn node_ref_key<'a>(lang_id: LangId, node: Node<'_>, text: &'a str) -> std::borrow::Cow<'a, str> {
+/// 参照ノード / 文字列セグメントを対象シンボル名と突き合わせる際の照合ドメイン。
+///
+/// single 経路 (テキスト比較) と batch 経路 (index lookup) が**同じ判定を共有する**ために
+/// 置く。旧実装は single が `php_name_is_case_insensitive(node)` を都度見る一方、batch は
+/// 折りたたみキーと原文キーを 1 つの map に混在させていたため、同じ入力で異なる結果を返した
+/// (`$this->foo` が シンボル `Foo` の折りたたみキーにヒットする)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RefKeyDomain {
+    /// `normalize_identifier` 済みキーで厳密一致。
+    Exact,
+    /// ASCII 大小無視で照合する (PHP の関数/メソッド/クラス系の名前)。
+    AsciiCaseInsensitive,
+}
+
+/// identifier ノードの照合ドメインを決める。PHP の関数/メソッド/クラス系の名前だけ
+/// case-insensitive で、変数・プロパティ・定数名は case-sensitive (PHP の言語仕様)。
+fn node_ref_domain(lang_id: LangId, node: Node<'_>) -> RefKeyDomain {
     if lang_id == LangId::Php && php_name_is_case_insensitive(node) {
-        return std::borrow::Cow::Owned(text.to_ascii_lowercase());
+        RefKeyDomain::AsciiCaseInsensitive
+    } else {
+        RefKeyDomain::Exact
     }
-    normalize_identifier(lang_id, text)
 }
 
 /// 文字列セグメント由来の参照 (PHPUnit metadata / callable array / `'Class@method'`) の
-/// マッチキーを生成する。PHP のこれらのセグメントは常にメソッド名なので case-insensitive
-/// に折りたたむ。Rust/Bash のセグメントは従来どおり normalize_identifier に従う。
-fn seg_ref_key<'a>(lang_id: LangId, seg: &'a str) -> std::borrow::Cow<'a, str> {
+/// 照合ドメイン。PHP のこれらのセグメントは常にメソッド名なので case-insensitive。
+/// Rust/Bash のセグメントは従来どおり `normalize_identifier` に従う。
+fn seg_ref_domain(lang_id: LangId) -> RefKeyDomain {
     if lang_id == LangId::Php {
-        return std::borrow::Cow::Owned(seg.to_ascii_lowercase());
+        RefKeyDomain::AsciiCaseInsensitive
+    } else {
+        RefKeyDomain::Exact
     }
-    normalize_identifier(lang_id, seg)
 }
 
-/// present_indices のシンボルから name_to_ix を構築する。
+/// batch 検索用の名前 index。照合ドメインごとに**別の map**を持つ。
 ///
-/// PHP では case-insensitive な名前 (関数/メソッド/クラス系) の参照に備え、元キーに加えて
-/// 小文字化キーも登録する (folded == exact の場合は重複登録しない)。1 つの参照ノードは
-/// `node_ref_key` で生成した単一キーのみを引くため、二重登録によるカウント二重化は起きない。
-pub(crate) fn build_name_to_ix<'a>(
+/// 1 つの参照ノードは `RefKeyDomain` で選ばれた片方の map だけを引くため、両方に登録しても
+/// カウント二重化は起きない。逆に 1 つの map に混在させると、case-sensitive 文脈の lookup が
+/// 別シンボルの折りたたみキーへ誤ヒットする (single 経路との乖離)。
+pub(crate) struct NameIndex<'a> {
+    lang_id: LangId,
+    /// `normalize_identifier` 済みキー (Xojo は小文字化、PHP を含む他言語は原文)。
+    exact: std::collections::HashMap<std::borrow::Cow<'a, str>, Vec<usize>>,
+    /// ASCII 小文字化キー。`AsciiCaseInsensitive` ドメインを取りうる PHP でのみ構築する。
+    folded: std::collections::HashMap<String, Vec<usize>>,
+}
+
+impl NameIndex<'_> {
+    /// 照合ドメインに対応する map から `text` に一致するシンボル index 集合を引く。
+    #[inline]
+    fn lookup(&self, domain: RefKeyDomain, text: &str) -> Option<&[usize]> {
+        match domain {
+            RefKeyDomain::Exact => self
+                .exact
+                .get(&*normalize_identifier(self.lang_id, text))
+                .map(Vec::as_slice),
+            RefKeyDomain::AsciiCaseInsensitive => self
+                .folded
+                .get(text.to_ascii_lowercase().as_str())
+                .map(Vec::as_slice),
+        }
+    }
+}
+
+/// present_indices のシンボルから [`NameIndex`] を構築する。
+pub(crate) fn build_name_index<'a>(
     lang_id: LangId,
     symbol_names: &'a [String],
     present_indices: &std::collections::HashSet<usize>,
-) -> std::collections::HashMap<std::borrow::Cow<'a, str>, Vec<usize>> {
-    use std::borrow::Cow;
-    let mut map: std::collections::HashMap<Cow<'a, str>, Vec<usize>> =
+) -> NameIndex<'a> {
+    let mut exact: std::collections::HashMap<std::borrow::Cow<'a, str>, Vec<usize>> =
         std::collections::HashMap::with_capacity(present_indices.len());
+    // PHP 以外は AsciiCaseInsensitive ドメインを取らないので folded を構築しない。
+    let build_folded = lang_id == LangId::Php;
+    let mut folded: std::collections::HashMap<String, Vec<usize>> = if build_folded {
+        std::collections::HashMap::with_capacity(present_indices.len())
+    } else {
+        std::collections::HashMap::new()
+    };
     for &i in present_indices {
         let raw = symbol_names[i].as_str();
-        if lang_id == LangId::Php {
-            let folded = raw.to_ascii_lowercase();
-            if folded != raw {
-                map.entry(Cow::Owned(folded)).or_default().push(i);
-            }
+        exact
+            .entry(normalize_identifier(lang_id, raw))
+            .or_default()
+            .push(i);
+        if build_folded {
+            folded.entry(raw.to_ascii_lowercase()).or_default().push(i);
         }
-        let key = normalize_identifier(lang_id, raw);
-        map.entry(key).or_default().push(i);
     }
-    map
+    NameIndex {
+        lang_id,
+        exact,
+        folded,
+    }
 }
 
 /// 単一参照検索で identifier ノードのテキストが target に一致するか判定する。
 /// PHP の case-insensitive 文脈では大小無視で比較する。`target` は呼び出し側で
 /// `normalize_identifier` 済み (PHP では原文のまま) を前提とする。
 fn ident_ref_matches(lang_id: LangId, node: Node<'_>, text: &str, target: &str) -> bool {
-    if lang_id == LangId::Php && php_name_is_case_insensitive(node) {
-        text.eq_ignore_ascii_case(target)
-    } else {
-        normalize_identifier(lang_id, text).as_ref() == target
+    match node_ref_domain(lang_id, node) {
+        RefKeyDomain::AsciiCaseInsensitive => text.eq_ignore_ascii_case(target),
+        RefKeyDomain::Exact => normalize_identifier(lang_id, text).as_ref() == target,
     }
 }
 
 /// 単一参照検索で文字列セグメント (PHP method 名等) が target に一致するか判定する。
 fn seg_ref_matches(lang_id: LangId, seg: &str, target: &str) -> bool {
-    if lang_id == LangId::Php {
-        seg.eq_ignore_ascii_case(target)
-    } else {
-        normalize_identifier(lang_id, seg).as_ref() == target
+    match seg_ref_domain(lang_id) {
+        RefKeyDomain::AsciiCaseInsensitive => seg.eq_ignore_ascii_case(target),
+        RefKeyDomain::Exact => normalize_identifier(lang_id, seg).as_ref() == target,
     }
 }
 
@@ -237,28 +286,25 @@ impl RefMatcher for SingleMatcher<'_> {
     }
 }
 
-/// batch 検索用 matcher。正規化キーで name_to_ix を引き、一致した全 index を返す。
+/// batch 検索用 matcher。照合ドメインに対応する map を引き、一致した全 index を返す。
+/// ドメイン判定 (`node_ref_domain` / `seg_ref_domain`) は [`SingleMatcher`] と共有する。
 pub(crate) struct IndexedMatcher<'map, 'name> {
-    pub(crate) lang_id: LangId,
-    pub(crate) name_to_ix:
-        &'map std::collections::HashMap<std::borrow::Cow<'name, str>, Vec<usize>>,
+    pub(crate) name_index: &'map NameIndex<'name>,
 }
 
 impl RefMatcher for IndexedMatcher<'_, '_> {
     #[inline]
     fn identifier_matches(&self, node: Node<'_>, text: &str) -> Option<MatchSet<'_>> {
-        // `&str` で引くことで返り値スライスの寿命を name_to_ix (`'map`) だけに縛り、
-        // 一時 Cow キー (text 借用) と切り離す。
-        self.name_to_ix
-            .get(&*node_ref_key(self.lang_id, node, text))
-            .map(|ixs| MatchSet::Many(ixs.as_slice()))
+        self.name_index
+            .lookup(node_ref_domain(self.name_index.lang_id, node), text)
+            .map(MatchSet::Many)
     }
 
     #[inline]
     fn segment_matches(&self, segment: &str) -> Option<MatchSet<'_>> {
-        self.name_to_ix
-            .get(&*seg_ref_key(self.lang_id, segment))
-            .map(|ixs| MatchSet::Many(ixs.as_slice()))
+        self.name_index
+            .lookup(seg_ref_domain(self.name_index.lang_id), segment)
+            .map(MatchSet::Many)
     }
 }
 

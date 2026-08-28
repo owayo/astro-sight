@@ -226,9 +226,6 @@ time: i64,
 /// 属性文字列参照が非 Definition としてカウントされ、dead-code 判定に反映されることを検証
 #[test]
 fn rust_attr_string_ref_counted_as_non_definition() {
-    use std::borrow::Cow;
-    use std::collections::HashMap;
-
     let source = r#"
 fn serialize_jst() {}
 #[derive(Serialize)]
@@ -239,12 +236,11 @@ time: i64,
 "#;
     let tree = parse_rust(source);
     let defs = definition_node_kinds(LangId::Rust);
-    let mut name_to_ix: HashMap<Cow<'_, str>, Vec<usize>> = HashMap::new();
-    name_to_ix.insert(Cow::Borrowed("serialize_jst"), vec![0]);
+    let symbol_names = vec!["serialize_jst".to_string()];
     let counts = count_refs_for_test(
         tree.root_node(),
         source.as_bytes(),
-        &name_to_ix,
+        &symbol_names,
         defs,
         LangId::Rust,
         1,
@@ -344,9 +340,6 @@ fn collect_all_attr_segments<'a>(
 /// single refs と count-only (dead-code 経路) の分類一致まで固定する。
 #[test]
 fn rust_closure_bound_identifiers_are_not_references() {
-    use std::borrow::Cow;
-    use std::collections::HashMap;
-
     // (説明, ソース, 期待 def 数, 期待 ref 数)
     let cases: &[(&str, &str, usize, usize)] = &[
         (
@@ -522,12 +515,11 @@ fn rust_closure_bound_identifiers_are_not_references() {
         assert_eq!(def_cnt, *want_def, "{label}: 定義数: {refs:?}");
         assert_eq!(ref_cnt, *want_ref, "{label}: 参照数: {refs:?}");
 
-        let mut name_to_ix: HashMap<Cow<'_, str>, Vec<usize>> = HashMap::new();
-        name_to_ix.insert(Cow::Borrowed(name), vec![0]);
+        let symbol_names = vec![name.to_string()];
         let counts = count_refs_for_test(
             tree.root_node(),
             source.as_bytes(),
-            &name_to_ix,
+            &symbol_names,
             defs,
             LangId::Rust,
             1,

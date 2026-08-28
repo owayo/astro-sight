@@ -36,7 +36,7 @@ use definition::definition_node_kinds;
 use lexer_path::{count_refs_in_file_via_lexer, find_refs_batch_via_lexer, find_refs_via_lexer};
 use walker::{
     CountSink, IndexedMatcher, SingleMatcher, SymbolReferenceSink, VisitorAdapter,
-    build_name_to_ix, run_ref_walk,
+    build_name_index, run_ref_walk,
 };
 
 /// `find_references` / `find_references_batch` 用の最大並列ワーカー数。
@@ -511,11 +511,10 @@ pub(crate) fn visit_refs_and_defs_in_file_cb<V: RefVisitor>(
     let root = tree.root_node();
     let definition_kinds = definition_node_kinds(lang_id);
 
-    let name_to_ix = build_name_to_ix(lang_id, symbol_names, &present_indices);
+    let name_index = build_name_index(lang_id, symbol_names, &present_indices);
 
     let matcher = IndexedMatcher {
-        lang_id,
-        name_to_ix: &name_to_ix,
+        name_index: &name_index,
     };
     let mut sink = VisitorAdapter { visitor };
     run_ref_walk(
@@ -562,14 +561,13 @@ pub(crate) fn find_refs_batch_in_file_indexed(
     let root = tree.root_node();
     let definition_kinds = definition_node_kinds(lang_id);
 
-    // 言語別に正規化キーで name_to_ix を構築する (Xojo は case 折りたたみ、PHP は
-    // 関数/メソッド/クラス系の case-insensitive 参照に備え folded キーも登録する)。
-    let name_to_ix = build_name_to_ix(lang_id, symbol_names, &present_indices);
+    // 言語別に照合ドメイン別の index を構築する (Xojo は case 折りたたみ、PHP は
+    // 関数/メソッド/クラス系の case-insensitive 参照用に folded map を別途持つ)。
+    let name_index = build_name_index(lang_id, symbol_names, &present_indices);
 
     let mut result = vec![Vec::new(); num];
     let matcher = IndexedMatcher {
-        lang_id,
-        name_to_ix: &name_to_ix,
+        name_index: &name_index,
     };
     let mut sink = SymbolReferenceSink {
         buckets: &mut result,
@@ -621,14 +619,13 @@ fn count_refs_in_file(
     let root = tree.root_node();
     let definition_kinds = definition_node_kinds(lang_id);
 
-    // 言語別に正規化キーで name_to_ix を構築 (Xojo は case 折りたたみ、PHP は関数/メソッド/
-    // クラス系の case-insensitive 参照に備え folded キーも登録)。
-    let name_to_ix = build_name_to_ix(lang_id, symbol_names, &present_indices);
+    // 言語別に照合ドメイン別の index を構築 (Xojo は case 折りたたみ、PHP は関数/メソッド/
+    // クラス系の case-insensitive 参照用に folded map を別途持つ)。
+    let name_index = build_name_index(lang_id, symbol_names, &present_indices);
 
     let mut counts = vec![0usize; num];
     let matcher = IndexedMatcher {
-        lang_id,
-        name_to_ix: &name_to_ix,
+        name_index: &name_index,
     };
     let mut sink = CountSink {
         counts: &mut counts,

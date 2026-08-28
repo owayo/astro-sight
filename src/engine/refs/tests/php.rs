@@ -445,3 +445,66 @@ fn find_references_php_group_use_const_is_case_sensitive() {
         "group use function must be case-insensitive"
     );
 }
+
+/// PHP の batch 経路 (IndexedMatcher) が single 経路 (SingleMatcher) と完全に一致すること。
+///
+/// 旧実装は `build_name_to_ix` が case-insensitive 用の折りたたみキー (小文字) と原文キーを
+/// **同じ map** に混在させていたため、case-sensitive 文脈 (`$this->foo` のプロパティ名) の
+/// lookup がシンボル `Foo` の折りたたみキーへ誤ヒットしていた。single 経路は
+/// `php_name_is_case_insensitive(node)` を都度見るので正しく、同じ入力で結果が食い違っていた。
+/// `find_references_batch` は `ApiRefIndex` の土台なので、汚染は api.rm / api.mod /
+/// refs_internal / dead-code (class が live に化ける fail-open) まで波及する。
+///
+/// 対照ケースを同一 fixture に内蔵する: case-insensitive 文脈 (`FOO::bar()`) では
+/// 大小違いのシンボルへ**引き続き**ヒットしなければならない (抑制しすぎない)。
+#[test]
+fn php_batch_refs_match_single_refs_across_case_domains() {
+    // `Foo` (クラス) と `foo` (関数/プロパティ) が同居し、case-sensitive 文脈と
+    // case-insensitive 文脈の両方から参照される fixture。
+    let source: &[u8] = b"<?php\n\
+class Foo {\n\
+    public $foo = 1;\n\
+    public function bar() { return $this->foo; }\n\
+}\n\
+function foo(): int { return 2; }\n\
+$Foo = new Foo();\n\
+$foo = FOO::bar();\n\
+echo foo();\n";
+    let lang_id = LangId::Php;
+    let tree = parser::parse_source(source, lang_id).unwrap();
+    let root = tree.root_node();
+    let defs = definition_node_kinds(lang_id);
+    let names = vec!["Foo".to_string(), "foo".to_string()];
+
+    let batch = collect_batch_refs_for_test(root, source, &names, "t.php", defs, lang_id);
+    for (ix, name) in names.iter().enumerate() {
+        let single = collect_single_refs_for_test(root, source, name, "t.php", defs, lang_id);
+        assert_eq!(
+            ref_fingerprints(&single),
+            ref_fingerprints(&batch[ix]),
+            "single と batch は同一入力に対して同一結果を返すこと (name={name})"
+        );
+    }
+
+    // 症状の直接固定: `$this->foo` (プロパティ = case-sensitive) の行は `Foo` の参照でない。
+    // ここは修正前に batch 側だけがヒットしていた。
+    let this_foo_line = 3; // 0-origin: `public function bar() { return $this->foo; }`
+    assert!(
+        !batch[0].iter().any(|r| r.line == this_foo_line),
+        "case-sensitive なプロパティ `$this->foo` を `Foo` の参照に数えないこと: {:?}",
+        batch[0]
+    );
+    // 対照: case-insensitive なクラス参照 `FOO::bar()` は大小違いでも `Foo` にヒットする。
+    let foo_scope_line = 7; // 0-origin: `$foo = FOO::bar();`
+    assert!(
+        batch[0].iter().any(|r| r.line == foo_scope_line),
+        "case-insensitive な `FOO::bar()` は `Foo` の参照として残ること: {:?}",
+        batch[0]
+    );
+    // 対照: プロパティ `$this->foo` はシンボル `foo` 側では引き続き参照として数える。
+    assert!(
+        batch[1].iter().any(|r| r.line == this_foo_line),
+        "`$this->foo` はシンボル `foo` の参照として数えること: {:?}",
+        batch[1]
+    );
+}

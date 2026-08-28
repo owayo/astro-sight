@@ -842,3 +842,92 @@ def build() -> Payload:\n\
         "戻り値型注釈と本体のコンストラクタ呼び出しが ref: {refs:?}"
     );
 }
+
+/// PHP で `refs --name` (single 経路) と `refs --names` (batch 経路) が
+/// **同じ入力に対して同じ結果**を返すことを CLI レベルで固定する。
+///
+/// 旧実装は batch 側の name index が case-insensitive 用の折りたたみキー (小文字) と
+/// 原文キーを同じ map に混在させていたため、case-sensitive 文脈 (`$this->foo` の
+/// プロパティ名や `$foo` 変数) の lookup がシンボル `Foo` の折りたたみキーへ誤ヒットした。
+/// `refs --names` が使う `find_references_batch` は `ApiRefIndex` の土台なので、
+/// この汚染は api.rm / api.mod / refs_internal / dead-code まで波及する。
+#[test]
+fn refs_single_and_batch_agree_on_php_case_domains() {
+    let repo = TestRepo::new();
+    repo.write(
+        "app.php",
+        "<?php\n\
+class Foo {\n\
+    public $foo = 1;\n\
+    public function bar() { return $this->foo; }\n\
+}\n\
+function foo(): int { return 2; }\n\
+$Foo = new Foo();\n\
+$foo = FOO::bar();\n\
+echo foo();\n",
+    );
+
+    // batch 経路: NDJSON (1 行 = 1 シンボル)
+    let out = cargo_bin()
+        .args(["refs", "--names", "Foo,foo", "--dir"])
+        .arg(repo.root())
+        .output()
+        .expect("failed to run refs --names");
+    assert!(out.status.success(), "refs --names failed");
+    let batch: std::collections::HashMap<String, serde_json::Value> =
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).expect("invalid NDJSON");
+                (v["symbol"].as_str().unwrap().to_string(), v)
+            })
+            .collect();
+
+    // 位置と分類まで含めた指紋で比較する (件数一致だけでは取りこぼす)。
+    let fingerprint = |v: &serde_json::Value| -> Vec<(u64, u64, String)> {
+        let mut out: Vec<_> = v["refs"]
+            .as_array()
+            .expect("refs array")
+            .iter()
+            .map(|r| {
+                (
+                    r["ln"].as_u64().unwrap(),
+                    r["col"].as_u64().unwrap(),
+                    r["kind"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    };
+
+    for name in ["Foo", "foo"] {
+        let single_out = cargo_bin()
+            .args(["refs", "--name", name, "--dir"])
+            .arg(repo.root())
+            .output()
+            .expect("failed to run refs --name");
+        assert!(single_out.status.success(), "refs --name {name} failed");
+        let single: serde_json::Value =
+            serde_json::from_slice(&single_out.stdout).expect("invalid JSON");
+        assert_eq!(
+            fingerprint(&single),
+            fingerprint(&batch[name]),
+            "single と batch は同一入力に対して同一結果を返すこと (name={name})"
+        );
+    }
+
+    // 症状の直接固定: case-sensitive なプロパティ `$this->foo` (0-origin 行 3) を
+    // `Foo` の参照に数えない。
+    let foo_class = fingerprint(&batch["Foo"]);
+    assert!(
+        !foo_class.iter().any(|(ln, _, _)| *ln == 3),
+        "case-sensitive なプロパティ参照を class `Foo` に帰属させないこと: {foo_class:?}"
+    );
+    // 対照: case-insensitive な `FOO::bar()` (0-origin 行 7) は `Foo` の参照として残す。
+    assert!(
+        foo_class.iter().any(|(ln, _, _)| *ln == 7),
+        "case-insensitive なクラス参照は残すこと (抑制しすぎない): {foo_class:?}"
+    );
+}

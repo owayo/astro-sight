@@ -63,9 +63,6 @@ fn definition_node_kinds_python() {
 /// single refs と count-only (dead-code 経路) で分類が一致することも固定する。
 #[test]
 fn python_type_positions_are_refs_not_defs() {
-    use std::borrow::Cow;
-    use std::collections::HashMap;
-
     let source = "class Base:\n\
     pass\n\
 \n\
@@ -105,12 +102,11 @@ def h() -> list[Base]:\n\
         "基底クラス / 戻り値型 / 引数型 / ジェネリック引数はいずれも参照: {refs:?}"
     );
 
-    let mut name_to_ix: HashMap<Cow<'_, str>, Vec<usize>> = HashMap::new();
-    name_to_ix.insert(Cow::Borrowed("Base"), vec![0]);
+    let symbol_names = vec!["Base".to_string()];
     let counts = count_refs_for_test(
         tree.root_node(),
         source.as_bytes(),
-        &name_to_ix,
+        &symbol_names,
         defs,
         LangId::Python,
         1,
@@ -182,9 +178,6 @@ fn python_declaration_names_stay_definitions() {
 /// 単独 forward declaration は ref/def いずれにも含めない。
 #[test]
 fn cpp_struct_tag_type_uses_are_refs_not_defs() {
-    use std::borrow::Cow;
-    use std::collections::HashMap;
-
     let source = "struct buffer_data { int x; };\n\
 struct holder {\n\
   struct buffer_data* buffer;\n\
@@ -222,12 +215,11 @@ struct forward_declared;\n";
         "member type, parameter type, local type, and sizeof type should be refs: {refs:?}"
     );
 
-    let mut name_to_ix: HashMap<Cow<'_, str>, Vec<usize>> = HashMap::new();
-    name_to_ix.insert(Cow::Borrowed("buffer_data"), vec![0]);
+    let symbol_names = vec!["buffer_data".to_string()];
     let counts = count_refs_for_test(
         tree.root_node(),
         source.as_bytes(),
-        &name_to_ix,
+        &symbol_names,
         defs,
         LangId::Cpp,
         1,
@@ -258,9 +250,6 @@ struct forward_declared;\n";
 /// single refs と count-only (dead-code 経路) で分類が一致することも固定する。
 #[test]
 fn type_positions_are_refs_not_defs_in_every_language() {
-    use std::borrow::Cow;
-    use std::collections::HashMap;
-
     // (言語, ソース, 期待 def 数, 期待 ref 数)
     let cases: &[(LangId, &str, usize, usize)] = &[
         // 宣言 1 / 引数型・戻り値型・var 型・戻り式で 4 参照
@@ -329,12 +318,11 @@ fn type_positions_are_refs_not_defs_in_every_language() {
             "{lang:?}: 型注釈位置はすべて参照になること: {refs:?}"
         );
 
-        let mut name_to_ix: HashMap<Cow<'_, str>, Vec<usize>> = HashMap::new();
-        name_to_ix.insert(Cow::Borrowed("Base"), vec![0]);
+        let symbol_names = vec!["Base".to_string()];
         let counts = count_refs_for_test(
             tree.root_node(),
             source.as_bytes(),
-            &name_to_ix,
+            &symbol_names,
             defs,
             *lang,
             1,
