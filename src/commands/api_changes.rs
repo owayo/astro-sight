@@ -34,10 +34,7 @@ pub(crate) fn detect_api_changes(
     diff_files: &[crate::models::impact::DiffFile],
 ) -> ApiChanges {
     let mut buckets = ApiChangeBuckets::default();
-    // api.rm の Rust private module 抑制で base 側 re-export index を base+crate 単位に再利用する。
-    let mut rust_reexport_cache = RustBaseReexportCache::default();
-    // api.add 経路では new (working tree) 側 crate を 1 度走査して edge graph を構築する。
-    let mut rust_new_reexport_cache = RustWorktreeReexportCache::default();
+    let mut rust_public = RustPublicApiContext::default();
 
     // .gitattributes の linguist-generated 指定ファイルは API 変更検出から除外する
     let gitattrs = std::fs::canonicalize(dir)
@@ -131,8 +128,7 @@ pub(crate) fn detect_api_changes(
     };
     let mut state = DetectionState {
         buckets: &mut buckets,
-        base_reexports: &mut rust_reexport_cache,
-        worktree_reexports: &mut rust_new_reexport_cache,
+        rust_public: &mut rust_public,
         closure_caches: &mut closure_caches,
     };
 

@@ -150,7 +150,7 @@ fn collect_added_symbols(
                 dir,
                 &df.new_path,
                 name,
-                state.worktree_reexports,
+                state.rust_public,
             ) {
                 continue;
             }
@@ -203,7 +203,7 @@ fn collect_removed_symbols(
                 base,
                 &df.old_path,
                 name,
-                state.base_reexports,
+                state.rust_public,
             ) {
                 continue;
             }
@@ -272,7 +272,7 @@ fn collect_modified_symbols(
     // 外部 API 面の変更ではないとみなす。
     let is_binary_rust_old_crate_for_mod =
         state
-            .base_reexports
+            .rust_public
             .is_binary_only_at_base(dir, base, &df.old_path);
     let is_binary_rust_new_crate_for_mod = is_binary_only_rust_crate(dir, &df.new_path);
     let skip_mod_for_binary_crate =
@@ -299,7 +299,7 @@ fn collect_modified_symbols(
                 base,
                 &df.old_path,
                 name,
-                state.base_reexports,
+                state.rust_public,
             ) {
                 continue;
             }
@@ -656,7 +656,7 @@ pub(crate) fn process_deleted_file(
             base,
             &df.old_path,
             name,
-            state.base_reexports,
+            state.rust_public,
         ) {
             continue;
         }
@@ -722,12 +722,8 @@ pub(crate) fn process_added_file(
         if is_binary_rust_crate {
             continue;
         }
-        if is_rust_new_symbol_outside_public_api_surface(
-            dir,
-            &df.new_path,
-            name,
-            state.worktree_reexports,
-        ) {
+        if is_rust_new_symbol_outside_public_api_surface(dir, &df.new_path, name, state.rust_public)
+        {
             continue;
         }
         if is_internally_connected(in_file_callees, name) {

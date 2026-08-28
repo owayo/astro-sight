@@ -71,10 +71,8 @@ pub(crate) struct DetectionInputs<'a> {
 /// 分類の過程で更新される可変状態 (結果バケットと、ファイル単位のメモ化キャッシュ)。
 pub(crate) struct DetectionState<'a> {
     pub(crate) buckets: &'a mut ApiChangeBuckets,
-    /// base リビジョン側の Rust 公開面判定キャッシュ (削除・シグネチャ変更で参照)。
-    pub(crate) base_reexports: &'a mut RustBaseReexportCache,
-    /// 作業ツリー側の Rust 公開面判定キャッシュ (追加で参照)。
-    pub(crate) worktree_reexports: &'a mut RustWorktreeReexportCache,
+    /// base/worktree を同じライフタイムへ閉じた Rust 公開面解析コンテキスト。
+    pub(crate) rust_public: &'a mut RustPublicApiContext,
     pub(crate) closure_caches: &'a mut crate::commands::api_changes::ref_index::ApiClosureCaches,
 }
 

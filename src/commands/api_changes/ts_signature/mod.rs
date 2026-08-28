@@ -12,6 +12,16 @@ use super::super::git_input::git_show_blob;
 use super::source_pair::{CompatibleModSite, SignatureSourceCache};
 use super::{ApiRefIndex, has_blocking_value_usage, normalize_signature_whitespace};
 
+mod function_params;
+mod literal_union;
+mod object_members;
+mod react;
+
+pub(crate) use function_params::*;
+pub(crate) use literal_union::*;
+pub(crate) use object_members::*;
+pub(crate) use react::*;
+
 /// TS/TSX/JS 全体を対象にする判定器の言語ゲート。
 const TS_JS_LANGS: &[crate::language::LangId] = &[
     crate::language::LangId::Typescript,
@@ -214,29 +224,6 @@ fn collect_leaf_tokens(
 ///
 /// **RHS の同値だけでは足りない**: 型パラメータ列 (`<T extends string>`) は RHS の外にある
 /// 公開契約なので、old/new で一致することも要求する (`type_alias_type_parameter_tokens`)。
-pub(crate) fn detect_equivalent_literal_union_alias_compatible_mod(
-    site: &CompatibleModSite<'_>,
-    sources: &mut SignatureSourceCache,
-) -> Option<CompatibleApiModification> {
-    let lang = site.lang_in(TS_ONLY_LANGS)?;
-    if site.kind != "type" {
-        return None;
-    }
-    let src = sources.get(site)?;
-    let (old_tree, new_tree) = src.parse_pair(lang)?;
-    if old_tree.root_node().has_error() || new_tree.root_node().has_error() {
-        return None;
-    }
-    let old_params = type_alias_type_parameter_tokens(old_tree.root_node(), &src.old, site.name)?;
-    let new_params = type_alias_type_parameter_tokens(new_tree.root_node(), &src.new, site.name)?;
-    if old_params != new_params {
-        return None;
-    }
-    let old_values = eval_named_literal_union(old_tree.root_node(), &src.old, site.name)?;
-    let new_values = eval_named_literal_union(new_tree.root_node(), &src.new, site.name)?;
-    (old_values == new_values).then(|| site.compatible("equivalent_literal_union_alias"))
-}
-
 /// TS/TSX/JS の exported component を `memo` / `forwardRef` 等の HOC でラップしただけの
 /// api.mod を互換変更 (`react_component_wrapper`) として判定する。
 ///
@@ -251,40 +238,6 @@ pub(crate) fn detect_equivalent_literal_union_alias_compatible_mod(
 ///
 /// 抽出失敗・型注釈なし・参照解析失敗・判定不能な参照は None を返し blocking を維持する
 /// (false negative 回避)。
-pub(crate) fn detect_react_wrapper_compatible_mod(
-    index: &ApiRefIndex,
-    site: &CompatibleModSite<'_>,
-    sources: &mut SignatureSourceCache,
-) -> Option<CompatibleApiModification> {
-    let lang = site.lang_in(TS_JS_LANGS)?;
-    // new 側が memo / forwardRef でラップされていること (単なる function 本体変更は対象外)。
-    if !new_sig_has_react_wrapper(site.new_sig) {
-        return None;
-    }
-    // old 側は非 wrapper (function 宣言等) であること。wrapper-to-wrapper の変更
-    // (`forwardRef<HTMLDivElement, P>` → `forwardRef<HTMLButtonElement, P>` 等) は ref 型や
-    // generic の差分を取りこぼすため対象外 (codex 指摘)。
-    if new_sig_has_react_wrapper(site.old_sig) {
-        return None;
-    }
-    // old は base リビジョン、new は working tree からソースを再取得して props 型を AST 抽出
-    // する。signature 文字列は const の先頭行 fallback で複数行 destructured props の型注釈を
-    // 取りこぼすため、ソース再パースで比較する (codex 設計合意)。
-    let src = sources.get(site)?;
-    // old / new 双方の第1引数 (props) の型注釈を抽出して一致を要求する。
-    let old_props = extract_component_props_type(&src.old, lang, site.name)?;
-    let new_props = extract_component_props_type(&src.new, lang, site.name)?;
-    if old_props != new_props {
-        return None;
-    }
-    // 値利用 (呼び出し / typeof / member / new / indexed) が残れば MemoExoticComponent 化で
-    // 壊れ得るため blocking 維持。
-    if has_blocking_value_usage(index, site.name) {
-        return None;
-    }
-    Some(site.compatible("react_component_wrapper"))
-}
-
 /// new 側 signature が `memo(` / `forwardRef(` / `React.memo(` / `React.forwardRef(` で
 /// ラップされているか (identifier 境界を確認し `somememo` 等の部分一致を弾く)。
 pub(crate) fn new_sig_has_react_wrapper(sig: &str) -> bool {
@@ -467,84 +420,6 @@ pub(crate) fn ctx_usage_is_jsx_or_safe(ctx: &str, name: &str) -> bool {
 /// member access (`.key` / `['key']` / `["key"]`) として参照されていない場合に降格する。
 /// 値のみ変更 / spread / computed key / mixed shape / record schema 不揃い / object でない /
 /// 抽出不能 / 同名複数宣言 / 削除キーの参照残存はすべて blocking 維持 (false negative 回避)。
-pub(crate) fn detect_object_members_compatible_mod(
-    site: &CompatibleModSite<'_>,
-    sources: &mut SignatureSourceCache,
-) -> Option<CompatibleApiModification> {
-    let lang = site.lang_in(TS_JS_LANGS)?;
-    let src = sources.get(site)?;
-    let old_keys = extract_object_member_keys(&src.old, lang, site.name)?;
-    let new_keys = extract_object_member_keys(&src.new, lang, site.name)?;
-    if old_keys.record_keys.is_some() != new_keys.record_keys.is_some() {
-        return None;
-    }
-    // 型注釈と `as` / `satisfies` は object literal の外にある公開契約。member キーだけで
-    // 降格すると、`cfg: { alpha: number }` → `cfg: { alpha: number | string; beta: number }`
-    // のように「無関係なキー追加」が同居した型変更が後方互換に見えてしまう (tsc は TS2322 で
-    // 落ちる)。`as const` の付け外しや `satisfies T` の型変更も同じ理由で blocking に残す。
-    if old_keys.declarator_type != new_keys.declarator_type
-        || old_keys.wrappers != new_keys.wrappers
-    {
-        return None;
-    }
-    // record entry を包む wrapper も同様。トップレベルだけ見ると
-    // `{ google: { alpha: 1 } as const }` → `{ google: { alpha: 1, beta: 2 } }` を
-    // 「キー追加のみ」として降格してしまう。両側に残る record key について比較する
-    // (片側にしか無い key は追加/削除であり、その可否は別途判定する)。
-    for (key, old_wrappers) in &old_keys.entry_wrappers {
-        if let Some(new_wrappers) = new_keys.entry_wrappers.get(key)
-            && new_wrappers != old_wrappers
-        {
-            return None;
-        }
-    }
-    let has_added_member = new_keys
-        .member_keys
-        .difference(&old_keys.member_keys)
-        .next()
-        .is_some();
-    let has_added_record_entry = match (&old_keys.record_keys, &new_keys.record_keys) {
-        (Some(old_record), Some(new_record)) => {
-            // record entry の削除は dynamic access (`config[id]`) を静的保証できないため blocking。
-            if old_record.difference(new_record).next().is_some() {
-                return None;
-            }
-            new_record.difference(old_record).next().is_some()
-        }
-        (None, None) => false,
-        _ => return None,
-    };
-    let removed_members: Vec<&String> = old_keys
-        .member_keys
-        .difference(&new_keys.member_keys)
-        .collect();
-    if removed_members.is_empty() && !has_added_member && !has_added_record_entry {
-        return None;
-    }
-    // 両側に残存するキーの値が変わっていれば破壊的なので blocking 維持。
-    // キー集合の差分だけを見ていると、`{a: () => {}}` → `{a: 42, b: () => {}}` のように
-    // 「既存キーの値の差し替え」と「無関係なキー追加」が同一 diff に同居した場合に
-    // 追加のみの変更として降格してしまう (呼び出し側の `a()` が実行時に壊れる)。
-    // 片側にしか無いキーは追加/削除であり、その可否は別途 removed_members 側で判定する。
-    for (key, old_value) in &old_keys.entry_values {
-        if let Some(new_value) = new_keys.entry_values.get(key)
-            && new_value != old_value
-        {
-            return None;
-        }
-    }
-    // 削除された schema キー (old にあって new にない)。いずれかへの member access が repo
-    // 全体で残っていれば破壊的なので blocking 維持。キーごとに全ファイルを再走査すると
-    // O(削除キー数 × ファイル数) になるため、対象キーを 1 個の AC と HashSet にまとめ、
-    // 各ファイルの read / parse / AST walk を最大 1 回に集約する。
-    let removed_member_set: HashSet<&str> =
-        removed_members.iter().map(|key| key.as_str()).collect();
-    if member_access_keys_have_ref(site.dir, &removed_member_set) {
-        return None;
-    }
-    Some(site.compatible("unused_object_members"))
-}
-
 /// TS/TSX のトップレベル exported function / class method で、末尾 optional/default
 /// 引数追加だけを compatible_modified (`trailing_optional_params`) として判定する。
 ///
@@ -560,26 +435,6 @@ pub(crate) fn detect_object_members_compatible_mod(
 /// const arrow function / nested class / import 型の解決などは対象外にして blocking を
 /// 維持する。false negative (破壊的変更の見逃し) を避けるため、AST 取得や git show に
 /// 失敗した場合も None。
-pub(crate) fn detect_trailing_optional_params_compatible_mod(
-    site: &CompatibleModSite<'_>,
-    sources: &mut SignatureSourceCache,
-) -> Option<CompatibleApiModification> {
-    with_resolved_ts_fn_pair(site, sources, |old_fn, old_source, new_fn, new_source| {
-        let old_parts = ts_function_signature_parts(old_fn, old_source)?;
-        let new_parts = ts_function_signature_parts(new_fn, new_source)?;
-
-        if old_parts.head != new_parts.head || old_parts.tail != new_parts.tail {
-            return None;
-        }
-        if !ts_params_prefix_same_with_optional_tail(&old_parts.params, &new_parts.params) {
-            return None;
-        }
-        Some(())
-    })?;
-
-    Some(site.compatible("trailing_optional_params"))
-}
-
 /// TS/TSX のトップレベル exported function / class method で、引数の inline object type
 /// literal へ optional プロパティを追加しただけの変更を compatible_modified
 /// (`optional_object_props`) として判定する
@@ -598,49 +453,6 @@ pub(crate) fn detect_trailing_optional_params_compatible_mod(
 ///
 /// ネストした object type の内部変更は既存メンバーのテキスト不一致になるため対象外
 /// (第一階層の追加のみ許容)。メンバー削除・型変更・必須メンバー追加は blocking を維持する。
-pub(crate) fn detect_optional_object_props_compatible_mod(
-    site: &CompatibleModSite<'_>,
-    sources: &mut SignatureSourceCache,
-) -> Option<CompatibleApiModification> {
-    with_resolved_ts_fn_pair(site, sources, |old_fn, old_source, new_fn, new_source| {
-        let old_parts = ts_function_signature_parts(old_fn, old_source)?;
-        let new_parts = ts_function_signature_parts(new_fn, new_source)?;
-        if old_parts.head != new_parts.head || old_parts.tail != new_parts.tail {
-            return None;
-        }
-
-        let old_params_node = old_fn.child_by_field_name("parameters")?;
-        let new_params_node = new_fn.child_by_field_name("parameters")?;
-        let mut old_cursor = old_params_node.walk();
-        let old_children: Vec<tree_sitter::Node> =
-            old_params_node.named_children(&mut old_cursor).collect();
-        let mut new_cursor = new_params_node.walk();
-        let new_children: Vec<tree_sitter::Node> =
-            new_params_node.named_children(&mut new_cursor).collect();
-        if old_children.len() != new_children.len() {
-            return None;
-        }
-
-        let mut any_extension = false;
-        for (old_param, new_param) in old_children.iter().zip(new_children.iter()) {
-            let old_text = node_normalized_text(*old_param, old_source)?;
-            let new_text = node_normalized_text(*new_param, new_source)?;
-            if old_text == new_text {
-                continue;
-            }
-            if !ts_param_pair_is_optional_object_extension(
-                *old_param, old_source, *new_param, new_source,
-            ) {
-                return None;
-            }
-            any_extension = true;
-        }
-        any_extension.then_some(())
-    })?;
-
-    Some(site.compatible("optional_object_props"))
-}
-
 /// 「object type literal 引数へ**必須**プロパティを追加しただけ」の signature 変更で、
 /// 追加された必須プロパティ名と対象引数の位置を返す。
 ///
@@ -809,37 +621,7 @@ fn ts_object_type_added_required_members(
 ///   React ランタイムエラーになる破壊的変更のため blocking 維持)
 /// - repo 内の参照が JSX タグ利用 / import / re-export / 定義のみ (関数呼び出し
 ///   `Foo()` は戻り値が Promise になり await が必要になるため blocking 維持)
-pub(crate) fn detect_async_jsx_component_compatible_mod(
-    index: &ApiRefIndex,
-    site: &CompatibleModSite<'_>,
-    sources: &mut SignatureSourceCache,
-) -> Option<CompatibleApiModification> {
-    // class method は RSC の関数コンポーネント規約外なので対象にしない。
-    if site.kind != "function" || site.name.contains('.') {
-        return None;
-    }
-    with_resolved_ts_fn_pair(site, sources, |old_fn, old_source, new_fn, new_source| {
-        let old_parts = ts_function_signature_parts(old_fn, old_source)?;
-        let new_parts = ts_function_signature_parts(new_fn, new_source)?;
-        if old_parts.params != new_parts.params || old_parts.tail != new_parts.tail {
-            return None;
-        }
-        if !head_is_async_addition(&old_parts.head, &new_parts.head) {
-            return None;
-        }
-        // 変更後が Client Component なら async 化は破壊的変更。
-        if ts_module_has_use_client_directive(module_root(new_fn), new_source) {
-            return None;
-        }
-        Some(())
-    })?;
-    // 値利用 (`Foo()` / `Foo.x` / `new Foo` 等) や判定不能な参照が残れば blocking 維持。
-    if has_blocking_value_usage(index, site.name) {
-        return None;
-    }
-    Some(site.compatible("async_jsx_component"))
-}
-
+///
 /// `new_head` から `async ` を 1 箇所取り除くと `old_head` に一致するか
 /// (= 変更が async キーワード追加のみか)。head は whitespace 正規化済み前提。
 fn head_is_async_addition(old_head: &str, new_head: &str) -> bool {
@@ -1868,63 +1650,6 @@ pub(crate) fn interface_has_extends(decl: tree_sitter::Node<'_>) -> bool {
 ///    可能と判定できる
 ///
 /// `old_path` と `new_path` は rename 差分に対応するため別々に渡す。
-pub(crate) fn is_ts_no_arg_to_optional_destructured_compatible(
-    old_sig: &str,
-    new_sig: &str,
-    dir: &str,
-    base: &str,
-    old_path: &str,
-    new_path: &str,
-    fn_name: &str,
-) -> bool {
-    let full_new_path = std::path::Path::new(dir).join(new_path);
-    let Some(utf8_str) = full_new_path.to_str() else {
-        return false;
-    };
-    let utf8_new_path = camino::Utf8Path::new(utf8_str);
-    let Ok(lang_id) = crate::language::LangId::from_path(utf8_new_path) else {
-        return false;
-    };
-    if !matches!(
-        lang_id,
-        crate::language::LangId::Typescript | crate::language::LangId::Tsx
-    ) {
-        return false;
-    }
-
-    // 早期 reject (高速化): 新 sig が destructure 形式でなければ判定不要
-    if !signature_has_destructured_params_for(new_sig, fn_name) {
-        return false;
-    }
-    // 早期 reject (高速化): 旧 sig 文字列に `fn_name()` パターンがなければ判定不要。
-    // 文字列 contains は false-positive あり (型注釈内 call signature) のため、これは
-    // 単なる早期スクリーニング。確実な判定は次の AST 検査で行う。
-    if !signature_has_empty_parens_for(old_sig, fn_name) {
-        return false;
-    }
-    // 旧ツリーで AST 検査: トップレベル関数 fn_name の parameters が実際に空か。
-    // rename 差分では `df.old_path` を使うため、`old_path` を渡す。
-    if !old_top_level_function_has_empty_parameters(dir, base, old_path, lang_id, fn_name) {
-        return false;
-    }
-
-    let Ok(source) = parser::read_file(utf8_new_path) else {
-        return false;
-    };
-    let Ok(tree) = parser::parse_source(&source, lang_id) else {
-        return false;
-    };
-    let root = tree.root_node();
-
-    let Some(fn_node) = find_top_level_function_by_name(root, &source, fn_name) else {
-        return false;
-    };
-    let Some(params) = fn_node.child_by_field_name("parameters") else {
-        return false;
-    };
-    is_optionally_omittable_single_destructured_param(params, root, &source)
-}
-
 /// signature 文字列に `fn_name()` (parameters なし) パターンが含まれるかを判定。
 /// 注: これは早期 reject 用のスクリーニング。型注釈内の call signature を誤検出する
 /// 可能性があるため、確実な判定には AST 検査 (`old_top_level_function_has_empty_parameters`)

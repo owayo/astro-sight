@@ -5,6 +5,7 @@ pub mod config;
 pub mod doctor;
 pub mod engine;
 pub mod error;
+mod git_support;
 pub mod language;
 pub mod logger;
 pub mod mcp;

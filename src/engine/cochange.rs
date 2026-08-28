@@ -1,40 +1,19 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 
 use anyhow::{Result, bail};
 use rayon::prelude::*;
 
 use crate::error::{AstroError, ErrorCode};
+use crate::git_support::{DEFAULT_BLAME_BASE, validate_git_revision};
 use crate::models::cochange::{
     BLAME_DEFAULT_EXCLUDE_GLOBS, CoChangeDiagnosticReason, CoChangeDiagnostics, CoChangeEntry,
     CoChangeEvidence, CoChangeOptions, CoChangeResult,
 };
 use crate::models::skip::SkipInfo;
 
-/// `git diff` / `git blame` 等に渡す revision を検証する。
-/// 先頭が `-` の値はオプションとして解釈されるため拒否する
-/// (`--output=/path` のようなファイル書き込みオプション混入を防ぐ)。
-fn validate_revision(rev: &str, arg_name: &str) -> Result<()> {
-    if rev.is_empty() {
-        bail!(AstroError::new(
-            ErrorCode::InvalidRequest,
-            format!("{arg_name} must not be empty"),
-        ));
-    }
-    if rev.starts_with('-') {
-        bail!(AstroError::new(
-            ErrorCode::InvalidRequest,
-            format!("{arg_name} must not start with '-': {rev}"),
-        ));
-    }
-    if rev.contains('\0') {
-        bail!(AstroError::new(
-            ErrorCode::InvalidRequest,
-            format!("{arg_name} must not contain NUL"),
-        ));
-    }
-    Ok(())
-}
+mod scoring;
+use scoring::{ShardStats, commit_size_weight, compare_entries_by_ranking};
 
 /// entries なし・commits_analyzed 0 の空結果を返す。起点なし / 証拠集合が空 /
 /// マージ除外後に空、の各早期 return で共用し、構築の重複を避ける。
@@ -132,14 +111,11 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
 
     let deadline = Deadline::new(opts.timeout_secs);
 
-    let base_rev: &str = opts
-        .base
-        .as_deref()
-        .unwrap_or(crate::commands::DEFAULT_BLAME_BASE);
+    let base_rev: &str = opts.base.as_deref().unwrap_or(DEFAULT_BLAME_BASE);
     // base は git diff / git blame に直接渡されるため、`-` プレフィクス等の
     // オプション誤認識を防ぐ revision 検証を必ず通す。--paths/--paths-file 経由で
     // resolve_blame_source_files の検証を迂回しても安全側に倒れる。
-    validate_revision(base_rev, "--base")?;
+    validate_git_revision(base_rev, "--base")?;
 
     let mut diag = CoChangeDiagnostics {
         sources_requested: opts.source_files.len(),
@@ -633,187 +609,6 @@ fn entries_for_source(
         out.truncate(opts.per_source_limit);
     }
     out
-}
-
-/// streaming 集計用のスレッドローカル統計。fold/reduce でマージされる。
-///
-/// commit-size weighting の集計は **f64 を足し込まず、コミットのファイル数ごとの度数
-/// (ヒストグラム) を整数で持つ**。weight は `commit_size_weight(file_count, pivot, hard_max)`
-/// で file_count だけから決まるので、度数さえ保てば後から同じ値を再構成できる。
-///
-/// f64 で足し込むと、`sha_to_sources` (HashMap) の反復順と rayon の reduce 順によって
-/// 加算順が実行ごとに変わり、非結合な f64 加算の結果が最終桁でぶれる (実測: 実際の
-/// weight 12 個で 6 通りの異なる和)。`score` はそのまま出力されるので
-/// 「出力は決定論的に保つ」規約に反する。整数の度数なら加算は結合的で順序に依存しない。
-///
-/// 固定小数点へ量子化する案は採らない。`score` の定義 (`sqrt(pivot/file_count)` の総和) を
-/// 変えてしまい、scale 値が新たな暗黙仕様になるため。
-/// - `per_source_raw` / `per_source_weight_hist` / `denom_weight_hist`: commit-size weighting の集計
-/// - `counted_denom`: 実際に集計対象となったコミット数 (= confidence の分母)
-/// - `denom_units` / `co_units`: author_unit_window_days > 0 のとき (author, time_bucket) 単位で
-///   起点ファイル別の unique unit と候補別の unique unit を保持する
-/// - `co_counts`: グローバル候補出現数 (= `CoChangeEntry.total_changes_b` の元)
-/// - `failed_commits`: diff-tree に失敗して変更ファイルを取得できなかったコミット数
-#[derive(Default)]
-struct ShardStats {
-    per_source_raw: Vec<HashMap<String, usize>>,
-    /// 起点 i → 候補パス → (コミットのファイル数 → 度数)。
-    per_source_weight_hist: Vec<HashMap<String, BTreeMap<usize, u64>>>,
-    counted_denom: Vec<usize>,
-    /// 起点 i → (コミットのファイル数 → 度数)。分母側の weight ヒストグラム。
-    denom_weight_hist: Vec<BTreeMap<usize, u64>>,
-    denom_units: Vec<HashSet<(String, i64)>>,
-    co_units: Vec<HashMap<String, HashSet<(String, i64)>>>,
-    co_counts: HashMap<String, usize>,
-    failed_commits: usize,
-}
-
-impl ShardStats {
-    fn new(n_sources: usize) -> Self {
-        Self {
-            per_source_raw: (0..n_sources).map(|_| HashMap::new()).collect(),
-            per_source_weight_hist: (0..n_sources).map(|_| HashMap::new()).collect(),
-            counted_denom: vec![0; n_sources],
-            denom_weight_hist: (0..n_sources).map(|_| BTreeMap::new()).collect(),
-            denom_units: (0..n_sources).map(|_| HashSet::new()).collect(),
-            co_units: (0..n_sources).map(|_| HashMap::new()).collect(),
-            co_counts: HashMap::new(),
-            failed_commits: 0,
-        }
-    }
-
-    fn merge(mut a: Self, b: Self) -> Self {
-        // per-source ベクタを持たない側 (n_sources = 0 の identity) でも、
-        // failed_commits だけは取りこぼさずに合算する。
-        if a.denom_weight_hist.is_empty() {
-            let mut b = b;
-            b.failed_commits += a.failed_commits;
-            return b;
-        }
-        if b.denom_weight_hist.is_empty() {
-            a.failed_commits += b.failed_commits;
-            return a;
-        }
-        for (i, m) in b.per_source_raw.into_iter().enumerate() {
-            for (k, v) in m {
-                *a.per_source_raw[i].entry(k).or_insert(0) += v;
-            }
-        }
-        for (i, c) in b.counted_denom.into_iter().enumerate() {
-            a.counted_denom[i] += c;
-        }
-        for (i, m) in b.per_source_weight_hist.into_iter().enumerate() {
-            for (k, hist) in m {
-                let dst = a.per_source_weight_hist[i].entry(k).or_default();
-                for (file_count, n) in hist {
-                    *dst.entry(file_count).or_insert(0) += n;
-                }
-            }
-        }
-        for (i, hist) in b.denom_weight_hist.into_iter().enumerate() {
-            for (file_count, n) in hist {
-                *a.denom_weight_hist[i].entry(file_count).or_insert(0) += n;
-            }
-        }
-        for (i, set) in b.denom_units.into_iter().enumerate() {
-            a.denom_units[i].extend(set);
-        }
-        for (i, map) in b.co_units.into_iter().enumerate() {
-            for (k, set) in map {
-                a.co_units[i].entry(k).or_default().extend(set);
-            }
-        }
-        for (k, v) in b.co_counts {
-            *a.co_counts.entry(k).or_insert(0) += v;
-        }
-        a.failed_commits += b.failed_commits;
-        a
-    }
-
-    /// 起点 `i` における候補 `cand` の平滑化スコア。
-    ///
-    /// `author_unit_active` かつ unit が取れているときは unit ベース
-    /// `(|co_units| + α) / (|denom_units| + α + β)` で計算し、同一 author の短時間 burst を
-    /// 1 票に圧縮する。unit が空 (author 情報を取れなかった SHA のみ) のときは
-    /// raw weighted へフォールバックする。
-    fn smoothed_score(
-        &self,
-        i: usize,
-        cand: &str,
-        opts: &CoChangeOptions,
-        author_unit_active: bool,
-    ) -> f64 {
-        let alpha = opts.smoothing_alpha;
-        let beta = opts.smoothing_beta;
-        if author_unit_active && !self.denom_units[i].is_empty() {
-            let denom_units_n = self.denom_units[i].len() as f64;
-            let co_units_n = self.co_units[i].get(cand).map(|s| s.len()).unwrap_or(0) as f64;
-            (co_units_n + alpha) / (denom_units_n + alpha + beta)
-        } else {
-            // ヒストグラムから weight 総和を再構成する。BTreeMap なので file_count 昇順の
-            // 固定した順序で畳まれ、加算順が実行ごとに変わらない。
-            let sum_weights = |hist: &BTreeMap<usize, u64>| -> f64 {
-                hist.iter()
-                    .map(|(&file_count, &n)| {
-                        n as f64
-                            * commit_size_weight(
-                                file_count,
-                                opts.commit_size_pivot,
-                                opts.max_files_per_commit,
-                            )
-                    })
-                    .sum()
-            };
-            let weighted_co = self.per_source_weight_hist[i]
-                .get(cand)
-                .map(sum_weights)
-                .unwrap_or(0.0);
-            let weighted_denom = sum_weights(&self.denom_weight_hist[i]);
-            (weighted_co + alpha) / (weighted_denom + alpha + beta)
-        }
-    }
-}
-
-/// 1 コミットあたりの「サイズ重み」を返す。
-/// - `pivot=0`: 常に 1.0 (旧挙動、size weighting 無効)
-/// - `pivot>0`: `min(1.0, sqrt(pivot/file_count))`
-///   小コミット (file_count <= pivot) は 1.0、大コミットほど 0 に近づく
-/// - `hard_max>0` かつ `file_count > hard_max`: 0.0 (スキップ済み)
-fn commit_size_weight(file_count: usize, pivot: usize, hard_max: usize) -> f64 {
-    if hard_max > 0 && file_count > hard_max {
-        return 0.0;
-    }
-    if pivot == 0 {
-        return 1.0;
-    }
-    let n = file_count.max(1) as f64;
-    let p = pivot as f64;
-    (p / n).sqrt().min(1.0)
-}
-
-/// CoChangeEntry を ranking 値で降順比較する。
-/// 同値時は co_changes (実共起数) 降順 → confidence 降順 → blame 証拠優先 →
-/// path 昇順の順で安定化する。
-/// ranking value (score / confidence) が同点でも、より多くのコミットで一緒に変更された
-/// ペアを優先することで、低 score 帯でのランキング品質を体感的に改善する。
-/// blame 証拠 (起点の変更行に直結) は履歴 fallback 証拠より密結合なので同点なら先に出す。
-fn compare_entries_by_ranking(
-    a: &CoChangeEntry,
-    b: &CoChangeEntry,
-    smoothing_on: bool,
-) -> std::cmp::Ordering {
-    b.ranking_value(smoothing_on)
-        .partial_cmp(&a.ranking_value(smoothing_on))
-        .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| b.co_changes.cmp(&a.co_changes))
-        .then_with(|| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .then_with(|| a.is_history_evidence().cmp(&b.is_history_evidence()))
-        .then_with(|| a.file_a.cmp(&b.file_a))
-        .then_with(|| a.file_b.cmp(&b.file_b))
 }
 
 /// 起点 1 ファイル分のコミット証拠。
@@ -2592,25 +2387,6 @@ mod tests {
             msg.contains("--base") && msg.contains("NUL"),
             "error message should reject NUL in base, got: {msg}"
         );
-    }
-
-    /// validate_revision のユニットテスト
-    #[test]
-    fn validate_revision_accepts_normal_refs() {
-        assert!(validate_revision("HEAD", "--base").is_ok());
-        assert!(validate_revision("HEAD~3", "--base").is_ok());
-        assert!(validate_revision("main", "--base").is_ok());
-        assert!(validate_revision("origin/main", "--base").is_ok());
-        assert!(validate_revision("v1.0.0", "--base").is_ok());
-        assert!(validate_revision("abc1234", "--base").is_ok());
-    }
-
-    #[test]
-    fn validate_revision_rejects_invalid_refs() {
-        assert!(validate_revision("", "--base").is_err());
-        assert!(validate_revision("--output=/tmp/pwn", "--base").is_err());
-        assert!(validate_revision("-p", "--base").is_err());
-        assert!(validate_revision("HEAD\0foo", "--base").is_err());
     }
 
     // ---- precision tests (commit-size weighting) ----

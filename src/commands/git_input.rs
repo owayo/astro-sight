@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 
 use crate::error::{AstroError, ErrorCode};
 use crate::models::skip::SkipInfo;
@@ -8,15 +8,8 @@ use super::common::{
     MAX_INPUT_SIZE, read_bytes_limited_and_drain, read_file_to_string_limited,
     read_paths_file_limited,
 };
-
-/// cochange の既定 base。context / impact / review / dead-code と揃えて
-/// 「未コミットの作業ツリー変更」を既定の解析対象にする。
-///
-/// 旧既定は `HEAD~1` (直前コミット) だったが、`git diff <base> HEAD` という
-/// 2 revision 形式と組み合わさって「`--git` を付けても未コミット変更を一切見ない」
-/// 状態になっていた。同じ `--git` で review と cochange が別の diff を見るのは
-/// ツール群として一貫しないため、単一 revision 形式 + 既定 HEAD に揃える。
-pub const DEFAULT_BLAME_BASE: &str = "HEAD";
+pub use crate::git_support::DEFAULT_BLAME_BASE;
+pub(crate) use crate::git_support::validate_git_revision;
 
 /// `resolve_blame_source_files` の結果。起点ファイルが解決できたか、
 /// git 管理外 (かつ明示 `--paths` / `--paths-file` 無し) で skip かを型で表す。
@@ -126,32 +119,6 @@ pub fn resolve_blame_source_files(
     // exit 1 ではなく空結果 (entries: [], commits_analyzed: 0) に倒す。
     // 生成物だけを触ったコミットで review / cochange 全体が落ちるのを防ぐ。
     Ok(BlameSourceResolution::Files(set.into_iter().collect()))
-}
-
-/// `git diff` / `git show` に渡す revision を検証する。
-/// 先頭が `-` の値は git がオプションとして解釈するため拒否する。
-/// (例: `--output=/path` によるファイル書き込みを防ぐ)
-pub(crate) fn validate_git_revision(rev: &str, arg_name: &str) -> Result<()> {
-    if rev.is_empty() {
-        bail!(AstroError::new(
-            ErrorCode::InvalidRequest,
-            format!("{arg_name} must not be empty"),
-        ));
-    }
-    if rev.starts_with('-') {
-        bail!(AstroError::new(
-            ErrorCode::InvalidRequest,
-            format!("{arg_name} must not start with '-': {rev}"),
-        ));
-    }
-    // `\0` を含む値はプロセス引数として不正
-    if rev.contains('\0') {
-        bail!(AstroError::new(
-            ErrorCode::InvalidRequest,
-            format!("{arg_name} must not contain NUL"),
-        ));
-    }
-    Ok(())
 }
 
 /// `git show <rev>:<path>` で blob を取得する単一のチョークポイント。
