@@ -2034,6 +2034,134 @@ fn detect_api_changes_ts_equivalent_literal_union_alias_is_compatible() {
 }
 
 #[test]
+fn detect_api_changes_ts_literal_union_alias_type_parameter_change_stays_modified() {
+    // 型パラメータ列は RHS の外にある公開契約。RHS (literal 集合) が同値でも、
+    // 型パラメータが変われば利用側が tsc で落ちるので blocking を維持しなければならない。
+    // 旧実装は decl.child_by_field_name("value") しか見ておらず、これらが
+    // compatible_modified へ降格していた (fail-closed 規約違反)。
+    //
+    // 対照ケースとして「型パラメータが両側同一なら従来どおり降格する」も同じテストで
+    // 固定する (全ケース blocking のままでも緑になるテストにしない)。
+    for (case, before, after, want_blocking) in [
+        (
+            // TS2315: Type 'Category' is not generic.
+            "型パラメータの削除",
+            "export type Category<T extends string> = \"x\" | \"y\";\n",
+            "export type Category = \"y\" | \"x\";\n",
+            true,
+        ),
+        (
+            // TS2314: Generic type 'Category' requires 1 type argument(s).
+            "型パラメータの追加",
+            "export type Category = \"x\" | \"y\";\n",
+            "export type Category<T extends string> = \"y\" | \"x\";\n",
+            true,
+        ),
+        (
+            // constraint が緩む / きつくなるのも契約変更。
+            "constraint の変更",
+            "export type Category<T extends string> = \"x\" | \"y\";\n",
+            "export type Category<T extends number> = \"y\" | \"x\";\n",
+            true,
+        ),
+        (
+            "default 型の変更",
+            "export type Category<T = string> = \"x\" | \"y\";\n",
+            "export type Category<T = number> = \"y\" | \"x\";\n",
+            true,
+        ),
+        (
+            // 対照: 型パラメータが同一なら、値集合の同値による降格は従来どおり成立する。
+            "型パラメータ同一 + 値集合同値",
+            "export type Category<T extends string> = \"x\" | \"y\";\n",
+            "export type Category<T extends string> = \"y\" | \"x\" | \"x\";\n",
+            false,
+        ),
+        (
+            // 文字列リテラル**内**の空白は意味を持つ。`Category<"a b">` は変更後に
+            // 型エラーになるので blocking を維持しなければならない
+            // (テキストから空白を除去する正規化だとここが同一に潰れる)。
+            "constraint の文字列リテラル内の空白",
+            "export type Category<T extends \"a b\"> = \"x\" | \"y\";\n",
+            "export type Category<T extends \"ab\"> = \"y\" | \"x\";\n",
+            true,
+        ),
+        (
+            // トークン境界が消える正規化だと `<T extends string>` と `<Textendsstring>` が
+            // 衝突する。後者は constraint の無い単一パラメータ `Textendsstring` なので
+            // 契約が違う (前者は `Category<"x">` を受けるが後者は任意型を受ける)。
+            "トークン境界の衝突",
+            "export type Category<T extends string> = \"x\" | \"y\";\n",
+            "export type Category<Textendsstring> = \"y\" | \"x\";\n",
+            true,
+        ),
+        (
+            // 対照: トークン間の空白差だけなら降格する
+            // (複数行に折り返した宣言は extract_api_signature が先頭行だけを返す別問題に
+            // 当たるため、ここでは 1 行内の空白差で固定する)。
+            "型パラメータの空白差のみ",
+            "export type Category<T extends string> = \"x\" | \"y\";\n",
+            "export type Category< T  extends  string > = \"y\" | \"x\";\n",
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        let src_dir = repo.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        fs::write(src_dir.join("types.ts"), before).expect("write before");
+        assert!(
+            Command::new("git")
+                .args(["add", "src/types.ts"])
+                .current_dir(repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(repo)
+                .status()
+                .expect("git commit")
+                .success()
+        );
+        fs::write(src_dir.join("types.ts"), after).expect("write after");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/types.ts".to_string(),
+            new_path: "src/types.ts".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: before.lines().count(),
+                new_start: 1,
+                new_count: after.lines().count(),
+            }],
+            deleted_old_source: None,
+        }];
+
+        let api_changes =
+            detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let is_blocking = api_changes
+            .modified
+            .iter()
+            .any(|change| change.name == "Category");
+        let is_compatible = api_changes
+            .compatible_modified
+            .iter()
+            .any(|change| change.name == "Category");
+        assert_eq!(
+            is_blocking, want_blocking,
+            "{case}: blocking 判定が期待と異なる: {api_changes:?}"
+        );
+        assert_eq!(
+            is_compatible, !want_blocking,
+            "{case}: compatible 判定が期待と異なる: {api_changes:?}"
+        );
+    }
+}
+
+#[test]
 fn detect_api_changes_ts_literal_union_widening_and_import_alias_stay_modified() {
     for (case, before, after) in [
         (

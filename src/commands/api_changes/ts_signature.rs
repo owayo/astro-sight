@@ -111,9 +111,9 @@ fn eval_literal_union(
     }
 }
 
-/// トップレベルに同名の `type_alias_declaration` がちょうど 1 件ある場合だけ RHS を返す。
+/// トップレベルに同名の `type_alias_declaration` がちょうど 1 件ある場合だけ宣言ノードを返す。
 /// interface merge や同名多重宣言、import された alias は解決しない。
-fn unique_top_level_type_alias_value<'a>(
+fn unique_top_level_type_alias_decl<'a>(
     root: tree_sitter::Node<'a>,
     source: &[u8],
     name: &str,
@@ -122,10 +122,88 @@ fn unique_top_level_type_alias_value<'a>(
     let [decl] = decls.as_slice() else {
         return None;
     };
-    if decl.kind() != "type_alias_declaration" {
-        return None;
+    (decl.kind() == "type_alias_declaration").then_some(*decl)
+}
+
+/// トップレベルに同名の `type_alias_declaration` がちょうど 1 件ある場合だけ RHS を返す。
+fn unique_top_level_type_alias_value<'a>(
+    root: tree_sitter::Node<'a>,
+    source: &[u8],
+    name: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    unique_top_level_type_alias_decl(root, source, name)?.child_by_field_name("value")
+}
+
+/// 型エイリアスの型パラメータ列 (`<T extends string = "x">`) を token 列として返す。
+/// 型パラメータが無ければ空の Vec。
+///
+/// **RHS だけを比べて降格してはいけない**: `type Category<T extends string> = "a" | "b"` を
+/// `type Category = "a" | "b"` にすると RHS は不変だが、利用側の `Category<"x">` は
+/// `TS2315: Type 'Category' is not generic.` で落ちる。逆向き (型パラメータの追加) も
+/// `TS2314: Generic type 'Mode' requires 1 type argument(s).` で落ちる。どちらも公開契約の
+/// 破壊なので、fail-closed 規約どおり blocking な api.mod を維持しなければならない。
+///
+/// 個数だけでなく constraint / default / variance modifier (`in` / `out`) / `const` も
+/// 契約なので、列全体を比較する。`T` → `U` の alpha rename も blocking に残るが、これは
+/// false negative を避ける安全側 (降格できるはずのものが降格しないだけ)。
+///
+/// 比較単位は **AST の leaf token (kind + 元テキスト) の列**。整形差 (トークン間の空白・
+/// 改行・コメント) だけを無視し、トークン境界は保つ。
+/// **テキストから空白を除去する正規化にしてはならない** — 2 つの壊れ方がある:
+/// (a) 文字列リテラル**内**の空白まで落ちて `T extends "a b"` と `T extends "ab"` が
+/// 同一になる (`Category<"a b">` が変更後に型エラーになるのに降格してしまう)、
+/// (b) トークン境界が消えて `<T extends string>` と `<Textendsstring>` が衝突する。
+fn type_alias_type_parameter_tokens(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    name: &str,
+) -> Option<Vec<(String, String)>> {
+    let decl = unique_top_level_type_alias_decl(root, source, name)?;
+    let Some(params) = decl.child_by_field_name("type_parameters") else {
+        return Some(Vec::new());
+    };
+    let mut tokens = Vec::new();
+    collect_leaf_tokens(params, source, &mut tokens)?;
+    Some(tokens)
+}
+
+/// ノード配下の leaf token を `(kind, 元テキスト)` の列として集める。
+/// `extra` ノード (コメント等) は整形の一部なので読み飛ばす。
+///
+/// 走査は単一 `TreeCursor` の反復 pre-order (`walk_refs` と同じ方式)。constraint / default
+/// には任意に深い型を書けるため、再帰にするとスタックオーバーフローし得る。
+fn collect_leaf_tokens(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    out: &mut Vec<(String, String)>,
+) -> Option<()> {
+    let mut cursor = node.walk();
+    loop {
+        let current = cursor.node();
+        let skip_subtree = current.is_extra() || current.kind() == "comment";
+        if !skip_subtree {
+            if current.child_count() == 0 {
+                let text =
+                    std::str::from_utf8(source.get(current.start_byte()..current.end_byte())?)
+                        .ok()?;
+                out.push((current.kind().to_string(), text.to_string()));
+            } else if cursor.goto_first_child() {
+                continue;
+            }
+        }
+        // 兄弟へ進む。無ければ親へ戻り、起点まで戻ったら終了。
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return Some(());
+            }
+            if cursor.node().id() == node.id() {
+                return Some(());
+            }
+        }
     }
-    decl.child_by_field_name("value")
 }
 
 /// TypeScript / TSX の公開 type alias が、同一ファイル内で証明できる有限 literal 集合として
@@ -133,6 +211,9 @@ fn unique_top_level_type_alias_value<'a>(
 ///
 /// 値集合の拡大・縮小・置換、import 越し alias、generic / conditional / intersection 等は
 /// 一切降格せず、従来どおり blocking な `api.mod` を維持する。
+///
+/// **RHS の同値だけでは足りない**: 型パラメータ列 (`<T extends string>`) は RHS の外にある
+/// 公開契約なので、old/new で一致することも要求する (`type_alias_type_parameter_tokens`)。
 pub(crate) fn detect_equivalent_literal_union_alias_compatible_mod(
     site: &CompatibleModSite<'_>,
     sources: &mut SignatureSourceCache,
@@ -144,6 +225,11 @@ pub(crate) fn detect_equivalent_literal_union_alias_compatible_mod(
     let src = sources.get(site)?;
     let (old_tree, new_tree) = src.parse_pair(lang)?;
     if old_tree.root_node().has_error() || new_tree.root_node().has_error() {
+        return None;
+    }
+    let old_params = type_alias_type_parameter_tokens(old_tree.root_node(), &src.old, site.name)?;
+    let new_params = type_alias_type_parameter_tokens(new_tree.root_node(), &src.new, site.name)?;
+    if old_params != new_params {
         return None;
     }
     let old_values = eval_named_literal_union(old_tree.root_node(), &src.old, site.name)?;
