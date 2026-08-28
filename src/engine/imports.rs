@@ -234,16 +234,25 @@ fn import_query(lang_id: LangId) -> (&'static str, ImportKind) {
             r#"(preproc_include path: (_) @import.source)"#,
             ImportKind::Include,
         ),
-        LangId::CSharp => (r#"(using_directive (_) @import.source)"#, ImportKind::Use),
+        // 末尾アンカー `.` で **最後の子だけ**を捕捉する。アンカー無しだと
+        // `using Alias = System.Text.StringBuilder;` の alias 名 `Alias` も import 元として
+        // 出てしまい、実在しない依存先が 1 件増える。
+        LangId::CSharp => (r#"(using_directive (_) @import.source .)"#, ImportKind::Use),
+        // 先頭アンカー `.` で clause の **最初の要素だけ**を捕捉する。アンカー無しだと
+        // `use App\Services\Mailer as M;` の alias `M` や、grouped の
+        // `use App\Services\{Mailer as M2};` の `App\Services\M2` (実在しない FQN) が
+        // import 元として出る。Python は `(aliased_import name: (dotted_name))` で
+        // 同じ問題を既に回避しており (Issue 2026-07-10)、alias を出すのが設計意図でない
+        // ことの証左になっている。
         LangId::Php => (
             r#"
             (namespace_use_declaration
               (namespace_use_clause
-                [(qualified_name) (name)] @import.source))
+                . [(qualified_name) (name)] @import.source))
             (namespace_use_declaration
               (namespace_use_group
                 (namespace_use_clause
-                  [(qualified_name) (name)] @import.source)))
+                  . [(qualified_name) (name)] @import.source)))
             "#,
             ImportKind::Use,
         ),

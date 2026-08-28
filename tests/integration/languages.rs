@@ -1426,3 +1426,81 @@ fn non_git_cochange_emits_skipped() {
     assert!(json["entries"].as_array().unwrap().is_empty());
     assert_eq!(json["skipped"]["reason"], "not_git_repository");
 }
+
+/// PHP / C# の import 抽出が alias を import 元として出さないこと。
+///
+/// 旧クエリは `(namespace_use_clause [(qualified_name) (name)] @import.source)` /
+/// `(using_directive (_) @import.source)` とアンカー無しだったため clause の全要素を
+/// 捕捉し、`use App\Services\Mailer as M;` の `M` や、grouped の
+/// `use App\Services\{Mailer as M2};` の `App\Services\M2` (実在しない FQN)、
+/// `using Alias = System.Text.StringBuilder;` の `Alias` が依存先として出ていた。
+/// Python は `(aliased_import name: (dotted_name))` で同じ問題を既に回避しており
+/// (Issue 2026-07-10)、alias を出すのが設計意図でないことの証左になっている。
+///
+/// **完全一致の集合で比較する** — 「含む」だけの assertion では phantom entry の
+/// 混入を検出できない。
+#[test]
+fn php_and_csharp_imports_exclude_aliases() {
+    let repo = TestRepo::new();
+    repo.write(
+        "a.php",
+        "<?php\n\
+use App\\Services\\Mailer as M;\n\
+use App\\Services\\{Mailer as M2, Logger};\n\
+use App\\Plain;\n\
+use function App\\Helpers\\format_date;\n\
+use const App\\Config\\MAX_SIZE;\n",
+    );
+    repo.write(
+        "b.cs",
+        "using Alias = System.Text.StringBuilder;\n\
+using static System.Math;\n\
+using System.Text;\n",
+    );
+
+    let sources = |rel: &str| -> Vec<String> {
+        let out = cargo_bin()
+            .args(["imports", "--path"])
+            .arg(repo.path(rel))
+            .output()
+            .expect("failed to run imports");
+        assert!(
+            out.status.success(),
+            "imports failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("invalid JSON");
+        let mut v: Vec<String> = json["imports"]
+            .as_array()
+            .expect("imports array")
+            .iter()
+            .map(|i| i["src"].as_str().unwrap_or_default().to_string())
+            .collect();
+        v.sort();
+        v
+    };
+
+    let mut want_php = vec![
+        "App\\Config\\MAX_SIZE".to_string(),
+        "App\\Helpers\\format_date".to_string(),
+        "App\\Plain".to_string(),
+        "App\\Services\\Logger".to_string(),
+        // `as M` / `as M2` の 2 行はどちらも Mailer を指す (alias 名は出さない)。
+        "App\\Services\\Mailer".to_string(),
+        "App\\Services\\Mailer".to_string(),
+    ];
+    want_php.sort();
+    assert_eq!(
+        sources("a.php"),
+        want_php,
+        "PHP: alias を import 元にしない"
+    );
+
+    let mut want_cs = vec![
+        "System.Math".to_string(),
+        "System.Text".to_string(),
+        "System.Text.StringBuilder".to_string(),
+    ];
+    want_cs.sort();
+    assert_eq!(sources("b.cs"), want_cs, "C#: alias を import 元にしない");
+}
