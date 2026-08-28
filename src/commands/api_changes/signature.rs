@@ -142,6 +142,51 @@ pub(crate) fn extract_api_signature(
         }
     }
 
+    // Python の class は宣言ヘッダ全体 (`class X(` 〜 body 直前) を signature にする。
+    //
+    // 先頭行 fallback だと、black / ruff が折り返した
+    // `class Payload(\n    TypedDict,\n    total=False,\n):` のヘッダが `class Payload(` に
+    // なり、2 行目以降のキーワード引数が signature に現れない。`python_contract.rs` は
+    // `old_sig` / `new_sig` に `total` の字面があるかで安価に前段フィルタしているため、
+    // 折り返しヘッダでは `total=` の反転を分類できず contract ラベルが失われていた。
+    //
+    // 「丸括弧が閉じていない signature は TypedDict 候補扱いにする」という回避は採らない。
+    // 3 値判定 (`PythonContractDetection`) では解析に失敗すると `PotentialBreakingChange` へ
+    // 倒れるため、無関係な複数行 Python class が広く blocking 化する。signature 抽出側を
+    // 正しくするのが本筋。
+    //
+    // 適用は **Python の class だけ**に閉じる (他言語の class signature 出力は不変)。
+    if lang_id == crate::language::LangId::Python && sym.kind == SymbolKind::Class {
+        let start = tree_sitter::Point {
+            row: sym.range.start.line,
+            column: sym.range.start.column,
+        };
+        let end = tree_sitter::Point {
+            row: sym.range.end.line,
+            column: sym.range.end.column,
+        };
+        if let Some(node) = root.descendant_for_point_range(start, end) {
+            let mut cur = node;
+            loop {
+                if cur.kind() == "class_definition" {
+                    let s = cur.start_byte();
+                    let e = cur
+                        .child_by_field_name("body")
+                        .map(|b| b.start_byte())
+                        .unwrap_or_else(|| cur.end_byte());
+                    if let Some(bytes) = source.get(s..e) {
+                        return normalize_signature_whitespace(bytes);
+                    }
+                    break;
+                }
+                match cur.parent() {
+                    Some(p) => cur = p,
+                    None => break,
+                }
+            }
+        }
+    }
+
     // フォールバック: 先頭行のみ
     lines
         .get(sym.range.start.line)

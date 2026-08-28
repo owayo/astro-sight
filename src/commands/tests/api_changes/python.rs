@@ -221,6 +221,65 @@ fn contract_of<'a>(
         .and_then(|c| c.contract_change.as_ref())
 }
 
+/// black / ruff が折り返したクラスヘッダでも `total=` の反転を分類できること。
+///
+/// `extract_api_signature` は class に対して先頭行だけを返していたため、
+/// `class Payload(\n    TypedDict,\n    total=False,\n):` のヘッダが `class Payload(` になり、
+/// `python_contract.rs` の前段フィルタ (`old_sig` / `new_sig` に `total` の字面があるか) を
+/// 通過できず contract ラベルが失われていた。
+///
+/// レポートの暫定案「丸括弧が閉じていない signature は TypedDict 候補扱いにする」は採らない。
+/// 3 値判定では解析に失敗すると `PotentialBreakingChange` へ倒れるため、無関係な複数行
+/// Python class が広く blocking 化する。signature 抽出側を正しくするのが本筋。
+///
+/// 対照として 1 行ヘッダが従来どおり分類されること
+/// (`typed_dict_total_false_removal_is_classified_as_producer_break`) も維持している。
+#[test]
+fn typed_dict_wrapped_header_total_change_is_still_classified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let before = "\
+from typing import TypedDict
+
+
+class Payload(
+    TypedDict,
+    total=False,
+):
+    a: int
+    b: str
+";
+    git_commit_files(repo, &[("models.py", before)], "initial");
+
+    let after = "\
+from typing import TypedDict
+
+
+class Payload(
+    TypedDict,
+):
+    a: int
+    b: str
+";
+    fs::write(repo.join("models.py"), after).expect("write");
+
+    let diff_files = vec![whole_file_diff("models.py", 9)];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    let contract = contract_of(&api, "Payload")
+        .expect("折り返しヘッダでも total=False の除去は型契約変更として分類されるべき");
+    assert_eq!(
+        contract.kind,
+        crate::models::review::ApiContractChangeKind::TypedDictTotalFalseRemoved
+    );
+    assert_eq!(
+        contract.breaks,
+        crate::models::review::ApiContractSide::Producer
+    );
+}
+
 #[test]
 fn typed_dict_total_false_removal_is_classified_as_producer_break() {
     let dir = tempfile::tempdir().expect("tempdir");
