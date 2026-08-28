@@ -438,3 +438,79 @@ fn cochange_dedups_equivalent_paths_before_max_source_files() {
         "上限超過であることが分かるエラーを返すこと: {combined}"
     );
 }
+
+/// 過去のコミットで削除済みのファイルを共変更候補として提案しないこと。
+///
+/// 共変更の候補は git 履歴から集めるため、削除済みファイルも候補に上がる。履歴上の
+/// 共変更頻度は事実だが、現在は開けるファイルが無いのでアクションが取れない。
+/// レポート (2026-08-28-cochange-deleted-path) の最小再現手順をそのまま fixture 化する。
+///
+/// 対照として「生存している共変更相手は従来どおり提案される」も同じテストで固定する
+/// (削除済み除外が効きすぎて本物の候補まで消していないこと)。
+#[test]
+fn cochange_excludes_candidates_deleted_before_base() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    // a.rs / b.rs / gone.rs を毎回まとめて変更するコミットを 5 回積む。
+    for i in 0..5 {
+        repo.write("src/a.rs", format!("pub fn a() {{ let _ = {i}; }}\n"));
+        repo.write("src/b.rs", format!("pub fn b() {{ let _ = {i}; }}\n"));
+        repo.write("src/gone.rs", format!("pub fn gone() {{ let _ = {i}; }}\n"));
+        repo.commit_all(&format!("change {i}"));
+    }
+    // gone.rs だけを削除する (a.rs は触らないので、a.rs の blame は直前の
+    // 「3 ファイルまとめて変更」コミットを指したまま)。
+    repo.remove_file("src/gone.rs");
+    repo.commit_all("remove gone");
+    // 起点となる未コミット変更。
+    repo.write("src/a.rs", "pub fn a() { let _ = 99; }\n");
+
+    let json = repo.run_json(
+        "cochange",
+        &[
+            "--paths",
+            "src/a.rs",
+            "--min-confidence",
+            "0.0",
+            "--min-samples",
+            "1",
+            "--min-denominator",
+            "1",
+            "--history-limit",
+            "20",
+        ],
+    );
+    let partners: Vec<&str> = json["entries"]
+        .as_array()
+        .expect("entries array")
+        .iter()
+        .map(|e| e["file_b"].as_str().unwrap_or_default())
+        .collect();
+
+    assert!(
+        !partners.contains(&"src/gone.rs"),
+        "削除済みファイルを共変更候補にしないこと: {partners:?}"
+    );
+    // 対照: 生存している相手は引き続き提案される (抑制しすぎていないこと)。
+    assert!(
+        partners.contains(&"src/b.rs"),
+        "生存している共変更相手は引き続き提案されること: {partners:?}"
+    );
+    // 落とした件数を診断で申告する (黙って消さない)。
+    let diag = &json["diagnostics"];
+    assert!(
+        diag["filtered_deleted_candidates"].as_u64().unwrap_or(0) > 0,
+        "削除済み候補を落としたことを diagnostics で申告すること: {diag}"
+    );
+    let reasons: Vec<&str> = diag["reasons"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|r| r.as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.contains("candidate_deleted_at_base")),
+        "reasons に candidate_deleted_at_base が含まれること: {reasons:?}"
+    );
+}

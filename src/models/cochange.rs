@@ -95,6 +95,8 @@ pub enum CoChangeDiagnosticReason {
     /// review 経路では起点過多 (退化した作業ツリー等) で cochange フェーズだけを
     /// 諦め、impact / API 差分 / dead 検出は継続する。
     SourceFilesExceedLimit,
+    /// 候補が base リビジョンに存在しない (過去に削除済み) ため除外した。
+    CandidateDeletedAtBase,
 }
 
 /// 共変更分析の内訳。`entries` が空のときに「共変更が無い」のか
@@ -125,6 +127,11 @@ pub struct CoChangeDiagnostics {
     pub filtered_min_score: usize,
     /// `per_source_limit` で切り捨てた候補ペア数。
     pub truncated_per_source_limit: usize,
+    /// base リビジョンに存在しない (過去のコミットで削除済み) ため落とした候補ペア数。
+    ///
+    /// 追加専用フィールドのため 0 のときは出力しない (既存 JSON 消費側への影響を避ける)。
+    #[serde(default, skip_serializing_if = "crate::models::review::is_zero_usize")]
+    pub filtered_deleted_candidates: usize,
     /// 証拠コミットのうち `git diff-tree` に失敗して変更ファイルを取得できなかった数。
     ///
     /// 失敗コミットは「変更 0 件のコミット」として集計を続行する (= confidence の実効分母

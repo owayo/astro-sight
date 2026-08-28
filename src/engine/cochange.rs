@@ -172,7 +172,17 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
 
     deadline.check("phase4_assemble")?;
 
-    let entries = assemble_entries(opts, &index, &stats, min_denom, &mut diag);
+    // base リビジョンの棚卸しを 1 回だけ行い、削除済みパスの候補を落とす。
+    // 失敗したら None = フィルタ無効 (従来どおりの出力) に倒す。
+    let base_tree_paths = collect_base_tree_paths(dir, base_rev);
+    let entries = assemble_entries(
+        opts,
+        &index,
+        &stats,
+        min_denom,
+        base_tree_paths.as_ref(),
+        &mut diag,
+    );
     diag.finalize();
 
     Ok(CoChangeResult {
@@ -479,6 +489,7 @@ fn assemble_entries(
     index: &EvidenceIndex,
     stats: &ShardStats,
     min_denom: usize,
+    base_tree_paths: Option<&HashSet<String>>,
     diag: &mut CoChangeDiagnostics,
 ) -> Vec<CoChangeEntry> {
     let smoothing_on = !opts.disable_smoothing;
@@ -494,12 +505,53 @@ fn assemble_entries(
             }
             continue;
         }
-        entries.extend(entries_for_source(i, source, evidence, stats, opts, diag));
+        entries.extend(entries_for_source(
+            i,
+            source,
+            evidence,
+            stats,
+            opts,
+            base_tree_paths,
+            diag,
+        ));
     }
 
     // 全体 ranking。smoothing 有効なら score 降順、無効なら confidence 降順。
     entries.sort_by(|a, b| compare_entries_by_ranking(a, b, smoothing_on));
     entries
+}
+
+/// base リビジョンに存在するパス集合を 1 度だけ列挙する。
+///
+/// 共変更の候補は git 履歴から集めるため、**過去に削除済みのファイルも候補になる**。
+/// 「現在は開けるファイルが無いパス」を「一緒に変更すべき候補」として提案しても
+/// アクションが取れないので、候補生成後にここで落とす。
+///
+/// 候補ごとに `git cat-file` を叩くと候補数ぶんプロセスが起動するため、
+/// `git ls-tree -r --name-only -z <rev>` で 1 回だけ棚卸しする。出力は cwd 相対なので
+/// astro-sight の `--dir` 相対規約とそのまま一致する (`-z` で NUL 区切りにするため
+/// 非 ASCII ファイル名の 8 進クォートも起きない)。
+///
+/// git の実行や revision 解決に失敗したら `None` を返し、**フィルタを適用しない**。
+/// 判定できないことを理由に候補を消すと、本物の共変更を黙って落とすことになる
+/// (この機能が消したいのは「削除済みと確定できた候補」だけ)。
+fn collect_base_tree_paths(dir: &str, base: &str) -> Option<HashSet<String>> {
+    let output = Command::new("git")
+        .args(["ls-tree", "-r", "--name-only", "-z", base])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        output
+            .stdout
+            .split(|&b| b == 0)
+            .filter(|seg| !seg.is_empty())
+            .map(|seg| String::from_utf8_lossy(seg).into_owned())
+            .collect(),
+    )
 }
 
 /// 起点 1 件分の候補を閾値でふるい、ランキングして `per_source_limit` で切り詰める。
@@ -514,6 +566,7 @@ fn entries_for_source(
     evidence: &SourceEvidence,
     stats: &ShardStats,
     opts: &CoChangeOptions,
+    base_tree_paths: Option<&HashSet<String>>,
     diag: &mut CoChangeDiagnostics,
 ) -> Vec<CoChangeEntry> {
     let smoothing_on = !opts.disable_smoothing;
@@ -532,6 +585,15 @@ fn entries_for_source(
     for (cand, co) in &stats.per_source_raw[i] {
         let co = *co;
         diag.candidate_pairs += 1;
+        // base リビジョンに存在しない候補 (過去のコミットで削除済み) は落とす。
+        // 履歴上の共変更頻度は事実だが、現在の変更候補としては成立しない。
+        if let Some(paths) = base_tree_paths
+            && !paths.contains(cand.as_str())
+        {
+            diag.filtered_deleted_candidates += 1;
+            diag.add_reason(CoChangeDiagnosticReason::CandidateDeletedAtBase);
+            continue;
+        }
         if co < opts.min_samples {
             diag.filtered_min_samples += 1;
             diag.add_reason(CoChangeDiagnosticReason::BelowMinSamples);
