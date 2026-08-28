@@ -1263,88 +1263,176 @@ pub(crate) fn expand_use_list_edges(
     Some(())
 }
 
-/// `path` ノード (scoped_identifier / identifier / crate / self / super) を解決して
-/// `(resolved_prefix, leaf_name)` を返す。anchor (crate/self/super) を current_module で解決し、
-/// scoped_identifier は再帰的に path → name を展開する。
+/// use path の 1 セグメント。先頭から順に平坦化して保持する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UsePathSegment {
+    /// `crate` (クレートルート起点)
+    Crate,
+    /// `self` (現 module 起点)
+    SelfMod,
+    /// `super` (1 階層上)
+    Super,
+    /// 通常の識別子
+    Name(String),
+}
+
+/// `scoped_identifier` の入れ子を先頭から順の平坦なセグメント列へ畳む。
 ///
-/// 戻り値:
-/// - `Some((prefix, Some(name)))`: scoped_identifier の終端で name 部分を抽出した
-/// - `Some((prefix, None))`: anchor 単体 (super::, crate:: 等) のみで終わった
-/// - `None`: 判定不能 (root を超える super::、不正な構造)
-pub(crate) fn resolve_use_path_node(
+/// **path 位置だけを anchor として扱ってはいけない**: tree-sitter-rust は
+/// `super::super::x` の 2 つ目の `super` を `scoped_identifier` の **name 位置**へ置く。
+/// name 位置のテキストを無条件に識別子として扱う実装だと、`"super"` が文字列として
+/// モジュールパスに積まれ、2 段以上の `super` を含む再エクスポートの解決が壊れる。
+/// ノード kind で分類してから解決すれば、path / name のどちらに来ても同じ結果になる。
+fn flatten_use_path(
     node: tree_sitter::Node<'_>,
     source: &[u8],
-    path_prefix: &[String],
-    current_module: &[String],
-) -> Option<(Vec<String>, Option<String>)> {
+    out: &mut Vec<UsePathSegment>,
+) -> Option<()> {
     match node.kind() {
+        "crate" => {
+            out.push(UsePathSegment::Crate);
+            Some(())
+        }
+        "self" => {
+            out.push(UsePathSegment::SelfMod);
+            Some(())
+        }
+        "super" => {
+            out.push(UsePathSegment::Super);
+            Some(())
+        }
+        "identifier" => {
+            out.push(UsePathSegment::Name(
+                node.utf8_text(source).ok()?.trim().to_string(),
+            ));
+            Some(())
+        }
         "scoped_identifier" => {
             // tree-sitter-rust grammar は scoped_identifier で path/name の field 名を出さない。
-            // named children は最大 2 つ: [path, name] または [name] のみ (path が省略された
-            // 場合は crate root レベルの単一 identifier 扱い)。
+            // named children は最大 2 つ: [path, name] または [name] のみ
+            // (path が省略された場合は crate root レベルの単一 identifier 扱い)。
             let mut named: Vec<tree_sitter::Node<'_>> = Vec::new();
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 named.push(child);
             }
             match named.as_slice() {
-                [name_node] => {
-                    let name_text = name_node.utf8_text(source).ok()?.trim().to_string();
-                    Some((path_prefix.to_vec(), Some(name_text)))
-                }
+                [only] => flatten_use_path(*only, source, out),
                 [path_node, name_node] => {
-                    let name_text = name_node.utf8_text(source).ok()?.trim().to_string();
-                    let (prefix, intermediate_leaf) =
-                        resolve_use_path_node(*path_node, source, path_prefix, current_module)?;
-                    let mut full_prefix = prefix;
-                    if let Some(leaf) = intermediate_leaf {
-                        full_prefix.push(leaf);
-                    }
-                    Some((full_prefix, Some(name_text)))
+                    flatten_use_path(*path_node, source, out)?;
+                    flatten_use_path(*name_node, source, out)
                 }
                 _ => None, // 想定外の named children 数
             }
         }
-        "identifier" => {
-            let text = node.utf8_text(source).ok()?.trim().to_string();
-            Some((path_prefix.to_vec(), Some(text)))
-        }
-        "crate" => {
-            // crate root 起点: 現 prefix を捨ててルート (空) 起点にする。
-            Some((Vec::new(), None))
-        }
-        "self" => {
-            // 現 module 起点。current_module を prefix に積む (まだ何も積んでいない時のみ)。
-            if path_prefix.is_empty() {
-                Some((current_module.to_vec(), None))
-            } else {
-                Some((path_prefix.to_vec(), None))
-            }
-        }
-        "super" => {
-            // 現 module から 1 階層上。
-            let mut effective = if path_prefix.is_empty() {
-                current_module.to_vec()
-            } else {
-                path_prefix.to_vec()
-            };
-            effective.pop()?;
-            Some((effective, None))
-        }
         _ => {
-            // 知らない kind は子供を再帰 walk して可能な解決を試みる。
+            // 知らない kind は子供を再帰 walk して可能な解決を試みる (従来の保守姿勢を維持)。
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                if child.is_named()
-                    && let Some(result) =
-                        resolve_use_path_node(child, source, path_prefix, current_module)
-                {
-                    return Some(result);
+                if child.is_named() {
+                    let mut sub = Vec::new();
+                    if flatten_use_path(child, source, &mut sub).is_some() {
+                        out.extend(sub);
+                        return Some(());
+                    }
                 }
             }
             None
         }
     }
+}
+
+/// use path のノードを (モジュール prefix, 末尾の item 名) へ解決する。
+///
+/// 先頭から続く `crate` / `self` / `super` を module anchor として消費し、残りの
+/// 識別子列のうち末尾を item、それ以外を module パスとして扱う。
+/// クレートルートを越える `super`、anchor が先頭以外に現れる不正な path、
+/// 解決できないノードはすべて `None` (fail-closed)。
+pub(crate) fn resolve_use_path_node(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    path_prefix: &[String],
+    current_module: &[String],
+) -> Option<(Vec<String>, Option<String>)> {
+    let mut segments = Vec::new();
+    flatten_use_path(node, source, &mut segments)?;
+    if segments.is_empty() {
+        return None;
+    }
+
+    let mut prefix: Vec<String> = path_prefix.to_vec();
+    let mut names: Vec<String> = Vec::new();
+    for (idx, segment) in segments.iter().enumerate() {
+        match segment {
+            UsePathSegment::Crate => {
+                // 先頭以外の `crate` は Rust として不正。
+                if idx != 0 {
+                    return None;
+                }
+                prefix = Vec::new();
+            }
+            UsePathSegment::SelfMod => {
+                if idx != 0 {
+                    return None;
+                }
+                if prefix.is_empty() {
+                    prefix = current_module.to_vec();
+                }
+            }
+            UsePathSegment::Super => {
+                // `super` は先頭から連続する場合のみ有効 (`a::super::b` は不正)。
+                if !names.is_empty() {
+                    return None;
+                }
+                if idx == 0 && prefix.is_empty() {
+                    prefix = current_module.to_vec();
+                }
+                // クレートルートを越える `super` は解決不能。
+                prefix.pop()?;
+            }
+            UsePathSegment::Name(name) => names.push(name.clone()),
+        }
+    }
+
+    // grouped 形式 (`use a::b::{self};`) では、list 要素として**単独の `self`** が
+    // path_prefix = ["a", "b"] を積んだ状態で届く (`expand_use_list_edges` が list の各要素へ
+    // 解決済み prefix を渡すため)。直接形 `use a::b::self;` と同値なので、prefix の末尾を
+    // item へ畳んで同じ edge を作る。畳まないと `leaf_name` が None になり
+    // `expand_rust_use_tree_edges_ast` が Named edge を生成せず、private module 配下の
+    // 公開 module をこの形で再エクスポートした場合に配下の API 削除を見逃す。
+    //
+    // path_prefix が空のとき (`use self::{a, b};` の path 位置に来る `self` など) は
+    // module anchor としての `self` なので畳まない。
+    if names.is_empty()
+        && segments.as_slice() == [UsePathSegment::SelfMod]
+        && !path_prefix.is_empty()
+    {
+        let item = prefix.pop()?;
+        return Some((prefix, Some(item)));
+    }
+
+    // 末尾の `self` (`use a::b::self;` = `use a::b::{self};`) は「その module 自身」の
+    // 再エクスポート。`self` は予約語なので item 名にはなり得ず、この位置に現れたら
+    // 必ず trailing self 形式。直前の名前を item にする。
+    //
+    // tree-sitter は末尾の `self` を kind `self` ではなく `identifier` として返すため
+    // (path 位置の `self` だけが kind `self` になる)、ここは `Name("self")` として届く。
+    // 畳まないと「`self` という名前の item」という実在しない edge を作る。
+    if names.last().is_some_and(|n| n == "self") {
+        names.pop();
+        if names.is_empty() {
+            // `crate::self` のような、直前の名前が無い形は解決不能 (fail-closed)。
+            return None;
+        }
+    }
+    // 末尾以外に現れる `self` は Rust として不正なので解決しない。
+    if names.iter().any(|n| n == "self") {
+        return None;
+    }
+
+    let leaf = names.pop();
+    prefix.extend(names);
+    Some((prefix, leaf))
 }
 
 /// Cargo.toml のテキストから `[lib]` セクションが宣言されているかを判定する。

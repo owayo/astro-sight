@@ -690,6 +690,257 @@ fn detect_api_changes_private_module_super_reexport_stays_in_removed() {
     );
 }
 
+/// 多段 `super::super::` の re-export が解決されること。
+///
+/// tree-sitter-rust は `super::super::x` の 2 つ目の `super` を `scoped_identifier` の
+/// **name 位置**へ置くため、path 位置だけを anchor として扱う旧実装では `"super"` が
+/// 文字列としてモジュールパスに積まれ、`app::a::super::wifi::found` のような実在しない
+/// パスへ解決していた。結果、多段 super 経由で再エクスポートされた公開 API の削除が
+/// api.rm から漏れていた。既存テストは 1 段の `super` しかカバーしていなかった。
+///
+/// 対照として、クレートルートを越える `super` は解決不能 (= 公開 API 面にしない) を
+/// 同じテストで固定する。
+#[test]
+fn detect_api_changes_multi_level_super_reexport_resolves() {
+    // src/a/b/prelude.rs の `super::super::super::wifi::found` は
+    // (a::b::prelude) → pop → (a::b) → pop → (a) → pop → (root) 起点で
+    // wifi::found に解決される。
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+            ),
+            ("src/lib.rs", "mod wifi;\npub mod a;\n"),
+            ("src/a/mod.rs", "pub mod b;\n"),
+            ("src/a/b/mod.rs", "pub mod prelude;\n"),
+            (
+                "src/a/b/prelude.rs",
+                "pub use super::super::super::wifi::found;\n",
+            ),
+            ("src/wifi/mod.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+        ],
+        "base",
+    );
+    fs::write(repo.join("src/wifi/mod.rs"), "\n").expect("write");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/wifi/mod.rs".to_string(),
+        new_path: "src/wifi/mod.rs".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 1,
+        }],
+        deleted_old_source: None,
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    let removed: Vec<&str> = api
+        .removed
+        .iter()
+        .chain(api.removed_dead.iter())
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(
+        removed.iter().any(|n| n.ends_with("found")),
+        "多段 super:: re-export も解決され、削除は api.rm に残るべき。got: {removed:?}"
+    );
+}
+
+/// grouped trailing `self` (`pub use outer::m::{self};`) が直接形と同じ edge を作ること。
+///
+/// list 経路では単独の `self` が path_prefix = ["outer","m"] を積んだ状態で届くため、
+/// 畳まないと leaf_name が None になり Named edge が生成されない。その結果、private な
+/// `outer` 配下の公開 module `m` をこの形で再エクスポートしても、`m` 配下の公開 API 削除が
+/// api.rm から漏れる。alias 付き (`{self as alias}`) も同経路。
+#[test]
+fn detect_api_changes_grouped_trailing_self_reexport_resolves() {
+    for (case, reexport) in [
+        ("grouped", "pub use outer::m::{self};\n"),
+        ("grouped alias", "pub use outer::m::{self as api};\n"),
+        ("direct", "pub use outer::m::self as api2;\n"),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+                ),
+                ("src/lib.rs", &format!("mod outer;\n{reexport}")),
+                ("src/outer/mod.rs", "pub mod m;\n"),
+                ("src/outer/m.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+            ],
+            "base",
+        );
+        fs::write(repo.join("src/outer/m.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/outer/m.rs".to_string(),
+            new_path: "src/outer/m.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.iter().any(|n| n.ends_with("found")),
+            "{case}: module 自身の再エクスポート経由でも削除は api.rm に残るべき。got: {removed:?}"
+        );
+    }
+}
+
+/// `resolve_use_path_node` の anchor 解決を直接固定する。
+///
+/// 段数分だけ pop すること、ルートを越えたら None になること (fail-closed)、
+/// `crate` / `self` が従来どおり動くこと、`super` が先頭以外に現れたら None になることを
+/// 同じテストで対にして押さえる。
+#[test]
+fn resolve_use_path_node_handles_multi_level_anchors() {
+    use crate::commands::api_changes::resolve_use_path_node;
+
+    // use_declaration > (visibility_modifier) argument
+    fn argument<'t>(tree: &'t tree_sitter::Tree) -> tree_sitter::Node<'t> {
+        let root = tree.root_node();
+        let decl = root.named_child(0).expect("use_declaration");
+        decl.child_by_field_name("argument").expect("argument")
+    }
+
+    let current_module = vec!["a".to_string(), "b".to_string()];
+
+    for (src, want) in [
+        // 1 段: a::b → a
+        (
+            "use super::x;",
+            Some((vec!["a".to_string()], Some("x".to_string()))),
+        ),
+        // 2 段: a::b → root
+        (
+            "use super::super::x;",
+            Some((Vec::<String>::new(), Some("x".to_string()))),
+        ),
+        // 3 段: ルートを越えるので解決不能
+        ("use super::super::super::x;", None),
+        // crate anchor はルート起点
+        (
+            "use crate::m::x;",
+            Some((vec!["m".to_string()], Some("x".to_string()))),
+        ),
+        // self anchor は現 module 起点
+        (
+            "use self::m::x;",
+            Some((
+                vec!["a".to_string(), "b".to_string(), "m".to_string()],
+                Some("x".to_string()),
+            )),
+        ),
+        // anchor 無しは path_prefix (ここでは空) 起点
+        (
+            "use m::x;",
+            Some((vec!["m".to_string()], Some("x".to_string()))),
+        ),
+        // 対照: super が先頭以外に現れる不正な path は解決しない
+        ("use m::super::x;", None),
+        // `self` anchor に続く `super` は有効 (先頭からの連続部分とみなす)
+        (
+            "use self::super::x;",
+            Some((vec!["a".to_string()], Some("x".to_string()))),
+        ),
+        // 末尾の `self` は `use a::b::{self};` と同値で「module 自身」の再エクスポート。
+        // tree-sitter は末尾 `self` を kind `identifier` として返すため、畳まないと
+        // 「`self` という名前の item」という実在しない edge になる。
+        (
+            "use outer::m::self;",
+            Some((vec!["outer".to_string()], Some("m".to_string()))),
+        ),
+        (
+            "use crate::m::self;",
+            Some((Vec::<String>::new(), Some("m".to_string()))),
+        ),
+        // 対照: 末尾以外の `self` は Rust として不正なので解決しない
+        ("use m::self::x;", None),
+    ] {
+        let tree =
+            crate::engine::parser::parse_source(src.as_bytes(), crate::language::LangId::Rust)
+                .expect("parse");
+        let node = argument(&tree);
+        let got = resolve_use_path_node(node, src.as_bytes(), &[], &current_module);
+        assert_eq!(got, want, "{src}");
+    }
+
+    // path_prefix が非空のとき (scoped_use_list / use_wildcard 経路から呼ばれる形) の
+    // anchor 挙動を固定する。`self` は prefix が非空なら current_module を積まず prefix を
+    // そのまま使い、`super` は prefix を起点に pop、`crate` は prefix を捨ててルート起点。
+    let prefix = vec!["p".to_string(), "q".to_string()];
+    for (src, want) in [
+        (
+            "use self::x;",
+            Some((
+                vec!["p".to_string(), "q".to_string()],
+                Some("x".to_string()),
+            )),
+        ),
+        (
+            "use super::x;",
+            Some((vec!["p".to_string()], Some("x".to_string()))),
+        ),
+        (
+            "use crate::x;",
+            Some((Vec::<String>::new(), Some("x".to_string()))),
+        ),
+        (
+            "use m::x;",
+            Some((
+                vec!["p".to_string(), "q".to_string(), "m".to_string()],
+                Some("x".to_string()),
+            )),
+        ),
+    ] {
+        let tree =
+            crate::engine::parser::parse_source(src.as_bytes(), crate::language::LangId::Rust)
+                .expect("parse");
+        let node = argument(&tree);
+        let got = resolve_use_path_node(node, src.as_bytes(), &prefix, &current_module);
+        assert_eq!(got, want, "非空 prefix: {src}");
+    }
+
+    // grouped 形式 (`use p::q::{self};`) の list 要素として届く**単独 `self`**。
+    // `expand_use_list_edges` が path_prefix = ["p","q"] を積んだ状態で渡すため、
+    // 末尾を item へ畳んで直接形 `use p::q::self;` と同じ結果にする。
+    let src = "use self;";
+    let tree = crate::engine::parser::parse_source(src.as_bytes(), crate::language::LangId::Rust)
+        .expect("parse");
+    let node = argument(&tree);
+    assert_eq!(
+        resolve_use_path_node(node, src.as_bytes(), &prefix, &current_module),
+        Some((vec!["p".to_string()], Some("q".to_string()))),
+        "非空 prefix + 単独 self は prefix の末尾を item へ畳む"
+    );
+    // 対照: path_prefix が空なら module anchor としての `self` なので畳まない
+    // (`use self::{a, b};` の path 位置がこの形で来る)。
+    assert_eq!(
+        resolve_use_path_node(node, src.as_bytes(), &[], &current_module),
+        Some((current_module.clone(), None)),
+        "空 prefix + 単独 self は module anchor のまま"
+    );
+}
+
 /// `pub use crate::{wifi::found /* } */};` のような grouped use 内ブロックコメントの `}` で
 /// bracket-balance が誤って崩れない (codex pre-merge レビュー 3 回目 Warning 指摘 #2 の回帰)。
 #[test]
