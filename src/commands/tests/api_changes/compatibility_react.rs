@@ -638,6 +638,130 @@ fn detect_object_members_value_only_change_stays_blocking() {
     assert!(result.is_none(), "値のみ変更は blocking 維持");
 }
 
+/// 型注釈 / `as` / `satisfies` の変更は member キーの追加が同居していても blocking を維持する。
+///
+/// `unused_object_members` は object literal の member キーと値しか見ておらず、
+/// `variable_declarator` の型注釈 (`const cfg: { alpha: number } = ...`) と
+/// `as const` / `satisfies T` の wrapper を無条件に剥がしていた。そのため
+/// `cfg: { alpha: number }` → `cfg: { alpha: number | string; beta: number }` のように
+/// 「既存メンバーの型変更」と「無関係なキー追加」が同一 diff に同居すると
+/// has_added_member が立って降格が成立し、tsc が TS2322 で落ちる変更が非 blocking になっていた。
+/// 既存コードが `entry_values` で「値の差し替え」に対して明示的に防いでいる問題と同型で、
+/// 型面だけ穴が残っていた。
+///
+/// 対照ケース (型注釈 / wrapper が両側同一なら従来どおり降格する) を同じテストに内蔵する。
+#[test]
+fn detect_object_members_type_annotation_or_wrapper_change_stays_blocking() {
+    for (case, before, after, want_compatible) in [
+        (
+            // TS2322: 注釈の型が変わっている (キー追加が同居)
+            "型注釈の型変更 + キー追加",
+            "export const c: { alpha: number } = { alpha: 1 };\n",
+            "export const c: { alpha: number | string; beta: number } = { alpha: 1, beta: 2 };\n",
+            false,
+        ),
+        (
+            "型注釈の追加",
+            "export const c = { alpha: 1 };\n",
+            "export const c: { alpha: number; beta: number } = { alpha: 1, beta: 2 };\n",
+            false,
+        ),
+        (
+            "型注釈の削除",
+            "export const c: { alpha: number } = { alpha: 1 };\n",
+            "export const c = { alpha: 1, beta: 2 };\n",
+            false,
+        ),
+        (
+            // `as const` を外すと literal 型が widen して利用側の型が変わる
+            "as const の削除",
+            "export const c = { alpha: 1 } as const;\n",
+            "export const c = { alpha: 1, beta: 2 };\n",
+            false,
+        ),
+        (
+            "as const の追加",
+            "export const c = { alpha: 1 };\n",
+            "export const c = { alpha: 1, beta: 2 } as const;\n",
+            false,
+        ),
+        (
+            "satisfies の型変更",
+            "export const c = { alpha: 1 } satisfies Shape;\n",
+            "export const c = { alpha: 1, beta: 2 } satisfies OtherShape;\n",
+            false,
+        ),
+        (
+            // 対照: 型注釈も wrapper も同一なら、純粋な member 追加は従来どおり降格する。
+            "型注釈同一 + キー追加のみ",
+            "export const c: Shape = { alpha: 1 };\n",
+            "export const c: Shape = { alpha: 1, beta: 2 };\n",
+            true,
+        ),
+        (
+            // 対照: wrapper が同一なら降格する。
+            "as const 同一 + キー追加のみ",
+            "export const c = { alpha: 1 } as const;\n",
+            "export const c = { alpha: 1, beta: 2 } as const;\n",
+            true,
+        ),
+        // --- homogeneous record の entry 側 wrapper ---
+        // トップレベルの wrapper / 型注釈は不変で、共通キーの値も同じなので
+        // 「キー追加のみ」に見えるが、公開型は `{ readonly alpha: 1 }` から
+        // `{ alpha: number; beta: number }` へ変わる。
+        (
+            "record entry の as const 削除",
+            "export const c = { google: { alpha: 1 } as const };\n",
+            "export const c = { google: { alpha: 1, beta: 2 } };\n",
+            false,
+        ),
+        (
+            "record entry の as const 追加",
+            "export const c = { google: { alpha: 1 } };\n",
+            "export const c = { google: { alpha: 1, beta: 2 } as const };\n",
+            false,
+        ),
+        (
+            "record entry の satisfies 型変更",
+            "export const c = { google: { alpha: 1 } satisfies Shape };\n",
+            "export const c = { google: { alpha: 1, beta: 2 } satisfies OtherShape };\n",
+            false,
+        ),
+        (
+            // 対照: entry の wrapper が同一なら従来どおり降格する。
+            "record entry の wrapper 同一 + member 追加のみ",
+            "export const c = { google: { alpha: 1 } as const };\n",
+            "export const c = { google: { alpha: 1, beta: 2 } as const };\n",
+            true,
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(repo, &[("config.tsx", before)], "initial");
+        fs::write(repo.join("config.tsx"), after).expect("write");
+        let result = detect_object_members_compatible_mod(
+            &CompatibleModSite {
+                dir: repo.to_str().expect("utf-8 path"),
+                base: "HEAD",
+                old_path: "config.tsx",
+                new_path: "config.tsx",
+                name: "c",
+                kind: "constant",
+                old_sig: "old",
+                new_sig: "new",
+                lang_id: Some(crate::language::LangId::Tsx),
+            },
+            &mut SignatureSourceCache::default(),
+        );
+        assert_eq!(
+            result.is_some(),
+            want_compatible,
+            "{case}: 降格判定が期待と異なる: {result:?}"
+        );
+    }
+}
+
 /// 削除 key なし、追加 key ありの純粋な member 追加は compatible に降格する。
 #[test]
 fn detect_object_members_pure_member_addition_is_compatible() {

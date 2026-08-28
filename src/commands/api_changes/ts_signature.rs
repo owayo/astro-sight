@@ -175,7 +175,7 @@ fn type_alias_type_parameter_tokens(
 fn collect_leaf_tokens(
     node: tree_sitter::Node<'_>,
     source: &[u8],
-    out: &mut Vec<(String, String)>,
+    out: &mut LeafTokens,
 ) -> Option<()> {
     let mut cursor = node.walk();
     loop {
@@ -477,6 +477,26 @@ pub(crate) fn detect_object_members_compatible_mod(
     let new_keys = extract_object_member_keys(&src.new, lang, site.name)?;
     if old_keys.record_keys.is_some() != new_keys.record_keys.is_some() {
         return None;
+    }
+    // 型注釈と `as` / `satisfies` は object literal の外にある公開契約。member キーだけで
+    // 降格すると、`cfg: { alpha: number }` → `cfg: { alpha: number | string; beta: number }`
+    // のように「無関係なキー追加」が同居した型変更が後方互換に見えてしまう (tsc は TS2322 で
+    // 落ちる)。`as const` の付け外しや `satisfies T` の型変更も同じ理由で blocking に残す。
+    if old_keys.declarator_type != new_keys.declarator_type
+        || old_keys.wrappers != new_keys.wrappers
+    {
+        return None;
+    }
+    // record entry を包む wrapper も同様。トップレベルだけ見ると
+    // `{ google: { alpha: 1 } as const }` → `{ google: { alpha: 1, beta: 2 } }` を
+    // 「キー追加のみ」として降格してしまう。両側に残る record key について比較する
+    // (片側にしか無い key は追加/削除であり、その可否は別途判定する)。
+    for (key, old_wrappers) in &old_keys.entry_wrappers {
+        if let Some(new_wrappers) = new_keys.entry_wrappers.get(key)
+            && new_wrappers != old_wrappers
+        {
+            return None;
+        }
     }
     let has_added_member = new_keys
         .member_keys
@@ -1190,6 +1210,28 @@ pub(crate) struct ObjectMemberKeys {
     /// (`{a: () => {}}` → `{a: 42, b: () => {}}`) を検出できないため、
     /// 両側に残存するキーの値同一性を照合する用途で持つ。
     pub(crate) entry_values: HashMap<ObjectEntryKey, String>,
+    /// `variable_declarator` の型注釈 (`const cfg: { alpha: number } = ...`) の token 列。
+    /// 注釈が無ければ `None`。
+    ///
+    /// **型注釈を見ずに member キーだけで降格してはいけない**: `cfg: { alpha: number }` →
+    /// `cfg: { alpha: number | string; beta: number }` は「キー追加」だけを見ると後方互換に
+    /// 見えるが、公開されているのは注釈の型なので利用側は `TS2322` で落ちる。
+    pub(crate) declarator_type: Option<LeafTokens>,
+    /// object literal を包む `as` / `satisfies` の連なり。要素は
+    /// `(ノード種別, 型部分の token 列)`。冗長括弧は整形なので記録しない。
+    ///
+    /// `as const` の付け外しや `satisfies T` の型変更は公開契約の変更なので、
+    /// 無条件に剥がして member キーだけ比較すると誤って降格する。
+    pub(crate) wrappers: Vec<ObjectLiteralWrapper>,
+    /// homogeneous record のとき: record key → その entry (nested object) を包む
+    /// `as` / `satisfies` の連なり。
+    ///
+    /// トップレベルの `wrappers` だけでは entry 側の wrapper 変更を見逃す。
+    /// `{ google: { alpha: 1 } as const }` → `{ google: { alpha: 1, beta: 2 } }` は
+    /// トップレベルの wrapper も型注釈も不変で、共通キーの値も同じなので「キー追加のみ」に
+    /// 見えるが、公開型は `{ readonly alpha: 1 }` から `{ alpha: number; beta: number }` へ
+    /// 変わる。
+    pub(crate) entry_wrappers: HashMap<String, Vec<ObjectLiteralWrapper>>,
 }
 
 /// `entry_values` のキー。flat は top-level key 単独、record は (record key, member key)。
@@ -1237,8 +1279,64 @@ pub(crate) fn extract_object_member_keys(
         return None;
     }
     let value = decls[0].child_by_field_name("value")?;
-    let obj = unwrap_to_object_literal(value)?;
-    collect_object_keys(obj, source)
+    let (obj, wrappers) = unwrap_to_object_literal_with_wrappers(value, source)?;
+    // 型注釈は object literal の外にある公開契約なので、member キーとは別に持って比較する。
+    let declarator_type = match decls[0].child_by_field_name("type") {
+        Some(annotation) => {
+            let mut tokens = Vec::new();
+            collect_leaf_tokens(annotation, source, &mut tokens)?;
+            Some(tokens)
+        }
+        None => None,
+    };
+    let mut keys = collect_object_keys(obj, source)?;
+    keys.declarator_type = declarator_type;
+    keys.wrappers = wrappers;
+    Some(keys)
+}
+
+/// AST の leaf token 列。要素は `(ノード種別, 元テキスト)`。
+pub(crate) type LeafTokens = Vec<(String, String)>;
+
+/// object literal を包む `as` / `satisfies` の 1 段。`(ノード種別, 型部分の token 列)`。
+pub(crate) type ObjectLiteralWrapper = (String, LeafTokens);
+
+/// `unwrap_to_object_literal` の wrapper 記録版。剥がした `as` / `satisfies` を
+/// `(ノード種別, 型部分の token 列)` として順に返す。冗長括弧は整形なので記録しない。
+///
+/// 型部分は「wrapper 全体の leaf token 列」から「内側の式の leaf token 列」を除いた残り。
+/// leaf の pre-order 走査では内側の式 (`named_child(0)` = 最左) のトークンが先に並ぶため、
+/// 先頭ぶんを落とせば `as const` / `satisfies Shape` の部分がそのまま残る。
+fn unwrap_to_object_literal_with_wrappers<'tree>(
+    node: tree_sitter::Node<'tree>,
+    source: &[u8],
+) -> Option<(tree_sitter::Node<'tree>, Vec<ObjectLiteralWrapper>)> {
+    let mut cur = node;
+    let mut wrappers = Vec::new();
+    loop {
+        match cur.kind() {
+            "object" => return Some((cur, wrappers)),
+            "parenthesized_expression" => {
+                cur = cur.named_child(0)?;
+            }
+            "as_expression" | "satisfies_expression" => {
+                let inner = cur.named_child(0)?;
+                let mut whole = Vec::new();
+                collect_leaf_tokens(cur, source, &mut whole)?;
+                let mut inner_tokens = Vec::new();
+                collect_leaf_tokens(inner, source, &mut inner_tokens)?;
+                // 長さだけでなく prefix 一致も確認する。grammar 変更や異常 AST で
+                // 内側の式が最左でなくなった場合に、無関係な token を型部分として
+                // 拾わず fail-closed に倒れる。
+                if !whole.starts_with(&inner_tokens) {
+                    return None;
+                }
+                wrappers.push((cur.kind().to_string(), whole[inner_tokens.len()..].to_vec()));
+                cur = inner;
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// `expr as const` / `expr satisfies T` / 冗長括弧 `(expr)` をはがして object literal
@@ -1267,6 +1365,7 @@ pub(crate) fn collect_object_keys(
     let mut top_level_keys = HashSet::new();
     let mut entry_values: HashMap<ObjectEntryKey, String> = HashMap::new();
     let mut record_member_keys: Option<HashSet<String>> = None;
+    let mut entry_wrappers: HashMap<String, Vec<ObjectLiteralWrapper>> = HashMap::new();
     let mut has_object_value = false;
     let mut has_non_object_value = false;
     let mut cursor = obj.walk();
@@ -1277,8 +1376,11 @@ pub(crate) fn collect_object_keys(
                 let key_text = object_key_text(key, source)?;
                 top_level_keys.insert(key_text.clone());
                 let value = child.child_by_field_name("value")?;
-                if let Some(nested) = unwrap_to_object_literal(value) {
+                if let Some((nested, nested_wrappers)) =
+                    unwrap_to_object_literal_with_wrappers(value, source)
+                {
                     has_object_value = true;
+                    entry_wrappers.insert(key_text.clone(), nested_wrappers);
                     let nested_keys = collect_flat_object_keys(nested, source)?;
                     // record は nested の member 単位で値を持つ。entry 全体をまとめて
                     // 比較すると member キーの追加/削除だけで差分になり、本判定の
@@ -1314,12 +1416,20 @@ pub(crate) fn collect_object_keys(
             member_keys: record_member_keys?,
             record_keys: Some(top_level_keys),
             entry_values,
+            // 宣言側の情報は object literal から見えないので、呼び出し元
+            // (`extract_object_member_keys`) が埋める。
+            declarator_type: None,
+            wrappers: Vec::new(),
+            entry_wrappers,
         });
     }
     Some(ObjectMemberKeys {
         member_keys: top_level_keys,
         record_keys: None,
         entry_values,
+        declarator_type: None,
+        wrappers: Vec::new(),
+        entry_wrappers,
     })
 }
 
