@@ -838,6 +838,89 @@ fn detect_api_changes_wildcard_reexport_exposes_module_and_pub_descendants() {
     }
 }
 
+/// glob import は source namespace の明示 item / named import に shadow される。
+///
+/// Rust では同一 namespace の明示 item・named import が glob import を shadow するため
+/// (Rust Reference: use declarations)、root に `pub mod api;` があれば外部の `crate::api` は
+/// root の `api` であって `internal::api` ではない。glob の target 配下を無条件に
+/// 到達可能化すると、公開されていない `internal::api::found` の削除を api.rm へ誤計上する。
+///
+/// 対照として「shadow が無ければ従来どおり到達可能」も同じテストで固定する。
+#[test]
+fn detect_api_changes_wildcard_reexport_respects_glob_shadowing() {
+    for (case, lib_rs, extra, want_reported) in [
+        (
+            // root の `pub mod api` が glob の `api` を shadow する
+            "明示 module による shadow",
+            "mod internal;\npub mod api;\npub use internal::*;\n",
+            vec![("src/api.rs", "pub fn other() -> u32 {\n    1\n}\n")],
+            false,
+        ),
+        (
+            // private な `mod api` でも同じ namespace を占めるので shadow する
+            "private module による shadow",
+            "mod internal;\nmod api;\npub use internal::*;\n",
+            vec![("src/api.rs", "pub fn other() -> u32 {\n    1\n}\n")],
+            false,
+        ),
+        (
+            // named re-export が同名を持ち込む場合も shadow する
+            "named re-export による shadow",
+            "mod internal;\nmod other;\npub use other::thing as api;\npub use internal::*;\n",
+            vec![("src/other.rs", "pub fn thing() -> u32 {\n    1\n}\n")],
+            false,
+        ),
+        (
+            // 対照: shadow が無ければ従来どおり到達可能
+            "shadow なし",
+            "mod internal;\npub use internal::*;\n",
+            vec![],
+            true,
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        let mut files: Vec<(&str, &str)> = vec![
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\n\n[lib]\nname = \"app_lib\"\n",
+            ),
+            ("src/lib.rs", lib_rs),
+            ("src/internal/mod.rs", "pub mod api;\n"),
+            ("src/internal/api.rs", "pub fn found() -> u32 {\n    0\n}\n"),
+        ];
+        files.extend(extra.iter().copied());
+        git_commit_files(repo, &files, "base");
+
+        fs::write(repo.join("src/internal/api.rs"), "\n").expect("write");
+        let diff_files = vec![crate::models::impact::DiffFile {
+            old_path: "src/internal/api.rs".to_string(),
+            new_path: "src/internal/api.rs".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 1,
+            }],
+            deleted_old_source: None,
+        }];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        let reported = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .any(|s| s.name.ends_with("found"));
+        assert_eq!(
+            reported,
+            want_reported,
+            "{case}: api.rm への計上が期待と異なる (removed={:?} removed_dead={:?})",
+            api.removed.iter().map(|s| &s.name).collect::<Vec<_>>(),
+            api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+}
+
 /// grouped trailing `self` (`pub use outer::m::{self};`) が直接形と同じ edge を作ること。
 ///
 /// list 経路では単独の `self` が path_prefix = ["outer","m"] を積んだ状態で届くため、

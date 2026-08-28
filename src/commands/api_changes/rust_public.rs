@@ -770,6 +770,18 @@ fn compute_reexport_reachable_modules(
     all_modules: &std::collections::HashMap<Vec<String>, Vec<String>>,
 ) -> std::collections::HashSet<Vec<String>> {
     let mut reachable = public_modules.clone();
+    // glob shadow 判定用: Named re-export が source namespace へ持ち込む名前。
+    let named_exports_in_source: std::collections::HashSet<(&Vec<String>, &String)> = edges
+        .iter()
+        .filter_map(|e| match e {
+            RustPubUseEdge::Named {
+                source_module,
+                exported_name,
+                ..
+            } => Some((source_module, exported_name)),
+            RustPubUseEdge::Wildcard { .. } => None,
+        })
+        .collect();
     loop {
         let mut changed = false;
         for edge in edges {
@@ -780,18 +792,6 @@ fn compute_reexport_reachable_modules(
                     target_item,
                     ..
                 } => (source_module, target_module, Some(target_item)),
-                // glob 再エクスポート (`pub use internal::*;`) は target module の pub item を
-                // source namespace へ持ち込む。**item ではなく module 自体を到達可能化する**のが
-                // 正しい: `internal` 直下の pub item は `S::x` で、pub 子 module `c` 配下の item は
-                // `S::c::x` で外から到達できるので、「target module + その pub 子孫」が
-                // ちょうど外部到達可能な集合になる。private 子 module は `pub mod` で宣言されて
-                // いないので `insert_pub_descendants` が含めない (prefix 一致で伝播すると
-                // private 子まで公開扱いになる)。
-                //
-                // Named と違い `declared_pub` を要求しない。glob は module 自体ではなく
-                // **中身**を再エクスポートするので、`mod internal; pub use internal::*;` の
-                // ように target が private module でも有効 (E0365 は module 自体を名前として
-                // 再エクスポートする場合の制限)。
                 RustPubUseEdge::Wildcard {
                     source_module,
                     target_module,
@@ -801,12 +801,46 @@ fn compute_reexport_reachable_modules(
                 continue;
             }
             let Some(target_item) = target_item else {
-                if !all_modules.contains_key(target_module) || reachable.contains(target_module) {
+                // glob 再エクスポート (`pub use internal::*;`) は target module の pub item を
+                // source namespace へ持ち込む。到達可能化するのは **target の pub 子 module** で、
+                // それらの配下 item が `S::child::x` として外から見えるようになる
+                // (target 直下の item は `propagate_live_exports` の exact-match wildcard 伝播が
+                // 拾うので、ここで target 自体を reachable にする必要はない)。
+                // private 子 module は `pub mod` 宣言されていないので `all_modules` の
+                // pub_children に載らず、はじめから対象外。
+                //
+                // Named と違い target module 自体の `declared_pub` は要求しない。glob は module
+                // 自体ではなく**中身**を再エクスポートするので、`mod internal; pub use internal::*;`
+                // のように target が private module でも有効 (E0365 は module 自体を名前として
+                // 再エクスポートする場合の制限)。
+                let Some(pub_children) = all_modules.get(target_module) else {
                     continue;
+                };
+                for child in pub_children {
+                    // **glob import は source namespace の明示 item / named import に shadow
+                    // される**。同名の子 module が source にある (private でも shadow する) か、
+                    // 同名を named re-export している場合、外から見える `S::child` は glob 由来では
+                    // ないので到達可能化しない。
+                    //
+                    // 検出できるのはこの 2 つの signal まで。型名前空間の非 module item
+                    // (`pub struct api`) による shadow は item 単位の情報が要るため見ておらず、
+                    // その場合は従来どおり (= 修正前と同じ) 到達可能扱いに倒れる。
+                    let mut shadow_probe = source_module.clone();
+                    shadow_probe.push(child.clone());
+                    if all_modules.contains_key(&shadow_probe)
+                        || named_exports_in_source.contains(&(source_module, child))
+                    {
+                        continue;
+                    }
+                    let mut candidate = target_module.clone();
+                    candidate.push(child.clone());
+                    if !all_modules.contains_key(&candidate) || reachable.contains(&candidate) {
+                        continue;
+                    }
+                    reachable.insert(candidate.clone());
+                    changed = true;
+                    insert_pub_descendants(&mut reachable, all_modules, candidate);
                 }
-                reachable.insert(target_module.clone());
-                changed = true;
-                insert_pub_descendants(&mut reachable, all_modules, target_module.clone());
                 continue;
             };
             let mut candidate = target_module.clone();
