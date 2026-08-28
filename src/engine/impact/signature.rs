@@ -33,13 +33,20 @@ pub(crate) fn detect_signature_changes(
             continue;
         }
 
-        if line.starts_with("+++ b/") {
-            let path = line.strip_prefix("+++ b/").unwrap_or("");
+        // `diff.rs` の state machine と同じリセット規約を持つ。`--- ` と未認識の `+++ `
+        // で必ず false へ落とさないと、削除ファイルの新側ヘッダ (`+++ /dev/null`) が
+        // どちらの分岐にも当たらず in_file が直前ファイルの true のまま残り、削除ファイル
+        // 本文の `-` 行が対象ファイルの偽 signature 変更として計上される。
+        if line.starts_with("--- ") {
+            in_file = false;
+        } else if let Some(path) = line.strip_prefix("+++ b/") {
             in_file = path == file_path;
             if in_file {
                 removed_lines.clear();
                 added_lines.clear();
             }
+        } else if line.starts_with("+++ ") {
+            in_file = false;
         } else if line.starts_with("@@ ")
             && let Some(hunk) = parse_hunk_header(line)
         {
@@ -172,8 +179,14 @@ pub(crate) fn is_symbol_in_changed_lines(
             continue;
         }
 
-        if line.starts_with("+++ b/") {
-            in_file = line.strip_prefix("+++ b/").unwrap_or("") == file_path;
+        // `detect_signature_changes` と同じリセット規約 (削除ファイルの `+++ /dev/null` で
+        // in_file を落とす)。
+        if line.starts_with("--- ") {
+            in_file = false;
+        } else if let Some(path) = line.strip_prefix("+++ b/") {
+            in_file = path == file_path;
+        } else if line.starts_with("+++ ") {
+            in_file = false;
         } else if line.starts_with("@@ ")
             && let Some(hunk) = parse_hunk_header(line)
         {
@@ -536,6 +549,104 @@ mod tests {
         }];
         let changes = detect_signature_changes(diff, "src/lib.rs", &affected, LangId::Rust);
         assert!(changes.is_empty());
+    }
+
+    /// 削除ファイル (`+++ /dev/null`) の本文行を、直前ファイルの解析結果へ混入させないこと。
+    ///
+    /// 旧実装は `in_file` を `+++ b/` 一致時にしか更新しなかったため、削除ファイルの新側
+    /// ヘッダ (`+++ /dev/null`) がどちらの分岐にも当たらず、`in_file` が直前ファイルの
+    /// `true` のまま残っていた。同じ責務の state machine は `diff.rs` が `--- ` と未認識の
+    /// `+++ ` でリセットしており、`signature.rs` の 2 箇所だけが欠落していた。
+    ///
+    /// 影響は 2 経路。(a) `is_symbol_in_changed_lines` が真を返し、body-only 変更の
+    /// cross-file skip が突破されて blocking な "Unresolved impacts found" へ昇格する。
+    /// (b) `detect_signature_changes` が削除ファイルの `-` 行を old signature として拾い、
+    /// 対象ファイルに存在しない偽のシグネチャ変更を報告する。
+    /// どちらもモジュール移動リファクタで日常的に成立する。
+    #[test]
+    fn detect_signature_changes_ignores_deleted_file_body() {
+        let deleted_block = "\
+--- a/src/gone.rs
++++ /dev/null
+@@ -1,3 +0,0 @@
+-fn greet(x: i32) {
+-    moved();
+-}";
+        let affected = vec![AffectedSymbol {
+            name: "greet".to_string(),
+            kind: "function".to_string(),
+            change_type: "modified".to_string(),
+        }];
+
+        // (a) 対象ファイルは本体のみ変更 (+/- 行に `greet` は出ない)。
+        let body_only = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,3 @@
+ fn greet() {
+-    body_before();
++    body_after();
+ }";
+        // (b) 対象ファイルは `greet` を新規追加 (`-` 側に signature が無い)。
+        let pure_add = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,0 +1,3 @@
++fn greet(name: &str) {
++    body();
++}";
+
+        // 削除ファイルが対象ファイルの前後どちらに来ても成立すること。
+        for (label, target) in [("pure-add", pure_add), ("body-only", body_only)] {
+            for (order, diff) in [
+                ("対象 → 削除", format!("{target}\n{deleted_block}")),
+                ("削除 → 対象", format!("{deleted_block}\n{target}")),
+            ] {
+                let changes =
+                    detect_signature_changes(&diff, "src/lib.rs", &affected, LangId::Rust);
+                assert!(
+                    changes.is_empty(),
+                    "{label}/{order}: 削除ファイルの `-` 行を対象ファイルの signature 変更にしないこと: {changes:?}"
+                );
+                assert!(
+                    !is_symbol_in_changed_lines(&diff, "src/lib.rs", "moved", LangId::Rust),
+                    "{label}/{order}: 削除ファイル本文だけに出る識別子を対象ファイルの変更行に数えないこと"
+                );
+            }
+        }
+
+        // 対照 1: 対象ファイル自身の signature 変更は引き続き検出する。
+        let real_change = format!(
+            "{}\n{}",
+            "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,3 @@
+-fn greet() {
++fn greet(name: &str) {
+     body();
+ }",
+            deleted_block
+        );
+        let changes = detect_signature_changes(&real_change, "src/lib.rs", &affected, LangId::Rust);
+        assert_eq!(
+            changes.len(),
+            1,
+            "対象ファイル自身の signature 変更は引き続き検出すること: {changes:?}"
+        );
+        assert!(changes[0].old_signature.contains("greet()"));
+        assert!(changes[0].new_signature.contains("greet(name: &str)"));
+
+        // 対照 2: 対象ファイル自身の変更行に出る識別子は引き続き真を返す。
+        assert!(
+            is_symbol_in_changed_lines(
+                &format!("{body_only}\n{deleted_block}"),
+                "src/lib.rs",
+                "body_after",
+                LangId::Rust
+            ),
+            "対象ファイル自身の変更行にある識別子は引き続き数えること"
+        );
     }
 
     /// arity 比較: generics / ネスト括弧内のカンマはトップレベル引数として数えない。
