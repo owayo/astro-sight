@@ -70,11 +70,39 @@ impl HunkProgress {
 /// 入らない symbol を context-only overlap として弾ける。
 ///
 /// 注意:
-/// - pure-delete hunk (new_count==0) は `+` 行が無いため、本 set には反映されない。
-///   呼び出し側はそのケースを別判定 (change_type=removed) で処理すること。
+/// - **削除は本 set に現れない** (`-` 行は new 側に行を持たない)。削除位置も必要なら
+///   [`extract_changed_line_facts`] を使い `deletion_gaps` と併用すること。追加行だけで
+///   「変更あり」を判定すると、context 付き diff の削除のみ hunk (`new_count > 0` になる)
+///   と重なったシンボルを取りこぼす。
 /// - file_path は `+++ b/<path>` の `<path>` と完全一致で照合する。
 pub fn extract_changed_new_lines(input: &str, file_path: &str) -> HashSet<usize> {
-    let mut result: HashSet<usize> = HashSet::new();
+    extract_changed_line_facts(input, file_path).added_lines
+}
+
+/// 単一ファイルの unified diff から抽出した「new 側の変更事実」。
+///
+/// 追加は new 側に**実在する行**として表せるが、削除は new 側に行を持たず
+/// 「行と行の**あいだ**」にしか現れない。両者を 1 つの set に混ぜると表現できないため
+/// 別フィールドに分ける。
+#[derive(Debug, Default, Clone)]
+pub struct ChangedLineFacts {
+    /// `+` 行の 0-indexed 行番号。
+    pub added_lines: HashSet<usize>,
+    /// 削除位置。値は**その削除の直後に来る new 側行の 0-indexed 行番号**
+    /// (ファイル末尾での削除なら最終行 + 1)。
+    pub deletion_gaps: HashSet<usize>,
+}
+
+/// 単一ファイルの unified diff から、new 側の追加行と削除位置 (gap) を抽出する。
+///
+/// `extract_changed_new_lines` は追加行しか返さないため、削除だけの hunk では
+/// 「symbol range 内に変更あり」を表現できない。astro-sight 自身の diff 生成
+/// (`git_input.rs`) は `-U` 未指定 = context 3 行なので、行削除には必ず context が付いて
+/// `new_count > 0` になる。その結果 `find_affected_symbols` の context-only フィルタが
+/// 「range 内に `+` 行が無い」を理由に、削除と重なった全シンボルを捨てていた
+/// (利用中の object literal メンバー削除などが review / api / dead-code すべてで無音になる)。
+pub fn extract_changed_line_facts(input: &str, file_path: &str) -> ChangedLineFacts {
+    let mut facts = ChangedLineFacts::default();
     let mut in_target_file = false;
     let mut active_hunk: Option<HunkProgress> = None;
     let mut current_new_line: usize = 0;
@@ -88,15 +116,22 @@ pub fn extract_changed_new_lines(input: &str, file_path: &str) -> HashSet<usize>
                 match consumed {
                     HunkBodyLine::Added(_) => {
                         if current_new_line > 0 {
-                            result.insert(current_new_line - 1);
+                            facts.added_lines.insert(current_new_line - 1);
                         }
                         current_new_line += 1;
                     }
                     HunkBodyLine::Context => {
                         current_new_line += 1;
                     }
-                    // 削除行は new 側に存在せず、metadata 行は行数に数えない。
-                    HunkBodyLine::Removed(_) | HunkBodyLine::Metadata => {}
+                    // 削除行は new 側に行を持たないので行番号を進めない。代わりに
+                    // 「次に現れる new 側行」を gap として記録する。
+                    HunkBodyLine::Removed(_) => {
+                        if current_new_line > 0 {
+                            facts.deletion_gaps.insert(current_new_line - 1);
+                        }
+                    }
+                    // metadata 行 (`\ No newline at end of file` 等) は行数に数えない。
+                    HunkBodyLine::Metadata => {}
                 }
             }
             if progress.is_complete() {
@@ -114,12 +149,20 @@ pub fn extract_changed_new_lines(input: &str, file_path: &str) -> HashSet<usize>
         } else if line.starts_with("@@ ")
             && let Some(hunk) = parse_hunk_header(line)
         {
-            current_new_line = hunk.new_start;
+            // ゼロ幅 hunk (`-U0` の純削除、例 `@@ -5 +4,0 @@`) の `new_start` は
+            // 「削除が起きた位置の**直前**にある new 側行」を 1-indexed で指す。gap の規約は
+            // 「削除の**直後**に来る new 側行」なので、ここで 1 行進めて座標系を揃える
+            // (ゼロ幅 hunk は定義上 `+` 行を持たないため added_lines への影響はない)。
+            current_new_line = if hunk.new_count == 0 {
+                hunk.new_start.saturating_add(1)
+            } else {
+                hunk.new_start
+            };
             active_hunk = Some(HunkProgress::new(&hunk));
         }
     }
 
-    result
+    facts
 }
 
 /// 指定ファイルの unified diff に、new 側の行範囲 `[start_line, end_line]` (0-indexed)
@@ -475,6 +518,60 @@ index 1234567..0000000
         let mut sorted: Vec<_> = changed.into_iter().collect();
         sorted.sort();
         assert_eq!(sorted, vec![1]);
+    }
+
+    /// `deletion_gaps` の座標規約を固定する。
+    ///
+    /// gap は「その削除の**直後**に来る new 側行の 0-indexed 行番号」。連続削除は同じ位置を
+    /// 指すので 1 つに畳まれ (存在確認にしか使わないので情報は失われない)、ファイル末尾での
+    /// 削除は「最終行 + 1」になる。
+    ///
+    /// ゼロ幅 hunk (`-U0` の純削除) の `new_start` は削除位置の**直前**行を 1-indexed で
+    /// 指すため、context 付き hunk と座標系が 1 行ずれる。両形式で同じ編集が同じ gap を返す
+    /// ことを対で固定する (この補正が無いと `ChangedLineFacts` の契約に反する)。
+    #[test]
+    fn extract_changed_line_facts_records_deletion_gaps() {
+        // 中間削除 (context 付き): a b [c を削除] d → 残る new 側は 0-indexed 0,1,2
+        // 削除の直後に来る new 側行は 0-indexed 2 (`d`)。
+        let mid = "--- a/foo.rs\n+++ b/foo.rs\n@@ -1,4 +1,3 @@\n a\n b\n-c\n d\n";
+        let facts = extract_changed_line_facts(mid, "foo.rs");
+        assert!(facts.added_lines.is_empty(), "削除のみなので `+` 行は無い");
+        assert_eq!(facts.deletion_gaps, HashSet::from([2]));
+
+        // 同じ編集を `-U0` で表現したもの。new_start=2 は削除直前の new 側行 (1-indexed)。
+        let mid_u0 = "--- a/foo.rs\n+++ b/foo.rs\n@@ -3 +2,0 @@\n-c\n";
+        let facts_u0 = extract_changed_line_facts(mid_u0, "foo.rs");
+        assert_eq!(
+            facts_u0.deletion_gaps, facts.deletion_gaps,
+            "context 付きと `-U0` で同じ gap を返すこと"
+        );
+
+        // 連続する末尾削除 (context 付き): a b [c d を削除] → 残る new 側は 0-indexed 0,1
+        // gap は 1 つに畳まれ、最終行 (1) + 1 = 2 になる。
+        let tail = "--- a/foo.rs\n+++ b/foo.rs\n@@ -1,4 +1,2 @@\n a\n b\n-c\n-d\n";
+        let tail_facts = extract_changed_line_facts(tail, "foo.rs");
+        assert_eq!(
+            tail_facts.deletion_gaps,
+            HashSet::from([2]),
+            "連続削除は 1 gap に畳まれ、末尾削除は最終行 + 1 を指す"
+        );
+
+        // 同じ末尾削除を `-U0` で。
+        let tail_u0 = "--- a/foo.rs\n+++ b/foo.rs\n@@ -3,2 +2,0 @@\n-c\n-d\n";
+        let tail_u0_facts = extract_changed_line_facts(tail_u0, "foo.rs");
+        assert_eq!(
+            tail_u0_facts.deletion_gaps, tail_facts.deletion_gaps,
+            "末尾の連続削除も context 付きと `-U0` で一致すること"
+        );
+
+        // 対照: 削除の無い純追加では gap を作らない。
+        let add_only = "--- a/foo.rs\n+++ b/foo.rs\n@@ -1,2 +1,3 @@\n a\n+b\n c\n";
+        let add_facts = extract_changed_line_facts(add_only, "foo.rs");
+        assert!(
+            add_facts.deletion_gaps.is_empty(),
+            "追加のみの hunk は gap を作らない: {add_facts:?}"
+        );
+        assert_eq!(add_facts.added_lines, HashSet::from([1]));
     }
 
     /// 対象ファイルでない `+` 行は無視する。

@@ -332,8 +332,9 @@ fn collect_affected_symbols(
         // diff の `+` 行 (実変更行) を抽出して hunk context-only overlap を除外する。
         // 隣接 hunk の context 3 行に巻き込まれた本体未変更 export
         // (Issue 2026-05-14-private-const-and-unchanged-export-noise) を排除する。
-        let changed_new_lines = diff::extract_changed_new_lines(diff_input, &df.new_path);
-        let affected_raw = find_affected_symbols(&syms, &df.hunks, Some(&changed_new_lines));
+        let changed_line_facts = diff::extract_changed_line_facts(diff_input, &df.new_path);
+        let changed_new_lines = &changed_line_facts.added_lines;
+        let affected_raw = find_affected_symbols(&syms, &df.hunks, Some(&changed_line_facts));
         log_phase(
             &format!("context.pass1.find_affected n={}", affected_raw.len()),
             "end",
@@ -397,7 +398,7 @@ fn collect_affected_symbols(
             root,
             source: &source,
             lang_id,
-            changed_new_lines: &changed_new_lines,
+            changed_new_lines,
         };
         let mut cross_file_symbol_keys: HashSet<String> = HashSet::new();
         for sym in &affected {
@@ -493,18 +494,38 @@ fn hunk_has_removed_lines(
     hunk.old_count.saturating_add(added_in_hunk) != hunk.new_count
 }
 
+/// symbol range 内に削除位置 (gap) があるか。
+///
+/// gap は「その削除の直後に来る new 側行」なので、`gap == sym_start` は**シンボルの直前**
+/// (前の空行・直前シンボルの末尾) からの削除を指し、シンボル内部の削除ではない。ここを
+/// 含めると隣接シンボルを巻き込み、context-only ノイズの除去が別経路で無に帰す。
+/// 逆にシンボル末尾行 (`gap == sym_end`) は本体最終行の直前からの削除なので含める。
+fn symbol_range_has_deletion(
+    sym_start: usize,
+    sym_end: usize,
+    deletion_gaps: &std::collections::HashSet<usize>,
+) -> bool {
+    deletion_gaps
+        .iter()
+        .any(|&gap| gap > sym_start && gap <= sym_end)
+}
+
 /// hunk をシンボル範囲と照合して affected シンボルを検出する。
 ///
-/// `changed_new_lines` が `Some` のときは、`+` 行が 1 つも symbol range に入らない
-/// (= context 行だけで overlap した) symbol を除外する。pure-delete hunk
-/// (new_count==0) は `+` 行が無いため、この追加フィルタを適用せず従来通り
-/// change_type=removed として残す。
+/// `facts` が `Some` のときは、symbol range 内に `+` 行も削除位置 (gap) も無い
+/// (= context 行だけで overlap した) symbol を除外する。
+///
+/// **追加行だけで判定してはいけない**: astro-sight 自身の diff 生成は context 3 行なので、
+/// 行削除だけの hunk でも `new_count > 0` になる。追加行のみを見ると「range 内に `+` 行が
+/// 無い」を理由に削除と重なった全シンボルが捨てられ、利用中の object literal メンバー削除の
+/// ような破壊的変更が review / api / dead-code すべてで無音になる。
 fn find_affected_symbols(
     syms: &[crate::models::symbol::Symbol],
     hunks: &[HunkInfo],
-    changed_new_lines: Option<&std::collections::HashSet<usize>>,
+    facts: Option<&crate::engine::diff::ChangedLineFacts>,
 ) -> Vec<AffectedSymbol> {
     let mut affected = Vec::new();
+    let changed_new_lines = facts.map(|f| &f.added_lines);
 
     for sym in syms {
         for hunk in hunks {
@@ -525,19 +546,25 @@ fn find_affected_symbols(
                 hunk_start <= sym_end && hunk_end > sym_start
             };
             if overlaps {
-                // context-only overlap の除外: changed_new_lines が Some かつ
-                // pure-delete でない hunk について、symbol range 内に `+` 行が
-                // 存在しなければ context だけの overlap と判断して skip する。
-                // pure-delete (new_count==0) は `+` 行が存在しないため、この
-                // フィルタを適用すると change_type=removed が出なくなる。
-                if let Some(cl) = changed_new_lines
+                // context-only overlap の除外: facts が Some かつ pure-delete でない
+                // hunk について、symbol range 内に `+` 行も削除位置 (gap) も無ければ
+                // context だけの overlap と判断して skip する。
+                // pure-delete (new_count==0) は追加行も gap も持ちうるが、hunk 自体が
+                // 削除位置そのものなので従来どおりフィルタを適用しない。
+                if let Some(f) = facts
                     && hunk.new_count > 0
-                    && !(sym_start..=sym_end).any(|l| cl.contains(&l))
+                    && !(sym_start..=sym_end).any(|l| f.added_lines.contains(&l))
+                    && !symbol_range_has_deletion(sym_start, sym_end, &f.deletion_gaps)
                 {
                     continue;
                 }
                 // change_type 判定:
-                // - new_count==0: pure delete → "removed"。
+                // - new_count==0: pure delete hunk。**"removed" にはしない** — `syms` は
+                //   new 側ファイルを parse した結果なので、ここで見つかるシンボルは
+                //   定義が残っている (完全に削除されたシンボルは syms に現れず、そもそも
+                //   この関数に到達しない)。生存シンボル内部の行削除なので "modified"。
+                //   同じ編集が `-U0` では "removed"、context 付き diff では "modified" に
+                //   なるという入力形式依存の非対称もこれで解消する。
                 // - シンボル全行が新規追加行 (changed_new_lines に全行含まれる) かつ
                 //   その hunk に削除行が無い → "added"。既存ファイルの context 込み hunk
                 //   (old_count>0) でも、純追加で挿入された新規シンボルを正しく "added" と
@@ -553,7 +580,7 @@ fn find_affected_symbols(
                         && !hunk_has_removed_lines(hunk, hunk_start, hunk_end, cl)
                 });
                 let change_type = if hunk.new_count == 0 {
-                    "removed"
+                    "modified"
                 } else if all_added_no_removal {
                     "added"
                 } else if hunk.old_count == 0 {
@@ -979,6 +1006,24 @@ mod tests {
     }
 
     /// ヘルパー: テスト用シンボルを生成する
+    /// テスト用: 追加行のみを持つ `ChangedLineFacts` を作る (削除位置なし)。
+    fn added_only(
+        added: &std::collections::HashSet<usize>,
+    ) -> crate::engine::diff::ChangedLineFacts {
+        crate::engine::diff::ChangedLineFacts {
+            added_lines: added.clone(),
+            deletion_gaps: std::collections::HashSet::new(),
+        }
+    }
+
+    /// テスト用: 削除位置 (gap) のみを持つ `ChangedLineFacts` を作る (追加行なし)。
+    fn deletions_only(gaps: &[usize]) -> crate::engine::diff::ChangedLineFacts {
+        crate::engine::diff::ChangedLineFacts {
+            added_lines: std::collections::HashSet::new(),
+            deletion_gaps: gaps.iter().copied().collect(),
+        }
+    }
+
     fn make_sym(name: &str, start_line: usize, end_line: usize) -> crate::models::symbol::Symbol {
         use crate::models::location::{Point, Range};
         crate::models::symbol::Symbol {
@@ -1001,7 +1046,11 @@ mod tests {
         }
     }
 
-    /// pure-delete hunk（new_count=0）がシンボル開始行と一致する場合に検出される
+    /// pure-delete hunk（new_count=0）がシンボル開始行と一致する場合に検出される。
+    ///
+    /// change_type は "removed" ではなく "modified"。`find_affected_symbols` に渡す `syms` は
+    /// **new 側ファイルを parse した結果**なので、ここで見つかるシンボルは定義が残っている
+    /// (完全に削除されたシンボルは syms に現れず、そもそもこの関数に到達しない)。
     #[test]
     fn find_affected_pure_delete_at_symbol_start() {
         let sym = make_sym("foo", 4, 9);
@@ -1014,7 +1063,7 @@ mod tests {
         let result = find_affected_symbols(&[sym], &[hunk], None);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "foo");
-        assert_eq!(result[0].change_type, "removed");
+        assert_eq!(result[0].change_type, "modified");
     }
 
     /// pure-delete hunk がシンボル内部にある場合も検出される
@@ -1153,7 +1202,7 @@ mod tests {
         for l in 44..78usize {
             changed.insert(l - 1);
         }
-        let result = find_affected_symbols(&[sym], &[hunk], Some(&changed));
+        let result = find_affected_symbols(&[sym], &[hunk], Some(&added_only(&changed)));
         assert!(
             result.is_empty(),
             "context-only overlap (+ 行が symbol range 内に無い) は除外されるべき"
@@ -1173,14 +1222,129 @@ mod tests {
         };
         let mut changed = std::collections::HashSet::new();
         changed.insert(43); // 0-indexed line 43 (= 1-indexed 44) は symbol range 内
-        let result = find_affected_symbols(&[sym], &[hunk], Some(&changed));
+        let result = find_affected_symbols(&[sym], &[hunk], Some(&added_only(&changed)));
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "modified_fn");
         assert_eq!(result[0].change_type, "modified");
     }
 
-    /// pure-delete hunk (new_count==0) は changed_new_lines が空でも従来通り
-    /// change_type=removed として残る (削除アンカー判定はフィルタ対象外)。
+    /// **削除のみの hunk** (context 付き = `new_count > 0`) と重なるシンボルが
+    /// affected に残ること。
+    ///
+    /// astro-sight 自身の diff 生成 (`git_input.rs`) は `-U` 未指定 = context 3 行なので、
+    /// 行削除には必ず context が付いて `new_count > 0` になる。旧実装の context-only
+    /// フィルタは「symbol range 内に `+` 行が無い」だけを見ていたため、`+` 行を持たない
+    /// 削除のみの hunk と重なった**全**シンボルが捨てられていた
+    /// (`context --dir . --git` が `{"changes":[]}`、`impact --dir . --git` が無出力)。
+    /// 利用中の object literal メンバー削除では review / api / dead-code がすべて無音になり、
+    /// 実行時に落ちる破壊的変更が Stop hook を素通りしていた。
+    ///
+    /// 実 diff から `ChangedLineFacts` を組み立てて経路全体を通す (HunkInfo を手で組むと
+    /// 旧テストと同じく「実運用では起きない new_count: 0」の前提に逃げてしまう)。
+    #[test]
+    fn find_affected_symbols_keeps_symbol_with_deletion_only_hunk() {
+        // 0-indexed: 3 = `pub fn target() {`, 4 = `before();`, 5 = `after();`, 6 = `}`
+        // 8..=10 = 直後の別関数 neighbor (削除の影響を受けない対照)
+        let diff = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,11 +1,10 @@
+ // header
+ // header
+ // header
+ pub fn target() {
+     before();
+-    removed();
+     after();
+ }
+ 
+ pub fn neighbor() {
+     untouched();
+ }";
+        let facts = crate::engine::diff::extract_changed_line_facts(diff, "src/lib.rs");
+        assert!(
+            facts.added_lines.is_empty(),
+            "削除のみの hunk なので `+` 行は無い: {facts:?}"
+        );
+        // 削除の直後に来る new 側行は 0-indexed 5 (`    after();`)。
+        assert_eq!(
+            facts.deletion_gaps,
+            std::collections::HashSet::from([5]),
+            "削除位置は直後の new 側行として記録される: {facts:?}"
+        );
+
+        let hunks = crate::engine::diff::parse_unified_diff(diff)
+            .into_iter()
+            .find(|f| f.new_path == "src/lib.rs")
+            .expect("diff file")
+            .hunks;
+        assert!(
+            hunks.iter().all(|h| h.new_count > 0),
+            "context 付き diff では削除のみの hunk でも new_count > 0: {hunks:?}"
+        );
+
+        let target = make_sym("target", 3, 6);
+        let neighbor = make_sym("neighbor", 9, 11);
+        let result = find_affected_symbols(&[target, neighbor], &hunks, Some(&facts));
+
+        // 症状の固定: 削除と重なる target が残ること。
+        assert_eq!(
+            result.len(),
+            1,
+            "削除と重なるシンボルだけが affected に残ること: {result:?}"
+        );
+        assert_eq!(result[0].name, "target");
+        assert_eq!(
+            result[0].change_type, "modified",
+            "生存シンボル内部の行削除は modified"
+        );
+    }
+
+    /// 削除位置 (gap) はシンボル**直前**の削除を含まない。
+    ///
+    /// gap は「削除の直後に来る new 側行」なので、`gap == sym_start` は前の空行や直前
+    /// シンボル末尾からの削除を指す。これを含めると隣接シンボルを巻き込み、context-only
+    /// overlap を除去した意味が無くなる。逆に `gap == sym_end` (本体最終行の直前からの削除) と
+    /// `gap == sym_end + 1` (シンボル直後の削除) の境界も同時に固定する。
+    #[test]
+    fn deletion_gap_at_symbol_start_does_not_make_symbol_affected() {
+        let hunk = HunkInfo {
+            old_start: 1,
+            old_count: 12,
+            new_start: 1,
+            new_count: 11,
+        };
+        let sym_start = 4;
+        let sym_end = 8;
+
+        for (gap, want, label) in [
+            (sym_start, false, "シンボル直前の削除は含めない"),
+            (sym_start + 1, true, "シンボル内部の削除は含める"),
+            (sym_end, true, "シンボル最終行の直前の削除は含める"),
+            (sym_end + 1, false, "シンボル直後の削除は含めない"),
+        ] {
+            let facts = deletions_only(&[gap]);
+            let result = find_affected_symbols(
+                &[make_sym("s", sym_start, sym_end)],
+                std::slice::from_ref(&hunk),
+                Some(&facts),
+            );
+            assert_eq!(
+                !result.is_empty(),
+                want,
+                "gap={gap}: {label} (result={result:?})"
+            );
+        }
+    }
+
+    /// pure-delete hunk (new_count==0) は追加行が空でも affected に残る
+    /// (hunk 自体が削除位置なので context-only フィルタの対象外)。
+    ///
+    /// **この形の hunk は `-U0` でしか生成されない**。astro-sight 自身の diff 生成は
+    /// context 3 行なので、行削除でも `new_count > 0` になる。旧実装はこのテストが
+    /// `new_count: 0` で書かれていたため、実運用の context 付き diff で削除と重なった
+    /// シンボルが全滅する乖離を検出できていなかった
+    /// (回帰は `find_affected_symbols_keeps_symbol_with_deletion_only_hunk`)。
     #[test]
     fn find_affected_symbols_pure_delete_remains_with_empty_changed_lines() {
         let sym = make_sym("removed_fn", 4, 9);
@@ -1191,9 +1355,9 @@ mod tests {
             new_count: 0,
         };
         let changed = std::collections::HashSet::new();
-        let result = find_affected_symbols(&[sym], &[hunk], Some(&changed));
+        let result = find_affected_symbols(&[sym], &[hunk], Some(&added_only(&changed)));
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].change_type, "removed");
+        assert_eq!(result[0].change_type, "modified");
     }
 
     /// 単一行シンボル（range.start.line == range.end.line）の変更が検出される。
@@ -1211,7 +1375,7 @@ mod tests {
         };
         let mut changed = std::collections::HashSet::new();
         changed.insert(0); // 0-indexed line 0 が実変更行
-        let result = find_affected_symbols(&[sym], &[hunk], Some(&changed));
+        let result = find_affected_symbols(&[sym], &[hunk], Some(&added_only(&changed)));
         assert_eq!(result.len(), 1, "単一行シンボルの変更が検出されるべき");
         assert_eq!(result[0].name, "MAX_RETRIES");
         assert_eq!(result[0].change_type, "modified");
@@ -1267,7 +1431,7 @@ mod tests {
         for l in 3..=7usize {
             changed.insert(l);
         }
-        let result = find_affected_symbols(&[sym], &[hunk], Some(&changed));
+        let result = find_affected_symbols(&[sym], &[hunk], Some(&added_only(&changed)));
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "AntigravityCfg");
         assert_eq!(
@@ -1294,7 +1458,7 @@ mod tests {
         for l in 0..=3usize {
             changed.insert(l);
         }
-        let result = find_affected_symbols(&[sym], &[hunk], Some(&changed));
+        let result = find_affected_symbols(&[sym], &[hunk], Some(&added_only(&changed)));
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].change_type, "modified",
@@ -1325,7 +1489,7 @@ mod tests {
         for l in 1..=3usize {
             changed.insert(l);
         }
-        let result = find_affected_symbols(&[sym], &[hunk], Some(&changed));
+        let result = find_affected_symbols(&[sym], &[hunk], Some(&added_only(&changed)));
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].change_type, "modified",

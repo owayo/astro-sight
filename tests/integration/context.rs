@@ -480,3 +480,77 @@ fn context_php_generic_method_bare_call_routed_to_low_confidence() {
         "fallback 下では low_confidence_callers は空 (skip_serializing_if で省略) のはず: {impact:?}"
     );
 }
+
+/// **削除のみの変更** (context 付き diff) で、削除された object literal メンバーを使う
+/// 呼び出し元が影響先として検出されること。
+///
+/// astro-sight 自身の diff 生成は context 3 行なので、行削除だけの hunk でも
+/// `new_count > 0` になる。旧実装の context-only フィルタは「symbol range 内に `+` 行が
+/// 無い」だけを見ていたため、削除と重なった**全**シンボルが捨てられ、`context --git` が
+/// `{"changes":[]}` を返していた。利用中のメンバー削除では review / api / dead-code が
+/// すべて無音になり、実行時に落ちる破壊的変更が Stop hook を素通りする。
+///
+/// unit テストが `new_count: 0` (= `-U0` でしか出ない形) で書かれていたためこの乖離が
+/// 検出されていなかった。ここでは実際に `git` が生成する diff を通す。
+#[test]
+fn context_git_detects_deletion_only_change() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    repo.write(
+        "src/config.ts",
+        "// header\n\
+// header\n\
+// header\n\
+export const config = {\n\
+  keep: () => 1,\n\
+  doomed: () => 2,\n\
+};\n\
+// footer\n\
+// footer\n\
+// footer\n",
+    );
+    repo.write(
+        "src/app.ts",
+        "import { config } from \"./config\";\n\
+export function run(): number {\n\
+  return config.keep();\n\
+}\n",
+    );
+    repo.commit_all("init");
+
+    // `doomed` の 1 行だけを削除する (追加行なし)。
+    repo.write(
+        "src/config.ts",
+        "// header\n\
+// header\n\
+// header\n\
+export const config = {\n\
+  keep: () => 1,\n\
+};\n\
+// footer\n\
+// footer\n\
+// footer\n",
+    );
+
+    let json = repo.run_json("context", &["--git"]);
+    let changes = json["changes"].as_array().expect("changes array");
+    assert!(
+        !changes.is_empty(),
+        "削除のみの変更でも changes が空にならないこと: {json}"
+    );
+    let affected: Vec<String> = changes
+        .iter()
+        .flat_map(|c| {
+            c["affected_symbols"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .map(|s| s["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        affected.iter().any(|n| n == "config"),
+        "削除と重なる `config` が affected に残ること: {affected:?}"
+    );
+}
