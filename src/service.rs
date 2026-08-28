@@ -721,8 +721,23 @@ impl AppService {
         // 起きないが、`../` を含むと canonical_dir (= サンドボックス配下に検証済み) の
         // 外にある同一リポジトリ内のファイルを blame できてしまう。dir 検証と同じ場所で
         // 「dir 配下の相対パス」に閉じる (他のパス系 API と検証系列を揃える)。
+        //
+        // 検証だけでなく**正規化**もここで行う。engine 側の起点除外は生の文字列一致だが、
+        // 候補は `git diff-tree --name-only` 由来の正規形なので、`./src/a.rs` や
+        // `src//a.rs` のような同値表記だと起点自身が候補として残り
+        // 「自分自身との共変更 confidence 1.0」が最上位に出る。MCP の cochange_analyze は
+        // エージェントが source_files を組み立てるため実運用で踏みやすい。
+        // (`is_contained_relative` 側で CurDir を弾く案は採れない — 既存テストが
+        // `./src/main.rs` を正当な入力として固定している。)
+        //
+        // 上限 (`max_source_files`) はここで **正規化後の unique 件数**に対して掛ける。
+        // engine 側の判定より前に置くのは、暴走防止の上限が「大量確保と全件比較を
+        // 終えてから」効くのでは意味が無いため。dedup は `Vec::contains` の O(N²) では
+        // なく `HashSet` で行い、`Vec` は入力順の保持だけに使う。
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut normalized_sources: Vec<String> = Vec::new();
         for f in &opts.source_files {
-            if !is_contained_relative(f) {
+            let Some(normalized) = normalize_contained_relative(f) else {
                 bail!(AstroError::new(
                     ErrorCode::PathOutOfBounds,
                     format!(
@@ -730,12 +745,31 @@ impl AppService {
                          (no '..', no absolute or drive-qualified prefix): {f}"
                     ),
                 ));
+            };
+            // 同値表記が複数指定された場合は先勝ちで畳む (出力順は入力順のまま)。
+            if !seen.insert(normalized.clone()) {
+                continue;
             }
+            if opts.max_source_files > 0 && normalized_sources.len() >= opts.max_source_files {
+                bail!(AstroError::new(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "source_files count exceeds --max-source-files limit {}; \
+                         narrow --paths or raise the limit explicitly",
+                        opts.max_source_files,
+                    ),
+                ));
+            }
+            normalized_sources.push(normalized);
         }
 
         let dir_str = canonical_dir.to_string_lossy();
 
-        let result = crate::engine::cochange::analyze_cochange(&dir_str, opts)?;
+        let normalized_opts = CoChangeOptions {
+            source_files: normalized_sources,
+            ..opts.clone()
+        };
+        let result = crate::engine::cochange::analyze_cochange(&dir_str, &normalized_opts)?;
         debug!(
             dir = dir,
             entries = result.entries.len(),
@@ -759,12 +793,42 @@ impl AppService {
 /// blame は base リビジョン側の履歴を辿るので、working tree に実体が無い
 /// (base 時点にしか存在しない) ファイルも正当な入力になる。したがって
 /// canonicalize による実在確認は行わない。
+/// `normalize_contained_relative` の真偽値ラッパー。
+///
+/// 本番経路は正規化結果を必要とするため `normalize_contained_relative` を直接呼ぶ。
+/// 「安全なパスか」だけを問う既存テストの可読性を保つために test 専用で残す
+/// (本番から参照が無いので `#[cfg(test)]` を外すと dead_code で clippy が落ちる)。
+#[cfg(test)]
 fn is_contained_relative(p: &str) -> bool {
+    normalize_contained_relative(p).is_some()
+}
+
+/// `--dir` 基準の相対パスを検証しつつ正規形へ畳む。安全でなければ `None`。
+///
+/// `.` (CurDir) と連続スラッシュを落とし、残った `Normal` セグメントを `/` で再結合する。
+/// 検証と正規化を 1 関数にまとめるのは、「検証は通したが正規化を忘れた経路」が生まれる
+/// のを防ぐため (engine 側の起点除外は生の文字列一致なので、正規化漏れは
+/// 「自分自身との共変更」という誤検出になって表に出る)。
+///
+/// `..` (ParentDir) / `/` (RootDir) / Windows のドライブ修飾 (Prefix, `C:foo` 含む) と、
+/// 正規化した結果が空になる入力 (`.` / `./` 等) は `None`。
+fn normalize_contained_relative(p: &str) -> Option<String> {
     use std::path::Component;
-    !p.is_empty()
-        && Path::new(p)
-            .components()
-            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    if p.is_empty() {
+        return None;
+    }
+    let mut segments: Vec<&str> = Vec::new();
+    for component in Path::new(p).components() {
+        match component {
+            Component::Normal(seg) => segments.push(seg.to_str()?),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    Some(segments.join("/"))
 }
 
 /// `--exclude-glob` の構文を `ignore::overrides::OverrideBuilder` で先行検証する。
@@ -855,6 +919,45 @@ fn collect_error_nodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `normalize_contained_relative` は検証と正規化を同時に行う。
+    ///
+    /// engine 側の起点除外は生の文字列一致だが、候補は `git diff-tree --name-only` 由来の
+    /// 正規形なので、`./src/a.rs` や `src//a.rs` を素通しすると起点自身が候補に残り
+    /// 「自分自身との共変更 confidence 1.0」が最上位に出る。
+    #[test]
+    fn normalize_contained_relative_folds_equivalent_spellings() {
+        // 同値表記はすべて同じ正規形へ畳まれる。
+        for spelling in [
+            "src/a.rs",
+            "./src/a.rs",
+            "src//a.rs",
+            "src/./a.rs",
+            "./src/./a.rs",
+        ] {
+            assert_eq!(
+                normalize_contained_relative(spelling).as_deref(),
+                Some("src/a.rs"),
+                "{spelling} は src/a.rs へ正規化されること"
+            );
+        }
+        // 対照: 安全でない入力は従来どおり None (= 検証エラー)。
+        // Windows のドライブ修飾は Prefix コンポーネントになる platform でのみ弾けるため、
+        // ここでは platform 非依存のケースだけを見る
+        // (`is_contained_relative_rejects_windows_drive_paths` が cfg(windows) で担当)。
+        for bad in ["", ".", "./", "..", "../secret.rs", "/etc/passwd"] {
+            assert_eq!(
+                normalize_contained_relative(bad),
+                None,
+                "{bad:?} は拒否されること"
+            );
+        }
+        // 対照: 正規化しても中身が変わらない入力はそのまま。
+        assert_eq!(
+            normalize_contained_relative("main.rs").as_deref(),
+            Some("main.rs")
+        );
+    }
 
     #[test]
     fn is_contained_relative_accepts_plain_relative_paths() {

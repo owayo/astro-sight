@@ -100,11 +100,24 @@ impl Deadline {
 /// hunk のみ / 変更行が 1 コミットにしか遡れない) は、`history_limit > 0` のとき
 /// `git log <base> -n <limit> -- <file>` のファイル履歴を代替証拠にフォールバックする。
 /// base 側に存在しない新規追加ファイルは履歴が無いため起点にならない (診断に記録する)。
+///
+/// # 入力の前提
+///
+/// `opts.source_files` は **`--dir` 基準に正規化済みの相対パス** (`./` や連続スラッシュを
+/// 含まない `/` 区切り) であること。起点の自己除外は生の文字列一致で行う一方、候補側は
+/// `git diff-tree --name-only` 由来の正規形なので、未正規化のパスを渡すと**起点自身が
+/// 共変更相手として返る**。
+///
+/// 製品内経路 (CLI / MCP / session / review) は必ず [`crate::service::AppService`] の
+/// `analyze_cochange` を通り、そこで検証と正規化がまとめて行われる。ライブラリとして
+/// この関数を直接呼ぶ場合は呼び出し側で正規化すること。
 pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeResult> {
     if opts.source_files.is_empty() {
         return Ok(empty_cochange_result(None, CoChangeDiagnostics::default()));
     }
     // 起点ファイル数の上限ガード (0 = 無制限)。暴走防止のため超過は明示的に停止する。
+    // AppService 側でも正規化後の unique 件数に対して先に掛かるので、ここは engine を
+    // 直接呼ぶ利用者向けの多層防御。
     if opts.max_source_files > 0 && opts.source_files.len() > opts.max_source_files {
         bail!(AstroError::new(
             ErrorCode::InvalidRequest,

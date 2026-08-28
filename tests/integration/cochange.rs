@@ -313,3 +313,128 @@ fn cochange_git_is_empty_on_clean_worktree() {
     assert_eq!(json["entries"].as_array().map(Vec::len), Some(0));
     assert_eq!(json["commits_analyzed"].as_u64(), Some(0));
 }
+
+/// `--paths ./src/a.rs` のような同値表記で「自分自身との共変更 confidence 1.0」が
+/// 出ないこと。
+///
+/// engine 側の起点除外は生の文字列一致だが、候補は `git diff-tree --name-only` 由来の
+/// 正規形なので、`./` 付きや連続スラッシュを素通しすると起点自身が候補に残り、
+/// 分母 = 分子で最上位に並ぶ。`is_contained_relative` は `Component::CurDir` を
+/// 正当な入力として許可しているため、検証だけでは防げなかった。
+/// MCP の `cochange_analyze` はエージェントが `source_files` を組み立てるため
+/// 実運用で踏みやすい。
+#[test]
+fn cochange_normalizes_source_paths_and_excludes_self_pair() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    // a.rs と b.rs を必ず一緒に変更するコミットを積む (共変更の相手を作る)。
+    for i in 0..3 {
+        repo.write("src/a.rs", format!("pub fn a() {{ let _ = {i}; }}\n"));
+        repo.write("src/b.rs", format!("pub fn b() {{ let _ = {i}; }}\n"));
+        repo.commit_all(&format!("change {i}"));
+    }
+    // 起点となる未コミット変更。
+    repo.write("src/a.rs", "pub fn a() { let _ = 99; }\n");
+
+    // 同値表記はすべて同じ結果になり、いずれも起点自身を候補にしない。
+    for spelling in ["src/a.rs", "./src/a.rs", "src//a.rs", "src/./a.rs"] {
+        let json = repo.run_json(
+            "cochange",
+            &[
+                "--paths",
+                spelling,
+                "--min-confidence",
+                "0.0",
+                "--min-samples",
+                "1",
+                "--min-denominator",
+                "1",
+            ],
+        );
+        let entries = json["entries"].as_array().expect("entries array");
+        let partners: Vec<&str> = entries
+            .iter()
+            .map(|e| e["file_b"].as_str().unwrap_or_default())
+            .collect();
+        assert!(
+            !partners
+                .iter()
+                .any(|p| p.trim_start_matches("./").replace("//", "/") == "src/a.rs"),
+            "{spelling}: 起点自身を共変更相手にしないこと: {partners:?}"
+        );
+        // 対照: 本来の共変更相手は引き続き検出する (抑制しすぎていないこと)。
+        assert!(
+            partners.contains(&"src/b.rs"),
+            "{spelling}: 本来の共変更相手 src/b.rs は検出されること: {partners:?}"
+        );
+    }
+}
+
+/// 同値表記の先勝ち dedup と `--max-source-files` の関係を固定する。
+///
+/// 上限は「指定件数」ではなく **正規化後の unique 件数**に対して掛かる。
+/// `["src/a.rs", "./src/a.rs"]` は 1 件に畳まれるので上限 1 でも通り、
+/// 別ファイルを足して 2 件になると上限 1 で拒否される。
+#[test]
+fn cochange_dedups_equivalent_paths_before_max_source_files() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    repo.write("src/a.rs", "pub fn a() {}\n");
+    repo.write("src/b.rs", "pub fn b() {}\n");
+    repo.commit_all("init");
+    repo.write("src/a.rs", "pub fn a() { let _ = 1; }\n");
+
+    // 同一ファイルの 2 表記 → unique 1 件なので上限 1 を超えない。
+    let out = cargo_bin()
+        .args(["cochange", "--dir"])
+        .arg(repo.root())
+        .args([
+            "--paths",
+            "src/a.rs,./src/a.rs",
+            "--max-source-files",
+            "1",
+            "--min-samples",
+            "1",
+            "--min-denominator",
+            "1",
+        ])
+        .output()
+        .expect("failed to run cochange");
+    assert!(
+        out.status.success(),
+        "同値表記は先勝ちで畳まれるので上限 1 を超えない: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 対照: 別ファイルを足すと unique 2 件になり上限 1 で拒否される。
+    let out = cargo_bin()
+        .args(["cochange", "--dir"])
+        .arg(repo.root())
+        .args([
+            "--paths",
+            "src/a.rs,src/b.rs",
+            "--max-source-files",
+            "1",
+            "--min-samples",
+            "1",
+            "--min-denominator",
+            "1",
+        ])
+        .output()
+        .expect("failed to run cochange");
+    assert!(
+        !out.status.success(),
+        "unique 2 件は上限 1 を超えるので拒否されること"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("max-source-files") || combined.contains("max_source_files"),
+        "上限超過であることが分かるエラーを返すこと: {combined}"
+    );
+}
