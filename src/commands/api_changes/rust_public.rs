@@ -753,14 +753,16 @@ pub(crate) fn collect_rust_pub_use_index(
 ///   実在する **pub 宣言された** module の場合に限りその module も到達可能になり、pub 子孫 module
 ///   も連鎖する。private module 自体の再エクスポート (`mod wifi;` + `pub use self::wifi as api;`)
 ///   は rustc では E0365 で無効なため、親の pub_children に含まれない target は reachable 化しない。
-/// - **Wildcard edge** (`pub use internal::*;`): source module が到達可能なら target module 自体を
-///   到達可能にする。glob は module ではなく**中身**を再エクスポートするので target が private
-///   module でも有効で (E0365 は module 自体を名前として再エクスポートする場合の制限)、
-///   `declared_pub` は要求しない。旧実装は Named 以外を `else { continue; }` で捨てていたため、
+/// - **Wildcard edge** (`pub use internal::*;`): source module が到達可能なら、target の
+///   **pub 子 module とその pub 子孫**を到達可能にする (target 自体は入れない — 直下の item は
+///   `propagate_live_exports` の exact-match wildcard 伝播が拾う)。glob は module ではなく
+///   **中身**を再エクスポートするので target が private module でも有効で (E0365 は module 自体を
+///   名前として再エクスポートする場合の制限)、target の `declared_pub` は要求しない。
+///   ただし **glob import は source namespace の同名 item に shadow される**ため、型名前空間を
+///   占める同名 item (子 module / module の named re-export) が source にあれば到達可能化しない。
+///   旧実装は Named 以外を `else { continue; }` で捨てていたため、
 ///   `mod internal; pub use internal::*;` 構成で **pub 子 module 配下**の公開 API 変更が無音に
-///   なっていた (target 直下の item は `propagate_live_exports` の exact-match wildcard 伝播が
-///   拾うので従来も検出できていた。落ちるのは seed の module が wildcard の target と一致しない
-///   子 module 配下)。
+///   なっていた (落ちるのは seed の module が wildcard の target と一致しない子 module 配下)。
 ///
 /// どちらの経路でも private child module は親が公開されても外部から辿れないため含めない
 /// (単純な prefix 判定だと private 子まで誤って公開扱いになる)。
@@ -770,15 +772,29 @@ fn compute_reexport_reachable_modules(
     all_modules: &std::collections::HashMap<Vec<String>, Vec<String>>,
 ) -> std::collections::HashSet<Vec<String>> {
     let mut reachable = public_modules.clone();
-    // glob shadow 判定用: Named re-export が source namespace へ持ち込む名前。
-    let named_exports_in_source: std::collections::HashSet<(&Vec<String>, &String)> = edges
+    // glob shadow 判定用: Named re-export が source namespace へ持ち込む **module 名**。
+    //
+    // **名前空間を区別する必要がある**。Rust では `mod api` は型名前空間、`fn api` は
+    // 値名前空間なので共存でき、`pub use other::thing as api;` (thing は関数) は
+    // glob 由来の module `api` を shadow しない。名前だけで shadow 扱いにすると、
+    // 実際に公開されている `api::found` の削除を見逃す (false negative)。
+    // target が module だと証明できる (= `target_module + target_item` が実在 module) 場合
+    // だけ shadow とみなす。
+    let named_module_reexports: std::collections::HashSet<(&Vec<String>, &String)> = edges
         .iter()
         .filter_map(|e| match e {
             RustPubUseEdge::Named {
                 source_module,
+                target_module,
+                target_item,
                 exported_name,
-                ..
-            } => Some((source_module, exported_name)),
+            } => {
+                let mut target_path = target_module.clone();
+                target_path.push(target_item.clone());
+                all_modules
+                    .contains_key(&target_path)
+                    .then_some((source_module, exported_name))
+            }
             RustPubUseEdge::Wildcard { .. } => None,
         })
         .collect();
@@ -818,17 +834,21 @@ fn compute_reexport_reachable_modules(
                 };
                 for child in pub_children {
                     // **glob import は source namespace の明示 item / named import に shadow
-                    // される**。同名の子 module が source にある (private でも shadow する) か、
-                    // 同名を named re-export している場合、外から見える `S::child` は glob 由来では
-                    // ないので到達可能化しない。
+                    // される**。glob が持ち込むのは module なので、shadow するのも
+                    // **型名前空間を占める同名 item** に限る:
+                    // (a) 同名の子 module が source にある (private でも namespace を占める)、
+                    // (b) 同名を **module の** named re-export で持ち込んでいる。
+                    // 関数などの値名前空間の同名 re-export は共存するので shadow しない。
                     //
                     // 検出できるのはこの 2 つの signal まで。型名前空間の非 module item
-                    // (`pub struct api`) による shadow は item 単位の情報が要るため見ておらず、
-                    // その場合は従来どおり (= 修正前と同じ) 到達可能扱いに倒れる。
+                    // (`pub struct api`) や `pub use` でない private named import
+                    // (`use other::module as api;`) による shadow は、item 単位の情報や
+                    // 非公開 import の収集が要るため見ておらず、その場合は従来どおり
+                    // (= 修正前と同じ) 到達可能扱いに倒れる。
                     let mut shadow_probe = source_module.clone();
                     shadow_probe.push(child.clone());
                     if all_modules.contains_key(&shadow_probe)
-                        || named_exports_in_source.contains(&(source_module, child))
+                        || named_module_reexports.contains(&(source_module, child))
                     {
                         continue;
                     }

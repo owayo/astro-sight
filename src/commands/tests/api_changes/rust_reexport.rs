@@ -864,11 +864,23 @@ fn detect_api_changes_wildcard_reexport_respects_glob_shadowing() {
             false,
         ),
         (
-            // named re-export が同名を持ち込む場合も shadow する
-            "named re-export による shadow",
+            // **module の** named re-export は型名前空間を占めるので shadow する
+            "module の named re-export による shadow",
+            "mod internal;\nmod other;\npub use other::sub as api;\npub use internal::*;\n",
+            vec![
+                ("src/other/mod.rs", "pub mod sub;\n"),
+                ("src/other/sub.rs", "pub fn other() -> u32 {\n    1\n}\n"),
+            ],
+            false,
+        ),
+        (
+            // 対照: **関数の** named re-export は値名前空間なので module と共存する。
+            // `api::found()` は glob 由来の module を参照できるので、shadow 扱いにすると
+            // 実際に公開されている API の削除を見逃す (false negative)。
+            "関数の named re-export は shadow しない",
             "mod internal;\nmod other;\npub use other::thing as api;\npub use internal::*;\n",
             vec![("src/other.rs", "pub fn thing() -> u32 {\n    1\n}\n")],
-            false,
+            true,
         ),
         (
             // 対照: shadow が無ければ従来どおり到達可能
