@@ -50,6 +50,13 @@ const TYPING_MODULES: [&str; 2] = ["typing", "typing_extensions"];
 const REQUIRED_QUALIFIER: &str = "Required";
 const NOT_REQUIRED_QUALIFIER: &str = "NotRequired";
 
+/// requiredness を変えずに型を包む wrapper。**修飾子はこれらの内側にも置ける**
+/// (PEP 655 "Interaction with Annotated" / PEP 705 の `ReadOnly`)。
+/// `Annotated[NotRequired[str], "meta"]` は `NotRequired[Annotated[str, "meta"]]` と等価なので、
+/// 最外周だけを見ると有効な requiredness 変更を取りこぼす。
+const ANNOTATED_WRAPPER: &str = "Annotated";
+const READ_ONLY_WRAPPER: &str = "ReadOnly";
+
 /// TypedDict クラス 1 件から読み取った契約事実。
 #[derive(Debug, PartialEq, Eq)]
 struct TypedDictFact {
@@ -403,6 +410,10 @@ fn analyze_typed_dict(
 struct RequirednessQualifiers {
     required: HashSet<TypingName>,
     not_required: HashSet<TypingName>,
+    /// `Annotated[X, ...]`。第 1 引数が実体で、以降はメタデータ。
+    annotated: HashSet<TypingName>,
+    /// `ReadOnly[X]` (PEP 705)。読み取り専用にするだけで requiredness は変えない。
+    read_only: HashSet<TypingName>,
 }
 
 impl RequirednessQualifiers {
@@ -411,18 +422,59 @@ impl RequirednessQualifiers {
         Some(Self {
             required: collect_typing_names(root, source, REQUIRED_QUALIFIER)?,
             not_required: collect_typing_names(root, source, NOT_REQUIRED_QUALIFIER)?,
+            annotated: collect_typing_names(root, source, ANNOTATED_WRAPPER)?,
+            read_only: collect_typing_names(root, source, READ_ONLY_WRAPPER)?,
         })
     }
 
     /// 収集した名前がすべて shadow されていないか。
     fn all_provable(&self, bindings: &BindingCounts) -> bool {
-        self.required
+        let sets = [
+            (&self.required, REQUIRED_QUALIFIER),
+            (&self.not_required, NOT_REQUIRED_QUALIFIER),
+            (&self.annotated, ANNOTATED_WRAPPER),
+            (&self.read_only, READ_ONLY_WRAPPER),
+        ];
+        sets.iter()
+            .all(|(names, target)| names.iter().all(|n| n.is_provable(bindings, target)))
+    }
+
+    /// 名前が requiredness 修飾子なら、その requiredness を返す。
+    fn qualifier_requiredness(&self, path: &str) -> Option<bool> {
+        if self
+            .required
             .iter()
-            .all(|n| n.is_provable(bindings, REQUIRED_QUALIFIER))
-            && self
-                .not_required
-                .iter()
-                .all(|n| n.is_provable(bindings, NOT_REQUIRED_QUALIFIER))
+            .any(|n| n.base_text(REQUIRED_QUALIFIER) == path)
+        {
+            Some(true)
+        } else if self
+            .not_required
+            .iter()
+            .any(|n| n.base_text(NOT_REQUIRED_QUALIFIER) == path)
+        {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// 名前が requiredness を変えない透過 wrapper なら、その種別を返す。
+    fn transparent_wrapper(&self, path: &str) -> Option<TransparentWrapper> {
+        if self
+            .annotated
+            .iter()
+            .any(|n| n.base_text(ANNOTATED_WRAPPER) == path)
+        {
+            Some(TransparentWrapper::Annotated)
+        } else if self
+            .read_only
+            .iter()
+            .any(|n| n.base_text(READ_ONLY_WRAPPER) == path)
+        {
+            Some(TransparentWrapper::ReadOnly)
+        } else {
+            None
+        }
     }
 
     /// 注釈の最外周が証明済み修飾子なら、その requiredness と型引数ノードを返す。
@@ -430,82 +482,157 @@ impl RequirednessQualifiers {
     /// 判定は AST で行う (文字列一致にしない) — `dict[str, NotRequired[int]]` のように
     /// 修飾子が内側にあるだけの注釈を最外周と取り違えないため。PEP 655 の修飾子は
     /// 注釈の最外周にしか置けないので、内側の出現は requiredness に影響しない。
-    fn outermost<'a>(
-        &self,
-        annotation: tree_sitter::Node<'a>,
-        source: &[u8],
-    ) -> QualifierMatch<'a> {
-        // 注釈は `type` ノードに包まれる。実体まで降りてから判定する。
-        //
-        // **添字の構文木は位置で変わる**。型注釈の位置 (`y: NotRequired[str]`) では
-        // `generic_type` + `type_parameter` になり、フィールド名を持たないので位置で読む。
-        // 式の位置 (`X = NotRequired[str]`) では `subscript` で `value` / `subscript`
-        // フィールドを持つ。TypedDict のフィールドは前者だが、両方受ける。
-        let node = unwrap_type_node(annotation);
-        let name_node = match node.kind() {
-            "generic_type" => node.named_child(0),
-            "subscript" => node.child_by_field_name("value"),
-            _ => None,
-        };
-        let Some(path) = name_node.and_then(|n| attribute_path(n, source)) else {
-            return QualifierMatch::None;
-        };
-        let required = if self
-            .required
-            .iter()
-            .any(|n| n.base_text(REQUIRED_QUALIFIER) == path)
-        {
-            true
-        } else if self
-            .not_required
-            .iter()
-            .any(|n| n.base_text(NOT_REQUIRED_QUALIFIER) == path)
-        {
-            false
-        } else {
-            return QualifierMatch::None;
-        };
-
-        // ここから先は「最外周が requiredness 修飾子だと確定した」。型引数の形が想定外なら
-        // 実効値を決めずに `Unprovable` (= 分類しない) へ倒す。`Required[T]` は
-        // 型引数ちょうど 1 つで、`Required[str, int]` は不正な形だが parse は通ってしまう。
-        let mut args = Vec::new();
-        match node.kind() {
-            "generic_type" => {
-                if let Some(params) = node.named_child(1)
-                    && params.kind() == "type_parameter"
-                {
-                    let mut cursor = params.walk();
-                    args.extend(params.named_children(&mut cursor));
+    /// 注釈から requiredness 修飾子を探し、剥がした後の型テキストとともに返す。
+    ///
+    /// 修飾子は最外周だけでなく **`Annotated` / `ReadOnly` の内側にも置ける**
+    /// (`Annotated[NotRequired[str], "meta"]` は `NotRequired[Annotated[str, "meta"]]` と等価)。
+    /// そのため透過 wrapper を辿りながら探す。判定は AST で行い字面では見ない —
+    /// `dict[str, NotRequired[int]]` のように**透過でない**型の引数に現れた修飾子は
+    /// requiredness に影響しないため辿らない。
+    ///
+    /// 修飾子が 2 つ以上見つかった場合 (`Required[NotRequired[str]]` 等の不正な形) は
+    /// 実効値が一意に決まらないので `Unprovable` へ倒す。
+    fn find_qualifier(&self, annotation: tree_sitter::Node<'_>, source: &[u8]) -> QualifierMatch {
+        let root = unwrap_type_node(annotation);
+        let mut node = root;
+        let mut found: Option<(bool, tree_sitter::Node<'_>, tree_sitter::Node<'_>)> = None;
+        while let Some((path, args)) = subscript_parts(node, source) {
+            if let Some(required) = self.qualifier_requiredness(&path) {
+                if found.is_some() {
+                    // 修飾子の入れ子は不正。実効値を一意に決められない。
+                    return QualifierMatch::Unprovable;
+                }
+                // `Required[T]` は型引数ちょうど 1 つ。`Required[str, int]` は不正な形だが
+                // parse は通ってしまうので明示的に弾く。
+                let [inner] = args.as_slice() else {
+                    return QualifierMatch::Unprovable;
+                };
+                found = Some((required, node, *inner));
+                node = unwrap_type_node(*inner);
+                continue;
+            }
+            match self.transparent_wrapper(&path) {
+                // `Annotated[X, meta, ...]` は実体 + メタデータ 1 つ以上。実体だけ辿る。
+                Some(TransparentWrapper::Annotated) => {
+                    if args.len() < 2 {
+                        return QualifierMatch::Unprovable;
+                    }
+                    node = unwrap_type_node(args[0]);
+                }
+                // `ReadOnly[X]` は型引数ちょうど 1 つ。
+                Some(TransparentWrapper::ReadOnly) => {
+                    let [inner] = args.as_slice() else {
+                        return QualifierMatch::Unprovable;
+                    };
+                    node = unwrap_type_node(*inner);
+                }
+                // 透過でない型に到達した。その引数の中の修飾子は requiredness に影響しない。
+                None => break,
+            }
+        }
+        match found {
+            Some((required, qualifier, inner)) => {
+                match strip_qualifier_text(root, qualifier, inner, source) {
+                    Some(underlying) => QualifierMatch::Proven {
+                        required,
+                        underlying,
+                    },
+                    // テキストを再構成できない (範囲が想定外) 場合は分類しない。
+                    None => QualifierMatch::Unprovable,
                 }
             }
-            "subscript" => {
-                let mut cursor = node.walk();
-                args.extend(node.children_by_field_name("subscript", &mut cursor));
+            None => {
+                // 透過 wrapper を剥がし切った先のテキスト。剥がせなければ注釈そのもの。
+                let core = source
+                    .get(node.start_byte()..node.end_byte())
+                    .map(super::normalize_signature_whitespace)
+                    .unwrap_or_default();
+                QualifierMatch::None { core }
             }
-            _ => {}
-        }
-        match args.as_slice() {
-            [inner] => QualifierMatch::Proven {
-                required,
-                inner: *inner,
-            },
-            _ => QualifierMatch::Unprovable,
         }
     }
 }
 
-/// 注釈の最外周が requiredness 修飾子かどうかの判定結果。
-enum QualifierMatch<'a> {
-    /// 修飾子ではない (実効 requiredness は `total` に従う)。
-    None,
-    /// 証明済み修飾子。`inner` は剥がした後の型。
-    Proven {
-        required: bool,
-        inner: tree_sitter::Node<'a>,
-    },
-    /// 修飾子の形だが実効値を決められない (型引数が 1 つでない)。
+/// 注釈に requiredness 修飾子があるかの判定結果。
+enum QualifierMatch {
+    /// 修飾子が無い (実効 requiredness は `total` に従う)。
+    ///
+    /// `core` は透過 wrapper (`Annotated` / `ReadOnly`) を剥がし切った後の型テキスト。
+    /// 「この注釈は requiredness 修飾子ではありえない」ことの証明はこれに対して行う —
+    /// `Annotated[str, "m"]` 全体は組み込み型ではないが、剥がした `str` は組み込み型で、
+    /// 別モジュールの `X = NotRequired[...]` エイリアスではありえないと言える。
+    None { core: String },
+    /// 証明済み修飾子。`underlying` は修飾子だけを取り除いた型テキスト
+    /// (`Annotated[NotRequired[str], "m"]` なら `Annotated[str, "m"]`)。
+    Proven { required: bool, underlying: String },
+    /// 修飾子の形だが実効値を決められない (型引数の数が不正 / 修飾子の入れ子)。
     Unprovable,
+}
+
+/// requiredness を変えずに型を包む wrapper の種別。引数の数の要件が違う。
+enum TransparentWrapper {
+    /// `Annotated[X, meta, ...]` — 実体 + メタデータ 1 つ以上。
+    Annotated,
+    /// `ReadOnly[X]` — 型引数ちょうど 1 つ。
+    ReadOnly,
+}
+
+/// 添字型 (`X[A, B]`) から「名前」と「型引数の並び」を取り出す。
+///
+/// **添字の構文木は位置で変わる**。型注釈の位置 (`y: NotRequired[str]`) では
+/// `generic_type` + `type_parameter` になりフィールド名を持たないので位置で読む。
+/// 式の位置 (`X = NotRequired[str]`) では `subscript` で `value` / `subscript` フィールドを持つ。
+/// TypedDict のフィールドは前者だが、両方受ける。
+fn subscript_parts<'a>(
+    node: tree_sitter::Node<'a>,
+    source: &[u8],
+) -> Option<(String, Vec<tree_sitter::Node<'a>>)> {
+    let (name_node, args) = match node.kind() {
+        "generic_type" => {
+            let params = node.named_child(1)?;
+            if params.kind() != "type_parameter" {
+                return None;
+            }
+            let mut cursor = params.walk();
+            (
+                node.named_child(0)?,
+                params.named_children(&mut cursor).collect(),
+            )
+        }
+        "subscript" => {
+            let mut cursor = node.walk();
+            (
+                node.child_by_field_name("value")?,
+                node.children_by_field_name("subscript", &mut cursor)
+                    .collect(),
+            )
+        }
+        _ => return None,
+    };
+    Some((attribute_path(name_node, source)?, args))
+}
+
+/// 注釈テキストから修飾子だけを取り除く (`Annotated[NotRequired[str], "m"]` →
+/// `Annotated[str, "m"]`)。修飾子が最外周なら剥がした型そのものになる。
+///
+/// 範囲の包含関係が想定どおりでなければ `None` (= 分類しない)。
+fn strip_qualifier_text(
+    annotation: tree_sitter::Node<'_>,
+    qualifier: tree_sitter::Node<'_>,
+    inner: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<String> {
+    let (a_start, a_end) = (annotation.start_byte(), annotation.end_byte());
+    let (q_start, q_end) = (qualifier.start_byte(), qualifier.end_byte());
+    let (i_start, i_end) = (inner.start_byte(), inner.end_byte());
+    if !(a_start <= q_start && q_end <= a_end && q_start <= i_start && i_end <= q_end) {
+        return None;
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(source.get(a_start..q_start)?);
+    out.extend_from_slice(source.get(i_start..i_end)?);
+    out.extend_from_slice(source.get(q_end..a_end)?);
+    Some(super::normalize_signature_whitespace(&out))
 }
 
 /// tree-sitter-python は注釈を `type` ノードで包む。実体ノードまで降りる。
@@ -1057,12 +1184,13 @@ fn field_fact(
     let full_text = super::normalize_signature_whitespace(
         source.get(annotation.start_byte()..annotation.end_byte())?,
     );
-    match qualifiers.outermost(annotation, source) {
+    match qualifiers.find_qualifier(annotation, source) {
         // 修飾子が確定した。実効値は修飾子そのもので、`total` の影響を受けない。
-        QualifierMatch::Proven { required, inner } => Some(TypedDictFieldFact {
-            underlying: super::normalize_signature_whitespace(
-                source.get(inner.start_byte()..inner.end_byte())?,
-            ),
+        QualifierMatch::Proven {
+            required,
+            underlying,
+        } => Some(TypedDictFieldFact {
+            underlying,
             qualifier: Some(required),
             requiredness_is_provable: true,
         }),
@@ -1073,8 +1201,10 @@ fn field_fact(
             requiredness_is_provable: false,
         }),
         // 修飾子なし。`total` に従うと言えるのは「修飾子ではありえない」と証明できる注釈だけ。
-        QualifierMatch::None => {
-            let provable = annotation_is_provably_plain(&full_text, bindings);
+        // 証明は透過 wrapper を剥がした `core` に対して行うが、型の同一性判定に使う
+        // `underlying` は注釈全体のまま (メタデータの変更を型変更として扱うため)。
+        QualifierMatch::None { core } => {
+            let provable = annotation_is_provably_plain(&core, bindings);
             Some(TypedDictFieldFact {
                 underlying: full_text,
                 qualifier: None,
@@ -1819,6 +1949,86 @@ mod tests {
         assert!(
             field_changes(old, new, "B").is_empty(),
             "total=False では NotRequired の有無で実効 requiredness は変わらない"
+        );
+    }
+    /// PEP 655 "Interaction with Annotated": 修飾子は `Annotated` の**内側**にも置ける。
+    /// `Annotated[NotRequired[str], "m"]` は `NotRequired[Annotated[str, "m"]]` と等価。
+    #[test]
+    fn qualifier_inside_annotated_is_recognized() {
+        let old = "from typing import Annotated, NotRequired, TypedDict\n\nclass B(TypedDict):\n    a: int\n    b: Annotated[NotRequired[str], \"m\"]\n";
+        let new = "from typing import Annotated, NotRequired, TypedDict\n\nclass B(TypedDict):\n    a: int\n    b: Annotated[str, \"m\"]\n";
+        assert_single_became_required(&field_changes(old, new, "B"), "B.b");
+    }
+
+    /// `Annotated` のメタデータが変わっただけなら型が変わったのと同じ扱いで、出さない。
+    /// (`underlying` に メタデータも含めているため一致しない)
+    #[test]
+    fn annotated_metadata_change_is_treated_as_type_change() {
+        let old = "from typing import Annotated, NotRequired, TypedDict\n\nclass B(TypedDict):\n    a: int\n    b: Annotated[NotRequired[str], \"old\"]\n";
+        let new = "from typing import Annotated, NotRequired, TypedDict\n\nclass B(TypedDict):\n    a: int\n    b: Annotated[str, \"new\"]\n";
+        assert!(
+            field_changes(old, new, "B").is_empty(),
+            "メタデータが変わっていれば requiredness だけが動いたとは言えない"
+        );
+    }
+
+    /// PEP 705 の `ReadOnly` も requiredness を変えない透過 wrapper。
+    #[test]
+    fn qualifier_inside_read_only_is_recognized() {
+        let old = "from typing import NotRequired, ReadOnly, TypedDict\n\nclass B(TypedDict):\n    a: int\n    b: ReadOnly[NotRequired[str]]\n";
+        let new = "from typing import NotRequired, ReadOnly, TypedDict\n\nclass B(TypedDict):\n    a: int\n    b: ReadOnly[str]\n";
+        assert_single_became_required(&field_changes(old, new, "B"), "B.b");
+    }
+
+    /// 修飾子が外側、透過 wrapper が内側でも同じ意味 (`NotRequired[Annotated[str, "m"]]`)。
+    #[test]
+    fn qualifier_outside_annotated_is_recognized() {
+        let old = "from typing import Annotated, NotRequired, TypedDict\n\nclass B(TypedDict):\n    a: int\n    b: NotRequired[Annotated[str, \"m\"]]\n";
+        let new = "from typing import Annotated, NotRequired, TypedDict\n\nclass B(TypedDict):\n    a: int\n    b: Annotated[str, \"m\"]\n";
+        assert_single_became_required(&field_changes(old, new, "B"), "B.b");
+    }
+
+    /// 修飾子の入れ子は不正な形。実効値が一意に決まらないので分類しない。
+    #[test]
+    fn nested_qualifiers_are_rejected() {
+        let old = "from typing import NotRequired, Required, TypedDict\n\nclass B(TypedDict):\n    a: int\n    b: Required[NotRequired[str]]\n";
+        let new = "from typing import NotRequired, Required, TypedDict\n\nclass B(TypedDict):\n    a: int\n    b: str\n";
+        assert!(
+            field_changes(old, new, "B").is_empty(),
+            "修飾子の入れ子は実効値を一意に決められない"
+        );
+    }
+
+    /// 透過 wrapper の名前が shadow されていたら、その中を辿れない。
+    #[test]
+    fn rebound_annotated_name_is_rejected() {
+        let old = "from typing import Annotated, NotRequired, TypedDict\n\nAnnotated = list\n\nclass B(TypedDict):\n    a: int\n    b: Annotated[NotRequired[str], \"m\"]\n";
+        let new = "from typing import Annotated, NotRequired, TypedDict\n\nAnnotated = list\n\nclass B(TypedDict):\n    a: int\n    b: Annotated[str, \"m\"]\n";
+        assert!(
+            field_changes(old, new, "B").is_empty(),
+            "shadow された wrapper 名は透過扱いにしない"
+        );
+    }
+
+    /// 出所不明の wrapper (`mypkg.Annotated`) は透過と証明できない。
+    #[test]
+    fn annotated_from_unknown_module_is_rejected() {
+        let old = "from typing import NotRequired, TypedDict\nfrom mypkg import Annotated\n\nclass B(TypedDict):\n    a: int\n    b: Annotated[NotRequired[str], \"m\"]\n";
+        let new = "from typing import NotRequired, TypedDict\nfrom mypkg import Annotated\n\nclass B(TypedDict):\n    a: int\n    b: Annotated[str, \"m\"]\n";
+        assert!(
+            field_changes(old, new, "B").is_empty(),
+            "出所不明の wrapper は透過扱いにしない"
+        );
+    }
+
+    /// `Annotated` はメタデータが必須。`Annotated[X]` は不正な形なので分類しない。
+    #[test]
+    fn annotated_without_metadata_is_rejected() {
+        let old = "from typing import Annotated, NotRequired, TypedDict\n\nclass B(TypedDict):\n    a: int\n    b: Annotated[NotRequired[str]]\n";
+        let new = "from typing import Annotated, NotRequired, TypedDict\n\nclass B(TypedDict):\n    a: int\n    b: Annotated[str]\n";
+        assert!(
+            field_changes(old, new, "B").is_empty(),
+            "メタデータの無い Annotated は不正な形"
         );
     }
 }
