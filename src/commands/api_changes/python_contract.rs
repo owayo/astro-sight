@@ -458,6 +458,28 @@ impl RequirednessQualifiers {
         }
     }
 
+    /// 注釈**全体**に現れる証明済み requiredness 修飾子の個数を数える。
+    ///
+    /// 探索経路 (透過 wrapper を辿る経路) の外に現れた修飾子は PEP 655 上は無効な位置
+    /// (`Required[dict[str, NotRequired[int]]]` の内側など) だが、**注釈の意図が読めない**ため
+    /// 分類を諦める根拠にする。数えないと、外側の修飾子だけを見て「型は同一のまま requiredness が
+    /// 動いた」と誤分類したり、`Annotated[dict[str, NotRequired[int]], "m"]` を「修飾子ではない」
+    /// と証明して `total` 反転の根拠にしてしまう。
+    fn count_qualifiers(&self, node: tree_sitter::Node<'_>, source: &[u8]) -> usize {
+        let mut count = 0;
+        let mut stack = vec![node];
+        while let Some(n) = stack.pop() {
+            if let Some((path, _)) = subscript_parts(n, source)
+                && self.qualifier_requiredness(&path).is_some()
+            {
+                count += 1;
+            }
+            let mut cursor = n.walk();
+            stack.extend(n.named_children(&mut cursor));
+        }
+        count
+    }
+
     /// 名前が requiredness を変えない透過 wrapper なら、その種別を返す。
     fn transparent_wrapper(&self, path: &str) -> Option<TransparentWrapper> {
         if self
@@ -494,6 +516,11 @@ impl RequirednessQualifiers {
     /// 実効値が一意に決まらないので `Unprovable` へ倒す。
     fn find_qualifier(&self, annotation: tree_sitter::Node<'_>, source: &[u8]) -> QualifierMatch {
         let root = unwrap_type_node(annotation);
+        // 経路外を含む出現数を先に見る。2 個以上あれば実効値が一意に決まらない。
+        let qualifier_count = self.count_qualifiers(root, source);
+        if qualifier_count > 1 {
+            return QualifierMatch::Unprovable;
+        }
         let mut node = root;
         let mut found: Option<(bool, tree_sitter::Node<'_>, tree_sitter::Node<'_>)> = None;
         while let Some((path, args)) = subscript_parts(node, source) {
@@ -541,6 +568,10 @@ impl RequirednessQualifiers {
                     None => QualifierMatch::Unprovable,
                 }
             }
+            // 探索経路の外にだけ修飾子がある (`dict[str, NotRequired[int]]` 等)。
+            // 無効な位置なので実効 requiredness は `total` に従うのが仕様上の解釈だが、
+            // 注釈の意図が読めないので「修飾子ではない」とも証明しない。
+            None if qualifier_count > 0 => QualifierMatch::Unprovable,
             None => {
                 // 透過 wrapper を剥がし切った先のテキスト。剥がせなければ注釈そのもの。
                 let core = source
@@ -2029,6 +2060,48 @@ mod tests {
         assert!(
             field_changes(old, new, "B").is_empty(),
             "メタデータの無い Annotated は不正な形"
+        );
+    }
+    /// 探索経路の**外**にも修飾子がある注釈は分類しない。
+    ///
+    /// `Required[dict[str, NotRequired[int]]]` の内側 `NotRequired` は PEP 655 上無効な位置だが、
+    /// 外側の `Required` だけを見て「型は同一のまま requiredness が動いた」と分類すると、
+    /// 不正な注釈に正常な変更のラベルが付く。
+    #[test]
+    fn qualifier_outside_search_path_is_rejected() {
+        let old = "from typing import NotRequired, Required, TypedDict\n\nclass B(TypedDict, total=False):\n    a: int\n    b: Required[dict[str, NotRequired[int]]]\n";
+        let new = "from typing import NotRequired, Required, TypedDict\n\nclass B(TypedDict, total=False):\n    a: int\n    b: dict[str, NotRequired[int]]\n";
+        assert!(
+            field_changes(old, new, "B").is_empty(),
+            "経路外を含めて修飾子が 2 個ある注釈は実効値を一意に決められない"
+        );
+    }
+
+    /// 経路外にだけ修飾子がある注釈は「修飾子ではない」とも証明しない。
+    ///
+    /// 証明してしまうと `total` 反転の分類根拠 (`total_flip_moves_any_field`) に使われる。
+    /// 対照として、修飾子を含まない同型の注釈は従来どおり証明できることを同じテストで固定する。
+    #[test]
+    fn qualifier_in_non_transparent_argument_is_not_provable() {
+        let f = fact(
+            "from typing import Annotated, NotRequired, TypedDict\n\nclass B(TypedDict, total=False):\n    b: Annotated[dict[str, NotRequired[int]], \"m\"]\n",
+            "B",
+        )
+        .expect("事実の抽出は成功する");
+        assert!(
+            !f.total_flip_moves_any_field(),
+            "経路外の修飾子を含む注釈は total の影響を受けると証明できない"
+        );
+
+        // 対照: 修飾子を含まなければ従来どおり証明できる。
+        let plain = fact(
+            "from typing import Annotated, NotRequired, TypedDict\n\nclass C(TypedDict, total=False):\n    b: Annotated[dict[str, int], \"m\"]\n",
+            "C",
+        )
+        .expect("事実の抽出は成功する");
+        assert!(
+            plain.total_flip_moves_any_field(),
+            "透過 wrapper を剥がした先が組み込み型なら total の影響を証明できる"
         );
     }
 }
