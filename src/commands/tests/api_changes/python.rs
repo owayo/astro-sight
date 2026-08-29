@@ -621,9 +621,23 @@ class Payload(TypedDict):
     let diff_files = vec![whole_file_diff("models.py", 6)];
     let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
 
+    let contract = contract_of(&api, "Payload").expect(
+        "修飾子が同居していても、修飾子なしフィールド (a: int) の requiredness は total で動くので分類できる",
+    );
+    assert_eq!(
+        contract.kind,
+        crate::models::review::ApiContractChangeKind::TypedDictTotalFalseRemoved
+    );
+    assert_eq!(
+        contract.breaks,
+        crate::models::review::ApiContractSide::Producer
+    );
+    // 対照: 修飾子付きフィールドしか無ければ total を反転しても実効値は動かないので
+    // 種別を付けない (blocking は維持される。`unclassifiable_total_change_is_still_not_demoted`)。
     assert!(
-        contract_of(&api, "Payload").is_none(),
-        "NotRequired が同居するファイルは実効 requiredness を証明できないので分類しない (別 Issue)"
+        !api.modified.iter().any(|c| c.name == "Payload.b"),
+        "total 変更はクラス単位で報告し、修飾子付きフィールドを二重に出さない: {:?}",
+        api.modified
     );
 }
 
@@ -664,9 +678,12 @@ class Payload(TypedDict):
 
 /// **severity ガードの回帰テスト** (レビュー 3 巡目の指摘)。
 ///
-/// `NotRequired` が同居して**種別を確定できない** `total=` 変更でも、blocking な `api.mod` に
-/// 残さなければならない。分類できないことは「破壊的でない」証明ではなく、ここでは bare な
-/// `a: int` の requiredness が実際に反転している。
+/// **種別を確定できない** `total=` 変更でも、blocking な `api.mod` に残さなければならない。
+/// 分類できないことは「破壊的でない」証明ではない。
+///
+/// ここでは唯一のフィールドが別モジュール由来の `MyModel` で、それが `NotRequired[...]` の
+/// 型エイリアスである可能性を静的に排除できないため実効 requiredness を決められない。
+/// それでも実際には反転している可能性があるので blocking は維持する。
 ///
 /// 前提は `typed_dict_total_change_is_never_demoted_even_if_callers_updated_in_diff` と同じで、
 /// 現状 Python の class は降格経路に到達しないため、バケットの assert は前方ガードとして効く。
@@ -677,12 +694,12 @@ fn unclassifiable_total_change_is_still_not_demoted() {
     init_git_repo_for_test(repo);
 
     let models_before = "\
-from typing import TypedDict, NotRequired
+from typing import TypedDict
+from mylib import MyModel
 
 
 class Payload(TypedDict, total=False):
-    a: int
-    b: NotRequired[str]
+    a: MyModel
 ";
     let producer_before = "\
 from models import Payload
@@ -701,12 +718,12 @@ def build() -> Payload:
     );
 
     let models_after = "\
-from typing import TypedDict, NotRequired
+from typing import TypedDict
+from mylib import MyModel
 
 
 class Payload(TypedDict):
-    a: int
-    b: NotRequired[str]
+    a: MyModel
 ";
     let producer_after = "\
 from models import Payload
@@ -936,4 +953,262 @@ fn detect_api_changes_python_implicit_string_concat_counterexamples_stay_modifie
             "反例を compatible_modified へ降格しない: {api:?}"
         );
     }
+}
+
+/// `y: NotRequired[str]` → `y: str` (省略可キーの必須化) を検出すること。
+///
+/// クラスヘッダ行が変わらないため既存のシグネチャ差分ループには乗らない。
+/// 独立した contract 経路が拾う (Issue
+/// 2026-08-19-python-typeddict-field-requiredness-detection)。
+#[test]
+fn typed_dict_not_required_removal_is_classified_as_producer_break() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let before = "\
+from typing import NotRequired, TypedDict
+
+
+class Payload(TypedDict):
+    x: int
+    y: NotRequired[str]
+";
+    git_commit_files(repo, &[("models.py", before)], "initial");
+
+    let after = "\
+from typing import NotRequired, TypedDict
+
+
+class Payload(TypedDict):
+    x: int
+    y: str
+";
+    fs::write(repo.join("models.py"), after).expect("write");
+
+    let diff_files = vec![whole_file_diff("models.py", 6)];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    eprintln!("modified: {:?}", api.modified);
+
+    let contract = contract_of(&api, "Payload.y")
+        .expect("NotRequired の除去はフィールド単位の型契約変更として分類されるべき");
+    assert_eq!(
+        contract.kind,
+        crate::models::review::ApiContractChangeKind::TypedDictFieldBecameRequired
+    );
+    assert_eq!(
+        contract.breaks,
+        crate::models::review::ApiContractSide::Producer
+    );
+}
+
+/// `y: str` → `y: NotRequired[str]` (必須キーの省略可化) を検出すること。
+///
+/// 対照として、同じ diff に置いた「表記も requiredness も変わらないフィールド」と
+/// 「型だけが変わったフィールド」が出ないことを同時に固定する。後者を出してしまうと
+/// 「requiredness の変更」というラベルが型変更にも付く。
+#[test]
+fn typed_dict_not_required_addition_is_classified_as_consumer_break() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let before = "\
+from typing import NotRequired, TypedDict
+
+
+class Payload(TypedDict):
+    keep: NotRequired[int]
+    widened: str
+    retyped: NotRequired[int]
+";
+    git_commit_files(repo, &[("models.py", before)], "initial");
+
+    let after = "\
+from typing import NotRequired, TypedDict
+
+
+class Payload(TypedDict):
+    keep: NotRequired[int]
+    widened: NotRequired[str]
+    retyped: NotRequired[float]
+";
+    fs::write(repo.join("models.py"), after).expect("write");
+
+    let diff_files = vec![whole_file_diff("models.py", 7)];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    let contract = contract_of(&api, "Payload.widened")
+        .expect("NotRequired の付与はフィールド単位の型契約変更として分類されるべき");
+    assert_eq!(
+        contract.kind,
+        crate::models::review::ApiContractChangeKind::TypedDictFieldBecameNotRequired
+    );
+    assert_eq!(
+        contract.breaks,
+        crate::models::review::ApiContractSide::Consumer,
+        "必須キーの省略可化で壊れるのは値を読む側"
+    );
+
+    assert!(
+        contract_of(&api, "Payload.keep").is_none(),
+        "requiredness が変わらないフィールドは出さない"
+    );
+    assert!(
+        contract_of(&api, "Payload.retyped").is_none(),
+        "型が変わったフィールドは『requiredness だけが動いた』と言えないので出さない: {:?}",
+        api.modified
+    );
+}
+
+/// requiredness 変更は、リポジトリ内の参照が同一 diff で更新済みでも blocking に残ること。
+///
+/// 外部リポジトリや動的に組み立てた dict は静的に追えないため、`total=` 変更と同じ理由で
+/// 降格させてはいけない。対照として、同じ diff 内の**通常の Python 関数**が従来どおり
+/// 扱われること (契約ラベルが付かないこと) を同時に固定する。
+#[test]
+fn typed_dict_field_requiredness_stays_blocking_when_all_callers_updated() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let models_before = "\
+from typing import NotRequired, TypedDict
+
+
+class Payload(TypedDict):
+    x: int
+    y: NotRequired[str]
+
+
+def build(x: int) -> Payload:
+    return {\"x\": x}
+";
+    let caller_before = "\
+from models import Payload, build
+
+
+def run() -> Payload:
+    return build(1)
+";
+    git_commit_files(
+        repo,
+        &[("models.py", models_before), ("caller.py", caller_before)],
+        "initial",
+    );
+
+    // y を必須化し、同一 diff で唯一の呼び出し側も追随させる。
+    let models_after = "\
+from typing import NotRequired, TypedDict
+
+
+class Payload(TypedDict):
+    x: int
+    y: str
+
+
+def build(x: int, y: str) -> Payload:
+    return {\"x\": x, \"y\": y}
+";
+    let caller_after = "\
+from models import Payload, build
+
+
+def run() -> Payload:
+    return build(1, \"z\")
+";
+    fs::write(repo.join("models.py"), models_after).expect("write");
+    fs::write(repo.join("caller.py"), caller_after).expect("write");
+
+    let diff_files = vec![
+        whole_file_diff("models.py", 10),
+        whole_file_diff("caller.py", 5),
+    ];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    let contract = contract_of(&api, "Payload.y")
+        .expect("呼び出し側を全て更新しても requiredness 変更は blocking な api.mod に残るべき");
+    assert_eq!(
+        contract.kind,
+        crate::models::review::ApiContractChangeKind::TypedDictFieldBecameRequired
+    );
+    assert!(
+        !api.compatible_modified
+            .iter()
+            .any(|c| c.name == "Payload.y"),
+        "契約変更を互換扱いへ降格させてはいけない"
+    );
+    assert!(
+        !api.modified_closed_in_diff
+            .iter()
+            .any(|c| c.name == "Payload.y"),
+        "契約変更を『同一 diff で解決済み』へ降格させてはいけない"
+    );
+
+    // 対照: 同じ diff の通常関数は契約ラベルを持たない (この経路が Python の class 以外へ
+    // 波及していないこと)。
+    assert!(
+        contract_of(&api, "build").is_none(),
+        "通常の関数シグネチャ変更に契約ラベルは付かない"
+    );
+}
+
+/// 公開判定は既存の exported symbol 判定と共有する。
+///
+/// `__all__` に載っていないクラスのフィールド requiredness が変わっても報告しない。
+/// contract 判定に独自の公開判定を持たせると、`symbols` / `dead-code` と食い違う。
+/// 対照として、同じ diff の `__all__` 掲載クラスは従来どおり報告されることを固定する。
+#[test]
+fn typed_dict_field_change_respects_dunder_all() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let before = "\
+from typing import NotRequired, TypedDict
+
+__all__ = [\"Public\"]
+
+
+class Public(TypedDict):
+    x: int
+    y: NotRequired[str]
+
+
+class Internal(TypedDict):
+    x: int
+    y: NotRequired[str]
+";
+    git_commit_files(repo, &[("models.py", before)], "initial");
+
+    let after = "\
+from typing import NotRequired, TypedDict
+
+__all__ = [\"Public\"]
+
+
+class Public(TypedDict):
+    x: int
+    y: str
+
+
+class Internal(TypedDict):
+    x: int
+    y: str
+";
+    fs::write(repo.join("models.py"), after).expect("write");
+
+    let diff_files = vec![whole_file_diff("models.py", 14)];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    assert!(
+        contract_of(&api, "Public.y").is_some(),
+        "__all__ に載っているクラスは報告する: {:?}",
+        api.modified
+    );
+    assert!(
+        contract_of(&api, "Internal.y").is_none(),
+        "__all__ に載っていないクラスは公開 API 面ではないので報告しない: {:?}",
+        api.modified
+    );
 }

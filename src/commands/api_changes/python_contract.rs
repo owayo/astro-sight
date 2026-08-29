@@ -1,4 +1,4 @@
-//! Python 固有の型契約変更の分類 (TypedDict の `total=` 変更)。
+//! Python 固有の型契約変更の分類 (TypedDict の `total=` 変更とフィールド requiredness 変更)。
 //!
 //! `api.mod` は「シグネチャが変わった」までしか言えないため、トリアージは毎回ソースを開いて
 //! 「引数が増えたのか / 型が狭まったのか / キーが必須化したのか」を読み直していた。ここでは
@@ -24,9 +24,16 @@
 //! 初手が逆になる」であって、破壊的変更の見逃しにはならない。降格判定 (fail-open が
 //! 破壊的変更の見逃しに直結する側) には一切関与しない。
 //!
-//! **対象外 (別 Issue)**: `NotRequired[...]` の追加・削除と `Literal` の値集合変更。どちらも
-//! 現状そもそも検出されておらず (クラスヘッダ行が変わらない / 型エイリアスが公開シンボルでない)、
-//! 分類ではなく新規検出の追加になるため、検出面・公開判定・出力単位を別途設計する。
+//! **フィールド単位の requiredness 変更** (`y: NotRequired[str]` → `y: str`) はクラスヘッダ行が
+//! 変わらないため api.mod 候補にすらならなかった。`detect_typed_dict_field_requiredness_changes`
+//! がシグネチャ差分と独立した新規検出経路として拾い、フィールド単位の疑似シンボル
+//! (`Class.field`, kind=`field`) として出力する (Issue
+//! 2026-08-19-python-typeddict-field-requiredness-detection)。こちらは `total` が動かない
+//! ケースだけを扱い、`total` の変更はクラス単位の判定が所有する (二重報告しない)。
+//!
+//! **対象外 (別 Issue)**: `Literal` の値集合変更。型エイリアスが公開シンボルでないため
+//! そもそも現状は未検出であり、分類ではなく新規検出の追加になるため、検出面・公開判定・
+//! 出力単位を別途設計する。
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -35,8 +42,13 @@ use crate::models::review::{ApiContractChange, ApiContractChangeKind, ApiContrac
 
 use super::source_pair::{CompatibleModSite, SignatureSourceCache};
 
-/// `typing` / `typing_extensions` から来た `TypedDict` だけを本物として認める。
-const TYPED_DICT_MODULES: [&str; 2] = ["typing", "typing_extensions"];
+/// `typing` / `typing_extensions` から来た名前 (`TypedDict` / `Required` / `NotRequired`) だけを
+/// 本物として認める。
+const TYPING_MODULES: [&str; 2] = ["typing", "typing_extensions"];
+
+/// PEP 655 の requiredness 修飾子。`typing` / `typing_extensions` 由来と証明できたものだけ扱う。
+const REQUIRED_QUALIFIER: &str = "Required";
+const NOT_REQUIRED_QUALIFIER: &str = "NotRequired";
 
 /// TypedDict クラス 1 件から読み取った契約事実。
 #[derive(Debug, PartialEq, Eq)]
@@ -48,9 +60,61 @@ struct TypedDictFact {
     /// PEP 695 の型パラメータ (`class B[T](TypedDict)`) のテキスト。無ければ `None`。
     /// 基底と同じ理由で old/new の一致を要求する。
     type_params: Option<String>,
-    /// このクラス自身が宣言したフィールドの `名前 → 型注釈テキスト`。
+    /// このクラス自身が宣言したフィールドの `名前 → 契約事実`。
     /// `total` は自クラスで宣言したフィールドにしか作用しないため、継承分は含めない。
-    own_fields: BTreeMap<String, String>,
+    own_fields: BTreeMap<String, TypedDictFieldFact>,
+}
+
+/// フィールド 1 件の契約事実。
+///
+/// 3 つを分けて持つのが要点。total 変更の判定 (「total 反転で実効値が動くフィールドがあるか」) と
+/// フィールド変更の判定 (「型は同じまま修飾子だけ変わったか」) で必要な保証が違うため。
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct TypedDictFieldFact {
+    /// PEP 655 の requiredness 修飾子を剥がした型注釈テキスト (正規化済み)。
+    /// 修飾子が無ければ注釈そのもの。
+    underlying: String,
+    /// 明示された requiredness 修飾子。`Required[T]` = `Some(true)` /
+    /// `NotRequired[T]` = `Some(false)` / 修飾子なし = `None` (実効値は class の `total` に従う)。
+    qualifier: Option<bool>,
+    /// このフィールドの実効 requiredness を確定できるか。
+    ///
+    /// 修飾子ありなら常に `true` (修飾子が実効値そのもの)。修飾子なしの場合は
+    /// 「注釈が requiredness 修飾子ではありえない」と証明できたときだけ `true` —
+    /// 別モジュールの `X = NotRequired[str]` を import して `y: X` と書かれている
+    /// 可能性を静的に排除できないため (`annotation_is_provably_plain`)。
+    requiredness_is_provable: bool,
+}
+
+impl TypedDictFieldFact {
+    /// 実効 requiredness。確定できなければ `None`。
+    fn effective(&self, effective_total: bool) -> Option<bool> {
+        if !self.requiredness_is_provable {
+            return None;
+        }
+        Some(self.qualifier.unwrap_or(effective_total))
+    }
+
+    /// このフィールドの実効 requiredness が `total` の反転で動くと証明できるか。
+    ///
+    /// 修飾子付きは `total` に左右されない (`NotRequired[str]` は total に関わらず省略可)。
+    /// 修飾子なしでも、注釈が修飾子ではありえないと証明できなければ動くとは言えない。
+    fn moves_with_total(&self) -> bool {
+        self.qualifier.is_none() && self.requiredness_is_provable
+    }
+}
+
+impl TypedDictFact {
+    /// `total` を反転させたとき、実効 requiredness が動くフィールドが 1 件以上あるか。
+    ///
+    /// 1 件も無ければ `total` の字面が変わっても契約は変わらない可能性があるため、
+    /// 種別を付けずに blocking だけ維持する。フィールドが 0 件のクラス、
+    /// 別モジュール由来の型注釈しか持たないクラス、修飾子付きフィールドしか無いクラスが該当する。
+    fn total_flip_moves_any_field(&self) -> bool {
+        self.own_fields
+            .values()
+            .any(TypedDictFieldFact::moves_with_total)
+    }
 }
 
 /// Python の TypedDict で `total=` の実効値が反転した api.mod を型契約変更として分類する。
@@ -110,10 +174,17 @@ pub(crate) fn detect_python_typed_dict_total_change(
 
     // total 以外の変更が混ざっていると「壊れる側」が一意に決まらないため種別は付けない。
     // 基底クラスが変わると継承フィールドが増減し、型パラメータが変わると具体化が変わる。
+    // フィールド事実の完全一致は requiredness 修飾子の付け外しも弾く (同一 diff で
+    // `total` と修飾子が両方変わった場合は、どのキーがどちら向きに動いたか一意に決まらない)。
     if old_fact.own_fields != new_fact.own_fields
         || old_fact.bases != new_fact.bases
         || old_fact.type_params != new_fact.type_params
     {
+        return D::PotentialBreakingChange;
+    }
+    // `total` の反転で実効 requiredness が実際に動くフィールドが 1 件以上あることを要求する。
+    // old/new のフィールド事実は上で一致を確認済みなので、どちらを見ても同じ。
+    if !old_fact.total_flip_moves_any_field() {
         return D::PotentialBreakingChange;
     }
     match (old_fact.effective_total, new_fact.effective_total) {
@@ -164,6 +235,101 @@ pub(crate) fn may_be_python_typed_dict_total_change(
         && (old_sig.contains("total") || new_sig.contains("total"))
 }
 
+/// TypedDict のフィールド 1 件の requiredness 変更。
+///
+/// クラスヘッダが変わらないため既存の api.mod 経路 (シグネチャ差分) には乗らない。
+/// 出力時にフィールド単位の疑似シンボル (`Class.field`, kind=`field`) へ変換する。
+#[derive(Debug)]
+pub(crate) struct TypedDictFieldChange {
+    /// `Class.field` 形式の qualname。既存のメソッド qualname (`Container.method`) と同じ規則。
+    pub(crate) name: String,
+    /// 表示用の変更前後 (`optional str` → `required str`)。型注釈そのものは変わらないため、
+    /// 生の注釈テキストを出しても差分が読めない。
+    pub(crate) old_signature: String,
+    pub(crate) new_signature: String,
+    pub(crate) contract: ApiContractChange,
+}
+
+/// クラスヘッダが変わらない TypedDict で、フィールドの実効 requiredness が変わったものを集める。
+///
+/// `y: NotRequired[str]` → `y: str` は「クラスヘッダ行が変わらない」ため
+/// `collect_modified_symbols` のシグネチャ差分ループに乗らず、api.mod 候補にすらならない
+/// (Issue 2026-08-19-python-typeddict-field-requiredness-detection)。ここは
+/// シグネチャ差分と独立に old/new の契約事実を突き合わせる新規検出経路。
+///
+/// **`total` が動いた場合は何も返さない**。そちらは `detect_python_typed_dict_total_change` の
+/// 担当で、同じ変更をクラス単位とフィールド単位で二重報告しないため。
+///
+/// 分類するのは「型は同一のまま requiredness だけが動いた」と証明できたフィールドだけ。
+/// フィールドの追加・削除・型変更は requiredness の変更ではないので v1 では扱わない
+/// (検出漏れであって誤検出ではない)。
+pub(crate) fn detect_typed_dict_field_requiredness_changes(
+    old_root: tree_sitter::Node<'_>,
+    old_source: &[u8],
+    new_root: tree_sitter::Node<'_>,
+    new_source: &[u8],
+    class_name: &str,
+) -> Vec<TypedDictFieldChange> {
+    let (Some(old_fact), Some(new_fact)) = (
+        analyze_typed_dict(old_root, old_source, class_name),
+        analyze_typed_dict(new_root, new_source, class_name),
+    ) else {
+        return Vec::new();
+    };
+    // クラスヘッダが動いていたら class-level detector の担当。基底・型パラメータが変わると
+    // 継承フィールドや具体化も変わるため、フィールド単位の帰属自体が怪しくなる。
+    if old_fact.effective_total != new_fact.effective_total
+        || old_fact.bases != new_fact.bases
+        || old_fact.type_params != new_fact.type_params
+    {
+        return Vec::new();
+    }
+
+    let total = old_fact.effective_total;
+    let mut changes = Vec::new();
+    // `own_fields` は BTreeMap なので反復順はフィールド名順で決定的。
+    for (field, old_field) in &old_fact.own_fields {
+        let Some(new_field) = new_fact.own_fields.get(field) else {
+            continue;
+        };
+        // 型そのものが変われば「requiredness だけが動いた」とは言えない。
+        if old_field.underlying != new_field.underlying {
+            continue;
+        }
+        let (Some(was_required), Some(is_required)) =
+            (old_field.effective(total), new_field.effective(total))
+        else {
+            continue;
+        };
+        let (kind, breaks) = match (was_required, is_required) {
+            // 省略可だったキーが必須化 → dict literal を組む側が壊れる。
+            (false, true) => (
+                ApiContractChangeKind::TypedDictFieldBecameRequired,
+                ApiContractSide::Producer,
+            ),
+            // 必須だったキーが省略可に → 値を読む側が壊れる。
+            (true, false) => (
+                ApiContractChangeKind::TypedDictFieldBecameNotRequired,
+                ApiContractSide::Consumer,
+            ),
+            _ => continue,
+        };
+        changes.push(TypedDictFieldChange {
+            name: format!("{class_name}.{field}"),
+            old_signature: requiredness_signature(was_required, &old_field.underlying),
+            new_signature: requiredness_signature(is_required, &new_field.underlying),
+            contract: ApiContractChange { kind, breaks },
+        });
+    }
+    changes
+}
+
+/// 表示用シグネチャ。型注釈が同一でも requiredness の差が読めるようにする。
+fn requiredness_signature(required: bool, underlying: &str) -> String {
+    let requiredness = if required { "required" } else { "optional" };
+    format!("{requiredness} {underlying}")
+}
+
 /// 1 ソースから対象クラスの契約事実を取り出す。証明できない形はすべて `None`。
 fn analyze_typed_dict(
     root: tree_sitter::Node<'_>,
@@ -173,17 +339,14 @@ fn analyze_typed_dict(
     if root.has_error() {
         return None;
     }
-    // `Required` / `NotRequired` が現れるファイルは対象外。これらはフィールド単位で
-    // `total` を打ち消すため、alias (`from typing import NotRequired as NR`) や別ファイルの
-    // 型エイリアス経由まで含めて「実効 requiredness が変わったか」を証明する必要がある。
-    // 別 Issue で検出面ごと設計するまで、ファイル全体を保守的に諦める。
-    if source_mentions_requiredness_qualifier(source) {
-        return None;
-    }
-    let typed_dict_names = collect_typed_dict_names(root, source)?;
+    let typed_dict_names = collect_typing_names(root, source, "TypedDict")?;
     if typed_dict_names.is_empty() {
         return None;
     }
+    // PEP 655 の requiredness 修飾子。`typing` 由来と証明できない `Required` /
+    // `NotRequired` が 1 つでもあれば `None` (ファイルごと諦める)。import していなければ
+    // 空集合で、「修飾子は 1 つも使われていない」と確定できる。
+    let qualifiers = RequirednessQualifiers::collect(root, source)?;
 
     // 認識した名前 (`TypedDict` / alias / `import typing as t` の `t`) が、canonical な import
     // 以外でも束縛されていたら、その名前が本当に何を指すか追えない。代入だけでなく
@@ -194,7 +357,15 @@ fn analyze_typed_dict(
     if bindings.dynamic_namespace_op {
         return None;
     }
-    if !typed_dict_names.iter().all(|n| n.is_provable(&bindings)) {
+    if !typed_dict_names
+        .iter()
+        .all(|n| n.is_provable(&bindings, "TypedDict"))
+    {
+        return None;
+    }
+    // 修飾子名も同じ shadow 検査を通す。`NotRequired = str` のような再束縛があると
+    // 注釈の最外周が修飾子かどうか判定できない。
+    if !qualifiers.all_provable(&bindings) {
         return None;
     }
 
@@ -216,22 +387,135 @@ fn analyze_typed_dict(
     }
 
     let header = class_header(target, source)?;
-    let own_fields = class_own_fields(target, source)?;
-    // フィールドが 0 件だと total を変えても実効 requiredness は変わらない。
-    // さらに「requiredness 修飾子ではありえない」と証明できるフィールドが最低 1 件必要
-    // (別モジュールの型エイリアスが `NotRequired[...]` の別名である可能性を排除できないため)。
-    if !own_fields
-        .values()
-        .any(|ty| annotation_is_provably_plain(ty, &bindings))
-    {
-        return None;
-    }
+    let own_fields = class_own_fields(target, source, &qualifiers, &bindings)?;
     Some(TypedDictFact {
         effective_total: header.total,
         bases: header.bases,
         type_params: header.type_params,
         own_fields,
     })
+}
+
+/// PEP 655 の requiredness 修飾子 (`Required` / `NotRequired`) を指すと証明できた名前。
+///
+/// `TypedDict` と違い、**空集合が正常系**である点が重要。修飾子を import していないファイルは
+/// 「注釈に修飾子は 1 つも付いていない」と確定でき、全フィールドが `total` に従う。
+struct RequirednessQualifiers {
+    required: HashSet<TypingName>,
+    not_required: HashSet<TypingName>,
+}
+
+impl RequirednessQualifiers {
+    /// module 直下の import から両修飾子の名前を集める。出所を証明できない名前があれば `None`。
+    fn collect(root: tree_sitter::Node<'_>, source: &[u8]) -> Option<Self> {
+        Some(Self {
+            required: collect_typing_names(root, source, REQUIRED_QUALIFIER)?,
+            not_required: collect_typing_names(root, source, NOT_REQUIRED_QUALIFIER)?,
+        })
+    }
+
+    /// 収集した名前がすべて shadow されていないか。
+    fn all_provable(&self, bindings: &BindingCounts) -> bool {
+        self.required
+            .iter()
+            .all(|n| n.is_provable(bindings, REQUIRED_QUALIFIER))
+            && self
+                .not_required
+                .iter()
+                .all(|n| n.is_provable(bindings, NOT_REQUIRED_QUALIFIER))
+    }
+
+    /// 注釈の最外周が証明済み修飾子なら、その requiredness と型引数ノードを返す。
+    ///
+    /// 判定は AST で行う (文字列一致にしない) — `dict[str, NotRequired[int]]` のように
+    /// 修飾子が内側にあるだけの注釈を最外周と取り違えないため。PEP 655 の修飾子は
+    /// 注釈の最外周にしか置けないので、内側の出現は requiredness に影響しない。
+    fn outermost<'a>(
+        &self,
+        annotation: tree_sitter::Node<'a>,
+        source: &[u8],
+    ) -> QualifierMatch<'a> {
+        // 注釈は `type` ノードに包まれる。実体まで降りてから判定する。
+        //
+        // **添字の構文木は位置で変わる**。型注釈の位置 (`y: NotRequired[str]`) では
+        // `generic_type` + `type_parameter` になり、フィールド名を持たないので位置で読む。
+        // 式の位置 (`X = NotRequired[str]`) では `subscript` で `value` / `subscript`
+        // フィールドを持つ。TypedDict のフィールドは前者だが、両方受ける。
+        let node = unwrap_type_node(annotation);
+        let name_node = match node.kind() {
+            "generic_type" => node.named_child(0),
+            "subscript" => node.child_by_field_name("value"),
+            _ => None,
+        };
+        let Some(path) = name_node.and_then(|n| attribute_path(n, source)) else {
+            return QualifierMatch::None;
+        };
+        let required = if self
+            .required
+            .iter()
+            .any(|n| n.base_text(REQUIRED_QUALIFIER) == path)
+        {
+            true
+        } else if self
+            .not_required
+            .iter()
+            .any(|n| n.base_text(NOT_REQUIRED_QUALIFIER) == path)
+        {
+            false
+        } else {
+            return QualifierMatch::None;
+        };
+
+        // ここから先は「最外周が requiredness 修飾子だと確定した」。型引数の形が想定外なら
+        // 実効値を決めずに `Unprovable` (= 分類しない) へ倒す。`Required[T]` は
+        // 型引数ちょうど 1 つで、`Required[str, int]` は不正な形だが parse は通ってしまう。
+        let mut args = Vec::new();
+        match node.kind() {
+            "generic_type" => {
+                if let Some(params) = node.named_child(1)
+                    && params.kind() == "type_parameter"
+                {
+                    let mut cursor = params.walk();
+                    args.extend(params.named_children(&mut cursor));
+                }
+            }
+            "subscript" => {
+                let mut cursor = node.walk();
+                args.extend(node.children_by_field_name("subscript", &mut cursor));
+            }
+            _ => {}
+        }
+        match args.as_slice() {
+            [inner] => QualifierMatch::Proven {
+                required,
+                inner: *inner,
+            },
+            _ => QualifierMatch::Unprovable,
+        }
+    }
+}
+
+/// 注釈の最外周が requiredness 修飾子かどうかの判定結果。
+enum QualifierMatch<'a> {
+    /// 修飾子ではない (実効 requiredness は `total` に従う)。
+    None,
+    /// 証明済み修飾子。`inner` は剥がした後の型。
+    Proven {
+        required: bool,
+        inner: tree_sitter::Node<'a>,
+    },
+    /// 修飾子の形だが実効値を決められない (型引数が 1 つでない)。
+    Unprovable,
+}
+
+/// tree-sitter-python は注釈を `type` ノードで包む。実体ノードまで降りる。
+fn unwrap_type_node(node: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+    if node.kind() == "type"
+        && let Some(inner) = node.named_child(0)
+    {
+        return inner;
+    }
+    node
 }
 
 /// 型注釈が「requiredness 修飾子ではありえない」と証明できるか。
@@ -271,30 +555,30 @@ fn annotation_is_provably_plain(annotation: &str, bindings: &BindingCounts) -> b
     bindings.count(root) == 0
 }
 
-/// `Required` / `NotRequired` の出現を素朴に見る。`NotRequired` は `Required` を含むため
-/// 1 パターンで足りる。フィールド名に `Required` を含むだけでも諦めるが、過剰に保守的な側。
-fn source_mentions_requiredness_qualifier(source: &[u8]) -> bool {
-    source.windows(b"Required".len()).any(|w| w == b"Required")
-}
-
-/// module 直下の import から「TypedDict を指す名前」を集める。
+/// module 直下の import から「`typing.<target>` を指す名前」を集める (`target` は
+/// `TypedDict` / `Required` / `NotRequired`)。
 ///
-/// 認識する形:
+/// 認識する形 (`target` = `TypedDict` の例):
 /// - `from typing import TypedDict` / `from typing_extensions import TypedDict` → `TypedDict`
 /// - `from typing import TypedDict as TD` → `TD`
 /// - `import typing` → `typing.TypedDict` / `import typing as t` → `t.TypedDict`
 ///
 /// 次は `None` (ファイルごと諦める):
 /// - `typing` / `typing_extensions` からの star import (何が入るか読めない)
-/// - 未知のモジュールからの star import (`TypedDict` が入りうる)
-/// - 未知のモジュールから `TypedDict` という名前を import している (出所を証明できない)
+/// - 未知のモジュールからの star import (`target` が入りうる)
+/// - 未知のモジュールから `target` という名前を import している (出所を証明できない)
 ///
 /// 条件分岐や try の中の import は module 直下ではないので集めない。結果として基底クラスを
 /// 証明できず `None` に倒れる (fail-closed)。
-fn collect_typed_dict_names(
+///
+/// **空集合と `None` は違う**。`Required` / `NotRequired` を import していないファイルは
+/// 空集合 (= 修飾子が 1 つも使われていないと確定できる) で、`None` は「出所を証明できない
+/// 名前がある」。前者は正常系、後者はファイルごと分類しない。
+fn collect_typing_names(
     root: tree_sitter::Node<'_>,
     source: &[u8],
-) -> Option<HashSet<TypedDictName>> {
+    target: &str,
+) -> Option<HashSet<TypingName>> {
     let mut names = HashSet::new();
     let mut cursor = root.walk();
     for stmt in root.named_children(&mut cursor) {
@@ -304,7 +588,7 @@ fn collect_typed_dict_names(
                     .child_by_field_name("module_name")
                     .and_then(|n| node_text(n, source))
                     .unwrap_or_default();
-                let known_module = TYPED_DICT_MODULES.contains(&module.as_str());
+                let known_module = TYPING_MODULES.contains(&module.as_str());
                 let mut inner = stmt.walk();
                 for child in stmt.named_children(&mut inner) {
                     // module_name 自身は名前リストではないので飛ばす。
@@ -318,25 +602,25 @@ fn collect_typed_dict_names(
                         "wildcard_import" => return None,
                         "dotted_name" => {
                             let text = node_text(child, source)?;
-                            if text == "TypedDict" {
+                            if text == target {
                                 if !known_module {
                                     return None;
                                 }
-                                names.insert(TypedDictName::Bare(text));
+                                names.insert(TypingName::Bare(text));
                             }
                         }
                         "aliased_import" => {
                             let original = child
                                 .child_by_field_name("name")
                                 .and_then(|n| node_text(n, source))?;
-                            if original == "TypedDict" {
+                            if original == target {
                                 if !known_module {
                                     return None;
                                 }
                                 let alias = child
                                     .child_by_field_name("alias")
                                     .and_then(|n| node_text(n, source))?;
-                                names.insert(TypedDictName::Bare(alias));
+                                names.insert(TypingName::Bare(alias));
                             }
                         }
                         _ => {}
@@ -349,19 +633,19 @@ fn collect_typed_dict_names(
                     match child.kind() {
                         "dotted_name" => {
                             let text = node_text(child, source)?;
-                            if TYPED_DICT_MODULES.contains(&text.as_str()) {
-                                names.insert(TypedDictName::Qualified { module_alias: text });
+                            if TYPING_MODULES.contains(&text.as_str()) {
+                                names.insert(TypingName::Qualified { module_alias: text });
                             }
                         }
                         "aliased_import" => {
                             let original = child
                                 .child_by_field_name("name")
                                 .and_then(|n| node_text(n, source))?;
-                            if TYPED_DICT_MODULES.contains(&original.as_str()) {
+                            if TYPING_MODULES.contains(&original.as_str()) {
                                 let alias = child
                                     .child_by_field_name("alias")
                                     .and_then(|n| node_text(n, source))?;
-                                names.insert(TypedDictName::Qualified {
+                                names.insert(TypingName::Qualified {
                                     module_alias: alias,
                                 });
                             }
@@ -376,35 +660,40 @@ fn collect_typed_dict_names(
     Some(names)
 }
 
-/// TypedDict を指すと認識した名前。
+/// `typing` / `typing_extensions` の特定メンバ (`TypedDict` / `Required` / `NotRequired`) を
+/// 指すと認識した名前。
 ///
-/// 基底クラスとの照合に使うテキスト (`base_text`) と、shadow 検査で守る対象は別物になる。
+/// 照合に使うテキスト (`base_text`) と、shadow 検査で守る対象は別物になる。
 /// `import typing as t` の場合、基底は `t.TypedDict` と書かれるが、守るべきは
 /// 「`t` がちょうど 1 回だけ束縛されている」ことと「`t.TypedDict` が書き換えられていない」ことの両方。
+///
+/// 対象メンバ名 (`target`) を値として持たず引数で受けるのは、同じ `import typing as t` から
+/// `t.TypedDict` と `t.NotRequired` の 2 つが導かれるため。集合はメンバごとに別々に作る。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum TypedDictName {
+enum TypingName {
     /// `from typing import TypedDict [as TD]`。
     Bare(String),
     /// `import typing [as t]`。
     Qualified { module_alias: String },
 }
 
-impl TypedDictName {
-    fn base_text(&self) -> String {
+impl TypingName {
+    fn base_text(&self, target: &str) -> String {
         match self {
             Self::Bare(name) => name.clone(),
-            Self::Qualified { module_alias } => format!("{module_alias}.TypedDict"),
+            Self::Qualified { module_alias } => format!("{module_alias}.{target}"),
         }
     }
 
-    /// この名前が本当に `typing.TypedDict` を指していると言えるか。
-    fn is_provable(&self, bindings: &BindingCounts) -> bool {
+    /// この名前が本当に `typing.<target>` を指していると言えるか。
+    fn is_provable(&self, bindings: &BindingCounts, target: &str) -> bool {
         match self {
             Self::Bare(name) => bindings.count(name) == 1,
             Self::Qualified { module_alias } => {
                 // alias 自体が 1 度だけ束縛され、かつ `t.TypedDict = Fake` のような
                 // 属性への書き込みが無いこと。前者だけでは module のメンバ差し替えを見逃す。
-                bindings.count(module_alias) == 1 && !bindings.attribute_written(&self.base_text())
+                bindings.count(module_alias) == 1
+                    && !bindings.attribute_written(&self.base_text(target))
             }
         }
     }
@@ -614,9 +903,12 @@ fn unique_class_named<'a>(
 fn prove_typed_dict_classes(
     classes: &[tree_sitter::Node<'_>],
     source: &[u8],
-    typed_dict_names: &HashSet<TypedDictName>,
+    typed_dict_names: &HashSet<TypingName>,
 ) -> HashSet<usize> {
-    let known_bases: HashSet<String> = typed_dict_names.iter().map(|n| n.base_text()).collect();
+    let known_bases: HashSet<String> = typed_dict_names
+        .iter()
+        .map(|n| n.base_text("TypedDict"))
+        .collect();
     let mut proven_ids: HashSet<usize> = HashSet::new();
     let mut proven_names: HashSet<String> = HashSet::new();
     loop {
@@ -715,7 +1007,9 @@ fn class_header(class: tree_sitter::Node<'_>, source: &[u8]) -> Option<ClassHead
 fn class_own_fields(
     class: tree_sitter::Node<'_>,
     source: &[u8],
-) -> Option<BTreeMap<String, String>> {
+    qualifiers: &RequirednessQualifiers,
+    bindings: &BindingCounts,
+) -> Option<BTreeMap<String, TypedDictFieldFact>> {
     let body = class.child_by_field_name("body")?;
     let mut fields = BTreeMap::new();
     let mut cursor = body.walk();
@@ -738,10 +1032,8 @@ fn class_own_fields(
                         }
                         let ty = inner.child_by_field_name("type")?;
                         let name = node_text(left, source)?;
-                        let ty_text = super::normalize_signature_whitespace(
-                            source.get(ty.start_byte()..ty.end_byte())?,
-                        );
-                        if fields.insert(name, ty_text).is_some() {
+                        let fact = field_fact(ty, source, qualifiers, bindings)?;
+                        if fields.insert(name, fact).is_some() {
                             // 同名フィールドの重複宣言は解釈が割れるため諦める。
                             return None;
                         }
@@ -753,6 +1045,43 @@ fn class_own_fields(
         }
     }
     Some(fields)
+}
+
+/// 型注釈 1 件から requiredness の事実を取り出す。
+fn field_fact(
+    annotation: tree_sitter::Node<'_>,
+    source: &[u8],
+    qualifiers: &RequirednessQualifiers,
+    bindings: &BindingCounts,
+) -> Option<TypedDictFieldFact> {
+    let full_text = super::normalize_signature_whitespace(
+        source.get(annotation.start_byte()..annotation.end_byte())?,
+    );
+    match qualifiers.outermost(annotation, source) {
+        // 修飾子が確定した。実効値は修飾子そのもので、`total` の影響を受けない。
+        QualifierMatch::Proven { required, inner } => Some(TypedDictFieldFact {
+            underlying: super::normalize_signature_whitespace(
+                source.get(inner.start_byte()..inner.end_byte())?,
+            ),
+            qualifier: Some(required),
+            requiredness_is_provable: true,
+        }),
+        // 修飾子の形だが型引数が 1 つでない。実効値を決められない。
+        QualifierMatch::Unprovable => Some(TypedDictFieldFact {
+            underlying: full_text,
+            qualifier: None,
+            requiredness_is_provable: false,
+        }),
+        // 修飾子なし。`total` に従うと言えるのは「修飾子ではありえない」と証明できる注釈だけ。
+        QualifierMatch::None => {
+            let provable = annotation_is_provably_plain(&full_text, bindings);
+            Some(TypedDictFieldFact {
+                underlying: full_text,
+                qualifier: None,
+                requiredness_is_provable: provable,
+            })
+        }
+    }
 }
 
 /// ノードの UTF-8 テキストを取り出す。非 UTF-8 / 範囲外は `None`。
@@ -774,6 +1103,36 @@ mod tests {
 
     const IMPORT: &str = "from typing import TypedDict\n";
 
+    /// requiredness 修飾子の付け外しを検出するヘルパー。
+    fn field_changes(old_src: &str, new_src: &str, class_name: &str) -> Vec<TypedDictFieldChange> {
+        let old_bytes = old_src.as_bytes();
+        let new_bytes = new_src.as_bytes();
+        let Ok(old_tree) = parser::parse_source(old_bytes, LangId::Python) else {
+            return Vec::new();
+        };
+        let Ok(new_tree) = parser::parse_source(new_bytes, LangId::Python) else {
+            return Vec::new();
+        };
+        detect_typed_dict_field_requiredness_changes(
+            old_tree.root_node(),
+            old_bytes,
+            new_tree.root_node(),
+            new_bytes,
+            class_name,
+        )
+    }
+
+    /// `NotRequired` の除去を 1 件だけ検出し、種別と方向が正しいこと。
+    fn assert_single_became_required(changes: &[TypedDictFieldChange], name: &str) {
+        assert_eq!(changes.len(), 1, "1 件だけ検出されるべき: {changes:?}");
+        assert_eq!(changes[0].name, name);
+        assert_eq!(
+            changes[0].contract.kind,
+            ApiContractChangeKind::TypedDictFieldBecameRequired
+        );
+        assert_eq!(changes[0].contract.breaks, ApiContractSide::Producer);
+    }
+
     #[test]
     fn total_false_is_read_as_effective_false() {
         let f = fact(
@@ -782,7 +1141,14 @@ mod tests {
         )
         .expect("分類できるはず");
         assert!(!f.effective_total);
-        assert_eq!(f.own_fields.get("a").map(String::as_str), Some("int"));
+        let a = f.own_fields.get("a").expect("フィールド a が読めるはず");
+        assert_eq!(a.underlying, "int");
+        assert_eq!(a.qualifier, None, "修飾子なしなので total に従う");
+        assert!(
+            a.requiredness_is_provable,
+            "組み込み型なので実効値を確定できる"
+        );
+        assert_eq!(a.effective(f.effective_total), Some(false));
     }
 
     #[test]
@@ -958,15 +1324,38 @@ mod tests {
         );
     }
 
+    /// `Required` / `NotRequired` が同居しても分類を諦めない (Issue
+    /// 2026-08-19-python-typeddict-field-requiredness-detection で解除)。
+    ///
+    /// 旧実装は `Required` の字面があるファイルを丸ごと対象外にしていた。今は修飾子の出所を
+    /// AST と import から証明し、フィールド単位で実効 requiredness を合成する。
+    /// 修飾子付きフィールドは `total` に左右されないが、修飾子なしフィールドが 1 件でもあれば
+    /// `total` の反転は分類できる。
     #[test]
-    fn not_required_anywhere_in_file_is_rejected() {
+    fn not_required_in_file_no_longer_blocks_total_classification() {
+        let f = fact(
+            "from typing import TypedDict, NotRequired\n\nclass B(TypedDict, total=False):\n    a: int\n    b: NotRequired[str]\n",
+            "B",
+        )
+        .expect("修飾子が同居していても事実を抽出できる");
         assert!(
-            fact(
-                "from typing import TypedDict, NotRequired\n\nclass B(TypedDict, total=False):\n    a: int\n    b: NotRequired[str]\n",
-                "B",
-            )
-            .is_none()
+            f.total_flip_moves_any_field(),
+            "修飾子なしの a: int があるので total の反転は実効値を動かす"
         );
+        let b = f.own_fields.get("b").expect("b が読める");
+        assert_eq!(b.qualifier, Some(false), "NotRequired は実効値を固定する");
+        assert!(
+            !b.moves_with_total(),
+            "修飾子付きフィールドは total に左右されない"
+        );
+
+        // 対照: 修飾子付きフィールドしか無ければ total の反転は何も動かさない。
+        let only_qualified = fact(
+            "from typing import TypedDict, NotRequired\n\nclass C(TypedDict, total=False):\n    b: NotRequired[str]\n",
+            "C",
+        )
+        .expect("事実の抽出は成功する");
+        assert!(!only_qualified.total_flip_moves_any_field());
     }
 
     #[test]
@@ -992,24 +1381,27 @@ mod tests {
     }
 
     #[test]
-    fn empty_body_is_rejected() {
-        assert!(
-            fact(
-                &format!("{IMPORT}\nclass B(TypedDict, total=False):\n    pass\n"),
-                "B"
-            )
-            .is_none()
-        );
+    fn empty_body_does_not_prove_total_flip() {
+        // フィールドが 0 件なら `total` を反転しても契約は変わらない。
+        // 事実の抽出自体は成功するが、種別は付けない (= 分類しない)。
+        let f = fact(
+            &format!("{IMPORT}\nclass B(TypedDict, total=False):\n    pass\n"),
+            "B",
+        )
+        .expect("事実の抽出は成功する");
+        assert!(!f.total_flip_moves_any_field());
     }
 
     #[test]
-    fn docstring_only_body_is_rejected() {
+    fn docstring_only_body_does_not_prove_total_flip() {
+        let f = fact(
+            &format!("{IMPORT}\nclass B(TypedDict, total=False):\n    \"\"\"doc\"\"\"\n"),
+            "B",
+        )
+        .expect("事実の抽出は成功する");
         assert!(
-            fact(
-                &format!("{IMPORT}\nclass B(TypedDict, total=False):\n    \"\"\"doc\"\"\"\n"),
-                "B",
-            )
-            .is_none()
+            !f.total_flip_moves_any_field(),
+            "docstring はフィールドではない"
         );
     }
 
@@ -1178,14 +1570,16 @@ mod tests {
     }
 
     #[test]
-    fn field_with_only_imported_types_is_rejected() {
+    fn field_with_only_imported_types_does_not_prove_total_flip() {
         // `MyModel` が別モジュールで `NotRequired[str]` の別名である可能性を排除できない。
+        let f = fact(
+            "from typing import TypedDict\nfrom mylib import MyModel\n\nclass B(TypedDict, total=False):\n    a: MyModel\n",
+            "B",
+        )
+        .expect("事実の抽出は成功する");
         assert!(
-            fact(
-                "from typing import TypedDict\nfrom mylib import MyModel\n\nclass B(TypedDict, total=False):\n    a: MyModel\n",
-                "B",
-            )
-            .is_none()
+            !f.total_flip_moves_any_field(),
+            "出所不明の型注釈は total の影響を受けると証明できない"
         );
     }
 
@@ -1211,13 +1605,13 @@ mod tests {
 
     #[test]
     fn rebound_builtin_name_is_not_plain() {
-        assert!(
-            fact(
-                &format!("{IMPORT}int = str\n\nclass B(TypedDict, total=False):\n    a: int\n"),
-                "B",
-            )
-            .is_none()
-        );
+        // `int` が再束縛されていたら組み込み型とは限らないので、total の影響も証明できない。
+        let f = fact(
+            &format!("{IMPORT}int = str\n\nclass B(TypedDict, total=False):\n    a: int\n"),
+            "B",
+        )
+        .expect("事実の抽出は成功する");
+        assert!(!f.total_flip_moves_any_field());
     }
 
     // --- レビュー 2 巡目 (2026-08-19) の指摘に対応 ---
@@ -1315,5 +1709,116 @@ mod tests {
         )
         .expect("import リストの 2 番目でも認識できるはず");
         assert!(!f.effective_total);
+    }
+    #[test]
+    fn not_required_alias_import_is_recognized() {
+        let old = "from typing import NotRequired as NR, TypedDict\n\nclass B(TypedDict):\n    a: int\n    b: NR[str]\n";
+        let new = "from typing import NotRequired as NR, TypedDict\n\nclass B(TypedDict):\n    a: int\n    b: str\n";
+        assert_single_became_required(&field_changes(old, new, "B"), "B.b");
+    }
+
+    #[test]
+    fn module_qualified_not_required_is_recognized() {
+        let old =
+            "import typing as t\n\nclass B(t.TypedDict):\n    a: int\n    b: t.NotRequired[str]\n";
+        let new = "import typing as t\n\nclass B(t.TypedDict):\n    a: int\n    b: str\n";
+        assert_single_became_required(&field_changes(old, new, "B"), "B.b");
+    }
+
+    #[test]
+    fn typing_extensions_not_required_is_recognized() {
+        let old = "from typing import TypedDict\nfrom typing_extensions import NotRequired\n\nclass B(TypedDict):\n    a: int\n    b: NotRequired[str]\n";
+        let new = "from typing import TypedDict\nfrom typing_extensions import NotRequired\n\nclass B(TypedDict):\n    a: int\n    b: str\n";
+        assert_single_became_required(&field_changes(old, new, "B"), "B.b");
+    }
+
+    /// 出所が `typing` / `typing_extensions` と証明できない `NotRequired` は分類しない。
+    ///
+    /// 対照として、同じ形で出所が `typing` なら検出できること
+    /// (`not_required_alias_import_is_recognized`) を別テストで固定している。
+    #[test]
+    fn not_required_from_unknown_module_is_rejected() {
+        let old = "from typing import TypedDict\nfrom mypkg import NotRequired\n\nclass B(TypedDict):\n    a: int\n    b: NotRequired[str]\n";
+        let new = "from typing import TypedDict\nfrom mypkg import NotRequired\n\nclass B(TypedDict):\n    a: int\n    b: str\n";
+        assert!(
+            field_changes(old, new, "B").is_empty(),
+            "出所不明の NotRequired は分類しない"
+        );
+    }
+
+    /// `NotRequired` が再束縛されていたら、注釈の最外周が修飾子か判定できない。
+    #[test]
+    fn rebound_not_required_name_is_rejected() {
+        let old = "from typing import NotRequired, TypedDict\n\nNotRequired = str\n\nclass B(TypedDict):\n    a: int\n    b: NotRequired[str]\n";
+        let new = "from typing import NotRequired, TypedDict\n\nNotRequired = str\n\nclass B(TypedDict):\n    a: int\n    b: str\n";
+        assert!(
+            field_changes(old, new, "B").is_empty(),
+            "shadow された修飾子名は分類しない"
+        );
+    }
+
+    /// `NotRequired[str, int]` は不正な形。parse は通るので明示的に弾く。
+    #[test]
+    fn multi_argument_qualifier_is_rejected() {
+        let old = "from typing import NotRequired, TypedDict\n\nclass B(TypedDict):\n    a: int\n    b: NotRequired[str, int]\n";
+        let new = "from typing import NotRequired, TypedDict\n\nclass B(TypedDict):\n    a: int\n    b: str\n";
+        assert!(
+            field_changes(old, new, "B").is_empty(),
+            "型引数が 1 つでない修飾子は実効値を決められない"
+        );
+    }
+
+    /// 修飾子が注釈の内側にあるだけの場合、requiredness には影響しない。
+    ///
+    /// PEP 655 の修飾子は最外周にしか置けないため、`dict[str, NotRequired[int]]` の
+    /// `NotRequired` を最外周と取り違えてはいけない。
+    #[test]
+    fn nested_qualifier_is_not_treated_as_outermost() {
+        let old = "from typing import NotRequired, TypedDict\n\nclass B(TypedDict):\n    a: int\n    b: dict[str, NotRequired[int]]\n";
+        let new = "from typing import NotRequired, TypedDict\n\nclass B(TypedDict):\n    a: int\n    b: dict[str, int]\n";
+        assert!(
+            field_changes(old, new, "B").is_empty(),
+            "内側の修飾子は requiredness を動かさない (型変更として扱う)"
+        );
+    }
+
+    /// `total` と修飾子が同じ diff で両方動いた場合、フィールド経路は何も返さない。
+    /// クラス単位の `total` 判定と二重報告しないため。
+    #[test]
+    fn total_and_qualifier_change_together_is_left_to_class_level() {
+        let old = "from typing import NotRequired, TypedDict\n\nclass B(TypedDict):\n    a: int\n    b: NotRequired[str]\n";
+        let new = "from typing import NotRequired, TypedDict\n\nclass B(TypedDict, total=False):\n    a: int\n    b: str\n";
+        assert!(
+            field_changes(old, new, "B").is_empty(),
+            "total が動いた変更は class 単位の判定が担当する"
+        );
+    }
+
+    /// `total=False` のクラスでは、修飾子なしフィールドが省略可。
+    /// `Required[T]` の除去はそのキーを省略可へ変える (consumer が壊れる)。
+    #[test]
+    fn required_removal_under_total_false_breaks_consumer() {
+        let old = "from typing import Required, TypedDict\n\nclass B(TypedDict, total=False):\n    a: int\n    b: Required[str]\n";
+        let new = "from typing import Required, TypedDict\n\nclass B(TypedDict, total=False):\n    a: int\n    b: str\n";
+        let changes = field_changes(old, new, "B");
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].name, "B.b");
+        assert_eq!(
+            changes[0].contract.kind,
+            ApiContractChangeKind::TypedDictFieldBecameNotRequired
+        );
+        assert_eq!(changes[0].contract.breaks, ApiContractSide::Consumer);
+    }
+
+    /// 修飾子を付け替えても実効 requiredness が変わらないなら出さない。
+    /// `total=False` のクラスで `NotRequired[T]` を外すのは実効的に同値。
+    #[test]
+    fn qualifier_removal_without_effective_change_is_not_reported() {
+        let old = "from typing import NotRequired, TypedDict\n\nclass B(TypedDict, total=False):\n    a: int\n    b: NotRequired[str]\n";
+        let new = "from typing import NotRequired, TypedDict\n\nclass B(TypedDict, total=False):\n    a: int\n    b: str\n";
+        assert!(
+            field_changes(old, new, "B").is_empty(),
+            "total=False では NotRequired の有無で実効 requiredness は変わらない"
+        );
     }
 }

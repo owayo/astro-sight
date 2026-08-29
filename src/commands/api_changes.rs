@@ -442,6 +442,6 @@ pub(crate) use removed_attribution::*;
 
 pub(crate) use rust_public::*;
 
-pub(crate) use source_pair::{CompatibleModSite, SignatureSourceCache};
+pub(crate) use source_pair::{CompatibleModSite, SignatureSourceCache, load_old_new_sources};
 
 pub(crate) use ts_signature::*;

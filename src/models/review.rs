@@ -206,6 +206,11 @@ pub enum ApiContractChangeKind {
     /// `class X(TypedDict)` → `class X(TypedDict, total=False)`。
     /// 必須だったキーが省略可になる。
     TypedDictTotalFalseAdded,
+    /// `y: NotRequired[str]` → `y: str` (クラスの実効 total が `True`)。
+    /// そのキー 1 件だけが必須化する。`kind` は `field`、`name` は `Class.field`。
+    TypedDictFieldBecameRequired,
+    /// `y: str` → `y: NotRequired[str]`。そのキー 1 件だけが省略可になる。
+    TypedDictFieldBecameNotRequired,
 }
 
 /// 契約変更で壊れる側。

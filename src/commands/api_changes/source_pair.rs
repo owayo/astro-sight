@@ -48,18 +48,32 @@ impl<'a> CompatibleModSite<'a> {
     /// 信頼境界外パスの再チェック → `git show` → working tree read の順で、
     /// いずれか失敗すれば `None` (= blocking 維持)。
     fn load_sources(&self) -> Option<OldNewSources> {
-        // 信頼境界外のパスは多層防御で再チェックする。
-        if !crate::engine::impact::is_safe_diff_path(self.old_path)
-            || !crate::engine::impact::is_safe_diff_path(self.new_path)
-        {
-            return None;
-        }
-        let old = git_show_blob(self.dir, self.base, self.old_path)?;
-        let new_full = std::path::Path::new(self.dir).join(self.new_path);
-        let new_utf8 = camino::Utf8Path::from_path(&new_full)?;
-        let new = parser::read_file(new_utf8).ok()?;
-        Some(OldNewSources { old, new })
+        load_old_new_sources(self.dir, self.base, self.old_path, self.new_path)
     }
+}
+
+/// base 側 blob と working tree ソースを取得する (対象シンボルに依らない)。
+///
+/// シグネチャ差分に乗らない契約変更 (TypedDict のフィールド requiredness 等) の検出でも
+/// 同じ組が要るため、`CompatibleModSite` から切り出して共有する。失敗はすべて `None` で、
+/// 呼び出し側は「証明できない = 分類しない」に倒す。
+pub(crate) fn load_old_new_sources(
+    dir: &str,
+    base: &str,
+    old_path: &str,
+    new_path: &str,
+) -> Option<OldNewSources> {
+    // 信頼境界外のパスは多層防御で再チェックする。
+    if !crate::engine::impact::is_safe_diff_path(old_path)
+        || !crate::engine::impact::is_safe_diff_path(new_path)
+    {
+        return None;
+    }
+    let old = git_show_blob(dir, base, old_path)?;
+    let new_full = std::path::Path::new(dir).join(new_path);
+    let new_utf8 = camino::Utf8Path::from_path(&new_full)?;
+    let new = parser::read_file(new_utf8).ok()?;
+    Some(OldNewSources { old, new })
 }
 
 /// base 側 blob と working tree ソースの組。

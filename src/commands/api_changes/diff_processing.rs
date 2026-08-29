@@ -59,6 +59,98 @@ pub(crate) fn process_modified_file(
         &new_symbols_in_current_file,
     );
     collect_modified_symbols(inputs, state, df, facts, &maps);
+    // シグネチャ差分に乗らない契約変更。上の 3 つと違い「old/new でシグネチャが同じ」
+    // シンボルを見るため、最後に独立した経路として走らせる。
+    collect_python_typed_dict_field_changes(inputs, state, df, facts, &maps);
+}
+
+/// クラスヘッダが変わらない Python TypedDict の、フィールド単位 requiredness 変更を検出する。
+///
+/// `y: NotRequired[str]` → `y: str` は**クラスヘッダ行が変わらない**ため
+/// `collect_modified_symbols` のシグネチャ差分ループ (`old_sig != new_sig`) に乗らず、
+/// api.mod 候補にすらならなかった (Issue
+/// 2026-08-19-python-typeddict-field-requiredness-detection)。ここはシグネチャ差分と
+/// 独立した新規検出経路で、証明できたものだけ blocking な `modified` へ足す。
+///
+/// **通常の exported symbol 集合には混ぜない**。`Class.field` はあくまで出力時の疑似シンボルで、
+/// `symbols` / `refs` / `dead-code` / `ApiRefIndex` の意味は一切変えない。
+fn collect_python_typed_dict_field_changes(
+    inputs: &DetectionInputs<'_>,
+    state: &mut DetectionState<'_>,
+    df: &crate::models::impact::DiffFile,
+    facts: &ModifiedFileFacts<'_>,
+    maps: &SymbolMaps<'_>,
+) {
+    let &DetectionInputs { dir, base, .. } = inputs;
+    let &ModifiedFileFacts { new_syms, .. } = facts;
+    let SymbolMaps {
+        old_map,
+        old_name_counts,
+        new_name_counts,
+        ..
+    } = maps;
+
+    if crate::language::LangId::from_path(camino::Utf8Path::new(df.new_path.as_str())).ok()
+        != Some(crate::language::LangId::Python)
+    {
+        return;
+    }
+    // 対象は「シグネチャ (= クラスヘッダ) が変わっていない」クラスだけ。変わっていれば
+    // `detect_python_typed_dict_total_change` が担当するので、ここで扱うと二重報告になる。
+    // 同名クラスが複数あるファイルは、どの定義を見ているか確定できないため除外する。
+    let candidates: Vec<&str> = new_syms
+        .iter()
+        .filter(|(name, kind, new_sig)| {
+            kind.as_str() == "class"
+                && !name.contains('.')
+                && old_map.get(name.as_str()) == Some(&new_sig.as_str())
+                && old_name_counts.get(name.as_str()).copied().unwrap_or(0) == 1
+                && new_name_counts.get(name.as_str()).copied().unwrap_or(0) == 1
+        })
+        .map(|(name, _, _)| name.as_str())
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let Some(src) = load_old_new_sources(dir, base, &df.old_path, &df.new_path) else {
+        return;
+    };
+    // `total` が動かない前提なので、requiredness が変わるには修飾子の字面が
+    // どちらかに必ずある。parse の前に安価に落とす。
+    if !mentions_requiredness_qualifier(&src.old) && !mentions_requiredness_qualifier(&src.new) {
+        return;
+    }
+    let Some((old_tree, new_tree)) = src.parse_pair(crate::language::LangId::Python) else {
+        return;
+    };
+    for class_name in candidates {
+        for change in detect_typed_dict_field_requiredness_changes(
+            old_tree.root_node(),
+            &src.old,
+            new_tree.root_node(),
+            &src.new,
+            class_name,
+        ) {
+            state.buckets.modified.push(ApiSymbolChange {
+                name: change.name,
+                kind: "field".to_string(),
+                file: df.new_path.clone(),
+                old_signature: Some(change.old_signature),
+                new_signature: Some(change.new_signature),
+                // 疑似シンボルなので呼び出し元の解決はしない。`field` を bare 名で引くと
+                // 無関係な同名フィールド / ローカル変数に当たる。
+                no_resolved_internal_callers: false,
+                contract_change: Some(change.contract),
+            });
+        }
+    }
+}
+
+/// `Required` / `NotRequired` の出現を素朴に見る安価な前段フィルタ。
+/// `NotRequired` は `Required` を含むため 1 パターンで足りる。
+/// 過剰にヒットしても後段の AST 判定で落ちるだけなので、保守側に振れている。
+fn mentions_requiredness_qualifier(source: &[u8]) -> bool {
+    source.windows(b"Required".len()).any(|w| w == b"Required")
 }
 
 /// 変更ファイルの新旧 exported シンボルから作る突き合わせ用インデックス。

@@ -1362,3 +1362,68 @@ fn build_review_hook_json_mixed_added_and_modified_keeps_only_modified() {
         "refs[].s も modified_fn のみに絞られるべき"
     );
 }
+
+/// フィールド単位の contract 変更も hook 出力に載り、blocking であること。
+///
+/// 疑似シンボル (`Class.field`, kind=`field`) は既存の api.mod と同じ枠に載せる。
+/// 新しいトップレベルキーを足すと既存 consumer の JSON パースを壊すため
+/// (Issue 2026-08-19-python-typeddict-field-requiredness-detection)。
+#[test]
+fn build_review_hook_json_api_modified_carries_field_contract_change() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let result = ReviewResult {
+        impact: crate::models::impact::ContextResult {
+            changes: Vec::new(),
+            skipped: None,
+            truncations: Vec::new(),
+        },
+        missing_cochanges: Vec::new(),
+        cochange_diagnostics: Default::default(),
+        api_changes: ApiChanges {
+            added: Vec::new(),
+            removed: Vec::new(),
+            modified: vec![ApiSymbolChange {
+                name: "Payload.y".to_string(),
+                kind: "field".to_string(),
+                file: "models.py".to_string(),
+                old_signature: Some("optional str".to_string()),
+                new_signature: Some("required str".to_string()),
+                no_resolved_internal_callers: false,
+                contract_change: Some(crate::models::review::ApiContractChange {
+                    kind:
+                        crate::models::review::ApiContractChangeKind::TypedDictFieldBecameRequired,
+                    breaks: crate::models::review::ApiContractSide::Producer,
+                }),
+            }],
+            moved: Vec::new(),
+            property_to_field: Vec::new(),
+            removed_dead: Vec::new(),
+            modified_closed_in_diff: Vec::new(),
+            const_value_changes: Vec::new(),
+            compatible_modified: Vec::new(),
+        },
+        dead_symbols: Vec::new(),
+        test_only_symbols: Vec::new(),
+        skipped: None,
+        truncations: Vec::new(),
+    };
+
+    let build = build_review_hook_json(&result, dir.path().to_str().expect("utf-8 path"), false);
+    let hook_json = build
+        .value
+        .expect("フィールド契約変更も hook JSON に出すべき");
+    assert!(
+        build.is_blocking,
+        "キーの必須化は破壊的変更なので blocking: {hook_json}"
+    );
+    assert_eq!(hook_json["api"]["mod"][0]["n"], "Payload.y", "{hook_json}");
+    assert_eq!(
+        hook_json["api"]["mod"][0]["contract"]["kind"], "typed_dict_field_became_required",
+        "{hook_json}"
+    );
+    assert_eq!(
+        hook_json["api"]["mod"][0]["contract"]["breaks"], "producer",
+        "{hook_json}"
+    );
+}
