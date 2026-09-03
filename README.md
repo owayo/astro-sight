@@ -273,9 +273,46 @@ astro-sight refs --name "AstgenResponse" --dir src/ --glob "**/*.rs"
 
 # 複数シンボルを一括検索（NDJSON 出力、1シンボル1行）
 astro-sight refs --names "AppService,AstgenResponse" --dir src/
+
+# 出力件数の上限を変える（既定は 100 件 / 3,000 トークン）
+astro-sight refs --name "new" --dir . --max-results 500
+astro-sight refs --name "new" --dir . --max-results unlimited --token-budget unlimited
 ```
 
 `--name` は空文字を受け付けない。`--names` も空要素のみ（例: `",,,"`）の場合は `INVALID_REQUEST` を返す。`--dir` にはディレクトリのみ指定でき、ファイルパスを渡した場合も `INVALID_REQUEST` を返す。
+
+#### 出力件数の上限と `result_summary`
+
+高頻度な識別子は 1 回の呼び出しで数千件返り、表現をいくら最適化してもトークンが飽和する（実測: 自リポジトリの `refs --name new --dir .` が 1,846 件 ≈ 68,000 tokens）。エージェントは呼ぶ前にその識別子が高頻度だと知りようがないため、既定で **100 件 / 推定 3,000 トークン**の上限を課す（同条件で約 2,600 tokens に収まる）。
+
+- **解析は止めない。** 全件解析して `total` を正確に出し、**出力だけ**を絞る。件数で走査を打ち切ると正確な総数も省略分の内訳も取れなくなる
+- **省略が 1 件でも起きたときだけ** `result_summary` を出す。上限に当たらない通常の問い合わせでは出力は従来とバイト単位で同一
+- 上限は**表現層だけ**に効く。`dead-code` / API 差分 / hook の判定は従来どおり全件を見た内部結果で行う
+- `--max-results` / `--token-budget` はいずれも `unlimited` を受ける。`--token-budget` の下限は 256（それ未満だとサマリ自体が収まらない）
+- `refs --names` の予算は**呼び出し全体で 1 つ**を round-robin で配分する。名前ごとに上限を課すと全体が名前数に比例して膨らみ、先頭から詰めると高頻度な 1 名が予算を食い尽くして後続が 0 件になる
+- 同じ上限は `session` の `max_results` / `token_budget`（数値または `"unlimited"`）と MCP の `refs_search` / `refs_batch_search` にも適用される
+
+```json
+{
+  "symbol": "new",
+  "refs": [ /* 上限内の件数 */ ],
+  "result_summary": {
+    "shown": 64, "total": 1846, "omitted": 1782,
+    "limited_by": ["max_results", "token_budget"],
+    "limits": { "max_results": 100, "token_budget": 3000 },
+    "complete_input": true,
+    "by_kind": { "ref": 1782 },
+    "by_lang": { "rust": 1776, "xojo": 5, "ruby": 1 },
+    "files": [ { "path": "src/commands/tests/review_hook.rs", "count": 326 } ],
+    "other_files": { "files": 128, "count": 1231 },
+    "rollup_truncated": { "shown": 5, "available": 133 }
+  }
+}
+```
+
+`by_kind` / `by_lang` / `files` は **省略された分だけ**の分布（本体込みの総分布にすると省略分を引き算で復元できない）。`by_lang` は polyglot リポジトリで効く — bare name の一致は言語をまたいで大量に出るため（実測: 名前 `search` の参照 2,522 件のうち 2,521 件が別言語）、言語構成が見えれば `--glob` で絞り直す判断ができる。`files` 自体も上限を持ち、超過分は `other_files` へ畳んで `rollup_truncated` で申告する（サマリが第二の出力爆発を起こさないため）。
+
+`complete_input` は「`total` が解析できた入力すべてを数えているか」。生成物としてスキャンから外したファイルがあれば false になり、`total` がリポジトリ全体の真の総数ではないことを示す。
 
 単一検索と複数シンボル検索はいずれも worker local の fold/reduce で結果を直接統合し、per-file の中間 `Vec` を全ファイル分保持しない。非常に多くの参照が返るシンボルでは出力自体が大きくなるため、`--glob` で対象言語を絞るか、必要に応じて `ASTRO_SIGHT_BATCH_WORKERS` で並列ワーカー数を下げる（既定は論理コア数）。複数シンボル検索（`refs --names`）はディレクトリ走査・Aho-Corasick 走査・parse をすべて名前数に依らずファイル毎 1 回に集約し、パターンは原則 1 個の AC オートマトンに載せる（実測 5 万パターン ≈ 8MB とパターン数にほぼ線形）。`ASTRO_SIGHT_REFS_BATCH_CHUNK`（既定 100,000）を超える大規模入力だけ AC を分割するが、その場合もファイル走査と parse は 1 回のままで、分割サイズに依らず結果は一致する。
 
@@ -803,18 +840,27 @@ BPE トークナイザでは**改行とインデントが 1 行あたりおよ�
 | `{"a":1,"b":2,"c":3,"d":4}` | 25 | **17** |
 | `a: 1` `b: 2` `c: 3` `d: 4`（4 行） | **19** | 19 |
 
-そこで判定には `文字数 + 3 × 改行数` を使う。astro-sight の出力 1,127 サンプルを tiktoken で実測した結果:
+そこで判定には `文字数 + 4 × 改行数` を使う。astro-sight の出力を tiktoken で実測した結果:
 
 | 判定指標 | 1 回の呼び出しの最悪損失 | 全体（真の最小との差） |
 |---|---:|---:|
 | 素の文字数 | +28 tokens (15%) | +65 |
-| **文字数 + 3 × 行数** | **+1〜2 tokens** | **+10〜67 (0.0001〜0.0008%)** |
+| **文字数 + 4 × 行数** | **+1〜2 tokens** | **0.0001〜0.13%** |
 
-係数は 1〜4 が平坦域でどちらのトークナイザでも安定しており、その中央値を採っている（特定のトークナイザ版に賭けた値ではない）。実トークナイザを積まないのは、(1) BPE テーブルで数 MB 増える、(2) 消費側のモデルや tokenizer 版で結果が変わり出力の再現性が壊れる、(3) 上表のとおり推定値で十分近い、の 3 点による。
+係数は**出力形が変わるたびに測り直す**。2026-09-04 に `result_summary`（出力上限の申告）という行数の多い小さな出力が加わったため再測定し、3 から 4 へ引き上げた:
+
+| サンプル集合 | k=3 の損失 | k=4 の損失 |
+|---|---:|---:|
+| 大きな出力 143 ペア | 0%（k=0..6 が同点） | 0% |
+| `result_summary` 付きの小さな出力 120 ペア | 0.67%（最悪 93 tokens） | **0.13%（最悪 30 tokens）** |
+
+小さい出力ほど形式間の逆転が起きやすいので、そちらで差が付く値を採る。両トークナイザで k=4 が最良で一致した。実トークナイザを積まないのは、(1) BPE テーブルで数 MB 増える、(2) 消費側のモデルや tokenizer 版で結果が変わり出力の再現性が壊れる、(3) 上表のとおり推定値で十分近い、の 3 点による。
+
+なお `--token-budget`（[出力件数の上限](#出力件数の上限と-result_summary)）は**この指標をそのまま使わない**。指標は形式間の**相対比較**用なので係数の絶対値を問わないが、予算は利用者が「N トークンまで」と指定する**絶対値**であり、桁を合わせないと「3,000 と指定したのに 900 しか出ない」という乖離になる。実測（252 サンプル × 2 トークナイザ）の `指標 / 実トークン` は p05=3.00 / p50=3.42 / min=2.73 なので、予算判定では指標を 3 で割る（予算を超えない側に倒した値）。
 
 #### 性質
 
-- **常に両候補以下**（どちらかを選ぶだけなので、片方より悪くなることはない）
+- **常に両候補以下**（どちらかを選ぶだけなので、片方より悪くなることはない）。ただし[出力件数の上限](#出力件数の上限と-result_summary)が効く場合、形式ごとに予算内へ収まる**件数**が変わる — 実測 `refs --name new` は JSON 64 件 / 2,591 tokens に対し TOON 83 件 / 2,548 tokens で、auto は TOON を選んで「同じ予算でより多くの情報」を返す
 - 選択は入力内容だけで決まるので**決定的**。同じ入力・同じバージョンなら常に同じ形式になる
 - 実際に両方が選ばれる。上記 1,127 サンプルでは **564 件で JSON、563 件で TOON** が選ばれた（`ast` は JSON、`symbols` / `refs` / `calls` は TOON が勝ちやすい）
 - `--pretty` は「選ばれた JSON をどう描画するか」だけを決める。比較そのものは常に compact JSON と TOON で行うため、TOON が勝った場合は `--pretty` の指定は効かない
@@ -897,8 +943,9 @@ format = "json"
 - **対象コマンド**: `ast`, `symbols`（単一ファイルモードのみ）
 - **キャッシュキー**: `BLAKE3(astro-sight バージョン + canonical path + BLAKE3(ファイル内容))` + コマンド固有サフィックス（オプション組み合わせ別）
 - **path/lang の分離**: `ast` / `symbols` の応答には `path` と `lang` が含まれるため、同じ内容でも別ファイル・別拡張子なら別キャッシュとして扱う
-- **保存先**: `~/.cache/astro-sight/`
-- **ディレクトリシャード**: ハッシュの先頭 2 文字でサブディレクトリを分割（例: `ab/cdef1234....symbols.json`）
+- **保存先**: `~/.cache/astro-sight/v<バージョン>/`
+- **ディレクトリシャード**: ハッシュの先頭 2 文字でサブディレクトリを分割（例: `v26.9.100/ab/cdef1234....symbols.json`）
+- **世代 GC**: キャッシュキーにバージョンが混ざるため、リリースのたびに全エントリが失効する。**失効するだけで消えはしない**ので、更新を重ねると死蔵データが積み上がっていた（実測: 開発機で 176MB、そのほぼ全量が到達不能）。世代ごとにディレクトリを分け、新しい世代の初回起動で旧世代を削除する。削除対象は旧バージョンの世代ディレクトリ（`v26.8.111`）と世代分離前のフラットな 2 桁 hex シャード（`00`〜`ff`）だけで、**それ以外の名前は消さない**（利用者の `~/.cache` 配下なので、astro-sight が作ったと確証が持てないものは残す）。失敗は無視する（掃除に失敗しても解析は続けられるべきなので）
 - **`--pretty` 時はキャッシュをスキップ**（compact 出力のみキャッシュ）
 - **`--no-cache`** で無効化可能
 
@@ -969,6 +1016,7 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 | `grep "name" one/file.ts` (single file) | ❌ → `astro-sight refs --name name --dir . --glob one/file.ts` | Single-file identifier search is still identifier search |
 | `grep -rn "Foo" src/`, `grep -rn "Foo" --include=*.tsx .` | ❌ → `astro-sight refs --name Foo --dir . --glob 'src/**'` | Recursive identifier search |
 | `grep -n "Foo" -A 20 file.ts` (wants surrounding lines) | ❌ → `refs` for the exact hit lines, then Read those offsets | `-A`/`-B` is not a reason to fall back to grep |
+| `cargo test 2>&1 \| grep "^error"` | ✅ grep OK | **Piped output filter — not searching files.** astro-sight cannot replace this |
 | `Grep "TODO"` | ✅ Grep OK | Non-code search |
 | `Grep "error message text"` | ✅ Grep OK | String literal search |
 | `Grep "config_key"` | ✅ Grep OK | Config value search |
@@ -994,6 +1042,7 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 
 ```
 astro-sight refs --name <symbol> --dir .           # Symbol reference search (REPLACES Grep for identifiers)
+astro-sight refs --name <symbol> --dir . --max-results unlimited  # opt out of the default 100-ref cap
 astro-sight refs --names sym1,sym2 --dir .         # Batch symbol search (REPLACES Grep "FOO|Bar")
 astro-sight symbols --path <file>                  # File structure overview
 astro-sight symbols --dir <dir>                    # Directory structure overview (NDJSON)

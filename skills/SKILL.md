@@ -68,9 +68,24 @@ The primary Grep replacement. Matches only tree-sitter identifier nodes — no f
 astro-sight refs --name <symbol> --dir <directory>
 astro-sight refs --name <symbol> --dir <directory> --glob "**/*.rs"   # narrow by glob
 astro-sight refs --names sym1,sym2,sym3 --dir <directory>             # multiple symbols (NDJSON, one line each)
+astro-sight refs --name <symbol> --dir . --max-results unlimited      # opt out of the default cap
 ```
 
-Output: `refs` array with `path`, `ln`, `col`, `ctx` (source line), `kind` (`def`/`ref`). `ctx` shows the source line — no need to Read files afterward. For very common symbols, narrow with `--glob` or lower `ASTRO_SIGHT_BATCH_WORKERS`.
+Output: `refs` array with `path`, `ln`, `col`, `ctx` (source line), `kind` (`def`/`ref`). `ctx` shows the source line — no need to Read files afterward.
+
+**Output is capped by default** (100 refs / ~3,000 tokens) so one hot identifier cannot burn tens of thousands of tokens. Analysis is never truncated — only the output is. When results are omitted you get a `result_summary`:
+
+```json
+"result_summary": {
+  "shown": 64, "total": 1846, "omitted": 1782,
+  "limited_by": ["max_results", "token_budget"],
+  "by_lang": { "rust": 1776, "xojo": 5 },
+  "files": [ { "path": "src/foo.rs", "count": 326 } ],
+  "other_files": { "files": 128, "count": 1231 }
+}
+```
+
+`total` is exact. `by_lang` / `files` describe **only the omitted refs** — use them to narrow with `--glob` (e.g. if most omitted hits are in another language, the name collides across languages). Raise or remove the cap with `--max-results N|unlimited` and `--token-budget N|unlimited`. If no results are omitted, `result_summary` is absent and output is byte-identical to before.
 
 ### `calls` — Call Graph Extraction
 
