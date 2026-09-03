@@ -165,7 +165,7 @@ fn run_symbol_query(
 
     let mut symbols = Vec::new();
     while let Some(m) = matches.next() {
-        for capture in m.captures {
+        for capture in m.captures() {
             let node = capture.node;
             let capture_name = &query.capture_names()[capture.index as usize];
             let kind = capture_name_to_kind(capture_name);

@@ -115,7 +115,7 @@ fn canonical_python_function_signature(
     let mut visited = 0usize;
     let mut stack = Vec::new();
     for index in (0..fn_node.child_count()).rev() {
-        let child = fn_node.child(u32::try_from(index).ok()?)?;
+        let child = fn_node.child(index)?;
         if !same_node(child, body) {
             stack.push(child);
         }
@@ -152,7 +152,7 @@ fn canonical_python_function_signature(
             continue;
         }
         for index in (0..node.child_count()).rev() {
-            stack.push(node.child(u32::try_from(index).ok()?)?);
+            stack.push(node.child(index)?);
         }
     }
 

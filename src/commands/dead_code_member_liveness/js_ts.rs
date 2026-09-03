@@ -317,7 +317,7 @@ fn analyze_file(
         while let Some(m) = matches.next() {
             let mut import_name: Option<&str> = None;
             let mut import_alias: Option<&str> = None;
-            for cap in m.captures {
+            for cap in m.captures() {
                 let Ok(text) = cap.node.utf8_text(source) else {
                     continue;
                 };
@@ -360,7 +360,7 @@ fn analyze_file(
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&query, root, source);
         while let Some(m) = matches.next() {
-            for cap in m.captures {
+            for cap in m.captures() {
                 let node = cap.node;
                 let Ok(text) = node.utf8_text(source) else {
                     continue;

@@ -81,7 +81,7 @@ pub fn lint_file(
                     let mut query_matches = cursor.matches(&query, root, source);
 
                     while let Some(m) = query_matches.next() {
-                        for capture in m.captures {
+                        for capture in m.captures() {
                             let node = capture.node;
                             let matched_text = node.utf8_text(source).unwrap_or("").to_string();
 

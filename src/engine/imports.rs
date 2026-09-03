@@ -20,7 +20,7 @@ pub fn extract_imports(root: Node<'_>, source: &[u8], lang_id: LangId) -> Result
 
     let mut edges = Vec::new();
     while let Some(m) = matches.next() {
-        for capture in m.captures {
+        for capture in m.captures() {
             let node = capture.node;
             let capture_name = &query.capture_names()[capture.index as usize];
             if *capture_name != "import.source" {

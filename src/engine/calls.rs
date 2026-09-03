@@ -26,7 +26,7 @@ pub fn extract_calls(
 
     let mut edges = Vec::new();
     while let Some(m) = matches.next() {
-        for capture in m.captures {
+        for capture in m.captures() {
             let node = capture.node;
             let capture_name = &query.capture_names()[capture.index as usize];
             if !capture_name.ends_with("callee") {
@@ -92,7 +92,7 @@ pub fn extract_all_callees(
 
     let mut callees = HashSet::new();
     while let Some(m) = matches.next() {
-        for capture in m.captures {
+        for capture in m.captures() {
             let capture_name = &query.capture_names()[capture.index as usize];
             if !capture_name.ends_with("callee") {
                 continue;
