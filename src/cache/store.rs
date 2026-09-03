@@ -11,6 +11,7 @@ impl CacheStore {
     pub fn new() -> Result<Self> {
         let dir = cache_dir();
         fs::create_dir_all(&dir)?;
+        collect_stale_generations_once();
         Ok(Self { dir })
     }
 
@@ -86,11 +87,80 @@ impl CacheStore {
     }
 }
 
-fn cache_dir() -> PathBuf {
+/// キャッシュのルート。世代ディレクトリの親。
+fn cache_root() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(".cache")
         .join("astro-sight")
+}
+
+/// この astro-sight バージョン専用のキャッシュ世代ディレクトリ名。
+fn current_generation() -> String {
+    format!("v{}", env!("CARGO_PKG_VERSION"))
+}
+
+fn cache_dir() -> PathBuf {
+    cache_root().join(current_generation())
+}
+
+/// 旧バージョンのキャッシュ世代を削除する (プロセスあたり 1 回、best-effort)。
+///
+/// キャッシュキーには astro-sight のバージョンが混ざっているため、リリースのたびに
+/// 全エントリが失効する。しかし**失効するだけで消えはしない**ので、更新を重ねるほど
+/// 死蔵データが積み上がっていた (実測: 開発機で 176MB、そのほぼ全量が到達不能)。
+/// 世代ごとにディレクトリを分け、新しい世代の初回起動で兄弟世代を掃く。
+///
+/// 失敗は無視する — キャッシュの掃除に失敗しても解析は続けられるべきで、
+/// 権限や他プロセスの都合で消せないことを利用者に見せる必要がない。
+/// 異なるバージョンが同時に走っていると走査中のディレクトリを消しうるが、
+/// キャッシュの読み書き失敗は miss として扱われるだけで解析結果は変わらない。
+fn collect_stale_generations_once() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| collect_stale_generations_in(&cache_root(), &current_generation()));
+}
+
+/// [`collect_stale_generations_once`] の実体。root と現世代名を引数で受けてテスト可能にする。
+fn collect_stale_generations_in(root: &std::path::Path, current: &str) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_stale_generation_dir(name, current) {
+            continue;
+        }
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// キャッシュルート直下のディレクトリ名が「消してよい旧世代」か。
+///
+/// 対象は 2 種類だけ:
+/// - 旧バージョンの世代ディレクトリ (`v26.8.110`)
+/// - 世代分離を導入する前のフラットな 2 桁 hex シャード (`00`〜`ff`)
+///
+/// **それ以外の名前は消さない。** このディレクトリは利用者の `~/.cache` 配下にあり、
+/// astro-sight が作ったと確証が持てないものを消すと復元できない。判定を「現世代以外の
+/// 全部」にしないのはそのため。
+fn is_stale_generation_dir(name: &str, current: &str) -> bool {
+    if name == current {
+        return false;
+    }
+    let is_generation = name
+        .strip_prefix('v')
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+    let is_legacy_shard = name.len() == 2
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    is_generation || is_legacy_shard
 }
 
 #[cfg(test)]
@@ -190,5 +260,66 @@ mod tests {
         assert!(store.get(&hash, "test_clear").is_some());
         store.clear().unwrap();
         assert!(store.get(&hash, "test_clear").is_none());
+    }
+
+    /// 旧世代だけを消し、現世代と「astro-sight が作ったと確証が持てない名前」は残す。
+    ///
+    /// このディレクトリは利用者の `~/.cache` 配下なので、判定を「現世代以外の全部」に
+    /// すると同居している別物を消しうる。対照ケースを同じテストで固定する。
+    #[test]
+    fn stale_generation_dirs_are_identified_conservatively() {
+        let current = "v26.9.100";
+        // 消す: 旧世代 + 世代分離前のフラットな hex シャード
+        for name in ["v26.8.111", "v1.0.0", "00", "ff", "a3", "9c"] {
+            assert!(
+                is_stale_generation_dir(name, current),
+                "{name} は旧世代として削除対象のはず"
+            );
+        }
+        // 残す: 現世代、および astro-sight が作ったと確証が持てない名前
+        for name in [
+            current,
+            "logs",
+            "tmp",
+            "vendor",
+            "v",
+            "version-notes",
+            "README",
+            "0",
+            "000",
+            "gg",
+            "AB",
+        ] {
+            assert!(
+                !is_stale_generation_dir(name, current),
+                "{name} は削除してはならない"
+            );
+        }
+    }
+
+    /// 実ディレクトリに対して旧世代だけが消えることを確認する。
+    #[test]
+    fn collect_stale_generations_removes_only_old_generations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let current = "v26.9.100";
+        for name in [current, "v26.8.111", "00", "logs"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+            fs::write(root.join(name).join("entry.json"), b"{}").unwrap();
+        }
+        collect_stale_generations_in(root, current);
+        assert!(root.join(current).exists(), "現世代を消してはならない");
+        assert!(root.join("logs").exists(), "未知の名前を消してはならない");
+        assert!(!root.join("v26.8.111").exists(), "旧世代は消えるべき");
+        assert!(!root.join("00").exists(), "旧フラットシャードは消えるべき");
+    }
+
+    /// キャッシュ本体はバージョン別ディレクトリに入る (世代 GC が効く前提)。
+    #[test]
+    fn cache_dir_is_namespaced_by_version() {
+        let dir = cache_dir();
+        let generation = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        assert_eq!(generation, current_generation());
+        assert_eq!(dir.parent().map(|p| p.to_path_buf()), Some(cache_root()));
     }
 }
