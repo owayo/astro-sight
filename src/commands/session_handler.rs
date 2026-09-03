@@ -5,6 +5,18 @@ use crate::error::{AstroError, ErrorCode};
 use crate::models::cochange::CoChangeOptions;
 use crate::service::{AppService, AstParams};
 
+/// session リクエストの `max_results` / `token_budget` を解決する。
+/// 不正値は他の入力検証と同じ `INVALID_REQUEST` にする。
+fn resolve_refs_limits(
+    req: &crate::models::request::AstgenRequest,
+) -> Result<crate::models::result_summary::ResultLimits> {
+    crate::models::result_summary::resolve_limits(
+        req.max_results.as_ref(),
+        req.token_budget.as_ref(),
+    )
+    .map_err(|m| AstroError::new(ErrorCode::InvalidRequest, m).into())
+}
+
 pub fn handle_request(
     service: &AppService,
     req: crate::models::request::AstgenRequest,
@@ -53,21 +65,27 @@ pub fn handle_request(
                     )
                     .into());
                 }
-                let results = service.find_references_batch_with_generated(
+                let mut results = service.find_references_batch_with_generated(
                     &filtered,
                     dir,
                     req.glob.as_deref(),
                     req.include_generated,
                 )?;
+                // 出力件数の上限は表現層の責務。session も CLI と同じ既定値を適用する
+                // (エージェントが消費する面なので、ここだけ無制限だと同じ爆発が起きる)。
+                let limits = resolve_refs_limits(&req)?;
+                crate::output::limit::apply_refs_batch_limits_json(&mut results, limits)?;
                 Ok(serde_json::to_value(results)?)
             } else if let Some(name) = req.name.as_deref().map(str::trim).filter(|n| !n.is_empty())
             {
-                let result = service.find_references_with_generated(
+                let mut result = service.find_references_with_generated(
                     name,
                     dir,
                     req.glob.as_deref(),
                     req.include_generated,
                 )?;
+                let limits = resolve_refs_limits(&req)?;
+                crate::output::limit::apply_refs_limits_json(&mut result, limits)?;
                 Ok(serde_json::to_value(result)?)
             } else {
                 Err(AstroError::new(

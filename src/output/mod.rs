@@ -15,6 +15,7 @@
 //! そうしないと `format = "toon"` を設定しただけで `session` や Stop hook が
 //! 全滅する (設定として使い物にならない)。
 
+pub mod limit;
 mod nullable;
 pub mod toon;
 
@@ -52,12 +53,31 @@ impl OutputFormat {
 ///
 /// BPE トークナイザでは改行とインデントが 1 行あたりおよそ 1 トークンを消費するため、
 /// 素の文字数だけで比べると **行数の多い TOON を過大評価する**。実測 (astro-sight の
-/// 出力 1,120 サンプル × tiktoken `o200k_base` / `cl100k_base`) では、
-/// 1 行あたり 1〜4 文字ぶんの罰則を入れると真のトークン数最小との一致率が上がり、
-/// **1 回の呼び出しあたりの最悪損失が 15〜16% から 4〜7% へ下がる**。
-/// k=1..4 が平坦域でどちらのトークナイザでも安定しているため、その中央値の 3 を採る
-/// (特定のトークナイザ版に賭けた magic number ではなく、平坦域の代表値)。
-const LINE_TOKEN_PENALTY: usize = 3;
+/// 出力サンプル × tiktoken `o200k_base` / `cl100k_base`) では、
+/// 1 行あたり数文字ぶんの罰則を入れると真のトークン数最小との一致率が上がり、
+/// **1 回の呼び出しあたりの最悪損失が 15〜16% から大きく下がる**。
+///
+/// 値は 2026-09-04 に再測定して 3 から 4 へ引き上げた。`result_summary` (出力上限の申告)
+/// という **行数の多い小さな出力**が新たに加わり、旧値の平坦域から外れたため
+/// (AGENTS.md の「DTO や出力形を変えたら係数を測り直すこと」に該当する):
+///
+/// - 大きな出力 143 ペア: k=0..6 がいずれも損失ゼロ (係数の選択が結果を変えない領域)
+/// - `result_summary` 付きの小さな出力 120 ペア: k=3 は損失 0.67% / 最悪 93 tokens に対し、
+///   **k=4 は損失 0.13% / 最悪 30 tokens**。両トークナイザで k=4 が最良で一致した
+///
+/// 小さい出力ほど形式間の逆転が起きやすいので、そちらで差が付く値を採る。
+const LINE_TOKEN_PENALTY: usize = 4;
+
+/// [`size_metric`] を実トークン数へ換算するときの除数。
+///
+/// `size_metric` は形式間の**相対比較**用なので係数の絶対値は問わないが、
+/// `--token-budget` のような**絶対的な予算**に使うにはトークン数と桁を合わせる必要がある
+/// (合わせないと「3000 トークンまで」と指定したのに実際は 900 トークンしか出ない)。
+///
+/// 実測 (252 サンプル × 2 トークナイザ、`LINE_TOKEN_PENALTY = 4` 時) の `metric / token` は
+/// p05=3.00 / p10=3.06 / p50=3.42 / p90=3.86 / min=2.73。**予算は超えない側に倒す**ので
+/// 中央値ではなく p05 相当の 3 を採る (95% のケースで予算内、最悪でも約 10% 超過)。
+const METRIC_PER_TOKEN: usize = 3;
 
 /// `auto` の比較単位 — トークン数の軽量な推定値。
 ///
@@ -76,8 +96,20 @@ fn size_metric(text: &str) -> usize {
 }
 
 /// バッチ経路が per-record の集計に使うための公開版。
+///
+/// これは **形式間の相対比較**用の指標で、単位はトークンではない。絶対的な予算
+/// (`--token-budget`) と突き合わせるときは [`estimated_tokens`] を使うこと。
 pub fn estimated_size(text: &str) -> usize {
     size_metric(text)
+}
+
+/// 出力テキストの推定トークン数。`--token-budget` の判定に使う。
+///
+/// [`estimated_size`] と違いトークンと同じ桁に揃えてあるので、利用者が指定した
+/// 「N トークンまで」がそのまま意味を持つ。切り上げ (`div_ceil`) にするのは、
+/// 非空の出力が 0 トークンと見積もられて予算判定が素通りするのを避けるため。
+pub fn estimated_tokens(text: &str) -> usize {
+    size_metric(text).div_ceil(METRIC_PER_TOKEN)
 }
 
 /// JSON の整形スタイル。`--pretty` は JSON 固有の設定で、TOON には対応概念が無い
@@ -574,6 +606,36 @@ mod tests {
         assert_eq!(size_metric("a\nb\nc"), 5 + 2 * LINE_TOKEN_PENALTY);
         // マルチバイト文字は 1 文字として数える (バイト長では重み付けしない)。
         assert_eq!(size_metric("日本語"), 3);
+    }
+
+    /// `estimated_tokens` は実トークン数と同じ桁でなければならない。
+    ///
+    /// `size_metric` は形式間の**相対比較**用なので係数の絶対値は問わないが、
+    /// `--token-budget` は利用者が「N トークンまで」と指定する**絶対値**。桁が
+    /// ずれると「3000 と指定したのに 900 しか出ない」という乖離になる (実際に
+    /// 一度そうなっていた)。実測 (252 サンプル × 2 トークナイザ) の metric/token は
+    /// p05=3.00 / p50=3.42 で、除数 3 は「予算を超えない側」に倒した値。
+    #[test]
+    fn estimated_tokens_is_metric_scaled_to_token_units() {
+        // 換算は metric / METRIC_PER_TOKEN の切り上げ
+        assert_eq!(estimated_tokens("abc"), 1);
+        assert_eq!(estimated_tokens(&"x".repeat(300)), 100);
+        assert_eq!(estimated_tokens(&"x".repeat(301)), 101);
+        // 非空の出力が 0 トークンと見積もられて予算判定が素通りしない
+        assert_eq!(estimated_tokens("a"), 1);
+        assert_eq!(estimated_tokens(""), 0);
+        // 改行の罰則は metric 側と同じ扱い (行の多い出力を過小評価しない)
+        let lines = "ab
+"
+        .repeat(30);
+        assert_eq!(
+            estimated_tokens(&lines),
+            size_metric(&lines).div_ceil(METRIC_PER_TOKEN)
+        );
+        assert!(
+            estimated_tokens(&lines) > lines.chars().count().div_ceil(METRIC_PER_TOKEN),
+            "改行ぶんの罰則が乗る"
+        );
     }
 
     #[test]

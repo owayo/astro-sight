@@ -572,3 +572,89 @@ fn session_review_command_returns_json_error() {
         "review が session 非対応であることを明示すべき: {error}"
     );
 }
+
+/// session も CLI と同じ既定の出力上限を適用する。
+///
+/// session はエージェントが直接消費する面なので、ここだけ無制限だと同じトークン爆発が
+/// 起きる。数値・`"unlimited"` の両表記を受け、不正値は他の入力検証と同じ
+/// `INVALID_REQUEST` に倒すことを 1 本で固定する (エラーコードを `IO_ERROR` へ
+/// 潰す退行の検出器も兼ねる)。
+#[test]
+fn session_refs_applies_result_limits() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut src = String::from("pub fn hotsym() {}\n");
+    for i in 0..300 {
+        src.push_str(&format!("pub fn caller{i}() {{ hotsym(); }}\n"));
+    }
+    std::fs::write(dir.path().join("a.rs"), &src).expect("write");
+    let dir_str = dir.path().to_str().expect("utf-8 path");
+
+    let mut child = cargo_bin()
+        .arg("session")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn session");
+    {
+        let stdin = child.stdin.as_mut().expect("stdin");
+        // 1: 既定 (上限あり) / 2: unlimited / 3: 数値指定 / 4: 不正値
+        writeln!(
+            stdin,
+            r#"{{"command":"refs","name":"hotsym","dir":"{dir_str}"}}"#
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            r#"{{"command":"refs","name":"hotsym","dir":"{dir_str}","max_results":"unlimited","token_budget":"unlimited"}}"#
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            r#"{{"command":"refs","name":"hotsym","dir":"{dir_str}","max_results":7,"token_budget":100000}}"#
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            r#"{{"command":"refs","name":"hotsym","dir":"{dir_str}","token_budget":10}}"#
+        )
+        .unwrap();
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("failed to wait");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    let lines: Vec<serde_json::Value> = stdout
+        .trim()
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("invalid NDJSON"))
+        .collect();
+    assert_eq!(lines.len(), 4, "1 リクエスト = 1 レスポンス: {stdout}");
+
+    // 既定では上限が効き、省略を申告する
+    let capped = &lines[0];
+    let shown = capped["refs"].as_array().expect("refs").len();
+    assert!(shown < 301, "既定で上限が効く: shown={shown}");
+    assert_eq!(capped["result_summary"]["total"], 301);
+    assert_eq!(capped["result_summary"]["shown"], shown as u64);
+
+    // unlimited は全件、サマリなし
+    assert_eq!(lines[1]["refs"].as_array().expect("refs").len(), 301);
+    assert!(lines[1].get("result_summary").is_none());
+
+    // 数値指定も受ける
+    assert_eq!(lines[2]["refs"].as_array().expect("refs").len(), 7);
+
+    // 不正値は INVALID_REQUEST (IO_ERROR へ潰さない)
+    assert_eq!(lines[3]["error"]["code"], "INVALID_REQUEST");
+    assert!(
+        lines[3]["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("token_budget"),
+        "session では JSON のキー名を名乗る: {}",
+        lines[3]
+    );
+}

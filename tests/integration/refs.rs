@@ -931,3 +931,184 @@ echo foo();\n",
         "case-insensitive なクラス参照は残すこと (抑制しすぎない): {foo_class:?}"
     );
 }
+
+/// 出力件数の上限が既定で効き、省略が起きたときだけ `result_summary` を出す。
+///
+/// 「上限に当たらない問い合わせでは出力が従来とバイト単位で同一」という契約を、
+/// **同じテストで対照として固定する** — 片方だけだと「常にサマリを出す」退行を
+/// 検出できない (既存 consumer の JSON パースが壊れる方向の事故)。
+#[test]
+fn refs_applies_default_result_limits_and_declares_omissions() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // 上限 (既定 100) を確実に超える件数の参照を作る。
+    let mut src = String::from("pub fn hotsym() {}\n");
+    for i in 0..300 {
+        src.push_str(&format!("pub fn caller{i}() {{ hotsym(); }}\n"));
+    }
+    std::fs::write(dir.path().join("a.rs"), &src).expect("write");
+
+    let output = cargo_bin()
+        .args(["refs", "--name", "hotsym", "--dir"])
+        .arg(dir.path())
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+
+    let shown = json["refs"].as_array().expect("refs").len();
+    let summary = &json["result_summary"];
+    assert!(!summary.is_null(), "省略が起きたら申告する: {json}");
+    assert_eq!(summary["shown"].as_u64().expect("shown") as usize, shown);
+    // 解析は止めないので total は正確 (定義 1 + 呼び出し 300)
+    assert_eq!(summary["total"], 301);
+    assert_eq!(
+        summary["omitted"].as_u64().expect("omitted") as usize,
+        301 - shown
+    );
+    assert!(shown < 301, "上限が効いていない: shown={shown}");
+    assert_eq!(summary["complete_input"], true);
+    assert!(
+        summary["limited_by"]
+            .as_array()
+            .expect("limited_by")
+            .iter()
+            .any(|v| v == "max_results" || v == "token_budget"),
+        "どの上限で切れたかを申告する: {summary}"
+    );
+    // 省略分の内訳は「省略された分だけ」を数える
+    let by_kind_ref = summary["by_kind"]["ref"].as_u64().expect("by_kind.ref");
+    assert_eq!(by_kind_ref as usize, 301 - shown);
+    assert_eq!(summary["by_lang"]["rust"], by_kind_ref);
+
+    // 対照: 上限に当たらない問い合わせでは result_summary を出さない
+    let output = cargo_bin()
+        .args(["refs", "--name", "caller7", "--dir"])
+        .arg(dir.path())
+        .output()
+        .expect("failed to run");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert!(
+        json.get("result_summary").is_none(),
+        "上限に当たらなければ出力は従来と同一: {json}"
+    );
+}
+
+/// `unlimited` で全件返り、サマリも出ない (明示的な全件取得の導線)。
+#[test]
+fn refs_unlimited_returns_every_reference() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut src = String::from("pub fn hotsym() {}\n");
+    for i in 0..300 {
+        src.push_str(&format!("pub fn caller{i}() {{ hotsym(); }}\n"));
+    }
+    std::fs::write(dir.path().join("a.rs"), &src).expect("write");
+
+    let output = cargo_bin()
+        .args([
+            "refs",
+            "--name",
+            "hotsym",
+            "--max-results",
+            "unlimited",
+            "--token-budget",
+            "unlimited",
+            "--dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert_eq!(json["refs"].as_array().expect("refs").len(), 301);
+    assert!(json.get("result_summary").is_none());
+}
+
+/// 上限の不正値は他の入力検証と同じ機械可読エラーで弾く (clap の型エラーにしない)。
+///
+/// エラーメッセージが名乗る名前は **その面での指定方法**に合わせる — CLI は
+/// `--max-results`、session / MCP は `max_results`。利用者が直せない名前を出すと
+/// 機械可読エラーの意味がない。
+#[test]
+fn refs_rejects_invalid_result_limits() {
+    for (flag, value, expect) in [
+        ("--max-results", "lots", "--max-results"),
+        ("--token-budget", "10", "--token-budget"),
+        ("--token-budget", "abc", "--token-budget"),
+    ] {
+        let output = cargo_bin()
+            .args(["refs", "--name", "x", "--dir", "src/", flag, value])
+            .output()
+            .expect("failed to run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value =
+            serde_json::from_str(stdout.trim()).unwrap_or_else(|_| panic!("not JSON: {stdout}"));
+        assert_eq!(
+            json["error"]["code"], "INVALID_REQUEST",
+            "{flag} {value} -> {stdout}"
+        );
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains(expect),
+            "{flag} {value} -> {stdout}"
+        );
+    }
+}
+
+/// `refs --names` の予算は **呼び出し全体で 1 つ**を round-robin 配分する。
+///
+/// 名前ごとに上限を課すと全体が名前数に比例して膨らみ、先頭から詰めると高頻度な
+/// 1 名が予算を食い尽くして後続が 0 件になる (飢餓)。両方を同じテストで固定する。
+#[test]
+fn refs_batch_shares_one_budget_round_robin() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut src = String::from("pub fn alpha() {}\npub fn beta() {}\n");
+    // alpha を圧倒的に多くして、飢餓が起きれば beta が 0 件になる状況を作る。
+    for i in 0..200 {
+        src.push_str(&format!("pub fn ca{i}() {{ alpha(); }}\n"));
+    }
+    for i in 0..5 {
+        src.push_str(&format!("pub fn cb{i}() {{ beta(); }}\n"));
+    }
+    std::fs::write(dir.path().join("a.rs"), &src).expect("write");
+
+    let output = cargo_bin()
+        .args([
+            "refs",
+            "--names",
+            "alpha,beta",
+            "--max-results",
+            "20",
+            "--token-budget",
+            "unlimited",
+            "--dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let records: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("invalid NDJSON"))
+        .collect();
+    assert_eq!(records.len(), 2, "名前ごとに 1 レコード: {stdout}");
+
+    let alpha = &records[0];
+    let beta = &records[1];
+    assert_eq!(alpha["symbol"], "alpha");
+    assert_eq!(beta["symbol"], "beta");
+    let a_n = alpha["refs"].as_array().expect("refs").len();
+    let b_n = beta["refs"].as_array().expect("refs").len();
+    // 全体で 20 件を分け合う (名前ごとに 20 ではない)
+    assert_eq!(a_n + b_n, 20, "全体で 1 予算: alpha={a_n} beta={b_n}");
+    // beta は参照が 6 件しかないので全部出る = 高頻度な alpha に飢餓させられない
+    assert_eq!(b_n, 6, "少ない側は飢餓しない: alpha={a_n} beta={b_n}");
+    assert!(
+        !beta.get("result_summary").is_some_and(|v| !v.is_null()),
+        "全件出た側にサマリは付かない: {beta}"
+    );
+    assert_eq!(alpha["result_summary"]["total"], 201);
+}

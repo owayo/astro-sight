@@ -14,6 +14,7 @@ use astro_sight::commands::{
 };
 use astro_sight::config::ConfigService;
 use astro_sight::error::{AstroError, ErrorCode};
+use astro_sight::models::result_summary::{MIN_TOKEN_BUDGET, ResultLimits, parse_limit_arg};
 use astro_sight::output::OutputOptions;
 use astro_sight::service::AppService;
 
@@ -165,6 +166,21 @@ fn resolve_names(name: Option<&str>, names: Option<&str>) -> Result<NameInput> {
         )
         .into())
     }
+}
+
+/// `--max-results` / `--token-budget` を解決する。
+///
+/// 不正値は `InvalidRequest` にする (clap の型エラーだと機械可読なエラーコードにならず、
+/// 他の入力検証エラーと扱いが揃わないため)。
+fn resolve_result_limits(max_results: &str, token_budget: &str) -> Result<ResultLimits> {
+    let max_results = parse_limit_arg(max_results, "--max-results", 0)
+        .map_err(|m| AstroError::new(ErrorCode::InvalidRequest, m))?;
+    let token_budget = parse_limit_arg(token_budget, "--token-budget", MIN_TOKEN_BUDGET)
+        .map_err(|m| AstroError::new(ErrorCode::InvalidRequest, m))?;
+    Ok(ResultLimits {
+        max_results,
+        token_budget,
+    })
 }
 
 fn resolve_paths(
@@ -425,24 +441,31 @@ fn dispatch_command(
             names,
             dir,
             glob,
-        } => match resolve_names(name.as_deref(), names.as_deref())? {
-            NameInput::Single(n) => cmd_refs(
-                service,
-                &n,
-                &dir,
-                glob.as_deref(),
-                include_generated,
-                output,
-            ),
-            NameInput::Batch(ns) => cmd_refs_batch(
-                service,
-                &ns,
-                &dir,
-                glob.as_deref(),
-                include_generated,
-                output,
-            ),
-        },
+            max_results,
+            token_budget,
+        } => {
+            let limits = resolve_result_limits(&max_results, &token_budget)?;
+            match resolve_names(name.as_deref(), names.as_deref())? {
+                NameInput::Single(n) => cmd_refs(
+                    service,
+                    &n,
+                    &dir,
+                    glob.as_deref(),
+                    include_generated,
+                    limits,
+                    output,
+                ),
+                NameInput::Batch(ns) => cmd_refs_batch(
+                    service,
+                    &ns,
+                    &dir,
+                    glob.as_deref(),
+                    include_generated,
+                    limits,
+                    output,
+                ),
+            }
+        }
         Commands::Review {
             dir,
             diff,

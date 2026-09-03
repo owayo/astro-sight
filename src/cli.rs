@@ -167,6 +167,16 @@ pub enum Commands {
         /// Glob pattern to filter files (e.g. "**/*.rs")
         #[arg(short, long)]
         glob: Option<String>,
+
+        /// 出力する参照の最大件数。`unlimited` で無制限 (既定: 100)。
+        /// 上限に当たった場合だけ `result_summary` で省略分を申告する。
+        /// 解析自体は常に全件行うため `result_summary.total` は正確。
+        #[arg(long, default_value = "100", value_name = "N|unlimited")]
+        max_results: String,
+
+        /// 出力全体の推定トークン予算。`unlimited` で無制限 (既定: 3000、最小: 256)。
+        #[arg(long, default_value = "3000", value_name = "N|unlimited")]
+        token_budget: String,
     },
 
     /// Smart context: analyze diff impact

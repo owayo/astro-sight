@@ -8,6 +8,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::doctor;
+use crate::models::result_summary::{LimitValue, resolve_limits};
 use crate::output::{OutputOptions, serialize_document};
 use crate::service::{AppService, AstParams};
 
@@ -74,6 +75,14 @@ pub struct RefsSearchParams {
     /// Include files detected as generated
     #[serde(default)]
     pub include_generated: bool,
+    /// Max references to return (number, or "unlimited"). Default 100.
+    /// When results are omitted, `result_summary` reports the exact total and
+    /// which files hold the omitted references.
+    #[serde(default)]
+    pub max_results: Option<LimitValue>,
+    /// Estimated token budget for the whole response (number, or "unlimited"). Default 3000.
+    #[serde(default)]
+    pub token_budget: Option<LimitValue>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -88,6 +97,14 @@ pub struct RefsBatchSearchParams {
     /// Include files detected as generated
     #[serde(default)]
     pub include_generated: bool,
+    /// Max references to return across the whole call (number, or "unlimited"). Default 100.
+    /// The budget is shared by all names and allocated round-robin so one hot name
+    /// cannot starve the others.
+    #[serde(default)]
+    pub max_results: Option<LimitValue>,
+    /// Estimated token budget for the whole response (number, or "unlimited"). Default 3000.
+    #[serde(default)]
+    pub token_budget: Option<LimitValue>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -276,12 +293,20 @@ impl AstroSightServer {
         if name.is_empty() {
             return Err(McpError::invalid_params("name must not be empty", None));
         }
-        self.to_tool_result(self.service.find_references_with_generated(
-            name,
-            &p.dir,
-            p.glob.as_deref(),
-            p.include_generated,
-        ))
+        let limits = match resolve_limits(p.max_results.as_ref(), p.token_budget.as_ref()) {
+            Ok(l) => l,
+            Err(m) => return Err(McpError::invalid_params(m, None)),
+        };
+        let result = self
+            .service
+            .find_references_with_generated(name, &p.dir, p.glob.as_deref(), p.include_generated)
+            .and_then(|mut r| {
+                // 出力件数の上限は表現層の責務。MCP はエージェントが直接消費する面なので
+                // CLI と同じ既定値を適用する。
+                crate::output::limit::apply_refs_limits_json(&mut r, limits)?;
+                Ok(r)
+            });
+        self.to_tool_result(result)
     }
 
     #[tool(
@@ -305,12 +330,23 @@ impl AstroSightServer {
                 None,
             ));
         }
-        self.to_tool_result(self.service.find_references_batch_with_generated(
-            &filtered,
-            &p.dir,
-            p.glob.as_deref(),
-            p.include_generated,
-        ))
+        let limits = match resolve_limits(p.max_results.as_ref(), p.token_budget.as_ref()) {
+            Ok(l) => l,
+            Err(m) => return Err(McpError::invalid_params(m, None)),
+        };
+        let result = self
+            .service
+            .find_references_batch_with_generated(
+                &filtered,
+                &p.dir,
+                p.glob.as_deref(),
+                p.include_generated,
+            )
+            .and_then(|mut r| {
+                crate::output::limit::apply_refs_batch_limits_json(&mut r, limits)?;
+                Ok(r)
+            });
+        self.to_tool_result(result)
     }
 
     #[tool(

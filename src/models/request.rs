@@ -42,6 +42,12 @@ pub struct AstgenRequest {
     /// generated 判定されたファイルも refs の走査対象に含める。
     #[serde(default, skip_serializing_if = "is_false")]
     pub include_generated: bool,
+    /// refs の出力件数上限。数値または `"unlimited"`。省略時は既定値 (100)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_results: Option<crate::models::result_summary::LimitValue>,
+    /// refs 出力全体の推定トークン予算。数値または `"unlimited"`。省略時は既定値 (3000)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<crate::models::result_summary::LimitValue>,
     /// diff 入力（session 経由の context コマンド用）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,

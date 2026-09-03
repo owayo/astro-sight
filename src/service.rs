@@ -499,6 +499,8 @@ impl AppService {
             symbol: name.to_string(),
             references,
             skipped,
+            // 上限適用は表現層 (commands / MCP) の責務。解析結果そのものは常に全件持つ。
+            result_summary: None,
         };
         debug!(
             name = name,
@@ -551,6 +553,7 @@ impl AppService {
                     symbol: name.clone(),
                     references,
                     skipped: None,
+                    result_summary: None,
                 }
             })
             .collect();

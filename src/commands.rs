@@ -5,6 +5,8 @@ use crate::cache::store::CacheStore;
 use crate::doctor;
 use crate::engine::parser;
 use crate::models::cochange::{CoChangeOptions, CoChangeResult};
+use crate::models::reference::{RefsResult, SymbolReference};
+use crate::models::result_summary::{ResultLimits, ResultSummary};
 use crate::models::skip::SkipInfo;
 use crate::service::{AppService, AstParams};
 
@@ -296,13 +298,48 @@ pub fn cmd_refs(
     dir: &str,
     glob: Option<&str>,
     include_generated: bool,
+    limits: ResultLimits,
     output: OutputOptions,
 ) -> Result<()> {
     let result = service.find_references_with_generated(name, dir, glob, include_generated)?;
-    let text = serialize_cli_document(&result, output)?;
-    info!(command = "refs", name = name, dir = dir, glob = ?glob, output_bytes = text.len(), "command completed");
+    let (text, shown, total) = render_refs_within_limits(result, limits, output)?;
+    info!(command = "refs", name = name, dir = dir, glob = ?glob, shown = shown, total = total, output_bytes = text.len(), "command completed");
     print!("{text}");
     Ok(())
+}
+
+/// `refs` 単一結果を上限内で描画する。返り値は `(本文, 出力件数, 総件数)`。
+///
+/// 予算は **実際に描画したテキスト**に対して判定するので、`--format` / `--pretty` の
+/// 選択がそのまま反映される (TOON が選ばれれば同じ予算でより多く出せる)。
+/// `skipped` (生成物としてスキャンから外したファイル) があれば入力集合が完全でないため
+/// `complete_input` を false にする。
+fn render_refs_within_limits(
+    mut result: RefsResult,
+    limits: ResultLimits,
+    output: OutputOptions,
+) -> Result<(String, usize, usize)> {
+    let total = result.references.len();
+    let complete_input = result.skipped.is_none();
+    let references = std::mem::take(&mut result.references);
+
+    let (shown, summary) =
+        crate::output::limit::apply_limits(&references, limits, complete_input, |k, summary| {
+            let probe = RefsResult {
+                symbol: result.symbol.clone(),
+                references: references[..k].to_vec(),
+                skipped: result.skipped.clone(),
+                result_summary: summary.cloned(),
+            };
+            serialize_cli_document(&probe, output)
+        })?;
+
+    let mut rendered = references;
+    rendered.truncate(shown);
+    result.references = rendered;
+    result.result_summary = summary;
+    let text = serialize_cli_document(&result, output)?;
+    Ok((text, shown, total))
 }
 
 pub fn cmd_refs_batch(
@@ -311,12 +348,12 @@ pub fn cmd_refs_batch(
     dir: &str,
     glob: Option<&str>,
     include_generated: bool,
+    limits: ResultLimits,
     output: OutputOptions,
 ) -> Result<()> {
     use std::io::Write;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let mut total_refs = 0usize;
 
     // find_references_batch が内部で名前を chunk 分割しつつディレクトリ走査を 1 回に
     // 集約するため、ここでは全名を 1 回で渡す（以前は呼び出し側で chunk 分割していたが
@@ -324,47 +361,83 @@ pub fn cmd_refs_batch(
     // NDJSON 出力も names 順を維持する。
     let results =
         service.find_references_batch_with_generated(names, dir, glob, include_generated)?;
-    for result in &results {
-        total_refs += result.references.len();
-    }
+    let total_refs: usize = results.iter().map(|r| r.references.len()).sum();
 
-    // この経路は元々全件を `Vec` で保持しているため、TOON では NDJSON ではなく
-    // 1 個のルート配列ドキュメントとして出す (ストリーミング要件が無いので、
-    // tabular 判定まで効く canonical なエンコードが使える)。
-    // auto も全件を持っているぶん近似が要らず、NDJSON 全体と TOON ドキュメントを
-    // 実際に組み立てて短い方を選べる。
-    match output.format() {
-        OutputFormat::Json => {
-            for result in &results {
-                let line = serde_json::to_string(result)?;
-                writeln!(out, "{line}")?;
-            }
-        }
-        OutputFormat::Toon => {
-            write!(out, "{}", serialize_document(&results, output)?)?;
-        }
-        OutputFormat::Auto => {
-            let mut ndjson = String::new();
-            for result in &results {
-                ndjson.push_str(&serde_json::to_string(result)?);
-                ndjson.push('\n');
-            }
-            let toon = serialize_document(&results, output.with_format(OutputFormat::Toon))?;
-            if crate::output::estimated_size(&toon) < crate::output::estimated_size(&ndjson) {
-                write!(out, "{toon}")?;
-            } else {
-                write!(out, "{ndjson}")?;
-            }
-        }
-    }
+    // 上限は **呼び出し全体**に 1 つだけ課し、名前間へ round-robin で配分する
+    // (名前ごとに上限を課すと全体が名前数に比例して膨らみ、先頭から詰めると
+    // 高頻度な 1 名が予算を食い尽くして後続が 0 件になる)。
+    let complete_input = results.iter().all(|r| r.skipped.is_none());
+    let groups: Vec<&[SymbolReference]> = results.iter().map(|r| r.references.as_slice()).collect();
+    let (alloc, summaries) = crate::output::limit::apply_grouped_limits(
+        &groups,
+        limits,
+        complete_input,
+        |alloc, summaries| render_refs_batch(&results, alloc, summaries, output),
+    )?;
+
+    let text = render_refs_batch(&results, &alloc, &summaries, output)?;
+    write!(out, "{text}")?;
 
     info!(
         command = "refs_batch",
         names_count = names.len(),
+        shown_refs = alloc.iter().sum::<usize>(),
         total_refs = total_refs,
         "command completed"
     );
     Ok(())
+}
+
+/// `refs --names` の出力本文を組み立てる。
+///
+/// この経路は元々全件を `Vec` で保持しているため、TOON では NDJSON ではなく
+/// 1 個のルート配列ドキュメントとして出す (ストリーミング要件が無いので、
+/// tabular 判定まで効く canonical なエンコードが使える)。
+/// auto も全件を持っているぶん近似が要らず、NDJSON 全体と TOON ドキュメントを
+/// 実際に組み立てて短い方を選べる。
+fn render_refs_batch(
+    results: &[RefsResult],
+    alloc: &[usize],
+    summaries: &[Option<ResultSummary>],
+    output: OutputOptions,
+) -> Result<String> {
+    let capped: Vec<RefsResult> = results
+        .iter()
+        .enumerate()
+        .map(|(i, r)| RefsResult {
+            symbol: r.symbol.clone(),
+            references: r.references[..alloc[i]].to_vec(),
+            skipped: r.skipped.clone(),
+            result_summary: summaries[i].clone(),
+        })
+        .collect();
+
+    let mut text = String::new();
+    match output.format() {
+        OutputFormat::Json => {
+            for result in &capped {
+                text.push_str(&serde_json::to_string(result)?);
+                text.push('\n');
+            }
+        }
+        OutputFormat::Toon => {
+            text.push_str(&serialize_document(&capped, output)?);
+        }
+        OutputFormat::Auto => {
+            let mut ndjson = String::new();
+            for result in &capped {
+                ndjson.push_str(&serde_json::to_string(result)?);
+                ndjson.push('\n');
+            }
+            let toon = serialize_document(&capped, output.with_format(OutputFormat::Toon))?;
+            if crate::output::estimated_size(&toon) < crate::output::estimated_size(&ndjson) {
+                text.push_str(&toon);
+            } else {
+                text.push_str(&ndjson);
+            }
+        }
+    }
+    Ok(text)
 }
 
 pub fn cmd_cochange(
