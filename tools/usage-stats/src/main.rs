@@ -32,6 +32,10 @@ struct Stats {
     astro_subcmds: HashMap<String, HashMap<String, u64>>,
     astro_daily: HashMap<String, u64>,
     bash_cmd_counts: HashMap<String, HashMap<String, u64>>,
+    /// source → [`SearchIntent::label`] → 件数。grep 系呼び出しの意図別内訳。
+    search_intent_counts: HashMap<String, HashMap<String, u64>>,
+    /// source → 検索パターン → 件数 (識別子検索だけ)。置換すべき実例の提示に使う。
+    identifier_search_patterns: HashMap<String, HashMap<String, u64>>,
     session_counts: HashMap<String, u64>,
     file_counts: HashMap<String, u64>,
     total_tool_calls: HashMap<String, u64>,
@@ -74,6 +78,18 @@ impl Stats {
             let entry = self.bash_cmd_counts.entry(src).or_default();
             for (cmd, count) in cmds {
                 *entry.entry(cmd).or_default() += count;
+            }
+        }
+        for (src, intents) in other.search_intent_counts {
+            let entry = self.search_intent_counts.entry(src).or_default();
+            for (intent, count) in intents {
+                *entry.entry(intent).or_default() += count;
+            }
+        }
+        for (src, patterns) in other.identifier_search_patterns {
+            let entry = self.identifier_search_patterns.entry(src).or_default();
+            for (pattern, count) in patterns {
+                *entry.entry(pattern).or_default() += count;
             }
         }
         for (src, count) in other.total_tool_calls {
@@ -142,11 +158,26 @@ fn astro_sight_invocation_args(cmd: &str) -> Option<&str> {
 /// 誤検出 (採用数の水増し) しないようにする。区切りはいずれも ASCII 1〜2 バイト
 /// なので、バイト境界で切り出してもマルチバイト文字を分断しない。
 fn split_top_level_segments(cmd: &str) -> Vec<&str> {
+    split_segments_with_pipe_flag(cmd)
+        .into_iter()
+        .map(|(segment, _)| segment)
+        .collect()
+}
+
+/// [`split_top_level_segments`] と同じ分割に「そのセグメントがパイプの受け側か」を添える。
+///
+/// パイプの受け側の `grep` は前段コマンドの**出力**を絞っているだけで、
+/// ファイルの中身を検索していない (`cargo test 2>&1 | grep '^error'` など)。
+/// astro-sight で置き換えられるのはファイル検索だけなので、両者を混ぜて数えると
+/// 「置換すべき grep」を数倍に見積もってしまう。
+fn split_segments_with_pipe_flag(cmd: &str) -> Vec<(&str, bool)> {
     let bytes = cmd.as_bytes();
     let mut segments = Vec::new();
     let mut start = 0;
     let mut i = 0;
     let mut quote: Option<u8> = None;
+    // 直前の区切りがパイプだったか。先頭セグメントは常に false。
+    let mut after_pipe = false;
     while i < bytes.len() {
         let b = bytes[i];
         match quote {
@@ -163,20 +194,25 @@ fn split_top_level_segments(cmd: &str) -> Vec<&str> {
                     i += 1;
                 }
                 b';' => {
-                    segments.push(&cmd[start..i]);
+                    segments.push((&cmd[start..i], after_pipe));
+                    after_pipe = false;
                     i += 1;
                     start = i;
                 }
                 b'|' => {
-                    segments.push(&cmd[start..i]);
+                    segments.push((&cmd[start..i], after_pipe));
                     i += 1;
                     if i < bytes.len() && bytes[i] == b'|' {
-                        i += 1; // `||`
+                        i += 1; // `||` は論理和なので出力は繋がらない
+                        after_pipe = false;
+                    } else {
+                        after_pipe = true;
                     }
                     start = i;
                 }
                 b'&' if i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
-                    segments.push(&cmd[start..i]);
+                    segments.push((&cmd[start..i], after_pipe));
+                    after_pipe = false;
                     i += 2;
                     start = i;
                 }
@@ -184,7 +220,7 @@ fn split_top_level_segments(cmd: &str) -> Vec<&str> {
             },
         }
     }
-    segments.push(&cmd[start..]);
+    segments.push((&cmd[start..], after_pipe));
     segments
 }
 
@@ -273,6 +309,232 @@ fn is_astro_sight_cmd(cmd: &str) -> bool {
 /// 自動継続の待機はコード分析や編集の選択ではないため、採用率の分母から除外する。
 fn counts_toward_adoption(tool_name: &str) -> bool {
     tool_name != "wait"
+}
+
+/// `grep` / `rg` 呼び出しの意図。astro-sight で置換できるのは
+/// [`SearchIntent::IdentifierFileSearch`] だけである。
+///
+/// 「`grep` 呼出数 / (`grep` + astro-sight)」を置換余地とみなす素朴な指標は
+/// **誤導的**である。実測 (2026-09-04、過去 30 日 / 全プロジェクト) では
+/// grep 相当 20,860 件のうち 87.9% が `^error` / `^test result` / `panicked` のような
+/// **ビルド・テスト出力のフィルタ**で、そもそもファイルを検索していなかった。
+/// この分類を持たないと毎回「採用率が低い」と誤診し、指示ファイルへ不要な
+/// ルールを積み増して肥大化させることになる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchIntent {
+    /// ファイルに対する識別子検索。astro-sight refs で置換すべき。
+    IdentifierFileSearch,
+    /// ファイルに対する非識別子検索 (エラーメッセージ・設定値・TODO 等)。grep が正当。
+    TextFileSearch,
+    /// パイプ経由のコマンド出力フィルタ。ファイルを見ていないので置換対象外。
+    OutputFilter,
+}
+
+impl SearchIntent {
+    fn label(self) -> &'static str {
+        match self {
+            Self::IdentifierFileSearch => "identifier_file_search",
+            Self::TextFileSearch => "text_file_search",
+            Self::OutputFilter => "output_filter",
+        }
+    }
+}
+
+/// シェルコマンドに含まれる grep 系呼び出しを列挙し、意図とパターンを返す。
+fn classify_search_invocations(cmd: &str) -> Vec<(SearchIntent, String)> {
+    let mut out = Vec::new();
+    for (segment, after_pipe) in split_segments_with_pipe_flag(cmd) {
+        let s = skip_env_assignments(segment.trim_start());
+        let Some((token, rest)) = first_token_with_rest(s) else {
+            continue;
+        };
+        let program = token.rsplit('/').next().unwrap_or(token);
+        if !matches!(program, "grep" | "rg" | "egrep" | "fgrep" | "ripgrep") {
+            continue;
+        }
+        let Some(pattern) = extract_search_pattern(rest) else {
+            continue;
+        };
+        let intent = if after_pipe {
+            SearchIntent::OutputFilter
+        } else if pattern_is_identifier_search(&pattern) {
+            SearchIntent::IdentifierFileSearch
+        } else {
+            SearchIntent::TextFileSearch
+        };
+        out.push((intent, pattern));
+    }
+    out
+}
+
+/// grep の引数列から検索パターンを取り出す。
+///
+/// `-e PATTERN` / `--regexp=PATTERN` は明示指定なので優先し、それ以外は
+/// フラグを読み飛ばした最初の位置引数をパターンとみなす。
+fn extract_search_pattern(args: &str) -> Option<String> {
+    let tokens = tokenize_shell_words(args);
+    let mut iter = tokens.into_iter().peekable();
+    let mut positional: Option<String> = None;
+    while let Some(token) = iter.next() {
+        if let Some(value) = token.strip_prefix("--regexp=") {
+            return Some(value.to_string());
+        }
+        if token == "--regexp" || token == "-e" {
+            return iter.next();
+        }
+        if let Some(flag) = token.strip_prefix("--") {
+            // `--include=*.rs` のように値を含む形はここで完結する。
+            if !flag.contains('=') && grep_long_flag_takes_value(flag) {
+                iter.next();
+            }
+            continue;
+        }
+        if token.starts_with('-') && token.len() > 1 {
+            // `-rn` のような短フラグの束。末尾が値を取るものなら次を読み飛ばす。
+            if let Some(last) = token.chars().last()
+                && grep_short_flag_takes_value(last)
+            {
+                iter.next();
+            }
+            continue;
+        }
+        if positional.is_none() {
+            positional = Some(token);
+        }
+    }
+    positional
+}
+
+fn grep_long_flag_takes_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "include" | "exclude" | "exclude-dir" | "file" | "glob" | "type" | "max-count" | "context"
+    )
+}
+
+fn grep_short_flag_takes_value(flag: char) -> bool {
+    matches!(flag, 'e' | 'f' | 'm' | 'A' | 'B' | 'C' | 'g' | 'd')
+}
+
+/// シェルの引用符を尊重して引数をトークンへ分割し、引用符は取り除く。
+fn tokenize_shell_words(args: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut has_content = false;
+    let mut quote: Option<char> = None;
+    let mut chars = args.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else {
+                    current.push(c);
+                }
+            }
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    has_content = true;
+                }
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                        has_content = true;
+                    }
+                }
+                c if c.is_whitespace() => {
+                    if has_content || !current.is_empty() {
+                        tokens.push(std::mem::take(&mut current));
+                        has_content = false;
+                    }
+                }
+                c => {
+                    current.push(c);
+                    has_content = true;
+                }
+            },
+        }
+    }
+    if has_content || !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// パターンがコード識別子 (またはその選言) だけを指しているか。
+///
+/// 単一の裸識別子 (`fooBar` / `MyClass` / `MAX_SIZE`) と、CLAUDE.md が名指しで
+/// 禁じているパイプ区切りの識別子列 (`Foo|Bar|baz`) を対象にする。
+/// `\bfoo\b` のような正規表現メタ文字を含む形は、意図が識別子検索でも
+/// 「astro-sight へ機械的に置き換えられる」とは限らないので数えない (過大評価を避ける)。
+/// **前後の空白を trim してはならない** — `grep "  ok"` はテスト結果の整形出力を
+/// 拾うためのテキスト検索で、識別子検索ではない。trim すると `ok` に化けて
+/// 識別子扱いになり、置換対象を水増しする (実測でこのパターンだけで 25 件混入していた)。
+fn pattern_is_identifier_search(pattern: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    pattern.split('|').all(is_bare_identifier)
+}
+
+/// grep 系呼び出しの意図別内訳を Stats へ記録する。
+fn record_search_intents(stats: &mut Stats, source: &str, cmd: &str) {
+    for (intent, pattern) in classify_search_invocations(cmd) {
+        *stats
+            .search_intent_counts
+            .entry(source.to_string())
+            .or_default()
+            .entry(intent.label().to_string())
+            .or_default() += 1;
+        if intent == SearchIntent::IdentifierFileSearch {
+            *stats
+                .identifier_search_patterns
+                .entry(source.to_string())
+                .or_default()
+                .entry(truncate(&pattern, 60))
+                .or_default() += 1;
+        }
+    }
+}
+
+/// `Grep` ツール (Claude Code の専用ツール) は常にファイルを検索するため、
+/// パイプ判定は不要でパターンだけで意図が決まる。
+fn record_grep_tool(stats: &mut Stats, source: &str, pattern: &str) {
+    let intent = if pattern_is_identifier_search(pattern) {
+        SearchIntent::IdentifierFileSearch
+    } else {
+        SearchIntent::TextFileSearch
+    };
+    *stats
+        .search_intent_counts
+        .entry(source.to_string())
+        .or_default()
+        .entry(intent.label().to_string())
+        .or_default() += 1;
+    if intent == SearchIntent::IdentifierFileSearch {
+        *stats
+            .identifier_search_patterns
+            .entry(source.to_string())
+            .or_default()
+            .entry(truncate(pattern, 60))
+            .or_default() += 1;
+    }
+}
+
+/// 2 文字以上の ASCII 識別子か。1 文字は誤検出が多すぎるため数えない。
+fn is_bare_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    if s.len() < 2 {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn extract_bash_category(cmd: &str) -> String {
@@ -524,6 +786,7 @@ fn record_shell_command(
         .or_default()
         .entry(category)
         .or_default() += 1;
+    record_search_intents(stats, source, command);
 
     if command.starts_with("grep ")
         || command.starts_with("rg ")
@@ -696,6 +959,7 @@ fn process_claude_file(path: &Path, project: &str) -> Stats {
                     detail: format!("pattern={pattern} path={search_path}"),
                 });
                 has_relevant_tool = true;
+                record_grep_tool(&mut stats, &source, pattern);
             }
 
             if tool_name == "Bash" {
@@ -716,6 +980,7 @@ fn process_claude_file(path: &Path, project: &str) -> Stats {
                     .or_default()
                     .entry(category)
                     .or_default() += 1;
+                record_search_intents(&mut stats, &source, cmd);
 
                 if let Some(subcmd) = extract_astro_subcmd(cmd) {
                     pending_tools.push(ToolDetail {
@@ -1071,6 +1336,85 @@ fn shorten_project_name(name: &str) -> String {
     name.to_string()
 }
 
+/// 識別子検索の置換状況を出す。
+///
+/// 「grep 総数 vs astro-sight 総数」ではなく **ファイルに対する識別子検索**だけを分母に
+/// することが要点。出力フィルタ (`| grep '^error'`) と非識別子検索 (エラーメッセージ・
+/// 設定値) を混ぜると置換余地を数倍に見積もり、指示ファイルへの不要なルール追加を招く。
+fn print_identifier_search_section(stats: &Stats) {
+    if stats.search_intent_counts.is_empty() {
+        return;
+    }
+    let mut table = Table::new();
+    table.load_style(UTF8_FULL_CONDENSED);
+    table.set_header(vec![
+        Cell::new("Source").add_attribute(Attribute::Bold),
+        Cell::new("astro-sight refs").add_attribute(Attribute::Bold),
+        Cell::new("identifier grep").add_attribute(Attribute::Bold),
+        Cell::new("replaced %").add_attribute(Attribute::Bold),
+        Cell::new("text grep").add_attribute(Attribute::Bold),
+        Cell::new("output filter").add_attribute(Attribute::Bold),
+    ]);
+
+    for src in &["claude-code", "codex"] {
+        let Some(intents) = stats.search_intent_counts.get(*src) else {
+            continue;
+        };
+        let get = |k: &str| intents.get(k).copied().unwrap_or(0);
+        let ident = get(SearchIntent::IdentifierFileSearch.label());
+        let text = get(SearchIntent::TextFileSearch.label());
+        let filtered = get(SearchIntent::OutputFilter.label());
+        // 置換の対抗馬になるのは識別子検索を担う refs だけ。symbols / calls などは
+        // 別目的なので分子に混ぜない。
+        let refs = stats
+            .astro_subcmds
+            .get(*src)
+            .and_then(|m| m.get("refs"))
+            .copied()
+            .unwrap_or(0);
+        let denom = refs + ident;
+        let pct = if denom > 0 {
+            (refs as f64 / denom as f64) * 100.0
+        } else {
+            0.0
+        };
+        table.add_row(vec![
+            Cell::new(src),
+            Cell::new(refs).set_alignment(CellAlignment::Right),
+            Cell::new(ident).set_alignment(CellAlignment::Right),
+            Cell::new(format!("{pct:.1}")).set_alignment(CellAlignment::Right),
+            Cell::new(text).set_alignment(CellAlignment::Right),
+            Cell::new(filtered).set_alignment(CellAlignment::Right),
+        ]);
+    }
+    println!("## Identifier Search (astro-sight refs replaces only 'identifier grep')\n{table}\n");
+
+    // 実際に置換すべきパターンを提示する。件数降順 → パターン昇順で決定的に並べる。
+    for src in &["claude-code", "codex"] {
+        let Some(patterns) = stats.identifier_search_patterns.get(*src) else {
+            continue;
+        };
+        if patterns.is_empty() {
+            continue;
+        }
+        let mut sorted: Vec<_> = patterns.iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        let mut ptable = Table::new();
+        ptable.load_style(UTF8_FULL_CONDENSED);
+        ptable.set_header(vec![
+            Cell::new("Pattern").add_attribute(Attribute::Bold),
+            Cell::new("Count").add_attribute(Attribute::Bold),
+        ]);
+        for (pattern, count) in sorted.iter().take(15) {
+            ptable.add_row(vec![
+                Cell::new(pattern),
+                Cell::new(count).set_alignment(CellAlignment::Right),
+            ]);
+        }
+        println!("## Identifier grep patterns [{src}] (top 15)\n{ptable}\n");
+    }
+}
+
 fn print_summary(stats: &Stats, label: &str) {
     let title = format!("  astro-sight Usage Statistics  {}", label);
     let width = title.len();
@@ -1182,6 +1526,8 @@ fn print_summary(stats: &Stats, label: &str) {
             }
         }
     }
+
+    print_identifier_search_section(stats);
 
     // astro-sight サブコマンド内訳
     let has_astro = stats.astro_subcmds.values().any(|m| !m.is_empty());
@@ -1389,7 +1735,35 @@ fn print_json(stats: &Stats, label: &str) {
         adoption_rate_pct: f64,
         tool_distribution: Vec<ToolEntry>,
         bash_breakdown: Vec<ToolEntry>,
+        /// grep 系呼び出しの意図別内訳と、そこから導いた真の置換率。
+        identifier_search: IdentifierSearchSummary,
         top_projects: Vec<ProjectEntry>,
+    }
+
+    /// 「astro-sight refs で置換できる grep」だけを分母にした採用率。
+    ///
+    /// `adoption_rate_pct` (全ツール呼び出しに占める astro-sight の比率) は分母に
+    /// `cd` / `cat` / `echo` まで含むため、置換余地の指標としては使えない。
+    #[derive(Serialize)]
+    struct IdentifierSearchSummary {
+        /// ファイルに対する識別子検索を行った grep / rg / Grep の件数。
+        identifier_file_search: u64,
+        /// ファイルに対する非識別子検索 (エラーメッセージ・設定値等)。grep が正当。
+        text_file_search: u64,
+        /// パイプ経由の出力フィルタ。ファイルを見ていないので置換対象外。
+        output_filter: u64,
+        /// `astro-sight refs` の呼び出し数。
+        astro_sight_refs: u64,
+        /// `refs / (refs + identifier_file_search)`。
+        replaced_pct: f64,
+        /// 置換すべきだった検索パターン (件数降順 → パターン昇順、上位 15 件)。
+        top_patterns: Vec<PatternEntry>,
+    }
+
+    #[derive(Serialize)]
+    struct PatternEntry {
+        pattern: String,
+        count: u64,
     }
 
     #[derive(Serialize)]
@@ -1515,6 +1889,33 @@ fn print_json(stats: &Stats, label: &str) {
             }
         }
 
+        let intents = stats.search_intent_counts.get(*src);
+        let intent_count = |k: &str| intents.and_then(|m| m.get(k)).copied().unwrap_or(0);
+        let ident_search = intent_count(SearchIntent::IdentifierFileSearch.label());
+        let refs_calls = stats
+            .astro_subcmds
+            .get(*src)
+            .and_then(|m| m.get("refs"))
+            .copied()
+            .unwrap_or(0);
+        let replace_denom = refs_calls + ident_search;
+        let replaced_pct = if replace_denom > 0 {
+            (refs_calls as f64 / replace_denom as f64) * 100.0
+        } else {
+            0.0
+        };
+        let mut top_patterns = Vec::new();
+        if let Some(patterns) = stats.identifier_search_patterns.get(*src) {
+            let mut sorted: Vec<_> = patterns.iter().collect();
+            sorted.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            for (pattern, count) in sorted.into_iter().take(15) {
+                top_patterns.push(PatternEntry {
+                    pattern: pattern.clone(),
+                    count: *count,
+                });
+            }
+        }
+
         sources.push(SourceSummary {
             name: src.to_string(),
             files_scanned: files,
@@ -1524,6 +1925,14 @@ fn print_json(stats: &Stats, label: &str) {
             adoption_rate_pct: (adoption * 1000.0).round() / 1000.0,
             tool_distribution: tool_dist,
             bash_breakdown,
+            identifier_search: IdentifierSearchSummary {
+                identifier_file_search: ident_search,
+                text_file_search: intent_count(SearchIntent::TextFileSearch.label()),
+                output_filter: intent_count(SearchIntent::OutputFilter.label()),
+                astro_sight_refs: refs_calls,
+                replaced_pct: (replaced_pct * 10.0).round() / 10.0,
+                top_patterns,
+            },
             top_projects,
         });
     }
@@ -1883,5 +2292,106 @@ mod tests {
         assert_eq!(stats.total_tool_calls["codex"], 1);
         assert_eq!(stats.tool_counts["codex"]["exec"], 1);
         assert!(!stats.tool_counts["codex"].contains_key("wait"));
+    }
+
+    /// パイプの受け側 grep は出力フィルタなので置換対象に数えない。
+    /// これを混ぜると「置換すべき grep」を数倍に見積もる (実測では 87.9% がこちら)。
+    #[test]
+    fn piped_grep_is_classified_as_output_filter() {
+        let cases = [
+            "cargo test 2>&1 | grep '^error'",
+            "cargo build 2>&1 | grep myFunction",
+            "ls -la | grep node_modules",
+        ];
+        for cmd in cases {
+            let got = classify_search_invocations(cmd);
+            assert_eq!(got.len(), 1, "{cmd}");
+            assert_eq!(got[0].0, SearchIntent::OutputFilter, "{cmd}");
+        }
+    }
+
+    /// ファイルに対する裸識別子の検索だけが astro-sight refs の置換対象。
+    #[test]
+    fn file_identifier_grep_is_the_replacement_target() {
+        let cases = [
+            "grep -rn myFunction src/",
+            "grep -r \"MyClass\" .",
+            "rg MAX_SIZE",
+            // CLAUDE.md が名指しで禁じているパイプ区切りの識別子列
+            "grep -rE 'Foo|Bar|baz' src/",
+            "grep -e handleClick src/app.ts",
+        ];
+        for cmd in cases {
+            let got = classify_search_invocations(cmd);
+            assert_eq!(got.len(), 1, "{cmd}");
+            assert_eq!(got[0].0, SearchIntent::IdentifierFileSearch, "{cmd}");
+        }
+    }
+
+    /// 識別子でないファイル検索は grep が正当なので置換対象にしない。
+    #[test]
+    fn non_identifier_file_grep_is_not_a_replacement_target() {
+        let cases = [
+            "grep -rn 'TODO:' src/",
+            "grep -r '^error' logs/",
+            "grep -rn 'failed to connect' .",
+            // 正規表現メタ文字を含む形は機械的な置換ができないので数えない
+            "grep -rn '\\bfoo\\b' src/",
+            "grep -rn 'foo.*bar' src/",
+            // 1 文字は誤検出が多いので識別子扱いしない
+            "grep -rn x src/",
+            // 前後に空白があるものは整形出力の照合であって識別子検索ではない
+            "grep -c '  ok' results.txt",
+            "grep 'ok ' results.txt",
+        ];
+        for cmd in cases {
+            let got = classify_search_invocations(cmd);
+            assert_eq!(got.len(), 1, "{cmd}");
+            assert_eq!(got[0].0, SearchIntent::TextFileSearch, "{cmd}");
+        }
+    }
+
+    /// `||` は論理和であってパイプではない。右辺の grep はファイル検索のまま。
+    #[test]
+    fn logical_or_is_not_a_pipe() {
+        let got = classify_search_invocations("test -f a.rs || grep -rn myFunction src/");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, SearchIntent::IdentifierFileSearch);
+    }
+
+    /// 引用符の内側にある grep はコマンドではないので数えない
+    /// (プロンプト内の例示を実呼び出しと誤検出しない)。
+    #[test]
+    fn quoted_grep_mention_is_not_counted() {
+        let got = classify_search_invocations("codex exec \"use grep -rn foo src/ here\"");
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    /// 値を取るフラグの後ろをパターンと取り違えない。
+    #[test]
+    fn flags_taking_values_are_skipped() {
+        let got = classify_search_invocations("grep -rn --include=*.rs myFunction src/");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, SearchIntent::IdentifierFileSearch);
+        assert_eq!(got[0].1, "myFunction");
+
+        let got = classify_search_invocations("grep -A 3 -rn myFunction src/");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, "myFunction");
+
+        // `-e` は明示指定なので、後ろに位置引数があっても -e の値が優先される
+        let got = classify_search_invocations("grep -rn -e handleClick src/app.ts");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, "handleClick");
+    }
+
+    /// 1 コマンド内の複数 grep をそれぞれ分類する。
+    #[test]
+    fn multiple_greps_in_one_command_are_classified_separately() {
+        let got =
+            classify_search_invocations("grep -rn myFunction src/ && cargo test | grep '^error'");
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].0, SearchIntent::IdentifierFileSearch);
+        assert_eq!(got[1].0, SearchIntent::OutputFilter);
     }
 }
