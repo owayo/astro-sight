@@ -142,6 +142,39 @@ pub(crate) fn extract_api_signature(
         }
     }
 
+    // 値バインディング (const / let / var / static) は **宣言全体**を signature にする。
+    //
+    // 先頭行 fallback だと、prettier が整形した
+    // `export const config = {\n  google: {\n    bgColor: "..."\n  }\n};` の signature が
+    // `export const config = {` になり、**中身をどう変えても signature が変わらない**。
+    // `collect_modified_symbols` は `old_sig != new_sig` でしか api.mod 候補を作らないため、
+    // 参照されている member の削除・改名・値の差し替えが api.mod にも
+    // compatible_modified にも一切現れず、**完全に沈黙する** (実測: 利用中の
+    // `providerConfig.google.bgColor` を `bgClass` に改名した diff が exit 0。同じ変更を
+    // 1 行に畳むと blocking な api.mod になる = 整形の違いだけで検出が反転していた)。
+    // object literal を複数行で書くのは prettier / biome の既定なので、実質
+    // 「TS/JS の exported const は member 変更を検出できない」状態だった。
+    //
+    // 対象は JS/TS/TSX と Rust に限る (object member 互換判定と const 値変更判定が
+    // 効くのはこの範囲。他言語の signature 出力は不変)。
+    //
+    // 単位は `lexical_declaration` 全体ではなく **declarator 1 個**にする。
+    // `const a = 1, b = 2;` で宣言全体を使うと、`b` だけを変えても `a` の signature が
+    // 変わって api.mod に出る (無関係なシンボルの誤検出)。宣言 keyword と `export` は
+    // `const` → `let` のような可視性・可変性の変化を捉えるため prefix として付ける。
+    if matches!(sym.kind, SymbolKind::Variable | SymbolKind::Constant)
+        && matches!(
+            lang_id,
+            crate::language::LangId::Javascript
+                | crate::language::LangId::Typescript
+                | crate::language::LangId::Tsx
+                | crate::language::LangId::Rust
+        )
+        && let Some(sig) = value_binding_signature(sym, root, source)
+    {
+        return sig;
+    }
+
     // Python の class は宣言ヘッダ全体 (`class X(` 〜 body 直前) を signature にする。
     //
     // 先頭行 fallback だと、black / ruff が折り返した
@@ -193,6 +226,67 @@ pub(crate) fn extract_api_signature(
         .unwrap_or(&"")
         .trim()
         .to_string()
+}
+
+/// 値バインディング 1 個 (`export const X = ...` / `const X: T = ...` / `static X: T = ...`)
+/// の宣言テキストを正規化して返す。
+///
+/// JS/TS では declarator 単位で切り出し、宣言 keyword (`const` / `let` / `var`) と
+/// `export` を prefix として補う。Rust は `const_item` / `static_item` が 1 名前 1 item
+/// なので item 全体をそのまま使う。
+fn value_binding_signature(
+    sym: &crate::models::symbol::Symbol,
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<String> {
+    let start = tree_sitter::Point {
+        row: sym.range.start.line,
+        column: sym.range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: sym.range.end.line,
+        column: sym.range.end.column,
+    };
+    let mut cur = root.descendant_for_point_range(start, end)?;
+    loop {
+        match cur.kind() {
+            // Rust: 1 item = 1 名前なので item 全体で良い。
+            "const_item" | "static_item" => {
+                return source
+                    .get(cur.start_byte()..cur.end_byte())
+                    .map(normalize_signature_whitespace);
+            }
+            "variable_declarator" => {
+                let body = source.get(cur.start_byte()..cur.end_byte())?;
+                let mut prefix = String::new();
+                // 宣言 keyword と export を辿って補う。
+                let mut ancestor = cur.parent();
+                while let Some(node) = ancestor {
+                    match node.kind() {
+                        "lexical_declaration" | "variable_declaration" => {
+                            // 最初の匿名トークンが `const` / `let` / `var`。
+                            if let Some(kw) = node.child(0)
+                                && let Some(text) = source.get(kw.start_byte()..kw.end_byte())
+                            {
+                                prefix
+                                    .insert_str(0, &format!("{} ", String::from_utf8_lossy(text)));
+                            }
+                        }
+                        "export_statement" => prefix.insert_str(0, "export "),
+                        // 宣言より外側は signature に関係しない。
+                        "program" | "statement_block" => break,
+                        _ => {}
+                    }
+                    ancestor = node.parent();
+                }
+                let mut sig = prefix;
+                sig.push_str(&normalize_signature_whitespace(body));
+                return Some(sig);
+            }
+            _ => {}
+        }
+        cur = cur.parent()?;
+    }
 }
 
 /// 値バインディング (const / static / export const) の宣言から抽出した shape 情報。

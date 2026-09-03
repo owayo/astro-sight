@@ -556,13 +556,54 @@ fn is_exported_python(node: Node, source: &[u8], root: Node) -> bool {
         return true; // 保守的
     };
 
-    // `__all__` が定義されていればその集合のみを public とみなす
-    if let Some(dunder_all) = parse_python_dunder_all(root, source) {
+    // `__all__` が定義されていればその集合のみを public とみなす。
+    //
+    // ただし `__all__` が支配するのは **モジュールトップレベルの名前だけ** (`from m import *`
+    // が束縛する名前) で、クラスのメンバーは対象外。メソッドは import * の対象になり得ないため
+    // Python の意味論上そもそも `__all__` に載せられない。にもかかわらず全シンボルへ一律適用して
+    // いたため、`__all__` を持つモジュールでは全クラスの全メソッドが「非公開」に落ちていた:
+    //   - 既存モジュールに `__all__` を追加しただけの diff で、全メソッドが api.rm (公開 API の
+    //     削除) として報告される (実リポジトリで再現)
+    //   - `__all__` のあるモジュールではメソッドの追加・シグネチャ変更・未参照 (dead-code) が
+    //     すべて無音になる (こちらは沈黙するぶん深刻)
+    // クラスメンバーは `__all__` の有無に依らず `_` 規約で判定する (= `__all__` が無い場合と
+    // 同じ扱い)。囲みクラス自身の公開性までは見ない — 公開扱いを維持する側が fail-closed で、
+    // 検出漏れを作らないため。
+    if !is_python_class_member(node)
+        && let Some(dunder_all) = parse_python_dunder_all(root, source)
+    {
         return dunder_all.iter().any(|s| s == name);
     }
 
     // デフォルト: `_` プレフィックスは private
     !name.starts_with('_')
+}
+
+/// Python: 対象シンボルがクラス配下のメンバー (メソッド / ネストクラス) かを判定する。
+///
+/// `__all__` はモジュールトップレベルの名前だけを支配するため、クラスメンバーには
+/// 適用してはならない。その振り分けに使う。
+fn is_python_class_member(node: Node) -> bool {
+    // symbol_range 由来のノードは name identifier のこともあるため、まず自身の定義ノードまで
+    // 繰り上げる (繰り上げないと class 自身を「囲みクラス」と数えてしまう)。
+    let mut own_definition = node;
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if matches!(n.kind(), "function_definition" | "class_definition") {
+            own_definition = n;
+            break;
+        }
+        current = n.parent();
+    }
+
+    let mut ancestor = own_definition.parent();
+    while let Some(n) = ancestor {
+        if n.kind() == "class_definition" {
+            return true;
+        }
+        ancestor = n.parent();
+    }
+    false
 }
 
 /// Python: 対象シンボルが関数 / lambda の内側 (字句ローカル) で宣言されているかを判定する。
@@ -609,8 +650,51 @@ fn is_python_lexically_local(node: Node) -> bool {
 ///   - `__all__ = ("foo", "bar")`
 ///   - `__all__: list[str] = ["foo"]`
 ///
-/// 複雑な演算（`__all__ += [...]` 等）は未対応。
+/// 集合を完全に確定できない形 (`__all__ += [...]` / `__all__.extend(...)` / 条件分岐での
+/// 組み立て / 非リテラル要素 / f-string / 文字列連結 / 再代入) では `None` を返し、
+/// 呼び出し側を `_` プレフィックス規約へフォールバックさせる。
+///
+/// これは fail-closed の要請。旧実装は最初の `__all__ = [...]` だけを完全な集合として採用し、
+/// 後続の `+=` / `.extend()` を黙って無視していたため、そこで追加された名前が「非公開」に落ち、
+/// **その削除もシグネチャ変更も api.rm / api.mod に出ない**という沈黙する検出漏れになっていた。
+/// 同様に list の要素も `string` 以外を読み飛ばしていたので、`__all__ = ["a", *other.__all__]`
+/// の展開分が丸ごと欠落していた。確定できないなら「`__all__` が無い」扱いに倒す方が、
+/// 公開面を広く取る = 破壊的変更を見逃さない側に倒れる。
 fn parse_python_dunder_all(root: Node, source: &[u8]) -> Option<Vec<String>> {
+    let definition = find_toplevel_dunder_all_assignment(root, source)?;
+
+    // ファイル中に現れる `__all__` 識別子が「その代入の左辺」1 個だけであることを要求する。
+    // 2 個以上あれば `+=` / `.extend()` / 再代入 / 条件分岐での組み立てのいずれかであり、
+    // 集合を確定できない (読み取りだけの参照も保守側に倒れるが、公開面が広くなるだけで安全)。
+    if count_dunder_all_identifiers(root, source) != 1 {
+        return None;
+    }
+
+    let right = definition.child_by_field_name("right")?;
+    if right.kind() != "list" && right.kind() != "tuple" {
+        // 現状は単純な list / tuple リテラルのみ対応
+        return None;
+    }
+
+    let mut names = Vec::new();
+    let mut rc = right.walk();
+    for element in right.named_children(&mut rc) {
+        // 要素は必ず単純な文字列リテラルであること。`*other.__all__` の展開・変数・
+        // 文字列連結 (`concatenated_string`) は確定できないので集合ごと諦める。
+        if element.kind() != "string" {
+            return None;
+        }
+        let name = python_plain_string_literal_text(element, source)?;
+        if name.is_empty() {
+            return None;
+        }
+        names.push(name);
+    }
+    Some(names)
+}
+
+/// モジュールトップレベルの `__all__ = ...` / `__all__: list[str] = ...` 代入ノードを返す。
+fn find_toplevel_dunder_all_assignment<'a>(root: Node<'a>, source: &[u8]) -> Option<Node<'a>> {
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
         if child.kind() != "expression_statement" {
@@ -625,33 +709,68 @@ fn parse_python_dunder_all(root: Node, source: &[u8]) -> Option<Vec<String>> {
         let Some(left) = assignment.child_by_field_name("left") else {
             continue;
         };
-        if left.utf8_text(source).ok() != Some("__all__") {
-            continue;
+        if left.kind() == "identifier" && left.utf8_text(source).ok() == Some("__all__") {
+            return Some(assignment);
         }
-        let Some(right) = assignment.child_by_field_name("right") else {
-            continue;
-        };
-        if right.kind() != "list" && right.kind() != "tuple" {
-            // 現状は単純な list / tuple リテラルのみ対応
-            return None;
-        }
-
-        let mut names = Vec::new();
-        let mut rc = right.walk();
-        for element in right.children(&mut rc) {
-            if element.kind() != "string" {
-                continue;
-            }
-            if let Ok(text) = element.utf8_text(source) {
-                let stripped = text.trim_matches(|c: char| c == '"' || c == '\'');
-                if !stripped.is_empty() {
-                    names.push(stripped.to_string());
-                }
-            }
-        }
-        return Some(names);
     }
     None
+}
+
+/// ファイル全体に現れる識別子 `__all__` の個数を数える。
+fn count_dunder_all_identifiers(root: Node, source: &[u8]) -> usize {
+    let mut count = 0usize;
+    let mut cursor = root.walk();
+    let mut recurse = true;
+    loop {
+        if recurse {
+            let node = cursor.node();
+            if node.kind() == "identifier" && node.utf8_text(source).ok() == Some("__all__") {
+                count += 1;
+            }
+        }
+        if recurse && cursor.goto_first_child() {
+            continue;
+        }
+        if cursor.goto_next_sibling() {
+            recurse = true;
+            continue;
+        }
+        if !cursor.goto_parent() {
+            break;
+        }
+        recurse = false;
+    }
+    count
+}
+
+/// 補間・連結・プレフィックス付き (f-string 等) を含まない素の文字列リテラルの中身を返す。
+///
+/// 確定できない形 (f-string の `interpolation`、`rb"..."` のようなバイト列/生文字列プレフィックス、
+/// エスケープシーケンス) では `None` を返す。`__all__` の要素は識別子なのでこれらは現れない。
+fn python_plain_string_literal_text(node: Node, source: &[u8]) -> Option<String> {
+    let mut content: Option<String> = None;
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "string_start" => {
+                // プレフィックス付き (f/b/r/u) は素の文字列ではないので諦める。
+                let text = child.utf8_text(source).ok()?;
+                if !text.starts_with('"') && !text.starts_with('\'') {
+                    return None;
+                }
+            }
+            "string_end" => {}
+            "string_content" => {
+                if content.is_some() {
+                    return None;
+                }
+                content = Some(child.utf8_text(source).ok()?.to_string());
+            }
+            // interpolation / escape_sequence など、値が静的に確定しないもの
+            _ => return None,
+        }
+    }
+    content
 }
 
 /// Rust: 宣言が「無修飾 `pub`」で外部公開されているかを AST から判定する。

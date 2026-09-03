@@ -1212,3 +1212,177 @@ class Internal(TypedDict):
         api.modified
     );
 }
+
+/// `__all__` はモジュールトップレベルの名前だけを支配し、クラスメンバーには効かない。
+///
+/// 既存モジュールに `__all__` を追加しただけで、そのモジュールの全クラスの全メソッドが
+/// 「公開 API の削除 (api.rm)」として報告されていた (メソッド名は `from m import *` の
+/// 対象になり得ないので `__all__` には載せられない = 常に membership 判定に落ちるため)。
+/// 対照として、トップレベルのクラスには従来どおり `__all__` が効くことを同じテストで固定する
+/// (片方だけだと「`__all__` を一切見なくなった」退行を検出できない)。
+#[test]
+fn dunder_all_does_not_apply_to_class_members() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let before = "\
+class Widget:
+    def compute_total(self, a: int, b: int) -> int:
+        return a + b
+
+
+class Helper:
+    def assist(self) -> int:
+        return 0
+";
+    git_commit_files(repo, &[("m.py", before)], "initial");
+
+    // `__all__` を追加し、あわせてメソッドへ末尾の任意引数を足す (後方互換な変更)。
+    let after = "\
+__all__ = [\"Widget\"]
+
+
+class Widget:
+    def compute_total(self, a: int, b: int, *, scale: int = 1) -> int:
+        return (a + b) * scale
+
+
+class Helper:
+    def assist(self) -> int:
+        return 0
+";
+    fs::write(repo.join("m.py"), after).expect("write");
+
+    let diff_files = vec![whole_file_diff("m.py", 11)];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    let removed: Vec<&str> = api
+        .removed
+        .iter()
+        .chain(api.removed_dead.iter())
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(
+        !removed.contains(&"Widget.compute_total"),
+        "`__all__` の追加でクラスメソッドが削除扱いになってはならない: {removed:?}"
+    );
+    assert!(
+        api.compatible_modified
+            .iter()
+            .any(|c| c.name == "Widget.compute_total"),
+        "末尾任意引数の追加は互換変更として報告する: {:?}",
+        api.compatible_modified
+    );
+
+    // 対照: トップレベルの名前には `__all__` が効き続ける。`Helper` は `__all__` に
+    // 載っていないので `from m import *` で束縛されなくなる = 公開 API 面からの削除であり、
+    // 報告されるのが正しい (これが「`__all__` を一切見なくなった」退行の検出器になる)。
+    // 一方 `Widget` は `__all__` に載っているので公開面に残る。
+    assert!(
+        removed.contains(&"Helper"),
+        "`__all__` から外れたトップレベルクラスは公開 API 面の削除として報告する: {removed:?}"
+    );
+    assert!(
+        !removed.contains(&"Widget"),
+        "`__all__` に載っているクラスは公開面に残る: {removed:?}"
+    );
+}
+
+/// `__all__` を完全に評価できない形では `_` 規約へフォールバックする (fail-closed)。
+///
+/// 旧実装は最初の `__all__ = [...]` だけを完全な集合として採用し、後続の `+=` /
+/// `.extend()` を黙って無視していたため、そこで追加された名前が「非公開」に落ち、
+/// 削除もシグネチャ変更も報告されない沈黙する検出漏れになっていた。
+#[test]
+fn dunder_all_mutation_falls_back_to_underscore_convention() {
+    for (label, header) in [
+        (
+            "augmented",
+            "__all__ = [\"Alpha\"]\n__all__ += [\"Beta\"]\n",
+        ),
+        (
+            "extend",
+            "__all__ = [\"Alpha\"]\n__all__.extend([\"Beta\"])\n",
+        ),
+        ("spread", "__all__ = [\"Alpha\", *_EXTRA]\n"),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+
+        let before = format!(
+            "_EXTRA = [\"Beta\"]\n{header}\n\nclass Alpha:\n    pass\n\n\nclass Beta:\n    pass\n\n\nclass _Private:\n    pass\n"
+        );
+        git_commit_files(repo, &[("m.py", before.as_str())], "initial");
+
+        // `Beta` と `_Private` を削除する。
+        let after = format!("_EXTRA = [\"Beta\"]\n{header}\n\nclass Alpha:\n    pass\n");
+        fs::write(repo.join("m.py"), after.as_str()).expect("write");
+
+        let diff_files = vec![whole_file_diff("m.py", 14)];
+        let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+        let removed: Vec<&str> = api
+            .removed
+            .iter()
+            .chain(api.removed_dead.iter())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            removed.contains(&"Beta"),
+            "[{label}] 評価できない `__all__` では `_` 規約へ倒し、Beta の削除を報告する: {removed:?}"
+        );
+        // 対照: フォールバック先は `_` 規約なので、`_` 始まりは引き続き非公開。
+        assert!(
+            !removed.contains(&"_Private"),
+            "[{label}] `_` 始まりは非公開のまま: {removed:?}"
+        );
+    }
+}
+
+/// 対照: 単純な `__all__` は従来どおり集合として尊重する。
+///
+/// 上のフォールバックが効きすぎて「`__all__` を常に無視する」退行になっていないかを固定する。
+#[test]
+fn simple_dunder_all_still_restricts_toplevel_surface() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let before = "\
+__all__ = [\"Alpha\"]
+
+
+class Alpha:
+    pass
+
+
+class Beta:
+    pass
+";
+    git_commit_files(repo, &[("m.py", before)], "initial");
+
+    let after = "\
+__all__ = [\"Alpha\"]
+
+
+class Alpha:
+    pass
+";
+    fs::write(repo.join("m.py"), after).expect("write");
+
+    let diff_files = vec![whole_file_diff("m.py", 9)];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    let removed: Vec<&str> = api
+        .removed
+        .iter()
+        .chain(api.removed_dead.iter())
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(
+        !removed.contains(&"Beta"),
+        "`__all__` に載っていないトップレベルクラスの削除は公開 API 変更ではない: {removed:?}"
+    );
+}
