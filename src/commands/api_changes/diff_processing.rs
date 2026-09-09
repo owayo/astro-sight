@@ -81,13 +81,23 @@ fn collect_python_contract_changes(
         return;
     }
     let &DetectionInputs { dir, base, .. } = inputs;
-    let Some(src) = load_old_new_sources(dir, base, &df.old_path, &df.new_path) else {
+    let typed_dict_candidates = python_typed_dict_field_candidates(facts, maps);
+    let Some(new_source) = load_new_source(dir, &df.new_path) else {
         return;
     };
-    let check_typed_dict =
-        mentions_requiredness_qualifier(&src.old) || mentions_requiredness_qualifier(&src.new);
-    let check_literal =
-        mentions_literal_qualifier(&src.old) || mentions_literal_qualifier(&src.new);
+    // Literal alias は old/new の双方に `Literal` が無ければ比較対象にならない。
+    // TypedDict 候補も無ければ、base blob を取る `git show` の前に落とせる。
+    let new_mentions_literal = mentions_literal_qualifier(&new_source);
+    if typed_dict_candidates.is_empty() && !new_mentions_literal {
+        return;
+    }
+    let Some(src) = load_old_source_with_new(dir, base, &df.old_path, &df.new_path, new_source)
+    else {
+        return;
+    };
+    let check_typed_dict = !typed_dict_candidates.is_empty()
+        && (mentions_requiredness_qualifier(&src.old) || mentions_requiredness_qualifier(&src.new));
+    let check_literal = new_mentions_literal && mentions_literal_qualifier(&src.old);
     if !check_typed_dict && !check_literal {
         return;
     }
@@ -102,7 +112,7 @@ fn collect_python_contract_changes(
     };
 
     if check_typed_dict {
-        collect_python_typed_dict_field_changes(state, df, facts, maps, &parsed);
+        collect_python_typed_dict_field_changes(state, df, &typed_dict_candidates, &parsed);
     }
     if check_literal {
         for change in detect_python_literal_alias_changes(
@@ -132,6 +142,35 @@ struct ParsedPythonSources<'tree, 'source> {
     new_source: &'source [u8],
 }
 
+/// クラスヘッダが不変で一意な、フィールド契約比較の候補名を I/O 前に抽出する。
+fn python_typed_dict_field_candidates<'a>(
+    facts: &ModifiedFileFacts<'a>,
+    maps: &SymbolMaps<'_>,
+) -> Vec<&'a str> {
+    let &ModifiedFileFacts { new_syms, .. } = facts;
+    let SymbolMaps {
+        old_map,
+        old_name_counts,
+        new_name_counts,
+        ..
+    } = maps;
+
+    // 対象は「シグネチャ (= クラスヘッダ) が変わっていない」クラスだけ。変わっていれば
+    // `detect_python_typed_dict_total_change` が担当するので、ここで扱うと二重報告になる。
+    // 同名クラスが複数あるファイルは、どの定義を見ているか確定できないため除外する。
+    new_syms
+        .iter()
+        .filter(|(name, kind, new_sig)| {
+            kind.as_str() == "class"
+                && !name.contains('.')
+                && old_map.get(name.as_str()) == Some(&new_sig.as_str())
+                && old_name_counts.get(name.as_str()).copied().unwrap_or(0) == 1
+                && new_name_counts.get(name.as_str()).copied().unwrap_or(0) == 1
+        })
+        .map(|(name, _, _)| name.as_str())
+        .collect()
+}
+
 /// クラスヘッダが変わらない Python TypedDict の、フィールド単位 requiredness 変更を検出する。
 ///
 /// `y: NotRequired[str]` → `y: str` は**クラスヘッダ行が変わらない**ため
@@ -145,36 +184,10 @@ struct ParsedPythonSources<'tree, 'source> {
 fn collect_python_typed_dict_field_changes(
     state: &mut DetectionState<'_>,
     df: &crate::models::impact::DiffFile,
-    facts: &ModifiedFileFacts<'_>,
-    maps: &SymbolMaps<'_>,
+    candidates: &[&str],
     parsed: &ParsedPythonSources<'_, '_>,
 ) {
-    let &ModifiedFileFacts { new_syms, .. } = facts;
-    let SymbolMaps {
-        old_map,
-        old_name_counts,
-        new_name_counts,
-        ..
-    } = maps;
-
-    // 対象は「シグネチャ (= クラスヘッダ) が変わっていない」クラスだけ。変わっていれば
-    // `detect_python_typed_dict_total_change` が担当するので、ここで扱うと二重報告になる。
-    // 同名クラスが複数あるファイルは、どの定義を見ているか確定できないため除外する。
-    let candidates: Vec<&str> = new_syms
-        .iter()
-        .filter(|(name, kind, new_sig)| {
-            kind.as_str() == "class"
-                && !name.contains('.')
-                && old_map.get(name.as_str()) == Some(&new_sig.as_str())
-                && old_name_counts.get(name.as_str()).copied().unwrap_or(0) == 1
-                && new_name_counts.get(name.as_str()).copied().unwrap_or(0) == 1
-        })
-        .map(|(name, _, _)| name.as_str())
-        .collect();
-    if candidates.is_empty() {
-        return;
-    }
-    for class_name in candidates {
+    for &class_name in candidates {
         for change in detect_typed_dict_field_requiredness_changes(
             parsed.old_root,
             parsed.old_source,

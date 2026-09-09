@@ -76,6 +76,35 @@ pub(crate) fn load_old_new_sources(
     Some(OldNewSources { old, new })
 }
 
+/// working tree 側だけを先に読み、old 側の `git show` が必要か安価に判定できるようにする。
+pub(crate) fn load_new_source(dir: &str, new_path: &str) -> Option<SourceBuf> {
+    if !crate::engine::impact::is_safe_diff_path(new_path) {
+        return None;
+    }
+    let new_full = std::path::Path::new(dir).join(new_path);
+    let new_utf8 = camino::Utf8Path::from_path(&new_full)?;
+    parser::read_file(new_utf8).ok()
+}
+
+/// 先読み済みの working tree ソースと base 側 blob を組にする。
+///
+/// 両パスはここでも再検証する。呼び出し側の前段ゲートを信頼境界にしない。
+pub(crate) fn load_old_source_with_new(
+    dir: &str,
+    base: &str,
+    old_path: &str,
+    new_path: &str,
+    new: SourceBuf,
+) -> Option<OldNewSources> {
+    if !crate::engine::impact::is_safe_diff_path(old_path)
+        || !crate::engine::impact::is_safe_diff_path(new_path)
+    {
+        return None;
+    }
+    let old = git_show_blob(dir, base, old_path)?;
+    Some(OldNewSources { old, new })
+}
+
 /// base 側 blob と working tree ソースの組。
 pub(crate) struct OldNewSources {
     pub(crate) old: Vec<u8>,
