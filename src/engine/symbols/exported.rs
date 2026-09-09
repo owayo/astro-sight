@@ -570,9 +570,9 @@ fn is_exported_python(node: Node, source: &[u8], root: Node) -> bool {
     // 同じ扱い)。囲みクラス自身の公開性までは見ない — 公開扱いを維持する側が fail-closed で、
     // 検出漏れを作らないため。
     if !is_python_class_member(node)
-        && let Some(dunder_all) = parse_python_dunder_all(root, source)
+        && let Some(exported) = python_module_name_is_exported(root, source, name)
     {
-        return dunder_all.iter().any(|s| s == name);
+        return exported;
     }
 
     // デフォルト: `_` プレフィックスは private
@@ -642,8 +642,7 @@ fn is_python_lexically_local(node: Node) -> bool {
     false
 }
 
-/// Python モジュールのトップレベル `__all__` 定義を解析し、収録された
-/// シンボル名の一覧を返す。定義がなければ None。
+/// Python モジュールのトップレベル `__all__` 定義を解析する。
 ///
 /// 対応する形式:
 ///   - `__all__ = ["foo", 'bar']`
@@ -651,8 +650,8 @@ fn is_python_lexically_local(node: Node) -> bool {
 ///   - `__all__: list[str] = ["foo"]`
 ///
 /// 集合を完全に確定できない形 (`__all__ += [...]` / `__all__.extend(...)` / 条件分岐での
-/// 組み立て / 非リテラル要素 / f-string / 文字列連結 / 再代入) では `None` を返し、
-/// 呼び出し側を `_` プレフィックス規約へフォールバックさせる。
+/// 組み立て / 非リテラル要素 / f-string / 文字列連結 / 再代入) は
+/// `Indeterminate` とし、未定義の `Absent` と区別する。
 ///
 /// これは fail-closed の要請。旧実装は最初の `__all__ = [...]` だけを完全な集合として採用し、
 /// 後続の `+=` / `.extend()` を黙って無視していたため、そこで追加された名前が「非公開」に落ち、
@@ -660,20 +659,54 @@ fn is_python_lexically_local(node: Node) -> bool {
 /// 同様に list の要素も `string` 以外を読み飛ばしていたので、`__all__ = ["a", *other.__all__]`
 /// の展開分が丸ごと欠落していた。確定できないなら「`__all__` が無い」扱いに倒す方が、
 /// 公開面を広く取る = 破壊的変更を見逃さない側に倒れる。
-fn parse_python_dunder_all(root: Node, source: &[u8]) -> Option<Vec<String>> {
-    let definition = find_toplevel_dunder_all_assignment(root, source)?;
+#[derive(Debug, PartialEq, Eq)]
+enum PythonDunderAll {
+    Absent,
+    Static(Vec<String>),
+    Indeterminate,
+}
+
+/// module 直下の名前が外部公開されるかを 3 値で判定する。
+///
+/// `Some(true/false)` は `__all__` または `_` 規約から公開性を確定できた場合、`None` は
+/// `__all__` が動的に組み立てられて確定できない場合。既存の symbol 抽出は `None` を
+/// `_` 規約へ倒して公開面を広く保つ一方、新規の契約検出は `None` なら報告を諦められる。
+pub(crate) fn python_module_name_is_exported(
+    root: Node,
+    source: &[u8],
+    name: &str,
+) -> Option<bool> {
+    match parse_python_dunder_all(root, source) {
+        PythonDunderAll::Absent => Some(!name.starts_with('_')),
+        PythonDunderAll::Static(names) => Some(names.iter().any(|candidate| candidate == name)),
+        PythonDunderAll::Indeterminate => None,
+    }
+}
+
+fn parse_python_dunder_all(root: Node, source: &[u8]) -> PythonDunderAll {
+    let definition = find_toplevel_dunder_all_assignment(root, source);
+    let identifier_count = count_dunder_all_identifiers(root, source);
+    let Some(definition) = definition else {
+        return if identifier_count == 0 {
+            PythonDunderAll::Absent
+        } else {
+            PythonDunderAll::Indeterminate
+        };
+    };
 
     // ファイル中に現れる `__all__` 識別子が「その代入の左辺」1 個だけであることを要求する。
     // 2 個以上あれば `+=` / `.extend()` / 再代入 / 条件分岐での組み立てのいずれかであり、
     // 集合を確定できない (読み取りだけの参照も保守側に倒れるが、公開面が広くなるだけで安全)。
-    if count_dunder_all_identifiers(root, source) != 1 {
-        return None;
+    if identifier_count != 1 {
+        return PythonDunderAll::Indeterminate;
     }
 
-    let right = definition.child_by_field_name("right")?;
+    let Some(right) = definition.child_by_field_name("right") else {
+        return PythonDunderAll::Indeterminate;
+    };
     if right.kind() != "list" && right.kind() != "tuple" {
         // 現状は単純な list / tuple リテラルのみ対応
-        return None;
+        return PythonDunderAll::Indeterminate;
     }
 
     let mut names = Vec::new();
@@ -682,15 +715,17 @@ fn parse_python_dunder_all(root: Node, source: &[u8]) -> Option<Vec<String>> {
         // 要素は必ず単純な文字列リテラルであること。`*other.__all__` の展開・変数・
         // 文字列連結 (`concatenated_string`) は確定できないので集合ごと諦める。
         if element.kind() != "string" {
-            return None;
+            return PythonDunderAll::Indeterminate;
         }
-        let name = python_plain_string_literal_text(element, source)?;
+        let Some(name) = python_plain_string_literal_text(element, source) else {
+            return PythonDunderAll::Indeterminate;
+        };
         if name.is_empty() {
-            return None;
+            return PythonDunderAll::Indeterminate;
         }
         names.push(name);
     }
-    Some(names)
+    PythonDunderAll::Static(names)
 }
 
 /// モジュールトップレベルの `__all__ = ...` / `__all__: list[str] = ...` 代入ノードを返す。

@@ -1386,3 +1386,78 @@ class Alpha:
         "`__all__` に載っていないトップレベルクラスの削除は公開 API 変更ではない: {removed:?}"
     );
 }
+
+/// 公開 Literal 型エイリアスの値集合変更は、通常の symbol 抽出に混ぜず API 契約変更として出す。
+///
+/// 同一 diff で呼び出し側が追随していても、外部利用者の入力までは確認できないため blocking を
+/// 維持する。対照として `__all__` 非掲載の型エイリアスは報告しない。
+#[test]
+fn literal_alias_narrowing_stays_blocking_when_callers_are_updated() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let models_before = r#"from typing import Literal
+
+__all__ = ["Mode"]
+
+Mode = Literal["read", "write"]
+Hidden = Literal["read", "write"]
+"#;
+    let caller_before = r#"from models import Mode
+
+def run(mode: Mode = "write") -> Mode:
+    return mode
+"#;
+    git_commit_files(
+        repo,
+        &[("models.py", models_before), ("caller.py", caller_before)],
+        "initial",
+    );
+
+    let models_after = models_before
+        .replace(
+            "Mode = Literal[\"read\", \"write\"]",
+            "Mode = Literal[\"read\"]",
+        )
+        .replace(
+            "Hidden = Literal[\"read\", \"write\"]",
+            "Hidden = Literal[\"read\"]",
+        );
+    let caller_after = caller_before.replace("= \"write\"", "= \"read\"");
+    fs::write(repo.join("models.py"), models_after).expect("write models");
+    fs::write(repo.join("caller.py"), caller_after).expect("write caller");
+
+    let diff_files = vec![
+        whole_file_diff("models.py", 7),
+        whole_file_diff("caller.py", 4),
+    ];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    let contract = contract_of(&api, "Mode")
+        .expect("公開 Literal の縮小は、呼び出し側が追随しても api.mod に残るべき");
+    assert_eq!(
+        contract.kind,
+        crate::models::review::ApiContractChangeKind::LiteralValuesNarrowed
+    );
+    assert_eq!(
+        contract.breaks,
+        crate::models::review::ApiContractSide::Producer
+    );
+    assert!(
+        !api.modified_closed_in_diff
+            .iter()
+            .any(|change| change.name == "Mode"),
+        "契約変更を『同一 diff で解決済み』へ降格させてはいけない"
+    );
+    assert!(
+        !api.compatible_modified
+            .iter()
+            .any(|change| change.name == "Mode"),
+        "契約変更を互換扱いへ降格させてはいけない"
+    );
+    assert!(
+        contract_of(&api, "Hidden").is_none(),
+        "__all__ 非掲載の型エイリアスは公開 API 面に含めない"
+    );
+}

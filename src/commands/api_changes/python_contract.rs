@@ -614,7 +614,7 @@ enum TransparentWrapper {
 /// `generic_type` + `type_parameter` になりフィールド名を持たないので位置で読む。
 /// 式の位置 (`X = NotRequired[str]`) では `subscript` で `value` / `subscript` フィールドを持つ。
 /// TypedDict のフィールドは前者だが、両方受ける。
-fn subscript_parts<'a>(
+pub(super) fn subscript_parts<'a>(
     node: tree_sitter::Node<'a>,
     source: &[u8],
 ) -> Option<(String, Vec<tree_sitter::Node<'a>>)> {
@@ -667,7 +667,7 @@ fn strip_qualifier_text(
 }
 
 /// tree-sitter-python は注釈を `type` ノードで包む。実体ノードまで降りる。
-fn unwrap_type_node(node: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+pub(super) fn unwrap_type_node(node: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
     if node.kind() == "type"
         && let Some(inner) = node.named_child(0)
     {
@@ -732,7 +732,7 @@ fn annotation_is_provably_plain(annotation: &str, bindings: &BindingCounts) -> b
 /// **空集合と `None` は違う**。`Required` / `NotRequired` を import していないファイルは
 /// 空集合 (= 修飾子が 1 つも使われていないと確定できる) で、`None` は「出所を証明できない
 /// 名前がある」。前者は正常系、後者はファイルごと分類しない。
-fn collect_typing_names(
+pub(super) fn collect_typing_names(
     root: tree_sitter::Node<'_>,
     source: &[u8],
     target: &str,
@@ -828,7 +828,7 @@ fn collect_typing_names(
 /// 対象メンバ名 (`target`) を値として持たず引数で受けるのは、同じ `import typing as t` から
 /// `t.TypedDict` と `t.NotRequired` の 2 つが導かれるため。集合はメンバごとに別々に作る。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum TypingName {
+pub(super) enum TypingName {
     /// `from typing import TypedDict [as TD]`。
     Bare(String),
     /// `import typing [as t]`。
@@ -836,7 +836,7 @@ enum TypingName {
 }
 
 impl TypingName {
-    fn base_text(&self, target: &str) -> String {
+    pub(super) fn base_text(&self, target: &str) -> String {
         match self {
             Self::Bare(name) => name.clone(),
             Self::Qualified { module_alias } => format!("{module_alias}.{target}"),
@@ -844,7 +844,7 @@ impl TypingName {
     }
 
     /// この名前が本当に `typing.<target>` を指していると言えるか。
-    fn is_provable(&self, bindings: &BindingCounts, target: &str) -> bool {
+    pub(super) fn is_provable(&self, bindings: &BindingCounts, target: &str) -> bool {
         match self {
             Self::Bare(name) => bindings.count(name) == 1,
             Self::Qualified { module_alias } => {
@@ -869,7 +869,7 @@ impl TypingName {
 /// 倒れるだけで安全。逆に `keyword_argument` の `name` は呼び出し時のラベルであって束縛では
 /// ないため除外する (これを数えると `f(Base=1)` だけで無関係な分類が消えてしまう)。
 #[derive(Debug, Default)]
-struct BindingCounts {
+pub(super) struct BindingCounts {
     counts: std::collections::HashMap<String, usize>,
     /// `t.TypedDict = Fake` のように書き換えられた属性の完全名。
     attribute_writes: HashSet<String>,
@@ -879,7 +879,7 @@ struct BindingCounts {
 }
 
 impl BindingCounts {
-    fn count(&self, name: &str) -> usize {
+    pub(super) fn count(&self, name: &str) -> usize {
         self.counts.get(name).copied().unwrap_or(0)
     }
 
@@ -890,13 +890,17 @@ impl BindingCounts {
     fn attribute_written(&self, dotted: &str) -> bool {
         self.attribute_writes.contains(dotted)
     }
+
+    pub(super) fn has_dynamic_namespace_operation(&self) -> bool {
+        self.dynamic_namespace_op
+    }
 }
 
 /// 静的に追えない namespace 操作を行う組み込み。1 つでも呼ばれていたら分類しない。
 const DYNAMIC_NAMESPACE_BUILTINS: [&str; 6] =
     ["globals", "locals", "vars", "setattr", "exec", "eval"];
 
-fn collect_binding_counts(root: tree_sitter::Node<'_>, source: &[u8]) -> BindingCounts {
+pub(super) fn collect_binding_counts(root: tree_sitter::Node<'_>, source: &[u8]) -> BindingCounts {
     let mut counts = BindingCounts::default();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
@@ -994,7 +998,7 @@ fn collect_identifiers(
 
 /// `attribute` ノードを空白・括弧に依存しない `a.b.c` 形式へ正規化する。
 /// 生テキストのまま比較すると `t . TypedDict = Fake` や `(t).TypedDict = Fake` を取りこぼす。
-fn attribute_path(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+pub(super) fn attribute_path(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
     match node.kind() {
         "identifier" => node_text(node, source),
         "attribute" => {
@@ -1246,7 +1250,7 @@ fn field_fact(
 }
 
 /// ノードの UTF-8 テキストを取り出す。非 UTF-8 / 範囲外は `None`。
-fn node_text(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+pub(super) fn node_text(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
     let bytes = source.get(node.start_byte()..node.end_byte())?;
     std::str::from_utf8(bytes).ok().map(|s| s.to_string())
 }

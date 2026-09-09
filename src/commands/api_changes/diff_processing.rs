@@ -61,7 +61,75 @@ pub(crate) fn process_modified_file(
     collect_modified_symbols(inputs, state, df, facts, &maps);
     // シグネチャ差分に乗らない契約変更。上の 3 つと違い「old/new でシグネチャが同じ」
     // シンボルを見るため、最後に独立した経路として走らせる。
-    collect_python_typed_dict_field_changes(inputs, state, df, facts, &maps);
+    collect_python_contract_changes(inputs, state, df, facts, &maps);
+}
+
+/// シグネチャ差分に乗らない Python の型契約変更を、1 組の source / parse から検出する。
+///
+/// TypedDict と Literal の検出器を別々に読み込ませると、同じ modified ファイルに対して
+/// `git show` と tree-sitter parse が 2 回ずつ走るため、ここで共有する。
+fn collect_python_contract_changes(
+    inputs: &DetectionInputs<'_>,
+    state: &mut DetectionState<'_>,
+    df: &crate::models::impact::DiffFile,
+    facts: &ModifiedFileFacts<'_>,
+    maps: &SymbolMaps<'_>,
+) {
+    if crate::language::LangId::from_path(camino::Utf8Path::new(df.new_path.as_str())).ok()
+        != Some(crate::language::LangId::Python)
+    {
+        return;
+    }
+    let &DetectionInputs { dir, base, .. } = inputs;
+    let Some(src) = load_old_new_sources(dir, base, &df.old_path, &df.new_path) else {
+        return;
+    };
+    let check_typed_dict =
+        mentions_requiredness_qualifier(&src.old) || mentions_requiredness_qualifier(&src.new);
+    let check_literal =
+        mentions_literal_qualifier(&src.old) || mentions_literal_qualifier(&src.new);
+    if !check_typed_dict && !check_literal {
+        return;
+    }
+    let Some((old_tree, new_tree)) = src.parse_pair(crate::language::LangId::Python) else {
+        return;
+    };
+    let parsed = ParsedPythonSources {
+        old_root: old_tree.root_node(),
+        old_source: &src.old,
+        new_root: new_tree.root_node(),
+        new_source: &src.new,
+    };
+
+    if check_typed_dict {
+        collect_python_typed_dict_field_changes(state, df, facts, maps, &parsed);
+    }
+    if check_literal {
+        for change in detect_python_literal_alias_changes(
+            parsed.old_root,
+            parsed.old_source,
+            parsed.new_root,
+            parsed.new_source,
+        ) {
+            state.buckets.modified.push(ApiSymbolChange {
+                name: change.name,
+                kind: "type".to_string(),
+                file: df.new_path.clone(),
+                old_signature: Some(change.old_signature),
+                new_signature: Some(change.new_signature),
+                // 疑似シンボルを bare 名で解決すると、無関係な同名変数を呼び出し元にしてしまう。
+                no_resolved_internal_callers: false,
+                contract_change: change.contract,
+            });
+        }
+    }
+}
+
+struct ParsedPythonSources<'tree, 'source> {
+    old_root: tree_sitter::Node<'tree>,
+    old_source: &'source [u8],
+    new_root: tree_sitter::Node<'tree>,
+    new_source: &'source [u8],
 }
 
 /// クラスヘッダが変わらない Python TypedDict の、フィールド単位 requiredness 変更を検出する。
@@ -75,13 +143,12 @@ pub(crate) fn process_modified_file(
 /// **通常の exported symbol 集合には混ぜない**。`Class.field` はあくまで出力時の疑似シンボルで、
 /// `symbols` / `refs` / `dead-code` / `ApiRefIndex` の意味は一切変えない。
 fn collect_python_typed_dict_field_changes(
-    inputs: &DetectionInputs<'_>,
     state: &mut DetectionState<'_>,
     df: &crate::models::impact::DiffFile,
     facts: &ModifiedFileFacts<'_>,
     maps: &SymbolMaps<'_>,
+    parsed: &ParsedPythonSources<'_, '_>,
 ) {
-    let &DetectionInputs { dir, base, .. } = inputs;
     let &ModifiedFileFacts { new_syms, .. } = facts;
     let SymbolMaps {
         old_map,
@@ -90,11 +157,6 @@ fn collect_python_typed_dict_field_changes(
         ..
     } = maps;
 
-    if crate::language::LangId::from_path(camino::Utf8Path::new(df.new_path.as_str())).ok()
-        != Some(crate::language::LangId::Python)
-    {
-        return;
-    }
     // 対象は「シグネチャ (= クラスヘッダ) が変わっていない」クラスだけ。変わっていれば
     // `detect_python_typed_dict_total_change` が担当するので、ここで扱うと二重報告になる。
     // 同名クラスが複数あるファイルは、どの定義を見ているか確定できないため除外する。
@@ -112,23 +174,12 @@ fn collect_python_typed_dict_field_changes(
     if candidates.is_empty() {
         return;
     }
-    let Some(src) = load_old_new_sources(dir, base, &df.old_path, &df.new_path) else {
-        return;
-    };
-    // `total` が動かない前提なので、requiredness が変わるには修飾子の字面が
-    // どちらかに必ずある。parse の前に安価に落とす。
-    if !mentions_requiredness_qualifier(&src.old) && !mentions_requiredness_qualifier(&src.new) {
-        return;
-    }
-    let Some((old_tree, new_tree)) = src.parse_pair(crate::language::LangId::Python) else {
-        return;
-    };
     for class_name in candidates {
         for change in detect_typed_dict_field_requiredness_changes(
-            old_tree.root_node(),
-            &src.old,
-            new_tree.root_node(),
-            &src.new,
+            parsed.old_root,
+            parsed.old_source,
+            parsed.new_root,
+            parsed.new_source,
             class_name,
         ) {
             state.buckets.modified.push(ApiSymbolChange {
@@ -151,6 +202,11 @@ fn collect_python_typed_dict_field_changes(
 /// 過剰にヒットしても後段の AST 判定で落ちるだけなので、保守側に振れている。
 fn mentions_requiredness_qualifier(source: &[u8]) -> bool {
     source.windows(b"Required".len()).any(|w| w == b"Required")
+}
+
+/// `Literal` の出現を素朴に見る安価な前段フィルタ。最終判定は AST と名前解決で行う。
+fn mentions_literal_qualifier(source: &[u8]) -> bool {
+    source.windows(b"Literal".len()).any(|w| w == b"Literal")
 }
 
 /// 変更ファイルの新旧 exported シンボルから作る突き合わせ用インデックス。

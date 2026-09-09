@@ -1383,19 +1383,32 @@ fn build_review_hook_json_api_modified_carries_field_contract_change() {
         api_changes: ApiChanges {
             added: Vec::new(),
             removed: Vec::new(),
-            modified: vec![ApiSymbolChange {
-                name: "Payload.y".to_string(),
-                kind: "field".to_string(),
-                file: "models.py".to_string(),
-                old_signature: Some("optional str".to_string()),
-                new_signature: Some("required str".to_string()),
-                no_resolved_internal_callers: false,
-                contract_change: Some(crate::models::review::ApiContractChange {
-                    kind:
-                        crate::models::review::ApiContractChangeKind::TypedDictFieldBecameRequired,
-                    breaks: crate::models::review::ApiContractSide::Producer,
-                }),
-            }],
+            modified: vec![
+                ApiSymbolChange {
+                    name: "Payload.y".to_string(),
+                    kind: "field".to_string(),
+                    file: "models.py".to_string(),
+                    old_signature: Some("optional str".to_string()),
+                    new_signature: Some("required str".to_string()),
+                    no_resolved_internal_callers: false,
+                    contract_change: Some(crate::models::review::ApiContractChange {
+                        kind: crate::models::review::ApiContractChangeKind::TypedDictFieldBecameRequired,
+                        breaks: crate::models::review::ApiContractSide::Producer,
+                    }),
+                },
+                ApiSymbolChange {
+                    name: "Mode".to_string(),
+                    kind: "type".to_string(),
+                    file: "models.py".to_string(),
+                    old_signature: Some("Literal['read', 'write']".to_string()),
+                    new_signature: Some("Literal['read']".to_string()),
+                    no_resolved_internal_callers: false,
+                    contract_change: Some(crate::models::review::ApiContractChange {
+                        kind: crate::models::review::ApiContractChangeKind::LiteralValuesNarrowed,
+                        breaks: crate::models::review::ApiContractSide::Producer,
+                    }),
+                },
+            ],
             moved: Vec::new(),
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
@@ -1424,6 +1437,15 @@ fn build_review_hook_json_api_modified_carries_field_contract_change() {
     );
     assert_eq!(
         hook_json["api"]["mod"][0]["contract"]["breaks"], "producer",
+        "{hook_json}"
+    );
+    assert_eq!(hook_json["api"]["mod"][1]["n"], "Mode", "{hook_json}");
+    assert_eq!(
+        hook_json["api"]["mod"][1]["contract"]["kind"], "literal_values_narrowed",
+        "{hook_json}"
+    );
+    assert_eq!(
+        hook_json["api"]["mod"][1]["contract"]["breaks"], "producer",
         "{hook_json}"
     );
 }

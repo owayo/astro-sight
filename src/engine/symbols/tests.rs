@@ -873,6 +873,39 @@ def other():
     assert!(!check_exported(src, LangId::Python, "other"));
 }
 
+/// 動的な `__all__` は、既存 symbol 抽出と新規契約検出で安全側が逆になる。
+///
+/// symbol 抽出は従来どおり `_` 規約へフォールバックして公開面を広く保つ一方、
+/// 契約検出向けの 3 値 API は `None` を返して「確定不能」を伝える。
+#[test]
+fn python_indeterminate_dunder_all_preserves_existing_fallback() {
+    let src = r#"
+__all__ = ["public_api"]
+__all__ += extra_exports
+
+def public_api():
+    pass
+
+def also_public():
+    pass
+
+def _private():
+    pass
+"#;
+    assert!(check_exported(src, LangId::Python, "also_public"));
+    assert!(!check_exported(src, LangId::Python, "_private"));
+
+    let language = LangId::Python.ts_language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).expect("set language");
+    let tree = parser.parse(src, None).expect("parse");
+    assert_eq!(
+        python_module_name_is_exported(tree.root_node(), src.as_bytes(), "public_api"),
+        None,
+        "動的な __all__ を未定義と混同してはならない"
+    );
+}
+
 // --- is_local_scope_symbol テスト ---
 
 fn check_local_scope(source: &str, lang_id: LangId, symbol_name: &str) -> bool {

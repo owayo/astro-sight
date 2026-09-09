@@ -188,7 +188,7 @@ pub struct ApiSymbolChange {
 ///
 /// `severity` は持たせない。severity の正本はバケット (`modified` = blocking) であり、
 /// フィールドと二重管理にしない。
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ApiContractChange {
     pub kind: ApiContractChangeKind,
     pub breaks: ApiContractSide,
@@ -211,6 +211,10 @@ pub enum ApiContractChangeKind {
     TypedDictFieldBecameRequired,
     /// `y: str` → `y: NotRequired[str]`。そのキー 1 件だけが省略可になる。
     TypedDictFieldBecameNotRequired,
+    /// `Literal["a", "b"]` → `Literal["a"]`。受理する値集合が狭まる。
+    LiteralValuesNarrowed,
+    /// `Literal["a"]` → `Literal["a", "b"]`。受理する値集合が広がる。
+    LiteralValuesWidened,
 }
 
 /// 契約変更で壊れる側。
