@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use tree_sitter::Node;
 
-use crate::engine::symbols::python_module_name_is_exported;
+use crate::engine::symbols::python_module_export_policy;
 use crate::models::review::{ApiContractChange, ApiContractChangeKind, ApiContractSide};
 
 use super::normalize_signature_whitespace;
@@ -105,6 +105,9 @@ fn collect_literal_aliases(
     if bindings.has_dynamic_namespace_operation() {
         return None;
     }
+    // `__all__` の解析はファイル全体の走査を含む。候補ごとに繰り返すと、定数表のような
+    // module 直下代入が多いファイルで O(N²) になるため 1 回だけ行う。
+    let export_policy = python_module_export_policy(root, source);
 
     let mut aliases = BTreeMap::new();
     let mut cursor = root.walk();
@@ -128,12 +131,6 @@ fn collect_literal_aliases(
         if bindings.count(&name) != 1 {
             continue;
         }
-        match python_module_name_is_exported(root, source, &name) {
-            Some(true) => {}
-            Some(false) => continue,
-            None => return None,
-        }
-
         if let Some(annotation) = assignment.child_by_field_name("type") {
             let annotation = unwrap_type_node(annotation);
             let Some(path) = attribute_path(annotation, source) else {
@@ -167,6 +164,11 @@ fn collect_literal_aliases(
         }
         if !complete || values.is_empty() {
             continue;
+        }
+        match export_policy.name_is_exported(&name) {
+            Some(true) => {}
+            Some(false) => continue,
+            None => return None,
         }
         let signature = normalize_signature_whitespace(
             source
@@ -225,6 +227,11 @@ fn python_plain_string_literal(node: Node<'_>, source: &[u8]) -> Option<String> 
             "string_end" => {}
             "string_content" => {
                 if content.is_some() {
+                    return None;
+                }
+                // escape_sequence は string_content の子に入る。デコードせず生テキストを
+                // 比較すると、quote 正規化だけで別値と誤判定するため alias ごと諦める。
+                if child.named_child_count() != 0 {
                     return None;
                 }
                 content = Some(child.utf8_text(source).ok()?.to_string());
@@ -408,5 +415,16 @@ Mode = Literal["a", "b"]
         ] {
             assert!(changes(old, new).is_empty(), "new={new}");
         }
+
+        let escaped_old = r#"from typing import Literal
+Mode = Literal['it\'s', "b"]
+"#;
+        let escaped_new = r#"from typing import Literal
+Mode = Literal["it's", "b"]
+"#;
+        assert!(
+            changes(escaped_old, escaped_new).is_empty(),
+            "escape を解釈しない以上、quote 正規化を値変更と誤判定してはならない"
+        );
     }
 }

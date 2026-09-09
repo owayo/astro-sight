@@ -1,3 +1,4 @@
+use super::exported::python_module_name_is_exported;
 use super::*;
 
 fn check_exported(source: &str, lang_id: LangId, symbol_name: &str) -> bool {
@@ -903,6 +904,28 @@ def _private():
         python_module_name_is_exported(tree.root_node(), src.as_bytes(), "public_api"),
         None,
         "動的な __all__ を未定義と混同してはならない"
+    );
+}
+
+/// escape を含む `__all__` は生テキストで誤比較せず、確定不能として公開面を広く保つ。
+#[test]
+fn python_escaped_dunder_all_preserves_existing_fallback() {
+    let src = r#"
+__all__ = ["M\u006fde"]
+
+def Mode():
+    pass
+"#;
+    assert!(check_exported(src, LangId::Python, "Mode"));
+
+    let language = LangId::Python.ts_language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).expect("set language");
+    let tree = parser.parse(src, None).expect("parse");
+    assert_eq!(
+        python_module_name_is_exported(tree.root_node(), src.as_bytes(), "Mode"),
+        None,
+        "escape を未評価のまま静的な公開名集合にしてはならない"
     );
 }
 

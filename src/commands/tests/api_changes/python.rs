@@ -1457,7 +1457,7 @@ def run(mode: Mode = "write") -> Mode:
         "契約変更を互換扱いへ降格させてはいけない"
     );
     assert!(
-        contract_of(&api, "Hidden").is_none(),
-        "__all__ 非掲載の型エイリアスは公開 API 面に含めない"
+        !api.modified.iter().any(|change| change.name == "Hidden"),
+        "__all__ 非掲載の型エイリアスは、ラベルの有無によらず api.mod に出してはならない"
     );
 }

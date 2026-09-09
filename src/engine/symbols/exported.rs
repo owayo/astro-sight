@@ -662,8 +662,34 @@ fn is_python_lexically_local(node: Node) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 enum PythonDunderAll {
     Absent,
-    Static(Vec<String>),
+    Static(std::collections::HashSet<String>),
     Indeterminate,
+}
+
+/// Python module の公開名規約を、ファイル単位で 1 回だけ解析した結果。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PythonModuleExportPolicy {
+    dunder_all: PythonDunderAll,
+}
+
+impl PythonModuleExportPolicy {
+    /// module 直下の名前が外部公開されるかを 3 値で返す。
+    pub(crate) fn name_is_exported(&self, name: &str) -> Option<bool> {
+        match &self.dunder_all {
+            PythonDunderAll::Absent => Some(!name.starts_with('_')),
+            PythonDunderAll::Static(names) => Some(names.contains(name)),
+            PythonDunderAll::Indeterminate => None,
+        }
+    }
+}
+
+/// Python module の公開名規約を解析する。
+///
+/// 複数の候補名を判定するときは戻り値を再利用し、名前ごとの AST 全走査を避ける。
+pub(crate) fn python_module_export_policy(root: Node, source: &[u8]) -> PythonModuleExportPolicy {
+    PythonModuleExportPolicy {
+        dunder_all: parse_python_dunder_all(root, source),
+    }
 }
 
 /// module 直下の名前が外部公開されるかを 3 値で判定する。
@@ -676,11 +702,7 @@ pub(crate) fn python_module_name_is_exported(
     source: &[u8],
     name: &str,
 ) -> Option<bool> {
-    match parse_python_dunder_all(root, source) {
-        PythonDunderAll::Absent => Some(!name.starts_with('_')),
-        PythonDunderAll::Static(names) => Some(names.iter().any(|candidate| candidate == name)),
-        PythonDunderAll::Indeterminate => None,
-    }
+    python_module_export_policy(root, source).name_is_exported(name)
 }
 
 fn parse_python_dunder_all(root: Node, source: &[u8]) -> PythonDunderAll {
@@ -709,7 +731,7 @@ fn parse_python_dunder_all(root: Node, source: &[u8]) -> PythonDunderAll {
         return PythonDunderAll::Indeterminate;
     }
 
-    let mut names = Vec::new();
+    let mut names = std::collections::HashSet::new();
     let mut rc = right.walk();
     for element in right.named_children(&mut rc) {
         // 要素は必ず単純な文字列リテラルであること。`*other.__all__` の展開・変数・
@@ -723,7 +745,7 @@ fn parse_python_dunder_all(root: Node, source: &[u8]) -> PythonDunderAll {
         if name.is_empty() {
             return PythonDunderAll::Indeterminate;
         }
-        names.push(name);
+        names.insert(name);
     }
     PythonDunderAll::Static(names)
 }
@@ -797,6 +819,11 @@ fn python_plain_string_literal_text(node: Node, source: &[u8]) -> Option<String>
             "string_end" => {}
             "string_content" => {
                 if content.is_some() {
+                    return None;
+                }
+                // escape_sequence は string_content の子に入る。生テキストのまま採用すると
+                // `"M\u006fde"` を実際の `Mode` と比較できず、公開 API を誤って隠す。
+                if child.named_child_count() != 0 {
                     return None;
                 }
                 content = Some(child.utf8_text(source).ok()?.to_string());
