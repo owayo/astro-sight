@@ -80,6 +80,12 @@ fn collect_python_contract_changes(
     {
         return;
     }
+    // テストファイルのシンボルは公開 API 差分の対象外。TypedDict 経路は
+    // `new_syms` 由来の候補で自然に除外されるが、Literal 経路は直接 AST を読むため
+    // ここで既存の export 抽出と同じ規約を適用する。
+    if is_test_path(std::path::Path::new(df.new_path.as_str())) {
+        return;
+    }
     let &DetectionInputs { dir, base, .. } = inputs;
     let typed_dict_candidates = python_typed_dict_field_candidates(facts, maps);
     let Some(new_source) = load_new_source(dir, &df.new_path) else {

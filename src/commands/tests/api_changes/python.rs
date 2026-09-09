@@ -1461,3 +1461,50 @@ def run(mode: Mode = "write") -> Mode:
         "__all__ 非掲載の型エイリアスは、ラベルの有無によらず api.mod に出してはならない"
     );
 }
+
+/// テストファイルは公開 API 面から除外し、同じ変更でも通常ソースなら検出する。
+#[test]
+fn literal_alias_change_ignores_test_path_but_reports_production_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    fs::create_dir_all(repo.join("tests")).expect("create tests directory");
+
+    let test_before = "from typing import Literal\n\nTestMode = Literal[\"read\", \"write\"]\n";
+    let production_before =
+        "from typing import Literal\n\nProductionMode = Literal[\"read\", \"write\"]\n";
+    git_commit_files(
+        repo,
+        &[
+            ("tests/test_modes.py", test_before),
+            ("models.py", production_before),
+        ],
+        "initial",
+    );
+
+    fs::write(
+        repo.join("tests/test_modes.py"),
+        test_before.replace(", \"write\"", ""),
+    )
+    .expect("write test module");
+    fs::write(
+        repo.join("models.py"),
+        production_before.replace(", \"write\"", ""),
+    )
+    .expect("write production module");
+
+    let diff_files = vec![
+        whole_file_diff("tests/test_modes.py", 3),
+        whole_file_diff("models.py", 3),
+    ];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    assert!(
+        contract_of(&api, "ProductionMode").is_some(),
+        "通常ソースの Literal 縮小は対照として検出されるべき"
+    );
+    assert!(
+        !api.modified.iter().any(|change| change.name == "TestMode"),
+        "テストファイルの Literal 縮小は api.mod に出してはならない"
+    );
+}

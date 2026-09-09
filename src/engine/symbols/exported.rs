@@ -536,6 +536,29 @@ fn find_enclosing_declaration_zig(node: Node) -> Option<Node> {
 /// Python: PEP8 の `_` プレフィックスを private 慣習として扱い、
 /// モジュール先頭に `__all__` があればそのリストを優先して判定する。
 fn is_exported_python(node: Node, source: &[u8], root: Node) -> bool {
+    is_exported_python_with(node, source, |name| {
+        python_module_name_is_exported(root, source, name)
+    })
+}
+
+/// ファイル単位で解析済みの公開名規約を再利用して Python シンボルを判定する。
+pub(crate) fn is_python_symbol_exported_with_policy(
+    root: Node,
+    source: &[u8],
+    symbol_range: &Range,
+    policy: &PythonModuleExportPolicy,
+) -> bool {
+    let Some(node) = node_for_symbol_range(root, symbol_range) else {
+        return true;
+    };
+    is_exported_python_with(node, source, |name| policy.name_is_exported(name))
+}
+
+fn is_exported_python_with(
+    node: Node,
+    source: &[u8],
+    module_name_is_exported: impl FnOnce(&str) -> Option<bool>,
+) -> bool {
     // 関数 / lambda の内部で宣言されたシンボルは module 属性にならないため公開 API 面に出ない。
     if is_python_lexically_local(node) {
         return false;
@@ -570,7 +593,7 @@ fn is_exported_python(node: Node, source: &[u8], root: Node) -> bool {
     // 同じ扱い)。囲みクラス自身の公開性までは見ない — 公開扱いを維持する側が fail-closed で、
     // 検出漏れを作らないため。
     if !is_python_class_member(node)
-        && let Some(exported) = python_module_name_is_exported(root, source, name)
+        && let Some(exported) = module_name_is_exported(name)
     {
         return exported;
     }
@@ -706,6 +729,11 @@ pub(crate) fn python_module_name_is_exported(
 }
 
 fn parse_python_dunder_all(root: Node, source: &[u8]) -> PythonDunderAll {
+    // 呼び出し側がファイル単位で結果を再利用できない経路でも、字面が無ければ
+    // `__all__` の定義も参照も存在しない。AST 全走査の前に安価に確定する。
+    if memchr::memmem::find(source, b"__all__").is_none() {
+        return PythonDunderAll::Absent;
+    }
     let definition = find_toplevel_dunder_all_assignment(root, source);
     let identifier_count = count_dunder_all_identifiers(root, source);
     let Some(definition) = definition else {

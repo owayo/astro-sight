@@ -138,6 +138,7 @@ pub(crate) struct ExportSurfaceContext<'tree, 'source> {
     file_path: Option<&'source str>,
     containers: Vec<&'source Symbol>,
     unittest_classes: HashSet<String>,
+    python_export_policy: Option<crate::engine::symbols::PythonModuleExportPolicy>,
 }
 
 impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
@@ -177,6 +178,10 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
             } else {
                 HashSet::new()
             };
+        // Python の `__all__` 解析は AST 全体を走査するため、シンボルごとではなく
+        // ファイル単位で 1 回だけ行う。非 Python では構築しない。
+        let python_export_policy = (lang_id == crate::language::LangId::Python)
+            .then(|| crate::engine::symbols::python_module_export_policy(root, source));
 
         Self {
             root,
@@ -188,6 +193,7 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
             file_path,
             containers,
             unittest_classes,
+            python_export_policy,
         }
     }
 
@@ -257,12 +263,22 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
         if matches!(sym.kind, SymbolKind::Module) {
             return true;
         }
-        if !crate::engine::symbols::is_symbol_exported(
-            self.root,
-            self.source,
-            self.lang_id,
-            &sym.range,
-        ) {
+        let is_exported = if let Some(policy) = &self.python_export_policy {
+            crate::engine::symbols::is_python_symbol_exported_with_policy(
+                self.root,
+                self.source,
+                &sym.range,
+                policy,
+            )
+        } else {
+            crate::engine::symbols::is_symbol_exported(
+                self.root,
+                self.source,
+                self.lang_id,
+                &sym.range,
+            )
+        };
+        if !is_exported {
             return true;
         }
         // pub(crate), pub(super) 等はクレート内部 API なので除外。

@@ -32,7 +32,8 @@ pub(crate) use cpp::{
     is_trait_impl_method_rust,
 };
 pub(crate) use exported::{
-    collect_js_ts_named_export_surface_names, collect_rust_reexported_names,
+    PythonModuleExportPolicy, collect_js_ts_named_export_surface_names,
+    collect_rust_reexported_names, is_python_symbol_exported_with_policy,
     python_module_export_policy, rust_node_has_unrestricted_pub_visibility,
 };
 
