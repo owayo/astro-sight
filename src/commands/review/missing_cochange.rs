@@ -276,6 +276,10 @@ pub(crate) fn detect_missing_cochanges(
     min_confidence: f64,
     min_samples: usize,
     base: Option<&str>,
+    // 生成物 (`.gitattributes` の `linguist-generated` / ヘッダマーカー) を起点・候補に
+    // 残すか。CLI のグローバル `--include-generated` (config.toml の `skip_generated`) を
+    // そのまま流す＝standalone の cochange と review で同じ指定が効く。
+    include_generated: bool,
 ) -> Result<MissingCochangeReport> {
     // review では blame モードで cochange を解析する。
     // 起点ファイル = 差分に登場したファイル。
@@ -329,6 +333,7 @@ pub(crate) fn detect_missing_cochanges(
         } else {
             min_samples
         },
+        include_generated,
         ..CoChangeOptions::default()
     };
     let smoothing_on = !opts.disable_smoothing;

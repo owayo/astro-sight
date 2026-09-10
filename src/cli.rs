@@ -38,7 +38,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<std::path::PathBuf>,
 
-    /// Include files detected as generated (default: skip and report them)
+    /// Include files detected as generated (default: skip and report them).
+    /// Applies to AST scans (`refs` / `dead-code`) and, separately, to `cochange`:
+    /// there it keeps paths declared generated via `.gitattributes`
+    /// (`linguist-generated`) or a header marker as co-change sources and candidates.
     #[arg(long, global = true)]
     pub include_generated: bool,
 }

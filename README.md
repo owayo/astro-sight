@@ -627,6 +627,15 @@ astro-sight cochange --dir . --git --base HEAD~10 --rename --copy
 
 `--paths-file` は 100MB 上限付きで読み込まれ、空リストは `INVALID_REQUEST` を返す。`--min-confidence` は有限な `0.0..=1.0`、`--smoothing-alpha` / `--smoothing-beta` は有限な非負値のみ受け付ける。`--paths` / `--paths-file` で渡すソースファイルは `--dir` 配下の相対パスである必要があり、`..` を含むパス・絶対パス・Windows のドライブ修飾パスは `PATH_OUT_OF_BOUNDS` で拒否される。
 
+**生成物は起点・候補の両方から除外する。** バッチ処理・コード生成・ビルドが同時に書き出すファイル群は履歴上ほぼ必ず同一コミットに乗るため、そのままでは「機械的な同時更新」が高い confidence の共変更として提示されてしまう。判定は `.gitattributes` の `linguist-generated` を最優先 (`set` / `true` は除外、`unset` / `false` はヘッダマーカーを見ずに残す) とし、指定が無ければファイル先頭の生成マーカー (`@generated` / `DO NOT EDIT` 等) を見る。どちらでも決まらなければ候補に残す。拡張子や更新頻度では判定しないので、コメントを書けない生成 JSON / CSV は `.gitattributes` で宣言する。
+
+```gitattributes
+data/*.json linguist-generated=true
+fixtures/hand-maintained.yaml -linguist-generated
+```
+
+除外しても**残った起点の分母は変わらない** (生成物が同居していたコミットを分母から抜くと `1/2` が `1/1` に化けて選択バイアスになるため)。除外件数は `diagnostics` の `excluded_generated_sources` / `filtered_generated_candidates` に出る。`git check-attr` を実行できない場合は除外を一切行わず (`GeneratedAttrLookupFailed` を申告)、判定できないことを理由に候補を消さない。グローバルの `--include-generated` (config.toml の `skip_generated = false` も同義) で従来どおり生成物も対象にできる。この指定は単体の `cochange` だけでなく `review` の `missing_cochanges` にも効く。
+
 ### doctor - 対応言語チェック
 
 ```bash

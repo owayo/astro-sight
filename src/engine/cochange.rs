@@ -12,7 +12,9 @@ use crate::models::cochange::{
 };
 use crate::models::skip::SkipInfo;
 
+mod generated_policy;
 mod scoring;
+use generated_policy::GeneratedPolicy;
 use scoring::{ShardStats, commit_size_weight, compare_entries_by_ranking};
 
 /// entries なし・commits_analyzed 0 の空結果を返す。起点なし / 証拠集合が空 /
@@ -151,14 +153,15 @@ pub fn analyze_cochange(dir: &str, opts: &CoChangeOptions) -> Result<CoChangeRes
     // base リビジョンの棚卸しを 1 回だけ行い、削除済みパスの候補を落とす。
     // 失敗したら None = フィルタ無効 (従来どおりの出力) に倒す。
     let base_tree_paths = collect_base_tree_paths(dir, base_rev);
-    let entries = assemble_entries(
-        opts,
-        &index,
-        &stats,
-        min_denom,
-        base_tree_paths.as_ref(),
-        &mut diag,
-    );
+    let candidate_policy = resolve_candidate_generated_policy(dir, opts, &stats);
+    if candidate_policy.attr_lookup_failed() {
+        diag.add_reason(CoChangeDiagnosticReason::GeneratedAttrLookupFailed);
+    }
+    let filters = CandidateFilters {
+        base_tree_paths: base_tree_paths.as_ref(),
+        generated: &candidate_policy,
+    };
+    let entries = assemble_entries(opts, &index, &stats, min_denom, &filters, &mut diag);
     diag.finalize();
 
     Ok(CoChangeResult {
@@ -204,10 +207,27 @@ fn build_evidence_index(
     diag: &mut CoChangeDiagnostics,
 ) -> Result<EvidenceIndex> {
     deadline.check("phase1_blame_setup")?;
+    // 生成物と宣言された起点は証拠収集そのものを行わない。バッチが書き出したファイルの
+    // 履歴を辿っても、得られるのは「同じバッチが同時に書いた相手」だけで、人手の変更に
+    // 対する共変更候補にならない。`source_files` との添字対応は集計全体の前提なので、
+    // 起点を配列から取り除かず「証拠なし」の印を付けて位置を保つ。
+    let source_policy = if opts.include_generated {
+        GeneratedPolicy::disabled()
+    } else {
+        GeneratedPolicy::resolve(dir, opts.source_files.iter().map(String::as_str))
+    };
+    if source_policy.attr_lookup_failed() {
+        diag.add_reason(CoChangeDiagnosticReason::GeneratedAttrLookupFailed);
+    }
     let mut per_source: Vec<SourceEvidence> = opts
         .source_files
         .par_iter()
-        .map(|f| collect_evidence_for_file(dir, f, base, min_denom, opts))
+        .map(|f| {
+            if source_policy.excluded(f).is_some() {
+                return SourceEvidence::generated_excluded();
+            }
+            collect_evidence_for_file(dir, f, base, min_denom, opts)
+        })
         .collect();
     deadline.check("phase1_blame_collected")?;
     record_evidence_diagnostics(&per_source, diag);
@@ -245,6 +265,13 @@ fn build_evidence_index(
 /// 起点ごとの内訳 (git 失敗 / 変更行なし / 新規ファイル / blame・履歴の別) を残す。
 fn record_evidence_diagnostics(per_source: &[SourceEvidence], diag: &mut CoChangeDiagnostics) {
     for ev in per_source {
+        if ev.generated_excluded {
+            // 「証拠を作れなかった」ではなく「作らないと決めた」ので、
+            // sources_without_evidence には数えない。
+            diag.excluded_generated_sources += 1;
+            diag.add_reason(CoChangeDiagnosticReason::SourceIsGenerated);
+            continue;
+        }
         if ev.git_failed {
             diag.add_reason(CoChangeDiagnosticReason::GitCommandFailed);
         }
@@ -460,12 +487,49 @@ fn accumulate_commit(
 /// 起点ごとに `CoChangeEntry` を構築し、全体ランキング順に並べて返す。
 ///
 /// 集計は `stats` で完了しているので、ここでは閾値フィルタとランキングだけを行う。
+/// 候補側の生成物ポリシーを解決する。
+///
+/// 判定対象を **`min_samples` を通る候補**に絞ってから解決する。生成物判定は
+/// `.gitattributes` の問い合わせとファイル先頭の読み込みを伴うので、閾値で落ちる候補まで
+/// 見ると I/O が候補総数に比例してしまう。`entries_for_source` 側でも生成物判定を
+/// `min_samples` の直後に置くため、ここで解決した集合と判定対象は完全に一致する
+/// (解決していないパスは `excluded` が常に None を返すので、取りこぼしても
+/// 「除外しない」= 従来どおりの出力に倒れる)。
+fn resolve_candidate_generated_policy(
+    dir: &str,
+    opts: &CoChangeOptions,
+    stats: &ShardStats,
+) -> GeneratedPolicy {
+    if opts.include_generated {
+        return GeneratedPolicy::disabled();
+    }
+    let candidates = stats
+        .per_source_raw
+        .iter()
+        .flat_map(|per_source| per_source.iter())
+        .filter(|(_, co)| **co >= opts.min_samples)
+        .map(|(path, _)| path.as_str());
+    GeneratedPolicy::resolve(dir, candidates)
+}
+
+/// 候補を落とすためのフィルタ一式。
+///
+/// どちらも「履歴上は共変更しているが、現在の変更候補として提示すべきでない」候補を
+/// 落とす判定なので 1 つにまとめる (`Option<&HashSet>` と `&GeneratedPolicy` を位置引数で
+/// 並べると呼び出し側で取り違えても型が合ってしまう組み合わせが増えるため)。
+struct CandidateFilters<'a> {
+    /// base リビジョンに存在するパス集合。`None` = 判定できなかったのでフィルタしない。
+    base_tree_paths: Option<&'a HashSet<String>>,
+    /// 生成物判定。`GeneratedPolicy::disabled()` なら常に「残す」。
+    generated: &'a GeneratedPolicy,
+}
+
 fn assemble_entries(
     opts: &CoChangeOptions,
     index: &EvidenceIndex,
     stats: &ShardStats,
     min_denom: usize,
-    base_tree_paths: Option<&HashSet<String>>,
+    filters: &CandidateFilters<'_>,
     diag: &mut CoChangeDiagnostics,
 ) -> Vec<CoChangeEntry> {
     let smoothing_on = !opts.disable_smoothing;
@@ -482,13 +546,7 @@ fn assemble_entries(
             continue;
         }
         entries.extend(entries_for_source(
-            i,
-            source,
-            evidence,
-            stats,
-            opts,
-            base_tree_paths,
-            diag,
+            i, source, evidence, stats, opts, filters, diag,
         ));
     }
 
@@ -542,7 +600,7 @@ fn entries_for_source(
     evidence: &SourceEvidence,
     stats: &ShardStats,
     opts: &CoChangeOptions,
-    base_tree_paths: Option<&HashSet<String>>,
+    filters: &CandidateFilters<'_>,
     diag: &mut CoChangeDiagnostics,
 ) -> Vec<CoChangeEntry> {
     let smoothing_on = !opts.disable_smoothing;
@@ -563,7 +621,7 @@ fn entries_for_source(
         diag.candidate_pairs += 1;
         // base リビジョンに存在しない候補 (過去のコミットで削除済み) は落とす。
         // 履歴上の共変更頻度は事実だが、現在の変更候補としては成立しない。
-        if let Some(paths) = base_tree_paths
+        if let Some(paths) = filters.base_tree_paths
             && !paths.contains(cand.as_str())
         {
             diag.filtered_deleted_candidates += 1;
@@ -573,6 +631,14 @@ fn entries_for_source(
         if co < opts.min_samples {
             diag.filtered_min_samples += 1;
             diag.add_reason(CoChangeDiagnosticReason::BelowMinSamples);
+            continue;
+        }
+        // 生成物は「一緒に直すべき相手」にならない。バッチが同時に書き出すという
+        // 機械的な同時更新が、意味的な依存として高 confidence で並ぶのを止める。
+        // `per_source_limit` の truncate より前なので、上位件数の枠も消費しない。
+        if filters.generated.excluded(cand.as_str()).is_some() {
+            diag.filtered_generated_candidates += 1;
+            diag.add_reason(CoChangeDiagnosticReason::CandidateIsGenerated);
             continue;
         }
         let confidence = co as f64 / local_denom_raw;
@@ -625,6 +691,12 @@ struct SourceEvidence {
     new_file: bool,
     /// git コマンドが失敗した (証拠なしと区別するため保持する)。
     git_failed: bool,
+    /// 生成物と判定されたため証拠収集を行わなかった。
+    ///
+    /// 「証拠を作れなかった」(`sources_without_evidence`) とは別物なので、診断では
+    /// 混ぜずに数える。混ぜると「解析が失敗した」と「意図的に除外した」を利用者が
+    /// 区別できない。
+    generated_excluded: bool,
 }
 
 impl SourceEvidence {
@@ -635,6 +707,15 @@ impl SourceEvidence {
             no_changed_old_lines: false,
             new_file: false,
             git_failed: false,
+            generated_excluded: false,
+        }
+    }
+
+    /// 生成物として除外した起点 (証拠収集を行わなかった)。
+    fn generated_excluded() -> Self {
+        Self {
+            generated_excluded: true,
+            ..Self::empty(CoChangeEvidence::Blame)
         }
     }
 }

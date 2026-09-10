@@ -136,6 +136,9 @@ pub fn handle_request(
                 max_files_per_commit: req
                     .max_files_per_commit
                     .unwrap_or(defaults.max_files_per_commit),
+                // refs / dead-code と同じ opt-out フラグを共有する。除外の対象と判定は
+                // 独立だが、「generated を特別扱いしない」という利用者の意図は共通。
+                include_generated: req.include_generated,
                 ..defaults
             };
             let result = service.analyze_cochange(dir, &opts)?;

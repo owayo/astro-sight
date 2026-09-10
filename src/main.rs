@@ -507,10 +507,13 @@ fn dispatch_command(
                 dead_scope: resolved_dead_scope,
                 strict_public_const_values,
                 include_wip_dead,
+                include_generated,
             };
             cmd_review(service, &opts)
         }
-        cmd @ Commands::Cochange { .. } => dispatch_cochange(service, cmd, output),
+        cmd @ Commands::Cochange { .. } => {
+            dispatch_cochange(service, cmd, output, include_generated)
+        }
         Commands::Context {
             dir,
             diff,
@@ -595,9 +598,14 @@ fn dispatch_command(
 }
 
 /// `cochange` サブコマンドの処理。`BlameSourceResolution` の解決、`ignore_merges` の等価簡約、
-/// 23 フィールドの `CoChangeOptions` 構築を担う。`dispatch_command` の 1 arm が肥大化するのを
+/// 24 フィールドの `CoChangeOptions` 構築を担う。`dispatch_command` の 1 arm が肥大化するのを
 /// 避けるため variant ごと受け取り内部で destructure する。
-fn dispatch_cochange(service: &AppService, command: Commands, output: OutputOptions) -> Result<()> {
+fn dispatch_cochange(
+    service: &AppService,
+    command: Commands,
+    output: OutputOptions,
+    include_generated: bool,
+) -> Result<()> {
     let Commands::Cochange {
         dir,
         git,
@@ -655,6 +663,7 @@ fn dispatch_cochange(service: &AppService, command: Commands, output: OutputOpti
         max_files_per_commit,
         commit_size_pivot,
         exclude_globs,
+        include_generated,
         max_source_files,
         rename,
         copy,

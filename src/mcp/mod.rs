@@ -180,6 +180,10 @@ pub struct CochangeAnalyzeParams {
     /// Commits touching more files than this threshold are skipped (default: 30)
     #[serde(default = "default_max_files_per_commit")]
     pub max_files_per_commit: usize,
+    /// Keep generated files (declared via `.gitattributes` `linguist-generated` or a
+    /// header marker) as co-change sources and candidates. Default false = exclude them.
+    #[serde(default)]
+    pub include_generated: bool,
 }
 
 fn default_min_confidence() -> f64 {
@@ -452,6 +456,7 @@ impl AstroSightServer {
             min_confidence: p.min_confidence,
             min_samples: p.min_samples,
             max_files_per_commit: p.max_files_per_commit,
+            include_generated: p.include_generated,
             ..Default::default()
         };
         self.to_tool_result(self.service.analyze_cochange(&p.dir, &opts))

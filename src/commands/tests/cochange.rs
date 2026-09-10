@@ -267,6 +267,7 @@ fn detect_missing_cochanges_excludes_cargo_manifest_lock_pair() {
         0.3,
         REVIEW_COCHANGE_MIN_SAMPLES,
         None,
+        false,
     )
     .expect("detect_missing_cochanges should succeed")
     .missing;
@@ -359,6 +360,7 @@ fn detect_missing_cochanges_uses_review_base_for_multi_commit_ranges() {
         0.0,
         crate::models::cochange::CoChangeOptions::default().min_samples,
         Some("HEAD~2"),
+        false,
     )
     .expect("detect_missing_cochanges should succeed")
     .missing;
@@ -391,6 +393,7 @@ fn detect_missing_cochanges_propagates_invalid_request_error() {
         f64::NAN,
         REVIEW_COCHANGE_MIN_SAMPLES,
         None,
+        false,
     );
 
     let err = result.expect_err("NaN min_confidence should surface as error");
@@ -425,6 +428,7 @@ fn detect_missing_cochanges_skips_cochange_when_sources_exceed_limit() {
         0.3,
         REVIEW_COCHANGE_MIN_SAMPLES,
         None,
+        false,
     )
     .expect("exceeding max_source_files must not fail the review pipeline");
 
@@ -528,6 +532,7 @@ fn detect_missing_cochanges_review_policy_drops_small_support_pairs() {
         0.0,
         crate::models::cochange::CoChangeOptions::default().min_samples,
         Some("HEAD~2"),
+        false,
     )
     .expect("detect_missing_cochanges should succeed")
     .missing;
@@ -544,6 +549,7 @@ fn detect_missing_cochanges_review_policy_drops_small_support_pairs() {
         0.0,
         REVIEW_COCHANGE_MIN_SAMPLES,
         Some("HEAD~2"),
+        false,
     )
     .expect("detect_missing_cochanges should succeed")
     .missing;
@@ -612,6 +618,7 @@ fn detect_missing_cochanges_review_policy_keeps_well_supported_pairs() {
         0.0,
         REVIEW_COCHANGE_MIN_SAMPLES,
         Some("HEAD~3"),
+        false,
     )
     .expect("detect_missing_cochanges should succeed")
     .missing;
@@ -706,6 +713,7 @@ fn detect_missing_cochanges_drops_dependency_manifest_when_only_body_changed() {
         0.0,
         REVIEW_COCHANGE_MIN_SAMPLES,
         None,
+        false,
     )
     .expect("detect_missing_cochanges should succeed")
     .missing;
@@ -777,6 +785,7 @@ fn detect_missing_cochanges_keeps_cross_ecosystem_manifest_pairs() {
         0.0,
         REVIEW_COCHANGE_MIN_SAMPLES,
         None,
+        false,
     )
     .expect("detect_missing_cochanges should succeed")
     .missing;
@@ -840,6 +849,7 @@ fn detect_missing_cochanges_keeps_manifest_outside_source_project() {
         0.0,
         REVIEW_COCHANGE_MIN_SAMPLES,
         None,
+        false,
     )
     .expect("detect_missing_cochanges should succeed")
     .missing;
@@ -905,6 +915,7 @@ fn detect_missing_cochanges_keeps_root_manifest_when_nested_manifest_exists() {
         0.0,
         REVIEW_COCHANGE_MIN_SAMPLES,
         None,
+        false,
     )
     .expect("detect_missing_cochanges should succeed")
     .missing;
@@ -979,6 +990,7 @@ fn detect_missing_cochanges_drops_nearest_nested_manifest() {
         0.0,
         REVIEW_COCHANGE_MIN_SAMPLES,
         None,
+        false,
     )
     .expect("detect_missing_cochanges should succeed")
     .missing;
@@ -1056,6 +1068,7 @@ fn detect_missing_cochanges_treats_shebang_script_as_source() {
         0.0,
         REVIEW_COCHANGE_MIN_SAMPLES,
         None,
+        false,
     )
     .expect("detect_missing_cochanges should succeed")
     .missing;
@@ -1131,6 +1144,7 @@ fn detect_missing_cochanges_shebang_probe_survives_multibyte_boundary() {
         0.0,
         REVIEW_COCHANGE_MIN_SAMPLES,
         None,
+        false,
     )
     .expect("detect_missing_cochanges should succeed")
     .missing;
@@ -1240,6 +1254,7 @@ fn detect_missing_cochanges_does_not_follow_symlinked_source() {
         0.0,
         REVIEW_COCHANGE_MIN_SAMPLES,
         None,
+        false,
     )
     .expect("detect_missing_cochanges should succeed");
     // symlink を Python と誤認していないこと = 除外が成立していないことを、
@@ -1296,6 +1311,7 @@ fn detect_missing_cochanges_ignores_lockfile_only_sources() {
         0.0,
         REVIEW_COCHANGE_MIN_SAMPLES,
         None,
+        false,
     )
     .expect("detect_missing_cochanges should succeed");
 
@@ -1406,4 +1422,390 @@ mod cochange_ignore_merges {
             "conflicts_with により両フラグ同時指定は parse エラー"
         );
     }
+}
+
+// ------------------------------------------------------------------
+// 生成物の cochange 除外 (Issue 2026-09-10-cochange-generated-data-contamination)
+// ------------------------------------------------------------------
+
+/// 生成物判定を効かせた `CoChangeOptions` を組む。
+/// 閾値は既定より緩めて、除外の有無だけが結果を分けるようにする。
+fn generated_test_opts(sources: &[&str]) -> crate::models::cochange::CoChangeOptions {
+    crate::models::cochange::CoChangeOptions {
+        source_files: sources.iter().map(|s| s.to_string()).collect(),
+        base: Some("HEAD~1".to_string()),
+        min_confidence: 0.0,
+        min_samples: 1,
+        min_denominator: 1,
+        // 同一 author の連続コミットを 1 unit に畳むと、テストの小さな履歴では
+        // 分子・分母が潰れて意図が読めなくなるため無効化する。
+        author_unit_window_days: 0,
+        ..Default::default()
+    }
+}
+
+/// マーカー付き生成物は候補から落ち、通常のソースは残る。
+///
+/// 対照ケース (`src/report.py`) を同一テストに持たせる — 「全部落ちる」実装でも
+/// 通ってしまうテストにしない。
+#[test]
+fn cochange_excludes_generated_candidates_but_keeps_normal_sources() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    // 3 回とも「人手ソース 2 本 + 生成物」を同時にコミットする履歴を作る。
+    // 生成物は毎回バッチが書き出すので、人手ソースと同じ confidence で並ぶ。
+    for i in 0..3 {
+        git_commit_files(
+            repo,
+            &[
+                ("src/app.py", &format!("def app():\n    return {i}\n")),
+                ("src/report.py", &format!("def report():\n    return {i}\n")),
+                (
+                    "out/summary.yaml",
+                    &format!("# @generated by daily batch — DO NOT EDIT\ncount: {i}\n"),
+                ),
+            ],
+            &format!("batch {i}"),
+        );
+    }
+    // 起点となる人手の変更。
+    git_commit_files(
+        repo,
+        &[("src/app.py", "def app():\n    return 99\n")],
+        "hand-written change",
+    );
+
+    let service = AppService::new();
+    let repo_path = repo.to_str().expect("utf-8 path");
+    let opts = generated_test_opts(&["src/app.py"]);
+    let result = service
+        .analyze_cochange(repo_path, &opts)
+        .expect("analyze_cochange should succeed");
+
+    let candidates: Vec<&str> = result.entries.iter().map(|e| e.file_b.as_str()).collect();
+    assert!(
+        candidates.contains(&"src/report.py"),
+        "人手ソース同士の共変更は残るはず (対照が壊れるとこのテストは無意味になる)。got: {candidates:?}"
+    );
+    assert!(
+        !candidates.contains(&"out/summary.yaml"),
+        "@generated マーカー付きの生成物は候補にしない。got: {candidates:?}"
+    );
+    assert!(
+        result.diagnostics.filtered_generated_candidates >= 1,
+        "除外したことを診断で申告する。got: {:?}",
+        result.diagnostics
+    );
+
+    // 対照: --include-generated 相当なら従来どおり生成物も候補に出る。
+    let inclusive = crate::models::cochange::CoChangeOptions {
+        include_generated: true,
+        ..generated_test_opts(&["src/app.py"])
+    };
+    let inclusive_result = service
+        .analyze_cochange(repo_path, &inclusive)
+        .expect("analyze_cochange should succeed");
+    let inclusive_candidates: Vec<&str> = inclusive_result
+        .entries
+        .iter()
+        .map(|e| e.file_b.as_str())
+        .collect();
+    assert!(
+        inclusive_candidates.contains(&"out/summary.yaml"),
+        "include_generated では従来どおり生成物も出す。got: {inclusive_candidates:?}"
+    );
+    assert_eq!(
+        inclusive_result.diagnostics.filtered_generated_candidates, 0,
+        "include_generated では除外カウントも立たない"
+    );
+}
+
+/// `.gitattributes` の `linguist-generated` は**双方向**に効く。
+///
+/// - `linguist-generated=true`: マーカーが無くても除外する (JSON のようにコメントを
+///   書けない生成物のための宣言手段)
+/// - `-linguist-generated` (unset): マーカーがあっても残す (利用者による明示的な上書き)
+#[test]
+fn cochange_gitattributes_overrides_header_marker_in_both_directions() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    for i in 0..3 {
+        git_commit_files(
+            repo,
+            &[
+                ("src/app.py", &format!("def app():\n    return {i}\n")),
+                // マーカーを書けない生成物 → 属性で宣言する
+                ("out/data.json", &format!("{{\"count\": {i}}}\n")),
+                // マーカーはあるが、属性で「生成物ではない」と明示する
+                (
+                    "src/vendored.py",
+                    &format!("# @generated — but hand-maintained in this repo\nX = {i}\n"),
+                ),
+                (
+                    ".gitattributes",
+                    "out/data.json linguist-generated=true\nsrc/vendored.py -linguist-generated\n",
+                ),
+            ],
+            &format!("batch {i}"),
+        );
+    }
+    git_commit_files(
+        repo,
+        &[("src/app.py", "def app():\n    return 99\n")],
+        "hand-written change",
+    );
+
+    let service = AppService::new();
+    let repo_path = repo.to_str().expect("utf-8 path");
+    let result = service
+        .analyze_cochange(repo_path, &generated_test_opts(&["src/app.py"]))
+        .expect("analyze_cochange should succeed");
+
+    let candidates: Vec<&str> = result.entries.iter().map(|e| e.file_b.as_str()).collect();
+    assert!(
+        !candidates.contains(&"out/data.json"),
+        "linguist-generated=true はマーカー無しでも除外する。got: {candidates:?}"
+    );
+    assert!(
+        candidates.contains(&"src/vendored.py"),
+        "-linguist-generated はマーカーより優先して残す。got: {candidates:?}"
+    );
+}
+
+/// 生成物を起点にした場合は証拠収集そのものを行わず、理由を診断で申告する。
+///
+/// 「証拠を作れなかった」(`sources_without_evidence`) と混ぜない — 混ぜると
+/// 「解析が失敗した」と「意図的に除外した」を利用者が区別できない。
+#[test]
+fn cochange_generated_source_yields_empty_result_with_diagnostics() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    for i in 0..3 {
+        git_commit_files(
+            repo,
+            &[
+                ("src/app.py", &format!("def app():\n    return {i}\n")),
+                (
+                    "out/summary.yaml",
+                    &format!("# @generated by daily batch\ncount: {i}\n"),
+                ),
+            ],
+            &format!("batch {i}"),
+        );
+    }
+    git_commit_files(
+        repo,
+        &[(
+            "out/summary.yaml",
+            "# @generated by daily batch\ncount: 99\n",
+        )],
+        "batch only",
+    );
+
+    let service = AppService::new();
+    let repo_path = repo.to_str().expect("utf-8 path");
+    let result = service
+        .analyze_cochange(repo_path, &generated_test_opts(&["out/summary.yaml"]))
+        .expect("analyze_cochange should succeed");
+
+    assert!(
+        result.entries.is_empty(),
+        "生成物を起点にした共変更は提示しない。got: {:?}",
+        result.entries
+    );
+    assert_eq!(
+        result.diagnostics.excluded_generated_sources, 1,
+        "除外した起点数を申告する。got: {:?}",
+        result.diagnostics
+    );
+    assert_eq!(
+        result.diagnostics.sources_without_evidence, 0,
+        "意図的な除外を「証拠なし」に混ぜない。got: {:?}",
+        result.diagnostics
+    );
+    assert!(
+        result
+            .diagnostics
+            .reasons
+            .contains(&crate::models::cochange::CoChangeDiagnosticReason::SourceIsGenerated),
+        "理由を申告する。got: {:?}",
+        result.diagnostics.reasons
+    );
+
+    // 対照: include_generated なら同じ起点で推薦が復元する。
+    // これが無いと「履歴不足で常に空」の実装でもテストが通ってしまう。
+    let inclusive = crate::models::cochange::CoChangeOptions {
+        include_generated: true,
+        ..generated_test_opts(&["out/summary.yaml"])
+    };
+    let inclusive_result = service
+        .analyze_cochange(repo_path, &inclusive)
+        .expect("analyze_cochange should succeed");
+    assert!(
+        inclusive_result
+            .entries
+            .iter()
+            .any(|e| e.file_b == "src/app.py"),
+        "include_generated では生成物起点の推薦が復元する。got: {:?}",
+        inclusive_result.entries
+    );
+    assert_eq!(
+        inclusive_result.diagnostics.excluded_generated_sources, 0,
+        "include_generated では起点除外も起きない"
+    );
+}
+
+/// `review` の `missing_cochanges` でも生成物は除外され、`--include-generated` で解除できる。
+///
+/// engine 側だけ配線しても `detect_missing_cochanges` が `CoChangeOptions::default()` を
+/// 使っていると、review 経由では常に除外されたままになり利用者が解除できない。
+#[test]
+fn detect_missing_cochanges_excludes_generated_unless_opted_in() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    // 人手ソースと生成物を毎回同時にコミットし、review 既定の support (3) を満たす履歴にする。
+    for i in 0..4 {
+        git_commit_files(
+            repo,
+            &[
+                ("src/app.py", &format!("def app():\n    return {i}\n")),
+                ("src/report.py", &format!("def report():\n    return {i}\n")),
+                (
+                    "out/summary.yaml",
+                    &format!("# @generated by daily batch\ncount: {i}\n"),
+                ),
+            ],
+            &format!("batch {i}"),
+        );
+    }
+    git_commit_files(
+        repo,
+        &[("src/app.py", "def app():\n    return 99\n")],
+        "hand-written change",
+    );
+
+    let service = AppService::new();
+    let repo_path = repo.to_str().expect("utf-8 path");
+    let mut changed_files = HashSet::new();
+    changed_files.insert("src/app.py".to_string());
+
+    let excluded = detect_missing_cochanges(
+        &service,
+        repo_path,
+        &changed_files,
+        0.0,
+        REVIEW_COCHANGE_MIN_SAMPLES,
+        Some("HEAD~1"),
+        false,
+    )
+    .expect("detect_missing_cochanges should succeed")
+    .missing;
+    assert!(
+        excluded.iter().all(|m| m.file != "out/summary.yaml"),
+        "既定では生成物を変更漏れ候補にしない。got: {excluded:?}"
+    );
+
+    // 対照: include_generated では従来どおり出る (「そもそも候補にならない履歴」ではない)。
+    let included = detect_missing_cochanges(
+        &service,
+        repo_path,
+        &changed_files,
+        0.0,
+        REVIEW_COCHANGE_MIN_SAMPLES,
+        Some("HEAD~1"),
+        true,
+    )
+    .expect("detect_missing_cochanges should succeed")
+    .missing;
+    assert!(
+        included.iter().any(|m| m.file == "out/summary.yaml"),
+        "include_generated では review 経由でも生成物が復元する。got: {included:?}"
+    );
+}
+
+/// 生成物の除外は**残存起点の分母を減らさない**。
+///
+/// 「生成物を取り除いたあと推薦候補が残らないコミット」を分母から消すと、推薦が
+/// 現れたコミットだけを条件にする選択バイアスになる (1/2 が 1/1 に化ける)。
+/// confidence は「選択された履歴内の共起比率」という定義を保つ。
+#[test]
+fn cochange_generated_exclusion_keeps_denominator_of_surviving_sources() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    // c1: source.py + generated.yaml (候補になる人手ソースは無い)
+    git_commit_files(
+        repo,
+        &[
+            ("source.py", "def f():\n    a = 0\n    b = 0\n"),
+            ("out/gen.yaml", "# @generated\nv: 0\n"),
+        ],
+        "c1",
+    );
+    // c2: source.py + test_source.py + generated.yaml
+    git_commit_files(
+        repo,
+        &[
+            ("source.py", "def f():\n    a = 1\n    b = 0\n"),
+            ("test_source.py", "def test_f():\n    pass\n"),
+            ("out/gen.yaml", "# @generated\nv: 1\n"),
+        ],
+        "c2",
+    );
+    // 起点となる変更 (c1 / c2 の両方で触った行を動かし、blame が両コミットに当たるようにする)
+    git_commit_files(
+        repo,
+        &[("source.py", "def f():\n    a = 2\n    b = 2\n")],
+        "hand-written change",
+    );
+
+    let service = AppService::new();
+    let repo_path = repo.to_str().expect("utf-8 path");
+    let opts = crate::models::cochange::CoChangeOptions {
+        base: Some("HEAD~1".to_string()),
+        ..generated_test_opts(&["source.py"])
+    };
+    let result = service
+        .analyze_cochange(repo_path, &opts)
+        .expect("analyze_cochange should succeed");
+
+    let entry = result
+        .entries
+        .iter()
+        .find(|e| e.file_b == "test_source.py")
+        .unwrap_or_else(|| panic!("test_source.py が候補に出るはず。got: {:?}", result.entries));
+    assert_eq!(entry.co_changes, 1, "共起は c2 の 1 回だけ。got: {entry:?}");
+    assert_eq!(
+        entry.denominator,
+        Some(2),
+        "生成物が同居していたことを理由に c1 を分母から消さない (1/2 が 1/1 に化けると選択バイアスになる)。got: {entry:?}"
+    );
+
+    // 対照: 生成物を除外しなくても分子・分母は同じ (除外は分母に影響しない)。
+    let inclusive = crate::models::cochange::CoChangeOptions {
+        include_generated: true,
+        ..opts.clone()
+    };
+    let inclusive_result = service
+        .analyze_cochange(repo_path, &inclusive)
+        .expect("analyze_cochange should succeed");
+    let inclusive_entry = inclusive_result
+        .entries
+        .iter()
+        .find(|e| e.file_b == "test_source.py")
+        .expect("test_source.py が候補に出るはず");
+    assert_eq!(
+        (inclusive_entry.co_changes, inclusive_entry.denominator),
+        (entry.co_changes, entry.denominator),
+        "生成物の除外は残存ペアの分子・分母を変えない"
+    );
 }

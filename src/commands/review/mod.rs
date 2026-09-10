@@ -47,6 +47,8 @@ pub struct CmdReviewOpts<'a> {
     pub dead_scope: crate::cli::DeadScope,
     pub strict_public_const_values: bool,
     pub include_wip_dead: bool,
+    /// 生成物を cochange の起点・候補に残すか (グローバル `--include-generated` の解決結果)。
+    pub include_generated: bool,
 }
 
 pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> {
@@ -69,6 +71,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
         dead_scope,
         strict_public_const_values,
         include_wip_dead,
+        include_generated,
     } = opts;
     // `--hook` の出力は Claude Code の Stop hook が消費する compact JSON 契約。
     // 明示的な `--format toon` は満たせないのでここで弾く (config 由来なら JSON に倒す)。
@@ -172,6 +175,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
             min_confidence,
             cochange_min_samples,
             Some(base),
+            include_generated,
         )
     })?;
 

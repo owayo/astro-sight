@@ -97,6 +97,13 @@ pub enum CoChangeDiagnosticReason {
     SourceFilesExceedLimit,
     /// 候補が base リビジョンに存在しない (過去に削除済み) ため除外した。
     CandidateDeletedAtBase,
+    /// 起点が生成物と判定されたため証拠収集を行わなかった。
+    SourceIsGenerated,
+    /// 候補が生成物と判定されたため除外した。
+    CandidateIsGenerated,
+    /// `git check-attr` に失敗し `linguist-generated` を参照できなかったため、
+    /// 生成物の除外を行わなかった (判定できないことを理由に候補を消さない)。
+    GeneratedAttrLookupFailed,
 }
 
 /// 共変更分析の内訳。`entries` が空のときに「共変更が無い」のか
@@ -132,6 +139,19 @@ pub struct CoChangeDiagnostics {
     /// 追加専用フィールドのため 0 のときは出力しない (既存 JSON 消費側への影響を避ける)。
     #[serde(default, skip_serializing_if = "crate::models::review::is_zero_usize")]
     pub filtered_deleted_candidates: usize,
+    /// 生成物と判定されたため証拠収集を行わなかった起点数。
+    ///
+    /// これらの起点は `sources_without_evidence` には数えない (証拠を作れなかったのでは
+    /// なく、意図的に作らなかったため)。
+    ///
+    /// 追加専用フィールドのため 0 のときは出力しない (既存 JSON 消費側への影響を避ける)。
+    #[serde(default, skip_serializing_if = "crate::models::review::is_zero_usize")]
+    pub excluded_generated_sources: usize,
+    /// 生成物と判定されたため落とした候補ペア数。
+    ///
+    /// 追加専用フィールドのため 0 のときは出力しない (既存 JSON 消費側への影響を避ける)。
+    #[serde(default, skip_serializing_if = "crate::models::review::is_zero_usize")]
+    pub filtered_generated_candidates: usize,
     /// 証拠コミットのうち `git diff-tree` に失敗して変更ファイルを取得できなかった数。
     ///
     /// 失敗コミットは「変更 0 件のコミット」として集計を続行する (= confidence の実効分母
@@ -209,6 +229,19 @@ pub struct CoChangeOptions {
     pub min_samples: usize,
     /// 候補ファイルから除外する glob パターン (BLAME_DEFAULT_EXCLUDE_GLOBS と OR で適用)。
     pub exclude_globs: Vec<String>,
+    /// 生成物 (`.gitattributes` の `linguist-generated` / ヘッダの生成マーカー) を
+    /// 起点・候補から除外しない。
+    ///
+    /// 既定 false = 除外する。バッチ処理やコード生成が同時に書き出すファイル群は履歴上
+    /// ほぼ必ず同一コミットに乗るため、「機械的な同時更新」が「意味的な依存関係」として
+    /// 高 confidence で提示されてしまう。生成物そのものの共変更履歴を調べたい場合だけ
+    /// true にする。
+    ///
+    /// **判定と除外対象は AST 解析側と独立**。あちらは「解析対象にしない」判断で、
+    /// こちらは「共変更の相手として提示しない」判断 (生成されたソースは AST の影響解析
+    /// からは外さない)。ただし**除外解除の指定は共有する** — CLI のグローバル
+    /// `--include-generated` と config.toml の `skip_generated` がそのまま効く。
+    pub include_generated: bool,
     /// 起点ファイル数の上限。0 = 無制限。超過時は InvalidRequest で停止する。
     ///
     /// 既定 500。`--git` の起点収集は `git diff <base>` (作業ツリー比較) なので、
@@ -271,6 +304,8 @@ impl Default for CoChangeOptions {
             min_score: 0.0,
             min_samples: 2,
             exclude_globs: Vec::new(),
+            // 生成物は既定で除外する。機械的な同時更新を意味的な共変更として出さない。
+            include_generated: false,
             // 暴走ガード。実レビューの diff (数十ファイル) には当たらない緩さで、
             // 作業ツリーが退化しているときの全件 blame だけを止める。
             max_source_files: 500,
