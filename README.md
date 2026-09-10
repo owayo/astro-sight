@@ -509,6 +509,16 @@ astro-sight review --dir . --git \
 
 依存宣言ファイル (`Cargo.toml` / `package.json` / `pyproject.toml` 等) とロックファイルは `missing_cochanges` の候補にしない。依存を追加するコミットではこれらとソースが必ず一緒に変わるため履歴相関が 100% になるが、その相関は「依存を追加したとき」限定で、import を 1 行も増減させない本体変更には因果が無い。単体の `cochange` コマンドは「過去に一緒に変更された」事実としてマニフェストを出し続ける (ロックファイルは生成物なので両方で除外)。
 
+**外部 snapshot と生成元テストの関係は方向付きで扱う。** snapshot を更新しただけの差分に対して「生成元テストも変更漏れでは」とは出さない (snapshot は被テスト対象の出力が変わったときにも更新されるので、テスト → snapshot の期待は成り立っても逆は成り立たない)。**逆方向は維持する** — テストを変更したのに snapshot が欠けている場合は従来どおり候補に出る。抑制するのは次をすべて満たすペアだけで、1 つでも確認できなければ従来どおり候補に残す:
+
+- snapshot の直上ディレクトリが正確に `__snapshots__` で、ファイル名末尾の `.snap` を 1 回だけ除いたパスが欠落候補と完全一致する (Jest / Vitest / Bun が共有する標準規約。`tests/__snapshots__/widget.test.tsx.snap` → `tests/widget.test.tsx`)
+- 生成元テストが実在する通常ファイルである
+- snapshot の**先頭行が既知のランナーヘッダと完全一致**する (`// Vitest Snapshot v1, …` など)。パス規約だけでは手書き fixture や別用途の `.snap` を巻き込むため、生成出力であることをファイル自身で確認する
+
+`.gitattributes` の `linguist-generated` とは判定経路が独立している (あちらは「生成物一般」の宣言で、指定すると両方向とも候補から消える)。カスタム snapshot resolver、inline snapshot、`.snap` 以外の形式は対象外で、いずれも従来どおり履歴相関の情報提供を維持する。グローバルの `--include-generated` を付けるとこの方向付けも無効化する。単体の `cochange` コマンドは探索的な用途なので方向付けしない。
+
+なお、これは「テスト変更が不要だと証明した」ものではない (期待値だけ更新して必要なテストロジックの変更を忘れることはある)。標準の生成関係にあるペアについて、履歴相関だけを根拠に逆方向の変更を要求しないという推薦方針。
+
 `api_changes.compatible_modified` には、シグネチャ文字列は変わるが既存呼び出しの互換性を保つ変更を出力する。React component の HOC ラップ、未参照 object member 削除、TS/TSX トップレベル関数の末尾 optional/default 引数追加 (`trailing_optional_params`)、Python トップレベル関数 / モジュール直下クラスメソッドの末尾 kwonly+default / 末尾 positional default 引数追加 (`trailing_optional_params`、デコレータ差分や同名関数複数定義は保守的に blocking 維持) は informational として扱い、`--hook` の blocking 対象にしない。同じシンボルに紐づく `impacts` も破壊的影響としては出さず、`mod_compat` の情報提供だけに留める。未参照 object member の判定では削除キーを 1 個ずつ全リポジトリ検索せず、Aho-Corasick で一括事前抽出して各 JS/TS ファイルを最大 1 回だけ parse する。ファイル収集・読み込み・parse の失敗時は互換扱いへ降格せず、従来どおり blocking を維持する。
 
 Python の公開型契約を方向付きで分類できる変更には、`api_changes.modified[].contract_change`（hook では `api.mod[].contract`）として `{kind, breaks}` を付ける。`TypedDict` の必須性変更に加え、モジュール直下の直接的な `Literal` 型エイリアスについて、値集合の縮小を `literal_values_narrowed`（producer 側が破壊）、拡大を `literal_values_widened`（consumer 側が破壊）として報告する。`Literal` は `typing` / `typing_extensions` 由来と証明でき、値が escape / prefix を含まない文字列・10 進整数・真偽値・`None` だけの場合に限る。値の置換、動的な `__all__`、名前の shadow、star import など意味を静的に確定できない場合は方向を推測せず、通常の blocking な `api.mod` に残す。テストファイルは既存の公開 API 面規約どおり検出対象外。型エイリアスの項目は `kind = "type"` の疑似シンボルであり、`symbols` / `refs` / `dead-code` の解析対象には追加しない。

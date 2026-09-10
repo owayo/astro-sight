@@ -1809,3 +1809,207 @@ fn cochange_generated_exclusion_keeps_denominator_of_surviving_sources() {
         "生成物の除外は残存ペアの分子・分母を変えない"
     );
 }
+
+// ------------------------------------------------------------------
+// snapshot → 生成元テストの方向付け
+// ------------------------------------------------------------------
+
+/// Jest / Vitest / Bun が共有する `__snapshots__` 規約のヘッダ。
+const VITEST_SNAPSHOT_HEADER: &str =
+    "// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html";
+
+/// 実装・テスト・snapshot が毎回一緒に変わる履歴を作る。
+///
+/// `min_samples` (review 既定 3) を満たすだけの共変更回数が要る。
+fn init_snapshot_cochange_repo(repo: &std::path::Path) {
+    init_git_repo_for_test(repo);
+    for i in 0..4 {
+        git_commit_files(
+            repo,
+            &[
+                ("ui/widget.tsx", &snapshot_widget_src(i)),
+                ("tests/widget.test.tsx", &snapshot_widget_test(i)),
+                (
+                    "tests/__snapshots__/widget.test.tsx.snap",
+                    &snapshot_widget_snap(i),
+                ),
+            ],
+            &format!("feat: widget {i}"),
+        );
+    }
+}
+
+fn snapshot_widget_src(n: usize) -> String {
+    format!("export function Widget() {{\n  return {n};\n}}\n")
+}
+
+fn snapshot_widget_test(n: usize) -> String {
+    format!("test('widget {n}', () => {{\n  expect(Widget()).toMatchSnapshot();\n}});\n")
+}
+
+fn snapshot_widget_snap(n: usize) -> String {
+    format!("{VITEST_SNAPSHOT_HEADER}\n\nexports[`widget {n} 1`] = `{n}`;\n")
+}
+
+/// snapshot → 生成元テストの方向だけを推薦から外すことを、逆方向・対照ペア・明示的な解除の
+/// 3 つの対照と**同じ履歴**で固定する。
+///
+/// 「候補に出ない」だけの assertion では、履歴の作り方を誤って**そもそも何も検出されていない**
+/// テストが素通りする。同じ実行で別の正当な候補が出ることまで確認する。
+#[test]
+fn detect_missing_cochanges_suppresses_snapshot_to_source_test_direction() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_snapshot_cochange_repo(repo);
+
+    let service = AppService::new();
+    let repo_path = repo.to_str().expect("utf-8 path");
+
+    // (1) snapshot だけを更新した差分 = 期待値の更新。テストロジックは触っていない。
+    fs::write(
+        repo.join("tests/__snapshots__/widget.test.tsx.snap"),
+        snapshot_widget_snap(99),
+    )
+    .expect("write snapshot");
+    let mut changed = HashSet::new();
+    changed.insert("tests/__snapshots__/widget.test.tsx.snap".to_string());
+
+    let missing = detect_missing_cochanges(
+        &service,
+        repo_path,
+        &changed,
+        0.0,
+        REVIEW_COCHANGE_MIN_SAMPLES,
+        None,
+        false,
+    )
+    .expect("detect_missing_cochanges should succeed")
+    .missing;
+
+    assert!(
+        missing.iter().all(|m| m.file != "tests/widget.test.tsx"),
+        "snapshot の更新だけで生成元テストの変更を要求してはならない。got: {missing:?}"
+    );
+    assert!(
+        missing.iter().any(|m| m.file == "ui/widget.tsx"),
+        "同じ履歴・同じ起点で実装ファイルは候補に残る (抑制が広すぎないことの対照)。got: {missing:?}"
+    );
+
+    // (2) 明示的な解除: `--include-generated` 相当なら従来どおり生成元テストも候補に出る。
+    let inclusive = detect_missing_cochanges(
+        &service,
+        repo_path,
+        &changed,
+        0.0,
+        REVIEW_COCHANGE_MIN_SAMPLES,
+        None,
+        true,
+    )
+    .expect("detect_missing_cochanges should succeed")
+    .missing;
+    assert!(
+        inclusive.iter().any(|m| m.file == "tests/widget.test.tsx"),
+        "include_generated では方向付けを無効化する。got: {inclusive:?}"
+    );
+
+    // (3) 逆方向: テストを変更したのに snapshot が欠けている場合は候補に残す。
+    fs::write(
+        repo.join("tests/__snapshots__/widget.test.tsx.snap"),
+        snapshot_widget_snap(3),
+    )
+    .expect("restore snapshot");
+    fs::write(repo.join("tests/widget.test.tsx"), snapshot_widget_test(99)).expect("write test");
+    let mut changed_test = HashSet::new();
+    changed_test.insert("tests/widget.test.tsx".to_string());
+
+    let reverse = detect_missing_cochanges(
+        &service,
+        repo_path,
+        &changed_test,
+        0.0,
+        REVIEW_COCHANGE_MIN_SAMPLES,
+        None,
+        false,
+    )
+    .expect("detect_missing_cochanges should succeed")
+    .missing;
+    assert!(
+        reverse
+            .iter()
+            .any(|m| m.file == "tests/__snapshots__/widget.test.tsx.snap"),
+        "テスト → snapshot の方向は維持する (snapshot の更新漏れは検出したい)。got: {reverse:?}"
+    );
+}
+
+/// 抑制を**重複排除より前**に行うことを固定する。
+///
+/// `insert_best_missing` は欠落ファイルごとに最良の 1 ペアだけを残すので、選択後に落とすと
+/// 「snapshot 由来のペアが最良として選ばれていた」場合に、同じテストへの**別の正当な**
+/// 候補 (実装ファイル由来) まで一緒に消える。
+#[test]
+fn detect_missing_cochanges_keeps_other_valid_pair_for_the_same_missing_test() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_snapshot_cochange_repo(repo);
+
+    // snapshot と実装の両方を変更し、テストだけ触っていない差分。
+    fs::write(repo.join("ui/widget.tsx"), snapshot_widget_src(99)).expect("write src");
+    fs::write(
+        repo.join("tests/__snapshots__/widget.test.tsx.snap"),
+        snapshot_widget_snap(99),
+    )
+    .expect("write snapshot");
+
+    let mut changed = HashSet::new();
+    changed.insert("ui/widget.tsx".to_string());
+    changed.insert("tests/__snapshots__/widget.test.tsx.snap".to_string());
+
+    let service = AppService::new();
+    let repo_path = repo.to_str().expect("utf-8 path");
+
+    // 前提の固定: 抑制しなければ **snapshot ペアの方が最良**として選ばれる。
+    // この前提が崩れると (ランキングや tie-break の変更で実装ファイル側が勝つと)、
+    // 抑制を重複排除の後に置いても下の assertion が通ってしまい、テストが空振りする。
+    let inclusive = detect_missing_cochanges(
+        &service,
+        repo_path,
+        &changed,
+        0.0,
+        REVIEW_COCHANGE_MIN_SAMPLES,
+        None,
+        true,
+    )
+    .expect("detect_missing_cochanges should succeed")
+    .missing;
+    let inclusive_entry = inclusive
+        .iter()
+        .find(|m| m.file == "tests/widget.test.tsx")
+        .expect("include_generated では候補に出るはず");
+    assert_eq!(
+        inclusive_entry.expected_with, "tests/__snapshots__/widget.test.tsx.snap",
+        "前提: 抑制しなければ snapshot ペアが最良として選ばれる \
+         (この前提が崩れると本題の assertion が空振りする)。got: {inclusive_entry:?}"
+    );
+
+    // 本題: snapshot ペアを抑制しても、実装ファイル由来の別の正当な候補は残る。
+    let missing = detect_missing_cochanges(
+        &service,
+        repo_path,
+        &changed,
+        0.0,
+        REVIEW_COCHANGE_MIN_SAMPLES,
+        None,
+        false,
+    )
+    .expect("detect_missing_cochanges should succeed")
+    .missing;
+
+    let test_entry = missing
+        .iter()
+        .find(|m| m.file == "tests/widget.test.tsx")
+        .expect("実装ファイル由来の候補は残るはず (snapshot ペアの抑制で消してはならない)");
+    assert_eq!(
+        test_entry.expected_with, "ui/widget.tsx",
+        "残るのは snapshot ではない側のペア。got: {test_entry:?}"
+    );
+}

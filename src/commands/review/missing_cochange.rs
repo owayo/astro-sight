@@ -98,12 +98,13 @@ fn is_nearest_declaration(
     false
 }
 
-/// shebang 行の読み込み上限 (バイト)。
+/// ファイル先頭の読み込み上限 (バイト)。shebang 判定と snapshot ヘッダ判定で共有する。
 ///
 /// 改行までいくらでも読むと、改行を含まない巨大ファイル (minified bundle / バイナリ相当の
-/// 生成物) を掴んだときにメモリを大きく食う。shebang は `#!/usr/bin/env python3` 程度なので
+/// 生成物) を掴んだときにメモリを大きく食う。shebang は `#!/usr/bin/env python3` 程度、
+/// snapshot ヘッダも `// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html` 程度なので
 /// 256 バイトで十分。
-const SHEBANG_PROBE_BYTES: u64 = 256;
+const FILE_HEAD_PROBE_BYTES: u64 = 256;
 
 /// ソースファイルの言語を解決する。拡張子で決まらない場合だけ先頭の shebang を見る。
 ///
@@ -137,7 +138,7 @@ fn resolve_source_lang(dir: &str, source: &str) -> Option<crate::language::LangI
     crate::language::LangId::from_shebang(first_line.trim_end())
 }
 
-/// shebang 判定用に先頭バイト列を読む。
+/// 先頭バイト列を読む (shebang 判定 / snapshot ヘッダ判定で共有)。
 ///
 /// **open と検証を一体化する**のが要点。`symlink_metadata` で確認してから `File::open` すると
 /// その間に通常ファイルを symlink / FIFO へ差し替えられ、open がパスを再解決してしまう
@@ -178,7 +179,9 @@ fn read_probe_head(path: &std::path::Path) -> Option<Vec<u8>> {
         return None;
     }
     let mut head = Vec::new();
-    file.take(SHEBANG_PROBE_BYTES).read_to_end(&mut head).ok()?;
+    file.take(FILE_HEAD_PROBE_BYTES)
+        .read_to_end(&mut head)
+        .ok()?;
     Some(head)
 }
 
@@ -192,6 +195,117 @@ pub(crate) fn resolve_source_lang_for_test(
     source: &str,
 ) -> Option<crate::language::LangId> {
     resolve_source_lang(dir, source)
+}
+
+/// 外部 snapshot ファイルの先頭行として認める既知のヘッダ。
+///
+/// **部分一致では判定しない**。`Snapshot` の語を含むだけの手書き fixture や、snapshot 以外の
+/// 用途で `.snap` を使うファイルまで巻き込むと、本物の暗黙の結合を消してしまう。既知のランナーが
+/// 実際に書き出す行と完全一致した場合だけ「生成出力」と認める。
+///
+/// 未知のランナー・将来のバージョン・URL 変更はここに載らないので抑制されない
+/// ＝従来どおり候補として出る (安全側)。
+const SNAPSHOT_FILE_HEADERS: &[&str] = &[
+    // Jest。v1 の案内 URL は短縮 URL 時代と現行ドキュメントの 2 種がある。
+    "// Jest Snapshot v1, https://goo.gl/fbAQLP",
+    "// Jest Snapshot v1, https://jestjs.io/docs/snapshot-testing",
+    // Vitest
+    "// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html",
+    // Bun。Jest 互換 API で `__snapshots__` 規約も同じ。
+    "// Bun Snapshot v1, https://bun.sh/docs/test/snapshots",
+];
+
+/// 外部 snapshot のパスから、それを生成したテストファイルのパスを導出する。
+///
+/// Jest / Vitest / Bun が共有する標準規約は「テストファイルと同じディレクトリの
+/// `__snapshots__/` へ、**テストファイル名そのまま** + `.snap` で書き出す」。
+///
+/// ```text
+/// tests/__snapshots__/widget.test.tsx.snap  →  tests/widget.test.tsx
+/// ```
+///
+/// snapshot 名が元の拡張子まで含むため `widget.test.ts` と `widget.test.tsx` が併存しても
+/// 曖昧にならない。拡張子を取り替えて探索したり別ディレクトリを走査したりはしない
+/// (規約から一意に決まるものだけを扱う)。
+///
+/// 規約に合わないパスは `None` = 「方向付けしない」に倒す。
+fn snapshot_source_test_path(snapshot: &str) -> Option<String> {
+    let path = camino::Utf8Path::new(snapshot);
+    // `.snap` は 1 回だけ剥がす。`x.snap.snap` の内側までは辿らない。
+    let stem = path.file_name()?.strip_suffix(".snap")?;
+    if stem.is_empty() {
+        return None;
+    }
+    let snapshots_dir = path.parent()?;
+    if snapshots_dir.file_name()? != "__snapshots__" {
+        return None;
+    }
+    let test_dir = snapshots_dir.parent()?;
+    // cochange のパスは git 由来の `/` 区切り正規形なので、`Utf8Path::join` ではなく `/` で連結する
+    // (`join` は Windows で `\` を挿入するため、導出パスが欠落候補と一致せず抑制が効かなくなる)。
+    // `__snapshots__` がワークスペース直下なら親は空パスになり、stem そのものになる。
+    Some(if test_dir.as_str().is_empty() {
+        stem.to_string()
+    } else {
+        format!("{}/{stem}", test_dir.as_str())
+    })
+}
+
+/// 先頭バイト列の 1 行目が既知の snapshot ヘッダと完全一致するか。
+///
+/// 改行が見つからない場合は認めない — 読み込み上限で行が途切れた可能性があり
+/// 「先頭行がヘッダと一致した」と言えないため (判定不能は抑制しない側に倒す)。
+fn head_is_snapshot_file(head: &[u8]) -> bool {
+    let Some(line_end) = head.iter().position(|&b| b == b'\n') else {
+        return false;
+    };
+    let mut line = &head[..line_end];
+    // CRLF で書き出された snapshot も同じ 1 行として扱う。
+    if line.last() == Some(&b'\r') {
+        line = &line[..line.len() - 1];
+    }
+    let Ok(text) = std::str::from_utf8(line) else {
+        return false;
+    };
+    SNAPSHOT_FILE_HEADERS.contains(&text)
+}
+
+/// 「欠落側 = 生成元テスト / diff にある側 = その snapshot」の関係が標準規約で一意に確定するか。
+/// true なら missing_cochange の推薦から外す。
+///
+/// snapshot は被テスト対象の出力が変わったときにも更新されるので、テストと snapshot の履歴相関は
+/// **双方向ではない**。テストを変えたら snapshot も更新するのが普通だが、snapshot を更新したから
+/// といってテストを変える必要はない。履歴頻度だけを根拠に逆方向の変更漏れを要求すると、
+/// 期待値を更新するたびに同じ誤検出が出る。
+///
+/// これは「テスト変更が不要だと証明した」わけではない (期待値だけ更新して必要なテストロジックの
+/// 変更を忘れることはある)。**標準の生成関係にあるペアについて、履歴相関だけでは逆方向の変更要求を
+/// 出さない**という推薦方針にすぎない。
+///
+/// `.gitattributes` の `linguist-generated` は見ない。あちらは「生成物一般」の宣言で、除外すると
+/// 両方向とも候補から消える。ここは実ファイルのヘッダで生成出力を確認したうえで**方向だけ**を
+/// 付けるので、判定経路が独立している。
+///
+/// **判定不能はすべて `false` を返し、既存の missing 候補を残す。** 読み込み失敗・非通常ファイル・
+/// 未知のヘッダ・規約に合わないパスがこれに当たる。
+fn is_snapshot_generated_from(dir: &str, source_test: &str, snapshot: &str) -> bool {
+    let Some(derived) = snapshot_source_test_path(snapshot) else {
+        return false;
+    };
+    if derived != source_test {
+        return false;
+    }
+    // 生成元テストが実在する通常ファイルであること。過去リビジョンから読み戻してまでは
+    // 確認しない — 削除済みのテストに対して抑制すると、消し忘れた snapshot の検出まで消える。
+    if read_probe_head(&std::path::Path::new(dir).join(source_test)).is_none() {
+        return false;
+    }
+    // パス規約だけでは手書き fixture や別用途の `.snap` を巻き込むため、生成出力であることを
+    // ファイル自身のヘッダで確認する。
+    let Some(head) = read_probe_head(&std::path::Path::new(dir).join(snapshot)) else {
+        return false;
+    };
+    head_is_snapshot_file(&head)
 }
 
 /// review の missing_cochanges が要求する既定の最小共変更回数。
@@ -394,6 +508,22 @@ pub(crate) fn detect_missing_cochanges(
         };
 
         if let Some(candidate) = candidate {
+            // snapshot → 生成元テストの方向だけ推薦から外す。
+            //
+            // **重複排除より前に判定する**のが要点。`insert_best_missing` は欠落ファイルごとに
+            // 最良の 1 ペアだけを残すので、選択後に落とすと同じテストについて別の変更ファイルから
+            // 得られた正当な候補まで失われる。
+            //
+            // 逆方向 (テストを変更したのに snapshot が欠けている) では `expected_with` が snapshot の
+            // 規約を満たさないため述語は false を返し、従来どおり候補に残る。
+            //
+            // `--include-generated` (config の `skip_generated = false`) は「生成物を特別扱いしない」
+            // という利用者の意図なので、この方向付けも無効化する＝解除手段を cochange 側と揃える。
+            if !include_generated
+                && is_snapshot_generated_from(dir, &candidate.file, &candidate.expected_with)
+            {
+                continue;
+            }
             insert_best_missing(
                 &mut best,
                 RankedMissingCochange::new(candidate, entry, smoothing_on),
@@ -454,5 +584,194 @@ mod tests {
 
         assert_eq!(ranked[0].item.expected_with, "stable.rs");
         assert_eq!(ranked[1].item.file, "another.rs");
+    }
+
+    /// snapshot パスから生成元テストを導出できる条件を、規約に合う形と合わない形の
+    /// **対照**で固定する。取りこぼし (None) は「方向付けしない = 従来どおり候補に出る」
+    /// なので安全側だが、規約外のパスから誤って導出すると本物の共変更を消す。
+    #[test]
+    fn snapshot_source_test_path_resolves_only_the_standard_convention() {
+        // 規約どおり: テストファイル名そのまま + `.snap` が同階層の `__snapshots__` にある
+        assert_eq!(
+            snapshot_source_test_path("tests/__snapshots__/widget.test.tsx.snap").as_deref(),
+            Some("tests/widget.test.tsx")
+        );
+        // snapshot 名が元の拡張子まで含むので `.ts` と `.tsx` は衝突しない
+        assert_eq!(
+            snapshot_source_test_path("tests/__snapshots__/widget.test.ts.snap").as_deref(),
+            Some("tests/widget.test.ts")
+        );
+        // ワークスペース直下の `__snapshots__` でも親が空パスになるだけ
+        assert_eq!(
+            snapshot_source_test_path("__snapshots__/a-test.jsx.snap").as_deref(),
+            Some("a-test.jsx")
+        );
+        // 深い階層でもディレクトリはそのまま保つ (別ディレクトリの同名は導出しない)
+        assert_eq!(
+            snapshot_source_test_path("src/ui/__snapshots__/card.test.tsx.snap").as_deref(),
+            Some("src/ui/card.test.tsx")
+        );
+
+        // 対照: 規約から外れるものは導出しない
+        assert_eq!(
+            snapshot_source_test_path("tests/widget.test.tsx.snap"),
+            None,
+            "`__snapshots__` 配下でない `.snap` は対象外"
+        );
+        assert_eq!(
+            snapshot_source_test_path("tests/__snapshots__/widget.test.tsx"),
+            None,
+            "`.snap` で終わらないファイルは対象外"
+        );
+        assert_eq!(
+            snapshot_source_test_path("tests/snapshots/widget.test.tsx.snap"),
+            None,
+            "ディレクトリ名が正確に `__snapshots__` でなければ対象外"
+        );
+        assert_eq!(
+            snapshot_source_test_path("tests/__snapshots__/nested/widget.test.tsx.snap"),
+            None,
+            "直上ディレクトリが `__snapshots__` でなければ対象外"
+        );
+        assert_eq!(
+            snapshot_source_test_path("tests/__snapshots__/.snap"),
+            None,
+            "剥がした結果が空になるパスは対象外"
+        );
+        // `.snap` は 1 回だけ剥がす (繰り返し除去への退行を防ぐ)。導出先 `tests/x.snap` が
+        // 実在しなければ `is_snapshot_generated_from` 側で抑制対象から外れる。
+        assert_eq!(
+            snapshot_source_test_path("tests/__snapshots__/x.snap.snap").as_deref(),
+            Some("tests/x.snap")
+        );
+    }
+
+    /// ヘッダ照合が**完全一致**であることを、既知・未知・部分一致の対照で固定する。
+    ///
+    /// 部分一致で通すと、`Snapshot` の語を含むだけの手書き fixture を生成物と誤認して
+    /// 本物の共変更を消してしまう。
+    #[test]
+    fn head_is_snapshot_file_requires_an_exact_known_header() {
+        for header in SNAPSHOT_FILE_HEADERS {
+            let head = format!("{header}\n\nexports[`x 1`] = `y`;\n");
+            assert!(
+                head_is_snapshot_file(head.as_bytes()),
+                "既知ヘッダは認定する: {header}"
+            );
+            // CRLF で書き出された snapshot も同じ 1 行として扱う
+            let crlf = format!("{header}\r\n\r\nexports[`x 1`] = `y`;\r\n");
+            assert!(
+                head_is_snapshot_file(crlf.as_bytes()),
+                "CRLF でも認定する: {header}"
+            );
+        }
+
+        // 対照: 認定してはいけないもの
+        assert!(
+            !head_is_snapshot_file(b"// Jest Snapshot v2, https://goo.gl/fbAQLP\n"),
+            "未知のバージョンは認定しない (従来どおり候補に出る)"
+        );
+        assert!(
+            !head_is_snapshot_file(b"// Some Snapshot of the old layout\n"),
+            "`Snapshot` を含むだけの手書きコメントは認定しない"
+        );
+        assert!(
+            !head_is_snapshot_file(b"# fixture\n// Jest Snapshot v1, https://goo.gl/fbAQLP\n"),
+            "2 行目以降にヘッダがあっても認定しない"
+        );
+        assert!(
+            !head_is_snapshot_file(b"// Jest Snapshot v1, https://goo.gl/fbAQLP"),
+            "改行が無い = 読み込み上限で途切れた可能性があるので認定しない"
+        );
+        assert!(
+            !head_is_snapshot_file(b"// Jest Snapshot v1, https://goo.gl/fbAQLP extra\n"),
+            "前方一致では認定しない"
+        );
+        assert!(!head_is_snapshot_file(b""), "空ファイルは認定しない");
+        assert!(
+            !head_is_snapshot_file(&[0xff, 0xfe, b'\n']),
+            "不正 UTF-8 は認定しない"
+        );
+    }
+
+    /// `is_snapshot_generated_from` の積 (パス規約 × 生成元の実在 × ヘッダ) を、
+    /// 1 つずつ崩した対照で固定する。判定不能はすべて false = 候補を残す。
+    #[test]
+    fn is_snapshot_generated_from_requires_path_existing_source_and_header() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        let dir_str = dir.to_str().expect("utf-8 path");
+        let header = "// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html";
+
+        std::fs::create_dir_all(dir.join("tests/__snapshots__")).expect("mkdir");
+        std::fs::write(dir.join("tests/widget.test.tsx"), "test('x', () => {});\n").expect("write");
+        std::fs::write(
+            dir.join("tests/__snapshots__/widget.test.tsx.snap"),
+            format!("{header}\n\nexports[`x 1`] = `<div />`;\n"),
+        )
+        .expect("write");
+
+        assert!(
+            is_snapshot_generated_from(
+                dir_str,
+                "tests/widget.test.tsx",
+                "tests/__snapshots__/widget.test.tsx.snap"
+            ),
+            "パス規約・生成元の実在・ヘッダが揃えば抑制対象"
+        );
+
+        // 対照 1: 方向が逆 (欠落側が snapshot) なら抑制しない
+        assert!(
+            !is_snapshot_generated_from(
+                dir_str,
+                "tests/__snapshots__/widget.test.tsx.snap",
+                "tests/widget.test.tsx"
+            ),
+            "テスト → snapshot の方向は維持する"
+        );
+
+        // 対照 2: 別ディレクトリの同名テストへは対応付けない
+        std::fs::create_dir_all(dir.join("other")).expect("mkdir");
+        std::fs::write(dir.join("other/widget.test.tsx"), "test('x', () => {});\n").expect("write");
+        assert!(
+            !is_snapshot_generated_from(
+                dir_str,
+                "other/widget.test.tsx",
+                "tests/__snapshots__/widget.test.tsx.snap"
+            ),
+            "導出先と欠落候補のディレクトリが違えば抑制しない"
+        );
+
+        // 対照 3: ヘッダの無い `.snap` (手書き fixture) は抑制しない
+        std::fs::create_dir_all(dir.join("fixtures/__snapshots__")).expect("mkdir");
+        std::fs::write(dir.join("fixtures/data.test.ts"), "test('y', () => {});\n").expect("write");
+        std::fs::write(
+            dir.join("fixtures/__snapshots__/data.test.ts.snap"),
+            "hand written fixture\n",
+        )
+        .expect("write");
+        assert!(
+            !is_snapshot_generated_from(
+                dir_str,
+                "fixtures/data.test.ts",
+                "fixtures/__snapshots__/data.test.ts.snap"
+            ),
+            "同じパス規約でもヘッダが無ければ抑制しない"
+        );
+
+        // 対照 4: 生成元テストが実在しなければ抑制しない
+        std::fs::write(
+            dir.join("tests/__snapshots__/removed.test.tsx.snap"),
+            format!("{header}\n\nexports[`x 1`] = `<div />`;\n"),
+        )
+        .expect("write");
+        assert!(
+            !is_snapshot_generated_from(
+                dir_str,
+                "tests/removed.test.tsx",
+                "tests/__snapshots__/removed.test.tsx.snap"
+            ),
+            "生成元テストが実在しなければ抑制しない (消し忘れ snapshot の検出を消さない)"
+        );
     }
 }

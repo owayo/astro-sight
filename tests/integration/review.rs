@@ -1374,3 +1374,72 @@ fn review_git_hook_stays_silent_without_truncations() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// Issue 2026-08-19-snapshot-directional-cochange: snapshot の期待値だけを更新した差分に対して
+/// 生成元テストの変更を要求しないことを CLI 全体 (通常 JSON 出力) で固定する。
+///
+/// snapshot は被テスト対象の出力が変わったときにも更新されるので、テストと snapshot の履歴相関は
+/// 双方向ではない。テストを変えたら snapshot も更新するが、逆は成り立たない。
+///
+/// 対照を同じ履歴に内蔵する — 実装ファイルは候補に残ること (抑制が広すぎない)、
+/// `--include-generated` では従来どおり出ること (解除手段がある) を同時に確認する。
+#[test]
+fn review_cochange_omits_source_test_for_snapshot_only_update() {
+    let repo = TestRepo::new();
+    repo.init_git();
+
+    const SNAPSHOT_HEADER: &str = "// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html";
+    let widget_of = |n: usize| format!("export function Widget() {{\n  return {n};\n}}\n");
+    let test_of = |n: usize| {
+        format!("test('widget {n}', () => {{\n  expect(Widget()).toMatchSnapshot();\n}});\n")
+    };
+    let snap_of = |n: usize| format!("{SNAPSHOT_HEADER}\n\nexports[`widget {n} 1`] = `{n}`;\n");
+
+    repo.create_dir_all("ui");
+    repo.create_dir_all("tests/__snapshots__");
+
+    // 実装・テスト・snapshot が毎回一緒に変わる履歴。
+    for i in 0..4 {
+        repo.write("ui/widget.tsx", widget_of(i));
+        repo.write("tests/widget.test.tsx", test_of(i));
+        repo.write("tests/__snapshots__/widget.test.tsx.snap", snap_of(i));
+        repo.commit_all(&format!("feat: widget {i}"));
+    }
+
+    // 未コミット: snapshot の期待値だけを更新する。
+    repo.write("tests/__snapshots__/widget.test.tsx.snap", snap_of(99));
+
+    let root = repo.root().to_str().expect("utf-8 path").to_string();
+    let files_from = |extra: &[&str]| -> Vec<String> {
+        let mut args = vec!["review", "--dir", root.as_str(), "--git"];
+        args.extend_from_slice(extra);
+        let output = cargo_bin().args(&args).output().expect("run review");
+        assert!(output.status.success(), "review should exit 0");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("review JSON");
+        json["missing_cochanges"]
+            .as_array()
+            .expect("missing_cochanges array")
+            .iter()
+            .map(|m| m["file"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+
+    let files = files_from(&[]);
+    assert!(
+        !files.iter().any(|f| f == "tests/widget.test.tsx"),
+        "snapshot の更新だけで生成元テストの変更を要求してはならない。got: {files:?}"
+    );
+    // 対照: 同じ起点でも実装ファイルは候補に残る (抑制が広すぎないことの確認)
+    assert!(
+        files.iter().any(|f| f == "ui/widget.tsx"),
+        "実装ファイルとの共変更は引き続き検出されるべき。got: {files:?}"
+    );
+
+    // 対照: 明示的な解除では従来どおり生成元テストも出る
+    let inclusive = files_from(&["--include-generated"]);
+    assert!(
+        inclusive.iter().any(|f| f == "tests/widget.test.tsx"),
+        "--include-generated では方向付けを無効化する。got: {inclusive:?}"
+    );
+}
