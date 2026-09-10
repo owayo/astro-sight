@@ -47,6 +47,31 @@ fn tree_sitter_kotlin() -> *const std::ffi::c_void {
 }
 
 impl LangId {
+    /// tree-sitter バックエンドを持つ全言語。言語横断の契約テスト
+    /// (ノード名テーブルの実在検証など) が対象を取りこぼさないために持つ。
+    ///
+    /// lexer-only の Xojo は `ts_language()` が panic するため含めない。
+    /// variant 追加時は `ecosystem` などの網羅 match が先にコンパイルエラーになるので
+    /// その流れでここにも追加する (件数は `all_tree_sitter_lang_ids_are_listed` が固定する)。
+    pub const ALL_TREE_SITTER: &'static [Self] = &[
+        Self::Rust,
+        Self::C,
+        Self::Cpp,
+        Self::Python,
+        Self::Javascript,
+        Self::Typescript,
+        Self::Tsx,
+        Self::Go,
+        Self::Php,
+        Self::Java,
+        Self::Kotlin,
+        Self::Swift,
+        Self::CSharp,
+        Self::Bash,
+        Self::Ruby,
+        Self::Zig,
+    ];
+
     /// Detect language from file extension.
     pub fn from_path(path: &Utf8Path) -> Result<Self, AstroError> {
         let ext = path.extension().unwrap_or("").to_lowercase();

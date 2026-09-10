@@ -229,6 +229,24 @@ pub struct ResultSummary {
     /// `files` 自体を打ち切った場合の申告。
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub rollup_truncated: Option<RollupTruncation>,
+    /// 出力を最小まで絞っても `token_budget` に収まらなかったことの申告。
+    ///
+    /// 申告そのものに固定コスト (1 グループあたりのサマリ本体) があるため、
+    /// 名前数が多く予算が小さいと**表示件数を 0 にしても予算を超える**。
+    /// 旧実装はこの状態を無言で返しており、`refs --names` 10 個 /
+    /// `--token-budget 256` が「参照 0 件・予算の 5.2 倍」という最悪の出力になっていた。
+    /// 「No silent caps」の原則どおり、守れなかったことを明示する
+    /// (利用者は予算を上げる / 名前を減らす / `--glob` で絞る、のいずれかを選べる)。
+    ///
+    /// 省略が 1 件も起きなければサマリ自体を出さない既存契約は維持するため、
+    /// 「省略ゼロだが予算超過」のケースはここでは申告されない。
+    #[serde(skip_serializing_if = "is_false", default)]
+    pub budget_exceeded: bool,
+}
+
+/// `#[serde(skip_serializing_if)]` 用。`false` のときフィールドごと省く。
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// rollup の材料になれるレコード。

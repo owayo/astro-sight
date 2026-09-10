@@ -1431,21 +1431,32 @@ pub fn cmd_dead_code(opts: &CmdDeadCodeOpts<'_>) -> Result<()> {
         },
     };
 
-    let files: Vec<std::path::PathBuf> = if let Some(diff_files) = resolved_diff.files.as_ref() {
-        filter_diff_files_for_dead_code(
+    let (files, unanalyzable_truncations): (
+        Vec<std::path::PathBuf>,
+        Vec<crate::models::truncation::TruncationInfo>,
+    ) = if let Some(diff_files) = resolved_diff.files.as_ref() {
+        let files = filter_diff_files_for_dead_code(
             &canonical_dir,
             diff_files,
             &excludes,
             &combined_globs,
             glob,
-        )?
+        )?;
+        (files, Vec::new())
     } else {
-        crate::engine::refs::collect_files_with_excludes(
+        // ディレクトリ走査経路では「ソースだが解析できなかったファイル」も受け取る。
+        // 参照を数えられないまま dead と断定すると、`.vue` の `<script>` からしか
+        // 使われていない TS 関数のように**生きているシンボルを dead と報告する**
+        // (最悪方向の誤り)。件数を黙って落とさず truncations として申告する。
+        let collection = crate::engine::refs::collect_files_scan_with_excludes(
             &canonical_dir,
             glob,
             &excludes,
             &combined_globs,
-        )?
+            crate::engine::refs::FileScanOptions::default(),
+        )?;
+        let unanalyzable = collection.unanalyzable_truncations(&canonical_dir);
+        (collection.files, unanalyzable)
     };
 
     let scanned_files = files.len();
@@ -1462,13 +1473,16 @@ pub fn cmd_dead_code(opts: &CmdDeadCodeOpts<'_>) -> Result<()> {
         dead_symbols
     };
 
+    let mut truncations = resolved_diff.truncations;
+    truncations.extend(unanalyzable_truncations);
+
     let result = DeadCodeResult {
         dir: canonical_dir.to_string_lossy().to_string(),
         scanned_files,
         dead_symbols,
         test_only_symbols,
         skipped: None,
-        truncations: resolved_diff.truncations,
+        truncations,
     };
 
     let text = serialize_cli_document(&result, output)?;

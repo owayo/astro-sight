@@ -312,6 +312,19 @@ impl RefMatcher for IndexedMatcher<'_, '_> {
 /// 型レベルで宣言し、不要な sink (CountSink) では呼び出し側が LineIndex 構築を省ける。
 pub(crate) trait RawRefSink {
     const NEEDS_LINE_INDEX: bool;
+
+    /// Rust の「フィールド名位置」の識別子 (`obj.redact` / `pub redact: bool` /
+    /// `Cfg { redact: v }` / `let Cfg { redact: v }`) を参照集合から落とすか。
+    ///
+    /// 同名の関数への参照ではないことが構造的に確定するので、影響分析の
+    /// ノイズ源になる (Issue: 2026-05-21-redact-impact-triage)。一方
+    /// **`refs` の出力は「識別子の出現」を返す契約**なので落としてはならない。
+    /// 旧実装はこの除外を共有 walker の identifier ガードに置いていたため、
+    /// `refs --name <フィールド名>` が実出現に対して常に 0 件を返していた
+    /// (CLAUDE.md がエージェントに「0 件の AST クエリも解析結果なので Grep で
+    /// 追試するな」と指示している以上、最悪方向の契約違反になる)。
+    const EXCLUDES_NON_CALLABLE_FIELDS: bool;
+
     fn on_hit(&mut self, hit: RawRefHit<'_, '_>, env: &RefEnvironment<'_>);
 }
 
@@ -324,6 +337,9 @@ pub(crate) struct SymbolReferenceSink<'a> {
 
 impl RawRefSink for SymbolReferenceSink<'_> {
     const NEEDS_LINE_INDEX: bool = true;
+    // `refs` の出力面。識別子の出現をそのまま返す (ApiRefIndex も同経路だが、
+    // 参照を過大に数える方向は api.rm を blocking のまま残す保守側に倒れる)。
+    const EXCLUDES_NON_CALLABLE_FIELDS: bool = false;
 
     fn on_hit(&mut self, hit: RawRefHit<'_, '_>, env: &RefEnvironment<'_>) {
         let kind = Some(if hit.is_def {
@@ -368,6 +384,8 @@ pub(crate) struct VisitorAdapter<'v, V: RefVisitor> {
 
 impl<V: RefVisitor> RawRefSink for VisitorAdapter<'_, V> {
     const NEEDS_LINE_INDEX: bool = true;
+    // impact の caller 列挙。フィールドアクセスは「更新すべき呼び出し側」ではない。
+    const EXCLUDES_NON_CALLABLE_FIELDS: bool = true;
 
     fn on_hit(&mut self, hit: RawRefHit<'_, '_>, env: &RefEnvironment<'_>) {
         let context = env.line_context(hit.line);
@@ -406,6 +424,9 @@ pub(crate) struct CountSink<'a> {
 
 impl RawRefSink for CountSink<'_> {
     const NEEDS_LINE_INDEX: bool = false;
+    // dead-code の参照カウント。フィールド名位置は同名関数への参照ではないと
+    // 構造的に確定するので数えない (shorthand は述語から外したのでここでも残る)。
+    const EXCLUDES_NON_CALLABLE_FIELDS: bool = true;
 
     fn on_hit(&mut self, hit: RawRefHit<'_, '_>, _env: &RefEnvironment<'_>) {
         // Definition は count 対象外 (旧 count_identifier_refs の guard 相当)。
@@ -468,7 +489,9 @@ fn visit_ref_node<M: RefMatcher, S: RawRefSink>(
     if is_identifier_kind(node.kind())
         && let Ok(text) = node.utf8_text(source)
         && let Some(matches) = matcher.identifier_matches(node, text)
-        && !(lang_id == LangId::Rust && is_rust_struct_field_non_callable(node))
+        && !(S::EXCLUDES_NON_CALLABLE_FIELDS
+            && lang_id == LangId::Rust
+            && is_rust_struct_field_non_callable(node))
         // closure パラメータが同名を束縛していれば、その配下の識別子は外側シンボルの
         // 参照ではない (シャドーイング)。参照として数えると dead-code が fail-open する。
         && !(lang_id == LangId::Rust

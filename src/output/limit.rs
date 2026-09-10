@@ -59,7 +59,14 @@ where
     //    削減幅は必ず 1 件以上とるので、遅くとも shown == 0 で停止する。
     if let Some(budget) = limits.token_budget {
         for _ in 0..MAX_SHRINK_ITERATIONS {
-            let summary = build_summary(records, shown, limits, complete_input, capped_by_count);
+            let summary = build_summary(
+                records,
+                shown,
+                limits,
+                complete_input,
+                capped_by_count,
+                limits.token_budget,
+            );
             let text = render(shown, summary.as_ref())?;
             let size = estimated_tokens(&text);
             if size <= budget || shown == 0 {
@@ -73,7 +80,22 @@ where
         }
     }
 
-    let summary = build_summary(records, shown, limits, complete_input, capped_by_count);
+    let mut summary = build_summary(
+        records,
+        shown,
+        limits,
+        complete_input,
+        capped_by_count,
+        limits.token_budget,
+    );
+    // 最小まで絞っても予算に収まらなかったなら、そのことを申告する
+    // (無言で超過すると「予算どおりに返った」と読まれる)。
+    if let (Some(budget), Some(sum)) = (limits.token_budget, summary.as_mut()) {
+        let text = render(shown, Some(sum))?;
+        if estimated_tokens(&text) > budget {
+            sum.budget_exceeded = true;
+        }
+    }
     Ok((shown, summary))
 }
 
@@ -110,11 +132,25 @@ where
     // 「件数上限で切れたのか、呼び出し全体の予算でさらに切れたのか」を区別する基準線に使う。
     let count_only = round_robin_allocate(&counts, capped_by_count);
 
+    // rollup の採寸は「呼び出し全体の予算 ÷ グループ数」で行う。全体予算をそのまま
+    // 各グループへ渡すと rollup がグループ数だけ多重計上され、予算を大幅に超過する。
+    let per_group_rollup_budget = limits
+        .token_budget
+        .map(|b| (b / groups.len().max(1)).max(1));
     let summaries_for = |alloc: &[usize]| -> Vec<Option<ResultSummary>> {
         groups
             .iter()
             .enumerate()
-            .map(|(i, group)| build_summary(group, alloc[i], limits, complete_input, count_only[i]))
+            .map(|(i, group)| {
+                build_summary(
+                    group,
+                    alloc[i],
+                    limits,
+                    complete_input,
+                    count_only[i],
+                    per_group_rollup_budget,
+                )
+            })
             .collect()
     };
 
@@ -135,7 +171,17 @@ where
     }
 
     let alloc = round_robin_allocate(&counts, budget_slots);
-    let summaries = summaries_for(&alloc);
+    let mut summaries = summaries_for(&alloc);
+    // 予算に収まらなかったことは呼び出し全体の性質なので、出力される全サマリに
+    // 同じ値を立てる (NDJSON はグループごとに 1 行で、呼び出し全体を表す場所が無い)。
+    if let Some(budget) = limits.token_budget {
+        let text = render(&alloc, &summaries)?;
+        if estimated_tokens(&text) > budget {
+            for summary in summaries.iter_mut().flatten() {
+                summary.budget_exceeded = true;
+            }
+        }
+    }
     Ok((alloc, summaries))
 }
 
@@ -216,18 +262,27 @@ fn round_robin_allocate(counts: &[usize], budget: usize) -> Vec<usize> {
 }
 
 /// `shown` 件を出したときのサマリを組み立てる。省略が無ければ `None`。
+/// `limits` は**利用者が指定した値**として出力にそのまま載せる。一方 `rollup_budget` は
+/// 「このサマリ 1 個が rollup に使ってよい予算」で、バッチでは呼び出し全体の予算を
+/// グループ数で割った値が渡る。
+///
+/// 分けているのは、旧実装が rollup の採寸にも `limits.token_budget` (呼び出し全体の予算)
+/// を使っていたため、`refs --names` でグループ数だけ rollup が多重計上され、
+/// **参照 0 件・予算の 5 倍**という出力になっていたため (実測: 10 名前 /
+/// `--token-budget 256` で 1,331 tokens)。
 fn build_summary<T: RollupRecord>(
     records: &[T],
     shown: usize,
     limits: ResultLimits,
     complete_input: bool,
     capped_by_count: usize,
+    rollup_budget: Option<usize>,
 ) -> Option<ResultSummary> {
     let total = records.len();
     if shown >= total {
         return None;
     }
-    let rollup = build_rollup(&records[shown..], limits.token_budget);
+    let rollup = build_rollup(&records[shown..], rollup_budget);
 
     // どの上限が実際に効いたかを両方申告する。件数上限で切れた位置より更に下がって
     // いれば予算側も効いている。
@@ -245,6 +300,9 @@ fn build_summary<T: RollupRecord>(
     limited_by.sort();
 
     Some(ResultSummary {
+        // 予算超過の申告は呼び出し側 (apply_limits / apply_grouped_limits) が
+        // 最終描画を実測してから立てる。
+        budget_exceeded: false,
         shown,
         total,
         omitted: total - shown,
@@ -263,9 +321,9 @@ fn build_summary<T: RollupRecord>(
 mod tests {
     use super::*;
 
-    struct Rec {
-        path: String,
-        kind: &'static str,
+    pub(super) struct Rec {
+        pub(super) path: String,
+        pub(super) kind: &'static str,
     }
 
     impl RollupRecord for Rec {
@@ -277,7 +335,7 @@ mod tests {
         }
     }
 
-    fn recs(n: usize) -> Vec<Rec> {
+    pub(super) fn recs(n: usize) -> Vec<Rec> {
         (0..n)
             .map(|i| Rec {
                 path: format!("src/f{:03}.rs", i % 7),
@@ -290,10 +348,30 @@ mod tests {
     ///
     /// 予算判定は [`estimated_tokens`] (改行なしなら `文字数 / 3` の切り上げ) なので、
     /// 「1 トークン = 3 文字」で文字数を置く。
-    fn render_fixed(shown: usize, summary: Option<&ResultSummary>) -> Result<String> {
+    pub(super) fn render_fixed(shown: usize, summary: Option<&ResultSummary>) -> Result<String> {
         let mut s = "x".repeat(shown * 30);
         if summary.is_some() {
             s.push_str(&"y".repeat(150));
+        }
+        Ok(s)
+    }
+
+    /// グループ版の素朴な描画。`render_fixed` と同じ縮尺 (1 レコード = 10 トークン、
+    /// サマリ 1 個 = 50 トークン) で、rollup のパス長も実測に反映させる
+    /// (rollup 予算の分割が効いていることをテストから観測できるようにするため)。
+    pub(super) fn render_grouped_fixed(
+        alloc: &[usize],
+        summaries: &[Option<ResultSummary>],
+    ) -> Result<String> {
+        let mut s = String::new();
+        for (i, shown) in alloc.iter().enumerate() {
+            s.push_str(&"x".repeat(shown * 30));
+            if let Some(summary) = summaries.get(i).and_then(Option::as_ref) {
+                s.push_str(&"y".repeat(150));
+                for f in &summary.files {
+                    s.push_str(f.path.as_str());
+                }
+            }
         }
         Ok(s)
     }
@@ -395,5 +473,99 @@ mod tests {
             assert_eq!(first.0, again.0);
             assert_eq!(first.1, again.1);
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::tests::*;
+    use super::*;
+
+    /// 最小まで絞っても予算に収まらないとき、その事実を申告する。
+    ///
+    /// 申告そのものに固定コスト (サマリ本体) があるため、グループ数 × サマリが
+    /// 予算を超えると**表示件数を 0 にしても超過**する。旧実装はこれを無言で返し、
+    /// 実測で `refs --names` 10 個 / `--token-budget 256` が
+    /// 「参照 0 件・予算の 5.2 倍」になっていた。
+    #[test]
+    fn grouped_limits_declare_unmeetable_budget() {
+        let g0 = recs(50);
+        let g1 = recs(50);
+        let groups: Vec<&[Rec]> = vec![&g0, &g1];
+        // サマリ 1 個 = 50 トークン相当なので、2 グループでは予算 20 は原理的に不可能。
+        let limits = ResultLimits {
+            max_results: Some(100),
+            token_budget: Some(20),
+        };
+        let (alloc, summaries) =
+            apply_grouped_limits(&groups, limits, true, render_grouped_fixed).unwrap();
+
+        assert_eq!(alloc, vec![0, 0], "予算不足なので表示件数は 0 に落ちる");
+        for summary in summaries.iter().flatten() {
+            assert!(
+                summary.budget_exceeded,
+                "予算を守れなかったことを申告すべき: {summary:?}"
+            );
+        }
+        assert_eq!(
+            summaries.iter().flatten().count(),
+            2,
+            "両グループが申告する"
+        );
+    }
+
+    /// 対照: 予算内に収まるなら申告しない (出力が余計に膨らまない)。
+    #[test]
+    fn grouped_limits_do_not_declare_when_budget_is_met() {
+        let g0 = recs(50);
+        let g1 = recs(50);
+        let groups: Vec<&[Rec]> = vec![&g0, &g1];
+        let limits = ResultLimits {
+            max_results: Some(100),
+            token_budget: Some(400),
+        };
+        let (alloc, summaries) =
+            apply_grouped_limits(&groups, limits, true, render_grouped_fixed).unwrap();
+
+        assert!(alloc.iter().sum::<usize>() > 0, "予算内なら件数が出る");
+        for summary in summaries.iter().flatten() {
+            assert!(
+                !summary.budget_exceeded,
+                "予算を守れているので申告しない: {summary:?}"
+            );
+        }
+    }
+
+    /// rollup の採寸は「呼び出し全体の予算 ÷ グループ数」で行う。
+    ///
+    /// 旧実装は各グループの rollup にも呼び出し全体の予算を渡していたため、
+    /// グループ数だけ rollup が多重計上され予算を大幅に超えていた。
+    /// グループ数が増えても 1 グループあたりの rollup が膨らまないことを固定する。
+    #[test]
+    fn grouped_rollup_budget_is_divided_across_groups() {
+        let many: Vec<Rec> = (0..200)
+            .map(|i| Rec {
+                path: format!("src/dir{i:03}/file{i:03}.rs"),
+                kind: "ref",
+            })
+            .collect();
+        let limits = ResultLimits {
+            max_results: Some(0),
+            token_budget: Some(600),
+        };
+
+        let single: Vec<&[Rec]> = vec![&many];
+        let (_, one) = apply_grouped_limits(&single, limits, true, render_grouped_fixed).unwrap();
+        let one_files = one[0].as_ref().unwrap().files.len();
+
+        let eight: Vec<&[Rec]> = vec![&many; 8];
+        let (_, many_groups) =
+            apply_grouped_limits(&eight, limits, true, render_grouped_fixed).unwrap();
+        let each_files = many_groups[0].as_ref().unwrap().files.len();
+
+        assert!(
+            each_files < one_files,
+            "グループが増えたら 1 グループあたりの rollup は縮むべき: {each_files} < {one_files}"
+        );
     }
 }

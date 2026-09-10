@@ -486,6 +486,9 @@ pub(crate) fn build_review_hook_json(
                     crate::models::truncation::TruncationReason::UntrackedFileTooLarge => {
                         "untracked_file_too_large"
                     }
+                    crate::models::truncation::TruncationReason::UnanalyzableSource => {
+                        "unanalyzable_source"
+                    }
                 },
             })
             .collect();

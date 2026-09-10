@@ -26,7 +26,7 @@ use crate::models::skip::SkippedFiles;
 
 pub use files::{
     FileCollection, FileScanOptions, collect_files, collect_files_scan,
-    collect_files_with_excludes, merge_extra_files,
+    collect_files_scan_with_excludes, collect_files_with_excludes, merge_extra_files,
 };
 pub(crate) use line_index::{LineIndex, absolute_position, byte_offset_to_row_col};
 pub(crate) use role::RefUsageRole;

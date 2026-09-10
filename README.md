@@ -291,6 +291,7 @@ astro-sight refs --name "new" --dir . --max-results unlimited --token-budget unl
 - `--max-results` / `--token-budget` はいずれも `unlimited` を受ける。`--token-budget` の下限は 256（それ未満だとサマリ自体が収まらない）
 - `refs --names` の予算は**呼び出し全体で 1 つ**を round-robin で配分する。名前ごとに上限を課すと全体が名前数に比例して膨らみ、先頭から詰めると高頻度な 1 名が予算を食い尽くして後続が 0 件になる
 - 同じ上限は `session` の `max_results` / `token_budget`（数値または `"unlimited"`）と MCP の `refs_search` / `refs_batch_search` にも適用される
+- **守れなかった予算は申告する。** サマリ自体に固定コストがあるため、名前数が多く予算が小さいと表示件数を 0 にしても予算を超える。その場合は `result_summary.budget_exceeded: true` を出す（予算を上げる / 名前を減らす / `--glob` で絞る、のいずれかが要ることを示す）。`refs --names` の rollup は「呼び出し全体の予算 ÷ 名前数」で採寸するので、名前を増やしてもサマリが多重に膨らむことはない
 
 ```json
 {
@@ -450,6 +451,16 @@ tracked ファイルには適用しない。commit / add 済みは意図的に�
 ```
 
 `--hook` では `trunc: [{"f": "generated.rs", "r": "untracked_file_too_large"}]` として出力する（検出ではなく解析範囲の申告なので exit 1 にはしない）。`impact` は構造化 JSON を持たないため stderr の `note:` 行で出す。`--staged` / `--diff` / `--diff-file` は明示された範囲を尊重するため未追跡の取り込み自体を行わない。
+
+#### 解析できないソースの申告
+
+`dead-code` / `review` は、ディレクトリ内に存在するが**どのバックエンドでも解析できなかったソースファイル**も同じ `truncations` に出す。`.vue` の `<script>` からしか使われていない TypeScript 関数のように、読めないファイル内の参照を数えられないまま dead と断定すると**生きているシンボルを dead と報告してしまう**ため、「参照が無い」のか「観測できなかった」のかを利用者が区別できるようにする。
+
+```json
+{ "...": "...", "truncations": [{ "reason": "unanalyzable_source", "message": "1 \".vue\" file(s) were not analyzed (no parser for this language); references inside them are not counted (e.g. src/App.vue)" }] }
+```
+
+対象は**プログラム / テンプレート言語だと確実に言える拡張子**に限る（`.vue` / `.svelte` / `.astro` / `.erb` / `.razor` / `.scala` / `.dart` / `.lua` など）。走査対象外のファイルには画像・アーカイブ・データも含まれるため、全件を申告すると本当に見落としているソースがノイズに埋もれる。出力は拡張子単位に 1 件へ畳み、拡張子 10 種 / 代表パス 3 件を上限とする。該当ファイルが無ければ `truncations` 自体を出力しない。
 
 #### デフォルト除外
 

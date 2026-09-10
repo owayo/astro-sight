@@ -85,7 +85,7 @@ Output: `refs` array with `path`, `ln`, `col`, `ctx` (source line), `kind` (`def
 }
 ```
 
-`total` is exact. `by_lang` / `files` describe **only the omitted refs** — use them to narrow with `--glob` (e.g. if most omitted hits are in another language, the name collides across languages). Raise or remove the cap with `--max-results N|unlimited` and `--token-budget N|unlimited`. If no results are omitted, `result_summary` is absent and output is byte-identical to before.
+`total` is exact. `by_lang` / `files` describe **only the omitted refs** — use them to narrow with `--glob` (e.g. if most omitted hits are in another language, the name collides across languages). Raise or remove the cap with `--max-results N|unlimited` and `--token-budget N|unlimited`. If no results are omitted, `result_summary` is absent and output is byte-identical to before. A `budget_exceeded: true` field means the output could not be squeezed into `--token-budget` even at zero shown refs (the summary itself has a fixed cost) — raise the budget, pass fewer names, or narrow with `--glob`.
 
 ### `calls` — Call Graph Extraction
 
@@ -226,6 +226,8 @@ astro-sight lint --path <file> --rules rules.yaml
 ### `dead-code` — Dead Code Detection
 
 Exported symbols with zero non-definition references. Diff flags limit the scan to diff-related files; without a diff, scans the whole project. Package-manager trees, test dirs, and build artifacts are excluded by default (`--include-vendor` / `--include-tests` / `--include-build` to opt back in).
+
+When the directory contains source files astro-sight has no parser for (`.vue`, `.svelte`, `.astro`, `.erb`, `.razor`, `.scala`, ...), references inside them cannot be counted, so a live symbol used only from such a file would be reported as dead. Those files are declared in `truncations` with `reason: "unanalyzable_source"` (folded to one entry per extension). **Read it before acting on a dead symbol** — the field is absent when every source file was analyzed.
 
 ```bash
 astro-sight dead-code --dir .                       # auto-detects each monorepo workspace with a `next` dependency

@@ -8,23 +8,35 @@ use tree_sitter::Node;
 
 use crate::language::LangId;
 
-/// Rust の構造体フィールド系ノードを参照として扱うべきでないかを判定する。
+/// Rust の識別子が「構造体フィールドの名前位置」かどうかを判定する。
 ///
 /// `pub fn redact()` のような関数名と struct field 名 (`pub redact: bool`) が衝突した場合、
 /// `cfg.output.redact` のフィールドアクセスや struct 宣言/初期化が関数の呼び出し位置として
 /// 誤マッチして impact 分析にノイズを生む (Issue: 2026-05-21-redact-impact-triage)。
 ///
-/// 関数ではないことが構造的に明らかな以下のケースを除外する:
+/// 関数への参照ではないことが構造的に明らかな以下のケースで true を返す:
 /// - `field_declaration` の field_identifier (struct のフィールド宣言)
 /// - `field_initializer` の field 側 field_identifier (`Config { redact: ... }`)
 /// - `field_pattern` の field_identifier (destructuring `let Cfg { redact: v } = ...`)
-/// - `shorthand_field_initializer` 配下の identifier (`Config { redact }`)
 /// - `field_expression` の field_identifier で、祖先 `call_expression.function` でないもの
 ///   (純粋なフィールドアクセス `obj.redact`)
 ///
 /// 一方、メソッド呼び出し (`obj.method()`) の `method` 部は `field_identifier` ノードだが
 /// 親 `field_expression` がさらに親 `call_expression` の `function` フィールドに位置するため
 /// 関数参照として残す。
+///
+/// **`shorthand_field_initializer` (`Config { redact }`) はここに含めない。** shorthand の
+/// 識別子は `Config { redact: redact }` の**値側**、つまりスコープ内の名前を読む式であり、
+/// `struct Table { handler: fn() }` に対する `Table { handler }` は `fn handler` への
+/// 正真正銘の参照になる。除外すると fn ポインタ表・レジストリに登録された公開関数が
+/// dead-code に出るという最悪方向の誤りになる (JS/TS で
+/// `shorthand_property_identifier` を参照として数え、束縛側の
+/// `shorthand_property_identifier_pattern` は数えない判断と同じ形)。ローカル束縛が
+/// 同名を隠している場合は関数への参照ではなくなるが、その取りこぼしは
+/// 「参照を過大に数える = dead と断定しない」保守側に倒れる。
+///
+/// この述語を参照集合から落とすかは sink 側の `EXCLUDES_NON_CALLABLE_FIELDS` が決める。
+/// `refs` の出力は「識別子の出現」を返す契約なので落とさない。
 pub(crate) fn is_rust_struct_field_non_callable(node: Node<'_>) -> bool {
     match node.kind() {
         "field_identifier" => {
@@ -57,10 +69,6 @@ pub(crate) fn is_rust_struct_field_non_callable(node: Node<'_>) -> bool {
                 _ => false,
             }
         }
-        // shorthand: `Config { redact }` の `redact`
-        "identifier" => node
-            .parent()
-            .is_some_and(|p| p.kind() == "shorthand_field_initializer"),
         _ => false,
     }
 }

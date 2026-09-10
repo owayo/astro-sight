@@ -1,10 +1,20 @@
 use super::*;
 
-/// Rust の `pub fn` と struct field が同名のとき、フィールドアクセスや
-/// struct 宣言・初期化を関数参照として誤マッチしないことを検証
-/// (Issue: 2026-05-21-redact-impact-triage)
+/// Rust の `pub fn` と struct field が同名のとき、フィールド名位置の扱いが
+/// **出力面 (`refs`) と判定面 (dead-code の参照カウント) で分かれる**ことを検証する。
+///
+/// - `refs` は「識別子の出現」を返す契約なので、フィールド宣言・初期化・アクセスも返す。
+///   旧実装はこれらを共有 walker で落としており、`refs --name <フィールド名>` が
+///   実出現に対して常に 0 件を返していた (CLAUDE.md がエージェントに
+///   「0 件の AST クエリも解析結果なので Grep で追試するな」と指示している以上、
+///   最悪方向の契約違反)。
+/// - dead-code の参照カウントは、同名関数への参照ではないと構造的に確定するので数えない
+///   (Issue: 2026-05-21-redact-impact-triage の impact ノイズと同じ根拠)。
+///
+/// 対照として、shorthand (`Cfg { redact }`) は**どちらの面でも参照**として残す
+/// (`shorthand_is_a_reference_so_fn_pointer_table_entry_is_not_dead` が本来の理由を固定する)。
 #[test]
-fn find_references_rust_function_excludes_same_name_struct_fields() {
+fn rust_field_name_positions_are_refs_but_not_counted_for_dead_code() {
     let dir = tempfile::tempdir().unwrap();
     let a = dir.path().join("a.rs");
     std::fs::write(
@@ -21,11 +31,6 @@ fn build(flag: bool) -> Cfg {
 Cfg { redact: flag }
 }
 
-fn build_short() -> Cfg {
-let redact = true;
-Cfg { redact }
-}
-
 fn caller(cfg: &Cfg, data: &str) {
 if cfg.redact {
     let _ = redact(data);
@@ -36,52 +41,101 @@ if cfg.redact {
     .unwrap();
 
     let refs = find_references("redact", dir.path(), Some("**/*.rs")).unwrap();
-    let kinds: Vec<_> = refs.iter().map(|r| (r.line, r.kind)).collect();
-
-    // 期待:
-    // - L4 (`pub fn redact`) — Definition
-    // - L18 (`let _ = redact(data)`) — Reference (関数呼び出し)
-    // それ以外のフィールド系 (L1=struct field 宣言, L9=field_initializer,
-    // L13=`let redact = true;` の binding ではなく、`Cfg { redact }` の shorthand,
-    // L16=`cfg.redact` の field_expression) は含まれないこと
-    assert!(
-        kinds.iter().any(|(_, k)| *k == Some(RefKind::Definition)),
-        "関数定義が含まれること: kinds={kinds:?}"
-    );
     let refs_text: Vec<&str> = refs.iter().filter_map(|r| r.context.as_deref()).collect();
-    // 関数呼び出しの行は含まれる
+
+    // 出力面: 定義・関数呼び出しに加え、フィールド名位置もすべて返る
+    assert!(
+        refs.iter().any(|r| r.kind == Some(RefKind::Definition)),
+        "関数定義が含まれること: {refs_text:?}"
+    );
     assert!(
         refs_text.iter().any(|c| c.contains("redact(data)")),
         "関数呼び出し redact(data) は含まれるべき: {refs_text:?}"
     );
-    // 純粋なフィールドアクセス / 宣言 / 初期化系は含まれない
     assert!(
-        !refs_text.iter().any(|c| c.contains("pub redact: bool")),
-        "struct field 宣言 'pub redact: bool' は除外されるべき: {refs_text:?}"
+        refs_text.iter().any(|c| c.contains("pub redact: bool")),
+        "struct field 宣言も識別子の出現として返るべき: {refs_text:?}"
     );
     assert!(
-        !refs_text.iter().any(|c| c.trim() == "redact: flag,"),
-        "field_initializer 'redact: flag' は除外されるべき: {refs_text:?}"
+        refs_text.iter().any(|c| c.contains("Cfg { redact: flag }")),
+        "field_initializer も識別子の出現として返るべき: {refs_text:?}"
     );
     assert!(
-        !refs_text.iter().any(|c| c.contains("Cfg { redact }")),
-        "shorthand 'Cfg {{ redact }}' は除外されるべき: {refs_text:?}"
+        refs_text.iter().any(|c| c.contains("cfg.redact")),
+        "field_expression も識別子の出現として返るべき: {refs_text:?}"
     );
-    assert!(
-        !refs_text.iter().any(|c| c.contains("cfg.redact")),
-        "field_expression 'cfg.redact' は除外されるべき: {refs_text:?}"
+
+    // 判定面: dead-code の参照カウントはフィールド名位置を数えない。
+    // 数えるのは `redact(data)` の 1 件だけ (定義行は Definition なので対象外)。
+    let counts = count_non_definition_refs_split_with_extra_files(
+        &["redact".to_string()],
+        dir.path(),
+        Some("**/*.rs"),
+        &[],
+        |_| false,
+    )
+    .unwrap();
+    let (prod, _test) = counts["redact"];
+    assert_eq!(
+        prod, 1,
+        "dead-code のカウントは関数呼び出し 1 件のみ (フィールド名位置は数えない)"
     );
 }
 
-/// destructuring pattern (`let Cfg { redact: v } = ...`) の field name も
-/// 関数参照として誤マッチしないことを検証
-/// (codex コミット前レビューでの追加指摘)
+/// shorthand (`Table { handler }`) は `Table { handler: handler }` の**値側**、
+/// つまりスコープ内の名前を読む式なので、fn ポインタ表へ登録された公開関数への
+/// 正真正銘の参照になる。旧実装はこれをフィールド名位置と一緒に落としていたため、
+/// **生きている公開関数が dead-code に出る**という最悪方向の誤りが起きていた
+/// (JS/TS の `shorthand_property_identifier` を参照として数える判断と同じ形)。
 #[test]
-fn find_references_rust_function_excludes_field_pattern() {
+fn shorthand_is_a_reference_so_fn_pointer_table_entry_is_not_dead() {
     let dir = tempfile::tempdir().unwrap();
-    let a = dir.path().join("a.rs");
     std::fs::write(
-        &a,
+        dir.path().join("a.rs"),
+        r#"pub fn handler() {}
+
+pub struct Table {
+pub handler: fn(),
+}
+
+pub fn make() -> Table {
+Table { handler }
+}
+"#,
+    )
+    .unwrap();
+
+    let refs = find_references("handler", dir.path(), Some("**/*.rs")).unwrap();
+    let texts: Vec<&str> = refs.iter().filter_map(|r| r.context.as_deref()).collect();
+    assert!(
+        texts.iter().any(|c| c.contains("Table { handler }")),
+        "shorthand は参照として返るべき: {texts:?}"
+    );
+
+    // dead-code のカウント経路でも参照として残る (= dead と誤判定しない)。
+    let counts = count_non_definition_refs_split_with_extra_files(
+        &["handler".to_string()],
+        dir.path(),
+        Some("**/*.rs"),
+        &[],
+        |_| false,
+    )
+    .unwrap();
+    let (prod, _test) = counts["handler"];
+    assert!(
+        prod >= 1,
+        "shorthand を数えないと fn ポインタ表の公開関数が dead と誤判定される: prod={prod}"
+    );
+}
+
+/// destructuring pattern (`let Cfg { redact: v } = ...`) の field name は
+/// **判定面では**関数参照として数えないことを検証
+/// (出力面の `refs` には識別子の出現として残る)。
+#[test]
+fn rust_field_pattern_name_is_not_counted_for_dead_code() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.rs"),
         r#"pub struct Cfg { pub redact: bool }
 pub fn redact(input: &str) -> String { input.to_string() }
 fn caller(cfg: Cfg, data: &str) {
@@ -94,17 +148,28 @@ if value {
     )
     .unwrap();
 
+    let counts = count_non_definition_refs_split_with_extra_files(
+        &["redact".to_string()],
+        dir.path(),
+        Some("**/*.rs"),
+        &[],
+        |_| false,
+    )
+    .unwrap();
+    let (prod, _test) = counts["redact"];
+    assert_eq!(
+        prod, 1,
+        "field_pattern の name 部と field 宣言は数えず、関数呼び出し 1 件のみ"
+    );
+
+    // 対照: 出力面では field_pattern も識別子の出現として返る
     let refs = find_references("redact", dir.path(), Some("**/*.rs")).unwrap();
     let texts: Vec<&str> = refs.iter().filter_map(|r| r.context.as_deref()).collect();
     assert!(
-        !texts
+        texts
             .iter()
             .any(|c| c.contains("let Cfg { redact: value }")),
-        "field_pattern の name 部は除外されるべき: {texts:?}"
-    );
-    assert!(
-        texts.iter().any(|c| c.contains("redact(data)")),
-        "関数呼び出しは残るべき: {texts:?}"
+        "refs には field_pattern の出現も返るべき: {texts:?}"
     );
 }
 
@@ -340,12 +405,16 @@ fn collect_all_attr_segments<'a>(
 /// single refs と count-only (dead-code 経路) の分類一致まで固定する。
 #[test]
 fn rust_closure_bound_identifiers_are_not_references() {
-    // (説明, ソース, 期待 def 数, 期待 ref 数)
-    let cases: &[(&str, &str, usize, usize)] = &[
+    // (説明, ソース, 期待 def 数, `refs` の期待 ref 数, dead-code カウントの期待 ref 数)
+    // 2 つの ref 数が分かれるのは Rust のフィールド名位置だけ。`refs` は識別子の出現を
+    // 返す契約なので struct のフィールド宣言も返し、dead-code のカウントは同名関数への
+    // 参照ではないと構造的に確定するので数えない。
+    let cases: &[(&str, &str, usize, usize, usize)] = &[
         (
             "tuple pattern",
             "pub fn tail(path: &str) -> &str {\n    path.rsplit_once('/').map_or(path, |(_, tail)| tail)\n}\n",
             1,
+            0,
             0,
         ),
         (
@@ -353,11 +422,13 @@ fn rust_closure_bound_identifiers_are_not_references() {
             "pub fn tail() -> u8 { 0 }\npub fn run(xs: &[u8]) -> u8 { xs.iter().map(|tail| *tail).max().unwrap_or(0) }\n",
             1,
             0,
+            0,
         ),
         (
             "reference pattern",
             "pub fn tail() -> u8 { 0 }\npub fn run(xs: &[u8]) -> u8 { xs.iter().map(|&tail| tail).max().unwrap_or(0) }\n",
             1,
+            0,
             0,
         ),
         (
@@ -365,10 +436,13 @@ fn rust_closure_bound_identifiers_are_not_references() {
             "pub fn tail() -> u8 { 0 }\npub fn run() -> u8 { let f = |tail: u8| tail; f(1) }\n",
             1,
             0,
+            0,
         ),
         (
             "struct shorthand pattern",
             "pub fn tail() -> u8 { 0 }\npub struct P { tail: u8 }\npub fn run(p: P) -> u8 { Some(p).map(|P { tail }| tail).unwrap_or(0) }\n",
+            1,
+            // `pub struct P { tail: u8 }` のフィールド宣言は識別子の出現として `refs` に出る
             1,
             0,
         ),
@@ -377,17 +451,20 @@ fn rust_closure_bound_identifiers_are_not_references() {
             "pub fn tail() -> u8 { 0 }\npub struct P { key: u8 }\npub fn run(p: P) -> u8 { Some(p).map(|P { key: tail }| tail).unwrap_or(0) }\n",
             1,
             0,
+            0,
         ),
         (
             "nested closure inherits the outer binding",
             "pub fn tail() -> u8 { 0 }\npub fn run() -> u8 { let f = |tail: u8| (move || tail)(); f(1) }\n",
             1,
             0,
+            0,
         ),
         // 対照: closure の外にある同名参照は従来どおり数える
         (
             "call outside the closure stays a reference",
             "pub fn tail() -> u8 { 0 }\npub fn run() -> u8 { let f = |x: u8| x; f(tail()) }\n",
+            1,
             1,
             1,
         ),
@@ -397,12 +474,14 @@ fn rust_closure_bound_identifiers_are_not_references() {
             "pub fn tail() -> u8 { 0 }\npub fn run() -> u8 { let f = |x: u8| x + tail(); f(1) }\n",
             1,
             1,
+            1,
         ),
         // 対照: パターンの型名は束縛ではないので参照のまま (引数型 + パターン型名の 2 件)
         (
             "tuple struct pattern type name stays a reference",
             "pub struct Tail(u8);\npub fn run(t: Tail) -> u8 { Some(t).map(|Tail(v)| v).unwrap_or(0) }\n",
             1,
+            2,
             2,
         ),
         // 対照: 修飾パス経由の呼び出しはローカル束縛にシャドーイングされない。
@@ -412,11 +491,13 @@ fn rust_closure_bound_identifiers_are_not_references() {
             "pub fn tail() -> u8 { 0 }\npub fn run() -> u8 { let f = |tail: u8| tail + crate::tail(); f(1) }\n",
             1,
             1,
+            1,
         ),
         // 対照: メソッド呼び出しの名前 (field_identifier) も束縛の対象外
         (
             "method call inside the closure stays a reference",
             "pub struct H;\nimpl H { pub fn tail(&self) -> u8 { 0 } }\npub fn run(h: H) -> u8 { let f = |tail: u8| tail + h.tail(); f(1) }\n",
+            1,
             1,
             1,
         ),
@@ -428,11 +509,13 @@ fn rust_closure_bound_identifiers_are_not_references() {
             "pub struct tail { v: u8 }\npub fn run() -> u8 { let f = |tail: tail| { let _ = tail; 0u8 }; f(tail { v: 0 }) }\n",
             1,
             2,
+            2,
         ),
         // 対照: 単位構造体パターンは束縛ではないので参照のまま
         (
             "unit struct pattern stays a reference",
             "pub struct Unit;\npub fn run() { let _f = |Unit| (); }\n",
+            1,
             1,
             1,
         ),
@@ -443,12 +526,14 @@ fn rust_closure_bound_identifiers_are_not_references() {
             "pub struct _Unit;\npub fn run() { let _f = |_Unit| (); }\n",
             1,
             1,
+            1,
         ),
         // 対照: 小文字名の定数パターン。命名 lint は強制ではないので大小文字だけでは
         // 束縛と証明できない。同一ファイルに同名 const があれば束縛判定を諦める。
         (
             "lowercase const pattern stays a reference",
             "#![allow(non_upper_case_globals)]\npub const tail: () = ();\npub fn run() { let f = |tail: ()| (); f(()); }\n",
+            1,
             1,
             1,
         ),
@@ -458,12 +543,14 @@ fn rust_closure_bound_identifiers_are_not_references() {
             "pub struct tail;\npub fn run() { let f = |tail| { let _ = tail; }; f(tail); }\n",
             1,
             3,
+            3,
         ),
         // 対照: `use` で持ち込まれた名前は外部の const / unit struct かもしれない
         (
             "imported name in a pattern stays a reference",
             "use crate::other::tail;\npub fn run() { let f = |tail| { let _ = tail; }; f(tail); }\n",
             0,
+            4,
             4,
         ),
         // 対照: glob import は持ち込む名前が AST に現れないため、対象名が定数パターン
@@ -472,6 +559,7 @@ fn rust_closure_bound_identifiers_are_not_references() {
             "glob import makes pattern names unresolvable",
             "use crate::other::*;\npub fn run() { let f = |tail| { let _ = tail; }; f(tail); }\n",
             0,
+            3,
             3,
         ),
         // 対照: マクロ名は値とは別の名前空間なので値束縛にシャドーイングされない。
@@ -483,10 +571,11 @@ fn rust_closure_bound_identifiers_are_not_references() {
             "#[macro_export]\nmacro_rules! tail { () => { 0u8 } }\npub fn run() -> u8 { let f = |tail: u8| tail + tail!(); f(1) }\n",
             0,
             2,
+            2,
         ),
     ];
 
-    for (label, source, want_def, want_ref) in cases {
+    for (label, source, want_def, want_ref, want_count) in cases {
         let name = match *label {
             l if l.starts_with("tuple struct pattern type") => "Tail",
             l if l.starts_with("unit struct pattern") => "Unit",
@@ -525,8 +614,8 @@ fn rust_closure_bound_identifiers_are_not_references() {
             1,
         );
         assert_eq!(
-            counts[0], *want_ref,
-            "{label}: count-only 経路も同じ分類になること"
+            counts[0], *want_count,
+            "{label}: count-only 経路 (dead-code) の分類"
         );
     }
 }

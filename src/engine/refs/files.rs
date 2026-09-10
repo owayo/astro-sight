@@ -11,6 +11,39 @@ use crate::models::skip::SkippedFiles;
 
 const SKIPPED_PATHS_CAP: usize = 50;
 
+/// 解析できないソースの申告で、1 拡張子あたりに載せる代表パスの上限。
+const UNANALYZABLE_EXAMPLES_PER_EXT: usize = 3;
+/// 同じく、申告する拡張子の種類数の上限 (件数降順 → 拡張子昇順で全順序を固定)。
+const UNANALYZABLE_EXT_CAP: usize = 10;
+
+/// astro-sight が解析できない「ソースコードの拡張子」。
+///
+/// `CandidateDecision::Ignore` に落ちるファイルには画像・アーカイブ・データも含まれるため、
+/// 全件を申告するとノイズになる。**プログラム/テンプレート言語だと確実に言える拡張子だけ**を
+/// 列挙し、それ以外は従来どおり黙って無視する (取りこぼしても現状維持なので退行しない)。
+///
+/// 申告の目的は dead-code の偽陽性を可視化すること — 例えば `.vue` の `<script>` から
+/// 使われている TS の関数は、`.vue` を読めない限り「参照ゼロ」に見えて dead と報告される。
+/// 「参照が無い」と「観測できなかった」を利用者が区別できるようにする。
+#[rustfmt::skip]
+const UNANALYZABLE_SOURCE_EXTENSIONS: &[&str] = &[
+    // JS/TS を埋め込むコンポーネント形式
+    "astro", "svelte", "vue",
+    // サーバサイドテンプレート (ホスト言語の識別子を参照する)
+    "cshtml", "ejs", "erb", "haml", "hbs", "jsp", "jspx", "liquid", "mustache", "pug",
+    "razor", "slim", "twig", "vbhtml",
+    // 未対応のプログラミング言語
+    "clj", "cljc", "cljs", "cr", "dart", "erl", "ex", "exs", "fs", "fsi", "fsx", "gradle",
+    "groovy", "hrl", "hs", "jl", "lhs", "lua", "ml", "mli", "nim", "pas", "pl", "pm", "pp",
+    "ps1", "psm1", "scala", "sol", "tcl", "vb", "vbs",
+];
+
+/// 拡張子が「解析できないソース」に該当するか (ASCII 小文字化して比較)。
+fn is_unanalyzable_source_ext(ext: &str) -> bool {
+    let lower = ext.to_ascii_lowercase();
+    UNANALYZABLE_SOURCE_EXTENSIONS.contains(&lower.as_str())
+}
+
 /// Generated-file handling for a directory scan.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FileScanOptions {
@@ -23,6 +56,8 @@ pub struct FileScanOptions {
 pub struct FileCollection {
     pub files: Vec<std::path::PathBuf>,
     skipped_generated: Vec<std::path::PathBuf>,
+    /// ソースコードだが解析バックエンドが無く走査対象から外れたファイル。
+    unanalyzable_sources: Vec<std::path::PathBuf>,
 }
 
 impl FileCollection {
@@ -50,12 +85,58 @@ impl FileCollection {
             paths,
         })
     }
+
+    /// 解析できなかったソースを拡張子単位に畳んで打ち切り申告にする。
+    ///
+    /// 出力は決定論的: 件数降順 → 拡張子昇順で全順序を付けてから上限を掛け、
+    /// 代表パスも昇順ソート後に切り詰める (同値キーだけで比較して実行ごとに
+    /// 違う部分集合が落ちるのを避ける)。
+    pub fn unanalyzable_truncations(
+        &self,
+        dir: &Path,
+    ) -> Vec<crate::models::truncation::TruncationInfo> {
+        use crate::models::truncation::TruncationInfo;
+        use std::collections::BTreeMap;
+
+        if self.unanalyzable_sources.is_empty() {
+            return Vec::new();
+        }
+        let mut by_ext: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for path in &self.unanalyzable_sources {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let rel = path
+                .strip_prefix(dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+            by_ext.entry(ext).or_default().push(rel);
+        }
+        let mut entries: Vec<(String, Vec<String>)> = by_ext.into_iter().collect();
+        // 件数降順 → 拡張子昇順。BTreeMap 由来なので同数のときの順序も決定論的。
+        entries.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+        entries.truncate(UNANALYZABLE_EXT_CAP);
+        entries
+            .into_iter()
+            .map(|(ext, mut paths)| {
+                let count = paths.len();
+                paths.sort();
+                paths.truncate(UNANALYZABLE_EXAMPLES_PER_EXT);
+                TruncationInfo::unanalyzable_source(&ext, count, &paths)
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateDecision {
     Keep,
     SkipGenerated,
+    /// ソースコードだが解析できない (申告対象)。
+    UnanalyzableSource,
     Ignore,
 }
 
@@ -98,7 +179,7 @@ pub fn collect_files_with_excludes(
     .files)
 }
 
-fn collect_files_scan_with_excludes(
+pub fn collect_files_scan_with_excludes(
     dir: &Path,
     glob_pattern: Option<&str>,
     excluded_dir_names: &[&str],
@@ -173,10 +254,12 @@ fn collect_files_scan_with_excludes(
 
     let mut files = Vec::new();
     let mut skipped_generated = Vec::new();
+    let mut unanalyzable_sources = Vec::new();
     for (path, decision) in decisions {
         match decision {
             CandidateDecision::Keep => files.push(path),
             CandidateDecision::SkipGenerated => skipped_generated.push(path),
+            CandidateDecision::UnanalyzableSource => unanalyzable_sources.push(path),
             CandidateDecision::Ignore => {}
         }
     }
@@ -184,6 +267,7 @@ fn collect_files_scan_with_excludes(
     Ok(FileCollection {
         files,
         skipped_generated,
+        unanalyzable_sources,
     })
 }
 
@@ -206,8 +290,12 @@ fn classify_candidate(path: &Path, exclude_generated: bool) -> CandidateDecision
             CandidateDecision::Keep
         };
     }
-    if path.extension().is_some() {
-        return CandidateDecision::Ignore;
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        return if is_unanalyzable_source_ext(ext) {
+            CandidateDecision::UnanalyzableSource
+        } else {
+            CandidateDecision::Ignore
+        };
     }
     let Some(head) = read_head_4k(path) else {
         return CandidateDecision::Ignore;

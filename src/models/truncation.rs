@@ -29,6 +29,10 @@ pub struct TruncationInfo {
 pub enum TruncationReason {
     /// 未追跡ファイルが `--git` 合成 diff の取り込み上限を超えたため対象外にした。
     UntrackedFileTooLarge,
+    /// ソースコードだがどのバックエンドでも解析できず、走査対象から外れた
+    /// (`.vue` / `.svelte` / `.scala` など)。そのファイル内の参照は数えられないため、
+    /// dead-code の判定は「参照が無い」ではなく「観測できなかった」可能性を含む。
+    UnanalyzableSource,
 }
 
 impl TruncationInfo {
@@ -48,6 +52,26 @@ impl TruncationInfo {
             message: format!(
                 "untracked file excluded from --git analysis: {limit_label} {actual} exceeds limit {limit}"
             ),
+        }
+    }
+
+    /// 解析できないソースファイルを拡張子単位で 1 件に畳んだ打ち切り。
+    ///
+    /// 全件列挙はノイズになり、ピーク RSS を入力件数から独立させる要件にも反するため、
+    /// 拡張子ごとに「件数 + 代表パス数件」へ集約する。`examples` は呼び出し側で
+    /// ソート済み・件数上限適用済みのものを渡すこと (出力を決定論に保つ)。
+    pub fn unanalyzable_source(ext: &str, count: usize, examples: &[String]) -> Self {
+        let mut message = format!(
+            "{count} \".{ext}\" file(s) were not analyzed (no parser for this language); \
+             references inside them are not counted"
+        );
+        if !examples.is_empty() {
+            message.push_str(&format!(" (e.g. {})", examples.join(", ")));
+        }
+        Self {
+            path: None,
+            reason: TruncationReason::UnanalyzableSource,
+            message,
         }
     }
 }

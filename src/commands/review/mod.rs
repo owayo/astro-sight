@@ -191,8 +191,14 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
         include_wip_dead,
         api_added: &api_changes.added,
     };
-    let (dead_symbols, test_only_symbols) =
-        timed_ok("dead_code", || review_dead_symbols(&dead_opts))?;
+    let dead_phase = timed_ok("dead_code", || review_dead_symbols(&dead_opts))?;
+    let ReviewDeadSymbols {
+        dead: dead_symbols,
+        test_only: test_only_symbols,
+        truncations: dead_truncations,
+    } = dead_phase;
+    let mut truncations = truncations;
+    truncations.extend(dead_truncations);
 
     let result = ReviewResult {
         impact,
@@ -273,11 +279,22 @@ struct ReviewDeadSymbolsOpts<'a> {
 /// 必要になった段階で dead-code と同様の --include-* オプションを追加する。
 ///
 /// `dir` を canonicalize できない場合は空結果 (エラーにしない)。
-fn review_dead_symbols(
-    opts: &ReviewDeadSymbolsOpts<'_>,
-) -> Result<(Vec<DeadSymbol>, Vec<DeadSymbol>)> {
+/// `review` の dead-symbol フェーズの結果。
+struct ReviewDeadSymbols {
+    dead: Vec<DeadSymbol>,
+    test_only: Vec<DeadSymbol>,
+    /// 参照カウントの走査対象から外れた「解析できないソース」の申告。
+    /// dead が 1 件も無ければ誤検出のしようが無いので空 (走査自体を行わない)。
+    truncations: Vec<crate::models::truncation::TruncationInfo>,
+}
+
+fn review_dead_symbols(opts: &ReviewDeadSymbolsOpts<'_>) -> Result<ReviewDeadSymbols> {
     let Ok(canonical_dir) = std::fs::canonicalize(opts.dir) else {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(ReviewDeadSymbols {
+            dead: Vec::new(),
+            test_only: Vec::new(),
+            truncations: Vec::new(),
+        });
     };
 
     let default_excludes = resolve_dead_code_excludes(false, false, false);
@@ -318,7 +335,29 @@ fn review_dead_symbols(
         dead_symbols
     };
 
-    Ok((dead_symbols, test_only_symbols))
+    // 解析できないソース (`.vue` / `.svelte` 等) があると、その中の参照を数えられないまま
+    // dead と断定してしまう (生きているシンボルを dead と報告する最悪方向の誤り)。
+    // ただし dead が 1 件も無ければ誤検出のしようが無いので、その場合は
+    // 追加のディレクトリ走査を行わない (`--hook` のホットパスにコストを足さない)。
+    let truncations = if dead_symbols.is_empty() && test_only_symbols.is_empty() {
+        Vec::new()
+    } else {
+        crate::engine::refs::collect_files_scan_with_excludes(
+            &canonical_dir,
+            None,
+            &excludes,
+            &combined_globs,
+            crate::engine::refs::FileScanOptions::default(),
+        )
+        .map(|collection| collection.unanalyzable_truncations(&canonical_dir))
+        .unwrap_or_default()
+    };
+
+    Ok(ReviewDeadSymbols {
+        dead: dead_symbols,
+        test_only: test_only_symbols,
+        truncations,
+    })
 }
 
 #[cfg(test)]
@@ -357,9 +396,10 @@ mod review_command_tests {
             api_added: &[],
         };
 
-        let (dead, test_only) =
-            review_dead_symbols(&opts).expect("missing dir must not be an error");
-        assert!(dead.is_empty());
-        assert!(test_only.is_empty());
+        let phase = review_dead_symbols(&opts).expect("missing dir must not be an error");
+        assert!(phase.dead.is_empty());
+        assert!(phase.test_only.is_empty());
+        // dir が存在しない = 走査もできないので申告も空
+        assert!(phase.truncations.is_empty());
     }
 }

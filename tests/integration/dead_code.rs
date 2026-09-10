@@ -747,3 +747,87 @@ pub fn caller() -> u8 { really_used() }\n",
         "実際に呼ばれている関数は dead ではない (対照): {dead:?}"
     );
 }
+
+/// 解析できないソース (`.vue` 等) がディレクトリにあると、その中の参照を数えられない。
+/// 旧実装はこれを黙って落としていたため、`.vue` の `<script>` からしか使われていない
+/// TS 関数が **dead と報告される** (生きているシンボルを dead と誤判定する最悪方向の誤り)
+/// のに、利用者は `scanned_files` の値からしか気付けなかった。
+///
+/// 対照として、解析できないソースが無いディレクトリでは `truncations` を出さない
+/// (出力バイト列が従来と同一 = 既存 consumer の契約を壊さない) ことも同時に固定する。
+#[test]
+fn dead_code_declares_unanalyzable_sources() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("api.ts"),
+        "export function usedOnlyFromVue() { return 42; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("App.vue"),
+        "<script setup lang=\"ts\">\nimport { usedOnlyFromVue } from './api';\nconsole.log(usedOnlyFromVue());\n</script>\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+
+    let truncations = json["truncations"]
+        .as_array()
+        .expect("解析できないソースがあるので truncations が出るべき");
+    assert_eq!(
+        truncations.len(),
+        1,
+        "拡張子単位に 1 件へ畳む: {truncations:?}"
+    );
+    assert_eq!(truncations[0]["reason"], "unanalyzable_source");
+    let message = truncations[0]["message"].as_str().unwrap();
+    assert!(
+        message.contains(".vue") && message.contains("App.vue"),
+        "拡張子と代表パスを含めること: {message}"
+    );
+
+    // 対照: 解析できないソースが無ければ truncations 自体を出さない
+    let clean = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        clean.path().join("api.ts"),
+        "export function trulyDead() { return 0; }\n",
+    )
+    .unwrap();
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", clean.path().to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert!(
+        json.get("truncations").is_none(),
+        "解析できないソースが無ければ truncations は出力しない: {json}"
+    );
+}
+
+/// 画像やデータファイルは「解析できないソース」ではないので申告しない
+/// (全件申告するとノイズになり、本当に見落としているソースが埋もれる)。
+#[test]
+fn dead_code_does_not_declare_non_source_files() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("api.ts"), "export function f() { return 1; }\n").unwrap();
+    std::fs::write(root.join("logo.png"), [0x89, 0x50, 0x4e, 0x47]).unwrap();
+    std::fs::write(root.join("data.json"), "{\"a\":1}\n").unwrap();
+    std::fs::write(root.join("README.md"), "# doc\n").unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    assert!(
+        json.get("truncations").is_none(),
+        "非ソースファイルは申告対象外: {json}"
+    );
+}

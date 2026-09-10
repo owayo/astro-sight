@@ -284,10 +284,24 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
         // 旧汎用スライスはどちらも持たず、これらだけを持つ関数がベース 1 のまま返っていた。
         // `switch_statement` 本体は判定点ではないので数えない (`case_statement` 側で計上。
         // tree-sitter-c では `default:` も `case_statement` なので catch-all も 1 計上される)。
-        // C++11 の range-for は `for_statement` ではなく `for_range_loop` (C 文法には
-        // 存在しないノードなので C 側の値は変わらない)。列挙しないと range-for だけの
+        //
+        // C と C++ でスライスを共用しない。`for_range_loop` (C++11 range-for) と
+        // `catch_clause` (C++ 例外) は **C 文法に存在しない**ため、共用すると C 側の
+        // テーブルに実在しないノード名が混ざる。値としては無害 (一致しないだけ) だが、
+        // 「テーブルの名前は実在する」という契約を破ると
+        // `branch_node_kinds_exist_in_every_grammar` で全言語の検証ができなくなり、
+        // 本当の改称・流用ミスを検出する網が失われる。
+        LangId::C => &[
+            "if_statement",
+            "for_statement",
+            "while_statement",
+            "do_statement",
+            "case_statement",
+            "conditional_expression",
+        ],
+        // C++ は上記に range-for と `catch` を足す。列挙しないと range-for だけの
         // 関数が cx=1 になり、等価な Java / C# / JS の for-each (いずれも 2) と食い違う。
-        LangId::C | LangId::Cpp => &[
+        LangId::Cpp => &[
             "if_statement",
             "for_statement",
             "for_range_loop",
@@ -312,5 +326,47 @@ fn branch_node_kinds(lang_id: LangId) -> &'static [&'static str] {
         ],
         // lexer-only 言語は AST を持たず calculate_complexity へ到達しない。
         LangId::Xojo => &[],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 言語別ノード名テーブルの文字列が、その文法に実在することを検証する。
+    ///
+    /// `LangId` を catch-all 無しで全列挙する既存規約は「言語を足したら arm を書く」
+    /// ことしか保証せず、**書いた名前が実在するか**は保証しない。文法側の改称や
+    /// 他言語テーブルの流用があっても 1 つもマッチしなくなるだけでエラーにならず、
+    /// `cx = 1` のような一見正常な値を返す (v26.7 / v26.8 で修正したノード名誤りは
+    /// すべてこの形で潜伏していた)。tree-sitter の Query コンパイラは未知のノード
+    /// 種別を拒否するので、各名前を単独パターンとしてコンパイルして実在を確かめる。
+    fn assert_node_kinds_exist(lang_id: LangId, table: &str, kinds: &[&str]) {
+        let language = lang_id.ts_language();
+        for kind in kinds {
+            let pattern = format!("({kind}) @probe");
+            assert!(
+                tree_sitter::Query::new(&language, &pattern).is_ok(),
+                "{lang_id} の {table} に実在しないノード名 \"{kind}\" がある"
+            );
+        }
+    }
+
+    #[test]
+    fn branch_node_kinds_exist_in_every_grammar() {
+        for &lang_id in LangId::ALL_TREE_SITTER {
+            assert_node_kinds_exist(lang_id, "branch_node_kinds", branch_node_kinds(lang_id));
+        }
+    }
+
+    #[test]
+    fn function_boundary_kinds_exist_in_every_grammar() {
+        for &lang_id in LangId::ALL_TREE_SITTER {
+            assert_node_kinds_exist(
+                lang_id,
+                "function_boundary_kinds",
+                function_boundary_kinds(lang_id),
+            );
+        }
     }
 }
