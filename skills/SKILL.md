@@ -36,7 +36,7 @@ The same rule applies inside shell commands: wrapping `grep` / `rg` in Bash is n
 
 **Grep is fine for**: error messages, config values, TODO comments, file-path patterns — anything that is NOT a code identifier.
 
-**Languages parsed** (17): Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby, Zig, and Xojo (lexer-only: `symbols` / `refs` / `dead-code` only). Identifiers that live *only* in a file type outside this list — SQL column names, HCL/Terraform blocks, `.vue` / `.svelte` templates — cannot be resolved, so Grep stays correct there. Do not guess, though: run `refs` first. A zero-result AST query is itself an analysis result, and `dead-code` now names the unparseable file types it had to skip (`truncations` → `unanalyzable_source`).
+**Languages parsed** (16): Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby, Zig. Identifiers that live *only* in a file type outside this list — SQL column names, HCL/Terraform blocks, `.vue` / `.svelte` templates — cannot be resolved, so Grep stays correct there. Do not guess, though: run `refs` first. A zero-result AST query is itself an analysis result, and `dead-code` now names the unparseable file types it had to skip (`truncations` → `unanalyzable_source`).
 
 ## Quick Reference
 
@@ -81,7 +81,7 @@ Output: `refs` array with `path`, `ln`, `col`, `ctx` (source line), `kind` (`def
 "result_summary": {
   "shown": 64, "total": 1846, "omitted": 1782,
   "limited_by": ["max_results", "token_budget"],
-  "by_lang": { "rust": 1776, "xojo": 5 },
+  "by_lang": { "rust": 1776, "php": 5 },
   "files": [ { "path": "src/foo.rs", "count": 326 } ],
   "other_files": { "files": 128, "count": 1231 }
 }
@@ -147,12 +147,11 @@ Review in dependency order: contracts/types → implementation → callers → t
 - `--framework` filters `dead_symbols` only. `--exclude-dir` / `--exclude-glob` affect both impact and `dead_symbols` (same meaning as on `dead-code`). `review` always excludes vendor / tests / build from `dead_symbols`.
 - `--dead-scope` defaults to `touched-symbols` with `--hook`, `all` otherwise. With `--hook`, exports newly added in the same diff are excluded from dead warnings (WIP noise); `--include-wip-dead` opts back in.
 - `--git --base <rev>` uses the same base for the diff and for blame-backed `missing_cochanges`. `--min-confidence` (default 0.3) tunes `missing_cochanges` volume. `--cochange-min-samples` (default 3, stricter than the standalone `cochange` default of 2) requires a pair to have changed together at least that many times: with changed-line blame a source often has only 2 evidence commits, so a pair that co-changed once reaches confidence 1.0 and dominates the report. Pass 2 to see small-sample candidates. Deduplication and the final top-10 selection preserve the standalone command's smoothed `score`; raw confidence remains the filter and displayed evidence. Dependency manifests (`Cargo.toml` / `package.json` / `pyproject.toml`, ...) and lockfiles are never reported as missing co-changes: dependency-adding commits always touch them together with sources, so the historical correlation hits 100% even though a body-only edit that adds no imports has no causal link to them (the standalone `cochange` command still reports manifests as historical fact; lockfiles are excluded there too as generated files). Each entry carries `n` (co-change count) / `d` (denominator) and `e: "history"` when the evidence came from file-history fallback rather than changed-line blame.
-- If all changed files are lexer-only languages (e.g. Xojo), `impact` / `api_changes` / `dead_symbols` come back empty — use `symbols` / `refs` / `dead-code` per file instead.
 - CLI-only (not available in `session`).
 
 ### `imports` — Import/Export Extraction
 
-Language-specific tree-sitter queries for all 16 tree-sitter languages (Xojo is lexer-only and excluded). JavaScript, TypeScript, and TSX include static imports, `require()`, and dynamic `import()` whose first argument is a plain string or an interpolation-free template literal. Only the first argument is used as the dependency target. Interpolated template literals are omitted because their dependency cannot be determined statically.
+Language-specific tree-sitter queries for all 16 languages. JavaScript, TypeScript, and TSX include static imports, `require()`, and dynamic `import()` whose first argument is a plain string or an interpolation-free template literal. Only the first argument is used as the dependency target. Interpolated template literals are omitted because their dependency cannot be determined statically.
 
 ```bash
 astro-sight imports --path <file>
@@ -289,7 +288,7 @@ printf '%s\n' \
 
 ## Notes
 
-- **16 tree-sitter languages**: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby, Zig — plus Xojo via a lexer-only backend (`symbols` / `refs` / `dead-code` only; `ast` / `calls` / `imports` / `lint` / `sequence` return `UNSUPPORTED_LANGUAGE`). Ruby methods may use Unicode identifiers, including simple case-fold characters such as `ſ` and `K`; ambiguous forms such as spaced index assignment, bare lambda parameters followed by a block, empty regex literals, blocks after paren-less calls, and empty-identifier heredocs are parsed without error nodes.
+- **16 tree-sitter languages**: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby, Zig. Ruby methods may use Unicode identifiers, including simple case-fold characters such as `ſ` and `K`; ambiguous forms such as spaced index assignment, bare lambda parameters followed by a block, empty regex literals, blocks after paren-less calls, and empty-identifier heredocs are parsed without error nodes.
 - Compact JSON by default (short keys: `ln`, `col`, `ctx`, `refs`, `src`, `def`/`ref`, `fn`...). Use `--pretty` (global) for human-readable output.
 - **`--format json|toon|auto`** (global) switches the output format; the default is `json`, and `format` in `~/.config/astro-sight/config.toml` sets a different default (CLI `--format` wins). TOON ([v4.1](https://toonformat.dev/)) encodes the same data with indentation and tables instead of repeated keys, measuring 17-60% smaller than compact JSON across commands. `--pretty` is JSON-only and ignored for TOON. CLI TOON documents never have a trailing newline, including batch output and TOON selected by `auto`; JSON/NDJSON retains its newline termination.
 - **`--format auto`** encodes both and emits whichever is estimated to use fewer tokens (character count plus a per-line penalty, since BPE spends roughly one token per newline+indent; ties go to JSON), so it is never worse than either candidate. The choice is deterministic for a given input. For batch modes the winner is decided from the first window of records and applied to the rest, since results are streamed rather than fully buffered.

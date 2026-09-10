@@ -27,7 +27,6 @@
   <img src="https://img.shields.io/badge/Bash-4EAA25?logo=gnubash&logoColor=white" alt="Bash">
   <img src="https://img.shields.io/badge/Ruby-CC342D?logo=ruby&logoColor=white" alt="Ruby">
   <img src="https://img.shields.io/badge/Zig-F7A41D?logo=zig&logoColor=white" alt="Zig">
-  <img src="https://img.shields.io/badge/Xojo_(lexer--only)-5A9E42" alt="Xojo (lexer-only)">
 </p>
 
 ## Install
@@ -260,7 +259,7 @@ astro-sight imports --path src/main.ts
 astro-sight imports --paths src/main.ts,src/worker.ts
 ```
 
-Xojo を除く16言語の import / use / include / require を tree-sitter AST から抽出し、`src`、`ln`、`kind`、`ctx` を返す。JavaScript / TypeScript / TSX は通常の import 文と `require()` に加えて、`import("./module")` および置換を含まない `` import(`./module`) `` も認識する。`${expr}` を含む template literal は依存先を静的に確定できないため除外し、呼び出し形式では第1引数だけを依存先として扱う。
+16言語の import / use / include / require を tree-sitter AST から抽出し、`src`、`ln`、`kind`、`ctx` を返す。JavaScript / TypeScript / TSX は通常の import 文と `require()` に加えて、`import("./module")` および置換を含まない `` import(`./module`) `` も認識する。`${expr}` を含む template literal は依存先を静的に確定できないため除外し、呼び出し形式では第1引数だけを依存先として扱う。
 
 ### refs - クロスファイル参照検索
 
@@ -303,7 +302,7 @@ astro-sight refs --name "new" --dir . --max-results unlimited --token-budget unl
     "limits": { "max_results": 100, "token_budget": 3000 },
     "complete_input": true,
     "by_kind": { "ref": 1782 },
-    "by_lang": { "rust": 1776, "xojo": 5, "ruby": 1 },
+    "by_lang": { "rust": 1776, "php": 5, "ruby": 1 },
     "files": [ { "path": "src/commands/tests/review_hook.rs", "count": 326 } ],
     "other_files": { "files": 128, "count": 1231 },
     "rollup_truncated": { "shown": 5, "available": 133 }
@@ -510,8 +509,6 @@ astro-sight review --dir . --git \
 
 依存宣言ファイル (`Cargo.toml` / `package.json` / `pyproject.toml` 等) とロックファイルは `missing_cochanges` の候補にしない。依存を追加するコミットではこれらとソースが必ず一緒に変わるため履歴相関が 100% になるが、その相関は「依存を追加したとき」限定で、import を 1 行も増減させない本体変更には因果が無い。単体の `cochange` コマンドは「過去に一緒に変更された」事実としてマニフェストを出し続ける (ロックファイルは生成物なので両方で除外)。
 
-全 changed file が Xojo などの lexer-only 言語だけの場合、`review` は `impact` / `api_changes` / `dead_symbols` をすべて空結果で返す。lexer 経路の cross-file 解析は汎用名ノイズが多いため、`symbols` / `refs` / `dead-code` の単体コマンドで確認する。
-
 `api_changes.compatible_modified` には、シグネチャ文字列は変わるが既存呼び出しの互換性を保つ変更を出力する。React component の HOC ラップ、未参照 object member 削除、TS/TSX トップレベル関数の末尾 optional/default 引数追加 (`trailing_optional_params`)、Python トップレベル関数 / モジュール直下クラスメソッドの末尾 kwonly+default / 末尾 positional default 引数追加 (`trailing_optional_params`、デコレータ差分や同名関数複数定義は保守的に blocking 維持) は informational として扱い、`--hook` の blocking 対象にしない。同じシンボルに紐づく `impacts` も破壊的影響としては出さず、`mod_compat` の情報提供だけに留める。未参照 object member の判定では削除キーを 1 個ずつ全リポジトリ検索せず、Aho-Corasick で一括事前抽出して各 JS/TS ファイルを最大 1 回だけ parse する。ファイル収集・読み込み・parse の失敗時は互換扱いへ降格せず、従来どおり blocking を維持する。
 
 Python の公開型契約を方向付きで分類できる変更には、`api_changes.modified[].contract_change`（hook では `api.mod[].contract`）として `{kind, breaks}` を付ける。`TypedDict` の必須性変更に加え、モジュール直下の直接的な `Literal` 型エイリアスについて、値集合の縮小を `literal_values_narrowed`（producer 側が破壊）、拡大を `literal_values_widened`（consumer 側が破壊）として報告する。`Literal` は `typing` / `typing_extensions` 由来と証明でき、値が escape / prefix を含まない文字列・10 進整数・真偽値・`None` だけの場合に限る。値の置換、動的な `__all__`、名前の shadow、star import など意味を静的に確定できない場合は方向を推測せず、通常の blocking な `api.mod` に残す。テストファイルは既存の公開 API 面規約どおり検出対象外。型エイリアスの項目は `kind = "type"` の疑似シンボルであり、`symbols` / `refs` / `dead-code` の解析対象には追加しない。
@@ -636,7 +633,7 @@ astro-sight cochange --dir . --git --base HEAD~10 --rename --copy
 astro-sight doctor
 ```
 
-`doctor` は対応言語（tree-sitter 16 言語 + lexer-only の Xojo、計 17）の可用性を確認し、tree-sitter 言語には ABI version も返す。
+`doctor` は対応言語の可用性を確認し、tree-sitter 言語には ABI version も返す。
 
 ### session - NDJSON ストリーミング
 
@@ -750,9 +747,8 @@ $ astro-sight ast --path nonexistent.rs
 | <img src="https://img.shields.io/badge/-4EAA25?logo=gnubash&logoColor=white" height="16"> Bash | `.sh`, `.bash`, `.zsh` | `tree-sitter-bash` | 0.25 |
 | <img src="https://img.shields.io/badge/-CC342D?logo=ruby&logoColor=white" height="16"> Ruby | `.rb`, `.rake`, `.gemspec` | `tree-sitter-ruby` | [owayo/tree-sitter-ruby](https://github.com/owayo/tree-sitter-ruby) |
 | <img src="https://img.shields.io/badge/-F7A41D?logo=zig&logoColor=white" height="16"> Zig | `.zig`, `.zon` | `tree-sitter-zig` | 1.1 |
-| Xojo (lexer-only) | `.xojo_code`, `.xojo_window`, `.xojo_menu`, `.xojo_toolbar`, `.xojo_report`, `.rbbas` | 手書き lexer（built-in、v26.6 で導入） | - |
 
-上記 16 言語は tree-sitter クエリによる精密なシンボル抽出に対応。Ruby は Unicode 識別子に対応し、simple case folding の対象となる `ſ` / `K` などを含むメソッド名も欠落なく抽出する。空白を挟む添字代入、括弧なし lambda 仮引数直後の `{}`、空正規表現、括弧なし呼び出し直後の block、空識別子 heredoc も構文エラーなく解析できる。Xojo は tree-sitter ではなく手書き lexer による限定サポート: `symbols` / `refs` / `dead-code` のみ動作し、`calls` / `imports` / `ast` / `lint` / `sequence` は `UNSUPPORTED_LANGUAGE` エラーを返す。`context` / `impact` / `review` は changed file が Xojo のみの diff では cross-file 解析を skip する。`doctor` は Xojo を含めて計 17 言語を報告する。
+上記 16 言語は tree-sitter クエリによる精密なシンボル抽出に対応。Ruby は Unicode 識別子に対応し、simple case folding の対象となる `ſ` / `K` などを含むメソッド名も欠落なく抽出する。空白を挟む添字代入、括弧なし lambda 仮引数直後の `{}`、空正規表現、括弧なし呼び出し直後の block、空識別子 heredoc も構文エラーなく解析できる。
 
 > **\* Kotlin バージョンについて:** `tree-sitter-kotlin` 0.3.8 以降は `links = "tree-sitter"` を宣言しており、コアクレート `tree-sitter` 0.26 と Cargo の native library リンク名が競合してビルドできない。現在は 0.3.5 系を利用している。
 >
@@ -1009,7 +1005,7 @@ cargo run --manifest-path tools/usage-stats/Cargo.toml -- --json --days 1
 - **YES → Use `astro-sight refs`** (Grep, `grep`, `rg` ALL FORBIDDEN)
 - **NO → Grep OK** (error messages, config values, TODOs, file paths, etc.)
 
-This applies to EVERY supported language — including Xojo (`.xojo_code`), Zig, Swift, C#, Ruby. Never assume a language is unsupported and fall back to Grep.
+This applies to EVERY supported language — including Zig, Swift, C#, Ruby. Never assume a language is unsupported and fall back to Grep.
 
 This rule also applies inside shell commands: wrapping `grep` / `rg` in Bash is not an exception.
 
