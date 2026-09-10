@@ -36,6 +36,8 @@ The same rule applies inside shell commands: wrapping `grep` / `rg` in Bash is n
 
 **Grep is fine for**: error messages, config values, TODO comments, file-path patterns — anything that is NOT a code identifier.
 
+**Languages parsed** (17): Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby, Zig, and Xojo (lexer-only: `symbols` / `refs` / `dead-code` only). Identifiers that live *only* in a file type outside this list — SQL column names, HCL/Terraform blocks, `.vue` / `.svelte` templates — cannot be resolved, so Grep stays correct there. Do not guess, though: run `refs` first. A zero-result AST query is itself an analysis result, and `dead-code` now names the unparseable file types it had to skip (`truncations` → `unanalyzable_source`).
+
 ## Quick Reference
 
 ```bash
