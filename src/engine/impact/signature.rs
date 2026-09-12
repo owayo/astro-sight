@@ -59,8 +59,10 @@ pub(crate) fn detect_signature_changes(
             continue;
         }
 
-        let old_sig = find_signature_in_lines(&removed_lines, &sym.name, lang_id);
-        let new_sig = find_signature_in_lines(&added_lines, &sym.name, lang_id);
+        let old_sig = find_signature_in_lines(&removed_lines, &sym.name, lang_id)
+            .map(|signature| normalize_signature_for_comparison(signature, lang_id));
+        let new_sig = find_signature_in_lines(&added_lines, &sym.name, lang_id)
+            .map(|signature| normalize_signature_for_comparison(signature, lang_id));
 
         if let (Some(old), Some(new)) = (old_sig, new_sig)
             && old != new
@@ -74,6 +76,15 @@ pub(crate) fn detect_signature_changes(
     }
 
     changes
+}
+
+fn normalize_signature_for_comparison(signature: String, lang_id: LangId) -> String {
+    if lang_id == LangId::Rust {
+        crate::engine::rust_signature::normalize_rust_signature_text(&signature)
+            .unwrap_or(signature)
+    } else {
+        signature
+    }
 }
 
 /// 指定された関数名を含むシグネチャ行を検索する。

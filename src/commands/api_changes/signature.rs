@@ -125,6 +125,16 @@ pub(crate) fn extract_api_signature(
                             && let Some(sig) =
                                 normalize_rust_tauri_command_signature(cur, source, s, e)
                         {
+                            return crate::engine::rust_signature::normalize_rust_signature_text(
+                                &sig,
+                            )
+                            .unwrap_or(sig);
+                        }
+                        if lang_id == crate::language::LangId::Rust
+                            && let Some(sig) = crate::engine::rust_signature::normalize_rust_parameter_binding_signature(
+                                cur, source, s, e,
+                            )
+                        {
                             return sig;
                         }
                         if let Some(bytes) = source.get(s..e) {

@@ -6,6 +6,55 @@ use super::support::*;
 use std::process::{Command, Stdio};
 
 #[test]
+fn impact_distinguishes_rust_binding_mut_from_type_mutability() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "src/lib.rs",
+        "pub mod consumer;\n\npub fn apply<F: FnMut(u32)>(mut callback: F) {\n    drop(callback);\n}\n\npub fn borrow(value: &mut u32) -> u32 {\n    *value\n}\n",
+    );
+    repo.write(
+        "src/consumer.rs",
+        "use crate::{apply, borrow};\n\npub fn run(value: &mut u32) {\n    apply(|_| {});\n    let _ = borrow(value);\n}\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+
+    repo.write(
+        "src/lib.rs",
+        "pub mod consumer;\n\npub fn apply<F: FnMut(u32)>(callback: F) {\n    drop(callback);\n}\n\npub fn borrow(value: &mut u32) -> u32 {\n    *value\n}\n",
+    );
+    let binding_only = cargo_bin()
+        .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run binding-only impact");
+    assert!(
+        binding_only.status.success(),
+        "binding-side の mut 除去だけなら unresolved impact にすべきでない: {}",
+        String::from_utf8_lossy(&binding_only.stderr)
+    );
+
+    repo.commit_all("remove binding mut");
+    repo.write(
+        "src/lib.rs",
+        "pub mod consumer;\n\npub fn apply<F: FnMut(u32)>(callback: F) {\n    drop(callback);\n}\n\npub fn borrow(value: &u32) -> u32 {\n    *value\n}\n",
+    );
+    let type_change = cargo_bin()
+        .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+        .output()
+        .expect("failed to run type-change impact");
+    let stderr = String::from_utf8_lossy(&type_change.stderr);
+    assert!(
+        !type_change.status.success(),
+        "型側の &mut T -> &T は unresolved impact に残すべき"
+    );
+    assert!(
+        stderr.contains("consumer.rs") && stderr.contains("borrow"),
+        "型契約変更の caller とシンボルを報告すべき: {stderr}"
+    );
+}
+
+#[test]
 fn impact_rust_local_var_not_treated_as_cross_file_ref() {
     // Issue 2026-06-13-ai-status-json-symbol-fp: 別ファイルのローカル変数 `let json` が
     // 同名の自由関数 `render::json` への cross-file 参照に誤マッチしないこと。

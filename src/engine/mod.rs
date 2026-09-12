@@ -15,6 +15,7 @@ pub mod parser;
 pub mod phpunit_refs;
 pub mod query_cache;
 pub mod refs;
+pub(crate) mod rust_signature;
 pub mod sequence;
 pub mod snippet;
 pub mod symbols;
