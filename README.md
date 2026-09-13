@@ -49,6 +49,14 @@
 brew install owayo/astro-sight/astro-sight
 ```
 
+### winget (Windows)
+
+```powershell
+winget install owayo.astro-sight
+```
+
+portable パッケージとして PATH が書き換わるため、インストール後は新しいターミナルを開くこと。
+
 ### From Source
 
 ```bash

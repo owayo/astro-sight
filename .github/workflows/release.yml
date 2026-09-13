@@ -396,9 +396,42 @@ jobs:
           git commit -m "Update astro-sight to ${TAG}"
           git push
 
+  publish-winget:
+    name: Publish to WinGet
+    needs: [prepare-release, release]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    steps:
+      # secrets は job-level の if で参照できないため、ステップ内で有無を判定して
+      # WINGET_TOKEN 未設定でもリリース全体を落とさない
+      - name: Check WinGet token
+        id: token
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if [ -z "${WINGET_TOKEN}" ]; then
+            echo "::warning::WINGET_TOKEN is not set; skipping winget-pkgs submission"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Submit manifest to winget-pkgs
+        if: steps.token.outputs.available == 'true'
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: owayo.astro-sight
+          version: ${{ needs.prepare-release.outputs.version }}
+          # workflow_dispatch 起点では release-tag の既定値が使えないので明示的に渡す
+          release-tag: ${{ needs.prepare-release.outputs.tag }}
+          # 既定値は exe/msi/msix/appx のみで zip を拾わない
+          installers-regex: '-pc-windows-msvc\.zip$'
+          max-versions-to-keep: 5
+          token: ${{ secrets.WINGET_TOKEN }}
+
   release-summary:
     name: Release Summary
-    needs: [prepare-release, release, update-homebrew]
+    needs: [prepare-release, release, update-homebrew, publish-winget]
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     steps:
@@ -415,3 +448,4 @@ jobs:
           echo "  - astro-sight-x86_64-pc-windows-msvc.zip"
           echo ""
           echo "🍺 Homebrew tap updated: owayo/homebrew-astro-sight"
+          echo "📦 WinGet manifest PR: microsoft/winget-pkgs (owayo.astro-sight)"
