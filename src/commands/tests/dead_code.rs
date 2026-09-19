@@ -943,3 +943,71 @@ fn filter_dead_by_wip_added_passes_through_when_added_is_empty() {
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].name, "foo");
 }
+
+/// Rust の型・trait が「型注釈位置・impl 行でしか名指しされない」場合でも live と判定する。
+///
+/// 旧実装は Rust の def/ref 分類に汎用の parent/grandparent 走査を使っており、
+/// `impl Trait for Type` の両識別子と戻り値型が def に化けて参照 0 件になっていた。
+/// その結果 **実装されている trait と、その実装先の型が dead として報告される**
+/// (live を dead と断定する最悪方向の誤り)。
+///
+/// **対照ケース内蔵**: 本当にどこからも参照されない型 (`ActuallyUnused`) は引き続き
+/// dead として検出されることを同一テストで固定する。これが無いと「dead-code が
+/// 何も報告しなくなっただけ」の退行を検出できない。
+///
+/// 再現元: ローカル Issue 2026-09-17-refs-def-misclassification (改善提案 1 の Rust 版)
+#[test]
+fn detect_dead_rust_impl_and_return_type_positions_are_live() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let source = "pub trait Summarize {\n\
+    fn summarize(&self) -> usize;\n\
+}\n\
+\n\
+pub struct Engine;\n\
+\n\
+impl Summarize for Engine {\n\
+    fn summarize(&self) -> usize {\n\
+        7\n\
+    }\n\
+}\n\
+\n\
+pub struct Report {\n\
+    pub total: usize,\n\
+}\n\
+\n\
+pub fn build() -> Report {\n\
+    Report { total: 1 }\n\
+}\n\
+\n\
+pub struct ActuallyUnused {\n\
+    pub value: usize,\n\
+}\n\
+\n\
+pub trait NeverImplemented {\n\
+    fn noop(&self);\n\
+}\n";
+    fs::write(repo.join("api.rs"), source).expect("write rs");
+
+    let files = vec![repo.join("api.rs")];
+    let (dead, _test_only) =
+        detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
+    let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+
+    // impl 行・戻り値型でしか名指しされない型/trait は live
+    for live in ["Summarize", "Engine", "Report"] {
+        assert!(
+            !names.contains(&live),
+            "impl 行または戻り値型で参照されている {live} は dead に出さない: {names:?}"
+        );
+    }
+    // 対照: 本当に未参照のものは引き続き dead
+    for unused in ["ActuallyUnused", "NeverImplemented"] {
+        assert!(
+            names.contains(&unused),
+            "未参照の {unused} は引き続き dead として検出されるべき: {names:?}"
+        );
+    }
+}

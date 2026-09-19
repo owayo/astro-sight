@@ -21,6 +21,7 @@ use crate::language::LangId;
 use cpp::{is_cpp_definition_context, is_cpp_standalone_forward_declaration_tag_name};
 use php::is_php_definition_context;
 use ruby::is_ruby_definition_context;
+use rust::is_rust_definition_context;
 
 /// この identifier ノードが定義コンテキストにあるかを判定する。
 ///
@@ -44,11 +45,10 @@ pub(crate) fn is_definition_context(
         LangId::Java | LangId::CSharp => is_name_field_definition_context(node, definition_kinds),
         LangId::Swift => is_swift_definition_context(node, definition_kinds),
         LangId::Kotlin => is_kotlin_definition_context(node, definition_kinds),
+        LangId::Rust => is_rust_definition_context(node, definition_kinds),
         // 未移行: 汎用の parent/grandparent 走査。型注釈位置の識別子を def と誤判定する
         // 既知の欠陥を持つが、言語ごとに実ノード名とフィールド構成を確認するまで倒さない。
-        LangId::Rust | LangId::Bash | LangId::Xojo => {
-            is_ancestor_kind_definition_context(node, definition_kinds)
-        }
+        LangId::Bash | LangId::Xojo => is_ancestor_kind_definition_context(node, definition_kinds),
     }
 }
 

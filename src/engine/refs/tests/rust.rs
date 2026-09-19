@@ -672,3 +672,174 @@ fn rust_pattern_binding_memo_does_not_leak_across_walks() {
         }
     }
 }
+
+/// Rust の def/ref 分類が「宣言の `name` フィールド一致」で行われることを固定する。
+///
+/// 旧実装は汎用の parent/grandparent 走査で、親が定義ノードでありさえすれば無条件に
+/// def としていた。tree-sitter-rust では戻り値型・型注釈・型エイリアス右辺・impl の
+/// trait 名/型名がいずれも定義ノードの**直接の子**なので、これらが軒並み def に化け、
+/// 実測では定義 1 箇所の型に対し `refs` が def を 5 件返していた。
+///
+/// **対照ケース内蔵**: 宣言名そのもの (struct / trait / type alias / const / static /
+/// fn / mod の name) は Definition のままであることを同一テストで固定する。これが無いと
+/// 「全部 Reference になっただけ」の退行を検出できない。
+#[test]
+fn rust_definition_is_only_the_name_field_not_type_positions() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.rs"),
+        r#"pub struct Outcome;
+
+pub type Alias = Outcome;
+
+pub type Wrapped = Option<Outcome>;
+
+pub const DEFAULT: Option<Outcome> = None;
+
+pub static CURRENT: Option<Outcome> = None;
+
+pub trait Runner {
+fn run(&self) -> Outcome;
+}
+
+pub struct Engine;
+
+impl Runner for Engine {
+fn run(&self) -> Outcome {
+    Outcome
+}
+}
+
+pub fn make() -> Outcome {
+Outcome
+}
+
+pub mod registry {
+pub fn lookup() {}
+}
+"#,
+    )
+    .unwrap();
+
+    let defs_of = |name: &str| -> Vec<String> {
+        find_references(name, dir.path(), Some("**/*.rs"))
+            .unwrap()
+            .iter()
+            .filter(|r| r.kind == Some(RefKind::Definition))
+            .map(|r| r.context.clone().unwrap_or_default().trim().to_string())
+            .collect()
+    };
+    let refs_of = |name: &str| -> Vec<String> {
+        find_references(name, dir.path(), Some("**/*.rs"))
+            .unwrap()
+            .iter()
+            .filter(|r| r.kind != Some(RefKind::Definition))
+            .map(|r| r.context.clone().unwrap_or_default().trim().to_string())
+            .collect()
+    };
+
+    // 型名: 定義は struct 宣言の 1 件だけ。戻り値型・alias 右辺・型引数・struct 式は Reference。
+    let outcome_defs = defs_of("Outcome");
+    assert_eq!(
+        outcome_defs,
+        vec!["pub struct Outcome;".to_string()],
+        "Outcome の Definition は struct 宣言 1 件のみであること"
+    );
+    let outcome_refs = refs_of("Outcome");
+    for expected in [
+        "pub type Alias = Outcome;",
+        "pub type Wrapped = Option<Outcome>;",
+        "pub const DEFAULT: Option<Outcome> = None;",
+        "pub static CURRENT: Option<Outcome> = None;",
+        "fn run(&self) -> Outcome;",
+        "pub fn make() -> Outcome {",
+    ] {
+        assert!(
+            outcome_refs.iter().any(|c| c == expected),
+            "{expected:?} は Reference であること: {outcome_refs:?}"
+        );
+    }
+
+    // trait 名: 宣言が Definition、impl 行は Reference。
+    assert_eq!(
+        defs_of("Runner"),
+        vec!["pub trait Runner {".to_string()],
+        "Runner の Definition は trait 宣言 1 件のみであること"
+    );
+    assert!(
+        refs_of("Runner")
+            .iter()
+            .any(|c| c == "impl Runner for Engine {"),
+        "impl の trait 名は Reference であること: {:?}",
+        refs_of("Runner")
+    );
+
+    // impl 対象の型名も Reference (impl_item は name フィールドを持たない)。
+    assert_eq!(
+        defs_of("Engine"),
+        vec!["pub struct Engine;".to_string()],
+        "Engine の Definition は struct 宣言 1 件のみであること"
+    );
+    assert!(
+        refs_of("Engine")
+            .iter()
+            .any(|c| c == "impl Runner for Engine {"),
+        "impl の型名は Reference であること: {:?}",
+        refs_of("Engine")
+    );
+
+    // 対照: 宣言名そのものは Definition のまま (「全部 ref になった」退行の検出)。
+    for (name, decl) in [
+        ("Alias", "pub type Alias = Outcome;"),
+        ("DEFAULT", "pub const DEFAULT: Option<Outcome> = None;"),
+        ("CURRENT", "pub static CURRENT: Option<Outcome> = None;"),
+        ("make", "pub fn make() -> Outcome {"),
+        ("registry", "pub mod registry {"),
+    ] {
+        assert_eq!(
+            defs_of(name),
+            vec![decl.to_string()],
+            "{name} の宣言名は Definition のままであること"
+        );
+    }
+}
+
+/// supertrait (`trait Child: Parent`) が Reference として数えられることを固定する。
+///
+/// 旧実装では `trait_bounds` を挟んだ grandparent 走査で `Parent` が def に化け、
+/// 「継承されているだけの trait」が参照 0 件になっていた。新実装が grandparent 経由の
+/// 救済を持たないことをここで保証する (持たせると本ケースが再び def へ戻る)。
+#[test]
+fn rust_supertrait_position_is_a_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.rs"),
+        r#"pub trait Parent {}
+
+pub trait Child: Parent {}
+"#,
+    )
+    .unwrap();
+
+    let refs = find_references("Parent", dir.path(), Some("**/*.rs")).unwrap();
+    let defs: Vec<_> = refs
+        .iter()
+        .filter(|r| r.kind == Some(RefKind::Definition))
+        .collect();
+    assert_eq!(
+        defs.len(),
+        1,
+        "Parent の Definition は宣言 1 件のみ: {refs:?}"
+    );
+
+    let counts = count_non_definition_refs_split_with_extra_files(
+        &["Parent".to_string()],
+        dir.path(),
+        Some("**/*.rs"),
+        &[],
+        |_| false,
+    )
+    .unwrap();
+    let (prod, _test) = counts["Parent"];
+    assert_eq!(prod, 1, "supertrait 位置が参照として数えられること");
+}

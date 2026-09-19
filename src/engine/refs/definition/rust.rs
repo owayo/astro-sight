@@ -423,3 +423,54 @@ pub(crate) fn rust_attr_string_ref_segments<'a>(
         .map(|(seg, off)| (seg, base.row, base.column + off))
         .collect()
 }
+
+/// Rust: 宣言の `name` フィールドと一致する識別子だけを `Definition` とみなす。
+///
+/// 旧実装は汎用の parent/grandparent 走査 (`is_ancestor_kind_definition_context`) で、
+/// 親が定義ノードでありさえすれば無条件に def としていた。tree-sitter-rust では
+/// 戻り値型・型注釈・型エイリアスの右辺がいずれも定義ノードの**直接の子**なので、
+/// これらが軒並み def に化けていた:
+///
+/// ```text
+/// pub fn make() -> Outcome {}   // function_item の return_type
+/// pub const C: Outcome = ...;   // const_item の type
+/// pub type Alias = Outcome;     // type_item の type (右辺)
+/// impl Runner for Engine {}     // impl_item の trait / type
+/// ```
+///
+/// 実測では定義 1 箇所の型に対し `refs` が def を 5 件返し、`impl Trait for Type` の
+/// 両識別子が def 扱いになることで**実装されている trait が dead-code に出た**
+/// (live を dead と断定する最悪方向の誤り)。JS/TS・Go・Java・C#・Swift・Kotlin・
+/// Python で同型の誤判定を潰した判定 (`is_name_field_definition_context` ほか) の
+/// Rust 版にあたる。
+///
+/// `impl_item` は **name フィールドを持たない** ため常に false を返す。`impl` 行に
+/// 現れる trait 名も型名も「既存の宣言を名指しする参照」であって定義位置ではない。
+/// これにより `impl` されているだけの型・trait が参照ありと数えられるが、これは
+/// 「参照を過大に数える = dead と断定しない」保守側であり、他言語で基底クラス位置を
+/// Reference として数えている扱いとも揃う。
+///
+/// grandparent 経由の救済は入れない。Rust の定義ノードは `impl_item` を除き全て
+/// `name` を直接子に持つことを `astro-sight ast --full` で確認済みで、grandparent を
+/// 許すと supertrait (`trait Child: Parent` の `trait_bounds` 経由) や型引数が
+/// 再び def に化けるリスクだけが残る。
+///
+/// 関数パラメータ (`parameters > parameter`) と struct フィールド
+/// (`field_declaration_list > field_declaration`)、enum バリアント
+/// (`enum_variant_list > enum_variant`) は親も祖父も定義ノードにならないため、
+/// 旧実装でも本実装でも Reference のまま (既存挙動を変えない)。
+pub(crate) fn is_rust_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if !definition_kinds.contains(&parent.kind()) {
+        return false;
+    }
+    // impl_item は宣言名を持たない (trait: / type: のみ) ため def 位置が存在しない。
+    if parent.kind() == "impl_item" {
+        return false;
+    }
+    parent
+        .child_by_field_name("name")
+        .is_some_and(|name| name.id() == node.id())
+}
