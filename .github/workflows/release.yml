@@ -401,6 +401,10 @@ jobs:
     needs: [prepare-release, release]
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
+    env:
+      WINGET_IDENTIFIER: owayo.astro-sight
+    outputs:
+      submitted: ${{ steps.submit.outcome == 'success' }}
     steps:
       # secrets は job-level の if で参照できないため、ステップ内で有無を判定して
       # WINGET_TOKEN 未設定でもリリース全体を落とさない
@@ -416,11 +420,56 @@ jobs:
             echo "available=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Submit manifest to winget-pkgs
+      # winget-releaser は「既に winget-pkgs にある版の上げ」しかできず、初版マニフェストが
+      # マージされるまでは 1 ステップ目で exit 1 する。初版はモデレータの承認待ちで数日かかる
+      # ことがあり、その間は未登録が正常系なので、提出前に登録を確認して未登録ならスキップする。
+      # continue-on-error は PAT 失効や installers-regex の取り違えまで緑にするので使わない
+      - name: Check winget-pkgs registration
+        id: registration
         if: steps.token.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # winget-releaser と同じ判定パス: manifests/<頭文字小文字>/<Publisher>/<Package>
+          INITIAL=$(printf '%s' "${WINGET_IDENTIFIER}" | cut -c1 | tr '[:upper:]' '[:lower:]')
+          MANIFEST_DIR="manifests/${INITIAL}/${WINGET_IDENTIFIER//.//}"
+
+          # bash -e (Actions の既定) で接続失敗ごとステップを落とさないよう || true で包む
+          http_status() {
+            curl --silent --output /dev/null --write-out '%{http_code}' "$@" || true
+          }
+
+          STATUS=$(http_status \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/microsoft/winget-pkgs/contents/${MANIFEST_DIR}")
+
+          # API が使えないとき (rate limit 等) は winget-releaser と同じ web パスで確かめ直す
+          if [ "${STATUS}" != "200" ] && [ "${STATUS}" != "404" ]; then
+            STATUS=$(http_status "https://github.com/microsoft/winget-pkgs/tree/master/${MANIFEST_DIR}")
+          fi
+
+          case "${STATUS}" in
+            200)
+              echo "registered=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "::notice::${WINGET_IDENTIFIER} is not in winget-pkgs yet (initial manifest PR awaiting moderator approval); skipping submission"
+              echo "registered=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              # 判定できなかったときは提出を試す (本当に出せなければ action 側が失敗する)
+              echo "::warning::Could not determine winget-pkgs registration (HTTP ${STATUS}); attempting submission"
+              echo "registered=true" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Submit manifest to winget-pkgs
+        id: submit
+        if: steps.registration.outputs.registered == 'true'
         uses: vedantmgoyal9/winget-releaser@v2
         with:
-          identifier: owayo.astro-sight
+          identifier: ${{ env.WINGET_IDENTIFIER }}
           version: ${{ needs.prepare-release.outputs.version }}
           # workflow_dispatch 起点では release-tag の既定値が使えないので明示的に渡す
           release-tag: ${{ needs.prepare-release.outputs.tag }}
@@ -448,4 +497,8 @@ jobs:
           echo "  - astro-sight-x86_64-pc-windows-msvc.zip"
           echo ""
           echo "🍺 Homebrew tap updated: owayo/homebrew-astro-sight"
-          echo "📦 WinGet manifest PR: microsoft/winget-pkgs (owayo.astro-sight)"
+          if [ "${{ needs.publish-winget.outputs.submitted }}" = "true" ]; then
+            echo "📦 WinGet manifest PR: microsoft/winget-pkgs (owayo.astro-sight)"
+          else
+            echo "📦 WinGet: submission skipped (see the 'Publish to WinGet' job log)"
+          fi
