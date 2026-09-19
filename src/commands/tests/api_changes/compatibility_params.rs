@@ -1227,3 +1227,193 @@ if __name__ == \"__main__\":
         "同一ファイル内でのみ呼ばれる関数へのオプショナル引数追加は api.mod に出してはならない。got: {mod_names:?}"
     );
 }
+
+/// 値バインディングの signature からコメントトークンを落とす。
+///
+/// signature は初期化子を含む item 全体から作るため、旧実装ではコメントまで signature の
+/// 一部になり、**コードを 1 文字も変えずコメントだけを直すと blocking な `api.mod` に載って
+/// Stop hook が止まっていた** (Issue: 2026-09-16-const-array-append-and-cochange-fp の
+/// パターン A、実測 exit 1)。加えて `normalize_signature_whitespace` が改行を潰すため
+/// 行コメント以降が 1 行に連なり、shape 抽出が parse に失敗して fail-closed で blocking 側に
+/// 残るという二次被害もあった。
+///
+/// **対照ケース内蔵** (「何も検出しなくなっただけ」の退行を防ぐ):
+/// - `TYPE_CHANGED`: コメント変更と同時に型も変える → 従来どおり blocking な `modified`
+/// - `VALUE_CHANGED`: コメント変更と同時に値も変える → informational な `const_value_changes`
+/// - `URL`: 文字列リテラル中の `//` を変える → コメントと誤認せず値変更として検出
+#[test]
+fn detect_api_changes_rust_comment_only_change_is_not_an_api_change() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[(
+            "src/constants.rs",
+            "/// 一覧表\n\
+pub const TABLE: &[&str] = &[\n\
+    // 最初の要素\n\
+    \"a\",\n\
+    /* 二番目 */ \"b\",\n\
+];\n\
+pub const TYPE_CHANGED: &[u32] = &[\n    // 旧コメント\n    1,\n];\n\
+pub const VALUE_CHANGED: &[u32] = &[\n    // 旧コメント\n    1,\n];\n\
+pub const URL: &str = \"https://example.test/a//b\";\n",
+        )],
+        "initial",
+    );
+    // TABLE: コメントだけを変える (配列の中身は不変)。
+    // TYPE_CHANGED: コメント + 型変更。VALUE_CHANGED: コメント + 値変更。
+    // URL: 文字列リテラル中の `//` の後ろを変更 (コメントではない)。
+    fs::write(
+        repo.join("src/constants.rs"),
+        "/// 一覧表 (仕様 X に対応)\n\
+pub const TABLE: &[&str] = &[\n\
+    // 先頭の要素 — 既定値として使う\n\
+    \"a\",\n\
+    /* 2 番目の要素 */ \"b\",\n\
+];\n\
+pub const TYPE_CHANGED: &[u64] = &[\n    // 新コメント (型も変えた)\n    1,\n];\n\
+pub const VALUE_CHANGED: &[u32] = &[\n    // 新コメント (値も変えた)\n    2,\n];\n\
+pub const URL: &str = \"https://example.test/a//c\";\n",
+    )
+    .expect("write new constants");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/constants.rs".to_string(),
+        new_path: "src/constants.rs".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 15,
+            new_start: 1,
+            new_count: 15,
+        }],
+        deleted_old_source: None,
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    // コメントだけを変えた TABLE はどの bucket にも出ない
+    for (bucket, names) in [
+        (
+            "modified",
+            api.modified
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "const_value_changes",
+            api.const_value_changes
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "added",
+            api.added
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "removed",
+            api.removed
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        assert!(
+            !names.contains(&"TABLE"),
+            "コメントのみ変更した TABLE が {bucket} に出ている: {names:?}"
+        );
+    }
+
+    // 対照 1: 型変更は従来どおり blocking な modified に残る
+    assert!(
+        api.modified.iter().any(|m| m.name == "TYPE_CHANGED"),
+        "型変更は modified に残すべき: {:?}",
+        api.modified.iter().map(|m| &m.name).collect::<Vec<_>>()
+    );
+    // 対照 2: 値変更は informational な const_value_changes に入る
+    assert!(
+        api.const_value_changes
+            .iter()
+            .any(|c| c.name == "VALUE_CHANGED"),
+        "値変更は const_value_changes に出すべき: {:?}",
+        api.const_value_changes
+            .iter()
+            .map(|c| &c.name)
+            .collect::<Vec<_>>()
+    );
+    // 対照 3: 文字列リテラル中の `//` はコメントではない。値変更として拾う
+    assert!(
+        api.const_value_changes.iter().any(|c| c.name == "URL"),
+        "文字列中の // をコメントと誤認せず値変更として拾うべき: {:?}",
+        api.const_value_changes
+            .iter()
+            .map(|c| &c.name)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// JS/TS では JSDoc (`/** @type {...} */`) が型アサーションとして実際に型契約を持つため、
+/// signature から落とさない。落とすと型の絞り込み・拡大を見逃す fail-open になる。
+///
+/// **対照ケース内蔵**: 同じファイルの通常コメント (`//` / 非 JSDoc の `/* */`) だけを
+/// 変えた定数は、Rust と同じくどの bucket にも出ないことを固定する。
+#[test]
+fn detect_api_changes_ts_keeps_jsdoc_but_drops_plain_comments() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[(
+            "src/values.ts",
+            "export const TYPED = /** @type {string | number} */ (\"x\");\n\
+export const PLAIN: string[] = [\n  // 説明\n  \"y\",\n];\n",
+        )],
+        "initial",
+    );
+    fs::write(
+        repo.join("src/values.ts"),
+        "export const TYPED = /** @type {string} */ (\"x\");\n\
+export const PLAIN: string[] = [\n  // 説明を書き直した\n  \"y\",\n];\n",
+    )
+    .expect("write new values");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "src/values.ts".to_string(),
+        new_path: "src/values.ts".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 5,
+            new_start: 1,
+            new_count: 5,
+        }],
+        deleted_old_source: None,
+    }];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+
+    // JSDoc の型を狭めた TYPED は **blocking な modified** に残り続ける。
+    // modified と const_value_changes を結合して判定すると、将来 informational 側へ
+    // 誤降格しても通ってしまうので、bucket を分けて確認する。
+    let modified: Vec<&str> = api.modified.iter().map(|m| m.name.as_str()).collect();
+    let demoted: Vec<&str> = api
+        .const_value_changes
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert!(
+        modified.contains(&"TYPED"),
+        "JSDoc の型変更は blocking な modified に残すべき: modified={modified:?} demoted={demoted:?}"
+    );
+    assert!(
+        !demoted.contains(&"TYPED"),
+        "JSDoc の型変更を const_value_changes へ降格してはいけない: {demoted:?}"
+    );
+    // 対照: 通常コメントだけの変更はどちらにも出さない
+    assert!(
+        !modified.contains(&"PLAIN") && !demoted.contains(&"PLAIN"),
+        "通常コメントのみ変更した PLAIN は API 変更に出すべきでない: modified={modified:?} demoted={demoted:?}"
+    );
+}

@@ -238,12 +238,91 @@ pub(crate) fn extract_api_signature(
         .to_string()
 }
 
+/// 宣言テキストから comment トークンを取り除いたうえで空白正規化する。
+///
+/// 値バインディングの signature は初期化子を含む item 全体から作るため、素朴に
+/// テキストを取るとコメントまで signature の一部になる。その結果 **コメントを直しただけで
+/// `api.mod` に載り Stop hook が blocking する** (実測: コードを 1 文字も変えず
+/// `/// 一覧表` と配列内の `// 最初の要素` を書き換えただけで `modified` 1 件 / exit 1)。
+/// さらに [`normalize_signature_whitespace`] が改行を潰すので、行コメント以降が 1 行へ
+/// 連なり後段の shape 抽出 (`extract_binding_shape`) が parse に失敗する。失敗は
+/// fail-closed なので、本来なら非 blocking な `const_value_changes` へ降格できる
+/// 純粋な値変更まで blocking 側に残っていた (Issue: 2026-09-16-const-array-append)。
+///
+/// **コメントは削るのではなく空白 1 個へ置換する。** 削るとトークンが連結して
+/// `foo/*c*/bar` が `foobar` になり、別物の signature が一致してしまう
+/// (`ts_signature.rs` の「トークン境界は保つ」と同じ規約)。
+///
+/// `keep_doc_comments` は **JS/TS 専用**。`/** @type {string} */ ("x")` のような JSDoc は
+/// 型アサーションとして実際に型契約を持つため、落とすと型変更を見逃す fail-open になる。
+/// Rust の `///` / `//!` は型契約を持たないので落として良い (そもそも tree-sitter-rust では
+/// doc comment と属性は `const_item` の**外側**に出るため範囲に入らない)。
+///
+/// 文字列リテラル中の `//` は comment ノードではないので AST ベースの本判定では誤爆しない
+/// (テキスト置換で実装すると `"https://example.test/a//b"` を壊す)。
+fn normalize_signature_dropping_comments(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    keep_doc_comments: bool,
+) -> Option<String> {
+    let (start, end) = (node.start_byte(), node.end_byte());
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut cursor = node.walk();
+    let mut descend = true;
+    loop {
+        let current = cursor.node();
+        let is_comment = matches!(current.kind(), "comment" | "line_comment" | "block_comment");
+        if is_comment {
+            let keep = keep_doc_comments
+                && source
+                    .get(current.start_byte()..current.end_byte())
+                    .is_some_and(|b| b.starts_with(b"/**"));
+            if !keep {
+                spans.push((current.start_byte(), current.end_byte()));
+            }
+        }
+        // comment ノードは葉なので潜らない。
+        if descend && !is_comment && cursor.goto_first_child() {
+            continue;
+        }
+        if cursor.goto_next_sibling() {
+            descend = true;
+            continue;
+        }
+        if !cursor.goto_parent() || cursor.node().id() == node.id() {
+            break;
+        }
+        descend = false;
+    }
+
+    if spans.is_empty() {
+        return source.get(start..end).map(normalize_signature_whitespace);
+    }
+    spans.sort_unstable();
+    let mut out: Vec<u8> = Vec::with_capacity(end.saturating_sub(start));
+    let mut pos = start;
+    for (s, e) in spans {
+        // 走査順の乱れや範囲外を拾っても壊れないよう、進行方向だけを信じる。
+        if s < pos || e > end {
+            continue;
+        }
+        out.extend_from_slice(source.get(pos..s)?);
+        out.push(b' ');
+        pos = e;
+    }
+    out.extend_from_slice(source.get(pos..end)?);
+    Some(normalize_signature_whitespace(&out))
+}
+
 /// 値バインディング 1 個 (`export const X = ...` / `const X: T = ...` / `static X: T = ...`)
 /// の宣言テキストを正規化して返す。
 ///
 /// JS/TS では declarator 単位で切り出し、宣言 keyword (`const` / `let` / `var`) と
 /// `export` を prefix として補う。Rust は `const_item` / `static_item` が 1 名前 1 item
 /// なので item 全体をそのまま使う。
+///
+/// どちらの経路でもコメントトークンは signature から落とす
+/// ([`normalize_signature_dropping_comments`])。
 fn value_binding_signature(
     sym: &crate::models::symbol::Symbol,
     root: tree_sitter::Node<'_>,
@@ -261,13 +340,14 @@ fn value_binding_signature(
     loop {
         match cur.kind() {
             // Rust: 1 item = 1 名前なので item 全体で良い。
+            // doc comment と属性は item の外側に出るため、落とすのは初期化子中の
+            // 行コメント / ブロックコメントだけになる。
             "const_item" | "static_item" => {
-                return source
-                    .get(cur.start_byte()..cur.end_byte())
-                    .map(normalize_signature_whitespace);
+                return normalize_signature_dropping_comments(cur, source, false);
             }
             "variable_declarator" => {
-                let body = source.get(cur.start_byte()..cur.end_byte())?;
+                // JS/TS は JSDoc (`/** @type {...} */`) が型アサーションとして効くので残す。
+                let body = normalize_signature_dropping_comments(cur, source, true)?;
                 let mut prefix = String::new();
                 // 宣言 keyword と export を辿って補う。
                 let mut ancestor = cur.parent();
@@ -290,7 +370,8 @@ fn value_binding_signature(
                     ancestor = node.parent();
                 }
                 let mut sig = prefix;
-                sig.push_str(&normalize_signature_whitespace(body));
+                // body は normalize_signature_dropping_comments で正規化済み。
+                sig.push_str(&body);
                 return Some(sig);
             }
             _ => {}
