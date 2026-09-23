@@ -85,11 +85,11 @@ impl JsTsMemberLiveness {
         let Some(all_files) = collect_source_files(canonical_dir, extra_files) else {
             return Self { statuses };
         };
+        // 拡張子なしの `bin/cli` (`#!/usr/bin/env node`) も参照件数の経路と同じく含める。
         let ts_js_files: Vec<(std::path::PathBuf, LangId)> = all_files
             .into_iter()
             .filter_map(|p| {
-                let s = p.to_str()?;
-                let lang = LangId::from_path(camino::Utf8Path::new(s)).ok()?;
+                let lang = crate::engine::refs::detect_source_lang(&p)?;
                 if is_js_ts_lang(lang) {
                     Some((p, lang))
                 } else {
@@ -386,6 +386,27 @@ fn analyze_file(
                         return analysis;
                     }
                 }
+            }
+        }
+    }
+
+    // 4. 分割代入でメンバーを取り出す access (`const { parse } = Alpha` /
+    //    `function f({ parse })` / `({ parse } = x)`) は member_expression にならないため
+    //    3 の query に掛からず、分割代入でしか使われない同名メンバーが両方 dead に出ていた。
+    //    右辺の receiver を辿れたとしても取り出した値の行き先は追わないので、帰属を推測せず
+    //    パターンのキーに同名が現れた時点で不解決 (duplicate set 全体を Ambiguous) に倒す。
+    if ts_language_for(lang).is_some()
+        && let Ok(query) = crate::engine::query_cache::cached_query(lang, DESTRUCTURED_KEY_QUERY)
+    {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, root, source);
+        while let Some(m) = matches.next() {
+            if m.captures()
+                .iter()
+                .any(|cap| cap.node.utf8_text(source) == Ok(target_member))
+            {
+                analysis.has_unresolved_access = true;
+                return analysis;
             }
         }
     }
@@ -750,10 +771,21 @@ const IMPORT_QUERY: &str = r#"
 "#;
 
 /// `obj.member` および `obj?.member` の右辺 property_identifier を捕捉する query。
-/// shorthand `{ member }` や `obj["member"]` は対象外 (別途 ambiguous 検出)。
+/// 分割代入 `{ member } = obj` は `DESTRUCTURED_KEY_QUERY`、`obj["member"]` は
+/// 引用符付きトークンの検出 (`contains_ambiguous_member_token`) で別途 ambiguous に倒す。
 const MEMBER_ACCESS_QUERY: &str = r#"
 (member_expression
   property: (property_identifier) @prop)
+"#;
+
+/// 分割代入パターンのキー位置にあるメンバー名を捕捉する query。変数宣言・パラメータ・
+/// 代入式・for-of の left のいずれでも `object_pattern` 配下に同じ形で現れる。
+/// shorthand (`{ m }`) / 別名 (`{ m: alias }`) / default 付き (`{ m = d }`) の 3 形。
+/// 文字列キー (`{ "m": a }`) は引用符付きトークンの検出側が拾う。
+const DESTRUCTURED_KEY_QUERY: &str = r#"
+(object_pattern (shorthand_property_identifier_pattern) @key)
+(object_pattern (pair_pattern key: (property_identifier) @key))
+(object_pattern (object_assignment_pattern left: (shorthand_property_identifier_pattern) @key))
 "#;
 
 #[cfg(test)]
@@ -906,6 +938,51 @@ mod tests {
         );
         assert!(!a.has_unresolved_access);
         assert_eq!(count_for(&a, "Alpha"), 2);
+    }
+
+    /// 分割代入でメンバーを取り出す access は member_expression にならないため、旧実装は
+    /// 見落として `Alpha.parse` / `Beta.parse` を両方 dead にしていた。キー位置に同名が
+    /// 現れたら不解決 (duplicate set 全体を Ambiguous) に倒す。
+    /// TS / TSX / JS の 3 文法で同じ query が効くこと (query のノード名が文法に無いと
+    /// コンパイル失敗で黙って判定が抜ける) も固定する。
+    #[test]
+    fn destructured_member_key_is_unresolved() {
+        let forms = [
+            "const { parse } = Alpha;\nparse(\"x\");\n",
+            "const { parse: p } = Alpha;\np(\"x\");\n",
+            "const { parse = fallback } = Alpha;\nparse(\"x\");\n",
+            "export function f({ parse }) { return parse(\"x\"); }\nf(Alpha);\n",
+            "let parse;\n({ parse } = Alpha);\nparse(\"x\");\n",
+            "for (const { parse } of [Alpha]) { parse(\"x\"); }\n",
+            "const { nested: { parse } } = holder;\nparse(\"x\");\n",
+        ];
+        for lang in [LangId::Typescript, LangId::Tsx, LangId::Javascript] {
+            for body in forms {
+                let src = format!("import {{ Alpha }} from \"./alpha\";\n{body}");
+                let a = analyze(&src, lang, &["Alpha", "Beta"], "parse");
+                assert!(
+                    a.has_unresolved_access,
+                    "{lang:?}: 分割代入の取り出しは不解決に倒すべき: {body}"
+                );
+            }
+        }
+    }
+
+    /// 対照: キーが別名の分割代入 (`{ other }`) や、値側の束縛名が偶然同名なだけの
+    /// パターン (`{ other: parse }`) は対象メンバーの取り出しではないので不解決にしない。
+    /// 通常の static access は従来どおり owner へ票が入る。
+    #[test]
+    fn unrelated_destructuring_does_not_mark_member_unresolved() {
+        for lang in [LangId::Typescript, LangId::Tsx, LangId::Javascript] {
+            let a = analyze(
+                "import { Alpha } from \"./alpha\";\nconst { other } = Alpha;\nconst { other: parse } = Alpha;\nAlpha.parse(\"x\");\n",
+                lang,
+                &["Alpha", "Beta"],
+                "parse",
+            );
+            assert!(!a.has_unresolved_access, "{lang:?}");
+            assert_eq!(count_for(&a, "Alpha"), 1, "{lang:?}");
+        }
     }
 
     /// 型注釈付きの単純 identifier は従来どおり owner へ解決される (回帰確認)。

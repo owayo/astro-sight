@@ -353,3 +353,235 @@ fn dead_code_php_conflicting_alias_stays_ambiguous() {
         "競合 alias は Ambiguous に倒して両 owner を旧スキップ維持: {names:?}"
     );
 }
+
+/// PHP 8 の nullsafe 呼び出し `$a?->fmt()` も receiver の型を静的に辿れない呼び出しとして
+/// duplicate set を Ambiguous に倒す。旧実装は `member_call_expression` しか見ておらず、
+/// `?->` でしか呼ばれない同名メソッド (`Alpha.fmt` / `Beta.fmt`) が両方 dead に出ていた。
+/// 対照: nullsafe の**プロパティ**アクセス `$a?->fmt` はメソッド参照ではないので
+/// set を Ambiguous にしない (`->` のプロパティアクセスと同じ扱い)。
+#[test]
+fn dead_code_php_nullsafe_call_marks_duplicate_set_ambiguous() {
+    let repo = TestRepo::new();
+
+    repo.write(
+        "Alpha.php",
+        "<?php\nclass Alpha {\n    public function fmt() { return 'a'; }\n    public function show() { return 'a'; }\n}\n",
+    );
+    repo.write(
+        "Beta.php",
+        "<?php\nclass Beta {\n    public function fmt() { return 'b'; }\n    public function show() { return 'b'; }\n}\n",
+    );
+    repo.write(
+        "Use.php",
+        "<?php\nfunction run(?Alpha $a) {\n    $x = $a?->fmt();\n    return $a?->show;\n}\n",
+    );
+
+    let names = dead_names(&repo);
+    assert!(
+        !contains(&names, "Alpha.fmt") && !contains(&names, "Beta.fmt"),
+        "`?->fmt()` は owner を推定できないので両方 dead 判定しないべき: {names:?}"
+    );
+    assert!(
+        contains(&names, "Alpha.show") && contains(&names, "Beta.show"),
+        "対照: `?->show` はプロパティアクセスなので show の set は従来どおり dead: {names:?}"
+    );
+}
+
+/// owner でも trait 合成先でもないクラスを scope にした静的呼び出し (`Child::make()`、
+/// `Child extends Base`) は継承元の候補へ到達し得る。旧実装は票を捨てていた (Ignore) ため
+/// `Base.make` が参照 0 件で dead と誤報されていた (TS 側は同条件を Ambiguous に倒す)。
+#[test]
+fn dead_code_php_subclass_static_call_marks_duplicate_set_ambiguous() {
+    let repo = TestRepo::new();
+
+    repo.write(
+        "Base.php",
+        "<?php\nabstract class Base { public static function make() { return 1; } }\n",
+    );
+    repo.write("Child.php", "<?php\nclass Child extends Base {}\n");
+    repo.write(
+        "Other.php",
+        "<?php\nclass Other { public static function make() { return 2; } }\n",
+    );
+    repo.write("Use.php", "<?php\nChild::make();\n");
+
+    let names = dead_names(&repo);
+    assert!(
+        !contains(&names, "Base.make") && !contains(&names, "Other.make"),
+        "サブクラス経由の静的呼び出しは継承元へ届き得るので dead 判定しないべき: {names:?}"
+    );
+}
+
+/// 対照: scope クラスが対象メソッドを自分で実装している場合 (ここでは private なので
+/// 候補ではない) は PHP の解決順 (自クラス > trait > 親) でそのメソッドへ静的に解決される。
+/// 候補へは届かないので票を捨て (Ambiguous にせず)、無関係な同名メソッドの dead 検出を保つ。
+#[test]
+fn dead_code_php_static_call_on_self_declaring_class_keeps_precision() {
+    let repo = TestRepo::new();
+
+    repo.write(
+        "Base.php",
+        "<?php\nclass Base { public static function make() { return 1; } }\n",
+    );
+    repo.write(
+        "Other.php",
+        "<?php\nclass Other { public static function make() { return 2; } }\n",
+    );
+    repo.write(
+        "Own.php",
+        "<?php\nclass Own {\n    private static function make() { return 3; }\n    public static function run() { return Own::make(); }\n}\n",
+    );
+    repo.write("Use.php", "<?php\nOther::make();\nOwn::run();\n");
+
+    let names = dead_names(&repo);
+    assert!(
+        contains(&names, "Base.make"),
+        "自己宣言メソッドへの呼び出しは set を Ambiguous にしないので Base.make は dead のまま: {names:?}"
+    );
+    assert!(
+        !contains(&names, "Other.make"),
+        "Other::make() は確定参照: {names:?}"
+    );
+}
+
+/// `new Child()` (`Child extends Base`、自前の constructor なし) は `Base::__construct` を
+/// 呼ぶ。旧実装は owner でない scope の object creation を捨てていたため `Base.__construct`
+/// が dead と誤報されていた。
+#[test]
+fn dead_code_php_new_subclass_marks_construct_set_ambiguous() {
+    let repo = TestRepo::new();
+
+    repo.write(
+        "Base.php",
+        "<?php\nabstract class Base { public function __construct() {} }\n",
+    );
+    repo.write("Child.php", "<?php\nclass Child extends Base {}\n");
+    repo.write(
+        "Other.php",
+        "<?php\nclass Other { public function __construct() {} }\n",
+    );
+    repo.write("Use.php", "<?php\n$c = new Child();\n");
+
+    let names = dead_names(&repo);
+    assert!(
+        !contains(&names, "Base.__construct") && !contains(&names, "Other.__construct"),
+        "継承元の constructor を呼ぶ new は dead 判定しないべき: {names:?}"
+    );
+}
+
+/// 対照: 走査対象外のクラス (`new \Exception()`) と、`extends` を持たない走査対象内の
+/// クラス (`new Plain()`) の object creation は候補の constructor へ届かないので
+/// set を Ambiguous にしない (constructor の dead 検出を保つ)。
+#[test]
+fn dead_code_php_new_unrelated_class_keeps_construct_precision() {
+    let repo = TestRepo::new();
+
+    repo.write(
+        "Foo.php",
+        "<?php\nclass Foo { public function __construct() {} }\n",
+    );
+    repo.write(
+        "Bar.php",
+        "<?php\nclass Bar { public function __construct() {} }\n",
+    );
+    repo.write("Plain.php", "<?php\nclass Plain {}\n");
+    repo.write(
+        "Use.php",
+        "<?php\n$f = new Foo();\n$e = new \\Exception('x');\n$p = new Plain();\n",
+    );
+
+    let names = dead_names(&repo);
+    assert!(
+        !contains(&names, "Foo.__construct"),
+        "new Foo() は確定参照: {names:?}"
+    );
+    assert!(
+        contains(&names, "Bar.__construct"),
+        "候補へ届かない new は set を Ambiguous にしないので Bar.__construct は dead のまま: {names:?}"
+    );
+}
+
+/// 無名サブクラス `new class extends Base {}` は、自前の constructor を持たなければ
+/// `Base::__construct` を呼ぶ (抽象クラスをテストで具象化するときの定番の形)。旧実装は
+/// 無名クラスの生成を一律に捨てていたため `Base.__construct` が dead と誤報されていた。
+///
+/// 3 形を別リポジトリで固定する:
+/// - 継承元が候補 → `new Base()` と同じく確定票 (未使用の `Other.__construct` は dead のまま)
+/// - 自前の `__construct` を持つ → 継承元へは届かないので票を捨てる (対照: 両方 dead)
+/// - trait を use する → 合成先を辿らず set 全体を Ambiguous に倒す
+#[test]
+fn dead_code_php_anonymous_subclass_reaches_base_constructor() {
+    let setup = |use_php: &str| {
+        let repo = TestRepo::new();
+        repo.write(
+            "Base.php",
+            "<?php\nabstract class Base { public function __construct() {} }\n",
+        );
+        repo.write(
+            "Other.php",
+            "<?php\nclass Other { public function __construct() {} }\n",
+        );
+        repo.write(
+            "Helper.php",
+            "<?php\ntrait Helper { public function h() {} }\n",
+        );
+        repo.write("Use.php", use_php);
+        repo
+    };
+
+    let names = dead_names(&setup("<?php\n$b = new class(1) extends Base {};\n"));
+    assert!(
+        !contains(&names, "Base.__construct"),
+        "無名サブクラスの生成は継承元の constructor を呼ぶ: {names:?}"
+    );
+    assert!(
+        contains(&names, "Other.__construct"),
+        "確定票なので同じ set の未使用側は dead のまま: {names:?}"
+    );
+
+    let names = dead_names(&setup(
+        "<?php\n$b = new class extends Base { public function __construct() {} };\n",
+    ));
+    assert!(
+        contains(&names, "Base.__construct") && contains(&names, "Other.__construct"),
+        "対照: 自前の constructor を持つ無名クラスは継承元へ届かない: {names:?}"
+    );
+
+    let names = dead_names(&setup(
+        "<?php\n$b = new class extends Other { use Helper; };\n",
+    ));
+    assert!(
+        !contains(&names, "Base.__construct") && !contains(&names, "Other.__construct"),
+        "trait を use する無名クラスは constructor の出所を推測せず Ambiguous: {names:?}"
+    );
+}
+
+/// 拡張子なしの PHP スクリプト (`bin/console`、`#!/usr/bin/env php`) も member liveness の
+/// 走査対象に含める。参照件数の経路は shebang で PHP と判定して走査する一方、member
+/// liveness は拡張子だけで PHP ファイルを選んでいたため、スクリプトからしか呼ばれない
+/// `Alpha.fmt` が参照 0 件で dead と誤報されていた。
+/// 対照: 呼ばれない `Beta.fmt` は owner 一意推定のまま dead。
+#[test]
+fn dead_code_php_member_liveness_scans_shebang_script() {
+    let repo = TestRepo::new();
+    repo.write(
+        "Alpha.php",
+        "<?php\nclass Alpha { public static function fmt() { return 1; } }\n",
+    );
+    repo.write(
+        "Beta.php",
+        "<?php\nclass Beta { public static function fmt() { return 2; } }\n",
+    );
+    repo.create_dir_all("bin");
+    repo.write("bin/console", "#!/usr/bin/env php\n<?php\nAlpha::fmt();\n");
+
+    let names = dead_names(&repo);
+    assert!(
+        !contains(&names, "Alpha.fmt"),
+        "shebang の PHP スクリプトからの呼び出しは確定参照: {names:?}"
+    );
+    assert!(
+        contains(&names, "Beta.fmt"),
+        "対照: 呼ばれない側は dead のまま: {names:?}"
+    );
+}

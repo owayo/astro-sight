@@ -2236,3 +2236,161 @@ fn detect_api_changes_ts_literal_union_widening_and_import_alias_stay_modified()
         );
     }
 }
+
+/// 引数なし関数へ省略可能な destructured 引数を足した変更でも、戻り値型や `async` など
+/// 引数以外の契約が変わっていれば blocking な api.mod に残す。
+///
+/// 旧判定は「旧引数が空で新引数が省略可能か」しか見ずに変更ごと捨てていたため、
+/// `getLabel(): string` → `getLabel({ loud } = {}): number` のように戻り値型が変わって
+/// 呼び出し側の `getLabel().toUpperCase()` が壊れても、api に何も出なかった。
+/// 引数以外が不変なら従来どおり非 blocking だが、黙って捨てず `compatible_modified` に
+/// 理由付きで載せる (他の互換判定と同じ扱い)。
+#[test]
+fn detect_api_changes_ts_no_arg_to_destructured_keeps_non_parameter_contract() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/label.ts",
+                "export function getLabel(): string {\n  return \"label\";\n}\n\nexport function loadLabel() {\n  return \"label\";\n}\n",
+            ),
+            (
+                "src/use.ts",
+                "import { getLabel, loadLabel } from \"./label\";\n\nexport function shout(): string {\n  return getLabel().toUpperCase() + loadLabel().toUpperCase();\n}\n",
+            ),
+        ],
+        "initial",
+    );
+    let unchanged_load = "export function loadLabel() {\n  return \"label\";\n}\n";
+    let unchanged_get = "export function getLabel(): string {\n  return \"label\";\n}\n";
+    // (ケース名, 変更後の label.ts, blocking に残るべきシンボル, 互換として載るべき (シンボル, 理由))
+    let cases = [
+        (
+            "戻り値型の変更を伴う destructured 引数追加",
+            format!(
+                "export function getLabel({{ loud }}: {{ loud?: boolean }} = {{}}): number {{\n  return loud ? 2 : 1;\n}}\n\n{unchanged_load}"
+            ),
+            Some("getLabel"),
+            None,
+        ),
+        (
+            "async 化を伴う destructured 引数追加",
+            format!(
+                "{unchanged_get}\nexport async function loadLabel({{ loud }}: {{ loud?: boolean }} = {{}}) {{\n  return loud ? \"LABEL\" : \"label\";\n}}\n"
+            ),
+            Some("loadLabel"),
+            None,
+        ),
+        (
+            "対照: 戻り値型だけの変更",
+            format!("export function getLabel(): number {{\n  return 1;\n}}\n\n{unchanged_load}"),
+            Some("getLabel"),
+            None,
+        ),
+        (
+            "対照: 引数以外が不変な destructured 引数追加",
+            format!(
+                "export function getLabel({{ loud }}: {{ loud?: boolean }} = {{}}): string {{\n  return loud ? \"LABEL\" : \"label\";\n}}\n\n{unchanged_load}"
+            ),
+            None,
+            Some(("getLabel", "trailing_optional_params")),
+        ),
+    ];
+    for (case, after, blocking, compatible) in cases {
+        fs::write(repo.join("src/label.ts"), &after).expect("write label.ts");
+        let api = detect_api_changes_from_worktree(repo);
+        let modified: Vec<&str> = api.modified.iter().map(|c| c.name.as_str()).collect();
+        let compat: Vec<(&str, &str)> = api
+            .compatible_modified
+            .iter()
+            .map(|c| (c.name.as_str(), c.reason.as_str()))
+            .collect();
+        assert_eq!(
+            modified,
+            blocking.into_iter().collect::<Vec<_>>(),
+            "{case}: blocking な api.mod が期待と異なる。compatible={compat:?}"
+        );
+        assert_eq!(
+            compat,
+            compatible.into_iter().collect::<Vec<_>>(),
+            "{case}: compatible_modified が期待と異なる。modified={modified:?}"
+        );
+    }
+}
+
+/// 引数なし関数へ default 値の無い destructured 引数 (型の全メンバーが optional) を足した
+/// 変更は、参照がすべて JSX タグ利用のときだけ互換とする。
+///
+/// TS では default 値も `?` も無い引数は省略できない (`buildQuery()` は TS2554) ため、
+/// 型が全 optional でも直接呼び出しは壊れる。JSX (`<Panel />`) は常に props object を
+/// 渡すので、JSX だけで使われる関数コンポーネントなら既存の利用は壊れない。
+#[test]
+fn detect_api_changes_ts_no_arg_to_optional_props_without_default_requires_jsx_only_usage() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/Panel.tsx",
+                "export function Panel() {\n  return null;\n}\n",
+            ),
+            (
+                "src/App.tsx",
+                "import { Panel } from \"./Panel\";\n\nexport function App() {\n  return <Panel />;\n}\n",
+            ),
+            (
+                "src/query.ts",
+                "export function buildQuery(): string {\n  return \"q\";\n}\n",
+            ),
+            (
+                "src/run.ts",
+                "import { buildQuery } from \"./query\";\n\nexport function run(): string {\n  return buildQuery();\n}\n",
+            ),
+            (
+                "src/config.ts",
+                "export function getConfig(): string {\n  return \"c\";\n}\n",
+            ),
+        ],
+        "initial",
+    );
+    // 参照が 1 件も無くても (= JSX 以外の利用も無くても)、戻り値型が変われば互換ではない。
+    fs::write(
+        repo.join("src/config.ts"),
+        "export function getConfig({ debug }: { debug?: boolean }): number {\n  return debug ? 1 : 0;\n}\n",
+    )
+    .expect("write config.ts");
+    fs::write(
+        repo.join("src/Panel.tsx"),
+        "interface PanelProps {\n  title?: string;\n}\n\nexport function Panel({ title }: PanelProps) {\n  return title ?? null;\n}\n",
+    )
+    .expect("write Panel.tsx");
+    fs::write(
+        repo.join("src/query.ts"),
+        "export function buildQuery({ limit }: { limit?: number }): string {\n  return `q${limit ?? \"\"}`;\n}\n",
+    )
+    .expect("write query.ts");
+
+    let api = detect_api_changes_from_worktree(repo);
+    let mut modified: Vec<&str> = api.modified.iter().map(|c| c.name.as_str()).collect();
+    modified.sort_unstable();
+    let compat: Vec<(&str, &str)> = api
+        .compatible_modified
+        .iter()
+        .map(|c| (c.name.as_str(), c.reason.as_str()))
+        .collect();
+    assert_eq!(
+        modified,
+        vec!["buildQuery", "getConfig"],
+        "直接呼び出しのある関数 / 戻り値型も変えた関数は blocking。compatible={compat:?}"
+    );
+    assert_eq!(
+        compat,
+        vec![("Panel", "optional_props_jsx_component")],
+        "JSX だけで使われるコンポーネントは互換として理由付きで載せる。modified={modified:?}"
+    );
+}

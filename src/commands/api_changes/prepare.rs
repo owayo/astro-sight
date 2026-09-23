@@ -66,6 +66,9 @@ pub(crate) struct DetectionInputs<'a> {
     pub(crate) diff_files: &'a [crate::models::impact::DiffFile],
     pub(crate) diff_new_paths: &'a HashSet<String>,
     pub(crate) ref_index: &'a ApiRefIndex,
+    /// base リビジョンの blob の読み手 (常駐 `git cat-file --batch`)。旧版を読む経路は
+    /// すべてこれを通し、ファイルやシンボルごとに `git show` を起動しない。
+    pub(crate) base_blobs: &'a crate::commands::git_input::GitBlobBatch,
 }
 
 /// 分類の過程で更新される可変状態 (結果バケットと、ファイル単位のメモ化キャッシュ)。
@@ -118,9 +121,12 @@ pub(crate) enum PreparedDiffFile {
         new_syms: Option<Vec<(String, String, String)>>,
         in_file_callees: std::collections::HashSet<String>,
     },
-    /// 削除ファイル (`new_path == "/dev/null"`)。cross-file 参照判定を行わないため
-    /// 抽出は従来どおり `process_deleted_file` 内で行う。
-    Deleted,
+    /// 削除ファイル (`new_path == "/dev/null"`)、または対応言語でないファイルへの rename
+    /// (新側に API 面が無い)。削除 bash 関数の残存参照判定に使う名前を ApiRefIndex へ
+    /// 入れるため、旧版の exported シンボルを Phase 0 で抽出しておく。
+    Deleted {
+        old_syms: Option<Vec<(String, String, String)>>,
+    },
     /// 通常の modified ファイル。
     Modified {
         old_syms: Option<Vec<(String, String, String)>>,
@@ -190,6 +196,22 @@ pub(crate) fn collect_modified_file_index_names(
             index_names.insert(bare_name(name).to_string());
         }
     }
+}
+
+/// 削除ファイルの旧版から exported シンボルを抽出する。
+///
+/// base が source branch HEAD と同一の場合、`git show base:old_path` は削除済みで
+/// 失敗し None になる。その場合は --diff-file が保持している旧ソース
+/// (deleted_old_source) から AST を組み立てて exported シンボルを抽出する。
+pub(crate) fn extract_deleted_file_exported_symbols(
+    base_blobs: &crate::commands::git_input::GitBlobBatch,
+    df: &crate::models::impact::DiffFile,
+) -> Option<ExportedSymbols> {
+    extract_exported_symbols_from_git(base_blobs, &df.old_path).or_else(|| {
+        df.deleted_old_source
+            .as_deref()
+            .and_then(|src| extract_exported_symbols_from_source(&df.old_path, src))
+    })
 }
 
 /// src 相対パスを Rust モジュールセグメント列に変換する。
@@ -266,6 +288,10 @@ pub(crate) struct NewFileFacts {
     pub(crate) exported: Option<Vec<(String, String, String)>>,
     pub(crate) callees: std::collections::HashSet<String>,
     pub(crate) export_surface_names: std::collections::HashSet<String>,
+    /// ファイルは読めたが、拡張子 / shebang から言語を判定できなかった
+    /// (= 解析対象のソースではない)。`exported` が `None` になる理由のうち、
+    /// 読み込み失敗や parse 失敗 (判定不能) と区別するために持つ。
+    pub(crate) language_unknown: bool,
 }
 
 pub(crate) fn extract_new_file_facts(dir: &str, file_path: &str) -> NewFileFacts {
@@ -273,6 +299,7 @@ pub(crate) fn extract_new_file_facts(dir: &str, file_path: &str) -> NewFileFacts
         exported: None,
         callees: std::collections::HashSet::new(),
         export_surface_names: std::collections::HashSet::new(),
+        language_unknown: false,
     };
     // exported の test path 短絡: parse せず Some(空) を返す (extract_exported_symbols_from_file と一致)。
     let is_test = is_test_path(std::path::Path::new(file_path));
@@ -291,6 +318,7 @@ pub(crate) fn extract_new_file_facts(dir: &str, file_path: &str) -> NewFileFacts
         return facts;
     };
     let Ok(lang_id) = parser::detect_lang(utf8_path, &source) else {
+        facts.language_unknown = true;
         return facts;
     };
 

@@ -207,6 +207,18 @@ compact 出力例:
 | `cn` | enclosing container 名。`impl Default for AppService` の中のメソッドなら `AppService`。同名メソッドの見分けに使う |
 | `doc` | docstring（`--doc` 指定時のみ） |
 
+#### 抽出する宣言
+
+関数・メソッド・クラス・構造体・列挙・型などの宣言に加え、次の形も 1 シンボルとして抽出する。
+これらは公開 API 差分 (`review` の api.add / api.rm / api.mod) と dead-code の対象にもなる。
+
+- JavaScript / TypeScript の分割代入 (`export const { auth, signOut } = NextAuth()` / `const [first, second] = pair()`) は束縛名ごとに 1 シンボル。プロパティキー (`{ key: renamed }` の `key`) は含めず、`ln` は各名前の行を返す。関数内のローカルな分割代入も通常の `const` と同じく抽出する
+- `var` 宣言、generator 関数 (`function*`)、`abstract class`
+- Java / C# の `record` (`class` として扱う)、Go の型エイリアス (`type A = B`)
+- Rust の trait メソッド (本体の無い必須メソッドを含む)。trait の可視性を継承し、`pub trait` のメソッドの削除・シグネチャ変更は api.rm / api.mod になる。dead-code の対象にはしない
+
+TypeScript の interface / abstract メソッドと Go の interface メソッドは現状抽出しない。
+
 #### 生成ファイルの除外と申告
 
 `refs --dir` と `symbols --dir` は、minified/bundle/IDE helper のファイル名と、
@@ -268,6 +280,8 @@ compact 出力例（caller でグルーピング）:
 ```
 
 `--pretty` で従来のフルフォーマット（caller/callee オブジェクト + call_site）を出力。
+
+`--function <name>` は `<name>` の**中から出ていく呼び出し** (callee) に絞る。「誰が `<name>` を呼んでいるか」(caller) は `calls` ではなく `refs --name <name>` で調べる (他ファイルからの呼び出しも含み、`ctx` に呼び出し行が入る)。
 
 ### imports - import 依存抽出
 
@@ -481,12 +495,15 @@ tracked ファイルには適用しない。commit / add 済みは意図的に�
 
 対象は**プログラム / テンプレート言語だと確実に言える拡張子**に限る（`.vue` / `.svelte` / `.astro` / `.erb` / `.razor` / `.scala` / `.dart` / `.lua` など）。走査対象外のファイルには画像・アーカイブ・データも含まれるため、全件を申告すると本当に見落としているソースがノイズに埋もれる。出力は拡張子単位に 1 件へ畳み、拡張子 10 種 / 代表パス 3 件を上限とする。該当ファイルが無ければ `truncations` 自体を出力しない。
 
+`dead-code` は参照を数えた範囲 (ディレクトリ全体) の解析できないソースを申告する。`--glob` や `--git` で dead の候補を絞っても参照はディレクトリ全体から数えるので、申告の範囲も狭めない。
+
 #### デフォルト除外
 
 `context` / `impact` / `review` の影響分析は、cross-file 参照検索時にサードパーティ依存と build artifact をデフォルトで除外する。`new` / `save` / `find` / `update` などの汎用メソッド名が 3rd-party / generated コードから大量に流入し、影響先を万件単位の偽陽性で埋めるのを防ぐ。
 
 - vendor / package manager: `vendor`, `node_modules`, `bower_components`, `.venv`, `venv`, `.tox`, `Pods`, `Carthage`
 - build artifact: `target`, `build`, `dist`, `out`, `.build`, `DerivedData`, `bin`, `obj`, `coverage`, `.next`, `.nuxt`, `.svelte-kit`, `.turbo`, `CMakeFiles`
+  - `bin` のうち Cargo パッケージの `src/bin/` (直上が `src` で、その親に `Cargo.toml` がある) はバイナリターゲットのソースなので除外しない。`--exclude-dir bin` を明示した場合はすべての `bin` を除外する
 
 追加除外を解除する場合:
 
@@ -540,6 +557,8 @@ astro-sight review --dir . --git \
 なお、これは「テスト変更が不要だと証明した」ものではない (期待値だけ更新して必要なテストロジックの変更を忘れることはある)。標準の生成関係にあるペアについて、履歴相関だけを根拠に逆方向の変更を要求しないという推薦方針。
 
 `api_changes.compatible_modified` には、シグネチャ文字列は変わるが既存呼び出しの互換性を保つ変更を出力する。React component の HOC ラップ、未参照 object member 削除、TS/TSX トップレベル関数の末尾 optional/default 引数追加 (`trailing_optional_params`)、Python トップレベル関数 / モジュール直下クラスメソッドの末尾 kwonly+default / 末尾 positional default 引数追加 (`trailing_optional_params`、デコレータ差分や同名関数複数定義は保守的に blocking 維持) は informational として扱い、`--hook` の blocking 対象にしない。同じシンボルに紐づく `impacts` も破壊的影響としては出さず、`mod_compat` の情報提供だけに留める。未参照 object member の判定では削除キーを 1 個ずつ全リポジトリ検索せず、Aho-Corasick で一括事前抽出して各 JS/TS ファイルを最大 1 回だけ parse する。ファイル収集・読み込み・parse の失敗時は互換扱いへ降格せず、従来どおり blocking を維持する。
+
+`export const` のような値バインディングは宣言全体 (初期化子を含む) を比較するが、**値そのものが関数の場合は本体を比較から外す** (`export function` の本体変更が api.mod にならないのと揃える)。対象は、値がアロー関数 / 関数式である場合 (括弧・`as`・`satisfies` 付きも含む)、React の `memo` / `forwardRef` に包んだ関数、オブジェクトリテラルのメンバーの関数 (メソッド・`key: () => ...`) の本体に限る。引数・型注釈・キーの追加削除は引き続き比較する。任意の呼び出しのコールバック (`create((set) => ({ ... }))` など) は中身がストアの形や値そのものを決めるので本体も比較する。分割代入の束縛 (`export const { a, b } = obj`) は、兄弟の追加・削除で生き残った束縛が api.mod にならないよう「その名前へ至る経路 + 初期化子」で比較する (配列は位置を保つ)。default 値・computed key・rest を含むパターンは宣言全体で比較する。
 
 Python の公開型契約を方向付きで分類できる変更には、`api_changes.modified[].contract_change`（hook では `api.mod[].contract`）として `{kind, breaks}` を付ける。`TypedDict` の必須性変更に加え、モジュール直下の直接的な `Literal` 型エイリアスについて、値集合の縮小を `literal_values_narrowed`（producer 側が破壊）、拡大を `literal_values_widened`（consumer 側が破壊）として報告する。`Literal` は `typing` / `typing_extensions` 由来と証明でき、値が escape / prefix を含まない文字列・10 進整数・真偽値・`None` だけの場合に限る。値の置換、動的な `__all__`、名前の shadow、star import など意味を静的に確定できない場合は方向を推測せず、通常の blocking な `api.mod` に残す。テストファイルは既存の公開 API 面規約どおり検出対象外。型エイリアスの項目は `kind = "type"` の疑似シンボルであり、`symbols` / `refs` / `dead-code` の解析対象には追加しない。
 
@@ -624,7 +643,18 @@ astro-sight dead-code --dir . --git --staged
 - **Python pytest**: `test_*.py` / `*_test.py` ファイルのトップレベル `test_*` 関数と `conftest.py` 内のすべての関数
 - **Python フレームワーク登録デコレータ**: Typer / Click / FastAPI / Flask / Django / Celery / pytest 等の登録デコレータが付いた関数・メソッド・クラス
 - **Python 動的プロトコルメソッド**: `urllib.request.BaseHandler` 系の `*_open` / `*_request` / `*_response` / `http_error_*` と、watchdog の `FileSystemEventHandler` 系 `on_*` callback。いずれも既知の基底クラスを直接継承するメソッドだけを除外する
-- **Angular**: `@Component` / `@Directive` 装飾クラスのライフサイクルフック (`ngOnInit` / `ngOnDestroy` / `ngOnChanges` / `ngDoCheck` / `ngAfterContentInit` / `ngAfterContentChecked` / `ngAfterViewInit` / `ngAfterViewChecked`) は Angular ランタイムが change detection サイクルで自動呼び出しするため除外
+- **Angular**: `@Component` / `@Directive` 装飾クラスのライフサイクルフック (`ngOnInit` / `ngOnDestroy` / `ngOnChanges` / `ngDoCheck` / `ngAfterContentInit` / `ngAfterContentChecked` / `ngAfterViewInit` / `ngAfterViewChecked`) は Angular ランタイムが change detection サイクルで自動呼び出しするため除外。`@Pipe` 装飾クラスの `transform` (テンプレートの `| name` から呼ばれる) と、`@Injectable` / `@Pipe` 装飾クラスの `ngOnDestroy` (service / pipe の破棄時に呼ばれる) も除外する。service / pipe の他のフック (`ngOnInit` 等) は Angular が呼ばないので除外しない
+- **プログラムのエントリポイント**: C / C++ のグローバルスコープの `main`、Kotlin のトップレベル `fun main` と `object` / `companion object` 直下の `@JvmStatic fun main`、Java の private でない `void main` (引数なしか `String[]` 1 個。Java 25 の instance main を含む)、C# の `static Main` (引数なしか `string[]` 1 個)。Java / C# / Kotlin はエントリポイントを宣言する型 (ネストした型の外側の型を含む) も除外する。API 差分には残す
+
+#### 生成ファイルの扱い
+
+生成ファイルとして検出したファイル (先頭の生成宣言コメント、`.gitattributes` の `linguist-generated` など) は、既定で dead 判定の**候補**から外す。ただし生成ファイルの中の参照は常に数える。gRPC の生成ハンドラ (`*_grpc.pb.go`) が手書きのサーバ実装を呼ぶ構成のように、生成コードは実行時に手書きコードを呼ぶため、その参照を捨てると生きているシンボルを dead と報告してしまう。
+
+候補から外したファイルは `generated_candidates_skipped` に `refs` の `skipped` と同じ形で出す (0 件なら出力しない)。`--include-generated` (または `skip_generated = false`) を指定すると生成ファイルのシンボルも候補にする。
+
+```json
+{ "...": "...", "generated_candidates_skipped": { "generated": 1, "paths": ["api/greeter_grpc.pb.go"] } }
+```
 
 #### フレームワーク自動検出 (v26.5.120+)
 
@@ -915,7 +945,7 @@ BPE トークナイザでは**改行とインデントが 1 行あたりおよ�
 - 空 object（`{}`）は TOON では空ドキュメント＝無出力になるため、auto は JSON を選ぶ。「結果が空」と「何も出力されなかった」を利用者が区別できなくなるのを避けるため（明示的な `--format toon` は仕様どおり空ドキュメントを出す）
 - プロトコル面（下記）では `auto` はエラーにならず JSON になる。「TOON で出せ」という満たせない要求ではなく、JSON を選ぶことも auto の正当な結果のため
 
-**バッチでの近似**: `--paths` / `--paths-file` / `--dir` は解析結果を全件バッファしない設計のため、全レコードを見てから勝者を決められない。**最初の window（既定でワーカー数 × 8 件）を両形式で描画し、その実測値で勝者を決めて以降の window に適用する**。二重エンコードのコストは先頭 window ぶんだけで、解析自体はどの経路でもパス 1 回きり。出力が途中で混ざることはない。
+**バッチでの近似**: `--paths` / `--paths-file` / `--dir` は解析結果を全件バッファしない設計のため、全レコードを見てから勝者を決められない。**出力順で先頭 32 件を標本として両形式で描画し、その実測値で勝者を決めて残りに適用する**。標本の件数は並列度（CPU 数 / `ASTRO_SIGHT_BATCH_WORKERS`）に依らない定数なので、同じ入力なら並列度を変えても同じ形式が選ばれる。二重エンコードのコストは標本ぶんだけで、解析自体はどの経路でもパス 1 回きり。出力が途中で混ざることはない。
 
 ### 常に JSON のままの出力
 
@@ -1071,14 +1101,15 @@ This is a MANDATORY rule. astro-sight uses tree-sitter AST parsing — matches o
 
 ## Workflow Rules (MANDATORY for code changes)
 - **Reviewing a diff / PR (START HERE)**: Run `astro-sight review --dir . --git` for impact + cochange + API diff + dead symbols before any piecemeal analysis
-- **Before editing code**: Run `astro-sight context --dir . --git` to check impact
+- **Before changing a function/type**: Run `astro-sight refs --name <symbol> --dir .` to list every call site first (`context` / `impact --git` only see an existing diff — on a clean tree they return nothing)
+- **Mid-edit, before touching more files**: Run `astro-sight context --dir . --git` to see what the diff so far breaks
 - **After editing code**: Run `astro-sight impact --dir . --git` to detect unresolved impacts
 - **Understanding a file**: Run `astro-sight symbols --path <file>` to see structure
 - **Understanding a directory**: Run `astro-sight symbols --dir <dir>` to see all symbols
 - **Exact AST node / parse debug**: Run `astro-sight ast --path <file> --line <n> --col <n>`
 - **Finding symbol usage**: Run `astro-sight refs` (Grep FORBIDDEN)
 - **Finding multiple symbols**: Run `astro-sight refs --names sym1,sym2 --dir .`
-- **Who calls this function?**: Run `astro-sight calls --path <file> --function <name>`
+- **Who calls this function?**: Run `astro-sight refs --name <name> --dir .` (`ctx` shows each call site, across files). `calls --function <name>` answers the opposite question — what `<name>` itself calls
 - **What does this file import?**: Run `astro-sight imports --path <file>`
 - **Files that change together**: Run `astro-sight cochange --dir . --paths <file>` (or `--git --base <rev>` to derive from a diff)
 - **Visualize call flow**: When execution order matters or the flow spans 3+ caller/callee interactions, run `astro-sight sequence --path <file> --function <name>`
@@ -1095,20 +1126,20 @@ astro-sight refs --names sym1,sym2 --dir .         # Batch symbol search (REPLAC
 astro-sight symbols --path <file>                  # File structure overview
 astro-sight symbols --dir <dir>                    # Directory structure overview (NDJSON)
 astro-sight ast --path <file> --line <n> --col <n> # Exact AST node at cursor (parse debug)
-astro-sight calls --path <file> --function <name>  # Caller/callee relationships
-astro-sight context --dir . --git                  # Change impact analysis (run BEFORE editing code)
+astro-sight calls --path <file> --function <name>  # What a function calls (callees; for callers use refs)
+astro-sight context --dir . --git                  # Impact of the current diff (needs uncommitted changes)
 astro-sight impact --dir . --git                   # Detect unresolved impacts (run AFTER editing code)
 astro-sight review --dir . --git                   # Structured diff review (impact + cochange + API + dead)
 astro-sight dead-code --dir . --git                # Find dead/unreferenced exported symbols
 astro-sight imports --path <file>                  # Import relationships
 astro-sight sequence --path <file>                 # Call flow visualization
-astro-sight cochange --dir .                       # Co-change patterns
+astro-sight cochange --dir . --paths <file>        # Files that usually change together (or --git)
 astro-sight lint --path <file> --rules rules.yaml  # Enforce repeated structural rules
 astro-sight session                                # NDJSON multi-query batch (stdin→stdout)
 ```
 
 ## Efficiency Rules
-- **`refs` results include `context` (source line)** → No need for additional Read/Grep
+- **`refs` results include `ctx` (source line)** → No need for additional Read/Grep
 - **Batch multiple symbol searches with `refs --names`** (simpler than session)
 - **For very common symbols, combine `--glob` with `ASTRO_SIGHT_BATCH_WORKERS`** to keep output size and peak RSS bounded
 - **Need surrounding lines (the `grep -A/-B` habit)?** → run `refs` first, then Read at the hit lines (astro-sight shows 1 line only)

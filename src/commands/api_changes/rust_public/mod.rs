@@ -1,7 +1,7 @@
 use crate::engine::parser;
 use crate::engine::symbols::rust_node_has_unrestricted_pub_visibility;
 
-use super::super::git_input::{git_show_blob, validate_git_revision};
+use super::super::git_input::validate_git_revision;
 use super::{bare_name, find_mod_decl_visibility, module_path_segments};
 
 mod reexport_graph;
@@ -10,6 +10,14 @@ mod use_tree;
 pub(crate) use reexport_graph::*;
 pub(crate) use source_tree::*;
 pub(crate) use use_tree::*;
+
+/// Rust の公開 API 面の判定対象になるパス (`.rs`) か。
+fn is_rust_source_path(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        == Some("rs")
+}
 
 /// `file_path` が属する Rust crate が binary-only (`src/lib.rs` を持たず外部から
 /// `pub` シンボルへ到達できない構成) かを判定する。binary-only crate では `pub` は
@@ -68,14 +76,21 @@ pub(crate) fn is_binary_only_rust_crate(dir: &str, file_path: &str) -> bool {
 /// - いずれの判定にも失敗 / 該当しない場合 = binary-only
 ///
 /// 失敗時は保守的に `false` (library crate 扱い) を返し、`api.rm` を抑制しない方向に倒す。
-pub(crate) fn is_binary_only_rust_crate_at_base(dir: &str, base: &str, file_path: &str) -> bool {
+///
+/// base 側は検出全体で共有する常駐の読み手から読む。祖先ディレクトリごとに `Cargo.toml` と
+/// `src/lib.rs` を 1 プロセスずつ `git show` していた旧実装は、このリポジトリ自身の review で
+/// 約 400 回のプロセス起動になっていた。
+pub(crate) fn is_binary_only_rust_crate_at_base(
+    base_blobs: &crate::commands::git_input::GitBlobBatch,
+    file_path: &str,
+) -> bool {
     let path = std::path::Path::new(file_path);
     if path.extension().and_then(|s| s.to_str()) != Some("rs") {
         return false;
     }
     // 祖先から導出する `<dir>/Cargo.toml` も同じ検証対象になるため、起点の file_path を
     // ここで弾いておく (先頭 `-` の dir を含む場合は導出パスも必ず不正になる)。
-    if validate_git_revision(base, "--base").is_err()
+    if validate_git_revision(base_blobs.rev(), "--base").is_err()
         || validate_git_revision(file_path, "diff file path").is_err()
     {
         return false;
@@ -84,10 +99,10 @@ pub(crate) fn is_binary_only_rust_crate_at_base(dir: &str, base: &str, file_path
     let mut ancestor: Option<&std::path::Path> = path.parent();
     while let Some(rel_dir) = ancestor {
         let cargo_rel = rel_dir.join("Cargo.toml");
-        if let Some(cargo_src) = git_show_blob(dir, base, &cargo_rel.to_string_lossy()) {
-            // 同 crate root の base 側 src/lib.rs 存在を git show で判定
+        if let Some(cargo_src) = base_blobs.read(&cargo_rel.to_string_lossy()) {
+            // 同 crate root の base 側 src/lib.rs 存在を判定
             let lib_rel = rel_dir.join("src/lib.rs");
-            if git_show_blob(dir, base, &lib_rel.to_string_lossy()).is_some() {
+            if base_blobs.read(&lib_rel.to_string_lossy()).is_some() {
                 return false;
             }
             let Ok(text) = std::str::from_utf8(&cargo_src) else {
@@ -113,34 +128,36 @@ pub(crate) fn is_binary_only_rust_crate_at_base(dir: &str, base: &str, file_path
 /// 構築する。`api.add` (new 側) / `api.mod` (old/new 両側) の private module 抑制と対称に base 側で判定する。
 pub(crate) fn is_rust_old_symbol_outside_public_api_surface(
     dir: &str,
-    base: &str,
+    base_blobs: &crate::commands::git_input::GitBlobBatch,
     old_path: &str,
     symbol_name: &str,
     context: &mut RustPublicApiContext,
 ) -> bool {
-    if context.is_binary_only_at_base(dir, base, old_path) {
+    // Rust 以外のファイルは対象外。以降の判定もすべて false に倒れるが、inline mod 判定だけは
+    // 旧版を読んで Rust として parse しており、TS などの api.rm / api.mod 候補 1 件ごとに
+    // 無駄な読み出しと parse が走っていた。
+    if !is_rust_source_path(old_path) {
+        return false;
+    }
+    if context.is_binary_only_at_base(base_blobs, old_path) {
         return true;
     }
+    let base = RustSourceTree::Base { blobs: base_blobs };
     // symbol が inline `mod_item` 内 (`mod foo { pub fn symbol() }` 形式) で定義されている
     // 場合、ファイルパス由来の module_segments とずれて edge graph seed が誤合致する。
     // 範囲限定 fail-closed: false negative を防ぐため `api.rm` 抑制を諦め symbol を残す
     // (Issue 2026-06-05-rust-api-add-private-module-reexport-edge-graph の codex 指摘)。
     // inline_mod は symbol 依存のためメモ化対象外 (今回見送り)。
-    if rust_symbol_is_inside_inline_mod(
-        RustSourceTree::Base { rev: base },
-        dir,
-        old_path,
-        symbol_name,
-    ) {
+    if rust_symbol_is_inside_inline_mod(base, dir, old_path, symbol_name) {
         return false;
     }
     // re-export を考慮しない raw private 判定。public-reachable / 判定不能なら api.rm を残す。
     // old_path 単位でメモ化済み (symbol 非依存)。
-    let Some(private) = context.private_module_info_at_base(dir, base, old_path) else {
+    let Some(private) = context.private_module_info_at_base(base_blobs, dir, old_path) else {
         return false;
     };
     // index 構築に失敗したら api.rm を残す (false negative 回避優先)。
-    let Some(index) = context.index_for(RustSourceTree::Base { rev: base }, dir, &private) else {
+    let Some(index) = context.index_for(base, dir, &private) else {
         return false;
     };
     !index.exposes_symbol(&private, symbol_name)
@@ -249,6 +266,10 @@ pub(crate) fn is_rust_new_symbol_outside_public_api_surface(
     symbol_name: &str,
     context: &mut RustPublicApiContext,
 ) -> bool {
+    // Rust 以外のファイルは対象外 (base 側の同名関数と同じ理由)。
+    if !is_rust_source_path(new_path) {
+        return false;
+    }
     if is_binary_only_rust_crate(dir, new_path) {
         return true;
     }
@@ -292,7 +313,7 @@ pub(crate) fn rust_symbol_is_inside_inline_mod(
                 Err(_) => return false,
             }
         }
-        RustSourceTree::Base { rev } => match git_show_blob(dir, rev, file_path) {
+        RustSourceTree::Base { blobs } => match blobs.read(file_path) {
             Some(blob) => blob,
             None => return false,
         },
@@ -394,14 +415,13 @@ impl RustPublicApiContext {
     /// `is_binary_only_rust_crate_at_base` を old_path 単位でメモ化する。
     pub(crate) fn is_binary_only_at_base(
         &mut self,
-        dir: &str,
-        base: &str,
+        base_blobs: &crate::commands::git_input::GitBlobBatch,
         file_path: &str,
     ) -> bool {
         if let Some(&cached) = self.binary_crate_memo.get(file_path) {
             return cached;
         }
-        let computed = is_binary_only_rust_crate_at_base(dir, base, file_path);
+        let computed = is_binary_only_rust_crate_at_base(base_blobs, file_path);
         self.binary_crate_memo
             .insert(file_path.to_string(), computed);
         computed
@@ -411,14 +431,15 @@ impl RustPublicApiContext {
     /// `None` も「計算済み」としてキャッシュする (`entry` で未計算と区別)。
     fn private_module_info_at_base(
         &mut self,
+        base_blobs: &crate::commands::git_input::GitBlobBatch,
         dir: &str,
-        base: &str,
         file_path: &str,
     ) -> Option<RustPrivateModuleInfo> {
         if let Some(cached) = self.private_module_memo.get(file_path) {
             return cached.clone();
         }
-        let computed = rust_private_module_info(RustSourceTree::Base { rev: base }, dir, file_path);
+        let computed =
+            rust_private_module_info(RustSourceTree::Base { blobs: base_blobs }, dir, file_path);
         self.private_module_memo
             .insert(file_path.to_string(), computed.clone());
         computed

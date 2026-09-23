@@ -101,6 +101,7 @@ pub fn handle_request(
             let options = crate::models::impact::ContextAnalysisOptions {
                 exclude_dirs: req.exclude_dirs.clone(),
                 exclude_globs: req.exclude_globs.clone(),
+                ..Default::default()
             };
             let result = service.analyze_context(diff_input, dir, &options)?;
             Ok(serde_json::to_value(result)?)

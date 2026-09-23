@@ -2,6 +2,20 @@ use std::collections::HashSet;
 
 use crate::models::impact::{DiffFile, HunkInfo};
 
+/// `--- a/<path>` / `+++ b/<path>` 形式のファイルヘッダ行から `<path>` を取り出す。
+/// `line` が `prefix` で始まらなければ `None`。
+///
+/// git はラベル (接頭辞 + パス) に空白を含むとき、行末に TAB を付けて出力する
+/// (`+++ b/my lib.rs\t`)。GNU diff も TAB の後ろにタイムスタンプを置く。クォートされない
+/// パスは TAB を含み得ない (TAB を含むパスは git が `"a/x\ty"` の C 形式でクォートし、
+/// そもそもこの接頭辞に一致しない) ため、最初の TAB 以降を落とせば元のパスに戻る。
+/// 落とさないと `"src/my lib.rs\t"` が存在確認で外れ、そのファイルの変更全体が
+/// 解析対象から黙って消える。ヘッダを解析する箇所はすべてこの関数を通すこと。
+pub(crate) fn strip_header_path<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(prefix)?;
+    Some(rest.split_once('\t').map_or(rest, |(path, _)| path))
+}
+
 /// hunk 本体の 1 行を分類した結果。
 pub(crate) enum HunkBodyLine<'a> {
     /// 追加行 (`+`)。先頭の `+` を除いた内容を保持する。
@@ -56,6 +70,90 @@ impl HunkProgress {
 
     pub(crate) fn is_complete(&self) -> bool {
         self.old_remaining == 0 && self.new_remaining == 0
+    }
+}
+
+/// diff 全体を 1 回だけ走査し、`+++ b/<path>` ヘッダで始まる区間を new 側パスごとに
+/// 引けるようにした索引。
+///
+/// `extract_changed_line_facts` / `detect_signature_changes` / `is_symbol_in_changed_lines` /
+/// `has_deletion_in_new_range` はいずれも「対象ファイル以外の区間は読み飛ばす」だけなので、
+/// diff 全体の代わりに対象ファイルの区間だけを渡しても結果は変わらない。影響分析の Pass 1 は
+/// これらをファイルごと (シンボルごと) に呼ぶため、diff 全体を渡すと diff 長 × ファイル数の
+/// 2 乗になっていた (実測: context が 1000 / 2000 / 3000 ファイルで 2.1 / 7.6 / 17.1 秒)。
+///
+/// 区間の境界は各関数の状態機械と同じ規約で決める: hunk 本体を消費中の行は (ヘッダに
+/// 見えても) 境界にしない。hunk 外の `--- ` / `+++ ` 行で区間を閉じ、`+++ b/<path>` なら
+/// 新しい区間を開く。区間は常に「hunk 外・直前の区間が閉じた状態」から始まるので、
+/// 対象ファイルの区間だけを順に連結した入力は、diff 全体を渡したときと同じ状態遷移を辿る。
+pub(crate) struct FileSections<'a> {
+    input: &'a str,
+    /// new 側パス → その区間のバイト範囲 (出現順)。同じパスが複数回現れる入力でも
+    /// 全区間を順に連結すれば diff 全体を渡した場合と同じ結果になる。
+    ranges_by_path: std::collections::HashMap<&'a str, Vec<std::ops::Range<usize>>>,
+}
+
+impl<'a> FileSections<'a> {
+    pub(crate) fn split(input: &'a str) -> Self {
+        let mut ranges_by_path: std::collections::HashMap<&'a str, Vec<std::ops::Range<usize>>> =
+            std::collections::HashMap::new();
+        let mut current: Option<(&'a str, usize)> = None;
+        let mut active_hunk: Option<HunkProgress> = None;
+        let mut offset = 0usize;
+        for raw in input.split_inclusive('\n') {
+            let line_start = offset;
+            offset += raw.len();
+            // `str::lines` と同じ行の切り出し (`\n` を落とし、続く `\r` も落とす)。
+            let line = raw
+                .strip_suffix('\n')
+                .map_or(raw, |l| l.strip_suffix('\r').unwrap_or(l));
+            if let Some(progress) = active_hunk.as_mut() {
+                progress.consume(line);
+                if progress.is_complete() {
+                    active_hunk = None;
+                }
+                continue;
+            }
+            if line.starts_with("--- ") || line.starts_with("+++ ") {
+                if let Some((path, start)) = current.take() {
+                    ranges_by_path
+                        .entry(path)
+                        .or_default()
+                        .push(start..line_start);
+                }
+                if let Some(path) = strip_header_path(line, "+++ b/") {
+                    current = Some((path, line_start));
+                }
+            } else if line.starts_with("@@ ")
+                && let Some(hunk) = parse_hunk_header(line)
+            {
+                active_hunk = Some(HunkProgress::new(&hunk));
+            }
+        }
+        if let Some((path, start)) = current {
+            ranges_by_path
+                .entry(path)
+                .or_default()
+                .push(start..input.len());
+        }
+        Self {
+            input,
+            ranges_by_path,
+        }
+    }
+
+    /// `path` の区間を返す (該当なしは空文字列)。区間が 1 つなら元の diff を借用する。
+    pub(crate) fn get(&self, path: &str) -> std::borrow::Cow<'a, str> {
+        match self.ranges_by_path.get(path).map(Vec::as_slice) {
+            None | Some([]) => std::borrow::Cow::Borrowed(""),
+            Some([range]) => std::borrow::Cow::Borrowed(&self.input[range.clone()]),
+            Some(ranges) => std::borrow::Cow::Owned(
+                ranges
+                    .iter()
+                    .map(|range| &self.input[range.clone()])
+                    .collect(),
+            ),
+        }
     }
 }
 
@@ -142,7 +240,7 @@ pub fn extract_changed_line_facts(input: &str, file_path: &str) -> ChangedLineFa
 
         if line.starts_with("--- ") {
             in_target_file = false;
-        } else if let Some(path) = line.strip_prefix("+++ b/") {
+        } else if let Some(path) = strip_header_path(line, "+++ b/") {
             in_target_file = path == file_path;
         } else if line.starts_with("+++ ") {
             in_target_file = false;
@@ -163,6 +261,136 @@ pub fn extract_changed_line_facts(input: &str, file_path: &str) -> ChangedLineFa
     }
 
     facts
+}
+
+/// 対象ファイル 1 件分の diff を new 側ソースへ逆適用して復元した変更前 (old 側) のソース。
+pub(crate) struct ReconstructedOldSource {
+    /// 復元した old 側ソース (各行を `\n` で終端する)。
+    pub(crate) source: Vec<u8>,
+    /// 削除された (`-` 行の) old 側 0-indexed 行番号。
+    pub(crate) removed_lines: HashSet<usize>,
+}
+
+/// `input` のうち `file_path` の hunk を `new_source` に逆適用し、old 側ソースを復元する。
+///
+/// unified diff は new 側と old 側の対応を完全に持つので、new 側ファイル + diff から
+/// old 側を再構成できる (git を呼ばないので `--diff` / stdin 入力でも使える)。
+/// hunk の context / 追加行が `new_source` の内容と一致しない、hunk が逆順・重複する、
+/// 行番号が範囲外になるなど、diff とファイルが食い違う場合は `None` を返す
+/// (食い違った入力から組み立てた old 側で判定しない)。
+pub(crate) fn reconstruct_old_source(
+    input: &str,
+    file_path: &str,
+    new_source: &[u8],
+) -> Option<ReconstructedOldSource> {
+    // `str::lines` と同じく、末尾の改行の後ろに空行を作らず、行末の `\r` は比較から外す。
+    let mut new_lines: Vec<&[u8]> = new_source.split(|&b| b == b'\n').collect();
+    if new_source.ends_with(b"\n") {
+        new_lines.pop();
+    }
+    let trim_cr =
+        |line: &[u8]| -> usize { line.strip_suffix(b"\r").map_or(line.len(), <[u8]>::len) };
+    let same_line = |source_line: &[u8], diff_text: &str| {
+        source_line[..trim_cr(source_line)] == *diff_text.as_bytes()
+    };
+
+    let mut out: Vec<u8> = Vec::with_capacity(new_source.len());
+    let mut removed_lines = HashSet::new();
+    let mut old_line = 0usize; // 出力済みの old 側行数
+    let mut new_idx = 0usize; // 次に消費する new 側行 (0-indexed)
+    let mut in_target_file = false;
+    let mut active_hunk: Option<HunkProgress> = None;
+
+    for line in input.lines() {
+        if let Some(progress) = active_hunk.as_mut() {
+            let consumed = progress.consume(line);
+            if in_target_file {
+                match consumed {
+                    HunkBodyLine::Context => {
+                        // context 行は先頭の空白 1 文字を落とす (空行として出力された context も許す)。
+                        let text = line.strip_prefix(' ').unwrap_or(line);
+                        let source_line = new_lines.get(new_idx)?;
+                        if !same_line(source_line, text) {
+                            return None;
+                        }
+                        out.extend_from_slice(source_line);
+                        out.push(b'\n');
+                        old_line += 1;
+                        new_idx += 1;
+                    }
+                    HunkBodyLine::Added(text) => {
+                        if !same_line(new_lines.get(new_idx)?, text) {
+                            return None;
+                        }
+                        new_idx += 1;
+                    }
+                    HunkBodyLine::Removed(text) => {
+                        removed_lines.insert(old_line);
+                        out.extend_from_slice(text.as_bytes());
+                        out.push(b'\n');
+                        old_line += 1;
+                    }
+                    HunkBodyLine::Metadata => {}
+                }
+            }
+            if progress.is_complete() {
+                active_hunk = None;
+            }
+            continue;
+        }
+
+        if line.starts_with("--- ") {
+            in_target_file = false;
+        } else if let Some(path) = strip_header_path(line, "+++ b/") {
+            in_target_file = path == file_path;
+        } else if line.starts_with("+++ ") {
+            in_target_file = false;
+        } else if line.starts_with("@@ ")
+            && let Some(hunk) = parse_hunk_header(line)
+        {
+            if in_target_file {
+                // ゼロ幅側の start は「挿入 / 削除位置の直前の行」(1-indexed) を指す。
+                let hunk_new_start = if hunk.new_count == 0 {
+                    hunk.new_start
+                } else {
+                    hunk.new_start - 1
+                };
+                let hunk_old_start = if hunk.old_count == 0 {
+                    hunk.old_start
+                } else {
+                    hunk.old_start - 1
+                };
+                if hunk_new_start < new_idx {
+                    return None;
+                }
+                // hunk の手前までは old / new で同一の行。
+                while new_idx < hunk_new_start {
+                    out.extend_from_slice(new_lines.get(new_idx)?);
+                    out.push(b'\n');
+                    old_line += 1;
+                    new_idx += 1;
+                }
+                if old_line != hunk_old_start {
+                    return None;
+                }
+            }
+            active_hunk = Some(HunkProgress::new(&hunk));
+        }
+    }
+    // 対象ファイルの hunk が宣言した行数に届かないまま入力が終わった (途中で切れた diff)。
+    // 残りを「変更なし」とみなして組み立てると、切れた後ろの `-` 行 (宣言ヘッダなど) を
+    // 失った old 側で判定することになる。
+    if in_target_file && active_hunk.is_some() {
+        return None;
+    }
+    for source_line in new_lines.get(new_idx..)? {
+        out.extend_from_slice(source_line);
+        out.push(b'\n');
+    }
+    Some(ReconstructedOldSource {
+        source: out,
+        removed_lines,
+    })
 }
 
 /// 指定ファイルの unified diff に、new 側の行範囲 `[start_line, end_line]` (0-indexed)
@@ -210,7 +438,7 @@ pub(crate) fn has_deletion_in_new_range(
         }
         if line.starts_with("--- ") {
             in_target_file = false;
-        } else if let Some(path) = line.strip_prefix("+++ b/") {
+        } else if let Some(path) = strip_header_path(line, "+++ b/") {
             in_target_file = path == file_path;
         } else if line.starts_with("+++ ") {
             in_target_file = false;
@@ -256,7 +484,7 @@ pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
             continue;
         }
 
-        if let Some(path) = line.strip_prefix("--- a/") {
+        if let Some(path) = strip_header_path(line, "--- a/") {
             // 直前のファイル情報を確定
             flush_file(
                 &mut files,
@@ -286,7 +514,7 @@ pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
                 &mut current_hunks,
                 &mut current_deleted_lines,
             );
-        } else if let Some(path) = line.strip_prefix("+++ b/") {
+        } else if let Some(path) = strip_header_path(line, "+++ b/") {
             current_new_path = Some(path.to_string());
         } else if line.starts_with("+++ /dev/null") {
             current_new_path = Some("/dev/null".to_string());
@@ -340,6 +568,60 @@ fn flush_file(
     deleted_lines.clear();
 }
 
+/// 内容が変わっていない rename (`git mv` 後の `rename from` / `rename to` だけのブロック) を
+/// `hunks` が空の `DiffFile` として返す。
+///
+/// `parse_unified_diff` は hunk を持つファイルだけを返すため、内容同一の rename は現れない
+/// (dead-code / cochange はこの前提で揃えている)。一方 API 差分では、対応言語でないファイルへの
+/// rename (`api.ts` → `api.ts.bak`) が「旧ファイルの API がすべて消える」変更になるため、
+/// 必要な呼び出し側だけが個別に取り込めるよう別関数にしている。
+/// C 形式でクォートされたパス (`rename from "a\tb"`) は安全に復元できないので返さない。
+pub fn parse_hunkless_renames(input: &str) -> Vec<DiffFile> {
+    #[derive(Default)]
+    struct Block {
+        from: Option<String>,
+        to: Option<String>,
+        has_content: bool,
+    }
+    impl Block {
+        fn finish(self, out: &mut Vec<DiffFile>) {
+            if let (Some(old_path), Some(new_path)) = (self.from, self.to)
+                && !self.has_content
+            {
+                out.push(DiffFile {
+                    old_path,
+                    new_path,
+                    hunks: Vec::new(),
+                    deleted_old_source: None,
+                });
+            }
+        }
+    }
+    let unquoted = |path: &str| (!path.starts_with('"')).then(|| path.to_string());
+
+    let mut out = Vec::new();
+    let mut block = Block::default();
+    for line in input.lines() {
+        if line.starts_with("diff --git ") {
+            std::mem::take(&mut block).finish(&mut out);
+        } else if let Some(path) = line.strip_prefix("rename from ") {
+            block.from = unquoted(path);
+        } else if let Some(path) = line.strip_prefix("rename to ") {
+            block.to = unquoted(path);
+        } else if line.starts_with("--- ")
+            || line.starts_with("+++ ")
+            || line.starts_with("@@ ")
+            || line.starts_with("Binary files ")
+        {
+            // 内容の差分があるブロックは `parse_unified_diff` の担当。hunk 本体の行は
+            // 必ず ` ` / `+` / `-` で始まるので、ここより前に `rename` 行と誤認することはない。
+            block.has_content = true;
+        }
+    }
+    block.finish(&mut out);
+    out
+}
+
 /// `"@@ -10,5 +10,8 @@"` や `"@@ -10,5 +10,8 @@ fn foo()"` の hunk ヘッダを解析する。
 pub(crate) fn parse_hunk_header(line: &str) -> Option<HunkInfo> {
     // 先頭の `"@@ "` を除去
@@ -385,6 +667,223 @@ fn parse_range_spec(spec: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// git はラベル (接頭辞 + パス) に空白を含むとき `--- a/my lib.rs\t` のように行末へ TAB を
+    /// 付ける。TAB ごとパスに取り込むと `"src/my lib.rs\t"` が存在確認で外れ、そのファイルの
+    /// 変更全体が黙って解析対象から消えていた。GNU diff の `\t<timestamp>` も同じ規約で落とす。
+    #[test]
+    fn strip_header_path_drops_git_tab_suffix_and_timestamps() {
+        assert_eq!(
+            strip_header_path("+++ b/src/my lib.rs\t", "+++ b/"),
+            Some("src/my lib.rs")
+        );
+        assert_eq!(
+            strip_header_path(
+                "--- a/src/x.rs\t2026-01-01 00:00:00.000000000 +0900",
+                "--- a/"
+            ),
+            Some("src/x.rs")
+        );
+        // 対照: TAB の無いヘッダはそのまま、接頭辞が違えば None。
+        assert_eq!(
+            strip_header_path("+++ b/src/x.rs", "+++ b/"),
+            Some("src/x.rs")
+        );
+        assert_eq!(strip_header_path("+++ /dev/null", "+++ b/"), None);
+    }
+
+    /// 空白を含むパスの実 git 出力 (ヘッダ行末に TAB) を、ヘッダを読む全関数が同じパスとして
+    /// 扱うこと。1 箇所でも TAB を取り込むと、そのファイルだけ変更行や hunk が消える。
+    #[test]
+    fn header_paths_with_git_tab_suffix_are_recognized_everywhere() {
+        let path = "src/my util.ts";
+        let diff = concat!(
+            "diff --git a/src/my util.ts b/src/my util.ts\n",
+            "index 0f62e86..33c1eb4 100644\n",
+            "--- a/src/my util.ts\t\n",
+            "+++ b/src/my util.ts\t\n",
+            "@@ -1,3 +1,3 @@\n",
+            "-export function helper(a: number): number {\n",
+            "-  return a + 1;\n",
+            "+export function helper(a: number, b: number): number {\n",
+            "+  return a + b;\n",
+            " }\n",
+        );
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].old_path, path);
+        assert_eq!(files[0].new_path, path);
+
+        let facts = extract_changed_line_facts(diff, path);
+        assert_eq!(facts.added_lines, HashSet::from([0, 1]));
+        assert!(has_deletion_in_new_range(diff, path, 0, 2));
+        let header_start = diff.find("+++").expect("new-side header");
+        assert_eq!(FileSections::split(diff).get(path), &diff[header_start..]);
+        let reconstructed = reconstruct_old_source(
+            diff,
+            path,
+            b"export function helper(a: number, b: number): number {\n  return a + b;\n}\n",
+        )
+        .expect("reconstruct");
+        assert_eq!(
+            String::from_utf8(reconstructed.source).expect("utf-8"),
+            "export function helper(a: number): number {\n  return a + 1;\n}\n"
+        );
+    }
+
+    /// `FileSections` で切り出した区間を渡しても、diff 全体を渡した場合と結果が一致すること
+    /// (影響分析 Pass 1 の 2 乗解消が出力を変えないことの固定)。
+    ///
+    /// 同じファイルが 2 回現れる入力 / 削除ファイル / hunk 本体がヘッダに見える行 /
+    /// `\ No newline at end of file` / CRLF / ヘッダの TAB を 1 つの diff に混ぜる。
+    #[test]
+    fn file_sections_give_same_results_as_full_diff() {
+        let diff = concat!(
+            "diff --git a/a.rs b/a.rs\n",
+            "--- a/a.rs\n",
+            "+++ b/a.rs\n",
+            "@@ -1,3 +1,3 @@\n",
+            " fn keep() {}\n",
+            "-fn a(x: u32) {}\n",
+            "+fn a(x: u32, y: u32) {}\n",
+            " fn tail() {}\n",
+            "diff --git a/gone.rs b/gone.rs\n",
+            "deleted file mode 100644\n",
+            "--- a/gone.rs\n",
+            "+++ /dev/null\n",
+            "@@ -1,2 +0,0 @@\n",
+            "-fn gone() {}\n",
+            "-fn a(x: u64) {}\n",
+            "diff --git a/b c.rs b/b c.rs\n",
+            "--- a/b c.rs\t\n",
+            "+++ b/b c.rs\t\n",
+            "@@ -1,2 +1,3 @@\n",
+            // hunk 本体の削除行 / 追加行がファイルヘッダに見える (本体として読む)。
+            "--- a/a.rs\n",
+            "+++ b/a.rs\n",
+            "+fn b(z: u8) {}\n",
+            " fn c() {}\r\n",
+            "\\ No newline at end of file\n",
+            "diff --git a/a.rs b/a.rs\n",
+            "--- a/a.rs\n",
+            "+++ b/a.rs\n",
+            "@@ -10,2 +10,1 @@\n",
+            "-fn removed_late() {}\n",
+            " fn late() {}\n",
+        );
+        let sections = FileSections::split(diff);
+        for path in ["a.rs", "b c.rs", "gone.rs", "missing.rs"] {
+            let section = sections.get(path);
+            assert!(
+                section.len() < diff.len(),
+                "{path}: 区間は diff 全体より短いこと (空振り防止)"
+            );
+            let full = extract_changed_line_facts(diff, path);
+            let part = extract_changed_line_facts(&section, path);
+            assert_eq!(full.added_lines, part.added_lines, "{path}: added_lines");
+            assert_eq!(
+                full.deletion_gaps, part.deletion_gaps,
+                "{path}: deletion_gaps"
+            );
+            for (start, end) in [(0, 0), (0, 5), (8, 12)] {
+                assert_eq!(
+                    has_deletion_in_new_range(diff, path, start, end),
+                    has_deletion_in_new_range(&section, path, start, end),
+                    "{path}: has_deletion_in_new_range({start}, {end})"
+                );
+            }
+        }
+        // 対照: 期待どおりの中身が区間に入っていること (同じファイルの 2 区間を両方拾う)。
+        let a = extract_changed_line_facts(&sections.get("a.rs"), "a.rs");
+        assert_eq!(a.added_lines, HashSet::from([1]));
+        assert_eq!(a.deletion_gaps, HashSet::from([1, 9]));
+        let bc = extract_changed_line_facts(&sections.get("b c.rs"), "b c.rs");
+        assert_eq!(bc.added_lines, HashSet::from([0, 1]));
+        assert!(sections.get("missing.rs").is_empty());
+    }
+
+    /// diff を new 側へ逆適用して old 側を復元する。移動 (削除 hunk + 追加 hunk) も
+    /// 1 ファイル内で正しく並べ戻し、削除行の old 側行番号を返す。
+    #[test]
+    fn reconstruct_old_source_reverses_moves_and_reports_removed_lines() {
+        let old = "fn helper(a: u32) -> u32 {\n    a\n}\n\nfn other() {}\nfn third() {}\n";
+        let new =
+            "fn other() {}\nfn third() {}\n\nfn helper(a: u32, b: u32) -> u32 {\n    a + b\n}\n";
+        let diff = concat!(
+            "--- a/src/util.rs\n",
+            "+++ b/src/util.rs\n",
+            "@@ -1,5 +1,1 @@\n",
+            "-fn helper(a: u32) -> u32 {\n",
+            "-    a\n",
+            "-}\n",
+            "-\n",
+            " fn other() {}\n",
+            "@@ -6 +2,5 @@\n",
+            " fn third() {}\n",
+            "+\n",
+            "+fn helper(a: u32, b: u32) -> u32 {\n",
+            "+    a + b\n",
+            "+}\n",
+        );
+        let rec = reconstruct_old_source(diff, "src/util.rs", new.as_bytes()).expect("reconstruct");
+        assert_eq!(String::from_utf8(rec.source).expect("utf-8"), old);
+        assert_eq!(rec.removed_lines, HashSet::from([0, 1, 2, 3]));
+
+        // `-U0` の純追加 / 純削除 hunk (ゼロ幅側の start は直前の行を指す)。
+        let u0 = concat!(
+            "--- a/f.rs\n",
+            "+++ b/f.rs\n",
+            "@@ -1,0 +2 @@\n",
+            "+inserted\n",
+            "@@ -3 +3,0 @@\n",
+            "-dropped\n",
+        );
+        let rec = reconstruct_old_source(u0, "f.rs", b"a\ninserted\nb\n").expect("reconstruct -U0");
+        assert_eq!(
+            String::from_utf8(rec.source).expect("utf-8"),
+            "a\nb\ndropped\n"
+        );
+        assert_eq!(rec.removed_lines, HashSet::from([2]));
+
+        // 対照: diff とファイル内容が食い違えば復元しない (食い違った old 側で判定しない)。
+        assert!(reconstruct_old_source(diff, "src/util.rs", b"unrelated\n").is_none());
+        // 対象ファイルの hunk が無ければ new 側がそのまま old 側。
+        let untouched = reconstruct_old_source(diff, "other.rs", b"x\n").expect("untouched");
+        assert_eq!(untouched.source, b"x\n");
+        assert!(untouched.removed_lines.is_empty());
+    }
+
+    /// 対象ファイルの hunk が宣言した行数に届かないまま diff が終わったら復元しない。
+    ///
+    /// 旧実装は残りを「変更なし」とみなして Some を返していたため、切れた後ろにある
+    /// `-` 行 (ここでは旧シグネチャ) を失った old 側で宣言ヘッダを比較することになっていた。
+    #[test]
+    fn reconstruct_old_source_rejects_truncated_hunk_of_target_file() {
+        let new = "fn helper(a: u32, b: u32) -> u32 {\n    a + b\n}\n";
+        let full = concat!(
+            "--- a/src/util.rs\n",
+            "+++ b/src/util.rs\n",
+            "@@ -1,3 +1,3 @@\n",
+            "+fn helper(a: u32, b: u32) -> u32 {\n",
+            "+    a + b\n",
+            "-fn helper(a: u32) -> u32 {\n",
+            "-    a\n",
+            " }\n",
+        );
+        // 対照: 完全な diff なら旧シグネチャを復元できる。
+        let rec = reconstruct_old_source(full, "src/util.rs", new.as_bytes()).expect("complete");
+        assert_eq!(
+            String::from_utf8(rec.source).expect("utf-8"),
+            "fn helper(a: u32) -> u32 {\n    a\n}\n"
+        );
+        // hunk 本体の途中 (`-` 行の手前) で切れた diff。
+        let truncated = full.split_inclusive('\n').take(5).collect::<String>();
+        assert!(reconstruct_old_source(&truncated, "src/util.rs", new.as_bytes()).is_none());
+        // 切れているのが対象外のファイルなら、対象ファイルの復元には影響しない。
+        let other_truncated =
+            format!("{full}--- a/other.rs\n+++ b/other.rs\n@@ -1,2 +1,2 @@\n-x\n");
+        assert!(reconstruct_old_source(&other_truncated, "src/util.rs", new.as_bytes()).is_some());
+    }
 
     #[test]
     fn parse_simple_diff() {
@@ -729,5 +1228,49 @@ index 1234567..0000000
         assert_eq!(files[0].new_path, "other.rs");
         assert_eq!(files[0].hunks.len(), 1);
         assert_eq!(files[0].hunks[0].new_count, 2);
+    }
+
+    /// 内容同一の rename だけを hunk 空の `DiffFile` として返す。内容の差分を持つ rename は
+    /// `parse_unified_diff` の担当なので返さず、クォートされたパスは復元できないので返さない。
+    #[test]
+    fn parse_hunkless_renames_returns_only_content_identical_renames() {
+        let diff = r#"diff --git a/src/api.ts b/src/api.ts.bak
+similarity index 100%
+rename from src/api.ts
+rename to src/api.ts.bak
+diff --git a/src/edited.ts b/src/edited.txt
+similarity index 72%
+rename from src/edited.ts
+rename to src/edited.txt
+index 794a7c2..0eb6578 100644
+--- a/src/edited.ts
++++ b/src/edited.txt
+@@ -1,1 +1,1 @@
+-rename from x
++rename to y
+diff --git "a/src/q\tx.ts" "b/src/q\tx.bak"
+similarity index 100%
+rename from "src/q\tx.ts"
+rename to "src/q\tx.bak"
+diff --git a/lib/a.rs b/lib/b.rs
+similarity index 100%
+rename from lib/a.rs
+rename to lib/b.rs
+"#;
+        let renames: Vec<(String, String, usize)> = parse_hunkless_renames(diff)
+            .into_iter()
+            .map(|f| (f.old_path, f.new_path, f.hunks.len()))
+            .collect();
+        assert_eq!(
+            renames,
+            vec![
+                ("src/api.ts".to_string(), "src/api.ts.bak".to_string(), 0),
+                ("lib/a.rs".to_string(), "lib/b.rs".to_string(), 0),
+            ]
+        );
+        // 対照: 内容同一の rename は `parse_unified_diff` には現れない (既存の前提を変えない)。
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].new_path, "src/edited.txt");
     }
 }

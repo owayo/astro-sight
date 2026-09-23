@@ -16,15 +16,51 @@ use super::dead_code_member_liveness::{JsTsMemberLiveness, MemberStatus, PhpMemb
 use super::git_input::{DiffSourceResolution, resolve_diff_source};
 use crate::output::{OutputOptions, serialize_cli_document};
 
-/// dead-code 検出本体。候補収集 → 名前インデックス構築 → 参照カウント →
-/// アセット参照収集 → 分類の段階パイプラインで (dead_symbols, test_only_symbols) を返す。
+/// dead-code 検出の結果一式。
+#[derive(Debug, Default)]
+pub(crate) struct DeadCodeDetection {
+    pub(crate) dead: Vec<DeadSymbol>,
+    pub(crate) test_only: Vec<DeadSymbol>,
+    /// 生成物として dead 候補から外したファイル (`dir` 相対、`/` 区切り)。
+    /// 参照の集計には含めている。
+    pub(crate) generated_candidates_skipped: Vec<String>,
+    /// 参照集計の走査で見つかった「解析できないソース」の申告。候補が 0 件で参照集計を
+    /// 行わなかった場合は空 (dead と断定したものが無いので誤検出の余地も無い)。
+    pub(crate) unanalyzable: Vec<crate::models::truncation::TruncationInfo>,
+}
+
+impl DeadCodeDetection {
+    /// dead を 1 件も断定しなかった結果。候補から外した生成物の申告だけは残す。
+    fn without_dead(generated_candidates_skipped: Vec<String>) -> Self {
+        Self {
+            generated_candidates_skipped,
+            ..Self::default()
+        }
+    }
+}
+
+/// dead-code 検出本体 (既定の生成物の扱い)。`(dead_symbols, test_only_symbols)` を返す。
 pub(crate) fn detect_dead_symbols_from_files(
     dir: &str,
     files: &[std::path::PathBuf],
 ) -> (Vec<DeadSymbol>, Vec<DeadSymbol>) {
+    let detection = detect_dead_symbols(dir, files, false);
+    (detection.dead, detection.test_only)
+}
+
+/// dead-code 検出本体。候補収集 → 参照走査集合の収集 → 名前インデックス構築 →
+/// 参照カウント → アセット参照収集 → 分類の段階パイプライン。
+///
+/// `include_generated` は生成物を dead の**候補**に含めるかだけを決める。参照の集計には
+/// 生成物を常に含める (`FileScanOptions::DEAD_CODE_REFERENCES`)。
+pub(crate) fn detect_dead_symbols(
+    dir: &str,
+    files: &[std::path::PathBuf],
+    include_generated: bool,
+) -> DeadCodeDetection {
     let canonical_dir = match std::fs::canonicalize(dir) {
         Ok(d) => d,
-        Err(_) => return (Vec::new(), Vec::new()),
+        Err(_) => return DeadCodeDetection::default(),
     };
 
     // case-insensitive 言語 (Xojo 等) のみで構成された files では dead-code 検出を
@@ -35,24 +71,33 @@ pub(crate) fn detect_dead_symbols_from_files(
     // 動作するため CI skip 機構は不要。`ASTRO_SIGHT_FORCE_CI_LANG_DEAD_CODE` は deprecate
     // (no-op、警告も出さない)。
 
-    let candidates = collect_dead_code_candidates(dir, &canonical_dir, files);
+    let mut candidates =
+        collect_dead_code_candidates(dir, &canonical_dir, files, include_generated);
+    let generated_candidates_skipped = std::mem::take(&mut candidates.generated_skipped);
     if candidates.all_syms.is_empty() {
-        return (Vec::new(), Vec::new());
+        return DeadCodeDetection::without_dead(generated_candidates_skipped);
     }
+
+    // 参照は候補の絞り込み (`--glob` / 既定のディレクトリ除外 / `--git`) と無関係に
+    // ディレクトリ全体から来るので、走査集合も全体にする。解析できないソースの申告も
+    // 同じ集合から出し、「数えた範囲」と「申告した範囲」を一致させる。
+    let scan = match collect_reference_scan(&canonical_dir, files) {
+        Ok(scan) => scan,
+        Err(_) => return DeadCodeDetection::without_dead(generated_candidates_skipped),
+    };
+    let unanalyzable = scan.unanalyzable_truncations(&canonical_dir);
 
     let index = build_dead_code_name_index(&candidates, &canonical_dir, files);
 
     // production / test 別に refs カウント。test/ 配下のみで参照されるシンボルは
     // dead_symbols ではなく test_only_symbols として分離する (F5)。
-    let counts = match crate::engine::refs::count_non_definition_refs_split_with_extra_files(
+    let counts = match crate::engine::refs::count_non_definition_refs_split_in_files(
         &index.unique_names,
-        &canonical_dir,
-        None,
-        files,
+        &scan.files,
         is_test_path,
     ) {
         Ok(v) => v,
-        Err(_) => return (Vec::new(), Vec::new()),
+        Err(_) => return DeadCodeDetection::without_dead(generated_candidates_skipped),
     };
 
     let asset_refs = collect_framework_asset_refs(&canonical_dir);
@@ -60,7 +105,30 @@ pub(crate) fn detect_dead_symbols_from_files(
     let (mut dead, mut test_only) =
         classify_dead_symbols(&candidates, &index, &counts, &asset_refs);
     attach_declaration_lines(dir, &mut dead, &mut test_only);
-    (dead, test_only)
+    DeadCodeDetection {
+        dead,
+        test_only,
+        generated_candidates_skipped,
+        unanalyzable,
+    }
+}
+
+/// dead-code の参照集計が走査するファイル集合 (count 経路と member liveness 経路で共有)。
+///
+/// `--glob` や既定のディレクトリ除外は候補の絞り込みであって参照の範囲ではないので適用しない。
+/// 生成物も含め (`FileScanOptions::DEAD_CODE_REFERENCES`)、hidden ディレクトリ配下でも
+/// 候補になった diff 由来ファイル (`extra_files`) は合流させる。
+pub(crate) fn collect_reference_scan(
+    canonical_dir: &std::path::Path,
+    extra_files: &[std::path::PathBuf],
+) -> Result<crate::engine::refs::FileCollection> {
+    let mut scan = crate::engine::refs::collect_files_scan(
+        canonical_dir,
+        None,
+        crate::engine::refs::FileScanOptions::DEAD_CODE_REFERENCES,
+    )?;
+    crate::engine::refs::merge_extra_files(&mut scan.files, canonical_dir, extra_files);
+    Ok(scan)
 }
 
 /// 検出済み dead / test-only シンボルに宣言行を付与する。
@@ -93,6 +161,8 @@ struct DeadCodeCandidates {
     /// C/C++ の追加 liveness 情報 (file, シンボル名, 追加名リスト, lang)。
     /// enum→列挙子名 / typedef tag→alias 名。後段で正規化して liveness_aliases に変換する。
     liveness_raw: Vec<(String, String, Vec<String>, crate::language::LangId)>,
+    /// 生成物として候補から外したファイル (`dir` 相対、`/` 区切り)。
+    generated_skipped: Vec<String>,
 }
 
 /// workspace 相対パスの区切り文字を `/` に正規化する。
@@ -118,16 +188,21 @@ fn normalize_workspace_separators(path: &str) -> String {
 
 /// 走査対象ファイルからエクスポートシンボル（trait impl メソッドは除外）と
 /// C/C++ liveness 補助情報を収集する。
+///
+/// 生成物は既定で候補から外す (生成コードの未使用 export を dead として並べてもノイズになる)。
+/// 外したファイルは申告用に記録する。`include_generated` のときは候補に含める。
 fn collect_dead_code_candidates(
     dir: &str,
     canonical_dir: &std::path::Path,
     files: &[std::path::PathBuf],
+    include_generated: bool,
 ) -> DeadCodeCandidates {
     // .gitattributes の linguist-generated 指定ファイルは dead-code 検出から除外する
     let gitattrs = crate::engine::gitattributes::GitAttributes::load(canonical_dir);
 
     let mut all_syms: Vec<(String, String, String, crate::language::LangId)> = Vec::new();
     let mut liveness_raw: Vec<(String, String, Vec<String>, crate::language::LangId)> = Vec::new();
+    let mut generated_skipped: Vec<String> = Vec::new();
     for path in files {
         // canonicalize で削除済みファイルをスキップ、dir 外のパスも除外
         let canonical_path = match std::fs::canonicalize(path) {
@@ -139,12 +214,13 @@ fn collect_dead_code_candidates(
             Ok(p) => normalize_workspace_separators(&p.to_string_lossy()),
             Err(_) => continue, // dir 外のパスは除外（セキュリティ境界）
         };
-        if gitattrs.is_generated(&rel) {
-            continue;
-        }
         // ファイル先頭の「自動生成」マーカーコメントでも除外する (.gitattributes が
         // 無いリポジトリでも tree-sitter の parser.c / protoc の *.pb.go 等を無視できる)
-        if crate::engine::generated::is_auto_generated(&canonical_path) {
+        if !include_generated
+            && (gitattrs.is_generated(&rel)
+                || crate::engine::generated::is_auto_generated(&canonical_path))
+        {
+            generated_skipped.push(rel);
             continue;
         }
         if let Some((lang, syms)) =
@@ -170,6 +246,7 @@ fn collect_dead_code_candidates(
     DeadCodeCandidates {
         all_syms,
         liveness_raw,
+        generated_skipped,
     }
 }
 
@@ -202,7 +279,7 @@ fn normalized_bare_name(lang: crate::language::LangId, name: &str) -> String {
 
 /// 候補シンボルから同名カウント / liveness alias / refs 検索対象名のインデックスを構築する。
 /// `candidate_files` は diff 由来の候補ファイル (hidden 配下含む)。member liveness の
-/// 走査集合を count 経路 (`count_non_definition_refs_split_with_extra_files`) と一致させる。
+/// 走査集合は count 経路と同じ `collect_reference_scan` で作る。
 fn build_dead_code_name_index(
     candidates: &DeadCodeCandidates,
     canonical_dir: &std::path::Path,
@@ -1336,6 +1413,9 @@ pub struct CmdDeadCodeOpts<'a> {
     pub extra_exclude_globs: &'a [String],
     pub output: OutputOptions,
     pub dead_scope: crate::cli::DeadScope,
+    /// 生成物も dead の候補にするか (グローバル `--include-generated` / config の
+    /// `skip_generated = false`)。参照の集計には常に生成物を含める。
+    pub include_generated: bool,
 }
 
 struct ResolvedDeadCodeDiff {
@@ -1360,6 +1440,7 @@ pub fn cmd_dead_code(opts: &CmdDeadCodeOpts<'_>) -> Result<()> {
     let extra_exclude_globs = opts.extra_exclude_globs;
     let output = opts.output;
     let dead_scope = opts.dead_scope;
+    let include_generated = opts.include_generated;
 
     let canonical_dir = std::fs::canonicalize(dir)?;
     if !canonical_dir.is_dir() {
@@ -1399,6 +1480,7 @@ pub fn cmd_dead_code(opts: &CmdDeadCodeOpts<'_>) -> Result<()> {
                     test_only_symbols: Vec::new(),
                     skipped: None,
                     truncations,
+                    generated_candidates_skipped: None,
                 };
                 print!("{}", serialize_cli_document(&result, output)?);
                 return Ok(());
@@ -1420,6 +1502,7 @@ pub fn cmd_dead_code(opts: &CmdDeadCodeOpts<'_>) -> Result<()> {
                 test_only_symbols: Vec::new(),
                 skipped: Some(skip),
                 truncations: Vec::new(),
+                generated_candidates_skipped: None,
             };
             print!("{}", serialize_cli_document(&result, output)?);
             return Ok(());
@@ -1431,36 +1514,44 @@ pub fn cmd_dead_code(opts: &CmdDeadCodeOpts<'_>) -> Result<()> {
         },
     };
 
-    let (files, unanalyzable_truncations): (
-        Vec<std::path::PathBuf>,
-        Vec<crate::models::truncation::TruncationInfo>,
-    ) = if let Some(diff_files) = resolved_diff.files.as_ref() {
-        let files = filter_diff_files_for_dead_code(
-            &canonical_dir,
-            diff_files,
-            &excludes,
-            &combined_globs,
-            glob,
-        )?;
-        (files, Vec::new())
-    } else {
-        // ディレクトリ走査経路では「ソースだが解析できなかったファイル」も受け取る。
-        // 参照を数えられないまま dead と断定すると、`.vue` の `<script>` からしか
-        // 使われていない TS 関数のように**生きているシンボルを dead と報告する**
-        // (最悪方向の誤り)。件数を黙って落とさず truncations として申告する。
-        let collection = crate::engine::refs::collect_files_scan_with_excludes(
-            &canonical_dir,
-            glob,
-            &excludes,
-            &combined_globs,
-            crate::engine::refs::FileScanOptions::default(),
-        )?;
-        let unanalyzable = collection.unanalyzable_truncations(&canonical_dir);
-        (collection.files, unanalyzable)
-    };
+    // 候補ファイルの収集。生成物として候補から外したファイルは申告用に控える
+    // (ディレクトリ走査では名前 / ヘッダマーカーで走査の段階から外れる)。
+    let (files, mut generated_skipped): (Vec<std::path::PathBuf>, Vec<String>) =
+        if let Some(diff_files) = resolved_diff.files.as_ref() {
+            let files = filter_diff_files_for_dead_code(
+                &canonical_dir,
+                diff_files,
+                &excludes,
+                &combined_globs,
+                glob,
+            )?;
+            (files, Vec::new())
+        } else {
+            let collection = crate::engine::refs::collect_files_scan_with_excludes(
+                &canonical_dir,
+                glob,
+                &excludes,
+                &combined_globs,
+                crate::engine::refs::FileScanOptions { include_generated },
+            )?;
+            let generated_skipped = collection
+                .skipped_generated_relative(&canonical_dir)
+                .iter()
+                .map(|path| normalize_workspace_separators(path))
+                .collect();
+            (collection.files, generated_skipped)
+        };
 
     let scanned_files = files.len();
-    let (dead_symbols, test_only_symbols) = detect_dead_symbols_from_files(dir, &files);
+    // 「ソースだが解析できなかったファイル」は参照集計と同じ走査集合から申告する
+    // (`detection.unanalyzable`)。参照を数えられないまま dead と断定すると、`.vue` の
+    // `<script>` からしか使われていない TS 関数のように**生きているシンボルを dead と
+    // 報告する** (最悪方向の誤り)。候補の絞り込み (`--glob` / `--git`) で申告を狭めると、
+    // 数えていない範囲が申告から消える。
+    let detection = detect_dead_symbols(dir, &files, include_generated);
+    generated_skipped.extend(detection.generated_candidates_skipped);
+    let dead_symbols = detection.dead;
+    let test_only_symbols = detection.test_only;
 
     // dead-scope=touched-symbols: --git/--diff 指定時のみ意味を持つ。
     // diff の追加行情報が必要なので、has_diff のときだけ適用する。
@@ -1474,7 +1565,7 @@ pub fn cmd_dead_code(opts: &CmdDeadCodeOpts<'_>) -> Result<()> {
     };
 
     let mut truncations = resolved_diff.truncations;
-    truncations.extend(unanalyzable_truncations);
+    truncations.extend(detection.unanalyzable);
 
     let result = DeadCodeResult {
         dir: canonical_dir.to_string_lossy().to_string(),
@@ -1483,6 +1574,9 @@ pub fn cmd_dead_code(opts: &CmdDeadCodeOpts<'_>) -> Result<()> {
         test_only_symbols,
         skipped: None,
         truncations,
+        generated_candidates_skipped: crate::engine::refs::skipped_files_from_relative(
+            generated_skipped,
+        ),
     };
 
     let text = serialize_cli_document(&result, output)?;

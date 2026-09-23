@@ -485,7 +485,7 @@ impl AppService {
         debug!(name = name, dir = dir, glob = ?glob, "find_references called");
         let canonical_dir = self.validate_dir(dir)?;
 
-        let (references, skipped) = refs::find_references_with_scan(
+        let scan = refs::find_references_with_scan(
             name,
             &canonical_dir,
             glob,
@@ -493,14 +493,15 @@ impl AppService {
         )?;
 
         // 絶対パスを `dir` 基準の相対パスへ変換する。
-        let references = relativize_paths(references, &canonical_dir);
+        let references = relativize_paths(scan.references, &canonical_dir);
 
         let result = RefsResult {
             symbol: name.to_string(),
             references,
-            skipped,
+            skipped: scan.skipped,
             // 上限適用は表現層 (commands / MCP) の責務。解析結果そのものは常に全件持つ。
             result_summary: None,
+            failed_files: scan.failed_files,
         };
         debug!(
             name = name,
@@ -536,7 +537,7 @@ impl AppService {
         debug!(names = ?names, dir = dir, glob = ?glob, "find_references_batch called");
         let canonical_dir = self.validate_dir(dir)?;
 
-        let (batch, skipped) = refs::find_references_batch_with_scan(
+        let scan = refs::find_references_batch_with_scan(
             names,
             &canonical_dir,
             glob,
@@ -544,21 +545,24 @@ impl AppService {
         )?;
 
         // 入力順を保ったまま `Vec<RefsResult>` に変換し、パスも相対化する。
+        // 読み込み失敗件数は出力に現れない内部情報なので、全名前に付ける
+        // (どの名前の参照が欠けたかは分からないため)。
         let mut results: Vec<RefsResult> = names
             .iter()
             .map(|name| {
-                let references = batch.get(name).cloned().unwrap_or_default();
+                let references = scan.references.get(name).cloned().unwrap_or_default();
                 let references = relativize_paths(references, &canonical_dir);
                 RefsResult {
                     symbol: name.clone(),
                     references,
                     skipped: None,
                     result_summary: None,
+                    failed_files: scan.failed_files,
                 }
             })
             .collect();
         if let Some(first) = results.first_mut() {
-            first.skipped = skipped;
+            first.skipped = scan.skipped;
         }
 
         debug!(

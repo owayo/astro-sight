@@ -24,7 +24,7 @@ pub fn is_symbol_exported(
         LangId::Typescript | LangId::Tsx | LangId::Javascript => {
             is_exported_js_ts(node, source, root)
         }
-        LangId::Rust => is_exported_rust(node),
+        LangId::Rust => is_exported_rust(node, source),
         LangId::Go => is_exported_go(node, source),
         LangId::Java | LangId::Kotlin => is_exported_jvm(node, source),
         LangId::Zig => is_exported_zig(node, source),
@@ -183,6 +183,9 @@ fn find_enclosing_declaration(node: Node) -> Option<Node> {
         "function_definition",
         "method_declaration",
         "class_declaration",
+        // Java / C# の record。無いとクラス内の `private record` が外側クラスの
+        // 修飾子で判定される。
+        "record_declaration",
         "interface_declaration",
         "enum_declaration",
         "object_declaration",
@@ -231,7 +234,19 @@ fn is_exported_js_ts(node: Node, source: &[u8], root: Node) -> bool {
     }
 
     // named export のチェック: export { name }
-    if let Some(name_node) = node.child_by_field_name("name")
+    //
+    // 分割代入の束縛 (`const { a, b } = obj; export { a };`) は宣言を複数シンボルで
+    // 共有するため、呼び出し側が名前ノードの位置 (`Symbol::identity_range`) を渡してくる。
+    // その場合は `node` 自身が名前なので、そのテキストで照合する (宣言の name は
+    // パターン全体で、`a` と `b` を区別できない)。
+    let name_node = node.child_by_field_name("name").or_else(|| {
+        matches!(
+            node.kind(),
+            "identifier" | "shorthand_property_identifier_pattern"
+        )
+        .then_some(node)
+    });
+    if let Some(name_node) = name_node
         && let Ok(name) = name_node.utf8_text(source)
     {
         return has_named_export(root, source, name);
@@ -464,12 +479,13 @@ fn collect_rust_use_tree_names(
     }
 }
 
-/// Rust: visibility_modifier (pub) または impl ブロック所属をチェック。
+/// Rust: visibility_modifier (pub) または impl / trait ブロック所属をチェック。
 ///
 /// - `pub fn` → エクスポート
 /// - trait impl のメソッド（明示的な `pub` 不要）→ エクスポート
 /// - 固有 impl の `pub` なしメソッド → モジュール内限定、非エクスポート
-fn is_exported_rust(node: Node) -> bool {
+/// - trait 内で宣言されたメソッド (必須 / default) → trait の可視性を継承
+fn is_exported_rust(node: Node, source: &[u8]) -> bool {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "visibility_modifier" {
@@ -477,18 +493,36 @@ fn is_exported_rust(node: Node) -> bool {
         }
     }
 
-    // 囲んでいる impl ブロックをチェック
+    // 囲んでいる impl / trait ブロックをチェック
     let mut parent = node.parent();
     while let Some(p) = parent {
-        if p.kind() == "impl_item" {
+        match p.kind() {
             // trait impl: メソッドは trait の可視性を継承（常に公開）
             // 固有 impl: pub なしメソッド → モジュール内限定
-            return p.child_by_field_name("trait").is_some();
+            "impl_item" => return p.child_by_field_name("trait").is_some(),
+            // trait 内のメソッドには可視性修飾子を書けず、trait の可視性を継承する。
+            // 旧実装はここを「修飾子なし = 非公開」と扱っていたため、`pub trait` の
+            // メソッドの削除・シグネチャ変更が api.rm / api.mod に一切出なかった。
+            // `pub(crate) trait` 等の制限付き公開はクレート外から見えないので非公開。
+            "trait_item" => return rust_node_has_unrestricted_pub_visibility(p, source),
+            _ => {}
         }
         parent = p.parent();
     }
 
     false
+}
+
+/// Rust: シンボル範囲が trait 本体で宣言されたメソッド (必須 / default) か。
+pub(crate) fn is_rust_trait_declared_method(root: Node, symbol_range: &Range) -> bool {
+    node_for_symbol_range(root, symbol_range).is_some_and(|node| {
+        matches!(node.kind(), "function_item" | "function_signature_item")
+            && node
+                .parent()
+                .filter(|p| p.kind() == "declaration_list")
+                .and_then(|p| p.parent())
+                .is_some_and(|p| p.kind() == "trait_item")
+    })
 }
 
 /// Go: 大文字で始まる識別子はエクスポート。

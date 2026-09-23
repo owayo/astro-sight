@@ -204,6 +204,51 @@ s.run();
     );
 }
 
+/// turbofish 付きメソッド呼び出し (`s.fetch::<u32>()`) はメソッド参照として数える。
+///
+/// `call_expression > generic_function > field_expression` と祖父が `generic_function` に
+/// なるため、旧実装は「ただのフィールドアクセス」と誤判定して dead-code / impact の
+/// 判定面から落としていた (turbofish でしか呼ばれない `Store.fetch` が dead に出た)。
+/// 対照: turbofish なしの呼び出しは従来どおり数え、同名フィールドへのアクセス
+/// (`s.fetch` / `s.plain`) とフィールド宣言は引き続き数えない。
+#[test]
+fn rust_turbofish_method_call_is_counted_but_field_access_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.rs"),
+        r#"pub struct Store {
+    pub fetch: u32,
+    pub plain: u32,
+}
+impl Store {
+    pub fn fetch<T: Default>(&self) -> T { T::default() }
+    pub fn plain(&self) -> u32 { 0 }
+}
+pub fn run(s: &Store) -> u32 {
+    s.fetch::<u32>() + s.plain() + s.fetch + s.plain
+}
+"#,
+    )
+    .unwrap();
+
+    let counts = count_non_definition_refs_split_with_extra_files(
+        &["fetch".to_string(), "plain".to_string()],
+        dir.path(),
+        Some("**/*.rs"),
+        &[],
+        |_| false,
+    )
+    .unwrap();
+    assert_eq!(
+        counts["fetch"].0, 1,
+        "turbofish 付き呼び出し 1 件だけを数える (フィールド宣言・`s.fetch` は数えない)"
+    );
+    assert_eq!(
+        counts["plain"].0, 1,
+        "対照: turbofish なしの呼び出し 1 件だけを数える (フィールド宣言・`s.plain` は数えない)"
+    );
+}
+
 /// 単一 refs 検索が複数ファイルを横断し、定義を先頭に返すことを検証
 #[test]
 fn find_references_single_search_sorts_definition_first() {

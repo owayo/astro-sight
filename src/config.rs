@@ -163,6 +163,8 @@ format = "json"
 
 # 生成ファイルをディレクトリ走査から除外する (デフォルト: true)。
 # 除外件数は refs / symbols --dir の skipped フィールドに出力される。
+# dead-code では dead 判定の候補からだけ外し (中の参照は常に数える)、
+# 件数を generated_candidates_skipped フィールドに出力する。
 # CLI の --include-generated はこの設定より優先される。
 skip_generated = true
 "#

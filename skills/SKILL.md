@@ -2,8 +2,9 @@
 name: astro-sight
 description: >-
   tree-sitter AST でコード構造を解析する CLI。コード識別子 (関数/クラス/変数/型/メソッド名)
-  を探すときは Grep でなく必ずこれ — refs --name/--names。diff/PR レビューは review
-  --git、編集前後の影響分析は context/impact、構文ノードの特定・parse エラー調査は ast。
+  を探すときは Grep でなく必ずこれ — refs --name/--names (関数の呼び出し元の特定も refs)。
+  diff/PR レビューは review --git、編集中・編集後の diff 影響分析は context/impact、
+  構文ノードの特定・parse エラー調査は ast。
   dead-code/symbols/calls/imports/sequence/lint/session も提供。
   識別子検索・シンボル参照・呼び出し関係・構造把握・構文確認・コードレビューの場面で発動。
 allowed-tools: Bash(astro-sight:*)
@@ -22,12 +23,13 @@ The same rule applies inside shell commands: wrapping `grep` / `rg` in Bash is n
 |---|---|
 | Find a function / class / variable / type / constant / method name | `refs --name <sym>` (pipe-separated `FOO`/`Bar` → `refs --names FOO,Bar`; single file → add `--glob <file>`) |
 | Review a diff / PR / bug-fix end-to-end | `review --dir . --git` (external patch: `--diff-file <patch>`) |
-| What a change breaks (before editing) | `context --dir . --git` |
+| Who calls a function — check this before changing its signature | `refs --name <fn>` (`ctx` shows each call site, across files) |
+| What the current diff breaks (needs uncommitted changes; a clean tree returns nothing) | `context --dir . --git` |
 | Unresolved impacts (after editing) | `impact --dir . --git` |
 | Dead (unreferenced) exported symbols | `dead-code --dir .` (diff-scoped: `--git`) — results carry `line` |
 | File / directory structure | `symbols --path <file>` / `symbols --dir <dir>` |
 | Exact syntax node at a cursor, or parse-error debug | `ast --path <file> --line <n> --col <n>` |
-| Who calls a function / what it calls | `calls --path <file> --function <name>` |
+| What a function calls (its callees — not its callers) | `calls --path <file> --function <name>` |
 | What a file imports | `imports --path <file>` |
 | Understand ordered call flow, especially 3+ interactions | `sequence --path <file> --function <name>` |
 | Files that usually change together | `cochange --dir . --paths <file>` |
@@ -44,11 +46,11 @@ The same rule applies inside shell commands: wrapping `grep` / `rg` in Bash is n
 astro-sight refs --name <symbol> --dir .           # 1. references (REPLACES Grep for identifiers)
 astro-sight refs --names sym1,sym2 --dir .         # 2. batch symbol search (REPLACES Grep "FOO|Bar")
 astro-sight review --dir . --git                   # 3. one-shot diff/PR review
-astro-sight context --dir . --git                  # 4. what a change breaks (before editing)
+astro-sight context --dir . --git                  # 4. what the current diff breaks (needs a diff)
 astro-sight impact --dir . --git                   # 5. unresolved impacts (after editing)
 astro-sight dead-code --dir . --git                # 6. dead exported symbols
 astro-sight symbols --path <file>                  # 7. file structure
-astro-sight calls --path <file> --function <name>  # 8. caller/callee relationships
+astro-sight calls --path <file> --function <name>  # 8. callees of a function (callers → refs)
 astro-sight imports --path <file>                  # 9. imports/exports
 astro-sight sequence --path <file> --function <name> # 10. ordered call flow (3+ interactions)
 astro-sight cochange --dir . --paths <file>        # 11. files that usually change together
@@ -98,9 +100,11 @@ astro-sight calls --path <file> --function <name>  # only calls made by one func
 
 Output (compact): `calls` array grouped by `caller`, each with `range` and `callees` (`name`, `ln`, `col`). `--pretty` for full format.
 
+`--function <name>` keeps only the calls made **from inside** `<name>`, so it answers "what does `<name>` call?". It never lists who calls `<name>` — for callers (including other files) use `refs --name <name>`, whose `ctx` shows each call site.
+
 ### `context` — Diff Impact Analysis
 
-Reads a unified diff and finds affected symbols, signature changes, and impacted callers. Answers "what does this change break?".
+Reads a unified diff and finds affected symbols, signature changes, and impacted callers. Answers "what does this change break?". It needs a diff to exist: on a clean working tree `--git` yields `{"changes":[]}`, so before your first edit list the call sites with `refs --name <symbol>` instead, and run `context` once edits are in place.
 
 ```bash
 astro-sight context --dir . --git                      # auto git diff (recommended)
@@ -168,6 +172,8 @@ Lists function/class/struct/enum definitions. Compact by default for token effic
 
 `cn` is the enclosing container; for Go methods it is the receiver type (`func (b *Box) Area()` → `cn: "Box"`).
 
+Besides functions/classes/types, it also extracts JS/TS destructured bindings (`export const { auth, signOut } = NextAuth()` → one symbol per bound name, `ln` = that name's line; property keys are not bindings), `var`, generator functions, `abstract class`, Java/C# `record`, Go type aliases, and Rust trait methods (including bodiless required ones, which inherit the trait's visibility). TS interface / abstract methods and Go interface methods are not extracted yet.
+
 ```bash
 astro-sight symbols --path <file>            # single file
 astro-sight symbols --path <file> --doc      # include docstrings
@@ -228,7 +234,9 @@ astro-sight lint --path <file> --rules rules.yaml
 
 Exported symbols with zero non-definition references. Diff flags limit the scan to diff-related files; without a diff, scans the whole project. Package-manager trees, test dirs, and build artifacts are excluded by default (`--include-vendor` / `--include-tests` / `--include-build` to opt back in).
 
-When the directory contains source files astro-sight has no parser for (`.vue`, `.svelte`, `.astro`, `.erb`, `.razor`, `.scala`, ...), references inside them cannot be counted, so a live symbol used only from such a file would be reported as dead. Those files are declared in `truncations` with `reason: "unanalyzable_source"` (folded to one entry per extension). **Read it before acting on a dead symbol** — the field is absent when every source file was analyzed.
+When the directory contains source files astro-sight has no parser for (`.vue`, `.svelte`, `.astro`, `.erb`, `.razor`, `.scala`, ...), references inside them cannot be counted, so a live symbol used only from such a file would be reported as dead. Those files are declared in `truncations` with `reason: "unanalyzable_source"` (folded to one entry per extension). The declaration covers the whole directory the references were counted in, so `--glob` / `--git` do not narrow it. **Read it before acting on a dead symbol** — the field is absent when every source file was analyzed.
+
+Files detected as generated (a generated-file header comment, `.gitattributes` `linguist-generated`, ...) are excluded from the dead **candidates** only; references inside them are always counted, because generated code (e.g. a gRPC `*_grpc.pb.go` handler) calls hand-written code at runtime. The excluded files are listed in `generated_candidates_skipped` (same `{generated, paths, truncated}` shape as `refs`' `skipped`); the global `--include-generated` makes their symbols candidates too.
 
 ```bash
 astro-sight dead-code --dir .                       # auto-detects each monorepo workspace with a `next` dependency
@@ -240,7 +248,7 @@ astro-sight dead-code --dir . --exclude-dir generated --exclude-glob 'app/Legacy
 astro-sight dead-code --dir . --git --dead-scope touched-symbols   # only dead symbols declared inside diff hunks
 ```
 
-Output: `dir`, `scanned_files`, `dead_symbols` (`name`, `kind`, `file`). Duplicate-named symbols across files are conservatively skipped. Runtime conventions (PHPUnit `*Test`/`*TestCase` + `testXxx`/`setUp`; Python unittest/pytest; Python `urllib.request.BaseHandler` protocol methods; watchdog `FileSystemEventHandler` callbacks; Angular lifecycle hooks like `ngOnInit`) are auto-excluded. A bin-only Rust crate's `pub fn` is excluded from `review`'s `api_changes` (unreachable from outside the crate).
+Output: `dir`, `scanned_files`, `dead_symbols` (`name`, `kind`, `file`). Duplicate-named symbols across files are conservatively skipped. Runtime conventions (PHPUnit `*Test`/`*TestCase` + `testXxx`/`setUp`; Python unittest/pytest; Python `urllib.request.BaseHandler` protocol methods; watchdog `FileSystemEventHandler` callbacks; Angular lifecycle hooks like `ngOnInit`, `@Pipe` `transform`, and `ngOnDestroy` on `@Injectable` / `@Pipe` classes; program entrypoints — C/C++ global `main`, Kotlin top-level `fun main` and `@JvmStatic fun main` in an `object` / `companion object`, Java non-private `void main` with no parameter or one `String[]`, C# `static Main` — plus the Java / C# / Kotlin types declaring them) are auto-excluded. A bin-only Rust crate's `pub fn` is excluded from `review`'s `api_changes` (unreachable from outside the crate).
 
 ### `session` — NDJSON Batch Mode
 
@@ -268,8 +276,9 @@ astro-sight sequence --path src/main.rs --function main
 
 ### "Is it safe to rename this function?"
 ```bash
-astro-sight refs --name old_name --dir .              # all usages
-astro-sight calls --path file.rs --function old_name  # callers
+astro-sight refs --name old_name --dir .              # every definition, call site, and import
+# ...rename...
+astro-sight impact --dir . --git                      # any caller left outside the diff?
 ```
 
 ### "What changed together with this file recently?"
@@ -291,12 +300,12 @@ printf '%s\n' \
 - **16 tree-sitter languages**: Rust, C, C++, Python, JavaScript, TypeScript, TSX, Go, PHP, Java, Kotlin, Swift, C#, Bash, Ruby, Zig. Ruby methods may use Unicode identifiers, including simple case-fold characters such as `ſ` and `K`; ambiguous forms such as spaced index assignment, bare lambda parameters followed by a block, empty regex literals, blocks after paren-less calls, and empty-identifier heredocs are parsed without error nodes.
 - Compact JSON by default (short keys: `ln`, `col`, `ctx`, `refs`, `src`, `def`/`ref`, `fn`...). Use `--pretty` (global) for human-readable output.
 - **`--format json|toon|auto`** (global) switches the output format; the default is `json`, and `format` in `~/.config/astro-sight/config.toml` sets a different default (CLI `--format` wins). TOON ([v4.1](https://toonformat.dev/)) encodes the same data with indentation and tables instead of repeated keys, measuring 17-60% smaller than compact JSON across commands. `--pretty` is JSON-only and ignored for TOON. CLI TOON documents never have a trailing newline, including batch output and TOON selected by `auto`; JSON/NDJSON retains its newline termination.
-- **`--format auto`** encodes both and emits whichever is estimated to use fewer tokens (character count plus a per-line penalty, since BPE spends roughly one token per newline+indent; ties go to JSON), so it is never worse than either candidate. The choice is deterministic for a given input. For batch modes the winner is decided from the first window of records and applied to the rest, since results are streamed rather than fully buffered.
+- **`--format auto`** encodes both and emits whichever is estimated to use fewer tokens (character count plus a per-line penalty, since BPE spends roughly one token per newline+indent; ties go to JSON), so it is never worse than either candidate. The choice is deterministic for a given input. For batch modes the winner is decided from the first 32 records (a fixed sample, so the choice does not change with the worker count / `ASTRO_SIGHT_BATCH_WORKERS`) and applied to the rest, since results are streamed rather than fully buffered.
 - **Always JSON regardless of `--format`**: `session` (line-oriented NDJSON protocol), `review --hook` / `impact --hook` (Stop hook contract), and the `{"error":{...}}` envelope. Passing `--format toon` explicitly to those is an `INVALID_REQUEST`; a config-file default silently falls back to JSON so setting `format = "toon"` never breaks hooks. `--format auto` is accepted there and simply yields JSON.
 - With `--format toon`, batch modes (`--paths` / `--paths-file` / `--dir`) emit **one root-array document** (`[N]:` followed by `- ` items) instead of NDJSON. Optional fields that compact JSON omits (e.g. `cx`) appear as explicit `null` cells so uniform tables stay possible.
 - `refs` respects `.gitignore`; results include `ctx` (source line) so no follow-up Read is needed. Use `refs --names` for symbol-only batches, `session` for mixed commands.
 - A zero-result identifier query is still an AST analysis result; do not repeat the same search with Grep/rg.
-- **Vendor/build exclusion** (`context` / `impact` / `review`): cross-file ref search skips package-manager trees (`vendor/`, `node_modules/`, `.venv/`, `Pods/`, `Carthage/`...) and build artifacts (`target/`, `build/`, `dist/`, `.build/`, `DerivedData/`, `.next/`, `bin/`, `obj/`...) so generic method names (`new`, `save`, `find`) don't flood `impacted_callers`. `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` opts back in; `.gitignore` / hidden exclusions are independent and always on. For non-default vendored trees (`pjproject-2.15/`, `third_party/`...) pass `--exclude-dir <NAME>` / `--exclude-glob <PATTERN>` (workspace-relative, negative-override); invalid globs fail up-front with `INVALID_REQUEST`.
+- **Vendor/build exclusion** (`context` / `impact` / `review`): cross-file ref search skips package-manager trees (`vendor/`, `node_modules/`, `.venv/`, `Pods/`, `Carthage/`...) and build artifacts (`target/`, `build/`, `dist/`, `.build/`, `DerivedData/`, `.next/`, `bin/` (except Cargo's `src/bin/`), `obj/`...) so generic method names (`new`, `save`, `find`) don't flood `impacted_callers`. `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` opts back in; `.gitignore` / hidden exclusions are independent and always on. For non-default vendored trees (`pjproject-2.15/`, `third_party/`...) pass `--exclude-dir <NAME>` / `--exclude-glob <PATTERN>` (workspace-relative, negative-override); invalid globs fail up-front with `INVALID_REQUEST`.
 - **Input validation**: empty `--name` / `--names` / `--paths` / `--paths-file` rejected with `INVALID_REQUEST`; `--paths-file` capped at 100MB; `cochange` rejects out-of-range `--min-confidence` / negative smoothing priors; `--base` rejects values starting with `-` (blocks git option injection).
 - Batch `--paths` output uses a dedicated rayon pool, defaulting to `min(available CPUs, 4)` workers to bound thread-local parser memory. Set a positive `ASTRO_SIGHT_BATCH_WORKERS` value to tune concurrency up to the available CPU count. Output preserves input order while retaining only `8 × workers` pending results; a closed stdout stops processing at the current window.
 - With `ASTRO_SIGHT_WORKSPACE`, session-relative `path` / `dir` resolve from the workspace root (invalid values fail closed). stdout broken pipes are handled gracefully (`symbols --dir src | head` won't panic).

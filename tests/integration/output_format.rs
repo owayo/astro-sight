@@ -357,6 +357,64 @@ pub fn f{i}() -> usize {{
     );
 }
 
+/// バッチの `auto` の選択は入力内容だけで決まり、並列度 (`ASTRO_SIGHT_BATCH_WORKERS`) に依存しない。
+///
+/// 旧実装は先頭 window (= ワーカー数 × 8 件) だけで勝者を決めていたため、先頭 8 件だけ
+/// JSON が短い入力では、1 ワーカー (window 8 件) で NDJSON、2 ワーカー以上で TOON になっていた。
+#[test]
+fn auto_batch_choice_does_not_depend_on_worker_count() {
+    let repo = TestRepo::new();
+    let mut paths = Vec::new();
+    // 先頭 8 件は関数 1 個 (JSON の方が短い)、続く 30 件は関数 20 個 (TOON の方が短い)。
+    for i in 1..=8 {
+        let name = format!("a{i}.py");
+        repo.write(&name, format!("def only_{i}():\n    return 1\n"));
+        paths.push(name);
+    }
+    for i in 1..=30 {
+        let name = format!("b{i}.py");
+        let body: String = (1..=20)
+            .map(|j| {
+                format!("def func_{i}_{j}(x):\n    if x:\n        return {j}\n    return 0\n\n")
+            })
+            .collect();
+        repo.write(&name, body);
+        paths.push(name);
+    }
+    let paths = paths.join(",");
+
+    let auto_with_workers = |workers: &str| {
+        let output = cargo_bin()
+            .env("ASTRO_SIGHT_BATCH_WORKERS", workers)
+            .args([
+                "symbols",
+                "--no-cache",
+                "--paths",
+                &paths,
+                "--format",
+                "auto",
+            ])
+            .current_dir(repo.root())
+            .output()
+            .expect("failed to run astro-sight");
+        stdout_of(&output)
+    };
+
+    let single_worker = auto_with_workers("1");
+    assert!(
+        single_worker.starts_with("[38]:"),
+        "入力全体では TOON の方が短い: {}",
+        &single_worker[..single_worker.len().min(80)]
+    );
+    for workers in ["2", "4"] {
+        assert_eq!(
+            auto_with_workers(workers),
+            single_worker,
+            "ASTRO_SIGHT_BATCH_WORKERS={workers} で出力が変わった"
+        );
+    }
+}
+
 #[test]
 fn auto_config_default_works_and_cli_overrides_it() {
     let repo = sample_repo();

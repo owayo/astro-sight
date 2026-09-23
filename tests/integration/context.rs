@@ -554,3 +554,89 @@ export const config = {\n\
         "削除と重なる `config` が affected に残ること: {affected:?}"
     );
 }
+
+/// turbofish 付きメソッド呼び出し `s.fetch::<u32>()` は impact の caller として列挙する。
+///
+/// `call_expression > generic_function > field_expression` と祖父が `generic_function` に
+/// なるため、旧実装は同名フィールドへのアクセスと同じ扱いで caller から落としていた
+/// (シグネチャを変えても呼び出し側の更新漏れが検出されない)。
+/// 対照: 同名フィールドの宣言とアクセス (`holder.rs`、`Store` も参照して owner 名による
+/// 絞り込みを通過させている) は従来どおり caller に含めない。
+#[test]
+fn context_rust_turbofish_method_call_is_impacted_caller() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub mod holder;\npub mod store;\npub mod user;\n",
+    )
+    .unwrap();
+    // 変更後の内容 (fetch に引数を追加)
+    std::fs::write(
+        root.join("src/store.rs"),
+        "pub struct Store;\n\
+         impl Store {\n\
+         \x20   pub fn fetch<T: Default>(&self, n: u32) -> T { let _ = n; T::default() }\n\
+         }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/user.rs"),
+        "use crate::store::Store;\npub fn run(s: &Store) -> u32 {\n    s.fetch::<u32>()\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/holder.rs"),
+        "use crate::store::Store;\n\
+         pub struct Holder { pub fetch: u32 }\n\
+         pub fn read(h: &Holder, _s: &Store) -> u32 {\n\
+         \x20   h.fetch\n\
+         }\n",
+    )
+    .unwrap();
+
+    let diff = "diff --git a/src/store.rs b/src/store.rs\n\
+--- a/src/store.rs\n\
++++ b/src/store.rs\n\
+@@ -1,4 +1,4 @@\n\
+ pub struct Store;\n\
+ impl Store {\n\
+-    pub fn fetch<T: Default>(&self) -> T { T::default() }\n\
++    pub fn fetch<T: Default>(&self, n: u32) -> T { let _ = n; T::default() }\n\
+ }\n";
+    let diff_path = root.join("changes.patch");
+    std::fs::write(&diff_path, diff).unwrap();
+
+    let output = cargo_bin()
+        .args([
+            "context",
+            "--dir",
+            root.to_str().unwrap(),
+            "--diff-file",
+            diff_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run context");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let caller_paths: Vec<&str> = json["changes"]
+        .as_array()
+        .expect("changes 配列")
+        .iter()
+        .flat_map(|change| change["impacted_callers"].as_array().into_iter().flatten())
+        .filter_map(|caller| caller["path"].as_str())
+        .collect();
+    assert!(
+        caller_paths.contains(&"src/user.rs"),
+        "turbofish 付き呼び出しは caller: {json}"
+    );
+    assert!(
+        !caller_paths.contains(&"src/holder.rs"),
+        "対照: 同名フィールドの宣言・アクセスは caller ではない: {json}"
+    );
+}

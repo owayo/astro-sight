@@ -272,3 +272,132 @@ fn mcp_sandbox_fail_closed_with_nonexistent_dir() {
         "存在しないディレクトリで sandbox は生成できないべき"
     );
 }
+
+// ---- MCP: refs の予算は tool result と同じ描画で採寸する ----
+
+/// `output::estimated_tokens` と同じ換算 (文字数 + 4 × 改行数 を 3 で割って切り上げ)。
+fn estimated_tokens(text: &str) -> usize {
+    let newlines = text.bytes().filter(|b| *b == b'\n').count();
+    (text.chars().count() + 4 * newlines).div_ceil(3)
+}
+
+/// `tool` を 1 回呼び、tool result の text を返す。
+fn mcp_tool_text(
+    global_args: &[&str],
+    cwd: &std::path::Path,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> String {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": { "name": tool, "arguments": arguments }
+    })
+    .to_string();
+    let stdout = mcp_send_after_init_with(global_args, Some(cwd), &[&request]);
+    let result_line = stdout
+        .lines()
+        .find(|line| line.contains("\"id\":2"))
+        .unwrap_or_else(|| panic!("{tool} のレスポンスが必要: {stdout}"));
+    let json: serde_json::Value = serde_json::from_str(result_line).expect("valid JSON-RPC");
+    json["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("text フィールドが必要: {json}"))
+        .to_string()
+}
+
+/// text に含まれる参照の件数。JSON (単体 / 配列) と TOON (`refs[N]` ヘッダの合計) の両方を読む。
+fn shown_refs(text: &str) -> usize {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        let results = match value.as_array() {
+            Some(items) => items.clone(),
+            None => vec![value],
+        };
+        return results
+            .iter()
+            .map(|r| r["refs"].as_array().map_or(0, Vec::len))
+            .sum();
+    }
+    text.match_indices("refs[")
+        .map(|(i, _)| {
+            let digits: String = text[i + "refs[".len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits
+                .parse::<usize>()
+                .expect("TOON の refs ヘッダには件数がある")
+        })
+        .sum()
+}
+
+/// MCP の `token_budget` は **実際に返す text** (`--format` / `--pretty` に従う) で採寸する。
+///
+/// 旧実装は予算の採寸だけ compact JSON に固定していたため、`--pretty mcp` では予算の
+/// 約 2 倍の text を `budget_exceeded` なしで返し、逆に 1 件あたりが軽い TOON では予算を
+/// 使い切らずに compact JSON と同じ件数で打ち切っていた (同条件の CLI は実描画で採寸する)。
+/// 単体 (`refs_search`) とバッチ (`refs_batch_search`) の両経路を確かめる。
+#[test]
+fn mcp_refs_budget_is_measured_on_the_rendered_text() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut src = String::from("pub fn alpha() {}\npub fn bravo() {}\npub fn charlie() {}\n");
+    for i in 0..120 {
+        src.push_str(&format!(
+            "pub fn caller{i}() {{ alpha(); bravo(); charlie(); }}\n"
+        ));
+    }
+    std::fs::write(dir.path().join("a.rs"), &src).expect("write");
+    let budget = 1500;
+
+    let calls = [
+        (
+            "refs_search",
+            serde_json::json!({ "name": "alpha", "dir": ".", "token_budget": budget }),
+        ),
+        (
+            "refs_batch_search",
+            serde_json::json!({
+                "names": ["alpha", "bravo", "charlie"],
+                "dir": ".",
+                "token_budget": budget
+            }),
+        ),
+    ];
+    for (tool, arguments) in calls {
+        let text_for = |args: &[&str]| mcp_tool_text(args, dir.path(), tool, arguments.clone());
+
+        // 対照: compact JSON (既定) は従来どおり予算内。
+        let compact = text_for(&[]);
+        assert!(
+            estimated_tokens(&compact) <= budget,
+            "{tool} compact: {} tokens",
+            estimated_tokens(&compact)
+        );
+        let compact_shown = shown_refs(&compact);
+        assert!(compact_shown > 0, "{tool}: 予算内で参照を返す");
+
+        let pretty = text_for(&["--pretty"]);
+        let toon = text_for(&["--format", "toon"]);
+        for (label, text) in [("pretty", &pretty), ("toon", &toon)] {
+            assert!(
+                estimated_tokens(text) <= budget || text.contains("budget_exceeded"),
+                "{tool} {label}: 予算 {budget} に対し {} tokens を申告なしで返した",
+                estimated_tokens(text)
+            );
+        }
+
+        // 1 件あたりが compact より重い pretty は同じ予算で出せる件数が減り、軽い TOON は
+        // 増える (採寸が compact JSON 固定のままだと、どちらも compact と同じ件数になる)。
+        assert!(
+            shown_refs(&pretty) < compact_shown,
+            "{tool}: pretty={} compact={compact_shown}",
+            shown_refs(&pretty)
+        );
+        assert!(
+            shown_refs(&toon) > compact_shown,
+            "{tool}: toon={} compact={compact_shown}",
+            shown_refs(&toon)
+        );
+    }
+}

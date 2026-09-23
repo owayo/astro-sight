@@ -370,6 +370,190 @@ fn git_show_blob_resolves_paths_relative_to_workspace_dir() {
     );
 }
 
+/// 常駐 `git cat-file --batch` の読み出し (`GitBlobBatch`) は `git_show_blob` と同じ結果を返す。
+///
+/// API 差分の前処理はファイルごとの `git show` をこれに置き換えている (200 ファイルの diff で
+/// 5.7 秒 → 0.15 秒)。サブディレクトリ実行の cwd 相対解決・存在しないパス・空白入りパス・
+/// 空ファイル・連続読み出し・不正な revision の拒否・改行入りパスの単発フォールバックを、
+/// すべて同じ入力で `git_show_blob` と突き合わせる。
+///
+/// 唯一の意図的な差はディレクトリ (tree) で、`git show` は tree の一覧テキストを成功扱いで
+/// 返すが、batch 版は blob ではないので `None` を返す (diff のファイル一覧にディレクトリは
+/// 現れず、ソースとして解析できない内容を渡さない方が正しい)。
+#[test]
+fn git_blob_batch_matches_git_show_blob() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_subproject_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            ("src/kept.rs", "pub fn root_kept() {}\n"),
+            ("app/src/with space.rs", "pub fn spaced() {}\n"),
+            ("app/src/empty.rs", ""),
+        ],
+        "add fixtures",
+    );
+    for workspace in [repo.to_path_buf(), repo.join("app")] {
+        let dir_str = workspace.to_str().expect("utf-8");
+        let batch = crate::commands::git_input::GitBlobBatch::new(dir_str, "HEAD");
+        for path in [
+            "src/kept.rs",
+            "src/with space.rs",
+            "src/empty.rs",
+            "src/missing.rs",
+            "src/kept.rs",
+            "src/new\nline.rs",
+        ] {
+            assert_eq!(
+                batch.read(path),
+                crate::commands::git_show_blob(dir_str, "HEAD", path),
+                "{dir_str}: {path:?}"
+            );
+        }
+        // tree は blob ではないので読まない (git show は一覧テキストを返す)。
+        assert!(crate::commands::git_show_blob(dir_str, "HEAD", "src").is_some());
+        assert_eq!(batch.read("src"), None, "{dir_str}: tree is not a blob");
+        // tree の応答を読み切った後も、続く要求は正しく読める (プロトコルがずれない)。
+        assert_eq!(
+            batch.read("src/kept.rs"),
+            crate::commands::git_show_blob(dir_str, "HEAD", "src/kept.rs")
+        );
+        let rejected = crate::commands::git_input::GitBlobBatch::new(dir_str, "--output=x");
+        assert_eq!(
+            rejected.read("src/kept.rs"),
+            None,
+            "option-like revision is rejected"
+        );
+    }
+}
+
+/// cat-file は要求行末の CR を区切りとして落とすため、`a<CR>` を batch で要求すると別ファイル
+/// `a` の内容が返る (実測)。CR / LF を含むパスは単発の `git show` で読み、取り違えないこと。
+/// 同名から CR を除いたファイルを並べ、取り違えたら別の内容が返るようにしてある。
+#[cfg(unix)]
+#[test]
+fn git_blob_batch_does_not_confuse_path_ending_with_carriage_return() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(repo, &[("a", "plain\n"), ("a\r", "carriage\n")], "add");
+    let dir_str = repo.to_str().expect("utf-8");
+    for rev in ["HEAD", ":0"] {
+        let batch = crate::commands::git_input::GitBlobBatch::new(dir_str, rev);
+        // 先に通常のパスを読んで常駐プロセスを起動させる (起動前のフォールバックだけを
+        // 通るテストにしない)。
+        assert_eq!(batch.read("a").as_deref(), Some(&b"plain\n"[..]), "{rev}");
+        assert_eq!(
+            batch.read("a\r").as_deref(),
+            Some(&b"carriage\n"[..]),
+            "{rev}: CR で終わるパスを別ファイルと取り違えない"
+        );
+        assert_eq!(
+            batch.read("a").as_deref(),
+            Some(&b"plain\n"[..]),
+            "{rev}: 後続の要求もずれない"
+        );
+    }
+}
+
+/// 実体の無い gitlink (サブモジュール) への要求で読み手を捨てない。
+///
+/// cat-file は gitlink に `<oid> submodule` (内容なし) と応答して処理を続ける。これを異常な
+/// 応答とみなすと、サブモジュールのポインタ更新を含む diff で以降の読み出しがすべて単発の
+/// `git show` に戻る (結果は同じだがプロセス起動の削減が失われる)。後続の要求が常駐プロセスで
+/// 読めていることまで確かめる。
+#[test]
+fn git_blob_batch_keeps_running_after_gitlink_request() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(repo, &[("a.txt", "a\n")], "initial");
+    let git = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .expect("git")
+                .success(),
+            "git {args:?}"
+        );
+    };
+    git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        "160000,1111111111111111111111111111111111111111,sub",
+    ]);
+    git(&["commit", "-qm", "add gitlink"]);
+
+    let batch =
+        crate::commands::git_input::GitBlobBatch::new(repo.to_str().expect("utf-8"), "HEAD");
+    assert_eq!(batch.read("sub"), None, "gitlink は blob ではない");
+    assert!(batch.is_batch_running(), "gitlink の応答で読み手を捨てない");
+    assert_eq!(batch.read("a.txt").as_deref(), Some(&b"a\n"[..]));
+    assert!(batch.is_batch_running());
+}
+
+/// `GitBlobBatch::index` は index (stage 0) の内容を順に読む。
+/// 作業ツリーではなく index の内容を返し、パスは `git_show_blob` と同じく `--dir` 相対。
+/// 読めない要求 (index に無い / 上限超過 / 改行入りパス) の後も応答の同期が崩れないこと。
+#[test]
+fn index_blob_reader_reads_staged_content_relative_to_workspace_dir() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_subproject_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            ("app/src/my util.rs", "pub fn committed() {}\n"),
+            // 同名パスをルート側にも置き、基準を取り違えたら別ファイルを読むようにする。
+            ("src/my util.rs", "pub fn root_side() {}\n"),
+        ],
+        "add files",
+    );
+    fs::write(repo.join("app/src/my util.rs"), "pub fn staged() {}\n").expect("stage content");
+    assert!(
+        Command::new("git")
+            .args(["add", "app/src/my util.rs"])
+            .current_dir(repo)
+            .status()
+            .expect("git add")
+            .success()
+    );
+    fs::write(repo.join("app/src/my util.rs"), "pub fn worktree() {}\n").expect("unstaged");
+
+    let app_dir = repo.join("app");
+    let reader = crate::commands::GitBlobBatch::index(app_dir.to_str().expect("utf-8"));
+    let read = |reader: &crate::commands::GitBlobBatch, path: &str, max: usize| {
+        reader
+            .read_limited(path, max)
+            .map(|b| String::from_utf8(b).expect("utf-8"))
+    };
+    assert_eq!(
+        read(&reader, "src/my util.rs", 1024).as_deref(),
+        Some("pub fn staged() {}\n"),
+        "作業ツリーではなく index の内容を、--dir 相対のパスで読む"
+    );
+    assert_eq!(read(&reader, "src/missing.rs", 1024), None);
+    assert_eq!(read(&reader, "bad\npath.rs", 1024), None);
+    assert_eq!(
+        read(&reader, "src/my util.rs", 4),
+        None,
+        "上限を超える内容は読み捨てる"
+    );
+    // 対照: 読めない要求の後も同じ reader で読み続けられる (応答がずれない)。
+    assert_eq!(
+        read(&reader, "src/kept.rs", 1024).as_deref(),
+        Some("pub fn kept() -> i32 {\n    1\n}\n")
+    );
+    assert_eq!(
+        read(&reader, "src/my util.rs", 1024).as_deref(),
+        Some("pub fn staged() {}\n")
+    );
+}
+
 /// staged モード (`--git --staged`) では未追跡を合成しない (index にある変更のみを尊重)。
 #[test]
 fn run_git_diff_staged_excludes_untracked_source() {
@@ -650,6 +834,130 @@ fn resolve_blame_source_files_applies_user_exclude_glob_for_git() {
     assert!(
         !result.iter().any(|p| p == "generated/codegen.rs"),
         "ユーザー指定 --exclude-glob は --git 経由の起点に適用される。got: {result:?}"
+    );
+}
+
+/// テストヘルパー: リポジトリ単位の git 設定を 1 つ足す (`git config <key> <value>`)。
+fn set_repo_git_config(repo: &std::path::Path, key: &str, value: &str) {
+    assert!(
+        Command::new("git")
+            .args(["config", key, value])
+            .current_dir(repo)
+            .status()
+            .expect("git config")
+            .success(),
+        "git config {key} {value} failed"
+    );
+}
+
+/// テストヘルパー: `set_repo_git_config` で足した設定を外す。
+fn unset_repo_git_config(repo: &std::path::Path, key: &str) {
+    assert!(
+        Command::new("git")
+            .args(["config", "--unset", key])
+            .current_dir(repo)
+            .status()
+            .expect("git config --unset")
+            .success(),
+        "git config --unset {key} failed"
+    );
+}
+
+/// 利用者の git 設定で `git diff` の出力形式が変わっても、解析する diff は既定の形のまま。
+///
+/// パーサは `a/` / `b/` 接頭辞・色なし・内蔵 diff を前提にしている。設定を 1 つ足すだけで
+/// 1 ファイルも認識できなくなり、`context` が `{"changes":[]}`、`impact --hook` /
+/// `review --hook` が exit 0 で破壊的変更を素通ししていた (fail-open)。
+/// 設定ごとに「既定設定で取った diff とバイト一致」かつ「対象ファイルを認識できる」ことを
+/// 確かめる (後者が無いと、両方が空の diff でも一致してしまう)。
+#[test]
+fn run_git_diff_output_does_not_depend_on_user_diff_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[(
+            "src/lib.rs",
+            "pub fn helper(a: u32) -> u32 {\n    a + 1\n}\n",
+        )],
+        "initial",
+    );
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn helper(a: u32, b: u32) -> u32 {\n    a + b\n}\n",
+    )
+    .expect("modify");
+    // textconv は属性で有効になる。`.gitattributes` を作ると未追跡ファイルとして diff に
+    // 混ざるため、リポジトリローカルの属性ファイルに書く。
+    let info_dir = repo.join(".git/info");
+    fs::create_dir_all(&info_dir).expect("mkdir .git/info");
+    fs::write(info_dir.join("attributes"), "*.rs diff=upper\n").expect("write attributes");
+
+    let repo_str = repo.to_str().expect("utf-8");
+    let baseline = crate::commands::run_git_diff(repo_str, "HEAD", false).expect("baseline diff");
+    let baseline_files = crate::engine::diff::parse_unified_diff(&baseline);
+    assert_eq!(
+        baseline_files
+            .iter()
+            .map(|f| (f.old_path.as_str(), f.new_path.as_str(), f.hunks.len()))
+            .collect::<Vec<_>>(),
+        vec![("src/lib.rs", "src/lib.rs", 1)],
+        "前提: 既定設定では変更ファイルを認識する: {baseline}"
+    );
+
+    let cases: &[(&str, &[(&str, &str)])] = &[
+        ("mnemonicPrefix", &[("diff.mnemonicPrefix", "true")]),
+        ("noprefix", &[("diff.noprefix", "true")]),
+        (
+            "srcPrefix/dstPrefix",
+            &[("diff.srcPrefix", "SRC/"), ("diff.dstPrefix", "DST/")],
+        ),
+        ("color.ui", &[("color.ui", "always")]),
+        ("color.diff", &[("color.diff", "always")]),
+        // 外部 diff は unified diff 以外を出力する (`echo` は引数をそのまま出す)。
+        ("diff.external", &[("diff.external", "echo")]),
+        // textconv は変換後テキストの diff になり、ファイル内容と行が一致しなくなる。
+        ("textconv", &[("diff.upper.textconv", "tr a-z A-Z <")]),
+    ];
+    for (label, settings) in cases {
+        for (key, value) in *settings {
+            set_repo_git_config(repo, key, value);
+        }
+        let diff = crate::commands::run_git_diff(repo_str, "HEAD", false).expect("diff");
+        for (key, _) in *settings {
+            unset_repo_git_config(repo, key);
+        }
+        assert_eq!(
+            diff, baseline,
+            "{label}: 利用者の git 設定で解析対象の diff が変わってはいけない"
+        );
+    }
+
+    // `--staged` (`git diff --cached`) も同じ。mnemonicPrefix では index / HEAD の比較が
+    // `c/` / `i/` 接頭辞になる。
+    let staged_baseline = {
+        assert!(
+            Command::new("git")
+                .args(["add", "src/lib.rs"])
+                .current_dir(repo)
+                .status()
+                .expect("git add")
+                .success()
+        );
+        crate::commands::run_git_diff(repo_str, "HEAD", true).expect("staged baseline")
+    };
+    assert_eq!(
+        crate::engine::diff::parse_unified_diff(&staged_baseline).len(),
+        1,
+        "前提: 既定設定では staged の変更ファイルを認識する: {staged_baseline}"
+    );
+    set_repo_git_config(repo, "diff.mnemonicPrefix", "true");
+    let staged = crate::commands::run_git_diff(repo_str, "HEAD", true).expect("staged diff");
+    unset_repo_git_config(repo, "diff.mnemonicPrefix");
+    assert_eq!(
+        staged, staged_baseline,
+        "mnemonicPrefix の staged diff も既定の形で取る"
     );
 }
 

@@ -86,7 +86,9 @@ fn collect_python_contract_changes(
     if is_test_path(std::path::Path::new(df.new_path.as_str())) {
         return;
     }
-    let &DetectionInputs { dir, base, .. } = inputs;
+    let &DetectionInputs {
+        dir, base_blobs, ..
+    } = inputs;
     let typed_dict_candidates = python_typed_dict_field_candidates(facts, maps);
     let Some(new_source) = load_new_source(dir, &df.new_path) else {
         return;
@@ -97,7 +99,7 @@ fn collect_python_contract_changes(
     if typed_dict_candidates.is_empty() && !new_mentions_literal {
         return;
     }
-    let Some(src) = load_old_source_with_new(dir, base, &df.old_path, &df.new_path, new_source)
+    let Some(src) = load_old_source_with_new(base_blobs, &df.old_path, &df.new_path, new_source)
     else {
         return;
     };
@@ -270,6 +272,42 @@ impl<'a> SymbolMaps<'a> {
     }
 }
 
+/// `from` の各エントリが「同名が `to` にも残るのに、`to` 側より件数が多い名前の余剰分」かを
+/// `from` の並び順のマスクで返す。
+///
+/// 余剰分は、同じ (name, kind, signature) が `to` に 1 件も残っていないエントリ。名前ごと
+/// 片側にしか無いものと、件数が同じか少ない名前は対象外 (前者は呼び出し側が別途扱い、
+/// 後者はどの定義同士が対応するか決められないため api.mod と同じく曖昧として扱う)。
+///
+/// 同じ (name, kind, signature) が `to` に残るエントリは、件数が減っていても余剰にしない。
+/// `#[cfg(..)]` / `#ifdef` の分岐ごとに同じシグネチャで定義した関数を 1 つにまとめると
+/// 件数だけが減るが、利用者から見た API は何も失われていない (多重集合の差分で数えると
+/// 生きている関数が blocking な api.rm に化ける)。
+fn same_name_surplus_mask(
+    from: &[(String, String, String)],
+    to: &[(String, String, String)],
+) -> Vec<bool> {
+    use std::collections::{HashMap, HashSet};
+    let mut from_counts: HashMap<&str, usize> = HashMap::new();
+    for (name, _, _) in from {
+        *from_counts.entry(name.as_str()).or_default() += 1;
+    }
+    let mut to_counts: HashMap<&str, usize> = HashMap::new();
+    let mut to_entries: HashSet<(&str, &str, &str)> = HashSet::new();
+    for (name, kind, sig) in to {
+        *to_counts.entry(name.as_str()).or_default() += 1;
+        to_entries.insert((name.as_str(), kind.as_str(), sig.as_str()));
+    }
+    from.iter()
+        .map(|(name, kind, sig)| {
+            let to_count = to_counts.get(name.as_str()).copied().unwrap_or(0);
+            to_count > 0
+                && from_counts[name.as_str()] > to_count
+                && !to_entries.contains(&(name.as_str(), kind.as_str(), sig.as_str()))
+        })
+        .collect()
+}
+
 /// 旧ツリーに存在しない新規シンボルを `all_new_candidates` / `added` に振り分ける。
 ///
 /// 返り値は同ファイル内の新規シンボル名集合。削除判定が「rename + 実装置換」の
@@ -288,6 +326,7 @@ fn collect_added_symbols(
         ..
     } = inputs;
     let &ModifiedFileFacts {
+        old_syms,
         new_syms,
         in_file_callees,
         ..
@@ -300,7 +339,20 @@ fn collect_added_symbols(
     let mut new_symbols_in_current_file: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
-    for (name, kind, sig) in new_syms {
+    let same_name_additions = same_name_surplus_mask(new_syms, old_syms);
+    for ((name, kind, sig), same_name_addition) in new_syms.iter().zip(same_name_additions) {
+        if same_name_addition {
+            // 同名が旧側にもある追加 (overload の追加など)。api.add には載せないが、
+            // 同名の 1 つを別ファイルへ移した変更の移動先として move 突き合わせの候補にする。
+            // 候補にしないと、移動元で件数の減った削除が相殺されず api.rm に残る。
+            state.buckets.all_new_candidates.push(ApiSymbolCandidate {
+                name: name.clone(),
+                kind: kind.clone(),
+                file: df.new_path.clone(),
+                signature: sig.clone(),
+            });
+            continue;
+        }
         if !old_map.contains_key(name.as_str()) {
             new_symbols_in_current_file.insert(name.clone());
             let candidate = ApiSymbolCandidate {
@@ -345,12 +397,13 @@ fn collect_removed_symbols(
     let &DetectionInputs {
         dir,
         base,
-        diff_new_paths,
         ref_index,
+        base_blobs,
         ..
     } = inputs;
     let &ModifiedFileFacts {
         old_syms,
+        new_syms,
         new_export_surface_names,
         ..
     } = facts;
@@ -359,15 +412,20 @@ fn collect_removed_symbols(
     // Bash スクリプトでは関数定義は `export -f` (または `declare -fx`/`declare -xf`) で
     // 明示しない限りサブプロセスへ波及しない。
     let is_bash_old_file = is_bash_script_path(&df.old_path);
+    // base 側 blob の `export -f` 宣言は必要になった時点でファイル単位に 1 回だけ読む。
+    let mut bash_exported: Option<std::collections::HashSet<String>> = None;
+    // 同名が新側にも残る削除 (overload の片方など)。名前の有無だけで判定すると検出
+    // できないが、件数が減り旧シグネチャも残っていない以上、消えた定義があるので曖昧ではない。
+    let same_name_removals = same_name_surplus_mask(old_syms, new_syms);
     // TS/JS: 新ツリーで export clause (`export { name } from "..."` / `import ...;
     // export { name };`) により name が公開され続けているシンボルは、利用者から見た
     // API 面が維持されているため api.rm から除外する。
     // `new_export_surface_names` は Phase 0 の単一 parse で先取り済み (perf #2)。
-    for (name, kind, sig) in old_syms {
-        if !new_map.contains_key(name.as_str()) {
+    for ((name, kind, sig), same_name_removal) in old_syms.iter().zip(same_name_removals) {
+        if same_name_removal || !new_map.contains_key(name.as_str()) {
             if is_rust_old_symbol_outside_public_api_surface(
                 dir,
-                base,
+                base_blobs,
                 &df.old_path,
                 name,
                 state.rust_public,
@@ -377,21 +435,34 @@ fn collect_removed_symbols(
             if new_export_surface_names.contains(name.as_str()) {
                 continue;
             }
+            // 以降の「rename + 実装置換」と `@property` → field の置き換えは、名前ごと
+            // 消えた場合の判定。同名が残る削除は rename でも field 化でもない。
+            if same_name_removal {
+                state.buckets.removed.push(ApiSymbolCandidate {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    file: df.old_path.clone(),
+                    signature: sig.clone(),
+                });
+                continue;
+            }
             // closed-in-diff for api.rm: 同ファイルに新規追加されたシンボルがあり、削除された
             // シンボルが変更後ツリーで 0 件参照なら「rename + 実装置換」と判断して api.rm から
             // 除外する。
             let bash_pure_removal_skip = is_bash_old_file
                 && new_symbols_in_current_file.is_empty()
-                && !bash_function_is_exported_in_git(dir, base, &df.old_path, name);
+                && !bash_exported
+                    .get_or_insert_with(|| bash_exported_functions_in_git(dir, base, &df.old_path))
+                    .contains(name);
             if (!new_symbols_in_current_file.is_empty() || bash_pure_removal_skip)
                 && is_removed_symbol_unreferenced(ref_index, name)
             {
                 continue;
             }
-            // Python の @property → dataclass field 置き換えなら removed 扱いせず
+            // Python の @property → 同じクラスの field 置き換えなら removed 扱いせず
             // property_to_field に振り替える。
             if let Some(target_file) =
-                detect_python_property_to_field(dir, &df.old_path, name, diff_new_paths)
+                detect_python_property_to_field(dir, base, &df.old_path, &df.new_path, name)
             {
                 state.buckets.property_to_field.push(PropertyToFieldChange {
                     name: name.clone(),
@@ -419,8 +490,8 @@ fn collect_modified_symbols(
 ) {
     let &DetectionInputs {
         dir,
-        base,
         ref_index,
+        base_blobs,
         ..
     } = inputs;
     let &ModifiedFileFacts {
@@ -437,10 +508,9 @@ fn collect_modified_symbols(
 
     // Rust bin-only crate 判定 (api.mod 抑制用)。lib → bin / bin → lib どちらかが bin-only なら
     // 外部 API 面の変更ではないとみなす。
-    let is_binary_rust_old_crate_for_mod =
-        state
-            .rust_public
-            .is_binary_only_at_base(dir, base, &df.old_path);
+    let is_binary_rust_old_crate_for_mod = state
+        .rust_public
+        .is_binary_only_at_base(base_blobs, &df.old_path);
     let is_binary_rust_new_crate_for_mod = is_binary_only_rust_crate(dir, &df.new_path);
     let skip_mod_for_binary_crate =
         is_binary_rust_old_crate_for_mod || is_binary_rust_new_crate_for_mod;
@@ -463,7 +533,7 @@ fn collect_modified_symbols(
             // private module 抑制
             if is_rust_old_symbol_outside_public_api_surface(
                 dir,
-                base,
+                base_blobs,
                 &df.old_path,
                 name,
                 state.rust_public,
@@ -487,19 +557,6 @@ fn collect_modified_symbols(
             if internally_closed
                 && !may_be_python_typed_dict_total_change(kind, old_sig, new_sig, lang_id_for_file)
             {
-                continue;
-            }
-
-            // TS/TSX で「引数なし `()` → 省略可能 destructured 引数」追加は後方互換
-            if is_ts_no_arg_to_optional_destructured_compatible(
-                old_sig,
-                new_sig,
-                dir,
-                base,
-                &df.old_path,
-                &df.new_path,
-                name,
-            ) {
                 continue;
             }
 
@@ -573,7 +630,7 @@ pub(crate) fn classify_signature_change(
         new_sig,
         lang_id: lang_id_for_file,
     };
-    let sources = &mut SignatureSourceCache::default();
+    let sources = &mut SignatureSourceCache::with_base_blobs(inputs.base_blobs);
     // Python の TypedDict で `total=` が絡む変更は blocking な api.mod に確定させる。
     // 互換判定器や closed-in-diff 判定より**前**に置くのが要点で、「リポジトリ内の参照が
     // 同一 diff で更新済み」でも降格させないため (外部リポジトリ / 動的生成された dict は
@@ -639,6 +696,15 @@ pub(crate) fn classify_signature_change(
     // React Server Component の async 化 (async キーワード追加のみ + 全参照が JSX タグ利用)
     // は呼び出し側の書き換えが不要なため compatible_modified として扱う。
     if let Some(compat) = detect_async_jsx_component_compatible_mod(ref_index, &site, sources) {
+        state.buckets.compatible_modified.push(compat);
+        return;
+    }
+    // 引数なし関数コンポーネントへ default 値の無い全 optional の destructured props を
+    // 足しただけで、参照がすべて JSX タグ利用なら `<X />` はそのまま通るため
+    // compatible_modified とする (default 値 / `?` 付きは trailing_optional_params が扱う)。
+    if let Some(compat) =
+        detect_optional_props_jsx_component_compatible_mod(ref_index, &site, sources)
+    {
         state.buckets.compatible_modified.push(compat);
         return;
     }
@@ -783,33 +849,29 @@ pub(crate) fn git_show_base_file(dir: &str, base: &str, rel: &str) -> Option<Str
     String::from_utf8(git_show_blob(dir, base, rel)?).ok()
 }
 
-/// 削除ファイル (`new_path == "/dev/null"`) 由来の exported シンボルを `removed` /
-/// `property_to_field` に分類する。
+/// 削除ファイル (`new_path == "/dev/null"`) 由来の exported シンボルを `removed` に分類する。
+/// 対応言語でないファイルへの rename も新側に API 面が無いため、ここで旧側 (`old_path`) の
+/// 削除として扱う。
 ///
-/// Rust private module / bin-only crate / Bash の未 export 関数 / Python `@property` →
-/// dataclass field 置き換え / Python root-level スクリプトの helper は `removed` から除外する。
+/// `old_syms` は `detect_api_changes` の Phase 0 で旧版から抽出済みのもの
+/// (`extract_deleted_file_exported_symbols`)。
+///
+/// Rust private module / bin-only crate / Bash の未 export 関数 / Python root-level
+/// スクリプトの helper は `removed` から除外する。Python `@property` → field 置き換え
+/// (`property_to_field`) は変更後の同じファイルを要するため、削除ファイルでは判定しない。
 pub(crate) fn process_deleted_file(
     inputs: &DetectionInputs<'_>,
     state: &mut DetectionState<'_>,
     df: &crate::models::impact::DiffFile,
+    old_syms: &[(String, String, String)],
 ) {
     let &DetectionInputs {
         dir,
         base,
-        diff_new_paths,
+        ref_index,
+        base_blobs,
         ..
     } = inputs;
-    // base が source branch HEAD と同一の場合、`git show base:old_path` は削除済みで
-    // 失敗し None になる。その場合は --diff-file が保持している旧ソース
-    // (deleted_old_source) から AST を組み立てて exported シンボルを抽出する。
-    let old_syms_opt = extract_exported_symbols_from_git(dir, base, &df.old_path).or_else(|| {
-        df.deleted_old_source
-            .as_deref()
-            .and_then(|src| extract_exported_symbols_from_source(&df.old_path, src))
-    });
-    let Some(old_syms) = old_syms_opt else {
-        return;
-    };
     // Python の root-level スクリプト (package 外の単体スクリプト) の top-level helper は公開
     // API 面外なので api.rm にしない (A3、Issue 2026-06-14-python-script-move-api-rm)。file 単位の
     // 判定なので全シンボルをまとめて除外する。
@@ -817,10 +879,12 @@ pub(crate) fn process_deleted_file(
         return;
     }
     let is_bash_old_file = is_bash_script_path(&df.old_path);
-    for (name, kind, sig) in &old_syms {
+    // base 側 blob の `export -f` 宣言はファイル単位で 1 回だけ読む (関数ごとの git show を避ける)。
+    let mut bash_exported: Option<std::collections::HashSet<String>> = None;
+    for (name, kind, sig) in old_syms {
         if is_rust_old_symbol_outside_public_api_surface(
             dir,
-            base,
+            base_blobs,
             &df.old_path,
             name,
             state.rust_public,
@@ -828,20 +892,11 @@ pub(crate) fn process_deleted_file(
             continue;
         }
         if is_bash_old_file
-            && !bash_function_is_exported_in_git(dir, base, &df.old_path, name)
-            && is_removed_bash_symbol_unreferenced(dir, name)
+            && !bash_exported
+                .get_or_insert_with(|| bash_exported_functions_in_git(dir, base, &df.old_path))
+                .contains(name)
+            && is_removed_bash_symbol_unreferenced(ref_index, name)
         {
-            continue;
-        }
-        // Python の @property → dataclass field 置き換えなら removed 扱いせず
-        // property_to_field に振り替える。
-        if let Some(target_file) =
-            detect_python_property_to_field(dir, &df.old_path, name, diff_new_paths)
-        {
-            state.buckets.property_to_field.push(PropertyToFieldChange {
-                name: name.clone(),
-                file: target_file,
-            });
             continue;
         }
         state.buckets.removed.push(ApiSymbolCandidate {

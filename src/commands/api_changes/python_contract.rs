@@ -138,7 +138,7 @@ impl TypedDictFact {
 /// - 実効 total が `false` ↔ `true` で反転している (省略 ↔ `total=True` は意味的に同値なので対象外)
 pub(crate) fn detect_python_typed_dict_total_change(
     site: &CompatibleModSite<'_>,
-    sources: &mut SignatureSourceCache,
+    sources: &mut SignatureSourceCache<'_>,
 ) -> PythonContractDetection {
     use PythonContractDetection as D;
 

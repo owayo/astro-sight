@@ -4,18 +4,21 @@ use super::*;
 
 /// Rust crate のソースツリーをどこから読むかを表す抽象化。
 ///
-/// `Worktree` は `std::fs` 経由で working tree を直接読み、`Base { rev }` は `git show <rev>:<path>` /
-/// `git ls-tree <rev>` 経由で base リビジョンを読む。`read_rust_module_source` / `collect_rust_rs_files` /
+/// `Worktree` は `std::fs` 経由で working tree を直接読み、`Base { blobs }` は base リビジョンを
+/// 検出全体で共有する常駐 `git cat-file --batch` の読み手 (`git show <rev>:<path>` と同じ内容) と
+/// `git ls-tree <rev>` で読む。`read_rust_module_source` / `collect_rust_rs_files` /
 /// `RustReexportCache` の API に渡して I/O 差分を吸収する (リファクタ Step 1: I/O 抽象化、
 /// 別 Issue `2026-06-06-refactor-rust-private-module-helpers-with-source-tree-enum.md` 対応)。
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum RustSourceTree<'a> {
     Worktree,
-    Base { rev: &'a str },
+    Base {
+        blobs: &'a crate::commands::git_input::GitBlobBatch,
+    },
 }
 
 /// `crate_root_rel`/src/`module_rel` を `source` 経由で読む。Worktree なら `std::fs::read`、
-/// Base なら `git show <rev>:<crate_root_rel>/src/<module_rel>`。失敗時は `None`。
+/// Base なら `<rev>:<crate_root_rel>/src/<module_rel>` の blob。失敗時は `None`。
 pub(crate) fn read_rust_module_source(
     source: RustSourceTree<'_>,
     dir: &str,
@@ -31,9 +34,9 @@ pub(crate) fn read_rust_module_source(
                 .join(module_rel);
             std::fs::read(full).ok()
         }
-        RustSourceTree::Base { rev } => {
+        RustSourceTree::Base { blobs } => {
             let full_rel = crate_root_rel.join("src").join(module_rel);
-            git_show_blob(dir, rev, full_rel.to_str()?)
+            blobs.read(full_rel.to_str()?)
         }
     }
 }
@@ -70,15 +73,21 @@ pub(crate) fn collect_rust_rs_files(
             }
             Some(files)
         }
-        RustSourceTree::Base { rev } => {
+        RustSourceTree::Base { blobs } => {
+            let rev = blobs.rev();
             let src_str = src_root_rel.to_str()?;
             if validate_git_revision(rev, "--base").is_err()
                 || validate_git_revision(src_str, "diff file path").is_err()
             {
                 return None;
             }
+            // -z: 区切りを NUL にして quoting を無効化する。改行区切りの出力は非 ASCII
+            // (core.quotepath) や `"` / `\` / TAB を含むパスを `"...\343..."` とクォートし、
+            // 末尾の `"` で `.rs` 判定から落ちる。crate が非 ASCII 名のディレクトリ配下にあると
+            // base 側の全ファイルが消えて `pub use` の辺を 1 本も集められず、再エクスポートで
+            // 公開していた API の削除が api.rm / rm_dead のどちらにも出なかった。
             let out = std::process::Command::new("git")
-                .args(["ls-tree", "-r", "--name-only", rev, "--", src_str])
+                .args(["ls-tree", "-r", "-z", "--name-only", rev, "--", src_str])
                 .current_dir(dir)
                 .output()
                 .ok()?;
@@ -87,7 +96,7 @@ pub(crate) fn collect_rust_rs_files(
             }
             let text = std::str::from_utf8(&out.stdout).ok()?;
             Some(
-                text.lines()
+                text.split('\0')
                     .filter(|l| l.ends_with(".rs"))
                     .map(std::path::PathBuf::from)
                     .collect(),
@@ -112,7 +121,7 @@ impl RustSourceTreeKey {
     ) -> Self {
         let rev = match source {
             RustSourceTree::Worktree => None,
-            RustSourceTree::Base { rev } => Some(rev.to_string()),
+            RustSourceTree::Base { blobs } => Some(blobs.rev().to_string()),
         };
         Self {
             rev,

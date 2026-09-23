@@ -80,4 +80,20 @@ pub struct RefsResult {
         default
     )]
     pub result_summary: Option<ResultSummary>,
+    /// 走査対象に選んだが、読み込み・parse に失敗して参照を数えられなかったファイル数。
+    ///
+    /// `result_summary.complete_input` の判定にだけ使う内部情報で、出力には含めない
+    /// (既存の JSON 出力を変えないため)。
+    #[serde(skip)]
+    pub failed_files: usize,
+}
+
+impl RefsResult {
+    /// `references` が「解析対象にできた入力すべて」を数えているか。
+    ///
+    /// 生成物として走査から外したファイル (`skipped`) や、読み込み・parse に失敗した
+    /// ファイルがあれば false。`ResultSummary::complete_input` の値になる。
+    pub fn input_is_complete(&self) -> bool {
+        self.skipped.is_none() && self.failed_files == 0
+    }
 }

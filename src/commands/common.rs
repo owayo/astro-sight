@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashSet;
 use std::io::Read;
 
 use crate::cache::store::CacheStore;
@@ -274,6 +275,97 @@ impl ChangedFileSet {
     }
 }
 
+/// 呼び出し側が「diff 内で解決済み」か (`impact --hook` / `review --hook` の共通判定)。
+///
+/// - 影響分析の結果に現れたファイル (affected シンボルを持つ変更ファイル) の呼び出し側は、
+///   ファイル単位で解決済みとみなす (従来の判定)。
+/// - それ以外の diff 内ファイルの呼び出し側は、**呼び出し行そのものが変更された (`+` 行)**
+///   ときだけ解決済みとみなす。トップレベルの文だけを変更したスクリプト (Python / JS) は
+///   affected シンボルを持たないため、従来は呼び出しを更新済みでも diff 外扱いになり
+///   "Unresolved impacts found" で誤ってブロックしていた。一方でファイル単位に広げると、
+///   定義を `pub use` に置き換えただけのファイルに残る**未変更の**呼び出し (型変更で壊れる)
+///   まで黙って解決済みになる (`review_hook_reexport_move_with_type_change_stays_blocking`)。
+///   呼び出し行の変更は、API 差分の `modified_closed_in_diff` と同じ強さの証拠。
+pub(crate) struct DiffCallerResolution {
+    affected_files: ChangedFileSet,
+    /// diff 内ファイルの変更行 (`+` 行、0-indexed)。照合規約は `ChangedFileSet` と同じで、
+    /// 呼び出し側を canonicalize できれば canonical、できなければ絶対パス文字列で引く。
+    changed_lines_canonical: std::collections::HashMap<std::path::PathBuf, HashSet<usize>>,
+    changed_lines_abs: std::collections::HashMap<String, HashSet<usize>>,
+}
+
+impl DiffCallerResolution {
+    pub(crate) fn build<'a, I>(
+        dir: &str,
+        affected_paths: I,
+        diff_input: &str,
+        diff_files: &[crate::models::impact::DiffFile],
+    ) -> Self
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let sections = crate::engine::diff::FileSections::split(diff_input);
+        let mut changed_lines_canonical: std::collections::HashMap<
+            std::path::PathBuf,
+            HashSet<usize>,
+        > = std::collections::HashMap::new();
+        let mut changed_lines_abs: std::collections::HashMap<String, HashSet<usize>> =
+            std::collections::HashMap::new();
+        for df in diff_files {
+            if df.new_path == "/dev/null" || !crate::engine::impact::is_safe_diff_path(&df.new_path)
+            {
+                continue;
+            }
+            let added = crate::engine::diff::extract_changed_line_facts(
+                &sections.get(&df.new_path),
+                &df.new_path,
+            )
+            .added_lines;
+            if added.is_empty() {
+                continue;
+            }
+            let abs = absolute_path_string(dir, &df.new_path);
+            if let Ok(canonical) = std::fs::canonicalize(&abs) {
+                changed_lines_canonical
+                    .entry(canonical)
+                    .or_default()
+                    .extend(added.iter().copied());
+            }
+            changed_lines_abs.entry(abs).or_default().extend(added);
+        }
+        Self {
+            affected_files: ChangedFileSet::build(dir, affected_paths),
+            changed_lines_canonical,
+            changed_lines_abs,
+        }
+    }
+
+    /// `caller_path` の `line` (0-indexed) にある呼び出しが diff 内で解決済みか。
+    pub(crate) fn is_resolved(&self, dir: &str, caller_path: &str, line: usize) -> bool {
+        if self.affected_files.contains_caller(dir, caller_path) {
+            return true;
+        }
+        let abs = absolute_path_string(dir, caller_path);
+        let lines = match std::fs::canonicalize(&abs) {
+            Ok(canonical) => self.changed_lines_canonical.get(&canonical),
+            Err(_) => self.changed_lines_abs.get(&abs),
+        };
+        lines.is_some_and(|lines| lines.contains(&line))
+    }
+}
+
+/// 相対パスを `dir` 基準の絶対パス文字列にする (`ChangedFileSet` と同じ規約)。
+fn absolute_path_string(dir: &str, path: &str) -> String {
+    if std::path::Path::new(path).is_relative() {
+        std::path::Path::new(dir)
+            .join(path)
+            .to_string_lossy()
+            .to_string()
+    } else {
+        path.to_string()
+    }
+}
+
 #[cfg(test)]
 mod common_tests {
     use super::*;
@@ -294,5 +386,58 @@ mod common_tests {
         let err = timed_ok::<()>("unit_test_phase", || Err(anyhow::anyhow!("boom")))
             .expect_err("error should propagate");
         assert!(err.to_string().contains("boom"));
+    }
+
+    /// 影響分析の結果に現れない diff 内ファイル (トップレベルの呼び出しだけを更新した
+    /// スクリプト等) の呼び出し側は、呼び出し行そのものが変更されたときだけ解決済み。
+    /// 旧実装は結果に現れたファイルしか見ず、更新済みの呼び出しで誤ってブロックしていた。
+    #[test]
+    fn diff_caller_resolution_accepts_updated_call_line_in_diff_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_str = dir.path().to_str().expect("utf-8 path");
+        std::fs::write(
+            dir.path().join("util.py"),
+            "def helper(a, b):\n    return a\n",
+        )
+        .expect("write util");
+        std::fs::write(
+            dir.path().join("script.py"),
+            "# note\nfrom util import helper\n\nprint(helper(1, 2))\nprint(helper(3))\n",
+        )
+        .expect("write script");
+        std::fs::write(dir.path().join("other.py"), "print(helper(1))\n").expect("write other");
+        let diff = concat!(
+            "--- a/util.py\n",
+            "+++ b/util.py\n",
+            "@@ -1,2 +1,2 @@\n",
+            "-def helper(a):\n",
+            "+def helper(a, b):\n",
+            "     return a\n",
+            "--- a/script.py\n",
+            "+++ b/script.py\n",
+            "@@ -1,4 +1,5 @@\n",
+            "+# note\n",
+            " from util import helper\n",
+            " \n",
+            "-print(helper(1))\n",
+            "+print(helper(1, 2))\n",
+            " print(helper(3))\n",
+        );
+        let diff_files = crate::engine::diff::parse_unified_diff(diff);
+        let resolution = DiffCallerResolution::build(dir_str, ["util.py"], diff, &diff_files);
+
+        assert!(
+            resolution.is_resolved(dir_str, "script.py", 3),
+            "更新済みの呼び出し行 (script.py:4) は解決済み"
+        );
+        // 対照: 同じ diff 内のファイルでも、変更していない呼び出し行は未解決のまま
+        // (ファイル単位に広げると、未変更の呼び出しまで黙って解決済みになる)。
+        assert!(
+            !resolution.is_resolved(dir_str, "script.py", 4),
+            "未変更の呼び出し行 (script.py:5) は未解決"
+        );
+        // 対照: diff 外のファイルは未解決。影響分析の結果に現れたファイルは従来どおり解決済み。
+        assert!(!resolution.is_resolved(dir_str, "other.py", 0));
+        assert!(resolution.is_resolved(dir_str, "util.py", 1));
     }
 }

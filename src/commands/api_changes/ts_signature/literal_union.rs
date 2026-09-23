@@ -5,7 +5,7 @@ use super::*;
 /// 同一ファイル内で有限 literal 集合として証明でき、型パラメータ列も不変なら互換とする。
 pub(crate) fn detect_equivalent_literal_union_alias_compatible_mod(
     site: &CompatibleModSite<'_>,
-    sources: &mut SignatureSourceCache,
+    sources: &mut SignatureSourceCache<'_>,
 ) -> Option<CompatibleApiModification> {
     let lang = site.lang_in(TS_ONLY_LANGS)?;
     if site.kind != "type" {

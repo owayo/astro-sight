@@ -10,7 +10,7 @@ use crate::engine::parser::SourceBuf;
 use crate::language::LangId;
 use crate::models::review::CompatibleApiModification;
 
-use super::super::git_input::git_show_blob;
+use super::super::git_input::{GitBlobBatch, git_show_blob};
 
 /// api.mod 候補 1 件の現場情報 (互換判定器の共通入力)。
 pub(crate) struct CompatibleModSite<'a> {
@@ -45,35 +45,25 @@ impl<'a> CompatibleModSite<'a> {
     }
 
     /// old 側 (base リビジョン) と new 側 (working tree) のソースを取得する。
-    /// 信頼境界外パスの再チェック → `git show` → working tree read の順で、
+    /// 信頼境界外パスの再チェック → base 側 blob → working tree read の順で、
     /// いずれか失敗すれば `None` (= blocking 維持)。
-    fn load_sources(&self) -> Option<OldNewSources> {
-        load_old_new_sources(self.dir, self.base, self.old_path, self.new_path)
+    ///
+    /// `blobs` は検出全体で共有する base 側の読み手。`None` (判定器を単体で呼ぶテスト) は
+    /// 単発の `git show` で読む。どちらも同じ blob を返す。
+    fn load_sources(&self, blobs: Option<&GitBlobBatch>) -> Option<OldNewSources> {
+        // 信頼境界外のパスは多層防御で再チェックする。
+        if !crate::engine::impact::is_safe_diff_path(self.old_path)
+            || !crate::engine::impact::is_safe_diff_path(self.new_path)
+        {
+            return None;
+        }
+        let old = match blobs {
+            Some(blobs) => blobs.read(self.old_path)?,
+            None => git_show_blob(self.dir, self.base, self.old_path)?,
+        };
+        let new = load_new_source(self.dir, self.new_path)?;
+        Some(OldNewSources { old, new })
     }
-}
-
-/// base 側 blob と working tree ソースを取得する (対象シンボルに依らない)。
-///
-/// シグネチャ差分に乗らない契約変更 (TypedDict のフィールド requiredness 等) の検出でも
-/// 同じ組が要るため、`CompatibleModSite` から切り出して共有する。失敗はすべて `None` で、
-/// 呼び出し側は「証明できない = 分類しない」に倒す。
-pub(crate) fn load_old_new_sources(
-    dir: &str,
-    base: &str,
-    old_path: &str,
-    new_path: &str,
-) -> Option<OldNewSources> {
-    // 信頼境界外のパスは多層防御で再チェックする。
-    if !crate::engine::impact::is_safe_diff_path(old_path)
-        || !crate::engine::impact::is_safe_diff_path(new_path)
-    {
-        return None;
-    }
-    let old = git_show_blob(dir, base, old_path)?;
-    let new_full = std::path::Path::new(dir).join(new_path);
-    let new_utf8 = camino::Utf8Path::from_path(&new_full)?;
-    let new = parser::read_file(new_utf8).ok()?;
-    Some(OldNewSources { old, new })
 }
 
 /// working tree 側だけを先に読み、old 側の `git show` が必要か安価に判定できるようにする。
@@ -90,8 +80,7 @@ pub(crate) fn load_new_source(dir: &str, new_path: &str) -> Option<SourceBuf> {
 ///
 /// 両パスはここでも再検証する。呼び出し側の前段ゲートを信頼境界にしない。
 pub(crate) fn load_old_source_with_new(
-    dir: &str,
-    base: &str,
+    base_blobs: &GitBlobBatch,
     old_path: &str,
     new_path: &str,
     new: SourceBuf,
@@ -101,7 +90,7 @@ pub(crate) fn load_old_source_with_new(
     {
         return None;
     }
-    let old = git_show_blob(dir, base, old_path)?;
+    let old = base_blobs.read(old_path)?;
     Some(OldNewSources { old, new })
 }
 
@@ -130,17 +119,31 @@ impl OldNewSources {
 /// spawn していた。ここで 1 度だけ取得して使い回す。
 ///
 /// 遅延にするのは、言語ゲートや安価な pre-gate で全判定器が弾かれる場合 (Rust の api.mod 等) に
-/// `git show` を 1 度も起動しない現行挙動を保つため。
+/// base 側 blob を 1 度も読まない現行挙動を保つため。
+///
+/// base 側は検出全体で共有する常駐の読み手 (`with_base_blobs`) から読む。シンボルごとに
+/// `git show` を起動していた旧実装は、TS 関数 1000 ファイルの引数追加で API 差分フェーズの
+/// 大半を占めていた。
 #[derive(Default)]
-pub(crate) struct SignatureSourceCache {
+pub(crate) struct SignatureSourceCache<'b> {
+    /// base 側 blob の読み手。`None` (判定器を単体で呼ぶテストの既定値) は単発の `git show`。
+    base_blobs: Option<&'b GitBlobBatch>,
     /// 外 `None` = 未取得、内 `None` = 取得失敗 (再試行しない)。
     loaded: Option<Option<OldNewSources>>,
 }
 
-impl SignatureSourceCache {
+impl<'b> SignatureSourceCache<'b> {
+    pub(crate) fn with_base_blobs(base_blobs: &'b GitBlobBatch) -> Self {
+        Self {
+            base_blobs: Some(base_blobs),
+            loaded: None,
+        }
+    }
+
     pub(crate) fn get(&mut self, site: &CompatibleModSite<'_>) -> Option<&OldNewSources> {
+        let base_blobs = self.base_blobs;
         self.loaded
-            .get_or_insert_with(|| site.load_sources())
+            .get_or_insert_with(|| site.load_sources(base_blobs))
             .as_ref()
     }
 }

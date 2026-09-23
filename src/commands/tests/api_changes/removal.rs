@@ -440,6 +440,93 @@ fn detect_api_changes_atomic_python_module_deletion_keeps_blocking_on_residual_p
     );
 }
 
+/// `pkg/util.py` の `helper` と、それを再エクスポートする `pkg/__init__.py` の
+/// `from .util import helper` を同時に削除し、`app_py` を残したときの (removed, removed_dead)。
+fn removed_names_after_python_package_reexport_deletion(
+    app_py: &str,
+) -> (Vec<String>, Vec<String>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let deleted_src = "def helper():\n    return 1\n";
+    git_commit_files(
+        repo,
+        &[
+            ("pkg/util.py", deleted_src),
+            ("pkg/__init__.py", "from .util import helper\n"),
+            ("app.py", app_py),
+        ],
+        "base",
+    );
+    std::fs::remove_file(repo.join("pkg/util.py")).expect("rm");
+    fs::write(repo.join("pkg/__init__.py"), "").expect("write");
+    let diff_files = vec![
+        crate::models::impact::DiffFile {
+            old_path: "pkg/util.py".to_string(),
+            new_path: "/dev/null".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 2,
+                new_start: 0,
+                new_count: 0,
+            }],
+            deleted_old_source: Some(deleted_src.as_bytes().to_vec()),
+        },
+        crate::models::impact::DiffFile {
+            old_path: "pkg/__init__.py".to_string(),
+            new_path: "pkg/__init__.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 1,
+                new_start: 0,
+                new_count: 0,
+            }],
+            deleted_old_source: None,
+        },
+    ];
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    (
+        api.removed.iter().map(|s| s.name.clone()).collect(),
+        api.removed_dead.iter().map(|s| s.name.clone()).collect(),
+    )
+}
+
+/// パッケージの `__init__.py` が再エクスポートしていた関数は `pkg.helper()` の形でも
+/// 呼べる。レシーバが祖先パッケージ名なら削除シンボルへの残存参照として blocking を維持する
+/// (旧実装はレシーバに削除モジュール名 `util` が無いことだけで別物と証明し、実行時に
+/// AttributeError になる削除を removed_dead へ降格していた)。
+#[test]
+fn detect_api_changes_python_package_reexport_attribute_access_stays_removed() {
+    for app_py in [
+        "import pkg\n\n\ndef run():\n    return pkg.helper()\n",
+        "import pkg as p\n\n\ndef run():\n    return p.helper()\n",
+    ] {
+        let (removed, removed_dead) = removed_names_after_python_package_reexport_deletion(app_py);
+        assert!(
+            removed.iter().any(|n| n == "helper"),
+            "祖先パッケージ経由の属性アクセスが残る削除は blocking を維持すべき。app.py={app_py:?} removed={removed:?} removed_dead={removed_dead:?}"
+        );
+    }
+
+    // 対照: 削除モジュール名を修飾した呼び出しは従来どおり blocking
+    let (removed, removed_dead) = removed_names_after_python_package_reexport_deletion(
+        "from pkg import util\n\n\ndef run():\n    return util.helper()\n",
+    );
+    assert!(
+        removed.iter().any(|n| n == "helper"),
+        "削除モジュールを修飾した属性アクセスは blocking を維持すべき。removed={removed:?} removed_dead={removed_dead:?}"
+    );
+
+    // 対照: 削除モジュールとも祖先パッケージとも無関係なレシーバは従来どおり降格する
+    let (removed, removed_dead) = removed_names_after_python_package_reexport_deletion(
+        "import other\n\n\ndef run():\n    return other.helper()\n",
+    );
+    assert!(
+        removed_dead.iter().any(|n| n == "helper") && !removed.iter().any(|n| n == "helper"),
+        "無関係なレシーバの属性アクセスしか残らない削除は removed_dead へ降格すべき。removed={removed:?} removed_dead={removed_dead:?}"
+    );
+}
+
 /// 負ケース: 参照ファイルの import specifier が削除ファイル自身に解決される場合は、
 /// 同名の残存定義があっても破壊的削除として blocking な removed を維持する。
 #[test]
@@ -683,6 +770,123 @@ class Foo:
         api_changes.property_to_field.is_empty(),
         "対応 field が無い場合は property_to_field に積まれないべき。got: {:?}",
         api_changes.property_to_field
+    );
+}
+
+/// `models.py` の `User` を `before` から `after` に書き換え (`extra` のファイルも同時に更新) た
+/// ときの API 差分。呼び出し側 `app.py` は変更しない。
+fn python_user_member_replacement(
+    before: &str,
+    after: &str,
+    extra: &[(&str, &str, &str)],
+) -> ApiChanges {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let mut base_files = vec![
+        ("models.py", before),
+        (
+            "app.py",
+            "from models import User\n\n\ndef show(u: User):\n    return u.name()\n",
+        ),
+    ];
+    base_files.extend(extra.iter().map(|(path, old, _)| (*path, *old)));
+    git_commit_files(repo, &base_files, "base");
+    let mut diff_files = Vec::new();
+    for (path, content) in std::iter::once(("models.py", after))
+        .chain(extra.iter().map(|(path, _, new)| (*path, *new)))
+    {
+        fs::write(repo.join(path), content).expect("write");
+        diff_files.push(crate::models::impact::DiffFile {
+            old_path: path.to_string(),
+            new_path: path.to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 20,
+                new_start: 1,
+                new_count: 20,
+            }],
+            deleted_old_source: None,
+        });
+    }
+    detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files)
+}
+
+/// 素のメソッドをフィールドに置き換えると `u.name()` は TypeError になる。property ではない
+/// 定義の置き換えは property_to_field (informational) に降格させず、blocking な removed に残す。
+#[test]
+fn detect_api_changes_python_method_replaced_by_field_stays_removed() {
+    let after = "from dataclasses import dataclass\n\n\n@dataclass\nclass User:\n    first: str\n    name: str\n";
+    let api = python_user_member_replacement(
+        "from dataclasses import dataclass\n\n\n@dataclass\nclass User:\n    first: str\n\n    def name(self) -> str:\n        return self.first\n",
+        after,
+        &[],
+    );
+    assert!(
+        api.removed.iter().any(|s| s.name == "User.name") && api.property_to_field.is_empty(),
+        "素のメソッド → フィールドは removed に残すべき。removed={:?} property_to_field={:?}",
+        api.removed.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        api.property_to_field
+    );
+
+    // 対照: setter 付き property / functools.cached_property の置き換えは従来どおり降格する
+    let api = python_user_member_replacement(
+        "import functools\n\n\nclass User:\n    @property\n    def name(self) -> str:\n        return self._name\n\n    @name.setter\n    def name(self, value: str) -> None:\n        self._name = value\n\n    @functools.cached_property\n    def slug(self) -> str:\n        return self._name.lower()\n",
+        "from dataclasses import dataclass\n\n\n@dataclass\nclass User:\n    name: str\n    slug: str\n",
+        &[],
+    );
+    let p2f: HashSet<&str> = api
+        .property_to_field
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
+    assert!(
+        p2f.contains("User.name") && p2f.contains("User.slug"),
+        "property の置き換えは property_to_field に積むべき。property_to_field={p2f:?} removed={:?}",
+        api.removed.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+    assert!(
+        !api.removed
+            .iter()
+            .any(|s| s.name == "User.name" || s.name == "User.slug"),
+        "property の置き換えを removed に残さない。removed={:?}",
+        api.removed.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+}
+
+/// property を削除し、別ファイルの同名クラスに同名フィールドを足しても置き換えの根拠に
+/// ならない。変更後の同じファイルの同じクラスに現れたフィールドだけを置き換え先とみなす。
+#[test]
+fn detect_api_changes_python_property_removed_with_field_in_other_file_stays_removed() {
+    let before = "class User:\n    def __init__(self, first):\n        self.first = first\n\n    @property\n    def name(self) -> str:\n        return self.first\n";
+    let api = python_user_member_replacement(
+        before,
+        "class User:\n    def __init__(self, first):\n        self.first = first\n",
+        &[(
+            "other.py",
+            "class User:\n    age: int\n",
+            "class User:\n    age: int\n    name: str\n",
+        )],
+    );
+    assert!(
+        api.removed.iter().any(|s| s.name == "User.name") && api.property_to_field.is_empty(),
+        "別ファイルの同名クラスへのフィールド追加で property 削除を降格しない。removed={:?} property_to_field={:?}",
+        api.removed.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        api.property_to_field
+    );
+
+    // 対照: 同じファイルの同じクラスにフィールドを置けば従来どおり降格する
+    let api = python_user_member_replacement(
+        before,
+        "class User:\n    name: str\n\n    def __init__(self, first):\n        self.first = first\n",
+        &[],
+    );
+    assert!(
+        api.property_to_field
+            .iter()
+            .any(|p| p.name == "User.name" && p.file == "models.py"),
+        "同じファイルの property → field は property_to_field に積むべき。property_to_field={:?}",
+        api.property_to_field
     );
 }
 
@@ -1396,4 +1600,306 @@ main() {\n    echo hi\n}\nmain\n";
         removed.contains(&"shared_helper"),
         "他ファイルから source 経由で参照されている bash 関数の削除は api.rm に残すべき。got: {removed:?}"
     );
+}
+
+/// 同名 overload の片方だけを削除した変更は api.rm に出す。
+///
+/// 削除判定が「新側に同名があるか」だけを見ていたため、`run(int)` が残ると `run(String)` の
+/// 削除を検出できず、別ファイルの `run("x")` がコンパイルできなくなるのに hook が通っていた。
+/// 件数が減った削除は曖昧ではないので、(kind, signature) の多重集合の差分を削除として積む。
+/// 件数が変わらない overload のシグネチャ変更は、どの overload の変更か決められないため
+/// 従来どおり api.rm / api.mod のどちらにも出さない (対照)。
+#[test]
+fn detect_api_changes_java_partial_overload_removal_is_removed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let runner =
+        |overloads: &str| format!("package demo;\n\npublic class Runner {{\n{overloads}}}\n");
+    let run_string = "    public void run(String s) {\n        System.out.println(s);\n    }\n";
+    let run_int = "    public void run(int n) {\n        System.out.println(n);\n    }\n";
+    let run_long = "    public void run(long n) {\n        System.out.println(n);\n    }\n";
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/Runner.java",
+                &runner(&format!("{run_string}{run_int}")),
+            ),
+            (
+                "src/Main.java",
+                "package demo;\n\npublic class Main {\n    public static void main(String[] args) {\n        Runner r = new Runner();\n        r.run(\"x\");\n        r.run(1);\n    }\n}\n",
+            ),
+        ],
+        "initial",
+    );
+
+    // run(String) だけを削除 (run(int) は残る)。
+    fs::write(repo.join("src/Runner.java"), runner(run_int)).expect("write");
+    let api = detect_api_changes_from_worktree(repo);
+    let removed: Vec<(&str, &str)> = api
+        .removed
+        .iter()
+        .map(|s| (s.name.as_str(), s.file.as_str()))
+        .collect();
+    assert_eq!(
+        removed,
+        vec![("Runner.run", "src/Runner.java")],
+        "overload の片方の削除は api.rm に出すべき。removed_dead={:?} modified={:?}",
+        api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        api.modified.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+
+    // 対照: 件数が同じまま片方のシグネチャだけ変えた場合は、どの overload の変更か
+    // 決められないため従来どおり何も出さない (削除として積まない)。
+    fs::write(
+        repo.join("src/Runner.java"),
+        runner(&format!("{run_long}{run_int}")),
+    )
+    .expect("write");
+    let api = detect_api_changes_from_worktree(repo);
+    assert!(
+        api.removed.is_empty() && api.removed_dead.is_empty() && api.modified.is_empty(),
+        "件数が変わらない overload 変更は曖昧として扱うべき。removed={:?} removed_dead={:?} modified={:?}",
+        api.removed.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        api.modified.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+}
+
+/// `#[cfg(..)]` / `#ifdef` の分岐ごとに同じシグネチャで定義した関数を 1 つにまとめても、
+/// 同じシグネチャが残る限り api.rm にしない。
+///
+/// 件数の減った削除を (kind, signature) の多重集合の差分で数えると、分岐の片方が消えた
+/// だけで生きている関数が blocking な api.rm になる。まとめた結果シグネチャが変わった
+/// 場合は旧シグネチャが残らないので、従来どおり削除として報告する (対照)。
+#[test]
+fn detect_api_changes_same_signature_variant_consolidation_is_not_removal() {
+    let removed_names = |api: &ApiChanges| -> Vec<String> {
+        api.removed
+            .iter()
+            .chain(&api.removed_dead)
+            .map(|s| s.name.clone())
+            .collect()
+    };
+
+    // Rust: プラットフォーム別の `#[cfg]` 分岐。
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "#[cfg(target_os = \"macos\")]\npub fn open_url(url: &str) -> bool {\n    !url.is_empty()\n}\n\n#[cfg(not(target_os = \"macos\"))]\npub fn open_url(url: &str) -> bool {\n    url.starts_with(\"http\")\n}\n",
+            ),
+            (
+                "src/main.rs",
+                "fn main() {\n    println!(\"{}\", demo::open_url(\"x\"));\n}\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn open_url(url: &str) -> bool {\n    !url.is_empty()\n}\n",
+    )
+    .expect("write lib.rs");
+    let api = detect_api_changes_from_worktree(repo);
+    assert!(
+        removed_names(&api).is_empty() && api.modified.is_empty(),
+        "同じシグネチャが残る cfg 分岐の統合を削除にしてはならない。removed={:?} modified={:?}",
+        removed_names(&api),
+        api.modified.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+
+    // 対照: まとめた結果シグネチャが変わった場合は、旧シグネチャが残らないので削除として報告する。
+    fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn open_url(url: &str) -> Result<(), String> {\n    if url.is_empty() { Err(String::new()) } else { Ok(()) }\n}\n",
+    )
+    .expect("write lib.rs");
+    let api = detect_api_changes_from_worktree(repo);
+    assert_eq!(
+        api.removed
+            .iter()
+            .map(|s| s.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["open_url".to_string(), "open_url".to_string()],
+        "旧シグネチャが残らない統合は blocking な削除として報告すべき。removed_dead={:?}",
+        api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+
+    // C: `#ifdef` 分岐。
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "util.c",
+                "#ifdef _WIN32\nint open_file(const char *p) {\n    return p != 0;\n}\n#else\nint open_file(const char *p) {\n    return p != 0 && p[0] != 0;\n}\n#endif\n",
+            ),
+            (
+                "main.c",
+                "int open_file(const char *p);\nint main(void) { return open_file(\"x\"); }\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("util.c"),
+        "int open_file(const char *p) {\n    return p != 0 && p[0] != 0;\n}\n",
+    )
+    .expect("write util.c");
+    let api = detect_api_changes_from_worktree(repo);
+    assert!(
+        removed_names(&api).is_empty(),
+        "同じシグネチャが残る #ifdef 分岐の統合を削除にしてはならない。removed={:?}",
+        removed_names(&api)
+    );
+}
+
+/// 別々の `impl` にある同名の関連定数は、owner 付きの qualname (`A.KIND`) で区別する。
+///
+/// 旧実装は関数 / メソッド以外を bare 名のままにしていたため、`impl A` と `impl B` の
+/// `KIND` が同一視されていた。A 側だけの削除は件数の減少としてしか見えず、型の変更は
+/// 「同名が複数 = 曖昧」として api.mod から落ちていた。
+#[test]
+fn detect_api_changes_rust_associated_const_is_qualified_by_owner() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let lib = |a_items: &str| {
+        format!(
+            "pub struct A;\npub struct B;\n\nimpl A {{\n{a_items}}}\n\nimpl B {{\n    pub const KIND: &'static str = \"b\";\n}}\n"
+        )
+    };
+    git_commit_files(
+        repo,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+            ),
+            (
+                "src/lib.rs",
+                &lib("    pub const KIND: &'static str = \"a\";\n"),
+            ),
+            (
+                "src/main.rs",
+                "fn main() {\n    println!(\"{}\", demo::A::KIND);\n    println!(\"{}\", demo::B::KIND);\n}\n",
+            ),
+        ],
+        "initial",
+    );
+    let names =
+        |symbols: &[ApiSymbol]| -> Vec<String> { symbols.iter().map(|s| s.name.clone()).collect() };
+    let changed_names = |changes: &[ApiSymbolChange]| -> Vec<String> {
+        changes.iter().map(|s| s.name.clone()).collect()
+    };
+
+    // A 側だけ削除: `demo::A::KIND` の利用が残るので blocking な api.rm。
+    fs::write(repo.join("src/lib.rs"), lib("")).expect("write");
+    let api = detect_api_changes_from_worktree(repo);
+    assert_eq!(
+        names(&api.removed),
+        vec!["A.KIND".to_string()],
+        "A 側の関連定数の削除を owner 付きで報告すべき。removed_dead={:?}",
+        names(&api.removed_dead)
+    );
+
+    // 型の変更: 同名が別 impl にあっても owner で区別できるので api.mod に出る。
+    fs::write(
+        repo.join("src/lib.rs"),
+        lib("    pub const KIND: u32 = 1;\n"),
+    )
+    .expect("write");
+    let api = detect_api_changes_from_worktree(repo);
+    assert_eq!(
+        changed_names(&api.modified),
+        vec!["A.KIND".to_string()],
+        "A 側の関連定数の型変更は api.mod に出すべき。const_value={:?}",
+        changed_names(&api.const_value_changes)
+    );
+
+    // 対照: 値だけの変更は従来どおり const_value_changes (非 blocking)。
+    fs::write(
+        repo.join("src/lib.rs"),
+        lib("    pub const KIND: &'static str = \"z\";\n"),
+    )
+    .expect("write");
+    let api = detect_api_changes_from_worktree(repo);
+    assert!(
+        api.modified.is_empty() && api.removed.is_empty(),
+        "値だけの変更を blocking にしてはならない。modified={:?} removed={:?}",
+        changed_names(&api.modified),
+        names(&api.removed)
+    );
+    assert_eq!(
+        changed_names(&api.const_value_changes),
+        vec!["A.KIND".to_string()]
+    );
+}
+
+/// 同名シンボルの 1 つだけを、同名が既にある別ファイルへ移した変更は moved として相殺する。
+///
+/// 件数の減った削除を api.rm に積むようになったため、移動先の「件数の増えた追加」も
+/// move 突き合わせの候補にしないと、同名が両ファイルに残るだけの移動が破壊的削除に化ける。
+#[test]
+fn detect_api_changes_partial_same_name_move_is_reconciled_as_moved() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let string_fmt = "fun String.fmt(): String = this\n";
+    let int_fmt = "fun Int.fmt(): String = toString()\n";
+    let long_fmt = "fun Long.fmt(): String = toString()\n";
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/A.kt",
+                &format!("package demo\n\n{string_fmt}\n{int_fmt}"),
+            ),
+            ("src/B.kt", &format!("package demo\n\n{long_fmt}")),
+            (
+                "src/Main.kt",
+                "package demo\n\nfun main() {\n    println(1.fmt())\n}\n",
+            ),
+        ],
+        "initial",
+    );
+
+    // `Int.fmt` を A.kt から B.kt へ移す (両ファイルに別の `fmt` が残る)。
+    fs::write(
+        repo.join("src/A.kt"),
+        format!("package demo\n\n{string_fmt}"),
+    )
+    .expect("write");
+    fs::write(
+        repo.join("src/B.kt"),
+        format!("package demo\n\n{long_fmt}\n{int_fmt}"),
+    )
+    .expect("write");
+    let api = detect_api_changes_from_worktree(repo);
+    assert!(
+        api.removed.is_empty(),
+        "同名の 1 つを移しただけで api.rm にしてはならない。removed={:?}",
+        api.removed
+            .iter()
+            .map(|s| (&s.name, &s.file))
+            .collect::<Vec<_>>()
+    );
+    let moved: Vec<(&str, &str, &str)> = api
+        .moved
+        .iter()
+        .map(|m| (m.name.as_str(), m.from.as_str(), m.to.as_str()))
+        .collect();
+    assert_eq!(moved, vec![("fmt", "src/A.kt", "src/B.kt")]);
 }

@@ -8,7 +8,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::engine::parser;
 use crate::models::review::CompatibleApiModification;
 
-use super::super::git_input::git_show_blob;
 use super::source_pair::{CompatibleModSite, SignatureSourceCache};
 use super::{ApiRefIndex, has_blocking_value_usage, normalize_signature_whitespace};
 
@@ -478,7 +477,7 @@ pub(crate) struct AddedRequiredObjectProps {
 
 pub(crate) fn detect_added_required_object_props(
     site: &CompatibleModSite<'_>,
-    sources: &mut SignatureSourceCache,
+    sources: &mut SignatureSourceCache<'_>,
 ) -> Option<AddedRequiredObjectProps> {
     with_resolved_ts_fn_pair(site, sources, |old_fn, old_source, new_fn, new_source| {
         let old_parts = ts_function_signature_parts(old_fn, old_source)?;
@@ -678,7 +677,7 @@ fn ts_module_has_use_client_directive(root: tree_sitter::Node<'_>, source: &[u8]
 /// parse 失敗 / シンボル非一意) は None = blocking 維持。
 fn with_resolved_ts_fn_pair<T>(
     site: &CompatibleModSite<'_>,
-    sources: &mut SignatureSourceCache,
+    sources: &mut SignatureSourceCache<'_>,
     check: impl FnOnce(tree_sitter::Node<'_>, &[u8], tree_sitter::Node<'_>, &[u8]) -> Option<T>,
 ) -> Option<T> {
     let lang = site.lang_in(TS_ONLY_LANGS)?;
@@ -1441,8 +1440,8 @@ pub(crate) fn static_js_string_text<'a>(
     }
 }
 
-/// 関数 parameters が「単一の destructured object parameter で、呼び出し側から
-/// 引数省略可能 (`foo()` で valid) と判定できる」場合に true。
+/// 関数 parameters が「単一の destructured object parameter で、空の props object で
+/// 呼べる」と判定できる場合に true。
 ///
 /// 判定基準:
 /// - parameters の named child が 1 個 (required_parameter / optional_parameter)
@@ -1450,6 +1449,8 @@ pub(crate) fn static_js_string_text<'a>(
 /// - 以下のいずれかを満たす:
 ///   1. parameter に default value (`= {}` 等の initializer) がある
 ///   2. type annotation の型が「全 optional な object type」と証明できる
+///      (default 値も `?` も無い場合、JSX `<Foo />` は通るが直接呼び出し `foo()` は
+///      TS2554 になる。直接呼び出しの有無は呼び出し側で確認すること)
 ///      - inline `object_type` ですべての property が `?` 付き (空も含む)
 ///      - 同一ファイル内の `interface` / `type alias` で同名のものが見つかり、
 ///        その body / value が全 optional な object type
@@ -1631,71 +1632,6 @@ pub(crate) fn interface_has_extends(decl: tree_sitter::Node<'_>) -> bool {
     let mut cursor = decl.walk();
     decl.children(&mut cursor)
         .any(|c| c.kind() == "extends_type_clause")
-}
-
-/// TS/TSX 関数の「引数なし `()` から省略可能 destructured 引数追加」が
-/// backward-compatible かを判定する。両側 signature を見て判定するため
-/// `detect_api_changes` から呼ぶ。`extract_api_signature` で signature 単独
-/// 正規化に組み込まないのは、optional 型変更 (`{x?:string}` → `{x?:number}`)
-/// まで誤って互換扱いするのを防ぐため (codex 設計合意)。
-///
-/// 条件:
-/// 1. `new_path` の言語が TypeScript / Tsx
-/// 2. `new_sig` に `fn_name({}` (destructure normalize 済み) が含まれる
-///    (早期 reject 用の文字列マッチ)
-/// 3. 旧ツリー (`base:old_path`) のトップレベル関数 `fn_name` の parameters が
-///    **AST 上で** 空 (codex 指摘: 文字列 contains だと型注釈内 call signature
-///    `{ fn_name(): void }` を誤検出するため、必ず AST で確認する)
-/// 4. 新ツリー (`new_path`) のトップレベル関数 `fn_name` の parameters が省略
-///    可能と判定できる
-///
-/// `old_path` と `new_path` は rename 差分に対応するため別々に渡す。
-/// signature 文字列に `fn_name()` (parameters なし) パターンが含まれるかを判定。
-/// 注: これは早期 reject 用のスクリーニング。型注釈内の call signature を誤検出する
-/// 可能性があるため、確実な判定には AST 検査 (`old_top_level_function_has_empty_parameters`)
-/// を併用する。
-pub(crate) fn signature_has_empty_parens_for(sig: &str, fn_name: &str) -> bool {
-    let needle = format!("{fn_name}()");
-    sig.contains(&needle)
-}
-
-/// signature 文字列に destructure normalize 済みの `fn_name({}` パターンが
-/// 含まれるかを判定。
-pub(crate) fn signature_has_destructured_params_for(sig: &str, fn_name: &str) -> bool {
-    let needle = format!("{fn_name}({{}}");
-    sig.contains(&needle)
-}
-
-/// 旧ツリー (base リビジョン) を `git show` で取得して parse し、トップレベル関数
-/// `fn_name` の parameters が空かを AST で判定する。
-///
-/// signature 文字列の `fn_name()` パターン検査だけでは型注釈内 call signature を
-/// 誤検出するため、最終確認として AST 検査が必要。
-///
-/// `base` / `file_path` の検証は `git_show_blob` 側で強制される (codex 指摘: 既存の
-/// `extract_exported_symbols_from_git` と同じ防御を行わないと `--diff` / stdin 経路で
-/// 未検証の `base` がここに到達し得る)。
-pub(crate) fn old_top_level_function_has_empty_parameters(
-    dir: &str,
-    base: &str,
-    file_path: &str,
-    lang_id: crate::language::LangId,
-    fn_name: &str,
-) -> bool {
-    let Some(source) = git_show_blob(dir, base, file_path) else {
-        return false;
-    };
-    let Ok(tree) = parser::parse_source(&source, lang_id) else {
-        return false;
-    };
-    let Some(fn_node) = find_top_level_function_by_name(tree.root_node(), &source, fn_name) else {
-        return false;
-    };
-    let Some(params) = fn_node.child_by_field_name("parameters") else {
-        return false;
-    };
-    let mut cursor = params.walk();
-    params.named_children(&mut cursor).count() == 0
 }
 
 /// `root` のトップレベル (program 直下 / `export_statement` 直下) にある関数 /

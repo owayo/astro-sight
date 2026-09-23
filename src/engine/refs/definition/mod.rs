@@ -35,8 +35,13 @@ pub(crate) fn is_definition_context(
     match lang_id {
         LangId::Ruby => is_ruby_definition_context(node),
         LangId::Php => is_php_definition_context(node),
+        // 分割代入の束縛 (`const { a: { b: bb }, c = x, ...rest } = obj` の bb / rest) は
+        // 宣言の name から 2 段以上離れるため name フィールド判定だけでは届かず、
+        // 自分自身への参照として数えられて dead を見逃していた (深さ 1 の `const [x] = ..`
+        // だけが def になる非対称もあった)。default 値・computed key の識別子は参照のまま。
         LangId::Typescript | LangId::Tsx | LangId::Javascript => {
             is_name_field_definition_context(node, definition_kinds)
+                || crate::engine::js_binding_pattern::is_declarator_pattern_binding(node)
         }
         LangId::Python => is_python_definition_context(node, definition_kinds),
         LangId::Zig => is_zig_definition_context(node, definition_kinds),
@@ -69,8 +74,18 @@ fn is_ancestor_kind_definition_context(node: Node<'_>, definition_kinds: &[&str]
 }
 
 pub(crate) fn is_ignored_identifier_context(node: Node<'_>, lang_id: LangId) -> bool {
-    matches!(lang_id, LangId::C | LangId::Cpp)
-        && is_cpp_standalone_forward_declaration_tag_name(node)
+    match lang_id {
+        LangId::C | LangId::Cpp => is_cpp_standalone_forward_declaration_tag_name(node),
+        // shorthand の束縛パターン (`{ x }`) は変数宣言の束縛位置だけを定義として出し、
+        // それ以外 (関数パラメータ・`for (const { x } of ..)`・代入式 `({ x } = obj)`) は
+        // 従来どおり参照にも定義にも数えない。参照として数えると、無関係な関数の
+        // パラメータ名で dead-code が fail-open する。
+        LangId::Javascript | LangId::Typescript | LangId::Tsx => {
+            node.kind() == "shorthand_property_identifier_pattern"
+                && !crate::engine::js_binding_pattern::is_declarator_pattern_binding(node)
+        }
+        _ => false,
+    }
 }
 
 /// 定義ノードが `name` フィールドを持つ文法で、識別子が「宣言の `name` フィールド」
@@ -245,7 +260,8 @@ fn is_python_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bo
 /// Zig: 宣言の「名前位置」にある identifier だけを `Definition` とみなす。
 ///
 /// tree-sitter-zig の AST では:
-/// - `variable_declaration` は `name` フィールドが無く、最初の子 identifier が変数名
+/// - `variable_declaration` は `name` フィールドが無く、`const` / `var` トークンの直後の
+///   identifier が変数名
 /// - `function_declaration` は `name`/`type`/`body` フィールドあり (戻り値型は `type`)
 /// - `test_declaration` は最初の identifier/string が テスト名
 /// - `struct_declaration` / `enum_declaration` 等は `name` フィールドあり
@@ -253,6 +269,13 @@ fn is_python_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bo
 /// 単純な parent/grandparent 走査では `const Foo = bar()` の `bar` (右辺) や
 /// `fn foo() ReturnType { ... }` の `ReturnType` (戻り値型) が def 誤判定される。
 /// 各定義種別ごとに「名前位置」を厳密に判定し、それ以外の identifier は ref として返す。
+///
+/// tree-sitter-zig は文レベルの代入 (`counter += 1;` / `x = 5;` / `a, b = .{..};`) も
+/// `variable_declaration` へ alias する (`_variable_declaration_expression_statement`)。
+/// 代入先は既存変数への参照なので、「最初の identifier 子」で判定すると代入先が def に化け、
+/// 書き込みでしか使われない変数が dead に出る。宣言は必ず `const` / `var` トークンの
+/// 直後に名前を置く (`_variable_declaration_header`) ため、直前の兄弟トークンで判定する
+/// (`extern "c" var x` / `a, const b = ..` の分割代入も同じ規則で扱える)。
 fn is_zig_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bool {
     let Some(parent) = node.parent() else {
         return false;
@@ -267,9 +290,23 @@ fn is_zig_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bool 
         return name_node.id() == node.id();
     }
 
-    // 2. variable_declaration / test_declaration は最初の identifier (or string) 子が
-    //    名前位置。それ以降の identifier は ref として扱う。
-    if matches!(parent.kind(), "variable_declaration" | "test_declaration") {
+    // 2. variable_declaration は `const` / `var` トークン直後の identifier だけが名前位置。
+    //    代入文 (`counter += 1;`) の代入先や右辺の identifier は ref として扱う。
+    //    間に挟まり得る行コメント (`var // note\n x`、extras) は読み飛ばす。
+    if parent.kind() == "variable_declaration" {
+        if node.kind() != "identifier" {
+            return false;
+        }
+        let mut prev = node.prev_sibling();
+        while let Some(comment) = prev.filter(|p| p.kind() == "comment") {
+            prev = comment.prev_sibling();
+        }
+        return prev.is_some_and(|prev| matches!(prev.kind(), "const" | "var"));
+    }
+
+    // 3. test_declaration は最初の identifier (or string) 子がテスト名。
+    //    それ以降の identifier は ref として扱う。
+    if parent.kind() == "test_declaration" {
         let mut cursor = parent.walk();
         for child in parent.children(&mut cursor) {
             if matches!(child.kind(), "identifier" | "string") {
@@ -308,13 +345,16 @@ pub(crate) fn definition_node_kinds(lang_id: LangId) -> &'static [&'static str] 
         LangId::Python => &["function_definition", "class_definition"],
         LangId::Javascript => &[
             "function_declaration",
+            "generator_function_declaration",
             "class_declaration",
             "method_definition",
             "variable_declarator",
         ],
         LangId::Typescript | LangId::Tsx => &[
             "function_declaration",
+            "generator_function_declaration",
             "class_declaration",
+            "abstract_class_declaration",
             "method_definition",
             "interface_declaration",
             "type_alias_declaration",
@@ -326,6 +366,8 @@ pub(crate) fn definition_node_kinds(lang_id: LangId) -> &'static [&'static str] 
             "function_declaration",
             "method_declaration",
             "type_spec",
+            // `type Alias = Other` は type_spec ではなく type_alias
+            "type_alias",
         ],
         LangId::Php => &[
             "function_definition",
@@ -338,6 +380,7 @@ pub(crate) fn definition_node_kinds(lang_id: LangId) -> &'static [&'static str] 
         LangId::Java => &[
             "method_declaration",
             "class_declaration",
+            "record_declaration",
             "interface_declaration",
             "enum_declaration",
         ],
@@ -355,6 +398,7 @@ pub(crate) fn definition_node_kinds(lang_id: LangId) -> &'static [&'static str] 
             "namespace_declaration",
             "method_declaration",
             "class_declaration",
+            "record_declaration",
             "struct_declaration",
             "interface_declaration",
             "enum_declaration",
@@ -408,9 +452,11 @@ pub(crate) fn is_identifier_kind(kind: &str) -> bool {
             // レジストリ / DI / `export default { setup, data }` / `module.exports = { a, b }`
             // は JS/TS で最も一般的な参照形なのに、ここに無いせいで walk_refs の
             // identifier ガードに弾かれ、生きているシンボルが dead-code に出ていた。
-            // 束縛側の `shorthand_property_identifier_pattern` (`const { x } = obj`) は
-            // 別ノードなので入れない — 束縛を参照として数えると dead-code が fail-open する。
             | "shorthand_property_identifier"
+            // 束縛側 (`const { x } = obj` の x) は変数宣言の束縛位置のときだけ定義として
+            // 出し、それ以外の文脈は `is_ignored_identifier_context` が除外する
+            // (束縛を参照として数えると dead-code が fail-open する)。
+            | "shorthand_property_identifier_pattern"
             | "simple_identifier"
             | "namespace_identifier"
             | "package_identifier"

@@ -22,7 +22,7 @@ use super::source_pair::{CompatibleModSite, SignatureSourceCache};
 /// blocking を維持する (false negative 回避)。
 pub(crate) fn detect_python_trailing_optional_params_compatible_mod(
     site: &CompatibleModSite<'_>,
-    sources: &mut SignatureSourceCache,
+    sources: &mut SignatureSourceCache<'_>,
 ) -> Option<CompatibleApiModification> {
     let lang = site.lang_in(&[LangId::Python])?;
     if site.kind != "function" && site.kind != "method" {
@@ -60,7 +60,7 @@ pub(crate) fn detect_python_trailing_optional_params_compatible_mod(
 /// Python シグネチャ変更をこの判定器が横取りしない。
 pub(crate) fn detect_python_implicit_string_concat_compatible_mod(
     site: &CompatibleModSite<'_>,
-    sources: &mut SignatureSourceCache,
+    sources: &mut SignatureSourceCache<'_>,
 ) -> Option<CompatibleApiModification> {
     let lang = site.lang_in(&[LangId::Python])?;
     if site.kind != "function" && site.kind != "method" {
@@ -358,22 +358,162 @@ pub(crate) fn python_collect_decorators(
     fn_node: tree_sitter::Node<'_>,
     source: &[u8],
 ) -> Vec<String> {
+    python_decorator_nodes(fn_node)
+        .into_iter()
+        .filter_map(|decorator| {
+            source
+                .get(decorator.start_byte()..decorator.end_byte())
+                .map(normalize_signature_whitespace)
+        })
+        .collect()
+}
+
+/// `function_definition` に付いた `decorator` ノードを外側 (ソース順) から返す。
+fn python_decorator_nodes(fn_node: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
     let Some(parent) = fn_node.parent() else {
         return Vec::new();
     };
     if parent.kind() != "decorated_definition" {
         return Vec::new();
     }
-    let mut decorators = Vec::new();
     let mut cursor = parent.walk();
-    for child in parent.named_children(&mut cursor) {
-        if child.kind() == "decorator"
-            && let Some(text) = source.get(child.start_byte()..child.end_byte())
-        {
-            decorators.push(normalize_signature_whitespace(text));
+    parent
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "decorator")
+        .collect()
+}
+
+/// 呼び出し方 (属性アクセス / 束縛) を変える組み込みデコレータ。
+///
+/// `@lru_cache` のように呼び出し互換を保つデコレータは対象外 (signature に入れると
+/// デコレータの付け外しだけで blocking な api.mod になる)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PyBindingDecorator {
+    /// `@property` (`obj.x` が値になる)
+    Property,
+    /// `@cached_property` / `@functools.cached_property` (`obj.x` が値になる)
+    CachedProperty,
+    /// `@staticmethod` (self / cls を束縛しない)
+    StaticMethod,
+    /// `@classmethod` (cls を束縛する)
+    ClassMethod,
+}
+
+impl PyBindingDecorator {
+    /// signature に載せる正規形。モジュール修飾の有無 (`functools.cached_property` と
+    /// `cached_property`) は束縛を変えないので同じ表記に畳む。
+    pub(crate) fn signature_token(self) -> &'static str {
+        match self {
+            Self::Property => "@property",
+            Self::CachedProperty => "@cached_property",
+            Self::StaticMethod => "@staticmethod",
+            Self::ClassMethod => "@classmethod",
         }
     }
-    decorators
+
+    fn is_property_like(self) -> bool {
+        matches!(self, Self::Property | Self::CachedProperty)
+    }
+}
+
+/// `decorator` ノードの式が束縛を変える組み込みデコレータなら種別を返す。
+///
+/// 行末コメントも `decorator` の子になるため、テキストではなく式ノードで判定する。
+/// 呼び出し形 (`@deco(...)`) や別名 import (`from functools import cached_property as cp`) は
+/// 判定できないので None (= 従来どおり signature に反映しない)。
+fn python_binding_decorator(
+    decorator: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<PyBindingDecorator> {
+    let mut cursor = decorator.walk();
+    let expr = decorator
+        .named_children(&mut cursor)
+        .find(|child| child.kind() != "comment")?;
+    let text = |node: tree_sitter::Node<'_>| node.utf8_text(source).ok();
+    let (module, name) = match expr.kind() {
+        "identifier" => (None, text(expr)?),
+        "attribute" => {
+            let object = expr.child_by_field_name("object")?;
+            if object.kind() != "identifier" {
+                return None;
+            }
+            (
+                Some(text(object)?),
+                text(expr.child_by_field_name("attribute")?)?,
+            )
+        }
+        _ => return None,
+    };
+    match (module, name) {
+        (None | Some("builtins"), "property") => Some(PyBindingDecorator::Property),
+        (None | Some("builtins"), "staticmethod") => Some(PyBindingDecorator::StaticMethod),
+        (None | Some("builtins"), "classmethod") => Some(PyBindingDecorator::ClassMethod),
+        (None | Some("functools"), "cached_property") => Some(PyBindingDecorator::CachedProperty),
+        _ => None,
+    }
+}
+
+/// `function_definition` に付いた束縛変更デコレータを外側から順に返す。
+pub(crate) fn python_binding_decorators(
+    fn_node: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Vec<PyBindingDecorator> {
+    python_decorator_nodes(fn_node)
+        .into_iter()
+        .filter_map(|decorator| python_binding_decorator(decorator, source))
+        .collect()
+}
+
+/// `root` の `Class.member` が property (`obj.member` が値を返す) として定義されているか。
+///
+/// getter は最も外側のデコレータが `@property` / `@cached_property` であることを要求する。
+/// 同名の定義は同じ property の一部である `@member.setter` / `.getter` / `.deleter` だけを
+/// 許し、それ以外 (素のメソッドによる上書き等) が 1 つでもあれば false。
+/// クラスやメソッドを一意に解決できない場合も false (property と断定しない側に倒す)。
+pub(crate) fn python_member_is_property(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    qualname: &str,
+) -> bool {
+    let Some((_, member)) = qualname.split_once('.') else {
+        return false;
+    };
+    let mut has_getter = false;
+    for fn_node in collect_python_function_candidates(root, source, qualname) {
+        let decorators = python_decorator_nodes(fn_node);
+        let Some(&outermost) = decorators.first() else {
+            return false;
+        };
+        if python_binding_decorator(outermost, source).is_some_and(|d| d.is_property_like()) {
+            has_getter = true;
+        } else if !is_python_property_accessor_decorator(outermost, source, member) {
+            return false;
+        }
+    }
+    has_getter
+}
+
+/// `@member.setter` / `@member.getter` / `@member.deleter` か。
+fn is_python_property_accessor_decorator(
+    decorator: tree_sitter::Node<'_>,
+    source: &[u8],
+    member: &str,
+) -> bool {
+    let mut cursor = decorator.walk();
+    let Some(expr) = decorator
+        .named_children(&mut cursor)
+        .find(|child| child.kind() != "comment")
+    else {
+        return false;
+    };
+    expr.kind() == "attribute"
+        && expr
+            .child_by_field_name("object")
+            .is_some_and(|o| o.kind() == "identifier" && o.utf8_text(source).ok() == Some(member))
+        && expr
+            .child_by_field_name("attribute")
+            .and_then(|a| a.utf8_text(source).ok())
+            .is_some_and(|a| matches!(a, "setter" | "getter" | "deleter"))
 }
 
 /// parameters 直下の named child を順番に収集する。判定不能な kind が混ざる場合は
@@ -719,6 +859,105 @@ mod tests {
         let old_parts = python_function_signature_parts(old_fn, old_src.as_bytes()).unwrap();
         let new_parts = python_function_signature_parts(new_fn, new_src.as_bytes()).unwrap();
         assert_ne!(old_parts.decorators, new_parts.decorators);
+    }
+
+    /// 束縛を変えるデコレータだけを外側から順に拾い、モジュール修飾・行末コメントに左右されない。
+    #[test]
+    fn binding_decorators_are_classified_by_expression() {
+        let src = "\
+import functools
+
+
+class C:
+    @property  # getter
+    def a(self):
+        return 1
+
+    @functools.cached_property
+    def b(self):
+        return 2
+
+    @staticmethod
+    @functools.lru_cache
+    def c(x):
+        return x
+
+    @classmethod
+    def d(cls):
+        return cls
+
+    @functools.lru_cache(maxsize=None)
+    def e(self):
+        return 5
+";
+        let tree = parse(src);
+        let binding = |name: &str| {
+            let fn_node = find_python_function_by_name(tree.root_node(), src.as_bytes(), name)
+                .expect("resolvable");
+            python_binding_decorators(fn_node, src.as_bytes())
+        };
+        assert_eq!(binding("C.a"), [PyBindingDecorator::Property]);
+        assert_eq!(binding("C.b"), [PyBindingDecorator::CachedProperty]);
+        assert_eq!(binding("C.c"), [PyBindingDecorator::StaticMethod]);
+        assert_eq!(binding("C.d"), [PyBindingDecorator::ClassMethod]);
+        assert!(
+            binding("C.e").is_empty(),
+            "束縛を変えないデコレータは拾わない"
+        );
+    }
+
+    /// getter が property のものだけを property と判定し、setter 等の同名定義は許す。
+    #[test]
+    fn member_is_property_requires_property_getter() {
+        let src = "\
+import functools
+
+
+class C:
+    @property
+    def plain(self):
+        return 1
+
+    @property
+    def rw(self):
+        return self._rw
+
+    @rw.setter
+    def rw(self, value):
+        self._rw = value
+
+    @functools.cached_property
+    def cached(self):
+        return 2
+
+    def method(self):
+        return 3
+
+    @staticmethod
+    def static():
+        return 4
+
+    @property
+    def overridden(self):
+        return 5
+
+    def overridden(self):
+        return 6
+";
+        let tree = parse(src);
+        let is_property =
+            |qualname: &str| python_member_is_property(tree.root_node(), src.as_bytes(), qualname);
+        assert!(is_property("C.plain"));
+        assert!(is_property("C.rw"), "setter 付き property も property");
+        assert!(is_property("C.cached"));
+        assert!(!is_property("C.method"), "素のメソッドは property ではない");
+        assert!(!is_property("C.static"));
+        assert!(
+            !is_property("C.overridden"),
+            "素のメソッドで上書きされた property は property と断定しない"
+        );
+        assert!(!is_property("C.missing"));
+        assert!(!is_property("Other.plain"));
     }
 
     #[test]

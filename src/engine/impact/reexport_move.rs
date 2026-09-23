@@ -271,7 +271,7 @@ fn collect_rust_changed_lines(input: &str) -> HashMap<String, ChangedLines> {
 
         if line.starts_with("--- ") {
             current_path = None;
-        } else if let Some(path) = line.strip_prefix("+++ b/") {
+        } else if let Some(path) = crate::engine::diff::strip_header_path(line, "+++ b/") {
             // Rust 以外は解析対象外 (本索引は Rust 限定)。
             current_path = path.ends_with(".rs").then(|| path.to_string());
         } else if line.starts_with("+++ ") {
@@ -619,6 +619,19 @@ fn is_plain_identifier(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 空白を含むパスのヘッダ行末に git が付ける TAB をパスに取り込まない
+    /// (取り込むと `.rs` 判定と後段のパス照合が外れ、そのファイルの変更行が消える)。
+    #[test]
+    fn collect_rust_changed_lines_strips_git_tab_suffix_from_header_path() {
+        let diff = "--- a/src/my game.rs\t\n+++ b/src/my game.rs\t\n@@ -1 +1 @@\n-pub const A: u32 = 1;\n+pub use crate::other::A;\n";
+        let per_file = collect_rust_changed_lines(diff);
+        let lines = per_file
+            .get("src/my game.rs")
+            .unwrap_or_else(|| panic!("TAB を除いたパスで引けること: {:?}", per_file.keys()));
+        assert_eq!(lines.added, vec!["pub use crate::other::A;".to_string()]);
+        assert_eq!(lines.removed, vec!["pub const A: u32 = 1;".to_string()]);
+    }
 
     /// Issue の再現形をそのまま diff にしたもの。
     /// background.rs へ定義が移動し、consumer.rs は旧パスを再輸出で維持する。

@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use crate::engine::parser;
 use crate::service::AppService;
 
-use super::super::git_input::validate_git_revision;
+use super::super::git_input::{git_show_blob, validate_git_revision};
 use super::{bare_name, ctx_usage_is_jsx_or_safe};
 
 /// API 差分判定用の cross-file 参照インデックス。
@@ -245,7 +245,7 @@ pub(crate) fn is_modified_closed_in_diff(
         let changed = caches
             .changed_new_lines
             .entry(df.new_path.clone())
-            .or_insert_with(|| changed_new_lines_for_file(dir, base, &df.old_path, &df.new_path));
+            .or_insert_with(|| changed_new_lines_for_diff_file(dir, base, df));
         if !changed.contains(&r.line) {
             // 複数行呼び出し (`startRecording({\n  fps,\n  cursor,\n})`) では識別子行は
             // 未変更のまま実引数のプロパティ行だけが変わる。JS/TS/TSX で参照が call の
@@ -631,6 +631,90 @@ pub(crate) fn import_statement_lines_for_ref(
     crate::engine::imports::import_statement_lines(tree.root_node())
 }
 
+/// diff ファイル 1 件について、new 側で実際に追加/変更された 0-indexed 行集合を返す。
+///
+/// `--git` が diff に合成した未追跡ファイルは `git diff <base>` に現れないため、git から
+/// 取り直すと常に空集合になり、追随済みの呼び出し側まで未更新と誤判定していた
+/// (`git add -N` しただけで結果が変わる)。
+///
+/// - 新規ファイル (`old_path == /dev/null`) は new 側の全行が追加行なので、hunk の new 範囲を
+///   そのまま使う。context 行を含まない hunk (`old_count == 0`) だけを使うので、`+` 行以外を
+///   追加行と数えることはない。
+/// - 既存ファイルの hunk は context 行を含み、`HunkInfo` からは `+` 行を区別できないため
+///   従来どおり git diff から実 `+` 行を取る。未追跡ファイルへの rename (削除 + 未追跡の
+///   合成) だけは git diff に new 側が現れないので `untracked_rename_added_lines` で補う。
+fn changed_new_lines_for_diff_file(
+    dir: &str,
+    base: &str,
+    df: &crate::models::impact::DiffFile,
+) -> std::collections::HashSet<usize> {
+    if df.old_path == "/dev/null" {
+        return df
+            .hunks
+            .iter()
+            .filter(|h| h.old_count == 0)
+            .flat_map(|h| {
+                let start = h.new_start.saturating_sub(1);
+                start..start + h.new_count
+            })
+            .collect();
+    }
+    let changed = changed_new_lines_for_file(dir, base, &df.old_path, &df.new_path);
+    if !changed.is_empty()
+        || df.hunks.is_empty()
+        || df.old_path == df.new_path
+        || !is_untracked_path(dir, &df.new_path)
+    {
+        return changed;
+    }
+    untracked_rename_added_lines(dir, base, &df.old_path, &df.new_path).unwrap_or(changed)
+}
+
+/// `path` (dir 相対) が git の index に無い (= 未追跡) か。判定できなければ false
+/// (呼び出し側は git diff の結果をそのまま使い、blocking 側に倒れる)。
+fn is_untracked_path(dir: &str, path: &str) -> bool {
+    if validate_git_revision(path, "diff file path").is_err() {
+        return false;
+    }
+    // パスに glob 文字 (`[id].tsx` 等) が含まれても別ファイルに一致させない。
+    let output = std::process::Command::new("git")
+        .args(["--literal-pathspecs", "ls-files", "-z", "--", path])
+        .current_dir(dir)
+        .output();
+    match output {
+        Ok(output) => output.status.success() && output.stdout.is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// 未追跡ファイルへの rename (`old_path` は base に存在) で、new 側の各行のうち旧ファイルの
+/// どの行とも一致しない行の 0-indexed 行集合を返す。旧側・新側が読めなければ None。
+///
+/// 合成 diff の hunk は共通の先頭・末尾以外をすべて `+` にするため、その範囲には
+/// 書き換えていない行 (未更新の呼び出し) も入りうる。旧ファイルに同じ行がある行を
+/// 変更行に数えなければ、どの行対応 (git の diff を含む) で見ても追加された行だけが残る
+/// (未更新の呼び出しを追随済みと誤判定する向きには倒れない)。
+fn untracked_rename_added_lines(
+    dir: &str,
+    base: &str,
+    old_path: &str,
+    new_path: &str,
+) -> Option<std::collections::HashSet<usize>> {
+    let old = git_show_blob(dir, base, old_path)?;
+    let full = std::path::Path::new(dir).join(new_path);
+    let new = parser::read_file(camino::Utf8Path::new(full.to_str()?)).ok()?;
+    let new = std::str::from_utf8(&new).ok()?;
+    let old = String::from_utf8_lossy(&old);
+    let old_lines: HashSet<&str> = old.lines().collect();
+    Some(
+        new.lines()
+            .enumerate()
+            .filter(|(_, line)| !old_lines.contains(line))
+            .map(|(i, _)| i)
+            .collect(),
+    )
+}
+
 /// `git diff <base> -M -- <old_path> <new_path>` を解析し、new 側で実際に追加/変更された
 /// 0-indexed 行集合を返す。取得・解析に失敗した場合は空集合 (= どの参照も追随済みと見なさず
 /// blocking 維持) を返す。
@@ -654,15 +738,12 @@ pub(crate) fn changed_new_lines_for_file(
     // --relative: `old_path` / `new_path` は `dir` 相対 (pathspec も cwd 基準) なので、
     // 出力ヘッダも `dir` 相対に揃えないと `extract_changed_new_lines` の new_path 照合が
     // サブディレクトリ実行で外れる。`--dir` = リポジトリルートでは無変化。
-    let mut args: Vec<&str> = vec![
-        "-c",
-        "core.quotepath=off",
-        "diff",
-        "--relative",
-        base,
-        "-M",
-        "--",
-    ];
+    // GIT_DIFF_PARSEABLE_OUTPUT_ARGS: 利用者の git 設定 (`diff.mnemonicPrefix` / `color.diff` /
+    // `diff.external` 等) で出力形式が変わると new_path 照合が外れ、追随済みの参照まで
+    // blocking に残る (`GIT_DIFF_PARSEABLE_OUTPUT_ARGS` の doc 参照)。
+    let mut args: Vec<&str> = vec!["-c", "core.quotepath=off", "diff"];
+    args.extend(crate::git_support::GIT_DIFF_PARSEABLE_OUTPUT_ARGS);
+    args.extend(["--relative", base, "-M", "--"]);
     if old_path != "/dev/null" && old_path != new_path {
         if validate_git_revision(old_path, "diff file path").is_err() {
             return HashSet::new();

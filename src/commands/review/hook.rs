@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::commands::ChangedFileSet;
+use crate::commands::DiffCallerResolution;
 use crate::models::impact::ImpactedCaller;
 use crate::models::review::{ApiChanges, ReviewResult};
 
@@ -293,12 +293,12 @@ fn accumulate_hook_impacts(
     target: &mut std::collections::BTreeMap<String, HookImpactGroup>,
     change_path: &str,
     callers: &[ImpactedCaller],
-    changed: &ChangedFileSet,
+    resolution: &DiffCallerResolution,
     dir: &str,
     keep_symbol: impl Fn(&str) -> bool,
 ) {
     for caller in callers {
-        if changed.contains_caller(dir, &caller.path) {
+        if resolution.is_resolved(dir, &caller.path, caller.line) {
             continue;
         }
         let causal_syms: Vec<String> = caller
@@ -320,10 +320,25 @@ fn accumulate_hook_impacts(
     }
 }
 
+/// diff を持たない呼び出し (単体テスト) 用。「diff 内で解決済み」の判定は影響分析の結果に
+/// 現れたファイルだけで行う。
+#[cfg(test)]
 pub(crate) fn build_review_hook_json(
     result: &ReviewResult,
     dir: &str,
     strict_const_values: bool,
+) -> HookJsonBuild {
+    build_review_hook_json_for_diff(result, dir, strict_const_values, "", &[])
+}
+
+/// `diff_input` / `diff_files` はレビュー対象の diff。呼び出し側が diff 内で解決済みか
+/// (`DiffCallerResolution`) の判定に使う。
+pub(crate) fn build_review_hook_json_for_diff(
+    result: &ReviewResult,
+    dir: &str,
+    strict_const_values: bool,
+    diff_input: &str,
+    diff_files: &[crate::models::impact::DiffFile],
 ) -> HookJsonBuild {
     // api 側で「互換 / 追随済み / 値のみ変更」と判定済みの modified 系シンボルは、
     // Stop hook の impact でも informational として扱う。ここを揃えないと api.mod_compat
@@ -354,8 +369,15 @@ pub(crate) fn build_review_hook_json(
         );
     }
 
-    // 未解決 impact を収集
-    let changed = ChangedFileSet::build(dir, result.impact.changes.iter().map(|c| c.path.as_str()));
+    // 未解決 impact を収集。呼び出し側が diff 内で解決済みかは `impact --hook` と同じ判定
+    // (`DiffCallerResolution`) にする。影響分析の結果 (`impact.changes`) だけで判定すると、
+    // トップレベルの呼び出しだけを更新したファイルが diff 外扱いになり誤ってブロックする。
+    let resolution = DiffCallerResolution::build(
+        dir,
+        result.impact.changes.iter().map(|c| c.path.as_str()),
+        diff_input,
+        diff_files,
+    );
 
     let mut unresolved: std::collections::BTreeMap<String, HookImpactGroup> =
         std::collections::BTreeMap::new();
@@ -387,7 +409,7 @@ pub(crate) fn build_review_hook_json(
             &mut unresolved,
             &change.path,
             &change.impacted_callers,
-            &changed,
+            &resolution,
             dir,
             |sym| {
                 matches!(
@@ -403,7 +425,7 @@ pub(crate) fn build_review_hook_json(
             &mut informational,
             &change.path,
             &change.informational_callers,
-            &changed,
+            &resolution,
             dir,
             |sym| matches!(affected_change_types.get(sym).copied(), Some("modified")),
         );
@@ -547,8 +569,11 @@ pub(crate) fn review_hook_output(
     result: &ReviewResult,
     dir: &str,
     strict_const_values: bool,
+    diff_input: &str,
+    diff_files: &[crate::models::impact::DiffFile],
 ) -> Result<()> {
-    let build = build_review_hook_json(result, dir, strict_const_values);
+    let build =
+        build_review_hook_json_for_diff(result, dir, strict_const_values, diff_input, diff_files);
     let Some(hook_output) = build.value else {
         return Ok(());
     };

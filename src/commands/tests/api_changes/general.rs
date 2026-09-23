@@ -1596,3 +1596,120 @@ fn member_access_ref_batch_detects_any_requested_member() {
         "空の候補集合は参照なしとして扱う"
     );
 }
+
+/// 未追跡ファイルの呼び出し側が変更後シグネチャで呼んでいれば、tracked の呼び出し側と
+/// 同じく「同一 diff で追随済み」として modified_closed_in_diff に降格する。
+///
+/// 追随判定の「実変更行」を `git diff <base>` から取っていたため、`--git` が diff に合成した
+/// 未追跡ファイルの行は常に空集合になり、`git add -N` しただけで結果が変わっていた。
+/// diff 外に未更新の tracked caller が残る場合は従来どおり blocking (対照)。
+#[test]
+fn detect_api_changes_untracked_caller_following_new_signature_is_closed() {
+    let caller = |name: &str, args: &str| {
+        format!(
+            "import {{ foo }} from \"./foo\";\n\nexport function {name}(): number {{\n  return foo({args});\n}}\n"
+        )
+    };
+    // (modified, modified_closed_in_diff) を返す。`stale_tracked_caller` が true なら
+    // 旧シグネチャで呼ぶ tracked な caller3 を diff 外に残す。
+    let run = |stale_tracked_caller: bool| -> (Vec<String>, Vec<String>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        let foo_before = "export function foo(a: number): number {\n  return a;\n}\n";
+        let caller1_before = caller("one", "1");
+        let caller3 = caller("three", "5");
+        let mut files: Vec<(&str, &str)> = vec![
+            ("src/foo.ts", foo_before),
+            ("src/caller1.ts", &caller1_before),
+        ];
+        if stale_tracked_caller {
+            files.push(("src/caller3.ts", &caller3));
+        }
+        git_commit_files(repo, &files, "initial");
+        // 必須引数の追加。tracked の caller1 と未追跡の caller2 は新シグネチャで呼ぶ。
+        fs::write(
+            repo.join("src/foo.ts"),
+            "export function foo(a: number, b: number): number {\n  return a + b;\n}\n",
+        )
+        .expect("write foo.ts");
+        fs::write(repo.join("src/caller1.ts"), caller("one", "1, 2")).expect("write caller1");
+        fs::write(repo.join("src/caller2.ts"), caller("two", "3, 4")).expect("write caller2");
+        let api = detect_api_changes_from_worktree(repo);
+        (
+            api.modified.iter().map(|c| c.name.clone()).collect(),
+            api.modified_closed_in_diff
+                .iter()
+                .map(|c| c.name.clone())
+                .collect(),
+        )
+    };
+
+    assert_eq!(
+        run(false),
+        (Vec::new(), vec!["foo".to_string()]),
+        "未追跡の caller も追随済みなら modified_closed_in_diff に降格すべき"
+    );
+    assert_eq!(
+        run(true),
+        (vec!["foo".to_string()], Vec::new()),
+        "diff 外に未更新の tracked caller が残るなら blocking な modified のまま"
+    );
+}
+
+/// 未追跡ファイルへ rename (`git mv` ではなく `mv`) した呼び出し側も、新シグネチャで呼んで
+/// いれば tracked の rename と同じく modified_closed_in_diff に降格する。
+///
+/// `--git` は削除 + 未追跡を rename として合成するが、new 側は `git diff <base>` に現れないため
+/// 変更行が常に空集合になっていた。合成 diff の hunk は共通の先頭・末尾以外をすべて `+` に
+/// するので、書き換えていない呼び出しを前後の行追加に挟んだ場合は blocking のまま (対照)。
+#[test]
+fn detect_api_changes_untracked_renamed_caller_following_new_signature_is_closed() {
+    let caller = |body: &str| {
+        format!("import {{ foo }} from \"./foo\";\n\nexport function two(): number {{\n{body}}}\n")
+    };
+    // (modified, modified_closed_in_diff) を返す。
+    let run = |renamed_body: &str| -> (Vec<String>, Vec<String>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        let legacy = caller("  return foo(3);\n");
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "src/foo.ts",
+                    "export function foo(a: number): number {\n  return a;\n}\n",
+                ),
+                ("src/legacy.ts", &legacy),
+            ],
+            "initial",
+        );
+        fs::write(
+            repo.join("src/foo.ts"),
+            "export function foo(a: number, b: number): number {\n  return a + b;\n}\n",
+        )
+        .expect("write foo.ts");
+        fs::rename(repo.join("src/legacy.ts"), repo.join("src/caller2.ts")).expect("mv");
+        fs::write(repo.join("src/caller2.ts"), caller(renamed_body)).expect("write caller2");
+        let api = detect_api_changes_from_worktree(repo);
+        (
+            api.modified.iter().map(|c| c.name.clone()).collect(),
+            api.modified_closed_in_diff
+                .iter()
+                .map(|c| c.name.clone())
+                .collect(),
+        )
+    };
+
+    assert_eq!(
+        run("  return foo(3, 4);\n"),
+        (Vec::new(), vec!["foo".to_string()]),
+        "未追跡へ rename した caller も追随済みなら modified_closed_in_diff に降格すべき"
+    );
+    assert_eq!(
+        run("  // note\n  return foo(3);\n  // end\n"),
+        (vec!["foo".to_string()], Vec::new()),
+        "書き換えていない呼び出しは前後に行を足しても blocking な modified のまま"
+    );
+}

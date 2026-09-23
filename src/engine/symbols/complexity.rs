@@ -47,12 +47,15 @@ fn function_boundary_kinds(lang_id: LangId) -> &'static [&'static str] {
         // `tokio::spawn(async move { ... })` の中身が外側関数の cx へ加算され、
         // 同じロジックを closure で書いた場合と値が食い違う (同一言語内の非対称)。
         LangId::Rust => &["function_item", "closure_expression", "async_block"],
+        // 式形式の generator (`const g = function* () {}`) も境界。宣言形式だけを
+        // 列挙していると、ネストした generator 式の分岐が外側関数の cx へ加算される。
         LangId::Javascript | LangId::Typescript | LangId::Tsx => &[
             "function_declaration",
             "function_expression",
             "arrow_function",
             "method_definition",
             "generator_function_declaration",
+            "generator_function",
         ],
         LangId::Python => &["function_definition", "lambda"],
         LangId::Go => &["function_declaration", "method_declaration", "func_literal"],

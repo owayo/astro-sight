@@ -12,8 +12,6 @@ pub(crate) use php::PhpMemberLiveness;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::engine::refs;
-
 /// duplicate な同名 class member の liveness 判定結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MemberStatus {
@@ -55,10 +53,11 @@ impl SetAccum {
     }
 }
 
+/// count 経路と同じ走査集合 (生成物・hidden 配下の diff 候補を含む) を返す。
 fn collect_source_files(canonical_dir: &Path, extra_files: &[PathBuf]) -> Option<Vec<PathBuf>> {
-    let mut files = refs::collect_files(canonical_dir, None).ok()?;
-    refs::merge_extra_files(&mut files, canonical_dir, extra_files);
-    Some(files)
+    super::dead_code::collect_reference_scan(canonical_dir, extra_files)
+        .ok()
+        .map(|scan| scan.files)
 }
 
 fn status_from_counts(production: usize, tests: usize) -> MemberStatus {

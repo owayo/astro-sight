@@ -810,6 +810,53 @@ fn dead_code_declares_unanalyzable_sources() {
     );
 }
 
+/// 解析できないソースの申告は、候補の絞り込み (`--glob` / `--git`) ではなく
+/// **参照を数えた範囲** (ディレクトリ全体) に合わせる。
+///
+/// 旧実装は申告を候補の走査から出していたため、`--glob 'src/**/*.ts'` では `.vue` が
+/// glob に掛からず、`--git` では申告用の走査自体が無く、どちらも申告なしで `.vue` からしか
+/// 使われていない `helper` を dead と報告していた (参照集計は常に全体を見ているので、
+/// 「数えていない場所」が申告から消えていた)。同じ入力で `review --git` は申告していた。
+#[test]
+fn dead_code_declares_unanalyzable_sources_for_glob_and_git() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write("src/helper.ts", "export function helper() { return 42; }\n");
+    repo.write(
+        "src/App.vue",
+        "<script setup lang=\"ts\">\nimport { helper } from './helper';\nconsole.log(helper());\n</script>\n",
+    );
+    repo.init_git();
+    repo.commit_all("init");
+    repo.write(
+        "src/helper.ts",
+        "export function helper() { return 42; }\nexport function helper2() { return 1; }\n",
+    );
+
+    for args in [&["--glob", "src/**/*.ts"][..], &["--git"][..]] {
+        let json = repo.run_json("dead-code", args);
+        let truncations = json["truncations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{args:?}: .vue の申告が必要: {json}"));
+        assert!(
+            truncations
+                .iter()
+                .any(|t| t["reason"] == "unanalyzable_source"
+                    && t["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains("src/App.vue"))),
+            "{args:?}: {json}"
+        );
+    }
+
+    // 対照: 解析できないソースが無ければ、絞り込み経路でも truncations を出さない。
+    let clean = TestRepo::new();
+    clean.create_dir_all("src");
+    clean.write("src/api.ts", "export function trulyDead() { return 0; }\n");
+    let json = clean.run_json("dead-code", &["--glob", "src/**/*.ts"]);
+    assert!(json.get("truncations").is_none(), "{json}");
+}
+
 /// 画像やデータファイルは「解析できないソース」ではないので申告しない
 /// (全件申告するとノイズになり、本当に見落としているソースが埋もれる)。
 #[test]

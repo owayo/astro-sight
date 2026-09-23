@@ -110,4 +110,19 @@ pub struct ContextAnalysisOptions {
     /// workspace-relative の glob パターン。`refs::collect_files_with_excludes`
     /// で negative override として扱われる (先頭の `!` は不要)。
     pub exclude_globs: Vec<String>,
+
+    /// diff の new 側 (hunk の `+` 側の行番号が指す内容) がどこにあるか。
+    /// 変更ファイルの解析はこの内容に対して行う。
+    pub new_side: DiffNewSide,
+}
+
+/// diff の new 側の内容がどこにあるか。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DiffNewSide {
+    /// 作業ツリーのファイル (`git diff <base>` / `--diff` / `--diff-file` / stdin / session / MCP)。
+    #[default]
+    WorkingTree,
+    /// git の index (`--git --staged` = `git diff --cached <base>`)。作業ツリーに未ステージの
+    /// 変更があると、作業ツリーを読んだ時点で hunk の行番号と内容が食い違う。
+    Index,
 }

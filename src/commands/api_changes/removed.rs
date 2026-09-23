@@ -333,17 +333,17 @@ pub(crate) fn collect_external_import_bindings(
 
 /// 削除された bash 関数 `name` が、変更後ツリーの bash 系ファイル内のどこからも
 /// 参照されていないかを判定する。CLI スクリプトを別言語に書き換えたときに、
-/// 新言語側の同名定義/参照を「別物」として扱うため bash ファイル限定で検索する。
-/// 参照検索に失敗した場合は保守的に false を返してレビュー対象として残す。
-pub(crate) fn is_removed_bash_symbol_unreferenced(dir: &str, name: &str) -> bool {
-    let service = AppService::new();
-    let Ok(refs_result) = service.find_references(name, dir, None) else {
+/// 新言語側の同名定義/参照を「別物」として扱うため bash ファイル限定で判定する。
+///
+/// 参照は `detect_api_changes` の Phase 0 で構築済みの `index` から引く (削除 bash ファイルの
+/// 関数名は Phase 0 で検索対象に入れる)。旧実装は関数ごとに `find_references` で全リポジトリを
+/// 走査しており、削除関数 600 個で Stop hook の 120 秒制限に迫っていた。
+/// 未収集 / 検索失敗の name は保守的に false を返してレビュー対象として残す。
+pub(crate) fn is_removed_bash_symbol_unreferenced(index: &ApiRefIndex, name: &str) -> bool {
+    let Some(refs) = index.refs_for(name) else {
         return false;
     };
-    refs_result
-        .references
-        .iter()
-        .all(|r| !is_bash_script_path(r.path.as_str()))
+    refs.iter().all(|r| !is_bash_script_path(r.path.as_str()))
 }
 
 /// 拡張子から bash 系シェルスクリプトファイル（.sh / .bash / .zsh）かを判定する。
@@ -354,47 +354,47 @@ pub(crate) fn is_bash_script_path(file_path: &str) -> bool {
         .is_some_and(|ext| matches!(ext, "sh" | "bash" | "zsh"))
 }
 
-/// `git show <base>:<file_path>` の内容から bash 関数 `name` が `export -f` 等で
-/// 明示的にエクスポートされているか判定する。base 側の取得に失敗した場合は
-/// 保守的に false（未 export 扱い）を返す。
-pub(crate) fn bash_function_is_exported_in_git(
+/// `git show <base>:<file_path>` の内容から、`export -f` 等で明示的にエクスポートされた
+/// bash 関数名の集合を返す。base 側の取得に失敗した場合は空集合 (= すべて未 export 扱い)。
+///
+/// 関数ごとに `git show` を起動しないよう、呼び出し側はファイル単位で 1 回だけ呼ぶ。
+pub(crate) fn bash_exported_functions_in_git(
     dir: &str,
     base: &str,
     file_path: &str,
-    name: &str,
-) -> bool {
+) -> HashSet<String> {
     let Some(blob) = git_show_blob(dir, base, file_path) else {
-        return false;
+        return HashSet::new();
     };
     let Ok(text) = std::str::from_utf8(&blob) else {
-        return false;
+        return HashSet::new();
     };
-    bash_has_export_f(text, name)
+    bash_exported_function_names(text)
 }
 
-/// shell ソース文字列に `export -f <name>` / `declare -fx <name>` / `declare -xf <name>`
-/// による関数エクスポート宣言が含まれているかを判定する。
+/// shell ソース文字列の `export -f <name>` / `declare -fx <name>` / `declare -xf <name>`
+/// による関数エクスポート宣言から、エクスポートされた関数名を集める。
 ///
 /// 各行を `trim_start()` してから先頭一致を見るため、インデント付きの宣言にも対応する。
 /// 同一行に複数名を列挙する形式 (`export -f foo bar`) もサポートする。
-pub(crate) fn bash_has_export_f(source: &str, name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    pub(crate) const PREFIXES: &[&str] = &["export -f ", "declare -fx ", "declare -xf "];
+pub(crate) fn bash_exported_function_names(source: &str) -> HashSet<String> {
+    const PREFIXES: &[&str] = &["export -f ", "declare -fx ", "declare -xf "];
+    let mut names = HashSet::new();
     for line in source.lines() {
         let trimmed = line.trim_start();
         for prefix in PREFIXES {
             if let Some(rest) = trimmed.strip_prefix(prefix) {
-                for token in rest.split_whitespace() {
-                    if token == name {
-                        return true;
-                    }
-                }
+                names.extend(rest.split_whitespace().map(str::to_string));
             }
         }
     }
-    false
+    names
+}
+
+/// shell ソース文字列で関数 `name` が `export -f` 等でエクスポートされているかを判定する。
+#[cfg(test)]
+pub(crate) fn bash_has_export_f(source: &str, name: &str) -> bool {
+    bash_exported_function_names(source).contains(name)
 }
 
 /// Python のクラス内に存在するフィールド宣言 (`name: type` 形式) を集める。
@@ -490,19 +490,25 @@ pub(crate) fn collect_python_dataclass_fields(
 }
 
 /// Python の `@property def member(self) -> T` を `@dataclass` フィールド `member: T` に
-/// 置き換えた変更を検出する。
+/// 置き換えた変更を検出する (`obj.member` の属性アクセスは壊れない)。
 ///
-/// `qualname` は `Container.member` 形式の文字列。`diff_new_paths` 内のいずれかの新ファイルに
-/// 同名 `Container` クラスが存在し、その中に `member: type` の typed annotation 宣言が
-/// あれば、それが置き換え先のファイルパスであるとして返す。複数候補があれば最初のものを返す。
+/// `qualname` は `Container.member` 形式の文字列。次をすべて満たすときだけ置き換え先
+/// (`new_path`) を返す:
+/// - `old_path` が Python (他言語の `Container.member` 削除を .py の偶然の一致で降格しない)
+/// - base 側の `Container.member` が property (`@property` / `@cached_property`、setter 等の
+///   同名定義を含む) として定義されていた。素のメソッドをフィールドに置き換えると
+///   `obj.member()` が TypeError になるため
+/// - 変更後の**同じファイル** (`new_path`、rename なら新しいパス) の同名クラス `Container` に
+///   `member: type` の typed annotation 宣言がある。別ファイルの同名クラスへのフィールド追加は
+///   置き換えの根拠にならない
 ///
-/// `old_path` は削除シンボルの元ファイル。Python 以外なら対象外 (他言語の `Container.member`
-/// 削除が、diff 内 .py の偶然の同名 class+field で informational に降格するのを防ぐ)。
+/// base 側を読めない・解析できない場合は None (removed として扱う側に倒す)。
 pub(crate) fn detect_python_property_to_field(
     dir: &str,
+    base: &str,
     old_path: &str,
+    new_path: &str,
     qualname: &str,
-    diff_new_paths: &HashSet<String>,
 ) -> Option<String> {
     if !matches!(
         crate::language::LangId::from_path(camino::Utf8Path::new(old_path)),
@@ -518,24 +524,18 @@ pub(crate) fn detect_python_property_to_field(
     if member.contains('.') {
         return None;
     }
-    // 複数の新規ファイルが同名クラス・同名フィールドを持つ場合に「最初の 1 件」を
-    // 決めるため、パス昇順で走査する。`diff_new_paths` は HashSet なので、そのまま
-    // 反復すると実行ごとに違うファイルが報告先になる。
-    let mut candidates: Vec<&String> = diff_new_paths.iter().collect();
-    candidates.sort_unstable();
-    for new_path in candidates {
-        if !std::path::Path::new(new_path)
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case("py"))
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let fields = extract_python_class_fields(dir, new_path, container);
-        if fields.contains(member) {
-            return Some(new_path.clone());
-        }
+    if !std::path::Path::new(new_path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("py"))
+    {
+        return None;
     }
-    None
+    if !extract_python_class_fields(dir, new_path, container).contains(member) {
+        return None;
+    }
+    let old_source = git_show_blob(dir, base, old_path)?;
+    let old_tree = parser::parse_source(&old_source, crate::language::LangId::Python).ok()?;
+    python_member_is_property(old_tree.root_node(), &old_source, qualname)
+        .then(|| new_path.to_string())
 }

@@ -263,29 +263,22 @@ fn find_binding_in_subtree(
 /// binding パターン (identifier / destructuring / rest / default) が `name` を束縛するか。
 /// `ts_const_arg` の binding 列挙とロジックを共有する (検出漏れ = shadow 見逃し =
 /// fail-open になるため、実装を 2 箇所に分けない)。
+///
+/// 束縛位置の規則 (pair_pattern は value 側のみ、default 値 `{ a = X }` / `(a = X)` の
+/// 右辺は参照なので left 側のみ) は [`visit_pattern_bindings`] に集約している。右辺まで
+/// 辿ると `function f(other = SHARED_DEPS)` の SHARED_DEPS を parameter binding と誤認し、
+/// binding 一意性を見る `ts_const_arg` で降格できるケースを取り逃す。
+///
+/// [`visit_pattern_bindings`]: crate::engine::js_binding_pattern::visit_pattern_bindings
 pub(crate) fn pattern_binds_name(pattern: Node<'_>, source: &[u8], name: &str) -> bool {
-    match pattern.kind() {
-        "identifier" | "shorthand_property_identifier_pattern" => {
-            pattern.utf8_text(source).ok() == Some(name)
+    crate::engine::js_binding_pattern::visit_pattern_bindings(pattern, &mut |binding| {
+        if binding.utf8_text(source).ok() == Some(name) {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
         }
-        // property key 側 (`{ key: alias }` の key) は binding ではないので value 側のみ辿る。
-        "pair_pattern" => pattern
-            .child_by_field_name("value")
-            .is_some_and(|v| pattern_binds_name(v, source, name)),
-        // default 値 (`{ a = X }` / `(a = X)` の右辺) は binding ではなく参照なので left のみ辿る。
-        // 右辺まで辿ると `function f(other = SHARED_DEPS)` の SHARED_DEPS を parameter binding と
-        // 誤認する (shadow 判定では「除外しない」方向の保守側だが、binding 一意性を見る
-        // `ts_const_arg` では降格できるケースを取り逃す false positive になる)。
-        "assignment_pattern" | "object_assignment_pattern" => pattern
-            .child_by_field_name("left")
-            .is_some_and(|l| pattern_binds_name(l, source, name)),
-        _ => {
-            let mut cursor = pattern.walk();
-            pattern
-                .named_children(&mut cursor)
-                .any(|c| pattern_binds_name(c, source, name))
-        }
-    }
+    })
+    .is_break()
 }
 
 /// import 文が `name` をローカル binding として導入するか (default / named / alias / namespace)。

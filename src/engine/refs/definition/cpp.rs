@@ -1,10 +1,13 @@
-//! C/C++ の定義コンテキスト判定。
+//! C/C++ の定義コンテキスト判定と、マクロ本体由来の参照源。
 //!
 //! `struct X` / `enum X` の型使用が `*_specifier` 配下に現れるため、汎用の
 //! parent/grandparent 判定ではパラメータ型やローカル変数型まで Definition に
 //! 化ける。本体付き tag 定義・関数本体付き定義の名前だけを Definition とする。
 
 use tree_sitter::Node;
+
+use crate::engine::refs::{LineIndex, absolute_position};
+use crate::language::LangId;
 
 /// C/C++ は `struct X` / `enum X` の型使用が `*_specifier` 配下に現れるため、
 /// 汎用 parent/grandparent 判定だとパラメータ型やローカル変数型まで Definition になる。
@@ -256,4 +259,125 @@ fn typedef_declarator_leaf(decl: Node<'_>) -> Option<Node<'_>> {
             .child_by_field_name("declarator")
             .and_then(typedef_declarator_leaf),
     }
+}
+
+/// C/C++ のマクロ定義本体 (`#define NAME body` / `#define F(x) body` の `preproc_arg`) を
+/// 識別子トークンへ分割し、参照セグメント `(name, row, col)` として返す。
+///
+/// tree-sitter-c/cpp は `preproc_arg` を不透明なテキストとして返すため、
+/// `#define CLAMP(v) clamp_impl((v), 0, 255)` 経由でしか使われない `clamp_impl` が
+/// 参照 0 件で dead に出ていた (`refs` も定義行しか返さなかった)。
+///
+/// 文字列・文字リテラルとコメント (`preproc_arg` は行末の `// ...` を含み得る) の中は
+/// 数えず、数値リテラル (`0x1Fu` / `1e10` / `1'000`) の断片も識別子にしない。
+/// マクロ仮引数 (`v`) や `##` で連結される断片も参照として数えられるが、
+/// 「参照を過大に数える = dead と断定しない」保守側として許容する。
+/// `#pragma` / `#error` 等 (`preproc_call`) の引数は散文を含み得るので対象外。
+pub(crate) fn cpp_macro_body_ref_segments<'a>(
+    node: Node<'_>,
+    source: &'a [u8],
+    lang_id: LangId,
+) -> Vec<(&'a str, usize, usize)> {
+    if !matches!(lang_id, LangId::C | LangId::Cpp) || node.kind() != "preproc_arg" {
+        return Vec::new();
+    }
+    let is_macro_body = node.parent().is_some_and(|parent| {
+        matches!(parent.kind(), "preproc_def" | "preproc_function_def")
+            && parent
+                .child_by_field_name("value")
+                .is_some_and(|value| value.id() == node.id())
+    });
+    if !is_macro_body {
+        return Vec::new();
+    }
+    let Some(body) = source.get(node.byte_range()) else {
+        return Vec::new();
+    };
+    let tokens = macro_body_identifier_tokens(body);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    // 継続行 (`\` 改行) を含む本体では 2 行目以降の位置がずれるため、本体内の相対位置を
+    // 行索引で求めてからファイル上の位置へ変換する。
+    let lines = LineIndex::new(body);
+    let base = node.start_position();
+    tokens
+        .into_iter()
+        .filter_map(|(start, end)| {
+            let text = std::str::from_utf8(&body[start..end]).ok()?;
+            let rel = lines.row_col(body.len(), start);
+            let (row, col) = absolute_position((base.row, base.column), rel);
+            Some((text, row, col))
+        })
+        .collect()
+}
+
+/// マクロ本体テキストから識別子トークンの byte 範囲 `(start, end)` を列挙する。
+///
+/// 非 ASCII バイトは識別子の構成文字として扱う (トークン境界が必ず ASCII 上に来るので、
+/// 切り出した範囲は UTF-8 として正しいまま)。
+fn macro_body_identifier_tokens(body: &[u8]) -> Vec<(usize, usize)> {
+    let is_ident_start = |b: u8| b == b'_' || b.is_ascii_alphabetic() || b >= 0x80;
+    let is_ident_continue = |b: u8| is_ident_start(b) || b.is_ascii_digit();
+    let n = body.len();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let b = body[i];
+        let next = body.get(i + 1).copied();
+        if b == b'/' && next == Some(b'/') {
+            // 行コメント: 行末まで。
+            i = body[i..]
+                .iter()
+                .position(|&c| c == b'\n')
+                .map_or(n, |p| i + p);
+        } else if b == b'/' && next == Some(b'*') {
+            i = body[i + 2..]
+                .windows(2)
+                .position(|w| w == b"*/")
+                .map_or(n, |p| i + 2 + p + 2);
+        } else if b == b'"' || b == b'\'' {
+            // 文字列・文字リテラル。閉じ引用符まで (エスケープは 1 文字読み飛ばす)。
+            let mut j = i + 1;
+            while j < n && body[j] != b {
+                j += if body[j] == b'\\' { 2 } else { 1 };
+            }
+            i = (j + 1).min(n);
+        } else if b.is_ascii_digit() || (b == b'.' && next.is_some_and(|c| c.is_ascii_digit())) {
+            // pp-number (`0x1Fu` / `1e+10` / `1'000'000`)。数値の途中の英字を識別子にしない。
+            let mut j = i + 1;
+            while j < n {
+                let c = body[j];
+                // 指数部の符号 (`1e+10` / `0x1p-3`) も数値の一部。
+                let exponent_sign =
+                    matches!(c, b'+' | b'-') && matches!(body[j - 1], b'e' | b'E' | b'p' | b'P');
+                if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || exponent_sign {
+                    j += 1;
+                } else if c == b'\'' && body.get(j + 1).is_some_and(u8::is_ascii_alphanumeric) {
+                    j += 2;
+                } else {
+                    break;
+                }
+            }
+            i = j.min(n);
+        } else if is_ident_start(b) {
+            let mut j = i + 1;
+            while j < n && is_ident_continue(body[j]) {
+                j += 1;
+            }
+            // 文字列の接頭辞 (`L"..."` / `u8"..."` / `R"(...)"`) は識別子ではない。
+            let is_literal_prefix = matches!(body.get(j), Some(b'"' | b'\''))
+                && matches!(
+                    &body[i..j],
+                    b"L" | b"u" | b"U" | b"u8" | b"R" | b"LR" | b"uR" | b"UR" | b"u8R"
+                );
+            if !is_literal_prefix {
+                out.push((i, j));
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
 }

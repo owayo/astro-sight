@@ -6,7 +6,7 @@ use crate::models::review::{ApiSymbol, DeadSymbol, ReviewResult};
 use crate::models::skip::SkipInfo;
 use crate::service::AppService;
 
-use super::api_changes::detect_api_changes;
+use super::api_changes::{api_diff_files, detect_api_changes};
 use crate::output::{OutputOptions, serialize_cli_document};
 
 use super::common::{MAX_INPUT_SIZE, log_phase, read_to_string_limited, timed, timed_ok};
@@ -144,9 +144,12 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
     let impact = timed_ok("context", || {
         // review の `--exclude-dir` / `--exclude-glob` は impact 解析と dead_symbols の
         // 両方に作用させる (v26.5.117 で挙動を統一)。
+        // `--git --staged` では変更ファイルを index の内容で解析する (hunk の行番号は index を
+        // 指す)。API 差分・dead-code は従来どおり作業ツリーを読む。
         let context_options = crate::models::impact::ContextAnalysisOptions {
             exclude_dirs: extra_exclude_dirs.to_vec(),
             exclude_globs: extra_exclude_globs.to_vec(),
+            new_side: super::git_input::diff_new_side(diff, diff_file, git, staged),
         };
         service.analyze_context(&diff_input, dir, &context_options)
     })?;
@@ -179,8 +182,10 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
         )
     })?;
 
-    // 5. API 公開面の差分
-    let api_changes = timed("api_changes", || detect_api_changes(dir, base, &diff_files));
+    // 5. API 公開面の差分 (内容同一の rename も含めて見る。`api_diff_files` 参照)
+    let api_changes = timed("api_changes", || {
+        detect_api_changes(dir, base, &api_diff_files(&diff_files, &diff_input))
+    });
 
     // 6. dead symbol 検出
     let dead_opts = ReviewDeadSymbolsOpts {
@@ -216,7 +221,13 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
     };
 
     if hook {
-        return review_hook_output(&result, dir, strict_public_const_values);
+        return review_hook_output(
+            &result,
+            dir,
+            strict_public_const_values,
+            &diff_input,
+            &diff_files,
+        );
     }
 
     let text = serialize_cli_document(&result, output)?;
@@ -255,7 +266,8 @@ fn emit_review_short_circuit(
     };
 
     if hook {
-        return review_hook_output(&result, dir, strict_const_values);
+        // 解析へ進まない経路なので impact も空 = diff 内の解決判定も要らない。
+        return review_hook_output(&result, dir, strict_const_values, "", &[]);
     }
 
     let text = serialize_cli_document(&result, output)?;

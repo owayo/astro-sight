@@ -1449,3 +1449,91 @@ fn build_review_hook_json_api_modified_carries_field_contract_change() {
         "{hook_json}"
     );
 }
+
+/// `review --hook` の「diff 内で解決済み」判定も `impact --hook` と同じ (`DiffCallerResolution`)。
+/// 影響分析の結果に現れない diff 内ファイル (トップレベルの呼び出しだけを更新したスクリプト) は、
+/// 呼び出し行そのものが変更されていれば解決済み、そうでなければ未解決のまま blocking。
+#[test]
+fn build_review_hook_json_resolves_updated_call_line_in_diff_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dir_str = dir.path().to_str().expect("utf-8 path");
+    fs::write(
+        dir.path().join("util.py"),
+        "def helper(a, b):\n    return a\n",
+    )
+    .expect("util");
+    fs::write(
+        dir.path().join("script.py"),
+        "from util import helper\n\nprint(helper(1, 2))\n",
+    )
+    .expect("script");
+    let result = ReviewResult {
+        impact: crate::models::impact::ContextResult {
+            changes: vec![crate::models::impact::FileImpact {
+                path: "util.py".to_string(),
+                hunks: Vec::new(),
+                affected_symbols: vec![crate::models::impact::AffectedSymbol {
+                    name: "helper".to_string(),
+                    kind: "function".to_string(),
+                    change_type: "modified".to_string(),
+                }],
+                signature_changes: Vec::new(),
+                impacted_callers: vec![crate::models::impact::ImpactedCaller {
+                    path: "script.py".to_string(),
+                    name: "<module>".to_string(),
+                    line: 2,
+                    symbols: vec!["helper".to_string()],
+                    confidence: None,
+                }],
+                low_confidence_callers: Vec::new(),
+                informational_callers: Vec::new(),
+            }],
+            skipped: None,
+            truncations: Vec::new(),
+        },
+        missing_cochanges: Vec::new(),
+        cochange_diagnostics: Default::default(),
+        api_changes: ApiChanges {
+            added: Vec::new(),
+            removed: Vec::new(),
+            modified: Vec::new(),
+            moved: Vec::new(),
+            property_to_field: Vec::new(),
+            removed_dead: Vec::new(),
+            modified_closed_in_diff: Vec::new(),
+            const_value_changes: Vec::new(),
+            compatible_modified: Vec::new(),
+        },
+        dead_symbols: Vec::new(),
+        test_only_symbols: Vec::new(),
+        skipped: None,
+        truncations: Vec::new(),
+    };
+    let util_diff = "--- a/util.py\n+++ b/util.py\n@@ -1,2 +1,2 @@\n-def helper(a):\n+def helper(a, b):\n     return a\n";
+    let build_for = |diff: &str| {
+        let diff_files = crate::engine::diff::parse_unified_diff(diff);
+        build_review_hook_json_for_diff(&result, dir_str, false, diff, &diff_files)
+    };
+
+    let updated_call = format!(
+        "{util_diff}--- a/script.py\n+++ b/script.py\n@@ -1,3 +1,3 @@\n from util import helper\n \n-print(helper(1))\n+print(helper(1, 2))\n"
+    );
+    let build = build_for(&updated_call);
+    assert!(
+        !build.is_blocking,
+        "更新済みの呼び出し行は解決済み: {:?}",
+        build.value
+    );
+
+    // 対照: 同じファイルが diff に含まれても、呼び出し行が変わっていなければ blocking。
+    let other_line_only = format!(
+        "{util_diff}--- a/script.py\n+++ b/script.py\n@@ -1,3 +1,3 @@\n-import util\n+from util import helper\n \n print(helper(1, 2))\n"
+    );
+    let build = build_for(&other_line_only);
+    let hook_json = build.value.expect("blocking な impacts を出すべき");
+    assert!(build.is_blocking, "{hook_json}");
+    assert_eq!(
+        hook_json["impacts"][0]["refs"][0]["p"], "script.py",
+        "{hook_json}"
+    );
+}

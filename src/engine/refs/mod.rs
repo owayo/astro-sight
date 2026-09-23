@@ -24,9 +24,11 @@ use crate::language::{LangId, normalize_identifier};
 use crate::models::reference::{RefKind, SymbolReference};
 use crate::models::skip::SkippedFiles;
 
+pub(crate) use files::detect_source_lang;
 pub use files::{
     FileCollection, FileScanOptions, collect_files, collect_files_scan,
     collect_files_scan_with_excludes, collect_files_with_excludes, merge_extra_files,
+    skipped_files_from_relative,
 };
 pub(crate) use line_index::{LineIndex, absolute_position, byte_offset_to_row_col};
 pub(crate) use role::RefUsageRole;
@@ -161,6 +163,17 @@ impl<'n> SingleNamePrefilter<'n> {
     }
 }
 
+/// 利用者向け参照検索 1 回分の走査結果。
+#[derive(Debug)]
+pub struct RefScan<T> {
+    pub references: T,
+    /// 生成物として走査から外したファイル (出力の `skipped`)。
+    pub skipped: Option<SkippedFiles>,
+    /// 走査対象に選んだが、読み込み・parse に失敗して参照を数えられなかったファイル数。
+    /// 0 でなければ参照件数は入力の一部しか数えていない (`complete_input` = false)。
+    pub failed_files: usize,
+}
+
 /// 指定シンボルへの参照をディレクトリ内のファイルから検索する。
 /// glob パターン（例: "**/*.rs"）によるフィルタも可能。
 pub fn find_references(
@@ -168,7 +181,10 @@ pub fn find_references(
     dir: &Path,
     glob_pattern: Option<&str>,
 ) -> Result<Vec<SymbolReference>> {
-    Ok(find_references_with_scan(symbol_name, dir, glob_pattern, FileScanOptions::default())?.0)
+    Ok(
+        find_references_with_scan(symbol_name, dir, glob_pattern, FileScanOptions::default())?
+            .references,
+    )
 }
 
 /// Reference search with generated-file omission metadata for user-facing scans.
@@ -177,7 +193,7 @@ pub fn find_references_with_scan(
     dir: &Path,
     glob_pattern: Option<&str>,
     options: FileScanOptions,
-) -> Result<(Vec<SymbolReference>, Option<SkippedFiles>)> {
+) -> Result<RefScan<Vec<SymbolReference>>> {
     let collection = collect_files_scan(dir, glob_pattern, options)?;
     let skipped = collection.skipped(dir);
     let files = collection.files;
@@ -186,22 +202,31 @@ pub fn find_references_with_scan(
     let prefilter = SingleNamePrefilter::new(symbol_name)?;
 
     // per-file Vec を全ファイル分保持せず、worker local の Vec へ直接統合する。
-    let mut all_refs: Vec<SymbolReference> = pool.install(|| {
+    // 読み込み・parse に失敗したファイルは参照 0 件と区別できるよう件数だけ数える。
+    let (mut all_refs, failed_files): (Vec<SymbolReference>, usize) = pool.install(|| {
         files
             .into_par_iter()
-            .fold(Vec::new, |mut local, path| {
-                if let Some(path_str) = path.to_str() {
-                    let utf8_path = camino::Utf8Path::new(path_str);
-                    if let Ok(mut refs) = find_refs_in_file(symbol_name, utf8_path, &prefilter) {
-                        local.append(&mut refs);
+            .fold(
+                || (Vec::new(), 0usize),
+                |(mut local, mut failed), path| {
+                    let scanned = path.to_str().and_then(|path_str| {
+                        let utf8_path = camino::Utf8Path::new(path_str);
+                        find_refs_in_file(symbol_name, utf8_path, &prefilter).ok()
+                    });
+                    match scanned {
+                        Some(mut refs) => local.append(&mut refs),
+                        None => failed += 1,
                     }
-                }
-                local
-            })
-            .reduce(Vec::new, |mut acc, mut local| {
-                acc.append(&mut local);
-                acc
-            })
+                    (local, failed)
+                },
+            )
+            .reduce(
+                || (Vec::new(), 0usize),
+                |(mut acc, acc_failed), (mut local, local_failed)| {
+                    acc.append(&mut local);
+                    (acc, acc_failed + local_failed)
+                },
+            )
     });
 
     // Angular template (`*.component.html` / inline `template:`) のバインディング式から
@@ -217,7 +242,11 @@ pub fn find_references_with_scan(
 
     sort_references(&mut all_refs);
 
-    Ok((all_refs, skipped))
+    Ok(RefScan {
+        references: all_refs,
+        skipped,
+        failed_files,
+    })
 }
 
 fn sort_references(refs: &mut [SymbolReference]) {
@@ -245,14 +274,17 @@ fn find_refs_in_file(
 ) -> Result<Vec<SymbolReference>> {
     let source = parser::read_file(path)?;
 
-    // ファイル言語を拡張子から先読みし、CI 言語ではバイト事前フィルタを skip
+    // ファイル言語を先読みし、CI 言語ではバイト事前フィルタを skip
     // (memchr は case-sensitive のため Xojo の `MyVar`/`myvar` 一致を取りこぼす)。
-    let ext_lang = LangId::from_path(path).ok();
-    let is_ci = ext_lang.is_some_and(|l| l.is_case_insensitive());
+    // 拡張子で決まらなければ parse と同じく shebang で判定する。拡張子だけで見ると
+    // `bin/console` (`#!/usr/bin/env php`) のような拡張子なし PHP が大小区別の memmem に
+    // 落ち、batch 経路 (AC は常に ASCII CI) が返す大小違いの呼び出しを single だけが落とす。
+    let detected_lang = LangId::detect(path, source.as_bytes()).ok();
+    let is_ci = detected_lang.is_some_and(|l| l.is_case_insensitive());
     if !is_ci {
         // PHP は関数/メソッド/クラス名が case-insensitive なため、大小無視で事前フィルタして
         // case 違いの参照を取りこぼさない。他の case-sensitive 言語は従来どおり memmem で弾く。
-        let present = if ext_lang == Some(LangId::Php) {
+        let present = if detected_lang == Some(LangId::Php) {
             prefilter.ci.is_match(source.as_bytes())
         } else {
             prefilter.exact.find(&source).is_some()
@@ -263,7 +295,7 @@ fn find_refs_in_file(
     }
 
     // lexer-only 言語は parse_file を呼ばず lexer 経由で identifier 列挙する。
-    if let Some(lang) = ext_lang
+    if let Some(lang) = detected_lang
         && let crate::language::DetectedLang::LexerOnly(lexer_lang) = lang.detected()
     {
         return Ok(find_refs_via_lexer(symbol_name, &source, path, lexer_lang));
@@ -322,7 +354,7 @@ pub fn find_references_batch(
         glob_pattern,
         FileScanOptions::default(),
     )?
-    .0)
+    .references)
 }
 
 type ReferenceBatchMap = std::collections::HashMap<String, Vec<SymbolReference>>;
@@ -333,11 +365,15 @@ pub fn find_references_batch_with_scan(
     dir: &Path,
     glob_pattern: Option<&str>,
     options: FileScanOptions,
-) -> Result<(ReferenceBatchMap, Option<SkippedFiles>)> {
+) -> Result<RefScan<ReferenceBatchMap>> {
     use std::collections::HashMap;
 
     if symbol_names.is_empty() {
-        return Ok((HashMap::new(), None));
+        return Ok(RefScan {
+            references: HashMap::new(),
+            skipped: None,
+            failed_files: 0,
+        });
     }
 
     let collection = collect_files_scan(dir, glob_pattern, options)?;
@@ -353,33 +389,36 @@ pub fn find_references_batch_with_scan(
         crate::engine::angular_template_refs::AngularBatchContext::prepare(dir, glob_pattern);
 
     // fold/reduce: ワーカーごとに Vec<Vec<SymbolReference>> を持ち、直接統合する。
-    let mut buckets: Vec<Vec<SymbolReference>> = pool.install(|| {
+    // 読み込み・parse に失敗したファイルは参照 0 件と区別できるよう件数だけ数える
+    // (どの名前の参照が欠けたかは分からないので、全名前の入力が不完全になる)。
+    let (mut buckets, failed_files): (Vec<Vec<SymbolReference>>, usize) = pool.install(|| {
         files
             .par_iter()
             .fold(
-                || vec![Vec::new(); symbol_names.len()],
-                |mut local, path| {
-                    let Some(path_str) = path.to_str() else {
-                        return local;
-                    };
-                    let utf8_path = camino::Utf8Path::new(path_str);
-                    if let Ok(per_file) =
-                        find_refs_batch_in_file_indexed(symbol_names, &acs, utf8_path)
-                    {
-                        for (ix, mut refs) in per_file.into_iter().enumerate() {
-                            local[ix].append(&mut refs);
+                || (vec![Vec::new(); symbol_names.len()], 0usize),
+                |(mut local, mut failed), path| {
+                    let scanned = path.to_str().and_then(|path_str| {
+                        let utf8_path = camino::Utf8Path::new(path_str);
+                        find_refs_batch_in_file_indexed(symbol_names, &acs, utf8_path).ok()
+                    });
+                    match scanned {
+                        Some(per_file) => {
+                            for (ix, mut refs) in per_file.into_iter().enumerate() {
+                                local[ix].append(&mut refs);
+                            }
                         }
+                        None => failed += 1,
                     }
-                    local
+                    (local, failed)
                 },
             )
             .reduce(
-                || vec![Vec::new(); symbol_names.len()],
-                |mut acc, mut local| {
+                || (vec![Vec::new(); symbol_names.len()], 0usize),
+                |(mut acc, acc_failed), (mut local, local_failed)| {
                     for (acc_refs, local_refs) in acc.iter_mut().zip(local.iter_mut()) {
                         acc_refs.append(local_refs);
                     }
-                    acc
+                    (acc, acc_failed + local_failed)
                 },
             )
     });
@@ -405,7 +444,11 @@ pub fn find_references_batch_with_scan(
         }
     }
 
-    Ok((merged, skipped))
+    Ok(RefScan {
+        references: merged,
+        skipped,
+        failed_files,
+    })
 }
 
 /// impact analyze 用: symbol_names を AC 事前フィルタで 1 回構築して返す。
@@ -419,14 +462,44 @@ pub(crate) fn build_ac_case_insensitive(
         .map_err(|e| anyhow::anyhow!("Failed to build pattern matcher: {e}"))
 }
 
-/// dead-code 判定用 (追加ファイル対応版)。通常の workspace walk で得たファイルに、
+/// dead-code 判定用 (追加ファイル対応版)。workspace walk で得たファイルに、
 /// diff 由来などの明示ファイルを canonical path で追加して参照件数を集計する。
 /// hidden ディレクトリ配下でも候補になったファイル自身の参照を取りこぼさないために使う。
+///
+/// 走査条件は dead-code の参照集計 ([`FileScanOptions::DEAD_CODE_REFERENCES`]) と同じで、
+/// 生成物も参照元として数える。
 pub fn count_non_definition_refs_split_with_extra_files<F>(
     symbol_names: &[String],
     dir: &Path,
     glob_pattern: Option<&str>,
     extra_files: &[std::path::PathBuf],
+    is_test: F,
+) -> Result<std::collections::HashMap<String, (usize, usize)>>
+where
+    F: Fn(&Path) -> bool + Sync,
+{
+    if symbol_names.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let canonical_dir = std::fs::canonicalize(dir)?;
+    let mut files = collect_files_scan(
+        &canonical_dir,
+        glob_pattern,
+        FileScanOptions::DEAD_CODE_REFERENCES,
+    )?
+    .files;
+    merge_extra_files(&mut files, &canonical_dir, extra_files);
+    count_non_definition_refs_split_in_files(symbol_names, &files, is_test)
+}
+
+/// 呼び出し側が収集済みの走査集合 `files` で、非 Definition 参照件数を production / test 別に数える。
+///
+/// dead-code は走査集合を 1 度だけ収集し、参照件数・member liveness・解析できないソースの
+/// 申告を同じ集合から導く (走査の条件を各所で書き直して範囲がずれるのを防ぐ)。
+pub fn count_non_definition_refs_split_in_files<F>(
+    symbol_names: &[String],
+    files: &[std::path::PathBuf],
     is_test: F,
 ) -> Result<std::collections::HashMap<String, (usize, usize)>>
 where
@@ -438,10 +511,6 @@ where
     if symbol_names.is_empty() {
         return Ok(HashMap::new());
     }
-
-    let canonical_dir = std::fs::canonicalize(dir)?;
-    let mut files = collect_files(&canonical_dir, glob_pattern)?;
-    merge_extra_files(&mut files, &canonical_dir, extra_files);
 
     let n = symbol_names.len();
     // shared atomic counters: rayon の fold バケットで `(vec![0; n], vec![0; n])` を

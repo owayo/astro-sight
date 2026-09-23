@@ -138,17 +138,24 @@ fn function_node_kinds(lang_id: LangId) -> &'static [&'static str] {
         LangId::Rust => &["function_item"],
         LangId::C | LangId::Cpp => &["function_definition"],
         LangId::Python => &["function_definition"],
+        // generator (`function* gen()` / `const g = function* () {}`) も呼び出し元になる。
+        // 列挙しないと generator 内の呼び出しが外側の関数へ誤帰属するか、トップレベルの
+        // generator では edge ごと消える。
         LangId::Javascript => &[
             "function_declaration",
             "method_definition",
             "arrow_function",
             "function_expression",
+            "generator_function_declaration",
+            "generator_function",
         ],
         LangId::Typescript | LangId::Tsx => &[
             "function_declaration",
             "method_definition",
             "arrow_function",
             "function_expression",
+            "generator_function_declaration",
+            "generator_function",
         ],
         LangId::Go => &["function_declaration", "method_declaration"],
         LangId::Php => &["function_definition", "method_declaration"],
@@ -178,8 +185,10 @@ fn find_function_name(node: Node<'_>, source: &[u8], lang_id: LangId) -> Option<
     if matches!(
         lang_id,
         LangId::Javascript | LangId::Typescript | LangId::Tsx
-    ) && matches!(node.kind(), "arrow_function" | "function_expression")
-    {
+    ) && matches!(
+        node.kind(),
+        "arrow_function" | "function_expression" | "generator_function"
+    ) {
         return js_ts_binding_name_for_function(node, source);
     }
 
@@ -291,11 +300,17 @@ fn c_function_name_from_declarator(decl: Node<'_>, source: &[u8]) -> Option<Stri
 /// 言語別の call expression 用 tree-sitter クエリを返す。
 fn call_query(lang_id: LangId) -> &'static str {
     match lang_id {
+        // turbofish 付き呼び出し (`parse::<u8>()` / `s.fetch::<u32>()` / `T::make::<i32>()`) は
+        // function が `generic_function` に包まれる。列挙しないと calls / sequence から
+        // 呼び出しごと消える (refs / dead-code 側は generic_function を透過済み)。
         LangId::Rust => {
             r#"
             (call_expression function: (identifier) @direct.callee)
             (call_expression function: (field_expression field: (field_identifier) @method.callee))
             (call_expression function: (scoped_identifier name: (identifier) @scoped.callee))
+            (call_expression function: (generic_function function: (identifier) @direct.callee))
+            (call_expression function: (generic_function function: (field_expression field: (field_identifier) @method.callee)))
+            (call_expression function: (generic_function function: (scoped_identifier name: (identifier) @scoped.callee)))
             "#
         }
         LangId::C => {
@@ -334,10 +349,12 @@ fn call_query(lang_id: LangId) -> &'static str {
             (call_expression function: (selector_expression field: (field_identifier) @method.callee))
             "#
         }
+        // nullsafe 呼び出し `$a?->fmt()` は member_call_expression とは別ノード。
         LangId::Php => {
             r#"
             (function_call_expression function: (name) @direct.callee)
             (member_call_expression name: (name) @method.callee)
+            (nullsafe_member_call_expression name: (name) @method.callee)
             (scoped_call_expression name: (name) @scoped.callee)
             "#
         }
@@ -699,5 +716,51 @@ mod tests {
             callers.contains(&"wrapper"),
             "匿名 callback は外側 named function へ帰属: {callers:?}"
         );
+    }
+
+    /// Rust の turbofish 付き呼び出しと PHP の nullsafe 呼び出しも callee として捕捉する。
+    /// どちらも通常の呼び出しとは別ノードに包まれ、旧クエリでは calls / sequence から消えていた。
+    #[test]
+    fn rust_turbofish_and_php_nullsafe_calls_are_captured() {
+        let rust = b"fn run(s: &Store) -> u32 { s.fetch::<u32>() + parse::<u8>() + Wrapper::make::<i32>() + plain() }\n";
+        let tree = parser::parse_source(rust, LangId::Rust).unwrap();
+        let edges = extract_calls(tree.root_node(), rust, LangId::Rust, None).unwrap();
+        let mut callees: Vec<&str> = edges.iter().map(|e| e.callee.name.as_str()).collect();
+        callees.sort_unstable();
+        assert_eq!(callees, ["fetch", "make", "parse", "plain"], "{edges:?}");
+
+        let php = b"<?php\nfunction f($a) { return $a?->fmt() . $a->plain(); }\n";
+        let tree = parser::parse_source(php, LangId::Php).unwrap();
+        let edges = extract_calls(tree.root_node(), php, LangId::Php, None).unwrap();
+        let mut callees: Vec<&str> = edges.iter().map(|e| e.callee.name.as_str()).collect();
+        callees.sort_unstable();
+        assert_eq!(callees, ["fmt", "plain"], "{edges:?}");
+    }
+
+    /// generator (`function* gen()` / `const g = function* () {}`) も caller になる。
+    /// 列挙していないと、トップレベルの generator 内の呼び出しは edge ごと消え、
+    /// 関数内の generator 式の呼び出しは外側の関数へ誤帰属していた。
+    #[test]
+    fn ts_generator_functions_are_callers() {
+        let source = b"function target() {}\n\
+                       export function* gen() { target(); yield 1; }\n\
+                       function outer() {\n\
+                           const inner = function* () { target(); };\n\
+                           return inner;\n\
+                       }\n";
+        for lang in [LangId::Typescript, LangId::Javascript] {
+            let tree = parser::parse_source(source, lang).unwrap();
+            let edges = extract_calls(tree.root_node(), source, lang, None).unwrap();
+            let callers: Vec<&str> = edges
+                .iter()
+                .filter(|e| e.callee.name == "target")
+                .map(|e| e.caller.name.as_str())
+                .collect();
+            assert!(callers.contains(&"gen"), "{lang:?} callers: {callers:?}");
+            assert!(
+                callers.contains(&"inner") && !callers.contains(&"outer"),
+                "{lang:?} generator 式は binding 名に帰属する: {callers:?}"
+            );
+        }
     }
 }

@@ -1,4 +1,4 @@
-use crate::engine::diff::{HunkBodyLine, HunkProgress, parse_hunk_header};
+use crate::engine::diff::{HunkBodyLine, HunkProgress, parse_hunk_header, strip_header_path};
 use crate::language::{LangId, normalize_identifier};
 use crate::models::impact::{AffectedSymbol, SignatureChange};
 
@@ -10,6 +10,40 @@ pub(crate) fn detect_signature_changes(
     lang_id: LangId,
 ) -> Vec<SignatureChange> {
     let mut changes = Vec::new();
+    let (removed_lines, added_lines) = collect_changed_line_texts(diff_input, file_path);
+
+    for sym in affected {
+        if sym.kind != "function" && sym.kind != "method" {
+            continue;
+        }
+
+        let old_sig = find_signature_in_lines(&removed_lines, &sym.name, lang_id)
+            .map(|signature| normalize_signature_for_comparison(signature, lang_id));
+        let new_sig = find_signature_in_lines(&added_lines, &sym.name, lang_id)
+            .map(|signature| normalize_signature_for_comparison(signature, lang_id));
+
+        if let (Some(old), Some(new)) = (old_sig, new_sig)
+            && old != new
+        {
+            changes.push(SignatureChange {
+                name: sym.name.clone(),
+                old_signature: old,
+                new_signature: new,
+            });
+        }
+    }
+
+    changes
+}
+
+/// 対象ファイルの削除行 (`-`) と追加行 (`+`) の本文を出現順に集める。
+///
+/// 同じファイルが diff に複数回現れる入力では、最後に現れた区間だけを使う
+/// (`+++ b/<path>` のたびに集め直す、従来の `detect_signature_changes` と同じ規約)。
+pub(crate) fn collect_changed_line_texts(
+    diff_input: &str,
+    file_path: &str,
+) -> (Vec<String>, Vec<String>) {
     let mut in_file = false;
     let mut active_hunk: Option<HunkProgress> = None;
     let mut removed_lines = Vec::new();
@@ -39,7 +73,7 @@ pub(crate) fn detect_signature_changes(
         // 本文の `-` 行が対象ファイルの偽 signature 変更として計上される。
         if line.starts_with("--- ") {
             in_file = false;
-        } else if let Some(path) = line.strip_prefix("+++ b/") {
+        } else if let Some(path) = strip_header_path(line, "+++ b/") {
             in_file = path == file_path;
             if in_file {
                 removed_lines.clear();
@@ -54,28 +88,7 @@ pub(crate) fn detect_signature_changes(
         }
     }
 
-    for sym in affected {
-        if sym.kind != "function" && sym.kind != "method" {
-            continue;
-        }
-
-        let old_sig = find_signature_in_lines(&removed_lines, &sym.name, lang_id)
-            .map(|signature| normalize_signature_for_comparison(signature, lang_id));
-        let new_sig = find_signature_in_lines(&added_lines, &sym.name, lang_id)
-            .map(|signature| normalize_signature_for_comparison(signature, lang_id));
-
-        if let (Some(old), Some(new)) = (old_sig, new_sig)
-            && old != new
-        {
-            changes.push(SignatureChange {
-                name: sym.name.clone(),
-                old_signature: old,
-                new_signature: new,
-            });
-        }
-    }
-
-    changes
+    (removed_lines, added_lines)
 }
 
 fn normalize_signature_for_comparison(signature: String, lang_id: LangId) -> String {
@@ -194,7 +207,7 @@ pub(crate) fn is_symbol_in_changed_lines(
         // in_file を落とす)。
         if line.starts_with("--- ") {
             in_file = false;
-        } else if let Some(path) = line.strip_prefix("+++ b/") {
+        } else if let Some(path) = strip_header_path(line, "+++ b/") {
             in_file = path == file_path;
         } else if line.starts_with("+++ ") {
             in_file = false;
@@ -658,6 +671,35 @@ mod tests {
             ),
             "対象ファイル自身の変更行にある識別子は引き続き数えること"
         );
+    }
+
+    /// 空白を含むパスでは git がヘッダ行末に TAB を付ける (`+++ b/src/my util.ts\t`)。
+    /// TAB ごとパスとして比べると対象ファイルの変更行が 1 行も読まれず、シグネチャ変更も
+    /// 「名前が変更行に出る」判定も落ちていた。
+    #[test]
+    fn signature_detection_reads_header_paths_with_git_tab_suffix() {
+        let diff = "--- a/src/my util.ts\t\n+++ b/src/my util.ts\t\n@@ -1,3 +1,3 @@\n-export function helper(a: number): number {\n+export function helper(a: number, b: number): number {\n   return a;\n }\n";
+        let affected = vec![AffectedSymbol {
+            name: "helper".to_string(),
+            kind: "function".to_string(),
+            change_type: "modified".to_string(),
+        }];
+        let changes =
+            detect_signature_changes(diff, "src/my util.ts", &affected, LangId::Typescript);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert!(is_symbol_in_changed_lines(
+            diff,
+            "src/my util.ts",
+            "helper",
+            LangId::Typescript
+        ));
+        // 対照: 別ファイルの変更は拾わない。
+        assert!(!is_symbol_in_changed_lines(
+            diff,
+            "src/my",
+            "helper",
+            LangId::Typescript
+        ));
     }
 
     /// arity 比較: generics / ネスト括弧内のカンマはトップレベル引数として数えない。

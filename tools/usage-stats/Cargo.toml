@@ -11,7 +11,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 comfy-table = "8.0.0"
 serde_json = "1.0.151"
-dirs = "6"
+dirs = "7.0.0"
 
 [profile.release]
 lto = true

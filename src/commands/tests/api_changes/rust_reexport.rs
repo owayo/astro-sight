@@ -751,6 +751,69 @@ fn detect_api_changes_multi_level_super_reexport_resolves() {
     );
 }
 
+/// 非 ASCII 名のディレクトリ配下にある crate でも、base 側の `pub use` 再エクスポートを解決する。
+///
+/// base 側のファイル一覧 (`collect_rust_rs_files` の `git ls-tree`) が改行区切りだったため、
+/// 非 ASCII のパスが `"\343\203\204..."` とクォートされ、末尾の `"` で `.rs` 判定から全件落ちていた。
+/// `pub use` の辺を 1 本も集められず、再エクスポートで公開していた `helper` の削除が
+/// api.rm / rm_dead のどちらにも出なかった。同じ構成の ASCII 名 crate を対照として並べる。
+#[test]
+fn detect_api_changes_reexport_in_crate_under_non_ascii_directory_resolves() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let manifest = "[package]\nname = \"tool\"\n\n[lib]\npath = \"src/lib.rs\"\n";
+    let lib = "mod internal;\npub use internal::helper;\n";
+    let internal = "pub fn helper() -> u32 {\n    1\n}\n\npub fn other() -> u32 {\n    2\n}\n";
+    let crates = ["ascii_tool", "ツール"];
+    let mut files = Vec::new();
+    for root in crates {
+        files.push((format!("{root}/Cargo.toml"), manifest));
+        files.push((format!("{root}/src/lib.rs"), lib));
+        files.push((format!("{root}/src/internal.rs"), internal));
+    }
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, c)| (p.as_str(), *c)).collect();
+    git_commit_files(repo, &files, "base");
+
+    let mut diff_files = Vec::new();
+    for root in crates {
+        fs::write(repo.join(format!("{root}/src/lib.rs")), "mod internal;\n").expect("write");
+        fs::write(
+            repo.join(format!("{root}/src/internal.rs")),
+            "pub fn other() -> u32 {\n    2\n}\n",
+        )
+        .expect("write");
+        for (file, old_count, new_count) in [("lib.rs", 2, 1), ("internal.rs", 7, 3)] {
+            let path = format!("{root}/src/{file}");
+            diff_files.push(crate::models::impact::DiffFile {
+                old_path: path.clone(),
+                new_path: path,
+                hunks: vec![crate::models::impact::HunkInfo {
+                    old_start: 1,
+                    old_count,
+                    new_start: 1,
+                    new_count,
+                }],
+                deleted_old_source: None,
+            });
+        }
+    }
+    let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    let removed: Vec<(&str, &str)> = api
+        .removed
+        .iter()
+        .chain(api.removed_dead.iter())
+        .map(|s| (s.name.as_str(), s.file.as_str()))
+        .collect();
+    for root in crates {
+        let file = format!("{root}/src/internal.rs");
+        assert!(
+            removed.contains(&("helper", file.as_str())),
+            "{root}: 再エクスポートしていた helper の削除を報告すべき。got: {removed:?}"
+        );
+    }
+}
+
 /// glob 再エクスポート (`pub use internal::*;`) 経由の公開 API 変更が検出されること。
 ///
 /// 旧実装は `compute_reexport_reachable_modules` が `RustPubUseEdge::Named` 以外を

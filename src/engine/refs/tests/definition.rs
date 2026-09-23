@@ -28,13 +28,42 @@ fn is_identifier_kind_rejects_non_identifier() {
 /// 弾かれ、レジストリ / DI / `module.exports = { a, b }` のような JS/TS で最も一般的な
 /// 参照形が 1 件も数えられず、生きているシンボルが dead-code に出る。
 ///
-/// 一方 `const { picked } = obj` (`shorthand_property_identifier_pattern`) は束縛なので
-/// **入れてはならない** — 束縛を参照として数えると dead-code が fail-open する。
-/// 2 つは別ノード種別なので、片方だけを対象にできる。
+/// 一方 `const { picked } = obj` (`shorthand_property_identifier_pattern`) は束縛。
+/// 走査対象には入れるが、変数宣言の束縛位置だけを定義として出し、それ以外の文脈
+/// (関数パラメータ・loop 変数・代入式) は `is_ignored_identifier_context` が除外する
+/// (束縛を参照として数えると dead-code が fail-open する)。
 #[test]
-fn is_identifier_kind_accepts_shorthand_value_but_not_binding_pattern() {
+fn is_identifier_kind_accepts_shorthand_value_and_binding_pattern() {
     assert!(is_identifier_kind("shorthand_property_identifier"));
-    assert!(!is_identifier_kind("shorthand_property_identifier_pattern"));
+    assert!(is_identifier_kind("shorthand_property_identifier_pattern"));
+}
+
+/// shorthand の束縛パターンは変数宣言の束縛位置だけを残し、他の文脈は除外する。
+#[test]
+fn shorthand_binding_pattern_is_ignored_outside_variable_declarations() {
+    let src = "const { kept } = obj;\n\
+               function f({ param }) {}\n\
+               for (const { loop } of xs) {}\n\
+               ({ assigned } = obj);\n";
+    let tree = crate::engine::parser::parse_source(src.as_bytes(), LangId::Typescript).unwrap();
+    let mut ignored = Vec::new();
+    let mut kept = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "shorthand_property_identifier_pattern" {
+            let name = node.utf8_text(src.as_bytes()).unwrap().to_string();
+            if is_ignored_identifier_context(node, LangId::Typescript) {
+                ignored.push(name);
+            } else {
+                kept.push(name);
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    ignored.sort();
+    assert_eq!(kept, ["kept"]);
+    assert_eq!(ignored, ["assigned", "loop", "param"]);
 }
 
 /// Rust の定義ノード種別に function_item と struct_item が含まれることを検証
@@ -445,5 +474,89 @@ fn declaration_names_stay_definitions_in_every_language() {
             "{lang:?} {name}: 宣言名は定義: {refs:?}"
         );
         assert_eq!(ref_cnt, *want_ref, "{lang:?} {name}: 参照数: {refs:?}");
+    }
+}
+
+/// Zig: 文レベルの代入 (`counter += 1;` / `counter = ..;` / `a, const b = ..;`) の代入先は
+/// Reference。tree-sitter-zig は代入文も `variable_declaration` へ alias するため、旧実装
+/// (「最初の identifier 子」を名前位置とみなす) では代入先が def に化け、書き込みでしか
+/// 使われない `pub var` が dead-code に出ていた。
+///
+/// 対照: `var` / `pub var` / `threadlocal var` / 関数内 `const` / 分割代入中の `const b` の
+/// 名前は Definition のまま、右辺の識別子は Reference のまま。`extern "c" var` の名前は
+/// 旧実装では先頭の `"c"` (string) に名前位置を奪われて def にならなかったが、これも def。
+/// `var` と名前の間に行コメントが挟まっても名前は Definition のまま。
+#[test]
+fn zig_assignment_target_is_reference_not_definition() {
+    let source = "var counter: u32 = 0;\n\
+pub var total: u32 = 0;\n\
+threadlocal var tl: u32 = 0;\n\
+extern \"c\" var ext: c_int;\n\
+pub fn bump() void {\n\
+    counter += 1;\n\
+    counter = total + tl;\n\
+    const local = counter;\n\
+    var a: u32 = 0;\n\
+    a, const b = .{ local, ext };\n\
+    total = b;\n\
+}\n\
+pub var // note\n\
+    noted: u32 = 0;\n\
+pub fn touch() void {\n\
+    noted = 1;\n\
+}\n";
+    let tree = parser::parse_source(source.as_bytes(), LangId::Zig).expect("parse");
+    let defs = definition_node_kinds(LangId::Zig);
+
+    // (名前, 定義行, 参照行)。行は 0-origin。
+    let cases: &[(&str, &[usize], &[usize])] = &[
+        ("counter", &[0], &[5, 6, 7]),
+        ("total", &[1], &[6, 10]),
+        ("tl", &[2], &[6]),
+        ("ext", &[3], &[9]),
+        ("local", &[7], &[9]),
+        ("a", &[8], &[9]),
+        ("b", &[9], &[10]),
+        ("noted", &[13], &[15]),
+    ];
+    for (name, want_defs, want_refs) in cases {
+        let refs = collect_single_refs_for_test(
+            tree.root_node(),
+            source.as_bytes(),
+            name,
+            "test.zig",
+            defs,
+            LangId::Zig,
+        );
+        let lines_of = |kind: RefKind| -> Vec<usize> {
+            refs.iter()
+                .filter(|r| r.kind == Some(kind))
+                .map(|r| r.line)
+                .collect()
+        };
+        assert_eq!(
+            lines_of(RefKind::Definition),
+            *want_defs,
+            "{name}: 宣言名だけが定義: {refs:?}"
+        );
+        assert_eq!(
+            lines_of(RefKind::Reference),
+            *want_refs,
+            "{name}: 代入先・右辺は参照: {refs:?}"
+        );
+
+        let counts = count_refs_for_test(
+            tree.root_node(),
+            source.as_bytes(),
+            &[name.to_string()],
+            defs,
+            LangId::Zig,
+            1,
+        );
+        assert_eq!(
+            counts[0],
+            want_refs.len(),
+            "{name}: count-only 経路も同じ分類になること"
+        );
     }
 }

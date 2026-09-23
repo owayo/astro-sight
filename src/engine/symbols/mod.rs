@@ -1,3 +1,5 @@
+use std::ops::ControlFlow;
+
 use anyhow::Result;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, QueryCursor};
@@ -8,12 +10,14 @@ use crate::models::symbol::{Symbol, SymbolKind};
 
 mod complexity;
 mod cpp;
+mod entrypoint;
 mod exported;
 mod framework;
 mod overrides;
 mod scope;
 
 pub use complexity::calculate_complexity;
+pub use entrypoint::is_program_entrypoint;
 pub use exported::{
     is_rust_declaration_restricted_pub, is_rust_declaration_unrestricted_pub, is_symbol_exported,
 };
@@ -34,7 +38,8 @@ pub(crate) use cpp::{
 pub(crate) use exported::{
     PythonModuleExportPolicy, collect_js_ts_named_export_surface_names,
     collect_rust_reexported_names, is_python_symbol_exported_with_policy,
-    python_module_export_policy, rust_node_has_unrestricted_pub_visibility,
+    is_rust_trait_declared_method, python_module_export_policy,
+    rust_node_has_unrestricted_pub_visibility,
 };
 
 use cpp::cpp_enclosing_function_definition;
@@ -130,7 +135,7 @@ pub fn extract_symbols_with_custom_query(
     let unknown: Vec<&str> = query
         .capture_names()
         .iter()
-        .filter(|name| capture_name_to_kind(name).is_none())
+        .filter(|name| !is_supported_capture(lang_id, name))
         .copied()
         .collect();
     if !unknown.is_empty() {
@@ -169,6 +174,10 @@ fn run_symbol_query(
         for capture in m.captures() {
             let node = capture.node;
             let capture_name = &query.capture_names()[capture.index as usize];
+            if *capture_name == DESTRUCTURING_PATTERN_CAPTURE {
+                push_destructured_binding_symbols(node, source, lang_id, &mut symbols);
+                continue;
+            }
             let kind = capture_name_to_kind(capture_name);
 
             if let Some(kind) = kind {
@@ -252,6 +261,7 @@ fn run_symbol_query(
                         complexity,
                         container,
                         children: Vec::new(),
+                        name_range: None,
                     });
                 }
             }
@@ -260,6 +270,65 @@ fn run_symbol_query(
 
     assign_enclosing_containers(&mut symbols);
     Ok(symbols)
+}
+
+/// 分割代入パターン全体を捕捉する capture 名。`capture_name_to_kind` の語彙とは別に、
+/// 束縛名ごとのシンボルへ展開する内部 capture として扱う (JS/TS 専用)。
+const DESTRUCTURING_PATTERN_CAPTURE: &str = "variable.pattern";
+
+/// `capture` がこの言語のシンボルクエリで使える capture 名か。
+/// built-in クエリとカスタムクエリ (`--query`) で同じ語彙を受け付ける。
+fn is_supported_capture(lang_id: LangId, capture: &str) -> bool {
+    capture_name_to_kind(capture).is_some()
+        || (capture == DESTRUCTURING_PATTERN_CAPTURE
+            && matches!(
+                lang_id,
+                LangId::Javascript | LangId::Typescript | LangId::Tsx
+            ))
+}
+
+/// 分割代入パターンの束縛名ごとにシンボルを作る (JS/TS 専用)。
+///
+/// `range` は declarator 全体を全束縛で共有する。初期化子だけの変更で全束縛が affected に
+/// なるのは通常の `const x = init` と同じ扱いにするため。一方で range からは名前を
+/// 区別できないので、束縛識別子の位置を `name_range` に持たせ、名前単位の判定
+/// (export 判定・束縛ごとの signature・宣言行) はそちらを使う。
+fn push_destructured_binding_symbols(
+    pattern: Node<'_>,
+    source: &[u8],
+    lang_id: LangId,
+    symbols: &mut Vec<Symbol>,
+) {
+    if !matches!(
+        lang_id,
+        LangId::Javascript | LangId::Typescript | LangId::Tsx
+    ) {
+        return;
+    }
+    let Some(declarator) = pattern
+        .parent()
+        .filter(|p| p.kind() == "variable_declarator")
+    else {
+        return;
+    };
+    let doc = extract_doc_comment(pattern, source);
+    let _ = crate::engine::js_binding_pattern::visit_pattern_bindings(pattern, &mut |binding| {
+        if let Ok(name) = binding.utf8_text(source)
+            && !name.is_empty()
+        {
+            symbols.push(Symbol {
+                name: name.to_string(),
+                kind: SymbolKind::Variable,
+                range: Range::from(declarator.range()),
+                doc: doc.clone(),
+                complexity: None,
+                container: None,
+                children: Vec::new(),
+                name_range: Some(Range::from(binding.range())),
+            });
+        }
+        ControlFlow::Continue(())
+    });
 }
 
 /// Go の `method_declaration` からレシーバ型名を取り出す。
@@ -432,6 +501,7 @@ fn fallback_symbols(root: Node<'_>, source: &[u8]) -> Vec<Symbol> {
             complexity: None,
             container: None,
             children: Vec::new(),
+            name_range: None,
         });
     }
 
@@ -475,8 +545,13 @@ fn node_kind_to_symbol_kind(kind: &str) -> SymbolKind {
 fn symbol_query(lang_id: LangId) -> &'static str {
     match lang_id {
         LangId::Rust => {
+            // trait の必須メソッド (`fn area(&self) -> f64;`) は本体を持たない
+            // function_signature_item。extern ブロックの外部関数宣言も同じノードなので、
+            // trait 本体の直下に限定する (Swift protocol / Java interface の要求メソッドを
+            // 列挙しているのと揃える)。
             r#"
             (function_item name: (identifier) @function.name)
+            (trait_item body: (declaration_list (function_signature_item name: (identifier) @function.name)))
             (struct_item name: (type_identifier) @struct.name)
             (enum_item name: (type_identifier) @enum.name)
             (trait_item name: (type_identifier) @trait.name)
@@ -523,23 +598,37 @@ fn symbol_query(lang_id: LangId) -> &'static str {
             (class_definition name: (identifier) @class.name)
             "#
         }
+        // `var` (variable_declaration) も let/const と同じく拾う。分割代入
+        // (`const { a, b } = obj` / `const [x, y] = arr`) はパターン全体を
+        // `@variable.pattern` で捕捉し、束縛名ごとのシンボルへ展開する
+        // (`run_symbol_query` 参照)。どちらも拾わないと `export const { auth } = NextAuth()` や
+        // `export var legacy` の削除が api.rm に出ない。
         LangId::Javascript => {
             r#"
             (function_declaration name: (identifier) @function.name)
+            (generator_function_declaration name: (identifier) @function.name)
             (class_declaration name: (identifier) @class.name)
             (method_definition name: (property_identifier) @method.name)
             (lexical_declaration (variable_declarator name: (identifier) @variable.name))
+            (variable_declaration (variable_declarator name: (identifier) @variable.name))
+            (lexical_declaration (variable_declarator name: [(object_pattern) (array_pattern)] @variable.pattern))
+            (variable_declaration (variable_declarator name: [(object_pattern) (array_pattern)] @variable.pattern))
             "#
         }
         LangId::Typescript | LangId::Tsx => {
             r#"
             (function_declaration name: (identifier) @function.name)
+            (generator_function_declaration name: (identifier) @function.name)
             (class_declaration name: (type_identifier) @class.name)
+            (abstract_class_declaration name: (type_identifier) @class.name)
             (method_definition name: (property_identifier) @method.name)
             (interface_declaration name: (type_identifier) @interface.name)
             (type_alias_declaration name: (type_identifier) @type.name)
             (enum_declaration name: (identifier) @enum.name)
             (lexical_declaration (variable_declarator name: (identifier) @variable.name))
+            (variable_declaration (variable_declarator name: (identifier) @variable.name))
+            (lexical_declaration (variable_declarator name: [(object_pattern) (array_pattern)] @variable.pattern))
+            (variable_declaration (variable_declarator name: [(object_pattern) (array_pattern)] @variable.pattern))
             "#
         }
         LangId::Go => {
@@ -548,6 +637,7 @@ fn symbol_query(lang_id: LangId) -> &'static str {
             (function_declaration name: (identifier) @function.name)
             (method_declaration name: (field_identifier) @method.name)
             (type_declaration (type_spec name: (type_identifier) @type.name))
+            (type_declaration (type_alias name: (type_identifier) @type.name))
             "#
         }
         LangId::Php => {
@@ -560,10 +650,13 @@ fn symbol_query(lang_id: LangId) -> &'static str {
             (trait_declaration name: (name) @trait.name)
             "#
         }
+        // record (Java 16+ / C# 9+) はクラスとして扱う。拾わないと record 自体が
+        // symbols / API 差分 / dead-code から消え、配下メソッドの container も付かない。
         LangId::Java => {
             r#"
             (method_declaration name: (identifier) @function.name)
             (class_declaration name: (identifier) @class.name)
+            (record_declaration name: (identifier) @class.name)
             (interface_declaration name: (identifier) @interface.name)
             (enum_declaration name: (identifier) @enum.name)
             "#
@@ -589,6 +682,7 @@ fn symbol_query(lang_id: LangId) -> &'static str {
             (namespace_declaration name: (_) @module.name)
             (method_declaration name: (identifier) @function.name)
             (class_declaration name: (identifier) @class.name)
+            (record_declaration name: (identifier) @class.name)
             (struct_declaration name: (identifier) @struct.name)
             (interface_declaration name: (identifier) @interface.name)
             (enum_declaration name: (identifier) @enum.name)

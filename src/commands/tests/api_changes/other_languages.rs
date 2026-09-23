@@ -786,6 +786,65 @@ public_helper() {\n    echo public\n}\nexport -f public_helper\n";
     );
 }
 
+/// 削除 bash ファイルの関数ごとの分類は、参照を ApiRefIndex から引き、`export -f` 宣言を
+/// ファイル単位で 1 回だけ読むようにしても変わらない (関数ごとの全リポジトリ走査と
+/// git show をやめた最適化の出力互換ガード)。1 ファイル内に「export 済み」「他の bash から
+/// 参照」「bash 以外からだけ参照」「未参照」が混在しても、関数ごとに独立して判定する。
+#[test]
+fn detect_api_changes_bash_file_deletion_classifies_each_function_independently() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+
+    let tool_before = "#!/usr/bin/env bash\n\
+exported_fn() {\n    echo exported\n}\nexport -f exported_fn\n\n\
+used_by_bash() {\n    echo bash\n}\n\n\
+used_by_python() {\n    echo py\n}\n\n\
+unused_fn() {\n    echo unused\n}\n";
+    git_commit_files(
+        repo,
+        &[
+            ("scripts/tool.sh", tool_before),
+            (
+                "scripts/other.sh",
+                "#!/usr/bin/env bash\nsource ./tool.sh\nused_by_bash\n",
+            ),
+            (
+                "tools/run.py",
+                "import subprocess\n\n\ndef used_by_python():\n    return subprocess.run([\"true\"])\n",
+            ),
+        ],
+        "initial",
+    );
+    std::fs::remove_file(repo.join("scripts/tool.sh")).expect("remove");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "scripts/tool.sh".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 17,
+            new_start: 0,
+            new_count: 0,
+        }],
+        deleted_old_source: None,
+    }];
+
+    let api_changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    let mut removed: Vec<&str> = api_changes
+        .removed
+        .iter()
+        .chain(api_changes.removed_dead.iter())
+        .map(|s| s.name.as_str())
+        .collect();
+    removed.sort_unstable();
+    assert_eq!(
+        removed,
+        ["exported_fn", "used_by_bash"],
+        "export 済みと bash から参照される関数だけを削除として残し、未参照・bash 以外からだけの参照は除外する"
+    );
+}
+
 // ------------------------------------------------------------------
 // is_bash_script_path / bash_has_export_f ヘルパー
 // ------------------------------------------------------------------

@@ -2112,6 +2112,40 @@ class FooService {
     assert!(!check_angular_lifecycle_hook(src, "ngOnInit"));
 }
 
+/// Angular は service (`@Injectable`) と pipe (`@Pipe`) にも破棄時の `ngOnDestroy` を呼ぶ。
+/// それ以外の hook は service / pipe には呼ばれないので、同じクラスでも対象外のまま
+/// (hook 名を広げると本当に dead な `ngOnInit` を隠す)。
+#[test]
+fn angular_service_and_pipe_on_destroy_is_detected() {
+    let service = r#"
+@Injectable({ providedIn: 'root' })
+export class PollerService {
+    ngOnDestroy(): void {}
+    ngOnInit(): void {}
+}
+"#;
+    assert!(check_angular_lifecycle_hook(service, "ngOnDestroy"));
+    assert!(!check_angular_lifecycle_hook(service, "ngOnInit"));
+
+    let pipe = r#"
+@Pipe({ name: 'trim' })
+export class TrimPipe {
+    ngOnDestroy(): void {}
+    ngAfterViewInit(): void {}
+}
+"#;
+    assert!(check_angular_lifecycle_hook(pipe, "ngOnDestroy"));
+    assert!(!check_angular_lifecycle_hook(pipe, "ngAfterViewInit"));
+
+    // 対照: Angular decorator の無いクラスの ngOnDestroy は対象外
+    let plain = r#"
+export class Plain {
+    ngOnDestroy(): void {}
+}
+"#;
+    assert!(!check_angular_lifecycle_hook(plain, "ngOnDestroy"));
+}
+
 /// Angular lifecycle hook 名以外のメソッド (custom method) は除外対象外。
 #[test]
 fn angular_component_non_lifecycle_method_not_detected() {
@@ -2243,6 +2277,29 @@ export class Other implements SomeOtherContract {
 }
 "#;
     assert!(!check_angular_runtime_entrypoint(src, "writeValue"));
+}
+
+/// `@Pipe` 装飾クラスの `transform` はテンプレートの `| name` から Angular が呼ぶ。
+/// pipe 名 (`name: 'trim'`) とメソッド名が一致しないのでテンプレート参照走査でも拾えない。
+#[test]
+fn angular_pipe_transform_is_runtime_entrypoint() {
+    let pipe = r#"
+@Pipe({ name: 'trim', standalone: true })
+export class TrimPipe implements PipeTransform {
+    transform(value: string): string { return value.trim(); }
+    helper(): void {}
+}
+"#;
+    assert!(check_angular_runtime_entrypoint(pipe, "transform"));
+    // 対照: pipe の他のメソッドと、pipe でないクラスの transform は対象外
+    assert!(!check_angular_runtime_entrypoint(pipe, "helper"));
+    let service = r#"
+@Injectable()
+export class Transformer {
+    transform(value: string): string { return value; }
+}
+"#;
+    assert!(!check_angular_runtime_entrypoint(service, "transform"));
 }
 
 // --- is_php_laravel_runtime_entrypoint テスト ---
@@ -3511,6 +3568,220 @@ fn cx_null_coalescing_is_not_counted_in_any_language() {
                 lang: LangId::Php,
                 label: "??",
                 src: "<?php\nfunction f($a) { return $a ?? 0; }",
+            },
+        ],
+    );
+}
+
+/// JS/TS の分割代入・`var`・generator・abstract class はシンボルとして抽出する。
+///
+/// いずれも旧クエリに無く、`export const { auth } = NextAuth()` / `export var legacy` /
+/// `export function* ids()` / `export abstract class Shape` の削除が api.rm に出なかった。
+/// 分割代入は束縛位置の名前だけを拾い、プロパティキー (`auth:` / `nested:`) は拾わない。
+#[test]
+fn js_ts_destructuring_var_generator_and_abstract_class_are_symbols() {
+    let src = "export const { handlers, auth: renamed, nested: { deep } } = NextAuth();\n\
+               export const [first, , third = 3, ...rest] = pair();\n\
+               export var legacy = 1;\n\
+               export function* ids() { yield 1; }\n\
+               export abstract class Shape { describe() { return 1; } }\n\
+               function local() { const { inner } = props(); return inner; }\n";
+    let syms = syms_of(src, LangId::Typescript);
+    let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+    for expected in [
+        "handlers", "renamed", "deep", "first", "third", "rest", "legacy", "ids", "Shape",
+        "describe", "inner",
+    ] {
+        assert!(names.contains(&expected), "{expected} missing: {names:?}");
+    }
+    for key in ["auth", "nested"] {
+        assert!(
+            !names.contains(&key),
+            "property key {key} is not a binding: {names:?}"
+        );
+    }
+    let describe = syms.iter().find(|s| s.name == "describe").unwrap();
+    assert_eq!(describe.container.as_deref(), Some("Shape"));
+    let ids = syms.iter().find(|s| s.name == "ids").unwrap();
+    assert_eq!(ids.kind, SymbolKind::Function);
+}
+
+/// 複数行の分割代入でも各束縛は自分の行を報告し、range (宣言全体) は共有する。
+#[test]
+fn destructured_bindings_report_their_own_line_and_share_the_declaration() {
+    let src = "export const {\n  alpha,\n  beta: renamed,\n} = source();\n";
+    let syms = syms_of(src, LangId::Typescript);
+    let alpha = syms.iter().find(|s| s.name == "alpha").unwrap();
+    let renamed = syms.iter().find(|s| s.name == "renamed").unwrap();
+    assert_eq!(alpha.to_compact(false).line, 1);
+    assert_eq!(renamed.to_compact(false).line, 2);
+    assert_eq!(alpha.range, renamed.range);
+    assert_eq!(alpha.range.start.line, 0);
+    // 名前を持たない通常のシンボルは range の先頭行のまま (出力は不変)。
+    let plain = syms_of("export const x = 1;\n", LangId::Typescript);
+    assert!(plain[0].name_range.is_none());
+    assert_eq!(plain[0].to_compact(false).line, 0);
+}
+
+/// 宣言を共有する束縛の export 判定は名前単位で行う。
+#[test]
+fn destructured_binding_export_is_judged_per_name() {
+    let src = "const obj = { a: 1, b: 2 };\nconst { a, b } = obj;\nexport { a };\n\
+               export const { c } = obj;\n";
+    let language = LangId::Typescript.ts_language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).unwrap();
+    let tree = parser.parse(src, None).unwrap();
+    let root = tree.root_node();
+    let syms = extract_symbols(root, src.as_bytes(), LangId::Typescript).unwrap();
+    let exported = |name: &str| {
+        let sym = syms.iter().find(|s| s.name == name).unwrap();
+        is_symbol_exported(
+            root,
+            src.as_bytes(),
+            LangId::Typescript,
+            sym.identity_range(),
+        )
+    };
+    assert!(exported("a"), "`export {{ a }}` exports a");
+    assert!(
+        !exported("b"),
+        "b shares the declaration but is not exported"
+    );
+    assert!(exported("c"), "`export const {{ c }}` exports c");
+}
+
+/// `@variable.pattern` はカスタムクエリでも JS/TS に限って使える (built-in と同じ語彙)。
+#[test]
+fn custom_query_accepts_destructuring_capture_only_for_js_ts() {
+    let ts_src = "const { a, b } = obj;\n";
+    let language = LangId::Typescript.ts_language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).unwrap();
+    let tree = parser.parse(ts_src, None).unwrap();
+    let syms = extract_symbols_with_custom_query(
+        tree.root_node(),
+        ts_src.as_bytes(),
+        LangId::Typescript,
+        "(variable_declarator name: (object_pattern) @variable.pattern)",
+    )
+    .expect("TS accepts @variable.pattern");
+    let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["a", "b"]);
+
+    let py_src = "a = 1\n";
+    let language = LangId::Python.ts_language();
+    parser.set_language(&language).unwrap();
+    let tree = parser.parse(py_src, None).unwrap();
+    assert!(
+        extract_symbols_with_custom_query(
+            tree.root_node(),
+            py_src.as_bytes(),
+            LangId::Python,
+            "(identifier) @variable.pattern",
+        )
+        .is_err(),
+        "@variable.pattern is JS/TS only"
+    );
+}
+
+/// Java / C# の record、Go の型エイリアス、Rust trait の必須メソッドを抽出する。
+/// extern ブロックの外部関数宣言は同じ function_signature_item でも拾わない。
+#[test]
+fn records_go_alias_and_rust_trait_requirements_are_symbols() {
+    let java = syms_of(
+        "public record Point(int x, int y) { public int sum() { return x + y; } }",
+        LangId::Java,
+    );
+    assert!(
+        java.iter()
+            .any(|s| s.name == "Point" && s.kind == SymbolKind::Class)
+    );
+    let sum = java.iter().find(|s| s.name == "sum").unwrap();
+    assert_eq!(sum.container.as_deref(), Some("Point"));
+
+    let csharp = syms_of(
+        "public record Person(string Name) { public string Greet() { return Name; } }\n\
+         public record struct Coord(int X, int Y);",
+        LangId::CSharp,
+    );
+    for name in ["Person", "Coord"] {
+        assert!(
+            csharp
+                .iter()
+                .any(|s| s.name == name && s.kind == SymbolKind::Class),
+            "{name}"
+        );
+    }
+    let greet = csharp.iter().find(|s| s.name == "Greet").unwrap();
+    assert_eq!(greet.container.as_deref(), Some("Person"));
+
+    let go = syms_of(
+        "package p\ntype Alias = Other\ntype Named int\n",
+        LangId::Go,
+    );
+    for name in ["Alias", "Named"] {
+        assert!(
+            go.iter()
+                .any(|s| s.name == name && s.kind == SymbolKind::Type),
+            "{name}"
+        );
+    }
+
+    let rust = syms_of(
+        "pub trait Shape {\n    fn area(&self) -> f64;\n    fn scale(&self) -> f64 { 1.0 }\n}\n\
+         extern \"C\" {\n    fn c_func(x: i32);\n}\n",
+        LangId::Rust,
+    );
+    for name in ["area", "scale"] {
+        let sym = rust.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(sym.container.as_deref(), Some("Shape"), "{name}");
+    }
+    assert!(!rust.iter().any(|s| s.name == "c_func"));
+}
+
+/// trait 本体のメソッドは可視性修飾子を書けず、trait の可視性を継承する。
+#[test]
+fn rust_trait_methods_inherit_trait_visibility() {
+    let src = "pub trait Public {\n    fn a(&self);\n    fn a2(&self) {}\n}\n\
+               pub(crate) trait Internal {\n    fn b(&self);\n}\n\
+               trait Private {\n    fn c(&self);\n}\n";
+    assert!(check_exported(src, LangId::Rust, "a"));
+    assert!(check_exported(src, LangId::Rust, "a2"));
+    assert!(!check_exported(src, LangId::Rust, "b"));
+    assert!(!check_exported(src, LangId::Rust, "c"));
+}
+
+/// クラス内の `private record` は record 自身の修飾子で判定する (外側クラスの修飾子を見ない)。
+#[test]
+fn java_nested_private_record_is_not_exported() {
+    let src =
+        "public class Outer {\n  private record Inner(int x) {}\n  public record Open(int y) {}\n}";
+    assert!(!check_exported(src, LangId::Java, "Inner"));
+    assert!(check_exported(src, LangId::Java, "Open"));
+}
+
+/// 式形式の generator (`const g = function* () {}`) も関数境界として扱う。
+/// 宣言形式だけを境界にしていると、ネストした generator 式の分岐が外側関数へ加算される。
+#[test]
+fn cx_nested_generator_expression_branches_excluded() {
+    assert_cx_cases(
+        1,
+        &[
+            CxCase {
+                lang: LangId::Typescript,
+                label: "generator expression",
+                src: "function f() { const g = function* () { if (a) { yield 1; } }; return g; }",
+            },
+            CxCase {
+                lang: LangId::Javascript,
+                label: "generator expression",
+                src: "function f() { const g = function* () { if (a) { yield 1; } }; return g; }",
+            },
+            CxCase {
+                lang: LangId::Typescript,
+                label: "arrow (control)",
+                src: "function f() { const g = () => { if (a) { return 1; } }; return g; }",
             },
         ],
     );

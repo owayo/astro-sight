@@ -12,6 +12,30 @@ use crate::error::{AstroError, ErrorCode};
 /// 「未コミットの作業ツリー変更」を既定の解析対象にする。
 pub const DEFAULT_BLAME_BASE: &str = "HEAD";
 
+/// 出力を解析する `git diff` 呼び出しに必ず付ける引数。
+///
+/// porcelain の `git diff` は利用者の git 設定で出力形式が変わる。パーサは既定の形式
+/// (`a/` / `b/` 接頭辞・色なし・内蔵 diff・textconv なし) を前提にしているため、次の
+/// どれか 1 つでも設定されていると 1 ファイルも認識できず、`context` が `{"changes":[]}`、
+/// `impact --hook` / `review --hook` が exit 0 で破壊的変更を素通しする (fail-open)。
+/// - `diff.mnemonicPrefix` / `diff.noprefix` / `diff.srcPrefix` / `diff.dstPrefix`:
+///   ヘッダが `--- c/..` / `--- ..` 等になる → 接頭辞をコマンドラインで固定する。
+///   `-c diff.mnemonicPrefix=false` のような設定ごとの上書きは、上書きし忘れた設定
+///   (`diff.srcPrefix` 等) や将来追加される設定を取りこぼすため採らない
+///   (コマンドライン指定はどの設定よりも優先される)。
+/// - `diff.external` / `GIT_EXTERNAL_DIFF` / gitattributes の diff driver: 外部ツールの
+///   出力に置き換わる (失敗すると git ごと異常終了する) → `--no-ext-diff`
+/// - `color.diff` / `color.ui = always`: 行頭に ANSI エスケープが付く → `--no-color`
+/// - textconv (`diff=<driver>` 属性 + `diff.<driver>.textconv`): 変換後テキストの diff に
+///   なり、解析対象のファイル内容と行が一致しない → `--no-textconv`
+pub(crate) const GIT_DIFF_PARSEABLE_OUTPUT_ARGS: [&str; 5] = [
+    "--no-ext-diff",
+    "--no-color",
+    "--no-textconv",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+];
+
 /// `git diff` / `git show` / `git blame` に渡す revision または path を検証する。
 ///
 /// 先頭が `-` の値は git がオプションとして解釈するため拒否する。空文字と NUL も

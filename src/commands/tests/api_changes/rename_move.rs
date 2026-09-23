@@ -1347,3 +1347,102 @@ fn detect_api_changes_ignores_moved_trait_impl_methods() {
         api_changes.added
     );
 }
+
+/// 対応言語でない拡張子への rename (`api.ts` → `api.ts.bak`) は旧ファイルの削除として扱う。
+///
+/// 新側の言語を判定できず exported シンボルが取れないため、旧実装は変更ファイルとして
+/// 何もせず、`./api` を import したままの呼び出し側が壊れるのに api.rm が出なかった
+/// (同じファイルを `git rm` すれば api.rm になる)。対応言語への rename は従来どおり
+/// 旧 API を保ったまま扱う (対照)。
+#[test]
+fn detect_api_changes_rename_to_unsupported_extension_is_removal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "src/api.ts",
+                "export function fetchUser(id: string): string {\n  return id;\n}\n",
+            ),
+            (
+                "src/app.ts",
+                "import { fetchUser } from \"./api\";\n\nexport function main(): string {\n  return fetchUser(\"1\");\n}\n",
+            ),
+            (
+                "lib/tool.rb",
+                "#!/usr/bin/env ruby\n\ndef helper\n  1\nend\n",
+            ),
+            ("app.rb", "require_relative \"lib/tool\"\n\nputs helper\n"),
+        ],
+        "initial",
+    );
+
+    let removed_of = |api: &ApiChanges| -> Vec<(String, String)> {
+        api.removed
+            .iter()
+            .map(|s| (s.name.clone(), s.file.clone()))
+            .collect()
+    };
+    let expected = vec![("fetchUser".to_string(), "src/api.ts".to_string())];
+
+    // 内容同一の rename (`git mv` のみ)。diff に hunk が無く `parse_unified_diff` に現れない。
+    git_in(repo, &["mv", "src/api.ts", "src/api.ts.bak"]);
+    let api = detect_api_changes_from_worktree(repo);
+    assert_eq!(
+        removed_of(&api),
+        expected,
+        "対応外の拡張子への rename は旧 API の削除として報告すべき。removed_dead={:?}",
+        api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+
+    // 内容も変えた rename。変更ファイルとして diff に現れるが、新側の言語が判定できない。
+    fs::write(
+        repo.join("src/api.ts.bak"),
+        "export function fetchUser(id: string): string {\n  return id + \"!\";\n}\n",
+    )
+    .expect("write api.ts.bak");
+    let api = detect_api_changes_from_worktree(repo);
+    assert_eq!(
+        removed_of(&api),
+        expected,
+        "内容を変えた rename でも旧 API の削除として報告すべき"
+    );
+    git_in(repo, &["checkout", "--", "src/api.ts.bak"]);
+
+    // 対照: 対応言語への rename は内容が同じなら API の削除にしない。
+    git_in(repo, &["mv", "src/api.ts.bak", "src/client.ts"]);
+    let api = detect_api_changes_from_worktree(repo);
+    assert!(
+        api.removed.is_empty() && api.removed_dead.is_empty(),
+        "対応言語への rename で削除を報告してはならない。removed={:?} removed_dead={:?}",
+        api.removed.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+
+    // 対照: 拡張子では判定できなくても shebang で言語を判定できる新側は、対応言語への
+    // rename と同じ扱い (API の削除にしない)。
+    git_in(repo, &["mv", "lib/tool.rb", "lib/tool.rb.bak"]);
+    let api = detect_api_changes_from_worktree(repo);
+    assert!(
+        api.removed.is_empty() && api.removed_dead.is_empty(),
+        "shebang で言語を判定できる rename で削除を報告してはならない。removed={:?} removed_dead={:?}",
+        api.removed.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+}
+
+/// API 差分へ足す内容同一の rename は、拡張子で判定できるソースを判定できないパスへ移した
+/// ものだけ。ソース同士 / 非ソース同士の rename は API 面を変えないので足さない
+/// (ディレクトリ移動で大量に来る画像や文書の rename ごとにファイルを読ませない)。
+#[test]
+fn api_diff_files_adds_only_hunkless_renames_leaving_known_extensions() {
+    let diff = "diff --git a/src/api.ts b/src/api.ts.bak\nsimilarity index 100%\nrename from src/api.ts\nrename to src/api.ts.bak\ndiff --git a/src/a.ts b/src/b.ts\nsimilarity index 100%\nrename from src/a.ts\nrename to src/b.ts\ndiff --git a/assets/logo.png b/public/logo.png\nsimilarity index 100%\nrename from assets/logo.png\nrename to public/logo.png\ndiff --git a/bin/tool b/bin/tool.bak\nsimilarity index 100%\nrename from bin/tool\nrename to bin/tool.bak\n";
+    let files = api_diff_files(&[], diff);
+    let renames: Vec<(&str, &str)> = files
+        .iter()
+        .map(|f| (f.old_path.as_str(), f.new_path.as_str()))
+        .collect();
+    assert_eq!(renames, vec![("src/api.ts", "src/api.ts.bak")]);
+}

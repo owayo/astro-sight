@@ -23,7 +23,10 @@ use crate::language::LangId;
 ///
 /// 一方、メソッド呼び出し (`obj.method()`) の `method` 部は `field_identifier` ノードだが
 /// 親 `field_expression` がさらに親 `call_expression` の `function` フィールドに位置するため
-/// 関数参照として残す。
+/// 関数参照として残す。turbofish 付きの `obj.method::<T>()` は `call_expression >
+/// generic_function > field_expression` と `generic_function` を 1 段挟むので、これも
+/// メソッド参照として残す (フィールドは型引数を取れないため、`generic_function` の
+/// `function` 位置にある `field_expression` は常にメソッド名)。
 ///
 /// **`shorthand_field_initializer` (`Config { redact }`) はここに含めない。** shorthand の
 /// 識別子は `Config { redact: redact }` の**値側**、つまりスコープ内の名前を読む式であり、
@@ -59,12 +62,15 @@ pub(crate) fn is_rust_struct_field_non_callable(node: Node<'_>) -> bool {
                         // 祖先なし → 純粋なフィールドアクセスとして除外
                         return true;
                     };
-                    // method call (`obj.method()`) の `method` 部は関数参照として残す
-                    let is_method_call = grand.kind() == "call_expression"
-                        && grand
-                            .child_by_field_name("function")
-                            .is_some_and(|n| n.id() == parent.id());
-                    !is_method_call
+                    // method call (`obj.method()`) の `method` 部は関数参照として残す。
+                    // `obj.method::<T>()` は祖父が `generic_function` になるので同様に残す
+                    // (落とすと turbofish でしか呼ばれないメソッドが dead に出る)。
+                    let is_method_ref =
+                        matches!(grand.kind(), "call_expression" | "generic_function")
+                            && grand
+                                .child_by_field_name("function")
+                                .is_some_and(|n| n.id() == parent.id());
+                    !is_method_ref
                 }
                 _ => false,
             }

@@ -71,6 +71,32 @@ pub(crate) fn resolve_git_diff_parts(
     }
 }
 
+/// テストヘルパー: `review --git` と同じ経路 (未追跡ファイルの合成、内容同一の rename の
+/// 取り込み込み) で作業ツリーの diff を作り、API 差分を検出する。rename / 未追跡のように
+/// diff の作り方そのものが結果を左右するケース用。
+pub(crate) fn detect_api_changes_from_worktree(repo: &std::path::Path) -> ApiChanges {
+    let (diff, _) = resolve_git_diff_parts(repo);
+    let diff_files = crate::engine::diff::parse_unified_diff(&diff);
+    detect_api_changes(
+        repo.to_str().expect("utf-8 path"),
+        "HEAD",
+        &api_diff_files(&diff_files, &diff),
+    )
+}
+
+/// テストヘルパー: 作業ツリーで `git <args>` を実行し、成功を確認する。
+pub(crate) fn git_in(repo: &std::path::Path, args: &[&str]) {
+    assert!(
+        Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .expect("git")
+            .success(),
+        "git {args:?} failed"
+    );
+}
+
 /// テストヘルパー: リポジトリルート直下と `app/` サブディレクトリの 2 プロジェクト構成を作る。
 /// `app/` を `--dir` に渡すサブディレクトリ実行のパス基準テスト用。
 pub(crate) fn init_subproject_repo_for_test(repo: &std::path::Path) {

@@ -508,3 +508,102 @@ echo foo();\n";
         batch[1]
     );
 }
+
+/// PHP 8 の nullsafe 呼び出し `$g?->Fmtx()` のメソッド名も case-insensitive に照合する。
+///
+/// `php_ref_context_is_case_insensitive` が `member_call_expression` しか見ておらず、
+/// `nullsafe_member_call_expression` の name は厳密一致に落ちていたため、定義 `Fmtx` に対する
+/// `refs --name fmtx` が `$g?->Fmtx()` を返さなかった (`->` 版は返す非対称)。
+/// 対照: nullsafe のプロパティアクセス `$g?->myProp` は `->` 版と同じく case-sensitive のまま。
+#[test]
+fn find_references_php_nullsafe_method_call_case_insensitive() {
+    let source: &[u8] = b"<?php\n\
+class Gamma {\n\
+    public $myProp = 1;\n\
+    public function Fmtx() { return 1; }\n\
+}\n\
+function run(?Gamma $g) {\n\
+    $g?->fmtx();\n\
+    $g->FMTX();\n\
+    return $g?->myProp;\n\
+}\n";
+    let lang_id = LangId::Php;
+    let tree = parser::parse_source(source, lang_id).unwrap();
+    let root = tree.root_node();
+    let defs = definition_node_kinds(lang_id);
+
+    let refs = collect_single_refs_for_test(root, source, "Fmtx", "t.php", defs, lang_id);
+    let ref_lines: Vec<usize> = refs
+        .iter()
+        .filter(|r| r.kind == Some(RefKind::Reference))
+        .map(|r| r.line)
+        .collect();
+    assert_eq!(
+        ref_lines,
+        [6, 7],
+        "nullsafe 呼び出し (6 行目) と通常呼び出し (7 行目) の両方を大小無視で返すこと: {refs:?}"
+    );
+
+    // 対照: プロパティは case-sensitive なので大小違いの検索に一致しない
+    let props = collect_single_refs_for_test(root, source, "MYPROP", "t.php", defs, lang_id);
+    assert!(
+        props.is_empty(),
+        "nullsafe のプロパティアクセスは case-sensitive のまま: {props:?}"
+    );
+
+    // single と batch が同じ結果を返すこと
+    let names = vec!["Fmtx".to_string(), "MYPROP".to_string()];
+    let batch = collect_batch_refs_for_test(root, source, &names, "t.php", defs, lang_id);
+    assert_eq!(ref_fingerprints(&refs), ref_fingerprints(&batch[0]));
+    assert_eq!(ref_fingerprints(&props), ref_fingerprints(&batch[1]));
+}
+
+/// 拡張子なしの PHP スクリプト (`bin/console` の shebang) でも single と batch が一致すること。
+///
+/// single 経路の事前フィルタが拡張子だけで言語を決めていたため、shebang で PHP と判定される
+/// ファイルに大小区別の memmem が掛かり、大小違いの関数呼び出し `Bootstrap_App()` を
+/// `refs --name` だけが落としていた (batch の AC は常に ASCII CI なので返す)。
+/// 対照: 拡張子 `.php` のファイルは従来どおり両経路で返る。
+#[test]
+fn shebang_php_file_single_and_batch_agree_on_case_insensitive_call() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+    std::fs::write(
+        dir.path().join("boot.php"),
+        "<?php\nfunction bootstrap_app() { return 1; }\nBOOTSTRAP_APP();\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("bin/console"),
+        "#!/usr/bin/env php\n<?php\nBootstrap_App();\n",
+    )
+    .unwrap();
+
+    let single = find_references("bootstrap_app", dir.path(), None).unwrap();
+    let batch = find_references_batch(&["bootstrap_app".to_string()], dir.path(), None)
+        .unwrap()
+        .remove("bootstrap_app")
+        .unwrap_or_default();
+    let key = |refs: &[SymbolReference]| -> Vec<(String, usize, usize)> {
+        refs.iter()
+            .map(|r| (r.path.clone(), r.line, r.column))
+            .collect()
+    };
+    assert_eq!(
+        key(&single),
+        key(&batch),
+        "single と batch は同じ参照集合を返すこと"
+    );
+    assert!(
+        single
+            .iter()
+            .any(|r| r.path.ends_with("console") && r.line == 2),
+        "shebang で PHP と判定されるファイルの大小違い呼び出しを返すこと: {single:?}"
+    );
+    assert!(
+        single
+            .iter()
+            .any(|r| r.path.ends_with("boot.php") && r.line == 2),
+        "対照: .php の大小違い呼び出しは従来どおり返ること: {single:?}"
+    );
+}

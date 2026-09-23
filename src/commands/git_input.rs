@@ -68,6 +68,8 @@ pub fn resolve_blame_source_files(
         // blame pathspec (cwd 相対) と基準がずれる (パス基準統一、Issue
         // 2026-08-05-moved-name-only-match-and-path-mismatch)。`--dir` = リポジトリルート
         // なら prefix が空で従来と同一出力。
+        // `--name-only` の出力は現行の git では色・外部 diff の影響を受けないが、
+        // 出力を解析する git diff 呼び出しの引数は 1 箇所の定義に揃えておく。
         let output = std::process::Command::new("git")
             .args([
                 "-c",
@@ -75,8 +77,9 @@ pub fn resolve_blame_source_files(
                 "diff",
                 "--relative",
                 "--name-only",
-                base_rev,
             ])
+            .args(crate::git_support::GIT_DIFF_PARSEABLE_OUTPUT_ARGS)
+            .arg(base_rev)
             .current_dir(dir)
             .output()
             .map_err(|e| {
@@ -146,6 +149,251 @@ pub(crate) fn git_show_blob(dir: &str, rev: &str, path: &str) -> Option<Vec<u8>>
         return None;
     }
     Some(output.stdout)
+}
+
+/// `git show <rev>:./<path>` と同じ blob を、1 プロセス常駐させた `git cat-file --batch` で順に読む。
+///
+/// 変更ファイルごとに旧版 (API 差分の前処理) や index の内容 (`--git --staged` の影響分析) を読む
+/// 経路で [`git_show_blob`] (1 ファイル 1 プロセス) を使うと、diff の規模に比例してプロセス起動が
+/// 積み上がる (実測: 本体だけを変えた 200 ファイルの diff で API 差分フェーズが 7.4 秒、3000 ファイルの
+/// staged diff の影響分析が 8.7 秒 → 72.7 秒。いずれもほぼ全てが `git show` の起動)。
+///
+/// 検証 (`validate_git_revision`)・パス解決 (`cwd_relative_git_path`)・「取れなければ `None`」の
+/// 意味は [`git_show_blob`] と同一。`git show` は blob に textconv を適用しないので出力も一致する。
+/// 子プロセスは最初の読み出しまで起動しない (1 ファイルも読まない diff で起動コストを払わない)。
+/// 起動できない・応答の形式が崩れた場合は以降 [`git_show_blob`] へ倒す (遅くなるだけで結果は同じ)。
+///
+/// 読み出しは `&self` で行う (子プロセスの状態は内部可変)。API 差分の検出では base 側を読む
+/// 経路が互換判定器・Rust の公開面判定などに散らばっており、1 本の読み手を共有参照で配るため。
+/// 共有は単一スレッドに限る (`RefCell` なので `Sync` ではない)。常駐プロセスは ref や index を
+/// 起動時点で読み込みうるので、寿命は 1 回の検出 (コマンド 1 回) に閉じ、プロセス全体では共有しない。
+pub(crate) struct GitBlobBatch {
+    dir: String,
+    rev: String,
+    state: std::cell::RefCell<BatchState>,
+}
+
+enum BatchState {
+    NotStarted,
+    Running(CatFileBatch),
+    /// 起動できなかった / 応答の同期が崩れた。以降は単発の `git show` で読む。
+    Unavailable,
+}
+
+impl GitBlobBatch {
+    pub(crate) fn new(dir: &str, rev: &str) -> Self {
+        Self {
+            dir: dir.to_string(),
+            rev: rev.to_string(),
+            state: std::cell::RefCell::new(BatchState::NotStarted),
+        }
+    }
+
+    /// index (stage 0) の内容を読む (revision `:0`)。
+    ///
+    /// `--git --staged` の diff は「base と index」の差分なので、hunk の new 側行番号は
+    /// 作業ツリーではなく index の内容を指す。
+    pub(crate) fn index(dir: &str) -> Self {
+        Self::new(dir, ":0")
+    }
+
+    /// 読み出す revision (`:0` は index)。
+    pub(crate) fn rev(&self) -> &str {
+        &self.rev
+    }
+
+    /// 常駐プロセスで読めている (単発の `git show` へ落ちていない) か。テストで経路を確かめる。
+    #[cfg(test)]
+    pub(crate) fn is_batch_running(&self) -> bool {
+        matches!(*self.state.borrow(), BatchState::Running(_))
+    }
+
+    /// `git show <rev>:./<path>` と同じ内容を返す。
+    pub(crate) fn read(&self, path: &str) -> Option<Vec<u8>> {
+        self.read_limited(path, usize::MAX)
+    }
+
+    /// [`Self::read`] に上限を付けたもの。`max_bytes` を超える blob は内容を確保せずに
+    /// 読み捨てて `None` を返す。
+    pub(crate) fn read_limited(&self, path: &str, max_bytes: usize) -> Option<Vec<u8>> {
+        let (dir, rev) = (self.dir.as_str(), self.rev.as_str());
+        validate_git_revision(rev, "git revision").ok()?;
+        validate_git_revision(path, "diff file path").ok()?;
+        // 要求は 1 行 1 件で、cat-file は要求行末の CR も区切りとして落とす (`a<CR>` を要求すると
+        // 別ファイル `a` の内容が返る)。改行・CR を含む値は要求に表せないので単発の git show で読む。
+        if [rev, path].iter().any(|s| s.contains(['\n', '\r'])) {
+            return show_blob_limited(dir, rev, path, max_bytes);
+        }
+        // 借用は 1 要求の間だけ。要求の途中で他の読み出しを呼ぶ経路は無い (再入しない)。
+        let mut state = self.state.borrow_mut();
+        if matches!(*state, BatchState::NotStarted) {
+            *state = CatFileBatch::spawn(dir).map_or(BatchState::Unavailable, BatchState::Running);
+        }
+        let BatchState::Running(batch) = &mut *state else {
+            drop(state);
+            return show_blob_limited(dir, rev, path, max_bytes);
+        };
+        let spec = format!("{rev}:{}", cwd_relative_git_path(path));
+        match batch.read_blob(&spec, max_bytes) {
+            Ok(blob) => blob,
+            Err(_) => {
+                // 同期が崩れた子は drop で kill して回収し、以降は単発で読む。
+                *state = BatchState::Unavailable;
+                drop(state);
+                show_blob_limited(dir, rev, path, max_bytes)
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for GitBlobBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitBlobBatch")
+            .field("dir", &self.dir)
+            .field("rev", &self.rev)
+            .finish_non_exhaustive()
+    }
+}
+
+/// 上限付きの [`git_show_blob`] ([`GitBlobBatch`] のフォールバック)。
+fn show_blob_limited(dir: &str, rev: &str, path: &str, max_bytes: usize) -> Option<Vec<u8>> {
+    git_show_blob(dir, rev, path).filter(|blob| blob.len() <= max_bytes)
+}
+
+/// 常駐 `git cat-file --batch` の子プロセス 1 本。
+///
+/// 1 要求を書いて flush → その応答を最後まで読む、を繰り返すので pipe の詰まりは起きず、
+/// cat-file はオブジェクトごとに出力を flush するので同時に保持する内容は 1 オブジェクト分で済む。
+struct CatFileBatch {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    /// 応答の途中で異常が起きた (以降の応答をどの要求に対応付けてよいか分からない)。
+    broken: bool,
+}
+
+impl CatFileBatch {
+    /// `dir` を cwd に起動する。起動できなければ `None`。
+    fn spawn(dir: &str) -> Option<Self> {
+        let mut child = std::process::Command::new("git")
+            .args(["cat-file", "--batch"])
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        match (child.stdin.take(), child.stdout.take()) {
+            (Some(stdin), Some(stdout)) => Some(Self {
+                child,
+                stdin: Some(stdin),
+                stdout: std::io::BufReader::new(stdout),
+                broken: false,
+            }),
+            _ => {
+                // パイプを取れなかった子は kill してから回収する (stdin が開いたままだと
+                // cat-file が入力を待ち続けて wait が返らない)。
+                let _ = child.kill();
+                let _ = child.wait();
+                None
+            }
+        }
+    }
+
+    /// `spec` (`<rev>:<path>`) の blob を読む。
+    ///
+    /// `Ok(None)` は「存在しない / blob ではない / `max_bytes` 超過」(内容は読み捨て済み)、
+    /// `Err` はプロトコル異常で、以降この子プロセスは使えない。
+    fn read_blob(&mut self, spec: &str, max_bytes: usize) -> std::io::Result<Option<Vec<u8>>> {
+        if self.broken {
+            return Err(std::io::Error::other("cat-file batch is out of sync"));
+        }
+        let result = self.request(spec, max_bytes);
+        if result.is_err() {
+            self.broken = true;
+        }
+        result
+    }
+
+    /// 応答は `<oid> SP <type> SP <size> LF <contents> LF`、見つからなければ
+    /// `<object> SP missing LF` / `<object> SP ambiguous LF`。オブジェクトを持たない gitlink
+    /// (サブモジュール) は `<oid> SP submodule LF` で内容が続かず、プロセスもそのまま続く。
+    fn request(&mut self, spec: &str, max_bytes: usize) -> std::io::Result<Option<Vec<u8>>> {
+        use std::io::{BufRead, Read, Write};
+        let invalid =
+            |msg: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string());
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| invalid("cat-file stdin is closed"))?;
+        stdin.write_all(spec.as_bytes())?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()?;
+
+        let mut header = Vec::new();
+        self.stdout.read_until(b'\n', &mut header)?;
+        if header.pop() != Some(b'\n') {
+            return Err(invalid("truncated cat-file header"));
+        }
+        let header =
+            std::str::from_utf8(&header).map_err(|_| invalid("non-UTF-8 cat-file header"))?;
+        // 成功時は object 名を含まない 3 語 (spec は必ず `:` を含むので oid と取り違えない)。
+        // object 名は空白を含みうるので、内容を持たない応答は末尾の語で判定する。
+        let fields: Vec<&str> = header.split(' ').collect();
+        let (object_type, size) = match fields.as_slice() {
+            [oid, object_type, size]
+                if !oid.is_empty() && oid.bytes().all(|b| b.is_ascii_hexdigit()) =>
+            {
+                let size: usize = size
+                    .parse()
+                    .map_err(|_| invalid("malformed cat-file size"))?;
+                (*object_type, size)
+            }
+            // submodule を異常扱いにすると、サブモジュールのポインタ更新を含む diff で読み手を
+            // 捨てて以降すべて単発の `git show` に戻ってしまう。
+            _ if [" missing", " ambiguous", " submodule"]
+                .iter()
+                .any(|suffix| header.ends_with(suffix)) =>
+            {
+                return Ok(None);
+            }
+            _ => return Err(invalid("malformed cat-file header")),
+        };
+        // 内容と末尾の LF は必ず読み切る (読み残すと次の応答とずれる)。
+        let contents = if object_type != "blob" || size > max_bytes {
+            let skipped = std::io::copy(
+                &mut (&mut self.stdout).take(size as u64),
+                &mut std::io::sink(),
+            )?;
+            if skipped != size as u64 {
+                return Err(invalid("truncated cat-file contents"));
+            }
+            None
+        } else {
+            let mut contents = vec![0u8; size];
+            self.stdout.read_exact(&mut contents)?;
+            Some(contents)
+        };
+        let mut terminator = [0u8; 1];
+        self.stdout.read_exact(&mut terminator)?;
+        if terminator != *b"\n" {
+            return Err(invalid("missing cat-file record terminator"));
+        }
+        Ok(contents)
+    }
+}
+
+impl Drop for CatFileBatch {
+    fn drop(&mut self) {
+        // stdin を閉じると cat-file は EOF で終了する。応答の途中で止めた子は kill し、
+        // 残りの出力を読み捨ててから回収する (書き込み待ちの子を wait で待ち続けない)。
+        drop(self.stdin.take());
+        if self.broken {
+            let _ = self.child.kill();
+        }
+        let _ = std::io::copy(&mut self.stdout, &mut std::io::sink());
+        let _ = self.child.wait();
+    }
 }
 
 /// `git show <rev>:<path>` の `<path>` を cwd 基準に明示した形へ正規化する。
@@ -271,6 +519,25 @@ pub(crate) fn resolve_diff_source(
     }
 }
 
+/// `resolve_diff_source` が返す diff の new 側がどこにあるか。
+///
+/// 優先順位は `resolve_diff_source` と同じ (inline → `--diff-file` → `--git`) で、
+/// `--git --staged` の diff (`git diff --cached <base>`) のときだけ new 側が index になる。
+/// それ以外 (作業ツリーとの diff・利用者が渡した diff) は作業ツリー。
+pub(crate) fn diff_new_side(
+    inline: Option<&str>,
+    file: Option<&str>,
+    git: bool,
+    staged: bool,
+) -> crate::models::impact::DiffNewSide {
+    use crate::models::impact::DiffNewSide;
+    if inline.is_none() && file.is_none() && git && staged {
+        DiffNewSide::Index
+    } else {
+        DiffNewSide::WorkingTree
+    }
+}
+
 /// 未追跡合成の打ち切り情報を捨てて diff だけ返す従来インタフェース。
 /// 打ち切りを結果に載せる必要がない呼び出し元 (cochange の blame source 解決など) 用。
 pub fn run_git_diff(dir: &str, base: &str, staged: bool) -> Result<String> {
@@ -296,6 +563,8 @@ fn run_git_diff_collecting_truncations(
     // 基準が混ざる (`api.moved` の `from` = ルート相対 / `to` = dir 相対で `to` が実在しない
     // パスになる。Issue 2026-08-05-moved-name-only-match-and-path-mismatch)。
     // `--dir` = リポジトリルートなら prefix が空なので従来と完全に同一の出力になる。
+    // 利用者の git 設定 (接頭辞 / 外部 diff / 色 / textconv) で出力形式が変わらないよう固定する
+    // (`GIT_DIFF_PARSEABLE_OUTPUT_ARGS` の doc 参照)。
     let mut args = vec![
         "-c".to_string(),
         "core.quotepath=off".to_string(),
@@ -303,6 +572,11 @@ fn run_git_diff_collecting_truncations(
         "--relative".to_string(),
         "--find-renames".to_string(),
     ];
+    args.extend(
+        crate::git_support::GIT_DIFF_PARSEABLE_OUTPUT_ARGS
+            .iter()
+            .map(|arg| arg.to_string()),
+    );
     if staged {
         args.push("--cached".to_string());
     }
@@ -511,7 +785,11 @@ fn collect_untracked_source_files(
     let mut out = Vec::new();
     for rel_path in untracked {
         // パスにNUL/改行を含むものは合成 diff を壊すため除外 (ls-files -z 由来では稀)。
-        if rel_path.contains('\n') || rel_path.contains('\r') {
+        // TAB も除外する: diff ヘッダの解析は最初の TAB 以降を落とす (git が空白入りパスの
+        // 行末に付ける TAB の除去、`strip_header_path`) ため、TAB 入りのパスは別名に化ける。
+        // 追跡済みファイルでも TAB 入りのパスは git が C 形式でクォートし解析対象外になるので、
+        // 未追跡の合成だけを通すと扱いが食い違う。
+        if rel_path.contains('\n') || rel_path.contains('\r') || rel_path.contains('\t') {
             continue;
         }
         // 言語判定できないファイル (バイナリ / 非ソース) は impact 解析対象外なので含めない。

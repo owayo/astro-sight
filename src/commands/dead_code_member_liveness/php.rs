@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::engine::parser;
+use crate::engine::{parser, refs};
 use crate::language::LangId;
 
 use super::{
@@ -44,7 +44,7 @@ impl PhpMemberLiveness {
         let Some(php_files) = collect_php_files(canonical_dir, extra_files) else {
             return Self { statuses };
         };
-        let trait_uses = collect_php_trait_uses(&php_files);
+        let types = collect_php_type_index(&php_files);
 
         // duplicate set を先に確定し、ファイル毎に 1 回だけ read + parse して全 set を
         // まとめて解析する (ループ反転、js_ts 側と同じ構成)。旧実装は set 毎に全 PHP
@@ -61,7 +61,7 @@ impl PhpMemberLiveness {
             })
             .collect();
 
-        let accums = analyze_php_sets_over_files(&sets, &php_files, &trait_uses, &is_test_path);
+        let accums = analyze_php_sets_over_files(&sets, &php_files, &types, &is_test_path);
 
         for ((bare_key, _owners), accum) in sets.iter().zip(accums) {
             let members = &bare_to_members[*bare_key];
@@ -141,15 +141,11 @@ fn collect_php_files(
     extra_files: &[std::path::PathBuf],
 ) -> Option<Vec<std::path::PathBuf>> {
     let files = collect_source_files(canonical_dir, extra_files)?;
+    // 拡張子なしの `bin/console` (`#!/usr/bin/env php`) も参照件数の経路と同じく含める。
     Some(
         files
             .into_iter()
-            .filter(|p| {
-                let Some(s) = p.to_str() else {
-                    return false;
-                };
-                matches!(LangId::from_path(camino::Utf8Path::new(s)), Ok(LangId::Php))
-            })
+            .filter(|p| refs::detect_source_lang(p) == Some(LangId::Php))
             .collect(),
     )
 }
@@ -165,44 +161,78 @@ struct PhpTraitUses {
     declared_methods: HashSet<String>,
 }
 
-/// PHP の class/trait 本体直下にある trait `use` を owner 名ごとに収集する。
+/// PHP の型宣言 (class / trait / enum / interface) 1 名分の、scope 解決に使う事実。
+///
+/// 候補 owner でも trait 合成先でもないクラスを scope にした参照 (`Child::make()` /
+/// `new Child()`) が、継承元の候補メソッドへ到達し得るかを判定する材料
+/// (`php_resolve_unowned_scope`)。
+#[derive(Default)]
+struct PhpTypeDecl {
+    /// 同名 (folded) の宣言数。namespace 違いの同名クラスは区別できないため、
+    /// 2 以上なら宣言ごとの事実を当てにしない。
+    count: usize,
+    /// `extends` (base_clause) を持つ宣言があるか。親の実装を継承し得る。
+    has_parent: bool,
+    /// 本体直下に**実装付き**で宣言されたメソッド名 (folded)。abstract 宣言と
+    /// interface のメソッド宣言は本体を持たないので含めない。
+    concrete_methods: HashSet<String>,
+}
+
+impl PhpTypeDecl {
+    /// 同名宣言の事実を合算する。加算と和集合だけなのでマージ順に依らず決定的。
+    fn merge(&mut self, other: PhpTypeDecl) {
+        self.count += other.count;
+        self.has_parent |= other.has_parent;
+        self.concrete_methods.extend(other.concrete_methods);
+    }
+}
+
+/// member liveness の scope 解決に使う、走査対象の PHP 型宣言の索引。
+#[derive(Default)]
+struct PhpTypeIndex {
+    /// owner (class / trait / enum) 名 → trait `use` の合成情報。
+    trait_uses: HashMap<String, PhpTraitUses>,
+    /// 型名 → 宣言の事実 (interface を含む全型宣言)。
+    decls: HashMap<String, PhpTypeDecl>,
+}
+
+/// PHP ファイル群から型宣言の索引を作る。trait `use` は owner 名ごとに収集し、
 /// 同名 owner の複数宣言や parse 不能な use は dispatch 先を一意に決められないため、
 /// 後段で `Ambiguous` に倒す情報として保持する。
-fn collect_php_trait_uses(files: &[std::path::PathBuf]) -> HashMap<String, PhpTraitUses> {
+fn collect_php_type_index(files: &[std::path::PathBuf]) -> PhpTypeIndex {
     use rayon::prelude::*;
 
     // ファイル毎の収集は独立なので並列化する。owner 重複時のマージ規則
     // (`merge_php_trait_use_entry`) が逐次実装と同じくファイル順で適用されるよう、
     // 順序保存の collect 後に入力順で統合する。
-    let per_file: Vec<HashMap<String, PhpTraitUses>> = files
+    let per_file: Vec<PhpTypeIndex> = files
         .par_iter()
         .map(|file_path| {
-            let mut uses_in_file = HashMap::new();
+            let mut in_file = PhpTypeIndex::default();
             let Some(path) = file_path.to_str() else {
-                return uses_in_file;
+                return in_file;
             };
             let Ok(source) = parser::read_file(camino::Utf8Path::new(path)) else {
-                return uses_in_file;
+                return in_file;
             };
             let Ok(tree) = parser::parse_source(&source, LangId::Php) else {
-                return uses_in_file;
+                return in_file;
             };
-            collect_php_trait_uses_from_node(
-                tree.root_node(),
-                source.as_bytes(),
-                &mut uses_in_file,
-            );
-            uses_in_file
+            collect_php_types_from_node(tree.root_node(), source.as_bytes(), &mut in_file);
+            in_file
         })
         .collect();
 
-    let mut uses_by_owner = HashMap::new();
-    for file_map in per_file {
-        for (owner, collected) in file_map {
-            merge_php_trait_use_entry(&mut uses_by_owner, owner, collected);
+    let mut index = PhpTypeIndex::default();
+    for file_index in per_file {
+        for (owner, collected) in file_index.trait_uses {
+            merge_php_trait_use_entry(&mut index.trait_uses, owner, collected);
+        }
+        for (name, decl) in file_index.decls {
+            index.decls.entry(name).or_default().merge(decl);
         }
     }
-    uses_by_owner
+    index
 }
 
 /// owner 単位の trait use 情報をマージ規則付きで登録する。
@@ -230,21 +260,29 @@ fn merge_php_trait_use_entry(
     }
 }
 
-fn collect_php_trait_uses_from_node(
+fn collect_php_types_from_node(
     node: tree_sitter::Node<'_>,
     source: &[u8],
-    uses_by_owner: &mut HashMap<String, PhpTraitUses>,
+    types: &mut PhpTypeIndex,
 ) {
     // enum (PHP 8.1+) も trait を use できるため収集対象に含める
-    // (name/body フィールドは class と同形)。
-    if matches!(
-        node.kind(),
-        "class_declaration" | "trait_declaration" | "enum_declaration"
-    ) && let Some(owner) = node
-        .child_by_field_name("name")
-        .and_then(|name| php_node_key(name, source))
+    // (name/body フィールドは class と同形)。interface は trait を use できないので
+    // 宣言の事実 (`decls`) だけを集める。
+    if is_php_type_declaration(node.kind())
+        && let Some(owner) = node
+            .child_by_field_name("name")
+            .and_then(|name| php_node_key(name, source))
         && let Some(body) = node.child_by_field_name("body")
     {
+        let mut decl = PhpTypeDecl {
+            count: 1,
+            has_parent: {
+                let mut cursor = node.walk();
+                node.named_children(&mut cursor)
+                    .any(|c| c.kind() == "base_clause")
+            },
+            concrete_methods: HashSet::new(),
+        };
         let mut collected = PhpTraitUses::default();
         let mut body_cursor = body.walk();
         for declaration in body.named_children(&mut body_cursor) {
@@ -256,11 +294,13 @@ fn collect_php_trait_uses_from_node(
                         .named_children(&mut method_cursor)
                         .any(|c| c.kind() == "abstract_modifier")
                 };
-                if !is_abstract
-                    && let Some(method_name) = declaration
-                        .child_by_field_name("name")
-                        .and_then(|name| php_node_key(name, source))
-                {
+                let method_name = declaration
+                    .child_by_field_name("name")
+                    .and_then(|name| php_node_key(name, source));
+                if !is_abstract && let Some(method_name) = method_name {
+                    if declaration.child_by_field_name("body").is_some() {
+                        decl.concrete_methods.insert(method_name.clone());
+                    }
                     collected.declared_methods.insert(method_name);
                 }
                 continue;
@@ -283,12 +323,15 @@ fn collect_php_trait_uses_from_node(
                 }
             }
         }
-        merge_php_trait_use_entry(uses_by_owner, owner, collected);
+        types.decls.entry(owner.clone()).or_default().merge(decl);
+        if node.kind() != "interface_declaration" {
+            merge_php_trait_use_entry(&mut types.trait_uses, owner, collected);
+        }
     }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_php_trait_uses_from_node(child, source, uses_by_owner);
+        collect_php_types_from_node(child, source, types);
     }
 }
 
@@ -302,7 +345,7 @@ fn collect_php_trait_uses_from_node(
 fn analyze_php_sets_over_files<F>(
     sets: &[(&str, HashSet<String>)],
     files: &[std::path::PathBuf],
-    trait_uses: &HashMap<String, PhpTraitUses>,
+    types: &PhpTypeIndex,
     is_test_path: &F,
 ) -> Vec<SetAccum>
 where
@@ -319,7 +362,7 @@ where
         .fold(
             || vec![SetAccum::default(); sets.len()],
             |mut acc, file_path| {
-                analyze_php_file_into(sets, file_path, trait_uses, is_test_path, &mut acc);
+                analyze_php_file_into(sets, file_path, types, is_test_path, &mut acc);
                 acc
             },
         )
@@ -339,7 +382,7 @@ where
 fn analyze_php_file_into<F>(
     sets: &[(&str, HashSet<String>)],
     file_path: &Path,
-    trait_uses: &HashMap<String, PhpTraitUses>,
+    types: &PhpTypeIndex,
     is_test_path: &F,
     acc: &mut [SetAccum],
 ) where
@@ -387,7 +430,7 @@ fn analyze_php_file_into<F>(
             owners,
             bare_key,
             None,
-            trait_uses,
+            types,
             aliases,
             &mut analysis,
         );
@@ -529,7 +572,7 @@ fn visit_php_node(
     owners: &HashSet<String>,
     bare_key: &str,
     current_type: Option<&PhpEnclosingType>,
-    trait_uses: &HashMap<String, PhpTraitUses>,
+    types: &PhpTypeIndex,
     aliases: &PhpFileAliases,
     analysis: &mut PhpFileAnalysis,
 ) {
@@ -537,17 +580,17 @@ fn visit_php_node(
         return;
     }
 
-    let current_type_buf = php_class_context_for_node(node, source, owners, bare_key, trait_uses);
+    let current_type_buf = php_class_context_for_node(node, source, owners, bare_key, types);
     let next_type = current_type_buf.as_ref().or(current_type);
 
     process_php_liveness_node(
-        node, source, owners, bare_key, next_type, trait_uses, aliases, analysis,
+        node, source, owners, bare_key, next_type, types, aliases, analysis,
     );
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         visit_php_node(
-            child, source, owners, bare_key, next_type, trait_uses, aliases, analysis,
+            child, source, owners, bare_key, next_type, types, aliases, analysis,
         );
         if analysis.ambiguous {
             break;
@@ -560,19 +603,19 @@ fn php_class_context_for_node(
     source: &[u8],
     owners: &HashSet<String>,
     bare_key: &str,
-    trait_uses: &HashMap<String, PhpTraitUses>,
+    types: &PhpTypeIndex,
 ) -> Option<PhpEnclosingType> {
     if !is_php_type_declaration(node.kind()) {
         return None;
     }
-    // trait 判定は宣言ノード種別で行う。`trait_uses.contains_key()` は「別 trait を
+    // trait 判定は宣言ノード種別で行う。`types.trait_uses.contains_key()` は「別 trait を
     // use しない trait」を含まず「trait を use する class/enum」を含むため使えない。
     let is_trait = node.kind() == "trait_declaration";
     node.child_by_field_name("name")
         .and_then(|name| php_node_key(name, source))
         .filter(|key| {
             !matches!(
-                php_resolve_trait_dispatch(key, bare_key, owners, trait_uses),
+                php_resolve_trait_dispatch(key, bare_key, owners, &types.trait_uses),
                 PhpOwnerResolution::Ignore
             )
         })
@@ -586,7 +629,7 @@ fn process_php_liveness_node(
     owners: &HashSet<String>,
     bare_key: &str,
     current_type: Option<&PhpEnclosingType>,
-    trait_uses: &HashMap<String, PhpTraitUses>,
+    types: &PhpTypeIndex,
     aliases: &PhpFileAliases,
     analysis: &mut PhpFileAnalysis,
 ) {
@@ -599,7 +642,7 @@ fn process_php_liveness_node(
                     owners,
                     bare_key,
                     current_type,
-                    trait_uses,
+                    types,
                     aliases,
                     analysis,
                 );
@@ -615,13 +658,15 @@ fn process_php_liveness_node(
                     owners,
                     bare_key,
                     current_type,
-                    trait_uses,
+                    types,
                     aliases,
                     analysis,
                 );
             }
         }
-        "member_call_expression" => {
+        // `$x->m()` / `$x?->m()` (PHP 8 nullsafe) は receiver の型を静的に辿れない。
+        // nullsafe を数え漏らすと、`?->` でしか呼ばれない同名メソッドが両方 dead に出る。
+        "member_call_expression" | "nullsafe_member_call_expression" => {
             if php_call_name_matches(node, source, bare_key) {
                 analysis.ambiguous = true;
             }
@@ -644,19 +689,11 @@ fn record_php_scoped_call(
     owners: &HashSet<String>,
     bare_key: &str,
     current_type: Option<&PhpEnclosingType>,
-    trait_uses: &HashMap<String, PhpTraitUses>,
+    types: &PhpTypeIndex,
     aliases: &PhpFileAliases,
     analysis: &mut PhpFileAnalysis,
 ) {
-    match php_scoped_call_owner(
-        node,
-        source,
-        owners,
-        bare_key,
-        current_type,
-        trait_uses,
-        aliases,
-    ) {
+    match php_scoped_call_owner(node, source, owners, bare_key, current_type, types, aliases) {
         PhpOwnerResolution::Resolved(owner) => {
             *analysis.scoped_counts.entry(owner).or_default() += 1;
         }
@@ -667,7 +704,7 @@ fn record_php_scoped_call(
 
 /// `new Foo()` を `Foo::__construct` への確定参照として数える。
 /// `new self()` は enclosing class、`new static()` / `new parent()` / `new $var()` は
-/// Ambiguous、anonymous class 等の非 name 対象は Ignore。
+/// Ambiguous、anonymous class は `php_resolve_anonymous_class_creation` で解決する。
 #[expect(clippy::too_many_arguments)]
 fn record_php_object_creation(
     node: tree_sitter::Node<'_>,
@@ -675,7 +712,7 @@ fn record_php_object_creation(
     owners: &HashSet<String>,
     bare_key: &str,
     current_type: Option<&PhpEnclosingType>,
-    trait_uses: &HashMap<String, PhpTraitUses>,
+    types: &PhpTypeIndex,
     aliases: &PhpFileAliases,
     analysis: &mut PhpFileAnalysis,
 ) {
@@ -687,11 +724,27 @@ fn record_php_object_creation(
             let Some(folded) = php_node_key(target, source) else {
                 return;
             };
-            php_resolve_scope_name(&folded, bare_key, owners, current_type, trait_uses, aliases)
+            php_resolve_scope_name(
+                &folded,
+                bare_key,
+                owners,
+                current_type,
+                types,
+                aliases,
+                PhpScopeUse::ObjectCreation,
+            )
         }
         // `new $cls()` は動的クラス名で owner を静的解決できない。
         "variable_name" => PhpOwnerResolution::Ambiguous,
-        // anonymous class (`new class {...}`) 等は candidate と無関係。
+        "anonymous_class" => php_resolve_anonymous_class_creation(
+            target,
+            source,
+            owners,
+            bare_key,
+            current_type,
+            types,
+            aliases,
+        ),
         _ => PhpOwnerResolution::Ignore,
     };
     match resolution {
@@ -700,6 +753,69 @@ fn record_php_object_creation(
         }
         PhpOwnerResolution::Ambiguous => analysis.ambiguous = true,
         PhpOwnerResolution::Ignore => {}
+    }
+}
+
+/// `new class(...) extends Base { ... }` (無名クラスの生成) が呼ぶ constructor を解決する。
+///
+/// 無名クラス自身は名前を持たず候補にならない。自前の `__construct` を宣言していれば
+/// それが呼ばれるので候補へは届かない (中の `parent::__construct()` は scoped call として
+/// 別途 Ambiguous に倒れる)。宣言していなければ constructor は合成した trait か継承元から
+/// 来る — trait は合成先を辿らず Ambiguous、`extends Base` は `new Base()` と同じ解決に
+/// 委ねる。旧実装は無名クラスを一律 Ignore にしていたため、`new class extends Base {}`
+/// でしか生成されない `Base.__construct` が dead と誤報されていた。
+fn php_resolve_anonymous_class_creation(
+    anon: tree_sitter::Node<'_>,
+    source: &[u8],
+    owners: &HashSet<String>,
+    bare_key: &str,
+    current_type: Option<&PhpEnclosingType>,
+    types: &PhpTypeIndex,
+    aliases: &PhpFileAliases,
+) -> PhpOwnerResolution {
+    let mut declares_ctor = false;
+    let mut uses_trait = false;
+    if let Some(body) = anon.child_by_field_name("body") {
+        let mut cursor = body.walk();
+        for decl in body.named_children(&mut cursor) {
+            match decl.kind() {
+                "method_declaration" => {
+                    declares_ctor |= decl
+                        .child_by_field_name("name")
+                        .and_then(|name| php_node_key(name, source))
+                        .is_some_and(|key| key == bare_key);
+                }
+                "use_declaration" => uses_trait = true,
+                _ => {}
+            }
+        }
+    }
+    if declares_ctor {
+        return PhpOwnerResolution::Ignore;
+    }
+    if uses_trait {
+        return PhpOwnerResolution::Ambiguous;
+    }
+    let mut cursor = anon.walk();
+    let base = anon
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "base_clause")
+        .and_then(|clause| clause.named_child(0));
+    let Some(base) = base else {
+        // 継承元も trait も無ければ constructor は暗黙の既定のみ。
+        return PhpOwnerResolution::Ignore;
+    };
+    match php_node_key(base, source) {
+        Some(folded) => php_resolve_scope_name(
+            &folded,
+            bare_key,
+            owners,
+            current_type,
+            types,
+            aliases,
+            PhpScopeUse::ObjectCreation,
+        ),
+        None => PhpOwnerResolution::Ambiguous,
     }
 }
 
@@ -715,7 +831,7 @@ fn php_scoped_call_owner(
     owners: &HashSet<String>,
     bare_key: &str,
     current_type: Option<&PhpEnclosingType>,
-    trait_uses: &HashMap<String, PhpTraitUses>,
+    types: &PhpTypeIndex,
     aliases: &PhpFileAliases,
 ) -> PhpOwnerResolution {
     let Some(scope) = node
@@ -736,7 +852,25 @@ fn php_scoped_call_owner(
             .next()
             .unwrap_or(text),
     );
-    php_resolve_scope_name(&folded, bare_key, owners, current_type, trait_uses, aliases)
+    php_resolve_scope_name(
+        &folded,
+        bare_key,
+        owners,
+        current_type,
+        types,
+        aliases,
+        PhpScopeUse::StaticCall,
+    )
+}
+
+/// scope 名が現れた構文。候補へ到達し得る経路が違うため、候補にも trait 合成経由の
+/// 候補にも辿り着かない scope の扱いを分ける (`php_resolve_unowned_scope`)。
+#[derive(Clone, Copy)]
+enum PhpScopeUse {
+    /// `X::m()`
+    StaticCall,
+    /// `new X()` (`__construct` set のみ)
+    ObjectCreation,
 }
 
 /// scope 名 (folded 済み) を candidate owner へ解決する。scoped call (`X::m()`) と
@@ -746,8 +880,9 @@ fn php_resolve_scope_name(
     bare_key: &str,
     owners: &HashSet<String>,
     current_type: Option<&PhpEnclosingType>,
-    trait_uses: &HashMap<String, PhpTraitUses>,
+    types: &PhpTypeIndex,
     aliases: &PhpFileAliases,
+    scope_use: PhpScopeUse,
 ) -> PhpOwnerResolution {
     match folded {
         // trait 本体内の `self::` / `new self()` は合成先ホストの文脈で解決され、
@@ -758,7 +893,7 @@ fn php_resolve_scope_name(
         // ため従来どおり確定解決する (LSB は `static::` で別途 Ambiguous 済み)。
         "self" => match current_type {
             Some(ctx) if ctx.is_trait => PhpOwnerResolution::Ambiguous,
-            Some(ctx) => php_resolve_trait_dispatch(&ctx.name, bare_key, owners, trait_uses),
+            Some(ctx) => php_resolve_trait_dispatch(&ctx.name, bare_key, owners, &types.trait_uses),
             None => PhpOwnerResolution::Ambiguous,
         },
         // `static::` は遅延静的束縛 (late static binding) でサブクラス override へ
@@ -772,15 +907,58 @@ fn php_resolve_scope_name(
             // trait dispatch を含む通常解決へ流す。alias マップが不完全 (multi-namespace /
             // 競合) な場合、alias 名への参照だけ Ambiguous に倒す (silent Ignore による
             // dead 誤検出を防ぐ)。
-            if let Some(map) = &aliases.resolved {
-                if let Some(target) = map.get(folded) {
-                    return php_resolve_trait_dispatch(target, bare_key, owners, trait_uses);
+            let target = match &aliases.resolved {
+                Some(map) => map.get(folded).map_or(folded, String::as_str),
+                None if aliases.alias_names.contains(folded) => {
+                    return PhpOwnerResolution::Ambiguous;
                 }
-            } else if aliases.alias_names.contains(folded) {
-                return PhpOwnerResolution::Ambiguous;
+                None => folded,
+            };
+            match php_resolve_trait_dispatch(target, bare_key, owners, &types.trait_uses) {
+                PhpOwnerResolution::Ignore => {
+                    php_resolve_unowned_scope(target, bare_key, scope_use, &types.decls)
+                }
+                resolved => resolved,
             }
-            php_resolve_trait_dispatch(folded, bare_key, owners, trait_uses)
         }
+    }
+}
+
+/// 候補 owner にも trait 合成経由の候補にも辿り着かなかった scope クラス `X` について、
+/// `X::m()` / `new X()` が候補メソッドへ到達し得るかを判定する。
+///
+/// 旧実装はこの場合を一律 `Ignore` (票を捨てる) にしていたため、`class Child extends Base {}`
+/// に対する `Child::make()` / `new Child()` が継承元 `Base` の候補へ届かず、`Base.make` /
+/// `Base.__construct` が参照 0 件で dead と誤報されていた (TS 側は同条件を Ambiguous に
+/// 倒している)。継承グラフを辿って票の行き先を推測はせず、候補へ届かないと言い切れる
+/// 場合だけ `Ignore` に残す:
+///
+/// - `X` が走査対象内に 1 つだけ宣言され、対象メソッドを実装付きで自己宣言している →
+///   PHP の解決順 (自クラス > trait > 親) で自クラスのメソッドへ静的に解決される。
+/// - 静的呼び出し (`X::m()`) のそれ以外 → `Ambiguous`。親からの継承に加え、走査対象外の
+///   クラス (Laravel の facade 等) は `__callStatic` で任意のインスタンスへ転送し得る。
+/// - `new X()` のそれ以外 → `X` が走査対象内で `extends` を持つ (または同名宣言が複数ある)
+///   なら親の constructor を継承し得るので `Ambiguous`。`extends` を持たない宣言と
+///   走査対象外 (vendor / 組み込み) のクラスは `Ignore` — constructor は `__callStatic`
+///   のような転送を受けず、依存先のクラスがリポジトリ内のクラスを継承することもない
+///   (`new \Exception()` のたびに constructor の duplicate set 全体が Ambiguous へ倒れ、
+///   未使用 constructor を 1 つも検出できなくなるのを避ける)。
+fn php_resolve_unowned_scope(
+    target: &str,
+    bare_key: &str,
+    scope_use: PhpScopeUse,
+    decls: &HashMap<String, PhpTypeDecl>,
+) -> PhpOwnerResolution {
+    let decl = decls.get(target);
+    if decl.is_some_and(|d| d.count == 1 && d.concrete_methods.contains(bare_key)) {
+        return PhpOwnerResolution::Ignore;
+    }
+    match scope_use {
+        PhpScopeUse::StaticCall => PhpOwnerResolution::Ambiguous,
+        PhpScopeUse::ObjectCreation => match decl {
+            Some(d) if d.count != 1 || d.has_parent => PhpOwnerResolution::Ambiguous,
+            _ => PhpOwnerResolution::Ignore,
+        },
     }
 }
 

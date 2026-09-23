@@ -163,30 +163,143 @@ if __name__ == \"__main__\":
     );
 }
 
-/// `detect_python_property_to_field` は old_path が Python の場合のみ判定する
-/// (他言語の `Container.member` 削除が diff 内 .py の偶然の同名 class+field で
-/// informational に降格しない)。
+/// `detect_python_property_to_field` は old_path が Python で、base 側が property の場合だけ
+/// 置き換え先を返す (他言語の `Container.member` 削除や、素のメソッドの置き換えを
+/// informational に降格しない)。別ファイルの同名クラスを根拠にしないことは
+/// `detect_api_changes_python_property_removed_with_field_in_other_file_stays_removed` で固定する。
 #[test]
 fn detect_python_property_to_field_requires_python_old_path() {
     let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[(
+            "m.py",
+            "class Container:\n    @property\n    def member(self) -> int:\n        return 1\n\n    def method(self) -> int:\n        return 2\n",
+        )],
+        "base",
+    );
     fs::write(
-        dir.path().join("new.py"),
-        "from dataclasses import dataclass\n@dataclass\nclass Container:\n    member: int\n",
+        repo.join("m.py"),
+        "from dataclasses import dataclass\n@dataclass\nclass Container:\n    member: int\n    method: int\n",
     )
     .expect("write");
-    let dir_str = dir.path().to_str().expect("utf-8 path");
-    let diff_new_paths: HashSet<String> = HashSet::from(["new.py".to_string()]);
+    let dir_str = repo.to_str().expect("utf-8 path");
 
     assert_eq!(
-        detect_python_property_to_field(dir_str, "old.py", "Container.member", &diff_new_paths),
-        Some("new.py".to_string()),
-        "Python の old_path なら置き換え先 new.py を検出する"
+        detect_python_property_to_field(dir_str, "HEAD", "m.py", "m.py", "Container.member"),
+        Some("m.py".to_string()),
+        "Python の property を同じファイルのフィールドに置き換えたなら検出する"
     );
     assert_eq!(
-        detect_python_property_to_field(dir_str, "old.ts", "Container.member", &diff_new_paths),
+        detect_python_property_to_field(dir_str, "HEAD", "m.ts", "m.py", "Container.member"),
         None,
         "Python 以外の old_path は言語ガードで対象外"
     );
+    assert_eq!(
+        detect_python_property_to_field(dir_str, "HEAD", "m.py", "m.py", "Container.method"),
+        None,
+        "素のメソッドをフィールドに置き換えると `obj.method()` が壊れるので対象外"
+    );
+}
+
+/// `models.py` を `before` から `after` に書き換えたときの API 差分。`app.py` は変更しない。
+fn python_models_change(before: &str, after: &str) -> ApiChanges {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            ("models.py", before),
+            (
+                "app.py",
+                "from models import User\n\n\ndef show(u: User):\n    return u.name(), User.build(1)\n",
+            ),
+        ],
+        "base",
+    );
+    fs::write(repo.join("models.py"), after).expect("write");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "models.py".to_string(),
+        new_path: "models.py".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 20,
+            new_start: 1,
+            new_count: 20,
+        }],
+        deleted_old_source: None,
+    }];
+    detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files)
+}
+
+/// `def` 行が変わらなくても、束縛を変えるデコレータ (`@property` / `@staticmethod` /
+/// `@classmethod` / `@cached_property`) の付け外しは呼び出し方を変える (`u.name()` が
+/// TypeError になる)。signature に反映して api.mod に出す。
+#[test]
+fn detect_api_changes_python_binding_decorator_change_is_modified() {
+    let api = python_models_change(
+        "class User:\n    def name(self) -> str:\n        return \"x\"\n\n    @staticmethod\n    def build(value):\n        return value\n",
+        "class User:\n    @property\n    def name(self) -> str:\n        return \"x\"\n\n    @classmethod\n    def build(value):\n        return value\n",
+    );
+    let name = api
+        .modified
+        .iter()
+        .find(|m| m.name == "User.name")
+        .unwrap_or_else(|| {
+            panic!(
+                "@property の付与は api.mod に出すべき。modified={:?}",
+                api.modified.iter().map(|m| &m.name).collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        name.old_signature.as_deref(),
+        Some("def name(self) -> str:")
+    );
+    assert_eq!(
+        name.new_signature.as_deref(),
+        Some("@property def name(self) -> str:")
+    );
+    assert!(
+        api.modified.iter().any(|m| m.name == "User.build"),
+        "@staticmethod → @classmethod も api.mod に出すべき。modified={:?}",
+        api.modified.iter().map(|m| &m.name).collect::<Vec<_>>()
+    );
+
+    // 対照: 束縛を変えないデコレータの付与と、モジュール修飾だけの書き換えは api 差分にしない
+    let api = python_models_change(
+        "from functools import cached_property\n\n\nclass User:\n    def name(self) -> str:\n        return \"x\"\n\n    @cached_property\n    def build(self):\n        return 1\n",
+        "import functools\n\n\nclass User:\n    @functools.lru_cache\n    def name(self) -> str:\n        return \"x\"\n\n    @functools.cached_property\n    def build(self):\n        return 1\n",
+    );
+    let changed: Vec<&str> = api
+        .modified
+        .iter()
+        .chain(&api.modified_closed_in_diff)
+        .map(|m| m.name.as_str())
+        .chain(api.compatible_modified.iter().map(|m| m.name.as_str()))
+        .collect();
+    assert!(
+        changed.is_empty(),
+        "@lru_cache の付与や cached_property のモジュール修飾は呼び出し方を変えない。changed={changed:?}"
+    );
+}
+
+/// signature への反映は束縛を変えるデコレータだけで、正規形 (`@cached_property`) に畳む。
+#[test]
+fn python_function_signature_includes_only_binding_decorators() {
+    let src = "import functools\n\n\nclass User:\n    @functools.cached_property  # cache\n    def slug(self) -> str:\n        return \"x\"\n\n    @functools.lru_cache\n    def name(self) -> str:\n        return \"x\"\n\n\ndef helper(a):\n    return a\n";
+    let syms = extract_exported_symbols_from_source("m.py", src.as_bytes()).expect("parse");
+    let sig = |name: &str| {
+        syms.iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, _, s)| s.as_str())
+            .unwrap_or_else(|| panic!("{name} が抽出されない: {syms:?}"))
+    };
+    assert_eq!(sig("User.slug"), "@cached_property def slug(self) -> str:");
+    assert_eq!(sig("User.name"), "def name(self) -> str:");
+    assert_eq!(sig("helper"), "def helper(a):");
 }
 
 // ---------------------------------------------------------------------------

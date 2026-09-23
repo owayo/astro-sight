@@ -40,8 +40,9 @@ pub(crate) enum RefOrigin {
     ImportResolved { candidates: Rc<HashSet<String>> },
     /// Python: symbol の出現がすべて属性アクセス (`re.search` / `self.search`) で、
     /// レシーバの実効モジュール名が `receiver_module_names`。モジュールレベルの自由関数 /
-    /// クラスは `<module>.<name>` 形式でしか属性アクセス経由に到達できないため、
-    /// レシーバ名の中に削除モジュール名が無ければ残存シンボル由来と証明できる。
+    /// クラスは `<module>.<name>` (または再エクスポートした祖先パッケージの
+    /// `<package>.<name>`) 形式でしか属性アクセス経由に到達できないため、レシーバ名の中に
+    /// 削除モジュール名とその祖先パッケージ名が無ければ残存シンボル由来と証明できる。
     PythonAttributeAccess {
         receiver_module_names: Rc<HashSet<String>>,
     },
@@ -92,28 +93,38 @@ pub(crate) fn proves_survivor_origin(
             if candidate.kind == "method" || candidate.name.contains('.') {
                 return false;
             }
-            let Some(module) = python_module_name(candidate.old_path) else {
-                return false;
-            };
-            !receiver_module_names.contains(&module)
+            let modules = python_module_names(candidate.old_path);
+            !modules.is_empty()
+                && !modules
+                    .iter()
+                    .any(|module| receiver_module_names.contains(module))
         }
         RefOrigin::Unproven => false,
     }
 }
 
-/// 削除元 Python ファイルのモジュール名。`pkg/core.py` → `core`、
-/// `pkg/__init__.py` → `pkg` (パッケージ名で参照されるため)。
-fn python_module_name(old_path: &str) -> Option<String> {
+/// 削除元 Python ファイルのシンボルへ属性アクセスで到達しうるモジュール名。
+/// `pkg/core.py` → `core` / `pkg`、`pkg/__init__.py` → `pkg` (パッケージ名で参照されるため)。
+///
+/// 祖先ディレクトリ名も含めるのは、`pkg/__init__.py` の `from .core import search` のような
+/// 再エクスポートで `pkg.search` としても到達できるため。祖先が実際に再エクスポートして
+/// いるかは確かめず、すべて照合対象にする (証明を諦める側 = blocking 維持に倒れる)。
+fn python_module_names(old_path: &str) -> Vec<String> {
     let path = std::path::Path::new(old_path);
-    let stem = path.file_stem()?.to_str()?;
-    if stem == "__init__" {
-        return path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .map(str::to_string);
+    let mut names: Vec<String> = Vec::new();
+    if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        && stem != "__init__"
+    {
+        names.push(stem.to_string());
     }
-    Some(stem.to_string())
+    let mut ancestor = path.parent();
+    while let Some(dir) = ancestor {
+        if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+            names.push(name.to_string());
+        }
+        ancestor = dir.parent();
+    }
+    names
 }
 
 /// (ref_path, symbol) 単位のファイル解析結果。参照ループでキャッシュされ、
@@ -271,8 +282,9 @@ fn path_lang(path: &str) -> Option<LangId> {
 /// すべて属性アクセスなら、レシーバの「実効モジュール名」集合を返す。実効モジュール名は
 /// レシーバ式の末尾識別子を、そのファイルの `as` 別名 (`import pkg.core as c` / `from pkg
 /// import core as c`) で解決したもの。モジュールレベルの自由関数・クラスへ属性アクセスで
-/// 到達する経路は `<module>.<name>` だけなので、この集合に削除モジュール名が無ければ
-/// 削除シンボル由来ではないと言える。
+/// 到達する経路は `<module>.<name>` (と再エクスポートした祖先パッケージの `<package>.<name>`)
+/// だけなので、この集合に削除モジュール名と祖先パッケージ名が無ければ削除シンボル由来では
+/// ないと言える。
 ///
 /// bare identifier としての出現が 1 件でもあれば None を返し従来どおり残存参照として数える
 /// (`from core import search` の import 行や `search()` の直接呼び出しがこれに当たる)。
@@ -850,6 +862,35 @@ mod tests {
             &candidate("pkg/__init__.py", "search", "function"),
             &defs
         ));
+        // `pkg/__init__.py` の `from .util import helper` 経由で `pkg.helper()` と呼べるため、
+        // 祖先パッケージ名がレシーバなら証明しない (直下・多段とも)
+        assert!(!proves_survivor_origin(
+            &receivers(&["pkg"]),
+            &candidate("pkg/util.py", "helper", "function"),
+            &defs
+        ));
+        assert!(!proves_survivor_origin(
+            &receivers(&["pkg"]),
+            &candidate("pkg/sub/util.py", "helper", "function"),
+            &defs
+        ));
+        assert!(
+            !proves_survivor_origin(
+                &receivers(&["sub"]),
+                &candidate("pkg/sub/__init__.py", "helper", "function"),
+                &defs
+            ) && !proves_survivor_origin(
+                &receivers(&["pkg"]),
+                &candidate("pkg/sub/__init__.py", "helper", "function"),
+                &defs
+            )
+        );
+        // 対照: 削除モジュールとも祖先パッケージとも無関係なレシーバは従来どおり証明する
+        assert!(proves_survivor_origin(
+            &receivers(&["re", "other"]),
+            &candidate("pkg/util.py", "helper", "function"),
+            &defs
+        ));
         // メソッド削除は属性アクセスこそが正当な参照形 → 証明しない (fail-closed)
         assert!(!proves_survivor_origin(
             &receivers(&["re"]),
@@ -864,16 +905,15 @@ mod tests {
     }
 
     #[test]
-    fn python_module_name_uses_package_name_for_init() {
+    fn python_module_names_include_package_name_and_ancestors() {
+        assert_eq!(python_module_names("scripts/core.py"), ["core", "scripts"]);
+        assert_eq!(python_module_names("pkg/__init__.py"), ["pkg"]);
+        assert_eq!(python_module_names("core.py"), ["core"]);
         assert_eq!(
-            python_module_name("scripts/core.py").as_deref(),
-            Some("core")
+            python_module_names("src/pkg/sub/util.py"),
+            ["util", "sub", "pkg", "src"]
         );
-        assert_eq!(
-            python_module_name("pkg/__init__.py").as_deref(),
-            Some("pkg")
-        );
-        assert_eq!(python_module_name("core.py").as_deref(), Some("core"));
+        assert_eq!(python_module_names("a/pkg/__init__.py"), ["pkg", "a"]);
     }
 
     fn python_facts_for(src: &str, symbol: &str) -> RefAttributionFacts {

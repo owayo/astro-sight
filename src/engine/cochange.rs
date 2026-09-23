@@ -798,8 +798,13 @@ fn collect_changed_old_ranges(dir: &str, file: &str, base: &str) -> Result<Chang
     // revision は `<base>` 単独 (`<base> HEAD` ではない)。2 revision 形式では
     // 未コミットの作業ツリー変更が hunk に現れず、pre-commit レビュー時に
     // 変更行 blame の証拠が常に空になる (他の --git コマンドと意味を揃える)。
+    // 利用者の git 設定で出力形式が変わらないよう固定する。外部 diff が設定されていると
+    // git ごと失敗して起点の証拠が空になり、色設定では `@@` 行を読めなくなる
+    // (`GIT_DIFF_PARSEABLE_OUTPUT_ARGS` の doc 参照)。
     let diff_output = Command::new("git")
-        .args(["diff", "--unified=0", base, "--", file])
+        .arg("diff")
+        .args(crate::git_support::GIT_DIFF_PARSEABLE_OUTPUT_ARGS)
+        .args(["--unified=0", base, "--", file])
         .current_dir(dir)
         .output()
         .map_err(|e| AstroError::new(ErrorCode::IoError, format!("Failed to run git: {e}")))?;
@@ -1342,6 +1347,51 @@ mod tests {
         let diff = "diff --git a/foo b/foo\n@@ -10,3 +10,3 @@ ctx\n-x\n+x\n@@ -22 +25 @@ ctx\n-y\n+y\n@@ -100,0 +103,2 @@ ctx\n+a\n+b\n";
         let r = parse_hunk_old_ranges(diff);
         assert_eq!(r, vec![(10u64, 3u64), (22u64, 1u64)]);
+    }
+
+    /// 変更行 blame の起点となる hunk 旧側 range は、利用者の git 設定 (色・外部 diff) に
+    /// 左右されない。色付きでは `@@` 行を読めず、外部 diff では unified diff 自体が出ないため、
+    /// 起点の証拠が黙って空になっていた。
+    #[test]
+    fn collect_changed_old_ranges_ignores_user_diff_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        commit_files(
+            repo,
+            &[("a.rs", "fn a() {}\nfn b() {}\nfn c() {}\n")],
+            "init",
+        );
+        std::fs::write(repo.join("a.rs"), "fn a() {}\nfn b2() {}\nfn c() {}\n").unwrap();
+        let dir_str = repo.to_str().unwrap();
+
+        let expected = collect_changed_old_ranges(dir_str, "a.rs", "HEAD").unwrap();
+        assert_eq!(
+            expected.ranges,
+            vec![(2, 1)],
+            "前提: 既定設定では range を取れる"
+        );
+        for (key, value) in [
+            ("color.ui", "always"),
+            ("color.diff", "always"),
+            ("diff.external", "echo"),
+        ] {
+            let git_config = |args: &[&str]| {
+                assert!(
+                    std::process::Command::new("git")
+                        .args(args)
+                        .current_dir(repo)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            };
+            git_config(&["config", key, value]);
+            let got = collect_changed_old_ranges(dir_str, "a.rs", "HEAD").unwrap();
+            git_config(&["config", "--unset", key]);
+            assert!(!got.git_failed, "{key}: git diff が失敗してはいけない");
+            assert_eq!(got.ranges, expected.ranges, "{key}: hunk 旧側 range");
+        }
     }
 
     /// blame モード: 起点ファイルの過去変更行に関わるコミットで他ファイルが

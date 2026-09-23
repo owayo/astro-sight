@@ -28,7 +28,8 @@ pub(super) struct CrossFileFilterContext<'a> {
     pub(super) syms: &'a [Symbol],
     pub(super) hunks: &'a [HunkInfo],
     pub(super) sig_changes: &'a [SignatureChange],
-    /// diff 全体のテキスト (シンボル名が変更行に出現するかの照合に使う)。
+    /// 対象ファイルの diff 区間 (`diff::FileSections`。シンボル名が変更行に出現するかの
+    /// 照合に使う)。diff 全体を渡しても結果は同じだが、シンボルごとに走査するため遅い。
     pub(super) diff_input: &'a str,
     /// diff の新側パス。
     pub(super) file_path: &'a str,
@@ -123,12 +124,17 @@ impl CrossFileFilterContext<'_> {
         }
         // 4. エクスポートされていないシンボルをスキップ
         if !overlapping.is_some_and(|s| {
-            symbols::is_symbol_exported(self.root, self.source, self.lang_id, &s.range)
+            symbols::is_symbol_exported(self.root, self.source, self.lang_id, s.identity_range())
         }) {
             return false;
         }
-        // 5. 変更行にシンボル名が出現しない場合スキップ
-        if !is_symbol_in_changed_lines(self.diff_input, self.file_path, &sym.name, self.lang_id) {
+        // 5. 変更行にシンボル名が出現しない場合スキップ。
+        // ただしシグネチャ変更が検出済みのシンボルは除外しない。複数行の引数リストへの
+        // 引数追加 (`+    b: u32,`) は変更行に名前が出ないが、宣言ヘッダの比較で呼び出し
+        // 契約の変更と確定している (`declaration::reconcile_declaration_changes`)。
+        if !self.sig_changes.iter().any(|sc| sc.name == sym.name)
+            && !is_symbol_in_changed_lines(self.diff_input, self.file_path, &sym.name, self.lang_id)
+        {
             return false;
         }
         // 6. 新規追加シンボル (change_type == "added") は cross-file caller がまだない
@@ -184,10 +190,16 @@ fn is_js_ts_object_literal_variable(
     false
 }
 
-/// 同一ファイル判定。サフィックスマッチで偽陽性を出さないよう、完全一致 or パス区切り付き
-/// （`ref_path.ends_with("/{source_path}")`）で判定する。
+/// 同一ファイル判定。
+///
+/// 参照側 (`refs` の走査結果を `--dir` で strip したパス) も変更側 (`--relative` 付き
+/// `git diff` 由来の new_path) も `--dir` 相対なので完全一致で判定する。
+/// 旧実装は `ref_path.ends_with("/{source_path}")` も許していたため、`src/util.ts` を
+/// 変更すると `packages/app/src/util.ts` の呼び出し側まで「同じファイル内の参照」として
+/// 捨てていた (見逃し)。後方一致は参照パスが絶対パスだった頃の名残で、現在の経路では
+/// 参照パスは常に `--dir` 相対になる。
 pub(super) fn is_same_source_file(ref_path: &str, source_path: &str) -> bool {
-    ref_path == source_path || ref_path.ends_with(&format!("/{source_path}"))
+    ref_path == source_path
 }
 
 /// 参照のコンテキスト行が import/re-export 文かどうかを判定する。
@@ -499,6 +511,44 @@ mod tests {
         ));
     }
 
+    // 5. 変更行に名前が出ないシンボルでも、シグネチャ変更が確定していれば除外しない。
+    // 複数行の引数リストへの引数追加 (`+  b: number,`) は名前を含まないが、宣言ヘッダの比較で
+    // 呼び出し契約の変更と確定している (`declaration::reconcile_declaration_changes`)。
+    #[test]
+    fn cross_file_filter_keeps_signature_change_whose_name_is_not_on_changed_lines() {
+        let source = "export const arrow = (\n  a: number,\n  b: number,\n): number => a;\n";
+        let diff = "--- a/mod.ts\n+++ b/mod.ts\n@@ -1,3 +1,4 @@\n export const arrow = (\n   a: number,\n+  b: number,\n ): number => a;\n";
+        let bytes = source.as_bytes();
+        let tree = crate::engine::parser::parse_source(bytes, LangId::Typescript).expect("parse");
+        let root = tree.root_node();
+        let syms = symbols::extract_symbols(root, bytes, LangId::Typescript).expect("symbols");
+        let hunks = vec![HunkInfo {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 4,
+        }];
+        let changed_new_lines: HashSet<usize> = HashSet::from([2]);
+        let include = |sig_changes: &[SignatureChange]| {
+            CrossFileFilterContext {
+                syms: &syms,
+                hunks: &hunks,
+                sig_changes,
+                diff_input: diff,
+                file_path: "mod.ts",
+                root,
+                source: bytes,
+                lang_id: LangId::Typescript,
+                changed_new_lines: &changed_new_lines,
+            }
+            .should_include_for_cross_file(&affected("arrow", "variable", "modified"))
+        };
+        assert!(include(&[sig_change("arrow")]));
+        // 対照: シグネチャ変更が無ければ従来どおり「名前が変更行に無い」で除外する
+        // (本体だけの変更を cross-file 検索に載せない既存の抑制)。
+        assert!(!include(&[]));
+    }
+
     // 3b. 宣言ヘッダ行が変更行に含まれない型シンボルは除外 (body/コメントのみ変更)
     #[test]
     fn cross_file_filter_skips_struct_with_unchanged_header() {
@@ -524,9 +574,18 @@ mod tests {
         assert!(is_same_source_file("src/main.rs", "src/main.rs"));
     }
 
+    /// 変更ファイルと末尾が一致するだけの別ファイル (`packages/app/src/util.ts` と
+    /// `src/util.ts`) は同一ファイルではない。旧実装はパス区切り付きの後方一致で同一扱いし、
+    /// monorepo で同名パスを持つパッケージの呼び出し側を捨てていた。
     #[test]
-    fn same_source_file_with_prefix() {
-        assert!(is_same_source_file("other/src/main.rs", "src/main.rs"));
+    fn same_source_file_rejects_path_suffix_match() {
+        assert!(!is_same_source_file(
+            "packages/app/src/util.ts",
+            "src/util.ts"
+        ));
+        assert!(!is_same_source_file("other/src/main.rs", "src/main.rs"));
+        // 対照: 完全一致は引き続き同一ファイル。
+        assert!(is_same_source_file("src/util.ts", "src/util.ts"));
     }
 
     #[test]

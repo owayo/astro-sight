@@ -31,7 +31,9 @@ pub(crate) fn extract_symbol_lines(
     let mut map = HashMap::new();
     for s in symbols {
         // 同名シンボルが複数ある場合、最初に出現した行を保持する。
-        map.entry(s.name).or_insert(s.range.start.line);
+        // 宣言を共有する分割代入の束縛は、宣言の先頭ではなく名前の行を使う。
+        let line = s.name_line();
+        map.entry(s.name).or_insert(line);
     }
     Some(map)
 }
@@ -95,6 +97,7 @@ pub(crate) fn extract_api_signature(
                 match cur.kind() {
                     "function_item"
                     | "function_declaration"
+                    | "generator_function_declaration"
                     | "function_definition"
                     | "method_declaration"
                     | "method_definition"
@@ -138,7 +141,11 @@ pub(crate) fn extract_api_signature(
                             return sig;
                         }
                         if let Some(bytes) = source.get(s..e) {
-                            return normalize_signature_whitespace(bytes);
+                            let sig = normalize_signature_whitespace(bytes);
+                            if lang_id == crate::language::LangId::Python {
+                                return with_python_binding_decorators(cur, source, sig);
+                            }
+                            return sig;
                         }
                         break;
                     }
@@ -238,6 +245,33 @@ pub(crate) fn extract_api_signature(
         .to_string()
 }
 
+/// Python の関数 signature (`def` 〜 body 直前) の前に、呼び出し方 (束縛) を変える
+/// デコレータ (`@property` / `@cached_property` / `@staticmethod` / `@classmethod`) を
+/// 外側から順に付ける。
+///
+/// `function_definition` は `def` から始まるため、デコレータだけの変更 (メソッドに
+/// `@property` を付ける = 呼び出し側の `u.name()` が TypeError になる) が signature に
+/// 現れず api.mod から沈黙していた。束縛を変えないデコレータ (`@lru_cache` 等) まで
+/// 入れると、呼び出し互換な付け外しが blocking になるため対象を絞る。
+/// 該当デコレータが無ければ従来の signature をそのまま返す。
+fn with_python_binding_decorators(
+    fn_node: tree_sitter::Node<'_>,
+    source: &[u8],
+    sig: String,
+) -> String {
+    let decorators = python_binding_decorators(fn_node, source);
+    if decorators.is_empty() {
+        return sig;
+    }
+    let mut out = String::new();
+    for decorator in decorators {
+        out.push_str(decorator.signature_token());
+        out.push(' ');
+    }
+    out.push_str(&sig);
+    out
+}
+
 /// 宣言テキストから comment トークンを取り除いたうえで空白正規化する。
 ///
 /// 値バインディングの signature は初期化子を含む item 全体から作るため、素朴に
@@ -265,8 +299,23 @@ fn normalize_signature_dropping_comments(
     source: &[u8],
     keep_doc_comments: bool,
 ) -> Option<String> {
+    normalize_signature_eliding(node, source, keep_doc_comments, &[])
+}
+
+/// [`normalize_signature_dropping_comments`] に加え、`elided` の各範囲 (関数本体) を
+/// `{}` に置き換える。範囲内のコメントは本体ごと消える。
+fn normalize_signature_eliding(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    keep_doc_comments: bool,
+    elided: &[(usize, usize)],
+) -> Option<String> {
     let (start, end) = (node.start_byte(), node.end_byte());
-    let mut spans: Vec<(usize, usize)> = Vec::new();
+    // (開始, 終了, 置換文字列)。コメントは空白 1 個、省略する本体は `{}`。
+    let mut spans: Vec<(usize, usize, &[u8])> = elided
+        .iter()
+        .map(|&(s, e)| (s, e, b"{}".as_slice()))
+        .collect();
     let mut cursor = node.walk();
     let mut descend = true;
     loop {
@@ -278,7 +327,7 @@ fn normalize_signature_dropping_comments(
                     .get(current.start_byte()..current.end_byte())
                     .is_some_and(|b| b.starts_with(b"/**"));
             if !keep {
-                spans.push((current.start_byte(), current.end_byte()));
+                spans.push((current.start_byte(), current.end_byte(), b" ".as_slice()));
             }
         }
         // comment ノードは葉なので潜らない。
@@ -301,13 +350,14 @@ fn normalize_signature_dropping_comments(
     spans.sort_unstable();
     let mut out: Vec<u8> = Vec::with_capacity(end.saturating_sub(start));
     let mut pos = start;
-    for (s, e) in spans {
+    for (s, e, replacement) in spans {
         // 走査順の乱れや範囲外を拾っても壊れないよう、進行方向だけを信じる。
+        // 省略した本体の内側にあるコメントは `s < pos` でここに落ちる。
         if s < pos || e > end {
             continue;
         }
         out.extend_from_slice(source.get(pos..s)?);
-        out.push(b' ');
+        out.extend_from_slice(replacement);
         pos = e;
     }
     out.extend_from_slice(source.get(pos..end)?);
@@ -346,8 +396,25 @@ fn value_binding_signature(
                 return normalize_signature_dropping_comments(cur, source, false);
             }
             "variable_declarator" => {
+                // 分割代入の束縛は「その名前へ至る経路 + 初期化子」だけを signature にする
+                // (`destructured_binding_body`)。単純でないパターンは None が返り、
+                // declarator 全体へ倒す。
+                // 関数値 (`= () => {..}` 等) は本体を省く (`js_function_value_body_spans`)。
                 // JS/TS は JSDoc (`/** @type {...} */`) が型アサーションとして効くので残す。
-                let body = normalize_signature_dropping_comments(cur, source, true)?;
+                let body = match sym
+                    .name_range
+                    .as_ref()
+                    .and_then(|name_range| destructured_binding_body(cur, name_range, source))
+                {
+                    Some(body) => body,
+                    None => {
+                        let mut elided = Vec::new();
+                        if let Some(value) = cur.child_by_field_name("value") {
+                            js_function_value_body_spans(value, source, &mut elided);
+                        }
+                        normalize_signature_eliding(cur, source, true, &elided)?
+                    }
+                };
                 let mut prefix = String::new();
                 // 宣言 keyword と export を辿って補う。
                 let mut ancestor = cur.parent();
@@ -377,6 +444,204 @@ fn value_binding_signature(
             _ => {}
         }
         cur = cur.parent()?;
+    }
+}
+
+/// 値バインディングの初期化子のうち、**バインディングの値そのものである関数**の本体範囲を
+/// 集める (signature から `{}` に置き換える)。
+///
+/// 値バインディングの signature は宣言全体なので、`export const Button = () => {..}` の
+/// JSX を 1 文字直しただけで blocking な api.mod になっていた (同じ変更を
+/// `export function Button` で書けば本体を除いた宣言だけが signature なので何も出ない)。
+/// アロー関数コンポーネントが主流の React では本体編集のたびに Stop hook が止まる。
+/// 関数宣言と揃えて、次の位置の関数本体だけを省く:
+/// - 値そのものが関数 (括弧・`as`・`satisfies`・`!` で包まれていても辿る)
+/// - React の HOC `memo` / `forwardRef` (`React.*` 含む) の引数の関数
+///   (描画ロジックで、コンポーネントの契約は引数と型引数に現れる)
+/// - オブジェクトリテラルのメンバーの関数 (メソッド・`key: () => ..`)。キーの追加・削除や
+///   関数から値への差し替えは本体を省いても signature に残る
+///
+/// 任意の呼び出しの引数 (`create((set) => ({ .. }))` / `compute(() => 1)`) は辿らない。
+/// コールバックの中身がストアの形や値そのものを決める (= 契約) ことがあるため。
+fn js_function_value_body_spans(
+    value: tree_sitter::Node<'_>,
+    source: &[u8],
+    out: &mut Vec<(usize, usize)>,
+) {
+    match value.kind() {
+        "parenthesized_expression"
+        | "as_expression"
+        | "satisfies_expression"
+        | "non_null_expression" => {
+            if let Some(inner) = value.named_child(0) {
+                js_function_value_body_spans(inner, source, out);
+            }
+        }
+        "arrow_function" | "function_expression" | "generator_function" => {
+            if let Some(body) = value.child_by_field_name("body") {
+                out.push((body.start_byte(), body.end_byte()));
+            }
+        }
+        "call_expression" => {
+            if value
+                .child_by_field_name("function")
+                .is_some_and(|callee| is_react_component_hoc(callee, source))
+                && let Some(args) = value.child_by_field_name("arguments")
+            {
+                let mut cursor = args.walk();
+                for arg in args.named_children(&mut cursor) {
+                    js_function_value_body_spans(arg, source, out);
+                }
+            }
+        }
+        "object" => {
+            let mut cursor = value.walk();
+            for member in value.named_children(&mut cursor) {
+                match member.kind() {
+                    "method_definition" => {
+                        if let Some(body) = member.child_by_field_name("body") {
+                            out.push((body.start_byte(), body.end_byte()));
+                        }
+                    }
+                    "pair" => {
+                        if let Some(member_value) = member.child_by_field_name("value") {
+                            js_function_value_body_spans(member_value, source, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 呼び出し先が React の `memo` / `forwardRef` (`React.memo` / `React.forwardRef` を含む) か。
+fn is_react_component_hoc(callee: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let is_hoc_name =
+        |node: tree_sitter::Node<'_>| matches!(node.utf8_text(source), Ok("memo" | "forwardRef"));
+    match callee.kind() {
+        "identifier" => is_hoc_name(callee),
+        "member_expression" => {
+            callee
+                .child_by_field_name("object")
+                .is_some_and(|object| object.utf8_text(source).ok() == Some("React"))
+                && callee
+                    .child_by_field_name("property")
+                    .is_some_and(is_hoc_name)
+        }
+        _ => false,
+    }
+}
+
+/// 分割代入の束縛 1 つ分の signature 本体 (`<経路パターン>[: 型] = <初期化子>`) を作る。
+///
+/// declarator 全体を signature にすると、兄弟の束縛を消しただけで生き残った束縛の
+/// signature まで変わり、契約が変わっていない束縛が blocking な api.mod に載る
+/// (`export const { auth, signOut } = NextAuth()` から `signOut` を消すと `auth` も
+/// 「変更」になる)。そこで「その名前へ至る経路」だけを残したパターンへ正規化する。
+/// 配列は位置が契約なので穴で添字を保つ (`[first, second]` → `[, second]` は同一、
+/// `[second]` は添字 1 → 0 の変更として検出する)。
+///
+/// 兄弟の差分を捨ててよいのは、パターンが評価を伴わない単純な束縛だけでできている
+/// ときに限る。default 値 (`{ a = f() }`)・computed key (`{ [k()]: v }`) は兄弟の評価が
+/// 副作用を持ちうるうえ、rest (`{ a, ...rest }`) は兄弟の集合で中身が決まる。これらを
+/// 1 つでも含むパターンは None を返し、呼び出し側が declarator 全体を signature にする
+/// (= 兄弟の変更でも api.mod に倒す保守側)。
+fn destructured_binding_body(
+    declarator: tree_sitter::Node<'_>,
+    name_range: &crate::models::location::Range,
+    source: &[u8],
+) -> Option<String> {
+    let pattern = declarator.child_by_field_name("name")?;
+    if !matches!(pattern.kind(), "object_pattern" | "array_pattern")
+        || pattern_has_non_static_element(pattern)
+    {
+        return None;
+    }
+    let mut target = None;
+    let _ = crate::engine::js_binding_pattern::visit_pattern_bindings(pattern, &mut |binding| {
+        if crate::models::location::Range::from(binding.range()) == *name_range {
+            target = Some(binding);
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    let mut body = binding_path_text(pattern, target?, source)?;
+    if let Some(ty) = declarator.child_by_field_name("type") {
+        body.push_str(&normalize_signature_dropping_comments(ty, source, true)?);
+    }
+    if let Some(value) = declarator.child_by_field_name("value") {
+        body.push_str(" = ");
+        body.push_str(&normalize_signature_dropping_comments(value, source, true)?);
+    }
+    Some(body)
+}
+
+/// パターンに default 値・computed key・rest を含むか (= 束縛ごとの正規化が安全でない)。
+fn pattern_has_non_static_element(pattern: tree_sitter::Node<'_>) -> bool {
+    let mut stack = vec![pattern];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "assignment_pattern"
+                | "object_assignment_pattern"
+                | "computed_property_name"
+                | "rest_pattern"
+        ) {
+            return true;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
+/// `node` (パターン) から束縛 `target` へ至る経路だけを残したパターン文字列を作る。
+/// 例: `{ a, b: { c } }` の `c` → `{ b: { c } }`、`[x, , y]` の `y` → `[, , y]`。
+fn binding_path_text(
+    node: tree_sitter::Node<'_>,
+    target: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<String> {
+    let text = |n: tree_sitter::Node<'_>| n.utf8_text(source).ok().map(str::to_string);
+    let contains = |outer: tree_sitter::Node<'_>| {
+        outer.start_byte() <= target.start_byte() && target.end_byte() <= outer.end_byte()
+    };
+    if node.id() == target.id() {
+        return text(node);
+    }
+    let mut cursor = node.walk();
+    match node.kind() {
+        "object_pattern" => {
+            let child = node
+                .named_children(&mut cursor)
+                .find(|child| contains(*child))?;
+            match child.kind() {
+                "shorthand_property_identifier_pattern" => Some(format!("{{ {} }}", text(child)?)),
+                "pair_pattern" => {
+                    let key = text(child.child_by_field_name("key")?)?;
+                    let inner =
+                        binding_path_text(child.child_by_field_name("value")?, target, source)?;
+                    Some(format!("{{ {key}: {inner} }}"))
+                }
+                _ => None,
+            }
+        }
+        "array_pattern" => {
+            // 添字 = 対象要素より前の `,` の数 (穴 `[, x]` も 1 要素として数える)。
+            let mut index = 0usize;
+            for child in node.children(&mut cursor) {
+                if child.kind() == "," {
+                    index += 1;
+                } else if child.is_named() && contains(child) {
+                    let inner = binding_path_text(child, target, source)?;
+                    return Some(format!("[{}{inner}]", ", ".repeat(index)));
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -507,6 +772,14 @@ pub(crate) fn extract_js_binding_shape(
         return None;
     }
     let declarator = declarators[0];
+    // 分割代入 (`const { a } = obj`) は値の変更で各束縛の型も中身も変わりうるため、
+    // 値のみの変更 (const_value_changes) へ降格させない。単純な束縛だけを対象にする。
+    if declarator
+        .child_by_field_name("name")
+        .is_none_or(|name| name.kind() != "identifier")
+    {
+        return None;
+    }
     let value = declarator.child_by_field_name("value");
     let has_type_annotation = declarator.child_by_field_name("type").is_some();
 

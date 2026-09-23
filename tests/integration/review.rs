@@ -1443,3 +1443,50 @@ fn review_cochange_omits_source_test_for_snapshot_only_update() {
         "--include-generated では方向付けを無効化する。got: {inclusive:?}"
     );
 }
+
+/// 対応言語でないファイルへの `git mv` (`api.ts` → `api.ts.bak`) は、`review --git --hook` で
+/// 旧 API の削除として blocking に報告する。
+///
+/// 内容同一の rename は hunk を持たないため `parse_unified_diff` に現れず、旧実装は API 差分に
+/// 何も渡らないまま exit 0 で通っていた (同じファイルを `git rm` すれば api.rm で止まる)。
+/// 対応言語への `git mv` は従来どおり何も報告しない (対照)。
+#[test]
+fn review_git_hook_reports_rename_to_unsupported_extension_as_removal() {
+    let run = |target: &str| {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.create_dir_all("src");
+        repo.write(
+            "src/api.ts",
+            "export function fetchUser(id: string): string {\n  return id;\n}\n",
+        );
+        repo.write(
+            "src/app.ts",
+            "import { fetchUser } from \"./api\";\n\nexport function main(): string {\n  return fetchUser(\"1\");\n}\n",
+        );
+        repo.commit_all("init");
+        repo.git(["mv", "src/api.ts", target]);
+        cargo_bin()
+            .args(["review", "--dir"])
+            .arg(repo.root())
+            .args(["--git", "--hook"])
+            .output()
+            .expect("failed to run review --git --hook")
+    };
+
+    let output = run("src/api.ts.bak");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "blocking にすべき: {stderr}");
+    assert!(
+        stderr.contains(r#""rm":[{"f":"src/api.ts","n":"fetchUser"}]"#),
+        "旧ファイルの API 削除を報告すべき: {stderr}"
+    );
+
+    // 対照: 対応言語への rename は内容が同じなら API を変えない。
+    let output = run("src/client.ts");
+    assert!(
+        output.status.success() && output.stderr.is_empty(),
+        "対応言語への rename では何も報告しない: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

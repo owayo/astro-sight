@@ -13,8 +13,7 @@ pub(crate) fn bare_name(qualname: &str) -> &str {
 /// count_non_definition_refs_split で production / test 別に件数のみカウントし、
 /// SymbolReference を確保しない。
 pub(crate) fn extract_exported_symbols_from_git(
-    dir: &str,
-    base: &str,
+    base_blobs: &crate::commands::git_input::GitBlobBatch,
     file_path: &str,
 ) -> Option<Vec<(String, String, String)>> {
     // テストファイル配下のシンボルは API 差分検出の対象外。
@@ -22,8 +21,9 @@ pub(crate) fn extract_exported_symbols_from_git(
     if is_test_path(std::path::Path::new(file_path)) {
         return Some(Vec::new());
     }
-    // revision / path の検証は git_show_blob 側で強制される
-    let old_source = git_show_blob(dir, base, file_path)?;
+    // 旧版は常駐 `git cat-file --batch` で読む (ファイルごとの `git show` 起動を避ける)。
+    // revision / path の検証と取得失敗時の None は git_show_blob と同一。
+    let old_source = base_blobs.read(file_path)?;
     extract_exported_symbols_from_source(file_path, &old_source)
 }
 
@@ -137,6 +137,8 @@ pub(crate) struct ExportSurfaceContext<'tree, 'source> {
     exclude_framework_entrypoints: bool,
     file_path: Option<&'source str>,
     containers: Vec<&'source Symbol>,
+    /// Rust の関連定数の owner 候補 (型宣言 / trait / impl ブロック)。Rust 以外では空。
+    rust_const_owners: Vec<&'source Symbol>,
     unittest_classes: HashSet<String>,
     python_export_policy: Option<crate::engine::symbols::PythonModuleExportPolicy>,
 }
@@ -169,6 +171,25 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
                 )
             })
             .collect();
+        // 関数 / メソッドの container (`symbols::assign_enclosing_containers`) と同じ候補集合。
+        // impl ブロック (kind = Type) を含めないと `impl A { pub const KIND }` の owner が引けない。
+        let rust_const_owners = if lang_id == crate::language::LangId::Rust {
+            syms.iter()
+                .filter(|sym| {
+                    matches!(
+                        sym.kind,
+                        SymbolKind::Class
+                            | SymbolKind::Struct
+                            | SymbolKind::Trait
+                            | SymbolKind::Interface
+                            | SymbolKind::Enum
+                            | SymbolKind::Type
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Python 限定: 同一ファイル内の `unittest.TestCase` 派生クラスを固定点計算で解決する。
         // dead-code 経路だけで使うため、実行時入口を除外する場合に限って構築する。
@@ -192,6 +213,7 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
             exclude_framework_entrypoints,
             file_path,
             containers,
+            rust_const_owners,
             unittest_classes,
             python_export_policy,
         }
@@ -271,11 +293,12 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
                 policy,
             )
         } else {
+            // 宣言を共有するシンボル (分割代入の束縛) は名前ノードで判定する。
             crate::engine::symbols::is_symbol_exported(
                 self.root,
                 self.source,
                 self.lang_id,
-                &sym.range,
+                sym.identity_range(),
             )
         };
         if !is_exported {
@@ -357,6 +380,16 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
                 self.lang_id,
                 &sym.range,
             )
+        {
+            return true;
+        }
+        // Rust の trait 本体で宣言されたメソッド (必須 / default) は trait 契約の一部。
+        // API 差分では削除・シグネチャ変更を検出する一方、dead-code (実行時入口を除外する
+        // 経路) では「未参照の実装」として扱わない。実装側は trait impl として別途除外済みで、
+        // 契約メソッドの要否は trait 単位で決まる (呼び出しが下流クレートにしか無いことも多い)。
+        if self.exclude_framework_entrypoints
+            && self.lang_id == crate::language::LangId::Rust
+            && crate::engine::symbols::is_rust_trait_declared_method(self.root, &sym.range)
         {
             return true;
         }
@@ -480,11 +513,12 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
         {
             return true;
         }
-        // Angular `@Component` / `@Directive` 装飾クラスの runtime entrypoint メンバー。
-        // 以下の 3 系統を統合判定する (詳細は is_js_ts_angular_runtime_entrypoint):
+        // Angular ランタイムが呼ぶ runtime entrypoint メンバー。
+        // 以下の 4 系統を統合判定する (詳細は is_js_ts_angular_runtime_entrypoint):
         //   1. lifecycle hook メソッド (`ngOnInit` / `ngAfterViewChecked` 等、既存)
         //      Angular ランタイムが change detection サイクルで自動呼出するため静的 caller が無い。
-        //      GitLab issue #8 対応。
+        //      GitLab issue #8 対応。service (`@Injectable`) / pipe (`@Pipe`) は破棄時の
+        //      `ngOnDestroy` だけが呼ばれるので、それ以外の hook は除外しない。
         //   2. ControlValueAccessor 規約メソッド (`writeValue` / `registerOnChange` /
         //      `registerOnTouched` / `setDisabledState`)。`implements ControlValueAccessor` または
         //      decorator metadata 内の `NG_VALUE_ACCESSOR` provider をシグナルとして判定。
@@ -493,6 +527,7 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
         //   3. member 単位の Angular decorator (`@HostListener` / `@HostBinding` / `@Input` /
         //      `@Output` / `@ViewChild` / `@ViewChildren` / `@ContentChild` / `@ContentChildren`)
         //      が付与された method/property。GitLab issue #23 対応。
+        //   4. `@Pipe` 装飾クラスの `transform` (テンプレートの `| name` から呼ばれる)。
         if self.exclude_framework_entrypoints
             && matches!(
                 self.lang_id,
@@ -591,6 +626,22 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
         {
             return true;
         }
+        // 言語規約のプログラムエントリポイント (C / C++ / Kotlin の `main`、
+        // Java / C# の `main` / `Main` とそれを宣言する型)。
+        // ランタイムやローダが規約の名前で呼ぶため、リポジトリ内の呼び出し元は 0 件が正常。
+        // Laravel と同じく dead-code 経路だけで除外し、API 差分には残す
+        // (形に依存する判定を旧版 / 新版へ当てると片側だけ除外され api.add / api.rm を誤る)。
+        if self.exclude_framework_entrypoints
+            && crate::engine::symbols::is_program_entrypoint(
+                self.root,
+                self.source,
+                self.lang_id,
+                sym.kind,
+                &sym.range,
+            )
+        {
+            return true;
+        }
 
         false
     }
@@ -604,6 +655,14 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
                 return format!("{container}.{}", sym.name);
             }
             enclosing_container(sym, &self.containers)
+                .map(|c| format!("{}.{}", c.name, sym.name))
+                .unwrap_or_else(|| sym.name.clone())
+        } else if self.lang_id == crate::language::LangId::Rust && sym.kind == SymbolKind::Constant
+        {
+            // 関連定数 (`impl A { pub const KIND }` / trait の `const`) も owner で区別する。
+            // bare 名のままだと別 impl の同名定数が 1 つに潰れ、片方だけの削除・型変更を
+            // 突き合わせられない。owner を引けない (トップレベル / inline mod) なら bare 名。
+            enclosing_container(sym, &self.rust_const_owners)
                 .map(|c| format!("{}.{}", c.name, sym.name))
                 .unwrap_or_else(|| sym.name.clone())
         } else {

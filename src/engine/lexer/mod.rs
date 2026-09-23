@@ -439,6 +439,7 @@ pub fn extract_symbols(source: &[u8], lang: LexerLang) -> Vec<Symbol> {
                         complexity: None,
                         container: None,
                         children: Vec::new(),
+                        name_range: None,
                     });
                 }
             }
@@ -473,6 +474,7 @@ pub fn extract_symbols(source: &[u8], lang: LexerLang) -> Vec<Symbol> {
                 complexity: None,
                 container: None,
                 children: Vec::new(),
+                name_range: None,
             });
         }
     }

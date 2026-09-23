@@ -51,6 +51,18 @@ pub struct FileScanOptions {
     pub include_generated: bool,
 }
 
+impl FileScanOptions {
+    /// dead-code の参照集計 (件数・member liveness・解析できないソースの申告) の走査条件。
+    ///
+    /// 生成物は dead 候補からは外すが、参照の集計には `--include-generated` と無関係に必ず
+    /// 含める。生成コードは実行時に手書きコードを呼ぶ本物のソースで (gRPC の生成ハンドラ →
+    /// サーバ実装、DI の生成コード → コンストラクタなど)、その参照を捨てると生きている
+    /// シンボルを dead と報告する (最悪方向の誤り)。
+    pub const DEAD_CODE_REFERENCES: Self = Self {
+        include_generated: true,
+    };
+}
+
 /// Files selected for parsing plus generated files intentionally omitted.
 #[derive(Debug, Default)]
 pub struct FileCollection {
@@ -63,12 +75,12 @@ pub struct FileCollection {
 impl FileCollection {
     /// Build bounded, deterministic metadata for machine-readable command output.
     pub fn skipped(&self, dir: &Path) -> Option<SkippedFiles> {
-        if self.skipped_generated.is_empty() {
-            return None;
-        }
-        let generated = self.skipped_generated.len();
-        let mut paths: Vec<String> = self
-            .skipped_generated
+        skipped_files_from_relative(self.skipped_generated_relative(dir))
+    }
+
+    /// 生成物として走査から外したファイルの `dir` 相対パス (未ソート)。
+    pub fn skipped_generated_relative(&self, dir: &Path) -> Vec<String> {
+        self.skipped_generated
             .iter()
             .map(|path| {
                 path.strip_prefix(dir)
@@ -76,14 +88,7 @@ impl FileCollection {
                     .to_string_lossy()
                     .to_string()
             })
-            .collect();
-        paths.sort();
-        paths.truncate(SKIPPED_PATHS_CAP);
-        Some(SkippedFiles {
-            generated,
-            truncated: generated > paths.len(),
-            paths,
-        })
+            .collect()
     }
 
     /// 解析できなかったソースを拡張子単位に畳んで打ち切り申告にする。
@@ -129,6 +134,25 @@ impl FileCollection {
             })
             .collect()
     }
+}
+
+/// 生成物として外したファイルの `dir` 相対パスから、出力用の申告を組み立てる (空なら `None`)。
+///
+/// 件数は重複を除いた全件、`paths` は昇順ソート後の先頭 [`SKIPPED_PATHS_CAP`] 件
+/// (出力量をリポジトリの生成物の数に比例させず、出力を決定論に保つ)。
+pub fn skipped_files_from_relative(mut paths: Vec<String>) -> Option<SkippedFiles> {
+    if paths.is_empty() {
+        return None;
+    }
+    paths.sort();
+    paths.dedup();
+    let generated = paths.len();
+    paths.truncate(SKIPPED_PATHS_CAP);
+    Some(SkippedFiles {
+        generated,
+        truncated: generated > paths.len(),
+        paths,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,6 +409,22 @@ fn has_generated_marker(path: &Path) -> bool {
 /// 妥当性を問わずバイト列としてマッチさせる (memchr::memmem)。
 fn head_has_generated_marker(head: &[u8]) -> bool {
     crate::engine::generated::head_declares_generated(head)
+}
+
+/// 収集済みファイルの言語を、parse と同じ規則 (拡張子、拡張子が無ければ shebang) で判定する。
+///
+/// `collect_files` は拡張子なしの実行スクリプト (`bin/console` の `#!/usr/bin/env php` 等) も
+/// shebang で走査対象に残す。走査集合を言語で絞り込む側が拡張子だけで判定すると、参照件数の
+/// 経路とは別の集合を見ることになり、スクリプトからしか使われないシンボルを取りこぼす。
+/// 内容を parse しないので `.h` の C/C++ 切り替え (`parser::detect_lang`) は行わない。
+pub(crate) fn detect_source_lang(path: &Path) -> Option<LangId> {
+    if let Ok(lang) = LangId::from_path(camino::Utf8Path::new(path.to_str()?)) {
+        return Some(lang);
+    }
+    if path.extension().is_some() {
+        return None;
+    }
+    detect_lang_from_shebang_head(&read_head_4k(path)?)
 }
 
 /// 読み込み済み先頭バッファの shebang 行から言語を判定する。

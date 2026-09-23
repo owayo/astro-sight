@@ -326,6 +326,138 @@ export class AppComponent {
     );
 }
 
+fn dead_code_names(root: &std::path::Path) -> Vec<String> {
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Angular は service (`@Injectable`) と pipe (`@Pipe`) の破棄時にも `ngOnDestroy` を呼び、
+/// pipe の `transform` はテンプレートの `| name` から呼ぶ。どちらも TS 上の caller は 0 件が
+/// 正常なので dead から除外する。service / pipe に `ngOnInit` などの他の hook は呼ばれないので、
+/// そちらは dead のまま残す (hook 名を広げない)。
+#[test]
+fn dead_code_excludes_angular_service_and_pipe_runtime_methods() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src/app")).unwrap();
+    std::fs::write(
+        root.join("src/app/poller.service.ts"),
+        "\
+import { Injectable, OnDestroy } from '@angular/core';
+@Injectable({ providedIn: 'root' })
+export class PollerService implements OnDestroy {
+    ngOnDestroy(): void {}
+    ngOnInit(): void {}
+}
+",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/app/trim.pipe.ts"),
+        "\
+import { Pipe, PipeTransform } from '@angular/core';
+@Pipe({ name: 'trim' })
+export class TrimPipe implements PipeTransform {
+    transform(value: string): string { return value.trim(); }
+    ngOnDestroy(): void {}
+    unusedHelper(): void {}
+}
+",
+    )
+    .unwrap();
+
+    let dead_names = dead_code_names(root);
+    for live in [
+        "PollerService.ngOnDestroy",
+        "TrimPipe.transform",
+        "TrimPipe.ngOnDestroy",
+    ] {
+        assert!(
+            !dead_names.iter().any(|n| n == live),
+            "{live} は Angular ランタイムが呼ぶので dead ではない: {dead_names:?}"
+        );
+    }
+    // 対照: service の ngOnInit は Angular に呼ばれず、pipe の自前メソッドも規約外。
+    for dead in ["PollerService.ngOnInit", "TrimPipe.unusedHelper"] {
+        assert!(
+            dead_names.iter().any(|n| n == dead),
+            "{dead} は dead として残るべき: {dead_names:?}"
+        );
+    }
+}
+
+/// 言語規約のエントリポイント (`main` / `Main`) はランタイムやローダが名前で呼ぶので、
+/// リポジトリ内の caller が 0 件でも dead ではない。Java / C# は入口を宣言する型も
+/// ビルド設定からしか参照されないので対象にする。入口と同じ型・ファイルにある
+/// 他の未参照シンボルは引き続き dead として報告する (対照)。
+#[test]
+fn dead_code_excludes_program_entrypoints() {
+    let cases: [(&str, &str, &[&str], &[&str]); 5] = [
+        (
+            "main.c",
+            "int main(void) { return 0; }\nint unused_c_helper(void) { return 1; }\n",
+            &["main"],
+            &["unused_c_helper"],
+        ),
+        (
+            "main.cpp",
+            "#include <cstdio>\nint main() { return 0; }\nint unused_cpp_helper() { return 1; }\n",
+            &["main"],
+            &["unused_cpp_helper"],
+        ),
+        (
+            "Main.kt",
+            "fun main(args: Array<String>) {}\nfun unusedHelper() {}\n",
+            &["main"],
+            &["unusedHelper"],
+        ),
+        (
+            "App.java",
+            "public class App {\n    public static void main(String[] args) {}\n    public static void unusedHelper() {}\n}\n",
+            &["App", "App.main"],
+            &["App.unusedHelper"],
+        ),
+        (
+            "Program.cs",
+            "class Program\n{\n    static void Main(string[] args) {}\n    public static void UnusedHelper() {}\n}\n",
+            &["Program", "Program.Main"],
+            &["Program.UnusedHelper"],
+        ),
+    ];
+    for (file, source, live, dead) in cases {
+        // 同名の `main` が複数ファイルにあると同名スキップに当たるので言語ごとに分ける。
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(file), source).unwrap();
+        let dead_names = dead_code_names(dir.path());
+        for name in live {
+            assert!(
+                !dead_names.iter().any(|n| n == name),
+                "{file}: エントリポイント {name} は dead ではない: {dead_names:?}"
+            );
+        }
+        for name in dead {
+            assert!(
+                dead_names.iter().any(|n| n == name),
+                "{file}: {name} は dead として残るべき: {dead_names:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn dead_code_excludes_angular_component_referenced_by_selector_tag() {
     // GitLab #26: standalone component class は TS 上の直接参照が無くても、
@@ -545,6 +677,105 @@ fn dead_code_skips_linguist_generated_files() {
     assert!(
         names.contains(&"unused_hand_written_symbol"),
         "通常ファイルの未参照シンボルは dead として報告されるべき: {names:?}"
+    );
+}
+
+/// 生成ファイルは dead 判定の**候補**から外すだけで、その中の参照は数える。
+///
+/// gRPC の生成ハンドラ (`*_grpc.pb.go`) だけが手書きのサーバ実装を呼ぶ構成で、旧実装は
+/// 生成ファイルを参照の走査からも外していたため、生きている `Server.SayHello` を dead と
+/// 報告していた (`--include-generated` も dead-code には配線されておらず、除外の申告も
+/// 無かった)。候補から外した生成ファイルは `generated_candidates_skipped` で申告し、
+/// `--include-generated` では生成ファイルのシンボルも候補にする。
+#[test]
+fn dead_code_counts_references_inside_generated_files() {
+    const GENERATED: &str = "\
+// Code generated by protoc-gen-go-grpc. DO NOT EDIT.
+
+package api
+
+type GreeterServer interface {
+\tSayHello(name string) string
+}
+
+func Dispatch(s GreeterServer) string {
+\treturn s.SayHello(\"x\")
+}
+";
+    const SERVER: &str = "\
+package server
+
+type Server struct{}
+
+func (s *Server) SayHello(name string) string {
+\treturn \"hello \" + name
+}
+
+func (s *Server) Unused() {}
+";
+    fn dead_names(json: &serde_json::Value) -> Vec<String> {
+        json["dead_symbols"]
+            .as_array()
+            .expect("dead_symbols 配列")
+            .iter()
+            .filter_map(|s| s["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    let repo = TestRepo::new();
+    repo.create_dir_all("api");
+    repo.create_dir_all("server");
+    repo.write("api/greeter_grpc.pb.go", GENERATED);
+    repo.write("server/server.go", SERVER);
+
+    let default = repo.run_json("dead-code", &[]);
+    let dead = dead_names(&default);
+    assert!(
+        !dead.iter().any(|n| n == "Server.SayHello"),
+        "生成ハンドラから呼ばれるサーバ実装は live: {default}"
+    );
+    // 対照: 生成ファイルから呼ばれていないメソッドは dead のまま。
+    assert!(
+        dead.iter().any(|n| n == "Server.Unused"),
+        "どこからも呼ばれないメソッドは dead: {default}"
+    );
+    // 生成ファイル自身のシンボルは既定では候補にしない (未参照の Dispatch も報告しない)。
+    assert!(!dead.iter().any(|n| n == "Dispatch"), "{default}");
+    assert_eq!(
+        default["generated_candidates_skipped"],
+        serde_json::json!({"generated": 1, "paths": ["api/greeter_grpc.pb.go"]}),
+        "候補から外した生成ファイルを申告する: {default}"
+    );
+
+    // --include-generated: 生成ファイルも候補になり、申告は消える。参照の数え方は同じ。
+    let included = repo.run_json("dead-code", &["--include-generated"]);
+    let dead = dead_names(&included);
+    assert!(
+        dead.iter().any(|n| n == "Dispatch"),
+        "生成ファイルの未参照シンボルも候補になる: {included}"
+    );
+    assert!(!dead.iter().any(|n| n == "Server.SayHello"), "{included}");
+    assert!(
+        included.get("generated_candidates_skipped").is_none(),
+        "{included}"
+    );
+
+    // --git: diff に入った生成ファイルも候補から外して申告し、参照は数える。
+    repo.init_git();
+    repo.commit_all("init");
+    repo.write(
+        "api/greeter_grpc.pb.go",
+        format!("{GENERATED}\n// regenerated\n"),
+    );
+    repo.write("server/server.go", format!("{SERVER}\n// touched\n"));
+    let git = repo.run_json("dead-code", &["--git"]);
+    let dead = dead_names(&git);
+    assert!(!dead.iter().any(|n| n == "Server.SayHello"), "{git}");
+    assert!(dead.iter().any(|n| n == "Server.Unused"), "{git}");
+    assert_eq!(
+        git["generated_candidates_skipped"]["paths"],
+        serde_json::json!(["api/greeter_grpc.pb.go"]),
+        "{git}"
     );
 }
 

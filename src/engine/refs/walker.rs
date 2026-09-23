@@ -11,10 +11,12 @@ use crate::engine::phpunit_refs::phpunit_metadata_ref_segments;
 use crate::language::{LangId, normalize_identifier};
 use crate::models::reference::{RefConfidence, RefKind, SymbolReference};
 
+use super::definition::cpp::cpp_macro_body_ref_segments;
 use super::definition::php::php_name_is_case_insensitive;
 use super::definition::php::{
     php_callable_array_method_segment, php_string_callable_method_segment,
 };
+use super::definition::ruby::ruby_symbol_ref_segment;
 use super::definition::rust::{
     RustPatternBindingCache, is_rust_closure_bound_identifier, is_rust_struct_field_non_callable,
     rust_attr_string_ref_segments,
@@ -52,7 +54,7 @@ fn node_ref_domain(lang_id: LangId, node: Node<'_>) -> RefKeyDomain {
 
 /// 文字列セグメント由来の参照 (PHPUnit metadata / callable array / `'Class@method'`) の
 /// 照合ドメイン。PHP のこれらのセグメントは常にメソッド名なので case-insensitive。
-/// Rust/Bash のセグメントは従来どおり `normalize_identifier` に従う。
+/// Rust / Bash / Ruby / C・C++ のセグメントは従来どおり `normalize_identifier` に従う。
 fn seg_ref_domain(lang_id: LangId) -> RefKeyDomain {
     if lang_id == LangId::Php {
         RefKeyDomain::AsciiCaseInsensitive
@@ -174,7 +176,7 @@ pub(crate) trait RefVisitor {
 //
 // 従来 4 本 (collect_identifier_refs / collect_refs_and_defs_indexed_cb /
 // collect_identifier_refs_indexed / count_identifier_refs) にコピペされていた
-// 「identifier ガード + 5 種 synthetic ref 源抽出 + 子への再帰」を 1 本の
+// 「identifier ガード + synthetic ref 源抽出 + 子への再帰」を 1 本の
 // `walk_refs` に集約する。出力差 (単一 Vec / index 別 Vec / callback / カウント) は
 // `RawRefSink` 実装に、単一名照合と index 照合の差は `RefMatcher` 実装に閉じ込める。
 // ref 源を追加するときは walk_refs 1 箇所だけを編集すればよい。
@@ -446,7 +448,7 @@ const _: () = assert!(!<CountSink<'static> as RawRefSink>::NEEDS_LINE_INDEX);
 const _: () = assert!(<SymbolReferenceSink<'static> as RawRefSink>::NEEDS_LINE_INDEX);
 
 /// synthetic 参照源 (文字列セグメント由来) 共通の hit 送出。segment が対象シンボルに
-/// 一致すれば `HitOrigin::Synthetic` の hit を sink に流す。5 種の source ループは
+/// 一致すれば `HitOrigin::Synthetic` の hit を sink に流す。各 source のループは
 /// walk_refs 内にそのまま残し、この 1 関数で送出処理だけを共有する。
 #[inline]
 fn emit_synthetic_hit<M: RefMatcher, S: RawRefSink>(
@@ -471,7 +473,7 @@ fn emit_synthetic_hit<M: RefMatcher, S: RawRefSink>(
     }
 }
 
-/// 1 ノード分の参照判定。「identifier → 5 種 synthetic 源」の順に照合し、
+/// 1 ノード分の参照判定。「identifier → synthetic 源 (2)〜(8)」の順に照合し、
 /// 一致するたび `sink.on_hit` を呼ぶ。
 fn visit_ref_node<M: RefMatcher, S: RawRefSink>(
     node: Node<'_>,
@@ -535,6 +537,17 @@ fn visit_ref_node<M: RefMatcher, S: RawRefSink>(
     // (6) PHP 文字列 callable `'Class@method'`
     if let Some((method, row, col)) = php_string_callable_method_segment(node, source, lang_id) {
         emit_synthetic_hit(method, row, col, matcher, sink, env);
+    }
+
+    // (7) Ruby のシンボルリテラル `:name` / `%i[name]` / `:"name"`
+    //     (`before_action :set_user` のようなメソッドの名指し) と値省略キー `{ name: }`
+    if let Some((name, row, col)) = ruby_symbol_ref_segment(node, source, lang_id) {
+        emit_synthetic_hit(name, row, col, matcher, sink, env);
+    }
+
+    // (8) C/C++ のマクロ定義本体 (`#define CLAMP(v) clamp_impl(v)` の不透明テキスト)
+    for (seg, row, col) in cpp_macro_body_ref_segments(node, source, lang_id) {
+        emit_synthetic_hit(seg, row, col, matcher, sink, env);
     }
 }
 

@@ -80,6 +80,9 @@ enum ReadLine {
     Eof,
     Line(String),
     Oversized(usize),
+    /// 行は読み切った (consume 済み) が UTF-8 として不正。巨大行・不正 JSON と同じく
+    /// その行だけ `INVALID_REQUEST` を返して続行する (セッション全体を落とさない)。
+    InvalidUtf8(std::str::Utf8Error),
 }
 
 fn read_line_limited<R: BufRead>(
@@ -131,31 +134,48 @@ fn read_line_limited<R: BufRead>(
         scratch.pop();
     }
 
-    let line = std::str::from_utf8(scratch)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-        .to_owned();
-    Ok(ReadLine::Line(line))
+    match std::str::from_utf8(scratch) {
+        Ok(line) => Ok(ReadLine::Line(line.to_owned())),
+        Err(e) => Ok(ReadLine::InvalidUtf8(e)),
+    }
 }
 
 /// NDJSON セッションを実行し、stdin の要求を stdout に逐次返す。
 pub fn run_session(handler: impl Fn(AstgenRequest) -> Result<serde_json::Value>) -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut input = stdin.lock();
-    let mut out = io::BufWriter::new(stdout.lock());
+    run_session_io(
+        stdin.lock(),
+        io::BufWriter::new(stdout.lock()),
+        MAX_LINE_SIZE,
+        handler,
+    )
+}
+
+/// `run_session` の本体。入出力を差し替えられるようにしてテストから行単位の挙動を固定する。
+fn run_session_io<R: BufRead, W: Write>(
+    mut input: R,
+    mut out: W,
+    max_line_size: usize,
+    handler: impl Fn(AstgenRequest) -> Result<serde_json::Value>,
+) -> Result<()> {
     let mut scratch = Vec::new();
 
     loop {
-        let next = read_line_limited(&mut input, MAX_LINE_SIZE, &mut scratch)?;
+        let next = read_line_limited(&mut input, max_line_size, &mut scratch)?;
         let value = match next {
             ReadLine::Eof => break,
-            ReadLine::Line(line) => process_line(&line, MAX_LINE_SIZE, &handler),
+            ReadLine::Line(line) => process_line(&line, max_line_size, &handler),
             ReadLine::Oversized(actual) => Some(make_error(
                 "INVALID_REQUEST",
                 format!(
                     "Input line exceeds maximum size ({} bytes > {} bytes)",
-                    actual, MAX_LINE_SIZE
+                    actual, max_line_size
                 ),
+            )),
+            ReadLine::InvalidUtf8(e) => Some(make_error(
+                "INVALID_REQUEST",
+                format!("Input line is not valid UTF-8: {e}"),
             )),
         };
 
@@ -269,6 +289,56 @@ mod tests {
             ReadLine::Line(line) => assert_eq!(line, "{}"),
             _ => panic!("second line should be readable"),
         }
+    }
+
+    /// 非 UTF-8 の行は consume 済みなので、その行だけ拒否して次の行を読める。
+    #[test]
+    fn read_line_limited_reports_invalid_utf8_and_continues() {
+        let mut input = io::Cursor::new(b"\xff\xfe\n{}\n".to_vec());
+        let mut scratch = Vec::new();
+
+        let first = read_line_limited(&mut input, 1024, &mut scratch).expect("read first line");
+        assert!(
+            matches!(first, ReadLine::InvalidUtf8(_)),
+            "first line should be reported as invalid UTF-8"
+        );
+
+        let second = read_line_limited(&mut input, 1024, &mut scratch).expect("read second line");
+        match second {
+            ReadLine::Line(line) => assert_eq!(line, "{}"),
+            _ => panic!("second line should be readable"),
+        }
+    }
+
+    /// 非 UTF-8 の行が 1 行混ざってもセッション全体は終了せず、その行だけ
+    /// `INVALID_REQUEST` を返して後続の要求を処理する (不正 JSON・巨大行と同じ扱い)。
+    /// 旧実装は `from_utf8` のエラーを `?` で上位へ伝播し、`IO_ERROR` + exit 1 で
+    /// 後続の要求を 1 件も処理しなかった。
+    #[test]
+    fn run_session_rejects_non_utf8_line_and_keeps_serving() {
+        let input = io::Cursor::new(
+            b"{\"command\":\"doctor\",\"path\":\".\"}\n\xff\xfe\n{\"command\":\"doctor\",\"path\":\".\"}\n"
+                .to_vec(),
+        );
+        let mut out = Vec::new();
+        run_session_io(input, &mut out, 1024, ok_handler).expect("session should not abort");
+
+        let text = String::from_utf8(out).expect("session output is UTF-8");
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("each line is JSON"))
+            .collect();
+        assert_eq!(lines.len(), 3, "one response per input line: {text}");
+        assert_eq!(lines[0]["ok"], true, "対照: 前の行は通常どおり処理される");
+        assert_eq!(lines[1]["error"]["code"], "INVALID_REQUEST");
+        assert!(
+            lines[1]["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("not valid UTF-8")),
+            "unexpected message: {}",
+            lines[1]
+        );
+        assert_eq!(lines[2]["ok"], true, "非 UTF-8 行の後も処理を続ける");
     }
 
     #[test]

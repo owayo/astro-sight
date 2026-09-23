@@ -4,7 +4,7 @@ use super::*;
 
 pub(crate) fn detect_object_members_compatible_mod(
     site: &CompatibleModSite<'_>,
-    sources: &mut SignatureSourceCache,
+    sources: &mut SignatureSourceCache<'_>,
 ) -> Option<CompatibleApiModification> {
     let lang = site.lang_in(TS_JS_LANGS)?;
     let src = sources.get(site)?;

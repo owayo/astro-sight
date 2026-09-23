@@ -1,4 +1,5 @@
 mod collector;
+mod declaration;
 mod filters;
 mod import_facts;
 mod pass2;
@@ -115,7 +116,7 @@ where
     let t = std::time::Instant::now();
     log_phase("context.pass1", "start", 0);
     let (file_contexts, all_symbol_names, method_parent_types, included_symbols) =
-        collect_affected_symbols(diff_input, &diff_files, dir);
+        collect_affected_symbols(diff_input, &diff_files, dir, options.new_side);
     log_phase("context.pass1", "end", t.elapsed().as_millis());
     log_phase(
         &format!(
@@ -261,11 +262,47 @@ fn assemble_without_cross_file(
         .collect()
 }
 
+/// Pass 1 で解析する new 側ソースの読み出し元。
+///
+/// `--git --staged` の diff は「base と index」の差分なので、hunk の new 側行番号は index の
+/// 内容を指す。作業ツリーを読むと、未ステージの変更 (先頭への関数追加など) の分だけ行が
+/// ずれて別のシンボルを affected と判定し、本来の変更の呼び出し側を見逃す。
+enum NewSideSource {
+    WorkingTree,
+    /// index (stage 0) を常駐 `git cat-file --batch` で読む (`git_show_blob` と同じ cwd 相対規約)。
+    /// `None` は `dir` が UTF-8 で表せない場合で、全ファイルを「読めない」として扱う。
+    Index(Option<crate::commands::GitBlobBatch>),
+}
+
+impl NewSideSource {
+    fn open(new_side: crate::models::impact::DiffNewSide, dir: &Path) -> Self {
+        match new_side {
+            crate::models::impact::DiffNewSide::WorkingTree => Self::WorkingTree,
+            crate::models::impact::DiffNewSide::Index => {
+                Self::Index(dir.to_str().map(crate::commands::GitBlobBatch::index))
+            }
+        }
+    }
+
+    /// 読めなければ食い違った内容で判定しないよう `None` (このファイルは解析しない)。
+    fn read(&self, file_path: &Path, rel_path: &str) -> Option<parser::SourceBuf> {
+        match self {
+            Self::WorkingTree => parser::read_file(Utf8Path::new(file_path.to_str()?)).ok(),
+            // 作業ツリー経路 (`parser::read_file`) と同じ 100MB 上限。
+            Self::Index(reader) => reader
+                .as_ref()?
+                .read_limited(rel_path, crate::commands::MAX_INPUT_SIZE)
+                .map(parser::SourceBuf::Vec),
+        }
+    }
+}
+
 /// Pass 1: 変更ファイルをパースし、シンボルを抽出し、cross-file 参照検索が必要なシンボル名を決定する。
 fn collect_affected_symbols(
     diff_input: &str,
     diff_files: &[DiffFile],
     dir: &Path,
+    new_side: crate::models::impact::DiffNewSide,
 ) -> (
     Vec<FileContext>,
     Vec<String>,
@@ -277,6 +314,12 @@ fn collect_affected_symbols(
     let mut symbol_name_set: HashSet<String> = HashSet::new();
     let mut method_parent_types: HashMap<String, String> = HashMap::new();
     let mut included_symbols: HashSet<String> = HashSet::new();
+    // ファイルごとの判定 (変更行の抽出・シグネチャ検出・cross-file フィルタ) は対象ファイルの
+    // 区間しか読まないので、diff 全体ではなく区間だけを渡す。diff 全体を渡すとファイル数 ×
+    // diff 長の 2 乗になる (`FileSections` の doc 参照)。結果は diff 全体を渡した場合と同一。
+    let file_sections = diff::FileSections::split(diff_input);
+    // `--staged` では変更ファイルを index の内容で解析する (`NewSideSource` 参照)。
+    let new_side_source = NewSideSource::open(new_side, dir);
 
     use crate::commands::log_phase;
     for df in diff_files {
@@ -306,11 +349,12 @@ fn collect_affected_symbols(
 
         let t = std::time::Instant::now();
         let utf8_path = Utf8Path::new(file_path.to_str().unwrap_or(""));
-        let source = match parser::read_file(utf8_path) {
-            Ok(s) => s,
-            Err(_) => continue,
+        let Some(source) = new_side_source.read(&file_path, &df.new_path) else {
+            continue;
         };
         log_phase("context.pass1.read_file", "end", t.elapsed().as_millis());
+        let file_diff = file_sections.get(&df.new_path);
+        let file_diff: &str = &file_diff;
 
         let t = std::time::Instant::now();
         let (tree, lang_id) = match parser::parse_file(utf8_path, &source) {
@@ -332,7 +376,7 @@ fn collect_affected_symbols(
         // diff の `+` 行 (実変更行) を抽出して hunk context-only overlap を除外する。
         // 隣接 hunk の context 3 行に巻き込まれた本体未変更 export
         // (Issue 2026-05-14-private-const-and-unchanged-export-noise) を排除する。
-        let changed_line_facts = diff::extract_changed_line_facts(diff_input, &df.new_path);
+        let changed_line_facts = diff::extract_changed_line_facts(file_diff, &df.new_path);
         let changed_new_lines = &changed_line_facts.added_lines;
         let affected_raw = find_affected_symbols(&syms, &df.hunks, Some(&changed_line_facts));
         log_phase(
@@ -345,7 +389,7 @@ fn collect_affected_symbols(
         // ローカル変数（関数内 const/let 等）はファイル外への影響を持たないため、
         // affected_symbols 出力と cross-file 伝播の両方からノイズを除去する。
         let t = std::time::Instant::now();
-        let affected: Vec<AffectedSymbol> = affected_raw
+        let mut affected: Vec<AffectedSymbol> = affected_raw
             .into_iter()
             .filter(|sym| {
                 if let Some(s) = find_overlapping_symbol(&syms, &sym.name, &df.hunks) {
@@ -368,7 +412,23 @@ fn collect_affected_symbols(
         );
 
         let t = std::time::Instant::now();
-        let sig_changes = detect_signature_changes(diff_input, &df.new_path, &affected, lang_id);
+        let mut sig_changes = detect_signature_changes(file_diff, &df.new_path, &affected, lang_id);
+        // 行ベースの検出が取りこぼす「複数行の引数リストの変更」と「同一ファイル内での移動 +
+        // シグネチャ変更」を、変更前の同じ宣言との AST ヘッダ比較で補う。
+        declaration::reconcile_declaration_changes(
+            &declaration::DeclarationChangeInput {
+                file_diff,
+                file_path: &df.new_path,
+                syms: &syms,
+                hunks: &df.hunks,
+                root,
+                source: &source,
+                lang_id,
+                facts: &changed_line_facts,
+            },
+            &mut affected,
+            &mut sig_changes,
+        );
         log_phase(
             &format!("context.pass1.detect_sig n={}", sig_changes.len()),
             "end",
@@ -393,7 +453,7 @@ fn collect_affected_symbols(
             syms: &syms,
             hunks: &df.hunks,
             sig_changes: &sig_changes,
-            diff_input,
+            diff_input: file_diff,
             file_path: &df.new_path,
             root,
             source: &source,
@@ -524,91 +584,102 @@ fn find_affected_symbols(
     hunks: &[HunkInfo],
     facts: Option<&crate::engine::diff::ChangedLineFacts>,
 ) -> Vec<AffectedSymbol> {
-    let mut affected = Vec::new();
+    syms.iter()
+        .filter_map(|sym| {
+            classify_symbol_change(sym, hunks, facts).map(|change_type| AffectedSymbol {
+                name: sym.name.clone(),
+                kind: symbol_kind_str(sym.kind).to_string(),
+                change_type: change_type.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// シンボル 1 件の変更種別 (`"added"` / `"modified"`)。hunk と重ならない、または context
+/// だけで重なるシンボルは `None` (判定規約は `find_affected_symbols` の doc 参照)。
+///
+/// `AffectedSymbol` は名前しか持たないため、同名のシンボルが複数あるファイルで affected の
+/// 1 件がどのシンボルを指すかを後段 (`declaration`) が引き直すときにも使う。
+fn classify_symbol_change(
+    sym: &crate::models::symbol::Symbol,
+    hunks: &[HunkInfo],
+    facts: Option<&crate::engine::diff::ChangedLineFacts>,
+) -> Option<&'static str> {
     let changed_new_lines = facts.map(|f| &f.added_lines);
+    for hunk in hunks {
+        let hunk_start = hunk.new_start.saturating_sub(1); // 1-indexed to 0-indexed
+        let hunk_end = hunk_start.saturating_add(hunk.new_count);
+        let sym_start = sym.range.start.line;
+        let sym_end = sym.range.end.line;
 
-    for sym in syms {
-        for hunk in hunks {
-            let hunk_start = hunk.new_start.saturating_sub(1); // 1-indexed to 0-indexed
-            let hunk_end = hunk_start.saturating_add(hunk.new_count);
-            let sym_start = sym.range.start.line;
-            let sym_end = sym.range.end.line;
-
-            // オーバーラップチェック。
-            // tree-sitter の range.end.line は包含的（シンボル最終バイトが乗る行）
-            // なので、通常 hunk では sym_end を含めて判定する。これにより単一行
-            // シンボル（start==end）や複数行シンボルの最終行のみの変更も検出する。
-            // ゼロ幅 hunk（pure-delete）は新ファイル側に行が無く、境界一致は
-            // 隣接行の削除を指すため、従来どおり半開区間（< sym_end）で判定する。
-            let overlaps = if hunk.new_count == 0 {
-                hunk_start >= sym_start && hunk_start < sym_end
-            } else {
-                hunk_start <= sym_end && hunk_end > sym_start
-            };
-            if overlaps {
-                // context-only overlap の除外: facts が Some かつ pure-delete でない
-                // hunk について、symbol range 内に `+` 行も削除位置 (gap) も無ければ
-                // context だけの overlap と判断して skip する。
-                // pure-delete (new_count==0) は追加行も gap も持ちうるが、hunk 自体が
-                // 削除位置そのものなので従来どおりフィルタを適用しない。
-                if let Some(f) = facts
-                    && hunk.new_count > 0
-                    && !(sym_start..=sym_end).any(|l| f.added_lines.contains(&l))
-                    && !symbol_range_has_deletion(sym_start, sym_end, &f.deletion_gaps)
-                {
-                    continue;
-                }
-                // change_type 判定:
-                // - new_count==0: pure delete hunk。**"removed" にはしない** — `syms` は
-                //   new 側ファイルを parse した結果なので、ここで見つかるシンボルは
-                //   定義が残っている (完全に削除されたシンボルは syms に現れず、そもそも
-                //   この関数に到達しない)。生存シンボル内部の行削除なので "modified"。
-                //   同じ編集が `-U0` では "removed"、context 付き diff では "modified" に
-                //   なるという入力形式依存の非対称もこれで解消する。
-                // - シンボル全行が新規追加行 (changed_new_lines に全行含まれる) かつ
-                //   その hunk に削除行が無い → "added"。既存ファイルの context 込み hunk
-                //   (old_count>0) でも、純追加で挿入された新規シンボルを正しく "added" と
-                //   判定する (Issue: 2026-06-14-antigravity-new-symbol-impact)。削除行の
-                //   有無は old/new の行数整合から算術的に導出する (old 側 parse 不要)。
-                //   近接削除を含む混在 hunk や複数 hunk にまたがるシンボルは all_added が
-                //   崩れるため "modified" に倒れる (fail-closed、false negative を避ける)。
-                // - hunk old_count==0: シンボル全体を hunk が覆う場合のみ "added"。hunk が
-                //   部分的にしか覆わない場合は既存シンボル内への行追加なので "modified"。
-                // - それ以外: "modified"。
-                let all_added_no_removal = changed_new_lines.is_some_and(|cl| {
-                    symbol_lines_all_added(sym_start, sym_end, cl)
-                        && !hunk_has_removed_lines(hunk, hunk_start, hunk_end, cl)
-                });
-                let change_type = if hunk.new_count == 0 {
-                    "modified"
-                } else if all_added_no_removal {
+        // オーバーラップチェック。
+        // tree-sitter の range.end.line は包含的（シンボル最終バイトが乗る行）
+        // なので、通常 hunk では sym_end を含めて判定する。これにより単一行
+        // シンボル（start==end）や複数行シンボルの最終行のみの変更も検出する。
+        // ゼロ幅 hunk（pure-delete）は新ファイル側に行が無く、境界一致は
+        // 隣接行の削除を指すため、従来どおり半開区間（< sym_end）で判定する。
+        let overlaps = if hunk.new_count == 0 {
+            hunk_start >= sym_start && hunk_start < sym_end
+        } else {
+            hunk_start <= sym_end && hunk_end > sym_start
+        };
+        if overlaps {
+            // context-only overlap の除外: facts が Some かつ pure-delete でない
+            // hunk について、symbol range 内に `+` 行も削除位置 (gap) も無ければ
+            // context だけの overlap と判断して skip する。
+            // pure-delete (new_count==0) は追加行も gap も持ちうるが、hunk 自体が
+            // 削除位置そのものなので従来どおりフィルタを適用しない。
+            if let Some(f) = facts
+                && hunk.new_count > 0
+                && !(sym_start..=sym_end).any(|l| f.added_lines.contains(&l))
+                && !symbol_range_has_deletion(sym_start, sym_end, &f.deletion_gaps)
+            {
+                continue;
+            }
+            // change_type 判定:
+            // - new_count==0: pure delete hunk。**"removed" にはしない** — `syms` は
+            //   new 側ファイルを parse した結果なので、ここで見つかるシンボルは
+            //   定義が残っている (完全に削除されたシンボルは syms に現れず、そもそも
+            //   この関数に到達しない)。生存シンボル内部の行削除なので "modified"。
+            //   同じ編集が `-U0` では "removed"、context 付き diff では "modified" に
+            //   なるという入力形式依存の非対称もこれで解消する。
+            // - シンボル全行が新規追加行 (changed_new_lines に全行含まれる) かつ
+            //   その hunk に削除行が無い → "added"。既存ファイルの context 込み hunk
+            //   (old_count>0) でも、純追加で挿入された新規シンボルを正しく "added" と
+            //   判定する (Issue: 2026-06-14-antigravity-new-symbol-impact)。削除行の
+            //   有無は old/new の行数整合から算術的に導出する (old 側 parse 不要)。
+            //   近接削除を含む混在 hunk や複数 hunk にまたがるシンボルは all_added が
+            //   崩れるため "modified" に倒れる (fail-closed、false negative を避ける)。
+            // - hunk old_count==0: シンボル全体を hunk が覆う場合のみ "added"。hunk が
+            //   部分的にしか覆わない場合は既存シンボル内への行追加なので "modified"。
+            // - それ以外: "modified"。
+            let all_added_no_removal = changed_new_lines.is_some_and(|cl| {
+                symbol_lines_all_added(sym_start, sym_end, cl)
+                    && !hunk_has_removed_lines(hunk, hunk_start, hunk_end, cl)
+            });
+            let change_type = if hunk.new_count == 0 {
+                "modified"
+            } else if all_added_no_removal {
+                "added"
+            } else if hunk.old_count == 0 {
+                // hunk が sym 全体（包含的な最終行 sym_end を含む）を覆う場合のみ
+                // "added"。hunk_end は排他的上限なので sym_end を含むには
+                // hunk_end > sym_end が必要。部分的にしか覆わない場合は既存
+                // シンボル内への追加なので "modified"（cross-file 探索の対象に残す）。
+                let hunk_covers_symbol = hunk_start <= sym_start && hunk_end > sym_end;
+                if hunk_covers_symbol {
                     "added"
-                } else if hunk.old_count == 0 {
-                    // hunk が sym 全体（包含的な最終行 sym_end を含む）を覆う場合のみ
-                    // "added"。hunk_end は排他的上限なので sym_end を含むには
-                    // hunk_end > sym_end が必要。部分的にしか覆わない場合は既存
-                    // シンボル内への追加なので "modified"（cross-file 探索の対象に残す）。
-                    let hunk_covers_symbol = hunk_start <= sym_start && hunk_end > sym_end;
-                    if hunk_covers_symbol {
-                        "added"
-                    } else {
-                        "modified"
-                    }
                 } else {
                     "modified"
-                };
-
-                affected.push(AffectedSymbol {
-                    name: sym.name.clone(),
-                    kind: symbol_kind_str(sym.kind).to_string(),
-                    change_type: change_type.to_string(),
-                });
-                break; // 重複カウントを防止
-            }
+                }
+            } else {
+                "modified"
+            };
+            // 最初に (context 以外で) 重なった hunk で決める (重複カウントを防止)。
+            return Some(change_type);
         }
     }
-
-    affected
+    None
 }
 
 /// シンボルの範囲がいずれかの hunk とオーバーラップするか確認する。
@@ -1043,6 +1114,7 @@ mod tests {
             complexity: None,
             container: None,
             children: vec![],
+            name_range: None,
         }
     }
 

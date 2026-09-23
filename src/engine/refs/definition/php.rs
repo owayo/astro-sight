@@ -80,8 +80,9 @@ fn php_ref_context_is_case_insensitive(parent: Node<'_>, effective: Node<'_>) ->
         )
     };
     match parent.kind() {
-        // $x->method() のメソッド名。member_access_expression ($x->prop) は _ に落ちて exact。
-        "member_call_expression" => is_field("name"),
+        // $x->method() / $x?->method() (PHP 8 nullsafe) のメソッド名。
+        // member_access_expression ($x->prop) / nullsafe_member_access_expression は _ に落ちて exact。
+        "member_call_expression" | "nullsafe_member_call_expression" => is_field("name"),
         // func() のグローバル/名前空間関数名
         "function_call_expression" => is_field("function"),
         // Foo::method() — scope(クラス名) も name(メソッド名) も case-fold

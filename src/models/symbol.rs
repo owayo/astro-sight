@@ -37,6 +37,12 @@ pub struct Symbol {
     pub container: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub children: Vec<Symbol>,
+    /// 名前ノードの位置。`range` (宣言全体) を複数シンボルが共有する場合にだけ設定する
+    /// (JS/TS の分割代入 `const { a, b } = obj` は `a` / `b` が同じ declarator を range に持つ)。
+    /// range から名前を引き直せない下流 (export 判定・束縛ごとの signature・宣言行) が使う
+    /// 内部情報なので出力には含めない。
+    #[serde(skip)]
+    pub name_range: Option<Range>,
 }
 
 /// トークン最適化出力用の compact シンボル。
@@ -81,11 +87,22 @@ fn serialize_compact_kind<S: Serializer>(kind: &SymbolKind, s: S) -> Result<S::O
 }
 
 impl Symbol {
+    /// このシンボルを一意に指す位置。宣言を共有するシンボルは名前ノード、それ以外は宣言。
+    /// export 判定のように「どの名前か」を区別する必要がある判定に渡す。
+    pub fn identity_range(&self) -> &Range {
+        self.name_range.as_ref().unwrap_or(&self.range)
+    }
+
+    /// 名前が現れる行 (0-indexed)。複数行の分割代入でも各名前の行を返す。
+    pub fn name_line(&self) -> usize {
+        self.identity_range().start.line
+    }
+
     pub fn to_compact(&self, include_doc: bool) -> CompactSymbol {
         CompactSymbol {
             name: self.name.clone(),
             kind: self.kind,
-            line: self.range.start.line,
+            line: self.name_line(),
             complexity: self.complexity,
             container: self.container.clone(),
             doc: if include_doc { self.doc.clone() } else { None },

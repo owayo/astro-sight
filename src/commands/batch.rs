@@ -33,11 +33,23 @@ fn build_batch_pool() -> Result<rayon::ThreadPool> {
         .map_err(|e| anyhow::anyhow!("Failed to build batch rayon pool: {e}"))
 }
 
+/// `--format auto` のバッチで形式の勝者を決める標本の件数 (出力順の先頭から数える)。
+///
+/// **並列度から独立した定数でなければならない**。旧実装は「最初の window
+/// (= ワーカー数 × 8 件)」を標本にしていたため、同じ入力でも CPU 数や
+/// `ASTRO_SIGHT_BATCH_WORKERS` で出力形式が変わっていた (auto の選択は入力内容だけで
+/// 決まるという契約に反する)。値は旧実装の既定 (4 ワーカー × 8 件) に揃えてあり、
+/// 4 コア以上のマシンの既定設定では従来と同じ判定になる。
+///
+/// 標本が揃うまでは両形式の描画を保持するので、保留分は最大でも
+/// `AUTO_SAMPLE_RECORDS + window - 1` 件 = 入力件数から独立する。
+const AUTO_SAMPLE_RECORDS: usize = 32;
+
 /// バッチ 1 件分の描画結果。
 ///
 /// `auto` は「全レコードを出し終えるまで勝敗が決まらない」一方、バッチは解析結果を
-/// 全件バッファしない設計なので、最初の window だけ両形式を保持して勝者を決める
-/// (`Both`)。決まった後の window は勝者だけを描画する (`One`)。
+/// 全件バッファしない設計なので、先頭 [`AUTO_SAMPLE_RECORDS`] 件だけ両形式を保持して
+/// 勝者を決める (`Both`)。決まった後のレコードは勝者だけを描画する (`One`)。
 pub(crate) enum BatchRendered {
     One(String),
     Both { json: String, toon: String },
@@ -72,7 +84,7 @@ impl BatchRendered {
 ///
 /// - JSON: 従来どおり 1 行の compact JSON (NDJSON の 1 レコード)
 /// - TOON: ルート配列の list item (`  - ...`、複数行になりうる)
-/// - auto: 両方 (勝者は呼び出し側が window 単位で決める)
+/// - auto: 両方 (勝者は呼び出し側が先頭 [`AUTO_SAMPLE_RECORDS`] 件の標本で決める)
 pub(crate) fn render_batch_record<T: serde::Serialize>(
     value: &T,
     output: OutputOptions,
@@ -177,12 +189,12 @@ where
     batch_ndjson_to_windowed(paths, output, process, out, window_size)
 }
 
-/// 先頭 window の実測値からバッチ全体の勝者を決める。
+/// 標本 (出力順の先頭 [`AUTO_SAMPLE_RECORDS`] 件) の実測値からバッチ全体の勝者を決める。
 ///
-/// TOON のルート配列ヘッダは **バッチ全体で 1 行きり**のコストなので、window の合計に
-/// 丸ごと足すと window 数が多いほど TOON を不当に不利にしてしまう。window の合計を
-/// バッチ全体へ引き伸ばしてから比較する (両辺に window 件数を掛けて整数のまま扱う)。
-/// 1 window で収まる入力ではこの引き伸ばしが恒等変換になり、比較は厳密になる。
+/// TOON のルート配列ヘッダは **バッチ全体で 1 行きり**のコストなので、標本の合計に
+/// 丸ごと足すと入力が多いほど TOON を不当に不利にしてしまう。標本の合計を
+/// バッチ全体へ引き伸ばしてから比較する (両辺に標本件数を掛けて整数のまま扱う)。
+/// 標本に収まる入力ではこの引き伸ばしが恒等変換になり、比較は厳密になる。
 ///
 /// 各長さは `output::estimated_size` (文字数 + 行罰則) の単位。レコードを区切る改行は
 /// 両形式で同数なので相殺され、比較には現れない。
@@ -191,20 +203,138 @@ fn decide_batch_format(
     json_len: usize,
     toon_len: usize,
     header_size: usize,
-    window_records: usize,
+    sample_records: usize,
     total_records: usize,
 ) -> OutputFormat {
-    let window_records = window_records.max(1) as u128;
+    let sample_records = sample_records.max(1) as u128;
     let total_records = total_records.max(1) as u128;
 
     let json_total = json_len as u128 * total_records;
-    // ヘッダは 1 回きりのコスト。window 件数を掛けているのは両辺のスケールを合わせるため。
-    let toon_total = toon_len as u128 * total_records + header_size as u128 * window_records;
+    // ヘッダは 1 回きりのコスト。標本件数を掛けているのは両辺のスケールを合わせるため。
+    let toon_total = toon_len as u128 * total_records + header_size as u128 * sample_records;
 
     if toon_total < json_total {
         OutputFormat::Toon
     } else {
         OutputFormat::Json
+    }
+}
+
+/// バッチ出力の書き手。TOON ルート配列ヘッダの先出しと、`auto` の勝者が決まるまでの
+/// 保留を 1 箇所で扱う。
+struct BatchWriter<W> {
+    out: W,
+    output: OutputOptions,
+    /// 確定した出力設定。`auto` は標本が揃うまで `None`。
+    resolved: Option<OutputOptions>,
+    /// `auto` の判定待ちで保留しているレコード (両形式の描画を持つ)。
+    pending: Vec<BatchRendered>,
+    /// 標本の推定サイズ合計 (`(json, toon)`) と件数。
+    sample_sizes: (usize, usize),
+    sample_records: usize,
+    total_records: usize,
+    bytes: usize,
+}
+
+impl<W: std::io::Write> BatchWriter<W> {
+    fn new(out: W, output: OutputOptions, total_records: usize) -> Result<Self> {
+        let mut writer = Self {
+            out,
+            output,
+            resolved: if output.is_auto() { None } else { Some(output) },
+            pending: Vec::new(),
+            sample_sizes: (0, 0),
+            sample_records: 0,
+            total_records,
+            bytes: 0,
+        };
+        // TOON はルート配列を list form (§9.4) で開く。要素数は入力パス数に任意の
+        // control record 1 件を加えた値として先に確定できるため、解析結果を溜めずに
+        // ヘッダを先出しでき、ピーク RSS を入力件数から独立させたまま
+        // 1 個の妥当な TOON ドキュメントになる。外側配列を tabular form (§9.3) にするには
+        // 全要素を見る必要があり、この streaming 要件と両立しないため list form を使う。
+        if output.is_toon() {
+            writer.write_header()?;
+        }
+        Ok(writer)
+    }
+
+    /// 次に描画するレコードの出力設定。`auto` の判定前は両形式を描画させる。
+    fn render_options(&self) -> OutputOptions {
+        self.resolved.unwrap_or(self.output)
+    }
+
+    fn push(&mut self, record: BatchRendered) -> Result<()> {
+        if let Some(opts) = self.resolved {
+            return self.write_record(record, opts);
+        }
+        // 標本は「出力順の先頭 N 件」で固定する。window 単位で判定すると、window の大きさ
+        // (= 並列度) によって標本が変わり、同じ入力でも出力形式が変わってしまう。
+        let (json, toon) = record.size_metrics();
+        self.sample_sizes.0 += json;
+        self.sample_sizes.1 += toon;
+        self.sample_records += 1;
+        self.pending.push(record);
+        if self.sample_records >= AUTO_SAMPLE_RECORDS {
+            self.resolve()?;
+        }
+        Ok(())
+    }
+
+    /// 標本から勝者を決め、ヘッダと保留分を書き出す。
+    fn resolve(&mut self) -> Result<()> {
+        let header = toon::streaming_array_header(self.total_records);
+        // ヘッダと最初の item の区切り改行も本文と同じ物差しで測る。
+        let header_size = estimated_size(&header) + estimated_size("\n");
+        let winner = decide_batch_format(
+            self.sample_sizes.0,
+            self.sample_sizes.1,
+            header_size,
+            self.sample_records,
+            self.total_records,
+        );
+        let opts = self.output.with_format(winner);
+        self.resolved = Some(opts);
+        if opts.is_toon() {
+            self.write_header()?;
+        }
+        for record in std::mem::take(&mut self.pending) {
+            self.write_record(record, opts)?;
+        }
+        Ok(())
+    }
+
+    fn write_header(&mut self) -> Result<()> {
+        let header = toon::streaming_array_header(self.total_records);
+        self.bytes += header.len();
+        write!(self.out, "{header}")?;
+        Ok(())
+    }
+
+    fn write_record(&mut self, record: BatchRendered, opts: OutputOptions) -> Result<()> {
+        let line = record.take(opts.format());
+        self.bytes += line.len() + 1;
+        if opts.is_toon() {
+            write!(self.out, "\n{line}")?;
+        } else {
+            writeln!(self.out, "{line}")?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.out.flush()?;
+        Ok(())
+    }
+
+    /// 全レコードを受け取った後に呼ぶ。標本件数に届かないまま入力が尽きた `auto` は
+    /// 全件 (= 標本) で判定する。書き出したバイト数を返す。
+    fn finish(mut self) -> Result<usize> {
+        if self.resolved.is_none() {
+            self.resolve()?;
+        }
+        self.flush()?;
+        Ok(self.bytes)
     }
 }
 
@@ -227,7 +357,7 @@ fn batch_ndjson_to_windowed_with_trailer<F, W>(
     trailer: Option<serde_json::Value>,
     output: OutputOptions,
     process: F,
-    mut out: W,
+    out: W,
     window_size: usize,
 ) -> Result<usize>
 where
@@ -236,110 +366,34 @@ where
 {
     let window_size = window_size.max(1);
     let pool = build_batch_pool()?;
-    let mut bytes = 0usize;
     let total_records = paths.len() + usize::from(trailer.is_some());
 
-    // `auto` は最初の window を両形式で描画してから勝者を決める。以降の window は
-    // 勝者だけを描画するので、二重エンコードのコストは先頭 window 分だけで済む
-    // (解析自体はどちらの経路でもパス 1 回きり)。
-    let mut resolved = if output.is_auto() { None } else { Some(output) };
-
-    // TOON はルート配列を list form (§9.4) で開く。要素数は入力パス数に任意の
-    // control record 1 件を加えた値として先に確定できるため、解析結果を溜めずに
-    // ヘッダを先出しでき、ピーク RSS を入力件数から独立させたまま
-    // 1 個の妥当な TOON ドキュメントになる。外側配列を tabular form (§9.3) にするには
-    // 全要素を見る必要があり、この streaming 要件と両立しないため list form を使う。
-    if let Some(opts) = resolved
-        && opts.is_toon()
-    {
-        let header = toon::streaming_array_header(total_records);
-        bytes += header.len();
-        write!(out, "{header}")?;
-    }
+    // `auto` は先頭 AUTO_SAMPLE_RECORDS 件を両形式で描画してから勝者を決める。以降は
+    // 勝者だけを描画するので、二重エンコードのコストは標本分だけで済む
+    // (解析自体はどちらの経路でもパス 1 回きり)。全件を見てから決めるには解析結果を
+    // 全件保持する必要があり、ピーク RSS の要件を壊すため「同じコマンドの実データによる
+    // 標本」で近似する (標本は出力順の先頭で固定なので決定的)。
+    let mut writer = BatchWriter::new(out, output, total_records)?;
 
     for chunk in paths.chunks(window_size) {
         // IndexedParallelIterator の collect は入力順を保つため、chunk 間も含めて
         // 呼び出し元が指定したパス順を維持できる。
-        let render_opts = resolved.unwrap_or(output);
+        let render_opts = writer.render_options();
         let rendered: Vec<BatchRendered> =
             pool.install(|| chunk.par_iter().map(|p| process(p, render_opts)).collect());
-
-        let opts = match resolved {
-            Some(opts) => opts,
-            None => {
-                // 先頭 window の実測値で勝者を決める。全件を見てから決めるには
-                // 解析結果を全件保持する必要があり、ピーク RSS の要件を壊すため
-                // 「同じコマンドの実データによる標本」で近似する (決定的)。
-                let (json_len, toon_len) = rendered.iter().fold((0, 0), |(j, t), r| {
-                    let (rj, rt) = r.size_metrics();
-                    (j + rj, t + rt)
-                });
-                let header = toon::streaming_array_header(total_records);
-                // ヘッダと最初の item の区切り改行も本文と同じ物差しで測る。
-                let header_size = estimated_size(&header) + estimated_size("\n");
-                let winner = decide_batch_format(
-                    json_len,
-                    toon_len,
-                    header_size,
-                    chunk.len(),
-                    total_records,
-                );
-                let opts = output.with_format(winner);
-                resolved = Some(opts);
-                if winner == OutputFormat::Toon {
-                    bytes += header.len();
-                    write!(out, "{header}")?;
-                }
-                opts
-            }
-        };
-
         for record in rendered {
-            let line = record.take(opts.format());
-            bytes += line.len() + 1;
-            if opts.is_toon() {
-                write!(out, "\n{line}")?;
-            } else {
-                writeln!(out, "{line}")?;
-            }
+            writer.push(record)?;
         }
         // broken pipe 等を chunk 境界で検出し、残りの解析を早期に打ち切る。
-        out.flush()?;
+        writer.flush()?;
     }
 
     if let Some(trailer) = trailer {
-        let rendered = render_batch_record(&trailer, resolved.unwrap_or(output));
-        let opts = match resolved {
-            Some(opts) => opts,
-            None => {
-                let (json_size, toon_size) = rendered.size_metrics();
-                let header = toon::streaming_array_header(total_records);
-                let winner = if toon_size + estimated_size(&header) + estimated_size("\n")
-                    < json_size + estimated_size("\n")
-                {
-                    OutputFormat::Toon
-                } else {
-                    OutputFormat::Json
-                };
-                let opts = output.with_format(winner);
-                if opts.is_toon() {
-                    bytes += header.len();
-                    write!(out, "{header}")?;
-                }
-                opts
-            }
-        };
-        let line = rendered.take(opts.format());
-        bytes += line.len() + 1;
-        if opts.is_toon() {
-            write!(out, "\n{line}")?;
-        } else {
-            writeln!(out, "{line}")?;
-        }
-        out.flush()?;
+        let rendered = render_batch_record(&trailer, writer.render_options());
+        writer.push(rendered)?;
     }
 
-    Ok(bytes)
+    writer.finish()
 }
 
 pub fn batch_ast(
@@ -593,6 +647,93 @@ mod tests {
         assert_eq!(
             decide_batch_format(100, 96, 11, 4, 1000),
             OutputFormat::Toon
+        );
+    }
+
+    /// `auto` の合成レコード: 先頭 8 件は JSON が短く、以降は TOON が短い。
+    /// 旧実装 (先頭 window = ワーカー数 × 8 件で判定) では window 8 だと JSON、
+    /// window 16 以上だと TOON を選び、並列度で出力形式が変わっていた。
+    fn skewed_record(path: &str, opts: OutputOptions) -> BatchRendered {
+        let index: usize = path.parse().expect("numeric path");
+        let (json_len, toon_len) = if index < 8 { (10, 30) } else { (100, 20) };
+        let json = format!("{{\"i\":{index}}}{}", "j".repeat(json_len));
+        let toon = format!("  - i: {index}{}", "t".repeat(toon_len));
+        match opts.format() {
+            OutputFormat::Json => BatchRendered::One(json),
+            OutputFormat::Toon => BatchRendered::One(toon),
+            OutputFormat::Auto => BatchRendered::Both { json, toon },
+        }
+    }
+
+    /// `auto` の選択は入力内容だけで決まり、window の大きさ (= 並列度) に依存しない。
+    #[test]
+    fn auto_batch_format_does_not_depend_on_window_size() {
+        let auto = OutputOptions::new(OutputFormat::Auto, JsonStyle::Compact);
+        let paths = (0..40).map(|i| i.to_string()).collect::<Vec<_>>();
+        let render = |window: usize| {
+            let mut output = Vec::new();
+            let bytes = batch_ndjson_to_windowed(&paths, auto, skewed_record, &mut output, window)
+                .expect("batch should succeed");
+            assert_eq!(bytes, output.len());
+            String::from_utf8(output).expect("valid UTF-8")
+        };
+
+        let baseline = render(8);
+        assert!(
+            baseline.starts_with("[40]:"),
+            "先頭 32 件の標本では TOON が短い: {baseline:.40}"
+        );
+        for window in [1, 3, 16, 32, 64] {
+            assert_eq!(render(window), baseline, "window={window}");
+        }
+    }
+
+    /// 標本が揃った時点で書き出しを始める = 保留は入力件数に比例しない。
+    #[test]
+    fn auto_batch_starts_writing_once_the_sample_is_complete() {
+        use super::AUTO_SAMPLE_RECORDS;
+
+        struct FirstWriteProbe<'a> {
+            processed: &'a AtomicUsize,
+            processed_at_first_write: Option<usize>,
+        }
+        impl Write for FirstWriteProbe<'_> {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.processed_at_first_write
+                    .get_or_insert(self.processed.load(Ordering::SeqCst));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let auto = OutputOptions::new(OutputFormat::Auto, JsonStyle::Compact);
+        let window = 4;
+        let paths = (0..400).map(|i| i.to_string()).collect::<Vec<_>>();
+        let processed = AtomicUsize::new(0);
+        let mut probe = FirstWriteProbe {
+            processed: &processed,
+            processed_at_first_write: None,
+        };
+        batch_ndjson_to_windowed(
+            &paths,
+            auto,
+            |path, opts| {
+                processed.fetch_add(1, Ordering::SeqCst);
+                skewed_record(path, opts)
+            },
+            &mut probe,
+            window,
+        )
+        .expect("batch should succeed");
+
+        let first = probe
+            .processed_at_first_write
+            .expect("output should be written");
+        assert!(
+            first <= AUTO_SAMPLE_RECORDS + window,
+            "標本 {AUTO_SAMPLE_RECORDS} 件 + window {window} 件を超えて保留した: {first}"
         );
     }
 

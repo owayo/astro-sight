@@ -39,9 +39,11 @@ pub struct Cli {
     pub config: Option<std::path::PathBuf>,
 
     /// Include files detected as generated (default: skip and report them).
-    /// Applies to AST scans (`refs` / `dead-code`) and, separately, to `cochange`:
-    /// there it keeps paths declared generated via `.gitattributes`
-    /// (`linguist-generated`) or a header marker as co-change sources and candidates.
+    /// `refs` / `symbols --dir` scan them. `dead-code` also checks their symbols for
+    /// deadness; references inside generated files are always counted, since generated
+    /// code calls hand-written code at runtime. Separately, `cochange` keeps paths
+    /// declared generated via `.gitattributes` (`linguist-generated`) or a header marker
+    /// as co-change sources and candidates.
     #[arg(long, global = true)]
     pub include_generated: bool,
 }
@@ -148,7 +150,8 @@ pub enum Commands {
         #[arg(long, conflicts_with_all = ["path", "paths"])]
         paths_file: Option<String>,
 
-        /// Filter to a specific function name
+        /// Only show calls made from inside this function (its callees).
+        /// To find who calls a function, use `refs --name <function>`
         #[arg(short, long)]
         function: Option<String>,
     },
@@ -305,7 +308,7 @@ pub enum Commands {
         #[arg(long, conflicts_with_all = ["path", "paths"])]
         paths_file: Option<String>,
 
-        /// Filter to a specific function name
+        /// Only draw calls made from inside this function (its callees)
         #[arg(short, long)]
         function: Option<String>,
     },

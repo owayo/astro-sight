@@ -185,12 +185,25 @@ where
     Ok((alloc, summaries))
 }
 
-/// compact JSON を前提に `RefsResult` 単体へ上限を適用する。
+/// `RefsResult` 単体へ上限を適用する。
 ///
-/// session (NDJSON 固定) と MCP (tool result の text) が共有する経路。どちらも
-/// 出力は compact JSON なので、予算判定もその描画に対して行う。
-pub fn apply_refs_limits_json(result: &mut RefsResult, limits: ResultLimits) -> Result<()> {
-    let complete_input = result.skipped.is_none();
+/// `render` には出力面が**実際に使う描画**を渡す (CLI は `--format` / `--pretty` に従う
+/// 単一ドキュメント、MCP は tool result の text、session は compact JSON)。予算判定は
+/// その描画結果に対して行うため、描画と採寸がずれて特定の形式でだけ黙って予算を超える、
+/// ということが起きない (旧実装は MCP の採寸を compact JSON に固定しており、`--pretty` /
+/// `--format toon` の MCP が予算の 2 倍前後を `budget_exceeded` なしで返していた)。
+///
+/// `complete_input` は生成物の除外 (`skipped`) と読み込み・parse 失敗の両方から決める
+/// ([`RefsResult::input_is_complete`])。
+pub fn apply_refs_limits<F>(
+    result: &mut RefsResult,
+    limits: ResultLimits,
+    mut render: F,
+) -> Result<()>
+where
+    F: FnMut(&RefsResult) -> Result<String>,
+{
+    let complete_input = result.input_is_complete();
     let references = std::mem::take(&mut result.references);
     let (shown, summary) = apply_limits(&references, limits, complete_input, |k, summary| {
         let probe = RefsResult {
@@ -198,8 +211,9 @@ pub fn apply_refs_limits_json(result: &mut RefsResult, limits: ResultLimits) -> 
             references: references[..k].to_vec(),
             skipped: result.skipped.clone(),
             result_summary: summary.cloned(),
+            failed_files: result.failed_files,
         };
-        Ok(serde_json::to_string(&probe)?)
+        render(&probe)
     })?;
     let mut rendered = references;
     rendered.truncate(shown);
@@ -208,12 +222,24 @@ pub fn apply_refs_limits_json(result: &mut RefsResult, limits: ResultLimits) -> 
     Ok(())
 }
 
-/// compact JSON を前提に `refs` バッチ結果へ上限を適用する (呼び出し全体で 1 予算)。
-pub fn apply_refs_batch_limits_json(
+/// compact JSON で描画する出力面 (session の NDJSON) 向けの [`apply_refs_limits`]。
+pub fn apply_refs_limits_json(result: &mut RefsResult, limits: ResultLimits) -> Result<()> {
+    apply_refs_limits(result, limits, |probe| Ok(serde_json::to_string(probe)?))
+}
+
+/// `refs` バッチ結果へ上限を適用する (呼び出し全体で 1 予算)。
+///
+/// `render` は上限適用後の結果列を出力面の描画で組み立てるクロージャ
+/// ([`apply_refs_limits`] と同じく、採寸と実際の描画を一致させるため)。
+pub fn apply_refs_batch_limits<F>(
     results: &mut [RefsResult],
     limits: ResultLimits,
-) -> Result<()> {
-    let complete_input = results.iter().all(|r| r.skipped.is_none());
+    mut render: F,
+) -> Result<()>
+where
+    F: FnMut(&[RefsResult]) -> Result<String>,
+{
+    let complete_input = results.iter().all(RefsResult::input_is_complete);
     let groups: Vec<&[SymbolReference]> = results.iter().map(|r| r.references.as_slice()).collect();
     let (alloc, summaries) =
         apply_grouped_limits(&groups, limits, complete_input, |alloc, summaries| {
@@ -225,15 +251,24 @@ pub fn apply_refs_batch_limits_json(
                     references: r.references[..alloc[i]].to_vec(),
                     skipped: r.skipped.clone(),
                     result_summary: summaries[i].clone(),
+                    failed_files: r.failed_files,
                 })
                 .collect();
-            Ok(serde_json::to_string(&capped)?)
+            render(&capped)
         })?;
     for (i, result) in results.iter_mut().enumerate() {
         result.references.truncate(alloc[i]);
         result.result_summary = summaries[i].clone();
     }
     Ok(())
+}
+
+/// compact JSON で描画する出力面 (session の NDJSON) 向けの [`apply_refs_batch_limits`]。
+pub fn apply_refs_batch_limits_json(
+    results: &mut [RefsResult],
+    limits: ResultLimits,
+) -> Result<()> {
+    apply_refs_batch_limits(results, limits, |capped| Ok(serde_json::to_string(capped)?))
 }
 
 /// 各グループへ 1 件ずつ順に配りながら `budget` スロットを使い切る。
@@ -566,6 +601,99 @@ mod budget_tests {
         assert!(
             each_files < one_files,
             "グループが増えたら 1 グループあたりの rollup は縮むべき: {each_files} < {one_files}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod refs_tests {
+    use super::*;
+    use crate::models::reference::RefKind;
+
+    fn refs_result(n: usize, failed_files: usize) -> RefsResult {
+        RefsResult {
+            symbol: "hot".into(),
+            references: (0..n)
+                .map(|i| SymbolReference {
+                    path: format!("src/f{}.rs", i % 5),
+                    line: i,
+                    column: 4,
+                    context: Some(format!("hot({i});")),
+                    kind: Some(RefKind::Reference),
+                    confidence: None,
+                })
+                .collect(),
+            skipped: None,
+            result_summary: None,
+            failed_files,
+        }
+    }
+
+    fn count_limit() -> ResultLimits {
+        ResultLimits {
+            max_results: Some(10),
+            token_budget: None,
+        }
+    }
+
+    /// 読み込み・parse に失敗したファイルがあれば `complete_input` を false にする。
+    /// 旧実装は `skipped` (生成物の除外) しか見ていなかった。
+    #[test]
+    fn failed_files_make_the_input_incomplete() {
+        // 対照: 失敗が無ければ complete_input は true。
+        let mut complete = refs_result(50, 0);
+        apply_refs_limits_json(&mut complete, count_limit()).expect("apply");
+        assert!(complete.result_summary.expect("summary").complete_input);
+
+        let mut single = refs_result(50, 1);
+        apply_refs_limits_json(&mut single, count_limit()).expect("apply");
+        assert!(!single.result_summary.expect("summary").complete_input);
+
+        // バッチは 1 件でも不完全なら全体が不完全。
+        let mut batch = vec![refs_result(50, 0), refs_result(50, 2)];
+        apply_refs_batch_limits_json(&mut batch, count_limit()).expect("apply");
+        for result in &batch {
+            if let Some(summary) = &result.result_summary {
+                assert!(!summary.complete_input, "{summary:?}");
+            }
+        }
+        assert!(batch.iter().any(|r| r.result_summary.is_some()));
+    }
+
+    /// 予算は渡した描画で採寸する。描画が重いほど出せる件数は減り、最終描画は予算内に収まる。
+    #[test]
+    fn budget_is_measured_with_the_given_renderer() {
+        let limits = ResultLimits {
+            max_results: None,
+            token_budget: Some(600),
+        };
+
+        let mut compact = refs_result(200, 0);
+        apply_refs_limits(&mut compact, limits, |probe| {
+            Ok(serde_json::to_string(probe)?)
+        })
+        .expect("apply");
+        let mut pretty = refs_result(200, 0);
+        apply_refs_limits(&mut pretty, limits, |probe| {
+            Ok(serde_json::to_string_pretty(probe)?)
+        })
+        .expect("apply");
+
+        let rendered = serde_json::to_string_pretty(&pretty).expect("render");
+        assert!(
+            estimated_tokens(&rendered) <= 600
+                || pretty
+                    .result_summary
+                    .as_ref()
+                    .is_some_and(|s| s.budget_exceeded),
+            "pretty の最終描画が予算を申告なしで超えた: {} tokens",
+            estimated_tokens(&rendered)
+        );
+        assert!(
+            pretty.references.len() < compact.references.len(),
+            "pretty={} compact={}",
+            pretty.references.len(),
+            compact.references.len()
         );
     }
 }

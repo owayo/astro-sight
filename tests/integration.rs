@@ -18,6 +18,7 @@ mod integration {
     mod git_non_ascii;
     mod hidden_and_angular_liveness;
     mod impact;
+    mod impact_diff_input;
     mod impact_output;
     mod languages;
     mod mcp;

@@ -190,9 +190,10 @@ fn classify_rust_ref_usage_roles() {
 }
 
 /// リファクタ後も single / batch Vec / callback / count の 4 経路が一致し続けることを
-/// 担保する同値性テスト。5 種 synthetic ref 源 (rust_attr / bash_trap /
-/// phpunit_metadata / php_callable_array / php_string_callable) + 通常 identifier を
-/// 言語別 fixture で網羅し、実際に synthetic 参照が発火していることも確認する。
+/// 担保する同値性テスト。7 種 synthetic ref 源 (rust_attr / bash_trap /
+/// phpunit_metadata / php_callable_array / php_string_callable / ruby_symbol /
+/// cpp_macro_body) + 通常 identifier を言語別 fixture で網羅し、実際に synthetic 参照が
+/// 発火していることも確認する。
 #[test]
 fn ref_walkers_agree_across_all_paths() {
     let rust_src = r#"fn serialize_jst() {}
@@ -240,6 +241,24 @@ public function routes(): void {
 }
 "#;
 
+    let ruby_src = r#"class UsersController
+  before_action :set_user, only: %i[show]
+  after_action :"log_access"
+  def show; end
+  def set_user; end
+  def log_access; set_user; end
+  def payload; { token:, status: 1 }; end
+  def token; end
+end
+"#;
+    let c_src = r#"int clamp_impl(int v);
+int multi_helper(int x);
+#define CLAMP(v) clamp_impl((v)) // multi_helper
+#define MULTI(x) \
+    multi_helper(x)
+int run(int v) { return CLAMP(v) + MULTI(v); }
+"#;
+
     let cases: &[(&str, &str, &[&str])] = &[
         (
             "equiv.rs",
@@ -252,6 +271,13 @@ public function routes(): void {
             php_src,
             &["provideData", "attrData", "handle", "testThing"],
         ),
+        (
+            "equiv.rb",
+            ruby_src,
+            &["set_user", "log_access", "show", "token", "status"],
+        ),
+        ("equiv.c", c_src, &["clamp_impl", "multi_helper", "CLAMP"]),
+        ("equiv.cpp", c_src, &["clamp_impl", "multi_helper", "CLAMP"]),
     ];
 
     for (fname, source, names) in cases {
@@ -351,7 +377,207 @@ public function routes(): void {
                     "php callable_array + string_callable synthetics must fire"
                 );
             }
+            // show / log_access はシンボル (`%i[show]` / `:"log_access"`) でのみ参照される。
+            // set_user は `:set_user` と本体内の呼び出しの 2 件。token は値省略キー
+            // `{ token: }` でのみ参照され、値付きキー `status: 1` は数えない。
+            "equiv.rb" => {
+                assert_eq!(count_of("show"), 1, "ruby bare_symbol synthetic must fire");
+                assert_eq!(
+                    count_of("log_access"),
+                    1,
+                    "ruby delimited_symbol synthetic must fire"
+                );
+                assert_eq!(
+                    count_of("set_user"),
+                    2,
+                    "ruby simple_symbol synthetic must fire"
+                );
+                assert_eq!(
+                    count_of("token"),
+                    1,
+                    "ruby omitted-value hash key synthetic must fire"
+                );
+                assert_eq!(count_of("status"), 0, "keyed hash key is not a reference");
+            }
+            // clamp_impl / multi_helper はマクロ本体でのみ参照される (宣言は参照として数える
+            // ので +1)。`// multi_helper` はコメントなので数えない。
+            "equiv.c" | "equiv.cpp" => {
+                assert_eq!(
+                    count_of("clamp_impl"),
+                    2,
+                    "cpp macro body synthetic must fire"
+                );
+                assert_eq!(
+                    count_of("multi_helper"),
+                    2,
+                    "cpp macro body synthetic must fire (continuation line, not the comment)"
+                );
+            }
             _ => {}
         }
+    }
+}
+
+/// Ruby のシンボルリテラル (`:name` / `%i[name]` / `:"name"`) はメソッドの名指しとして
+/// 参照に数える。旧実装は identifier ノードしか見ておらず、`before_action :set_user` /
+/// `after_action :log_access` / `validate :check_name` 経由でしか呼ばれないメソッドが
+/// dead に出ていた (`refs` も定義行しか返さなかった)。値を省略したハッシュキー /
+/// キーワード引数 (`{ token: }` / `deliver(token:)`) も `token` を読む式なので数える。
+///
+/// 対照: 値を伴うハッシュキー `set_user: 1` (`hash_key_symbol`) はキー名であって名指しでは
+/// ないので数えず、補間を含む `:"log_#{x}"` は名前が静的に決まらないので数えない。
+#[test]
+fn ruby_symbol_literals_count_as_references() {
+    let source = r#"class UsersController
+  before_action :set_user, only: %i[show edit]
+  after_action :log_access
+  validate :"check_name"
+  OPTS = { set_user: 1, status: :ok }
+  DYN = :"log_#{1}"
+  def set_user; end
+  def log_access; end
+  def check_name; end
+  def show; end
+  def unused_one; end
+  def payload; { token:, status: 1 }; end
+  def notify; deliver(token:); end
+  def token; end
+end
+"#;
+    let lang_id = LangId::Ruby;
+    let tree = parser::parse_source(source.as_bytes(), lang_id).expect("parse");
+    let root = tree.root_node();
+    let defs = definition_node_kinds(lang_id);
+
+    let names: Vec<String> = [
+        "set_user",
+        "log_access",
+        "check_name",
+        "show",
+        "edit",
+        "ok",
+        "unused_one",
+        "token",
+        "status",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let counts = count_refs_for_test(root, source.as_bytes(), &names, defs, lang_id, names.len());
+    let count_of = |n: &str| counts[names.iter().position(|x| x == n).unwrap()];
+    assert_eq!(
+        count_of("token"),
+        2,
+        "値省略のハッシュキー `{{ token: }}` とキーワード引数 `deliver(token:)`"
+    );
+    assert_eq!(
+        count_of("status"),
+        0,
+        "対照: 値を伴うハッシュキー `status:` は数えない"
+    );
+    assert_eq!(
+        count_of("set_user"),
+        1,
+        "`:set_user` だけ (ハッシュキー `set_user:` は数えない)"
+    );
+    assert_eq!(
+        count_of("log_access"),
+        1,
+        "`:log_access` だけ (補間付きシンボルは数えない)"
+    );
+    assert_eq!(
+        count_of("check_name"),
+        1,
+        "`:\"check_name\"` (delimited_symbol)"
+    );
+    assert_eq!(count_of("show"), 1, "`%i[show edit]` の show (bare_symbol)");
+    assert_eq!(count_of("edit"), 1, "`%i[show edit]` の edit (bare_symbol)");
+    assert_eq!(count_of("ok"), 1, "無関係なシンボルも参照に数える (保守側)");
+    assert_eq!(
+        count_of("unused_one"),
+        0,
+        "対照: 名指しされないメソッドは 0 件のまま"
+    );
+
+    // 位置は `:` / 引用符を除いた名前の先頭を指す。
+    let refs =
+        collect_single_refs_for_test(root, source.as_bytes(), "log_access", "t.rb", defs, lang_id);
+    let positions: Vec<(usize, usize, Option<RefKind>)> =
+        refs.iter().map(|r| (r.line, r.column, r.kind)).collect();
+    assert_eq!(
+        positions,
+        [
+            (2, 16, Some(RefKind::Reference)),
+            (7, 6, Some(RefKind::Definition))
+        ],
+        "{refs:?}"
+    );
+    let refs =
+        collect_single_refs_for_test(root, source.as_bytes(), "check_name", "t.rb", defs, lang_id);
+    assert_eq!(refs[0].line, 3);
+    assert_eq!(
+        refs[0].column, 13,
+        "`validate :\"check_name\"` の引用符の内側"
+    );
+    let refs =
+        collect_single_refs_for_test(root, source.as_bytes(), "token", "t.rb", defs, lang_id);
+    let positions: Vec<(usize, usize, Option<RefKind>)> =
+        refs.iter().map(|r| (r.line, r.column, r.kind)).collect();
+    assert_eq!(
+        positions,
+        [
+            (11, 17, Some(RefKind::Reference)),
+            (12, 22, Some(RefKind::Reference)),
+            (13, 6, Some(RefKind::Definition))
+        ],
+        "値省略キーは名前の先頭を指す: {refs:?}"
+    );
+}
+
+/// C/C++ のマクロ定義本体 (`preproc_arg`) の識別子を参照に数える。tree-sitter-c/cpp は
+/// マクロ本体を不透明なテキストとして返すため、旧実装は `#define CLAMP(v) clamp_impl(v)`
+/// 経由でしか使われない `clamp_impl` を dead と誤報していた。
+///
+/// 対照: 行末コメント・ブロックコメント・文字列/文字リテラル (接頭辞 `L` 含む)・数値
+/// リテラルの断片 (`0x1Fu` の `Fu` 等) と、`#pragma` の引数は数えない。継続行 (`\` 改行)
+/// の 2 行目以降も正しいファイル上の位置を指す。
+#[test]
+fn cpp_macro_body_identifiers_are_references() {
+    let source = r#"#define A(v) foo_a(v) // foo_b
+#define B(v) foo_c(v, "foo_d") + 'x' + L"foo_e" + 1e10 + 0x1Fu + 1'000 /* foo_f */
+#define C(x) \
+    foo_g(x); \
+    foo_h(x)
+#define D /* foo_i */ foo_j
+#pragma foo_k
+int foo_l(void);
+"#;
+    for lang_id in [LangId::C, LangId::Cpp] {
+        let tree = parser::parse_source(source.as_bytes(), lang_id).expect("parse");
+        let mut segments = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            for (seg, row, col) in cpp_macro_body_ref_segments(node, source.as_bytes(), lang_id) {
+                segments.push((seg.to_string(), row, col));
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
+        }
+        segments.sort_by_key(|(_, row, col)| (*row, *col));
+        let expected: Vec<(String, usize, usize)> = [
+            ("foo_a", 0, 13),
+            ("v", 0, 19),
+            ("foo_c", 1, 13),
+            ("v", 1, 19),
+            ("foo_g", 3, 4),
+            ("x", 3, 10),
+            ("foo_h", 4, 4),
+            ("x", 4, 10),
+            ("foo_j", 5, 22),
+        ]
+        .iter()
+        .map(|(s, r, c)| (s.to_string(), *r, *c))
+        .collect();
+        assert_eq!(segments, expected, "{lang_id:?}");
     }
 }

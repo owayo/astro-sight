@@ -549,12 +549,22 @@ const ANGULAR_LIFECYCLE_HOOKS: &[&str] = &[
 /// `abstract_class_declaration` として現れるため両方を対象にする。
 const JS_TS_CLASS_DECLARATION_KINDS: &[&str] = &["class_declaration", "abstract_class_declaration"];
 
-/// `symbol_range` の method が Angular `@Component` / `@Directive` 装飾クラスの
-/// lifecycle hook かを判定する。
+/// 全 lifecycle hook を Angular ランタイムが呼ぶ class decorator (view を持つ宣言)。
+const ANGULAR_VIEW_DECORATORS: &[&str] = &["Component", "Directive"];
+
+/// `ngOnDestroy` だけを Angular ランタイムが呼ぶ class decorator。
+///
+/// service (`@Injectable`) は injector の破棄時、pipe (`@Pipe`) は所属 view の破棄時に
+/// `ngOnDestroy` が呼ばれる (Angular の `OnDestroy`: "called when a directive, pipe, or
+/// service is destroyed")。`ngOnInit` などの他の hook は service / pipe には呼ばれない
+/// ので、ここに載せても hook 名を広げてはならない (本当に dead な `ngOnInit` を隠す)。
+const ANGULAR_DESTROY_ONLY_DECORATORS: &[&str] = &["Injectable", "Pipe"];
+
+/// `symbol_range` の method が Angular ランタイムの呼ぶ lifecycle hook かを判定する。
 ///
 /// 判定:
-/// 1. メソッド名が [`ANGULAR_LIFECYCLE_HOOKS`] のいずれかに一致
-/// 2. enclosing `class_declaration` に `@Component` または `@Directive` decorator が付与されている
+/// 1. `@Component` / `@Directive` 装飾クラスでは [`ANGULAR_LIFECYCLE_HOOKS`] のすべて
+/// 2. `@Injectable` / `@Pipe` 装飾クラスでは `ngOnDestroy` だけ
 ///
 /// dead-code 検出側で `exclude_framework_entrypoints == true` のとき除外対象に使う想定。
 pub fn is_js_ts_angular_lifecycle_hook(root: Node, source: &[u8], symbol_range: &Range) -> bool {
@@ -575,21 +585,47 @@ pub fn is_js_ts_angular_lifecycle_hook(root: Node, source: &[u8], symbol_range: 
         return false;
     }
 
-    // enclosing class_declaration を探し、@Component / @Directive decorator を確認
+    // enclosing class_declaration の decorator で、どの hook が呼ばれるかが決まる
     let Some(class_node) = enclosing_of_kind(method_node, JS_TS_CLASS_DECLARATION_KINDS) else {
         return false;
     };
-    class_has_component_or_directive_decorator(class_node, source)
+    class_has_angular_decorator(class_node, source, ANGULAR_VIEW_DECORATORS)
+        || (name == "ngOnDestroy"
+            && class_has_angular_decorator(class_node, source, ANGULAR_DESTROY_ONLY_DECORATORS))
+}
+
+/// `symbol_range` の method が `@Pipe` 装飾クラスの `transform` かを判定する。
+///
+/// pipe の `transform` はテンプレートの `{{ value | name }}` から Angular ランタイムが
+/// 呼ぶため、TS 上の直接の caller が無いのが正常。テンプレート参照の走査は pipe 名
+/// (`name: 'trim'`) とメソッド名が一致しないので拾えない。
+fn is_js_ts_angular_pipe_transform(root: Node, source: &[u8], symbol_range: &Range) -> bool {
+    let Some(node) = node_for_symbol_range(root, symbol_range) else {
+        return false;
+    };
+    let Some(method_node) = enclosing_of_kind(node, &["method_definition"]) else {
+        return false;
+    };
+    if js_ts_method_name(method_node, source) != Some("transform") {
+        return false;
+    }
+    let Some(class_node) = enclosing_of_kind(method_node, JS_TS_CLASS_DECLARATION_KINDS) else {
+        return false;
+    };
+    class_has_angular_decorator(class_node, source, &["Pipe"])
 }
 
 /// `class_declaration` ノードに `@Component` / `@Directive` decorator が付与されているかを判定する。
+fn class_has_component_or_directive_decorator(class_node: Node, source: &[u8]) -> bool {
+    class_has_angular_decorator(class_node, source, ANGULAR_VIEW_DECORATORS)
+}
+
+/// `class_declaration` ノードに `decorators` のいずれかの decorator が付与されているかを判定する。
 ///
 /// tree-sitter-typescript の AST では decorator は class_declaration の sibling として
 /// **直前** に並ぶ (export 文の中では export_statement の子)。class_declaration の親を
 /// 走査して周辺の decorator ノードを確認する。
-fn class_has_component_or_directive_decorator(class_node: Node, source: &[u8]) -> bool {
-    const ANGULAR_DECORATORS: &[&str] = &["Component", "Directive"];
-
+fn class_has_angular_decorator(class_node: Node, source: &[u8], decorators: &[&str]) -> bool {
     // class_declaration の前方兄弟と export_statement 経由の decorator の両方を見る
     let containers: [Node; 2] = match class_node.parent() {
         Some(parent) => [parent, class_node],
@@ -603,7 +639,7 @@ fn class_has_component_or_directive_decorator(class_node: Node, source: &[u8]) -
             }
             // `@Foo(...)` / `@Foo` の `Foo` を取り出し Angular decorator 名と照合する
             if let Some(name) = decorator_call_name(child, source)
-                && ANGULAR_DECORATORS.contains(&name.as_str())
+                && decorators.contains(&name.as_str())
             {
                 return true;
             }
@@ -644,10 +680,11 @@ const ANGULAR_MEMBER_RUNTIME_DECORATORS: &[&str] = &[
 ];
 
 /// `symbol_range` が Angular ランタイムから呼び出される member かを判定する。
-/// `is_js_ts_angular_lifecycle_hook` の上位互換で、`@Component` / `@Directive` 装飾クラスの
-/// 以下の member を `true` とする (静的 caller 0 件でも dead 候補から除外する想定):
+/// `is_js_ts_angular_lifecycle_hook` の上位互換で、以下の member を `true` とする
+/// (静的 caller 0 件でも dead 候補から除外する想定):
 ///
-/// 1. 既存: lifecycle hook 名 (`ngOnInit` 等)
+/// 1. 既存: lifecycle hook 名 (`@Component` / `@Directive` の `ngOnInit` 等と、
+///    `@Injectable` / `@Pipe` の `ngOnDestroy`)
 /// 2. (GitLab #20) `ControlValueAccessor` 規約メソッド (`writeValue` / `registerOnChange` /
 ///    `registerOnTouched` / `setDisabledState`)。CVA を `implements ControlValueAccessor` で
 ///    宣言しているか、または同じ意味の `NG_VALUE_ACCESSOR` provider を decorator metadata に
@@ -655,12 +692,16 @@ const ANGULAR_MEMBER_RUNTIME_DECORATORS: &[&str] = &[
 /// 3. (GitLab #23) member 単位の Angular decorator (`@HostListener` / `@HostBinding` /
 ///    `@Input` / `@Output` / `@ViewChild` / `@ViewChildren` / `@ContentChild` /
 ///    `@ContentChildren`) が付与された property / accessor / method。
+/// 4. `@Pipe` 装飾クラスの `transform` (テンプレートの `| name` から呼ばれる)。
 pub fn is_js_ts_angular_runtime_entrypoint(
     root: Node,
     source: &[u8],
     symbol_range: &Range,
 ) -> bool {
     if is_js_ts_angular_lifecycle_hook(root, source, symbol_range) {
+        return true;
+    }
+    if is_js_ts_angular_pipe_transform(root, source, symbol_range) {
         return true;
     }
     if is_js_ts_angular_member_decorator_target(root, source, symbol_range) {

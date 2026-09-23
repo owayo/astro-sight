@@ -14,11 +14,12 @@ use super::*;
 // 本体側の各サブモジュールに散った被テスト項目を、テストモジュール直下へ一括で
 // 引き込む。サブモジュール側は `use super::*;` だけでこれらを引けるようにし、
 // テスト本体は分割前と同じ名前 (`super::is_generated_file` 等) のまま動かす。
-use super::definition::is_identifier_kind;
+use super::definition::cpp::cpp_macro_body_ref_segments;
 use super::definition::php::{
     php_callable_array_method_segment, php_string_callable_method_segment,
 };
 use super::definition::rust::{rust_attr_string_ref_segments, split_path_segments};
+use super::definition::{is_identifier_kind, is_ignored_identifier_context};
 use super::files::is_generated_file;
 use super::line_index::{extract_line_context_bytes_indexed, extract_line_context_indexed};
 use super::role::classify_ref_usage_role;

@@ -35,6 +35,8 @@ const CHUNK_SIZE: usize = 128;
 ///   bin / obj / coverage / .next / .nuxt / .svelte-kit / .turbo / CMakeFiles):
 ///   生成物。`.gitignore` に入っているのが普通だが、明示除外しておくことで
 ///   `.gitignore` を持たないチェックアウトや CI 一時ディレクトリでも安全に動作する。
+///   `bin` のうち Cargo パッケージの `src/bin/` はバイナリターゲットのソースなので除外しない
+///   (`is_excluded_bin_path`)。
 ///
 /// 解除する場合は `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` を設定する
 /// (環境変数名は v26.5.115 互換のため変更しない。新規 build artifact 除外も同じ
@@ -168,12 +170,27 @@ fn prepare_scan(
     } else {
         IMPACT_DEFAULT_EXCLUDED_DIRS.to_vec()
     };
+    // 既定の `bin` 除外は Cargo パッケージの `src/bin/` (バイナリターゲットのソース) を
+    // 巻き込むため、セグメント一致から外して後段で判定する (`is_excluded_bin_path`)。
+    // 利用者が `--exclude-dir bin` を明示した場合は従来どおり全 `bin` を除外する。
+    let cargo_aware_bin_exclusion =
+        excluded_dirs.contains(&"bin") && !options.exclude_dirs.iter().any(|d| d == "bin");
+    if cargo_aware_bin_exclusion {
+        excluded_dirs.retain(|d| *d != "bin");
+    }
     excluded_dirs.extend(options.exclude_dirs.iter().map(String::as_str));
     excluded_dirs.sort_unstable();
     excluded_dirs.dedup();
     let excluded_globs: Vec<&str> = options.exclude_globs.iter().map(String::as_str).collect();
-    let files =
+    let mut files =
         refs::collect_files_with_excludes(dir, None, &excluded_dirs, &excluded_globs).ok()?;
+    if cargo_aware_bin_exclusion {
+        let mut cargo_package_roots: HashMap<std::path::PathBuf, bool> = HashMap::new();
+        files.retain(|path| {
+            let rel = path.strip_prefix(dir).unwrap_or(path);
+            !is_excluded_bin_path(rel, dir, &mut cargo_package_roots)
+        });
+    }
 
     // rayon fold/reduce は worker local 集約 + reduce acc 併存でピーク RSS が 2x まで
     // 膨らむため、デフォルトは 1 worker (= fold バケット 1 個、ピーク 2x も小さい) とする。
@@ -184,6 +201,33 @@ fn prepare_scan(
         .ok()?;
 
     Some(Pass2Scan { ac, files, pool })
+}
+
+/// 既定の除外リストの `bin` に当たるか (パスのどこかに `bin` セグメントがあるか)。
+///
+/// ただし Cargo パッケージの `src/bin/` (直上が `src` で、その親に `Cargo.toml` がある) は
+/// バイナリターゲットのソースディレクトリ (Cargo の自動検出規約) でビルド成果物ではないので
+/// 除外しない。`bin` を一律に除外すると `src/bin/*.rs` の呼び出し側が申告なしで落ち、
+/// refs / dead-code では数えられるのに impact だけ見逃す状態になっていた。
+/// `Cargo.toml` の有無は `cargo_package_roots` にパッケージルートごとにキャッシュする。
+fn is_excluded_bin_path(
+    rel: &Path,
+    dir: &Path,
+    cargo_package_roots: &mut HashMap<std::path::PathBuf, bool>,
+) -> bool {
+    let components: Vec<&std::ffi::OsStr> = rel.components().map(|c| c.as_os_str()).collect();
+    components.iter().enumerate().any(|(i, name)| {
+        if *name != "bin" {
+            return false;
+        }
+        let is_cargo_src_bin = i >= 1 && components[i - 1] == "src" && {
+            let package_root: std::path::PathBuf = components[..i - 1].iter().collect();
+            *cargo_package_roots
+                .entry(package_root)
+                .or_insert_with_key(|root| dir.join(root).join("Cargo.toml").is_file())
+        };
+        !is_cargo_src_bin
+    })
 }
 
 /// `TARGET_FILE_CACHE_SIZE` 上限の per-worker LRU キャッシュを作る。
@@ -476,6 +520,35 @@ mod tests {
             file_context("b.xojo_code", LangId::Xojo),
         ];
         assert!(all_file_contexts_case_insensitive(&fcs));
+    }
+
+    /// 既定の `bin` 除外は Cargo パッケージの `src/bin/` (バイナリターゲットのソース) を
+    /// 巻き込まない。それ以外の `bin` (ビルド成果物・`Cargo.toml` の無い `src/bin`) は従来どおり除外。
+    #[test]
+    fn bin_exclusion_keeps_cargo_src_bin_sources() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        std::fs::create_dir_all(root.join("crates/tool")).unwrap();
+        std::fs::write(root.join("crates/tool/Cargo.toml"), "[package]\n").unwrap();
+        std::fs::create_dir_all(root.join("web/src")).unwrap();
+
+        let mut cache = HashMap::new();
+        let mut excluded = |rel: &str| is_excluded_bin_path(Path::new(rel), root, &mut cache);
+        // Cargo パッケージの src/bin (ルート / ワークスペース配下の両方)。
+        assert!(!excluded("src/bin/tool.rs"));
+        assert!(!excluded("src/bin/tool/main.rs"));
+        assert!(!excluded("crates/tool/src/bin/run.rs"));
+        // 対照: ビルド成果物の bin と、Cargo.toml を持たない src/bin は除外する。
+        assert!(excluded("bin/Debug/app.js"));
+        assert!(excluded("MyApp/bin/Release/site.js"));
+        assert!(excluded("web/src/bin/cli.js"));
+        assert!(
+            excluded("src/bin/nested/bin/gen.rs"),
+            "内側の bin は src 直下ではない"
+        );
+        // bin を含まないパスは対象外。
+        assert!(!excluded("src/main.rs"));
     }
 
     // CI 言語と通常言語が混在する diff では skip しない

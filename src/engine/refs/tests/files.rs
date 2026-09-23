@@ -136,3 +136,59 @@ fn collect_files_scan_reports_generated_and_honors_explicit_controls() {
         vec!["generated.rb"]
     );
 }
+
+/// 走査対象に選んだのに読めなかったファイルは、「参照 0 件」と区別できるよう件数を数える。
+///
+/// 旧実装は `find_refs_in_file` の失敗を `if let Ok` で黙って捨てており、読めた分だけの
+/// 件数を「全入力の総数」として返していた (`result_summary.complete_input` が true のまま)。
+/// 失敗は上限 (100MB) 超えのファイルで起こす — 権限 (`chmod 000`) だと root 実行で再現しない。
+#[test]
+fn reference_scans_count_files_that_could_not_be_read() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("a.py"), "value = 1\nprint(value)\n").expect("write a");
+    std::fs::write(dir.path().join("b.py"), "value = 2\n").expect("write b");
+    let names = vec!["value".to_string()];
+
+    // 対照: 全ファイルを読めるなら失敗は 0 件。
+    let single = super::find_references_with_scan(
+        "value",
+        dir.path(),
+        None,
+        super::FileScanOptions::default(),
+    )
+    .expect("single scan");
+    assert_eq!(single.failed_files, 0);
+    assert_eq!(single.references.len(), 3);
+    let batch = super::find_references_batch_with_scan(
+        &names,
+        dir.path(),
+        None,
+        super::FileScanOptions::default(),
+    )
+    .expect("batch scan");
+    assert_eq!(batch.failed_files, 0);
+
+    // 実データを書かない sparse file で読み込み上限を超えさせる。
+    let huge = std::fs::File::create(dir.path().join("huge.py")).expect("create huge");
+    huge.set_len(100 * 1024 * 1024 + 1).expect("extend huge");
+    drop(huge);
+
+    let single = super::find_references_with_scan(
+        "value",
+        dir.path(),
+        None,
+        super::FileScanOptions::default(),
+    )
+    .expect("single scan");
+    assert_eq!(single.failed_files, 1, "読めなかったファイルを数える");
+    assert_eq!(single.references.len(), 3, "読めたファイルの参照はそのまま");
+    let batch = super::find_references_batch_with_scan(
+        &names,
+        dir.path(),
+        None,
+        super::FileScanOptions::default(),
+    )
+    .expect("batch scan");
+    assert_eq!(batch.failed_files, 1, "バッチも同じ失敗を数える");
+    assert_eq!(batch.references.get("value").map(Vec::len), Some(3));
+}

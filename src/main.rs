@@ -589,6 +589,7 @@ fn dispatch_command(
             extra_exclude_globs: &exclude_globs,
             output,
             dead_scope,
+            include_generated,
         }),
         Commands::Doctor => cmd_doctor(output),
         Commands::Session => cmd_session(output),

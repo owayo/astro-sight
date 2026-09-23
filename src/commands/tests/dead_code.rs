@@ -1011,3 +1011,78 @@ pub trait NeverImplemented {\n\
         );
     }
 }
+
+/// trait 本体で宣言されたメソッド (必須 / default) は dead-code の対象にしない。
+///
+/// `pub trait` のメソッドは API 差分では公開契約として扱う (シグネチャ変更は api.mod) が、
+/// 呼び出しが下流クレートにしか無いことも多く、「未参照の実装」ではない。
+/// 実装側 (`impl Trait for Type`) も従来どおり対象外。trait 自体の未参照は引き続き検出する。
+#[test]
+fn rust_trait_declared_methods_are_not_dead_but_unused_trait_is() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let source = "pub trait Plugin {\n\
+    fn name(&self) -> String;\n\
+    fn describe(&self) -> String { String::new() }\n\
+}\n\
+\n\
+pub struct Hello;\n\
+\n\
+impl Plugin for Hello {\n\
+    fn name(&self) -> String { String::new() }\n\
+}\n\
+\n\
+pub fn register(p: &dyn Plugin) -> usize { p.name().len() }\n\
+\n\
+pub trait Unused {\n\
+    fn noop(&self);\n\
+}\n";
+    fs::write(repo.join("api.rs"), source).expect("write rs");
+    let files = vec![repo.join("api.rs")];
+    let (dead, _test_only) =
+        detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
+    let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+    for method in ["name", "describe", "noop"] {
+        assert!(
+            !names.iter().any(|n| n.rsplit('.').next() == Some(method)),
+            "trait-declared method {method} must not be dead: {names:?}"
+        );
+    }
+    // 対照: 未参照の trait 自体は引き続き dead
+    assert!(names.contains(&"Unused"), "{names:?}");
+}
+
+/// 分割代入で export した名前も dead-code の対象になる。束縛位置
+/// (`{ alias: renamed }` / `{ nested: { deep } }` / `[x, y = 1, ...zs]`) は参照に数えないので、
+/// 自分の宣言を自己参照と数えて dead を見逃すことはない。
+#[test]
+fn destructured_exports_are_dead_code_candidates_without_self_references() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    fs::write(
+        repo.join("lib.ts"),
+        "export const { used, unused, alias: renamed, nested: { deep } } = source();\n\
+         export const [x, y = 1, ...zs] = pair();\n",
+    )
+    .expect("write lib");
+    fs::write(
+        repo.join("use.ts"),
+        "import { used, x } from \"./lib\";\nexport function consume() { return [used, x]; }\n",
+    )
+    .expect("write use");
+    let files = vec![repo.join("lib.ts"), repo.join("use.ts")];
+    let (dead, _test_only) =
+        detect_dead_symbols_from_files(repo.to_str().expect("utf-8 path"), &files);
+    let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+    for unused in ["unused", "renamed", "deep", "y", "zs"] {
+        assert!(
+            names.contains(&unused),
+            "{unused} should be dead: {names:?}"
+        );
+    }
+    for live in ["used", "x"] {
+        assert!(!names.contains(&live), "{live} is imported: {names:?}");
+    }
+}

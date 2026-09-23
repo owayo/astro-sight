@@ -1376,6 +1376,91 @@ fn dead_code_ts_factory_receiver_marks_set_ambiguous() {
     );
 }
 
+/// duplicate member (`Alpha.parse` / `Beta.parse`) を分割代入 `const { parse } = Alpha;` で
+/// 取り出して使う場合、member_expression にならないため旧実装は見落として両方 dead に
+/// していた。取り出した値の行き先は追わないので、帰属を推測せず set 全体を Ambiguous に倒す。
+/// 対照: 別の duplicate set (`fmt`) は分割代入の影響を受けず、owner 一意推定で未使用側
+/// (`Beta.fmt`) を従来どおり dead と検出する。
+#[test]
+fn dead_code_ts_destructured_member_marks_set_ambiguous() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("alpha.ts"),
+        "export class Alpha {\n  static parse(s: string): number { return s.length; }\n  static fmt(): string { return \"a\"; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("beta.ts"),
+        "export class Beta {\n  static parse(s: string): number { return s.length * 2; }\n  static fmt(): string { return \"b\"; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("use.ts"),
+        "import { Alpha } from \"./alpha\";\nconst { parse } = Alpha;\nexport const v = parse(\"x\") + Alpha.fmt().length;\n",
+    )
+    .unwrap();
+
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    let names: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"Alpha.parse") && !names.contains(&"Beta.parse"),
+        "分割代入で取り出される parse の set は Ambiguous (旧スキップ) 維持: {names:?}"
+    );
+    assert!(
+        names.contains(&"Beta.fmt") && !names.contains(&"Alpha.fmt"),
+        "対照: fmt の set は owner 一意推定のまま未使用側だけ dead: {names:?}"
+    );
+}
+
+/// 拡張子なしの Node スクリプト (`bin/cli`、`#!/usr/bin/env node`) も member liveness の
+/// 走査対象に含める。参照件数の経路は shebang で JS と判定して走査する一方、member
+/// liveness は拡張子だけで TS/JS ファイルを選んでいたため、スクリプトからしか呼ばれない
+/// `Alpha.fmt` が参照 0 件で dead と誤報されていた。
+/// 対照: 呼ばれない `Beta.fmt` は owner 一意推定のまま dead。
+#[test]
+fn dead_code_js_member_liveness_scans_shebang_script() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("alpha.ts"),
+        "export class Alpha {\n  static fmt(): string { return \"a\"; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("beta.ts"),
+        "export class Beta {\n  static fmt(): string { return \"b\"; }\n}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    std::fs::write(
+        root.join("bin/cli"),
+        "#!/usr/bin/env node\nimport { Alpha } from \"../alpha.js\";\nAlpha.fmt();\n",
+    )
+    .unwrap();
+
+    let names = dead_symbol_names(root);
+    assert!(
+        !names.iter().any(|n| n == "Alpha.fmt"),
+        "shebang の Node スクリプトからの呼び出しは確定参照: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "Beta.fmt"),
+        "対照: 呼ばれない側は dead のまま: {names:?}"
+    );
+}
+
 #[test]
 fn dead_code_ts_for_of_loop_variable_shadow_marks_set_ambiguous() {
     // for-of の loop 変数が owner クラス名と同名の場合、`Alpha.fmt()` は loop 変数
@@ -1800,4 +1885,165 @@ fn dead_code_rust_restricted_visibility_uses_ast_not_line_substring() {
             "制限付き可視性の {restricted} は公開 API 面ではない (対照): {dead:?}"
         );
     }
+}
+
+/// `dead-code` を実行して dead_symbols の name 一覧を返す。
+fn dead_symbol_names(root: &std::path::Path) -> Vec<String> {
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    json["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Ruby はメソッドをシンボルで名指しする (`before_action :set_user` / `%i[..]` /
+/// `validate :"check_name"`) ほか、値を省略したハッシュキー `{ token: }` でメソッドを読む。
+/// いずれも identifier ノードではないため、旧実装はこれらでしか使われないメソッドを
+/// dead と誤報していた。対照: どこからも名指しされない `really_unused` は dead のまま。
+#[test]
+fn dead_code_ruby_symbol_references_keep_methods_live() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("users_controller.rb"),
+        "class UsersController\n\
+         \x20 before_action :set_user, only: %i[show_page]\n\
+         \x20 validate :\"check_name\"\n\
+         \x20 def show_page; end\n\
+         \x20 def set_user; end\n\
+         \x20 def check_name; end\n\
+         \x20 def payload; { token: }; end\n\
+         \x20 def token; end\n\
+         \x20 def really_unused; end\n\
+         end\n",
+    )
+    .unwrap();
+
+    let dead = dead_symbol_names(dir.path());
+    for live in ["set_user", "show_page", "check_name", "token"] {
+        let qualified = format!("UsersController.{live}");
+        assert!(
+            !dead.contains(&qualified),
+            "シンボル / 値省略キーで参照される {qualified} は dead ではない: {dead:?}"
+        );
+    }
+    assert!(
+        dead.iter().any(|n| n == "UsersController.really_unused"),
+        "対照: 名指しされないメソッドは dead のまま: {dead:?}"
+    );
+}
+
+/// C/C++ のマクロ本体 (`#define CLAMP(v) clamp_impl(..)`) は tree-sitter では不透明な
+/// テキストなので、旧実装はマクロ経由でしか呼ばれない `clamp_impl` を dead と誤報していた。
+/// 対照: マクロ本体のコメントにだけ現れる `only_in_comment` と未使用の `really_unused_c` は
+/// dead のまま。
+#[test]
+fn dead_code_c_macro_body_reference_keeps_function_live() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("util.c"),
+        "int clamp_impl(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }\n\
+         int only_in_comment(void) { return 0; }\n\
+         int really_unused_c(void) { return 0; }\n\
+         #define CLAMP(v) clamp_impl((v), 0, 255) /* only_in_comment */\n\
+         int apply(int x) { return CLAMP(x); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("main.c"),
+        "int apply(int x);\nint main(void) { return apply(300); }\n",
+    )
+    .unwrap();
+
+    let dead = dead_symbol_names(dir.path());
+    assert!(
+        !dead.iter().any(|n| n == "clamp_impl"),
+        "マクロ本体からの呼び出しは参照: {dead:?}"
+    );
+    for still_dead in ["only_in_comment", "really_unused_c"] {
+        assert!(
+            dead.iter().any(|n| n == still_dead),
+            "対照: {still_dead} は dead のまま: {dead:?}"
+        );
+    }
+}
+
+/// Zig の代入文 (`counter += 1;`) は tree-sitter-zig で `variable_declaration` に alias
+/// されるため、旧実装は代入先を定義と誤判定し、書き込みでしか使われない `pub var` を dead と
+/// 誤報していた。対照: どこからも使われない `unused_var` は dead のまま。
+#[test]
+fn dead_code_zig_assignment_target_keeps_variable_live() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("counter.zig"),
+        "pub var counter: u32 = 0;\n\
+         pub var unused_var: u32 = 0;\n\
+         pub fn bump() void {\n\
+         \x20   counter += 1;\n\
+         }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("main.zig"),
+        "const c = @import(\"counter.zig\");\npub fn main() void {\n    c.bump();\n}\n",
+    )
+    .unwrap();
+
+    let dead = dead_symbol_names(dir.path());
+    assert!(
+        !dead.iter().any(|n| n == "counter"),
+        "代入先は参照: {dead:?}"
+    );
+    assert!(
+        dead.iter().any(|n| n == "unused_var"),
+        "対照: 未使用の変数は dead のまま: {dead:?}"
+    );
+}
+
+/// turbofish 付きメソッド呼び出し `s.fetch::<u32>()` は `call_expression > generic_function >
+/// field_expression` になり、旧実装はフィールドアクセスと誤判定して参照から落としていた。
+/// 対照: 未使用の `Store.other` は dead のまま。
+#[test]
+fn dead_code_rust_turbofish_method_call_keeps_method_live() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub mod store;\npub mod user;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/store.rs"),
+        "pub struct Store;\n\
+         impl Store {\n\
+         \x20   pub fn fetch<T: Default>(&self) -> T { T::default() }\n\
+         \x20   pub fn other(&self) -> u32 { 0 }\n\
+         }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/user.rs"),
+        "use crate::store::Store;\npub fn run(s: &Store) -> u32 {\n    s.fetch::<u32>()\n}\n",
+    )
+    .unwrap();
+
+    let dead = dead_symbol_names(dir.path());
+    assert!(
+        !dead.iter().any(|n| n == "Store.fetch"),
+        "turbofish 付き呼び出しは参照: {dead:?}"
+    );
+    assert!(
+        dead.iter().any(|n| n == "Store.other"),
+        "対照: 未使用メソッドは dead のまま: {dead:?}"
+    );
 }

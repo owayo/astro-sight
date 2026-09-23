@@ -408,6 +408,52 @@ fn session_invalid_json_returns_error() {
     );
 }
 
+/// 非 UTF-8 の行は他の不正な行と同じく行単位の `INVALID_REQUEST` にし、
+/// 後続の要求を処理し続ける (旧実装は `IO_ERROR` + exit 1 でセッションごと終了していた)。
+#[test]
+fn session_non_utf8_line_is_rejected_per_line_and_session_continues() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = cargo_bin()
+        .arg("session")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn session");
+
+    let stdin = child.stdin.as_mut().unwrap();
+    stdin
+        .write_all(
+            b"{\"command\":\"doctor\",\"path\":\".\"}\n\xff\xfe\n{\"command\":\"symbols\",\"path\":\"src/main.rs\"}\n",
+        )
+        .unwrap();
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("failed to wait");
+    assert!(
+        output.status.success(),
+        "非 UTF-8 の行でセッション全体を終了させない"
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each line is JSON"))
+        .collect();
+    assert_eq!(lines.len(), 3, "1 行の入力に 1 行の応答: {stdout}");
+    assert!(
+        lines[0]["languages"].is_array(),
+        "対照: 前の要求は処理される"
+    );
+    assert_eq!(lines[1]["error"]["code"], "INVALID_REQUEST");
+    assert!(
+        lines[2]["symbols"].is_array(),
+        "非 UTF-8 行の後の要求も処理される: {}",
+        lines[2]
+    );
+}
+
 #[test]
 fn session_empty_input_exits_cleanly() {
     use std::process::Stdio;

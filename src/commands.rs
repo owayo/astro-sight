@@ -5,8 +5,8 @@ use crate::cache::store::CacheStore;
 use crate::doctor;
 use crate::engine::parser;
 use crate::models::cochange::{CoChangeOptions, CoChangeResult};
-use crate::models::reference::{RefsResult, SymbolReference};
-use crate::models::result_summary::{ResultLimits, ResultSummary};
+use crate::models::reference::RefsResult;
+use crate::models::result_summary::ResultLimits;
 use crate::models::skip::SkipInfo;
 use crate::service::{AppService, AstParams};
 
@@ -14,8 +14,12 @@ mod common;
 
 pub use crate::output::{OutputFormat, OutputOptions, serialize_cli_document, serialize_document};
 #[cfg(test)]
+pub(crate) use common::ChangedFileSet;
+#[cfg(test)]
 pub(crate) use common::read_bytes_limited_and_drain;
-pub(crate) use common::{ChangedFileSet, cache_hash_for_path, log_phase, read_to_string_limited};
+pub(crate) use common::{
+    DiffCallerResolution, cache_hash_for_path, log_phase, read_to_string_limited,
+};
 pub use common::{MAX_INPUT_SIZE, classify_error, read_paths_file_limited};
 
 // ---------------------------------------------------------------------------
@@ -312,32 +316,18 @@ pub fn cmd_refs(
 ///
 /// 予算は **実際に描画したテキスト**に対して判定するので、`--format` / `--pretty` の
 /// 選択がそのまま反映される (TOON が選ばれれば同じ予算でより多く出せる)。
-/// `skipped` (生成物としてスキャンから外したファイル) があれば入力集合が完全でないため
-/// `complete_input` を false にする。
+/// 生成物としてスキャンから外したファイル (`skipped`) や読み込み・parse に失敗した
+/// ファイルがあれば入力集合が完全でないため `complete_input` を false にする。
 fn render_refs_within_limits(
     mut result: RefsResult,
     limits: ResultLimits,
     output: OutputOptions,
 ) -> Result<(String, usize, usize)> {
     let total = result.references.len();
-    let complete_input = result.skipped.is_none();
-    let references = std::mem::take(&mut result.references);
-
-    let (shown, summary) =
-        crate::output::limit::apply_limits(&references, limits, complete_input, |k, summary| {
-            let probe = RefsResult {
-                symbol: result.symbol.clone(),
-                references: references[..k].to_vec(),
-                skipped: result.skipped.clone(),
-                result_summary: summary.cloned(),
-            };
-            serialize_cli_document(&probe, output)
-        })?;
-
-    let mut rendered = references;
-    rendered.truncate(shown);
-    result.references = rendered;
-    result.result_summary = summary;
+    crate::output::limit::apply_refs_limits(&mut result, limits, |probe| {
+        serialize_cli_document(probe, output)
+    })?;
+    let shown = result.references.len();
     let text = serialize_cli_document(&result, output)?;
     Ok((text, shown, total))
 }
@@ -359,77 +349,56 @@ pub fn cmd_refs_batch(
     // 集約するため、ここでは全名を 1 回で渡す（以前は呼び出し側で chunk 分割していたが
     // chunk 毎に walk し直していた）。service は入力順を保った `Vec<RefsResult>` を返すので
     // NDJSON 出力も names 順を維持する。
-    let results =
+    let mut results =
         service.find_references_batch_with_generated(names, dir, glob, include_generated)?;
     let total_refs: usize = results.iter().map(|r| r.references.len()).sum();
 
     // 上限は **呼び出し全体**に 1 つだけ課し、名前間へ round-robin で配分する
     // (名前ごとに上限を課すと全体が名前数に比例して膨らみ、先頭から詰めると
     // 高頻度な 1 名が予算を食い尽くして後続が 0 件になる)。
-    let complete_input = results.iter().all(|r| r.skipped.is_none());
-    let groups: Vec<&[SymbolReference]> = results.iter().map(|r| r.references.as_slice()).collect();
-    let (alloc, summaries) = crate::output::limit::apply_grouped_limits(
-        &groups,
-        limits,
-        complete_input,
-        |alloc, summaries| render_refs_batch(&results, alloc, summaries, output),
-    )?;
+    crate::output::limit::apply_refs_batch_limits(&mut results, limits, |capped| {
+        render_refs_batch(capped, output)
+    })?;
 
-    let text = render_refs_batch(&results, &alloc, &summaries, output)?;
+    let text = render_refs_batch(&results, output)?;
     write!(out, "{text}")?;
 
     info!(
         command = "refs_batch",
         names_count = names.len(),
-        shown_refs = alloc.iter().sum::<usize>(),
+        shown_refs = results.iter().map(|r| r.references.len()).sum::<usize>(),
         total_refs = total_refs,
         "command completed"
     );
     Ok(())
 }
 
-/// `refs --names` の出力本文を組み立てる。
+/// `refs --names` の出力本文を組み立てる (`capped` は上限適用済みの結果列)。
 ///
 /// この経路は元々全件を `Vec` で保持しているため、TOON では NDJSON ではなく
 /// 1 個のルート配列ドキュメントとして出す (ストリーミング要件が無いので、
 /// tabular 判定まで効く canonical なエンコードが使える)。
 /// auto も全件を持っているぶん近似が要らず、NDJSON 全体と TOON ドキュメントを
 /// 実際に組み立てて短い方を選べる。
-fn render_refs_batch(
-    results: &[RefsResult],
-    alloc: &[usize],
-    summaries: &[Option<ResultSummary>],
-    output: OutputOptions,
-) -> Result<String> {
-    let capped: Vec<RefsResult> = results
-        .iter()
-        .enumerate()
-        .map(|(i, r)| RefsResult {
-            symbol: r.symbol.clone(),
-            references: r.references[..alloc[i]].to_vec(),
-            skipped: r.skipped.clone(),
-            result_summary: summaries[i].clone(),
-        })
-        .collect();
-
+fn render_refs_batch(capped: &[RefsResult], output: OutputOptions) -> Result<String> {
     let mut text = String::new();
     match output.format() {
         OutputFormat::Json => {
-            for result in &capped {
+            for result in capped {
                 text.push_str(&serde_json::to_string(result)?);
                 text.push('\n');
             }
         }
         OutputFormat::Toon => {
-            text.push_str(&serialize_document(&capped, output)?);
+            text.push_str(&serialize_document(capped, output)?);
         }
         OutputFormat::Auto => {
             let mut ndjson = String::new();
-            for result in &capped {
+            for result in capped {
                 ndjson.push_str(&serde_json::to_string(result)?);
                 ndjson.push('\n');
             }
-            let toon = serialize_document(&capped, output.with_format(OutputFormat::Toon))?;
+            let toon = serialize_document(capped, output.with_format(OutputFormat::Toon))?;
             if crate::output::estimated_size(&toon) < crate::output::estimated_size(&ndjson) {
                 text.push_str(&toon);
             } else {
@@ -484,7 +453,9 @@ mod git_input;
 pub use git_input::{
     BlameSourceResolution, DEFAULT_BLAME_BASE, resolve_blame_source_files, run_git_diff,
 };
-pub(crate) use git_input::{DiffSourceResolution, resolve_diff_source};
+pub(crate) use git_input::{DiffSourceResolution, diff_new_side, resolve_diff_source};
+// impact の Pass 1 が `--staged` で index の内容を読むために使う。
+pub(crate) use git_input::GitBlobBatch;
 // GitDiffInput / resolve_git_diff は Task 4 で resolve_diff_source に内包され、
 // 非テストコードからの直接参照は無くなった。tests.rs のみが `super::*` 経由で使う。
 #[cfg(test)]
@@ -546,6 +517,7 @@ pub fn cmd_context(service: &AppService, opts: &CmdContextOpts<'_>) -> Result<()
     let options = crate::models::impact::ContextAnalysisOptions {
         exclude_dirs: exclude_dirs.to_vec(),
         exclude_globs: exclude_globs.to_vec(),
+        new_side: diff_new_side(diff, diff_file, git, staged),
     };
 
     // 逐次出力できるのは compact JSON だけ。pretty は整形が要り、TOON はルート配列の
@@ -666,11 +638,22 @@ pub fn cmd_impact(service: &AppService, opts: &CmdImpactOpts<'_>) -> Result<()> 
     let options = crate::models::impact::ContextAnalysisOptions {
         exclude_dirs: exclude_dirs.to_vec(),
         exclude_globs: exclude_globs.to_vec(),
+        new_side: diff_new_side(None, None, git, staged),
     };
     let result = service.analyze_context(&diff_input, dir, &options)?;
 
-    // 変更されたファイルパスを事前に canonicalize してキャッシュ（O(M) syscall に削減）
-    let changed = ChangedFileSet::build(dir, result.changes.iter().map(|c| c.path.as_str()));
+    // 呼び出し側が diff 内で解決済みかの判定 (`DiffCallerResolution` の doc 参照)。
+    // `result.changes` は affected シンボルを持つファイルしか含まないため、それだけで判定すると
+    // トップレベルの呼び出しだけを更新したファイル (Python / JS のスクリプト等) が diff 外扱いに
+    // なり、更新済みの呼び出し側で "Unresolved impacts found" と誤ってブロックする。
+    // 変更ファイルのパスは事前に canonicalize してキャッシュする (O(M) syscall)。
+    let diff_files = crate::engine::diff::parse_unified_diff(&diff_input);
+    let resolution = DiffCallerResolution::build(
+        dir,
+        result.changes.iter().map(|c| c.path.as_str()),
+        &diff_input,
+        &diff_files,
+    );
 
     // 未解決の影響をグループ化: diff に含まれないファイルの caller
     // caller ごとに影響シンボルを追跡
@@ -688,8 +671,8 @@ pub fn cmd_impact(service: &AppService, opts: &CmdImpactOpts<'_>) -> Result<()> 
         }
 
         for caller in &change.impacted_callers {
-            // caller のファイルが変更ファイルに含まれていないか（= diff 内で未解決か）を判定
-            if !changed.contains_caller(dir, &caller.path) {
+            // caller が diff 内で未解決か (変更ファイル内 / 更新済みの呼び出し行でないか) を判定
+            if !resolution.is_resolved(dir, &caller.path, caller.line) {
                 unresolved
                     .entry(change.path.clone())
                     .or_default()
@@ -788,7 +771,7 @@ pub fn cmd_mcp(output: OutputOptions) -> Result<()> {
 mod review;
 
 #[cfg(test)]
-pub(crate) use review::hook::build_review_hook_json;
+pub(crate) use review::hook::{build_review_hook_json, build_review_hook_json_for_diff};
 pub use review::{CmdReviewOpts, cmd_review};
 
 mod api_changes;

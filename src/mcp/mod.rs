@@ -58,7 +58,8 @@ pub struct SymbolsExtractParams {
 pub struct CallsExtractParams {
     /// Path to the source file
     pub path: String,
-    /// Filter to a specific function name
+    /// Only show calls made from inside this function (its callees).
+    /// To find who calls a function, use refs_search
     #[serde(default)]
     pub function: Option<String>,
 }
@@ -157,7 +158,7 @@ pub struct LintRuleParam {
 pub struct SequenceDiagramParams {
     /// Path to the source file
     pub path: String,
-    /// Filter to a specific function name
+    /// Only draw calls made from inside this function (its callees)
     #[serde(default)]
     pub function: Option<String>,
 }
@@ -306,8 +307,11 @@ impl AstroSightServer {
             .find_references_with_generated(name, &p.dir, p.glob.as_deref(), p.include_generated)
             .and_then(|mut r| {
                 // 出力件数の上限は表現層の責務。MCP はエージェントが直接消費する面なので
-                // CLI と同じ既定値を適用する。
-                crate::output::limit::apply_refs_limits_json(&mut r, limits)?;
+                // CLI と同じ既定値を適用する。予算は tool result と同じ描画で採寸する
+                // (`--format` / `--pretty` に従うため、compact JSON 固定で測ると超過する)。
+                crate::output::limit::apply_refs_limits(&mut r, limits, |probe| {
+                    self.render_text(probe)
+                })?;
                 Ok(r)
             });
         self.to_tool_result(result)
@@ -347,7 +351,9 @@ impl AstroSightServer {
                 p.include_generated,
             )
             .and_then(|mut r| {
-                crate::output::limit::apply_refs_batch_limits_json(&mut r, limits)?;
+                crate::output::limit::apply_refs_batch_limits(&mut r, limits, |capped| {
+                    self.render_text(capped)
+                })?;
                 Ok(r)
             });
         self.to_tool_result(result)
@@ -365,6 +371,7 @@ impl AstroSightServer {
         let options = crate::models::impact::ContextAnalysisOptions {
             exclude_dirs: p.exclude_dirs,
             exclude_globs: p.exclude_globs,
+            ..Default::default()
         };
         self.to_tool_result(self.service.analyze_context(&p.diff, &p.dir, &options))
     }
@@ -476,13 +483,20 @@ impl AstroSightServer {
 // ---------------------------------------------------------------------------
 
 impl AstroSightServer {
+    /// tool result の text content を組み立てる。`refs` の予算採寸も必ずこれを通し、
+    /// 実際に返す描画と採寸を一致させる。
+    fn render_text<T: serde::Serialize + ?Sized>(&self, value: &T) -> anyhow::Result<String> {
+        serialize_document(value, self.output)
+    }
+
     fn to_tool_result<T: serde::Serialize>(
         &self,
         result: anyhow::Result<T>,
     ) -> Result<CallToolResult, McpError> {
         match result {
             Ok(value) => {
-                let text = serialize_document(&value, self.output)
+                let text = self
+                    .render_text(&value)
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
             }
@@ -496,11 +510,11 @@ impl AstroSightServer {
 // ---------------------------------------------------------------------------
 
 impl ServerHandler for AstroSightServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let mut caps = ServerCapabilities::default();
         caps.tools = Some(ToolsCapability::default());
 
-        ServerInfo::new(caps).with_server_info(Implementation::new(
+        ServerConfig::new(caps).with_server_info(Implementation::new(
             "astro-sight",
             env!("CARGO_PKG_VERSION"),
         ))

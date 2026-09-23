@@ -505,7 +505,7 @@ impl ModuleVisibilityCollector<'_, '_> {
 }
 
 /// `src/` 配下の `.rs` ファイル (file は dir 相対) を `source` 経由で読む。
-/// Worktree なら `std::fs::read(<canonical_dir>/<file>)`、Base なら `git show <rev>:<file>`。
+/// Worktree なら `std::fs::read(<canonical_dir>/<file>)`、Base なら `<rev>:<file>` の blob。
 pub(crate) fn read_rs_blob(
     source: RustSourceTree<'_>,
     dir: &str,
@@ -517,14 +517,6 @@ pub(crate) fn read_rs_blob(
             let abs = canonical_dir.join(file);
             std::fs::read(abs).ok()
         }
-        RustSourceTree::Base { rev } => {
-            let file_str = file.to_str()?;
-            read_git_blob_at_base(dir, rev, file_str)
-        }
+        RustSourceTree::Base { blobs } => blobs.read(file.to_str()?),
     }
-}
-
-/// `git show <base>:<file>` で blob を取る (file は repo 相対)。
-pub(crate) fn read_git_blob_at_base(dir: &str, base: &str, file: &str) -> Option<Vec<u8>> {
-    git_show_blob(dir, base, file)
 }

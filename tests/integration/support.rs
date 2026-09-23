@@ -137,11 +137,25 @@ pub(super) fn cargo_bin_with_explicit_config() -> Command {
 
 /// MCP テスト用ヘルパー: initialize + initialized 後に追加メッセージを送信し、stdout を返す
 pub(super) fn mcp_send_after_init(extra_messages: &[&str]) -> String {
+    mcp_send_after_init_with(&[], None, extra_messages)
+}
+
+/// `mcp_send_after_init` の拡張版。`global_args` (`--pretty` / `--format toon` 等) を
+/// `mcp` サブコマンドの前に付け、`cwd` を指定すればそこをサンドボックスとして起動する。
+pub(super) fn mcp_send_after_init_with(
+    global_args: &[&str],
+    cwd: Option<&Path>,
+    extra_messages: &[&str],
+) -> String {
     use std::io::{BufRead, BufReader, Write};
     use std::process::Stdio;
 
-    let mut child = cargo_bin()
-        .arg("mcp")
+    let mut command = cargo_bin();
+    command.args(global_args).arg("mcp");
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

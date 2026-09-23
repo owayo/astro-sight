@@ -70,11 +70,16 @@ fn refs_counts_object_shorthand_value_but_not_destructuring_binding() {
         "object shorthand `{{ handler }}` should be counted as a reference: {handler:?}"
     );
 
-    // `const { picked } = ...` は束縛なので ref にしない (数えると dead-code が fail-open する)
+    // `const { picked } = ...` は束縛なので ref にしない (数えると dead-code が fail-open する)。
+    // 変数宣言の束縛位置なので def として出す (定義位置を refs で辿れるようにする)。
     let picked = refs_of("picked");
     assert!(
-        !picked.iter().any(|r| r["ln"] == 3),
+        !picked.iter().any(|r| r["ln"] == 3 && r["kind"] == "ref"),
         "destructuring binding should not be counted as a reference: {picked:?}"
+    );
+    assert!(
+        picked.iter().any(|r| r["ln"] == 3 && r["kind"] == "def"),
+        "destructuring binding in a variable declaration should be reported as a definition: {picked:?}"
     );
 
     // shorthand で参照されている関数が dead に出ないこと (本来の症状)
@@ -993,6 +998,53 @@ fn refs_applies_default_result_limits_and_declares_omissions() {
     );
 }
 
+/// 読み込みに失敗したファイルがあれば `result_summary.complete_input` を false にする。
+///
+/// 旧実装は `skipped` (生成物の除外) だけで判定しており、読めなかったファイルの参照を
+/// 黙って数え落としたまま `total` を「全入力の総数」として申告していた。
+/// 失敗は読み込み上限 (100MB) を超える sparse file で起こす (`chmod 000` は root で再現しない)。
+#[test]
+fn refs_declares_incomplete_input_when_a_file_cannot_be_read() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("a.py"), "value = 1\nprint(value)\n").expect("write a");
+    std::fs::write(dir.path().join("b.py"), "value = 2\nprint(value)\n").expect("write b");
+
+    let summary_of = |args: &[&str]| -> serde_json::Value {
+        let output = cargo_bin()
+            .args(args)
+            .arg("--dir")
+            .arg(dir.path())
+            .output()
+            .expect("failed to run");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+        let first = stdout.lines().next().expect("at least one record");
+        let json: serde_json::Value = serde_json::from_str(first).expect("invalid JSON");
+        json["result_summary"].clone()
+    };
+    let single = ["refs", "--name", "value", "--max-results", "1"];
+    let batch = ["refs", "--names", "value", "--max-results", "1"];
+
+    // 対照: 全ファイルを読めるなら complete_input は true のまま。
+    let summary = summary_of(&single);
+    assert_eq!(summary["total"], 4);
+    assert_eq!(summary["complete_input"], true, "{summary}");
+    assert_eq!(summary_of(&batch)["complete_input"], true);
+
+    // 実データを書かない sparse file で読み込み上限を超えさせる。
+    let huge = std::fs::File::create(dir.path().join("huge.py")).expect("create huge");
+    huge.set_len(100 * 1024 * 1024 + 1).expect("extend huge");
+    drop(huge);
+
+    let summary = summary_of(&single);
+    assert_eq!(summary["total"], 4, "読めたファイルの件数はそのまま");
+    assert_eq!(
+        summary["complete_input"], false,
+        "読めなかったファイルがあれば total は全入力の総数ではない: {summary}"
+    );
+    assert_eq!(summary_of(&batch)["complete_input"], false);
+}
+
 /// `unlimited` で全件返り、サマリも出ない (明示的な全件取得の導線)。
 #[test]
 fn refs_unlimited_returns_every_reference() {
@@ -1111,4 +1163,42 @@ fn refs_batch_shares_one_budget_round_robin() {
         "全件出た側にサマリは付かない: {beta}"
     );
     assert_eq!(alpha["result_summary"]["total"], 201);
+}
+
+/// 変数宣言の分割代入の束縛位置は深さに依らず def。default 値・computed key・
+/// プロパティキーの識別子は参照のまま。
+///
+/// 旧実装は深さ 1 の `const [x] = ..` だけを def にし、`{ key: renamed }` / 入れ子 /
+/// `y = 1` / `...rest` の束縛を ref と数えていた (自己参照で dead を見逃す)。
+#[test]
+fn refs_classifies_destructuring_bindings_as_definitions() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("lib.ts"),
+        "export const { key: renamed, nested: { deep }, ...rest } = source();\n\
+         export const [x, y = fallback] = pair();\n",
+    )
+    .expect("write fixture");
+    let dir_arg = dir.path().to_str().expect("utf-8 path");
+    let kinds_of = |name: &str| -> Vec<String> {
+        let output = cargo_bin()
+            .args(["refs", "--name", name, "--dir", dir_arg])
+            .output()
+            .expect("failed to run");
+        assert!(output.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+        json["refs"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|r| r["kind"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    for binding in ["renamed", "deep", "rest", "x", "y"] {
+        assert_eq!(kinds_of(binding), ["def"], "{binding}");
+    }
+    // default 値とプロパティキーは参照
+    assert_eq!(kinds_of("fallback"), ["ref"]);
+    assert_eq!(kinds_of("key"), ["ref"]);
 }

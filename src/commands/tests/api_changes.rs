@@ -2,6 +2,7 @@
 
 mod compatibility_params;
 mod compatibility_react;
+mod declaration_coverage;
 mod general;
 mod other_languages;
 mod python;

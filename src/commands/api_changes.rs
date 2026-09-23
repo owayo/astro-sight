@@ -28,6 +28,53 @@ pub(crate) type ExportedSymbols = Vec<(String, String, String)>;
 
 type ExportedSymbolsWithLang = (crate::language::LangId, ExportedSymbols);
 
+/// `detect_api_changes` に渡す diff ファイル一覧。`diff_files` (= `parse_unified_diff` の結果) に、
+/// そこへ現れない内容同一の rename のうち、拡張子で言語を判定できるソースを判定できないパスへ
+/// 移したもの (`git mv api.ts api.ts.bak`) を足す。
+///
+/// impact / cochange / dead-code は内容同一の rename を扱わない前提で揃えているため
+/// `parse_unified_diff` 自体には足さず、API 差分でだけ見る。上の rename は旧ファイルの API が
+/// すべて消える変更だが、hunk を持たないため、これを足さないと api.rm が出ない (同じファイルを
+/// `git rm` すれば出る)。それ以外の内容同一 rename は API 面を変えないので足さない
+/// (ディレクトリ移動で大量に来る画像や文書の rename ごとにファイルを読ませない)。
+/// 新側が shebang で言語を判定できる場合の除外は `detect_api_changes` 側で行う。
+pub(crate) fn api_diff_files<'a>(
+    diff_files: &'a [crate::models::impact::DiffFile],
+    diff_input: &str,
+) -> std::borrow::Cow<'a, [crate::models::impact::DiffFile]> {
+    let hunkless_renames: Vec<_> = crate::engine::diff::parse_hunkless_renames(diff_input)
+        .into_iter()
+        .filter(renames_out_of_known_extension)
+        .collect();
+    if hunkless_renames.is_empty() {
+        return std::borrow::Cow::Borrowed(diff_files);
+    }
+    std::borrow::Cow::Owned(diff_files.iter().cloned().chain(hunkless_renames).collect())
+}
+
+/// 削除扱いにしたファイル (削除 / 対応言語外への rename) が bash なら、関数名を
+/// ApiRefIndex の検索対象に入れる。残存参照判定 (`is_removed_bash_symbol_unreferenced`) を
+/// 関数ごとの全リポジトリ走査ではなく index から引くため。bash の関数名は `.` を含みうるので
+/// bare name に畳まず、そのままの名前で検索する。
+fn collect_deleted_bash_index_names(
+    df: &crate::models::impact::DiffFile,
+    old_syms: Option<&[(String, String, String)]>,
+    index_names: &mut HashSet<String>,
+) {
+    if is_bash_script_path(&df.old_path)
+        && let Some(syms) = old_syms
+    {
+        index_names.extend(syms.iter().map(|(name, _, _)| name.clone()));
+    }
+}
+
+/// rename の旧パスは拡張子で言語を判定できるが、新パスはできない (`api.ts` → `api.ts.bak`)。
+fn renames_out_of_known_extension(df: &crate::models::impact::DiffFile) -> bool {
+    let known =
+        |path: &str| crate::language::LangId::from_path(camino::Utf8Path::new(path)).is_ok();
+    known(&df.old_path) && !known(&df.new_path)
+}
+
 pub(crate) fn detect_api_changes(
     dir: &str,
     base: &str,
@@ -52,11 +99,13 @@ pub(crate) fn detect_api_changes(
 
     let canonical_dir = std::fs::canonicalize(dir).ok();
 
-    // Phase 0: added / modified ファイルの exported シンボルを抽出し、cross-file 参照
-    // 判定の対象になりうる name を集めて ApiRefIndex を構築する。候補シンボルごとの
+    // Phase 0: added / modified / deleted ファイルの exported シンボルを抽出し、cross-file
+    // 参照判定の対象になりうる name を集めて ApiRefIndex を構築する。候補シンボルごとの
     // 全リポジトリ走査 (O(候補数 × 全ファイル)) を chunk 単位の batch 検索に集約する。
     let mut prepared: Vec<PreparedDiffFile> = Vec::with_capacity(diff_files.len());
     let mut index_names: HashSet<String> = HashSet::new();
+    // 変更 / 削除ファイルの旧版はここで 1 プロセスの `git cat-file --batch` から読む。
+    let base_blobs = crate::commands::git_input::GitBlobBatch::new(dir, base);
     for df in diff_files {
         if should_skip_diff_file(df, &gitattrs, canonical_dir.as_deref()) {
             prepared.push(PreparedDiffFile::Skip);
@@ -83,15 +132,48 @@ pub(crate) fn detect_api_changes(
             continue;
         }
         if df.new_path == "/dev/null" {
-            prepared.push(PreparedDiffFile::Deleted);
+            let old_syms = extract_deleted_file_exported_symbols(&base_blobs, df);
+            collect_deleted_bash_index_names(df, old_syms.as_deref(), &mut index_names);
+            prepared.push(PreparedDiffFile::Deleted { old_syms });
+            continue;
+        }
+        // hunk の無い rename (内容同一) はシンボルが変わらない。旧側が拡張子で判定できる
+        // ソースで、新側が対応言語の外へ出た (拡張子でも shebang でも言語を判定できない) 場合
+        // だけ、旧ファイルの削除として扱う。内容が同一なので、旧側を拡張子で判定できなければ
+        // 旧側の言語も新側と同じ shebang で決まり、API 面は変わらない。
+        if df.hunks.is_empty() {
+            let leaves_source = renames_out_of_known_extension(df)
+                && extract_new_file_facts(dir, &df.new_path).language_unknown;
+            prepared.push(if leaves_source {
+                let old_syms = extract_deleted_file_exported_symbols(&base_blobs, df);
+                collect_deleted_bash_index_names(df, old_syms.as_deref(), &mut index_names);
+                PreparedDiffFile::Deleted { old_syms }
+            } else {
+                PreparedDiffFile::Skip
+            });
             continue;
         }
         // rename 差分では base 側に新パスが存在しないため、旧版は old_path から読む。
-        let old_syms = extract_exported_symbols_from_git(dir, base, &df.old_path);
+        let old_syms = extract_exported_symbols_from_git(&base_blobs, &df.old_path);
         // new_path を 1 回 read+parse して exported / callees / export surface を導出 (perf #2)。
         // export surface は process_modified_file が再 parse せず使えるよう
         // PreparedDiffFile に持たせる。
         let facts = extract_new_file_facts(dir, &df.new_path);
+        // 対応言語でないファイルへの rename (`api.ts` → `api.ts.bak`) は、新側に API 面が
+        // 無いので旧ファイルの削除と同じ。変更ファイルとして扱うと新側のシンボルが取れず
+        // 何も検出されない (旧 API がすべて消えるのに api.rm が出ない)。
+        // 読み込み / parse の失敗は「API 面が無い」証明ではないので対象外。同じパスのまま
+        // shebang を消した拡張子なしスクリプトのような in-place 変更も、パスで参照する
+        // 利用側は壊れないので対象外 (rename に限る)。
+        if df.old_path != df.new_path
+            && old_syms.is_some()
+            && facts.exported.is_none()
+            && facts.language_unknown
+        {
+            collect_deleted_bash_index_names(df, old_syms.as_deref(), &mut index_names);
+            prepared.push(PreparedDiffFile::Deleted { old_syms });
+            continue;
+        }
         let new_syms = facts.exported;
         let in_file_callees = facts.callees;
         let new_export_surface_names = facts.export_surface_names;
@@ -125,6 +207,7 @@ pub(crate) fn detect_api_changes(
         diff_files,
         diff_new_paths: &diff_new_paths,
         ref_index: &ref_index,
+        base_blobs: &base_blobs,
     };
     let mut state = DetectionState {
         buckets: &mut buckets,
@@ -151,8 +234,10 @@ pub(crate) fn detect_api_changes(
                     );
                 }
             }
-            PreparedDiffFile::Deleted => {
-                process_deleted_file(&inputs, &mut state, df);
+            PreparedDiffFile::Deleted { old_syms } => {
+                if let Some(old_syms) = old_syms {
+                    process_deleted_file(&inputs, &mut state, df, old_syms);
+                }
             }
             PreparedDiffFile::Modified {
                 old_syms,

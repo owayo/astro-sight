@@ -6,7 +6,7 @@ use super::*;
 pub(crate) fn detect_react_wrapper_compatible_mod(
     index: &ApiRefIndex,
     site: &CompatibleModSite<'_>,
-    sources: &mut SignatureSourceCache,
+    sources: &mut SignatureSourceCache<'_>,
 ) -> Option<CompatibleApiModification> {
     let lang = site.lang_in(TS_JS_LANGS)?;
     if !new_sig_has_react_wrapper(site.new_sig) {
