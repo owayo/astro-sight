@@ -60,6 +60,14 @@ fn build_review_hook_json_compatible_modified_is_informational() {
         "mod_compat は情報提供として hook JSON に出すべき"
     );
     assert!(!build.is_blocking, "mod_compat (互換変更) は非 blocking");
+    assert_eq!(
+        build.value.unwrap().to_string(),
+        concat!(
+            r#"{"api":{"mod_compat":[{"f":"ScheduleItem.tsx","n":"ScheduleItem","reason":"react_component_wrapper"}]},"#,
+            r#""hint":"False positives? Run astro-sight-triage skill."}"#
+        ),
+        "preserve_order が有効でも hook の JSON キー順を保つ"
+    );
 }
 
 /// mod_compat に分類済みのシンボルに紐づく cross-file impact は、破壊的影響ではなく

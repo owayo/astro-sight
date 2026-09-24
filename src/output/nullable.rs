@@ -57,7 +57,7 @@ pub(super) enum OmittedDefault {
 impl OmittedDefault {
     fn value(self) -> ToonValue {
         match self {
-            OmittedDefault::UsizeZero => ToonValue::UInt(0),
+            OmittedDefault::UsizeZero => ToonValue::from(0u64),
             OmittedDefault::BoolFalse => ToonValue::Bool(false),
         }
     }
@@ -66,7 +66,7 @@ impl OmittedDefault {
     /// 「登録したフィールドの列」だと確認できないため補完しない。
     fn matches(self, value: &ToonValue) -> bool {
         match self {
-            OmittedDefault::UsizeZero => matches!(value, ToonValue::UInt(_)),
+            OmittedDefault::UsizeZero => value.is_u64(),
             OmittedDefault::BoolFalse => matches!(value, ToonValue::Bool(_)),
         }
     }
@@ -158,14 +158,11 @@ fn fill_array(items: &mut [ToonValue]) -> bool {
     let mut union: Vec<String> = Vec::new();
     let mut all_complete = true;
     for item in items.iter() {
-        let Some(fields) = item.as_non_empty_object() else {
+        let Some(fields) = item.as_object().filter(|fields| !fields.is_empty()) else {
             return false;
         };
-        for (i, (key, value)) in fields.iter().enumerate() {
-            if !value.is_primitive() {
-                return false;
-            }
-            if fields[..i].iter().any(|(prev, _)| prev == key) {
+        for (key, value) in fields {
+            if value.is_array() || value.is_object() {
                 return false;
             }
             if !union.iter().any(|existing| existing == key) {
@@ -177,7 +174,8 @@ fn fill_array(items: &mut [ToonValue]) -> bool {
     // 既に全要素が同じキー集合なら、厳密エンコードのままで tabular になる。
     for item in items.iter() {
         let fields = item
-            .as_non_empty_object()
+            .as_object()
+            .filter(|fields| !fields.is_empty())
             .expect("checked above that every item is a non-empty object");
         if fields.len() != union.len() {
             all_complete = false;
@@ -198,9 +196,9 @@ fn fill_array(items: &mut [ToonValue]) -> bool {
             Some(default) => {
                 let consistent = items
                     .iter()
-                    .filter_map(|item| item.as_non_empty_object())
-                    .filter_map(|fields| fields.iter().find(|(k, _)| k == key))
-                    .all(|(_, value)| default.matches(value));
+                    .filter_map(|item| item.as_object().filter(|fields| !fields.is_empty()))
+                    .filter_map(|fields| fields.get(key))
+                    .all(|value| default.matches(value));
                 if !consistent {
                     return false;
                 }
@@ -214,14 +212,10 @@ fn fill_array(items: &mut [ToonValue]) -> bool {
         let ToonValue::Object(fields) = item else {
             unreachable!("checked above that every item is a non-empty object");
         };
-        let mut rebuilt = Vec::with_capacity(union.len());
+        let mut rebuilt = serde_json::Map::with_capacity(union.len());
         for (key, fill) in union.iter().zip(&fills) {
-            let value = fields
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.clone())
-                .unwrap_or_else(|| fill.clone());
-            rebuilt.push((key.clone(), value));
+            let value = fields.get(key).cloned().unwrap_or_else(|| fill.clone());
+            rebuilt.insert(key.clone(), value);
         }
         *fields = rebuilt;
     }
@@ -241,8 +235,8 @@ mod tests {
         )
     }
 
-    fn n(v: i128) -> ToonValue {
-        ToonValue::Int(v)
+    fn n(v: i64) -> ToonValue {
+        ToonValue::from(v)
     }
 
     #[test]
@@ -275,7 +269,8 @@ mod tests {
         };
         for item in items {
             let keys: Vec<&str> = item
-                .as_non_empty_object()
+                .as_object()
+                .filter(|fields| !fields.is_empty())
                 .unwrap()
                 .iter()
                 .map(|(k, _)| k.as_str())
@@ -337,13 +332,13 @@ mod tests {
         let ToonValue::Object(root) = &value else {
             panic!("object expected");
         };
-        let ToonValue::Array(files) = &root[0].1 else {
+        let ToonValue::Array(files) = &root["files"] else {
             panic!("array expected");
         };
         let ToonValue::Object(file) = &files[0] else {
             panic!("object expected");
         };
-        let ToonValue::Array(symbols) = &file[0].1 else {
+        let ToonValue::Array(symbols) = &file["symbols"] else {
             panic!("array expected");
         };
         assert_eq!(symbols[1], obj(&[("n", n(3)), ("cx", ToonValue::Null)]));
@@ -352,7 +347,7 @@ mod tests {
     /// 対照として、同じ配列の `Option` 列は従来どおり `null` で埋める。
     #[test]
     fn registered_non_option_keys_are_filled_with_their_default() {
-        let u = |v: u128| ToonValue::UInt(v);
+        let u = |v: u64| ToonValue::from(v);
         let mut value = ToonValue::Array(vec![
             obj(&[
                 ("name", n(1)),
@@ -389,7 +384,7 @@ mod tests {
         let mut value = ToonValue::Array(vec![
             obj(&[
                 ("name", n(1)),
-                ("refs_internal", ToonValue::Str("x".into())),
+                ("refs_internal", ToonValue::String("x".into())),
             ]),
             obj(&[("name", n(2))]),
         ]);

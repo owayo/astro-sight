@@ -179,7 +179,9 @@ fn run_session_io<R: BufRead, W: Write>(
             )),
         };
 
-        if let Some(value) = value {
+        if let Some(mut value) = value {
+            // session は従来の辞書順 JSON を維持する。
+            value.sort_all_objects();
             serde_json::to_writer(&mut out, &value)?;
             out.write_all(b"\n")?;
             out.flush()?;
@@ -195,6 +197,19 @@ mod tests {
 
     fn ok_handler(_req: AstgenRequest) -> Result<serde_json::Value> {
         Ok(serde_json::json!({ "ok": true }))
+    }
+
+    #[test]
+    fn session_keeps_sorted_json_keys_with_preserve_order() {
+        let mut output = Vec::new();
+        run_session_io(
+            &b"{\"command\":\"doctor\",\"path\":\".\"}\n"[..],
+            &mut output,
+            1024,
+            |_| Ok(serde_json::json!({"z": [{"z": 2, "a": 1}], "a": true})),
+        )
+        .unwrap();
+        assert_eq!(output, b"{\"a\":true,\"z\":[{\"a\":1,\"z\":2}]}\n");
     }
 
     #[test]

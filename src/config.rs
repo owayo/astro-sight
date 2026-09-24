@@ -152,7 +152,7 @@ debug = false
 # log_path = "~/.config/astro-sight/logs"
 
 # 既定の出力フォーマット: "json" | "toon" | "auto" (デフォルト: json)
-# toon = Token-Oriented Object Notation v4.1 (https://toonformat.dev/)。
+# toon = Token-Oriented Object Notation v3 (https://toonformat.dev/)。
 #        同じ内容を少ないトークン数で表現でき、LLM へ渡す用途に向く。
 # auto = json と toon のうち、その出力で推定トークン数が小さい方を自動で選ぶ
 #        (文字数 + 行数罰則。BPE では改行とインデントが 1 行あたり 1 トークンほど掛かる)。

@@ -885,7 +885,7 @@ compact 出力例（ast/symbols）:
 | | JSON | TOON | auto |
 |---|---|---|---|
 | 既定 | ✅ | | |
-| 仕様 | RFC 8259 | [TOON v4.1](https://toonformat.dev/) | 推定トークン数が小さい方 |
+| 仕様 | RFC 8259 | [TOON v3](https://github.com/toon-format/toon-rust) | 推定トークン数が小さい方 |
 | `--pretty` | 有効 | 無視（TOON は元からインデント構造） | JSON が選ばれた場合のみ有効 |
 | キャッシュ | compact のみ利用 | 利用しない | 利用しない |
 
@@ -900,33 +900,21 @@ astro-sight symbols --path src/main.rs --format toon
 ```toon
 path: src/main.rs
 lang: rust
-symbols[19]{name,kind,ln,cx}:
-  DELIMITER,const,8,null
-  needs_quoting,fn,11,6
-  is_numeric_like,fn,46,11
+symbols[3]{name,kind,ln,cx}:
+  MAX,const,0,null
+  alpha,fn,1,2
+  beta,fn,4,1
 ```
 
 同じ内容の JSON は次のようになる。キー名が要素ごとに繰り返される分が削減される。
 
 ```json
-{"path":"src/main.rs","lang":"rust","symbols":[{"name":"DELIMITER","kind":"const","ln":8},{"name":"needs_quoting","kind":"fn","ln":11,"cx":6},...]}
+{"path":"src/main.rs","lang":"rust","symbols":[{"name":"MAX","kind":"const","ln":0},{"name":"alpha","kind":"fn","ln":1,"cx":2},{"name":"beta","kind":"fn","ln":4,"cx":1}]}
 ```
 
-astro-sight のリポジトリ（`src/` 全体）での実測値:
+変換には [`toon-format` 0.5.0](https://github.com/toon-format/toon-rust) を使用する。CLI/TUI 用の依存を避けるため `default-features = false` とし、comma 区切り・2 スペースの既定設定で符号化する。対応仕様は **TOON v3**。空配列は `[0]:`、名前付きの空配列は `items[0]:` となる。
 
-| コマンド | JSON | TOON | 削減 |
-|---|---:|---:|---:|
-| `symbols --dir src` | 223,435 B | 160,702 B | -28% |
-| `symbols --path <file>` | 1,804 B | 1,124 B | -38% |
-| `calls --path <file>` | 9,756 B | 6,887 B | -29% |
-| `refs --name <sym> --dir .` | 1,924 B | 1,382 B | -28% |
-| `imports --path <file>` | 3,878 B | 3,215 B | -17% |
-| `dead-code --dir <dir>` | 330 B | 243 B | -26% |
-| `cochange --git` | 11,342 B | 5,355 B | -53% |
-| `review --git` | 2,727 B | 2,119 B | -22% |
-| `doctor` | 1,435 B | 578 B | -60% |
-
-出力はリファレンス実装（[`@toon-format/toon`](https://www.npmjs.com/package/@toon-format/toon) v4.1）の **strict モード** で decode できることを確認している。canonical encoder の要件に合わせ、単一出力・バッチ出力・`auto` で選ばれた TOON のいずれも文書末尾に改行を付けない（JSON / NDJSON の改行終端は従来どおり）。
+単一出力・バッチ出力は同ライブラリの strict decoder で検証している。文書末尾に改行は付けない（JSON / NDJSON の改行終端は従来どおり）。削減率は内容によって異なり、形式を自動選択する場合は `--format auto` を使う。
 
 ### auto - トークン数が少ない方を自動選択
 
@@ -945,21 +933,14 @@ BPE トークナイザでは**改行とインデントが 1 行あたりおよ�
 | `{"a":1,"b":2,"c":3,"d":4}` | 25 | **17** |
 | `a: 1` `b: 2` `c: 3` `d: 4`（4 行） | **19** | 19 |
 
-そこで判定には `文字数 + 4 × 改行数` を使う。astro-sight の出力を tiktoken で実測した結果:
+そこで判定には `文字数 + 4 × 改行数` を使う。TOON v3 への移行時（2026-09-24）に、単一出力・バッチ・件数制限付き refs の **63 ペア**を tiktoken で再測定した。既存の係数 4 を維持する。
 
-| 判定指標 | 1 回の呼び出しの最悪損失 | 全体（真の最小との差） |
+| トークナイザ | 係数 3 の合計損失 / 最大損失 | 係数 4 の合計損失 / 最大損失 |
 |---|---:|---:|
-| 素の文字数 | +28 トークン（15%） | +65 |
-| **文字数 + 4 × 改行数** | **+1〜2 トークン** | **0.0001〜0.13%** |
+| `o200k_base` | 6 / 6 tokens | 0 / 0 tokens |
+| `cl100k_base` | 12 / 9 tokens | 3 / 3 tokens |
 
-係数は**出力形が変わるたびに測り直す**。2026-09-04 に `result_summary`（出力上限の申告）という行数の多い小さな出力が加わったため再測定し、3 から 4 へ引き上げた:
-
-| サンプル集合 | k=3 の損失 | k=4 の損失 |
-|---|---:|---:|
-| 大きな出力 143 ペア | 0%（k=0..6 が同点） | 0% |
-| `result_summary` 付きの小さな出力 120 ペア | 0.67%（最悪 93 トークン） | **0.13%（最悪 30 トークン）** |
-
-小さい出力ほど形式間の逆転が起きやすいので、そちらで差が付く値を採る。両トークナイザで k=4 が最良で一致した。実トークナイザを積まないのは、(1) BPE テーブルで数 MB 増える、(2) 消費側のモデルやトークナイザの版で結果が変わり出力の再現性が壊れる、(3) 上表のとおり推定値で十分近い、の 3 点による。
+損失は JSON と TOON の実トークン数が少ない方との差。これは上記標本での測定値で、任意の出力についての上限保証ではない。係数は出力形が変わるたびに再測定する。実トークナイザを本体に含めないことで、追加データの容量とモデルごとの tokenizer 差を避け、同じ入力に対する選択を一定に保つ。
 
 なお `--token-budget`（[出力件数の上限](#出力件数の上限と-result_summary)）は、**この指標をそのまま使わない**。指標は形式間の相対比較に使うものなので、係数の絶対値は問わない。一方、予算は利用者が「N トークンまで」と絶対値で指定する。両者の桁を合わせないと、「3,000 と指定したのに 900 しか出ない」という乖離が起きる。実測（252 サンプル × 2 トークナイザ）の `指標 / 実トークン` は p05=3.00 / p50=3.42 / min=2.73 なので、予算判定では指標を 3 で割る（予算を超えない側に倒した値）。
 
@@ -1008,11 +989,7 @@ CLI で明示的に `--format toon` を渡した場合は「満たせない要�
 
 外側の配列は list form（`- ` 項目）で、tabular form にはしない。tabular 化には、全要素を見終えて初めて決まる情報が要る。これは、解析結果を全件バッファしない（ピーク RSS を入力件数から独立させる）という設計要件と両立しない。要素数 `[N]` は入力パス数から先に分かるので、ヘッダだけは先出しできる。内側の配列は従来どおり tabular form になり、削減量の大半はそちらから来る。
 
-なお **TOON v4.1 §9.3 は「tabular 条件を満たす配列には tabular form を使う」ことを MUST としている**。そのため、外側の配列が tabular 条件を満たすときに list form で出すのは、仕様に適合しない。ストリーミング要件を優先した意図的な選択で、影響は次のとおり限定される。
-
-- 発現するのは**バッチの全レコードが同一キー集合かつ全列が primitive / nested-uniform** のときだけ。通常のレコード（`symbols` / `ast` / `calls` / `imports` / `sequence` / `lint`）は必ず配列列を持つので tabular 不適格になり、実質「全パスが解析失敗したバッチ」に限られる
-- decode は壊れない。リファレンス実装の strict モードで decode でき、その結果は仕様どおり tabular で書いた場合の decode 結果と一致する
-- 損をするのはトークン量だけ（実測: 全 12 パスが `UNSUPPORTED_LANGUAGE` になるバッチで、本来 compact JSON 比 -27% のところ +14%）。ただし `--format auto` はこのとき正しく JSON を選ぶため、**auto 利用時に JSON より悪化することはない**（`--format toon` を明示したときだけ該当する）
+バッチでは、全要素を一括変換した場合に tabular form になる配列も list form で出す。要素の符号化はライブラリへ委譲し、strict decoder で復元した値が一致することをテストしている。解析失敗も 1 要素として数えるため、ヘッダの件数と出力件数は一致する。`refs --names` は元々全件を保持しているため、一括変換する。
 
 ### nullable 列の正規化
 

@@ -33,7 +33,7 @@ pub enum OutputFormat {
     /// JSON (default)
     #[default]
     Json,
-    /// TOON v4.1 - same data, fewer tokens (https://toonformat.dev/)
+    /// TOON v3 - compact tables (toon-format 0.5) (https://toonformat.dev/)
     Toon,
     /// Whichever of json/toon is estimated to use fewer tokens for this output
     Auto,
@@ -66,6 +66,8 @@ impl OutputFormat {
 ///   **k=4 は損失 0.13% / 最悪 30 tokens**。両トークナイザで k=4 が最良で一致した
 ///
 /// 小さい出力ほど形式間の逆転が起きやすいので、そちらで差が付く値を採る。
+// TOON v3 移行時の 63 ペアでも再計測し維持 (2026-09-24)。
+// k=4 の損失は o200k_base で 0、cl100k_base で合計・最大とも 3 tokens。
 const LINE_TOKEN_PENALTY: usize = 4;
 
 /// [`size_metric`] を実トークン数へ換算するときの除数。
@@ -244,7 +246,7 @@ pub fn serialize_document<T: serde::Serialize + ?Sized>(
 
 /// CLI の単一ドキュメントを直列化する。
 ///
-/// JSON は従来の行指向契約を保つため末尾改行を付ける。一方、TOON v4.1 の canonical
+/// JSON は従来の行指向契約を保つため末尾改行を付ける。一方、TOON の canonical
 /// encoder は末尾改行を禁止しているため、明示指定だけでなく `auto` で TOON が選ばれた
 /// 場合も改行を付けない。
 pub fn serialize_cli_document<T: serde::Serialize + ?Sized>(

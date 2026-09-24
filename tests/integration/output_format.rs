@@ -99,7 +99,7 @@ fn toon_single_document_is_indentation_based() {
     assert!(toon.starts_with("path: a.rs\n"), "unexpected: {toon}");
     assert!(toon.contains("lang: rust\n"), "unexpected: {toon}");
     assert!(toon.contains("symbols[3]"), "unexpected: {toon}");
-    // TOON v4.1 の canonical encoder は文書末尾の改行を禁止する。
+    // TOON v3 の canonical encoder は文書末尾の改行を禁止する。
     assert!(!toon.ends_with('\n'));
     for line in toon.lines() {
         assert_eq!(line, line.trim_end(), "trailing whitespace: {line:?}");
@@ -661,4 +661,44 @@ fn invalid_config_format_is_reported() {
 
     let output = run(&repo, &["--config", config, "symbols", "--path", "a.rs"]);
     assert!(!output.status.success());
+}
+
+#[test]
+fn toon_v3_documents_and_batches_decode_with_the_selected_library() {
+    let repo = sample_repo();
+    for args in [
+        vec!["symbols", "--path", "a.rs"],
+        vec!["symbols", "--dir", ".", "--glob", "**/*.rs"],
+        vec!["symbols", "--paths", "missing.rs,also-missing.rs"],
+        vec!["symbols", "--dir", ".", "--glob", "**/*.go"],
+        vec!["refs", "--names", "alpha,gamma", "--dir", "."],
+        vec!["imports", "--path", "a.rs"],
+        vec!["calls", "--path", "a.rs"],
+    ] {
+        let mut toon_args = args.clone();
+        toon_args.extend(["--format", "toon"]);
+        let text = stdout_of(&run(&repo, &toon_args));
+        let decoded: serde_json::Value =
+            toon_format::decode_strict(&text).unwrap_or_else(|e| panic!("{args:?}: {e}\n{text}"));
+        let json = stdout_of(&run(&repo, &args));
+        let expected: Vec<serde_json::Value> = json
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        if args.contains(&"--dir") || args.contains(&"--paths") || args.contains(&"--names") {
+            assert_eq!(
+                decoded.as_array().unwrap().len(),
+                expected.len(),
+                "{args:?}"
+            );
+        } else if args[0] != "symbols" {
+            assert_eq!(decoded, expected[0], "{args:?}");
+        } else {
+            // DTO の欠損列補完は維持する。None の列以外の内容を確認する。
+            assert_eq!(decoded["path"], expected[0]["path"]);
+            assert_eq!(decoded["symbols"].as_array().unwrap().len(), 3);
+            assert_eq!(decoded["symbols"][0]["cx"], serde_json::Value::Null);
+        }
+        assert!(!text.ends_with('\n'));
+    }
 }

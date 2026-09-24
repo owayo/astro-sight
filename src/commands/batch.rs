@@ -441,9 +441,11 @@ pub fn batch_symbols(
     paths: &[String],
     opts: BatchSymbolsOpts<'_>,
 ) -> Result<()> {
-    let trailer = opts
-        .skipped
-        .map(|skipped| serde_json::json!({ "skipped": skipped }));
+    let trailer = opts.skipped.map(|skipped| {
+        let mut value = serde_json::json!({ "skipped": skipped });
+        value.sort_all_objects();
+        value
+    });
     batch_ndjson_with_trailer(paths, trailer, opts.output, |p, output| {
         match service.extract_symbols_with_query(p, opts.query) {
             Ok(mut response) => {
