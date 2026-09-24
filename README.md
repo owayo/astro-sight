@@ -8,7 +8,7 @@
   AI エージェント向け AST 情報生成 CLI。tree-sitter ベースの高速構文解析で、AST 断片・シンボル定義・スニペットを JSON で返す。
 </p>
 
-<h3 align="center">Supported Platforms</h3>
+<h3 align="center">対応プラットフォーム</h3>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Linux-FCC624?logo=linux&amp;logoColor=black" alt="Linux">
