@@ -364,9 +364,11 @@ mod tests {
         fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         let explicit = default_log_path();
 
+        // TOML のリテラル文字列 ('...') で書く。基本文字列 ("...") だと Windows のパスの `\U` などが
+        // エスケープとして解釈され、設定ファイルの parse に失敗する
         fs::write(
             &config_path,
-            format!("debug = true\nlog_path = \"{}\"\n", explicit.display()),
+            format!("debug = true\nlog_path = '{}'\n", explicit.display()),
         )
         .unwrap();
 
