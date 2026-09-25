@@ -123,7 +123,7 @@ make install
 
 ## 使い方
 
-どのコマンドも既定では compact JSON を 1 行で出力します。`--pretty` を付けると JSON を字下げし、`--format toon` か `--format auto` を付けると TOON か、推定トークン数が少ない方の形式に切り替わります。
+結果の既定は 1 行の compact JSON です (バッチ処理ではファイルごとに 1 行)。`--pretty` を付けると JSON を字下げし、`--format toon` か `--format auto` を付けると TOON か、推定トークン数が少ない方の形式に切り替わります。
 
 ### エージェント向けの手順
 
