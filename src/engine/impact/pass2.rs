@@ -370,11 +370,16 @@ pub(super) fn stream_caller_maps_and_defs(
                         return state;
                     };
                     let utf8_path = camino::Utf8Path::new(path_str);
-                    let display_path_str = path
+                    // dir 相対の表示パス。diff のパス (常に `/` 区切り) と文字列で突き合わせる
+                    // (同一ファイルの判定・import の解決・出力の impacted_callers) ので、Windows でも
+                    // 区切りを `/` にそろえる (`\` のままだと変更元ファイル自身の参照まで外部の
+                    // 呼び出し元に数える)
+                    let display_path = path
                         .strip_prefix(dir)
                         .ok()
                         .and_then(|p| p.to_str())
-                        .unwrap_or(path_str);
+                        .map(crate::git_support::normalize_workspace_separators);
+                    let display_path_str = display_path.as_deref().unwrap_or(path_str);
 
                     // 本 per-file の可変バッファを `ImpactCollector` にまとめて borrow し、
                     // `visit_refs_and_defs_in_file_cb` の内部から callback で直接流す。
