@@ -635,7 +635,9 @@ fn session_refs_applies_result_limits() {
         src.push_str(&format!("pub fn caller{i}() {{ hotsym(); }}\n"));
     }
     std::fs::write(dir.path().join("a.rs"), &src).expect("write");
-    let dir_str = dir.path().to_str().expect("utf-8 path");
+    // JSON の文字列として埋め込む (Windows のパスの `\` をそのまま書くと不正なエスケープになる)
+    let dir_json =
+        serde_json::to_string(dir.path().to_str().expect("utf-8 path")).expect("json string");
 
     let mut child = cargo_bin()
         .arg("session")
@@ -648,22 +650,22 @@ fn session_refs_applies_result_limits() {
         // 1: 既定 (上限あり) / 2: unlimited / 3: 数値指定 / 4: 不正値
         writeln!(
             stdin,
-            r#"{{"command":"refs","name":"hotsym","dir":"{dir_str}"}}"#
+            r#"{{"command":"refs","name":"hotsym","dir":{dir_json}}}"#
         )
         .unwrap();
         writeln!(
             stdin,
-            r#"{{"command":"refs","name":"hotsym","dir":"{dir_str}","max_results":"unlimited","token_budget":"unlimited"}}"#
+            r#"{{"command":"refs","name":"hotsym","dir":{dir_json},"max_results":"unlimited","token_budget":"unlimited"}}"#
         )
         .unwrap();
         writeln!(
             stdin,
-            r#"{{"command":"refs","name":"hotsym","dir":"{dir_str}","max_results":7,"token_budget":100000}}"#
+            r#"{{"command":"refs","name":"hotsym","dir":{dir_json},"max_results":7,"token_budget":100000}}"#
         )
         .unwrap();
         writeln!(
             stdin,
-            r#"{{"command":"refs","name":"hotsym","dir":"{dir_str}","token_budget":10}}"#
+            r#"{{"command":"refs","name":"hotsym","dir":{dir_json},"token_budget":10}}"#
         )
         .unwrap();
     }
