@@ -75,7 +75,7 @@ astro-sight symbols --path src/main.rs
 # Compact output with docstrings
 astro-sight symbols --path src/main.rs --doc
 
-# The older full output (includes hash, range, and doc)
+# The full output (includes hash, range, and doc)
 astro-sight symbols --path src/main.rs --full
 
 # Symbols of every source file in a directory, as NDJSON
@@ -140,7 +140,7 @@ When at least one file is excluded, a machine-readable `skipped` always appears 
 {"symbol":"foo","refs":[],"skipped":{"generated":2,"paths":["gen/a.rs","gen/b.rs"]}}
 ```
 
-`symbols --dir` prints NDJSON, so it adds one control record with the same `skipped` object at the end. `refs --names` with several names keeps its "one record per symbol" form and adds the shared `skipped` once, to the first record. Batch responses of session / MCP keep their root array as before.
+`symbols --dir` prints NDJSON, so it adds one control record with the same `skipped` object at the end. `refs --names` with several names keeps its "one record per symbol" form and adds the shared `skipped` once, to the first record. Batch responses of session / MCP keep their root array.
 
 To scan without the exclusion, pass the global option `--include-generated`.
 
@@ -149,7 +149,7 @@ astro-sight --include-generated refs --name foo --dir .
 astro-sight --include-generated symbols --dir src
 ```
 
-`skip_generated = false` in the configuration file does the same, and the environment variable `ASTRO_SIGHT_NO_GENERATED_EXCLUSION=1` still works for backward compatibility. When the last segment of a glob names a concrete file, as in `**/parser.c`, the explicit request is honored and that file is scanned. An ordinary filtered scan such as `**/*.c` keeps the default exclusion.
+`skip_generated = false` in the configuration file does the same, and so does the environment variable `ASTRO_SIGHT_NO_GENERATED_EXCLUSION=1`, kept for backward compatibility. When the last segment of a glob names a concrete file, as in `**/parser.c`, the explicit request is honored and that file is scanned. An ordinary filtered scan such as `**/*.c` keeps the default exclusion.
 
 ## calls: Extract the Call Graph
 
@@ -229,7 +229,7 @@ Output (`astro-sight refs --name extract_symbols --dir .`):
 A frequent identifier returns thousands of results in one call, and the token cost balloons however well the representation is optimized (measured when the limits were introduced: `refs --name new --dir .` on this repository returned 1,846 results ≈ 68,000 tokens). An agent has no way of knowing before the call that an identifier is frequent, so a default limit of **100 results / an estimated 3,000 tokens** applies (the same query then fits in about 2,600 tokens).
 
 - **The analysis does not stop.** Everything is analyzed so that `total` is exact, and only the output is cut. Stopping the scan at a count would lose both the exact total and the breakdown of what was omitted
-- `result_summary` appears only when at least one result was omitted. A normal query that stays within the limits gets no `result_summary`, and its output is byte for byte the same as before the limits existed
+- `result_summary` appears only when at least one result was omitted. A normal query that stays within the limits gets no `result_summary`, and its output is byte for byte the same as with the limits removed (`unlimited`)
 - The limits apply only to the output. `dead-code`, the API diff, and the hook decisions use the full internal results
 - Both `--max-results` and `--token-budget` accept `unlimited`. The minimum of `--token-budget` is 256 (below that, the summary itself does not fit)
 - `refs --names` shares one budget across the whole call, handed out round-robin. A limit per name would make the total grow with the number of names, and filling from the front would let one frequent name eat the whole budget and leave 0 results for the rest
@@ -367,4 +367,4 @@ astro-sight ast --path nonexistent.rs
 {"error":{"code":"FILE_NOT_FOUND","message":"File not found: nonexistent.rs"}}
 ```
 
-When a downstream command ends first and closes the stdout pipe, as in `astro-sight symbols --dir src | head`, astro-sight exits 0 without printing a panic. This keeps ordinary paging and sampling on the command line working; real analysis errors still return a JSON error and exit code 1.
+When a downstream command ends first and closes the stdout pipe, as in `astro-sight symbols --dir src | head`, astro-sight exits 0 without printing a panic. This keeps ordinary paging and sampling on the command line working; real analysis errors return a JSON error and exit code 1.

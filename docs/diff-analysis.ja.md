@@ -111,7 +111,7 @@ condition = { command_exists = "astro-sight" }
 { "...": "...", "skipped": { "reason": "not_git_repository", "source": "git", "message": "--git was requested but --dir is not inside a git worktree" } }
 ```
 
-判定には `git rev-parse --is-inside-work-tree`（`LC_ALL=C`）を使うので、worktree / submodule / bare repo でも正しく判定できる。**真のエラー**（`--base` 不正・git 実行不能・壊れた repo・権限不足）は従来どおり `exit 1` を維持する。`--diff` / `--diff-file` / stdin で diff を渡す経路はこの判定を通らないので、挙動は変わらない。
+判定には `git rev-parse --is-inside-work-tree`（`LC_ALL=C`）を使うので、worktree / submodule / bare repo でも正しく判定できる。**真のエラー**（`--base` 不正・git 実行不能・壊れた repo・権限不足）は `exit 1` を返す。`--diff` / `--diff-file` / stdin で diff を渡す経路は、この判定を通らない。
 
 ### 未追跡ファイルの取り込み上限
 
@@ -183,17 +183,17 @@ astro-sight review --dir . --git \
 
 `--git --base <rev>` を指定した場合、`missing_cochanges` の blame 解析にも同じ base を使う。複数コミット分の PR をまとめてレビューするときも、diff と共変更候補の解析範囲が揃う。
 
-`missing_cochanges` は、共変更が 3 回以上あるペアだけを候補にする（`--cochange-min-samples`、既定 3）。変更行 blame では証拠コミットが 2 件だけの起点がよく現れ、「1 回だけ一緒に変わった」ペアが confidence 1.0 として上位に並ぶため。探索的に小標本まで見たい場合は `--cochange-min-samples 2` を指定する（単体の `cochange` コマンドは既定 2 のまま）。候補の重複排除と上位 10 件の選択には、単体コマンドと同じ平滑化済みの `score` を使う。3/3 の小標本が 30/40 のような十分な標本より機械的に上位へ来るのを防ぐためで、raw confidence は証拠の表示と閾値判定に引き続き使う。
+`missing_cochanges` は、共変更が 3 回以上あるペアだけを候補にする（`--cochange-min-samples`、既定 3）。変更行 blame では証拠コミットが 2 件だけの起点がよく現れ、「1 回だけ一緒に変わった」ペアが confidence 1.0 として上位に並ぶため。探索的に小標本まで見たい場合は `--cochange-min-samples 2` を指定する（単体の `cochange` コマンドは既定 2 のまま）。候補の重複排除と上位 10 件の選択には、単体コマンドと同じ平滑化済みの `score` を使う。3/3 の小標本が 30/40 のような十分な標本より機械的に上位へ来るのを防ぐためで、raw confidence は証拠の表示と閾値判定に使う。
 
 ロックファイルと、ソースに対応する依存宣言ファイル（`Cargo.toml` / `package.json` / `pyproject.toml` など）は `missing_cochanges` の候補にしない。依存を追加するコミットでは、これらとソースが必ず一緒に変わるので、履歴相関は 100% になる。しかしその相関は「依存を追加したとき」に限ったもので、import を 1 行も増減させない本体変更とは因果関係がない。依存宣言ファイルを候補から外すのは、ソースと同じエコシステムで、そのソースから見て最も近いものとの組だけに限る（`Cargo.toml` と Python スクリプトのような別エコシステムの組は候補に残る）。単体の `cochange` コマンドは、「過去に一緒に変更された」事実として依存宣言ファイルを出し続ける（ロックファイルは生成物なので両方で除外）。
 
-**外部 snapshot と生成元テストの関係は方向付きで扱う。** snapshot を更新しただけの差分に対して、「生成元テストも変更漏れでは」とは出さない。snapshot は被テスト対象の出力が変わったときにも更新されるので、「テストを変えたら snapshot も変わる」という期待は成り立っても、その逆は成り立たないためである。逆方向は維持する。テストを変更したのに snapshot が欠けている場合は、従来どおり候補に出る。抑制するのは次をすべて満たすペアだけで、1 つでも確認できなければ従来どおり候補に残す:
+**外部 snapshot と生成元テストの関係は方向付きで扱う。** snapshot を更新しただけの差分に対して、「生成元テストも変更漏れでは」とは出さない。snapshot は被テスト対象の出力が変わったときにも更新されるので、「テストを変えたら snapshot も変わる」という期待は成り立っても、その逆は成り立たないためである。逆方向は残す。テストを変更したのに snapshot が欠けている場合は、候補に出る。抑制するのは次をすべて満たすペアだけで、1 つでも確認できなければ候補に残す:
 
 - snapshot の直上ディレクトリが正確に `__snapshots__` で、ファイル名末尾の `.snap` を 1 回だけ除いたパスが欠落候補と完全一致する（Jest / Vitest / Bun が共有する標準規約。`tests/__snapshots__/widget.test.tsx.snap` → `tests/widget.test.tsx`）
 - 生成元テストが実在する通常ファイルである
 - snapshot の**先頭行が既知のランナーヘッダと完全一致**する（`// Vitest Snapshot v1, …` など）。パス規約だけでは手書き fixture や別用途の `.snap` を巻き込むため、生成出力であることをファイル自身で確認する
 
-`.gitattributes` の `linguist-generated` とは判定経路が独立している（あちらは「生成物一般」の宣言で、指定すると両方向とも候補から消える）。カスタム snapshot resolver、inline snapshot、`.snap` 以外の形式は対象外で、いずれも従来どおり履歴相関の情報提供を維持する。グローバルの `--include-generated` を付けるとこの方向付けも無効化する。単体の `cochange` コマンドは探索的な用途なので方向付けしない。
+`.gitattributes` の `linguist-generated` とは判定経路が独立している（あちらは「生成物一般」の宣言で、指定すると両方向とも候補から消える）。カスタム snapshot resolver、inline snapshot、`.snap` 以外の形式は対象外で、いずれも履歴相関を情報として出す。グローバルの `--include-generated` を付けるとこの方向付けも無効化する。単体の `cochange` コマンドは探索的な用途なので方向付けしない。
 
 なお、これは「テスト変更が不要だと証明した」ものではない（期待値だけ更新して必要なテストロジックの変更を忘れることはある）。標準の生成関係にあるペアについて、履歴相関だけを根拠に逆方向の変更を要求しないという推薦方針。
 
@@ -204,7 +204,7 @@ astro-sight review --dir . --git \
 - TS/TSX のトップレベル関数の末尾への optional / default 引数の追加（`trailing_optional_params`）
 - Python のトップレベル関数 / モジュール直下のクラスメソッドの末尾への、kwonly+default 引数または positional default 引数の追加（`trailing_optional_params`）。デコレータの差分がある場合や同名関数が複数定義されている場合は、保守的に blocking を維持する
 
-同じシンボルに紐づく `impacts` も破壊的影響としては出さず、`mod_compat` の情報提供だけに留める。未参照 object member の判定では、削除キーを 1 個ずつ全リポジトリで検索せずに Aho-Corasick で一括して事前抽出し、各 JS/TS ファイルを最大 1 回だけ parse する。ファイルの収集・読み込み・parse に失敗したときは互換扱いへ降格せず、従来どおり blocking を維持する。
+同じシンボルに紐づく `impacts` も破壊的影響としては出さず、`mod_compat` の情報提供だけに留める。未参照 object member の判定では、削除キーを 1 個ずつ全リポジトリで検索せずに Aho-Corasick で一括して事前抽出し、各 JS/TS ファイルを最大 1 回だけ parse する。ファイルの収集・読み込み・parse に失敗したときは互換扱いへ降格せず、blocking のままにする。
 
 `export const` のような値バインディングは宣言全体（初期化子を含む）を比較するが、**値そのものが関数の場合は本体を比較から外す**（`export function` の本体変更が api.mod にならないのと揃える）。本体を比較から外すのは、次の関数の本体に限る。
 
@@ -212,7 +212,7 @@ astro-sight review --dir . --git \
 - React の `memo` / `forwardRef` に包んだ関数
 - オブジェクトリテラルのメンバーの関数（メソッド・`key: () => ...`）
 
-引数・型注釈・キーの追加削除は引き続き比較する。それ以外の呼び出しに渡すコールバック（`create((set) => ({ ... }))` など）は、中身がストアの形や値そのものを決めるので本体も比較する。分割代入の束縛（`export const { a, b } = obj`）は「その名前へ至る経路 + 初期化子」で比較する（配列は位置を保つ）。同じ分割代入のほかの束縛を追加・削除しても、残った束縛が api.mod にならないようにするためである。default 値・computed key・rest を含むパターンは宣言全体で比較する。
+引数・型注釈・キーの追加削除は比較する。それ以外の呼び出しに渡すコールバック（`create((set) => ({ ... }))` など）は、中身がストアの形や値そのものを決めるので本体も比較する。分割代入の束縛（`export const { a, b } = obj`）は「その名前へ至る経路 + 初期化子」で比較する（配列は位置を保つ）。同じ分割代入のほかの束縛を追加・削除しても、残った束縛が api.mod にならないようにするためである。default 値・computed key・rest を含むパターンは宣言全体で比較する。
 
 Python の公開型契約を方向付きで分類できる変更には、`api_changes.modified[].contract_change`（hook では `api.mod[].contract`）として `{kind, breaks}` を付ける。対象は `TypedDict` の必須性変更と、モジュール直下の直接的な `Literal` 型エイリアスの値集合の変更である。`Literal` では、値集合の縮小を `literal_values_narrowed`（producer 側が壊れる）、拡大を `literal_values_widened`（consumer 側が壊れる）として報告する。`Literal` は `typing` / `typing_extensions` 由来と証明でき、値が escape / prefix を含まない文字列・10 進整数・真偽値・`None` だけの場合に限る。値の置換、動的な `__all__`、名前の shadow、star import など意味を静的に確定できない場合は方向を推測せず、通常の blocking な `api.mod` に残す。テストファイルは既存の公開 API 面規約どおり検出対象外。型エイリアスの項目は `kind = "type"` の疑似シンボルであり、`symbols` / `refs` / `dead-code` の解析対象には追加しない。
 
@@ -288,7 +288,7 @@ astro-sight dead-code --dir . --git --staged
 
 `line` は宣言行（0 始まり）。テストからしか参照されないシンボルは `dead_symbols` に含めず、`test_only_symbols` に分けて出す。
 
-同名シンボルが複数ファイルに存在する場合は誤判定防止のためスキップされる。ただし TS/JS と PHP の class member は、owner を安全に一意推定できる場合だけ例外的に判定する。PHP では、`Owner::method()` と同一クラス内の `self::method()` を確定参照として扱う。`$obj->method()` や callable 文字列のように owner を確定できない参照がある場合は、従来どおりスキップする。`static::` は遅延静的束縛によりサブクラスの override に到達し得るため、確定参照としては解決しない。trait を `use` する class / trait / enum 経由の静的呼び出しは、一意に到達する trait method に限り参照として数える。ただし合成先が同名の具象メソッドを持つ場合は、PHP の解決順に従って trait 側へは辿らない。
+同名シンボルが複数ファイルに存在する場合は誤判定防止のためスキップされる。ただし TS/JS と PHP の class member は、owner を安全に一意推定できる場合だけ例外的に判定する。PHP では、`Owner::method()` と同一クラス内の `self::method()` を確定参照として扱う。`$obj->method()` や callable 文字列のように owner を確定できない参照がある場合は、スキップする。`static::` は遅延静的束縛によりサブクラスの override に到達し得るため、確定参照としては解決しない。trait を `use` する class / trait / enum 経由の静的呼び出しは、一意に到達する trait method に限り参照として数える。ただし合成先が同名の具象メソッドを持つ場合は、PHP の解決順に従って trait 側へは辿らない。
 
 ### 実行時規約の自動除外
 

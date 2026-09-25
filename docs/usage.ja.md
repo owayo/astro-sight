@@ -75,7 +75,7 @@ astro-sight symbols --path src/main.rs
 # docstring 付き compact 出力
 astro-sight symbols --path src/main.rs --doc
 
-# 旧来の完全出力（hash, range, doc をすべて含む）
+# 完全な形式の出力（hash, range, doc をすべて含む）
 astro-sight symbols --path src/main.rs --full
 
 # ディレクトリ内の全ソースファイルのシンボルを NDJSON で出力
@@ -140,7 +140,7 @@ TypeScript の interface / abstract メソッドと Go の interface メソッ�
 {"symbol":"foo","refs":[],"skipped":{"generated":2,"paths":["gen/a.rs","gen/b.rs"]}}
 ```
 
-`symbols --dir` は NDJSON なので、同じ `skipped` object を持つ制御用のレコード（control record）を末尾に 1 行追加する。複数名の `refs --names` は既存の「1 シンボル 1 レコード」を維持し、共有の `skipped` を先頭レコードへ 1 回だけ追加する。session / MCP の batch 応答も従来どおりルート配列を維持する。
+`symbols --dir` は NDJSON なので、同じ `skipped` object を持つ制御用のレコード（control record）を末尾に 1 行追加する。複数名の `refs --names` は「1 シンボル 1 レコード」の形のまま、共有の `skipped` を先頭レコードへ 1 回だけ追加する。session / MCP の batch 応答は、ルート配列の形のまま返す。
 
 除外せず走査する場合はグローバルオプション `--include-generated` を指定する。
 
@@ -149,7 +149,7 @@ astro-sight --include-generated refs --name foo --dir .
 astro-sight --include-generated symbols --dir src
 ```
 
-設定ファイルでは `skip_generated = false` で同じ動作になる。後方互換の環境変数 `ASTRO_SIGHT_NO_GENERATED_EXCLUSION=1` も引き続き利用できる。`**/parser.c` のように glob の最終セグメントで具体的なファイル名を指定した場合は、明示指定を尊重してそのファイルを走査する。`**/*.c` のような通常の絞り込み走査では、既定の除外を維持する。
+設定ファイルでは `skip_generated = false` で同じ動作になる。後方互換のため、環境変数 `ASTRO_SIGHT_NO_GENERATED_EXCLUSION=1` でも同じ動作になる。`**/parser.c` のように glob の最終セグメントで具体的なファイル名を指定した場合は、明示指定を尊重してそのファイルを走査する。`**/*.c` のような通常の絞り込み走査では、既定の除外を維持する。
 
 ## calls - コールグラフ抽出
 
@@ -229,7 +229,7 @@ astro-sight refs --name "new" --dir . --max-results unlimited --token-budget unl
 高頻度な識別子は 1 回の呼び出しで数千件返り、表現をいくら最適化してもトークン消費が膨れ上がる（導入時点の実測: 自リポジトリの `refs --name new --dir .` が 1,846 件 ≈ 68,000 トークン）。エージェントは呼ぶ前にその識別子が高頻度だと知りようがないため、既定で **100 件 / 推定 3,000 トークン**の上限を課す（同条件で約 2,600 トークンに収まる）。
 
 - **解析は止めない。** 全件解析して `total` を正確に出し、出力だけを絞る。件数で走査を打ち切ると、正確な総数も省略分の内訳も取れなくなる
-- 省略が 1 件でも起きたときだけ `result_summary` を出す。上限に当たらない通常の問い合わせでは `result_summary` は付かず、出力は上限を設ける前とバイト単位で同じ
+- 省略が 1 件でも起きたときだけ `result_summary` を出す。上限に当たらない通常の問い合わせでは `result_summary` は付かず、出力は上限を外したとき（`unlimited`）とバイト単位で同じ
 - 上限が効くのは出力だけ。`dead-code` / API 差分 / hook の判定は、全件を見た内部結果で行う
 - `--max-results` / `--token-budget` はいずれも `unlimited` を受ける。`--token-budget` の下限は 256（それ未満だとサマリ自体が収まらない）
 - `refs --names` では、呼び出し全体で 1 つの予算を round-robin で配分する。名前ごとに上限を課すと全体が名前数に比例して膨らみ、先頭から詰めると高頻度な 1 名が予算を食い尽くして後続が 0 件になる
@@ -367,4 +367,4 @@ astro-sight ast --path nonexistent.rs
 {"error":{"code":"FILE_NOT_FOUND","message":"File not found: nonexistent.rs"}}
 ```
 
-`astro-sight symbols --dir src | head` のように、下流コマンドが先に終了して stdout pipe が閉じた場合は panic を表示せず exit 0 で終了する。これは CLI 利用時の通常のページング・サンプリングを壊さないための挙動で、実際の解析エラーは従来どおり JSON エラー + exit code 1 で返す。
+`astro-sight symbols --dir src | head` のように、下流コマンドが先に終了して stdout pipe が閉じた場合は panic を表示せず exit 0 で終了する。これは CLI 利用時の通常のページング・サンプリングを壊さないための挙動で、実際の解析エラーは JSON エラーと exit code 1 で返す。

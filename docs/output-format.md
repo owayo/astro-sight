@@ -54,7 +54,7 @@ The same content in JSON looks like this. TOON saves the key names that JSON rep
 
 The conversion uses [`toon-format` 0.5.0](https://github.com/toon-format/toon-rust), with `default-features = false` to avoid its CLI/TUI dependencies, and encodes with the default settings (comma delimiter, 2-space indentation). The supported specification is **TOON v3**. An empty array is `[0]:`, and a named empty array is `items[0]:`.
 
-Single and batch output are verified with the library's strict decoder. No newline is added at the end of the document (JSON / NDJSON still end with a newline). How much TOON saves depends on the content; use `--format auto` to choose the format automatically.
+Single and batch output are verified with the library's strict decoder. No newline is added at the end of the document (JSON / NDJSON end with a newline). How much TOON saves depends on the content; use `--format auto` to choose the format automatically.
 
 ## auto: Choose the Format with Fewer Tokens
 
@@ -127,7 +127,7 @@ An explicit `--format toon` on the command line is an error for these outputs (a
       gamma,fn,1
 ```
 
-The outer array uses the list form (`- ` items), not the tabular form. The tabular form needs information that is known only after every element has been seen, which conflicts with the design requirement of not buffering all results (keeping peak RSS independent of the number of inputs). The element count `[N]` is known in advance from the number of input paths, so the header alone can be written first. The inner arrays use the tabular form as usual, and they account for most of the savings.
+The outer array uses the list form (`- ` items), not the tabular form. The tabular form needs information that is known only after every element has been seen, which conflicts with the design requirement of not buffering all results (keeping peak RSS independent of the number of inputs). The element count `[N]` is known in advance from the number of input paths, so the header alone can be written first. The inner arrays use the tabular form, and they account for most of the savings.
 
 In batch mode, arrays that would become tabular if all elements were converted at once are still printed in the list form. Encoding of each element is left to the library, and tests check that the strict decoder restores the same values. A failed analysis also counts as an element, so the count in the header matches the number of elements printed. `refs --names` already holds every result, so it is converted in one go.
 
