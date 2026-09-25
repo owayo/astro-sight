@@ -14,7 +14,10 @@
   <img src="https://img.shields.io/badge/Linux-FCC624?logo=linux&amp;logoColor=black" alt="Linux">
   <img src="https://img.shields.io/badge/macOS-000000?logo=apple&amp;logoColor=white" alt="macOS">
   <img src="https://img.shields.io/badge/Windows-0078D6" alt="Windows">
-  <br>
+</p>
+
+<p align="center">
+  <a href="https://github.com/owayo/astro-sight/actions/workflows/release.yml"><img src="https://github.com/owayo/astro-sight/actions/workflows/release.yml/badge.svg?branch=main" alt="Release"></a>
   <a href="https://github.com/owayo/astro-sight/actions/workflows/ci.yml"><img src="https://github.com/owayo/astro-sight/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="https://github.com/owayo/astro-sight/releases/latest"><img src="https://img.shields.io/github/v/release/owayo/astro-sight" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/owayo/astro-sight" alt="License"></a>
@@ -1237,7 +1240,7 @@ GitHub Actions の **Actions > Release > Run workflow** から実行する。1 �
 
 版の形式は `yy.m.counter`（例: `26.9.103`）。counter は年月が変わると 100 に戻り、同じ年月の中ではリリースのたびに 1 ずつ増える。
 
-`dry_run` を有効にすると、次の版を計算してログに出すだけで、コミット・タグ・ビルド・リリースは行わない。6 つのターゲットのビルドは、CI の build ジョブが push と PR のたびに同じ設定で確かめている。
+`dry_run` を有効にすると、次の版を計算してログに出すだけで、コミット・タグ・ビルド・リリースは行わない。6 つのターゲットのビルドは、CI の build ジョブが main への push と PR のたびに同じ設定で確かめている。
 
 リポジトリに要る設定値は次のとおり。
 

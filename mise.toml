@@ -5,3 +5,12 @@
 # components を明示する。未指定だと rustup の既定 profile 次第で入るものが変わり、
 # GitHub Actions のランナー (minimal) では cargo fmt が無いと言われて落ちる
 rust = { version = "1.98.1", components = ["rustfmt", "clippy"] }
+
+[env]
+# macOS: cc crate (tree-sitter の C パーサ) と rustc のデプロイメントターゲットをそろえる。
+# 未指定だと cc crate は C をホストの SDK の版 (例: 26.5) でビルドし、rustc の既定
+# (aarch64-apple-darwin は 11.0) とずれてリンカが警告を出す。
+# make (mise exec)・素の cargo (mise の shim。Stop hook の cargo clippy もここを通る)・
+# CI (mise-action が後続のステップへ渡す) が同じ値を読むよう、ここを唯一の正にする。
+# 経路ごとに値が違うと cc の build script が作り直され、ビルドのたびに C の再コンパイルが往復する
+MACOSX_DEPLOYMENT_TARGET = "11.0"

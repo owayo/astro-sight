@@ -23,11 +23,9 @@ CARGO_FLAGS ?= --locked
 # install の後にスキルを入れる AI エージェント。make install SKILL_TARGETS= で入れない
 SKILL_TARGETS ?= claude codex
 
-# macOS: cc crate と rustc のデプロイメントターゲットを揃える
-# 未指定だと tree-sitter-swift の parser.o がホスト SDK (例: 26.5) でビルドされ、
-# rustc の aarch64-apple-darwin デフォルト (11.0) と齟齬になり linker が警告を出す。
-# CI の build ジョブと release.yml の build ジョブにも同じ値を書いている。
-export MACOSX_DEPLOYMENT_TARGET ?= 11.0
+# macOS: cc crate と rustc のデプロイメントターゲット (MACOSX_DEPLOYMENT_TARGET) は
+# mise.toml の [env] で指定している。$(RUN) (= mise exec --) がそれを渡すので、ここでは
+# export しない (make と素の cargo で値が食い違うと、C のパーサの再ビルドが往復するため)。
 
 # macOS: ar は Apple 純正 (/usr/bin/ar) を使う。以前は -D フラグ warning 回避のため
 # GNU binutils の ar を export していたが、GNU ar 2.46 が生成する静的アーカイブを

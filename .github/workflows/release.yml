@@ -108,10 +108,6 @@ jobs:
     needs: prepare-release
     if: ${{ !inputs.dry_run }}
     runs-on: ${{ matrix.os }}
-    env:
-      # Makefile の export と同じ値。未指定だと cc crate が C のパーサをランナーの SDK の版で
-      # ビルドし、rustc の既定 (11.0) とずれる
-      MACOSX_DEPLOYMENT_TARGET: "11.0"
     strategy:
       fail-fast: false
       matrix:
@@ -163,6 +159,7 @@ jobs:
           ref: ${{ needs.prepare-release.outputs.tag }}
 
       # ツールの版は mise.toml が正。mise 本体は version の固定と署名付き checksum で検証される。
+      # mise.toml の [env] (MACOSX_DEPLOYMENT_TARGET) も後続のステップへ渡る (env: true が既定)。
       # cache は切る (ci.yml と同じ理由。mise-action のキャッシュは rustup の components を戻さない)
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
