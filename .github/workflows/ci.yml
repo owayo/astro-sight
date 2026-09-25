@@ -82,8 +82,8 @@ jobs:
         with:
           persist-credentials: false
 
-      # mise.toml の [env] (MACOSX_DEPLOYMENT_TARGET) も後続のステップへ渡る (env: true が既定)。
-      # cargo を直接呼ぶこのジョブでも、手元の make と同じ値でビルドされる (mise-guide 18 章)
+      # ビルドに効く環境変数 (MACOSX_DEPLOYMENT_TARGET など) は mise.toml の [env] に置く。mise-action が
+      # 後続のステップへ渡すので、ci.yml と release.yml と手元の make で同じ値になる
       - uses: jdx/mise-action@v4
         with:
           minimum_release_age: 14d
