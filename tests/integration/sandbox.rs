@@ -14,9 +14,14 @@ fn sandboxed_service_rejects_path_traversal() {
     let cwd = std::fs::canonicalize(cwd).unwrap();
     let service = astro_sight::service::AppService::sandboxed(cwd).unwrap();
 
-    // ワークスペース外の /etc/hosts を指定する。
+    // ワークスペース外に実在するファイルを指定する (/etc/hosts は Windows に無く、境界の判定の前に
+    // FILE_NOT_FOUND になってしまう)。一時ディレクトリはワークスペース (リポジトリ) の外にある。
+    let outside = tempfile::Builder::new()
+        .suffix(".rs")
+        .tempfile()
+        .expect("create a file outside the workspace");
     let params = astro_sight::service::AstParams {
-        path: "/etc/hosts",
+        path: outside.path().to_str().expect("utf-8 temp path"),
         line: None,
         col: None,
         end_line: None,
