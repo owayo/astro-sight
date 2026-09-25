@@ -106,25 +106,13 @@ mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
 
+    /// 更新時刻だけを書き換える (cleanup_old_logs が見るのは modified だけ)。libc は unix 専用の
+    /// 依存なので、Windows でもテストをビルドできるよう std の File::set_modified を使う
     fn set_file_modified_time(path: &Path, time: SystemTime) -> std::io::Result<()> {
-        let since_epoch = time.duration_since(SystemTime::UNIX_EPOCH).unwrap();
-        let secs = since_epoch.as_secs();
-        let atime = libc::timespec {
-            tv_sec: secs as libc::time_t,
-            tv_nsec: 0,
-        };
-        let mtime = libc::timespec {
-            tv_sec: secs as libc::time_t,
-            tv_nsec: 0,
-        };
-        let times = [atime, mtime];
-        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        let ret = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
-        if ret == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
+        fs::File::options()
+            .write(true)
+            .open(path)?
+            .set_modified(time)
     }
 
     #[test]
