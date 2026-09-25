@@ -4,6 +4,7 @@ use tracing::info;
 
 use crate::engine::parser;
 use crate::error::{AstroError, ErrorCode};
+use crate::git_support::normalize_workspace_separators;
 use crate::models::dead_code::DeadCodeResult;
 use crate::models::review::DeadSymbol;
 
@@ -165,27 +166,6 @@ struct DeadCodeCandidates {
     generated_skipped: Vec<String>,
 }
 
-/// workspace 相対パスの区切り文字を `/` に正規化する。
-///
-/// `DeadSymbol.file` は unified diff 由来のパス (`DiffFile.new_path` /
-/// `ApiSymbol.file`) と突き合わせるが、diff のパスは常に `/` 区切りである一方
-/// `Path::to_string_lossy` は Windows で `\` を返す。正規化しないと
-/// `filter_dead_by_touched_symbols` / `filter_dead_by_wip_added` の突合せが
-/// Windows で常に不一致になり、前者は dead を全件落とし (= `review --hook` の
-/// 既定スコープで dead 検出が丸ごと消える)、後者は WIP 抑止が効かなくなる。
-/// review JSON 内の他のパス項目 (`impact.changes[].path` /
-/// `missing_cochanges[].file` 等) との表記統一も兼ねる。
-///
-/// Unix ではバックスラッシュがファイル名の正当な文字なので、`MAIN_SEPARATOR` が
-/// `/` のプラットフォームでは何も置換しない。
-fn normalize_workspace_separators(path: &str) -> String {
-    if std::path::MAIN_SEPARATOR == '/' {
-        path.to_string()
-    } else {
-        path.replace(std::path::MAIN_SEPARATOR, "/")
-    }
-}
-
 /// 走査対象ファイルからエクスポートシンボル（trait impl メソッドは除外）と
 /// C/C++ liveness 補助情報を収集する。
 ///
@@ -210,6 +190,9 @@ fn collect_dead_code_candidates(
             Err(_) => continue,
         };
         // diff 由来のパス (常に `/` 区切り) と突き合わせるため区切り文字を正規化する。
+        // そろえないと filter_dead_by_touched_symbols / filter_dead_by_wip_added の突合せが
+        // Windows で常に不一致になり、前者は dead を全件落とし (= review --hook の既定スコープで
+        // dead 検出が丸ごと消える)、後者は WIP 抑止が効かなくなる。
         let rel = match canonical_path.strip_prefix(canonical_dir) {
             Ok(p) => normalize_workspace_separators(&p.to_string_lossy()),
             Err(_) => continue, // dir 外のパスは除外（セキュリティ境界）

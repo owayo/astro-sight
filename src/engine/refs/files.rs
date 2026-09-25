@@ -78,15 +78,14 @@ impl FileCollection {
         skipped_files_from_relative(self.skipped_generated_relative(dir))
     }
 
-    /// 生成物として走査から外したファイルの `dir` 相対パス (未ソート)。
+    /// 生成物として走査から外したファイルの `dir` 相対パス (`/` 区切り、未ソート)。
     pub fn skipped_generated_relative(&self, dir: &Path) -> Vec<String> {
         self.skipped_generated
             .iter()
             .map(|path| {
-                path.strip_prefix(dir)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .to_string()
+                crate::git_support::normalize_workspace_separators(
+                    &path.strip_prefix(dir).unwrap_or(path).to_string_lossy(),
+                )
             })
             .collect()
     }
@@ -113,11 +112,9 @@ impl FileCollection {
                 .and_then(|e| e.to_str())
                 .unwrap_or_default()
                 .to_ascii_lowercase();
-            let rel = path
-                .strip_prefix(dir)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .to_string();
+            let rel = crate::git_support::normalize_workspace_separators(
+                &path.strip_prefix(dir).unwrap_or(path).to_string_lossy(),
+            );
             by_ext.entry(ext).or_default().push(rel);
         }
         let mut entries: Vec<(String, Vec<String>)> = by_ext.into_iter().collect();

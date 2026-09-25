@@ -62,6 +62,24 @@ pub(crate) fn validate_git_revision(value: &str, arg_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// workspace 相対パスの区切り文字を `/` に正規化する。
+///
+/// unified diff 由来のパス (`DiffFile.new_path` / `ApiSymbol.file` 等) は常に `/` 区切りである
+/// 一方、`Path::to_string_lossy` は Windows で `\` を返す。正規化しないと、参照パスと diff の
+/// パスの突き合わせ (同一 diff 内の参照・削除シンボルの帰属・dead の絞り込み) が Windows で
+/// 常に不一致になり、出力のパス表記 (`refs` の `path` / `impacted_callers` / `dead_symbols` 等)
+/// もコマンドごとにばらつく。
+///
+/// Unix ではバックスラッシュがファイル名の正当な文字なので、`MAIN_SEPARATOR` が
+/// `/` のプラットフォームでは何も置換しない。
+pub(crate) fn normalize_workspace_separators(path: &str) -> String {
+    if std::path::MAIN_SEPARATOR == '/' {
+        path.to_string()
+    } else {
+        path.replace(std::path::MAIN_SEPARATOR, "/")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,5 +96,29 @@ mod tests {
         for revision in ["", "--output=/tmp/pwn", "-p", "HEAD\0foo"] {
             assert!(validate_git_revision(revision, "--base").is_err());
         }
+    }
+
+    #[test]
+    fn normalize_workspace_separators_keeps_forward_slashes() {
+        assert_eq!(
+            normalize_workspace_separators("src/engine/lib.rs"),
+            "src/engine/lib.rs"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_workspace_separators_replaces_backslashes_on_windows() {
+        assert_eq!(
+            normalize_workspace_separators(r"src\engine\lib.rs"),
+            "src/engine/lib.rs"
+        );
+    }
+
+    /// Unix ではバックスラッシュもファイル名に使える文字なので置き換えない
+    #[cfg(unix)]
+    #[test]
+    fn normalize_workspace_separators_keeps_backslashes_on_unix() {
+        assert_eq!(normalize_workspace_separators(r"src\lib.rs"), r"src\lib.rs");
     }
 }

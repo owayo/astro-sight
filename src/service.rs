@@ -646,10 +646,11 @@ impl AppService {
         let mut affected_count = 0usize;
 
         impact::analyze_impact_streaming(diff, &canonical_dir, options, |mut impact| {
-            // impacted_callers 内の絶対パスを相対パスへ変換する。
+            // impacted_callers 内の絶対パスを相対パス (`/` 区切り、diff のパスと同じ表記) へ変換する。
             for caller in &mut impact.impacted_callers {
                 if let Ok(rel) = std::path::Path::new(&caller.path).strip_prefix(&canonical_dir) {
-                    caller.path = rel.to_string_lossy().to_string();
+                    caller.path =
+                        crate::git_support::normalize_workspace_separators(&rel.to_string_lossy());
                 }
             }
             changes_count += 1;
@@ -873,15 +874,19 @@ fn validate_exclude_globs(globs: &[String]) -> Result<()> {
 // パス補助関数
 // ---------------------------------------------------------------------------
 
-/// 絶対パスを `dir` 基準の相対パスへ変換する。
+/// 絶対パスを `dir` 基準の相対パス (`/` 区切り) へ変換する。
 /// `dir` 配下でないパスはそのまま残す。
+///
+/// 区切りを `/` にそろえるのは、API 差分の判定が参照パスを diff のパス (常に `/` 区切り) と
+/// 文字列で突き合わせるため (Windows で `\` のままだと、同一 diff 内の参照や削除シンボルの
+/// 帰属が一致しない)。
 fn relativize_paths(
     mut refs: Vec<crate::models::reference::SymbolReference>,
     dir: &std::path::Path,
 ) -> Vec<crate::models::reference::SymbolReference> {
     for r in &mut refs {
         if let Ok(rel) = std::path::Path::new(&r.path).strip_prefix(dir) {
-            r.path = rel.to_string_lossy().to_string();
+            r.path = crate::git_support::normalize_workspace_separators(&rel.to_string_lossy());
         }
     }
     refs
@@ -1128,6 +1133,24 @@ mod tests {
         }];
         let result = relativize_paths(refs, dir);
         assert_eq!(result[0].path, "src/main.rs");
+    }
+
+    /// Windows でも相対パスの区切りは `/` (diff のパスと突き合わせるため)
+    #[cfg(windows)]
+    #[test]
+    fn relativize_paths_uses_forward_slashes_on_windows() {
+        use crate::models::reference::SymbolReference;
+        let dir = std::path::Path::new(r"C:\repo");
+        let refs = vec![SymbolReference {
+            path: r"C:\repo\src\engine\main.rs".to_string(),
+            line: 1,
+            column: 0,
+            context: None,
+            kind: None,
+            confidence: None,
+        }];
+        let result = relativize_paths(refs, dir);
+        assert_eq!(result[0].path, "src/engine/main.rs");
     }
 
     /// relativize_paths でディレクトリ外のパスはそのまま

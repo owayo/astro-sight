@@ -449,12 +449,13 @@ pub fn batch_symbols(
     batch_ndjson_with_trailer(paths, trailer, opts.output, |p, output| {
         match service.extract_symbols_with_query(p, opts.query) {
             Ok(mut response) => {
-                // dir 指定時に絶対パスを相対パスに変換
+                // dir 指定時に絶対パスを相対パス (`/` 区切り、refs の path と同じ表記) に変換
                 if let Some(base) = opts.dir
                     && let Ok(rel) =
                         std::path::Path::new(&response.location.path).strip_prefix(base)
                 {
-                    response.location.path = rel.to_string_lossy().to_string();
+                    response.location.path =
+                        crate::git_support::normalize_workspace_separators(&rel.to_string_lossy());
                 }
                 if opts.full {
                     render_batch_record(&response, output)
