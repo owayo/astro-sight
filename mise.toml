@@ -2,9 +2,10 @@
 # mise.lock は置かない。rust は rustup に任せるので、lock に固定するもの (URL と checksum) が無い。
 
 [tools]
-# components を明示する。未指定だと rustup の既定 profile 次第で入るものが変わり、
-# GitHub Actions のランナー (minimal) では cargo fmt が無いと言われて落ちる
-rust = { version = "1.98.1", components = ["rustfmt", "clippy"] }
+# profile と components を明示する。未指定だと rustup の既定の profile 次第で入るものが変わり、
+# GitHub Actions のランナー (minimal) では cargo fmt が無いと言われて落ちる。minimal に要る
+# components だけを足すと、手元と CI で同じものが入り、使わない component (rust-docs など) を取らない
+rust = { version = "1.98.1", profile = "minimal", components = ["rustfmt", "clippy"] }
 
 [env]
 # macOS: cc crate (tree-sitter の C パーサ) と rustc のデプロイメントターゲットをそろえる。
