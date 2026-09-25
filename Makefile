@@ -1,43 +1,41 @@
-# astro-sight の開発用タスク。引数なしの `make` でターゲット一覧を表示する。
+# Development tasks for astro-sight. Run `make` with no arguments to list the targets.
 #
-# ツールの版は mise.toml が正。mise があればコマンドを `mise exec --` 経由で呼ぶので、
-# シェルで mise を activate していなくても (IDE や GUI から make を呼んでも)
-# mise.toml の版で動く。mise を使わず PATH 上のツールで動かすなら SYSTEM_TOOLS=1 を
-# 付ける (その場合、版の再現性は保証しない)。
+# Tool versions are pinned in mise.toml. When mise is available, every tool runs through
+# `mise exec --`, so the pinned versions are used even when mise is not activated in the shell
+# (for example when make is started from an IDE or a GUI). SYSTEM_TOOLS=1 uses the tools on PATH
+# instead (the versions are then not guaranteed).
 #
-# CI の quality ジョブは `make setup` と `make ci` だけを呼ぶ。検査を足すときは ci から
-# たどれるターゲットに足す (workflow にコマンドを重ねて書かない)。
+# The CI quality job only runs `make setup` and `make ci`. Add new checks to a target that ci
+# depends on instead of repeating commands in the workflow.
 #
-# macOS 標準の GNU Make 3.81 で動く書き方に限っている
-# (.ONESHELL / .SHELLFLAGS / $(file ...) / != は使わない)。
+# Only GNU Make 3.81 features are used (the make that ships with macOS):
+# no .ONESHELL, .SHELLFLAGS, $(file ...) or !=.
 
 .DEFAULT_GOAL := help
 
-# Variables
 BINARY_NAME := astro-sight
 INSTALL_PATH ?= /usr/local/bin
-# Cargo.lock をコミットしているので、依存の解決結果を CI とそろえる。
-# .cargo/config.toml の [patch] でローカルの tree-sitter 系を差し込んでいて Cargo.lock が
-# 手元でだけ変わるときは、make ci CARGO_FLAGS= のように外す
+# Cargo.lock is committed, so resolve dependencies exactly as CI does. When a [patch] in
+# .cargo/config.toml swaps in local tree-sitter crates and Cargo.lock changes only on your machine,
+# drop the flag with `make ci CARGO_FLAGS=`.
 CARGO_FLAGS ?= --locked
-# install の後にスキルを入れる AI エージェント。make install SKILL_TARGETS= で入れない
+# AI agents that receive the skill after install. `make install SKILL_TARGETS=` installs none.
 SKILL_TARGETS ?= claude codex
 
-# macOS: cc crate と rustc のデプロイメントターゲット (MACOSX_DEPLOYMENT_TARGET) は
-# mise.toml の [env] で指定している。$(RUN) (= mise exec --) がそれを渡すので、ここでは
-# export しない (make と素の cargo で値が食い違うと、C のパーサの再ビルドが往復するため)。
+# macOS: the deployment target shared by the cc crate (the tree-sitter C parsers) and rustc
+# (MACOSX_DEPLOYMENT_TARGET) is set in the [env] table of mise.toml. $(RUN) (= mise exec --) passes
+# it on, so it is not exported here: if make and a bare cargo saw different values, the C parsers
+# would be rebuilt back and forth.
 
-# macOS: ar は Apple 純正 (/usr/bin/ar) を使う。以前は -D フラグ warning 回避のため
-# GNU binutils の ar を export していたが、GNU ar 2.46 が生成する静的アーカイブを
-# 新しい Apple ld (ld-1267 以降) が「member not 8-byte aligned」で拒否し、
-# make 経由のリンクが全滅する。また AR は cc crate のビルド指紋に入るため、
-# make (GNU ar) と素の cargo (Apple ar) で build script の再実行がピンポンする
-# 副作用もあった。warning 回避より実害が大きいため override を撤去。
+# macOS: use Apple's ar (/usr/bin/ar). Exporting GNU binutils' ar (to silence the -D flag warning)
+# broke linking: newer Apple ld (ld-1267 and later) rejects static archives made by GNU ar 2.46
+# with "member not 8-byte aligned". AR is also part of the cc crate's build fingerprint, so make
+# (GNU ar) and a bare cargo (Apple ar) kept re-running the build scripts. The override was removed.
 
-# ---- ツールチェーン -----------------------------------------------------------
-# mise は PATH、よくある導入先の順に探す。GUI から起動した make はシェルの PATH を
-# 引き継がないことがあるため。make MISE=/path/to/mise で明示もできる。
-# mise が無い環境の振る舞いを試すときは MISE_CANDIDATES= で探す先を空にする。
+# ---- Toolchain ------------------------------------------------------------------
+# Look for mise on PATH, then in the usual install locations (make started from a GUI may not
+# inherit the shell's PATH). Override with make MISE=/path/to/mise.
+# To try the behavior without mise, empty the candidates with MISE_CANDIDATES=.
 MISE_CANDIDATES ?= $(HOME)/.local/bin/mise /opt/homebrew/bin/mise /usr/local/bin/mise
 ifeq ($(SYSTEM_TOOLS),1)
 RUN :=
@@ -47,7 +45,7 @@ MISE := $(firstword $(shell command -v mise 2>/dev/null) $(wildcard $(MISE_CANDI
 endif
 ifeq ($(MISE),)
 ifneq ($(filter-out help,$(or $(MAKECMDGOALS),help)),)
-$(error mise が見つかりません。https://mise.jdx.dev で導入するか、PATH 上のツールで実行するなら SYSTEM_TOOLS=1 を付けてください)
+$(error mise was not found. Install it from https://mise.jdx.dev, or add SYSTEM_TOOLS=1 to use the tools on PATH)
 endif
 endif
 RUN := $(if $(MISE),$(MISE) exec --,)
@@ -57,52 +55,53 @@ endif
 
 ## Setup
 
-setup: ## Install the toolchain (mise.toml) and fetch dependencies
+setup: ## Install the toolchain (mise) and dependencies
 	@if [ -n "$(MISE)" ]; then "$(MISE)" install; fi
 	$(RUN) cargo fetch $(CARGO_FLAGS)
 
-## Build Commands
+## Build
 
-build: ## Build debug version
+build: ## Build a debug binary
 	$(RUN) cargo build $(CARGO_FLAGS)
 
-release: ## Build release version
+release: ## Build a release binary
 	$(RUN) cargo build --release $(CARGO_FLAGS)
 
-run: ## Run the debug build (pass arguments with ARGS="...")
+run: ## Run the debug binary (arguments via ARGS="...")
 	$(RUN) cargo run $(CARGO_FLAGS) -- $(ARGS)
 
-## Development
+## Checks
 
-# テストは既定の feature で回す (配布物と同じ mimalloc の構成を検証するため)。
-# --all-features にすると dhat-heap のアロケータで動き、各プロセスが dhat-heap.json を書き出す
-test: ## Run tests
+# Tests run with the default features (the same mimalloc setup as the released binary).
+# With --all-features the dhat-heap allocator is used and every process writes dhat-heap.json.
+test: ## Run the tests
 	$(RUN) cargo test $(CARGO_FLAGS)
 
-# dhat-heap 側のコードも検査するため --all-features で回す。既定の feature の側
-# (#[cfg(not(feature = "dhat-heap"))]) は check の cargo check と test がコンパイルする
+# clippy runs with --all-features so that the dhat-heap code is checked too. The default-feature
+# side (#[cfg(not(feature = "dhat-heap"))]) is compiled by the cargo check in check and by test.
 lint: ## Run clippy with warnings as errors
 	$(RUN) cargo clippy $(CARGO_FLAGS) --all-targets --all-features -- -D warnings
 
-fmt: ## Format code
+fmt: ## Format the code (rewrites files)
 	$(RUN) cargo fmt
 
-fmt-check: ## Check formatting (no rewrite)
+fmt-check: ## Check the formatting (no changes)
 	$(RUN) cargo fmt -- --check
 
-check: fmt-check lint ## Run fmt check, clippy, and cargo check (no rewrite)
+check: fmt-check lint ## Run fmt-check and lint (no changes), then cargo check with the default features
 	$(RUN) cargo check $(CARGO_FLAGS)
 
-ci: check test ## Run the same checks as the CI quality job (no rewrite)
+ci: check test ## Run the same checks as CI (no changes)
 
-## Installation
+## Install
 
-# 上書きコピーではなく一時ファイル + rename で置き換える。macOS はコード署名の
-# 検証結果を inode 単位でキャッシュするため、実行中や直前に実行したバイナリへ cp で
-# 上書きすると、新しいバイナリが起動直後に SIGKILL される (exit 137)。
-# 一時ファイルは rename が inode の差し替えになるよう、同じディレクトリに置く。
-# スキルは入れたばかりのバイナリで書き出す (バイナリとスキルの版をそろえるため)。
-install: release ## Build release, install the binary to INSTALL_PATH, and install skills (claude + codex)
+# Replace the binary through a temporary file and a rename instead of copying over it. macOS
+# caches the code signature check per inode, so a binary copied over one that is running (or ran
+# a moment ago) is killed with SIGKILL right after it starts (exit 137). The temporary file sits
+# in the same directory so that the rename swaps the inode.
+# The skills are written by the binary that was just installed, so that the binary and the skills
+# come from the same version.
+install: release ## Install the release binary to INSTALL_PATH (default /usr/local/bin) and the agent skills (SKILL_TARGETS)
 	@mkdir -p "$(INSTALL_PATH)"
 	cp "target/release/$(BINARY_NAME)" "$(INSTALL_PATH)/$(BINARY_NAME).new"
 	mv -f "$(INSTALL_PATH)/$(BINARY_NAME).new" "$(INSTALL_PATH)/$(BINARY_NAME)"
@@ -110,27 +109,23 @@ install: release ## Build release, install the binary to INSTALL_PATH, and insta
 		"$(INSTALL_PATH)/$(BINARY_NAME)" skill-install "$$target" || exit 1; \
 	done
 
-# バイナリだけを消し、スキルは消さない。スキルの置き場所はエージェントごとに違い、
-# 別の版で入れたものまで消してしまうため
-uninstall: ## Remove the binary from INSTALL_PATH (installed skills are kept)
+# Only the binary is removed. The skills are kept: each agent keeps them in its own place, and
+# removing them could delete skills installed by another version.
+uninstall: ## Remove the binary from INSTALL_PATH (the installed skills are kept)
 	rm -f "$(INSTALL_PATH)/$(BINARY_NAME)"
 
-clean: ## Clean build artifacts
+clean: ## Remove build artifacts
 	$(RUN) cargo clean
 
 ## Help
 
-help: ## Show this help message
-	@echo "$(BINARY_NAME) Build Commands"
+help: ## Show this help
+	@echo "Development tasks for $(BINARY_NAME)"
 	@echo ""
-	@echo "Usage: make [target]"
+	@echo "Usage: make <target>"
 	@echo ""
-	@echo "Targets:"
-	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 	@echo ""
-	@echo "Toolchain:"
-	@echo "  Versions are pinned in mise.toml. Run 'make setup' first."
-	@echo "  Without mise, add SYSTEM_TOOLS=1 to use the tools on PATH."
-	@echo ""
-	@echo "Release:"
-	@echo "  Use GitHub Actions > Release > Run workflow"
+	@echo "Tool versions are pinned in mise.toml. Run make setup first."
+	@echo "Without mise, add SYSTEM_TOOLS=1 to use the tools on PATH."
+	@echo "Release: GitHub Actions > Release > Run workflow"
