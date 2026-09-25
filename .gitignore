@@ -28,6 +28,13 @@ target
 # ローカル開発用のパス上書き設定 (CI では git 依存を使用)
 .cargo/config.toml
 
+# mise の個人用の上書き (ツールの版の正は mise.toml)
+mise.local.toml
+.mise.local.toml
+
+# `--features dhat-heap` で実行すると作業ディレクトリに書き出されるヒーププロファイル
+dhat-heap.json
+
 .claude/settings.json
 
 # reference-improver 等のローカルプラン/ベンチマークドキュメントは

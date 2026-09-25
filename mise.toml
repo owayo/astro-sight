@@ -1,0 +1,7 @@
+# このリポジトリのツールチェーン。ローカルと CI の両方がここを正とする。
+# mise.lock は置かない。rust は rustup に任せるので、lock に固定するもの (URL と checksum) が無い。
+
+[tools]
+# components を明示する。未指定だと rustup の既定 profile 次第で入るものが変わり、
+# GitHub Actions のランナー (minimal) では cargo fmt が無いと言われて落ちる
+rust = { version = "1.98.1", components = ["rustfmt", "clippy"] }

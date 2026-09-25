@@ -180,12 +180,19 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Build & Test
 
+開発コマンドは `make help` を参照する。ツールの版は `mise.toml` が正で、Makefile は `mise exec --` 経由でその版の `cargo` を呼ぶ（mise を使わない場合は `SYSTEM_TOOLS=1` を付ける）。
+
 ```bash
-make build    # or: cargo build
-make test     # or: cargo test
-make check    # clippy + fmt check
+make setup    # mise.toml のツールチェーンを入れ、依存を取得する (初回と依存の更新後)
+make build    # デバッグビルド
+make test     # テスト (既定の feature = 配布物と同じ mimalloc の構成)
+make check    # fmt-check + clippy (--all-targets --all-features) + cargo check
+make ci       # check + test。CI の quality ジョブは make setup と make ci だけを呼ぶ
 make help     # 全ターゲット表示
 ```
+
+- 個別のテストの絞り込みのように対応するターゲットが無いものは、`mise exec -- cargo test <filter>` のように mise 経由で直接呼ぶ
+- Cargo のコマンドには `CARGO_FLAGS` (既定 `--locked`) を付ける。`.cargo/config.toml` の `[patch]` で Cargo.lock が手元でだけ変わるときは `make ci CARGO_FLAGS=` で外す
 
 ## Notes
 

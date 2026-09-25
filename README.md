@@ -5,7 +5,7 @@
 <h1 align="center"><b>AST</b>ro-sight</h1>
 
 <p align="center">
-  AI エージェント向け AST 情報生成 CLI。tree-sitter ベースの高速構文解析で、AST 断片・シンボル定義・スニペットを JSON で返す。
+  AI エージェント向けの AST 情報生成 CLI。tree-sitter で 16 言語のコードを解析し、シンボルの定義と参照、diff の影響範囲、API の差分、デッドコードを JSON か TOON で返す。
 </p>
 
 <h3 align="center">対応プラットフォーム</h3>
@@ -20,7 +20,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/owayo/astro-sight" alt="License"></a>
 </p>
 
-<h3 align="center">Supported Languages</h3>
+<h3 align="center">対応言語</h3>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Rust-000000?logo=rust&amp;logoColor=white" alt="Rust">
@@ -57,14 +57,6 @@ winget install owayo.astro-sight
 
 portable パッケージとしてインストールすると winget が PATH を書き換えるため、インストール後は新しいターミナルを開くこと。
 
-### From Source
-
-```bash
-git clone https://github.com/owayo/astro-sight.git
-cd astro-sight
-make install
-```
-
 ### From GitHub Releases
 
 [Releases](https://github.com/owayo/astro-sight/releases) から最新のバイナリをダウンロードする。
@@ -90,6 +82,15 @@ curl -L https://github.com/owayo/astro-sight/releases/latest/download/astro-sigh
 sudo mv astro-sight /usr/local/bin/
 ```
 
+#### Linux (x86_64, musl)
+
+glibc を使わない静的リンク版。Alpine のように glibc が無い環境や、glibc が古い Docker イメージで使う。
+
+```bash
+curl -L https://github.com/owayo/astro-sight/releases/latest/download/astro-sight-x86_64-unknown-linux-musl.tar.gz | tar xz
+sudo mv astro-sight /usr/local/bin/
+```
+
 #### Linux (ARM64)
 
 ```bash
@@ -100,6 +101,32 @@ sudo mv astro-sight /usr/local/bin/
 #### Windows
 
 [Releases](https://github.com/owayo/astro-sight/releases) から `astro-sight-x86_64-pc-windows-msvc.zip` をダウンロードして展開し、中の `astro-sight.exe` を PATH の通ったディレクトリに置く。
+
+### From Source
+
+ビルドには [mise](https://mise.jdx.dev/) と C コンパイラ（macOS なら Xcode Command Line Tools）が要る。Rust の版は `mise.toml` で固定していて、`make` が mise 経由でその版の `cargo` を呼ぶ。
+
+```bash
+git clone https://github.com/owayo/astro-sight.git
+cd astro-sight
+make install
+```
+
+`make install` はリリース版をビルドして `INSTALL_PATH`（既定は `/usr/local/bin`）に置き、続けて `astro-sight skill-install` で Claude Code と Codex のスキルを書き込む。スキルの書き込み先は `INSTALL_PATH` の外の `~/.claude/skills/astro-sight/` と `~/.codex/skills/astro-sight/` になる（→ [スキルインストール](#スキルインストール)）。バイナリの置き場所は `INSTALL_PATH` で、スキルを入れるエージェントは `SKILL_TARGETS` で変えられる。
+
+```bash
+# 書き込み権限のあるディレクトリに入れる
+make install INSTALL_PATH="$HOME/.local/bin"
+
+# スキルを入れない / Claude Code のスキルだけ入れる
+make install SKILL_TARGETS=
+make install SKILL_TARGETS=claude
+
+# mise を使わず、PATH 上の cargo でビルドする（Rust の版は mise.toml とずれることがある）
+make install SYSTEM_TOOLS=1
+```
+
+`make uninstall` はバイナリだけを消し、書き込んだスキルは残す。
 
 ## Usage
 
@@ -1167,6 +1194,58 @@ Claude Desktop や Cursor などの MCP クライアントから利用する場�
   }
 }
 ```
+
+## Development
+
+[mise](https://mise.jdx.dev/) を前提にしている。Rust の版は `mise.toml` で固定し、Makefile の各ターゲットが `mise exec --` 経由でその版の `cargo` を呼ぶ。シェルで mise を有効にしていなくても版はそろう。mise のほかに C コンパイラ（tree-sitter の各パーサをビルドする）と git（結合テストが一時リポジトリを作って `git` コマンドを呼ぶ）が要る。
+
+```bash
+make setup   # mise.toml のツールチェーンを入れ、依存を取得する
+make ci      # CI と同じ検査（整形・clippy・cargo check・テスト）
+```
+
+CI の quality ジョブは `make setup` と `make ci` を呼ぶだけなので、手元の `make ci` がそのまま CI の検査になる。テストは配布物と同じ既定の feature で回す。clippy だけは `--all-features` で、ヒーププロファイラ（`dhat-heap` feature）側のコードも検査する。
+
+| Command | Description |
+|---|---|
+| `make setup` | Install the toolchain (mise.toml) and fetch dependencies |
+| `make build` | Build debug version |
+| `make release` | Build release version |
+| `make run` | Run the debug build (pass arguments with ARGS="...") |
+| `make test` | Run tests |
+| `make lint` | Run clippy with warnings as errors |
+| `make fmt` | Format code |
+| `make fmt-check` | Check formatting (no rewrite) |
+| `make check` | Run fmt check, clippy, and cargo check (no rewrite) |
+| `make ci` | Run the same checks as the CI quality job (no rewrite) |
+| `make install` | Build release, install the binary to INSTALL_PATH, and install skills (claude + codex) |
+| `make uninstall` | Remove the binary from INSTALL_PATH (installed skills are kept) |
+| `make clean` | Clean build artifacts |
+| `make help` | Show this help message |
+
+Cargo のコマンドには既定で `--locked` を付けている。`.cargo/config.toml` の `[patch]` でローカルの tree-sitter 系を差し込むと `Cargo.lock` が手元でだけ変わり、`--locked` で止まる。そのときは `make ci CARGO_FLAGS=` のように `CARGO_FLAGS` を空にする。
+
+`tools/usage-stats`（[利用状況の分析](#利用状況の分析)）はルートとは別の Cargo プロジェクトで、`make ci` の対象に入らない。コマンドとして入れるなら `make -C tools/usage-stats install` を実行する。
+
+## Release
+
+GitHub Actions の **Actions > Release > Run workflow** から実行する。1 回の実行で次の順に進む。
+
+1. `Cargo.toml` と `Cargo.lock` の版を書き換えてコミットし、`v<版>` のタグを付けて push する
+2. 6 つのターゲット（Linux の x86_64 / x86_64 musl / ARM64、macOS の Intel / Apple Silicon、Windows の x86_64）をビルドし、GitHub Release を作る
+3. Homebrew tap（`owayo/homebrew-astro-sight`）の Formula と bottle を更新し、winget-pkgs に更新のマニフェストを提出する
+
+版の形式は `yy.m.counter`（例: `26.9.103`）。counter は年月が変わると 100 に戻り、同じ年月の中ではリリースのたびに 1 ずつ増える。
+
+`dry_run` を有効にすると、次の版を計算してログに出すだけで、コミット・タグ・ビルド・リリースは行わない。6 つのターゲットのビルドは、CI の build ジョブが push と PR のたびに同じ設定で確かめている。
+
+リポジトリに要る設定値は次のとおり。
+
+| 名前 | 置き場所 | 用途 |
+|---|---|---|
+| `APP_CLIENT_ID` | Actions の Variables | Homebrew tap に push する GitHub App の Client ID |
+| `PRIVATE_KEY` | Actions の Secrets | 同じ GitHub App の秘密鍵 |
+| `WINGET_TOKEN` | Actions の Secrets | winget-pkgs に PR を出すトークン。未設定なら winget への提出だけを飛ばす |
 
 ## License
 
