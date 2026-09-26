@@ -192,6 +192,16 @@ pub(super) fn declaration_header(
     };
     let body_id = body.map(|b| b.id());
 
+    if lang_id == LangId::Python {
+        let display = crate::engine::python_signature::normalize_function_header(decl, source)?;
+        return Some(DeclarationHeader {
+            first_line: decl.child_by_field_name("name")?.start_position().row,
+            last_line,
+            tokens: vec![display.clone()],
+            display,
+        });
+    }
+
     // 名前ノード: 本体の外にある、シンボル名と同じテキストを持つ最初の名前付き葉。
     let mut name_node = None;
     let mut leaves: Vec<Node<'_>> = Vec::new();
@@ -441,6 +451,32 @@ pub(super) fn reconcile_declaration_changes(
             continue;
         }
         let has_text_sig_change = sig_changes.iter().any(|sc| sc.name == symbol_change.name);
+        // Python は単一の宣言を新旧とも確認できる場合、共通のトークン比較を正本にする。
+        // 行比較の空白誤検出を打ち消す一方、文字列内部の空白変更の見逃しも補う。
+        // 同名の別メソッド・overload や構文エラーがあれば従来の検出を維持する。
+        if !is_added && input.lang_id == LangId::Python && !input.root.has_error() {
+            let mut matching = input.syms.iter().filter(|s| s.name == symbol_change.name);
+            if let Some(symbol) = matching.next()
+                && matching.next().is_none()
+                && let Some(old) = old_side.get(input)
+                && !old.tree.root_node().has_error()
+                && old.symbols.iter().filter(|s| s.name == symbol.name).count() == 1
+                && let [old_header] = old.counterpart_headers(symbol, input.lang_id).as_slice()
+                && let Some(new_header) =
+                    declaration_header(input.root, input.source, symbol, input.lang_id)
+            {
+                if old_header.same_contract(&new_header) {
+                    sig_changes.retain(|sc| sc.name != symbol_change.name);
+                } else if !has_text_sig_change {
+                    sig_changes.push(SignatureChange {
+                        name: symbol_change.name.clone(),
+                        old_signature: old_header.display.clone(),
+                        new_signature: new_header.display,
+                    });
+                }
+                continue;
+            }
+        }
         if !is_added && has_text_sig_change {
             continue;
         }

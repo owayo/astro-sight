@@ -6,6 +6,34 @@ use super::support::*;
 use std::process::{Command, Stdio};
 
 #[test]
+fn impact_python_signature_reformat_keeps_real_changes() {
+    let repo = TestRepo::new();
+    repo.write("api.py", "def formatted(\n    value: str = 'a  b',\n) -> str:\n    return value\n\ndef changed(value=(1,)):\n    return value\n");
+    repo.write(
+        "consumer.py",
+        "from api import formatted, changed\nformatted()\nchanged()\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    for value in ["(1)", "'a  b'", "'a b'"] {
+        repo.write("api.py", format!("def formatted(value: str = 'a  b') -> str:\n    return value\n\ndef changed(value={value}):\n    return value\n"));
+        let output = cargo_bin()
+            .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("changed") && stderr.contains("consumer.py"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("formatted"), "{stderr}");
+        // 次の変更では文字列内部の空白だけが異なる対照になる。
+        repo.commit_all("change default");
+    }
+}
+
+#[test]
 fn impact_distinguishes_rust_binding_mut_from_type_mutability() {
     let repo = TestRepo::new();
     repo.create_dir_all("src");

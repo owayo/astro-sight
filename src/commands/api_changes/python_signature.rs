@@ -1,5 +1,6 @@
 //! Python 固有のシグネチャ解析と互換 API 変更判定ヘルパー (末尾 optional/default 引数追加)。
 
+use crate::engine::python_signature::normalize_signature_range;
 use crate::language::LangId;
 use crate::models::review::CompatibleApiModification;
 
@@ -340,8 +341,8 @@ pub(crate) fn python_function_signature_parts(
     let params = fn_node.child_by_field_name("parameters")?;
     let body = fn_node.child_by_field_name("body")?;
     let sig_start = fn_node.start_byte();
-    let head = normalize_signature_whitespace(source.get(sig_start..params.start_byte())?);
-    let tail = normalize_signature_whitespace(source.get(params.end_byte()..body.start_byte())?);
+    let head = normalize_signature_range(fn_node, source, sig_start..params.start_byte())?;
+    let tail = normalize_signature_range(fn_node, source, params.end_byte()..body.start_byte())?;
     let parts = python_function_params(params, source)?;
     let decorators = python_collect_decorators(fn_node, source);
     Some(PyFunctionSignatureParts {
@@ -527,26 +528,30 @@ pub(crate) fn python_function_params(
     for child in params.named_children(&mut cursor) {
         match child.kind() {
             "identifier" | "typed_parameter" => {
-                let text = source.get(child.start_byte()..child.end_byte())?;
                 result.push(PyParamPart::Param(PyFunctionParam {
-                    normalized: normalize_signature_whitespace(text),
+                    normalized: normalize_signature_range(child, source, child.byte_range())?,
                     has_default: false,
                 }));
             }
             "default_parameter" | "typed_default_parameter" => {
-                let text = source.get(child.start_byte()..child.end_byte())?;
                 result.push(PyParamPart::Param(PyFunctionParam {
-                    normalized: normalize_signature_whitespace(text),
+                    normalized: normalize_signature_range(child, source, child.byte_range())?,
                     has_default: true,
                 }));
             }
             "list_splat_pattern" => {
-                let text = source.get(child.start_byte()..child.end_byte())?;
-                result.push(PyParamPart::VarArgs(normalize_signature_whitespace(text)));
+                result.push(PyParamPart::VarArgs(normalize_signature_range(
+                    child,
+                    source,
+                    child.byte_range(),
+                )?));
             }
             "dictionary_splat_pattern" => {
-                let text = source.get(child.start_byte()..child.end_byte())?;
-                result.push(PyParamPart::KwArgs(normalize_signature_whitespace(text)));
+                result.push(PyParamPart::KwArgs(normalize_signature_range(
+                    child,
+                    source,
+                    child.byte_range(),
+                )?));
             }
             "keyword_separator" => result.push(PyParamPart::KeywordSeparator),
             "positional_separator" => result.push(PyParamPart::PositionalSeparator),

@@ -141,10 +141,12 @@ pub(crate) fn extract_api_signature(
                             return sig;
                         }
                         if let Some(bytes) = source.get(s..e) {
-                            let sig = normalize_signature_whitespace(bytes);
                             if lang_id == crate::language::LangId::Python {
+                                let sig = crate::engine::python_signature::normalize_function_header(cur, source)
+                                    .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
                                 return with_python_binding_decorators(cur, source, sig);
                             }
+                            let sig = normalize_signature_whitespace(bytes);
                             return sig;
                         }
                         break;

@@ -14,6 +14,7 @@ pub mod lexer;
 pub mod lint;
 pub mod parser;
 pub mod phpunit_refs;
+pub(crate) mod python_signature;
 pub mod query_cache;
 pub mod refs;
 pub(crate) mod rust_signature;

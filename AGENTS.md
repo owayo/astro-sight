@@ -4,6 +4,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **Python 関数ヘッダの整形** — `engine/python_signature.rs` の AST トークン正規化を API 差分・省略可能な引数追加の互換判定・impact の宣言比較で共有する。トークン間の空白、通常コメント、引数リストの末尾カンマだけを整形差として除く。文字列全体 (f-string を含む)・タプルのカンマ・`# type:` コメントは保持する。impact の行比較結果を打ち消すのは、新旧が解析可能で同名宣言が各 1 件の場合だけ。同名メソッド・overload・復元失敗・構文エラーでは従来の検出を維持する。この打ち消しは Python に限定し、他言語の既存の末尾カンマ比較へ広げない。
 - **AppService 層** — CLI / Session / MCP の統一コアロジック（`src/service.rs`）
 - **tree-sitter** ベースの構文解析エンジン（16言語対応）
 - **動的 import の依存抽出** — JavaScript / TypeScript / TSX の通常の import 文と `require()` に加え、`import("./module")` と置換を含まない `` import(`./module`) `` を `imports` で抽出する。`${expr}` を含む template literal は静的に依存先を確定できないため除外し、呼び出し形式は第1引数だけを依存先として扱う

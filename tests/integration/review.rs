@@ -6,6 +6,83 @@ use super::support::*;
 use std::process::{Command, Stdio};
 
 #[test]
+fn review_python_signature_reformat_preserves_real_contract_changes() {
+    let before = "def run(\n    value: str = \"x  y\",\n    timeout: int = 15,\n) -> str:\n    return value\n";
+    for (after, compatible) in [
+        (
+            "def run(value: str = \"x  y\", timeout: int = 15) -> str:\n    return value\n",
+            true,
+        ),
+        (
+            "def run( value : str = \"x  y\", # ordinary comment\n timeout : int = 15 , ) -> str:\n    return value\n",
+            true,
+        ),
+        (
+            "def run(value: str = \"x y\", timeout: int = 15) -> str:\n    return value\n",
+            false,
+        ),
+        (
+            "def run(value: str = \"x  y\", timeout: int = 16) -> str:\n    return value\n",
+            false,
+        ),
+        (
+            "def run(value: str = \"x  y\", /, timeout: int = 15) -> str:\n    return value\n",
+            false,
+        ),
+        (
+            "def run(*, value: str = \"x  y\", timeout: int = 15) -> str:\n    return value\n",
+            false,
+        ),
+        (
+            "def run(value: str = \"x  y\", timeout: int = 15) -> int:\n    return value\n",
+            false,
+        ),
+    ] {
+        let output = a3_review_hook(
+            |root| std::fs::write(root.join("pkg/api.py"), after).unwrap(),
+            &[
+                ("pkg/__init__.py", ""),
+                ("pkg/api.py", before),
+                (
+                    "consumer.py",
+                    "from pkg.api import run\nprint(run(value=\"a\"))\n",
+                ),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), compatible, "{after}\n{stderr}");
+        if compatible {
+            assert!(!stderr.contains("\"mod\""), "{stderr}");
+            assert!(!stderr.contains("\"impacts\""), "{stderr}");
+        } else {
+            assert!(stderr.contains("\"mod\""), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn review_python_optional_addition_does_not_hide_changed_literal() {
+    let before = "def run(value: str = 'a  b') -> str:\n    return value\n";
+    for (literal, compatible) in [("'a  b'", true), ("'a b'", false)] {
+        let after = format!(
+            "def run(\n value: str = {literal},\n timeout: int = 15,\n) -> str:\n    return value\n"
+        );
+        let output = a3_review_hook(
+            |root| std::fs::write(root.join("pkg/api.py"), &after).unwrap(),
+            &[
+                ("pkg/__init__.py", ""),
+                ("pkg/api.py", before),
+                ("consumer.py", "from pkg.api import run\nprint(run())\n"),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), compatible, "{after}\n{stderr}");
+        assert_eq!(stderr.contains("\"mod_compat\""), compatible, "{stderr}");
+        assert_eq!(stderr.contains("\"mod\""), !compatible, "{stderr}");
+    }
+}
+
+#[test]
 fn review_python_root_script_move_no_api_rm() {
     // Issue 2026-06-14-python-script-move-api-rm: root-level の単体スクリプトを package へ移設
     // すると旧スクリプトの top-level helper が api.rm (blocking) で hook を止める FP。
