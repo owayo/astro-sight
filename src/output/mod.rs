@@ -33,7 +33,7 @@ pub enum OutputFormat {
     /// JSON (default)
     #[default]
     Json,
-    /// TOON v3 - compact tables (toon-format 0.5) (https://toonformat.dev/)
+    /// TOON v4.1 - compact tables (https://toonformat.dev/)
     Toon,
     /// Whichever of json/toon is estimated to use fewer tokens for this output
     Auto,
@@ -57,26 +57,23 @@ impl OutputFormat {
 /// 1 行あたり数文字ぶんの罰則を入れると真のトークン数最小との一致率が上がり、
 /// **1 回の呼び出しあたりの最悪損失が 15〜16% から大きく下がる**。
 ///
-/// 値は 2026-09-04 に再測定して 3 から 4 へ引き上げた。`result_summary` (出力上限の申告)
-/// という **行数の多い小さな出力**が新たに加わり、旧値の平坦域から外れたため
-/// (AGENTS.md の「DTO や出力形を変えたら係数を測り直すこと」に該当する):
-///
-/// - 大きな出力 143 ペア: k=0..6 がいずれも損失ゼロ (係数の選択が結果を変えない領域)
-/// - `result_summary` 付きの小さな出力 120 ペア: k=3 は損失 0.67% / 最悪 93 tokens に対し、
-///   **k=4 は損失 0.13% / 最悪 30 tokens**。両トークナイザで k=4 が最良で一致した
-///
-/// 小さい出力ほど形式間の逆転が起きやすいので、そちらで差が付く値を採る。
-// TOON v3 移行時の 63 ペアでも再計測し維持 (2026-09-24)。
-// k=4 の損失は o200k_base で 0、cl100k_base で合計・最大とも 3 tokens。
-const LINE_TOKEN_PENALTY: usize = 4;
+/// TOON v4.1 への移行後、単一・バッチ・件数制限付き refs の 90 ペアを
+/// `o200k_base` / `cl100k_base` で再測定した。係数 1〜4 が平坦域で、
+/// k=3 の合計損失はそれぞれ 0 / 12 tokens、単発最大損失は 0 / 2 tokens。
+/// 平坦域の中央値に近い 3 を採る。出力形が変わったら再測定する。
+const LINE_TOKEN_PENALTY: usize = 3;
 
-/// [`size_metric`] を実トークン数へ換算するときの除数。
+/// 絶対的なトークン予算では、改行の多い整形 JSON を過小評価しないため
+/// TOON / JSON の相対比較より大きい行罰則を使う。
+const BUDGET_LINE_TOKEN_PENALTY: usize = 4;
+
+/// 予算用の指標を実トークン数へ換算するときの除数。
 ///
 /// `size_metric` は形式間の**相対比較**用なので係数の絶対値は問わないが、
 /// `--token-budget` のような**絶対的な予算**に使うにはトークン数と桁を合わせる必要がある
 /// (合わせないと「3000 トークンまで」と指定したのに実際は 900 トークンしか出ない)。
 ///
-/// 実測 (252 サンプル × 2 トークナイザ、`LINE_TOKEN_PENALTY = 4` 時) の `metric / token` は
+/// 実測 (252 サンプル × 2 トークナイザ、予算用の行罰則 4 時) の `metric / token` は
 /// p05=3.00 / p10=3.06 / p50=3.42 / p90=3.86 / min=2.73。**予算は超えない側に倒す**ので
 /// 中央値ではなく p05 相当の 3 を採る (95% のケースで予算内、最悪でも約 10% 超過)。
 const METRIC_PER_TOKEN: usize = 3;
@@ -111,7 +108,8 @@ pub fn estimated_size(text: &str) -> usize {
 /// 「N トークンまで」がそのまま意味を持つ。切り上げ (`div_ceil`) にするのは、
 /// 非空の出力が 0 トークンと見積もられて予算判定が素通りするのを避けるため。
 pub fn estimated_tokens(text: &str) -> usize {
-    size_metric(text).div_ceil(METRIC_PER_TOKEN)
+    let newlines = text.bytes().filter(|b| *b == b'\n').count();
+    (text.chars().count() + BUDGET_LINE_TOKEN_PENALTY * newlines).div_ceil(METRIC_PER_TOKEN)
 }
 
 /// JSON の整形スタイル。`--pretty` は JSON 固有の設定で、TOON には対応概念が無い
@@ -626,13 +624,15 @@ mod tests {
         // 非空の出力が 0 トークンと見積もられて予算判定が素通りしない
         assert_eq!(estimated_tokens("a"), 1);
         assert_eq!(estimated_tokens(""), 0);
-        // 改行の罰則は metric 側と同じ扱い (行の多い出力を過小評価しない)
+        // 絶対予算では行数の多い整形出力を過小評価しないよう罰則を強める。
         let lines = "ab
 "
         .repeat(30);
         assert_eq!(
             estimated_tokens(&lines),
-            size_metric(&lines).div_ceil(METRIC_PER_TOKEN)
+            (lines.chars().count()
+                + BUDGET_LINE_TOKEN_PENALTY * lines.bytes().filter(|b| *b == b'\n').count())
+            .div_ceil(METRIC_PER_TOKEN)
         );
         assert!(
             estimated_tokens(&lines) > lines.chars().count().div_ceil(METRIC_PER_TOKEN),

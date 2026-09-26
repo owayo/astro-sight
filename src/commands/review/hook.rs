@@ -551,7 +551,7 @@ pub(crate) fn build_review_hook_json_for_diff(
         serde_json::Value::String("False positives? Run astro-sight-triage skill.".into()),
     );
 
-    // toon-format が有効にする preserve_order に依らず、従来の JSON キー順を保つ。
+    // TOON 用の preserve_order に依らず、従来の JSON キー順を保つ。
     let mut value = serde_json::Value::Object(hook_obj);
     value.sort_all_objects();
     HookJsonBuild {

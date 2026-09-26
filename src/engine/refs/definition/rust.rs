@@ -8,6 +8,76 @@ use tree_sitter::Node;
 
 use crate::language::LangId;
 
+/// `cfg_attr` の引数木かを判定する。入れ子の `cfg_attr` も許す。
+fn is_cfg_attr_arguments(mut tree: Node<'_>, source: &[u8]) -> bool {
+    loop {
+        let Some(parent) = tree.parent() else {
+            return false;
+        };
+        if parent.kind() == "attribute" {
+            return parent
+                .named_child(0)
+                .and_then(|name| name.utf8_text(source).ok())
+                == Some("cfg_attr");
+        }
+        if parent.kind() != "token_tree"
+            || tree
+                .prev_sibling()
+                .and_then(|name| name.utf8_text(source).ok())
+                != Some("cfg_attr")
+        {
+            return false;
+        }
+        tree = parent;
+    }
+}
+
+/// `cfg` 条件の識別子は Rust のシンボル参照ではなく設定キーなので除外する。
+///
+/// tree-sitter は他のマクロの引数内にある `cfg!(...)` を `macro_invocation` にせず、
+/// `identifier`・`!`・`token_tree` に分ける。引数木の直前の兄弟を見ることで
+/// その形も扱う。`cfg_attr` は最初の引数だけが条件なので、直下のカンマまでに
+/// 限る。後続の `derive(Trait)` は実際のシンボル参照として残す。
+pub(crate) fn is_rust_cfg_condition_identifier(node: Node<'_>, source: &[u8]) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(tree) = ancestor {
+        ancestor = tree.parent();
+        if tree.kind() != "token_tree" {
+            continue;
+        }
+        let Some(previous) = tree.prev_sibling() else {
+            continue;
+        };
+        let (name_node, is_macro) = if previous.kind() == "!" {
+            (previous.prev_sibling(), true)
+        } else {
+            (Some(previous), false)
+        };
+        let Some(name) = name_node.and_then(|n| n.utf8_text(source).ok()) else {
+            continue;
+        };
+        let is_attribute = tree.parent().is_some_and(|parent| {
+            parent.kind() == "attribute"
+                || (parent.kind() == "token_tree" && is_cfg_attr_arguments(parent, source))
+        });
+        if !is_macro && !is_attribute {
+            continue;
+        }
+        match name {
+            "cfg" => return true,
+            "cfg_attr" if !is_macro => {
+                let mut cursor = tree.walk();
+                return tree
+                    .children(&mut cursor)
+                    .find(|child| child.kind() == ",")
+                    .is_some_and(|comma| node.end_byte() <= comma.start_byte());
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Rust の識別子が「構造体フィールドの名前位置」かどうかを判定する。
 ///
 /// `pub fn redact()` のような関数名と struct field 名 (`pub redact: bool`) が衝突した場合、

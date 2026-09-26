@@ -123,7 +123,7 @@ Building from source also needs a C compiler for the tree-sitter parsers (Xcode 
 
 ## Usage
 
-Results are compact JSON on one line by default (batch modes print one line per file). `--pretty` indents the JSON, and `--format toon` or `--format auto` switches to TOON or to whichever of the two is estimated to take fewer tokens.
+Results are compact JSON on one line by default (batch modes print one line per file). `--pretty` indents the JSON, and `--format toon` or `--format auto` switches to TOON or to whichever of the two is estimated to take fewer tokens. TOON output follows the [v4.1 specification](https://github.com/toon-format/spec/blob/main/SPEC.md); an empty array is `[]`.
 
 ### Recommended Flow for Agents
 

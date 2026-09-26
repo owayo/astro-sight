@@ -1,46 +1,47 @@
-//! ライブラリへの委譲と、ストリーミング用アダプタのデータ保持を検証する。
+//! TOON v4.1 の必須表記とストリーミング出力を固定する。
 
 use super::{encode, encode_list_item, streaming_array_header, to_toon_value};
-use serde_json::{Value, json};
+use serde_json::json;
 
 #[test]
-fn delegates_documents_to_toon_v3() {
-    for value in [
-        json!([]),
-        json!({}),
-        json!({"empty": []}),
-        json!({"rows": [{"id": 1}, {"id": 2}]}),
-        json!({"rows": [{"id": 1}, {"id": 2, "name": "Ada"}]}),
-        json!({"rows": [{"meta": {"x": 1}}, {"meta": {"x": 2}}]}),
-        json!({"a": {"id": 1}, "b": {"id": 2}}),
-        json!({"text": "日本語\n\"quoted\"\\path", "number": 1.25}),
-    ] {
-        let actual = encode(&value).unwrap();
-        assert_eq!(actual, toon_format::encode_default(&value).unwrap());
-        let decoded: Value = toon_format::decode_strict(&actual).unwrap();
-        assert_eq!(decoded, value);
-        assert!(!actual.ends_with('\n'));
-    }
-    assert_eq!(encode(&json!([])).unwrap(), "[0]:");
-    assert_eq!(encode(&json!({"empty": []})).unwrap(), "empty[0]:");
+fn empty_arrays_use_v41_literal() {
+    assert_eq!(encode(&json!([])).unwrap(), "[]");
+    assert_eq!(encode(&json!({"empty": []})).unwrap(), "empty: []");
+    assert_eq!(streaming_array_header(0), "[]");
 }
 
 #[test]
-fn struct_field_order_and_unsized_inputs_are_preserved() {
+fn ambiguous_strings_and_numbers_follow_v41_rules() {
+    assert_eq!(encode(&json!("#tag")).unwrap(), "\"#tag\"");
+    assert_eq!(
+        encode(&json!({"hash": "#tag", "dash": "-tag", "number": "1e6", "truth": "true"})).unwrap(),
+        "hash: \"#tag\"\ndash: \"-tag\"\nnumber: \"1e6\"\ntruth: \"true\""
+    );
+    assert_eq!(
+        encode(&json!({"million": 1e6, "micro": 1e-6, "large": 1e21})).unwrap(),
+        "million: 1000000\nmicro: 0.000001\nlarge: 1e+21"
+    );
+}
+
+#[test]
+fn uniform_rows_use_required_tabular_forms() {
+    assert_eq!(encode(&json!({"rows": [{"id": 1, "user": {"name": "Ada"}}, {"id": 2, "user": {"name": "Bob"}}]})).unwrap(),
+        "rows[2]{id,user{name}}:\n  1,Ada\n  2,Bob");
+    assert_eq!(
+        encode(&json!({"a": {"id": 1}, "b": {"id": 2}})).unwrap(),
+        "[2:]{id}:\n  a: 1\n  b: 2"
+    );
+}
+
+#[test]
+fn struct_order_and_duplicate_keys_match_the_current_json_model() {
     #[derive(serde::Serialize)]
     struct Row {
         z: u32,
         a: u32,
     }
-    let row = Row { z: 1, a: 2 };
-    assert_eq!(encode(&row).unwrap(), "z: 1\na: 2");
-    assert_eq!(encode("hello").unwrap(), "hello");
-    assert_eq!(encode(&[1u32, 2][..]).unwrap(), "[2]: 1,2");
-    assert_eq!(to_toon_value(&f64::NAN).unwrap(), Value::Null);
-}
+    assert_eq!(encode(&Row { z: 1, a: 2 }).unwrap(), "z: 1\na: 2");
 
-#[test]
-fn duplicate_map_keys_follow_serde_json_last_value_wins() {
     struct Duplicate;
     impl serde::Serialize for Duplicate {
         fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -52,42 +53,32 @@ fn duplicate_map_keys_follow_serde_json_last_value_wins() {
         }
     }
     assert_eq!(to_toon_value(&Duplicate).unwrap(), json!({"key": 2}));
-    let text = encode(&Duplicate).unwrap();
-    assert_eq!(
-        toon_format::decode_strict::<Value>(&text).unwrap(),
-        json!({"key": 2})
-    );
+    assert_eq!(encode(&Duplicate).unwrap(), "key: 2");
 }
 
 #[test]
-fn streaming_items_round_trip_all_json_shapes() {
-    let records = vec![
-        json!({}),
-        json!([]),
-        json!(null),
-        json!(false),
-        json!(42),
-        json!("comma, colon: quote\"\n  - [0]:"),
-        json!([1, 2]),
-        json!([{"id": 1}, {"id": 2}]),
-        json!([{"id": 1}, false]),
-        json!({"nested": {"x": 1}, "tail": true}),
-        json!({"rows": [{"id": 1}, {"id": 2}], "tail": true}),
-        json!({"rows": [{"id": 1}, {"other": 2}], "tail": true}),
-        json!({"empty": [], "tail": true}),
+fn streaming_items_have_matching_count_and_no_trailing_whitespace() {
+    let records = [
+        json!({"path": "a.rs", "symbols": []}),
+        json!({"path": "b.rs", "symbols": [1, 2]}),
     ];
-    let mut text = streaming_array_header(records.len());
-    for value in &records {
-        let item = encode_list_item(value).unwrap();
-        assert!(item.starts_with("  -"), "{item}");
-        assert!(!item.ends_with('\n'));
-        text.push('\n');
-        text.push_str(&item);
+    let mut output = streaming_array_header(records.len());
+    for record in &records {
+        let item = encode_list_item(record).unwrap();
+        assert!(item.starts_with("  - "));
+        output.push('\n');
+        output.push_str(&item);
     }
-    let decoded: Vec<Value> = toon_format::decode_strict(&text).unwrap();
-    assert_eq!(decoded, records, "{text}");
+    assert!(output.starts_with("[2]:\n  - "));
     assert_eq!(
-        toon_format::decode_strict::<Value>(&streaming_array_header(0)).unwrap(),
-        json!([])
+        output
+            .lines()
+            .filter(|line| line.starts_with("  - "))
+            .count(),
+        records.len()
     );
+    assert!(!output.ends_with('\n'));
+    for line in output.lines() {
+        assert_eq!(line, line.trim_end());
+    }
 }

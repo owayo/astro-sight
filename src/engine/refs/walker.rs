@@ -18,8 +18,8 @@ use super::definition::php::{
 };
 use super::definition::ruby::ruby_symbol_ref_segment;
 use super::definition::rust::{
-    RustPatternBindingCache, is_rust_closure_bound_identifier, is_rust_struct_field_non_callable,
-    rust_attr_string_ref_segments,
+    RustPatternBindingCache, is_rust_cfg_condition_identifier, is_rust_closure_bound_identifier,
+    is_rust_struct_field_non_callable, rust_attr_string_ref_segments,
 };
 use super::definition::{is_definition_context, is_identifier_kind, is_ignored_identifier_context};
 use super::line_index::{LineIndex, context_column, extract_line_context_indexed};
@@ -498,6 +498,7 @@ fn visit_ref_node<M: RefMatcher, S: RawRefSink>(
         // 参照ではない (シャドーイング)。参照として数えると dead-code が fail-open する。
         && !(lang_id == LangId::Rust
             && is_rust_closure_bound_identifier(node, text, source, &env.rust_binding_cache))
+        && !(lang_id == LangId::Rust && is_rust_cfg_condition_identifier(node, source))
         && !is_ignored_identifier_context(node, lang_id)
     {
         let is_def = is_definition_context(node, definition_kinds, lang_id);

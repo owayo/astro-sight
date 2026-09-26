@@ -1,5 +1,80 @@
 use super::*;
 
+/// cfg 条件のキーは同名の Rust シンボルを参照しない。
+/// cfg_attr の条件以外や通常のマクロ引数、関数呼び出しは残す。
+#[test]
+fn rust_cfg_condition_keys_are_not_symbol_references() {
+    let source = r#"pub fn feature() {}
+#[cfg(feature = "extra")]
+fn optional() {}
+#[cfg_attr(all(feature = "extra", not(test)), derive(Feature))]
+struct Optional;
+#[cfg_attr(feature = "extra", cfg(feature = "nested"), derive(Feature))]
+#[cfg_attr(feature = "extra", cfg_attr(feature = "inner", cfg(feature = "deep")))]
+struct Nested;
+fn call() {
+    if cfg!(not(feature = "extra")) { feature(); }
+    assert!(cfg!(feature = "inside_macro"));
+    ordinary!(feature);
+    cfg_attr!(feature, 0);
+}
+"#;
+    let tree = parser::parse_source(source.as_bytes(), LangId::Rust).unwrap();
+    let kinds = definition_node_kinds(LangId::Rust);
+    let refs = collect_single_refs_for_test(
+        tree.root_node(),
+        source.as_bytes(),
+        "feature",
+        "test.rs",
+        kinds,
+        LangId::Rust,
+    );
+    let refs_in_batch = collect_batch_refs_for_test(
+        tree.root_node(),
+        source.as_bytes(),
+        &["feature".to_string()],
+        "test.rs",
+        kinds,
+        LangId::Rust,
+    );
+    assert_eq!(refs.len(), 4, "定義と実際の参照 3 件だけ: {refs:?}");
+    assert_eq!(
+        ref_fingerprints(&refs_in_batch[0]),
+        ref_fingerprints(&refs),
+        "単一名とバッチの結果が一致すること"
+    );
+    assert_eq!(
+        count_refs_for_test(
+            tree.root_node(),
+            source.as_bytes(),
+            &["feature".to_string()],
+            kinds,
+            LangId::Rust,
+            1,
+        )[0],
+        3,
+        "件数だけの経路も cfg 条件を除外すること"
+    );
+    let combinator = collect_single_refs_for_test(
+        tree.root_node(),
+        source.as_bytes(),
+        "test",
+        "test.rs",
+        kinds,
+        LangId::Rust,
+    );
+    assert!(combinator.is_empty(), "bare の条件キーも除外すること");
+    let derive_trait = collect_single_refs_for_test(
+        tree.root_node(),
+        source.as_bytes(),
+        "Feature",
+        "test.rs",
+        kinds,
+        LangId::Rust,
+    );
+    assert_eq!(derive_trait.len(), 2, "cfg_attr の後続属性は保持すること");
+}
+
 /// Rust の `pub fn` と struct field が同名のとき、フィールド名位置の扱いが
 /// **出力面 (`refs`) と判定面 (dead-code の参照カウント) で分かれる**ことを検証する。
 ///

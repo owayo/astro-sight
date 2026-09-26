@@ -123,7 +123,7 @@ make install
 
 ## 使い方
 
-結果の既定は 1 行の compact JSON です (バッチ処理ではファイルごとに 1 行)。`--pretty` を付けると JSON を字下げし、`--format toon` か `--format auto` を付けると TOON か、推定トークン数が少ない方の形式に切り替わります。
+結果の既定は 1 行の compact JSON です (バッチ処理ではファイルごとに 1 行)。`--pretty` を付けると JSON を字下げし、`--format toon` か `--format auto` を付けると TOON か、推定トークン数が少ない方の形式に切り替わります。TOON 出力は [v4.1 仕様](https://github.com/toon-format/spec/blob/main/SPEC.md) に従い、空配列は `[]` です。
 
 ### エージェント向けの手順
 

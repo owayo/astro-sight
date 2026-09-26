@@ -6,6 +6,46 @@ use super::support::*;
 use std::process::{Command, Stdio};
 
 #[test]
+fn review_hook_ignores_rust_cfg_keys_when_public_method_is_removed() {
+    let manifest = "[package]\nname = \"cfg-key-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n";
+    let before = "pub struct Lang;\nimpl Lang { pub fn feature(&self) -> bool { true } }\n";
+    let after = "pub struct Lang;\n";
+    let flags = "#[cfg(feature = \"extra\")]\npub fn optional() {}\npub fn check() -> bool { cfg!(feature = \"extra\") }\n";
+
+    let cfg_only = a3_review_hook(
+        |root| std::fs::write(root.join("src/lib.rs"), after).unwrap(),
+        &[
+            ("Cargo.toml", manifest),
+            ("src/lib.rs", before),
+            ("src/flags.rs", flags),
+        ],
+    );
+    assert!(
+        cfg_only.status.success(),
+        "cfg 条件のキーだけでは削除を blocking にしない: {}",
+        String::from_utf8_lossy(&cfg_only.stderr)
+    );
+
+    let real_call = a3_review_hook(
+        |root| std::fs::write(root.join("src/lib.rs"), after).unwrap(),
+        &[
+            ("Cargo.toml", manifest),
+            ("src/lib.rs", before),
+            ("src/flags.rs", flags),
+            (
+                "src/consumer.rs",
+                "use crate::Lang;\npub fn consume(lang: &Lang) { lang.feature(); }\n",
+            ),
+        ],
+    );
+    assert!(
+        !real_call.status.success(),
+        "実際の呼び出しが残る場合は blocking にする: {}",
+        String::from_utf8_lossy(&real_call.stderr)
+    );
+}
+
+#[test]
 fn review_python_signature_reformat_preserves_real_contract_changes() {
     let before = "def run(\n    value: str = \"x  y\",\n    timeout: int = 15,\n) -> str:\n    return value\n";
     for (after, compatible) in [

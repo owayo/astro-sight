@@ -664,8 +664,36 @@ fn invalid_config_format_is_reported() {
 }
 
 #[test]
-fn toon_v3_documents_and_batches_decode_with_the_selected_library() {
+fn toon_v41_documents_and_batches_decode_with_the_reference_implementation() {
+    fn assert_json_content(actual: &serde_json::Value, expected: &serde_json::Value) {
+        match (actual, expected) {
+            (serde_json::Value::Object(actual), serde_json::Value::Object(expected)) => {
+                for (key, value) in expected {
+                    let actual_value = actual
+                        .get(key)
+                        .unwrap_or_else(|| panic!("キーが欠落: {key}"));
+                    assert_json_content(actual_value, value);
+                }
+                for (key, value) in actual {
+                    if !expected.contains_key(key) {
+                        assert!(value.is_null(), "補完対象外の列が増えた: {key}={value}");
+                    }
+                }
+            }
+            (serde_json::Value::Array(actual), serde_json::Value::Array(expected)) => {
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(expected) {
+                    assert_json_content(actual, expected);
+                }
+            }
+            _ => assert_eq!(actual, expected),
+        }
+    }
+
     let repo = sample_repo();
+    // 公式 decoder の配置先を指定した開発環境では strict モードで全ケースを照合する。
+    // CI に Node の常設依存を増やさないため、未指定時も件数と表記の検証を続ける。
+    let reference_dir = std::env::var("TOON_REFERENCE_DIR").ok();
     for args in [
         vec!["symbols", "--path", "a.rs"],
         vec!["symbols", "--dir", ".", "--glob", "**/*.rs"],
@@ -678,27 +706,82 @@ fn toon_v3_documents_and_batches_decode_with_the_selected_library() {
         let mut toon_args = args.clone();
         toon_args.extend(["--format", "toon"]);
         let text = stdout_of(&run(&repo, &toon_args));
-        let decoded: serde_json::Value =
-            toon_format::decode_strict(&text).unwrap_or_else(|e| panic!("{args:?}: {e}\n{text}"));
         let json = stdout_of(&run(&repo, &args));
         let expected: Vec<serde_json::Value> = json
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        if args.contains(&"--dir") || args.contains(&"--paths") || args.contains(&"--names") {
-            assert_eq!(
-                decoded.as_array().unwrap().len(),
-                expected.len(),
-                "{args:?}"
+        let decoded = reference_dir.as_ref().map(|dir| {
+            use std::io::Write;
+            let mut child = std::process::Command::new("node")
+                .args([
+                    "--input-type=module",
+                    "-e",
+                    "import {decode} from '@toon-format/toon'; import {readFileSync} from 'node:fs'; console.log(JSON.stringify(decode(readFileSync(0, 'utf8'), {strict: true})))",
+                ])
+                .current_dir(dir)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("公式 decoder を起動できること");
+            child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{args:?}: {}\n{text}",
+                String::from_utf8_lossy(&output.stderr)
             );
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+        });
+        if let Some(decoded) = &decoded {
+            if args.contains(&"--dir") || args.contains(&"--paths") || args.contains(&"--names") {
+                assert_json_content(decoded, &serde_json::Value::Array(expected.clone()));
+            } else {
+                assert_json_content(decoded, &expected[0]);
+            }
+        }
+        if args.contains(&"--dir") || args.contains(&"--paths") || args.contains(&"--names") {
+            assert!(
+                text.starts_with(&format!("[{}]:", expected.len()))
+                    || (expected.is_empty() && text == "[]"),
+                "{args:?}: {text}"
+            );
+            if let Some(decoded) = &decoded {
+                assert_eq!(
+                    decoded.as_array().unwrap().len(),
+                    expected.len(),
+                    "{args:?}"
+                );
+            }
         } else if args[0] != "symbols" {
-            assert_eq!(decoded, expected[0], "{args:?}");
-        } else {
+            if let Some(decoded) = &decoded {
+                assert_eq!(decoded, &expected[0], "{args:?}");
+            }
+        } else if let Some(decoded) = &decoded {
             // DTO の欠損列補完は維持する。None の列以外の内容を確認する。
             assert_eq!(decoded["path"], expected[0]["path"]);
             assert_eq!(decoded["symbols"].as_array().unwrap().len(), 3);
             assert_eq!(decoded["symbols"][0]["cx"], serde_json::Value::Null);
         }
         assert!(!text.ends_with('\n'));
+        for line in text.lines() {
+            assert_eq!(line, line.trim_end(), "行末空白を出さないこと: {args:?}");
+        }
+    }
+    if let Some(dir) = reference_dir {
+        let invalid_count = std::process::Command::new("node")
+            .args([
+                "--input-type=module",
+                "-e",
+                "import {decode} from '@toon-format/toon'; try { decode('[2]:\\n  - a: 1', {strict: true}); process.exit(1) } catch { process.exit(0) }",
+            ])
+            .current_dir(dir)
+            .status()
+            .expect("公式 decoder を起動できること");
+        assert!(
+            invalid_count.success(),
+            "strict モードは件数不一致を拒否する"
+        );
     }
 }

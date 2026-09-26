@@ -5,7 +5,7 @@
 | | JSON | TOON | auto |
 |---|---|---|---|
 | Default | ✅ | | |
-| Specification | RFC 8259 | [TOON v3](https://github.com/toon-format/toon-rust) | Whichever is estimated to use fewer tokens |
+| Specification | RFC 8259 | [TOON v4.1](https://github.com/toon-format/spec/blob/main/SPEC.md) | Whichever is estimated to use fewer tokens |
 | `--pretty` | Applies | Ignored (TOON is indented by design) | Applies only when JSON is chosen |
 | Cache | Compact output only | Not used | Not used |
 
@@ -52,9 +52,9 @@ The same content in JSON looks like this. TOON saves the key names that JSON rep
 {"path":"src/main.rs","lang":"rust","symbols":[{"name":"MAX","kind":"const","ln":0},{"name":"alpha","kind":"fn","ln":1,"cx":2},{"name":"beta","kind":"fn","ln":4,"cx":1}]}
 ```
 
-The conversion uses [`toon-format` 0.5.0](https://github.com/toon-format/toon-rust), with `default-features = false` to avoid its CLI/TUI dependencies, and encodes with the default settings (comma delimiter, 2-space indentation). The supported specification is **TOON v3**. An empty array is `[0]:`, and a named empty array is `items[0]:`.
+The encoder in `src/output/toon/` targets **TOON v4.1** with a comma delimiter and two-space indentation. The Rust `toon-format` 0.5.0 crate still targets v3, so it cannot meet the v4.1 encoder requirements. An empty root array is `[]`, and a named empty array is `items: []`.
 
-Single and batch output are verified with the library's strict decoder. No newline is added at the end of the document (JSON / NDJSON end with a newline). How much TOON saves depends on the content; use `--format auto` to choose the format automatically.
+Single and batch output can be checked with the official `@toon-format/toon` v4.1 strict decoder. Install it outside the repository and set `TOON_REFERENCE_DIR` to that directory when running `cargo test toon_v41_documents_and_batches_decode_with_the_reference_implementation`. No newline is added at the end of a TOON document (JSON / NDJSON end with a newline). How much TOON saves depends on the content; use `--format auto` to choose the format automatically.
 
 ## auto: Choose the Format with Fewer Tokens
 
@@ -73,16 +73,16 @@ In BPE tokenizers, **newlines and indentation cost about 1 token per line**, so 
 | `{"a":1,"b":2,"c":3,"d":4}` | 25 | **17** |
 | `a: 1` `b: 2` `c: 3` `d: 4` (4 lines) | **19** | 19 |
 
-The comparison therefore uses `characters + 4 × newlines`. When moving to TOON v3 (2026-09-24), **63 pairs** of single output, batch output, and limited refs output were measured again with tiktoken, and the existing factor of 4 was kept.
+The comparison uses `characters + 3 × newlines`. After the TOON v4.1 change, 90 single, batch, and limited refs output pairs were measured with two tokenizers. Factors 1 through 4 formed a flat minimum; 3 is near its midpoint. Recheck it whenever output shapes change.
 
 | Tokenizer | Factor 3: total loss / max loss | Factor 4: total loss / max loss |
 |---|---:|---:|
-| `o200k_base` | 6 / 6 tokens | 0 / 0 tokens |
-| `cl100k_base` | 12 / 9 tokens | 3 / 3 tokens |
+| `o200k_base` | 0 / 0 tokens | 0 / 0 tokens |
+| `cl100k_base` | 12 / 2 tokens | 12 / 2 tokens |
 
 The loss is the difference from whichever of JSON and TOON actually uses fewer tokens. These figures come from the sample above and are not an upper bound for arbitrary output; the factor is measured again whenever the output shape changes. Leaving a real tokenizer out of the binary avoids the extra data size and the differences between models' tokenizers, and keeps the choice for a given input fixed.
 
-`--token-budget` ([output limits](usage.md#output-limits-and-result_summary)) **does not use this metric as is**. The metric only compares formats with each other, so the absolute value of the factor does not matter. A budget, on the other hand, is an absolute number given by the user ("up to N tokens"). Unless the two scales match, a budget of 3,000 would print only about 900 tokens. The measured `metric / actual tokens` ratio (252 samples × 2 tokenizers) is p05=3.00 / p50=3.42 / min=2.73, so the budget check divides the metric by 3 (rounded toward staying within the budget).
+`--token-budget` ([output limits](usage.md#output-limits-and-result_summary)) uses a separate estimate: `characters + 4 × newlines`, divided by 3 with rounding up. The stronger line penalty keeps indented JSON within the budget; using the format comparison's factor of 3 let a 1,500-token MCP response report 1,517 tokens without an overflow notice. The measured `metric / actual tokens` ratio for the budget estimate (252 samples × 2 tokenizers) is p05=3.00 / p50=3.42 / min=2.73.
 
 ### Properties
 
@@ -129,7 +129,7 @@ An explicit `--format toon` on the command line is an error for these outputs (a
 
 The outer array uses the list form (`- ` items), not the tabular form. The tabular form needs information that is known only after every element has been seen, which conflicts with the design requirement of not buffering all results (keeping peak RSS independent of the number of inputs). The element count `[N]` is known in advance from the number of input paths, so the header alone can be written first. The inner arrays use the tabular form, and they account for most of the savings.
 
-In batch mode, arrays that would become tabular if all elements were converted at once are still printed in the list form. Encoding of each element is left to the library, and tests check that the strict decoder restores the same values. A failed analysis also counts as an element, so the count in the header matches the number of elements printed. `refs --names` already holds every result, so it is converted in one go.
+In batch mode, arrays that would become tabular if all elements were converted at once are still printed in the list form. Each element is encoded independently, and the optional reference test checks that the strict decoder restores the same values. A failed analysis also counts as an element, so the count in the header matches the number of elements printed. `refs --names` already holds every result, so it is converted in one go.
 
 ## Normalizing Nullable Columns
 

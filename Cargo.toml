@@ -29,17 +29,16 @@ memchr = "2.8.3"
 memmap2 = "0.9.11"
 mimalloc = "0.1.52"
 rayon = "1.12.0"
-rmcp = { version = "3.2.0", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "3.3.0", features = ["server", "macros", "transport-io"] }
 schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
 serde_yaml = "0.9.34"
-smallvec = "1.16.0"
+smallvec = "1.16.1"
 streaming-iterator = "0.1.9"
 time = { version = "0.3.55", features = ["formatting", "macros", "local-offset"] }
 tokio = { version = "1.53.1", features = ["full"] }
-toml = "1.1.5"
-toon-format = { version = "0.5.0", default-features = false }
+toml = "1.1.6"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
