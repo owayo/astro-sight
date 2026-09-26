@@ -77,19 +77,19 @@ run: ## Run the debug binary (arguments via ARGS="...")
 test: ## Run the tests
 	$(RUN) cargo test $(CARGO_FLAGS)
 
-# clippy runs with --all-features so that the dhat-heap code is checked too. The default-feature
-# side (#[cfg(not(feature = "dhat-heap"))]) is compiled by the cargo check in check and by test.
+# clippy runs twice: with the default features (the released binary, #[cfg(not(feature = "dhat-heap"))])
+# and with --all-features so that the dhat-heap code is checked too.
 lint: ## Run clippy with warnings as errors
+	$(RUN) cargo clippy $(CARGO_FLAGS) --all-targets -- -D warnings
 	$(RUN) cargo clippy $(CARGO_FLAGS) --all-targets --all-features -- -D warnings
 
 fmt: ## Format the code (rewrites files)
-	$(RUN) cargo fmt
+	$(RUN) cargo fmt --all
 
 fmt-check: ## Check the formatting (no changes)
-	$(RUN) cargo fmt -- --check
+	$(RUN) cargo fmt --all -- --check
 
-check: fmt-check lint ## Run fmt-check and lint (no changes), then cargo check with the default features
-	$(RUN) cargo check $(CARGO_FLAGS)
+check: fmt-check lint ## Run fmt-check and lint (no changes)
 
 ci: check test ## Run the same checks as CI (no changes)
 
