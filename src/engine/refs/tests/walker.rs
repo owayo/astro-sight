@@ -267,6 +267,11 @@ int run(int v) { return CLAMP(v) + MULTI(v); }
         ),
         ("equiv.sh", bash_src, &["cleanup_signal", "cleanup_exit"]),
         (
+            "equiv.zsh",
+            "load_record\nfunction check_revision() {\ncase $1 in\n9.<2->*) return 0 ;;\nesac\n}\nload_record() {\nif { read record } < <(echo sample); then :; fi\n}\n",
+            &["check_revision", "load_record"],
+        ),
+        (
             "equiv.php",
             php_src,
             &["provideData", "attrData", "handle", "testThing"],
@@ -352,6 +357,11 @@ int run(int v) { return CLAMP(v) + MULTI(v); }
                 .unwrap_or(0)
         };
         match *fname {
+            "equiv.zsh" => {
+                assert!(batch[1].iter().any(|r| r.kind == Some(RefKind::Unknown)));
+                assert!(batch[1].iter().any(|r| r.kind == Some(RefKind::Reference)));
+                assert_eq!(count_of("load_record"), 2);
+            }
             // is_none は属性文字列内にのみ出現するので、非定義参照 = rust_attr 発火。
             "equiv.rs" => assert!(count_of("is_none") >= 1, "rust_attr synthetic must fire"),
             // cleanup_exit は trap 内にのみ出現するので、非定義参照 = bash_trap 発火。

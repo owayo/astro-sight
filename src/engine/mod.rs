@@ -1,4 +1,5 @@
 pub mod angular_template_refs;
+pub(crate) mod bash_parse_recovery;
 pub mod bash_trap_refs;
 pub(crate) mod bounded_read;
 pub mod calls;

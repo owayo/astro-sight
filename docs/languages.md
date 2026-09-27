@@ -33,3 +33,5 @@ All 16 languages get precise symbol extraction through tree-sitter queries. Ruby
 > package `tree-sitter` links to the native library `tree-sitter`, but it conflicts with a previous package which links to `tree-sitter` as well:
 > package `tree-sitter v0.27.0`
 > ```
+
+`.zsh` files and zsh shebang scripts use the Bash grammar, not a native zsh parser. When parsing fails, `symbols` and `ast` identify this fallback in a diagnostic. Declarations inside `ERROR` regions may be absent from `symbols`; recognizable top-level declaration headers appear as `kind: "unknown"` in `refs`.

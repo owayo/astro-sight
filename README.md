@@ -35,6 +35,8 @@ astro-sight answers the structural questions an AI coding agent has while it edi
 
 It matches identifier nodes in the tree-sitter syntax tree, so `refs --name new` does not pick up comments or strings the way `grep new` does. Output is compact JSON by default, with TOON or automatic selection when tokens matter, and the same queries run from the CLI, an NDJSON session, or an MCP server.
 
+Bash/zsh parse failures are reported explicitly: recognizable declarations inside error regions use `refs.kind: "unknown"`, and `review` separates unverified removals from confirmed deletions. See [shell parse errors](docs/diff-analysis.md#shell-parse-errors).
+
 ## Features
 
 - **References by identifier**: `refs` lists the definitions and references of a symbol across a directory, and `refs --names` looks up many names in one pass

@@ -29,6 +29,8 @@ compact 出力例（ast/symbols）:
 
 `ast` / `symbols` に `--full` を付けると、キーを短縮しない完全な形式（`location`, `language`, `hash`, `range` など）で出力する。`--pretty` は字下げするだけで、キーは短縮したまま変わらない（`calls` だけは `--pretty` で完全な形式になる）。`version` フィールドを含むのは `doctor` と MCP の `initialize` 応答だけ。
 
+Bash / zsh の解析エラー内にある宣言候補では、`refs.kind` は `"unknown"` になる。JSON と TOON で同じ値を使い、出力制限時の `result_summary.by_kind` でも別に集計する。出現自体は残すが、定義とも利用とも断定しない。
+
 ## TOON とは
 
 [TOON](https://toonformat.dev/)（Token-Oriented Object Notation）は JSON と同じデータモデルを、インデントと表形式で表現するフォーマット。同じ内容をより少ないトークンで LLM に渡せる。

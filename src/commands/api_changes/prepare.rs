@@ -48,6 +48,8 @@ pub(crate) fn should_skip_diff_file(
 pub(crate) struct ApiChangeBuckets {
     pub(crate) added: Vec<ApiSymbolCandidate>,
     pub(crate) removed: Vec<ApiSymbolCandidate>,
+    pub(crate) uncertain_removals: Vec<crate::models::review::UncertainApiRemoval>,
+    pub(crate) parse_truncations: Vec<crate::models::truncation::TruncationInfo>,
     pub(crate) modified: Vec<ApiSymbolChange>,
     pub(crate) modified_closed_in_diff: Vec<ApiSymbolChange>,
     pub(crate) const_value_changes: Vec<ApiSymbolChange>,
@@ -87,6 +89,8 @@ pub(crate) struct AddedFileFacts<'a> {
 
 /// 変更ファイル 1 件について Phase 0 で先取り済みの事実。
 pub(crate) struct ModifiedFileFacts<'a> {
+    pub(crate) unparsed_declarations:
+        &'a [crate::engine::bash_parse_recovery::UnparsedBashDeclaration],
     pub(crate) old_syms: &'a [(String, String, String)],
     pub(crate) new_syms: &'a [(String, String, String)],
     pub(crate) in_file_callees: &'a HashSet<String>,
@@ -129,6 +133,7 @@ pub(crate) enum PreparedDiffFile {
     },
     /// 通常の modified ファイル。
     Modified {
+        unparsed_declarations: Vec<crate::engine::bash_parse_recovery::UnparsedBashDeclaration>,
         old_syms: Option<Vec<(String, String, String)>>,
         new_syms: Option<Vec<(String, String, String)>>,
         in_file_callees: std::collections::HashSet<String>,
@@ -285,6 +290,9 @@ pub(crate) fn find_mod_decl_visibility(
 /// - `export_surface_names`: `is_safe_diff_path` かつ TS/TSX/JS/Rust のみ、それ以外は空。
 ///   TS/JS は named export clause (from 句の有無を問わず)、Rust は `pub use` が公開する名前
 pub(crate) struct NewFileFacts {
+    pub(crate) unparsed_declarations:
+        Vec<crate::engine::bash_parse_recovery::UnparsedBashDeclaration>,
+    pub(crate) parse_truncations: Vec<crate::models::truncation::TruncationInfo>,
     pub(crate) exported: Option<Vec<(String, String, String)>>,
     pub(crate) callees: std::collections::HashSet<String>,
     pub(crate) export_surface_names: std::collections::HashSet<String>,
@@ -296,6 +304,8 @@ pub(crate) struct NewFileFacts {
 
 pub(crate) fn extract_new_file_facts(dir: &str, file_path: &str) -> NewFileFacts {
     let mut facts = NewFileFacts {
+        unparsed_declarations: Vec::new(),
+        parse_truncations: Vec::new(),
         exported: None,
         callees: std::collections::HashSet::new(),
         export_surface_names: std::collections::HashSet::new(),
@@ -337,6 +347,18 @@ pub(crate) fn extract_new_file_facts(dir: &str, file_path: &str) -> NewFileFacts
         return facts;
     };
     let root = tree.root_node();
+
+    if lang_id == crate::language::LangId::Bash && root.has_error() {
+        use crate::engine::bash_parse_recovery::{parse_error_message, unparsed_declarations};
+        facts.unparsed_declarations = unparsed_declarations(root, &source);
+        facts
+            .parse_truncations
+            .push(crate::models::truncation::TruncationInfo {
+                path: Some(file_path.to_owned()),
+                reason: crate::models::truncation::TruncationReason::ParseErrorRegion,
+                message: parse_error_message(file_path, &source).to_owned(),
+            });
+    }
 
     // callees: test/safe ガードなし (extract_in_file_callees と一致)。
     facts.callees =

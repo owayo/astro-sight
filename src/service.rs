@@ -288,7 +288,7 @@ impl AppService {
         response.hash = Some(CacheStore::hash(&source));
         response.ast = Some(ast_nodes);
         response.snippet = snip;
-        collect_diagnostics(root, &mut response);
+        collect_diagnostics(root, &source, &mut response);
         debug!(
             path = p.path,
             language = ?lang_id,
@@ -360,7 +360,7 @@ impl AppService {
         let mut response = AstgenResponse::success(location, lang_id);
         response.hash = Some(CacheStore::hash(&source));
         response.symbols = Some(syms);
-        collect_diagnostics(root, &mut response);
+        collect_diagnostics(root, &source, &mut response);
         debug!(
             path = path,
             language = ?lang_id,
@@ -896,9 +896,23 @@ fn relativize_paths(
 // 診断情報ヘルパー（AppService の全コード経路で共有）
 // ---------------------------------------------------------------------------
 
-fn collect_diagnostics(root: tree_sitter::Node<'_>, response: &mut AstgenResponse) {
+fn collect_diagnostics(root: tree_sitter::Node<'_>, source: &[u8], response: &mut AstgenResponse) {
     if root.has_error() {
         collect_error_nodes(root, &mut response.diagnostics);
+        if response.language == crate::language::LangId::Bash {
+            response
+                .diagnostics
+                .push(crate::models::diagnostic::Diagnostic {
+                    severity: crate::models::diagnostic::Severity::Warning,
+                    message: crate::engine::bash_parse_recovery::parse_error_message(
+                        &response.location.path,
+                        source,
+                    )
+                    .to_owned(),
+                    line: None,
+                    column: None,
+                });
+        }
     }
 }
 

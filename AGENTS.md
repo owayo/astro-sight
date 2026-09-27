@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **Bash / zsh の解析エラー** — `engine/bash_parse_recovery.rs` が ERROR 内のトップレベル関数ヘッダだけを API 差分と refs で共有する。新旧とも Bash 文法で解析し、同名が各 1 件の場合に限り `uncertain_removals`（hook: `rm_unverified`）へ分ける。旧側の拡張子なしファイルは旧 blob の shebang で判定し、他言語からシェルへの置き換えによる削除を降格しない。実削除・同名複数定義・文字列や heredoc の曖昧な内容は従来の保守的な判定に残す。疑似シンボルは作らない。`refs` は候補を `unknown` として返し、count / visitor は過少計上を避けるため出現を保持する。変更後の Bash 木に ERROR があれば `parse_error_region` を申告し、zsh の symbols / ast 診断には Bash 文法による代替解析であることを示す。
+
 - **Python 関数ヘッダの整形** — `engine/python_signature.rs` の AST トークン正規化を API 差分・省略可能な引数追加の互換判定・impact の宣言比較で共有する。トークン間の空白、通常コメント、引数リストの末尾カンマだけを整形差として除く。文字列全体 (f-string を含む)・タプルのカンマ・`# type:` コメントは保持する。impact の行比較結果を打ち消すのは、新旧が解析可能で同名宣言が各 1 件の場合だけ。同名メソッド・overload・復元失敗・構文エラーでは従来の検出を維持する。この打ち消しは Python に限定し、他言語の既存の末尾カンマ比較へ広げない。
 - **AppService 層** — CLI / Session / MCP の統一コアロジック（`src/service.rs`）
 - **tree-sitter** ベースの構文解析エンジン（16言語対応）

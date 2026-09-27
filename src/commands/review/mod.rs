@@ -183,7 +183,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
     })?;
 
     // 5. API 公開面の差分 (内容同一の rename も含めて見る。`api_diff_files` 参照)
-    let api_changes = timed("api_changes", || {
+    let mut api_changes = timed("api_changes", || {
         detect_api_changes(dir, base, &api_diff_files(&diff_files, &diff_input))
     });
 
@@ -208,6 +208,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
     } = dead_phase;
     let mut truncations = truncations;
     truncations.extend(dead_truncations);
+    truncations.append(&mut api_changes.parse_truncations);
 
     let result = ReviewResult {
         impact,

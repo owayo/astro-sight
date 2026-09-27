@@ -356,3 +356,11 @@ fixtures/hand-maintained.yaml -linguist-generated
 ```
 
 除外しても**残った起点の分母は変わらない**（生成物が同居していたコミットを分母から抜くと `1/2` が `1/1` に化けて選択バイアスになるため）。除外件数は `diagnostics` の `excluded_generated_sources` / `filtered_generated_candidates` に出る。`git check-attr` を実行できない場合は除外を一切行わず（`GeneratedAttrLookupFailed` を申告）、判定できないことを理由に候補を消さない。グローバルの `--include-generated`（`config.toml` の `skip_generated = false` も同義）で、生成物も対象にできる。この指定は単体の `cochange` だけでなく `review` の `missing_cochanges` にも効く。
+
+## シェルの解析エラー
+
+この分類は変更前・変更後の双方が Bash 文法のときだけ適用する。別言語の API をシェルへ置き換えた場合は、同名の関数ヘッダが残っても旧 API の削除判定を維持する。拡張子なしファイルは変更前の shebang も確認する。
+
+Bash / zsh の関数が抽出結果から消えても、`ERROR` 内に同名の宣言ヘッダが残る場合、`review` は削除と断定せず `api_changes.uncertain_removals` に分類する。名前・ファイル・0 始まりの行番号・旧シグネチャ・`reason: "parse_error_region"` を返す。hook では `api.rm_unverified` の `{n,f,l,r}` となる。この項目自体は情報提供であり、同じファイルの確定した削除は引き続き blocking になる。同名の複数定義や、文字列・heredoc か判別できない内容では、従来の保守的な削除判定を維持する。
+
+解析エラーを含む変更後の Bash / zsh ファイルは、`truncations`（hook: `trunc`）にも `parse_error_region` として申告する。その範囲の宣言・参照・シグネチャ変更は未検証であり、exit 0 は互換性の保証ではない。推測したシンボルは追加せず、正常に解析できた領域の検証は続ける。

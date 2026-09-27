@@ -563,7 +563,7 @@ pub(crate) fn count_internal_refs(
     let self_path = std::path::Path::new(file);
     let mut count = 0usize;
     for r in refs {
-        if r.kind == Some(RefKind::Definition) {
+        if matches!(r.kind, Some(RefKind::Definition | RefKind::Unknown)) {
             continue;
         }
         if std::path::Path::new(r.path.as_str()) != self_path {

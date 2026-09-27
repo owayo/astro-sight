@@ -232,6 +232,7 @@ pub(crate) struct RefEnvironment<'a> {
     /// Rust の closure 束縛判定で使う名前別メモ。walk 1 回 (= 1 ファイル) の寿命に
     /// 閉じることで、ポインタ再利用による前ファイル結果の誤用を構造的に防ぐ。
     rust_binding_cache: RustPatternBindingCache,
+    bash_declarations: Vec<crate::engine::bash_parse_recovery::UnparsedBashDeclaration>,
 }
 
 impl RefEnvironment<'_> {
@@ -346,6 +347,10 @@ impl RawRefSink for SymbolReferenceSink<'_> {
     fn on_hit(&mut self, hit: RawRefHit<'_, '_>, env: &RefEnvironment<'_>) {
         let kind = Some(if hit.is_def {
             RefKind::Definition
+        } else if matches!(hit.origin, HitOrigin::Identifier(node)
+            if env.bash_declarations.binary_search_by_key(&node.start_byte(), |d| d.byte).is_ok())
+        {
+            RefKind::Unknown
         } else {
             RefKind::Reference
         });
@@ -488,8 +493,18 @@ fn visit_ref_node<M: RefMatcher, S: RawRefSink>(
     // (1) identifier ノード。ガード順 (matches → struct field 除外 → ignored 除外) は
     //     旧 collect 経路と同一。is_def は sink 側で用途が分かれるため常に算出する
     //     (count は Definition を弾き、collect/visitor は kind に反映)。
-    if is_identifier_kind(node.kind())
-        && let Ok(text) = node.utf8_text(source)
+    // extglob 回復ではノードが `name()` 全体を含むこともある。共通判定が返した
+    // 名前だけを照合し、括弧を含む文字列で検索して取りこぼさない。
+    let recovered_name = (node.kind() == "extglob_pattern")
+        .then(|| {
+            env.bash_declarations
+                .binary_search_by_key(&node.start_byte(), |d| d.byte)
+                .ok()
+        })
+        .flatten()
+        .map(|ix| env.bash_declarations[ix].name.as_str());
+    if (is_identifier_kind(node.kind()) || recovered_name.is_some())
+        && let Some(text) = recovered_name.or_else(|| node.utf8_text(source).ok())
         && let Some(matches) = matcher.identifier_matches(node, text)
         && !(S::EXCLUDES_NON_CALLABLE_FIELDS
             && lang_id == LangId::Rust
@@ -602,6 +617,13 @@ pub(crate) fn run_ref_walk<M: RefMatcher, S: RawRefSink>(
         line_index: line_index.as_ref(),
         lang_id,
         rust_binding_cache: RustPatternBindingCache::default(),
+        // ERROR 回復が extglob とした宣言も全経路で保持する。count / visitor は
+        // 未検証の出現を保守的に数え、refs の出力だけを unknown に分類する。
+        bash_declarations: if lang_id == LangId::Bash {
+            crate::engine::bash_parse_recovery::unparsed_declarations(root, source)
+        } else {
+            Vec::new()
+        },
     };
     walk_refs(root, matcher, sink, &env, definition_kinds);
 }

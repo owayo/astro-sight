@@ -27,6 +27,8 @@ pub struct TruncationInfo {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TruncationReason {
+    /// 代替文法を含む構文解析の ERROR 内は、宣言・参照・契約変更を検証できない。
+    ParseErrorRegion,
     /// 未追跡ファイルが `--git` 合成 diff の取り込み上限を超えたため対象外にした。
     UntrackedFileTooLarge,
     /// ソースコードだがどのバックエンドでも解析できず、走査対象から外れた

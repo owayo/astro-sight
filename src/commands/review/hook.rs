@@ -142,7 +142,17 @@ struct HookTruncation<'a> {
 }
 
 #[derive(Serialize)]
+struct HookUncertainRemoval<'a> {
+    n: &'a str,
+    f: &'a str,
+    l: usize,
+    r: crate::models::truncation::TruncationReason,
+}
+
+#[derive(Serialize)]
 struct HookApi<'a> {
+    #[serde(rename = "rm_unverified", skip_serializing_if = "Vec::is_empty")]
+    uncertain_removals: Vec<HookUncertainRemoval<'a>>,
     #[serde(rename = "add", skip_serializing_if = "Vec::is_empty")]
     added: Vec<HookAddedSymbol<'a>>,
     /// `add` の抽出条件の自己記述。`add` には「新規 export のうち同一 diff の**他ファイル**
@@ -193,6 +203,16 @@ impl<'a> HookApi<'a> {
         let added_scope = (!added.is_empty()).then_some("no_cross_file_refs_in_diff");
         Self {
             added,
+            uncertain_removals: api
+                .uncertain_removals
+                .iter()
+                .map(|s| HookUncertainRemoval {
+                    n: &s.name,
+                    f: &s.file,
+                    l: s.line,
+                    r: s.reason,
+                })
+                .collect(),
             added_scope,
             removed: api
                 .removed
@@ -252,6 +272,7 @@ impl<'a> HookApi<'a> {
 
     fn is_empty(&self) -> bool {
         self.added.is_empty()
+            && self.uncertain_removals.is_empty()
             && self.removed.is_empty()
             && self.modified.is_empty()
             && self.modified_closed_in_diff.is_empty()
@@ -505,6 +526,9 @@ pub(crate) fn build_review_hook_json_for_diff(
             .map(|t| HookTruncation {
                 f: t.path.as_deref(),
                 r: match t.reason {
+                    crate::models::truncation::TruncationReason::ParseErrorRegion => {
+                        "parse_error_region"
+                    }
                     crate::models::truncation::TruncationReason::UntrackedFileTooLarge => {
                         "untracked_file_too_large"
                     }

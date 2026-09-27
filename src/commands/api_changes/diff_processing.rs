@@ -417,6 +417,23 @@ fn collect_removed_symbols(
     // 同名が新側にも残る削除 (overload の片方など)。名前の有無だけで判定すると検出
     // できないが、件数が減り旧シグネチャも残っていない以上、消えた定義があるので曖昧ではない。
     let same_name_removals = same_name_surplus_mask(old_syms, new_syms);
+    let mut unparsed_by_name = std::collections::HashMap::<&str, Vec<_>>::new();
+    let mut old_name_counts = std::collections::HashMap::<&str, usize>::new();
+    // 旧側も Bash 文法で解析していた場合だけ照合する。別言語の同名 API を
+    // シェルへ置き換えた削除は抑制しない。拡張子なしの旧 shebang も確認する。
+    if !facts.unparsed_declarations.is_empty()
+        && base_blobs.read(&df.old_path).is_some_and(|source| {
+            parser::detect_lang(camino::Utf8Path::new(&df.old_path), &source).ok()
+                == Some(crate::language::LangId::Bash)
+        })
+    {
+        for decl in facts.unparsed_declarations {
+            unparsed_by_name.entry(&decl.name).or_default().push(decl);
+        }
+        for (name, _, _) in old_syms {
+            *old_name_counts.entry(name).or_default() += 1;
+        }
+    }
     // TS/JS: 新ツリーで export clause (`export { name } from "..."` / `import ...;
     // export { name };`) により name が公開され続けているシンボルは、利用者から見た
     // API 面が維持されているため api.rm から除外する。
@@ -444,6 +461,26 @@ fn collect_removed_symbols(
                     file: df.old_path.clone(),
                     signature: sig.clone(),
                 });
+                continue;
+            }
+            // 同名宣言が 1 件ずつの場合だけ、ERROR 内のヘッダを未検証の証拠にする。
+            // 複数定義の一部削除を隠さず、move / dead の相殺にも流さない。
+            if kind == "function"
+                && old_name_counts.get(name.as_str()) == Some(&1)
+                && let Some(decls) = unparsed_by_name.get(name.as_str())
+                && let [decl] = decls.as_slice()
+            {
+                state
+                    .buckets
+                    .uncertain_removals
+                    .push(crate::models::review::UncertainApiRemoval {
+                        name: name.clone(),
+                        kind: kind.clone(),
+                        file: df.new_path.clone(),
+                        line: decl.line,
+                        old_signature: sig.clone(),
+                        reason: crate::models::truncation::TruncationReason::ParseErrorRegion,
+                    });
                 continue;
             }
             // closed-in-diff for api.rm: 同ファイルに新規追加されたシンボルがあり、削除された

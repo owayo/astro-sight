@@ -3,13 +3,15 @@ use serde::{Deserialize, Serialize};
 use super::result_summary::{ResultSummary, RollupRecord};
 use super::skip::SkippedFiles;
 
-/// 参照の種類（定義または利用）。
+/// 参照の種類（定義・利用・解析不能な宣言候補）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RefKind {
     #[serde(rename = "def")]
     Definition,
     #[serde(rename = "ref")]
     Reference,
+    #[serde(rename = "unknown")]
+    Unknown,
 }
 
 /// 参照の確信度レベル。
@@ -59,6 +61,7 @@ impl RollupRecord for SymbolReference {
         match self.kind? {
             RefKind::Definition => Some("def"),
             RefKind::Reference => Some("ref"),
+            RefKind::Unknown => Some("unknown"),
         }
     }
 }

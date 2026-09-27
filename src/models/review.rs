@@ -80,6 +80,13 @@ pub struct MissingCochange {
 pub struct ApiChanges {
     pub added: Vec<ApiSymbol>,
     pub removed: Vec<ApiSymbol>,
+    /// 解析エラー内に同名の宣言ヘッダが残り、削除と断定できない候補。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub uncertain_removals: Vec<UncertainApiRemoval>,
+    /// review のトップレベルへ合流する解析範囲の申告。
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub parse_truncations: Vec<crate::models::truncation::TruncationInfo>,
     pub modified: Vec<ApiSymbolChange>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub moved: Vec<MovedSymbol>,
@@ -105,6 +112,17 @@ pub struct ApiChanges {
     /// (Issue 2026-06-02-react-memo / 2026-06-02-provider-avatar 対応)。
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub compatible_modified: Vec<CompatibleApiModification>,
+}
+
+/// 新側の宣言候補の位置 (0-based) と、比較できなかった旧シグネチャ。
+#[derive(Debug, Clone, Serialize)]
+pub struct UncertainApiRemoval {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: usize,
+    pub old_signature: String,
+    pub reason: crate::models::truncation::TruncationReason,
 }
 
 /// 公開シンボル情報。

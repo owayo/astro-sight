@@ -1607,3 +1607,245 @@ fn review_git_hook_reports_rename_to_unsupported_extension_as_removal() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// zsh の代替解析で宣言を失っても、削除の断定と解析範囲の申告を混同しない。
+#[test]
+fn zsh_parse_errors_are_visible_in_review_refs_and_diagnostics() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let before = include_str!("../fixtures/bash_parse_recovery/before.zsh");
+    let after = include_str!("../fixtures/bash_parse_recovery/after.zsh");
+    repo.write("sample.zsh", before);
+    repo.write(
+        "consumer.zsh",
+        "source ./sample.zsh\ncheck_revision 9.5\nload_record\ngone\n",
+    );
+    repo.commit_all("base");
+    repo.write("sample.zsh", after);
+
+    let review = repo.run_json("review", &["--git"]);
+    assert_eq!(review["api_changes"]["removed"], serde_json::json!([]));
+    assert_eq!(
+        review["api_changes"]["uncertain_removals"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(review["truncations"][0]["reason"], "parse_error_region");
+    assert!(
+        review["truncations"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("zsh parsed with Bash grammar")
+    );
+    let hook = cargo_bin()
+        .args(["review", "--git", "--hook", "--dir"])
+        .arg(repo.root())
+        .output()
+        .unwrap();
+    assert!(
+        hook.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hook.stderr)
+    );
+    let hook: serde_json::Value = serde_json::from_slice(&hook.stderr).unwrap();
+    assert_eq!(hook["api"]["rm_unverified"].as_array().unwrap().len(), 2);
+    assert!(hook["api"].get("rm").is_none() && hook["api"].get("rm_dead").is_none());
+    assert_eq!(hook["trunc"][0]["r"], "parse_error_region");
+
+    let refs = repo.run_json(
+        "refs",
+        &[
+            "--name",
+            "load_record",
+            "--max-results",
+            "unlimited",
+            "--token-budget",
+            "unlimited",
+        ],
+    );
+    let refs = refs["refs"].as_array().unwrap();
+    assert!(
+        refs.iter()
+            .any(|r| r["path"] == "sample.zsh" && r["kind"] == "unknown")
+    );
+    assert!(
+        refs.iter()
+            .any(|r| r["path"] == "consumer.zsh" && r["kind"] == "ref")
+    );
+    // 打ち切り集計にも unknown が残る。
+    let limited = repo.run_json("refs", &["--name", "load_record", "--max-results", "1"]);
+    assert_eq!(limited["result_summary"]["by_kind"]["unknown"], 1);
+    for command in ["symbols", "ast"] {
+        for file in ["sample.zsh", "runner"] {
+            repo.write(file, after);
+            let result = cargo_bin()
+                .args([command, "--path"])
+                .arg(repo.path(file))
+                .output()
+                .unwrap();
+            assert!(result.status.success());
+            let result: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert!(
+                result["diagnostics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|d| d["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("zsh parsed with Bash grammar")),
+                "{result}"
+            );
+        }
+    }
+    repo.remove_file("runner");
+    // ERROR と同居する実削除は hook を引き続き失敗させる。
+    repo.write("sample.zsh", format!("{before}function gone() {{ :; }}\n"));
+    repo.commit_all("add removable function");
+    repo.write("sample.zsh", after);
+    let hook = cargo_bin()
+        .args(["review", "--git", "--hook", "--dir"])
+        .arg(repo.root())
+        .output()
+        .unwrap();
+    assert_eq!(hook.status.code(), Some(1));
+    let hook: serde_json::Value = serde_json::from_slice(&hook.stderr).unwrap();
+    assert!(
+        hook["api"]["rm"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["n"] == "gone"),
+        "{hook}"
+    );
+}
+
+/// 解析エラー内の別スコープに同名ヘッダが残っていても、実削除は exit 1 を維持する。
+#[test]
+fn zsh_parse_errors_keep_real_deletions_blocking_with_nested_lookalikes() {
+    let after = include_str!("../fixtures/bash_parse_recovery/after.zsh");
+    for opener in [
+        "x=$(\n",
+        "cat <(\n",
+        "cat >(\n",
+        "outer() {\n",
+        "(\n",
+        "$((\n",
+        "((\n",
+        "[[\n",
+        "x=$[\n",
+        "echo $'\n",
+    ] {
+        let source = format!("{opener}{}", after.replace("load_record", "gone"));
+        let hook = a3_review_hook(
+            |root| std::fs::write(root.join("sample.zsh"), &source).unwrap(),
+            &[
+                ("sample.zsh", "function gone() { :; }\n"),
+                ("consumer.zsh", "source ./sample.zsh\ngone\n"),
+            ],
+        );
+        assert_eq!(
+            hook.status.code(),
+            Some(1),
+            "{opener:?}: {}",
+            String::from_utf8_lossy(&hook.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&hook.stderr).unwrap();
+        assert!(
+            json["api"]["rm"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["n"] == "gone"),
+            "{json}"
+        );
+        assert!(json["api"].get("rm_unverified").is_none(), "{json}");
+    }
+}
+
+/// 別言語の API をシェルへ置き換えた削除は、同名ヘッダが残っても未確認へ降格しない。
+#[test]
+fn zsh_parse_errors_keep_cross_language_removals_blocking() {
+    let shell_before = include_str!("../fixtures/bash_parse_recovery/before.zsh");
+    let after = include_str!("../fixtures/bash_parse_recovery/after.zsh");
+    for (old_path, new_path, before, is_shell) in [
+        (
+            "sample.ts",
+            "sample.zsh",
+            "export function load_record() { return 1; }\n",
+            false,
+        ),
+        (
+            "runner",
+            "runner",
+            "#!/usr/bin/env python3\ndef load_record():\n    return 1\n",
+            false,
+        ),
+        ("runner", "runner", shell_before, true),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.write(old_path, before);
+        if old_path.ends_with(".ts") {
+            repo.write(
+                "consumer.ts",
+                "import { load_record } from './sample';\nload_record();\n",
+            );
+        } else if is_shell {
+            repo.write("consumer.zsh", "load_record\n");
+        } else {
+            repo.write(
+                "consumer.py",
+                "from runner import load_record\nload_record()\n",
+            );
+        }
+        repo.commit_all("base");
+        if old_path != new_path {
+            repo.remove_file(old_path);
+        }
+        repo.write(new_path, after);
+        let diff = format!(
+            "diff --git a/{old_path} b/{new_path}\n--- a/{old_path}\n+++ b/{new_path}\n@@ -1,{} +1,{} @@\n{}{}",
+            before.lines().count(),
+            after.lines().count(),
+            before
+                .lines()
+                .map(|s| format!("-{s}\n"))
+                .collect::<String>(),
+            after.lines().map(|s| format!("+{s}\n")).collect::<String>(),
+        );
+        repo.write("change.diff", diff);
+        let hook = cargo_bin()
+            .args(["review", "--dir"])
+            .arg(repo.root())
+            .args(["--diff-file"])
+            .arg(repo.path("change.diff"))
+            .args(["--base", "HEAD", "--hook"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            hook.status.code(),
+            Some(if is_shell { 0 } else { 1 }),
+            "{old_path} shell={is_shell}: {}",
+            String::from_utf8_lossy(&hook.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&hook.stderr).unwrap();
+        if is_shell {
+            // 拡張子なしでも、旧 shebang が zsh なら同じ解析不能を未確認として示す。
+            assert_eq!(json["api"]["rm_unverified"].as_array().unwrap().len(), 2);
+            assert!(json["api"].get("rm").is_none(), "{json}");
+        } else {
+            assert!(
+                json["api"]["rm"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["n"] == "load_record"),
+                "{json}"
+            );
+            assert!(json["api"].get("rm_unverified").is_none(), "{json}");
+        }
+    }
+}

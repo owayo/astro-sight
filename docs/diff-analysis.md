@@ -356,3 +356,11 @@ fixtures/hand-maintained.yaml -linguist-generated
 ```
 
 **The denominators of the remaining starting points do not change** with the exclusion (removing commits in which generated files were present from the denominator would turn `1/2` into `1/1`, a selection bias). The numbers of exclusions are in `excluded_generated_sources` / `filtered_generated_candidates` of `diagnostics`. When `git check-attr` cannot be run, nothing is excluded at all (reported as `GeneratedAttrLookupFailed`), and candidates are not removed just because the decision is impossible. The global `--include-generated` (or the equivalent `skip_generated = false` in `config.toml`) includes generated output too. The option affects not only the standalone `cochange` but also `missing_cochanges` of `review`.
+
+## Shell parse errors
+
+This classification applies only when both versions use the Bash grammar. Replacing an API from another language with a shell function of the same name retains the existing deletion checks. Extensionless files are checked against their original shebang as well.
+
+If a Bash/zsh function disappears from the parsed symbols but its declaration header remains inside an `ERROR` region, `review` reports it in `api_changes.uncertain_removals` instead of confirming a deletion. Each item includes the name, file, zero-based line, old signature, and `reason: "parse_error_region"`. The hook emits `api.rm_unverified` with `{n,f,l,r}`. These entries are informational; a confirmed deletion in the same file still blocks. Duplicate declarations and ambiguous string/heredoc contents keep the existing conservative deletion checks.
+
+`truncations` (hook: `trunc`) also reports `parse_error_region` for changed Bash/zsh files with parser errors. This means declarations, references, and signature changes in those regions could not be verified; exit 0 does not establish compatibility. The parser does not invent replacement symbols, and the analysis of healthy regions continues.

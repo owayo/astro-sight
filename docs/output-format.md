@@ -29,6 +29,8 @@ Compact output (ast/symbols):
 
 `--full` on `ast` / `symbols` prints the complete form with unshortened keys (`location`, `language`, `hash`, `range`, and so on). `--pretty` only indents and keeps the keys shortened (only `calls` switches to the complete form with `--pretty`). Only `doctor` and the MCP `initialize` response include a `version` field.
 
+For Bash/zsh declaration headers inside parse errors, `refs.kind` can also be `"unknown"`. JSON and TOON use the same value, and limited-output `result_summary.by_kind` counts it separately. The occurrence is retained; it is neither a verified definition nor a verified use.
+
 ## What TOON Is
 
 [TOON](https://toonformat.dev/) (Token-Oriented Object Notation) expresses the JSON data model with indentation and tables. It hands the same content to an LLM in fewer tokens.

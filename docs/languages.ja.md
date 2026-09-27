@@ -33,3 +33,5 @@
 > package `tree-sitter` links to the native library `tree-sitter`, but it conflicts with a previous package which links to `tree-sitter` as well:
 > package `tree-sitter v0.27.0`
 > ```
+
+`.zsh` と zsh shebang のスクリプトは Bash 文法で代替解析する。解析エラーがある場合は `symbols` / `ast` の診断に代替解析であることを表示する。`ERROR` 内の宣言は `symbols` から欠けることがあり、トップレベルの宣言ヘッダを識別できた出現は `refs` で `kind: "unknown"` として返す。

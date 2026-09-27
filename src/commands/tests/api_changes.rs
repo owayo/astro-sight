@@ -5,6 +5,7 @@ mod compatibility_react;
 mod declaration_coverage;
 mod general;
 mod other_languages;
+mod parse_errors;
 mod python;
 mod removal;
 mod rename_move;

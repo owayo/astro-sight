@@ -114,6 +114,7 @@ pub(crate) fn detect_api_changes(
         if df.old_path == "/dev/null" {
             // new_path を 1 回 read+parse して exported / callees を導出 (perf #2)。
             let facts = extract_new_file_facts(dir, &df.new_path);
+            buckets.parse_truncations.extend(facts.parse_truncations);
             let new_syms = facts.exported;
             let in_file_callees = facts.callees;
             if let Some(syms) = &new_syms {
@@ -159,6 +160,7 @@ pub(crate) fn detect_api_changes(
         // export surface は process_modified_file が再 parse せず使えるよう
         // PreparedDiffFile に持たせる。
         let facts = extract_new_file_facts(dir, &df.new_path);
+        buckets.parse_truncations.extend(facts.parse_truncations);
         // 対応言語でないファイルへの rename (`api.ts` → `api.ts.bak`) は、新側に API 面が
         // 無いので旧ファイルの削除と同じ。変更ファイルとして扱うと新側のシンボルが取れず
         // 何も検出されない (旧 API がすべて消えるのに api.rm が出ない)。
@@ -187,6 +189,7 @@ pub(crate) fn detect_api_changes(
             );
         }
         prepared.push(PreparedDiffFile::Modified {
+            unparsed_declarations: facts.unparsed_declarations,
             old_syms,
             new_syms,
             in_file_callees,
@@ -240,6 +243,7 @@ pub(crate) fn detect_api_changes(
                 }
             }
             PreparedDiffFile::Modified {
+                unparsed_declarations,
                 old_syms,
                 new_syms,
                 in_file_callees,
@@ -251,6 +255,7 @@ pub(crate) fn detect_api_changes(
                         &mut state,
                         df,
                         &ModifiedFileFacts {
+                            unparsed_declarations,
                             old_syms,
                             new_syms,
                             in_file_callees,
@@ -307,6 +312,8 @@ pub(crate) fn detect_api_changes(
         .collect();
 
     ApiChanges {
+        uncertain_removals: buckets.uncertain_removals,
+        parse_truncations: buckets.parse_truncations,
         added,
         removed: removed_kept
             .into_iter()
