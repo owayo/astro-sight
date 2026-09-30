@@ -626,6 +626,18 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
         {
             return true;
         }
+        if self.exclude_framework_entrypoints
+            && self.lang_id == crate::language::LangId::Go
+            && sym.kind == SymbolKind::Function
+            && crate::engine::symbols::is_go_test_entrypoint(
+                self.root,
+                self.source,
+                &sym.range,
+                self.file_path,
+            )
+        {
+            return true;
+        }
         // 言語規約のプログラムエントリポイント (C / C++ / Kotlin の `main`、
         // Java / C# の `main` / `Main` とそれを宣言する型)。
         // ランタイムやローダが規約の名前で呼ぶため、リポジトリ内の呼び出し元は 0 件が正常。
