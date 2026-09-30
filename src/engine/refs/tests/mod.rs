@@ -23,6 +23,7 @@ use super::definition::{is_identifier_kind, is_ignored_identifier_context};
 use super::files::is_generated_file;
 use super::line_index::{extract_line_context_bytes_indexed, extract_line_context_indexed};
 use super::role::classify_ref_usage_role;
+use super::walker::SymbolReferenceSink;
 
 /// テスト用: 単一名の in-memory 参照収集 (SingleMatcher + SymbolReferenceSink)。
 /// 旧 `collect_identifier_refs` を直接叩いていた単体テストの置き換え。

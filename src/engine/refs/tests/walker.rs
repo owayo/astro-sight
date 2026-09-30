@@ -1,5 +1,75 @@
 use super::*;
 
+#[test]
+fn bash_function_options_survive_command_prefix_syntax() {
+    for command in [
+        "LC_ALL=C builtin unset foo\n",
+        ">/dev/null command export -f foo\n",
+        "builtin \\\nunset foo\n",
+        "export \\-f foo\n",
+        "typeset -fx foo\n",
+        "builtin() { shift; \"$@\"; }\nLC_ALL=C builtin local foo\n",
+        "builtin declare -- foo\n",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("sample.sh"),
+            format!("foo() {{ :; }}\n{command}"),
+        )
+        .unwrap();
+        let refs = find_references("foo", dir.path(), None).unwrap();
+        assert_eq!(refs.len(), 2, "{command}: {refs:?}");
+        let expected = if command == "builtin declare -- foo\n" {
+            RefKind::Definition
+        } else {
+            RefKind::Reference
+        };
+        assert_eq!(refs[1].kind, Some(expected), "{command}: {refs:?}");
+    }
+}
+
+#[test]
+fn bash_variable_namespace_is_separate_in_semantic_walkers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sample.sh");
+    let source = "foo() { :; }\nfoo=1\necho \"$foo\"\nlocal foo\nexport -f foo\ndeclare -F foo\nreadonly -f foo\nunset -f foo\nunset foo\nunset -v foo\ndeclare -p foo\nbuiltin local foo\ncommand export foo\nbuiltin declare -f foo\ndeclare \"-x\" foo\ndeclare \"$flags\" foo\nfoo\n";
+    std::fs::write(&path, source).unwrap();
+    let path = camino::Utf8Path::from_path(&path).unwrap();
+    let names = vec!["foo".to_string()];
+    let ac = build_ac_case_insensitive(&names).unwrap();
+    let acs = vec![(0, ac.clone())];
+    let occurrences = find_refs_batch_in_file_indexed::<true>(&names, &acs, path).unwrap();
+    assert_eq!(occurrences[0].len(), 17);
+    let defs: Vec<_> = occurrences[0]
+        .iter()
+        .filter(|r| r.kind == Some(RefKind::Definition))
+        .map(|r| r.line)
+        .collect();
+    assert_eq!(defs, vec![0, 1, 3, 11, 12, 14]);
+    let semantic = find_refs_batch_in_file_indexed::<false>(&names, &acs, path).unwrap();
+    let lines: Vec<_> = semantic[0].iter().map(|r| r.line).collect();
+    assert_eq!(
+        lines,
+        vec![0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    );
+    struct Recorder(Vec<(usize, bool)>);
+    impl RefVisitor for Recorder {
+        fn on_ref(&mut self, event: RefVisitEvent<'_>) {
+            self.0.push((event.line, event.is_def));
+        }
+    }
+    let mut recorder = Recorder(Vec::new());
+    visit_refs_and_defs_in_file_cb(&names, &ac, path, &mut recorder).unwrap();
+    assert_eq!(
+        recorder.0,
+        semantic[0]
+            .iter()
+            .map(|r| (r.line, r.kind == Some(RefKind::Definition)))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(count_refs_in_file(&names, &acs, path).unwrap(), vec![14]);
+}
+
 /// bash の `trap '<handler>' SIG` 内の関数参照が count 経路 (CountSink) で
 /// 非 Definition としてカウントされ、dead-code 判定で生存扱いになることを検証する。
 /// 旧実装では trap handler 内は文字列扱いで参照ゼロとなり、`cleanup_signal` のような
@@ -295,7 +365,7 @@ int run(int v) { return CLAMP(v) + MULTI(v); }
         let acs = vec![(0usize, ac.clone())];
 
         // 経路 B: batch Vec
-        let batch = find_refs_batch_in_file_indexed(&name_vec, &acs, utf8_path).unwrap();
+        let batch = find_refs_batch_in_file_indexed::<true>(&name_vec, &acs, utf8_path).unwrap();
 
         // 経路 C: callback (index 別に (line, column, is_def) を収集)
         struct Rec {

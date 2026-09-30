@@ -534,10 +534,35 @@ impl AppService {
         glob: Option<&str>,
         include_generated: bool,
     ) -> Result<Vec<RefsResult>> {
+        self.find_references_batch_with_generated_policy::<true>(
+            names,
+            dir,
+            glob,
+            include_generated,
+        )
+    }
+
+    /// 関数等の API 判定用。Bash の変数出現を同名関数への参照として数えない。
+    pub(crate) fn find_symbol_references_batch(
+        &self,
+        names: &[String],
+        dir: &str,
+        glob: Option<&str>,
+    ) -> Result<Vec<RefsResult>> {
+        self.find_references_batch_with_generated_policy::<false>(names, dir, glob, false)
+    }
+
+    fn find_references_batch_with_generated_policy<const SHELL_VARS: bool>(
+        &self,
+        names: &[String],
+        dir: &str,
+        glob: Option<&str>,
+        include_generated: bool,
+    ) -> Result<Vec<RefsResult>> {
         debug!(names = ?names, dir = dir, glob = ?glob, "find_references_batch called");
         let canonical_dir = self.validate_dir(dir)?;
 
-        let scan = refs::find_references_batch_with_scan(
+        let scan = refs::find_references_batch_with_scan_policy::<SHELL_VARS>(
             names,
             &canonical_dir,
             glob,

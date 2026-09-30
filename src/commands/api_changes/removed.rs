@@ -55,7 +55,7 @@ pub(crate) fn partition_removed_dead_candidates(
     }
 
     let service = AppService::new();
-    let batch_result = match service.find_references_batch(&unique_bare, dir, None) {
+    let batch_result = match service.find_symbol_references_batch(&unique_bare, dir, None) {
         Ok(r) => r,
         Err(_) => {
             // 検索失敗時は保守的にすべて removed に残す
