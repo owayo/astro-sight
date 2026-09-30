@@ -878,3 +878,64 @@ fn dead_code_does_not_declare_non_source_files() {
         "非ソースファイルは申告対象外: {json}"
     );
 }
+
+/// 抑制は利用者の意思表示であり、参照や公開APIの生存証拠ではない。
+#[test]
+fn dead_code_rust_allow_dead_marker_is_shared_with_review_without_changing_refs() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    std::fs::create_dir(repo.root().join("src")).unwrap();
+    repo.write("src/lib.rs", "pub fn kept() {}\npub fn unused() {}\n");
+    repo.commit_all("init");
+    let before = repo.run_json("refs", &["--name", "kept"]);
+    repo.write(
+        "src/lib.rs",
+        "// astro-sight:allow-dead\npub fn kept() {}\npub fn unused() {}\n",
+    );
+    let after = repo.run_json("refs", &["--name", "kept"]);
+    assert_eq!(
+        before["refs"].as_array().unwrap().len(),
+        after["refs"].as_array().unwrap().len()
+    );
+    assert_eq!(after["refs"][0]["kind"], "def");
+    let dead = repo.run_json("dead-code", &[]);
+    let names: Vec<_> = dead["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"unused") && !names.contains(&"kept"),
+        "{dead}"
+    );
+    let review = repo.run_json("review", &["--git", "--dead-scope", "all"]);
+    let names: Vec<_> = review["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"unused") && !names.contains(&"kept"),
+        "{review}"
+    );
+    assert!(
+        review["api_changes"]["removed"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        review["api_changes"]["modified"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        review["api_changes"]["added"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}

@@ -724,6 +724,12 @@ pub(crate) fn filter_exported_symbols(
         exclude_framework_entrypoints,
         file_path,
     );
+    // マーカーのない通常ファイルでは、宣言ごとの兄弟ノード探索を行わない。
+    let rust_may_have_allow_dead = exclude_framework_entrypoints
+        && lang_id == crate::language::LangId::Rust
+        && source
+            .windows(b"// astro-sight:allow-dead".len())
+            .any(|bytes| bytes == b"// astro-sight:allow-dead");
     let mut result = Vec::new();
     for sym in syms {
         if context.is_excluded_before_qualname(sym) {
@@ -734,6 +740,14 @@ pub(crate) fn filter_exported_symbols(
             continue;
         }
         if context.rust_owner_type_is_crate_internal(sym, &qualname) {
+            continue;
+        }
+        // このフラグを持つ経路は dead/test-only の候補抽出だけ。
+        // 利用者の意思表示を API 差分・参照・生存証拠として扱わない。
+        if rust_may_have_allow_dead
+            && matches!(sym.kind, SymbolKind::Function | SymbolKind::Method)
+            && crate::engine::symbols::rust_has_allow_dead_marker(root, source, &sym.range)
+        {
             continue;
         }
         // 除外判定後に署名を作り、不要な文字列構築を避ける。

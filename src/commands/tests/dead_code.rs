@@ -1086,3 +1086,97 @@ fn destructured_exports_are_dead_code_candidates_without_self_references() {
         assert!(!names.contains(&live), "{live} is imported: {names:?}");
     }
 }
+
+#[test]
+fn detect_dead_rust_allow_dead_marker_excludes_only_marked_callables() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    fs::write(
+        repo.join("api.rs"),
+        r#"// astro-sight:allow-dead
+pub fn put_u8() {}
+pub fn put_u16() {}
+// astro-sight:allow-dead
+pub fn put_test() {}
+pub fn put_test_unmarked() {}
+#[allow(dead_code)]
+pub fn rust_allowed() {}
+// astro-sight:allow-dead
+pub const RESERVED: u32 = 3;
+pub struct Writer;
+impl Writer {
+    // astro-sight:allow-dead
+    /// Write a value.
+    #[inline]
+    pub fn put_u32(&self) {}
+    pub fn put_u64(&self) {}
+}
+"#,
+    )
+    .unwrap();
+    fs::create_dir(repo.join("tests")).unwrap();
+    fs::write(
+        repo.join("tests/use.rs"),
+        "fn test_value() { put_test(); put_test_unmarked(); }\n",
+    )
+    .unwrap();
+    let (dead, test_only) =
+        detect_dead_symbols_from_files(repo.to_str().unwrap(), &[repo.join("api.rs")]);
+    let names: HashSet<_> = dead.iter().map(|s| s.name.as_str()).collect();
+    assert!(
+        names.contains("put_u16")
+            && names.contains("Writer.put_u64")
+            && names.contains("rust_allowed")
+            && names.contains("RESERVED"),
+        "{names:?}"
+    );
+    assert!(
+        !names.contains("put_u8")
+            && !names.contains("Writer.put_u32")
+            && !names.contains("put_test"),
+        "{names:?}"
+    );
+    assert!(
+        !test_only.iter().any(|s| s.name == "put_test"),
+        "{test_only:?}"
+    );
+    assert!(
+        test_only.iter().any(|s| s.name == "put_test_unmarked"),
+        "{test_only:?}"
+    );
+}
+
+#[test]
+fn detect_api_changes_rust_allow_dead_marker_does_not_hide_contract_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            ("src/lib.rs", "pub fn kept(value: u32) -> u32 { value }\n"),
+            ("src/caller.rs", "fn use_api() { let _ = kept(1); }\n"),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("src/lib.rs"),
+        "// astro-sight:allow-dead\npub fn kept(value: u32) -> u32 { value }\n",
+    )
+    .unwrap();
+    let api = detect_api_changes_from_worktree(repo);
+    assert!(
+        api.added.is_empty() && api.removed.is_empty() && api.modified.is_empty(),
+        "{api:?}"
+    );
+    fs::write(
+        repo.join("src/lib.rs"),
+        "// astro-sight:allow-dead\npub fn kept(value: u64) -> u64 { value }\n",
+    )
+    .unwrap();
+    let api = detect_api_changes_from_worktree(repo);
+    assert!(api.modified.iter().any(|s| s.name == "kept"), "{api:?}");
+    fs::write(repo.join("src/lib.rs"), "// astro-sight:allow-dead\n").unwrap();
+    let api = detect_api_changes_from_worktree(repo);
+    assert!(api.removed.iter().any(|s| s.name == "kept"), "{api:?}");
+}

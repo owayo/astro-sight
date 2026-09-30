@@ -15,6 +15,7 @@ mod exported;
 mod framework;
 mod go_test;
 mod overrides;
+mod rust_allow_dead;
 mod scope;
 
 pub use complexity::calculate_complexity;
@@ -31,6 +32,7 @@ pub use framework::{
 };
 pub(crate) use go_test::is_go_test_entrypoint;
 pub use overrides::is_override_method;
+pub(crate) use rust_allow_dead::rust_has_allow_dead_marker;
 pub use scope::is_local_scope_symbol;
 
 pub(crate) use cpp::{
