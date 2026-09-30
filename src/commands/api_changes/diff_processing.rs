@@ -414,6 +414,18 @@ fn collect_removed_symbols(
     let is_bash_old_file = is_bash_script_path(&df.old_path);
     // base 側 blob の `export -f` 宣言は必要になった時点でファイル単位に 1 回だけ読む。
     let mut bash_exported: Option<std::collections::HashSet<String>> = None;
+    // 対象となる値の置き換えがあるときだけ、ファイル単位で 1 回読む。
+    let mut forwarded_signatures = None;
+    let is_js_ts_pair = [&df.old_path, &df.new_path].iter().all(|path| {
+        matches!(
+            crate::language::LangId::from_path(camino::Utf8Path::new(path)).ok(),
+            Some(
+                crate::language::LangId::Typescript
+                    | crate::language::LangId::Tsx
+                    | crate::language::LangId::Javascript
+            )
+        )
+    });
     // 同名が新側にも残る削除 (overload の片方など)。名前の有無だけで判定すると検出
     // できないが、件数が減り旧シグネチャも残っていない以上、消えた定義があるので曖昧ではない。
     let same_name_removals = same_name_surplus_mask(old_syms, new_syms);
@@ -450,6 +462,26 @@ fn collect_removed_symbols(
                 continue;
             }
             if new_export_surface_names.contains(name.as_str()) {
+                if is_js_ts_pair && matches!(kind.as_str(), "variable" | "constant") {
+                    let signatures = forwarded_signatures.get_or_insert_with(|| {
+                        super::forwarded_values::signatures(dir, &df.new_path)
+                    });
+                    // 読み込み・解析に失敗した場合も、同名だけで変化を相殺しない。
+                    if signatures.as_ref().is_none_or(|map| map.contains_key(name)) {
+                        state.buckets.modified.push(ApiSymbolChange {
+                            name: name.clone(),
+                            kind: kind.clone(),
+                            file: df.new_path.clone(),
+                            old_signature: Some(sig.clone()),
+                            new_signature: signatures
+                                .as_ref()
+                                .and_then(|map| map.get(name))
+                                .cloned(),
+                            no_resolved_internal_callers: false,
+                            contract_change: None,
+                        });
+                    }
+                }
                 continue;
             }
             // 以降の「rename + 実装置換」と `@property` → field の置き換えは、名前ごと

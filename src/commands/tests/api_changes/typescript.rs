@@ -2394,3 +2394,158 @@ fn detect_api_changes_ts_no_arg_to_optional_props_without_default_requires_jsx_o
         "JSX だけで使われるコンポーネントは互換として理由付きで載せる。modified={modified:?}"
     );
 }
+
+/// 同名の公開名が残っても、別モジュールへ転送された値の変更は失われてはならない。
+#[test]
+fn detect_api_changes_forwarded_values_preserve_changes_and_unknown_contracts() {
+    for (before, after, target, expected) in [
+        (
+            "export const LIMIT: number = 2;",
+            "export { LIMIT } from './next';",
+            "export const LIMIT: number = 5;",
+            "mod",
+        ),
+        (
+            "export const LIMIT: number = 2;",
+            "import { LIMIT } from './next'; export { LIMIT };",
+            "export const LIMIT: number = 5;",
+            "mod",
+        ),
+        (
+            "export const LIMIT = 2;",
+            "export { LIMIT } from './next';",
+            "export const LIMIT = 5;",
+            "mod",
+        ),
+        (
+            "export const LIMIT: number = 2;",
+            "export { LIMIT } from './next';",
+            "export const LIMIT: number = 2;",
+            "mod",
+        ),
+        (
+            "export const LIMIT = 2;",
+            "export { LIMIT } from './next';",
+            "export const LIMIT = 2;",
+            "mod",
+        ),
+        (
+            "export const LIMIT: number = 2;",
+            "export { LIMIT } from './missing';",
+            "export const LIMIT: number = 2;",
+            "mod",
+        ),
+        (
+            "export const LIMIT: number = 2;",
+            "export { LIMIT } from '@/next';",
+            "export const LIMIT: number = 2;",
+            "mod",
+        ),
+        (
+            "export const LIMIT: number = 2;",
+            "export { OTHER as LIMIT } from './next';",
+            "export const OTHER: number = 2;",
+            "mod",
+        ),
+        (
+            "export const LIMIT: number = 2;",
+            "export type { LIMIT } from './next';",
+            "export const LIMIT: number = 2;",
+            "mod",
+        ),
+        (
+            "export const LIMIT: number = 2;",
+            "export { LIMIT } from './next';",
+            "export let LIMIT: number = 2;",
+            "mod",
+        ),
+        (
+            "export const LIMIT: number = 2;",
+            "export { LIMIT } from './next';",
+            "export const LIMIT: number = 2, OTHER = 3;",
+            "mod",
+        ),
+        (
+            "type Kind = number; export const LIMIT: Kind = 2;",
+            "export { LIMIT } from './next';",
+            "type Kind = string; export const LIMIT: Kind = 'two';",
+            "mod",
+        ),
+        (
+            "export const LIMIT = { count: 2 };",
+            "export { LIMIT } from './next';",
+            "export const LIMIT = { count: 5 };",
+            "mod",
+        ),
+        (
+            "export const LIMIT = () => 2;",
+            "export { LIMIT } from './next';",
+            "export const LIMIT = () => 5;",
+            "mod",
+        ),
+        (
+            "export function LIMIT() { return 2; }",
+            "export { LIMIT } from './next';",
+            "export function LIMIT() { return 5; }",
+            "legacy",
+        ),
+        (
+            "export interface LIMIT { count: number }",
+            "export type { LIMIT } from './next';",
+            "export interface LIMIT { count: string }",
+            "legacy",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                ("api.ts", before),
+                (
+                    "caller.ts",
+                    "import { LIMIT } from './api'; console.log(LIMIT);",
+                ),
+            ],
+            "init",
+        );
+        fs::write(repo.join("api.ts"), after).unwrap();
+        fs::write(repo.join("next.ts"), target).unwrap();
+        let result = detect_api_changes_from_worktree(repo);
+        let modified = result
+            .modified
+            .iter()
+            .any(|x| x.file == "api.ts" && x.name == "LIMIT");
+        let value = result
+            .const_value_changes
+            .iter()
+            .any(|x| x.file == "api.ts" && x.name == "LIMIT");
+        assert_eq!(
+            (modified, value),
+            (expected == "mod", false),
+            "before={before}, after={after}, target={target}, result={result:?}"
+        );
+        if modified {
+            let change = result
+                .modified
+                .iter()
+                .find(|x| x.file == "api.ts" && x.name == "LIMIT")
+                .unwrap();
+            assert!(change.old_signature.is_some());
+            assert!(
+                change
+                    .new_signature
+                    .as_ref()
+                    .is_some_and(|s| s.starts_with("export"))
+            );
+            assert!(!change.no_resolved_internal_callers);
+        }
+        assert!(
+            !result
+                .removed
+                .iter()
+                .any(|x| x.file == "api.ts" && x.name == "LIMIT")
+        );
+    }
+}

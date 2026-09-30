@@ -499,6 +499,7 @@ pub(crate) fn reconcile_with_moves(
 
 pub(crate) mod diff_processing;
 pub(crate) mod exported;
+mod forwarded_values;
 mod js_ts_shadow;
 pub(crate) mod prepare;
 pub(crate) mod removed;

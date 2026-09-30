@@ -308,7 +308,7 @@ fn with_python_binding_decorators(
 ///
 /// 文字列リテラル中の `//` は comment ノードではないので AST ベースの本判定では誤爆しない
 /// (テキスト置換で実装すると `"https://example.test/a//b"` を壊す)。
-fn normalize_signature_dropping_comments(
+pub(super) fn normalize_signature_dropping_comments(
     node: tree_sitter::Node<'_>,
     source: &[u8],
     keep_doc_comments: bool,

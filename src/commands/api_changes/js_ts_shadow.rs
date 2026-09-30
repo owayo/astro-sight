@@ -283,38 +283,50 @@ pub(crate) fn pattern_binds_name(pattern: Node<'_>, source: &[u8], name: &str) -
 
 /// import 文が `name` をローカル binding として導入するか (default / named / alias / namespace)。
 pub(crate) fn import_binds_name(import_stmt: Node<'_>, source: &[u8], name: &str) -> bool {
-    fn walk(node: Node<'_>, source: &[u8], name: &str) -> bool {
+    visit_import_bindings(import_stmt, source, |local| local == name)
+}
+
+/// import のローカル束縛を列挙する。true を返した時点で走査を終える。
+pub(crate) fn visit_import_bindings(
+    import_stmt: Node<'_>,
+    source: &[u8],
+    mut visit: impl FnMut(&str) -> bool,
+) -> bool {
+    fn walk(node: Node<'_>, source: &[u8], visit: &mut impl FnMut(&str) -> bool) -> bool {
         match node.kind() {
             "import_specifier" => {
                 // alias があれば alias がローカル名、なければ name がローカル名。
                 let local = node
                     .child_by_field_name("alias")
                     .or_else(|| node.child_by_field_name("name"));
-                local.is_some_and(|n| n.utf8_text(source).ok() == Some(name))
+                local
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .is_some_and(&mut *visit)
             }
             "namespace_import" => {
                 let mut cursor = node.walk();
-                node.named_children(&mut cursor)
-                    .any(|c| c.kind() == "identifier" && c.utf8_text(source).ok() == Some(name))
+                node.named_children(&mut cursor).any(|c| {
+                    c.kind() == "identifier" && c.utf8_text(source).ok().is_some_and(&mut *visit)
+                })
             }
-            "identifier" => node.utf8_text(source).ok() == Some(name),
+            "identifier" => node.utf8_text(source).ok().is_some_and(&mut *visit),
             "string" => false,
             _ => {
                 let mut cursor = node.walk();
                 node.named_children(&mut cursor)
-                    .any(|c| walk(c, source, name))
+                    .any(|c| walk(c, source, visit))
             }
         }
     }
     import_stmt
         .child_by_field_name("import")
-        .map(|clause| walk(clause, source, name))
+        .map(|clause| walk(clause, source, &mut visit))
         .unwrap_or_else(|| {
             let mut cursor = import_stmt.walk();
             import_stmt
                 .named_children(&mut cursor)
                 .filter(|c| c.kind() == "import_clause")
-                .any(|c| walk(c, source, name))
+                .any(|c| walk(c, source, &mut visit))
         })
 }
 

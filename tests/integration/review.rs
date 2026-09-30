@@ -2012,3 +2012,54 @@ fn review_hook_reports_structured_unanalyzable_source_summary() {
             .starts_with("12 \".vue\" file(s)")
     );
 }
+
+/// const の宣言が消えても同名の export 句だけで値変更を相殺しない。
+#[test]
+fn review_hook_keeps_forwarded_public_value_changes_blocking() {
+    for forwarding in [
+        "export { LIMIT } from './next';",
+        "import { LIMIT } from './next'; export { LIMIT };",
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.write("api.ts", "export const LIMIT: number = 2;\n");
+        repo.write(
+            "caller.ts",
+            "import { LIMIT } from './api'; console.log(LIMIT);\n",
+        );
+        repo.commit_all("init");
+        repo.write("api.ts", forwarding);
+        repo.write("next.ts", "export const LIMIT: number = 5;\n");
+        let normal = repo.run_json("review", &["--git"]);
+        let changed = normal["api_changes"]["modified"].as_array().unwrap();
+        assert_eq!(changed.len(), 1, "{normal}");
+        assert_eq!(changed[0]["name"], "LIMIT");
+        assert_eq!(changed[0]["file"], "api.ts");
+        assert!(normal["api_changes"].get("const_value_changes").is_none());
+        assert!(
+            normal["api_changes"]["removed"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let output = cargo_bin()
+            .args(["review", "--dir"])
+            .arg(repo.root())
+            .args(["--git", "--hook"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(output.stdout.is_empty());
+        let value: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+        assert!(
+            value["blocking_categories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x == "api.mod")
+        );
+        assert_eq!(value["api"]["mod"][0]["n"], "LIMIT");
+        assert!(value["api"].get("const_value").is_none());
+    }
+}
