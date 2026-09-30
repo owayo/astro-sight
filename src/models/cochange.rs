@@ -2,6 +2,51 @@ use serde::{Deserialize, Serialize};
 
 use super::skip::SkipInfo;
 
+/// 履歴上の関連。未知の値から変更義務や対応完了を推測しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CoChangeRelation {
+    HistoricalCochange,
+}
+
+/// 今回の変更必要性を独立した根拠から証明した状態ではない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CoChangeActionability {
+    HistoryOnly,
+}
+
+/// 履歴頻度だけでは対応済み・未対応のどちらとも認定できない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CoChangeResolution {
+    NotAssessed,
+}
+
+/// blame/history とも履歴の証拠であり、因果・必要性・完了状態とは区別する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CoChangeInterpretation {
+    pub relation: CoChangeRelation,
+    pub actionability: CoChangeActionability,
+    pub resolution: CoChangeResolution,
+}
+
+impl CoChangeInterpretation {
+    pub const HISTORY_ONLY: Self = Self {
+        relation: CoChangeRelation::HistoricalCochange,
+        actionability: CoChangeActionability::HistoryOnly,
+        resolution: CoChangeResolution::NotAssessed,
+    };
+}
+
+/// 不明・非有限な順位の根拠を null や疑似的な数値として出力しない。
+pub(crate) fn is_absent_or_non_finite_ranking(score: &Option<f64>) -> bool {
+    score.is_none_or(|value| !value.is_finite())
+}
+
 /// 起点ファイルのコミット集合をどう構築したかの種別。
 ///
 /// `Blame` が既定かつ最も密結合な証拠 (起点の**変更行**を最後に触ったコミット)。

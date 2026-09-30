@@ -2063,3 +2063,58 @@ fn review_hook_keeps_forwarded_public_value_changes_blocking() {
         assert!(value["api"].get("const_value").is_none());
     }
 }
+
+/// 高い履歴頻度でも、今回の変更必要性や対応完了の証明にはしない。
+#[test]
+fn review_cochange_history_candidates_explain_unassessed_actionability_and_ranking() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    for version in 0..5 {
+        repo.write("spec.md", format!("Specification version {version}\n"));
+        repo.write("detail.md", format!("Detail version {version}\n"));
+        repo.commit_all(&format!("document {version}"));
+    }
+    repo.write("spec.md", "Specification version 6\n");
+    let normal = repo.run_json("review", &["--git"]);
+    let entries = normal["missing_cochanges"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{normal}");
+    let entry = &entries[0];
+    assert_eq!(entry["file"], "detail.md");
+    assert_eq!(entry["expected_with"], "spec.md");
+    assert_eq!(entry["confidence"], 1.0);
+    assert_eq!(entry["co_changes"], 5);
+    assert_eq!(entry["denominator"], 5);
+    assert_eq!(entry["evidence"], "history");
+    let interpretation = serde_json::json!({"relation":"historical_cochange","actionability":"history_only","resolution":"not_assessed"});
+    assert_eq!(entry["interpretation"], interpretation);
+    // 単純な頻度式から作り直さず、既存エンジンの重み付き順位をそのまま保持する。
+    let standalone = repo.run_json("cochange", &["--paths", "spec.md"]);
+    let pair = standalone["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pair| {
+            (pair["file_a"] == "spec.md" && pair["file_b"] == "detail.md")
+                || (pair["file_b"] == "spec.md" && pair["file_a"] == "detail.md")
+        })
+        .unwrap();
+    assert_eq!(entry["ranking_score"], pair["score"], "{standalone}");
+    assert!(entry["ranking_score"].is_number());
+    let hook = cargo_bin()
+        .args(["review", "--dir"])
+        .arg(repo.root())
+        .args(["--git", "--hook"])
+        .output()
+        .unwrap();
+    assert!(
+        hook.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hook.stderr)
+    );
+    assert!(hook.stdout.is_empty());
+    let compact: serde_json::Value = serde_json::from_slice(&hook.stderr).unwrap();
+    assert_eq!(compact["blocking_categories"], serde_json::json!([]));
+    assert_eq!(compact["cochange"][0]["i"], entry["interpretation"]);
+    assert_eq!(compact["cochange"][0]["s"], entry["ranking_score"]);
+    assert_eq!(compact["cochange"][0]["c"], 100);
+}

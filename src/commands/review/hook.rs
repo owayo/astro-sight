@@ -146,6 +146,9 @@ struct HookCochange<'a> {
     /// トリアージがそこを読めるようにする。
     #[serde(skip_serializing_if = "Option::is_none")]
     e: Option<&'static str>,
+    i: crate::models::cochange::CoChangeInterpretation,
+    #[serde(skip_serializing_if = "crate::models::cochange::is_absent_or_non_finite_ranking")]
+    s: Option<f64>,
 }
 
 /// 打ち切り (解析対象から外したもの) の hook 用 DTO。
@@ -515,6 +518,8 @@ pub(crate) fn build_review_hook_json_for_diff(
                     // blame は既定なので省略して出力を短く保つ (フィールドが無ければ blame)。
                     Some(crate::models::cochange::CoChangeEvidence::Blame) | None => None,
                 },
+                i: cochange.interpretation,
+                s: cochange.ranking_score,
             })
             .collect();
         hook_obj.insert(

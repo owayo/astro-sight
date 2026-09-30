@@ -459,6 +459,7 @@ pub enum Commands {
     },
 
     /// Structured review: integrates impact, cochange, API surface diff, and dead symbol detection
+    /// Cochange candidates are historical associations; change necessity and resolution are unassessed.
     Review {
         /// Workspace directory
         #[arg(short, long)]

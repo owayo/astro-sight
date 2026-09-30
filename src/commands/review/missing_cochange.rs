@@ -341,10 +341,20 @@ struct RankedMissingCochange {
 }
 
 impl RankedMissingCochange {
-    fn new(item: MissingCochange, entry: &CoChangeEntry, smoothing_on: bool) -> Self {
+    fn from_entry(entry: &CoChangeEntry, missing: &str, present: &str, smoothing_on: bool) -> Self {
+        let ranking = entry.ranking_value(smoothing_on);
         Self {
-            item,
-            ranking: entry.ranking_value(smoothing_on),
+            item: MissingCochange {
+                file: missing.to_owned(),
+                expected_with: present.to_owned(),
+                confidence: entry.confidence,
+                co_changes: entry.co_changes,
+                denominator: entry.denominator,
+                evidence: entry.evidence,
+                interpretation: crate::models::cochange::CoChangeInterpretation::HISTORY_ONLY,
+                ranking_score: ranking.is_finite().then_some(ranking),
+            },
+            ranking,
             is_history_evidence: entry.is_history_evidence(),
         }
     }
@@ -486,23 +496,19 @@ pub(crate) fn detect_missing_cochanges(
         let b_in_diff = changed_files.contains(&entry.file_b);
 
         let candidate = if a_in_diff && !b_in_diff {
-            Some(MissingCochange {
-                file: entry.file_b.clone(),
-                expected_with: entry.file_a.clone(),
-                confidence: entry.confidence,
-                co_changes: entry.co_changes,
-                denominator: entry.denominator,
-                evidence: entry.evidence,
-            })
+            Some(RankedMissingCochange::from_entry(
+                entry,
+                &entry.file_b,
+                &entry.file_a,
+                smoothing_on,
+            ))
         } else if b_in_diff && !a_in_diff {
-            Some(MissingCochange {
-                file: entry.file_a.clone(),
-                expected_with: entry.file_b.clone(),
-                confidence: entry.confidence,
-                co_changes: entry.co_changes,
-                denominator: entry.denominator,
-                evidence: entry.evidence,
-            })
+            Some(RankedMissingCochange::from_entry(
+                entry,
+                &entry.file_a,
+                &entry.file_b,
+                smoothing_on,
+            ))
         } else {
             None
         };
@@ -520,14 +526,15 @@ pub(crate) fn detect_missing_cochanges(
             // `--include-generated` (config の `skip_generated = false`) は「生成物を特別扱いしない」
             // という利用者の意図なので、この方向付けも無効化する＝解除手段を cochange 側と揃える。
             if !include_generated
-                && is_snapshot_generated_from(dir, &candidate.file, &candidate.expected_with)
+                && is_snapshot_generated_from(
+                    dir,
+                    &candidate.item.file,
+                    &candidate.item.expected_with,
+                )
             {
                 continue;
             }
-            insert_best_missing(
-                &mut best,
-                RankedMissingCochange::new(candidate, entry, smoothing_on),
-            );
+            insert_best_missing(&mut best, candidate);
         }
     }
 
@@ -554,18 +561,18 @@ mod tests {
         co_changes: usize,
         ranking: f64,
     ) -> RankedMissingCochange {
-        RankedMissingCochange {
-            item: MissingCochange {
-                file: file.to_string(),
-                expected_with: expected_with.to_string(),
-                confidence,
-                co_changes,
-                denominator: Some(co_changes),
-                evidence: None,
-            },
-            ranking,
-            is_history_evidence: false,
-        }
+        let entry = CoChangeEntry {
+            file_a: expected_with.to_owned(),
+            file_b: file.to_owned(),
+            confidence,
+            co_changes,
+            total_changes_a: co_changes,
+            total_changes_b: co_changes,
+            denominator: Some(co_changes),
+            evidence: None,
+            score: Some(ranking),
+        };
+        RankedMissingCochange::from_entry(&entry, file, expected_with, true)
     }
 
     #[test]
@@ -584,6 +591,34 @@ mod tests {
 
         assert_eq!(ranked[0].item.expected_with, "stable.rs");
         assert_eq!(ranked[1].item.file, "another.rs");
+        assert_eq!(ranked[0].item.ranking_score, Some(0.64));
+        assert_eq!(ranked[1].item.ranking_score, Some(0.5));
+    }
+
+    #[test]
+    fn cochange_interpretation_keeps_raw_confidence_and_unsmoothed_ranking_distinct() {
+        let entry = CoChangeEntry {
+            file_a: "source.md".into(),
+            file_b: "related.md".into(),
+            confidence: 0.9,
+            co_changes: 9,
+            total_changes_a: 10,
+            total_changes_b: 10,
+            denominator: Some(10),
+            score: Some(0.5),
+            evidence: Some(crate::models::cochange::CoChangeEvidence::History),
+        };
+        for (smoothing, ranking) in [(true, 0.5), (false, 0.9)] {
+            let result =
+                RankedMissingCochange::from_entry(&entry, "related.md", "source.md", smoothing);
+            assert_eq!(result.item.confidence, 0.9);
+            assert_eq!(result.ranking, ranking);
+            assert_eq!(result.item.ranking_score, Some(ranking));
+            assert_eq!(
+                result.item.interpretation,
+                crate::models::cochange::CoChangeInterpretation::HISTORY_ONLY
+            );
+        }
     }
 
     /// snapshot パスから生成元テストを導出できる条件を、規約に合う形と合わない形の

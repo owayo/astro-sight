@@ -290,6 +290,8 @@ fn build_review_hook_json_cochange_only_is_informational() {
             co_changes: 9,
             denominator: Some(10),
             evidence: None,
+            interpretation: crate::models::cochange::CoChangeInterpretation::HISTORY_ONLY,
+            ranking_score: None,
         }],
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
@@ -355,6 +357,8 @@ fn build_review_hook_json_cochange_marks_history_evidence() {
             co_changes: 3,
             denominator: Some(3),
             evidence: Some(crate::models::cochange::CoChangeEvidence::History),
+            interpretation: crate::models::cochange::CoChangeInterpretation::HISTORY_ONLY,
+            ranking_score: None,
         }],
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
@@ -403,6 +407,8 @@ fn build_review_hook_json_cochange_omits_denominator_when_unknown() {
             co_changes: 3,
             denominator: None,
             evidence: None,
+            interpretation: crate::models::cochange::CoChangeInterpretation::HISTORY_ONLY,
+            ranking_score: None,
         }],
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
@@ -1641,6 +1647,8 @@ fn build_review_hook_json_blocking_categories_match_filtered_output_and_exit() {
                 co_changes: 9,
                 denominator: Some(10),
                 evidence: None,
+                interpretation: crate::models::cochange::CoChangeInterpretation::HISTORY_ONLY,
+                ranking_score: None,
             });
             result.truncations.push(
                 crate::models::truncation::TruncationInfo::untracked_file_too_large(
@@ -1792,5 +1800,84 @@ fn build_review_hook_json_preserves_unanalyzable_source_detail() {
             value["trunc"][2],
             serde_json::json!({"f":"large.ts", "r":"untracked_file_too_large"})
         );
+    }
+}
+
+#[test]
+fn build_review_hook_json_cochange_interpretation_is_unassessed_for_both_evidence_kinds() {
+    let dir = tempfile::tempdir().unwrap();
+    for evidence in [
+        None,
+        Some(crate::models::cochange::CoChangeEvidence::History),
+    ] {
+        let item = MissingCochange {
+            file: "docs/detail.md".into(),
+            expected_with: "docs/spec.md".into(),
+            confidence: 1.0,
+            co_changes: 5,
+            denominator: Some(5),
+            evidence,
+            interpretation: crate::models::cochange::CoChangeInterpretation::HISTORY_ONLY,
+            ranking_score: Some(6.0 / 14.0),
+        };
+        let full = serde_json::to_value(&item).unwrap();
+        let expected = serde_json::json!({"relation":"historical_cochange", "actionability":"history_only", "resolution":"not_assessed"});
+        assert_eq!(full["interpretation"], expected);
+        assert_eq!(full["ranking_score"], serde_json::json!(6.0 / 14.0));
+        let result = ReviewResult {
+            missing_cochanges: vec![item],
+            ..Default::default()
+        };
+        let build = build_review_hook_json(&result, dir.path().to_str().unwrap(), false);
+        let compact = build.value.unwrap();
+        assert_eq!(compact["cochange"][0]["i"], expected);
+        assert_eq!(compact["cochange"][0]["s"], full["ranking_score"]);
+        assert_eq!(compact["blocking_categories"], serde_json::json!([]));
+        assert!(!build.is_blocking);
+    }
+}
+
+#[test]
+fn build_review_hook_json_cochange_omits_non_finite_ranking_without_losing_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    for ranking_score in [
+        None,
+        Some(f64::NAN),
+        Some(f64::INFINITY),
+        Some(f64::NEG_INFINITY),
+    ] {
+        let item = MissingCochange {
+            file: "detail.md".into(),
+            expected_with: "spec.md".into(),
+            confidence: 0.9,
+            co_changes: 9,
+            denominator: None,
+            evidence: None,
+            interpretation: crate::models::cochange::CoChangeInterpretation::HISTORY_ONLY,
+            ranking_score,
+        };
+        let full = serde_json::to_value(&item).unwrap();
+        assert!(
+            full.get("ranking_score").is_none()
+                && full.get("denominator").is_none()
+                && full.get("evidence").is_none()
+        );
+        assert_eq!(full["confidence"], 0.9);
+        let build = build_review_hook_json(
+            &ReviewResult {
+                missing_cochanges: vec![item],
+                ..Default::default()
+            },
+            dir.path().to_str().unwrap(),
+            false,
+        );
+        assert!(!build.is_blocking);
+        let value = build.value.unwrap();
+        let compact = &value["cochange"][0];
+        assert!(
+            compact.get("s").is_none() && compact.get("d").is_none() && compact.get("e").is_none()
+        );
+        assert_eq!(compact["c"], 90);
+        assert_eq!(compact["i"], full["interpretation"]);
     }
 }

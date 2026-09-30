@@ -32,7 +32,7 @@ pub struct ReviewResult {
     pub truncations: Vec<crate::models::truncation::TruncationInfo>,
 }
 
-/// cochange で検出された「一緒に変更されるはずだが diff に含まれないファイル」。
+/// 共変更履歴に関連し、今回の diff に含まれないファイル。変更義務は未判定。
 ///
 /// `confidence` は raw ratio (`co_changes / denominator`) なので、1/1 と 5/5 が
 /// どちらも 1.0 になる。標本の大きさが出力から読めないと「100% 共変更」という
@@ -58,6 +58,11 @@ pub struct MissingCochange {
     /// 無関係な共変更まで含む。同じ `c` / `n` / `d` でも証拠の強さが違うため区別できるようにする。
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub evidence: Option<crate::models::cochange::CoChangeEvidence>,
+    /// 既存のキー名は変更義務・未対応状態を意味しない。
+    pub interpretation: crate::models::cochange::CoChangeInterpretation,
+    /// 選択に使った順位の根拠。頻度比や未更新の確率として使わない。
+    #[serde(skip_serializing_if = "crate::models::cochange::is_absent_or_non_finite_ranking")]
+    pub ranking_score: Option<f64>,
 }
 
 /// 公開シンボルの変更サマリ。
