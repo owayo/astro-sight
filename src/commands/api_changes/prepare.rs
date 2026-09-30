@@ -353,11 +353,11 @@ pub(crate) fn extract_new_file_facts(dir: &str, file_path: &str) -> NewFileFacts
         facts.unparsed_declarations = unparsed_declarations(root, &source);
         facts
             .parse_truncations
-            .push(crate::models::truncation::TruncationInfo {
-                path: Some(file_path.to_owned()),
-                reason: crate::models::truncation::TruncationReason::ParseErrorRegion,
-                message: parse_error_message(file_path, &source).to_owned(),
-            });
+            .push(crate::models::truncation::TruncationInfo::new(
+                Some(file_path.to_owned()),
+                crate::models::truncation::TruncationReason::ParseErrorRegion,
+                parse_error_message(file_path, &source).to_owned(),
+            ));
     }
 
     // callees: test/safe ガードなし (extract_in_file_callees と一致)。

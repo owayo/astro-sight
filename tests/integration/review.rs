@@ -1944,3 +1944,71 @@ fn review_hook_explains_blocking_categories_without_promoting_information() {
         );
     }
 }
+
+/// test-only の候補がある走査では、hook にも未解析言語の全件数と代表パスを残す。
+#[test]
+fn review_hook_reports_structured_unanalyzable_source_summary() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.write(
+        "api.ts",
+        "export function greet(): string { return 'before'; }\n",
+    );
+    repo.write(
+        "api.test.ts",
+        "import { greet } from './api'; console.log(greet());\n",
+    );
+    for (extension, count) in [("vue", 12), ("svelte", 2)] {
+        // 逆順の作成でも、代表パスは辞書順で固定する。
+        for index in (0..count).rev() {
+            repo.write(
+                format!("{index:02}.{extension}"),
+                "<script>greet()</script>\n",
+            );
+        }
+    }
+    repo.commit_all("init");
+    repo.write(
+        "api.ts",
+        "export function greet(): string { return 'after'; }\n",
+    );
+    repo.write(
+        "api.test.ts",
+        "import { greet } from './api'; console.log('result', greet());\n",
+    );
+    let output = cargo_bin()
+        .args(["review", "--dir"])
+        .arg(repo.root())
+        .args(["--git", "--hook"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(output.stdout.is_empty());
+    let value: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+    assert_eq!(value["blocking_categories"], serde_json::json!([]));
+    assert_eq!(
+        value["trunc"],
+        serde_json::json!([
+            {"r":"unanalyzable_source", "d":{"x":"vue", "n":12, "e":["00.vue", "01.vue", "02.vue"]}},
+            {"r":"unanalyzable_source", "d":{"x":"svelte", "n":2, "e":["00.svelte", "01.svelte"]}},
+        ])
+    );
+    assert!(value.get("api").is_none() && value.get("dead").is_none());
+    // 通常出力も同じ情報源を使い、件数とメッセージを維持する。
+    let normal = repo.run_json("review", &["--git"]);
+    assert_eq!(normal["truncations"][0]["detail"]["count"], 12);
+    assert_eq!(
+        normal["truncations"][0]["detail"]["examples"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(
+        normal["truncations"][0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("12 \".vue\" file(s)")
+    );
+}

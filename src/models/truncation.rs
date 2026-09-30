@@ -21,6 +21,19 @@ pub struct TruncationInfo {
     pub reason: TruncationReason,
     /// 人間向けの補足メッセージ (閾値と実測値を含める)。
     pub message: String,
+    /// 未解析ソースの集約根拠。旧応答や他の理由では省略する。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub detail: Option<UnanalyzableSourceSummary>,
+}
+
+/// 拡張子ごとの未解析ファイル数と、上限を設けた代表パス。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnanalyzableSourceSummary {
+    /// 先頭ドットを含まない小文字の拡張子。
+    pub extension: String,
+    /// 代表パスに切り詰める前の全件数。
+    pub count: usize,
+    pub examples: Vec<String>,
 }
 
 /// 打ち切りの理由。
@@ -38,6 +51,16 @@ pub enum TruncationReason {
 }
 
 impl TruncationInfo {
+    /// 構造化された集約情報を伴わない打ち切り。
+    pub fn new(path: Option<String>, reason: TruncationReason, message: String) -> Self {
+        Self {
+            path,
+            reason,
+            message,
+            detail: None,
+        }
+    }
+
     /// 未追跡ファイルが取り込み上限を超えたため合成 diff に含めなかった打ち切り。
     ///
     /// `limit_label` は超過した上限の種類 (`"size"` / `"lines"`)、`actual` / `limit` は
@@ -48,13 +71,13 @@ impl TruncationInfo {
         actual: usize,
         limit: usize,
     ) -> Self {
-        Self {
-            path: Some(path.to_string()),
-            reason: TruncationReason::UntrackedFileTooLarge,
-            message: format!(
+        Self::new(
+            Some(path.to_string()),
+            TruncationReason::UntrackedFileTooLarge,
+            format!(
                 "untracked file excluded from --git analysis: {limit_label} {actual} exceeds limit {limit}"
             ),
-        }
+        )
     }
 
     /// 解析できないソースファイルを拡張子単位で 1 件に畳んだ打ち切り。
@@ -63,17 +86,53 @@ impl TruncationInfo {
     /// 拡張子ごとに「件数 + 代表パス数件」へ集約する。`examples` は呼び出し側で
     /// ソート済み・件数上限適用済みのものを渡すこと (出力を決定論に保つ)。
     pub fn unanalyzable_source(ext: &str, count: usize, examples: &[String]) -> Self {
+        let detail = UnanalyzableSourceSummary {
+            extension: ext.to_ascii_lowercase(),
+            count,
+            examples: examples.to_vec(),
+        };
         let mut message = format!(
-            "{count} \".{ext}\" file(s) were not analyzed (no parser for this language); \
-             references inside them are not counted"
+            "{} \".{}\" file(s) were not analyzed (no parser for this language); \
+             references inside them are not counted",
+            detail.count, detail.extension
         );
-        if !examples.is_empty() {
-            message.push_str(&format!(" (e.g. {})", examples.join(", ")));
+        if !detail.examples.is_empty() {
+            message.push_str(&format!(" (e.g. {})", detail.examples.join(", ")));
         }
         Self {
             path: None,
             reason: TruncationReason::UnanalyzableSource,
             message,
+            detail: Some(detail),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unanalyzable_source_has_structured_detail_and_preserves_message() {
+        let examples = vec!["a.vue".to_owned(), "b.vue".to_owned()];
+        let info = TruncationInfo::unanalyzable_source("vue", 12, &examples);
+        assert_eq!(
+            info.message,
+            "12 \".vue\" file(s) were not analyzed (no parser for this language); references inside them are not counted (e.g. a.vue, b.vue)"
+        );
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(
+            value["detail"],
+            serde_json::json!({"extension":"vue", "count":12, "examples":examples})
+        );
+        assert_eq!(
+            serde_json::from_value::<TruncationInfo>(value).unwrap(),
+            info
+        );
+        let old = serde_json::json!({"reason":"unanalyzable_source", "message":"legacy summary"});
+        let legacy: TruncationInfo = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(legacy).unwrap(), old);
+        let size = TruncationInfo::untracked_file_too_large("generated.rs", "lines", 6000, 5000);
+        assert!(serde_json::to_value(size).unwrap().get("detail").is_none());
     }
 }

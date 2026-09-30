@@ -1746,3 +1746,51 @@ fn build_review_hook_json_blocking_categories_match_filtered_output_and_exit() {
         "終了判定を全組み合わせで確認した後の出力不一致: {category_mismatches:?}"
     );
 }
+
+/// 集約された未解析ソースの根拠は、message を読まずに hook から判断できる。
+#[test]
+fn build_review_hook_json_preserves_unanalyzable_source_detail() {
+    use crate::models::truncation::TruncationInfo;
+    let dir = tempfile::tempdir().unwrap();
+    let mut result = ReviewResult {
+        truncations: vec![
+            TruncationInfo::unanalyzable_source("vue", 12, &["a.vue".into(), "b.vue".into()]),
+            TruncationInfo::unanalyzable_source("svelte", 2, &[]),
+            TruncationInfo::untracked_file_too_large("large.ts", "lines", 6000, 5000),
+        ],
+        ..Default::default()
+    };
+    for blocking in [false, true] {
+        if blocking {
+            result.api_changes.removed.push(ApiSymbol {
+                name: "Removed".into(),
+                kind: "class".into(),
+                file: "api.ts".into(),
+                refs_internal: 0,
+            });
+        }
+        let build = build_review_hook_json(&result, dir.path().to_str().unwrap(), false);
+        assert_eq!(build.is_blocking, blocking);
+        let value = build.value.unwrap();
+        assert_eq!(
+            value["blocking_categories"],
+            if blocking {
+                serde_json::json!(["api.rm"])
+            } else {
+                serde_json::json!([])
+            }
+        );
+        assert_eq!(
+            value["trunc"][0],
+            serde_json::json!({"r":"unanalyzable_source", "d":{"x":"vue", "n":12, "e":["a.vue","b.vue"]}})
+        );
+        assert_eq!(
+            value["trunc"][1],
+            serde_json::json!({"r":"unanalyzable_source", "d":{"x":"svelte", "n":2}})
+        );
+        assert_eq!(
+            value["trunc"][2],
+            serde_json::json!({"f":"large.ts", "r":"untracked_file_too_large"})
+        );
+    }
+}

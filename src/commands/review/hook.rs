@@ -156,6 +156,16 @@ struct HookTruncation<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     f: Option<&'a str>,
     r: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    d: Option<HookUnanalyzableSourceSummary<'a>>,
+}
+
+#[derive(Serialize)]
+struct HookUnanalyzableSourceSummary<'a> {
+    x: &'a str,
+    n: usize,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    e: &'a [String],
 }
 
 #[derive(Serialize)]
@@ -536,7 +546,7 @@ pub(crate) fn build_review_hook_json_for_diff(
         );
     }
 
-    // trunc: [{f,r}] — 解析対象から外したものの申告。情報提供のみ (blocking にしない)。
+    // trunc: [{f,r,d?}] — 解析対象から外したものの申告。情報提供のみ。
     if !result.truncations.is_empty() {
         has_any_output = true;
         let truncs: Vec<HookTruncation<'_>> = result
@@ -554,6 +564,17 @@ pub(crate) fn build_review_hook_json_for_diff(
                     crate::models::truncation::TruncationReason::UnanalyzableSource => {
                         "unanalyzable_source"
                     }
+                },
+                d: if t.reason == crate::models::truncation::TruncationReason::UnanalyzableSource {
+                    t.detail
+                        .as_ref()
+                        .map(|detail| HookUnanalyzableSourceSummary {
+                            x: &detail.extension,
+                            n: detail.count,
+                            e: &detail.examples,
+                        })
+                } else {
+                    None
                 },
             })
             .collect();
