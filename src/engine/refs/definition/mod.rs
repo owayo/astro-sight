@@ -244,6 +244,13 @@ fn is_python_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bo
             .is_some_and(|name| name.id() == node.id());
     }
 
+    if definition_kinds.contains(&"function_definition")
+        && crate::engine::python_callable::lambda_binding_name(parent)
+            .is_some_and(|name| name.id() == node.id())
+    {
+        return true;
+    }
+
     // `def f(x)` の直接パラメータ。`parameters` フィールド経由であることまで確認する。
     if parent.kind() == "parameters"
         && let Some(function) = parent.parent()

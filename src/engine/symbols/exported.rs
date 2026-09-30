@@ -600,6 +600,7 @@ fn is_exported_python_with(
 
     let name = node
         .child_by_field_name("name")
+        .or_else(|| crate::engine::python_callable::lambda_binding_name(node))
         .and_then(|n| n.utf8_text(source).ok())
         .or_else(|| {
             // フォールバック: ノードが識別子そのものの場合
@@ -646,7 +647,9 @@ fn is_python_class_member(node: Node) -> bool {
     let mut own_definition = node;
     let mut current = Some(node);
     while let Some(n) = current {
-        if matches!(n.kind(), "function_definition" | "class_definition") {
+        if matches!(n.kind(), "function_definition" | "class_definition")
+            || crate::engine::python_callable::lambda_binding_name(n).is_some()
+        {
             own_definition = n;
             break;
         }
@@ -682,7 +685,9 @@ fn is_python_lexically_local(node: Node) -> bool {
     let mut own_definition = node;
     let mut current = Some(node);
     while let Some(n) = current {
-        if matches!(n.kind(), "function_definition" | "class_definition") {
+        if matches!(n.kind(), "function_definition" | "class_definition")
+            || crate::engine::python_callable::lambda_binding_name(n).is_some()
+        {
             own_definition = n;
             break;
         }

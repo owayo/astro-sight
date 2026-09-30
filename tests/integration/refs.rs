@@ -1,5 +1,65 @@
 //! refs サブコマンド (参照検索) の統合テスト。
 
+#[test]
+fn refs_python_lambda_binding_has_definition_and_real_use() {
+    let repo = TestRepo::new();
+    repo.write("sample.py", "normalize = lambda text: text.strip()\nprint(normalize(' A '))\nplain = 42\nfor item in [1]:\n    conditional = lambda text: text\ndef outer():\n    local = lambda text: text\n    return local('x')\n_private = lambda text: text\nchain = another = lambda text: text\n");
+    repo.write("surface.py", "__all__ = ['listed']\nlisted: object = lambda text: text\nunlisted = lambda text: text\nclass Handler:\n    member = lambda self, text: text\n");
+    let output = repo.run_json("refs", &["--name", "normalize"]);
+    let refs = output["refs"].as_array().unwrap();
+    assert_eq!(refs.len(), 2, "{output}");
+    assert_eq!(refs[0]["kind"], "def", "{output}");
+    assert_eq!(refs[1]["kind"], "ref", "{output}");
+    let output = cargo_bin()
+        .args(["symbols", "--path"])
+        .arg(repo.path("sample.py"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let symbols: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    for name in ["normalize", "conditional", "local", "_private"] {
+        assert!(
+            symbols["symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["name"] == name && s["kind"] == "fn"),
+            "{symbols}"
+        );
+    }
+    for name in ["plain", "chain", "another"] {
+        assert!(
+            !symbols["symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["name"] == name),
+            "単純な lambda 束縛以外は新たに callable と扱わない: {symbols}"
+        );
+    }
+    let dead = repo.run_json("dead-code", &[]);
+    let names: Vec<_> = dead["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"conditional"),
+        "未使用のモジュール束縛は候補に残る: {dead}"
+    );
+    assert!(
+        !names.contains(&"local") && !names.contains(&"_private") && !names.contains(&"normalize"),
+        "ローカル・private・使用中を未使用扱いしない: {dead}"
+    );
+    assert!(
+        names.contains(&"listed")
+            && names.contains(&"Handler.member")
+            && !names.contains(&"unlisted"),
+        "モジュールの __all__ は class メンバーを除外しない: {dead}"
+    );
+}
+
 #[allow(unused_imports)]
 use super::support::*;
 #[allow(unused_imports)]

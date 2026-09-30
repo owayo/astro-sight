@@ -1,5 +1,149 @@
 //! Python の API 差分検出テスト。
 
+#[test]
+fn detect_api_changes_python_lambda_binding_replaces_callable_not_name() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+    for (before, after) in [
+        (
+            "def normalize(text):\n    return text.strip()\n",
+            "normalize = lambda text: text.strip()\n",
+        ),
+        (
+            "normalize = lambda text: text.strip()\n",
+            "def normalize(text):\n    return text.strip()\n",
+        ),
+        (
+            "for item in [1]:\n    def normalize(text):\n        return text.strip()\n",
+            "for item in [1]:\n    normalize = lambda text: text.strip()\n",
+        ),
+        (
+            "def normalize(text):\n    return text.strip()\n",
+            "normalize = lambda text, mode: text.strip()\n",
+        ),
+        (
+            "normalize = lambda text: 'a  b'\n",
+            "normalize = lambda text: 'a b'\n",
+        ),
+        (
+            "normalize = lambda text: (\n    text.strip()\n)\n",
+            "normalize = lambda text: (\n    text.lower()\n)\n",
+        ),
+        (
+            "class Handler:\n    def normalize(self, text):\n        return text.strip()\n",
+            "class Handler:\n    normalize = lambda self, text: text.strip()\n",
+        ),
+        (
+            "class Handler:\n    normalize = lambda self, text: text.strip()\n",
+            "class Handler:\n    def normalize(self, text):\n        return text.strip()\n",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        let (name, consumer) = if before.starts_with("class Handler:") {
+            (
+                "Handler.normalize",
+                "from core import Handler\nprint(Handler().normalize(' A '))\n",
+            )
+        } else {
+            (
+                "normalize",
+                "from core import normalize\nprint(normalize(' A '))\n",
+            )
+        };
+        git_commit_files(
+            repo,
+            &[("core.py", before), ("consumer.py", consumer)],
+            "base",
+        );
+        std::fs::write(repo.join("core.py"), after).unwrap();
+        let api = detect_api_changes_from_worktree(repo);
+        assert!(
+            api.removed.is_empty() && api.removed_dead.is_empty(),
+            "{before} -> {after}: {api:?}"
+        );
+        assert!(
+            api.modified
+                .iter()
+                .filter(|change| change.name == name)
+                .count()
+                == 1
+                && !api.added.iter().any(|change| change.name == name),
+            "メタデータ・引数・本体の変化を同値扱いしない: {api:?}"
+        );
+    }
+    // callable でない置換と本当の削除は削除として残す。
+    for before in [
+        "def normalize(text):\n    return text.strip()\n",
+        "normalize = lambda text: text.strip()\n",
+    ] {
+        for after in [
+            "normalize = 42\n",
+            "",
+            "normalize = other = lambda text: text.strip()\n",
+            "normalize = (lambda text: text.strip())\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path();
+            init_git_repo_for_test(repo);
+            git_commit_files(
+                repo,
+                &[
+                    ("core.py", before),
+                    (
+                        "consumer.py",
+                        "from core import normalize\nprint(normalize(' A '))\n",
+                    ),
+                ],
+                "base",
+            );
+            std::fs::write(repo.join("core.py"), after).unwrap();
+            let api = detect_api_changes_from_worktree(repo);
+            assert!(
+                api.removed.iter().any(|change| change.name == "normalize"),
+                "{api:?}"
+            );
+        }
+    }
+    // 整形だけでは callable の契約変更を作らない。
+    for (before, after) in [
+        (
+            "normalize = lambda text: text.strip()\n",
+            "normalize = lambda  text :text.strip()  # note\n",
+        ),
+        (
+            "normalize = lambda text: (\n    text.strip()\n)\n",
+            "normalize = lambda text: (text.strip())\n",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                ("core.py", before),
+                (
+                    "consumer.py",
+                    "from core import normalize\nprint(normalize(' A '))\n",
+                ),
+            ],
+            "base",
+        );
+        std::fs::write(repo.join("core.py"), after).unwrap();
+        let api = detect_api_changes_from_worktree(repo);
+        assert!(
+            api.modified.is_empty()
+                && api.added.is_empty()
+                && api.removed.is_empty()
+                && api.removed_dead.is_empty(),
+            "{api:?}"
+        );
+    }
+}
+
 #[allow(unused_imports)]
 use crate::commands::tests::common::*;
 #[allow(unused_imports)]

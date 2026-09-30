@@ -92,6 +92,18 @@ pub(crate) fn extract_api_signature(
             column: sym.range.end.column,
         };
         if let Some(node) = root.descendant_for_point_range(start, end) {
+            // lambda は式本体も値の契約に含める。文字列内部の空白は保持し、
+            // def との置換はメタデータも変わるため互換変更へ降格しない。
+            if lang_id == crate::language::LangId::Python
+                && crate::engine::python_callable::lambda_binding_name(node).is_some()
+            {
+                return crate::engine::python_signature::normalize_signature_range(
+                    node,
+                    source,
+                    node.byte_range(),
+                )
+                .unwrap_or_else(|| node.utf8_text(source).unwrap_or("").to_owned());
+            }
             let mut cur = node;
             loop {
                 match cur.kind() {

@@ -186,6 +186,13 @@ fn run_symbol_query(
                 let name = node.utf8_text(source).unwrap_or("");
                 if !name.is_empty() {
                     let mut parent_node = node.parent().unwrap_or(node);
+                    if lang_id == LangId::Python
+                        && parent_node.kind() == "assignment"
+                        && crate::engine::python_callable::lambda_binding_name(parent_node)
+                            .is_none()
+                    {
+                        continue;
+                    }
                     // C/C++ は関数名を `function_declarator` 配下でキャプチャするため、
                     // 本体を持つ function_definition まで繰り上げる。pointer_declarator /
                     // reference_declarator / qualified_identifier を経由しても辿れる。
@@ -597,6 +604,7 @@ fn symbol_query(lang_id: LangId) -> &'static str {
         LangId::Python => {
             r#"
             (function_definition name: (identifier) @function.name)
+            (assignment left: (identifier) @function.name right: (lambda))
             (class_definition name: (identifier) @class.name)
             "#
         }
