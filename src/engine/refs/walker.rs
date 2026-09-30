@@ -11,6 +11,7 @@ use crate::engine::phpunit_refs::phpunit_metadata_ref_segments;
 use crate::language::{LangId, normalize_identifier};
 use crate::models::reference::{RefConfidence, RefKind, SymbolReference};
 
+use super::definition::bash::{BashDeclarationCache, classify_bash_occurrence};
 use super::definition::cpp::cpp_macro_body_ref_segments;
 use super::definition::php::php_name_is_case_insensitive;
 use super::definition::php::{
@@ -232,6 +233,7 @@ pub(crate) struct RefEnvironment<'a> {
     /// Rust の closure 束縛判定で使う名前別メモ。walk 1 回 (= 1 ファイル) の寿命に
     /// 閉じることで、ポインタ再利用による前ファイル結果の誤用を構造的に防ぐ。
     rust_binding_cache: RustPatternBindingCache,
+    bash_declaration_cache: BashDeclarationCache,
     bash_declarations: Vec<crate::engine::bash_parse_recovery::UnparsedBashDeclaration>,
 }
 
@@ -315,6 +317,8 @@ impl RefMatcher for IndexedMatcher<'_, '_> {
 /// 型レベルで宣言し、不要な sink (CountSink) では呼び出し側が LineIndex 構築を省ける。
 pub(crate) trait RawRefSink {
     const NEEDS_LINE_INDEX: bool;
+    /// 出現検索だけが Bash の変数名前空間を受け取る。関数の判定面とは分ける。
+    const INCLUDES_SHELL_VARS: bool;
 
     /// Rust の「フィールド名位置」の識別子 (`obj.redact` / `pub redact: bool` /
     /// `Cfg { redact: v }` / `let Cfg { redact: v }`) を参照集合から落とすか。
@@ -333,13 +337,17 @@ pub(crate) trait RawRefSink {
 
 /// hit を index 別の `Vec<SymbolReference>` に積む sink。単一名検索は長さ 1、
 /// batch 検索は長さ num のバッファを渡すことで両者を兼ねる。
-pub(crate) struct SymbolReferenceSink<'a> {
+pub(crate) struct NamespaceReferenceSink<'a, const SHELL_VARS: bool> {
     pub(crate) buckets: &'a mut [Vec<SymbolReference>],
     pub(crate) path: &'a str,
 }
 
-impl RawRefSink for SymbolReferenceSink<'_> {
+pub(crate) type SymbolReferenceSink<'a> = NamespaceReferenceSink<'a, false>;
+pub(crate) type OccurrenceReferenceSink<'a> = NamespaceReferenceSink<'a, true>;
+
+impl<const SHELL_VARS: bool> RawRefSink for NamespaceReferenceSink<'_, SHELL_VARS> {
     const NEEDS_LINE_INDEX: bool = true;
+    const INCLUDES_SHELL_VARS: bool = SHELL_VARS;
     // `refs` の出力面。識別子の出現をそのまま返す (ApiRefIndex も同経路だが、
     // 参照を過大に数える方向は api.rm を blocking のまま残す保守側に倒れる)。
     const EXCLUDES_NON_CALLABLE_FIELDS: bool = false;
@@ -391,6 +399,7 @@ pub(crate) struct VisitorAdapter<'v, V: RefVisitor> {
 
 impl<V: RefVisitor> RawRefSink for VisitorAdapter<'_, V> {
     const NEEDS_LINE_INDEX: bool = true;
+    const INCLUDES_SHELL_VARS: bool = false;
     // impact の caller 列挙。フィールドアクセスは「更新すべき呼び出し側」ではない。
     const EXCLUDES_NON_CALLABLE_FIELDS: bool = true;
 
@@ -431,6 +440,7 @@ pub(crate) struct CountSink<'a> {
 
 impl RawRefSink for CountSink<'_> {
     const NEEDS_LINE_INDEX: bool = false;
+    const INCLUDES_SHELL_VARS: bool = false;
     // dead-code の参照カウント。フィールド名位置は同名関数への参照ではないと
     // 構造的に確定するので数えない (shorthand は述語から外したのでここでも残る)。
     const EXCLUDES_NON_CALLABLE_FIELDS: bool = true;
@@ -503,7 +513,8 @@ fn visit_ref_node<M: RefMatcher, S: RawRefSink>(
         })
         .flatten()
         .map(|ix| env.bash_declarations[ix].name.as_str());
-    if (is_identifier_kind(node.kind()) || recovered_name.is_some())
+    if (is_identifier_kind(node.kind()) || recovered_name.is_some()
+        || (lang_id == LangId::Bash && node.kind() == "variable_name"))
         && let Some(text) = recovered_name.or_else(|| node.utf8_text(source).ok())
         && let Some(matches) = matcher.identifier_matches(node, text)
         && !(S::EXCLUDES_NON_CALLABLE_FIELDS
@@ -516,7 +527,16 @@ fn visit_ref_node<M: RefMatcher, S: RawRefSink>(
         && !(lang_id == LangId::Rust && is_rust_cfg_condition_identifier(node, source))
         && !is_ignored_identifier_context(node, lang_id)
     {
-        let is_def = is_definition_context(node, definition_kinds, lang_id);
+        let bash_role = (lang_id == LangId::Bash)
+            .then(|| classify_bash_occurrence(node, source, &env.bash_declaration_cache))
+            .flatten();
+        if !S::INCLUDES_SHELL_VARS && bash_role.is_some_and(|role| role.is_variable()) {
+            return;
+        }
+        let is_def = bash_role.map_or_else(
+            || is_definition_context(node, definition_kinds, lang_id),
+            |role| role.is_definition(),
+        );
         let pos = node.start_position();
         sink.on_hit(
             RawRefHit {
@@ -617,6 +637,7 @@ pub(crate) fn run_ref_walk<M: RefMatcher, S: RawRefSink>(
         line_index: line_index.as_ref(),
         lang_id,
         rust_binding_cache: RustPatternBindingCache::default(),
+        bash_declaration_cache: BashDeclarationCache::default(),
         // ERROR 回復が extglob とした宣言も全経路で保持する。count / visitor は
         // 未検証の出現を保守的に数え、refs の出力だけを unknown に分類する。
         bash_declarations: if lang_id == LangId::Bash {

@@ -37,8 +37,8 @@ pub(crate) use walker::{RefVisitEvent, RefVisitor};
 use definition::definition_node_kinds;
 use lexer_path::{count_refs_in_file_via_lexer, find_refs_batch_via_lexer, find_refs_via_lexer};
 use walker::{
-    CountSink, IndexedMatcher, SingleMatcher, SymbolReferenceSink, VisitorAdapter,
-    build_name_index, run_ref_walk,
+    CountSink, IndexedMatcher, NamespaceReferenceSink, OccurrenceReferenceSink, SingleMatcher,
+    VisitorAdapter, build_name_index, run_ref_walk,
 };
 
 /// `find_references` / `find_references_batch` 用の最大並列ワーカー数。
@@ -312,7 +312,7 @@ fn find_refs_in_file(
     };
     // 単一名検索は長さ 1 のバッファへ集約し、SymbolReferenceSink を batch と共用する。
     let mut buckets = vec![Vec::new()];
-    let mut sink = SymbolReferenceSink {
+    let mut sink = OccurrenceReferenceSink {
         buckets: &mut buckets,
         path: path.as_str(),
     };
@@ -366,6 +366,16 @@ pub fn find_references_batch_with_scan(
     glob_pattern: Option<&str>,
     options: FileScanOptions,
 ) -> Result<RefScan<ReferenceBatchMap>> {
+    find_references_batch_with_scan_policy::<true>(symbol_names, dir, glob_pattern, options)
+}
+
+/// API 判定は Bash の変数を含めず、公開の出現検索は含める。
+pub(crate) fn find_references_batch_with_scan_policy<const SHELL_VARS: bool>(
+    symbol_names: &[String],
+    dir: &Path,
+    glob_pattern: Option<&str>,
+    options: FileScanOptions,
+) -> Result<RefScan<ReferenceBatchMap>> {
     use std::collections::HashMap;
 
     if symbol_names.is_empty() {
@@ -399,7 +409,8 @@ pub fn find_references_batch_with_scan(
                 |(mut local, mut failed), path| {
                     let scanned = path.to_str().and_then(|path_str| {
                         let utf8_path = camino::Utf8Path::new(path_str);
-                        find_refs_batch_in_file_indexed(symbol_names, &acs, utf8_path).ok()
+                        find_refs_batch_in_file_indexed::<SHELL_VARS>(symbol_names, &acs, utf8_path)
+                            .ok()
                     });
                     match scanned {
                         Some(per_file) => {
@@ -599,7 +610,7 @@ pub(crate) fn visit_refs_and_defs_in_file_cb<V: RefVisitor>(
 
 /// 単一ファイル内で複数シンボルの参照を index ベースの Vec に格納する。
 /// find_references_batch の fold/reduce から呼ばれる。
-pub(crate) fn find_refs_batch_in_file_indexed(
+pub(crate) fn find_refs_batch_in_file_indexed<const SHELL_VARS: bool>(
     symbol_names: &[String],
     acs: &[(usize, aho_corasick::AhoCorasick)],
     path: &camino::Utf8Path,
@@ -638,7 +649,7 @@ pub(crate) fn find_refs_batch_in_file_indexed(
     let matcher = IndexedMatcher {
         name_index: &name_index,
     };
-    let mut sink = SymbolReferenceSink {
+    let mut sink = NamespaceReferenceSink::<SHELL_VARS> {
         buckets: &mut result,
         path: path.as_str(),
     };

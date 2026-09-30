@@ -224,6 +224,10 @@ astro-sight refs --name "new" --dir . --max-results unlimited --token-budget unl
 
 `path` は `--dir` からの相対パスで返す。`--name` は空文字を受け付けない。`--names` も空要素のみ（例: `",,,"`）の場合は `INVALID_REQUEST` を返す。`--dir` にはディレクトリのみ指定でき、ファイルパスを渡した場合も `INVALID_REQUEST` を返す。
 
+### Bash の変数
+
+Bash では変数代入、`$NAME` / `${NAME}` 展開、`local` / `export` / `declare` / `typeset` / `readonly` の名前も検索する。単一検索と一括検索で同じ出現を返し、コメントと単一引用符内の文字列は除く。変数の出現は、`dead-code` や API 差分で同名シェル関数の使用とは数えない。`export -f` などの関数オプション、動的な宣言オプション、オプションなしの `unset NAME` は保守的に関数参照として残す。`read NAME` / `printf -v NAME` などは従来の単語単位の分類を維持する。
+
 ### 出力件数の上限と `result_summary`
 
 高頻度な識別子は 1 回の呼び出しで数千件返り、表現をいくら最適化してもトークン消費が膨れ上がる（導入時点の実測: 自リポジトリの `refs --name new --dir .` が 1,846 件 ≈ 68,000 トークン）。エージェントは呼ぶ前にその識別子が高頻度だと知りようがないため、既定で **100 件 / 推定 3,000 トークン**の上限を課す（同条件で約 2,600 トークンに収まる）。

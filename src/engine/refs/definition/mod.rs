@@ -9,6 +9,7 @@
 //! 汎用スライスの流用や grammar の改称に追随できていない場合、エラーにならず
 //! 「1 つもマッチせず参照が 0 件」という静かな壊れ方をするため。
 
+pub(crate) mod bash;
 pub(crate) mod cpp;
 pub(crate) mod php;
 pub(crate) mod ruby;

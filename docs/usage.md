@@ -224,6 +224,10 @@ Output (`astro-sight refs --name extract_symbols --dir .`):
 
 `path` is relative to `--dir`. `--name` does not accept an empty string, and `--names` with only empty elements (for example `",,,"`) returns `INVALID_REQUEST`. `--dir` accepts only a directory; a file path also returns `INVALID_REQUEST`.
 
+### Bash Variables
+
+Bash searches include variable assignments, `$NAME` / `${NAME}` expansions, and names in `local`, `export`, `declare`, `typeset`, and `readonly`. Single and batch searches return the same occurrences. Comments and single-quoted strings are excluded. Variable occurrences do not count as uses of a same-named shell function in `dead-code` or API change analysis; function options such as `export -f`, dynamic declaration options, and bare `unset NAME` remain conservative function references. Commands such as `read NAME` and `printf -v NAME` retain their existing word-based classification.
+
 ### Output Limits and `result_summary`
 
 A frequent identifier returns thousands of results in one call, and the token cost balloons however well the representation is optimized (measured when the limits were introduced: `refs --name new --dir .` on this repository returned 1,846 results ≈ 68,000 tokens). An agent has no way of knowing before the call that an identifier is frequent, so a default limit of **100 results / an estimated 3,000 tokens** applies (the same query then fits in about 2,600 tokens).

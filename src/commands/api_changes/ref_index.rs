@@ -46,7 +46,7 @@ impl ApiRefIndex {
         // 検索失敗時と同じ保守側ポリシー (cross_file/blocking → true) に倒れる
         // (false negative を起こさない)。
         let service = AppService::new();
-        match service.find_references_batch(&sorted, dir, None) {
+        match service.find_symbol_references_batch(&sorted, dir, None) {
             Ok(results) => {
                 for r in results {
                     index.refs.insert(r.symbol, r.references);

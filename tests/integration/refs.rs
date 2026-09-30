@@ -6,6 +6,116 @@ use super::support::*;
 use std::process::{Command, Stdio};
 
 #[test]
+fn refs_bash_variables_are_occurrences_in_single_and_batch_search() {
+    let repo = TestRepo::new();
+    repo.write(
+        "sample.sh",
+        "foo() { :; }\nfoo=1\nfoo+=2\nscope() { local foo; }\nexport foo\ndeclare -i foo\nreadonly foo\necho \"$foo\" \"${foo:-fallback}\" \"'$foo'\"\necho '$foo'\n# $foo\n",
+    );
+    repo.write(
+        "sample.php",
+        "<?php function php_name() {} $php_name = 1; echo $php_name;\n",
+    );
+    let single = repo.run_json("refs", &["--name", "foo"]);
+    let refs = single["refs"].as_array().unwrap();
+    let shell: Vec<_> = refs.iter().filter(|r| r["path"] == "sample.sh").collect();
+    assert_eq!(shell.len(), 10, "{single}");
+    let defs: Vec<_> = shell
+        .iter()
+        .filter(|r| r["kind"] == "def")
+        .map(|r| r["ln"].as_u64().unwrap())
+        .collect();
+    assert_eq!(defs, vec![0, 1, 2, 3, 4, 5, 6], "{single}");
+    assert_eq!(
+        shell
+            .iter()
+            .filter(|r| r["kind"] == "ref" && r["ln"] == 7)
+            .count(),
+        3,
+        "{single}"
+    );
+    let php = repo.run_json("refs", &["--name", "php_name"]);
+    assert_eq!(
+        php["refs"].as_array().unwrap().len(),
+        3,
+        "PHP の既存結果を維持する: {php}"
+    );
+    let output = cargo_bin()
+        .args(["refs", "--names", "foo,missing_name", "--dir"])
+        .arg(repo.root())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows[0], single);
+    assert!(rows[1]["refs"].as_array().unwrap().is_empty());
+    // Session も CLI と同じ変数の出現を返す。
+    {
+        use std::io::Write;
+        let mut child = cargo_bin()
+            .arg("session")
+            .env("ASTRO_SIGHT_WORKSPACE", repo.root())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let request = serde_json::json!({"command":"refs", "name":"foo", "dir":"."});
+        writeln!(child.stdin.as_mut().unwrap(), "{request}").unwrap();
+        drop(child.stdin.take());
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let session: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(session, single);
+    }
+    let dead = repo.run_json("dead-code", &[]);
+    assert!(
+        dead["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "foo"),
+        "変数だけでは同名関数は live にならない: {dead}"
+    );
+}
+
+#[test]
+fn refs_bash_variable_occurrences_do_not_keep_removed_functions_blocking() {
+    let repo = TestRepo::new();
+    repo.write("functions.sh", "foo() { :; }\n");
+    repo.write("variables.sh", "foo=1\necho \"${foo}\"\n");
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("functions.sh", "# removed\n");
+    let refs = repo.run_json("refs", &["--name", "foo"]);
+    assert_eq!(refs["refs"].as_array().unwrap().len(), 2, "{refs}");
+    let hook = || {
+        cargo_bin()
+            .args(["review", "--git", "--hook", "--dir"])
+            .arg(repo.root())
+            .output()
+            .unwrap()
+    };
+    let output = hook();
+    assert!(
+        output.status.success(),
+        "変数は削除した関数の参照ではない: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    repo.write("variables.sh", "foo=1\necho \"${foo}\"\nfoo\n");
+    let output = hook();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "関数呼び出しが残れば blocking を維持する"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("foo"));
+}
+
+#[test]
 fn refs_finds_symbol() {
     let output = cargo_bin()
         .args(["refs", "--name", "AstgenResponse", "--dir", "src/"])
