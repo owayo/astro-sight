@@ -66,6 +66,7 @@ fn build_review_hook_json_compatible_modified_is_informational() {
         build.value.unwrap().to_string(),
         concat!(
             r#"{"api":{"mod_compat":[{"f":"ScheduleItem.tsx","n":"ScheduleItem","reason":"react_component_wrapper"}]},"#,
+            r#""blocking_categories":[],"#,
             r#""hint":"False positives? Run astro-sight-triage skill."}"#
         ),
         "preserve_order が有効でも hook の JSON キー順を保つ"
@@ -1593,5 +1594,155 @@ fn build_review_hook_json_resolves_updated_call_line_in_diff_file() {
     assert_eq!(
         hook_json["impacts"][0]["refs"][0]["p"], "script.py",
         "{hook_json}"
+    );
+}
+#[test]
+fn build_review_hook_json_blocking_categories_match_filtered_output_and_exit() {
+    use crate::models::impact::{AffectedSymbol, FileImpact, ImpactedCaller};
+    use crate::models::review::DeadSymbol;
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("changed.ts"),
+        "export function changed() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("caller.ts"),
+        "import { changed } from './changed';\nchanged();\n",
+    )
+    .unwrap();
+    let symbol = || ApiSymbol {
+        name: "item".into(),
+        kind: "function".into(),
+        file: "changed.ts".into(),
+        refs_internal: 0,
+    };
+    let change = || ApiSymbolChange {
+        name: "item".into(),
+        kind: "function".into(),
+        file: "changed.ts".into(),
+        old_signature: None,
+        new_signature: None,
+        no_resolved_internal_callers: false,
+        contract_change: None,
+    };
+    // 全組み合わせで既存の終了判定を固定する。影響の added と値変更の非 strict は
+    // 出力に存在しても blocking の根拠にならない、という対照を同時に検査する。
+    let mut category_mismatches = Vec::new();
+    for mask in 0u8..64 {
+        let mut result = ReviewResult::default();
+        if mask & 32 != 0 {
+            result.api_changes.added.push(symbol());
+            result.api_changes.removed_dead.push(symbol());
+            result.missing_cochanges.push(MissingCochange {
+                file: "historical.ts".into(),
+                expected_with: "changed.ts".into(),
+                confidence: 0.9,
+                co_changes: 9,
+                denominator: Some(10),
+                evidence: None,
+            });
+            result.truncations.push(
+                crate::models::truncation::TruncationInfo::untracked_file_too_large(
+                    "large.ts", "lines", 80_000, 5_000,
+                ),
+            );
+        }
+        result.impact.changes.push(FileImpact {
+            path: "changed.ts".into(),
+            hunks: vec![],
+            affected_symbols: vec![AffectedSymbol {
+                name: "changed".into(),
+                kind: "function".into(),
+                change_type: if mask & 1 != 0 { "modified" } else { "added" }.into(),
+            }],
+            signature_changes: vec![],
+            impacted_callers: vec![ImpactedCaller {
+                path: "caller.ts".into(),
+                name: "changed".into(),
+                line: 1,
+                symbols: vec!["changed".into()],
+                confidence: None,
+            }],
+            low_confidence_callers: vec![],
+            informational_callers: vec![],
+        });
+        if mask & 2 != 0 {
+            result.api_changes.removed.push(symbol());
+        }
+        if mask & 4 != 0 {
+            result.api_changes.modified.push(change());
+        }
+        if mask & 8 != 0 {
+            result.api_changes.const_value_changes.push(change());
+        }
+        if mask & 16 != 0 {
+            result.dead_symbols.push(DeadSymbol {
+                name: "unused".into(),
+                kind: "function".into(),
+                file: "unused.ts".into(),
+                line: Some(0),
+            });
+        }
+        for strict in [false, true] {
+            let build = build_review_hook_json(&result, dir.path().to_str().unwrap(), strict);
+            let expected_exit = mask & 23 != 0 || (strict && mask & 8 != 0);
+            assert_eq!(
+                build.is_blocking, expected_exit,
+                "mask={mask}, strict={strict}"
+            );
+            assert_eq!(
+                build.value.is_some(),
+                mask != 0,
+                "mask={mask}, strict={strict}"
+            );
+            if mask == 0 {
+                continue;
+            }
+            let value = build.value.unwrap();
+            let expected: Vec<_> = [
+                (1, "impacts"),
+                (2, "api.rm"),
+                (4, "api.mod"),
+                (8, "api.const_value"),
+                (16, "dead"),
+            ]
+            .into_iter()
+            .filter(|(bit, _)| mask & bit != 0 && (*bit != 8 || strict))
+            .map(|(_, category)| category)
+            .collect();
+            if value["blocking_categories"] != serde_json::json!(expected) {
+                category_mismatches.push((
+                    mask,
+                    strict,
+                    value["blocking_categories"].clone(),
+                    expected,
+                ));
+            }
+            for category in value["blocking_categories"].as_array().unwrap() {
+                let mut bucket = &value;
+                for key in category.as_str().unwrap().split('.') {
+                    bucket = &bucket[key];
+                }
+                assert!(
+                    !bucket.as_array().unwrap().is_empty(),
+                    "停止理由に対応する実際の出力が必要: {value}"
+                );
+            }
+            if mask & 32 != 0 {
+                assert!(value["api"].get("add").is_some() && value["api"].get("rm_dead").is_some());
+                assert!(value.get("trunc").is_some() && value.get("cochange").is_some());
+            }
+        }
+    }
+    let empty = build_review_hook_json(
+        &ReviewResult::default(),
+        dir.path().to_str().unwrap(),
+        false,
+    );
+    assert!(empty.value.is_none() && !empty.is_blocking);
+    assert!(
+        category_mismatches.is_empty(),
+        "終了判定を全組み合わせで確認した後の出力不一致: {category_mismatches:?}"
     );
 }

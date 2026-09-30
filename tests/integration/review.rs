@@ -1902,3 +1902,45 @@ fn zsh_parse_errors_keep_cross_language_removals_blocking() {
         }
     }
 }
+#[test]
+fn review_hook_explains_blocking_categories_without_promoting_information() {
+    let repo = TestRepo::new();
+    repo.write("api.ts", "export function convert(value: string): string { return value; }\nexport const LABEL: string = 'before';\nexport type Old = number;\n");
+    repo.write(
+        "caller.ts",
+        "import { convert, LABEL } from './api';\nconsole.log(convert('a'), LABEL);\n",
+    );
+    repo.init_git();
+    repo.commit_all("base");
+    repo.write("api.ts", "export function convert(value: string, mode: string): string { return value; }\nexport const LABEL: string = 'after';\n");
+    for (strict, expected) in [
+        (false, vec!["impacts", "api.mod"]),
+        (true, vec!["impacts", "api.mod", "api.const_value"]),
+    ] {
+        let mut command = cargo_bin();
+        command
+            .args(["review", "--dir"])
+            .arg(repo.root())
+            .args(["--git", "--hook"]);
+        if strict {
+            command.arg("--strict-public-const-values");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        let value: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(
+            value["blocking_categories"],
+            serde_json::json!(expected),
+            "{value}"
+        );
+        assert!(
+            value["api"].get("const_value").is_some() && value["api"].get("rm_dead").is_some(),
+            "{value}"
+        );
+        assert!(
+            value.get("dead").is_none(),
+            "使用中の公開名は dead にしない: {value}"
+        );
+    }
+}

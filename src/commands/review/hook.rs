@@ -14,6 +14,23 @@ pub(crate) struct HookJsonBuild {
     pub is_blocking: bool,
 }
 
+/// hook の exit 1 を発生させたカテゴリ。情報提供の同居を原因と誤認しないため、
+/// 最終フィルタ後の判定と説明を同じ集合から生成する。列挙順を出力順として固定する。
+#[derive(Serialize, PartialEq, Eq, PartialOrd, Ord)]
+enum HookBlockingCategory {
+    #[serde(rename = "impacts")]
+    Impacts,
+    #[serde(rename = "api.rm")]
+    ApiRm,
+    #[serde(rename = "api.mod")]
+    ApiMod,
+    /// strict 指定時の `api.const_value` バケット。
+    #[serde(rename = "api.const_value")]
+    ApiConstValue,
+    #[serde(rename = "dead")]
+    Dead,
+}
+
 #[derive(Default)]
 struct HookImpactGroup {
     changed_symbols: std::collections::BTreeSet<String>,
@@ -454,14 +471,13 @@ pub(crate) fn build_review_hook_json_for_diff(
 
     // 空セクションは省略した compact JSON を構築
     let mut hook_obj = serde_json::Map::new();
-    // has_blocking_issues: Stop hook を止めるべき重要な検出 (impacts / api / dead)
     // has_any_output: 出力すべき検出 (上記 + cochange)
-    let mut has_blocking_issues = false;
+    let mut blocking_categories = Vec::new();
     let mut has_any_output = false;
 
     // impacts: [{src,syms,refs:[{p,ln,s}]}]
     if !unresolved.is_empty() {
-        has_blocking_issues = true;
+        blocking_categories.push(HookBlockingCategory::Impacts);
         has_any_output = true;
         hook_obj.insert("impacts".into(), impact_groups_value(&unresolved));
     }
@@ -503,12 +519,15 @@ pub(crate) fn build_review_hook_json_for_diff(
     // 破壊的変更ではないため Stop hook のブロッキング対象から外し informational 扱いにする。
     // api.removed / api.modified は破壊的変更の可能性があるため従来どおり blocking。
     // const_value (値のみ変更) は `--strict-public-const-values` 指定時のみ blocking に昇格する。
-    let has_api_breaking = !result.api_changes.removed.is_empty()
-        || !result.api_changes.modified.is_empty()
-        || (strict_const_values && !result.api_changes.const_value_changes.is_empty());
     if !api.is_empty() {
-        if has_api_breaking {
-            has_blocking_issues = true;
+        if !api.removed.is_empty() {
+            blocking_categories.push(HookBlockingCategory::ApiRm);
+        }
+        if !api.modified.is_empty() {
+            blocking_categories.push(HookBlockingCategory::ApiMod);
+        }
+        if strict_const_values && !api.const_value_changes.is_empty() {
+            blocking_categories.push(HookBlockingCategory::ApiConstValue);
         }
         has_any_output = true;
         hook_obj.insert(
@@ -546,7 +565,7 @@ pub(crate) fn build_review_hook_json_for_diff(
 
     // dead: [{n,f,l}]
     if !result.dead_symbols.is_empty() {
-        has_blocking_issues = true;
+        blocking_categories.push(HookBlockingCategory::Dead);
         has_any_output = true;
         let dead: Vec<HookDeadSymbol<'_>> = result
             .dead_symbols
@@ -570,6 +589,15 @@ pub(crate) fn build_review_hook_json_for_diff(
         };
     }
 
+    // 空配列も「情報提供だけで停止しない」という事実なので省略しない。
+    blocking_categories.sort_unstable();
+    blocking_categories.dedup();
+    let is_blocking = !blocking_categories.is_empty();
+    hook_obj.insert(
+        "blocking_categories".into(),
+        serde_json::to_value(blocking_categories).expect("hook categories should serialize"),
+    );
+
     hook_obj.insert(
         "hint".into(),
         serde_json::Value::String("False positives? Run astro-sight-triage skill.".into()),
@@ -580,7 +608,7 @@ pub(crate) fn build_review_hook_json_for_diff(
     value.sort_all_objects();
     HookJsonBuild {
         value: Some(value),
-        is_blocking: has_blocking_issues,
+        is_blocking,
     }
 }
 
