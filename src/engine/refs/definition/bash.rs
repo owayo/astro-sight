@@ -1,27 +1,83 @@
 //! Bash の変数の出現と、同名の関数の参照を分離する。
 
-use std::{cell::RefCell, collections::HashMap};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
 use tree_sitter::Node;
 
 #[derive(Clone, Copy)]
 pub(crate) enum BashOccurrence {
     VariableDefinition,
     VariableReference,
+    // 宣言コマンドや builtin/command 自体も関数に上書きされ得る。
+    DeclarationName,
     FunctionReference,
 }
 
 impl BashOccurrence {
     pub(crate) fn is_variable(self) -> bool {
-        !matches!(self, Self::FunctionReference)
+        matches!(self, Self::VariableDefinition | Self::VariableReference)
     }
 
-    pub(crate) fn is_definition(self) -> bool {
+    pub(crate) fn is_definition(self, occurrences: bool) -> bool {
         matches!(self, Self::VariableDefinition)
+            || (occurrences && matches!(self, Self::DeclarationName))
     }
 }
 
 #[derive(Default)]
-pub(crate) struct BashDeclarationCache(RefCell<HashMap<usize, BashOccurrence>>);
+// Node::id は同じ Tree 内でのみ有効。キャッシュは 1 ファイルの walk に閉じる。
+pub(crate) struct BashDeclarationCache {
+    roles: RefCell<HashMap<usize, BashOccurrence>>,
+    overrides: RefCell<Option<HashSet<String>>>,
+}
+
+impl BashDeclarationCache {
+    fn is_overridden(&self, command: Node<'_>, source: &[u8]) -> bool {
+        let name = if command.kind() == "command" {
+            command.child_by_field_name("name")
+        } else {
+            command.child(0)
+        }
+        .and_then(|n| n.utf8_text(source).ok());
+        if self.overrides.borrow().is_none() {
+            let mut root = command;
+            while let Some(parent) = root.parent() {
+                root = parent;
+            }
+            let mut names = HashSet::new();
+            // 不完全な構文から「上書きなし」を証明しない。
+            if root.has_error() {
+                names.insert("*".to_string());
+            }
+            let mut cursor = root.walk();
+            loop {
+                let node = cursor.node();
+                if node.kind() == "function_definition"
+                    && let Some(name) = node
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(source).ok())
+                {
+                    names.insert(name.to_string());
+                }
+                if cursor.goto_first_child() {
+                    continue;
+                }
+                while !cursor.goto_next_sibling() {
+                    if !cursor.goto_parent() {
+                        *self.overrides.borrow_mut() = Some(names);
+                        return self.is_overridden(command, source);
+                    }
+                }
+            }
+        }
+        let overrides = self.overrides.borrow();
+        overrides.as_ref().is_some_and(|names| {
+            names.contains("*") || name.is_none_or(|name| names.contains(name))
+        })
+    }
+}
 
 /// フラグの走査は宣言コマンドごとに一度だけ。多数の宣言名でも二乗走査にしない。
 pub(crate) fn classify_bash_occurrence(
@@ -29,12 +85,12 @@ pub(crate) fn classify_bash_occurrence(
     source: &[u8],
     cache: &BashDeclarationCache,
 ) -> Option<BashOccurrence> {
-    let parent = node.parent()?;
     if !matches!(node.kind(), "variable_name" | "word") {
         return None;
     }
-    let (command, skip) = match parent.kind() {
-        "declaration_command" | "unset_command" => (Some(parent), 0),
+    let parent = node.parent()?;
+    let (command, keyword) = match parent.kind() {
+        "declaration_command" | "unset_command" => (Some(parent), None),
         "command" => {
             let name = parent.child_by_field_name("name")?.utf8_text(source).ok()?;
             if !matches!(name, "builtin" | "command") {
@@ -52,19 +108,25 @@ pub(crate) fn classify_bash_occurrence(
             {
                 return None;
             }
-            (Some(parent), 1)
+            (Some(parent), Some(first.utf8_text(source).ok()?))
         }
-        _ => (None, 0),
+        _ => (None, None),
     };
     if let Some(command) = command {
         if !node.utf8_text(source).ok().is_some_and(is_variable_name) {
             return None;
         }
-        if let Some(role) = cache.0.borrow().get(&command.id()).copied() {
+        if let Some(role) = cache.roles.borrow().get(&command.id()).copied() {
             return Some(role);
         }
-        let role = declaration_role(command, source, skip);
-        cache.0.borrow_mut().insert(command.id(), role);
+        let role = declaration_role(command, source, keyword);
+        let role = match role {
+            BashOccurrence::VariableDefinition if !cache.is_overridden(command, source) => {
+                BashOccurrence::DeclarationName
+            }
+            _ => BashOccurrence::FunctionReference,
+        };
+        cache.roles.borrow_mut().insert(command.id(), role);
         return Some(role);
     }
     if node.kind() != "variable_name" {
@@ -106,23 +168,24 @@ fn is_variable_name(name: &str) -> bool {
         && chars.all(|c| c == b'_' || c.is_ascii_alphanumeric())
 }
 
-fn declaration_role(command: Node<'_>, source: &[u8], skip: usize) -> BashOccurrence {
+fn declaration_role(command: Node<'_>, source: &[u8], keyword: Option<&str>) -> BashOccurrence {
     let mut cursor = command.walk();
-    let mut children = command.named_children(&mut cursor);
-    // builtin/command の command_name と、その直後の宣言コマンド名を飛ばす。
-    if skip != 0 {
-        children.next();
-    }
-    let mut args = children.skip(skip).filter(|n| n.kind() != "comment");
-    let unset = command.kind() == "unset_command"
-        || (skip != 0
-            && command
-                .utf8_text(source)
-                .ok()
-                .is_some_and(|s| s.split_whitespace().nth(1) == Some("unset")));
+    // 前置代入・redirect・継続行があっても引数フィールドだけを見る。
+    let args: Vec<_> = if keyword.is_some() {
+        command
+            .children_by_field_name("argument", &mut cursor)
+            .skip(1)
+            .collect()
+    } else {
+        command
+            .named_children(&mut cursor)
+            .filter(|n| n.kind() != "comment")
+            .collect()
+    };
+    let unset = command.kind() == "unset_command" || keyword == Some("unset");
     let mut variable_only = false;
     let mut print_only = false;
-    for arg in &mut args {
+    for arg in args {
         if matches!(arg.kind(), "variable_name" | "variable_assignment") {
             break;
         }
@@ -130,6 +193,7 @@ fn declaration_role(command: Node<'_>, source: &[u8], skip: usize) -> BashOccurr
             return BashOccurrence::FunctionReference;
         };
         let text = match arg.kind() {
+            "word" if text.contains('\\') => return BashOccurrence::FunctionReference,
             "word" => text,
             "raw_string" => text.trim_matches('\''),
             "string"

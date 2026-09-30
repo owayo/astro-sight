@@ -71,7 +71,9 @@ fn refs_bash_variables_are_occurrences_in_single_and_batch_search() {
         let session: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(session, single);
     }
-    let dead = repo.run_json("dead-code", &[]);
+    let variables = TestRepo::new();
+    variables.write("sample.sh", "foo() { :; }\nfoo=1\necho \"$foo\"\n");
+    let dead = variables.run_json("dead-code", &[]);
     assert!(
         dead["dead_symbols"]
             .as_array()
@@ -80,6 +82,48 @@ fn refs_bash_variables_are_occurrences_in_single_and_batch_search() {
             .any(|s| s["name"] == "foo"),
         "変数だけでは同名関数は live にならない: {dead}"
     );
+}
+
+#[test]
+fn refs_bash_overridden_declaration_commands_keep_function_calls_live() {
+    let repo = TestRepo::new();
+    repo.write("functions.sh", "foo() { :; }\n");
+    repo.write("commands.sh", "local() { \"$@\"; }\nlocal foo\n");
+    repo.init_git();
+    repo.commit_all("initial");
+    let dead = repo.run_json("dead-code", &[]);
+    assert!(
+        !dead["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "foo"),
+        "上書き関数の引数は本物の呼び出しになり得る: {dead}"
+    );
+    repo.write("functions.sh", "# removed\n");
+    let output = cargo_bin()
+        .args(["review", "--git", "--hook", "--dir"])
+        .arg(repo.root())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    for commands in [
+        "builtin() { shift; \"$@\"; }\nbuiltin local foo\n",
+        "command() { shift; \"$@\"; }\ncommand local foo\n",
+        "local foo\n",
+    ] {
+        repo.write("functions.sh", "foo() { :; }\nlocal() { \"$@\"; }\n");
+        repo.write("commands.sh", commands);
+        let dead = repo.run_json("dead-code", &[]);
+        assert!(
+            !dead["dead_symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["name"] == "foo"),
+            "別ファイルや前置コマンドの上書きも保守的に保持する: {commands}: {dead}"
+        );
+    }
 }
 
 #[test]

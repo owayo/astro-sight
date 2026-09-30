@@ -535,7 +535,7 @@ fn visit_ref_node<M: RefMatcher, S: RawRefSink>(
         }
         let is_def = bash_role.map_or_else(
             || is_definition_context(node, definition_kinds, lang_id),
-            |role| role.is_definition(),
+            |role| role.is_definition(S::INCLUDES_SHELL_VARS),
         );
         let pos = node.start_position();
         sink.on_hit(

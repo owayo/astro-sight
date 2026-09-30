@@ -226,7 +226,7 @@ astro-sight refs --name "new" --dir . --max-results unlimited --token-budget unl
 
 ### Bash の変数
 
-Bash では変数代入、`$NAME` / `${NAME}` 展開、`local` / `export` / `declare` / `typeset` / `readonly` の名前も検索する。単一検索と一括検索で同じ出現を返し、コメントと単一引用符内の文字列は除く。変数の出現は、`dead-code` や API 差分で同名シェル関数の使用とは数えない。`export -f` などの関数オプション、動的な宣言オプション、オプションなしの `unset NAME` は保守的に関数参照として残す。`read NAME` / `printf -v NAME` などは従来の単語単位の分類を維持する。
+Bash では変数代入、`$NAME` / `${NAME}` 展開、`local` / `export` / `declare` / `typeset` / `readonly` の名前も検索する。単一検索と一括検索で同じ出現を返し、コメントと単一引用符内の文字列は除く。代入と展開は、`dead-code` や API 差分で同名シェル関数の使用とは数えない。宣言コマンドに渡された名前は、コマンド自身や `builtin` / `command` も関数に上書きできるため、意味解析では保守的に関数参照として残す。公開検索では通常の宣言名を定義として返すが、同じファイルにコマンドの上書きがある場合や構文エラーがある場合は参照として残す。関数オプションや動的な宣言オプションも参照とする。`read NAME` / `printf -v NAME` などは従来の単語単位の分類を維持する。
 
 ### 出力件数の上限と `result_summary`
 

@@ -1,6 +1,34 @@
 use super::*;
 
 #[test]
+fn bash_function_options_survive_command_prefix_syntax() {
+    for command in [
+        "LC_ALL=C builtin unset foo\n",
+        ">/dev/null command export -f foo\n",
+        "builtin \\\nunset foo\n",
+        "export \\-f foo\n",
+        "typeset -fx foo\n",
+        "builtin() { shift; \"$@\"; }\nLC_ALL=C builtin local foo\n",
+        "builtin declare -- foo\n",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("sample.sh"),
+            format!("foo() {{ :; }}\n{command}"),
+        )
+        .unwrap();
+        let refs = find_references("foo", dir.path(), None).unwrap();
+        assert_eq!(refs.len(), 2, "{command}: {refs:?}");
+        let expected = if command == "builtin declare -- foo\n" {
+            RefKind::Definition
+        } else {
+            RefKind::Reference
+        };
+        assert_eq!(refs[1].kind, Some(expected), "{command}: {refs:?}");
+    }
+}
+
+#[test]
 fn bash_variable_namespace_is_separate_in_semantic_walkers() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sample.sh");
@@ -20,7 +48,10 @@ fn bash_variable_namespace_is_separate_in_semantic_walkers() {
     assert_eq!(defs, vec![0, 1, 3, 11, 12, 14]);
     let semantic = find_refs_batch_in_file_indexed::<false>(&names, &acs, path).unwrap();
     let lines: Vec<_> = semantic[0].iter().map(|r| r.line).collect();
-    assert_eq!(lines, vec![0, 4, 5, 6, 7, 8, 13, 15, 16]);
+    assert_eq!(
+        lines,
+        vec![0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    );
     struct Recorder(Vec<(usize, bool)>);
     impl RefVisitor for Recorder {
         fn on_ref(&mut self, event: RefVisitEvent<'_>) {
@@ -36,7 +67,7 @@ fn bash_variable_namespace_is_separate_in_semantic_walkers() {
             .map(|r| (r.line, r.kind == Some(RefKind::Definition)))
             .collect::<Vec<_>>()
     );
-    assert_eq!(count_refs_in_file(&names, &acs, path).unwrap(), vec![8]);
+    assert_eq!(count_refs_in_file(&names, &acs, path).unwrap(), vec![14]);
 }
 
 /// bash の `trap '<handler>' SIG` 内の関数参照が count 経路 (CountSink) で
