@@ -25,6 +25,10 @@ pub(crate) struct RefAttribution {
 /// 参照が「残存シンボル由来」であることの根拠。
 #[derive(Clone)]
 pub(crate) enum RefOrigin {
+    /// 通常の自由関数定義、または同じ Python モジュール内での読み取り。
+    IndependentDefinition { path: String },
+    /// Rust のローカル値束縛・非 callable なフィールド名位置。
+    LocalValue,
     /// 参照ファイル自身に同名定義が残存している (TS/JS/bash)。TS/JS は削除ファイルからの
     /// 同名 import が同ファイル定義と共存できない (duplicate declaration) ため、bash は
     /// 削除ファイルが消えても同ファイル定義が残り未定義呼び出しにならないため、削除
@@ -78,6 +82,13 @@ pub(crate) fn proves_survivor_origin(
         return true;
     }
     match &attr.origin {
+        RefOrigin::IndependentDefinition { path } => {
+            candidate.kind == "function"
+                && !candidate.name.contains('.')
+                && super::removed_scope::module_key(path)
+                    != super::removed_scope::module_key(candidate.old_path)
+        }
+        RefOrigin::LocalValue => candidate.kind == "function" && !candidate.name.contains('.'),
         RefOrigin::SelfDefined { sourced_candidates } => sourced_candidates
             .as_ref()
             .is_none_or(|sourced| !sourced.contains(candidate.old_path)),
@@ -101,6 +112,24 @@ pub(crate) fn proves_survivor_origin(
         }
         RefOrigin::Unproven => false,
     }
+}
+
+/// 定義数ガードの緩和では、既存のファイル単位 SelfDefined を証明に使わない。
+pub(crate) fn proves_independent_definition(
+    attr: &RefAttribution,
+    candidate: &RemovedCandidateRef<'_>,
+    residual_def_paths: &HashSet<String>,
+) -> bool {
+    let cross_language = match (attr.ref_lang, path_lang(candidate.old_path)) {
+        (Some(reference), Some(old)) => !reference.can_reference_definition_in(old),
+        _ => false,
+    };
+    (cross_language
+        || matches!(
+            &attr.origin,
+            RefOrigin::IndependentDefinition { .. } | RefOrigin::LocalValue
+        ))
+        && proves_survivor_origin(attr, candidate, residual_def_paths)
 }
 
 /// 削除元 Python ファイルのシンボルへ属性アクセスで到達しうるモジュール名。
@@ -130,6 +159,9 @@ fn python_module_names(old_path: &str) -> Vec<String> {
 /// (ref_path, symbol) 単位のファイル解析結果。参照ループでキャッシュされ、
 /// `attribution_for_ref` で `RefAttribution` に変換される。
 pub(crate) struct RefAttributionFacts {
+    /// 0 始まりの行・byte 列。解析一回の寿命に閉じ、別 revision へ再利用しない。
+    independent_positions: super::removed_scope::Positions,
+    local_positions: super::removed_scope::Positions,
     /// 外部パッケージ import の local binding が symbol
     /// (従来の analyze_external_import_for_symbol と同義)。
     pub external_local_bound: bool,
@@ -157,6 +189,8 @@ pub(crate) struct RefAttributionFacts {
 impl RefAttributionFacts {
     fn opaque() -> Self {
         Self {
+            independent_positions: HashSet::new(),
+            local_positions: HashSet::new(),
             external_local_bound: false,
             external_source_name_lines: HashSet::new(),
             local_import_candidates: None,
@@ -176,10 +210,11 @@ pub(crate) fn attribution_for_ref(
     facts: &RefAttributionFacts,
     ref_path: &str,
     residual_def_paths: &HashSet<String>,
+    position: (usize, usize),
 ) -> RefAttribution {
     RefAttribution {
         ref_lang: facts.ref_lang,
-        origin: ref_origin_for(facts, ref_path, residual_def_paths),
+        origin: ref_origin_for(facts, ref_path, residual_def_paths, position),
     }
 }
 
@@ -187,7 +222,16 @@ fn ref_origin_for(
     facts: &RefAttributionFacts,
     ref_path: &str,
     residual_def_paths: &HashSet<String>,
+    position: (usize, usize),
 ) -> RefOrigin {
+    if facts.local_positions.contains(&position) {
+        return RefOrigin::LocalValue;
+    }
+    if facts.independent_positions.contains(&position) {
+        return RefOrigin::IndependentDefinition {
+            path: ref_path.to_string(),
+        };
+    }
     if facts.is_js_ts {
         if facts.has_unresolvable_import_binding {
             return RefOrigin::Unproven;
@@ -246,6 +290,7 @@ pub(crate) fn analyze_ref_attribution_facts(
         }
         LangId::Bash => analyze_bash_facts(utf8, ref_path),
         LangId::Python => analyze_python_facts(utf8, symbol),
+        LangId::Rust => analyze_rust_facts(utf8, symbol),
         _ => RefAttributionFacts::opaque(),
     };
     facts.ref_lang = Some(lang);
@@ -296,13 +341,34 @@ fn analyze_python_facts(utf8: &camino::Utf8Path, symbol: &str) -> RefAttribution
         return RefAttributionFacts::opaque();
     };
     let root = tree.root_node();
+    let mut facts = RefAttributionFacts {
+        independent_positions: super::removed_scope::python_independent_positions(
+            root, &source, symbol,
+        ),
+        ..RefAttributionFacts::opaque()
+    };
     let aliases = collect_python_import_aliases(root, &source);
     let mut receivers: HashSet<String> = HashSet::new();
     if !collect_python_attribute_receivers(root, &source, symbol, &aliases, &mut receivers) {
-        return RefAttributionFacts::opaque();
+        return facts;
     }
+    facts.python_attribute_receivers = Some(Rc::new(receivers));
+    facts
+}
+
+/// 同じファイル・解析木で定義座標と値束縛座標をまとめて収集する。
+fn analyze_rust_facts(utf8: &camino::Utf8Path, symbol: &str) -> RefAttributionFacts {
+    let Ok(source) = parser::read_file(utf8) else {
+        return RefAttributionFacts::opaque();
+    };
+    let Ok(tree) = parser::parse_source(&source, LangId::Rust) else {
+        return RefAttributionFacts::opaque();
+    };
+    let (independent_positions, local_positions) =
+        super::removed_scope::rust_scope_positions(tree.root_node(), &source, symbol);
     RefAttributionFacts {
-        python_attribute_receivers: Some(Rc::new(receivers)),
+        independent_positions,
+        local_positions,
         ..RefAttributionFacts::opaque()
     }
 }

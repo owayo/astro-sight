@@ -1903,3 +1903,213 @@ fn detect_api_changes_partial_same_name_move_is_reconciled_as_moved() {
         .collect();
     assert_eq!(moved, vec![("fmt", "src/A.kt", "src/B.kt")]);
 }
+
+/// 独立した同名定義・束縛と、削除した自由関数への実参照を対照する。
+fn removal_scope_fixture(old_path: &str, extras: &[(&str, &str)]) -> ApiChanges {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let (old, new) = if old_path.ends_with(".rs") {
+        (
+            "pub fn total(x: u32) -> u32 { x }\npub fn keep() -> u32 { 1 }\n",
+            "pub fn keep() -> u32 { 1 }\n",
+        )
+    } else if old_path.ends_with(".mjs") {
+        (
+            "export function abort() {}\nexport function keep() {}\n",
+            "export function keep() {}\n",
+        )
+    } else if old_path.ends_with(".sh") {
+        ("abort() { :; }\nkeep() { :; }\n", "keep() { :; }\n")
+    } else {
+        (
+            "def abort(message):\n    raise SystemExit(message)\ndef version():\n    return '1.0'\n",
+            "def version():\n    return '1.0'\n",
+        )
+    };
+    let mut files = vec![(old_path, old)];
+    files.extend_from_slice(extras);
+    git_commit_files(repo, &files, "base");
+    fs::write(repo.join(old_path), new).expect("write");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: old_path.into(),
+        new_path: old_path.into(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: old.lines().count(),
+            new_start: 1,
+            new_count: new.lines().count(),
+        }],
+        deleted_old_source: None,
+    }];
+    detect_api_changes(repo.to_str().expect("path"), "HEAD", &diff_files)
+}
+
+#[test]
+fn removed_free_function_ignores_independent_python_definitions_and_calls() {
+    for extras in [
+        vec![
+            (
+                "tools/report.py",
+                "def abort(message):\n    print(message)\n",
+            ),
+            (
+                "tools/notify.py",
+                "def abort(message):\n    print(message)\n",
+            ),
+        ],
+        vec![(
+            "tools/report.py",
+            "def abort(message):\n    print(message)\nabort('report failed')\n",
+        )],
+    ] {
+        let api = removal_scope_fixture("tools/util.py", &extras);
+        assert!(api.removed.is_empty(), "{:?}", api.removed);
+        assert!(api.removed_dead.iter().any(|s| s.name == "abort"));
+    }
+}
+
+#[test]
+fn removed_free_function_ignores_rust_local_values() {
+    let api = removal_scope_fixture(
+        "src/a.rs",
+        &[
+            ("src/lib.rs", "pub mod a;\npub mod b;\n"),
+            ("src/b.rs", "pub fn run() -> u32 { let total = 3; total }\n"),
+        ],
+    );
+    assert!(api.removed.is_empty(), "{:?}", api.removed);
+    assert!(api.removed_dead.iter().any(|s| s.name == "total"));
+}
+
+#[test]
+fn removed_free_function_preserves_js_and_bash_definition_guards() {
+    for (path, extras) in [
+        (
+            "src/api.mjs",
+            vec![
+                ("src/report.mjs", "export class abort {}\n"),
+                ("src/notify.mjs", "export class abort {}\n"),
+            ],
+        ),
+        (
+            "src/api.sh",
+            vec![
+                ("src/report.sh", "abort() { :; }\n"),
+                ("src/notify.sh", "abort() { :; }\n"),
+            ],
+        ),
+    ] {
+        let api = removal_scope_fixture(path, &extras);
+        assert!(
+            api.removed.iter().any(|s| s.name == "abort"),
+            "{path}\n{:?}",
+            api.removed_dead
+        );
+    }
+}
+
+#[test]
+fn removed_free_function_keeps_unproven_python_origins_blocking() {
+    for source in [
+        "from tools.util import abort\nabort('failed')\n",
+        "import tools.util as util\nutil.abort('failed')\n",
+        "def abort(message):\n    print(message)\nfrom tools.util import abort\nabort('failed')\n",
+        "from tools.util import *\ndef abort(message):\n    print(message)\nabort('failed')\n",
+        "def abort(message):\n    print(message)\nexec('abort = replacement')\nabort('failed')\n",
+        "import builtins\ndef abort(message):\n    pass\ngetattr(builtins, 'exec')('from tools.util import abort')\nabort('failed')\n",
+        "import builtins\ndef abort(message):\n    pass\nbuiltins.__dict__['exec']('from tools.util import abort')\nabort('failed')\n",
+        "def abort(message):\n    print(message)\ndef run(abort):\n    abort('failed')\n",
+        "def abort(message):\n    print(message)\nabort = replacement\nabort('failed')\n",
+        "def abort(message):\n    print(message)\nclass abort:\n    pass\nabort('failed')\n",
+        "def abort(message):\n    print(message)\ndef abort(message):\n    print(message)\nabort('failed')\n",
+        "if enabled:\n    def abort(message):\n        print(message)\nabort('failed')\n",
+    ] {
+        let api = removal_scope_fixture("tools/util.py", &[("tools/report.py", source)]);
+        assert!(
+            api.removed.iter().any(|s| s.name == "abort"),
+            "{source}\n{:?}",
+            api.removed_dead
+        );
+    }
+    // 未知の同名定義を、別ファイルの証明済み呼び出しだけで降格しない。
+    let api = removal_scope_fixture(
+        "tools/util.py",
+        &[
+            (
+                "tools/report.py",
+                "def abort(message):\n    print(message)\nabort('failed')\n",
+            ),
+            ("tools/notify.py", "class abort:\n    pass\n"),
+        ],
+    );
+    assert!(api.removed.iter().any(|s| s.name == "abort"));
+    for path in [
+        "tools/util.pyi",
+        "tools/util/__init__.py",
+        "tools/util/__init__.pyi",
+    ] {
+        let api = removal_scope_fixture(
+            "tools/util.py",
+            &[(
+                path,
+                "def abort(message):\n    print(message)\nabort('failed')\n",
+            )],
+        );
+        assert!(api.removed.iter().any(|s| s.name == "abort"), "{path}");
+    }
+}
+
+#[test]
+fn removed_free_function_rust_scope_proof_stays_inside_value_bindings() {
+    for source in [
+        "pub fn run() -> u32 { let total = 3; total }\n",
+        "pub fn run(total: u32) -> u32 { total }\n",
+        "pub fn run() -> u32 { let (_, total) = (1, 3); total }\n",
+        "pub fn run() -> u32 { let total = 3; { total } }\n",
+        "pub fn run() -> u32 { let f = |total| total; f(3) }\n",
+        "struct Cfg { total: u32 }\npub fn run(c: Cfg) -> u32 { c.total }\n",
+    ] {
+        let api = removal_scope_fixture(
+            "src/a.rs",
+            &[
+                ("src/lib.rs", "pub mod a;\npub mod b;\n"),
+                ("src/b.rs", source),
+            ],
+        );
+        assert!(api.removed.is_empty(), "{source}\n{:?}", api.removed);
+        assert!(api.removed_dead.iter().any(|s| s.name == "total"));
+    }
+    for source in [
+        "pub fn run() -> u32 { let total = total(3); total }\n",
+        "pub fn run() -> u32 { { let total = 3; } total(3) }\n",
+        "pub fn run() -> u32 { if let total = value {} total(3) }\n",
+        "pub fn run() -> u32 { let Some(total) = value else { return total(3); }; total }\n",
+        "pub fn run() -> u32 { #[cfg(test)] let total = 3; total(3) }\n",
+        "pub fn run(#[cfg(test)] total: u32) -> u32 { total(3) }\n",
+        "pub fn run(#[cfg_attr(test, cfg(test))] total: u32) -> u32 { total(3) }\n",
+        "pub fn run() -> u32 { let total = 3; crate::a::total(3) }\n",
+        "pub fn run() -> u32 { let total = 3; m!(total) }\n",
+        "pub fn run() -> u32 { let total = 3; { import_total!(); total(3) } }\n",
+        "pub fn run() -> u32 { let total = 3; { include!(\"imports.rs\"); total(3) } }\n",
+        "make_constants!();\npub fn run(total: ()) { let _ = total; }\n",
+        "pub fn run() -> u32 { let total = 3; { use crate::a::*; total(3) } }\n",
+        "pub fn run() -> u32 { let total = 3; fn inner() -> u32 { total(3) } inner() }\n",
+        "use crate::a::total;\npub fn run() -> u32 { total(3) }\n",
+        "pub fn total(x: u32) -> u32 { x }\npub fn run() -> u32 { crate::a::total(3) }\n",
+        "struct Table { total: fn(u32) -> u32 }\npub fn run() { let table = Table { total }; }\n",
+    ] {
+        let api = removal_scope_fixture(
+            "src/a.rs",
+            &[
+                ("src/lib.rs", "pub mod a;\npub mod b;\n"),
+                ("src/b.rs", source),
+            ],
+        );
+        assert!(
+            api.removed.iter().any(|s| s.name == "total"),
+            "{source}\n{:?}",
+            api.removed_dead
+        );
+    }
+}

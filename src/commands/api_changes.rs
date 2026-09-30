@@ -513,6 +513,7 @@ mod python_signature;
 mod ref_index;
 
 mod removed_attribution;
+mod removed_scope;
 
 mod rust_public;
 

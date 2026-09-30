@@ -84,19 +84,25 @@ pub(crate) fn partition_removed_dead_candidates(
 
     // Pass 2: bare_name -> (def_count, 参照ごとの帰属分類)
     let mut counts: HashMap<String, (usize, Vec<RefAttribution>)> = HashMap::new();
+    let mut definition_attributions: HashMap<String, Vec<RefAttribution>> = HashMap::new();
     for r in &batch_result {
         let residual_defs = definition_paths.get(&r.symbol).cloned().unwrap_or_default();
         let mut def_count = 0usize;
         let mut attributions: Vec<RefAttribution> = Vec::new();
         for x in &r.references {
-            if x.kind == Some(RefKind::Definition) {
-                def_count += 1;
-                continue;
-            }
             let key = (x.path.clone(), r.symbol.clone());
             let facts = facts_cache.entry(key).or_insert_with(|| {
                 analyze_ref_attribution_facts(dir, &x.path, &r.symbol, &external_pkgs)
             });
+            let attr = attribution_for_ref(facts, &x.path, &residual_defs, (x.line, x.column));
+            if x.kind == Some(RefKind::Definition) {
+                def_count += 1;
+                definition_attributions
+                    .entry(r.symbol.clone())
+                    .or_default()
+                    .push(attr);
+                continue;
+            }
             // 外部 import specifier の import 元名そのものの参照 (import 行) は別モジュールの
             // export 名なので数えない (`import { Config as X } from "pkg"` の `Config`)。
             if facts.external_source_name_lines.contains(&x.line) {
@@ -107,7 +113,7 @@ pub(crate) fn partition_removed_dead_candidates(
             if facts.external_local_bound {
                 continue;
             }
-            attributions.push(attribution_for_ref(facts, &x.path, &residual_defs));
+            attributions.push(attr);
         }
         counts.insert(r.symbol.clone(), (def_count, attributions));
     }
@@ -131,7 +137,20 @@ pub(crate) fn partition_removed_dead_candidates(
             name: &c.name,
             kind: &c.kind,
         };
+        // 新しい位置別証明では、未知の class / method / overload 等の残存定義も
+        // 無視しない。既存 JS / Bash のファイル単位証明にはこの条件を広げない。
+        let definitions_proven = definition_attributions.get(&bare).is_none_or(|defs| {
+            defs.iter()
+                .all(|a| proves_independent_definition(a, &candidate_ref, residual_defs))
+        });
+        let uses_scope_proof = attributions.iter().any(|a| {
+            matches!(
+                &a.origin,
+                RefOrigin::IndependentDefinition { .. } | RefOrigin::LocalValue
+            )
+        });
         if !attributions.is_empty()
+            && (!uses_scope_proof || definitions_proven)
             && attributions
                 .iter()
                 .all(|a| proves_survivor_origin(a, &candidate_ref, residual_defs))
@@ -140,7 +159,8 @@ pub(crate) fn partition_removed_dead_candidates(
             continue;
         }
         // 同名定義が複数残っている → 保守的に removed に残す
-        if *def_count > 1 {
+        if *def_count > 1 && !(definitions_proven && c.kind == "function" && !c.name.contains('.'))
+        {
             removed_kept.push(c);
             continue;
         }
