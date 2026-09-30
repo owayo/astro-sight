@@ -24,6 +24,10 @@ use crate::language::{LangId, normalize_identifier};
 use crate::models::reference::{RefKind, SymbolReference};
 use crate::models::skip::SkippedFiles;
 
+pub(crate) use definition::rust::{
+    RustPatternBindingCache, is_rust_shadowable_value_identifier,
+    is_rust_struct_field_non_callable, rust_pattern_binds_name,
+};
 pub(crate) use files::detect_source_lang;
 pub use files::{
     FileCollection, FileScanOptions, collect_files, collect_files_scan,

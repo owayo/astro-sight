@@ -6,6 +6,59 @@ use super::support::*;
 use std::process::{Command, Stdio};
 
 #[test]
+fn review_hook_distinguishes_independent_names_from_removed_function_calls() {
+    let before =
+        "def abort(message):\n    raise SystemExit(message)\ndef version():\n    return '1.0'\n";
+    let after = "def version():\n    return '1.0'\n";
+    for (source, notify, informational) in [
+        (
+            "def abort(message):\n    print(message)\n",
+            "def abort(message):\n    print(message)\n",
+            true,
+        ),
+        (
+            "def abort(message):\n    print(message)\nabort('failed')\n",
+            "",
+            true,
+        ),
+        ("from tools.util import abort\nabort('failed')\n", "", false),
+    ] {
+        let output = a3_review_hook(
+            |root| std::fs::write(root.join("tools/util.py"), after).unwrap(),
+            &[
+                ("tools/util.py", before),
+                ("tools/report.py", source),
+                ("tools/notify.py", notify),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), informational, "{source}\n{stderr}");
+        assert_eq!(stderr.contains("\"rm\""), !informational, "{stderr}");
+    }
+    let before = "pub fn total(x: u32) -> u32 { x }\npub fn keep() -> u32 { 1 }\n";
+    let after = "pub fn keep() -> u32 { 1 }\n";
+    for (source, informational) in [
+        ("pub fn run() -> u32 { let total = 3; total }\n", true),
+        (
+            "use crate::a::total;\npub fn run() -> u32 { total(3) }\n",
+            false,
+        ),
+    ] {
+        let output = a3_review_hook(
+            |root| std::fs::write(root.join("src/a.rs"), after).unwrap(),
+            &[
+                ("src/lib.rs", "pub mod a;\npub mod b;\n"),
+                ("src/a.rs", before),
+                ("src/b.rs", source),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), informational, "{source}\n{stderr}");
+        assert_eq!(stderr.contains("\"rm\""), !informational, "{stderr}");
+    }
+}
+
+#[test]
 fn review_hook_ignores_rust_cfg_keys_when_public_method_is_removed() {
     let manifest = "[package]\nname = \"cfg-key-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n";
     let before = "pub struct Lang;\nimpl Lang { pub fn feature(&self) -> bool { true } }\n";

@@ -191,7 +191,7 @@ pub(crate) fn is_rust_closure_bound_identifier(
 /// - `obj.tail()` のメソッド名 (`field_identifier` — kind で弾かれる)
 /// - 型位置の識別子 (`type_identifier` / ジェネリック引数 — kind と親で弾かれる)
 /// - `tail!()` のマクロ名 — マクロは値とは別の名前空間で、値束縛にシャドーイングされない
-fn is_rust_shadowable_value_identifier(node: Node<'_>) -> bool {
+pub(crate) fn is_rust_shadowable_value_identifier(node: Node<'_>) -> bool {
     if node.kind() != "identifier" {
         return false;
     }
@@ -219,7 +219,7 @@ fn is_rust_shadowable_value_identifier(node: Node<'_>) -> bool {
 /// 辿らない。未知のパターン種別は辿らず `false` を返す (= 参照として残す安全側。
 /// 束縛の取りこぼしは従来どおりの過大計上に戻るだけだが、逆に非束縛を束縛と誤れば
 /// 本物の参照を消してしまう)。
-fn rust_pattern_binds_name(
+pub(crate) fn rust_pattern_binds_name(
     node: Node<'_>,
     name: &str,
     source: &[u8],

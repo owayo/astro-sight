@@ -48,6 +48,16 @@ printf '%s\n' \
   | astro-sight session
 ```
 
+When a free function is removed, `review` distinguishes an independent Python
+module's plain, unique function definition and its bare reads from references to
+the removed function. It also recognizes Rust values bound by ordinary `let`
+statements and function parameters within their scope. These occurrences remain
+visible in `refs`, but do not keep an otherwise unreferenced removal blocking.
+Imports, qualified calls, ambiguous definitions, conditional bindings, and
+unresolved cases retain the conservative classification. Python reflection and
+Rust macro expansion prevent these new binding proofs; Python stub/package
+variants of the removed module are treated as the same module.
+
 ## ast: Extract AST Fragments
 
 ```bash
