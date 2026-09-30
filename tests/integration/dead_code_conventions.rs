@@ -1817,3 +1817,143 @@ class MainActivity : AppCompatActivity() {
         "AndroidManifest.xml で宣言された activity は dead 扱いすべきでない: {names:?}"
     );
 }
+
+#[test]
+fn go_test_entrypoints_are_live_but_unused_helpers_remain_dead() {
+    for package in ["calc", "calc_test"] {
+        let repo = TestRepo::new();
+        let source = format!(
+            r#"//go:build integration
+package {package}
+import tt "testing"
+func TestAdd(t *tt.T) {{ UsedHelper() }}
+func BenchmarkAdd(b *tt.B) {{}}
+func FuzzAdd(f *tt.F) {{}}
+func TestMain(m *tt.M) {{}}
+func Example() {{}}
+func ExampleAdd() {{}}
+func ExampleAdd_method() {{}}
+func TestÉ(t *tt.T) {{}}
+func Testª(t *tt.T) {{}}
+func Testé(t *tt.T) {{}}
+func Test(t *tt.T) {{}}
+func UsedHelper() {{}}
+func UnusedHelper() {{}}
+func Testfoo(t *tt.T) {{}}
+func TestWrong(t *tt.B) {{}}
+func TestMany(t, other *tt.T) {{}}
+func TestReturn(t *tt.T) int {{ return 0 }}
+func TestGeneric[T any](t *tt.T) {{}}
+func TestVariadic(t ...*tt.T) {{}}
+func TestValue(t tt.T) {{}}
+func ExampleArgs(t *tt.T) {{}}
+func Examplelower() {{}}
+type Holder struct {{}}
+func (h Holder) TestMethod(t *tt.T) {{}}
+"#
+        );
+        repo.write("calc_test.go", &source);
+        repo.write(
+            "calc.go",
+            format!(
+                "package {package}\nimport \"testing\"\nfunc TestOrdinary(t *testing.T) {{}}\n"
+            ),
+        );
+        let json = repo.run_json("dead-code", &[]);
+        let names: Vec<_> = json["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        for live in [
+            "TestAdd",
+            "BenchmarkAdd",
+            "FuzzAdd",
+            "TestMain",
+            "Example",
+            "ExampleAdd",
+            "ExampleAdd_method",
+            "TestÉ",
+            "Testª",
+            "Test",
+            "UsedHelper",
+        ] {
+            assert!(
+                !names.contains(&live),
+                "{package}: {live} reported dead: {json}"
+            );
+        }
+        for dead in [
+            "UnusedHelper",
+            "Testfoo",
+            "Testé",
+            "TestWrong",
+            "TestMany",
+            "TestReturn",
+            "TestGeneric",
+            "TestVariadic",
+            "TestValue",
+            "ExampleArgs",
+            "Examplelower",
+            "Holder.TestMethod",
+            "TestOrdinary",
+        ] {
+            assert!(
+                names.contains(&dead),
+                "{package}: {dead} missing from dead: {json}"
+            );
+        }
+    }
+}
+
+#[test]
+fn go_test_entrypoints_do_not_block_review_hook() {
+    let repo = TestRepo::new();
+    repo.write("calc.go", "package calc\n");
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("calc_test.go", "package calc\nimport . \"testing\"\nfunc TestAdd(t *T) {}\nfunc BenchmarkAdd(b *B) {}\nfunc FuzzAdd(f *F) {}\nfunc TestMain(m *M) {}\nfunc Example() {}\n");
+    let output = cargo_bin()
+        .args(["review", "--git", "--hook", "--dir"])
+        .arg(repo.root())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    repo.write(
+        "calc_test.go",
+        "package calc\nimport \"testing\"\nfunc TestAdd(t *testing.T) {}\nfunc UnusedHelper() {}\n",
+    );
+    let output = cargo_bin()
+        .args(["review", "--git", "--hook", "--dir"])
+        .arg(repo.root())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("UnusedHelper"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("TestAdd"));
+}
+
+#[test]
+fn go_test_entrypoints_accept_alias_types_and_testmain_t() {
+    for source in [
+        "package calc\nimport \"testing\"\nfunc TestMain(t *testing.T) {}\nfunc TestUnnamed(*testing.T) {}\n",
+        "package calc\nimport (`testing`)\nfunc TestMain(t *testing.T) {}\n",
+        "package calc\nimport \"testing\"\ntype T = testing.T\nfunc TestAlias(t *T) {}\n",
+        "package calc\nimport th \"example.com/testhelper\"\nfunc TestAlias(t *th.T) {}\n",
+        "package calc\nfunc TestEmpty(t *T) () {}\nfunc TestComment(/* c */ t *T) {}\n",
+        "package calc\nfunc TestBody(t *T) { value := }\n",
+    ] {
+        let repo = TestRepo::new();
+        repo.write("calc_test.go", source);
+        let json = repo.run_json("dead-code", &[]);
+        assert!(
+            json["dead_symbols"].as_array().unwrap().is_empty(),
+            "{json}"
+        );
+    }
+}

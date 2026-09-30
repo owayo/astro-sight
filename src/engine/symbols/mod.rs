@@ -13,6 +13,7 @@ mod cpp;
 mod entrypoint;
 mod exported;
 mod framework;
+mod go_test;
 mod overrides;
 mod scope;
 
@@ -28,6 +29,7 @@ pub use framework::{
     is_php_laravel_runtime_entrypoint, is_php_pseudo_enum_method,
     is_python_dynamic_protocol_method, php_doc_has_runtime_annotation, python_class_base_names,
 };
+pub(crate) use go_test::is_go_test_entrypoint;
 pub use overrides::is_override_method;
 pub use scope::is_local_scope_symbol;
 
