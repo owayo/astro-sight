@@ -16,6 +16,7 @@ pub mod lint;
 pub mod parser;
 pub mod phpunit_refs;
 pub(crate) mod python_callable;
+pub(crate) mod python_scope;
 pub(crate) mod python_signature;
 pub mod query_cache;
 pub mod refs;

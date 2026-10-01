@@ -1,6 +1,42 @@
 use super::*;
 
 #[test]
+fn python_lexical_binding_flags_preserve_all_occurrence_and_count_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("runner.py");
+    std::fs::write(&path, "def main():\n    collect_items = []\n    collect_items.append(1)\n    return len(collect_items)\n").unwrap();
+    let names = vec!["collect_items".to_string()];
+    let single = find_references("collect_items", dir.path(), None).unwrap();
+    let ac = build_ac_case_insensitive(&names).unwrap();
+    let acs = vec![(0, ac.clone())];
+    let path = camino::Utf8Path::from_path(&path).unwrap();
+    let batch = find_refs_batch_in_file_indexed::<false>(&names, &acs, path).unwrap();
+    assert_eq!(single.len(), 3);
+    assert_eq!(ref_fingerprints(&single), ref_fingerprints(&batch[0]));
+    assert_eq!(count_refs_in_file(&names, &acs, path).unwrap(), vec![3]);
+    struct Recorder(Vec<(usize, usize, crate::engine::python_scope::LexicalBinding)>);
+    impl RefVisitor for Recorder {
+        fn on_ref(&mut self, event: RefVisitEvent<'_>) {
+            self.0
+                .push((event.line, event.column, event.lexical_binding));
+        }
+    }
+    let mut recorder = Recorder(Vec::new());
+    visit_refs_and_defs_in_file_cb(&names, &ac, path, &mut recorder).unwrap();
+    assert_eq!(
+        recorder.0,
+        single
+            .iter()
+            .map(|r| (
+                r.line,
+                r.column,
+                crate::engine::python_scope::LexicalBinding::FunctionLocal
+            ))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn bash_function_options_survive_command_prefix_syntax() {
     for command in [
         "LC_ALL=C builtin unset foo\n",

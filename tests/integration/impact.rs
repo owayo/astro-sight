@@ -6,6 +6,74 @@ use super::support::*;
 use std::process::{Command, Stdio};
 
 #[test]
+fn impact_python_local_bindings_are_not_external_callers() {
+    for consumer in [
+        "def main():\n    collect_items = []\n    collect_items.append(1)\n    return len(collect_items)\n",
+        "def main(collect_items):\n    return collect_items\n",
+        "def main(collect_items: list):\n    return collect_items\n",
+        "def main(collect_items=[]):\n    return collect_items\n",
+        "def main(collect_items: list=[]):\n    return collect_items\n",
+        "def main():\n    collect_items: list[int] = []\n    return len(collect_items)\n",
+        "def helper(value: dict[str, int]):\n    pass\ndef main():\n    collect_items = []\n    return len(collect_items)\n",
+        "def main():\n    for collect_items in [[]]:\n        print(collect_items)\n",
+        "from producer import collect_items\ndef main():\n    collect_items = []\n    return collect_items\n",
+    ] {
+        let repo = TestRepo::new();
+        repo.write(
+            "producer.py",
+            "def collect_items(limit):\n    return list(range(limit))\n",
+        );
+        repo.write("runner.py", consumer);
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write("producer.py", "def collect_items(limit, reverse=False):\n    values = list(range(limit))\n    return values[::-1] if reverse else values\n");
+        let output = cargo_bin()
+            .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{consumer}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn impact_python_keeps_imported_and_ambiguous_callers() {
+    for consumer in [
+        "from producer import collect_items\ndef main():\n    return collect_items(3)\n",
+        "import producer\ndef main(collect_items):\n    return producer.collect_items(3)\n",
+        "def main():\n    from producer import collect_items\n    return collect_items(3)\n",
+        "from producer import collect_items\ndef main():\n    global collect_items\n    collect_items = collect_items(3)\n",
+        "from producer import collect_items\ndef main(collect_items=collect_items(3)):\n    return collect_items\n",
+        "from producer import collect_items\ndef main():\n    def inner():\n        return collect_items(3)\n    return inner()\n",
+    ] {
+        let repo = TestRepo::new();
+        repo.write(
+            "producer.py",
+            "def collect_items(limit):\n    return list(range(limit))\n",
+        );
+        repo.write("runner.py", consumer);
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "producer.py",
+            "def collect_items(limit, required):\n    return list(range(limit))\n",
+        );
+        let output = cargo_bin()
+            .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && stderr.contains("runner.py"),
+            "{consumer}: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn impact_python_signature_reformat_keeps_real_changes() {
     let repo = TestRepo::new();
     repo.write("api.py", "def formatted(\n    value: str = 'a  b',\n) -> str:\n    return value\n\ndef changed(value=(1,)):\n    return value\n");

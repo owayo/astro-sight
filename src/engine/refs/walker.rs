@@ -162,6 +162,7 @@ pub(crate) struct RefVisitEvent<'a> {
     pub(crate) rust_macro_callee: bool,
     /// 参照の AST 上の使われ方 (identifier 経路のみ分類、他経路は `Other`)。
     pub(crate) usage: RefUsageRole,
+    pub(crate) lexical_binding: crate::engine::python_scope::LexicalBinding,
 }
 
 /// `visit_refs_and_defs_in_file_cb` が内部で呼び出す訪問者 trait。
@@ -233,6 +234,7 @@ pub(crate) struct RefEnvironment<'a> {
     /// Rust の closure 束縛判定で使う名前別メモ。walk 1 回 (= 1 ファイル) の寿命に
     /// 閉じることで、ポインタ再利用による前ファイル結果の誤用を構造的に防ぐ。
     rust_binding_cache: RustPatternBindingCache,
+    python_scope_index: std::cell::OnceCell<Option<crate::engine::python_scope::PythonScopeIndex>>,
     bash_declaration_cache: BashDeclarationCache,
     bash_declarations: Vec<crate::engine::bash_parse_recovery::UnparsedBashDeclaration>,
 }
@@ -406,6 +408,17 @@ impl<V: RefVisitor> RawRefSink for VisitorAdapter<'_, V> {
     fn on_hit(&mut self, hit: RawRefHit<'_, '_>, env: &RefEnvironment<'_>) {
         let context = env.line_context(hit.line);
         let context_column = env.ctx_column(hit.column, hit.line);
+        let lexical_binding = match hit.origin {
+            HitOrigin::Identifier(node) if env.lang_id == LangId::Python && !hit.is_def => env
+                .python_scope_index
+                .get_or_init(|| {
+                    crate::engine::python_scope::PythonScopeIndex::build(node, env.source)
+                })
+                .as_ref()
+                .map(|index| index.resolve(node, env.source))
+                .unwrap_or_default(),
+            _ => crate::engine::python_scope::LexicalBinding::Unknown,
+        };
         // identifier 由来のときだけ receiver-aware 分類 / macro callee / usage role を計算。
         // synthetic (文字列セグメント) は従来どおり ExactOwner / false / Other 固定。
         let (confidence, rust_macro_callee, usage) = match hit.origin {
@@ -427,6 +440,7 @@ impl<V: RefVisitor> RawRefSink for VisitorAdapter<'_, V> {
                 confidence,
                 rust_macro_callee,
                 usage,
+                lexical_binding,
             });
         });
     }
@@ -637,6 +651,7 @@ pub(crate) fn run_ref_walk<M: RefMatcher, S: RawRefSink>(
         line_index: line_index.as_ref(),
         lang_id,
         rust_binding_cache: RustPatternBindingCache::default(),
+        python_scope_index: std::cell::OnceCell::new(),
         bash_declaration_cache: BashDeclarationCache::default(),
         // ERROR 回復が extglob とした宣言も全経路で保持する。count / visitor は
         // 未検証の出現を保守的に数え、refs の出力だけを unknown に分類する。
