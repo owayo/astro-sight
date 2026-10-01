@@ -1402,7 +1402,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys",
@@ -1782,8 +1782,8 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-ruby"
-version = "26.9.100"
-source = "git+https://github.com/owayo/tree-sitter-ruby.git?branch=master#710bc56bda9d8548dc5e8714a6418f2deb292e05"
+version = "26.10.100"
+source = "git+https://github.com/owayo/tree-sitter-ruby.git?branch=master#0188e9602bb7d7d2efa39ce3a8b8164c66e96d1c"
 dependencies = [
  "cc",
  "tree-sitter-language",
