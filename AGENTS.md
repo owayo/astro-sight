@@ -8,6 +8,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 - **Python 関数ヘッダの整形** — `engine/python_signature.rs` の AST トークン正規化を API 差分・省略可能な引数追加の互換判定・impact の宣言比較で共有する。トークン間の空白、通常コメント、引数リストの末尾カンマだけを整形差として除く。文字列全体 (f-string を含む)・タプルのカンマ・`# type:` コメントは保持する。impact の行比較結果を打ち消すのは、新旧が解析可能で同名宣言が各 1 件の場合だけ。同名メソッド・overload・復元失敗・構文エラーでは従来の検出を維持する。この打ち消しは Python に限定し、他言語の既存の末尾カンマ比較へ広げない。
 - **AppService 層** — CLI / Session / MCP の統一コアロジック（`src/service.rs`）
+- **Python の関数ローカル束縛と impact** — `engine/python_scope.rs` が引数・代入・for・with/except の束縛を関数単位で索引化する。`VisitorAdapter` はファイル走査の寿命に閉じた遅延索引から `LexicalBinding` を付け、impact の collector だけが確定したローカル参照を除外する。`refs` の単一/バッチ出現一覧と dead-code の件数は変えない。属性名・型注釈・関数外の既定値は除外せず、global/nonlocal・関数内 import・match・解析エラーは保守的に保持する。lambda/内包表記は独自の scope として証明対象外、walrus/PEP 695 の型パラメータ宣言・type 文があるファイルは索引を使わない。関数内 import 等の曖昧性を見落とさないため、索引は部分木ではなく必ず解析木全体から作る。
 - **tree-sitter** ベースの構文解析エンジン（16言語対応）
 - **動的 import の依存抽出** — JavaScript / TypeScript / TSX の通常の import 文と `require()` に加え、`import("./module")` と置換を含まない `` import(`./module`) `` を `imports` で抽出する。`${expr}` を含む template literal は静的に依存先を確定できないため除外し、呼び出し形式は第1引数だけを依存先として扱う
 - **Ruby Unicode 識別子・曖昧構文** — simple case folding の対象となる `ſ` / `K` などを含むメソッド名を tree-sitter で正しく抽出する。空白を挟む添字代入、括弧なし lambda 仮引数直後の `{}`、連続する `/` の空正規表現、括弧なし呼び出し直後の block、空識別子 heredoc も構文エラーなく解析する

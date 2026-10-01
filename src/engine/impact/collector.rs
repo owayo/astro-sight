@@ -292,6 +292,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             confidence,
             rust_macro_callee,
             usage,
+            lexical_binding,
         } = event;
         let ix = sym_ix as usize;
         if ix < self.ref_hit.len() {
@@ -299,6 +300,9 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
         }
         if is_def {
             self.def_events.push(sym_ix);
+            return;
+        }
+        if lexical_binding == crate::engine::python_scope::LexicalBinding::FunctionLocal {
             return;
         }
 
