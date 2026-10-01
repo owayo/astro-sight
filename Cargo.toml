@@ -1,6 +1,6 @@
 [package]
 name = "astro-sight"
-version = "26.10.100"
+version = "26.10.101"
 edition = "2024"
 # mise.toml の rust の major.minor。CI で確かめている版だけを最低要件として宣言する
 rust-version = "1.98"
