@@ -2,6 +2,7 @@ mod collector;
 mod declaration;
 mod filters;
 mod import_facts;
+mod object_members;
 mod pass2;
 mod pass3;
 mod reexport_move;
@@ -50,6 +51,7 @@ struct FileContext {
     /// 置換する (旧実装は ref ごとに `affected.iter().find(|a| ci_key(..)==key)` を実行していた)。
     /// 同一 ci_key が複数あれば先勝ち (旧 `.find()` の最初一致と挙動一致)。
     affected_name_by_cikey: HashMap<String, String>,
+    object_member_changes: HashMap<String, object_members::ObjectMemberChange>,
 }
 
 /// キャッシュされたパース結果: (tree, ソースバッファ, 言語)。
@@ -504,6 +506,15 @@ fn collect_affected_symbols(
                 .or_insert_with(|| a.name.clone());
         }
 
+        let object_member_changes = object_members::collect_object_member_changes(
+            file_diff,
+            &df.new_path,
+            root,
+            &source,
+            lang_id,
+            &syms,
+            &affected,
+        );
         file_contexts.push(FileContext {
             new_path: df.new_path.clone(),
             lang_id,
@@ -513,6 +524,7 @@ fn collect_affected_symbols(
             call_edges,
             cross_file_symbol_keys,
             affected_name_by_cikey,
+            object_member_changes,
         });
     }
 

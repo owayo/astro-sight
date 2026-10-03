@@ -19,6 +19,7 @@ mod integration {
     mod hidden_and_angular_liveness;
     mod impact;
     mod impact_diff_input;
+    mod impact_object_members;
     mod impact_output;
     mod languages;
     mod mcp;

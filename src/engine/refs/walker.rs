@@ -163,6 +163,9 @@ pub(crate) struct RefVisitEvent<'a> {
     /// 参照の AST 上の使われ方 (identifier 経路のみ分類、他経路は `Other`)。
     pub(crate) usage: RefUsageRole,
     pub(crate) lexical_binding: crate::engine::python_scope::LexicalBinding,
+    /// callback の間だけ有効な AST とソース。impact 固有の証明は collector 側で行う。
+    pub(crate) node: Option<Node<'a>>,
+    pub(crate) source: &'a [u8],
 }
 
 /// `visit_refs_and_defs_in_file_cb` が内部で呼び出す訪問者 trait。
@@ -441,6 +444,11 @@ impl<V: RefVisitor> RawRefSink for VisitorAdapter<'_, V> {
                 rust_macro_callee,
                 usage,
                 lexical_binding,
+                node: match hit.origin {
+                    HitOrigin::Identifier(node) => Some(node),
+                    HitOrigin::Synthetic => None,
+                },
+                source: env.source,
             });
         });
     }
