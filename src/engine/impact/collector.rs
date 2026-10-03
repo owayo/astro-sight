@@ -9,6 +9,7 @@
 //!   直接受け取って `finish_file` で Stage 1-6 (Stage 4b 除く) を適用する。
 use lru::LruCache;
 
+use crate::engine::lexical_binding::LexicalBinding;
 use crate::engine::refs;
 use crate::language::LangId;
 
@@ -78,6 +79,8 @@ pub(super) struct RefEventMini {
     pub(super) member_path_id: u32,
     /// 別名のない named import/export 以外は、全体利用の範囲を証明しない。
     pub(super) unproven_module_ref: bool,
+    /// Rust 値束縛の証拠は変更元ごとの kind を確認して適用する。
+    pub(super) rust_value_binding: bool,
 }
 
 /// 汎用すぎてシンボル名だけでは owner を特定できない PHP/JS 系メソッド名。
@@ -155,7 +158,9 @@ impl RouteDecisionContext<'_> {
         // シグネチャのみ変更 (arity 不変) ならトレイト境界に吸収されコンパイルが通る
         // ことが多いため informational へ。arity 変更は高階 API でも壊れ得るため、
         // また removed (存在破壊) は sig_changes に載らないため、どちらも blocking 維持。
-        let fn_value_informational = event.fn_value_ref
+        let kind_changed = file_context.rust_kind_changes.contains(symbol_name);
+        let fn_value_informational = !kind_changed
+            && event.fn_value_ref
             && file_context.sig_changes.iter().any(|change| {
                 ci_key(file_context.lang_id, &change.name) == symbol_name
                     && same_top_level_arity(&change.old_signature, &change.new_signature)
@@ -226,7 +231,10 @@ impl RouteDecisionContext<'_> {
                     ) {
                         Some(has_evidence) => should_route_rust_ref_low(
                             has_evidence,
-                            event.local_shadow_hint,
+                            // 関数向けの確定束縛は除外済み。行全体の推測で初期化子等を降格しない。
+                            event.local_shadow_hint
+                                && !rust_function_only(file_context, symbol_name)
+                                && !kind_changed,
                             event.ref_in_macro,
                         ),
                         None => false,
@@ -313,7 +321,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             self.def_events.push(sym_ix);
             return;
         }
-        if lexical_binding == crate::engine::python_scope::LexicalBinding::FunctionLocal {
+        if lexical_binding == LexicalBinding::FunctionLocal {
             return;
         }
 
@@ -410,8 +418,14 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             fn_value_ref: usage == refs::RefUsageRole::FunctionValue,
             member_path_id,
             unproven_module_ref,
+            rust_value_binding: lexical_binding == LexicalBinding::RustValueBinding,
         });
     }
+}
+
+/// 同名の別 kind をまとめて除外しない。変更後 kind も含めて全件を確認する。
+fn rust_function_only(context: &FileContext, name: &str) -> bool {
+    context.lang_id == LangId::Rust && context.rust_function_names.contains(name)
 }
 
 impl<'a> ImpactCollector<'a> {
@@ -466,6 +480,11 @@ impl<'a> ImpactCollector<'a> {
             for &fc_ix_raw in fc_ixs {
                 let fc_ix = fc_ix_raw as usize;
                 let ctx = &self.file_contexts[fc_ix];
+                if e.rust_value_binding
+                    && rust_function_only(ctx, &self.all_symbol_names[sym_ix_usize])
+                {
+                    continue;
+                }
                 let source_path = &ctx.new_path;
                 let source_lang_group = lang_compat_group(ctx.lang_id);
 
@@ -574,6 +593,7 @@ mod tests {
             fn_value_ref: false,
             member_path_id: u32::MAX,
             unproven_module_ref: false,
+            rust_value_binding: false,
         }
     }
 
@@ -620,6 +640,7 @@ mod tests {
         FileContext {
             new_path: "src/changed.rs".to_string(),
             lang_id: LangId::Rust,
+            rust_function_names: super::super::rust_function_names(LangId::Rust, &affected),
             affected,
             sig_changes,
             hunks: Vec::new(),
@@ -627,6 +648,33 @@ mod tests {
             cross_file_symbol_keys: Default::default(),
             affected_name_by_cikey: Default::default(),
             object_member_changes: Default::default(),
+            rust_kind_changes: Default::default(),
+        }
+    }
+
+    #[test]
+    fn rust_scope_kind_proof_is_per_context_and_requires_all_same_named_kinds() {
+        let symbol = |kind: &str| AffectedSymbol {
+            name: "comments".to_owned(),
+            kind: kind.to_owned(),
+            change_type: "modified".to_owned(),
+        };
+        let functions = file_context(vec![symbol("function"), symbol("method")], Vec::new());
+        let constants = file_context(vec![symbol("constant")], Vec::new());
+        let mixed = file_context(vec![symbol("function"), symbol("constant")], Vec::new());
+        assert!(rust_function_only(&functions, "comments"));
+        assert!(!rust_function_only(&constants, "comments"));
+        assert!(!rust_function_only(&mixed, "comments"));
+        assert!(!rust_function_only(&functions, "unknown"));
+        assert!(!rust_function_only(
+            &file_context(Vec::new(), Vec::new()),
+            "comments"
+        ));
+        for kind in ["struct", "enum", "type", "variable"] {
+            assert!(!rust_function_only(
+                &file_context(vec![symbol(kind)], Vec::new()),
+                "comments"
+            ));
         }
     }
 
@@ -690,6 +738,13 @@ mod tests {
         assert_eq!(
             decide_route(&function_value, &same_arity, true),
             CallerRoute::Informational
+        );
+
+        let mut changed_kind = same_arity;
+        changed_kind.rust_kind_changes.insert("target".to_owned());
+        assert_eq!(
+            decide_route(&function_value, &changed_kind, false),
+            CallerRoute::Normal
         );
 
         let changed_arity = file_context(

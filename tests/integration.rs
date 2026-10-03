@@ -21,6 +21,7 @@ mod integration {
     mod impact_diff_input;
     mod impact_object_members;
     mod impact_output;
+    mod impact_rust_scope;
     mod languages;
     mod mcp;
     mod output_format;

@@ -52,6 +52,29 @@ struct FileContext {
     /// 同一 ci_key が複数あれば先勝ち (旧 `.find()` の最初一致と挙動一致)。
     affected_name_by_cikey: HashMap<String, String>,
     object_member_changes: HashMap<String, object_members::ObjectMemberChange>,
+    /// 同名 affected がすべて Rust function/method の場合だけ値束縛を除外する。
+    rust_function_names: HashSet<String>,
+    /// 旧新の種別が異なる名前では束縛と値渡しを降格しない。
+    rust_kind_changes: HashSet<String>,
+}
+
+fn rust_function_names(lang: LangId, affected: &[AffectedSymbol]) -> HashSet<String> {
+    if lang != LangId::Rust {
+        return HashSet::new();
+    }
+    let mut names = HashMap::new();
+    for symbol in affected {
+        let fn_kind = matches!(symbol.kind.as_str(), "function" | "method");
+        names
+            .entry(symbol.name.as_str())
+            .and_modify(|only_fn| *only_fn &= fn_kind)
+            .or_insert(fn_kind);
+    }
+    names
+        .into_iter()
+        .filter(|(_, only_fn)| *only_fn)
+        .map(|(name, _)| name.to_owned())
+        .collect()
 }
 
 /// キャッシュされたパース結果: (tree, ソースバッファ, 言語)。
@@ -417,7 +440,7 @@ fn collect_affected_symbols(
         let mut sig_changes = detect_signature_changes(file_diff, &df.new_path, &affected, lang_id);
         // 行ベースの検出が取りこぼす「複数行の引数リストの変更」と「同一ファイル内での移動 +
         // シグネチャ変更」を、変更前の同じ宣言との AST ヘッダ比較で補う。
-        declaration::reconcile_declaration_changes(
+        let declaration_proof = declaration::reconcile_declaration_changes(
             &declaration::DeclarationChangeInput {
                 file_diff,
                 file_path: &df.new_path,
@@ -455,6 +478,7 @@ fn collect_affected_symbols(
             syms: &syms,
             hunks: &df.hunks,
             sig_changes: &sig_changes,
+            rust_kind_changes: &declaration_proof.rust_kind_changes,
             diff_input: file_diff,
             file_path: &df.new_path,
             root,
@@ -518,6 +542,8 @@ fn collect_affected_symbols(
         file_contexts.push(FileContext {
             new_path: df.new_path.clone(),
             lang_id,
+            rust_function_names: declaration_proof.rust_function_names,
+            rust_kind_changes: declaration_proof.rust_kind_changes,
             affected,
             sig_changes,
             hunks,

@@ -28,6 +28,7 @@ pub(super) struct CrossFileFilterContext<'a> {
     pub(super) syms: &'a [Symbol],
     pub(super) hunks: &'a [HunkInfo],
     pub(super) sig_changes: &'a [SignatureChange],
+    pub(super) rust_kind_changes: &'a HashSet<String>,
     /// 対象ファイルの diff 区間 (`diff::FileSections`。シンボル名が変更行に出現するかの
     /// 照合に使う)。diff 全体を渡しても結果は同じだが、シンボルごとに走査するため遅い。
     pub(super) diff_input: &'a str,
@@ -74,6 +75,7 @@ impl CrossFileFilterContext<'_> {
         // 3. ボディのみの変更の関数/メソッドをスキップ
         if (sym.kind == "function" || sym.kind == "method")
             && !self.sig_changes.iter().any(|sc| sc.name == sym.name)
+            && !(self.lang_id == LangId::Rust && self.rust_kind_changes.contains(&sym.name))
         {
             return false;
         }
@@ -338,6 +340,7 @@ mod tests {
         let changed_new_lines: HashSet<usize> = changed_lines.iter().copied().collect();
         let ctx = CrossFileFilterContext {
             syms: &syms,
+            rust_kind_changes: &HashSet::new(),
             hunks: &hunks,
             sig_changes,
             diff_input: &diff_input,
@@ -439,6 +442,7 @@ mod tests {
         let changed_new_lines: HashSet<usize> = changed_lines.iter().copied().collect();
         let ctx = CrossFileFilterContext {
             syms: &syms,
+            rust_kind_changes: &HashSet::new(),
             hunks: &hunks,
             sig_changes: &[],
             diff_input,
@@ -532,6 +536,7 @@ mod tests {
         let include = |sig_changes: &[SignatureChange]| {
             CrossFileFilterContext {
                 syms: &syms,
+                rust_kind_changes: &HashSet::new(),
                 hunks: &hunks,
                 sig_changes,
                 diff_input: diff,
