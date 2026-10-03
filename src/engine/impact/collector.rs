@@ -74,6 +74,10 @@ pub(super) struct RefEventMini {
     /// シグネチャのみ変更 (arity 不変) の場合、トレイト境界に吸収されコンパイルが通る
     /// ことが多いため informational へ格下げする (Issue 2026-07-12 Bevy systemparam FP)。
     pub(super) fn_value_ref: bool,
+    /// dot chain の直接読み出しパス。対象外は u32::MAX、文字列は既存 pool で共有する。
+    pub(super) member_path_id: u32,
+    /// 別名のない named import/export 以外は、全体利用の範囲を証明しない。
+    pub(super) unproven_module_ref: bool,
 }
 
 /// 汎用すぎてシンボル名だけでは owner を特定できない PHP/JS 系メソッド名。
@@ -145,6 +149,7 @@ impl RouteDecisionContext<'_> {
         symbol_name: &str,
         has_parent_type: bool,
         base_route_low: bool,
+        member_unchanged: bool,
     ) -> CallerRoute {
         // callee でない関数値渡し参照 (`register((a, my_system, b))` のタプル要素等) は、
         // シグネチャのみ変更 (arity 不変) ならトレイト境界に吸収されコンパイルが通る
@@ -168,6 +173,8 @@ impl RouteDecisionContext<'_> {
         let route_informational = fn_value_informational
             || reexport_move_informational
             || (event.is_import
+                && !(event.unproven_module_ref
+                    && file_context.object_member_changes.contains_key(symbol_name))
                 && file_context.affected.iter().any(|symbol| {
                     symbol.change_type == "modified"
                         && ci_key(file_context.lang_id, &symbol.name) == symbol_name
@@ -235,6 +242,8 @@ impl RouteDecisionContext<'_> {
             CallerRoute::Informational
         } else if route_low {
             CallerRoute::Low
+        } else if member_unchanged {
+            CallerRoute::Informational
         } else {
             CallerRoute::Normal
         }
@@ -293,6 +302,8 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             rust_macro_callee,
             usage,
             lexical_binding,
+            node,
+            source,
         } = event;
         let ix = sym_ix as usize;
         if ix < self.ref_hit.len() {
@@ -312,6 +323,17 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
         // context は trim 済み文字列のため、列は context_column (trim 相対) を渡す
         // (絶対列 `column` は AST point 照合用で座標系が異なる)。
         let is_import = filters::is_import_context_at(Some(context), context_column);
+        let unproven_module_ref = is_import
+            && self.ref_lang.is_some_and(lang_is_ts_family)
+            && !node.is_some_and(|node| {
+                node.parent().is_some_and(|parent| {
+                    matches!(parent.kind(), "import_specifier" | "export_specifier")
+                        && parent.child_by_field_name("alias").is_none()
+                        && parent
+                            .child_by_field_name("name")
+                            .is_some_and(|name| name.id() == node.id())
+                })
+            });
         let caller_name_fallback = || self.all_symbol_names.get(ix).cloned().unwrap_or_default();
         let caller_name =
             extract_function_from_context(context).unwrap_or_else(caller_name_fallback);
@@ -320,6 +342,26 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             .lock()
             .expect("string pool mutex poisoned")
             .intern(&caller_name);
+
+        // 対象のオブジェクトが無い参照では AST の追加走査も文字列確保もしない。
+        let member_path = if self.ref_lang.is_some_and(lang_is_ts_family)
+            && self.sym_to_fc.get(ix).is_some_and(|contexts| {
+                contexts.iter().any(|&fc_ix| {
+                    self.file_contexts[fc_ix as usize]
+                        .object_member_changes
+                        .contains_key(&self.all_symbol_names[ix])
+                })
+            }) {
+            node.and_then(|node| super::object_members::direct_member_read(node, source))
+        } else {
+            None
+        };
+        let member_path_id = member_path.as_deref().map_or(u32::MAX, |path| {
+            self.pool
+                .lock()
+                .expect("string pool mutex poisoned")
+                .intern(path)
+        });
 
         let confidence_u8 = match confidence {
             crate::models::reference::RefConfidence::ExactOwner => 0,
@@ -366,6 +408,8 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             ref_in_macro,
             rust_macro_callee,
             fn_value_ref: usage == refs::RefUsageRole::FunctionValue,
+            member_path_id,
+            unproven_module_ref,
         });
     }
 }
@@ -448,12 +492,22 @@ impl<'a> ImpactCollector<'a> {
                 }
 
                 let sym_key_canonical = &self.all_symbol_names[sym_ix_usize];
+                // pool の lock 中には比較だけを行い、import 解析前に解放する。
+                let member_unchanged = e.member_path_id != u32::MAX
+                    && ctx
+                        .object_member_changes
+                        .get(sym_key_canonical)
+                        .is_some_and(|change| {
+                            let pool = self.pool.lock().expect("string pool mutex poisoned");
+                            change.read_is_unchanged(pool.get(e.member_path_id))
+                        });
                 let route = route_context.decide(
                     &e,
                     ctx,
                     sym_key_canonical,
                     has_parent_type,
                     base_route_low,
+                    member_unchanged,
                 );
                 // 事前 index (ci_key→元名) で O(1) 参照。per-ref の線形 find + ci_key String 割当を排除。
                 let affected_sym_name = ctx
@@ -518,6 +572,8 @@ mod tests {
             ref_in_macro: false,
             rust_macro_callee: false,
             fn_value_ref: false,
+            member_path_id: u32::MAX,
+            unproven_module_ref: false,
         }
     }
 
@@ -570,6 +626,7 @@ mod tests {
             call_edges: Vec::new(),
             cross_file_symbol_keys: Default::default(),
             affected_name_by_cikey: Default::default(),
+            object_member_changes: Default::default(),
         }
     }
 
@@ -588,7 +645,7 @@ mod tests {
             import_facts_cache: &mut cache,
             reexport_moves: &reexport_moves,
         }
-        .decide(event, context, "target", false, base_low)
+        .decide(event, context, "target", false, base_low, false)
     }
 
     /// informational は low より優先し、import は modified 以外を low に落とさない。
@@ -610,6 +667,11 @@ mod tests {
             }],
             Vec::new(),
         );
+        assert_eq!(
+            decide_route(&import, &modified, true),
+            CallerRoute::Informational
+        );
+        import.unproven_module_ref = true;
         assert_eq!(
             decide_route(&import, &modified, true),
             CallerRoute::Informational

@@ -205,7 +205,9 @@ fn import_query(lang_id: LangId) -> (&'static str, ImportKind) {
               (#eq? @fn_name "require"))
             (call_expression
               function: (import)
-              arguments: (arguments . [(string) (template_string)] @import.source))
+              arguments: [
+                (arguments . [(string) (template_string)] @import.source)
+                (arguments . (comment)+ . [(string) (template_string)] @import.source)])
             "#,
             ImportKind::Import,
         ),
@@ -218,7 +220,9 @@ fn import_query(lang_id: LangId) -> (&'static str, ImportKind) {
               (#eq? @fn_name "require"))
             (call_expression
               function: (import)
-              arguments: (arguments . [(string) (template_string)] @import.source))
+              arguments: [
+                (arguments . [(string) (template_string)] @import.source)
+                (arguments . (comment)+ . [(string) (template_string)] @import.source)])
             "#,
             ImportKind::Import,
         ),
@@ -364,6 +368,12 @@ const skipped = import(`./${name}`);
 const fake = fooimport("./fake");
 // import("./commented");
 const lodash = require("lodash", "ignored-require");
+const magic = import(/* webpackChunkName: "chunk" */ "./magic");
+const multiple = import(/* a */ /* b */ "./multiple", opts);
+const unknown = import(expr, "./decoy");
+const unknownComment = import(expr /* c */, "./decoy-comment");
+const leadingComment = import(/* c */ expr, "./leading-decoy");
+const surroundingComments = import(/* a */ expr /* b */, "./surrounding-decoy");
 "#;
 
         for lang in [LangId::Javascript, LangId::Typescript, LangId::Tsx] {
@@ -371,7 +381,17 @@ const lodash = require("lodash", "ignored-require");
             let imports = extract_imports(tree.root_node(), source, lang).unwrap();
             let sources: Vec<&str> = imports.iter().map(|edge| edge.source.as_str()).collect();
 
-            assert_eq!(sources, vec!["./static", "./boot", "./dep", "lodash"]);
+            assert_eq!(
+                sources,
+                vec![
+                    "./static",
+                    "./boot",
+                    "./dep",
+                    "lodash",
+                    "./magic",
+                    "./multiple"
+                ]
+            );
             assert_eq!(imports[0].kind, ImportKind::Import);
             assert_eq!(imports[1].kind, ImportKind::Import);
             assert_eq!(imports[2].kind, ImportKind::Import);

@@ -17,7 +17,7 @@ use std::collections::HashSet;
 
 use lru::LruCache;
 
-use crate::engine::parser;
+use crate::engine::{imports, parser};
 use crate::language::LangId;
 
 /// ref file から抽出した「直接 import している specifier 末尾 basename 集合」と言語情報。
@@ -48,6 +48,7 @@ pub(super) struct RefFileFacts {
 /// - `export { X } from "specifier";`
 /// - `export * from "specifier";`
 /// - `const X = require("specifier");` / `require("specifier")`
+/// - `import("specifier")` / 置換を含まない template literal
 pub(super) fn extract_ts_import_basenames(source: &[u8], lang_id: LangId) -> HashSet<String> {
     let mut out = HashSet::new();
     if !is_ts_family(lang_id) {
@@ -57,6 +58,14 @@ pub(super) fn extract_ts_import_basenames(source: &[u8], lang_id: LangId) -> Has
         return out;
     };
     walk_for_import_specifiers(tree.root_node(), source, &mut out);
+    // 動的 import は共有クエリの静的 source 判定にそろえ、同じ解析木を使う。
+    if let Ok(edges) = imports::extract_imports(tree.root_node(), source, lang_id) {
+        for edge in edges {
+            if let Some(basename) = specifier_basename(&edge.source) {
+                out.insert(basename);
+            }
+        }
+    }
     out
 }
 
@@ -669,6 +678,50 @@ export { foo } from "./bar/baz";
         assert!(bases.contains("helpers"));
         assert!(bases.contains("render"));
         assert!(bases.contains("baz"));
+    }
+
+    #[test]
+    fn extract_ts_import_basenames_dynamic_imports_follow_shared_contract() {
+        let source = br#"
+const a = import('./entry.js');
+const b = import(`./static_template`);
+const c = import('./with_options', { with: { type: 'json' } });
+const d = import(`./dynamic/${suffix}`);
+const e = import(path, './later_argument');
+const f = loader.import('./ordinary_method');
+const g = import(/* webpackChunkName: "entry" */ './magic_comment');
+const h = import.meta.url;
+const i = import('./layout/index');
+const j = import(/* a */ /* b */ './multiple_comments', opts);
+const k = import(expr /* c */, './comment_decoy');
+const l = import(/* c */ expr, './leading_decoy');
+const m = import(/* a */ expr /* b */, './surrounding_decoy');
+"#;
+        for lang in [LangId::Javascript, LangId::Typescript, LangId::Tsx] {
+            let expected: HashSet<String> = [
+                "entry",
+                "static_template",
+                "with_options",
+                "magic_comment",
+                "layout",
+                "multiple_comments",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+            assert_eq!(
+                extract_ts_import_basenames(source, lang),
+                expected,
+                "{lang:?}"
+            );
+            let tree = parser::parse_source(source, lang).unwrap();
+            let shared: HashSet<String> = imports::extract_imports(tree.root_node(), source, lang)
+                .unwrap()
+                .iter()
+                .filter_map(|edge| specifier_basename(&edge.source))
+                .collect();
+            assert_eq!(shared, expected, "shared: {lang:?}");
+        }
     }
 
     #[test]

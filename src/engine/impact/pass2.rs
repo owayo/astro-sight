@@ -508,6 +508,7 @@ mod tests {
             call_edges: Vec::new(),
             cross_file_symbol_keys: std::collections::HashSet::new(),
             affected_name_by_cikey: HashMap::new(),
+            object_member_changes: HashMap::new(),
         }
     }
 
