@@ -1,6 +1,48 @@
 use super::*;
 
 #[test]
+fn rust_lexical_binding_flags_preserve_all_occurrence_and_count_paths() {
+    use crate::engine::lexical_binding::LexicalBinding;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("runner.rs");
+    std::fs::write(&path, "use crate::api::comments;\nfn run() {\n    comments();\n    let comments = vec![1];\n    comments.len();\n    let capture = || comments;\n    crate::api::comments();\n}\n").unwrap();
+    let names = vec!["comments".to_string()];
+    let single = find_references("comments", dir.path(), None).unwrap();
+    let ac = build_ac_case_insensitive(&names).unwrap();
+    let acs = vec![(0, ac.clone())];
+    let path = camino::Utf8Path::from_path(&path).unwrap();
+    let batch = find_refs_batch_in_file_indexed::<false>(&names, &acs, path).unwrap();
+    assert_eq!(single.len(), 6);
+    assert_eq!(ref_fingerprints(&single), ref_fingerprints(&batch[0]));
+    assert_eq!(count_refs_in_file(&names, &acs, path).unwrap(), vec![6]);
+    struct Recorder(Vec<(usize, usize, LexicalBinding)>);
+    impl RefVisitor for Recorder {
+        fn on_ref(&mut self, event: RefVisitEvent<'_>) {
+            self.0
+                .push((event.line, event.column, event.lexical_binding));
+        }
+    }
+    let mut recorder = Recorder(Vec::new());
+    visit_refs_and_defs_in_file_cb(&names, &ac, path, &mut recorder).unwrap();
+    let flags = [
+        LexicalBinding::Unknown,
+        LexicalBinding::Unknown,
+        LexicalBinding::RustValueBinding,
+        LexicalBinding::RustValueBinding,
+        LexicalBinding::RustValueBinding,
+        LexicalBinding::Unknown,
+    ];
+    assert_eq!(
+        recorder.0,
+        single
+            .iter()
+            .zip(flags)
+            .map(|(reference, flag)| (reference.line, reference.column, flag))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn python_lexical_binding_flags_preserve_all_occurrence_and_count_paths() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("runner.py");
@@ -14,7 +56,7 @@ fn python_lexical_binding_flags_preserve_all_occurrence_and_count_paths() {
     assert_eq!(single.len(), 3);
     assert_eq!(ref_fingerprints(&single), ref_fingerprints(&batch[0]));
     assert_eq!(count_refs_in_file(&names, &acs, path).unwrap(), vec![3]);
-    struct Recorder(Vec<(usize, usize, crate::engine::python_scope::LexicalBinding)>);
+    struct Recorder(Vec<(usize, usize, crate::engine::lexical_binding::LexicalBinding)>);
     impl RefVisitor for Recorder {
         fn on_ref(&mut self, event: RefVisitEvent<'_>) {
             self.0
@@ -30,7 +72,7 @@ fn python_lexical_binding_flags_preserve_all_occurrence_and_count_paths() {
             .map(|r| (
                 r.line,
                 r.column,
-                crate::engine::python_scope::LexicalBinding::FunctionLocal
+                crate::engine::lexical_binding::LexicalBinding::FunctionLocal
             ))
             .collect::<Vec<_>>()
     );

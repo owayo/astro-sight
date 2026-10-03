@@ -509,6 +509,8 @@ mod tests {
             cross_file_symbol_keys: std::collections::HashSet::new(),
             affected_name_by_cikey: HashMap::new(),
             object_member_changes: HashMap::new(),
+            rust_function_names: Default::default(),
+            rust_kind_changes: Default::default(),
         }
     }
 

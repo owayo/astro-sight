@@ -20,7 +20,7 @@ use tree_sitter::Node;
 use crate::engine::{diff, parser, symbols};
 use crate::language::LangId;
 use crate::models::impact::{AffectedSymbol, HunkInfo, SignatureChange};
-use crate::models::symbol::Symbol;
+use crate::models::symbol::{Symbol, SymbolKind};
 
 use super::signature::find_signature_in_lines;
 
@@ -415,6 +415,13 @@ impl OldSide {
     }
 }
 
+/// 旧解析を再利用して確定した Rust の種別情報。
+#[derive(Default)]
+pub(super) struct DeclarationProof {
+    pub(super) rust_function_names: HashSet<String>,
+    pub(super) rust_kind_changes: HashSet<String>,
+}
+
 /// 行ベースのシグネチャ検出を AST の宣言ヘッダ比較で補う。
 ///
 /// - `"added"` と判定された関数のうち、同じファイルの変更前に同じ識別の宣言があり、その
@@ -431,7 +438,7 @@ pub(super) fn reconcile_declaration_changes(
     input: &DeclarationChangeInput<'_>,
     affected: &mut [AffectedSymbol],
     sig_changes: &mut Vec<SignatureChange>,
-) {
+) -> DeclarationProof {
     let file_has_removed_lines = !input.facts.deletion_gaps.is_empty();
     let mut old_side = LazyOldSide::Pending;
     // 行ベースの検出が変更前後のシグネチャ行を揃えられたかを判定するための変更行。
@@ -547,6 +554,51 @@ pub(super) fn reconcile_declaration_changes(
             sig_changes.push(change);
         }
     }
+    let mut proof = DeclarationProof::default();
+    if input.lang_id != LangId::Rust || affected.is_empty() || input.root.has_error() {
+        return proof;
+    }
+    let Some(old) = old_side.get(input) else {
+        return proof;
+    };
+    if old.tree.root_node().has_error() {
+        return proof;
+    }
+    let mut old_kinds = std::collections::HashMap::<&str, Vec<SymbolKind>>::new();
+    let mut new_kinds = std::collections::HashMap::<&str, Vec<SymbolKind>>::new();
+    for (symbols, kinds) in [
+        (&old.symbols[..], &mut old_kinds),
+        (input.syms, &mut new_kinds),
+    ] {
+        for symbol in symbols {
+            let entry = kinds.entry(symbol.name.as_str()).or_default();
+            let category = match symbol.kind {
+                SymbolKind::Function | SymbolKind::Method => SymbolKind::Function,
+                other => other,
+            };
+            if !entry.contains(&category) {
+                entry.push(category);
+            }
+        }
+    }
+    proof.rust_function_names = super::rust_function_names(input.lang_id, affected);
+    proof.rust_function_names.retain(|name| {
+        old_kinds.get(name.as_str()).is_some_and(|kinds| {
+            kinds
+                .iter()
+                .all(|kind| matches!(kind, SymbolKind::Function | SymbolKind::Method))
+        })
+    });
+    for symbol in affected {
+        if let (Some(old), Some(new)) = (
+            old_kinds.get(symbol.name.as_str()),
+            new_kinds.get(symbol.name.as_str()),
+        ) && old.iter().any(|kind| !new.contains(kind))
+        {
+            proof.rust_kind_changes.insert(symbol.name.clone());
+        }
+    }
+    proof
 }
 
 /// 行ベースの検出 (`detect_signature_changes`) が `name` の変更前後のシグネチャ行を
@@ -566,6 +618,117 @@ fn text_path_compared(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_scope_old_kind_proof_requires_both_sides_and_valid_reconstruction() {
+        let proof = |old: &str, new: &str, mismatched_diff: bool| {
+            let diff_text = unified_diff(
+                "api.rs",
+                old,
+                if mismatched_diff {
+                    "pub fn comments() -> usize { 2 }\n"
+                } else {
+                    new
+                },
+            );
+            let hunks = diff::parse_unified_diff(&diff_text)[0].hunks.clone();
+            let tree = parser::parse_source(new.as_bytes(), LangId::Rust).unwrap();
+            let root = tree.root_node();
+            let mut syms = symbols::extract_symbols(root, new.as_bytes(), LangId::Rust).unwrap();
+            // 現文法の impl 関数は Function。モデル上の Method も同カテゴリで固定する。
+            for symbol in &mut syms {
+                if symbol.container.as_deref() == Some("B") && symbol.kind == SymbolKind::Function {
+                    symbol.kind = SymbolKind::Method;
+                }
+            }
+            let facts = diff::extract_changed_line_facts(&diff_text, "api.rs");
+            let mut affected = super::super::find_affected_symbols(&syms, &hunks, Some(&facts));
+            let mut sig_changes = Vec::new();
+            reconcile_declaration_changes(
+                &DeclarationChangeInput {
+                    file_diff: &diff_text,
+                    file_path: "api.rs",
+                    syms: &syms,
+                    hunks: &hunks,
+                    root,
+                    source: new.as_bytes(),
+                    lang_id: LangId::Rust,
+                    facts: &facts,
+                },
+                &mut affected,
+                &mut sig_changes,
+            )
+        };
+        let new = "pub fn comments() -> u32 { 1 }\n";
+        let old = "pub fn comments() -> usize {\n 1\n}\npub struct B;\n";
+        for added in [
+            "impl B { pub fn comments(&self) -> usize { 3 } }\n",
+            "pub mod legacy { pub const comments: usize = 1; }\n",
+        ] {
+            let with_added = format!("{}{added}", old.replace(" 1", " 2"));
+            assert!(
+                proof(old, &with_added, false).rust_kind_changes.is_empty(),
+                "{added}"
+            );
+        }
+        assert_eq!(
+            proof("pub fn comments() -> usize { 1 }\npub mod legacy { pub const comments: usize = 1; }\n", new, false).rust_kind_changes,
+            HashSet::from(["comments".to_owned()])
+        );
+        assert_eq!(
+            proof("pub fn comments() -> usize { 1 }\n", new, false).rust_function_names,
+            HashSet::from(["comments".to_owned()])
+        );
+        for (old, new) in [
+            ("pub const comments: usize = 1;\n", new),
+            (
+                "pub fn comments() -> usize { 1 }\n",
+                "pub const comments: usize = 1;\n",
+            ),
+        ] {
+            let result = proof(old, new, false);
+            assert!(result.rust_function_names.is_empty());
+            assert_eq!(
+                result.rust_kind_changes,
+                HashSet::from(["comments".to_owned()])
+            );
+        }
+        assert!(
+            proof("pub fn comments() -> usize { 1 }\n", new, false)
+                .rust_kind_changes
+                .is_empty()
+        );
+        assert!(
+            proof("pub const comments: usize = 1;\n", new, true)
+                .rust_kind_changes
+                .is_empty()
+        );
+        for old in [
+            "pub const comments: usize = 1;\n",
+            "pub fn comments() -> usize { 1 }\npub mod values { pub const comments: usize = 1; }\n",
+            "pub fn comments() -> usize { let broken = ; }\n",
+            "make_functions!();\n",
+        ] {
+            assert!(
+                proof(old, new, false).rust_function_names.is_empty(),
+                "{old}"
+            );
+        }
+        assert!(
+            proof("pub fn comments() -> usize { 1 }\n", new, true)
+                .rust_function_names
+                .is_empty()
+        );
+        assert!(
+            proof(
+                "pub fn comments() -> usize { 1 }\n",
+                "pub fn comments() -> u32 { let broken = ; }\n",
+                false
+            )
+            .rust_function_names
+            .is_empty()
+        );
+    }
 
     /// テスト用: `source` を解析し、名前が `name` のシンボルの宣言ヘッダを返す。
     fn header_of(lang_id: LangId, source: &str, name: &str) -> DeclarationHeader {

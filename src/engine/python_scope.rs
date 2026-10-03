@@ -4,6 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use tree_sitter::Node;
 
+use super::lexical_binding::LexicalBinding;
+
 const OPAQUE_SCOPES: &[&str] = &[
     "lambda",
     "list_comprehension",
@@ -22,13 +24,6 @@ const TARGET_WRAPPERS: &[&str] = &[
     "dictionary_splat_pattern",
     "as_pattern_target",
 ];
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum LexicalBinding {
-    #[default]
-    Unknown,
-    FunctionLocal,
-}
 
 #[derive(Default)]
 struct Bindings {

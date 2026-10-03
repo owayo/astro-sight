@@ -162,7 +162,7 @@ pub(crate) struct RefVisitEvent<'a> {
     pub(crate) rust_macro_callee: bool,
     /// 参照の AST 上の使われ方 (identifier 経路のみ分類、他経路は `Other`)。
     pub(crate) usage: RefUsageRole,
-    pub(crate) lexical_binding: crate::engine::python_scope::LexicalBinding,
+    pub(crate) lexical_binding: crate::engine::lexical_binding::LexicalBinding,
     /// callback の間だけ有効な AST とソース。impact 固有の証明は collector 側で行う。
     pub(crate) node: Option<Node<'a>>,
     pub(crate) source: &'a [u8],
@@ -238,6 +238,7 @@ pub(crate) struct RefEnvironment<'a> {
     /// 閉じることで、ポインタ再利用による前ファイル結果の誤用を構造的に防ぐ。
     rust_binding_cache: RustPatternBindingCache,
     python_scope_index: std::cell::OnceCell<Option<crate::engine::python_scope::PythonScopeIndex>>,
+    rust_scope_index: std::cell::OnceCell<Option<crate::engine::rust_scope::RustScopeIndex>>,
     bash_declaration_cache: BashDeclarationCache,
     bash_declarations: Vec<crate::engine::bash_parse_recovery::UnparsedBashDeclaration>,
 }
@@ -420,7 +421,13 @@ impl<V: RefVisitor> RawRefSink for VisitorAdapter<'_, V> {
                 .as_ref()
                 .map(|index| index.resolve(node, env.source))
                 .unwrap_or_default(),
-            _ => crate::engine::python_scope::LexicalBinding::Unknown,
+            HitOrigin::Identifier(node) if env.lang_id == LangId::Rust && !hit.is_def => env
+                .rust_scope_index
+                .get_or_init(|| crate::engine::rust_scope::RustScopeIndex::build(node, env.source))
+                .as_ref()
+                .map(|index| index.resolve(node, env.source))
+                .unwrap_or_default(),
+            _ => crate::engine::lexical_binding::LexicalBinding::Unknown,
         };
         // identifier 由来のときだけ receiver-aware 分類 / macro callee / usage role を計算。
         // synthetic (文字列セグメント) は従来どおり ExactOwner / false / Other 固定。
@@ -660,6 +667,7 @@ pub(crate) fn run_ref_walk<M: RefMatcher, S: RawRefSink>(
         lang_id,
         rust_binding_cache: RustPatternBindingCache::default(),
         python_scope_index: std::cell::OnceCell::new(),
+        rust_scope_index: std::cell::OnceCell::new(),
         bash_declaration_cache: BashDeclarationCache::default(),
         // ERROR 回復が extglob とした宣言も全経路で保持する。count / visitor は
         // 未検証の出現を保守的に数え、refs の出力だけを unknown に分類する。
