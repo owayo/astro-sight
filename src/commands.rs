@@ -776,6 +776,7 @@ pub use review::{CmdReviewOpts, cmd_review};
 
 mod api_changes;
 mod dead_code;
+mod dead_code_default_liveness;
 mod dead_code_member_liveness;
 
 #[cfg(test)]
