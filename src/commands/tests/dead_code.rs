@@ -18,6 +18,197 @@ use std::io::Cursor;
 #[allow(unused_imports)]
 use std::process::Command;
 
+#[test]
+fn detect_dead_dynamic_import_keeps_only_the_target_default_export_live() {
+    for (extension, declaration) in [
+        ("tsx", "export default function Panel() { return <div/>; }"),
+        ("ts", "export default class Panel {}"),
+        ("js", "export default function Panel() { return 1; }"),
+        ("jsx", "export default function Panel() { return <div/>; }"),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        fs::create_dir(repo.join("other")).unwrap();
+        fs::write(
+            repo.join(format!("panel.{extension}")),
+            format!("{declaration}\nexport function unusedNamed() {{}}"),
+        )
+        .unwrap();
+        fs::write(
+            repo.join("other/panel.ts"),
+            "export default function UnloadedPanel() {}",
+        )
+        .unwrap();
+        fs::write(
+            repo.join(format!("app.{extension}")),
+            "export async function loadPanel() {\n\
+             const module = await import('./panel.js');\n\
+             return module.default;\n\
+             }\nvoid loadPanel();",
+        )
+        .unwrap();
+        let files = vec![
+            repo.join(format!("panel.{extension}")),
+            repo.join("other/panel.ts"),
+        ];
+        let (dead, test_only) = detect_dead_symbols_from_files(repo.to_str().unwrap(), &files);
+        let names: HashSet<_> = dead.iter().map(|symbol| symbol.name.as_str()).collect();
+        assert_eq!(
+            names,
+            HashSet::from(["unusedNamed", "UnloadedPanel"]),
+            "{extension}"
+        );
+        assert!(test_only.is_empty(), "{test_only:?}");
+    }
+}
+
+#[test]
+fn detect_dead_dynamic_import_preserves_test_only_and_production_precedence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    fs::create_dir(repo.join("tests")).unwrap();
+    fs::write(
+        repo.join("panel.tsx"),
+        "export default function Panel() { return <div/>; }",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("tests/loader.ts"),
+        "export async function load() { return (await import('../panel.js')).default; }",
+    )
+    .unwrap();
+    let files = vec![repo.join("panel.tsx")];
+    let (dead, test_only) = detect_dead_symbols_from_files(repo.to_str().unwrap(), &files);
+    assert!(dead.is_empty(), "{dead:?}");
+    assert_eq!(test_only.len(), 1);
+    assert_eq!(test_only[0].name, "Panel");
+
+    fs::write(
+        repo.join("loader.ts"),
+        "export function lazy() { return import(`./panel.js`); }",
+    )
+    .unwrap();
+    let (dead, test_only) = detect_dead_symbols_from_files(repo.to_str().unwrap(), &files);
+    assert!(dead.is_empty(), "{dead:?}");
+    assert!(test_only.is_empty(), "{test_only:?}");
+}
+
+#[test]
+fn detect_dead_dynamic_import_resolves_relative_and_index_sources() {
+    for specifier in [
+        "./view",
+        "./view/index",
+        "./view/index.js",
+        "./view/index.tsx",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::create_dir(repo.join("view")).unwrap();
+        fs::write(
+            repo.join("view/index.tsx"),
+            "export default function View() { return <div/>; }",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("loader.ts"),
+            format!("export function lazy() {{ return import(/* chunk */ '{specifier}', {{ with: {{ type: 'json' }} }}); }}"),
+        )
+        .unwrap();
+        let (dead, test_only) =
+            detect_dead_symbols_from_files(repo.to_str().unwrap(), &[repo.join("view/index.tsx")]);
+        assert!(dead.is_empty(), "{specifier}: {dead:?}");
+        assert!(test_only.is_empty(), "{specifier}: {test_only:?}");
+    }
+}
+
+#[test]
+fn detect_dead_dynamic_import_ignores_non_static_or_unrelated_sources() {
+    for source in [
+        "void import(`./${name}.js`);",
+        "void import(path, './panel.js');",
+        "// import('./panel.js')\n",
+        "const text = \"import('./panel.js')\";",
+        "void import('panel.js');",
+        "void import('./missing/panel.js');",
+        "import './panel.js';",
+        "import type { Other } from './panel.js';",
+        "export * from './panel.js';",
+        "export { Other as default } from './panel.js';",
+        "void import('./panel.js?raw');",
+        "void import('./panel.js#fragment');",
+        "void import('../panel.js');",
+        r"void import('./pan\u0065l.js');",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("panel.ts"), "export default function Panel() {}").unwrap();
+        fs::write(repo.join("loader.ts"), source).unwrap();
+        let (dead, test_only) =
+            detect_dead_symbols_from_files(repo.to_str().unwrap(), &[repo.join("panel.ts")]);
+        assert_eq!(dead.len(), 1, "{source}: {dead:?}");
+        assert_eq!(dead[0].name, "Panel");
+        assert!(test_only.is_empty(), "{test_only:?}");
+    }
+}
+
+#[test]
+fn detect_dead_default_consuming_imports_and_reexports_keep_the_declaration_live() {
+    for source in [
+        "import Alias from './panel.js'; void Alias;",
+        "import Alias, { Other } from './panel.js'; void Alias; void Other;",
+        "import * as namespace from './panel.js'; void namespace;",
+        "import { default as Alias } from './panel.js'; void Alias;",
+        "export { default } from './panel.js';",
+        "export { default as Alias } from './panel.js';",
+        "export * as namespace from './panel.js';",
+        "const namespace = require('./panel.js'); void namespace.default;",
+        "const load = () => import('./panel.js'); void load;",
+        "import type Alias from './panel.js';",
+        "import Alias = require('./panel.js'); void Alias.default;",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("panel.ts"), "export default function Panel() {}").unwrap();
+        fs::write(repo.join("loader.ts"), source).unwrap();
+        let (dead, test_only) =
+            detect_dead_symbols_from_files(repo.to_str().unwrap(), &[repo.join("panel.ts")]);
+        assert!(dead.is_empty(), "{source}: {dead:?}");
+        assert!(test_only.is_empty(), "{source}: {test_only:?}");
+    }
+}
+
+#[test]
+fn detect_dead_directory_only_specifiers_do_not_load_a_sibling_file() {
+    for (importer, specifier) in [
+        ("views/app.ts", "."),
+        ("views/child/app.ts", ".."),
+        ("app.ts", "./views/"),
+        ("views/child/app.ts", "../."),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::create_dir_all(repo.join("views/child")).unwrap();
+        fs::write(repo.join("views.ts"), "export default function Views() {}").unwrap();
+        fs::write(
+            repo.join("views/index.ts"),
+            "export default function ViewIndex() {}",
+        )
+        .unwrap();
+        for comment in ["", "// open views\n"] {
+            fs::write(
+                repo.join(importer),
+                format!("{comment}export const load = () => import('{specifier}');"),
+            )
+            .unwrap();
+            let files = [repo.join("views.ts"), repo.join("views/index.ts")];
+            let (dead, test_only) = detect_dead_symbols_from_files(repo.to_str().unwrap(), &files);
+            assert_eq!(dead.len(), 1, "{importer} {specifier} {comment}: {dead:?}");
+            assert_eq!(dead[0].name, "Views");
+            assert!(test_only.is_empty(), "{test_only:?}");
+        }
+    }
+}
+
 /// Angular component の public method が `templateUrl` で紐づく
 /// `.component.html` から参照されている場合、dead 判定から除外される。
 ///

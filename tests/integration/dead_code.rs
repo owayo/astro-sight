@@ -6,6 +6,103 @@ use super::support::*;
 use std::process::{Command, Stdio};
 
 #[test]
+fn dead_code_dynamic_import_default_is_live_without_synthetic_refs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir(root.join("lib")).unwrap();
+    std::fs::write(
+        root.join("lib/panel.tsx"),
+        "export default function Panel() { return <div/>; }\nexport function unusedNamed() {}",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("app.tsx"),
+        "export async function loadPanel() {\n\
+         const module = await import('./lib/panel.js');\n\
+         return module.default;\n\
+         }\nvoid loadPanel();",
+    )
+    .unwrap();
+    let output = cargo_bin()
+        .args([
+            "dead-code",
+            "--dir",
+            root.to_str().unwrap(),
+            "--glob",
+            "lib/**",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let dead = json["dead_symbols"].as_array().unwrap();
+    assert_eq!(dead.len(), 1, "{json}");
+    assert_eq!(dead[0]["name"], "unusedNamed");
+
+    for option in ["--name", "--names"] {
+        let output = cargo_bin()
+            .args(["refs", option, "Panel", "--dir", root.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let refs = json["refs"].as_array().unwrap();
+        assert_eq!(refs.len(), 1, "{json}");
+        assert_eq!(refs[0]["kind"], "def");
+    }
+}
+
+#[test]
+fn review_hook_keeps_a_changed_dynamic_default_export_out_of_dead() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.write(
+        "panel.tsx",
+        "export default function Panel() { return <div/>; }\n",
+    );
+    repo.write(
+        "app.ts",
+        "export function load() { return import('./panel.js'); }\nvoid load();\n",
+    );
+    repo.commit_all("baseline");
+    repo.write(
+        "panel.tsx",
+        "export default function Panel() { return <section/>; }\n",
+    );
+
+    let dead = repo.run_json("dead-code", &["--git"]);
+    assert!(
+        dead["dead_symbols"].as_array().unwrap().is_empty(),
+        "{dead}"
+    );
+    let review = repo.run_json("review", &["--git"]);
+    assert!(
+        review["dead_symbols"].as_array().unwrap().is_empty(),
+        "{review}"
+    );
+    let hook = cargo_bin()
+        .args([
+            "review",
+            "--dir",
+            repo.root().to_str().unwrap(),
+            "--git",
+            "--hook",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        hook.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hook.stderr)
+    );
+    assert!(hook.stdout.is_empty());
+}
+
+#[test]
 fn dead_code_does_not_exclude_angular_provider_callback_from_sibling_token() {
     // codex review: 同じファイルに RECAPTCHA_LOADER_OPTIONS import/provider があっても、
     // OTHER_TOKEN の provider object にある onBeforeLoad は除外しない。

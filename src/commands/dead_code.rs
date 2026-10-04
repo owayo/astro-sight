@@ -13,6 +13,7 @@ use super::api_changes::extract_exported_symbols_from_file_inner;
 use super::api_changes::{
     bare_name, extract_exported_symbols_from_file_inner_with_lang, extract_symbol_lines,
 };
+use super::dead_code_default_liveness::DefaultExportLiveness;
 use super::dead_code_member_liveness::{JsTsMemberLiveness, MemberStatus, PhpMemberLiveness};
 use super::git_input::{DiffSourceResolution, resolve_diff_source};
 use crate::output::{OutputOptions, serialize_cli_document};
@@ -102,9 +103,11 @@ pub(crate) fn detect_dead_symbols(
     };
 
     let asset_refs = collect_framework_asset_refs(&canonical_dir);
+    let default_liveness =
+        DefaultExportLiveness::build(&candidates.all_syms, &canonical_dir, &scan.files);
 
     let (mut dead, mut test_only) =
-        classify_dead_symbols(&candidates, &index, &counts, &asset_refs);
+        classify_dead_symbols(&candidates, &index, &counts, &asset_refs, &default_liveness);
     attach_declaration_lines(dir, &mut dead, &mut test_only);
     DeadCodeDetection {
         dead,
@@ -441,6 +444,7 @@ fn classify_dead_symbols(
     index: &DeadCodeNameIndex,
     counts: &std::collections::HashMap<String, (usize, usize)>,
     asset_refs: &FrameworkAssetRefs,
+    default_liveness: &DefaultExportLiveness,
 ) -> (Vec<DeadSymbol>, Vec<DeadSymbol>) {
     // production 0 / test 0 → dead_symbols
     // production 0 / test > 0 → test_only_symbols (F5)
@@ -496,6 +500,9 @@ fn classify_dead_symbols(
         }
 
         let (prod_cnt, test_cnt) = ref_counts_with_liveness(&key, file, index, counts);
+        let (default_prod, default_test) = default_liveness.counts_for(file, name);
+        let prod_cnt = prod_cnt.saturating_add(default_prod);
+        let test_cnt = test_cnt.saturating_add(default_test);
         if prod_cnt > 0 {
             continue;
         }
