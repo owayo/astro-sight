@@ -56,6 +56,12 @@ Callers fall into 3 groups by confidence and by how breaking they are. "Blocking
 - `low_confidence_callers`: generic names whose owner (the class or type a method belongs to) cannot be determined, and same-name references in TS/Rust without evidence of a direct import
 - `informational_callers`: function-value references to symbols whose name and number of arguments did not change, and import lines of modified symbols whose name did not change. Not blocking
 
+### Python Relative Import Bindings
+
+An unaliased, unconditional module-level `from .cli import main` can bind `main()` to a different function than an unrelated changed `legacy.main`. Impact analysis excludes that use only when the relative module resolves uniquely inside the workspace and contains a single, undecorated, direct definition of the imported function. References to the actual defining module, `.pyi` changes, and import-name occurrences keep their existing handling. `refs` and dead-code reference counts are unchanged.
+
+The proof requires package initializers containing only comments, plain string literals, or `pass`. Rebinding, duplicate imports, star imports, dynamic namespace operations (including `__dict__` and frame namespace access), parse failures, and module `__getattr__` prevent it. Absolute imports, aliases, namespace packages, class bodies, type positions, lambdas, and comprehensions keep the conservative result. Arbitrary runtime replacement from another file, custom import hooks, and string-based monkey patching are outside this static proof. Package and target evidence is reused within one analysis and discarded before the next query; imported names unrelated to the changed symbols are skipped.
+
 ## impact: Detect Unresolved Impacts (for Stop Hooks)
 
 From the result of `context`, `impact` flags impacts on files outside the diff as "unresolved". It is meant for the Stop hook of an AI agent: when affected code is left untouched, it blocks and prompts the agent to continue. `impact` only follows symbols that still exist in the changed tree, so deleted symbols are not detected (exit 0 even if calls remain). To stop on deletions too, use `review --dir . --git --hook`, which detects removed public APIs as `api.rm`.

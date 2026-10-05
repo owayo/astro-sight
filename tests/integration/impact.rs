@@ -6,6 +6,265 @@ use super::support::*;
 use std::process::{Command, Stdio};
 
 #[test]
+fn impact_python_relative_import_belongs_to_its_defining_module() {
+    for consumer in [
+        "from .cli import main\nraise SystemExit(main())\n",
+        "from .cli import main\ndef run():\n    return main()\n",
+        "from .cli import (main,)\ncallback = main\n",
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("pkg");
+        repo.write("legacy.py", "def main():\n    return 0\n");
+        repo.write("pkg/__init__.py", "");
+        repo.write(
+            "pkg/cli.py",
+            "def main() -> int:\n    return 0\n\ndef helper():\n    return 0\n",
+        );
+        repo.write("pkg/__main__.py", consumer);
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "legacy.py",
+            "def main(required: str) -> int:\n    return 0\n",
+        );
+
+        let context = repo.run_json("context", &["--git"]);
+        assert_eq!(context["changes"].as_array().unwrap().len(), 1);
+        assert!(
+            context["changes"][0]["impacted_callers"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "{consumer}: {context}"
+        );
+        let output = cargo_bin()
+            .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{consumer}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // 同じ参照で実際の所有元を変更すると未解決影響になる。
+        repo.write("pkg/cli.py", "def main(required: str) -> int:\n    return 0\n\ndef helper(required: str):\n    return 0\n");
+        let context = repo.run_json("context", &["--git"]);
+        let changes = context["changes"].as_array().unwrap();
+        let legacy = changes.iter().find(|c| c["path"] == "legacy.py").unwrap();
+        assert!(
+            legacy["impacted_callers"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "{context}"
+        );
+        let actual = changes.iter().find(|c| c["path"] == "pkg/cli.py").unwrap();
+        assert!(
+            actual["impacted_callers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["path"] == "pkg/__main__.py"),
+            "{context}"
+        );
+        let output = cargo_bin()
+            .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{consumer}");
+    }
+}
+
+#[test]
+fn impact_python_import_proof_keeps_unresolved_and_ambiguous_callers() {
+    for (target, consumer) in [
+        (None, "from .cli import main\nmain()\n"),
+        (
+            Some("from legacy import main\n"),
+            "from .cli import main\nmain()\n",
+        ),
+        (
+            Some("if True:\n    def main():\n        return 0\n"),
+            "from .cli import main\nmain()\n",
+        ),
+        (
+            Some("def main():\n    return 0\nmain = other\n"),
+            "from .cli import main\nmain()\n",
+        ),
+        (
+            Some("def main():\n    return 0\ndef broken(\n"),
+            "from .cli import main\nmain()\n",
+        ),
+        (
+            Some(
+                "import legacy\ndef __getattr__(name):\n    return legacy.main\nimport pkg.runner\ndef main():\n    return 0\n",
+            ),
+            "from .cli import main\nmain()\n",
+        ),
+        (
+            Some("import legacy\n@decorate(legacy.main)\ndef main():\n    return 0\n"),
+            "from .cli import main\nmain()\n",
+        ),
+        (
+            Some(
+                "import legacy\ndef main():\n    return 0\nmain.__globals__.update(main=legacy.main)\n",
+            ),
+            "from .cli import main\nmain()\n",
+        ),
+        (
+            Some(
+                "import sys, legacy\ndef main():\n    return 0\nsys.modules[__name__].__dict__.update(main=legacy.main)\n",
+            ),
+            "from .cli import main\nmain()\n",
+        ),
+        (
+            Some("def main():\n    return 0\n"),
+            "from .cli import main\nimport sys, legacy\nsys._getframe().f_globals.update(main=legacy.main)\nmain()\n",
+        ),
+        (
+            Some("def main():\n    return 0\n"),
+            "from .cli import main\nimport sys, legacy\nsys.modules[__name__].__setattr__('main', legacy.main)\nmain()\n",
+        ),
+        (
+            Some(
+                "import sys, legacy\ndef main():\n    return 0\nsys.modules.update({__name__: legacy})\n",
+            ),
+            "from .cli import main\nmain()\n",
+        ),
+        (
+            Some(
+                "import sys, legacy\ndef main():\n    return 0\nsys.modules[__spec__.name] = legacy\n",
+            ),
+            "from .cli import main\nmain()\n",
+        ),
+        (
+            Some("def main():\n    return 0\n"),
+            "import sys, legacy\nsys.modules['pkg.cli'] = legacy\nfrom .cli import main\nmain()\n",
+        ),
+        (
+            Some("def main():\n    return 0\n"),
+            "import types, legacy, pkg.cli\nclass M(types.ModuleType):\n    def __getattribute__(self, name):\n        return getattr(legacy, name)\npkg.cli.__class__ = M\nfrom .cli import main\nmain()\n",
+        ),
+        (
+            Some("def main():\n    return 0\n"),
+            "from .cli import main\nimport legacy\ng = globals\ng().update(main=legacy.main)\nmain()\n",
+        ),
+        (
+            Some("def main():\n    return 0\n"),
+            "import other.sub\n__spec__ = other.sub.__spec__\nfrom .cli import main\nmain()\n",
+        ),
+        (
+            Some("def main():\n    return 0\n"),
+            "from .cli import main\nfrom legacy import *\nmain()\n",
+        ),
+        (
+            Some("def main():\n    return 0\n"),
+            "from .cli import main\nmain = other\nmain()\n",
+        ),
+        (
+            Some("def main():\n    return 0\n"),
+            "from .cli import main\ndef run():\n    global main\n    return main()\n",
+        ),
+        (
+            Some("def main():\n    return 0\n"),
+            "from .cli import main\nobj.main()\n",
+        ),
+        (
+            Some("def main():\n    return 0\n"),
+            "from .cli import main\nexec(code)\nmain()\n",
+        ),
+        (
+            Some("def main():\n    return 0\n"),
+            "main()\nfrom .cli import main\n",
+        ),
+        (
+            Some("def main():\n    return 0\n"),
+            "if True:\n    from .cli import main\nmain()\n",
+        ),
+        (
+            Some("def main():\n    return 0\n"),
+            "from .cli import main\nimport legacy\nmain(); legacy.main()\n",
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("pkg");
+        repo.write("legacy.py", "def main():\n    return 0\n");
+        repo.write("pkg/__init__.py", "");
+        if let Some(target) = target {
+            repo.write("pkg/cli.py", target);
+        }
+        repo.write("pkg/runner.py", consumer);
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write("legacy.py", "def main(required):\n    return 0\n");
+        let context = repo.run_json("context", &["--git"]);
+        assert!(
+            context["changes"][0]["impacted_callers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["path"] == "pkg/runner.py"),
+            "{target:?} / {consumer}: {context}"
+        );
+        let output = cargo_bin()
+            .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{consumer}");
+    }
+}
+
+#[test]
+fn impact_python_import_keeps_type_stub_changes() {
+    for stub in ["pkg/cli.pyi", "pkg/cli.PYI"] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("pkg");
+        repo.write("pkg/__init__.py", "");
+        repo.write("pkg/cli.py", "def main():\n    return 0\n");
+        repo.write(stub, "def main() -> int: ...\n");
+        repo.write("pkg/runner.py", "from .cli import main\nmain()\n");
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(stub, "def main(required: str) -> int: ...\n");
+        let output = cargo_bin()
+            .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("pkg/runner.py"));
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn impact_python_import_does_not_hide_same_source_through_symlink() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("pkg");
+    repo.write("legacy.py", "def main():\n    return 0\n");
+    repo.write("pkg/__init__.py", "");
+    std::os::unix::fs::symlink("../legacy.py", repo.path("pkg/cli.py")).unwrap();
+    repo.write("pkg/runner.py", "from .cli import main\nmain()\n");
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("legacy.py", "def main(required):\n    return 0\n");
+    let output = cargo_bin()
+        .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("pkg/runner.py"));
+}
+
+#[test]
 fn impact_python_local_bindings_are_not_external_callers() {
     for consumer in [
         "def main():\n    collect_items = []\n    collect_items.append(1)\n    return len(collect_items)\n",
