@@ -81,6 +81,8 @@ pub(super) struct RefEventMini {
     pub(super) unproven_module_ref: bool,
     /// Rust 値束縛の証拠は変更元ごとの kind を確認して適用する。
     pub(super) rust_value_binding: bool,
+    /// Python の相対 import で直接定義へ解決した所有元。未証明は u32::MAX。
+    pub(super) python_import_owner_id: u32,
 }
 
 /// 汎用すぎてシンボル名だけでは owner を特定できない PHP/JS 系メソッド名。
@@ -262,6 +264,10 @@ impl RouteDecisionContext<'_> {
 /// ファイル走査完了後に `finish_file` で Stage 1-6 (Stage 4b 除く) の filter を適用して
 /// `local_maps` / `local_def_paths` へ流す。`SymbolReference` の Vec は生成しない。
 pub(super) struct ImpactCollector<'a> {
+    pub(super) python_imports:
+        std::cell::OnceCell<Option<super::python_imports::PythonImportIndex>>,
+    pub(super) python_import_cache: &'a super::python_imports::PythonImportCache,
+    pub(super) python_changed_names: &'a std::collections::HashMap<String, usize>,
     pub(super) sym_to_fc: &'a [Vec<u32>],
     pub(super) file_contexts: &'a [FileContext],
     pub(super) all_symbol_names: &'a [String],
@@ -405,6 +411,33 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             && context_line_has_macro_invocation(context)
             && !rust_macro_callee;
 
+        let python_import_owner_id = if self.ref_lang == Some(LangId::Python) {
+            node.and_then(|node| {
+                self.python_imports
+                    .get_or_init(|| {
+                        super::python_imports::PythonImportIndex::build(
+                            node,
+                            source,
+                            self.dir,
+                            self.path_str,
+                            self.python_changed_names,
+                            self.python_import_cache,
+                        )
+                    })
+                    .as_ref()?
+                    .owner(node, source)
+            })
+            .and_then(|owner| owner.to_str())
+            .map_or(u32::MAX, |owner| {
+                self.pool
+                    .lock()
+                    .expect("string pool mutex poisoned")
+                    .intern(&crate::git_support::normalize_workspace_separators(owner))
+            })
+        } else {
+            u32::MAX
+        };
+
         self.ref_events.push(RefEventMini {
             sym_ix,
             line: line as u32,
@@ -419,6 +452,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             member_path_id,
             unproven_module_ref,
             rust_value_binding: lexical_binding == LexicalBinding::RustValueBinding,
+            python_import_owner_id,
         });
     }
 }
@@ -454,6 +488,40 @@ impl<'a> ImpactCollector<'a> {
         // Phase 4: confidence == BareNameOnly + シンボル名が generic (new/update/...) なら
         // local_low_maps へ振り分け、強い impact 信号を汚染しない。
         let filter_disabled = confidence_filter_disabled();
+        // symlink 経由の同一ファイルを別の所有元と判定しない。変更元ごとに1回だけ解決する。
+        let python_source_paths = if self
+            .ref_events
+            .iter()
+            .any(|event| event.python_import_owner_id != u32::MAX)
+        {
+            self.python_import_cache
+                .source_paths
+                .get_or_init(|| {
+                    self.file_contexts
+                        .iter()
+                        .map(|context| {
+                            (context.lang_id == LangId::Python
+                                && !camino::Utf8Path::new(&context.new_path)
+                                    .extension()
+                                    .is_some_and(|extension| extension.eq_ignore_ascii_case("pyi")))
+                            .then(|| {
+                                std::path::Path::new(self.dir)
+                                    .join(&context.new_path)
+                                    .canonicalize()
+                                    .ok()
+                                    .and_then(|path| {
+                                        path.to_str()
+                                            .map(crate::git_support::normalize_workspace_separators)
+                                    })
+                            })
+                            .flatten()
+                        })
+                        .collect()
+                })
+                .as_slice()
+        } else {
+            &[]
+        };
         let mut route_context = RouteDecisionContext {
             filter_disabled,
             ref_lang: self.ref_lang,
@@ -464,6 +532,13 @@ impl<'a> ImpactCollector<'a> {
         };
         for e in self.ref_events.drain(..) {
             let sym_ix_usize = e.sym_ix as usize;
+            let python_owner = (e.python_import_owner_id != u32::MAX).then(|| {
+                self.pool
+                    .lock()
+                    .expect("string pool mutex poisoned")
+                    .get(e.python_import_owner_id)
+                    .to_owned()
+            });
             let fc_ixs = &self.sym_to_fc[sym_ix_usize];
             if fc_ixs.is_empty() {
                 continue;
@@ -480,6 +555,12 @@ impl<'a> ImpactCollector<'a> {
             for &fc_ix_raw in fc_ixs {
                 let fc_ix = fc_ix_raw as usize;
                 let ctx = &self.file_contexts[fc_ix];
+                if let Some(owner) = python_owner.as_deref()
+                    && let Some(Some(source_path)) = python_source_paths.get(fc_ix)
+                    && owner != source_path
+                {
+                    continue;
+                }
                 if e.rust_value_binding
                     && rust_function_only(ctx, &self.all_symbol_names[sym_ix_usize])
                 {
@@ -594,6 +675,7 @@ mod tests {
             member_path_id: u32::MAX,
             unproven_module_ref: false,
             rust_value_binding: false,
+            python_import_owner_id: u32::MAX,
         }
     }
 

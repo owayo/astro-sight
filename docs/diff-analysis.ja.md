@@ -56,6 +56,12 @@ astro-sight context --dir . --diff-file /tmp/changes.diff
 - `low_confidence_callers`: owner（メソッドが属するクラスや型）を確定できない汎用名や、直接 import の証拠がない TS/Rust の同名参照
 - `informational_callers`: 名前と引数個数が変わっていないシンボルへの関数値参照や、名前が変わっていない modified シンボルの import 行。blocking 対象にしない
 
+### Python の相対 import 束縛
+
+別名のない、無条件のモジュール直下の `from .cli import main` で読み込んだ `main()` は、無関係な `legacy.main` の変更による影響から除外する。除外するのは、相対モジュールを workspace 内の一意なファイルへ解決でき、import した関数が無装飾・直接定義で各1件だけ存在する場合に限る。実際の定義元の変更、型スタブ `.pyi` の変更、import 名の出現位置は従来の扱いを維持する。`refs` の出現一覧と dead-code の参照件数も変えない。
+
+package の初期化はコメント・通常の文字列リテラル・`pass` だけを許す。再束縛、重複 import、star import、動的な名前空間操作（`__dict__` や frame の名前空間へのアクセスを含む）、解析失敗、モジュールの `__getattr__` があれば証明しない。絶対 import、別名、namespace package、クラス本体、型位置、lambda、内包表記は保守的な判定に残す。別ファイルからの任意の実行時差し替え、独自 import hook、文字列による monkey patch はこの静的な証明の対象外。package と定義元の証拠は1回の解析内で再利用し、次の問い合わせには持ち越さない。変更シンボルと無関係な import 名は解決しない。
+
 ## impact - 未解決の影響検出（Stop hook 用）
 
 `context` の結果から、diff に含まれないファイルへの影響を「未解決」と判定する。AI エージェントの Stop hook で使用し、未対応の影響先があればブロックして続行を促す。`impact` が追うのは変更後のツリーに残っているシンボルだけで、削除したシンボルは検出しない（呼び出しが残っていても exit 0）。削除まで止めたい場合は、公開 API の削除を `api.rm` として検出する `review --dir . --git --hook` を使う。

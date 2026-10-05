@@ -350,6 +350,7 @@ pub(super) fn stream_caller_maps_and_defs(
 
     // 全 chunk を通して 1 つの StringPool を共有する。workers=1 なら lock 競合は発生しない。
     let string_pool = std::sync::Mutex::new(StringPool::new());
+    let python_import_cache = super::python_imports::PythonImportCache::default();
 
     let init_state = || new_worker_state(n_fc, n_sym);
 
@@ -399,6 +400,9 @@ pub(super) fn stream_caller_maps_and_defs(
                         let ref_lang = crate::language::LangId::from_path(utf8_path).ok();
                         let dir_str = dir.to_str().unwrap_or("");
                         let mut collector = ImpactCollector {
+                            python_imports: std::cell::OnceCell::new(),
+                            python_import_cache: &python_import_cache,
+                            python_changed_names: sym_ix,
                             sym_to_fc: &sym_to_fc,
                             file_contexts,
                             all_symbol_names,

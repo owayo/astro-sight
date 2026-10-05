@@ -5,6 +5,7 @@ mod import_facts;
 mod object_members;
 mod pass2;
 mod pass3;
+mod python_imports;
 mod reexport_move;
 mod signature;
 pub(crate) mod test_context;
