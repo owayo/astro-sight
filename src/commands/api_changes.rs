@@ -328,6 +328,7 @@ pub(crate) fn detect_api_changes(
             .collect(),
         modified_closed_in_diff: buckets.modified_closed_in_diff,
         const_value_changes: buckets.const_value_changes,
+        callback_body_changes: buckets.callback_body_changes,
         compatible_modified: buckets.compatible_modified,
     }
 }
@@ -500,6 +501,7 @@ pub(crate) fn reconcile_with_moves(
 pub(crate) mod diff_processing;
 pub(crate) mod exported;
 mod forwarded_values;
+mod js_const;
 mod js_ts_shadow;
 pub(crate) mod prepare;
 pub(crate) mod removed;
@@ -526,6 +528,7 @@ mod ts_signature;
 
 pub(crate) use diff_processing::*;
 pub(crate) use exported::*;
+use js_const::detect_callback_body_only_change;
 pub(crate) use prepare::*;
 pub(crate) use python_contract::*;
 pub(crate) use python_literal::*;

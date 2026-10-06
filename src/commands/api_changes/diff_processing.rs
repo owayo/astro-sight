@@ -810,6 +810,14 @@ pub(crate) fn classify_signature_change(
         state.closure_caches,
     ) {
         state.buckets.modified_closed_in_diff.push(change);
+    } else if detect_callback_body_only_change(&site, sources) {
+        state
+            .buckets
+            .callback_body_changes
+            .push(crate::models::review::CallbackBodyChange {
+                change,
+                reason: crate::models::review::CallbackBodyChangeReason::CallbackBodyChange,
+            });
     } else {
         // blocking な api.mod にだけ「解決できた呼び出し参照ゼロ」フラグを添える。
         // 分類も blocking 判定も変えず、トリアージが「呼び出し側を探す」段階を省けるようにする。

@@ -529,8 +529,9 @@ pub enum Commands {
         dead_scope: Option<DeadScope>,
 
         /// `pub const` / 非 mut `pub static` / `export const` の値 (initializer) のみ変更を
-        /// 厳格に扱う。指定時は api.const_value を Stop hook の blocking 対象に昇格する。
-        /// デフォルトでは値のみの変更はコンパイル互換性を壊さないため informational (非 blocking)。
+        /// 厳格に扱う。api.const_value と、任意 wrapper 内の callback 本体だけの変更
+        /// (api.callback_body、戻り値の公開形状は未検証) を Stop hook の blocking 対象にする。
+        /// デフォルトではこれらを informational (非 blocking) として報告する。
         #[arg(long = "strict-public-const-values")]
         strict_public_const_values: bool,
 

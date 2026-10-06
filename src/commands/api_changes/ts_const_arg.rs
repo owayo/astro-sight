@@ -73,7 +73,7 @@ fn bare_identifier_argument<'a>(
 /// その子 `required_parameter` など) が、過大側 = 一意性チェックで不成立 = blocking 維持
 /// なので安全側に倒れる。本判定が成立してほしいケース (トップレベルの `const NAME = {...}`)
 /// は `variable_declarator` 1 個だけで数えられ、二重計上は起きない。
-fn collect_bindings_named<'tree>(
+pub(super) fn collect_bindings_named<'tree>(
     root: tree_sitter::Node<'tree>,
     source: &[u8],
     name: &str,
@@ -177,7 +177,7 @@ fn leftmost_identifier_text<'a>(node: tree_sitter::Node<'_>, source: &'a [u8]) -
 
 /// `variable_declarator` が `const` 宣言かを判定する。`let` / `var` は再代入されうるため
 /// 「定義側の更新 = 呼び出し時の値の更新」と言い切れず対象外。
-fn declarator_is_const(declarator: tree_sitter::Node<'_>) -> bool {
+pub(super) fn declarator_is_const(declarator: tree_sitter::Node<'_>) -> bool {
     let Some(parent) = declarator.parent() else {
         return false;
     };

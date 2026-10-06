@@ -6,6 +6,118 @@ use super::support::*;
 use std::process::{Command, Stdio};
 
 #[test]
+fn review_hook_callback_header_changes_stay_blocking() {
+    let before =
+        "export const handle = wrap((req: Request): Response => { return 1; }, { retry: 1 });\n";
+    for (before, after) in [
+        (
+            before,
+            "export const handle = wrap((req: Request, ctx: unknown): Response => { return 2; }, { retry: 1 });\n",
+        ),
+        (
+            before,
+            "export const handle = wrap((req: Request): Other => { return 2; }, { retry: 1 });\n",
+        ),
+        (
+            before,
+            "export const handle = other((req: Request): Response => { return 2; }, { retry: 1 });\n",
+        ),
+        (
+            before,
+            "export const handle = wrap((req: Request): Response => { return 2; }, { retry: 2 });\n",
+        ),
+        (
+            "export const handle = wrap(() => 1, 'a b');\n",
+            "export const handle = wrap(() => 2, 'a  b');\n",
+        ),
+    ] {
+        let output = a3_review_hook(
+            |root| std::fs::write(root.join("api.ts"), after).unwrap(),
+            &[
+                ("api.ts", before),
+                (
+                    "use.ts",
+                    "import { handle } from './api';\nexport function use() { return handle(request); }\n",
+                ),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stderr}");
+        let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert_eq!(json["api"]["mod"][0]["n"], "handle", "{stderr}");
+        assert!(json["api"]["callback_body"].is_null(), "{stderr}");
+    }
+}
+
+#[test]
+fn review_hook_callback_body_edits_remain_visible() {
+    for (file, before, after, usage) in [
+        (
+            "api.ts",
+            "export const handle = wrap(async (req: Request) => { return req.old; });\n",
+            "export const handle = wrap(async (req: Request) => { return req.new; });\n",
+            "handle(request)",
+        ),
+        (
+            "api.ts",
+            "export const handle = create(set => ({ a: 1, b: 2 }));\n",
+            "export const handle = create(set => ({ a: 1 }));\n",
+            "handle.a",
+        ),
+        (
+            "api.js",
+            "export const handle = wrap(async req => { return req.old; });\n",
+            "export const handle = wrap(async req => { return req.new; });\n",
+            "handle(request)",
+        ),
+    ] {
+        let use_source = format!(
+            "import {{ handle }} from './api';\nexport function use() {{ return {usage}; }}\n"
+        );
+        let mut strict_output = None;
+        let output = a3_review_hook(
+            |root| {
+                std::fs::write(root.join(file), after).unwrap();
+                strict_output = Some(
+                    cargo_bin()
+                        .args([
+                            "review",
+                            "--dir",
+                            root.to_str().unwrap(),
+                            "--git",
+                            "--hook",
+                            "--strict-public-const-values",
+                        ])
+                        .output()
+                        .unwrap(),
+                );
+            },
+            &[(file, before), ("use.ts", &use_source)],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert_eq!(json["blocking_categories"], serde_json::json!([]));
+        assert_eq!(json["api"]["callback_body"][0]["n"], "handle");
+        assert_eq!(
+            json["api"]["callback_body"][0]["reason"],
+            "callback_body_change"
+        );
+        assert!(json["api"]["mod"].is_null(), "{stderr}");
+        assert!(json["api"]["mod_compat"].is_null(), "{stderr}");
+        let strict = strict_output.unwrap();
+        let stderr = String::from_utf8_lossy(&strict.stderr);
+        assert!(!strict.status.success(), "{stderr}");
+        let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert_eq!(
+            json["blocking_categories"],
+            serde_json::json!(["impacts", "api.callback_body"]),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
 fn review_hook_multiline_jsx_checks_only_the_opening_tag() {
     let before = "import { memo } from 'react';\nexport const Card = memo(function Card({ label }: { label: string }) {\n  return <span>{label}</span>;\n});\n";
     let after = "import { memo } from 'react';\nexport const Card = memo(function Card({ label, tone }: { label: string; tone: string }) {\n  return <span data-tone={tone}>{label}</span>;\n});\n";

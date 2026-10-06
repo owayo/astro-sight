@@ -18,6 +18,63 @@ use std::io::Cursor;
 #[allow(unused_imports)]
 use std::process::Command;
 
+#[test]
+fn callback_body_hook_reports_unverified_changes_and_supports_strict_mode() {
+    use crate::models::review::{CallbackBodyChange, CallbackBodyChangeReason};
+    let result = ReviewResult {
+        api_changes: ApiChanges {
+            callback_body_changes: vec![CallbackBodyChange {
+                change: ApiSymbolChange {
+                    name: "store".into(),
+                    kind: "variable".into(),
+                    file: "store.ts".into(),
+                    old_signature: Some(
+                        "export const store = create(() => ({ a: 1, b: 2 }))".into(),
+                    ),
+                    new_signature: Some("export const store = create(() => ({ a: 1 }))".into()),
+                    no_resolved_internal_callers: false,
+                    contract_change: None,
+                },
+                reason: CallbackBodyChangeReason::CallbackBodyChange,
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(
+        json["api_changes"]["callback_body_changes"][0]["name"],
+        "store"
+    );
+    assert_eq!(
+        json["api_changes"]["callback_body_changes"][0]["reason"],
+        "callback_body_change"
+    );
+    assert!(
+        !json["api_changes"]["callback_body_changes"][0]["old_signature"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
+    for strict in [false, true] {
+        let build = build_review_hook_json(&result, ".", strict);
+        assert_eq!(build.is_blocking, strict);
+        let json = build.value.unwrap();
+        assert_eq!(
+            json["api"]["callback_body"][0]["reason"],
+            "callback_body_change"
+        );
+        assert_eq!(
+            json["blocking_categories"],
+            if strict {
+                serde_json::json!(["api.callback_body"])
+            } else {
+                serde_json::json!([])
+            }
+        );
+    }
+}
+
 /// compatible_modified (mod_compat) のみの api 変更は informational として hook JSON に
 /// 出すが blocking にはしない。
 #[test]
@@ -41,6 +98,7 @@ fn build_review_hook_json_compatible_modified_is_informational() {
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: vec![CompatibleApiModification {
                 name: "ScheduleItem".to_string(),
@@ -126,6 +184,7 @@ fn build_review_hook_json_compatible_modified_impact_is_informational() {
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: vec![CompatibleApiModification {
                 name: "TaskDetailHeader".to_string(),
@@ -227,6 +286,7 @@ fn build_review_hook_json_mixed_compatible_and_breaking_impact_keeps_breaking_on
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: vec![CompatibleApiModification {
                 name: "TaskDetailHeader".to_string(),
@@ -304,6 +364,7 @@ fn build_review_hook_json_cochange_only_is_informational() {
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: Vec::new(),
         },
@@ -371,6 +432,7 @@ fn build_review_hook_json_cochange_marks_history_evidence() {
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: Vec::new(),
         },
@@ -421,6 +483,7 @@ fn build_review_hook_json_cochange_omits_denominator_when_unknown() {
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: Vec::new(),
         },
@@ -492,6 +555,7 @@ fn build_review_hook_json_impact_info_only_is_informational() {
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: Vec::new(),
         },
@@ -545,6 +609,7 @@ fn build_review_hook_json_api_add_only_is_informational() {
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: Vec::new(),
         },
@@ -569,6 +634,7 @@ fn build_review_hook_json_api_add_only_is_informational() {
 fn build_review_hook_json_api_add_carries_extraction_scope() {
     let dir = tempfile::tempdir().expect("tempdir");
     let empty_api = || ApiChanges {
+        callback_body_changes: Vec::new(),
         uncertain_removals: Vec::new(),
         parse_truncations: Vec::new(),
         added: Vec::new(),
@@ -772,6 +838,7 @@ fn build_review_hook_json_api_removed_is_blocking() {
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: Vec::new(),
         },
@@ -817,6 +884,7 @@ fn build_review_hook_json_api_modified_is_blocking() {
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: Vec::new(),
         },
@@ -871,6 +939,7 @@ fn build_review_hook_json_api_modified_carries_contract_change() {
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: Vec::new(),
         },
@@ -929,6 +998,7 @@ fn build_review_hook_json_api_modified_without_callers_is_flagged_but_still_bloc
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: Vec::new(),
         },
@@ -990,6 +1060,7 @@ fn build_review_hook_json_removed_dead_only_is_not_blocking() {
                 },
             ],
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: Vec::new(),
         },
@@ -1031,6 +1102,7 @@ fn build_review_hook_json_const_value_only_is_informational() {
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: vec![ApiSymbolChange {
                 name: "ENEMY_SPEED".to_string(),
                 kind: "constant".to_string(),
@@ -1079,6 +1151,7 @@ fn build_review_hook_json_const_value_is_blocking_under_strict() {
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: vec![ApiSymbolChange {
                 name: "ENEMY_SPEED".to_string(),
                 kind: "constant".to_string(),
@@ -1149,6 +1222,7 @@ fn build_review_hook_json_uses_changed_symbols_in_summary() {
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: Vec::new(),
         },
@@ -1232,6 +1306,7 @@ fn build_review_hook_json_filters_non_causal_affected_symbols_from_syms() {
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: Vec::new(),
         },
@@ -1309,6 +1384,7 @@ fn build_review_hook_json_added_only_caller_is_not_blocking() {
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: Vec::new(),
         },
@@ -1397,6 +1473,7 @@ fn build_review_hook_json_mixed_added_and_modified_keeps_only_modified() {
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: Vec::new(),
         },
@@ -1476,6 +1553,7 @@ fn build_review_hook_json_api_modified_carries_field_contract_change() {
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: Vec::new(),
         },
@@ -1566,6 +1644,7 @@ fn build_review_hook_json_resolves_updated_call_line_in_diff_file() {
             property_to_field: Vec::new(),
             removed_dead: Vec::new(),
             modified_closed_in_diff: Vec::new(),
+            callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: Vec::new(),
         },
