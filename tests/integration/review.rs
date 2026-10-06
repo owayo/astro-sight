@@ -6,6 +6,123 @@ use super::support::*;
 use std::process::{Command, Stdio};
 
 #[test]
+fn review_hook_barrel_reexports_do_not_count_as_unupdated_callers() {
+    let before = "import { memo } from 'react';\nexport const Card = memo(function Card({ label }: { label: string }) {\n  return <span>{label}</span>;\n});\n";
+    let after = "import { memo } from 'react';\nexport const Card = memo(function Card({ label, tone }: { label: string; tone: string }) {\n  return <span data-tone={tone}>{label}</span>;\n});\n";
+    for (file, barrel, updated, closed) in [
+        ("index.ts", "export { Card } from './Card';\n", true, true),
+        (
+            "index.tsx",
+            "export {\n Card,\n} from './Card';\n",
+            true,
+            true,
+        ),
+        ("index.js", "export {Card} from './Card';\n", true, true),
+        (
+            "index.ts",
+            "export { Card as Card } from './Card';\n",
+            true,
+            true,
+        ),
+        (
+            "index.ts",
+            "/* カード */ export { Card } from './Card';\n",
+            true,
+            true,
+        ),
+        ("index.ts", "export { Card } from './Card';\n", false, false),
+        (
+            "index.ts",
+            "export { Card as LegacyCard } from './Card';\n",
+            true,
+            false,
+        ),
+        (
+            "index.ts",
+            "import { Card } from './Card';\nexport { Card };\n",
+            true,
+            false,
+        ),
+        (
+            "index.ts",
+            "import { Card } from './Card';\nexport default Card;\n",
+            true,
+            false,
+        ),
+        (
+            "index.ts",
+            "import { Card } from './Card';\nexport { Card } from './Card'; Card({ label: 'a' });\n",
+            true,
+            false,
+        ),
+        (
+            "index.ts",
+            "export { Card } from './Card';\nconst broken = ;\n",
+            true,
+            false,
+        ),
+    ] {
+        // 改名ケースにも名前索引で見える実 caller を置き、空集合ガードだけでは
+        // 改名の除外ミスを隠せない対照にする。
+        let import = if barrel.contains("LegacyCard") {
+            "import { Card } from './Card';"
+        } else if barrel.contains("export default") {
+            "import Card from './index';"
+        } else {
+            "import { Card } from './index';"
+        };
+        let old_usage =
+            format!("{import}\nexport function List() {{\n  return <Card label=\"a\" />;\n}}\n");
+        let new_usage = format!(
+            "{import}\nexport function List() {{\n  return <Card label=\"a\" tone=\"x\" />;\n}}\n"
+        );
+        let output = a3_review_hook(
+            |root| {
+                std::fs::write(root.join("Card.tsx"), after).unwrap();
+                if updated {
+                    std::fs::write(root.join("List.tsx"), &new_usage).unwrap();
+                }
+            },
+            &[
+                ("Card.tsx", before),
+                (file, barrel),
+                ("List.tsx", &old_usage),
+                // Card の判定を無関係な未使用 List の警告と混同しない。
+                (
+                    "entry.tsx",
+                    "import { List } from './List';\nexport const page = <List />;\n",
+                ),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.success(),
+            closed,
+            "{file}: {barrel}\n{stderr}"
+        );
+        let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        let category = if closed { "mod_closed" } else { "mod" };
+        let other = if closed { "mod" } else { "mod_closed" };
+        assert!(
+            json["api"][category]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["n"] == "Card"),
+            "{stderr}"
+        );
+        assert!(
+            !json["api"][other]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|s| s["n"] == "Card"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
 fn review_hook_callback_header_changes_stay_blocking() {
     let before =
         "export const handle = wrap((req: Request): Response => { return 1; }, { retry: 1 });\n";

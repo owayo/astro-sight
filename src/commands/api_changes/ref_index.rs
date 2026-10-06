@@ -214,7 +214,7 @@ pub(crate) fn is_modified_closed_in_diff(
     // 誤判定して blocking していた問題への対応)。
     // 2 つのキャッシュは detect_api_changes スコープで生成して全 modified シンボルで共有する。
     // per-symbol の git diff サブプロセス起動と tree-sitter parse を unique file 単位に削減する。
-    let call_refs = collect_call_refs(refs, dir, caches);
+    let call_refs = collect_call_refs(refs, dir, bare, caches);
     if call_refs.is_empty() {
         return false;
     }
@@ -442,7 +442,90 @@ fn jsx_name_opening_tag<'a>(
     }
 }
 
-/// 定義・import/use 行を除いた「実際の呼び出し参照」だけを抜き出す。
+/// 素通し再 export の名前位置なら true。同じ行の実利用は除外しない。
+/// 改名された公開名の利用は名前索引で追跡できないため、改名 specifier は残す。
+fn pass_through_reexport_at(
+    tree: &tree_sitter::Tree,
+    source: &[u8],
+    bare: &str,
+    line: usize,
+    column: usize,
+) -> bool {
+    let check = || -> Option<()> {
+        let root = tree.root_node();
+        if bare.is_empty() || root.has_error() {
+            return None;
+        }
+        let start = tree_sitter::Point { row: line, column };
+        let end = tree_sitter::Point {
+            row: line,
+            column: column.checked_add(bare.len())?,
+        };
+        // 終点は識別子内部に置き、隣の句読点を含む範囲照会を避ける。
+        let inside = tree_sitter::Point {
+            row: line,
+            column: end.column.checked_sub(1)?,
+        };
+        let node = root.descendant_for_point_range(start, inside)?;
+        if node.start_position() != start
+            || node.end_position() != end
+            || node.utf8_text(source).ok()? != bare
+        {
+            return None;
+        }
+        let specifier = node.parent()?;
+        let clause = specifier.parent()?;
+        let statement = clause.parent()?;
+        if specifier.kind() != "export_specifier"
+            || clause.kind() != "export_clause"
+            || statement.kind() != "export_statement"
+            || statement.child_by_field_name("source")?.kind() != "string"
+            || statement.child_by_field_name("declaration").is_some()
+            || statement.child_by_field_name("value").is_some()
+        {
+            return None;
+        }
+        let name = specifier.child_by_field_name("name")?;
+        let alias = specifier.child_by_field_name("alias");
+        if name.kind() == "string"
+            || alias.is_some_and(|a| a.kind() == "string")
+            || (node.id() != name.id() && !alias.is_some_and(|a| node.id() == a.id()))
+        {
+            return None;
+        }
+        if let Some(alias) = alias {
+            let name = name.utf8_text(source).ok()?;
+            if name != "default" && name != alias.utf8_text(source).ok()? {
+                return None;
+            }
+        }
+        Some(())
+    };
+    check().is_some()
+}
+
+fn ref_is_pass_through_reexport(
+    dir: &str,
+    r: &crate::models::reference::SymbolReference,
+    bare: &str,
+    caches: &mut ApiClosureCaches,
+) -> bool {
+    // 他言語・lexer-only ファイルには新たな parse を行わない。
+    if !matches!(
+        crate::language::LangId::from_path(camino::Utf8Path::new(&r.path)),
+        Ok(crate::language::LangId::Javascript
+            | crate::language::LangId::Typescript
+            | crate::language::LangId::Tsx)
+    ) {
+        return false;
+    }
+    let Some(parsed) = parsed_ref_file(dir, &r.path, caches) else {
+        return false;
+    };
+    pass_through_reexport_at(&parsed.tree, &parsed.source, bare, r.line, r.column)
+}
+
+/// 定義・import/use 行・素通し再 export を除いた「実際の呼び出し参照」だけを抜き出す。
 ///
 /// 行頭テキスト判定 (`ref_is_import_line`) は複数行 grouped use ブロックの継続行
 /// (`    a, b, cmd_cochange, ...` のように `use ` で始まらない行) を拾えないため、AST ベースの
@@ -450,6 +533,7 @@ fn jsx_name_opening_tag<'a>(
 fn collect_call_refs<'a>(
     refs: &'a [crate::models::reference::SymbolReference],
     dir: &str,
+    bare: &str,
     caches: &mut ApiClosureCaches,
 ) -> Vec<&'a crate::models::reference::SymbolReference> {
     use crate::models::reference::RefKind;
@@ -460,12 +544,13 @@ fn collect_call_refs<'a>(
                 .import_lines
                 .entry(r.path.clone())
                 .or_insert_with(|| import_statement_lines_for_ref(dir, &r.path));
-            !import_lines.contains(&r.line)
+            !import_lines.contains(&r.line) && !ref_is_pass_through_reexport(dir, r, bare, caches)
         })
         .collect()
 }
 
-/// リポジトリ内に解決できた呼び出し参照が 1 件も無いか (定義・import/use 行を除く)。
+/// リポジトリ内に解決できた呼び出し参照が 1 件も無いか
+/// (定義・import/use 行・素通し再 export を除く)。
 ///
 /// `api.mod` に残ったシンボルへ添えるトリアージ用フラグの算出。参照集合を引けない
 /// (index 未収集 / batch 失敗) 場合は `false` = 「参照ありかもしれない」に倒す
@@ -482,7 +567,7 @@ pub(crate) fn has_no_resolved_internal_callers(
     let Some(refs) = index.refs_for(bare_name(name)) else {
         return false;
     };
-    collect_call_refs(refs, dir, caches).is_empty()
+    collect_call_refs(refs, dir, bare_name(name), caches).is_empty()
 }
 
 /// 参照 (call の callee) が「引数に渡している共有 `const` の定義側が同一 diff 内で更新済み」
@@ -922,6 +1007,68 @@ mod tests {
     use super::*;
     use crate::engine::parser;
     use crate::language::LangId;
+
+    #[test]
+    fn reexport_exclusion_is_exact_and_preserves_renamed_and_value_uses() {
+        for (marked, expected) in [
+            ("export {@Card} from './module';", true),
+            ("export {\n @Card,\n} from './module';", true),
+            ("export { @Card as Card } from './module';", true),
+            ("export { Card as @Card } from './module';", true),
+            ("export { default as @Card } from './module';", true),
+            ("export { @Card, Other as Legacy } from './module';", true),
+            ("/* カード */ export { @Card } from './module';", true),
+            ("export { @Card as Legacy } from './module';", false),
+            ("export { Other as @Card } from './module';", false),
+            ("export { @Card as default } from './module';", false),
+            ("export { 'Card' as @Card } from './module';", false),
+            ("export { @Card as 'x-y' } from './module';", false),
+            ("export { @Card };", false),
+            ("export default @Card;", false),
+            ("export const value = @Card();", false),
+            ("export function value() { return @Card(); }", false),
+            ("export * as @Card from './module';", false),
+            ("export { Card } from './module'; @Card();", false),
+            ("export { @Card } from './module';\nconst broken = ;", false),
+        ] {
+            let offset = marked.find('@').unwrap();
+            let source = marked.replace('@', "");
+            let prefix = &source[..offset];
+            let line = prefix.bytes().filter(|b| *b == b'\n').count();
+            let column = offset - prefix.rfind('\n').map_or(0, |i| i + 1);
+            for lang in [LangId::Javascript, LangId::Typescript, LangId::Tsx] {
+                let tree = parser::parse_source(source.as_bytes(), lang).unwrap();
+                assert_eq!(
+                    pass_through_reexport_at(&tree, source.as_bytes(), "Card", line, column),
+                    expected,
+                    "{lang:?}: {marked}"
+                );
+                assert!(!pass_through_reexport_at(
+                    &tree,
+                    source.as_bytes(),
+                    "Card",
+                    line,
+                    column + 1
+                ));
+            }
+        }
+        for source in [
+            "export type { Card } from './module';",
+            "export { type Card } from './module';",
+        ] {
+            let column = source.find("Card").unwrap();
+            for lang in [LangId::Typescript, LangId::Tsx] {
+                let tree = parser::parse_source(source.as_bytes(), lang).unwrap();
+                assert!(pass_through_reexport_at(
+                    &tree,
+                    source.as_bytes(),
+                    "Card",
+                    0,
+                    column
+                ));
+            }
+        }
+    }
 
     fn call_range_at(src: &str, bare: &str, line: usize, column: usize) -> Option<(usize, usize)> {
         let tree = parser::parse_source(src.as_bytes(), LangId::Typescript).unwrap();
