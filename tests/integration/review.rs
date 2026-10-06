@@ -6,6 +6,368 @@ use super::support::*;
 use std::process::{Command, Stdio};
 
 #[test]
+fn review_hook_non_direct_const_values_keep_priority_with_companion_types_and_comments() {
+    let companion =
+        "type Handlers = { marker: true };\ntype HandlerMap = Record<string, unknown>;\n";
+    let wrapper =
+        "declare function wrap(callback: (x: number) => number): Record<string, unknown>;\n";
+    for (before, after, usage) in [
+        (
+            format!("{companion}export const Handlers: HandlerMap = {{ a: (x: number) => x }};\n"),
+            format!("{companion}export const Handlers: HandlerMap = {{ a: 1 }};\n"),
+            "import { Handlers } from './api';\nexport const result = Handlers;\n",
+        ),
+        (
+            format!("{companion}{wrapper}export const Handlers: HandlerMap = wrap(x => 1);\n"),
+            format!("{companion}{wrapper}export const Handlers: HandlerMap = wrap(x => 2);\n"),
+            "import { Handlers } from './api';\nexport const result = Handlers;\n",
+        ),
+        (
+            "type HandlerMap = Record<string, unknown>;\nexport const other = 1,\n  Handlers: HandlerMap = { a: (x: number) => x };\n".to_string(),
+            "type HandlerMap = Record<string, unknown>;\nexport const other = 1,\n  Handlers: HandlerMap = { a: 1 };\n".to_string(),
+            "import { Handlers, other } from './api';\nexport const result = [Handlers, other];\n",
+        ),
+        (
+            format!("{companion}{wrapper}export const Handlers: HandlerMap = wrap((x: number) => {{ return x; }}, 1);\n"),
+            format!("{companion}{wrapper}export const Handlers: HandlerMap = wrap((x: number) => {{ return x; }}, 2);\n"),
+            "import { Handlers } from './api';\nexport const result = Handlers;\n",
+        ),
+        (
+            format!("{companion}export const Handlers: HandlerMap = {{ a(x: number) {{ return x; }}, b: 1 }};\n"),
+            format!("{companion}export const Handlers: HandlerMap = {{ a(x: number) {{ return x; }}, b: 2 }};\n"),
+            "import { Handlers } from './api';\nexport const result = Handlers.a(1);\n",
+        ),
+        (
+            format!("{companion}export const Handlers: HandlerMap = {{ url: 'http://example.test/a//b', value: 1 }};\n"),
+            format!("{companion}export const Handlers: HandlerMap = {{ url: 'http://example.test/a//b', value: 2 }};\n"),
+            "import { Handlers } from './api';\nexport const result = Handlers;\n",
+        ),
+        (
+            "type HandlerMap = { a: number; b: number };\nexport const Handlers: HandlerMap = {\n  a: 1, // ordinary comment\n  b: 2\n};\n".to_string(),
+            "type HandlerMap = { a: number; b: number };\nexport const Handlers: HandlerMap = {\n  a: 3, // ordinary comment\n  b: 2\n};\n".to_string(),
+            "import { Handlers } from './api';\nexport const result = Handlers;\n",
+        ),
+    ] {
+        for file in ["api.ts", "api.tsx"] {
+            let output = a3_review_hook(
+                |root| std::fs::write(root.join(file), &after).unwrap(),
+                &[(file, &before), ("use.ts", usage)],
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{file}: {before} -> {after}\n{stderr}");
+            let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+            assert!(json["api"]["const_value"].as_array().unwrap().iter()
+                .any(|change| change["n"] == "Handlers"), "{stderr}");
+            assert!(!json["api"]["mod"].as_array().into_iter().flatten()
+                .any(|change| change["n"] == "Handlers"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn review_hook_direct_const_callables_accept_compatible_parameter_extensions() {
+    for (before, after, usage, reason) in [
+        (
+            "export const f = (value: number): number => value;\n",
+            "export const f = (value: number, factor?: number): number => value * (factor ?? 2);\n",
+            "f(1)",
+            "trailing_optional_params",
+        ),
+        (
+            "export const f = function (value: number): number { return value; };\n",
+            "export const f = function (value: number, factor = 2): number { return value * factor; };\n",
+            "f(1)",
+            "trailing_optional_params",
+        ),
+        (
+            "export const f = function named(options: { size: number }): number { return options.size; };\n",
+            "export const f = function named(options: { size: number; label?: string }): number { return options.size; };\n",
+            "f({ size: 1 })",
+            "optional_object_props",
+        ),
+        (
+            "export const f = ((value:number):number => value);\n",
+            "export const f = (( value : number, factor = 2 ): number => value * factor);\n",
+            "f(1)",
+            "trailing_optional_params",
+        ),
+        (
+            "export const f = value => value;\n",
+            "export const f = (value, factor = 2) => value * factor;\n",
+            "f(1)",
+            "trailing_optional_params",
+        ),
+        (
+            "export const f = async value => value;\n",
+            "export const f = async (value, extra?: number) => value;\n",
+            "f(1)",
+            "trailing_optional_params",
+        ),
+        (
+            "export const f = (options: { size: number }, ...rest: number[]): number => options.size;\n",
+            "export const f = (options: { size: number; label?: string }, ...rest: number[]): number => options.size;\n",
+            "f({ size: 1 }, 2)",
+            "optional_object_props",
+        ),
+        (
+            "export function f(options: { size: number }, ...rest: number[]): number { return options.size; }\n",
+            "export function f(options: { size: number; label?: string }, ...rest: number[]): number { return options.size; }\n",
+            "f({ size: 1 }, 2)",
+            "optional_object_props",
+        ),
+    ] {
+        for file in ["api.ts", "api.tsx"] {
+            let caller = format!("import {{ f }} from './api';\nexport const result = {usage};\n");
+            let output = a3_review_hook(
+                |root| std::fs::write(root.join(file), after).unwrap(),
+                &[(file, before), ("use.ts", &caller)],
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "{file}: {before} -> {after}\n{stderr}"
+            );
+            let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+            assert!(
+                json["api"]["mod_compat"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|change| change["n"] == "f" && change["reason"] == reason),
+                "{stderr}"
+            );
+            assert!(
+                !json["api"]["mod"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|change| change["n"] == "f"),
+                "{stderr}"
+            );
+            assert!(
+                !json["impacts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|impact| impact["syms"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|symbol| symbol == "f")),
+                "{stderr}"
+            );
+            assert!(
+                json["blocking_categories"]
+                    .as_array()
+                    .is_none_or(|categories| categories.is_empty()),
+                "{stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn review_hook_direct_const_callable_contract_changes_remain_blocking() {
+    let before = "export const f = (value: number): number => value;\n";
+    for (before, after, usage) in [
+        (
+            before,
+            "export const f = (value: number, extra: number): number => value;\n",
+            "f(1)",
+        ),
+        (
+            before,
+            "export const f = (value: number, extra?: number): string => 'x';\n",
+            "f(1)",
+        ),
+        (
+            before,
+            "export const f = async (value: number, extra?: number): number => value;\n",
+            "f(1)",
+        ),
+        (
+            before,
+            "export const f = function (value: number, extra?: number): number { return value; };\n",
+            "f(1)",
+        ),
+        (
+            before,
+            "export const f = ((value: number, extra?: number): number => value);\n",
+            "f(1)",
+        ),
+        (
+            "export const f = value => value;\n",
+            "export const f = (value: number, extra = 1) => value;\n",
+            "f('x')",
+        ),
+        (
+            "export const f = value => value;\n",
+            "export const f = (renamed?: number) => renamed;\n",
+            "f('x')",
+        ),
+        (
+            "export const f = wrap((value: number): number => value);\n",
+            "export const f = wrap((value: number, extra?: number): number => value);\n",
+            "f(1)",
+        ),
+        (
+            "export const f = <T extends number>(value: T): T => value;\n",
+            "export const f = <T extends string>(value: T, extra?: number): T => value;\n",
+            "f(1)",
+        ),
+        (
+            "export const f = (...rest: number[]): number => 1;\n",
+            "export const f = (...rest: number[], extra?: number): number => 1;\n",
+            "f(1)",
+        ),
+        (
+            "const other = 1,\n  f = (value?: number): number => value ?? other;\nexport { f };\n",
+            "const other = 1,\n  f = (value: number): number => value;\nexport { f };\n",
+            "f()",
+        ),
+        (
+            "const other = 1,\n  f: (value: 'a b') => string = value => value;\nexport { f };\n",
+            "const other = 1,\n  f: (value: 'a  b') => string = (value, extra = 1) => value;\nexport { f };\n",
+            "f('a b')",
+        ),
+        (
+            "export const f: (value: number) => number = value => value;\n",
+            "export const f: (value: string) => string = (value, extra = 1) => value;\n",
+            "f(1)",
+        ),
+    ] {
+        for file in ["api.ts", "api.tsx"] {
+            let caller = format!("import {{ f }} from './api';\nexport const result = {usage};\n");
+            let output = a3_review_hook(
+                |root| std::fs::write(root.join(file), after).unwrap(),
+                &[(file, before), ("use.ts", &caller)],
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{before} -> {after}\n{stderr}");
+            let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+            assert!(
+                json["api"]["mod"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|change| change["n"] == "f"),
+                "{stderr}"
+            );
+            assert!(
+                !json["api"]["mod_compat"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|change| change["n"] == "f"),
+                "{stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn review_hook_literal_type_whitespace_is_not_callable_compatibility() {
+    for (old_params, new_params, tail, usage) in [
+        (
+            "value: 'a b'",
+            "value: 'a  b', extra?: number",
+            "number",
+            "f('a b')",
+        ),
+        (
+            "value: `a b${string}`",
+            "value: `a  b${string}`, extra?: number",
+            "number",
+            "f('a bx')",
+        ),
+        (
+            "options: { label: 'a b' }",
+            "options: { label: 'a  b'; extra?: number }",
+            "number",
+            "f({ label: 'a b' })",
+        ),
+    ] {
+        for is_const in [false, true] {
+            let (before, after) = if is_const {
+                (
+                    format!("export const f = ({old_params}): {tail} => 1;\n"),
+                    format!("export const f = ({new_params}): {tail} => 1;\n"),
+                )
+            } else {
+                (
+                    format!("export function f({old_params}): {tail} {{ return 1; }}\n"),
+                    format!("export function f({new_params}): {tail} {{ return 1; }}\n"),
+                )
+            };
+            let caller = format!("import {{ f }} from './api';\nexport const result = {usage};\n");
+            let output = a3_review_hook(
+                |root| std::fs::write(root.join("api.ts"), &after).unwrap(),
+                &[("api.ts", &before), ("use.ts", &caller)],
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{before} -> {after}\n{stderr}");
+            let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+            assert!(
+                json["api"]["mod"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|change| change["n"] == "f"),
+                "{stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn review_hook_const_annotation_literal_changes_do_not_use_value_bucket() {
+    for (old_type, new_type, expected) in [
+        ("'a b'", "'a  b'", "mod"),
+        ("`a b${string}`", "`a  b${string}`", "mod"),
+        ("string", "string", "const_value"),
+    ] {
+        let before = format!("export const f: (value: {old_type}) => string = value => value;\n");
+        // 空白の整形と初期化子変更だけなら既存 const_value の優先順位を維持する。
+        let after = format!(
+            "export const   f : ( value : {new_type} ) => string = (value, extra = 1) => value;\n"
+        );
+        let output = a3_review_hook(
+            |root| std::fs::write(root.join("api.ts"), &after).unwrap(),
+            &[
+                ("api.ts", &before),
+                (
+                    "use.ts",
+                    "import { f } from './api';\nexport const result = f('a b');\n",
+                ),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.success(),
+            expected == "const_value",
+            "{stderr}"
+        );
+        let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert!(
+            json["api"][expected]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|change| change["n"] == "f"),
+            "{stderr}"
+        );
+        assert!(
+            !json["api"]["mod_compat"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|change| change["n"] == "f"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
 fn review_hook_barrel_reexports_do_not_count_as_unupdated_callers() {
     let before = "import { memo } from 'react';\nexport const Card = memo(function Card({ label }: { label: string }) {\n  return <span>{label}</span>;\n});\n";
     let after = "import { memo } from 'react';\nexport const Card = memo(function Card({ label, tone }: { label: string; tone: string }) {\n  return <span data-tone={tone}>{label}</span>;\n});\n";

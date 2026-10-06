@@ -506,6 +506,7 @@ mod js_ts_shadow;
 pub(crate) mod prepare;
 pub(crate) mod removed;
 pub(crate) mod signature;
+mod signature_tokens;
 
 mod python_contract;
 

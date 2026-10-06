@@ -9,12 +9,17 @@ use crate::engine::parser;
 use crate::models::review::CompatibleApiModification;
 
 use super::source_pair::{CompatibleModSite, SignatureSourceCache};
-use super::{ApiRefIndex, has_blocking_value_usage, normalize_signature_whitespace};
+use super::{ApiRefIndex, has_blocking_value_usage};
 
+mod callable;
 mod function_params;
 mod literal_union;
 mod object_members;
 mod react;
+
+use super::signature_tokens::{SigTokens, node_signature_tokens, signature_tokens_in_range};
+pub(super) use callable::ts_const_value_header_guard;
+use callable::with_resolved_ts_callable_pair;
 
 pub(crate) use function_params::*;
 pub(crate) use literal_union::*;
@@ -501,8 +506,8 @@ pub(crate) fn detect_added_required_object_props(
         let mut changed: Option<(usize, Vec<String>)> = None;
         for (ix, (old_param, new_param)) in old_children.iter().zip(new_children.iter()).enumerate()
         {
-            let old_text = node_normalized_text(*old_param, old_source)?;
-            let new_text = node_normalized_text(*new_param, new_source)?;
+            let old_text = node_signature_tokens(*old_param, old_source)?;
+            let new_text = node_signature_tokens(*new_param, new_source)?;
             if old_text == new_text {
                 continue;
             }
@@ -543,17 +548,13 @@ fn ts_param_pair_added_required_prop_names(
         old_param.child_by_field_name("pattern")?,
         new_param.child_by_field_name("pattern")?,
     );
-    if node_normalized_text(old_pattern, old_source)
-        != node_normalized_text(new_pattern, new_source)
+    if node_signature_tokens(old_pattern, old_source)
+        != node_signature_tokens(new_pattern, new_source)
     {
         return None;
     }
-    let old_value = old_param
-        .child_by_field_name("value")
-        .and_then(|n| node_normalized_text(n, old_source));
-    let new_value = new_param
-        .child_by_field_name("value")
-        .and_then(|n| node_normalized_text(n, new_source));
+    let old_value = ts_parameter_default_tokens(old_param, old_source)?;
+    let new_value = ts_parameter_default_tokens(new_param, new_source)?;
     if old_value != new_value {
         return None;
     }
@@ -574,17 +575,17 @@ fn ts_object_type_added_required_members(
     new_source: &[u8],
 ) -> Option<Vec<String>> {
     use std::collections::HashMap;
-    let mut new_members: HashMap<String, Vec<tree_sitter::Node>> = HashMap::new();
+    let mut new_members: HashMap<SigTokens, Vec<tree_sitter::Node>> = HashMap::new();
     let mut cursor = new_ty.walk();
     for member in new_ty.named_children(&mut cursor) {
         new_members
-            .entry(node_normalized_text(member, new_source)?)
+            .entry(node_signature_tokens(member, new_source)?)
             .or_default()
             .push(member);
     }
     let mut cursor = old_ty.walk();
     for member in old_ty.named_children(&mut cursor) {
-        let text = node_normalized_text(member, old_source)?;
+        let text = node_signature_tokens(member, old_source)?;
         match new_members.get_mut(&text) {
             Some(nodes) if !nodes.is_empty() => {
                 nodes.pop();
@@ -621,21 +622,27 @@ fn ts_object_type_added_required_members(
 /// - repo 内の参照が JSX タグ利用 / import / re-export / 定義のみ (関数呼び出し
 ///   `Foo()` は戻り値が Promise になり await が必要になるため blocking 維持)
 ///
-/// `new_head` から `async ` を 1 箇所取り除くと `old_head` に一致するか
-/// (= 変更が async キーワード追加のみか)。head は whitespace 正規化済み前提。
-fn head_is_async_addition(old_head: &str, new_head: &str) -> bool {
-    let Some(pos) = new_head.find("async ") else {
+/// 新 head から keyword の `async` を 1 個だけ除いて比較する。
+/// method 名の `async` (property_identifier) は取り除かない。
+fn head_is_async_addition(old_head: &SigTokens, new_head: &SigTokens) -> bool {
+    let mut positions = new_head
+        .0
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| token.0 == "async" && token.1 == "async")
+        .map(|(index, _)| index);
+    let Some(position) = positions.next() else {
         return false;
     };
-    // `async` が識別子の一部 (`myasync` 等) でないことを確認する。
-    if pos > 0 {
-        let before = new_head.as_bytes()[pos - 1];
-        if before.is_ascii_alphanumeric() || before == b'_' || before == b'$' {
-            return false;
-        }
+    if positions.next().is_some() {
+        return false;
     }
-    let stripped = format!("{}{}", &new_head[..pos], &new_head[pos + "async ".len()..]);
-    stripped == old_head
+    new_head
+        .0
+        .iter()
+        .enumerate()
+        .filter_map(|(index, token)| (index != position).then_some(token))
+        .eq(old_head.0.iter())
 }
 
 /// ノードから module root (program ノード) まで遡る。
@@ -713,11 +720,15 @@ fn with_resolved_ts_fn_pair<T>(
     check(old_fn, &src.old, new_fn, &src.new)
 }
 
-/// ノードのソーステキストを whitespace 正規化して返す。
-fn node_normalized_text(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
-    source
-        .get(node.start_byte()..node.end_byte())
-        .map(normalize_signature_whitespace)
+/// 既定値なしとトークン化不能を区別し、失敗を「なし」と同一視しない。
+fn ts_parameter_default_tokens(
+    param: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<Option<SigTokens>> {
+    match param.child_by_field_name("value") {
+        Some(value) => Some(Some(node_signature_tokens(value, source)?)),
+        None => Some(None),
+    }
 }
 
 /// 引数ペアが「inline object type literal への optional プロパティ追加だけ」の互換拡張かを
@@ -742,17 +753,17 @@ fn ts_param_pair_is_optional_object_extension(
     ) else {
         return false;
     };
-    if node_normalized_text(old_pattern, old_source)
-        != node_normalized_text(new_pattern, new_source)
+    if node_signature_tokens(old_pattern, old_source)
+        != node_signature_tokens(new_pattern, new_source)
     {
         return false;
     }
-    let old_value = old_param
-        .child_by_field_name("value")
-        .and_then(|n| node_normalized_text(n, old_source));
-    let new_value = new_param
-        .child_by_field_name("value")
-        .and_then(|n| node_normalized_text(n, new_source));
+    let (Some(old_value), Some(new_value)) = (
+        ts_parameter_default_tokens(old_param, old_source),
+        ts_parameter_default_tokens(new_param, new_source),
+    ) else {
+        return false;
+    };
     if old_value != new_value {
         return false;
     }
@@ -782,18 +793,18 @@ fn ts_object_type_members_optional_superset(
     new_source: &[u8],
 ) -> bool {
     use std::collections::HashMap;
-    // normalized text -> 出現ノード列 (同一テキストの重複は TS エラーだが multiset で保守)
-    let mut new_members: HashMap<String, Vec<tree_sitter::Node>> = HashMap::new();
+    // signature tokens -> 出現ノード列 (同一テキストの重複は TS エラーだが multiset で保守)
+    let mut new_members: HashMap<SigTokens, Vec<tree_sitter::Node>> = HashMap::new();
     let mut cursor = new_ty.walk();
     for member in new_ty.named_children(&mut cursor) {
-        let Some(text) = node_normalized_text(member, new_source) else {
+        let Some(text) = node_signature_tokens(member, new_source) else {
             return false;
         };
         new_members.entry(text).or_default().push(member);
     }
     let mut cursor = old_ty.walk();
     for member in old_ty.named_children(&mut cursor) {
-        let Some(text) = node_normalized_text(member, old_source) else {
+        let Some(text) = node_signature_tokens(member, old_source) else {
             return false;
         };
         // 既存メンバーは new 側で 1 つ消費できなければ削除/変更あり → 不成立
@@ -904,14 +915,14 @@ fn find_unique_top_level_class_method<'a>(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TsFunctionParam {
-    normalized: String,
+    tokens: SigTokens,
     omittable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TsFunctionSignatureParts {
-    head: String,
-    tail: String,
+    head: SigTokens,
+    tail: SigTokens,
     params: Vec<TsFunctionParam>,
 }
 
@@ -921,37 +932,67 @@ pub(crate) fn ts_function_signature_parts(
     fn_node: tree_sitter::Node<'_>,
     source: &[u8],
 ) -> Option<TsFunctionSignatureParts> {
-    let params = fn_node.child_by_field_name("parameters")?;
-    let sig_start = fn_node.start_byte();
+    let (params_node, params) = match (
+        fn_node.child_by_field_name("parameters"),
+        fn_node.child_by_field_name("parameter"),
+    ) {
+        (Some(list), None) => (list, ts_function_params(list, source)?),
+        // `x => ...` は引数なしではなく、必須引数が 1 個ある。
+        (None, Some(identifier)) if identifier.kind() == "identifier" => (
+            identifier,
+            vec![TsFunctionParam {
+                tokens: node_signature_tokens(identifier, source)?,
+                omittable: false,
+            }],
+        ),
+        _ => return None,
+    };
     let sig_end = fn_node
         .child_by_field_name("body")
-        .map(|b| b.start_byte())
+        .map(|body| body.start_byte())
         .unwrap_or_else(|| fn_node.end_byte());
-    let head = normalize_signature_whitespace(source.get(sig_start..params.start_byte())?);
-    let tail = normalize_signature_whitespace(source.get(params.end_byte()..sig_end)?);
-    let params = ts_function_params(params, source)?;
+    let head = signature_tokens_in_range(
+        fn_node,
+        source,
+        fn_node.start_byte(),
+        params_node.start_byte(),
+    )?;
+    let tail = signature_tokens_in_range(fn_node, source, params_node.end_byte(), sig_end)?;
     Some(TsFunctionSignatureParts { head, tail, params })
 }
 
-/// formal_parameters 直下の実引数ノードを抽出する。判定不能な parameter kind が混ざる場合は
-/// None にして blocking を維持する。
+/// formal_parameters 直下の実引数ノードを抽出する。判定不能な kind や
+/// rest の後続引数・省略可能な rest は blocking を維持する。
 pub(crate) fn ts_function_params(
     params: tree_sitter::Node<'_>,
     source: &[u8],
 ) -> Option<Vec<TsFunctionParam>> {
+    if params.kind() != "formal_parameters" || params.has_error() {
+        return None;
+    }
     let mut result = Vec::new();
+    let mut saw_rest = false;
     let mut cursor = params.walk();
     for child in params.named_children(&mut cursor) {
+        if saw_rest {
+            return None;
+        }
         match child.kind() {
             "required_parameter" | "optional_parameter" | "formal_parameter" | "identifier" => {
-                let text = source.get(child.start_byte()..child.end_byte())?;
+                let is_rest = child
+                    .child_by_field_name("pattern")
+                    .is_some_and(|pattern| pattern.kind() == "rest_pattern");
+                let omittable = ts_param_is_omittable(child);
+                if is_rest && omittable {
+                    return None;
+                }
+                saw_rest = is_rest;
                 result.push(TsFunctionParam {
-                    normalized: normalize_signature_whitespace(text),
-                    omittable: ts_param_is_omittable(child),
+                    tokens: node_signature_tokens(child, source)?,
+                    omittable,
                 });
             }
-            // rest parameter の追加は呼び出し側 arity 互換ではあっても型契約の意図を
-            // ここでは保証しないため、互換降格しない。
+            // TS の rest は required_parameter.pattern。JS の直下 rest は対象外。
             "rest_pattern" => return None,
             _ => return None,
         }

@@ -1,5 +1,6 @@
 //! API シグネチャの抽出と正規化。言語別の binding shape と Tauri / TypeScript の正規化を含む。
 
+use super::signature_tokens::{SigTokens, signature_tokens_in_range};
 use super::*;
 
 /// dead_symbols のうち、宣言行が今回の diff の追加行 (`+` 行) と重なるもののみを残す。
@@ -660,11 +661,17 @@ fn binding_path_text(
     }
 }
 
+#[derive(PartialEq, Eq)]
+enum BindingShapeText {
+    Legacy(String),
+    Tokens(SigTokens),
+}
+
 /// 値バインディング (const / static / export const) の宣言から抽出した shape 情報。
 /// initializer (= 右辺) を除いた宣言の骨格と、value-only 変更を安全に判定するための補助情報。
 pub(crate) struct BindingShape {
-    /// initializer を除いた正規化済み宣言テキスト (名前・型・visibility・binding kind を含む)。
-    shape: String,
+    /// initializer を除いた宣言 (名前・型・visibility・binding kind を含む)。
+    shape: BindingShapeText,
     /// 不変バインディング (Rust `const` / 非 mut `static`、TS/JS `const`) なら true。
     /// mutable (`static mut` / `let` / `var`) は false。
     is_const_binding: bool,
@@ -755,7 +762,7 @@ pub(crate) fn extract_rust_binding_shape(
     let shape_bytes = source.get(node.start_byte()..shape_end)?;
     let initializer_is_scalar = value.map(rust_value_is_scalar).unwrap_or(false);
     Some(BindingShape {
-        shape: normalize_binding_shape_text(shape_bytes),
+        shape: BindingShapeText::Legacy(normalize_binding_shape_text(shape_bytes)),
         is_const_binding: !is_mut,
         has_type_annotation,
         initializer_is_scalar,
@@ -798,18 +805,22 @@ pub(crate) fn extract_js_binding_shape(
     let value = declarator.child_by_field_name("value");
     let has_type_annotation = declarator.child_by_field_name("type").is_some();
 
-    // visibility (export) を shape に含めるため、親が export_statement なら起点を遡る。
-    let shape_start = match node.parent() {
-        Some(p) if p.kind() == "export_statement" => p.start_byte(),
-        _ => node.start_byte(),
-    };
+    // export の token も保持し、型リテラル内部の空白変更を消さない。
+    let statement = node
+        .parent()
+        .filter(|parent| parent.kind() == "export_statement")
+        .unwrap_or(node);
     let shape_end = value
-        .map(|v| v.start_byte())
+        .map(|value| value.start_byte())
         .unwrap_or_else(|| declarator.end_byte());
-    let shape_bytes = source.get(shape_start..shape_end)?;
     let initializer_is_scalar = value.map(js_value_is_scalar).unwrap_or(false);
     Some(BindingShape {
-        shape: normalize_binding_shape_text(shape_bytes),
+        shape: BindingShapeText::Tokens(signature_tokens_in_range(
+            statement,
+            source,
+            statement.start_byte(),
+            shape_end,
+        )?),
         is_const_binding,
         has_type_annotation,
         initializer_is_scalar,
