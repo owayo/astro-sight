@@ -7,7 +7,7 @@ pub(crate) fn detect_trailing_optional_params_compatible_mod(
     site: &CompatibleModSite<'_>,
     sources: &mut SignatureSourceCache<'_>,
 ) -> Option<CompatibleApiModification> {
-    with_resolved_ts_fn_pair(site, sources, |old_fn, old_source, new_fn, new_source| {
+    with_resolved_ts_callable_pair(site, sources, |old_fn, old_source, new_fn, new_source| {
         let old_parts = ts_function_signature_parts(old_fn, old_source)?;
         let new_parts = ts_function_signature_parts(new_fn, new_source)?;
         if old_parts.head != new_parts.head || old_parts.tail != new_parts.tail {
@@ -26,7 +26,7 @@ pub(crate) fn detect_optional_object_props_compatible_mod(
     site: &CompatibleModSite<'_>,
     sources: &mut SignatureSourceCache<'_>,
 ) -> Option<CompatibleApiModification> {
-    with_resolved_ts_fn_pair(site, sources, |old_fn, old_source, new_fn, new_source| {
+    with_resolved_ts_callable_pair(site, sources, |old_fn, old_source, new_fn, new_source| {
         let old_parts = ts_function_signature_parts(old_fn, old_source)?;
         let new_parts = ts_function_signature_parts(new_fn, new_source)?;
         if old_parts.head != new_parts.head || old_parts.tail != new_parts.tail {
@@ -47,8 +47,8 @@ pub(crate) fn detect_optional_object_props_compatible_mod(
 
         let mut any_extension = false;
         for (old_param, new_param) in old_children.iter().zip(new_children.iter()) {
-            let old_text = node_normalized_text(*old_param, old_source)?;
-            let new_text = node_normalized_text(*new_param, new_source)?;
+            let old_text = node_signature_tokens(*old_param, old_source)?;
+            let new_text = node_signature_tokens(*new_param, new_source)?;
             if old_text == new_text {
                 continue;
             }

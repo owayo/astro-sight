@@ -681,11 +681,6 @@ pub(crate) fn classify_signature_change(
         internally_closed,
     } = site;
     let name = change.name.clone();
-    // const / 非 mut static / export const の値 (initializer) のみ変更は const_value_changes へ
-    if lang_id_for_file.is_some_and(|lid| is_const_value_only_change(old_sig, new_sig, kind, lid)) {
-        state.buckets.const_value_changes.push(change);
-        return;
-    }
     // 以降の互換判定器はすべて同じ現場情報を見る。old/new ソースは最初に必要になった
     // 判定器で 1 度だけ取得して使い回す (旧実装は判定器ごとに git show を起動していた)。
     let site = CompatibleModSite {
@@ -700,6 +695,13 @@ pub(crate) fn classify_signature_change(
         lang_id: lang_id_for_file,
     };
     let sources = &mut SignatureSourceCache::with_base_blobs(inputs.base_blobs);
+    // const_value の優先順位を維持し、直接 TS callable の型注釈だけは元ソースで照合する。
+    if lang_id_for_file.is_some_and(|lid| is_const_value_only_change(old_sig, new_sig, kind, lid))
+        && super::ts_signature::ts_const_value_header_guard(&site, sources)
+    {
+        state.buckets.const_value_changes.push(change);
+        return;
+    }
     // Python の TypedDict で `total=` が絡む変更は blocking な api.mod に確定させる。
     // 互換判定器や closed-in-diff 判定より**前**に置くのが要点で、「リポジトリ内の参照が
     // 同一 diff で更新済み」でも降格させないため (外部リポジトリ / 動的生成された dict は
