@@ -341,6 +341,7 @@ fn parsed_ref_file<'a>(
 
 /// JS/TS/TSX の参照が call の callee (直接または `obj.name(...)` の member 経由) を成す
 /// 場合、その call_expression / new_expression 全体の行範囲 (0-indexed、両端含む) を返す。
+/// JSX の要素名なら、子要素を含まない開始タグの範囲を返す。
 /// callee でない参照・他言語・parse 失敗は `None` (従来の単一行判定に留める)。
 fn enclosing_call_line_range(
     dir: &str,
@@ -361,7 +362,7 @@ fn enclosing_call_line_range(
 }
 
 /// `(line, column)` の identifier が call の callee を成すなら、その call_expression /
-/// new_expression 全体の行範囲を返す純粋ロジック。ファイル I/O を分離してユニットテスト
+/// new_expression または JSX 開始タグの行範囲を返す純粋ロジック。ファイル I/O を分離してユニットテスト
 /// 可能にした部分。callee でない参照は `None`。
 fn callee_call_line_range(
     tree: &tree_sitter::Tree,
@@ -374,7 +375,19 @@ fn callee_call_line_range(
     let node = tree
         .root_node()
         .descendant_for_point_range(point, point)
-        .filter(|n| n.kind() == "identifier" && n.utf8_text(source).ok() == Some(bare))?;
+        .filter(|n| {
+            matches!(n.kind(), "identifier" | "property_identifier")
+                && n.utf8_text(source).ok() == Some(bare)
+        })?;
+    if let Some(tag) = jsx_name_opening_tag(node, source) {
+        // 新しい JSX 証明は、ファイル全体に解析エラーがあれば使わない。
+        return (!tree.root_node().has_error())
+            .then(|| (tag.start_position().row, tag.end_position().row));
+    }
+    // property_identifier の受け入れは JSX のメンバー名だけに限定する。
+    if node.kind() != "identifier" {
+        return None;
+    }
     // callee 位置まで透過して登る。member_expression は `ns.startRecording({...})` の
     // receiver、parenthesized_expression は冗長括弧付き callee `(foo)(...)` を通すため
     // (括弧を挟むと call_expression の function フィールドは最外の括弧ノードになるので、
@@ -394,6 +407,39 @@ fn callee_call_line_range(
         }
     }
     None
+}
+
+/// JSX の名前位置だけを解決し、終了タグも対応する開始タグへ戻す。
+fn jsx_name_opening_tag<'a>(
+    mut node: tree_sitter::Node<'a>,
+    source: &[u8],
+) -> Option<tree_sitter::Node<'a>> {
+    let mut parent = node.parent()?;
+    while parent.kind() == "member_expression" {
+        if parent.child_by_field_name("property")?.id() != node.id() {
+            return None;
+        }
+        node = parent;
+        parent = node.parent()?;
+    }
+    if parent.child_by_field_name("name")?.id() != node.id() {
+        return None;
+    }
+    match parent.kind() {
+        "jsx_opening_element" | "jsx_self_closing_element" => Some(parent),
+        "jsx_closing_element" => {
+            let element = parent.parent()?;
+            if element.kind() != "jsx_element" {
+                return None;
+            }
+            let open = element.child_by_field_name("open_tag")?;
+            let open_name = open.child_by_field_name("name")?;
+            (open.kind() == "jsx_opening_element"
+                && open_name.utf8_text(source).ok()? == node.utf8_text(source).ok()?)
+            .then_some(open)
+        }
+        _ => None,
+    }
 }
 
 /// 定義・import/use 行を除いた「実際の呼び出し参照」だけを抜き出す。
@@ -880,6 +926,30 @@ mod tests {
     fn call_range_at(src: &str, bare: &str, line: usize, column: usize) -> Option<(usize, usize)> {
         let tree = parser::parse_source(src.as_bytes(), LangId::Typescript).unwrap();
         callee_call_line_range(&tree, src.as_bytes(), bare, line, column)
+    }
+
+    #[test]
+    fn jsx_call_range_excludes_children_attributes_and_receivers() {
+        for lang in [LangId::Javascript, LangId::Tsx] {
+            let src = "const view = <ns.Card\n value={Card}\n>\n {Card}\n</ns.Card>;\n";
+            let tree = parser::parse_source(src.as_bytes(), lang).unwrap();
+            for (line, column, expected) in [
+                (0, 17, Some((0, 2))),
+                (4, 5, Some((0, 2))),
+                (1, 8, None),
+                (3, 2, None),
+            ] {
+                assert_eq!(
+                    callee_call_line_range(&tree, src.as_bytes(), "Card", line, column),
+                    expected,
+                    "{lang:?}: {line}:{column}",
+                );
+            }
+            assert_eq!(
+                callee_call_line_range(&tree, src.as_bytes(), "ns", 0, 14),
+                None
+            );
+        }
     }
 
     /// 括弧なしの複数行呼び出しは従来どおり call_expression 全体の行範囲を返す。

@@ -6,6 +6,67 @@ use super::support::*;
 use std::process::{Command, Stdio};
 
 #[test]
+fn review_hook_multiline_jsx_checks_only_the_opening_tag() {
+    let before = "import { memo } from 'react';\nexport const Card = memo(function Card({ label }: { label: string }) {\n  return <span>{label}</span>;\n});\n";
+    let after = "import { memo } from 'react';\nexport const Card = memo(function Card({ label, tone }: { label: string; tone: string }) {\n  return <span data-tone={tone}>{label}</span>;\n});\n";
+    for (import, name) in [
+        ("import { Card } from './Card';", "Card"),
+        ("import * as ns from './Card';", "ns.Card"),
+    ] {
+        for (old_tag, new_tag, closed) in [
+            (
+                format!("<{name}\n    label=\"a\"\n  />"),
+                format!("<{name}\n    label=\"a\"\n    tone=\"x\"\n  />"),
+                true,
+            ),
+            (
+                format!("<{name}\n    label=\"a\"\n  >\n    old\n  </{name}>"),
+                format!("<{name}\n    label=\"a\"\n    tone=\"x\"\n  >\n    old\n  </{name}>"),
+                true,
+            ),
+            (
+                format!("<{name}\n    label=\"a\"\n  >\n    old\n  </{name}>"),
+                format!("<{name}\n    label=\"a\"\n  >\n    new\n  </{name}>"),
+                false,
+            ),
+        ] {
+            let old_usage =
+                format!("{import}\nexport function List() {{\n  return {old_tag};\n}}\n");
+            let new_usage =
+                format!("{import}\nexport function List() {{\n  return {new_tag};\n}}\n");
+            let output = a3_review_hook(
+                |root| {
+                    std::fs::write(root.join("Card.tsx"), after).unwrap();
+                    std::fs::write(root.join("List.tsx"), &new_usage).unwrap();
+                },
+                &[("Card.tsx", before), ("List.tsx", &old_usage)],
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.success(), closed, "{new_usage}\n{stderr}");
+            let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+            let category = if closed { "mod_closed" } else { "mod" };
+            let other = if closed { "mod" } else { "mod_closed" };
+            assert!(
+                !json["api"][other]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|s| s["n"] == "Card"),
+                "{stderr}",
+            );
+            assert!(
+                json["api"][category]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["n"] == "Card"),
+                "{stderr}"
+            );
+        }
+    }
+}
+
+#[test]
 fn review_hook_distinguishes_independent_names_from_removed_function_calls() {
     let before =
         "def abort(message):\n    raise SystemExit(message)\ndef version():\n    return '1.0'\n";
