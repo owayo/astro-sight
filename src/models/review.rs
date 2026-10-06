@@ -111,6 +111,11 @@ pub struct ApiChanges {
     /// blocking に昇格する (Issue 2026-06-02-balance-const-value-changes 対応)。
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub const_value_changes: Vec<ApiSymbolChange>,
+    /// 任意の呼び出しへ渡した callback の本体だけの変更。戻り値の公開形状や
+    /// 実行時互換性は未検証なので、互換変更とは分けて必ず報告する。
+    /// `--strict-public-const-values` 指定時は hook をブロックする。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub callback_body_changes: Vec<CallbackBodyChange>,
     /// シグネチャ文字列は変わったが公開契約 (呼び出し側の互換性) が維持される互換 api.mod。
     /// React component の HOC ラップ (`memo` / `forwardRef`) や、未参照プロパティのみ削除した
     /// exported object 等。非 blocking の informational 扱い
@@ -264,6 +269,20 @@ pub struct CompatibleApiModification {
     pub new_signature: Option<String>,
     /// 互換と判定した根拠 ("react_component_wrapper" / "unused_object_members")。
     pub reason: String,
+}
+
+/// Callback の本体以外は不変だが、公開値の互換性までは証明していない変更。
+#[derive(Debug, Clone, Serialize)]
+pub struct CallbackBodyChange {
+    #[serde(flatten)]
+    pub change: ApiSymbolChange,
+    pub reason: CallbackBodyChangeReason,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallbackBodyChangeReason {
+    CallbackBodyChange,
 }
 
 /// 参照カウント 0 の公開シンボル。

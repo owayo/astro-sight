@@ -477,6 +477,7 @@ fn value_binding_signature(
 ///
 /// 任意の呼び出しの引数 (`create((set) => ({ .. }))` / `compute(() => 1)`) は辿らない。
 /// コールバックの中身がストアの形や値そのものを決める (= 契約) ことがあるため。
+/// 本体だけの変更は分類側で、互換性未検証の callback_body_changes として報告する。
 fn js_function_value_body_spans(
     value: tree_sitter::Node<'_>,
     source: &[u8],

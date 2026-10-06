@@ -27,6 +27,8 @@ enum HookBlockingCategory {
     /// strict 指定時の `api.const_value` バケット。
     #[serde(rename = "api.const_value")]
     ApiConstValue,
+    #[serde(rename = "api.callback_body")]
+    ApiCallbackBody,
     #[serde(rename = "dead")]
     Dead,
 }
@@ -119,6 +121,13 @@ struct HookCompatibleModification<'a> {
 }
 
 #[derive(Serialize)]
+struct HookCallbackBodyChange<'a> {
+    n: &'a str,
+    f: &'a str,
+    reason: crate::models::review::CallbackBodyChangeReason,
+}
+
+#[derive(Serialize)]
 struct HookMovedSymbol<'a> {
     n: &'a str,
     from: &'a str,
@@ -205,6 +214,8 @@ struct HookApi<'a> {
     modified_closed_in_diff: Vec<HookNameFile<'a>>,
     #[serde(rename = "const_value", skip_serializing_if = "Vec::is_empty")]
     const_value_changes: Vec<HookNameFile<'a>>,
+    #[serde(rename = "callback_body", skip_serializing_if = "Vec::is_empty")]
+    callback_body_changes: Vec<HookCallbackBodyChange<'a>>,
     #[serde(rename = "mod_compat", skip_serializing_if = "Vec::is_empty")]
     compatible_modified: Vec<HookCompatibleModification<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -278,6 +289,15 @@ impl<'a> HookApi<'a> {
                     reason: change.reason.as_str(),
                 })
                 .collect(),
+            callback_body_changes: api
+                .callback_body_changes
+                .iter()
+                .map(|entry| HookCallbackBodyChange {
+                    n: &entry.change.name,
+                    f: &entry.change.file,
+                    reason: entry.reason,
+                })
+                .collect(),
             moved: api
                 .moved
                 .iter()
@@ -307,6 +327,7 @@ impl<'a> HookApi<'a> {
             && self.modified.is_empty()
             && self.modified_closed_in_diff.is_empty()
             && self.const_value_changes.is_empty()
+            && self.callback_body_changes.is_empty()
             && self.compatible_modified.is_empty()
             && self.moved.is_empty()
             && self.removed_dead.is_empty()
@@ -411,6 +432,13 @@ pub(crate) fn build_review_hook_json_for_diff(
             .map(|m| (m.file.as_str(), m.name.as_str())),
     );
     if !strict_const_values {
+        informational_modified_api_symbols.extend(
+            result
+                .api_changes
+                .callback_body_changes
+                .iter()
+                .map(|m| (m.change.file.as_str(), m.change.name.as_str())),
+        );
         informational_modified_api_symbols.extend(
             result
                 .api_changes
@@ -543,6 +571,9 @@ pub(crate) fn build_review_hook_json_for_diff(
         }
         if strict_const_values && !api.const_value_changes.is_empty() {
             blocking_categories.push(HookBlockingCategory::ApiConstValue);
+        }
+        if strict_const_values && !api.callback_body_changes.is_empty() {
+            blocking_categories.push(HookBlockingCategory::ApiCallbackBody);
         }
         has_any_output = true;
         hook_obj.insert(

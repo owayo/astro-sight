@@ -116,7 +116,8 @@ fn destructuring_with_rest_or_default_compares_the_whole_declaration() {
 /// 旧実装は宣言全体を signature にしていたため、`export const Button = () => {..}` の
 /// JSX を直しただけで blocking な api.mod になっていた。React の HOC (`forwardRef`)
 /// とオブジェクトリテラルのメソッドも同様。任意の呼び出しのコールバック
-/// (`create((set) => ({..}))`) はストアの形そのものなので本体を省かない (対照)。
+/// (`create((set) => ({..}))`) はストアの形そのものなので signature から本体を省かず、
+/// 本文だけの変更も互換性未検証の情報として出力に残す (対照)。
 #[test]
 fn function_valued_binding_body_change_is_not_api_mod() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -163,8 +164,29 @@ fn function_valued_binding_body_change_is_not_api_mod() {
         "parameter change stays api.mod: {modified:?}"
     );
     assert!(
-        modified.contains(&"useStore"),
-        "store shape change stays api.mod: {modified:?}"
+        !modified.contains(&"useStore"),
+        "callback body change is informational: {modified:?}"
+    );
+    let store = api
+        .callback_body_changes
+        .iter()
+        .find(|entry| entry.change.name == "useStore")
+        .expect("store shape change must remain visible");
+    assert!(
+        store
+            .change
+            .old_signature
+            .as_deref()
+            .unwrap()
+            .contains("inc:")
+    );
+    assert!(
+        !store
+            .change
+            .new_signature
+            .as_deref()
+            .unwrap()
+            .contains("inc:")
     );
 }
 
