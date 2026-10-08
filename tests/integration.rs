@@ -32,4 +32,5 @@ mod integration {
     mod sandbox;
     mod session;
     mod static_const_values;
+    mod type_annotations;
 }

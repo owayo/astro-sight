@@ -155,6 +155,8 @@ printf '%s\n' \
   | astro-sight session
 ```
 
+TypeScript/TSX `export const` annotation-only edits appear in `api_changes.type_annotation_changes` with `reason: type_annotation_only` and `compatibility: unverified`. Type compatibility needs a TypeScript check. `review --hook` keeps their references informational; `--strict-public-type-annotations` requests review through `policy.type_annotation`, independently of `--strict-public-const-values`. Annotation formatting alone is omitted and does not block either policy.
+
 ### Find References
 
 ```bash

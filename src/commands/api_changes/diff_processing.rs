@@ -608,6 +608,39 @@ fn collect_modified_symbols(
                 lang_id: lang_id_for_file,
             };
             let mut sources = SignatureSourceCache::with_base_blobs(base_blobs);
+            match super::type_annotation::classify_type_annotation_change(&site, &mut sources) {
+                super::type_annotation::TypeAnnotationDetection::Unchanged => {
+                    state.buckets.unchanged_type_annotations.push(ApiSymbol {
+                        name: name.clone(),
+                        kind: kind.clone(),
+                        file: df.new_path.clone(),
+                        refs_internal: 0,
+                    });
+                    continue;
+                }
+                super::type_annotation::TypeAnnotationDetection::AnnotationOnly => {
+                    state
+                        .buckets
+                        .type_annotation_changes
+                        .push(crate::models::review::TypeAnnotationChange {
+                        change: ApiSymbolChange {
+                            name: name.clone(),
+                            kind: kind.clone(),
+                            file: df.new_path.clone(),
+                            old_signature: Some(old_sig.to_string()),
+                            new_signature: Some(new_sig.clone()),
+                            no_resolved_internal_callers: false,
+                            contract_change: None,
+                        },
+                        reason:
+                            crate::models::review::TypeAnnotationChangeReason::TypeAnnotationOnly,
+                        compatibility:
+                            crate::models::review::TypeAnnotationCompatibility::Unverified,
+                    });
+                    continue;
+                }
+                super::type_annotation::TypeAnnotationDetection::NotApplicable => {}
+            }
             match super::static_const::classify_static_const_change(&site, &mut sources) {
                 super::static_const::StaticConstChange::Unchanged => {
                     state.buckets.unchanged_static_consts.push(ApiSymbol {
@@ -735,6 +768,28 @@ pub(crate) fn classify_signature_change(
         lang_id: lang_id_for_file,
     };
     let sources = &mut SignatureSourceCache::with_base_blobs(inputs.base_blobs);
+    match super::type_annotation::classify_type_annotation_change(&site, sources) {
+        super::type_annotation::TypeAnnotationDetection::Unchanged => {
+            state.buckets.unchanged_type_annotations.push(ApiSymbol {
+                name: change.name,
+                kind: change.kind,
+                file: change.file,
+                refs_internal: 0,
+            });
+            return;
+        }
+        super::type_annotation::TypeAnnotationDetection::AnnotationOnly => {
+            state.buckets.type_annotation_changes.push(
+                crate::models::review::TypeAnnotationChange {
+                    change,
+                    reason: crate::models::review::TypeAnnotationChangeReason::TypeAnnotationOnly,
+                    compatibility: crate::models::review::TypeAnnotationCompatibility::Unverified,
+                },
+            );
+            return;
+        }
+        super::type_annotation::TypeAnnotationDetection::NotApplicable => {}
+    }
     // 既存の値変更判定を優先し、直接 TS callable の型注釈は元ソースで照合する。
     if lang_id_for_file.is_some_and(|lid| is_const_value_only_change(old_sig, new_sig, kind, lid))
         && super::ts_signature::ts_const_value_header_guard(&site, sources)

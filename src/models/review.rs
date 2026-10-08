@@ -116,6 +116,14 @@ pub struct ApiChanges {
     #[serde(skip)]
     #[doc(hidden)]
     pub unchanged_static_consts: Vec<ApiSymbol>,
+    /// 宣言子の型注釈だけの変更。型検査による互換性確認は行っていない。
+    /// 既定は情報提供、`--strict-public-type-annotations` は確認を求めてブロックする。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub type_annotation_changes: Vec<TypeAnnotationChange>,
+    /// 型注釈の整形だけの変更。hook の因果参照だけを情報提供へ移す内部証拠。
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub unchanged_type_annotations: Vec<ApiSymbol>,
     /// 任意の呼び出しへ渡した callback の本体だけの変更。戻り値の公開形状や
     /// 実行時互換性は未検証なので、互換変更とは分けて必ず報告する。
     /// `--strict-public-const-values` 指定時は hook をブロックする。
@@ -288,6 +296,27 @@ pub struct CallbackBodyChange {
 #[serde(rename_all = "snake_case")]
 pub enum CallbackBodyChangeReason {
     CallbackBodyChange,
+}
+
+/// 実行時の初期化式は不変だが、型の互換性は型検査で確認する必要がある変更。
+#[derive(Debug, Clone, Serialize)]
+pub struct TypeAnnotationChange {
+    #[serde(flatten)]
+    pub change: ApiSymbolChange,
+    pub reason: TypeAnnotationChangeReason,
+    pub compatibility: TypeAnnotationCompatibility,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeAnnotationChangeReason {
+    TypeAnnotationOnly,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeAnnotationCompatibility {
+    Unverified,
 }
 
 /// 参照カウント 0 の公開シンボル。

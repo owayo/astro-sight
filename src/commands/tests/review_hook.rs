@@ -24,6 +24,8 @@ fn callback_body_hook_reports_unverified_changes_and_supports_strict_mode() {
     let result = ReviewResult {
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             callback_body_changes: vec![CallbackBodyChange {
                 change: ApiSymbolChange {
                     name: "store".into(),
@@ -91,6 +93,8 @@ fn build_review_hook_json_compatible_modified_is_informational() {
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: Vec::new(),
@@ -178,6 +182,8 @@ fn build_review_hook_json_compatible_modified_impact_is_informational() {
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: Vec::new(),
@@ -271,6 +277,8 @@ fn build_review_hook_json_mixed_compatible_and_breaking_impact_keeps_breaking_on
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: Vec::new(),
@@ -360,6 +368,8 @@ fn build_review_hook_json_cochange_only_is_informational() {
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: Vec::new(),
@@ -429,6 +439,8 @@ fn build_review_hook_json_cochange_marks_history_evidence() {
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: Vec::new(),
@@ -481,6 +493,8 @@ fn build_review_hook_json_cochange_omits_denominator_when_unknown() {
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: Vec::new(),
@@ -554,6 +568,8 @@ fn build_review_hook_json_impact_info_only_is_informational() {
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: Vec::new(),
@@ -604,6 +620,8 @@ fn build_review_hook_json_api_add_only_is_informational() {
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: vec![ApiSymbol {
@@ -644,6 +662,8 @@ fn build_review_hook_json_api_add_carries_extraction_scope() {
     let dir = tempfile::tempdir().expect("tempdir");
     let empty_api = || ApiChanges {
         unchanged_static_consts: Vec::new(),
+        type_annotation_changes: Vec::new(),
+        unchanged_type_annotations: Vec::new(),
         callback_body_changes: Vec::new(),
         uncertain_removals: Vec::new(),
         parse_truncations: Vec::new(),
@@ -674,6 +694,8 @@ fn build_review_hook_json_api_add_carries_extraction_scope() {
 
     let with_add = review_with(ApiChanges {
         unchanged_static_consts: Vec::new(),
+        type_annotation_changes: Vec::new(),
+        unchanged_type_annotations: Vec::new(),
         uncertain_removals: Vec::new(),
         parse_truncations: Vec::new(),
         added: vec![ApiSymbol {
@@ -694,6 +716,8 @@ fn build_review_hook_json_api_add_carries_extraction_scope() {
     // `add` が空なら `add_scope` も出さない (無意味なトークンを増やさない)
     let without_add = review_with(ApiChanges {
         unchanged_static_consts: Vec::new(),
+        type_annotation_changes: Vec::new(),
+        unchanged_type_annotations: Vec::new(),
         uncertain_removals: Vec::new(),
         parse_truncations: Vec::new(),
         removed: vec![ApiSymbol {
@@ -733,6 +757,8 @@ fn build_review_hook_json_api_add_carries_internal_ref_count() {
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added,
@@ -838,6 +864,8 @@ fn build_review_hook_json_api_removed_is_blocking() {
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: Vec::new(),
@@ -882,6 +910,8 @@ fn build_review_hook_json_api_modified_is_blocking() {
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: Vec::new(),
@@ -935,6 +965,8 @@ fn build_review_hook_json_api_modified_carries_contract_change() {
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: Vec::new(),
@@ -998,6 +1030,8 @@ fn build_review_hook_json_api_modified_without_callers_is_flagged_but_still_bloc
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: Vec::new(),
@@ -1056,6 +1090,8 @@ fn build_review_hook_json_removed_dead_only_is_not_blocking() {
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: Vec::new(),
@@ -1112,6 +1148,8 @@ fn build_review_hook_json_const_value_only_is_informational() {
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: Vec::new(),
@@ -1162,6 +1200,8 @@ fn build_review_hook_json_const_value_is_blocking_under_strict() {
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: Vec::new(),
@@ -1234,6 +1274,8 @@ fn build_review_hook_json_uses_changed_symbols_in_summary() {
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: Vec::new(),
@@ -1319,6 +1361,8 @@ fn build_review_hook_json_filters_non_causal_affected_symbols_from_syms() {
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: Vec::new(),
@@ -1398,6 +1442,8 @@ fn build_review_hook_json_added_only_caller_is_not_blocking() {
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: Vec::new(),
@@ -1488,6 +1534,8 @@ fn build_review_hook_json_mixed_added_and_modified_keeps_only_modified() {
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: Vec::new(),
@@ -1544,6 +1592,8 @@ fn build_review_hook_json_api_modified_carries_field_contract_change() {
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: Vec::new(),
@@ -1661,6 +1711,8 @@ fn build_review_hook_json_resolves_updated_call_line_in_diff_file() {
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
             unchanged_static_consts: Vec::new(),
+            type_annotation_changes: Vec::new(),
+            unchanged_type_annotations: Vec::new(),
             uncertain_removals: Vec::new(),
             parse_truncations: Vec::new(),
             added: Vec::new(),
@@ -1682,7 +1734,7 @@ fn build_review_hook_json_resolves_updated_call_line_in_diff_file() {
     let util_diff = "--- a/util.py\n+++ b/util.py\n@@ -1,2 +1,2 @@\n-def helper(a):\n+def helper(a, b):\n     return a\n";
     let build_for = |diff: &str| {
         let diff_files = crate::engine::diff::parse_unified_diff(diff);
-        build_review_hook_json_for_diff(&result, dir_str, false, diff, &diff_files)
+        build_review_hook_json_for_diff(&result, dir_str, false, false, diff, &diff_files)
     };
 
     let updated_call = format!(

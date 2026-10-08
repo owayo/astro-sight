@@ -54,6 +54,8 @@ pub(crate) struct ApiChangeBuckets {
     pub(crate) modified_closed_in_diff: Vec<ApiSymbolChange>,
     pub(crate) const_value_changes: Vec<ApiSymbolChange>,
     pub(crate) unchanged_static_consts: Vec<ApiSymbol>,
+    pub(crate) type_annotation_changes: Vec<crate::models::review::TypeAnnotationChange>,
+    pub(crate) unchanged_type_annotations: Vec<ApiSymbol>,
     pub(crate) callback_body_changes: Vec<crate::models::review::CallbackBodyChange>,
     pub(crate) compatible_modified: Vec<CompatibleApiModification>,
     pub(crate) all_new_candidates: Vec<ApiSymbolCandidate>,
