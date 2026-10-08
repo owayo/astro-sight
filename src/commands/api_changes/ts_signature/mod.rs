@@ -16,6 +16,7 @@ mod function_params;
 mod literal_union;
 mod object_members;
 mod react;
+mod removed_params;
 
 use super::signature_tokens::{SigTokens, node_signature_tokens, signature_tokens_in_range};
 pub(super) use callable::ts_const_value_header_guard;
@@ -25,6 +26,9 @@ pub(crate) use function_params::*;
 pub(crate) use literal_union::*;
 pub(crate) use object_members::*;
 pub(crate) use react::*;
+pub(crate) use removed_params::{
+    OptionalRemovalCache, detect_trailing_optional_params_removed_compatible_mod,
+};
 
 /// TS/TSX/JS 全体を対象にする判定器の言語ゲート。
 const TS_JS_LANGS: &[crate::language::LangId] = &[

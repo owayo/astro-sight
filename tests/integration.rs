@@ -24,6 +24,7 @@ mod integration {
     mod impact_rust_scope;
     mod languages;
     mod mcp;
+    mod optional_param_removal;
     mod output_format;
     mod php_member_liveness;
     mod refs;
