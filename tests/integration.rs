@@ -35,4 +35,5 @@ mod integration {
     mod static_const_values;
     mod swift_grammar;
     mod type_annotations;
+    mod typescript_grammar;
 }

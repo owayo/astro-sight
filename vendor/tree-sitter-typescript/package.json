@@ -1,0 +1,7 @@
+{
+  "name": "grammar-reproduction",
+  "private": true,
+  "devDependencies": {
+    "tree-sitter-javascript": "0.23.1"
+  }
+}
