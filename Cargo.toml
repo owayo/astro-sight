@@ -83,3 +83,4 @@ strip = true
 # Vendored grammar fixes; generated parsers build without a grammar generator.
 [patch.crates-io]
 tree-sitter-swift = { path = "vendor/tree-sitter-swift" }
+tree-sitter-typescript = { path = "vendor/tree-sitter-typescript" }
