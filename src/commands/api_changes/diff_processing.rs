@@ -592,6 +592,46 @@ fn collect_modified_symbols(
     let mut seen_modified: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
     for (name, kind, new_sig) in new_syms {
+        // 正規化済み signature が同じでも、静的 container の整形が impact に残り得る。
+        if let Some(old_sig) = old_map.get(name.as_str())
+            && old_sig == &new_sig.as_str()
+        {
+            let site = CompatibleModSite {
+                dir,
+                base: inputs.base,
+                old_path: &df.old_path,
+                new_path: &df.new_path,
+                name,
+                kind,
+                old_sig,
+                new_sig,
+                lang_id: lang_id_for_file,
+            };
+            let mut sources = SignatureSourceCache::with_base_blobs(base_blobs);
+            match super::static_const::classify_static_const_change(&site, &mut sources) {
+                super::static_const::StaticConstChange::Unchanged => {
+                    state.buckets.unchanged_static_consts.push(ApiSymbol {
+                        name: name.clone(),
+                        kind: kind.clone(),
+                        file: df.new_path.clone(),
+                        refs_internal: 0,
+                    });
+                }
+                super::static_const::StaticConstChange::ValueOnly => {
+                    state.buckets.const_value_changes.push(ApiSymbolChange {
+                        name: name.clone(),
+                        kind: kind.clone(),
+                        file: df.new_path.clone(),
+                        old_signature: Some(old_sig.to_string()),
+                        new_signature: Some(new_sig.clone()),
+                        no_resolved_internal_callers: false,
+                        contract_change: None,
+                    });
+                }
+                super::static_const::StaticConstChange::NotApplicable => {}
+            }
+            continue;
+        }
         if let Some(old_sig) = old_map.get(name.as_str())
             && old_sig != &new_sig.as_str()
             && seen_modified.insert((df.new_path.clone(), name.clone()))
@@ -695,12 +735,29 @@ pub(crate) fn classify_signature_change(
         lang_id: lang_id_for_file,
     };
     let sources = &mut SignatureSourceCache::with_base_blobs(inputs.base_blobs);
-    // const_value の優先順位を維持し、直接 TS callable の型注釈だけは元ソースで照合する。
+    // 既存の値変更判定を優先し、直接 TS callable の型注釈は元ソースで照合する。
     if lang_id_for_file.is_some_and(|lid| is_const_value_only_change(old_sig, new_sig, kind, lid))
         && super::ts_signature::ts_const_value_header_guard(&site, sources)
     {
         state.buckets.const_value_changes.push(change);
         return;
+    }
+    // 型注釈のない静的 container は、構造に加えて葉の値も比較して整形だけを除く。
+    match super::static_const::classify_static_const_change(&site, sources) {
+        super::static_const::StaticConstChange::Unchanged => {
+            state.buckets.unchanged_static_consts.push(ApiSymbol {
+                name: change.name,
+                kind: change.kind,
+                file: change.file,
+                refs_internal: 0,
+            });
+            return;
+        }
+        super::static_const::StaticConstChange::ValueOnly => {
+            state.buckets.const_value_changes.push(change);
+            return;
+        }
+        super::static_const::StaticConstChange::NotApplicable => {}
     }
     // Python の TypedDict で `total=` が絡む変更は blocking な api.mod に確定させる。
     // 互換判定器や closed-in-diff 判定より**前**に置くのが要点で、「リポジトリ内の参照が

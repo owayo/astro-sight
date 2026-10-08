@@ -431,6 +431,13 @@ pub(crate) fn build_review_hook_json_for_diff(
             .iter()
             .map(|m| (m.file.as_str(), m.name.as_str())),
     );
+    informational_modified_api_symbols.extend(
+        result
+            .api_changes
+            .unchanged_static_consts
+            .iter()
+            .map(|m| (m.file.as_str(), m.name.as_str())),
+    );
     if !strict_const_values {
         informational_modified_api_symbols.extend(
             result

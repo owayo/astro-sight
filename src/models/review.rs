@@ -105,12 +105,17 @@ pub struct ApiChanges {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub modified_closed_in_diff: Vec<ApiSymbolChange>,
     /// `pub const` / 非 mut `pub static` / `export const` の shape (名前・型・visibility・
-    /// binding kind) は不変で initializer (値) のみ変更されたケース。値変更はコンパイル
-    /// 互換性を壊さないため `modified` (api.mod) とは別カテゴリとして informational に扱い、
-    /// デフォルトでは stop hook をブロックしない。`--strict-public-const-values` 指定時のみ
+    /// binding kind) や静的 container の構造は不変で、initializer (値) のみ変更されたケース。
+    /// `as const` 等では派生リテラル型が変わり得るため、コンパイル互換性の保証ではない。
+    /// 値変更ポリシーとして `modified` (api.mod) と分け、既定では informational とし、
+    /// stop hook をブロックしない。`--strict-public-const-values` 指定時は確認を求めるため
     /// blocking に昇格する (Issue 2026-06-02-balance-const-value-changes 対応)。
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub const_value_changes: Vec<ApiSymbolChange>,
+    /// 静的 container の構造と値が同一。hook の impact 判定だけに使う内部証拠。
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub unchanged_static_consts: Vec<ApiSymbol>,
     /// 任意の呼び出しへ渡した callback の本体だけの変更。戻り値の公開形状や
     /// 実行時互換性は未検証なので、互換変更とは分けて必ず報告する。
     /// `--strict-public-const-values` 指定時は hook をブロックする。

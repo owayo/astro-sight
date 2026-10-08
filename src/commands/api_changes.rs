@@ -328,6 +328,7 @@ pub(crate) fn detect_api_changes(
             .collect(),
         modified_closed_in_diff: buckets.modified_closed_in_diff,
         const_value_changes: buckets.const_value_changes,
+        unchanged_static_consts: buckets.unchanged_static_consts,
         callback_body_changes: buckets.callback_body_changes,
         compatible_modified: buckets.compatible_modified,
     }
@@ -507,6 +508,7 @@ pub(crate) mod prepare;
 pub(crate) mod removed;
 pub(crate) mod signature;
 mod signature_tokens;
+mod static_const;
 
 mod python_contract;
 
