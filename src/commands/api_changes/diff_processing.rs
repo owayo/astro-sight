@@ -918,6 +918,13 @@ pub(crate) fn classify_signature_change(
     // 渡す (呼び出し式が無変更でも共有 const の定義側が同一 diff で更新されていれば追随済み)。
     // 互換変更ではないので compatible_modified には入れず、あくまで closed 判定の入力。
     let added_required_props = detect_added_required_object_props(&site, sources);
+    let python_protocol =
+        super::python_protocol_arg::prepare_protocol_argument_change(&site, sources);
+    let arg_evidence = match (&added_required_props, &python_protocol) {
+        (Some(props), _) => super::ref_index::ClosureArgEvidence::TsAddedRequiredProps(props),
+        (None, Some(proof)) => super::ref_index::ClosureArgEvidence::PythonProtocolParams(proof),
+        _ => super::ref_index::ClosureArgEvidence::None,
+    };
     // 全 cross-file 参照が同一 diff 内で追随済みなら informational
     if is_modified_closed_in_diff(
         ModifiedClosureInput {
@@ -928,7 +935,7 @@ pub(crate) fn classify_signature_change(
             base,
             target_new_path: &df.new_path,
             diff_files,
-            added_required_props: added_required_props.as_ref(),
+            arg_evidence,
         },
         state.closure_caches,
     ) {

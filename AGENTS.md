@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **Python Protocol 引数の構造的な適合証拠** — `commands/api_changes/python_protocol_arg.rs` はトップレベル関数の引数注釈だけの変更について、同一ファイル内の直接 `Protocol` を継承するメソッド契約と、呼び出し側の `C` / `C | None` 注釈を持つローカル変数の実装クラスを照合する。全必須メソッドの引数名・型・既定値・戻り型・async が一致する場合に、無変更の呼び出しも `modified_closed_in_diff` へ分ける。型は組み込みとコンテナの厳密一致に限定し、別名・相対 import、未知の型、実装の継承・装飾・データメンバー、曖昧な束縛・再代入、解析エラー、`.pyi` は証明しない。引数リストのコメントは位置計算から除き、generator / keyword / spread は保持する。解析中の AST は既存キャッシュを共有し、呼び出し側の検査・名前解決・ローカル束縛と、引数位置ごとの実装適合を再利用する。TS の共有 const 証拠と同じ `ClosureArgEvidence` へ統合し、既存の変更行による判定も維持する。動的・推移的な名前解決や型検査器による全体の互換性判定は行わない。
+
 - **静的オブジェクトのメンバー別 impact** — `engine/impact/object_members.rs` は JS / TS / TSX の一意な `const` 宣言について、新旧の静的オブジェクトリテラルと宣言ヘッダを比較する。変更パスと重ならず、新旧で own path が存在する直接の読み取りだけを informational へ分ける。変更メンバー・親オブジェクト・全体利用は従来の判定を保ち、既存の Low を優先する。spread / computed key / 重複キー / getter / 関数・識別子・配列の値 / 動的アクセス / 書き込み / 型注釈・タグ付き JSDoc / 復元・解析失敗は証明を諦める。定義元ファイルに書き換え、別名・全体・オブジェクト部分木の受け渡しがある場合も降格しない。別ファイルからの書き換えはその書き込み参照を報告し、候補オブジェクトのモジュール参照は、別名のない import / 再 export の名前位置だけを情報提供にし、それ以外は不明な全体利用として報告する。依存証拠には既存 imports 抽出による静的な動的 import（文字列 / 置換なし template literal）も含める。動的な依存先・escape を含む specifier・文字列で指定する import 名など既存 refs が拾わない経路と、推移的なデータフローまでは解決しない。`refs` と dead-code の出現契約は変えない。
 
 - **Bash / zsh の解析エラー** — `engine/bash_parse_recovery.rs` が ERROR 内のトップレベル関数ヘッダだけを API 差分と refs で共有する。新旧とも Bash 文法で解析し、同名が各 1 件の場合に限り `uncertain_removals`（hook: `rm_unverified`）へ分ける。旧側の拡張子なしファイルは旧 blob の shebang で判定し、他言語からシェルへの置き換えによる削除を降格しない。実削除・同名複数定義・文字列や heredoc の曖昧な内容は従来の保守的な判定に残す。疑似シンボルは作らない。`refs` は候補を `unknown` として返し、count / visitor は過少計上を避けるため出現を保持する。変更後の Bash 木に ERROR があれば `parse_error_region` を申告し、zsh の symbols / ast 診断には Bash 文法による代替解析であることを示す。

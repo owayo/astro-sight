@@ -157,6 +157,10 @@ printf '%s\n' \
 
 TypeScript/TSX `export const` annotation-only edits appear in `api_changes.type_annotation_changes` with `reason: type_annotation_only` and `compatibility: unverified`. Type compatibility needs a TypeScript check. `review --hook` keeps their references informational; `--strict-public-type-annotations` requests review through `policy.type_annotation`, independently of `--strict-public-const-values`. Annotation formatting alone is omitted and does not block either policy.
 
+Python function parameter annotation changes to a local `Protocol` can appear in `api_changes.modified_closed_in_diff` (`api.mod_closed` in hook output) even when callers are unchanged. The proof follows a local variable annotated as `C` or `C | None`, initialized with `C(...)` or `None`, to a unique class declared locally or imported directly from a repository module. The class must declare every inherited Protocol method with matching parameter names, types, defaults, return types, and async behavior. Existing conforming classes also qualify.
+
+This checks declared contracts using built-in types and containers. Aliased or relative imports, keyword or spread arguments, omitted changed parameters, complex local scopes or rebinding, decorated or inherited implementation classes, data members, unknown types, parse errors, and companion `.pyi` files keep the conservative blocking classification. Dynamic or transitive name resolution is outside this proof.
+
 ### Find References
 
 ```bash

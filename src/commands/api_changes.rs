@@ -517,6 +517,8 @@ mod python_contract;
 
 mod python_literal;
 
+mod python_protocol_arg;
+
 mod python_signature;
 
 mod ref_index;
