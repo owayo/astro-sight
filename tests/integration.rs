@@ -33,5 +33,6 @@ mod integration {
     mod sandbox;
     mod session;
     mod static_const_values;
+    mod swift_grammar;
     mod type_annotations;
 }

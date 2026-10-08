@@ -283,6 +283,9 @@ pub fn read_file(path: &Utf8Path) -> Result<SourceBuf> {
 }
 
 #[cfg(test)]
+mod grammar_regressions;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::language::LangId;
