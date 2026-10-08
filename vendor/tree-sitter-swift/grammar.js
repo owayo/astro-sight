@@ -967,12 +967,14 @@ module.exports = grammar({
         PRECS.tuple,
         seq(
           "(",
-          sep1Opt(
-            seq(
-              optional(seq(field("name", $.simple_identifier), ":")),
-              field("value", $._expression)
-            ),
-            ","
+          optional(
+            sep1Opt(
+              seq(
+                optional(seq(field("name", $.simple_identifier), ":")),
+                field("value", $._expression)
+              ),
+              ","
+            )
           ),
           ")"
         )
@@ -1992,7 +1994,8 @@ module.exports = grammar({
         ),
         alias($._binding_pattern_with_expr, $.pattern)
       ),
-    _tuple_pattern: ($) => seq("(", sep1Opt($._tuple_pattern_item, ","), ")"),
+    _tuple_pattern: ($) =>
+      seq("(", optional(sep1Opt($._tuple_pattern_item, ",")), ")"),
     _case_pattern: ($) =>
       seq(
         optional("case"),

@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::path::Path;
 
 const SWIFT_COALESCING_SOURCE: &str = include_str!("../fixtures/swift_nil_coalescing.swift");
+const SWIFT_EMPTY_TUPLE_SOURCE: &str = include_str!("../fixtures/swift_empty_tuple.swift");
 
 fn swift_cli_json(command: &str, path: &Path, args: &[&str]) -> Value {
     let output = cargo_bin()
@@ -36,6 +37,57 @@ fn swift_ast_nodes(value: &Value) -> Vec<&Value> {
         }
     }
     nodes
+}
+
+#[test]
+fn swift_empty_tuple_cli_parses_values_and_patterns_without_diagnostics() {
+    let repo = TestRepo::new();
+    repo.write("unit.swift", SWIFT_EMPTY_TUPLE_SOURCE);
+    let path = repo.path("unit.swift");
+
+    for command in ["ast", "symbols"] {
+        let output = swift_cli_json(command, &path, &["--no-cache"]);
+        assert!(
+            output["diagnostics"]
+                .as_array()
+                .is_none_or(|items| items.is_empty()),
+            "{command}: {}",
+            output["diagnostics"]
+        );
+    }
+
+    let ast = swift_cli_json("ast", &path, &["--full", "--depth", "32", "--no-cache"]);
+    let nodes = swift_ast_nodes(&ast["ast"]);
+    assert!(nodes.iter().all(|node| node["kind"] != "ERROR"));
+    assert!(nodes.iter().any(|node| {
+        node["kind"] == "tuple_expression"
+            && node["range"]["start"]["line"] == 3
+            && node["children"]
+                .as_array()
+                .is_none_or(|children| children.is_empty())
+    }));
+    assert!(nodes.iter().any(|node| {
+        node["kind"] == "tuple_expression"
+            && node["range"]["start"]["line"] == 8
+            && node["children"]
+                .as_array()
+                .is_none_or(|children| children.is_empty())
+    }));
+    assert!(nodes.iter().any(|node| {
+        node["kind"] == "value_arguments"
+            && node["range"]["start"]["line"] == 34
+            && node["children"]
+                .as_array()
+                .is_none_or(|children| children.is_empty())
+    }));
+    assert!(
+        nodes
+            .iter()
+            .any(|node| { node["kind"] == "tuple_type" && node["range"]["start"]["line"] == 36 })
+    );
+    assert!(nodes.iter().any(|node| {
+        node["kind"] == "lambda_function_type" && node["range"]["start"]["line"] == 36
+    }));
 }
 
 #[test]

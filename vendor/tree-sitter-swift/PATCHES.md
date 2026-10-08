@@ -15,6 +15,7 @@ in the scanner and three query files; query contents otherwise match the crate. 
 
 Upstream: <https://github.com/alex-pinkus/tree-sitter-swift>.
 Local regression: <https://github.com/owayo/astro-sight/issues/32>.
+Empty-tuple regression: <https://github.com/owayo/astro-sight/issues/41>.
 
 ## Change
 
@@ -28,6 +29,11 @@ Append a dedicated `_immediate_double_quest` external token and use it only in
 existing nil coalescing token and scanner serialization unchanged. Disable this
 new token during the all-symbols-valid error-recovery probe. Generated node-type
 entries retain the upstream schema.
+
+Swift also permits an empty tuple `()` as a value and pattern. Both
+`tuple_expression` and `_tuple_pattern` now allow zero elements so valid uses
+such as `.success(())`, `[()]`, and `case .success(())` do not produce missing
+tokens or error nodes. The generated `tuple_expression.value` field is optional.
 
 ## Regenerate
 
@@ -48,6 +54,9 @@ CLI grammar tests and the upstream corpus. The original crate, its unmodified
 regeneration and the patched parser produced identical full ASTs for all 238
 upstream corpus cases. The regression tests additionally cover the reported
 multiline cast/coalescing expression and source ranges.
+The empty-tuple patch keeps the full ASTs of the current upstream corpus sources
+byte-identical and adds a CLI regression for values, patterns, and unaffected
+parenthesized expressions, calls, and function types.
 
 ## Existing limitation
 
