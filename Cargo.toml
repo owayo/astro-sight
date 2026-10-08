@@ -79,3 +79,7 @@ tempfile = "3.27.0"
 lto = true
 codegen-units = 1
 strip = true
+
+# Vendored grammar fixes; generated parsers build without a grammar generator.
+[patch.crates-io]
+tree-sitter-swift = { path = "vendor/tree-sitter-swift" }

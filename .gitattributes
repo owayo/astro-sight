@@ -1,0 +1,4 @@
+vendor/** text eol=lf linguist-vendored
+vendor/**/src/parser.c linguist-generated
+vendor/**/src/grammar.json linguist-generated
+vendor/**/src/node-types.json linguist-generated
