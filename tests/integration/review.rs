@@ -2770,3 +2770,533 @@ fn review_cochange_history_candidates_explain_unassessed_actionability_and_ranki
     assert_eq!(compact["cochange"][0]["s"], entry["ranking_score"]);
     assert_eq!(compact["cochange"][0]["c"], 100);
 }
+
+const PY_PROTOCOL_OLD: &str = "from typing import Protocol\n\nclass Poster(Protocol):\n    def post(self, text: str) -> None: ...\n\ndef run(poster: Poster | None) -> None:\n    if poster is not None:\n        poster.post('hello')\n";
+const PY_PROTOCOL_NEW: &str = "from typing import Protocol\n\nclass Poster(Protocol):\n    def post(self, text: str) -> None: ...\n\nclass Reader(Protocol):\n    def read(self) -> list[str]: ...\n\nclass Port(Poster, Reader, Protocol):\n    \"\"\"Both contracts.\"\"\"\n\ndef run(poster: Port | None) -> None:\n    if poster is not None:\n        poster.post('hello')\n";
+const PY_PROTOCOL_CLIENT_OLD: &str =
+    "class Client:\n    def post(self, text: str) -> None:\n        print(text)\n";
+const PY_PROTOCOL_CLIENT_NEW: &str = "class Client:\n    def post(self, text: str) -> None:\n        print(text)\n\n    def read(self) -> list[str]:\n        return []\n";
+const PY_PROTOCOL_CALLER: &str = "from app.client import Client\nfrom app.notify import run\n\ndef main() -> None:\n    client: Client | None = Client()\n    run(client)\n";
+
+fn python_protocol_hook(new_api: &str, new_client: &str, caller: &str) -> std::process::Output {
+    a3_review_hook(
+        |root| {
+            std::fs::write(root.join("app/notify.py"), new_api).unwrap();
+            std::fs::write(root.join("app/client.py"), new_client).unwrap();
+        },
+        &[
+            ("app/__init__.py", ""),
+            ("app/notify.py", PY_PROTOCOL_OLD),
+            ("app/client.py", PY_PROTOCOL_CLIENT_OLD),
+            ("app/main.py", caller),
+        ],
+    )
+}
+
+#[test]
+fn review_hook_python_protocol_argument_tracks_unchanged_caller() {
+    for caller in [
+        PY_PROTOCOL_CALLER.to_owned(),
+        PY_PROTOCOL_CALLER.replace("Client | None =", "Client ="),
+        PY_PROTOCOL_CALLER.replace("run(client)", "run(client)\n    return run(client)"),
+    ] {
+        let output = python_protocol_hook(PY_PROTOCOL_NEW, PY_PROTOCOL_CLIENT_NEW, &caller);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert!(
+            json["api"]["mod_closed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["n"] == "run"),
+            "{stderr}"
+        );
+        assert!(
+            !json["impacts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|impact| impact["syms"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s == "run")),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn review_hook_python_protocol_argument_keeps_unproven_callers_blocking() {
+    let cases = [
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_OLD.to_owned(),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW.replace("read(self)", "read(self, count: int)"),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW.replace("list[str]", "list[int]"),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW.replace("text: str", "text: int"),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW.to_owned(),
+            PY_PROTOCOL_CALLER.replace("run(client)", "run(Client())"),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW.to_owned(),
+            PY_PROTOCOL_CALLER.replace("client: Client | None", "client"),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW.to_owned(),
+            PY_PROTOCOL_CALLER.replace("run(client)", "client = object()\n    run(client)"),
+        ),
+        (
+            PY_PROTOCOL_NEW.replace("poster: Port | None", "poster: Port | None, count: int"),
+            PY_PROTOCOL_CLIENT_NEW.to_owned(),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.replace("run(poster: Port", "run(port: Port"),
+            PY_PROTOCOL_CLIENT_NEW.to_owned(),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.replace("poster: Port | None", "poster: Port"),
+            PY_PROTOCOL_CLIENT_NEW.to_owned(),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            format!("{PY_PROTOCOL_CLIENT_NEW}\nclass Client:\n    pass\n"),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW.to_owned(),
+            format!("{PY_PROTOCOL_CALLER}\nrun(object())\n"),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW.to_owned(),
+            PY_PROTOCOL_CALLER.replace("run(client)", "callback = run\n    callback(client)"),
+        ),
+    ];
+    let extra_cases = [
+        (
+            PY_PROTOCOL_NEW.replace("Port(Poster, Reader, Protocol)", "Port(Poster, Reader)"),
+            PY_PROTOCOL_CLIENT_NEW.to_owned(),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.replace("from typing import Protocol", "from custom import Protocol"),
+            PY_PROTOCOL_CLIENT_NEW.to_owned(),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.replace("    def read(self)", "    value: int\n    def read(self)"),
+            PY_PROTOCOL_CLIENT_NEW.to_owned(),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.replace("def run(", "async def run("),
+            PY_PROTOCOL_CLIENT_NEW.to_owned(),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.replace(
+                "def run(poster: Port | None) -> None",
+                "def run(poster: Port | None) -> int",
+            ),
+            PY_PROTOCOL_CLIENT_NEW.to_owned(),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            format!("str = bytes\n{PY_PROTOCOL_CLIENT_NEW}"),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            format!("{PY_PROTOCOL_CLIENT_NEW}\nClient.read = None\n"),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW.replace(
+                "class Client:",
+                "class Client:\n    def __init__(self):\n        self.read = None",
+            ),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW.replace("class Client:", "class Client:\n    list = tuple"),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW.replace("def read(self)", "async def read(self)"),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW
+                .replace("    def read(self)", "    @property\n    def read(self)"),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW.replace("text: str", "message: str"),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW.replace("class Client:", "@decorate\nclass Client:"),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW.replace("class Client:", "class Client(Base):"),
+            PY_PROTOCOL_CALLER.to_owned(),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW.to_owned(),
+            PY_PROTOCOL_CALLER.replace("= Client()", "= factory()"),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW.to_owned(),
+            PY_PROTOCOL_CALLER.replace(
+                "run(client)",
+                "other((client := object()))\n    run(client)",
+            ),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW.to_owned(),
+            PY_PROTOCOL_CALLER.replace("run(client)", "run(poster=client)"),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW.to_owned(),
+            PY_PROTOCOL_CALLER.replace("def main()", "def main(run=None)"),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW.to_owned(),
+            PY_PROTOCOL_CALLER.replace("run(client)", "run(client)\n    client = object()"),
+        ),
+        (
+            PY_PROTOCOL_NEW.to_owned(),
+            PY_PROTOCOL_CLIENT_NEW.to_owned(),
+            PY_PROTOCOL_CALLER.replace(
+                "run(client)",
+                "setattr(client, 'read', None)\n    run(client)",
+            ),
+        ),
+    ];
+    for (api, client, caller) in cases.into_iter().chain(extra_cases) {
+        let output = python_protocol_hook(&api, &client, &caller);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{api}\n{client}\n{caller}\n{stderr}"
+        );
+        let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert!(
+            json["api"]["mod"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["n"] == "run"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn review_hook_python_protocol_argument_rejects_hidden_imports_and_stubs() {
+    for (file, contents) in [
+        (
+            "app/hidden.py",
+            "from app.notify import run as go\ngo(object())\n",
+        ),
+        ("app/client.pyi", "class Client: ...\n"),
+        ("app/notify.pyi", "def run(poster: int) -> None: ...\n"),
+        ("app/client/__init__.py", "class Client: ...\n"),
+    ] {
+        let output = a3_review_hook(
+            |root| {
+                std::fs::write(root.join("app/notify.py"), PY_PROTOCOL_NEW).unwrap();
+                std::fs::write(root.join("app/client.py"), PY_PROTOCOL_CLIENT_NEW).unwrap();
+            },
+            &[
+                ("app/__init__.py", ""),
+                ("app/notify.py", PY_PROTOCOL_OLD),
+                ("app/client.py", PY_PROTOCOL_CLIENT_OLD),
+                ("app/main.py", PY_PROTOCOL_CALLER),
+                (file, contents),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{file}: {stderr}");
+        let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert!(
+            json["api"]["mod"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["n"] == "run"),
+            "{file}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn review_hook_python_protocol_argument_accepts_already_conforming_classes() {
+    for (api, caller) in [
+        (PY_PROTOCOL_NEW.to_owned(), PY_PROTOCOL_CALLER.to_owned()),
+        (
+            PY_PROTOCOL_NEW.replace("poster: Port | None", "poster: Port"),
+            PY_PROTOCOL_CALLER.replace("Client | None =", "Client ="),
+        ),
+    ] {
+        let output = a3_review_hook(
+            |root| std::fs::write(root.join("app/notify.py"), &api).unwrap(),
+            &[
+                ("app/__init__.py", ""),
+                ("app/notify.py", PY_PROTOCOL_OLD),
+                ("app/client.py", PY_PROTOCOL_CLIENT_NEW),
+                ("app/main.py", &caller),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert!(
+            json["api"]["mod_closed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["n"] == "run"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn review_hook_python_protocol_argument_combines_proof_with_changed_calls() {
+    let second_old = "from app.client import Client\nfrom app.notify import run\ndef other() -> None:\n    run(None)\n";
+    let output = a3_review_hook(
+        |root| {
+            std::fs::write(root.join("app/notify.py"), PY_PROTOCOL_NEW).unwrap();
+            std::fs::write(root.join("app/client.py"), PY_PROTOCOL_CLIENT_NEW).unwrap();
+            std::fs::write(
+                root.join("app/second.py"),
+                second_old.replace("run(None)", "run(Client())"),
+            )
+            .unwrap();
+        },
+        &[
+            ("app/__init__.py", ""),
+            ("app/notify.py", PY_PROTOCOL_OLD),
+            ("app/client.py", PY_PROTOCOL_CLIENT_OLD),
+            ("app/main.py", PY_PROTOCOL_CALLER),
+            ("app/second.py", second_old),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert!(
+        json["api"]["mod_closed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["n"] == "run"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn review_hook_python_protocol_argument_cache_keeps_requirements_per_function() {
+    let old_api =
+        format!("{PY_PROTOCOL_OLD}\ndef run2(poster: Poster | None) -> None:\n    pass\n");
+    let new_api = format!(
+        "{PY_PROTOCOL_NEW}\nclass Scanner(Protocol):\n    def scan(self) -> bytes: ...\nclass ScanPort(Poster, Scanner, Protocol):\n    pass\ndef run2(poster: ScanPort | None) -> None:\n    pass\n"
+    );
+    for calls in [
+        "run(client)\n    run2(client)",
+        "run2(client)\n    run(client)",
+    ] {
+        let caller = PY_PROTOCOL_CALLER
+            .replace("import run", "import run, run2")
+            .replace("run(client)", calls);
+        let output = a3_review_hook(
+            |root| {
+                std::fs::write(root.join("app/notify.py"), &new_api).unwrap();
+                std::fs::write(root.join("app/client.py"), PY_PROTOCOL_CLIENT_NEW).unwrap();
+            },
+            &[
+                ("app/__init__.py", ""),
+                ("app/notify.py", &old_api),
+                ("app/client.py", PY_PROTOCOL_CLIENT_OLD),
+                ("app/main.py", &caller),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert!(
+            json["api"]["mod_closed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["n"] == "run"),
+            "{stderr}"
+        );
+        assert!(
+            json["api"]["mod"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["n"] == "run2"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn review_hook_python_protocol_argument_rejects_ambiguous_local_bindings() {
+    for caller in [
+        PY_PROTOCOL_CALLER.replace("run(client)", "other = client = object()\n    run(client)"),
+        PY_PROTOCOL_CALLER.replace("def main()", "def main[Client]()"),
+        PY_PROTOCOL_CALLER.replace("def main()", "def main[run]()"),
+        PY_PROTOCOL_CALLER.replace(
+            "    client: Client | None = Client()",
+            "    run(client)\n    client: Client | None = Client()",
+        ),
+    ] {
+        let output = python_protocol_hook(PY_PROTOCOL_NEW, PY_PROTOCOL_CLIENT_NEW, &caller);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{caller}\n{stderr}");
+        let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert!(
+            json["api"]["mod"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["n"] == "run"),
+            "{caller}\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn review_hook_python_protocol_argument_ignores_call_argument_comments() {
+    let old = PY_PROTOCOL_OLD.replace(
+        "poster: Poster | None",
+        "first: object, poster: Poster | None, extra: int = 0",
+    );
+    let new = PY_PROTOCOL_NEW.replace(
+        "poster: Port | None",
+        "first: object, poster: Port | None, extra: int = 0",
+    );
+    for (call, expected) in [
+        ("run(client, 42)", 1),
+        ("run(  # note\n        client,\n        42,\n    )", 1),
+        ("run(  # note\n        42,\n        client,\n    )", 0),
+        ("run(x for x in values)", 1),
+    ] {
+        let caller = PY_PROTOCOL_CALLER.replace("run(client)", call);
+        let output = a3_review_hook(
+            |root| {
+                std::fs::write(root.join("app/notify.py"), &new).unwrap();
+                std::fs::write(root.join("app/client.py"), PY_PROTOCOL_CLIENT_NEW).unwrap();
+            },
+            &[
+                ("app/__init__.py", ""),
+                ("app/notify.py", &old),
+                ("app/client.py", PY_PROTOCOL_CLIENT_OLD),
+                ("app/main.py", &caller),
+            ],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{call}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn review_hook_python_protocol_argument_cache_keeps_requirements_per_parameter() {
+    let old = PY_PROTOCOL_OLD.replace(
+        "poster: Poster | None",
+        "poster: Poster | None, scanner: Poster | None",
+    );
+    for params in [
+        "poster: Port | None, scanner: ScanPort | None",
+        "poster: ScanPort | None, scanner: Port | None",
+    ] {
+        let new = format!(
+            "{}\nclass Scanner(Protocol):\n    def scan(self) -> bytes: ...\nclass ScanPort(Poster, Scanner, Protocol):\n    pass\n",
+            PY_PROTOCOL_NEW.replace("poster: Port | None", params),
+        );
+        let caller = PY_PROTOCOL_CALLER.replace("run(client)", "run(client, client)");
+        let output = a3_review_hook(
+            |root| {
+                std::fs::write(root.join("app/notify.py"), &new).unwrap();
+                std::fs::write(root.join("app/client.py"), PY_PROTOCOL_CLIENT_NEW).unwrap();
+            },
+            &[
+                ("app/__init__.py", ""),
+                ("app/notify.py", &old),
+                ("app/client.py", PY_PROTOCOL_CLIENT_OLD),
+                ("app/main.py", &caller),
+            ],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{params}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn review_hook_python_protocol_argument_rejects_contract_mutation_and_builtin_shadow() {
+    for client in [
+        format!("from compat import str\n{PY_PROTOCOL_CLIENT_NEW}"),
+        format!("class list:\n    pass\n{PY_PROTOCOL_CLIENT_NEW}"),
+        format!("{PY_PROTOCOL_CLIENT_NEW}\ndef patch() -> None:\n    Client.read = None\n"),
+        format!("{PY_PROTOCOL_CLIENT_NEW}\ndef patch() -> None:\n    del Client.read\n"),
+    ] {
+        let output = python_protocol_hook(PY_PROTOCOL_NEW, &client, PY_PROTOCOL_CALLER);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{client}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

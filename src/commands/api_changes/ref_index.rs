@@ -121,25 +121,14 @@ pub(crate) fn has_blocking_value_usage(index: &ApiRefIndex, name: &str) -> bool 
     false
 }
 
-/// modified シンボルの全 cross-file 参照が同一 diff 内の変更 hunk で追随済みかを判定する。
-///
-/// 全ての非定義参照が diff_files の変更 hunk (new 範囲) に収まれば、呼び出し側が同一
-/// コミットで更新済みとみなし closed-in-diff (informational)。refs 解析失敗 /
-/// diff 外 or hunk 外の参照が 1 つでもあれば false を返し、保守的に blocking 側
-/// (通常の api.mod) へ倒す。
-///
-/// 同名定義が複数ある場合: 変更対象ファイル (`target_new_path`) 内の定義が 1 つに
-/// 特定できなければ従来どおり false。他ファイルの同名定義は、JS/TS/TSX のトップレベル
-/// 関数 (bare 名) に限り `js_ts_shadow::resolve_reference_binding` で参照単位に解決し、
-/// 「同一ファイルの function_declaration に束縛されるローカル呼び出し」だけを判定対象
-/// から除外する (Issue 2026-07-12-api-mod-same-diff-informational: export 関数と
-/// 別ファイルのローカル同名関数の併存で closed 判定が全滅していた)。method qualname
-/// (`Container.method`) と JS/TS 以外の言語は従来ガード (即 blocking) を維持する。
-///
-/// `added_required_props` は「object type literal 引数への必須プロパティ追加のみ」の signature
-/// 変更のときだけ `Some`。呼び出し式が無変更でも、渡している共有 `const` の定義側に同一 diff で
-/// 当該プロパティが追加されていれば追随済みとみなす追加証拠に使う
-/// (`closed_via_local_const_argument`、Issue 2026-08-05-api-mod-callers-updated-indirectly)。
+/// 無変更の呼び出し式を閉じる追加証拠。TS は共有 const の必須プロパティ追加、
+/// Python はローカル変数のクラスと新しい Protocol の構造的な適合を証明する。
+pub(crate) enum ClosureArgEvidence<'a> {
+    None,
+    TsAddedRequiredProps(&'a super::ts_signature::AddedRequiredObjectProps),
+    PythonProtocolParams(&'a super::python_protocol_arg::ProtocolArgumentChange),
+}
+
 pub(crate) struct ModifiedClosureInput<'a> {
     pub(crate) index: &'a ApiRefIndex,
     pub(crate) dir: &'a str,
@@ -148,10 +137,24 @@ pub(crate) struct ModifiedClosureInput<'a> {
     pub(crate) base: &'a str,
     pub(crate) target_new_path: &'a str,
     pub(crate) diff_files: &'a [crate::models::impact::DiffFile],
-    pub(crate) added_required_props:
-        Option<&'a crate::commands::api_changes::ts_signature::AddedRequiredObjectProps>,
+    pub(crate) arg_evidence: ClosureArgEvidence<'a>,
 }
 
+/// modified シンボルの全 cross-file 参照が同一 diff 内の変更 hunk で追随済みかを判定する。
+///
+/// 全ての非定義参照が diff_files の変更 hunk (new 範囲) に収まれば、呼び出し側が同一
+/// コミットで更新済みとみなし closed-in-diff (informational)。refs 解析失敗 /
+/// diff 外 or hunk 外の未証明の参照が 1 つでもあれば false を返し、保守的に blocking 側
+/// (通常の api.mod) へ倒す。無変更の呼び出しを閉じる追加証拠は ClosureArgEvidence に渡す
+/// (TS: Issue 2026-08-05-api-mod-callers-updated-indirectly、Python: #38)。
+///
+/// 同名定義が複数ある場合: 変更対象ファイル (`target_new_path`) 内の定義が 1 つに
+/// 特定できなければ従来どおり false。他ファイルの同名定義は、JS/TS/TSX のトップレベル
+/// 関数 (bare 名) に限り `js_ts_shadow::resolve_reference_binding` で参照単位に解決し、
+/// 「同一ファイルの function_declaration に束縛されるローカル呼び出し」だけを判定対象
+/// から除外する (Issue 2026-07-12-api-mod-same-diff-informational: export 関数と
+/// 別ファイルのローカル同名関数の併存で closed 判定が全滅していた)。method qualname
+/// (`Container.method`) と JS/TS 以外の言語は従来ガード (即 blocking) を維持する。
 pub(crate) fn is_modified_closed_in_diff(
     input: ModifiedClosureInput<'_>,
     caches: &mut ApiClosureCaches,
@@ -165,12 +168,17 @@ pub(crate) fn is_modified_closed_in_diff(
         base,
         target_new_path,
         diff_files,
-        added_required_props,
+        arg_evidence,
     } = input;
     let bare = bare_name(name);
     let Some(refs) = index.refs_for(bare) else {
         return false;
     };
+    if matches!(arg_evidence, ClosureArgEvidence::PythonProtocolParams(_))
+        && !super::python_protocol_arg::imports_are_unaliased(dir, refs, bare, caches)
+    {
+        return false;
+    }
     // 変更対象ファイル内の定義が 1 つに特定できなければ曖昧なので保守的に blocking。
     let defs: Vec<&crate::models::reference::SymbolReference> = refs
         .iter()
@@ -237,6 +245,11 @@ pub(crate) fn is_modified_closed_in_diff(
             continue;
         }
         effective_call_refs += 1;
+        if let ClosureArgEvidence::PythonProtocolParams(proof) = &arg_evidence
+            && proof.closes_reference(dir, r, caches)
+        {
+            continue;
+        }
         let Some(df) = diff_files.iter().find(|df| {
             df.new_path != "/dev/null" && diff_path_matches_ref(&df.new_path, &r.path, dir)
         }) else {
@@ -269,7 +282,10 @@ pub(crate) fn is_modified_closed_in_diff(
                     dir,
                     r,
                     bare,
-                    added_required_props,
+                    match &arg_evidence {
+                        ClosureArgEvidence::TsAddedRequiredProps(props) => Some(*props),
+                        _ => None,
+                    },
                     &changed_lines,
                     caches,
                 ) {
@@ -303,16 +319,16 @@ fn resolve_ref_shadow_binding(
     )
 }
 
-struct ParsedRefFile {
-    source: crate::engine::parser::SourceBuf,
-    tree: tree_sitter::Tree,
-    lang_id: crate::language::LangId,
+pub(super) struct ParsedRefFile {
+    pub(super) source: crate::engine::parser::SourceBuf,
+    pub(super) tree: tree_sitter::Tree,
+    pub(super) lang_id: crate::language::LangId,
 }
 
 /// 参照ファイルの parse 結果 (キャッシュ付き) を返す。読み込みは `parser::read_file`
 /// (100MB 上限 + TOCTOU 対策 + mmap ゼロコピー) を通し、`std::fs::read` の無制限読み込みを
 /// 迂回経路にしない。
-fn parsed_ref_file<'a>(
+pub(super) fn parsed_ref_file<'a>(
     dir: &str,
     ref_path: &str,
     caches: &'a mut ApiClosureCaches,
