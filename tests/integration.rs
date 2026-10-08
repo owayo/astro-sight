@@ -31,4 +31,5 @@ mod integration {
     mod review_dead_scope;
     mod sandbox;
     mod session;
+    mod static_const_values;
 }
