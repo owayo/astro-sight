@@ -481,6 +481,7 @@ fn dispatch_command(
             exclude_globs,
             dead_scope,
             strict_public_const_values,
+            strict_public_type_annotations,
             include_wip_dead,
         } => {
             // --hook 指定時、未指定なら touched-symbols に降格して
@@ -506,6 +507,7 @@ fn dispatch_command(
                 extra_exclude_globs: &exclude_globs,
                 dead_scope: resolved_dead_scope,
                 strict_public_const_values,
+                strict_public_type_annotations,
                 include_wip_dead,
                 include_generated,
             };

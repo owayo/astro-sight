@@ -535,6 +535,11 @@ pub enum Commands {
         #[arg(long = "strict-public-const-values")]
         strict_public_const_values: bool,
 
+        /// 型注釈だけの変更は互換性未確認として報告する。指定時は確認を求める
+        /// policy.type_annotation を Stop hook の blocking 対象にする。
+        #[arg(long = "strict-public-type-annotations")]
+        strict_public_type_annotations: bool,
+
         /// `--hook` のとき、同一 diff で新規 export された (= `api_changes.added` に挙がる)
         /// シンボルも dead 警告に含める。`--hook` 既定では多段実装中の WIP ノイズ (consumer
         /// 結線が後続コミット予定の純粋ヘルパー追加) を抑止するため、新規追加 export は

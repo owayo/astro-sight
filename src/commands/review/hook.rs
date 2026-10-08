@@ -29,6 +29,8 @@ enum HookBlockingCategory {
     ApiConstValue,
     #[serde(rename = "api.callback_body")]
     ApiCallbackBody,
+    #[serde(rename = "policy.type_annotation")]
+    PolicyTypeAnnotation,
     #[serde(rename = "dead")]
     Dead,
 }
@@ -128,6 +130,14 @@ struct HookCallbackBodyChange<'a> {
 }
 
 #[derive(Serialize)]
+struct HookTypeAnnotationChange<'a> {
+    n: &'a str,
+    f: &'a str,
+    reason: crate::models::review::TypeAnnotationChangeReason,
+    compatibility: crate::models::review::TypeAnnotationCompatibility,
+}
+
+#[derive(Serialize)]
 struct HookMovedSymbol<'a> {
     n: &'a str,
     from: &'a str,
@@ -214,6 +224,8 @@ struct HookApi<'a> {
     modified_closed_in_diff: Vec<HookNameFile<'a>>,
     #[serde(rename = "const_value", skip_serializing_if = "Vec::is_empty")]
     const_value_changes: Vec<HookNameFile<'a>>,
+    #[serde(rename = "type_annotation", skip_serializing_if = "Vec::is_empty")]
+    type_annotation_changes: Vec<HookTypeAnnotationChange<'a>>,
     #[serde(rename = "callback_body", skip_serializing_if = "Vec::is_empty")]
     callback_body_changes: Vec<HookCallbackBodyChange<'a>>,
     #[serde(rename = "mod_compat", skip_serializing_if = "Vec::is_empty")]
@@ -280,6 +292,16 @@ impl<'a> HookApi<'a> {
                 .iter()
                 .map(|change| name_file(&change.name, &change.file))
                 .collect(),
+            type_annotation_changes: api
+                .type_annotation_changes
+                .iter()
+                .map(|change| HookTypeAnnotationChange {
+                    n: change.change.name.as_str(),
+                    f: change.change.file.as_str(),
+                    reason: change.reason,
+                    compatibility: change.compatibility,
+                })
+                .collect(),
             compatible_modified: api
                 .compatible_modified
                 .iter()
@@ -327,6 +349,7 @@ impl<'a> HookApi<'a> {
             && self.modified.is_empty()
             && self.modified_closed_in_diff.is_empty()
             && self.const_value_changes.is_empty()
+            && self.type_annotation_changes.is_empty()
             && self.callback_body_changes.is_empty()
             && self.compatible_modified.is_empty()
             && self.moved.is_empty()
@@ -400,7 +423,7 @@ pub(crate) fn build_review_hook_json(
     dir: &str,
     strict_const_values: bool,
 ) -> HookJsonBuild {
-    build_review_hook_json_for_diff(result, dir, strict_const_values, "", &[])
+    build_review_hook_json_for_diff(result, dir, strict_const_values, false, "", &[])
 }
 
 /// `diff_input` / `diff_files` はレビュー対象の diff。呼び出し側が diff 内で解決済みか
@@ -409,6 +432,7 @@ pub(crate) fn build_review_hook_json_for_diff(
     result: &ReviewResult,
     dir: &str,
     strict_const_values: bool,
+    strict_type_annotations: bool,
     diff_input: &str,
     diff_files: &[crate::models::impact::DiffFile],
 ) -> HookJsonBuild {
@@ -438,6 +462,21 @@ pub(crate) fn build_review_hook_json_for_diff(
             .iter()
             .map(|m| (m.file.as_str(), m.name.as_str())),
     );
+    // 型注釈の互換性は未確認。strict でも参照の分類は保ち、専用 policy で確認を求める。
+    let annotation_info_symbols: std::collections::HashSet<(&str, &str)> = result
+        .api_changes
+        .type_annotation_changes
+        .iter()
+        .map(|m| (m.change.file.as_str(), m.change.name.as_str()))
+        .chain(
+            result
+                .api_changes
+                .unchanged_type_annotations
+                .iter()
+                .map(|m| (m.file.as_str(), m.name.as_str())),
+        )
+        .collect();
+    informational_modified_api_symbols.extend(annotation_info_symbols.iter().copied());
     if !strict_const_values {
         informational_modified_api_symbols.extend(
             result
@@ -504,6 +543,18 @@ pub(crate) fn build_review_hook_json_for_diff(
                         && !informational_modified_api_symbols
                             .contains(&(change.path.as_str(), sym))
                 )
+            },
+        );
+        // 型注釈だけの変更に由来する読み取り参照も、確認箇所として残す。
+        accumulate_hook_impacts(
+            &mut informational,
+            &change.path,
+            &change.impacted_callers,
+            &resolution,
+            dir,
+            |sym| {
+                affected_change_types.get(sym).copied() == Some("modified")
+                    && annotation_info_symbols.contains(&(change.path.as_str(), sym))
             },
         );
         // informational: modified 由来のみを低信号として残す。
@@ -581,6 +632,9 @@ pub(crate) fn build_review_hook_json_for_diff(
         }
         if strict_const_values && !api.callback_body_changes.is_empty() {
             blocking_categories.push(HookBlockingCategory::ApiCallbackBody);
+        }
+        if strict_type_annotations && !api.type_annotation_changes.is_empty() {
+            blocking_categories.push(HookBlockingCategory::PolicyTypeAnnotation);
         }
         has_any_output = true;
         hook_obj.insert(
@@ -688,11 +742,18 @@ pub(crate) fn review_hook_output(
     result: &ReviewResult,
     dir: &str,
     strict_const_values: bool,
+    strict_type_annotations: bool,
     diff_input: &str,
     diff_files: &[crate::models::impact::DiffFile],
 ) -> Result<()> {
-    let build =
-        build_review_hook_json_for_diff(result, dir, strict_const_values, diff_input, diff_files);
+    let build = build_review_hook_json_for_diff(
+        result,
+        dir,
+        strict_const_values,
+        strict_type_annotations,
+        diff_input,
+        diff_files,
+    );
     let Some(hook_output) = build.value else {
         return Ok(());
     };

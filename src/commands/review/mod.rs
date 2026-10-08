@@ -46,6 +46,7 @@ pub struct CmdReviewOpts<'a> {
     pub extra_exclude_globs: &'a [String],
     pub dead_scope: crate::cli::DeadScope,
     pub strict_public_const_values: bool,
+    pub strict_public_type_annotations: bool,
     pub include_wip_dead: bool,
     /// 生成物を cochange の起点・候補に残すか (グローバル `--include-generated` の解決結果)。
     pub include_generated: bool,
@@ -70,6 +71,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
         extra_exclude_globs,
         dead_scope,
         strict_public_const_values,
+        strict_public_type_annotations,
         include_wip_dead,
         include_generated,
     } = opts;
@@ -92,6 +94,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
                     output,
                     dir,
                     strict_public_const_values,
+                    strict_public_type_annotations,
                     Some(skip),
                     Vec::new(),
                 );
@@ -111,6 +114,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
             output,
             dir,
             strict_public_const_values,
+            strict_public_type_annotations,
             None,
             truncations,
         );
@@ -136,6 +140,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
             output,
             dir,
             strict_public_const_values,
+            strict_public_type_annotations,
             None,
             truncations,
         );
@@ -226,6 +231,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
             &result,
             dir,
             strict_public_const_values,
+            strict_public_type_annotations,
             &diff_input,
             &diff_files,
         );
@@ -257,6 +263,7 @@ fn emit_review_short_circuit(
     output: OutputOptions,
     dir: &str,
     strict_const_values: bool,
+    strict_type_annotations: bool,
     skipped: Option<SkipInfo>,
     truncations: Vec<crate::models::truncation::TruncationInfo>,
 ) -> Result<()> {
@@ -268,7 +275,14 @@ fn emit_review_short_circuit(
 
     if hook {
         // 解析へ進まない経路なので impact も空 = diff 内の解決判定も要らない。
-        return review_hook_output(&result, dir, strict_const_values, "", &[]);
+        return review_hook_output(
+            &result,
+            dir,
+            strict_const_values,
+            strict_type_annotations,
+            "",
+            &[],
+        );
     }
 
     let text = serialize_cli_document(&result, output)?;
@@ -384,12 +398,21 @@ mod review_command_tests {
     /// `--hook` の短絡は 3 経路 (git 管理外 / 空 diff / CI 言語のみ) すべてで無出力 Ok。
     #[test]
     fn short_circuit_is_silent_under_hook() {
-        emit_review_short_circuit(true, OutputOptions::default(), ".", false, None, Vec::new())
-            .expect("hook short-circuit must succeed");
         emit_review_short_circuit(
             true,
             OutputOptions::default(),
             ".",
+            false,
+            false,
+            None,
+            Vec::new(),
+        )
+        .expect("hook short-circuit must succeed");
+        emit_review_short_circuit(
+            true,
+            OutputOptions::default(),
+            ".",
+            false,
             false,
             Some(SkipInfo::not_git_repository()),
             Vec::new(),
