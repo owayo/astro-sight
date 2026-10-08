@@ -863,6 +863,15 @@ pub(crate) fn classify_signature_change(
         state.buckets.compatible_modified.push(compat);
         return;
     }
+    if let Some(compat) = detect_trailing_optional_params_removed_compatible_mod(
+        ref_index,
+        &site,
+        sources,
+        &mut state.closure_caches.optional_removal,
+    ) {
+        state.buckets.compatible_modified.push(compat);
+        return;
+    }
     // TS/TSX の引数 object type literal へ optional プロパティを追加しただけなら、
     // 既存呼び出しが渡す object はそのまま受理されるため compatible_modified として扱う。
     if let Some(compat) = detect_optional_object_props_compatible_mod(&site, sources) {

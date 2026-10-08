@@ -236,7 +236,7 @@ fn has_default_specifier(clause: Node<'_>, source: &[u8]) -> bool {
     })
 }
 
-fn static_specifier<'a>(node: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+pub(super) fn static_specifier<'a>(node: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
     let mut cursor = node.walk();
     if node
         .named_children(&mut cursor)
@@ -253,7 +253,7 @@ fn static_specifier<'a>(node: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
 const JS_TS_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
 
 /// 候補集合だけに照合する。ディレクトリ外への探索や basename だけの照合はしない。
-fn resolve_relative_specifier(
+pub(super) fn resolve_relative_specifier(
     importer: &str,
     specifier: &str,
     targets: &HashMap<String, Vec<String>>,

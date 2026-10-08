@@ -191,6 +191,8 @@ src/engine/symbols/mod.rs changed [extract_symbols]:
 
 When every caller has been updated, `impact` prints nothing and exits 0. Otherwise it prints the list above to stderr and exits 1. Line numbers in this text are 1-based so that an editor can open them directly.
 
+`review --hook` reports TS/TSX trailing optional/default parameter removal as `mod_compat` with reason `trailing_optional_params_removed` when unchanged remaining parameters, an explicit unchanged return annotation, and a closed inventory of direct internal calls prove the calls still fit. Their references remain in `impact_info`. Aliases, dynamic or ambiguous dependencies, and incomplete source coverage keep the existing conservative classification. This proof covers calls in the analyzed static repository; it does not guarantee external compatibility or equivalent runtime behavior.
+
 The full reference is split by topic:
 
 - Every command with its options, batch mode, `session`, and the MCP server: [docs/usage.md](docs/usage.md)

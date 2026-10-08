@@ -477,6 +477,13 @@ pub(crate) fn build_review_hook_json_for_diff(
         )
         .collect();
     informational_modified_api_symbols.extend(annotation_info_symbols.iter().copied());
+    let optional_removal_info_symbols: std::collections::HashSet<(&str, &str)> = result
+        .api_changes
+        .compatible_modified
+        .iter()
+        .filter(|m| m.reason == "trailing_optional_params_removed")
+        .map(|m| (m.file.as_str(), m.name.as_str()))
+        .collect();
     if !strict_const_values {
         informational_modified_api_symbols.extend(
             result
@@ -545,7 +552,7 @@ pub(crate) fn build_review_hook_json_for_diff(
                 )
             },
         );
-        // 型注釈だけの変更に由来する読み取り参照も、確認箇所として残す。
+        // 型注釈変更と省略可能引数削除の参照を、確認箇所として残す。
         accumulate_hook_impacts(
             &mut informational,
             &change.path,
@@ -554,7 +561,8 @@ pub(crate) fn build_review_hook_json_for_diff(
             dir,
             |sym| {
                 affected_change_types.get(sym).copied() == Some("modified")
-                    && annotation_info_symbols.contains(&(change.path.as_str(), sym))
+                    && (annotation_info_symbols.contains(&(change.path.as_str(), sym))
+                        || optional_removal_info_symbols.contains(&(change.path.as_str(), sym)))
             },
         );
         // informational: modified 由来のみを低信号として残す。
