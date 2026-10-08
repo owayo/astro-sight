@@ -1,6 +1,100 @@
 //! refs サブコマンド (参照検索) の統合テスト。
 
 #[test]
+fn refs_swift_declarations_are_definitions_without_reclassifying_uses() {
+    let repo = TestRepo::new();
+    repo.write(
+        "sample.swift",
+        include_str!("../fixtures/swift_declaration_refs.swift"),
+    );
+
+    let declarations = [
+        ("required", &[1, 19][..]),
+        ("draw", &[2, 20]),
+        ("Pixels", &[5]),
+        ("draft", &[8]),
+        ("final", &[8]),
+        ("maxRetries", &[12]),
+        ("scale", &[13]),
+        ("computedScale", &[14]),
+        ("sharedScale", &[15]),
+        ("total", &[16]),
+        ("label", &[17]),
+        ("cached", &[18]),
+        ("globalScale", &[23]),
+        ("first", &[24]),
+        ("second", &[24]),
+        ("left", &[25]),
+        ("right", &[25]),
+        ("labeledLeft", &[26]),
+        ("labeledRight", &[26]),
+        ("local", &[29]),
+        ("mutable", &[30]),
+    ];
+    for (name, expected_lines) in declarations {
+        let output = repo.run_json("refs", &["--name", name]);
+        let refs = output["refs"].as_array().unwrap();
+        let mut actual_lines: Vec<_> = refs
+            .iter()
+            .filter(|reference| reference["kind"] == "def")
+            .map(|reference| reference["ln"].as_u64().unwrap())
+            .collect();
+        actual_lines.sort_unstable();
+        assert_eq!(actual_lines, expected_lines, "{name}: {output}");
+    }
+
+    for (name, expected_refs) in [
+        ("label", 0),
+        ("maxRetries", 1),
+        ("draft", 1),
+        ("draw", 1),
+        ("Pixels", 1),
+        ("mutable", 2),
+        ("x", 2),
+        ("y", 2),
+    ] {
+        let output = repo.run_json("refs", &["--name", name]);
+        let actual = output["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|reference| reference["kind"] == "ref")
+            .count();
+        assert_eq!(actual, expected_refs, "{name}: {output}");
+    }
+    let int_refs = repo.run_json("refs", &["--name", "Int"]);
+    assert!(
+        int_refs["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|reference| reference["kind"] == "ref"),
+        "型注釈と typealias の右辺は参照: {int_refs}"
+    );
+
+    let batch = cargo_bin()
+        .args(["refs", "--names", "draw,label,draft,x", "--dir"])
+        .arg(repo.root())
+        .output()
+        .unwrap();
+    assert!(batch.status.success());
+    for (row, name) in String::from_utf8(batch.stdout)
+        .unwrap()
+        .lines()
+        .zip(["draw", "label", "draft", "x"])
+    {
+        let parsed: serde_json::Value = serde_json::from_str(row).unwrap();
+        assert_eq!(parsed, repo.run_json("refs", &["--name", name]));
+    }
+
+    let dead = repo.run_json("dead-code", &[]);
+    assert!(
+        dead["dead_symbols"].as_array().unwrap().is_empty(),
+        "protocol 要件と実装は呼び出しがなくても未使用と断定しない: {dead}"
+    );
+}
+
+#[test]
 fn refs_python_lambda_binding_has_definition_and_real_use() {
     let repo = TestRepo::new();
     repo.write("sample.py", "normalize = lambda text: text.strip()\nprint(normalize(' A '))\nplain = 42\nfor item in [1]:\n    conditional = lambda text: text\ndef outer():\n    local = lambda text: text\n    return local('x')\n_private = lambda text: text\nchain = another = lambda text: text\n");

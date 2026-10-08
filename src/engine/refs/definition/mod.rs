@@ -176,11 +176,13 @@ fn is_go_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bool {
 /// Swift: 宣言名は「`name` フィールドのうち identifier 系のノード」で判定する。
 ///
 /// tree-sitter-swift の `function_declaration` は関数名と戻り値型の**双方**を `name`
-/// フィールドで返す:
-/// `(function_declaration name: (simple_identifier) … name: (user_type (type_identifier)))`
-/// `child_by_field_name` は最初の一致を返すため結果的に関数名へ当たるが、その順序依存に
-/// 頼らず kind まで確認する (戻り値型は `user_type` で identifier 系ではない)。
+/// フィールドで返す。`enum_entry` は複数の case 名を `name` として返す。
+/// すべての `name` を調べ、identifier 系だけを定義にする (戻り値型は
+/// `user_type` で identifier 系ではない)。
 fn is_swift_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> bool {
+    if is_swift_property_pattern_binding(node) {
+        return true;
+    }
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -190,8 +192,50 @@ fn is_swift_definition_context(node: Node<'_>, definition_kinds: &[&str]) -> boo
     let mut cursor = parent.walk();
     parent
         .children_by_field_name("name", &mut cursor)
-        .find(|child| is_identifier_kind(child.kind()))
-        .is_some_and(|name| name.id() == node.id())
+        .any(|child| is_identifier_kind(child.kind()) && child.id() == node.id())
+}
+
+/// プロパティ宣言の `name: (pattern ...)` が束縛する識別子だけを def にする。
+/// タプルのラベルや型注釈・初期化子は pattern の束縛位置ではない。
+fn is_swift_property_pattern_binding(node: Node<'_>) -> bool {
+    if node.kind() != "simple_identifier" {
+        return false;
+    }
+    let Some(mut pattern) = node.parent() else {
+        return false;
+    };
+    if pattern.kind() != "pattern" {
+        return false;
+    }
+    if let Some(bound) = pattern.child_by_field_name("bound_identifier") {
+        if bound.id() != node.id() {
+            return false;
+        }
+    } else if pattern.named_child_count() != 1
+        || pattern
+            .named_child(0)
+            .is_none_or(|child| child.id() != node.id())
+    {
+        return false;
+    }
+
+    while let Some(parent) = pattern.parent() {
+        if parent.kind() == "pattern" {
+            pattern = parent;
+            continue;
+        }
+        if !matches!(
+            parent.kind(),
+            "property_declaration" | "protocol_property_declaration"
+        ) {
+            return false;
+        }
+        let mut cursor = parent.walk();
+        return parent
+            .children_by_field_name("name", &mut cursor)
+            .any(|name| name.id() == pattern.id());
+    }
+    false
 }
 
 /// Kotlin: tree-sitter-kotlin の宣言ノードは `name` フィールドを持たず、最初の
@@ -401,6 +445,11 @@ pub(crate) fn definition_node_kinds(lang_id: LangId) -> &'static [&'static str] 
             "function_declaration",
             "class_declaration",
             "protocol_declaration",
+            "property_declaration",
+            "protocol_property_declaration",
+            "typealias_declaration",
+            "enum_entry",
+            "protocol_function_declaration",
         ],
         LangId::CSharp => &[
             "namespace_declaration",
