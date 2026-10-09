@@ -179,6 +179,8 @@ astro-sight refs --name extract_symbols --dir .
 
 `path` is relative to `--dir`, and `ln` and `col` are 0-based. When a name has more than 100 references or the output would exceed about 3,000 tokens, the output stops there and a `result_summary` describes the omitted references; `--max-results` and `--token-budget` change the limits (`unlimited` removes them).
 
+Source files in a language astro-sight cannot parse (`.vue`, `.applescript`, ...) are listed in `truncations` instead of being skipped silently, and a scope where no file can be parsed returns `UNSUPPORTED_LANGUAGE` rather than an empty list. See [Files astro-sight Cannot Parse](docs/usage.md#files-astro-sight-cannot-parse).
+
 ### Check Unresolved Impacts
 
 ```bash

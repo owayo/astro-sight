@@ -234,6 +234,30 @@ Output (`astro-sight refs --name extract_symbols --dir .`):
 
 `path` is relative to `--dir`. `--name` does not accept an empty string, and `--names` with only empty elements (for example `",,,"`) returns `INVALID_REQUEST`. `--dir` accepts only a directory; a file path also returns `INVALID_REQUEST`.
 
+### Files astro-sight Cannot Parse
+
+`refs` searches only the [languages astro-sight parses](languages.md). Source files in the search scope that have no parser are not dropped silently: they are listed in `truncations` with `reason: "unanalyzable_source"`, one entry per extension (the same report as `dead-code`). References inside them were not searched, so a zero result does not mean the name is unused there.
+
+```json
+{"symbol":"greetUser","refs":[],"truncations":[{"reason":"unanalyzable_source","message":"1 \".applescript\" file(s) were not analyzed (no parser for this language); references inside them are not counted (e.g. sample.applescript)","detail":{"extension":"applescript","count":1,"examples":["sample.applescript"]}}]}
+```
+
+- Only extensions that are certainly program or template languages are reported (`.vue` / `.svelte` / `.applescript` / `.scala` / `.lua`, and so on). Images, documents, and data are not, so that the report does not bury the sources that matter
+- The report is attached whether or not the name was found. `refs --names` attaches it once, to the first record, like `skipped`; repeating it for every name would spend the output budget on the report
+- The search scope is what `--dir` and `--glob` select. `--glob "**/*.rs"` leaves `.vue` files out of the scope, so they are not reported
+
+When the scope contains files but **none of them can be searched**, `refs` fails with `UNSUPPORTED_LANGUAGE` (exit code 1) instead of returning an empty list, as `symbols --path` does for a single file. This counts every matched file, including documents and images, and the message lists the extensions and up to three paths. The same applies to `refs --names`, `session`, and MCP.
+
+```bash
+astro-sight refs --name greetUser --dir . --glob "*.applescript"
+```
+
+```json
+{"error":{"code":"UNSUPPORTED_LANGUAGE","message":"No file in a language astro-sight can parse is in the search scope: 1 file(s) matched (.applescript: 1; e.g. sample.applescript), so references cannot be searched"}}
+```
+
+The error is not raised when the scope matches no file at all (an empty directory, or a glob that matches nothing), when it contains generated files excluded by default (reported in `skipped`), when an extensionless file could not be read to look for a shebang, or when it contains Angular templates linked from a component. In those cases the search runs as usual, and the result is an empty list only when nothing is found.
+
 ### Bash Variables
 
 Bash searches include variable assignments, `$NAME` / `${NAME}` expansions, and names in `local`, `export`, `declare`, `typeset`, and `readonly`. Single and batch searches return the same occurrences. Comments and single-quoted strings are excluded. Assignments and expansions do not count as uses of a same-named shell function in `dead-code` or API change analysis. Names passed to declaration commands remain conservative function references there, because these commands and even `builtin` / `command` can be overridden by functions. In public search output, a recognized declaration name is a definition unless the command is overridden in the same file or the file has parse errors. Function options such as `export -f` and dynamic declaration options are references. Commands such as `read NAME` and `printf -v NAME` retain their existing word-based classification.
@@ -270,7 +294,7 @@ A frequent identifier returns thousands of results in one call, and the token co
 
 `by_kind` / `by_lang` / `files` describe **only the omitted results** (a distribution that included the shown results would not let you recover the omitted part by subtraction). `by_lang` helps in repositories that mix several languages (polyglot). Bare-name matches pour in across languages (measured: in one polyglot repository, 2,521 of the 2,522 references to the name `search` were in other languages), and seeing the language mix tells you whether to narrow the search again with `--glob`. `files` has its own limit; the excess is folded into `other_files` and reported in `rollup_truncated` (so that the summary does not become a second output explosion).
 
-`complete_input` tells whether `total` counts every input that could have been analyzed. It is false when files were excluded from the scan as generated, or failed to read or parse, which means `total` is not the true total for the whole repository.
+`complete_input` tells whether `total` counts every input in the search scope. It is false when files were excluded from the scan as generated, failed to read or parse, or are sources in a language astro-sight cannot parse (`truncations`), which means `total` is not the true total for the whole repository. Files with an extension that is not recognized as a source (see above) are not counted against it.
 
 Both single and multi-symbol searches merge results directly with a fold/reduce per worker, without keeping an intermediate `Vec` per file for all files. For a symbol with a very large number of references the output itself is large, so narrow the languages with `--glob`, or lower the number of parallel workers with `ASTRO_SIGHT_BATCH_WORKERS` when needed (the default is the number of available CPUs).
 

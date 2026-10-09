@@ -173,6 +173,8 @@ astro-sight refs --name extract_symbols --dir .
 
 `path` は `--dir` からの相対パスで、`ln` と `col` は 0 始まりです。参照が 100 件を超えるか、出力が約 3,000 トークンを超える名前では、そこで出力を打ち切り、省いた参照の内訳を `result_summary` に出します。上限は `--max-results` と `--token-budget` で変えられます (`unlimited` で上限なし)。
 
+解析できない言語のソース (`.vue`、`.applescript` など) は黙って飛ばさず `truncations` に並べます。どのファイルも解析できない範囲では、空の結果ではなく `UNSUPPORTED_LANGUAGE` を返します。詳しくは [解析できない言語のファイル](docs/usage.ja.md#解析できない言語のファイル) を参照してください。
+
 ### 未解決の影響を確かめる
 
 ```bash
