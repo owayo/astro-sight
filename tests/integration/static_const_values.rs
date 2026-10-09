@@ -228,6 +228,63 @@ fn static_const_values_formatting_is_not_reported_or_blocked_by_strict_policy() 
 }
 
 #[test]
+fn static_const_values_untyped_array_count_changes_follow_element_shapes() {
+    for extension in ["js", "ts", "tsx"] {
+        for (old, new) in [
+            ("['s', 'm', 'l']", "['s', 'm']"),
+            ("[1]", "[2, 3]"),
+            ("[1, 'a', 2]", "['b', 3, 4, 'c']"),
+            ("{ sizes: ['s', 'm'] }", "{ sizes: ['l'] }"),
+            ("[[1, 2], ['a']]", "[['b'], [3]]"),
+            ("[[1], [2]]", "[[1, 2]]"),
+        ] {
+            let repo = TestRepo::new();
+            repo.init_git();
+            let file = format!("api.{extension}");
+            repo.write(&file, format!("export const VALUE = {old};\n"));
+            repo.write(
+                format!("use.{extension}"),
+                "import { VALUE } from './api';\nexport function read() { return VALUE; }\n",
+            );
+            repo.commit_all("initial");
+            repo.write(&file, format!("export const VALUE = {new};\n"));
+
+            let (output, json) = hook(&repo, false);
+            assert!(
+                output.status.success(),
+                "{extension}: {old} -> {new}: {json}"
+            );
+            assert!(
+                json["api"]["const_value"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|change| change["n"] == "VALUE"),
+                "{extension}: {old} -> {new}: {json}"
+            );
+            assert!(
+                json["impact_info"]
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty()),
+                "{extension}: {old} -> {new}: {json}"
+            );
+            assert!(
+                json["impacts"]
+                    .as_array()
+                    .is_none_or(|items| items.is_empty()),
+                "{extension}: {old} -> {new}: {json}"
+            );
+            assert!(
+                json["blocking_categories"]
+                    .as_array()
+                    .is_none_or(|items| items.is_empty()),
+                "{extension}: {old} -> {new}: {json}"
+            );
+        }
+    }
+}
+
+#[test]
 fn static_const_values_unsafe_changes_keep_blocking_api_mod() {
     for (old, new) in [
         ("{ a: 1 }", "{ a: 2, b: 3 }"),
@@ -243,7 +300,12 @@ fn static_const_values_unsafe_changes_keep_blocking_api_mod() {
         ("{ a: 1, [key]: 2 }", "{ a: 2, [key]: 2 }"),
         ("{ a: 1, a: 2 }", "{ a: 3, a: 4 }"),
         ("{ __proto__: { a: 1 } }", "{ __proto__: { a: 2 } }"),
-        ("[1, 2]", "[3, 4, 5]"),
+        ("[1, 'a']", "[2]"),
+        ("[]", "[1]"),
+        ("[1]", "[]"),
+        ("[1, 2] as const", "[3] as const"),
+        ("[1 as const, 2 as const]", "[3 as const]"),
+        ("{ sizes: [1, 2] } as const", "{ sizes: [3] } as const"),
         ("[1,,2]", "[3,,4]"),
         ("{ a: 1 } satisfies Shape", "{ a: 2 } satisfies Shape"),
     ] {

@@ -1,6 +1,6 @@
 //! 型注釈のない const の静的な object/array の構造を比較する。
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use tree_sitter::Node;
 
@@ -12,7 +12,7 @@ use crate::language::LangId;
 const MAX_DEPTH: usize = 32;
 const MAX_NODES: usize = 4096;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum ScalarKind {
     Number,
     BigInt,
@@ -27,6 +27,13 @@ enum StaticShape {
     Object(Vec<(String, StaticShape)>),
     Array(Vec<StaticShape>),
     ConstAssert(Box<StaticShape>),
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum WidenedShape {
+    Scalar(ScalarKind),
+    Object(Vec<(String, WidenedShape)>),
+    Array(Vec<WidenedShape>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -71,7 +78,7 @@ pub(super) fn classify_static_const_change(
     ) else {
         return StaticConstChange::NotApplicable;
     };
-    if old != new {
+    if !same_contract(&old, &new) {
         return StaticConstChange::NotApplicable;
     }
     let (Some(old_tokens), Some(new_tokens)) = (
@@ -80,10 +87,45 @@ pub(super) fn classify_static_const_change(
     ) else {
         return StaticConstChange::NotApplicable;
     };
-    if old_tokens == new_tokens {
+    if old.shape == new.shape && old_tokens == new_tokens {
         StaticConstChange::Unchanged
     } else {
         StaticConstChange::ValueOnly
+    }
+}
+
+fn same_contract(old: &StaticConstContract, new: &StaticConstContract) -> bool {
+    if old.prefix != new.prefix || old.suffix != new.suffix {
+        return false;
+    }
+    if old.shape == new.shape {
+        return true;
+    }
+    matches!(
+        (widened_shape(&old.shape), widened_shape(&new.shape)),
+        (Some(old), Some(new)) if old == new
+    )
+}
+
+fn widened_shape(shape: &StaticShape) -> Option<WidenedShape> {
+    match shape {
+        StaticShape::Scalar(kind) => Some(WidenedShape::Scalar(*kind)),
+        StaticShape::Object(properties) => Some(WidenedShape::Object(
+            properties
+                .iter()
+                .map(|(key, value)| Some((key.clone(), widened_shape(value)?)))
+                .collect::<Option<Vec<_>>>()?,
+        )),
+        StaticShape::Array(elements) => Some(WidenedShape::Array(
+            elements
+                .iter()
+                .map(widened_shape)
+                .collect::<Option<BTreeSet<_>>>()?
+                .into_iter()
+                .collect(),
+        )),
+        // Literal types and readonly tuples cannot be reduced to a set of widened shapes.
+        StaticShape::ConstAssert(_) => None,
     }
 }
 
@@ -397,6 +439,34 @@ mod tests {
 
     fn initializer(value: &str, lang: LangId) -> Option<StaticConstContract> {
         contract(&format!("export const VALUE = {value};"), lang)
+    }
+
+    #[test]
+    fn untyped_arrays_compare_distinct_widened_element_shapes() {
+        for (old, new) in [
+            ("['s', 'm', 'l']", "['s', 'm']"),
+            ("[1]", "[2, 3]"),
+            ("[1, 'a', 2]", "['b', 3, 4, 'c']"),
+            ("{ sizes: ['s', 'm'] }", "{ sizes: ['l'] }"),
+            ("[[1, 2], ['a']]", "[['b'], [3]]"),
+            ("[[1], [2]]", "[[1, 2]]"),
+        ] {
+            let old = initializer(old, LangId::Typescript).unwrap();
+            let new = initializer(new, LangId::Typescript).unwrap();
+            assert!(same_contract(&old, &new), "{old:?} -> {new:?}");
+        }
+        for (old, new) in [
+            ("[1, 'a']", "[2]"),
+            ("[]", "[1]"),
+            ("[1]", "[]"),
+            ("[1, 2] as const", "[3] as const"),
+            ("[1 as const, 2 as const]", "[3 as const]"),
+            ("{ sizes: [1, 2] } as const", "{ sizes: [3] } as const"),
+        ] {
+            let old = initializer(old, LangId::Typescript).unwrap();
+            let new = initializer(new, LangId::Typescript).unwrap();
+            assert!(!same_contract(&old, &new), "{old:?} -> {new:?}");
+        }
     }
 
     #[test]
