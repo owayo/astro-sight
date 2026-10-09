@@ -232,6 +232,35 @@ astro-sight refs --name "new" --dir . --max-results unlimited --token-budget unl
 
 `path` は `--dir` からの相対パスで返す。`--name` は空文字を受け付けない。`--names` も空要素のみ（例: `",,,"`）の場合は `INVALID_REQUEST` を返す。`--dir` にはディレクトリのみ指定でき、ファイルパスを渡した場合も `INVALID_REQUEST` を返す。
 
+### 解析できない言語のファイル
+
+`refs` が検索するのは [astro-sight が解析できる言語](languages.ja.md) のファイルだけである。検索範囲にある、解析できない言語のソースは黙って落とさず、`truncations` に `reason: "unanalyzable_source"` として拡張子ごとに 1 件ずつ出す（`dead-code` と同じ申告）。そのファイルの中の参照は検索していないため、0 件でも、そこで使われている可能性は残る。
+
+```json
+{"symbol":"greetUser","refs":[],"truncations":[{"reason":"unanalyzable_source","message":"1 \".applescript\" file(s) were not analyzed (no parser for this language); references inside them are not counted (e.g. sample.applescript)","detail":{"extension":"applescript","count":1,"examples":["sample.applescript"]}}]}
+```
+
+- 申告するのは、プログラム言語かテンプレート言語だと確実に言える拡張子だけである（`.vue` / `.svelte` / `.applescript` / `.scala` / `.lua` など）。画像・文書・データまで並べると、本当に見落としているソースが埋もれるため
+- 名前が見つかったかどうかに関係なく付ける。`refs --names` では `skipped` と同じく先頭のレコードにだけ付ける。名前ごとに繰り返すと、申告だけで出力の予算を使い切るため
+- 検索範囲は `--dir` と `--glob` で選んだファイルである。`--glob "**/*.rs"` を付ければ `.vue` は範囲に入らないので申告しない
+
+検索範囲にファイルはあるのに**どれも検索できない**ときは、空の結果ではなく `UNSUPPORTED_LANGUAGE` のエラーを返す（終了コード 1）。単一ファイルに対する `symbols --path` と同じ扱いである。この判定には文書や画像も含めて、範囲に入ったすべてのファイルを数える。メッセージには拡張子ごとの件数と、パスを 3 件まで載せる。`refs --names`・`session`・MCP も同じである。
+
+```bash
+astro-sight refs --name greetUser --dir . --glob "*.applescript"
+```
+
+```json
+{"error":{"code":"UNSUPPORTED_LANGUAGE","message":"No file in a language astro-sight can parse is in the search scope: 1 file(s) matched (.applescript: 1; e.g. sample.applescript), so references cannot be searched"}}
+```
+
+次の場合はエラーにせず、通常どおり検索する（見つからなければ空の結果になる）。
+
+- 範囲に 1 件もファイルが無い（空のディレクトリや、何にも当たらない glob）
+- 既定で除外した生成物がある（`skipped` で申告する）
+- 拡張子の無いファイルの先頭を読めず、shebang を確かめられなかった
+- component に紐付いた Angular テンプレートがある
+
 ### Bash の変数
 
 Bash では変数代入、`$NAME` / `${NAME}` 展開、`local` / `export` / `declare` / `typeset` / `readonly` の名前も検索する。単一検索と一括検索で同じ出現を返し、コメントと単一引用符内の文字列は除く。代入と展開は、`dead-code` や API 差分で同名シェル関数の使用とは数えない。宣言コマンドに渡された名前は、コマンド自身や `builtin` / `command` も関数に上書きできるため、意味解析では保守的に関数参照として残す。公開検索では通常の宣言名を定義として返すが、同じファイルにコマンドの上書きがある場合や構文エラーがある場合は参照として残す。関数オプションや動的な宣言オプションも参照とする。`read NAME` / `printf -v NAME` などは従来の単語単位の分類を維持する。
@@ -268,7 +297,7 @@ Bash では変数代入、`$NAME` / `${NAME}` 展開、`local` / `export` / `dec
 
 `by_kind` / `by_lang` / `files` は **省略された分だけ**の分布（本体込みの総分布にすると省略分を引き算で復元できない）。`by_lang` は、複数の言語が混在する（polyglot）リポジトリで効く。名前だけの一致（bare name）は言語をまたいで大量に出る（実測: ある polyglot リポジトリで、名前 `search` の参照 2,522 件のうち 2,521 件が別言語）。言語構成が見えれば、`--glob` で絞り直すかどうかを判断できる。`files` 自体も上限を持ち、超過分は `other_files` へ畳んで `rollup_truncated` で申告する（サマリが第二の出力爆発を起こさないため）。
 
-`complete_input` は、解析対象になり得た入力を `total` がすべて数えているかどうかを表す。生成物として走査から外したファイルや、読み込み・parse に失敗したファイルがあれば false になり、`total` がリポジトリ全体の真の総数ではないことを示す。
+`complete_input` は、検索範囲の入力を `total` がすべて数えているかどうかを表す。生成物として走査から外したファイル、読み込み・parse に失敗したファイル、解析できない言語のソース（`truncations`）があれば false になり、`total` がリポジトリ全体の真の総数ではないことを示す。ソースだと判定しない拡張子のファイル（前述）は数えない。
 
 単一検索と複数シンボル検索はいずれも、ワーカーごとの fold/reduce で結果を直接統合し、ファイルごとの中間 `Vec` を全ファイル分保持しない。非常に多くの参照が返るシンボルでは出力自体が大きくなるため、`--glob` で対象言語を絞るか、必要に応じて `ASTRO_SIGHT_BATCH_WORKERS` で並列ワーカー数を下げる（既定は利用可能 CPU 数）。
 

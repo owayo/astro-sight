@@ -210,6 +210,7 @@ where
             symbol: result.symbol.clone(),
             references: references[..k].to_vec(),
             skipped: result.skipped.clone(),
+            truncations: result.truncations.clone(),
             result_summary: summary.cloned(),
             failed_files: result.failed_files,
         };
@@ -250,6 +251,7 @@ where
                     symbol: r.symbol.clone(),
                     references: r.references[..alloc[i]].to_vec(),
                     skipped: r.skipped.clone(),
+                    truncations: r.truncations.clone(),
                     result_summary: summaries[i].clone(),
                     failed_files: r.failed_files,
                 })
@@ -624,6 +626,7 @@ mod refs_tests {
                 })
                 .collect(),
             skipped: None,
+            truncations: Vec::new(),
             result_summary: None,
             failed_files,
         }
@@ -658,6 +661,55 @@ mod refs_tests {
             }
         }
         assert!(batch.iter().any(|r| r.result_summary.is_some()));
+    }
+
+    /// 対応言語でないソースの申告 (`truncations`) があれば `complete_input` を false にし、
+    /// 申告は採寸用の probe にも載せる (載せないと、申告の分だけ予算を黙って超える)。
+    #[test]
+    fn unanalyzable_sources_make_the_input_incomplete_and_count_toward_the_budget() {
+        let truncation = || {
+            vec![
+                crate::models::truncation::TruncationInfo::unanalyzable_source(
+                    "vue",
+                    1,
+                    &["src/App.vue".to_string()],
+                ),
+            ]
+        };
+
+        // 採寸 (描画) は予算があるときだけ走る。
+        let budget = ResultLimits {
+            max_results: Some(10),
+            token_budget: Some(3000),
+        };
+        let mut single = refs_result(50, 0);
+        single.truncations = truncation();
+        let mut probes_with_truncations = 0;
+        apply_refs_limits(&mut single, budget, |probe| {
+            if !probe.truncations.is_empty() {
+                probes_with_truncations += 1;
+            }
+            Ok(serde_json::to_string(probe)?)
+        })
+        .expect("apply");
+        assert!(probes_with_truncations > 0, "probe が申告を落とした");
+        assert!(!single.result_summary.expect("summary").complete_input);
+        assert_eq!(single.truncations, truncation(), "申告は出力に残る");
+
+        // バッチの申告は先頭の結果にだけ付くが、後続の名前の summary も不完全になる。
+        let mut first = refs_result(50, 0);
+        first.truncations = truncation();
+        let mut batch = vec![first, refs_result(50, 0)];
+        apply_refs_batch_limits_json(&mut batch, count_limit()).expect("apply");
+        for result in &batch {
+            let summary = result.result_summary.as_ref().expect("summary");
+            assert!(!summary.complete_input, "{}: {summary:?}", result.symbol);
+        }
+
+        // 対照: 申告が無ければ complete_input は true のまま。
+        let mut complete = refs_result(50, 0);
+        apply_refs_limits_json(&mut complete, count_limit()).expect("apply");
+        assert!(complete.result_summary.expect("summary").complete_input);
     }
 
     /// 予算は渡した描画で採寸する。描画が重いほど出せる件数は減り、最終描画は予算内に収まる。

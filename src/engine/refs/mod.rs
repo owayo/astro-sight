@@ -23,6 +23,7 @@ use crate::engine::parser;
 use crate::language::{LangId, normalize_identifier};
 use crate::models::reference::{RefKind, SymbolReference};
 use crate::models::skip::SkippedFiles;
+use crate::models::truncation::TruncationInfo;
 
 pub(crate) use definition::rust::{
     RustPatternBindingCache, is_rust_shadowable_value_identifier,
@@ -30,7 +31,7 @@ pub(crate) use definition::rust::{
 };
 pub(crate) use files::detect_source_lang;
 pub use files::{
-    FileCollection, FileScanOptions, collect_files, collect_files_scan,
+    FileCollection, FileScanOptions, UnsupportedScope, collect_files, collect_files_scan,
     collect_files_scan_with_excludes, collect_files_with_excludes, merge_extra_files,
     skipped_files_from_relative,
 };
@@ -176,6 +177,30 @@ pub struct RefScan<T> {
     /// 走査対象に選んだが、読み込み・parse に失敗して参照を数えられなかったファイル数。
     /// 0 でなければ参照件数は入力の一部しか数えていない (`complete_input` = false)。
     pub failed_files: usize,
+    /// 対応言語でないソースとして走査から外したファイルの申告 (拡張子単位の
+    /// `unanalyzable_source`)。その中の参照は数えていない。
+    pub unanalyzable: Vec<TruncationInfo>,
+    /// 検索範囲にファイルはあるが、参照を検索できる入力 (対応言語のファイル・Angular
+    /// テンプレート) が 1 件も無かったときの内訳。利用者向けの面はエラーにする。
+    pub unsupported_only: Option<UnsupportedScope>,
+}
+
+/// 走査結果の入力の申告と、「検索できる入力が無い」判定をまとめて取り出す。
+///
+/// Angular テンプレートは通常のファイル収集とは別経路の入力なので、対象テンプレートが
+/// 1 件でもあれば (検索名やヒット数に関係なく) 検索できる入力があるとみなす。
+fn scan_coverage(
+    collection: &FileCollection,
+    dir: &Path,
+    angular_ctx: Option<&crate::engine::angular_template_refs::AngularBatchContext>,
+) -> (Vec<TruncationInfo>, Option<UnsupportedScope>) {
+    let template_inputs = angular_ctx.map_or(0, |ctx| ctx.input_count());
+    let unsupported_only = if template_inputs == 0 {
+        collection.unsupported_only(dir)
+    } else {
+        None
+    };
+    (collection.unanalyzable_truncations(dir), unsupported_only)
 }
 
 /// 指定シンボルへの参照をディレクトリ内のファイルから検索する。
@@ -200,6 +225,11 @@ pub fn find_references_with_scan(
 ) -> Result<RefScan<Vec<SymbolReference>>> {
     let collection = collect_files_scan(dir, glob_pattern, options)?;
     let skipped = collection.skipped(dir);
+    // Angular の前処理 (canonicalize / プロジェクト判定 / component の走査) は 1 回で済ます。
+    // 非 Angular リポでは `None` となり、template scan を完全に skip する。
+    let angular_ctx =
+        crate::engine::angular_template_refs::AngularBatchContext::prepare(dir, glob_pattern);
+    let (unanalyzable, unsupported_only) = scan_coverage(&collection, dir, angular_ctx.as_ref());
     let files = collection.files;
 
     let pool = build_bounded_pool()?;
@@ -235,14 +265,15 @@ pub fn find_references_with_scan(
 
     // Angular template (`*.component.html` / inline `template:`) のバインディング式から
     // の参照を追加する。TS の AST 参照だけでは外部テンプレート経由の呼び出しを取りこぼす
-    // ため (GitLab #18)。非 Angular プロジェクトでは空を返し副作用なし。
-    all_refs.extend(
-        crate::engine::angular_template_refs::find_angular_template_references(
-            symbol_name,
-            dir,
-            glob_pattern,
-        ),
-    );
+    // ため (GitLab #18)。
+    if let Some(ctx) = angular_ctx.as_ref() {
+        let names = [symbol_name.to_string()];
+        let template_refs =
+            crate::engine::angular_template_refs::find_angular_template_references_batch_with_context(
+                &names, ctx,
+            );
+        all_refs.extend(template_refs.into_iter().flatten());
+    }
 
     sort_references(&mut all_refs);
 
@@ -250,6 +281,8 @@ pub fn find_references_with_scan(
         references: all_refs,
         skipped,
         failed_files,
+        unanalyzable,
+        unsupported_only,
     })
 }
 
@@ -387,20 +420,23 @@ pub(crate) fn find_references_batch_with_scan_policy<const SHELL_VARS: bool>(
             references: HashMap::new(),
             skipped: None,
             failed_files: 0,
+            unanalyzable: Vec::new(),
+            unsupported_only: None,
         });
     }
 
     let collection = collect_files_scan(dir, glob_pattern, options)?;
     let skipped = collection.skipped(dir);
-    let files = collection.files;
-    let pool = build_bounded_pool()?;
-    let acs = build_batch_acs(symbol_names)?;
 
     // Angular template scan の前処理 (canonicalize / `is_angular_project` の全 dir 走査 /
     // `collect_component_templates` の全 `.ts` 走査) も 1 回で済ます。
     // 非 Angular リポでは `None` となり、template scan を完全に skip する。
     let angular_ctx =
         crate::engine::angular_template_refs::AngularBatchContext::prepare(dir, glob_pattern);
+    let (unanalyzable, unsupported_only) = scan_coverage(&collection, dir, angular_ctx.as_ref());
+    let files = collection.files;
+    let pool = build_bounded_pool()?;
+    let acs = build_batch_acs(symbol_names)?;
 
     // fold/reduce: ワーカーごとに Vec<Vec<SymbolReference>> を持ち、直接統合する。
     // 読み込み・parse に失敗したファイルは参照 0 件と区別できるよう件数だけ数える
@@ -463,6 +499,8 @@ pub(crate) fn find_references_batch_with_scan_policy<const SHELL_VARS: bool>(
         references: merged,
         skipped,
         failed_files,
+        unanalyzable,
+        unsupported_only,
     })
 }
 

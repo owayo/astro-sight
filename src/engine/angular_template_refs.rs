@@ -664,8 +664,11 @@ struct InlineTemplate {
 
 /// Angular template から `symbol_name` の参照を位置付きで検索する。
 ///
-/// 非 Angular プロジェクト、または該当なしの場合は空 Vec。パスは `dir` 基準の
-/// 絶対パスで返し、呼び出し側 (`find_references`) の `relativize_paths` で相対化される。
+/// 非 Angular プロジェクト、または該当なしの場合は空 Vec。パスは `dir` 基準の絶対パス。
+///
+/// `refs` は「検索できる入力が無い」判定にテンプレートの数も使うため、
+/// [`AngularBatchContext`] を自分で組み立てて [`find_angular_template_references_batch_with_context`]
+/// を呼ぶ (前処理を 2 回走らせないため)。
 pub fn find_angular_template_references(
     symbol_name: &str,
     dir: &Path,
@@ -678,7 +681,7 @@ pub fn find_angular_template_references(
         .unwrap_or_default()
 }
 
-/// batch 版。複数シンボルを 1 回の template 走査で検索する (`refs --names` 用)。
+/// batch 版。複数シンボルを 1 回の template 走査で検索する。
 /// 戻り値は `symbol_names` と同じ並び・同じ長さの Vec。
 pub fn find_angular_template_references_batch(
     symbol_names: &[String],
@@ -770,6 +773,16 @@ impl AngularBatchContext {
         let glob_ov = build_glob_override(dir, glob);
         let model = collect_component_templates(dir, &glob_ov);
         Some(Self { model })
+    }
+
+    /// 参照検索の入力になるテンプレートの数 (外部 html は重複除去済みのファイル単位、
+    /// inline は template 領域単位)。検索名やヒット数には依らない。
+    ///
+    /// `refs --glob '**/*.html'` のように通常のファイル収集が空でも、紐付いたテンプレートが
+    /// あれば参照を検索できる。「検索できる入力が無い」判定がこれを数えないと、テンプレートの
+    /// 検索をエラー扱いにしてしまう。
+    pub fn input_count(&self) -> usize {
+        self.model.linked_html.len() + self.model.inline.len()
     }
 }
 

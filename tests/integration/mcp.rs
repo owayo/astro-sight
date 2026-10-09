@@ -401,3 +401,35 @@ fn mcp_refs_budget_is_measured_on_the_rendered_text() {
         );
     }
 }
+
+/// MCP の `refs_search` も、検索できる入力が無い範囲を成功の空結果にせずエラーにする。
+#[test]
+fn mcp_refs_search_rejects_scope_without_searchable_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("sample.applescript"),
+        "on greetUser()\nend greetUser\n",
+    )
+    .expect("write");
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "refs_search",
+            "arguments": { "name": "greetUser", "dir": "." }
+        }
+    })
+    .to_string();
+    let stdout = mcp_send_after_init_with(&[], Some(dir.path()), &[&request]);
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("\"id\":2"))
+        .unwrap_or_else(|| panic!("refs_search のレスポンスが必要: {stdout}"));
+    let json: serde_json::Value = serde_json::from_str(line).expect("valid JSON-RPC");
+    let message = json["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{json}"));
+    assert!(message.contains("UNSUPPORTED_LANGUAGE"), "{message}");
+    assert!(json.get("result").is_none(), "{json}");
+}
