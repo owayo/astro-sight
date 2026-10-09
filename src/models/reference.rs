@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use super::result_summary::{ResultSummary, RollupRecord};
 use super::skip::SkippedFiles;
+use super::truncation::TruncationInfo;
 
 /// 参照の種類（定義・利用・解析不能な宣言候補）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +76,13 @@ pub struct RefsResult {
     /// Generated files omitted from the directory scan. Missing means zero.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub skipped: Option<SkippedFiles>,
+    /// 検索範囲にあったが、対応言語でないため参照を数えられなかったソースの申告
+    /// (`reason: unanalyzable_source`、拡張子単位)。空なら出力に含めない。
+    ///
+    /// `refs --names` では `skipped` と同じく先頭の結果にだけ付ける。名前ごとに繰り返すと
+    /// 呼び出し全体の出力予算を申告だけで使い切るため。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub truncations: Vec<TruncationInfo>,
     /// 出力件数の上限で省略が起きたときだけ付く申告。省略が無ければ出力にも現れないため、
     /// 上限に当たらない通常の問い合わせでは従来とバイト単位で同一の出力になる。
     #[serde(
@@ -92,11 +100,13 @@ pub struct RefsResult {
 }
 
 impl RefsResult {
-    /// `references` が「解析対象にできた入力すべて」を数えているか。
+    /// `references` が検索範囲の入力すべてを数えているか。
     ///
-    /// 生成物として走査から外したファイル (`skipped`) や、読み込み・parse に失敗した
-    /// ファイルがあれば false。`ResultSummary::complete_input` の値になる。
+    /// 生成物として走査から外したファイル (`skipped`)、読み込み・parse に失敗したファイル、
+    /// 対応言語でないソース (`truncations`) があれば false。`ResultSummary::complete_input`
+    /// の値になる。`truncations` が拾うのはソースだと確実に言える拡張子だけなので、未知の
+    /// 拡張子のファイルまで含めた網羅性は保証しない。
     pub fn input_is_complete(&self) -> bool {
-        self.skipped.is_none() && self.failed_files == 0
+        self.skipped.is_none() && self.failed_files == 0 && self.truncations.is_empty()
     }
 }

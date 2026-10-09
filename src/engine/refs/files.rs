@@ -33,9 +33,9 @@ const UNANALYZABLE_SOURCE_EXTENSIONS: &[&str] = &[
     "cshtml", "ejs", "erb", "haml", "hbs", "jsp", "jspx", "liquid", "mustache", "pug",
     "razor", "slim", "twig", "vbhtml",
     // 未対応のプログラミング言語
-    "clj", "cljc", "cljs", "cr", "dart", "erl", "ex", "exs", "fs", "fsi", "fsx", "gradle",
-    "groovy", "hrl", "hs", "jl", "lhs", "lua", "ml", "mli", "nim", "pas", "pl", "pm", "pp",
-    "ps1", "psm1", "scala", "sol", "tcl", "vb", "vbs",
+    "applescript", "clj", "cljc", "cljs", "cr", "dart", "erl", "ex", "exs", "fs", "fsi", "fsx",
+    "gradle", "groovy", "hrl", "hs", "jl", "lhs", "lua", "ml", "mli", "nim", "pas", "pl", "pm",
+    "pp", "ps1", "psm1", "scala", "sol", "tcl", "vb", "vbs",
 ];
 
 /// 拡張子が「解析できないソース」に該当するか (ASCII 小文字化して比較)。
@@ -70,6 +70,90 @@ pub struct FileCollection {
     skipped_generated: Vec<std::path::PathBuf>,
     /// ソースコードだが解析バックエンドが無く走査対象から外れたファイル。
     unanalyzable_sources: Vec<std::path::PathBuf>,
+    /// 対応言語でもソースの拡張子でもなく、黙って外したファイル (画像・文書・データ等)。
+    ignored: IgnoredFiles,
+    /// 拡張子が無く、先頭を読めずに言語を判定できなかったファイルの数。
+    /// 対応言語のスクリプトかもしれないので「対応言語のファイルが無い」根拠にしない。
+    unreadable_candidates: usize,
+}
+
+/// 黙って外したファイルの集計。全パスは持たず、件数・拡張子別の件数・辞書順で先頭の
+/// 代表パスだけを持つ (出力量とメモリを入力件数から独立させる)。
+#[derive(Debug, Default)]
+struct IgnoredFiles {
+    count: usize,
+    by_ext: std::collections::BTreeMap<String, usize>,
+    /// 昇順ソート済み、最大 [`UNSUPPORTED_SCOPE_EXAMPLES`] 件。
+    examples: Vec<std::path::PathBuf>,
+}
+
+impl IgnoredFiles {
+    fn record(&mut self, path: std::path::PathBuf) {
+        self.count += 1;
+        *self.by_ext.entry(extension_key(&path)).or_default() += 1;
+        let at = self.examples.partition_point(|p| p < &path);
+        if at < UNSUPPORTED_SCOPE_EXAMPLES {
+            self.examples.insert(at, path);
+            self.examples.truncate(UNSUPPORTED_SCOPE_EXAMPLES);
+        }
+    }
+}
+
+/// 「対応言語のファイルが 1 件も無い」ときのエラーに載せる代表パスの上限。
+const UNSUPPORTED_SCOPE_EXAMPLES: usize = 3;
+/// 同じく、件数を載せる拡張子の種類数の上限 (件数降順 → 拡張子昇順)。
+const UNSUPPORTED_SCOPE_EXT_CAP: usize = 10;
+
+/// 集計用の拡張子キー (ASCII 小文字化。拡張子が無ければ空文字)。
+fn extension_key(path: &Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+/// 検索範囲にファイルはあるが、どれも参照を検索できる言語でなかったときの内訳。
+///
+/// 「参照が無い」と「検索できなかった」を利用者が区別できるよう、利用者向けの `refs` は
+/// これをエラー (`UNSUPPORTED_LANGUAGE`) にする。内容は決定論的 (拡張子は件数降順 →
+/// 拡張子昇順、代表パスは辞書順)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedScope {
+    /// 検索範囲に入ったファイルの総数。
+    pub matched: usize,
+    /// `(拡張子, 件数)`。拡張子の無いファイルは空文字。最大 [`UNSUPPORTED_SCOPE_EXT_CAP`] 種。
+    pub extensions: Vec<(String, usize)>,
+    /// 上限で載せなかった拡張子の種類数。
+    pub omitted_extensions: usize,
+    /// `dir` 相対の代表パス (`/` 区切り、辞書順、最大 [`UNSUPPORTED_SCOPE_EXAMPLES`] 件)。
+    pub examples: Vec<String>,
+}
+
+impl UnsupportedScope {
+    /// エラーメッセージ。言語が未対応のソースだと断定しない (画像や文書も含むため)。
+    pub fn message(&self) -> String {
+        let mut exts: Vec<String> = self
+            .extensions
+            .iter()
+            .map(|(ext, count)| {
+                if ext.is_empty() {
+                    format!("no extension: {count}")
+                } else {
+                    format!(".{ext}: {count}")
+                }
+            })
+            .collect();
+        if self.omitted_extensions > 0 {
+            exts.push(format!("{} more extension(s)", self.omitted_extensions));
+        }
+        format!(
+            "No file in a language astro-sight can parse is in the search scope: \
+             {} file(s) matched ({}; e.g. {}), so references cannot be searched",
+            self.matched,
+            exts.join(", "),
+            self.examples.join(", ")
+        )
+    }
 }
 
 impl FileCollection {
@@ -131,6 +215,58 @@ impl FileCollection {
             })
             .collect()
     }
+
+    /// 検索範囲にファイルはあるのに、参照を検索できる入力が 1 件も無いか。
+    ///
+    /// 対応言語のファイル・生成物として外したファイル・先頭を読めず言語を判定できなかった
+    /// ファイルのどれかがあれば `None` (生成物は `skipped` で申告済み、読めなかったファイルは
+    /// 未対応と言えない)。ファイルが 1 件も無い (glob が何にも当たらない) 場合も `None`。
+    /// Angular テンプレートのような別経路の入力は呼び出し側が確かめる。
+    pub fn unsupported_only(&self, dir: &Path) -> Option<UnsupportedScope> {
+        if !self.files.is_empty()
+            || !self.skipped_generated.is_empty()
+            || self.unreadable_candidates > 0
+        {
+            return None;
+        }
+        let matched = self.unanalyzable_sources.len() + self.ignored.count;
+        if matched == 0 {
+            return None;
+        }
+
+        let mut by_ext = self.ignored.by_ext.clone();
+        for path in &self.unanalyzable_sources {
+            *by_ext.entry(extension_key(path)).or_default() += 1;
+        }
+        let mut extensions: Vec<(String, usize)> = by_ext.into_iter().collect();
+        extensions.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let omitted_extensions = extensions.len().saturating_sub(UNSUPPORTED_SCOPE_EXT_CAP);
+        extensions.truncate(UNSUPPORTED_SCOPE_EXT_CAP);
+
+        // 両方の集合の先頭 N 件の和集合から先頭 N 件を取れば、全体の先頭 N 件になる。
+        let mut examples: Vec<&std::path::PathBuf> = self
+            .unanalyzable_sources
+            .iter()
+            .chain(&self.ignored.examples)
+            .collect();
+        examples.sort();
+        examples.truncate(UNSUPPORTED_SCOPE_EXAMPLES);
+        let examples = examples
+            .into_iter()
+            .map(|path| {
+                crate::git_support::normalize_workspace_separators(
+                    &path.strip_prefix(dir).unwrap_or(path).to_string_lossy(),
+                )
+            })
+            .collect();
+
+        Some(UnsupportedScope {
+            matched,
+            extensions,
+            omitted_extensions,
+            examples,
+        })
+    }
 }
 
 /// 生成物として外したファイルの `dir` 相対パスから、出力用の申告を組み立てる (空なら `None`)。
@@ -158,6 +294,8 @@ enum CandidateDecision {
     SkipGenerated,
     /// ソースコードだが解析できない (申告対象)。
     UnanalyzableSource,
+    /// 拡張子が無く、先頭を読めなかったため言語を判定できない。
+    Unreadable,
     Ignore,
 }
 
@@ -276,12 +414,15 @@ pub fn collect_files_scan_with_excludes(
     let mut files = Vec::new();
     let mut skipped_generated = Vec::new();
     let mut unanalyzable_sources = Vec::new();
+    let mut ignored = IgnoredFiles::default();
+    let mut unreadable_candidates = 0;
     for (path, decision) in decisions {
         match decision {
             CandidateDecision::Keep => files.push(path),
             CandidateDecision::SkipGenerated => skipped_generated.push(path),
             CandidateDecision::UnanalyzableSource => unanalyzable_sources.push(path),
-            CandidateDecision::Ignore => {}
+            CandidateDecision::Unreadable => unreadable_candidates += 1,
+            CandidateDecision::Ignore => ignored.record(path),
         }
     }
 
@@ -289,6 +430,8 @@ pub fn collect_files_scan_with_excludes(
         files,
         skipped_generated,
         unanalyzable_sources,
+        ignored,
+        unreadable_candidates,
     })
 }
 
@@ -319,7 +462,7 @@ fn classify_candidate(path: &Path, exclude_generated: bool) -> CandidateDecision
         };
     }
     let Some(head) = read_head_4k(path) else {
-        return CandidateDecision::Ignore;
+        return CandidateDecision::Unreadable;
     };
     if exclude_generated && head_has_generated_marker(&head) {
         return CandidateDecision::SkipGenerated;

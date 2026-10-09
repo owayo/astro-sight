@@ -491,6 +491,7 @@ impl AppService {
             glob,
             refs::FileScanOptions { include_generated },
         )?;
+        reject_unsupported_only_scope(scan.unsupported_only.as_ref())?;
 
         // 絶対パスを `dir` 基準の相対パスへ変換する。
         let references = relativize_paths(scan.references, &canonical_dir);
@@ -499,6 +500,7 @@ impl AppService {
             symbol: name.to_string(),
             references,
             skipped: scan.skipped,
+            truncations: scan.unanalyzable,
             // 上限適用は表現層 (commands / MCP) の責務。解析結果そのものは常に全件持つ。
             result_summary: None,
             failed_files: scan.failed_files,
@@ -539,6 +541,7 @@ impl AppService {
             dir,
             glob,
             include_generated,
+            RefSearchAudience::User,
         )
     }
 
@@ -549,7 +552,13 @@ impl AppService {
         dir: &str,
         glob: Option<&str>,
     ) -> Result<Vec<RefsResult>> {
-        self.find_references_batch_with_generated_policy::<false>(names, dir, glob, false)
+        self.find_references_batch_with_generated_policy::<false>(
+            names,
+            dir,
+            glob,
+            false,
+            RefSearchAudience::Internal,
+        )
     }
 
     fn find_references_batch_with_generated_policy<const SHELL_VARS: bool>(
@@ -558,6 +567,7 @@ impl AppService {
         dir: &str,
         glob: Option<&str>,
         include_generated: bool,
+        audience: RefSearchAudience,
     ) -> Result<Vec<RefsResult>> {
         debug!(names = ?names, dir = dir, glob = ?glob, "find_references_batch called");
         let canonical_dir = self.validate_dir(dir)?;
@@ -568,6 +578,9 @@ impl AppService {
             glob,
             refs::FileScanOptions { include_generated },
         )?;
+        if audience == RefSearchAudience::User {
+            reject_unsupported_only_scope(scan.unsupported_only.as_ref())?;
+        }
 
         // 入力順を保ったまま `Vec<RefsResult>` に変換し、パスも相対化する。
         // 読み込み失敗件数は出力に現れない内部情報なので、全名前に付ける
@@ -581,13 +594,16 @@ impl AppService {
                     symbol: name.clone(),
                     references,
                     skipped: None,
+                    truncations: Vec::new(),
                     result_summary: None,
                     failed_files: scan.failed_files,
                 }
             })
             .collect();
+        // 走査の申告は全名前で共通なので、先頭の結果にだけ付ける。
         if let Some(first) = results.first_mut() {
             first.skipped = scan.skipped;
+            first.truncations = scan.unanalyzable;
         }
 
         debug!(
@@ -917,6 +933,31 @@ fn relativize_paths(
     refs
 }
 
+/// 参照検索の結果を誰が読むか。検索範囲に検索できる入力が無いことをエラーにするかを決める。
+///
+/// Bash の変数を数えるか (`SHELL_VARS`) は参照の意味を変える別の方針なので、この判定には
+/// 流用しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefSearchAudience {
+    /// CLI / session / MCP の利用者。結果の 0 件を「参照が無い」と読むので、検索できなかった
+    /// ことはエラーにして区別させる。
+    User,
+    /// API 差分などの内部判定。従来どおり、検索できる入力が無ければ参照 0 件として扱う。
+    Internal,
+}
+
+/// 検索範囲のどのファイルも参照を検索できる言語でなければ `UNSUPPORTED_LANGUAGE` にする。
+///
+/// `symbols --path` が未対応言語のファイルをエラーにするのと揃える。成功の空結果で返すと、
+/// 「0 件ならそれを結果として扱う」利用者が、検索できなかったファイルの参照を「無い」と
+/// 読み違える。
+fn reject_unsupported_only_scope(scope: Option<&refs::UnsupportedScope>) -> Result<()> {
+    match scope {
+        Some(scope) => Err(AstroError::new(ErrorCode::UnsupportedLanguage, scope.message()).into()),
+        None => Ok(()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 診断情報ヘルパー（AppService の全コード経路で共有）
 // ---------------------------------------------------------------------------
@@ -1090,6 +1131,45 @@ mod tests {
         let service = AppService::sandboxed(dir.path().to_path_buf()).unwrap();
         assert!(service.workspace_root.is_some());
         assert_eq!(service.max_input_size, 100 * 1024 * 1024);
+    }
+
+    /// 検索範囲に参照を検索できるファイルが無いとき、利用者向けの検索だけをエラーにする。
+    ///
+    /// API 差分などの内部判定は従来どおり参照 0 件として扱う (エラーにすると、対応言語の
+    /// ファイルを全部消した diff のような正当な入力で判定そのものが止まる)。
+    #[test]
+    fn unsupported_only_scope_is_an_error_only_for_user_searches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("sample.applescript"),
+            "on greet()\nend greet\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("README.md"), "# doc\n").unwrap();
+        let service = AppService::new();
+        let root = dir.path().to_str().unwrap();
+        let names = vec!["greet".to_string()];
+        let code_of = |err: anyhow::Error| err.downcast::<AstroError>().map(|e| e.code).ok();
+
+        let single = service.find_references(&names[0], root, None).unwrap_err();
+        assert_eq!(code_of(single), Some(ErrorCode::UnsupportedLanguage));
+        let batch = service
+            .find_references_batch(&names, root, None)
+            .unwrap_err();
+        assert_eq!(code_of(batch), Some(ErrorCode::UnsupportedLanguage));
+
+        let internal = service
+            .find_symbol_references_batch(&names, root, None)
+            .expect("内部判定はエラーにしない");
+        assert_eq!(internal.len(), 1);
+        assert!(internal[0].references.is_empty());
+
+        // 対照: 対応言語のファイルが 1 件でもあれば検索でき、未対応のソースは申告する。
+        std::fs::write(dir.path().join("a.sh"), "greet() { :; }\n").unwrap();
+        let found = service.find_references(&names[0], root, None).unwrap();
+        assert_eq!(found.references.len(), 1);
+        assert_eq!(found.truncations.len(), 1, "{:?}", found.truncations);
+        assert!(!found.input_is_complete());
     }
 
     /// sandboxed で存在しないパスを指定するとエラー
