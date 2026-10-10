@@ -1,13 +1,117 @@
 //! API 差分判定用の cross-file 参照インデックス (`ApiRefIndex`) と、
 //! 参照状況から api.add / api.rm / api.mod の扱いを決める判定ヘルパー。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::engine::parser;
 use crate::service::AppService;
 
 use super::super::git_input::{git_show_blob, validate_git_revision};
-use super::{bare_name, ctx_usage_is_jsx_or_safe};
+use super::{PreparedDiffFile, bare_name, ctx_usage_is_jsx_or_safe};
+
+/// Old-side references used only to distinguish a rename from an already unused removal.
+/// All changed sources are parsed once, and references inside declarations removed by the
+/// same diff are excluded: a recursive method or a deleted caller cannot prove a rename.
+pub(crate) struct OldRefIndex {
+    references: HashMap<String, Vec<crate::models::reference::SymbolReference>>,
+    removed_ranges: HashMap<String, Vec<crate::models::location::Range>>,
+}
+
+impl OldRefIndex {
+    pub(crate) fn build(
+        names: &HashSet<String>,
+        diff_files: &[crate::models::impact::DiffFile],
+        prepared: &[PreparedDiffFile],
+        base_blobs: &crate::commands::git_input::GitBlobBatch,
+    ) -> Self {
+        let mut sorted: Vec<String> = names.iter().cloned().collect();
+        sorted.sort_unstable();
+        let mut index = Self {
+            references: HashMap::new(),
+            removed_ranges: HashMap::new(),
+        };
+        let Ok(batch) = crate::engine::refs::SourceReferenceBatch::new(&sorted) else {
+            return index;
+        };
+        for (df, prep) in diff_files.iter().zip(prepared) {
+            if df.old_path == "/dev/null" || df.new_path == "/dev/null" {
+                continue;
+            }
+            let PreparedDiffFile::Modified {
+                old_syms: Some(old_syms),
+                new_syms: Some(new_syms),
+                ..
+            } = prep
+            else {
+                continue;
+            };
+            let Some(source) = base_blobs.read(&df.old_path) else {
+                continue;
+            };
+            let Ok(scan) = batch.scan(camino::Utf8Path::new(&df.old_path), &source) else {
+                continue;
+            };
+            let surviving: HashSet<&str> =
+                new_syms.iter().map(|(name, _, _)| name.as_str()).collect();
+            let removed: HashSet<&str> = old_syms
+                .iter()
+                .map(|(name, _, _)| name.as_str())
+                .filter(|name| !surviving.contains(name))
+                .collect();
+            let matched: Vec<_> = scan
+                .symbols
+                .iter()
+                .filter_map(|symbol| {
+                    let qualified = symbol.container.as_ref().map_or_else(
+                        || symbol.name.clone(),
+                        |container| format!("{container}.{}", symbol.name),
+                    );
+                    removed
+                        .contains(qualified.as_str())
+                        .then_some((qualified, symbol.range))
+                })
+                .collect();
+            // Missing declaration ranges make attribution uncertain. Keep the removal visible.
+            if removed
+                .iter()
+                .any(|name| !matched.iter().any(|(matched_name, _)| matched_name == name))
+            {
+                continue;
+            }
+            let ranges = matched.into_iter().map(|(_, range)| range).collect();
+            index.removed_ranges.insert(df.old_path.clone(), ranges);
+            for (name, refs) in sorted.iter().zip(scan.references) {
+                index
+                    .references
+                    .entry(name.clone())
+                    .or_default()
+                    .extend(refs);
+            }
+        }
+        index
+    }
+
+    pub(crate) fn has_surviving_old_reference(&self, name: &str) -> bool {
+        use crate::models::reference::RefKind;
+        self.references.get(bare_name(name)).is_some_and(|refs| {
+            refs.iter().any(|reference| {
+                if reference.kind == Some(RefKind::Definition) {
+                    return false;
+                }
+                let position = (reference.line, reference.column);
+                !self
+                    .removed_ranges
+                    .get(&reference.path)
+                    .is_some_and(|ranges| {
+                        ranges.iter().any(|range| {
+                            position >= (range.start.line, range.start.column)
+                                && position < (range.end.line, range.end.column)
+                        })
+                    })
+            })
+        })
+    }
+}
 
 /// API 差分判定用の cross-file 参照インデックス。
 ///

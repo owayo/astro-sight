@@ -72,6 +72,9 @@ pub(crate) struct DetectionInputs<'a> {
     pub(crate) diff_files: &'a [crate::models::impact::DiffFile],
     pub(crate) diff_new_paths: &'a HashSet<String>,
     pub(crate) ref_index: &'a ApiRefIndex,
+    pub(crate) old_ref_index: &'a std::cell::OnceCell<OldRefIndex>,
+    pub(crate) index_names: &'a HashSet<String>,
+    pub(crate) prepared: &'a [PreparedDiffFile],
     /// base リビジョンの blob の読み手 (常駐 `git cat-file --batch`)。旧版を読む経路は
     /// すべてこれを通し、ファイルやシンボルごとに `git show` を起動しない。
     pub(crate) base_blobs: &'a crate::commands::git_input::GitBlobBatch,

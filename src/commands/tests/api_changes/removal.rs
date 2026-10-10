@@ -943,6 +943,228 @@ fn detect_api_changes_unreferenced_removal_goes_to_removed_dead_not_removed() {
     );
 }
 
+#[test]
+fn detect_api_changes_unreferenced_method_removal_survives_unrelated_addition() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "shop/catalog.py",
+                "class Catalog:\n    def total(self, skus: list[str]) -> int:\n        return len(skus)\n\n    def legacy_total(self, skus: list[str]) -> int:\n        return len(skus) * 2\n",
+            ),
+            (
+                "shop/report.py",
+                "from shop.catalog import Catalog\n\ndef summary(catalog: Catalog) -> str:\n    return str(catalog.total(['a']))\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("shop/catalog.py"),
+        "class Catalog:\n    def total(self, skus: list[str]) -> int:\n        return len(skus)\n\n    def describe(self) -> str:\n        return 'catalog'\n",
+    )
+    .expect("write");
+
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "shop/catalog.py".to_string(),
+        new_path: "shop/catalog.py".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 6,
+            new_start: 1,
+            new_count: 6,
+        }],
+        deleted_old_source: None,
+    }];
+    let changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        changes
+            .removed_dead
+            .iter()
+            .any(|symbol| symbol.name == "Catalog.legacy_total"),
+        "unrelated method addition must not hide an already unused removal: {changes:?}"
+    );
+    assert!(
+        !changes
+            .removed
+            .iter()
+            .any(|symbol| symbol.name == "Catalog.legacy_total"),
+        "the unused removal should remain informational: {changes:?}"
+    );
+}
+
+#[test]
+fn detect_api_changes_used_method_rename_remains_closed_in_diff() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[(
+            "shop/catalog.py",
+            "class Catalog:\n    def old_total(self, skus: list[str]) -> int:\n        return len(skus)\n\ndef summary(catalog: Catalog) -> int:\n    return catalog.old_total(['a'])\n",
+        )],
+        "initial",
+    );
+    fs::write(
+        repo.join("shop/catalog.py"),
+        "class Catalog:\n    def new_total(self, skus: list[str]) -> int:\n        return len(skus)\n\ndef summary(catalog: Catalog) -> int:\n    return catalog.new_total(['a'])\n",
+    )
+    .expect("write");
+    let diff_files = vec![crate::models::impact::DiffFile {
+        old_path: "shop/catalog.py".to_string(),
+        new_path: "shop/catalog.py".to_string(),
+        hunks: vec![crate::models::impact::HunkInfo {
+            old_start: 1,
+            old_count: 6,
+            new_start: 1,
+            new_count: 6,
+        }],
+        deleted_old_source: None,
+    }];
+    let changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        changes
+            .removed
+            .iter()
+            .chain(changes.removed_dead.iter())
+            .all(|symbol| symbol.name != "Catalog.old_total"),
+        "a used method renamed with its caller is closed in the diff: {changes:?}"
+    );
+}
+
+#[test]
+fn detect_api_changes_cross_file_method_rename_remains_closed_in_diff() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "shop/catalog.py",
+                "class Catalog:\n    def old_total(self) -> int:\n        return 1\n",
+            ),
+            (
+                "shop/report.py",
+                "from shop.catalog import Catalog\n\ndef summary(catalog: Catalog) -> int:\n    return catalog.old_total()\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("shop/catalog.py"),
+        "class Catalog:\n    def new_total(self) -> int:\n        return 1\n",
+    )
+    .expect("write catalog");
+    fs::write(
+        repo.join("shop/report.py"),
+        "from shop.catalog import Catalog\n\ndef summary(catalog: Catalog) -> int:\n    return catalog.new_total()\n",
+    )
+    .expect("write report");
+    let diff_files = ["shop/catalog.py", "shop/report.py"]
+        .iter()
+        .map(|path| crate::models::impact::DiffFile {
+            old_path: (*path).to_string(),
+            new_path: (*path).to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 4,
+                new_start: 1,
+                new_count: 4,
+            }],
+            deleted_old_source: None,
+        })
+        .collect::<Vec<_>>();
+    let changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        changes
+            .removed
+            .iter()
+            .chain(changes.removed_dead.iter())
+            .all(|symbol| symbol.name != "Catalog.old_total"),
+        "a cross-file caller updated with a method rename is closed in the diff: {changes:?}"
+    );
+}
+
+#[test]
+fn detect_api_changes_removed_callers_do_not_prove_method_rename() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "shop/catalog.py",
+                "class Catalog:\n    def legacy_total(self, n: int) -> int:\n        return 0 if n == 0 else self.legacy_total(n - 1)\n",
+            ),
+            (
+                "shop/report.py",
+                "from shop.catalog import Catalog\n\ndef summary(catalog: Catalog) -> str:\n    return 'old'\n",
+            ),
+            (
+                "tests/test_catalog.py",
+                "from shop.catalog import Catalog\n\ndef test_legacy():\n    assert Catalog().legacy_total(1) == 0\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("shop/catalog.py"),
+        "class Catalog:\n    def describe(self) -> str:\n        return 'catalog'\n",
+    )
+    .expect("write catalog");
+    fs::write(
+        repo.join("shop/report.py"),
+        "from shop.catalog import Catalog\n\ndef summary(catalog: Catalog) -> str:\n    return catalog.describe()\n",
+    )
+    .expect("write report");
+    fs::remove_file(repo.join("tests/test_catalog.py")).expect("remove test");
+
+    let diff_files = vec![
+        crate::models::impact::DiffFile {
+            old_path: "shop/catalog.py".to_string(),
+            new_path: "shop/catalog.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 3,
+            }],
+            deleted_old_source: None,
+        },
+        crate::models::impact::DiffFile {
+            old_path: "shop/report.py".to_string(),
+            new_path: "shop/report.py".to_string(),
+            hunks: vec![crate::models::impact::HunkInfo {
+                old_start: 1,
+                old_count: 4,
+                new_start: 1,
+                new_count: 4,
+            }],
+            deleted_old_source: None,
+        },
+        crate::models::impact::DiffFile {
+            old_path: "tests/test_catalog.py".to_string(),
+            new_path: "/dev/null".to_string(),
+            hunks: vec![],
+            deleted_old_source: None,
+        },
+    ];
+    let changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+    assert!(
+        changes
+            .removed_dead
+            .iter()
+            .any(|symbol| symbol.name == "Catalog.legacy_total"),
+        "self-recursion and deleted tests cannot prove a rename: {changes:?}"
+    );
+}
+
 /// HEAD ツリーで他ファイルから参照されているシンボル (alive) の削除は、
 /// `removed_dead` ではなく `removed` に残ること (副作用回帰防止)。
 /// 「破壊的削除」と「dead-code 整理」の区別が機能していることを確認。

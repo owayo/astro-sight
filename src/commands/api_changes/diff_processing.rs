@@ -397,13 +397,18 @@ fn collect_removed_symbols(
     let &DetectionInputs {
         dir,
         base,
+        diff_files,
         ref_index,
+        old_ref_index,
+        index_names,
+        prepared,
         base_blobs,
         ..
     } = inputs;
     let &ModifiedFileFacts {
         old_syms,
         new_syms,
+        in_file_callees,
         new_export_surface_names,
         ..
     } = facts;
@@ -515,17 +520,34 @@ fn collect_removed_symbols(
                     });
                 continue;
             }
-            // closed-in-diff for api.rm: 同ファイルに新規追加されたシンボルがあり、削除された
-            // シンボルが変更後ツリーで 0 件参照なら「rename + 実装置換」と判断して api.rm から
-            // 除外する。
+            // 変更後の参照 0 件だけでは、元から未使用だった API の削除と、caller も
+            // 追随した rename を区別できない。変更前に AST 参照があり、新しい
+            // シンボルにも参照があるときだけ rename とみなす。
+            // 変更前の参照が残っている未変更ファイルは、変更後の参照 0 件という
+            // 条件を満たさないため、差分ファイルの旧 blob だけを調べれば足りる。
             let bash_pure_removal_skip = is_bash_old_file
                 && new_symbols_in_current_file.is_empty()
                 && !bash_exported
                     .get_or_insert_with(|| bash_exported_functions_in_git(dir, base, &df.old_path))
                     .contains(name);
-            if (!new_symbols_in_current_file.is_empty() || bash_pure_removal_skip)
-                && is_removed_symbol_unreferenced(ref_index, name)
-            {
+            let new_unreferenced = is_removed_symbol_unreferenced(ref_index, name);
+            let replacement_is_used = new_unreferenced
+                && new_symbols_in_current_file.iter().any(|new_name| {
+                    is_internally_connected(in_file_callees, new_name)
+                        || ref_index.refs_for(bare_name(new_name)).is_some_and(|refs| {
+                            refs.iter().any(|r| {
+                                r.kind != Some(crate::models::reference::RefKind::Definition)
+                            })
+                        })
+                });
+            let has_old_reference = new_unreferenced
+                && replacement_is_used
+                && old_ref_index
+                    .get_or_init(|| {
+                        OldRefIndex::build(index_names, diff_files, prepared, base_blobs)
+                    })
+                    .has_surviving_old_reference(name);
+            if new_unreferenced && (bash_pure_removal_skip || has_old_reference) {
                 continue;
             }
             // Python の @property → 同じクラスの field 置き換えなら removed 扱いせず
