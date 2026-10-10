@@ -197,6 +197,7 @@ pub(crate) fn detect_api_changes(
         });
     }
     let ref_index = ApiRefIndex::build(dir, &index_names);
+    let old_ref_index = std::cell::OnceCell::new();
 
     // process_modified_file → classify_signature_change → is_modified_closed_in_diff の per-file
     // キャッシュ (import 行集合 / 変更行集合) を detect_api_changes スコープで 1 度確保し、
@@ -210,6 +211,9 @@ pub(crate) fn detect_api_changes(
         diff_files,
         diff_new_paths: &diff_new_paths,
         ref_index: &ref_index,
+        old_ref_index: &old_ref_index,
+        index_names: &index_names,
+        prepared: &prepared,
         base_blobs: &base_blobs,
     };
     let mut state = DetectionState {

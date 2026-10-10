@@ -365,6 +365,87 @@ fn find_refs_in_file(
     Ok(buckets.into_iter().next().unwrap_or_default())
 }
 
+/// References and declaration ranges from an already loaded source blob.
+pub(crate) struct SourceReferenceScan {
+    pub(crate) references: Vec<Vec<SymbolReference>>,
+    pub(crate) symbols: Vec<crate::models::symbol::Symbol>,
+}
+
+/// Reuse one name prefilter across all changed base revision blobs.
+pub(crate) struct SourceReferenceBatch {
+    symbol_names: Vec<String>,
+    acs: Vec<(usize, aho_corasick::AhoCorasick)>,
+}
+
+impl SourceReferenceBatch {
+    pub(crate) fn new(symbol_names: &[String]) -> Result<Self> {
+        Ok(Self {
+            symbol_names: symbol_names.to_vec(),
+            acs: build_batch_acs(symbol_names)?,
+        })
+    }
+
+    /// Scan all requested names in one parse of an old source blob.
+    pub(crate) fn scan(
+        &self,
+        path: &camino::Utf8Path,
+        source: &[u8],
+    ) -> Result<SourceReferenceScan> {
+        let mut references = vec![Vec::new(); self.symbol_names.len()];
+        if self.symbol_names.is_empty() {
+            return Ok(SourceReferenceScan {
+                references,
+                symbols: Vec::new(),
+            });
+        }
+        let present_indices = ac_present_indices_multi(&self.acs, source, self.symbol_names.len());
+        if present_indices.is_empty() {
+            return Ok(SourceReferenceScan {
+                references,
+                symbols: Vec::new(),
+            });
+        }
+        let lang_id = LangId::detect(path, source)?;
+        if let crate::language::DetectedLang::LexerOnly(lexer_lang) = lang_id.detected() {
+            return Ok(SourceReferenceScan {
+                references: find_refs_batch_via_lexer(
+                    &self.symbol_names,
+                    &present_indices,
+                    source,
+                    path,
+                    lexer_lang,
+                ),
+                symbols: crate::engine::lexer::extract_symbols(source, lexer_lang),
+            });
+        }
+        let tree = parser::parse_source(source, lang_id)?;
+        if tree.root_node().has_error() {
+            anyhow::bail!("old source contains a parse error");
+        }
+        let symbols = crate::engine::symbols::extract_symbols(tree.root_node(), source, lang_id)?;
+        let name_index = build_name_index(lang_id, &self.symbol_names, &present_indices);
+        let matcher = IndexedMatcher {
+            name_index: &name_index,
+        };
+        let mut sink = NamespaceReferenceSink::<false> {
+            buckets: &mut references,
+            path: path.as_str(),
+        };
+        run_ref_walk(
+            tree.root_node(),
+            source,
+            lang_id,
+            definition_node_kinds(lang_id),
+            &matcher,
+            &mut sink,
+        );
+        Ok(SourceReferenceScan {
+            references,
+            symbols,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // バッチ参照検索: O(S × N) ではなく O(N + S) で処理する
 // ---------------------------------------------------------------------------
