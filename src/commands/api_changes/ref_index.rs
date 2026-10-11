@@ -257,8 +257,9 @@ pub(crate) struct ModifiedClosureInput<'a> {
 /// 関数 (bare 名) に限り `js_ts_shadow::resolve_reference_binding` で参照単位に解決し、
 /// 「同一ファイルの function_declaration に束縛されるローカル呼び出し」だけを判定対象
 /// から除外する (Issue 2026-07-12-api-mod-same-diff-informational: export 関数と
-/// 別ファイルのローカル同名関数の併存で closed 判定が全滅していた)。method qualname
-/// (`Container.method`) と JS/TS 以外の言語は従来ガード (即 blocking) を維持する。
+/// 別ファイルのローカル同名関数の併存で closed 判定が全滅していた)。Python の method
+/// qualname は、他ファイルの同名定義がすべて追加行にあると証明できる場合だけ通す。
+/// それ以外の言語・種類は従来どおり blocking に残す。
 pub(crate) fn is_modified_closed_in_diff(
     input: ModifiedClosureInput<'_>,
     caches: &mut ApiClosureCaches,
@@ -295,13 +296,41 @@ pub(crate) fn is_modified_closed_in_diff(
     if target_def_count != 1 {
         return false;
     }
-    // 他ファイルの同名定義がある場合、JS/TS/TSX の**トップレベル関数** (bare 名かつ
-    // kind=function) のみ shadow resolver での参照単位除外に進む。class / const /
-    // type alias 等や method qualname、他言語は従来どおり blocking。
+    // 他ファイルの同名定義がある場合、Python メソッドでは全定義の名前位置がこの
+    // diff の追加行にあることを証明できれば、呼び出し側の追随判定へ進む。
+    // 定義の帰属は曖昧でも、全候補が更新済みならどの定義へ束縛されてもよい。
+    // JS/TS/TSX のトップレベル関数は従来の shadow resolver を使う。
     let has_foreign_defs = defs.len() > target_def_count;
     let target_lang =
         crate::language::LangId::from_path(camino::Utf8Path::new(target_new_path)).ok();
+    let python_foreign_defs_updated = has_foreign_defs
+        && name.contains('.')
+        && target_lang == Some(crate::language::LangId::Python)
+        && defs
+            .iter()
+            .filter(|r| !diff_path_matches_ref(target_new_path, &r.path, dir))
+            .all(|r| {
+                let Some(parsed) = parsed_ref_file(dir, &r.path, caches) else {
+                    return false;
+                };
+                if parsed.lang_id != crate::language::LangId::Python
+                    || parsed.tree.root_node().has_error()
+                {
+                    return false;
+                }
+                let Some(df) = diff_files.iter().find(|df| {
+                    df.new_path != "/dev/null" && diff_path_matches_ref(&df.new_path, &r.path, dir)
+                }) else {
+                    return false;
+                };
+                caches
+                    .changed_new_lines
+                    .entry(df.new_path.clone())
+                    .or_insert_with(|| changed_new_lines_for_diff_file(dir, base, df))
+                    .contains(&r.line)
+            });
     if has_foreign_defs
+        && !python_foreign_defs_updated
         && (name.contains('.')
             || kind != "function"
             || !matches!(
@@ -342,6 +371,7 @@ pub(crate) fn is_modified_closed_in_diff(
         // ローカル呼び出しなので除外する。解決失敗・property 位置・function 以外の
         // binding は OtherOrAmbiguous = 除外せず下の diff 実変更行チェックに掛かる。
         if has_foreign_defs
+            && !python_foreign_defs_updated
             && !diff_path_matches_ref(target_new_path, &r.path, dir)
             && resolve_ref_shadow_binding(dir, r, bare, caches)
                 == crate::commands::api_changes::js_ts_shadow::LocalResolution::SameFileFunction
