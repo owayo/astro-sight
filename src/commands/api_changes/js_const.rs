@@ -90,6 +90,58 @@ fn unwrap_transparent_expression(mut node: Node<'_>) -> Node<'_> {
     }
 }
 
+/// call の object 引数に置かれた関数値だけの本体を集める。
+/// pair の key、array、spread、値にある call や class には進まない。
+fn object_callback_body_spans(object: Node<'_>, out: &mut Vec<(usize, usize)>) {
+    let mut stack = vec![object];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "object" => {
+                let mut cursor = node.walk();
+                stack.extend(
+                    node.named_children(&mut cursor)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev(),
+                );
+            }
+            "pair" => {
+                let Some(value) = node.child_by_field_name("value") else {
+                    continue;
+                };
+                let value = unwrap_transparent_expression(value);
+                match value.kind() {
+                    "arrow_function" | "function_expression" | "generator_function" => {
+                        if let Some(body) = value.child_by_field_name("body") {
+                            out.push((body.start_byte(), body.end_byte()));
+                        }
+                    }
+                    "object" => stack.push(value),
+                    _ => {}
+                }
+            }
+            "method_definition" => {
+                let Some(name) = node.child_by_field_name("name") else {
+                    continue;
+                };
+                let mut cursor = node.walk();
+                let accessor = node
+                    .children(&mut cursor)
+                    .take_while(|child| child.id() != name.id())
+                    .any(|child| matches!(child.kind(), "get" | "set"));
+                if !accessor
+                    && let Some(body) = node
+                        .child_by_field_name("body")
+                        .filter(|body| body.kind() == "statement_block")
+                {
+                    out.push((body.start_byte(), body.end_byte()));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 #[derive(Default)]
 struct CallbackEvidence<'a> {
     bodies: Vec<(usize, usize)>,
@@ -97,7 +149,7 @@ struct CallbackEvidence<'a> {
 }
 
 /// 引数に直接置かれた関数と tagged template だけを辿る。
-/// object/array、IIFE の callee、new/await は辿らない。
+/// object 引数は関数値だけを辿り、array、IIFE の callee、new/await は辿らない。
 fn callback_body_spans<'a>(value: Node<'a>, out: &mut CallbackEvidence<'a>) -> bool {
     let value = unwrap_transparent_expression(value);
     if value.kind() != "call_expression" {
@@ -130,6 +182,7 @@ fn callback_body_spans<'a>(value: Node<'a>, out: &mut CallbackEvidence<'a>) -> b
                     callback_body_spans(arg, out);
                 }
             },
+            "object" => object_callback_body_spans(arg, &mut out.bodies),
             _ => {}
         }
     }
@@ -392,6 +445,90 @@ mod tests {
     }
 
     #[test]
+    fn object_argument_callback_bodies_are_elided_with_headers_preserved() {
+        for value in [
+            "wrap({ fn: async (item: Item) => { return BODY; } })",
+            "wrap({ fn: function (item: Item) { return BODY; } })",
+            "wrap({ fn(item: Item) { return BODY; } })",
+            "wrap({ nested: { fn(item: Item) { return BODY; } } })",
+        ] {
+            let before = format!("export const handle = {};", value.replace("BODY", "1"));
+            let after = format!("export const handle = {};", value.replace("BODY", "2"));
+            let old = scaffold(&before, LangId::Typescript).expect(&before);
+            assert_eq!(Some(old), scaffold(&after, LangId::Typescript), "{value}");
+        }
+        let before = "export const handle = wrap<Settings>({ fn: async (item: Item) => { return 1; }, stable: 2 });";
+        let old = scaffold(before, LangId::Typescript).expect(before);
+        for after in [
+            "export const handle = wrap<Settings>({ other: async (item: Item) => { return 2; }, stable: 2 });",
+            "export const handle = wrap<Settings>({ fn: async (value: Item) => { return 2; }, stable: 2 });",
+            "export const handle = wrap<Settings>({ fn: async (item: Other) => { return 2; }, stable: 2 });",
+            "export const handle = wrap<Settings>({ fn: [async (item: Item) => { return 2; }], stable: 2 });",
+            "export const handle = wrap<Other>({ fn: async (item: Item) => { return 2; }, stable: 2 });",
+            "export const handle = wrap<Settings>({ fn: async (item: Item) => { return 2; }, stable: 3 });",
+        ] {
+            assert_ne!(
+                Some(&old),
+                scaffold(after, LangId::Typescript).as_ref(),
+                "{after}"
+            );
+        }
+        let before = "export const handle = wrap(() => 1, { fn: () => 1 });";
+        let after = "export const handle = wrap(() => 2, { fn: () => 2 });";
+        assert_eq!(
+            scaffold(before, LangId::Typescript),
+            scaffold(after, LangId::Typescript)
+        );
+
+        for (before, after) in [
+            (
+                "export const handle = wrap({ fn: () => 1, get x() { return 1; } });",
+                "export const handle = wrap({ fn: () => 1, get x() { return 2; } });",
+            ),
+            (
+                "export const handle = wrap({ fn: () => 1, set x(value) { this.x = value; } });",
+                "export const handle = wrap({ fn: () => 1, set x(value) { this.x = value + 1; } });",
+            ),
+            (
+                "export const handle = wrap({ fn: () => 1, ...base });",
+                "export const handle = wrap({ fn: () => 1, ...other });",
+            ),
+            (
+                "export const handle = wrap({ fn: () => 1, list: [() => 1] });",
+                "export const handle = wrap({ fn: () => 1, list: [() => 2] });",
+            ),
+            (
+                "export const handle = wrap({ fn: () => 1, other: inner(() => 1) });",
+                "export const handle = wrap({ fn: () => 1, other: inner(() => 2) });",
+            ),
+            (
+                "export const handle = wrap({ fn: () => 1, item: class { method() { return 1; } } });",
+                "export const handle = wrap({ fn: () => 1, item: class { method() { return 2; } } });",
+            ),
+        ] {
+            let old = scaffold(before, LangId::Typescript).expect(before);
+            assert_ne!(Some(old), scaffold(after, LangId::Typescript), "{after}");
+        }
+
+        let before = "export const handle = wrap({ fn(item: Item): Result { return 1; } });";
+        let old = scaffold(before, LangId::Typescript).expect(before);
+        for after in [
+            "export const handle = wrap({ other(item: Item): Result { return 2; } });",
+            "export const handle = wrap({ fn(value: Item): Result { return 2; } });",
+            "export const handle = wrap({ fn(item: Other): Result { return 2; } });",
+            "export const handle = wrap({ fn(item: Item): Other { return 2; } });",
+            "export const handle = wrap({ async fn(item: Item): Result { return 2; } });",
+            "export const handle = wrap({ *fn(item: Item): Result { return 2; } });",
+        ] {
+            assert_ne!(
+                Some(&old),
+                scaffold(after, LangId::Typescript).as_ref(),
+                "{after}"
+            );
+        }
+    }
+
+    #[test]
     fn callback_headers_and_call_scaffolding_are_preserved() {
         let before = "export const handle = wrap<Request>((req: Request): Response => { return 1; }, { retry: 1 });";
         let old = scaffold(before, LangId::Typescript).unwrap();
@@ -415,10 +552,6 @@ mod tests {
             (
                 "wrap(function old() { return 1; })",
                 "wrap(function renamed() { return 2; })",
-            ),
-            (
-                "wrap(() => 1, { fn: () => 1 })",
-                "wrap(() => 2, { fn: () => 2 })",
             ),
             ("wrap((() => 1) as A)", "wrap((() => 2) as B)"),
         ] {
@@ -455,8 +588,13 @@ mod tests {
     #[test]
     fn callback_proof_rejects_ambiguous_bindings_and_other_expression_positions() {
         for value in [
-            "wrap({ fn: () => 1 })",
+            "wrap({ fn: [() => 1] })",
+            "wrap({ fn: inner(() => 1) })",
+            "wrap({ get fn() { return 1; } })",
+            "wrap({ set fn(value) { this.value = value; } })",
+            "wrap({ fn: class { method() { return 1; } } })",
             "wrap([() => 1])",
+            "wrap([{ fn: () => 1 }])",
             "(() => 1)()",
             "new Wrapper(() => 1)",
             "await wrap(() => 1)",

@@ -692,6 +692,110 @@ fn review_hook_tagged_template_text_is_informational() {
 }
 
 #[test]
+fn review_hook_object_argument_callback_bodies_are_informational() {
+    for (index, (before, after)) in [
+        (
+            "export const plugin = host.register<Settings>({ size: async ({}, done: (value: number) => Promise<void>) => { await done(1); } });\n",
+            "export const plugin = host.register<Settings>({ size: async ({}, done: (value: number) => Promise<void>) => { await done(2); } });\n",
+        ),
+        (
+            "export const plugin = host.register<Settings>({ setup() { return 1; } });\n",
+            "export const plugin = host.register<Settings>({ setup() { return 2; } });\n",
+        ),
+        (
+            "export const plugin = host.register<Settings>({ nested: { setup() { return 1; } } });\n",
+            "export const plugin = host.register<Settings>({ nested: { setup() { return 2; } } });\n",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let use_source = match index {
+            1 => "import { plugin } from './api';\nexport const used = plugin.setup();\n",
+            2 => "import { plugin } from './api';\nexport const used = plugin.nested.setup();\n",
+            _ => "import { plugin } from './api';\nexport const used = plugin;\n",
+        };
+        let mut strict_output = None;
+        let output = a3_review_hook(
+            |root| {
+                std::fs::write(root.join("api.ts"), after).unwrap();
+                if index == 0 {
+                    strict_output = Some(
+                        cargo_bin()
+                            .args([
+                                "review",
+                                "--dir",
+                                root.to_str().unwrap(),
+                                "--git",
+                                "--hook",
+                                "--strict-public-const-values",
+                            ])
+                            .output()
+                            .unwrap(),
+                    );
+                }
+            },
+            &[("api.ts", before), ("use.ts", use_source)],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert_eq!(json["blocking_categories"], serde_json::json!([]));
+        assert_eq!(json["api"]["callback_body"][0]["n"], "plugin");
+        assert!(json["api"]["mod"].is_null(), "{stderr}");
+        assert!(json["impacts"].is_null(), "{stderr}");
+        if let Some(strict) = strict_output {
+            let stderr = String::from_utf8_lossy(&strict.stderr);
+            assert!(!strict.status.success(), "{stderr}");
+            let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+            assert_eq!(
+                json["blocking_categories"],
+                serde_json::json!(["impacts", "api.callback_body"]),
+                "{stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn review_hook_object_argument_callback_contract_changes_stay_blocking() {
+    for (before, after) in [
+        (
+            "export const plugin = wrap({ fn: () => 1 });\n",
+            "export const plugin = wrap({ fn: () => 2, added: 1 });\n",
+        ),
+        (
+            "export const plugin = wrap({ fn: (item: Item) => item.old });\n",
+            "export const plugin = wrap({ fn: (item: Other) => item.new });\n",
+        ),
+        (
+            "export const plugin = wrap({ fn: () => 1 });\n",
+            "export const plugin = wrap({ fn: [() => 2] });\n",
+        ),
+        (
+            "export const plugin = wrap<Settings>({ fn: () => 1 });\n",
+            "export const plugin = wrap<Other>({ fn: () => 2 });\n",
+        ),
+    ] {
+        let output = a3_review_hook(
+            |root| std::fs::write(root.join("api.ts"), after).unwrap(),
+            &[
+                ("api.ts", before),
+                (
+                    "use.ts",
+                    "import { plugin } from './api';\nexport const used = plugin;\n",
+                ),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{before} -> {after}: {stderr}");
+        let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert_eq!(json["api"]["mod"][0]["n"], "plugin", "{stderr}");
+        assert!(json["api"]["callback_body"].is_null(), "{stderr}");
+    }
+}
+
+#[test]
 fn review_hook_multiline_jsx_checks_only_the_opening_tag() {
     let before = "import { memo } from 'react';\nexport const Card = memo(function Card({ label }: { label: string }) {\n  return <span>{label}</span>;\n});\n";
     let after = "import { memo } from 'react';\nexport const Card = memo(function Card({ label, tone }: { label: string; tone: string }) {\n  return <span data-tone={tone}>{label}</span>;\n});\n";
