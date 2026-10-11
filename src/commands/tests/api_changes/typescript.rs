@@ -18,6 +18,272 @@ use std::io::Cursor;
 #[allow(unused_imports)]
 use std::process::Command;
 
+fn type_member_diff_files(repo: &std::path::Path) -> Vec<crate::models::impact::DiffFile> {
+    let output = Command::new("git")
+        .args(["diff", "--unified=0", "HEAD", "--", "src/model.ts"])
+        .current_dir(repo)
+        .output()
+        .expect("git diff");
+    assert!(output.status.success());
+    crate::engine::diff::parse_unified_diff(
+        std::str::from_utf8(&output.stdout).expect("utf-8 diff"),
+    )
+}
+
+#[test]
+fn detect_api_changes_ts_type_members_ignore_layout_and_classify_optional_additions() {
+    let cases = [
+        (
+            "inline alias optional",
+            "export type Shape = { theme: string };\n",
+            "export type Shape = { theme: string; fontSize?: number };\n",
+            true,
+        ),
+        (
+            "multiline alias optional",
+            "export type Shape = {\n  theme: string;\n};\n",
+            "export type Shape = {\n  theme: string;\n  fontSize?: number;\n};\n",
+            true,
+        ),
+        (
+            "inline interface optional",
+            "export interface Shape { theme: string }\n",
+            "export interface Shape { theme: string; fontSize?: number }\n",
+            true,
+        ),
+        (
+            "multiline interface optional",
+            "export interface Shape {\n  theme: string;\n}\n",
+            "export interface Shape {\n  theme: string;\n  fontSize?: number;\n}\n",
+            true,
+        ),
+        (
+            "inline alias type change",
+            "export type Shape = { theme: string };\n",
+            "export type Shape = { theme: number };\n",
+            false,
+        ),
+        (
+            "multiline alias type change",
+            "export type Shape = {\n  theme: string;\n};\n",
+            "export type Shape = {\n  theme: number;\n};\n",
+            false,
+        ),
+        (
+            "required member addition",
+            "export type Shape = { theme: string };\n",
+            "export type Shape = { theme: string; fontSize: number };\n",
+            false,
+        ),
+        (
+            "member removal",
+            "export type Shape = { theme: string; fontSize?: number };\n",
+            "export type Shape = { theme: string };\n",
+            false,
+        ),
+        (
+            "optional becomes required",
+            "export interface Shape { theme?: string }\n",
+            "export interface Shape { theme: string }\n",
+            false,
+        ),
+        (
+            "interface member type change",
+            "export interface Shape {\n  theme: string;\n}\n",
+            "export interface Shape {\n  theme: number;\n}\n",
+            false,
+        ),
+        (
+            "type parameter change",
+            "export type Shape<T> = { theme: T };\n",
+            "export type Shape<T extends string> = { theme: T; fontSize?: number };\n",
+            false,
+        ),
+        (
+            "opaque intersection stays blocking",
+            "export type Shape = Base & { theme: string };\n",
+            "export type Shape = Base & { theme: string; fontSize?: number };\n",
+            false,
+        ),
+        (
+            "optional method addition",
+            "export interface Shape { theme: string }\n",
+            "export interface Shape { theme: string; resize?(): void }\n",
+            true,
+        ),
+        (
+            "required method addition",
+            "export interface Shape { theme: string }\n",
+            "export interface Shape { theme: string; resize(): void }\n",
+            false,
+        ),
+        (
+            "index signature addition",
+            "export interface Shape { theme: string }\n",
+            "export interface Shape { theme: string; [key: string]: string }\n",
+            false,
+        ),
+        (
+            "call signature addition",
+            "export interface Shape { theme: string }\n",
+            "export interface Shape { theme: string; (): void }\n",
+            false,
+        ),
+        (
+            "readonly change",
+            "export interface Shape { theme: string }\n",
+            "export interface Shape { readonly theme: string; fontSize?: number }\n",
+            false,
+        ),
+        (
+            "documented optional addition",
+            "export interface Shape { theme: string }\n",
+            "export interface Shape { theme: string; /** Units */ fontSize?: number }\n",
+            true,
+        ),
+        (
+            "duplicate optional property",
+            "export interface Shape { theme: string }\n",
+            "export interface Shape { theme: string; theme?: number }\n",
+            false,
+        ),
+        (
+            "optional overload of existing method",
+            "export interface Shape { resize(): void }\n",
+            "export interface Shape { resize(): void; resize?(size: number): void }\n",
+            false,
+        ),
+        (
+            "call overload order change",
+            "export interface Shape { (value: string): 'text'; (value: any): 'other' }\n",
+            "export interface Shape { (value: any): 'other'; (value: string): 'text' }\n",
+            false,
+        ),
+        (
+            "method overload order change",
+            "export interface Shape { read(value: string): 'text'; read(value: any): 'other' }\n",
+            "export interface Shape { read(value: any): 'other'; read(value: string): 'text' }\n",
+            false,
+        ),
+    ];
+    for (label, before, after, compatible) in cases {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                ("src/model.ts", before),
+                (
+                    "src/use.ts",
+                    "import type { Shape } from './model';\nexport function read(shape: Shape) { return shape.theme; }\n",
+                ),
+            ],
+            "initial",
+        );
+        fs::write(repo.join("src/model.ts"), after).expect("write");
+        let diff_files = type_member_diff_files(repo);
+        if label.starts_with("multiline") {
+            assert!(
+                diff_files[0].hunks.iter().all(|hunk| hunk.old_start > 1),
+                "{label}: the declaration line must be outside the changed hunk"
+            );
+        }
+        let changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        assert_eq!(
+            changes
+                .compatible_modified
+                .iter()
+                .any(|change| change.name == "Shape" && change.reason == "optional_type_members"),
+            compatible,
+            "{label}: {changes:?}"
+        );
+        assert_eq!(
+            changes.modified.iter().any(|change| change.name == "Shape"),
+            !compatible,
+            "{label}: {changes:?}"
+        );
+    }
+}
+
+#[test]
+fn detect_api_changes_ts_type_members_layout_only_change_is_unchanged() {
+    let cases = [
+        (
+            "line layout and trailing separator",
+            "export type Shape = { theme: string };\n",
+            "export type Shape = {\n  theme: string\n};\n",
+        ),
+        (
+            "member order and separators",
+            "export type Shape = { theme: string; size?: number };\n",
+            "export type Shape = { size?: number, theme: string };\n",
+        ),
+        (
+            "interface member order",
+            "export interface Shape { theme: string; size?: number }\n",
+            "export interface Shape { size?: number; theme: string }\n",
+        ),
+    ];
+    for (label, before, after) in cases {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                ("src/model.ts", before),
+                (
+                    "src/use.ts",
+                    "import type { Shape } from './model';\nexport function read(shape: Shape) { return shape.theme; }\n",
+                ),
+            ],
+            "initial",
+        );
+        fs::write(repo.join("src/model.ts"), after).expect("write");
+        let diff_files = type_member_diff_files(repo);
+        let changes = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+        assert!(
+            changes.modified.is_empty()
+                && changes.modified_closed_in_diff.is_empty()
+                && changes.compatible_modified.is_empty()
+                && changes.type_annotation_changes.is_empty(),
+            "{label}: layout alone must not change the API: {changes:?}"
+        );
+    }
+}
+
+#[test]
+fn detect_api_changes_ts_malformed_optional_member_is_not_compatible() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            ("src/model.ts", "export interface Shape { theme: string }\n"),
+            (
+                "src/use.ts",
+                "import type { Shape } from './model';\nexport function read(shape: Shape) { return shape.theme; }\n",
+            ),
+        ],
+        "initial",
+    );
+    let malformed = "export interface Shape { theme: string; size?: }\n";
+    let tree = crate::engine::parser::parse_source(
+        malformed.as_bytes(),
+        crate::language::LangId::Typescript,
+    )
+    .expect("parse");
+    assert!(tree.root_node().has_error());
+    fs::write(repo.join("src/model.ts"), malformed).expect("write");
+    let changes = detect_api_changes_from_worktree(repo);
+    assert!(
+        changes.compatible_modified.is_empty(),
+        "malformed source cannot prove compatibility: {changes:?}"
+    );
+}
+
 /// TSX 関数コンポーネントの destructured props に optional prop を追加するだけの
 /// React 後方互換変更は api.mod に出してはならない (Issue
 /// 引数なし TS/TSX 関数に、`= {}` default 付きの destructured props を追加する

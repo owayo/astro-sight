@@ -83,6 +83,17 @@ pub(crate) fn extract_api_signature(
     lang_id: crate::language::LangId,
 ) -> String {
     use crate::models::symbol::SymbolKind;
+    if matches!(
+        lang_id,
+        crate::language::LangId::Typescript | crate::language::LangId::Tsx
+    ) && matches!(
+        sym.kind,
+        SymbolKind::Type | SymbolKind::Trait | SymbolKind::Interface
+    ) && let Some(signature) =
+        super::ts_signature::type_members::declaration_signature(sym, root, source)
+    {
+        return signature;
+    }
     if matches!(sym.kind, SymbolKind::Function | SymbolKind::Method) {
         let start = tree_sitter::Point {
             row: sym.range.start.line,

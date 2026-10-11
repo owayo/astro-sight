@@ -879,6 +879,10 @@ pub(crate) fn classify_signature_change(
         state.buckets.compatible_modified.push(compat);
         return;
     }
+    if let Some(compat) = detect_type_members_compatible_mod(&site, sources) {
+        state.buckets.compatible_modified.push(compat);
+        return;
+    }
     // TS/TSX の関数末尾へ optional/default 引数を追加しただけなら、既存呼び出しの required
     // arity は変わらないため compatible_modified として扱う。
     if let Some(compat) = detect_trailing_optional_params_compatible_mod(&site, sources) {
