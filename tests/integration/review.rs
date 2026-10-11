@@ -526,6 +526,48 @@ fn review_hook_callback_header_changes_stay_blocking() {
         assert_eq!(json["api"]["mod"][0]["n"], "handle", "{stderr}");
         assert!(json["api"]["callback_body"].is_null(), "{stderr}");
     }
+    for (before, after) in [
+        (
+            "export const handle = wrap(q`select ${name} from items`);\n",
+            "export const handle = wrap(q`select ${other} from items`);\n",
+        ),
+        (
+            "export const handle = wrap(q`select ${name} from items`);\n",
+            "export const handle = wrap(q`select ${name}${other} from items`);\n",
+        ),
+        (
+            "export const handle = wrap(q`select items`);\n",
+            "export const handle = wrap(sql`select active_items`);\n",
+        ),
+        (
+            "export const handle = wrap(q<A>`select items`);\n",
+            "export const handle = wrap(q<B>`select active_items`);\n",
+        ),
+        (
+            "export const handle = wrap(`select items`);\n",
+            "export const handle = wrap(`select active_items`);\n",
+        ),
+        (
+            "export const handle = wrap('select items');\n",
+            "export const handle = wrap('select active_items');\n",
+        ),
+    ] {
+        let output = a3_review_hook(
+            |root| std::fs::write(root.join("api.ts"), after).unwrap(),
+            &[
+                ("api.ts", before),
+                (
+                    "use.ts",
+                    "import { handle } from './api';\nexport const used = handle;\n",
+                ),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{before} -> {after}: {stderr}");
+        let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert_eq!(json["api"]["mod"][0]["n"], "handle", "{stderr}");
+        assert!(json["api"]["callback_body"].is_null(), "{stderr}");
+    }
 }
 
 #[test]
@@ -594,6 +636,59 @@ fn review_hook_callback_body_edits_remain_visible() {
             "{stderr}"
         );
     }
+}
+
+#[test]
+fn review_hook_tagged_template_text_is_informational() {
+    let before = "export const handle = view('totals').as(q`select ${name} from items`);\n";
+    let after = "export const handle = view('totals').as(q`select ${name} from active_items`);\n";
+    let mut strict_output = None;
+    let output = a3_review_hook(
+        |root| {
+            std::fs::write(root.join("api.ts"), after).unwrap();
+            strict_output = Some(
+                cargo_bin()
+                    .args([
+                        "review",
+                        "--dir",
+                        root.to_str().unwrap(),
+                        "--git",
+                        "--hook",
+                        "--strict-public-const-values",
+                    ])
+                    .output()
+                    .unwrap(),
+            );
+        },
+        &[
+            ("api.ts", before),
+            (
+                "use.ts",
+                "import { handle } from './api';\nexport const used = handle;\n",
+            ),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(json["blocking_categories"], serde_json::json!([]));
+    assert_eq!(json["api"]["callback_body"][0]["n"], "handle");
+    assert_eq!(
+        json["api"]["callback_body"][0]["reason"],
+        "callback_body_change"
+    );
+    assert!(json["api"]["mod"].is_null(), "{stderr}");
+    assert!(json["impacts"].is_null(), "{stderr}");
+
+    let strict = strict_output.unwrap();
+    let stderr = String::from_utf8_lossy(&strict.stderr);
+    assert!(!strict.status.success(), "{stderr}");
+    let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(
+        json["blocking_categories"],
+        serde_json::json!(["impacts", "api.callback_body"]),
+        "{stderr}"
+    );
 }
 
 #[test]
