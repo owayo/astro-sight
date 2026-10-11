@@ -1,6 +1,148 @@
 //! Python の API 差分検出テスト。
 
 #[test]
+fn python_same_name_methods_close_only_when_all_definitions_and_callers_change() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+
+    for (label, update_fake, update_summary, malformed_fake, should_close) in [
+        ("all updated", true, true, false, true),
+        ("unchanged fake definition", false, true, false, false),
+        ("unchanged caller", true, false, false, false),
+        ("malformed fake file", true, true, true, false),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                ("shop/__init__.py", ""),
+                (
+                    "shop/catalog.py",
+                    "class Catalog:\n    def price(self, sku: str) -> int:\n        return len(sku)\n",
+                ),
+                (
+                    "shop/report.py",
+                    "from typing import Protocol\n\nclass PriceSource(Protocol):\n    def price(self, sku: str) -> int: ...\n\ndef summary(source: PriceSource) -> int:\n    return source.price('a')\n",
+                ),
+                (
+                    "tests/test_report.py",
+                    "from shop.report import summary\n\nclass FakeSource:\n    def price(self, sku: str) -> int:\n        return 1\n\ndef test_summary():\n    assert summary(FakeSource()) == 1\n",
+                ),
+                (
+                    "tests/test_catalog.py",
+                    "from shop.catalog import Catalog\n\ndef test_price():\n    assert Catalog().price('ab') == 2\n",
+                ),
+            ],
+            "initial",
+        );
+        std::fs::write(
+            repo.join("shop/catalog.py"),
+            "class Catalog:\n    def price(self, sku: str, currency: str) -> int:\n        return len(sku) + len(currency)\n",
+        )
+        .expect("write catalog");
+        std::fs::write(
+            repo.join("shop/report.py"),
+            if update_summary {
+                "from typing import Protocol\n\nclass PriceSource(Protocol):\n    def price(self, sku: str, currency: str) -> int: ...\n\ndef summary(source: PriceSource) -> int:\n    return source.price('a', 'usd')\n"
+            } else {
+                "from typing import Protocol\n\nclass PriceSource(Protocol):\n    def price(self, sku: str, currency: str) -> int: ...\n\ndef summary(source: PriceSource) -> int:\n    return source.price('a')\n"
+            },
+        )
+        .expect("write report");
+        if update_fake {
+            std::fs::write(
+                repo.join("tests/test_report.py"),
+                if malformed_fake {
+                    "from shop.report import summary\n\nclass FakeSource:\n    def price(self, sku: str, currency: str) -> int:\n        return 1\n\ndef test_summary():\n    assert summary(FakeSource()) == 1\n\ndef broken(\n"
+                } else {
+                    "from shop.report import summary\n\nclass FakeSource:\n    def price(self, sku: str, currency: str) -> int:\n        return 1\n\ndef test_summary():\n    assert summary(FakeSource()) == 1\n"
+                },
+            )
+            .expect("write fake");
+        }
+        std::fs::write(
+            repo.join("tests/test_catalog.py"),
+            "from shop.catalog import Catalog\n\ndef test_price():\n    assert Catalog().price('ab', '') == 2\n",
+        )
+        .expect("write test");
+
+        let changes = detect_api_changes_from_worktree(repo);
+        for name in ["Catalog.price", "PriceSource.price"] {
+            assert_eq!(
+                changes
+                    .modified_closed_in_diff
+                    .iter()
+                    .any(|change| change.name == name),
+                should_close,
+                "{label} / {name}: {changes:?}"
+            );
+            assert_eq!(
+                changes.modified.iter().any(|change| change.name == name),
+                !should_close,
+                "{label} / {name}: {changes:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn python_same_name_test_fake_does_not_block_updated_method_and_callers() {
+    use crate::commands::tests::common::{
+        detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            ("shop/__init__.py", ""),
+            (
+                "shop/catalog.py",
+                "class Catalog:\n    def price(self, sku: str) -> int:\n        return len(sku)\n",
+            ),
+            (
+                "shop/report.py",
+                "from shop.catalog import Catalog\n\ndef summary(catalog: Catalog) -> int:\n    return catalog.price('a')\n",
+            ),
+            (
+                "tests/test_fake.py",
+                "class FakeCatalog:\n    def price(self, sku: str) -> int:\n        return 1\n\ndef test_fake():\n    assert FakeCatalog().price('a') == 1\n",
+            ),
+        ],
+        "initial",
+    );
+    std::fs::write(
+        repo.join("shop/catalog.py"),
+        "class Catalog:\n    def price(self, sku: str, currency: str) -> int:\n        return len(sku) + len(currency)\n",
+    )
+    .expect("write catalog");
+    std::fs::write(
+        repo.join("shop/report.py"),
+        "from shop.catalog import Catalog\n\ndef summary(catalog: Catalog) -> int:\n    return catalog.price('a', 'usd')\n",
+    )
+    .expect("write report");
+    std::fs::write(
+        repo.join("tests/test_fake.py"),
+        "class FakeCatalog:\n    def price(self, sku: str, currency: str) -> int:\n        return 1\n\ndef test_fake():\n    assert FakeCatalog().price('a', 'usd') == 1\n",
+    )
+    .expect("write fake");
+
+    let changes = detect_api_changes_from_worktree(repo);
+    assert!(
+        changes
+            .modified_closed_in_diff
+            .iter()
+            .any(|change| change.name == "Catalog.price"),
+        "updated fake and caller should close the changed method: {changes:?}"
+    );
+}
+
+#[test]
 fn detect_api_changes_python_lambda_binding_replaces_callable_not_name() {
     use crate::commands::tests::common::{
         detect_api_changes_from_worktree, git_commit_files, init_git_repo_for_test,
