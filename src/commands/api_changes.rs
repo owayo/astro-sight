@@ -616,6 +616,7 @@ pub(crate) mod python_module_path;
 
 mod python_literal;
 mod python_member_origin;
+mod python_private_owner;
 
 mod python_protocol_arg;
 

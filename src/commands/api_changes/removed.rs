@@ -105,6 +105,12 @@ pub(crate) fn partition_removed_dead_candidates(
     // import 先のモジュールが公開名をどう export しているかの判定 (候補ファイルごとに 1 回)。
     let mut export_cache = super::js_ref_sites::JsExportOriginCache::default();
     let mut python_members = super::python_member_origin::PythonMemberOrigins::default();
+    let mut private_owners = super::python_private_owner::PrivateOwnerRemovals::default();
+    let python_old_paths: HashSet<String> = candidates
+        .iter()
+        .filter(|candidate| candidate.file.ends_with(".py"))
+        .map(|candidate| candidate.file.clone())
+        .collect();
 
     // Pass 1: bare_name ごとの残存定義ファイル集合。参照帰属の照合先になる。
     let mut definition_paths: HashMap<String, HashSet<String>> = HashMap::new();
@@ -204,6 +210,17 @@ pub(crate) fn partition_removed_dead_candidates(
             name: &c.name,
             kind: &c.kind,
         };
+        if python_input_complete
+            && private_owners.proves_closed_removal(
+                dir,
+                base_blobs,
+                &candidate_ref,
+                &python_old_paths,
+            )
+        {
+            removed_dead.push(c);
+            continue;
+        }
         if python_input_complete
             && references_by_name
                 .get(bare.as_str())

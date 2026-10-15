@@ -36,6 +36,7 @@ mod integration {
     mod output_format;
     mod php_member_liveness;
     mod python_member_removal;
+    mod python_private_owner_removal;
     mod refs;
     mod review;
     mod review_dead_scope;
