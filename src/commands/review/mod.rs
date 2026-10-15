@@ -16,7 +16,7 @@ use super::dead_code::{
     filter_diff_files_for_dead_code, resolve_dead_code_excludes,
     resolve_framework_globs_with_auto_detect,
 };
-use super::git_input::{DiffSourceResolution, resolve_diff_source, run_git_diff};
+use super::git_input::{DiffSourceResolution, GitDiffShortRead, resolve_diff_source, run_git_diff};
 use hook::review_hook_output;
 use missing_cochange::{ReviewCochangeInput, detect_missing_cochanges_scoped};
 
@@ -25,6 +25,8 @@ pub mod hook;
 mod index_snapshot;
 pub(crate) mod missing_cochange;
 mod recent_cochange;
+#[cfg(test)]
+mod retry_tests;
 
 // ---------------------------------------------------------------------------
 // Review コマンド: impact / cochange / API surface diff / dead symbol 統合
@@ -56,7 +58,51 @@ pub struct CmdReviewOpts<'a> {
     pub include_generated: bool,
 }
 
+const REVIEW_MAX_ATTEMPTS: usize = 3;
+
 pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> {
+    let git_input = opts.git && opts.diff.is_none() && opts.diff_file.is_none();
+    let result = retry_review(git_input, |_| review_attempt(service, opts, |_, _| {}));
+    if opts.hook && result.as_ref().is_err_and(review_input_changed) {
+        eprintln!("review input kept changing; run review again");
+    }
+    result
+}
+
+fn review_input_changed(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<AstroError>()
+        .is_some_and(|error| error.code == ErrorCode::ReviewInputChanged)
+}
+
+/// Git 入力だけを差分取得からやり直す。結果や一時 snapshot は試行をまたいで持たない。
+fn retry_review<T>(git_input: bool, mut attempt: impl FnMut(usize) -> Result<T>) -> Result<T> {
+    let attempts = if git_input { REVIEW_MAX_ATTEMPTS } else { 1 };
+    for number in 1..=attempts {
+        match attempt(number) {
+            Err(error)
+                if git_input
+                    && (review_input_changed(&error)
+                        || error.downcast_ref::<GitDiffShortRead>().is_some()) => {}
+            result => return result,
+        }
+    }
+    Err(AstroError::new(
+        ErrorCode::ReviewInputChanged,
+        format!(
+            "review input kept changing during analysis ({attempts} attempts); run review again"
+        ),
+    )
+    .into())
+}
+
+/// 競合しうる読み込みと出力前の確認を一つの試行に閉じる。
+/// before_check は同期テスト用。本番の空クロージャは最適化で除かれる。
+fn review_attempt(
+    service: &AppService,
+    opts: &CmdReviewOpts<'_>,
+    mut before_check: impl FnMut(&ReviewResult, &str),
+) -> Result<()> {
     // 本体は従来の局所変数名のまま使うため、ここで一括分解する
     // (全フィールド Copy。本体側の書き換えゼロ = 引数取り違えの余地ゼロ)。
     let &CmdReviewOpts {
@@ -316,6 +362,7 @@ pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> 
         truncations,
     };
 
+    before_check(&result, analysis_dir);
     ensure_review_diff_unchanged(
         dir,
         pinned_base.as_deref(),
@@ -366,7 +413,7 @@ fn ensure_review_diff_unchanged(
         let current_diff = run_git_diff(dir, base, staged)?;
         if current_diff != original_diff {
             return Err(AstroError::new(
-                ErrorCode::InvalidRequest,
+                ErrorCode::ReviewInputChanged,
                 "review input changed during analysis; run review again",
             )
             .into());
@@ -375,7 +422,7 @@ fn ensure_review_diff_unchanged(
             let current = run_git_diff(dir, base, false)?;
             if current != original {
                 return Err(AstroError::new(
-                    ErrorCode::InvalidRequest,
+                    ErrorCode::ReviewInputChanged,
                     "review working tree changed during analysis; run review again",
                 )
                 .into());

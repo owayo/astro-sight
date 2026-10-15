@@ -127,7 +127,11 @@ When a command that accepts `--git` (`context` / `impact` / `review` / `dead-cod
 
 The check uses `git rev-parse --is-inside-work-tree` (with `LC_ALL=C`), so worktrees, submodules, and bare repositories are detected correctly. **Real errors** (an invalid `--base`, a base that cannot resolve to a commit, git not runnable, a broken repository, missing permissions) return `exit 1`. Passing a diff through `--diff` / `--diff-file` / stdin does not go through this check.
 
-For `review --git`, the base is resolved to a commit once and used for the diff, cochange, and API analysis. If the index or working tree changes during review, the command returns `exit 1` and asks you to run it again. With `--staged`, the index contents are written to a temporary directory, and impact, API, and dead-code analysis all read those contents. Unstaged edits in the working tree do not enter the result (for large repositories, see "Size limit of the staged snapshot").
+`review --git` makes at most three attempts when the index or working tree changes during analysis, or when `git diff` reports a short read while indexing a file. Each attempt starts by acquiring the diff again and resolving the base to a commit. That commit stays fixed for the attempt's diff, cochange, and API analysis; moving HEAD alone does not invalidate it. Failed results and temporary snapshots are discarded.
+
+If all three attempts fail for these reasons, both normal review and `--hook` return `REVIEW_INPUT_CHANGED` with **exit 2**. A single JSON error is printed to stdout; `--hook` also prints a short instruction to rerun review on stderr. Other errors and blocking hook findings keep exit 1. Explicit `--diff`, `--diff-file`, and stdin inputs are not retried.
+
+With `--staged`, the index contents are written to a temporary directory, and impact, API, and dead-code analysis all read those contents. Unstaged edits in the working tree do not enter the result (for large repositories, see "Size limit of the staged snapshot").
 
 ### Limit on Untracked Files
 

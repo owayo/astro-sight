@@ -67,6 +67,7 @@ fn main() {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             let (code, message) = commands::classify_error(&e);
+            let exit_code = if code == "REVIEW_INPUT_CHANGED" { 2 } else { 1 };
             let error = serde_json::json!({
                 "error": { "code": code, "message": message }
             });
@@ -76,7 +77,7 @@ fn main() {
                 }
                 eprintln!("failed to write error output: {write_error}");
             }
-            std::process::exit(1);
+            std::process::exit(exit_code);
         }
         Err(payload) => {
             if is_broken_pipe_panic_payload(payload.as_ref()) {

@@ -588,6 +588,16 @@ pub fn run_git_diff(dir: &str, base: &str, staged: bool) -> Result<String> {
     run_git_diff_collecting_truncations(dir, base, staged, &mut Vec::new())
 }
 
+/// review が再試行できる short read。元の AstroError の分類と表示を context 内に保つ。
+#[derive(Debug)]
+pub(crate) struct GitDiffShortRead(String);
+
+impl std::fmt::Display for GitDiffShortRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 fn run_git_diff_collecting_truncations(
     dir: &str,
     base: &str,
@@ -633,6 +643,7 @@ fn run_git_diff_collecting_truncations(
     let mut child = crate::git_support::git_command_for_dir(dir)
         .args(&args)
         .current_dir(dir)
+        .env("LC_ALL", "C")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -667,11 +678,22 @@ fn run_git_diff_collecting_truncations(
 
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr_bytes);
-        return Err(AstroError::new(
+        let error: anyhow::Error = AstroError::new(
             ErrorCode::InvalidRequest,
             format!("git diff failed: {stderr}"),
         )
-        .into());
+        .into();
+        return Err(
+            if stderr
+                .lines()
+                .any(|line| line.starts_with("error: short read while indexing "))
+            {
+                let marker = GitDiffShortRead(error.to_string());
+                error.context(marker)
+            } else {
+                error
+            },
+        );
     }
 
     let mut diff = String::from_utf8(stdout_bytes).map_err(|e| {

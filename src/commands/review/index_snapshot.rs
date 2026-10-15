@@ -384,9 +384,11 @@ impl IndexSnapshot {
             false,
         )?) != diff_contract(expected_diff)
         {
-            return Err(failure(
+            return Err(AstroError::new(
+                ErrorCode::ReviewInputChanged,
                 "Staged input changed while creating the analysis snapshot",
-            ));
+            )
+            .into());
         }
         Ok(PreparedSnapshot::Ready(Self {
             _temporary: temporary,

@@ -400,7 +400,7 @@ MCP クライアント設定例:
 
 ## エラー出力
 
-エラーは JSON 形式で stdout に出力し、exit code 1 で終了:
+エラーは JSON 形式で stdout に出力し、通常は exit code 1 で終了:
 
 ```bash
 astro-sight ast --path nonexistent.rs
@@ -410,4 +410,6 @@ astro-sight ast --path nonexistent.rs
 {"error":{"code":"FILE_NOT_FOUND","message":"File not found: nonexistent.rs"}}
 ```
 
-`astro-sight symbols --dir src | head` のように、下流コマンドが先に終了して stdout pipe が閉じた場合は panic を表示せず exit 0 で終了する。これは CLI 利用時の通常のページング・サンプリングを壊さないための挙動で、実際の解析エラーは JSON エラーと exit code 1 で返す。
+`review --git` は入力の変化と Git の取り込み中の short read を検出すると、最大 3 回まで試行する。入力が定まらなければ、通常の review と `--hook` は `REVIEW_INPUT_CHANGED` の JSON エラーを 1 件出力し、exit 2 で終了する。hook は stderr に再実行の案内も出す。blocking 指摘と他のエラーは exit 1 を維持する。明示した diff と stdin の入力は再試行しない。詳しくは [差分解析](diff-analysis.ja.md#git-管理外ディレクトリでのスキップ) を参照。
+
+`astro-sight symbols --dir src | head` のように、下流コマンドが先に終了して stdout pipe が閉じた場合は panic を表示せず exit 0 で終了する。これは CLI 利用時の通常のページング・サンプリングを壊さないための挙動で、他の解析エラーは JSON エラーと exit code 1 で返す。

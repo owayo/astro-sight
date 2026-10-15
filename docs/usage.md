@@ -397,7 +397,7 @@ MCP client configuration:
 
 ## Error Output
 
-Errors are printed to stdout as JSON, and the process exits with code 1:
+Errors are printed to stdout as JSON, and the process normally exits with code 1:
 
 ```bash
 astro-sight ast --path nonexistent.rs
@@ -407,4 +407,6 @@ astro-sight ast --path nonexistent.rs
 {"error":{"code":"FILE_NOT_FOUND","message":"File not found: nonexistent.rs"}}
 ```
 
-When a downstream command ends first and closes the stdout pipe, as in `astro-sight symbols --dir src | head`, astro-sight exits 0 without printing a panic. This keeps ordinary paging and sampling on the command line working; real analysis errors return a JSON error and exit code 1.
+`review --git` retries input changes and Git indexing short reads up to three attempts. If the input still does not stabilize, normal review and `--hook` return one `REVIEW_INPUT_CHANGED` JSON error with exit 2. The hook also prints a rerun instruction to stderr. Blocking hook findings and other errors keep exit 1. Explicit diff and stdin inputs are not retried; see [diff analysis](diff-analysis.md#skipping-directories-outside-git).
+
+When a downstream command ends first and closes the stdout pipe, as in `astro-sight symbols --dir src | head`, astro-sight exits 0 without printing a panic. This keeps ordinary paging and sampling on the command line working; other analysis errors return a JSON error and exit code 1.

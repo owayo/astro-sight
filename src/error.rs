@@ -10,6 +10,7 @@ pub enum ErrorCode {
     CacheError,
     IoError,
     InvalidRequest,
+    ReviewInputChanged,
     PathOutOfBounds,
     /// 内部不変条件の違反。`main.rs` の直列化失敗フォールバックが既に
     /// `INTERNAL_ERROR` を出しており、その語彙に合わせる。
@@ -26,6 +27,7 @@ impl fmt::Display for ErrorCode {
             Self::CacheError => write!(f, "CACHE_ERROR"),
             Self::IoError => write!(f, "IO_ERROR"),
             Self::InvalidRequest => write!(f, "INVALID_REQUEST"),
+            Self::ReviewInputChanged => write!(f, "REVIEW_INPUT_CHANGED"),
             Self::PathOutOfBounds => write!(f, "PATH_OUT_OF_BOUNDS"),
             Self::InternalError => write!(f, "INTERNAL_ERROR"),
         }

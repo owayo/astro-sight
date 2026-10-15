@@ -127,7 +127,11 @@ condition = { command_exists = "astro-sight" }
 
 判定には `git rev-parse --is-inside-work-tree`（`LC_ALL=C`）を使うので、worktree / submodule / bare repo でも正しく判定できる。**真のエラー**（`--base` 不正・base がコミットに解決できない・git 実行不能・壊れた repo・権限不足）は `exit 1` を返す。`--diff` / `--diff-file` / stdin で diff を渡す経路は、この判定を通らない。
 
-`review --git` は開始時に base をコミット ID に固定し、差分・cochange・API 解析で共有する。解析中に index や作業ツリーが変わった場合は `exit 1` で再実行を促す。`--staged` は index の内容を一時ディレクトリに書き出し、影響・API 差分・dead-code をすべてその内容で解析する。作業ツリーにある未ステージの編集は結果に入らない (大きなリポジトリの扱いは「staged review の書き出しの上限」を参照)。
+`review --git` は解析中の入力変化を検出すると、最大 3 回まで試行する。対象は index・作業ツリーの変化と、`git diff` がファイルの取り込み中に返す short read。各試行で差分取得からやり直し、base をコミット ID に解決する。その ID を試行内の差分・cochange・API 解析で共有するため、HEAD の移動だけでは試行を無効にしない。失敗した結果と一時 snapshot は破棄する。
+
+3 回とも入力が定まらなければ、通常の review と `--hook` は `REVIEW_INPUT_CHANGED` を返し、**exit 2** で終了する。stdout には JSON エラーを 1 件出力し、`--hook` では stderr に再実行を促す短い案内も出す。他のエラーと hook の blocking 指摘は exit 1 を維持する。明示した `--diff`・`--diff-file`・stdin の入力は再試行しない。
+
+`--staged` は index の内容を一時ディレクトリに書き出し、影響・API 差分・dead-code をすべてその内容で解析する。作業ツリーにある未ステージの編集は結果に入らない (大きなリポジトリの扱いは「staged review の書き出しの上限」を参照)。
 
 ### 未追跡ファイルの取り込み上限
 
