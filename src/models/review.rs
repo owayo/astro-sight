@@ -98,6 +98,9 @@ pub struct ApiChanges {
     pub property_to_field: Vec<PropertyToFieldChange>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub removed_dead: Vec<ApiSymbol>,
+    /// 削除は確定しているが、型要求のある参照の receiver を確定できない候補。
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub removed_unresolved: Vec<UnresolvedApiRemoval>,
     /// シグネチャ変更だが、全 cross-file 参照が同一 diff 内の変更 hunk で追随済みの api.mod。
     /// 呼び出し側が同一コミットで更新済みのため破壊的でなく、stop hook をブロックしない
     /// informational 扱い (Issue 2026-05-29-swift-sidecar-api-mod パターンA)。
@@ -145,6 +148,60 @@ pub struct UncertainApiRemoval {
     pub line: usize,
     pub old_signature: String,
     pub reason: crate::models::truncation::TruncationReason,
+}
+
+/// 実行時の前提を伴う低確信度の分類。残存参照ゼロの証明ではない。
+#[derive(Debug, Clone, Serialize)]
+pub struct UnresolvedApiRemoval {
+    #[serde(flatten)]
+    pub symbol: ApiSymbol,
+    pub reason: UnresolvedRemovalReason,
+    pub confidence: UnresolvedRemovalConfidence,
+    pub references: Vec<UnresolvedMemberReference>,
+    pub field_owners: Vec<UnresolvedFieldOwner>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnresolvedRemovalReason {
+    UnresolvedReceiverTypeDemand,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnresolvedRemovalConfidence {
+    Low,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberTypeDemand {
+    UnaryNumeric,
+    NumericArithmetic,
+    NumericOrdering,
+    Int,
+    Float,
+    Abs,
+    Round,
+    Range,
+    Len,
+    SumElement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnresolvedMemberReference {
+    pub file: String,
+    pub line: usize,
+    pub column: usize,
+    pub demand: MemberTypeDemand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnresolvedFieldOwner {
+    pub file: String,
+    pub class: String,
+    pub line: usize,
+    pub column: usize,
 }
 
 /// 公開シンボル情報。

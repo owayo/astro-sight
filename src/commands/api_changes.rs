@@ -339,7 +339,7 @@ pub(crate) fn detect_api_changes(
     // ならなかった削除は、`old_path` 依存の帰属判定で片方だけ `removed_dead` へ落ちうる
     // ため、blocking と informational に割れたときだけ保守側 (blocking) へ寄せる
     // (揃っているグループは触らない。Issue 2026-08-21-api-consolidation-many-to-one-move)。
-    let (mut removed_kept, removed_dead) =
+    let (mut removed_kept, removed_dead, removed_unresolved) =
         partition_removed_dead_candidates(dir, &base_blobs, removed, &ambiguous_relation_keys);
     removed_kept.extend(unverified_removed);
 
@@ -361,6 +361,7 @@ pub(crate) fn detect_api_changes(
         .collect();
 
     ApiChanges {
+        removed_unresolved,
         uncertain_removals: buckets.uncertain_removals,
         parse_truncations: buckets.parse_truncations,
         added,

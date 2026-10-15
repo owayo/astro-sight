@@ -207,7 +207,35 @@ struct HookUncertainRemoval<'a> {
 }
 
 #[derive(Serialize)]
+struct HookUnresolvedRemoval<'a> {
+    n: &'a str,
+    f: &'a str,
+    r: crate::models::review::UnresolvedRemovalReason,
+    confidence: crate::models::review::UnresolvedRemovalConfidence,
+    refs: Vec<HookDemandReference<'a>>,
+    field_owners: Vec<HookFieldOwner<'a>>,
+}
+
+#[derive(Serialize)]
+struct HookDemandReference<'a> {
+    f: &'a str,
+    l: usize,
+    c: usize,
+    d: crate::models::review::MemberTypeDemand,
+}
+
+#[derive(Serialize)]
+struct HookFieldOwner<'a> {
+    f: &'a str,
+    n: &'a str,
+    l: usize,
+    c: usize,
+}
+
+#[derive(Serialize)]
 struct HookApi<'a> {
+    #[serde(rename = "rm_unresolved", skip_serializing_if = "Vec::is_empty")]
+    removed_unresolved: Vec<HookUnresolvedRemoval<'a>>,
     #[serde(rename = "rm_unverified", skip_serializing_if = "Vec::is_empty")]
     uncertain_removals: Vec<HookUncertainRemoval<'a>>,
     #[serde(rename = "add", skip_serializing_if = "Vec::is_empty")]
@@ -264,6 +292,36 @@ impl<'a> HookApi<'a> {
         let added_scope = (!added.is_empty()).then_some("no_cross_file_refs_in_diff");
         Self {
             added,
+            removed_unresolved: api
+                .removed_unresolved
+                .iter()
+                .map(|removal| HookUnresolvedRemoval {
+                    n: &removal.symbol.name,
+                    f: &removal.symbol.file,
+                    r: removal.reason,
+                    confidence: removal.confidence,
+                    refs: removal
+                        .references
+                        .iter()
+                        .map(|reference| HookDemandReference {
+                            f: &reference.file,
+                            l: reference.line,
+                            c: reference.column,
+                            d: reference.demand,
+                        })
+                        .collect(),
+                    field_owners: removal
+                        .field_owners
+                        .iter()
+                        .map(|owner| HookFieldOwner {
+                            f: &owner.file,
+                            n: &owner.class,
+                            l: owner.line,
+                            c: owner.column,
+                        })
+                        .collect(),
+                })
+                .collect(),
             uncertain_removals: api
                 .uncertain_removals
                 .iter()
@@ -352,6 +410,7 @@ impl<'a> HookApi<'a> {
 
     fn is_empty(&self) -> bool {
         self.added.is_empty()
+            && self.removed_unresolved.is_empty()
             && self.uncertain_removals.is_empty()
             && self.removed.is_empty()
             && self.modified.is_empty()

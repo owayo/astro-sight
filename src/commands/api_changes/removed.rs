@@ -1,6 +1,9 @@
 //! 削除候補の最終分類。参照 0 件の removed_dead 振り分けと、外部 import / bash / Python 固有の帰属判定を担う。
 
 use super::*;
+use crate::models::review::{
+    UnresolvedApiRemoval, UnresolvedRemovalConfidence, UnresolvedRemovalReason,
+};
 
 /// `removed` 候補のうち、HEAD ツリーで repo 内参照 0 件のものを `removed_dead` に
 /// 振り分ける。残りは `removed` (破壊的削除) として返す。
@@ -37,12 +40,16 @@ pub(crate) fn partition_removed_dead_candidates(
     base_blobs: &crate::commands::git_input::GitBlobBatch,
     candidates: Vec<ApiSymbolCandidate>,
     ambiguous_relation_keys: &HashSet<ApiRelationKey>,
-) -> (Vec<ApiSymbolCandidate>, Vec<ApiSymbolCandidate>) {
+) -> (
+    Vec<ApiSymbolCandidate>,
+    Vec<ApiSymbolCandidate>,
+    Vec<UnresolvedApiRemoval>,
+) {
     use crate::models::reference::RefKind;
     use std::collections::HashMap;
 
     if candidates.is_empty() {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
 
     // 候補から bare name を重複排除して集める
@@ -69,7 +76,7 @@ pub(crate) fn partition_removed_dead_candidates(
         Ok(r) => r,
         Err(_) => {
             // 検索失敗時は保守的にすべて removed に残す
-            return (candidates, Vec::new());
+            return (candidates, Vec::new(), Vec::new());
         }
     };
     let python_input_complete = batch_result.iter().all(|result| result.input_is_complete());
@@ -170,6 +177,7 @@ pub(crate) fn partition_removed_dead_candidates(
         HashMap::new();
     let mut removed_kept = Vec::new();
     let mut removed_dead = Vec::new();
+    let mut removed_unresolved = Vec::new();
     let references_by_name: HashMap<_, _> = batch_result
         .iter()
         .map(|result| (result.symbol.as_str(), result.references.as_slice()))
@@ -239,6 +247,34 @@ pub(crate) fn partition_removed_dead_candidates(
                 })
         {
             removed_dead.push(c);
+            continue;
+        }
+        // 対応付けが曖昧な move は、この低確信度の分類に含めない。
+        if python_input_complete
+            && !ambiguous_relation_keys.contains(&api_relation_key(&c))
+            && let Some(evidence) = references_by_name
+                .get(bare.as_str())
+                .and_then(|references| {
+                    python_members.unresolved_type_demands(
+                        dir,
+                        base_blobs,
+                        &candidate_ref,
+                        references,
+                        c.name
+                            .split_once('.')
+                            .and_then(|(owner, _)| references_by_name.get(owner))
+                            .copied()
+                            .unwrap_or_default(),
+                    )
+                })
+        {
+            removed_unresolved.push(UnresolvedApiRemoval {
+                symbol: c.into_api_symbol(),
+                reason: UnresolvedRemovalReason::UnresolvedReceiverTypeDemand,
+                confidence: UnresolvedRemovalConfidence::Low,
+                references: evidence.references,
+                field_owners: evidence.field_owners,
+            });
             continue;
         }
         // Rust の削除を Swift / JS / TS が同名で参照している場合だけ、旧ツリーの FFI・
@@ -360,7 +396,7 @@ pub(crate) fn partition_removed_dead_candidates(
         }
     }
 
-    (removed_kept, removed_dead)
+    (removed_kept, removed_dead, removed_unresolved)
 }
 
 /// 現在の index が所有する gitlink。取得失敗・未マージ・上限超過なら除外しない。

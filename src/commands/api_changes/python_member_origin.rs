@@ -12,6 +12,15 @@ use crate::engine::parser;
 use crate::engine::tree_walk::{Children, Walk, walk_preorder};
 use crate::language::LangId;
 use crate::models::reference::SymbolReference;
+use crate::models::review::{UnresolvedFieldOwner, UnresolvedMemberReference};
+
+#[path = "python_member_origin/type_demand.rs"]
+mod type_demand;
+
+pub(super) struct TypeDemandEvidence {
+    pub references: Vec<UnresolvedMemberReference>,
+    pub field_owners: Vec<UnresolvedFieldOwner>,
+}
 
 const MAX_SOURCE_BYTES: usize = 1_000_000;
 const MAX_FILES: usize = 512;
@@ -27,12 +36,16 @@ struct ClassIdentity {
 struct Binding {
     id: usize,
     byte: usize,
+    imported: bool,
 }
 
 struct PythonFile {
     source: Vec<u8>,
     tree: Tree,
     bindings: HashMap<String, Vec<Binding>>,
+    builtins_access: bool,
+    custom_addition: bool,
+    deleted_names: std::collections::HashSet<String>,
 }
 
 #[derive(Default)]
@@ -41,7 +54,10 @@ pub(super) struct PythonMemberOrigins {
     old_files: HashMap<String, Option<Rc<PythonFile>>>,
     classes: HashMap<(String, String), Option<ClassIdentity>>,
     fields: HashMap<(String, String, String), bool>,
+    untyped_iterable_fields: HashMap<(String, String, String), bool>,
     inventory: Option<bool>,
+    builtins_untouched: bool,
+    addition_untouched: bool,
     cached_source_bytes: usize,
 }
 
@@ -68,26 +84,7 @@ impl PythonMemberOrigins {
         if member.contains('.') {
             return false;
         }
-        let old = if let Some(old) = self.old_files.get(candidate.old_path) {
-            old.clone()
-        } else {
-            if self.old_files.len() + self.files.len() >= MAX_FILES {
-                return false;
-            }
-            let old = base
-                .read_limited(candidate.old_path, MAX_SOURCE_BYTES)
-                .filter(|source| {
-                    source.len() <= MAX_CACHED_BYTES.saturating_sub(self.cached_source_bytes)
-                })
-                .and_then(PythonFile::parse)
-                .map(Rc::new);
-            if let Some(file) = &old {
-                self.cached_source_bytes += file.source.len();
-            }
-            self.old_files
-                .insert(candidate.old_path.to_owned(), old.clone());
-            old
-        };
+        let old = self.old_file(base, candidate.old_path);
         // 注釈の型は subclass も許す。削除 owner に基底クラスがある場合は、
         // 別クラスの field と同じ継承系列になり得るため証明しない。
         if old
@@ -118,6 +115,141 @@ impl PythonMemberOrigins {
             self.reference_owner(dir, reference, member)
                 .is_some_and(|class| class.path != candidate.old_path || class.name != owner)
         })
+    }
+
+    pub(super) fn unresolved_type_demands(
+        &mut self,
+        dir: &str,
+        base: &GitBlobBatch,
+        candidate: &RemovedCandidateRef<'_>,
+        references: &[SymbolReference],
+        owner_references: &[SymbolReference],
+    ) -> Option<TypeDemandEvidence> {
+        if !matches!(candidate.kind, "method" | "function") || !candidate.old_path.ends_with(".py")
+        {
+            return None;
+        }
+        let (owner, member) = candidate.name.split_once('.')?;
+        if member.contains('.') {
+            return None;
+        }
+        let old = self.old_file(base, candidate.old_path)?;
+        let class = local_class(&old, owner)?;
+        if old.builtins_access || !type_demand::ordinary_method(&old, class, member) {
+            return None;
+        }
+        // owner が消える変更は既存の消滅証明に任せる。
+        let current = self.file(dir, candidate.old_path)?;
+        local_class(&current, owner)?;
+        let inventory = if let Some(inventory) = self.inventory {
+            inventory
+        } else {
+            let inventory = self.project_is_static(dir);
+            self.inventory = Some(inventory);
+            inventory
+        };
+        if !inventory || !self.builtins_untouched {
+            return None;
+        }
+        let mut evidence = TypeDemandEvidence {
+            references: Vec::new(),
+            field_owners: Vec::new(),
+        };
+        let mut other_reads_safe = None;
+        for reference in references {
+            let file = self.file(dir, &reference.path)?;
+            let point = tree_sitter::Point::new(reference.line, reference.column);
+            let node = file
+                .tree
+                .root_node()
+                .named_descendant_for_point_range(point, point)?;
+            if let Some(class) = self.reference_owner(dir, reference, member) {
+                if class.path == candidate.old_path && class.name == owner {
+                    return None;
+                }
+                if field_declaration_owner(&file, node).is_some() {
+                    evidence.field_owners.push(UnresolvedFieldOwner {
+                        file: class.path,
+                        class: class.name,
+                        line: reference.line,
+                        column: reference.column,
+                    });
+                } else if !*other_reads_safe.get_or_insert_with(|| {
+                    !owner_references.is_empty()
+                        && owner_references
+                            .iter()
+                            .all(|reference| self.class_does_not_escape(dir, reference, owner))
+                }) {
+                    return None;
+                }
+                continue;
+            }
+            if node.kind() != "identifier" || text(node, &file.source) != Some(member) {
+                return None;
+            }
+            let attribute = node.parent()?;
+            if attribute.kind() != "attribute"
+                || attribute.child_by_field_name("attribute")?.id() != node.id()
+                || !is_field_read(attribute)
+            {
+                return None;
+            }
+            let receiver = attribute.child_by_field_name("object")?;
+            if self
+                .receiver_class(dir, &reference.path, &file, receiver)
+                .is_some()
+                || !type_demand::unknown_receiver(&file, receiver, owner, |root, field| {
+                    self.untyped_iterable_field(dir, &reference.path, &file, root, field)
+                })
+            {
+                return None;
+            }
+            let demand = type_demand::value_demand(&file, attribute)?;
+            if demand == crate::models::review::MemberTypeDemand::SumElement
+                && (old.custom_addition || !self.addition_untouched)
+            {
+                return None;
+            }
+            evidence.references.push(UnresolvedMemberReference {
+                file: reference.path.clone(),
+                line: reference.line,
+                column: reference.column,
+                demand,
+            });
+        }
+        if evidence.references.is_empty() || evidence.field_owners.is_empty() {
+            return None;
+        }
+        evidence.references.sort_by(|a, b| {
+            (&a.file, a.line, a.column, a.demand).cmp(&(&b.file, b.line, b.column, b.demand))
+        });
+        evidence.references.dedup();
+        evidence.field_owners.sort_by(|a, b| {
+            (&a.file, a.line, a.column, &a.class).cmp(&(&b.file, b.line, b.column, &b.class))
+        });
+        evidence.field_owners.dedup();
+        Some(evidence)
+    }
+
+    fn old_file(&mut self, base: &GitBlobBatch, path: &str) -> Option<Rc<PythonFile>> {
+        if let Some(old) = self.old_files.get(path) {
+            return old.clone();
+        }
+        if self.old_files.len() + self.files.len() >= MAX_FILES {
+            return None;
+        }
+        let old = base
+            .read_limited(path, MAX_SOURCE_BYTES)
+            .filter(|source| {
+                source.len() <= MAX_CACHED_BYTES.saturating_sub(self.cached_source_bytes)
+            })
+            .and_then(PythonFile::parse)
+            .map(Rc::new);
+        if let Some(file) = &old {
+            self.cached_source_bytes += file.source.len();
+        }
+        self.old_files.insert(path.to_owned(), old.clone());
+        old
     }
 
     fn file(&mut self, dir: &str, path: &str) -> Option<Rc<PythonFile>> {
@@ -157,7 +289,11 @@ impl PythonMemberOrigins {
 
     /// 名前を文字列から取得する経路は owner の refs だけでは見えない。
     /// 同じ探索範囲を一度だけ調べ、不要な source と Tree はその場で捨てる。
-    fn project_is_static(&self, dir: &str) -> bool {
+    fn project_is_static(&mut self, dir: &str) -> bool {
+        self.builtins_untouched = false;
+        self.addition_untouched = false;
+        let mut builtins_untouched = true;
+        let mut addition_untouched = true;
         let Some(root) = std::fs::canonicalize(dir).ok() else {
             return false;
         };
@@ -180,6 +316,8 @@ impl PythonMemberOrigins {
             };
             let relative = crate::git_support::normalize_workspace_separators(relative);
             if let Some(Some(file)) = self.files.get(&relative) {
+                builtins_untouched &= !file.builtins_access;
+                addition_untouched &= !file.custom_addition;
                 bytes += file.source.len();
                 if bytes > MAX_PROJECT_BYTES {
                     return false;
@@ -195,11 +333,50 @@ impl PythonMemberOrigins {
                 return false;
             };
             bytes += source.len();
-            if bytes > MAX_PROJECT_BYTES || PythonFile::parse(source).is_none() {
+            if bytes > MAX_PROJECT_BYTES {
                 return false;
             }
+            let Some(file) = PythonFile::parse(source) else {
+                return false;
+            };
+            builtins_untouched &= !file.builtins_access;
+            addition_untouched &= !file.custom_addition;
         }
+        self.builtins_untouched = builtins_untouched;
+        self.addition_untouched = addition_untouched;
         true
+    }
+
+    fn untyped_iterable_field(
+        &mut self,
+        dir: &str,
+        path: &str,
+        file: &PythonFile,
+        root: Node<'_>,
+        field: &str,
+    ) -> bool {
+        let class = (|| {
+            let function = enclosing_function(root)?;
+            let name = text(root, &file.source)?;
+            let annotation = parameter_annotation(file, function, name)?.named_child(0)?;
+            if annotation.kind() != "identifier" {
+                return None;
+            }
+            self.class_for_name(dir, path, file, text(annotation, &file.source)?)
+        })();
+        let Some(class) = class else {
+            return false;
+        };
+        let key = (class.path.clone(), class.name.clone(), field.to_owned());
+        if let Some(found) = self.untyped_iterable_fields.get(&key) {
+            return *found;
+        }
+        let found = self.file(dir, &class.path).is_some_and(|file| {
+            local_class(&file, &class.name)
+                .is_some_and(|class| class_has_untyped_parameter_field(&file, class, field))
+        });
+        self.untyped_iterable_fields.insert(key, found);
+        found
     }
 
     fn class_does_not_escape(
@@ -510,8 +687,30 @@ impl PythonFile {
         {
             return None;
         }
+        let builtins_access = all
+            .iter()
+            .any(|node| node.kind() == "identifier" && text(*node, &source) == Some("builtins"));
+        let custom_addition = all.iter().any(|node| {
+            node.kind() == "identifier"
+                && matches!(text(*node, &source), Some("__add__" | "__radd__"))
+        });
+        let mut deleted_names = std::collections::HashSet::new();
         let mut bindings: HashMap<String, Vec<Binding>> = HashMap::new();
         for node in all {
+            if node.kind() == "delete_statement" {
+                let _: std::ops::ControlFlow<()> =
+                    walk_preorder(node, Children::Named, |node, _| {
+                        if matches!(node.kind(), "attribute" | "subscript") {
+                            return std::ops::ControlFlow::Continue(Walk::Skip);
+                        }
+                        if node.kind() == "identifier"
+                            && let Some(name) = text(node, &source)
+                        {
+                            deleted_names.insert(name.to_owned());
+                        }
+                        std::ops::ControlFlow::Continue(Walk::Descend)
+                    });
+            }
             let pattern = match node.kind() {
                 "class_definition" | "function_definition" => node.child_by_field_name("name"),
                 "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
@@ -556,6 +755,9 @@ impl PythonFile {
             source,
             tree,
             bindings,
+            builtins_access,
+            custom_addition,
+            deleted_names,
         };
         class_bases_are_static(&file).then_some(file)
     }
@@ -595,6 +797,7 @@ fn record_pattern(
             bindings.entry(name.to_owned()).or_default().push(Binding {
                 id: binder.id(),
                 byte: binder.start_byte(),
+                imported: matches!(binder.kind(), "import_statement" | "import_from_statement"),
             });
         }
         std::ops::ControlFlow::Continue(Walk::Descend)
@@ -794,6 +997,83 @@ fn class_has_field(file: &PythonFile, class: Node<'_>, member: &str) -> bool {
         if field_declaration_owner(file, node).is_some_and(|owner| owner.id() == class.id()) {
             found = true;
         }
+    }
+    found
+}
+
+/// 型付き root でも、無注釈の引数をそのまま保存した field の要素型は断定しない。
+fn class_has_untyped_parameter_field(file: &PythonFile, class: Node<'_>, member: &str) -> bool {
+    if class.child_by_field_name("body").is_none_or(|body| {
+        children(body).iter().any(|statement| {
+            statement.kind() == "expression_statement"
+                && statement
+                    .named_child(0)
+                    .and_then(|assignment| assignment.child_by_field_name("left"))
+                    .is_some_and(|left| {
+                        nodes(left).iter().any(|node| {
+                            node.kind() == "identifier" && text(*node, &file.source) == Some(member)
+                        })
+                    })
+        })
+    }) {
+        return false;
+    }
+    let mut found = false;
+    for node in nodes(class) {
+        if node.kind() != "identifier" || text(node, &file.source) != Some(member) {
+            continue;
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        if parent.kind() != "attribute"
+            || parent
+                .child_by_field_name("attribute")
+                .map(|name| name.id())
+                != Some(node.id())
+        {
+            if parent.kind() == "function_definition"
+                && parent.child_by_field_name("name").map(|name| name.id()) == Some(node.id())
+            {
+                return false;
+            }
+            continue;
+        }
+        if is_field_read(parent) {
+            continue;
+        }
+        let Some(owner) = field_declaration_owner(file, node) else {
+            return false;
+        };
+        let Some(assignment) = parent.parent() else {
+            return false;
+        };
+        let Some(function) = enclosing_function(assignment) else {
+            return false;
+        };
+        let Some(right) = assignment.child_by_field_name("right") else {
+            return false;
+        };
+        let Some(name) = text(right, &file.source) else {
+            return false;
+        };
+        if found
+            || owner.id() != class.id()
+            || assignment.child_by_field_name("type").is_some()
+            || right.kind() != "identifier"
+            || !function
+                .child_by_field_name("parameters")
+                .is_some_and(|parameters| {
+                    children(parameters).iter().skip(1).any(|parameter| {
+                        parameter.kind() == "identifier"
+                            && text(*parameter, &file.source) == Some(name)
+                            && file.bound_once(name, parameter.id(), Some(function))
+                    })
+                })
+        {
+            return false;
+        }
+        found = true;
     }
     found
 }

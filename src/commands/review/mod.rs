@@ -504,6 +504,9 @@ fn keep_reference_based_downgrades_blocking(api: &mut ApiChanges) {
         }));
     let dead = std::mem::take(&mut api.removed_dead);
     api.removed.extend(dead);
+    let unresolved = std::mem::take(&mut api.removed_unresolved);
+    api.removed
+        .extend(unresolved.into_iter().map(|removal| removal.symbol));
 }
 
 #[cfg(test)]
@@ -648,7 +651,10 @@ mod snapshot_tests {
     /// blocking のバケットへ戻す。それ以外のバケットは動かさない。
     #[test]
     fn reference_based_downgrades_return_to_blocking_buckets() {
-        use crate::models::review::CompatibleApiModification;
+        use crate::models::review::{
+            CompatibleApiModification, UncertainApiRemoval, UnresolvedApiRemoval,
+            UnresolvedRemovalConfidence, UnresolvedRemovalReason,
+        };
         let symbol = |name: &str| ApiSymbol {
             name: name.into(),
             kind: "function".into(),
@@ -677,6 +683,21 @@ mod snapshot_tests {
             }],
             removed: vec![symbol("removed")],
             removed_dead: vec![symbol("dead")],
+            removed_unresolved: vec![UnresolvedApiRemoval {
+                symbol: symbol("unresolved"),
+                reason: UnresolvedRemovalReason::UnresolvedReceiverTypeDemand,
+                confidence: UnresolvedRemovalConfidence::Low,
+                references: Vec::new(),
+                field_owners: Vec::new(),
+            }],
+            uncertain_removals: vec![UncertainApiRemoval {
+                name: "unverified".into(),
+                kind: "function".into(),
+                file: "lib.sh".into(),
+                line: 0,
+                old_signature: "unverified()".into(),
+                reason: crate::models::truncation::TruncationReason::ParseErrorRegion,
+            }],
             const_value_changes: vec![change("value")],
             ..ApiChanges::default()
         };
@@ -695,9 +716,11 @@ mod snapshot_tests {
                 .iter()
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>(),
-            ["removed", "dead"]
+            ["removed", "dead", "unresolved"]
         );
         assert!(api.removed_dead.is_empty());
+        assert!(api.removed_unresolved.is_empty());
+        assert_eq!(api.uncertain_removals.len(), 1);
         assert_eq!(
             names(&api.const_value_changes),
             ["value"],
