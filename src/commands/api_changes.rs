@@ -615,6 +615,7 @@ mod python_contract;
 pub(crate) mod python_module_path;
 
 mod python_literal;
+mod python_member_origin;
 
 mod python_protocol_arg;
 

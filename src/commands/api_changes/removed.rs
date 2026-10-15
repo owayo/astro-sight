@@ -53,6 +53,15 @@ pub(crate) fn partition_removed_dead_candidates(
         if seen.insert(bare.clone()) {
             unique_bare.push(bare);
         }
+        // 注釈の型から member を帰属させる前に、削除 owner の継承・別名化も
+        // 確認する。既存 batch に加え、候補ごとの再走査を避ける。
+        if super::removed_attribution::path_lang(&c.file) == Some(crate::language::LangId::Python)
+            && let Some((owner, member)) = c.name.split_once('.')
+            && !member.contains('.')
+            && seen.insert(owner.to_owned())
+        {
+            unique_bare.push(owner.to_owned());
+        }
     }
 
     let service = AppService::new();
@@ -63,6 +72,7 @@ pub(crate) fn partition_removed_dead_candidates(
             return (candidates, Vec::new());
         }
     };
+    let python_input_complete = batch_result.iter().all(|result| result.input_is_complete());
 
     // Initialized submodules belong to another repository. Keep refs occurrence
     // output unchanged; omit those files only from this repository's API proof.
@@ -94,6 +104,7 @@ pub(crate) fn partition_removed_dead_candidates(
     let mut facts_cache: HashMap<(String, String), RefAttributionFacts> = HashMap::new();
     // import 先のモジュールが公開名をどう export しているかの判定 (候補ファイルごとに 1 回)。
     let mut export_cache = super::js_ref_sites::JsExportOriginCache::default();
+    let mut python_members = super::python_member_origin::PythonMemberOrigins::default();
 
     // Pass 1: bare_name ごとの残存定義ファイル集合。参照帰属の照合先になる。
     let mut definition_paths: HashMap<String, HashSet<String>> = HashMap::new();
@@ -153,6 +164,10 @@ pub(crate) fn partition_removed_dead_candidates(
         HashMap::new();
     let mut removed_kept = Vec::new();
     let mut removed_dead = Vec::new();
+    let references_by_name: HashMap<_, _> = batch_result
+        .iter()
+        .map(|result| (result.symbol.as_str(), result.references.as_slice()))
+        .collect();
     for c in candidates {
         let bare = bare_name(&c.name).to_string();
         // `export default function formatPrice` / `export { formatPrice as price }` の利用者は
@@ -189,6 +204,26 @@ pub(crate) fn partition_removed_dead_candidates(
             name: &c.name,
             kind: &c.kind,
         };
+        if python_input_complete
+            && references_by_name
+                .get(bare.as_str())
+                .is_some_and(|references| {
+                    python_members.proves_unrelated_fields(
+                        dir,
+                        base_blobs,
+                        &candidate_ref,
+                        references,
+                        c.name
+                            .split_once('.')
+                            .and_then(|(owner, _)| references_by_name.get(owner))
+                            .copied()
+                            .unwrap_or_default(),
+                    )
+                })
+        {
+            removed_dead.push(c);
+            continue;
+        }
         // Rust の削除を Swift / JS / TS が同名で参照している場合だけ、旧ツリーの FFI・
         // バインディング生成の痕跡を調べる (言語表だけでは束縛の可否が決まらない)。
         let needs_foreign_evidence = c.file.ends_with(".rs")
