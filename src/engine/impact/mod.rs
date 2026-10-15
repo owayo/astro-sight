@@ -2,6 +2,7 @@ mod collector;
 mod declaration;
 mod filters;
 mod import_facts;
+mod jsx_props;
 mod object_members;
 mod pass2;
 mod pass3;
@@ -112,6 +113,7 @@ struct FileContext {
     /// 同一 ci_key が複数あれば先勝ち (旧 `.find()` の最初一致と挙動一致)。
     affected_name_by_cikey: HashMap<String, String>,
     object_member_changes: HashMap<String, object_members::ObjectMemberChange>,
+    jsx_prop_changes: HashMap<String, jsx_props::OptionalPropChange>,
     /// 同名 affected がすべて Rust function/method の場合だけ値束縛を除外する。
     rust_function_names: HashSet<String>,
     rust_free_function_names: HashSet<String>,
@@ -858,6 +860,15 @@ fn collect_affected_symbols(
             &syms,
             &affected,
         );
+        let jsx_prop_changes = jsx_props::collect(
+            file_diff,
+            &df.new_path,
+            root,
+            &source,
+            lang_id,
+            &syms,
+            &affected,
+        );
         let rust_private_widening_names =
             if lang_id == LangId::Rust && diff_files.len() == 1 && df.old_path == df.new_path {
                 rust_visibility_scope::private_widening_names(
@@ -887,6 +898,7 @@ fn collect_affected_symbols(
             cross_file_symbol_keys,
             affected_name_by_cikey,
             object_member_changes,
+            jsx_prop_changes,
         });
     }
 

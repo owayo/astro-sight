@@ -447,6 +447,8 @@ pub(super) fn stream_caller_maps_and_defs(
                         let ref_lang = crate::language::LangId::from_path(utf8_path).ok();
                         let dir_str = dir.to_str().unwrap_or("");
                         let mut collector = ImpactCollector {
+                            jsx_shapes: Vec::new(),
+                            jsx_parse_clean: std::cell::OnceCell::new(),
                             python_imports: std::cell::OnceCell::new(),
                             rust_std_origin: std::cell::OnceCell::new(),
                             rust_path_owner: std::cell::OnceCell::new(),
@@ -571,6 +573,7 @@ mod tests {
             cross_file_symbol_keys: std::collections::HashSet::new(),
             affected_name_by_cikey: HashMap::new(),
             object_member_changes: HashMap::new(),
+            jsx_prop_changes: HashMap::new(),
             rust_function_names: Default::default(),
             rust_free_function_names: Default::default(),
             rust_kind_changes: Default::default(),

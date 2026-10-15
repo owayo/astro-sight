@@ -133,6 +133,8 @@ astro-sight impact --dir . --git --hook     # appends triage hint on detection
 
 Exit codes: `0` = no unresolved impacts (silent), `1` = unresolved impacts found (stderr). Only real call-site references count as unresolved — import-only / re-export references never trigger exit 1. `--hook` appends a triage hint for AI agents.
 
+For unique root TS/TSX functions with one inline object parameter, direct identifier JSX tags omitting all changed, still-optional props can be informational per source/name. Headers, patterns and explicit return types must stay unchanged; whole-parameter and pattern defaults are excluded. Prop/return types must be primitive, literal or static inline objects. Inferred returns must all be direct JSX or string/number/boolean/null literals after removing parentheses, with a final top-level return and identical old/new category sets. Nested functions/classes are skipped; JSX pragma comments prevent the inferred-return proof. Supplied props (including `undefined`), spread, type arguments, mismatched tags, changed implicit children, overloads, required changes and top-level prop additions/removals stay unproven. Any bytes between paired tags, including whitespace, count as children. Existing Low routes and global `api.mod` classification retain priority; other body behavior, `refs` and dead-code occurrences are unchanged.
+
 ### `review` — Structured Diff Review (One-Shot)
 
 Integrates `context` (impact) + `cochange` (missing co-change) + API surface diff (added/removed/modified public symbols) + dead symbol detection. Ideal for PR review or pre-merge checks.

@@ -1072,38 +1072,7 @@ fn callee_call_line_range(
     None
 }
 
-/// JSX の名前位置だけを解決し、終了タグも対応する開始タグへ戻す。
-pub(super) fn jsx_name_opening_tag<'a>(
-    mut node: tree_sitter::Node<'a>,
-    source: &[u8],
-) -> Option<tree_sitter::Node<'a>> {
-    let mut parent = node.parent()?;
-    while parent.kind() == "member_expression" {
-        if parent.child_by_field_name("property")?.id() != node.id() {
-            return None;
-        }
-        node = parent;
-        parent = node.parent()?;
-    }
-    if parent.child_by_field_name("name")?.id() != node.id() {
-        return None;
-    }
-    match parent.kind() {
-        "jsx_opening_element" | "jsx_self_closing_element" => Some(parent),
-        "jsx_closing_element" => {
-            let element = parent.parent()?;
-            if element.kind() != "jsx_element" {
-                return None;
-            }
-            let open = element.child_by_field_name("open_tag")?;
-            let open_name = open.child_by_field_name("name")?;
-            (open.kind() == "jsx_opening_element"
-                && open_name.utf8_text(source).ok()? == node.utf8_text(source).ok()?)
-            .then_some(open)
-        }
-        _ => None,
-    }
-}
+pub(super) use crate::engine::jsx::jsx_name_opening_tag;
 
 /// 素通し再 export の名前位置なら true。同じ行の実利用は除外しない。
 /// 改名された公開名の利用は名前索引で追跡できないため、改名 specifier は残す。

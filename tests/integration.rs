@@ -24,6 +24,7 @@ mod integration {
     mod identifier_spellings;
     mod impact;
     mod impact_diff_input;
+    mod impact_jsx_props;
     mod impact_object_members;
     mod impact_output;
     mod impact_rust_reexport;

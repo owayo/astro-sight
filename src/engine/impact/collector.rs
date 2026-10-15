@@ -90,6 +90,7 @@ pub(super) struct RefEventMini {
     pub(super) fn_value_ref: bool,
     /// dot chain の直接読み出しパス。対象外は u32::MAX、文字列は既存 pool で共有する。
     pub(super) member_path_id: u32,
+    pub(super) jsx_shape_id: u32,
     /// 別名のない named import/export 以外は、全体利用の範囲を証明しない。
     pub(super) unproven_module_ref: bool,
     /// Rust 値束縛の証拠は変更元ごとの kind を確認して適用する。
@@ -300,6 +301,8 @@ impl RouteDecisionContext<'_> {
 /// ファイル走査完了後に `finish_file` で Stage 1-6 (Stage 4b 除く) の filter を適用して
 /// `local_maps` / `local_def_paths` へ流す。`SymbolReference` の Vec は生成しない。
 pub(super) struct ImpactCollector<'a> {
+    pub(super) jsx_shapes: Vec<super::jsx_props::JsxShape>,
+    pub(super) jsx_parse_clean: std::cell::OnceCell<bool>,
     pub(super) python_imports:
         std::cell::OnceCell<Option<super::python_imports::PythonImportIndex>>,
     pub(super) rust_std_origin:
@@ -677,6 +680,22 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                 index.plain_import_binding_safe(node, source, &self.all_symbol_names[ix])
             });
 
+        let jsx_shape_id = if self.ref_lang == Some(LangId::Tsx) {
+            node.and_then(|node| {
+                let clean = *self
+                    .jsx_parse_clean
+                    .get_or_init(|| super::jsx_props::parse_is_clean(node));
+                super::jsx_props::caller_shape(node, source, clean)
+            })
+            .and_then(|shape| {
+                let id = u32::try_from(self.jsx_shapes.len()).ok()?;
+                self.jsx_shapes.push(shape);
+                Some(id)
+            })
+            .unwrap_or(u32::MAX)
+        } else {
+            u32::MAX
+        };
         self.ref_events.push(RefEventMini {
             sym_ix,
             line: line as u32,
@@ -695,6 +714,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             rust_std_origin,
             fn_value_ref: usage == refs::RefUsageRole::FunctionValue,
             member_path_id,
+            jsx_shape_id,
             unproven_module_ref,
             rust_value_binding: lexical_binding == LexicalBinding::RustValueBinding,
             python_import_owner_id,
@@ -1272,13 +1292,21 @@ impl<'a> ImpactCollector<'a> {
         let all_symbol_names = self.all_symbol_names;
         let sym_key_canonical = &all_symbol_names[e.sym_ix as usize];
         // pool の lock 中には比較だけを行い、import 解析前に解放する。
-        let member_unchanged = e.member_path_id != u32::MAX
+        let member_unchanged = (e.member_path_id != u32::MAX
             && ctx
                 .object_member_changes
                 .get(sym_key_canonical)
                 .is_some_and(|change| {
                     let pool = self.pool.lock().expect("string pool mutex poisoned");
                     change.read_is_unchanged(pool.get(e.member_path_id))
+                }))
+            || self
+                .jsx_shapes
+                .get(e.jsx_shape_id as usize)
+                .is_some_and(|shape| {
+                    ctx.jsx_prop_changes
+                        .get(sym_key_canonical)
+                        .is_some_and(|change| change.is_omitted_by(shape))
                 });
         if scope.visibility_only_informational {
             CallerRoute::Informational
@@ -1375,6 +1403,7 @@ mod tests {
             rust_std_origin: false,
             fn_value_ref: false,
             member_path_id: u32::MAX,
+            jsx_shape_id: u32::MAX,
             unproven_module_ref: false,
             rust_value_binding: false,
             python_import_owner_id: u32::MAX,
@@ -1440,6 +1469,7 @@ mod tests {
             cross_file_symbol_keys: Default::default(),
             affected_name_by_cikey: Default::default(),
             object_member_changes: Default::default(),
+            jsx_prop_changes: Default::default(),
             rust_kind_changes: Default::default(),
             rust_private_root_names: Default::default(),
             rust_private_method_owners: Default::default(),
