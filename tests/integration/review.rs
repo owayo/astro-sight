@@ -797,6 +797,182 @@ fn review_hook_optional_union_object_props_keep_reason_exit_and_caller_classific
 }
 
 #[test]
+fn review_hook_destructured_optional_props_preserve_reason_exit_and_callers() {
+    for (old_param, new_param, compatible) in [
+        (
+            "{ label }: { label: string } | Base",
+            "{ label }: { label: string; hint?: string } | Base",
+            true,
+        ),
+        (
+            "{ label }: { label: string } | Base",
+            "{ label, hint }: { label: string; hint?: string } | Base",
+            false,
+        ),
+        (
+            "{ label }: { label: string }",
+            "{ label, hint = '' }: { label: string; hint?: number }",
+            false,
+        ),
+        (
+            "{ label }: { label: string }",
+            "{ label, hint = null }: { label: string; hint?: string }",
+            false,
+        ),
+        (
+            "{ label }: { label: string }",
+            "{ label, hint = `x` }: { label: string; hint?: 'a' | 'b' }",
+            false,
+        ),
+        (
+            "{ label }: { label: string }",
+            "{ label, hint = 1n }: { label: string; hint?: number }",
+            false,
+        ),
+        (
+            "{ label }: { label: string }",
+            "{ label, hint = -1n }: { label: string; hint?: number }",
+            false,
+        ),
+        (
+            "{ label }: { label: string }",
+            "{ label, hint = -1 }: { label: string; hint?: string | number | null }",
+            true,
+        ),
+        (
+            "{ label }: { label: string }",
+            "{ label }: { label: string; hint?: string }",
+            true,
+        ),
+        (
+            "{ label }: { label: string }",
+            "{ label, hint }: { label: string; hint?: string }",
+            true,
+        ),
+        (
+            "{ label }: { label: string }",
+            "{ label, hint = '' }: { label: string; hint?: string }",
+            true,
+        ),
+        (
+            "{ label }: { label: string } | undefined = { label: '' }",
+            "{ label, hint }: { label: string; hint?: string } | undefined = { label: '' }",
+            true,
+        ),
+        (
+            "{ label }: { label: string }",
+            "{ label, hint }: { label: string; hint: string }",
+            false,
+        ),
+    ] {
+        for (file, caller) in [
+            (
+                "api.ts",
+                "import { Field } from './api';\nexport const value = Field({ label: 'Name' });\n",
+            ),
+            (
+                "api.tsx",
+                "import { Field } from './api';\nexport function Page() { return <Field label='Name' />; }\n",
+            ),
+        ] {
+            let before = format!(
+                "type Base = {{ label: string; mode: string }};\nexport function Field({old_param}): string {{ return ''; }}\n"
+            );
+            let after = format!(
+                "type Base = {{ label: string; mode: string }};\nexport function Field({new_param}): string {{ return ''; }}\n"
+            );
+            let output = a3_review_hook(
+                |root| std::fs::write(root.join(file), &after).unwrap(),
+                &[(file, &before), ("use.tsx", caller)],
+            );
+            assert!(output.stdout.is_empty(), "{output:?}");
+            assert_eq!(
+                output.status.code(),
+                Some(if compatible { 0 } else { 1 }),
+                "{new_param}: {output:?}"
+            );
+            let result: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+            let bucket = if compatible { "mod_compat" } else { "mod" };
+            let item = result["api"][bucket]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["n"] == "Field")
+                .unwrap();
+            if compatible {
+                assert_eq!(item["reason"], "optional_object_props");
+            }
+            assert_eq!(
+                result["blocking_categories"].as_array().unwrap().is_empty(),
+                compatible,
+                "{result}"
+            );
+            assert_eq!(
+                result["impacts"]
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty()),
+                !compatible,
+                "{result}"
+            );
+            assert!(
+                result["impact_info"]
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty()),
+                "{result}"
+            );
+        }
+    }
+}
+
+#[test]
+fn review_hook_destructured_optional_props_body_bindings_stay_blocking() {
+    for file in ["api.ts", "api.tsx"] {
+        for body in [
+            "const hint = label; return hint;",
+            "var hint = label; return hint;",
+            "function hint() {} return label;",
+            "if (label) { var hint = label; } return label;",
+            "for (var hint in data) {} return label;",
+        ] {
+            let before = format!(
+                "export function Field({{ label }}: {{ label: string }}): string {{ {body} }}\n"
+            );
+            let after = format!(
+                "export function Field({{ label, hint }}: {{ label: string; hint?: string }}): string {{ {body} }}\n"
+            );
+            let caller =
+                "import { Field } from './api';\nexport const value = Field({ label: 'Name' });\n";
+            let output = a3_review_hook(
+                |root| std::fs::write(root.join(file), &after).unwrap(),
+                &[(file, &before), ("use.ts", caller)],
+            );
+            assert!(output.stdout.is_empty(), "{output:?}");
+            assert_eq!(output.status.code(), Some(1), "{body}: {output:?}");
+            let result: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert!(
+                result["api"]["mod"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["n"] == "Field"),
+                "{result}"
+            );
+            assert!(
+                result["api"]["mod_compat"]
+                    .as_array()
+                    .is_none_or(Vec::is_empty)
+            );
+            assert!(
+                result["impacts"]
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty()),
+                "{result}"
+            );
+        }
+    }
+}
+
+#[test]
 fn review_hook_direct_const_callable_contract_changes_remain_blocking() {
     let before = "export const f = (value: number): number => value;\n";
     for (before, after, usage) in [

@@ -232,9 +232,18 @@ astro-sight review --dir . --git \
 - React component の HOC ラップ
 - 未参照の object member の削除
 - TS/TSX のトップレベル関数の末尾への optional / default 引数の追加（`trailing_optional_params`）
+- TypeScript の inline object 引数型への optional プロパティ追加。他の枝が変わらない union の、一意な object 枝も含む（`optional_object_props`）
 - Python のトップレベル関数 / モジュール直下のクラスメソッドの末尾への、kwonly+default 引数または positional default 引数の追加（`trailing_optional_params`）。デコレータの差分がある場合や同名関数が複数定義されている場合は、保守的に blocking を維持する
 
 同じシンボルに紐づく `impacts` も破壊的影響としては出さず、`mod_compat` の情報提供だけに留める。未参照 object member の判定では、削除キーを 1 個ずつ全リポジトリで検索せずに Aho-Corasick で一括して事前抽出し、各 JS/TS ファイルを最大 1 回だけ parse する。ファイルの収集・読み込み・parse に失敗したときは互換扱いへ降格せず、blocking のままにする。
+
+`optional_object_props` では、同じ変更で型に足した optional プロパティを、分割代入の末尾にも追加できる。既存の要素は別名・既定値を含め、トークンが同じ順序で残ることが条件。追加できるのは shorthand 束縛と、リテラルの既定値を持つ shorthand 束縛だけである。既定値は文字列・数値・真偽値・null・置換のない template・負数に限る。引数の kind、引数全体の既定値、残りのシグネチャは変えない。
+
+束縛を追加する場合、union の他の枝は `undefined` に限る。既定値は、`string`・`number`・`boolean`・`null`、またはこれらだけの union 型に適合する必要がある。別名型、これら以外のリテラル型、不明な型、BigInt の既定値、旧式の 8 進数、文字列や template の数字 escape は証明しない。
+
+rest・computed key・入れ子・キーや束縛の重複・新しい別名は、この証明の対象外となる。旧型に既にあるキーの束縛追加も扱わない。新しい束縛名が後続引数の既定値や、プロパティ型・戻り値型の `typeof` などに現れる場合も blocking を維持する。direct eval、escape を含む識別子、未対応のメンバー形式は証明しない。型だけを変える従来の分類は維持する。
+
+新しい束縛は、関数本体直下の lexical 宣言・関数宣言と、同じ関数 scope の `var` 束縛に衝突してはならない。未知の宣言形式は blocking を維持する。本体内の通常の参照が持つ意味は、この互換性の証明では検証しない。
 
 `export const` のような値バインディングは宣言全体（初期化子を含む）を比較するが、**値そのものが関数の場合は本体を比較から外す**（`export function` の本体変更が api.mod にならないのと揃える）。本体を比較から外すのは、次の関数の本体に限る。
 

@@ -699,6 +699,184 @@ fn detect_api_changes_ts_optional_union_object_props_preserve_other_contracts() 
     }
 }
 
+#[test]
+fn detect_api_changes_ts_destructured_optional_props_keep_the_type_contract() {
+    for extension in ["ts", "tsx"] {
+        for (old_param, new_param, compatible) in [
+            (
+                "{ label }: { label: string }",
+                "{ label }: { label: string; hint?: string }",
+                true,
+            ),
+            (
+                "{ label }: { label: string }",
+                "{ label, hint }: { label: string; hint?: string }",
+                true,
+            ),
+            (
+                "{ label }: { label: string }",
+                "{ label, hint = '' }: { label: string; hint?: string }",
+                true,
+            ),
+            (
+                "{ label }: { label: string } | undefined = { label: '' }",
+                "{ label, hint }: { label: string; hint?: string } | undefined = { label: '' }",
+                true,
+            ),
+            (
+                "{ label }: { label: string; hint?: string }",
+                "{ label, hint }: { label: string; hint?: string; extra?: boolean }",
+                false,
+            ),
+            (
+                "{ label }: { label: string }",
+                "{ label, hint }: { label: string; hint: string }",
+                false,
+            ),
+            (
+                "{ label, ...rest }: { label: string }",
+                "{ label, hint, ...rest }: { label: string; hint?: string }",
+                false,
+            ),
+            (
+                "{ label: hint }: { label: string }",
+                "{ label: hint, hint }: { label: string; hint?: string }",
+                false,
+            ),
+            (
+                "{ label }: { label: string } | Base",
+                "{ label }: { label: string; hint?: string } | Base",
+                true,
+            ),
+            (
+                "{ label }: { label: string } | Base",
+                "{ label, hint }: { label: string; hint?: string } | Base",
+                false,
+            ),
+            (
+                "{ label }: { label: string }",
+                "{ label, hint = '' }: { label: string; hint?: number }",
+                false,
+            ),
+            (
+                "{ label }: { label: string }",
+                "{ label, hint = null }: { label: string; hint?: string }",
+                false,
+            ),
+            (
+                "{ label }: { label: string }",
+                "{ label, hint = `x` }: { label: string; hint?: 'a' | 'b' }",
+                false,
+            ),
+            (
+                "{ label }: { label: string }",
+                "{ label, hint = 1n }: { label: string; hint?: number }",
+                false,
+            ),
+            (
+                "{ label }: { label: string }",
+                "{ label, hint = -1n }: { label: string; hint?: number }",
+                false,
+            ),
+            (
+                "{ label }: { label: string }",
+                "{ label, hint = -1 }: { label: string; hint?: string | number | null }",
+                true,
+            ),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let repo = temporary.path();
+            init_git_repo_for_test(repo);
+            let file = format!("api.{extension}");
+            let before = format!(
+                "type Base = {{ label: string; mode: string }};\nexport function Field({old_param}): string {{ return ''; }}\n"
+            );
+            let after = format!(
+                "type Base = {{ label: string; mode: string }};\nexport function Field({new_param}): string {{ return ''; }}\n"
+            );
+            git_commit_files(repo, &[(&file, &before)], "base");
+            fs::write(repo.join(&file), after).unwrap();
+            let output = Command::new("git")
+                .args(["diff", "--unified=0", "HEAD"])
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let diff = crate::engine::diff::parse_unified_diff(
+                std::str::from_utf8(&output.stdout).unwrap(),
+            );
+            let api = detect_api_changes(repo.to_str().unwrap(), "HEAD", &diff);
+            assert_eq!(
+                api.compatible_modified
+                    .iter()
+                    .any(|item| item.name == "Field" && item.reason == "optional_object_props"),
+                compatible,
+                "{extension}: {old_param} -> {new_param}: {api:?}"
+            );
+            assert_eq!(
+                api.modified.iter().any(|item| item.name == "Field"),
+                !compatible,
+                "{api:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn detect_api_changes_ts_destructured_optional_props_body_bindings_preserve_scope() {
+    for extension in ["ts", "tsx"] {
+        for (body, compatible) in [
+            ("const hint = label; return hint;", false),
+            ("{ const hint = label; } return label;", true),
+            ("var hint = label; return hint;", false),
+            ("function hint() {} return label;", false),
+            ("if (label) { var hint = label; } return label;", false),
+            ("for (var hint in data) {} return label;", false),
+            ("var local = label; return local;", true),
+            (
+                "const f = function () { var hint = ''; }; return label;",
+                true,
+            ),
+            ("return hint || label;", true),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let repo = temporary.path();
+            init_git_repo_for_test(repo);
+            let file = format!("api.{extension}");
+            let before = format!(
+                "const hint = '';\nexport function Field({{ label }}: {{ label: string }}): string {{ {body} }}\n"
+            );
+            let after = format!(
+                "const hint = '';\nexport function Field({{ label, hint }}: {{ label: string; hint?: string }}): string {{ {body} }}\n"
+            );
+            git_commit_files(repo, &[(&file, &before)], "base");
+            fs::write(repo.join(&file), after).unwrap();
+            let output = Command::new("git")
+                .args(["diff", "--unified=0", "HEAD"])
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let diff = crate::engine::diff::parse_unified_diff(
+                std::str::from_utf8(&output.stdout).unwrap(),
+            );
+            let api = detect_api_changes(repo.to_str().unwrap(), "HEAD", &diff);
+            assert_eq!(
+                api.compatible_modified
+                    .iter()
+                    .any(|item| item.name == "Field" && item.reason == "optional_object_props"),
+                compatible,
+                "{extension}/{body}: {api:?}"
+            );
+            assert_eq!(
+                api.modified.iter().any(|item| item.name == "Field"),
+                !compatible,
+                "{extension}/{body}: {api:?}"
+            );
+        }
+    }
+}
+
 /// 負ケース: 引数 object type への必須プロパティ追加は既存呼び出しを壊すため
 /// blocking な api.mod を維持する。
 #[test]

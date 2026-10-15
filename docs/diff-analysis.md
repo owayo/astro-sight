@@ -232,9 +232,18 @@ This does not prove that no test change is needed (you can update only the expec
 - Wrapping a React component in a HOC
 - Removing an object member that nothing references
 - Adding optional / default parameters at the end of a top-level TS/TSX function (`trailing_optional_params`)
+- Adding optional properties to an inline TypeScript object parameter type, including the unique object branch of an otherwise unchanged union (`optional_object_props`)
 - Adding keyword-only parameters with defaults or positional parameters with defaults at the end of a top-level Python function or of a method of a class directly under the module (`trailing_optional_params`). When decorators differ or there are several definitions with the same name, the change stays blocking to be safe
 
 The `impacts` tied to the same symbol are not reported as breaking either; they only appear as `mod_compat` information. To detect unreferenced object members, the removed keys are pre-extracted all at once with Aho-Corasick instead of searching the whole repository once per key, and each JS/TS file is parsed at most once. When collecting, reading, or parsing a file fails, the change is not downgraded to compatible and stays blocking.
+
+For `optional_object_props`, object destructuring can also append bindings for optional properties added to the type in the same change. Existing elements must remain an exact token prefix, including aliases and defaults. New elements may be shorthand bindings or shorthand bindings with literal defaults: strings, numbers, booleans, null, templates without substitutions, or negative numbers. Parameter kind, the whole-parameter default, and the rest of the signature must stay unchanged.
+
+When bindings are added, other union branches must be `undefined`. Defaults must match a property type made only of `string`, `number`, `boolean`, `null`, or a union of these. Aliases, other literal types, unknown type forms, BigInt defaults, legacy octal numbers, and numeric string/template escapes remain unproven.
+
+This destructuring proof rejects rest, computed or nested patterns, duplicate keys or bindings, new aliases, and keys already present in the old type. It also rejects names referenced elsewhere in the signature, including another parameter's default and `typeof` inside a property or return type. Direct eval, escaped identifiers, and unsupported member forms remain unproven. The existing type-only classification is unchanged.
+
+New bindings must also avoid direct-body lexical and function declarations, and any `var` binding in the same function scope. Unknown declaration forms remain blocking. Ordinary body references are outside this compatibility proof.
 
 Value bindings such as `export const` are compared as whole declarations (including the initializer), but **when the value itself is a function, its body is left out of the comparison** (consistent with a body change of `export function` not being an api.mod). Only the bodies of the following functions are left out:
 

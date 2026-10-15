@@ -15,6 +15,7 @@ mod callable;
 mod function_params;
 mod literal_union;
 mod object_members;
+mod pattern_extension;
 mod react;
 mod removed_params;
 pub(crate) mod type_members;
@@ -692,52 +693,69 @@ fn ts_parameter_default_tokens(
 }
 
 /// inline object、または union の一意な object 枝への optional プロパティ追加を判定する。
-/// 引数の kind (required/optional)・名前 (pattern)・default 値は不変であること。
-fn ts_param_pair_is_optional_object_extension(
+/// kind/default は不変で、pattern の追加束縛は別途 signature 全体でも検査する。
+fn ts_param_pair_optional_object_extension(
     old_param: tree_sitter::Node<'_>,
     old_source: &[u8],
     new_param: tree_sitter::Node<'_>,
     new_source: &[u8],
-) -> bool {
+) -> Option<Vec<pattern_extension::AddedBinding>> {
     if old_param.kind() != new_param.kind()
         || !matches!(
             old_param.kind(),
             "required_parameter" | "optional_parameter"
         )
     {
-        return false;
+        return None;
     }
-    let (Some(old_pattern), Some(new_pattern)) = (
-        old_param.child_by_field_name("pattern"),
-        new_param.child_by_field_name("pattern"),
-    ) else {
-        return false;
-    };
-    if node_signature_tokens(old_pattern, old_source)
-        != node_signature_tokens(new_pattern, new_source)
-    {
-        return false;
-    }
-    let (Some(old_value), Some(new_value)) = (
-        ts_parameter_default_tokens(old_param, old_source),
-        ts_parameter_default_tokens(new_param, new_source),
-    ) else {
-        return false;
-    };
+    let old_pattern = old_param.child_by_field_name("pattern")?;
+    let new_pattern = new_param.child_by_field_name("pattern")?;
+    let old_tokens = node_signature_tokens(old_pattern, old_source)?;
+    let new_tokens = node_signature_tokens(new_pattern, new_source)?;
+    let old_value = ts_parameter_default_tokens(old_param, old_source)?;
+    let new_value = ts_parameter_default_tokens(new_param, new_source)?;
     if old_value != new_value {
-        return false;
+        return None;
     }
-    let (Some(old_ty), Some(new_ty)) = (
-        old_param
-            .child_by_field_name("type")
-            .and_then(|annotation| annotation.named_child(0)),
-        new_param
-            .child_by_field_name("type")
-            .and_then(|annotation| annotation.named_child(0)),
-    ) else {
-        return false;
-    };
-    ts_type_is_optional_object_extension(old_ty, old_source, new_ty, new_source)
+    let old_annotation = old_param.child_by_field_name("type")?;
+    let new_annotation = new_param.child_by_field_name("type")?;
+    let old_ty = old_annotation.named_child(0)?;
+    let new_ty = new_annotation.named_child(0)?;
+    if !ts_type_is_optional_object_extension(old_ty, old_source, new_ty, new_source) {
+        return None;
+    }
+    if old_tokens == new_tokens {
+        return Some(Vec::new());
+    }
+    // pattern/type 以外の modifier、区切り、引数全体の default は変更しない。
+    for (old_start, old_end, new_start, new_end) in [
+        (
+            old_param.start_byte(),
+            old_pattern.start_byte(),
+            new_param.start_byte(),
+            new_pattern.start_byte(),
+        ),
+        (
+            old_pattern.end_byte(),
+            old_annotation.start_byte(),
+            new_pattern.end_byte(),
+            new_annotation.start_byte(),
+        ),
+        (
+            old_annotation.end_byte(),
+            old_param.end_byte(),
+            new_annotation.end_byte(),
+            new_param.end_byte(),
+        ),
+    ] {
+        if signature_tokens_in_range(old_param, old_source, old_start, old_end)?
+            != signature_tokens_in_range(new_param, new_source, new_start, new_end)?
+        {
+            return None;
+        }
+    }
+    let added = pattern_extension::added_optional_keys(old_ty, old_source, new_ty, new_source)?;
+    pattern_extension::added_bindings(old_pattern, old_source, new_pattern, new_source, &added)
 }
 
 /// union の枝は同順・同数で、変更する object 枝以外のトークンがすべて一致すること。
