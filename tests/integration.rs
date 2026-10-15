@@ -30,6 +30,7 @@ mod integration {
     mod impact_rust_reexport;
     mod impact_rust_scope;
     mod impact_ts_barrels;
+    mod js_signature_sites;
     mod languages;
     mod mcp;
     mod optional_param_removal;

@@ -1046,6 +1046,31 @@ fn closure_or_blocking_decision(
         (None, Some(proof)) => super::ref_index::ClosureArgEvidence::PythonProtocolParams(proof),
         _ => super::ref_index::ClosureArgEvidence::None,
     };
+    // 真偽判定の不変性は関数のシグネチャ変更だけの証拠。値から関数への種類変更は除く。
+    // ソースは互換判定器と共有し、候補ごとに一度だけ旧新の宣言を確かめる。
+    let js_direct_function_change = site.kind == "function"
+        && !site.name.contains('.')
+        && site
+            .lang_in(&[
+                crate::language::LangId::Javascript,
+                crate::language::LangId::Typescript,
+                crate::language::LangId::Tsx,
+            ])
+            .and_then(|lang| sources.get(site)?.parse_pair(lang))
+            .is_some_and(|(old, new)| {
+                let Some(pair) = sources.get(site) else {
+                    return false;
+                };
+                crate::engine::js_occurrence::unique_direct_function(
+                    old.root_node(),
+                    &pair.old,
+                    site.name,
+                ) && crate::engine::js_occurrence::unique_direct_function(
+                    new.root_node(),
+                    &pair.new,
+                    site.name,
+                )
+            });
     // 全 cross-file 参照が同一 diff 内で追随済みなら informational
     if is_modified_closed_in_diff(
         ModifiedClosureInput {
@@ -1058,6 +1083,7 @@ fn closure_or_blocking_decision(
             diff_files: inputs.diff_files,
             arg_evidence,
             public_name_differs,
+            js_direct_function_change,
         },
         caches,
     ) {

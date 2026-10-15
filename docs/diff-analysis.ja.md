@@ -58,6 +58,16 @@ Rust の `affected_symbols[].kind` は、impl ヘッダの変更・メソッド�
 - `low_confidence_callers`: owner（メソッドが属するクラスや型）を確定できない汎用名や、直接 import の証拠がない TS/Rust の同名参照
 - `informational_callers`: 名前と引数個数が変わっていないシンボルへの関数値参照や、名前が変わっていない modified シンボルの import 行。blocking 対象にしない
 
+### JS / TS のシグネチャに依存しない参照
+
+JS / TS / TSX のトップレベル関数について、別ファイルの同名の出現がシグネチャに依存しないと確認できれば、`modified_closed_in_diff` (`api.mod_closed`) の判定から外す。旧新とも一意なトップレベルの直接関数宣言がある変更に限り、宣言種別が変わる変更には適用しない。対象は、非 computed な `property_signature` の名前と、用途が真偽判定だけの引数である。プロパティ型は、直接書いた `boolean`・`string`・`number` などの非 callable な組み込み型、リテラル型、その union に限る。型の別名・関数型・method signature・モックのキーは除外しない。
+
+引数の証拠には、ファイル全体が strict mode だと確認できることが必要である。static import/export 文、またはファイル先頭の正しい `"use strict"` directive prologue で確認する。動的 import、関数内の directive、class 内だけの strict mode は証拠に使わない。sloppy mode や strictness が不明な入力は、関数の外からの反射的な引数取得も否定できないため保留する。プロパティ宣言の証拠には strict mode を要求しない。
+
+引数は単純な識別子か、object pattern 直下の shorthand に限る。同じ関数内の入れ子の closure も含め、すべての同名の用途を調べる。括弧を除き、三項演算子や `if`・`while`・`do`・`for` の条件、または前置 `!` の対象だけなら除外できる。呼び出し・値の受け渡し・返却・代入・同名の再宣言・型への言及が一つでもあれば、引数全体を未証明のまま残す。default・rest・名前を変える分割代入・constructor parameter property も対象外である。`arguments` を参照する関数も、引数への別経路を否定できないため対象外とする。
+
+解析エラー、`with`、`eval` の手掛かり、ambient 宣言、宣言ファイルではこの証拠を使わない。識別子系のいずれかの AST kind に Unicode escape があれば、名前の同一性を推測せず保留する。対象関数の実呼び出しを一つ以上確認し、同じ差分で引数の個数と変更行が追随していることも必要である。別名 import などの既存の停止条件は維持する。単一・バッチの `refs` と dead-code の件数は変えない。この判定は API 差分にだけ適用し、impact の判定は変えない。
+
 ### Python の相対 import 束縛
 
 別名のない、無条件のモジュール直下の `from .cli import main` で読み込んだ `main()` は、無関係な `legacy.main` の変更による影響から除外する。除外するのは、相対モジュールを workspace 内の一意なファイルへ解決でき、import した関数が無装飾・直接定義で各1件だけ存在する場合に限る。実際の定義元の変更、型スタブ `.pyi` の変更、import 名の出現位置は従来の扱いを維持する。`refs` の出現一覧と dead-code の参照件数も変えない。

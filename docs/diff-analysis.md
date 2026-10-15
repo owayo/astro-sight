@@ -58,6 +58,16 @@ Callers fall into 3 groups by confidence and by how breaking they are. "Blocking
 - `low_confidence_callers`: generic names whose owner (the class or type a method belongs to) cannot be determined, and same-name references in TS/Rust without evidence of a direct import
 - `informational_callers`: function-value references to symbols whose name and number of arguments did not change, and import lines of modified symbols whose name did not change. Not blocking
 
+### JS / TS references independent of the signature
+
+For top-level JS / TS / TSX functions, `modified_closed_in_diff` (`api.mod_closed`) excludes same-name occurrences in another file when their use does not depend on the function signature. Both revisions must contain a unique direct top-level function declaration without visible rebinding. Changes from values or other symbol kinds do not use this proof. The supported sites are noncomputed `property_signature` names with directly written noncallable predefined types such as `boolean`, `string`, and `number`, literal types, or unions of those types; and parameters used only for truthiness. Type aliases, callable properties, method signatures, and mock object keys remain unproven.
+
+Parameter proofs additionally require file-wide strict mode, established by a static import/export statement or an exact `"use strict"` directive in the file directive prologue. Dynamic import, function-local directives, and class-only strictness are not used as evidence. Sloppy or unknown strictness remains unproven because reflective argument access can occur outside the function. Property-declaration proofs do not require strict mode.
+
+Parameters must be plain identifiers or direct object-pattern shorthands. Every same-name use in the function, including nested closures, is checked. Only ternary / `if` / `while` / `do` / `for` conditions and prefix `!` operands are accepted, through bounded parentheses. A call, value escape, return, assignment, same-name declaration, or type use keeps the entire binding unproven. Defaults, rest parameters, renamed destructuring, and constructor parameter properties are excluded. Functions referring to `arguments` remain unproven because parameters can be accessed indirectly.
+
+Parse errors, clues for `with` or `eval`, ambient declarations, and declaration files prevent this proof. Unicode escapes in any identifier node kind also prevent it; escaped names are not guessed. At least one actual target call must still be verified against the changed argument count and changed lines. Existing alias-import guards remain in place. Single and batch `refs` occurrences and dead-code counts are unchanged. This proof applies only to API changes; impact classification is unchanged.
+
 ### Python Relative Import Bindings
 
 An unaliased, unconditional module-level `from .cli import main` can bind `main()` to a different function than an unrelated changed `legacy.main`. Impact analysis excludes that use only when the relative module resolves uniquely inside the workspace and contains a single, undecorated, direct definition of the imported function. References to the actual defining module, `.pyi` changes, and import-name occurrences keep their existing handling. `refs` and dead-code reference counts are unchanged.

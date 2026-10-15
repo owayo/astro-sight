@@ -512,6 +512,8 @@ pub(crate) struct ModifiedClosureInput<'a> {
     /// 対象が宣言名と違う公開名 (default export / 別名 export) で公開されている (JS/TS)。
     /// その利用者は宣言名の参照に現れないので、見えた呼び出しが全部更新済みでも閉じない。
     pub(crate) public_name_differs: bool,
+    /// 新旧とも一意な直接関数宣言で、今回の非依存用途の証拠を使える。
+    pub(crate) js_direct_function_change: bool,
 }
 
 /// modified シンボルの全 cross-file 参照が同一 diff 内の変更 hunk で追随済みかを判定する。
@@ -781,6 +783,24 @@ fn classify_reference_owner(
         target_new_path,
         ..
     } = input;
+    // 別ファイルの primitive property と、全用途が truthiness に限られる引数は、
+    // 対象のトップレベル関数のシグネチャに依存しない。同名定義の有無とは独立に見る。
+    if input.js_direct_function_change
+        && input.kind == "function"
+        && !name.contains('.')
+        && matches!(
+            target.target_lang,
+            Some(
+                crate::language::LangId::Javascript
+                    | crate::language::LangId::Typescript
+                    | crate::language::LangId::Tsx
+            )
+        )
+        && !diff_path_matches_ref(target_new_path, &r.path, dir)
+        && signature_insensitive_js_reference(dir, r, target.bare, caches)
+    {
+        return ReferenceOwner::Other;
+    }
     // 他ファイルの同名定義がある場合: 変更対象ファイル以外の参照で、lexical scope が
     // 同一ファイルの function_declaration に束縛されるものは対象 API と無関係な
     // ローカル呼び出しなので除外する。解決失敗・property 位置・function 以外の
@@ -948,10 +968,50 @@ fn resolve_ref_shadow_binding(
     )
 }
 
+fn signature_insensitive_js_reference(
+    dir: &str,
+    reference: &crate::models::reference::SymbolReference,
+    bare: &str,
+    caches: &mut ApiClosureCaches,
+) -> bool {
+    use crate::engine::js_occurrence::JsSignatureSite;
+    if reference.path.ends_with(".d.ts")
+        || reference.path.ends_with(".d.mts")
+        || reference.path.ends_with(".d.cts")
+    {
+        return false;
+    }
+    let Some(parsed) = parsed_ref_file(dir, &reference.path, caches) else {
+        return false;
+    };
+    if !matches!(
+        parsed.lang_id,
+        crate::language::LangId::Javascript
+            | crate::language::LangId::Typescript
+            | crate::language::LangId::Tsx
+    ) {
+        return false;
+    }
+    let Some(node) = ref_name_node(parsed, bare, reference.line, reference.column) else {
+        return false;
+    };
+    let index = parsed.js_occurrences.get_or_init(|| {
+        crate::engine::js_occurrence::JsOccurrenceIndex::new(
+            parsed.tree.root_node(),
+            &parsed.source,
+        )
+    });
+    matches!(
+        index.classify(node, &parsed.source, bare),
+        JsSignatureSite::NonReference | JsSignatureSite::InsensitiveParamUse
+    )
+}
+
 pub(super) struct ParsedRefFile {
     pub(super) source: crate::engine::parser::SourceBuf,
     pub(super) tree: tree_sitter::Tree,
     pub(super) lang_id: crate::language::LangId,
+    js_occurrences: std::cell::OnceCell<crate::engine::js_occurrence::JsOccurrenceIndex>,
 }
 
 /// 参照ファイルの parse 結果 (キャッシュ付き) を返す。読み込みは `parser::read_file`
@@ -999,6 +1059,7 @@ fn parse_ref_file(dir: &str, ref_path: &str) -> Option<ParsedRefFile> {
         source,
         tree,
         lang_id: lang,
+        js_occurrences: std::cell::OnceCell::new(),
     })
 }
 
@@ -1743,6 +1804,7 @@ mod tests {
             source: crate::engine::parser::SourceBuf::Vec(source.clone().into_bytes()),
             tree,
             lang_id: lang,
+            js_occurrences: std::cell::OnceCell::new(),
         };
         let node = ref_name_node(&parsed, bare, line, column)?;
         Some(import_role_at(node, &parsed.source, bare))
@@ -1858,6 +1920,7 @@ mod tests {
             source: crate::engine::parser::SourceBuf::Vec(source.clone().into_bytes()),
             tree,
             lang_id: LangId::Tsx,
+            js_occurrences: std::cell::OnceCell::new(),
         };
         let node = ref_name_node(&parsed, "ScheduleItem", line, column).expect("node");
         js_reference_is_non_value(node, &parsed.source, "ScheduleItem")
