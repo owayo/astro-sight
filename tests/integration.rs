@@ -9,6 +9,7 @@ mod integration {
     mod support;
 
     mod ast_symbols;
+    mod bash_grammar;
     mod cli_basics;
     mod cochange;
     mod context;
