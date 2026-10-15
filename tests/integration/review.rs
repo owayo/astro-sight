@@ -683,6 +683,120 @@ fn review_hook_direct_const_callables_accept_compatible_parameter_extensions() {
 }
 
 #[test]
+fn review_hook_optional_union_object_props_keep_reason_exit_and_caller_classification() {
+    for (old_param, new_param, compatible) in [
+        (
+            "options: { mode: string }",
+            "options: { mode: string; label?: string }",
+            true,
+        ),
+        (
+            "options?: { mode: string }",
+            "options?: { mode: string; label?: string }",
+            true,
+        ),
+        (
+            "options: { mode: string } = { mode: 'fast' }",
+            "options: { mode: string; label?: string } = { mode: 'fast' }",
+            true,
+        ),
+        (
+            "options: { mode: string } | undefined",
+            "options: { mode: string; label?: string } | undefined",
+            true,
+        ),
+        (
+            "options: { mode: string } | null",
+            "options: { mode: string; label?: string } | null",
+            true,
+        ),
+        (
+            "options: { mode: string } | undefined = undefined",
+            "options: { mode: string; label?: string } | undefined = undefined",
+            true,
+        ),
+        (
+            "options?: { mode: string } | null",
+            "options?: { mode: string; label?: string } | null",
+            true,
+        ),
+        (
+            "options: undefined | { mode: string } | null",
+            "options:\n | undefined\n | { mode: string; label?: string }\n | null",
+            true,
+        ),
+        (
+            "options: { mode: string } | undefined",
+            "options: { mode: string; label?: string } | null",
+            false,
+        ),
+    ] {
+        for file in ["api.ts", "api.tsx"] {
+            let before = format!(
+                "export function save(name: string, {old_param}): string {{ return name; }}\n"
+            );
+            let after = format!(
+                "export function save(name: string, {new_param}): string {{ return name; }}\n"
+            );
+            let caller = "import { save } from './api';\nexport const saved = save('a', { mode: 'fast' });\n";
+            let output = a3_review_hook(
+                |root| std::fs::write(root.join(file), &after).unwrap(),
+                &[(file, &before), ("use.ts", caller)],
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(if compatible { 0 } else { 1 }),
+                "{file} {old_param}: {stderr}"
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "error JSON: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+            let contains_save = |items: &serde_json::Value| {
+                items
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|item| item["n"] == "save")
+            };
+            assert_eq!(
+                contains_save(&json["api"]["mod_compat"]),
+                compatible,
+                "{stderr}"
+            );
+            assert_eq!(contains_save(&json["api"]["mod"]), !compatible, "{stderr}");
+            if compatible {
+                assert_eq!(
+                    json["api"]["mod_compat"][0]["reason"], "optional_object_props",
+                    "{stderr}"
+                );
+            }
+            let caller_is_blocking =
+                json["impacts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|impact| {
+                        impact["syms"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|name| name == "save")
+                    });
+            assert_eq!(caller_is_blocking, !compatible, "{stderr}");
+            assert_eq!(
+                json["blocking_categories"].as_array().unwrap().is_empty(),
+                compatible,
+                "{stderr}"
+            );
+        }
+    }
+}
+
+#[test]
 fn review_hook_direct_const_callable_contract_changes_remain_blocking() {
     let before = "export const f = (value: number): number => value;\n";
     for (before, after, usage) in [

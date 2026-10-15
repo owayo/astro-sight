@@ -691,8 +691,8 @@ fn ts_parameter_default_tokens(
     }
 }
 
-/// 引数ペアが「inline object type literal への optional プロパティ追加だけ」の互換拡張かを
-/// 判定する。引数の kind (required/optional)・名前 (pattern)・default 値は不変であること。
+/// inline object、または union の一意な object 枝への optional プロパティ追加を判定する。
+/// 引数の kind (required/optional)・名前 (pattern)・default 値は不変であること。
 fn ts_param_pair_is_optional_object_extension(
     old_param: tree_sitter::Node<'_>,
     old_source: &[u8],
@@ -728,12 +728,93 @@ fn ts_param_pair_is_optional_object_extension(
         return false;
     }
     let (Some(old_ty), Some(new_ty)) = (
-        ts_param_object_type(old_param),
-        ts_param_object_type(new_param),
+        old_param
+            .child_by_field_name("type")
+            .and_then(|annotation| annotation.named_child(0)),
+        new_param
+            .child_by_field_name("type")
+            .and_then(|annotation| annotation.named_child(0)),
     ) else {
         return false;
     };
-    ts_object_type_members_optional_superset(old_ty, old_source, new_ty, new_source)
+    ts_type_is_optional_object_extension(old_ty, old_source, new_ty, new_source)
+}
+
+/// union の枝は同順・同数で、変更する object 枝以外のトークンがすべて一致すること。
+/// 括弧や intersection は展開せず、既存の inline object の証明に限って比較する。
+fn ts_type_is_optional_object_extension(
+    old_ty: tree_sitter::Node<'_>,
+    old_source: &[u8],
+    new_ty: tree_sitter::Node<'_>,
+    new_source: &[u8],
+) -> bool {
+    if old_ty.has_error() || new_ty.has_error() {
+        return false;
+    }
+    match (old_ty.kind(), new_ty.kind()) {
+        ("object_type", "object_type") => {
+            ts_object_type_members_optional_superset(old_ty, old_source, new_ty, new_source)
+        }
+        ("union_type", "union_type") => {
+            let old_parts = ts_union_type_parts(old_ty);
+            let new_parts = ts_union_type_parts(new_ty);
+            if old_parts.len() != new_parts.len() {
+                return false;
+            }
+            let mut object_seen = false;
+            for (old, new) in old_parts.into_iter().zip(new_parts) {
+                if old.kind() != new.kind() {
+                    return false;
+                }
+                match old.kind() {
+                    "object_type" => {
+                        if object_seen
+                            || !ts_object_type_members_optional_superset(
+                                old, old_source, new, new_source,
+                            )
+                        {
+                            return false;
+                        }
+                        object_seen = true;
+                    }
+                    "intersection_type" | "parenthesized_type" => return false,
+                    _ => {
+                        let (Some(old_tokens), Some(new_tokens)) = (
+                            node_signature_tokens(old, old_source),
+                            node_signature_tokens(new, new_source),
+                        ) else {
+                            return false;
+                        };
+                        if old_tokens != new_tokens {
+                            return false;
+                        }
+                    }
+                }
+            }
+            object_seen
+        }
+        _ => false,
+    }
+}
+
+/// 左結合の union だけを反復で平坦化する。コメントも位置を保って比較へ渡す。
+fn ts_union_type_parts(root: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
+    let mut parts = Vec::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "union_type" {
+            let mut cursor = node.walk();
+            pending.extend(
+                node.named_children(&mut cursor)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev(),
+            );
+        } else {
+            parts.push(node);
+        }
+    }
+    parts
 }
 
 /// 引数の type annotation が inline object type literal (`{ ... }`) ならそのノードを返す。

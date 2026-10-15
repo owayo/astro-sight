@@ -767,6 +767,31 @@ fn api_signature_handles_deep_parenthesized_const() {
     );
 }
 
+#[test]
+fn api_optional_object_extension_handles_deep_union() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let branches = std::iter::repeat_n("'value'", 50_000)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let source = |members: &str| {
+        format!(
+            "export function save(name: string, options: {{ {members} }} | {branches}): string {{ return name; }}\nexport function after(): number {{ return 1; }}\n"
+        )
+    };
+    repo.write("api.ts", source("mode: string"));
+    repo.write("use.ts", "import { save, after } from './api';\nexport const result = save('a', { mode: 'fast' }) + after();\n");
+    repo.commit_all("initial");
+    repo.write("api.ts", source("mode: string; label?: string"));
+
+    let buckets = review_api_buckets("deep optional object union", &repo);
+    assert!(
+        in_bucket(&buckets, "compatible_modified", "save"),
+        "{buckets:?}"
+    );
+    assert!(!in_bucket(&buckets, "modified", "save"), "{buckets:?}");
+}
+
 /// `review --git` を実行し、正常終了したことを確かめて API 差分の分類 → 名前の一覧を返す。
 fn review_api_buckets(label: &str, repo: &TestRepo) -> serde_json::Map<String, serde_json::Value> {
     let mut command = cargo_bin();

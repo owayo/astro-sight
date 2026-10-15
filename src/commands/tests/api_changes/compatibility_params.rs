@@ -477,6 +477,228 @@ fn detect_api_changes_ts_optional_object_prop_addition_is_compatible() {
     assert_eq!(compat.reason, "optional_object_props");
 }
 
+#[test]
+fn detect_api_changes_ts_optional_union_object_props_preserve_other_contracts() {
+    let cases = [
+        (
+            "inline",
+            "options: { mode: string }",
+            "options: { mode: string; label?: string }",
+            true,
+        ),
+        (
+            "optional inline",
+            "options?: { mode: string }",
+            "options?: { mode: string; label?: string }",
+            true,
+        ),
+        (
+            "default inline",
+            "options: { mode: string } = { mode: 'fast' }",
+            "options: { mode: string; label?: string } = { mode: 'fast' }",
+            true,
+        ),
+        (
+            "undefined",
+            "options: { mode: string } | undefined",
+            "options: { mode: string; label?: string } | undefined",
+            true,
+        ),
+        (
+            "null",
+            "options: { mode: string } | null",
+            "options: { mode: string; label?: string } | null",
+            true,
+        ),
+        (
+            "default union",
+            "options: { mode: string } | undefined = undefined",
+            "options: { mode: string; label?: string } | undefined = undefined",
+            true,
+        ),
+        (
+            "optional union",
+            "options?: { mode: string } | null",
+            "options?: { mode: string; label?: string } | null",
+            true,
+        ),
+        (
+            "middle object",
+            "options: undefined | { mode: string } | null",
+            "options: undefined | { mode: string; label?: string } | null",
+            true,
+        ),
+        (
+            "leading pipe",
+            "options: { mode: string } | undefined",
+            "options:\n | { mode: string; label?: string }\n | undefined",
+            true,
+        ),
+        (
+            "other branch changed",
+            "options: { mode: string } | undefined",
+            "options: { mode: string; label?: string } | null",
+            false,
+        ),
+        (
+            "branch added",
+            "options: { mode: string } | undefined",
+            "options: { mode: string; label?: string } | undefined | null",
+            false,
+        ),
+        (
+            "branch removed",
+            "options: { mode: string } | undefined | null",
+            "options: { mode: string; label?: string } | undefined",
+            false,
+        ),
+        (
+            "branch reordered",
+            "options: { mode: string } | undefined",
+            "options: undefined | { mode: string; label?: string }",
+            false,
+        ),
+        (
+            "multiple objects",
+            "options: { mode: string } | { size: number }",
+            "options: { mode: string; label?: string } | { size: number }",
+            false,
+        ),
+        (
+            "intersection",
+            "options: { mode: string } & Extra",
+            "options: { mode: string; label?: string } & Extra",
+            false,
+        ),
+        (
+            "intersection branch",
+            "options: { mode: string } | (Extra & Other)",
+            "options: { mode: string; label?: string } | (Extra & Other)",
+            false,
+        ),
+        (
+            "parenthesized object",
+            "options: ({ mode: string }) | undefined",
+            "options: ({ mode: string; label?: string }) | undefined",
+            false,
+        ),
+        (
+            "parenthesized union",
+            "options: ({ mode: string } | undefined)",
+            "options: ({ mode: string; label?: string } | undefined)",
+            false,
+        ),
+        (
+            "generic wrapper",
+            "options: Array<{ mode: string } | undefined>",
+            "options: Array<{ mode: string; label?: string } | undefined>",
+            false,
+        ),
+        (
+            "required addition",
+            "options: { mode: string } | undefined",
+            "options: { mode: string; label: string } | undefined",
+            false,
+        ),
+        (
+            "existing member changed",
+            "options: { mode: string } | undefined",
+            "options: { mode: number; label?: string } | undefined",
+            false,
+        ),
+        (
+            "kind changed",
+            "options: { mode: string } | undefined",
+            "options?: { mode: string; label?: string } | undefined",
+            false,
+        ),
+        (
+            "pattern changed",
+            "options: { mode: string } | undefined",
+            "changed: { mode: string; label?: string } | undefined",
+            false,
+        ),
+        (
+            "default added",
+            "options: { mode: string } | undefined",
+            "options: { mode: string; label?: string } | undefined = undefined",
+            false,
+        ),
+        (
+            "default changed",
+            "options: { mode: string } | null | undefined = undefined",
+            "options: { mode: string; label?: string } | null | undefined = null",
+            false,
+        ),
+        (
+            "literal whitespace changed",
+            "options: { mode: string } | 'a b'",
+            "options: { mode: string; label?: string } | 'a  b'",
+            false,
+        ),
+        (
+            "scalar branch",
+            "options: { mode: string } | string",
+            "options: { mode: string; label?: string } | string",
+            true,
+        ),
+        (
+            "union comment preserved",
+            "options: { mode: string } | /* retained */ undefined",
+            "options: { mode: string; label?: string } | /* retained */ undefined",
+            true,
+        ),
+        (
+            "union comment changed",
+            "options: { mode: string } | /* old */ undefined",
+            "options: { mode: string; label?: string } | /* new */ undefined",
+            false,
+        ),
+        (
+            "incomplete member",
+            "options: { mode: string } | undefined",
+            "options: { mode: string; label?: } | undefined",
+            false,
+        ),
+    ];
+    for extension in ["ts", "tsx"] {
+        for (label, old_param, new_param, compatible) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let repo = dir.path();
+            init_git_repo_for_test(repo);
+            let file = format!("api.{extension}");
+            let before = format!(
+                "export function save(name: string, {old_param}): string {{ return name; }}\n"
+            );
+            let after = format!(
+                "export function save(name: string, {new_param}): string {{ return name; }}\n"
+            );
+            git_commit_files(repo, &[(&file, &before)], "initial");
+            fs::write(repo.join(&file), after).expect("write changed file");
+            let output = Command::new("git")
+                .args(["diff", "--unified=0", "HEAD"])
+                .current_dir(repo)
+                .output()
+                .expect("git diff");
+            assert!(output.status.success());
+            let diff_files = crate::engine::diff::parse_unified_diff(
+                std::str::from_utf8(&output.stdout).expect("utf-8 diff"),
+            );
+            let api = detect_api_changes(repo.to_str().expect("utf-8 path"), "HEAD", &diff_files);
+            assert_eq!(
+                api.compatible_modified.iter().any(|change| change.name == "save" && change.reason == "optional_object_props"),
+                compatible,
+                "{extension} {label}: {api:?}"
+            );
+            assert_eq!(
+                api.modified.iter().any(|change| change.name == "save"),
+                !compatible,
+                "{extension} {label}: {api:?}"
+            );
+        }
+    }
+}
+
 /// 負ケース: 引数 object type への必須プロパティ追加は既存呼び出しを壊すため
 /// blocking な api.mod を維持する。
 #[test]
