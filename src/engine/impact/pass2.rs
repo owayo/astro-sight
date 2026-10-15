@@ -447,6 +447,8 @@ pub(super) fn stream_caller_maps_and_defs(
                         let ref_lang = crate::language::LangId::from_path(utf8_path).ok();
                         let dir_str = dir.to_str().unwrap_or("");
                         let mut collector = ImpactCollector {
+                            js_signature_sites_trusted: options.new_side
+                                == crate::models::impact::DiffNewSide::WorkingTree,
                             jsx_shapes: Vec::new(),
                             jsx_parse_clean: std::cell::OnceCell::new(),
                             python_imports: std::cell::OnceCell::new(),
@@ -563,6 +565,7 @@ mod tests {
 
     fn file_context(new_path: &str, lang_id: LangId) -> FileContext {
         FileContext {
+            js_modified_direct_function_names: Default::default(),
             new_path: new_path.to_string(),
             lang_id,
             affected: Vec::new(),

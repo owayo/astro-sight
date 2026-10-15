@@ -569,6 +569,74 @@ mod snapshot_tests {
     /// 上限を超えた staged tree はエラーにせず縮退し、申告を出す。作業ツリーの追跡ファイルが
     /// index と同じときだけ、作業ツリーの参照を根拠にした降格をそのまま使う。
     #[test]
+    fn staged_snapshot_fallback_keeps_js_signature_sites_blocking() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        let api = "export function isOpen(day: string) { return true; }\nexport function dayLabel(day) { return day; }\n";
+        fs::write(repo.join("days.ts"), api).unwrap();
+        fs::write(repo.join("badge.ts"), "import { dayLabel } from './days'; dayLabel('mon');\nexport function badge({isOpen}) { return isOpen('mon'); }\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "initial"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        fs::write(
+            repo.join("days.ts"),
+            api.replace("day: string)", "day: string, days: string[])"),
+        )
+        .unwrap();
+        git(&["add", "days.ts"]);
+        fs::write(repo.join("badge.ts"), "import { dayLabel } from './days'; dayLabel('mon');\nexport function badge({isOpen}) { return !!isOpen; }\n").unwrap();
+        let dir = repo.to_str().unwrap();
+        let diff = run_git_diff(dir, &base, true).unwrap();
+        let prepared = prepare_staged_source(
+            dir,
+            &base,
+            &diff,
+            index_snapshot::SnapshotBudget {
+                files: 1,
+                bytes: u64::MAX,
+            },
+        )
+        .unwrap();
+        assert!(prepared.snapshot.is_none());
+        assert!(prepared.keep_reference_downgrades_blocking);
+        let context = AppService::new()
+            .analyze_context(
+                &diff,
+                dir,
+                &crate::models::impact::ContextAnalysisOptions {
+                    new_side: crate::models::impact::DiffNewSide::Index,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            context
+                .changes
+                .iter()
+                .filter(|change| change.path == "days.ts")
+                .flat_map(|change| &change.impacted_callers)
+                .any(|caller| caller.path == "badge.ts"),
+            "{context:?}"
+        );
+    }
+
+    #[test]
     fn over_budget_staged_tree_falls_back_and_keeps_downgrades_only_when_clean() {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();

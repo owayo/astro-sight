@@ -163,6 +163,7 @@ pub(crate) struct RefVisitEvent<'a> {
     /// 参照の AST 上の使われ方 (identifier 経路のみ分類、他経路は `Other`)。
     pub(crate) usage: RefUsageRole,
     pub(crate) lexical_binding: crate::engine::lexical_binding::LexicalBinding,
+    pub(crate) js_signature_site: crate::engine::js_occurrence::JsSignatureSite,
     /// callback の間だけ有効な AST とソース。impact 固有の証明は collector 側で行う。
     pub(crate) node: Option<Node<'a>>,
     pub(crate) source: &'a [u8],
@@ -240,6 +241,7 @@ pub(crate) struct RefEnvironment<'a> {
     rust_binding_cache: RustPatternBindingCache,
     python_scope_index: std::cell::OnceCell<Option<crate::engine::python_scope::PythonScopeIndex>>,
     rust_scope_index: std::cell::OnceCell<Option<crate::engine::rust_scope::RustScopeIndex>>,
+    js_occurrence_index: std::cell::OnceCell<crate::engine::js_occurrence::JsOccurrenceIndex>,
     bash_declaration_cache: BashDeclarationCache,
     bash_declarations: Vec<crate::engine::bash_parse_recovery::UnparsedBashDeclaration>,
 }
@@ -413,6 +415,28 @@ impl<V: RefVisitor> RawRefSink for VisitorAdapter<'_, V> {
     fn on_hit(&mut self, hit: RawRefHit<'_, '_>, env: &RefEnvironment<'_>) {
         let context = env.line_context(hit.line);
         let context_column = env.ctx_column(hit.column, hit.line);
+        let js_signature_site = match hit.origin {
+            HitOrigin::Identifier(node)
+                if !hit.is_def
+                    && matches!(
+                        env.lang_id,
+                        LangId::Javascript | LangId::Typescript | LangId::Tsx
+                    ) =>
+            {
+                let index = env.js_occurrence_index.get_or_init(|| {
+                    let mut root = node;
+                    while let Some(parent) = root.parent() {
+                        root = parent;
+                    }
+                    crate::engine::js_occurrence::JsOccurrenceIndex::new(root, env.source)
+                });
+                node.utf8_text(env.source)
+                    .ok()
+                    .map(|name| index.classify(node, env.source, name))
+                    .unwrap_or(crate::engine::js_occurrence::JsSignatureSite::Unknown)
+            }
+            _ => crate::engine::js_occurrence::JsSignatureSite::Unknown,
+        };
         let lexical_binding = match hit.origin {
             HitOrigin::Identifier(node) if env.lang_id == LangId::Python && !hit.is_def => env
                 .python_scope_index
@@ -452,6 +476,7 @@ impl<V: RefVisitor> RawRefSink for VisitorAdapter<'_, V> {
                 rust_macro_callee,
                 usage,
                 lexical_binding,
+                js_signature_site,
                 node: match hit.origin {
                     HitOrigin::Identifier(node) => Some(node),
                     HitOrigin::Synthetic(_) => None,
@@ -676,6 +701,7 @@ pub(crate) fn run_ref_walk<M: RefMatcher, S: RawRefSink>(
         rust_binding_cache: RustPatternBindingCache::default(),
         python_scope_index: std::cell::OnceCell::new(),
         rust_scope_index: std::cell::OnceCell::new(),
+        js_occurrence_index: std::cell::OnceCell::new(),
         bash_declaration_cache: BashDeclarationCache::default(),
         // ERROR 回復が extglob とした宣言も全経路で保持する。count / visitor は
         // 未検証の出現を保守的に数え、refs の出力だけを unknown に分類する。

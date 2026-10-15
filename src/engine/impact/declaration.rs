@@ -581,9 +581,10 @@ impl OldSide {
     }
 }
 
-/// 旧解析を再利用して確定した Rust の種別情報。
+/// 旧解析を再利用して確定した宣言の種別情報。
 #[derive(Default)]
 pub(super) struct DeclarationProof {
+    pub(super) js_modified_direct_function_names: HashSet<String>,
     pub(super) rust_function_names: HashSet<String>,
     /// 旧新とも同名宣言が自由関数だけの名前。メソッド位置の参照は指し得ない。
     pub(super) rust_free_function_names: HashSet<String>,
@@ -927,7 +928,15 @@ pub(super) fn reconcile_declaration_changes(
             sig_changes.push(change);
         }
     }
-    let mut proof = DeclarationProof::default();
+    let mut proof = DeclarationProof {
+        js_modified_direct_function_names: js_modified_direct_function_names(
+            input,
+            affected,
+            sig_changes,
+            &mut old_side,
+        ),
+        ..Default::default()
+    };
     if input.lang_id == LangId::Rust {
         proof.rust_alias_changes = rust_modified_alias_names(input, affected, &mut old_side);
     }
@@ -1004,6 +1013,79 @@ pub(super) fn reconcile_declaration_changes(
         }
     }
     proof
+}
+
+fn js_modified_direct_function_names(
+    input: &DeclarationChangeInput<'_>,
+    affected: &[AffectedSymbol],
+    sig_changes: &[SignatureChange],
+    old_side: &mut LazyOldSide,
+) -> HashSet<String> {
+    use crate::engine::js_occurrence::unique_direct_function;
+    if !matches!(
+        input.lang_id,
+        LangId::Javascript | LangId::Typescript | LangId::Tsx
+    ) || [".d.ts", ".d.mts", ".d.cts"]
+        .iter()
+        .any(|suffix| input.file_path.ends_with(suffix))
+    {
+        return HashSet::new();
+    }
+    let candidates: HashSet<&str> = sig_changes
+        .iter()
+        .map(|change| change.name.as_str())
+        .collect();
+    let mut proven = HashSet::new();
+    for name in candidates {
+        let changes: Vec<_> = affected
+            .iter()
+            .filter(|change| change.name == name)
+            .collect();
+        if changes.is_empty()
+            || changes
+                .iter()
+                .any(|change| change.change_type != "modified" || change.kind != "function")
+        {
+            continue;
+        }
+        // 同名の無変更 root 関数を、変更されたメソッド等の証拠に使わない。
+        let originals: Vec<_> = input
+            .syms
+            .iter()
+            .filter(|symbol| {
+                symbol.name == name
+                    && super::classify_symbol_change(symbol, input.hunks, Some(input.facts))
+                        == Some("modified")
+            })
+            .collect();
+        if originals.is_empty()
+            || originals.iter().any(|symbol| {
+                symbol.kind != SymbolKind::Function
+                    || symbol.container.is_some()
+                    || !super::descendant_for_range(input.root, &symbol.range).is_some_and(|node| {
+                        node.parent().is_some_and(|parent| {
+                            parent.id() == input.root.id()
+                                || (parent.kind() == "export_statement"
+                                    && parent
+                                        .child_by_field_name("declaration")
+                                        .is_some_and(|decl| decl.id() == node.id())
+                                    && parent
+                                        .parent()
+                                        .is_some_and(|root| root.id() == input.root.id()))
+                        })
+                    })
+            })
+            || !unique_direct_function(input.root, input.source, name)
+        {
+            continue;
+        }
+        if let Some(old) = old_side.get(input)
+            && unique_direct_function(old.tree.root_node(), &old.source, name)
+        {
+            proven.insert(super::ci_key(input.lang_id, name));
+        }
+    }
+    proven
 }
 
 /// 旧新ソースから対象の本体だけを抜いた残りが完全一致するときに限る。対象の宣言の
@@ -1104,6 +1186,83 @@ fn text_path_compared(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn js_signature_source_proof_requires_the_modified_direct_function_on_both_sides() {
+        let proof = |lang, old: &str, new: &str, extra: Option<&str>| {
+            let path = "api.ts";
+            let text = unified_diff(path, old, new);
+            let hunks = diff::parse_unified_diff(&text)[0].hunks.clone();
+            let tree = parser::parse_source(new.as_bytes(), lang).unwrap();
+            let root = tree.root_node();
+            let syms = symbols::extract_symbols(root, new.as_bytes(), lang).unwrap();
+            let facts = diff::extract_changed_line_facts(&text, path);
+            let moves = super::super::ReexportMoveIndex::build(&text);
+            let mut affected = super::super::find_affected_symbols(&syms, &hunks, Some(&facts));
+            if let Some(kind) = extra {
+                affected.push(AffectedSymbol {
+                    name: "isOpen".into(),
+                    kind: kind.into(),
+                    change_type: "removed".into(),
+                });
+            }
+            let mut signatures =
+                super::super::signature::detect_signature_changes(&text, path, &affected, lang);
+            reconcile_declaration_changes(
+                &DeclarationChangeInput {
+                    file_diff: &text,
+                    file_path: path,
+                    syms: &syms,
+                    hunks: &hunks,
+                    root,
+                    source: new.as_bytes(),
+                    lang_id: lang,
+                    facts: &facts,
+                    reexport_moves: &moves,
+                },
+                &mut affected,
+                &mut signatures,
+            )
+            .js_modified_direct_function_names
+        };
+        let old = "export function isOpen(day) { return true; }\n";
+        let new = "export function isOpen(day, days) { return true; }\n";
+        for lang in [LangId::Javascript, LangId::Typescript, LangId::Tsx] {
+            assert_eq!(
+                proof(lang, old, new, None),
+                HashSet::from(["isOpen".to_owned()])
+            );
+            for (old, new) in [
+                ("export const isOpen = false;\n", new),
+                (old, "export const isOpen = false;\n"),
+                ("export const other = true;\n", new),
+                (
+                    "export class Gate { isOpen(day) { return true; } }\n",
+                    "export class Gate { isOpen(day, days) { return true; } }\n",
+                ),
+                (
+                    "export function isOpen(day) { return true; }\nexport class Gate { isOpen(day) { return true; } }\n",
+                    "export function isOpen(day) { return true; }\nexport class Gate { isOpen(day, days) { return true; } }\n",
+                ),
+                (
+                    "export function isOpen(day) { return true; }\nexport class Gate { isOpen(day) { return true; } }\n",
+                    "export function isOpen(day, days) { return true; }\nexport class Gate { isOpen(day, days) { return true; } }\n",
+                ),
+                (
+                    "export function isOpen(day) { return true; }\nconst isOpen = false;\n",
+                    new,
+                ),
+            ] {
+                assert!(
+                    proof(lang, old, new, None).is_empty(),
+                    "{lang:?}: {old} -> {new}"
+                );
+            }
+            for kind in ["method", "constant", "function"] {
+                assert!(proof(lang, old, new, Some(kind)).is_empty(), "{kind}");
+            }
+        }
+    }
 
     #[test]
     fn rust_module_alias_excludes_impl_associated_type() {

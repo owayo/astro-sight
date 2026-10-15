@@ -264,6 +264,7 @@ mod tests {
 
     fn empty_ctx(path: &str) -> FileContext {
         FileContext {
+            js_modified_direct_function_names: Default::default(),
             new_path: path.to_string(),
             lang_id: LangId::Php,
             affected: Vec::new(),

@@ -11,6 +11,7 @@ use lru::LruCache;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::engine::js_occurrence::JsSignatureSite;
 use crate::engine::lexical_binding::LexicalBinding;
 use crate::engine::refs;
 use crate::language::LangId;
@@ -54,6 +55,7 @@ pub(super) struct WorkerState {
 /// `context` 文字列自体は保持しない（per-file buffer の heap を劇的に削減）。
 /// sym_ix / line / column / caller_name_id / is_import_flag / confidence の計 24 B 構造体 + 1 bit + 1 byte。
 pub(super) struct RefEventMini {
+    pub(super) js_signature_site: JsSignatureSite,
     pub(super) sym_ix: u32,
     pub(super) line: u32,
     pub(super) column: u32,
@@ -161,6 +163,7 @@ enum CallerRoute {
 /// 集約mapや文字列poolは持たず、判定に必要なimport事実キャッシュだけを更新する。
 struct RouteDecisionContext<'a> {
     filter_disabled: bool,
+    js_signature_sites_trusted: bool,
     ref_lang: Option<LangId>,
     dir: &'a str,
     path_str: &'a str,
@@ -222,6 +225,20 @@ impl RouteDecisionContext<'_> {
         let route_low = if event.is_import {
             false
         } else {
+            let js_signature_low = !self.filter_disabled
+                && self.js_signature_sites_trusted
+                && self.ref_lang.is_some_and(lang_is_ts_family)
+                && lang_is_ts_family(file_context.lang_id)
+                && ![".d.ts", ".d.mts", ".d.cts"]
+                    .iter()
+                    .any(|suffix| self.path_str.ends_with(suffix))
+                && file_context
+                    .js_modified_direct_function_names
+                    .contains(symbol_name)
+                && matches!(
+                    event.js_signature_site,
+                    JsSignatureSite::NonReference | JsSignatureSite::InsensitiveParamUse
+                );
             // TS/TSX/JS 名前衝突の誤検出抑制:
             // 参照元と変更元がTS系で、変更元moduleの直接importがなければlowへ振り分ける。
             let ts_route_low = if !self.filter_disabled
@@ -282,7 +299,7 @@ impl RouteDecisionContext<'_> {
             } else {
                 false
             };
-            base_route_low || ts_route_low || rust_route_low
+            base_route_low || ts_route_low || rust_route_low || js_signature_low
         };
 
         if route_informational {
@@ -301,6 +318,7 @@ impl RouteDecisionContext<'_> {
 /// ファイル走査完了後に `finish_file` で Stage 1-6 (Stage 4b 除く) の filter を適用して
 /// `local_maps` / `local_def_paths` へ流す。`SymbolReference` の Vec は生成しない。
 pub(super) struct ImpactCollector<'a> {
+    pub(super) js_signature_sites_trusted: bool,
     pub(super) jsx_shapes: Vec<super::jsx_props::JsxShape>,
     pub(super) jsx_parse_clean: std::cell::OnceCell<bool>,
     pub(super) python_imports:
@@ -365,6 +383,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             rust_macro_callee,
             usage,
             lexical_binding,
+            js_signature_site,
             node,
             source,
         } = event;
@@ -697,6 +716,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             u32::MAX
         };
         self.ref_events.push(RefEventMini {
+            js_signature_site,
             sym_ix,
             line: line as u32,
             column: column as u32,
@@ -1315,6 +1335,7 @@ impl<'a> ImpactCollector<'a> {
         } else {
             RouteDecisionContext {
                 filter_disabled,
+                js_signature_sites_trusted: self.js_signature_sites_trusted,
                 ref_lang: self.ref_lang,
                 dir: self.dir,
                 path_str: self.path_str,
@@ -1386,6 +1407,7 @@ mod tests {
 
     fn ev(sym_ix: u32, confidence: u8) -> RefEventMini {
         RefEventMini {
+            js_signature_site: JsSignatureSite::Unknown,
             sym_ix,
             line: 0,
             column: 0,
@@ -1414,6 +1436,80 @@ mod tests {
             rust_direct_import_site: false,
             rust_import_binding_safe: false,
         }
+    }
+
+    #[test]
+    fn js_signature_route_requires_each_source_and_reference_boundary() {
+        let mut context = file_context(
+            vec![AffectedSymbol {
+                name: "target".to_owned(),
+                kind: "function".to_owned(),
+                change_type: "modified".to_owned(),
+            }],
+            Vec::new(),
+        );
+        context.lang_id = LangId::Typescript;
+        context.new_path = "src/days.ts".to_owned();
+        context
+            .js_modified_direct_function_names
+            .insert("target".to_owned());
+        let decide = |event: &RefEventMini, ctx: &FileContext, trusted, disabled, path: &str| {
+            let mut cache = LruCache::unbounded();
+            // None は import 不明として扱い、既存の importless 降格を止める。
+            cache.put(path.to_owned(), None);
+            let moves = super::super::reexport_move::ReexportMoveIndex::build("");
+            let barrels = super::super::ts_barrels::TsBarrelIndex::default();
+            RouteDecisionContext {
+                filter_disabled: disabled,
+                js_signature_sites_trusted: trusted,
+                ref_lang: Some(LangId::Typescript),
+                dir: ".",
+                path_str: path,
+                import_facts_cache: &mut cache,
+                reexport_moves: &moves,
+                ts_barrels: &barrels,
+            }
+            .decide(event, ctx, "target", false, false, false)
+        };
+        for site in [
+            JsSignatureSite::NonReference,
+            JsSignatureSite::InsensitiveParamUse,
+        ] {
+            let mut event = ev(0, 0);
+            event.js_signature_site = site;
+            assert_eq!(
+                decide(&event, &context, true, false, "src/badge.ts"),
+                CallerRoute::Low
+            );
+            assert_eq!(
+                decide(&event, &context, false, false, "src/badge.ts"),
+                CallerRoute::Normal
+            );
+            assert_eq!(
+                decide(&event, &context, true, true, "src/badge.ts"),
+                CallerRoute::Normal
+            );
+            for path in ["src/badge.d.ts", "src/badge.d.mts", "src/badge.d.cts"] {
+                assert_eq!(
+                    decide(&event, &context, true, false, path),
+                    CallerRoute::Normal
+                );
+            }
+            let other = file_context(Vec::new(), Vec::new());
+            assert_eq!(
+                decide(&event, &other, true, false, "src/badge.ts"),
+                CallerRoute::Normal
+            );
+            event.is_import = true;
+            assert_eq!(
+                decide(&event, &context, true, false, "src/badge.ts"),
+                CallerRoute::Informational
+            );
+        }
+        assert_eq!(
+            decide(&ev(0, 0), &context, true, false, "src/badge.ts"),
+            CallerRoute::Normal
+        );
     }
 
     /// generic method name 判定: 仕様の全名・大文字混在・該当外の確認
@@ -1457,6 +1553,7 @@ mod tests {
         sig_changes: Vec<SignatureChange>,
     ) -> FileContext {
         FileContext {
+            js_modified_direct_function_names: Default::default(),
             new_path: "src/changed.rs".to_string(),
             lang_id: LangId::Rust,
             rust_function_names: super::super::rust_function_names(LangId::Rust, &affected),
@@ -1510,6 +1607,7 @@ mod tests {
         let reexport_moves = super::super::reexport_move::ReexportMoveIndex::build("");
         let ts_barrels = super::super::ts_barrels::TsBarrelIndex::default();
         RouteDecisionContext {
+            js_signature_sites_trusted: false,
             // TS/Rust のファイル解析を伴う補正は既存の import_facts テストに任せ、
             // ここでは3バケットの優先順位だけを固定する。
             filter_disabled: true,

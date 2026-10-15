@@ -91,6 +91,8 @@ struct FileContext {
     lang_id: LangId,
     affected: Vec<AffectedSymbol>,
     sig_changes: Vec<SignatureChange>,
+    /// 旧新とも一意な直接関数宣言と証明できた modified のシグネチャ変更。
+    js_modified_direct_function_names: HashSet<String>,
     /// 透過的な Rust type alias 導入だけと old/new AST で証明できたシグネチャ変更。
     /// cross-file / same-file の caller は消さず informational へ振り分ける。
     compatible_signature_keys: HashSet<String>,
@@ -884,6 +886,7 @@ fn collect_affected_symbols(
         file_contexts.push(FileContext {
             new_path: df.new_path.clone(),
             lang_id,
+            js_modified_direct_function_names: declaration_proof.js_modified_direct_function_names,
             rust_function_names: declaration_proof.rust_function_names,
             rust_free_function_names: declaration_proof.rust_free_function_names,
             rust_kind_changes: declaration_proof.rust_kind_changes,

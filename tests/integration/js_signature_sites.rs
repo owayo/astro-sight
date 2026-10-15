@@ -56,36 +56,61 @@ fn unrelated_truthiness_parameter_closes_updated_api() {
 }
 
 #[test]
-fn same_module_other_import_closes_api_without_changing_impact() {
-    let repo = fixture(
-        "ts",
-        &format!(
-            "import {{ dayLabel }} from './days';\n{}",
+fn same_module_other_import_keeps_signature_insensitive_impact_low() {
+    for extension in ["ts", "tsx", "js"] {
+        let badge = if extension == "js" {
+            "export function badgeLabel({day, isOpen}) {\n  return isOpen ? dayLabel(day) : 'closed';\n}".to_owned()
+        } else {
             BADGE.replace("isOpen ? day", "isOpen ? dayLabel(day)")
-        ),
-        UPDATED,
-    );
-    let (code, json) = hook(&repo);
-    assert_eq!(json["api"]["mod_closed"][0]["n"], "isOpen", "{json}");
-    assert_eq!(
-        code, 0,
-        "closed API suppresses related hook impacts: {json}"
-    );
-    let impact = cargo_bin()
-        .args(["impact", "--git", "--dir"])
-        .arg(repo.root())
-        .output()
-        .unwrap();
-    assert_eq!(
-        impact.status.code(),
-        Some(1),
-        "standalone impact belongs to the follow-up"
-    );
-    let details = String::from_utf8_lossy(&impact.stderr);
-    assert!(
-        details.contains("src/badge.ts") && details.contains("isOpen"),
-        "{details}"
-    );
+        };
+        let repo = fixture(
+            extension,
+            &format!("import {{ dayLabel }} from './days';\n{badge}"),
+            UPDATED,
+        );
+        let impact = cargo_bin()
+            .args(["impact", "--git", "--dir"])
+            .arg(repo.root())
+            .output()
+            .unwrap();
+        assert_eq!(
+            impact.status.code(),
+            Some(0),
+            "{extension}: {}",
+            String::from_utf8_lossy(&impact.stderr)
+        );
+        let context = repo.run_json("context", &["--git"]);
+        let change = context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|change| change["path"] == format!("src/days.{extension}"))
+            .unwrap_or_else(|| panic!("{context}"));
+        let badge_path = format!("src/badge.{extension}");
+        assert!(
+            !change["impacted_callers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|caller| caller["path"] == badge_path),
+            "{context}"
+        );
+        assert_eq!(
+            change["low_confidence_callers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|caller| caller["path"] == badge_path)
+                .count(),
+            if extension == "js" { 1 } else { 2 },
+            "{context}"
+        );
+        let (code, json) = hook(&repo);
+        assert_eq!(json["api"]["mod_closed"][0]["n"], "isOpen", "{json}");
+        assert_eq!(code, 0, "{json}");
+        let review = repo.run_json("review", &["--git"]);
+        assert_eq!(review["impact"], context, "{review}");
+    }
 }
 
 #[test]
@@ -118,10 +143,262 @@ fn signature_sensitive_parameter_uses_stay_blocking() {
         "export function badge(isOpen) { return !!isOpen; } const broken = ;",
         "declare module './days' { interface Props { isOpen?: boolean; } }",
     ] {
-        let repo = fixture("ts", badge, UPDATED);
+        let badge = format!("import {{ dayLabel }} from './days';\ndayLabel('mon');\n{badge}");
+        let repo = fixture("ts", &badge, UPDATED);
         let (_, json) = hook(&repo);
         assert!(json["api"]["mod_closed"].is_null(), "{badge}: {json}");
         assert_eq!(json["api"]["mod"][0]["n"], "isOpen", "{badge}: {json}");
+        assert_badge_blocking(&repo, "src/days.ts", "src/badge.ts");
+    }
+}
+
+fn assert_badge_blocking(repo: &TestRepo, source: &str, badge: &str) {
+    let context = repo.run_json("context", &["--git"]);
+    let change = context["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["path"] == source)
+        .unwrap_or_else(|| panic!("{context}"));
+    assert!(
+        change["impacted_callers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|caller| caller["path"] == badge
+                && caller["symbols"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|name| name == "isOpen")),
+        "{context}"
+    );
+    let output = cargo_bin()
+        .args(["impact", "--git", "--dir"])
+        .arg(repo.root())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn impact_keeps_actual_callers_and_signature_sensitive_source_kinds() {
+    for (old, new, badge) in [
+        (
+            "export function isOpen(day) { return true; }",
+            "export function isOpen(day, days) { return true; }",
+            "import { isOpen } from './days';\nexport function badge() { return isOpen('mon'); }",
+        ),
+        (
+            "export function isOpen(day) { return true; }",
+            "export function isOpen(day, days) { return true; }",
+            "import * as days from './days';\nexport function badge() { return days.isOpen('mon'); }",
+        ),
+        (
+            "export const isOpen = false;",
+            "export function isOpen(day, days) { return true; }",
+            "export function badge({isOpen}) { return !!isOpen; }",
+        ),
+        (
+            "export function isOpen(day) { return true; }",
+            "export const isOpen = false;",
+            "export function badge({isOpen}) { return !!isOpen; }",
+        ),
+        (
+            "export function isOpen(day) { return true; }\nexport class Gate { isOpen(day) { return true; } }",
+            "export function isOpen(day) { return true; }\nexport class Gate { isOpen(day, days) { return true; } }",
+            "import { Gate } from './days';\nnew Gate();\nexport function badge({isOpen}) { return !!isOpen; }",
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.create_dir_all("src");
+        let label = "\nexport function dayLabel(day) { return day; }\n";
+        repo.write("src/days.ts", format!("{old}{label}"));
+        repo.write(
+            "src/badge.ts",
+            format!("import {{ dayLabel }} from './days'; dayLabel('mon');\n{badge}\n"),
+        );
+        repo.commit_all("initial");
+        repo.write("src/days.ts", format!("{new}{label}"));
+        if old.starts_with("export const") || new.starts_with("export const") {
+            let context = repo.run_json("context", &["--git"]);
+            assert!(
+                !context["changes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|c| c["low_confidence_callers"].as_array().into_iter().flatten())
+                    .any(|c| c["path"] == "src/badge.ts"),
+                "{old} -> {new}: {context}"
+            );
+        } else {
+            assert_badge_blocking(&repo, "src/days.ts", "src/badge.ts");
+        }
+    }
+}
+
+#[test]
+fn signature_impact_proof_is_per_changed_source() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    repo.write("src/days.ts", "export function isOpen(day) { return true; }\nexport function dayLabel(day) { return day; }\n");
+    repo.write(
+        "src/other.ts",
+        "export const isOpen = false;\nexport function otherLabel(day) { return day; }\n",
+    );
+    repo.write("src/badge.ts", "import { dayLabel } from './days';\nimport { otherLabel } from './other';\ndayLabel(otherLabel('mon'));\nexport function badge({isOpen}) { return !!isOpen; }\n");
+    repo.commit_all("initial");
+    repo.write("src/days.ts", "export function isOpen(day, days) { return true; }\nexport function dayLabel(day) { return day; }\n");
+    repo.write(
+        "src/other.ts",
+        "export const isOpen = true;\nexport function otherLabel(day) { return day; }\n",
+    );
+    let context = repo.run_json("context", &["--git"]);
+    let days = context["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["path"] == "src/days.ts")
+        .unwrap();
+    assert!(
+        days["low_confidence_callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["path"] == "src/badge.ts"),
+        "{context}"
+    );
+    assert!(
+        !days["impacted_callers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|c| c["path"] == "src/badge.ts"),
+        "{context}"
+    );
+    assert_badge_blocking(&repo, "src/other.ts", "src/badge.ts");
+}
+
+#[test]
+fn removed_function_keeps_api_removal_blocking_with_truthiness_sites() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    repo.write("src/days.ts", "export function isOpen(day: string) { return true; }\nexport function dayLabel(day) { return day; }\n");
+    repo.write(
+        "src/badge.ts",
+        format!("import {{ dayLabel }} from './days';\n{BADGE}"),
+    );
+    repo.write(
+        "src/main.ts",
+        "import { isOpen } from './days'; isOpen('mon');\n",
+    );
+    repo.commit_all("initial");
+    repo.write(
+        "src/days.ts",
+        "export function dayLabel(day) { return day; }\n",
+    );
+    let (code, json) = hook(&repo);
+    assert_eq!(code, 1, "{json}");
+    assert!(
+        json["api"]["rm"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["n"] == "isOpen"),
+        "{json}"
+    );
+}
+
+#[test]
+fn impact_declaration_files_and_disabled_filter_keep_original_candidates() {
+    for suffix in ["d.ts", "d.mts", "d.cts"] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.create_dir_all("src");
+        repo.write("src/days.ts", "export function isOpen(day: string) { return true; }\nexport function dayLabel(day) { return day; }\n");
+        let path = format!("src/contract.{suffix}");
+        repo.write(
+            &path,
+            format!("import {{dayLabel}} from './days';\n{BADGE}"),
+        );
+        repo.commit_all("initial");
+        repo.write("src/days.ts", "export function isOpen(day: string, days: string[]) { return true; }\nexport function dayLabel(day) { return day; }\n");
+        assert_badge_blocking(&repo, "src/days.ts", &path);
+    }
+    let repo = fixture(
+        "ts",
+        &format!("import {{dayLabel}} from './days';\n{BADGE}"),
+        UPDATED,
+    );
+    let output = cargo_bin()
+        .args(["context", "--git", "--dir"])
+        .arg(repo.root())
+        .env("ASTRO_SIGHT_NO_CONFIDENCE_FILTER", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let context: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        context["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["path"] == "src/days.ts")
+            .flat_map(|c| c["impacted_callers"].as_array().into_iter().flatten())
+            .any(|c| c["path"] == "src/badge.ts"),
+        "{context}"
+    );
+}
+
+#[test]
+fn staged_signature_impact_uses_only_trusted_snapshot_references() {
+    let safe = format!("import {{dayLabel}} from './days'; dayLabel('mon');\n{BADGE}");
+    let sensitive = "import {dayLabel} from './days'; dayLabel('mon');\nexport function badge({isOpen}) { return isOpen('mon'); }\n";
+    for (staged_badge, working_badge, blocking) in
+        [(&safe[..], sensitive, false), (sensitive, &safe[..], true)]
+    {
+        let repo = fixture("ts", staged_badge, UPDATED);
+        repo.stage_all();
+        repo.write("src/badge.ts", working_badge);
+        let review = repo.run_json("review", &["--git", "--staged"]);
+        let days = review["impact"]["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["path"] == "src/days.ts")
+            .unwrap();
+        assert_eq!(
+            days["impacted_callers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|c| c["path"] == "src/badge.ts"),
+            blocking,
+            "{review}"
+        );
+        let direct = repo.run_json("context", &["--git", "--staged"]);
+        let days = direct["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["path"] == "src/days.ts")
+            .unwrap();
+        assert!(
+            days["impacted_callers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|c| c["path"] == "src/badge.ts"),
+            "Index must keep untrusted worktree references: {direct}"
+        );
     }
 }
 
@@ -217,6 +494,7 @@ fn arguments_alias_keeps_parameter_signature_sensitive() {
         let (_, json) = hook(&repo);
         assert!(json["api"]["mod_closed"].is_null(), "{use_site}: {json}");
         assert_eq!(json["api"]["mod"][0]["n"], "isOpen", "{use_site}: {json}");
+        assert_badge_blocking(&repo, "src/days.ts", "src/badge.ts");
     }
 }
 
@@ -249,6 +527,7 @@ fn sloppy_function_arguments_property_keeps_old_call_blocking() {
         if json["api"]["mod_closed"].is_array() {
             missed.push(format!("{access}: {json}"));
         }
+        assert_badge_blocking(&repo, "src/days.js", "src/badge.js");
     }
     assert!(missed.is_empty(), "{}", missed.join("\n"));
 }
@@ -260,6 +539,7 @@ fn escaped_shorthand_parameter_escape_stays_blocking() {
     let (_, json) = hook(&repo);
     assert!(json["api"]["mod_closed"].is_null(), "{json}");
     assert_eq!(json["api"]["mod"][0]["n"], "isOpen", "{json}");
+    assert_badge_blocking(&repo, "src/days.js", "src/badge.js");
 }
 
 #[test]
