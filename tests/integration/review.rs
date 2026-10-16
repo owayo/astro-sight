@@ -29,6 +29,16 @@ fn staged_api_contracts_and_callers_use_the_index_snapshot() {
             "Service.price",
         ),
         (
+            "pkg/api.py",
+            "pkg/caller.py",
+            "def price(amount):\n    return amount\n",
+            "def price(amount, tax):\n    return amount + tax\n",
+            "from pkg.api import price\n\ndef use():\n    return ",
+            "price(\n        1,\n    ) + 0",
+            "price(\n        1,\n        2,\n    )",
+            "price",
+        ),
+        (
             "api.ts",
             "caller.ts",
             "export function price(amount: number) { return amount; }\n",
@@ -1599,6 +1609,160 @@ fn review_hook_object_argument_callback_contract_changes_stay_blocking() {
         assert_eq!(json["api"]["mod"][0]["n"], "plugin", "{stderr}");
         assert!(json["api"]["callback_body"].is_null(), "{stderr}");
     }
+}
+
+#[test]
+fn review_hook_python_multiline_call_updates_require_valid_changed_calls() {
+    let before = "def render(name, *, punctuation, **options):\n    return name + punctuation\n";
+    let after = "def render(name, *, greeting, punctuation, **options):\n    return greeting + name + punctuation\n";
+    for (label, import, old_call, new_call, closed) in [
+        (
+            "direct call",
+            "from pkg.api import render",
+            "render(\n    'world',\n    punctuation='!',\n)",
+            "render(\n    'world',\n    greeting='Hello',\n    punctuation='!',\n)",
+            true,
+        ),
+        (
+            "module attribute call",
+            "import pkg.api",
+            "pkg.api.render(\n    'world',\n    punctuation='!',\n)",
+            "pkg.api.render(\n    'world',\n    greeting='Hello',\n    punctuation='!',\n)",
+            true,
+        ),
+        (
+            "nested call",
+            "from pkg.api import render",
+            "print(render(\n    'world',\n    punctuation='!',\n))",
+            "print(render(\n    'world',\n    greeting='Hello',\n    punctuation='!',\n))",
+            true,
+        ),
+        (
+            "missing required keyword",
+            "from pkg.api import render",
+            "render(\n    'world',\n    punctuation='!',\n)",
+            "render(\n    'world',\n    punctuation='?',\n)",
+            false,
+        ),
+        (
+            "keyword-only supplied positionally",
+            "from pkg.api import render",
+            "render(\n    'world',\n    punctuation='!',\n)",
+            "render(\n    'world',\n    'Hello',\n    punctuation='!',\n)",
+            false,
+        ),
+        (
+            "keyword expansion",
+            "from pkg.api import render",
+            "render(\n    'world',\n    punctuation='!',\n)",
+            "render(\n    'world',\n    **options,\n    punctuation='!',\n)",
+            false,
+        ),
+        (
+            "function value in argument",
+            "from pkg.api import render",
+            "consume(\n    render,\n    'old',\n)",
+            "consume(\n    render,\n    'new',\n)",
+            false,
+        ),
+        (
+            "receiver of another call",
+            "from pkg.api import render",
+            "render.invoke(\n    'old',\n)",
+            "render.invoke(\n    'new',\n)",
+            false,
+        ),
+        (
+            "only outer call changed",
+            "from pkg.api import render",
+            "print(\n    render(\n        'world',\n        greeting='Hello',\n        punctuation='!',\n    ),\n    'old',\n)",
+            "print(\n    render(\n        'world',\n        greeting='Hello',\n        punctuation='!',\n    ),\n    'new',\n)",
+            false,
+        ),
+        (
+            "only outside call changed",
+            "from pkg.api import render",
+            "render(\n    'world',\n    greeting='Hello',\n    punctuation='!',\n)\nmarker = 'old'",
+            "render(\n    'world',\n    greeting='Hello',\n    punctuation='!',\n)\nmarker = 'new'",
+            false,
+        ),
+        (
+            "another caller is unchanged",
+            "from pkg.api import render",
+            "render(\n    'world',\n    punctuation='!',\n)\nrender('other', punctuation='!')",
+            "render(\n    'world',\n    greeting='Hello',\n    punctuation='!',\n)\nrender('other', punctuation='!')",
+            false,
+        ),
+        (
+            "parse error",
+            "from pkg.api import render",
+            "render(\n    'world',\n    punctuation='!',\n)",
+            "render(\n    'world',\n    greeting='Hello',\n    punctuation='!',\n)\ndef broken(",
+            false,
+        ),
+    ] {
+        let old_usage = format!("{import}\n\n{old_call}\n");
+        let new_usage = format!("{import}\n\n{new_call}\n");
+        let output = a3_review_hook(
+            |root| {
+                std::fs::write(root.join("pkg/api.py"), after).unwrap();
+                std::fs::write(root.join("app.py"), &new_usage).unwrap();
+            },
+            &[
+                ("pkg/__init__.py", ""),
+                ("pkg/api.py", before),
+                ("app.py", &old_usage),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(!closed)),
+            "{label}: {stderr}"
+        );
+        let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        for (category, expected) in [("mod_closed", closed), ("mod", !closed)] {
+            assert_eq!(
+                json["api"][category]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|s| s["n"] == "render"),
+                expected,
+                "{label}: {stderr}",
+            );
+        }
+    }
+}
+
+#[test]
+fn review_hook_python_multiline_unchecked_class_call_stays_blocking() {
+    let before = "class Base:\n    pass\n\nclass Service:\n    pass\n";
+    let after = "class Base:\n    pass\n\nclass Service(Base):\n    pass\n";
+    let old_usage = "from pkg.api import Service\n\nService(\n    # old\n)\n";
+    let new_usage = "from pkg.api import Service\n\nService(\n    # new\n)\n";
+    let output = a3_review_hook(
+        |root| {
+            std::fs::write(root.join("pkg/api.py"), after).unwrap();
+            std::fs::write(root.join("app.py"), new_usage).unwrap();
+        },
+        &[
+            ("pkg/__init__.py", ""),
+            ("pkg/api.py", before),
+            ("app.py", old_usage),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert!(
+        json["api"]["mod"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["n"] == "Service"),
+        "{stderr}"
+    );
 }
 
 #[test]

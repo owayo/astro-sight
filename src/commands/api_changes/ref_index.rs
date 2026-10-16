@@ -888,9 +888,10 @@ fn prove_reference_updated(
     {
         return false;
     }
-    if target.target_lang == Some(crate::language::LangId::Python)
+    let python_function = target.target_lang == Some(crate::language::LangId::Python)
         && kind == "function"
-        && !name.contains('.')
+        && !name.contains('.');
+    if python_function
         && !super::python_call_arity::changed_top_level_call_matches_signature(
             dir,
             target_new_path,
@@ -921,10 +922,10 @@ fn prove_reference_updated(
         return true;
     }
     // 複数行呼び出し (`startRecording({\n  fps,\n  cursor,\n})`) では識別子行は
-    // 未変更のまま実引数のプロパティ行だけが変わる。JS/TS/TSX で参照が call の
-    // callee を成す場合に限り、enclosing call_expression の行範囲まで広げて
-    // 実変更行との交差を確認する (交差しなければ従来どおり未更新 caller 扱い)。
-    if enclosing_call_line_range(dir, r, bare, caches)
+    // 未変更のまま実引数の行だけが変わる。参照が callee を成す場合に限り、
+    // 呼び出し式の行範囲と実変更行の交差を確認する。Python は引数照合を通った
+    // トップレベル関数だけを対象にし、メソッド・クラス等や他言語の API からは範囲を広げない。
+    if enclosing_call_line_range(dir, r, bare, python_function, caches)
         .is_some_and(|(start, end)| (start..=end).any(|line| changed.contains(&line)))
     {
         return true;
@@ -1063,17 +1064,21 @@ fn parse_ref_file(dir: &str, ref_path: &str) -> Option<ParsedRefFile> {
     })
 }
 
-/// JS/TS/TSX の参照が call の callee (直接または `obj.name(...)` の member 経由) を成す
-/// 場合、その call_expression / new_expression 全体の行範囲 (0-indexed、両端含む) を返す。
+/// JS/TS/TSX、または引数照合済みの Python 参照が callee を成す場合、
+/// 呼び出し式全体の行範囲 (0-indexed、両端含む) を返す。
 /// JSX の要素名なら、子要素を含まない開始タグの範囲を返す。
 /// callee でない参照・他言語・parse 失敗は `None` (従来の単一行判定に留める)。
 fn enclosing_call_line_range(
     dir: &str,
     r: &crate::models::reference::SymbolReference,
     bare: &str,
+    python_call_checked: bool,
     caches: &mut ApiClosureCaches,
 ) -> Option<(usize, usize)> {
     let parsed = parsed_ref_file(dir, &r.path, caches)?;
+    if parsed.lang_id == crate::language::LangId::Python && python_call_checked {
+        return python_callee_call_line_range(&parsed.tree, &parsed.source, bare, r.line, r.column);
+    }
     if !matches!(
         parsed.lang_id,
         crate::language::LangId::Javascript
@@ -1083,6 +1088,37 @@ fn enclosing_call_line_range(
         return None;
     }
     callee_call_line_range(&parsed.tree, &parsed.source, bare, r.line, r.column)
+}
+
+/// Python の直接 callee と属性の末尾名だけを扱い、受け手や引数から外側の call へ登らない。
+fn python_callee_call_line_range(
+    tree: &tree_sitter::Tree,
+    source: &[u8],
+    bare: &str,
+    line: usize,
+    column: usize,
+) -> Option<(usize, usize)> {
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let point = tree_sitter::Point { row: line, column };
+    let node = root
+        .descendant_for_point_range(point, point)
+        .filter(|n| n.kind() == "identifier" && n.utf8_text(source).ok() == Some(bare))?;
+    let function = match node.parent()? {
+        parent if parent.kind() == "call" => node,
+        parent
+            if parent.kind() == "attribute"
+                && parent.child_by_field_name("attribute").map(|n| n.id()) == Some(node.id()) =>
+        {
+            parent
+        }
+        _ => return None,
+    };
+    let call = function.parent().filter(|n| n.kind() == "call")?;
+    (call.child_by_field_name("function").map(|n| n.id()) == Some(function.id()))
+        .then(|| (call.start_position().row, call.end_position().row))
 }
 
 /// `(line, column)` の identifier が call の callee を成すなら、その call_expression /
@@ -1983,6 +2019,41 @@ mod tests {
         assert!(!contains_js_word("const $format = 1;", "format"));
         assert!(!contains_js_word("const bb = 1; ab;", "b"));
         assert!(!contains_js_word("anything", ""));
+    }
+
+    #[test]
+    fn python_call_range_only_covers_the_selected_callee() {
+        for (marked, expected) in [
+            ("@render(\n    value,\n)", Some((0, 2))),
+            ("pkg.api.@render(\n    value,\n)", Some((0, 2))),
+            ("Service().@render(\n    value,\n)", Some((0, 2))),
+            ("await @render(\n    value,\n)", Some((0, 2))),
+            ("@render(\n    value,\n)(\n    other,\n)", Some((0, 2))),
+            (
+                "print(\n    @render(\n        value,\n    ),\n    other,\n)",
+                Some((1, 3)),
+            ),
+            ("@render.invoke(\n    value,\n)", None),
+            ("pkg.@render.invoke(\n    value,\n)", None),
+            ("consume(\n    @render,\n    value,\n)", None),
+            ("consume(\n    pkg.@render,\n    value,\n)", None),
+            ("consume(\n    key=@render,\n)", None),
+            ("(@render)(\n    value,\n)", None),
+            ("@render[0](\n    value,\n)", None),
+            ("@render(\n    value,\n)\ndef broken(", None),
+        ] {
+            let offset = marked.find('@').unwrap();
+            let source = marked.replacen('@', "", 1);
+            let before = &source[..offset];
+            let line = before.bytes().filter(|b| *b == b'\n').count();
+            let column = before.rsplit('\n').next().unwrap().len();
+            let tree = parser::parse_source(source.as_bytes(), LangId::Python).unwrap();
+            assert_eq!(
+                python_callee_call_line_range(&tree, source.as_bytes(), "render", line, column),
+                expected,
+                "{marked}",
+            );
+        }
     }
 
     fn call_range_at(src: &str, bare: &str, line: usize, column: usize) -> Option<(usize, usize)> {
