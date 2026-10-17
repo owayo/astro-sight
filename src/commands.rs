@@ -662,6 +662,17 @@ pub fn cmd_impact(service: &AppService, opts: &CmdImpactOpts<'_>) -> Result<()> 
         &diff_input,
         &diff_files,
     );
+    // 未解決 caller がある場合だけ API 互換証拠を確認する。関数ヘッダ差分は要求しない。
+    let compatible_symbols = if result.changes.iter().any(|change| {
+        change
+            .impacted_callers
+            .iter()
+            .any(|caller| !resolution.is_resolved(dir, &caller.path, caller.line))
+    }) {
+        compatible_impact_symbols(dir, base, git, staged, &diff_files)
+    } else {
+        std::collections::BTreeMap::new()
+    };
 
     // 未解決の影響をグループ化: diff に含まれないファイルの caller
     // caller ごとに影響シンボルを追跡
@@ -680,16 +691,33 @@ pub fn cmd_impact(service: &AppService, opts: &CmdImpactOpts<'_>) -> Result<()> 
 
         for caller in &change.impacted_callers {
             // caller が diff 内で未解決か (変更ファイル内 / 更新済みの呼び出し行でないか) を判定
-            if !resolution.is_resolved(dir, &caller.path, caller.line) {
-                unresolved
-                    .entry(change.path.clone())
-                    .or_default()
-                    .push(UnresolvedCaller {
-                        path: caller.path.clone(),
-                        line: caller.line,
-                        symbols: caller.symbols.clone(),
-                    });
+            if resolution.is_resolved(dir, &caller.path, caller.line) {
+                continue;
             }
+
+            // 1 つの caller が複数の変更シンボルを参照することがある。互換と証明できた
+            // シンボルだけを除き、残るシンボル (または空の証拠) は blocking のままにする。
+            let unresolved_symbols: Vec<String> = caller
+                .symbols
+                .iter()
+                .filter(|symbol| {
+                    !compatible_symbols
+                        .get(&change.path)
+                        .is_some_and(|names| names.contains(*symbol))
+                })
+                .cloned()
+                .collect();
+            if !caller.symbols.is_empty() && unresolved_symbols.is_empty() {
+                continue;
+            }
+            unresolved
+                .entry(change.path.clone())
+                .or_default()
+                .push(UnresolvedCaller {
+                    path: caller.path.clone(),
+                    line: caller.line,
+                    symbols: unresolved_symbols,
+                });
         }
     }
 
@@ -733,6 +761,57 @@ pub fn cmd_impact(service: &AppService, opts: &CmdImpactOpts<'_>) -> Result<()> 
     }
 
     std::process::exit(1);
+}
+
+/// review が互換と分類したシンボルを impact の非 blocking 集合へ変換する。
+fn compatible_impact_symbols(
+    dir: &str,
+    base: &str,
+    git: bool,
+    staged: bool,
+    diff_files: &[crate::models::impact::DiffFile],
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+    let empty = std::collections::BTreeMap::new();
+    if !git {
+        return empty;
+    }
+    // detect_api_changes は新側ソースを作業ツリーから読む。index 差分の結果を別内容で
+    // 判定しないよう、staged mode では index と作業ツリーの一致を先に確認する。
+    if staged && !worktree_matches_index(dir) {
+        return empty;
+    }
+
+    api_changes::compatible_impact_names(dir, base, diff_files)
+}
+
+/// 作業ツリーが index と異なる場合、staged impact に worktree ベースの API 判定を混ぜない。
+fn worktree_matches_index(dir: &str) -> bool {
+    if crate::git_support::index_snapshot_tree(dir).is_some() {
+        return false;
+    }
+    let mut diff = crate::git_support::git_command_for_dir(dir);
+    let Ok(status) = diff
+        .args(["diff", "--quiet", "--"])
+        .current_dir(dir)
+        .stderr(std::process::Stdio::null())
+        .status()
+    else {
+        return false;
+    };
+    if !status.success() {
+        return false;
+    }
+
+    let mut untracked = crate::git_support::git_command_for_dir(dir);
+    let Ok(output) = untracked
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .current_dir(dir)
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    output.status.success() && output.stdout.is_empty()
 }
 
 pub fn cmd_doctor(output: OutputOptions) -> Result<()> {

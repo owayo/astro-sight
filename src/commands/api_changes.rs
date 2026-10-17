@@ -598,6 +598,7 @@ pub(crate) fn reconcile_with_moves(
 pub(crate) mod diff_processing;
 pub(crate) mod exported;
 mod forwarded_values;
+mod impact_compatibility;
 mod js_const;
 mod js_member_origin;
 mod js_public_name;
@@ -639,6 +640,7 @@ mod ts_signature;
 
 pub(crate) use diff_processing::*;
 pub(crate) use exported::*;
+pub(crate) use impact_compatibility::compatible_impact_names;
 use js_const::detect_callback_body_only_change;
 pub(crate) use prepare::*;
 pub(crate) use python_contract::*;

@@ -28,12 +28,12 @@ use crate::models::truncation::TruncationInfo;
 pub(crate) use definition::rust::{
     is_rust_shadowable_value_identifier, is_rust_struct_field_non_callable,
 };
-pub(crate) use files::detect_source_lang;
 pub use files::{
     FileCollection, FileScanOptions, UnsupportedScope, collect_files, collect_files_scan,
     collect_files_scan_with_excludes, collect_files_with_excludes, merge_extra_files,
     skipped_files_from_relative,
 };
+pub(crate) use files::{detect_source_lang, is_unanalyzable_source_ext};
 pub(crate) use line_index::{LineIndex, absolute_position, byte_offset_to_row_col};
 pub(crate) use role::RefUsageRole;
 pub(crate) use walker::{RefVisitEvent, RefVisitor};

@@ -6071,14 +6071,360 @@ fn impact_rust_new_marker_impl_keeps_its_owner() {
 
 /// `impact --git` を実行し、(exit code, stderr) を返す。
 fn run_impact_git(repo: &TestRepo) -> (Option<i32>, String) {
+    run_impact_git_with_args(repo, &[])
+}
+
+fn run_impact_git_with_args(repo: &TestRepo, extra_args: &[&str]) -> (Option<i32>, String) {
     let output = cargo_bin()
         .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+        .args(extra_args)
         .output()
         .expect("failed to run astro-sight");
     (
         output.status.code(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
+}
+
+/// review と同じ互換分類を impact に適用する。追加した末尾 default 引数を省略する
+/// 既存 call はそのまま有効なので、作業ツリー / index のどちらでも blocking にしない。
+#[test]
+fn impact_allows_unchanged_calls_after_compatible_defaulted_parameter() {
+    for staged in [false, true] {
+        let repo = TestRepo::new();
+        repo.write(
+            "library.ts",
+            "export function formatLabel(value: string) { return value.trim(); }\n",
+        );
+        repo.write(
+            "consumer.ts",
+            "import { formatLabel } from './library';\nconsole.log(formatLabel(' Ready '));\n",
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "library.ts",
+            "export function formatLabel(value: string, options: { verbose?: boolean } = {}) {\n  return value.trim();\n}\n",
+        );
+        if staged {
+            repo.stage_all();
+        }
+
+        let review = if staged {
+            repo.run_json("review", &["--git", "--staged"])
+        } else {
+            repo.run_json("review", &["--git"])
+        };
+        assert!(
+            review["api_changes"]["compatible_modified"]
+                .as_array()
+                .is_some_and(|changes| {
+                    changes.iter().any(|change| {
+                        change["file"] == "library.ts"
+                            && change["name"] == "formatLabel"
+                            && change["reason"] == "trailing_optional_params"
+                    })
+                }),
+            "staged={staged}: {review}"
+        );
+
+        let extra_args = if staged { &["--staged"][..] } else { &[] };
+        let (code, stderr) = run_impact_git_with_args(&repo, extra_args);
+        assert_eq!(code, Some(0), "staged={staged}: {stderr}");
+        assert!(stderr.is_empty(), "staged={staged}: {stderr}");
+    }
+}
+
+/// 互換と判定されたシンボルだけを抑制し、同じ変更ファイルの必須引数追加は blocking に残す。
+#[test]
+fn impact_keeps_incompatible_symbols_blocking_beside_compatible_changes() {
+    let repo = TestRepo::new();
+    repo.write(
+        "library.ts",
+        "export function formatLabel(value: string) { return value.trim(); }\nexport function requireOption(value: string) { return value; }\n",
+    );
+    repo.write(
+        "consumer.ts",
+        "import { formatLabel, requireOption } from './library';\nconsole.log(formatLabel(' Ready '));\nconsole.log(requireOption(' Ready '));\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "library.ts",
+        "export function formatLabel(value: string, options: { verbose?: boolean } = {}) { return value.trim(); }\nexport function requireOption(value: string, required: boolean) { return value; }\n",
+    );
+
+    let (code, stderr) = run_impact_git(&repo);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("consumer.ts:3 [requireOption]"), "{stderr}");
+    assert!(!stderr.contains("consumer.ts:2 [formatLabel]"), "{stderr}");
+}
+
+/// 自由関数の互換証拠で、同名メソッドの必須引数追加を隠さない。
+#[test]
+fn impact_keeps_same_named_incompatible_declarations_blocking() {
+    for (extension, old, new, consumer) in [
+        (
+            "ts",
+            "export function render(value: string) { return value; }\nexport class Label {\n  render(value: string) { return value; }\n}\n",
+            "export function render(value: string, options = {}) { return value; }\nexport class Label {\n  render(value: string, required: boolean) { return value; }\n}\n",
+            "import {Label, render} from './library';\nconsole.log(render('x'));\nconst label = new Label();\nconsole.log(label.render('x'));\n",
+        ),
+        (
+            "ts",
+            "export function render(value: string) { return value; }\nclass Hidden {\n  render(value: string) { return value; }\n}\nexport function makeLabel() { return new Hidden(); }\n",
+            "export function render(value: string, options = {}) { return value; }\nclass Hidden {\n  render(value: string, required: boolean) { return value; }\n}\nexport function makeLabel() { return new Hidden(); }\n",
+            "import {makeLabel, render} from './library';\nconsole.log(render('x'));\nconst label = makeLabel();\nconsole.log(label.render('x'));\n",
+        ),
+        (
+            "py",
+            "def render(value):\n    return value\n\nclass Label:\n    def render(self, value):\n        return value\n",
+            "def render(value, options=None):\n    return value\n\nclass Label:\n    def render(self, value, required):\n        return value\n",
+            "from library import Label, render\nprint(render('x'))\nlabel = Label()\nprint(label.render('x'))\n",
+        ),
+        (
+            "py",
+            "def render(value):\n    return value\n\nclass Label:\n    def render(self, value):\n        return value\n",
+            "def render(value, options=None):\n    return value\n\nclass Label:\n    pass\n",
+            "from library import Label, render\nprint(render('x'))\nlabel = Label()\nprint(label.render('x'))\n",
+        ),
+        (
+            "py",
+            "def render(value):\n    return value\n\nclass Label:\n    def render(self, value):\n        return value\n",
+            "def render(value, options=None):\n    return value\n\nclass Label:\n    def render(self, value):\n        return value\n",
+            "from library import Label, render\nprint(render('x'))\nlabel = Label()\nprint(label.render('x'))\n",
+        ),
+    ] {
+        for staged in [false, true] {
+            let repo = TestRepo::new();
+            repo.write(format!("library.{extension}"), old);
+            repo.write(format!("consumer.{extension}"), consumer);
+            repo.init_git();
+            repo.commit_all("initial");
+            repo.write(format!("library.{extension}"), new);
+            if staged {
+                repo.stage_all();
+            }
+            let args = if staged { &["--staged"][..] } else { &[] };
+            let (code, stderr) = run_impact_git_with_args(&repo, args);
+            assert_eq!(code, Some(1), "{extension}, staged={staged}: {stderr}");
+            assert!(
+                stderr.contains(&format!("consumer.{extension}:4 [render]")),
+                "{extension}, staged={staged}: {stderr}"
+            );
+        }
+    }
+}
+
+/// 1 行の caller が互換・非互換の両方を参照しても、非互換な名前を残す。
+#[test]
+fn impact_keeps_mixed_symbols_on_one_caller_line() {
+    let repo = TestRepo::new();
+    repo.write("library.ts", "export function format(value: string) { return value; }\nexport function render(value: string) { return value; }\n");
+    repo.write(
+        "consumer.ts",
+        "import {format, render} from './library';\nconsole.log(format('x'), render('x'));\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("library.ts", "export function format(value: string, options = {}) { return value; }\nexport function render(value: string, required: boolean) { return value; }\n");
+    let (code, stderr) = run_impact_git(&repo);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("consumer.ts:2 [render]"), "{stderr}");
+    assert!(!stderr.contains("format"), "{stderr}");
+}
+
+/// 別ファイルの同名宣言を削除しても、互換な宣言の caller に混ざった参照を隠さない。
+#[test]
+fn impact_keeps_other_files_removed_declarations_blocking() {
+    for (removed, call) in [
+        (
+            "export function render(value: string) { return value; }\n",
+            "broken.render('x')",
+        ),
+        (
+            "function render(value: string) { return value; }\nexport const label = {render};\n",
+            "broken.label.render('x')",
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.write(
+            "safe.ts",
+            "export function render(value: string) { return value; }\n",
+        );
+        repo.write("broken.ts", removed);
+        repo.write(
+            "consumer.ts",
+            format!("import * as safe from './safe';\nimport * as broken from './broken';\nconsole.log(safe.render('x'));\nconsole.log({call});\n"),
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "safe.ts",
+            "export function render(value: string, options = {}) { return value; }\n",
+        );
+        repo.write("broken.ts", "export {};\n");
+        let (code, stderr) = run_impact_git(&repo);
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(stderr.contains("consumer.ts:4 [render]"), "{stderr}");
+    }
+}
+
+/// 変更したソースを解析できなければ証明を保留し、通常の文書変更は許す。
+#[test]
+fn impact_keeps_compatibility_unverified_for_unparsed_changes() {
+    for (path, source, expected) in [
+        ("other.ts", "export function broken( {\n", 1),
+        ("other.vue", "<script>const label = 'x';</script>\n", 1),
+        ("README.md", "Updated documentation.\n", 0),
+    ] {
+        let repo = TestRepo::new();
+        repo.write(
+            "library.ts",
+            "export function render(value: string) { return value; }\n",
+        );
+        repo.write(
+            "consumer.ts",
+            "import {render} from './library';\nconsole.log(render('x'));\n",
+        );
+        repo.write(path, "/* Initial content. */\n");
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "library.ts",
+            "export function render(value: string, options = {}) { return value; }\n",
+        );
+        repo.write(path, source);
+        let (code, stderr) = run_impact_git(&repo);
+        assert_eq!(code, Some(expected), "{path}: {stderr}");
+        if expected == 1 {
+            assert!(
+                stderr.contains("consumer.ts:2 [render]"),
+                "{path}: {stderr}"
+            );
+        }
+    }
+}
+
+/// API の所有型付き名と caller の素のメソッド名を安全に対応付ける。
+#[test]
+fn impact_allows_compatible_python_method_calls() {
+    for staged in [false, true] {
+        let repo = TestRepo::new();
+        repo.write(
+            "library.py",
+            "class Label:\n    def render(self, value):\n        return value\n",
+        );
+        repo.write(
+            "consumer.py",
+            "from library import Label\nlabel = Label()\nprint(label.render('x'))\n",
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "library.py",
+            "class Label:\n    def render(self, value, options=None):\n        return value\n",
+        );
+        if staged {
+            repo.stage_all();
+        }
+        let args = if staged { &["--staged"][..] } else { &[] };
+        let review = repo.run_json("review", &[&["--git"][..], args].concat());
+        assert!(
+            review["api_changes"]["compatible_modified"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|change| change["name"] == "Label.render"),
+            "{review}"
+        );
+        let (code, stderr) = run_impact_git_with_args(&repo, args);
+        assert_eq!(code, Some(0), "staged={staged}: {stderr}");
+        assert!(stderr.is_empty(), "staged={staged}: {stderr}");
+    }
+}
+
+/// 同名宣言が複数あっても、すべての所有元の互換性を証明できれば除外する。
+#[test]
+fn impact_allows_same_named_declarations_when_all_are_compatible() {
+    let repo = TestRepo::new();
+    repo.write(
+        "library.py",
+        "def render(value):\n    return value\n\nclass Label:\n    def render(self, value):\n        return value\n",
+    );
+    repo.write(
+        "consumer.py",
+        "from library import Label, render\nprint(render('x'))\nlabel = Label()\nprint(label.render('x'))\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "library.py",
+        "def render(value, options=None):\n    return value\n\nclass Label:\n    def render(self, value, options=None):\n        return value\n",
+    );
+    let (code, stderr) = run_impact_git(&repo);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+/// 関数シグネチャ差分がなくても、型への optional メンバー追加は互換判定する。
+#[test]
+fn impact_allows_compatible_type_members_without_signature_changes() {
+    for staged in [false, true] {
+        let repo = TestRepo::new();
+        repo.write("library.ts", "export interface Config { name: string; }\n");
+        repo.write(
+            "consumer.ts",
+            "import {Config} from './library';\nexport const config: Config = {name: 'x'};\n",
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "library.ts",
+            "export interface Config { name: string; extra?: boolean; }\n",
+        );
+        if staged {
+            repo.stage_all();
+        }
+        let args = if staged { &["--staged"][..] } else { &[] };
+        let review = repo.run_json("review", &[&["--git"][..], args].concat());
+        let change = &review["impact"]["changes"][0];
+        assert!(change.get("signature_changes").is_none(), "{review}");
+        assert_eq!(
+            review["api_changes"]["compatible_modified"][0]["reason"], "optional_type_members",
+            "{review}"
+        );
+        let (code, stderr) = run_impact_git_with_args(&repo, args);
+        assert_eq!(code, Some(0), "staged={staged}: {stderr}");
+        assert!(stderr.is_empty(), "staged={staged}: {stderr}");
+    }
+}
+
+/// index と作業ツリーのどちらが互換でも、両者が異なれば互換証拠を使わない。
+#[test]
+fn impact_keeps_staged_compatibility_unverified_when_worktree_differs() {
+    let compatible = "export function render(value: string, options = {}) { return value; }\n";
+    let incompatible =
+        "export function render(value: string, required: boolean) { return value; }\n";
+    for (index, worktree) in [(compatible, incompatible), (incompatible, compatible)] {
+        let repo = TestRepo::new();
+        repo.write(
+            "library.ts",
+            "export function render(value: string) { return value; }\n",
+        );
+        repo.write(
+            "consumer.ts",
+            "import {render} from './library';\nconsole.log(render('x'));\n",
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write("library.ts", index);
+        repo.stage_all();
+        repo.write("library.ts", worktree);
+        let (code, stderr) = run_impact_git_with_args(&repo, &["--staged"]);
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(stderr.contains("consumer.ts:2 [render]"), "{stderr}");
+    }
 }
 
 /// 言語ごとに、変更する公開関数を呼ぶファイルを置く。

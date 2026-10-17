@@ -781,6 +781,25 @@ pub(crate) fn filter_exported_symbols(
     result
 }
 
+/// 非公開・ローカル宣言も含め、API と同じ qualname・kind・signature を作る。
+pub(crate) fn unfiltered_declaration_signatures(
+    syms: &[Symbol],
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    lang_id: crate::language::LangId,
+) -> ExportedSymbols {
+    let context = ExportSurfaceContext::new(syms, root, source, lang_id, false, false, None);
+    syms.iter()
+        .map(|sym| {
+            (
+                context.qualname(sym),
+                format!("{:?}", sym.kind).to_lowercase(),
+                extract_api_signature(sym, root, source, &context.lines, lang_id),
+            )
+        })
+        .collect()
+}
+
 /// `qualname` (例: `Class.method` や bare name `foo`) が `callees` に含まれるかを判定する。
 /// Python/Ruby など「obj.method()」形式で呼び出される言語では callee 側は bare name のみ
 /// なので、qualname の末尾 (`.` 区切りの最後) でも判定する。

@@ -39,7 +39,7 @@ const UNANALYZABLE_SOURCE_EXTENSIONS: &[&str] = &[
 ];
 
 /// 拡張子が「解析できないソース」に該当するか (ASCII 小文字化して比較)。
-fn is_unanalyzable_source_ext(ext: &str) -> bool {
+pub(crate) fn is_unanalyzable_source_ext(ext: &str) -> bool {
     let lower = ext.to_ascii_lowercase();
     UNANALYZABLE_SOURCE_EXTENSIONS.contains(&lower.as_str())
 }

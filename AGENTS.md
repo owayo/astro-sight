@@ -207,6 +207,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Key Modules
 
+- **impact の API 互換証拠** — `commands/api_changes/impact_compatibility.rs` は `review` の互換分類を、所有元を持たない impact の参照名へ対応付ける。旧新ソースの同名宣言がすべて一意に互換な公開 API へ対応する場合だけ除外する。非公開・ローカル・削除済み・非互換の同名宣言が候補に混じる場合や、差分内の別ファイルに同名宣言の未証明な変更がある場合、ソースの解析に失敗した場合は blocking を維持する。関数のシグネチャ差分がなくても型の互換変更を扱う。`--staged` は作業ツリーと index が一致すると確認できた場合だけ証拠を使い、`refs` と `context` の出現一覧は変えない。
+
 - `src/service.rs` - **AppService**: 全コア操作の統一エントリポイント（extract_ast/symbols/calls/imports/lint/sequence/cochange, find_references/find_references_batch, analyze_context + パス検証 + cochange オプション検証 + tracing ログ）
 - `src/output/mod.rs` - **OutputOptions**: `--format` / `--pretty` / `config.toml` の解決結果と `serialize_document` / `serialize_toon_list_item`。プロトコル面 (session / hook / エラー) の JSON 固定判定 (`ensure_json_protocol`) もここ。トークン量の指標を 2 つ持ち **用途で使い分ける**: `estimated_size` (= `size_metric` = 文字数 + 4 × 改行数) は形式間の**相対比較**用で単位はトークンではない、`estimated_tokens` (= `size_metric / 3` の切り上げ) は `--token-budget` のような**絶対的な予算**と突き合わせる用。混同すると「3,000 トークンと指定したのに 900 しか出ない」形でずれる (実際に一度そうなった)
 - `src/output/limit.rs` - 出力レコード数の上限適用 (`apply_limits` / `apply_grouped_limits` / `apply_refs_limits` / `apply_refs_batch_limits`、compact JSON 固定の session 向けに `*_json` 版)。判定は **実際に描画したテキスト**の `estimated_tokens` に対して行い、描画は呼び出し側 (CLI / MCP / session) が出力面と同じものをクロージャで渡すため `--format` / `--pretty` の選択がそのまま予算に反映される。バッチでは rollup の採寸だけ「呼び出し全体の予算 ÷ グループ数」に分け (`per_group_rollup_budget`)、出力に載せる `limits` は利用者が指定した値のまま保つ。最小まで絞っても収まらなければ `ResultSummary::budget_exceeded` で申告する
