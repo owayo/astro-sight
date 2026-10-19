@@ -957,6 +957,11 @@ fn compatible_modification(
     caches: &mut ApiClosureCaches,
     public_name_differs: bool,
 ) -> Option<CompatibleApiModification> {
+    if let Some(compat) =
+        detect_fixed_callback_contract_compatible_mod(ref_index, site, sources, caches)
+    {
+        return Some(compat);
+    }
     // React component を memo / forwardRef 等の HOC でラップしただけは compatible_modified
     if !public_name_differs
         && let Some(compat) = detect_react_wrapper_compatible_mod(ref_index, site, sources, caches)
