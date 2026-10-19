@@ -12,6 +12,7 @@ use super::source_pair::{CompatibleModSite, SignatureSourceCache};
 use super::{ApiClosureCaches, ApiRefIndex, has_blocking_value_usage};
 
 mod callable;
+mod callback_contract;
 mod function_params;
 mod literal_union;
 mod object_members;
@@ -24,6 +25,9 @@ use super::signature_tokens::{SigTokens, node_signature_tokens, signature_tokens
 pub(super) use callable::ts_const_value_header_guard;
 use callable::with_resolved_ts_callable_pair;
 
+pub(crate) use callback_contract::{
+    FixedCallbackCache, detect_fixed_callback_contract_compatible_mod,
+};
 pub(crate) use function_params::*;
 pub(crate) use literal_union::*;
 pub(crate) use object_members::*;

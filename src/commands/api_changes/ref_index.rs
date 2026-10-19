@@ -1364,6 +1364,7 @@ fn closed_via_local_const_argument(
 /// unique file 単位の F 回に圧縮する。
 #[derive(Default)]
 pub(crate) struct ApiClosureCaches {
+    pub(crate) fixed_callback: super::ts_signature::FixedCallbackCache,
     pub(crate) optional_removal: super::ts_signature::OptionalRemovalCache,
     /// `import_statement_lines_for_ref` の (ref path → import 行集合) キャッシュ。
     pub(crate) import_lines: std::collections::HashMap<String, std::collections::HashSet<usize>>,
