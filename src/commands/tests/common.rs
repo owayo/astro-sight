@@ -65,7 +65,7 @@ pub(crate) fn git_commit_files(repo: &std::path::Path, files: &[(&str, &str)], m
 pub(crate) fn resolve_git_diff_parts(
     repo: &std::path::Path,
 ) -> (String, Vec<crate::models::truncation::TruncationInfo>) {
-    match resolve_git_diff(repo.to_str().expect("utf-8"), "HEAD", false).expect("resolve") {
+    match resolve_git_diff(repo.to_str().expect("utf-8"), None, false).expect("resolve") {
         GitDiffInput::Diff {
             diff, truncations, ..
         } => (diff, truncations),

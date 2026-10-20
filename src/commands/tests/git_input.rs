@@ -101,7 +101,7 @@ fn is_git_work_tree_false_outside_repo() {
 #[test]
 fn resolve_git_diff_skips_non_git_dir() {
     let dir = tempfile::tempdir().expect("tempdir");
-    match resolve_git_diff(dir.path().to_str().expect("utf-8"), "HEAD", false).expect("resolve") {
+    match resolve_git_diff(dir.path().to_str().expect("utf-8"), None, false).expect("resolve") {
         GitDiffInput::Skipped(skip) => {
             assert_eq!(skip.reason.as_str(), "not_git_repository");
             assert_eq!(skip.source.as_str(), "git");
@@ -115,7 +115,7 @@ fn resolve_git_diff_rejects_invalid_base_even_when_non_git() {
     // base 不正は git 管理外でも入力契約違反として弾く (skip より優先)。
     let dir = tempfile::tempdir().expect("tempdir");
     assert!(
-        resolve_git_diff(dir.path().to_str().expect("utf-8"), "-x", false).is_err(),
+        resolve_git_diff(dir.path().to_str().expect("utf-8"), Some("-x"), false).is_err(),
         "先頭 '-' の base は非 git でも Err"
     );
 }
@@ -142,7 +142,8 @@ fn resolve_git_diff_pins_commit_for_worktree_and_index() {
         if staged {
             git_in(repo, &["add", "src/lib.rs"]);
         }
-        match resolve_git_diff(repo.to_str().expect("utf-8"), revision, staged).expect("diff") {
+        match resolve_git_diff(repo.to_str().expect("utf-8"), Some(revision), staged).expect("diff")
+        {
             GitDiffInput::Diff {
                 diff, base_commit, ..
             } => {
@@ -162,10 +163,224 @@ fn resolve_git_diff_rejects_unresolvable_commit() {
     git_commit_files(repo, &[("src/lib.rs", "pub fn before() {}\n")], "initial");
     for revision in ["missing-ref", "HEAD..HEAD"] {
         assert!(
-            resolve_git_diff(repo.to_str().expect("utf-8"), revision, false).is_err(),
+            resolve_git_diff(repo.to_str().expect("utf-8"), Some(revision), false).is_err(),
             "{revision} should be rejected before analysis"
         );
     }
+}
+
+/// `git show-ref --exists` (git 2.43 以降) を使えるか。使えない git では HEAD が unborn だと
+/// 判定できず、`--base` を省略しても従来どおりエラーになる。
+fn git_supports_show_ref_exists() -> bool {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_in(dir.path(), &["init", "-q"]);
+    Command::new("git")
+        .args(["show-ref", "--exists", "refs/heads/astro-sight-probe"])
+        .current_dir(dir.path())
+        .output()
+        .is_ok_and(|out| out.status.code() == Some(2))
+}
+
+/// ref の保存形式を指定して、コミットの無いリポジトリを作る。`--ref-format` を持たない git
+/// (2.45 より前) は files しか作れないので、files なら通常の init にし、ほかの形式は作らずに
+/// false を返す。作れた場合は、実際の保存形式も確かめる (設定を無視されると気付けないため)。
+fn init_repo_with_ref_format(repo: &std::path::Path, ref_format: &str) -> bool {
+    let flag = format!("--ref-format={ref_format}");
+    let created = Command::new("git")
+        .args(["init", "-q", "-b", "main", flag.as_str()])
+        .current_dir(repo)
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if created {
+        let shown = Command::new("git")
+            .args(["rev-parse", "--show-ref-format"])
+            .current_dir(repo)
+            .output()
+            .expect("rev-parse --show-ref-format");
+        assert_eq!(String::from_utf8_lossy(&shown.stdout).trim(), ref_format);
+    } else if ref_format == "files" {
+        git_in(repo, &["init", "-q", "-b", "main"]);
+    } else {
+        return false;
+    }
+    git_in(repo, &["config", "user.name", "astro-sight-tests"]);
+    git_in(repo, &["config", "user.email", "astro-sight@example.com"]);
+    true
+}
+
+/// `--base` を省略した `--git` で HEAD が unborn のときの結果を確かめる。`show-ref --exists` を
+/// 使える git では `unborn_head` の skip、使えない git では従来どおりのエラー。
+fn expect_unborn_outcome(result: anyhow::Result<GitDiffInput>, supported: bool, context: &str) {
+    match result {
+        Ok(GitDiffInput::Skipped(skip)) if supported => {
+            assert_eq!(skip.reason.as_str(), "unborn_head", "{context}");
+            assert_eq!(skip.source.as_str(), "git", "{context}");
+        }
+        Err(error) if !supported => assert!(
+            error
+                .to_string()
+                .contains("--base does not resolve to a commit: HEAD"),
+            "{context}: {error}"
+        ),
+        Ok(GitDiffInput::Skipped(skip)) => panic!("{context}: 古い git では skip しない: {skip:?}"),
+        Ok(GitDiffInput::Diff { diff, .. }) => panic!("{context}: 解析すべきでない: {diff}"),
+        Err(error) => panic!("{context}: unborn_head で skip すべき: {error}"),
+    }
+}
+
+/// `git init` 直後 (コミットが 1 つも無い) のリポジトリでは、`--base` を省略した `--git` は
+/// git 管理外と同じく解析を飛ばす (Issue #86)。明示した `--base HEAD` と存在しない base は、
+/// 従来どおり解決できない base としてエラーにする。
+#[test]
+fn resolve_git_diff_skips_unborn_head_only_when_base_is_omitted() {
+    let supported = git_supports_show_ref_exists();
+    // unborn の判定は ref のファイルを読まず git に問い合わせるので、ref の保存形式に依らない。
+    for ref_format in ["files", "reftable"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        if !init_repo_with_ref_format(repo, ref_format) {
+            continue;
+        }
+        fs::write(repo.join("calc.go"), "package calc\n").expect("write");
+        let path = repo.to_str().expect("utf-8");
+
+        for staged in [false, true] {
+            let context = format!("{ref_format}: untracked, staged={staged}");
+            expect_unborn_outcome(resolve_git_diff(path, None, staged), supported, &context);
+        }
+        git_in(repo, &["add", "-A"]);
+        for staged in [false, true] {
+            let context = format!("{ref_format}: added, staged={staged}");
+            expect_unborn_outcome(resolve_git_diff(path, None, staged), supported, &context);
+        }
+
+        for revision in ["HEAD", "missing-ref"] {
+            let error = match resolve_git_diff(path, Some(revision), false) {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("{ref_format}: 明示した base {revision} はエラーにすべき"),
+            };
+            assert!(
+                error.contains(&format!("--base does not resolve to a commit: {revision}")),
+                "{ref_format}: {error}"
+            );
+        }
+    }
+}
+
+/// Unix の ref 名は UTF-8 とは限らない。UTF-8 でないブランチ名でも unborn と判定する。
+#[cfg(unix)]
+#[test]
+fn resolve_git_diff_skips_unborn_head_with_non_utf8_branch_name() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let supported = git_supports_show_ref_exists();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let branch = std::ffi::OsStr::from_bytes(b"refs/heads/topic-\xff");
+    assert!(
+        Command::new("git")
+            .arg("symbolic-ref")
+            .arg("HEAD")
+            .arg(branch)
+            .current_dir(repo)
+            .status()
+            .expect("git symbolic-ref")
+            .success()
+    );
+    fs::write(repo.join("calc.go"), "package calc\n").expect("write");
+
+    expect_unborn_outcome(
+        resolve_git_diff(repo.to_str().expect("utf-8"), None, false),
+        supported,
+        "non-utf8 branch",
+    );
+}
+
+/// 別のブランチに履歴があっても、HEAD が orphan ブランチ (コミット前) なら skip する。
+/// 有効な base を明示すれば、その base との差分を解析する。
+#[test]
+fn resolve_git_diff_skips_orphan_branch_but_uses_explicit_base() {
+    let supported = git_supports_show_ref_exists();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(repo, &[("calc.go", "package calc\n")], "initial");
+    git_in(repo, &["checkout", "-q", "--orphan", "fresh"]);
+    fs::write(repo.join("sub.go"), "package calc\n\nfunc Sub() {}\n").expect("write");
+    let path = repo.to_str().expect("utf-8");
+
+    expect_unborn_outcome(resolve_git_diff(path, None, false), supported, "orphan");
+    match resolve_git_diff(path, Some("main"), false).expect("diff") {
+        GitDiffInput::Diff { diff, .. } => assert!(diff.contains("+func Sub()"), "{diff}"),
+        GitDiffInput::Skipped(skip) => panic!("明示した base は解析すべき: {skip:?}"),
+    }
+}
+
+/// 壊れた HEAD (存在しないオブジェクトを指す ref・内容の壊れた ref・存在しないオブジェクトを
+/// 指す detached HEAD) は unborn ではない。`--base` を省略していてもエラーのまま。
+#[test]
+fn resolve_git_diff_keeps_error_for_broken_head() {
+    // 壊れた ref をファイルへ直接書くので、ref の保存形式を files に固定する (reftable だと
+    // `.git/refs` / `.git/HEAD` を書き換えても HEAD が変わらない)。
+    let init_committed_files_repo = |repo: &std::path::Path| {
+        assert!(init_repo_with_ref_format(repo, "files"));
+        git_commit_files(repo, &[("calc.go", "package calc\n")], "initial");
+    };
+    let missing = "1111111111111111111111111111111111111111";
+    for (label, corrupt) in [("missing-object", missing), ("garbage-content", "garbage")] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_committed_files_repo(repo);
+        fs::write(repo.join(".git/refs/heads/main"), format!("{corrupt}\n")).expect("write ref");
+        assert!(
+            resolve_git_diff(repo.to_str().expect("utf-8"), None, false).is_err(),
+            "{label}: 壊れた HEAD は skip しない"
+        );
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_committed_files_repo(repo);
+    fs::write(repo.join(".git/HEAD"), format!("{missing}\n")).expect("write HEAD");
+    assert!(
+        resolve_git_diff(repo.to_str().expect("utf-8"), None, false).is_err(),
+        "存在しないオブジェクトを指す detached HEAD は skip しない"
+    );
+}
+
+/// cochange の `--git` も、`--base` を省略して HEAD が unborn なら skip する。明示の起点が
+/// あれば (git 管理外のときと同じく) それだけで続行し、明示した base はエラーのまま。
+/// `show-ref --exists` を使えない git では unborn と判定できず、従来どおりエラーになる。
+#[test]
+fn resolve_blame_source_files_handles_unborn_head() {
+    let supported = git_supports_show_ref_exists();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    fs::write(repo.join("a.py"), "x = 1\n").expect("write");
+    let path = repo.to_str().expect("utf-8");
+
+    let without_paths = resolve_blame_source_files(path, true, None, None, None, &[]);
+    let with_paths = resolve_blame_source_files(path, true, None, Some("a.py"), None, &[]);
+    if supported {
+        match without_paths.expect("resolve") {
+            BlameSourceResolution::Skipped(skip) => {
+                assert_eq!(skip.reason.as_str(), "unborn_head")
+            }
+            BlameSourceResolution::Files(files) => panic!("Skipped を返すべき: {files:?}"),
+        }
+        match with_paths.expect("resolve") {
+            BlameSourceResolution::Files(files) => assert_eq!(files, vec!["a.py".to_string()]),
+            BlameSourceResolution::Skipped(skip) => panic!("明示の起点で続行すべき: {skip:?}"),
+        }
+    } else {
+        assert!(without_paths.is_err() && with_paths.is_err());
+    }
+    assert!(
+        resolve_blame_source_files(path, true, Some("HEAD"), None, None, &[]).is_err(),
+        "明示した base はエラーのまま"
+    );
 }
 
 #[test]
@@ -176,7 +391,7 @@ fn explicit_diff_keeps_base_unpinned() {
         Some("sample diff"),
         None,
         true,
-        "missing-ref",
+        Some("missing-ref"),
         false,
     )
     .expect("explicit diff")

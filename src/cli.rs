@@ -203,9 +203,10 @@ pub enum Commands {
         #[arg(long, conflicts_with_all = ["diff", "diff_file"])]
         git: bool,
 
-        /// Base ref for git diff (default: HEAD)
-        #[arg(long, default_value = "HEAD")]
-        base: String,
+        /// Base ref for git diff (default: HEAD). When omitted and HEAD has no commit yet,
+        /// `--git` skips the analysis
+        #[arg(long)]
+        base: Option<String>,
 
         /// Use staged changes (git diff --cached)
         #[arg(long)]
@@ -234,9 +235,10 @@ pub enum Commands {
         #[arg(long)]
         git: bool,
 
-        /// Base ref for git diff (default: HEAD)
-        #[arg(long, default_value = "HEAD")]
-        base: String,
+        /// Base ref for git diff (default: HEAD). When omitted and HEAD has no commit yet,
+        /// `--git` skips the analysis
+        #[arg(long)]
+        base: Option<String>,
 
         /// Use staged changes (git diff --cached)
         #[arg(long)]
@@ -477,9 +479,10 @@ pub enum Commands {
         #[arg(long, conflicts_with_all = ["diff", "diff_file"])]
         git: bool,
 
-        /// Base ref for git diff (default: HEAD)
-        #[arg(long, default_value = "HEAD")]
-        base: String,
+        /// Base ref for git diff (default: HEAD). When omitted and HEAD has no commit yet,
+        /// `--git` skips the analysis
+        #[arg(long)]
+        base: Option<String>,
 
         /// Use staged changes (git diff --cached)
         #[arg(long)]
@@ -572,9 +575,10 @@ pub enum Commands {
         #[arg(long, conflicts_with_all = ["diff", "diff_file"])]
         git: bool,
 
-        /// Base ref for git diff (default: HEAD)
-        #[arg(long, default_value = "HEAD")]
-        base: String,
+        /// Base ref for git diff (default: HEAD). When omitted and HEAD has no commit yet,
+        /// `--git` skips the analysis
+        #[arg(long)]
+        base: Option<String>,
 
         /// Use staged changes (git diff --cached)
         #[arg(long)]

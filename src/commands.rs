@@ -472,7 +472,8 @@ pub struct CmdContextOpts<'a> {
     pub diff: Option<&'a str>,
     pub diff_file: Option<&'a str>,
     pub git: bool,
-    pub base: &'a str,
+    /// `--base` の指定。省略なら `None` (既定の HEAD を使い、HEAD が unborn なら skip)。
+    pub base: Option<&'a str>,
     pub staged: bool,
     pub output: OutputOptions,
     pub exclude_dirs: &'a [String],
@@ -589,7 +590,8 @@ pub fn cmd_context(service: &AppService, opts: &CmdContextOpts<'_>) -> Result<()
 pub struct CmdImpactOpts<'a> {
     pub dir: &'a str,
     pub git: bool,
-    pub base: &'a str,
+    /// `--base` の指定。省略なら `None` (既定の HEAD を使い、HEAD が unborn なら skip)。
+    pub base: Option<&'a str>,
     pub staged: bool,
     pub hook: bool,
     pub output: OutputOptions,
@@ -669,7 +671,13 @@ pub fn cmd_impact(service: &AppService, opts: &CmdImpactOpts<'_>) -> Result<()> 
             .iter()
             .any(|caller| !resolution.is_resolved(dir, &caller.path, caller.line))
     }) {
-        compatible_impact_symbols(dir, base, git, staged, &diff_files)
+        compatible_impact_symbols(
+            dir,
+            base.unwrap_or(crate::git_support::DEFAULT_GIT_BASE),
+            git,
+            staged,
+            &diff_files,
+        )
     } else {
         std::collections::BTreeMap::new()
     };

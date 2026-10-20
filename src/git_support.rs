@@ -48,9 +48,16 @@ pub(crate) fn git_command_for_dir(dir: impl AsRef<std::path::Path>) -> std::proc
     }
 }
 
-/// cochange の既定 base。context / impact / review / dead-code と揃えて
-/// 「未コミットの作業ツリー変更」を既定の解析対象にする。
-pub const DEFAULT_BLAME_BASE: &str = "HEAD";
+/// `--base` を省略したときの既定 base。context / impact / review / dead-code / cochange で
+/// 共通に「未コミットの作業ツリー変更」を既定の解析対象にする。
+///
+/// CLI は省略と明示 (`--base HEAD`) を区別して持ち、この値を補うのは使う直前にする。
+/// HEAD がまだコミットを指していない (unborn) とき、省略なら解析を飛ばし、明示ならエラーに
+/// するため。
+pub const DEFAULT_GIT_BASE: &str = "HEAD";
+
+/// cochange の既定 base (`DEFAULT_GIT_BASE` と同じ)。
+pub const DEFAULT_BLAME_BASE: &str = DEFAULT_GIT_BASE;
 
 /// 出力を解析する `git diff` 呼び出しに必ず付ける引数。
 ///

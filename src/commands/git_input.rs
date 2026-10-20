@@ -89,6 +89,15 @@ pub fn resolve_blame_source_files(
                 ))
             })?;
         if !output.status.success() {
+            // `--base` を省略し、HEAD がまだコミットを指していない (unborn) なら比較の基点が
+            // 無い。git 管理外と同じく、明示の起点があればそれだけで続行し、無ければ skip する
+            // (明示の起点を skip で捨てると、その検証まで飛ばしてしまう)。
+            if base.is_none() && head_is_unborn(dir) {
+                if set.is_empty() {
+                    return Ok(BlameSourceResolution::Skipped(SkipInfo::unborn_head()));
+                }
+                return Ok(BlameSourceResolution::Files(set.into_iter().collect()));
+            }
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!(crate::error::AstroError::new(
                 crate::error::ErrorCode::IoError,
@@ -463,14 +472,37 @@ pub(crate) fn is_git_work_tree(dir: &str) -> Result<bool> {
 /// git worktree 内なら diff を取得し `Diff`、管理外なら `Skipped` を返す。
 /// `base` 検証を worktree 判定より前に置くのは意図的: base が不正なら git 管理外
 /// でも `exit 1` にする (入力契約違反を skip より優先)。
-pub(crate) fn resolve_git_diff(dir: &str, base: &str, staged: bool) -> Result<GitDiffInput> {
-    validate_git_revision(base, "--base")?;
+///
+/// `base` は `--base` の指定そのもので、省略なら `None` (既定の HEAD を使う)。省略していて
+/// HEAD がまだコミットを指していない (unborn) ときだけ、比較の基点が無いので git 管理外と
+/// 同じく `Skipped` にする。base を明示した場合 (`--base HEAD` を含む) は skip せず、コミットに
+/// 解決できなければ従来どおりエラー。壊れた HEAD もエラー。成功経路では unborn の判定に git を
+/// 起動しない。
+pub(crate) fn resolve_git_diff(
+    dir: &str,
+    base: Option<&str>,
+    staged: bool,
+) -> Result<GitDiffInput> {
+    let revision = base.unwrap_or(crate::git_support::DEFAULT_GIT_BASE);
+    validate_git_revision(revision, "--base")?;
 
     if !is_git_work_tree(dir)? {
         return Ok(GitDiffInput::Skipped(SkipInfo::not_git_repository()));
     }
 
-    let base_commit = resolve_commit_revision(dir, base)?;
+    let base_commit = match try_resolve_commit_revision(dir, revision)? {
+        CommitRevision::Resolved(commit) => commit,
+        CommitRevision::Unresolved if base.is_none() && head_is_unborn(dir) => {
+            return Ok(GitDiffInput::Skipped(SkipInfo::unborn_head()));
+        }
+        CommitRevision::Unresolved => {
+            return Err(AstroError::new(
+                ErrorCode::InvalidRequest,
+                format!("--base does not resolve to a commit: {revision}"),
+            )
+            .into());
+        }
+    };
     let mut truncations = Vec::new();
     let diff = run_git_diff_collecting_truncations(dir, &base_commit, staged, &mut truncations)?;
     Ok(GitDiffInput::Diff {
@@ -480,9 +512,16 @@ pub(crate) fn resolve_git_diff(dir: &str, base: &str, staged: bool) -> Result<Gi
     })
 }
 
+/// `<revision>^{commit}` を解決した結果。git を起動できなかった場合は `Err` で、ここには来ない。
+enum CommitRevision {
+    Resolved(String),
+    /// git は動いたが、コミットに解決できなかった。
+    Unresolved,
+}
+
 /// 変動する ref を一度だけ解決する。rev-list / show / diff が別々の HEAD を
 /// 見ないよう、呼び出し側は返されたコミット ID を全段階へ渡す。
-fn resolve_commit_revision(dir: &str, revision: &str) -> Result<String> {
+fn try_resolve_commit_revision(dir: &str, revision: &str) -> Result<CommitRevision> {
     let commit_expr = format!("{revision}^{{commit}}");
     let output = crate::git_support::git_command_for_dir(dir)
         .args(["rev-parse", "--verify", "--quiet", &commit_expr])
@@ -498,13 +537,74 @@ fn resolve_commit_revision(dir: &str, revision: &str) -> Result<String> {
         || !matches!(commit.len(), 40 | 64)
         || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        return Err(AstroError::new(
-            ErrorCode::InvalidRequest,
-            format!("--base does not resolve to a commit: {revision}"),
-        )
-        .into());
+        return Ok(CommitRevision::Unresolved);
     }
-    Ok(commit)
+    Ok(CommitRevision::Resolved(commit))
+}
+
+/// HEAD がまだコミットの無いブランチ (unborn) を指しているか。
+///
+/// `git init` の直後や `git checkout --orphan` の直後は、HEAD が指すブランチの ref がまだ無い。
+/// rev-parse の失敗を一律に unborn とみなすと、壊れた HEAD まで黙って skip するので、
+/// 次をすべて満たすときだけ真にする。どれかの git が失敗したら偽 (呼び出し側は元のエラーを返す)。
+/// - `git symbolic-ref --no-recurse HEAD` が `refs/heads/` の名前を返す。detached HEAD は対象外で、
+///   symref の連鎖はたどらず直接の参照先だけを見る
+/// - その名前が `git check-ref-format` を通る
+/// - `git show-ref --exists` が「ref が無い」(終了コード 2) を返す。存在しないオブジェクトを指す
+///   ref は 0、内容の壊れた ref は 1 になるので unborn と区別できる。`--exists` は git 2.43 以降で、
+///   それより前の git では偽になる (従来どおりエラー)
+///
+/// `.git/HEAD` や ref のファイルを直接読まず git に問い合わせるので、reftable や linked worktree
+/// でも同じ判定になる。
+fn head_is_unborn(dir: &str) -> bool {
+    use std::ffi::OsStr;
+
+    let run = |args: &[&OsStr]| {
+        crate::git_support::git_command_for_dir(dir)
+            .args(args)
+            .current_dir(dir)
+            .env("LC_ALL", "C")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .output()
+            .ok()
+    };
+    let Some(head) = run(&["symbolic-ref", "--quiet", "--no-recurse", "HEAD"].map(OsStr::new))
+    else {
+        return false;
+    };
+    if !head.status.success() {
+        return false;
+    }
+    // ref 名には空白を含めうるので trim しない。出力の終端の改行だけを除く。
+    let Some(name) = head.stdout.strip_suffix(b"\n") else {
+        return false;
+    };
+    let name = name.strip_suffix(b"\r").unwrap_or(name);
+    if !name.starts_with(b"refs/heads/") {
+        return false;
+    }
+    let Some(reference) = git_ref_name_arg(name) else {
+        return false;
+    };
+    if !run(&[OsStr::new("check-ref-format"), &reference]).is_some_and(|out| out.status.success()) {
+        return false;
+    }
+    run(&[OsStr::new("show-ref"), OsStr::new("--exists"), &reference])
+        .is_some_and(|out| out.status.code() == Some(2))
+}
+
+/// git が出力した ref 名を、そのまま git の引数に戻せる形にする。Unix の ref 名は UTF-8 とは
+/// 限らない (`refs/heads/topic-\xff` も有効な名前) ので、バイト列のまま渡す。
+#[cfg(unix)]
+fn git_ref_name_arg(name: &[u8]) -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    Some(std::ffi::OsStr::from_bytes(name).to_os_string())
+}
+
+/// Windows のコマンド引数は Unicode なので、UTF-8 として読める名前だけを扱う。
+#[cfg(not(unix))]
+fn git_ref_name_arg(name: &[u8]) -> Option<std::ffi::OsString> {
+    std::str::from_utf8(name).ok().map(std::ffi::OsString::from)
 }
 
 /// 経路A (context / impact / review / dead-code) の diff 入力ソースを **解決のみ** 行う。
@@ -530,7 +630,7 @@ pub(crate) fn resolve_diff_source(
     inline: Option<&str>,
     file: Option<&str>,
     git: bool,
-    base: &str,
+    base: Option<&str>,
     staged: bool,
 ) -> Result<DiffSourceResolution> {
     if let Some(d) = inline {
