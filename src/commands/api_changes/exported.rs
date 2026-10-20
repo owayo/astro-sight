@@ -142,6 +142,9 @@ pub(crate) struct ExportSurfaceContext<'tree, 'source> {
     rust_const_owners: Vec<&'source Symbol>,
     unittest_classes: HashSet<String>,
     python_export_policy: Option<crate::engine::symbols::PythonModuleExportPolicy>,
+    /// Python のデコレータの別名を解決する import の索引。名前を書いたままでは登録と
+    /// 決まらないデコレータが現れたときに 1 回だけ作る。
+    python_decorator_imports: std::cell::OnceCell<crate::engine::symbols::PythonDecoratorImports>,
 }
 
 impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
@@ -217,6 +220,7 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
             rust_const_owners,
             unittest_classes,
             python_export_policy,
+            python_decorator_imports: std::cell::OnceCell::new(),
         }
     }
 
@@ -465,7 +469,7 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
             return true;
         }
         // Python のフレームワーク登録デコレータ (Typer / Click / FastAPI / Flask /
-        // pytest 等) で装飾された関数 / メソッド / クラスは、フレームワーク内部
+        // pytest / Pydantic 等) で装飾された関数 / メソッド / クラスは、フレームワーク内部
         // レジストリ経由で呼び出されるため識別子レベルの cross-file refs では
         // caller を追跡できない。dead-code 判定では偽陽性源になるため除外する。
         if self.exclude_framework_entrypoints
@@ -478,6 +482,7 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
                 self.root,
                 self.source,
                 &sym.range,
+                &self.python_decorator_imports,
             )
         {
             return true;

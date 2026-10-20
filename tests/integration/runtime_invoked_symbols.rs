@@ -214,3 +214,27 @@ fn rust_serde_default_function_is_not_dead() {
     assert!(!dead.contains(&"default_port".to_string()), "{dead:?}");
     assert!(dead.contains(&"unused_default".to_string()), "{dead:?}");
 }
+
+/// Pydantic がモデルの検証・シリアライズのときに呼ぶメソッド (`@model_validator` 等) と、
+/// 別名で import した登録デコレータ・行末コメント付きの登録デコレータで登録した関数を
+/// dead にしない (Issue #85)。旧実装は名前表に Pydantic のデコレータが無く、別名を
+/// 解決せず、行末コメントまで名前として照合していた。
+#[test]
+fn python_pydantic_hooks_and_aliased_registrations_are_not_dead() {
+    let repo = TestRepo::new();
+    repo.write(
+        "record.py",
+        "from pydantic import BaseModel, computed_field, field_validator\nfrom pydantic import model_validator as mv\n\n\nclass ReadingPacket(BaseModel):\n    level: int\n\n    @mv(mode=\"after\")\n    def enforce_floor(self):\n        if self.level < 0:\n            raise ValueError(\"negative level\")\n        return self\n\n    @field_validator(\"level\")\n    @classmethod\n    def check_level(cls, v):\n        return v\n\n    @computed_field\n    @property\n    def doubled(self) -> int:\n        return self.level * 2\n\n    def unused_helper(self):\n        return 1\n\n\nReadingPacket.model_validate({\"level\": 2})\n",
+    );
+    repo.write(
+        "tasks.py",
+        "from celery import shared_task\nfrom celery import shared_task as st\n\n\n@shared_task  # nightly\ndef rebuild_index():\n    pass\n\n\n@st\ndef send_digest():\n    pass\n\n\ndef unused_job():\n    pass\n",
+    );
+    assert_eq!(
+        dead_names(&repo),
+        vec![
+            "ReadingPacket.unused_helper".to_string(),
+            "unused_job".to_string()
+        ]
+    );
+}
