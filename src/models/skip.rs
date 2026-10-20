@@ -21,7 +21,8 @@ pub struct SkippedFiles {
 
 /// `--git` 指定だが解析対象の diff を取得できずスキップした理由を機械可読に伝える。
 ///
-/// git 管理外ディレクトリ (または worktree 外) で `--git` が要求されたケースを
+/// git 管理外ディレクトリ (または worktree 外) で `--git` が要求されたケースと、
+/// `--base` を省略したのに HEAD がまだコミットを指していない (unborn) ケースを
 /// 「想定内の skip」として表現する。真のエラー (壊れた repo / 不正 base /
 /// git 実行不能 / 権限不足) は従来どおり `exit 1` のエラー JSON を返し、ここには
 /// 到達しない。
@@ -49,6 +50,21 @@ impl SkipInfo {
             reason: "not_git_repository".to_string(),
             source: "git".to_string(),
             message: "--git was requested but --dir is not inside a git worktree".to_string(),
+        }
+    }
+
+    /// `--base` を省略した `--git` で、HEAD がまだコミットを指していない (unborn) ため
+    /// 比較の基点が無い skip。
+    ///
+    /// `git init` の直後や `git checkout --orphan` の直後の正常な状態なので、git 管理外と
+    /// 同じく解析を飛ばす。`--base` を明示した場合は skip せず、コミットに解決できなければ
+    /// `HEAD` でも従来どおりエラーにする。
+    pub fn unborn_head() -> Self {
+        Self {
+            reason: "unborn_head".to_string(),
+            source: "git".to_string(),
+            message: "--git was requested without --base, but HEAD does not point to a commit yet"
+                .to_string(),
         }
     }
 }

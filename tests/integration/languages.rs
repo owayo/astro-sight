@@ -1427,6 +1427,172 @@ fn non_git_cochange_emits_skipped() {
     assert_eq!(json["skipped"]["reason"], "not_git_repository");
 }
 
+// ---------------------------------------------------------------------------
+// コミットが 1 つも無い (HEAD が unborn の) リポジトリでの skip (--git、Issue #86)
+// ---------------------------------------------------------------------------
+
+/// `git show-ref --exists` (git 2.43 以降) を使えるか。使えない git では HEAD が unborn だと
+/// 判定できず、`--base` を省略しても従来どおり exit 1 になる。
+fn git_supports_show_ref_exists() -> bool {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let initialized = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .is_ok_and(|status| status.success());
+    initialized
+        && std::process::Command::new("git")
+            .args(["show-ref", "--exists", "refs/heads/astro-sight-probe"])
+            .current_dir(dir.path())
+            .output()
+            .is_ok_and(|out| out.status.code() == Some(2))
+}
+
+fn run_command(repo: &TestRepo, command: &str, args: &[&str]) -> std::process::Output {
+    cargo_bin()
+        .arg(command)
+        .arg("--dir")
+        .arg(repo.root())
+        .args(args)
+        .output()
+        .expect("run astro-sight")
+}
+
+/// `git init` 直後のリポジトリでは、`--base` を省略した `--git` は git 管理外と同じく解析を
+/// 飛ばして exit 0 で終わる。未追跡だけのときも `git add` 後も、`--staged` の有無も同じ。
+/// dead-code は skip の後に全体の走査へ切り替えない (切り替えると未使用の `Add` が出る)。
+#[test]
+fn unborn_head_git_commands_skip_with_exit_zero() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("pkg/calc");
+    repo.write(
+        "pkg/calc/calc.go",
+        "package calc\n\nfunc Add(a, b int) int { return a + b }\n",
+    );
+    if !git_supports_show_ref_exists() {
+        // 古い git では unborn と判定できないので、従来どおりのエラーを確かめるだけにする。
+        let output = run_command(&repo, "review", &["--git", "--hook"]);
+        assert_eq!(output.status.code(), Some(1));
+        return;
+    }
+
+    for added in [false, true] {
+        if added {
+            repo.stage_all();
+        }
+        for staged in [&[][..], &["--staged"][..]] {
+            for (command, extra) in [
+                ("review", &["--hook"][..]),
+                ("impact", &["--hook"][..]),
+                ("impact", &[][..]),
+            ] {
+                let args = [&["--git"][..], extra, staged].concat();
+                let output = run_command(&repo, command, &args);
+                let label = format!("added={added} {command} {args:?}");
+                assert!(output.status.success(), "{label}: exit 0 であるべき");
+                assert!(
+                    output.stdout.is_empty() && output.stderr.is_empty(),
+                    "{label}: 無出力であるべき: {} / {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            for command in ["review", "context", "dead-code"] {
+                let args = [&["--git"][..], staged].concat();
+                let output = run_command(&repo, command, &args);
+                let label = format!("added={added} {command} {args:?}");
+                assert!(output.status.success(), "{label}: exit 0 であるべき");
+                let json: serde_json::Value =
+                    serde_json::from_slice(&output.stdout).expect("valid JSON");
+                assert_eq!(json["skipped"]["reason"], "unborn_head", "{label}: {json}");
+                assert_eq!(json["skipped"]["source"], "git", "{label}: {json}");
+                if command == "dead-code" {
+                    assert_eq!(json["scanned_files"], 0, "{label}: {json}");
+                    assert!(
+                        json["dead_symbols"].as_array().unwrap().is_empty(),
+                        "{label}: {json}"
+                    );
+                }
+            }
+        }
+        let json = repo.run_json("cochange", &["--git"]);
+        assert_eq!(json["skipped"]["reason"], "unborn_head", "{json}");
+    }
+}
+
+/// HEAD が unborn でも、明示した `--base HEAD` と存在しない base は従来どおり
+/// INVALID_REQUEST で exit 1 にする (利用者が指定した revision が解決できない)。
+#[test]
+fn unborn_head_explicit_or_missing_base_still_fails() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.write("a.py", "def run():\n    return 1\n");
+    for command in ["review", "context", "dead-code", "impact"] {
+        for base in ["HEAD", "missing-ref"] {
+            let output = run_command(&repo, command, &["--git", "--base", base]);
+            assert_eq!(output.status.code(), Some(1), "{command} --base {base}");
+            let json: serde_json::Value =
+                serde_json::from_slice(&output.stdout).expect("valid JSON");
+            assert_eq!(
+                json["error"]["code"], "INVALID_REQUEST",
+                "{command} --base {base}: {json}"
+            );
+        }
+    }
+}
+
+/// 別のブランチに履歴がある orphan ブランチ (HEAD は unborn) でも skip する。有効な base を
+/// 明示すれば解析し、最初のコミットの後は従来どおり解析する。
+#[test]
+fn orphan_branch_skips_until_base_is_given_or_committed() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.write(
+        "calc.go",
+        "package calc\n\nfunc Add(a, b int) int { return a + b }\n",
+    );
+    repo.commit_all("init");
+    repo.git(["branch", "-M", "main"]);
+    repo.git(["checkout", "-q", "--orphan", "fresh"]);
+    repo.write(
+        "sub.go",
+        "package calc\n\nfunc Sub(a, b int) int { return a - b }\n",
+    );
+
+    let json = repo.run_json("context", &["--git", "--base", "main"]);
+    assert!(json["skipped"].is_null(), "{json}");
+    assert!(
+        json["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["path"] == "sub.go"),
+        "{json}"
+    );
+    if !git_supports_show_ref_exists() {
+        // 古い git では unborn と判定できないので、--base の省略は従来どおりのエラーになる。
+        let output = run_command(&repo, "context", &["--git"]);
+        assert_eq!(output.status.code(), Some(1));
+        return;
+    }
+
+    let output = run_command(&repo, "review", &["--git", "--hook"]);
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty() && output.stderr.is_empty());
+    let json = repo.run_json("context", &["--git"]);
+    assert_eq!(json["skipped"]["reason"], "unborn_head", "{json}");
+
+    repo.commit_all("first commit on fresh");
+    repo.write(
+        "sub.go",
+        "package calc\n\nfunc Sub(a, b int) int { return a - b }\n\nfunc Mul(a, b int) int { return a * b }\n",
+    );
+    let json = repo.run_json("context", &["--git"]);
+    assert!(json["skipped"].is_null(), "{json}");
+    assert!(!json["changes"].as_array().unwrap().is_empty(), "{json}");
+}
+
 /// PHP / C# の import 抽出が alias を import 元として出さないこと。
 ///
 /// 旧クエリは `(namespace_use_clause [(qualified_name) (name)] @import.source)` /

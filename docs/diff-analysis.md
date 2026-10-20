@@ -109,6 +109,7 @@ git diff HEAD~1 | astro-sight impact --dir .
 - Nothing unresolved → exit 0 (no output)
 - Something unresolved → text on stderr + exit 1
 - `--dir` is not in a git repository → exit 0 (no output, with or without `--hook`; see "Skipping Directories Outside Git" below)
+- `--base` is omitted and there is no commit yet (HEAD is unborn) → exit 0 (no output; see the same section)
 
 Output (on exit 1):
 ```text
@@ -141,7 +142,9 @@ When a command that accepts `--git` (`context` / `impact` / `review` / `dead-cod
 { "...": "...", "skipped": { "reason": "not_git_repository", "source": "git", "message": "--git was requested but --dir is not inside a git worktree" } }
 ```
 
-The check uses `git rev-parse --is-inside-work-tree` (with `LC_ALL=C`), so worktrees, submodules, and bare repositories are detected correctly. **Real errors** (an invalid `--base`, a base that cannot resolve to a commit, git not runnable, a broken repository, missing permissions) return `exit 1`. Passing a diff through `--diff` / `--diff-file` / stdin does not go through this check.
+The check uses `git rev-parse --is-inside-work-tree` (with `LC_ALL=C`), so worktrees, submodules, and bare repositories are detected correctly. **Real errors** (an invalid `--base`, a base that cannot resolve to a commit, git not runnable, a broken repository, missing permissions) return `exit 1`.
+
+A repository without any commit is skipped in the same way when `--base` is omitted. Right after `git init` or `git checkout --orphan`, HEAD does not point to a commit yet, so there is no base to compare against. `skipped.reason` is `unborn_head`. An explicit `--base` is never skipped: the diff against that base is analyzed, and a base that does not resolve to a commit, even `--base HEAD`, still returns exit 1. When `cochange` gets `--paths` / `--paths-file`, it continues with those files only, as it does outside git. Whether HEAD is unborn is checked with `git show-ref --exists` (git 2.43 or later); older git does not skip and keeps exit 1. Passing a diff through `--diff` / `--diff-file` / stdin does not go through this check.
 
 `review --git` makes at most three attempts when the index or working tree changes during analysis, or when `git diff` reports a short read while indexing a file. Each attempt starts by acquiring the diff again and resolving the base to a commit. That commit stays fixed for the attempt's diff, cochange, and API analysis; moving HEAD alone does not invalidate it. Failed results and temporary snapshots are discarded.
 

@@ -109,6 +109,7 @@ git diff HEAD~1 | astro-sight impact --dir .
 - 未解決なし → exit 0（出力なし）
 - 未解決あり → stderr にテキスト出力 + exit 1
 - `--dir` が git 管理外 → exit 0（出力なし。`--hook` の有無は問わない。下記「git 管理外ディレクトリでのスキップ」参照）
+- `--base` を省略していて、まだコミットが無い（HEAD が unborn）→ exit 0（出力なし。同じく下記参照）
 
 出力例（exit 1 時）:
 ```text
@@ -141,7 +142,9 @@ condition = { command_exists = "astro-sight" }
 { "...": "...", "skipped": { "reason": "not_git_repository", "source": "git", "message": "--git was requested but --dir is not inside a git worktree" } }
 ```
 
-判定には `git rev-parse --is-inside-work-tree`（`LC_ALL=C`）を使うので、worktree / submodule / bare repo でも正しく判定できる。**真のエラー**（`--base` 不正・base がコミットに解決できない・git 実行不能・壊れた repo・権限不足）は `exit 1` を返す。`--diff` / `--diff-file` / stdin で diff を渡す経路は、この判定を通らない。
+判定には `git rev-parse --is-inside-work-tree`（`LC_ALL=C`）を使うので、worktree / submodule / bare repo でも正しく判定できる。**真のエラー**（`--base` 不正・base がコミットに解決できない・git 実行不能・壊れた repo・権限不足）は `exit 1` を返す。
+
+コミットが 1 つも無いリポジトリでも、`--base` を省略した場合は同じくスキップする。`git init` の直後や `git checkout --orphan` の直後は HEAD がまだコミットを指しておらず、比較の基点が無いためである。`skipped.reason` は `unborn_head` になる。`--base` を明示した場合はスキップせず、その base との差分を解析する。base がコミットに解決できなければ、`--base HEAD` でも従来どおり exit 1 を返す。`cochange` で `--paths` / `--paths-file` を明示した場合は、git 管理外のときと同じく、明示したファイルだけで続行する。HEAD が unborn かどうかは `git show-ref --exists`（git 2.43 以降）で確かめるので、それより前の git ではスキップせず exit 1 のままになる。`--diff` / `--diff-file` / stdin で diff を渡す経路は、この判定を通らない。
 
 `review --git` は解析中の入力変化を検出すると、最大 3 回まで試行する。対象は index・作業ツリーの変化と、`git diff` がファイルの取り込み中に返す short read。各試行で差分取得からやり直し、base をコミット ID に解決する。その ID を試行内の差分・cochange・API 解析で共有するため、HEAD の移動だけでは試行を無効にしない。失敗した結果と一時 snapshot は破棄する。
 

@@ -39,7 +39,8 @@ pub struct CmdReviewOpts<'a> {
     pub diff: Option<&'a str>,
     pub diff_file: Option<&'a str>,
     pub git: bool,
-    pub base: &'a str,
+    /// `--base` の指定。省略なら `None` (既定の HEAD を使い、HEAD が unborn なら skip)。
+    pub base: Option<&'a str>,
     pub staged: bool,
     pub min_confidence: f64,
     /// missing_cochanges が要求する最小共変更回数
@@ -162,7 +163,10 @@ fn review_attempt(
                 )
             }
         };
-    let analysis_base = pinned_base.as_deref().unwrap_or(base);
+    let analysis_base = pinned_base
+        .as_deref()
+        .or(base)
+        .unwrap_or(crate::git_support::DEFAULT_GIT_BASE);
     // 構築前後の入力変化を検出するため、index と作業ツリーの両方を記録する。
     let working_tree_diff = if staged {
         pinned_base

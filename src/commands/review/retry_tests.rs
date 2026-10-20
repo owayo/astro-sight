@@ -43,7 +43,7 @@ fn options(dir: &str, staged: bool) -> CmdReviewOpts<'_> {
         diff: None,
         diff_file: None,
         git: true,
-        base: "HEAD",
+        base: None,
         staged,
         min_confidence: 0.5,
         cochange_min_samples: 0,

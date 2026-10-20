@@ -1741,7 +1741,8 @@ pub struct CmdDeadCodeOpts<'a> {
     pub diff: Option<&'a str>,
     pub diff_file: Option<&'a str>,
     pub git: bool,
-    pub base: &'a str,
+    /// `--base` の指定。省略なら `None` (既定の HEAD を使い、HEAD が unborn なら skip)。
+    pub base: Option<&'a str>,
     pub staged: bool,
     pub include_vendor: bool,
     pub include_tests: bool,
