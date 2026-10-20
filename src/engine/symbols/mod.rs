@@ -16,6 +16,7 @@ mod framework;
 mod go_test;
 mod operator;
 mod overrides;
+mod python_decorator;
 mod rust_allow_dead;
 mod scope;
 
@@ -25,16 +26,16 @@ pub use exported::{
     is_rust_declaration_restricted_pub, is_rust_declaration_unrestricted_pub, is_symbol_exported,
 };
 pub use framework::{
-    has_framework_entrypoint_decorator_python, is_java_flyway_migration_class,
-    is_js_ts_angular_lifecycle_hook, is_js_ts_angular_provider_option_callback,
-    is_js_ts_angular_runtime_entrypoint, is_js_ts_framework_dsl_callback,
-    is_php_laravel_runtime_entrypoint, is_php_pseudo_enum_method,
+    is_java_flyway_migration_class, is_js_ts_angular_lifecycle_hook,
+    is_js_ts_angular_provider_option_callback, is_js_ts_angular_runtime_entrypoint,
+    is_js_ts_framework_dsl_callback, is_php_laravel_runtime_entrypoint, is_php_pseudo_enum_method,
     is_python_dynamic_protocol_method, php_declaration_has_runtime_attribute,
     php_doc_has_runtime_annotation, python_class_base_names,
 };
 pub(crate) use go_test::is_go_test_entrypoint;
 pub use operator::is_syntax_invoked_method;
 pub use overrides::is_override_method;
+pub use python_decorator::{PythonDecoratorImports, has_framework_entrypoint_decorator_python};
 pub(crate) use rust_allow_dead::rust_has_allow_dead_marker;
 pub use scope::is_local_scope_symbol;
 

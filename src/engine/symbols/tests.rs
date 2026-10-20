@@ -1406,7 +1406,12 @@ fn check_python_framework_decorator(source: &str, symbol_name: &str) -> bool {
                 syms.iter().map(|s| &s.name).collect::<Vec<_>>()
             )
         });
-    has_framework_entrypoint_decorator_python(root, source.as_bytes(), &sym.range)
+    has_framework_entrypoint_decorator_python(
+        root,
+        source.as_bytes(),
+        &sym.range,
+        &std::cell::OnceCell::new(),
+    )
 }
 
 #[test]
@@ -1716,6 +1721,207 @@ class Cli:
         pass
 "#;
     assert!(check_python_framework_decorator(src, "show"));
+}
+
+/// 行末コメントも decorator ノードの子になる。旧実装はデコレータのテキストを `(` で
+/// 切っていたので、括弧の無い `@shared_task  # celery` が名前表と一致しなかった。
+#[test]
+fn python_decorator_with_trailing_comment_is_detected() {
+    for (src, name) in [
+        (
+            "@shared_task  # celery\ndef rebuild():\n    pass\n",
+            "rebuild",
+        ),
+        (
+            "@register.filter  # template\ndef currency(v):\n    return v\n",
+            "currency",
+        ),
+        ("@app.command()  # cli\ndef sync():\n    pass\n", "sync"),
+    ] {
+        assert!(check_python_framework_decorator(src, name), "{src}");
+    }
+    assert!(!check_python_framework_decorator(
+        "@lru_cache  # memo\ndef memo():\n    pass\n",
+        "memo"
+    ));
+}
+
+/// 別名で import した登録デコレータを元の名前で照合する。import はデコレータを評価する
+/// スコープ (外側の関数・モジュール。if / try の中も含む) のものだけを使う。
+#[test]
+fn python_aliased_registration_decorators_are_detected() {
+    for (src, name) in [
+        (
+            "from celery import shared_task as st\n\n@st\ndef job():\n    pass\n",
+            "job",
+        ),
+        (
+            "from django.dispatch import receiver as on\n\n@on(post_save)\ndef handle(sender, **kw):\n    pass\n",
+            "handle",
+        ),
+        (
+            "import pytest as pt\n\n@pt.mark.slow\ndef test_x():\n    pass\n",
+            "test_x",
+        ),
+        (
+            "from django.contrib import admin as dj\n\n@dj.register(Product)\nclass ProductAdmin:\n    pass\n",
+            "ProductAdmin",
+        ),
+        (
+            "try:\n    from celery import shared_task as st\nexcept ImportError:\n    st = None\n\n@st\ndef job():\n    pass\n",
+            "job",
+        ),
+        (
+            "def factory():\n    from celery import shared_task as st\n\n    @st\n    def job():\n        pass\n",
+            "job",
+        ),
+        // モジュールの別名。出所を付けた完全名は末尾の一致で照合する
+        (
+            "import django.contrib.admin as dj\n\n@dj.register(Product)\nclass ProductAdmin:\n    pass\n",
+            "ProductAdmin",
+        ),
+        (
+            "from django.contrib.admin import register as reg\n\n@reg(Product)\nclass ProductAdmin:\n    pass\n",
+            "ProductAdmin",
+        ),
+        (
+            "import django.dispatch as dd\n\n@dd.receiver(post_save)\ndef handle(sender, **kw):\n    pass\n",
+            "handle",
+        ),
+    ] {
+        assert!(check_python_framework_decorator(src, name), "{src}");
+    }
+
+    for (src, name) in [
+        // 無関係な関数の中の import はモジュール直下のデコレータに効かない
+        (
+            "def other():\n    from celery import shared_task as st\n\n@st\ndef job():\n    pass\n",
+            "job",
+        ),
+        // デコレータは外側で評価されるので、装飾した関数自身の本体の import は効かない
+        (
+            "@st\ndef job():\n    from celery import shared_task as st\n",
+            "job",
+        ),
+        // 登録でないデコレータの別名
+        (
+            "from functools import lru_cache as st\n\n@st\ndef memo():\n    pass\n",
+            "memo",
+        ),
+        // Django の admin ではない `register`
+        (
+            "from myapp.registry import register as reg\n\n@reg(Product)\nclass ProductAdmin:\n    pass\n",
+            "ProductAdmin",
+        ),
+    ] {
+        assert!(!check_python_framework_decorator(src, name), "{src}");
+    }
+}
+
+/// Pydantic がモデルの検証・シリアライズ時に呼ぶメソッド (Issue #85)。出所を確かめずに
+/// 名前で照合する (`from pydantic import *` や再エクスポートでも拾う) が、クラス本体の
+/// 関数に限る。
+#[test]
+fn python_pydantic_member_decorators_are_detected() {
+    for (decorators, name) in [
+        ("@model_validator(mode=\"after\")", "enforce_floor"),
+        ("@mv(mode=\"before\")\n    @classmethod", "coerce"),
+        (
+            "@pydantic.field_validator(\"level\")\n    @classmethod",
+            "check_level",
+        ),
+        (
+            "@pydantic.functional_validators.model_validator(mode=\"wrap\")",
+            "wrap",
+        ),
+        ("@field_serializer(\"level\")", "dump_level"),
+        ("@model_serializer(mode=\"wrap\")", "dump"),
+        ("@computed_field\n    @property", "total"),
+        ("@root_validator(pre=True)", "legacy"),
+    ] {
+        let src = format!(
+            "import pydantic\nfrom pydantic import BaseModel, model_validator as mv\n\nclass M(BaseModel):\n    level: int\n\n    {decorators}\n    def {name}(self):\n        return self\n"
+        );
+        assert!(check_python_framework_decorator(&src, name), "{src}");
+    }
+
+    // クラス本体の if の中で定義したメソッドもクラス本体の関数
+    let src = "import sys\nfrom pydantic import BaseModel, field_validator\n\nclass M(BaseModel):\n    level: int\n    if sys.version_info >= (3, 9):\n        @field_validator(\"level\")\n        @classmethod\n        def check(cls, v):\n            return v\n";
+    assert!(check_python_framework_decorator(src, "check"));
+
+    // モジュール直下の関数に付いていても Pydantic は呼ばない
+    let src = "from pydantic import model_validator\n\n@model_validator(mode=\"after\")\ndef enforce_floor(m):\n    return m\n";
+    assert!(!check_python_framework_decorator(src, "enforce_floor"));
+}
+
+/// Pydantic v1 の `@validator` は名前が汎用的なので、pydantic からの import と確かめた
+/// 場合だけ登録として扱う。
+#[test]
+fn python_pydantic_v1_validator_requires_pydantic_origin() {
+    for src in [
+        "from pydantic import BaseModel, validator\n\nclass M(BaseModel):\n    @validator(\"level\")\n    def check(cls, v):\n        return v\n",
+        "from pydantic.v1 import validator as v1_validator\n\nclass M:\n    @v1_validator(\"level\")\n    def check(cls, v):\n        return v\n",
+        "import pydantic\n\nclass M(pydantic.BaseModel):\n    @pydantic.validator(\"level\")\n    def check(cls, v):\n        return v\n",
+        "from pydantic import *\n\nclass M(BaseModel):\n    @validator(\"level\")\n    def check(cls, v):\n        return v\n",
+        // import の名前の途中の行継続は、名前に含めない
+        "from pydantic.\\\nv1 import BaseModel, validator\n\nclass M(BaseModel):\n    @validator(\"level\")\n    def check(cls, v):\n        return v\n",
+        "import pydantic.\\\nv1 as pv\n\nclass M(pv.BaseModel):\n    @pv.validator(\"level\")\n    def check(cls, v):\n        return v\n",
+    ] {
+        assert!(check_python_framework_decorator(src, "check"), "{src}");
+    }
+
+    for src in [
+        // 自作の `validator` (pydantic と無関係)
+        "def validator(fn):\n    return fn\n\nclass M:\n    @validator\n    def check(self):\n        return 1\n",
+        // 出所の分からない `@x.validator`
+        "class M:\n    @level.validator\n    def check(self, attribute, value):\n        pass\n",
+        // モジュール直下の関数
+        "from pydantic import validator\n\n@validator(\"x\")\ndef check(v):\n    return v\n",
+        // 相対 import の `pydantic` は外部の pydantic ではない
+        "from .pydantic import validator\n\nclass M:\n    @validator(\"x\")\n    def check(cls, v):\n        return v\n",
+    ] {
+        assert!(!check_python_framework_decorator(src, "check"), "{src}");
+    }
+}
+
+/// 呼び出しの結果や添字を受け手にした形は、末尾の名前で照合する。受け手が呼び出しなら、
+/// その呼び出し先の名前でも照合する (テキストの最初の `(` より前を名前にしていた旧実装が
+/// 拾えていた形を落とさない)。
+#[test]
+fn python_decorator_with_non_name_receiver_uses_tail_name() {
+    for (src, name) in [
+        ("@get_app().task\ndef job():\n    pass\n", "job"),
+        (
+            "from celery import shared_task\n\n@shared_task().__call__\ndef called():\n    pass\n",
+            "called",
+        ),
+        (
+            "@routes[\"v1\"].get(\"/x\")\ndef index():\n    pass\n",
+            "index",
+        ),
+        (
+            "@(app.command)\ndef parenthesized():\n    pass\n",
+            "parenthesized",
+        ),
+        (
+            "@app.route(\"/\")(\"x\")\ndef twice():\n    pass\n",
+            "twice",
+        ),
+    ] {
+        assert!(check_python_framework_decorator(src, name), "{src}");
+    }
+    for (src, name) in [
+        (
+            "@handlers[\"x\"]\ndef subscripted():\n    pass\n",
+            "subscripted",
+        ),
+        (
+            "@validator.__func__\ndef unwrapped():\n    pass\n",
+            "unwrapped",
+        ),
+    ] {
+        assert!(!check_python_framework_decorator(src, name), "{src}");
+    }
 }
 
 /// `python_class_base_names` がクラスの直接 base を identifier / attribute 形式で

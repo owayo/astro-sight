@@ -4775,3 +4775,35 @@ fn review_git_head_advance_case(staged: bool) {
         "cochange phase must read history from the pinned base: {result}"
     );
 }
+
+/// 通常の `review --git` も、Pydantic の `@model_validator` で登録したメソッドを
+/// dead_symbols に含めない (Issue #85 の再現手順)。除外は dead-code の判定だけで、
+/// API 差分の追加には従来どおり載る。本当に未使用の関数は報告し続ける。
+#[test]
+fn review_git_does_not_report_pydantic_model_validator_as_dead() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.git(["commit", "--allow-empty", "-q", "-m", "init"]);
+    repo.write(
+        "record.py",
+        "from pydantic import BaseModel, model_validator\n\n\nclass ReadingPacket(BaseModel):\n    level: int\n\n    @model_validator(mode=\"after\")\n    def enforce_floor(self):\n        if self.level < 0:\n            raise ValueError(\"negative level\")\n        return self\n\n\nReadingPacket.model_validate({\"level\": 2})\n\n\ndef unused_helper():\n    return 1\n",
+    );
+    let json = repo.run_json("review", &["--git"]);
+    let dead: Vec<&str> = json["dead_symbols"]
+        .as_array()
+        .expect("dead_symbols")
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert_eq!(dead, vec!["unused_helper"], "{json}");
+    let added: Vec<&str> = json["api_changes"]["added"]
+        .as_array()
+        .expect("api_changes.added")
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert!(
+        added.contains(&"ReadingPacket.enforce_floor"),
+        "API 差分では除外しない: {json}"
+    );
+}
