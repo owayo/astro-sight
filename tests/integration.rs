@@ -40,6 +40,7 @@ mod integration {
     mod python_member_removal;
     mod python_private_owner_removal;
     mod refs;
+    mod required_type_members;
     mod review;
     mod review_dead_scope;
     mod review_retry;
