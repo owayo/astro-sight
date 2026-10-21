@@ -360,7 +360,7 @@ fn import_role_at(node: tree_sitter::Node<'_>, source: &[u8], bare: &str) -> Ref
 
 /// 参照位置 (0 始まりの行・byte 列) から、テキストが名前と一致する最小のノードを返す。
 /// 位置と名前が食い違う (ファイルが変わった・解析できない) 場合は None。
-fn ref_name_node<'t>(
+pub(super) fn ref_name_node<'t>(
     parsed: &'t ParsedRefFile,
     bare: &str,
     line: usize,
@@ -498,6 +498,9 @@ pub(crate) enum ClosureArgEvidence<'a> {
     None,
     TsAddedRequiredProps(&'a super::ts_signature::AddedRequiredObjectProps),
     PythonProtocolParams(&'a super::python_protocol_arg::ProtocolArgumentChange),
+    /// TS の interface / object 型の type alias への必須プロパティ追加。型の参照を役割ごとの
+    /// 義務で閉じ、参照行が変更行にあるだけの証拠は使わない (Issue #89)。
+    TsRequiredTypeMembers(&'a super::ts_required_members::RequiredMemberDelta),
 }
 
 pub(crate) struct ModifiedClosureInput<'a> {
@@ -555,6 +558,31 @@ pub(crate) fn is_modified_closed_in_diff(
     if call_refs.is_empty() {
         return false;
     }
+    // 型への必須プロパティ追加は、参照の位置ごとの義務だけで閉じる (変更行の照合へ戻さない)。
+    if let ClosureArgEvidence::TsRequiredTypeMembers(delta) = input.arg_evidence {
+        let mut owned = Vec::with_capacity(call_refs.len());
+        for r in &call_refs {
+            match classify_reference_owner(&input, &target, r, caches) {
+                ReferenceOwner::Target => owned.push(*r),
+                ReferenceOwner::Other => {}
+                ReferenceOwner::Unknown => return false,
+            }
+        }
+        let scope = super::ts_required_members::ClosureScope {
+            dir: input.dir,
+            base: input.base,
+            type_name: target.bare,
+            target_path: input.target_new_path,
+        };
+        return !owned.is_empty()
+            && super::ts_required_members::prove_closure(
+                &scope,
+                &owned,
+                delta,
+                &mut diff_files,
+                caches,
+            );
+    }
     // 全ての呼び出し参照が、diff 内ファイルかつ実際の追加/変更行 (context 行ではない) にあるか。
     // shadow 除外で全参照が消えた場合は「対象 API の caller を 1 件も確認できていない」
     // ため closed にしない (除外前の空チェックだけだと fail-open になる)。空集合に対する
@@ -601,7 +629,7 @@ enum ReferenceOwner {
 /// 参照パス → 一致する diff ファイル (diff の並びで最初に一致したもの) のメモ。
 /// `diff_path_matches_ref` は一致しない組で canonicalize を 2 回呼ぶため、参照ごとに
 /// diff ファイルを先頭から照合し直さず、参照パスごとに 1 回だけ照合する。
-struct DiffFileLookup<'a> {
+pub(super) struct DiffFileLookup<'a> {
     diff_files: &'a [crate::models::impact::DiffFile],
     dir: &'a str,
     memo: std::collections::HashMap<String, Option<usize>>,
@@ -616,7 +644,7 @@ impl<'a> DiffFileLookup<'a> {
         }
     }
 
-    fn find(&mut self, ref_path: &str) -> Option<&'a crate::models::impact::DiffFile> {
+    pub(super) fn find(&mut self, ref_path: &str) -> Option<&'a crate::models::impact::DiffFile> {
         let index = match self.memo.get(ref_path) {
             Some(index) => *index,
             None => {
@@ -1233,7 +1261,7 @@ fn pass_through_reexport_at(
     check().is_some()
 }
 
-fn ref_is_pass_through_reexport(
+pub(super) fn ref_is_pass_through_reexport(
     dir: &str,
     r: &crate::models::reference::SymbolReference,
     bare: &str,
@@ -1397,6 +1425,18 @@ pub(crate) struct ApiClosureCaches {
     /// JS / TS / TSX の変更後関数契約。参照ごとの定義ファイル再走査を避ける。
     pub(super) js_call_contracts:
         std::collections::HashMap<(String, String), Option<super::js_ts_call_arity::CallContract>>,
+    /// 型への必須プロパティ追加の証明で、型の名前とは別に集めた名前 (型を受け取る関数・
+    /// 型の値を作る関数と変数) の参照。`None` = 検索失敗か、読めないファイルがあった。
+    pub(super) ts_name_refs: std::collections::HashMap<
+        String,
+        Option<std::rc::Rc<Vec<crate::models::reference::SymbolReference>>>,
+    >,
+    /// ディレクトリ (dir 相対) → そこの tsconfig / jsconfig が相対 import の解決を変える設定
+    /// (`rootDirs` / `moduleSuffixes`) を持たないか。
+    pub(super) ts_plain_resolution_dirs: std::collections::HashMap<String, bool>,
+    /// JSDoc と文字列で書いた名前を調べる、tsc が型検査するファイルの一覧。外 `None` = 未取得、
+    /// 内 `None` = 取得失敗。
+    pub(super) ts_checked_files: Option<Option<std::rc::Rc<Vec<std::path::PathBuf>>>>,
 }
 
 /// 参照行が named export clause (`export { X }` / `export type { X }`) かを判定する。
@@ -1553,6 +1593,24 @@ fn changed_new_lines_for_diff_file(
         return changed;
     }
     untracked_rename_added_lines(dir, base, &df.old_path, &df.new_path).unwrap_or(changed)
+}
+
+/// 参照のあるファイル `ref_path` の実変更行 (0-indexed)。diff に無いファイルは None。
+/// 1 回の検出の中ではファイルごとに 1 回だけ git diff を取る。
+pub(super) fn changed_lines_for_ref_path(
+    dir: &str,
+    base: &str,
+    ref_path: &str,
+    diff_files: &mut DiffFileLookup<'_>,
+    caches: &mut ApiClosureCaches,
+) -> Option<std::rc::Rc<std::collections::HashSet<usize>>> {
+    let df = diff_files.find(ref_path)?;
+    Some(std::rc::Rc::clone(
+        caches
+            .changed_new_lines
+            .entry(df.new_path.clone())
+            .or_insert_with(|| std::rc::Rc::new(changed_new_lines_for_diff_file(dir, base, df))),
+    ))
 }
 
 /// `path` (dir 相対) が git の index に無い (= 未追跡) か。判定できなければ false

@@ -1046,9 +1046,22 @@ fn closure_or_blocking_decision(
     let added_required_props = detect_added_required_object_props(site, sources);
     let python_protocol =
         super::python_protocol_arg::prepare_protocol_argument_change(site, sources);
-    let arg_evidence = match (&added_required_props, &python_protocol) {
-        (Some(props), _) => super::ref_index::ClosureArgEvidence::TsAddedRequiredProps(props),
-        (None, Some(proof)) => super::ref_index::ClosureArgEvidence::PythonProtocolParams(proof),
+    // interface / object 型の type alias への必須プロパティ追加は、値を作る箇所・受け取る箇所
+    // ごとの証明だけで閉じる。証明に対応しない形 (generic / extends / メソッド追加など) は、
+    // 参照行が変更行にあるだけでは追随済みと言えないので閉じない (Issue #89)。
+    let required_members = super::ts_signature::classify_required_member_addition(site, sources);
+    if matches!(
+        required_members,
+        super::ts_required_members::RequiredMemberChange::Unsupported
+    ) {
+        return SignatureDecision::Blocking(None);
+    }
+    let arg_evidence = match (&added_required_props, &python_protocol, &required_members) {
+        (Some(props), _, _) => super::ref_index::ClosureArgEvidence::TsAddedRequiredProps(props),
+        (None, Some(proof), _) => super::ref_index::ClosureArgEvidence::PythonProtocolParams(proof),
+        (None, None, super::ts_required_members::RequiredMemberChange::Supported(delta)) => {
+            super::ref_index::ClosureArgEvidence::TsRequiredTypeMembers(delta)
+        }
         _ => super::ref_index::ClosureArgEvidence::None,
     };
     // 真偽判定の不変性は関数のシグネチャ変更だけの証拠。値から関数への種類変更は除く。

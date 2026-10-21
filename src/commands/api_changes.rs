@@ -636,6 +636,8 @@ mod source_pair;
 
 mod ts_const_arg;
 
+mod ts_required_members;
+
 mod ts_signature;
 
 pub(crate) use diff_processing::*;
