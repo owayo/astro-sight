@@ -1092,6 +1092,18 @@ fn closure_or_blocking_decision(
                     site.name,
                 )
             });
+    let rust_module_function_change = (site.kind == "function"
+        && !site.name.contains('.')
+        && site.lang_id == Some(crate::language::LangId::Rust))
+    .then(|| sources.get(site))
+    .flatten()
+    .and_then(|pair| {
+        let (old, new) = pair.parse_pair(crate::language::LangId::Rust)?;
+        super::rust_ref_sites::ModuleFunctions::from_root(old.root_node(), &pair.old)?
+            .prove(site.name, site.old_sig)?;
+        super::rust_ref_sites::ModuleFunctions::from_root(new.root_node(), &pair.new)?
+            .prove(site.name, site.new_sig)
+    });
     // 全 cross-file 参照が同一 diff 内で追随済みなら informational
     if is_modified_closed_in_diff(
         ModifiedClosureInput {
@@ -1105,6 +1117,7 @@ fn closure_or_blocking_decision(
             arg_evidence,
             public_name_differs,
             js_direct_function_change,
+            rust_module_function_change,
         },
         caches,
     ) {

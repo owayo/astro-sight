@@ -647,6 +647,7 @@ mod removed_ffi;
 mod removed_scope;
 
 mod rust_public;
+mod rust_ref_sites;
 
 mod source_pair;
 
