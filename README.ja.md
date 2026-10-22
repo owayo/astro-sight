@@ -86,7 +86,7 @@ winget install owayo.astro-sight
 
 ### Cargo
 
-Rust 1.98 以上が必要です。
+Rust 1.99 以上が必要です。
 
 ```bash
 cargo install --git https://github.com/owayo/astro-sight --locked
@@ -118,6 +118,8 @@ make install
 ```
 
 `make install` は `/usr/local/bin` に入れます。場所を変えるときは `INSTALL_PATH` を指定します (例: `make install INSTALL_PATH="$HOME/.local/bin"`)。
+
+インストール後は `astro-sight --version` を確認します。`command -v astro-sight` が mise の shim を指す場合は、`mise which astro-sight` で更新対象の実体を確認できます。詳しくは [インストール後の確認](docs/development.ja.md#ci-と同じ検査) を参照してください。
 <!-- standard:install:end -->
 
 `winget install` の後は新しいターミナルを開いてください。portable パッケージは PATH を書き換えて `astro-sight` を通すので、開いていたターミナルには反映されません。musl 版は glibc を使わない静的リンクのバイナリで、Alpine のように glibc が無い環境や、glibc が古い Docker イメージで使えます。

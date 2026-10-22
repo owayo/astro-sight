@@ -76,20 +76,20 @@ where
     })
 }
 
-enum ReadLine {
+enum ReadLine<'a> {
     Eof,
-    Line(String),
+    Line(&'a str),
     Oversized(usize),
     /// 行は読み切った (consume 済み) が UTF-8 として不正。巨大行・不正 JSON と同じく
     /// その行だけ `INVALID_REQUEST` を返して続行する (セッション全体を落とさない)。
     InvalidUtf8(std::str::Utf8Error),
 }
 
-fn read_line_limited<R: BufRead>(
+fn read_line_limited<'a, R: BufRead>(
     reader: &mut R,
     max_line_size: usize,
-    scratch: &mut Vec<u8>,
-) -> io::Result<ReadLine> {
+    scratch: &'a mut Vec<u8>,
+) -> io::Result<ReadLine<'a>> {
     scratch.clear();
     let mut total_bytes = 0usize;
 
@@ -135,7 +135,8 @@ fn read_line_limited<R: BufRead>(
     }
 
     match std::str::from_utf8(scratch) {
-        Ok(line) => Ok(ReadLine::Line(line.to_owned())),
+        // 次の行まで scratch を借り、上限付近の入力をもう一度コピーしない。
+        Ok(line) => Ok(ReadLine::Line(line)),
         Err(e) => Ok(ReadLine::InvalidUtf8(e)),
     }
 }
@@ -165,7 +166,7 @@ fn run_session_io<R: BufRead, W: Write>(
         let next = read_line_limited(&mut input, max_line_size, &mut scratch)?;
         let value = match next {
             ReadLine::Eof => break,
-            ReadLine::Line(line) => process_line(&line, max_line_size, &handler),
+            ReadLine::Line(line) => process_line(line, max_line_size, &handler),
             ReadLine::Oversized(actual) => Some(make_error(
                 "INVALID_REQUEST",
                 format!(
@@ -366,5 +367,31 @@ mod tests {
             ReadLine::Line(line) => assert_eq!(line, "{}"),
             _ => panic!("line should be parsed"),
         }
+    }
+
+    #[test]
+    fn read_line_limited_reuses_buffer_across_fragmented_utf8_and_eof() {
+        let mut input = io::BufReader::with_capacity(1, io::Cursor::new("abé\r\n終"));
+        let mut scratch = Vec::with_capacity(16);
+        let buffer_ptr = scratch.as_ptr();
+
+        match read_line_limited(&mut input, 5, &mut scratch).unwrap() {
+            ReadLine::Line(line) => {
+                assert_eq!(line, "abé");
+                assert_eq!(line.as_ptr(), buffer_ptr, "読み込み済みの行をコピーしない");
+            }
+            _ => panic!("上限ちょうどの UTF-8 行を受け付けること"),
+        }
+        match read_line_limited(&mut input, 3, &mut scratch).unwrap() {
+            ReadLine::Line(line) => {
+                assert_eq!(line, "終");
+                assert_eq!(line.as_ptr(), buffer_ptr, "次の行でも同じ領域を使う");
+            }
+            _ => panic!("改行なしの最終行を受け付けること"),
+        }
+        assert!(matches!(
+            read_line_limited(&mut input, 3, &mut scratch).unwrap(),
+            ReadLine::Eof
+        ));
     }
 }

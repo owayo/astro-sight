@@ -736,7 +736,10 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             member_path_id,
             jsx_shape_id,
             unproven_module_ref,
-            rust_value_binding: lexical_binding == LexicalBinding::RustValueBinding,
+            rust_value_binding: lexical_binding == LexicalBinding::RustValueBinding
+                || (lexical_binding == LexicalBinding::RustMacroValueBinding
+                    && self.rust_path_owner_enabled
+                    && self.rust_path_owner_project.allows_macro_value_bindings()),
             python_import_owner_id,
             rust_owner_path_id,
             rust_owner_is_free_function,

@@ -342,7 +342,7 @@ fn import_role_at(node: tree_sitter::Node<'_>, source: &[u8], bare: &str) -> Ref
                 let aliased = parent.named_children(&mut cursor).any(|child| {
                     child.kind() == "import_alias"
                         && !node_within(node, child)
-                        && child.named_child(0).is_none_or(&alias_differs)
+                        && child.named_child(0).is_none_or(alias_differs)
                 });
                 return if aliased {
                     RefImportRole::Aliased

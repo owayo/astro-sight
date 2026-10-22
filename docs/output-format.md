@@ -54,7 +54,7 @@ The same content in JSON looks like this. TOON saves the key names that JSON rep
 {"path":"src/main.rs","lang":"rust","symbols":[{"name":"MAX","kind":"const","ln":0},{"name":"alpha","kind":"fn","ln":1,"cx":2},{"name":"beta","kind":"fn","ln":4,"cx":1}]}
 ```
 
-The encoder in `src/output/toon/` targets **TOON v4.1** with a comma delimiter and two-space indentation. The Rust `toon-format` 0.5.0 crate still targets v3, so it cannot meet the v4.1 encoder requirements. An empty root array is `[]`, and a named empty array is `items: []`.
+The encoder in `src/output/toon/` targets **TOON v4.1** with a comma delimiter and two-space indentation. The Rust `toon-format` 0.7.0 crate supports v4.4, but still enables `serde_json/preserve_order` unconditionally. Its streaming helpers parse the entire input before encoding. The migration requirements therefore remain unmet; the current encoder keeps bounded-memory list-item output and the existing JSON byte contract. An empty root array is `[]`, and a named empty array is `items: []`.
 
 Single and batch output can be checked with the official `@toon-format/toon` v4.1 strict decoder. Install it outside the repository and set `TOON_REFERENCE_DIR` to that directory when running `cargo test toon_v41_documents_and_batches_decode_with_the_reference_implementation`. No newline is added at the end of a TOON document (JSON / NDJSON end with a newline). How much TOON saves depends on the content; use `--format auto` to choose the format automatically.
 

@@ -28,6 +28,10 @@ make install SKILL_TARGETS=claude    # Claude Code のスキルだけ入れる
 
 `make uninstall` はバイナリだけを消し、書き込んだスキルは残す。
 
+インストール後は `command -v astro-sight` と `astro-sight --version` で実行先と版を確認する。mise の shim が選ばれる場合は `mise which astro-sight` で実体が分かる。既定の `/usr/local/bin` より別のコピーが優先されていたら、実体のあるディレクトリを `INSTALL_PATH` に指定する。たとえば `make install INSTALL_PATH="$HOME/.cargo/bin"` とする。shim 自体は置き換えない。
+
+Bash・Swift・TypeScript の文法には独自修正がある。依存更新でその修正が外れないよう、依存の版を vendor 内のパッケージの版と完全一致させている。文法と回帰テストは一緒に更新する。Kotlin は新しい版が互換性のない tree-sitter を要求するため、0.3.5 を維持する。
+
 ## ヒーププロファイル
 
 `dhat-heap` feature を付けて実行すると、ヒープの内訳を作業ディレクトリの `dhat-heap.json` に書き出す。巨大なリポジトリでメモリの内訳を測るときに使う。

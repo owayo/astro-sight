@@ -702,15 +702,32 @@ fn toon_v41_documents_and_batches_decode_with_the_reference_implementation() {
         vec!["refs", "--names", "alpha,gamma", "--dir", "."],
         vec!["imports", "--path", "a.rs"],
         vec!["calls", "--path", "a.rs"],
+        vec!["ast", "--path", "a.rs", "--depth", "4"],
+        vec!["ast", "--path", "a.rs", "--full"],
+        vec!["sequence", "--path", "a.rs", "--function", "beta"],
+        vec!["symbols", "--paths", "a.rs,missing.rs,b.rs"],
+        vec!["ast", "--paths", "a.rs,missing.rs,b.rs"],
+        vec!["calls", "--paths", "a.rs,missing.rs,b.rs"],
+        vec!["imports", "--paths", "a.rs,missing.rs,b.rs"],
+        vec!["sequence", "--paths", "a.rs,missing.rs,b.rs"],
+        vec!["symbols", "--path", "a.rs", "--pretty"],
+        vec!["refs", "--name", "alpha", "--dir", "."],
+        vec!["refs", "--name", "absent", "--dir", "."],
     ] {
+        let is_batch = args.contains(&"--paths")
+            || args.contains(&"--names")
+            || (args[0] == "symbols" && args.contains(&"--dir"));
         let mut toon_args = args.clone();
         toon_args.extend(["--format", "toon"]);
         let text = stdout_of(&run(&repo, &toon_args));
         let json = stdout_of(&run(&repo, &args));
-        let expected: Vec<serde_json::Value> = json
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+        let expected: Vec<serde_json::Value> = if is_batch {
+            json.lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        } else {
+            vec![serde_json::from_str(&json).unwrap()]
+        };
         let decoded = reference_dir.as_ref().map(|dir| {
             use std::io::Write;
             let mut child = std::process::Command::new("node")
@@ -735,13 +752,13 @@ fn toon_v41_documents_and_batches_decode_with_the_reference_implementation() {
             serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
         });
         if let Some(decoded) = &decoded {
-            if args.contains(&"--dir") || args.contains(&"--paths") || args.contains(&"--names") {
+            if is_batch {
                 assert_json_content(decoded, &serde_json::Value::Array(expected.clone()));
             } else {
                 assert_json_content(decoded, &expected[0]);
             }
         }
-        if args.contains(&"--dir") || args.contains(&"--paths") || args.contains(&"--names") {
+        if is_batch {
             assert!(
                 text.starts_with(&format!("[{}]:", expected.len()))
                     || (expected.is_empty() && text == "[]"),

@@ -28,6 +28,10 @@ make install SKILL_TARGETS=claude    # the Claude Code skill only
 
 `make uninstall` removes only the binary and keeps the skills it wrote.
 
+After an install, check `command -v astro-sight` and `astro-sight --version`. If a mise shim is selected, `mise which astro-sight` shows the actual executable. A different copy can take precedence over the default `/usr/local/bin` installation. Set `INSTALL_PATH` to the directory containing the selected executable, for example `make install INSTALL_PATH="$HOME/.cargo/bin"`; do not replace the shim itself.
+
+The Bash, Swift, and TypeScript grammars have local patches. Their dependency versions match the vendored package versions exactly so a dependency update cannot silently bypass the patches. Update each grammar and its regression tests together. Kotlin 0.3.5 remains pinned because newer releases require an incompatible tree-sitter runtime.
+
 ## Heap Profiling
 
 With the `dhat-heap` feature, a run writes a breakdown of the heap to `dhat-heap.json` in the working directory. Use it to measure where memory goes on a large repository.

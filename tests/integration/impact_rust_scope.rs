@@ -406,7 +406,6 @@ fn impact_rust_scope_keeps_actual_calls_and_unproven_positions() {
             "fn f() {\n let comments = 1;\n crate::api::comments();\n}",
             3,
         ),
-        ("fn f() {\n let comments = 1;\n dbg!(comments);\n}", 3),
         (
             "fn f() {\n let comments = 1;\n for value in values { comments(); }\n}",
             3,
@@ -493,4 +492,159 @@ fn impact_rust_scope_original_local_declaration_is_not_a_caller() {
             .is_empty(),
         "{review}"
     );
+}
+
+#[test]
+fn impact_rust_scope_macro_arguments_exclude_only_proven_local_values() {
+    for source in [
+        "pub fn f() { let comments = 1; println!(\"{}\", comments); }",
+        "pub fn f(comments: u8) { eprintln!(\"{}\", comments); }",
+        "pub fn f() { let r#comments = 1; print!(\"{}\", r#comments); }",
+        "pub fn f() { let comments = 1; let text = format!(\"{}\", comments); }",
+        "pub fn f() { let comments = 1; dbg!(comments); }",
+        "pub fn f() { let comments = 1; println!(\"{}\", /* before */ comments /* after */,); }",
+    ] {
+        let repo = rust_scope_repo(source);
+        let context = repo.run_json("context", &["--git"]);
+        assert!(
+            context["changes"][0]["impacted_callers"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "{source}: {context}"
+        );
+        let output = cargo_bin()
+            .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{source}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let refs = repo.run_json("refs", &["--name", "comments"]);
+        assert_eq!(
+            refs["refs"].as_array().unwrap().len(),
+            3,
+            "{source}: {refs}"
+        );
+        let dead = repo.run_json("dead-code", &[]);
+        assert!(
+            !dead["dead_symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol["name"] == "comments"),
+            "{dead}"
+        );
+
+        repo.write(
+            "consumer.rs",
+            format!(
+                "{source}\npub fn actual() {{ println!(\"{{}}\", crate::api::comments()); }}\n"
+            ),
+        );
+        let context = repo.run_json("context", &["--git"]);
+        assert!(
+            context["changes"][0]["impacted_callers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|caller| caller["path"] == "consumer.rs" && caller["line"] == 1),
+            "{context}"
+        );
+    }
+}
+
+#[test]
+fn impact_rust_scope_macro_arguments_keep_unproven_syntax_and_macro_origins() {
+    for (source, extra) in [
+        ("pub fn f() { println!(\"{}\", comments()); }", ""),
+        (
+            "pub fn f() { println!(\"{}\", comments); let comments = 1; }",
+            "",
+        ),
+        (
+            "pub fn f() { let comments = 1; println!(\"{}\", comments); let broken = ; }",
+            "",
+        ),
+        ("pub fn f() { let comments = 1; custom!(comments); }", ""),
+        (
+            "pub fn f() { let comments = 1; outer!(println!(\"{}\", comments)); }",
+            "",
+        ),
+        (
+            "pub fn f() { let comments = 1; println!(\"{}\", comments); }",
+            "gen!();",
+        ),
+        (
+            "pub fn f() { let comments = 1; println!(\"{}\", comments); }",
+            "macro_rules! shadow { () => { macro_rules! println { ($f:expr, $i:ident) => { crate::api::$i() } } } } shadow!();",
+        ),
+        (
+            "pub fn f() { let comments = 1; println!(\"{}\", object.comments); }",
+            "",
+        ),
+        (
+            "pub fn f() { let comments = 1; println!(\"{}\", crate::api::comments()); }",
+            "",
+        ),
+        (
+            "pub fn f() { let comments = 1; println!(\"{}\", (comments)); }",
+            "",
+        ),
+        (
+            "pub fn f() { let comments = 1; println!(\"{}\", comments()); }",
+            "",
+        ),
+        (
+            "pub fn f() { let comments = crate::api::comments; println!(\"{:?}\", comments); }",
+            "",
+        ),
+        (
+            "pub fn f() { let comments = 1; unknown!(); println!(\"{}\", comments); }",
+            "",
+        ),
+        (
+            "macro_rules! println { ($x:expr, $i:ident) => { crate::api::$i() }; } pub fn f() { let comments = 1; println!(\"{}\", comments); }",
+            "",
+        ),
+        (
+            "use external::other as println; pub fn f() { let comments = 1; println!(\"{}\", comments); }",
+            "",
+        ),
+        (
+            "use external::*; pub fn f() { let comments = 1; println!(\"{}\", comments); }",
+            "",
+        ),
+        (
+            "pub fn f() { let comments = 1; println!(\"{}\", comments); }",
+            "#[macro_export] macro_rules! println { ($x:expr, $i:ident) => { crate::api::$i() }; }",
+        ),
+        (
+            "pub fn f() { let comments = 1; println!(\"{}\", comments); }",
+            "use external::other as println;",
+        ),
+        (
+            "pub fn f() { let comments = 1; println!(\"{}\", comments); }",
+            "macro_rules! r#println { ($x:expr, $i:ident) => { crate::api::$i() }; }",
+        ),
+        (
+            "pub fn f() { let comments = 1; println!(\"{}\", comments); }",
+            "use external::Custom as Debug; #[derive(Debug)] struct Value;",
+        ),
+    ] {
+        let repo = rust_scope_repo(source);
+        if !extra.is_empty() {
+            repo.write("macros.rs", extra);
+        }
+        let context = repo.run_json("context", &["--git"]);
+        assert!(
+            context["changes"][0]["impacted_callers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|caller| caller["path"] == "consumer.rs"),
+            "{source} / {extra}: {context}"
+        );
+    }
 }

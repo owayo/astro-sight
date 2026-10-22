@@ -37,6 +37,7 @@ struct BlockFacts {
     /// 宣言順の開始位置。参照ごとに前方の文を走査しない。
     lets: HashMap<String, Vec<LetBinding>>,
     barrier: bool,
+    non_expression_macro_barrier: bool,
 }
 
 struct LetBinding {
@@ -168,6 +169,15 @@ impl RustScopeIndex {
                 continue;
             }
             // item/use は block 全体へ巻き上がる。文マクロも未知の再束縛を生成し得る。
+            let invocation = if statement.kind() == "macro_invocation" {
+                Some(statement)
+            } else if statement.kind() == "expression_statement" {
+                statement
+                    .named_child(0)
+                    .filter(|child| child.kind() == "macro_invocation")
+            } else {
+                None
+            };
             if statement.kind().ends_with("_item")
                 || matches!(
                     statement.kind(),
@@ -179,6 +189,12 @@ impl RustScopeIndex {
                         .is_some_and(|child| child.kind() == "macro_invocation"))
             {
                 facts.barrier = true;
+                if attributed
+                    || !invocation
+                        .is_some_and(|node| is_value_expression_macro_invocation(node, source))
+                {
+                    facts.non_expression_macro_barrier = true;
+                }
             }
             if statement.kind() == "let_declaration"
                 && let Some(pattern) = statement.child_by_field_name("pattern")
@@ -186,6 +202,7 @@ impl RustScopeIndex {
                 let (_, pattern_has_macro) = subtree_names(pattern, source);
                 if attributed || pattern_has_macro {
                     facts.barrier = true;
+                    facts.non_expression_macro_barrier = true;
                 }
                 // 複数の束縛があっても初期化子は一度だけ走査する。
                 let rhs_names = statement
@@ -229,6 +246,8 @@ impl RustScopeIndex {
             return LexicalBinding::Unknown;
         };
         let name = binding_name(name);
+        let macro_argument = is_lone_expression_macro_argument(node, source);
+        let mut requires_macro_validation = macro_argument;
         let mut proven = pattern_position;
         let mut child = node;
         while let Some(parent) = child.parent() {
@@ -236,8 +255,7 @@ impl RustScopeIndex {
                 || ITEM_BOUNDARIES.contains(&parent.kind())
                 || matches!(
                     parent.kind(),
-                    "token_tree"
-                        | "attribute_item"
+                    "attribute_item"
                         | "type_arguments"
                         | "type_binding"
                         | "scoped_identifier"
@@ -245,6 +263,11 @@ impl RustScopeIndex {
                 )
                 || field_contains(parent, "type", node)
                 || field_contains(parent, "return_type", node)
+                || (parent.kind() == "token_tree"
+                    && !(macro_argument
+                        && node
+                            .parent()
+                            .is_some_and(|direct| direct.id() == parent.id())))
             {
                 return LexicalBinding::Unknown;
             }
@@ -275,7 +298,10 @@ impl RustScopeIndex {
                         return LexicalBinding::Unknown;
                     };
                     if facts.barrier {
-                        return LexicalBinding::Unknown;
+                        if facts.non_expression_macro_barrier {
+                            return LexicalBinding::Unknown;
+                        }
+                        requires_macro_validation = true;
                     }
                     if let Some(bindings) = facts.lets.get(name) {
                         let latest =
@@ -305,7 +331,9 @@ impl RustScopeIndex {
                     {
                         proven = true;
                     }
-                    return if proven {
+                    return if proven && requires_macro_validation {
+                        LexicalBinding::RustMacroValueBinding
+                    } else if proven {
                         LexicalBinding::RustValueBinding
                     } else {
                         LexicalBinding::Unknown
@@ -317,6 +345,93 @@ impl RustScopeIndex {
         }
         LexicalBinding::Unknown
     }
+}
+
+pub(crate) fn is_value_expression_macro(name: &str) -> bool {
+    matches!(
+        name,
+        "print"
+            | "println"
+            | "eprint"
+            | "eprintln"
+            | "format"
+            | "format_args"
+            | "write"
+            | "writeln"
+            | "panic"
+            | "unreachable"
+            | "todo"
+            | "unimplemented"
+            | "assert"
+            | "assert_eq"
+            | "assert_ne"
+            | "debug_assert"
+            | "debug_assert_eq"
+            | "debug_assert_ne"
+            | "dbg"
+            | "vec"
+    )
+}
+
+fn is_value_expression_macro_invocation(node: Node<'_>, source: &[u8]) -> bool {
+    node.child_by_field_name("macro").is_some_and(|name| {
+        name.kind() == "identifier" && name.utf8_text(source).is_ok_and(is_value_expression_macro)
+    })
+}
+
+/// 全引数が単独の識別子かリテラルの場合だけ扱う。型引数・パターン・名前付き引数を
+/// token tree のカンマだけで式と誤認しない。入れ子や呼び出しは従来の候補へ残す。
+fn is_lone_expression_macro_argument(node: Node<'_>, source: &[u8]) -> bool {
+    if node.kind() != "identifier" {
+        return false;
+    }
+    let Some(tokens) = node.parent().filter(|parent| parent.kind() == "token_tree") else {
+        return false;
+    };
+    let Some(invocation) = tokens
+        .parent()
+        .filter(|parent| parent.kind() == "macro_invocation")
+    else {
+        return false;
+    };
+    if !is_value_expression_macro_invocation(invocation, source) {
+        return false;
+    }
+    let is_vec = invocation
+        .child_by_field_name("macro")
+        .and_then(|name| name.utf8_text(source).ok())
+        == Some("vec");
+    let mut expect_value = true;
+    let mut found = false;
+    let mut cursor = tokens.walk();
+    for child in tokens.children(&mut cursor) {
+        if matches!(child.kind(), "line_comment" | "block_comment")
+            || child.start_byte() == tokens.start_byte()
+            || child.end_byte() == tokens.end_byte()
+        {
+            continue;
+        }
+        if expect_value {
+            if child.kind() != "identifier"
+                && !matches!(
+                    child.kind(),
+                    "string_literal"
+                        | "raw_string_literal"
+                        | "integer_literal"
+                        | "float_literal"
+                        | "boolean_literal"
+                        | "char_literal"
+                )
+            {
+                return false;
+            }
+            found |= child.id() == node.id();
+        } else if child.kind() != "," && !(is_vec && child.kind() == ";") {
+            return false;
+        }
+        expect_value = !expect_value;
+    }
+    found
 }
 
 fn field_contains(parent: Node<'_>, field: &str, node: Node<'_>) -> bool {
@@ -476,7 +591,6 @@ mod tests {
             "fn f(#[cfg(feature=\"x\")] /* note */ comments: u8) { comments(); }",
             "fn f() { let comments = 1; create_binding!(); comments(); }",
             "fn f() { let comments = 1; comments!(); }",
-            "fn f() { let comments = 1; dbg!(comments); }",
             "fn f() { let comments = 1; crate::api::comments(); }",
             "fn f() { let comments = 1; self::comments(); }",
             "fn f() { let comments = 1; object.comments(); }",
@@ -501,6 +615,33 @@ mod tests {
             "fn f() { let comments = 1; let pattern!() = value; comments(); }",
             "fn f() { let comments = crate::api::r#comments; comments(); }",
             "fn f() { let r#comments = crate::api::comments; comments(); }",
+        ] {
+            assert_eq!(resolve_last(source), LexicalBinding::Unknown, "{source}");
+        }
+    }
+
+    #[test]
+    fn rust_scope_macro_arguments_require_project_validation_and_simple_values() {
+        for source in [
+            "fn f() { let comments = 1; println!(\"{}\", comments); }",
+            "fn f(comments: u8) { dbg!(comments); }",
+            "fn f() { let comments = 1; let s = format!(\"{}\", comments); }",
+            "fn f() { let comments = 1; vec![comments; 3]; }",
+        ] {
+            assert_eq!(
+                resolve_last(source),
+                LexicalBinding::RustMacroValueBinding,
+                "{source}"
+            );
+        }
+        for source in [
+            "fn f() { let comments = 1; println!(\"{}\", (comments)); }",
+            "fn f() { let comments = 1; println!(\"{}\", comments()); }",
+            "fn f() { let comments = 1; println!(\"{}\", object.comments); }",
+            "fn f() { let comments = 1; println!(\"{}\", crate::api::comments); }",
+            "fn f() { let comments = 1; println!(\"{}\", f::<A, comments, B>()); }",
+            "fn f() { let comments = 1; custom!(comments); }",
+            "fn f() { let comments = 1; std::println!(\"{}\", comments); }",
         ] {
             assert_eq!(resolve_last(source), LexicalBinding::Unknown, "{source}");
         }
@@ -584,6 +725,12 @@ mod tests {
                 "if_expression",
                 "while_expression",
                 "closure_expression",
+                "string_literal",
+                "raw_string_literal",
+                "integer_literal",
+                "float_literal",
+                "boolean_literal",
+                "char_literal",
             ])
         {
             tree_sitter::Query::new(&language, &format!("({kind}) @node"))

@@ -153,9 +153,18 @@ fn is_stale_generation_dir(name: &str, current: &str) -> bool {
     if name == current {
         return false;
     }
-    let is_generation = name
-        .strip_prefix('v')
-        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+    let is_generation = name.strip_prefix('v').is_some_and(|version| {
+        // 公開版が作る vMAJOR.MINOR.PATCH だけを認め、バックアップなどは残す。
+        let mut parts = version.split('.');
+        (0..3).all(|_| {
+            parts.next().is_some_and(|part| {
+                !part.is_empty()
+                    && part.bytes().all(|b| b.is_ascii_digit())
+                    && (part.len() == 1 || !part.starts_with('0'))
+                    && part.parse::<u64>().is_ok()
+            })
+        }) && parts.next().is_none()
+    });
     let is_legacy_shard = name.len() == 2
         && name
             .bytes()
@@ -270,7 +279,16 @@ mod tests {
     fn stale_generation_dirs_are_identified_conservatively() {
         let current = "v26.9.100";
         // 消す: 旧世代 + 世代分離前のフラットな hex シャード
-        for name in ["v26.8.111", "v1.0.0", "00", "ff", "a3", "9c"] {
+        for name in [
+            "v26.8.111",
+            "v1.0.0",
+            "v0.0.0",
+            "v18446744073709551615.0.0",
+            "00",
+            "ff",
+            "a3",
+            "9c",
+        ] {
             assert!(
                 is_stale_generation_dir(name, current),
                 "{name} は旧世代として削除対象のはず"
@@ -284,6 +302,19 @@ mod tests {
             "vendor",
             "v",
             "version-notes",
+            "v1-notes",
+            "v1.backup",
+            "v26.10.115-backup",
+            "v26.10.115.1",
+            "v26.10",
+            "v26..115",
+            "v26.10.115-beta.1",
+            "v26.10.115+build",
+            "v026.10.115",
+            "v26.010.115",
+            "v26.10.+115",
+            "v26.10.１２３",
+            "v26.10.18446744073709551616",
             "README",
             "0",
             "000",
@@ -314,12 +345,48 @@ mod tests {
         assert!(!root.join("00").exists(), "旧フラットシャードは消えるべき");
     }
 
+    #[test]
+    fn collect_stale_generations_keeps_version_like_user_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let current = "v26.10.115";
+        let preserved = [
+            current,
+            "v1-notes",
+            "v1.backup",
+            "v26.10.115-backup",
+            "v26.10.114.1",
+            "v26.10.114-beta.1",
+            "v26.10.114+build",
+            "v026.10.114",
+        ];
+        let removed = ["v0.0.0", "v26.10.114", "v26.10.116", "v1.2.3", "00", "ff"];
+        for name in preserved.iter().chain(&removed) {
+            fs::create_dir(root.join(name)).unwrap();
+            fs::write(root.join(name).join("entry.json"), b"keep contents").unwrap();
+        }
+
+        collect_stale_generations_in(root, current);
+
+        for name in preserved {
+            assert_eq!(
+                fs::read(root.join(name).join("entry.json")).unwrap(),
+                b"keep contents",
+                "{name} の内容を消してはならない"
+            );
+        }
+        for name in removed {
+            assert!(!root.join(name).exists(), "{name} は旧キャッシュとして消す");
+        }
+    }
+
     /// キャッシュ本体はバージョン別ディレクトリに入る (世代 GC が効く前提)。
     #[test]
     fn cache_dir_is_namespaced_by_version() {
         let dir = cache_dir();
         let generation = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
         assert_eq!(generation, current_generation());
+        assert!(is_stale_generation_dir(generation, "not-current"));
         assert_eq!(dir.parent().map(|p| p.to_path_buf()), Some(cache_root()));
     }
 }

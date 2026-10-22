@@ -14,6 +14,10 @@ allowed-tools: Bash(astro-sight:*)
 
 tree-sitter AST-based code structure CLI. The primary **Grep replacement for code identifiers** (`refs`), plus diff review (`review`), impact analysis (`context` / `impact`), dead-code detection, and structural queries. Output defaults to compact JSON, with TOON and automatic token-size selection available on data commands.
 
+## 更新後の版確認
+
+更新後も以前の検出が残るときは、`command -v astro-sight` と `astro-sight --version` で実行先と版を確認する。mise の shim が選ばれる場合は `mise which astro-sight` で実体を調べる。`make install` の既定の配置先と実行先が違うときは、実体のあるディレクトリを `INSTALL_PATH` に指定してインストールする。
+
 ## When to Use (Decision Checklist)
 
 **Immediately before every Grep call, ask: "Does my search contain code identifiers?"** If yes → astro-sight, not Grep. Classify the search pattern itself; do not infer from the file type or the surrounding task.

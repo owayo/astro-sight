@@ -124,6 +124,7 @@ pub(super) struct RustPathOwnerProjectProof {
     private_scope_sources: OnceLock<bool>,
     reexport_sources: OnceLock<bool>,
     safe_private_import_environment: OnceLock<bool>,
+    safe_macro_value_environment: OnceLock<bool>,
     no_source_inclusion: OnceLock<bool>,
     no_glob_imports: OnceLock<bool>,
     module_wiring_unchanged: bool,
@@ -173,6 +174,7 @@ impl RustPathOwnerProjectProof {
             private_scope_sources: OnceLock::new(),
             reexport_sources: OnceLock::new(),
             safe_private_import_environment: OnceLock::new(),
+            safe_macro_value_environment: OnceLock::new(),
             no_source_inclusion: OnceLock::new(),
             no_glob_imports: OnceLock::new(),
             module_wiring_unchanged,
@@ -228,6 +230,69 @@ impl RustPathOwnerProjectProof {
         *self
             .safe_private_import_environment
             .get_or_init(|| scan_safe_private_import_environment(&self.root))
+    }
+
+    pub(super) fn allows_macro_value_bindings(&self) -> bool {
+        *self.safe_macro_value_environment.get_or_init(|| {
+            let mut shadowable_attributes = HashSet::new();
+            let mut other_bindings = HashSet::new();
+            let safe = scan_safe_source_environment(&self.root, |source| {
+                if source_defines_allowed_macro(source) || source_may_include_elsewhere(source) {
+                    return true;
+                }
+                let Ok(tree) = parser::parse_source(source, LangId::Rust) else {
+                    return true;
+                };
+                let root = tree.root_node();
+                if root.has_error() {
+                    return true;
+                }
+                let mut pending = vec![root];
+                while let Some(node) = pending.pop() {
+                    if node.is_missing() || node.kind() == "extern_crate_declaration" {
+                        return true;
+                    }
+                    if matches!(node.kind(), "attribute_item" | "inner_attribute_item") {
+                        let Some(names) = super::rust_std_origin::safe_attribute(node, source)
+                        else {
+                            return true;
+                        };
+                        shadowable_attributes.extend(names);
+                    }
+                    if node.kind() == "macro_definition" {
+                        let Some(name) = node
+                            .child_by_field_name("name")
+                            .and_then(|name| name.utf8_text(source).ok())
+                        else {
+                            return true;
+                        };
+                        let name = name.strip_prefix("r#").unwrap_or(name);
+                        if crate::engine::rust_scope::is_value_expression_macro(name) {
+                            return true;
+                        }
+                        other_bindings.insert(name.to_owned());
+                    }
+                    if node.kind() == "use_declaration" {
+                        let Ok(text) = node.utf8_text(source) else {
+                            return true;
+                        };
+                        if text.contains('*') {
+                            return true;
+                        }
+                        for token in text.split(|ch: char| !ch.is_alphanumeric() && ch != '_') {
+                            if crate::engine::rust_scope::is_value_expression_macro(token) {
+                                return true;
+                            }
+                            other_bindings.insert(token.to_owned());
+                        }
+                    }
+                    let mut cursor = node.walk();
+                    pending.extend(node.named_children(&mut cursor));
+                }
+                false
+            });
+            safe && shadowable_attributes.is_disjoint(&other_bindings)
+        })
     }
 
     /// A leaf module has no other source file in its privacy subtree. A
@@ -1216,6 +1281,15 @@ fn source_defines_allowed_macro(source: &[u8]) -> bool {
 /// Direct-import evidence can cross workspace members, but only when no
 /// source in the repository can place the same file in another module.
 fn scan_safe_private_import_environment(root: &Path) -> bool {
+    scan_safe_source_environment(root, |source| {
+        source_defines_allowed_macro(source) || source_may_include_elsewhere(source)
+    })
+}
+
+fn scan_safe_source_environment(
+    root: &Path,
+    mut source_is_uncertain: impl FnMut(&[u8]) -> bool,
+) -> bool {
     let Ok(root) = root.canonicalize() else {
         return false;
     };
@@ -1272,9 +1346,7 @@ fn scan_safe_private_import_environment(root: &Path) -> bool {
                     let Some(source) = read_input_file(&entry.path()) else {
                         return false;
                     };
-                    if source_defines_allowed_macro(&source)
-                        || source_may_include_elsewhere(&source)
-                    {
+                    if source_is_uncertain(&source) {
                         return false;
                     }
                 }
