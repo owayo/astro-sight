@@ -54,7 +54,7 @@ symbols[3]{name,kind,ln,cx}:
 {"path":"src/main.rs","lang":"rust","symbols":[{"name":"MAX","kind":"const","ln":0},{"name":"alpha","kind":"fn","ln":1,"cx":2},{"name":"beta","kind":"fn","ln":4,"cx":1}]}
 ```
 
-`src/output/toon/` のエンコーダは **TOON v4.1** に対応し、comma 区切り・2 スペースのインデントで符号化する。Rust の `toon-format` 0.5.0 は v3 形式を出すため採用しない。ルートの空配列は `[]`、名前付きの空配列は `items: []` となる。
+`src/output/toon/` のエンコーダは **TOON v4.1** に対応し、comma 区切り・2 スペースのインデントで符号化する。Rust の `toon-format` 0.7.0 は v4.4 に対応したが、`serde_json/preserve_order` は引き続き必須で、streaming helper も入力全体を読み込んでから符号化する。移行条件を満たしていないため、要素単位で出力する現在の実装と既存 JSON のバイト列を維持する。ルートの空配列は `[]`、名前付きの空配列は `items: []` となる。
 
 単一出力・バッチ出力は、公式 `@toon-format/toon` v4.1 の strict decoder で確認できる。リポジトリ外に同パッケージを入れ、`TOON_REFERENCE_DIR` にそのディレクトリを指定して `cargo test toon_v41_documents_and_batches_decode_with_the_reference_implementation` を実行する。文書末尾に改行は付けない（JSON / NDJSON は改行で終わる）。削減率は内容によって異なり、形式を自動選択する場合は `--format auto` を使う。
 

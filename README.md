@@ -86,7 +86,7 @@ winget install owayo.astro-sight
 
 ### Cargo
 
-Requires Rust 1.98 or later.
+Requires Rust 1.99 or later.
 
 ```bash
 cargo install --git https://github.com/owayo/astro-sight --locked
@@ -118,6 +118,8 @@ make install
 ```
 
 `make install` installs to `/usr/local/bin`. Set `INSTALL_PATH` to change it (for example `make install INSTALL_PATH="$HOME/.local/bin"`).
+
+Check `astro-sight --version` after installing. If `command -v astro-sight` shows a mise shim, `mise which astro-sight` identifies the executable to update; see [installation checks](docs/development.md#same-checks-as-ci).
 <!-- standard:install:end -->
 
 After `winget install`, open a new terminal: the portable package reaches `PATH` by rewriting it, which terminals that were already open do not pick up. The musl archive is a statically linked build for Linux without glibc (Alpine) or with an old glibc (some Docker images).
