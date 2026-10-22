@@ -13,6 +13,97 @@ fn rust_scope_repo(consumer: &str) -> TestRepo {
 }
 
 #[test]
+fn impact_rust_scope_inner_let_with_child_test_glob_preserves_real_calls() {
+    for test_import in ["use super::*;", "use super::first_gap;"] {
+        for actual_call in ["", "crate::jobs::start", "start"] {
+            let repo = TestRepo::new();
+            repo.create_dir_all("src");
+            repo.write(
+                "Cargo.toml",
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            );
+            repo.write("src/lib.rs", "mod jobs;\nmod runs;\n");
+            repo.write("src/jobs.rs", "pub fn start(n: u32) -> u32 {\n n + 1\n}\n");
+            let caller = if actual_call.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "{}pub fn actual() -> u32 {{ {actual_call}(1) }}\n",
+                    if actual_call == "start" {
+                        "use crate::jobs::*;\n"
+                    } else {
+                        ""
+                    }
+                )
+            };
+            repo.write(
+                "src/runs.rs",
+                format!(
+                    r#"pub fn first_gap(values: &[u32]) -> Option<usize> {{
+    let mut cursor = 0;
+    while let Some(offset) = values[cursor..].iter().position(|v| *v == 0) {{
+        let start = cursor + offset;
+        if start > 2 {{
+            return Some(start);
+        }}
+        cursor = start + 1;
+    }}
+    None
+}}
+
+#[cfg(test)]
+mod tests {{
+    {test_import}
+    #[test]
+    fn finds_gap() {{
+        assert_eq!(first_gap(&[1, 1, 1, 0]), Some(3));
+    }}
+}}
+{caller}"#
+                ),
+            );
+            repo.init_git();
+            repo.commit_all("initial");
+            repo.write("src/jobs.rs", "pub fn start(n: u64) -> u64 {\n n + 1\n}\n");
+
+            let context = repo.run_json("context", &["--git"]);
+            let callers = context["changes"][0]["impacted_callers"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            assert!(
+                callers.iter().all(|caller| {
+                    caller["path"] != "src/runs.rs"
+                        || !matches!(caller["line"].as_u64().unwrap(), 3 | 4 | 5 | 7)
+                }),
+                "{test_import}, {actual_call}: {context}"
+            );
+            assert_eq!(
+                callers.iter().any(|caller| caller["path"] == "src/runs.rs"),
+                !actual_call.is_empty(),
+                "{test_import}, {actual_call}: {context}"
+            );
+            let output = cargo_bin()
+                .args([
+                    "review",
+                    "--dir",
+                    repo.root().to_str().unwrap(),
+                    "--git",
+                    "--hook",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(i32::from(!actual_call.is_empty())),
+                "{test_import}, {actual_call}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+#[test]
 fn impact_rust_scope_review_keeps_calls_through_same_named_function_aliases() {
     for (consumer, call_line) in [
         (

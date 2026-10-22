@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **Rust のパターンスコープ内のローカル束縛** — `engine/rust_scope.rs` は `while let` / `if let` / `for` / `match` の内側で通常の `let` に束縛された名前を、その宣言位置と後続の参照で証明する。パターン構文自体の束縛や外側の変数に依存する場合は保留し、マクロ・属性・item 境界・同名関数への代入の既存ガードを維持する。子テストモジュールの glob import の有無で、親関数のローカル変数を変更した自由関数の caller に数えない。`refs` と dead-code の出現契約は変えない。
+
 - **Rust マクロの単純なローカル引数と impact** — `engine/rust_scope.rs` は既知の標準式マクロへ渡す単独の識別子をローカル束縛の候補として記録する。全引数が単独の識別子かリテラルの形だけを扱い、呼び出し・型引数・入れ子・名前付き引数・修飾マクロは証明しない。impact の collector は、解析 root 内の全 Rust ソースと manifest を一度だけ調べ、同名マクロの定義・import、glob、未知の属性やマクロ、外部ソース取り込み、symlink、解析失敗が無い場合にだけ、関数変更への候補から除く。`--staged` では使わない。生成コードや解析 root 外からの注入は解決しない。`refs` と dead-code の出現契約は変えない。
 
 - **Rust の外部ソース取り込み** — `engine/rust_dynamic_source.rs` が `include!`、`path` 属性、`cfg_attr` 内とマクロの token tree 内の取り込みを AST で判定する。空白・コメント・raw identifier に依存せず、FFI の旧ツリー検査と未使用メソッド判定で共有する。文字列と通常属性は取り込みとしない。メタ変数から属性名を生成するマクロの展開は行わない。

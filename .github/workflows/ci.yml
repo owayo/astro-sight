@@ -33,13 +33,13 @@ jobs:
         with:
           persist-credentials: false
 
-      # ツールの版は mise.toml が正。mise 本体は公開から 14 日以上たった最新の版を、署名付きの checksum で
+      # ツールの版は mise.toml が正。mise 本体は公開から 14 日以上たった版を固定し、署名付きの checksum で
       # 確かめて入れる。cache は切る。mise-action のキャッシュは mise の導入済みの印だけを戻し、rustup が
       # 持つツールチェーンと components (clippy / rustfmt) を戻さないため、復元した回だけ
       # 'cargo-clippy' is not installed で落ちる (jdx/mise-action#215)
       - uses: jdx/mise-action@v4
         with:
-          minimum_release_age: 14d
+          version: 2026.10.4 # 2026-10-07 公開。14 日以上経過した版を固定する
           cache: false
 
       # target/ と ~/.cargo のキャッシュ (鍵に rustc の版が入るので、mise.toml の rust を上げると作り直す)
@@ -86,7 +86,7 @@ jobs:
       # 後続のステップへ渡すので、ci.yml と release.yml と手元の make で同じ値になる
       - uses: jdx/mise-action@v4
         with:
-          minimum_release_age: 14d
+          version: 2026.10.4 # 2026-10-07 公開。14 日以上経過した版を固定する
           cache: false
 
       - uses: Swatinem/rust-cache@v2
