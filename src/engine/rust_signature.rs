@@ -417,6 +417,9 @@ fn canonicalize_visit(
     stack: &mut Vec<String>,
     canonical: &mut CanonicalSignature,
 ) -> Option<Walk> {
+    if is_rust_list_trailing_comma(node) {
+        return Some(Walk::Skip);
+    }
     // 引数の束縛に付く `mut` は呼び出し契約ではないので比べない (`is_rust_binding_mut`)。
     if node.kind() == "mutable_specifier" && parent.is_some_and(is_binding_mut_parent) {
         return Some(Walk::Skip);
@@ -569,7 +572,8 @@ fn parseable_signature_source(signature: &str) -> (Vec<u8>, usize) {
     if trimmed.ends_with('{') {
         parseable.extend_from_slice(b" }");
     } else if !trimmed.ends_with(';') && !trimmed.ends_with('}') {
-        parseable.extend_from_slice(b" {}");
+        // ヘッダの末尾が行コメントでも、補う本体をコメントへ取り込まない。
+        parseable.extend_from_slice(b"\n{}");
     }
     (parseable, original_len)
 }
@@ -581,6 +585,86 @@ fn parseable_signature_source(signature: &str) -> (Vec<u8>, usize) {
 /// `*mut T`・参照パターン `&mut x` の `mut` は型の側なので含めない。
 pub(crate) fn is_rust_binding_mut(node: Node<'_>) -> bool {
     node.kind() == "mutable_specifier" && node.parent().is_some_and(is_binding_mut_parent)
+}
+
+/// 引数・型パラメータ・型引数のリストに直接属する省略可能な末尾カンマ。
+/// tuple / macro の token tree / 呼び出し引数は、そのカンマが値や型を変え得るので含めない。
+pub(crate) fn is_rust_list_trailing_comma(node: Node<'_>) -> bool {
+    if node.kind() != "," {
+        return false;
+    }
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    let closing = match parent.kind() {
+        "parameters" => ")",
+        "type_parameters" | "type_arguments" => ">",
+        _ => return false,
+    };
+    let mut sibling = node.next_sibling();
+    while let Some(comment) =
+        sibling.filter(|next| matches!(next.kind(), "line_comment" | "block_comment"))
+    {
+        sibling = comment.next_sibling();
+    }
+    sibling.is_some_and(|next| next.kind() == closing && next.next_sibling().is_none())
+}
+
+/// 表示用 signature を書き換えず、Rust のヘッダのトークンが同じかを比べる。
+pub(crate) fn rust_signature_formatting_equivalent(old: &str, new: &str) -> bool {
+    rust_signature_token_key(old)
+        .zip(rust_signature_token_key(new))
+        .is_some_and(|(old, new)| old == new)
+}
+
+fn rust_signature_token_key(signature: &str) -> Option<Vec<(String, String)>> {
+    let (source, original_len) = parseable_signature_source(signature);
+    let tree = parser::parse_source(&source, LangId::Rust).ok()?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let function = find_function_node(root)?;
+    let mut children = root.walk();
+    if root
+        .named_children(&mut children)
+        .any(|node| !node.is_extra() && node.id() != function.id())
+    {
+        return None;
+    }
+    let end = function
+        .child_by_field_name("body")
+        .map_or(original_len, |body| body.start_byte());
+    // 行ベースの入力が本体まで含む場合は、既存の厳格な本体変更証明に任せる。
+    if end < original_len && signature.get(end..)?.trim() != "{" {
+        return None;
+    }
+    let mut tokens = Vec::new();
+    let flow = walk_preorder(function, Children::All, |node, _| {
+        if node.start_byte() >= end {
+            return ControlFlow::Continue(Walk::Skip);
+        }
+        if node.is_error() || node.is_missing() {
+            return ControlFlow::Break(());
+        }
+        if is_rust_binding_mut(node) || is_rust_list_trailing_comma(node) {
+            return ControlFlow::Continue(Walk::Skip);
+        }
+        if node.child_count() == 0
+            || matches!(
+                node.kind(),
+                "string_literal" | "raw_string_literal" | "char_literal" | "token_tree"
+            )
+        {
+            let Ok(text) = node.utf8_text(&source) else {
+                return ControlFlow::Break(());
+            };
+            tokens.push((node.kind().to_owned(), text.to_owned()));
+            return ControlFlow::Continue(Walk::Skip);
+        }
+        ControlFlow::Continue(Walk::Descend)
+    });
+    flow.is_continue().then_some(tokens)
 }
 
 /// `mutable_specifier` の親から、その `mut` が束縛の指定かを決める。
@@ -610,6 +694,9 @@ pub(crate) fn normalize_rust_parameter_binding_signature(
     start: usize,
     end: usize,
 ) -> Option<String> {
+    if function.has_error() {
+        return None;
+    }
     let parameters = function
         .child_by_field_name("parameters")
         .or_else(|| direct_named_child(function, "parameters"))?;
@@ -620,8 +707,35 @@ pub(crate) fn normalize_rust_parameter_binding_signature(
         }
         ControlFlow::Continue(Walk::Descend)
     });
+    let mut preserve_whitespace = false;
+    let flow = walk_preorder(function, Children::All, |node, _| {
+        if node.start_byte() >= end {
+            return ControlFlow::Continue(Walk::Skip);
+        }
+        if node.is_missing() || node.is_error() {
+            return ControlFlow::Break(());
+        }
+        if matches!(
+            node.kind(),
+            "string_literal"
+                | "raw_string_literal"
+                | "char_literal"
+                | "token_tree"
+                | "line_comment"
+                | "block_comment"
+        ) {
+            preserve_whitespace = true;
+            return ControlFlow::Continue(Walk::Skip);
+        }
+        ControlFlow::Continue(Walk::Descend)
+    });
+    if flow.is_break() {
+        return None;
+    }
 
-    rebuild_without_ranges(source, start, end, &omitted)
+    // リテラル・macro token tree の内部と行コメントの終端は空白にも意味がある。
+    // これらがあるヘッダは表示の空白を保ち、比較用 AST トークン列に整形差を任せる。
+    rebuild_without_ranges(source, start, end, &omitted, preserve_whitespace)
 }
 
 /// unified diff の 1 行シグネチャにも同じ AST 正規化を適用する。
@@ -631,6 +745,9 @@ pub(crate) fn normalize_rust_signature_text(signature: &str) -> Option<String> {
     let (parseable, original_len) = parseable_signature_source(signature);
 
     let tree = parser::parse_source(&parseable, LangId::Rust).ok()?;
+    if tree.root_node().has_error() {
+        return None;
+    }
     let function = find_function_node(tree.root_node())?;
     normalize_rust_parameter_binding_signature(
         function,
@@ -664,20 +781,23 @@ fn rebuild_without_ranges(
     start: usize,
     end: usize,
     omitted: &[(usize, usize)],
+    preserve_whitespace: bool,
 ) -> Option<String> {
     let _ = source.get(start..end)?;
-    let mut ranges: Vec<_> = omitted
-        .iter()
-        .copied()
-        .filter(|(range_start, range_end)| start <= *range_start && *range_end <= end)
-        .collect();
+    if omitted.iter().any(|&(range_start, range_end)| {
+        range_start < start || range_end > end || range_start >= range_end
+    }) {
+        return None;
+    }
+    let mut ranges = omitted.to_vec();
     ranges.sort_unstable();
+    ranges.dedup();
 
     let mut rebuilt = Vec::with_capacity(end.saturating_sub(start));
     let mut cursor = start;
     for (range_start, mut range_end) in ranges {
         if range_start < cursor {
-            continue;
+            return None;
         }
         rebuilt.extend_from_slice(source.get(cursor..range_start)?);
         while range_end < end && source[range_end].is_ascii_whitespace() {
@@ -686,7 +806,11 @@ fn rebuild_without_ranges(
         cursor = range_end;
     }
     rebuilt.extend_from_slice(source.get(cursor..end)?);
-    Some(normalize_whitespace(&rebuilt))
+    if preserve_whitespace {
+        String::from_utf8(rebuilt).ok()
+    } else {
+        Some(normalize_whitespace(&rebuilt))
+    }
 }
 
 fn normalize_whitespace(bytes: &[u8]) -> String {
@@ -696,6 +820,128 @@ fn normalize_whitespace(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_signature_formatting_keys_keep_contract_tokens() {
+        for (old, new) in [
+            ("pub fn f(x: u64) -> u64", "pub fn f(\n x: u64,\n) -> u64"),
+            (
+                "pub fn f<'a, T>(x: &'a Vec<Result<T, u8>>) -> Vec<T>",
+                "pub fn f<'a, T,>(\n x: &'a Vec<Result<T, u8,>,>,\n) -> Vec<T,>",
+            ),
+            (
+                "pub fn f<T /*same*/>(x: T /*same*/) -> T",
+                "pub fn f<T, /*same*/>(x: T, /*same*/) -> T",
+            ),
+            (
+                "pub fn f<T //same\n>(x: T //same\n) -> T",
+                "pub fn f<T, //same\n>(x: T, //same\n) -> T",
+            ),
+        ] {
+            assert!(
+                rust_signature_formatting_equivalent(old, new),
+                "{old} -> {new}"
+            );
+            assert!(
+                rust_signature_formatting_equivalent(new, old),
+                "{new} -> {old}"
+            );
+        }
+        for (old, new) in [
+            ("pub fn f(x: (String))", "pub fn f(x: (String,))"),
+            ("pub fn f(x: u64)", "pub fn f(x: u64, y: u64)"),
+            ("pub fn f(x: u64, y: String)", "pub fn f(x: String, y: u64)"),
+            ("pub fn f(x: u64) -> u64", "pub fn f(x: u32) -> u64"),
+            ("pub fn f(x: u64) -> u64", "pub fn f(x: u64) -> u32"),
+            (
+                "pub fn f(x: tagged!(\"a b\"))",
+                "pub fn f(x: tagged!(\"a  b\"))",
+            ),
+            ("pub fn f(x: tagged!(u8,))", "pub fn f(x: tagged!(u8))"),
+            (
+                "pub fn f(x: Const<{ call(1,) }>)",
+                "pub fn f(x: Const<{ call(1) }>)",
+            ),
+            ("pub fn f(x: )", "pub fn f(x: )"),
+            ("pub fn f<T(x: T)", "pub fn f<T(x: T)"),
+        ] {
+            assert!(
+                !rust_signature_formatting_equivalent(old, new),
+                "{old} -> {new}"
+            );
+        }
+        let literal = "pub fn f(x: tagged!(\"a  b\"))";
+        assert!(
+            normalize_rust_signature_text(literal)
+                .unwrap()
+                .contains("a  b")
+        );
+    }
+
+    #[test]
+    fn rust_signature_trailing_comma_node_contract() {
+        let source = b"pub fn f<T,>(x: Vec<T,>, y: (u8,),) { g(1,); m!(u8,); }";
+        let tree = parser::parse_source(source, LangId::Rust).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut accepted = Vec::new();
+        let mut rejected = Vec::new();
+        let _: ControlFlow<()> = walk_preorder(tree.root_node(), Children::All, |node, _| {
+            if node.kind() == "," {
+                let parent = node.parent().unwrap().kind();
+                if is_rust_list_trailing_comma(node) {
+                    accepted.push(parent);
+                } else {
+                    rejected.push(parent);
+                }
+            }
+            ControlFlow::Continue(Walk::Descend)
+        });
+        assert_eq!(
+            accepted,
+            ["type_parameters", "type_arguments", "parameters"]
+        );
+        assert!(rejected.contains(&"tuple_type"));
+        assert!(rejected.contains(&"arguments"));
+        assert!(rejected.contains(&"token_tree"));
+        let grammar = LangId::Rust.ts_language();
+        for kind in [
+            "parameters",
+            "type_parameters",
+            "type_arguments",
+            "tuple_type",
+            "arguments",
+            "token_tree",
+            "line_comment",
+            "block_comment",
+            "string_literal",
+            "raw_string_literal",
+            "char_literal",
+        ] {
+            assert_ne!(
+                grammar.id_for_node_kind(kind, true),
+                0,
+                "missing grammar kind: {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_alias_proof_uses_the_same_trailing_comma_rule() {
+        let old = b"pub fn f(x: Vec<(u64, String)>) -> Vec<(u64, String)> { x }";
+        let new =
+            b"pub type Entry = (u64, String);\npub fn f(x: Vec<Entry,>,) -> Vec<Entry,> { x }";
+        assert!(
+            RustTypeAliasEquivalence::new(old, new)
+                .unwrap()
+                .prove_function("f")
+        );
+        let new = b"pub type Entry = (u64, String,);\npub fn f(x: Vec<(Entry,)>,) -> Vec<Entry,> { vec![] }";
+        assert!(
+            !RustTypeAliasEquivalence::new(old, new)
+                .unwrap()
+                .prove_function("f")
+        );
+    }
 
     #[test]
     fn deep_nested_body_does_not_overflow_alias_index() {

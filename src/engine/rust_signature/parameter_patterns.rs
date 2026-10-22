@@ -3,7 +3,10 @@
 //! 表示用 signature は変更しない。引数名を外部契約に使い得る属性・マクロや、
 //! 解析できない構文があれば同値と証明しない。
 
-use super::{Children, ControlFlow, HashSet, Node, Walk, is_rust_binding_mut, walk_preorder};
+use super::{
+    Children, ControlFlow, HashSet, Node, Walk, is_rust_binding_mut, is_rust_list_trailing_comma,
+    walk_preorder,
+};
 
 /// 通常引数の型・位置は保持し、関数本体でだけ使うパターンを同じ印に置き換える。
 /// receiver、ジェネリクス、ABI、可視性、外側の宣言と属性のトークンは保持する。
@@ -72,9 +75,7 @@ pub(crate) fn rust_parameter_pattern_contract(
         }
         patterns.insert(pattern.id());
     }
-    if patterns.is_empty() {
-        return None;
-    }
+    // 引数が無い宣言も、generic list の末尾commaなどヘッダの整形比較に使う。
     let mut tokens = Vec::new();
     append_header(function, source, &patterns, &mut tokens)?;
     let mut current = function;
@@ -164,7 +165,11 @@ fn append_header(
         {
             return ControlFlow::Break(());
         }
-        if node.is_extra() || Some(node.id()) == body || is_rust_binding_mut(node) {
+        if node.is_extra()
+            || Some(node.id()) == body
+            || is_rust_binding_mut(node)
+            || is_rust_list_trailing_comma(node)
+        {
             return ControlFlow::Continue(Walk::Skip);
         }
         if patterns.contains(&node.id()) {

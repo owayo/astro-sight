@@ -145,6 +145,8 @@ pub(super) struct DeclarationHeader {
     display: String,
     /// 本体の byte 範囲。Rust の行比較を取り消す際、ほかの変更が無い証拠に使う。
     body_bytes: Option<(usize, usize)>,
+    /// 本体を含まないヘッダの範囲。整形だけの変更の外側が不変かを確かめる。
+    header_bytes: (usize, usize),
     /// Rust の引数の束縛に付く `mut` の byte 範囲 (昇順)。本体だけの変更の証明で、
     /// 本体の外のバイト列を比べるときに除く。
     binding_mut_bytes: Vec<(usize, usize)>,
@@ -209,6 +211,7 @@ pub(super) fn declaration_header(
             tokens: vec![display.clone()],
             display,
             body_bytes,
+            header_bytes: (decl.start_byte(), header_end),
             binding_mut_bytes: Vec::new(),
             rust_parameter_contract: None,
         });
@@ -228,7 +231,7 @@ pub(super) fn declaration_header(
         let skip_subtree = Some(node.id()) == body_id || omitted_token;
         if omitted_token {
             omitted.push((node.start_byte(), node.end_byte()));
-            if !node.is_extra() {
+            if crate::engine::rust_signature::is_rust_binding_mut(node) {
                 binding_mut_bytes.push((node.start_byte(), node.end_byte()));
             }
         }
@@ -268,7 +271,9 @@ pub(super) fn declaration_header(
         .filter(|leaf| leaf.start_byte() >= line_start && leaf.end_byte() <= header_end)
         .filter_map(|leaf| leaf.utf8_text(source).ok().map(str::to_string))
         .collect();
-    drop_trailing_commas(&mut tokens);
+    if lang_id != LangId::Rust {
+        drop_trailing_commas(&mut tokens);
+    }
 
     Some(DeclarationHeader {
         first_line,
@@ -276,6 +281,7 @@ pub(super) fn declaration_header(
         tokens,
         display: header_display(source, line_start, header_end, &omitted),
         body_bytes,
+        header_bytes: (decl.start_byte(), header_end),
         binding_mut_bytes,
         rust_parameter_contract: (lang_id == LangId::Rust)
             .then(|| crate::engine::rust_signature::rust_parameter_pattern_contract(decl, source))
@@ -288,7 +294,9 @@ pub(super) fn declaration_header(
 /// ない。行ベースの検出と API 差分も `rust_signature::is_rust_binding_mut` で同じものを除く)。
 fn is_omitted_token(node: Node<'_>, lang_id: LangId) -> bool {
     node.is_extra()
-        || (lang_id == LangId::Rust && crate::engine::rust_signature::is_rust_binding_mut(node))
+        || (lang_id == LangId::Rust
+            && (crate::engine::rust_signature::is_rust_binding_mut(node)
+                || crate::engine::rust_signature::is_rust_list_trailing_comma(node)))
 }
 
 /// `bytes` (ファイル先頭からの範囲) から、引数の束縛に付く `mut` とその直後の空白を除く。
@@ -887,7 +895,8 @@ pub(super) fn reconcile_declaration_changes(
             // 従来の本体変更の証明は byte 比較も求め、適用範囲を広げない。
             if has_text_sig_change
                 && old.same_contract(&new)
-                && rust_only_body_changed(input, &mut old_side, &old, &new)
+                && (rust_only_body_changed(input, &mut old_side, &old, &new)
+                    || rust_only_header_formatting_changed(input, &mut old_side, &old, &new))
             {
                 sig_changes.retain(|sc| sc.name != symbol_change.name);
                 continue;
@@ -1156,6 +1165,54 @@ fn rust_only_body_changed(
     old_suffix == new_suffix
         && without_binding_muts(old_prefix, &old_header.binding_mut_bytes)
             == without_binding_muts(new_prefix, &new_header.binding_mut_bytes)
+}
+
+/// AST のヘッダが同じトークン列で、ヘッダ以外は byte 一致するときだけ整形差を取り消す。
+fn rust_only_header_formatting_changed(
+    input: &DeclarationChangeInput<'_>,
+    old_side: &mut LazyOldSide,
+    old_header: &DeclarationHeader,
+    new_header: &DeclarationHeader,
+) -> bool {
+    if input.old_file_path != input.file_path
+        || old_header.rust_parameter_contract.is_none()
+        || new_header.rust_parameter_contract.is_none()
+    {
+        return false;
+    }
+    let Some(old) = old_side.get(input) else {
+        return false;
+    };
+    let (old_start, old_end) = old_header.header_bytes;
+    let (new_start, new_end) = new_header.header_bytes;
+    let (
+        Some(old_prefix),
+        Some(new_prefix),
+        Some(old_suffix),
+        Some(new_suffix),
+        Some(old_header),
+        Some(new_header),
+    ) = (
+        old.source.get(..old_start),
+        input.source.get(..new_start),
+        old.source.get(old_end..),
+        input.source.get(new_end..),
+        old.source
+            .get(old_start..old_end)
+            .and_then(|bytes| std::str::from_utf8(bytes).ok()),
+        input
+            .source
+            .get(new_start..new_end)
+            .and_then(|bytes| std::str::from_utf8(bytes).ok()),
+    )
+    else {
+        return false;
+    };
+    old_prefix == new_prefix
+        && old_suffix == new_suffix
+        && crate::engine::rust_signature::rust_signature_formatting_equivalent(
+            old_header, new_header,
+        )
 }
 
 /// 同名宣言が新旧とも一意で、両側を解析できるときだけヘッダを対応付ける。
