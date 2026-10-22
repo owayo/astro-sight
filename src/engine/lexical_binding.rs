@@ -7,4 +7,6 @@ pub(crate) enum LexicalBinding {
     FunctionLocal,
     /// Rust の値束縛または定数等のパターン。関数・メソッドだけを除外できる。
     RustValueBinding,
+    /// 標準マクロの再束縛検査が必要な値束縛候補。
+    RustMacroValueBinding,
 }

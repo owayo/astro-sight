@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **Rust マクロの単純なローカル引数と impact** — `engine/rust_scope.rs` は既知の標準式マクロへ渡す単独の識別子をローカル束縛の候補として記録する。全引数が単独の識別子かリテラルの形だけを扱い、呼び出し・型引数・入れ子・名前付き引数・修飾マクロは証明しない。impact の collector は、解析 root 内の全 Rust ソースと manifest を一度だけ調べ、同名マクロの定義・import、glob、未知の属性やマクロ、外部ソース取り込み、symlink、解析失敗が無い場合にだけ、関数変更への候補から除く。`--staged` では使わない。生成コードや解析 root 外からの注入は解決しない。`refs` と dead-code の出現契約は変えない。
+
 - **Rust の外部ソース取り込み** — `engine/rust_dynamic_source.rs` が `include!`、`path` 属性、`cfg_attr` 内とマクロの token tree 内の取り込みを AST で判定する。空白・コメント・raw identifier に依存せず、FFI の旧ツリー検査と未使用メソッド判定で共有する。文字列と通常属性は取り込みとしない。メタ変数から属性名を生成するマクロの展開は行わない。
 
 - **Rust 削除と Swift の同名参照** — `commands/api_changes/removed_ffi.rs` は旧 revision のリポジトリ全体を調べ、C ABI 属性・FFI ブリッジ・UDL・ヘッダーの手掛かりが無いと確認できたときだけ、Swift の同名参照を旧 Rust 宣言への参照から外す。旧ツリーやファイルを読めない場合、サブモジュール・ソースになり得るシンボリックリンクがある場合、または手掛かりがあれば blocking を維持する。同じディレクトリの追跡済み Markdown ファイルを指す Markdown シンボリックリンクだけをソース探索から除く。旧ツリーが 10,000 ファイルを超えるか、対象ファイルが 2 MiB を超える場合、Cargo.toml が無い場合も blocking を維持する。他言語と `refs` の出現一覧は変えない。無関係な C ヘッダーがあっても保守的に blocking になる。外部ビルドが生成する未追跡の橋渡しコードや未知のマクロは判定できない。
