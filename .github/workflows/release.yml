@@ -52,7 +52,7 @@ jobs:
       # cargo update を mise.toml の版の Rust で実行する (無いとランナーに最初から入っている Rust で動く)
       - uses: jdx/mise-action@v4
         with:
-          minimum_release_age: 14d
+          version: 2026.10.4 # 2026-10-07 公開。14 日以上経過した版を固定する
           cache: false
 
       - name: Bump the version
@@ -160,7 +160,7 @@ jobs:
       # 書けるほかのジョブの汚染が配布物に入る。Rust の版と mise.toml の [env] は mise-action が渡す
       - uses: jdx/mise-action@v4
         with:
-          minimum_release_age: 14d
+          version: 2026.10.4 # 2026-10-07 公開。14 日以上経過した版を固定する
           cache: false
 
       # mise.toml の rust はホストのツールチェーンと components だけを入れるので、配布のターゲットを足す

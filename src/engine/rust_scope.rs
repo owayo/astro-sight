@@ -251,7 +251,8 @@ impl RustScopeIndex {
         let mut proven = pattern_position;
         let mut child = node;
         while let Some(parent) = child.parent() {
-            if OPAQUE_SCOPES.contains(&parent.kind())
+            // 内側のブロックで確定した let は、外側のパターン束縛に影響されない。
+            if (!proven && OPAQUE_SCOPES.contains(&parent.kind()))
                 || ITEM_BOUNDARIES.contains(&parent.kind())
                 || matches!(
                     parent.kind(),
@@ -273,11 +274,12 @@ impl RustScopeIndex {
             }
             match parent.kind() {
                 "if_expression" | "while_expression"
-                    if parent
-                        .child_by_field_name("condition")
-                        .is_some_and(|condition| {
-                            matches!(condition.kind(), "let_condition" | "let_chain")
-                        }) =>
+                    if !proven
+                        && parent
+                            .child_by_field_name("condition")
+                            .is_some_and(|condition| {
+                                matches!(condition.kind(), "let_condition" | "let_chain")
+                            }) =>
                 {
                     return LexicalBinding::Unknown;
                 }
@@ -557,6 +559,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn rust_scope_proves_inner_let_inside_pattern_control_flow() {
+        for source in [
+            "fn f() { while let Some(offset) = next() { let comments = offset + 1; comments; } }",
+            "fn f() { if let Some(offset) = next() { let comments = offset + 1; comments; } }",
+            "fn f() { for offset in values { let comments = offset + 1; comments; } }",
+            "fn f() { match value { Some(offset) => { let comments = offset + 1; comments; }, _ => {} } }",
+        ] {
+            assert_eq!(
+                resolve_last(source),
+                LexicalBinding::RustValueBinding,
+                "{source}"
+            );
+        }
+
+        let source = "fn f(values: &[u32]) -> Option<usize> { let mut cursor = 0; while let Some(offset) = values[cursor..].iter().position(|v| *v == 0) { let comments = cursor + offset; if comments > 2 { return Some(comments); } cursor = comments + 1; } None }";
+        let tree = parser::parse_source(source.as_bytes(), LangId::Rust).unwrap();
+        assert!(!tree.root_node().has_error());
+        let index = RustScopeIndex::build(tree.root_node(), source.as_bytes()).unwrap();
+        let positions: Vec<_> = source.match_indices("comments").collect();
+        assert_eq!(positions.len(), 4);
+        for (start, _) in positions {
+            let node = tree
+                .root_node()
+                .descendant_for_byte_range(start, start + "comments".len())
+                .unwrap();
+            assert_eq!(
+                index.resolve(node, source.as_bytes()),
+                LexicalBinding::RustValueBinding,
+                "position {start}: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_scope_inner_let_keeps_opaque_bindings_and_barriers_unknown() {
+        for source in [
+            "fn f() { while let Some(comments) = next() { comments(); } }",
+            "fn f() { if let Some(comments) = next() { comments(); } }",
+            "fn f() { for comments in values { comments(); } }",
+            "fn f() { match value { Some(comments) => comments(), _ => () } }",
+            "fn f() { while let Some(offset) = next() { let comments = comments(); } }",
+            "fn f() { while let Some(offset) = next() { let comments = 1; let comments = crate::api::comments; comments(); } }",
+            "fn f() { while let Some(offset) = next() { let mut comments = || 1; comments = crate::api::comments; comments(); } }",
+            "fn f() { while let Some(offset) = next() { let comments = 1; create_binding!(); comments(); } }",
+            "fn f() { while let Some(offset) = next() { #[cfg(feature=\"x\")] let comments = 1; comments(); } }",
+            "fn f() { while let Some(offset) = next() { let comments = 1; fn inner() { comments(); } } }",
+            "fn comments(n: u8) {} #[cfg(test)] mod tests { use super::*; #[test] fn invokes() { comments(1); } }",
+        ] {
+            assert_eq!(resolve_last(source), LexicalBinding::Unknown, "{source}");
+        }
+        assert_eq!(
+            resolve_last(
+                "fn f() { while let Some(offset) = next() { let comments = offset; dbg!(comments); } }"
+            ),
+            LexicalBinding::RustMacroValueBinding
+        );
     }
 
     #[test]
