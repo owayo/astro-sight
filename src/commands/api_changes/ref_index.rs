@@ -517,6 +517,7 @@ pub(crate) struct ModifiedClosureInput<'a> {
     pub(crate) public_name_differs: bool,
     /// 新旧とも一意な直接関数宣言で、今回の非依存用途の証拠を使える。
     pub(crate) js_direct_function_change: bool,
+    pub(super) rust_module_function_change: Option<super::rust_ref_sites::ModuleFunctionProof>,
 }
 
 /// modified シンボルの全 cross-file 参照が同一 diff 内の変更 hunk で追随済みかを判定する。
@@ -609,6 +610,7 @@ struct ClosureTarget<'a> {
     target_lang: Option<crate::language::LangId>,
     /// Python のクラス直下のメソッド (`Class.method`)。
     python_method: bool,
+    rust_module_function: Option<super::rust_ref_sites::ModuleFunctionProof>,
     refs: &'a [crate::models::reference::SymbolReference],
     /// 変更対象ファイル以外にも同名の定義がある。
     has_foreign_defs: bool,
@@ -723,6 +725,11 @@ fn prepare_closure_target<'a>(
     let defs: Vec<&crate::models::reference::SymbolReference> = refs
         .iter()
         .filter(|r| r.kind == Some(RefKind::Definition))
+        .filter(|r| {
+            input.rust_module_function_change.is_none()
+                || rust_member_site(dir, r, bare, caches)
+                    != Some(super::rust_ref_sites::MemberSite::AssociatedDefinition)
+        })
         .collect();
     let target_defs: Vec<_> = defs
         .iter()
@@ -792,6 +799,7 @@ fn prepare_closure_target<'a>(
         bare,
         target_lang,
         python_method,
+        rust_module_function: input.rust_module_function_change,
         refs,
         has_foreign_defs,
         python_foreign_defs_updated,
@@ -811,6 +819,12 @@ fn classify_reference_owner(
         target_new_path,
         ..
     } = input;
+    if target.rust_module_function.is_some()
+        && rust_member_site(dir, r, target.bare, caches)
+            == Some(super::rust_ref_sites::MemberSite::DirectMethodCall)
+    {
+        return ReferenceOwner::Other;
+    }
     // 別ファイルの primitive property と、全用途が truthiness に限られる引数は、
     // 対象のトップレベル関数のシグネチャに依存しない。同名定義の有無とは独立に見る。
     if input.js_direct_function_change
@@ -870,6 +884,25 @@ fn classify_reference_owner(
         }
     }
     ReferenceOwner::Target
+}
+
+fn rust_member_site(
+    dir: &str,
+    reference: &crate::models::reference::SymbolReference,
+    name: &str,
+    caches: &mut ApiClosureCaches,
+) -> Option<super::rust_ref_sites::MemberSite> {
+    let parsed = parsed_ref_file_shared(dir, &reference.path, caches)?;
+    if parsed.lang_id != crate::language::LangId::Rust
+        || !*caches
+            .rust_clean_files
+            .entry(reference.path.clone())
+            .or_insert_with(|| super::rust_ref_sites::clean_tree(parsed.tree.root_node()))
+    {
+        return None;
+    }
+    let node = ref_name_node(&parsed, name, reference.line, reference.column)?;
+    super::rust_ref_sites::classify_member_site(node, &parsed.source)
 }
 
 /// 変更対象への呼び出し参照 1 件が、同一 diff で追随済みだと証明できるか。
@@ -1392,6 +1425,8 @@ fn closed_via_local_const_argument(
 /// unique file 単位の F 回に圧縮する。
 #[derive(Default)]
 pub(crate) struct ApiClosureCaches {
+    /// Rust の参照側 AST に ERROR / MISSING がないか、ファイルごとに一度だけ確認する。
+    rust_clean_files: std::collections::HashMap<String, bool>,
     pub(crate) fixed_callback: super::ts_signature::FixedCallbackCache,
     pub(crate) optional_removal: super::ts_signature::OptionalRemovalCache,
     /// `import_statement_lines_for_ref` の (ref path → import 行集合) キャッシュ。

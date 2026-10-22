@@ -30,6 +30,8 @@ pub(crate) enum RefOrigin {
     IndependentDefinition { path: String },
     /// Rust のローカル値束縛・非 callable なフィールド名位置。
     LocalValue,
+    /// Rust の関連メンバー定義または直接のメソッド呼び出し。
+    RustAssociatedMember,
     /// 参照ファイル自身に同名定義が残存している (bash)。静的な依存先に削除ファイルが
     /// 含まれる場合は証明しない。
     SelfDefined {
@@ -77,6 +79,7 @@ pub(crate) struct RemovedCandidateRef<'a> {
     pub(crate) name: &'a str,
     /// 削除シンボルの kind (`function` / `method` / `class` ...)。
     pub(crate) kind: &'a str,
+    pub(super) rust_module_function: Option<super::rust_ref_sites::ModuleFunctionProof>,
 }
 
 /// `attr` が「削除ファイル `candidate.old_path` のシンボルではなく残存シンボル由来」と
@@ -130,6 +133,9 @@ pub(crate) fn proves_survivor_origin_with_ffi(
                     != super::removed_scope::module_key(candidate.old_path)
         }
         RefOrigin::LocalValue => candidate.kind == "function" && !candidate.name.contains('.'),
+        RefOrigin::RustAssociatedMember => {
+            attr.ref_lang == Some(LangId::Rust) && candidate.rust_module_function.is_some()
+        }
         RefOrigin::SelfDefined { sourced_candidates } => {
             sourced_candidates
                 .as_ref()
@@ -194,7 +200,9 @@ pub(crate) fn proves_independent_definition_with_ffi(
     (cross_language
         || matches!(
             &attr.origin,
-            RefOrigin::IndependentDefinition { .. } | RefOrigin::LocalValue
+            RefOrigin::IndependentDefinition { .. }
+                | RefOrigin::LocalValue
+                | RefOrigin::RustAssociatedMember
         ))
         && proves_survivor_origin_with_ffi(attr, candidate, foreign_bindable)
 }
@@ -229,6 +237,7 @@ pub(crate) struct RefAttributionFacts {
     /// 0 始まりの行・byte 列。解析一回の寿命に閉じ、別 revision へ再利用しない。
     independent_positions: super::removed_scope::Positions,
     local_positions: super::removed_scope::Positions,
+    rust_sites: HashMap<(usize, usize), super::rust_ref_sites::MemberSite>,
     /// JS/TS: 出現の位置 (0 始まりの行・byte 列) ごとの分類。外部パッケージの束縛
     /// (`JsRefSite::External`) の出現は参照に数えない。
     js_sites: HashMap<(usize, usize), super::js_ref_sites::JsRefSite>,
@@ -255,6 +264,7 @@ impl RefAttributionFacts {
         Self {
             independent_positions: HashSet::new(),
             local_positions: HashSet::new(),
+            rust_sites: HashMap::new(),
             js_sites: HashMap::new(),
             js_member_evidence: HashMap::new(),
             bash_sourced_candidates: None,
@@ -297,6 +307,14 @@ fn ref_origin_for(
     residual_def_paths: &HashSet<String>,
     position: (usize, usize),
 ) -> RefOrigin {
+    match facts.rust_sites.get(&position) {
+        Some(super::rust_ref_sites::MemberSite::UnprovenFieldValue) => return RefOrigin::Unproven,
+        Some(
+            super::rust_ref_sites::MemberSite::AssociatedDefinition
+            | super::rust_ref_sites::MemberSite::DirectMethodCall,
+        ) => return RefOrigin::RustAssociatedMember,
+        None => {}
+    }
     if facts.local_positions.contains(&position) {
         return RefOrigin::LocalValue;
     }
@@ -471,6 +489,7 @@ fn analyze_rust_facts(utf8: &camino::Utf8Path, symbol: &str) -> RefAttributionFa
     RefAttributionFacts {
         independent_positions,
         local_positions,
+        rust_sites: super::rust_ref_sites::member_positions(tree.root_node(), &source, symbol),
         ..RefAttributionFacts::opaque()
     }
 }
@@ -938,6 +957,7 @@ mod tests {
                     old_path,
                     name: "Formatter.formatItem",
                     kind: "method",
+                    rust_module_function: None,
                 },
             ));
         }
@@ -947,6 +967,7 @@ mod tests {
                 old_path: "dist/util.js",
                 name: "Formatter.formatItem",
                 kind: "method",
+                rust_module_function: None,
             },
         ));
     }
@@ -999,6 +1020,7 @@ mod tests {
             old_path,
             name,
             kind,
+            rust_module_function: None,
         }
     }
 

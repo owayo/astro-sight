@@ -113,6 +113,8 @@ pub(crate) fn partition_removed_dead_candidates(
     let mut export_cache = super::js_ref_sites::JsExportOriginCache::default();
     let mut python_members = super::python_member_origin::PythonMemberOrigins::default();
     let mut private_owners = super::python_private_owner::PrivateOwnerRemovals::default();
+    let mut old_rust_functions: HashMap<String, Option<super::rust_ref_sites::ModuleFunctions>> =
+        HashMap::new();
     let python_old_paths: HashSet<String> = candidates
         .iter()
         .filter(|candidate| candidate.file.ends_with(".py"))
@@ -217,6 +219,20 @@ pub(crate) fn partition_removed_dead_candidates(
             old_path: &c.file,
             name: &c.name,
             kind: &c.kind,
+            rust_module_function: (c.kind == "function"
+                && !c.name.contains('.')
+                && super::removed_attribution::path_lang(&c.file)
+                    == Some(crate::language::LangId::Rust))
+            .then(|| {
+                old_rust_functions
+                    .entry(c.file.clone())
+                    .or_insert_with(|| {
+                        super::rust_ref_sites::ModuleFunctions::parse(&base_blobs.read(&c.file)?)
+                    })
+                    .as_ref()?
+                    .prove(&c.name, &c.signature)
+            })
+            .flatten(),
         };
         if python_input_complete
             && private_owners.proves_closed_removal(
@@ -302,7 +318,9 @@ pub(crate) fn partition_removed_dead_candidates(
         let uses_scope_proof = attributions.iter().any(|a| {
             matches!(
                 &a.origin,
-                RefOrigin::IndependentDefinition { .. } | RefOrigin::LocalValue
+                RefOrigin::IndependentDefinition { .. }
+                    | RefOrigin::LocalValue
+                    | RefOrigin::RustAssociatedMember
             )
         });
         if !attributions.is_empty()

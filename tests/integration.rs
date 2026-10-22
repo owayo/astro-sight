@@ -48,6 +48,7 @@ mod integration {
     mod review_retry;
     mod runtime_invoked_symbols;
     mod rust_parameter_patterns;
+    mod rust_reference_sites;
     mod sandbox;
     mod session;
     mod static_const_values;
