@@ -212,6 +212,8 @@ With `--hook`, this is printed as `trunc: [{"f": "generated.rs", "r": "untracked
 
 On this path, references found in the working tree do not match the content being committed when it has unstaged edits. So when the working tree differs from the index, the checks that move a change to a non-blocking category because no references remain (`mod_closed` / `mod_compat` / `rm_dead`) are not used, and the change stays blocking. With `--hook`, this is printed as `trunc: [{"r": "staged_snapshot_unavailable"}]` (it reports the analyzed scope, so it does not cause exit 1 by itself).
 
+Staged diffs containing Swift files require the snapshot for protocol witness detection. If it exceeds the limit, `review` and Swift `dead-code --git --staged` return an error, so unstaged conformances cannot remove a staged dead candidate.
+
 ### Reporting Sources That Cannot Be Analyzed
 
 `dead-code` / `review` also list in `truncations` the **source files that exist in the directory but that no backend could analyze**. Declaring a symbol dead without counting the references inside unreadable files would report live symbols as dead (for example a TypeScript function used only from the `<script>` of a `.vue` file). The report lets you tell "there are no references" from "references could not be observed".
@@ -420,6 +422,7 @@ Symbols that frameworks and test runners call dynamically, by naming convention 
 - **Angular**: lifecycle hooks of classes decorated with `@Component` / `@Directive` (`ngOnInit` / `ngOnDestroy` / `ngOnChanges` / `ngDoCheck` / `ngAfterContentInit` / `ngAfterContentChecked` / `ngAfterViewInit` / `ngAfterViewChecked`) are excluded because the Angular runtime calls them in the change detection cycle. `transform` of `@Pipe` classes (called from `| name` in templates) and `ngOnDestroy` of `@Injectable` / `@Pipe` classes (called when a service / pipe is destroyed) are excluded too. Other hooks of services and pipes (`ngOnInit`, and so on) are not called by Angular and are not excluded
 - **PHP annotations and attributes**: methods and classes whose docblock has an annotation starting with an uppercase letter (`@Route`, `@Entity`, ...) or a PHPUnit annotation such as `@test` / `@dataProvider`, and those with a PHP 8 attribute of the same name (`#[Route]`, `#[Test]`, ...)
 - **Methods called through syntax**: Kotlin `operator fun` and Swift `callAsFunction`. They are called through operators or call syntax, not by name. They stay in the API diff
+- **Swift external protocol witnesses**: `applicationShouldTerminateAfterLastWindowClosed(_:)`, `menuNeedsUpdate(_:)`, `hash(into:)`, `makeNSView(context:)`, and `updateNSView(_:context:)` are excluded when the owning type's SDK/standard-library conformance and the method signature are established. Helpers and unused owners remain candidates. Additional requirements can be declared in [configuration](configuration.md#swift-protocol-methods); API changes and `refs` are unchanged
 - **Program entry points**: the following are excluded (they stay in the API diff)
   - C / C++: `main` at global scope
   - Kotlin: top-level `fun main`, and `@JvmStatic fun main` directly inside an `object` / `companion object`

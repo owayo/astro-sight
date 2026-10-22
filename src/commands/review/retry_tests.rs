@@ -192,3 +192,54 @@ fn review_input_retry_does_not_repeat_explicit_input_or_unrelated_errors() {
         );
     }
 }
+
+#[test]
+fn review_swift_protocol_configuration_survives_a_retry() {
+    let temporary = tempfile::tempdir().unwrap();
+    let repo = temporary.path();
+    crate::commands::tests::common::init_git_repo_for_test(repo);
+    std::fs::write(
+        repo.join("Widget.swift"),
+        "import Acme\npublic struct Widget: Acme.P {}\n",
+    )
+    .unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-qm", "base"]);
+    let source = |number| {
+        format!(
+            "import Acme\npublic struct Widget: Acme.P {{\n public func refresh(_ value: Swift.String) {{ print({number}) }}\n public func helper() {{}}\n}}\n"
+        )
+    };
+    std::fs::write(repo.join("Widget.swift"), source(0)).unwrap();
+    let config: crate::config::Config = toml::from_str("[[swift_protocol_methods]]\nprotocol='Acme.P'\nmethod='refresh'\nlabels=['_']\nparameter_types=['Swift.String']\nreturn_type='Swift.Void'\n").unwrap();
+    let opts = options(repo.to_str().unwrap(), false);
+    let mut attempts = 0;
+    retry_review(true, |attempt| {
+        attempts += 1;
+        review_attempt_with_swift_protocols(
+            &AppService::new(),
+            &opts,
+            &config.swift_protocol_methods,
+            |result, _| {
+                assert!(
+                    !result
+                        .dead_symbols
+                        .iter()
+                        .chain(&result.test_only_symbols)
+                        .any(|symbol| symbol.name == "Widget.refresh")
+                );
+                assert!(
+                    result
+                        .dead_symbols
+                        .iter()
+                        .any(|symbol| symbol.name == "Widget.helper")
+                );
+                if attempt == 1 {
+                    std::fs::write(repo.join("Widget.swift"), source(attempt)).unwrap();
+                }
+            },
+        )
+    })
+    .unwrap();
+    assert_eq!(attempts, 2);
+}

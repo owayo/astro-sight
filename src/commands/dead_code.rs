@@ -15,7 +15,9 @@ use super::dead_code_default_liveness::DefaultExportLiveness;
 use super::dead_code_member_liveness::{
     JsTsMemberLiveness, MemberStatus, PhpMemberLiveness, RustMemberLiveness,
 };
+use super::dead_code_swift_protocol::SwiftProtocolLiveness;
 use super::git_input::{DiffSourceResolution, resolve_diff_source};
+use crate::config::SwiftProtocolMethods;
 use crate::output::{OutputOptions, serialize_cli_document};
 
 /// dead-code 検出の結果一式。
@@ -63,10 +65,25 @@ pub(crate) fn detect_dead_symbols_from_files(
 ///
 /// `include_generated` は生成物を dead の**候補**に含めるかだけを決める。参照の集計には
 /// 生成物を常に含める (`FileScanOptions::DEAD_CODE_REFERENCES`)。
+#[cfg(test)]
 pub(crate) fn detect_dead_symbols(
     dir: &str,
     files: &[std::path::PathBuf],
     include_generated: bool,
+) -> DeadCodeDetection {
+    detect_dead_symbols_with_swift_protocols(
+        dir,
+        files,
+        include_generated,
+        &SwiftProtocolMethods::default(),
+    )
+}
+
+pub(crate) fn detect_dead_symbols_with_swift_protocols(
+    dir: &str,
+    files: &[std::path::PathBuf],
+    include_generated: bool,
+    swift_protocols: &SwiftProtocolMethods,
 ) -> DeadCodeDetection {
     let canonical_dir = match std::fs::canonicalize(dir) {
         Ok(d) => d,
@@ -96,6 +113,18 @@ pub(crate) fn detect_dead_symbols(
         Err(_) => return DeadCodeDetection::without_dead(generated_candidates_skipped),
     };
     let unanalyzable = scan.unanalyzable_truncations(&canonical_dir);
+
+    if candidates
+        .all_syms
+        .iter()
+        .any(|(_, _, _, lang)| *lang == crate::language::LangId::Swift)
+    {
+        let liveness = SwiftProtocolLiveness::build(&canonical_dir, &scan.files, swift_protocols);
+        exclude_swift_protocol_witnesses(&mut candidates, &liveness);
+        if candidates.all_syms.is_empty() {
+            return DeadCodeDetection::without_dead(generated_candidates_skipped);
+        }
+    }
 
     // テストからの参照かは `dir` からの相対パスで判定する。走査したファイルは絶対パスなので、
     // そのまま渡すとリポジトリの親ディレクトリ名 (`~/test/myrepo` の `test`) まで照合し、
@@ -146,6 +175,83 @@ pub(crate) fn detect_dead_symbols(
         unanalyzable,
         uncounted,
         unverified: classified.unverified,
+    }
+}
+
+fn exclude_swift_protocol_witnesses(
+    candidates: &mut DeadCodeCandidates,
+    liveness: &SwiftProtocolLiveness,
+) {
+    // Unsupported owners still contribute candidates. Never let a witness
+    // key shared with one of those declarations remove both methods.
+    let mut identities = std::collections::HashMap::new();
+    for ((name, _, file, _), signature) in
+        candidates.all_syms.iter().zip(&candidates.swift_signatures)
+    {
+        if let Some(signature) = signature {
+            *identities
+                .entry((file.clone(), name.clone(), signature.clone()))
+                .or_insert(0) += 1;
+        }
+    }
+    let mut kept = Vec::with_capacity(candidates.all_syms.len());
+    let mut lines = Vec::with_capacity(candidates.all_syms.len());
+    for (candidate, signature) in candidates
+        .all_syms
+        .drain(..)
+        .zip(&candidates.swift_signatures)
+    {
+        let (name, _, file, _) = &candidate;
+        if signature.as_deref().is_some_and(|signature| {
+            identities.get(&(file.clone(), name.clone(), signature.to_owned())) == Some(&1)
+                && liveness.contains(file, name, signature)
+        }) {
+            continue;
+        }
+        lines.push(
+            signature
+                .as_deref()
+                .and_then(|signature| liveness.line(file, name, signature)),
+        );
+        kept.push(candidate);
+    }
+    candidates.all_syms = kept;
+    candidates.swift_lines = lines;
+}
+
+#[cfg(test)]
+mod swift_protocol_candidate_tests {
+    use super::*;
+
+    #[test]
+    fn swift_protocol_duplicate_headers_include_unsupported_owners() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temporary.path()).unwrap();
+        let path = root.join("Point.swift");
+        std::fs::write(&path, "public struct A: Hashable {}\nextension A {\n public func hash(into value: inout Hasher) {}\n}\npublic struct B<T> {}\nextension B where T: Equatable {\n public func hash(into value: inout Hasher) {}\n}\n").unwrap();
+        let files = vec![path];
+        let dir = root.to_str().unwrap();
+        let mut candidates = collect_dead_code_candidates(dir, &root, &files, false);
+        assert_eq!(
+            candidates
+                .all_syms
+                .iter()
+                .filter(|(name, _, _, _)| name == "hash")
+                .count(),
+            2
+        );
+        let liveness =
+            SwiftProtocolLiveness::build(&root, &files, &SwiftProtocolMethods::default());
+        exclude_swift_protocol_witnesses(&mut candidates, &liveness);
+        assert_eq!(
+            candidates
+                .all_syms
+                .iter()
+                .filter(|(name, _, _, _)| name == "hash")
+                .count(),
+            2,
+            "unsupported owner's helper must not share the witness exclusion"
+        );
     }
 }
 
@@ -339,7 +445,9 @@ fn attach_declaration_lines(dir: &str, dead: &mut [DeadSymbol], test_only: &mut 
         let lines = cache
             .entry(sym.file.clone())
             .or_insert_with(|| DeclarationLines::load(dir, &sym.file));
-        sym.line = lines.line_of(&sym.name);
+        if sym.line.is_none() {
+            sym.line = lines.line_of(&sym.name);
+        }
     }
 }
 
@@ -406,6 +514,8 @@ struct DeadCodeCandidates {
     /// 全ファイルのエクスポートシンボル (original_name, kind, file, lang_id)。
     /// case-insensitive 言語では lang_id でシンボル名を正規化した比較を行うため lang も保持する。
     all_syms: Vec<(String, String, String, crate::language::LangId)>,
+    swift_signatures: Vec<Option<String>>,
+    swift_lines: Vec<Option<usize>>,
     /// C/C++ の追加 liveness 情報 (file, シンボル名, 追加名リスト, lang)。
     /// enum→列挙子名 / typedef tag→alias 名。後段で正規化して liveness_aliases に変換する。
     liveness_raw: Vec<(String, String, Vec<String>, crate::language::LangId)>,
@@ -444,6 +554,7 @@ fn collect_dead_code_candidates(
     let mut all_syms: Vec<(String, String, String, crate::language::LangId)> = Vec::new();
     let mut liveness_raw: Vec<(String, String, Vec<String>, crate::language::LangId)> = Vec::new();
     let mut generated_skipped: Vec<String> = Vec::new();
+    let mut swift_signatures = Vec::new();
     for file in scanned {
         match file {
             CandidateFile::Ignored => {}
@@ -454,7 +565,9 @@ fn collect_dead_code_candidates(
                     symbols,
                     cpp_liveness,
                 } = candidates;
-                for (name, kind, _sig) in symbols {
+                for (name, kind, signature) in symbols {
+                    swift_signatures
+                        .push((lang == crate::language::LangId::Swift).then_some(signature));
                     all_syms.push((name, kind, rel.clone(), lang));
                 }
                 for (sym, extras) in cpp_liveness {
@@ -466,6 +579,8 @@ fn collect_dead_code_candidates(
 
     DeadCodeCandidates {
         all_syms,
+        swift_signatures,
+        swift_lines: Vec::new(),
         liveness_raw,
         generated_skipped,
     }
@@ -807,7 +922,7 @@ fn classify_dead_symbols(
     // production > 0 → 生存とみなしどちらにも報告しない
     // 数えられなかったファイルから参照されうる候補は断定せず unverified に回す
     let mut classified = ClassifiedDead::default();
-    for (name, kind, file, lang) in &candidates.all_syms {
+    for (candidate_index, (name, kind, file, lang)) in candidates.all_syms.iter().enumerate() {
         let key = normalized_bare_name(*lang, name);
         // 数えられなかったファイルからの参照がありうるか (検索キーと liveness 補助名、
         // default export の import)。(production, test) の組。
@@ -830,7 +945,11 @@ fn classify_dead_symbols(
             file: file.clone(),
             // 宣言行は attach_declaration_lines で後付けする
             // (per-file の parse を 1 回に集約するため)。
-            line: None,
+            line: candidates
+                .swift_lines
+                .get(candidate_index)
+                .copied()
+                .flatten(),
         };
         // 同名シンボルが複数存在する場合は bare name では区別できないためスキップする。
         // ただし TS/JS の class member については `JsTsMemberLiveness` で owner 一意推定
@@ -1764,6 +1883,14 @@ struct ResolvedDeadCodeDiff {
 }
 
 pub fn cmd_dead_code(opts: &CmdDeadCodeOpts<'_>) -> Result<()> {
+    cmd_dead_code_with_swift_protocols(opts, &SwiftProtocolMethods::default())
+}
+
+/// 検証済みの外部 Swift protocol 要件を追加して dead-code を実行する。
+pub fn cmd_dead_code_with_swift_protocols(
+    opts: &CmdDeadCodeOpts<'_>,
+    swift_protocols: &SwiftProtocolMethods,
+) -> Result<()> {
     let dir = opts.dir;
     let glob = opts.glob;
     let diff = opts.diff;
@@ -1807,10 +1934,14 @@ pub fn cmd_dead_code(opts: &CmdDeadCodeOpts<'_>) -> Result<()> {
     // 取得・parse して再利用する (旧実装は run_git_diff + parse_unified_diff を 2 回呼んでおり、
     // --staged 実行中の git add で 2 つの diff が乖離する競合状態があった)。
     // NotRequested (diff/diff_file/git いずれも未指定) は全体走査に振り分ける。
+    let mut pinned_base = None;
     let resolved_diff = match resolve_diff_source(dir, diff, diff_file, git, base, staged)? {
         DiffSourceResolution::Diff {
-            diff, truncations, ..
+            diff,
+            truncations,
+            base_commit,
         } => {
+            pinned_base = base_commit;
             if diff.trim().is_empty() {
                 // 未追跡の巨大ファイルを除外した結果 diff が空になった場合も、
                 // 何を対象外にしたかを報告する (空結果と打ち切りを混同させない)。
@@ -1857,6 +1988,31 @@ pub fn cmd_dead_code(opts: &CmdDeadCodeOpts<'_>) -> Result<()> {
         },
     };
 
+    // 候補・準拠・参照を同じ index の版で読む。公開先の dir は元のパスを保つ。
+    let output_dir = canonical_dir.clone();
+    let snapshot = if matches!(
+        super::git_input::diff_new_side(diff, diff_file, git, staged),
+        crate::models::impact::DiffNewSide::Index
+    ) && resolved_diff.files.as_ref().is_some_and(|files| {
+        files
+            .iter()
+            .any(|file| file.new_path.to_ascii_lowercase().ends_with(".swift"))
+    }) {
+        Some(super::review::prepare_dead_code_snapshot(
+            dir,
+            pinned_base.as_deref().unwrap_or("HEAD"),
+            resolved_diff.input.as_deref().unwrap_or(""),
+        )?)
+    } else {
+        None
+    };
+    let dir = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.dir())
+        .transpose()?
+        .unwrap_or(dir);
+    let canonical_dir = std::fs::canonicalize(dir)?;
+
     // 候補ファイルの収集。生成物として候補から外したファイルは申告用に控える
     // (ディレクトリ走査では名前 / ヘッダマーカーで走査の段階から外れる)。
     let (files, mut generated_skipped): (Vec<std::path::PathBuf>, Vec<String>) =
@@ -1891,7 +2047,8 @@ pub fn cmd_dead_code(opts: &CmdDeadCodeOpts<'_>) -> Result<()> {
     // `<script>` からしか使われていない TS 関数のように**生きているシンボルを dead と
     // 報告する** (最悪方向の誤り)。候補の絞り込み (`--glob` / `--git`) で申告を狭めると、
     // 数えていない範囲が申告から消える。
-    let detection = detect_dead_symbols(dir, &files, include_generated);
+    let detection =
+        detect_dead_symbols_with_swift_protocols(dir, &files, include_generated, swift_protocols);
     generated_skipped.extend(detection.generated_candidates_skipped);
     let dead_symbols = detection.dead;
     let test_only_symbols = detection.test_only;
@@ -1914,7 +2071,7 @@ pub fn cmd_dead_code(opts: &CmdDeadCodeOpts<'_>) -> Result<()> {
     truncations.extend(detection.uncounted);
 
     let result = DeadCodeResult {
-        dir: canonical_dir.to_string_lossy().to_string(),
+        dir: output_dir.to_string_lossy().to_string(),
         scanned_files,
         dead_symbols,
         test_only_symbols,

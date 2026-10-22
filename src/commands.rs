@@ -872,16 +872,17 @@ mod review;
 
 #[cfg(test)]
 pub(crate) use review::hook::{build_review_hook_json, build_review_hook_json_for_diff};
-pub use review::{CmdReviewOpts, cmd_review};
+pub use review::{CmdReviewOpts, cmd_review, cmd_review_with_swift_protocols};
 
 mod api_changes;
 mod dead_code;
 mod dead_code_default_liveness;
 mod dead_code_member_liveness;
+mod dead_code_swift_protocol;
 
 #[cfg(test)]
 pub(crate) use api_changes::*;
-pub use dead_code::{CmdDeadCodeOpts, cmd_dead_code};
+pub use dead_code::{CmdDeadCodeOpts, cmd_dead_code, cmd_dead_code_with_swift_protocols};
 // tests.rs が `use super::*` 経由で参照する dead_code 内部シンボル。
 // (production 側の唯一の利用者だった cmd_review は review モジュールへ移動し、
 //  そこから `super::dead_code::…` を直接参照している)
