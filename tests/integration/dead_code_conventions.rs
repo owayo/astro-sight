@@ -5,6 +5,469 @@ use super::support::*;
 #[allow(unused_imports)]
 use std::process::{Command, Stdio};
 
+#[test]
+fn dead_code_swift_protocol_witnesses_preserve_helpers_and_dead_owners() {
+    let repo = TestRepo::new();
+    repo.write("Witnesses.swift", r#"import AppKit
+import SwiftUI
+public struct Point: Hashable {
+  public func hash(into hasher: inout Hasher) {}
+  public func hash(with text: String) {}
+  public func helper() {}
+}
+public final class Delegate: NSObject, NSApplicationDelegate {
+  public func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+}
+extension Delegate: NSMenuDelegate {
+  public func menuNeedsUpdate(_ menu: NSMenu) {}
+  public func unusedMenuHelper() {}
+}
+public struct Canvas: NSViewRepresentable {
+  public func makeNSView(context: Context) -> NSView { NSView() }
+  public func updateNSView(_ nsView: NSView, context: Context) {}
+}
+public class Preferences: NSViewController {
+  public override func viewDidLoad() {}
+}
+"#);
+    let value = repo.run_json("dead-code", &[]);
+    let dead = value["dead_symbols"].as_array().unwrap();
+    assert!(dead.iter().any(|s| s["name"] == "Point"), "{value}");
+    assert!(
+        dead.iter().any(|s| s["name"] == "Point.hash"),
+        "hash(with:) must remain: {value}"
+    );
+    for name in ["Point.helper", "unusedMenuHelper"] {
+        assert!(dead.iter().any(|s| s["name"] == name), "{name}: {value}");
+    }
+    for name in [
+        "menuNeedsUpdate",
+        "Delegate.applicationShouldTerminateAfterLastWindowClosed",
+        "Canvas.makeNSView",
+        "Canvas.updateNSView",
+        "Preferences.viewDidLoad",
+    ] {
+        assert!(!dead.iter().any(|s| s["name"] == name), "{name}: {value}");
+    }
+}
+
+#[test]
+fn dead_code_swift_protocol_custom_configuration_is_explicit_and_typed() {
+    let repo = TestRepo::new();
+    repo.write("Widget.swift", "import Acme\npublic struct Widget: Acme.RefreshDelegate {\n public func refresh(_ value: Swift.String) {}\n public func refresh(_ value: Swift.Int) {}\n public func unusedHelper() {}\n}\n");
+    repo.write("custom.toml", "[[swift_protocol_methods]]\nprotocol = 'Acme.RefreshDelegate'\nmethod = 'refresh'\nlabels = ['_']\nparameter_types = ['Swift.String']\nreturn_type = 'Swift.Void'\n");
+    let output = cargo_bin_with_explicit_config()
+        .args([
+            "--config",
+            repo.path("custom.toml").to_str().unwrap(),
+            "dead-code",
+            "--dir",
+            repo.root().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let dead = value["dead_symbols"].as_array().unwrap();
+    assert!(
+        dead.iter().any(|s| s["name"] == "Widget.refresh"),
+        "typed helper must remain: {value}"
+    );
+    assert_eq!(
+        dead.iter()
+            .filter(|s| s["name"] == "Widget.refresh")
+            .count(),
+        1,
+        "{value}"
+    );
+    assert!(
+        dead.iter().any(|s| s["name"] == "Widget.unusedHelper"),
+        "{value}"
+    );
+    assert_eq!(
+        dead.iter().find(|s| s["name"] == "Widget.refresh").unwrap()["line"],
+        3,
+        "{value}"
+    );
+}
+
+#[test]
+fn dead_code_swift_protocol_cross_file_conformances_use_the_whole_target() {
+    let repo = TestRepo::new();
+    repo.write("Package.swift", "import PackageDescription\nlet package = Package(name: \"Example\", targets: [.target(name: \"First\"), .target(name: \"Second\"), .target(name: \"Third\")])\n");
+    for target in ["First", "Second", "Third"] {
+        repo.create_dir_all(format!("Sources/{target}"));
+    }
+    repo.write(
+        "Sources/First/Point.swift",
+        "public struct Point: Hashable {}\n",
+    );
+    repo.write("Sources/First/Hash.swift", "extension Point {\n public func hash(into hasher: inout Hasher) {}\n public func unusedFirstHelper() {}\n}\n");
+    repo.write("Sources/Second/Point.swift", "public struct Point {\n public func hash(into hasher: inout Hasher) {}\n public func unusedSecondHelper() {}\n}\n");
+    repo.write(
+        "Sources/Second/Conformance.swift",
+        "extension Point: Hashable {}\n",
+    );
+    // Same owner spelling in a different target must not inherit a conformance.
+    repo.write(
+        "Sources/Third/Point.swift",
+        "public struct Point {\n public func hash(into hasher: inout Hasher) {}\n}\n",
+    );
+    let value = repo.run_json("dead-code", &[]);
+    let methods: Vec<_> = value["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|symbol| symbol["name"].as_str().unwrap().ends_with("hash"))
+        .collect();
+    assert_eq!(methods.len(), 1, "{value}");
+    assert_eq!(methods[0]["file"], "Sources/Third/Point.swift", "{value}");
+    for name in ["unusedFirstHelper", "Point.unusedSecondHelper"] {
+        assert!(
+            value["dead_symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol["name"] == name),
+            "{value}"
+        );
+    }
+    // The implementation is the only selected candidate file; conformance is unchanged elsewhere.
+    let value = repo.run_json("dead-code", &["--glob", "Sources/Second/Point.swift"]);
+    assert!(
+        !value["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["name"] == "Point.hash"),
+        "{value}"
+    );
+}
+
+#[test]
+fn dead_code_swift_protocol_witnesses_are_excluded_from_test_only() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("tests");
+    repo.write("Point.swift", "public struct Point: Hashable {\n public func hash(into hasher: inout Hasher) {}\n public func testOnlyHelper() {}\n}\n");
+    repo.write("tests/PointTests.swift", "func exercise(point: Point, hasher: inout Hasher) { point.hash(into: &hasher); point.testOnlyHelper() }\n");
+    let value = repo.run_json("dead-code", &[]);
+    assert!(
+        value["test_only_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["name"] == "Point.testOnlyHelper"),
+        "{value}"
+    );
+    for field in ["dead_symbols", "test_only_symbols"] {
+        assert!(
+            !value[field]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol["name"] == "Point.hash"),
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn dead_code_swift_protocol_requires_matching_shape_and_unambiguous_names() {
+    for (prefix, owner, method) in [
+        (
+            "",
+            "Point: Hashable",
+            "public func hash(into value: inout String) {}",
+        ),
+        (
+            "",
+            "Point: Hashable",
+            "public static func hash(into value: inout Hasher) {}",
+        ),
+        (
+            "",
+            "Point: Hashable",
+            "public func hash(into value: inout Hasher) async {}",
+        ),
+        (
+            "",
+            "Point: Hashable",
+            "public func hash(into value: inout Hasher) throws {}",
+        ),
+        (
+            "",
+            "Point: Hashable",
+            "public func hash<T>(into value: inout Hasher) {}",
+        ),
+        ("", "Point", "public func hash(into value: inout Hasher) {}"),
+        (
+            "protocol Hashable {}\n",
+            "Point: Hashable",
+            "public func hash(into value: inout Hasher) {}",
+        ),
+        (
+            "typealias Hasher = String\n",
+            "Point: Hashable",
+            "public func hash(into value: inout Hasher) {}",
+        ),
+        (
+            "import Other\n",
+            "Point: Hashable",
+            "public func hash(into value: inout Hasher) {}",
+        ),
+        (
+            "#declareTypes()\n",
+            "Point: Hashable",
+            "public func hash(into value: inout Hasher) {}",
+        ),
+        (
+            "@DeclarePeers public struct Other {}\n",
+            "Point: Hashable",
+            "public func hash(into value: inout Hasher) {}",
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.write(
+            "Point.swift",
+            format!("{prefix}public struct {owner} {{\n {method}\n}}\n"),
+        );
+        let value = repo.run_json("dead-code", &[]);
+        assert!(
+            value["dead_symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol["name"] == "Point.hash"),
+            "{prefix} {owner} {method}: {value}"
+        );
+    }
+}
+
+#[test]
+fn dead_code_swift_protocol_custom_static_and_qualified_names() {
+    for (protocol, parameter, excluded) in [
+        ("Acme.RefreshDelegate", "Swift.String", true),
+        ("RefreshDelegate", "Swift.String", false),
+        ("Acme.RefreshDelegate", "String", false),
+    ] {
+        let repo = TestRepo::new();
+        repo.write("Widget.swift", format!("import Acme\nimport Other\npublic struct Widget: {protocol} {{\n public static func refresh(_ value: {parameter}) {{}}\n}}\n"));
+        repo.write("custom.toml", "[[swift_protocol_methods]]\nprotocol='Acme.RefreshDelegate'\nmethod='refresh'\nlabels=['_']\nparameter_types=['Swift.String']\nreturn_type='Swift.Void'\nstatic=true\n");
+        let output = cargo_bin_with_explicit_config()
+            .arg("--config")
+            .arg(repo.path("custom.toml"))
+            .args(["dead-code", "--dir"])
+            .arg(repo.root())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let present = value["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["name"] == "Widget.refresh");
+        assert_eq!(present, !excluded, "{protocol} {parameter}: {value}");
+    }
+}
+
+#[test]
+fn dead_code_swift_protocol_custom_unqualified_types_keep_import_ambiguity() {
+    for (expected, actual, returns, excluded) in [
+        ("Payload", "Payload", "Swift.Void", false),
+        ("Swift.String", "Swift.String", "Void", false),
+        ("Swift.String", "Swift.String", "Swift.Void", true),
+    ] {
+        let repo = TestRepo::new();
+        repo.write("Widget.swift", format!("import Acme\nimport Other\npublic struct Widget: Acme.P {{\n public func refresh(_ value: {actual}) -> {returns} {{}}\n}}\n"));
+        repo.write("custom.toml", format!("[[swift_protocol_methods]]\nprotocol='Acme.P'\nmethod='refresh'\nlabels=['_']\nparameter_types=['{expected}']\nreturn_type='Swift.Void'\n"));
+        let output = cargo_bin_with_explicit_config()
+            .arg("--config")
+            .arg(repo.path("custom.toml"))
+            .args(["dead-code", "--dir"])
+            .arg(repo.root())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let present = value["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["name"] == "Widget.refresh");
+        assert_eq!(present, !excluded, "{expected} {returns}: {value}");
+    }
+}
+
+#[test]
+fn dead_code_swift_protocol_git_and_review_preserve_api_and_refs() {
+    let repo = TestRepo::new();
+    repo.write(
+        "Widget.swift",
+        "import Acme\npublic struct Widget: Acme.RefreshDelegate {\n public func removedHelper() {}\n}\n",
+    );
+    repo.write("custom.toml", "[[swift_protocol_methods]]\nprotocol='Acme.RefreshDelegate'\nmethod='refresh'\nlabels=['_']\nparameter_types=['Swift.String']\nreturn_type='Swift.Void'\n");
+    repo.init_git();
+    repo.commit_all("base");
+    repo.write("Widget.swift", "import Acme\npublic struct Widget: Acme.RefreshDelegate {\n public func refresh(_ value: Swift.String) {}\n public func unusedHelper() {}\n}\n");
+    for command in ["dead-code", "review"] {
+        let mut process = cargo_bin_with_explicit_config();
+        process
+            .arg("--config")
+            .arg(repo.path("custom.toml"))
+            .arg(command)
+            .arg("--dir")
+            .arg(repo.root())
+            .arg("--git");
+        if command == "review" {
+            process.arg("--include-wip-dead");
+        }
+        let output = process.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            !value["dead_symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol["name"] == "Widget.refresh"),
+            "{value}"
+        );
+        assert!(
+            value["dead_symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol["name"] == "Widget.unusedHelper"),
+            "{value}"
+        );
+        if command == "review" {
+            assert!(
+                value["api_changes"]["added"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|symbol| symbol["name"] == "Widget.refresh"),
+                "{value}"
+            );
+            let ordinary = repo.run_json("review", &["--git", "--include-wip-dead"]);
+            assert_eq!(value["api_changes"], ordinary["api_changes"], "{value}");
+            assert!(
+                value["api_changes"]["removed_dead"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|symbol| symbol["name"] == "Widget.removedHelper"),
+                "{value}"
+            );
+        }
+    }
+    let ordinary = repo.run_json("refs", &["--name", "refresh"]);
+    let output = cargo_bin_with_explicit_config()
+        .arg("--config")
+        .arg(repo.path("custom.toml"))
+        .args(["refs", "--dir"])
+        .arg(repo.root())
+        .args(["--name", "refresh"])
+        .output()
+        .unwrap();
+    let configured: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(ordinary, configured);
+}
+
+#[test]
+fn dead_code_swift_protocol_staged_uses_index_for_candidate_and_conformance() {
+    for staged_conformance in [false, true] {
+        let repo = TestRepo::new();
+        repo.write("Package.swift", "import PackageDescription\nlet package = Package(name: \"Example\", targets: [.target(name: \"Core\")])\n");
+        repo.create_dir_all("Sources/Core");
+        repo.write("Sources/Core/Point.swift", "public struct Point {}\n");
+        repo.write("Sources/Core/Conformance.swift", "\n");
+        repo.init_git();
+        repo.commit_all("base");
+        repo.write(
+            "Sources/Core/Point.swift",
+            "public struct Point {\n public func hash(into hasher: inout Hasher) {}\n}\n",
+        );
+        if staged_conformance {
+            repo.write(
+                "Sources/Core/Conformance.swift",
+                "extension Point: Hashable {}\n",
+            );
+        }
+        repo.stage_all();
+        // Working tree says precisely the opposite of the index.
+        repo.write(
+            "Sources/Core/Conformance.swift",
+            if staged_conformance {
+                "\n"
+            } else {
+                "extension Point: Hashable {}\n"
+            },
+        );
+        for command in ["dead-code", "review"] {
+            let mut args = vec!["--git", "--staged"];
+            if command == "review" {
+                args.push("--include-wip-dead");
+            }
+            let value = repo.run_json(command, &args);
+            let present = value["dead_symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol["name"] == "Point.hash");
+            assert_eq!(
+                present, !staged_conformance,
+                "{command}, staged={staged_conformance}: {value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dead_code_swift_protocol_bad_config_fails_before_session_or_mcp_starts() {
+    let repo = TestRepo::new();
+    repo.write("bad.toml", "[[swift_protocol_methods]]\nprotocol='Acme.P'\nmethod='refresh'\nlabels=['_']\nreturn_type='Void'\n");
+    for command in ["dead-code", "review", "session", "mcp"] {
+        let mut process = cargo_bin_with_explicit_config();
+        process
+            .arg("--config")
+            .arg(repo.path("bad.toml"))
+            .arg(command)
+            .stdin(Stdio::null());
+        if matches!(command, "dead-code" | "review") {
+            process.arg("--dir").arg(repo.root());
+        }
+        let output = process.output().unwrap();
+        assert!(!output.status.success(), "{command}");
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            diagnostic.contains("Failed to parse config file"),
+            "{command}: {diagnostic}"
+        );
+    }
+}
+
 /// GitLab issue #24 回帰: Flyway の Java マイグレーションクラス
 /// (`extends BaseJavaMigration`) は dead-code 検出から除外される。
 #[test]

@@ -274,7 +274,7 @@ impl OverBudget {
     }
 }
 
-pub(super) struct IndexSnapshot {
+pub(in crate::commands) struct IndexSnapshot {
     _temporary: tempfile::TempDir,
     analysis_dir: PathBuf,
 }
@@ -396,7 +396,7 @@ impl IndexSnapshot {
         }))
     }
 
-    pub(super) fn dir(&self) -> Result<&str> {
+    pub(in crate::commands) fn dir(&self) -> Result<&str> {
         self.analysis_dir
             .to_str()
             .ok_or_else(|| failure("Non-UTF-8 staged analysis path"))

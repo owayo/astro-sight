@@ -8,9 +8,10 @@ use astro_sight::cli::{Cli, Commands};
 use astro_sight::commands::{
     self, BatchSymbolsOpts, CmdAstOpts, CmdContextOpts, CmdDeadCodeOpts, CmdImpactOpts,
     CmdReviewOpts, CmdSymbolsDirOpts, batch_ast, batch_calls, batch_imports, batch_lint,
-    batch_sequence, batch_symbols, cmd_ast, cmd_calls, cmd_cochange, cmd_context, cmd_dead_code,
-    cmd_doctor, cmd_impact, cmd_imports, cmd_lint, cmd_mcp, cmd_refs, cmd_refs_batch, cmd_review,
-    cmd_sequence, cmd_session, cmd_symbols, cmd_symbols_dir,
+    batch_sequence, batch_symbols, cmd_ast, cmd_calls, cmd_cochange, cmd_context,
+    cmd_dead_code_with_swift_protocols, cmd_doctor, cmd_impact, cmd_imports, cmd_lint, cmd_mcp,
+    cmd_refs, cmd_refs_batch, cmd_review_with_swift_protocols, cmd_sequence, cmd_session,
+    cmd_symbols, cmd_symbols_dir,
 };
 use astro_sight::config::ConfigService;
 use astro_sight::error::{AstroError, ErrorCode};
@@ -288,7 +289,13 @@ fn run(cli: Cli) -> Result<()> {
     let service = AppService::new();
     let start = std::time::Instant::now();
 
-    let result = dispatch_command(&service, cli.command, output, include_generated);
+    let result = dispatch_command(
+        &service,
+        cli.command,
+        output,
+        include_generated,
+        &config.swift_protocol_methods,
+    );
 
     let elapsed = start.elapsed();
     info!(
@@ -304,6 +311,7 @@ fn dispatch_command(
     command: Commands,
     output: OutputOptions,
     include_generated: bool,
+    swift_protocols: &astro_sight::config::SwiftProtocolMethods,
 ) -> Result<()> {
     match command {
         Commands::Ast {
@@ -518,7 +526,7 @@ fn dispatch_command(
                 include_wip_dead,
                 include_generated,
             };
-            cmd_review(service, &opts)
+            cmd_review_with_swift_protocols(service, &opts, swift_protocols)
         }
         cmd @ Commands::Cochange { .. } => {
             dispatch_cochange(service, cmd, output, include_generated)
@@ -582,24 +590,27 @@ fn dispatch_command(
             exclude_dirs,
             exclude_globs,
             dead_scope,
-        } => cmd_dead_code(&CmdDeadCodeOpts {
-            dir: &dir,
-            glob: glob.as_deref(),
-            diff: diff.as_deref(),
-            diff_file: diff_file.as_deref(),
-            git,
-            base: base.as_deref(),
-            staged,
-            include_vendor,
-            include_tests,
-            include_build,
-            framework: framework.as_deref(),
-            extra_exclude_dirs: &exclude_dirs,
-            extra_exclude_globs: &exclude_globs,
-            output,
-            dead_scope,
-            include_generated,
-        }),
+        } => cmd_dead_code_with_swift_protocols(
+            &CmdDeadCodeOpts {
+                dir: &dir,
+                glob: glob.as_deref(),
+                diff: diff.as_deref(),
+                diff_file: diff_file.as_deref(),
+                git,
+                base: base.as_deref(),
+                staged,
+                include_vendor,
+                include_tests,
+                include_build,
+                framework: framework.as_deref(),
+                extra_exclude_dirs: &exclude_dirs,
+                extra_exclude_globs: &exclude_globs,
+                output,
+                dead_scope,
+                include_generated,
+            },
+            swift_protocols,
+        ),
         Commands::Doctor => cmd_doctor(output),
         Commands::Session => cmd_session(output),
         Commands::Mcp => cmd_mcp(output),

@@ -18,6 +18,28 @@ skip_generated = true
 
 When `log_path` is omitted, astro-sight uses `logs/` in the directory of the configuration file it loaded. The same applies when a custom file is given with `--config /path/to/config.toml`. An explicit `log_path` is respected as explicit, even when its value equals the default path.
 
+## Swift protocol methods
+
+`dead-code` and `review` omit the five known witnesses for `NSApplicationDelegate`, `NSMenuDelegate`, `Hashable`, and `NSViewRepresentable` from both `dead_symbols` and `test_only_symbols`. Other public methods in the conforming type or extension remain candidates. The owning type can still be dead. API changes and `refs` output are unaffected.
+
+Add external requirements with `[[swift_protocol_methods]]`:
+
+```toml
+[[swift_protocol_methods]]
+protocol = "Acme.RefreshDelegate"
+method = "refresh"                 # name = "refresh" is also accepted
+labels = ["_"]                    # external labels, in declaration order
+parameter_types = ["Swift.String"]
+return_type = "Swift.Void"
+static = false                    # optional; defaults to instance dispatch
+```
+
+The protocol name must include its module. Method names and labels must be Swift identifiers, and every parameter and the return value needs a valid Swift type. `labels` and `parameter_types` must have the same length. Invalid rows, missing fields, duplicate requirements, and unknown row fields fail configuration loading, including direct deserialization of `Config` and startup of `session` / `mcp`. Those transports do not expose dead-code or review commands.
+
+The comparison includes the name, external labels, instance/static dispatch, parameter types, and return type. Use qualified type names to avoid ambiguity between imports. An ambiguous short name or a local declaration shadowing an SDK name prevents exclusion. Async, throwing, generic, conditional, and other unsupported declarations remain candidates. This is a syntax proof, without compiler type inference or expansion of aliases.
+
+Conformances and implementations are collected from the full reference scan, even with `--git` or `--glob`. Separate files are joined only for ordinary literal Swift Package Manager targets under `Sources/<target>` or `Tests/<target>`, without custom source paths or dynamic manifests. Other layouts use evidence within the same file. Staged Swift dead-code analysis reads candidates, conformances, and references from the index snapshot; unstaged changes do not provide evidence. The existing duplicate-name/reference rules still apply to the remaining candidates, so calls to a witness can also keep a same-name helper from being reported.
+
 ## Cache
 
 A cache stores the compact output of single-file `ast` / `symbols` runs, keyed with BLAKE3. When the file content or the astro-sight version changes, the hash changes and the cache entry is invalidated automatically. The version is part of the key so that an old result is never returned when a change in the analysis logic or the output schema changes the result for the same content.

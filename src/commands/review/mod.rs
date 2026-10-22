@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::collections::HashSet;
 use tracing::info;
 
+use crate::config::SwiftProtocolMethods;
 use crate::error::{AstroError, ErrorCode};
 use crate::models::review::{ApiChanges, ApiSymbol, ApiSymbolChange, DeadSymbol, ReviewResult};
 use crate::models::skip::SkipInfo;
@@ -12,8 +13,8 @@ use crate::output::{OutputOptions, serialize_cli_document};
 
 use super::common::{MAX_INPUT_SIZE, log_phase, read_to_string_limited, timed, timed_ok};
 use super::dead_code::{
-    detect_dead_symbols, filter_dead_by_touched_symbols, filter_dead_by_wip_added,
-    filter_diff_files_for_dead_code, resolve_dead_code_excludes,
+    detect_dead_symbols_with_swift_protocols, filter_dead_by_touched_symbols,
+    filter_dead_by_wip_added, filter_diff_files_for_dead_code, resolve_dead_code_excludes,
     resolve_framework_globs_with_auto_detect,
 };
 use super::git_input::{DiffSourceResolution, GitDiffShortRead, resolve_diff_source, run_git_diff};
@@ -61,9 +62,40 @@ pub struct CmdReviewOpts<'a> {
 
 const REVIEW_MAX_ATTEMPTS: usize = 3;
 
+pub(super) fn prepare_dead_code_snapshot(
+    dir: &str,
+    base: &str,
+    diff: &str,
+) -> Result<index_snapshot::IndexSnapshot> {
+    match index_snapshot::IndexSnapshot::prepare(
+        dir,
+        base,
+        diff,
+        index_snapshot::SnapshotBudget::DEFAULT,
+    )? {
+        index_snapshot::PreparedSnapshot::Ready(snapshot) => Ok(snapshot),
+        index_snapshot::PreparedSnapshot::OverBudget(_) => Err(AstroError::new(
+            ErrorCode::InvalidRequest,
+            "staged Swift dead-code snapshot exceeds the analysis limit",
+        )
+        .into()),
+    }
+}
+
 pub fn cmd_review(service: &AppService, opts: &CmdReviewOpts<'_>) -> Result<()> {
+    cmd_review_with_swift_protocols(service, opts, &SwiftProtocolMethods::default())
+}
+
+/// 検証済みの外部 Swift protocol 要件を各 review 試行で共有する。
+pub fn cmd_review_with_swift_protocols(
+    service: &AppService,
+    opts: &CmdReviewOpts<'_>,
+    swift_protocols: &SwiftProtocolMethods,
+) -> Result<()> {
     let git_input = opts.git && opts.diff.is_none() && opts.diff_file.is_none();
-    let result = retry_review(git_input, |_| review_attempt(service, opts, |_, _| {}));
+    let result = retry_review(git_input, |_| {
+        review_attempt_with_swift_protocols(service, opts, swift_protocols, |_, _| {})
+    });
     if opts.hook && result.as_ref().is_err_and(review_input_changed) {
         eprintln!("review input kept changing; run review again");
     }
@@ -99,9 +131,24 @@ fn retry_review<T>(git_input: bool, mut attempt: impl FnMut(usize) -> Result<T>)
 
 /// 競合しうる読み込みと出力前の確認を一つの試行に閉じる。
 /// before_check は同期テスト用。本番の空クロージャは最適化で除かれる。
+#[cfg(test)]
 fn review_attempt(
     service: &AppService,
     opts: &CmdReviewOpts<'_>,
+    before_check: impl FnMut(&ReviewResult, &str),
+) -> Result<()> {
+    review_attempt_with_swift_protocols(
+        service,
+        opts,
+        &SwiftProtocolMethods::default(),
+        before_check,
+    )
+}
+
+fn review_attempt_with_swift_protocols(
+    service: &AppService,
+    opts: &CmdReviewOpts<'_>,
+    swift_protocols: &SwiftProtocolMethods,
     mut before_check: impl FnMut(&ReviewResult, &str),
 ) -> Result<()> {
     // 本体は従来の局所変数名のまま使うため、ここで一括分解する
@@ -343,6 +390,7 @@ fn review_attempt(
         hook,
         include_wip_dead,
         api_added: &api_changes.added,
+        swift_protocols,
     };
     let dead_phase = timed_ok("dead_code", || review_dead_symbols(&dead_opts))?;
     let ReviewDeadSymbols {
@@ -462,6 +510,16 @@ fn prepare_staged_source(
                 ..StagedSource::default()
             },
             index_snapshot::PreparedSnapshot::OverBudget(over) => {
+                if crate::engine::diff::parse_unified_diff(diff)
+                    .iter()
+                    .any(|file| file.new_path.to_ascii_lowercase().ends_with(".swift"))
+                {
+                    return Err(AstroError::new(
+                        ErrorCode::InvalidRequest,
+                        "staged Swift review snapshot exceeds the analysis limit",
+                    )
+                    .into());
+                }
                 let matches = working_tree_matches_index(dir);
                 StagedSource {
                     snapshot: None,
@@ -518,6 +576,65 @@ mod snapshot_tests {
     use super::*;
     use std::fs;
     use std::process::Command;
+
+    #[test]
+    fn swift_protocol_over_budget_staged_review_rejects_worktree_evidence() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repo = temporary.path();
+        crate::commands::tests::common::init_git_repo_for_test(repo);
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(repo)
+                    .status()
+                    .unwrap()
+                    .success()
+            )
+        };
+        fs::write(repo.join("Point.swift"), "public struct Point {}\n").unwrap();
+        fs::write(repo.join("Conformance.swift"), "\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        let base = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        fs::write(
+            repo.join("Point.swift"),
+            "public struct Point {\n public func hash(into value: inout Hasher) {}\n}\n",
+        )
+        .unwrap();
+        git(&["add", "Point.swift"]);
+        fs::write(
+            repo.join("Conformance.swift"),
+            "extension Point: Hashable {}\n",
+        )
+        .unwrap();
+        let dir = repo.to_str().unwrap();
+        let diff = run_git_diff(dir, base.trim(), true).unwrap();
+        let result = prepare_staged_source(
+            dir,
+            base.trim(),
+            &diff,
+            index_snapshot::SnapshotBudget {
+                files: 1,
+                bytes: u64::MAX,
+            },
+        );
+        let error = result
+            .err()
+            .expect("Swift must not use a mixed staged/worktree fallback");
+        assert!(
+            error.to_string().contains("staged Swift review snapshot"),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn changed_worktree_or_index_invalidates_review_result() {
@@ -859,6 +976,7 @@ struct ReviewDeadSymbolsOpts<'a> {
     include_wip_dead: bool,
     /// 同一 diff で新規 export されたシンボル (WIP dead 抑止の判定材料)。
     api_added: &'a [ApiSymbol],
+    swift_protocols: &'a SwiftProtocolMethods,
 }
 
 /// dead symbol 検出 (framework プリセット + ユーザ指定 exclude を適用)。
@@ -900,7 +1018,8 @@ fn review_dead_symbols(opts: &ReviewDeadSymbolsOpts<'_>) -> Result<ReviewDeadSym
         &combined_globs,
         None,
     )?;
-    let detection = detect_dead_symbols(opts.dir, &files, false);
+    let detection =
+        detect_dead_symbols_with_swift_protocols(opts.dir, &files, false, opts.swift_protocols);
     let (dead_symbols, test_only_symbols) = (detection.dead, detection.test_only);
     // dead-scope=touched-symbols: 宣言行が diff の `+` 行と重ならない dead を除外。
     // `--hook` のデフォルトで「changed file 内の元から存在した dead」の
@@ -994,6 +1113,7 @@ mod review_command_tests {
             hook: false,
             include_wip_dead: false,
             api_added: &[],
+            swift_protocols: &SwiftProtocolMethods::default(),
         };
 
         let phase = review_dead_symbols(&opts).expect("missing dir must not be an error");

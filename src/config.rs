@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 
 use crate::output::OutputFormat;
 
+mod swift_protocols;
+pub use swift_protocols::SwiftProtocolMethods;
+pub(crate) use swift_protocols::{SwiftProtocolMethod, compact_type};
+
 /// 実行時に使う設定。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -23,6 +27,8 @@ pub struct Config {
 
     /// Directory scans omit files declared as generated unless explicitly included.
     pub skip_generated: bool,
+    /// Swift の外部 protocol が呼ぶメソッドの追加要件。
+    pub swift_protocol_methods: SwiftProtocolMethods,
 }
 
 impl Default for Config {
@@ -32,6 +38,7 @@ impl Default for Config {
             log_path: default_log_path(),
             format: OutputFormat::Json,
             skip_generated: true,
+            swift_protocol_methods: SwiftProtocolMethods::default(),
         }
     }
 }
@@ -42,6 +49,7 @@ struct RawConfig {
     log_path: Option<PathBuf>,
     format: Option<OutputFormat>,
     skip_generated: Option<bool>,
+    swift_protocol_methods: Option<SwiftProtocolMethods>,
 }
 
 /// デフォルトのログ出力先: ~/.config/astro-sight/logs
@@ -117,6 +125,7 @@ impl ConfigService {
             log_path,
             format: raw.format.unwrap_or_default(),
             skip_generated: raw.skip_generated.unwrap_or(true),
+            swift_protocol_methods: raw.swift_protocol_methods.unwrap_or_default(),
         })
     }
 
@@ -167,6 +176,16 @@ format = "json"
 # 件数を generated_candidates_skipped フィールドに出力する。
 # CLI の --include-generated はこの設定より優先される。
 skip_generated = true
+
+# 外部 Swift protocol のメソッドを dead/test_only 候補から外す追加要件。
+# 名前だけで helper を除かないよう、引数ラベル・型・戻り型をすべて指定する。
+# [[swift_protocol_methods]]
+# protocol = "Acme.RefreshDelegate"
+# method = "refresh"
+# labels = ["_"]
+# parameter_types = ["Swift.String"]
+# return_type = "Swift.Void"
+# static = false
 "#
         .to_string()
     }
