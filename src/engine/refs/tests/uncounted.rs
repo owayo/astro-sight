@@ -70,15 +70,16 @@ fn uncounted_files_are_reported_with_possible_names() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let mut files = vec![
+    let files = vec![
         dir.path().join("ok.ts"),
         dir.path().join("notes.unknownext"),
     ];
 
     // 開けないファイル (権限なし)。root で動いていて読めてしまう環境では確かめない。
     #[cfg(unix)]
-    let locked = {
+    let (files, locked) = {
         use std::os::unix::fs::PermissionsExt;
+        let mut files = files;
         let path = dir.path().join("locked.ts");
         std::fs::write(&path, "delta();\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -86,7 +87,7 @@ fn uncounted_files_are_reported_with_possible_names() {
         if locked {
             files.push(path);
         }
-        locked
+        (files, locked)
     };
     #[cfg(not(unix))]
     let locked = false;
