@@ -30,6 +30,7 @@ mod integration {
     mod impact_output;
     mod impact_rust_reexport;
     mod impact_rust_scope;
+    mod impact_rust_visibility_widening;
     mod impact_ts_barrels;
     mod js_signature_sites;
     mod languages;
