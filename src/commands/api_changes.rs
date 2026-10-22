@@ -117,7 +117,7 @@ pub(crate) fn detect_api_changes(
             // new_path を 1 回 read+parse して exported / callees を導出 (perf #2)。
             let facts = extract_new_file_facts(dir, &df.new_path);
             buckets.parse_truncations.extend(facts.parse_truncations);
-            let new_syms = facts.exported;
+            let new_syms = facts.exported.map(|facts| facts.symbols);
             let in_file_callees = facts.callees;
             if let Some(syms) = &new_syms {
                 for (name, _, _) in syms {
@@ -185,7 +185,7 @@ pub(crate) fn detect_api_changes(
             continue;
         }
         // rename 差分では base 側に新パスが存在しないため、旧版は old_path から読む。
-        let old_syms = extract_exported_symbols_from_git(&base_blobs, &df.old_path);
+        let old_facts = extract_exported_file_facts_from_git(&base_blobs, &df.old_path);
         // new_path を 1 回 read+parse して exported / callees / export surface を導出 (perf #2)。
         // export surface は process_modified_file が再 parse せず使えるよう
         // PreparedDiffFile に持たせる。
@@ -198,10 +198,11 @@ pub(crate) fn detect_api_changes(
         // shebang を消した拡張子なしスクリプトのような in-place 変更も、パスで参照する
         // 利用側は壊れないので対象外 (rename に限る)。
         if df.old_path != df.new_path
-            && old_syms.is_some()
+            && old_facts.is_some()
             && facts.exported.is_none()
             && facts.language_unknown
         {
+            let old_syms = old_facts.map(|facts| facts.symbols);
             collect_deleted_bash_index_names(df, old_syms.as_deref(), &mut index_names);
             prepared.push(PreparedDiffFile::Deleted {
                 old_syms,
@@ -209,7 +210,18 @@ pub(crate) fn detect_api_changes(
             });
             continue;
         }
-        let new_syms = facts.exported;
+        // 同じ parse で得た証拠を比較し、以後は証明済みの名前だけを運ぶ。
+        let parameter_pattern_only_names = if df.old_path == df.new_path {
+            old_facts
+                .as_ref()
+                .zip(facts.exported.as_ref())
+                .map(|(old, new)| old.parameter_pattern_only_names(new))
+                .unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
+        let old_syms = old_facts.map(|facts| facts.symbols);
+        let new_syms = facts.exported.map(|facts| facts.symbols);
         let in_file_callees = facts.callees;
         let new_export_surface_names = facts.export_surface_names;
         if let (Some(old), Some(new)) = (&old_syms, &new_syms) {
@@ -217,6 +229,7 @@ pub(crate) fn detect_api_changes(
                 old,
                 new,
                 &in_file_callees,
+                &parameter_pattern_only_names,
                 is_bash_script_path(&df.old_path),
                 &mut index_names,
             );
@@ -225,6 +238,7 @@ pub(crate) fn detect_api_changes(
             unparsed_declarations: facts.unparsed_declarations,
             old_syms,
             new_syms,
+            parameter_pattern_only_names,
             in_file_callees,
             new_export_surface_names,
         });
@@ -286,6 +300,7 @@ pub(crate) fn detect_api_changes(
                 unparsed_declarations,
                 old_syms,
                 new_syms,
+                parameter_pattern_only_names,
                 in_file_callees,
                 new_export_surface_names,
             } => {
@@ -298,6 +313,7 @@ pub(crate) fn detect_api_changes(
                             unparsed_declarations,
                             old_syms,
                             new_syms,
+                            parameter_pattern_only_names,
                             in_file_callees,
                             new_export_surface_names,
                         },

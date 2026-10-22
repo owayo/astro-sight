@@ -677,6 +677,9 @@ fn collect_modified_symbols(
             {
                 continue;
             }
+            if facts.parameter_pattern_only_names.contains(name) {
+                continue;
+            }
             // closed-in-diff: 同一ファイル内でしか呼ばれていない関数のシグネチャ変更は除外。
             //
             // ただし Python の TypedDict `total=` 変更候補だけはここで落とさない。

@@ -857,7 +857,8 @@ function compute() { return 1; }\n",
     let facts = extract_new_file_facts(dir.path().to_str().expect("utf-8"), "mod.ts");
     let exported: Vec<&str> = facts
         .exported
-        .as_deref()
+        .as_ref()
+        .map(|facts| facts.symbols.as_slice())
         .unwrap_or_default()
         .iter()
         .map(|(n, _, _)| n.as_str())

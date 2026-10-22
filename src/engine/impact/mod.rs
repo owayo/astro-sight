@@ -610,6 +610,7 @@ fn collect_affected_symbols(
             &declaration::DeclarationChangeInput {
                 file_diff,
                 file_path: &df.new_path,
+                old_file_path: &df.old_path,
                 syms: &syms,
                 hunks: &df.hunks,
                 root,

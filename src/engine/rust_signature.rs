@@ -13,6 +13,11 @@ use crate::engine::parser;
 use crate::engine::tree_walk::{Children, Walk, any_node, walk_preorder};
 use crate::language::LangId;
 
+mod parameter_patterns;
+pub(crate) use parameter_patterns::{
+    rust_parameter_import_environment, rust_parameter_pattern_contract,
+};
+
 /// old/new それぞれの同一ファイル内 `pub type` を使い、関数シグネチャの型表現が
 /// 透過的な alias 導入だけで変わったかを証明するコンテキスト。
 ///

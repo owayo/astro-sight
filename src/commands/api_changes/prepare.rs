@@ -100,6 +100,7 @@ pub(crate) struct ModifiedFileFacts<'a> {
         &'a [crate::engine::bash_parse_recovery::UnparsedBashDeclaration],
     pub(crate) old_syms: &'a [(String, String, String)],
     pub(crate) new_syms: &'a [(String, String, String)],
+    pub(crate) parameter_pattern_only_names: &'a HashSet<String>,
     pub(crate) in_file_callees: &'a HashSet<String>,
     pub(crate) new_export_surface_names: &'a HashSet<String>,
 }
@@ -145,6 +146,7 @@ pub(crate) enum PreparedDiffFile {
         unparsed_declarations: Vec<crate::engine::bash_parse_recovery::UnparsedBashDeclaration>,
         old_syms: Option<Vec<(String, String, String)>>,
         new_syms: Option<Vec<(String, String, String)>>,
+        parameter_pattern_only_names: HashSet<String>,
         in_file_callees: std::collections::HashSet<String>,
         /// new_path の export clause / `pub use` が公開する名前集合 (TS/JS/Rust)。
         /// Phase 0 の単一 parse で先取りし、process_modified_file が再 read+parse
@@ -177,6 +179,7 @@ pub(crate) fn collect_modified_file_index_names(
     old_syms: &[(String, String, String)],
     new_syms: &[(String, String, String)],
     in_file_callees: &std::collections::HashSet<String>,
+    parameter_pattern_only_names: &HashSet<String>,
     is_bash_old_file: bool,
     index_names: &mut HashSet<String>,
 ) {
@@ -194,7 +197,9 @@ pub(crate) fn collect_modified_file_index_names(
                     index_names.insert(bare_name(name).to_string());
                 }
             }
-            Some(old_sig) if old_sig != &sig.as_str() => {
+            Some(old_sig)
+                if old_sig != &sig.as_str() && !parameter_pattern_only_names.contains(name) =>
+            {
                 // has_cross_file_refs も bare 名で照合するため exact 名 (qualname) の
                 // 収集は不要 (identifier ノードに一致せず常に 0 件で AC trie を太らせるだけ)。
                 index_names.insert(bare_name(name).to_string());
@@ -355,7 +360,7 @@ pub(crate) struct NewFileFacts {
     pub(crate) unparsed_declarations:
         Vec<crate::engine::bash_parse_recovery::UnparsedBashDeclaration>,
     pub(crate) parse_truncations: Vec<crate::models::truncation::TruncationInfo>,
-    pub(crate) exported: Option<Vec<(String, String, String)>>,
+    pub(crate) exported: Option<ExportedFileFacts>,
     pub(crate) callees: std::collections::HashSet<String>,
     pub(crate) export_surface_names: std::collections::HashSet<String>,
     /// ファイルは読めたが、拡張子 / shebang から言語を判定できなかった
@@ -376,7 +381,7 @@ pub(crate) fn extract_new_file_facts(dir: &str, file_path: &str) -> NewFileFacts
     // exported の test path 短絡: parse せず Some(空) を返す (extract_exported_symbols_from_file と一致)。
     let is_test = is_test_path(std::path::Path::new(file_path));
     if is_test {
-        facts.exported = Some(Vec::new());
+        facts.exported = Some(ExportedFileFacts::default());
     }
     // exported (非 test) / reexports は is_safe_diff_path を要求する。callees は要求しない。
     let safe = crate::engine::impact::is_safe_diff_path(file_path);
@@ -398,8 +403,8 @@ pub(crate) fn extract_new_file_facts(dir: &str, file_path: &str) -> NewFileFacts
     // reexports は元実装でも空)。exported のみ lexer 経由 (非 test かつ safe のとき)。
     if let crate::language::DetectedLang::LexerOnly(lexer_lang) = lang_id.detected() {
         if !is_test && safe {
-            facts.exported = Some(crate::engine::lexer::extract_exported_symbols(
-                &source, lexer_lang, false,
+            facts.exported = Some(ExportedFileFacts::from_symbols(
+                crate::engine::lexer::extract_exported_symbols(&source, lexer_lang, false),
             ));
         }
         return facts;
@@ -432,7 +437,7 @@ pub(crate) fn extract_new_file_facts(dir: &str, file_path: &str) -> NewFileFacts
         && safe
         && let Ok(syms) = crate::engine::symbols::extract_symbols(root, &source, lang_id)
     {
-        facts.exported = Some(filter_exported_symbols(
+        facts.exported = Some(filter_exported_file_facts(
             &syms,
             root,
             &source,
