@@ -117,6 +117,12 @@ pub(super) struct RustPathOwnerIndex {
 pub(super) type RustSourceModule = (PathBuf, PathBuf, Vec<String>);
 pub(super) type RustModuleKey = (PathBuf, Vec<String>);
 
+#[derive(Clone)]
+struct VisibilityModule {
+    crate_root: PathBuf,
+    modules: Vec<String>,
+}
+
 pub(super) struct RustPathOwnerProjectProof {
     pub(super) root: PathBuf,
     pub(super) canonical_root: Option<PathBuf>,
@@ -138,6 +144,7 @@ pub(super) struct RustPathOwnerProjectProof {
     pub(super) reexport_files:
         Mutex<HashMap<PathBuf, Option<Arc<super::rust_reexport_owner::ModuleBindings>>>>,
     leaf_sources: Mutex<HashMap<String, bool>>,
+    visibility_modules: Mutex<HashMap<PathBuf, Option<VisibilityModule>>>,
 }
 
 impl RustPathOwnerProjectProof {
@@ -187,6 +194,7 @@ impl RustPathOwnerProjectProof {
             files: Mutex::new(HashMap::new()),
             reexport_files: Mutex::new(HashMap::new()),
             leaf_sources: Mutex::new(HashMap::new()),
+            visibility_modules: Mutex::new(HashMap::new()),
         }
     }
 
@@ -224,6 +232,88 @@ impl RustPathOwnerProjectProof {
             && *self.no_glob_imports.get_or_init(|| {
                 scan_sources(&self.root, super::rust_visibility_scope::has_glob_import)
             })
+    }
+
+    /// 旧境界内と確定した参照だけを認める。範囲外や不明の参照は除外しない。
+    pub(super) fn explicit_widening_contains(
+        &self,
+        source_path: &str,
+        ref_path: &str,
+        proof: &super::rust_visibility_scope::ExplicitWidening,
+    ) -> bool {
+        if !self.allows_private_widening_paths() {
+            return false;
+        }
+        let Some(source) = self.visibility_module(Path::new(source_path)) else {
+            return false;
+        };
+        let Some(reference) = self.visibility_module(Path::new(ref_path)) else {
+            return false;
+        };
+        if source.crate_root != reference.crate_root {
+            return false;
+        }
+        proof
+            .old_boundary(&source.modules)
+            .is_some_and(|old| reference.modules.starts_with(&old))
+    }
+
+    fn visibility_module(&self, file: &Path) -> Option<VisibilityModule> {
+        if let Some(found) = self
+            .visibility_modules
+            .lock()
+            .expect("visibility cache mutex poisoned")
+            .get(file)
+        {
+            return found.clone();
+        }
+        let result = (|| {
+            let (_, src, modules) = source_module_path_inner(&self.root, file, true)?;
+            let mut owner = None;
+            for root in [src.join("lib.rs"), src.join("main.rs")] {
+                // crate root 自体を別モジュールとして読む配置は所有元が一意でない。
+                if modules.is_empty()
+                    && private_module_file_from_roots(
+                        &self.root,
+                        &src,
+                        &[file.file_stem()?.to_str()?.to_owned()],
+                        true,
+                        true,
+                        [root.clone()],
+                    )
+                    .as_deref()
+                        == Some(file)
+                {
+                    return None;
+                }
+                if private_module_file_from_roots(
+                    &self.root,
+                    &src,
+                    &modules,
+                    true,
+                    true,
+                    [root.clone()],
+                )
+                .as_deref()
+                    == Some(file)
+                {
+                    if owner.is_some() {
+                        // 同じファイルでも複数の crate に属すれば所有元は一意でない。
+                        return None;
+                    }
+                    owner = Some(root);
+                }
+            }
+            Some(VisibilityModule {
+                crate_root: owner?,
+                modules,
+            })
+        })();
+        self.visibility_modules
+            .lock()
+            .expect("visibility cache mutex poisoned")
+            .insert(file.to_owned(), result.clone());
+        result
     }
 
     fn has_safe_private_import_environment(&self) -> bool {
@@ -1750,6 +1840,14 @@ pub(super) fn source_module_path(
     dir: &Path,
     ref_file: &Path,
 ) -> Option<(PathBuf, PathBuf, Vec<String>)> {
+    source_module_path_inner(dir, ref_file, false)
+}
+
+fn source_module_path_inner(
+    dir: &Path,
+    ref_file: &Path,
+    allow_nested_root_names: bool,
+) -> Option<(PathBuf, PathBuf, Vec<String>)> {
     let package = ref_file
         .ancestors()
         .find(|ancestor| dir.join(ancestor).join("Cargo.toml").is_file())?;
@@ -1777,7 +1875,10 @@ pub(super) fn source_module_path(
         .iter()
         .map(|part| (*part).to_owned())
         .collect::<Vec<_>>();
-    if file != "mod.rs" && file != "lib.rs" && file != "main.rs" {
+    if file != "mod.rs"
+        && ((!matches!(file, "lib.rs" | "main.rs"))
+            || (allow_nested_root_names && !folders.is_empty()))
+    {
         modules.push(file.strip_suffix(".rs")?.to_owned());
     } else if matches!(file, "lib.rs" | "main.rs") && !folders.is_empty() {
         return None;
@@ -1793,8 +1894,26 @@ pub(super) fn private_module_file(
     modules: &[String],
     verify_syntax: bool,
 ) -> Option<PathBuf> {
+    private_module_file_from_roots(
+        dir,
+        src,
+        modules,
+        verify_syntax,
+        false,
+        [src.join("lib.rs"), src.join("main.rs")],
+    )
+}
+
+fn private_module_file_from_roots(
+    dir: &Path,
+    src: &Path,
+    modules: &[String],
+    verify_syntax: bool,
+    normalize_raw_names: bool,
+    roots: impl IntoIterator<Item = PathBuf>,
+) -> Option<PathBuf> {
     let mut resolved = None;
-    for root in [src.join("lib.rs"), src.join("main.rs")] {
+    for root in roots {
         if !dir.join(&root).is_file() {
             continue;
         }
@@ -1819,6 +1938,13 @@ pub(super) fn private_module_file(
                     child
                         .child_by_field_name("name")
                         .and_then(|name| name.utf8_text(&source).ok())
+                        .map(|name| {
+                            if normalize_raw_names {
+                                name.strip_prefix("r#").unwrap_or(name)
+                            } else {
+                                name
+                            }
+                        })
                         == Some(module.as_str())
                         && child.child_by_field_name("body").is_none()
                 })

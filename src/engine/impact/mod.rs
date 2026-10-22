@@ -128,6 +128,7 @@ struct FileContext {
     rust_private_method_owners: HashMap<String, String>,
     /// Names whose entire source edit only widens a direct private Rust item.
     rust_private_widening_names: HashSet<String>,
+    rust_explicit_widenings: HashMap<String, rust_visibility_scope::ExplicitWidening>,
 }
 
 fn rust_function_names(lang: LangId, affected: &[AffectedSymbol]) -> HashSet<String> {
@@ -884,6 +885,18 @@ fn collect_affected_symbols(
             } else {
                 HashSet::new()
             };
+        let rust_explicit_widenings =
+            if lang_id == LangId::Rust && diff_files.len() == 1 && df.old_path == df.new_path {
+                rust_visibility_scope::explicit_widenings(
+                    file_diff,
+                    &df.new_path,
+                    &source,
+                    root,
+                    &affected,
+                )
+            } else {
+                HashMap::new()
+            };
         file_contexts.push(FileContext {
             new_path: df.new_path.clone(),
             lang_id,
@@ -894,6 +907,7 @@ fn collect_affected_symbols(
             rust_private_root_names,
             rust_private_method_owners,
             rust_private_widening_names,
+            rust_explicit_widenings,
             affected,
             sig_changes,
             compatible_signature_keys,

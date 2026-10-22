@@ -583,6 +583,7 @@ mod tests {
             rust_private_root_names: Default::default(),
             rust_private_method_owners: Default::default(),
             rust_private_widening_names: Default::default(),
+            rust_explicit_widenings: Default::default(),
         }
     }
 

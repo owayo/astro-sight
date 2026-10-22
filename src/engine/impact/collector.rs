@@ -873,6 +873,7 @@ struct RefFileEvidence<'a> {
     /// 変更元ごとに、参照ファイルが旧 private 宣言のモジュール部分木に入るか。
     /// `None` は証明できないことを表し、`Some(false)` とは区別する。
     rust_private_scope: HashMap<usize, Option<bool>>,
+    rust_explicit_widening_scope: HashMap<(usize, usize), bool>,
     rust_private_import_owners: HashMap<(usize, usize), bool>,
     rust_ref_source: std::cell::OnceCell<Option<Vec<u8>>>,
 }
@@ -1010,6 +1011,7 @@ impl<'a> ImpactCollector<'a> {
             python_source_paths,
             rust_owner_paths: HashMap::new(),
             rust_private_scope: HashMap::new(),
+            rust_explicit_widening_scope: HashMap::new(),
             rust_private_import_owners: HashMap::new(),
             rust_ref_source: std::cell::OnceCell::new(),
         }
@@ -1145,7 +1147,7 @@ impl<'a> ImpactCollector<'a> {
             && !filters::is_same_source_file(self.path_str, source_path)
             && ctx.rust_private_widening_names.contains(name)
             && self.rust_path_owner_project.allows_private_widening_paths();
-        let visibility_only_informational = if visibility_only_widening {
+        let private_visibility_informational = if visibility_only_widening {
             let old_scope = *evidence
                 .rust_private_scope
                 .entry(fc_ix)
@@ -1157,6 +1159,23 @@ impl<'a> ImpactCollector<'a> {
         } else {
             false
         };
+        let explicit_visibility_informational = ctx.lang_id == LangId::Rust
+            && !filter_disabled
+            && !filters::is_same_source_file(self.path_str, source_path)
+            && ctx.rust_explicit_widenings.get(name).is_some_and(|proof| {
+                *evidence
+                    .rust_explicit_widening_scope
+                    .entry((fc_ix, sym_ix_usize))
+                    .or_insert_with(|| {
+                        self.rust_path_owner_project.explicit_widening_contains(
+                            source_path,
+                            self.path_str,
+                            proof,
+                        )
+                    })
+            });
+        let visibility_only_informational =
+            private_visibility_informational || explicit_visibility_informational;
         if ctx.lang_id == LangId::Rust
             && !filter_disabled
             && !filters::is_same_source_file(self.path_str, source_path)
@@ -1574,6 +1593,7 @@ mod tests {
             rust_private_root_names: Default::default(),
             rust_private_method_owners: Default::default(),
             rust_private_widening_names: Default::default(),
+            rust_explicit_widenings: Default::default(),
         }
     }
 
