@@ -49,6 +49,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 - **Bash / zsh の解析エラー** — `engine/bash_parse_recovery.rs` が ERROR 内のトップレベル関数ヘッダだけを API 差分と refs で共有する。新旧とも Bash 文法で解析し、同名が各 1 件の場合に限り `uncertain_removals`（hook: `rm_unverified`）へ分ける。旧側の拡張子なしファイルは旧 blob の shebang で判定し、他言語からシェルへの置き換えによる削除を降格しない。実削除・同名複数定義・文字列や heredoc の曖昧な内容は従来の保守的な判定に残す。疑似シンボルは作らない。`refs` は候補を `unknown` として返し、count / visitor は過少計上を避けるため出現を保持する。変更後の Bash 木に ERROR があれば `parse_error_region` を申告し、zsh の symbols / ast 診断には Bash 文法による代替解析であることを示す。
 
+- **Kotlin の when 分岐境界** — `vendor/tree-sitter-kotlin` は 0.3.5 の Rust binding と ABI 14 を維持した局所修正。`return` の次の括弧付き条件や `else` を前の式へ吸収する場合に、when_entry 専用の隠し外部 token で境界を補う。改行、コメント・引用符、括弧の深さと次の top-level arrow を検査し、通常の複数行 call・infix・if/else は維持する。先読みは深さ128・65,536反復で制限し、未証明な補間や slash は従来の文法へ戻す。scanner の状態と既存 token 番号は変えず、全 token 有効の recovery では無効化する。CLI 0.26.6 / ABI 14 の生成済み C と出典・MIT license を含む。AST の範囲・分岐数・return 数、LF/CRLF・誤分割・不正構文と braced 形との CLI 対照を回帰にする。
+
 - **Python 関数ヘッダの整形** — `engine/python_signature.rs` の AST トークン正規化を API 差分・省略可能な引数追加の互換判定・impact の宣言比較で共有する。トークン間の空白、通常コメント、引数リストの末尾カンマだけを整形差として除く。文字列全体 (f-string を含む)・タプルのカンマ・`# type:` コメントは保持する。impact の行比較結果を打ち消すのは、新旧が解析可能で同名宣言が各 1 件の場合だけ。同名メソッド・overload・復元失敗・構文エラーでは従来の検出を維持する。この打ち消しは Python に限定し、他言語の既存の末尾カンマ比較へ広げない。
 - **AppService 層** — CLI / Session / MCP の統一コアロジック（`src/service.rs`）
 - **Python の関数ローカル束縛と impact** — `engine/python_scope.rs` が引数・代入・for・with/except の束縛を関数単位で索引化する。`VisitorAdapter` はファイル走査の寿命に閉じた遅延索引から `LexicalBinding` を付け、impact の collector だけが確定したローカル参照を除外する。`refs` の単一/バッチ出現一覧と dead-code の件数は変えない。属性名・型注釈・関数外の既定値は除外せず、global/nonlocal・関数内 import・match・解析エラーは保守的に保持する。lambda/内包表記は独自の scope として証明対象外、walrus/PEP 695 の型パラメータ宣言・type 文があるファイルは索引を使わない。関数内 import 等の曖昧性を見落とさないため、索引は部分木ではなく必ず解析木全体から作る。

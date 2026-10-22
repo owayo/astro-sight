@@ -82,5 +82,6 @@ strip = true
 # 文法の独自修正。生成済みパーサーを含むので文法ジェネレータなしでビルドできる。
 [patch.crates-io]
 tree-sitter-bash = { path = "vendor/tree-sitter-bash" }
+tree-sitter-kotlin = { path = "vendor/tree-sitter-kotlin" }
 tree-sitter-swift = { path = "vendor/tree-sitter-swift" }
 tree-sitter-typescript = { path = "vendor/tree-sitter-typescript" }
