@@ -41,7 +41,8 @@ export const TaskKanbanCard = memo(function TaskKanbanCard() {\n\
 
     let syms = extract_new_file_facts(repo.to_str().expect("utf-8 path"), "Card.tsx")
         .exported
-        .expect("symbols");
+        .expect("symbols")
+        .symbols;
     let names: Vec<&str> = syms.iter().map(|(n, _, _)| n.as_str()).collect();
     assert!(
         !names.contains(&"hasAssignee"),

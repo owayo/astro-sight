@@ -98,6 +98,14 @@ For this kind of change, a reference line inside the changed lines is not accept
 
 The proof checks references to the type name and to the names of the functions, variables, and containers that produce values, within the syntax listed above. Types carried by inference through call results, arguments, or returns are not tracked, for example assigning `toRow()` to a variable annotated with a different type whose `note` property conflicts, or `typeof r` after `const r = toRow("a")`.
 
+### Rust Parameter Patterns
+
+Renaming or destructuring a typed ordinary parameter does not change how Rust callers pass arguments. For example, changing `fn double(_n: i32)` to `fn double(n: i32)`, or renaming a tuple pattern with the same tuple type, does not produce `api.mod` or a function signature impact when both declarations and their import environments can be verified. The body may change at the same time. Displayed signatures keep their parameter names.
+
+The proof preserves parameter types, count and order, return types, receivers, generics, bounds, lifetimes, qualifiers, ABI, visibility, enclosing declaration headers and allowed attribute values. Attributes outside the small built-in allowlist, `cfg_attr`, `unsafe(...)` attribute wrappers, parameter attributes, macro invocations in a header, parse errors and ambiguous declarations keep the existing conservative result. Attributes on out-of-line module declarations and external macro expansion are not resolved. Type names are compared as written; this proof does not resolve simultaneous changes to local type definitions or transitive aliases.
+
+This comparison applies to function items. Containers keep their existing checks: a one-line trait can still report `api.mod` for the trait itself, and an impl owner can still have an impact. References and dead-code occurrence counts are unchanged.
+
 ### Python Relative Import Bindings
 
 An unaliased, unconditional module-level `from .cli import main` can bind `main()` to a different function than an unrelated changed `legacy.main`. Impact analysis excludes that use only when the relative module resolves uniquely inside the workspace and contains a single, undecorated, direct definition of the imported function. References to the actual defining module, `.pyi` changes, and import-name occurrences keep their existing handling. `refs` and dead-code reference counts are unchanged.

@@ -148,6 +148,8 @@ pub(super) struct DeclarationHeader {
     /// Rust の引数の束縛に付く `mut` の byte 範囲 (昇順)。本体だけの変更の証明で、
     /// 本体の外のバイト列を比べるときに除く。
     binding_mut_bytes: Vec<(usize, usize)>,
+    /// 通常引数のパターンだけを消した Rust の契約。表示と従来の本体変更証明は変えない。
+    rust_parameter_contract: Option<Vec<String>>,
 }
 
 impl DeclarationHeader {
@@ -208,6 +210,7 @@ pub(super) fn declaration_header(
             display,
             body_bytes,
             binding_mut_bytes: Vec::new(),
+            rust_parameter_contract: None,
         });
     }
 
@@ -274,6 +277,9 @@ pub(super) fn declaration_header(
         display: header_display(source, line_start, header_end, &omitted),
         body_bytes,
         binding_mut_bytes,
+        rust_parameter_contract: (lang_id == LangId::Rust)
+            .then(|| crate::engine::rust_signature::rust_parameter_pattern_contract(decl, source))
+            .flatten(),
     })
 }
 
@@ -358,6 +364,7 @@ pub(super) struct DeclarationChangeInput<'a> {
     /// 対象ファイルの diff 区間。
     pub(super) file_diff: &'a str,
     pub(super) file_path: &'a str,
+    pub(super) old_file_path: &'a str,
     pub(super) syms: &'a [Symbol],
     pub(super) hunks: &'a [HunkInfo],
     pub(super) root: Node<'a>,
@@ -807,6 +814,7 @@ pub(super) fn reconcile_declaration_changes(
     }
     // 行ベースの検出が変更前後のシグネチャ行を揃えられたかを判定するための変更行。
     let mut changed_line_texts: Option<(Vec<String>, Vec<String>)> = None;
+    let mut rust_parameter_environment_unchanged: Option<bool> = None;
 
     for symbol_change in affected.iter_mut() {
         // variable は JS/TS の `const f = (a) => ...` のように関数を束縛するものだけが
@@ -841,17 +849,49 @@ pub(super) fn reconcile_declaration_changes(
             }
             continue;
         }
-        // ヘッダだけでなく本体の外側が byte 単位で不変と証明する。
-        // 属性・import・外側の impl 等を同時に変えた場合は取り消さない。
         if !is_added
-            && has_text_sig_change
             && input.lang_id == LangId::Rust
             && let Some((old, new)) = unique_header_pair(input, &symbol_change.name, &mut old_side)
-            && old.same_contract(&new)
-            && rust_only_body_changed(input, &mut old_side, &old, &new)
         {
-            sig_changes.retain(|sc| sc.name != symbol_change.name);
-            continue;
+            // 名前変更と同時に本体を実装した場合も、通常引数のパターンは呼び出し契約に
+            // 含めない。型・receiver・属性・外側の宣言・import が不変の場合だけ証明する。
+            if old.tokens != new.tokens
+                && old
+                    .rust_parameter_contract
+                    .as_ref()
+                    .zip(new.rust_parameter_contract.as_ref())
+                    .is_some_and(|(old, new)| old == new)
+                && *rust_parameter_environment_unchanged.get_or_insert_with(|| {
+                    if input.old_file_path != input.file_path {
+                        return false;
+                    }
+                    let Some(old) = old_side.get(input) else {
+                        return false;
+                    };
+                    crate::engine::rust_signature::rust_parameter_import_environment(
+                        old.tree.root_node(),
+                        &old.source,
+                    )
+                    .zip(
+                        crate::engine::rust_signature::rust_parameter_import_environment(
+                            input.root,
+                            input.source,
+                        ),
+                    )
+                    .is_some_and(|(old, new)| old == new)
+                })
+            {
+                sig_changes.retain(|sc| sc.name != symbol_change.name);
+                continue;
+            }
+            // 従来の本体変更の証明は byte 比較も求め、適用範囲を広げない。
+            if has_text_sig_change
+                && old.same_contract(&new)
+                && rust_only_body_changed(input, &mut old_side, &old, &new)
+            {
+                sig_changes.retain(|sc| sc.name != symbol_change.name);
+                continue;
+            }
         }
         if !is_added && has_text_sig_change {
             continue;
@@ -1188,6 +1228,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rust_parameter_pattern_proof_handles_new_side_only_diff_sections() {
+        let path = "api.rs";
+        let old = "pub fn f(_n: u8) -> u8 { 0 }\n";
+        for (new, old_path, blocking) in [
+            ("pub fn f(n: u8) -> u8 { n }\n", path, false),
+            ("pub fn f(n: u16) -> u8 { 0 }\n", path, true),
+            ("pub fn f(n: u8) -> u8 { n }\n", "before.rs", true),
+        ] {
+            let text = unified_diff(path, old, new);
+            let hunks = diff::parse_unified_diff(&text)[0].hunks.clone();
+            let sections = diff::FileSections::split(&text);
+            let section = sections.get(path);
+            let tree = parser::parse_source(new.as_bytes(), LangId::Rust).unwrap();
+            let root = tree.root_node();
+            let syms = symbols::extract_symbols(root, new.as_bytes(), LangId::Rust).unwrap();
+            let facts = diff::extract_changed_line_facts(&section, path);
+            let moves = super::super::ReexportMoveIndex::build(&text);
+            let mut affected = super::super::find_affected_symbols(&syms, &hunks, Some(&facts));
+            let mut signatures = super::super::signature::detect_signature_changes(
+                &section,
+                path,
+                &affected,
+                LangId::Rust,
+            );
+            reconcile_declaration_changes(
+                &DeclarationChangeInput {
+                    file_diff: &section,
+                    file_path: path,
+                    old_file_path: old_path,
+                    syms: &syms,
+                    hunks: &hunks,
+                    root,
+                    source: new.as_bytes(),
+                    lang_id: LangId::Rust,
+                    facts: &facts,
+                    reexport_moves: &moves,
+                },
+                &mut affected,
+                &mut signatures,
+            );
+            assert_eq!(
+                signatures.iter().any(|change| change.name == "f"),
+                blocking,
+                "{old_path}: {new}"
+            );
+        }
+    }
+
+    #[test]
     fn js_signature_source_proof_requires_the_modified_direct_function_on_both_sides() {
         let proof = |lang, old: &str, new: &str, extra: Option<&str>| {
             let path = "api.ts";
@@ -1212,6 +1301,7 @@ mod tests {
                 &DeclarationChangeInput {
                     file_diff: &text,
                     file_path: path,
+                    old_file_path: path,
                     syms: &syms,
                     hunks: &hunks,
                     root,
@@ -1429,6 +1519,7 @@ mod tests {
                 &DeclarationChangeInput {
                     file_diff: &diff_text,
                     file_path: "api.rs",
+                    old_file_path: "api.rs",
                     syms: &syms,
                     hunks: &hunks,
                     root,
@@ -1639,6 +1730,7 @@ mod tests {
                 &DeclarationChangeInput {
                     file_diff: &diff_text,
                     file_path: path,
+                    old_file_path: path,
                     syms: &syms,
                     hunks: &hunks,
                     root,

@@ -45,6 +45,7 @@ mod integration {
     mod review_dead_scope;
     mod review_retry;
     mod runtime_invoked_symbols;
+    mod rust_parameter_patterns;
     mod sandbox;
     mod session;
     mod static_const_values;

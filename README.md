@@ -42,6 +42,7 @@ Bash/zsh parse failures are reported explicitly: recognizable declarations insid
 - **References by identifier**: `refs` lists the definitions and references of a symbol across a directory, and `refs --names` looks up many names in one pass
 - **Diff impact**: `context` maps a unified diff to changed symbols, signature changes, and callers, and `impact` exits 1 while callers outside the diff are left unresolved (made for Stop hooks)
 - **Rust type aliases**: a transparent public alias introduced in the same file can turn an equivalent function signature change into an informational result when the old and new syntax trees prove the underlying type is unchanged
+- **Rust parameter patterns**: verified ordinary parameter renames and destructuring changes keep the same call contract; types and receivers remain checked. See [proof boundaries and container limitations](docs/diff-analysis.md#rust-parameter-patterns).
 - **Structured review**: `review` combines the impact, files that usually change together according to git blame (`cochange`), public API changes, and dead symbols in one run
 - **File structure**: `symbols`, `calls`, `imports`, and `ast` return a file's outline, call graph, dependencies, and exact syntax nodes, and `sequence` draws the call flow as a Mermaid sequence diagram
 - **Dead code and rules**: `dead-code` reports exported symbols that nothing references, leaving out the ones test runners and frameworks call at run time, and `lint` checks AST pattern rules written in YAML

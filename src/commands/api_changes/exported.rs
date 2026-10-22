@@ -2,41 +2,129 @@
 
 use super::*;
 
+/// API 表示用シグネチャと、同じ parse で抽出した Rust の引数パターン比較用証拠。
+#[derive(Default)]
+pub(crate) struct ExportedFileFacts {
+    pub(crate) symbols: ExportedSymbols,
+    rust_parameters: RustParameterContracts,
+}
+
+#[derive(Default)]
+struct RustParameterContracts {
+    imports: Option<Vec<String>>,
+    by_name: std::collections::HashMap<String, Option<Vec<String>>>,
+}
+
+impl ExportedFileFacts {
+    pub(crate) fn from_symbols(symbols: ExportedSymbols) -> Self {
+        Self {
+            symbols,
+            ..Self::default()
+        }
+    }
+
+    /// 一意な qualname と同じ import 環境の下で、通常引数のパターンだけが違う名前。
+    pub(crate) fn parameter_pattern_only_names(&self, new: &Self) -> HashSet<String> {
+        let (Some(old_imports), Some(new_imports)) =
+            (&self.rust_parameters.imports, &new.rust_parameters.imports)
+        else {
+            return HashSet::new();
+        };
+        if old_imports != new_imports {
+            return HashSet::new();
+        }
+        let new_signatures: std::collections::HashMap<_, _> = new
+            .symbols
+            .iter()
+            .map(|(name, _, signature)| (name.as_str(), signature.as_str()))
+            .collect();
+        self.symbols
+            .iter()
+            .filter_map(|(name, _, signature)| {
+                let old = self.rust_parameters.by_name.get(name)?.as_ref()?;
+                let current = new.rust_parameters.by_name.get(name)?.as_ref()?;
+                (old == current
+                    && new_signatures
+                        .get(name.as_str())
+                        .is_some_and(|new| *new != signature))
+                .then(|| name.clone())
+            })
+            .collect()
+    }
+}
+
+fn parameter_pattern_contract_for_symbol(
+    sym: &Symbol,
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<Vec<String>> {
+    if !matches!(sym.kind, SymbolKind::Function | SymbolKind::Method) {
+        return None;
+    }
+    let start = tree_sitter::Point {
+        row: sym.range.start.line,
+        column: sym.range.start.column,
+    };
+    let end = tree_sitter::Point {
+        row: sym.range.end.line,
+        column: sym.range.end.column,
+    };
+    let mut node = root.descendant_for_point_range(start, end)?;
+    for _ in 0..64 {
+        if matches!(node.kind(), "function_item" | "function_signature_item") {
+            let name = node.child_by_field_name("name")?.utf8_text(source).ok()?;
+            if crate::language::normalize_identifier(crate::language::LangId::Rust, name)
+                != crate::language::normalize_identifier(crate::language::LangId::Rust, &sym.name)
+            {
+                return None;
+            }
+            return crate::engine::rust_signature::rust_parameter_pattern_contract(node, source);
+        }
+        node = node.parent()?;
+    }
+    None
+}
+
 /// qualname (`Container.method`) から末尾セグメントのみを抜き出す。
 /// `a.b.c` → `c`、`foo` → `foo`。
 pub(crate) fn bare_name(qualname: &str) -> &str {
     qualname.rsplit('.').next().unwrap_or(qualname)
 }
 
-/// ファイルリストからエクスポートシンボルを収集し、参照ゼロのシンボルを返す。
-/// dead-code コマンドと review コマンドの共通コアロジック。
-/// count_non_definition_refs_split で production / test 別に件数のみカウントし、
-/// SymbolReference を確保しない。
-pub(crate) fn extract_exported_symbols_from_git(
+/// 旧 blob の公開面と Rust の引数パターン比較用証拠を、同じ parse から抽出する。
+pub(crate) fn extract_exported_file_facts_from_git(
     base_blobs: &crate::commands::git_input::GitBlobBatch,
     file_path: &str,
-) -> Option<Vec<(String, String, String)>> {
+) -> Option<ExportedFileFacts> {
     // テストファイル配下のシンボルは API 差分検出の対象外。
     // (api.rm の base 側比較もテストファイルからは行わない)
     if is_test_path(std::path::Path::new(file_path)) {
-        return Some(Vec::new());
+        return Some(ExportedFileFacts::default());
     }
     // 旧版は常駐 `git cat-file --batch` で読む (ファイルごとの `git show` 起動を避ける)。
     // revision / path の検証と取得失敗時の None は git_show_blob と同一。
     let old_source = base_blobs.read(file_path)?;
-    extract_exported_symbols_from_source(file_path, &old_source)
+    extract_exported_file_facts_from_source(file_path, &old_source, true)
 }
 
 /// 与えられた旧側ソースから export シンボル一覧を抽出する。
 ///
-/// `extract_exported_symbols_from_git` のフォールバックとして、`--diff-file` の削除 hunk から
+/// `extract_exported_file_facts_from_git` のフォールバックとして、`--diff-file` の削除 hunk から
 /// 復元した旧ソースを直接渡す経路で使う。test path 判定とフィルタは git 経路と同一。
 pub(crate) fn extract_exported_symbols_from_source(
     file_path: &str,
     source: &[u8],
 ) -> Option<ExportedSymbols> {
+    extract_exported_file_facts_from_source(file_path, source, false).map(|facts| facts.symbols)
+}
+
+fn extract_exported_file_facts_from_source(
+    file_path: &str,
+    source: &[u8],
+    collect_metadata: bool,
+) -> Option<ExportedFileFacts> {
     if is_test_path(std::path::Path::new(file_path)) {
-        return Some(Vec::new());
+        return Some(ExportedFileFacts::default());
     }
     let utf8_path = camino::Utf8Path::new(file_path);
     let lang_id = parser::detect_lang(utf8_path, source).ok()?;
@@ -49,14 +137,12 @@ pub(crate) fn extract_exported_symbols_from_source(
     // に誤計上されるのを避けるため、API 変更検出でも trait impl メソッドを除外する。
     // 旧側を読む経路は API 変更検出 (api.rm 比較) のみで使われる。
     // dead-code は最新コミット側だけを見るため framework entrypoint の除外は不要。
-    Some(filter_exported_symbols(
+    let context =
+        ExportSurfaceContext::new(&syms, root, source, lang_id, true, false, Some(file_path));
+    Some(filter_exported_with_metadata(
         &syms,
-        root,
-        source,
-        lang_id,
-        true,
-        false,
-        Some(file_path),
+        &context,
+        collect_metadata,
     ))
 }
 
@@ -753,13 +839,52 @@ pub(crate) fn filter_exported_symbols(
         exclude_framework_entrypoints,
         file_path,
     );
+    filter_exported_with_metadata(syms, &context, false).symbols
+}
+
+pub(crate) fn filter_exported_file_facts(
+    syms: &[Symbol],
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    lang_id: crate::language::LangId,
+    exclude_trait_impls: bool,
+    exclude_framework_entrypoints: bool,
+    file_path: Option<&str>,
+) -> ExportedFileFacts {
+    let context = ExportSurfaceContext::new(
+        syms,
+        root,
+        source,
+        lang_id,
+        exclude_trait_impls,
+        exclude_framework_entrypoints,
+        file_path,
+    );
+    filter_exported_with_metadata(syms, &context, true)
+}
+
+fn filter_exported_with_metadata(
+    syms: &[Symbol],
+    context: &ExportSurfaceContext<'_, '_>,
+    collect_metadata: bool,
+) -> ExportedFileFacts {
+    let &ExportSurfaceContext {
+        root,
+        source,
+        lang_id,
+        ..
+    } = context;
     // マーカーのない通常ファイルでは、宣言ごとの兄弟ノード探索を行わない。
-    let rust_may_have_allow_dead = exclude_framework_entrypoints
+    let rust_may_have_allow_dead = context.exclude_framework_entrypoints
         && lang_id == crate::language::LangId::Rust
         && source
             .windows(b"// astro-sight:allow-dead".len())
             .any(|bytes| bytes == b"// astro-sight:allow-dead");
-    let mut result = Vec::new();
+    let mut result = ExportedFileFacts::default();
+    if collect_metadata && lang_id == crate::language::LangId::Rust {
+        result.rust_parameters.imports =
+            crate::engine::rust_signature::rust_parameter_import_environment(root, source);
+    }
     for sym in syms {
         if context.is_excluded_before_qualname(sym) {
             continue;
@@ -781,7 +906,18 @@ pub(crate) fn filter_exported_symbols(
         }
         // 除外判定後に署名を作り、不要な文字列構築を避ける。
         let sig = extract_api_signature(sym, root, source, &context.lines, lang_id);
-        result.push((qualname, format!("{:?}", sym.kind).to_lowercase(), sig));
+        if result.rust_parameters.imports.is_some() {
+            let contract = parameter_pattern_contract_for_symbol(sym, root, source);
+            result
+                .rust_parameters
+                .by_name
+                .entry(qualname.clone())
+                .and_modify(|entry| *entry = None)
+                .or_insert(contract);
+        }
+        result
+            .symbols
+            .push((qualname, format!("{:?}", sym.kind).to_lowercase(), sig));
     }
     result
 }
@@ -822,4 +958,31 @@ pub(crate) fn is_internally_connected(
         return true;
     }
     false
+}
+
+#[cfg(test)]
+mod parameter_pattern_tests {
+    use super::*;
+
+    #[test]
+    fn parameter_contract_checks_the_name_at_a_byte_range_after_unicode() {
+        let source = "pub fn 前置(_n: u8) {} pub fn r#double(_n: u32) {}".as_bytes();
+        let lang = crate::language::LangId::Rust;
+        let tree = parser::parse_source(source, lang).unwrap();
+        let root = tree.root_node();
+        let symbols = crate::engine::symbols::extract_symbols(root, source, lang).unwrap();
+        let mut symbol = symbols
+            .iter()
+            .find(|symbol| symbol.name.contains("double"))
+            .unwrap()
+            .clone();
+        assert!(parameter_pattern_contract_for_symbol(&symbol, root, source).is_some());
+        // 誤った範囲が隣の宣言を指しても、その契約を対象の名前に結び付けない。
+        symbol.range = symbols
+            .iter()
+            .find(|symbol| symbol.name == "前置")
+            .unwrap()
+            .range;
+        assert!(parameter_pattern_contract_for_symbol(&symbol, root, source).is_none());
+    }
 }
