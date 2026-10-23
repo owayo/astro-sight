@@ -26,11 +26,12 @@ pub(crate) struct RefAttribution {
 /// 参照が「残存シンボル由来」であることの根拠。
 #[derive(Clone)]
 pub(crate) enum RefOrigin {
-    /// 通常の自由関数定義、または同じ Python モジュール内での読み取り。
+    /// 通常の自由関数定義、または同じ Python モジュール内での読み取り。Rust では、修飾部や
+    /// 素の名前から解決できた残るモジュールの自由関数 (path は宣言したファイル) も含む。
     IndependentDefinition { path: String },
     /// Rust のローカル値束縛・非 callable なフィールド名位置。
     LocalValue,
-    /// Rust の関連メンバー定義または直接のメソッド呼び出し。
+    /// Rust の関連メンバー定義、直接のメソッド呼び出し、または型を修飾部に持つ関連項目のパス。
     RustAssociatedMember,
     /// 参照ファイル自身に同名定義が残存している (bash)。静的な依存先に削除ファイルが
     /// 含まれる場合は証明しない。
@@ -238,6 +239,7 @@ pub(crate) struct RefAttributionFacts {
     independent_positions: super::removed_scope::Positions,
     local_positions: super::removed_scope::Positions,
     rust_sites: HashMap<(usize, usize), super::rust_ref_sites::MemberSite>,
+    rust_paths: HashMap<(usize, usize), super::removed_rust_paths::PathSite>,
     /// JS/TS: 出現の位置 (0 始まりの行・byte 列) ごとの分類。外部パッケージの束縛
     /// (`JsRefSite::External`) の出現は参照に数えない。
     js_sites: HashMap<(usize, usize), super::js_ref_sites::JsRefSite>,
@@ -265,6 +267,7 @@ impl RefAttributionFacts {
             independent_positions: HashSet::new(),
             local_positions: HashSet::new(),
             rust_sites: HashMap::new(),
+            rust_paths: HashMap::new(),
             js_sites: HashMap::new(),
             js_member_evidence: HashMap::new(),
             bash_sourced_candidates: None,
@@ -313,6 +316,17 @@ fn ref_origin_for(
             super::rust_ref_sites::MemberSite::AssociatedDefinition
             | super::rust_ref_sites::MemberSite::DirectMethodCall,
         ) => return RefOrigin::RustAssociatedMember,
+        None => {}
+    }
+    match facts.rust_paths.get(&position) {
+        Some(super::removed_rust_paths::PathSite::Associated) => {
+            return RefOrigin::RustAssociatedMember;
+        }
+        Some(super::removed_rust_paths::PathSite::ModuleFunction(path)) => {
+            return RefOrigin::IndependentDefinition {
+                path: path.to_string(),
+            };
+        }
         None => {}
     }
     if facts.local_positions.contains(&position) {
@@ -373,6 +387,7 @@ pub(crate) fn analyze_ref_attribution_facts(
     external_pkgs: &HashSet<String>,
     member_proof: bool,
     export_cache: &mut super::js_ref_sites::JsExportOriginCache,
+    rust_paths: &mut super::removed_rust_paths::RustPathResolver,
 ) -> RefAttributionFacts {
     let abs = if std::path::Path::new(ref_path).is_absolute() {
         std::path::PathBuf::from(ref_path)
@@ -398,7 +413,7 @@ pub(crate) fn analyze_ref_attribution_facts(
         ),
         LangId::Bash => analyze_bash_facts(utf8, ref_path),
         LangId::Python => analyze_python_facts(utf8, symbol),
-        LangId::Rust => analyze_rust_facts(utf8, symbol),
+        LangId::Rust => analyze_rust_facts(utf8, ref_path, symbol, rust_paths),
         _ => RefAttributionFacts::opaque(),
     };
     facts.ref_lang = Some(lang);
@@ -477,7 +492,12 @@ fn analyze_python_facts(utf8: &camino::Utf8Path, symbol: &str) -> RefAttribution
 }
 
 /// 同じファイル・解析木で定義座標と値束縛座標をまとめて収集する。
-fn analyze_rust_facts(utf8: &camino::Utf8Path, symbol: &str) -> RefAttributionFacts {
+fn analyze_rust_facts(
+    utf8: &camino::Utf8Path,
+    ref_path: &str,
+    symbol: &str,
+    rust_paths: &mut super::removed_rust_paths::RustPathResolver,
+) -> RefAttributionFacts {
     let Ok(source) = parser::read_file(utf8) else {
         return RefAttributionFacts::opaque();
     };
@@ -490,6 +510,7 @@ fn analyze_rust_facts(utf8: &camino::Utf8Path, symbol: &str) -> RefAttributionFa
         independent_positions,
         local_positions,
         rust_sites: super::rust_ref_sites::member_positions(tree.root_node(), &source, symbol),
+        rust_paths: rust_paths.positions(tree.root_node(), &source, symbol, ref_path),
         ..RefAttributionFacts::opaque()
     }
 }

@@ -679,6 +679,7 @@ mod ref_index;
 
 mod removed_attribution;
 mod removed_ffi;
+mod removed_rust_paths;
 mod removed_scope;
 
 mod rust_public;

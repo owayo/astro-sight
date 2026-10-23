@@ -115,6 +115,7 @@ pub(crate) fn partition_removed_dead_candidates(
     let mut private_owners = super::python_private_owner::PrivateOwnerRemovals::default();
     let mut old_rust_functions: HashMap<String, Option<super::rust_ref_sites::ModuleFunctions>> =
         HashMap::new();
+    let mut rust_paths = super::removed_rust_paths::RustPathResolver::new(dir);
     let python_old_paths: HashSet<String> = candidates
         .iter()
         .filter(|candidate| candidate.file.ends_with(".py"))
@@ -149,6 +150,7 @@ pub(crate) fn partition_removed_dead_candidates(
                     &external_pkgs,
                     member_names.contains(&r.symbol),
                     &mut export_cache,
+                    &mut rust_paths,
                 )
             });
             let attr = attribution_for_ref(facts, &x.path, &residual_defs, (x.line, x.column));

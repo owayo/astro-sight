@@ -187,7 +187,6 @@ fn rust_reference_sites_removal_preserves_function_values_and_real_uses() {
         "#[rewrite] pub fn get(e: &Engine) -> fn() -> u32 { e.run }\n",
         "pub struct Count { pub run: u32 } pub fn get(e: &Engine) -> fn() -> u32 { e.run }\n",
         "pub struct Count { pub run: u32 } pub fn get(e: &Count) -> fn() -> u32 { let e = Engine { run: fallback }; e.run }\n",
-        "pub fn drive() { Engine::run(); }\n",
         "pub fn drive(e: &Engine) { e.run::<u32>(); }\n",
         "pub fn drive(e: &Engine) { m!(e.run()); }\n",
         "#[rewrite] pub fn drive(e: &Engine) { e.run(); }\n",
@@ -210,6 +209,359 @@ fn rust_reference_sites_removal_preserves_function_values_and_real_uses() {
         assert!(
             api.removed_dead.iter().all(|s| s.name != "run"),
             "{usage}: {api:?}"
+        );
+    }
+}
+
+/// 型 `Engine` を修飾部に持つ `Engine::run` は型の関連項目 (ここでは `&self` のメソッド) を
+/// 指すパスで、フィールドの関数ポインタ (`e.run` でしか読めない) にも、消したモジュールの
+/// 自由関数にもならない。以前は修飾部を確かめずに残存参照と数えていた (Issue #110)。
+/// `Engine::run()` は receiver の引数が足りずコンパイルできないが、パスの指す先は同じ。
+#[test]
+fn rust_reference_sites_removal_ignores_type_paths_beside_function_fields() {
+    let methods = "pub struct Engine { pub run: fn() -> u32 }\nimpl Engine { pub fn run(&self) -> u32 { 1 } }\n";
+    for usage in [
+        "pub fn drive() { Engine::run(); }\n",
+        "pub fn drive(e: &Engine) -> u32 { Engine::run(e) }\n",
+        "pub fn drive() -> fn(&Engine) -> u32 { Engine::run }\n",
+    ] {
+        let client = format!("{methods}{usage}");
+        let api = api_after(
+            &[
+                ("src/api.rs", "pub fn run() -> u32 {\n 7\n}\n"),
+                ("src/client.rs", &client),
+            ],
+            &[("src/api.rs", "pub fn launch() -> u32 {\n 7\n}\n")],
+        );
+        assert!(
+            api.removed.iter().all(|s| s.name != "run"),
+            "{usage}: {api:?}"
+        );
+        assert!(
+            api.removed_dead.iter().any(|s| s.name == "run"),
+            "{usage}: {api:?}"
+        );
+    }
+}
+
+/// `src/launcher.rs` の自由関数 `run` をファイルごと消し、`lib.rs` から `pub mod launcher;` を
+/// 消す。`modules` は変更後の `lib.rs`、`files` は変えないファイル。
+fn api_after_removing_launcher(modules: &str, files: &[(&str, &str)]) -> ApiChanges {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let lib = format!("pub mod launcher;\n{modules}");
+    let mut all = vec![
+        (
+            "Cargo.toml",
+            "[package]\nname = \"tool\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("src/lib.rs", lib.as_str()),
+        ("src/launcher.rs", "pub fn run() -> u32 {\n 7\n}\n"),
+    ];
+    all.extend_from_slice(files);
+    git_commit_files(repo, &all, "base");
+    fs::remove_file(repo.join("src/launcher.rs")).unwrap();
+    fs::write(repo.join("src/lib.rs"), modules).unwrap();
+    detect_api_changes_from_worktree(repo)
+}
+
+/// 修飾部や素の名前が、残るモジュールの自由関数か型の関連項目を指すと確かめられる参照は、
+/// 消した自由関数の残存参照に数えない (Issue #110)。
+#[test]
+fn rust_reference_sites_removal_resolves_paths_to_surviving_items() {
+    let modules = "pub mod engine;\npub mod app;\n";
+    let engine = "pub fn run() -> u32 { 1 }\npub fn drive() -> u32 { run() }\n";
+    let typed = "pub struct Engine;\nimpl Engine { pub fn run() -> u32 { 1 } }\n";
+    for (engine, app) in [
+        // 再現 A: 別モジュールの同名の自由関数へのパスと、同じモジュールの素の呼び出し
+        (engine, "pub fn start() -> u32 { crate::engine::run() }\n"),
+        (engine, "pub fn start() -> u32 { super::engine::run() }\n"),
+        (
+            engine,
+            "pub fn start() -> fn() -> u32 { crate::engine::run }\n",
+        ),
+        (
+            "pub fn run() -> u32 { 1 }\npub fn drive() -> u32 { self::run() }\npub mod inner { pub fn go() -> u32 { super::run() } }\n",
+            "",
+        ),
+        // 再現 B: 同じモジュールが宣言する型の関連関数
+        (
+            "pub struct Engine;\nimpl Engine { pub fn run() -> u32 { 1 } }\npub fn drive() -> u32 { Engine::run() }\n",
+            "",
+        ),
+        (
+            "#[derive(Clone, Debug)]\npub struct Engine;\nimpl Engine { pub fn run() -> u32 { 1 } pub fn go() -> u32 { Self::run() + <Engine>::run() } }\n",
+            "",
+        ),
+        (
+            typed,
+            "pub fn start() -> u32 { crate::engine::Engine::run() }\n",
+        ),
+    ] {
+        let api =
+            api_after_removing_launcher(modules, &[("src/engine.rs", engine), ("src/app.rs", app)]);
+        assert!(
+            api.removed.iter().all(|s| s.name != "run"),
+            "{engine}{app}: {api:?}"
+        );
+        assert!(
+            api.removed_dead.iter().any(|s| s.name == "run"),
+            "{engine}{app}: {api:?}"
+        );
+    }
+    // lib と bin の両方があっても、参照元へ mod 宣言で届く crate root が 1 つなら解決する
+    let api = api_after_removing_launcher(
+        modules,
+        &[
+            ("src/engine.rs", engine),
+            (
+                "src/app.rs",
+                "pub fn start() -> u32 { crate::engine::run() }\n",
+            ),
+            ("src/main.rs", "fn main() {\n    tool::app::start();\n}\n"),
+        ],
+    );
+    assert!(api.removed_dead.iter().any(|s| s.name == "run"), "{api:?}");
+    // 残る定義がインライン mod の中にある・同じファイルに同名のメソッドと属性付きの自由関数がある
+    for (modules, files) in [
+        (
+            "pub mod engine;\npub mod app;\npub mod inner {\n    pub fn run() -> u32 { 1 }\n    pub fn go() -> u32 { run() }\n}\n",
+            [
+                (
+                    "src/engine.rs",
+                    "pub fn drive() -> u32 { crate::inner::run() }\n",
+                ),
+                (
+                    "src/app.rs",
+                    "pub fn start() -> u32 { super::inner::run() }\n",
+                ),
+            ],
+        ),
+        (
+            modules,
+            [
+                (
+                    "src/engine.rs",
+                    "pub struct Engine;\nimpl Engine { pub fn run(&self) -> u32 { 1 } }\n#[inline]\npub fn run() -> u32 { 1 }\npub fn drive(e: &Engine) -> u32 { run() + e.run() }\n",
+                ),
+                (
+                    "src/app.rs",
+                    "pub fn start() -> u32 { crate::engine::run() }\n",
+                ),
+            ],
+        ),
+    ] {
+        let api = api_after_removing_launcher(modules, &files);
+        assert!(
+            api.removed_dead.iter().any(|s| s.name == "run"),
+            "{modules}{files:?}: {api:?}"
+        );
+    }
+}
+
+#[test]
+fn rust_reference_sites_removal_accepts_matching_memberships_and_unrelated_roots() {
+    for extra in [
+        vec![("build.rs", "fn main() {}")],
+        vec![("src/main.rs", "mod engine; mod app; fn main() {}")],
+        vec![("src/scratch.rs", "include!(\"app.rs\");")],
+    ] {
+        let mut files = vec![
+            ("src/engine.rs", "pub fn run() -> u32 { 1 }"),
+            (
+                "src/app.rs",
+                "pub fn start() -> u32 { crate::engine::run() }",
+            ),
+        ];
+        files.extend(extra);
+        let api = api_after_removing_launcher("pub mod engine; pub mod app;", &files);
+        assert!(
+            api.removed_dead.iter().any(|symbol| symbol.name == "run"),
+            "{files:?}: {api:?}"
+        );
+        assert!(
+            api.removed.iter().all(|symbol| symbol.name != "run"),
+            "{files:?}: {api:?}"
+        );
+    }
+}
+
+#[test]
+fn rust_reference_sites_removal_preserves_unicode_import_aliases() {
+    for (module, alias, call) in [
+        ("cafe\u{301}", "cafe\u{301}", "cafe\u{301}"),
+        ("caf\u{e9}", "cafe\u{301}", "caf\u{e9}"),
+        ("K", "\u{212a}", "K"),
+    ] {
+        let source = format!(
+            "mod {module} {{ pub fn run() -> u32 {{ 1 }} }} pub fn drive() -> u32 {{ use crate::launcher as {alias}; {call}::run() }}"
+        );
+        let api = api_after_removing_launcher("pub mod engine;", &[("src/engine.rs", &source)]);
+        assert!(
+            api.removed.iter().any(|symbol| symbol.name == "run"),
+            "{source}: {api:?}"
+        );
+        assert!(
+            api.removed_dead.iter().all(|symbol| symbol.name != "run"),
+            "{source}: {api:?}"
+        );
+    }
+}
+
+/// 変更後の `lib.rs`、`src/engine.rs`、変えないほかのファイル。
+type RemovalCase<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+
+/// 修飾部や素の名前の指す先を確かめられない参照、消したモジュールを指す参照は、
+/// 今と同じく消した自由関数の残存参照として api.rm に残す (Issue #110)。
+#[test]
+fn rust_reference_sites_removal_keeps_unresolved_and_removed_paths() {
+    let modules = "pub mod engine;\npub mod app;\n";
+    let engine = "pub fn run() -> u32 { 1 }\npub fn drive() -> u32 { run() }\n";
+    let cases: &[RemovalCase<'_>] = &[
+        // 消したモジュールを指すパスと、消した関数の import・別名
+        (
+            modules,
+            engine,
+            &[(
+                "src/app.rs",
+                "pub fn start() -> u32 { crate::launcher::run() }\n",
+            )],
+        ),
+        (
+            modules,
+            engine,
+            &[(
+                "src/app.rs",
+                "use crate::launcher::run;\npub fn start() -> u32 { run() }\n",
+            )],
+        ),
+        (
+            modules,
+            engine,
+            &[(
+                "src/app.rs",
+                "use crate::launcher as engine2;\npub fn start() -> u32 { engine2::run() }\n",
+            )],
+        ),
+        // 先頭が宣言の無い名前 (外部 crate かもしれない)
+        (
+            modules,
+            engine,
+            &[("src/app.rs", "pub fn start() -> u32 { engine::run() }\n")],
+        ),
+        // マクロの中・属性付きの item・ブロックのグロブ import・cfg 付きの定義
+        (
+            modules,
+            "pub fn run() -> u32 { 1 }\nmacro_rules! m { ($e:expr) => { $e }; }\npub fn drive() -> u32 { m!(run()) }\n",
+            &[],
+        ),
+        (
+            modules,
+            "pub fn run() -> u32 { 1 }\n#[rewrite]\npub fn drive() -> u32 { run() }\n",
+            &[],
+        ),
+        (
+            modules,
+            "pub fn run() -> u32 { 1 }\npub fn drive() -> u32 { use crate::app::*; run() }\n",
+            &[],
+        ),
+        (
+            modules,
+            "#[cfg(test)]\npub fn run() -> u32 { 1 }\npub fn drive() -> u32 { run() }\n",
+            &[],
+        ),
+        // 型名・モジュール名をブロックの import が隠す (呼び出しより後の import も)・ブロックの
+        // derive が item を足し得る・修飾部の型が同じモジュールに無い
+        (
+            modules,
+            "pub struct Engine;\npub fn drive() -> u32 { use crate::app as Engine; Engine::run() }\n",
+            &[],
+        ),
+        (
+            modules,
+            "pub mod inner { pub fn run() -> u32 { 1 } }\npub fn drive() -> u32 { use crate::app as inner; inner::run() }\n",
+            &[],
+        ),
+        (
+            modules,
+            "pub mod inner { pub fn run() -> u32 { 1 } }\npub fn drive() -> u32 { let n = inner::run(); use crate::app as inner; n }\n",
+            &[],
+        ),
+        (
+            modules,
+            "pub fn run() -> u32 { 1 }\npub fn drive() -> u32 { #[derive(Inject)] struct Marker; run() }\n",
+            &[],
+        ),
+        (
+            modules,
+            "pub fn drive() -> u32 { Engine::run() }\n",
+            &[("src/app.rs", "pub struct Engine;\n")],
+        ),
+        // 同じファイルを別の crate やモジュールに置き得る `#[path]`・`include!`・暗黙の build script
+        (
+            "pub mod engine;\npub mod app;\n#[path = \"engine.rs\"]\nmod mirror;\n",
+            engine,
+            &[(
+                "src/app.rs",
+                "pub fn start() -> u32 { crate::engine::run() }\n",
+            )],
+        ),
+        (
+            "pub mod engine; pub mod app; mod extra;\n",
+            engine,
+            &[
+                (
+                    "src/app.rs",
+                    "pub fn start() -> u32 { crate::engine::run() }\n",
+                ),
+                ("src/extra.rs", "include!(\"app.rs\");\n"),
+            ],
+        ),
+        (
+            modules,
+            engine,
+            &[
+                (
+                    "src/app.rs",
+                    "pub fn start() -> u32 { crate::engine::run() }\n",
+                ),
+                (
+                    "build.rs",
+                    "#[path = \"src/app.rs\"] mod mirror; fn main() {}\n",
+                ),
+            ],
+        ),
+        // 別の root で同じ参照が別の宣言へ解決される
+        (
+            modules,
+            engine,
+            &[
+                (
+                    "src/app.rs",
+                    "pub fn start() -> u32 { crate::engine::run() }\n",
+                ),
+                (
+                    "src/main.rs",
+                    "mod app; mod engine { pub fn run() -> u32 { 2 } } fn main() {}\n",
+                ),
+            ],
+        ),
+    ];
+    for (modules, engine, files) in cases {
+        let mut all = vec![("src/engine.rs", *engine)];
+        all.extend_from_slice(files);
+        if !all.iter().any(|(path, _)| *path == "src/app.rs") {
+            all.push(("src/app.rs", ""));
+        }
+        let api = api_after_removing_launcher(modules, &all);
+        assert!(
+            api.removed.iter().any(|s| s.name == "run"),
+            "{modules}{engine}{files:?}: {api:?}"
+        );
+        assert!(
+            api.removed_dead.iter().all(|s| s.name != "run"),
+            "{modules}{engine}{files:?}: {api:?}"
         );
     }
 }

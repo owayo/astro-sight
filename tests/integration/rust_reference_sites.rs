@@ -122,6 +122,135 @@ fn rust_reference_sites_hook_removal_keeps_occurrence_and_dead_code_contracts() 
     }
 }
 
+/// `src/launcher.rs` の自由関数 `run` をファイルごと消し、`lib.rs` から `pub mod launcher;` を
+/// 消した差分の hook 出力と終了コード。`files` は変えないファイル。
+fn hook_after_removing_launcher(
+    modules: &str,
+    files: &[(&str, &str)],
+) -> (TestRepo, Option<i32>, serde_json::Value) {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"tool\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", format!("pub mod launcher;\n{modules}"));
+    repo.write("src/launcher.rs", "pub fn run() -> u32 {\n    7\n}\n");
+    for (path, source) in files {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            repo.create_dir_all(parent);
+        }
+        repo.write(path, source);
+    }
+    repo.init_git();
+    repo.commit_all("base");
+    repo.remove_file("src/launcher.rs");
+    repo.write("src/lib.rs", modules);
+    let output = cargo_bin()
+        .args([
+            "review",
+            "--dir",
+            repo.root().to_str().unwrap(),
+            "--git",
+            "--hook",
+        ])
+        .output()
+        .unwrap();
+    let hook = serde_json::from_slice(&output.stderr).unwrap();
+    (repo, output.status.code(), hook)
+}
+
+fn hook_lists(hook: &serde_json::Value, key: &str, name: &str) -> bool {
+    hook["api"][key]
+        .as_array()
+        .is_some_and(|symbols| symbols.iter().any(|symbol| symbol["n"] == name))
+}
+
+/// Issue #110: 別モジュールの同名の自由関数や別の型の同名の関連関数をパス付きで呼ぶだけなら、
+/// 呼ばれていない自由関数を消す差分は rm_dead にする。消したモジュールを指すパスや、消した関数の
+/// import の後の素の呼び出しは api.rm に残す。refs の出現一覧は変えない。
+#[test]
+fn rust_reference_sites_hook_removal_resolves_qualified_paths() {
+    let engine = "pub fn run() -> u32 {\n    1\n}\n\npub fn drive() -> u32 {\n    run()\n}\n";
+    let modules = "pub mod engine;\npub mod app;\n";
+    let (repo, code, hook) = hook_after_removing_launcher(
+        modules,
+        &[
+            ("src/engine.rs", engine),
+            (
+                "src/app.rs",
+                "pub fn start() -> u32 {\n    crate::engine::run()\n}\n",
+            ),
+        ],
+    );
+    assert_eq!(code, Some(0), "{hook}");
+    assert!(hook_lists(&hook, "rm_dead", "run"), "{hook}");
+    assert!(!hook_lists(&hook, "rm", "run"), "{hook}");
+    let refs = repo.run_json("refs", &["--name", "run"]);
+    assert_eq!(refs["refs"].as_array().unwrap().len(), 3, "{refs}");
+
+    let (_, code, hook) = hook_after_removing_launcher(
+        "pub mod engine;\n",
+        &[(
+            "src/engine.rs",
+            "pub struct Engine;\n\nimpl Engine {\n    pub fn run() -> u32 {\n        1\n    }\n}\n\npub fn drive() -> u32 {\n    Engine::run()\n}\n",
+        )],
+    );
+    assert_eq!(code, Some(0), "{hook}");
+    assert!(hook_lists(&hook, "rm_dead", "run"), "{hook}");
+
+    for app in [
+        "pub fn start() -> u32 {\n    crate::launcher::run()\n}\n",
+        "use crate::launcher::run;\n\npub fn start() -> u32 {\n    run()\n}\n",
+    ] {
+        let (_, code, hook) = hook_after_removing_launcher(
+            modules,
+            &[("src/engine.rs", engine), ("src/app.rs", app)],
+        );
+        assert_eq!(code, Some(1), "{app}: {hook}");
+        assert!(hook_lists(&hook, "rm", "run"), "{app}: {hook}");
+        assert!(!hook_lists(&hook, "rm_dead", "run"), "{app}: {hook}");
+    }
+}
+
+#[test]
+fn rust_reference_sites_hook_removal_audits_ignored_test_roots() {
+    let modules = "pub mod engine; pub mod app;";
+    let engine = "pub fn run() -> u32 { 1 }";
+    let app = "pub fn start() -> u32 { super::engine::run() }";
+    for extra in [
+        vec![(
+            "tests/local.rs",
+            "use tool::launcher as engine; #[path = \"../src/app.rs\"] mod app; #[test] fn smoke() { app::start(); }",
+        )],
+        vec![(
+            "examples/probe.rs",
+            "macro_rules! mount { ($a:ident, $p:literal) => { #[$a = $p] mod app; }; } use tool::launcher as engine; mount!(path, \"../src/app.rs\"); fn main() { app::start(); }",
+        )],
+    ] {
+        let mut files = vec![
+            ("src/engine.rs", engine),
+            ("src/app.rs", app),
+            (".gitignore", "tests/\nexamples/\n"),
+        ];
+        files.extend(extra);
+        let (_, code, hook) = hook_after_removing_launcher(modules, &files);
+        assert_eq!(code, Some(1), "{files:?}: {hook}");
+        assert!(hook_lists(&hook, "rm", "run"), "{hook}");
+        assert!(!hook_lists(&hook, "rm_dead", "run"), "{hook}");
+    }
+    for extra in [
+        vec![("build.rs", "fn main() {}")],
+        vec![("src/main.rs", "mod engine; mod app; fn main() {}")],
+    ] {
+        let mut files = vec![("src/engine.rs", engine), ("src/app.rs", app)];
+        files.extend(extra);
+        let (_, code, hook) = hook_after_removing_launcher(modules, &files);
+        assert_eq!(code, Some(0), "{files:?}: {hook}");
+        assert!(hook_lists(&hook, "rm_dead", "run"), "{hook}");
+    }
+}
+
 #[test]
 fn rust_reference_sites_hook_removal_keeps_unproven_field_values_blocking() {
     for result in [
