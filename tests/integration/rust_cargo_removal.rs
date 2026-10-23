@@ -340,3 +340,91 @@ fn rust_cargo_removal_hook_keeps_refs_and_dead_code_occurrences() {
         );
     }
 }
+
+#[test]
+fn rust_cargo_removal_hook_allows_standard_macros_and_derives() {
+    // 実際のワークスペースによくある標準のマクロ・derive・テストのモジュールでは証明を続ける
+    // (Issue #117)。
+    let engine = "pub fn run() -> u32 {\n    1\n}\n\npub fn drive() -> u32 {\n    println!(\"drive\");\n    run()\n}\n\n#[derive(Debug, Clone)]\npub struct Marker;\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn drives() {\n        assert_eq!(drive(), 1);\n    }\n}\n\nmod indirect {\n    use super::run;\n    pub fn call() -> u32 {\n        run()\n    }\n}\n";
+    let repo = remove_old_app(&package("engine", ""), engine);
+    assert_eq!(review_hook(&repo, &[]), (Some(0), "rm_dead".to_owned()));
+    // import 経由の未解決参照は Cargo の証明を要し、staged では保守的に残す。
+    repo.stage_all();
+    assert_eq!(
+        review_hook(&repo, &["--staged"]),
+        (Some(1), "rm".to_owned())
+    );
+    // 外部のマクロは展開で別 package のソースを取り込みうるので、今と同じく止まる。
+    let repo = remove_old_app(
+        &package("engine", ""),
+        &format!("{engine}\npub fn fail() -> u32 {{\n    anyhow::bail!(\"x\")\n}}\n"),
+    );
+    assert_eq!(review_hook(&repo, &[]), (Some(1), "rm".to_owned()));
+}
+
+#[test]
+fn rust_cargo_removal_hook_keeps_unproven_standard_macro_scopes() {
+    for source in [
+        format!(
+            "pub use custom as origin;\npub use crate::origin as relay;\nuse crate::relay::*;\n{ENGINE_IMPORT_RUN}\npub fn show() {{ println!(\"x\"); }}\n"
+        ),
+        format!(
+            "{ENGINE_IMPORT_RUN}\npub fn show() {{ let _ = vec![{{ use custom::println; println!(); 1 }}]; }}\n"
+        ),
+        format!(
+            "{ENGINE_IMPORT_RUN}\npub fn show() {{ let _ = vec![{{ #[custom::attribute] fn generated() {{}} 1 }}]; }}\n"
+        ),
+        format!(
+            "{ENGINE_IMPORT_RUN}\npub fn show() {{ let _ = vec![{{ #[derive(custom::Derive)] struct Generated; 1 }}]; }}\n"
+        ),
+        format!(
+            "{ENGINE_IMPORT_RUN}\npub fn show() {{ let _ = vec![{{ macro_rules! println {{ () => {{}}; }} println!(); 1 }}]; }}\n"
+        ),
+    ] {
+        let repo = remove_old_app(
+            &package("engine", "[dependencies]\ncustom = \"1\"\n"),
+            &source,
+        );
+        assert_eq!(
+            review_hook(&repo, &[]),
+            (Some(1), "rm".to_owned()),
+            "{source}"
+        );
+    }
+    for name in ["proc_macro", "test"] {
+        let manifest = package(
+            "engine",
+            &format!("[dependencies]\n{name} = {{ package = \"custom\", version = \"1\" }}\n"),
+        );
+        let source = format!(
+            "extern crate {name} as shim;\nuse crate::shim::*;\n{ENGINE_IMPORT_RUN}\npub fn show() {{ println!(\"x\"); }}\n"
+        );
+        let repo = remove_old_app(&manifest, &source);
+        assert_eq!(
+            review_hook(&repo, &[]),
+            (Some(1), "rm".to_owned()),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn rust_cargo_removal_hook_rejects_replaced_sysroot_in_legacy_tables() {
+    let source = format!(
+        "use std::println;\n{ENGINE_IMPORT_RUN}\n#[cfg(test)] pub fn show() {{ println!(\"x\"); }}\n"
+    );
+    let repo = remove_old_app(&package("engine", ""), &source);
+    assert_eq!(review_hook(&repo, &[]), (Some(0), "rm_dead".to_owned()));
+    for table in ["dev_dependencies", "build_dependencies"] {
+        for prefix in ["", "target.'cfg(unix)'."] {
+            let dependencies =
+                format!("[{prefix}{table}]\nstd = {{ package = \"custom\", version = \"1\" }}\n");
+            let repo = remove_old_app(&package("engine", &dependencies), &source);
+            assert_eq!(
+                review_hook(&repo, &[]),
+                (Some(1), "rm".to_owned()),
+                "{dependencies}"
+            );
+        }
+    }
+}

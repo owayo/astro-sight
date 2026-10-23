@@ -145,6 +145,10 @@ Rust ソースの変更がファイル直下の private 宣言への `pub(crate)
 
 Rust の型と自由関数の参照では、通常の Cargo モジュール配置に限り、名前付き import・`pub use` の連鎖・glob import をたどって宣言元を確認する。参照が別ファイルの同名宣言を指し、解決に使った束縛が差分の前後で変わらない場合だけ影響候補から除外する。別名 import が利用・公開されるか、子モジュールからの利用があり得る場合は、元の名前が現れる import 行を blocking に残す。標準 crate または registry 依存と証明できる別名 import は情報提供に保つ。registry 依存と見なすのは、Cargo がそのパッケージで読む設定 (パッケージの祖先の `.cargo/config(.toml)` と、プロジェクトの置き場所に関係なく読む `$CARGO_HOME/config(.toml)`) と環境変数に、依存の取得元 (`[patch]`・`[source]`・`paths`)・コンパイラ (`rustc`・wrapper・`[env]` で rustc に渡す差し替え)・`--extern` を変えうるものが無く、どれも読めて解析できる場合に限る。`cargo --config` で渡す設定と、パッケージの根より下のディレクトリで cargo を動かしたときにだけ読む設定は見えない。その他の外部 import、条件付き束縛、曖昧な glob、束縛変更、特殊なソース配置、ステージ済みの解析では従来の保守的な判定を維持する。`refs` と dead-code の出力は変えない。
 
+Cargo の依存で変更元の package に届かない別 package の同名参照も、到達性を証明できた場合だけ除外する。この走査では、修飾なしの標準の式マクロと組み込みの derive・属性を許す。ワークスペース全体のマクロ定義・import と、`std` / `core` / `alloc` の名前を差し替える宣言・依存・library 名を調べ、使った標準名を上書きし得る場合は証明しない。依存は `dev-dependencies` / `build-dependencies` と従来の `dev_dependencies` / `build_dependencies` を、target 別の表も含めて同じ条件で調べる。マクロの引数内は token tree なので、そこに `use`・`extern`・マクロ定義・属性があれば保留する。glob は標準クレート起点のものと、`crate` / `self` / `super` だけを通るものに限る。テスト内の `use super::*` は許すが、`use crate::facade::*` は `facade` が外部クレートの別名を何段でも経由し得るため保留する。
+
+未知のマクロ・独自の derive・属性マクロ・修飾したマクロ呼び出し（`std::println!` も含む）は保留する。未知マクロの定義元クレートと依存の解決は行わない。`include!`・`path`、独自のビルド構成、ソースの読み取り・解析失敗、LFS のポインタなどの既存の障壁も維持する。この到達性の検査は削除した Rust 自由関数の API 判定と共有し、`refs` と dead-code の出現一覧を変えない。
+
 ```bash
 # git diff を自動取得して未解決影響を検出（推奨）
 astro-sight impact --dir . --git
@@ -488,6 +492,8 @@ astro-sight review --dir . --git
 ### bin-only Rust crate の API 差分除外
 
 `review` の `api_changes`（`added` / `removed` / `modified`）は、bin-only Rust crate（`src/lib.rs` がなく `Cargo.toml` に `[lib]` セクションもない）の `pub fn` 変更を自動的に除外する。bin-only crate の `pub fn` は crate 外から到達できないため、追加・削除・シグネチャ変更いずれも外部公開 API の互換性問題にはならない。`src/lib.rs` を削除する変更が同じ diff に含まれていても、base リビジョン側で library crate だった場合は、旧公開 API の削除を正しく `removed` に残す。
+
+削除した Rust の自由関数では、既存の帰属証明を先に使い、未解決の同名の出現について、変更前と変更後の両方で Cargo の依存が削除元 package に届かないと証明できたものを除く。残りで既存の削除判定をやり直す。この証拠は起動時の環境、字句上と実体側の祖先、`CARGO_HOME` の設定も調べ、`--extern`・コンパイラの差し替えなどがあれば使わない。staged では元の Cargo 設定の場所を確定できないため、この証拠を使わない。標準マクロ・derive・属性の検査は上記の impact と共通で、`println!` や `#[derive(Debug)]` だけでは証明を止めない。属性付き・ABI 付きの削除関数や、変更後も削除元 package を指し得る参照は対象外。同じ差分で書き換えた参照ファイルでは、同じファイル直下の自由関数への修飾なしの束縛を証明できた出現だけを除く。
 
 ## cochange - 共変更パターン検出
 

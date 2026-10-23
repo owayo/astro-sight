@@ -479,6 +479,13 @@ fn rust_cargo_removal_call_written_in_this_diff_needs_a_binding() {
             "",
             true,
         ),
+        // 標準の式マクロは item を作らないので、同じファイルの関数への束縛を変えない (Issue #117)。
+        (
+            "pub fn drive() -> u32 {\n    1\n}\n",
+            "pub fn run() -> u64 {\n    1\n}\n\npub fn drive() -> u64 {\n    println!(\"drive\");\n    run()\n}\n",
+            "",
+            true,
+        ),
     ] {
         let api = api_after(
             &[
@@ -525,23 +532,200 @@ fn rust_cargo_removal_mention_of_removed_crate_keeps_api_rm() {
 }
 
 #[test]
-fn rust_cargo_removal_macro_in_either_tree_keeps_api_rm() {
-    // マクロはソースを取り込めるので、ワークスペースのどこかにあれば証明しない。
+fn rust_cargo_removal_standard_macros_and_derives_keep_the_proof() {
+    // 標準のマクロと組み込みの derive・属性はソースを取り込まない (Issue #117)。
+    // indirect の use は既存の帰属証拠だけでは外せず、Cargo の証明を必要とする。
+    let printing = "pub fn run() -> u32 {\n    1\n}\n\npub fn drive() -> u32 {\n    println!(\"drive\");\n    run()\n}\n\nmod indirect {\n    use super::run;\n    pub fn call() -> u32 {\n        run()\n    }\n}\n".to_owned();
+    let nested = "pub fn run() -> u32 {\n    1\n}\n\npub fn drive() -> u32 {\n    println!(\"{:?}\", vec![run()]);\n    run()\n}\n\nmod indirect {\n    use super::run;\n    pub fn call() -> u32 {\n        run()\n    }\n}\n".to_owned();
+    let block = "pub fn run() -> u32 {\n    1\n}\n\npub fn drive() -> u32 {\n    let values = vec![{ let value = run(); assert_eq!(value, 1); value }];\n    values[0]\n}\n\nmod indirect {\n    use super::run;\n    pub fn call() -> u32 {\n        run()\n    }\n}\n".to_owned();
+    let derived =
+        format!("{ENGINE_IMPORT_RUN}\n#[derive(Debug, Clone, PartialEq)]\npub struct Marker;\n");
+    let tested = format!(
+        "{ENGINE_IMPORT_RUN}\n#[cfg(test)]\nmod tests {{\n    use super::*;\n\n    #[test]\n    fn drives() {{\n        assert_eq!(drive(), 1);\n    }}\n\n    #[test]\n    #[ignore = \"slow\"]\n    #[should_panic]\n    fn panics() {{\n        panic!(\"x\");\n    }}\n}}\n"
+    );
+    // std から持ち込んだ名前は、std を差し替えていなければ標準のもの。
+    let imported = format!(
+        "use std::fmt::Debug;\n\n{ENGINE_IMPORT_RUN}\n#[derive(Debug)]\npub struct Marker;\n"
+    );
     for (old_source, engine_source) in [
+        (OLD_RUN.to_owned(), printing),
+        (OLD_RUN.to_owned(), nested),
+        (OLD_RUN.to_owned(), block),
+        (OLD_RUN.to_owned(), derived),
+        (OLD_RUN.to_owned(), tested),
+        (OLD_RUN.to_owned(), imported),
+        // 変更前のツリーにだけあるマクロも同じ。
         (
-            OLD_RUN,
-            "pub fn run() -> u32 {\n    1\n}\n\npub fn drive() -> u32 {\n    assert!(run() > 0);\n    run()\n}\n",
-        ),
-        (
-            "pub fn run() -> u32 {\n    vec![7].len() as u32\n}\n",
-            ENGINE_IMPORT_RUN,
+            "pub fn run() -> u32 {\n    vec![7].len() as u32\n}\n".to_owned(),
+            ENGINE_IMPORT_RUN.to_owned(),
         ),
     ] {
-        let api = remove_old_app(("", ""), old_source, engine_source);
-        assert!(
-            !is_dead(&api, "run"),
-            "{old_source}{engine_source}: {api:?}"
+        let api = remove_old_app(("", ""), &old_source, &engine_source);
+        assert!(is_dead(&api, "run"), "{old_source}{engine_source}: {api:?}");
+    }
+}
+
+#[test]
+fn rust_cargo_removal_shadowed_standard_names_keep_api_rm() {
+    let drive = "pub fn run() -> u32 {\n    1\n}\n\npub fn drive() -> u32 {\n    println!(\"drive\");\n    run()\n}\n\nmod indirect {\n    use super::run;\n    pub fn call() -> u32 {\n        run()\n    }\n}\n";
+    let marker = format!("{ENGINE_IMPORT_RUN}\n#[derive(Debug)]\npub struct Marker;\n");
+    for engine_source in [
+        // 同名の macro_rules! と、std 以外から持ち込んだ同名のマクロ・derive は標準のものではない。
+        format!("macro_rules! println {{\n    ($($t:tt)*) => {{}};\n}}\n\n{drive}"),
+        format!("use custom::println;\n\n{drive}"),
+        format!("use custom::Debug;\n\n{marker}"),
+        format!("use crate::shim::Debug;\n\n{marker}"),
+        // 外部の glob と、外部の名前を通る glob は同名のマクロを持ち込みうる。
+        format!("use custom::*;\n\n{drive}"),
+        format!("use custom as shim;\nuse self::shim::*;\n\n{drive}"),
+        // std という名前そのものを差し替えると、std から持ち込んだ名前も標準とは限らない。
+        format!("use custom as std;\nuse std::fmt::Debug;\n\n{marker}"),
+        // 引数の中の標準でないマクロ。
+        "pub fn run() -> u32 {\n    1\n}\n\npub fn drive() -> u32 {\n    println!(\"{}\", custom!());\n    run()\n}\n\nmod indirect {\n    use super::run;\n    pub fn call() -> u32 {\n        run()\n    }\n}\n".to_owned(),
+    ] {
+        let api = remove_old_app(("", ""), OLD_RUN, &engine_source);
+        assert!(!is_dead(&api, "run"), "{engine_source}: {api:?}");
+    }
+    // 上書きする定義が別のファイルにある場合も同じ。
+    let api = api_after(
+        &[
+            ("Cargo.toml", BOTH_MEMBERS),
+            ("old_app/Cargo.toml", &package("old_app", "")),
+            ("old_app/src/lib.rs", OLD_RUN),
+            ("engine/Cargo.toml", &package("engine", "")),
+            ("engine/src/lib.rs", &format!("mod shim;\n\n{drive}")),
+            (
+                "engine/src/shim.rs",
+                "macro_rules! println {\n    ($($t:tt)*) => {};\n}\n",
+            ),
+        ],
+        &["old_app"],
+        &[("Cargo.toml", ENGINE_ONLY)],
+    );
+    assert!(!is_dead(&api, "run"), "{api:?}");
+}
+
+#[test]
+fn rust_cargo_removal_source_inclusion_and_unknown_expansions_keep_api_rm() {
+    for engine_source in [
+        // ソースの取り込み: include!・標準のマクロの引数の中の include!・#[path]・
+        // 本体で include! を使う macro_rules!。
+        format!("include!(\"extra.rs\");\n\n{ENGINE_IMPORT_RUN}"),
+        "pub fn run() -> u32 {\n    1\n}\n\npub fn drive() -> u32 {\n    println!(\"{}\", include!(\"extra.rs\"));\n    run()\n}\n\nmod indirect {\n    use super::run;\n    pub fn call() -> u32 {\n        run()\n    }\n}\n".to_owned(),
+        format!("#[path = \"extra.rs\"]\nmod extra;\n\n{ENGINE_IMPORT_RUN}"),
+        format!(
+            "macro_rules! load {{\n    () => {{\n        include!(\"extra.rs\")\n    }};\n}}\n\n{ENGINE_IMPORT_RUN}"
+        ),
+        // 外部のマクロ・独自の derive・属性マクロ・修飾した呼び出しは、展開で別 package の
+        // ソースを取り込みうる。
+        format!("{ENGINE_IMPORT_RUN}\npub fn fail() -> u32 {{\n    anyhow::bail!(\"x\")\n}}\n"),
+        format!("{ENGINE_IMPORT_RUN}\n#[derive(serde::Serialize)]\npub struct Marker;\n"),
+        format!("{ENGINE_IMPORT_RUN}\n#[tracing::instrument]\npub fn traced() {{}}\n"),
+        format!("{ENGINE_IMPORT_RUN}\npub fn show() {{\n    std::println!(\"x\");\n}}\n"),
+        // 依存に書かれていない crate を build script の探索パスからつなぎうる。
+        format!("extern crate custom;\n\n{ENGINE_IMPORT_RUN}"),
+    ] {
+        let api = remove_old_app(("", ""), OLD_RUN, &engine_source);
+        assert!(!is_dead(&api, "run"), "{engine_source}: {api:?}");
+    }
+}
+
+#[test]
+fn rust_cargo_removal_unproven_standard_macro_scopes_keep_api_rm() {
+    let custom = "[dependencies]\ncustom = \"1\"\n";
+    for source in [
+        format!(
+            "pub use custom as origin;\npub use crate::origin as relay;\nuse crate::relay::*;\n{ENGINE_IMPORT_RUN}\npub fn show() {{ println!(\"x\"); }}\n"
+        ),
+        format!(
+            "{ENGINE_IMPORT_RUN}\npub fn show() {{ let _ = vec![{{ use custom::println; println!(); 1 }}]; }}\n"
+        ),
+        format!(
+            "{ENGINE_IMPORT_RUN}\npub fn show() {{ let _ = vec![{{ #[custom::attribute] fn generated() {{}} 1 }}]; }}\n"
+        ),
+        format!(
+            "{ENGINE_IMPORT_RUN}\npub fn show() {{ let _ = vec![{{ #[derive(custom::Derive)] struct Generated; 1 }}]; }}\n"
+        ),
+        format!(
+            "{ENGINE_IMPORT_RUN}\npub fn show() {{ let _ = vec![{{ macro_rules! println {{ () => {{}}; }} println!(); 1 }}]; }}\n"
+        ),
+    ] {
+        let api = remove_old_app((custom, custom), OLD_RUN, &source);
+        assert!(!is_dead(&api, "run"), "{source}: {api:?}");
+    }
+    for name in ["proc_macro", "test"] {
+        let manifest =
+            format!("[dependencies]\n{name} = {{ package = \"custom\", version = \"1\" }}\n");
+        let source = format!(
+            "extern crate {name} as shim;\nuse crate::shim::*;\n{ENGINE_IMPORT_RUN}\npub fn show() {{ println!(\"x\"); }}\n"
         );
+        let api = remove_old_app((&manifest, &manifest), OLD_RUN, &source);
+        assert!(!is_dead(&api, "run"), "{source}: {api:?}");
+    }
+}
+
+#[test]
+fn rust_cargo_removal_legacy_dependency_tables_keep_api_rm() {
+    let source = format!(
+        "use std::println;\n{ENGINE_IMPORT_RUN}\n#[cfg(test)] pub fn show() {{ println!(\"x\"); }}\n"
+    );
+    for table in [
+        "dev-dependencies",
+        "dev_dependencies",
+        "build-dependencies",
+        "build_dependencies",
+    ] {
+        for prefix in ["", "target.'cfg(unix)'."] {
+            let replacement =
+                format!("[{prefix}{table}]\nstd = {{ package = \"custom\", version = \"1\" }}\n");
+            let api = remove_old_app((&replacement, &replacement), OLD_RUN, &source);
+            assert!(!is_dead(&api, "run"), "{replacement}: {api:?}");
+            let ordinary = format!("[{prefix}{table}]\ncustom = \"1\"\n");
+            let api = remove_old_app((&ordinary, &ordinary), OLD_RUN, &source);
+            assert!(is_dead(&api, "run"), "{ordinary}: {api:?}");
+        }
+    }
+}
+
+#[test]
+fn rust_cargo_removal_workspace_macro_rules_keep_api_rm() {
+    // ワークスペースの macro_rules! を export して別の crate から呼ぶと、本体に書いた名前は
+    // 呼び出した crate の文脈で解決する。書かれたファイルの package からは判定できないので、
+    // 定義する crate が old_app に依存するかどうかにかかわらず証明しない。
+    let helpers_lib = "#[macro_export]\nmacro_rules! call_run {\n    () => {\n        $crate::forward()\n    };\n}\n\npub fn forward() -> u32 {\n    3\n}\n";
+    let engine_lib =
+        format!("{ENGINE_IMPORT_RUN}\npub fn other() -> u32 {{\n    helpers::call_run!()\n}}\n");
+    let engine_manifest = package(
+        "engine",
+        "[dependencies]\nhelpers = { path = \"../helpers\" }\n",
+    );
+    for helpers_dependency in ["", "[dependencies]\nold_app = { path = \"../old_app\" }\n"] {
+        let api = api_after(
+            &[
+                (
+                    "Cargo.toml",
+                    "[workspace]\nmembers = [\"old_app\", \"helpers\", \"engine\"]\nresolver = \"2\"\n",
+                ),
+                ("old_app/Cargo.toml", &package("old_app", "")),
+                ("old_app/src/lib.rs", OLD_RUN),
+                (
+                    "helpers/Cargo.toml",
+                    &package("helpers", helpers_dependency),
+                ),
+                ("helpers/src/lib.rs", helpers_lib),
+                ("engine/Cargo.toml", &engine_manifest),
+                ("engine/src/lib.rs", &engine_lib),
+            ],
+            &["old_app"],
+            &[
+                (
+                    "Cargo.toml",
+                    "[workspace]\nmembers = [\"helpers\", \"engine\"]\nresolver = \"2\"\n",
+                ),
+                ("helpers/Cargo.toml", &package("helpers", "")),
+            ],
+        );
+        assert!(!is_dead(&api, "run"), "{helpers_dependency}: {api:?}");
     }
 }
 

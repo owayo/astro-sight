@@ -234,15 +234,13 @@ pub(super) fn rust_scope_positions(
 /// ファイル直下に同名の自由関数を持つ Rust ファイルで、そのファイルのモジュールから修飾なしで
 /// 名前を引く位置。こうした出現はその関数か、より内側の束縛に解決し、ほかのファイルの宣言を
 /// 指さない。inline の `mod` の中、パスの一部、use、extern ブロック、マクロと属性の中、属性の
-/// 付いた item の中は含めず、マクロを含むファイルでは何も返さない。
+/// 付いた item の中は含めず、標準の式マクロ以外のマクロや `macro_rules!` の定義を含むファイルでは
+/// 何も返さない。
 pub(super) fn rust_file_scope_positions(root: Node<'_>, source: &[u8], name: &str) -> Positions {
-    let all = nodes(root);
-    if all
-        .iter()
-        .any(|node| matches!(node.kind(), "macro_invocation" | "macro_definition"))
-    {
+    if !crate::engine::impact::rust_cargo_reachability::invokes_only_standard_macros(root, source) {
         return Positions::new();
     }
+    let all = nodes(root);
     let mut positions = Positions::new();
     for node in all {
         if node.kind() != "identifier" || node.utf8_text(source).ok() != Some(name) {
