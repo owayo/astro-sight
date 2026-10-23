@@ -47,6 +47,7 @@ mod integration {
     mod review;
     mod review_dead_scope;
     mod review_retry;
+    mod ruby_constructor_liveness;
     mod runtime_invoked_symbols;
     mod rust_const_fn;
     mod rust_parameter_patterns;

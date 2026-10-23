@@ -19,6 +19,32 @@ use std::io::Cursor;
 use std::process::Command;
 
 #[test]
+fn detect_dead_ruby_new_keeps_the_instance_initializer_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("example.rb");
+    fs::write(
+        &file,
+        "module Demo\n  class Builder\n    def initialize(input)\n      @input = input\n    end\n    def output\n      @input\n    end\n  end\n  def self.build(input)\n    Builder.new(input).output\n  end\nend\nputs Demo.build('ok')\n",
+    )
+    .unwrap();
+    let root = dir.path().to_str().unwrap();
+    let candidates = extract_dead_code_candidates_from_file(root, "example.rb").unwrap();
+    assert!(
+        candidates
+            .iter()
+            .any(|(name, _, _)| name == "Builder.initialize")
+    );
+    let (dead, test_only) = detect_dead_symbols_from_files(root, &[file]);
+    assert!(
+        !dead
+            .iter()
+            .any(|symbol| symbol.name == "Builder.initialize"),
+        "{dead:?}"
+    );
+    assert!(test_only.is_empty(), "{test_only:?}");
+}
+
+#[test]
 fn detect_dead_dynamic_import_keeps_only_the_target_default_export_live() {
     for (extension, declaration) in [
         ("tsx", "export default function Panel() { return <div/>; }"),
