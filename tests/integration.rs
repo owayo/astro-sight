@@ -57,6 +57,7 @@ mod integration {
     mod rust_const_fn;
     mod rust_parameter_patterns;
     mod rust_reference_sites;
+    mod rust_unicode_escapes;
     mod sandbox;
     mod session;
     mod static_const_values;

@@ -57,7 +57,7 @@ tree-sitter-language = "0.1.8"
 tree-sitter-php = "0.25.1"
 tree-sitter-python = "0.25"
 tree-sitter-ruby = { git = "https://github.com/owayo/tree-sitter-ruby.git", branch = "master" }
-tree-sitter-rust = "0.24.2"
+tree-sitter-rust = "=0.24.2"
 tree-sitter-swift = "=0.7.3"
 tree-sitter-typescript = "=0.23.2"
 tree-sitter-zig = "1.1.2"
@@ -83,5 +83,6 @@ strip = true
 [patch.crates-io]
 tree-sitter-bash = { path = "vendor/tree-sitter-bash" }
 tree-sitter-kotlin = { path = "vendor/tree-sitter-kotlin" }
+tree-sitter-rust = { path = "vendor/tree-sitter-rust" }
 tree-sitter-swift = { path = "vendor/tree-sitter-swift" }
 tree-sitter-typescript = { path = "vendor/tree-sitter-typescript" }
