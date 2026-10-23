@@ -52,6 +52,8 @@ Output:
 
 For Rust, `affected_symbols[].kind` is `impl` when an impl header changes, an impl without methods is added, or deleted lines may include a method declaration. Adding a method without deleting lines reports the method without reporting its owning type as changed. Edits with deleted lines keep the `impl` record because a removed method cannot be ruled out from the new tree alone. An attribute-only change also keeps the `impl` record because the method symbol does not include attributes. The `symbols` command still includes the impl owner for method ownership.
 
+Rust signature attribution checks the declared function name in the AST. A parameter named `text` in `apply(text: &str)` does not make that line the signature of a separate `text` method. A new method in a mixed addition/deletion hunk is reported as `added` when it is a unique callable directly inside a file-root inherent impl, all its lines are added, and the old AST proves that the name did not belong to a callable, associated item, or import. Existing same-name items, trait or nested impls, generating macros or attributes, uncertain Unicode identity, parse failures, reconstruction failures, and possible removals in other files keep the classification conservative. This does not change the existing proofs for body-only edits, compatibility, or private methods.
+
 Callers fall into 3 groups by confidence and by how breaking they are. "Blocking" here means a finding that makes `impact` or `review --hook` return exit 1.
 
 - `impacted_callers`: actual call sites. Those left outside the diff are blocking for `impact`. References to symbols whose number of arguments changed, and references that cannot be decided, also stay here

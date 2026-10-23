@@ -517,6 +517,89 @@ pub(super) fn rust_private_inherent_method(
         .flatten()
 }
 
+/// ファイル直下の inherent impl に直接属する、実体のあるメソッドだけを追加候補にする。
+/// owner の綴りから型の同一性は証明しない。旧側の同名項目は別途すべて保留する。
+fn rust_is_root_inherent_method(root: Node<'_>, source: &[u8], symbol: &Symbol) -> bool {
+    if !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method) {
+        return false;
+    }
+    let Some(method) = super::descendant_for_range(root, &symbol.range) else {
+        return false;
+    };
+    if method.kind() != "function_item"
+        || method
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(source).ok())
+            != Some(symbol.name.as_str())
+    {
+        return false;
+    }
+    let Some(body) = method
+        .parent()
+        .filter(|node| node.kind() == "declaration_list")
+    else {
+        return false;
+    };
+    let Some(implementation) = body.parent().filter(|node| node.kind() == "impl_item") else {
+        return false;
+    };
+    implementation
+        .parent()
+        .is_some_and(|parent| parent.id() == root.id())
+        && implementation.child_by_field_name("trait").is_none()
+        && implementation
+            .child_by_field_name("type")
+            .is_some_and(|owner| {
+                let owner = if owner.kind() == "generic_type" {
+                    owner.child_by_field_name("type")
+                } else {
+                    Some(owner)
+                };
+                owner.is_some_and(|owner| owner.kind() == "type_identifier")
+            })
+}
+
+/// 生成・条件付き項目と名前の正規化を解決せず、明示された関数/関連項目名だけを集める。
+fn rust_explicit_method_bindings(root: Node<'_>, source: &[u8]) -> Option<HashSet<String>> {
+    use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+    use std::ops::ControlFlow;
+    let mut names = HashSet::new();
+    let result = walk_preorder(root, Children::Named, |node, _| {
+        if matches!(
+            node.kind(),
+            "macro_invocation"
+                | "macro_definition"
+                | "attribute_item"
+                | "inner_attribute_item"
+                | "extern_crate_declaration"
+        ) {
+            return ControlFlow::Break(());
+        }
+        if matches!(
+            node.kind(),
+            "function_item"
+                | "function_signature_item"
+                | "const_item"
+                | "static_item"
+                | "type_item"
+        ) {
+            let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(source).ok())
+            else {
+                return ControlFlow::Break(());
+            };
+            // NFC が異なる綴りの同名を除外したという証拠にはしない。
+            if !name.is_ascii() {
+                return ControlFlow::Break(());
+            }
+            names.insert(crate::language::normalize_identifier(LangId::Rust, name).into_owned());
+        }
+        ControlFlow::Continue(Walk::Descend)
+    });
+    result.is_continue().then_some(names)
+}
+
 fn collect_rust_use_tree_bindings(
     node: Node<'_>,
     source: &[u8],
@@ -775,13 +858,23 @@ pub(super) fn reconcile_declaration_changes(
     // 同名複数・復元失敗では AffectedSymbol を位置へ一意に対応付けられない。
     if input.lang_id == LangId::Rust && file_has_removed_lines && !input.root.has_error() {
         let mut new_by_key: HashMap<(&str, &str), Option<&Symbol>> = HashMap::new();
+        let mut callable_counts = HashMap::<String, usize>::new();
         for symbol in input.syms {
             new_by_key
                 .entry((&symbol.name, super::symbol_kind_str(symbol.kind)))
                 .and_modify(|slot| *slot = None)
                 .or_insert(Some(symbol));
+            if matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method) {
+                *callable_counts
+                    .entry(
+                        crate::language::normalize_identifier(LangId::Rust, &symbol.name)
+                            .into_owned(),
+                    )
+                    .or_default() += 1;
+            }
         }
-        let candidates: Vec<(usize, &Symbol)> = affected
+        let new_method_bindings = rust_explicit_method_bindings(input.root, input.source);
+        let candidates: Vec<(usize, &Symbol, bool)> = affected
             .iter()
             .enumerate()
             .filter(|(_, change)| change.change_type == "modified")
@@ -790,14 +883,23 @@ pub(super) fn reconcile_declaration_changes(
                     .get(&(change.name.as_str(), change.kind.as_str()))
                     .and_then(|symbol| *symbol)
                     .filter(|symbol| {
-                        is_rust_file_root_symbol(input.root, symbol)
-                            && super::symbol_lines_all_added(
-                                symbol.range.start.line,
-                                symbol.range.end.line,
-                                &input.facts.added_lines,
-                            )
+                        super::symbol_lines_all_added(
+                            symbol.range.start.line,
+                            symbol.range.end.line,
+                            &input.facts.added_lines,
+                        )
                     })
-                    .map(|symbol| (index, symbol))
+                    .and_then(|symbol| {
+                        let is_root = is_rust_file_root_symbol(input.root, symbol);
+                        let is_method = !is_root
+                            && new_method_bindings.is_some()
+                            && callable_counts.get(
+                                crate::language::normalize_identifier(LangId::Rust, &symbol.name)
+                                    .as_ref(),
+                            ) == Some(&1)
+                            && rust_is_root_inherent_method(input.root, input.source, symbol);
+                        (is_root || is_method).then_some((index, symbol, is_method))
+                    })
             })
             .collect();
         if !candidates.is_empty()
@@ -817,13 +919,35 @@ pub(super) fn reconcile_declaration_changes(
                 &mut old_use_names,
                 &mut old_use_uncertain,
             );
-            for (index, symbol) in candidates {
-                if !old_names.contains(symbol.name.as_str())
-                    && !input
+            let old_method_bindings = candidates
+                .iter()
+                .any(|(_, _, method)| *method)
+                .then(|| rust_explicit_method_bindings(old.tree.root_node(), &old.source))
+                .flatten();
+            for (index, symbol, is_method) in candidates {
+                let normalized = crate::language::normalize_identifier(LangId::Rust, &symbol.name);
+                let removed_identity_is_unproven = if is_method {
+                    input
+                        .reexport_moves
+                        .might_have_removed_identity_outside(&symbol.name, input.file_path)
+                } else {
+                    input
                         .reexport_moves
                         .might_have_removed_identity(&symbol.name)
+                };
+                if !old_names.contains(symbol.name.as_str())
+                    && !removed_identity_is_unproven
                     && !old_use_uncertain
                     && !old_use_names.contains(&symbol.name)
+                    && (!is_method
+                        || old_method_bindings.as_ref().is_some_and(|names| {
+                            !names.contains(normalized.as_ref())
+                                && old_use_names.iter().all(|name| {
+                                    name.is_ascii()
+                                        && crate::language::normalize_identifier(LangId::Rust, name)
+                                            != normalized
+                                })
+                        }))
                 {
                     affected[index].change_type = "added".to_string();
                 }
@@ -1529,6 +1653,229 @@ mod tests {
             true,
         );
         assert_eq!(change_type_of(&after_blank, "Fresh"), Some("added"));
+    }
+
+    #[test]
+    fn rust_mixed_hunk_method_signatures_belong_to_the_declared_name() {
+        let old = include_str!("../../../tests/fixtures/rust_method_signature/old.rs");
+        let new = include_str!("../../../tests/fixtures/rust_method_signature/new.rs");
+        for (old, new, method) in [
+            (old.to_owned(), new.to_owned(), "text"),
+            (
+                old.replace("text", "r#text"),
+                new.replace("text", "r#text"),
+                "r#text",
+            ),
+            (
+                old.to_owned(),
+                new.replace(
+                    "fn text(&self) -> &str",
+                    "fn text(\n        &self,\n    ) -> &str",
+                ),
+                "text",
+            ),
+        ] {
+            let (affected, signatures) = run_pass1(LangId::Rust, "api.rs", &old, &new, true);
+            assert_eq!(change_type_of(&affected, method), Some("added"), "{new}");
+            assert_eq!(change_type_of(&affected, "apply"), Some("modified"));
+            assert_eq!(signatures.len(), 1, "{new}");
+            assert_eq!(signatures[0].name, "apply");
+            assert!(signatures[0].old_signature.contains("Cow<'a, str>"));
+            assert!(signatures[0].new_signature.contains("Readable<'a>"));
+        }
+    }
+
+    #[test]
+    fn rust_existing_method_body_change_does_not_borrow_parameter_signatures() {
+        let old = "struct State;\nimpl State {\n    fn apply(&self, text: &str) -> u8 { 1 }\n    fn text(&self) -> u8 {\n        1\n    }\n}\n";
+        let new = old
+            .replace(
+                "apply(&self, text: &str) -> u8",
+                "apply(&self, text: &str) -> u16",
+            )
+            .replace("        1", "        2");
+        let (affected, signatures) = run_pass1(LangId::Rust, "api.rs", old, &new, true);
+        assert_eq!(change_type_of(&affected, "text"), Some("modified"));
+        assert_eq!(signatures.len(), 1);
+        assert_eq!(signatures[0].name, "apply");
+    }
+
+    #[test]
+    fn rust_new_method_proof_keeps_existing_and_uncertain_identities_modified() {
+        let stable_old = "fn changed() -> u8 { 1 }\n";
+        let stable_new = "fn changed() -> u16 { 1 }\n";
+        for (old, new) in [
+            (
+                "struct S;\nimpl S {\n    pub fn text(&self) -> u8 { 0 }\n}\n",
+                "struct S;\nimpl S {\n    fn text(&self, value: u8) -> u8 { value }\n}\n",
+            ),
+            (
+                "struct S;\ntype Alias = S;\nimpl Alias {\n    fn text(&self) -> u8 { 0 }\n}\n",
+                "struct S;\ntype Alias = S;\nimpl S {\n    fn text(&self, value: u8) -> u8 { value }\n}\n",
+            ),
+            (
+                "struct A;\nstruct B;\nimpl A {\n    fn text(&self, value: u8) {}\n}\n",
+                "struct A;\nstruct B;\nimpl B {\n    fn text(&self) {}\n}\n",
+            ),
+            (
+                "struct S;\nimpl S {\n    const text: u8 = 0;\n}\n",
+                "struct S;\nimpl S {\n    fn text(&self) -> u8 { 0 }\n}\n",
+            ),
+            (
+                "struct S;\nimpl S { methods!(); }\n",
+                "struct S;\nimpl S {\n    fn text(&self) -> u8 { 0 }\n}\n",
+            ),
+            (
+                "#[generate]\nstruct S;\n",
+                "struct S;\nimpl S {\n    fn text(&self) -> u8 { 0 }\n}\n",
+            ),
+            (
+                "struct S;\ntrait T {}\n",
+                "struct S;\ntrait T {}\nimpl T for S {\n    fn text(&self) -> u8 { 0 }\n}\n",
+            ),
+            (
+                "struct S;\n",
+                "struct S;\nmod inner {\n    impl S {\n        fn text(&self) -> u8 { 0 }\n    }\n}\n",
+            ),
+            (
+                "struct S;\nstruct Other;\n",
+                "struct S;\nstruct Other;\nimpl S {\n    fn text(&self) -> u8 { 0 }\n}\nimpl Other {\n    fn text(&self) -> u8 { 0 }\n}\n",
+            ),
+            (
+                "struct S;\nfn invalid(\n",
+                "struct S;\nimpl S {\n    fn text(&self) -> u8 { 0 }\n}\n",
+            ),
+            (
+                "struct S;\nimpl S {\n    fn r#text(&self) -> u8 { 0 }\n}\n",
+                "struct S;\nimpl S {\n    fn text(&self, value: u8) -> u8 { value }\n}\n",
+            ),
+            (
+                "use path::r#text;\nstruct S;\n",
+                "struct S;\nimpl S {\n    fn text(&self) -> u8 { 0 }\n}\n",
+            ),
+        ] {
+            let old = format!("{stable_old}{old}");
+            let new = format!("{stable_new}{new}");
+            let (affected, _) = run_pass1(LangId::Rust, "api.rs", &old, &new, true);
+            assert!(
+                !affected
+                    .iter()
+                    .any(|s| s.name == "text" && s.change_type == "added"),
+                "{old} -> {new}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_new_method_proof_preserves_other_file_and_root_deletion_guards() {
+        let old = "fn changed(text: u8) -> u8 { text }\nstruct S;\n";
+        let new = "fn changed(text: u8) -> u16 { text as u16 }\nstruct S;\nimpl S {\n    fn text(&self) -> u8 { 0 }\n}\n";
+        let neutral = unified_diff(
+            "other.rs",
+            "fn unrelated() -> u8 { 1 }\n",
+            "fn unrelated() -> u16 { 2 }\n",
+        );
+        let (neutral_affected, _) =
+            run_pass1_with_extra_diff(LangId::Rust, "api.rs", old, new, true, &neutral);
+        assert_eq!(change_type_of(&neutral_affected, "text"), Some("added"));
+        for (old_other, new_other) in [
+            ("fn text() {}\n", ""),
+            ("fn r#text() {}\n", ""),
+            ("fn r#text() -> u8 { 0 }\n", "fn r#text() -> u16 { 0 }\n"),
+            (
+                "fn other(text: u8) -> u8 { text }\n",
+                "fn other(text: u8) -> u16 { text as u16 }\n",
+            ),
+            ("fn K() {}\n", ""),
+        ] {
+            let other = unified_diff("other.rs", old_other, new_other);
+            let (affected, _) =
+                run_pass1_with_extra_diff(LangId::Rust, "api.rs", old, new, true, &other);
+            assert_eq!(
+                change_type_of(&affected, "text"),
+                Some("modified"),
+                "{other}"
+            );
+        }
+        let root = "fn changed(text: u8) -> u16 { text as u16 }\nstruct S;\nfn text() {}\n";
+        let (affected, _) = run_pass1(LangId::Rust, "api.rs", old, root, true);
+        assert_eq!(change_type_of(&affected, "text"), Some("modified"));
+
+        let unicode_old = "fn changed() -> u8 { 0 }\nstruct S;\nimpl S {\n    fn K(&self) {}\n}\n";
+        let unicode_new = "fn changed() -> u16 { 0 }\nstruct S;\nimpl S {\n    fn K(&self) {}\n}\n";
+        let (affected, _) = run_pass1(LangId::Rust, "api.rs", unicode_old, unicode_new, true);
+        assert_eq!(change_type_of(&affected, "K"), Some("modified"));
+    }
+
+    #[test]
+    fn rust_new_method_proof_requires_matching_old_source_reconstruction() {
+        let old = "fn changed() -> u8 { 1 }\nstruct S;\n";
+        let new =
+            "fn changed() -> u16 { 2 }\nstruct S;\nimpl S {\n    fn text(&self) -> u8 { 0 }\n}\n";
+        let mismatched = new.replace("{ 2 }", "{ 3 }");
+        let path = "api.rs";
+        let text = unified_diff(path, old, new);
+        let hunks = diff::parse_unified_diff(&text)[0].hunks.clone();
+        let source = mismatched.as_bytes();
+        let tree = parser::parse_source(source, LangId::Rust).unwrap();
+        let root = tree.root_node();
+        let syms = symbols::extract_symbols(root, source, LangId::Rust).unwrap();
+        let facts = diff::extract_changed_line_facts(&text, path);
+        let moves = super::super::ReexportMoveIndex::build(&text);
+        let mut affected = super::super::find_affected_symbols(&syms, &hunks, Some(&facts));
+        let mut signatures =
+            super::super::signature::detect_signature_changes(&text, path, &affected, LangId::Rust);
+        assert!(diff::reconstruct_old_source(&text, path, source).is_none());
+        reconcile_declaration_changes(
+            &DeclarationChangeInput {
+                file_diff: &text,
+                file_path: path,
+                old_file_path: path,
+                syms: &syms,
+                hunks: &hunks,
+                root,
+                source,
+                lang_id: LangId::Rust,
+                facts: &facts,
+                reexport_moves: &moves,
+            },
+            &mut affected,
+            &mut signatures,
+        );
+        assert_eq!(change_type_of(&affected, "text"), Some("modified"));
+    }
+
+    #[test]
+    fn rust_method_multiline_contract_change_stays_detected() {
+        let old = "struct S;\nimpl S {\n    fn text(\n        &self,\n        value: u8,\n    ) -> u8 { value }\n}\n";
+        let new = old
+            .replace("value: u8", "value: u16")
+            .replace(") -> u8", ") -> u16");
+        let (affected, signatures) = run_pass1(LangId::Rust, "api.rs", old, &new, true);
+        assert_eq!(change_type_of(&affected, "text"), Some("modified"));
+        assert_eq!(signatures.len(), 1);
+        assert_eq!(signatures[0].name, "text");
+        assert!(signatures[0].old_signature.contains("u8"));
+        assert!(signatures[0].new_signature.contains("u16"));
+    }
+
+    #[test]
+    fn rust_unicode_method_signature_change_survives_alias_owner_rewrite() {
+        for name in ["e\u{301}", "r#e\u{301}", "é"] {
+            let old = format!(
+                "pub struct S;\npub type Alias = S;\nimpl Alias {{\n    pub fn {name}(&self) {{}}\n}}\npub fn caller() {{ S.{name}(); }}\n"
+            );
+            let new = old.replace("impl Alias", "impl S").replace(
+                &format!("{name}(&self)"),
+                &format!("{name}(&self, value: u8)"),
+            );
+            let (affected, signatures) = run_pass1(LangId::Rust, "api.rs", &old, &new, true);
+            assert_eq!(change_type_of(&affected, name), Some("modified"));
+            assert_eq!(signatures.len(), 1, "{name}: {signatures:?}");
+            assert_eq!(signatures[0].name, name);
+            assert!(!signatures[0].old_signature.contains("value: u8"));
+            assert!(signatures[0].new_signature.contains("value: u8"));
+        }
     }
 
     #[test]

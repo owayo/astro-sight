@@ -140,20 +140,65 @@ fn normalize_signature_for_comparison(signature: String, lang_id: LangId) -> Str
     }
 }
 
-/// 指定された関数名を含むシグネチャ行を検索する。
+/// 指定された関数名のシグネチャ行を検索する。Rust は宣言の名前を AST で照合する。
 pub(crate) fn find_signature_in_lines(
     lines: &[String],
     func_name: &str,
     lang_id: LangId,
 ) -> Option<String> {
+    let rust_declared_name = func_name.rsplit("::").next().unwrap_or(func_name);
     let func_name = bare_symbol_name(func_name, lang_id);
     for line in lines {
         let trimmed = line.trim();
-        if line_has_identifier(trimmed, func_name, lang_id) && is_signature_line(trimmed) {
+        if line_has_identifier(trimmed, func_name, lang_id)
+            && is_signature_line(trimmed)
+            && (lang_id != LangId::Rust
+                || rust_signature_line_declares(trimmed, rust_declared_name).unwrap_or(true))
+        {
             return Some(trimmed.to_string());
         }
     }
     None
+}
+
+/// 不完結なヘッダに空の本体を補い、引数・型・コメント内の名前との取り違えを防ぐ。
+/// 解析不能な断片と複数宣言は証明せず、既存の保守的な行判定を維持する。
+fn rust_signature_line_declares(line: &str, name: &str) -> Option<bool> {
+    let mut source = line.as_bytes().to_vec();
+    if line.ends_with('{') {
+        source.extend_from_slice(b" }");
+    } else if !line.ends_with([';', '}']) {
+        source.extend_from_slice(b"\n{}");
+    }
+    let tree = crate::engine::parser::parse_source(&source, LangId::Rust).ok()?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+    use std::ops::ControlFlow;
+    let mut matches_name = None;
+    let result = walk_preorder(root, Children::Named, |node, _| {
+        if matches!(node.kind(), "function_item" | "function_signature_item") {
+            if matches_name.is_some() {
+                return ControlFlow::Break(());
+            }
+            let Some(declared) = node
+                .child_by_field_name("name")
+                .and_then(|node| node.utf8_text(&source).ok())
+            else {
+                return ControlFlow::Break(());
+            };
+            matches_name = Some(
+                normalize_identifier(LangId::Rust, declared)
+                    == normalize_identifier(LangId::Rust, name),
+            );
+        }
+        ControlFlow::Continue(Walk::Descend)
+    });
+    result
+        .is_continue()
+        .then_some(matches_name.unwrap_or(false))
 }
 
 /// `Type::method` 形式の名前でも、シグネチャ行では末尾の識別子だけを照合する。
@@ -348,6 +393,62 @@ mod tests {
         ));
         assert!(is_signature_line("def handle_request(self):"));
         assert!(is_signature_line("function calculate() {"));
+    }
+
+    #[test]
+    fn rust_signature_lines_match_the_declared_function_name() {
+        for line in [
+            "fn apply(text: &str) -> u8 {",
+            "fn apply(value: text) -> u8 {",
+            "fn apply(value: u8) -> text {",
+            "fn apply(callback: fn(text: &str)) -> u8 {",
+            "#[doc = \"fn text\"] fn apply(text: &str) -> u8 {",
+            "/* fn text() */ fn apply(text: &str) -> u8 {",
+            "impl S { fn apply(text: &str) -> u8 {} }",
+        ] {
+            let lines = vec![line.to_owned()];
+            assert!(
+                find_signature_in_lines(&lines, "text", LangId::Rust).is_none(),
+                "{line}"
+            );
+            assert!(
+                find_signature_in_lines(&lines, "apply", LangId::Rust).is_some(),
+                "{line}"
+            );
+        }
+        for name in ["text", "r#text"] {
+            let line = "pub const fn r#text(text: u8) -> u8 {".to_owned();
+            assert_eq!(
+                find_signature_in_lines(std::slice::from_ref(&line), name, LangId::Rust),
+                Some(line)
+            );
+        }
+    }
+
+    #[test]
+    fn rust_signature_lines_keep_complete_raw_and_qualified_unicode_names() {
+        for name in ["e\u{301}", "é"] {
+            for declared in [name.to_owned(), format!("r#{name}")] {
+                let line = format!("pub fn {declared}(&self, value: u8) {{");
+                for target in [
+                    name.to_owned(),
+                    format!("r#{name}"),
+                    format!("S::{name}"),
+                    format!("S::r#{name}"),
+                    format!("<S as Trait>::{name}"),
+                ] {
+                    assert_eq!(
+                        find_signature_in_lines(std::slice::from_ref(&line), &target, LangId::Rust),
+                        Some(line.clone()),
+                        "{declared}: {target}"
+                    );
+                }
+            }
+        }
+        let lines = vec!["pub fn e\u{301}(&self) {".to_owned()];
+        assert!(find_signature_in_lines(&lines, "e", LangId::Rust).is_none());
+        let parameter = vec!["pub fn apply(e\u{301}: u8) {".to_owned()];
+        assert!(find_signature_in_lines(&parameter, "e\u{301}", LangId::Rust).is_none());
     }
 
     /// detect_signature_changes は hunk 本体先頭の `+++ b/x` (追加行コンテンツ) で
