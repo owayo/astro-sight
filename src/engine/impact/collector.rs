@@ -203,12 +203,12 @@ impl RouteDecisionContext<'_> {
                 .reexport_moves
                 .covers(self.path_str, symbol_name, &file_context.new_path);
 
-        // old/new のフルソース AST で透過的な root type alias 導入だけと証明できた
-        // シグネチャ変更は、caller を消さず informational に残す。
-        let transparent_alias_informational =
+        // old/new のフルソース AST で透過的な root type alias 導入だけ、または関数に `const`
+        // を足しただけと証明できたシグネチャ変更は、caller を消さず informational に残す。
+        let compatible_signature_informational =
             file_context.compatible_signature_keys.contains(symbol_name);
 
-        let route_informational = transparent_alias_informational
+        let route_informational = compatible_signature_informational
             || fn_value_informational
             || reexport_move_informational
             || (event.is_import

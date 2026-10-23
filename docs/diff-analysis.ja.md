@@ -316,8 +316,9 @@ astro-sight review --dir . --git \
 - TS/TSX のトップレベル関数の末尾への optional / default 引数の追加（`trailing_optional_params`）
 - TypeScript の inline object 引数型への optional プロパティ追加。他の枝が変わらない union の、一意な object 枝も含む（`optional_object_props`）
 - Python のトップレベル関数 / モジュール直下のクラスメソッドの末尾への、kwonly+default 引数または positional default 引数の追加（`trailing_optional_params`）。デコレータの差分がある場合や同名関数が複数定義されている場合は、保守的に blocking を維持する
+- Rust の関数・inherent impl のメソッドへの `const` の追加（`rust_const_fn_added`）。const の文脈の外からの呼び出しは変わらないので、呼び出し元は `impact_info` に残す。違ってよいのは `const` だけで、ほかの宣言・属性・外側のモジュールや `impl` のヘッダ・ファイルの import と、宣言に現れる名前の同じファイルの宣言（型別名・`use` の別名・配列長の定数など。それらが使う名前もたどる）は変わらないことが条件。戻り値が `impl Trait` の関数は、隠れた型と外に漏れる auto trait が本体で決まるので、本体と、その本体が参照する同じファイルの宣言も変わらないことが条件。マクロの token tree は原文を保ち、空の impl を含む impl ヘッダと、入れ子の `impl`・マクロ呼び出しは囲む宣言と属性も含めて比べ、そこに現れる名前も依存先として調べる。参照先が旧新とも一意な関数なら、既存のヘッダ正規化の下で const を足しただけで本体のトークンが不変な変更も許す。関数自身の `const` だけは除くので、関数内の未変更の `assert!` は証明を妨げない。位置依存または未証明のマクロ呼び出しは、行と Unicode 文字の列も不変であることを求める。別名と入れ子のマクロトークンも保留する。単純な assert と、入れ子のマクロ・属性・呼び出しを含まない一意な先行 root マクロ定義だけは位置を問わないが、同一ファイル内のマクロ束縛が不明ならこの例外は使わない。ヘッダのマクロは未対応のまま保守的に残す。`const` を外す変更や、引数・戻り値・ジェネリクス・`unsafe`・`async`・`extern`・公開範囲の同時の変更は blocking を維持する。同じファイルに同名の宣言（別の `impl` のメソッド、`cfg` で分けた関数）があると呼び出し元を区別できないので、`impacts` は残る
 
-同じシンボルに紐づく `impacts` も破壊的影響としては出さず、`mod_compat` の情報提供だけに留める。未参照 object member の判定では、削除キーを 1 個ずつ全リポジトリで検索せずに Aho-Corasick で一括して事前抽出し、各 JS/TS ファイルを最大 1 回だけ parse する。ファイルの収集・読み込み・parse に失敗したときは互換扱いへ降格せず、blocking のままにする。
+同じシンボルに紐づく `impacts` も破壊的影響としては出さず、`mod_compat` の情報提供だけに留める。`rust_const_fn_added` の `impacts` は影響分析の判定に従い、同じファイルに同名の宣言があれば残す。未参照 object member の判定では、削除キーを 1 個ずつ全リポジトリで検索せずに Aho-Corasick で一括して事前抽出し、各 JS/TS ファイルを最大 1 回だけ parse する。ファイルの収集・読み込み・parse に失敗したときは互換扱いへ降格せず、blocking のままにする。
 
 `optional_object_props` では、同じ変更で型に足した optional プロパティを、分割代入の末尾にも追加できる。既存の要素は別名・既定値を含め、トークンが同じ順序で残ることが条件。追加できるのは shorthand 束縛と、リテラルの既定値を持つ shorthand 束縛だけである。既定値は文字列・数値・真偽値・null・置換のない template・負数に限る。引数の kind、引数全体の既定値、残りのシグネチャは変えない。
 

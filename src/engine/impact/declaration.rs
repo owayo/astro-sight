@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 
 use tree_sitter::Node;
 
+use crate::engine::rust_signature::RustFileItems;
 use crate::engine::{diff, parser, symbols};
 use crate::language::LangId;
 use crate::models::impact::{AffectedSymbol, HunkInfo, SignatureChange};
@@ -152,6 +153,8 @@ pub(super) struct DeclarationHeader {
     binding_mut_bytes: Vec<(usize, usize)>,
     /// 通常引数のパターンだけを消した Rust の契約。表示と従来の本体変更証明は変えない。
     rust_parameter_contract: Option<Vec<String>>,
+    /// 関数自身の `const` を除いた Rust の宣言。`const` を足しただけかの証明に使う。
+    rust_const_qualifier: Option<crate::engine::rust_signature::RustConstQualifier>,
 }
 
 impl DeclarationHeader {
@@ -214,6 +217,7 @@ pub(super) fn declaration_header(
             header_bytes: (decl.start_byte(), header_end),
             binding_mut_bytes: Vec::new(),
             rust_parameter_contract: None,
+            rust_const_qualifier: None,
         });
     }
 
@@ -285,6 +289,9 @@ pub(super) fn declaration_header(
         binding_mut_bytes,
         rust_parameter_contract: (lang_id == LangId::Rust)
             .then(|| crate::engine::rust_signature::rust_parameter_pattern_contract(decl, source))
+            .flatten(),
+        rust_const_qualifier: (lang_id == LangId::Rust)
+            .then(|| crate::engine::rust_signature::rust_const_qualifier(decl, source))
             .flatten(),
     })
 }
@@ -605,6 +612,9 @@ pub(super) struct DeclarationProof {
     pub(super) rust_free_function_names: HashSet<String>,
     pub(super) rust_kind_changes: HashSet<String>,
     pub(super) rust_alias_changes: HashSet<String>,
+    /// 宣言ヘッダの違いが関数に `const` を足したことだけの名前。シグネチャ変更は残し、
+    /// 呼び出し元は型別名の証明と同じく情報提供に回す。
+    pub(super) rust_const_additions: HashSet<String>,
 }
 
 /// モジュール直下の type alias だけを対象にする。trait / impl の関連型は同じ
@@ -822,7 +832,10 @@ pub(super) fn reconcile_declaration_changes(
     }
     // 行ベースの検出が変更前後のシグネチャ行を揃えられたかを判定するための変更行。
     let mut changed_line_texts: Option<(Vec<String>, Vec<String>)> = None;
-    let mut rust_parameter_environment_unchanged: Option<bool> = None;
+    let mut rust_import_environment_unchanged: Option<bool> = None;
+    let mut rust_const_additions = HashSet::new();
+    // `const` を足しただけの候補があるときだけ、旧新のファイルの宣言を 1 度ずつ索引にする。
+    let mut rust_file_items: Option<Option<(RustFileItems, RustFileItems)>> = None;
 
     for symbol_change in affected.iter_mut() {
         // variable は JS/TS の `const f = (a) => ...` のように関数を束縛するものだけが
@@ -869,28 +882,29 @@ pub(super) fn reconcile_declaration_changes(
                     .as_ref()
                     .zip(new.rust_parameter_contract.as_ref())
                     .is_some_and(|(old, new)| old == new)
-                && *rust_parameter_environment_unchanged.get_or_insert_with(|| {
-                    if input.old_file_path != input.file_path {
-                        return false;
-                    }
-                    let Some(old) = old_side.get(input) else {
-                        return false;
-                    };
-                    crate::engine::rust_signature::rust_parameter_import_environment(
-                        old.tree.root_node(),
-                        &old.source,
-                    )
-                    .zip(
-                        crate::engine::rust_signature::rust_parameter_import_environment(
-                            input.root,
-                            input.source,
-                        ),
-                    )
-                    .is_some_and(|(old, new)| old == new)
-                })
+                && *rust_import_environment_unchanged
+                    .get_or_insert_with(|| same_rust_import_environment(input, &mut old_side))
             {
                 sig_changes.retain(|sc| sc.name != symbol_change.name);
                 continue;
+            }
+            // 関数に `const` を足しただけのヘッダ変更は、シグネチャ変更として残したまま
+            // 呼び出し元を情報提供に回す。属性・外側の宣言・import と、ヘッダに現れる名前の
+            // 同じファイルの宣言が不変の場合だけ証明する。
+            if let (Some(new_qualifier), Some(old_qualifier)) = (
+                new.rust_const_qualifier.as_ref(),
+                old.rust_const_qualifier.as_ref(),
+            ) && new_qualifier.header_only_adds_const_to(old_qualifier)
+                && *rust_import_environment_unchanged
+                    .get_or_insert_with(|| same_rust_import_environment(input, &mut old_side))
+                && rust_file_items
+                    .get_or_insert_with(|| rust_file_items_pair(input, &mut old_side))
+                    .as_ref()
+                    .is_some_and(|(old_items, new_items)| {
+                        new_qualifier.only_adds_const_to(new_items, old_qualifier, old_items)
+                    })
+            {
+                rust_const_additions.insert(symbol_change.name.clone());
             }
             // 従来の本体変更の証明は byte 比較も求め、適用範囲を広げない。
             if has_text_sig_change
@@ -984,6 +998,7 @@ pub(super) fn reconcile_declaration_changes(
             sig_changes,
             &mut old_side,
         ),
+        rust_const_additions,
         ..Default::default()
     };
     if input.lang_id == LangId::Rust {
@@ -1062,6 +1077,38 @@ pub(super) fn reconcile_declaration_changes(
         }
     }
     proof
+}
+
+/// 同じパスの旧新で、型の名前を束縛する import とモジュールの構成が同じか。
+/// 違えば同じ字面の型が別の型を指しうるので、ヘッダの比較を証明に使わない。
+fn same_rust_import_environment(
+    input: &DeclarationChangeInput<'_>,
+    old_side: &mut LazyOldSide,
+) -> bool {
+    if input.old_file_path != input.file_path {
+        return false;
+    }
+    let Some(old) = old_side.get(input) else {
+        return false;
+    };
+    crate::engine::rust_signature::rust_parameter_import_environment(
+        old.tree.root_node(),
+        &old.source,
+    )
+    .zip(crate::engine::rust_signature::rust_parameter_import_environment(input.root, input.source))
+    .is_some_and(|(old, new)| old == new)
+}
+
+/// 旧新のファイルの名前付きの宣言 (`const` を足しただけかの証明で、ヘッダに現れる名前を引く)。
+fn rust_file_items_pair(
+    input: &DeclarationChangeInput<'_>,
+    old_side: &mut LazyOldSide,
+) -> Option<(RustFileItems, RustFileItems)> {
+    let old = old_side.get(input)?;
+    Some((
+        RustFileItems::new(old.tree.root_node(), &old.source)?,
+        RustFileItems::new(input.root, input.source)?,
+    ))
 }
 
 fn js_modified_direct_function_names(
@@ -2197,6 +2244,70 @@ mod tests {
             signatures.iter().any(|change| change.name == "take"),
             "{signatures:?}"
         );
+    }
+
+    /// 関数に `const` を足しただけのヘッダ変更は、シグネチャ変更を残したまま証明に載せる。
+    /// 別名の束縛先の変更や、旧新でパスの違う (rename の) 差分では載せない。
+    #[test]
+    fn rust_const_addition_is_proven_only_with_unchanged_bindings_and_path() {
+        let path = "src/lib.rs";
+        let plain = "pub struct S;\nimpl S {\n    pub fn label(&self, x: u8) -> u8 {\n        x\n    }\n}\n";
+        let constant = plain.replace("pub fn label", "pub const fn label");
+        let aliased = |alias: &str, qualifier: &str| {
+            format!(
+                "type Original = {alias};\nuse self::Original as Arg;\npub {qualifier}fn label(x: Arg) -> u8 {{\n    0\n}}\n"
+            )
+        };
+        for (old, new, old_path, proven) in [
+            (plain.to_string(), constant.clone(), path, true),
+            (plain.to_string(), constant, "src/old.rs", false),
+            (aliased("u8", ""), aliased("u8", "const "), path, true),
+            (aliased("u8", ""), aliased("u16", "const "), path, false),
+        ] {
+            let diff_text = unified_diff(path, &old, &new);
+            let hunks = diff::parse_unified_diff(&diff_text)
+                .into_iter()
+                .find(|file| file.new_path == path)
+                .expect("diff file")
+                .hunks;
+            let tree = parser::parse_source(new.as_bytes(), LangId::Rust).expect("parse");
+            let root = tree.root_node();
+            let syms = symbols::extract_symbols(root, new.as_bytes(), LangId::Rust).expect("syms");
+            let facts = diff::extract_changed_line_facts(&diff_text, path);
+            let reexport_moves = super::super::ReexportMoveIndex::build(&diff_text);
+            let mut affected = super::super::find_affected_symbols(&syms, &hunks, Some(&facts));
+            let mut sig_changes = super::super::signature::detect_signature_changes(
+                &diff_text,
+                path,
+                &affected,
+                LangId::Rust,
+            );
+            let proof = reconcile_declaration_changes(
+                &DeclarationChangeInput {
+                    file_diff: &diff_text,
+                    file_path: path,
+                    old_file_path: old_path,
+                    syms: &syms,
+                    hunks: &hunks,
+                    root,
+                    source: new.as_bytes(),
+                    lang_id: LangId::Rust,
+                    facts: &facts,
+                    reexport_moves: &reexport_moves,
+                },
+                &mut affected,
+                &mut sig_changes,
+            );
+            assert_eq!(
+                proof.rust_const_additions.contains("label"),
+                proven,
+                "{old_path}: {new}"
+            );
+            assert!(
+                sig_changes.iter().any(|change| change.name == "label"),
+                "{new}: {sig_changes:?}"
+            );
+        }
     }
 
     /// 複数行の引数リストの継続行だけを変えた変更を、シグネチャ変更として記録する。

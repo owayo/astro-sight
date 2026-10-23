@@ -12,6 +12,7 @@ mod reference_positions;
 mod removal;
 mod rename_move;
 mod required_type_members;
+mod rust_const_fn;
 mod rust_crate_kind;
 mod rust_module_visibility;
 mod rust_parameter_binding;

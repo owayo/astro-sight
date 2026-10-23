@@ -77,7 +77,7 @@ pub(crate) fn rust_parameter_pattern_contract(
     }
     // 引数が無い宣言も、generic list の末尾commaなどヘッダの整形比較に使う。
     let mut tokens = Vec::new();
-    append_header(function, source, &patterns, &mut tokens)?;
+    append_header(function, source, &patterns, None, &mut tokens)?;
     let mut current = function;
     // Node::parent の深さ依存コストを制限し、深い未対応の配置では証明を保留する。
     for _ in 0..64 {
@@ -97,7 +97,7 @@ pub(crate) fn rust_parameter_pattern_contract(
             "declaration_list" => current = parent,
             "impl_item" | "trait_item" | "mod_item" | "foreign_mod_item" => {
                 tokens.push("<enclosing-declaration>".to_string());
-                append_header(parent, source, &HashSet::new(), &mut tokens)?;
+                append_header(parent, source, &HashSet::new(), None, &mut tokens)?;
                 current = parent;
             }
             _ => return None,
@@ -125,7 +125,7 @@ pub(crate) fn rust_parameter_import_environment(
         }
         if node.kind() == "mod_item" {
             tokens.push(format!("<module-depth:{depth}>"));
-            if append_header(node, source, &HashSet::new(), &mut tokens).is_none()
+            if append_header(node, source, &HashSet::new(), None, &mut tokens).is_none()
                 || append_outer_attributes(node, source, &mut tokens).is_none()
             {
                 return ControlFlow::Break(());
@@ -146,10 +146,13 @@ pub(crate) fn rust_parameter_import_environment(
     result.is_continue().then_some(tokens)
 }
 
-fn append_header(
+/// 本体を除く宣言のトークンを足す。`patterns` の部分木は同じ印に置き換え、`omitted` の
+/// トークン (関数自身の `const` など) は比べない。
+pub(super) fn append_header(
     declaration: Node<'_>,
     source: &[u8],
     patterns: &HashSet<usize>,
+    omitted: Option<usize>,
     tokens: &mut Vec<String>,
 ) -> Option<()> {
     let body = declaration
@@ -167,6 +170,7 @@ fn append_header(
         }
         if node.is_extra()
             || Some(node.id()) == body
+            || Some(node.id()) == omitted
             || is_rust_binding_mut(node)
             || is_rust_list_trailing_comma(node)
         {
@@ -187,7 +191,7 @@ fn append_header(
     result.is_continue().then_some(())
 }
 
-fn append_outer_attributes(
+pub(super) fn append_outer_attributes(
     declaration: Node<'_>,
     source: &[u8],
     tokens: &mut Vec<String>,
@@ -207,7 +211,7 @@ fn append_outer_attributes(
     Some(())
 }
 
-fn append_inner_attributes(
+pub(super) fn append_inner_attributes(
     container: Node<'_>,
     source: &[u8],
     tokens: &mut Vec<String>,
@@ -256,7 +260,7 @@ fn append_safe_attribute(item: Node<'_>, source: &[u8], tokens: &mut Vec<String>
     append_tokens(item, source, tokens)
 }
 
-fn append_tokens(node: Node<'_>, source: &[u8], tokens: &mut Vec<String>) -> Option<()> {
+pub(super) fn append_tokens(node: Node<'_>, source: &[u8], tokens: &mut Vec<String>) -> Option<()> {
     let result = walk_preorder(node, Children::All, |node, _| {
         if node.is_error() || node.is_missing() {
             return ControlFlow::Break(());

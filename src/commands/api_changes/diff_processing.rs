@@ -595,6 +595,7 @@ fn collect_modified_symbols(
     } = maps;
     let mut files =
         ChangedSignatureFiles::new(inputs, state, &df.old_path, &df.new_path, in_file_callees);
+    files.rust_const_additions = Some(facts.rust_const_additions);
 
     // 同一 (file, qualname) の modified を重複排除するためのキーセット
     let mut seen_modified: std::collections::HashSet<(String, String)> =
@@ -713,6 +714,9 @@ struct ChangedSignatureFiles<'a> {
     /// Rust の同一ファイル内 public type alias は、最初の候補で old/new source を 1 回だけ
     /// 読み込んで以降の候補へ再利用する。候補ごとの git show + parse を避ける。
     rust_type_aliases: Option<Option<crate::engine::rust_signature::RustTypeAliasEquivalence>>,
+    /// 関数に `const` を足しただけと Phase 0 で証明した qualname。型の移動と同じ差分の
+    /// メンバーは旧新で別ファイルを比べるので持たない。
+    rust_const_additions: Option<&'a std::collections::HashSet<String>>,
 }
 
 impl<'a> ChangedSignatureFiles<'a> {
@@ -735,6 +739,7 @@ impl<'a> ChangedSignatureFiles<'a> {
             skip_for_binary_crate,
             lang_id: crate::language::LangId::from_path(camino::Utf8Path::new(new_path)).ok(),
             rust_type_aliases: None,
+            rust_const_additions: None,
         }
     }
 
@@ -788,6 +793,31 @@ impl<'a> ChangedSignatureFiles<'a> {
         if internally_closed
             && !may_be_python_typed_dict_total_change(kind, old_sig, new_sig, self.lang_id)
         {
+            return;
+        }
+
+        // Rust の関数に `const` を足しただけなら、const の文脈の外からの呼び出しは変わらない
+        // ので非 blocking (Issue #113)。外す変更とほかの部分も変えた変更は証明に入らない。
+        if self.lang_id == Some(crate::language::LangId::Rust)
+            && self
+                .rust_const_additions
+                .is_some_and(|names| names.contains(name))
+        {
+            let site = CompatibleModSite {
+                dir,
+                base: inputs.base,
+                old_path: self.old_path,
+                new_path: self.new_path,
+                name,
+                kind,
+                old_sig,
+                new_sig,
+                lang_id: self.lang_id,
+            };
+            state
+                .buckets
+                .compatible_modified
+                .push(site.compatible("rust_const_fn_added"));
             return;
         }
 
