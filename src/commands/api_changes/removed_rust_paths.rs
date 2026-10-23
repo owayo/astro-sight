@@ -21,9 +21,16 @@ use crate::{engine::parser, language::LangId};
 #[path = "removed_rust_layout.rs"]
 mod layout;
 
+#[path = "removed_rust_dependencies.rs"]
+mod dependencies;
+
 #[cfg(test)]
 #[path = "removed_rust_layout_tests.rs"]
 mod layout_tests;
+
+#[cfg(test)]
+#[path = "removed_rust_dependency_tests.rs"]
+mod dependency_tests;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum PathSite {
@@ -256,6 +263,85 @@ fn locally_rewrite_free(node: Node<'_>, attributes: &AttributeSummaries) -> bool
         && attributes.outer(node).tokens
 }
 
+/// 組み込み derive の名前を置き換え得る import は、ファイル全体から一度だけ集める。
+fn file_import_tokens(root: Node<'_>, source: &[u8]) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    let _: std::ops::ControlFlow<()> = crate::engine::tree_walk::walk_preorder(
+        root,
+        crate::engine::tree_walk::Children::Named,
+        |node, _| {
+            if matches!(node.kind(), "use_declaration" | "extern_crate_declaration") {
+                tokens.extend(identifier_tokens(node, source));
+                if node.utf8_text(source).is_ok_and(|text| text.contains('*')) {
+                    tokens.insert("*".to_owned());
+                }
+                return std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Skip);
+            }
+            std::ops::ControlFlow::Continue(crate::engine::tree_walk::Walk::Descend)
+        },
+    );
+    tokens
+}
+
+/// 外部クレートの名前は、同名の直接宣言がないときにも展開が隠し得る。
+fn attribute_may_generate(
+    item: Node<'_>,
+    source: &[u8],
+    policy: AttributePolicy,
+    imported: &HashSet<String>,
+) -> bool {
+    let Some(names) = attribute_names(item, source) else {
+        return true;
+    };
+    let direct_derive = item
+        .named_child(0)
+        .and_then(|attribute| attribute.named_child(0))
+        .and_then(|name| name.utf8_text(source).ok())
+        == Some("derive");
+    names.iter().any(|name| {
+        if policy.keeps_item(name) || *name == "cfg" {
+            return false;
+        }
+        *name != "derive"
+            || !direct_derive
+            || policy.derive_shadowed
+            || !builtin_derives(item, source, imported)
+    })
+}
+
+fn builtin_derives(item: Node<'_>, source: &[u8], imported: &HashSet<String>) -> bool {
+    if imported.contains("*") {
+        return false;
+    }
+    let Some(arguments) = item
+        .named_child(0)
+        .and_then(|attribute| attribute.child_by_field_name("arguments"))
+    else {
+        return false;
+    };
+    let mut cursor = arguments.walk();
+    arguments
+        .children(&mut cursor)
+        .all(|token| match token.kind() {
+            "(" | ")" | "," | "line_comment" | "block_comment" => true,
+            "identifier" => token.utf8_text(source).is_ok_and(|name| {
+                matches!(
+                    name,
+                    "Clone"
+                        | "Copy"
+                        | "Debug"
+                        | "Default"
+                        | "Eq"
+                        | "PartialEq"
+                        | "Ord"
+                        | "PartialOrd"
+                        | "Hash"
+                ) && !imported.contains(name)
+            }),
+            _ => false,
+        })
+}
+
 fn plain_name(name: &str) -> &str {
     name.strip_prefix("r#").unwrap_or(name)
 }
@@ -294,6 +380,8 @@ struct ScopeFacts {
     functions: HashMap<String, usize>,
     /// 型の名前空間の宣言数 (属性を問わない。mod を含む)。
     types: HashMap<String, usize>,
+    /// NFC 同値の別表記を否定できない。外部依存への fallback だけを保留する。
+    non_ascii_type_names: bool,
     /// 有無が属性に左右されない型 (struct・enum・union・trait・type) の宣言数。
     plain_types: HashMap<String, usize>,
     /// 有無と配置が属性に左右されない子 mod。
@@ -303,6 +391,12 @@ struct ScopeFacts {
     unknown_children: bool,
     /// use 宣言と extern crate に現れる識別子。
     import_tokens: HashSet<String>,
+    extern_crates: HashSet<String>,
+    glob: bool,
+    may_generate: bool,
+    no_implicit_prelude: bool,
+    /// cfg_attr 経由を含む inner cfg。依存 root の存在証明だけで使う。
+    inner_cfg: bool,
     /// トークンを書き換え得る inner attribute がある。
     opaque: bool,
     parent: Option<usize>,
@@ -329,6 +423,16 @@ impl ScopeFacts {
         }
         self.modules.get(name).copied()
     }
+
+    fn lacks_type_name(&self, name: &str) -> bool {
+        !self.opaque
+            && !self.non_ascii_type_names
+            && !self.unknown_children
+            && !self.may_generate
+            && !self.glob
+            && !self.types.contains_key(name)
+            && !self.import_tokens.contains(name)
+    }
 }
 
 fn count(map: &mut HashMap<String, usize>, name: &str) {
@@ -353,6 +457,7 @@ impl FileScopes {
         }
         let policy = AttributePolicy::for_tree(root, source);
         let attributes = AttributeSummaries::collect(root, source, policy);
+        let imported = file_import_tokens(root, source);
         let mut scopes = Vec::new();
         // 番号は積んだ順に振り、同じ順に取り出して埋める。
         let mut pending = VecDeque::from([(root, None)]);
@@ -369,6 +474,26 @@ impl FileScopes {
             let mut cursor = scope.walk();
             for item in scope.named_children(&mut cursor) {
                 let name = declared_name(item, source);
+                match item.kind() {
+                    "attribute_item" => {
+                        facts.may_generate |=
+                            attribute_may_generate(item, source, policy, &imported);
+                    }
+                    "inner_attribute_item" => {
+                        let names = attribute_names(item, source);
+                        facts.inner_cfg |=
+                            names.as_ref().is_some_and(|names| names.contains(&"cfg"));
+                        facts.no_implicit_prelude |=
+                            names.is_none_or(|names| names.contains(&"no_implicit_prelude"));
+                    }
+                    "use_declaration" => {
+                        facts.glob |= item.utf8_text(source).is_ok_and(|text| text.contains('*'));
+                    }
+                    "extern_crate_declaration" => {
+                        facts.extern_crates.extend(identifier_tokens(item, source));
+                    }
+                    _ => {}
+                }
                 match (item.kind(), name) {
                     ("function_item", Some(name)) => {
                         count(&mut facts.values, name);
@@ -444,6 +569,7 @@ impl FileScopes {
                 }
             }
             facts.unknown_children |= facts.opaque;
+            facts.non_ascii_type_names = facts.types.keys().any(|name| !name.is_ascii());
             scopes.push(facts);
         }
         Some(Self { scopes, policy })
@@ -643,6 +769,7 @@ impl BlockBindings {
 pub(crate) struct RustPathResolver {
     dir: PathBuf,
     layout: OnceCell<Option<layout::Layout>>,
+    dependencies: dependencies::DependencyProof,
 }
 
 impl RustPathResolver {
@@ -650,6 +777,7 @@ impl RustPathResolver {
         Self {
             dir: PathBuf::from(dir),
             layout: OnceCell::new(),
+            dependencies: dependencies::DependencyProof::new(std::path::Path::new(dir)),
         }
     }
 
@@ -839,9 +967,12 @@ impl RustPathResolver {
         source: &[u8],
         context: Option<usize>,
     ) -> Option<Resolved> {
-        let segments = path_segments(path)?;
+        let (segments, global) = path_segments(path)?;
         let (first, rest) = segments.split_first()?;
         let mut current = match first.kind() {
+            "identifier" if global => {
+                self.dependency_root(file, plain_name(first.utf8_text(source).ok()?), context)?
+            }
             "crate" => self.layout()?.crate_root(context?),
             "self" => current_module(file, *first)?,
             "super" => {
@@ -865,9 +996,17 @@ impl RustPathResolver {
                             scope: *file.ids.get(&scope.id())?,
                             occurrence: None,
                         };
-                        match self.step(file, &module, name, rest.is_empty(), context)? {
-                            Resolved::Type => return Some(Resolved::Type),
-                            Resolved::Module(module) => module,
+                        let facts = file.scopes.scopes.get(module.scope)?;
+                        if facts.lacks_type_name(name) {
+                            if self.implicit_prelude_disabled(file, &module, context)? {
+                                return None;
+                            }
+                            self.dependency_root(file, name, context)?
+                        } else {
+                            match self.step(file, &module, name, rest.is_empty(), context)? {
+                                Resolved::Type => return Some(Resolved::Type),
+                                Resolved::Module(module) => module,
+                            }
                         }
                     }
                 }
@@ -953,6 +1092,51 @@ impl RustPathResolver {
         self.layout()?.file_scopes(&module.file)
     }
 
+    fn implicit_prelude_disabled(
+        &self,
+        file: &RefFile,
+        module: &ModuleRef,
+        context: Option<usize>,
+    ) -> Option<bool> {
+        let layout = self.layout()?;
+        let root = layout.crate_root(context?).occurrence?;
+        let mut current = module.clone();
+        loop {
+            let scopes = self.module_scopes(file, &current)?;
+            if scopes.scopes.get(current.scope)?.no_implicit_prelude {
+                return Some(true);
+            }
+            let occurrence = current
+                .occurrence
+                .or_else(|| layout.scope_occurrence(context?, current.scope))?;
+            if occurrence == root {
+                return Some(false);
+            }
+            current = self.parent_module(file, &current, context)?;
+        }
+    }
+
+    fn dependency_root(
+        &self,
+        file: &RefFile,
+        name: &str,
+        context: Option<usize>,
+    ) -> Option<ModuleRef> {
+        let layout = self.layout()?;
+        let root = layout.crate_root(context?);
+        let scopes = self.module_scopes(file, &root)?;
+        let facts = scopes.scopes.get(root.scope)?;
+        // root の展開は extern prelude 自体を変え得る。`::name` でもこの確認は要る。
+        if facts.opaque
+            || facts.unknown_children
+            || facts.may_generate
+            || facts.extern_crates.contains(name)
+        {
+            return None;
+        }
+        self.dependencies.root(layout, context?, name)
+    }
+
     fn layout(&self) -> Option<&layout::Layout> {
         self.layout
             .get_or_init(|| layout::Layout::build(&self.dir))
@@ -980,15 +1164,15 @@ fn current_module(file: &RefFile, node: Node<'_>) -> Option<ModuleRef> {
     None
 }
 
-/// `a::b::c` の各段のノード。`path` を先頭までたどり、再帰しない。
-fn path_segments(node: Node<'_>) -> Option<Vec<Node<'_>>> {
+/// パスの各段のノードと、extern prelude だけを引く `::` で始まるか。
+fn path_segments(node: Node<'_>) -> Option<(Vec<Node<'_>>, bool)> {
     let mut reversed = Vec::new();
     let mut current = node;
-    loop {
+    let global = loop {
         match current.kind() {
             "identifier" | "type_identifier" | "crate" | "self" | "super" => {
                 reversed.push(current);
-                break;
+                break false;
             }
             "scoped_identifier" | "scoped_type_identifier" => {
                 let name = current.child_by_field_name("name")?;
@@ -996,13 +1180,19 @@ fn path_segments(node: Node<'_>) -> Option<Vec<Node<'_>>> {
                     return None;
                 }
                 reversed.push(name);
-                current = current.child_by_field_name("path")?;
+                match current.child_by_field_name("path") {
+                    Some(path) => current = path,
+                    None if current.child(0).is_some_and(|token| token.kind() == "::") => {
+                        break true;
+                    }
+                    None => return None,
+                }
             }
             _ => return None,
         }
-    }
+    };
     reversed.reverse();
-    Some(reversed)
+    Some((reversed, global))
 }
 
 /// 部分木に現れる識別子 (束縛の位置を絞らない、保守側の材料)。

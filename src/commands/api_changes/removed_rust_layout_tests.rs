@@ -665,7 +665,7 @@ fn removed_rust_layout_normalizes_ancestor_aliases_but_rejects_root_links() {
     let special_parent = temp_parent.path().join("a&b[layout]");
     std::fs::create_dir_all(&special_parent).unwrap();
     let dir = tempfile::tempdir_in(&special_parent).unwrap();
-    let physical = dir.path().join("physical");
+    let physical = dir.path().join("physical/nested");
     let project = physical.join("project");
     for (path, source) in base() {
         let path = project.join(path);
@@ -693,6 +693,60 @@ fn removed_rust_layout_normalizes_ancestor_aliases_but_rejects_root_links() {
             .values()
             .any(|site| *site == PathSite::ModuleFunction(Rc::from("src/engine.rs")))
     );
+
+    let dependency_project = physical.join("dependencies");
+    let dependency_source = "pub fn f() { beta::items::run(); }";
+    for (path, source) in [
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"alpha\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "alpha/Cargo.toml",
+            "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nbeta = { path = \"../beta\" }\n",
+        ),
+        ("alpha/src/lib.rs", dependency_source),
+        (
+            "beta/Cargo.toml",
+            "[package]\nname = \"beta\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("beta/src/lib.rs", "pub mod items { pub fn run() {} }"),
+    ] {
+        let path = dependency_project.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, source).unwrap();
+    }
+    let aliased_dependency_project = parent_alias.join("dependencies");
+    let dependency_layout = layout::Layout::build(&aliased_dependency_project).unwrap();
+    assert_eq!(
+        dependency_layout.package_at("alpha", "../beta"),
+        Some(Rc::from("beta"))
+    );
+    let resolves_dependency = || {
+        let tree = parser::parse_source(dependency_source.as_bytes(), LangId::Rust).unwrap();
+        RustPathResolver::new(aliased_dependency_project.to_str().unwrap())
+            .positions(
+                tree.root_node(),
+                dependency_source.as_bytes(),
+                "run",
+                "alpha/src/lib.rs",
+            )
+            .values()
+            .any(|site| *site == PathSite::ModuleFunction(Rc::from("beta/src/lib.rs")))
+    };
+    assert!(resolves_dependency());
+    let physical_ancestor = physical.parent().unwrap();
+    std::fs::create_dir_all(physical_ancestor.join(".cargo")).unwrap();
+    let physical_config = physical_ancestor.join(".cargo/config.toml");
+    std::fs::write(
+        &physical_config,
+        "[build]\nrustc-wrapper = \"other-rustc\"\n",
+    )
+    .unwrap();
+    assert!(layout::Layout::build(&aliased_dependency_project).is_some());
+    assert!(!resolves_dependency());
+    std::fs::remove_file(physical_config).unwrap();
+    assert!(resolves_dependency());
 
     std::fs::create_dir_all(logical_parent.join(".cargo")).unwrap();
     let config = logical_parent.join(".cargo/config.toml");
