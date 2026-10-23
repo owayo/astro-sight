@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **Rust の Unicode エスケープの区切り** — `vendor/tree-sitter-rust` は公開 crate 0.24.2 の文法で、波括弧形式の Unicode エスケープの16進数字の後に続くアンダースコアを `char_literal` と `escape_sequence` の両方で許可する (Issue #135)。入力を加工せず、文字列の後の宣言・呼び出しのバイト位置を保つ。既存の桁数の許容・非波括弧形式・prefix の扱いは維持し、Unicode scalar や byte literal の意味検証は追加しない。生成は CLI 0.26.6 / ABI 15。scanner・queries・bindings・node-types・headers は公開 crate と byte 一致し、通常のビルドに generator は不要。由来と再生成差分は `vendor/tree-sitter-rust/PATCHES.md`、回帰は parser の `grammar_regressions_rust.rs` と CLI の `rust_unicode_escapes.rs`。
+
 - **Rust の private helper と include の識別子** — `engine/impact/rust_path_owner.rs` の葉モジュール証明は、`use` が `include` を取り込むかを `rust_dynamic_source::node_includes_external_source` の AST 判定で調べる (Issue #133)。`compile_includes`・`include_str`・コメント中の `include` は取り込みとせず、実際の `include` の import・別名・raw identifier と、UTF-8 の読取失敗・構文エラーは証明を止める。`rust_assert_include.rs` は、標準 `assert!` 内の `include.method(...)` / `!include.method(...)` の receiver だけを追加で除外する。Cargo の通常配置で親のソースと字句スコープを調べ、マクロ・属性の上書き、glob・別名 import、不明な展開、対象に重なる静的 path 配置・配置を確定できない属性や宣言マクロ・非対応 target を保留する。固定された組み込み属性だけを出す宣言マクロと、対象の部分木に届かない静的 path は監査で区別する。任意マクロへの token の受け渡し、入れ子のマクロ、実際の include・子モジュール・staged の参照は保持する。外部の未展開 proc macro が名前や別配置を合成する場合は保証対象外。共有の取り込み検出と refs/dead-code の出現契約は変えない。回帰は `tests/integration/impact_rust_private_helpers.rs` の同名参照7件と上書き・別配置・子モジュール・別名 include の対照。
 
 - **TS/TSX の1行関数の本体変更と impact** — `engine/impact/declaration.rs` は、明示戻り型を持つ一意なファイル直下の通常関数について、旧新 AST のヘッダと、本体を除いたファイル全体が一致するときだけ、行比較に混ざった本体変更を `signature_changes` から除く (Issue #126)。変更済みシンボルの記録は保持する。引数・戻り型・公開指定・周辺コードの変更、戻り型の推論、JS、メソッド・generator・関数値、overload・同名束縛・再束縛・解析不能・旧側の復元失敗・パス変更は補正しない。staged は index のソースで照合する。refs/dead-code の出現契約は変えない。

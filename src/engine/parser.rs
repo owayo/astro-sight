@@ -294,6 +294,9 @@ mod grammar_regressions_typescript;
 mod grammar_regressions_kotlin;
 
 #[cfg(test)]
+mod grammar_regressions_rust;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::language::LangId;
