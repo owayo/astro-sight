@@ -4,6 +4,7 @@ mod compatibility_params;
 mod compatibility_react;
 mod declaration_coverage;
 mod general;
+mod moved_member_signature;
 mod other_languages;
 mod parse_errors;
 mod python;

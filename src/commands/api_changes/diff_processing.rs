@@ -580,10 +580,7 @@ fn collect_modified_symbols(
     maps: &SymbolMaps<'_>,
 ) {
     let &DetectionInputs {
-        dir,
-        ref_index,
-        base_blobs,
-        ..
+        dir, base_blobs, ..
     } = inputs;
     let &ModifiedFileFacts {
         new_syms,
@@ -596,24 +593,8 @@ fn collect_modified_symbols(
         new_name_counts,
         ..
     } = maps;
-
-    // Rust bin-only crate 判定 (api.mod 抑制用)。lib → bin / bin → lib どちらかが bin-only なら
-    // 外部 API 面の変更ではないとみなす。
-    let is_binary_rust_old_crate_for_mod = state
-        .rust_public
-        .is_binary_only_at_base(base_blobs, &df.old_path);
-    let is_binary_rust_new_crate_for_mod = is_binary_only_rust_crate(dir, &df.new_path);
-    let skip_mod_for_binary_crate =
-        is_binary_rust_old_crate_for_mod || is_binary_rust_new_crate_for_mod;
-
-    // 値バインディングの value-only 変更を const_value_changes へ振り分けるための言語判定。
-    let lang_id_for_file =
-        crate::language::LangId::from_path(camino::Utf8Path::new(df.new_path.as_str())).ok();
-    // Rust の同一ファイル内 public type alias は、最初の候補で old/new source を 1 回だけ
-    // 読み込んで以降の候補へ再利用する。候補ごとの git show + parse を避ける。
-    let mut rust_type_aliases: Option<
-        Option<crate::engine::rust_signature::RustTypeAliasEquivalence>,
-    > = None;
+    let mut files =
+        ChangedSignatureFiles::new(inputs, state, &df.old_path, &df.new_path, in_file_callees);
 
     // 同一 (file, qualname) の modified を重複排除するためのキーセット
     let mut seen_modified: std::collections::HashSet<(String, String)> =
@@ -632,7 +613,7 @@ fn collect_modified_symbols(
                 kind,
                 old_sig,
                 new_sig,
-                lang_id: lang_id_for_file,
+                lang_id: files.lang_id,
             };
             let mut sources = SignatureSourceCache::with_base_blobs(base_blobs);
             // signature が同じなので、型注釈と静的 container の段階だけを見る。
@@ -658,19 +639,6 @@ fn collect_modified_symbols(
             && old_sig != &new_sig.as_str()
             && seen_modified.insert((df.new_path.clone(), name.clone()))
         {
-            if skip_mod_for_binary_crate {
-                continue;
-            }
-            // private module 抑制
-            if is_rust_old_symbol_outside_public_api_surface(
-                dir,
-                base_blobs,
-                &df.old_path,
-                name,
-                state.rust_public,
-            ) {
-                continue;
-            }
             // 同名が旧/新いずれかに複数あるシンボルは曖昧として modified から除外
             if old_name_counts.get(name.as_str()).copied().unwrap_or(0) > 1
                 || new_name_counts.get(name.as_str()).copied().unwrap_or(0) > 1
@@ -680,95 +648,214 @@ fn collect_modified_symbols(
             if facts.parameter_pattern_only_names.contains(name) {
                 continue;
             }
-            // closed-in-diff: 同一ファイル内でしか呼ばれていない関数のシグネチャ変更は除外。
-            //
-            // ただし Python の TypedDict `total=` 変更候補だけはここで落とさない。
-            // 落とすと契約変更の 3 値判定に到達できず、「キーが必須化する破壊的変更」が
-            // api.mod にすら出なくなる。判定が `NotApplicable` なら
-            // `classify_signature_change` 側で従来どおり捨てる。
-            // default export / 別名 export (`export { f as g }`) の利用者は宣言名で現れないので、
-            // 宣言名の cross-file 参照 0 件は「同一ファイル内でしか使われていない」証明にならない。
-            let internally_closed = is_internally_connected(in_file_callees, name)
-                && !has_cross_file_refs(ref_index, &df.new_path, name)
-                && !super::js_public_name::published_names_for_diff_file(
-                    dir,
-                    base_blobs,
-                    &df.old_path,
-                    &df.new_path,
-                    state.closure_caches,
-                )
-                .is_some_and(|names| !name.contains('.') && names.may_differ(name));
-            if internally_closed
-                && !may_be_python_typed_dict_total_change(kind, old_sig, new_sig, lang_id_for_file)
-            {
-                continue;
-            }
+            files.classify(inputs, state, name, kind, old_sig, new_sig);
+        }
+    }
+}
 
-            // Rust の透過的な root public type alias 導入だけで説明できる表記変更は非 blocking。
-            // working tree 側を先に読み、利用可能な alias がある場合だけ base blob を `git show`
-            // する。同一ファイルの候補間では old/new alias index を再利用する。
-            if lang_id_for_file == Some(crate::language::LangId::Rust) && kind == "function" {
-                let context = rust_type_aliases.get_or_insert_with(|| {
-                    let new_source = super::source_pair::load_new_source(dir, &df.new_path)?;
-                    let prepared = crate::engine::rust_signature::RustTypeAliasEquivalence::prepare_new_source(
+/// 型の移動と同じ差分でシグネチャの変わったメンバーを、rename した変更ファイルと同じ規則で
+/// 判定する。移動元を旧ファイル、移動先を新ファイルとして扱う。組の一意性は
+/// [`pair_moved_member_changes`] が確かめている。
+pub(crate) fn process_moved_member_changes(
+    inputs: &DetectionInputs<'_>,
+    state: &mut DetectionState<'_>,
+    changes: &[MovedMemberChange<'_>],
+) {
+    // (移動元, 移動先) ごとに文脈を 1 つ作り、型別名の読み込みなどを共有する。
+    let mut files: Vec<ChangedSignatureFiles<'_>> = Vec::new();
+    for change in changes {
+        let (old_path, new_path) = (change.old.file.as_str(), change.new.file.as_str());
+        let ix = match files
+            .iter()
+            .position(|files| files.old_path == old_path && files.new_path == new_path)
+        {
+            Some(ix) => ix,
+            None => {
+                let mut moved = ChangedSignatureFiles::new(
+                    inputs,
+                    state,
+                    old_path,
+                    new_path,
+                    change.new_in_file_callees,
+                );
+                moved.moved_from = Some(old_path);
+                files.push(moved);
+                files.len() - 1
+            }
+        };
+        files[ix].classify(
+            inputs,
+            state,
+            &change.new.name,
+            &change.new.kind,
+            &change.old.signature,
+            &change.new.signature,
+        );
+    }
+}
+
+/// シグネチャの変わったシンボルを判定する、旧新のファイルの組ごとの文脈。
+///
+/// 変更ファイル (rename を含む) と、型の移動と同じ差分でシグネチャの変わったメンバー
+/// ([`process_moved_member_changes`]) が同じ規則で判定するために共有する。ファイル内の
+/// 対応付け (同名の複数定義・引数パターンだけの変更) の検査は呼び出し側が済ませる。
+struct ChangedSignatureFiles<'a> {
+    old_path: &'a str,
+    new_path: &'a str,
+    /// 型の移動と同じ差分でシグネチャの変わったメンバーなら移動元 (`old_path`)。
+    moved_from: Option<&'a str>,
+    in_file_callees: &'a std::collections::HashSet<String>,
+    /// Rust bin-only crate 判定 (api.mod 抑制用)。lib → bin / bin → lib どちらかが bin-only なら
+    /// 外部 API 面の変更ではないとみなす。
+    skip_for_binary_crate: bool,
+    /// 値バインディングの value-only 変更を const_value_changes へ振り分けるための言語判定。
+    lang_id: Option<crate::language::LangId>,
+    /// Rust の同一ファイル内 public type alias は、最初の候補で old/new source を 1 回だけ
+    /// 読み込んで以降の候補へ再利用する。候補ごとの git show + parse を避ける。
+    rust_type_aliases: Option<Option<crate::engine::rust_signature::RustTypeAliasEquivalence>>,
+}
+
+impl<'a> ChangedSignatureFiles<'a> {
+    fn new(
+        inputs: &DetectionInputs<'_>,
+        state: &mut DetectionState<'_>,
+        old_path: &'a str,
+        new_path: &'a str,
+        in_file_callees: &'a std::collections::HashSet<String>,
+    ) -> Self {
+        let skip_for_binary_crate = state
+            .rust_public
+            .is_binary_only_at_base(inputs.base_blobs, old_path)
+            || is_binary_only_rust_crate(inputs.dir, new_path);
+        Self {
+            old_path,
+            new_path,
+            moved_from: None,
+            in_file_callees,
+            skip_for_binary_crate,
+            lang_id: crate::language::LangId::from_path(camino::Utf8Path::new(new_path)).ok(),
+            rust_type_aliases: None,
+        }
+    }
+
+    /// シグネチャの変わったシンボル 1 件を判定し、対応する bucket へ入れる。
+    fn classify(
+        &mut self,
+        inputs: &DetectionInputs<'_>,
+        state: &mut DetectionState<'_>,
+        name: &str,
+        kind: &str,
+        old_sig: &str,
+        new_sig: &str,
+    ) {
+        let &DetectionInputs {
+            dir,
+            ref_index,
+            base_blobs,
+            ..
+        } = inputs;
+        if self.skip_for_binary_crate {
+            return;
+        }
+        // private module 抑制
+        if is_rust_old_symbol_outside_public_api_surface(
+            dir,
+            base_blobs,
+            self.old_path,
+            name,
+            state.rust_public,
+        ) {
+            return;
+        }
+        // closed-in-diff: 同一ファイル内でしか呼ばれていない関数のシグネチャ変更は除外。
+        //
+        // ただし Python の TypedDict `total=` 変更候補だけはここで落とさない。
+        // 落とすと契約変更の 3 値判定に到達できず、「キーが必須化する破壊的変更」が
+        // api.mod にすら出なくなる。判定が `NotApplicable` なら
+        // `classify_signature_change` 側で従来どおり捨てる。
+        // default export / 別名 export (`export { f as g }`) の利用者は宣言名で現れないので、
+        // 宣言名の cross-file 参照 0 件は「同一ファイル内でしか使われていない」証明にならない。
+        let internally_closed = is_internally_connected(self.in_file_callees, name)
+            && !has_cross_file_refs(ref_index, self.new_path, name)
+            && !super::js_public_name::published_names_for_diff_file(
+                dir,
+                base_blobs,
+                self.old_path,
+                self.new_path,
+                state.closure_caches,
+            )
+            .is_some_and(|names| !name.contains('.') && names.may_differ(name));
+        if internally_closed
+            && !may_be_python_typed_dict_total_change(kind, old_sig, new_sig, self.lang_id)
+        {
+            return;
+        }
+
+        // Rust の透過的な root public type alias 導入だけで説明できる表記変更は非 blocking。
+        // working tree 側を先に読み、利用可能な alias がある場合だけ base blob を `git show`
+        // する。同一ファイルの候補間では old/new alias index を再利用する。
+        if self.lang_id == Some(crate::language::LangId::Rust) && kind == "function" {
+            let (old_path, new_path) = (self.old_path, self.new_path);
+            let context = self.rust_type_aliases.get_or_insert_with(|| {
+                let new_source = super::source_pair::load_new_source(dir, new_path)?;
+                let prepared =
+                    crate::engine::rust_signature::RustTypeAliasEquivalence::prepare_new_source(
                         &new_source,
                     )?;
-                    let sources = super::source_pair::load_old_source_with_new(
-                        base_blobs,
-                        &df.old_path,
-                        &df.new_path,
-                        new_source,
-                    )?;
-                    prepared.with_old_source(&sources.old)
-                });
-                if context
-                    .as_ref()
-                    .is_some_and(|context| context.prove_function(name))
-                {
-                    let site = CompatibleModSite {
-                        dir,
-                        base: inputs.base,
-                        old_path: &df.old_path,
-                        new_path: &df.new_path,
-                        name,
-                        kind,
-                        old_sig,
-                        new_sig,
-                        lang_id: lang_id_for_file,
-                    };
-                    state
-                        .buckets
-                        .compatible_modified
-                        .push(site.compatible("transparent_rust_type_alias"));
-                    continue;
-                }
-            }
-
-            let change = ApiSymbolChange {
-                name: name.clone(),
-                kind: kind.clone(),
-                file: df.new_path.clone(),
-                old_signature: Some(old_sig.to_string()),
-                new_signature: Some(new_sig.clone()),
-                // blocking な api.mod に確定した時点でのみ算出する (classify_signature_change)。
-                no_resolved_internal_callers: false,
-                // 型契約変更として種別が確定した時点で埋める (classify_signature_change)。
-                contract_change: None,
-            };
-            classify_signature_change(
-                inputs,
-                state,
-                df,
-                SignatureChangeSite {
-                    change,
+                let sources = super::source_pair::load_old_source_with_new(
+                    base_blobs, old_path, new_path, new_source,
+                )?;
+                prepared.with_old_source(&sources.old)
+            });
+            if context
+                .as_ref()
+                .is_some_and(|context| context.prove_function(name))
+            {
+                let site = CompatibleModSite {
+                    dir,
+                    base: inputs.base,
+                    old_path,
+                    new_path,
+                    name,
                     kind,
                     old_sig,
                     new_sig,
-                    lang_id: lang_id_for_file,
-                    internally_closed,
-                },
-            );
+                    lang_id: self.lang_id,
+                };
+                state
+                    .buckets
+                    .compatible_modified
+                    .push(site.compatible("transparent_rust_type_alias"));
+                return;
+            }
         }
+
+        let change = ApiSymbolChange {
+            name: name.to_owned(),
+            kind: kind.to_owned(),
+            file: self.new_path.to_owned(),
+            old_signature: Some(old_sig.to_owned()),
+            new_signature: Some(new_sig.to_owned()),
+            // blocking な api.mod に確定した時点でのみ算出する (classify_signature_change)。
+            no_resolved_internal_callers: false,
+            // 型契約変更として種別が確定した時点で埋める (classify_signature_change)。
+            contract_change: None,
+        };
+        classify_signature_change(
+            inputs,
+            state,
+            SignatureChangeSite {
+                change,
+                old_path: self.old_path,
+                new_path: self.new_path,
+                moved_from: self.moved_from,
+                kind,
+                old_sig,
+                new_sig,
+                lang_id: self.lang_id,
+                internally_closed,
+            },
+        );
     }
 }
 
@@ -800,10 +887,9 @@ enum SignatureDecision {
 pub(crate) fn classify_signature_change(
     inputs: &DetectionInputs<'_>,
     state: &mut DetectionState<'_>,
-    df: &crate::models::impact::DiffFile,
     site: SignatureChangeSite<'_>,
 ) {
-    let decision = decide_signature_change(inputs, state.closure_caches, df, &site);
+    let decision = decide_signature_change(inputs, state.closure_caches, &site);
     record_signature_decision(inputs, state, site.change, decision);
 }
 
@@ -813,7 +899,6 @@ pub(crate) fn classify_signature_change(
 fn decide_signature_change(
     inputs: &DetectionInputs<'_>,
     caches: &mut ApiClosureCaches,
-    df: &crate::models::impact::DiffFile,
     site: &SignatureChangeSite<'_>,
 ) -> SignatureDecision {
     let &DetectionInputs {
@@ -825,6 +910,9 @@ fn decide_signature_change(
     } = inputs;
     let &SignatureChangeSite {
         ref change,
+        old_path,
+        new_path,
+        moved_from,
         kind,
         old_sig,
         new_sig,
@@ -837,11 +925,7 @@ fn decide_signature_change(
     // 同一 diff での追随) はどれも使えない。
     let public_name_differs = !name.contains('.')
         && super::js_public_name::published_names_for_diff_file(
-            dir,
-            base_blobs,
-            &df.old_path,
-            &df.new_path,
-            caches,
+            dir, base_blobs, old_path, new_path, caches,
         )
         .is_some_and(|names| names.may_differ(name));
     // 以降の互換判定器はすべて同じ現場情報を見る。old/new ソースは最初に必要になった
@@ -849,8 +933,8 @@ fn decide_signature_change(
     let site = CompatibleModSite {
         dir,
         base,
-        old_path: &df.old_path,
-        new_path: &df.new_path,
+        old_path,
+        new_path,
         name,
         kind,
         old_sig,
@@ -878,7 +962,14 @@ fn decide_signature_change(
     {
         return SignatureDecision::Compatible(compat);
     }
-    closure_or_blocking_decision(inputs, caches, df, &site, sources, public_name_differs)
+    closure_or_blocking_decision(
+        inputs,
+        caches,
+        &site,
+        sources,
+        public_name_differs,
+        moved_from,
+    )
 }
 
 /// 型注釈だけの変更か。
@@ -1038,10 +1129,10 @@ fn compatible_modification(
 fn closure_or_blocking_decision(
     inputs: &DetectionInputs<'_>,
     caches: &mut ApiClosureCaches,
-    df: &crate::models::impact::DiffFile,
     site: &CompatibleModSite<'_>,
     sources: &mut SignatureSourceCache<'_>,
     public_name_differs: bool,
+    moved_from: Option<&str>,
 ) -> SignatureDecision {
     // object type literal 引数への必須プロパティ追加のみの変更なら、閉包判定へ追加証拠として
     // 渡す (呼び出し式が無変更でも共有 const の定義側が同一 diff で更新されていれば追随済み)。
@@ -1112,12 +1203,13 @@ fn closure_or_blocking_decision(
             name: site.name,
             kind: site.kind,
             base: inputs.base,
-            target_new_path: &df.new_path,
+            target_new_path: site.new_path,
             diff_files: inputs.diff_files,
             arg_evidence,
             public_name_differs,
             js_direct_function_change,
             rust_module_function_change,
+            moved_from,
         },
         caches,
     ) {

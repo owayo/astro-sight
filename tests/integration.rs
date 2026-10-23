@@ -36,6 +36,7 @@ mod integration {
     mod kotlin_grammar;
     mod languages;
     mod mcp;
+    mod moved_member_signature;
     mod optional_param_removal;
     mod output_format;
     mod php_member_liveness;
