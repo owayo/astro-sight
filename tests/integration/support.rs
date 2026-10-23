@@ -61,13 +61,32 @@ impl TestRepo {
     }
 
     pub(super) fn run_json(&self, subcommand: &str, args: &[&str]) -> serde_json::Value {
-        let mut command = cargo_bin();
-        command
-            .arg(subcommand)
-            .arg("--dir")
-            .arg(self.root())
-            .args(args);
-        parse_json_output(command.output().expect("failed to run astro-sight"))
+        parse_json_output(
+            self.command(subcommand, args)
+                .output()
+                .expect("failed to run astro-sight"),
+        )
+    }
+
+    /// `run_json` と同じだが、`--dir` をこのディレクトリの下の `dir` にし、子プロセスに `envs`
+    /// (`CARGO_HOME` など) を渡す。Cargo の設定は `dir` からこのディレクトリまでの祖先を読む。
+    pub(super) fn run_json_in<K, V>(
+        &self,
+        dir: impl AsRef<Path>,
+        envs: impl IntoIterator<Item = (K, V)>,
+        subcommand: &str,
+        args: &[&str],
+    ) -> serde_json::Value
+    where
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
+        parse_json_output(
+            self.command_in(&self.path(dir), subcommand, args)
+                .envs(envs)
+                .output()
+                .expect("failed to run astro-sight"),
+        )
     }
 
     pub(super) fn run_json_with_stdin(
@@ -78,11 +97,8 @@ impl TestRepo {
     ) -> serde_json::Value {
         use std::io::Write;
 
-        let mut child = cargo_bin()
-            .arg(subcommand)
-            .arg("--dir")
-            .arg(self.root())
-            .args(args)
+        let mut child = self
+            .command(subcommand, args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -100,6 +116,25 @@ impl TestRepo {
                 .wait_with_output()
                 .expect("failed to wait for astro-sight"),
         )
+    }
+
+    fn command(&self, subcommand: &str, args: &[&str]) -> Command {
+        self.command_in(self.root(), subcommand, args)
+    }
+
+    /// `dir` を `--dir` にした astro-sight の起動。Rust の外部クレートの別名の証明が読む Cargo の
+    /// 設定の祖先の走査を、Cargo 自身のテストと同じ `__CARGO_TEST_ROOT` でこのディレクトリに
+    /// 止める (一時ディレクトリの祖先にある開発機の `.cargo/config.toml` を読まない)。
+    fn command_in(&self, dir: &Path, subcommand: &str, args: &[&str]) -> Command {
+        let root = std::fs::canonicalize(self.root()).expect("failed to resolve test repository");
+        let mut command = cargo_bin();
+        command
+            .env("__CARGO_TEST_ROOT", root)
+            .arg(subcommand)
+            .arg("--dir")
+            .arg(dir)
+            .args(args);
+        command
     }
 }
 
@@ -119,15 +154,36 @@ pub(super) const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(super) fn cargo_bin() -> Command {
     let missing_config = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/.astro-sight-test-config-does-not-exist.toml");
-    assert!(
-        !missing_config.exists(),
-        "テスト隔離用の設定パスが存在しています: {}",
-        missing_config.display()
-    );
+    let missing_cargo_home = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/.astro-sight-test-cargo-home-does-not-exist");
+    for path in [&missing_config, &missing_cargo_home] {
+        assert!(
+            !path.exists(),
+            "テスト隔離用のパスが存在しています: {}",
+            path.display()
+        );
+    }
 
     let mut command = cargo_bin_with_explicit_config();
     // 開発者の実設定に format = "toon" / "auto" があっても、JSON 契約のテストへ漏らさない。
     command.arg("--config").arg(missing_config);
+    // Rust の外部クレートの別名の証明が読む Cargo の環境 (`$CARGO_HOME/config.toml`、rustc の
+    // 差し替えと rustflags の環境変数) も、開発機のものを漏らさない。
+    for (name, _) in std::env::vars_os() {
+        let upper = name.to_string_lossy().to_ascii_uppercase();
+        if upper.starts_with("CARGO_")
+            || upper.starts_with("RUSTC")
+            || upper == "RUSTFLAGS"
+            || upper == "__CARGO_TEST_ROOT"
+            || matches!(
+                upper.as_str(),
+                "LD_PRELOAD" | "LD_AUDIT" | "DYLD_INSERT_LIBRARIES"
+            )
+        {
+            command.env_remove(name);
+        }
+    }
+    command.env("CARGO_HOME", missing_cargo_home);
     command
 }
 

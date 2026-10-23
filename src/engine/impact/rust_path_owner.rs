@@ -145,6 +145,7 @@ pub(super) struct RustPathOwnerProjectProof {
         Mutex<HashMap<PathBuf, Option<Arc<super::rust_reexport_owner::ModuleBindings>>>>,
     leaf_sources: Mutex<HashMap<String, bool>>,
     visibility_modules: Mutex<HashMap<PathBuf, Option<VisibilityModule>>>,
+    pub(super) cargo_configs: super::rust_cargo_config::CargoConfigProof,
 }
 
 impl RustPathOwnerProjectProof {
@@ -195,6 +196,7 @@ impl RustPathOwnerProjectProof {
             reexport_files: Mutex::new(HashMap::new()),
             leaf_sources: Mutex::new(HashMap::new()),
             visibility_modules: Mutex::new(HashMap::new()),
+            cargo_configs: super::rust_cargo_config::CargoConfigProof::capture(root),
         }
     }
 

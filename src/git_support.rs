@@ -35,13 +35,17 @@ pub(crate) fn isolated_git_command() -> std::process::Command {
     command
 }
 
-pub(crate) fn git_command_for_dir(dir: impl AsRef<std::path::Path>) -> std::process::Command {
+/// `dir` が staged の解析用に index を書き出した一時リポジトリの中か。
+pub(crate) fn is_inside_index_snapshot(dir: impl AsRef<std::path::Path>) -> bool {
     let dir = dir.as_ref();
     let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    if canonical
+    canonical
         .ancestors()
         .any(|parent| parent.join(".git").join(INDEX_SNAPSHOT_MARKER).is_file())
-    {
+}
+
+pub(crate) fn git_command_for_dir(dir: impl AsRef<std::path::Path>) -> std::process::Command {
+    if is_inside_index_snapshot(dir) {
         isolated_git_command()
     } else {
         std::process::Command::new("git")
