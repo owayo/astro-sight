@@ -634,7 +634,7 @@ fn parse_edition(edition: &str) -> Option<u32> {
     }
 }
 
-fn has_sysroot_dependency(value: &toml::Value, in_dependencies: bool) -> bool {
+pub(super) fn has_sysroot_dependency(value: &toml::Value, in_dependencies: bool) -> bool {
     match value {
         toml::Value::Table(table) => table.iter().any(|(key, value)| {
             let in_dependencies = in_dependencies
@@ -642,7 +642,9 @@ fn has_sysroot_dependency(value: &toml::Value, in_dependencies: bool) -> bool {
                     key.as_str(),
                     "dependencies"
                         | "dev-dependencies"
+                        | "dev_dependencies"
                         | "build-dependencies"
+                        | "build_dependencies"
                         | "patch"
                         | "replace"
                 );

@@ -86,6 +86,16 @@ impl CargoIndex {
             if manifest.get("patch").is_some() || manifest.get("replace").is_some() {
                 return None;
             }
+            // std / core / alloc という名前の依存や library は、std から持ち込む名前を差し替えうる。
+            if super::rust_std_origin::has_sysroot_dependency(&manifest, false)
+                || manifest
+                    .get("lib")
+                    .and_then(|lib| lib.get("name"))
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(is_sysroot)
+            {
+                return None;
+            }
             if directory.as_os_str().is_empty() {
                 if manifest.get("package").is_none() {
                     continue;
@@ -101,7 +111,7 @@ impl CargoIndex {
             }
             let name = package.get("name")?.as_str()?.to_owned();
             // Sysroot crates can be visible without an ordinary Cargo dependency.
-            if matches!(name.as_str(), "std" | "core" | "alloc") {
+            if is_sysroot(&name) {
                 return None;
             }
             packages.push(Package {
@@ -156,10 +166,14 @@ impl CargoIndex {
         // A source file may be compiled by a different package through #[path],
         // include!, or a macro. A path-based owner is safe only when no Rust source
         // in the workspace can introduce such a cross-package compilation context.
+        // 標準の式マクロと組み込みの derive・属性は取り込みをしないが、別のファイルから
+        // 上書きされうるので、全ソースを見てから決める。
+        let mut expansions = ExpansionFacts::default();
         for path in &files.rust_files {
-            if source_has_expansion(&tree.read(path)?) {
-                return None;
-            }
+            expansions.add(&tree.read(path)?)?;
+        }
+        if !expansions.allows() {
+            return None;
         }
         Some(Self {
             packages,
@@ -616,44 +630,302 @@ fn collect_dependencies(
     Some(())
 }
 
-fn source_has_expansion(source: &[u8]) -> bool {
-    // LFS のポインタからは実際のソースの取り込みやマクロを確かめられない。
-    if source.starts_with(b"version https://git-lfs.github.com/spec/v1") {
-        return true;
-    }
-    if memchr::memchr2(b'#', b'!', source).is_none() {
-        return false;
-    }
-    let Ok(tree) = parser::parse_source(source, LangId::Rust) else {
-        return true;
-    };
-    let root = tree.root_node();
-    if root.has_error() {
-        return true;
-    }
-    has_expansion_node(root, source)
+fn is_sysroot(name: &str) -> bool {
+    matches!(name, "std" | "core" | "alloc")
 }
 
-fn has_expansion_node(root: Node<'_>, source: &[u8]) -> bool {
+fn unraw(name: &str) -> &str {
+    name.strip_prefix("r#").unwrap_or(name)
+}
+
+/// ワークスペースの Rust ソースの、展開と標準の名前の上書きに関わる要約。標準の式マクロと組み込みの
+/// derive・属性はソースを取り込まないが、別のファイルの定義や import で上書きされうるので、全ソースを
+/// 集めてから `allows` で決める (Issue #117)。
+#[derive(Default)]
+struct ExpansionFacts {
+    /// 修飾なしで呼んだ標準の式マクロと、上書きされうる組み込みの属性・derive の名前。
+    standard_names: HashSet<String>,
+    /// `macro_rules!` の定義名と、std / core / alloc 以外から `use` で持ち込む名前 (別名を含む)。
+    shadowing_names: HashSet<String>,
+    /// std / core / alloc から `use` で持ち込む名前。
+    sysroot_imported_names: HashSet<String>,
+    /// 標準クレート、または crate / self / super だけのパス以外からの glob がある。
+    unproven_glob: bool,
+    /// std / core / alloc を起点にした glob がある。
+    sysroot_glob: bool,
+    /// std / core / alloc という名前を、別名・モジュール・`extern crate` で別のものにしている。
+    rebinds_sysroot: bool,
+}
+
+impl ExpansionFacts {
+    /// ソース 1 つを足す。ソースの取り込み・標準でないマクロや属性・依存の外の crate・解析失敗が
+    /// あれば None。
+    fn add(&mut self, source: &[u8]) -> Option<()> {
+        // LFS のポインタからは実際のソースの取り込みやマクロを確かめられない。
+        if source.starts_with(b"version https://git-lfs.github.com/spec/v1") {
+            return None;
+        }
+        let tree = parser::parse_source(source, LangId::Rust).ok()?;
+        let root = tree.root_node();
+        if root.has_error() {
+            return None;
+        }
+        // macro_rules! の本体は呼び出されない限り展開されず、標準でないマクロの呼び出しは許さない
+        // ので、本体では取り込みの構文だけを見る。
+        let mut pending = vec![(root, false)];
+        while let Some((node, in_definition)) = pending.pop() {
+            if crate::engine::rust_dynamic_source::node_includes_external_source(node, source) {
+                return None;
+            }
+            let mut children_in_definition = in_definition;
+            match node.kind() {
+                "macro_invocation" => {
+                    self.standard_names
+                        .insert(standard_macro_name(node, source)?.to_owned());
+                }
+                "token_tree" if !in_definition => {
+                    for name in nested_macro_names(node, source)? {
+                        self.standard_names.insert(name.to_owned());
+                    }
+                }
+                "attribute_item" | "inner_attribute_item" => {
+                    self.standard_names.extend(builtin_attribute(node, source)?);
+                }
+                "macro_definition" => {
+                    let name = node.child_by_field_name("name")?.utf8_text(source).ok()?;
+                    self.shadowing_names.insert(unraw(name).to_owned());
+                    children_in_definition = true;
+                }
+                "use_declaration" => self.add_use(node, source)?,
+                "extern_crate_declaration" => self.add_extern_crate(node, source)?,
+                "mod_item" => {
+                    let name = node.child_by_field_name("name")?.utf8_text(source).ok()?;
+                    self.rebinds_sysroot |= is_sysroot(unraw(name));
+                }
+                _ => {}
+            }
+            let mut cursor = node.walk();
+            pending.extend(
+                node.named_children(&mut cursor)
+                    .map(|child| (child, children_in_definition)),
+            );
+        }
+        Some(())
+    }
+
+    fn add_use(&mut self, node: Node<'_>, source: &[u8]) -> Option<()> {
+        let mut pending = vec![(node.child_by_field_name("argument")?, Vec::new())];
+        while let Some((node, prefix)) = pending.pop() {
+            let mut path: Vec<String> = prefix;
+            match node.kind() {
+                "use_list" => {
+                    let mut cursor = node.walk();
+                    pending.extend(
+                        node.named_children(&mut cursor)
+                            .map(|item| (item, path.clone())),
+                    );
+                }
+                "scoped_use_list" => {
+                    if let Some(scope) = node.child_by_field_name("path") {
+                        path.extend(use_path(scope, source)?);
+                    }
+                    pending.push((node.child_by_field_name("list")?, path));
+                }
+                "use_wildcard" => {
+                    if let Some(scope) = node.named_child(0) {
+                        path.extend(use_path(scope, source)?);
+                    }
+                    self.add_glob(&path);
+                }
+                "use_as_clause" => {
+                    path.extend(use_path(node.child_by_field_name("path")?, source)?);
+                    let alias = node.child_by_field_name("alias")?.utf8_text(source).ok()?;
+                    self.add_import(&path, unraw(alias));
+                }
+                _ => {
+                    path.extend(use_path(node, source)?);
+                    // `use a::{self}` は a を持ち込む。
+                    let name = path
+                        .iter()
+                        .rev()
+                        .find(|segment| *segment != "self")?
+                        .clone();
+                    self.add_import(&path, &name);
+                }
+            }
+        }
+        Some(())
+    }
+
+    fn add_import(&mut self, path: &[String], name: &str) {
+        let root = path.first().map(String::as_str);
+        // `use std;` のように std をそのまま持ち込むのは差し替えではない。
+        if is_sysroot(name) && !(path.len() == 1 && root == Some(name)) {
+            self.rebinds_sysroot = true;
+        }
+        match root {
+            Some(root) if is_sysroot(root) => {
+                self.sysroot_imported_names.insert(name.to_owned());
+            }
+            _ => {
+                self.shadowing_names.insert(name.to_owned());
+            }
+        }
+    }
+
+    fn add_glob(&mut self, path: &[String]) {
+        match path.first().map(String::as_str) {
+            Some(root) if is_sysroot(root) => self.sysroot_glob = true,
+            Some("crate" | "self" | "super")
+                if path
+                    .iter()
+                    .all(|segment| matches!(segment.as_str(), "crate" | "self" | "super")) => {}
+            // 名前付きの区間は、外部クレートの別名を何段でも経由しうる。独自の名前解決はせず保留する。
+            _ => self.unproven_glob = true,
+        }
+    }
+
+    fn add_extern_crate(&mut self, node: Node<'_>, source: &[u8]) -> Option<()> {
+        let name = unraw(node.child_by_field_name("name")?.utf8_text(source).ok()?);
+        // build script が足した探索パスから、依存に書いていない crate をつなぎうる。
+        // proc_macro / test も、同名の Cargo 依存が別のクレートを指している可能性がある。
+        if !is_sysroot(name) && name != "self" {
+            return None;
+        }
+        if let Some(alias) = node.child_by_field_name("alias") {
+            let alias = unraw(alias.utf8_text(source).ok()?);
+            self.rebinds_sysroot |= is_sysroot(alias) && alias != name;
+        }
+        Some(())
+    }
+
+    /// 使った標準の名前を、どのファイルからも上書きできないか。
+    fn allows(&self) -> bool {
+        if self.standard_names.is_empty() {
+            return true;
+        }
+        // 未証明の glob は、別名の連鎖を通して同名のマクロを持ち込みうる。
+        if self.unproven_glob || (self.rebinds_sysroot && self.sysroot_glob) {
+            return false;
+        }
+        self.standard_names.iter().all(|name| {
+            !self.shadowing_names.contains(name)
+                && !(self.rebinds_sysroot && self.sysroot_imported_names.contains(name))
+        })
+    }
+}
+
+/// use の木のパスの区切り (`crate` / `self` / `super` を含む)。`::a` は a から始める。
+fn use_path(node: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
+    let mut reversed = Vec::new();
+    let mut current = Some(node);
+    while let Some(part) = current {
+        match part.kind() {
+            "identifier" | "crate" | "self" | "super" => {
+                reversed.push(unraw(part.utf8_text(source).ok()?).to_owned());
+                current = None;
+            }
+            "scoped_identifier" => {
+                let name = part.child_by_field_name("name")?.utf8_text(source).ok()?;
+                reversed.push(unraw(name).to_owned());
+                current = part.child_by_field_name("path");
+            }
+            _ => return None,
+        }
+    }
+    reversed.reverse();
+    Some(reversed)
+}
+
+/// 証明を妨げないマクロ呼び出しの名前。修飾なしの標準の式マクロだけを認める。`std::println!`
+/// のような修飾は、std の束縛まで確かめられないので認めない。
+fn standard_macro_name<'a>(node: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    let name = node.child_by_field_name("macro")?;
+    if name.kind() != "identifier" {
+        return None;
+    }
+    let name = unraw(name.utf8_text(source).ok()?);
+    super::rust_path_owner::is_allowed_expression_macro(name).then_some(name)
+}
+
+/// token tree の中の入れ子の呼び出し (`name!(..)`) の名前。標準の式マクロ以外、または
+/// import・extern・マクロ定義・属性があれば None。引数内の Rust 構文は AST の item として解析されない。
+fn nested_macro_names<'a>(tokens: Node<'_>, source: &'a [u8]) -> Option<Vec<&'a str>> {
+    let mut cursor = tokens.walk();
+    let children: Vec<Node<'_>> = tokens
+        .children(&mut cursor)
+        .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
+        .collect();
+    let mut names = Vec::new();
+    for (ix, child) in children.iter().enumerate() {
+        // `use` は非 named token、`extern` は identifier になるため、実トークンの文字列で見る。
+        if matches!(
+            child.utf8_text(source).ok()?,
+            "use" | "extern" | "macro" | "macro_rules" | "macro_rules!" | "#"
+        ) {
+            return None;
+        }
+        if child.kind() != "!"
+            || ix == 0
+            || children
+                .get(ix + 1)
+                .is_none_or(|next| next.kind() != "token_tree")
+        {
+            continue;
+        }
+        let previous = children[ix - 1];
+        match previous.kind() {
+            "identifier" => {}
+            "metavariable" => return None,
+            // `(!(..))` のような否定は呼び出しではない。
+            _ => continue,
+        }
+        if ix >= 2 && children[ix - 2].kind() == "::" {
+            return None;
+        }
+        let name = unraw(previous.utf8_text(source).ok()?);
+        if !super::rust_path_owner::is_allowed_expression_macro(name) {
+            return None;
+        }
+        names.push(name);
+    }
+    Some(names)
+}
+
+/// 組み込みの属性と標準の derive なら、上書きされうる名前を返す。属性マクロ・独自の derive・
+/// `macro_export`・`macro_use` などは None。
+fn builtin_attribute(node: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
+    if let Some(names) = super::rust_std_origin::safe_attribute(node, source) {
+        return Some(names);
+    }
+    // テストの組み込みの属性。`#[test]` と同じく上書きの検査にかける。
+    let name = node.named_child(0)?.named_child(0)?;
+    if name.kind() != "identifier" {
+        return None;
+    }
+    let name = name.utf8_text(source).ok()?;
+    matches!(name, "ignore" | "should_panic").then(|| vec![name.to_owned()])
+}
+
+/// ファイルのマクロ呼び出しが、修飾なしの標準の式マクロ (引数の中の入れ子を含む) だけか。
+/// 標準の式マクロは item を作らないので、同じファイルの名前の束縛を変えない。`macro_rules!` の
+/// 定義があるファイルは対象にしない。
+pub(crate) fn invokes_only_standard_macros(root: Node<'_>, source: &[u8]) -> bool {
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
-        let attribute = matches!(node.kind(), "attribute_item" | "inner_attribute_item");
-        let derive = attribute
-            && node
-                .named_child(0)
-                .and_then(|attribute| attribute.named_child(0))
-                .and_then(|name| name.utf8_text(source).ok())
-                == Some("derive");
-        if node.kind() == "macro_invocation"
-            || attribute
-                && (derive || super::rust_std_origin::safe_attribute(node, source).is_none())
-        {
-            return true;
+        let standard = match node.kind() {
+            "macro_definition" => false,
+            "macro_invocation" => standard_macro_name(node, source).is_some(),
+            "token_tree" => nested_macro_names(node, source).is_some(),
+            _ => true,
+        };
+        if !standard {
+            return false;
         }
         let mut cursor = node.walk();
         pending.extend(node.named_children(&mut cursor));
     }
-    false
+    true
 }
 
 #[cfg(test)]
@@ -662,8 +934,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        CargoIndex, RustCargoReachability, TreeEntry, WorkspaceFiles, WorkspaceTree,
-        lexical_relative,
+        CargoIndex, ExpansionFacts, RustCargoReachability, TreeEntry, WorkspaceFiles,
+        WorkspaceTree, invokes_only_standard_macros, lexical_relative,
     };
 
     fn proves_unreachable(
@@ -708,6 +980,16 @@ mod tests {
     fn unrelated_package_is_excluded_but_all_dependency_kinds_remain() {
         let ordinary = "pub fn unrelated() {}\n";
         assert!(proves_unreachable("", "", "", ordinary, true));
+        // 標準のマクロと組み込みの derive・属性はソースを取り込まない (Issue #117)。
+        for source in [
+            "pub fn unrelated() {\n    println!(\"{:?}\", vec![1]);\n}\n",
+            "pub fn unrelated() {\n    let _ = vec![{ let value = 1; assert_eq!(value, 1); value }];\n}\n",
+            "#[derive(Debug, Clone)]\npub struct Unrelated;\n",
+            "use std::fmt::Debug;\n#[derive(Debug)]\npub struct Unrelated;\n",
+            "pub fn unrelated() {}\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn works() {\n        assert_eq!(1, 1);\n        unrelated();\n    }\n}\n",
+        ] {
+            assert!(proves_unreachable("", "", "", source, true), "{source}");
+        }
         for dependency in [
             "[dependencies]\nsample-a = { path = \"../a\" }\n",
             "[dependencies]\nrenamed = { package = \"sample-a\", path = \"../a\" }\n",
@@ -734,6 +1016,116 @@ mod tests {
                 !proves_unreachable(workspace, dependency, c, ordinary, true),
                 "{dependency}"
             );
+        }
+    }
+
+    #[test]
+    fn standard_macro_arguments_require_visible_bindings_and_attributes() {
+        for (source, expected) in [
+            ("pub fn unrelated() { println!(\"use extern #\"); }", true),
+            (
+                "pub fn unrelated(r#use: u8) { println!(\"{}\", r#use); }",
+                true,
+            ),
+            (
+                "pub fn unrelated() { let _ = vec![{ let value = 1; assert_eq!(value, 1); value }]; }",
+                true,
+            ),
+            (
+                "pub fn unrelated() { let _ = vec![{ use custom::println; println!(); 1 }]; }",
+                false,
+            ),
+            (
+                "pub fn unrelated() { let _ = vec![{ #[custom::attribute] fn generated() {} 1 }]; }",
+                false,
+            ),
+            (
+                "pub fn unrelated() { let _ = vec![{ #[derive(custom::Derive)] struct Generated; 1 }]; }",
+                false,
+            ),
+            (
+                "pub fn unrelated() { let _ = vec![{ extern crate proc_macro as custom; 1 }]; }",
+                false,
+            ),
+            (
+                "pub fn unrelated() { let _ = vec![{ macro_rules! println { () => {}; } println!(); 1 }]; }",
+                false,
+            ),
+        ] {
+            let bytes = source.as_bytes();
+            let tree =
+                crate::engine::parser::parse_source(bytes, crate::language::LangId::Rust).unwrap();
+            assert!(!tree.root_node().has_error(), "{source}");
+            assert_eq!(
+                invokes_only_standard_macros(tree.root_node(), bytes),
+                expected,
+                "{source}"
+            );
+            let mut facts = ExpansionFacts::default();
+            assert_eq!(
+                facts.add(bytes).is_some() && facts.allows(),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn extern_crate_names_do_not_prove_sysroot_identity() {
+        for name in ["proc_macro", "test"] {
+            let manifest =
+                format!("[dependencies]\n{name} = {{ package = \"custom\", version = \"1\" }}\n");
+            let source =
+                format!("extern crate {name};\npub fn unrelated() {{ println!(\"x\"); }}\n");
+            assert!(
+                !proves_unreachable("", &manifest, "", &source, true),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn sysroot_include_aliases_keep_source_inclusion_barrier() {
+        for source in [
+            "use std::include as println;\nprintln!(\"../../a/src/lib.rs\");\npub fn unrelated() {}\n",
+            "use core::{include as println};\nprintln!(\"../../a/src/lib.rs\");\npub fn unrelated() {}\n",
+            "pub use std::r#include as r#println;\nr#println!(\"../../a/src/lib.rs\");\npub fn unrelated() {}\n",
+        ] {
+            assert!(!proves_unreachable("", "", "", source, true), "{source}");
+        }
+        assert!(proves_unreachable(
+            "",
+            "",
+            "",
+            "use std::{println, fmt::Debug};\n#[derive(Debug)] pub struct Marker;\npub fn unrelated() { println!(\"x\"); }\n",
+            true,
+        ));
+    }
+
+    #[test]
+    fn legacy_dependency_tables_cannot_replace_sysroot_macros() {
+        let source =
+            "#[cfg(test)] use std::println;\n#[cfg(test)] println!();\npub fn unrelated() {}\n";
+        for table in [
+            "dev-dependencies",
+            "dev_dependencies",
+            "build-dependencies",
+            "build_dependencies",
+        ] {
+            for prefix in ["", "target.'cfg(unix)'."] {
+                let replacement = format!(
+                    "[{prefix}{table}]\nstd = {{ package = \"custom\", version = \"1\" }}\n"
+                );
+                assert!(
+                    !proves_unreachable("", &replacement, "", source, true),
+                    "{replacement}"
+                );
+                let ordinary = format!("[{prefix}{table}]\ncustom = \"1\"\n");
+                assert!(
+                    proves_unreachable("", &ordinary, "", source, true),
+                    "{ordinary}"
+                );
+            }
         }
     }
 
@@ -781,6 +1173,35 @@ mod tests {
             "[dependencies]\ncustom = \"1\"\n",
             "",
             "use custom::Clone;\n#[derive(Clone)] pub struct Value;\n",
+            true
+        ));
+        // 上書きされうる標準の名前、標準でない展開、依存の外の crate。
+        for source in [
+            "macro_rules! println {\n    () => {};\n}\npub fn unrelated() {\n    println!();\n}\n",
+            "use custom::*;\npub fn unrelated() {\n    println!(\"x\");\n}\n",
+            "use custom as shim;\nuse self::shim::*;\npub fn unrelated() {\n    println!(\"x\");\n}\n",
+            "pub use custom as origin;\npub use crate::origin as relay;\nuse crate::relay::*;\npub fn unrelated() {\n    println!(\"x\");\n}\n",
+            "use custom as std;\nuse std::fmt::Debug;\n#[derive(Debug)]\npub struct Value;\n",
+            "pub fn unrelated() {\n    println!(\"{}\", custom!());\n}\n",
+            "pub fn unrelated() {\n    custom!();\n}\n",
+            "pub fn unrelated() {\n    std::println!(\"x\");\n}\n",
+            "#[derive(custom::Derive)]\npub struct Value;\n",
+            "#[macro_export]\nmacro_rules! unrelated {\n    () => {};\n}\n",
+            "extern crate custom;\npub fn unrelated() {}\n",
+            "extern crate proc_macro as shim;\nuse crate::shim::*;\npub fn unrelated() { println!(\"x\"); }\n",
+            "extern crate test as shim;\nuse crate::shim::*;\npub fn unrelated() { println!(\"x\"); }\n",
+        ] {
+            assert!(
+                !proves_unreachable("", "[dependencies]\ncustom = \"1\"\n", "", source, true),
+                "{source}"
+            );
+        }
+        // 依存の名前で std を差し替えると、std から持ち込んだ名前も標準とは限らない。
+        assert!(!proves_unreachable(
+            "",
+            "[dependencies]\nstd = { package = \"custom\", version = \"1\" }\n",
+            "",
+            "pub fn unrelated() {}\n",
             true
         ));
         assert!(!proves_unreachable(

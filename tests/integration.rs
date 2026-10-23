@@ -29,6 +29,7 @@ mod integration {
     mod impact_jsx_props;
     mod impact_object_members;
     mod impact_output;
+    mod impact_rust_cargo_reachability;
     mod impact_rust_reexport;
     mod impact_rust_scope;
     mod impact_rust_visibility_widening;
