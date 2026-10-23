@@ -48,6 +48,7 @@ mod integration {
     mod review_dead_scope;
     mod review_retry;
     mod runtime_invoked_symbols;
+    mod rust_cargo_removal;
     mod rust_const_fn;
     mod rust_parameter_patterns;
     mod rust_reference_sites;

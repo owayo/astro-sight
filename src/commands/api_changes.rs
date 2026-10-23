@@ -81,6 +81,17 @@ pub(crate) fn detect_api_changes(
     base: &str,
     diff_files: &[crate::models::impact::DiffFile],
 ) -> ApiChanges {
+    detect_api_changes_with_renames(dir, base, diff_files, &[])
+}
+
+/// `renames` は diff の内容同一の rename (`parse_hunkless_renames`)。API の分類には使わず、
+/// 削除した Rust の宣言と同名の参照があるファイルの、変更前の位置を引くためだけに使う。
+pub(crate) fn detect_api_changes_with_renames(
+    dir: &str,
+    base: &str,
+    diff_files: &[crate::models::impact::DiffFile],
+    renames: &[crate::models::impact::DiffFile],
+) -> ApiChanges {
     let mut buckets = ApiChangeBuckets::default();
     let mut rust_public = RustPublicApiContext::default();
 
@@ -404,8 +415,15 @@ pub(crate) fn detect_api_changes(
     // ならなかった削除は、`old_path` 依存の帰属判定で片方だけ `removed_dead` へ落ちうる
     // ため、blocking と informational に割れたときだけ保守側 (blocking) へ寄せる
     // (揃っているグループは触らない。Issue 2026-08-21-api-consolidation-many-to-one-move)。
-    let (mut removed_kept, removed_dead, removed_unresolved) =
-        partition_removed_dead_candidates(dir, &base_blobs, removed, &ambiguous_relation_keys);
+    let rust_packages =
+        removed_cargo::RemovedRustPackages::new(dir, &base_blobs, diff_files, renames);
+    let (mut removed_kept, removed_dead, removed_unresolved) = partition_removed_dead_candidates(
+        dir,
+        &base_blobs,
+        &rust_packages,
+        removed,
+        &ambiguous_relation_keys,
+    );
     removed_kept.extend(unverified_removed);
 
     // cfg の相補的な 2 分岐は公開名として 1 件。同一ファイルの新規候補だけを
@@ -693,6 +711,7 @@ mod python_signature;
 mod ref_index;
 
 mod removed_attribution;
+mod removed_cargo;
 mod removed_ffi;
 mod removed_rust_paths;
 mod removed_scope;

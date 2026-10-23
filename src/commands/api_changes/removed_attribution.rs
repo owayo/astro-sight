@@ -20,6 +20,11 @@ use crate::language::LangId;
 pub(crate) struct RefAttribution {
     /// 参照ファイルの言語。解決できない場合は None (言語による証明はしない = fail-closed)。
     pub(crate) ref_lang: Option<LangId>,
+    /// 参照ファイル (dir 相対)。
+    pub(crate) ref_path: String,
+    /// Rust の出現が、同じファイル直下の同名の自由関数か、より内側の束縛に解決する位置か
+    /// (`removed_scope::rust_file_scope_positions`)。
+    pub(crate) rust_binds_in_file: bool,
     pub(crate) origin: RefOrigin,
 }
 
@@ -238,6 +243,7 @@ pub(crate) struct RefAttributionFacts {
     /// 0 始まりの行・byte 列。解析一回の寿命に閉じ、別 revision へ再利用しない。
     independent_positions: super::removed_scope::Positions,
     local_positions: super::removed_scope::Positions,
+    rust_file_scope_positions: super::removed_scope::Positions,
     rust_sites: HashMap<(usize, usize), super::rust_ref_sites::MemberSite>,
     rust_paths: HashMap<(usize, usize), super::removed_rust_paths::PathSite>,
     /// JS/TS: 出現の位置 (0 始まりの行・byte 列) ごとの分類。外部パッケージの束縛
@@ -266,6 +272,7 @@ impl RefAttributionFacts {
         Self {
             independent_positions: HashSet::new(),
             local_positions: HashSet::new(),
+            rust_file_scope_positions: HashSet::new(),
             rust_sites: HashMap::new(),
             rust_paths: HashMap::new(),
             js_sites: HashMap::new(),
@@ -300,6 +307,8 @@ pub(crate) fn attribution_for_ref(
 ) -> RefAttribution {
     RefAttribution {
         ref_lang: facts.ref_lang,
+        ref_path: ref_path.to_owned(),
+        rust_binds_in_file: facts.rust_file_scope_positions.contains(&position),
         origin: ref_origin_for(facts, ref_path, residual_def_paths, position),
     }
 }
@@ -506,9 +515,16 @@ fn analyze_rust_facts(
     };
     let (independent_positions, local_positions) =
         super::removed_scope::rust_scope_positions(tree.root_node(), &source, symbol);
+    // ファイル直下に同名の自由関数があるときだけ、修飾の無い出現がそこへ解決する。
+    let rust_file_scope_positions = if independent_positions.is_empty() {
+        HashSet::new()
+    } else {
+        super::removed_scope::rust_file_scope_positions(tree.root_node(), &source, symbol)
+    };
     RefAttributionFacts {
         independent_positions,
         local_positions,
+        rust_file_scope_positions,
         rust_sites: super::rust_ref_sites::member_positions(tree.root_node(), &source, symbol),
         rust_paths: rust_paths.positions(tree.root_node(), &source, symbol, ref_path),
         ..RefAttributionFacts::opaque()
@@ -964,6 +980,8 @@ mod tests {
         });
         let attributed = RefAttribution {
             ref_lang: Some(LangId::Typescript),
+            ref_path: String::new(),
+            rust_binds_in_file: false,
             origin: RefOrigin::JsMemberOfResolvedClass(evidence),
         };
         for old_path in [
@@ -1032,6 +1050,8 @@ mod tests {
     fn attr(origin: RefOrigin) -> RefAttribution {
         RefAttribution {
             ref_lang: None,
+            ref_path: String::new(),
+            rust_binds_in_file: false,
             origin,
         }
     }
@@ -1130,6 +1150,8 @@ mod tests {
         ] {
             let a = RefAttribution {
                 ref_lang: Some(lang),
+                ref_path: String::new(),
+                rust_binds_in_file: false,
                 origin: RefOrigin::Unproven,
             };
             assert!(
@@ -1140,12 +1162,16 @@ mod tests {
         // 同一言語 (Python) の bare 参照は従来どおり証明不能 = blocking 維持
         let same_lang = RefAttribution {
             ref_lang: Some(LangId::Python),
+            ref_path: String::new(),
+            rust_binds_in_file: false,
             origin: RefOrigin::Unproven,
         };
         assert!(!proves_survivor_origin(&same_lang, &deleted));
         // 言語が判らない参照 (Android XML 等) も fail-closed
         let unknown = RefAttribution {
             ref_lang: None,
+            ref_path: String::new(),
+            rust_binds_in_file: false,
             origin: RefOrigin::Unproven,
         };
         assert!(!proves_survivor_origin(&unknown, &deleted));
@@ -1154,6 +1180,8 @@ mod tests {
         for lang in [LangId::Python, LangId::Kotlin, LangId::Php, LangId::Ruby] {
             let a = RefAttribution {
                 ref_lang: Some(lang),
+                ref_path: String::new(),
+                rust_binds_in_file: false,
                 origin: RefOrigin::Unproven,
             };
             assert!(

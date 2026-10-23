@@ -231,6 +231,51 @@ pub(super) fn rust_scope_positions(
     (independent, local)
 }
 
+/// ファイル直下に同名の自由関数を持つ Rust ファイルで、そのファイルのモジュールから修飾なしで
+/// 名前を引く位置。こうした出現はその関数か、より内側の束縛に解決し、ほかのファイルの宣言を
+/// 指さない。inline の `mod` の中、パスの一部、use、extern ブロック、マクロと属性の中、属性の
+/// 付いた item の中は含めず、マクロを含むファイルでは何も返さない。
+pub(super) fn rust_file_scope_positions(root: Node<'_>, source: &[u8], name: &str) -> Positions {
+    let all = nodes(root);
+    if all
+        .iter()
+        .any(|node| matches!(node.kind(), "macro_invocation" | "macro_definition"))
+    {
+        return Positions::new();
+    }
+    let mut positions = Positions::new();
+    for node in all {
+        if node.kind() != "identifier" || node.utf8_text(source).ok() != Some(name) {
+            continue;
+        }
+        let mut ancestor = node.parent();
+        let mut module_scope = true;
+        while let Some(parent) = ancestor {
+            // 属性マクロは item の本体ごと書き換えうる。
+            if matches!(
+                parent.kind(),
+                "scoped_identifier"
+                    | "scoped_type_identifier"
+                    | "use_declaration"
+                    | "mod_item"
+                    | "foreign_mod_item"
+                    | "token_tree"
+                    | "attribute_item"
+                    | "inner_attribute_item"
+            ) || (parent.kind().ends_with("_item") && has_attributes(parent))
+            {
+                module_scope = false;
+                break;
+            }
+            ancestor = parent.parent();
+        }
+        if module_scope {
+            positions.insert(position(node));
+        }
+    }
+    positions
+}
+
 /// 拡張子の違いと package/module の代替配置を同一のモジュールとして扱う。
 pub(super) fn module_key(path: &str) -> String {
     let path = std::path::Path::new(path);
