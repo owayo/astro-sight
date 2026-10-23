@@ -2,16 +2,24 @@
 
 use std::collections::{HashMap, HashSet};
 
+use tree_sitter::Node;
+
 use super::{ApiRelationKey, ApiSymbolCandidate, PreparedDiffFile, api_relation_key, bare_name};
 use crate::engine::parser;
 use crate::models::review::MovedSymbol;
 
-type Symbols = [(String, String, String)];
+pub(super) type Symbols = [(String, String, String)];
 
 /// Phase 0 で抽出したファイルごとの全 exported シンボル。旧側は旧パス、新側は新パスで引く。
+/// 自由関数・定数の移動の組 (`moved_symbols`) も使う。
 pub(crate) struct MemberFileFacts<'a> {
-    old: HashMap<&'a str, &'a Symbols>,
-    new: HashMap<&'a str, (&'a Symbols, &'a HashSet<String>)>,
+    pub(super) old: HashMap<&'a str, &'a Symbols>,
+    /// 新側のシンボルと、そのファイルの中の呼び出し先。
+    pub(super) new: HashMap<&'a str, (&'a Symbols, &'a HashSet<String>)>,
+    /// 変更後も残るファイルの旧パス → 新パス (変更・rename)。
+    pub(super) new_path_of: HashMap<&'a str, &'a str>,
+    /// 変更前からあったファイルの新パス → 旧パス (変更・rename)。
+    pub(super) old_path_of: HashMap<&'a str, &'a str>,
 }
 
 impl<'a> MemberFileFacts<'a> {
@@ -21,6 +29,14 @@ impl<'a> MemberFileFacts<'a> {
     ) -> Self {
         let mut old = HashMap::new();
         let mut new = HashMap::new();
+        let mut new_path_of = HashMap::new();
+        let mut old_path_of = HashMap::new();
+        for df in diff_files {
+            if df.old_path != "/dev/null" && df.new_path != "/dev/null" {
+                new_path_of.insert(df.old_path.as_str(), df.new_path.as_str());
+                old_path_of.insert(df.new_path.as_str(), df.old_path.as_str());
+            }
+        }
         for (df, prep) in diff_files.iter().zip(prepared) {
             let (old_syms, new_syms) = match prep {
                 PreparedDiffFile::Skip => continue,
@@ -46,7 +62,12 @@ impl<'a> MemberFileFacts<'a> {
                 new.insert(df.new_path.as_str(), facts);
             }
         }
-        Self { old, new }
+        Self {
+            old,
+            new,
+            new_path_of,
+            old_path_of,
+        }
     }
 
     /// 組になり得るメンバー (別のファイルの旧側に同じ qualname・種別があり、シグネチャが違う
@@ -95,6 +116,60 @@ pub(crate) enum Side {
     New,
 }
 
+/// Rust の `#[cfg(...)]` / `#[cfg_attr(...)]` が、node 自身か、node を囲むモジュール・ファイルに
+/// 掛かっているか (外側の属性、impl や mod の本体の内側の属性、ファイル直下の `#![cfg(...)]`)。
+/// 属性名は構文木で見る (属性の中のコメントや、`#[doc = "cfg(x)"]` の文字列に左右されない)。
+/// 属性の形を読めなければ cfg とみなす。
+pub(super) fn rust_cfg_applies(node: Node<'_>, source: &[u8]) -> bool {
+    let is_cfg = |attribute_item: Node<'_>| {
+        let mut cursor = attribute_item.walk();
+        let Some(attribute) = attribute_item
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "attribute")
+        else {
+            return true;
+        };
+        let name = match attribute.named_child(0) {
+            Some(path) if path.kind() == "identifier" => Some(path),
+            Some(path) if path.kind() == "scoped_identifier" => path.child_by_field_name("name"),
+            _ => None,
+        };
+        name.is_none_or(|name| matches!(rust_name(name, source), Some("cfg" | "cfg_attr")))
+    };
+    let inner_cfg = |container: Node<'_>| {
+        let mut cursor = container.walk();
+        container
+            .named_children(&mut cursor)
+            .any(|child| child.kind() == "inner_attribute_item" && is_cfg(child))
+    };
+    let mut current = Some(node);
+    while let Some(node) = current {
+        let mut previous = node.prev_named_sibling();
+        while let Some(sibling) = previous {
+            match sibling.kind() {
+                "attribute_item" if is_cfg(sibling) => return true,
+                "attribute_item" | "line_comment" | "block_comment" => {
+                    previous = sibling.prev_named_sibling();
+                }
+                _ => break,
+            }
+        }
+        if node.child_by_field_name("body").is_some_and(inner_cfg)
+            || (node.kind() == "source_file" && inner_cfg(node))
+        {
+            return true;
+        }
+        current = node.parent();
+    }
+    false
+}
+
+/// Rust の識別子の文字列 (`r#` を外す)。
+fn rust_name<'s>(node: Node<'_>, source: &'s [u8]) -> Option<&'s str> {
+    let text = node.utf8_text(source).ok()?;
+    Some(text.strip_prefix("r#").unwrap_or(text))
+}
+
 /// `source` の中で、`<owner>.<member>` が owner の型宣言に属すると証明できるか。
 ///
 /// qualname の owner は型の名前だけなので、名前だけでは別の型のメンバーと区別できない
@@ -115,7 +190,7 @@ pub(crate) enum Side {
 /// trait impl、言語を判定できない・構文エラーがあるファイルは証明しない。
 pub(crate) fn proves_member_binding(path: &str, source: &[u8], owner: &str, member: &str) -> bool {
     use crate::language::LangId;
-    use tree_sitter::{Node, Point};
+    use tree_sitter::Point;
 
     // 型宣言の本体に直接置かれたメンバーか。本体の包み (class_body・block・Java の
     // enum_body_declarations・Python の decorated_definition など) だけを上り、最初に出会った
@@ -153,62 +228,6 @@ pub(crate) fn proves_member_binding(path: &str, source: &[u8], owner: &str, memb
             node = parent;
         }
         false
-    }
-
-    // Rust の `#[cfg(...)]` / `#[cfg_attr(...)]` が、node 自身か、node を囲むモジュール・ファイルに
-    // 掛かっているか (外側の属性、impl や mod の本体の内側の属性、ファイル直下の `#![cfg(...)]`)。
-    // 属性名は構文木で見る (属性の中のコメントや、`#[doc = "cfg(x)"]` の文字列に左右されない)。
-    // 属性の形を読めなければ cfg とみなす。
-    fn cfg_applies(node: Node<'_>, source: &[u8]) -> bool {
-        let is_cfg = |attribute_item: Node<'_>| {
-            let mut cursor = attribute_item.walk();
-            let Some(attribute) = attribute_item
-                .named_children(&mut cursor)
-                .find(|child| child.kind() == "attribute")
-            else {
-                return true;
-            };
-            let name = match attribute.named_child(0) {
-                Some(path) if path.kind() == "identifier" => Some(path),
-                Some(path) if path.kind() == "scoped_identifier" => {
-                    path.child_by_field_name("name")
-                }
-                _ => None,
-            };
-            name.is_none_or(|name| matches!(rust_name(name, source), Some("cfg" | "cfg_attr")))
-        };
-        let inner_cfg = |container: Node<'_>| {
-            let mut cursor = container.walk();
-            container
-                .named_children(&mut cursor)
-                .any(|child| child.kind() == "inner_attribute_item" && is_cfg(child))
-        };
-        let mut current = Some(node);
-        while let Some(node) = current {
-            let mut previous = node.prev_named_sibling();
-            while let Some(sibling) = previous {
-                match sibling.kind() {
-                    "attribute_item" if is_cfg(sibling) => return true,
-                    "attribute_item" | "line_comment" | "block_comment" => {
-                        previous = sibling.prev_named_sibling();
-                    }
-                    _ => break,
-                }
-            }
-            if node.child_by_field_name("body").is_some_and(inner_cfg)
-                || (node.kind() == "source_file" && inner_cfg(node))
-            {
-                return true;
-            }
-            current = node.parent();
-        }
-        false
-    }
-
-    // Rust の識別子の文字列 (`r#` を外す)。
-    fn rust_name<'s>(node: Node<'_>, source: &'s [u8]) -> Option<&'s str> {
-        let text = node.utf8_text(source).ok()?;
-        Some(text.strip_prefix("r#").unwrap_or(text))
     }
 
     // use tree が束縛する名前を `out` に積む。パスは解決せず、末尾の名前か別名だけを見る
@@ -317,7 +336,7 @@ pub(crate) fn proves_member_binding(path: &str, source: &[u8], owner: &str, memb
         let owner_node = node(&owner_symbol.range)?;
         let member_node = node(&member_symbol.range)?;
         let rust = lang == LangId::Rust;
-        if rust && (cfg_applies(owner_node, source) || cfg_applies(member_node, source)) {
+        if rust && (rust_cfg_applies(owner_node, source) || rust_cfg_applies(member_node, source)) {
             return Some(false);
         }
         // 型宣言の本体に直接書いたメンバー (class / trait などの本体に書く言語)
@@ -333,7 +352,7 @@ pub(crate) fn proves_member_binding(path: &str, source: &[u8], owner: &str, memb
             || body.kind() != "declaration_list"
             || impl_item.kind() != "impl_item"
             || impl_item.child_by_field_name("trait").is_some()
-            || cfg_applies(impl_item, source)
+            || rust_cfg_applies(impl_item, source)
         {
             return Some(false);
         }

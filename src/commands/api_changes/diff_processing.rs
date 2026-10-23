@@ -695,15 +695,89 @@ pub(crate) fn process_moved_member_changes(
     }
 }
 
+/// 自由関数・定数を別のファイルへ移した同じ差分でシグネチャの変わった組
+/// ([`pair_moved_symbol_changes`]) を、rename した変更ファイルと同じ規則で判定する。移動元を
+/// 旧ファイル、移動先を新ファイルとして扱う。
+///
+/// 宣言を構文で確かめ ([`MovedSymbolFiles::proves_declaration`])、判定が移動に使える証拠
+/// ([`SignatureDecision::proves_compatible_move`]) で、契約部分に現れる名前が移動元と移動先で同じ
+/// ものを指すと確かめられた組だけ、判定を bucket へ入れて返す。それ以外の組は何も入れない
+/// (呼び出し側が今と同じ削除と追加に残す)。owner の移動のような対応の証拠が無いので、呼び出し側の
+/// 追随で閉じる変更 (mod_closed) や api.mod の組を移動と見なすと、別物の削除を隠し得る。
+pub(crate) fn process_moved_symbol_changes<'c, 'a>(
+    inputs: &DetectionInputs<'_>,
+    state: &mut DetectionState<'_>,
+    changes: &'c [MovedSymbolChange<'a>],
+) -> Vec<&'c MovedSymbolChange<'a>> {
+    let mut sources = MovedSymbolFiles::new(inputs.dir, inputs.base_blobs);
+    // (移動元, 移動先) ごとに文脈を 1 つ作り、型別名の読み込みなどを共有する。
+    let mut files: Vec<ChangedSignatureFiles<'_>> = Vec::new();
+    let mut file_index: std::collections::HashMap<(&str, &str), usize> =
+        std::collections::HashMap::new();
+    let mut accepted = Vec::new();
+    for change in changes {
+        if is_rust_new_symbol_outside_public_api_surface(
+            inputs.dir,
+            &change.new.file,
+            &change.new.name,
+            state.rust_public,
+        ) || !sources.proves_declaration(change)
+            || !sources.references_reach_destination(change, inputs.ref_index)
+        {
+            continue;
+        }
+        let (old_path, new_path) = (change.old.file.as_str(), change.new.file.as_str());
+        let ix = *file_index.entry((old_path, new_path)).or_insert_with(|| {
+            let mut pair = ChangedSignatureFiles::new(
+                inputs,
+                state,
+                old_path,
+                new_path,
+                change.new_in_file_callees,
+            );
+            pair.moved_from = Some(old_path);
+            files.push(pair);
+            files.len() - 1
+        });
+        if sources.const_addition_is_compatible(change) {
+            files[ix]
+                .rust_moved_const_additions
+                .insert(change.new.name.clone());
+        }
+        let (symbol_change, decision) = files[ix].decide(
+            inputs,
+            state,
+            &change.new.name,
+            &change.new.kind,
+            &change.old.signature,
+            &change.new.signature,
+        );
+        if !decision.proves_compatible_move() {
+            continue;
+        }
+        // 値だけの変更は型を字面で比べるので、型に現れる名前が同じものを指すか別に確かめる
+        // (型別名の証明は `prove_moved_function` の中で確かめる)。
+        if matches!(decision, SignatureDecision::ConstValue)
+            && !sources.constant_type_resolves_alike(change)
+        {
+            continue;
+        }
+        record_signature_decision(inputs, state, symbol_change, decision);
+        accepted.push(change);
+    }
+    accepted
+}
+
 /// シグネチャの変わったシンボルを判定する、旧新のファイルの組ごとの文脈。
 ///
 /// 変更ファイル (rename を含む) と、型の移動と同じ差分でシグネチャの変わったメンバー
-/// ([`process_moved_member_changes`]) が同じ規則で判定するために共有する。ファイル内の
+/// ([`process_moved_member_changes`])、移動と同じ差分でシグネチャの変わった自由関数・定数
+/// ([`process_moved_symbol_changes`]) が同じ規則で判定するために共有する。ファイル内の
 /// 対応付け (同名の複数定義・引数パターンだけの変更) の検査は呼び出し側が済ませる。
 struct ChangedSignatureFiles<'a> {
     old_path: &'a str,
     new_path: &'a str,
-    /// 型の移動と同じ差分でシグネチャの変わったメンバーなら移動元 (`old_path`)。
+    /// 移動と同じ差分でシグネチャの変わった宣言なら移動元 (`old_path`)。
     moved_from: Option<&'a str>,
     in_file_callees: &'a std::collections::HashSet<String>,
     /// Rust bin-only crate 判定 (api.mod 抑制用)。lib → bin / bin → lib どちらかが bin-only なら
@@ -717,6 +791,8 @@ struct ChangedSignatureFiles<'a> {
     /// 関数に `const` を足しただけと Phase 0 で証明した qualname。型の移動と同じ差分の
     /// メンバーは旧新で別ファイルを比べるので持たない。
     rust_const_additions: Option<&'a std::collections::HashSet<String>>,
+    /// 自由関数の移動で、const 追加と別ファイルの型所有元まで証明した名前。
+    rust_moved_const_additions: std::collections::HashSet<String>,
 }
 
 impl<'a> ChangedSignatureFiles<'a> {
@@ -740,6 +816,7 @@ impl<'a> ChangedSignatureFiles<'a> {
             lang_id: crate::language::LangId::from_path(camino::Utf8Path::new(new_path)).ok(),
             rust_type_aliases: None,
             rust_const_additions: None,
+            rust_moved_const_additions: std::collections::HashSet::new(),
         }
     }
 
@@ -753,14 +830,39 @@ impl<'a> ChangedSignatureFiles<'a> {
         old_sig: &str,
         new_sig: &str,
     ) {
+        let (change, decision) = self.decide(inputs, state, name, kind, old_sig, new_sig);
+        record_signature_decision(inputs, state, change, decision);
+    }
+
+    /// シグネチャの変わったシンボル 1 件を判定する。bucket は書き換えない。
+    fn decide(
+        &mut self,
+        inputs: &DetectionInputs<'_>,
+        state: &mut DetectionState<'_>,
+        name: &str,
+        kind: &str,
+        old_sig: &str,
+        new_sig: &str,
+    ) -> (ApiSymbolChange, SignatureDecision) {
         let &DetectionInputs {
             dir,
             ref_index,
             base_blobs,
             ..
         } = inputs;
+        let change = ApiSymbolChange {
+            name: name.to_owned(),
+            kind: kind.to_owned(),
+            file: self.new_path.to_owned(),
+            old_signature: Some(old_sig.to_owned()),
+            new_signature: Some(new_sig.to_owned()),
+            // blocking な api.mod に確定した時点でのみ算出する (record_signature_decision)。
+            no_resolved_internal_callers: false,
+            // 型契約変更として種別が確定した時点で埋める (record_signature_decision)。
+            contract_change: None,
+        };
         if self.skip_for_binary_crate {
-            return;
+            return (change, SignatureDecision::Omit);
         }
         // private module 抑制
         if is_rust_old_symbol_outside_public_api_surface(
@@ -770,14 +872,34 @@ impl<'a> ChangedSignatureFiles<'a> {
             name,
             state.rust_public,
         ) {
-            return;
+            return (change, SignatureDecision::Omit);
+        }
+        // 移動先への全参照と const 追加を証明した組は、同一ファイル内だけの caller でも記録する。
+        if self.lang_id == Some(crate::language::LangId::Rust)
+            && self.rust_moved_const_additions.contains(name)
+        {
+            let site = CompatibleModSite {
+                dir,
+                base: inputs.base,
+                old_path: self.old_path,
+                new_path: self.new_path,
+                name,
+                kind,
+                old_sig,
+                new_sig,
+                lang_id: self.lang_id,
+            };
+            return (
+                change,
+                SignatureDecision::MovedConstAddition(site.compatible("rust_const_fn_added")),
+            );
         }
         // closed-in-diff: 同一ファイル内でしか呼ばれていない関数のシグネチャ変更は除外。
         //
         // ただし Python の TypedDict `total=` 変更候補だけはここで落とさない。
         // 落とすと契約変更の 3 値判定に到達できず、「キーが必須化する破壊的変更」が
         // api.mod にすら出なくなる。判定が `NotApplicable` なら
-        // `classify_signature_change` 側で従来どおり捨てる。
+        // `decide_signature_change` 側で従来どおり捨てる。
         // default export / 別名 export (`export { f as g }`) の利用者は宣言名で現れないので、
         // 宣言名の cross-file 参照 0 件は「同一ファイル内でしか使われていない」証明にならない。
         let internally_closed = is_internally_connected(self.in_file_callees, name)
@@ -793,7 +915,7 @@ impl<'a> ChangedSignatureFiles<'a> {
         if internally_closed
             && !may_be_python_typed_dict_total_change(kind, old_sig, new_sig, self.lang_id)
         {
-            return;
+            return (change, SignatureDecision::Omit);
         }
 
         // Rust の関数に `const` を足しただけなら、const の文脈の外からの呼び出しは変わらない
@@ -814,16 +936,14 @@ impl<'a> ChangedSignatureFiles<'a> {
                 new_sig,
                 lang_id: self.lang_id,
             };
-            state
-                .buckets
-                .compatible_modified
-                .push(site.compatible("rust_const_fn_added"));
-            return;
+            return (
+                change,
+                SignatureDecision::Compatible(site.compatible("rust_const_fn_added")),
+            );
         }
 
-        // Rust の透過的な root public type alias 導入だけで説明できる表記変更は非 blocking。
-        // working tree 側を先に読み、利用可能な alias がある場合だけ base blob を `git show`
-        // する。同一ファイルの候補間では old/new alias index を再利用する。
+        // Rust の透過的な root public type alias の導入・展開だけで説明できる表記変更は
+        // 非 blocking。同一ファイルの候補間では old/new alias index を再利用する。
         if self.lang_id == Some(crate::language::LangId::Rust) && kind == "function" {
             let (old_path, new_path) = (self.old_path, self.new_path);
             let context = self.rust_type_aliases.get_or_insert_with(|| {
@@ -837,10 +957,16 @@ impl<'a> ChangedSignatureFiles<'a> {
                 )?;
                 prepared.with_old_source(&sources.old)
             });
-            if context
-                .as_ref()
-                .is_some_and(|context| context.prove_function(name))
-            {
+            // 移動では旧新が別のファイルなので、名前が同じものを指すことも確かめる。
+            let moved = self.moved_from.is_some();
+            let proven = context.as_ref().is_some_and(|context| {
+                if moved {
+                    context.prove_moved_function(name)
+                } else {
+                    context.prove_function(name)
+                }
+            });
+            if proven {
                 let site = CompatibleModSite {
                     dir,
                     base: inputs.base,
@@ -852,47 +978,34 @@ impl<'a> ChangedSignatureFiles<'a> {
                     new_sig,
                     lang_id: self.lang_id,
                 };
-                state
-                    .buckets
-                    .compatible_modified
-                    .push(site.compatible("transparent_rust_type_alias"));
-                return;
+                return (
+                    change,
+                    SignatureDecision::Compatible(site.compatible("transparent_rust_type_alias")),
+                );
             }
         }
 
-        let change = ApiSymbolChange {
-            name: name.to_owned(),
-            kind: kind.to_owned(),
-            file: self.new_path.to_owned(),
-            old_signature: Some(old_sig.to_owned()),
-            new_signature: Some(new_sig.to_owned()),
-            // blocking な api.mod に確定した時点でのみ算出する (classify_signature_change)。
-            no_resolved_internal_callers: false,
-            // 型契約変更として種別が確定した時点で埋める (classify_signature_change)。
-            contract_change: None,
+        let site = SignatureChangeSite {
+            change,
+            old_path: self.old_path,
+            new_path: self.new_path,
+            moved_from: self.moved_from,
+            kind,
+            old_sig,
+            new_sig,
+            lang_id: self.lang_id,
+            internally_closed,
         };
-        classify_signature_change(
-            inputs,
-            state,
-            SignatureChangeSite {
-                change,
-                old_path: self.old_path,
-                new_path: self.new_path,
-                moved_from: self.moved_from,
-                kind,
-                old_sig,
-                new_sig,
-                lang_id: self.lang_id,
-                internally_closed,
-            },
-        );
+        let decision = decide_signature_change(inputs, state.closure_caches, &site);
+        (site.change, decision)
     }
 }
 
 /// シグネチャ変更 1 件の分類結果。判定 ([`decide_signature_change`]) と bucket への格納
 /// ([`record_signature_decision`]) を分け、格納を 1 か所にまとめる。
 enum SignatureDecision {
-    /// どの bucket にも出さない (同一ファイル内でしか使われていない変更)。
+    /// どの bucket にも出さない (bin-only crate・private module・同一ファイル内でしか
+    /// 使われていない変更)。
     Omit,
     /// 型注釈の表記だけが変わり、型は同じ (unchanged_type_annotations)。
     UnchangedTypeAnnotation,
@@ -904,6 +1017,8 @@ enum SignatureDecision {
     UnchangedStaticConst,
     /// 呼び出し側を壊さない変更 (compatible_modified)。
     Compatible(CompatibleApiModification),
+    /// const 追加に加え、移動元と移動先の型所有元まで証明した自由関数。
+    MovedConstAddition(CompatibleApiModification),
     /// 全 cross-file 参照が同一 diff で追随済み (modified_closed_in_diff)。
     ClosedInDiff,
     /// callback 本体だけの変更 (callback_body_changes)。
@@ -912,15 +1027,20 @@ enum SignatureDecision {
     Blocking(Option<crate::models::review::ApiContractChange>),
 }
 
-/// シグネチャ変更を const_value / compatible_modified (React HOC / Object member 削除) /
-/// modified_closed_in_diff / modified のいずれかに分類する。
-pub(crate) fn classify_signature_change(
-    inputs: &DetectionInputs<'_>,
-    state: &mut DetectionState<'_>,
-    site: SignatureChangeSite<'_>,
-) {
-    let decision = decide_signature_change(inputs, state.closure_caches, &site);
-    record_signature_decision(inputs, state, site.change, decision);
+impl SignatureDecision {
+    /// 移動と同じ差分で変わった自由関数・定数の組 ([`process_moved_symbol_changes`]) を移動と
+    /// みなせる判定か。宣言の比較だけで決まり、移動先で名前が同じものを指すことを確かめられる
+    /// 証拠 (値だけの変更と、Rust の透過的な型別名) に限る。互換性を確かめていない変更
+    /// (`TypeAnnotationOnly`・`CallbackBodyOnly`)、出さないだけの変更 (`Omit`)、呼び出し側の追随で
+    /// 閉じた変更 (`ClosedInDiff`)、参照の用途で決まる互換判定 (旧パスを指す参照を区別しない) は
+    /// 含めない。区分や理由を新しく足しても、ここに足さない限り移動には使わない。
+    fn proves_compatible_move(&self) -> bool {
+        match self {
+            Self::ConstValue | Self::MovedConstAddition(_) => true,
+            Self::Compatible(compat) => compat.reason == "transparent_rust_type_alias",
+            _ => false,
+        }
+    }
 }
 
 /// 分類の段階を記述順に評価し、最初に確定した段階の結果を返す。段階の順序がそのまま
@@ -1293,7 +1413,9 @@ fn record_signature_decision(
                 refs_internal: 0,
             });
         }
-        SignatureDecision::Compatible(compat) => buckets.compatible_modified.push(compat),
+        SignatureDecision::Compatible(compat) | SignatureDecision::MovedConstAddition(compat) => {
+            buckets.compatible_modified.push(compat)
+        }
         SignatureDecision::ClosedInDiff => buckets.modified_closed_in_diff.push(change),
         SignatureDecision::CallbackBodyOnly => {
             buckets

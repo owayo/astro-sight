@@ -130,6 +130,8 @@ pub(crate) struct ApiRefIndex {
     refs: std::collections::HashMap<String, Vec<crate::models::reference::SymbolReference>>,
     /// batch 検索に失敗した chunk の name 集合 (保守側判定の対象)。
     failed: HashSet<String>,
+    /// 移動の証明にだけ使う、未解析ソースなどで参照集合が完全でない名前。
+    incomplete: HashSet<String>,
 }
 
 impl ApiRefIndex {
@@ -142,6 +144,7 @@ impl ApiRefIndex {
         let mut index = Self {
             refs: std::collections::HashMap::new(),
             failed: HashSet::new(),
+            incomplete: HashSet::new(),
         };
         if sorted.is_empty() {
             return index;
@@ -152,8 +155,16 @@ impl ApiRefIndex {
         let service = AppService::new();
         match service.find_symbol_references_batch(&sorted, dir, None) {
             Ok(results) => {
+                let mut incomplete_input = false;
                 for r in results {
+                    if r.failed_files > 0 || !r.truncations.is_empty() || r.skipped.is_some() {
+                        incomplete_input = true;
+                    }
                     index.refs.insert(r.symbol, r.references);
+                }
+                // 一括検索の入力欠落は先頭 record だけに付く場合もある。全名の移動証明を止める。
+                if incomplete_input {
+                    index.incomplete.extend(sorted.iter().cloned());
                 }
             }
             Err(_) => index.failed.extend(sorted),
@@ -170,6 +181,15 @@ impl ApiRefIndex {
             return None;
         }
         self.refs.get(name).map(|v| v.as_slice())
+    }
+
+    pub(crate) fn complete_refs_for(
+        &self,
+        name: &str,
+    ) -> Option<&[crate::models::reference::SymbolReference]> {
+        (!self.incomplete.contains(name))
+            .then(|| self.refs_for(name))
+            .flatten()
     }
 }
 
@@ -518,7 +538,7 @@ pub(crate) struct ModifiedClosureInput<'a> {
     /// 新旧とも一意な直接関数宣言で、今回の非依存用途の証拠を使える。
     pub(crate) js_direct_function_change: bool,
     pub(super) rust_module_function_change: Option<super::rust_ref_sites::ModuleFunctionProof>,
-    /// 型の移動と同じ差分でシグネチャの変わったメンバーの移動元。移動先 (`target_new_path`)
+    /// 移動と同じ差分でシグネチャの変わった宣言の移動元。移動先 (`target_new_path`)
     /// の行のうち移動元にも同じ行があるものは持ち込んだだけの行なので、追随の証拠にしない
     /// (rename として渡る差分では、それらは未変更の行になる)。
     pub(crate) moved_from: Option<&'a str>,

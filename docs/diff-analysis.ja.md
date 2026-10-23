@@ -332,11 +332,16 @@ astro-sight review --dir . --git \
 `api_changes.compatible_modified` には、シグネチャ文字列は変わるが既存の呼び出しとの互換性を保つ変更を出力する。次の変更は informational として扱い、`--hook` の blocking 対象にしない。
 
 - React component の HOC ラップ
+- Rust の一意な root 関数のヘッダを、非 generic・制限なしの `pub type` で書き直す変更と、その別名を展開した型へ戻す変更（`transparent_rust_type_alias`）。旧新それぞれのファイルの別名と import 環境を確かめる。
 - 未参照の object member の削除
 - TS/TSX のトップレベル関数の末尾への optional / default 引数の追加（`trailing_optional_params`）
 - TypeScript の inline object 引数型への optional プロパティ追加。他の枝が変わらない union の、一意な object 枝も含む（`optional_object_props`）
 - Python のトップレベル関数 / モジュール直下のクラスメソッドの末尾への、kwonly+default 引数または positional default 引数の追加（`trailing_optional_params`）。デコレータの差分がある場合や同名関数が複数定義されている場合は、保守的に blocking を維持する
 - Rust の関数・inherent impl のメソッドへの `const` の追加（`rust_const_fn_added`）。const の文脈の外からの呼び出しは変わらないので、呼び出し元は `impact_info` に残す。違ってよいのは `const` だけで、ほかの宣言・属性・外側のモジュールや `impl` のヘッダ・ファイルの import と、宣言に現れる名前の同じファイルの宣言（型別名・`use` の別名・配列長の定数など。それらが使う名前もたどる）は変わらないことが条件。戻り値が `impl Trait` の関数は、隠れた型と外に漏れる auto trait が本体で決まるので、本体と、その本体が参照する同じファイルの宣言も変わらないことが条件。マクロの token tree は原文を保ち、空の impl を含む impl ヘッダと、入れ子の `impl`・マクロ呼び出しは囲む宣言と属性も含めて比べ、そこに現れる名前も依存先として調べる。参照先が旧新とも一意な関数なら、既存のヘッダ正規化の下で const を足しただけで本体のトークンが不変な変更も許す。関数自身の `const` だけは除くので、関数内の未変更の `assert!` は証明を妨げない。位置依存または未証明のマクロ呼び出しは、行と Unicode 文字の列も不変であることを求める。別名と入れ子のマクロトークンも保留する。単純な assert と、入れ子のマクロ・属性・呼び出しを含まない一意な先行 root マクロ定義だけは位置を問わないが、同一ファイル内のマクロ束縛が不明ならこの例外は使わない。ヘッダのマクロは未対応のまま保守的に残す。`const` を外す変更や、引数・戻り値・ジェネリクス・`unsafe`・`async`・`extern`・公開範囲の同時の変更は blocking を維持する。同じファイルに同名の宣言（別の `impl` のメソッド、`cfg` で分けた関数）があると呼び出し元を区別できないので、`impacts` は残る
+
+Rust の root 自由関数・定数を移すのと同時に互換な宣言変更をした場合は、`moved` と `const_value_changes`（初期化式の変更）、または `compatible_modified`（透過的な型別名・自由関数への const 追加）を報告できる。const 追加は #113 の宣言依存の完全な比較に加え、別ファイルでの型の名前解決も確かめる。`impl Trait` 戻り値と rename 差分の const 追加は証明しない。名前・種別・宣言・移動先が一意であることを求める。追加証明は、edition を明示した通常の Cargo モジュールと非 optional の直接 path dependency（依存キーの改名を含む）を扱い、全参照が移動先を指す直接パスか移動先ファイル内の素の名前であることを確かめる。旧パスの残存、import・再公開の別名、曖昧な所有元、可視性縮小、非互換変更は従来の削除判定に残す。初期化式の値は評価せず、`const_value` は宣言した型が変わらないことを表す。
+
+移動の型の証明では primitive 名も束縛を照合し、raw 識別子は索引で正規化する。glob・未知属性が primitive 名を隠す可能性も保留する。移動の証明では、std / core / alloc 起点の import も、旧新の両ファイルで先頭名が束縛されていない場合だけ型の証拠にする。依存名の証明では raw identifier を正規化し、参照ファイルに非 ASCII 識別子があれば NFC 同値を否定できないため証明しない。旧新のソース構成を一度ずつ調べ、未知のマクロ・属性、derive、外部ソース取り込み、symlink、build script、Cargo 設定、custom target、参照入力の不完全性があれば証明しない。上限は各側の列挙 10,000 entries と、旧新の Rust 合計 512 ファイル / 8 MiB。生成コードや解析 root 外のコンパイル構成は解決しない。従来の厳密なシグネチャ一致の移動、移動した型のメンバー変更、`refs` と dead-code の出現契約は変えない。
 
 同じシンボルに紐づく `impacts` も破壊的影響としては出さず、`mod_compat` の情報提供だけに留める。`rust_const_fn_added` の `impacts` は影響分析の判定に従い、同じファイルに同名の宣言があれば残す。未参照 object member の判定では、削除キーを 1 個ずつ全リポジトリで検索せずに Aho-Corasick で一括して事前抽出し、各 JS/TS ファイルを最大 1 回だけ parse する。ファイルの収集・読み込み・parse に失敗したときは互換扱いへ降格せず、blocking のままにする。
 

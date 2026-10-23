@@ -1,6 +1,6 @@
 //! Rust 関数シグネチャの非契約差分を正規化・証明する。
 //!
-//! 通常引数の binding-side `mut` 除去と、root-level の公開 type alias 導入だけで
+//! 通常引数の binding-side `mut` 除去と、root-level の公開 type alias の導入・展開だけで
 //! 実体型が変わらないことの old/new AST 証明、関数に `const` を足しただけの証明を担う。
 
 use std::collections::{HashMap, HashSet};
@@ -21,7 +21,8 @@ pub(crate) use parameter_patterns::{
 };
 
 /// old/new それぞれの同一ファイル内 `pub type` を使い、関数シグネチャの型表現が
-/// 透過的な alias 導入だけで変わったかを証明するコンテキスト。
+/// 透過的な alias の導入 (新側で使う) か展開 (旧側で使っていた alias を展開した形に戻す) だけで
+/// 変わったかを証明するコンテキスト。
 ///
 /// 対象は非 generic・一意・unrestricted `pub` の alias に限定する。import alias、private / restricted
 /// alias、generic、重複、循環、parse 不能はすべて「同値と証明できない」側へ倒す。
@@ -32,8 +33,8 @@ pub(crate) struct RustTypeAliasEquivalence {
 
 /// working tree 側を先に parse した alias 同値証明候補。
 ///
-/// 新側に利用可能な root `pub type` が無ければ構築せず、API 検出で base blob の
-/// `git show` を起動しない。impact では Pass 1 の既存 tree から構築して再 parse を避ける。
+/// impact では Pass 1 の既存 tree から構築して再 parse を避ける。旧側を読んだ後、どちらの
+/// 側にも利用可能な root `pub type` が無ければ証明しない ([`Self::with_old_source`])。
 pub(crate) struct PreparedRustTypeAliases {
     new: TypeAliasIndex,
 }
@@ -47,7 +48,7 @@ impl RustTypeAliasEquivalence {
         })
     }
 
-    /// working tree ソースを先に parse し、新側に証明対象の alias がある場合だけ候補を返す。
+    /// working tree ソースを先に parse する。解析できなければ None。
     pub(crate) fn prepare_new_source(new_source: &[u8]) -> Option<PreparedRustTypeAliases> {
         let tree = parser::parse_source(new_source, LangId::Rust).ok()?;
         Self::prepare_new_tree(tree.root_node(), new_source)
@@ -58,49 +59,86 @@ impl RustTypeAliasEquivalence {
         new_root: Node<'_>,
         new_source: &[u8],
     ) -> Option<PreparedRustTypeAliases> {
-        let new = TypeAliasIndex::from_root(new_root, new_source)?;
-        (!new.aliases.is_empty()).then_some(PreparedRustTypeAliases { new })
+        Some(PreparedRustTypeAliases {
+            new: TypeAliasIndex::from_root(new_root, new_source)?,
+        })
     }
 
     /// old/new の完全な root 関数ヘッダを比較する。diff の変更行や抽出済みの
     /// 1 行シグネチャは名前の候補にだけ使い、同値性の証拠にはしない。
+    ///
+    /// 旧新のどちらかで alias を展開し、展開後のトークン列が一致することを求める。新側で
+    /// alias を使う (導入) だけでなく、旧側で使っていた alias を展開した形に戻す変更も同じ型を
+    /// 表す。移動と同じ差分では旧新が別のファイルなので、alias が片側にしか無いことも多い。
     pub(crate) fn prove_function(&self, name: &str) -> bool {
+        self.proven_pair(name).is_some()
+    }
+
+    /// 移動 (旧新が別のファイル) の関数ヘッダの同値証明。[`Self::prove_function`] に加え、
+    /// ヘッダと展開した alias の右辺に現れる名前が、どちらのファイルでも同じものを指すことを
+    /// 求める ([`resolves_alike_across_files`])。同じファイルの旧新と違い、字面が同じ root の
+    /// 宣言や `use crate::...` でも別のものを指し得る。
+    pub(crate) fn prove_moved_function(&self, name: &str) -> bool {
+        let Some((old, new)) = self.proven_pair(name) else {
+            return false;
+        };
+        let names = old.names.union(&new.names).cloned().collect();
+        let roots = PathRoots::union(&old.path_roots, &new.path_roots);
+        resolves_alike_across_files(&self.old, &self.new, &names, &roots, &|used| {
+            self.expanded_alias_itself(&old, &new, used)
+        })
+    }
+
+    /// 同値と証明できた旧新の正規化シグネチャ。
+    fn proven_pair(&self, name: &str) -> Option<(CanonicalSignature, CanonicalSignature)> {
+        let name = rust_name_key(name);
         // import の意味が同じと証明できない状態で、alias RHS 内の同名型を字面だけで同一視しない。
         if self.old.imports != self.new.imports {
-            return false;
+            return None;
+        }
+        // マクロ呼び出し・`extern crate`・inner attribute などで root のスコープが曖昧な側は、
+        // 名前を何が束縛しているか分からない (展開しない側でも、生成された型が std の名前を
+        // 隠し得る)。
+        if self.old.ambiguous_scope || self.new.ambiguous_scope {
+            return None;
         }
         if self.old.function_counts.get(name) != Some(&1)
             || self.new.function_counts.get(name) != Some(&1)
         {
-            return false;
+            return None;
         }
-        let Some(old_header) = self.old.root_function_headers.get(name) else {
-            return false;
-        };
-        let Some(new_header) = self.new.root_function_headers.get(name) else {
-            return false;
-        };
-        let Some(old) = canonicalize_signature(old_header, &self.old) else {
-            return false;
-        };
-        let Some(new) = canonicalize_signature(new_header, &self.new) else {
-            return false;
-        };
+        let old_header = self.old.root_function_headers.get(name)?;
+        let new_header = self.new.root_function_headers.get(name)?;
+        let old = canonicalize_signature(old_header, &self.old)?;
+        let new = canonicalize_signature(new_header, &self.new)?;
         if old.function_name != name || new.function_name != name {
-            return false;
+            return None;
         }
-        if !new.expanded_alias || old.tokens != new.tokens {
-            return false;
+        if !(old.expanded_alias || new.expanded_alias) || old.tokens != new.tokens {
+            return None;
         }
         // 型・配列長などに現れる名前の root 束縛が変化した場合は、字面の
-        // 一致だけで実体型が同じとは言えない。新規 alias 自身だけを除外する。
-        old.names.union(&new.names).all(|used| {
-            if new.expanded_alias_names.contains(used) && !self.old.root_bindings.contains_key(used)
-            {
-                return true;
-            }
-            self.old.root_bindings.get(used) == self.new.root_bindings.get(used)
-        })
+        // 一致だけで実体型が同じとは言えない。片側で展開した alias 自身だけを除外する。
+        old.names
+            .union(&new.names)
+            .all(|used| {
+                self.expanded_alias_itself(&old, &new, used)
+                    || self.old.root_bindings.get(used) == self.new.root_bindings.get(used)
+            })
+            .then_some((old, new))
+    }
+
+    /// `used` が片側で展開した alias 自身で、反対側に同じ名前の root 束縛が無い (新側で導入した
+    /// alias・旧側で展開をやめた alias)。右辺に現れる名前は含めない。
+    fn expanded_alias_itself(
+        &self,
+        old: &CanonicalSignature,
+        new: &CanonicalSignature,
+        used: &str,
+    ) -> bool {
+        (new.expanded_alias_names.contains(used) && !self.old.root_bindings.contains_key(used))
+            || (old.expanded_alias_names.contains(used)
+                && !self.new.root_bindings.contains_key(used))
     }
 
     #[cfg(test)]
@@ -117,11 +155,11 @@ impl RustTypeAliasEquivalence {
 
 impl PreparedRustTypeAliases {
     /// 先に準備した new index と、後から取得した old フルソースを組み合わせる。
+    /// どちらの側にも証明に使える alias が無ければ None。
     pub(crate) fn with_old_source(self, old_source: &[u8]) -> Option<RustTypeAliasEquivalence> {
-        Some(RustTypeAliasEquivalence {
-            old: TypeAliasIndex::from_source(old_source)?,
-            new: self.new,
-        })
+        let old = TypeAliasIndex::from_source(old_source)?;
+        (!old.aliases.is_empty() || !self.new.aliases.is_empty())
+            .then_some(RustTypeAliasEquivalence { old, new: self.new })
     }
 }
 
@@ -134,6 +172,41 @@ struct TypeAliasIndex {
     function_counts: HashMap<String, usize>,
     root_bindings: HashMap<String, Vec<String>>,
     blocked_root_functions: HashSet<String>,
+    /// root のマクロ呼び出し・`extern crate`・inner attribute・属性付き `use` があり、root の
+    /// 名前を何が束縛しているか確定できない。
+    ambiguous_scope: bool,
+    /// root の `use` が束縛する名前と、その束縛 (glob は含めない)。
+    use_bindings: HashMap<String, Vec<UseBinding>>,
+    /// root に glob の `use` がある (std からの glob でも、どの名前を持ち込むかは std の版や
+    /// モジュールで変わる)。
+    has_glob: bool,
+    /// root の項目に、名前を生成し得る属性 (未知の属性マクロ・std 以外の derive) がある。
+    unknown_attribute: bool,
+}
+
+/// root の `use` による名前 1 つの束縛。
+#[derive(PartialEq, Eq)]
+struct UseBinding {
+    /// 束縛先のパス (`std::collections::HashMap`)。
+    path: String,
+    /// パスの先頭の字面が std / core / alloc。先頭名の未束縛は別に確かめる。
+    std_rooted: bool,
+}
+
+/// どのファイル・クレートでも同じものを指すパスの先頭。
+const STD_ROOTS: [&str; 3] = ["std", "core", "alloc"];
+
+/// 索引用の名前。表示と比較に使うトークンは元の綴りを保つ。
+fn rust_name_key(name: &str) -> &str {
+    name.strip_prefix("r#").unwrap_or(name)
+}
+
+impl TypeAliasIndex {
+    /// root で `name` を束縛する宣言か `use` がある。
+    fn binds(&self, name: &str) -> bool {
+        let name = rust_name_key(name);
+        self.root_bindings.contains_key(name) || self.use_bindings.contains_key(name)
+    }
 }
 
 impl TypeAliasIndex {
@@ -156,6 +229,9 @@ impl TypeAliasIndex {
                 has_pending_attribute = true;
                 pending_attributes.push_str(child.utf8_text(source).ok()?);
                 pending_attributes.push('\n');
+                if crate::engine::impact::rust_std_origin::safe_attribute(child, source).is_none() {
+                    index.unknown_attribute = true;
+                }
                 continue;
             }
             if child.kind() == "inner_attribute_item" {
@@ -165,9 +241,11 @@ impl TypeAliasIndex {
             if matches!(child.kind(), "line_comment" | "block_comment") {
                 continue;
             }
+            // root のマクロ呼び出しは `foo! { .. }` なら `macro_invocation`、`foo!(..);` なら
+            // それを包む `expression_statement` になる (どちらも項目を生成し得る)。
             if matches!(
                 child.kind(),
-                "macro_invocation" | "extern_crate_declaration"
+                "macro_invocation" | "expression_statement" | "extern_crate_declaration"
             ) {
                 ambiguous_root_scope = true;
             }
@@ -188,6 +266,9 @@ impl TypeAliasIndex {
                     ambiguous_root_scope = true;
                 }
                 index.imports.push(canonical_token_stream(child, source)?);
+                if index.collect_use_bindings(child, source).is_none() {
+                    ambiguous_root_scope = true;
+                }
             }
             if child.kind() != "function_item" {
                 index.collect_root_binding(child, source, &pending_attributes)?;
@@ -199,8 +280,35 @@ impl TypeAliasIndex {
         if ambiguous_root_scope {
             index.aliases.clear();
         }
+        index.ambiguous_scope = ambiguous_root_scope;
         index.imports.sort();
         Some(index)
+    }
+
+    /// root の `use` 1 つが束縛する名前を `use_bindings` に積む。読めない形は None。
+    fn collect_use_bindings(&mut self, item: Node<'_>, source: &[u8]) -> Option<()> {
+        let mut bindings = Vec::new();
+        collect_use_tree(item.child_by_field_name("argument")?, source, &mut bindings)?;
+        for (name, path) in bindings {
+            let path: Vec<_> = path
+                .iter()
+                .map(|name| rust_name_key(name).to_owned())
+                .collect();
+            match name {
+                Some(name) => self
+                    .use_bindings
+                    .entry(rust_name_key(&name).to_owned())
+                    .or_default()
+                    .push(UseBinding {
+                        std_rooted: path
+                            .first()
+                            .is_some_and(|root| STD_ROOTS.contains(&root.as_str())),
+                        path: path.join("::"),
+                    }),
+                None => self.has_glob = true,
+            }
+        }
+        Some(())
     }
 
     fn collect_alias(&mut self, item: Node<'_>, source: &[u8], attributed: bool) {
@@ -210,7 +318,7 @@ impl TypeAliasIndex {
         let Ok(name) = name_node.utf8_text(source) else {
             return;
         };
-        let name = name.to_string();
+        let name = rust_name_key(name).to_string();
         let unrestricted_public = direct_named_child(item, "visibility_modifier")
             .and_then(|node| node.utf8_text(source).ok())
             .is_some_and(|visibility| !visibility.contains('('));
@@ -242,6 +350,7 @@ impl TypeAliasIndex {
         else {
             return;
         };
+        let name = rust_name_key(name);
         let header = item
             .child_by_field_name("body")
             .and_then(|body| source.get(item.start_byte()..body.start_byte()))
@@ -275,7 +384,7 @@ impl TypeAliasIndex {
         let Some(name) = item.child_by_field_name("name") else {
             return Some(());
         };
-        let name = name.utf8_text(source).ok()?.to_string();
+        let name = rust_name_key(name.utf8_text(source).ok()?).to_string();
         let declaration = format!("{pending_attributes}{}", item.utf8_text(source).ok()?);
         self.root_bindings
             .entry(name)
@@ -292,6 +401,7 @@ impl TypeAliasIndex {
                     .child_by_field_name("name")
                     .and_then(|name| name.utf8_text(source).ok())
                 {
+                    let name = rust_name_key(name);
                     self.aliases.remove(name);
                     self.blocked.insert(name.to_string());
                 }
@@ -301,6 +411,319 @@ impl TypeAliasIndex {
             let children: Vec<_> = node.named_children(&mut cursor).collect();
             pending.extend(children.into_iter().rev());
         }
+    }
+}
+
+/// use tree が束縛する名前と、束縛先のパスの区切りごとの名前を `out` に積む。glob は名前を
+/// None にする (パスの下のどの名前も束縛し得る)。`crate` / `self` / `super` もパスの区切りとして
+/// 積む。読めない形は None。入れ子の深さだけ再帰しないよう明示スタックで辿る。
+fn collect_use_tree(
+    argument: Node<'_>,
+    source: &[u8],
+    out: &mut Vec<(Option<String>, Vec<String>)>,
+) -> Option<()> {
+    let mut pending: Vec<(Node<'_>, std::rc::Rc<[String]>)> =
+        vec![(argument, std::rc::Rc::from(Vec::new()))];
+    while let Some((node, prefix)) = pending.pop() {
+        match node.kind() {
+            "identifier" | "scoped_identifier" => {
+                let mut path = prefix.to_vec();
+                path.extend(path_segments(node, source)?);
+                out.push((Some(path.last()?.clone()), path));
+            }
+            // `a::{self}` は `a` を束縛する
+            "self" => out.push((Some(prefix.last()?.clone()), prefix.to_vec())),
+            "use_as_clause" => {
+                let mut path = prefix.to_vec();
+                path.extend(path_segments(node.child_by_field_name("path")?, source)?);
+                let alias = node.child_by_field_name("alias")?.utf8_text(source).ok()?;
+                // `use Trait as _;` は名前を束縛しない
+                if alias != "_" {
+                    out.push((Some(alias.to_owned()), path));
+                }
+            }
+            "scoped_use_list" => {
+                let mut nested = prefix.to_vec();
+                if let Some(path) = node.child_by_field_name("path") {
+                    nested.extend(path_segments(path, source)?);
+                }
+                pending.push((node.child_by_field_name("list")?, std::rc::Rc::from(nested)));
+            }
+            "use_list" => {
+                let mut cursor = node.walk();
+                let items: Vec<_> = node
+                    .named_children(&mut cursor)
+                    .filter(|item| !matches!(item.kind(), "line_comment" | "block_comment"))
+                    .collect();
+                pending.extend(
+                    items
+                        .into_iter()
+                        .rev()
+                        .map(|item| (item, std::rc::Rc::clone(&prefix))),
+                );
+            }
+            "use_wildcard" => {
+                let mut path = prefix.to_vec();
+                let mut cursor = node.walk();
+                if let Some(inner) = node
+                    .named_children(&mut cursor)
+                    .find(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
+                {
+                    path.extend(path_segments(inner, source)?);
+                }
+                out.push((None, path));
+            }
+            _ => return None,
+        }
+    }
+    Some(())
+}
+
+/// パス (`std::collections::HashMap`・`crate::a`・`::std::fmt`) の区切りごとの名前。先頭の `::` は
+/// 落とす。`crate` / `self` / `super` はその字面。`<T as Tr>::` などの形は None。
+fn path_segments(mut node: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
+    let mut segments = Vec::new();
+    loop {
+        match node.kind() {
+            "scoped_identifier" | "scoped_type_identifier" => {
+                segments.push(
+                    node.child_by_field_name("name")?
+                        .utf8_text(source)
+                        .ok()?
+                        .to_owned(),
+                );
+                match node.child_by_field_name("path") {
+                    Some(path) => node = path,
+                    None => break,
+                }
+            }
+            "identifier" | "type_identifier" | "crate" | "self" | "super" => {
+                segments.push(node.utf8_text(source).ok()?.to_owned());
+                break;
+            }
+            _ => return None,
+        }
+    }
+    segments.reverse();
+    Some(segments)
+}
+
+/// 契約部分に現れるパスの先頭の名前。
+#[derive(Default)]
+struct PathRoots {
+    names: HashSet<String>,
+    /// 先頭を名前で表せないパス (`<T as Tr>::X`) やマクロの型がある。
+    unsupported: bool,
+}
+
+impl PathRoots {
+    fn union(old: &Self, new: &Self) -> Self {
+        Self {
+            names: old.names.union(&new.names).cloned().collect(),
+            unsupported: old.unsupported || new.unsupported,
+        }
+    }
+}
+
+/// 移動 (旧新が別のファイル) の契約部分に現れる名前が、旧新のどちらのファイルでも同じものを
+/// 指すか。同じファイルの旧新と違い、字面が同じでも別のものを指し得る (別ファイルの同名の
+/// root 宣言、`use crate::...`・`use super::...`、子モジュール名で始まるパス、glob の `use`、
+/// マクロ)。名前の束縛を積極的に確かめられたときだけ同じとみなす:
+/// - root のスコープがどちらでも曖昧でない ([`TypeAliasIndex::ambiguous_scope`])
+/// - パスの先頭が std / core / alloc で、その名前をどちらでも root で束縛し直しておらず、glob の
+///   `use` も無い
+/// - 素の名前が、どちらでも std / core / alloc を先頭にする同じパスの `use` で束縛されているか、
+///   どちらでも束縛されていない (prelude の型・引数名など)。後者は、どちらにも glob の `use` と
+///   名前を生成し得る属性が無いときだけ (生成された項目や glob は prelude の名前を隠し得る)。
+///   root の宣言で束縛される名前は、字面が同じでも別のファイルの別のものなので同じとみなさない
+///
+/// `checked` は呼び出し側が別に確かめた名前 (片側で展開した alias 自身)。
+fn resolves_alike_across_files(
+    old: &TypeAliasIndex,
+    new: &TypeAliasIndex,
+    names: &HashSet<String>,
+    roots: &PathRoots,
+    checked: &dyn Fn(&str) -> bool,
+) -> bool {
+    let sides = [old, new];
+    // Rust は識別子を NFC で比べる。字面で作った索引から同名の束縛を取りこぼさない。
+    if names.iter().any(|name| !name.is_ascii())
+        || sides.iter().any(|side| {
+            side.root_bindings
+                .keys()
+                .chain(side.use_bindings.keys())
+                .any(|name| !name.is_ascii())
+        })
+    {
+        return false;
+    }
+    if sides.iter().any(|side| side.ambiguous_scope) || roots.unsupported {
+        return false;
+    }
+    if !roots.names.is_empty()
+        && !roots.names.iter().all(|root| {
+            STD_ROOTS.contains(&root.as_str())
+                && sides.iter().all(|side| !side.binds(root) && !side.has_glob)
+        })
+    {
+        return false;
+    }
+    names.iter().all(|name| {
+        if checked(name) {
+            return true;
+        }
+        if sides
+            .iter()
+            .any(|side| side.root_bindings.contains_key(name.as_str()))
+        {
+            return false;
+        }
+        match (
+            old.use_bindings.get(name.as_str()),
+            new.use_bindings.get(name.as_str()),
+        ) {
+            (Some(old), Some(new)) => {
+                old == new
+                    && old.iter().all(|binding| {
+                        binding.std_rooted
+                            && binding.path.split("::").next().is_some_and(|root| {
+                                sides.iter().all(|side| !side.binds(root) && !side.has_glob)
+                            })
+                    })
+            }
+            (None, None) => sides
+                .iter()
+                .all(|side| !side.has_glob && !side.unknown_attribute),
+            _ => false,
+        }
+    })
+}
+
+/// 移動 (旧新が別のファイル) の root の定数 `name` の型に現れる名前が、旧新のどちらのファイルでも
+/// 同じものを指すか ([`resolves_alike_across_files`])。値だけの変更 (`const_value`) は型を字面で
+/// 比べるので、別ファイルでは名前が同じものを指すことを別に確かめる。値の評価が要る配列長や
+/// const generic 引数、マクロの型は証明しない。`old` / `new` は解析済みのファイル全体。
+pub(crate) fn moved_constant_type_resolves_alike(
+    old: (Node<'_>, &[u8]),
+    new: (Node<'_>, &[u8]),
+    name: &str,
+) -> bool {
+    let contract =
+        |(root, source): (Node<'_>, &[u8])| -> Option<(TypeAliasIndex, CanonicalSignature)> {
+            let index = TypeAliasIndex::from_root(root, source)?;
+            let mut cursor = root.walk();
+            let mut items = root.named_children(&mut cursor).filter(|item| {
+                matches!(item.kind(), "const_item" | "static_item")
+                    && item
+                        .child_by_field_name("name")
+                        .and_then(|item_name| item_name.utf8_text(source).ok())
+                        == Some(name)
+            });
+            let (Some(item), None) = (items.next(), items.next()) else {
+                return None;
+            };
+            let ty = item.child_by_field_name("type")?;
+            let mut canonical = CanonicalSignature::default();
+            canonicalize_node(
+                ty,
+                source,
+                ty.end_byte(),
+                &TypeAliasIndex::default(),
+                &HashSet::new(),
+                &mut Vec::new(),
+                &mut canonical,
+            )?;
+            Some((index, canonical))
+        };
+    let (Some((old_index, old)), Some((new_index, new))) = (contract(old), contract(new)) else {
+        return false;
+    };
+    resolves_alike_across_files(
+        &old_index,
+        &new_index,
+        &old.names.union(&new.names).cloned().collect(),
+        &PathRoots::union(&old.path_roots, &new.path_roots),
+        &|_| false,
+    )
+}
+
+/// root 自由関数の移動と const 追加を、両ファイルの宣言と型の所有元で証明する。
+pub(crate) struct MovedRustConstAdditions {
+    old: MovedConstFile,
+    new: MovedConstFile,
+}
+
+struct MovedConstFile {
+    index: TypeAliasIndex,
+    items: RustFileItems,
+    functions: HashMap<String, (RustConstQualifier, CanonicalSignature)>,
+}
+
+impl MovedConstFile {
+    fn new(root: Node<'_>, source: &[u8]) -> Option<Self> {
+        let mut functions = HashMap::new();
+        let mut cursor = root.walk();
+        for function in root.named_children(&mut cursor) {
+            if function.kind() != "function_item"
+                || function
+                    .child_by_field_name("return_type")
+                    .is_some_and(|ty| {
+                        any_node(ty, Children::Named, |node| node.kind() == "abstract_type")
+                    })
+            {
+                continue;
+            }
+            let Some(qualifier) = rust_const_qualifier(function, source) else {
+                continue;
+            };
+            let body = function.child_by_field_name("body")?;
+            let header =
+                std::str::from_utf8(source.get(function.start_byte()..body.start_byte())?).ok()?;
+            let Some(contract) = canonicalize_signature(header, &TypeAliasIndex::default()) else {
+                continue;
+            };
+            functions.insert(contract.function_name.clone(), (qualifier, contract));
+        }
+        Some(Self {
+            index: TypeAliasIndex::from_root(root, source)?,
+            items: RustFileItems::new(root, source)?,
+            functions,
+        })
+    }
+}
+
+impl MovedRustConstAdditions {
+    pub(crate) fn new(old: (Node<'_>, &[u8]), new: (Node<'_>, &[u8])) -> Option<Self> {
+        Some(Self {
+            old: MovedConstFile::new(old.0, old.1)?,
+            new: MovedConstFile::new(new.0, new.1)?,
+        })
+    }
+
+    pub(crate) fn proves(&self, name: &str) -> bool {
+        let name = rust_name_key(name);
+        if self.old.index.function_counts.get(name) != Some(&1)
+            || self.new.index.function_counts.get(name) != Some(&1)
+            || self.old.index.imports != self.new.index.imports
+        {
+            return false;
+        }
+        let (Some((old_qualifier, old)), Some((new_qualifier, new))) =
+            (self.old.functions.get(name), self.new.functions.get(name))
+        else {
+            return false;
+        };
+        if !new_qualifier.only_adds_const_to(&self.new.items, old_qualifier, &self.old.items) {
+            return false;
+        }
+        let names = old.names.union(&new.names).cloned().collect();
+        resolves_alike_across_files(
+            &self.old.index,
+            &self.new.index,
+            &names,
+            &PathRoots::union(&old.path_roots, &new.path_roots),
+            &|_| false,
+        )
     }
 }
 
@@ -315,7 +738,7 @@ fn collect_function_counts(
             && let Some(name) = node.child_by_field_name("name")
         {
             *counts
-                .entry(name.utf8_text(source).ok()?.to_string())
+                .entry(rust_name_key(name.utf8_text(source).ok()?).to_string())
                 .or_default() += 1;
         }
         let mut cursor = node.walk();
@@ -325,12 +748,15 @@ fn collect_function_counts(
     Some(())
 }
 
+#[derive(Default)]
 struct CanonicalSignature {
     tokens: String,
     expanded_alias: bool,
     expanded_alias_names: HashSet<String>,
     function_name: String,
     names: HashSet<String>,
+    /// 移動の組の検査 ([`resolves_alike_across_files`]) だけが使う。
+    path_roots: PathRoots,
 }
 
 fn canonicalize_signature(signature: &str, aliases: &TypeAliasIndex) -> Option<CanonicalSignature> {
@@ -340,11 +766,13 @@ fn canonicalize_signature(signature: &str, aliases: &TypeAliasIndex) -> Option<C
         return None;
     }
     let function = find_function_node(tree.root_node())?;
-    let function_name = function
-        .child_by_field_name("name")?
-        .utf8_text(&source)
-        .ok()?
-        .to_string();
+    let function_name = rust_name_key(
+        function
+            .child_by_field_name("name")?
+            .utf8_text(&source)
+            .ok()?,
+    )
+    .to_string();
     let mut shadowed = HashSet::new();
     if let Some(type_parameters) = direct_named_child(function, "type_parameters") {
         collect_type_identifiers(type_parameters, &source, &mut shadowed)?;
@@ -356,11 +784,8 @@ fn canonicalize_signature(signature: &str, aliases: &TypeAliasIndex) -> Option<C
         .unwrap_or(original_len)
         .min(original_len);
     let mut canonical = CanonicalSignature {
-        tokens: String::new(),
-        expanded_alias: false,
-        expanded_alias_names: HashSet::new(),
         function_name,
-        names: HashSet::new(),
+        ..CanonicalSignature::default()
     };
     let mut stack = Vec::new();
     canonicalize_node(
@@ -444,13 +869,36 @@ fn canonicalize_visit(
             return None;
         }
     }
-    if matches!(node.kind(), "identifier" | "type_identifier") {
+    // primitive_type も同名の type や use で隠せる。
+    if matches!(
+        node.kind(),
+        "identifier" | "type_identifier" | "primitive_type"
+    ) {
         canonical
             .names
-            .insert(node.utf8_text(source).ok()?.to_string());
+            .insert(rust_name_key(node.utf8_text(source).ok()?).to_string());
+    }
+    // パスの先頭は、鎖の外側の 1 か所 (親が修飾パスでない位置) でだけ数える。
+    if matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier")
+        && !parent.is_some_and(|parent| {
+            matches!(
+                parent.kind(),
+                "scoped_identifier" | "scoped_type_identifier"
+            )
+        })
+    {
+        match path_segments(node, source).and_then(|segments| segments.into_iter().next()) {
+            Some(root) => {
+                canonical.path_roots.names.insert(root);
+            }
+            None => canonical.path_roots.unsupported = true,
+        }
+    }
+    if node.kind() == "macro_invocation" {
+        canonical.path_roots.unsupported = true;
     }
     if node.kind() == "type_identifier" {
-        let name = node.utf8_text(source).ok()?;
+        let name = rust_name_key(node.utf8_text(source).ok()?);
         if aliases.blocked.contains(name) {
             return None;
         }
@@ -522,13 +970,7 @@ fn contains_unsupported_alias_type(node: Node<'_>) -> bool {
 }
 
 fn canonical_token_stream(node: Node<'_>, source: &[u8]) -> Option<String> {
-    let mut canonical = CanonicalSignature {
-        tokens: String::new(),
-        expanded_alias: false,
-        expanded_alias_names: HashSet::new(),
-        function_name: String::new(),
-        names: HashSet::new(),
-    };
+    let mut canonical = CanonicalSignature::default();
     canonicalize_node(
         node,
         source,
@@ -551,7 +993,7 @@ fn collect_type_identifiers(
             let Ok(name) = node.utf8_text(source) else {
                 return ControlFlow::Break(());
             };
-            names.insert(name.to_string());
+            names.insert(rust_name_key(name).to_string());
         }
         ControlFlow::Continue(Walk::Descend)
     });
@@ -1064,14 +1506,499 @@ mod tests {
         ));
     }
 
+    /// 旧新のどちらにも alias が無ければ証明の文脈を作らない。片側にあれば作る。
     #[test]
-    fn new_source_without_candidate_alias_skips_preparation() {
-        assert!(
-            RustTypeAliasEquivalence::prepare_new_source(
-                b"pub fn collect() -> Vec<(u64, String)> { vec![] }"
+    fn sources_without_candidate_alias_skip_the_proof() {
+        let plain: &[u8] = b"pub fn collect() -> Vec<(u64, String)> { vec![] }";
+        let aliased: &[u8] =
+            b"pub type Entry = (u64, String);\npub fn collect() -> Vec<Entry> { vec![] }";
+        let context = |old: &[u8], new: &[u8]| {
+            RustTypeAliasEquivalence::prepare_new_source(new)
+                .and_then(|prepared| prepared.with_old_source(old))
+        };
+        assert!(context(plain, plain).is_none());
+        for (old, new) in [(plain, aliased), (aliased, plain)] {
+            assert!(
+                context(old, new).is_some_and(|context| context.prove_function("collect")),
+                "{} -> {}",
+                String::from_utf8_lossy(old),
+                String::from_utf8_lossy(new)
+            );
+        }
+    }
+
+    /// 旧側で使っていた alias を展開した形に戻す変更も、導入と同じく同じ型を表す。
+    #[test]
+    fn alias_expansion_on_the_old_side_is_equivalent() {
+        let old = b"pub type Entry = (u64, String);\npub fn collect() -> Vec<Entry> { vec![] }";
+        for new in [
+            "pub type Entry = (u64, String);\npub fn collect() -> Vec<(u64, String)> { vec![] }",
+            "pub fn collect() -> Vec<(u64, String)> { vec![] }",
+            "pub type Item = (u64, String);\npub fn collect() -> Vec<Item> { vec![] }",
+        ] {
+            let context =
+                RustTypeAliasEquivalence::new(old, new.as_bytes()).expect("valid Rust sources");
+            assert!(context.prove_function("collect"), "{new}");
+        }
+    }
+
+    /// 旧側の alias の右辺が別の型を指すことになる変更は、展開でも証明しない。
+    #[test]
+    fn alias_expansion_on_the_old_side_fails_closed() {
+        for (label, old, new) in [
+            (
+                "展開した形の型が違う",
+                "pub type Entry = (u64, String);\npub fn collect() -> Vec<Entry> { vec![] }",
+                "pub fn collect() -> Vec<(u32, String)> { vec![] }",
+            ),
+            (
+                "右辺の名前の root 束縛が変わる",
+                "pub struct Id;\npub type Entry = (Id, String);\npub fn collect() -> Vec<Entry> { vec![] }",
+                "pub struct Id(u8);\npub fn collect() -> Vec<(Id, String)> { vec![] }",
+            ),
+            (
+                "右辺の名前の import が変わる",
+                "use a::Id;\npub type Entry = (Id, String);\npub fn collect() -> Vec<Entry> { vec![] }",
+                "use b::Id;\npub fn collect() -> Vec<(Id, String)> { vec![] }",
+            ),
+            (
+                "generic な alias",
+                "pub type Entry<T> = (T, String);\npub fn collect() -> Vec<Entry<u64>> { vec![] }",
+                "pub fn collect() -> Vec<(u64, String)> { vec![] }",
+            ),
+            (
+                "非公開の alias",
+                "type Entry = (u64, String);\npub fn collect() -> Vec<Entry> { vec![] }",
+                "pub fn collect() -> Vec<(u64, String)> { vec![] }",
+            ),
+        ] {
+            let context = RustTypeAliasEquivalence::new(old.as_bytes(), new.as_bytes())
+                .expect("valid Rust sources");
+            assert!(!context.prove_function("collect"), "{label}");
+        }
+    }
+
+    /// 移動 (旧新が別のファイル) の別名の証明は、ヘッダと別名の右辺の名前がどちらのファイルでも
+    /// 同じものを指すことも求める。同じファイルの旧新なら同じものを指す字面 (root の宣言・
+    /// `crate::` の import・glob) は、別のファイルでは別のものを指し得る。
+    #[test]
+    fn moved_alias_proof_requires_names_that_resolve_alike() {
+        let context = |old: &str, new: &str| {
+            RustTypeAliasEquivalence::new(old.as_bytes(), new.as_bytes())
+                .expect("valid Rust sources")
+        };
+        let expanded = "use std::collections::HashMap;\npub fn count(m: &HashMap<String, String>) -> usize { 0 }";
+        let aliased = "use std::collections::HashMap;\npub type Tags = HashMap<String, String>;\npub fn count(m: &Tags) -> usize { 0 }";
+        for (old, new) in [
+            (expanded, aliased),
+            (aliased, expanded),
+            (
+                "pub fn count(m: &::std::collections::HashMap<u8, u8>) -> usize { 0 }",
+                "pub type Tags = ::std::collections::HashMap<u8, u8>;\npub fn count(m: &Tags) -> usize { 0 }",
+            ),
+            (
+                "pub fn count(x: (u8, u16)) -> usize { 0 }",
+                "pub type Pair = (u8, u16);\npub fn count(x: Pair) -> usize { 0 }",
+            ),
+        ] {
+            assert!(
+                context(old, new).prove_moved_function("count"),
+                "{old} -> {new}"
+            );
+        }
+        // 同じファイルの旧新なら証明できるが、別のファイルでは名前が別のものを指し得る。
+        for (label, old, new) in [
+            (
+                "字面が同じ root の型",
+                "pub struct Marks;\npub fn count(_: &Marks) -> usize { 0 }",
+                "pub struct Marks;\npub type Tags = Marks;\npub fn count(_: &Tags) -> usize { 0 }",
+            ),
+            (
+                "crate 起点の use",
+                "use crate::types::Map;\npub fn count(_: &Map) -> usize { 0 }",
+                "use crate::types::Map;\npub type Tags = Map;\npub fn count(_: &Tags) -> usize { 0 }",
+            ),
+            (
+                "super 起点のパス",
+                "pub fn count(_: &super::Map) -> usize { 0 }",
+                "pub type Tags = super::Map;\npub fn count(_: &Tags) -> usize { 0 }",
+            ),
+            (
+                "子モジュール名で始まるパス",
+                "pub fn count(_: &types::Map) -> usize { 0 }",
+                "pub type Tags = types::Map;\npub fn count(_: &Tags) -> usize { 0 }",
+            ),
+            (
+                "std からの glob",
+                "use std::fmt::*;\npub fn count(_: Option<Error>) -> usize { 0 }",
+                "use std::fmt::*;\npub type Failure = Option<Error>;\npub fn count(_: Failure) -> usize { 0 }",
+            ),
+            (
+                "std を root で束縛し直す",
+                "pub mod std {}\npub fn count(_: &::std::string::String) -> usize { 0 }",
+                "pub mod std {}\npub type Text = ::std::string::String;\npub fn count(_: &Text) -> usize { 0 }",
+            ),
+            (
+                "名前を生成し得る属性",
+                "#[my_macro]\npub struct Other;\npub fn count(_: String) -> usize { 0 }",
+                "#[my_macro]\npub struct Other;\npub type Text = String;\npub fn count(_: Text) -> usize { 0 }",
+            ),
+            (
+                "std 以外の derive",
+                "#[derive(Serialize)]\npub struct Other;\npub fn count(_: String) -> usize { 0 }",
+                "#[derive(Serialize)]\npub struct Other;\npub type Text = String;\npub fn count(_: Text) -> usize { 0 }",
+            ),
+            (
+                "型の中のマクロ",
+                "pub fn count(_: u8, _: ty!()) -> usize { 0 }",
+                "pub type Byte = u8;\npub fn count(_: Byte, _: ty!()) -> usize { 0 }",
+            ),
+        ] {
+            let context = context(old, new);
+            assert!(
+                context.prove_function("count"),
+                "{label}: 移さない変更なら証明できる"
+            );
+            assert!(!context.prove_moved_function("count"), "{label}");
+        }
+    }
+
+    #[test]
+    fn moved_alias_proof_rejects_names_with_unresolved_nfc_bindings() {
+        // Kelvin sign は Rust では ASCII の K と同じ名前になる。
+        let old = "pub struct K(u8);\npub fn count(_: K) -> usize { 0 }";
+        let new = "pub struct K(u16);\npub type Key = K;\npub fn count(_: Key) -> usize { 0 }";
+        let context = RustTypeAliasEquivalence::new(old.as_bytes(), new.as_bytes()).unwrap();
+        assert!(!context.prove_moved_function("count"));
+    }
+
+    #[test]
+    fn moved_alias_proof_rejects_shadowed_standard_import_roots() {
+        for root in STD_ROOTS {
+            let module = format!("pub mod {root} {{ pub mod types {{ pub struct Id; }} }}\n");
+            for binding in [format!("mod {root}"), format!("mod r#{root}")] {
+                let module = module.replace(&format!("mod {root}"), &binding);
+                let old = format!("{module}use {root}::types::Id;\npub fn take(_: Id) {{}}");
+                let new = format!(
+                    "{module}use {root}::types::Id;\npub type Value = Id;\npub fn take(_: Value) {{}}"
+                );
+                for (old, new) in [(&old, &new), (&new, &old)] {
+                    let context =
+                        RustTypeAliasEquivalence::new(old.as_bytes(), new.as_bytes()).unwrap();
+                    assert!(
+                        !context.prove_moved_function("take"),
+                        "{binding}: {old} -> {new}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn moved_constant_proof_rejects_shadowed_standard_import_roots() {
+        for root in STD_ROOTS {
+            for binding in [format!("mod {root}"), format!("mod r#{root}")] {
+                let prefix = format!(
+                    "pub {binding} {{ pub mod types {{ pub struct Id; }} }}\nuse {root}::types::Id;\n"
+                );
+                let old = format!("{prefix}pub const WEEK: Option<Id> = None;");
+                let new = format!("{prefix}pub const WEEK: Option<Id> = Some(Id);");
+                let old_tree = parser::parse_source(old.as_bytes(), LangId::Rust).unwrap();
+                let new_tree = parser::parse_source(new.as_bytes(), LangId::Rust).unwrap();
+                assert!(
+                    !moved_constant_type_resolves_alike(
+                        (old_tree.root_node(), old.as_bytes()),
+                        (new_tree.root_node(), new.as_bytes()),
+                        "WEEK",
+                    ),
+                    "{binding}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn moved_proof_rejects_shadowed_primitives() {
+        for declaration in ["pub type u8 = u16;", "pub type r#u8 = u16;"] {
+            let old = "pub const WEEK: u8 = 1;";
+            let new = format!("{declaration}\npub const WEEK: u8 = 1 + 0;");
+            let old_tree = parser::parse_source(old.as_bytes(), LangId::Rust).unwrap();
+            let new_tree = parser::parse_source(new.as_bytes(), LangId::Rust).unwrap();
+            assert!(!moved_constant_type_resolves_alike(
+                (old_tree.root_node(), old.as_bytes()),
+                (new_tree.root_node(), new.as_bytes()),
+                "WEEK",
+            ));
+            let old = "pub fn take(_: u8) {}";
+            let new = format!("{declaration}\npub type Value = u8;\npub fn take(_: Value) {{}}");
+            let context = RustTypeAliasEquivalence::new(old.as_bytes(), new.as_bytes()).unwrap();
+            assert!(!context.prove_moved_function("take"), "{declaration}");
+        }
+    }
+
+    #[test]
+    fn moved_proof_normalizes_raw_binding_names() {
+        for prefix in [
+            "pub struct Day;",
+            "pub struct r#Day;",
+            "use crate::types::Day as r#Day;",
+            "use crate::types::Day;",
+        ] {
+            for name in ["Day", "r#Day"] {
+                let old = format!("{prefix}\npub const WEEK: Option<{name}> = None;");
+                let new = format!("{prefix}\npub const WEEK: Option<{name}> = None::<{name}>;");
+                let old_tree = parser::parse_source(old.as_bytes(), LangId::Rust).unwrap();
+                let new_tree = parser::parse_source(new.as_bytes(), LangId::Rust).unwrap();
+                assert!(
+                    !moved_constant_type_resolves_alike(
+                        (old_tree.root_node(), old.as_bytes()),
+                        (new_tree.root_node(), new.as_bytes()),
+                        "WEEK",
+                    ),
+                    "{prefix}: {name}"
+                );
+                let old = format!("{prefix}\npub fn take(_: Option<{name}>) {{}}");
+                let new = format!(
+                    "{prefix}\npub type Value = Option<{name}>;\npub fn take(_: Value) {{}}"
+                );
+                let context =
+                    RustTypeAliasEquivalence::new(old.as_bytes(), new.as_bytes()).unwrap();
+                assert!(!context.prove_moved_function("take"), "{prefix}: {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn moved_proof_preserves_transparent_raw_aliases() {
+        for declaration in ["Value", "r#Value"] {
+            for usage in ["Value", "r#Value"] {
+                let prefix = "use std::num::NonZeroU8 as r#Number;\n";
+                let old = format!("{prefix}pub fn take(_: Option<Number>) {{}}");
+                let new = format!(
+                    "{prefix}pub type {declaration} = Option<Number>;\npub fn take(_: {usage}) {{}}"
+                );
+                let context =
+                    RustTypeAliasEquivalence::new(old.as_bytes(), new.as_bytes()).unwrap();
+                assert!(context.prove_function("take"), "{declaration}: {usage}");
+                assert!(
+                    context.prove_moved_function("take"),
+                    "{declaration}: {usage}"
+                );
+            }
+        }
+    }
+
+    fn moved_const_addition_is_proven(old: &str, new: &str) -> bool {
+        let old_tree = parser::parse_source(old.as_bytes(), LangId::Rust).unwrap();
+        let new_tree = parser::parse_source(new.as_bytes(), LangId::Rust).unwrap();
+        MovedRustConstAdditions::new(
+            (old_tree.root_node(), old.as_bytes()),
+            (new_tree.root_node(), new.as_bytes()),
+        )
+        .is_some_and(|context| context.proves("f"))
+    }
+
+    #[test]
+    fn moved_const_addition_proves_explicit_contracts() {
+        for (old, new) in [
+            (
+                "pub fn f(x: u8) -> u8 { x }",
+                "pub const fn f(x: u8) -> u8 { x + 1 }",
+            ),
+            (
+                "#[inline]\npub fn f(x: u8) -> u8 { x }",
+                "#[inline]\npub const fn f(x: u8) -> u8 { x }",
+            ),
+            (
+                "pub fn f<T: Copy>(x: T) -> T { x }",
+                "pub const fn f<T: Copy>(x: T) -> T { x }",
+            ),
+            (
+                "pub fn f(x: [u8; 4]) -> [u8; 4] { x }",
+                "pub const fn f(x: [u8; 4]) -> [u8; 4] { x }",
+            ),
+            (
+                "use core::num::NonZeroU8;\npub fn f(_: Option<NonZeroU8>) {}",
+                "use core::num::NonZeroU8;\npub const fn f(_: Option<NonZeroU8>) {}",
+            ),
+            (
+                "type Other = u8;\npub fn f() -> u8 { 0 }",
+                "type Other = u16;\npub const fn f() -> u8 { 1 }",
+            ),
+            (
+                "pub fn f(x: u8) -> u8 { assert!(x > 0); x }",
+                "pub const fn f(x: u8) -> u8 { assert!(x > 0); x }",
+            ),
+        ] {
+            assert!(moved_const_addition_is_proven(old, new), "{old} -> {new}");
+        }
+    }
+
+    #[test]
+    fn moved_const_addition_requires_file_and_owner_proofs() {
+        for (old, new) in [
+            (
+                "pub const fn f(x: u8) -> u8 { x }",
+                "pub fn f(x: u8) -> u8 { x }",
+            ),
+            ("pub fn f(x: u8) {}", "pub const fn f(x: u16) {}"),
+            (
+                "pub fn f() -> u8 { 0 }",
+                "pub const unsafe fn f() -> u8 { 0 }",
+            ),
+            (
+                "pub fn f() -> u8 { 0 }",
+                "#[inline]\npub const fn f() -> u8 { 0 }",
+            ),
+            (
+                "pub struct Id;\npub fn f(_: Id) {}",
+                "pub struct Id;\npub const fn f(_: Id) {}",
+            ),
+            (
+                "pub struct r#Id;\npub fn f(_: Id) {}",
+                "pub struct r#Id;\npub const fn f(_: Id) {}",
+            ),
+            (
+                "use crate::types::Id as r#Arg;\npub fn f(_: Arg) {}",
+                "use crate::types::Id as r#Arg;\npub const fn f(_: Arg) {}",
+            ),
+            (
+                "pub type u8 = u16;\npub fn f(_: u8) {}",
+                "pub type u8 = u16;\npub const fn f(_: u8) {}",
+            ),
+            (
+                "pub mod r#std { pub mod fmt { pub struct Error; } }\nuse std::fmt::Error;\npub fn f(_: Error) {}",
+                "pub mod r#std { pub mod fmt { pub struct Error; } }\nuse std::fmt::Error;\npub const fn f(_: Error) {}",
+            ),
+            (
+                "use crate::other::*;\npub fn f(_: u8) {}",
+                "use crate::other::*;\npub const fn f(_: u8) {}",
+            ),
+            (
+                "pub struct Other;\npub fn f() -> u8 { 0 }",
+                "pub struct Other;\nimpl Other {}\npub const fn f() -> u8 { 0 }",
+            ),
+            (
+                "pub fn f() -> impl Copy { 0u8 }",
+                "pub const fn f() -> impl Copy { 0u8 }",
+            ),
+            (
+                "pub fn f() {}",
+                "pub const fn f() {}\nmod other { pub fn f() {} }",
+            ),
+        ] {
+            assert!(!moved_const_addition_is_proven(old, new), "{old} -> {new}");
+        }
+    }
+
+    /// root のマクロ呼び出しがある側は、展開する側でもしない側でも証明しない。旧側だけにある
+    /// 変更 (今の新側で展開する向き) も含む。
+    #[test]
+    fn ambiguous_root_scope_on_either_side_blocks_alias_proof() {
+        for (old, new) in [
+            (
+                "local_string!();\npub fn count(_: &String) -> usize { 0 }",
+                "pub type Tags = String;\npub fn count(_: &Tags) -> usize { 0 }",
+            ),
+            (
+                "pub type Tags = String;\npub fn count(_: &Tags) -> usize { 0 }",
+                "local_string!();\npub fn count(_: &String) -> usize { 0 }",
+            ),
+        ] {
+            let context = RustTypeAliasEquivalence::new(old.as_bytes(), new.as_bytes())
+                .expect("valid Rust sources");
+            assert!(!context.prove_function("count"), "{old} -> {new}");
+            assert!(!context.prove_moved_function("count"), "{old} -> {new}");
+        }
+    }
+
+    /// 移動する定数の型に現れる名前も、どちらのファイルでも同じものを指すことを求める。
+    #[test]
+    fn moved_constant_type_requires_names_that_resolve_alike() {
+        let resolves = |old: &str, new: &str| {
+            let old_tree = parser::parse_source(old.as_bytes(), LangId::Rust).expect("parse");
+            let new_tree = parser::parse_source(new.as_bytes(), LangId::Rust).expect("parse");
+            moved_constant_type_resolves_alike(
+                (old_tree.root_node(), old.as_bytes()),
+                (new_tree.root_node(), new.as_bytes()),
+                "WEEK",
             )
-            .is_none()
-        );
+        };
+        for (old, new) in [
+            (
+                "pub const WEEK: [(&str, u8); 2] = [(\"Mon\", 1), (\"Tue\", 2)];",
+                "const NAMES: [&str; 2] = [\"Mon\", \"Tue\"];\npub const WEEK: [(&str, u8); 2] = [(NAMES[0], 1), (NAMES[1], 2)];",
+            ),
+            (
+                "use std::num::NonZeroU8;\npub const WEEK: Option<NonZeroU8> = None;",
+                "use std::num::NonZeroU8;\n#[derive(Debug)]\npub struct Other;\npub const WEEK: Option<NonZeroU8> = NonZeroU8::new(1);",
+            ),
+            (
+                "pub static WEEK: &str = \"a\";",
+                "pub struct Other;\npub static WEEK: &str = \"b\";",
+            ),
+        ] {
+            assert!(resolves(old, new), "{old} -> {new}");
+        }
+        for (label, old, new) in [
+            (
+                "primitive を隠し得る glob と属性",
+                "pub static WEEK: &str = \"a\";",
+                "use crate::other::*;\n#[my_macro]\npub struct Other;\npub static WEEK: &str = \"b\";",
+            ),
+            (
+                "字面が同じ root の型",
+                "pub struct Day;\npub const WEEK: Day = Day;",
+                "pub struct Day;\npub const WEEK: Day = Day;",
+            ),
+            (
+                "std からの別の glob で持ち込む名前",
+                "use std::fmt::*;\npub const WEEK: Option<Error> = None;",
+                "use std::io::*;\npub const WEEK: Option<Error> = None;",
+            ),
+            (
+                "同じ名前で import した std の別の型",
+                "use std::fmt::Error;\npub const WEEK: Option<Error> = None;",
+                "use std::io::Error;\npub const WEEK: Option<Error> = None;",
+            ),
+            (
+                "crate 起点の use",
+                "use crate::day::Day;\npub const WEEK: Option<Day> = None;",
+                "use crate::day::Day;\npub const WEEK: Option<Day> = None;",
+            ),
+            (
+                "値の評価が要る配列長",
+                "const fn width() -> usize { 1 }\npub const WEEK: [u8; width()] = [1; width()];",
+                "const fn width() -> usize { 2 }\npub const WEEK: [u8; width()] = [2; width()];",
+            ),
+            (
+                "定数の配列長",
+                "const N: usize = 2;\npub const WEEK: [u8; N] = [1, 2];",
+                "const N: usize = 2;\npub const WEEK: [u8; N] = [2, 1];",
+            ),
+            (
+                "型の中のマクロ",
+                "pub const WEEK: ty!() = 1;",
+                "pub const WEEK: ty!() = 2;",
+            ),
+            (
+                "root のマクロ呼び出し",
+                "pub const WEEK: Option<u8> = None;",
+                "local_option!();\npub const WEEK: Option<u8> = Some(1);",
+            ),
+            (
+                "名前を生成し得る属性",
+                "pub const WEEK: Option<u8> = None;",
+                "#[my_macro]\npub struct Other;\npub const WEEK: Option<u8> = Some(1);",
+            ),
+            (
+                "同じ名前の定数が 2 件",
+                "pub const WEEK: u8 = 1;",
+                "#[cfg(unix)]\npub const WEEK: u8 = 2;\n#[cfg(not(unix))]\npub const WEEK: u8 = 3;",
+            ),
+        ] {
+            assert!(!resolves(old, new), "{label}");
+        }
     }
 
     #[test]
@@ -1289,13 +2216,16 @@ mod tests {
                 return None;
             }
         }
-        if matches!(node.kind(), "identifier" | "type_identifier") {
+        if matches!(
+            node.kind(),
+            "identifier" | "type_identifier" | "primitive_type"
+        ) {
             canonical
                 .names
-                .insert(node.utf8_text(source).ok()?.to_string());
+                .insert(rust_name_key(node.utf8_text(source).ok()?).to_string());
         }
         if node.kind() == "type_identifier" {
-            let name = node.utf8_text(source).ok()?;
+            let name = rust_name_key(node.utf8_text(source).ok()?);
             if aliases.blocked.contains(name) {
                 return None;
             }
@@ -1367,7 +2297,7 @@ mod tests {
         names: &mut HashSet<String>,
     ) -> Option<()> {
         if node.kind() == "type_identifier" {
-            names.insert(node.utf8_text(source).ok()?.to_string());
+            names.insert(rust_name_key(node.utf8_text(source).ok()?).to_string());
         }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
@@ -1411,13 +2341,7 @@ mod tests {
     }
 
     fn empty_canonical() -> CanonicalSignature {
-        CanonicalSignature {
-            tokens: String::new(),
-            expanded_alias: false,
-            expanded_alias_names: HashSet::new(),
-            function_name: String::new(),
-            names: HashSet::new(),
-        }
+        CanonicalSignature::default()
     }
 
     /// 反復に書き換えた正規化・別名の検査・型名の収集・関数の探索が、浅い入力で修正前の

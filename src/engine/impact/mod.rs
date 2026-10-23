@@ -13,7 +13,7 @@ pub(crate) mod rust_cargo_reachability;
 mod rust_impl_owner;
 mod rust_path_owner;
 mod rust_reexport_owner;
-mod rust_std_origin;
+pub(crate) mod rust_std_origin;
 mod rust_visibility_scope;
 mod signature;
 pub(crate) mod test_context;

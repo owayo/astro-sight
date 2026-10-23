@@ -110,12 +110,12 @@ pub(crate) struct ModifiedFileFacts<'a> {
 /// シグネチャ変更 1 件を分類するための現場情報。
 pub(crate) struct SignatureChangeSite<'a> {
     pub(crate) change: ApiSymbolChange,
-    /// 旧版を読むパス (base 側)。rename なら旧パス、型の移動と同じ差分でシグネチャの
-    /// 変わったメンバーなら移動元。
+    /// 旧版を読むパス (base 側)。rename なら旧パス、移動と同じ差分でシグネチャの
+    /// 変わった宣言 (型のメンバー・自由関数・定数) なら移動元。
     pub(crate) old_path: &'a str,
     /// 新版を読むパス (作業ツリー側)。呼び出し側の追随を確かめる定義もここで探す。
     pub(crate) new_path: &'a str,
-    /// 型の移動と同じ差分でシグネチャの変わったメンバーなら移動元 (`old_path` と同じ)。
+    /// 移動と同じ差分でシグネチャの変わった宣言なら移動元 (`old_path` と同じ)。
     /// 移動先の行のうち移動元にもある行を、呼び出し側の追随の証拠にしない。
     pub(crate) moved_from: Option<&'a str>,
     pub(crate) kind: &'a str,
