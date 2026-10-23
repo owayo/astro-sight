@@ -518,6 +518,10 @@ pub(crate) struct ModifiedClosureInput<'a> {
     /// 新旧とも一意な直接関数宣言で、今回の非依存用途の証拠を使える。
     pub(crate) js_direct_function_change: bool,
     pub(super) rust_module_function_change: Option<super::rust_ref_sites::ModuleFunctionProof>,
+    /// 型の移動と同じ差分でシグネチャの変わったメンバーの移動元。移動先 (`target_new_path`)
+    /// の行のうち移動元にも同じ行があるものは持ち込んだだけの行なので、追随の証拠にしない
+    /// (rename として渡る差分では、それらは未変更の行になる)。
+    pub(crate) moved_from: Option<&'a str>,
 }
 
 /// modified シンボルの全 cross-file 参照が同一 diff 内の変更 hunk で追随済みかを判定する。
@@ -973,12 +977,30 @@ fn prove_reference_updated(
     };
     // HunkInfo の new 範囲は context 行を含むため、git diff から実 `+` 行集合を取得して照合する
     // (codex 指摘: context 行に古い呼び出しが入ると未更新 caller を誤って closed 判定してしまう)。
-    let changed = std::rc::Rc::clone(
+    let mut changed = std::rc::Rc::clone(
         caches
             .changed_new_lines
             .entry(df.new_path.clone())
             .or_insert_with(|| std::rc::Rc::new(changed_new_lines_for_diff_file(dir, base, df))),
     );
+    if let Some(moved_from) = input.moved_from
+        && diff_path_matches_ref(target_new_path, &r.path, dir)
+    {
+        // 移動先は削除と追加として渡ると全行が追加行になる。移動元から持ち込んだだけの
+        // 未更新の呼び出しを追随済みと数えないよう、移動元に無い行だけを残す
+        // (読めなければ空集合 = 追随の証拠にしない)。
+        changed = std::rc::Rc::clone(
+            caches
+                .moved_member_changed_lines
+                .entry((moved_from.to_owned(), target_new_path.to_owned()))
+                .or_insert_with(|| {
+                    let carried =
+                        untracked_rename_added_lines(dir, base, moved_from, target_new_path)
+                            .unwrap_or_default();
+                    std::rc::Rc::new(changed.intersection(&carried).copied().collect())
+                }),
+        );
+    }
     if changed.contains(&r.line) {
         return true;
     }
@@ -1472,6 +1494,10 @@ pub(crate) struct ApiClosureCaches {
     /// JSDoc と文字列で書いた名前を調べる、tsc が型検査するファイルの一覧。外 `None` = 未取得、
     /// 内 `None` = 取得失敗。
     pub(super) ts_checked_files: Option<Option<std::rc::Rc<Vec<std::path::PathBuf>>>>,
+    /// (移動元, 移動先) → 移動先の変更行のうち、移動元に同じ行が無いもの
+    /// (`ModifiedClosureInput::moved_from`)。
+    moved_member_changed_lines:
+        std::collections::HashMap<(String, String), std::rc::Rc<std::collections::HashSet<usize>>>,
 }
 
 /// 参照行が named export clause (`export { X }` / `export type { X }`) かを判定する。

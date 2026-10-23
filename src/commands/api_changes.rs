@@ -243,6 +243,10 @@ pub(crate) fn detect_api_changes(
             new_export_surface_names,
         });
     }
+    // 型の移動と同じ差分でシグネチャの変わったメンバーは、削除と追加に割れた後で変更として
+    // 判定し直す (`pair_moved_member_changes`)。その名前も検索対象に入れておく。
+    let member_files = MemberFileFacts::new(diff_files, &prepared);
+    member_files.collect_index_names(&mut index_names);
     let ref_index = ApiRefIndex::build(dir, &index_names);
     let old_ref_index = std::cell::OnceCell::new();
 
@@ -329,12 +333,42 @@ pub(crate) fn detect_api_changes(
     // `is_used_in_diff_paths` 等で `added` から外れた候補も含まれるため、module → package
     // 化のように新規ファイル側のシンボルが同 diff 内の `__init__.py` 等から参照されて
     // `added` に乗らないケースでも `removed` を相殺できる。
-    let (verified_removed, unverified_removed): (Vec<_>, Vec<_>) = buckets
-        .removed
-        .into_iter()
-        .partition(|candidate| !unverified_deleted_paths.contains(&candidate.file));
-    let (added, removed, moved, ambiguous_relation_keys) =
-        reconcile_with_moves(buckets.added, verified_removed, buckets.all_new_candidates);
+    let all_new_candidates = std::mem::take(&mut state.buckets.all_new_candidates);
+    let (verified_removed, unverified_removed): (Vec<_>, Vec<_>) =
+        std::mem::take(&mut state.buckets.removed)
+            .into_iter()
+            .partition(|candidate| !unverified_deleted_paths.contains(&candidate.file));
+    let (added, removed, moved, ambiguous_relation_keys) = reconcile_with_moves(
+        std::mem::take(&mut state.buckets.added),
+        verified_removed,
+        all_new_candidates.clone(),
+    );
+
+    // 型の移動と同じ差分でシグネチャの変わったメンバーは、厳密一致の move に乗らず削除と
+    // 追加に割れる。git が rename として渡す差分と同じ判定にするため、移動元と移動先の組を
+    // 変更ファイルと同じ規則で判定する (Issue #109)。
+    let mut member_bindings: std::collections::HashMap<(Side, String, String, String), bool> =
+        std::collections::HashMap::new();
+    let (added, removed, moved_member_changes) = pair_moved_member_changes(
+        &moved,
+        added,
+        removed,
+        &all_new_candidates,
+        &ambiguous_relation_keys,
+        &member_files,
+        &mut |side, path, owner, member| {
+            *member_bindings
+                .entry((side, path.to_owned(), owner.to_owned(), member.to_owned()))
+                .or_insert_with(|| match side {
+                    Side::Old => base_blobs
+                        .read(path)
+                        .is_some_and(|source| proves_member_binding(path, &source, owner, member)),
+                    Side::New => load_new_source(dir, path)
+                        .is_some_and(|source| proves_member_binding(path, &source, owner, member)),
+                })
+        },
+    );
+    process_moved_member_changes(&inputs, &mut state, &moved_member_changes);
 
     // removed のうち HEAD ツリーで他ファイル参照 0 件のものを `removed_dead` に振り分け。
     // 「base 時点で dead だった symbol の整理」だけでなく「base alive → HEAD で関連
@@ -621,6 +655,7 @@ mod js_public_name;
 mod js_ref_sites;
 mod js_ts_call_arity;
 mod js_ts_shadow;
+mod moved_members;
 pub(crate) mod prepare;
 pub(crate) mod removed;
 pub(crate) mod signature;
@@ -661,6 +696,9 @@ pub(crate) use diff_processing::*;
 pub(crate) use exported::*;
 pub(crate) use impact_compatibility::compatible_impact_names;
 use js_const::detect_callback_body_only_change;
+use moved_members::{
+    MemberFileFacts, MovedMemberChange, Side, pair_moved_member_changes, proves_member_binding,
+};
 pub(crate) use prepare::*;
 pub(crate) use python_contract::*;
 pub(crate) use python_literal::*;
