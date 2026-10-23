@@ -787,6 +787,7 @@ mod tests {
                 old_syms: Some(vec![symbol("Local.run", "function", "pub fn run()")]),
                 new_syms: Some(vec![symbol("Local.run", "function", "pub fn run(n: u32)")]),
                 parameter_pattern_only_names: HashSet::new(),
+                rust_const_additions: HashSet::new(),
                 in_file_callees: HashSet::new(),
                 new_export_surface_names: HashSet::new(),
             },

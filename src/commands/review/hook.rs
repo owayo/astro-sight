@@ -513,6 +513,10 @@ pub(crate) fn build_review_hook_json_for_diff(
             .api_changes
             .compatible_modified
             .iter()
+            // `const` の追加は qualname ごとの証明なので、同じ素の名前の別の宣言 (別の impl の
+            // メソッド・cfg の分岐) の呼び出し元までまとめて外さない。呼び出し元は impact
+            // エンジンが同名の宣言まで確かめて情報提供に分ける。
+            .filter(|m| m.reason != "rust_const_fn_added")
             .map(|m| (m.file.as_str(), m.name.as_str())),
     );
     informational_modified_api_symbols.extend(

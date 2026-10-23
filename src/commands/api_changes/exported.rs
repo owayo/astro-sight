@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// API 表示用シグネチャと、同じ parse で抽出した Rust の引数パターン比較用証拠。
+/// API 表示用シグネチャと、同じ parse で抽出した Rust の引数パターン・`const` 比較用証拠。
 #[derive(Default)]
 pub(crate) struct ExportedFileFacts {
     pub(crate) symbols: ExportedSymbols,
@@ -13,6 +13,11 @@ pub(crate) struct ExportedFileFacts {
 struct RustParameterContracts {
     imports: Option<Vec<String>>,
     by_name: std::collections::HashMap<String, Option<Vec<String>>>,
+    /// 関数自身の `const` を除いた宣言。同じ qualname が複数あれば `None`。
+    const_qualifiers: std::collections::HashMap<
+        String,
+        Option<crate::engine::rust_signature::RustConstQualifier>,
+    >,
 }
 
 impl ExportedFileFacts {
@@ -51,13 +56,65 @@ impl ExportedFileFacts {
             })
             .collect()
     }
+
+    /// 一意な qualname と同じ import 環境の下で、関数に `const` を足しただけの名前。
+    ///
+    /// 宣言の比較で候補が見つかったときだけ、`sources` で旧新のソースを読み直し、宣言に
+    /// 現れる名前の同じファイルの宣言を比べる (多くの変更ファイルでは読み直さない)。
+    pub(crate) fn const_addition_names(
+        &self,
+        new: &Self,
+        sources: impl FnOnce() -> Option<super::source_pair::OldNewSources>,
+    ) -> HashSet<String> {
+        let (Some(old_imports), Some(new_imports)) =
+            (&self.rust_parameters.imports, &new.rust_parameters.imports)
+        else {
+            return HashSet::new();
+        };
+        if old_imports != new_imports {
+            return HashSet::new();
+        }
+        let candidates: Vec<_> = self
+            .rust_parameters
+            .const_qualifiers
+            .iter()
+            .filter_map(|(name, old)| {
+                let old = old.as_ref()?;
+                let current = new.rust_parameters.const_qualifiers.get(name)?.as_ref()?;
+                current
+                    .header_only_adds_const_to(old)
+                    .then_some((name, old, current))
+            })
+            .collect();
+        if candidates.is_empty() {
+            return HashSet::new();
+        }
+        let Some(sources) = sources() else {
+            return HashSet::new();
+        };
+        let Some((old_tree, new_tree)) = sources.parse_pair(crate::language::LangId::Rust) else {
+            return HashSet::new();
+        };
+        let (Some(old_items), Some(new_items)) = (
+            crate::engine::rust_signature::RustFileItems::new(old_tree.root_node(), &sources.old),
+            crate::engine::rust_signature::RustFileItems::new(new_tree.root_node(), &sources.new),
+        ) else {
+            return HashSet::new();
+        };
+        candidates
+            .into_iter()
+            .filter(|(_, old, current)| current.only_adds_const_to(&new_items, old, &old_items))
+            .map(|(name, _, _)| name.clone())
+            .collect()
+    }
 }
 
-fn parameter_pattern_contract_for_symbol(
+/// シンボルの宣言にあたる Rust の関数ノード。宣言の名前がシンボル名と違えば `None`。
+fn rust_function_node_for_symbol<'tree>(
     sym: &Symbol,
-    root: tree_sitter::Node<'_>,
+    root: tree_sitter::Node<'tree>,
     source: &[u8],
-) -> Option<Vec<String>> {
+) -> Option<tree_sitter::Node<'tree>> {
     if !matches!(sym.kind, SymbolKind::Function | SymbolKind::Method) {
         return None;
     }
@@ -78,7 +135,7 @@ fn parameter_pattern_contract_for_symbol(
             {
                 return None;
             }
-            return crate::engine::rust_signature::rust_parameter_pattern_contract(node, source);
+            return Some(node);
         }
         node = node.parent()?;
     }
@@ -907,13 +964,25 @@ fn filter_exported_with_metadata(
         // 除外判定後に署名を作り、不要な文字列構築を避ける。
         let sig = extract_api_signature(sym, root, source, &context.lines, lang_id);
         if result.rust_parameters.imports.is_some() {
-            let contract = parameter_pattern_contract_for_symbol(sym, root, source);
+            let function = rust_function_node_for_symbol(sym, root, source);
+            let contract = function.and_then(|function| {
+                crate::engine::rust_signature::rust_parameter_pattern_contract(function, source)
+            });
             result
                 .rust_parameters
                 .by_name
                 .entry(qualname.clone())
                 .and_modify(|entry| *entry = None)
                 .or_insert(contract);
+            let qualifier = function.and_then(|function| {
+                crate::engine::rust_signature::rust_const_qualifier(function, source)
+            });
+            result
+                .rust_parameters
+                .const_qualifiers
+                .entry(qualname.clone())
+                .and_modify(|entry| *entry = None)
+                .or_insert(qualifier);
         }
         result
             .symbols
@@ -976,13 +1045,13 @@ mod parameter_pattern_tests {
             .find(|symbol| symbol.name.contains("double"))
             .unwrap()
             .clone();
-        assert!(parameter_pattern_contract_for_symbol(&symbol, root, source).is_some());
+        assert!(rust_function_node_for_symbol(&symbol, root, source).is_some());
         // 誤った範囲が隣の宣言を指しても、その契約を対象の名前に結び付けない。
         symbol.range = symbols
             .iter()
             .find(|symbol| symbol.name == "前置")
             .unwrap()
             .range;
-        assert!(parameter_pattern_contract_for_symbol(&symbol, root, source).is_none());
+        assert!(rust_function_node_for_symbol(&symbol, root, source).is_none());
     }
 }

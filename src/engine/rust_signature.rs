@@ -1,7 +1,7 @@
 //! Rust 関数シグネチャの非契約差分を正規化・証明する。
 //!
 //! 通常引数の binding-side `mut` 除去と、root-level の公開 type alias 導入だけで
-//! 実体型が変わらないことの old/new AST 証明を担う。
+//! 実体型が変わらないことの old/new AST 証明、関数に `const` を足しただけの証明を担う。
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -13,7 +13,9 @@ use crate::engine::parser;
 use crate::engine::tree_walk::{Children, Walk, any_node, walk_preorder};
 use crate::language::LangId;
 
+mod const_qualifier;
 mod parameter_patterns;
+pub(crate) use const_qualifier::{RustConstQualifier, RustFileItems, rust_const_qualifier};
 pub(crate) use parameter_patterns::{
     rust_parameter_import_environment, rust_parameter_pattern_contract,
 };

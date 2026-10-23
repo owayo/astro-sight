@@ -211,14 +211,26 @@ pub(crate) fn detect_api_changes(
             continue;
         }
         // 同じ parse で得た証拠を比較し、以後は証明済みの名前だけを運ぶ。
-        let parameter_pattern_only_names = if df.old_path == df.new_path {
+        let (parameter_pattern_only_names, rust_const_additions) = if df.old_path == df.new_path {
             old_facts
                 .as_ref()
                 .zip(facts.exported.as_ref())
-                .map(|(old, new)| old.parameter_pattern_only_names(new))
+                .map(|(old, new)| {
+                    (
+                        old.parameter_pattern_only_names(new),
+                        old.const_addition_names(new, || {
+                            load_old_source_with_new(
+                                &base_blobs,
+                                &df.old_path,
+                                &df.new_path,
+                                load_new_source(dir, &df.new_path)?,
+                            )
+                        }),
+                    )
+                })
                 .unwrap_or_default()
         } else {
-            HashSet::new()
+            (HashSet::new(), HashSet::new())
         };
         let old_syms = old_facts.map(|facts| facts.symbols);
         let new_syms = facts.exported.map(|facts| facts.symbols);
@@ -239,6 +251,7 @@ pub(crate) fn detect_api_changes(
             old_syms,
             new_syms,
             parameter_pattern_only_names,
+            rust_const_additions,
             in_file_callees,
             new_export_surface_names,
         });
@@ -305,6 +318,7 @@ pub(crate) fn detect_api_changes(
                 old_syms,
                 new_syms,
                 parameter_pattern_only_names,
+                rust_const_additions,
                 in_file_callees,
                 new_export_surface_names,
             } => {
@@ -318,6 +332,7 @@ pub(crate) fn detect_api_changes(
                             old_syms,
                             new_syms,
                             parameter_pattern_only_names,
+                            rust_const_additions,
                             in_file_callees,
                             new_export_surface_names,
                         },

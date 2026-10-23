@@ -101,6 +101,8 @@ pub(crate) struct ModifiedFileFacts<'a> {
     pub(crate) old_syms: &'a [(String, String, String)],
     pub(crate) new_syms: &'a [(String, String, String)],
     pub(crate) parameter_pattern_only_names: &'a HashSet<String>,
+    /// Rust の関数に `const` を足しただけと証明できた qualname。
+    pub(crate) rust_const_additions: &'a HashSet<String>,
     pub(crate) in_file_callees: &'a HashSet<String>,
     pub(crate) new_export_surface_names: &'a HashSet<String>,
 }
@@ -155,6 +157,7 @@ pub(crate) enum PreparedDiffFile {
         old_syms: Option<Vec<(String, String, String)>>,
         new_syms: Option<Vec<(String, String, String)>>,
         parameter_pattern_only_names: HashSet<String>,
+        rust_const_additions: HashSet<String>,
         in_file_callees: std::collections::HashSet<String>,
         /// new_path の export clause / `pub use` が公開する名前集合 (TS/JS/Rust)。
         /// Phase 0 の単一 parse で先取りし、process_modified_file が再 read+parse

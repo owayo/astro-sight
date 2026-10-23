@@ -94,8 +94,8 @@ struct FileContext {
     sig_changes: Vec<SignatureChange>,
     /// 旧新とも一意な直接関数宣言と証明できた modified のシグネチャ変更。
     js_modified_direct_function_names: HashSet<String>,
-    /// 透過的な Rust type alias 導入だけと old/new AST で証明できたシグネチャ変更。
-    /// cross-file / same-file の caller は消さず informational へ振り分ける。
+    /// 透過的な Rust type alias 導入だけ、または関数に `const` を足しただけと old/new AST で
+    /// 証明できたシグネチャ変更。cross-file / same-file の caller は消さず informational へ振り分ける。
     compatible_signature_keys: HashSet<String>,
     hunks: Vec<HunkInfo>,
     call_edges: Vec<CallEdge>,
@@ -645,6 +645,7 @@ fn collect_affected_symbols(
             }
         }
         debug_assert_eq!(affected.len(), originals.len());
+        // 透過的な型別名の導入と、関数に `const` を足しただけのシグネチャ変更は互換。
         let compatible_signature_keys: HashSet<String> = if lang_id == LangId::Rust {
             signature::compatible_rust_alias_signature_names(
                 file_diff,
@@ -655,6 +656,16 @@ fn collect_affected_symbols(
                 &sig_changes,
             )
             .into_iter()
+            .chain(
+                sig_changes
+                    .iter()
+                    .filter(|change| {
+                        declaration_proof
+                            .rust_const_additions
+                            .contains(&change.name)
+                    })
+                    .map(|change| change.name.clone()),
+            )
             .map(|name| ci_key(lang_id, &name))
             .collect()
         } else {
