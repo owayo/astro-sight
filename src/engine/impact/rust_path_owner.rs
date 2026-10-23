@@ -1458,6 +1458,9 @@ fn scan_no_source_inclusion(root: &Path) -> bool {
         }
     }
     let mut pending = vec![root.to_owned()];
+    let mut sources = Vec::new();
+    let mut manifests = Vec::new();
+    let mut candidates = Vec::new();
     while let Some(directory) = pending.pop() {
         let Ok(entries) = std::fs::read_dir(&directory) else {
             return false;
@@ -1479,6 +1482,12 @@ fn scan_no_source_inclusion(root: &Path) -> bool {
                 }
                 pending.push(entry.path());
             } else if kind.is_file()
+                && name
+                    .to_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("Cargo.toml"))
+            {
+                manifests.push(entry.path());
+            } else if kind.is_file()
                 && let Some(extension) = entry.path().extension()
             {
                 let Some(extension) = extension.to_str() else {
@@ -1491,17 +1500,37 @@ fn scan_no_source_inclusion(root: &Path) -> bool {
                     let Some(source) = read_input_file(&entry.path()) else {
                         return false;
                     };
+                    sources.push((entry.path(), blake3::hash(&source)));
                     if source_has_include_macro(&source) {
-                        return false;
+                        let possible = super::rust_assert_include::candidate_offsets(&source);
+                        if source_has_include_macro_except(&source, &possible) {
+                            return false;
+                        }
+                        candidates.push((entry.path(), source));
                     }
                 }
             }
         }
     }
-    true
+    if candidates.is_empty() {
+        return true;
+    }
+    let Some(proof) = super::rust_assert_include::AssertionProof::build(&sources, &manifests)
+    else {
+        return false;
+    };
+    candidates.into_iter().all(|(path, source)| {
+        proof
+            .receiver_offsets(&path, &source)
+            .is_some_and(|offsets| !source_has_include_macro_except(&source, &offsets))
+    })
 }
 
 fn source_has_include_macro(source: &[u8]) -> bool {
+    source_has_include_macro_except(source, &HashSet::new())
+}
+
+fn source_has_include_macro_except(source: &[u8], receivers: &HashSet<usize>) -> bool {
     if memchr::memmem::find(source, b"include").is_none() {
         return false;
     }
@@ -1521,6 +1550,7 @@ fn source_has_include_macro(source: &[u8]) -> bool {
                 .is_some_and(|name| name.strip_prefix("r#").unwrap_or(name) == "include")
             && has_token_tree_ancestor(node)
             && !is_field_name_in_token_tree(node, source)
+            && !receivers.contains(&node.start_byte())
         {
             return true;
         }
