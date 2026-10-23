@@ -238,6 +238,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Key Modules
 
+- **TS 関数値の受け渡しと閉じた戻り型変更** — `commands/api_changes/ts_function_values.rs` は、直接 export した一意な root 関数の明示戻り型と、単一の必須 callback property を持つ interface の戻り型が同じ差分で変わったとき、`consumer({ key: producer })` の旧新で同一な手渡しを証明する (Issue #119)。producer の引数と他のヘッダは不変、callback の旧新それぞれへの代入が成立し、consumer は同一ファイルの interface を唯一の必須引数に取り、不変の明示 primitive/void 戻り契約を持つことを求める。consumer 本体は callback 結果の捨て値・primitive literal の return・配列 callback 結果の `.length` を number として返す形だけを扱う。全三者の名前の出現と module 輸送を、旧新ソースの有限 inventory で調べてから producer と interface を一括して `mod_closed` にする。型は void・string/number/boolean/bigint・mutable/readonly 配列だけで、名前付き型や union は解決しない。別名・namespace/default import・再 export・動的 loader・未知の参照・JS/他言語/埋込 source・JSDoc・ERROR/MISSING・read failure・symlink/junction・config の extends/rootDirs/moduleSuffixes/paths/baseUrl・source 512件/旧新合計8MiB/AST 100,000ノード/深さ128/候補照合2,048回の上限で保留する。通常の refs/dead-code/context の出現契約は変えず、standalone impact はこの差分限定証拠だけを既存の同名宣言監査へ追加する。外部利用者の互換性や TypeScript 全体の型検査を保証しない。
+
 - **impact の API 互換証拠** — `commands/api_changes/impact_compatibility.rs` は `review` の互換分類を、所有元を持たない impact の参照名へ対応付ける。旧新ソースの同名宣言がすべて一意に互換な公開 API へ対応する場合だけ除外する。非公開・ローカル・削除済み・非互換の同名宣言が候補に混じる場合や、差分内の別ファイルに同名宣言の未証明な変更がある場合、ソースの解析に失敗した場合は blocking を維持する。関数のシグネチャ差分がなくても型の互換変更を扱う。`--staged` は作業ツリーと index が一致すると確認できた場合だけ証拠を使い、`refs` と `context` の出現一覧は変えない。
 
 - `src/service.rs` - **AppService**: 全コア操作の統一エントリポイント（extract_ast/symbols/calls/imports/lint/sequence/cochange, find_references/find_references_batch, analyze_context + パス検証 + cochange オプション検証 + tracing ログ）

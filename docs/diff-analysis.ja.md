@@ -72,6 +72,14 @@ JS / TS / TSX のトップレベル関数について、別ファイルの同名
 
 `context` と `impact` も、この証拠を持つ別ファイルの参照を `low_confidence_callers` に分ける。対象は旧新とも一意な直接関数宣言で、変更された宣言自身がトップレベル関数だと確認できるシグネチャ変更に限る。同名の変更対象にメソッドや別種の宣言が混ざれば適用しない。削除・追加・宣言種別の変更、import の位置も対象外とする。確信度フィルタを無効にした場合は使わない。直接の `impact --staged` や、review の staged snapshot を作れなかった場合も適用しない。`review --staged` が index 全体の snapshot を使う場合は、その中の参照だけで判定する。
 
+### TypeScript の関数値の受け渡し
+
+export した関数の明示戻り型と、その関数を受け取る interface の callback 戻り型を同じ差分で変えた場合、無変更の `execute({ clone: cloneText })` を証明して両 API 変更を `mod_closed` にできる。三者は直接 export した一意な root 宣言に限り、interface は必須の function-type property を一つだけ持ち、consumer は同じファイルの interface を唯一の必須引数として受け取る。旧新それぞれで callback への代入を照合し、producer の引数、consumer の明示戻り契約など、それ以外のヘッダは不変であることを求める。
+
+型は void・primitive・mutable/readonly 配列に限る。consumer 本体は callback 結果を捨てる呼び出し、primitive literal の return、配列 callback 結果の `.length` を number として返す形だけを証明する。producer の直接呼び出し、受取 interface の未更新、callback の変更・抽出・外部への受け渡し、consumer の推論戻り型、未知の用途は保留する。三者の全出現と module 輸送を旧新で確認してから両方を閉じる。standalone `impact --git` も同じ差分限定証拠を使い、通常の refs と context の出現は維持する。
+
+inventory の上限は TS/TSX 512ファイル、旧新合計8MiB、AST 100,000ノード、深さ128、候補照合2,048回である。別名/default/namespace import、再 export、動的 loader、JS・埋込 source、JSDoc、解析・読取失敗、リンク、不確定な設定 (extends/rootDirs/moduleSuffixes/paths/baseUrl) があれば証明しない。観測した内部の手渡しと限定した consumer の依存を確認するもので、一般的な API 互換性や TypeScript 全体の型検査を保証しない。
+
 ### TypeScript の型への必須プロパティ追加
 
 export した TS / TSX の interface か object 型の type alias へ、必須プロパティを足した変更を扱う。その型の値を作る箇所と受け取る関数が同じ差分で追随していれば、`modified_closed_in_diff` (`api.mod_closed`) に分ける。型への参照は、それぞれ次のどれかでなければならない。

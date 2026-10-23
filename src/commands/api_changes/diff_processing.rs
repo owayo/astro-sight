@@ -1164,6 +1164,12 @@ fn closure_or_blocking_decision(
     public_name_differs: bool,
     moved_from: Option<&str>,
 ) -> SignatureDecision {
+    if !public_name_differs
+        && moved_from.is_none()
+        && caches.function_handoffs.covers(inputs, site, sources)
+    {
+        return SignatureDecision::ClosedInDiff;
+    }
     // object type literal 引数への必須プロパティ追加のみの変更なら、閉包判定へ追加証拠として
     // 渡す (呼び出し式が無変更でも共有 const の定義側が同一 diff で更新されていれば追随済み)。
     // 互換変更ではないので compatible_modified には入れず、あくまで closed 判定の入力。

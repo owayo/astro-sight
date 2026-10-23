@@ -72,6 +72,14 @@ Parse errors, clues for `with` or `eval`, ambient declarations, and declaration 
 
 `context` and `impact` also route these proven sites in other files to `low_confidence_callers`. Both revisions must contain a unique direct function declaration, and the modified declaration itself must be a top-level function with a signature change. Mixed same-name affected methods or other declarations prevent this proof. Removed or added declarations, symbol-kind changes, and import sites do not qualify. Disabling the confidence filter disables this route. Direct `impact --staged` and review fallback without a staged snapshot remain conservative. When `review --staged` uses a complete index snapshot, only references inside that snapshot provide evidence.
 
+### TypeScript Function-Value Handoffs
+
+When an exported function's explicit return type and a receiving interface's callback return type change together, unchanged `execute({ clone: cloneText })` handoffs can close both API changes as `mod_closed`. The producer, interface, and consumer must be unique directly exported root declarations. The interface must contain one required function-type property, and the consumer must receive that interface as its only required parameter. Both old and new callback assignments are checked. Other signature tokens, including the consumer's explicit return contract, must stay equal.
+
+The proof handles `void`, primitive types, and mutable/readonly arrays. It limits the consumer body to discarded callback calls, primitive literal returns, and returning an array callback result's `.length` as `number`. Direct producer calls, an unchanged receiving interface, callback mutation/extraction/escape, inferred consumer returns, and unrecognized uses remain unproven. It checks every observed producer/interface/consumer reference and module transport in both source versions before closing either API change. Standalone `impact --git` uses the same diff-scoped evidence; ordinary references and `context` output remain intact.
+
+The inventory is limited to 512 TS/TSX files, 8 MiB across both versions, 100,000 AST nodes, depth 128, and 2,048 candidate comparisons. Aliased/default/namespace imports, reexports, dynamic loaders, JS or embedded sources, JSDoc, parse/read failures, links, and uncertain configuration (`extends`, `rootDirs`, `moduleSuffixes`, `paths`, or `baseUrl`) prevent this proof. This verifies the observed internal handoffs and bounded consumer dependencies, without establishing general API compatibility or replacing TypeScript checking.
+
 ### TypeScript Required Property Additions
 
 Adding a required property to an exported TS / TSX interface or object type alias can appear in `modified_closed_in_diff` (`api.mod_closed`) when every site that produces a value of the type, and every function that receives one, is followed in the same diff. Each reference to the type must be one of these:
