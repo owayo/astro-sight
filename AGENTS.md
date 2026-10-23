@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **Rust の private helper と include の import** — `engine/impact/rust_path_owner.rs` の葉モジュール証明は、`use` が `include` を取り込むかを `rust_dynamic_source::node_includes_external_source` の AST 判定で調べる (Issue #133)。`compile_includes`・`include_str`・コメント中の `include` は取り込みとせず、実際の `include` の import・別名・raw identifier と、UTF-8 の読取失敗・構文エラーは従来どおり証明を止める。マクロ呼び出し・token tree・子モジュール・staged の境界、refs/dead-code の出現契約は変えない。回帰は `tests/integration/impact_rust_private_helpers.rs` の同名参照7件と子モジュール・別名 include の対照。
+
 - **TS/TSX の1行関数の本体変更と impact** — `engine/impact/declaration.rs` は、明示戻り型を持つ一意なファイル直下の通常関数について、旧新 AST のヘッダと、本体を除いたファイル全体が一致するときだけ、行比較に混ざった本体変更を `signature_changes` から除く (Issue #126)。変更済みシンボルの記録は保持する。引数・戻り型・公開指定・周辺コードの変更、戻り型の推論、JS、メソッド・generator・関数値、overload・同名束縛・再束縛・解析不能・旧側の復元失敗・パス変更は補正しない。staged は index のソースで照合する。refs/dead-code の出現契約は変えない。
 
 - **Rust の外部 path 依存と削除参照** — `commands/api_changes/removed_rust_dependencies.rs` は、#110 の Cargo 入力閉包・全所属・lib occurrence を使い、`beta::items::run` / `::beta::items::run` が通常の非 optional path 依存の残存する直接関数を指す場合だけ、削除元の参照から外す (Issue #115)。改名は依存キー、改名なしは依存先の lib 名を照合し、workspace 継承の path は workspace manifest 基準で解釈する。dev/build/target 別の表も同名の競合の確認に使い、全所属の結果が一致しなければ証明しない。build script の所属、条件付き inner cfg を持つ依存 root、registry/git 依存、再公開、未知の依存仕様、patch/replace、root が生成し得る extern alias、参照モジュールの同名束縛・glob・名前生成を保留する。`::` はローカル mod を無視するが root の extern prelude の検査は省略しない。設定・環境・staged snapshot の判定は #112 の `CargoConfigProof` を共有する。ambiguous move の照合規則と refs/dead-code の出現契約は変えない。
