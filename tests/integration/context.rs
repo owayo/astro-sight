@@ -119,6 +119,86 @@ fn context_diff_file_arg() {
     let _ = std::fs::remove_file(&tmp);
 }
 
+#[test]
+fn context_rust_mixed_hunk_adds_method_without_borrowing_another_signature() {
+    let dir = tempfile::tempdir().unwrap();
+    let new = include_str!("../fixtures/rust_method_signature/new.rs");
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/parser.rs"), new).unwrap();
+    // Issue の改行を維持し、削除と新規メソッドを同じ hunk に含める。
+    let patch = [
+        "--- a/src/parser.rs",
+        "+++ b/src/parser.rs",
+        "@@ -5,11 +5,22 @@",
+        " }",
+        " ",
+        " impl State {",
+        "-    fn apply<'a>(&self, text: &'a str) -> Cow<'a, str> {",
+        "-        if self.blanked.is_empty() {",
+        "+    fn apply<'a>(&self, text: &'a str) -> Readable<'a> {",
+        "+        let analysis = if self.blanked.is_empty() {",
+        "             Cow::Borrowed(text)",
+        "         } else {",
+        "             Cow::Owned(text.to_owned())",
+        "-        }",
+        "+        };",
+        "+        Readable { analysis }",
+        "     }",
+        " }",
+        "+",
+        "+struct Readable<'a> {",
+        "+    analysis: Cow<'a, str>,",
+        "+}",
+        "+",
+        "+impl Readable<'_> {",
+        "+    fn text(&self) -> &str {",
+        "+        &self.analysis",
+        "+    }",
+        "+}",
+        "",
+    ]
+    .join("\n");
+    let patch_path = dir.path().join("changes.patch");
+    std::fs::write(&patch_path, patch).unwrap();
+    let output = cargo_bin()
+        .args(["context", "--dir"])
+        .arg(dir.path())
+        .arg("--diff-file")
+        .arg(&patch_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let change = &result["changes"][0];
+    let signatures = change["signature_changes"].as_array().unwrap();
+    assert_eq!(signatures.len(), 1, "{result}");
+    assert_eq!(signatures[0]["name"], "apply");
+    assert!(
+        signatures[0]["old_signature"]
+            .as_str()
+            .unwrap()
+            .contains("Cow<'a, str>")
+    );
+    assert!(
+        signatures[0]["new_signature"]
+            .as_str()
+            .unwrap()
+            .contains("Readable<'a>")
+    );
+    assert!(
+        change["affected_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["name"] == "text" && symbol["change_type"] == "added"),
+        "{result}"
+    );
+}
+
 // ---- Phase 3: Batch refs unit test (via context command) ----
 
 #[test]

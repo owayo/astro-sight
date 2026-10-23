@@ -115,6 +115,10 @@ pub(super) struct ReexportMoveIndex {
     /// 削除された Rust 行に現れた識別子。同名の追加は旧宣言・再輸出・
     /// マクロ等からの置換かもしれないため、Pass 1 で added と断定しない。
     removed_identities: HashSet<String>,
+    /// 新規メソッドの旧側不在を調べるため、同じ削除名の出現ファイルも一度だけ記録する。
+    removed_identity_files: HashMap<String, HashSet<String>>,
+    /// NFC を解決していない非 ASCII 名は、他ファイルの旧側不在の証拠に使わない。
+    uncertain_removed_identity_files: HashSet<String>,
     /// 参照ファイルパス → シンボル名 → 移動候補。
     /// 条件 1 (自前定義の削除) を満たしたものだけを登録する。
     ///
@@ -167,6 +171,8 @@ impl ReexportMoveIndex {
         let mut added_defs: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
         let mut moves: HashMap<String, HashMap<String, Vec<MoveCandidate>>> = HashMap::new();
         let mut removed_identities = HashSet::new();
+        let mut removed_identity_files: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut uncertain_removed_identity_files = HashSet::new();
 
         for (path, lines) in &per_file {
             for line in &lines.removed {
@@ -177,6 +183,13 @@ impl ReexportMoveIndex {
                 for token in code.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
                     if !token.is_empty() {
                         removed_identities.insert(token.to_string());
+                        removed_identity_files
+                            .entry(token.to_string())
+                            .or_default()
+                            .insert(path.clone());
+                        if !token.is_ascii() {
+                            uncertain_removed_identity_files.insert(path.clone());
+                        }
                     }
                 }
             }
@@ -222,6 +235,8 @@ impl ReexportMoveIndex {
 
         Self {
             removed_identities,
+            removed_identity_files,
+            uncertain_removed_identity_files,
             moves,
             added_defs,
             removed_decls: HashMap::new(),
@@ -301,6 +316,18 @@ impl ReexportMoveIndex {
 
     pub(super) fn might_have_removed_identity(&self, name: &str) -> bool {
         self.removed_identities.contains(name)
+    }
+
+    /// 同一ファイルの旧 AST で不在を確認したメソッドだけが使う。他ファイルは粗い判定を保つ。
+    pub(super) fn might_have_removed_identity_outside(&self, name: &str, file_path: &str) -> bool {
+        let name = crate::language::normalize_identifier(crate::language::LangId::Rust, name);
+        self.removed_identity_files
+            .get(name.as_ref())
+            .is_some_and(|paths| paths.iter().any(|path| path != file_path))
+            || self
+                .uncertain_removed_identity_files
+                .iter()
+                .any(|path| path != file_path)
     }
 
     /// `ref_path` の `symbol` 参照が、`source_path` への定義移動 + 再輸出で
