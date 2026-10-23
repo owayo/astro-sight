@@ -9,7 +9,7 @@ mod pass3;
 mod python_imports;
 mod reexport_move;
 pub(crate) mod rust_cargo_config;
-mod rust_cargo_reachability;
+pub(crate) mod rust_cargo_reachability;
 mod rust_impl_owner;
 mod rust_path_owner;
 mod rust_reexport_owner;

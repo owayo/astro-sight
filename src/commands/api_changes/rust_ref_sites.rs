@@ -1,6 +1,6 @@
 //! API 判定専用の Rust 自由関数と関連メンバーの証拠。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
 use crate::{engine::parser, language::LangId, models::symbol::SymbolKind};
@@ -17,6 +17,8 @@ pub(super) struct ModuleFunctionProof(());
 
 pub(super) struct ModuleFunctions {
     signatures: HashMap<String, Option<String>>,
+    /// `extern` の ABI (`extern "C" fn` など) を持つ関数の名前。
+    foreign_abi: HashSet<String>,
 }
 
 impl ModuleFunctions {
@@ -32,6 +34,7 @@ impl ModuleFunctions {
         let symbols = crate::engine::symbols::extract_symbols(root, source, LangId::Rust).ok()?;
         let lines: Vec<_> = std::str::from_utf8(source).ok()?.lines().collect();
         let mut signatures = HashMap::new();
+        let mut foreign_abi = HashSet::new();
         for symbol in symbols {
             if matches!(
                 symbol.kind,
@@ -62,17 +65,42 @@ impl ModuleFunctions {
             .then(|| {
                 super::signature::extract_api_signature(&symbol, root, source, &lines, LangId::Rust)
             });
+            if has_extern_modifier(node) {
+                foreign_abi.insert(name.clone());
+            }
             signatures
                 .entry(name)
                 .and_modify(|entry| *entry = None)
                 .or_insert(signature);
         }
-        Some(Self { signatures })
+        Some(Self {
+            signatures,
+            foreign_abi,
+        })
     }
 
     pub(super) fn prove(&self, name: &str, signature: &str) -> Option<ModuleFunctionProof> {
         (self.signatures.get(name)?.as_deref()? == signature).then_some(ModuleFunctionProof(()))
     }
+
+    /// `prove` に加えて `extern` の ABI を持たない関数か。C などの ABI で公開した関数は、Cargo の
+    /// 依存の外 (リンクやほかの言語) から同じ名前で使われうる。
+    pub(super) fn proves_package_local(&self, name: &str, signature: &str) -> bool {
+        self.prove(name, signature).is_some() && !self.foreign_abi.contains(name)
+    }
+}
+
+fn has_extern_modifier(function: Node<'_>) -> bool {
+    let mut cursor = function.walk();
+    function
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "function_modifiers")
+        .any(|modifiers| {
+            let mut cursor = modifiers.walk();
+            modifiers
+                .children(&mut cursor)
+                .any(|modifier| modifier.kind() == "extern_modifier")
+        })
 }
 
 fn module_child(node: Node<'_>) -> bool {

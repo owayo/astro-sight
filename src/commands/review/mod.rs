@@ -8,7 +8,7 @@ use crate::models::review::{ApiChanges, ApiSymbol, ApiSymbolChange, DeadSymbol, 
 use crate::models::skip::SkipInfo;
 use crate::service::AppService;
 
-use super::api_changes::{api_diff_files, detect_api_changes};
+use super::api_changes::{api_diff_files, detect_api_changes_with_renames};
 use crate::output::{OutputOptions, serialize_cli_document};
 
 use super::common::{MAX_INPUT_SIZE, log_phase, read_to_string_limited, timed, timed_ok};
@@ -368,10 +368,11 @@ fn review_attempt_with_swift_protocols(
 
     // 5. API 公開面の差分 (内容同一の rename も含めて見る。`api_diff_files` 参照)
     let mut api_changes = timed("api_changes", || {
-        detect_api_changes(
+        detect_api_changes_with_renames(
             analysis_dir,
             analysis_base,
             &api_diff_files(&diff_files, &diff_input),
+            &crate::engine::diff::parse_hunkless_renames(&diff_input),
         )
     });
     if keep_reference_downgrades_blocking {

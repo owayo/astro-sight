@@ -38,6 +38,7 @@ use crate::models::review::{
 pub(crate) fn partition_removed_dead_candidates(
     dir: &str,
     base_blobs: &crate::commands::git_input::GitBlobBatch,
+    rust_packages: &super::removed_cargo::RemovedRustPackages<'_>,
     candidates: Vec<ApiSymbolCandidate>,
     ambiguous_relation_keys: &HashSet<ApiRelationKey>,
 ) -> (
@@ -210,31 +211,32 @@ pub(crate) fn partition_removed_dead_candidates(
             removed_kept.push(c);
             continue;
         }
-        let (def_count, attributions) = counts.get(&bare).unwrap_or(&empty_attrs);
+        let (_, attributions) = counts.get(&bare).unwrap_or(&empty_attrs);
         // 全参照が「削除ファイル c.file ではなく残存シンボル由来」と証明できた候補は、
         // 削除シンボルへの残存参照ゼロとして removed_dead (informational) に降格する。
         // 同名定義が複数残る場合 (従来は無条件 kept) も、帰属証明があれば bare name
         // カウントの誤認 (Issue 2026-07-19-bulk-subsystem-removal の shell `usage` /
         // mjs `loadEnvFiles`) を解消できる。証明できない参照が 1 件でもあれば従来どおり
         // removed (blocking) に残す (fail-closed)。
+        let rust_functions = (c.kind == "function"
+            && !c.name.contains('.')
+            && super::removed_attribution::path_lang(&c.file)
+                == Some(crate::language::LangId::Rust))
+        .then(|| {
+            old_rust_functions
+                .entry(c.file.clone())
+                .or_insert_with(|| {
+                    super::rust_ref_sites::ModuleFunctions::parse(&base_blobs.read(&c.file)?)
+                })
+                .as_ref()
+        })
+        .flatten();
         let candidate_ref = RemovedCandidateRef {
             old_path: &c.file,
             name: &c.name,
             kind: &c.kind,
-            rust_module_function: (c.kind == "function"
-                && !c.name.contains('.')
-                && super::removed_attribution::path_lang(&c.file)
-                    == Some(crate::language::LangId::Rust))
-            .then(|| {
-                old_rust_functions
-                    .entry(c.file.clone())
-                    .or_insert_with(|| {
-                        super::rust_ref_sites::ModuleFunctions::parse(&base_blobs.read(&c.file)?)
-                    })
-                    .as_ref()?
-                    .prove(&c.name, &c.signature)
-            })
-            .flatten(),
+            rust_module_function: rust_functions
+                .and_then(|functions| functions.prove(&c.name, &c.signature)),
         };
         if python_input_complete
             && private_owners.proves_closed_removal(
@@ -295,63 +297,67 @@ pub(crate) fn partition_removed_dead_candidates(
             });
             continue;
         }
+        let references: Vec<&RefAttribution> = attributions.iter().collect();
+        let definitions: Vec<&RefAttribution> = definition_attributions
+            .get(&bare)
+            .into_iter()
+            .flatten()
+            .collect();
         // Rust の削除を Swift / JS / TS が同名で参照している場合だけ、旧ツリーの FFI・
         // バインディング生成の痕跡を調べる (言語表だけでは束縛の可否が決まらない)。
         let needs_foreign_evidence = c.file.ends_with(".rs")
-            && attributions
-                .iter()
-                .chain(definition_attributions.get(&bare).into_iter().flatten())
-                .any(|a| {
-                    a.ref_lang
-                        .is_some_and(super::removed_ffi::ForeignBindability::is_evidence_consumer)
-                });
+            && references.iter().chain(&definitions).any(|a| {
+                a.ref_lang
+                    .is_some_and(super::removed_ffi::ForeignBindability::is_evidence_consumer)
+            });
         let foreign_bindable = if needs_foreign_evidence {
             ffi_evidence.may_bind(&c.file)
         } else {
             super::removed_ffi::ForeignBindability::ANY
         };
-        // 新しい位置別証明では、未知の class / method / overload 等の残存定義も
-        // 無視しない。既存 JS / Bash のファイル単位証明にはこの条件を広げない。
-        let definitions_proven = definition_attributions.get(&bare).is_none_or(|defs| {
-            defs.iter().all(|a| {
-                proves_independent_definition_with_ffi(a, &candidate_ref, foreign_bindable)
-            })
-        });
-        let uses_scope_proof = attributions.iter().any(|a| {
-            matches!(
-                &a.origin,
-                RefOrigin::IndependentDefinition { .. }
-                    | RefOrigin::LocalValue
-                    | RefOrigin::RustAssociatedMember
-            )
-        });
-        if !attributions.is_empty()
-            && (!uses_scope_proof || definitions_proven)
-            && attributions
+        let mut dead = has_no_live_reference(
+            &references,
+            &definitions,
+            &candidate_ref,
+            foreign_bindable,
+            needs_foreign_evidence,
+        );
+        // 削除元の package に Cargo の依存で届かない Rust の出現を除き、残りで判定し直す
+        // (Issue #111)。FFI として公開した関数と属性の付いた関数は、Cargo の依存の外から
+        // 使われうるので対象にしない。
+        if !dead
+            && rust_functions
+                .is_some_and(|functions| functions.proves_package_local(&c.name, &c.signature))
+        {
+            let rust = |a: &RefAttribution| a.ref_lang == Some(crate::language::LangId::Rust);
+            let live_references: Vec<&RefAttribution> = references
                 .iter()
-                .all(|a| proves_survivor_origin_with_ffi(a, &candidate_ref, foreign_bindable))
-        {
-            removed_dead.push(c);
-            continue;
+                .copied()
+                .filter(|a| {
+                    !(rust(a)
+                        && rust_packages.excludes_reference(
+                            &a.ref_path,
+                            &c.file,
+                            a.rust_binds_in_file,
+                        ))
+                })
+                .collect();
+            let live_definitions: Vec<&RefAttribution> = definitions
+                .iter()
+                .copied()
+                .filter(|a| !(rust(a) && rust_packages.excludes_definition(&a.ref_path, &c.file)))
+                .collect();
+            dead = (live_references.len() < references.len()
+                || live_definitions.len() < definitions.len())
+                && has_no_live_reference(
+                    &live_references,
+                    &live_definitions,
+                    &candidate_ref,
+                    foreign_bindable,
+                    needs_foreign_evidence,
+                );
         }
-        // 同名定義が複数残っている → 保守的に removed に残す
-        let definitions_foreign = needs_foreign_evidence
-            && !foreign_bindable.swift
-            && definition_attributions.get(&bare).is_some_and(|defs| {
-                defs.len() == *def_count
-                    && !defs.is_empty()
-                    && defs
-                        .iter()
-                        .all(|a| a.ref_lang == Some(crate::language::LangId::Swift))
-            });
-        if *def_count > 1
-            && !(definitions_proven
-                && (definitions_foreign || (c.kind == "function" && !c.name.contains('.'))))
-        {
-            removed_kept.push(c);
-            continue;
-        }
-        if attributions.is_empty() {
+        if dead {
             removed_dead.push(c);
         } else {
             removed_kept.push(c);
@@ -417,6 +423,52 @@ pub(crate) fn partition_removed_dead_candidates(
     }
 
     (removed_kept, removed_dead, removed_unresolved)
+}
+
+/// 削除候補と同名の参照・残存定義の帰属から、削除した宣言を指す参照が残っていないと言えるか。
+fn has_no_live_reference(
+    references: &[&RefAttribution],
+    definitions: &[&RefAttribution],
+    candidate: &RemovedCandidateRef<'_>,
+    foreign_bindable: super::removed_ffi::ForeignBindability,
+    needs_foreign_evidence: bool,
+) -> bool {
+    // 新しい位置別証明では、未知の class / method / overload 等の残存定義も
+    // 無視しない。既存 JS / Bash のファイル単位証明にはこの条件を広げない。
+    let definitions_proven = definitions
+        .iter()
+        .all(|a| proves_independent_definition_with_ffi(a, candidate, foreign_bindable));
+    let uses_scope_proof = references.iter().any(|a| {
+        matches!(
+            &a.origin,
+            RefOrigin::IndependentDefinition { .. }
+                | RefOrigin::LocalValue
+                | RefOrigin::RustAssociatedMember
+        )
+    });
+    if !references.is_empty()
+        && (!uses_scope_proof || definitions_proven)
+        && references
+            .iter()
+            .all(|a| proves_survivor_origin_with_ffi(a, candidate, foreign_bindable))
+    {
+        return true;
+    }
+    // 同名定義が複数残っている → 保守的に removed に残す
+    let definitions_foreign = needs_foreign_evidence
+        && !foreign_bindable.swift
+        && !definitions.is_empty()
+        && definitions
+            .iter()
+            .all(|a| a.ref_lang == Some(crate::language::LangId::Swift));
+    if definitions.len() > 1
+        && !(definitions_proven
+            && (definitions_foreign
+                || (candidate.kind == "function" && !candidate.name.contains('.'))))
+    {
+        return false;
+    }
+    references.is_empty()
 }
 
 /// 現在の index が所有する gitlink。取得失敗・未マージ・上限超過なら除外しない。

@@ -280,7 +280,7 @@ fn has_js_binding_marker(content: &[u8]) -> bool {
     .any(|marker| compact.contains(marker))
 }
 
-fn is_lfs_pointer(content: &[u8]) -> bool {
+pub(super) fn is_lfs_pointer(content: &[u8]) -> bool {
     content.starts_with(b"version https://git-lfs.github.com/spec/v1\n")
 }
 

@@ -79,10 +79,11 @@ pub(crate) fn resolve_git_diff_parts(
 pub(crate) fn detect_api_changes_from_worktree(repo: &std::path::Path) -> ApiChanges {
     let (diff, _) = resolve_git_diff_parts(repo);
     let diff_files = crate::engine::diff::parse_unified_diff(&diff);
-    detect_api_changes(
+    detect_api_changes_with_renames(
         repo.to_str().expect("utf-8 path"),
         "HEAD",
         &api_diff_files(&diff_files, &diff),
+        &crate::engine::diff::parse_hunkless_renames(&diff),
     )
 }
 
