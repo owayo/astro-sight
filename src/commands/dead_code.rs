@@ -13,7 +13,8 @@ use super::api_changes::extract_exported_symbols_from_file_inner;
 use super::api_changes::{ExportedSymbols, bare_name, filter_exported_symbols};
 use super::dead_code_default_liveness::DefaultExportLiveness;
 use super::dead_code_member_liveness::{
-    JsTsMemberLiveness, MemberStatus, PhpMemberLiveness, RustMemberLiveness,
+    JsTsMemberLiveness, MemberStatus, PhpMemberLiveness, RubyConstructorLiveness,
+    RustMemberLiveness,
 };
 use super::dead_code_swift_protocol::SwiftProtocolLiveness;
 use super::git_input::{DiffSourceResolution, resolve_diff_source};
@@ -131,7 +132,8 @@ pub(crate) fn detect_dead_symbols_with_swift_protocols(
     // 全参照をテストからの参照と数えていた (本番で使うシンボルが test_only になる)。
     let is_test = |path: &std::path::Path| is_workspace_test_path(&canonical_dir, path);
 
-    let index = build_dead_code_name_index(&candidates, &canonical_dir, files, &is_test);
+    let index =
+        build_dead_code_name_index(&candidates, &canonical_dir, files, &scan.files, &is_test);
 
     // production / test 別に refs カウント。test/ 配下のみで参照されるシンボルは
     // dead_symbols ではなく test_only_symbols として分離する (F5)。
@@ -706,6 +708,8 @@ struct DeadCodeNameIndex {
     /// PHP の duplicate な同名 class member について `Owner::member()` などの
     /// 確定参照だけを使って dead/test_only/live を再判定するためのインデックス。
     php_member_liveness: PhpMemberLiveness,
+    /// Ruby の静的な new から通常の initialize への追加参照。Dead の断定には使わない。
+    ruby_constructor_liveness: RubyConstructorLiveness,
 }
 
 /// 言語別に正規化した bare name を返す。
@@ -733,6 +737,7 @@ fn build_dead_code_name_index<F>(
     candidates: &DeadCodeCandidates,
     canonical_dir: &std::path::Path,
     candidate_files: &[std::path::PathBuf],
+    reference_files: &[std::path::PathBuf],
     is_test: &F,
 ) -> DeadCodeNameIndex
 where
@@ -801,6 +806,12 @@ where
         candidate_files,
         is_test,
     );
+    let ruby_constructor_liveness = RubyConstructorLiveness::build(
+        &candidates.all_syms,
+        canonical_dir,
+        reference_files,
+        is_test,
+    );
 
     DeadCodeNameIndex {
         name_counts,
@@ -808,6 +819,7 @@ where
         unique_names,
         member_liveness,
         php_member_liveness,
+        ruby_constructor_liveness,
     }
 }
 
@@ -989,8 +1001,17 @@ fn classify_dead_symbols(
 
         let (prod_cnt, test_cnt) = ref_counts_with_liveness(&key, file, index, counts);
         let (default_prod, default_test) = default_liveness.counts_for(file, name);
-        let prod_cnt = prod_cnt.saturating_add(default_prod);
-        let test_cnt = test_cnt.saturating_add(default_test);
+        let (constructor_prod, constructor_test) = if *lang == crate::language::LangId::Ruby {
+            index.ruby_constructor_liveness.counts_for(file, name)
+        } else {
+            (0, 0)
+        };
+        let prod_cnt = prod_cnt
+            .saturating_add(default_prod)
+            .saturating_add(constructor_prod);
+        let test_cnt = test_cnt
+            .saturating_add(default_test)
+            .saturating_add(constructor_test);
         if prod_cnt > 0 {
             continue;
         }

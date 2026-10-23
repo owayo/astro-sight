@@ -5,10 +5,12 @@
 
 mod js_ts;
 mod php;
+mod ruby;
 mod rust;
 
 pub(crate) use js_ts::JsTsMemberLiveness;
 pub(crate) use php::PhpMemberLiveness;
+pub(crate) use ruby::RubyConstructorLiveness;
 pub(crate) use rust::RustMemberLiveness;
 
 use std::collections::HashMap;
