@@ -8,6 +8,7 @@ mod pass2;
 mod pass3;
 mod python_imports;
 mod reexport_move;
+mod rust_assert_include;
 pub(crate) mod rust_cargo_config;
 pub(crate) mod rust_cargo_reachability;
 mod rust_impl_owner;
