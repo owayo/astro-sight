@@ -36,6 +36,7 @@ mod integration {
     mod kotlin_grammar;
     mod languages;
     mod mcp;
+    mod moved_compatible_change;
     mod moved_member_signature;
     mod optional_param_removal;
     mod output_format;

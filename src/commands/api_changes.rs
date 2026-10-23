@@ -256,10 +256,12 @@ pub(crate) fn detect_api_changes(
             new_export_surface_names,
         });
     }
-    // 型の移動と同じ差分でシグネチャの変わったメンバーは、削除と追加に割れた後で変更として
-    // 判定し直す (`pair_moved_member_changes`)。その名前も検索対象に入れておく。
+    // 型の移動と同じ差分でシグネチャの変わったメンバー、移動と同じ差分でシグネチャの変わった
+    // 自由関数・定数は、削除と追加に割れた後で変更として判定し直す
+    // (`pair_moved_member_changes` / `pair_moved_symbol_changes`)。その名前も検索対象に入れておく。
     let member_files = MemberFileFacts::new(diff_files, &prepared);
     member_files.collect_index_names(&mut index_names);
+    member_files.collect_moved_symbol_index_names(&mut index_names);
     let ref_index = ApiRefIndex::build(dir, &index_names);
     let old_ref_index = std::cell::OnceCell::new();
 
@@ -384,6 +386,21 @@ pub(crate) fn detect_api_changes(
         },
     );
     process_moved_member_changes(&inputs, &mut state, &moved_member_changes);
+
+    // 自由関数・定数を移すのと同時に、移さなければ互換と判定される変更 (定数の初期化の式、
+    // 同じ型の別名への書き換え) をした宣言も、削除と追加に割れる。組を移さないときと同じ規則で
+    // 判定し、互換と確定したものだけを moved にする (Issue #114)。
+    let moved_symbol_changes = pair_moved_symbol_changes(
+        &removed,
+        &unverified_removed,
+        &all_new_candidates,
+        &moved,
+        &ambiguous_relation_keys,
+        &member_files,
+    );
+    let compatible_moves = process_moved_symbol_changes(&inputs, &mut state, &moved_symbol_changes);
+    let (added, removed, moved) =
+        settle_moved_symbol_changes(added, removed, moved, &compatible_moves);
 
     // removed のうち HEAD ツリーで他ファイル参照 0 件のものを `removed_dead` に振り分け。
     // 「base 時点で dead だった symbol の整理」だけでなく「base alive → HEAD で関連
@@ -671,6 +688,7 @@ mod js_ref_sites;
 mod js_ts_call_arity;
 mod js_ts_shadow;
 mod moved_members;
+mod moved_symbols;
 pub(crate) mod prepare;
 pub(crate) mod removed;
 pub(crate) mod signature;
@@ -714,6 +732,9 @@ pub(crate) use impact_compatibility::compatible_impact_names;
 use js_const::detect_callback_body_only_change;
 use moved_members::{
     MemberFileFacts, MovedMemberChange, Side, pair_moved_member_changes, proves_member_binding,
+};
+use moved_symbols::{
+    MovedSymbolChange, MovedSymbolFiles, pair_moved_symbol_changes, settle_moved_symbol_changes,
 };
 pub(crate) use prepare::*;
 pub(crate) use python_contract::*;

@@ -42,7 +42,7 @@ impl Scope {
 
 /// Only compiler-defined attributes with no ability to introduce a sibling name
 /// can leave the module scope open. Unknown proc macros remain a barrier.
-pub(super) fn safe_attribute(node: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
+pub(crate) fn safe_attribute(node: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
     let attribute = node.named_child(0)?;
     if attribute.kind() != "attribute" || attribute.has_error() {
         return None;
