@@ -12,7 +12,8 @@
 //! 逆適用して復元し (`diff::reconstruct_old_source`)、同じ識別 (名前 / 種別 / container)
 //! の宣言のヘッダをトークン列で比較する。Rust の 1 行関数では本体が行比較に混ざるため、
 //! 宣言が一意でヘッダが同じと証明できた場合だけ行比較の誤検出を取り消す。
-//! 他の 1 行ヘッダでは行比較を優先し、ここは補完に徹する。
+//! TS/TSX も明示戻り型を持つ一意な root 関数の本体だけの変更を補正する。
+//! その他の 1 行ヘッダでは行比較を優先し、ここは補完に徹する。
 
 use std::collections::{HashMap, HashSet};
 
@@ -844,8 +845,8 @@ fn rust_modified_alias_names(
 /// - `"modified"` の関数でヘッダの行範囲に変更があるのに行ベースの検出が結論を出せなかった
 ///   もの (複数行のヘッダ、関数名の行が無変更) は、変更前の同じ宣言とヘッダを比べる。
 ///
-/// Rust の 1 行関数は行比較に本体が混ざるため、一意な旧新ヘッダが一致するときだけ
-/// 行ベースのシグネチャ変更を取り消す。他言語の 1 行ヘッダは行ベースの結果を優先する。
+/// Rust と、明示戻り型を持つ TS/TSX の root 関数は、一意な旧新ヘッダと本体以外の
+/// ソースが一致するときに行比較へ混ざった本体の差を取り消す。
 pub(super) fn reconcile_declaration_changes(
     input: &DeclarationChangeInput<'_>,
     affected: &mut [AffectedSymbol],
@@ -992,6 +993,23 @@ pub(super) fn reconcile_declaration_changes(
                     new_signature: new_header.display,
                 });
             }
+            continue;
+        }
+        if !is_added
+            && has_text_sig_change
+            && symbol_change.kind == "function"
+            && matches!(input.lang_id, LangId::Typescript | LangId::Tsx)
+            && let Some((old, new)) = unique_header_pair(input, &symbol_change.name, &mut old_side)
+            && old.same_contract(&new)
+            && ts_only_typed_function_body_changed(
+                input,
+                &mut old_side,
+                &symbol_change.name,
+                &old,
+                &new,
+            )
+        {
+            sig_changes.retain(|sc| sc.name != symbol_change.name);
             continue;
         }
         if !is_added
@@ -1338,6 +1356,63 @@ fn rust_only_body_changed(
             == without_binding_muts(new_prefix, &new_header.binding_mut_bytes)
 }
 
+/// 推論戻り型・overload・再束縛を除き、同じパスの root 関数の本体だけの差を証明する。
+fn ts_only_typed_function_body_changed(
+    input: &DeclarationChangeInput<'_>,
+    old_side: &mut LazyOldSide,
+    name: &str,
+    old_header: &DeclarationHeader,
+    new_header: &DeclarationHeader,
+) -> bool {
+    if input.old_file_path != input.file_path {
+        return false;
+    }
+    let (Some((old_start, old_end)), Some((new_start, new_end))) =
+        (old_header.body_bytes, new_header.body_bytes)
+    else {
+        return false;
+    };
+    let Some(old) = old_side.get(input) else {
+        return false;
+    };
+    for (root, source) in [
+        (old.tree.root_node(), old.source.as_slice()),
+        (input.root, input.source),
+    ] {
+        if !crate::engine::js_occurrence::unique_direct_function(root, source, name) {
+            return false;
+        }
+        let mut cursor = root.walk();
+        if !root.named_children(&mut cursor).any(|statement| {
+            let declaration = if statement.kind() == "export_statement" {
+                statement.child_by_field_name("declaration")
+            } else {
+                Some(statement)
+            };
+            declaration.is_some_and(|decl| {
+                decl.kind() == "function_declaration"
+                    && decl
+                        .child_by_field_name("name")
+                        .and_then(|node| node.utf8_text(source).ok())
+                        == Some(name)
+                    && decl.child_by_field_name("return_type").is_some()
+                    && decl.child_by_field_name("body").is_some()
+            })
+        }) {
+            return false;
+        }
+    }
+    let (Some(old_prefix), Some(new_prefix), Some(old_suffix), Some(new_suffix)) = (
+        old.source.get(..old_start),
+        input.source.get(..new_start),
+        old.source.get(old_end..),
+        input.source.get(new_end..),
+    ) else {
+        return false;
+    };
+    old_prefix == new_prefix && old_suffix == new_suffix
+}
+
 /// AST のヘッダが同じトークン列で、ヘッダ以外は byte 一致するときだけ整形差を取り消す。
 fn rust_only_header_formatting_changed(
     input: &DeclarationChangeInput<'_>,
@@ -1454,6 +1529,47 @@ fn text_path_compared(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ts_inline_body_change_preserves_affected_symbol_without_signature_change() {
+        for lang in [LangId::Typescript, LangId::Tsx] {
+            for old in [
+                "export function execute(): number { return 0; }\n",
+                "export function execute(): { value: number } { return { value: 0 }; }\n",
+            ] {
+                let new = old.replace('0', "1");
+                let (_, raw) = run_pass1(lang, "api.ts", old, &new, false);
+                assert_eq!(raw.len(), 1, "前提: {lang}: {old}: {raw:?}");
+                let (affected, changes) = run_pass1(lang, "api.ts", old, &new, true);
+                assert_eq!(change_type_of(&affected, "execute"), Some("modified"));
+                assert!(changes.is_empty(), "{lang}: {old}: {changes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn ts_inline_body_change_keeps_uncertain_and_real_contract_changes() {
+        let old = "export function execute(): number { return 0; }\n";
+        for new in [
+            "export function execute(value: number): number { return 1; }\n",
+            "export function execute(): string { return 'one'; }\n",
+            "export function execute(): number { return 1; }\nconst extra = 1;\n",
+            "function execute(): number { return 1; }\n",
+            "export function execute(): number { return 1; }\nconst broken = ;\n",
+        ] {
+            let (_, changes) = run_pass1(LangId::Typescript, "api.ts", old, new, true);
+            assert_eq!(changes.len(), 1, "{new}: {changes:?}");
+        }
+        for old in [
+            "export function execute(): number;\nexport function execute(): number { return 0; }\n",
+            "export class First { public execute(): number { return 0; } }\nexport class Second { public execute(): number { return 0; } }\n",
+            "export function execute() { return 0; }\n",
+        ] {
+            let new = old.replace("return 0", "return 1");
+            let (_, changes) = run_pass1(LangId::Typescript, "api.ts", old, &new, true);
+            assert!(!changes.is_empty(), "{old}: {changes:?}");
+        }
+    }
 
     #[test]
     fn rust_parameter_pattern_proof_handles_new_side_only_diff_sections() {

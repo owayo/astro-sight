@@ -6,6 +6,104 @@ use super::support::*;
 use std::process::{Command, Stdio};
 
 #[test]
+fn ts_inline_body_change_keeps_context_and_hooks_consistent() {
+    for extension in ["ts", "tsx"] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        let api = format!("api.{extension}");
+        repo.write(&api, "export function execute(): number { return 0; }\n");
+        repo.write(
+            format!("use.{extension}"),
+            "import { execute } from './api';\nexport function main(): number { return execute(); }\nmain();\n",
+        );
+        repo.commit_all("initial");
+        repo.write(&api, "export function execute(): number { return 1; }\n");
+        repo.stage_all();
+        let patch = format!(
+            "--- a/{api}\n+++ b/{api}\n@@ -1 +1 @@\n-export function execute(): number {{ return 0; }}\n+export function execute(): number {{ return 1; }}\n"
+        );
+        repo.write("change.patch", patch);
+        let patch_path = repo.path("change.patch");
+        for args in [
+            vec!["--diff-file", patch_path.to_str().unwrap()],
+            vec!["--git"],
+            vec!["--git", "--staged"],
+        ] {
+            if args.contains(&"--staged") {
+                repo.write(
+                    &api,
+                    "export function execute(value: string): string { return value; }\n",
+                );
+            }
+            let context = repo.run_json("context", &args);
+            let change = &context["changes"][0];
+            assert_eq!(
+                change["affected_symbols"][0]["name"], "execute",
+                "{context}"
+            );
+            assert_eq!(
+                change["affected_symbols"][0]["change_type"], "modified",
+                "{context}"
+            );
+            assert!(change.get("signature_changes").is_none(), "{context}");
+            assert!(change.get("impacted_callers").is_none(), "{context}");
+            for command in ["impact", "review"] {
+                if command == "impact" && args.contains(&"--diff-file") {
+                    continue;
+                }
+                let output = cargo_bin()
+                    .args([command, "--dir"])
+                    .arg(repo.root())
+                    .args(&args)
+                    .arg("--hook")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{extension}: {command}: {args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn ts_inline_body_change_still_blocks_changed_parameters_and_return_types() {
+    for new in [
+        "export function execute(value: number): number { return value; }\n",
+        "export function execute(): string { return 'one'; }\n",
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.write(
+            "api.ts",
+            "export function execute(): number { return 0; }\n",
+        );
+        repo.write(
+            "use.ts",
+            "import { execute } from './api';\nexport function main(): number { return execute(); }\nmain();\n",
+        );
+        repo.commit_all("initial");
+        repo.write("api.ts", new);
+        let context = repo.run_json("context", &["--git"]);
+        assert_eq!(
+            context["changes"][0]["signature_changes"][0]["name"], "execute",
+            "{new}: {context}"
+        );
+        for command in ["impact", "review"] {
+            let output = cargo_bin()
+                .args([command, "--dir"])
+                .arg(repo.root())
+                .args(["--git", "--hook"])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1), "{new}: {command}");
+        }
+    }
+}
+
+#[test]
 fn context_with_diff() {
     use std::io::Write;
     use std::process::Stdio;
