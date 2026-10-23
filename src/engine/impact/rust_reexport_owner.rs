@@ -327,15 +327,16 @@ fn proven_external_alias(
             if manifest.get("patch").is_some() || manifest.get("replace").is_some() {
                 return None;
             }
-            let package_root = dir.join(src.parent()?);
-            if package_root
-                .ancestors()
+            // 祖先のワークスペースの `[patch]` と、Cargo が読む設定 (祖先と `$CARGO_HOME`) による
+            // 依存の取得元・コンパイラの差し替えを除く。
+            let package_root =
+                super::rust_cargo_config::absolute_package_root(&dir.join(src.parent()?))?;
+            let cargo = &project.cargo_configs;
+            if cargo
+                .ancestors(&package_root)
                 .skip(1)
                 .any(|parent| parent.join("Cargo.toml").exists())
-                || package_root.ancestors().any(|parent| {
-                    parent.join(".cargo/config.toml").exists()
-                        || parent.join(".cargo/config").exists()
-                })
+                || !cargo.keeps_dependency_sources(&package_root)
             {
                 return None;
             }

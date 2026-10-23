@@ -334,6 +334,225 @@ fn impact_rust_external_aliases_do_not_become_blocking() {
     }
 }
 
+/// registry 依存の別名の証明は、Cargo が読む設定 (パッケージの祖先の `.cargo/config(.toml)` と
+/// `$CARGO_HOME/config(.toml)`) を、リポジトリがホームの下にあるかどうかに関係なく同じ規則で
+/// 調べる。依存の取得元やコンパイラを変える設定・環境変数や、解析できない設定があるときだけ、
+/// 別名の import を呼び出し元に残す。
+#[test]
+fn impact_rust_external_alias_reads_cargo_configs_wherever_the_repository_lives() {
+    const NEUTRAL: &str = "[build]\njobs = 2\n[net]\ngit-fetch-with-cli = true\n";
+    const PATCH: &str = "[patch.crates-io]\nanyhow = { path = \"../anyhow\" }\n";
+    const SOURCE: &str = "[source.crates-io]\nreplace-with = \"vendored\"\n[source.vendored]\ndirectory = \"vendor\"\n";
+    // 一時ディレクトリを利用者のファイルシステムに見立てる。`$CARGO_HOME` は `home/.cargo`。
+    // `home/GitHub/repo` はホームの下のリポジトリで、ホームの設定を祖先の設定としても読む。
+    // `work/repo` はホームの外。
+    // (`$CARGO_HOME/config.toml`, 環境変数, リポジトリ,
+    //  [(パッケージ, リポジトリに置く設定, 別名の import が残るか)])
+    let runs = [
+        (
+            NEUTRAL,
+            &[][..],
+            "home/GitHub/repo",
+            vec![("sample", None, false)],
+        ),
+        (
+            NEUTRAL,
+            &[][..],
+            "work/repo",
+            vec![
+                ("sample", None, false),
+                (
+                    "plain/sample",
+                    Some(("plain/.cargo/config", NEUTRAL)),
+                    false,
+                ),
+                (
+                    "vendored/sample",
+                    Some(("vendored/.cargo/config.toml", SOURCE)),
+                    true,
+                ),
+                (
+                    "broken/sample",
+                    Some(("broken/sample/.cargo/config.toml", "[patch\n")),
+                    true,
+                ),
+                (
+                    "loader/sample",
+                    Some((
+                        "loader/.cargo/config.toml",
+                        "[env]\nLD_PRELOAD = { value = \"custom.so\", force = true }\n",
+                    )),
+                    true,
+                ),
+                (
+                    "path/sample",
+                    Some((
+                        "path/.cargo/config.toml",
+                        "[env]\nPATH = { value = \"tools\", force = true }\n",
+                    )),
+                    true,
+                ),
+            ],
+        ),
+        (
+            PATCH,
+            &[][..],
+            "home/GitHub/repo",
+            vec![("sample", None, true)],
+        ),
+        (PATCH, &[][..], "work/repo", vec![("sample", None, true)]),
+        (
+            NEUTRAL,
+            &[("RUSTC_WRAPPER", "sccache")][..],
+            "work/repo",
+            vec![("sample", None, true)],
+        ),
+        (
+            NEUTRAL,
+            &[(
+                "CARGO_ENCODED_RUSTFLAGS",
+                "-C\u{1f}opt-level=1\u{1f}@flags.txt",
+            )][..],
+            "work/repo",
+            vec![("sample", None, true)],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (home_config, environment, repository, packages) in runs {
+        let root = TestRepo::new();
+        root.create_dir_all("home/.cargo");
+        root.write("home/.cargo/config.toml", home_config);
+        for (package, config, _) in &packages {
+            let package = format!("{repository}/{package}");
+            root.create_dir_all(format!("{package}/src"));
+            root.write(
+                format!("{package}/Cargo.toml"),
+                "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nanyhow = \"1\"\n",
+            );
+            root.write(
+                format!("{package}/src/lib.rs"),
+                "pub mod origin; pub mod external_dep; pub mod local;\n",
+            );
+            root.write(
+                format!("{package}/src/origin.rs"),
+                "pub struct Result { pub value: u8 }\n",
+            );
+            root.write(
+                format!("{package}/src/external_dep.rs"),
+                "use anyhow::Result as AnyResult; pub fn read(_: AnyResult<()>) {}\n",
+            );
+            root.write(
+                format!("{package}/src/local.rs"),
+                "use crate::origin::Result as LocalResult; pub fn read(_: LocalResult) {}\n",
+            );
+            if let Some((path, content)) = config {
+                let path = format!("{repository}/{path}");
+                root.create_dir_all(std::path::Path::new(&path).parent().unwrap());
+                root.write(path, content);
+            }
+        }
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "astro-sight@example.com"],
+            &["config", "user.name", "astro-sight"],
+            &["add", "."],
+            &["commit", "-m", "initial", "-q"],
+        ] {
+            root.git(["-C", repository].iter().chain(args));
+        }
+        for (package, _, _) in &packages {
+            root.write(
+                format!("{repository}/{package}/src/origin.rs"),
+                "pub struct Result { pub value: u64 }\n",
+            );
+        }
+
+        let cargo_home = root.path("home/.cargo");
+        let envs = environment
+            .iter()
+            .map(|(name, value)| (*name, std::ffi::OsStr::new(value)))
+            .chain([("CARGO_HOME", cargo_home.as_os_str())]);
+        let context = root.run_json_in(repository, envs, "context", &["--git"]);
+        for (package, config, keeps_alias) in &packages {
+            let callers = context["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|change| change["path"] == format!("{package}/src/origin.rs"))
+                .and_then(|change| change["impacted_callers"].as_array())
+                .map(|callers| {
+                    callers
+                        .iter()
+                        .filter_map(|entry| entry["path"].as_str())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !callers.contains(&format!("{package}/src/local.rs").as_str())
+                || callers.contains(&format!("{package}/src/external_dep.rs").as_str())
+                    != *keeps_alias
+            {
+                failures.push(format!(
+                    "home {home_config:?}, env {environment:?}, {repository}/{package} {config:?}: {callers:?}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// review --staged は index を一時ディレクトリに書き出して解析する。そこからは Cargo が実際に
+/// 読む設定 (元のリポジトリの祖先と、追跡していない `.cargo/config.toml`) が見えないので、
+/// registry 依存の別名を証明せず呼び出し元に残す。作業ツリーの review では従来どおり外す。
+#[test]
+fn impact_rust_external_alias_stays_in_staged_review() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nanyhow = \"1\"\n",
+    );
+    repo.write(
+        "src/lib.rs",
+        "pub mod origin; pub mod external_dep; pub mod local;\n",
+    );
+    repo.write("src/origin.rs", "pub struct Result { pub value: u8 }\n");
+    repo.write(
+        "src/external_dep.rs",
+        "use anyhow::Result as AnyResult; pub fn read(_: AnyResult<()>) {}\n",
+    );
+    repo.write(
+        "src/local.rs",
+        "use crate::origin::Result as LocalResult; pub fn read(_: LocalResult) {}\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("src/origin.rs", "pub struct Result { pub value: u64 }\n");
+    repo.stage_all();
+
+    for (args, keeps_alias) in [(&["--git"][..], false), (&["--git", "--staged"][..], true)] {
+        let review = repo.run_json("review", args);
+        let callers = review["impact"]["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|change| change["path"] == "src/origin.rs")
+            .and_then(|change| change["impacted_callers"].as_array())
+            .map(|callers| {
+                callers
+                    .iter()
+                    .filter_map(|entry| entry["path"].as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert!(callers.contains(&"src/local.rs"), "{args:?}: {review}");
+        assert_eq!(
+            callers.contains(&"src/external_dep.rs"),
+            keeps_alias,
+            "{args:?}: {review}"
+        );
+    }
+}
+
 #[test]
 fn impact_rust_reexport_owner_survives_unrelated_module_wiring() {
     let repo = TestRepo::new();
