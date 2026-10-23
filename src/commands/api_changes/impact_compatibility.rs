@@ -48,7 +48,33 @@ pub(crate) fn compatible_impact_names(
 ) -> BTreeMap<String, BTreeSet<String>> {
     let mut candidates: BTreeMap<String, Vec<CompatibleApiModification>> = BTreeMap::new();
     let mut names = BTreeSet::new();
-    for change in detect_api_changes(dir, base, diff_files).compatible_modified {
+    let api = detect_api_changes(dir, base, diff_files);
+    let mut changes = api.compatible_modified;
+    if api.modified_closed_in_diff.iter().any(|change| {
+        matches!(change.kind.as_str(), "function" | "interface" | "trait")
+            && matches!(
+                crate::language::LangId::from_path(camino::Utf8Path::new(&change.file)),
+                Ok(crate::language::LangId::Typescript | crate::language::LangId::Tsx)
+            )
+    }) {
+        let blobs = GitBlobBatch::new(dir, base);
+        if let Some(proof) = super::ts_function_values::HandoffProof::build(dir, &blobs, diff_files)
+        {
+            for change in api.modified_closed_in_diff {
+                if proof.covers(&change.file, &change.name) {
+                    changes.push(CompatibleApiModification {
+                        name: change.name,
+                        kind: change.kind,
+                        file: change.file,
+                        old_signature: change.old_signature,
+                        new_signature: change.new_signature,
+                        reason: "closed_function_value_handoff".to_owned(),
+                    });
+                }
+            }
+        }
+    }
+    for change in changes {
         names.insert(bare_name(&change.name).to_string());
         candidates
             .entry(change.file.clone())
