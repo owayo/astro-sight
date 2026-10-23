@@ -1530,10 +1530,8 @@ fn source_has_include_macro(source: &[u8]) -> bool {
             return true;
         }
         if node.kind() == "use_declaration"
-            && node
-                .utf8_text(source)
-                .ok()
-                .is_none_or(|text| text.contains("include"))
+            && (node.utf8_text(source).is_err()
+                || crate::engine::rust_dynamic_source::node_includes_external_source(node, source))
         {
             return true;
         }
@@ -2227,6 +2225,37 @@ mod tests {
         assert!(!source_has_include_macro(
             b"fn helper() { println!(\"include! in text\"); }\n"
         ));
+    }
+
+    #[test]
+    fn private_leaf_include_imports_match_the_identifier() {
+        for source in [
+            "use paths::compile_includes;\n",
+            "use paths::{compile_includes, compile_excludes};\n",
+            "use paths::include_helper as compile_includes;\n",
+            "use std::{include_str, include_bytes};\n",
+            "use paths /* include */ :: compile_includes;\n",
+            "use paths::{r#compile_includes};\n",
+            "use paths::includes;\n",
+        ] {
+            assert!(!source_has_include_macro(source.as_bytes()), "{source}");
+        }
+        for source in [
+            "use std::include as load;\n",
+            "use std::{include as load};\n",
+            "use std /* note */ :: r#include as load;\n",
+            "use std::{r#include as load, include_str};\n",
+            "use custom::load as include;\n",
+            "use std::{self, nested::{r#include as load}};\n",
+            "fn f() { assert!(include.matches()); }\n",
+            "macro_rules! load { ($head:ident.$tail:ident) => { $head!(\"a.rs\"); } }\nload!(include.any);\n",
+        ] {
+            assert!(source_has_include_macro(source.as_bytes()), "{source}");
+        }
+        assert!(source_has_include_macro(
+            b"use paths /* include \xff */ ::compile_includes;\n"
+        ));
+        assert!(source_has_include_macro(b"use std::{include;\n"));
     }
 
     #[test]
