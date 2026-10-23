@@ -26,7 +26,6 @@ pub(super) enum TargetKind {
     Other,
 }
 
-#[allow(dead_code)]
 pub(super) struct CrateInput {
     pub(super) package: Rc<str>,
     pub(super) kind: TargetKind,
@@ -50,11 +49,10 @@ pub(super) struct Layout {
     unknown_directories: Vec<PathBuf>,
     unproven_files: HashSet<Rc<str>>,
     // 同じ実体を異なる Cargo target が使う場合も、root のコンパイル文脈は分けて保持する。
-    #[allow(dead_code)]
     pub(super) packages: HashMap<Rc<str>, Rc<toml::Value>>,
-    #[allow(dead_code)]
+    /// 入力集合の監査で確認した表記から、manifest の実体が属する package への対応。
+    package_paths: HashMap<Rc<str>, Rc<str>>,
     pub(super) crate_inputs: HashMap<usize, CrateInput>,
-    #[allow(dead_code)]
     pub(super) library_roots: HashMap<Rc<str>, usize>,
 }
 
@@ -88,6 +86,14 @@ impl Layout {
         self.occurrences[self.occurrences[occurrence].root]
             .module
             .clone()
+    }
+
+    pub(super) fn package_at(&self, base: &str, raw: &str) -> Option<Rc<str>> {
+        let path = normalized(&join_relative(Path::new(base), raw)?)?;
+        let package = self.package_paths.get(path.as_str())?;
+        self.packages
+            .get_key_value(package.as_ref())
+            .map(|(key, _)| key.clone())
     }
 
     pub(super) fn parent(&self, occurrence: usize) -> Option<ModuleRef> {
@@ -137,6 +143,7 @@ impl Builder {
                 unknown_directories: Vec::new(),
                 unproven_files: HashSet::new(),
                 packages: HashMap::new(),
+                package_paths: HashMap::new(),
                 crate_inputs: HashMap::new(),
                 library_roots: HashMap::new(),
             },
@@ -186,8 +193,20 @@ impl Builder {
         }
         let mut closed = HashSet::new();
         let mut input_edges = queue.len();
-        while let Some(path) = queue.pop_front() {
-            let path = self.plain(&path, false)??;
+        while let Some(raw_path) = queue.pop_front() {
+            let path = self.plain(&raw_path, false)??;
+            let package: Rc<str> = normalized(path.parent()?)?.into();
+            // 同じ manifest を既に読んでいても、依存の表記違いは先に記録する。
+            for alias in [normalized(raw_path.parent()?)?.into(), package.clone()] {
+                if let Some(previous) = self.layout.package_paths.insert(alias, package.clone())
+                    && previous != package
+                {
+                    return None;
+                }
+            }
+            if self.layout.package_paths.len() > MAX_ENTRIES {
+                return None;
+            }
             if !closed.insert(path.clone()) {
                 continue;
             }

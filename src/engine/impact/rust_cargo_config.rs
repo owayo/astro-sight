@@ -86,7 +86,7 @@ const COMPILER_VARIABLES: &[&str] = &[
 ];
 
 /// 解析の開始時に捕まえた Cargo の環境と、設定ディレクトリごとの判定。
-pub(super) struct CargoConfigProof {
+pub(crate) struct CargoConfigProof {
     /// `$CARGO_HOME`。環境変数がコンパイラか rustflags を差し替えうるとき、staged の一時
     /// スナップショットの中を解析するとき (Cargo が読む設定の置き場所が分からない)、
     /// `$CARGO_HOME` を決められないときは `None` で、証明しない。
@@ -98,7 +98,7 @@ pub(super) struct CargoConfigProof {
 
 impl CargoConfigProof {
     /// `root` を解析するこのプロセスの環境から作る。
-    pub(super) fn capture(root: &Path) -> Self {
+    pub(crate) fn capture(root: &Path) -> Self {
         let observable = !crate::git_support::is_inside_index_snapshot(root)
             && environment_keeps_compilation(std::env::vars_os());
         let home = observable
@@ -138,7 +138,7 @@ impl CargoConfigProof {
 
     /// Cargo が `package_root` で読む設定が、どれも依存の取得元とコンパイラを変えないと
     /// 確かめられたか。
-    pub(super) fn keeps_dependency_sources(&self, package_root: &Path) -> bool {
+    pub(crate) fn keeps_dependency_sources(&self, package_root: &Path) -> bool {
         let Some(home) = &self.home else {
             return false;
         };

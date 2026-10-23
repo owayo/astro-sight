@@ -625,3 +625,305 @@ fn rust_reference_sites_removal_distinguishes_other_crate_methods_and_free_calls
         );
     }
 }
+
+const HAS_FLAG: &str = "pub fn has_flag(s: Option<&str>) -> bool {\n    s == Some(\"tasks\")\n}\n";
+
+fn crate_manifest(name: &str, dependencies: &str) -> String {
+    format!(
+        "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n{dependencies}"
+    )
+}
+
+/// workspace のクレート alpha の `items::has_flag` を beta へ移し (alpha の items.rs は削除)、
+/// 同じ名前の関数 `gamma_function` を gamma にも足す (Issue #115 の再現)。`alpha_lib` と
+/// `alpha_dependencies` は変更後の alpha の lib.rs と依存、`extra` は変更後に書くファイル。
+fn api_after_moving_to_other_crate(
+    alpha_lib: &str,
+    alpha_dependencies: &str,
+    gamma_function: &str,
+    extra: &[(&str, &str)],
+) -> ApiChanges {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let (alpha, beta, gamma) = (
+        crate_manifest("alpha", ""),
+        crate_manifest("beta", ""),
+        crate_manifest("gamma", ""),
+    );
+    git_commit_files(
+        repo,
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"crates/alpha\", \"crates/beta\", \"crates/gamma\"]\nresolver = \"2\"\n",
+            ),
+            ("crates/alpha/Cargo.toml", &alpha),
+            (
+                "crates/alpha/src/lib.rs",
+                "pub mod items;\n\npub fn check() -> bool {\n    items::has_flag(None)\n}\n",
+            ),
+            ("crates/alpha/src/items.rs", HAS_FLAG),
+            ("crates/beta/Cargo.toml", &beta),
+            ("crates/beta/src/lib.rs", "pub mod items;\n"),
+            ("crates/beta/src/items.rs", ""),
+            ("crates/gamma/Cargo.toml", &gamma),
+            (
+                "crates/gamma/src/lib.rs",
+                "pub fn other() -> i32 {\n    1\n}\n",
+            ),
+        ],
+        "base",
+    );
+    fs::remove_file(repo.join("crates/alpha/src/items.rs")).unwrap();
+    fs::write(
+        repo.join("crates/alpha/Cargo.toml"),
+        crate_manifest("alpha", alpha_dependencies),
+    )
+    .unwrap();
+    fs::write(repo.join("crates/beta/src/items.rs"), HAS_FLAG).unwrap();
+    fs::write(repo.join("crates/alpha/src/lib.rs"), alpha_lib).unwrap();
+    fs::write(
+        repo.join("crates/gamma/src/lib.rs"),
+        format!(
+            "pub fn other() -> i32 {{\n    1\n}}\n\npub fn {gamma_function}(s: Option<&str>) -> bool {{\n    s == Some(\"tasks\")\n}}\n"
+        ),
+    )
+    .unwrap();
+    for (path, source) in extra {
+        let full = repo.join(path);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, source).unwrap();
+    }
+    detect_api_changes_from_worktree(repo)
+}
+
+const BETA_DEPENDENCY: &str = "beta = { path = \"../beta\" }\n";
+const CHECK_THROUGH_BETA: &str = "pub fn check() -> bool {\n    beta::items::has_flag(None)\n}\n";
+
+#[test]
+fn rust_reference_sites_removal_keeps_conditional_dependency_roots() {
+    for attribute in ["#![cfg(any())]", "#![cfg_attr(all(), cfg(any()))]"] {
+        let root = format!("{attribute}\npub mod items;\n");
+        let api = api_after_moving_to_other_crate(
+            CHECK_THROUGH_BETA,
+            BETA_DEPENDENCY,
+            "has_flag",
+            &[("crates/beta/src/lib.rs", &root)],
+        );
+        assert!(
+            api.removed.iter().any(|symbol| symbol.name == "has_flag"),
+            "{attribute}: {api:?}"
+        );
+        assert!(
+            api.removed_dead
+                .iter()
+                .all(|symbol| symbol.name != "has_flag"),
+            "{attribute}: {api:?}"
+        );
+    }
+    let api = api_after_moving_to_other_crate(
+        CHECK_THROUGH_BETA,
+        BETA_DEPENDENCY,
+        "has_flag",
+        &[(
+            "crates/beta/src/lib.rs",
+            "#![cfg_attr(all(), allow(dead_code))]\npub mod items;\n",
+        )],
+    );
+    assert!(
+        api.removed_dead
+            .iter()
+            .any(|symbol| symbol.name == "has_flag"),
+        "{api:?}"
+    );
+}
+
+#[test]
+fn rust_reference_sites_removal_keeps_nfc_equivalent_local_module_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let alpha = crate_manifest("alpha", "K = { path = \"../beta\", package = \"beta\" }\n");
+    let beta = crate_manifest("beta", "");
+    git_commit_files(
+        repo,
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"alpha\", \"beta\"]\nresolver = \"2\"\n",
+            ),
+            ("alpha/Cargo.toml", &alpha),
+            (
+                "alpha/src/lib.rs",
+                "pub mod \u{212a} { pub mod items { pub fn run() {} } }\npub fn caller() { K::items::run(); }\n",
+            ),
+            ("beta/Cargo.toml", &beta),
+            ("beta/src/lib.rs", "pub mod items { pub fn run() {} }\n"),
+        ],
+        "base",
+    );
+    fs::write(
+        repo.join("alpha/src/lib.rs"),
+        "pub mod \u{212a} { pub mod items {} }\npub fn caller() { K::items::run(); }\n",
+    )
+    .unwrap();
+    let api = detect_api_changes_from_worktree(repo);
+    assert!(
+        api.removed.iter().any(|symbol| symbol.name == "run"),
+        "{api:?}"
+    );
+    assert!(
+        api.removed_dead.iter().all(|symbol| symbol.name != "run"),
+        "{api:?}"
+    );
+}
+
+/// 移動先が 2 つで moved にならない削除でも、依存クレートの名前で始まるパスが依存先の残る
+/// 関数に解決できれば、消した関数の残存参照に数えない (Issue #115)。
+#[test]
+fn rust_reference_sites_removal_resolves_paths_into_dependency_crates() {
+    for (alpha_lib, dependencies, extra) in [
+        // 再現: 依存のキー・改名した依存・`::` で始まる外部クレートのパス・workspace の依存
+        (CHECK_THROUGH_BETA, BETA_DEPENDENCY, vec![]),
+        (
+            "pub fn check() -> bool {\n    shared::items::has_flag(None)\n}\n",
+            "shared = { path = \"../beta\", package = \"beta\" }\n",
+            vec![],
+        ),
+        (
+            "pub fn check() -> bool {\n    ::beta::items::has_flag(None)\n}\n",
+            BETA_DEPENDENCY,
+            vec![],
+        ),
+        (
+            CHECK_THROUGH_BETA,
+            "beta = { workspace = true }\n",
+            vec![(
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"crates/alpha\", \"crates/beta\", \"crates/gamma\"]\nresolver = \"2\"\n\n[workspace.dependencies]\nbeta = { path = \"crates/beta\" }\n",
+            )],
+        ),
+    ] {
+        let api = api_after_moving_to_other_crate(alpha_lib, dependencies, "has_flag", &extra);
+        assert!(api.moved.is_empty(), "{alpha_lib}: {api:?}");
+        assert!(
+            api.removed.iter().all(|s| s.name != "has_flag"),
+            "{alpha_lib}{dependencies}: {api:?}"
+        );
+        assert!(
+            api.removed_dead.iter().any(|s| s.name == "has_flag"),
+            "{alpha_lib}{dependencies}: {api:?}"
+        );
+    }
+    // 対照: 移動先が 1 つなら従来どおり moved
+    let api =
+        api_after_moving_to_other_crate(CHECK_THROUGH_BETA, BETA_DEPENDENCY, "has_other_flag", &[]);
+    assert!(api.moved.iter().any(|s| s.name == "has_flag"), "{api:?}");
+}
+
+/// 依存クレートを指すと確かめられないパスと、消した関数を指し得るパスは api.rm に残す (Issue #115)。
+#[test]
+fn rust_reference_sites_removal_keeps_unproven_dependency_paths() {
+    // 再公開はグロブにして、`has_flag` の語がパスの判定にだけ現れるようにする
+    let local_beta = [(
+        "crates/alpha/src/beta.rs",
+        "pub mod items {\n    pub use crate::items::*;\n}\n",
+    )];
+    let beta_reexport = [
+        (
+            "crates/beta/src/lib.rs",
+            "pub mod items;\npub mod reexport;\n",
+        ),
+        (
+            "crates/beta/src/reexport.rs",
+            "pub use alpha_old::items::*;\n",
+        ),
+    ];
+    let cases: &[RemovalCase<'_>] = &[
+        // 消した関数のモジュールを指すパスと import (cargo check は失敗する)
+        (
+            "pub fn check() -> bool {\n    crate::items::has_flag(None)\n}\n",
+            BETA_DEPENDENCY,
+            &[],
+        ),
+        (
+            "use crate::items::has_flag;\n\npub fn check() -> bool {\n    has_flag(None)\n}\n",
+            BETA_DEPENDENCY,
+            &[],
+        ),
+        // 同じ名前のローカルの mod が消した関数を再公開し得る・use の別名・extern crate
+        (
+            "mod beta;\n\npub fn check() -> bool {\n    beta::items::has_flag(None)\n}\n",
+            BETA_DEPENDENCY,
+            &local_beta,
+        ),
+        (
+            "use gamma as beta;\n\npub fn check() -> bool {\n    beta::has_flag(None)\n}\n",
+            "beta = { path = \"../beta\" }\ngamma = { path = \"../gamma\" }\n",
+            &[],
+        ),
+        (
+            "extern crate self as beta;\n\npub fn check() -> bool {\n    beta::items::has_flag(None)\n}\n",
+            BETA_DEPENDENCY,
+            &[],
+        ),
+        (
+            "macro_rules! bind { () => { extern crate self as beta; } }\nbind!();\npub mod caller;\n",
+            BETA_DEPENDENCY,
+            &[("crates/alpha/src/caller.rs", CHECK_THROUGH_BETA)],
+        ),
+        (
+            "macro_rules! bind { () => { extern crate self as beta; } }\nbind!();\npub fn check() -> bool { ::beta::items::has_flag(None) }\n",
+            BETA_DEPENDENCY,
+            &[],
+        ),
+        (
+            CHECK_THROUGH_BETA,
+            "beta = { path = \"../beta\", package = \"different\" }\n",
+            &[],
+        ),
+        (
+            CHECK_THROUGH_BETA,
+            "beta = { path = \"../beta\", optional = \"true\" }\n",
+            &[],
+        ),
+        // グロブ・マクロの中・依存に無い名前・registry の依存・依存先の再公開・patch
+        (
+            "use std::collections::*;\n\npub fn check() -> bool {\n    beta::items::has_flag(None)\n}\n",
+            BETA_DEPENDENCY,
+            &[],
+        ),
+        (
+            "macro_rules! call { ($e:expr) => { $e }; }\n\npub fn check() -> bool {\n    call!(beta::items::has_flag(None))\n}\n",
+            BETA_DEPENDENCY,
+            &[],
+        ),
+        (CHECK_THROUGH_BETA, "", &[]),
+        (CHECK_THROUGH_BETA, "beta = \"0.1\"\n", &[]),
+        (
+            "pub fn check() -> bool {\n    beta::reexport::has_flag(None)\n}\n",
+            BETA_DEPENDENCY,
+            &beta_reexport,
+        ),
+        (
+            CHECK_THROUGH_BETA,
+            BETA_DEPENDENCY,
+            &[(
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"crates/alpha\", \"crates/beta\", \"crates/gamma\"]\nresolver = \"2\"\n\n[patch.crates-io]\nbeta = { path = \"crates/alpha\" }\n",
+            )],
+        ),
+    ];
+    for (alpha_lib, dependencies, extra) in cases {
+        let api = api_after_moving_to_other_crate(alpha_lib, dependencies, "has_flag", extra);
+        assert!(
+            api.removed.iter().any(|s| s.name == "has_flag"),
+            "{alpha_lib}{dependencies}{extra:?}: {api:?}"
+        );
+        assert!(
+            api.removed_dead.iter().all(|s| s.name != "has_flag"),
+            "{alpha_lib}{dependencies}{extra:?}: {api:?}"
+        );
+    }
+}

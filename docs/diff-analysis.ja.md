@@ -279,6 +279,8 @@ astro-sight review --dir . --git \
 
 ファイルをまたぐ証拠は、解析 root 内で発見した Cargo manifest と、workspace・member・path 依存の閉包を使う。任意の拡張子の明示 target、build script、標準の library/bin/test/example/bench root を列挙し、明示した `mod` 宣言ごとに親と子の探索ディレクトリを保持する。同じファイルに複数の所属があれば、すべてが同じ参照先を証明する場合だけ分類する。未知の所属があれば証明せず、条件付き・曖昧な mod の辺はすべて監査し、都合のよい一方を選ばない。
 
+`beta::items::run()`・`::beta::items::run()` などの外部パスも、通常の非 optional なローカル path 依存の残存する直接関数を証明できる。依存の改名、lib 名、workspace 継承、明示 lib root を同じ Cargo 入力閉包で確認し、すべての所属で結果が一致する必要がある。パスは入力監査で記録した package の実体との対応を使い、大文字小文字を区別するディレクトリ名を一律に変換しない。型の名前空間に非 ASCII の宣言があれば、NFC 同値のローカル名を否定できないため依存への fallback を保留するが、既存の file-local 証明と明示した `::` パスは保つ。build script の所属、条件付き inner cfg を持つ依存 root、依存先の競合、再公開、不明な名前の隠蔽や生成 extern alias、未対応の依存フィールド、コンパイラ・取得元の差し替えがあれば blocking を保つ。この証明では registry/git 依存を解決せず、曖昧な移動の対応付けも変えない。
+
 到達したソースの取り込み（`#[path]`・`include!`）、配置変更を否定できない宣言マクロのテンプレート、解析 root 自身や配下の symlink、読取・解析失敗、資源上限の超過があればファイル間の証拠を使わない。モジュール位置の未展開マクロは、その子の探索ディレクトリ以下を ignore なしで再帰的に監査する。祖先ディレクトリの alias は実体パスへ正規化して配置グラフを作るが、Cargo 入力は論理・実体の両祖先を監査する。Cargo の実行場所を解析 root として、root・祖先・有効な `CARGO_HOME` の config を読み、ソース差し替えや未対応の config include があれば証明しない。入力閉包外の無視された独立 package、解析 root 外の独立 crate、別の実行場所でだけ使う config、未展開 proc macro や解析入力外のマクロ定義が生成する配置変更は保証対象外とする。ファイル内で完結する証拠は、この配置証明に依存しない。
 
 ### Python の受け手が未解決なメンバー削除

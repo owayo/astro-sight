@@ -298,3 +298,119 @@ fn rust_reference_sites_hook_removal_keeps_unproven_field_values_blocking() {
         );
     }
 }
+
+/// workspace のクレート alpha の `items::has_flag` を beta へ移し、同じ名前・同じシグネチャの
+/// 関数 `gamma_function` を gamma にも足した差分の hook 出力と終了コード (Issue #115)。
+fn hook_after_moving_to_other_crate(
+    alpha_lib: &str,
+    gamma_function: &str,
+) -> (Option<i32>, serde_json::Value) {
+    hook_after_moving_to_other_crate_with_env(alpha_lib, gamma_function, None)
+}
+
+fn hook_after_moving_to_other_crate_with_env(
+    alpha_lib: &str,
+    gamma_function: &str,
+    environment: Option<(&str, &str)>,
+) -> (Option<i32>, serde_json::Value) {
+    let has_flag = "pub fn has_flag(s: Option<&str>) -> bool {\n    s == Some(\"tasks\")\n}\n";
+    let manifest = |name: &str, dependencies: &str| {
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n{dependencies}"
+        )
+    };
+    let repo = TestRepo::new();
+    for directory in ["crates/alpha/src", "crates/beta/src", "crates/gamma/src"] {
+        repo.create_dir_all(directory);
+    }
+    repo.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/alpha\", \"crates/beta\", \"crates/gamma\"]\nresolver = \"2\"\n",
+    );
+    repo.write("crates/alpha/Cargo.toml", manifest("alpha", ""));
+    repo.write(
+        "crates/alpha/src/lib.rs",
+        "pub mod items;\n\npub fn check() -> bool {\n    items::has_flag(None)\n}\n",
+    );
+    repo.write("crates/alpha/src/items.rs", has_flag);
+    repo.write("crates/beta/Cargo.toml", manifest("beta", ""));
+    repo.write("crates/beta/src/lib.rs", "pub mod items;\n");
+    repo.write("crates/beta/src/items.rs", "");
+    repo.write("crates/gamma/Cargo.toml", manifest("gamma", ""));
+    repo.write(
+        "crates/gamma/src/lib.rs",
+        "pub fn other() -> i32 {\n    1\n}\n",
+    );
+    repo.init_git();
+    repo.commit_all("base");
+    repo.remove_file("crates/alpha/src/items.rs");
+    repo.write(
+        "crates/alpha/Cargo.toml",
+        manifest("alpha", "beta = { path = \"../beta\" }\n"),
+    );
+    repo.write("crates/beta/src/items.rs", has_flag);
+    repo.write("crates/alpha/src/lib.rs", alpha_lib);
+    repo.write(
+        "crates/gamma/src/lib.rs",
+        format!(
+            "pub fn other() -> i32 {{\n    1\n}}\n\npub fn {gamma_function}(s: Option<&str>) -> bool {{\n    s == Some(\"tasks\")\n}}\n"
+        ),
+    );
+    let mut command = cargo_bin();
+    command.args([
+        "review",
+        "--dir",
+        repo.root().to_str().unwrap(),
+        "--git",
+        "--hook",
+    ]);
+    if let Some((name, value)) = environment {
+        command.env(name, value);
+    }
+    let output = command.output().unwrap();
+    let hook = serde_json::from_slice(&output.stderr).unwrap();
+    (output.status.code(), hook)
+}
+
+/// Issue #115: 移動先が 2 つで moved にならない削除でも、依存クレートの名前で始まるパスが依存先の
+/// 残る関数に解決できれば rm_dead にする。移動先が 1 つなら従来どおり moved、消した関数を指す
+/// パスが残れば api.rm。
+#[test]
+fn rust_reference_sites_hook_removal_resolves_dependency_crate_paths() {
+    let through_beta = "pub fn check() -> bool {\n    beta::items::has_flag(None)\n}\n";
+    let (code, hook) = hook_after_moving_to_other_crate(through_beta, "has_flag");
+    assert_eq!(code, Some(0), "{hook}");
+    assert!(hook_lists(&hook, "rm_dead", "has_flag"), "{hook}");
+    assert!(!hook_lists(&hook, "rm", "has_flag"), "{hook}");
+
+    let (code, hook) = hook_after_moving_to_other_crate(through_beta, "has_other_flag");
+    assert_eq!(code, Some(0), "{hook}");
+    assert!(
+        hook["api"]["moved"]
+            .as_array()
+            .is_some_and(|moved| moved.iter().any(|symbol| symbol["n"] == "has_flag")),
+        "{hook}"
+    );
+
+    let (code, hook) = hook_after_moving_to_other_crate(
+        "pub fn check() -> bool {\n    crate::items::has_flag(None)\n}\n",
+        "has_flag",
+    );
+    assert_eq!(code, Some(1), "{hook}");
+    assert!(hook_lists(&hook, "rm", "has_flag"), "{hook}");
+}
+
+#[test]
+fn rust_reference_sites_dependency_paths_keep_compiler_overrides_blocking() {
+    let through_beta = "pub fn check() -> bool { beta::items::has_flag(None) }\n";
+    for environment in [
+        ("RUSTFLAGS", "--extern beta=other.rlib"),
+        ("CARGO_ENCODED_RUSTFLAGS", "--extern\u{1f}beta=other.rlib"),
+        ("RUSTC_WRAPPER", "unknown-compiler-wrapper"),
+    ] {
+        let (code, hook) =
+            hook_after_moving_to_other_crate_with_env(through_beta, "has_flag", Some(environment));
+        assert_eq!(code, Some(1), "{environment:?}: {hook}");
+        assert!(hook_lists(&hook, "rm", "has_flag"), "{hook}");
+    }
+}
