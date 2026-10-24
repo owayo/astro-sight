@@ -1,14 +1,317 @@
-//! TypeScript の interface / object 型の type alias へ必須プロパティを足した変更の閉包判定
-//! (Issue #89)。値を作る箇所と受け取る関数の呼び出し側が同一 diff で追随していれば
-//! `modified_closed_in_diff`、1 つでも証明できなければ blocking な `modified` に残す。
-//!
-//! 各ケースの変更後のソースは、tsc 5.9 (strict) で「closed」のものが型検査を通り、
-//! 「blocking」のうち型エラーになるもの (未更新の箇所が残るもの) が実際に落ちることを
-//! 確かめてある。
+//! TypeScript の必須プロパティ追加・型縮小・プロパティ削除の閉包判定。
+//! 値の作成と利用の義務が証明できれば `modified_closed_in_diff`、
+//! 1 つでも証明できなければ blocking な `modified` に残す。
 
 use crate::commands::tests::common::*;
 use crate::models::review::ApiChanges;
 use std::fs;
+
+const REMOVAL_ROW_BASE: &str = "export interface Row {\n    id: string;\n    note: string;\n    extra: number;\n}\nexport function toRow(id: string): Row {\n    return { id, note: id, extra: 0 };\n}\n";
+const REMOVAL_VIEW_BASE: &str = "import { type Row, toRow } from './row';\nexport function label(row: Row): string {\n    return `${row.id} (${row.note}, ${row.extra})`;\n}\nexport const first = label(toRow('a'));\n";
+
+fn removal_row() -> String {
+    REMOVAL_ROW_BASE
+        .replace("    extra: number;\n", "")
+        .replace(", extra: 0", "")
+}
+
+fn removal_view() -> String {
+    REMOVAL_VIEW_BASE.replace(", ${row.extra}", "")
+}
+
+fn removal_verdict(row: &str, view: &str, extra: &[(&str, &str)]) -> Verdict {
+    let mut base = vec![
+        ("src/row.ts", REMOVAL_ROW_BASE),
+        ("src/view.ts", REMOVAL_VIEW_BASE),
+    ];
+    base.extend_from_slice(extra);
+    verdict(
+        &api_after(&base, &[("src/row.ts", row), ("src/view.ts", view)]),
+        "Row",
+    )
+}
+
+#[test]
+fn member_property_removal_closes_updated_producer_and_consumer() {
+    assert_eq!(
+        removal_verdict(&removal_row(), &removal_view(), &[]),
+        Verdict::Closed
+    );
+    let alias = |source: &str| {
+        source
+            .replace("export interface Row {", "export type Row = {")
+            .replace("\n}\nexport function", "\n};\nexport function")
+    };
+    let api = api_after(
+        &[
+            ("src/row.ts", &alias(REMOVAL_ROW_BASE)),
+            ("src/view.ts", REMOVAL_VIEW_BASE),
+        ],
+        &[
+            ("src/row.ts", &alias(&removal_row())),
+            ("src/view.ts", &removal_view()),
+        ],
+    );
+    assert_eq!(verdict(&api, "Row"), Verdict::Closed, "{api:?}");
+}
+
+#[test]
+fn member_property_removal_accepts_const_and_unused_optional_properties() {
+    let row = removal_row();
+    let view = removal_view().replace(
+        "export const first = label(toRow('a'));",
+        "const SAMPLE: Row = { id: 'a', note: 'a' };\nexport const first = label(SAMPLE);",
+    );
+    assert_eq!(removal_verdict(&row, &view, &[]), Verdict::Closed);
+    let base = REMOVAL_ROW_BASE
+        .replace("extra: number", "extra?: number")
+        .replace(", extra: 0", "");
+    let api = api_after(
+        &[("src/row.ts", &base), ("src/view.ts", &removal_view())],
+        &[("src/row.ts", &removal_row())],
+    );
+    assert_eq!(verdict(&api, "Row"), Verdict::Closed, "{api:?}");
+    let row = removal_row().replace(
+        "return { id, note: id };",
+        "const note: string = id; return { id, note };",
+    );
+    assert_eq!(removal_verdict(&row, &removal_view(), &[]), Verdict::Closed);
+}
+
+#[test]
+fn member_property_removal_keeps_residual_keys_and_unknown_value_uses_blocking() {
+    let row = removal_row();
+    let view = removal_view();
+    for body in [
+        "return row.extra;",
+        "row.extra = 1; return row.id;",
+        "row.extra += 1; return row.id;",
+        "row.extra++; return row.id;",
+        "delete row.extra; return row.id;",
+        "for (row.extra of [1]) {} return row.id;",
+        "const { extra } = row; return row.id;",
+        "const { extra: renamed } = row; return row.id;",
+        "return row['extra'];",
+        "return row[`extra`];",
+        "return row?.extra;",
+        "const key = 'extra'; return row[key];",
+        "const key = 'id'; return row[key];",
+        "send(row); return row.id;",
+        "const alias = row; return alias.id;",
+        "const { id } = row; return id;",
+    ] {
+        let changed = view.replace("return `${row.id} (${row.note})`;", body);
+        assert_eq!(
+            removal_verdict(&row, &changed, &[]),
+            Verdict::Blocking,
+            "{body}"
+        );
+    }
+    for object in [
+        "{}",
+        "{ id }",
+        "{ id: 1, note: id }",
+        "{ id, note: id, extra: 0 }",
+        "{ id, note: id, extra }",
+        "{ id, note: id, get extra() { return 0; } }",
+        "{ id, note: id, extra() {} }",
+        "{ id, note: id, ...other }",
+        "{ id, note: id, [key]: 0 }",
+        "{ id, note: id } as Row",
+        "other!",
+        "{ id, note: id as string }",
+        "{ id, note: id! }",
+    ] {
+        let changed = row.replace("{ id, note: id };", &format!("{object};"));
+        assert_eq!(
+            removal_verdict(&changed, &view, &[]),
+            Verdict::Blocking,
+            "{object}"
+        );
+    }
+    for changed in [
+        row.replace("id: string): Row", "id: any): Row"),
+        row.replace(
+            "return { id, note: id };",
+            "const note: string = sourceAny; return { id, note };",
+        ),
+        row.replace(
+            "return { id, note: id };",
+            "const note: string = maybe!; return { id, note };",
+        ),
+        row.replace(
+            "return { id, note: id };",
+            "if (id) return { id, note: id };",
+        ),
+    ] {
+        assert_eq!(
+            removal_verdict(&changed, &view, &[]),
+            Verdict::Blocking,
+            "{changed}"
+        );
+    }
+}
+
+#[test]
+fn member_property_removal_checks_type_keys_escapes_aliases_and_hidden_sources() {
+    for (path, extra) in [
+        (
+            "src/extra.ts",
+            "import type { Row } from './row'; type Picked = Pick<Row, 'extra'>;",
+        ),
+        (
+            "src/extra.ts",
+            "import type { Row } from './row'; type Picked = Row['extra'];",
+        ),
+        (
+            "src/extra.ts",
+            "import type { Row } from './row'; type Keys = keyof Row;",
+        ),
+        ("src/extra.ts", "export const other = { extra: 1 };"),
+        (
+            "src/extra.ts",
+            r#"export const value = other["\u0065xtra"];"#,
+        ),
+        ("src/extra.ts", r#"export const value = other.e\u0078tra;"#),
+        ("src/extra.ts", r#"const { "\u0065xtra": value } = other;"#),
+        (
+            "src/extra.ts",
+            "import { toRow } from './row'; export const value = toRow('a')['extra'];",
+        ),
+        (
+            "src/extra.ts",
+            "import { toRow } from './row'; type Copied = ReturnType<typeof toRow>;",
+        ),
+        (
+            "src/extra.ts",
+            "import { toRow as make } from './row'; export const value = make('a');",
+        ),
+        (
+            "src/extra.ts",
+            "import type { Row as Alias } from './row'; export const value: Alias = { id: 'a', note: 'a' };",
+        ),
+        (
+            "src/extra.ts",
+            "import type { Row } from './row'; type Alias = Row;",
+        ),
+        (
+            "src/extra.js",
+            "/** @type {ReturnType<typeof toRow>} */ const copied = null;",
+        ),
+        ("src/extra.vue", "<template>{{ value.extra }}</template>"),
+        (
+            "src/extra.vue",
+            r#"<template>{{ value["\u0065xtra"] }}</template>"#,
+        ),
+        ("src/extra.ts", "export const other = { extra: ;"),
+    ] {
+        assert_eq!(
+            removal_verdict(&removal_row(), &removal_view(), &[(path, extra)]),
+            Verdict::Blocking,
+            "{extra}"
+        );
+    }
+}
+
+#[test]
+fn member_property_removal_unsupported_or_mixed_changes_never_use_changed_lines() {
+    for (before, after) in [
+        (
+            "export interface Row { id: string; extra: number }",
+            "export interface Row { id: string; note: string }",
+        ),
+        (
+            "export interface Row { id: string | null; extra: number }",
+            "export interface Row { id: string }",
+        ),
+        (
+            "export interface Row<T> { id: string; extra: number }",
+            "export interface Row<T> { id: string }",
+        ),
+        (
+            "export interface Row extends Base { id: string; extra: number }",
+            "export interface Row extends Base { id: string }",
+        ),
+        (
+            "export interface Row { id: string; [key: string]: string | number; extra: number }",
+            "export interface Row { id: string; [key: string]: string | number }",
+        ),
+        (
+            "export interface Row { id: string; extra(): number }",
+            "export interface Row { id: string }",
+        ),
+        (
+            "export interface Row { id: string; reset: () => void; extra: number }",
+            "export interface Row { id: string; reset: () => void }",
+        ),
+        (
+            "export interface Row { id: string; 'extra': number }",
+            "export interface Row { id: string }",
+        ),
+        (
+            "export interface Row { id: string; extra: number; extra: number }",
+            "export interface Row { id: string; extra: number }",
+        ),
+        (
+            "export interface Row { id: string; next?: Row; extra: number }",
+            "export interface Row { id: string; next?: Row }",
+        ),
+        (
+            "export interface Row { id: string; extra: number } namespace N { interface Row { other: number } }",
+            "export interface Row { id: string } namespace N { interface Row { other: number } }",
+        ),
+    ] {
+        let api = api_after(
+            &[
+                ("src/row.ts", before),
+                (
+                    "src/view.ts",
+                    "import type { Row } from './row';\nexport const row: Row = { id: 'a' };\n",
+                ),
+            ],
+            &[
+                ("src/row.ts", after),
+                (
+                    "src/view.ts",
+                    "import type { Row } from './row';\nexport const row: Row = { id: 'a' }; // touched\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            verdict(&api, "Row"),
+            Verdict::Blocking,
+            "{before} -> {after}: {api:?}"
+        );
+    }
+    for (row, view) in [
+        (
+            removal_row().replace(
+                "function toRow(id: string): Row",
+                "const toRow = (id: string): Row =>",
+            ),
+            removal_view(),
+        ),
+        (
+            removal_row(),
+            removal_view().replace("label(row: Row): string", "label(row: Row)"),
+        ),
+        (
+            removal_row()
+                .replace("toRow(id: string): Row", "toRow(ids: string[]): Row[]")
+                .replace(
+                    "return { id, note: id };",
+                    "return ids.map(id => ({ id, note: id }));",
+                ),
+            removal_view(),
+        ),
+    ] {
+        assert_eq!(
+            removal_verdict(&row, &view, &[]),
+            Verdict::Blocking,
+            "{row} {view}"
+        );
+    }
+}
 
 const ROW_BASE: &str = r#"export interface Row {
     id: string;

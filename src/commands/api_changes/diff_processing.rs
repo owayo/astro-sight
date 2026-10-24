@@ -1319,13 +1319,18 @@ fn closure_or_blocking_decision(
     let added_required_props = detect_added_required_object_props(site, sources);
     let python_protocol =
         super::python_protocol_arg::prepare_protocol_argument_change(site, sources);
-    // interface / object 型の type alias への必須プロパティ追加は、値を作る箇所・受け取る箇所
+    // interface / object 型の type alias のメンバー変更は、値を作る箇所・受け取る箇所
     // ごとの証明だけで閉じる。証明に対応しない形 (generic / extends / メソッド追加など) は、
     // 参照行が変更行にあるだけでは追随済みと言えないので閉じない (Issue #89)。
     let required_members =
         match super::ts_signature::classify_required_member_addition(site, sources) {
             super::ts_required_members::RequiredMemberChange::NotApplicable => {
-                super::ts_signature::classify_member_type_narrowing(site, sources)
+                match super::ts_signature::classify_member_property_removal(site, sources) {
+                    super::ts_required_members::RequiredMemberChange::NotApplicable => {
+                        super::ts_signature::classify_member_type_narrowing(site, sources)
+                    }
+                    classified => classified,
+                }
             }
             classified => classified,
         };
