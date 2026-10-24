@@ -225,6 +225,54 @@ fn detect_api_changes_rust_const_value_only_is_demoted() {
     );
 }
 
+#[test]
+fn detect_api_changes_rust_internal_const_values_follow_existing_policy() {
+    for layout in ["no-cargo", "bin", "private-lib", "public-lib"] {
+        for binding in ["pub const", "pub static"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let repo = dir.path();
+            init_git_repo_for_test(repo);
+            let before = format!("{binding} WINDOW_LIMIT: u64 = 20;\n");
+            let root = if layout == "public-lib" {
+                "pub mod policy;\npub fn read() -> u64 { policy::WINDOW_LIMIT }\n"
+            } else if layout == "private-lib" {
+                "mod policy;\npub fn read() -> u64 { policy::WINDOW_LIMIT }\n"
+            } else {
+                "mod policy;\nfn main() { println!(\"{}\", policy::WINDOW_LIMIT); }\n"
+            };
+            let root_path = if layout.ends_with("lib") {
+                "src/lib.rs"
+            } else {
+                "src/main.rs"
+            };
+            let mut base = vec![(root_path, root), ("src/policy.rs", before.as_str())];
+            if layout != "no-cargo" {
+                base.push((
+                    "Cargo.toml",
+                    "[package]\nname = \"scan-demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+                ));
+            }
+            git_commit_files(repo, &base, "base");
+            fs::write(
+                repo.join("src/policy.rs"),
+                before.replace("= 20", "= 10 * 4"),
+            )
+            .unwrap();
+            let api = detect_api_changes_from_worktree(repo);
+            assert!(
+                api.const_value_changes
+                    .iter()
+                    .any(|change| change.name == "WINDOW_LIMIT"),
+                "{layout}/{binding}: {api:?}"
+            );
+            assert!(
+                api.added.is_empty() && api.removed.is_empty() && api.modified.is_empty(),
+                "{layout}/{binding}: {api:?}"
+            );
+        }
+    }
+}
+
 /// `pub const` の型変更 (shape 変更) は const_value_changes ではなく従来どおり
 /// blocking な modified に残す。
 #[test]

@@ -22,6 +22,152 @@ fn hook(repo: &TestRepo, strict: bool) -> (std::process::Output, serde_json::Val
     (output, json)
 }
 
+fn rust_const_fixture(layout: &str, before: &str) -> TestRepo {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    if layout != "no-cargo" {
+        repo.write("Cargo.toml", "[package]\nname = \"scan-demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[features]\na = []\n");
+    }
+    if layout.ends_with("lib") {
+        let visibility = if layout == "public-lib" { "pub " } else { "" };
+        repo.write("src/lib.rs", format!("{visibility}mod policy;\npub fn read() -> u64 {{ unsafe {{ policy::WINDOW_LIMIT }} }}\n"));
+    } else {
+        repo.write("src/main.rs", "mod policy;\nfn main() { let value = unsafe { policy::WINDOW_LIMIT }; println!(\"{value}\"); }\n");
+    }
+    repo.write("src/policy.rs", before);
+    repo.commit_all("initial");
+    repo
+}
+
+#[test]
+fn rust_internal_const_value_policy_is_independent_of_cargo_public_surface() {
+    for layout in ["no-cargo", "bin", "private-lib", "public-lib"] {
+        for binding in ["pub const", "pub static"] {
+            let before = format!("{binding} WINDOW_LIMIT: u64 = 20;\n");
+            let repo = rust_const_fixture(layout, &before);
+            let sites = |refs: serde_json::Value| {
+                refs["refs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| serde_json::json!([r["path"], r["ln"], r["col"], r["kind"]]))
+                    .collect::<Vec<_>>()
+            };
+            let before_refs = sites(repo.run_json("refs", &["--name", "WINDOW_LIMIT"]));
+            assert!(before_refs.len() >= 2, "{before_refs:?}");
+            repo.write("src/policy.rs", before.replace("= 20", "= 10 * 4"));
+            assert_eq!(
+                before_refs,
+                sites(repo.run_json("refs", &["--name", "WINDOW_LIMIT"]))
+            );
+            let review = repo.run_json("review", &["--git"]);
+            assert!(
+                review["api_changes"]["const_value_changes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["name"] == "WINDOW_LIMIT"),
+                "{layout}/{binding}: {review}"
+            );
+            for bucket in ["added", "removed", "modified"] {
+                assert!(
+                    review["api_changes"][bucket]
+                        .as_array()
+                        .is_none_or(|items| items.is_empty()),
+                    "{layout}/{binding}: {review}"
+                );
+            }
+            for strict in [false, true] {
+                let (output, json) = hook(&repo, strict);
+                assert_eq!(
+                    output.status.code(),
+                    Some(i32::from(strict)),
+                    "{layout}/{binding}/{strict}: {json}"
+                );
+                assert_eq!(json["api"]["const_value"][0]["n"], "WINDOW_LIMIT", "{json}");
+                if !strict {
+                    assert!(
+                        json["blocking_categories"].as_array().unwrap().is_empty(),
+                        "{json}"
+                    );
+                } else {
+                    assert!(
+                        json["blocking_categories"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|item| item
+                                .as_str()
+                                .is_some_and(|name| name.contains("const_value"))),
+                        "{json}"
+                    );
+                }
+            }
+            repo.stage_all();
+            repo.write("src/policy.rs", "pub const UNRELATED: u64 = 0;\n");
+            for strict in [false, true] {
+                let mut command = cargo_bin();
+                command
+                    .args(["review", "--git", "--staged", "--hook", "--dir"])
+                    .arg(repo.root());
+                if strict {
+                    command.arg("--strict-public-const-values");
+                }
+                let output = command.output().unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(i32::from(strict)),
+                    "staged {layout}/{binding}/{strict}: {json}"
+                );
+                assert_eq!(json["api"]["const_value"][0]["n"], "WINDOW_LIMIT", "{json}");
+            }
+        }
+    }
+}
+
+#[test]
+fn rust_internal_const_value_policy_keeps_shape_mutability_and_ambiguity_blocking() {
+    for layout in ["bin", "private-lib", "public-lib"] {
+        for (before, after) in [
+            (
+                "pub const WINDOW_LIMIT: u64 = 20;\n",
+                "pub const WINDOW_LIMIT: u32 = 40;\n",
+            ),
+            (
+                "pub const WINDOW_LIMIT: u64 = 20;\n",
+                "pub(crate) const WINDOW_LIMIT: u64 = 40;\n",
+            ),
+            (
+                "pub static mut WINDOW_LIMIT: u64 = 20;\n",
+                "pub static mut WINDOW_LIMIT: u64 = 40;\n",
+            ),
+            (
+                "#[cfg(feature = \"a\")]\npub const WINDOW_LIMIT: u64 = 20;\n#[cfg(not(feature = \"a\"))]\npub const WINDOW_LIMIT: u64 = 30;\n",
+                "#[cfg(feature = \"a\")]\npub const WINDOW_LIMIT: u64 = 40;\n#[cfg(not(feature = \"a\"))]\npub const WINDOW_LIMIT: u64 = 30;\n",
+            ),
+        ] {
+            let repo = rust_const_fixture(layout, before);
+            repo.write("src/policy.rs", after);
+            for strict in [false, true] {
+                let (output, json) = hook(&repo, strict);
+                assert_eq!(
+                    output.status.code(),
+                    Some(1),
+                    "{layout}/{after}/{strict}: {json}"
+                );
+                assert!(
+                    json["api"]["const_value"]
+                        .as_array()
+                        .is_none_or(|items| items.is_empty()),
+                    "{json}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn static_const_values_plain_sheet_use_existing_policy_and_api_bucket() {
     for extension in ["js", "ts", "tsx"] {

@@ -293,6 +293,12 @@ astro-sight review --dir . --git \
 
 On top of the impact analysis of `context`, `review` returns candidates for missed changes from `cochange`, the public API diff, and dead symbols in a single run. It is meant for PR reviews and pre-merge checks.
 
+### Rust internal-module constant values
+
+For an ordinary change at the same path, a Rust `pub const` or non-`mut` `pub static` whose name, type, visibility, and binding kind remain unchanged while only its initializer changes uses the existing `api_changes.const_value_changes` bucket (`api.const_value` in hook output). This value-policy information is retained before external-API suppression, including Cargo bin-only crates and private modules in libraries. The default hook does not stop on unchanged references solely because of this classification. `--strict-public-const-values` makes the same classification blocking.
+
+This is a value-change policy, not a compatibility or external-reachability proof. Public-surface decisions for `added`, `removed`, and `modified` remain unchanged. Type or visibility changes, `static mut`, and ambiguous pairings do not use this correction. Moves and renames retain their existing checks. Normal output and staged hooks use the same classification; `refs` occurrence contracts are unchanged.
+
 ### Rust free-function removals and qualified names
 
 Removing an unused module free function can produce `removed_dead` (`api.rm_dead`) when surviving occurrences of its name provably refer to another item. The proof handles directly declared types such as `Engine::run()`, module paths such as `crate::engine::run()`, and bare calls to another function declared in the same module. A remaining `crate::launcher::run()` or an unresolved `use` of the removed function stays in blocking `removed` (`api.rm`). Rust compares identifiers after NFC normalization; non-ASCII import or block-item bindings remain unproven when equivalent spellings cannot be ruled out. `refs` and dead-code occurrence lists are unchanged.
