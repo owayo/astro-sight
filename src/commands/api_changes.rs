@@ -254,6 +254,7 @@ pub(crate) fn detect_api_changes_with_renames(
                 &in_file_callees,
                 &parameter_pattern_only_names,
                 is_bash_script_path(&df.old_path),
+                ts_namespace::recovery_language(&df.old_path, &df.new_path),
                 &mut index_names,
             );
         }
@@ -741,6 +742,7 @@ mod source_pair;
 
 mod ts_const_arg;
 mod ts_function_values;
+mod ts_namespace;
 
 mod ts_required_members;
 

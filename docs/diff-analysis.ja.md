@@ -298,6 +298,12 @@ astro-sight review --dir . --git \
 
 `context` の影響分析に加えて、`cochange` による変更漏れ候補、公開 API 差分、死蔵シンボルを 1 回の実行でまとめて返す。PR レビューや pre-merge チェック向け。
 
+### TypeScript の名前空間と同名の宣言
+
+別の名前空間が、ファイル直下で直接exportされた関数・interface・type alias・単純な変数と同名の項目をexportしている場合、TS/TSXのAPI比較はAST上の位置で直下宣言の署名変更を回復する。旧新が同じTS/TSX文法で解析でき、直下の束縛が一意と確認できる場合に限る。新しい直下署名が旧名前空間の署名と一致するときも、変更された重複名を参照検索へ残す。名前空間だけの変更を直下APIの変更にはしない。
+
+回復した候補には既存の互換性・引数個数・型メンバー検査を適用する。必須引数を足していない呼出しは、その行を整形していてもblockingに残す。既存の複数定義ガードにより、変数や型の利用箇所を変更してもblockingに残る場合がある。overload・宣言merge・再束縛・分割代入の変数・間接/default export・解析失敗は、この回復の対象外。他言語とrefs/dead-codeの出現契約は変えない。
+
 ### Rust の内部モジュールの定数値変更
 
 Rust の `pub const` / 非 `mut` の `pub static` は、同一パスの通常変更で名前・型・可視性・binding kind が変わらず、初期値だけが変わった場合、既存の `api_changes.const_value_changes`（hook では `api.const_value`）へ分類する。Cargo のbin-only crateやlibraryのprivate moduleにある場合も、外部API面から除く処理より先にこの値変更の情報を保持する。既定のhookでは、この分類だけを理由に未更新参照で停止しない。`--strict-public-const-values` を付けると同じ分類をblockingとして扱う。

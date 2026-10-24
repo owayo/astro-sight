@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **TS/TSX の名前空間内の同名exportとAPI変更** — `commands/api_changes/ts_namespace.rs` は、変更された重複名のうち、同じ文法で解析した旧新ASTから直接exportされた一意な直下function/interface/type alias/単純variableを対応付ける (Issue #144)。共有の署名抽出で回復した候補を既存の分類へ通し、arity・型メンバー・複数定義の閉包ガードを迂回しない。overload/merge/再束縛/default・間接export/分割代入の変数/解析失敗は回復しない。`prepare.rs` はTS/TSXの(name,kind,signature)多重集合が変わった重複bare名だけを追加で参照検索へ残し、last-winsで新root署名と旧nested署名が一致する欠落を防ぐ。公開結果は既存のnew_syms順で一度だけ記録する。共有抽出・他言語の重複規則・refs/dead-codeは不変。回帰は補助モジュール、既存typescript分類、CLIの`ts_namespace_collisions.rs`で、4種の宣言・名前空間のみ変更・順序・TSX・staged/通常/hook・参照位置を照合する。
+
 - **Rust の内部定数の値変更と公開面** — `commands/api_changes/diff_processing.rs` の `ChangedSignatureFiles::decide` は、同一パス・非移動のRust候補で既存の `is_const_value_only_change` が証明する `pub const` / 非mut `pub static` を、bin-only/private-moduleのAPI抑制より先に `ConstValue` へ分類する (Issue #140)。外部APIとしての到達性と値変更の方針を分け、通常出力とhookの既存const_value bucketを使う。既定hookは情報提供、strictはblocking。型・可視性・static mut・曖昧な宣言は補正せず、added/removed/modifiedの公開面と移動・renameの検査は維持する。回帰はCargo無し/bin/private-lib/public-libのconst/static、型・可視性・mutable/条件付き同名の負例、staged/strict/通常出力とrefsの出現を照合する。
 
 - **TS の既存プロパティ型の縮小と閉包** — `commands/api_changes/ts_signature/type_members/narrowing.rs` は、scalar型のプロパティだけを持つexport済みinterface/object型の既存必須プロパティについて、unionの要素削除を限定して分類する (Issue #139)。未対応のメンバー変更とobject型の一意性・解析の未証明は `Unsupported` とし、参照行だけの閉包へ戻さない。`ts_required_members/narrowed_uses.rs` は変更行・値型の既存証明に加え、先行constの初期化子を16段まで調べてany/assertion依存・循環・再代入を保留し、Row注釈の変数/引数とproducerの直接呼出し結果の書込み・disjoint比較・alias・未知の呼出し/キーを監査する。forの左辺は外側の束縛も調べる。型の全メンバーをscalarに限り、メソッド/getter付きproducerと、配列/Promise/satisfies/arrow/推論戻り値は保留する。通常の型付き引数の呼出し元のprimitive由来や、名前を出さない推論・外部コード・reflectionは追わない。必須追加側とrefs/dead-codeの出現契約は変えない。

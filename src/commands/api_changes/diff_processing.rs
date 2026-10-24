@@ -596,11 +596,25 @@ fn collect_modified_symbols(
     let mut files =
         ChangedSignatureFiles::new(inputs, state, &df.old_path, &df.new_path, in_file_callees);
     files.rust_const_additions = Some(facts.rust_const_additions);
+    let recovered = super::ts_namespace::recover_root_changes(inputs, df, facts);
 
     // 同一 (file, qualname) の modified を重複排除するためのキーセット
     let mut seen_modified: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
     for (name, kind, new_sig) in new_syms {
+        if let Some(root) = recovered.get(name) {
+            if seen_modified.insert((df.new_path.clone(), name.clone())) {
+                files.classify(
+                    inputs,
+                    state,
+                    name,
+                    &root.kind,
+                    &root.old_sig,
+                    &root.new_sig,
+                );
+            }
+            continue;
+        }
         // 正規化済み signature が同じでも、静的 container の整形が impact に残り得る。
         if let Some(old_sig) = old_map.get(name.as_str())
             && old_sig == &new_sig.as_str()
