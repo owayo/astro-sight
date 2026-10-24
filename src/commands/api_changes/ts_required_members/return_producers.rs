@@ -308,7 +308,7 @@ fn widen_element(atom: &TypeAtom) -> TypeAtom {
     }
 }
 
-fn callback_rebinds(body: Node<'_>, source: &[u8], name: &str) -> bool {
+pub(super) fn callback_rebinds(body: Node<'_>, source: &[u8], name: &str) -> bool {
     any_node(body, Children::Named, |node| match node.kind() {
         "assignment_expression" | "augmented_assignment_expression" => node
             .child_by_field_name("left")
@@ -422,7 +422,7 @@ fn array_parameter_uses_are_plain(
 }
 
 /// 対応する終了形を限定し、分岐の片側だけに return がある本体は閉じない。
-fn definitely_exits(node: Node<'_>, depth: usize) -> bool {
+pub(super) fn definitely_exits(node: Node<'_>, depth: usize) -> bool {
     if depth >= MAX_UNWRAP {
         return false;
     }

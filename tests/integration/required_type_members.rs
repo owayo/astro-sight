@@ -94,3 +94,44 @@ fn map_producer_required_member_addition_closes_only_updated_values() {
         assert_eq!(staged["api"][category][0]["n"], "Row", "{body}: {staged}");
     }
 }
+
+#[test]
+fn member_type_narrowing_hook_checks_producers_and_uses_in_worktree_and_index() {
+    let base = "export interface Row {\n    id: string;\n    note: string | null;\n}\nexport function toRow(id: string): Row {\n    return { id, note: null };\n}\n";
+    let view_base = "import { type Row, toRow } from './row';\nexport function label(row: Row): string {\n    return row.note === null ? row.id : `${row.id} (${row.note})`;\n}\nexport const first = label(toRow('a'));\n";
+    for (value, stale_comparison, expected) in
+        [("id", false, 0), ("null", false, 1), ("id", true, 1)]
+    {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.create_dir_all("src");
+        repo.write("src/row.ts", base);
+        repo.write("src/view.ts", view_base);
+        repo.commit_all("initial");
+        repo.write(
+            "src/row.ts",
+            base.replace("note: string | null", "note: string")
+                .replace("note: null", &format!("note: {value}")),
+        );
+        let view = if stale_comparison {
+            view_base.to_string()
+        } else {
+            view_base.replace("row.note === null ? row.id : ", "")
+        };
+        repo.write("src/view.ts", view);
+        let (code, json) = hook(&repo);
+        let category = if expected == 0 { "mod_closed" } else { "mod" };
+        assert_eq!(code, expected, "{json}");
+        assert_eq!(json["api"][category][0]["n"], "Row", "{json}");
+        repo.stage_all();
+        repo.write("src/row.ts", "export const unrelated = 1;\n");
+        let output = cargo_bin()
+            .args(["review", "--git", "--staged", "--hook", "--dir"])
+            .arg(repo.root())
+            .output()
+            .unwrap();
+        let staged: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(expected), "{staged}");
+        assert_eq!(staged["api"][category][0]["n"], "Row", "{staged}");
+    }
+}

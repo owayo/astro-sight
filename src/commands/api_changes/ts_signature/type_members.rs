@@ -5,6 +5,9 @@ use crate::models::symbol::Symbol;
 use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
+mod narrowing;
+pub(crate) use narrowing::classify_member_type_narrowing;
+
 pub(crate) fn declaration_signature(
     symbol: &Symbol,
     root: Node<'_>,
@@ -315,7 +318,10 @@ pub(crate) fn classify_required_member_addition(
         }
         properties.push(RequiredProperty { name, ty });
     }
-    RequiredMemberChange::Supported(RequiredMemberDelta { added: properties })
+    RequiredMemberChange::Supported(RequiredMemberDelta {
+        added: properties,
+        narrowing: false,
+    })
 }
 
 fn unique_type_declaration<'a>(

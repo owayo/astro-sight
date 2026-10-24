@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **TS の既存プロパティ型の縮小と閉包** — `commands/api_changes/ts_signature/type_members/narrowing.rs` は、scalar型のプロパティだけを持つexport済みinterface/object型の既存必須プロパティについて、unionの要素削除を限定して分類する (Issue #139)。未対応のメンバー変更とobject型の一意性・解析の未証明は `Unsupported` とし、参照行だけの閉包へ戻さない。`ts_required_members/narrowed_uses.rs` は変更行・値型の既存証明に加え、先行constの初期化子を16段まで調べてany/assertion依存・循環・再代入を保留し、Row注釈の変数/引数とproducerの直接呼出し結果の書込み・disjoint比較・alias・未知の呼出し/キーを監査する。forの左辺は外側の束縛も調べる。型の全メンバーをscalarに限り、メソッド/getter付きproducerと、配列/Promise/satisfies/arrow/推論戻り値は保留する。通常の型付き引数の呼出し元のprimitive由来や、名前を出さない推論・外部コード・reflectionは追わない。必須追加側とrefs/dead-codeの出現契約は変えない。
+
 - **TS の配列・Promise producer と必須プロパティ追加** — `commands/api_changes/ts_required_members/return_producers.rs` は、ファイル直下の関数宣言の `Row[]`・`Array<Row>`・`readonly Row[]` と async の `Promise<Row[]>` / `Promise<Row>` を限定して証明する (Issue #138)。配列型の必須引数か配列 literal の `.map` に渡す、引数1つの無注釈 inline arrow の全 return を既存の値・変更行の証明へ渡し、callback と外側の関数の fallthrough を許さない。receiver の別名・書き換え・持ち出し、callback 引数の書き換え、Array/ReadonlyArray/Promise の宣言・import・prototype の参照や持ち出し、型アサーション・await・任意の同名 map・他の配列メソッドは保留する。型の名前の所属、typeof・alias 等の既存ガードは維持する。外部コードによる prototype の変更や推論経由の依存は解決しない。refs/dead-code の出現契約は変えない。
 
 - **Rust の Unicode エスケープの区切り** — `vendor/tree-sitter-rust` は公開 crate 0.24.2 の文法で、波括弧形式の Unicode エスケープの16進数字の後に続くアンダースコアを `char_literal` と `escape_sequence` の両方で許可する (Issue #135)。入力を加工せず、文字列の後の宣言・呼び出しのバイト位置を保つ。既存の桁数の許容・非波括弧形式・prefix の扱いは維持し、Unicode scalar や byte literal の意味検証は追加しない。生成は CLI 0.26.6 / ABI 15。scanner・queries・bindings・node-types・headers は公開 crate と byte 一致し、通常のビルドに generator は不要。由来と再生成差分は `vendor/tree-sitter-rust/PATCHES.md`、回帰は parser の `grammar_regressions_rust.rs` と CLI の `rust_unicode_escapes.rs`。
