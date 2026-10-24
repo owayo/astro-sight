@@ -59,3 +59,38 @@ fn producer_left_unchanged_keeps_required_member_addition_blocking() {
     assert_eq!(json["api"]["mod"][0]["n"], "Row", "{json}");
     assert_eq!(code, 1, "{json}");
 }
+
+#[test]
+fn map_producer_required_member_addition_closes_only_updated_values() {
+    for (body, expected) in [
+        ("return ids.map((id) => ({ id, note: null }));", 0),
+        ("return ids.map((id) => ({ id }));", 1),
+        (
+            "if (ids.length) return [] as Row[]; return ids.map((id) => ({ id, note: null }));",
+            1,
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.create_dir_all("src");
+        repo.write("src/row.ts", "export interface Row {\n    id: string;\n}\nexport function toRows(ids: string[]): Row[] {\n    return ids.map((id) => ({ id }));\n}\n");
+        repo.write("src/view.ts", "import { toRows } from './row';\nexport const ids = toRows(['a', 'b']).map((row) => row.id);\n");
+        repo.commit_all("initial");
+        repo.write("src/row.ts", format!("export interface Row {{\n    id: string;\n    note: string | null;\n}}\nexport function toRows(ids: string[]): Row[] {{\n    {body}\n}}\n"));
+        let (code, json) = hook(&repo);
+        assert_eq!(code, expected, "{body}: {json}");
+        let category = if expected == 0 { "mod_closed" } else { "mod" };
+        assert_eq!(json["api"][category][0]["n"], "Row", "{body}: {json}");
+        // 作業ツリーと異なる index でも、同じ staged ソースで証明する。
+        repo.stage_all();
+        repo.write("src/row.ts", "export const unrelated = 1;\n");
+        let output = cargo_bin()
+            .args(["review", "--git", "--staged", "--hook", "--dir"])
+            .arg(repo.root())
+            .output()
+            .unwrap();
+        let staged: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(expected), "{body}: {staged}");
+        assert_eq!(staged["api"][category][0]["n"], "Row", "{body}: {staged}");
+    }
+}

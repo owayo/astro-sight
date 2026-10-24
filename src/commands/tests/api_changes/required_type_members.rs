@@ -780,3 +780,189 @@ fn required_member_ignores_value_names_and_intrinsic_jsx_elements() {
     ];
     assert_eq!(row_verdict(&extra, ROW_AFTER, &[]), Verdict::Closed);
 }
+
+fn array_producer_verdict(signature: &str, body: &str, extra: &str) -> Verdict {
+    let base = format!(
+        "export interface Row {{\n    id: string;\n}}\nexport {signature} {{\n    return ids.map((id) => ({{ id }}));\n}}\n{extra}"
+    );
+    let after = format!(
+        "export interface Row {{\n    id: string;\n    note: string | null;\n}}\nexport {signature} {{\n    {body}\n}}\n{extra}"
+    );
+    verdict(
+        &api_after(&[("src/row.ts", &base)], &[("src/row.ts", &after)]),
+        "Row",
+    )
+}
+
+#[test]
+fn required_member_array_producers_close_only_proven_map_returns() {
+    for signature in [
+        "function toRows(ids: string[]): Row[]",
+        "function toRows(ids: readonly string[]): readonly Row[]",
+        "function toRows(ids: Array<string>): Array<Row>",
+        "async function toRows(ids: string[]): Promise<Row[]>",
+        "async function toRows(ids: string[]): Promise<Array<Row>>",
+    ] {
+        for body in [
+            "return ids.map((id) => ({ id, note: null }));",
+            "return ids.map((id) => ({ id, note: id }));",
+            "return ids.map(id => ({ id, note: null }));",
+            "return ids.map((id) => { return { id, note: null }; });",
+            "return ids.map((id) => { if (id) return { id, note: null }; return { id, note: null }; });",
+            "return ids.map((id) => { if (id) return { id, note: null }; else return { id, note: null }; });",
+        ] {
+            assert_eq!(
+                array_producer_verdict(signature, body, ""),
+                Verdict::Closed,
+                "{signature}: {body}"
+            );
+        }
+    }
+}
+
+#[test]
+fn required_member_array_producers_keep_unproven_values_blocking() {
+    for body in [
+        "return ids.map((id) => ({ id }));",
+        "return ids.map((id) => ({ id, note: 123 }));",
+        "return ids.map((id) => { id = undefined; return { id, note: id }; });",
+        "return ids.map((id) => { if (id) return { id, note: null }; });",
+        "if (ids.length) return ids.map((id) => ({ id, note: null }));",
+        "if (ids.length) return [] as Row[]; return ids.map((id) => ({ id, note: null }));",
+        "return ids.flatMap((id) => ({ id, note: null }));",
+        "return ids.map(async (id) => ({ id, note: null }));",
+        "return ids.map((id) => ({ id, note: null } as Row));",
+        "return ids.map((id) => ({ id, note: null })) as Row[];",
+        "return ids.map((id) => { const inner = () => ({ id, note: null }); return { id }; });",
+        "ids.map = other; return ids.map((id) => ({ id, note: null }));",
+    ] {
+        assert_eq!(
+            array_producer_verdict("function toRows(ids: string[]): Row[]", body, ""),
+            Verdict::Blocking,
+            "{body}"
+        );
+    }
+    for signature in [
+        "function toRows(ids: any): Row[]",
+        "function toRows(ids: unknown): Row[]",
+    ] {
+        assert_eq!(
+            array_producer_verdict(
+                signature,
+                "return ids.map((id) => ({ id, note: null }));",
+                ""
+            ),
+            Verdict::Blocking,
+            "{signature}"
+        );
+    }
+    for (signature, extra) in [
+        (
+            "function toRows(ids: string[]): Array<Row>",
+            "type Array<T> = T[];\n",
+        ),
+        (
+            "async function toRows(ids: string[]): Promise<Row[]>",
+            "type Promise<T> = T;\n",
+        ),
+        (
+            "function toRows(ids: string[]): Box<Row>",
+            "type Box<T> = T;\n",
+        ),
+        (
+            "function toRows(ids: string[]): Row[]",
+            "Array.prototype.map = customMap;\n",
+        ),
+    ] {
+        assert_eq!(
+            array_producer_verdict(
+                signature,
+                "return ids.map((id) => ({ id, note: null }));",
+                extra
+            ),
+            Verdict::Blocking,
+            "{signature}: {extra}"
+        );
+    }
+}
+
+#[test]
+fn required_member_async_single_producer_closes_proven_return() {
+    let base = ROW_BASE
+        .replace("export function toRow", "export async function toRow")
+        .replace("): Row {", "): Promise<Row> {");
+    let after = ROW_AFTER
+        .replace("export function toRow", "export async function toRow")
+        .replace("): Row {", "): Promise<Row> {");
+    let api = api_after(&[("src/row.ts", &base)], &[("src/row.ts", &after)]);
+    assert_eq!(verdict(&api, "Row"), Verdict::Closed, "{api:?}");
+}
+
+#[test]
+fn required_member_map_contextual_type_is_bounded_in_existing_producers() {
+    let make = |value: &str, added: &str, outer: &str| {
+        format!(
+            "export interface Row {{\n    id: string;\n{added}}}\nexport function toRow(ids: string[]): Row {{\n    ids.map((id) => {{ const row: Row = {{ id{value} }}; return row; }});\n    return {{ id: 'x'{outer} }};\n}}\n"
+        )
+    };
+    let base = make("", "", "");
+    for (value, expected) in [("id", Verdict::Closed), ("123", Verdict::Blocking)] {
+        let after = make(
+            &format!(", note: {value}"),
+            "    note: string | null;\n",
+            ", note: null",
+        );
+        let api = api_after(&[("src/row.ts", &base)], &[("src/row.ts", &after)]);
+        assert_eq!(verdict(&api, "Row"), expected, "{api:?}");
+    }
+    // 未対応の generic 戻り値を、裸の Row の既存経路で証明しない。
+    let base = ROW_BASE.replace("): Row {", "): Box<Row> {") + "type Box<T> = T;\n";
+    let after = ROW_AFTER.replace("): Row {", "): Box<Row> {") + "type Box<T> = T;\n";
+    let api = api_after(&[("src/row.ts", &base)], &[("src/row.ts", &after)]);
+    assert_eq!(verdict(&api, "Row"), Verdict::Blocking, "{api:?}");
+}
+
+#[test]
+fn required_member_array_literal_callback_types_are_widened() {
+    let base = "export interface Row {\n    id: string;\n}\nexport function toRows(): Row[] {\n    return ['ready'].map((id) => ({ id }));\n}\n";
+    for (value, expected) in [("id", Verdict::Blocking), ("'ready'", Verdict::Closed)] {
+        let after = format!(
+            "export interface Row {{\n    id: string;\n    note: 'ready';\n}}\nexport function toRows(): Row[] {{\n    return ['ready'].map((id) => ({{ id, note: {value} }}));\n}}\n"
+        );
+        let api = api_after(&[("src/row.ts", base)], &[("src/row.ts", &after)]);
+        assert_eq!(verdict(&api, "Row"), expected, "{api:?}");
+    }
+}
+
+#[test]
+fn required_member_builtin_type_uses_require_parseable_sources() {
+    for (signature, good, bad) in [
+        (
+            "function toRows(ids: string[]): Row[]",
+            "export const other: Array<string> = [];\n",
+            "export const other: Array<string> = ;\n",
+        ),
+        (
+            "async function toRows(ids: string[]): Promise<Row[]>",
+            "export const other: Promise<string> = Promise.resolve('ok');\n",
+            "export const other: Promise<string> = ;\n",
+        ),
+    ] {
+        let base = format!(
+            "export interface Row {{\n    id: string;\n}}\nexport {signature} {{\n    return ids.map((id) => ({{ id }}));\n}}\n"
+        );
+        let after = base
+            .replace(
+                "    id: string;",
+                "    id: string;\n    note: string | null;",
+            )
+            .replace("({ id })", "({ id, note: null })");
+        for (other, expected) in [(good, Verdict::Closed), (bad, Verdict::Blocking)] {
+            let api = api_after(
+                &[("src/row.ts", &base), ("src/other.ts", other)],
+                &[("src/row.ts", &after)],
+            );
+            assert_eq!(verdict(&api, "Row"), expected, "{other}: {api:?}");
+        }
+    }
+}
