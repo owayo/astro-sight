@@ -229,12 +229,12 @@ pub(crate) fn classify_member_type_narrowing(
     } else {
         RequiredMemberChange::Supported(RequiredMemberDelta {
             added: narrowed,
-            narrowing: true,
+            mode: crate::commands::api_changes::ts_required_members::MemberChangeMode::Narrowing,
         })
     }
 }
 
-fn root_has_object_type(root: Node<'_>, name: &str, source: &[u8]) -> bool {
+pub(super) fn root_has_object_type(root: Node<'_>, name: &str, source: &[u8]) -> bool {
     let mut cursor = root.walk();
     root.named_children(&mut cursor).any(|statement| {
         let declaration = if statement.kind() == "export_statement" {

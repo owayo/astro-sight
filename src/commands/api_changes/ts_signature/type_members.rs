@@ -6,7 +6,9 @@ use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
 mod narrowing;
+mod removal;
 pub(crate) use narrowing::classify_member_type_narrowing;
+pub(crate) use removal::classify_member_property_removal;
 
 pub(crate) fn declaration_signature(
     symbol: &Symbol,
@@ -320,7 +322,7 @@ pub(crate) fn classify_required_member_addition(
     }
     RequiredMemberChange::Supported(RequiredMemberDelta {
         added: properties,
-        narrowing: false,
+        mode: super::super::ts_required_members::MemberChangeMode::Addition,
     })
 }
 

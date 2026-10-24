@@ -1,4 +1,4 @@
-//! 型縮小時は、値の作成だけでなく観測できる利用も確かめる (Issue #139)。
+//! 型縮小・プロパティ削除では、値の作成だけでなく観測できる利用も確かめる。
 
 use super::*;
 
@@ -310,7 +310,21 @@ impl Prover<'_, '_> {
         if name.contains('\\') || member.child_by_field_name("optional_chain").is_some() {
             return false;
         }
-        let Some(property) = self.delta.added.iter().find(|p| p.name == name) else {
+        if self
+            .delta
+            .removed_names()
+            .iter()
+            .any(|removed| removed == name)
+        {
+            return false;
+        }
+        let Some(property) = self
+            .delta
+            .added
+            .iter()
+            .find(|p| p.name == name)
+            .filter(|_| matches!(self.delta.mode, MemberChangeMode::Narrowing))
+        else {
             // メンバー関数は未知の書込みを行い得るので、変更していないキーでも呼び出さない。
             return !member.parent().is_some_and(|p| {
                 p.kind() == "call_expression"

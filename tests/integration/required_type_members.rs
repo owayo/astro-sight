@@ -135,3 +135,89 @@ fn member_type_narrowing_hook_checks_producers_and_uses_in_worktree_and_index() 
         assert_eq!(staged["api"][category][0]["n"], "Row", "{staged}");
     }
 }
+
+#[test]
+fn member_property_removal_hook_checks_values_uses_and_index_snapshot() {
+    let row_base = "export interface Row {\n    id: string;\n    note: string;\n    extra: number;\n}\nexport function toRow(id: string): Row {\n    return { id, note: id, extra: 0 };\n}\n";
+    let view_base = "import { type Row, toRow } from './row';\nexport function label(row: Row): string {\n    return `${row.id} (${row.note}, ${row.extra})`;\n}\nexport const first = label(toRow('a'));\n";
+    for alias in [false, true] {
+        for case in ["updated", "producer", "reader", "dynamic key"] {
+            let as_alias = |source: &str| {
+                if alias {
+                    source
+                        .replace("export interface Row {", "export type Row = {")
+                        .replace("\n}\nexport function", "\n};\nexport function")
+                } else {
+                    source.to_owned()
+                }
+            };
+            let repo = TestRepo::new();
+            repo.init_git();
+            repo.create_dir_all("src");
+            repo.write("src/row.ts", as_alias(row_base));
+            repo.write("src/view.ts", view_base);
+            repo.commit_all("initial");
+            let dead_names = |json: serde_json::Value| -> Vec<_> {
+                json["dead_symbols"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|symbol| {
+                        (
+                            symbol["name"].clone(),
+                            symbol["kind"].clone(),
+                            symbol["file"].clone(),
+                        )
+                    })
+                    .collect()
+            };
+            let baseline_dead = if case == "updated" {
+                Some(dead_names(repo.run_json("dead-code", &[])))
+            } else {
+                None
+            };
+            let mut row = row_base.replace("    extra: number;\n", "");
+            if case != "producer" {
+                row = row.replace(", extra: 0", "");
+            }
+            let view = match case {
+                "reader" => view_base.to_owned(),
+                "dynamic key" => view_base.replace(
+                    "return `${row.id} (${row.note}, ${row.extra})`;",
+                    "const key = 'extra'; return `${row[key]}`;",
+                ),
+                _ => view_base.replace(", ${row.extra}", ""),
+            };
+            repo.write("src/row.ts", as_alias(&row));
+            repo.write("src/view.ts", &view);
+            let expected = i32::from(case != "updated");
+            let category = if expected == 0 { "mod_closed" } else { "mod" };
+            let (code, json) = hook(&repo);
+            assert_eq!(code, expected, "alias={alias}, {case}: {json}");
+            assert_eq!(json["api"][category][0]["n"], "Row", "{json}");
+            if let Some(baseline) = baseline_dead {
+                assert_eq!(dead_names(repo.run_json("dead-code", &[])), baseline);
+                let refs = repo.run_json("refs", &["--name", "extra"]);
+                assert!(refs["refs"].as_array().unwrap().is_empty(), "{refs}");
+            }
+            if case == "updated" {
+                let normal = repo.run_json("review", &["--git"]);
+                assert_eq!(
+                    normal["api_changes"]["modified_closed_in_diff"][0]["name"], "Row",
+                    "{normal}"
+                );
+            }
+            repo.stage_all();
+            repo.write("src/row.ts", "export const unrelated = 1;\n");
+            repo.write("src/view.ts", "export const unrelated = 2;\n");
+            let output = cargo_bin()
+                .args(["review", "--git", "--staged", "--hook", "--dir"])
+                .arg(repo.root())
+                .output()
+                .unwrap();
+            let staged: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert_eq!(output.status.code(), Some(expected), "{staged}");
+            assert_eq!(staged["api"][category][0]["n"], "Row", "{staged}");
+        }
+    }
+}

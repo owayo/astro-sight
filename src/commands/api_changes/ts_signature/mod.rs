@@ -36,8 +36,8 @@ pub(crate) use removed_params::{
     OptionalRemovalCache, detect_trailing_optional_params_removed_compatible_mod,
 };
 pub(crate) use type_members::{
-    classify_member_type_narrowing, classify_required_member_addition,
-    detect_type_members_compatible_mod,
+    classify_member_property_removal, classify_member_type_narrowing,
+    classify_required_member_addition, detect_type_members_compatible_mod,
 };
 
 /// TS/TSX/JS 全体を対象にする判定器の言語ゲート。

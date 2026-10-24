@@ -512,6 +512,22 @@ pub(crate) fn embedded_js_sources_may_mention(
         .may_mention(names)
 }
 
+/// 削除キーの監査では escape だけの表記も未解析ソースに隠れ得る。
+pub(crate) fn embedded_js_sources_may_hide_removed_keys(
+    dir: &str,
+    names: &[&str],
+    caches: &mut ApiClosureCaches,
+) -> bool {
+    let sources = caches
+        .embedded_js_sources
+        .get_or_insert_with(|| std::rc::Rc::new(EmbeddedJsSources::load(dir)));
+    sources.may_mention(names)
+        || sources
+            .texts
+            .iter()
+            .any(|text| text.as_ref().is_none_or(|text| text.contains('\\')))
+}
+
 /// 無変更の呼び出し式を閉じる追加証拠。TS は共有 const の必須プロパティ追加、
 /// Python はローカル変数のクラスと新しい Protocol の構造的な適合を証明する。
 pub(crate) enum ClosureArgEvidence<'a> {
@@ -583,7 +599,7 @@ pub(crate) fn is_modified_closed_in_diff(
     if call_refs.is_empty() {
         return false;
     }
-    // 型への必須プロパティ追加は、参照の位置ごとの義務だけで閉じる (変更行の照合へ戻さない)。
+    // 型のメンバー変更は、参照の位置ごとの義務だけで閉じる (変更行の照合へ戻さない)。
     if let ClosureArgEvidence::TsRequiredTypeMembers(delta) = input.arg_evidence {
         let mut owned = Vec::with_capacity(call_refs.len());
         for r in &call_refs {

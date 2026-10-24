@@ -1,5 +1,5 @@
-//! TypeScript の interface / object 型の type alias の必須追加・限定的な型縮小について、
-//! 値を作る箇所と受け取る箇所が同一 diff で追随済みかを証明する (Issue #89 / #138 / #139)。
+//! TypeScript の interface / object 型の type alias の必須追加・型縮小・プロパティ削除を、
+//! 値を作る箇所と受け取る箇所の義務から証明する (Issue #89 / #138 / #139 / #141)。
 //!
 //! 名前で集めた型の参照を構文上の役割で分け、役割ごとの義務をすべて証明できたときだけ閉じる。
 //! 参照行が変更行にあることは追随の証拠にしない (`label(row: Row)` の行を整形しただけで、
@@ -51,6 +51,7 @@ use super::ref_index::{
 };
 
 mod narrowed_uses;
+mod removed_uses;
 mod return_producers;
 
 /// 配列型の入れ子 (`string[][]`) と式の配列 literal の入れ子をたどる上限。
@@ -92,22 +93,40 @@ pub(crate) enum TypeAtom {
     Unknown,
 }
 
-/// 必須プロパティ追加と既存プロパティの型縮小の分類。
+/// 必須プロパティ追加・既存プロパティの型縮小・純粋なプロパティ削除の分類。
 pub(crate) enum RequiredMemberChange {
     /// この変更種別には当たらない (従来の判定へ)。
     NotApplicable,
-    /// 証明に対応する形の必須追加・型縮小。
+    /// 証明に対応する形の変更。
     Supported(RequiredMemberDelta),
-    /// 必須メンバーの追加だが、証明に対応しない形 (generic・`extends`・メソッド・単純でない型・
-    /// 自己参照)。参照行が変更行にあるだけの証拠でも閉じない。
+    /// 証明に対応しないメンバー変更。参照行が変更行にあるだけの証拠でも閉じない。
     Unsupported,
 }
 
 /// 値の構築で検査するプロパティと、利用監査のモード。
 pub(crate) struct RequiredMemberDelta {
+    /// 値の検査対象。追加・縮小では対象プロパティ、削除では残る必須プロパティ。
     pub(crate) added: Vec<RequiredProperty>,
-    /// 型縮小では、値の由来と書込み・比較・持ち出しを追加で確かめる。
-    pub(crate) narrowing: bool,
+    pub(crate) mode: MemberChangeMode,
+}
+
+pub(crate) enum MemberChangeMode {
+    Addition,
+    Narrowing,
+    Removal(Vec<String>),
+}
+
+impl RequiredMemberDelta {
+    fn audits_uses(&self) -> bool {
+        !matches!(self.mode, MemberChangeMode::Addition)
+    }
+
+    fn removed_names(&self) -> &[String] {
+        match &self.mode {
+            MemberChangeMode::Removal(names) => names,
+            _ => &[],
+        }
+    }
 }
 
 pub(crate) struct RequiredProperty {
@@ -280,7 +299,8 @@ pub(super) fn prove_closure(
     // 値を作る箇所も受け取る箇所も無い (公開するだけ) なら、利用者を 1 件も確かめていない。
     prover.sites > 0
         && prover.prove_deferred(diff_files, caches)
-        && (!delta.narrowing || prover.prove_narrowed_uses(caches))
+        && (!delta.audits_uses() || prover.prove_narrowed_uses(caches))
+        && (delta.removed_names().is_empty() || prover.prove_removed_keys_absent(caches))
 }
 
 /// 受け取る箇所 (ファイル直下の関数の必須引数) の義務。呼び出しは関数名で後から検索する。
@@ -347,7 +367,7 @@ impl Prover<'_, '_> {
         if !is_checked_source(&parsed, &r.path) {
             return false;
         }
-        if self.delta.narrowing {
+        if self.delta.audits_uses() {
             self.narrowed_paths.insert(r.path.clone());
         }
         let source: &[u8] = &parsed.source;
@@ -389,7 +409,7 @@ impl Prover<'_, '_> {
                 self.prove_variable(declarator, &parsed, &r.path, diff_files, caches)
             }
             Some(TypeRole::Satisfies(satisfies)) => {
-                if self.delta.narrowing {
+                if self.delta.audits_uses() {
                     return false;
                 }
                 let proven = first_named_child(satisfies).is_some_and(|expr| {
@@ -454,7 +474,7 @@ impl Prover<'_, '_> {
         diff_files: &mut DiffFileLookup<'_>,
         caches: &mut ApiClosureCaches,
     ) -> bool {
-        if self.delta.narrowing
+        if self.delta.audits_uses()
             && (function.kind() != "function_declaration" || !is_top_level_declaration(function))
         {
             return false;
@@ -464,7 +484,7 @@ impl Prover<'_, '_> {
             .and_then(only_named_child)
             .is_none_or(|ty| ty.kind() != "type_identifier")
         {
-            if self.delta.narrowing {
+            if self.delta.audits_uses() {
                 return false;
             }
             return self.prove_wrapped_return(function, parsed, path, diff_files, caches);
@@ -475,7 +495,7 @@ impl Prover<'_, '_> {
         let Some(body) = function.child_by_field_name("body") else {
             return false;
         };
-        if self.delta.narrowing && !return_producers::definitely_exits(body, 0) {
+        if self.delta.audits_uses() && !return_producers::definitely_exits(body, 0) {
             return false;
         }
         let proven = if body.kind() == "statement_block" {
@@ -567,7 +587,7 @@ impl Prover<'_, '_> {
         let Some(name_node) = function.child_by_field_name("name") else {
             return false;
         };
-        if self.delta.narrowing && function.child_by_field_name("return_type").is_none() {
+        if self.delta.audits_uses() && function.child_by_field_name("return_type").is_none() {
             return false;
         }
         let (Ok(function_name), Ok(param_name)) =
@@ -887,8 +907,8 @@ impl Prover<'_, '_> {
         }
     }
 
-    /// object literal が追加した全プロパティを 1 つずつ持ち、値の型が適合するか。
-    /// 各プロパティの行が変更行であることも求める (同一 diff で足した証拠)。
+    /// object literal が検査対象の必須プロパティを 1 つずつ持ち、値の型が適合するか。
+    /// 追加・縮小ではその行の変更も求め、削除では既に適合する未変更の値も許す。
     fn prove_object_literal(
         &self,
         object: Node<'_>,
@@ -898,10 +918,19 @@ impl Prover<'_, '_> {
         caches: &mut ApiClosureCaches,
     ) -> bool {
         let source: &[u8] = &parsed.source;
-        let Some(changed) =
-            changed_lines_for_ref_path(self.scope.dir, self.scope.base, path, diff_files, caches)
-        else {
-            return false;
+        let changed = if matches!(self.delta.mode, MemberChangeMode::Removal(_)) {
+            None
+        } else {
+            let Some(changed) = changed_lines_for_ref_path(
+                self.scope.dir,
+                self.scope.base,
+                path,
+                diff_files,
+                caches,
+            ) else {
+                return false;
+            };
+            Some(changed)
         };
         let names: HashSet<&str> = self.delta.added.iter().map(|p| p.name.as_str()).collect();
         // escape を含む名前 (`n\u006fte`・`"n\u006fte"`) は、表記と違う名前のキーを作る。
@@ -949,7 +978,7 @@ impl Prover<'_, '_> {
                 // メソッド・getter・setter が追加したキーを作る形と、名前を静的に決められない形は
                 // 値の型を確かめられない。
                 "method_definition" => {
-                    if self.delta.narrowing {
+                    if self.delta.audits_uses() {
                         return false;
                     }
                     let Some(key) = member.child_by_field_name("name") else {
@@ -971,13 +1000,14 @@ impl Prover<'_, '_> {
             let Some([(value, line)]) = found.get(property.name.as_str()).map(Vec::as_slice) else {
                 return false;
             };
-            changed.contains(line)
+            (matches!(self.delta.mode, MemberChangeMode::Removal(_))
+                || changed.as_ref().is_some_and(|lines| lines.contains(line)))
                 && (property.accepts_any_value()
                     || self
                         .value_type(*value, parsed, 0)
                         .is_some_and(|value_type| {
                             assignable(&value_type, &property.ty)
-                                && (!self.delta.narrowing
+                                && (!self.delta.audits_uses()
                                     || self.narrowed_value_sources(
                                         *value,
                                         parsed,
