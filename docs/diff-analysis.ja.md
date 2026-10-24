@@ -298,6 +298,12 @@ astro-sight review --dir . --git \
 
 `context` の影響分析に加えて、`cochange` による変更漏れ候補、公開 API 差分、死蔵シンボルを 1 回の実行でまとめて返す。PR レビューや pre-merge チェック向け。
 
+### Rust の内部モジュールの定数値変更
+
+Rust の `pub const` / 非 `mut` の `pub static` は、同一パスの通常変更で名前・型・可視性・binding kind が変わらず、初期値だけが変わった場合、既存の `api_changes.const_value_changes`（hook では `api.const_value`）へ分類する。Cargo のbin-only crateやlibraryのprivate moduleにある場合も、外部API面から除く処理より先にこの値変更の情報を保持する。既定のhookでは、この分類だけを理由に未更新参照で停止しない。`--strict-public-const-values` を付けると同じ分類をblockingとして扱う。
+
+これは値変更のポリシー分類であり、互換性の証明や外部への公開の証明ではない。`added` / `removed` / `modified` の公開面の判定は維持し、型・可視性・`static mut`・曖昧な対応はこの補正で降格しない。移動やrenameは従来の検査経路を使う。通常出力とstagedのhookにも同じ分類を使い、`refs`の出現契約は変えない。
+
 ### Rust の自由関数削除とパス付きの同名参照
 
 未使用のモジュール自由関数を消したとき、残った同名の出現が別の項目を指すと証明できれば `removed_dead`（hook では `api.rm_dead`）へ分類する。同じモジュールが直接宣言する型の `Engine::run()`、`crate::engine::run()` などのモジュールパス、別の自由関数を同じモジュールで呼ぶ素の `run()` が対象になる。消した関数を指す `crate::launcher::run()` や、解決できない `use` が残れば blocking の `removed`（`api.rm`）を保つ。`refs` と dead-code の出現一覧は変えない。

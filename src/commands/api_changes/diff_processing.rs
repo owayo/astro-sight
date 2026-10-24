@@ -861,6 +861,15 @@ impl<'a> ChangedSignatureFiles<'a> {
             // 型契約変更として種別が確定した時点で埋める (record_signature_decision)。
             contract_change: None,
         };
+        // 値変更の方針は外部API面から独立。通常のRust定数変更だけ、公開面の抑制より先に残す。
+        // 移動では公開面や型所有元の検査を省けないため、従来の判定経路を使う。
+        if self.lang_id == Some(crate::language::LangId::Rust)
+            && self.moved_from.is_none()
+            && self.old_path == self.new_path
+            && is_const_value_only_change(old_sig, new_sig, kind, crate::language::LangId::Rust)
+        {
+            return (change, SignatureDecision::ConstValue);
+        }
         if self.skip_for_binary_crate {
             return (change, SignatureDecision::Omit);
         }
