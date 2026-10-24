@@ -84,7 +84,8 @@ inventory の上限は TS/TSX 512ファイル、旧新合計8MiB、AST 100,000�
 
 export した TS / TSX の interface か object 型の type alias へ、必須プロパティを足した変更を扱う。その型の値を作る箇所と受け取る関数が同じ差分で追随していれば、`modified_closed_in_diff` (`api.mod_closed`) に分ける。型への参照は、それぞれ次のどれかでなければならない。
 
-- 関数・メソッドの戻り値の型 (型注釈がちょうどその型)。すべての `return` が、後述の「証明できる値」を返すこと。async 関数と generator は対象外
+- 関数・メソッドの戻り値の型 (型注釈がちょうどその型)。すべての `return` が、後述の「証明できる値」を返すこと。async 関数は次の限定した形だけを扱い、generator は対象外
+- ファイル直下の通常関数宣言の戻り値が `Row[]`・`Array<Row>`・`readonly Row[]`、または async 関数宣言の戻り値が `Promise<Row[]>`・`Promise<Array<Row>>`・`Promise<readonly Row[]>`・`Promise<Row>`。配列を返す全 `return` は、配列型の必須引数か配列 literal に対する `.map` で、引数1つの無注釈 inline arrow が証明できる値だけを返すこと。callback の式本体とブロック本体を扱い、callback と外側の関数の両方で fallthrough がないことも確かめる。`Promise<Row>` は証明できる値を直接返す形だけを扱う。receiver の別名・書き換え・持ち出し、callback 引数の書き換え、任意オブジェクトの同名メソッド、`filter`・`flatMap`・spread・型アサーション・`await` は証明しない。`Array` / `ReadonlyArray` / `Promise` の宣言・import・prototype への参照や別名への持ち出しが解析範囲内にあっても証明しない。外部コードによる prototype の変更は解決しない
 - `const x: Row = <値>` と `<値> satisfies Row`。値が証明できること
 - ファイル直下の関数宣言の、既定値の無い必須引数 (`function label(row: Row)`)。本体でその引数へ代入せず、値を別の名前へ束縛したりオブジェクト・配列へ入れたりせず、`typeof` で型を取り出さないこと。メンバーの読み出し (`row.id`) と呼び出しへの受け渡しは妨げない。関数名で別に検索し、直接の呼び出しが 1 件以上あり、すべての参照が import・別名なしの export・その位置へ証明できる値を渡す直接の呼び出しのどれかであること
 - 別名なしの `export { Row }`。値の名前空間の出現 (同名の変数・JSX のコンポーネント・プロパティ名) は型を指さないので数えない
@@ -111,7 +112,7 @@ export した TS / TSX の interface か object 型の type alias へ、必須�
 - 上の一覧にないメンバーの型、文字列名のプロパティ
 - メンバー名の衝突 (同時に足した optional メンバーとの衝突を含む)、表記で比べられない名前 (数値の `1` と `0x1`、escape)、自分自身を参照する型
 
-ほかの位置の参照 (`Row[]`・`Promise<Row>`・ほかの型のプロパティ型・`implements`・`as Row`・型引数・callback・メソッド・arrow 関数・optional 引数) も blocking に残す。この証明を入れる前は、参照の行がすべて変わっていれば、位置によらず閉じていた。
+ほかの位置の参照 (上の戻り値以外の `Row[]`・`Promise<Row>`・ほかの型のプロパティ型・`implements`・`as Row`・型引数・callback・メソッド・arrow 関数・optional 引数) も blocking に残す。この証明を入れる前は、参照の行がすべて変わっていれば、位置によらず閉じていた。
 
 証明が及ぶのは、型の名前の参照と、値を作る関数・変数・入れ物の名前の参照を、上に挙げた構文の範囲で確かめるところまでである。呼び出しの結果・引数・return を通って推論で伝わる型は追わない。たとえば `note` の型が衝突する別の型で注釈した変数に `toRow()` を代入する場合や、`const r = toRow("a")` の `typeof r` である。
 

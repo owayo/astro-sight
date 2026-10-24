@@ -50,6 +50,8 @@ use super::ref_index::{
     ref_import_role, ref_is_pass_through_reexport, ref_name_node,
 };
 
+mod return_producers;
+
 /// 配列型の入れ子 (`string[][]`) と式の配列 literal の入れ子をたどる上限。
 const MAX_ARRAY_DEPTH: usize = 8;
 /// 括弧・`satisfies`・`as const` を剥がす上限。超えたら証明しない。
@@ -439,6 +441,13 @@ impl Prover<'_, '_> {
         diff_files: &mut DiffFileLookup<'_>,
         caches: &mut ApiClosureCaches,
     ) -> bool {
+        if function
+            .child_by_field_name("return_type")
+            .and_then(only_named_child)
+            .is_none_or(|ty| ty.kind() != "type_identifier")
+        {
+            return self.prove_wrapped_return(function, parsed, path, diff_files, caches);
+        }
         if has_token(function, "async") || has_token(function, "*") {
             return false;
         }
@@ -1169,7 +1178,12 @@ impl Prover<'_, '_> {
                 self.value_type(init, parsed, MAX_ARRAY_DEPTH)
             }
             (scope, ScopeBinding::Other) => {
-                let param = parameter_named(scope, source, name)?;
+                let Some(param) = parameter_named(scope, source, name) else {
+                    return self.map_parameter_type(scope, name, parsed);
+                };
+                if param.child_by_field_name("type").is_none() {
+                    return self.map_parameter_type(scope, name, parsed);
+                }
                 let annotation = param.child_by_field_name("type")?;
                 let mut ty = simple_type(only_named_child(annotation)?, source)?;
                 if param.kind() == "optional_parameter" {
@@ -1237,7 +1251,7 @@ fn type_role(node: Node<'_>) -> Option<TypeRole<'_>> {
     if parent.kind() != "type_annotation"
         || only_named_child(parent).map(|n| n.id()) != Some(node.id())
     {
-        return None;
+        return return_producers::wrapped_return_owner(node).map(TypeRole::Return);
     }
     let owner = parent.parent()?;
     let field_is = |field: &str| {
