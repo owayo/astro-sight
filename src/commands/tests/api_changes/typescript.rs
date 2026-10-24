@@ -18,6 +18,192 @@ use std::io::Cursor;
 #[allow(unused_imports)]
 use std::process::Command;
 
+#[test]
+fn detect_api_changes_ts_namespace_collision_keeps_root_contract_changes() {
+    for (label, before, after, nested, use_before, use_after, closed) in [
+        (
+            "function",
+            "export function run(value: string): void {}\n",
+            "export function run(value: string, required: boolean): void {}\n",
+            "namespace N { export function run(value: number): void {} }\n",
+            "import { run } from './model';\nexport function main(): void { run('x'); }\nmain();\n",
+            "import { run } from './model';\nexport function main(): void { run( 'x' ); }\nmain();\n",
+            false,
+        ),
+        (
+            "interface",
+            "export interface Row { id: string }\n",
+            "export interface Row { id: string; note: string }\n",
+            "namespace N { export interface Row { other: number } }\n",
+            "import type { Row } from './model';\nexport const row: Row = { id: 'x' };\n",
+            "import type { Row } from './model';\nexport const row: Row = { id: 'x' }; // touched\n",
+            false,
+        ),
+        (
+            "type alias",
+            "export type Row = { id: string };\n",
+            "export type Row = { id: string; note: string };\n",
+            "namespace N { export type Row = { other: number }; }\n",
+            "import type { Row } from './model';\nexport const row: Row = { id: 'x' };\n",
+            "import type { Row } from './model';\nexport const row: Row = { id: 'x' }; // touched\n",
+            false,
+        ),
+        (
+            "variable",
+            "export const LIMIT: number = 1;\n",
+            "export const LIMIT: string = 'x';\n",
+            "namespace N { export const LIMIT: boolean = true; }\n",
+            "import { LIMIT } from './model';\nexport const doubled = LIMIT * 2;\n",
+            "import { LIMIT } from './model';\nexport const doubled = LIMIT  * 2;\n",
+            true,
+        ),
+    ] {
+        for with_namespace in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path();
+            init_git_repo_for_test(repo);
+            let nested = if with_namespace { nested } else { "" };
+            git_commit_files(
+                repo,
+                &[
+                    ("src/model.ts", &format!("{before}{nested}")),
+                    ("src/use.ts", use_before),
+                ],
+                "initial",
+            );
+            fs::write(repo.join("src/model.ts"), format!("{after}{nested}")).unwrap();
+            fs::write(repo.join("src/use.ts"), use_after).unwrap();
+            let changes = detect_api_changes_from_worktree(repo);
+            let name = if label == "function" {
+                "run"
+            } else if label == "variable" {
+                "LIMIT"
+            } else {
+                "Row"
+            };
+            // 同名の定義が同ファイルに複数あるときの既存の閉包ガードは維持する。
+            let closed = closed && !with_namespace;
+            assert_eq!(
+                changes.modified.iter().filter(|c| c.name == name).count(),
+                usize::from(!closed),
+                "{label}, namespace={with_namespace}: {changes:?}"
+            );
+            assert_eq!(
+                changes
+                    .modified_closed_in_diff
+                    .iter()
+                    .filter(|c| c.name == name)
+                    .count(),
+                usize::from(closed),
+                "{label}, namespace={with_namespace}: {changes:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn detect_api_changes_ts_namespace_collision_indexes_last_wins_hidden_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let before = "export function run(value: string): void {}\nnamespace N { export function run(value: string, required: boolean): void {} }\nexport function local(): void { run('local'); }\n";
+    git_commit_files(
+        repo,
+        &[
+            ("src/model.ts", before),
+            (
+                "src/use.ts",
+                "import { run } from './model';\nexport function main(): void { run('x'); }\nmain();\n",
+            ),
+        ],
+        "initial",
+    );
+    fs::write(
+        repo.join("src/model.ts"),
+        before
+            .replace(
+                "run(value: string):",
+                "run(value: string, required: boolean):",
+            )
+            .replace("run('local')", "run( 'local' )"),
+    )
+    .unwrap();
+    fs::write(
+        repo.join("src/use.ts"),
+        "import { run } from './model';\nexport function main(): void { run( 'x' ); }\nmain();\n",
+    )
+    .unwrap();
+    let changes = detect_api_changes_from_worktree(repo);
+    assert_eq!(
+        changes
+            .modified
+            .iter()
+            .filter(|change| change.name == "run")
+            .count(),
+        1,
+        "{changes:?}"
+    );
+    assert!(
+        !changes
+            .modified_closed_in_diff
+            .iter()
+            .any(|change| change.name == "run"),
+        "{changes:?}"
+    );
+}
+
+#[test]
+fn detect_api_changes_ts_namespace_only_change_does_not_change_root_signature() {
+    for (before, after) in [
+        (
+            "export function run(value: number): void {}",
+            "export function run(value: number, extra: boolean): void {}",
+        ),
+        (
+            "export interface run { value: number }",
+            "export interface run { value: string }",
+        ),
+        (
+            "export type run = { value: number };",
+            "export type run = { value: string };",
+        ),
+        ("export const run = 1;", "export const run = 'nested';"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        let root = "export function run(value: string): void {}\n";
+        git_commit_files(
+            repo,
+            &[
+                (
+                    "src/model.ts",
+                    &format!("{root}namespace N {{ {before} }}\n"),
+                ),
+                ("src/use.ts", "import { run } from './model';\nrun('x');\n"),
+            ],
+            "initial",
+        );
+        fs::write(
+            repo.join("src/model.ts"),
+            format!("{root}namespace N {{ {after} }}\n"),
+        )
+        .unwrap();
+        let changes = detect_api_changes_from_worktree(repo);
+        assert!(
+            !changes.modified.iter().any(|change| change.name == "run"),
+            "{changes:?}"
+        );
+        assert!(
+            !changes
+                .modified_closed_in_diff
+                .iter()
+                .any(|change| change.name == "run"),
+            "{changes:?}"
+        );
+    }
+}
+
 fn type_member_diff_files(repo: &std::path::Path) -> Vec<crate::models::impact::DiffFile> {
     let output = Command::new("git")
         .args(["diff", "--unified=0", "HEAD", "--", "src/model.ts"])

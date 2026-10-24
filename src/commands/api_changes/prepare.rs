@@ -192,8 +192,17 @@ pub(crate) fn collect_modified_file_index_names(
     in_file_callees: &std::collections::HashSet<String>,
     parameter_pattern_only_names: &HashSet<String>,
     is_bash_old_file: bool,
+    lang: Option<crate::language::LangId>,
     index_names: &mut HashSet<String>,
 ) {
+    if matches!(
+        lang,
+        Some(crate::language::LangId::Typescript | crate::language::LangId::Tsx)
+    ) {
+        index_names.extend(super::ts_namespace::changed_duplicate_names(
+            old_syms, new_syms,
+        ));
+    }
     let old_map: std::collections::HashMap<&str, &str> = old_syms
         .iter()
         .map(|(name, _kind, sig)| (name.as_str(), sig.as_str()))

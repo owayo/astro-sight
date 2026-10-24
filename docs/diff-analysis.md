@@ -293,6 +293,12 @@ astro-sight review --dir . --git \
 
 On top of the impact analysis of `context`, `review` returns candidates for missed changes from `cochange`, the public API diff, and dead symbols in a single run. It is meant for PR reviews and pre-merge checks.
 
+### TypeScript namespace name collisions
+
+When a separate namespace exports the same name as a directly exported root function, interface, type alias, or simple variable, TS/TSX API comparison can recover the root declaration's changed signature from its AST position. Both versions must use the same TS/TSX grammar and prove a unique root binding. Changed duplicate names remain in the reference index even when the new root signature equals an old namespace signature. A namespace-only edit does not become a root API change.
+
+Recovered candidates use the existing compatibility, argument-count, and type-member checks. A required argument left missing stays blocking even if its call line was reformatted. Existing multiple-definition guards can also keep a recovered variable or type change blocking after its uses are edited. Overloads, declaration merging, rebinding, destructured variables, indirect/default exports, and parse failures are outside this recovery. Other languages and the `refs` / dead-code occurrence contracts are unchanged.
+
 ### Rust internal-module constant values
 
 For an ordinary change at the same path, a Rust `pub const` or non-`mut` `pub static` whose name, type, visibility, and binding kind remain unchanged while only its initializer changes uses the existing `api_changes.const_value_changes` bucket (`api.const_value` in hook output). This value-policy information is retained before external-API suppression, including Cargo bin-only crates and private modules in libraries. The default hook does not stop on unchanged references solely because of this classification. `--strict-public-const-values` makes the same classification blocking.
