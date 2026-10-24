@@ -966,3 +966,273 @@ fn required_member_builtin_type_uses_require_parseable_sources() {
         }
     }
 }
+
+fn narrowing_verdict(row: &str, view: &str, extra: &[(&str, &str)]) -> Verdict {
+    let mut base = vec![("src/row.ts", ROW_AFTER), ("src/view.ts", VIEW_AFTER)];
+    base.extend_from_slice(extra);
+    verdict(
+        &api_after(&base, &[("src/row.ts", row), ("src/view.ts", view)]),
+        "Row",
+    )
+}
+
+#[test]
+fn member_type_narrowing_closes_updated_producer_and_consumer() {
+    let row = ROW_AFTER
+        .replace("note: string | null", "note: string")
+        .replace("note: null", "note: id");
+    let view = VIEW_AFTER.replace("row.note === null ? row.id : ", "");
+    assert_eq!(narrowing_verdict(&row, &view, &[]), Verdict::Closed);
+}
+
+#[test]
+fn member_type_narrowing_keeps_stale_and_unproven_values_blocking() {
+    let row = ROW_AFTER
+        .replace("note: string | null", "note: string")
+        .replace("note: null", "note: id");
+    let view = VIEW_AFTER.replace("row.note === null ? row.id : ", "");
+    for stale in [
+        row.replace("note: id", "note: null"),
+        row.replace("id: string): Row", "id: any): Row"),
+        row.replace("note: id", "note: id as string"),
+        row.replace("note: id", "note: id!"),
+        row.replace(
+            "return { id, note: id };",
+            "if (id) return { id, note: id };",
+        ),
+        row.replace(
+            "return { id, note: id };",
+            "return { id, note: id } as Row;",
+        ),
+    ] {
+        assert_eq!(
+            narrowing_verdict(&stale, &view, &[]),
+            Verdict::Blocking,
+            "{stale}"
+        );
+    }
+    assert_eq!(narrowing_verdict(&row, VIEW_AFTER, &[]), Verdict::Blocking);
+    assert_eq!(
+        narrowing_verdict(&row, &view.replace("): string {", ") {"), &[]),
+        Verdict::Blocking
+    );
+    for statement in [
+        "row.note = null;",
+        "row.note = 'valid';",
+        "row.note += '!';",
+        "row.note++;",
+        "delete row.note;",
+        "({ note: row.note } = incoming);",
+        "[row.note] = incoming;",
+        "for (row.note of incoming) {}",
+        "row['note'] = null;",
+        "const alias = row; alias.note = null;",
+        "const note = row.note;",
+        "const { note } = row;",
+        "unknown(row);",
+        "unknown(row.note);",
+        "Object.assign(row, { note: null });",
+        "row.note === null;",
+        "null !== row.note;",
+        "row.note === undefined;",
+        "const missing = null; row.note === missing;",
+        "row.note!;",
+    ] {
+        let changed = view.replace("    return `", &format!("    {statement}\n    return `"));
+        assert_eq!(
+            narrowing_verdict(&row, &changed, &[]),
+            Verdict::Blocking,
+            "{statement}"
+        );
+    }
+    for extra in [
+        "import { toRow } from './row';\ntoRow('x').note = null;\n",
+        "import { toRow } from './row';\ntoRow('x').note === null;\n",
+        "import { toRow } from './row';\nconst alias = toRow('x');\nalias.note = null;\n",
+        "import { toRow } from './row';\nunknown(toRow('x'));\n",
+        "import { toRow } from './row';\ntoRow('x')['note'] = null;\n",
+        "import { toRow } from './row';\nconst make = toRow;\n",
+    ] {
+        assert_eq!(
+            narrowing_verdict(&row, &view, &[("src/extra.ts", extra)]),
+            Verdict::Blocking,
+            "{extra}"
+        );
+    }
+}
+
+#[test]
+fn member_type_narrowing_accepts_only_strict_scalar_union_removals() {
+    for (before, after, old_value, new_value) in [
+        ("string | undefined", "string", "undefined", "'ready'"),
+        ("'ready' | 'done'", "'ready'", "'done'", "'ready'"),
+        ("true | false", "true", "false", "true"),
+        ("1n | 2n", "1n", "2n", "1n"),
+    ] {
+        let make = |ty: &str, value: &str| {
+            format!(
+                "export interface Row {{\n    note: {ty};\n}}\nexport function toRow(): Row {{\n    return {{ note: {value} }};\n}}\n"
+            )
+        };
+        let (base, updated) = (make(before, old_value), make(after, new_value));
+        let api = api_after(&[("src/row.ts", &base)], &[("src/row.ts", &updated)]);
+        assert_eq!(
+            verdict(&api, "Row"),
+            Verdict::Closed,
+            "{before} -> {after}: {api:?}"
+        );
+    }
+    let row = ROW_AFTER
+        .replace("note: string | null", "note: string")
+        .replace("note: null", "note: id");
+    let view = VIEW_AFTER.replace("row.note === null ? row.id : ", "");
+    for unsupported in [
+        row.replace("note: string", "note: number")
+            .replace("note: id", "note: 1"),
+        row.replace("note: string", "note: string | number | null"),
+        row.replace("note: string", "readonly note: string"),
+        row.replace(
+            "export interface Row {",
+            "export interface Row<T = string> {",
+        ),
+        row.replace(
+            "    note: string;",
+            "    note: string;\n    extra?: string;",
+        ),
+    ] {
+        // 参照行をすべて変更しても、未知の型変更は行の証拠へ戻さない。
+        let changed = unsupported.replace("): Row {", "): Row { // updated");
+        let view_changed = view.replace("row: Row", "row : Row");
+        assert_eq!(
+            narrowing_verdict(&changed, &view_changed, &[]),
+            Verdict::Blocking,
+            "{changed}"
+        );
+    }
+}
+
+#[test]
+fn member_type_narrowing_unknown_names_do_not_fall_back_to_changed_lines() {
+    for key in ["\"note\"", "1"] {
+        let base = ROW_AFTER
+            .replace("note: string | null", &format!("{key}: string | null"))
+            .replace("note: null", &format!("{key}: null"));
+        let changed = base
+            .replace("string | null", "string")
+            .replace("): Row {", "): Row { // updated type reference");
+        let view = if key == "1" {
+            VIEW_AFTER.replace("row.note", "row[1]")
+        } else {
+            VIEW_AFTER.to_string()
+        };
+        let view_changed = view.replace("row: Row", "row : Row");
+        let api = api_after(
+            &[("src/row.ts", &base), ("src/view.ts", &view)],
+            &[("src/row.ts", &changed), ("src/view.ts", &view_changed)],
+        );
+        assert_eq!(verdict(&api, "Row"), Verdict::Blocking, "{key}: {api:?}");
+    }
+}
+
+#[test]
+fn member_type_narrowing_method_producers_are_unproven() {
+    let view = VIEW_AFTER.replace("row.note === null ? row.id : ", "");
+    let base = ROW_AFTER
+        .replace(
+            "    note: string | null;",
+            "    note: string | null;\n    reset: () => void;",
+        )
+        .replace(
+            "return { id, note: null };",
+            "return { id, note: null, reset() { this.note = null; } };",
+        );
+    let after = base
+        .replace("note: string | null", "note: string")
+        .replace("id, note: null,", "id, note: id,");
+    let api = api_after(
+        &[("src/row.ts", &base), ("src/view.ts", VIEW_AFTER)],
+        &[("src/row.ts", &after), ("src/view.ts", &view)],
+    );
+    assert_eq!(verdict(&api, "Row"), Verdict::Blocking, "{api:?}");
+
+    // スカラーだけの型でも、getter が this へ書き込む producer は証明しない。
+    let base = ROW_AFTER.replace(
+        "return { id, note: null };",
+        "return { get id() { this.note = null; return id; }, note: null };",
+    );
+    let after = base
+        .replace("note: string | null", "note: string")
+        .replace("}, note: null", "}, note: id");
+    let api = api_after(
+        &[("src/row.ts", &base), ("src/view.ts", VIEW_AFTER)],
+        &[("src/row.ts", &after), ("src/view.ts", &view)],
+    );
+    assert_eq!(verdict(&api, "Row"), Verdict::Blocking, "{api:?}");
+}
+
+#[test]
+fn member_type_narrowing_local_annotations_do_not_hide_unsafe_initializers() {
+    let row = ROW_AFTER
+        .replace("note: string | null", "note: string")
+        .replace("note: null", "note: note");
+    let view = VIEW_AFTER.replace("row.note === null ? row.id : ", "");
+    for prefix in [
+        "const maybe: string | null = null; const note: string = maybe!;",
+        "const sourceAny: any = null; const note: string = sourceAny;",
+        "const note: string = id as string;",
+        "const note: string = 123;",
+        "const a: string = b; const b: string = a; const note: string = a;",
+        "let note: string = id; note = sourceAny;",
+        "const sourceAny: any = null; id = sourceAny; const note: string = id;",
+    ] {
+        let after = row.replace("    return {", &format!("    {prefix}\n    return {{"));
+        assert_eq!(
+            narrowing_verdict(&after, &view, &[]),
+            Verdict::Blocking,
+            "{prefix}"
+        );
+    }
+    for prefix in [
+        "const note: string = id;",
+        "const first: string = id; const note: string = first;",
+    ] {
+        let after = row.replace("    return {", &format!("    {prefix}\n    return {{"));
+        assert_eq!(
+            narrowing_verdict(&after, &view, &[]),
+            Verdict::Closed,
+            "{prefix}"
+        );
+    }
+    let mut chain = String::from("const n0: string = id; ");
+    for index in 1..=17 {
+        chain.push_str(&format!("const n{index}: string = n{}; ", index - 1));
+    }
+    chain.push_str("const note: string = n17;");
+    let after = row.replace("    return {", &format!("    {chain}\n    return {{"));
+    assert_eq!(narrowing_verdict(&after, &view, &[]), Verdict::Blocking);
+    for (default, expected) in [("123", Verdict::Blocking), ("'fallback'", Verdict::Closed)] {
+        let after = row
+            .replace("id: string): Row", &format!("id: string = {default}): Row"))
+            .replace("note: note", "note: id");
+        assert_eq!(
+            narrowing_verdict(&after, &view, &[]),
+            expected,
+            "default {default}"
+        );
+    }
+}
+
+#[test]
+fn member_type_narrowing_ambiguous_declarations_remain_blocking() {
+    let extra = "\nnamespace N { interface Row { other: string; } }\n";
+    let base = ROW_AFTER.to_string() + extra;
+    let after = base
+        .replace("note: string | null", "note: string")
+        .replace("): Row {", "): Row { // updated reference");
+    let view = VIEW_AFTER.replace("row: Row", "row : Row");
+    let api = api_after(
+        &[("src/row.ts", &base), ("src/view.ts", VIEW_AFTER)],
+        &[("src/row.ts", &after), ("src/view.ts", &view)],
+    );
+    assert_eq!(verdict(&api, "Row"), Verdict::Blocking, "{api:?}");
+}
