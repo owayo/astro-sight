@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::commands::api_changes::ts_required_members::{
-    MemberChangeMode, RequiredMemberChange, RequiredMemberDelta, TypeAtom, simple_type,
+    MemberChangeMode, RequiredMemberChange, RequiredMemberDelta, simple_type,
 };
 
 pub(crate) fn classify_member_property_removal(
@@ -118,29 +118,8 @@ pub(crate) fn classify_member_property_removal(
             };
             let scalar = member
                 .child_by_field_name("type")
-                .and_then(|annotation| {
-                    let mut cursor = annotation.walk();
-                    let mut children = annotation
-                        .named_children(&mut cursor)
-                        .filter(|n| n.kind() != "comment");
-                    let ty = children.next()?;
-                    children
-                        .next()
-                        .is_none()
-                        .then(|| simple_type(ty, source))
-                        .flatten()
-                })
-                .is_some_and(|ty| {
-                    ty.iter().all(|atom| {
-                        !matches!(
-                            atom,
-                            TypeAtom::Array(_)
-                                | TypeAtom::Any
-                                | TypeAtom::Unknown
-                                | TypeAtom::StrLit(None)
-                        )
-                    })
-                });
+                .and_then(|annotation| simple_annotation_type(annotation, source))
+                .is_some_and(|ty| ty.iter().all(is_scalar_atom));
             if member.kind() != "property_signature"
                 || name.contains('\\')
                 || !names.insert(name)

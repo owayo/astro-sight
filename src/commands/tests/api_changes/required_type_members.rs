@@ -1415,6 +1415,32 @@ fn member_type_narrowing_accepts_only_strict_scalar_union_removals() {
 }
 
 #[test]
+fn member_changes_keep_commented_type_annotations_in_both_grammars() {
+    let make = |members: &str, values: &str| {
+        format!(
+            "export interface Row {{\n    id: /* key */ string;\n{members}}}\nexport function toRow(): Row {{\n    return {{ id: 'a'{values} }};\n}}\n"
+        )
+    };
+    let base = make("", "");
+    let nullable = make("    note: /* value */ string | null;\n", ", note: null");
+    let narrowed = make("    note: /* value */ string;\n", ", note: 'ready'");
+    // 追加は配列も扱うが、縮小・削除は未変更のプロパティも scalar 型に限る。
+    let array = make("    note: /* value */ string[];\n", ", note: ['ready']");
+    for path in ["src/row.ts", "src/row.tsx"] {
+        for (name, before, after, expected) in [
+            ("addition", &base, &nullable, Verdict::Closed),
+            ("narrowing", &nullable, &narrowed, Verdict::Closed),
+            ("removal", &nullable, &base, Verdict::Closed),
+            ("array addition", &base, &array, Verdict::Closed),
+            ("array removal", &array, &base, Verdict::Blocking),
+        ] {
+            let api = api_after(&[(path, before)], &[(path, after)]);
+            assert_eq!(verdict(&api, "Row"), expected, "{path} {name}: {api:?}");
+        }
+    }
+}
+
+#[test]
 fn member_type_narrowing_unknown_names_do_not_fall_back_to_changed_lines() {
     for key in ["\"note\"", "1"] {
         let base = ROW_AFTER

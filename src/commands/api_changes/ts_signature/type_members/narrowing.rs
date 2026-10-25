@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::commands::api_changes::ts_required_members::{
-    RequiredMemberChange, RequiredMemberDelta, RequiredProperty, TypeAtom, simple_type,
+    RequiredMemberChange, RequiredMemberDelta, RequiredProperty, simple_type,
 };
 
 pub(crate) fn classify_member_type_narrowing(
@@ -138,17 +138,7 @@ pub(crate) fn classify_member_type_narrowing(
                     .find(|n| n.kind() != "comment")?;
                 simple_type(ty, &src.new)
             })
-            .is_some_and(|atoms| {
-                atoms.iter().all(|atom| {
-                    !matches!(
-                        atom,
-                        TypeAtom::Array(_)
-                            | TypeAtom::Any
-                            | TypeAtom::Unknown
-                            | TypeAtom::StrLit(None)
-                    )
-                })
-            });
+            .is_some_and(|atoms| atoms.iter().all(is_scalar_atom));
         if !scalar_properties {
             return RequiredMemberChange::Unsupported;
         }
@@ -192,31 +182,14 @@ pub(crate) fn classify_member_type_narrowing(
         ) {
             return RequiredMemberChange::Unsupported;
         }
-        let read = |annotation: Node<'_>, source: &[u8]| {
-            let mut cursor = annotation.walk();
-            let mut children = annotation
-                .named_children(&mut cursor)
-                .filter(|n| n.kind() != "comment");
-            let node = children.next()?;
-            if children.next().is_some() {
-                return None;
-            }
-            simple_type(node, source)
-        };
         let (Some(before), Some(after)) = (
-            read(old_annotation, &src.old),
-            read(new_annotation, &src.new),
+            simple_annotation_type(old_annotation, &src.old),
+            simple_annotation_type(new_annotation, &src.new),
         ) else {
             return RequiredMemberChange::Unsupported;
         };
-        let scalar = |atom: &TypeAtom| {
-            !matches!(
-                atom,
-                TypeAtom::Array(_) | TypeAtom::Any | TypeAtom::Unknown | TypeAtom::StrLit(None)
-            )
-        };
-        if !before.iter().all(scalar)
-            || !after.iter().all(scalar)
+        if !before.iter().all(is_scalar_atom)
+            || !after.iter().all(is_scalar_atom)
             || after.len() >= before.len()
             || !after.iter().all(|atom| before.contains(atom))
         {
