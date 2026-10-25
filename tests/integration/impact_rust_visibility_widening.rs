@@ -2,6 +2,192 @@
 
 use super::support::*;
 
+fn private_parent_glob_fixture(cargo: bool, directory_module: bool) -> TestRepo {
+    let repo = TestRepo::new();
+    let base = if cargo { "src/" } else { "" };
+    repo.create_dir_all(format!("{base}formatter/lifecycle"));
+    if cargo {
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"visibility\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        repo.write("src/lib.rs", "mod formatter;\n");
+    }
+    let parent = if directory_module {
+        format!("{base}formatter/mod.rs")
+    } else {
+        format!("{base}formatter.rs")
+    };
+    repo.write(
+        &parent,
+        "mod lifecycle;\nfn absolute_path(path: &str) -> &str { path }\n",
+    );
+    repo.write(
+        format!("{base}formatter/lifecycle.rs"),
+        "use super::*;\nfn emit(path: &str) -> &str { absolute_path(path) }\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        parent,
+        "mod lifecycle;\npub(crate) fn absolute_path(path: &str) -> &str { path }\n",
+    );
+    repo
+}
+
+#[test]
+fn rust_private_visibility_widening_preserves_direct_child_parent_globs() {
+    for cargo in [false, true] {
+        for directory_module in [false, true] {
+            let repo = private_parent_glob_fixture(cargo, directory_module);
+            let caller = if cargo {
+                "src/formatter/lifecycle.rs"
+            } else {
+                "formatter/lifecycle.rs"
+            };
+            let base = if cargo { "src/" } else { "" };
+            let parent = if directory_module {
+                format!("{base}formatter/mod.rs")
+            } else {
+                format!("{base}formatter.rs")
+            };
+            let after = std::fs::read_to_string(repo.path(&parent)).unwrap();
+            repo.write(&parent, after.replace("pub(crate) ", ""));
+            let old_refs = repo.run_json("refs", &["--name", "absolute_path"]);
+            let old_dead = repo.run_json("dead-code", &[]);
+            repo.write(&parent, &after);
+            let new_refs = repo.run_json("refs", &["--name", "absolute_path"]);
+            let refs = |result: &serde_json::Value| {
+                result["refs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|row| row["kind"] == "ref")
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(refs(&old_refs), refs(&new_refs));
+            assert_eq!(old_dead, repo.run_json("dead-code", &[]));
+            let context = repo.run_json("context", &["--git"]);
+            assert!(
+                !has_caller(&context, "impacted_callers", caller),
+                "{context}"
+            );
+            assert!(
+                has_caller(&context, "informational_callers", caller),
+                "{context}"
+            );
+            for command in ["impact", "review"] {
+                let output = cargo_bin()
+                    .args([
+                        command,
+                        "--dir",
+                        repo.root().to_str().unwrap(),
+                        "--git",
+                        "--hook",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{command}: {output:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn rust_private_visibility_widening_parent_glob_without_git() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("formatter");
+    repo.write(
+        "formatter.rs",
+        "mod lifecycle;\npub(crate) fn absolute_path(path: &str) -> &str { path }\n",
+    );
+    repo.write(
+        "formatter/lifecycle.rs",
+        "use super /* parent */ :: *;\nfn emit(path: &str) -> &str { absolute_path(path) }\n",
+    );
+    repo.write("changes.patch", "diff --git a/formatter.rs b/formatter.rs\n--- a/formatter.rs\n+++ b/formatter.rs\n@@ -1,2 +1,2 @@\n mod lifecycle;\n-fn absolute_path(path: &str) -> &str { path }\n+pub(crate) fn absolute_path(path: &str) -> &str { path }\n");
+    let patch = repo.path("changes.patch");
+    let args = ["--diff-file", patch.to_str().unwrap()];
+    let context = repo.run_json("context", &args);
+    assert!(
+        !has_caller(&context, "impacted_callers", "formatter/lifecycle.rs"),
+        "{context}"
+    );
+    assert!(
+        has_caller(&context, "informational_callers", "formatter/lifecycle.rs"),
+        "{context}"
+    );
+    let output = cargo_bin()
+        .args([
+            "review",
+            "--dir",
+            repo.root().to_str().unwrap(),
+            args[0],
+            args[1],
+            "--hook",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn rust_private_visibility_widening_parent_glob_keeps_uncertain_changes() {
+    for case in [
+        "body",
+        "parameter",
+        "attribute",
+        "other-glob",
+        "outside",
+        "ambiguous",
+        "ambiguous-parent",
+        "path",
+        "parse",
+        "shrink",
+        "staged",
+    ] {
+        let repo = private_parent_glob_fixture(true, false);
+        match case {
+            "body" => repo.write("src/formatter.rs", "mod lifecycle;\npub(crate) fn absolute_path(path: &str) -> &str { \"other\" }\n"),
+            "parameter" => repo.write("src/formatter.rs", "mod lifecycle;\npub(crate) fn absolute_path(path: String) -> String { path }\n"),
+            "attribute" => repo.write("src/formatter.rs", "mod lifecycle;\n#[inline]\npub(crate) fn absolute_path(path: &str) -> &str { path }\n"),
+            "other-glob" => repo.write("src/formatter/lifecycle.rs", "use super::*;\nuse crate::other::*;\nfn emit(path: &str) -> &str { absolute_path(path) }\n"),
+            "outside" => {
+                repo.write("src/outside.rs", "fn emit(path: &str) -> &str { crate::formatter::absolute_path(path) }\n");
+                repo.git(["add", "src/outside.rs"]);
+                repo.git(["commit", "-m", "outside reference", "-q"]);
+            }
+            "ambiguous" => repo.write("src/formatter/lifecycle/mod.rs", "fn emit() {}\n"),
+            "ambiguous-parent" => repo.write("src/formatter/mod.rs", "mod lifecycle;\n"),
+            "path" => repo.write("src/other.rs", "#[path = \"formatter/lifecycle.rs\"]\nmod lifecycle;\n"),
+            "parse" => repo.write("src/other.rs", "fn broken(\n"),
+            "shrink" => {
+                repo.git(["add", "src/formatter.rs"]);
+                repo.git(["commit", "-m", "visible parent", "-q"]);
+                repo.write("src/formatter.rs", "mod lifecycle;\nfn absolute_path(path: &str) -> &str { path }\n");
+            }
+            "staged" => repo.stage_all(),
+            _ => unreachable!(),
+        }
+        let args = if case == "staged" {
+            vec!["--git", "--staged"]
+        } else {
+            vec!["--git"]
+        };
+        let context = repo.run_json("context", &args);
+        let caller = if case == "outside" {
+            "src/outside.rs"
+        } else {
+            "src/formatter/lifecycle.rs"
+        };
+        assert!(
+            has_caller(&context, "impacted_callers", caller),
+            "{case}: {context}"
+        );
+    }
+}
+
 fn fixture(old: &str, new: &str, caller: &str) -> TestRepo {
     fixture_with_suffix(old, new, caller, "")
 }
