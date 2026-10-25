@@ -280,6 +280,37 @@ pub(super) fn has_glob_import(source: &[u8]) -> bool {
     false
 }
 
+/// 親以外からの glob は、公開範囲の拡大で新しい同名束縛を取り込み得る。
+pub(super) fn has_non_parent_glob(source: &[u8]) -> bool {
+    let Ok(tree) = parser::parse_source(source, LangId::Rust) else {
+        return true;
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return true;
+    }
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "use_wildcard" {
+            let mut cursor = node.walk();
+            let mut children = node
+                .named_children(&mut cursor)
+                .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"));
+            if !node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "use_declaration")
+                || children.next().is_none_or(|child| child.kind() != "super")
+                || children.next().is_some()
+            {
+                return true;
+            }
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
 #[cfg(test)]
 mod explicit_tests {
     use super::*;
@@ -292,6 +323,8 @@ mod explicit_tests {
         }
         for query in [
             "(visibility_modifier)",
+            "(use_declaration argument: (use_wildcard (super)))",
+            "(mod_item name: (identifier))",
             "(scoped_identifier path: (_) @path name: (_) @name)",
             "(identifier)",
             "(crate)",
@@ -299,6 +332,29 @@ mod explicit_tests {
             "(super)",
         ] {
             tree_sitter::Query::new(&language, query).unwrap();
+        }
+    }
+
+    #[test]
+    fn private_widening_globs_require_a_direct_parent_path() {
+        for source in [
+            "use super::*;",
+            "use super /* parent */ :: *;",
+            "pub(crate) use super::*;",
+            "use super::item;",
+            "const TEXT: &str = \"use other::*;\"; // use other::*;",
+        ] {
+            assert!(!has_non_parent_glob(source.as_bytes()), "{source}");
+        }
+        for source in [
+            "use other::*;",
+            "use super::other::*;",
+            "use crate::*;",
+            "use super::{*};",
+            "use super::{item, other::*};",
+            "fn broken(",
+        ] {
+            assert!(has_non_parent_glob(source.as_bytes()), "{source}");
         }
     }
 

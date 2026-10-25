@@ -873,6 +873,7 @@ struct RefFileEvidence<'a> {
     /// 変更元ごとに、参照ファイルが旧 private 宣言のモジュール部分木に入るか。
     /// `None` は証明できないことを表し、`Some(false)` とは区別する。
     rust_private_scope: HashMap<usize, Option<bool>>,
+    rust_private_widening_child: HashMap<usize, bool>,
     rust_explicit_widening_scope: HashMap<(usize, usize), bool>,
     rust_private_import_owners: HashMap<(usize, usize), bool>,
     rust_ref_source: std::cell::OnceCell<Option<Vec<u8>>>,
@@ -1011,6 +1012,7 @@ impl<'a> ImpactCollector<'a> {
             python_source_paths,
             rust_owner_paths: HashMap::new(),
             rust_private_scope: HashMap::new(),
+            rust_private_widening_child: HashMap::new(),
             rust_explicit_widening_scope: HashMap::new(),
             rust_private_import_owners: HashMap::new(),
             rust_ref_source: std::cell::OnceCell::new(),
@@ -1174,8 +1176,19 @@ impl<'a> ImpactCollector<'a> {
                         )
                     })
             });
-        let visibility_only_informational =
-            private_visibility_informational || explicit_visibility_informational;
+        let parent_glob_visibility_informational = ctx.lang_id == LangId::Rust
+            && !filter_disabled
+            && ctx.rust_private_widening_names.contains(name)
+            && *evidence
+                .rust_private_widening_child
+                .entry(fc_ix)
+                .or_insert_with(|| {
+                    self.rust_path_owner_project
+                        .private_widening_direct_child(source_path, self.path_str)
+                });
+        let visibility_only_informational = private_visibility_informational
+            || explicit_visibility_informational
+            || parent_glob_visibility_informational;
         if ctx.lang_id == LangId::Rust
             && !filter_disabled
             && !filters::is_same_source_file(self.path_str, source_path)

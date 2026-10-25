@@ -133,6 +133,7 @@ pub(super) struct RustPathOwnerProjectProof {
     safe_macro_value_environment: OnceLock<bool>,
     no_source_inclusion: OnceLock<bool>,
     no_glob_imports: OnceLock<bool>,
+    parent_glob_widening_sources: OnceLock<bool>,
     module_wiring_unchanged: bool,
     private_scope_wiring_unchanged: bool,
     reexport_cargo_enabled: bool,
@@ -185,6 +186,7 @@ impl RustPathOwnerProjectProof {
             safe_macro_value_environment: OnceLock::new(),
             no_source_inclusion: OnceLock::new(),
             no_glob_imports: OnceLock::new(),
+            parent_glob_widening_sources: OnceLock::new(),
             module_wiring_unchanged,
             private_scope_wiring_unchanged,
             reexport_cargo_enabled,
@@ -234,6 +236,88 @@ impl RustPathOwnerProjectProof {
             && *self.no_glob_imports.get_or_init(|| {
                 scan_sources(&self.root, super::rust_visibility_scope::has_glob_import)
             })
+    }
+
+    /// 通常の直下子 module は、親の private 宣言を変更前から参照できる。
+    pub(super) fn private_widening_direct_child(&self, source_path: &str, ref_path: &str) -> bool {
+        if !self.private_scope_wiring_unchanged
+            || !*self.parent_glob_widening_sources.get_or_init(|| {
+                scan_safe_source_environment(&self.root, |source| {
+                    source_can_retarget_private_scope(source)
+                        || super::rust_visibility_scope::has_non_parent_glob(source)
+                })
+            })
+        {
+            return false;
+        }
+        let source = Path::new(source_path);
+        let Some(filename) = source.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        let base = match filename {
+            // crate root と通常の module の両方になり得る名前は既存の Cargo 証明に任せる。
+            "lib.rs" | "main.rs" => return false,
+            "mod.rs" => source.parent().unwrap_or(Path::new("")).to_owned(),
+            _ => source.with_extension(""),
+        };
+        let alternative = if filename == "mod.rs" {
+            base.with_extension("rs")
+        } else {
+            base.join("mod.rs")
+        };
+        if self.root.join(alternative).exists() {
+            return false;
+        }
+        let reference = Path::new(ref_path);
+        let Ok(relative) = reference.strip_prefix(&base) else {
+            return false;
+        };
+        let parts = relative.components().collect::<Vec<_>>();
+        let name = match parts.as_slice() {
+            [std::path::Component::Normal(file)] => {
+                file.to_str().and_then(|name| name.strip_suffix(".rs"))
+            }
+            [
+                std::path::Component::Normal(module),
+                std::path::Component::Normal(file),
+            ] if *file == "mod.rs" => module.to_str(),
+            _ => None,
+        };
+        let Some(name) = name.filter(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        }) else {
+            return false;
+        };
+        let file = base.join(format!("{name}.rs"));
+        let directory_file = base.join(name).join("mod.rs");
+        if self.root.join(&file).is_file() == self.root.join(&directory_file).is_file() {
+            return false;
+        }
+        let Some(Some(old)) = self.reexport_old_sources.get(source) else {
+            return false;
+        };
+        let Ok(tree) = parser::parse_source(old, LangId::Rust) else {
+            return false;
+        };
+        let root = tree.root_node();
+        if root.has_error() {
+            return false;
+        }
+        let mut cursor = root.walk();
+        let mut declarations = root.named_children(&mut cursor).filter(|node| {
+            node.kind() == "mod_item"
+                && node
+                    .child_by_field_name("name")
+                    .and_then(|node| node.utf8_text(old).ok())
+                    .is_some_and(|value| value.strip_prefix("r#").unwrap_or(value) == name)
+        });
+        declarations
+            .next()
+            .is_some_and(|node| node.child_by_field_name("body").is_none())
+            && declarations.next().is_none()
     }
 
     /// 旧境界内と確定した参照だけを認める。範囲外や不明の参照は除外しない。
