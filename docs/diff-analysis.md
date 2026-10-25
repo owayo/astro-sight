@@ -303,6 +303,8 @@ astro-sight review --dir . --git \
 
 ## review: Structured Diff Review
 
+`review --hook` keeps `api.mod` and `api.const_value` visible but treats them as nonblocking when the same review's `test_only_symbols` contains the same file, name, and symbol kind with a known declaration line. This also applies under `--strict-public-const-values`; normal API classifications are unchanged. Any reported coverage gap in the review or impact analysis prevents this downgrade. Production uses and re-exports, unreferenced exports, and same-name symbols in other files do not establish test-only use; a mixed list still blocks on its production changes. Removal, callback, and type-annotation policies are unchanged. This is a policy based on observed repository references, without guaranteeing the absence of external consumers.
+
 On top of the impact analysis of `context`, `review` returns candidates for missed changes from `cochange`, the public API diff, and dead symbols in a single run. It is meant for PR reviews and pre-merge checks.
 
 ### TypeScript namespace name collisions

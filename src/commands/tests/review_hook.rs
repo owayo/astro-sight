@@ -18,6 +18,123 @@ use std::io::Cursor;
 #[allow(unused_imports)]
 use std::process::Command;
 
+fn test_only_api_fixture(const_value: bool) -> ReviewResult {
+    let change = ApiSymbolChange {
+        name: "PAGE_URL".into(),
+        kind: "variable".into(),
+        file: "e2e/pages.ts".into(),
+        old_signature: None,
+        new_signature: None,
+        no_resolved_internal_callers: false,
+        contract_change: None,
+    };
+    ReviewResult {
+        api_changes: if const_value {
+            ApiChanges {
+                const_value_changes: vec![change],
+                ..Default::default()
+            }
+        } else {
+            ApiChanges {
+                modified: vec![change],
+                ..Default::default()
+            }
+        },
+        test_only_symbols: vec![crate::models::review::DeadSymbol {
+            name: "PAGE_URL".into(),
+            kind: "variable".into(),
+            file: "e2e/pages.ts".into(),
+            line: Some(1),
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_only_api_changes_keep_output_without_blocking() {
+    for const_value in [false, true] {
+        let result = test_only_api_fixture(const_value);
+        for strict in [false, true] {
+            let build = build_review_hook_json(&result, ".", strict);
+            assert!(
+                !build.is_blocking,
+                "test-only, const={const_value}, strict={strict}"
+            );
+            let json = build.value.unwrap();
+            let bucket = if const_value { "const_value" } else { "mod" };
+            assert_eq!(json["api"][bucket][0]["n"], "PAGE_URL", "{json}");
+            assert_eq!(json["blocking_categories"], serde_json::json!([]), "{json}");
+        }
+    }
+}
+
+#[test]
+fn test_only_api_proof_requires_same_identity_and_complete_analysis() {
+    for const_value in [false, true] {
+        for case in [
+            "file",
+            "name",
+            "kind",
+            "line",
+            "truncated",
+            "impact truncated",
+            "no refs",
+            "mixed",
+        ] {
+            let mut result = test_only_api_fixture(const_value);
+            match case {
+                "file" => result.test_only_symbols[0].file = "other.ts".into(),
+                "name" => result.test_only_symbols[0].name = "OTHER".into(),
+                "kind" => result.test_only_symbols[0].kind = "function".into(),
+                "line" => result.test_only_symbols[0].line = None,
+                "truncated" => {
+                    result
+                        .truncations
+                        .push(crate::models::truncation::TruncationInfo::new(
+                            None,
+                            crate::models::truncation::TruncationReason::UnanalyzableSource,
+                            "incomplete source inventory".into(),
+                        ))
+                }
+                "no refs" => result.test_only_symbols.clear(),
+                "impact truncated" => {
+                    result
+                        .impact
+                        .truncations
+                        .push(crate::models::truncation::TruncationInfo::new(
+                            None,
+                            crate::models::truncation::TruncationReason::ParseErrorRegion,
+                            "incomplete impact analysis".into(),
+                        ))
+                }
+                "mixed" => {
+                    let changes = if const_value {
+                        &mut result.api_changes.const_value_changes
+                    } else {
+                        &mut result.api_changes.modified
+                    };
+                    let mut production = changes[0].clone();
+                    production.name = "LIVE_URL".into();
+                    changes.push(production);
+                }
+                _ => unreachable!(),
+            }
+            let build = build_review_hook_json(&result, ".", true);
+            assert!(build.is_blocking, "{const_value}/{case}");
+            let json = build.value.unwrap();
+            let bucket = if const_value { "const_value" } else { "mod" };
+            assert_eq!(json["api"][bucket][0]["n"], "PAGE_URL", "{json}");
+            assert!(
+                json["blocking_categories"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!(format!("api.{bucket}"))),
+                "{json}"
+            );
+        }
+    }
+}
+
 #[test]
 fn callback_body_hook_reports_unverified_changes_and_supports_strict_mode() {
     use crate::models::review::{CallbackBodyChange, CallbackBodyChangeReason};
