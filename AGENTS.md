@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **TS のローカル producer の束縛** — `ts_required_members/local_producers.rs` は必須追加で証明する関数・ブロック内の `const x: Row` の利用を、字句スコープで同じ宣言へ解決する識別子だけに限って監査する (Issue #148)。別ファイルや別スコープの同名変数・引数は対象にせず、同じ束縛の `typeof`・alias・入れ物への格納・重複宣言・escape は保留する。内側の別束縛を consumer へ渡した値は既存の型の証明で確かめる。直下の宣言・関数・入れ物と縮小・削除の監査、refs/dead-code の出現契約は変えない。
+
 - **TS の型メンバー分類の分担** — `ts_signature/type_members.rs` は宣言・メンバーのトークン正規化と optional 追加の互換判定を持つ。必須追加は `type_members/addition.rs` で既存メンバーの多重集合照合・追加順序の保持・名前衝突の監査を分け、縮小と削除は `narrowing.rs` / `removal.rs` で判定する。3 モードが使う型注釈の読取りと、縮小・削除に共通する scalar 型の制約は `properties.rs` に置く。モードごとの `NotApplicable` / `Unsupported` の使い分けは各分類器が保持し、追加で扱える配列型を縮小・削除へ広げない。回帰は `required_type_members.rs` の既存ケースと TS/TSX のコメント入り型注釈・配列型の対照で確認する。
 
 - **TS の純粋なプロパティ削除と閉包** — `ts_signature/type_members/removal.rs` はscalar propertyだけを持つ一意なinterface/object型で、ヘッダと残存メンバーが不変の削除を分類する (Issue #141)。`MemberChangeMode`で追加・縮小・削除を区別し、削除は残る必須フィールドの値を変更行条件なしで検査する。通常直下関数/同ファイルconst/明示戻り型consumerに限定し、既存のtype/producer/consumer/deferred義務と`narrowed_uses`の未知key・alias・持出し監査を使う。削除名は`removed_uses.rs`でmember/object/destructure/string/type keyを横断確認し、無関係な同名キーも保留。escapeを含むソースはraw名の事前フィルタで落とさず、escaped識別子/キー・JSのJSDoc・削除名かescapeを含む埋め込みソースを保留する。generic/extends/index/method/関数値/自己参照/不明型/混在/解析不能は行だけで閉じない。配列/Promise/satisfies/arrow/importしたRow定数等は削除側で広げない。追加/縮小・refs/dead-codeの契約は不変。unit/CLIはキー残存・動的key・typeof/alias・escape・staged・既存modeと対照し、新ノードは両TS文法のQueryと実構文で検証する。

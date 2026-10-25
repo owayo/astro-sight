@@ -46,6 +46,38 @@ fn producer_updated_in_same_diff_closes_required_member_addition() {
 }
 
 #[test]
+fn local_producer_binding_hook_matches_worktree_and_index() {
+    for extension in ["ts", "tsx"] {
+        for (extra, expected) in [
+            ("", 0),
+            ("type Copy = typeof row;", 1),
+            ("{ const row = { id: 'stale' }; label(row); }", 1),
+            ("{ const row = 1; type Copy = typeof row; }", 0),
+        ] {
+            let app = format!(
+                "import {{ type Row, toRow }} from './row';\nimport {{ label }} from './view';\nexport function run(): string {{ const row: Row = toRow('a'); {extra} return label(row); }}\n"
+            );
+            let path = format!("src/app.{extension}");
+            let repo = fixture("{ id, note: null }", &[(&path, &app)]);
+            let (code, json) = hook(&repo);
+            let category = if expected == 0 { "mod_closed" } else { "mod" };
+            assert_eq!(code, expected, "{extension}/{extra}: {json}");
+            assert_eq!(json["api"][category][0]["n"], "Row", "{json}");
+            repo.stage_all();
+            repo.write(&path, "export const unrelated = 1;\n");
+            let output = cargo_bin()
+                .args(["review", "--git", "--staged", "--hook", "--dir"])
+                .arg(repo.root())
+                .output()
+                .unwrap();
+            let staged: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert_eq!(output.status.code(), Some(expected), "{staged}");
+            assert_eq!(staged["api"][category][0]["n"], "Row", "{staged}");
+        }
+    }
+}
+
+#[test]
 fn producer_left_unchanged_keeps_required_member_addition_blocking() {
     // toRow が note を返さない (型検査も通らない) 差分。
     let (code, json) = hook(&fixture("{ id }", &[]));

@@ -6,6 +6,79 @@ use crate::commands::tests::common::*;
 use crate::models::review::ApiChanges;
 use std::fs;
 
+#[test]
+fn required_member_local_producer_uses_lexical_binding() {
+    for (local, param) in [
+        ("row", "row"),
+        ("picked", "picked"),
+        ("picked", "row"),
+        ("row", "value"),
+    ] {
+        for extension in ["ts", "tsx"] {
+            let view = format!(
+                "import type {{ Row }} from './row';\nexport function label({param}: Row): string {{ return {param}.id; }}\n"
+            );
+            let app = format!(
+                "import {{ type Row, toRow }} from './row';\nimport {{ label }} from './view';\nexport function run(): string {{ const {local}: Row = toRow('a'); return label({local}); }}\n"
+            );
+            let view_path = format!("src/view.{extension}");
+            let app_path = format!("src/app.{extension}");
+            let api = api_after(
+                &[
+                    ("src/row.ts", ROW_BASE),
+                    (&view_path, &view),
+                    (&app_path, &app),
+                ],
+                &[("src/row.ts", ROW_AFTER)],
+            );
+            assert_eq!(
+                verdict(&api, "Row"),
+                Verdict::Closed,
+                "{local}/{param}/{extension}: {api:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn required_member_local_producer_keeps_own_queries_and_aliases_blocking() {
+    for (extra, expected) in [
+        ("type Copy = typeof row;", Verdict::Blocking),
+        ("const other = row;", Verdict::Blocking),
+        ("const box = { row };", Verdict::Blocking),
+        (
+            "const copy = () => { type Copy = typeof row; };",
+            Verdict::Blocking,
+        ),
+        (
+            "{ const row = 1; type Copy = typeof row; }",
+            Verdict::Closed,
+        ),
+        (
+            "const unrelated = (row: number) => { const other = row; };",
+            Verdict::Closed,
+        ),
+        (
+            "{ const row = { id: 'stale' }; label(row); }",
+            Verdict::Blocking,
+        ),
+        ("const row: Row = toRow('b');", Verdict::Blocking),
+    ] {
+        let app = format!(
+            "import {{ type Row, toRow }} from './row';\nimport {{ label }} from './view';\nexport function run(): string {{ const row: Row = toRow('a'); {extra} return label(row); }}\n"
+        );
+        let api = api_after(
+            &[
+                ("src/row.ts", ROW_BASE),
+                ("src/view.ts", VIEW_BASE),
+                ("src/app.ts", &app),
+            ],
+            &[("src/row.ts", ROW_AFTER), ("src/view.ts", VIEW_AFTER)],
+        );
+        assert_eq!(verdict(&api, "Row"), expected, "{extra}: {api:?}");
+    }
+}
+
 const REMOVAL_ROW_BASE: &str = "export interface Row {\n    id: string;\n    note: string;\n    extra: number;\n}\nexport function toRow(id: string): Row {\n    return { id, note: id, extra: 0 };\n}\n";
 const REMOVAL_VIEW_BASE: &str = "import { type Row, toRow } from './row';\nexport function label(row: Row): string {\n    return `${row.id} (${row.note}, ${row.extra})`;\n}\nexport const first = label(toRow('a'));\n";
 
