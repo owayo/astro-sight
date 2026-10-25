@@ -3,19 +3,28 @@
 use super::*;
 
 /// ファイル直下や変数以外は既存の名前による監査へ戻す。
-pub(super) fn prove_local_variable(declaration: Node<'_>, parsed: &ParsedRefFile) -> Option<bool> {
-    prove_variable(declaration, parsed, false)
+pub(super) fn prove_local_variable(
+    declaration: Node<'_>,
+    parsed: &ParsedRefFile,
+    type_name: &str,
+) -> Option<bool> {
+    prove_variable(declaration, parsed, false, type_name)
 }
 
 /// 型注釈の無い const は、module 内の非公開の直下宣言も同じ束縛で監査する。
-pub(super) fn prove_inferred_variable(declaration: Node<'_>, parsed: &ParsedRefFile) -> bool {
-    prove_variable(declaration, parsed, true) == Some(true)
+pub(super) fn prove_inferred_variable(
+    declaration: Node<'_>,
+    parsed: &ParsedRefFile,
+    type_name: &str,
+) -> bool {
+    prove_variable(declaration, parsed, true, type_name) == Some(true)
 }
 
 fn prove_variable(
     declaration: Node<'_>,
     parsed: &ParsedRefFile,
     allow_module: bool,
+    type_name: &str,
 ) -> Option<bool> {
     if declaration.kind() != "variable_declarator" {
         return None;
@@ -87,7 +96,7 @@ fn prove_variable(
                         .parent()
                         .is_some_and(|parent| parent.kind() == "export_specifier")
                     || reference_is_written(node)
-                    || !node_outside_type_query(node, source, false)
+                    || !node_outside_type_query(node, source, false, Some(type_name))
             }
             Some(_) => false,
             None => true,

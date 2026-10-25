@@ -6,6 +6,165 @@ use crate::commands::tests::common::*;
 use crate::models::review::ApiChanges;
 use std::fs;
 
+fn spread_copy_api(copy: &str, call: &str, after_copy: Option<&str>) -> ApiChanges {
+    let source = |body: &str| format!("import {{ type Row, toRow }} from './row';\n{body}\n");
+    let before = source(copy);
+    let app = format!(
+        "import {{ toRow }} from './row';\nimport {{ copy }} from './copy';\nexport const result = {call}.id;\n"
+    );
+    let mut changes = vec![("src/row.ts", ROW_AFTER)];
+    let after = after_copy.map(source);
+    if let Some(after) = &after {
+        changes.push(("src/copy.ts", after));
+    }
+    api_after(
+        &[
+            ("src/row.ts", ROW_BASE),
+            ("src/copy.ts", &before),
+            ("src/app.ts", &app),
+        ],
+        &changes,
+    )
+}
+
+#[test]
+fn required_member_spread_copies_complete_target_values() {
+    for (copy, call) in [
+        (
+            "export function copy(row: Row, id: string): Row { return { ...row, id }; }",
+            "copy(toRow('a'), 'b')",
+        ),
+        (
+            "export function copy(row: Row): Row { return { ...row, id: 'b' }; }",
+            "copy(toRow('a'))",
+        ),
+        (
+            "export function copy(): Row { const row: Row = toRow('a'); return { ...row, id: 'b' }; }",
+            "copy()",
+        ),
+        (
+            "export function copy(): Row { const row = toRow('a'); return { ...row, id: 'b' }; }",
+            "copy()",
+        ),
+        (
+            "const SAMPLE: Row = toRow('a'); export function copy(): Row { return { ...SAMPLE, id: 'b' }; }",
+            "copy()",
+        ),
+        (
+            "export function copy(): Row { return { ...toRow('a'), id: 'b' }; }",
+            "copy()",
+        ),
+        (
+            "export function copy(row: Row): Row { const next: Row = { ...row, id: 'b' }; return next; }",
+            "copy(toRow('a'))",
+        ),
+        (
+            "export function copy(row: Row): Row { return ({ ...row, id: 'b' } satisfies Row); }",
+            "copy(toRow('a'))",
+        ),
+    ] {
+        let api = spread_copy_api(copy, call, None);
+        assert_eq!(verdict(&api, "Row"), Verdict::Closed, "{copy}: {api:?}");
+    }
+    for extension in ["ts", "tsx"] {
+        for alias in [false, true] {
+            let declaration = |s: &str| {
+                if alias {
+                    s.replace("export interface Row {", "export type Row = {")
+                        .replace("\n}\n\nexport function", "\n};\n\nexport function")
+                } else {
+                    s.to_string()
+                }
+            };
+            let root = format!("src/row.{extension}");
+            let before = declaration(ROW_BASE);
+            let after = declaration(ROW_AFTER);
+            let copy_path = format!("src/copy.{extension}");
+            let copy = "import type { Row } from './row';\nexport function copy(row: Row): Row { return { ...(row), id: 'b' }; }\n";
+            let app = "import { toRow } from './row';\nimport { copy } from './copy';\nexport const result = copy(toRow('a')).id;\n";
+            let api = api_after(
+                &[(&root, &before), (&copy_path, copy), ("src/app.ts", app)],
+                &[(&root, &after)],
+            );
+            assert_eq!(
+                verdict(&api, "Row"),
+                Verdict::Closed,
+                "{extension}/{alias}: {api:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn required_member_spread_overrides_follow_the_last_proven_source() {
+    let before = "export function copy(row: Row): Row { return { ...row }; }";
+    for (value, expected) in [
+        ("{ ...row, note: null }", Verdict::Closed),
+        ("{ ...row, note: 'new' }", Verdict::Closed),
+        ("{ ...row, note: 123 }", Verdict::Blocking),
+        ("{ note: 123, ...row }", Verdict::Closed),
+        ("{ ...row, note: 123, ...row }", Verdict::Closed),
+        ("{ ...row, ...row, id: 'b' }", Verdict::Closed),
+        ("{ ...row, ...unknown }", Verdict::Blocking),
+        ("{ ...unknown, ...row }", Verdict::Blocking),
+        ("{ ...row, ['note']: null }", Verdict::Blocking),
+        (r#"{ ...row, "n\u006fte": null }"#, Verdict::Blocking),
+        ("{ ...row, note: null, note: 'new' }", Verdict::Blocking),
+        ("{ ...row, get note() { return null; } }", Verdict::Blocking),
+    ] {
+        let after = format!("export function copy(row: Row): Row {{ return {value}; }}");
+        let api = spread_copy_api(before, "copy(toRow('a'))", Some(&after));
+        assert_eq!(verdict(&api, "Row"), expected, "{value}: {api:?}");
+    }
+}
+
+#[test]
+fn required_member_spread_does_not_accept_unknown_sources_or_hidden_copies() {
+    for copy in [
+        "export function copy(row: Partial<Row>): Row { return { ...row }; }",
+        "export function copy(row: any): Row { return { ...row }; }",
+        "export function copy(row: { id: string }): Row { return { ...row }; }",
+        "export function copy(): Row { return { ...toRow<string>('a') }; }",
+        "export function copy(): Row { return { ...toRow(...['a']) }; }",
+        "function make<T>(): Row { return toRow('a'); } export function copy(): Row { return { ...make() }; }",
+        "export function copy(row: Row): Row { return { ...(row as Row) }; }",
+        "export function copy(row: Row): Row { const alias = row; return { ...alias }; }",
+        "export function copy(row: Row): Row { const box = { ...row }; return box; }",
+        "export function copy(row: Row): Row { const next: Row = { ...row }; type Copy = typeof next; return next; }",
+        "export function copy(row: Row): Row { const next: Row = { ...row }; const alias = next; return next; }",
+        "export function copy(row: Row): Row { row = stale; return { ...row }; }",
+        "export function copy(row: Row): Row { return { ...row }; }\nexport type Copy = ReturnType<typeof copy>;",
+    ] {
+        let api = spread_copy_api(copy, "copy(toRow('a'))", None);
+        assert_eq!(verdict(&api, "Row"), Verdict::Blocking, "{copy}: {api:?}");
+    }
+}
+
+#[test]
+fn member_narrowing_and_removal_do_not_accept_spread_copy() {
+    let copy = "import { type Row } from './row';\nexport function copy(row: Row): Row { return { ...row, id: 'b' }; }\n";
+    let app = "import { toRow } from './row';\nimport { copy } from './copy';\nexport const result = copy(toRow('a')).id;\n";
+    for (before, after) in [
+        (
+            ROW_AFTER.to_string(),
+            ROW_AFTER
+                .replace("note: string | null", "note: string")
+                .replace("note: null", "note: id"),
+        ),
+        (REMOVAL_ROW_BASE.to_string(), removal_row()),
+    ] {
+        let api = api_after(
+            &[
+                ("src/row.ts", &before),
+                ("src/copy.ts", copy),
+                ("src/app.ts", app),
+            ],
+            &[("src/row.ts", &after)],
+        );
+        assert_eq!(verdict(&api, "Row"), Verdict::Blocking, "{after}: {api:?}");
+    }
+}
+
 #[test]
 fn required_member_inferred_const_accepts_direct_annotated_call_results() {
     for extension in ["ts", "tsx"] {
