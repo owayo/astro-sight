@@ -30,20 +30,20 @@ memmap2 = "0.9.11"
 mimalloc = "0.1.52"
 rayon = "1.12.0"
 rmcp = { version = "3.5.1", features = ["server", "macros", "transport-io"] }
-schemars = "1.2.2"
+schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = { version = "1.0.151", features = ["preserve_order"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
 serde_yaml = "0.9.34"
-smallvec = "1.16.2"
+smallvec = "1.16.3"
 streaming-iterator = "0.1.9"
 tempfile = "3.27.0"
 time = { version = "0.3.55", features = ["formatting", "macros", "local-offset"] }
-tokio = { version = "1.53.2", features = ["full"] }
-toml = "1.1.7"
+tokio = { version = "1.53.3", features = ["full"] }
+toml = "1.1.8"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
-tree-sitter = "0.27.0"
+tree-sitter = "0.27.1"
 # 文法の独自修正を使う。上流の更新で path patch が外れないよう版を合わせる。
 tree-sitter-bash = "=0.25.1"
 tree-sitter-c = "0.24.2"
@@ -53,7 +53,7 @@ tree-sitter-go = "0.25"
 tree-sitter-java = "0.23.5"
 tree-sitter-javascript = "0.25"
 tree-sitter-kotlin = "=0.3.5"  # tree-sitter 0.27 と非互換 (0.3.8 以降が >=0.21,<0.23 を要求)
-tree-sitter-language = "0.1.8"
+tree-sitter-language = "0.1.9"
 tree-sitter-php = "0.25.1"
 tree-sitter-python = "0.25"
 tree-sitter-ruby = { git = "https://github.com/owayo/tree-sitter-ruby.git", branch = "master" }
@@ -67,7 +67,7 @@ unicode-general-category = "1.1.0"
 # 避けるために使う。Windows は `FILE_FLAG_OPEN_REPARSE_POINT` を自前定義するので不要なため、
 # 全ターゲット依存にはしない。
 [target.'cfg(unix)'.dependencies]
-libc = "0.2.190"
+libc = "0.2.191"
 
 [features]
 # `cargo run --release --features dhat-heap -- <args>` でヒーププロファイルを
