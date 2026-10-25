@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **TS の対象型の spread copy** — `ts_required_members/spread_copy.rs` は必須追加で、全 spread 元が対象型の識別子または一意な通常直下関数の明示戻り型付き直接呼出しと証明できる object を扱う (Issue #152)。追加キーごとに最後の spread と明示値の順序を照合し、後続の明示値には既存の型・変更行の証明を求める。unknown/any/Partial/assertion、computed/escape key、重複した明示追加キー・method は保留。alias 例外は、型参照の義務と producer 名の監査を別に持つ明示 Row return の直下通常関数・const x:Row・satisfies Row のコピー先に限る。単に同名の型注釈だけで閉じず、既存の所属・値・caller・typeof/alias の義務を全て通す。spread ごとの全キー展開や再帰的な object 追跡はせず、縮小・削除・refs/dead-code の契約を維持する。
+
 - **テスト専用 API と hook の停止** — `review/hook.rs` は同一レビューの `test_only_symbols` と file/name/kind が一致し宣言行がある modified・const_value だけを停止条件から外す (Issue #151)。strict const でも表示は維持し、通常の API 分類と refs/dead-code は変えない。review/impact の truncation と skip があれば降格せず、本体利用・再 export・無参照・同名別宣言・mixed の本体変更は blocking を維持する。removed/callback/type annotation の policy は不変。保証は観測した内部参照の範囲で、外部利用者の不在は証明しない。
 
 - **TS の呼出し結果を入れた const** — 必須追加の `identifier_has_target_type` は、先行する単純な無注釈 const の初期化子が、明示戻り型を持つ一意な直下関数の直接呼出しの場合も証明する (Issue #149)。`CallResultUse` は新経路の generic・型引数・spread の制限を既存の直接値の証明と分ける。ローカルと module 内の非公開な直下 const を束縛で監査し、typeof・alias・格納・重複・書込み・公開を保留する。JS・script global・変数の import・alias 連鎖・型アサーション・nullable 戻り型は広げない。縮小・削除と refs/dead-code の契約は維持する。

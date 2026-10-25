@@ -15,7 +15,9 @@
 //!
 //! 「対象の型と証明できる式」は次の形。
 //! - 追加した全プロパティを 1 つずつ持ち、値の型が追加したメンバーの型に適合する object literal
-//!   (spread・computed key があれば不成立。各プロパティの行が変更行)
+//!   (通常の literal では spread・computed key を除く。各プロパティの行が変更行)
+//! - 必須追加では、対象型と証明した値の spread と、証明できる後続の上書きを持つ object。
+//!   コピー先の明示した型と束縛名も別の義務で監査する。
 //! - 戻り値の型がちょうど対象の型のファイル直下の関数宣言の呼び出し
 //! - 型注釈がちょうど対象の型の必須引数・変数
 //! - 必須追加では、上の関数の直接呼び出しで初期化した、型注釈の無い単純な const。
@@ -56,6 +58,7 @@ mod local_producers;
 mod narrowed_uses;
 mod removed_uses;
 mod return_producers;
+mod spread_copy;
 
 /// 配列型の入れ子 (`string[][]`) と式の配列 literal の入れ子をたどる上限。
 const MAX_ARRAY_DEPTH: usize = 8;
@@ -339,6 +342,7 @@ enum ImportUse {
 enum CallResultUse {
     Direct,
     InferredConst,
+    ObjectSpread,
 }
 
 /// 直接呼び出しの参照 1 件の分類。
@@ -530,7 +534,8 @@ impl Prover<'_, '_> {
     /// 別名の export のように名前で利用者を追えない場合は false (証明しない)。
     fn register_producer(&mut self, node: Node<'_>, parsed: &ParsedRefFile) -> bool {
         if matches!(self.delta.mode, MemberChangeMode::Addition)
-            && let Some(proven) = local_producers::prove_local_variable(node, parsed)
+            && let Some(proven) =
+                local_producers::prove_local_variable(node, parsed, self.scope.type_name)
         {
             return proven;
         }
@@ -638,7 +643,9 @@ impl Prover<'_, '_> {
         let Some(body) = function.child_by_field_name("body") else {
             return false;
         };
-        if body_rebinds_or_queries(body, source, param_name) {
+        let copy_type =
+            matches!(self.delta.mode, MemberChangeMode::Addition).then_some(self.scope.type_name);
+        if body_rebinds_or_queries(body, source, param_name, copy_type) {
             return false;
         }
         self.consumers.push(ConsumerSite {
@@ -725,7 +732,12 @@ impl Prover<'_, '_> {
         let Some(node) = ref_name_node(&parsed, name, r.line, r.column) else {
             return false;
         };
-        node_outside_type_query(node, &parsed.source, container)
+        node_outside_type_query(
+            node,
+            &parsed.source,
+            container,
+            matches!(self.delta.mode, MemberChangeMode::Addition).then_some(self.scope.type_name),
+        )
     }
 
     /// 受け取る関数の全参照が、import・export か、対象の型と証明できる値を渡す直接呼び出し
@@ -919,6 +931,15 @@ impl Prover<'_, '_> {
         caches: &mut ApiClosureCaches,
     ) -> bool {
         let source: &[u8] = &parsed.source;
+        if matches!(self.delta.mode, MemberChangeMode::Addition) {
+            let mut cursor = object.walk();
+            if object
+                .named_children(&mut cursor)
+                .any(|member| member.kind() == "spread_element")
+            {
+                return self.prove_spread_object(object, parsed, path, diff_files, caches);
+            }
+        }
         let changed = if matches!(self.delta.mode, MemberChangeMode::Removal(_)) {
             None
         } else {
@@ -1040,7 +1061,7 @@ impl Prover<'_, '_> {
     ) -> bool {
         // `f?.()` の結果は undefined になり得る。
         if call.child_by_field_name("optional_chain").is_some()
-            || (result_use == CallResultUse::InferredConst
+            || (result_use != CallResultUse::Direct
                 && (call.child_by_field_name("type_arguments").is_some()
                     || call.child_by_field_name("arguments").is_none_or(|args| {
                         let mut cursor = args.walk();
@@ -1137,7 +1158,7 @@ impl Prover<'_, '_> {
         // overload の宣言や同名の束縛があれば、呼び出しの解決先が曖昧になる。
         if super::ts_const_arg::collect_bindings_named(root, source, name).len() != 1
             || has_token(*function, "async")
-            || (result_use == CallResultUse::InferredConst
+            || (result_use != CallResultUse::Direct
                 && function.child_by_field_name("type_parameters").is_some())
         {
             return false;
@@ -1207,7 +1228,7 @@ impl Prover<'_, '_> {
             return false;
         };
         self.call_returns_target_for(call, parsed, path, CallResultUse::InferredConst, caches)
-            && local_producers::prove_inferred_variable(declaration, parsed)
+            && local_producers::prove_inferred_variable(declaration, parsed, self.scope.type_name)
     }
 
     /// プロパティの値 `expr` の型。対応しない式は None。
@@ -1356,7 +1377,17 @@ impl Prover<'_, '_> {
     }
 }
 
-fn node_outside_type_query(node: Node<'_>, source: &[u8], container: bool) -> bool {
+fn node_outside_type_query(
+    node: Node<'_>,
+    source: &[u8],
+    container: bool,
+    copy_type: Option<&str>,
+) -> bool {
+    if !container
+        && copy_type.is_some_and(|name| spread_copy::is_typed_copy_source(node, source, name))
+    {
+        return true;
+    }
     let mut current = node;
     for _ in 0..MAX_TYPE_QUERY_CHAIN {
         let Some(parent) = current.parent() else {
@@ -1838,7 +1869,12 @@ fn function_returns(body: Node<'_>) -> Vec<Node<'_>> {
 
 /// 本体が引数 `name` へ書き込むか、`var` で束縛し直すか、`typeof name` で型を取り出すか。
 /// 入れ子の関数の中も見る (クロージャからの再代入もある)。
-fn body_rebinds_or_queries(body: Node<'_>, source: &[u8], name: &str) -> bool {
+fn body_rebinds_or_queries(
+    body: Node<'_>,
+    source: &[u8],
+    name: &str,
+    copy_type: Option<&str>,
+) -> bool {
     any_node(body, Children::Named, |node| match node.kind() {
         "assignment_expression" | "augmented_assignment_expression" => node
             .child_by_field_name("left")
@@ -1872,6 +1908,8 @@ fn body_rebinds_or_queries(body: Node<'_>, source: &[u8], name: &str) -> bool {
             node.utf8_text(source).ok() == Some(name)
                 && !is_binding_name(node)
                 && binds_value_to_another_name(node, source, false)
+                && !copy_type
+                    .is_some_and(|name| spread_copy::is_typed_copy_source(node, source, name))
         }
         _ => false,
     })
@@ -2410,7 +2448,7 @@ mod tests {
             let function = tree.root_node().named_child(0).unwrap();
             let body_node = function.child_by_field_name("body").unwrap();
             assert_eq!(
-                body_rebinds_or_queries(body_node, source.as_bytes(), "row"),
+                body_rebinds_or_queries(body_node, source.as_bytes(), "row", None),
                 expected,
                 "{body}"
             );

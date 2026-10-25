@@ -3,6 +3,103 @@
 
 use super::support::{TestRepo, cargo_bin};
 
+#[test]
+fn typed_spread_copy_matches_normal_hook_and_index_without_changing_refs() {
+    for extension in ["ts", "tsx"] {
+        for (copy, call, expected) in [
+            (
+                "export function copy(row: Row, id: string): Row { return { ...row, id }; }",
+                "copy(toRow('a'), 'b')",
+                0,
+            ),
+            (
+                "export function copy(): Row { return { ...toRow('a'), id: 'b' }; }",
+                "copy()",
+                0,
+            ),
+            (
+                "export function copy(): Row { const row: Row = toRow('a'); return { ...row, id: 'b' }; }",
+                "copy()",
+                0,
+            ),
+            (
+                "export function copy(row: any): Row { return { ...row, id: 'b' }; }",
+                "copy(toRow('a'))",
+                1,
+            ),
+            (
+                "export function copy(row: Row): Row { return { ...row, note: 123 }; }",
+                "copy(toRow('a'))",
+                1,
+            ),
+        ] {
+            let repo = TestRepo::new();
+            repo.init_git();
+            repo.create_dir_all("src");
+            let row_path = format!("src/row.{extension}");
+            let copy_path = format!("src/copy.{extension}");
+            repo.write(&row_path, ROW_BASE);
+            repo.write(
+                &copy_path,
+                format!("import {{ type Row, toRow }} from './row';\n{copy}\n"),
+            );
+            repo.write("src/app.ts", format!("import {{ toRow }} from './row';\nimport {{ copy }} from './copy';\nexport const result = {call}.id;\n"));
+            repo.commit_all("initial");
+            let copy_refs = || {
+                let output = cargo_bin()
+                    .args(["refs", "--name", "Row", "--format", "json", "--dir"])
+                    .arg(repo.root())
+                    .output()
+                    .unwrap();
+                let refs: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                refs["refs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r["path"] == copy_path)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let before = copy_refs();
+            repo.write(
+                &row_path,
+                ROW_BASE
+                    .replace("\tid: string;", "\tid: string;\n\tnote: string | null;")
+                    .replace("return { id };", "return { id, note: null };"),
+            );
+            let (code, json) = hook(&repo);
+            let bucket = if expected == 0 { "mod_closed" } else { "mod" };
+            assert_eq!(code, expected, "{extension}/{copy}: {json}");
+            assert_eq!(json["api"][bucket][0]["n"], "Row", "{json}");
+            let output = cargo_bin()
+                .args(["review", "--git", "--format", "json", "--dir"])
+                .arg(repo.root())
+                .output()
+                .unwrap();
+            let normal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let bucket = if expected == 0 {
+                "modified_closed_in_diff"
+            } else {
+                "modified"
+            };
+            assert_eq!(normal["api_changes"][bucket][0]["name"], "Row", "{normal}");
+            assert!(!before.is_empty());
+            assert_eq!(copy_refs(), before);
+            repo.stage_all();
+            repo.write(&copy_path, "import type { Row } from './row';\nexport function copy(row: Row): Row { return { id: row.id }; }\n");
+            let output = cargo_bin()
+                .args(["review", "--git", "--staged", "--hook", "--dir"])
+                .arg(repo.root())
+                .output()
+                .unwrap();
+            let staged: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert_eq!(output.status.code(), Some(expected), "{staged}");
+            let bucket = if expected == 0 { "mod_closed" } else { "mod" };
+            assert_eq!(staged["api"][bucket][0]["n"], "Row", "{staged}");
+        }
+    }
+}
+
 const ROW_BASE: &str = "export interface Row {\n\tid: string;\n}\n\nexport function toRow(id: string): Row {\n\treturn { id };\n}\n";
 const VIEW_BASE: &str = "import { type Row, toRow } from \"./row\";\n\nexport function label(row: Row): string {\n\treturn row.id;\n}\n\nexport const first = label(toRow(\"a\"));\n";
 const VIEW_AFTER: &str = "import { type Row, toRow } from \"./row\";\n\nexport function label(row: Row): string {\n\treturn row.note === null ? row.id : `${row.id} (${row.note})`;\n}\n\nexport const first = label(toRow(\"a\"));\n";

@@ -96,6 +96,10 @@ export した TS / TSX の interface か object 型の type alias へ、必須�
 
 必須追加では `const picked = makeRow(); label(picked)` も、TS/TSX の単純な const で、宣言が参照より前にあり、初期化子が明示戻り型を持つ一意なファイル直下の関数の直接呼び出しなら証明できる。関数の戻り型はちょうど対象の型でなければならず、別名なしの相対 import も既存の解決条件で確かめる。変数の利用を同じ字句束縛で監査し、`typeof`・別名への代入・格納・重複・書込みを認めない。ローカル変数と module 内の非公開な直下変数を扱い、変数の export/import、JS、script global、`let`・分割代入・alias 連鎖・型アサーション・generic/overload・明示型引数・spread・名前空間経由・async/nullable 戻り型は証明しない。括弧で包んだ呼び出しは同じ値として扱う。
 
+必須追加は `{ ...snapshot, title }` のようなコピーも扱う。すべての spread 元が、対象の型と証明できる必須引数・変数 (上記の直接呼び出し結果の const を含む)、または対象の型を明示して返す一意な通常直下関数の直接呼び出しでなければならない。コピーされた追加プロパティに変更行は求めず、後ろの明示値で上書きする場合は、その値の型と変更行を従来どおり確かめる。最後の確実な spread が前の明示値を上書きする順序も照合する。不明な spread は前後の位置によらず保留し、`any`・`Partial`・型アサーション・generic/overload・明示型引数・spread 引数・配列/Promise の元は扱わない。computed/escape key、重複した明示追加キー、メソッドを持つコピーも保留する。
+
+引数・変数の値を spread で格納する際の例外は、コピー先が明示した対象型の戻り値を持つ直下の通常関数、`const x: Row` の初期化子、または `satisfies Row` の位置に限る。その型の所属・コピー先の値・caller・束縛名の `typeof` と別名利用は、他の型参照と同様に全て確認する。無注釈のコピー用変数や入れ物は例外にしない。型縮小・プロパティ削除はこのコピーの証明を使わない。
+
 別ファイルの参照は、別名なしの named import で、相対 specifier の解決先として存在するファイルがちょうど宣言ファイル 1 つのときだけ数える。参照元から解析 root までの `tsconfig*.json` / `jsconfig*.json` に `rootDirs` か `moduleSuffixes` があれば証明しない。作った値を束縛する名前 (関数・変数・`satisfies` で初期化した変数と、その値を入れた外側のオブジェクトや配列) も検索する。次のどれかがあれば証明しない。
 
 - `typeof` の利用。`ReturnType<typeof toRow>` のように、型の名前を出さずに型を写す
