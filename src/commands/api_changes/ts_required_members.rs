@@ -50,6 +50,7 @@ use super::ref_index::{
     ref_import_role, ref_is_pass_through_reexport, ref_name_node,
 };
 
+mod local_producers;
 mod narrowed_uses;
 mod removed_uses;
 mod return_producers;
@@ -520,6 +521,11 @@ impl Prover<'_, '_> {
     /// 値を作る箇所の値を束縛する名前を、`typeof` の確認の対象に加える。default export や
     /// 別名の export のように名前で利用者を追えない場合は false (証明しない)。
     fn register_producer(&mut self, node: Node<'_>, parsed: &ParsedRefFile) -> bool {
+        if matches!(self.delta.mode, MemberChangeMode::Addition)
+            && let Some(proven) = local_producers::prove_local_variable(node, parsed)
+        {
+            return proven;
+        }
         let source: &[u8] = &parsed.source;
         match producer_binding(node, source) {
             ProducerName::Anonymous => true,
@@ -711,20 +717,7 @@ impl Prover<'_, '_> {
         let Some(node) = ref_name_node(&parsed, name, r.line, r.column) else {
             return false;
         };
-        let mut current = node;
-        for _ in 0..MAX_TYPE_QUERY_CHAIN {
-            let Some(parent) = current.parent() else {
-                return true;
-            };
-            match parent.kind() {
-                "type_query" => return false,
-                "member_expression" | "nested_identifier" | "subscript_expression" => {
-                    current = parent;
-                }
-                _ => break,
-            }
-        }
-        !binds_value_to_another_name(node, &parsed.source, container)
+        node_outside_type_query(node, &parsed.source, container)
     }
 
     /// 受け取る関数の全参照が、import・export か、対象の型と証明できる値を渡す直接呼び出し
@@ -1300,6 +1293,21 @@ impl Prover<'_, '_> {
     fn same_path(&self, a: &str, b: &str) -> bool {
         diff_path_matches_ref(a, b, self.scope.dir)
     }
+}
+
+fn node_outside_type_query(node: Node<'_>, source: &[u8], container: bool) -> bool {
+    let mut current = node;
+    for _ in 0..MAX_TYPE_QUERY_CHAIN {
+        let Some(parent) = current.parent() else {
+            return true;
+        };
+        match parent.kind() {
+            "type_query" => return false,
+            "member_expression" | "nested_identifier" | "subscript_expression" => current = parent,
+            _ => break,
+        }
+    }
+    !binds_value_to_another_name(node, source, container)
 }
 
 /// 型の参照 `node` (type_identifier) の構文上の役割。型注釈の中身がちょうどその名前の
