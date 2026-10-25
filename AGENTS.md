@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **TS の呼出し結果を入れた const** — 必須追加の `identifier_has_target_type` は、先行する単純な無注釈 const の初期化子が、明示戻り型を持つ一意な直下関数の直接呼出しの場合も証明する (Issue #149)。`CallResultUse` は新経路の generic・型引数・spread の制限を既存の直接値の証明と分ける。ローカルと module 内の非公開な直下 const を束縛で監査し、typeof・alias・格納・重複・書込み・公開を保留する。JS・script global・変数の import・alias 連鎖・型アサーション・nullable 戻り型は広げない。縮小・削除と refs/dead-code の契約は維持する。
+
 - **TS のローカル producer の束縛** — `ts_required_members/local_producers.rs` は必須追加で証明する関数・ブロック内の `const x: Row` の利用を、字句スコープで同じ宣言へ解決する識別子だけに限って監査する (Issue #148)。別ファイルや別スコープの同名変数・引数は対象にせず、同じ束縛の `typeof`・alias・入れ物への格納・重複宣言・escape は保留する。内側の別束縛を consumer へ渡した値は既存の型の証明で確かめる。直下の宣言・関数・入れ物と縮小・削除の監査、refs/dead-code の出現契約は変えない。
 
 - **TS の型メンバー分類の分担** — `ts_signature/type_members.rs` は宣言・メンバーのトークン正規化と optional 追加の互換判定を持つ。必須追加は `type_members/addition.rs` で既存メンバーの多重集合照合・追加順序の保持・名前衝突の監査を分け、縮小と削除は `narrowing.rs` / `removal.rs` で判定する。3 モードが使う型注釈の読取りと、縮小・削除に共通する scalar 型の制約は `properties.rs` に置く。モードごとの `NotApplicable` / `Unsupported` の使い分けは各分類器が保持し、追加で扱える配列型を縮小・削除へ広げない。回帰は `required_type_members.rs` の既存ケースと TS/TSX のコメント入り型注釈・配列型の対照で確認する。
