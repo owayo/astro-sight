@@ -13,11 +13,13 @@
 //! - 公開するだけの箇所: 別名なしの `export { Row }`。値の名前空間の出現 (同名の変数・JSX の
 //!   要素名・プロパティ名) は interface / type alias を指さないので数えない
 //!
-//! 「対象の型と証明できる式」は次の 3 つ。
+//! 「対象の型と証明できる式」は次の形。
 //! - 追加した全プロパティを 1 つずつ持ち、値の型が追加したメンバーの型に適合する object literal
 //!   (spread・computed key があれば不成立。各プロパティの行が変更行)
 //! - 戻り値の型がちょうど対象の型のファイル直下の関数宣言の呼び出し
 //! - 型注釈がちょうど対象の型の必須引数・変数
+//! - 必須追加では、上の関数の直接呼び出しで初期化した、型注釈の無い単純な const。
+//!   先行する宣言へ束縛が解決し、型の取り出し・alias・書込み・公開が無いことも確かめる。
 //!
 //! 値の型は単純な型 (string / number / boolean / bigint / null / undefined / literal /
 //! これらの union と配列 / any / unknown) だけを扱う。型注釈のない変数は literal の widening が
@@ -331,6 +333,12 @@ enum TypeRole<'t> {
 enum ImportUse {
     Type,
     Value,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallResultUse {
+    Direct,
+    InferredConst,
 }
 
 /// 直接呼び出しの参照 1 件の分類。
@@ -1019,8 +1027,27 @@ impl Prover<'_, '_> {
         path: &str,
         caches: &mut ApiClosureCaches,
     ) -> bool {
+        self.call_returns_target_for(call, parsed, path, CallResultUse::Direct, caches)
+    }
+
+    fn call_returns_target_for(
+        &self,
+        call: Node<'_>,
+        parsed: &ParsedRefFile,
+        path: &str,
+        result_use: CallResultUse,
+        caches: &mut ApiClosureCaches,
+    ) -> bool {
         // `f?.()` の結果は undefined になり得る。
-        if call.child_by_field_name("optional_chain").is_some() {
+        if call.child_by_field_name("optional_chain").is_some()
+            || (result_use == CallResultUse::InferredConst
+                && (call.child_by_field_name("type_arguments").is_some()
+                    || call.child_by_field_name("arguments").is_none_or(|args| {
+                        let mut cursor = args.walk();
+                        args.named_children(&mut cursor)
+                            .any(|arg| arg.kind() == "spread_element")
+                    })))
+        {
             return false;
         }
         let Some(callee) = call
@@ -1033,9 +1060,8 @@ impl Prover<'_, '_> {
             return false;
         };
         match resolve_binding_scope(callee, &parsed.source, name, Namespace::Value) {
-            Some((scope, ScopeBinding::FunctionDeclaration)) if scope.kind() == "program" => {
-                self.top_level_function_returns_target(parsed, path, name, false, caches)
-            }
+            Some((scope, ScopeBinding::FunctionDeclaration)) if scope.kind() == "program" => self
+                .top_level_function_returns_target(parsed, path, name, false, result_use, caches),
             Some((_, ScopeBinding::Import(statement))) => {
                 let Some(resolved) = self.import_target(
                     statement,
@@ -1051,8 +1077,9 @@ impl Prover<'_, '_> {
                     return false;
                 };
                 is_checked_source(&target, &resolved)
-                    && self
-                        .top_level_function_returns_target(&target, &resolved, name, true, caches)
+                    && self.top_level_function_returns_target(
+                        &target, &resolved, name, true, result_use, caches,
+                    )
             }
             _ => false,
         }
@@ -1066,6 +1093,7 @@ impl Prover<'_, '_> {
         path: &str,
         name: &str,
         require_export: bool,
+        result_use: CallResultUse,
         caches: &mut ApiClosureCaches,
     ) -> bool {
         let source: &[u8] = &parsed.source;
@@ -1109,6 +1137,8 @@ impl Prover<'_, '_> {
         // overload の宣言や同名の束縛があれば、呼び出しの解決先が曖昧になる。
         if super::ts_const_arg::collect_bindings_named(root, source, name).len() != 1
             || has_token(*function, "async")
+            || (result_use == CallResultUse::InferredConst
+                && function.child_by_field_name("type_parameters").is_some())
         {
             return false;
         }
@@ -1117,8 +1147,8 @@ impl Prover<'_, '_> {
             .is_some_and(|annotation| self.annotation_is_target(annotation, parsed, path, caches))
     }
 
-    /// 識別子の束縛の型注釈がちょうど対象の型か (必須引数・変数)。注釈の付いた束縛自体は
-    /// 対象の型の参照として別に証明する。
+    /// 必須引数・変数の型注釈、または必須追加の限定した const の初期化子から型を証明する。
+    /// 注釈の付いた束縛自体は対象の型の参照として別に証明する。
     fn identifier_has_target_type(
         &self,
         ident: Node<'_>,
@@ -1134,9 +1164,14 @@ impl Prover<'_, '_> {
                 declarator
                     .child_by_field_name("name")
                     .is_some_and(|n| n.kind() == "identifier")
-                    && declarator
-                        .child_by_field_name("type")
-                        .is_some_and(|ann| self.annotation_is_target(ann, parsed, path, caches))
+                    && match declarator.child_by_field_name("type") {
+                        Some(annotation) => {
+                            self.annotation_is_target(annotation, parsed, path, caches)
+                        }
+                        None => self.inferred_const_has_target_type(
+                            ident, declarator, parsed, path, caches,
+                        ),
+                    }
             }
             Some((scope, ScopeBinding::Other)) => parameter_named(scope, &parsed.source, name)
                 .is_some_and(|param| {
@@ -1147,6 +1182,32 @@ impl Prover<'_, '_> {
                 }),
             _ => false,
         }
+    }
+
+    fn inferred_const_has_target_type(
+        &self,
+        ident: Node<'_>,
+        declaration: Node<'_>,
+        parsed: &ParsedRefFile,
+        path: &str,
+        caches: &mut ApiClosureCaches,
+    ) -> bool {
+        if !matches!(self.delta.mode, MemberChangeMode::Addition)
+            || !matches!(parsed.lang_id, LangId::Typescript | LangId::Tsx)
+            || !super::ts_const_arg::declarator_is_const(declaration)
+            || declaration.end_byte() > ident.start_byte()
+        {
+            return false;
+        }
+        let Some(call) = declaration
+            .child_by_field_name("value")
+            .and_then(unwrap_parens)
+            .filter(|value| value.kind() == "call_expression")
+        else {
+            return false;
+        };
+        self.call_returns_target_for(call, parsed, path, CallResultUse::InferredConst, caches)
+            && local_producers::prove_inferred_variable(declaration, parsed)
     }
 
     /// プロパティの値 `expr` の型。対応しない式は None。

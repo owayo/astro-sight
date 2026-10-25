@@ -7,6 +7,162 @@ use crate::models::review::ApiChanges;
 use std::fs;
 
 #[test]
+fn required_member_inferred_const_accepts_direct_annotated_call_results() {
+    for extension in ["ts", "tsx"] {
+        for (binding, scope) in [("row", true), ("picked", true), ("picked", false)] {
+            for init in ["toRow('a')", "(toRow('a'))"] {
+                let body = format!("const {binding} = {init}; return label({binding});");
+                let body = if scope {
+                    format!("export function run(): string {{ {body} }}")
+                } else {
+                    body.replace("return label", "export const result = label")
+                };
+                let app = format!(
+                    "import {{ toRow }} from './row';\nimport {{ label }} from './view';\n{body}\n"
+                );
+                let path = format!("src/app.{extension}");
+                let api = api_after(
+                    &[
+                        ("src/row.ts", ROW_BASE),
+                        ("src/view.ts", VIEW_BASE),
+                        (&path, &app),
+                    ],
+                    &[("src/row.ts", ROW_AFTER), ("src/view.ts", VIEW_AFTER)],
+                );
+                assert_eq!(
+                    verdict(&api, "Row"),
+                    Verdict::Closed,
+                    "{extension}/{app}: {api:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn required_member_inferred_const_keeps_unknown_initializers_and_uses_blocking() {
+    for body in [
+        "let picked = toRow('a'); return label(picked);",
+        "const { id } = toRow('a'); return label(id);",
+        "const picked = toRow('a') as Row; return label(picked);",
+        "const picked = toRow('a')!; return label(picked);",
+        "const picked = { id: 'a', note: null }; return label(picked);",
+        "const first = toRow('a'); const picked = first; return label(picked);",
+        "const picked = toRow('a'); type Copy = typeof picked; return label(picked);",
+        "const picked = toRow('a'); const other = picked; return label(picked);",
+        "const picked = toRow('a'); const box = { picked }; return label(picked);",
+        "const picked = toRow('a'); picked = stale; return label(picked);",
+        "const picked = toRow('a'); for (picked of stale) {} return label(picked);",
+        "const picked = toRow('a'); { const picked = { id: 'stale' }; return label(picked); }",
+        "return label(picked); const picked = toRow('a');",
+        "const picked = toRow('a'); const picked = stale; return label(picked);",
+        "const picked = toRow<string>('a'); return label(picked);",
+        "const picked = toRow(...['a']); return label(picked);",
+        "const picked = toRow('a'); for (var picked of stale) {} return label(picked);",
+    ] {
+        let app = format!(
+            "import {{ type Row, toRow }} from './row';\nimport {{ label }} from './view';\nexport function run(): string {{ {body} }}\n"
+        );
+        let api = api_after(
+            &[
+                ("src/row.ts", ROW_BASE),
+                ("src/view.ts", VIEW_BASE),
+                ("src/app.ts", &app),
+            ],
+            &[("src/row.ts", ROW_AFTER), ("src/view.ts", VIEW_AFTER)],
+        );
+        assert_eq!(verdict(&api, "Row"), Verdict::Blocking, "{body}: {api:?}");
+    }
+    for body in [
+        "export const picked = toRow('a');\nexport const result = label(picked);",
+        "const picked = toRow('a');\nexport { picked };\nexport const result = label(picked);",
+    ] {
+        let app = format!(
+            "import {{ toRow }} from './row';\nimport {{ label }} from './view';\n{body}\n"
+        );
+        let api = api_after(
+            &[
+                ("src/row.ts", ROW_BASE),
+                ("src/view.ts", VIEW_BASE),
+                ("src/app.ts", &app),
+            ],
+            &[("src/row.ts", ROW_AFTER), ("src/view.ts", VIEW_AFTER)],
+        );
+        assert_eq!(verdict(&api, "Row"), Verdict::Blocking, "{body}: {api:?}");
+    }
+}
+
+#[test]
+fn required_member_inferred_const_requires_exact_nongeneric_return_annotation() {
+    for (before, after) in [
+        (
+            ROW_BASE.replace("): Row", ")"),
+            ROW_AFTER.replace("): Row", ")"),
+        ),
+        (
+            ROW_BASE.replace("): Row", "): Row | null"),
+            ROW_AFTER.replace("): Row", "): Row | null"),
+        ),
+        (
+            ROW_BASE.replace("toRow(", "toRow<T>("),
+            ROW_AFTER.replace("toRow(", "toRow<T>("),
+        ),
+    ] {
+        let app = "import { toRow } from './row';\nimport { label } from './view';\nexport function run(): string { const picked = toRow('a'); return label(picked); }\n";
+        let api = api_after(
+            &[
+                ("src/row.ts", &before),
+                ("src/view.ts", VIEW_BASE),
+                ("src/app.ts", app),
+            ],
+            &[("src/row.ts", &after), ("src/view.ts", VIEW_AFTER)],
+        );
+        assert_eq!(verdict(&api, "Row"), Verdict::Blocking, "{after}: {api:?}");
+    }
+}
+
+#[test]
+fn required_member_inferred_const_distinguishes_inner_bindings() {
+    let app = "import { toRow } from './row';\nimport { label } from './view';\nexport function run(): string { const picked = toRow('a'); { const picked = 1; type Copy = typeof picked; } for (const picked of [1]) { const copy = picked; } return label(picked); }\n";
+    let api = api_after(
+        &[
+            ("src/row.ts", ROW_BASE),
+            ("src/view.ts", VIEW_BASE),
+            ("src/app.ts", app),
+        ],
+        &[("src/row.ts", ROW_AFTER), ("src/view.ts", VIEW_AFTER)],
+    );
+    assert_eq!(verdict(&api, "Row"), Verdict::Closed, "{api:?}");
+
+    for (before, after, view_before, view_after) in [
+        (
+            ROW_AFTER.to_string(),
+            ROW_AFTER
+                .replace("note: string | null", "note: string")
+                .replace("note: null", "note: id"),
+            VIEW_AFTER.to_string(),
+            VIEW_AFTER.replace("row.note === null ? row.id : ", ""),
+        ),
+        (
+            REMOVAL_ROW_BASE.to_string(),
+            removal_row(),
+            REMOVAL_VIEW_BASE.to_string(),
+            removal_view(),
+        ),
+    ] {
+        let api = api_after(
+            &[
+                ("src/row.ts", &before),
+                ("src/view.ts", &view_before),
+                ("src/app.ts", app),
+            ],
+            &[("src/row.ts", &after), ("src/view.ts", &view_after)],
+        );
+        assert_eq!(verdict(&api, "Row"), Verdict::Blocking, "{after}: {api:?}");
+    }
+}
+
+#[test]
 fn required_member_local_producer_uses_lexical_binding() {
     for (local, param) in [
         ("row", "row"),

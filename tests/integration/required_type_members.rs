@@ -78,6 +78,62 @@ fn local_producer_binding_hook_matches_worktree_and_index() {
 }
 
 #[test]
+fn inferred_const_call_result_matches_normal_hook_and_staged_review() {
+    for extension in ["ts", "tsx"] {
+        for (body, expected) in [
+            ("return label(toRow('a'));", 0),
+            ("const row: Row = toRow('a'); return label(row);", 0),
+            ("const row = toRow('a'); return label(row);", 0),
+            (
+                "const row = toRow('a'); type Copy = typeof row; return label(row);",
+                1,
+            ),
+            (
+                "const row = toRow('a'); const other = row; return label(row);",
+                1,
+            ),
+            ("let row = toRow('a'); return label(row);", 1),
+        ] {
+            let app = format!(
+                "import {{ type Row, toRow }} from './row';\nimport {{ label }} from './view';\nexport function run(): string {{ {body} }}\n"
+            );
+            let path = format!("src/app.{extension}");
+            let repo = fixture("{ id, note: null }", &[(&path, &app)]);
+            let (code, json) = hook(&repo);
+            let category = if expected == 0 { "mod_closed" } else { "mod" };
+            assert_eq!(code, expected, "{extension}/{body}: {json}");
+            assert_eq!(json["api"][category][0]["n"], "Row", "{json}");
+            let output = cargo_bin()
+                .args(["review", "--git", "--format", "json", "--dir"])
+                .arg(repo.root())
+                .output()
+                .unwrap();
+            let normal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let category = if expected == 0 {
+                "modified_closed_in_diff"
+            } else {
+                "modified"
+            };
+            assert_eq!(
+                normal["api_changes"][category][0]["name"], "Row",
+                "{normal}"
+            );
+            repo.stage_all();
+            repo.write(&path, "export const unrelated = 1;\n");
+            let output = cargo_bin()
+                .args(["review", "--git", "--staged", "--hook", "--dir"])
+                .arg(repo.root())
+                .output()
+                .unwrap();
+            let staged: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert_eq!(output.status.code(), Some(expected), "{staged}");
+            let category = if expected == 0 { "mod_closed" } else { "mod" };
+            assert_eq!(staged["api"][category][0]["n"], "Row", "{staged}");
+        }
+    }
+}
+
+#[test]
 fn producer_left_unchanged_keeps_required_member_addition_blocking() {
     // toRow が note を返さない (型検査も通らない) 差分。
     let (code, json) = hook(&fixture("{ id }", &[]));
