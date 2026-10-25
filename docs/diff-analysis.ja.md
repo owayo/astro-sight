@@ -308,6 +308,8 @@ astro-sight review --dir . --git \
 
 ## review - 構造化 diff レビュー
 
+`review --hook` は、同じレビューの `test_only_symbols` にファイル・名前・種別が一致し、宣言行も分かる `api.mod` と `api.const_value` を停止対象から外す。`--strict-public-const-values` 指定時も同じで、API の表示と通常出力の分類は維持する。レビューまたは impact に解析範囲の欠落があれば、この根拠は使わない。本体の利用・再 export がある記号、無参照の export、別ファイルの同名記号はテスト専用として扱わず、同じ一覧に本体用の変更があれば停止する。削除・callback・型注釈の policy は変更しない。これは観測したリポジトリ内の参照に基づく停止方針であり、外部の利用者がいないという保証ではない。
+
 `context` の影響分析に加えて、`cochange` による変更漏れ候補、公開 API 差分、死蔵シンボルを 1 回の実行でまとめて返す。PR レビューや pre-merge チェック向け。
 
 ### TypeScript の名前空間と同名の宣言

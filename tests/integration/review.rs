@@ -6,6 +6,105 @@ use super::support::*;
 use std::process::{Command, Stdio};
 
 #[test]
+fn test_only_api_modifications_keep_hook_output_and_staged_policy() {
+    for extension in ["ts", "tsx"] {
+        for const_value in [false, true] {
+            for usage in ["tests", "production", "reexport", "none", "unparsed"] {
+                let repo = TestRepo::new();
+                repo.init_git();
+                repo.create_dir_all("e2e");
+                repo.create_dir_all("src");
+                let path = format!("e2e/pages.{extension}");
+                repo.write(&path, "export const PAGE_URL = '/items/1';\n");
+                repo.write("src/link.ts", "export {};\n");
+                if usage != "none" {
+                    repo.write(
+                        "e2e/items.spec.ts",
+                        "import { PAGE_URL } from './pages';\nconsole.log(PAGE_URL);\n",
+                    );
+                }
+                match usage {
+                    "production" => repo.write(
+                        "src/link.ts",
+                        "import { PAGE_URL } from '../e2e/pages';\nconsole.log(PAGE_URL);\n",
+                    ),
+                    "reexport" => {
+                        repo.write("src/link.ts", "export { PAGE_URL } from '../e2e/pages';\n")
+                    }
+                    "unparsed" => {
+                        repo.write("src/View.vue", "<script>console.log(PAGE_URL)</script>\n")
+                    }
+                    _ => {}
+                }
+                repo.commit_all("initial");
+                let after = if const_value {
+                    "export const PAGE_URL = '/work/1';\n"
+                } else {
+                    "function itemUrl(id: number): string { return `/work/${id}`; }\nexport const PAGE_URL = itemUrl(1);\n"
+                };
+                repo.write(&path, after);
+                let output = cargo_bin()
+                    .args(["review", "--git", "--format", "json", "--dir"])
+                    .arg(repo.root())
+                    .output()
+                    .unwrap();
+                let normal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                let bucket = if const_value {
+                    "const_value_changes"
+                } else {
+                    "modified"
+                };
+                assert_eq!(
+                    normal["api_changes"][bucket][0]["name"], "PAGE_URL",
+                    "{normal}"
+                );
+                if usage == "tests" {
+                    assert_eq!(
+                        normal["test_only_symbols"][0]["name"], "PAGE_URL",
+                        "{normal}"
+                    );
+                }
+                let expected = if usage == "tests" { 0 } else { 1 };
+                for staged in [false, true] {
+                    if staged {
+                        repo.stage_all();
+                        repo.write(
+                            "src/link.ts",
+                            "import { PAGE_URL } from '../e2e/pages';\nconsole.log(PAGE_URL);\n",
+                        );
+                    }
+                    let mut command = cargo_bin();
+                    command
+                        .args([
+                            "review",
+                            "--git",
+                            "--hook",
+                            "--strict-public-const-values",
+                            "--dir",
+                        ])
+                        .arg(repo.root());
+                    if staged {
+                        command.arg("--staged");
+                    }
+                    let output = command.output().unwrap();
+                    let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+                    assert_eq!(
+                        output.status.code(),
+                        Some(expected),
+                        "{extension}/{const_value}/{usage}/{staged}: {json}"
+                    );
+                    let bucket = if const_value { "const_value" } else { "mod" };
+                    assert_eq!(json["api"][bucket][0]["n"], "PAGE_URL", "{json}");
+                    if expected == 0 {
+                        assert_eq!(json["blocking_categories"], serde_json::json!([]), "{json}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn staged_api_contracts_and_callers_use_the_index_snapshot() {
     for (api_path, caller_path, before, after, import, bad, good, symbol) in [
         (

@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **テスト専用 API と hook の停止** — `review/hook.rs` は同一レビューの `test_only_symbols` と file/name/kind が一致し宣言行がある modified・const_value だけを停止条件から外す (Issue #151)。strict const でも表示は維持し、通常の API 分類と refs/dead-code は変えない。review/impact の truncation と skip があれば降格せず、本体利用・再 export・無参照・同名別宣言・mixed の本体変更は blocking を維持する。removed/callback/type annotation の policy は不変。保証は観測した内部参照の範囲で、外部利用者の不在は証明しない。
+
 - **TS の呼出し結果を入れた const** — 必須追加の `identifier_has_target_type` は、先行する単純な無注釈 const の初期化子が、明示戻り型を持つ一意な直下関数の直接呼出しの場合も証明する (Issue #149)。`CallResultUse` は新経路の generic・型引数・spread の制限を既存の直接値の証明と分ける。ローカルと module 内の非公開な直下 const を束縛で監査し、typeof・alias・格納・重複・書込み・公開を保留する。JS・script global・変数の import・alias 連鎖・型アサーション・nullable 戻り型は広げない。縮小・削除と refs/dead-code の契約は維持する。
 
 - **TS のローカル producer の束縛** — `ts_required_members/local_producers.rs` は必須追加で証明する関数・ブロック内の `const x: Row` の利用を、字句スコープで同じ宣言へ解決する識別子だけに限って監査する (Issue #148)。別ファイルや別スコープの同名変数・引数は対象にせず、同じ束縛の `typeof`・alias・入れ物への格納・重複宣言・escape は保留する。内側の別束縛を consumer へ渡した値は既存の型の証明で確かめる。直下の宣言・関数・入れ物と縮小・削除の監査、refs/dead-code の出現契約は変えない。

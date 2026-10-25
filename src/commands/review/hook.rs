@@ -703,6 +703,35 @@ pub(crate) fn build_review_hook_json_for_diff(
     }
 
     // api: {add,rm,mod,moved,property_to_field,rm_dead,const_value} — 空でないセクションのみ
+    // test-only の根拠は同じレビューの宣言に限る。解析範囲が欠けた結果や、宣言位置が
+    // 分からない候補は停止判定の降格に使わない。表示する API の分類・項目は維持する。
+    let test_only_api_symbols: std::collections::HashSet<(&str, &str, &str)> =
+        if result.truncations.is_empty()
+            && result.impact.truncations.is_empty()
+            && result.skipped.is_none()
+        {
+            result
+                .test_only_symbols
+                .iter()
+                .filter(|symbol| symbol.line.is_some())
+                .map(|symbol| {
+                    (
+                        symbol.file.as_str(),
+                        symbol.name.as_str(),
+                        symbol.kind.as_str(),
+                    )
+                })
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+    let is_test_only = |change: &crate::models::review::ApiSymbolChange| {
+        test_only_api_symbols.contains(&(
+            change.file.as_str(),
+            change.name.as_str(),
+            change.kind.as_str(),
+        ))
+    };
     let api = HookApi::from_api_changes(&result.api_changes);
     // api.added / api.moved / api.property_to_field / api.removed_dead / api.const_value は
     // 破壊的変更ではないため Stop hook のブロッキング対象から外し informational 扱いにする。
@@ -712,10 +741,21 @@ pub(crate) fn build_review_hook_json_for_diff(
         if !api.removed.is_empty() {
             blocking_categories.push(HookBlockingCategory::ApiRm);
         }
-        if !api.modified.is_empty() {
+        if result
+            .api_changes
+            .modified
+            .iter()
+            .any(|change| !is_test_only(change))
+        {
             blocking_categories.push(HookBlockingCategory::ApiMod);
         }
-        if strict_const_values && !api.const_value_changes.is_empty() {
+        if strict_const_values
+            && result
+                .api_changes
+                .const_value_changes
+                .iter()
+                .any(|change| !is_test_only(change))
+        {
             blocking_categories.push(HookBlockingCategory::ApiConstValue);
         }
         if strict_const_values && !api.callback_body_changes.is_empty() {
