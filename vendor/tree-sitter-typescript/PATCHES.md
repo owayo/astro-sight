@@ -15,9 +15,10 @@ The regeneration dependency is pinned to upstream's `tree-sitter-javascript`
 **0.23.1**, with an integrity-checked npm lock file.
 
 Upstream: <https://github.com/tree-sitter/tree-sitter-typescript>.
-Local regression: <https://github.com/owayo/astro-sight/issues/33>.
+Local regressions: <https://github.com/owayo/astro-sight/issues/33> and
+<https://github.com/owayo/astro-sight/issues/160>.
 
-## Change
+## Type query conflicts (#33)
 
 The static precedence between `call_expression` and `_type_query_call_expression`
 commits too early when a type argument contains `typeof import("module")`, such
@@ -28,6 +29,40 @@ The patch changes no node kinds, fields or subtypes. CLI 0.26.6 adds
 `extra: true` metadata to the existing `comment` and `html_comment` entries;
 these two additive flags also appear when regenerating the unmodified baseline.
 The patched node schemas equal those unmodified regenerated schemas.
+
+## Import type arguments (#160)
+
+The original `generic_type` rule only accepts local and namespace-qualified type
+identifiers as its `name`. An import type such as
+`import('./box.js').Box<string>` consequently stops at the existing
+`member_expression`, leaving `<string>` in an `ERROR` node. Allow the existing
+import-only `_type_query_member_expression_in_type_annotation` alias as one
+more `generic_type.name` alternative. The import path and qualifier retain their
+existing `member_expression` / `call_expression` structure; the complete type
+is a `generic_type` with a `name` and `type_arguments`.
+
+This also composes with the existing array, union, intersection, lookup and
+nested generic type rules, including qualified imports such as
+`import('./box.js').Namespace.Box<string>`. It does not change the expression
+grammar, the earlier type-query conflict patch, uninstantiated import types,
+or `typeof import(...)`. No node kind or field is added; the only schema change
+is that `generic_type.name` also permits `member_expression` in both grammars.
+Scanners, headers, Rust bindings, queries and regeneration dependencies are
+unchanged. Generated C parser tables, grammar JSON and node schemas are checked
+in for both TypeScript and TSX.
+
+Parser and CLI regressions cover the reported annotation, qualified and nested
+types, later declarations and calls, import/reference extraction, raw byte
+ranges with Unicode and CRLF, incremental recovery, and malformed input that
+must still report diagnostics. Existing type-query, expression, generic arrow
+and JSX controls remain part of the grammar regression suite.
+
+Against the preceding patched grammar, all 112 shared upstream corpus cases
+from `f975a621f4e7f532fe322e13c4f79495e0a7b2e7` and 16 expression controls
+retained identical complete trees, fields and ranges in TypeScript and TSX;
+TSX also retained its JSX control (128 TypeScript / 129 TSX cases). TypeScript
+7.0.2 accepted the new valid import-type variants in both file kinds with
+`--strict --noEmit --module nodenext --jsx preserve`.
 
 ## Regenerate
 

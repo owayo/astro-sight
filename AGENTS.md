@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **TS/TSX の型引数付き import type** — `vendor/tree-sitter-typescript/common/define-grammar.js` は既存の import 専用 member expression を `generic_type` の `name` に許可する (Issue #160)。`import('./box.js').Box<string>` を型引数ごと型注釈・型 alias・配列・union・戻り型に組み込み、名前部分は従来の `member_expression`、型引数は `type_arguments` として保持する。#33 の type query の conflict と通常の式・JSX は変えず、原文の前処理や診断の抑制はしない。生成は CLI 0.26.6 / ABI 14。回帰は parser の `grammar_regressions_typescript.rs` と CLI の `typescript_grammar.rs` で、TS/TSX・Unicode/CRLF の位置・増分修復・不正入力の診断・後続の宣言と参照を確認する。
+
 - **Python の同名直下関数と属性代入の帰属** — `engine/impact/python_imports.rs` は、参照側ファイルの再束縛のない一意な通常直下関数を、その宣言後の裸の参照の所有元として証明する (Issue #158)。既存の相対 import の障壁を共有し、decorator・重複・条件付き定義・global/nonlocal・star import・動的な名前空間操作・解析失敗は保留する。`declaration.rs` が旧新とも通常直下関数と証明した modified に限り、collector は属性への単純代入の左辺を caller から外す。属性呼び出し・関数値の読み出し・複合代入・右辺の実参照・method/property の変更はこの証拠で落とさない。参照を作業ツリーから読む context/impact の staged では新しい2種の証拠を適用せず、review の staged は index のスナップショット内で適用できる。型stubと既存の相対 import の方針、refs/dead-code の出現契約は維持する。回帰は `tests/integration/impact_python_bindings.rs` の通常/staged・実caller・曖昧な束縛・属性書込みと読出しの対照。
 
 - **TS の対象型の spread copy** — `ts_required_members/spread_copy.rs` は必須追加で、全 spread 元が対象型の識別子または一意な通常直下関数の明示戻り型付き直接呼出しと証明できる object を扱う (Issue #152)。追加キーごとに最後の spread と明示値の順序を照合し、後続の明示値には既存の型・変更行の証明を求める。unknown/any/Partial/assertion、computed/escape key、重複した明示追加キー・method は保留。alias 例外は、型参照の義務と producer 名の監査を別に持つ明示 Row return の直下通常関数・const x:Row・satisfies Row のコピー先に限る。単に同名の型注釈だけで閉じず、既存の所属・値・caller・typeof/alias の義務を全て通す。spread ごとの全キー展開や再帰的な object 追跡はせず、縮小・削除・refs/dead-code の契約を維持する。

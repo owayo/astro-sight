@@ -354,3 +354,137 @@ fn typescript_await_and_tagged_template_cli_no_regression_vs_baseline() {
         );
     }
 }
+
+#[test]
+fn typescript_import_type_arguments_cli_preserves_types_and_later_references() {
+    let source = "declare const thing: import('./box.js').Box<string>;\nexport default thing;\nexport function read(value: import('./box.js').Box<string>): string { return value.value; }\nexport function caller(): string { return read(thing); }\n";
+    for extension in ["ts", "tsx"] {
+        let repo = TestRepo::new();
+        let filename = format!("import_type.{extension}");
+        repo.write(&filename, source);
+        let path = repo.path(&filename);
+        let ast = typescript_cli_json("ast", &path, &["--full", "--depth", "32", "--no-cache"]);
+        assert_typescript_cli_clean(&ast, source);
+        let nodes = typescript_ast_nodes(&ast["ast"]);
+        let generics: Vec<_> = nodes
+            .iter()
+            .filter(|node| node["kind"] == "generic_type")
+            .collect();
+        assert_eq!(generics.len(), 2);
+        for generic in generics {
+            assert_eq!(
+                typescript_ast_field(generic, "name")["kind"],
+                "member_expression"
+            );
+            let arguments = typescript_ast_field(generic, "type_arguments");
+            assert_eq!(arguments["kind"], "type_arguments");
+            assert_eq!(arguments["children"][0]["node"]["kind"], "predefined_type");
+        }
+        let symbols = typescript_cli_json("symbols", &path, &["--no-cache"]);
+        assert!(
+            symbols["diagnostics"]
+                .as_array()
+                .is_none_or(|items| items.is_empty())
+        );
+        for (name, line) in [("read", 2), ("caller", 3)] {
+            assert!(
+                symbols["symbols"].as_array().unwrap().iter().any(|symbol| {
+                    symbol["name"] == name && symbol["ln"] == line && symbol["kind"] == "fn"
+                }),
+                "{symbols}"
+            );
+        }
+        let calls = typescript_cli_json("calls", &path, &["--function", "caller"]);
+        assert_eq!(calls["calls"][0]["callees"][0]["name"], "read");
+        assert_eq!(calls["calls"][0]["callees"][0]["ln"], 3);
+        assert_eq!(
+            calls["calls"][0]["callees"][0]["col"],
+            source.lines().nth(3).unwrap().find("read").unwrap()
+        );
+        let imports = typescript_cli_json("imports", &path, &[]);
+        assert_eq!(imports["imports"].as_array().unwrap().len(), 2);
+        assert!(
+            imports["imports"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|import| import["src"] == "./box.js")
+        );
+        let type_refs = repo.run_json("refs", &["--name", "Box", "--max-results", "unlimited"]);
+        assert_eq!(type_refs["refs"].as_array().unwrap().len(), 2);
+        for line in [0, 2] {
+            assert!(
+                imports["imports"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|import| import["ln"] == line)
+            );
+            assert!(
+                type_refs["refs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|reference| {
+                        reference["path"] == filename
+                            && reference["kind"] == "ref"
+                            && reference["ln"] == line
+                            && reference["col"]
+                                == source.lines().nth(line).unwrap().find("Box").unwrap()
+                    }),
+                "{type_refs}"
+            );
+        }
+        let refs = repo.run_json("refs", &["--name", "read", "--max-results", "unlimited"]);
+        assert_eq!(refs["refs"].as_array().unwrap().len(), 2);
+        for (kind, line) in [("def", 2), ("ref", 3)] {
+            assert!(
+                refs["refs"].as_array().unwrap().iter().any(|reference| {
+                    reference["path"] == filename
+                        && reference["kind"] == kind
+                        && reference["ln"] == line
+                }),
+                "{refs}"
+            );
+        }
+    }
+}
+
+#[test]
+fn typescript_import_type_arguments_cli_keeps_malformed_diagnostics() {
+    for extension in ["ts", "tsx"] {
+        for imported in [
+            "import('./box.js').Box<@>",
+            "import('./box.js').Box<string, @>",
+            "import(@).Box<string>",
+        ] {
+            let source =
+                format!("declare const thing: {imported};\nexport function later() {{}}\n");
+            let repo = TestRepo::new();
+            let filename = format!("broken_import_type.{extension}");
+            repo.write(&filename, source);
+            let path = repo.path(&filename);
+            for command in ["ast", "symbols"] {
+                let output = typescript_cli_json(command, &path, &["--no-cache"]);
+                assert!(
+                    output["diagnostics"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|item| item["severity"] == "error"),
+                    "{output}"
+                );
+                if command == "symbols" {
+                    assert!(
+                        output["symbols"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|symbol| { symbol["name"] == "later" && symbol["ln"] == 1 }),
+                        "{output}"
+                    );
+                }
+            }
+        }
+    }
+}
