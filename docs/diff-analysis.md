@@ -149,6 +149,12 @@ An unaliased, unconditional module-level `from .cli import main` can bind `main(
 
 The proof requires package initializers containing only comments, plain string literals, or `pass`. Rebinding, duplicate imports, star imports, dynamic namespace operations (including `__dict__` and frame namespace access), parse failures, and module `__getattr__` prevent it. Absolute imports, aliases, namespace packages, class bodies, type positions, lambdas, and comprehensions keep the conservative result. Arbitrary runtime replacement from another file, custom import hooks, and string-based monkey patching are outside this static proof. Package and target evidence is reused within one analysis and discarded before the next query; imported names unrelated to the changed symbols are skipped.
 
+### Python Local Function Definitions and Attribute Writes
+
+Impact analysis can also identify a unique, undecorated function declared directly in the reference file as the owner of a bare use after its declaration. Rebinding, duplicate or conditional definitions, decorators, and the namespace barriers above keep the reference unproven.
+
+For a modified function proven to be a normal module function on both sides, the attribute name on the left of a plain assignment is excluded from callers. Attribute calls, function values, augmented assignments, references on the right, and changes to methods or properties retain their existing handling. These two proofs are disabled when `context --staged` or `impact --staged` reads callers from the working tree while using index sources. `review --staged` can apply them within its index snapshot. The `refs` occurrence list and dead-code counts are unchanged.
+
 ## impact: Detect Unresolved Impacts (for Stop Hooks)
 
 From the result of `context`, `impact` flags impacts on files outside the diff as "unresolved". It is meant for the Stop hook of an AI agent: when affected code is left untouched, it blocks and prompts the agent to continue. `impact` only follows symbols that still exist in the changed tree, so deleted symbols are not detected (exit 0 even if calls remain). To stop on deletions too, use `review --dir . --git --hook`, which detects removed public APIs as `api.rm`.

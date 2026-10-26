@@ -29,6 +29,7 @@ mod integration {
     mod impact_jsx_props;
     mod impact_object_members;
     mod impact_output;
+    mod impact_python_bindings;
     mod impact_rust_cargo_reachability;
     mod impact_rust_private_helpers;
     mod impact_rust_reexport;
