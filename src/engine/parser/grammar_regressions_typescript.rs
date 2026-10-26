@@ -503,3 +503,217 @@ fn typescript_await_and_tagged_template_no_regression_vs_baseline() {
         assert_eq!(tree.root_node().to_sexp(), expected);
     }
 }
+
+#[test]
+fn typescript_import_type_arguments_keep_generic_type_boundaries() {
+    let imported = "import('./box.js').Box<string>";
+    let source = format!("declare const thing: {imported};\nexport default thing;\n");
+    for lang in [LangId::Typescript, LangId::Tsx] {
+        let tree = assert_typescript_parse_clean(source.as_bytes(), lang);
+        let generic = typescript_node_with_text(
+            tree.root_node(),
+            source.as_bytes(),
+            "generic_type",
+            imported,
+        );
+        assert_eq!(generic.parent().unwrap().kind(), "type_annotation");
+        let name = generic.child_by_field_name("name").unwrap();
+        assert_eq!(name.kind(), "member_expression");
+        assert_eq!(
+            name.utf8_text(source.as_bytes()).unwrap(),
+            "import('./box.js').Box"
+        );
+        assert_eq!(
+            generic
+                .child_by_field_name("type_arguments")
+                .unwrap()
+                .utf8_text(source.as_bytes())
+                .unwrap(),
+            "<string>"
+        );
+    }
+    for (source, kind, text) in [
+        (
+            "const value = import('./box.js').Box<string>;",
+            "instantiation_expression",
+            "import('./box.js').Box<string>",
+        ),
+        (
+            "const value = import('./box.js').Box<string>();",
+            "call_expression",
+            "import('./box.js').Box<string>()",
+        ),
+        (
+            "type Value = typeof import('./box.js').factory<string>;",
+            "instantiation_expression",
+            "import('./box.js').factory<string>",
+        ),
+    ] {
+        for lang in [LangId::Typescript, LangId::Tsx] {
+            let tree = assert_typescript_parse_clean(source.as_bytes(), lang);
+            typescript_node_with_text(tree.root_node(), source.as_bytes(), kind, text);
+            assert!(
+                typescript_nodes(tree.root_node())
+                    .iter()
+                    .all(|node| node.kind() != "generic_type")
+            );
+        }
+    }
+}
+
+#[test]
+fn typescript_import_type_arguments_compose_with_existing_types() {
+    for (source, imported) in [
+        (
+            "type Row = import('./box.js').Box<string>;",
+            "import('./box.js').Box<string>",
+        ),
+        (
+            "type Row = import('./box.js').Namespace.Box<string>;",
+            "import('./box.js').Namespace.Box<string>",
+        ),
+        (
+            "type Row = import('./box.js').Pair<string, Array<number>>;",
+            "import('./box.js').Pair<string, Array<number>>",
+        ),
+        (
+            "type Row = Array<import('./box.js').Box<string>>;",
+            "import('./box.js').Box<string>",
+        ),
+        (
+            "type Row = readonly import('./box.js').Box<string>[];",
+            "import('./box.js').Box<string>",
+        ),
+        (
+            "type Row = import('./box.js').Box<string> | null;",
+            "import('./box.js').Box<string>",
+        ),
+        (
+            "type Row = import('./box.js').Box<string> & { tag: true };",
+            "import('./box.js').Box<string>",
+        ),
+        (
+            "type Row = import('./box.js').Box<string>['value'];",
+            "import('./box.js').Box<string>",
+        ),
+        (
+            "function read(): import('./box.js').Box<string> { return { value: '' }; }",
+            "import('./box.js').Box<string>",
+        ),
+        (
+            "type Row = import('./box.js').Box<typeof import('./box.js')>;",
+            "import('./box.js').Box<typeof import('./box.js')>",
+        ),
+        (
+            "declare const thing: import /* module */ ('./box.js').Box /* args */ <string>;",
+            "import /* module */ ('./box.js').Box /* args */ <string>",
+        ),
+    ] {
+        let mut previous = None;
+        for lang in [LangId::Typescript, LangId::Tsx] {
+            let tree = assert_typescript_parse_clean(source.as_bytes(), lang);
+            let generic = typescript_node_with_text(
+                tree.root_node(),
+                source.as_bytes(),
+                "generic_type",
+                imported,
+            );
+            let name = generic.child_by_field_name("name").unwrap();
+            assert_eq!(name.kind(), "member_expression");
+            assert_eq!(
+                name.child_by_field_name("property").unwrap().kind(),
+                "property_identifier"
+            );
+            assert_eq!(
+                generic
+                    .child_by_field_name("type_arguments")
+                    .unwrap()
+                    .kind(),
+                "type_arguments"
+            );
+            let sexp = tree.root_node().to_sexp();
+            if let Some(previous) = &previous {
+                assert_eq!(&sexp, previous);
+            }
+            previous = Some(sexp);
+        }
+    }
+}
+
+#[test]
+fn typescript_import_type_arguments_preserve_unicode_crlf_and_raw_ranges() {
+    let source = "// 名前🙂\r\ndeclare const thing: /* 名前🙂 */ import('./box.js').Box<string>;\r\nexport function later() { return thing; }\r\n";
+    let imported = "import('./box.js').Box<string>";
+    for lang in [LangId::Typescript, LangId::Tsx] {
+        let tree = assert_typescript_parse_clean(source.as_bytes(), lang);
+        let generic = typescript_node_with_text(
+            tree.root_node(),
+            source.as_bytes(),
+            "generic_type",
+            imported,
+        );
+        let start = source.find(imported).unwrap();
+        assert_eq!(generic.byte_range(), start..start + imported.len());
+        assert_eq!(
+            generic.start_position(),
+            Point::new(1, "declare const thing: /* 名前🙂 */ ".len())
+        );
+        let later = typescript_node_with_text(
+            tree.root_node(),
+            source.as_bytes(),
+            "function_declaration",
+            "function later() { return thing; }",
+        );
+        assert_eq!(later.start_position(), Point::new(2, 7));
+        for node in typescript_nodes(tree.root_node()) {
+            assert_eq!(
+                node.start_position(),
+                typescript_point_at(source.as_bytes(), node.start_byte())
+            );
+            assert_eq!(
+                node.end_position(),
+                typescript_point_at(source.as_bytes(), node.end_byte())
+            );
+            assert_eq!(
+                node.utf8_text(source.as_bytes()).unwrap().as_bytes(),
+                &source.as_bytes()[node.byte_range()]
+            );
+        }
+    }
+}
+
+#[test]
+fn typescript_import_type_arguments_incremental_parse_recovers_invalid_to_valid() {
+    let valid =
+        "declare const thing: import('./box.js').Box<string>;\nexport function later() {}\n";
+    let broken = valid.replace("<string>", "<@>");
+    let start = broken.find('@').unwrap();
+    for lang in [LangId::Typescript, LangId::Tsx] {
+        let mut parser = Parser::new();
+        parser.set_language(&lang.ts_language()).unwrap();
+        let mut old_tree = parser.parse(&broken, None).unwrap();
+        assert!(old_tree.root_node().has_error());
+        old_tree.edit(&InputEdit {
+            start_byte: start,
+            old_end_byte: start + 1,
+            new_end_byte: start + "string".len(),
+            start_position: Point::new(0, start),
+            old_end_position: Point::new(0, start + 1),
+            new_end_position: Point::new(0, start + "string".len()),
+        });
+        let incremental = parser.parse(valid, Some(&old_tree)).unwrap();
+        assert!(!incremental.root_node().has_error());
+        let fresh = assert_typescript_parse_clean(valid.as_bytes(), lang);
+        assert_eq!(
+            incremental.root_node().to_sexp(),
+            fresh.root_node().to_sexp()
+        );
+        typescript_node_with_text(
+            incremental.root_node(),
+            valid.as_bytes(),
+            "generic_type",
+            "import('./box.js').Box<string>",
+        );
+        Query::new(&lang.ts_language(), "(generic_type name: (member_expression object: (call_expression function: (import) arguments: (arguments (string))) property: (property_identifier)) type_arguments: (type_arguments (predefined_type)))").unwrap();
+    }
+}
