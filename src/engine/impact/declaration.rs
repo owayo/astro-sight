@@ -691,6 +691,7 @@ impl OldSide {
 #[derive(Default)]
 pub(super) struct DeclarationProof {
     pub(super) js_modified_direct_function_names: HashSet<String>,
+    pub(super) python_modified_direct_function_names: HashSet<String>,
     pub(super) rust_function_names: HashSet<String>,
     /// 旧新とも同名宣言が自由関数だけの名前。メソッド位置の参照は指し得ない。
     pub(super) rust_free_function_names: HashSet<String>,
@@ -1134,6 +1135,11 @@ pub(super) fn reconcile_declaration_changes(
         }
     }
     let mut proof = DeclarationProof {
+        python_modified_direct_function_names: python_modified_direct_function_names(
+            input,
+            affected,
+            &mut old_side,
+        ),
         js_modified_direct_function_names: js_modified_direct_function_names(
             input,
             affected,
@@ -1251,6 +1257,42 @@ fn rust_file_items_pair(
         RustFileItems::new(old.tree.root_node(), &old.source)?,
         RustFileItems::new(input.root, input.source)?,
     ))
+}
+
+fn python_modified_direct_function_names(
+    input: &DeclarationChangeInput<'_>,
+    affected: &[AffectedSymbol],
+    old_side: &mut LazyOldSide,
+) -> HashSet<String> {
+    if input.lang_id != LangId::Python {
+        return HashSet::new();
+    }
+    let Some(new_names) =
+        super::python_imports::direct_function_names_in_source(input.root, input.source)
+    else {
+        return HashSet::new();
+    };
+    let Some(old) = old_side.get(input) else {
+        return HashSet::new();
+    };
+    let Some(old_names) =
+        super::python_imports::direct_function_names_in_source(old.tree.root_node(), &old.source)
+    else {
+        return HashSet::new();
+    };
+    new_names
+        .intersection(&old_names)
+        .filter(|name| {
+            let mut changes = affected
+                .iter()
+                .filter(|change| change.name == **name)
+                .peekable();
+            changes.peek().is_some()
+                && changes
+                    .all(|change| change.kind == "function" && change.change_type == "modified")
+        })
+        .cloned()
+        .collect()
 }
 
 fn js_modified_direct_function_names(

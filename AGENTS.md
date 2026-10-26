@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **Python の同名直下関数と属性代入の帰属** — `engine/impact/python_imports.rs` は、参照側ファイルの再束縛のない一意な通常直下関数を、その宣言後の裸の参照の所有元として証明する (Issue #158)。既存の相対 import の障壁を共有し、decorator・重複・条件付き定義・global/nonlocal・star import・動的な名前空間操作・解析失敗は保留する。`declaration.rs` が旧新とも通常直下関数と証明した modified に限り、collector は属性への単純代入の左辺を caller から外す。属性呼び出し・関数値の読み出し・複合代入・右辺の実参照・method/property の変更はこの証拠で落とさない。参照を作業ツリーから読む context/impact の staged では新しい2種の証拠を適用せず、review の staged は index のスナップショット内で適用できる。型stubと既存の相対 import の方針、refs/dead-code の出現契約は維持する。回帰は `tests/integration/impact_python_bindings.rs` の通常/staged・実caller・曖昧な束縛・属性書込みと読出しの対照。
+
 - **TS の対象型の spread copy** — `ts_required_members/spread_copy.rs` は必須追加で、全 spread 元が対象型の識別子または一意な通常直下関数の明示戻り型付き直接呼出しと証明できる object を扱う (Issue #152)。追加キーごとに最後の spread と明示値の順序を照合し、後続の明示値には既存の型・変更行の証明を求める。unknown/any/Partial/assertion、computed/escape key、重複した明示追加キー・method は保留。alias 例外は、型参照の義務と producer 名の監査を別に持つ明示 Row return の直下通常関数・const x:Row・satisfies Row のコピー先に限る。単に同名の型注釈だけで閉じず、既存の所属・値・caller・typeof/alias の義務を全て通す。spread ごとの全キー展開や再帰的な object 追跡はせず、縮小・削除・refs/dead-code の契約を維持する。
 
 - **テスト専用 API と hook の停止** — `review/hook.rs` は同一レビューの `test_only_symbols` と file/name/kind が一致し宣言行がある modified・const_value だけを停止条件から外す (Issue #151)。strict const でも表示は維持し、通常の API 分類と refs/dead-code は変えない。review/impact の truncation と skip があれば降格せず、本体利用・再 export・無参照・同名別宣言・mixed の本体変更は blocking を維持する。removed/callback/type annotation の policy は不変。保証は観測した内部参照の範囲で、外部利用者の不在は証明しない。

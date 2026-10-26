@@ -95,6 +95,8 @@ struct FileContext {
     sig_changes: Vec<SignatureChange>,
     /// 旧新とも一意な直接関数宣言と証明できた modified のシグネチャ変更。
     js_modified_direct_function_names: HashSet<String>,
+    /// 旧新とも一意な Python の通常直下関数。属性の単純代入は読み出しではない。
+    python_modified_direct_function_names: HashSet<String>,
     /// 透過的な Rust type alias 導入だけ、または関数に `const` を足しただけと old/new AST で
     /// 証明できたシグネチャ変更。cross-file / same-file の caller は消さず informational へ振り分ける。
     compatible_signature_keys: HashSet<String>,
@@ -914,6 +916,8 @@ fn collect_affected_symbols(
             new_path: df.new_path.clone(),
             lang_id,
             js_modified_direct_function_names: declaration_proof.js_modified_direct_function_names,
+            python_modified_direct_function_names: declaration_proof
+                .python_modified_direct_function_names,
             rust_function_names: declaration_proof.rust_function_names,
             rust_free_function_names: declaration_proof.rust_free_function_names,
             rust_kind_changes: declaration_proof.rust_kind_changes,

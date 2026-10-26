@@ -1,4 +1,5 @@
-//! impact 専用の相対 import 束縛証明。解決できない参照は従来の判定に残す。
+//! impact 専用の相対 import・同一ファイルの直下関数の束縛証明。
+//! 解決できない参照は従来の判定に残す。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -35,9 +36,13 @@ impl PythonImportIndex {
         path: &str,
         changed_names: &HashMap<String, usize>,
         cache: &PythonImportCache,
+        allow_local_functions: bool,
     ) -> Option<Self> {
         while let Some(parent) = root.parent() {
             root = parent;
+        }
+        if root.has_error() {
+            return None;
         }
         let workspace = cache
             .workspace
@@ -47,8 +52,28 @@ impl PythonImportIndex {
         let mut candidates = HashMap::new();
         let mut ignored = HashSet::new();
         let mut duplicates = HashSet::new();
+        let mut local_names = HashSet::new();
         let mut cursor = root.walk();
         for statement in root.named_children(&mut cursor) {
+            if allow_local_functions && statement.kind() == "function_definition" {
+                let name = statement.child_by_field_name("name")?;
+                let text = name.utf8_text(source).ok()?;
+                if changed_names.contains_key(text) {
+                    if candidates.contains_key(text) {
+                        duplicates.insert(text.to_owned());
+                    }
+                    ignored.insert(name.id());
+                    local_names.insert(text.to_owned());
+                    candidates.insert(
+                        text.to_owned(),
+                        ImportBinding {
+                            owner: ref_path.canonicalize().ok()?,
+                            after: statement.end_byte(),
+                        },
+                    );
+                }
+                continue;
+            }
             if statement.kind() != "import_from_statement" {
                 continue;
             }
@@ -105,6 +130,9 @@ impl PythonImportIndex {
         candidates.retain(|name, binding| {
             if duplicates.contains(name) || blocked.contains(name) {
                 return false;
+            }
+            if local_names.contains(name) {
+                return true;
             }
             owners
                 .entry(binding.owner.clone())
@@ -237,7 +265,13 @@ fn package_is_inert(path: &Path, packages: &mut HashMap<PathBuf, bool>) -> bool 
 fn direct_function_names(path: &Path) -> Option<HashSet<String>> {
     let source = parser::read_file(camino::Utf8Path::from_path(path)?).ok()?;
     let tree = parser::parse_source(&source, LangId::Python).ok()?;
-    let root = tree.root_node();
+    direct_function_names_in_source(tree.root_node(), &source)
+}
+
+pub(super) fn direct_function_names_in_source(
+    root: Node<'_>,
+    source: &[u8],
+) -> Option<HashSet<String>> {
     let mut definitions = HashMap::new();
     let mut ignored = HashSet::new();
     let mut cursor = root.walk();
@@ -245,18 +279,33 @@ fn direct_function_names(path: &Path) -> Option<HashSet<String>> {
         // decorator や条件付き定義は実体が別関数になる可能性がある。
         if node.kind() == "function_definition" {
             let name = node.child_by_field_name("name")?;
-            let text = name.utf8_text(&source).ok()?;
+            let text = name.utf8_text(source).ok()?;
             *definitions.entry(text.to_owned()).or_insert(0usize) += 1;
             ignored.insert(name.id());
         }
     }
-    let blocked = blocked_names(root, &source, &ignored)?;
+    let blocked = blocked_names(root, source, &ignored)?;
     Some(
         definitions
             .into_iter()
             .filter_map(|(name, count)| (count == 1 && !blocked.contains(&name)).then_some(name))
             .collect(),
     )
+}
+
+pub(super) fn attribute_is_plain_write(node: Node<'_>) -> bool {
+    let Some(attribute) = node.parent().filter(|parent| parent.kind() == "attribute") else {
+        return false;
+    };
+    attribute
+        .child_by_field_name("attribute")
+        .is_some_and(|field| field.id() == node.id())
+        && attribute.parent().is_some_and(|parent| {
+            parent.kind() == "assignment"
+                && parent
+                    .child_by_field_name("left")
+                    .is_some_and(|left| left.id() == attribute.id())
+        })
 }
 
 fn collect_names(
@@ -394,6 +443,7 @@ mod tests {
             path,
             &changed_names,
             &cache,
+            true,
         )?;
         let mut pending = vec![root];
         let mut last = None;

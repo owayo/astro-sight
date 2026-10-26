@@ -97,8 +97,9 @@ pub(super) struct RefEventMini {
     pub(super) unproven_module_ref: bool,
     /// Rust 値束縛の証拠は変更元ごとの kind を確認して適用する。
     pub(super) rust_value_binding: bool,
-    /// Python の相対 import で直接定義へ解決した所有元。未証明は u32::MAX。
+    /// Python の相対 import または同一ファイルの直下関数の所有元。未証明は u32::MAX。
     pub(super) python_import_owner_id: u32,
+    pub(super) python_attribute_write: bool,
     /// Rust type path structurally resolved to a local declaration file.
     pub(super) rust_owner_path_id: u32,
     pub(super) rust_owner_is_free_function: bool,
@@ -318,7 +319,7 @@ impl RouteDecisionContext<'_> {
 /// ファイル走査完了後に `finish_file` で Stage 1-6 (Stage 4b 除く) の filter を適用して
 /// `local_maps` / `local_def_paths` へ流す。`SymbolReference` の Vec は生成しない。
 pub(super) struct ImpactCollector<'a> {
-    pub(super) js_signature_sites_trusted: bool,
+    pub(super) new_side_is_worktree: bool,
     pub(super) jsx_shapes: Vec<super::jsx_props::JsxShape>,
     pub(super) jsx_parse_clean: std::cell::OnceCell<bool>,
     pub(super) python_imports:
@@ -567,6 +568,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                             self.path_str,
                             self.python_changed_names,
                             self.python_import_cache,
+                            self.new_side_is_worktree,
                         )
                     })
                     .as_ref()?
@@ -716,6 +718,13 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             u32::MAX
         };
         self.ref_events.push(RefEventMini {
+            python_attribute_write: self.ref_lang == Some(LangId::Python)
+                && self.new_side_is_worktree
+                && self
+                    .python_imports
+                    .get()
+                    .is_some_and(|index| index.is_some())
+                && node.is_some_and(super::python_imports::attribute_is_plain_write),
             js_signature_site,
             sym_ix,
             line: line as u32,
@@ -1081,6 +1090,9 @@ impl<'a> ImpactCollector<'a> {
         let all_symbol_names = self.all_symbol_names;
         let name = &all_symbol_names[e.sym_ix as usize];
         let filter_disabled = evidence.filter_disabled;
+        if e.python_attribute_write && ctx.python_modified_direct_function_names.contains(name) {
+            return true;
+        }
         if let Some(owner) = facts.python_owner.as_deref()
             && let Some(Some(source_path)) = evidence.python_source_paths.get(fc_ix)
             && owner != source_path
@@ -1370,7 +1382,7 @@ impl<'a> ImpactCollector<'a> {
         } else {
             RouteDecisionContext {
                 filter_disabled,
-                js_signature_sites_trusted: self.js_signature_sites_trusted,
+                js_signature_sites_trusted: self.new_side_is_worktree,
                 ref_lang: self.ref_lang,
                 dir: self.dir,
                 path_str: self.path_str,
@@ -1464,6 +1476,7 @@ mod tests {
             unproven_module_ref: false,
             rust_value_binding: false,
             python_import_owner_id: u32::MAX,
+            python_attribute_write: false,
             rust_owner_path_id: u32::MAX,
             rust_owner_is_free_function: false,
             rust_associated_type_path: false,
@@ -1588,6 +1601,7 @@ mod tests {
         sig_changes: Vec<SignatureChange>,
     ) -> FileContext {
         FileContext {
+            python_modified_direct_function_names: Default::default(),
             js_modified_direct_function_names: Default::default(),
             new_path: "src/changed.rs".to_string(),
             lang_id: LangId::Rust,
