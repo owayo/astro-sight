@@ -26,7 +26,7 @@ const TS_IDENTIFIER_KINDS: &[&str] = &[
     "type_identifier",
 ];
 
-fn identifier_kind(kind: &str) -> bool {
+pub(crate) fn identifier_kind(kind: &str) -> bool {
     COMMON_IDENTIFIER_KINDS.contains(&kind) || TS_IDENTIFIER_KINDS.contains(&kind)
 }
 

@@ -276,6 +276,7 @@ pub(super) fn changed_call_matches_signature(
     dir: &str,
     target_path: &str,
     name: &str,
+    reference_name: &str,
     reference: &SymbolReference,
     caches: &mut ApiClosureCaches,
 ) -> bool {
@@ -335,7 +336,7 @@ pub(super) fn changed_call_matches_signature(
         return false;
     };
     if !matches!(callee.kind(), "identifier" | "property_identifier")
-        || text(callee, &caller.source) != Some(name)
+        || text(callee, &caller.source) != Some(reference_name)
     {
         return false;
     }

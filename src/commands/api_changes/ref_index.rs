@@ -9,6 +9,8 @@ use crate::service::AppService;
 use super::super::git_input::{git_show_blob, validate_git_revision};
 use super::{PreparedDiffFile, bare_name};
 
+mod ts_import_alias;
+
 /// Old-side references used only to distinguish a rename from an already unused removal.
 /// All changed sources are parsed once, and references inside declarations removed by the
 /// same diff are excluded: a recursive method or a deleted caller cannot prove a rename.
@@ -596,7 +598,7 @@ pub(crate) fn is_modified_closed_in_diff(
     // 2 つのキャッシュは detect_api_changes スコープで生成して全 modified シンボルで共有する。
     // per-symbol の git diff サブプロセス起動と tree-sitter parse を unique file 単位に削減する。
     let call_refs = collect_call_refs(target.refs, input.dir, target.bare, caches);
-    if call_refs.is_empty() {
+    if call_refs.is_empty() && target.aliased_calls.is_empty() {
         return false;
     }
     // 型のメンバー変更は、参照の位置ごとの義務だけで閉じる (変更行の照合へ戻さない)。
@@ -636,7 +638,20 @@ pub(crate) fn is_modified_closed_in_diff(
             ReferenceOwner::Unknown => return false,
         }
         effective_call_refs += 1;
-        if !prove_reference_updated(&input, &target, r, &mut diff_files, caches) {
+        if !prove_reference_updated(&input, &target, r, target.bare, &mut diff_files, caches) {
+            return false;
+        }
+    }
+    for call in &target.aliased_calls {
+        effective_call_refs += 1;
+        if !prove_reference_updated(
+            &input,
+            &target,
+            &call.reference,
+            &call.local_name,
+            &mut diff_files,
+            caches,
+        ) {
             return false;
         }
     }
@@ -652,6 +667,8 @@ struct ClosureTarget<'a> {
     python_method: bool,
     rust_module_function: Option<super::rust_ref_sites::ModuleFunctionProof>,
     refs: &'a [crate::models::reference::SymbolReference],
+    /// 直接の named import を通して束縛を証明した別名側の呼び出し。
+    aliased_calls: Vec<ts_import_alias::AliasedCall>,
     /// 変更対象ファイル以外にも同名の定義がある。
     has_foreign_defs: bool,
     /// (Python のメソッドで) 他ファイルの同名定義がすべてこの diff の追加行にある。
@@ -735,14 +752,6 @@ fn prepare_closure_target<'a>(
         return None;
     }
     let refs = index.refs_for(bare)?;
-    // 別名で import / use / 再 export された名前 (`run as r`) の呼び出しは名前索引に現れず、
-    // 見えた呼び出しが全部更新済みでも未更新の利用者が残り得る。言語を問わず閉じない。
-    if refs.iter().any(|r| {
-        r.kind != Some(crate::models::reference::RefKind::Definition)
-            && ref_import_role(dir, r, bare, caches) == Some(RefImportRole::Aliased)
-    }) {
-        return None;
-    }
     // `.vue` などの解析できない埋め込みソースにある利用は refs に現れない。名前が現れ得る
     // ソースがあれば、見えた呼び出しだけで追随済みとは言えない。
     if matches!(
@@ -835,12 +844,15 @@ fn prepare_closure_target<'a>(
     {
         return None;
     }
+    // 元名の索引に現れない別名の利用も全件監査する。未対応の輸送は従来どおり閉じない。
+    let aliased_calls = ts_import_alias::collect(input, refs, caches)?;
     Some(ClosureTarget {
         bare,
         target_lang,
         python_method,
         rust_module_function: input.rust_module_function_change,
         refs,
+        aliased_calls,
         has_foreign_defs,
         python_foreign_defs_updated,
     })
@@ -967,6 +979,7 @@ fn prove_reference_updated(
     input: &ModifiedClosureInput<'_>,
     target: &ClosureTarget<'_>,
     r: &crate::models::reference::SymbolReference,
+    reference_name: &str,
     diff_files: &mut DiffFileLookup<'_>,
     caches: &mut ApiClosureCaches,
 ) -> bool {
@@ -979,7 +992,7 @@ fn prove_reference_updated(
         ref arg_evidence,
         ..
     } = input;
-    let bare = target.bare;
+    let bare = reference_name;
     if matches!(
         target.target_lang,
         Some(
@@ -992,6 +1005,7 @@ fn prove_reference_updated(
         && !super::js_ts_call_arity::changed_call_matches_signature(
             dir,
             target_new_path,
+            target.bare,
             bare,
             r,
             caches,
@@ -1541,6 +1555,8 @@ pub(crate) struct ApiClosureCaches {
     /// JSDoc と文字列で書いた名前を調べる、tsc が型検査するファイルの一覧。外 `None` = 未取得、
     /// 内 `None` = 取得失敗。
     pub(super) ts_checked_files: Option<Option<std::rc::Rc<Vec<std::path::PathBuf>>>>,
+    /// 別名の閉包で、名前索引の外に隠れる出現・module 輸送を監査した結果。
+    pub(super) ts_alias_inventories: std::collections::HashMap<(String, String), bool>,
     /// (移動元, 移動先) → 移動先の変更行のうち、移動元に同じ行が無いもの
     /// (`ModifiedClosureInput::moved_from`)。
     moved_member_changed_lines:
