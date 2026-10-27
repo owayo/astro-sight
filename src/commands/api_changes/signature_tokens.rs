@@ -122,4 +122,67 @@ mod tests {
             ));
         }
     }
+
+    #[test]
+    fn literal_const_value_nodes_exist_and_match_all_js_grammars() {
+        for lang in [LangId::Javascript, LangId::Typescript, LangId::Tsx] {
+            let language = lang.ts_language();
+            for kind in [
+                "regex",
+                "template_string",
+                "string_fragment",
+                "escape_sequence",
+                "template_substitution",
+            ] {
+                tree_sitter::Query::new(&language, &format!("({kind}) @node")).unwrap();
+            }
+            for (value, expected, children) in [
+                ("/a+/gy", "regex", vec!["regex_pattern", "regex_flags"]),
+                ("``", "template_string", vec![]),
+                (
+                    "`a\\nb`",
+                    "template_string",
+                    vec!["string_fragment", "escape_sequence", "string_fragment"],
+                ),
+                (
+                    "`a${name}`",
+                    "template_string",
+                    vec!["string_fragment", "template_substitution"],
+                ),
+            ] {
+                let source = format!("export const VALUE = {value};");
+                let tree = parser::parse_source(source.as_bytes(), lang).unwrap();
+                assert!(!tree.root_node().has_error(), "{source}");
+                let declaration = super::super::signature::find_first_descendant_of_kinds(
+                    tree.root_node(),
+                    &["variable_declarator"],
+                )
+                .unwrap();
+                let initializer = declaration.child_by_field_name("value").unwrap();
+                assert_eq!(initializer.kind(), expected, "{source}");
+                let mut cursor = initializer.walk();
+                assert_eq!(
+                    initializer
+                        .named_children(&mut cursor)
+                        .map(|child| child.kind())
+                        .collect::<Vec<_>>(),
+                    children,
+                    "{source}"
+                );
+            }
+            for (old, new) in [
+                ("/a/", "/b/g"),
+                ("'a'", "`b`"),
+                ("`a`", "'b'"),
+                ("``", "`a\\nb`"),
+            ] {
+                assert!(is_const_value_only_change(
+                    &format!("export const VALUE = {old};"),
+                    &format!("export const VALUE = {new};"),
+                    "variable",
+                    lang
+                ));
+            }
+        }
+    }
 }

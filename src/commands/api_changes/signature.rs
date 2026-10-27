@@ -687,6 +687,13 @@ enum BindingShapeText {
     Tokens(SigTokens),
 }
 
+/// 公開 const の単純リテラル。正規表現を container の scalar 葉へ広げない。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsConstLiteralKind {
+    Scalar(super::static_const::ScalarKind),
+    RegExp,
+}
+
 /// 値バインディング (const / static / export const) の宣言から抽出した shape 情報。
 /// initializer (= 右辺) を除いた宣言の骨格と、value-only 変更を安全に判定するための補助情報。
 pub(crate) struct BindingShape {
@@ -697,12 +704,12 @@ pub(crate) struct BindingShape {
     is_const_binding: bool,
     /// 型注釈を持つなら true (TS の型注釈なし initializer の安全判定に使う)。
     has_type_annotation: bool,
-    /// initializer が scalar literal (数値 / 文字列 / 真偽値 / null 等) なら true。
+    /// initializer が単純リテラル (正規表現・置換なし template を含む) なら true。
     /// 関数 / object / array / call 等の複雑な式は false。
-    initializer_is_scalar: bool,
-    /// TS/JS の scalar literal の種類 (Rust では None)。型注釈がないと推論される公開型は
+    initializer_is_simple_literal: bool,
+    /// TS/JS の単純リテラルの種類 (Rust では None)。型注釈がないと推論される公開型は
     /// 値の種類で決まるため、種類が変わる変更 (`30` → `"30s"`) を値だけの変更と区別する。
-    js_scalar_kind: Option<super::static_const::ScalarKind>,
+    js_literal_kind: Option<JsConstLiteralKind>,
 }
 
 /// `node` を起点に、指定 kind のいずれかに最初に一致する子孫ノードを深さ優先で探す。
@@ -788,13 +795,13 @@ pub(crate) fn extract_rust_binding_shape(
         .map(|v| v.start_byte())
         .unwrap_or_else(|| node.end_byte());
     let shape_bytes = source.get(node.start_byte()..shape_end)?;
-    let initializer_is_scalar = value.map(rust_value_is_scalar).unwrap_or(false);
+    let initializer_is_simple_literal = value.map(rust_value_is_scalar).unwrap_or(false);
     Some(BindingShape {
         shape: BindingShapeText::Legacy(normalize_binding_shape_text(shape_bytes)),
         is_const_binding: !is_mut,
         has_type_annotation,
-        initializer_is_scalar,
-        js_scalar_kind: None,
+        initializer_is_simple_literal,
+        js_literal_kind: None,
     })
 }
 
@@ -842,9 +849,7 @@ pub(crate) fn extract_js_binding_shape(
     let shape_end = value
         .map(|value| value.start_byte())
         .unwrap_or_else(|| declarator.end_byte());
-    let initializer_is_scalar = value.map(js_value_is_scalar).unwrap_or(false);
-    let js_scalar_kind =
-        value.and_then(|value| super::static_const::js_scalar_literal_kind(value, source));
+    let js_literal_kind = value.and_then(|value| js_const_literal_kind(value, source));
     Some(BindingShape {
         shape: BindingShapeText::Tokens(signature_tokens_in_range(
             statement,
@@ -854,8 +859,8 @@ pub(crate) fn extract_js_binding_shape(
         )?),
         is_const_binding,
         has_type_annotation,
-        initializer_is_scalar,
-        js_scalar_kind,
+        initializer_is_simple_literal: js_literal_kind.is_some(),
+        js_literal_kind,
     })
 }
 
@@ -872,19 +877,35 @@ pub(crate) fn rust_value_is_scalar(value: tree_sitter::Node<'_>) -> bool {
     )
 }
 
-/// JS/TS の値ノードが scalar literal かを判定する。関数 / object / array / call は false。
-pub(crate) fn js_value_is_scalar(value: tree_sitter::Node<'_>) -> bool {
-    matches!(
-        value.kind(),
-        "number" | "string" | "true" | "false" | "null" | "undefined"
-    )
+/// JS/TS の公開 const に限り、正規表現と静的 template も値の種類として比較する。
+fn js_const_literal_kind(
+    value: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<JsConstLiteralKind> {
+    if value.has_error() || value.is_missing() {
+        return None;
+    }
+    match value.kind() {
+        "regex" => Some(JsConstLiteralKind::RegExp),
+        "template_string" => {
+            let mut cursor = value.walk();
+            value
+                .named_children(&mut cursor)
+                .all(|child| matches!(child.kind(), "string_fragment" | "escape_sequence"))
+                .then_some(JsConstLiteralKind::Scalar(
+                    super::static_const::ScalarKind::String,
+                ))
+        }
+        _ => super::static_const::js_scalar_literal_kind(value, source)
+            .map(JsConstLiteralKind::Scalar),
+    }
 }
 
 /// old/new signature が「const / 非 mut static / export const の値のみ変更 (shape 不変)」かを
 /// 判定する。true なら api.mod ではなく const_value_changes (informational) に振り分ける。
 ///
 /// gate: (1) kind が value binding (constant/variable)、(2) 言語が Rust/TS/TSX/JS、
-/// (3) 両者が不変バインディング、(4) shape 一致、(5) TS で型注釈なしなら両者 scalar literal。
+/// (3) 両者が不変バインディング、(4) shape 一致、(5) TS で型注釈なしなら同種の単純リテラル。
 /// いずれか外れる / 抽出失敗時は false を返し、保守的に api.mod へ倒す。
 pub(crate) fn is_const_value_only_change(
     old_sig: &str,
@@ -920,10 +941,10 @@ pub(crate) fn is_const_value_only_change(
         return false;
     }
     // TS/JS で型注釈がない場合、関数 / object / array / call initializer は shape 推定が
-    // 危険なため scalar literal 同士のときだけ demote する (codex 指摘)。
-    // 型注釈がないと公開型は値から推論されるため、scalar の種類 (number / string / ...) が
+    // 危険なため同種の単純リテラル同士のときだけ demote する。
+    // 型注釈がないと公開型は値から推論されるため、種類 (number / string / RegExp / ...) が
     // 変わる変更は値だけの変更ではない (`30` → `"30s"` で `TIMEOUT * 1000` が TS2362)。
-    // 静的 container の葉 (`static_const`) と同じく種類まで一致したときだけ demote する。
+    // 正規表現の pattern / flags の動作差は既存の strict const policy で扱う。
     if matches!(
         lang_id,
         crate::language::LangId::Typescript
@@ -931,11 +952,11 @@ pub(crate) fn is_const_value_only_change(
             | crate::language::LangId::Javascript
     ) {
         let both_typed = old.has_type_annotation && new.has_type_annotation;
-        let both_scalar = old.initializer_is_scalar
-            && new.initializer_is_scalar
-            && old.js_scalar_kind.is_some()
-            && old.js_scalar_kind == new.js_scalar_kind;
-        if !both_typed && !both_scalar {
+        let both_literals = old.initializer_is_simple_literal
+            && new.initializer_is_simple_literal
+            && old.js_literal_kind.is_some()
+            && old.js_literal_kind == new.js_literal_kind;
+        if !both_typed && !both_literals {
             return false;
         }
     }

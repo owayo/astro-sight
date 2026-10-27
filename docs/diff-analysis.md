@@ -337,6 +337,12 @@ When a separate namespace exports the same name as a directly exported root func
 
 Recovered candidates use the existing compatibility, argument-count, and type-member checks. A required argument left missing stays blocking even if its call line was reformatted. Existing multiple-definition guards can also keep a recovered variable or type change blocking after its uses are edited. Overloads, declaration merging, rebinding, destructured variables, indirect/default exports, and parse failures are outside this recovery. Other languages and the `refs` / dead-code occurrence contracts are unchanged.
 
+### JavaScript and TypeScript literal constant values
+
+For an otherwise unchanged exported `const` declaration without a type annotation, changes between regular-expression literals use `api_changes.const_value_changes` (`api.const_value` in hook output). Pattern and flag changes retain the same `RegExp` kind. Templates without substitutions, including empty templates and escapes, share the existing string-literal kind, so string/template replacements also use this value policy. This applies to JS, TS and TSX, including staged review.
+
+The default hook treats these value changes as informational; `--strict-public-const-values` makes them blocking. This policy does not establish equivalent runtime behavior: flags such as `g` and `y` can change how a regular expression is used. Changes between different kinds, templates with substitutions, tagged templates, assertions and `satisfies` retain their previous handling. Declaration-header checks and the separate scalar-leaf rules for static object/array constants are unchanged.
+
 ### Rust internal-module constant values
 
 For an ordinary change at the same path, a Rust `pub const` or non-`mut` `pub static` whose name, type, visibility, and binding kind remain unchanged while only its initializer changes uses the existing `api_changes.const_value_changes` bucket (`api.const_value` in hook output). This value-policy information is retained before external-API suppression, including Cargo bin-only crates and private modules in libraries. The default hook does not stop on unchanged references solely because of this classification. `--strict-public-const-values` makes the same classification blocking.
