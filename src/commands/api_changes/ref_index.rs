@@ -1512,6 +1512,7 @@ pub(crate) struct ApiClosureCaches {
     rust_clean_files: std::collections::HashMap<String, bool>,
     pub(crate) fixed_callback: super::ts_signature::FixedCallbackCache,
     pub(crate) optional_removal: super::ts_signature::OptionalRemovalCache,
+    pub(super) python_optional_removal: super::python_optional_removal::RemovalCache,
     /// `import_statement_lines_for_ref` の (ref path → import 行集合) キャッシュ。
     pub(crate) import_lines: std::collections::HashMap<String, std::collections::HashSet<usize>>,
     /// `changed_new_lines_for_file` の (new_path → 実際に変更/追加された new 行集合) キャッシュ。

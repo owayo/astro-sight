@@ -227,7 +227,7 @@ fn is_identifier_attribute_chain(mut node: Node<'_>) -> bool {
 }
 
 impl CallContract {
-    fn from_function(function: Node<'_>, source: &[u8]) -> Option<Self> {
+    pub(super) fn from_function(function: Node<'_>, source: &[u8]) -> Option<Self> {
         // 任意の decorator は関数の呼出し契約を変更できる。
         if function
             .parent()
@@ -319,7 +319,7 @@ impl CallContract {
         })
     }
 
-    fn accepts_call(&self, call: Node<'_>, source: &[u8]) -> bool {
+    pub(super) fn accepts_call(&self, call: Node<'_>, source: &[u8]) -> bool {
         let Some(arguments) = call.child_by_field_name("arguments") else {
             return false;
         };

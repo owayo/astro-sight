@@ -157,6 +157,12 @@ An unaliased, unconditional module-level `from .cli import main` can bind `main(
 
 The proof requires package initializers containing only comments, plain string literals, or `pass`. Rebinding, duplicate imports, star imports, dynamic namespace operations (including `__dict__` and frame namespace access), parse failures, and module `__getattr__` prevent it. Absolute imports, aliases, namespace packages, class bodies, type positions, lambdas, and comprehensions keep the conservative result. Arbitrary runtime replacement from another file, custom import hooks, and string-based monkey patching are outside this static proof. Package and target evidence is reused within one analysis and discarded before the next query; imported names unrelated to the changed symbols are skipped.
 
+### Python Optional Parameter Removal
+
+Removing optional keyword-only parameters or trailing defaulted positional parameters from a unique, undecorated top-level Python function can produce `api.mod_closed`. Remaining parameters, their modes, annotations and defaults, and the rest of the header must be unchanged. All observed uses in the current source must be direct calls accepted by the new signature, the declaration itself, or an unaliased absolute import resolved to that declaration; at least one call is required. Calls need not have changed in the diff. The hook does not block on their impacts, while ordinary impact and reference output stays available.
+
+Aliases, module transport, re-exports, function values, ambiguous bindings, dynamic namespace access, non-ASCII identifiers, variadic or positional-only signatures, parse failures and incomplete inventories remain unproven. The inventory follows the reference scan's ignore and hidden-file scope; other source languages, links or junctions, read/walk failures, and limits of 512 source files, 2 MiB per file, 8 MiB total, 100,000 AST nodes or walk entries, and depth 128 prevent the proof. Staged review uses the index snapshot. This is a repository-local call proof; external consumers and arbitrary runtime reflection are outside its scope.
+
 ### Python Local Function Definitions and Attribute Writes
 
 Impact analysis can also identify a unique, undecorated function declared directly in the reference file as the owner of a bare use after its declaration. Rebinding, duplicate or conditional definitions, decorators, and the namespace barriers above keep the reference unproven.

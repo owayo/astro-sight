@@ -1309,6 +1309,21 @@ fn closure_or_blocking_decision(
 ) -> SignatureDecision {
     if !public_name_differs
         && moved_from.is_none()
+        && let Some(closed) = super::python_optional_removal::prove_removal(
+            inputs.ref_index,
+            site,
+            sources,
+            &mut caches.python_optional_removal,
+        )
+    {
+        return if closed {
+            SignatureDecision::ClosedInDiff
+        } else {
+            SignatureDecision::Blocking(None)
+        };
+    }
+    if !public_name_differs
+        && moved_from.is_none()
         && caches.function_handoffs.covers(inputs, site, sources)
     {
         return SignatureDecision::ClosedInDiff;

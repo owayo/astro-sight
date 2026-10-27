@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **Python の省略可能引数削除と閉包** — `commands/api_changes/python_optional_removal.rs` は、一意な通常直下関数の省略可能なキーワード専用引数、または末尾の既定値付き位置引数だけの削除を旧新 AST で確認し、変更後の全観測参照が直接呼び出し・宣言・解決済みの別名なし absolute import である場合に `mod_closed` へ分類する (Issue #166)。残存引数の順序・型・既定値・位置/keyword-only 区分とヘッダを保持し、未変更 caller も既存の引数契約照合へ通す。相対/別名/再 export・module 輸送・関数値・同名束縛・動的名前空間・非 ASCII 識別子・decorator・variadic/位置専用引数・解析失敗は証明しない。refs と同じ ignore/hidden 範囲を一度解析し、他言語/未対応ソース・リンク/junction・走査/読取失敗・512ソース/1件2MiB/合計8MiB/100,000ノード・entry/128階層の上限でも保留する。review の staged は index snapshot で照合し、refs/dead-code の出現契約と通常 impact の caller 一覧は維持する。外部利用者・解析範囲外・任意の runtime reflection は証明しない。
+
 - **TS/TSX の named import の別名と閉包** — `commands/api_changes/ref_index/ts_import_alias.rs` は、直接の相対 named import が変更対象の通常関数へ一意に到達するとき、別名の全利用を字句束縛で調べ、内部の閉包義務へ追加する (Issue #163)。元の export 名で引数契約を読み、別名の直接 call にも既存の arity・実変更行・複数行の call 範囲を適用する。内側の別束縛は除外するが、再 export・default/不明な import・型メンバー変更・関数値/typeof/alias/格納・type-only・動的/曖昧な束縛・escape・解析失敗は保留する。名前は ASCII の単純名、caller は2MiB、別名64、全走査100,000ノードに限り、相対解決の候補と root までの config・symlink/junction を監査する。rootDirs/moduleSuffixes/extends/escape・config読取失敗・1MiB/10,000entry/128階層の上限でも保留する。refs/dead-code と通常の出現一覧は変えず、通常/staged・shadow・未更新 caller・輸送・解決障壁を CLI で対照する。
 
   `ts_import_alias/inventory.rs` は同じ走査範囲の JS/TS/TSX を一度ずつ解析し、別ファイルの escaped identifier・namespace/default import・export star・直接 require/import に利用が隠れていないかを追加で確かめる。module 輸送は別の相対ファイルへ一意に到達する場合だけ除外し、対象か不明なら保留する。したがって無関係でも解決不能な default/namespace import があると閉じない。walk error、symlink、動的コード、解析失敗、ソース10,000件/1件2MiB/合計64MiB/100,000ノード/100,000entry の上限も保留する。監査結果は対象の path/name ごとに共有し、識別子種別と文法の実在検査を `js_occurrence` と共有する。ignore・生成物の選択は既存の参照走査にそろえ、解析範囲外の利用や任意の runtime reflection は証明しない。
