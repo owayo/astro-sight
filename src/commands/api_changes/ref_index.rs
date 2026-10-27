@@ -883,13 +883,23 @@ fn classify_reference_owner(
     {
         return ReferenceOwner::Other;
     }
-    // 他ファイルの同名定義がある場合: 変更対象ファイル以外の参照で、lexical scope が
-    // 同一ファイルの function_declaration に束縛されるものは対象 API と無関係な
-    // ローカル呼び出しなので除外する。解決失敗・property 位置・function 以外の
+    // 変更対象ファイル以外の参照で、lexical scope が同一ファイルの関数宣言または
+    // 書換えのない直接関数値に束縛されるものは対象 API と無関係なので除外する。
+    // 変数が refs で定義に分類されない形もあるため、同名定義の数には依存しない。
+    // 解決失敗・property 位置・由来を証明できない
     // binding は OtherOrAmbiguous = 除外せず diff の実変更行の確認に掛かる。
-    if target.has_foreign_defs
-        && !target.python_foreign_defs_updated
+    if !target.python_foreign_defs_updated
         && !target.python_method
+        && input.kind == "function"
+        && !name.contains('.')
+        && matches!(
+            target.target_lang,
+            Some(
+                crate::language::LangId::Javascript
+                    | crate::language::LangId::Typescript
+                    | crate::language::LangId::Tsx
+            )
+        )
         && !diff_path_matches_ref(target_new_path, &r.path, dir)
         && resolve_ref_shadow_binding(dir, r, target.bare, caches)
             == crate::commands::api_changes::js_ts_shadow::LocalResolution::SameFileFunction
