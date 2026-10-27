@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **JS/TS/TSX の正規表現・静的 template の定数値変更** — `commands/api_changes/signature.rs` は公開 const の単純リテラルを専用の `JsConstLiteralKind` で比較し、正規表現同士の pattern/flags 変更を `RegExp`、置換なし template を既存の文字列と同じ種類として `const_value` に分類する (Issue #167)。名前・型注釈・公開指定・binding kind の一致と既存の strict policy を保持し、種類変更・置換・タグ・assertion/satisfies は従来どおり扱う。共有の `ScalarKind` と object/array の葉の判定は変更しない。JS/TS/TSX の実ノードと Query を照合し、通常/staged・strict・単行/複数行・Unicode/CRLF・refs の位置・静的 container の負例を CLI で対照する。
+
 - **Python の省略可能引数削除と閉包** — `commands/api_changes/python_optional_removal.rs` は、一意な通常直下関数の省略可能なキーワード専用引数、または末尾の既定値付き位置引数だけの削除を旧新 AST で確認し、変更後の全観測参照が直接呼び出し・宣言・解決済みの別名なし absolute import である場合に `mod_closed` へ分類する (Issue #166)。残存引数の順序・型・既定値・位置/keyword-only 区分とヘッダを保持し、未変更 caller も既存の引数契約照合へ通す。相対/別名/再 export・module 輸送・関数値・同名束縛・動的名前空間・非 ASCII 識別子・decorator・variadic/位置専用引数・解析失敗は証明しない。refs と同じ ignore/hidden 範囲を一度解析し、他言語/未対応ソース・リンク/junction・走査/読取失敗・512ソース/1件2MiB/合計8MiB/100,000ノード・entry/128階層の上限でも保留する。review の staged は index snapshot で照合し、refs/dead-code の出現契約と通常 impact の caller 一覧は維持する。外部利用者・解析範囲外・任意の runtime reflection は証明しない。
 
 - **TS/TSX の named import の別名と閉包** — `commands/api_changes/ref_index/ts_import_alias.rs` は、直接の相対 named import が変更対象の通常関数へ一意に到達するとき、別名の全利用を字句束縛で調べ、内部の閉包義務へ追加する (Issue #163)。元の export 名で引数契約を読み、別名の直接 call にも既存の arity・実変更行・複数行の call 範囲を適用する。内側の別束縛は除外するが、再 export・default/不明な import・型メンバー変更・関数値/typeof/alias/格納・type-only・動的/曖昧な束縛・escape・解析失敗は保留する。名前は ASCII の単純名、caller は2MiB、別名64、全走査100,000ノードに限り、相対解決の候補と root までの config・symlink/junction を監査する。rootDirs/moduleSuffixes/extends/escape・config読取失敗・1MiB/10,000entry/128階層の上限でも保留する。refs/dead-code と通常の出現一覧は変えず、通常/staged・shadow・未更新 caller・輸送・解決障壁を CLI で対照する。

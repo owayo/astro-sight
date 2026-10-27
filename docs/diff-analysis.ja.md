@@ -342,6 +342,12 @@ astro-sight review --dir . --git \
 
 回復した候補には既存の互換性・引数個数・型メンバー検査を適用する。必須引数を足していない呼出しは、その行を整形していてもblockingに残す。既存の複数定義ガードにより、変数や型の利用箇所を変更してもblockingに残る場合がある。overload・宣言merge・再束縛・分割代入の変数・間接/default export・解析失敗は、この回復の対象外。他言語とrefs/dead-codeの出現契約は変えない。
 
+### JavaScript / TypeScript のリテラル定数値変更
+
+型注釈がなく、それ以外の宣言が不変の公開 `const` では、正規表現リテラル同士の変更も `api_changes.const_value_changes`（hook では `api.const_value`）に分類する。pattern・flags が変わっても種類は `RegExp` として比較する。置換を含まない template は、空の template や escape を含むものも既存の文字列リテラルと同じ種類にし、文字列との相互変更にもこの値変更ポリシーを適用する。JS / TS / TSX と staged review で同じ扱いになる。
+
+既定の hook は情報提供にし、`--strict-public-const-values` 指定時は blocking にする。`g`・`y` などの flags は正規表現の使い方を変えうるため、動作が同じという証明ではない。種類の変更、置換あり・タグ付きの template、assertion、`satisfies` は従来の判定を維持する。宣言ヘッダの検査と、静的 object / array の scalar 葉の判定も変えない。
+
 ### Rust の内部モジュールの定数値変更
 
 Rust の `pub const` / 非 `mut` の `pub static` は、同一パスの通常変更で名前・型・可視性・binding kind が変わらず、初期値だけが変わった場合、既存の `api_changes.const_value_changes`（hook では `api.const_value`）へ分類する。Cargo のbin-only crateやlibraryのprivate moduleにある場合も、外部API面から除く処理より先にこの値変更の情報を保持する。既定のhookでは、この分類だけを理由に未更新参照で停止しない。`--strict-public-const-values` を付けると同じ分類をblockingとして扱う。
