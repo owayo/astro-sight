@@ -39,6 +39,7 @@ mod integration {
     mod js_signature_sites;
     mod kotlin_grammar;
     mod languages;
+    mod local_callable_shadow;
     mod mcp;
     mod moved_compatible_change;
     mod moved_member_signature;

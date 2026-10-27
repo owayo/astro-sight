@@ -5,20 +5,23 @@
 //! 未更新 caller かもしれない」と誤読して closed 判定を諦めていた (def_count != 1 ガード)。
 //!
 //! 本モジュールは参照位置の identifier を AST で解決し、「lexical scope chain を内側から
-//! 外側へ辿った最初の同名 value binding が、同一ファイルの function_declaration である」
+//! 外側へ辿った最初の同名 value binding が、同一ファイルの function_declaration または
+//! 書換えのないローカルの直接関数値である」
 //! 場合に限り `SameFileFunction` を返す。その参照は対象 API と無関係なローカル呼び出しと
 //! みなせるため、closed 判定の対象から除外できる。判定に失敗した参照・property 位置・
-//! function 以外の binding (変数 / parameter / import / class 等) はすべて
+//! 証明できない binding (変数 / parameter / import / class 等) はすべて
 //! `OtherOrAmbiguous` に倒し、除外しない (fail-closed: 誤って closed に倒さない)。
 
 use tree_sitter::Node;
 
 use crate::language::LangId;
 
+mod local_callable;
+
 /// 参照 identifier の束縛解決の結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalResolution {
-    /// 同一ファイル内の `function_declaration` に束縛される (対象 API と無関係な
+    /// 同一ファイル内の関数宣言または安定したローカル関数値に束縛される (対象 API と無関係な
     /// ローカル関数への参照)。
     SameFileFunction,
     /// それ以外 (property 位置 / 変数・parameter・import 等の binding / 未解決 /
@@ -60,6 +63,12 @@ pub(crate) fn resolve_reference_binding(
     // lexical scope chain を内側から外側へ辿り、最初に同名 binding を持つ scope で判定する。
     match resolve_scope_binding(node, source, name, Namespace::Value) {
         Some(ScopeBinding::FunctionDeclaration) => LocalResolution::SameFileFunction,
+        Some(ScopeBinding::Variable(declaration))
+            if !tree.root_node().has_error()
+                && local_callable::is_stable_local_callable(node, declaration, source, name) =>
+        {
+            LocalResolution::SameFileFunction
+        }
         _ => LocalResolution::OtherOrAmbiguous,
     }
 }

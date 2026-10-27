@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **JS/TS のローカル関数値と閉包** — `engine/js_scope/local_callable.rs` は、関数内で直接 arrow/function 式を持つ単純な const/let/var を、初期化後の参照に限って別の関数と証明する (Issue #162)。閉包判定は refs の同名定義数に依存せず字句束縛を調べる。関数全体の再代入・更新式・分割代入・loop 左辺・重複宣言・eval/with・escape・解析失敗・走査上限を保留し、呼出し結果・alias・module 直下の変数は広げない。refs/dead-code と通常の影響の出現契約は維持し、CLI 回帰で TS/TSX の通常・staged と実 caller の対照を確認する。
+
 - **TS/TSX の型引数付き import type** — `vendor/tree-sitter-typescript/common/define-grammar.js` は既存の import 専用 member expression を `generic_type` の `name` に許可する (Issue #160)。`import('./box.js').Box<string>` を型引数ごと型注釈・型 alias・配列・union・戻り型に組み込み、名前部分は従来の `member_expression`、型引数は `type_arguments` として保持する。#33 の type query の conflict と通常の式・JSX は変えず、原文の前処理や診断の抑制はしない。生成は CLI 0.26.6 / ABI 14。回帰は parser の `grammar_regressions_typescript.rs` と CLI の `typescript_grammar.rs` で、TS/TSX・Unicode/CRLF の位置・増分修復・不正入力の診断・後続の宣言と参照を確認する。
 
 - **Python の同名直下関数と属性代入の帰属** — `engine/impact/python_imports.rs` は、参照側ファイルの再束縛のない一意な通常直下関数を、その宣言後の裸の参照の所有元として証明する (Issue #158)。既存の相対 import の障壁を共有し、decorator・重複・条件付き定義・global/nonlocal・star import・動的な名前空間操作・解析失敗は保留する。`declaration.rs` が旧新とも通常直下関数と証明した modified に限り、collector は属性への単純代入の左辺を caller から外す。属性呼び出し・関数値の読み出し・複合代入・右辺の実参照・method/property の変更はこの証拠で落とさない。参照を作業ツリーから読む context/impact の staged では新しい2種の証拠を適用せず、review の staged は index のスナップショット内で適用できる。型stubと既存の相対 import の方針、refs/dead-code の出現契約は維持する。回帰は `tests/integration/impact_python_bindings.rs` の通常/staged・実caller・曖昧な束縛・属性書込みと読出しの対照。
