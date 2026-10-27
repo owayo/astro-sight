@@ -68,9 +68,17 @@ JS / TS / TSX のトップレベル関数について、別ファイルの同名
 
 引数は単純な識別子か、object pattern 直下の shorthand に限る。同じ関数内の入れ子の closure も含め、すべての同名の用途を調べる。括弧を除き、三項演算子や `if`・`while`・`do`・`for` の条件、または前置 `!` の対象だけなら除外できる。呼び出し・値の受け渡し・返却・代入・同名の再宣言・型への言及が一つでもあれば、引数全体を未証明のまま残す。default・rest・名前を変える分割代入・constructor parameter property も対象外である。`arguments` を参照する関数も、引数への別経路を否定できないため対象外とする。
 
-解析エラー、`with`、`eval` の手掛かり、ambient 宣言、宣言ファイルではこの証拠を使わない。識別子系のいずれかの AST kind に Unicode escape があれば、名前の同一性を推測せず保留する。API の降格には、対象関数の実呼び出しを一つ以上確認する必要がある。同じ差分で引数の個数と変更行が追随していることも確かめる。別名 import などの既存の停止条件は維持する。単一・バッチの `refs` と dead-code の件数は変えない。
+解析エラー、`with`、`eval` の手掛かり、ambient 宣言、宣言ファイルではこの証拠を使わない。識別子系のいずれかの AST kind に Unicode escape があれば、名前の同一性を推測せず保留する。API の降格には、対象関数の実呼び出しを一つ以上確認する必要がある。同じ差分で引数の個数と変更行が追随していることも確かめる。別名 import は後述の独立した証拠で判定する。単一・バッチの `refs` と dead-code の件数は変えない。
 
 `context` と `impact` も、この証拠を持つ別ファイルの参照を `low_confidence_callers` に分ける。対象は旧新とも一意な直接関数宣言で、変更された宣言自身がトップレベル関数だと確認できるシグネチャ変更に限る。同名の変更対象にメソッドや別種の宣言が混ざれば適用しない。削除・追加・宣言種別の変更、import の位置も対象外とする。確信度フィルタを無効にした場合は使わない。直接の `impact --staged` や、review の staged snapshot を作れなかった場合も適用しない。`review --staged` が index 全体の snapshot を使う場合は、その中の参照だけで判定する。
+
+### TypeScript の named import の別名
+
+TS/TSX の一意な通常直下関数では、直接の相対 `import { total as sum } from './pricing'` を通した呼び出しも `api.mod_closed` に数えられる。解決先は変更した宣言ファイル1つに限り、競合する候補があれば証明しない。別名の全利用が同じ import に束縛される直接 call であることを求める。内側で同名の引数やローカルを宣言した利用は別束縛として除く。元の名前と別名の両方について、変更後の引数数と既存の実変更行の条件を照合する。複数行の call も扱い、`review --staged` は完全な index snapshot の中の証拠だけを使う。
+
+再 export、type-only import、関数値の持ち出し、`typeof`、値をさらに別名へ束縛する形、未対応の call、不確定な解決は blocking に残す。さらに同じ範囲の JS/TS/TSX を監査し、元名の索引に現れない escaped identifier と module object 経由の輸送を確かめる。namespace/default import、export star、直接の require・動的 import は、別の相対ファイルへ一意に到達する場合だけ許す。無関係でも解決不能な輸送があれば閉じない。rootDirs/moduleSuffixes/extends、config の escape、読取・解析失敗、リンク、動的コードの手掛かりでも保留する。名前は ASCII の単純な識別子に限り、型メンバー変更の義務は従来の方針を維持する。
+
+inventory はソース10,000件・1件2MiB・合計64MiB・100,000 ASTノード・100,000 walk entry に限る。別名参照の走査には別途、別名64件と100,000ノードの上限がある。config は1件1MiB、ディレクトリ10,000 entry、祖先128階層まで調べ、上限を超えれば blocking に残す。ファイルの選択は既存の ignore・生成物の方針に従い、外部利用者や任意の runtime reflection は証明しない。`refs`・dead-code の件数と通常の出現一覧は変えない。
 
 ### TypeScript の関数値の受け渡し
 

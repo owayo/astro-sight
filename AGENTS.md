@@ -4,6 +4,10 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **TS/TSX の named import の別名と閉包** — `commands/api_changes/ref_index/ts_import_alias.rs` は、直接の相対 named import が変更対象の通常関数へ一意に到達するとき、別名の全利用を字句束縛で調べ、内部の閉包義務へ追加する (Issue #163)。元の export 名で引数契約を読み、別名の直接 call にも既存の arity・実変更行・複数行の call 範囲を適用する。内側の別束縛は除外するが、再 export・default/不明な import・型メンバー変更・関数値/typeof/alias/格納・type-only・動的/曖昧な束縛・escape・解析失敗は保留する。名前は ASCII の単純名、caller は2MiB、別名64、全走査100,000ノードに限り、相対解決の候補と root までの config・symlink/junction を監査する。rootDirs/moduleSuffixes/extends/escape・config読取失敗・1MiB/10,000entry/128階層の上限でも保留する。refs/dead-code と通常の出現一覧は変えず、通常/staged・shadow・未更新 caller・輸送・解決障壁を CLI で対照する。
+
+  `ts_import_alias/inventory.rs` は同じ走査範囲の JS/TS/TSX を一度ずつ解析し、別ファイルの escaped identifier・namespace/default import・export star・直接 require/import に利用が隠れていないかを追加で確かめる。module 輸送は別の相対ファイルへ一意に到達する場合だけ除外し、対象か不明なら保留する。したがって無関係でも解決不能な default/namespace import があると閉じない。walk error、symlink、動的コード、解析失敗、ソース10,000件/1件2MiB/合計64MiB/100,000ノード/100,000entry の上限も保留する。監査結果は対象の path/name ごとに共有し、識別子種別と文法の実在検査を `js_occurrence` と共有する。ignore・生成物の選択は既存の参照走査にそろえ、解析範囲外の利用や任意の runtime reflection は証明しない。
+
 - **JS/TS のローカル関数値と閉包** — `engine/js_scope/local_callable.rs` は、関数内で直接 arrow/function 式を持つ単純な const/let/var を、初期化後の参照に限って別の関数と証明する (Issue #162)。閉包判定は refs の同名定義数に依存せず字句束縛を調べる。関数全体の再代入・更新式・分割代入・loop 左辺・重複宣言・eval/with・escape・解析失敗・走査上限を保留し、呼出し結果・alias・module 直下の変数は広げない。refs/dead-code と通常の影響の出現契約は維持し、CLI 回帰で TS/TSX の通常・staged と実 caller の対照を確認する。
 
 - **TS/TSX の型引数付き import type** — `vendor/tree-sitter-typescript/common/define-grammar.js` は既存の import 専用 member expression を `generic_type` の `name` に許可する (Issue #160)。`import('./box.js').Box<string>` を型引数ごと型注釈・型 alias・配列・union・戻り型に組み込み、名前部分は従来の `member_expression`、型引数は `type_arguments` として保持する。#33 の type query の conflict と通常の式・JSX は変えず、原文の前処理や診断の抑制はしない。生成は CLI 0.26.6 / ABI 14。回帰は parser の `grammar_regressions_typescript.rs` と CLI の `typescript_grammar.rs` で、TS/TSX・Unicode/CRLF の位置・増分修復・不正入力の診断・後続の宣言と参照を確認する。
