@@ -40,6 +40,7 @@ mod integration {
     mod kotlin_grammar;
     mod languages;
     mod literal_const_values;
+    mod literal_union_removal;
     mod local_callable_shadow;
     mod mcp;
     mod moved_compatible_change;
