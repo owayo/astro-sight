@@ -44,35 +44,12 @@ pub(crate) fn classify_required_member_addition(
     else {
         return RequiredMemberChange::NotApplicable;
     };
-    let range = |outer: Node<'_>, source: &[u8], start: usize, end: usize| {
-        normalized_range(outer, source, start, end)
-    };
-    let header_same = range(
-        old_outer,
-        &src.old,
-        old_outer.start_byte(),
-        old_body.start_byte(),
-    )
-    .zip(range(
-        new_outer,
-        &src.new,
-        new_outer.start_byte(),
-        new_body.start_byte(),
-    ))
-    .is_some_and(|(old, new)| old == new);
-    let footer_same = range(
-        old_outer,
-        &src.old,
-        old_body.end_byte(),
-        old_outer.end_byte(),
-    )
-    .zip(range(
-        new_outer,
-        &src.new,
-        new_body.end_byte(),
-        new_outer.end_byte(),
-    ))
-    .is_some_and(|(old, new)| old == new);
+    let header_same = normalized_prefix(old_outer, old_body, &src.old)
+        .zip(normalized_prefix(new_outer, new_body, &src.new))
+        .is_some_and(|(old, new)| old == new);
+    let footer_same = normalized_suffix(old_outer, old_body, &src.old)
+        .zip(normalized_suffix(new_outer, new_body, &src.new))
+        .is_some_and(|(old, new)| old == new);
     if !header_same || !footer_same {
         return RequiredMemberChange::NotApplicable;
     }

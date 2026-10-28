@@ -25,8 +25,8 @@ pub(crate) fn classify_member_property_removal(
         unique_type_declaration(old_tree.root_node(), site.name, &src.old),
         unique_type_declaration(new_tree.root_node(), site.name, &src.new),
     ) else {
-        return if narrowing::root_has_object_type(old_tree.root_node(), site.name, &src.old)
-            || narrowing::root_has_object_type(new_tree.root_node(), site.name, &src.new)
+        return if root_has_object_type(old_tree.root_node(), site.name, &src.old)
+            || root_has_object_type(new_tree.root_node(), site.name, &src.new)
         {
             RequiredMemberChange::Unsupported
         } else {
@@ -67,28 +67,10 @@ pub(crate) fn classify_member_property_removal(
         || old_decl.kind() != new_decl.kind()
         || old_decl.child_by_field_name("type_parameters").is_some()
         || new_decl.child_by_field_name("type_parameters").is_some()
-        || normalized_range(
-            old_outer,
-            &src.old,
-            old_outer.start_byte(),
-            old_body.start_byte(),
-        ) != normalized_range(
-            new_outer,
-            &src.new,
-            new_outer.start_byte(),
-            new_body.start_byte(),
-        )
-        || normalized_range(
-            old_outer,
-            &src.old,
-            old_body.end_byte(),
-            old_outer.end_byte(),
-        ) != normalized_range(
-            new_outer,
-            &src.new,
-            new_body.end_byte(),
-            new_outer.end_byte(),
-        )
+        || normalized_prefix(old_outer, old_body, &src.old)
+            != normalized_prefix(new_outer, new_body, &src.new)
+        || normalized_suffix(old_outer, old_body, &src.old)
+            != normalized_suffix(new_outer, new_body, &src.new)
         || new
             .iter()
             .any(|(signature, _)| !old.iter().any(|(previous, _)| previous == signature))

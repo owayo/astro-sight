@@ -74,28 +74,10 @@ pub(crate) fn classify_member_type_narrowing(
         || old.len() != new.len()
         || old_decl.child_by_field_name("type_parameters").is_some()
         || new_decl.child_by_field_name("type_parameters").is_some()
-        || normalized_range(
-            old_outer,
-            &src.old,
-            old_outer.start_byte(),
-            old_body.start_byte(),
-        ) != normalized_range(
-            new_outer,
-            &src.new,
-            new_outer.start_byte(),
-            new_body.start_byte(),
-        )
-        || normalized_range(
-            old_outer,
-            &src.old,
-            old_body.end_byte(),
-            old_outer.end_byte(),
-        ) != normalized_range(
-            new_outer,
-            &src.new,
-            new_body.end_byte(),
-            new_outer.end_byte(),
-        )
+        || normalized_prefix(old_outer, old_body, &src.old)
+            != normalized_prefix(new_outer, new_body, &src.new)
+        || normalized_suffix(old_outer, old_body, &src.old)
+            != normalized_suffix(new_outer, new_body, &src.new)
         || crate::engine::tree_walk::any_node(
             new_decl,
             crate::engine::tree_walk::Children::Named,
@@ -159,27 +141,11 @@ pub(crate) fn classify_member_type_narrowing(
         ) else {
             return RequiredMemberChange::Unsupported;
         };
-        if normalized_range(
-            *old_member,
-            &src.old,
-            old_member.start_byte(),
-            old_annotation.start_byte(),
-        ) != normalized_range(
-            member,
-            &src.new,
-            member.start_byte(),
-            new_annotation.start_byte(),
-        ) || normalized_range(
-            *old_member,
-            &src.old,
-            old_annotation.end_byte(),
-            old_member.end_byte(),
-        ) != normalized_range(
-            member,
-            &src.new,
-            new_annotation.end_byte(),
-            member.end_byte(),
-        ) {
+        if normalized_prefix(*old_member, old_annotation, &src.old)
+            != normalized_prefix(member, new_annotation, &src.new)
+            || normalized_suffix(*old_member, old_annotation, &src.old)
+                != normalized_suffix(member, new_annotation, &src.new)
+        {
             return RequiredMemberChange::Unsupported;
         }
         let (Some(before), Some(after)) = (
@@ -205,22 +171,4 @@ pub(crate) fn classify_member_type_narrowing(
             mode: crate::commands::api_changes::ts_required_members::MemberChangeMode::Narrowing,
         })
     }
-}
-
-pub(super) fn root_has_object_type(root: Node<'_>, name: &str, source: &[u8]) -> bool {
-    let mut cursor = root.walk();
-    root.named_children(&mut cursor).any(|statement| {
-        let declaration = if statement.kind() == "export_statement" {
-            statement.child_by_field_name("declaration")
-        } else {
-            Some(statement)
-        };
-        declaration.is_some_and(|node| {
-            matches!(
-                node.kind(),
-                "interface_declaration" | "type_alias_declaration"
-            ) && super::super::super::node_field_name_eq(node, name, source)
-                && type_member_body(node).is_some()
-        })
-    })
 }

@@ -46,9 +46,8 @@ pub(crate) fn declaration_signature(
                 ));
             }
             if let Some(body) = type_member_body(node) {
-                let header =
-                    normalized_range(outer, source, outer.start_byte(), body.start_byte())?;
-                let footer = normalized_range(outer, source, body.end_byte(), outer.end_byte())?;
+                let header = normalized_prefix(outer, body, source)?;
+                let footer = normalized_suffix(outer, body, source)?;
                 let members = normalized_members(body, source)?;
                 return Some(format!(
                     "{header} {{ {} }} {footer}",
@@ -82,27 +81,11 @@ pub(crate) fn detect_type_members_compatible_mod(
     }
     let old_body = type_member_body(old_decl)?;
     let new_body = type_member_body(new_decl)?;
-    if normalized_range(
-        old_outer,
-        &src.old,
-        old_outer.start_byte(),
-        old_body.start_byte(),
-    )? != normalized_range(
-        new_outer,
-        &src.new,
-        new_outer.start_byte(),
-        new_body.start_byte(),
-    )? || normalized_range(
-        old_outer,
-        &src.old,
-        old_body.end_byte(),
-        old_outer.end_byte(),
-    )? != normalized_range(
-        new_outer,
-        &src.new,
-        new_body.end_byte(),
-        new_outer.end_byte(),
-    )? {
+    if normalized_prefix(old_outer, old_body, &src.old)?
+        != normalized_prefix(new_outer, new_body, &src.new)?
+        || normalized_suffix(old_outer, old_body, &src.old)?
+            != normalized_suffix(new_outer, new_body, &src.new)?
+    {
         return None;
     }
     let old_members = normalized_members(old_body, &src.old)?;
@@ -148,6 +131,25 @@ fn unique_type_declaration<'a>(
     Some((decl, outer))
 }
 
+/// 一意な宣言を証明できない場合も、直下の同名 object 型の存在は別途確かめる。
+fn root_has_object_type(root: Node<'_>, name: &str, source: &[u8]) -> bool {
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor).any(|statement| {
+        let declaration = if statement.kind() == "export_statement" {
+            statement.child_by_field_name("declaration")
+        } else {
+            Some(statement)
+        };
+        declaration.is_some_and(|node| {
+            matches!(
+                node.kind(),
+                "interface_declaration" | "type_alias_declaration"
+            ) && node_field_name_eq(node, name, source)
+                && type_member_body(node).is_some()
+        })
+    })
+}
+
 fn type_member_body(decl: Node<'_>) -> Option<Node<'_>> {
     match decl.kind() {
         "type_alias_declaration" => decl
@@ -156,6 +158,16 @@ fn type_member_body(decl: Node<'_>) -> Option<Node<'_>> {
         "interface_declaration" => decl.child_by_field_name("body"),
         _ => None,
     }
+}
+
+/// 内側のノードより前のトークン列。読取り失敗の扱いは各分類器に委ねる。
+fn normalized_prefix(outer: Node<'_>, inner: Node<'_>, source: &[u8]) -> Option<String> {
+    normalized_range(outer, source, outer.start_byte(), inner.start_byte())
+}
+
+/// 内側のノードより後のトークン列。読取り失敗の扱いは各分類器に委ねる。
+fn normalized_suffix(outer: Node<'_>, inner: Node<'_>, source: &[u8]) -> Option<String> {
+    normalized_range(outer, source, inner.end_byte(), outer.end_byte())
 }
 
 fn normalized_range(node: Node<'_>, source: &[u8], start: usize, end: usize) -> Option<String> {
