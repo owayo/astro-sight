@@ -156,6 +156,22 @@ export した TS / TSX の interface か object 型の type alias へ、必須�
 
 別の走査で、削除名がプロパティ/メンバー名、objectや分割代入のキー、文字列の添字、文字列literal型に残っていないことを求める。`Pick<Row, "extra">`・`Row["extra"]`も含み、無関係なobjectや型の同名キーでもblockingに残す。通常の文字列値やコメントはキーとしないが、型を供給するJSのJSDocは保留する。生の削除名が無くてもescapeを含むファイルを解析し、escapeで書いた識別子やキーは証明しない。削除名かescapeを含む未解析の埋め込みソース、読取失敗、関係する解析失敗、keyof Row、typeof・別名や隠れたimport/exportも保留する。stagedはindex snapshotを使う。この限定検査は一般の推論・外部コード・reflectionを追わず、refs/dead-codeの出現契約も変えない。
 
+### TypeScript の文字列 union の要素削除
+
+ファイル直下で直接 export した、文字列 literal だけの type alias から要素を削除した変更も、観測した値の流れを証明できれば `api.mod_closed` にする。宣言ヘッダと残る要素の順序・表記を保持し、重複・escape・型引数・別名の展開・追加との混在は扱わない。対象と判断した形を証明できないときは、参照行が変更されていても blocking に残す。削除のない追加・並べ替えと、旧側が純粋な文字列型でない変更は既存の判定に返す。旧文字列要素が失われて `string` 等の一般型になる変更も、この証明では保留する。同一パス・同名の候補だけを扱い、rename は既存判定に任せる。旧入力の上限超過や ERROR に包まれた alias など、旧宣言そのものを認識できない場合も、この追加証明は適用しない。
+
+型の参照は、直下の `const X: Record<Mode, primitive>`、`const X: Mode[]` / `readonly Mode[]`、明示した primitive/void 戻り型を持つ通常関数の必須 `Mode` 引数に限る。primitive は `string`・`number`・`boolean`・`bigint` の keyword とし、戻り型だけ `void` も扱う。ほかの引数も型付きの必須 primitive 引数に限り、optional・既定値・rest・分割代入・generic は扱わない。Record のキーは残る集合と一致し、配列の要素は残る文字列 literal だけとする。直接の相対 named import は別名なしで一意に対象へ到達する場合だけ扱う。同名の別型は束縛で区別し、解析や所属が不明なら保留する。許可した受け口と値の実利用が少なくとも1件必要で、無参照・型位置だけの利用では閉じない。
+
+配列は単一引数の inline arrow による `.filter(...)` の連鎖と終端 `.map(...)` に限る。filter は既知の boolean consumer 呼出しか残る literal との比較、map はこの比較・既知の primitive consumer 呼出し・Record の添字読出しのいずれかを証明する。consumer 引数と添字へ入る値は、残る文字列 literal、証明済み consumer 引数、配列 callback 引数だけ。Mode の値の利用も、その呼出し・添字・既知 literal との比較・switch の判別に限る。別名・持出し・書込み・typeof/keyof・再 export・未知の引数・assertion・optional/spread/type-argument/thisArg は保留する。
+
+補助の残存走査では、削除文字列と同じ cooked 値の string・静的 template・型 literal・property key を調べる。無関係な同一値も blocking とし、部分一致や無関係な置換付き template は妨げない。通常の JS escape と Unicode escape を解釈する。削除値が数値としても読める場合は生の名前の事前フィルタを使わず、数値・computed の静的キーを保留する。JavaScript の数値から文字列への変換は再実装しない。対象の名前や削除値を含む JSDoc・埋め込みソース・JSON も監査する。ignore・hidden・生成物の扱いは既存の参照走査にそろえる。この削除候補を認めた後の読取・解析・走査失敗、ソースを隠し得るリンク、走査上限では保留する。上限は100,000 entry・10,000ファイル・1件2MiB・合計64MiB・解析512ファイル・100,000 ASTノード。解析数とノード数は同一の API 変更検出全体で共有する。
+
+相対 import の解決前には、caller の論理上・実体上の祖先をファイルシステムの root まで監査する。ignore に関係なく tsconfig / jsconfig の解決設定を読み、不明な設定・project references・読取失敗は保留する。directory import の先に package.json がある場合も保留する。候補列挙より先に解決され得る別ソースも監査する。明示した宣言ファイルより優先される実装ソースや、古い解決方式の JS suffix に付く宣言・directory entry も含む。config の entry・読取量・深さにも共有上限を設ける。祖先でない config をコマンドラインで指定した場合や、外部 bundler 独自の platform suffix などの解決規則は証明対象外とする。
+
+`createRequire`・member の `require`・`require.context`・`import.meta.glob` 等の既知loaderも保留する。JSX の HTML entity は補助走査で復元せず、対象型の JSX 利用は未対応として保留する。生成物として選択から外れたソースや、任意の loader 別名・動的な名前合成は証明対象に含めない。
+
+保証は観測範囲内の限定した静的な流れまで。外部利用者・runtime データ・reflection は証明しない。Record 定数の `const_value` と strict const の方針、standalone impact・refs・dead-code の出現契約は変えない。
+
 ### Rust の引数パターン
 
 Rust の型付き通常引数では、名前や分解パターンだけを変えても呼び出し方は変わりません。`fn double(_n: i32)` → `fn double(n: i32)` や、同じタプル型の分解パターンの名前変更は、新旧の宣言と import 環境を確認できれば `api.mod` と関数シグネチャの影響から外します。本体を同時に変更した場合も対象です。表示用のシグネチャには引数名を残します。

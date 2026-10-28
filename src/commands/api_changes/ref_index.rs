@@ -1507,6 +1507,7 @@ fn closed_via_local_const_argument(
 /// unique file 単位の F 回に圧縮する。
 #[derive(Default)]
 pub(crate) struct ApiClosureCaches {
+    pub(super) literal_union_removal: super::ts_literal_union_removal::RemovalCache,
     pub(super) function_handoffs: super::ts_function_values::HandoffCache,
     /// Rust の参照側 AST に ERROR / MISSING がないか、ファイルごとに一度だけ確認する。
     rust_clean_files: std::collections::HashMap<String, bool>,

@@ -743,6 +743,7 @@ mod source_pair;
 
 mod ts_const_arg;
 mod ts_function_values;
+mod ts_literal_union_removal;
 mod ts_namespace;
 
 mod ts_required_members;
