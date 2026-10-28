@@ -35,6 +35,7 @@
 //! 公開や import・クラスのメンバー) と、埋め込みソース・JS 系ファイルのコメント (JSDoc) への
 //! 出現は証明しない。
 
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::path::Path;
@@ -54,6 +55,7 @@ use super::ref_index::{
     ref_import_role, ref_is_pass_through_reexport, ref_name_node,
 };
 
+pub(crate) mod invariant_members;
 mod local_producers;
 mod narrowed_uses;
 mod removed_uses;
@@ -119,7 +121,19 @@ pub(crate) struct RequiredMemberDelta {
 pub(crate) enum MemberChangeMode {
     Addition,
     Narrowing,
-    Removal(Vec<String>),
+    Removal(RemovedMembers),
+}
+
+pub(crate) struct RemovedMembers {
+    pub(crate) names: Vec<String>,
+    /// 非 scalar の残存メンバーでは、値の型照合に代えて旧新の不変性を証明する。
+    pub(crate) invariant_properties: Option<Vec<RetainedProperty>>,
+    pub(crate) builtin_names: BTreeSet<&'static str>,
+}
+
+pub(crate) struct RetainedProperty {
+    pub(crate) name: String,
+    pub(crate) required: bool,
 }
 
 impl RequiredMemberDelta {
@@ -129,7 +143,7 @@ impl RequiredMemberDelta {
 
     fn removed_names(&self) -> &[String] {
         match &self.mode {
-            MemberChangeMode::Removal(names) => names,
+            MemberChangeMode::Removal(removed) => &removed.names,
             _ => &[],
         }
     }
@@ -295,6 +309,8 @@ pub(super) fn prove_closure(
         consumers: Vec::new(),
         typeof_names: BTreeMap::new(),
         narrowed_paths: BTreeSet::new(),
+        invariant_files: RefCell::new(HashMap::new()),
+        invariant_builtins: OnceCell::new(),
         sites: 0,
     };
     for r in refs {
@@ -363,6 +379,9 @@ struct Prover<'s, 'a> {
     /// 入れた外側の束縛)。値は、その名前が値を入れた入れ物 (`box`・`list`) か。
     typeof_names: BTreeMap<String, bool>,
     narrowed_paths: BTreeSet<String>,
+    /// この型の旧新不変証明を producer ファイルごとに共有する。
+    invariant_files: RefCell<HashMap<String, Option<Vec<invariant_members::ObjectRange>>>>,
+    invariant_builtins: OnceCell<bool>,
     /// 証明した値を作る箇所・受け取る箇所の数。
     sites: usize,
 }
@@ -931,6 +950,11 @@ impl Prover<'_, '_> {
         caches: &mut ApiClosureCaches,
     ) -> bool {
         let source: &[u8] = &parsed.source;
+        if let MemberChangeMode::Removal(removed) = &self.delta.mode
+            && let Some(properties) = &removed.invariant_properties
+        {
+            return self.prove_invariant_object(object, parsed, path, properties, caches);
+        }
         if matches!(self.delta.mode, MemberChangeMode::Addition) {
             let mut cursor = object.walk();
             if object
@@ -973,7 +997,14 @@ impl Prover<'_, '_> {
                     if key.kind() == "computed_property_name" || escaped(key) {
                         return false;
                     }
-                    if let Some(key) = super::object_key_text(key, source)
+                    let key = super::object_key_text(key, source);
+                    if key
+                        .as_ref()
+                        .is_some_and(|key| self.delta.removed_names().contains(key))
+                    {
+                        return false;
+                    }
+                    if let Some(key) = key
                         && let Some(name) = names.get(key.as_str())
                     {
                         found
@@ -983,7 +1014,14 @@ impl Prover<'_, '_> {
                     }
                 }
                 "shorthand_property_identifier" => {
-                    if escaped(member) {
+                    if escaped(member)
+                        || member.utf8_text(source).is_ok_and(|name| {
+                            self.delta
+                                .removed_names()
+                                .iter()
+                                .any(|removed| removed == name)
+                        })
+                    {
                         return false;
                     }
                     if let Some(name) = member

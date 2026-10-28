@@ -2,7 +2,9 @@
 
 use super::*;
 use crate::commands::api_changes::ts_required_members::{
-    MemberChangeMode, RequiredMemberChange, RequiredMemberDelta, simple_type,
+    MemberChangeMode, RemovedMembers, RequiredMemberChange, RequiredMemberDelta, RetainedProperty,
+    invariant_members::{property_builtin_names, supported_property_type},
+    simple_type,
 };
 
 pub(crate) fn classify_member_property_removal(
@@ -77,9 +79,20 @@ pub(crate) fn classify_member_property_removal(
     {
         return RequiredMemberChange::Unsupported;
     }
-    for (decl, members, source) in [
-        (old_decl, &old, src.old.as_slice()),
-        (new_decl, &new, src.new.as_ref()),
+    // 削除する側の非 scalar 型は、この拡張では引き受けない。
+    if removed.iter().any(|(_, member)| {
+        member
+            .child_by_field_name("type")
+            .and_then(|annotation| simple_annotation_type(annotation, &src.old))
+            .is_none_or(|ty| !ty.iter().all(is_scalar_atom))
+    }) {
+        return RequiredMemberChange::Unsupported;
+    }
+    let mut invariant = false;
+    let mut builtin_names = std::collections::BTreeSet::new();
+    for (decl, members, source, is_new) in [
+        (old_decl, &old, src.old.as_slice(), false),
+        (new_decl, &new, src.new.as_ref(), true),
     ] {
         let mut names = HashSet::new();
         if crate::engine::tree_walk::any_node(
@@ -105,14 +118,40 @@ pub(crate) fn classify_member_property_removal(
             if member.kind() != "property_signature"
                 || name.contains('\\')
                 || !names.insert(name)
-                || !scalar
+                || member
+                    .child_by_field_name("type")
+                    .is_none_or(|annotation| !supported_property_type(annotation, source))
             {
                 return RequiredMemberChange::Unsupported;
             }
+            if is_new {
+                invariant |= !scalar;
+                if let Some(annotation) = member.child_by_field_name("type") {
+                    builtin_names.extend(property_builtin_names(annotation, source));
+                }
+            }
         }
     }
+    let invariant_properties = if invariant {
+        let properties = new
+            .iter()
+            .map(|(_, member)| {
+                Some(RetainedProperty {
+                    name: member_name(*member, &src.new).flatten()?,
+                    required: !ts_property_signature_is_optional(*member),
+                })
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(properties) = properties else {
+            return RequiredMemberChange::Unsupported;
+        };
+        Some(properties)
+    } else {
+        None
+    };
     let retained = new
         .iter()
+        .filter(|_| !invariant)
         .filter(|(_, member)| !ts_property_signature_is_optional(*member))
         .map(|(_, member)| {
             let name = member_name(*member, &src.new).flatten()?;
@@ -134,11 +173,13 @@ pub(crate) fn classify_member_property_removal(
     };
     RequiredMemberChange::Supported(RequiredMemberDelta {
         added: retained,
-        mode: MemberChangeMode::Removal(
-            removed
+        mode: MemberChangeMode::Removal(RemovedMembers {
+            names: removed
                 .iter()
                 .filter_map(|(_, member)| member_name(*member, &src.old).flatten())
                 .collect(),
-        ),
+            invariant_properties,
+            builtin_names,
+        }),
     })
 }
