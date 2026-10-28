@@ -86,6 +86,20 @@ impl Prover<'_, '_> {
             return false;
         };
         if !is_top_level_declaration(function)
+            || (self.scalar_removal()
+                && (!shape.array
+                    || function
+                        .child_by_field_name("name")
+                        .and_then(|name| name.utf8_text(source).ok())
+                        .is_none_or(|name| {
+                            super::super::ts_const_arg::collect_bindings_named(
+                                parsed.tree.root_node(),
+                                source,
+                                name,
+                            )
+                            .len()
+                                != 1
+                        })))
             || has_token(function, "*")
             || has_token(function, "async") != shape.promise
             || function.child_by_field_name("type_parameters").is_some()
@@ -134,6 +148,15 @@ impl Prover<'_, '_> {
             || !self.register_producer(function, parsed)
         {
             return false;
+        }
+        if self.scalar_removal() {
+            self.wrapped_producers
+                .push(super::row_array_map::WrappedProducer {
+                    path: path.to_string(),
+                    start: function.start_byte(),
+                    end: function.end_byte(),
+                    promise: shape.promise,
+                });
         }
         self.sites += 1;
         true
@@ -197,6 +220,9 @@ impl Prover<'_, '_> {
         let Some(call) = unwrap_parens(value) else {
             return false;
         };
+        if self.scalar_removal() && !super::row_array_map::ordinary_call(call) {
+            return false;
+        }
         let Some((receiver, callback)) = map_parts(call, &parsed.source) else {
             return false;
         };
@@ -206,6 +232,9 @@ impl Prover<'_, '_> {
         let Some(body) = callback.child_by_field_name("body") else {
             return false;
         };
+        if self.scalar_removal() && unwrap_parens(body).is_none_or(|body| body.kind() != "object") {
+            return false;
+        }
         if body.kind() != "statement_block" {
             return self.prove_value(body, parsed, path, diff_files, caches);
         }
@@ -269,6 +298,29 @@ impl Prover<'_, '_> {
             return None;
         }
         Some(elements)
+    }
+
+    pub(super) fn removal_map_parameter_is_known(
+        &self,
+        scope: Node<'_>,
+        name: &str,
+        parsed: &ParsedRefFile,
+    ) -> bool {
+        if !self.scalar_removal() || scope.kind() != "arrow_function" {
+            return false;
+        }
+        let Some(call) = scope.parent().and_then(|arguments| arguments.parent()) else {
+            return false;
+        };
+        let Some((receiver, callback)) = map_parts(call, &parsed.source) else {
+            return false;
+        };
+        callback.start_byte() == scope.start_byte()
+            && callback.end_byte() == scope.end_byte()
+            && unwrap_parens(receiver).is_some_and(|receiver| receiver.kind() == "identifier")
+            && self
+                .map_parameter_type(scope, name, parsed)
+                .is_some_and(|ty| super::narrowed_uses::known_type(&ty))
     }
 
     pub(super) fn map_parameter_type(

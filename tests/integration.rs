@@ -47,6 +47,7 @@ mod integration {
     mod optional_param_removal;
     mod output_format;
     mod php_member_liveness;
+    mod property_removal_arrays;
     mod python_member_removal;
     mod python_optional_removal;
     mod python_private_owner_removal;

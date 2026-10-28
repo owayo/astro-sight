@@ -58,6 +58,9 @@ impl Prover<'_, '_> {
                     })
             }
             Some((scope, ScopeBinding::Other)) => {
+                if self.removal_map_parameter_is_known(scope, name, parsed) {
+                    return true;
+                }
                 let Some(param) = parameter_named(scope, &parsed.source, name) else {
                     return false;
                 };
@@ -109,9 +112,11 @@ impl Prover<'_, '_> {
                     continue;
                 }
                 if let Some(call) = direct_call(node) {
-                    if !self.call_returns_target(call, &parsed, &r.path, caches)
-                        || !self.narrowed_root_use(call, &parsed, &r.path, caches)
-                    {
+                    if self.call_returns_target(call, &parsed, &r.path, caches) {
+                        if !self.narrowed_root_use(call, &parsed, &r.path, caches) {
+                            return false;
+                        }
+                    } else if !self.wrapped_call_is_consumed(call, &parsed, &r.path, caches) {
                         return false;
                     }
                 } else if !self.identifier_has_target_type(node, &parsed, &r.path, caches) {
