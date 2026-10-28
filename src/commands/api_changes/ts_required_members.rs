@@ -60,6 +60,7 @@ mod local_producers;
 mod narrowed_uses;
 mod removed_uses;
 mod return_producers;
+mod row_array_map;
 mod spread_copy;
 
 /// 配列型の入れ子 (`string[][]`) と式の配列 literal の入れ子をたどる上限。
@@ -311,6 +312,7 @@ pub(super) fn prove_closure(
         narrowed_paths: BTreeSet::new(),
         invariant_files: RefCell::new(HashMap::new()),
         invariant_builtins: OnceCell::new(),
+        wrapped_producers: Vec::new(),
         sites: 0,
     };
     for r in refs {
@@ -382,6 +384,7 @@ struct Prover<'s, 'a> {
     /// この型の旧新不変証明を producer ファイルごとに共有する。
     invariant_files: RefCell<HashMap<String, Option<Vec<invariant_members::ObjectRange>>>>,
     invariant_builtins: OnceCell<bool>,
+    wrapped_producers: Vec<row_array_map::WrappedProducer>,
     /// 証明した値を作る箇所・受け取る箇所の数。
     sites: usize,
 }
@@ -516,7 +519,7 @@ impl Prover<'_, '_> {
             .and_then(only_named_child)
             .is_none_or(|ty| ty.kind() != "type_identifier")
         {
-            if self.delta.audits_uses() {
+            if self.delta.audits_uses() && !self.scalar_removal() {
                 return false;
             }
             return self.prove_wrapped_return(function, parsed, path, diff_files, caches);
@@ -835,7 +838,20 @@ impl Prover<'_, '_> {
             return ConsumerRef::Neutral;
         }
         let Some(call) = direct_call(node) else {
-            return ConsumerRef::Unproven;
+            return if self.callee_is_consumer(node, &parsed, &r.path, consumer, caches)
+                && node
+                    .parent()
+                    .and_then(|arguments| arguments.parent())
+                    .and_then(|call| self.row_array_map_site(call, &parsed, &r.path, caches))
+                    .is_some_and(|site| {
+                        site.consumer.start_byte() == node.start_byte()
+                            && site.consumer.end_byte() == node.end_byte()
+                    })
+            {
+                ConsumerRef::ProvenCall
+            } else {
+                ConsumerRef::Unproven
+            };
         };
         if !self.callee_is_consumer(node, &parsed, &r.path, consumer, caches) {
             return ConsumerRef::Unproven;
