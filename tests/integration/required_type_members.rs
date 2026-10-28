@@ -406,3 +406,272 @@ fn member_property_removal_hook_checks_values_uses_and_index_snapshot() {
         }
     }
 }
+
+#[test]
+fn property_removal_preserves_unchanged_non_scalar_values_in_worktree_and_index() {
+    for extension in ["ts", "tsx"] {
+        for (annotation, value, changed_value) in [
+            ("string[]", "[]", "['changed']"),
+            ("readonly string[]", "[]", "['changed']"),
+            ("Array<string>", "[]", "['changed']"),
+            ("ReadonlyArray<string>", "[]", "['changed']"),
+            ("Record<string, number>", "{}", "{ changed: 1 }"),
+        ] {
+            for case in [
+                "updated",
+                "value changed",
+                "reader remains",
+                "parameter changed",
+            ] {
+                if case != "updated" && !matches!(annotation, "string[]" | "Record<string, number>")
+                {
+                    continue;
+                }
+                let repo = TestRepo::new();
+                repo.init_git();
+                repo.create_dir_all("src");
+                let row_path = format!("src/row.{extension}");
+                let view_path = format!("src/view.{extension}");
+                let row = format!(
+                    "export interface Row {{\n    id: string;\n    data: {annotation};\n    extra: number;\n}}\nexport function toRow(id: string): Row {{\n    return {{ id, data: {value}, extra: 0 }};\n}}\n"
+                );
+                let view = "import { type Row, toRow } from './row';\nexport function label(row: Row): string {\n    return `${row.id} (${row.extra})`;\n}\nexport const first = label(toRow('a'));\n";
+                repo.write(&row_path, &row);
+                repo.write(&view_path, view);
+                repo.commit_all("initial");
+                let mut after = row
+                    .replace("    extra: number;\n", "")
+                    .replace(", extra: 0", "");
+                if case == "value changed" {
+                    after =
+                        after.replace(&format!("data: {value}"), &format!("data: {changed_value}"));
+                }
+                if case == "parameter changed" {
+                    after = after.replace("id: string): Row", "id: number): Row");
+                }
+                repo.write(&row_path, after);
+                repo.write(
+                    &view_path,
+                    if case == "reader remains" {
+                        view.to_string()
+                    } else {
+                        view.replace(" (${row.extra})", "")
+                    },
+                );
+                let expected = i32::from(case != "updated");
+                let category = if expected == 0 { "mod_closed" } else { "mod" };
+                let (code, json) = hook(&repo);
+                assert_eq!(code, expected, "{extension}/{annotation}/{case}: {json}");
+                assert!(
+                    json["api"][category]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry["n"] == "Row"),
+                    "{json}"
+                );
+                if expected == 0 {
+                    let normal = repo.run_json("review", &["--git"]);
+                    assert_eq!(
+                        normal["api_changes"]["modified_closed_in_diff"][0]["name"], "Row",
+                        "{normal}"
+                    );
+                }
+                repo.stage_all();
+                repo.write(&row_path, "export const changedOnlyInWorktree = 1;\n");
+                let output = cargo_bin()
+                    .args(["review", "--git", "--staged", "--hook", "--dir"])
+                    .arg(repo.root())
+                    .output()
+                    .unwrap();
+                let staged: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(expected),
+                    "{extension}/{annotation}/{case}: {staged}"
+                );
+                assert!(
+                    staged["api"][category]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry["n"] == "Row"),
+                    "{staged}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn non_scalar_property_removal_rejects_optional_value_changes_and_unproven_producers() {
+    for case in [
+        "optional stable",
+        "optional changed",
+        "root const",
+        "local const",
+        "literal argument",
+        "assertion",
+        "named element type",
+        "global builtin",
+        "removed literal key",
+        "new producer",
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.create_dir_all("src");
+        let mut row = "export interface Row {\n    id: string;\n    data?: string[];\n    extra: number;\n}\nexport function toRow(id: string): Row {\n    return { id, data: [], extra: 0 };\n}\n".to_string();
+        let mut view = "import { type Row, toRow } from './row';\nexport function label(row: Row): string {\n    return `${row.id} (${row.extra})`;\n}\nexport const first = label(toRow('a'));\n".to_string();
+        if case == "root const" {
+            row += "const stored: Row = { id: 'fixed', data: [], extra: 0 };\nexport const second = stored.id;\n";
+        }
+        if case == "local const" {
+            row = row.replace(
+                "return { id, data: [], extra: 0 };",
+                "const local: Row = { id, data: [], extra: 0 }; return local;",
+            );
+        }
+        if case == "literal argument" {
+            view += "export const second = label({ id: 'literal', data: [], extra: 0 });\n";
+        }
+        if case == "assertion" {
+            row = row.replace("data: []", "data: [] as string[]");
+        }
+        if case == "named element type" {
+            row = format!(
+                "type Tag = string;\n{}",
+                row.replace("data?: string[]", "data?: Tag[]")
+            );
+        }
+        if case == "global builtin" {
+            row = row
+                .replace("data?: string[]", "data?: Record<string, number>")
+                .replace("data: []", "data: {}");
+        }
+        repo.write("src/row.ts", &row);
+        repo.write("src/view.ts", &view);
+        if case == "global builtin" {
+            repo.write("src/global.ts", "interface Record<K, V> { unrelated: V }\n");
+        }
+        repo.commit_all("initial");
+        let mut after = row
+            .replace("    extra: number;\n", "")
+            .replace(", extra: 0", "");
+        if case == "optional changed" {
+            after = after.replace("data: []", "data: ['changed']");
+        }
+        if case == "removed literal key" {
+            after = after.replace("data: []", "data: [], 'extra': 0");
+        }
+        if case == "new producer" {
+            after += "export const additional: Row = { id: 'new', data: [] };\n";
+        }
+        repo.write("src/row.ts", after);
+        repo.write(
+            "src/view.ts",
+            view.replace(" (${row.extra})", "")
+                .replace(", extra: 0", ""),
+        );
+        let expected = i32::from(!matches!(case, "optional stable" | "root const"));
+        let (code, json) = hook(&repo);
+        assert_eq!(code, expected, "{case}: {json}");
+        let bucket = if expected == 0 { "mod_closed" } else { "mod" };
+        assert!(
+            json["api"][bucket]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["n"] == "Row"),
+            "{case}: {json}"
+        );
+    }
+}
+
+#[test]
+fn property_removal_builtin_audit_allows_value_reads_and_rejects_type_shadowing() {
+    for (annotation, value, utility, expected) in [
+        (
+            "string[]",
+            "[]",
+            "export const ok = (value: unknown) => Array.isArray(value);\ninterface Record<K, V> { unrelated: V }",
+            0,
+        ),
+        (
+            "Array<string>",
+            "[]",
+            "export const ok = (value: unknown) => Array.isArray(value);\nexport const values = Array.from('abc');\nexport const empty = new Array();",
+            0,
+        ),
+        (
+            "Record<string, number>",
+            "{}",
+            "export const ok = (value: unknown) => Array.isArray(value);",
+            0,
+        ),
+        ("Array<string>", "[]", "type Array<T> = { custom: T };", 1),
+        (
+            "Record<string, number>",
+            "{}",
+            "import type { Record } from './foreign';",
+            1,
+        ),
+        ("Array<string>", "[]", "export { Array };", 1),
+        ("Array<string>", "[]", "const Alias = Array;", 1),
+        ("Array<string>", "[]", "Array = replacement;", 1),
+    ] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.create_dir_all("src");
+        let row = format!(
+            "export interface Row {{ id: string; data: {annotation}; extra: number }}\nexport function toRow(id: string): Row {{ return {{ id, data: {value}, extra: 0 }}; }}\n"
+        );
+        let view = "import { type Row, toRow } from './row';\nexport function label(row: Row): string { return `${row.id} (${row.extra})`; }\nexport const first = label(toRow('a'));\n";
+        repo.write("src/row.ts", &row);
+        repo.write("src/view.ts", view);
+        repo.write("src/util.ts", utility);
+        if utility.starts_with("import") {
+            repo.write(
+                "src/foreign.ts",
+                "export type Record<K, V> = { custom: V };\n",
+            );
+        }
+        repo.commit_all("initial");
+        repo.write(
+            "src/row.ts",
+            row.replace(" extra: number", "").replace(", extra: 0", ""),
+        );
+        repo.write("src/view.ts", view.replace(" (${row.extra})", ""));
+        let (code, json) = hook(&repo);
+        let bucket = if expected == 0 { "mod_closed" } else { "mod" };
+        assert_eq!(code, expected, "{annotation}/{utility}: {json}");
+        assert!(
+            json["api"][bucket]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["n"] == "Row"),
+            "{json}"
+        );
+    }
+}
+
+#[test]
+fn property_removal_keeps_removed_non_scalar_members_outside_the_proof() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    let row = "export interface Row { id: string; extra: string[] }\nexport function toRow(id: string): Row { return { id, extra: [] }; }\n";
+    let view = "import { type Row, toRow } from './row';\nexport function label(row: Row): string { return `${row.id} (${row.extra.length})`; }\nexport const first = label(toRow('a'));\n";
+    repo.write("src/row.ts", row);
+    repo.write("src/view.ts", view);
+    repo.commit_all("initial");
+    repo.write(
+        "src/row.ts",
+        row.replace(" extra: string[]", "")
+            .replace(", extra: []", ""),
+    );
+    repo.write("src/view.ts", view.replace(" (${row.extra.length})", ""));
+    let (code, json) = hook(&repo);
+    assert_eq!(code, 1, "{json}");
+    assert_eq!(json["api"]["mod"][0]["n"], "Row", "{json}");
+}

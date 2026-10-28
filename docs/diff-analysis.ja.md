@@ -144,9 +144,11 @@ export した TS / TSX の interface か object 型の type alias へ、必須�
 
 ### TypeScript のプロパティ削除
 
-ファイル直下でexportしたinterface/object型のtype aliasからproperty signatureだけを削除した変更は、観測できるproducerとconsumerの追随を全て証明できれば`api.mod_closed`にする。宣言ヘッダと残るメンバーが不変で、旧新の全メンバーが一意な識別子名と単純なscalar型を持つpropertyである場合に限る。必須・optionalのどちらも削除できる。generic・継承・index signature・メソッド・関数値や未知の型・自己参照・宣言の曖昧性や解析不能・追加や型変更との混在は、全参照行が変わっていてもblockingに残す。
+ファイル直下でexportしたinterface/object型のtype aliasからproperty signatureだけを削除した変更は、観測できるproducerとconsumerの追随を全て証明できれば`api.mod_closed`にする。宣言ヘッダと残るメンバーが不変で、旧新の全メンバーが一意な識別子名を持つpropertyであることを求める。scalar型だけの変更は、従来の値の型照合で証明する。必須・optionalのどちらも削除できる。削除するメンバー自身はscalar型に限る。generic・継承・index signature・メソッド・関数値や対応外の型・自己参照・宣言の曖昧性や解析不能・追加や型変更との混在は、全参照行が変わっていてもblockingに残す。
 
 値を作る箇所は、ちょうど`Row`を返す直下の通常関数と、同ファイルの`const x: Row`に限る。残る必須プロパティがあり、値の型が合うことを確かめる。追加・縮小と違い、そのプロパティが変更行にある必要はない。any・unknown・assertion・不適切な初期化子に依存する値、spread・computed key・メソッド・getterやfallthroughは保留し、先行constの初期化子を追う既存の上限付き検査を使う。consumerには明示戻り型と直接呼出しの証明を求める。型付きRowの値とproducerの直接呼出し結果も調べ、`const key = "extra"; row[key]`等の動的/文字列キー、分割代入、別名、未知の呼出しや持出しはblockingに残す。配列/Promise戻り値・satisfies・arrow・クラスメンバー・importしたRow定数・戻り型の推論は、この削除の証明には含めない。追加・縮小の既存契約は維持する。
+
+残るメンバーにscalarの配列型、`readonly T[]`、`Array<T>`、`ReadonlyArray<T>`、`Record<string, scalar>`があれば、旧新の値が変わらないことを別の証拠にする。残る型注釈のgeneric表記に現れる組み込み型名だけを監査し、同名宣言・import・別名への持出し・書換えがあれば証明しない。`Array.isArray`などの通常の値参照は許し、`T[]`と`readonly T[]`だけならこの監査は行わない。値を作る位置は一意な直下の通常関数のreturnと、直下の`const x: Row`のobject literalに限る。対象の型宣言と削除キーの項目だけを除き、ファイル全体のトークン列が旧新で一致することを求める。これにより、引数・束縛・残る全キーの値の変更も保留する。optionalなキーも、値を書いてあれば比較する。値はliteral、配列・object literal、型と束縛を確かめたproducer引数に限り、call・外側の変数・名前付き型・assertionは扱わない。引数の型はscalarか`T[]`・`readonly T[]`に限り、generic表記は保留する。新しいproducerやliteral引数、ローカルconst、map、satisfiesもこの証拠には含めない。1ファイル2MiB・100,000ノード・値の入れ子8段の上限、対応付けの失敗、同じファイルでのほかの変更でも保留する。scalarだけの経路と追加・縮小の判定は変えない。
 
 別の走査で、削除名がプロパティ/メンバー名、objectや分割代入のキー、文字列の添字、文字列literal型に残っていないことを求める。`Pick<Row, "extra">`・`Row["extra"]`も含み、無関係なobjectや型の同名キーでもblockingに残す。通常の文字列値やコメントはキーとしないが、型を供給するJSのJSDocは保留する。生の削除名が無くてもescapeを含むファイルを解析し、escapeで書いた識別子やキーは証明しない。削除名かescapeを含む未解析の埋め込みソース、読取失敗、関係する解析失敗、keyof Row、typeof・別名や隠れたimport/exportも保留する。stagedはindex snapshotを使う。この限定検査は一般の推論・外部コード・reflectionを追わず、refs/dead-codeの出現契約も変えない。
 
