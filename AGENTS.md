@@ -387,7 +387,7 @@ make ci       # check + test。CI の quality ジョブは make setup と make c
 make help     # 全ターゲット表示
 ```
 
-- CI の quality (Linux/macOS)、test-windows、6ターゲットの build は独立して開始する。Windows は単体/binary/doc と全統合テスト (`--test '*'`) を別ランナーへ分け、各テストは一度ずつ実行する。単体/binary と統合テストのステップだけ `RUST_TEST_THREADS=8` を指定して Git・ファイル I/O の待機を重ねる。test-windows は既存の Windows build のキャッシュを読み、保存は build に任せる。feature と全 profile の設定は変更しない。
+- CI の quality (Linux/macOS)、test-windows、6ターゲットの build は独立して開始する。Windows は単体/binary/doc と全統合テスト (`--test '*'`) を別ランナーへ分け、各テストは一度ずつ実行する。単体/binary のステップだけ `RUST_TEST_THREADS=8` を指定して Git・ファイル I/O の待機を重ね、期限付きのストレステストを含む統合テストは既定の並列数を使う。test-windows は既存の Windows build のキャッシュを読み、保存は build に任せる。feature と全 profile の設定は変更しない。
 - 個別のテストの絞り込みのように対応するターゲットが無いものは、`mise exec -- cargo test <filter>` のように mise 経由で直接呼ぶ
 - Cargo のコマンドには `CARGO_FLAGS` (既定 `--locked`) を付ける。`.cargo/config.toml` の `[patch]` で Cargo.lock が手元でだけ変わるときは `make ci CARGO_FLAGS=` で外す
 

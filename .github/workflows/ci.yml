@@ -88,10 +88,9 @@ jobs:
         run: cargo test --locked --doc
 
       # wildcard で全統合テストターゲットを含め、今後のターゲット追加も漏らさない。
+      # 期限付きの深い入れ子のテストがあるので、並列数は利用可能な CPU 数の既定値を使う。
       - name: Integration tests
         if: matrix.suite == 'integration'
-        env:
-          RUST_TEST_THREADS: '8'
         run: cargo test --locked --test '*'
 
   build:
