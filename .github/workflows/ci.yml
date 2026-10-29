@@ -17,7 +17,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # 検査の中身は Makefile の ci が定義する (fmt-check / clippy / cargo check / cargo test)。
+  # 検査の中身は Makefile の ci が定義する (fmt-check / clippy / cargo test)。
   # ここには OS 固有の準備だけを置き、検査コマンドを重ねて書かない
   quality:
     name: Quality (${{ matrix.os }})
@@ -26,7 +26,7 @@ jobs:
       fail-fast: false
       matrix:
         # Windows は入れない。ランナーの make は MinGW の mingw32-make の写しで、レシピの POSIX シェル前提
-        # ($$(...) や [ -n ... ]) の解釈に癖がある。Windows のテストは build で cargo を直接呼ぶ
+        # ($$(...) や [ -n ... ]) の解釈に癖がある。Windows のテストは test-windows で cargo を直接呼ぶ
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
@@ -48,9 +48,54 @@ jobs:
       - run: make setup
       - run: make ci
 
+  # テストと配布用ビルドは成果物を受け渡さないので、Windows でも独立して始める。
+  test-windows:
+    name: Test (Windows, ${{ matrix.suite }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [unit, integration]
+    steps:
+      - name: Keep LF line endings
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.4
+          cache: false
+
+      # 既存の Windows build の鍵 (key + job 名) を共有し、依存を再取得しない。
+      # 保存は build に任せ、2つのテストジョブは同じキャッシュを読む。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: x86_64-pc-windows-msvc-build
+          save-if: 'false'
+
+      # Git / ファイル I/O の待機を重ねる。実行時だけの設定なのでキャッシュの鍵には入れない。
+      - name: Unit and binary tests
+        if: matrix.suite == 'unit'
+        env:
+          RUST_TEST_THREADS: '8'
+        run: cargo test --locked --lib --bins
+
+      - name: Documentation tests
+        if: matrix.suite == 'unit'
+        run: cargo test --locked --doc
+
+      # wildcard で全統合テストターゲットを含め、今後のターゲット追加も漏らさない。
+      # 期限付きの深い入れ子のテストがあるので、並列数は利用可能な CPU 数の既定値を使う。
+      - name: Integration tests
+        if: matrix.suite == 'integration'
+        run: cargo test --locked --test '*'
+
   build:
     name: Build (${{ matrix.target }})
-    needs: quality
+    # Quality とテストを待つ必要はない。全ジョブの成功で従来の検査範囲を確かめる。
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -102,12 +147,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-
-      # Windows は quality で make ci を回さないので、配る OS の裏付けとしてここでテストする
-      # (Makefile の test と同じく既定の feature で回す)
-      - name: Test (Windows)
-        if: runner.os == 'Windows'
-        run: cargo test --locked
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}

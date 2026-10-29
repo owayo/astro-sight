@@ -15,7 +15,9 @@ make install SYSTEM_TOOLS=1
 
 ## Same Checks as CI
 
-The CI quality job (Linux and macOS) only runs `make setup` and `make ci`, so a local `make ci` runs exactly the CI checks. Tests run with the default features, the same as the released binary. Only clippy runs with `--all-features`, to check the heap profiler code (the `dhat-heap` feature) as well. On Windows, the build job runs `cargo test --locked` directly.
+The CI quality jobs (Linux and macOS) only run `make setup` and `make ci`, so a local `make ci` runs the same checks. Tests run with the default features, the same as the released binary. Clippy runs with both the default features and `--all-features`, to check the heap profiler code (the `dhat-heap` feature) as well.
+
+Quality checks, Windows tests, and the six release-target builds start independently. Windows tests use two runners: one runs `cargo test --locked --lib --bins` and `cargo test --locked --doc`; the other runs every integration target with `cargo test --locked --test '*'`. Unit and binary tests use `RUST_TEST_THREADS=8` to overlap Git and file I/O. Integration tests keep the default CPU-based concurrency because they include stress tests with processing deadlines. Both test jobs read the existing Windows build cache; the build job saves it. All profiles, features, test cases, and processing deadlines remain the same.
 
 Cargo commands get `--locked` by default. When a `[patch]` in `.cargo/config.toml` swaps in local tree-sitter crates, `Cargo.lock` changes only on your machine and `--locked` stops the build. Empty `CARGO_FLAGS` in that case, as in `make ci CARGO_FLAGS=`.
 

@@ -15,7 +15,9 @@ make install SYSTEM_TOOLS=1
 
 ## CI と同じ検査
 
-CI の quality ジョブ (Linux と macOS) は `make setup` と `make ci` を呼ぶだけなので、手元の `make ci` がそのまま CI の検査になる。テストは配布物と同じ既定の feature で回す。clippy だけは `--all-features` で、ヒーププロファイラ（`dhat-heap` feature）側のコードも検査する。Windows は build ジョブで `cargo test --locked` を直接回す。
+CI の quality ジョブ (Linux と macOS) は `make setup` と `make ci` を呼ぶだけなので、手元の `make ci` がそのまま CI の検査になる。テストは配布物と同じ既定の feature で回す。clippy は既定の feature と `--all-features` の両方で、ヒーププロファイラ（`dhat-heap` feature）側のコードも検査する。
+
+Quality、Windows のテスト、6ターゲットの配布用ビルドは独立して開始する。Windows は2つのランナーに分け、一方で `cargo test --locked --lib --bins` と `cargo test --locked --doc`、他方で `cargo test --locked --test '*'` による全統合ターゲットを実行する。単体/binary は `RUST_TEST_THREADS=8` で Git・ファイル I/O の待機を重ねる。統合テストには処理期限付きのストレステストがあるため、CPU 数に応じた既定の並列数を使う。2つのテストジョブは既存の Windows build のキャッシュを読み、保存は build が担当する。profile・feature・テスト内容・処理期限は従来どおり。
 
 Cargo のコマンドには既定で `--locked` を付けている。`.cargo/config.toml` の `[patch]` でローカルの tree-sitter 系を差し込むと `Cargo.lock` が手元でだけ変わり、`--locked` で止まる。そのときは `make ci CARGO_FLAGS=` のように `CARGO_FLAGS` を空にする。
 
