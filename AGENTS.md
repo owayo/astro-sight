@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **Rust 書式マクロの暗黙キャプチャ** — `engine/refs/definition/rust_format.rs` が既知の format/format_args/print/println/eprint/eprintln/write/writeln の直接リテラルから値・幅・精度の名前を取り、統合 walker の単一・バッチ・visitor・カウントへ渡す (Issue #177)。明示引数を優先し、通常文字列・二重波括弧・生成した書式・未知の外側マクロ・マクロ定義をキャプチャとして追加しない。既知の式マクロ内の呼び出し、raw/cooked literal、Unicode/CRLF とエスケープに元の byte 座標を維持する。引数の役割は実 Rust 文法で検査し、内側の token tree は同種の単純な式へ畳んで入れ子全体の再解析を避ける。綴りをエスケープした名前は事前フィルタを保守的に広げ、ストリームでも印をチャンク間で保持する。closure の既存束縛除外は維持し、一般のマクロ展開・別名・名前解決は行わない。回帰は `refs/tests/rust_format.rs` と `tests/integration/rust_format_captures.rs`、ノード種別の Query 実在検査、stream の境界対照。
+
 - **Rust の cfg 判定と祖先列** — `engine/refs/walker.rs` は共通の `tree_walk::walk_preorder` で全ノードを前順に訪れ、Rust の場合だけ祖先列を深さに比例する領域で持ち回す (Issue #176)。`definition/rust.rs` の cfg/cfg_attr 判定はその列を内側から読む。識別子ごとの `Node::parent` 反復による深さの2乗の再探索を避け、部分木を起点にする場合は外側の祖先を一度だけ補う。条件キー・後続の derive・通常のマクロ引数、単一/バッチ/visitor/カウントの契約と位置・順序は維持する。回帰は `refs/tests/cfg_ancestors.rs` の旧実装との全ノード比較と全部分木比較、既存の cfg と walker の対照。性能比較は `tools/bench-refs.py` で旧新の実行順を交互にし、出力一致・時間・ピーク working set を記録する。closure 束縛や参照役割など、他の祖先判定をこの証拠で変えない。
 
 - **JS/TS/TSX の正規表現・静的 template の定数値変更** — `commands/api_changes/signature.rs` は公開 const の単純リテラルを専用の `JsConstLiteralKind` で比較し、正規表現同士の pattern/flags 変更を `RegExp`、置換なし template を既存の文字列と同じ種類として `const_value` に分類する (Issue #167)。名前・型注釈・公開指定・binding kind の一致と既存の strict policy を保持し、種類変更・置換・タグ・assertion/satisfies は従来どおり扱う。共有の `ScalarKind` と object/array の葉の判定は変更しない。JS/TS/TSX の実ノードと Query を照合し、通常/staged・strict・単行/複数行・Unicode/CRLF・refs の位置・静的 container の負例を CLI で対照する。

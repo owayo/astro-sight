@@ -617,6 +617,31 @@ fn visit_ref_node<M: RefMatcher, S: RawRefSink>(
         emit_synthetic_hit(seg, row, col, exact, matcher, sink, env);
     }
 
+    if lang_id == LangId::Rust && node.kind() == "token_tree" {
+        for (name, byte) in super::definition::rust_format::captures(node, ancestors, source) {
+            if ancestors.iter().rev().any(|ancestor| {
+                ancestor.kind() == "closure_expression"
+                    && ancestor
+                        .child_by_field_name("parameters")
+                        .is_some_and(|params| {
+                            super::definition::rust::rust_pattern_binds_name(
+                                params,
+                                &name,
+                                source,
+                                &env.rust_binding_cache,
+                            )
+                        })
+            }) {
+                continue;
+            }
+            // 件数だけの sink は座標を使わない。各キャプチャで全ソースを走査し直さない。
+            let (row, col) = env
+                .line_index
+                .map_or((0, 0), |index| index.row_col(source.len(), byte));
+            emit_synthetic_hit(&name, row, col, exact, matcher, sink, env);
+        }
+    }
+
     // (3) bash `trap '<handler>' SIG` の handler 文字列
     for (seg, row, col) in bash_trap_handler_ref_segments(node, source, lang_id) {
         emit_synthetic_hit(&seg, row, col, exact, matcher, sink, env);

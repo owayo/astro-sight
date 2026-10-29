@@ -14,6 +14,7 @@ pub(crate) mod cpp;
 pub(crate) mod php;
 pub(crate) mod ruby;
 pub(crate) mod rust;
+pub(crate) mod rust_format;
 
 use tree_sitter::Node;
 

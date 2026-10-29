@@ -6,6 +6,7 @@ mod files;
 mod line_context;
 mod php;
 mod rust;
+mod rust_format;
 mod uncounted;
 mod walker;
 

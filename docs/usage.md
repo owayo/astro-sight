@@ -2,6 +2,8 @@
 
 How to use each subcommand, with output examples. The commands that take a diff (`context` / `impact` / `review` / `dead-code` / `cochange`) are in [Diff Analysis](diff-analysis.md), output formats in [Output Format](output-format.md), and the configuration file in [Configuration](configuration.md).
 
+Rust references include implicit names in literal format strings passed to `format!`, `format_args!`, `print!`, `println!`, `eprint!`, `eprintln!`, `write!`, and `writeln!`, including named width/precision. Explicit named arguments override implicit captures. Original byte positions are preserved for raw/cooked strings, Unicode escapes, and CRLF. Ordinary text, escaped braces, generated format strings, macro definitions, and unknown enclosing macros add no captures. Macro aliases and general macro/name resolution are outside this syntactic scan. See the [Rust formatting rules](https://doc.rust-lang.org/std/fmt/#named-parameters).
+
 ## Global Options
 
 ```bash

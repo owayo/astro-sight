@@ -121,6 +121,9 @@ fn ac_present_indices(
     source: &[u8],
     num_names: usize,
 ) -> std::collections::HashSet<usize> {
+    if definition::rust_format::may_have_escaped_capture(source) {
+        return (0..num_names).collect();
+    }
     let mut present_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for mat in ac.find_overlapping_iter(source) {
         present_indices.insert(mat.pattern().as_usize());
@@ -138,6 +141,9 @@ fn ac_present_indices_multi(
     source: &[u8],
     num_names: usize,
 ) -> std::collections::HashSet<usize> {
+    if definition::rust_format::may_have_escaped_capture(source) {
+        return (0..num_names).collect();
+    }
     let mut present_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
     'outer: for (offset, ac) in acs {
         for mat in ac.find_overlapping_iter(source) {
@@ -332,7 +338,10 @@ fn find_refs_in_file(
         } else {
             prefilter.exact.find(&source).is_some()
         };
-        if !present {
+        if !present
+            && !(detected_lang == Some(LangId::Rust)
+                && definition::rust_format::may_have_escaped_capture(source.as_bytes()))
+        {
             return Ok(Vec::new());
         }
     }
@@ -850,12 +859,15 @@ fn stream_present_indices_from(
         .map(|name| identifier_prefilter_pattern(name).len())
         .max()
         .unwrap_or(0)
-        .saturating_sub(1);
+        .saturating_sub(1)
+        .max(8);
     let num = symbol_names.len();
     let mut present: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut buf: Vec<u8> = Vec::with_capacity(chunk_size + overlap);
     let mut chunk = vec![0u8; chunk_size.max(1)];
     let mut total: u64 = 0;
+    let mut format_seen = false;
+    let mut escape_seen = false;
     loop {
         let read = match reader.read(&mut chunk) {
             Ok(0) => break,
@@ -868,6 +880,11 @@ fn stream_present_indices_from(
             return None;
         }
         buf.extend_from_slice(&chunk[..read]);
+        format_seen |= definition::rust_format::has_format_marker(&buf);
+        escape_seen |= definition::rust_format::has_escape_marker(&buf);
+        if format_seen && escape_seen {
+            return Some((0..num).collect());
+        }
         present.extend(ac_present_indices_multi(acs, &buf, num));
         if present.len() == num {
             break;
