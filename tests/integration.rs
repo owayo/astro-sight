@@ -31,6 +31,7 @@ mod integration {
     mod impact_output;
     mod impact_python_bindings;
     mod impact_rust_cargo_reachability;
+    mod impact_rust_line_endings;
     mod impact_rust_private_helpers;
     mod impact_rust_reexport;
     mod impact_rust_scope;

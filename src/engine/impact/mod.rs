@@ -12,6 +12,7 @@ mod rust_assert_include;
 pub(crate) mod rust_cargo_config;
 pub(crate) mod rust_cargo_reachability;
 mod rust_impl_owner;
+mod rust_line_endings;
 mod rust_path_owner;
 mod rust_reexport_owner;
 pub(crate) mod rust_std_origin;
@@ -532,6 +533,18 @@ fn collect_affected_symbols(
         // (Issue 2026-05-14-private-const-and-unchanged-export-noise) を排除する。
         let changed_line_facts = diff::extract_changed_line_facts(file_diff, &df.new_path);
         let changed_new_lines = &changed_line_facts.added_lines;
+        let eol_unchanged = if lang_id == LangId::Rust {
+            rust_line_endings::unchanged_symbols(
+                file_diff,
+                &df.old_path,
+                &df.new_path,
+                root,
+                &source,
+                &syms,
+            )
+        } else {
+            HashSet::new()
+        };
         // symbols には method の container 解決用の合成 impl owner が含まれる。
         // メンバーだけの変更では owner を影響の起点にしないが、impl ヘッダ変更や
         // メンバー削除は情報を失わないよう "impl" として残す。
@@ -558,6 +571,7 @@ fn collect_affected_symbols(
         };
         let affected_raw: Vec<_> = impact_syms
             .iter()
+            .filter(|sym| !eol_unchanged.contains(&(sym.name.as_str(), symbol_kind_str(sym.kind))))
             .filter_map(|sym| {
                 classify_symbol_change(sym, &df.hunks, Some(&changed_line_facts)).map(
                     |change_type| {

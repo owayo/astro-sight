@@ -2,6 +2,8 @@
 
 The commands here take a unified diff (with `--git`, the `git diff` of the working tree) and examine what a change affects. `context` returns the impact, `impact` stops with exit 1 while impacts are unresolved, and `review` returns the impact, co-changes, public API changes, and dead symbols in one run. `dead-code` and `cochange` also work without a diff.
 
+Rust declarations touched only by LF/CRLF conversion are excluded as impact origins when the old and new ASTs prove their complete text, ownership, and attributes unchanged. Only physical CRLF is normalized; changes to literal spaces, blank lines, or `\r` / `\n` escapes remain visible. Duplicate names, changed paths, reconstruction/parse failures, large inputs, and deep ownership retain the conservative result. This applies to working-tree, staged, and external diffs, including the impact portion of review.
+
 ## context: Smart Context (Diff → Impact Analysis)
 
 `context` takes a unified diff and analyzes the scope of the change, to support AI code review. Function signature changes are matched on identifier boundaries, so two different functions whose names only share a prefix, such as `foo` and `foo_bar`, are not confused.
