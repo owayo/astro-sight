@@ -57,3 +57,18 @@ The version format is `yy.m.counter` (for example `26.9.103`). The year and mont
 With `dry_run` enabled, the run only computes the next version and prints it to the log, without a commit, a tag, a build, or a release. The CI build job builds the 6 targets with the same settings on every push to main and every PR.
 
 When the repository lacks the settings for the tap or for winget-pkgs, that job prints a warning and is skipped, and the release itself does not stop. The results appear in the run's Summary.
+
+## Reference Scan Performance
+
+With Python 3.9 or later, compare two release binaries using the same Rust toolchain and release profile:
+
+```powershell
+python tools/bench-refs.py `
+  --baseline C:/temp/astro-before.exe `
+  --candidate C:/temp/astro-after.exe `
+  --output-directory C:/temp/astro-refs-bench --mode session --repeats 9
+```
+
+Use `--mode session` for request times inside one persistent process per case, or `--mode cli` (the default) to include process startup. The mixed-language session case sends the three names as separate requests. The script saves deterministic inputs, checks identical stdout for every run, warms up each binary once, and alternates their order. Cases cover a name deep inside Rust `use` paths, repeated path segments, a leaf name, an absent name, ordinary shallow functions, and the mixed-language fixtures. It writes every elapsed-time and peak-working-set measurement to `samples.csv`, with medians, ranges, executable hashes, and environment metadata in `summary.json`. On Windows, the peak comes from GetProcessMemoryInfo after each CLI process exits, or after each request in session mode and includes mapped pages; it is not an allocation count. Session peaks include the warmup and earlier requests within that case. Other platforms record null for this metric.
+
+Keep generated inputs outside the repository so they do not become extra sources for reference and API analyses. Record the source revision, dependency versions, toolchain, build command, machine load, and whether the file cache was warm with the results. Compare large improvements against the full range of samples; small differences can be scheduler noise. Rust closure binding and usage-role checks still have separate ancestor walks, so these measurements do not establish linear time for every Rust reference query.

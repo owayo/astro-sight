@@ -9,11 +9,12 @@ use tree_sitter::Node;
 use crate::language::LangId;
 
 /// `cfg_attr` の引数木かを判定する。入れ子の `cfg_attr` も許す。
-fn is_cfg_attr_arguments(mut tree: Node<'_>, source: &[u8]) -> bool {
-    loop {
-        let Some(parent) = tree.parent() else {
-            return false;
-        };
+fn is_cfg_attr_arguments(ancestors: &[Node<'_>], source: &[u8]) -> bool {
+    let mut path = ancestors.iter().rev().copied();
+    let Some(mut tree) = path.next() else {
+        return false;
+    };
+    for parent in path {
         if parent.kind() == "attribute" {
             return parent
                 .named_child(0)
@@ -30,6 +31,7 @@ fn is_cfg_attr_arguments(mut tree: Node<'_>, source: &[u8]) -> bool {
         }
         tree = parent;
     }
+    false
 }
 
 /// `cfg` 条件の識別子は Rust のシンボル参照ではなく設定キーなので除外する。
@@ -38,10 +40,12 @@ fn is_cfg_attr_arguments(mut tree: Node<'_>, source: &[u8]) -> bool {
 /// `identifier`・`!`・`token_tree` に分ける。引数木の直前の兄弟を見ることで
 /// その形も扱う。`cfg_attr` は最初の引数だけが条件なので、直下のカンマまでに
 /// 限る。後続の `derive(Trait)` は実際のシンボル参照として残す。
-pub(crate) fn is_rust_cfg_condition_identifier(node: Node<'_>, source: &[u8]) -> bool {
-    let mut ancestor = node.parent();
-    while let Some(tree) = ancestor {
-        ancestor = tree.parent();
+pub(crate) fn is_rust_cfg_condition_identifier(
+    node: Node<'_>,
+    ancestors: &[Node<'_>],
+    source: &[u8],
+) -> bool {
+    for (index, &tree) in ancestors.iter().enumerate().rev() {
         if tree.kind() != "token_tree" {
             continue;
         }
@@ -56,9 +60,10 @@ pub(crate) fn is_rust_cfg_condition_identifier(node: Node<'_>, source: &[u8]) ->
         let Some(name) = name_node.and_then(|n| n.utf8_text(source).ok()) else {
             continue;
         };
-        let is_attribute = tree.parent().is_some_and(|parent| {
+        let is_attribute = ancestors[..index].last().is_some_and(|parent| {
             parent.kind() == "attribute"
-                || (parent.kind() == "token_tree" && is_cfg_attr_arguments(parent, source))
+                || (parent.kind() == "token_tree"
+                    && is_cfg_attr_arguments(&ancestors[..index], source))
         });
         if !is_macro && !is_attribute {
             continue;

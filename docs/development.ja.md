@@ -57,3 +57,18 @@ GitHub Actions の **Actions > Release > Run workflow** から実行する。1 �
 `dry_run` を有効にすると、次の版を計算してログに出すだけで、コミット・タグ・ビルド・リリースは行わない。6 つのターゲットのビルドは、CI の build ジョブが main への push と PR のたびに同じ設定で確かめている。
 
 tap と winget-pkgs への提出に使う設定がリポジトリに無いときは、そのジョブが警告を出して飛ばし、リリースそのものは止めない。結果は実行の Summary に出る。
+
+## 参照走査の性能
+
+Python 3.9 以降では、同じ Rust ツールチェーンと release profile で作った2つのバイナリを比較できます。
+
+```powershell
+python tools/bench-refs.py `
+  --baseline C:/temp/astro-before.exe `
+  --candidate C:/temp/astro-after.exe `
+  --output-directory C:/temp/astro-refs-bench --mode session --repeats 9
+```
+
+`--mode session` はケースごとに常駐するプロセス内の要求時間を測り、`--mode cli` (既定) は起動時間も含めます。多言語の session ケースは3つの名前を別々の要求で送ります。スクリプトは再現可能な入力を保存し、毎回の stdout 一致を確認します。各版を1回ウォームアップしてから実行順を交互に反転します。Rust の深い `use` パス内の名前、同名セグメントの反復、末尾の名前、不在の名前、浅い通常関数、多言語 fixture を測定します。全測定の時間とピーク working set は `samples.csv`、中央値・範囲・実行ファイルのハッシュ・環境は `summary.json` に出します。Windows のピーク値はCLI の終了後または session の各要求後に GetProcessMemoryInfo で取得し、mmap のページも含みます。割当回数ではありません。session のピークは同じケースのウォームアップと先行要求も含みます。他の OS ではこの指標を null として記録します。
+
+生成入力はリポジトリの外に置き、参照検索や API 分析の対象ソースへ混入させないでください。結果にはソース revision、依存の版、ツールチェーン、ビルドコマンド、同時負荷、ファイルキャッシュの条件を記録します。改善幅は全測定の範囲と比較し、小さな差をスケジューラ由来の変動と区別します。Rust の closure 束縛と参照役割には別の祖先走査が残るため、全 Rust 参照検索が線形時間になるという測定ではありません。

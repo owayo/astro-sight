@@ -1,5 +1,6 @@
 //! `refs` の単体テスト。テーマ別サブモジュールに分ける。
 
+mod cfg_ancestors;
 mod definition;
 mod files;
 mod line_context;

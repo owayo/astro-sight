@@ -8,6 +8,7 @@ use tree_sitter::Node;
 
 use crate::engine::bash_trap_refs::bash_trap_handler_ref_segments;
 use crate::engine::phpunit_refs::phpunit_metadata_ref_segments;
+use crate::engine::tree_walk::{Children, Walk, walk_preorder};
 use crate::language::{LangId, normalize_identifier};
 use crate::models::reference::{RefConfidence, RefKind, SymbolReference};
 
@@ -549,6 +550,7 @@ fn emit_synthetic_hit<M: RefMatcher, S: RawRefSink>(
 /// 一致するたび `sink.on_hit` を呼ぶ。
 fn visit_ref_node<M: RefMatcher, S: RawRefSink>(
     node: Node<'_>,
+    ancestors: &[Node<'_>],
     matcher: &M,
     sink: &mut S,
     env: &RefEnvironment<'_>,
@@ -581,7 +583,8 @@ fn visit_ref_node<M: RefMatcher, S: RawRefSink>(
         // 参照ではない (シャドーイング)。参照として数えると dead-code が fail-open する。
         && !(lang_id == LangId::Rust
             && is_rust_closure_bound_identifier(node, text, source, &env.rust_binding_cache))
-        && !(lang_id == LangId::Rust && is_rust_cfg_condition_identifier(node, source))
+        && !(lang_id == LangId::Rust
+            && is_rust_cfg_condition_identifier(node, ancestors, source))
         && !is_ignored_identifier_context(node, lang_id)
     {
         let bash_role = (lang_id == LangId::Bash)
@@ -649,12 +652,9 @@ fn visit_ref_node<M: RefMatcher, S: RawRefSink>(
     }
 }
 
-/// 統合参照ウォーカー。単一 TreeCursor の反復 pre-order 走査で全ノードを
-/// `visit_ref_node` に通す。訪問順 (親 → 子を宣言順) は旧再帰実装と同一。
-///
-/// 旧実装はノード毎に `node.walk()` で TreeCursor を C 側 malloc しており、
-/// ノード数分の確保/解放と再帰の呼び出しオーバーヘッドが積み上がっていた。
-/// depth ガードにより、subtree root で呼ばれても root の兄弟ノードへは進まない。
+/// 共通の前順走査で全ノードを判定し、Rust では根からの祖先列を持ち回す。
+/// `Node::parent` の反復による深さの 2 乗の再探索を避け、保持量は深さに比例する。
+/// 部分木の外の祖先も最初に補い、部分木を起点とする場合の判定を維持する。
 fn walk_refs<M: RefMatcher, S: RawRefSink>(
     root: Node<'_>,
     matcher: &M,
@@ -662,25 +662,27 @@ fn walk_refs<M: RefMatcher, S: RawRefSink>(
     env: &RefEnvironment<'_>,
     definition_kinds: &[&str],
 ) {
-    let mut cursor = root.walk();
-    let mut depth = 0usize;
-    loop {
-        visit_ref_node(cursor.node(), matcher, sink, env, definition_kinds);
-        if cursor.goto_first_child() {
-            depth += 1;
-            continue;
+    let rust = env.lang_id == LangId::Rust;
+    let mut ancestors = Vec::new();
+    if rust {
+        let mut parent = root.parent();
+        while let Some(node) = parent {
+            ancestors.push(node);
+            parent = node.parent();
         }
-        loop {
-            if depth == 0 {
-                return;
-            }
-            if cursor.goto_next_sibling() {
-                break;
-            }
-            cursor.goto_parent();
-            depth -= 1;
-        }
+        ancestors.reverse();
     }
+    let outer_depth = ancestors.len();
+    let _: std::ops::ControlFlow<()> = walk_preorder(root, Children::All, |node, depth| {
+        if rust {
+            ancestors.truncate(outer_depth + depth);
+        }
+        visit_ref_node(node, &ancestors, matcher, sink, env, definition_kinds);
+        if rust {
+            ancestors.push(node);
+        }
+        std::ops::ControlFlow::Continue(Walk::Descend)
+    });
 }
 
 /// walk_refs の呼び出しラッパー。sink が context を必要とする場合のみ LineIndex を

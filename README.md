@@ -37,6 +37,8 @@ It matches identifier nodes in the tree-sitter syntax tree, so `refs --name new`
 
 Bash/zsh parse failures are reported explicitly: recognizable declarations inside error regions use `refs.kind: "unknown"`, and `review` separates unverified removals from confirmed deletions. See [shell parse errors](docs/diff-analysis.md#shell-parse-errors).
 
+Rust cfg-condition classification reuses the current ancestor path to avoid repeated parent traversal on deep `use` paths. Reference positions, ordering, and cfg-key exclusions are preserved. See [performance checks](docs/development.md#reference-scan-performance) for the reproducible comparison.
+
 ## Features
 
 - **References by identifier**: `refs` lists the definitions and references of a symbol across a directory, and `refs --names` looks up many names in one pass

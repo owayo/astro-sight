@@ -1,0 +1,156 @@
+{
+  "repeats": 9,
+  "os": "Windows-11-10.0.26300-SP0",
+  "processors": 16,
+  "python": "3.12.9",
+  "cases": [
+    {
+      "case": "deep-500",
+      "before": {
+        "median_ms": 435.9316999980365,
+        "min_ms": 209.87999999488238,
+        "max_ms": 672.7576999983285,
+        "max_working_set_bytes": 14757888
+      },
+      "after": {
+        "median_ms": 387.875599997642,
+        "min_ms": 280.97349999734433,
+        "max_ms": 672.7698000031523,
+        "max_working_set_bytes": 14807040
+      },
+      "improvement_percent": 11.023768172998427
+    },
+    {
+      "case": "deep-1000",
+      "before": {
+        "median_ms": 245.53149999701418,
+        "min_ms": 178.87709999922663,
+        "max_ms": 408.7240999942878,
+        "max_working_set_bytes": 14761984
+      },
+      "after": {
+        "median_ms": 242.94270000245888,
+        "min_ms": 161.92449999653036,
+        "max_ms": 374.9298999973689,
+        "max_working_set_bytes": 14823424
+      },
+      "improvement_percent": 1.0543657309089793
+    },
+    {
+      "case": "deep-2000",
+      "before": {
+        "median_ms": 371.5620999937528,
+        "min_ms": 292.6986000020406,
+        "max_ms": 406.33859999798005,
+        "max_working_set_bytes": 14983168
+      },
+      "after": {
+        "median_ms": 368.44099999871105,
+        "min_ms": 230.3390999950352,
+        "max_ms": 491.36079999880167,
+        "max_working_set_bytes": 14979072
+      },
+      "improvement_percent": 0.8399941746195849
+    },
+    {
+      "case": "many-250",
+      "before": {
+        "median_ms": 443.12039999931585,
+        "min_ms": 321.3522000005469,
+        "max_ms": 681.3722000006237,
+        "max_working_set_bytes": 15183872
+      },
+      "after": {
+        "median_ms": 473.5475000052247,
+        "min_ms": 333.4376999991946,
+        "max_ms": 562.1301000064705,
+        "max_working_set_bytes": 15151104
+      },
+      "improvement_percent": -6.8665536513227154
+    },
+    {
+      "case": "many-500",
+      "before": {
+        "median_ms": 999.7896999993827,
+        "min_ms": 851.7895999975735,
+        "max_ms": 1086.8496999974013,
+        "max_working_set_bytes": 15331328
+      },
+      "after": {
+        "median_ms": 363.9670999982627,
+        "min_ms": 275.88879999530036,
+        "max_ms": 674.4628000014927,
+        "max_working_set_bytes": 15319040
+      },
+      "improvement_percent": 63.59563416201552
+    },
+    {
+      "case": "leaf-control",
+      "before": {
+        "median_ms": 342.16839999862714,
+        "min_ms": 223.20820000459207,
+        "max_ms": 530.5307999951765,
+        "max_working_set_bytes": 14823424
+      },
+      "after": {
+        "median_ms": 355.0918999972055,
+        "min_ms": 250.55330000031972,
+        "max_ms": 451.8315999957849,
+        "max_working_set_bytes": 15011840
+      },
+      "improvement_percent": -3.7769414120737643
+    },
+    {
+      "case": "absent-control",
+      "before": {
+        "median_ms": 284.10620000067865,
+        "min_ms": 167.47420000319835,
+        "max_ms": 613.0698999986635,
+        "max_working_set_bytes": 14069760
+      },
+      "after": {
+        "median_ms": 373.42999999964377,
+        "min_ms": 256.32000000041444,
+        "max_ms": 498.44280000252184,
+        "max_working_set_bytes": 14237696
+      },
+      "improvement_percent": -31.440285357641518
+    },
+    {
+      "case": "ordinary",
+      "before": {
+        "median_ms": 304.8644000009517,
+        "min_ms": 264.82290000421926,
+        "max_ms": 470.6551000053878,
+        "max_working_set_bytes": 15470592
+      },
+      "after": {
+        "median_ms": 379.7024999948917,
+        "min_ms": 253.01290000061272,
+        "max_ms": 718.816099994001,
+        "max_working_set_bytes": 15794176
+      },
+      "improvement_percent": -24.547995762609975
+    },
+    {
+      "case": "mixed-languages",
+      "before": {
+        "median_ms": 424.96789999859175,
+        "min_ms": 322.84549999894807,
+        "max_ms": 597.7315999989514,
+        "max_working_set_bytes": 21856256
+      },
+      "after": {
+        "median_ms": 482.44420000264654,
+        "min_ms": 118.27810000249883,
+        "max_ms": 729.845199995907,
+        "max_working_set_bytes": 21807104
+      },
+      "improvement_percent": -13.52485681959632
+    }
+  ],
+  "executable_sha256": {
+    "before": "078a1e38f099b0bd9185b82a5823ce5ab4d773a86f3aabd4452e68e2a139a1ae",
+    "after": "c296258227f9e5f87b87dee4e8009c02d9c950c8a9e8e8e279f6c534a86b5e7c"
+  }
+}

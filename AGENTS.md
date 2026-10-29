@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **Rust の cfg 判定と祖先列** — `engine/refs/walker.rs` は共通の `tree_walk::walk_preorder` で全ノードを前順に訪れ、Rust の場合だけ祖先列を深さに比例する領域で持ち回す (Issue #176)。`definition/rust.rs` の cfg/cfg_attr 判定はその列を内側から読む。識別子ごとの `Node::parent` 反復による深さの2乗の再探索を避け、部分木を起点にする場合は外側の祖先を一度だけ補う。条件キー・後続の derive・通常のマクロ引数、単一/バッチ/visitor/カウントの契約と位置・順序は維持する。回帰は `refs/tests/cfg_ancestors.rs` の旧実装との全ノード比較と全部分木比較、既存の cfg と walker の対照。性能比較は `tools/bench-refs.py` で旧新の実行順を交互にし、出力一致・時間・ピーク working set を記録する。closure 束縛や参照役割など、他の祖先判定をこの証拠で変えない。
+
 - **JS/TS/TSX の正規表現・静的 template の定数値変更** — `commands/api_changes/signature.rs` は公開 const の単純リテラルを専用の `JsConstLiteralKind` で比較し、正規表現同士の pattern/flags 変更を `RegExp`、置換なし template を既存の文字列と同じ種類として `const_value` に分類する (Issue #167)。名前・型注釈・公開指定・binding kind の一致と既存の strict policy を保持し、種類変更・置換・タグ・assertion/satisfies は従来どおり扱う。共有の `ScalarKind` と object/array の葉の判定は変更しない。JS/TS/TSX の実ノードと Query を照合し、通常/staged・strict・単行/複数行・Unicode/CRLF・refs の位置・静的 container の負例を CLI で対照する。
 
 - **Python の省略可能引数削除と閉包** — `commands/api_changes/python_optional_removal.rs` は、一意な通常直下関数の省略可能なキーワード専用引数、または末尾の既定値付き位置引数だけの削除を旧新 AST で確認し、変更後の全観測参照が直接呼び出し・宣言・解決済みの別名なし absolute import である場合に `mod_closed` へ分類する (Issue #166)。残存引数の順序・型・既定値・位置/keyword-only 区分とヘッダを保持し、未変更 caller も既存の引数契約照合へ通す。相対/別名/再 export・module 輸送・関数値・同名束縛・動的名前空間・非 ASCII 識別子・decorator・variadic/位置専用引数・解析失敗は証明しない。refs と同じ ignore/hidden 範囲を一度解析し、他言語/未対応ソース・リンク/junction・走査/読取失敗・512ソース/1件2MiB/合計8MiB/100,000ノード・entry/128階層の上限でも保留する。review の staged は index snapshot で照合し、refs/dead-code の出現契約と通常 impact の caller 一覧は維持する。外部利用者・解析範囲外・任意の runtime reflection は証明しない。
