@@ -22,10 +22,6 @@ jobs:
   quality:
     name: Quality (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    env:
-      # 非最適化の AST 解析を繰り返すテストが長いため、テストと検査対象の CLI だけを軽く最適化する。
-      # test profile の debug assertion / overflow check と既定 feature は維持する。
-      CARGO_PROFILE_TEST_OPT_LEVEL: '1'
     strategy:
       fail-fast: false
       matrix:
@@ -54,10 +50,12 @@ jobs:
 
   # テストと配布用ビルドは成果物を受け渡さないので、Windows でも独立して始める。
   test-windows:
-    name: Test (Windows)
+    name: Test (Windows, ${{ matrix.suite }})
     runs-on: windows-latest
-    env:
-      CARGO_PROFILE_TEST_OPT_LEVEL: '1'
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [unit, integration]
     steps:
       - name: Keep LF line endings
         run: git config --global core.autocrlf false
@@ -71,11 +69,30 @@ jobs:
           version: 2026.10.4
           cache: false
 
-      # job 名と最適化設定が鍵に入るので、release build のキャッシュと混ざらない。
+      # 既存の Windows build の鍵 (key + job 名) を共有し、依存を再取得しない。
+      # 保存は build に任せ、2つのテストジョブは同じキャッシュを読む。
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: x86_64-pc-windows-msvc-build
+          save-if: 'false'
 
-      - name: Test
-        run: cargo test --locked
+      # Git / ファイル I/O の待機を重ねる。実行時だけの設定なのでキャッシュの鍵には入れない。
+      - name: Unit and binary tests
+        if: matrix.suite == 'unit'
+        env:
+          RUST_TEST_THREADS: '8'
+        run: cargo test --locked --lib --bins
+
+      - name: Documentation tests
+        if: matrix.suite == 'unit'
+        run: cargo test --locked --doc
+
+      # wildcard で全統合テストターゲットを含め、今後のターゲット追加も漏らさない。
+      - name: Integration tests
+        if: matrix.suite == 'integration'
+        env:
+          RUST_TEST_THREADS: '8'
+        run: cargo test --locked --test '*'
 
   build:
     name: Build (${{ matrix.target }})
