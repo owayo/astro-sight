@@ -34,7 +34,9 @@ const MAX_SHRINK_ITERATIONS: usize = 64;
 ///
 /// 返る `shown` が 0 になることは許容する。予算が極端に小さい場合に「最低 1 件は返す」と
 /// すると予算そのものが守られなくなるため。CLI 側は `--token-budget` に下限
-/// ([`crate::models::result_summary::MIN_TOKEN_BUDGET`]) を課してこの状況を避ける。
+/// ([`crate::models::result_summary::MIN_TOKEN_BUDGET`]) を課し、`refs` は申告の代表パスを
+/// 参照より先に縮める ([`apply_refs_limits`])。それでも件数・申告の本文・rollup のような
+/// 縮められない部分が予算を超えれば、0 件まで下がって `budget_exceeded` を申告する。
 pub fn apply_limits<T, F>(
     records: &[T],
     limits: ResultLimits,
@@ -51,7 +53,7 @@ where
     }
 
     // 1. まず件数上限を適用する。
-    let capped_by_count = limits.max_results.map_or(total, |m| m.min(total));
+    let capped_by_count = count_capped(total, limits);
     let mut shown = capped_by_count;
 
     // 2. 予算上限を適用する。サマリの大きさは `shown` に依存する (省略分の rollup が
@@ -118,46 +120,18 @@ where
     T: RollupRecord,
     F: FnMut(&[usize], &[Option<ResultSummary>]) -> Result<String>,
 {
-    let counts: Vec<usize> = groups.iter().map(|g| g.len()).collect();
-    let total: usize = counts.iter().sum();
-
     if limits.is_unlimited() {
+        let counts = groups.iter().map(|g| g.len()).collect();
         return Ok((counts, vec![None; groups.len()]));
     }
 
-    let capped_by_count = limits.max_results.map_or(total, |m| m.min(total));
-    let mut budget_slots = capped_by_count;
-
-    // 「件数上限だけを適用したときの配分」。各グループのサマリで
-    // 「件数上限で切れたのか、呼び出し全体の予算でさらに切れたのか」を区別する基準線に使う。
-    let count_only = round_robin_allocate(&counts, capped_by_count);
-
-    // rollup の採寸は「呼び出し全体の予算 ÷ グループ数」で行う。全体予算をそのまま
-    // 各グループへ渡すと rollup がグループ数だけ多重計上され、予算を大幅に超過する。
-    let per_group_rollup_budget = limits
-        .token_budget
-        .map(|b| (b / groups.len().max(1)).max(1));
-    let summaries_for = |alloc: &[usize]| -> Vec<Option<ResultSummary>> {
-        groups
-            .iter()
-            .enumerate()
-            .map(|(i, group)| {
-                build_summary(
-                    group,
-                    alloc[i],
-                    limits,
-                    complete_input,
-                    count_only[i],
-                    per_group_rollup_budget,
-                )
-            })
-            .collect()
-    };
+    let plan = GroupedCountPlan::new(groups, limits);
+    let mut budget_slots = plan.capped_by_count;
 
     if let Some(budget) = limits.token_budget {
         for _ in 0..MAX_SHRINK_ITERATIONS {
-            let alloc = round_robin_allocate(&counts, budget_slots);
-            let summaries = summaries_for(&alloc);
+            let alloc = round_robin_allocate(&plan.counts, budget_slots);
+            let summaries = plan.summaries(groups, &alloc, limits, complete_input);
             let text = render(&alloc, &summaries)?;
             let size = estimated_tokens(&text);
             if size <= budget || budget_slots == 0 {
@@ -170,8 +144,8 @@ where
         }
     }
 
-    let alloc = round_robin_allocate(&counts, budget_slots);
-    let mut summaries = summaries_for(&alloc);
+    let alloc = round_robin_allocate(&plan.counts, budget_slots);
+    let mut summaries = plan.summaries(groups, &alloc, limits, complete_input);
     // 予算に収まらなかったことは呼び出し全体の性質なので、出力される全サマリに
     // 同じ値を立てる (NDJSON はグループごとに 1 行で、呼び出し全体を表す場所が無い)。
     if let Some(budget) = limits.token_budget {
@@ -195,6 +169,10 @@ where
 ///
 /// `complete_input` は生成物の除外 (`skipped`) と読み込み・parse 失敗の両方から決める
 /// ([`RefsResult::input_is_complete`])。
+///
+/// 参照を削る前に、申告 (`skipped` / `truncations`) の代表パスを縮める
+/// ([`fit_declaration_samples`])。代表パスが長いと、申告だけで予算を使い切って参照が
+/// 0 件まで削られていたため。
 pub fn apply_refs_limits<F>(
     result: &mut RefsResult,
     limits: ResultLimits,
@@ -205,6 +183,7 @@ where
 {
     let complete_input = result.input_is_complete();
     let references = std::mem::take(&mut result.references);
+    fit_declaration_samples(result, &references, limits, complete_input, &mut render)?;
     let (shown, summary) = apply_limits(&references, limits, complete_input, |k, summary| {
         let probe = RefsResult {
             symbol: result.symbol.clone(),
@@ -241,6 +220,7 @@ where
     F: FnMut(&[RefsResult]) -> Result<String>,
 {
     let complete_input = results.iter().all(RefsResult::input_is_complete);
+    fit_batch_declaration_samples(results, limits, complete_input, &mut render)?;
     let groups: Vec<&[SymbolReference]> = results.iter().map(|r| r.references.as_slice()).collect();
     let (alloc, summaries) =
         apply_grouped_limits(&groups, limits, complete_input, |alloc, summaries| {
@@ -271,6 +251,194 @@ pub fn apply_refs_batch_limits_json(
     limits: ResultLimits,
 ) -> Result<()> {
     apply_refs_batch_limits(results, limits, |capped| Ok(serde_json::to_string(capped)?))
+}
+
+/// 件数上限までの参照を削らずに済むよう、申告 (`skipped` / `truncations`) の代表パスを
+/// 先に縮める。
+///
+/// 代表パスは入力の欠落を調べる手掛かりで、観測した参照より優先しない。件数上限までの
+/// 参照と一緒に予算へ収まる最大の件数 (リストごとに同じ上限) を探し、どの件数でも
+/// 収まらなければ 0 件にして、参照の縮小 ([`apply_limits`]) に任せる。件数
+/// (`generated` / `detail.count`) は残し、縮めたリストには理由 (`token_budget`) を付ける。
+/// 元から予算に収まる出力は変えない。
+fn fit_declaration_samples<F>(
+    result: &mut RefsResult,
+    references: &[SymbolReference],
+    limits: ResultLimits,
+    complete_input: bool,
+    render: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&RefsResult) -> Result<String>,
+{
+    let max_cap = result.declaration_sample_len();
+    let Some(budget) = limits.token_budget else {
+        return Ok(());
+    };
+    if max_cap == 0 {
+        return Ok(());
+    }
+    let shown = count_capped(references.len(), limits);
+    let mut probe = RefsResult {
+        symbol: result.symbol.clone(),
+        references: references[..shown].to_vec(),
+        skipped: None,
+        truncations: Vec::new(),
+        result_summary: build_summary(
+            references,
+            shown,
+            limits,
+            complete_input,
+            shown,
+            limits.token_budget,
+        ),
+        failed_files: result.failed_files,
+    };
+    let cap = largest_fitting_sample_cap(max_cap, budget, |cap| {
+        (probe.skipped, probe.truncations) =
+            result.declarations_with_sample_cap(cap, ResultLimitKind::TokenBudget);
+        render(&probe)
+    })?
+    .unwrap_or(0);
+    (result.skipped, result.truncations) =
+        result.declarations_with_sample_cap(cap, ResultLimitKind::TokenBudget);
+    Ok(())
+}
+
+/// [`fit_declaration_samples`] のバッチ版 (呼び出し全体で 1 予算)。
+///
+/// 件数上限だけを配った状態 ([`GroupedCountPlan`]) で収まる最大の件数を探し、全結果の
+/// 申告に同じ上限を掛ける。申告は通常先頭の結果にだけ付くが、それを前提にしない。
+fn fit_batch_declaration_samples<F>(
+    results: &mut [RefsResult],
+    limits: ResultLimits,
+    complete_input: bool,
+    render: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&[RefsResult]) -> Result<String>,
+{
+    let max_cap = results
+        .iter()
+        .map(RefsResult::declaration_sample_len)
+        .max()
+        .unwrap_or(0);
+    let Some(budget) = limits.token_budget else {
+        return Ok(());
+    };
+    if max_cap == 0 {
+        return Ok(());
+    }
+    let groups: Vec<&[SymbolReference]> = results.iter().map(|r| r.references.as_slice()).collect();
+    let plan = GroupedCountPlan::new(&groups, limits);
+    let summaries = plan.summaries(&groups, &plan.count_only, limits, complete_input);
+    let mut probes: Vec<RefsResult> = results
+        .iter()
+        .zip(summaries)
+        .zip(&plan.count_only)
+        .map(|((r, summary), &shown)| RefsResult {
+            symbol: r.symbol.clone(),
+            references: r.references[..shown].to_vec(),
+            skipped: None,
+            truncations: Vec::new(),
+            result_summary: summary,
+            failed_files: r.failed_files,
+        })
+        .collect();
+    let cap = largest_fitting_sample_cap(max_cap, budget, |cap| {
+        for (probe, result) in probes.iter_mut().zip(results.iter()) {
+            (probe.skipped, probe.truncations) =
+                result.declarations_with_sample_cap(cap, ResultLimitKind::TokenBudget);
+        }
+        render(&probes)
+    })?
+    .unwrap_or(0);
+    for result in results.iter_mut() {
+        (result.skipped, result.truncations) =
+            result.declarations_with_sample_cap(cap, ResultLimitKind::TokenBudget);
+    }
+    Ok(())
+}
+
+/// 申告の代表パスの件数を `max_cap` から 1 件ずつ減らして描画し、予算に収まった最初の
+/// 件数を返す。どの件数でも収まらなければ `None`。
+///
+/// 二分探索にしないのは、描画の大きさが件数について単調だと言えないため
+/// (`--format auto` の形式選択と予算判定は別の尺度で、TOON の nullable 補完の採否も
+/// 別の尺度で決まる)。上から順に試せば、単調でなくても収まる最大の件数が得られる。
+fn largest_fitting_sample_cap<F>(
+    max_cap: usize,
+    budget: usize,
+    mut render: F,
+) -> Result<Option<usize>>
+where
+    F: FnMut(usize) -> Result<String>,
+{
+    for cap in (0..=max_cap).rev() {
+        if estimated_tokens(&render(cap)?) <= budget {
+            return Ok(Some(cap));
+        }
+    }
+    Ok(None)
+}
+
+/// 件数上限だけを掛けたときの出力件数。
+fn count_capped(total: usize, limits: ResultLimits) -> usize {
+    limits.max_results.map_or(total, |m| m.min(total))
+}
+
+/// グループ版の「件数上限だけを掛けた状態」と、グループごとのサマリの組み立て方。
+/// [`apply_grouped_limits`] と [`fit_batch_declaration_samples`] で同じ計算を使う。
+struct GroupedCountPlan {
+    counts: Vec<usize>,
+    capped_by_count: usize,
+    /// 件数上限だけを適用したときの配分。各グループのサマリで「件数上限で切れたのか、
+    /// 呼び出し全体の予算でさらに切れたのか」を区別する基準線に使う。
+    count_only: Vec<usize>,
+    /// rollup の採寸に使う予算 (呼び出し全体の予算 ÷ グループ数)。全体予算をそのまま
+    /// 各グループへ渡すと rollup がグループ数だけ多重計上され、予算を大幅に超過する。
+    per_group_rollup_budget: Option<usize>,
+}
+
+impl GroupedCountPlan {
+    fn new<T>(groups: &[&[T]], limits: ResultLimits) -> Self {
+        let counts: Vec<usize> = groups.iter().map(|g| g.len()).collect();
+        let capped_by_count = count_capped(counts.iter().sum(), limits);
+        let count_only = round_robin_allocate(&counts, capped_by_count);
+        let per_group_rollup_budget = limits
+            .token_budget
+            .map(|b| (b / groups.len().max(1)).max(1));
+        Self {
+            counts,
+            capped_by_count,
+            count_only,
+            per_group_rollup_budget,
+        }
+    }
+
+    /// グループごとに `alloc[i]` 件を出したときのサマリ。
+    fn summaries<T: RollupRecord>(
+        &self,
+        groups: &[&[T]],
+        alloc: &[usize],
+        limits: ResultLimits,
+        complete_input: bool,
+    ) -> Vec<Option<ResultSummary>> {
+        groups
+            .iter()
+            .enumerate()
+            .map(|(i, group)| {
+                build_summary(
+                    group,
+                    alloc[i],
+                    limits,
+                    complete_input,
+                    self.count_only[i],
+                    self.per_group_rollup_budget,
+                )
+            })
+            .collect()
+    }
 }
 
 /// 各グループへ 1 件ずつ順に配りながら `budget` スロットを使い切る。
@@ -747,5 +915,517 @@ mod refs_tests {
             pretty.references.len(),
             compact.references.len()
         );
+    }
+}
+
+/// 申告 (`skipped` / `truncations`) の代表パスは、参照より先に縮める (Issue #181)。
+#[cfg(test)]
+mod declaration_sample_tests {
+    use super::*;
+    use crate::models::reference::RefKind;
+    use crate::models::skip::SkippedFiles;
+    use crate::models::truncation::TruncationInfo;
+
+    const LONG_DIR: &str =
+        "generated/a_rather_long_generated_directory_name/another_nested_package_directory";
+    const TOKEN_BUDGET: ResultLimitKind = ResultLimitKind::TokenBudget;
+
+    /// `refs` 件の参照と、生成物 `paths + 10` 件 (代表パス `paths` 件) の申告を持つ結果。
+    fn result_with(refs: usize, paths: usize) -> RefsResult {
+        RefsResult {
+            symbol: "Alpha".into(),
+            references: (0..refs)
+                .map(|i| SymbolReference {
+                    path: format!("src/caller{}.php", i % 3),
+                    line: i,
+                    column: 5,
+                    context: Some(format!("$a{i} = new Alpha();")),
+                    kind: Some(RefKind::Reference),
+                    confidence: None,
+                })
+                .collect(),
+            skipped: (paths > 0).then(|| SkippedFiles {
+                generated: paths + 10,
+                paths: (0..paths)
+                    .map(|i| format!("{LONG_DIR}/generated_message_type_{i:02}.php"))
+                    .collect(),
+                truncated: true,
+                paths_limited_by: None,
+            }),
+            truncations: Vec::new(),
+            result_summary: None,
+            failed_files: 0,
+        }
+    }
+
+    /// 解析できないソースの申告 (拡張子 10 種 × 長い代表パス 3 件)。
+    fn unanalyzable_declarations() -> Vec<TruncationInfo> {
+        [
+            "astro", "dart", "erb", "groovy", "lua", "mdx", "scala", "svelte", "twig", "vue",
+        ]
+        .iter()
+        .map(|ext| {
+            let examples: Vec<String> = (1..=3)
+                .map(|i| format!("{LONG_DIR}/component_template_{i}.{ext}"))
+                .collect();
+            TruncationInfo::unanalyzable_source(ext, 3, &examples)
+        })
+        .collect()
+    }
+
+    fn json(result: &RefsResult) -> Result<String> {
+        Ok(serde_json::to_string(result)?)
+    }
+
+    fn tokens(result: &RefsResult) -> usize {
+        estimated_tokens(&json(result).unwrap())
+    }
+
+    /// 参照の列 (`SymbolReference` は `PartialEq` を持たないので出力の形で比べる)。
+    fn refs_json(result: &RefsResult) -> serde_json::Value {
+        serde_json::to_value(&result.references).unwrap()
+    }
+
+    fn budget(tokens: usize) -> ResultLimits {
+        ResultLimits {
+            max_results: Some(100),
+            token_budget: Some(tokens),
+        }
+    }
+
+    /// `cap` 件に縮めた申告を付けた `original` の描画の大きさ (縮めた理由のフィールドと
+    /// 作り直した `message` を含む)。
+    fn cost_at(original: &RefsResult, cap: usize) -> usize {
+        let mut probe = original.clone();
+        (probe.skipped, probe.truncations) =
+            original.declarations_with_sample_cap(cap, TOKEN_BUDGET);
+        tokens(&probe)
+    }
+
+    /// 件数上限までの参照を全部出し、代表パスだけを予算に収まる最大の件数まで縮める。
+    ///
+    /// 予算をちょうど「2 件に縮めた描画」の大きさにすると 2 件を選ぶ。縮めた理由の
+    /// フィールドと作り直した `message` の分まで採寸に含めていないと、この境界で外れる。
+    #[test]
+    fn samples_shrink_before_any_reference_is_cut() {
+        let mut original = result_with(2, 50);
+        original.truncations = unanalyzable_declarations();
+        let limit = cost_at(&original, 2);
+        assert!(cost_at(&original, 3) > limit, "前提: 3 件では収まらない");
+        let mut result = original.clone();
+        apply_refs_limits_json(&mut result, budget(limit)).unwrap();
+
+        assert_eq!(refs_json(&result), refs_json(&original), "参照は削らない");
+        assert!(
+            result.result_summary.is_none(),
+            "参照の省略が無ければサマリは出さない"
+        );
+        assert!(tokens(&result) <= limit, "{} > {limit}", tokens(&result));
+
+        let skipped = result.skipped.as_ref().unwrap();
+        let original_paths = &original.skipped.as_ref().unwrap().paths;
+        assert_eq!(skipped.generated, 60, "全件数は残す");
+        assert!(skipped.truncated);
+        assert_eq!(skipped.paths_limited_by, Some(TOKEN_BUDGET));
+        assert_eq!(
+            skipped.paths[..],
+            original_paths[..2],
+            "先頭からの prefix を残す"
+        );
+        for (after, before) in result.truncations.iter().zip(&original.truncations) {
+            let (after, before) = (
+                after.detail.as_ref().unwrap(),
+                before.detail.as_ref().unwrap(),
+            );
+            assert_eq!(after.count, before.count, "件数は残す");
+            assert_eq!(after.examples[..], before.examples[..2]);
+            assert_eq!(after.examples_limited_by, Some(TOKEN_BUDGET));
+        }
+    }
+
+    /// 代表パスのリストごとに同じ上限を掛けるので、短いリスト (代表パス 3 件) は長い
+    /// リスト (50 件) が 3 件まで縮むまで元のまま (理由も付けない)。
+    #[test]
+    fn longer_sample_lists_shrink_first() {
+        let mut original = result_with(2, 50);
+        original.truncations = unanalyzable_declarations();
+        let limit = cost_at(&original, 10);
+        let mut result = original.clone();
+        apply_refs_limits_json(&mut result, budget(limit)).unwrap();
+
+        assert_eq!(refs_json(&result), refs_json(&original));
+        let skipped = result.skipped.as_ref().unwrap();
+        assert_eq!(skipped.paths.len(), 10);
+        assert_eq!(skipped.paths_limited_by, Some(TOKEN_BUDGET));
+        assert_eq!(
+            serde_json::to_value(&result.truncations).unwrap(),
+            serde_json::to_value(&original.truncations).unwrap(),
+            "縮めていないリストは元のまま"
+        );
+    }
+
+    /// 対照: 元から予算に収まるなら、申告は元のまま (理由も付けない) で出力はバイト一致。
+    #[test]
+    fn samples_are_untouched_when_everything_fits() {
+        let mut original = result_with(2, 50);
+        original.truncations = unanalyzable_declarations();
+        for limits in [
+            budget(tokens(&original)),
+            ResultLimits {
+                max_results: Some(100),
+                token_budget: None,
+            },
+            ResultLimits::UNLIMITED,
+        ] {
+            let mut result = original.clone();
+            apply_refs_limits_json(&mut result, limits).unwrap();
+            assert_eq!(
+                json(&result).unwrap(),
+                json(&original).unwrap(),
+                "{limits:?}"
+            );
+        }
+    }
+
+    /// 代表パスを 0 件にしても参照が収まらないときだけ参照を削り、代表パスは 0 件のまま。
+    #[test]
+    fn references_are_cut_only_after_samples_reach_zero() {
+        let original = result_with(100, 50);
+        let limit = tokens(&result_with(100, 0)) / 2;
+        let mut result = original.clone();
+        apply_refs_limits_json(&mut result, budget(limit)).unwrap();
+
+        let skipped = result.skipped.as_ref().unwrap();
+        assert!(skipped.paths.is_empty(), "{}", skipped.paths.len());
+        assert_eq!(skipped.generated, 60);
+        assert_eq!(skipped.paths_limited_by, Some(TOKEN_BUDGET));
+        assert!(
+            !result.references.is_empty() && result.references.len() < 100,
+            "{}",
+            result.references.len()
+        );
+        let summary = result.result_summary.as_ref().unwrap();
+        assert_eq!(summary.limited_by, vec![ResultLimitKind::TokenBudget]);
+        assert!(!summary.budget_exceeded);
+        assert!(tokens(&result) <= limit, "{} > {limit}", tokens(&result));
+    }
+
+    /// 描画の大きさが代表パスの件数について単調でなくても、収まる最大の件数を選ぶ。
+    /// 0 件で超えても途中の件数を試す (二分探索だと参照の縮小へ進んでしまう)。
+    #[test]
+    fn non_monotonic_renderer_still_gets_the_largest_fitting_cap() {
+        // 代表パスが 3 件のときだけ小さく描画される (形式の切り替えを模す)。
+        let render = |probe: &RefsResult| -> Result<String> {
+            let paths = probe.skipped.as_ref().map_or(0, |s| s.paths.len());
+            let size = if paths == 3 { 100 } else { 1_000 };
+            // 改行なしなら `estimated_tokens` は「文字数 / 3」の切り上げ。
+            Ok("x".repeat(size * 3))
+        };
+        let mut result = result_with(2, 6);
+        apply_refs_limits(&mut result, budget(200), render).unwrap();
+        assert_eq!(result.references.len(), 2, "参照は削らない");
+        assert!(result.result_summary.is_none());
+        let skipped = result.skipped.as_ref().unwrap();
+        assert_eq!(skipped.paths.len(), 3);
+        assert_eq!(skipped.paths_limited_by, Some(TOKEN_BUDGET));
+    }
+
+    /// 申告に代表パスが無ければ、描画の回数は参照の縮小 ([`apply_limits`]) だけのときと同じ。
+    #[test]
+    fn no_extra_render_without_samples() {
+        let original = result_with(150, 0);
+        let limits = budget(400);
+        let mut calls = 0;
+        let mut result = original.clone();
+        apply_refs_limits(&mut result, limits, |probe| {
+            calls += 1;
+            json(probe)
+        })
+        .unwrap();
+
+        let mut baseline = 0;
+        let references = original.references.clone();
+        apply_limits(&references, limits, true, |k, summary| {
+            baseline += 1;
+            json(&RefsResult {
+                references: references[..k].to_vec(),
+                result_summary: summary.cloned(),
+                ..original.clone()
+            })
+        })
+        .unwrap();
+        assert_eq!(calls, baseline);
+    }
+
+    /// 既知の制約 (既存の割り切り): 参照が 0 件で、代表パスを 0 件にしても申告の本文だけで
+    /// 予算を超える場合、参照の省略が無いので `result_summary` (と `budget_exceeded`) は
+    /// 出ない。代表パスを縮めたことは `examples_limited_by` で分かる。
+    #[test]
+    fn unmeetable_budget_without_reference_omission_has_no_summary() {
+        let mut original = result_with(0, 0);
+        original.truncations = unanalyzable_declarations();
+        let limit = crate::models::result_summary::MIN_TOKEN_BUDGET;
+        let mut result = original.clone();
+        apply_refs_limits_json(&mut result, budget(limit)).unwrap();
+
+        assert!(result.result_summary.is_none());
+        assert!(tokens(&result) > limit, "この入力は予算に収まらない");
+        for truncation in &result.truncations {
+            let detail = truncation.detail.as_ref().unwrap();
+            assert!(detail.examples.is_empty());
+            assert_eq!(detail.count, 3);
+            assert_eq!(detail.examples_limited_by, Some(TOKEN_BUDGET));
+        }
+    }
+
+    /// バッチ: 呼び出し全体の 1 予算でも、件数上限までの参照を全部配ったまま代表パスを
+    /// 縮める。申告が先頭以外の結果にあっても縮め、申告の無い結果はそのまま。
+    #[test]
+    fn batch_samples_shrink_before_any_slot_is_cut() {
+        for carrier in [0usize, 2] {
+            let mut batch: Vec<RefsResult> = ["Alpha", "Beta", "Gamma", "Delta"]
+                .iter()
+                .enumerate()
+                .map(|(i, name)| RefsResult {
+                    symbol: name.to_string(),
+                    ..result_with(2, if i == carrier { 50 } else { 0 })
+                })
+                .collect();
+            let refs_only: Vec<RefsResult> = batch
+                .iter()
+                .map(|r| RefsResult {
+                    skipped: None,
+                    ..r.clone()
+                })
+                .collect();
+            let limit = estimated_tokens(&serde_json::to_string(&refs_only).unwrap()) + 300;
+            let original = batch.clone();
+            apply_refs_batch_limits_json(&mut batch, budget(limit)).unwrap();
+
+            for (after, before) in batch.iter().zip(&original) {
+                assert_eq!(refs_json(after), refs_json(before), "{}", after.symbol);
+                assert!(after.result_summary.is_none(), "{}", after.symbol);
+            }
+            let skipped = batch[carrier].skipped.as_ref().unwrap();
+            assert!(skipped.paths.len() < 50, "{}", skipped.paths.len());
+            assert_eq!(skipped.generated, 60);
+            assert_eq!(skipped.paths_limited_by, Some(TOKEN_BUDGET));
+            for (i, result) in batch.iter().enumerate() {
+                if i != carrier {
+                    assert!(result.skipped.is_none(), "{}", result.symbol);
+                }
+            }
+            let rendered = serde_json::to_string(&batch).unwrap();
+            assert!(estimated_tokens(&rendered) <= limit);
+        }
+    }
+
+    /// バッチ: 代表パスを 0 件にしても収まらないときだけスロットを削り、round-robin の
+    /// 配分 (少ない名前を飢餓させない) は保つ。
+    #[test]
+    fn batch_slots_are_cut_only_after_samples_reach_zero() {
+        let mut batch = vec![
+            RefsResult {
+                symbol: "hot".into(),
+                ..result_with(100, 50)
+            },
+            RefsResult {
+                symbol: "rare".into(),
+                ..result_with(2, 0)
+            },
+        ];
+        let refs_only = vec![result_with(100, 0), result_with(2, 0)];
+        let limit = estimated_tokens(&serde_json::to_string(&refs_only).unwrap()) / 2;
+        apply_refs_batch_limits_json(&mut batch, budget(limit)).unwrap();
+
+        let skipped = batch[0].skipped.as_ref().unwrap();
+        assert!(skipped.paths.is_empty());
+        assert_eq!(skipped.paths_limited_by, Some(TOKEN_BUDGET));
+        assert!(batch[0].references.len() < 100);
+        assert_eq!(batch[1].references.len(), 2, "少ない名前は飢餓しない");
+        assert!(estimated_tokens(&serde_json::to_string(&batch).unwrap()) <= limit);
+    }
+
+    /// 採寸の目安に使う予算の値。サマリの `limits` に載る数字の桁だけが描画の大きさに効く。
+    const PROBE_BUDGET: usize = 1_000;
+
+    /// 件数上限 `max_results` で切った参照とそのサマリに、`cap` 件に縮めた申告を付けた
+    /// 単一の結果の描画の大きさ。
+    fn single_cost(original: &RefsResult, max_results: usize, cap: usize) -> usize {
+        let limits = ResultLimits {
+            max_results: Some(max_results),
+            token_budget: Some(PROBE_BUDGET),
+        };
+        let shown = count_capped(original.references.len(), limits);
+        let (skipped, truncations) = original.declarations_with_sample_cap(cap, TOKEN_BUDGET);
+        tokens(&RefsResult {
+            references: original.references[..shown].to_vec(),
+            skipped,
+            truncations,
+            result_summary: build_summary(
+                &original.references,
+                shown,
+                limits,
+                original.input_is_complete(),
+                shown,
+                limits.token_budget,
+            ),
+            ..original.clone()
+        })
+    }
+
+    /// [`single_cost`] のバッチ版 (件数上限だけを round-robin で配った状態)。
+    fn batch_cost(batch: &[RefsResult], max_results: usize, cap: usize) -> usize {
+        let limits = ResultLimits {
+            max_results: Some(max_results),
+            token_budget: Some(PROBE_BUDGET),
+        };
+        let complete_input = batch.iter().all(RefsResult::input_is_complete);
+        let groups: Vec<&[SymbolReference]> =
+            batch.iter().map(|r| r.references.as_slice()).collect();
+        let plan = GroupedCountPlan::new(&groups, limits);
+        let summaries = plan.summaries(&groups, &plan.count_only, limits, complete_input);
+        let probes: Vec<RefsResult> = batch
+            .iter()
+            .zip(summaries)
+            .zip(&plan.count_only)
+            .map(|((r, result_summary), &shown)| {
+                let (skipped, truncations) = r.declarations_with_sample_cap(cap, TOKEN_BUDGET);
+                RefsResult {
+                    references: r.references[..shown].to_vec(),
+                    skipped,
+                    truncations,
+                    result_summary,
+                    ..r.clone()
+                }
+            })
+            .collect();
+        estimated_tokens(&serde_json::to_string(&probes).unwrap())
+    }
+
+    /// 件数上限で参照が切れる場合も、件数上限のサマリ込みで採寸して代表パスだけを縮める。
+    /// 参照は件数上限まで出し、`limited_by` は `max_results` だけのまま。
+    #[test]
+    fn samples_shrink_together_with_the_count_cap() {
+        let original = result_with(4, 50);
+        // 代表パスを 0 件にすれば収まり、50 件のままでは収まらない予算。
+        let limit = (single_cost(&original, 2, 0) + single_cost(&original, 2, 50)) / 2;
+        let limits = ResultLimits {
+            max_results: Some(2),
+            token_budget: Some(limit),
+        };
+        let mut result = original.clone();
+        apply_refs_limits_json(&mut result, limits).unwrap();
+
+        assert_eq!(
+            refs_json(&result),
+            serde_json::to_value(&original.references[..2]).unwrap()
+        );
+        let summary = result.result_summary.as_ref().unwrap();
+        assert_eq!((summary.shown, summary.total), (2, 4));
+        assert_eq!(summary.limited_by, vec![ResultLimitKind::MaxResults]);
+        assert!(!summary.complete_input, "生成物を除外しているので不完全");
+        assert!(!summary.budget_exceeded);
+        let skipped = result.skipped.as_ref().unwrap();
+        assert!(
+            !skipped.paths.is_empty() && skipped.paths.len() < 50,
+            "{}",
+            skipped.paths.len()
+        );
+        assert_eq!(skipped.paths_limited_by, Some(TOKEN_BUDGET));
+        assert!(tokens(&result) <= limit, "{} > {limit}", tokens(&result));
+    }
+
+    /// `max_results = 0` でも省略のサマリは保ち、代表パスだけを縮める。縮められない部分
+    /// だけで予算を超えるなら、代表パスを 0 件にしたうえで `budget_exceeded` を申告する。
+    #[test]
+    fn zero_max_results_keeps_the_summary_and_shrinks_samples() {
+        let original = result_with(3, 50);
+        let limit = (single_cost(&original, 0, 0) + single_cost(&original, 0, 50)) / 2;
+        let mut result = original.clone();
+        apply_refs_limits_json(
+            &mut result,
+            ResultLimits {
+                max_results: Some(0),
+                token_budget: Some(limit),
+            },
+        )
+        .unwrap();
+        assert!(result.references.is_empty());
+        let summary = result.result_summary.as_ref().unwrap();
+        assert_eq!((summary.shown, summary.omitted), (0, 3));
+        assert_eq!(summary.limited_by, vec![ResultLimitKind::MaxResults]);
+        assert!(!summary.budget_exceeded);
+        let skipped = result.skipped.as_ref().unwrap();
+        assert!(!skipped.paths.is_empty() && skipped.paths.len() < 50);
+        assert_eq!(skipped.paths_limited_by, Some(TOKEN_BUDGET));
+        assert!(tokens(&result) <= limit);
+
+        // 解析できないソースの申告 10 件の本文だけで最小の予算を超える場合。
+        let mut heavy = result_with(3, 50);
+        heavy.truncations = unanalyzable_declarations();
+        let limit = crate::models::result_summary::MIN_TOKEN_BUDGET;
+        assert!(
+            single_cost(&heavy, 0, 0) > limit,
+            "前提: 0 件でも収まらない"
+        );
+        apply_refs_limits_json(
+            &mut heavy,
+            ResultLimits {
+                max_results: Some(0),
+                token_budget: Some(limit),
+            },
+        )
+        .unwrap();
+        let summary = heavy.result_summary.as_ref().unwrap();
+        assert!(summary.budget_exceeded, "守れなかった予算は申告する");
+        assert!(heavy.skipped.as_ref().unwrap().paths.is_empty());
+        assert!(
+            heavy
+                .truncations
+                .iter()
+                .all(|t| t.detail.as_ref().unwrap().examples.is_empty())
+        );
+    }
+
+    /// バッチで件数上限による配分 (`[4, 2]` を 3 件 → `[2, 1]`) と代表パスの縮小が同時に
+    /// 起きる。申告は後ろの結果にあり、サマリは件数上限の分だけを申告する。
+    #[test]
+    fn batch_samples_shrink_together_with_the_count_cap() {
+        let original = vec![
+            RefsResult {
+                symbol: "four".into(),
+                ..result_with(4, 0)
+            },
+            RefsResult {
+                symbol: "two".into(),
+                ..result_with(2, 50)
+            },
+        ];
+        let limit = (batch_cost(&original, 3, 0) + batch_cost(&original, 3, 50)) / 2;
+        let mut batch = original.clone();
+        apply_refs_batch_limits_json(
+            &mut batch,
+            ResultLimits {
+                max_results: Some(3),
+                token_budget: Some(limit),
+            },
+        )
+        .unwrap();
+
+        let shown: Vec<usize> = batch.iter().map(|r| r.references.len()).collect();
+        assert_eq!(shown, vec![2, 1], "件数上限の round-robin 配分のまま");
+        for (result, total) in batch.iter().zip([4, 2]) {
+            let summary = result.result_summary.as_ref().unwrap();
+            assert_eq!(summary.total, total, "{}", result.symbol);
+            assert_eq!(summary.limited_by, vec![ResultLimitKind::MaxResults]);
+            assert!(!summary.complete_input, "{}", result.symbol);
+            assert!(!summary.budget_exceeded, "{}", result.symbol);
+        }
+        assert!(batch[0].skipped.is_none());
+        let skipped = batch[1].skipped.as_ref().unwrap();
+        assert!(!skipped.paths.is_empty() && skipped.paths.len() < 50);
+        assert_eq!(skipped.paths_limited_by, Some(TOKEN_BUDGET));
+        assert!(estimated_tokens(&serde_json::to_string(&batch).unwrap()) <= limit);
     }
 }

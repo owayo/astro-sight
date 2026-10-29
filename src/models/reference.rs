@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::result_summary::{ResultSummary, RollupRecord};
+use super::result_summary::{ResultLimitKind, ResultSummary, RollupRecord};
 use super::skip::SkippedFiles;
 use super::truncation::TruncationInfo;
 
@@ -108,5 +108,36 @@ impl RefsResult {
     /// 拡張子のファイルまで含めた網羅性は保証しない。
     pub fn input_is_complete(&self) -> bool {
         self.skipped.is_none() && self.failed_files == 0 && self.truncations.is_empty()
+    }
+
+    /// 申告 (`skipped` / `truncations`) の代表パスのリストのうち、最も長いものの件数。
+    /// 申告に代表パスが無ければ 0。
+    pub fn declaration_sample_len(&self) -> usize {
+        let skipped = self.skipped.as_ref().map_or(0, |s| s.paths.len());
+        self.truncations
+            .iter()
+            .map(TruncationInfo::example_count)
+            .fold(skipped, usize::max)
+    }
+
+    /// 申告の代表パスをリストごとに先頭 `cap` 件までに絞った `(skipped, truncations)`。
+    /// 実際に縮めたリストには `limited_by` を記録する。
+    ///
+    /// 件数 (`skipped.generated` / `detail.count`) は保つので、`input_is_complete` も
+    /// 変わらない。`cap` が [`Self::declaration_sample_len`] 以上なら元のままの写しになる。
+    pub fn declarations_with_sample_cap(
+        &self,
+        cap: usize,
+        limited_by: ResultLimitKind,
+    ) -> (Option<SkippedFiles>, Vec<TruncationInfo>) {
+        (
+            self.skipped
+                .as_ref()
+                .map(|s| s.with_path_cap(cap, limited_by)),
+            self.truncations
+                .iter()
+                .map(|t| t.with_example_cap(cap, limited_by))
+                .collect(),
+        )
     }
 }
