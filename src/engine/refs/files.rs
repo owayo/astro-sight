@@ -290,6 +290,7 @@ pub fn skipped_files_from_relative(mut paths: Vec<String>) -> Option<SkippedFile
         generated,
         truncated: generated > paths.len(),
         paths,
+        paths_limited_by: None,
     })
 }
 

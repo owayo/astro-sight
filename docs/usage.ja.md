@@ -146,7 +146,7 @@ TypeScript の interface / abstract メソッドと Go の interface メソッ�
 
 マーカーはコメント行頭の宣言形だけを認識するため、文字列リテラルや「automatically generated comments」のような通常コメント中の説明では発火しない。
 
-除外が 1 件以上あれば、stdout に必ず機械可読な `skipped` を出す。`skipped` がなければ除外は 0 件である。`paths` には決定的にソートした先頭 50 件が入る。全件数は常に `generated` に入り、省略の有無は `truncated` で確認できる。
+除外が 1 件以上あれば、stdout に必ず機械可読な `skipped` を出す。`skipped` がなければ除外は 0 件である。`paths` には決定的にソートした先頭 50 件が入る。全件数は常に `generated` に入り、省略の有無は `truncated` で確認できる。`refs` では、参照と `paths` が出力の上限に一緒に収まらないときも `paths` を縮め、`paths_limited_by: "token_budget"` を付ける（[出力件数の上限](#出力件数の上限と-result_summary)）。
 
 ```json
 {"symbol":"foo","refs":[],"skipped":{"generated":2,"paths":["gen/a.rs","gen/b.rs"]}}
@@ -274,12 +274,13 @@ Bash では変数代入、`$NAME` / `${NAME}` 展開、`local` / `export` / `dec
 高頻度な識別子は 1 回の呼び出しで数千件返り、表現をいくら最適化してもトークン消費が膨れ上がる（導入時点の実測: 自リポジトリの `refs --name new --dir .` が 1,846 件 ≈ 68,000 トークン）。エージェントは呼ぶ前にその識別子が高頻度だと知りようがないため、既定で **100 件 / 推定 3,000 トークン**の上限を課す（同条件で約 2,600 トークンに収まる）。
 
 - **解析は止めない。** 全件解析して `total` を正確に出し、出力だけを絞る。件数で走査を打ち切ると、正確な総数も省略分の内訳も取れなくなる
-- 省略が 1 件でも起きたときだけ `result_summary` を出す。上限に当たらない通常の問い合わせでは `result_summary` は付かず、出力は上限を外したとき（`unlimited`）とバイト単位で同じ
+- 省略が 1 件でも起きたときだけ `result_summary` を出す。上限に当たらない通常の問い合わせでは `result_summary` は付かず、出力は上限を外したとき（`unlimited`）とバイト単位で同じ。申告の代表パスだけを縮めた場合も `result_summary` は付かず、縮めたリストに `paths_limited_by` / `examples_limited_by` が付く（後述）
 - 上限が効くのは出力だけ。`dead-code` / API 差分 / hook の判定は、全件を見た内部結果で行う
 - `--max-results` / `--token-budget` はいずれも `unlimited` を受ける。`--token-budget` の下限は 256（それ未満だとサマリ自体が収まらない）
 - `refs --names` では、呼び出し全体で 1 つの予算を round-robin で配分する。名前ごとに上限を課すと全体が名前数に比例して膨らみ、先頭から詰めると高頻度な 1 名が予算を食い尽くして後続が 0 件になる
 - 同じ上限は `session` の `max_results` / `token_budget`（数値または `"unlimited"`）と MCP の `refs_search` / `refs_batch_search` にも適用される
-- **守れなかった予算は申告する。** サマリ自体に固定コストがあるため、名前数が多く予算が小さいと、表示件数を 0 にしても予算を超える。その場合は `result_summary.budget_exceeded: true` を出す（予算を上げる / 名前を減らす / `--glob` で絞る、のいずれかが要ることを示す）。`refs --names` では、名前ごとの省略分の内訳（rollup）を「呼び出し全体の予算 ÷ 名前数」に収めるので、名前を増やしてもサマリが多重に膨らむことはない
+- **申告の代表パスは参照に譲る。** `skipped.paths` と `truncations[].detail.examples` は、走査から外れたものを調べるための標本である。`--max-results` までの参照と一緒に予算へ収まらなければ、参照より先に標本を縮める。どのリストも先頭から同じ件数だけ残し、件数（`skipped.generated` / `detail.count`）はそのまま出す。縮めたリストには `paths_limited_by` / `examples_limited_by: "token_budget"` を付け、`unanalyzable_source` の `message` も残したパスだけを挙げる。参照を削るのは、どのリストも 0 件にしてなお収まらないときだけ。生成物の長いパスの一覧に押し出されて、参照が 1 件も出なくなることはない
+- **守れなかった予算は申告する。** サマリ自体に固定コストがあるため、名前数が多く予算が小さいと、表示件数を 0 にしても予算を超える。その場合は `result_summary.budget_exceeded: true` を出す（予算を上げる / 名前を減らす / `--glob` で絞る、のいずれかが要ることを示す）。`refs --names` では、名前ごとの省略分の内訳（rollup）を「呼び出し全体の予算 ÷ 名前数」に収めるので、名前を増やしてもサマリが多重に膨らむことはない。参照が 1 件も無い名前には `result_summary` が付かないので、申告だけで予算を超えてもこのフラグは出ない
 
 ```json
 {

@@ -97,7 +97,9 @@ Output: `refs` array with `path`, `ln`, `col`, `ctx` (source line), `kind` (`def
 }
 ```
 
-`total` is exact. `by_lang` / `files` describe **only the omitted refs** — use them to narrow with `--glob` (e.g. if most omitted hits are in another language, the name collides across languages). Raise or remove the cap with `--max-results N|unlimited` and `--token-budget N|unlimited`. If no results are omitted, `result_summary` is absent and output is byte-identical to before. A `budget_exceeded: true` field means the output could not be squeezed into `--token-budget` even at zero shown refs (the summary itself has a fixed cost) — raise the budget, pass fewer names, or narrow with `--glob`.
+`total` is exact. `by_lang` / `files` describe **only the omitted refs** — use them to narrow with `--glob` (e.g. if most omitted hits are in another language, the name collides across languages). Raise or remove the cap with `--max-results N|unlimited` and `--token-budget N|unlimited`. If no results are omitted, `result_summary` is absent; output is byte-identical to an unlimited run unless sample paths were shortened (below). A `budget_exceeded: true` field means the output could not be squeezed into `--token-budget` even at zero shown refs (the summary itself has a fixed cost) — raise the budget, pass fewer names, or narrow with `--glob`.
+
+Sample paths in `skipped.paths` and `truncations[].detail.examples` give way to refs: they are shortened before any ref is cut, the counts (`skipped.generated`, `detail.count`) stay, and a shortened list carries `paths_limited_by` / `examples_limited_by: "token_budget"`. Those fields mean only the sample was cut, not the refs; pass `--token-budget unlimited` to see every sample path.
 
 ### `calls` — Call Graph Extraction
 

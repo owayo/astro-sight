@@ -54,6 +54,7 @@ mod integration {
     mod python_optional_removal;
     mod python_private_owner_removal;
     mod refs;
+    mod refs_declaration_budget;
     mod required_type_members;
     mod review;
     mod review_dead_scope;

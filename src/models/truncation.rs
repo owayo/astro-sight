@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::result_summary::ResultLimitKind;
+
 /// 解析対象を意図的に打ち切った (カバレッジを削った) ことを機械可読に伝える。
 ///
 /// `SkipInfo` が「コマンド全体を解析しなかった」大域的な skip を表すのに対し、
@@ -34,6 +36,9 @@ pub struct UnanalyzableSourceSummary {
     /// 代表パスに切り詰める前の全件数。
     pub count: usize,
     pub examples: Vec<String>,
+    /// 出力の上限に収めるために `examples` を縮めたときだけ付く理由 (`token_budget`)。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub examples_limited_by: Option<ResultLimitKind>,
 }
 
 /// 打ち切りの理由。
@@ -137,6 +142,7 @@ impl TruncationInfo {
             extension: ext.to_ascii_lowercase(),
             count,
             examples: examples.to_vec(),
+            examples_limited_by: None,
         };
         let mut message = format!(
             "{} \".{}\" file(s) were not analyzed (no parser for this language); \
@@ -151,6 +157,36 @@ impl TruncationInfo {
             reason: TruncationReason::UnanalyzableSource,
             message,
             detail: Some(detail),
+        }
+    }
+
+    /// 代表パス (未解析ソースの `detail.examples`) の件数。代表パスを持たない申告は 0。
+    pub fn example_count(&self) -> usize {
+        match (&self.reason, &self.detail) {
+            (TruncationReason::UnanalyzableSource, Some(detail)) => detail.examples.len(),
+            _ => 0,
+        }
+    }
+
+    /// 代表パスを先頭 `cap` 件までに絞った写し。`message` も絞った代表パスで作り直し、
+    /// 実際に縮めたときだけ `limited_by` を `detail.examples_limited_by` に記録する。
+    ///
+    /// 件数 (`detail.count`) は保つ。代表パスを持たない申告と、`cap` が代表パスの件数
+    /// 以上のときはそのまま返す (出力の予算に収めるために標本だけを縮める用途)。
+    pub fn with_example_cap(&self, cap: usize, limited_by: ResultLimitKind) -> Self {
+        match (&self.reason, &self.detail) {
+            (TruncationReason::UnanalyzableSource, Some(detail)) if cap < detail.examples.len() => {
+                let mut capped = Self::unanalyzable_source(
+                    &detail.extension,
+                    detail.count,
+                    &detail.examples[..cap],
+                );
+                if let Some(capped_detail) = capped.detail.as_mut() {
+                    capped_detail.examples_limited_by = Some(limited_by);
+                }
+                capped
+            }
+            _ => self.clone(),
         }
     }
 }
@@ -181,5 +217,56 @@ mod tests {
         assert_eq!(serde_json::to_value(legacy).unwrap(), old);
         let size = TruncationInfo::untracked_file_too_large("generated.rs", "lines", 6000, 5000);
         assert!(serde_json::to_value(size).unwrap().get("detail").is_none());
+    }
+
+    /// 代表パスだけを縮め、件数は保ち、`message` は縮めた代表パスで作り直し、
+    /// 縮めた理由を `detail.examples_limited_by` に残す。
+    #[test]
+    fn with_example_cap_shrinks_only_the_examples() {
+        let budget = ResultLimitKind::TokenBudget;
+        let examples = vec!["a.vue".to_owned(), "b.vue".to_owned(), "c.vue".to_owned()];
+        let info = TruncationInfo::unanalyzable_source("vue", 12, &examples);
+        assert_eq!(info.example_count(), 3);
+
+        // 対照: 代表パスの件数以上の上限では元のまま (理由も付けない)。
+        assert_eq!(info.with_example_cap(3, budget), info);
+        assert_eq!(info.with_example_cap(50, budget), info);
+        assert!(
+            serde_json::to_value(&info).unwrap()["detail"]
+                .get("examples_limited_by")
+                .is_none()
+        );
+
+        let one = info.with_example_cap(1, budget);
+        let mut expected = TruncationInfo::unanalyzable_source("vue", 12, &examples[..1]);
+        expected.detail.as_mut().unwrap().examples_limited_by = Some(budget);
+        assert_eq!(one, expected);
+        assert!(one.message.ends_with("(e.g. a.vue)"), "{}", one.message);
+
+        let none = info.with_example_cap(0, budget);
+        assert_eq!(
+            none.message,
+            "12 \".vue\" file(s) were not analyzed (no parser for this language); references inside them are not counted"
+        );
+        assert_eq!(
+            serde_json::to_value(&none).unwrap()["detail"],
+            serde_json::json!({
+                "extension": "vue",
+                "count": 12,
+                "examples": [],
+                "examples_limited_by": "token_budget"
+            })
+        );
+
+        // 代表パスを持たない申告 (旧形式・他の理由) はそのまま。
+        let legacy: TruncationInfo = serde_json::from_value(
+            serde_json::json!({"reason":"unanalyzable_source", "message":"legacy summary"}),
+        )
+        .unwrap();
+        assert_eq!(legacy.example_count(), 0);
+        assert_eq!(legacy.with_example_cap(0, budget), legacy);
+        let size = TruncationInfo::untracked_file_too_large("generated.rs", "lines", 6000, 5000);
+        assert_eq!(size.example_count(), 0);
+        assert_eq!(size.with_example_cap(0, budget), size);
     }
 }
