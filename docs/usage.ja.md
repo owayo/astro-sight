@@ -2,6 +2,8 @@
 
 サブコマンドごとの使い方と出力の例をまとめる。diff を受け取るコマンド (`context` / `impact` / `review` / `dead-code` / `cochange`) は [diff の解析](diff-analysis.ja.md)、出力の形式は [出力形式](output-format.ja.md)、設定ファイルは [設定](configuration.ja.md) にある。
 
+Rust の `format!`・`format_args!`・`print!`・`println!`・`eprint!`・`eprintln!`・`write!`・`writeln!` のリテラル内で暗黙に参照する名前を、幅・精度の指定も含めて数えます。明示した名前付き引数を優先し、raw/cooked 文字列・Unicode エスケープ・CRLF の元の byte 位置を保ちます。通常の文章・二重波括弧・生成した書式・マクロ定義・未知の外側マクロからはキャプチャを追加しません。マクロの別名や一般のマクロ展開・名前解決は行いません。[Rust の書式規則](https://doc.rust-lang.org/std/fmt/#named-parameters)を参照してください。
+
 ## グローバルオプション
 
 ```bash

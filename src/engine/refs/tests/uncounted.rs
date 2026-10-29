@@ -1,5 +1,19 @@
 use super::*;
 
+#[test]
+fn stream_scan_keeps_escaped_format_names_across_chunks() {
+    let names = vec!["VALUE".to_string(), "OTHER".to_string()];
+    let acs = build_batch_acs(&names).unwrap();
+    let source = b"format!(\"{VA\\u{4c}UE}\")";
+    for chunk in 1..=12 {
+        assert_eq!(
+            stream_present_indices_from(&acs, &names, source.as_slice(), chunk, u64::MAX),
+            Some(vec![0, 1]),
+            "chunk={chunk}"
+        );
+    }
+}
+
 /// 読み込めないファイルのストリーム走査は、チャンクの境界をまたぐ名前も拾い、
 /// ファイル全体を一度に検索した場合と同じ集合を返す。
 #[test]
