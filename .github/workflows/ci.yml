@@ -17,16 +17,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # 検査の中身は Makefile の ci が定義する (fmt-check / clippy / cargo check / cargo test)。
+  # 検査の中身は Makefile の ci が定義する (fmt-check / clippy / cargo test)。
   # ここには OS 固有の準備だけを置き、検査コマンドを重ねて書かない
   quality:
     name: Quality (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      # 非最適化の AST 解析を繰り返すテストが長いため、テストと検査対象の CLI だけを軽く最適化する。
+      # test profile の debug assertion / overflow check と既定 feature は維持する。
+      CARGO_PROFILE_TEST_OPT_LEVEL: '1'
     strategy:
       fail-fast: false
       matrix:
         # Windows は入れない。ランナーの make は MinGW の mingw32-make の写しで、レシピの POSIX シェル前提
-        # ($$(...) や [ -n ... ]) の解釈に癖がある。Windows のテストは build で cargo を直接呼ぶ
+        # ($$(...) や [ -n ... ]) の解釈に癖がある。Windows のテストは test-windows で cargo を直接呼ぶ
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
@@ -48,9 +52,34 @@ jobs:
       - run: make setup
       - run: make ci
 
+  # テストと配布用ビルドは成果物を受け渡さないので、Windows でも独立して始める。
+  test-windows:
+    name: Test (Windows)
+    runs-on: windows-latest
+    env:
+      CARGO_PROFILE_TEST_OPT_LEVEL: '1'
+    steps:
+      - name: Keep LF line endings
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.4
+          cache: false
+
+      # job 名と最適化設定が鍵に入るので、release build のキャッシュと混ざらない。
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked
+
   build:
     name: Build (${{ matrix.target }})
-    needs: quality
+    # Quality とテストを待つ必要はない。全ジョブの成功で従来の検査範囲を確かめる。
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -102,12 +131,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-
-      # Windows は quality で make ci を回さないので、配る OS の裏付けとしてここでテストする
-      # (Makefile の test と同じく既定の feature で回す)
-      - name: Test (Windows)
-        if: runner.os == 'Windows'
-        run: cargo test --locked
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
