@@ -39,6 +39,8 @@ Bash/zsh parse failures are reported explicitly: recognizable declarations insid
 
 Rust cfg-condition classification reuses the current ancestor path to avoid repeated parent traversal on deep `use` paths. Reference positions, ordering, and cfg-key exclusions are preserved. See [performance checks](docs/development.md#reference-scan-performance) for the reproducible comparison.
 
+Symbol extraction indexes declaration ranges when assigning methods to their enclosing types, avoiding a comparison of every method with every type in large files. Existing ownership and output ordering rules are preserved. See [symbol extraction benchmarks](docs/development.md#symbol-extraction-performance).
+
 ## Features
 
 - **References by identifier**: `refs` lists the definitions and references of a symbol across a directory, and `refs --names` looks up many names in one pass

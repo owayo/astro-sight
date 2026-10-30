@@ -1,0 +1,94 @@
+{
+  "repeats": 9,
+  "mode": "session",
+  "suite": "symbols",
+  "os": "Windows-11-10.0.26300-SP0",
+  "processors": 16,
+  "python": "3.12.9",
+  "cases": [
+    {
+      "case": "classes-1000",
+      "before": {
+        "median_ms": 20.861200013314374,
+        "min_ms": 19.48679999622982,
+        "max_ms": 21.24970000295434,
+        "max_working_set_bytes": 20615168
+      },
+      "after": {
+        "median_ms": 20.80329999444075,
+        "min_ms": 19.78039999085013,
+        "max_ms": 25.72350000264123,
+        "max_working_set_bytes": 21086208
+      },
+      "improvement_percent": 0.2775488410861837
+    },
+    {
+      "case": "classes-4000",
+      "before": {
+        "median_ms": 93.06230000220239,
+        "min_ms": 90.46629999647848,
+        "max_ms": 101.61139999399893,
+        "max_working_set_bytes": 38830080
+      },
+      "after": {
+        "median_ms": 88.95259999553673,
+        "min_ms": 83.68199999677017,
+        "max_ms": 91.2749000126496,
+        "max_working_set_bytes": 39419904
+      },
+      "improvement_percent": 4.4160739704138035
+    },
+    {
+      "case": "classes-16000",
+      "before": {
+        "median_ms": 507.7196000056574,
+        "min_ms": 486.3557999924524,
+        "max_ms": 600.5355999950552,
+        "max_working_set_bytes": 88485888
+      },
+      "after": {
+        "median_ms": 360.7743000029586,
+        "min_ms": 352.92679999838583,
+        "max_ms": 465.18189999915194,
+        "max_working_set_bytes": 88604672
+      },
+      "improvement_percent": 28.942215348996058
+    },
+    {
+      "case": "functions-control",
+      "before": {
+        "median_ms": 65.16329999431036,
+        "min_ms": 62.42570000176784,
+        "max_ms": 98.67409999424126,
+        "max_working_set_bytes": 27340800
+      },
+      "after": {
+        "median_ms": 68.77030000032391,
+        "min_ms": 63.09140000666957,
+        "max_ms": 93.15590000187512,
+        "max_working_set_bytes": 27410432
+      },
+      "improvement_percent": -5.535324341045489
+    },
+    {
+      "case": "real-rust",
+      "before": {
+        "median_ms": 42.34090000682045,
+        "min_ms": 36.33360000094399,
+        "max_ms": 49.76100000203587,
+        "max_working_set_bytes": 21164032
+      },
+      "after": {
+        "median_ms": 40.84899999725167,
+        "min_ms": 37.53270000743214,
+        "max_ms": 63.26439999975264,
+        "max_working_set_bytes": 21159936
+      },
+      "improvement_percent": 3.523543451670752
+    }
+  ],
+  "executable_sha256": {
+    "before": "6dee0019eea8fa97ec84dc3c8a7e61fa5df79e2d100ffda2802c3f2a307baca2",
+    "after": "11462b760ea8ad9878fada57c112bada56312f30e09d7866589f79d3135371fb"
+  }
+}
