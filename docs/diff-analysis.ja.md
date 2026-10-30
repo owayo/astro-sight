@@ -599,6 +599,8 @@ astro-sight review --dir . --git
 
 git blame と diff-tree から、指定ファイルと一緒に変更されやすいファイルを検出する。`review --git --base <rev>` の `missing_cochanges` でも同じ解析を使う。
 
+SHA-1 と SHA-256 のリポジトリで、blame のメタデータ、履歴 fallback、merge 除外を同じように扱う。
+
 ```bash
 # git diff から起点ファイルを自動取得
 astro-sight cochange --dir . --git --base HEAD~5

@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **SHA-256 リポジトリの共変更証拠** — `engine/cochange.rs` の blame・履歴 fallback・merge 除外は、完全な40桁または64桁の ASCII 16進 OID を同じ private 判定で受け付ける (Issue #194)。blame は最初の空白までを OID とし、author-mail/time と既存のヘッダ・metadata 契約は保持する。不正幅・非16進は受理せず、ランキング・既定値・出力形式は変えない。unit は両幅の metadata と不正値、実 SHA-1/SHA-256 の merge/nonmerge を対照し、CLI は history4件・blame1件・review の候補/診断の一致を確認する。
+
 - **TS/TSX の拡張子変更と署名比較** — `commands/git_input/ts_extensions.rs` は `--git` の同一ディレクトリ・同一 stem の `.ts` ↔ `.tsx` だけを、旧新の候補ファイルと静的な相対 import の継続を監査した後に Modified diff へ対応付ける (Issue #192)。Git の D/A と内容変更を伴う R のどちらも同じ証拠を要求し、旧拡張子の明示参照が残る R は D/A として保持する。既存の API 互換判定・必須引数照合・impact を使い、名前一致だけの一般移動には広げない。新側は通常は作業ツリー、staged は index/snapshot を読み、base の祖先設定と ignore 外の設定も確認する。祖先の alias は論理・実体の両経路で設定を監査する。bare import・解決を変える設定・JSONC/壊れた設定・escape・動的 loader・require の持出し・埋込みソース・解析root/配下のリンク・読取/parse 失敗は証明しない。上限は tree 10,000entry、走査100,000entry、1ソース2MiB、旧新合計64MiB/100,000ノード。候補が無い diff は追加 Git 起動と走査をしない。外部 diff、JS/JSX、任意の runtime reflection、解析範囲外の利用は対象外で、refs/dead-code の出現契約は変えない。回帰は `tests/integration/ts_extension_changes.rs` の両方向・通常/staged・汚れた作業ツリー・サブディレクトリ・明示旧拡張子・loader・祖先/ignore 設定と実削除の対照。
 
 - **Rust の改行変換と不変の影響起点** — `engine/impact/rust_line_endings.rs` は CRLF を含む差分または新ソースに限り、同一パスの旧側を復元し、一意な name/kind の宣言全体と module/impl/trait の所属ヘッダ・属性・inner attribute を旧新 AST で比較する (Issue #178)。CRLF の CR だけを比較から外し、不変な宣言を affected/caller の起点から除く。実際の値・署名・型・リテラル内容・所属・属性の変更は残し、同名複数・解析/復元失敗・移動パス・2MiB/128階層/所属情報64KiBの上限は保留する。inner attribute はスコープごとに索引化し、refs/dead-code の出現契約は変えない。回帰は同モジュールの単体と `tests/integration/impact_rust_line_endings.rs` の LF/CRLF 両方向、混在、通常/staged (作業ツリーの別変更あり)、外部 diff、review、文字列・所属・曖昧さの対照。

@@ -599,6 +599,8 @@ For a removed Rust free function, the API check uses existing ownership proofs f
 
 `cochange` finds files that tend to change together with the given files, from git blame and diff-tree. `missing_cochanges` of `review --git --base <rev>` uses the same analysis.
 
+SHA-1 and SHA-256 repositories use the same evidence collection, including blame metadata, history fallback, and merge exclusion.
+
 ```bash
 # Take the starting files from the git diff
 astro-sight cochange --dir . --git --base HEAD~5

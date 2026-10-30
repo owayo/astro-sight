@@ -1205,22 +1205,22 @@ fn collect_blame_commits_for_file(
     parse_blame_porcelain(&blame_text)
 }
 
+/// Git が返す完全な SHA-1 / SHA-256 のコミット OID。
+fn is_commit_oid(oid: &str) -> bool {
+    matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// blame `--line-porcelain` 出力から SHA → BlameInfo を抽出する。
-/// 各 entry の先頭行 `<sha40> <orig> <final> [count]` をエントリ境界とし、
+/// 各 entry の先頭行 `<sha40|sha64> <orig> <final> [count]` をエントリ境界とし、
 /// それ以降の `author-mail <addr>` / `author-time <unix>` を SHA に紐付ける。
 fn parse_blame_porcelain(blame_text: &str) -> Result<HashMap<String, BlameInfo>> {
     let mut out: HashMap<String, BlameInfo> = HashMap::new();
     let mut current_sha: Option<String> = None;
     for line in blame_text.lines() {
-        let bytes = line.as_bytes();
-        // entry header: 40 hex + space + 残り
-        if bytes.len() >= 41
-            && bytes[40] == b' '
-            && bytes[..40].iter().all(|b| b.is_ascii_hexdigit())
+        if let Some((sha, _)) = line.split_once(' ')
+            && is_commit_oid(sha)
         {
-            let sha = std::str::from_utf8(&bytes[..40])
-                .expect("ascii hex is utf-8")
-                .to_string();
+            let sha = sha.to_owned();
             // 既出の SHA でも info を上書きしない (最初に出た情報を信頼)
             out.entry(sha.clone()).or_default();
             current_sha = Some(sha);
@@ -1304,7 +1304,7 @@ fn collect_history_commits_for_file(
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let mut parts = line.split('\0');
         let Some(sha) = parts.next() else { continue };
-        if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !is_commit_oid(sha) {
             continue;
         }
         let mail = parts.next().unwrap_or("").trim();
@@ -1377,7 +1377,7 @@ fn list_merge_commits(dir: &str, shas: &HashSet<String>) -> Result<HashSet<Strin
         }
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             let s = line.trim();
-            if s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if is_commit_oid(s) {
                 merges.insert(s.to_string());
             }
         }
@@ -3828,6 +3828,102 @@ filename a.rs
             .get("fedc1234567890abcd1234567890abcd00000000")
             .unwrap();
         assert_eq!(info2.author_mail.as_deref(), Some("other@example.com"));
+    }
+
+    #[test]
+    fn sha256_cochange_blame_headers_validate_oids_and_metadata() {
+        for width in [40, 64] {
+            let first = "aB12".repeat(width / 4);
+            let second = "dEf0".repeat(width / 4);
+            let blame = format!(
+                "{first} 1 1 1\nauthor-mail <first@example.com>\nauthor-time 1700000000\nfilename a.rs\n\tfn a() {{}}\n{second} 2 2\nauthor-mail <second@example.com>\nauthor-time 1701000000\nfilename a.rs\n\tfn b() {{}}\n"
+            );
+            let parsed = parse_blame_porcelain(&blame).unwrap();
+            assert_eq!(parsed.len(), 2, "width={width}: {parsed:?}");
+            assert_eq!(
+                parsed[&first].author_mail.as_deref(),
+                Some("first@example.com")
+            );
+            assert_eq!(parsed[&first].author_time, Some(1_700_000_000));
+            assert_eq!(
+                parsed[&second].author_mail.as_deref(),
+                Some("second@example.com")
+            );
+            assert_eq!(parsed[&second].author_time, Some(1_701_000_000));
+        }
+        for oid in [
+            String::new(),
+            "a".repeat(39),
+            "a".repeat(41),
+            "a".repeat(63),
+            "a".repeat(65),
+            format!("{}z", "a".repeat(39)),
+            format!("{}z", "a".repeat(63)),
+            "é".repeat(20),
+            "é".repeat(32),
+        ] {
+            let blame =
+                format!("{oid} 1 1 1\nauthor-mail <invalid@example.com>\nauthor-time 1700000000\n");
+            assert!(
+                parse_blame_porcelain(&blame).unwrap().is_empty(),
+                "invalid oid={oid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sha256_cochange_merge_filter_distinguishes_merge_and_regular_commits() {
+        for object_format in ["sha1", "sha256"] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path();
+            git_ok(
+                repo,
+                &[
+                    "init",
+                    "-q",
+                    "-b",
+                    "main",
+                    &format!("--object-format={object_format}"),
+                ],
+            );
+            git_ok(repo, &["config", "user.name", "test"]);
+            git_ok(repo, &["config", "user.email", "test@example.com"]);
+            commit_files(repo, &[("root.rs", "fn root() {}\n")], "root");
+            git_ok(repo, &["checkout", "-q", "-b", "side"]);
+            commit_files(repo, &[("side.rs", "fn side() {}\n")], "side");
+            git_ok(repo, &["checkout", "-q", "main"]);
+            commit_files(repo, &[("main.rs", "fn main() {}\n")], "main");
+            git_ok(repo, &["merge", "-q", "--no-ff", "side", "-m", "merge"]);
+            let listed = Command::new("git")
+                .args(["rev-list", "--all"])
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(listed.status.success());
+            let shas: HashSet<String> = String::from_utf8(listed.stdout)
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(shas.len(), 4);
+            let head = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(head.status.success());
+            let merge = String::from_utf8(head.stdout).unwrap().trim().to_owned();
+            assert_eq!(
+                list_merge_commits(repo.to_str().unwrap(), &shas).unwrap(),
+                HashSet::from([merge]),
+                "object_format={object_format}"
+            );
+            assert!(
+                list_merge_commits(repo.to_str().unwrap(), &HashSet::new())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     /// tie-break: ranking 値・co_changes 同点なら confidence 降順

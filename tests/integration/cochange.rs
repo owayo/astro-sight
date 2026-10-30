@@ -5,6 +5,103 @@ use super::support::*;
 #[allow(unused_imports)]
 use std::process::{Command, Stdio};
 
+#[test]
+fn sha256_cochange_matches_sha1_history_blame_and_review() {
+    let mut reports = Vec::new();
+    for object_format in ["sha1", "sha256"] {
+        let repo = TestRepo::new();
+        repo.git([
+            "init",
+            "-q",
+            "-b",
+            "main",
+            &format!("--object-format={object_format}"),
+        ]);
+        repo.git(["config", "user.name", "test"]);
+        repo.git(["config", "user.email", "test@example.com"]);
+        for value in 1..=4 {
+            repo.write("a.rs", format!("fn a() {{ let _ = {value}; }}\n"));
+            repo.write("b.rs", format!("fn b() {{ let _ = {value}; }}\n"));
+            repo.stage_all();
+            let output = Command::new("git")
+                .args(["commit", "-qm", &format!("pair {value}")])
+                .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00+00:00")
+                .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00+00:00")
+                .current_dir(repo.root())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        repo.write("a.rs", "fn a() { let _ = 9; }\n");
+        let history = repo.run_json(
+            "cochange",
+            &[
+                "--git",
+                "--base",
+                "HEAD",
+                "--min-samples",
+                "1",
+                "--min-denominator",
+                "2",
+                "--author-unit-window-days",
+                "0",
+            ],
+        );
+        assert_eq!(history["commits_analyzed"], 4, "{object_format}: {history}");
+        assert_eq!(history["entries"][0]["file_b"], "b.rs", "{history}");
+        assert_eq!(history["entries"][0]["evidence"], "history", "{history}");
+        assert_eq!(
+            history["diagnostics"]["sources_with_history_evidence"], 1,
+            "{history}"
+        );
+
+        let blame = repo.run_json(
+            "cochange",
+            &[
+                "--git",
+                "--base",
+                "HEAD",
+                "--history-limit",
+                "0",
+                "--min-samples",
+                "1",
+                "--min-denominator",
+                "1",
+                "--author-unit-window-days",
+                "0",
+            ],
+        );
+        assert_eq!(blame["commits_analyzed"], 1, "{object_format}: {blame}");
+        assert_eq!(blame["entries"][0]["file_b"], "b.rs", "{blame}");
+        assert_eq!(
+            blame["diagnostics"]["sources_with_blame_evidence"], 1,
+            "{blame}"
+        );
+
+        let mut review = repo.run_json(
+            "review",
+            &["--git", "--base", "HEAD", "--cochange-min-samples", "1"],
+        );
+        let head = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo.root())
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        let head = String::from_utf8(head.stdout).unwrap();
+        let missing = review["missing_cochanges"].as_array_mut().unwrap();
+        assert_eq!(missing.len(), 1, "{object_format}: {missing:?}");
+        assert_eq!(missing[0]["file"], "b.rs");
+        assert_eq!(missing[0]["interpretation"]["recent"]["base"], head.trim());
+        missing[0]["interpretation"]["recent"]["base"] = "<base>".into();
+        reports.push((history, blame, review));
+    }
+    assert_eq!(
+        reports[0], reports[1],
+        "SHA-1 と SHA-256 は同じ証拠・診断・候補を返す"
+    );
+}
+
 // ---- Co-change analysis tests (blame mode) ----
 
 #[test]
