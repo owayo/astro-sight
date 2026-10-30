@@ -25,6 +25,8 @@ lint、テスト、6 ターゲットの配布用ビルドは独立して開始�
 
 ビルドのキャッシュを保存するのは main への push だけで、PR は復元するだけにする。PR ごとに保存すると上限の 10GB を使い切り、main のキャッシュが追い出される。キャッシュの鍵はジョブの種類ごとに分け（`lint`、`test`、`build-<target>`）、テストのランナーは OS ごとに 1 つの鍵を共有して 1 番目だけが保存する。
 
+CI の各ジョブは `.github/actions/setup-tools` で `mise.toml` のツールを入れる。Rust はランナーのイメージにある rustup を使わず、`runner.temp` の下に作るジョブ専用の `RUSTUP_HOME` と `CARGO_HOME` に、mise が rustup ごと入れる。rust-cache は入っている全ツールチェーンの `rustc -vV` をキャッシュの鍵に入れるので、イメージの stable が `mise.toml` の版と違うと、イメージの版ごとに鍵が変わり、main が保存したキャッシュを外していた（macOS では配布用ビルドが 3 分台から 9〜12 分に延びた）。専用の home には `mise.toml` の版しか入らないので鍵はイメージに左右されず、ほかのツールチェーンが見えたらこの action がジョブを止める。rustup の導入で増える時間はジョブあたり 1 秒前後。`cargo install` で入れるものは無いので、`CARGO_HOME/bin` はキャッシュしない（`cache-bin: false`）。
+
 Cargo のコマンドには既定で `--locked` を付けている。`.cargo/config.toml` の `[patch]` でローカルの tree-sitter 系を差し込むと `Cargo.lock` が手元でだけ変わり、`--locked` で止まる。そのときは `make ci CARGO_FLAGS=` のように `CARGO_FLAGS` を空にする。
 
 `make install` はバイナリを入れた後に、Claude Code と Codex のスキルも書き込む。書き込む先は `SKILL_TARGETS` で選べる（既定は `claude codex`）。
