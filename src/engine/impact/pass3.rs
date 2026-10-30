@@ -129,6 +129,16 @@ pub(super) fn build_file_impact(
 ) -> FileImpact {
     // 同一ファイル内の call_edges をマージ
     for sym in &ctx.affected {
+        // 本体だけが変わった関数・メソッド、および新しく足した関数・メソッドは、呼び出し側を
+        // 直す必要がない。同一ファイルの call_edges は callee の名前だけで突き合わせるので、
+        // これらを対象に残すと `len` / `push` / `new` のような名前のメソッドを足しただけで、
+        // 標準の型に対する同名の呼び出しが impacted_callers に並ぶ。
+        // cross-file 探索の filter 3 と同じ基準で、シグネチャ変更のあるものだけを対象にする。
+        if matches!(sym.kind.as_str(), "function" | "method")
+            && !ctx.sig_changes.iter().any(|sc| sc.name == sym.name)
+        {
+            continue;
+        }
         let sym_key = ci_key(ctx.lang_id, &sym.name);
         for edge in &ctx.call_edges {
             if ci_key(ctx.lang_id, &edge.callee.name) == sym_key {

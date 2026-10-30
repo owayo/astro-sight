@@ -5,6 +5,109 @@ use super::support::*;
 #[allow(unused_imports)]
 use std::process::{Command, Stdio};
 
+/// 標準の型のメソッドと同じ名前の private メソッドを足しただけでは、同じファイルの
+/// 無関係な呼び出しを impacted_callers に出さない。
+///
+/// 同一ファイルの `call_edges` は callee の名前だけで突き合わせるので、`len` / `push` /
+/// `iter` のような名前のメソッドを足すと、`Vec` や slice に対する同名の呼び出しが
+/// 当たってしまう。本体だけの変更・新規追加はシグネチャ変更が無く、呼び出し側を直す
+/// 必要がないので、cross-file 探索と同じ基準で対象から外す。
+#[test]
+fn impact_added_private_methods_do_not_claim_same_file_std_calls() {
+    let repo = TestRepo::new();
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.create_dir_all("src");
+    repo.write(
+        "src/lib.rs",
+        r#"pub fn untouched(bytes: &[u8], names: &[String]) -> usize {
+    let mut out = Vec::new();
+    for name in names.iter() {
+        out.push(name.len());
+    }
+    bytes.len() + out.len()
+}
+
+pub fn collect_spans(names: &[String]) -> Vec<(u32, String)> {
+    names.iter().map(|n| (n.len() as u32, n.clone())).collect()
+}
+"#,
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    // untouched は 1 文字も変えず、private struct を足して collect_spans の戻り値の型だけ変える
+    repo.write(
+        "src/lib.rs",
+        r#"pub fn untouched(bytes: &[u8], names: &[String]) -> usize {
+    let mut out = Vec::new();
+    for name in names.iter() {
+        out.push(name.len());
+    }
+    bytes.len() + out.len()
+}
+
+#[derive(Default)]
+struct Spans {
+    inner: Vec<u32>,
+}
+
+impl Spans {
+    fn push(&mut self, value: u32) {
+        self.inner.push(value);
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.inner.iter().copied()
+    }
+}
+
+pub fn collect_spans(names: &[String]) -> Spans {
+    let mut spans = Spans::default();
+    for name in names {
+        spans.push(name.len() as u32);
+    }
+    spans
+}
+"#,
+    );
+
+    let context = repo.run_json("context", &["--git"]);
+    let changes = context["changes"].as_array().expect("changes");
+    let change = changes
+        .iter()
+        .find(|change| change["path"] == "src/lib.rs")
+        .expect("lib.rs の変更は見える");
+    // 戻り値の型を変えた collect_spans のシグネチャ変更は残る
+    assert!(
+        change["signature_changes"]
+            .as_array()
+            .expect("signature_changes")
+            .iter()
+            .any(|signature| signature["name"] == "collect_spans"),
+        "{change}"
+    );
+    for key in ["impacted_callers", "low_confidence_callers"] {
+        let callers = change[key].as_array().cloned().unwrap_or_default();
+        assert!(
+            callers.iter().all(|caller| {
+                caller["name"] != "untouched"
+                    && !["len", "push", "iter"].iter().any(|name| {
+                        caller["symbols"]
+                            .as_array()
+                            .is_some_and(|symbols| symbols.iter().any(|symbol| symbol == name))
+                    })
+            }),
+            "{key} に標準の型の呼び出しが出ている: {change}"
+        );
+    }
+}
+
 #[test]
 fn impact_python_relative_import_belongs_to_its_defining_module() {
     for consumer in [
