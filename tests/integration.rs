@@ -30,6 +30,7 @@ mod integration {
     mod impact_object_members;
     mod impact_output;
     mod impact_python_bindings;
+    mod impact_rust_anonymous_const;
     mod impact_rust_cargo_reachability;
     mod impact_rust_line_endings;
     mod impact_rust_private_helpers;
