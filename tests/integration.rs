@@ -74,6 +74,7 @@ mod integration {
     mod session;
     mod static_const_values;
     mod swift_grammar;
+    mod ts_extension_changes;
     mod ts_import_alias;
     mod ts_namespace_collisions;
     mod type_annotations;

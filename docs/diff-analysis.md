@@ -4,6 +4,8 @@ The commands here take a unified diff (with `--git`, the `git diff` of the worki
 
 Rust declarations touched only by LF/CRLF conversion are excluded as impact origins when the old and new ASTs prove their complete text, ownership, and attributes unchanged. Only physical CRLF is normalized; changes to literal spaces, blank lines, or `\r` / `\n` escapes remain visible. Duplicate names, changed paths, reconstruction/parse failures, large inputs, and deep ownership retain the conservative result. This applies to working-tree, staged, and external diffs, including the impact portion of review.
 
+With `--git`, a `.ts` ↔ `.tsx` extension change in the same directory can remain one module even when Git reports deletion and addition. After checking that static relative imports still resolve to that module, the usual signature comparison reports optional parameter additions as compatible and required additions with their affected callers. This applies to working-tree and staged changes. Explicit references to the old extension, ambiguous resolution, unsupported configuration or loaders, escapes, and incomplete source analysis retain the conservative result; external diffs are unchanged.
+
 ## context: Smart Context (Diff → Impact Analysis)
 
 `context` takes a unified diff and analyzes the scope of the change, to support AI code review. Function signature changes are matched on identifier boundaries, so two different functions whose names only share a prefix, such as `foo` and `foo_bar`, are not confused.

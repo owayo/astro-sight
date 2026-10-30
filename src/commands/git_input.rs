@@ -8,6 +8,7 @@ use super::common::{
     MAX_INPUT_SIZE, read_bytes_limited_and_drain, read_file_to_string_limited,
     read_paths_file_limited,
 };
+mod ts_extensions;
 pub use crate::git_support::DEFAULT_BLAME_BASE;
 pub(crate) use crate::git_support::validate_git_revision;
 
@@ -933,6 +934,7 @@ fn run_git_diff_collecting_truncations(
     if !staged {
         append_untracked_added_diffs(dir, &mut diff, truncations);
     }
+    ts_extensions::normalize(dir, base, staged, &mut diff);
     Ok(diff)
 }
 
