@@ -56,7 +56,7 @@ tree-sitter-kotlin = "=0.3.5"  # tree-sitter 0.27 と非互換 (0.3.8 以降が 
 tree-sitter-language = "0.1.9"
 tree-sitter-php = "0.25.1"
 tree-sitter-python = "0.25"
-tree-sitter-ruby = { git = "https://github.com/owayo/tree-sitter-ruby.git", tag = "v26.10.105" }
+tree-sitter-ruby = { git = "https://github.com/owayo/tree-sitter-ruby.git", tag = "v26.10.106" }
 tree-sitter-rust = "=0.24.2"
 tree-sitter-swift = "=0.7.3"
 tree-sitter-typescript = "=0.23.2"

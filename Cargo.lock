@@ -251,9 +251,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.9.0"
+version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "877bf67ac8e52449eb2f9e98a344ea163beb70dd1f9eebe3cc5357dcfeaee4df"
+checksum = "86e055fa6e3e40ad6187ba25b6855eeb635d5271f8e0f0e1e9a5826b8d75bea0"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -1780,8 +1780,8 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-ruby"
-version = "26.10.105"
-source = "git+https://github.com/owayo/tree-sitter-ruby.git?tag=v26.10.105#bfea52ceccccecaf518ab11e03dc8e63328d35d5"
+version = "26.10.106"
+source = "git+https://github.com/owayo/tree-sitter-ruby.git?tag=v26.10.106#12e6f527702e7a98a3b02bc0125e0861d39be36a"
 dependencies = [
  "cc",
  "tree-sitter-language",

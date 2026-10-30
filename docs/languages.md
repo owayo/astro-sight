@@ -16,7 +16,7 @@
 | <img src="https://img.shields.io/badge/-F05138?logo=swift&amp;logoColor=white" height="16"> Swift | `.swift` | `tree-sitter-swift` | 0.7 |
 | <img src="https://img.shields.io/badge/-512BD4?logo=dotnet&amp;logoColor=white" height="16"> C# | `.cs` | `tree-sitter-c-sharp` | 0.23 |
 | <img src="https://img.shields.io/badge/-4EAA25?logo=gnubash&amp;logoColor=white" height="16"> Bash | `.sh`, `.bash`, `.zsh` | `tree-sitter-bash` | 0.25 |
-| <img src="https://img.shields.io/badge/-CC342D?logo=ruby&amp;logoColor=white" height="16"> Ruby | `.rb`, `.rake`, `.gemspec` | `tree-sitter-ruby` | [v26.10.105](https://github.com/owayo/tree-sitter-ruby/releases/tag/v26.10.105) |
+| <img src="https://img.shields.io/badge/-CC342D?logo=ruby&amp;logoColor=white" height="16"> Ruby | `.rb`, `.rake`, `.gemspec` | `tree-sitter-ruby` | [v26.10.106](https://github.com/owayo/tree-sitter-ruby/releases/tag/v26.10.106) |
 | <img src="https://img.shields.io/badge/-F7A41D?logo=zig&amp;logoColor=white" height="16"> Zig | `.zig`, `.zon` | `tree-sitter-zig` | 1.1 |
 
 All 16 languages get precise symbol extraction through tree-sitter queries. Ruby supports Unicode identifiers, and method names containing characters subject to simple case folding, such as `ſ` and `K`, are extracted without gaps. Index assignments with spaces, `{}` right after unparenthesized lambda parameters, empty regular expressions, a block right after an unparenthesized call, and heredocs with an empty identifier also parse without syntax errors.
