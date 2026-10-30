@@ -10,13 +10,13 @@
 | <img src="https://img.shields.io/badge/-3178C6?logo=typescript&amp;logoColor=white" height="16"> TypeScript | `.ts`, `.mts`, `.cts` | `tree-sitter-typescript` | 0.23 |
 | <img src="https://img.shields.io/badge/-61DAFB?logo=react&amp;logoColor=black" height="16"> TSX | `.tsx` | `tree-sitter-typescript` | 0.23 |
 | <img src="https://img.shields.io/badge/-00ADD8?logo=go&amp;logoColor=white" height="16"> Go | `.go` | `tree-sitter-go` | 0.25 |
-| <img src="https://img.shields.io/badge/-777BB4?logo=php&amp;logoColor=white" height="16"> PHP | `.php`, `.phtml` | `tree-sitter-php` | 0.24 |
+| <img src="https://img.shields.io/badge/-777BB4?logo=php&amp;logoColor=white" height="16"> PHP | `.php`, `.phtml` | `tree-sitter-php` | 0.25 |
 | <img src="https://img.shields.io/badge/-ED8B00?logo=openjdk&amp;logoColor=white" height="16"> Java | `.java` | `tree-sitter-java` | 0.23 |
 | <img src="https://img.shields.io/badge/-7F52FF?logo=kotlin&amp;logoColor=white" height="16"> Kotlin | `.kt`, `.kts` | `tree-sitter-kotlin` | 0.3.5 * |
 | <img src="https://img.shields.io/badge/-F05138?logo=swift&amp;logoColor=white" height="16"> Swift | `.swift` | `tree-sitter-swift` | 0.7 |
 | <img src="https://img.shields.io/badge/-512BD4?logo=dotnet&amp;logoColor=white" height="16"> C# | `.cs` | `tree-sitter-c-sharp` | 0.23 |
 | <img src="https://img.shields.io/badge/-4EAA25?logo=gnubash&amp;logoColor=white" height="16"> Bash | `.sh`, `.bash`, `.zsh` | `tree-sitter-bash` | 0.25 |
-| <img src="https://img.shields.io/badge/-CC342D?logo=ruby&amp;logoColor=white" height="16"> Ruby | `.rb`, `.rake`, `.gemspec` | `tree-sitter-ruby` | [owayo/tree-sitter-ruby](https://github.com/owayo/tree-sitter-ruby) |
+| <img src="https://img.shields.io/badge/-CC342D?logo=ruby&amp;logoColor=white" height="16"> Ruby | `.rb`, `.rake`, `.gemspec` | `tree-sitter-ruby` | [v26.10.105](https://github.com/owayo/tree-sitter-ruby/releases/tag/v26.10.105) |
 | <img src="https://img.shields.io/badge/-F7A41D?logo=zig&amp;logoColor=white" height="16"> Zig | `.zig`, `.zon` | `tree-sitter-zig` | 1.1 |
 
 All 16 languages get precise symbol extraction through tree-sitter queries. Ruby supports Unicode identifiers, and method names containing characters subject to simple case folding, such as `ſ` and `K`, are extracted without gaps. Index assignments with spaces, `{}` right after unparenthesized lambda parameters, empty regular expressions, a block right after an unparenthesized call, and heredocs with an empty identifier also parse without syntax errors.
