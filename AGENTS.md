@@ -377,7 +377,7 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Build & Test
 
-開発コマンドは `make help` を参照する。ツールの版は `mise.toml` が正で、Makefile は `mise exec --` 経由でその版の `cargo` を呼ぶ（mise を使わない場合は `SYSTEM_TOOLS=1` を付ける）。
+開発コマンドは `make help` を参照する。ツールの版は `mise.toml` が正で、Makefile は `mise exec --` 経由でその版の `cargo` を呼ぶ（mise を使わない場合は `SYSTEM_TOOLS=1` を付ける）。配布物の URL と checksum は `mise.lock` に固定していて、版を変えたら `mise lock --platform linux-x64,linux-arm64,macos-x64,macos-arm64,windows-x64` で作り直す (CI の mise-action は lock があると `--locked` で入れる)。
 
 ```bash
 make setup    # mise.toml のツールチェーンを入れ、依存を取得する (初回と依存の更新後)
@@ -388,7 +388,7 @@ make ci       # check + test
 make help     # 全ターゲット表示
 ```
 
-- CI の lint (Linux の `make check`)、test (Linux / macOS を各 2 シャード。`make test TEST_PARTITION=slice:<m>/2`)、test-windows (5 シャード。Makefile の test と同じことを `cargo nextest run --partition slice:<m>/5` で直接呼ぶ)、6 ターゲットの build は独立して開始する。macOS の lint は別ランナーにせず、test の 1 番目が `make ci` で兼ねる (lint を分けると build の 2 つと合わせて macOS の同時実行の上限 5 を使い切る)。doctest は分割できないので各 OS の 1 番目のシャードだけが回し、残りは `TEST_DOC=0` で飛ばす。シャード数は、最も遅いシャードが配布用 build (約 7 分) より先に終わるように決めている
+- CI の lint (Linux の `make check`)、test (Linux / macOS を各 2 シャード。`make test TEST_PARTITION=slice:<m>/2`)、test-windows (5 シャード。Makefile の test と同じことを `cargo nextest run --partition slice:<m>/5` で直接呼ぶ)、6 ターゲットの build は独立して開始する。macOS の lint は別ランナーにせず、test の 1 番目が `make ci` で兼ねる (lint を分けると build の 2 つと合わせて macOS の同時実行の上限 5 を使い切る)。doctest は分割できないので各 OS の 1 番目のシャードだけが回し、残りは `TEST_DOC=0` で飛ばす。シャード数は、どのシャードも配布用 build (約 7 分) と同じころに終わることを目安に決めている。macOS のランナーは速さのばらつきが大きく、lint も回す 1 番目は build より長くなることがある
 - テストランナーは cargo-nextest (版は `mise.toml`、設定は `.config/nextest.toml`)。テストは 1 件ずつ別プロセスで走るので、テスト間で static やプロセスの状態 (環境変数・カレントディレクトリ) を共有する前提で書かない。並列数は既定 (CPU 数) のまま。テストの大半は git と astro-sight の子プロセスの起動待ちで、CPU 数より増やすと子プロセスが CPU を取り合って遅くなる (4 コアの Linux / Windows で 8・12 並列は悪化した)。CPU 律速の `deep_nesting::rust_impact_proofs_handle_deep_nesting` だけは `priority = 100` (最初に始める) と `threads-required = 2` を付ける (libtest の 8 並列では各コマンドの 300 秒期限を超えた)。同じように CPU を長く使うテストを足したら、同じ override に足す
 - Windows のテストは TMP / TEMP を `runner.temp` (作業ツリーと同じ D:) に置く。既定の TEMP (C:) では同じテストが 1.6 倍かかった。テストのステップだけ git の本体 (`git --exec-path` にある git.exe) を PATH の先頭に置く。PATH で見つかる `bin\git.exe` は本体を子プロセスとして起動し直すラッパーで、同じランナーで比べるとテストが 25% 前後縮んだ
 - キャッシュ (rust-cache) は main への push だけが保存し、PR は main のキャッシュを読むだけにする (PR ごとに保存すると上限 10GB を使い切り、main のキャッシュが追い出される)。鍵は用途ごとに分ける (`lint` / `test` / `build-<target>`)。test のシャードは OS ごとに 1 つの鍵を共有し、1 番目だけが保存する
