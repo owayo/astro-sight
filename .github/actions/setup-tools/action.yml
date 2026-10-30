@@ -1,0 +1,58 @@
+# CI の各ジョブの準備 (ci.yml から checkout の後に呼ぶ)。mise.toml のツールを mise-action で入れる。
+#
+# Rust はランナーのイメージにある rustup とツールチェーンを使わず、ジョブ専用の RUSTUP_HOME と CARGO_HOME
+# (runner.temp の下) に mise が rustup ごと入れる。rust-cache は rustup に入っている全ツールチェーンの
+# rustc -vV を鍵に入れる (v2.9.0 から)。イメージの stable が mise.toml の版と違うと、同じ mise.toml でも
+# イメージの版ごとに鍵が割れ、main が保存したキャッシュを外していた (macOS では stable が 1.99.0 のイメージと
+# 1.99.1 のイメージが混在し、外した回は release ビルドが 3 分台から 9〜12 分に延びた)。専用の home には
+# mise.toml の版しか入らないので、イメージの stable が上がっても鍵は変わらない。rustup の導入で増える時間は
+# ジョブあたり 1 秒前後 (計測で 0.2〜1.1 秒)
+name: Set up the tools from mise.toml
+description: Install the tools pinned in mise.toml, with Rust in job-local rustup and cargo homes
+
+inputs:
+  install_args:
+    description: Tools to install, passed to mise install (empty installs everything in mise.toml)
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # home のパスも鍵に入る (RUSTUP_HOME と CARGO_HOME の値) ので、run ID のように実行ごとに変わる値は混ぜない。
+    # mise-action より前に置き、mise が入れる先と後続のステップが読む先をそろえる。Windows ではパスの区切りを
+    # \ にそろえる (pwsh の Join-Path でもそろうが、Linux / macOS のランナーでは pwsh の起動だけで 1.1〜6.4 秒かかった)
+    - name: Use job-local Rust homes
+      shell: bash
+      run: |
+        if [ "$RUNNER_OS" = Windows ]; then sep='\'; else sep=/; fi
+        printf 'RUSTUP_HOME=%s\n' "${RUNNER_TEMP}${sep}rust${sep}rustup" >> "$GITHUB_ENV"
+        printf 'CARGO_HOME=%s\n' "${RUNNER_TEMP}${sep}rust${sep}cargo" >> "$GITHUB_ENV"
+
+    # ツールの版は mise.toml が正。mise 本体は公開から 14 日以上たった版を固定し、署名付きの checksum で
+    # 確かめて入れる (release.yml も同じ版を固定しているので、上げるときは両方)。cache は切る。mise-action の
+    # キャッシュは mise の導入済みの印だけを戻し、rustup が持つツールチェーンと components (clippy / rustfmt) を
+    # 戻さないため、復元した回だけ 'cargo-clippy' is not installed で落ちる (jdx/mise-action#215)。
+    # 専用の home には rustup が無いので、mise が rustup-init で入れてからツールチェーンを入れる。macOS の
+    # イメージは Homebrew の rustup を PATH に置いていて、rustup-init がそれを既存の Rust と見て
+    # "cannot install while Rust is installed" を出す (-y なので先へ進む)。home を分けているので共存してよく、
+    # 誤解を招く error の行を出さないよう確認を飛ばす (このステップだけの環境変数なので鍵には入らない)
+    - uses: jdx/mise-action@v4
+      env:
+        RUSTUP_INIT_SKIP_PATH_CHECK: "yes"
+      with:
+        version: 2026.10.4 # 2026-10-07 公開。14 日以上経過した版を固定する
+        cache: false
+        install_args: ${{ inputs.install_args }}
+
+    # rust-cache の鍵に入るツールチェーンが、mise の選んだ 1 つだけであることを確かめる。mise の更新などで
+    # home の扱いが変わり、イメージのツールチェーンがまた見えるようになったら、ここで止めて気づけるようにする
+    - name: Check that rustup has only the mise.toml toolchain
+      shell: bash
+      run: |
+        active=$(rustup show active-toolchain | cut -d' ' -f1)
+        installed=$(rustup toolchain list --quiet)
+        if [ "$installed" != "$active" ]; then
+          echo "::error::rustup has toolchains other than $active selected by mise: $(echo $installed)"
+          exit 1
+        fi

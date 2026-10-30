@@ -25,6 +25,8 @@ Tests keep the default concurrency (the number of CPUs). Most of their time goes
 
 Only pushes to main save the build caches; pull requests restore them without saving, so they do not fill the 10 GB cache limit and evict the caches of main. Each kind of job has its own cache key (`lint`, `test`, `build-<target>`), and the test runners of an OS share one key that the first runner saves.
 
+Each CI job installs the tools in `mise.toml` through `.github/actions/setup-tools`. Rust does not use the rustup that comes with the runner image: mise installs rustup and the toolchain into job-local `RUSTUP_HOME` and `CARGO_HOME` directories under `runner.temp`. rust-cache puts the `rustc -vV` of every installed toolchain into the cache key, so when the image's own stable toolchain differed from the version in `mise.toml`, the key changed with the image version and jobs missed the caches that main had saved (on macOS, the release builds went from about 3 minutes to 9–12). The job-local homes hold only the `mise.toml` toolchain, so the key no longer depends on the image, and the action stops the job if rustup sees any other toolchain. Installing rustup adds about a second per job. Nothing is installed with `cargo install`, so `CARGO_HOME/bin` is not cached (`cache-bin: false`).
+
 Cargo commands get `--locked` by default. When a `[patch]` in `.cargo/config.toml` swaps in local tree-sitter crates, `Cargo.lock` changes only on your machine and `--locked` stops the build. Empty `CARGO_FLAGS` in that case, as in `make ci CARGO_FLAGS=`.
 
 After installing the binary, `make install` also writes the skills for Claude Code and Codex. `SKILL_TARGETS` selects which ones (default `claude codex`).

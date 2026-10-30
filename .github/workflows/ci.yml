@@ -20,7 +20,8 @@ env:
 # 分け、どのシャードも配布用の build (約 7 分) と同じころに終わることを目安に数を決めている (macOS のランナーは
 # 速さのばらつきが大きく、lint も回す 1 番目は build より長くなることがある)。
 # キャッシュは main への push だけが保存する。PR は main のキャッシュを読むだけにして、PR ごとのキャッシュで
-# 容量の上限 (10GB) を使い切らない (使い切ると古い順に追い出され、main のキャッシュも消える)
+# 容量の上限 (10GB) を使い切らない (使い切ると古い順に追い出され、main のキャッシュも消える)。
+# 鍵がランナーのイメージの版で割れないよう、Rust はジョブ専用の home に入れる (.github/actions/setup-tools)
 jobs:
   # 検査の中身は Makefile が定義する (lint は make check、テストは make test)。
   # ここには OS 固有の準備とテストの分け方だけを置き、検査コマンドを重ねて書かない
@@ -33,20 +34,16 @@ jobs:
         with:
           persist-credentials: false
 
-      # ツールの版は mise.toml が正。mise 本体は公開から 14 日以上たった版を固定し、署名付きの checksum で
-      # 確かめて入れる。cache は切る。mise-action のキャッシュは mise の導入済みの印だけを戻し、rustup が
-      # 持つツールチェーンと components (clippy / rustfmt) を戻さないため、復元した回だけ
-      # 'cargo-clippy' is not installed で落ちる (jdx/mise-action#215)
-      - uses: jdx/mise-action@v4
-        with:
-          version: 2026.10.4 # 2026-10-07 公開。14 日以上経過した版を固定する
-          cache: false
+      # mise.toml のツールを入れる (Rust はジョブ専用の rustup と cargo の home に入る)
+      - uses: ./.github/actions/setup-tools
 
-      # target/ と ~/.cargo のキャッシュ (鍵に rustc の版が入るので、mise.toml の rust を上げると作り直す)。
-      # clippy の成果物はテストのビルドと別物なので、test とは鍵を分ける
+      # target/ と CARGO_HOME のキャッシュ (鍵に rustc の版が入るので、mise.toml の rust を上げると作り直す)。
+      # clippy の成果物はテストのビルドと別物なので、test とは鍵を分ける。CARGO_HOME/bin は保存しない
+      # (cargo install で入れるものは無く、あるのは mise が毎回入れる rustup とその proxy だけ)
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: lint
+          cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - run: make setup
@@ -78,14 +75,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: jdx/mise-action@v4
-        with:
-          version: 2026.10.4 # 2026-10-07 公開。14 日以上経過した版を固定する
-          cache: false
+      - uses: ./.github/actions/setup-tools
 
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test
+          cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.partition == 1 }}
 
       - run: make setup
@@ -113,15 +108,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: jdx/mise-action@v4
-        with:
-          version: 2026.10.4 # 2026-10-07 公開。14 日以上経過した版を固定する
-          cache: false
+      - uses: ./.github/actions/setup-tools
 
       # 鍵の名前は Linux / macOS の test と同じ (OS とアーキテクチャは rust-cache が鍵に足す)
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test
+          cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.partition == 1 }}
 
       # テストは一時リポジトリを TEMP に作り、そこで git と astro-sight を何度も起動する。既定の TEMP (C:) より、
@@ -181,16 +174,15 @@ jobs:
       # ビルドに効く環境変数 (MACOSX_DEPLOYMENT_TARGET など) は mise.toml の [env] に置く。mise-action が
       # 後続のステップへ渡すので、ci.yml と release.yml と手元の make で同じ値になる。
       # ビルドに要るのは Rust だけなので、テストランナー (cargo-nextest) は入れない
-      - uses: jdx/mise-action@v4
+      - uses: ./.github/actions/setup-tools
         with:
-          version: 2026.10.4 # 2026-10-07 公開。14 日以上経過した版を固定する
-          cache: false
           install_args: rust
 
       # 配布用の release の成果物だけを持つ鍵 (テストの debug の成果物と混ぜない)
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: build-${{ matrix.target }}
+          cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # mise.toml の rust はホストのツールチェーンと components だけを入れるので、配布のターゲットを足す
