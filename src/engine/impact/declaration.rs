@@ -977,13 +977,36 @@ pub(super) fn reconcile_declaration_changes(
             continue;
         }
         let has_text_sig_change = sig_changes.iter().any(|sc| sc.name == symbol_change.name);
+        // 新旧の宣言を 1 つずつ確認できる場合の宣言比較。Python は同じ組を正本の判定にも
+        // 使う。他の言語では表示の補正だけに使うため、行ベースの検出が何も出していない
+        // ときは従来どおり組を作らない (旧側の走査を増やさない)。
+        let header_pair = if !is_added && (has_text_sig_change || input.lang_id == LangId::Python) {
+            unique_header_pair(input, &symbol_change.name, &mut old_side)
+        } else {
+            None
+        };
+        // 行ベースの検出は宣言の名前がある行しか見ないため、複数行に折り返した宣言では
+        // 署名が `def f(` / `pub fn f(` のように途中で切れる。新旧の宣言を 1 つずつ
+        // 確認できて契約も違うときは、表示だけ正規化したヘッダへ差し替える。
+        // 片側だけ差し替えると比べられなくなるので両方そろえる。判定は変えない。
+        if has_text_sig_change
+            && let Some((old_header, new_header)) = header_pair.as_ref()
+            && (old_header.is_multi_line() || new_header.is_multi_line())
+            && !old_header.same_contract(new_header)
+        {
+            for change in sig_changes
+                .iter_mut()
+                .filter(|change| change.name == symbol_change.name)
+            {
+                change.old_signature = old_header.display.clone();
+                change.new_signature = new_header.display.clone();
+            }
+        }
         // Python は単一の宣言を新旧とも確認できる場合、共通のトークン比較を正本にする。
         // 行比較の空白誤検出を打ち消す一方、文字列内部の空白変更の見逃しも補う。
         // 同名の別メソッド・overload や構文エラーがあれば従来の検出を維持する。
-        if !is_added
-            && input.lang_id == LangId::Python
-            && let Some((old_header, new_header)) =
-                unique_header_pair(input, &symbol_change.name, &mut old_side)
+        if input.lang_id == LangId::Python
+            && let Some((old_header, new_header)) = header_pair
         {
             if old_header.same_contract(&new_header) {
                 sig_changes.retain(|sc| sc.name != symbol_change.name);

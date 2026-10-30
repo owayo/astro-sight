@@ -48,6 +48,7 @@ mod integration {
     mod mcp;
     mod moved_compatible_change;
     mod moved_member_signature;
+    mod multiline_declaration_signature;
     mod optional_param_removal;
     mod output_format;
     mod php_member_liveness;
