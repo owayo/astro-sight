@@ -426,6 +426,10 @@ pub(crate) enum GitDiffInput {
         truncations: Vec<TruncationInfo>,
         /// 差分取得時に確定した旧側のコミット。後続解析で ref を再解決しない。
         base_commit: String,
+        /// `dir` で `git rev-parse --show-prefix` を実行した出力から、終端の改行を除いたバイト列。
+        /// 差分の取得と同じ rev-parse で取れたときだけ `Some`。同じ `dir` で prefix を使う後段
+        /// (review の cochange の Scope) が、git を起動し直さずに使う。
+        workspace_prefix: Option<Vec<u8>>,
     },
     Skipped(SkipInfo),
 }
@@ -478,6 +482,9 @@ pub(crate) fn is_git_work_tree(dir: &str) -> Result<bool> {
 /// 同じく `Skipped` にする。base を明示した場合 (`--base HEAD` を含む) は skip せず、コミットに
 /// 解決できなければ従来どおりエラー。壊れた HEAD もエラー。成功経路では unborn の判定に git を
 /// 起動しない。
+///
+/// worktree の判定・base のコミットの解決・prefix の取得は 1 回の rev-parse で済ませる
+/// ([`probe_workspace`])。出力が想定の形でなければ、従来の別々の問い合わせに戻す。
 pub(crate) fn resolve_git_diff(
     dir: &str,
     base: Option<&str>,
@@ -486,11 +493,22 @@ pub(crate) fn resolve_git_diff(
     let revision = base.unwrap_or(crate::git_support::DEFAULT_GIT_BASE);
     validate_git_revision(revision, "--base")?;
 
-    if !is_git_work_tree(dir)? {
-        return Ok(GitDiffInput::Skipped(SkipInfo::not_git_repository()));
-    }
-
-    let base_commit = match try_resolve_commit_revision(dir, revision)? {
+    let (resolved, workspace_prefix) = match probe_workspace(dir, revision)? {
+        WorkspaceProbe::OutsideWorkTree => {
+            return Ok(GitDiffInput::Skipped(SkipInfo::not_git_repository()));
+        }
+        WorkspaceProbe::Inside { commit, prefix } => (
+            commit.map_or(CommitRevision::Unresolved, CommitRevision::Resolved),
+            Some(prefix),
+        ),
+        WorkspaceProbe::Unrecognized => {
+            if !is_git_work_tree(dir)? {
+                return Ok(GitDiffInput::Skipped(SkipInfo::not_git_repository()));
+            }
+            (try_resolve_commit_revision(dir, revision)?, None)
+        }
+    };
+    let base_commit = match resolved {
         CommitRevision::Resolved(commit) => commit,
         CommitRevision::Unresolved if base.is_none() && head_is_unborn(dir) => {
             return Ok(GitDiffInput::Skipped(SkipInfo::unborn_head()));
@@ -509,6 +527,7 @@ pub(crate) fn resolve_git_diff(
         diff,
         truncations,
         base_commit,
+        workspace_prefix,
     })
 }
 
@@ -517,6 +536,102 @@ enum CommitRevision {
     Resolved(String),
     /// git は動いたが、コミットに解決できなかった。
     Unresolved,
+}
+
+/// [`probe_workspace`] の結果。
+enum WorkspaceProbe {
+    /// worktree の外 (`.git` の中・bare リポジトリ・git 管理外)。
+    OutsideWorkTree,
+    Inside {
+        /// `<revision>^{commit}` を解決したコミット。解決できなければ `None`。
+        commit: Option<String>,
+        /// `--show-prefix` の出力から終端の改行を除いたバイト列。
+        prefix: Vec<u8>,
+    },
+    /// 出力が想定の形でない。呼び出し側は [`is_git_work_tree`] と [`try_resolve_commit_revision`]
+    /// を別々に呼ぶ従来の経路に戻す。
+    Unrecognized,
+}
+
+/// worktree の判定・`<revision>^{commit}` の解決・prefix の取得を 1 回の
+/// `git rev-parse --is-inside-work-tree --show-prefix --verify --quiet <revision>^{commit}` で済ませる。
+///
+/// 3 つを別々に起動していた間は、`impact` / `context` の `--git` だけで rev-parse を 2 回、review では
+/// cochange の prefix にもう 1 回起動していた (Windows では 1 回が数十 ms)。rev-parse は引数の順に
+/// 出力するので、1 行目が worktree の判定 (`true` / `false`)、次が prefix (リポジトリのルートでは空行)、
+/// 成功時の最後の行がコミットになる。base を解決できなければ `--quiet` で何も足さずに終了コード 1 で
+/// 終わり、それまでの 2 行は出る。git 管理外・壊れたリポジトリでは何も出さずに失敗する。
+///
+/// 判定とエラーの分類は [`is_git_work_tree`] と [`try_resolve_commit_revision`] を続けて呼んだ場合と
+/// 同じにする: `false` なら base の結果に関わらず worktree の外。何も出さずに失敗したら stderr で
+/// git 管理外とそれ以外のエラーを分ける。`true` で解決できなければ未解決 (unborn かどうかは呼び出し側が
+/// 従来どおり [`head_is_unborn`] で確かめる)。prefix は行に分けずに、先頭の判定と末尾のコミットの間を
+/// バイト列のまま切り出す (UTF-8 への変換は使う側が従来どおりに行う)。形が合わなければ
+/// [`WorkspaceProbe::Unrecognized`]。
+fn probe_workspace(dir: &str, revision: &str) -> Result<WorkspaceProbe> {
+    let commit_expr = format!("{revision}^{{commit}}");
+    let output = crate::git_support::git_command_for_dir(dir)
+        .args([
+            "rev-parse",
+            "--is-inside-work-tree",
+            "--show-prefix",
+            "--verify",
+            "--quiet",
+            &commit_expr,
+        ])
+        .current_dir(dir)
+        .env("LC_ALL", "C")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .map_err(|e| {
+            AstroError::new(ErrorCode::InvalidRequest, format!("Failed to run git: {e}"))
+        })?;
+    let stdout = output.stdout.as_slice();
+    if stdout.is_empty() {
+        if output.status.success() {
+            return Ok(WorkspaceProbe::Unrecognized);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.to_ascii_lowercase().contains("not a git repository") {
+            return Ok(WorkspaceProbe::OutsideWorkTree);
+        }
+        // 壊れた repo / 権限など本物の異常は従来どおりエラー (fail-closed)。
+        return Err(AstroError::new(
+            ErrorCode::InvalidRequest,
+            format!("git rev-parse failed: {stderr}"),
+        )
+        .into());
+    }
+    if stdout.starts_with(b"false\n") {
+        return Ok(WorkspaceProbe::OutsideWorkTree);
+    }
+    let Some(rest) = stdout
+        .strip_prefix(b"true\n")
+        .and_then(|rest| rest.strip_suffix(b"\n"))
+    else {
+        return Ok(WorkspaceProbe::Unrecognized);
+    };
+    if !output.status.success() {
+        return Ok(if rest.contains(&b'\n') {
+            WorkspaceProbe::Unrecognized
+        } else {
+            WorkspaceProbe::Inside {
+                commit: None,
+                prefix: rest.to_vec(),
+            }
+        });
+    }
+    let Some(split) = rest.iter().rposition(|&b| b == b'\n') else {
+        return Ok(WorkspaceProbe::Unrecognized);
+    };
+    let (prefix, commit) = (&rest[..split], &rest[split + 1..]);
+    if !matches!(commit.len(), 40 | 64) || !commit.iter().all(u8::is_ascii_hexdigit) {
+        return Ok(WorkspaceProbe::Unrecognized);
+    }
+    Ok(WorkspaceProbe::Inside {
+        commit: Some(String::from_utf8_lossy(commit).into_owned()),
+        prefix: prefix.to_vec(),
+    })
 }
 
 /// 変動する ref を一度だけ解決する。rev-list / show / diff が別々の HEAD を
@@ -620,6 +735,9 @@ pub(crate) enum DiffSourceResolution {
         truncations: Vec<TruncationInfo>,
         /// `--git` 入力だけ Some。明示 diff の既存 base 解決規則は維持する。
         base_commit: Option<String>,
+        /// `--git` 入力で、差分の取得と同じ rev-parse で取れた `dir` の prefix
+        /// ([`GitDiffInput::Diff`] の同名フィールド)。
+        workspace_prefix: Option<Vec<u8>>,
     },
     Skipped(SkipInfo),
     NotRequested,
@@ -638,12 +756,14 @@ pub(crate) fn resolve_diff_source(
             diff: d.to_string(),
             truncations: Vec::new(),
             base_commit: None,
+            workspace_prefix: None,
         })
     } else if let Some(df) = file {
         Ok(DiffSourceResolution::Diff {
             diff: read_file_to_string_limited(df, MAX_INPUT_SIZE)?,
             truncations: Vec::new(),
             base_commit: None,
+            workspace_prefix: None,
         })
     } else if git {
         match resolve_git_diff(dir, base, staged)? {
@@ -651,10 +771,12 @@ pub(crate) fn resolve_diff_source(
                 diff,
                 truncations,
                 base_commit,
+                workspace_prefix,
             } => Ok(DiffSourceResolution::Diff {
                 diff,
                 truncations,
                 base_commit: Some(base_commit),
+                workspace_prefix,
             }),
             GitDiffInput::Skipped(skip) => Ok(DiffSourceResolution::Skipped(skip)),
         }

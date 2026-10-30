@@ -227,6 +227,19 @@ fn build_evidence_index(
     if source_policy.attr_lookup_failed() {
         diag.add_reason(CoChangeDiagnosticReason::GeneratedAttrLookupFailed);
     }
+    // 変更行は起点ごとに `git diff` を起動せず、まとめて取る (取れなかった起点だけ 1 件ずつ)。
+    let evidence_sources: Vec<&str> = opts
+        .source_files
+        .iter()
+        .map(String::as_str)
+        .filter(|f| source_policy.excluded(f).is_none())
+        .collect();
+    let batched_changes = collect_changed_old_ranges_batch(
+        dir,
+        &evidence_sources,
+        base,
+        opts.changed_lines_from_index,
+    );
     let mut per_source: Vec<SourceEvidence> = opts
         .source_files
         .par_iter()
@@ -234,7 +247,14 @@ fn build_evidence_index(
             if source_policy.excluded(f).is_some() {
                 return SourceEvidence::generated_excluded();
             }
-            collect_evidence_for_file(dir, f, base, min_denom, opts)
+            collect_evidence_for_file(
+                dir,
+                f,
+                base,
+                min_denom,
+                opts,
+                batched_changes.get(f.as_str()),
+            )
         })
         .collect();
     deadline.check("phase1_blame_collected")?;
@@ -387,12 +407,14 @@ impl CommitScanContext<'_> {
     }
 }
 
-/// 証拠コミットを 1 件ずつ diff-tree に掛け、per-source 集計へ畳み込む。
+/// 証拠コミットの変更ファイルを取り、per-source 集計へ畳み込む。
 ///
-/// 各 SHA について diff-tree 取得 → サイズ重み計算 → per-source 集計 (raw / weighted /
-/// units) と global co_counts を rayon の fold/reduce で直接畳み込む。
-/// `commit_files: Vec<Vec<String>>` を全保持しないため、大規模 diff (commits 数百〜千超)
-/// でもピーク RSS が線形以下に収まる。
+/// 変更ファイルはコミットごとに diff-tree を起動せず、[`DIFF_TREE_BATCH_COMMITS`] 件ずつ
+/// 1 プロセスの `git diff-tree --stdin` で取る ([`scan_commit_chunk`])。まとまりは rayon で
+/// 並列に処理し、各コミットの結果はその場でサイズ重み計算 → per-source 集計 (raw / weighted /
+/// units) と global co_counts に畳み込む。`commit_files: Vec<Vec<String>>` を全保持しないため、
+/// 大規模 diff (commits 数百〜千超) でもピーク RSS が線形以下に収まる。集計は件数の
+/// ヒストグラムなので、まとまりの分け方や畳む順序に結果は依存しない。
 fn aggregate_commits(
     dir: &str,
     index: &EvidenceIndex,
@@ -413,18 +435,161 @@ fn aggregate_commits(
     let n_sources = opts.source_files.len();
     let sha_entries: Vec<(&String, &Vec<usize>)> = index.sha_to_sources.iter().collect();
     Ok(sha_entries
-        .par_iter()
-        .fold(
-            || ShardStats::new(n_sources),
-            |mut acc, &(sha, sources)| {
-                accumulate_commit(&mut acc, &ctx, sha, sources);
-                acc
-            },
-        )
+        .par_chunks(DIFF_TREE_BATCH_COMMITS)
+        .map(|chunk| scan_commit_chunk(&ctx, chunk, n_sources))
         .reduce(|| ShardStats::new(n_sources), ShardStats::merge))
 }
 
-/// SHA 1 件分の変更ファイルを取得し、per-source 集計へ畳み込む。
+/// 1 つの `git diff-tree --stdin` に流すコミット数の上限。
+///
+/// 1 コミットあたりの処理は 1ms 未満で、Windows では起動の数十 ms の方が重い (実測: 1 件ずつだと
+/// 48 コミットで 2.3 秒、まとめると 0.1 秒)。通常の review の証拠コミットはこれ以下なので
+/// 1 プロセスで済み、上回る大きな差分だけを複数のプロセスに分けて並列に流す。
+const DIFF_TREE_BATCH_COMMITS: usize = 512;
+
+/// `git diff-tree --stdin` でコミットの区切りとして書く行。
+///
+/// diff-tree は stdin の行のうち OID として読めないものを、そのまま stdout へ書き戻して flush する
+/// (builtin/diff-tree.c)。`--name-only` が出すパスは `/` で始まらず、改行などの特殊文字を含む
+/// パスは引用されるので、この行がパスの行と取り違えられることはない。
+const DIFF_TREE_SEPARATOR: &[u8] = b"/astro-sight-commit-end";
+
+/// 1 まとまりの証拠コミットの変更ファイルを取り、集計する。
+///
+/// まず 1 プロセスの `git diff-tree --stdin` でまとめて取る ([`run_diff_tree_batch`])。
+/// プロセスが正常に終わらなかった (起動・書き込みの失敗、非 0 終了、出力が想定の形でない、途中で
+/// 終わった) ときは、このまとまりの仮集計を捨てて全コミットを 1 件ずつ取り直す。正常に終わり、
+/// 特定のコミットの見出しだけが無い (diff-tree がそのコミットを読めなかった) ときは、そのコミット
+/// だけを 1 件ずつ取る。どちらも失敗の判定と件数 (`failed_commits`) は 1 件ずつの経路に任せるので、
+/// 結果はコミットごとに `git diff-tree` を起動した場合と同じになる。
+fn scan_commit_chunk(
+    ctx: &CommitScanContext<'_>,
+    chunk: &[(&String, &Vec<usize>)],
+    n_sources: usize,
+) -> ShardStats {
+    let mut acc = ShardStats::new(n_sources);
+    let shas: Vec<&str> = chunk.iter().map(|(sha, _)| sha.as_str()).collect();
+    let completed = run_diff_tree_batch(ctx.dir, &shas, &mut |i, lines| {
+        let (sha, sources) = chunk[i];
+        let commit =
+            commit_files_from_lines(lines.iter().map(String::as_str), &ctx.workspace_prefix);
+        accumulate_commit(&mut acc, ctx, sha, sources, Ok(commit));
+    });
+    let retry: Vec<usize> = match completed {
+        Some(completed) => (0..chunk.len()).filter(|&i| !completed[i]).collect(),
+        None => {
+            acc = ShardStats::new(n_sources);
+            (0..chunk.len()).collect()
+        }
+    };
+    let retried = retry
+        .par_iter()
+        .fold(
+            || ShardStats::new(n_sources),
+            |mut acc, &i| {
+                let (sha, sources) = chunk[i];
+                let commit = collect_files_in_commit(ctx.dir, sha, &ctx.workspace_prefix);
+                accumulate_commit(&mut acc, ctx, sha, sources, commit);
+                acc
+            },
+        )
+        .reduce(|| ShardStats::new(n_sources), ShardStats::merge);
+    ShardStats::merge(acc, retried)
+}
+
+/// `shas` を 1 プロセスの `git diff-tree --stdin` に流し、見出しから区切りまで揃って読めたコミットの
+/// 出力の行を `each(添字, 行)` に渡す。
+///
+/// stdin には `<sha>\n<区切り>\n` を順に書く。`--always` で差分が空のコミット (マージ・空コミット) も
+/// 見出し (コミット ID) を出すので、見出しの無いまま区切りが来たコミットは diff-tree が読めなかった
+/// ものと分かる。見出しと区切りの間の行は `git diff-tree --root --no-commit-id --name-only -r <sha>` の
+/// 出力と同じ (`core.quotepath=off` と引用の扱いも同じにする)。
+///
+/// 戻り値は、プロセスが正常に終わり、全コミットの区切りまで想定どおりに読めたときだけ `Some`
+/// (`completed[i]` = `each` に渡した)。それ以外は `None` で、`each` に渡した分は捨てる前提。
+fn run_diff_tree_batch(
+    dir: &str,
+    shas: &[&str],
+    each: &mut dyn FnMut(usize, &[String]),
+) -> Option<Vec<bool>> {
+    use std::io::{BufRead, Write};
+
+    let mut child = Command::new("git")
+        .args([
+            "-c",
+            "core.quotepath=off",
+            "diff-tree",
+            "--stdin",
+            "--always",
+            "--root",
+            "--no-abbrev-commit",
+            "--name-only",
+            "-r",
+        ])
+        .current_dir(dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let mut input = Vec::new();
+    for sha in shas {
+        input.extend_from_slice(sha.as_bytes());
+        input.push(b'\n');
+        input.extend_from_slice(DIFF_TREE_SEPARATOR);
+        input.push(b'\n');
+    }
+    // 書き終えてから読むと、出力で pipe が埋まった git が書けずに止まり、こちらも書けずに止まる。
+    let writer = std::thread::spawn(move || stdin.write_all(&input).is_ok());
+
+    let mut completed = vec![false; shas.len()];
+    let mut reached = 0;
+    let mut intact = true;
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = Vec::new();
+    let mut files: Option<Vec<String>> = None;
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => {
+                intact = false;
+                break;
+            }
+        }
+        let (Some(text), Some(&sha)) = (line.strip_suffix(b"\n"), shas.get(reached)) else {
+            intact = false;
+            break;
+        };
+        match files.as_mut() {
+            None if text == sha.as_bytes() => files = Some(Vec::new()),
+            None if text == DIFF_TREE_SEPARATOR => reached += 1,
+            Some(_) if text == DIFF_TREE_SEPARATOR => {
+                each(reached, &files.take().unwrap_or_default());
+                completed[reached] = true;
+                reached += 1;
+            }
+            Some(lines) => lines.push(String::from_utf8_lossy(text).into_owned()),
+            None => {
+                intact = false;
+                break;
+            }
+        }
+    }
+    // 途中で読むのをやめたときに git が書き込みで詰まらないよう、待つ前に pipe を閉じる。
+    drop(reader);
+    let written = writer.join().unwrap_or(false);
+    let exited = child.wait().is_ok_and(|status| status.success());
+    (intact && written && exited && reached == shas.len()).then_some(completed)
+}
+
+/// SHA 1 件分の変更ファイルを per-source 集計へ畳み込む。
 ///
 /// `git diff-tree` の失敗は「変更ファイル 0 件」と同じ扱いで解析を続行しつつ、件数を
 /// `failed_commits` へ持ち上げる。黙って 0 件に畳むと「解析できなかったコミット」が
@@ -434,8 +599,9 @@ fn accumulate_commit(
     ctx: &CommitScanContext<'_>,
     sha: &str,
     sources: &[usize],
+    commit: Result<CommitFiles>,
 ) {
-    let commit = match collect_files_in_commit(ctx.dir, sha, &ctx.workspace_prefix) {
+    let commit = match commit {
         Ok(commit) => commit,
         Err(_) => {
             acc.failed_commits += 1;
@@ -738,18 +904,29 @@ impl SourceEvidence {
 /// 空になる。新規ファイルの「追加コミット = 今レビュー中の diff そのもの」を証拠に
 /// してしまうと、同一コミットの全ファイルが confidence 1.0 の共変更として並ぶだけで
 /// 情報量がゼロになるため、これは意図した挙動。
+///
+/// `batched` は [`collect_changed_old_ranges_batch`] がまとめて取った変更行。無ければ
+/// このファイルだけの `git diff` で取る。
 fn collect_evidence_for_file(
     dir: &str,
     file: &str,
     base: &str,
     min_denom: usize,
     opts: &CoChangeOptions,
+    batched: Option<&ChangedOldRanges>,
 ) -> SourceEvidence {
-    let changed = collect_changed_old_ranges(dir, file, base, opts.changed_lines_from_index)
-        .unwrap_or(ChangedOldRanges {
-            git_failed: true,
-            ..Default::default()
-        });
+    let fetched;
+    let changed = match batched {
+        Some(changed) => changed,
+        None => {
+            fetched = collect_changed_old_ranges(dir, file, base, opts.changed_lines_from_index)
+                .unwrap_or(ChangedOldRanges {
+                    git_failed: true,
+                    ..Default::default()
+                });
+            &fetched
+        }
+    };
 
     let mut ev = SourceEvidence::empty(CoChangeEvidence::Blame);
     ev.new_file = changed.new_file;
@@ -789,7 +966,7 @@ fn collect_evidence_for_file(
 
 /// `collect_changed_old_ranges` の結果。同型の bool を位置引数で返すと
 /// 取り違えてもコンパイルが通るため構造体で束ねる。
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq)]
 struct ChangedOldRanges {
     /// blame 対象にする hunk 旧側 (start, count)。純粋追加 hunk は含まない。
     ranges: Vec<(u64, u64)>,
@@ -835,12 +1012,145 @@ fn collect_changed_old_ranges(
             ..Default::default()
         });
     }
-    let diff_text = String::from_utf8_lossy(&diff_output.stdout);
-    Ok(ChangedOldRanges {
-        ranges: parse_hunk_old_ranges(&diff_text),
+    Ok(changed_old_ranges_from_diff(&String::from_utf8_lossy(
+        &diff_output.stdout,
+    )))
+}
+
+/// 1 ファイル分の `--unified=0` の出力から [`ChangedOldRanges`] を作る。ファイルごとの経路と
+/// [`collect_changed_old_ranges_batch`] で共有する。
+fn changed_old_ranges_from_diff(diff_text: &str) -> ChangedOldRanges {
+    ChangedOldRanges {
+        ranges: parse_hunk_old_ranges(diff_text),
         new_file: diff_text.lines().any(|l| l == "--- /dev/null"),
         git_failed: false,
-    })
+    }
+}
+
+/// [`collect_changed_old_ranges_batch`] の 1 回の `git diff` に渡すパスの長さの合計の上限
+/// (UTF-16 の符号単位)。Windows のコマンドラインは 32,767 単位までで、`git.exe` は本体の git を
+/// 同じ引数で起動し直す。固定の引数と base、引数ごとの空白と引用符を足しても十分に収まる大きさにする。
+const CHANGED_LINES_BATCH_MAX_PATH_UNITS: usize = 16 * 1024;
+
+/// 起点ファイルの変更行を、ファイルごとに `git diff` を起動せずにまとめて取る。
+///
+/// `git diff <固定の書式> [--cached] --unified=0 --no-renames --relative <base> -- <f1> <f2> ...` の
+/// 出力を `diff --git` の見出しでファイルごとのブロックに分け、[`collect_changed_old_ranges`] が
+/// 1 ファイル分の出力に対して行うのと同じ解析をブロックに掛ける。
+///
+/// - 本体の diff (`--unified=3`) から導かないのは、git が `--unified=0` のときだけ末尾の共通部分を
+///   切り詰めてから diff する (`xdiff-interface.c` の `trim_common_tail`) ため。変更のまとまり方が
+///   変わって blame の範囲がずれることがある (このリポジトリの履歴 1,871 ファイル中 2 件)。
+///   切り詰めはファイルごとに行われるので、一括の各ブロックはファイルごとの出力と一致する。
+/// - `--no-renames`: ファイルごとの実行は pathspec が 1 ファイルにしか一致しないので rename / copy を
+///   組めない。一括では利用者の `diff.renames` で組めてしまうため、明示的に切って同じにする。
+/// - `--relative`: 見出しのパスを `dir` 相対 (= 渡したパス) にそろえ、対応付けに使う。中身は変わらない。
+///
+/// 一括で確定できたファイルだけを返し、返さなかったファイルは呼び出し側が 1 件ずつ取る。
+/// 一括にしないもの: git が見出しで引用するパス (`"` / `\` / 制御文字。見出しから元のパスに
+/// 戻せない)、ほかの起点を配下に持つパス (`-- p` は `p/a.rs` のブロックも返すので、ブロックを
+/// パスの完全一致で振り分けると取りこぼす)。まとまりごとに、git の失敗・期待しない見出し
+/// (パスがディレクトリに一致した等)・競合中の index の表示が出たら、そのまとまりを丸ごと返さない。
+fn collect_changed_old_ranges_batch(
+    dir: &str,
+    files: &[&str],
+    base: &str,
+    from_index: bool,
+) -> HashMap<String, ChangedOldRanges> {
+    let requested: std::collections::BTreeSet<&str> = files.iter().copied().collect();
+    let has_requested_descendant = |path: &str| {
+        let parent = format!("{path}/");
+        requested
+            .range::<str, _>((
+                std::ops::Bound::Included(parent.as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .next()
+            .is_some_and(|other| other.starts_with(&parent))
+    };
+    let mut result = HashMap::new();
+    let mut chunk: Vec<&str> = Vec::new();
+    let mut units = 0usize;
+    for &file in &requested {
+        if git_quotes_path(file) || has_requested_descendant(file) {
+            continue;
+        }
+        let file_units = file.encode_utf16().count() + 3;
+        if !chunk.is_empty() && units + file_units > CHANGED_LINES_BATCH_MAX_PATH_UNITS {
+            result.extend(run_changed_lines_batch(dir, &chunk, base, from_index));
+            chunk.clear();
+            units = 0;
+        }
+        chunk.push(file);
+        units += file_units;
+    }
+    if !chunk.is_empty() {
+        result.extend(run_changed_lines_batch(dir, &chunk, base, from_index));
+    }
+    result
+}
+
+/// `core.quotepath=off` の git が diff の見出しで引用するパスか (`"` / `\` / 制御文字 / DEL)。
+fn git_quotes_path(path: &str) -> bool {
+    path.bytes()
+        .any(|b| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\')
+}
+
+/// [`collect_changed_old_ranges_batch`] の 1 まとまり分。確定できなければ空を返す。
+fn run_changed_lines_batch(
+    dir: &str,
+    files: &[&str],
+    base: &str,
+    from_index: bool,
+) -> HashMap<String, ChangedOldRanges> {
+    let mut command = Command::new("git");
+    command
+        .args(["-c", "core.quotepath=off", "diff"])
+        .args(crate::git_support::GIT_DIFF_PARSEABLE_OUTPUT_ARGS);
+    if from_index {
+        command.arg("--cached");
+    }
+    let Ok(output) = command
+        .args(["--unified=0", "--no-renames", "--relative", base, "--"])
+        .args(files)
+        .env(LITERAL_PATHSPECS_ENV, "1")
+        .current_dir(dir)
+        .output()
+    else {
+        return HashMap::new();
+    };
+    if !output.status.success() {
+        return HashMap::new();
+    }
+    let headers: HashMap<String, &str> = files
+        .iter()
+        .map(|&file| (format!("diff --git a/{file} b/{file}"), file))
+        .collect();
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut blocks: HashMap<&str, String> = HashMap::new();
+    let mut current: Option<&str> = None;
+    for line in text.lines() {
+        if line.starts_with("diff --") || line.starts_with("* Unmerged path ") {
+            // 型の変更 (削除と追加の 2 ブロック) では同じパスの見出しが続けて出る。
+            let Some(&file) = headers.get(line) else {
+                return HashMap::new();
+            };
+            current = Some(file);
+        }
+        let Some(file) = current else {
+            return HashMap::new();
+        };
+        let block = blocks.entry(file).or_default();
+        block.push_str(line);
+        block.push('\n');
+    }
+    files
+        .iter()
+        .map(|&file| {
+            let diff_text = blocks.get(file).map_or("", String::as_str);
+            (file.to_string(), changed_old_ranges_from_diff(diff_text))
+        })
+        .collect()
 }
 
 /// 1 ファイルの diff hunk 群を 1 回の `git blame -L S,+C [-L S,+C]...` にまとめて
@@ -1089,7 +1399,7 @@ fn list_merge_commits(dir: &str, shas: &HashSet<String>) -> Result<HashSet<Strin
 /// (起点 `source_files` は `is_contained_relative` で `dir` 相対に閉じているため、
 /// 相手側だけルート相対だと同一エントリ内で基準が混ざる)。
 /// `--dir` = リポジトリルートでは prefix が空で従来と完全に同一。
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq)]
 struct CommitFiles {
     /// コミット全体の変更ファイル数 (リポジトリルート基準、規模評価用)。
     total_files: usize,
@@ -1123,9 +1433,20 @@ fn collect_files_in_commit(dir: &str, sha: &str, workspace_prefix: &str) -> Resu
             format!("git diff-tree failed for {sha}: {}", stderr.trim()),
         ));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let all: Vec<&str> = stdout
-        .lines()
+    Ok(commit_files_from_lines(
+        String::from_utf8_lossy(&output.stdout).lines(),
+        workspace_prefix,
+    ))
+}
+
+/// `git diff-tree --name-only` の出力の行から [`CommitFiles`] を作る。1 件ずつの経路
+/// ([`collect_files_in_commit`]) と一括の経路 ([`run_diff_tree_batch`]) で共有する。
+fn commit_files_from_lines<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+    workspace_prefix: &str,
+) -> CommitFiles {
+    let all: Vec<&str> = lines
+        .into_iter()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
@@ -1140,10 +1461,10 @@ fn collect_files_in_commit(dir: &str, sha: &str, workspace_prefix: &str) -> Resu
         })
         .filter(|p| !p.is_empty())
         .collect();
-    Ok(CommitFiles {
+    CommitFiles {
         total_files: all.len(),
         workspace_files,
-    })
+    }
 }
 
 /// `dir` のリポジトリルートからの相対 prefix (`"backend/"` 形式、ルートなら空) を返す。
@@ -1459,6 +1780,360 @@ mod tests {
         assert_eq!(staged.ranges, vec![(2, 1)]);
         let worktree = collect_changed_old_ranges(dir_str, "a.rs", "HEAD", false).unwrap();
         assert_eq!(worktree.ranges, vec![(8, 1)]);
+    }
+
+    fn git_ok(repo: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn numbered_lines(count: usize, edit: impl Fn(usize) -> Option<String>) -> String {
+        (1..=count)
+            .map(|n| format!("{}\n", edit(n).unwrap_or_else(|| format!("line{n}"))))
+            .collect()
+    }
+
+    /// まとめて取った変更行が、起点ごとに `git diff --unified=0` を起動した結果と一致する。
+    /// 変更・追加 (intent-to-add)・削除・rename の両側・バイナリ・末尾改行なし・空白や非 ASCII を
+    /// 含むパス・未追跡・未変更・存在しないパスを、作業ツリーと index の両方、サブディレクトリからも
+    /// 比べる。本体の diff (`--unified=3`) から導くと変更のまとまり方がずれることがあるので、
+    /// 一括でも `--unified=0` のまま取っている。
+    #[test]
+    fn changed_lines_batch_matches_per_file_diffs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        let renamed = numbered_lines(10, |n| Some(format!("fn r{n}() {{}}")));
+        commit_files(
+            repo,
+            &[
+                ("a.rs", &numbered_lines(30, |_| None)),
+                ("deleted.rs", "one\ntwo\nthree\n"),
+                ("renamed_old.rs", &renamed),
+                ("no_eol.rs", "x\ny"),
+                ("with space.rs", "a\nb\nc\n"),
+                ("日本/c.rs", "a\nb\nc\n"),
+                ("sub/s.rs", &numbered_lines(5, |_| None)),
+                ("unchanged.rs", "same\n"),
+            ],
+            "init",
+        );
+        std::fs::write(repo.join("bin.dat"), [0u8, 1, 2, 3, 0, 5]).unwrap();
+        git_ok(repo, &["add", "bin.dat"]);
+        git_ok(repo, &["commit", "-qm", "binary"]);
+
+        std::fs::write(
+            repo.join("a.rs"),
+            numbered_lines(30, |n| match n {
+                2 => Some("changed2".into()),
+                10..=12 => Some(format!("changed{n}")),
+                20 => Some("line20\ninserted".into()),
+                25 => Some("changed25".into()),
+                _ => None,
+            }),
+        )
+        .unwrap();
+        git_ok(repo, &["add", "a.rs"]);
+        std::fs::write(
+            repo.join("a.rs"),
+            numbered_lines(30, |n| (n == 28).then(|| "unstaged28".into())),
+        )
+        .unwrap();
+        std::fs::remove_file(repo.join("deleted.rs")).unwrap();
+        git_ok(repo, &["mv", "renamed_old.rs", "renamed_new.rs"]);
+        std::fs::write(
+            repo.join("renamed_new.rs"),
+            renamed.replace("fn r3()", "fn r3b()"),
+        )
+        .unwrap();
+        std::fs::write(repo.join("bin.dat"), [0u8, 9, 9, 3, 0, 5]).unwrap();
+        std::fs::write(repo.join("no_eol.rs"), "x\nz").unwrap();
+        std::fs::write(repo.join("with space.rs"), "a\nB\nc\n").unwrap();
+        std::fs::write(repo.join("日本/c.rs"), "a\nb\nC\n").unwrap();
+        std::fs::write(
+            repo.join("sub/s.rs"),
+            numbered_lines(5, |n| (n == 4).then(|| "s4".into())),
+        )
+        .unwrap();
+        std::fs::write(repo.join("added.rs"), "fn added() {}\n").unwrap();
+        git_ok(repo, &["add", "-N", "added.rs"]);
+        std::fs::write(repo.join("untracked.rs"), "fn untracked() {}\n").unwrap();
+
+        let root_files = [
+            "a.rs",
+            "deleted.rs",
+            "renamed_old.rs",
+            "renamed_new.rs",
+            "bin.dat",
+            "no_eol.rs",
+            "with space.rs",
+            "日本/c.rs",
+            "sub/s.rs",
+            "added.rs",
+            "untracked.rs",
+            "unchanged.rs",
+            "missing.rs",
+        ];
+        let root = repo.to_str().unwrap();
+        let sub = repo.join("sub");
+        let sub = sub.to_str().unwrap();
+        for from_index in [false, true] {
+            for (dir, files) in [(root, &root_files[..]), (sub, &["s.rs", "missing.rs"][..])] {
+                let batch = collect_changed_old_ranges_batch(dir, files, "HEAD", from_index);
+                for file in files {
+                    let expected =
+                        collect_changed_old_ranges(dir, file, "HEAD", from_index).unwrap();
+                    assert_eq!(
+                        batch.get(*file),
+                        Some(&expected),
+                        "{file} (from_index={from_index}, dir={dir})"
+                    );
+                }
+            }
+        }
+        // 比較が空どうしにならないことの確認。
+        let worktree = collect_changed_old_ranges_batch(root, &root_files, "HEAD", false);
+        assert_eq!(worktree["a.rs"].ranges, vec![(28, 1)]);
+        assert_eq!(worktree["deleted.rs"].ranges, vec![(1, 3)]);
+        assert_eq!(worktree["renamed_old.rs"].ranges, vec![(1, 10)]);
+        assert!(worktree["renamed_new.rs"].new_file);
+        assert!(worktree["added.rs"].new_file);
+        assert_eq!(worktree["untracked.rs"], ChangedOldRanges::default());
+        let staged = collect_changed_old_ranges_batch(root, &root_files, "HEAD", true);
+        assert_eq!(staged["a.rs"].ranges, vec![(2, 1), (10, 3), (25, 1)]);
+    }
+
+    /// 利用者の diff 設定 (色・外部 diff・接頭辞・rename 検出・相対パス) に左右されない。
+    /// `diff.renames` が効くと一括の pathspec の中で rename を組み、削除と追加が 1 つのブロックに
+    /// なってしまう (ファイルごとの実行では組めない)。
+    #[test]
+    fn changed_lines_batch_ignores_user_diff_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        let moved = numbered_lines(12, |n| Some(format!("fn m{n}() {{}}")));
+        commit_files(
+            repo,
+            &[
+                ("a.rs", "fn a() {}\nfn b() {}\nfn c() {}\n"),
+                ("old.rs", &moved),
+            ],
+            "init",
+        );
+        std::fs::write(repo.join("a.rs"), "fn a() {}\nfn b2() {}\nfn c() {}\n").unwrap();
+        std::fs::remove_file(repo.join("old.rs")).unwrap();
+        std::fs::write(repo.join("new.rs"), &moved).unwrap();
+        git_ok(repo, &["add", "-A"]);
+        let dir_str = repo.to_str().unwrap();
+        let files = ["a.rs", "old.rs", "new.rs"];
+        let expected: HashMap<String, ChangedOldRanges> = files
+            .iter()
+            .map(|f| {
+                let changed = collect_changed_old_ranges(dir_str, f, "HEAD", true).unwrap();
+                (f.to_string(), changed)
+            })
+            .collect();
+        assert_eq!(
+            expected["old.rs"].ranges,
+            vec![(1, 12)],
+            "前提: 削除として取れる"
+        );
+        assert_eq!(
+            collect_changed_old_ranges_batch(dir_str, &files, "HEAD", true),
+            expected
+        );
+        for (key, value) in [
+            ("color.ui", "always"),
+            ("diff.external", "echo"),
+            ("diff.noprefix", "true"),
+            ("diff.mnemonicPrefix", "true"),
+            ("diff.renames", "copies"),
+            ("diff.relative", "true"),
+        ] {
+            git_ok(repo, &["config", key, value]);
+            let got = collect_changed_old_ranges_batch(dir_str, &files, "HEAD", true);
+            git_ok(repo, &["config", "--unset", key]);
+            assert_eq!(got, expected, "{key}={value}");
+        }
+    }
+
+    /// 一括の結果をパスの完全一致で振り分けられないものは、1 件ずつの経路に残す。
+    /// - ほかの起点を配下に持つパス: `-- p` は `p/a.rs` のブロックも返す
+    /// - 起点として渡していないファイルを配下に持つディレクトリ: そのまとまりごと
+    /// - 競合中の index (`* Unmerged path`): そのまとまりごと
+    #[test]
+    fn changed_lines_batch_leaves_ambiguous_paths_to_per_file_diffs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        commit_files(
+            repo,
+            &[("p", "file\n"), ("q", "file\n"), ("a.rs", "a\n")],
+            "init",
+        );
+        git_ok(repo, &["rm", "-q", "p", "q"]);
+        commit_files(
+            repo,
+            &[("p/a.rs", "pa\n"), ("q/x.rs", "qx\n"), ("a.rs", "b\n")],
+            "dirs",
+        );
+        let dir_str = repo.to_str().unwrap();
+        let base = "HEAD~1";
+
+        let nested =
+            collect_changed_old_ranges_batch(dir_str, &["p", "p/a.rs", "a.rs"], base, false);
+        assert!(!nested.contains_key("p"), "{nested:?}");
+        for file in ["p/a.rs", "a.rs"] {
+            assert_eq!(
+                nested.get(file),
+                Some(&collect_changed_old_ranges(dir_str, file, base, false).unwrap()),
+                "{file}"
+            );
+        }
+        let per_file_p = collect_changed_old_ranges(dir_str, "p", base, false).unwrap();
+        assert_eq!(
+            per_file_p.ranges,
+            vec![(1, 1)],
+            "`-- p` は削除された p の行を返す"
+        );
+        assert!(per_file_p.new_file, "`-- p` は p/a.rs の追加も返す");
+
+        let directory = collect_changed_old_ranges_batch(dir_str, &["q", "a.rs"], base, false);
+        assert!(directory.is_empty(), "{directory:?}");
+
+        // 競合: 同じ行を変えた 2 つのブランチを merge する。
+        git_ok(repo, &["checkout", "-q", "-b", "other"]);
+        commit_files(repo, &[("a.rs", "other\n")], "other");
+        git_ok(repo, &["checkout", "-q", "-"]);
+        commit_files(repo, &[("a.rs", "main\n"), ("p/a.rs", "pb\n")], "main");
+        let merge = Command::new("git")
+            .args(["merge", "-q", "other"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(!merge.status.success(), "前提: a.rs が競合する");
+        let conflicted =
+            collect_changed_old_ranges_batch(dir_str, &["a.rs", "p/a.rs"], "HEAD~1", true);
+        assert!(conflicted.is_empty(), "{conflicted:?}");
+    }
+
+    /// `"` を含むパスは git が見出しで引用するので、一括の対象にしない。
+    #[cfg(unix)]
+    #[test]
+    fn changed_lines_batch_leaves_quoted_paths_to_per_file_diffs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        commit_files(repo, &[("q\"uote.rs", "a\n"), ("a.rs", "a\n")], "init");
+        std::fs::write(repo.join("q\"uote.rs"), "b\n").unwrap();
+        std::fs::write(repo.join("a.rs"), "b\n").unwrap();
+        let dir_str = repo.to_str().unwrap();
+        let batch =
+            collect_changed_old_ranges_batch(dir_str, &["q\"uote.rs", "a.rs"], "HEAD", false);
+        assert!(!batch.contains_key("q\"uote.rs"), "{batch:?}");
+        assert_eq!(batch["a.rs"].ranges, vec![(1, 1)]);
+    }
+
+    /// 1 プロセスの `git diff-tree --stdin` で読んだ各コミットの変更ファイルが、コミットごとに
+    /// `git diff-tree` を起動した結果と一致する。ルートコミット・空コミット・マージ・空白や非 ASCII を
+    /// 含むパス・サブディレクトリの prefix を含め、存在しない SHA は 1 件ずつの経路に残す。
+    #[test]
+    fn diff_tree_batch_matches_per_commit_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        commit_files(
+            repo,
+            &[
+                ("a.rs", "a\n"),
+                ("sp ace/b.rs", "b\n"),
+                ("日本/c.rs", "c\n"),
+                ("sub/d.rs", "d\n"),
+            ],
+            "root",
+        );
+        commit_files(repo, &[("a.rs", "a2\n"), ("sub/d.rs", "d2\n")], "pair");
+        git_ok(repo, &["commit", "-q", "--allow-empty", "-m", "empty"]);
+        git_ok(repo, &["checkout", "-q", "-b", "side"]);
+        commit_files(repo, &[("sub/side.rs", "s\n")], "side");
+        git_ok(repo, &["checkout", "-q", "main"]);
+        commit_files(repo, &[("日本/c.rs", "c2\n")], "main");
+        git_ok(repo, &["merge", "-q", "--no-ff", "side", "-m", "merge"]);
+        let listed = Command::new("git")
+            .args(["rev-list", "--all"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        let mut shas: Vec<String> = String::from_utf8(listed.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(shas.len(), 6);
+        shas.insert(2, "1111111111111111111111111111111111111111".to_owned());
+        let shas: Vec<&str> = shas.iter().map(String::as_str).collect();
+
+        let sub = repo.join("sub");
+        for (dir, prefix) in [(repo, ""), (sub.as_path(), "sub/")] {
+            let dir = dir.to_str().unwrap();
+            let mut batched: HashMap<usize, CommitFiles> = HashMap::new();
+            let completed = run_diff_tree_batch(dir, &shas, &mut |i, lines| {
+                batched.insert(
+                    i,
+                    commit_files_from_lines(lines.iter().map(String::as_str), prefix),
+                );
+            })
+            .expect("diff-tree は存在しない SHA があっても正常に終わる");
+            for (i, sha) in shas.iter().enumerate() {
+                match collect_files_in_commit(dir, sha, prefix) {
+                    Ok(expected) => {
+                        assert!(completed[i], "{sha}");
+                        assert_eq!(batched.get(&i), Some(&expected), "{sha} ({prefix})");
+                    }
+                    Err(_) => assert!(!completed[i] && !batched.contains_key(&i), "{sha}"),
+                }
+            }
+        }
+    }
+
+    /// diff-tree が途中で終了した (壊れた tree を読んだ) ら、一括の結果は使わない。呼び出し側は
+    /// そのまとまりを 1 件ずつ取り直し、失敗の件数は従来どおり数える
+    /// (`analyze_cochange_reports_commit_scan_failures`)。
+    #[test]
+    fn diff_tree_batch_is_discarded_when_git_exits_abnormally() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        for i in 0..3 {
+            commit_files(
+                repo,
+                &[("a.rs", &format!("{i}\n")), ("sub/x.rs", &format!("{i}\n"))],
+                &format!("c{i}"),
+            );
+        }
+        let head = |rev: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        let shas = [head("HEAD"), head("HEAD~1"), head("HEAD~2")];
+        let shas: Vec<&str> = shas.iter().map(String::as_str).collect();
+        let dir_str = repo.to_str().unwrap();
+        assert!(run_diff_tree_batch(dir_str, &shas, &mut |_, _| {}).is_some());
+
+        corrupt_subtree_object(repo, "HEAD~1");
+        assert!(run_diff_tree_batch(dir_str, &shas, &mut |_, _| {}).is_none());
     }
 
     /// author 単位の集計は、同じコミットを blame 経由で見ても履歴 fallback 経由で見ても

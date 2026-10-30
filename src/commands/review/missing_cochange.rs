@@ -410,6 +410,9 @@ fn insert_best_missing(
 pub(crate) struct ReviewCochangeInput<'a> {
     pub dir: &'a str,
     pub analysis_dir: &'a str,
+    /// `analysis_dir` で `git rev-parse --show-prefix` を実行した出力。差分の取得で取れていれば
+    /// 渡し、Scope が同じ問い合わせを繰り返さないようにする。
+    pub analysis_prefix: Option<&'a [u8]>,
     pub changed_files: &'a HashSet<String>,
     pub diff_files: &'a [crate::models::impact::DiffFile],
     pub min_confidence: f64,
@@ -440,6 +443,7 @@ pub(crate) fn detect_missing_cochanges(
         ReviewCochangeInput {
             dir,
             analysis_dir: dir,
+            analysis_prefix: None,
             changed_files,
             diff_files: &[],
             min_confidence,
@@ -487,6 +491,7 @@ pub(crate) fn detect_missing_cochanges_scoped(
     let ReviewCochangeInput {
         dir,
         analysis_dir,
+        analysis_prefix,
         changed_files,
         diff_files,
         min_confidence,
@@ -497,8 +502,9 @@ pub(crate) fn detect_missing_cochanges_scoped(
         exclude_dirs,
         exclude_globs,
     } = input;
-    let mut scope = super::cochange_scope::Scope::new(
+    let mut scope = super::cochange_scope::Scope::with_known_prefix(
         analysis_dir,
+        analysis_prefix,
         base,
         diff_files,
         exclude_dirs,

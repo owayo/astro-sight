@@ -182,13 +182,14 @@ fn review_attempt_with_swift_protocols(
     // 未指定時は package.json から next 依存を検出して nextjs プリセットを自動適用する。
     let framework_globs = resolve_framework_globs_with_auto_detect(framework, dir)?;
     // 1. diff 取得（context コマンドと同じ入力方式）
-    let (diff_input, truncations, pinned_base) =
+    let (diff_input, truncations, pinned_base, workspace_prefix) =
         match resolve_diff_source(dir, diff, diff_file, git, base, staged)? {
             DiffSourceResolution::Diff {
                 diff,
                 truncations,
                 base_commit,
-            } => (diff, truncations, base_commit),
+                workspace_prefix,
+            } => (diff, truncations, base_commit, workspace_prefix),
             // git 管理外: hook は完全 silent、通常は空結果 + skipped で exit 0。
             DiffSourceResolution::Skipped(skip) => {
                 return emit_review_short_circuit(
@@ -207,6 +208,7 @@ fn review_attempt_with_swift_protocols(
                     read_to_string_limited(stdin.lock(), MAX_INPUT_SIZE, "stdin input")?,
                     Vec::new(),
                     None,
+                    None,
                 )
             }
         };
@@ -223,15 +225,6 @@ fn review_attempt_with_swift_protocols(
     } else {
         None
     };
-    if working_tree_diff.is_some() {
-        ensure_review_diff_unchanged(
-            dir,
-            pinned_base.as_deref(),
-            staged,
-            &diff_input,
-            working_tree_diff.as_deref(),
-        )?;
-    }
 
     if diff_input.trim().is_empty() {
         ensure_review_diff_unchanged(
@@ -283,6 +276,17 @@ fn review_attempt_with_swift_protocols(
             None,
             truncations,
         );
+    }
+    // staged は記録した index と作業ツリーの組を、解析に進む前に確かめる。短絡する経路は返す直前の
+    // 確認だけで済ませる (記録の直後にも確かめると、間に diff の parse しか無いまま読み直しが続く)。
+    if working_tree_diff.is_some() {
+        ensure_review_diff_unchanged(
+            dir,
+            pinned_base.as_deref(),
+            staged,
+            &diff_input,
+            working_tree_diff.as_deref(),
+        )?;
     }
 
     let new_side = super::git_input::diff_new_side(diff, diff_file, git, staged);
@@ -353,6 +357,8 @@ fn review_attempt_with_swift_protocols(
             ReviewCochangeInput {
                 dir,
                 analysis_dir,
+                // 差分の取得で取った prefix は `dir` のもの。スナップショットでは使わない。
+                analysis_prefix: workspace_prefix.as_deref().filter(|_| snapshot.is_none()),
                 changed_files: &changed_file_set,
                 diff_files: &diff_files,
                 min_confidence,

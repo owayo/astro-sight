@@ -21,6 +21,7 @@ mod integration {
     mod deep_nesting;
     mod fixed_callback_contract;
     mod function_value_handoff;
+    mod git_invocations;
     mod git_non_ascii;
     mod hidden_and_angular_liveness;
     mod identifier_spellings;

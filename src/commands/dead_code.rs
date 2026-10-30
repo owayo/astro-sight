@@ -1961,6 +1961,7 @@ pub fn cmd_dead_code_with_swift_protocols(
             diff,
             truncations,
             base_commit,
+            ..
         } => {
             pinned_base = base_commit;
             if diff.trim().is_empty() {

@@ -55,6 +55,7 @@ fn review_cochange_prefers_current_import_evidence_and_marks_small_samples() {
         ReviewCochangeInput {
             dir: repo.to_str().unwrap(),
             analysis_dir: repo.to_str().unwrap(),
+            analysis_prefix: None,
             changed_files: &files,
             diff_files: &[],
             min_confidence: 0.3,
@@ -152,6 +153,7 @@ fn review_staged_cochange_blames_index_lines_not_unstaged_edits() {
             ReviewCochangeInput {
                 dir: repo.to_str().unwrap(),
                 analysis_dir: repo.to_str().unwrap(),
+                analysis_prefix: None,
                 changed_files: &files,
                 diff_files: &[],
                 min_confidence: 0.3,
@@ -300,6 +302,7 @@ fn review_cochange_deletion_keeps_only_observed_references_and_honors_exclusions
                 ReviewCochangeInput {
                     dir: repo.to_str().unwrap(),
                     analysis_dir: repo.to_str().unwrap(),
+                    analysis_prefix: None,
                     changed_files: &files,
                     diff_files: &diff,
                     min_confidence: 0.3,
