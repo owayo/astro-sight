@@ -4,9 +4,9 @@ Notes that supplement [Development](../README.md#development) in the README, whi
 
 ## Prerequisites
 
-Development assumes [mise](https://mise.jdx.dev/). The Rust version is pinned in `mise.toml`, and every Makefile target calls `cargo` of that version through `mise exec --`, so the version is the same even when mise is not activated in the shell. Besides mise, you need a C compiler (to build the tree-sitter parsers; Xcode Command Line Tools on macOS) and git (the integration tests create temporary repositories and run `git`).
+Development assumes [mise](https://mise.jdx.dev/). The versions of Rust and of the test runner [cargo-nextest](https://nexte.st/) are pinned in `mise.toml`, and every Makefile target calls `cargo` of that version through `mise exec --`, so the versions are the same even when mise is not activated in the shell. `mise.lock` pins the download URLs and checksums; after changing a version, regenerate it with `mise lock --platform linux-x64,linux-arm64,macos-x64,macos-arm64,windows-x64` (CI installs the tools with `--locked`, so a stale lock stops it). Besides mise, you need a C compiler (to build the tree-sitter parsers; Xcode Command Line Tools on macOS) and git (the integration tests create temporary repositories and run `git`).
 
-To use `cargo` on `PATH` without mise, add `SYSTEM_TOOLS=1`. The Rust version may then differ from `mise.toml`.
+To use `cargo` on `PATH` without mise, add `SYSTEM_TOOLS=1`. The versions may then differ from `mise.toml`, and `make test` also needs `cargo-nextest` on `PATH`.
 
 ```bash
 make ci SYSTEM_TOOLS=1
@@ -15,9 +15,15 @@ make install SYSTEM_TOOLS=1
 
 ## Same Checks as CI
 
-The CI quality jobs (Linux and macOS) only run `make setup` and `make ci`, so a local `make ci` runs the same checks. Tests run with the default features, the same as the released binary. Clippy runs with both the default features and `--all-features`, to check the heap profiler code (the `dhat-heap` feature) as well.
+On Linux and macOS, CI only runs `make setup` and the targets that make up `make ci` (`make check` and `make test`), so a local `make ci` runs the same checks. Tests run with the default features, the same as the released binary. Clippy runs with both the default features and `--all-features`, to check the heap profiler code (the `dhat-heap` feature) as well.
 
-Quality checks, Windows tests, and the six release-target builds start independently. Windows tests use two runners: one runs `cargo test --locked --lib --bins` and `cargo test --locked --doc`; the other runs every integration target with `cargo test --locked --test '*'`. Unit and binary tests use `RUST_TEST_THREADS=8` to overlap Git and file I/O. Integration tests keep the default CPU-based concurrency because they include stress tests with processing deadlines. Both test jobs read the existing Windows build cache; the build job saves it. All profiles, features, test cases, and processing deadlines remain the same.
+`make test` runs the unit and integration tests with cargo-nextest, each test in its own process (settings in `.config/nextest.toml`), and then the doctests with `cargo test --doc`, which nextest does not run. To run only some tests, call nextest through mise, as in `mise exec -- cargo nextest run <filter>`.
+
+The lint job, the test jobs, and the six release-target builds start independently. CI splits the tests across runners with nextest's `--partition slice:<m>/<n>`: two runners each on Linux and macOS (`make test TEST_PARTITION=slice:<m>/2`) and five on Windows, which calls `cargo nextest run` directly. Only the first runner of each OS runs the doctests; the others pass `TEST_DOC=0`. The first macOS runner runs `make ci`, so it also covers the lint for macOS without taking another macOS runner. The number of runners aims to have every one finish around the time the release builds do (about 7 minutes). macOS runners vary a lot in speed, so the first macOS runner, which also runs the lint, can take longer than the builds.
+
+Tests keep the default concurrency (the number of CPUs). Most of their time goes to starting `git` and `astro-sight` processes, and more concurrency than CPUs made them slower on the 4-core Linux and Windows runners. The one CPU-bound stress test (`deep_nesting::rust_impact_proofs_handle_deep_nesting`, with a 300-second deadline per command) starts first and counts as two tests. On Windows, the tests put temporary files in `runner.temp`, on the same drive as the workspace; with the default `TEMP` on `C:` the same tests took 1.6 times as long. The test step also puts Git's own `git.exe` (in the directory that `git --exec-path` prints) first on `PATH`. The `git.exe` found on `PATH` is a wrapper that starts it as another process, and skipping the wrapper made the tests about 25% faster on the same runner.
+
+Only pushes to main save the build caches; pull requests restore them without saving, so they do not fill the 10 GB cache limit and evict the caches of main. Each kind of job has its own cache key (`lint`, `test`, `build-<target>`), and the test runners of an OS share one key that the first runner saves.
 
 Cargo commands get `--locked` by default. When a `[patch]` in `.cargo/config.toml` swaps in local tree-sitter crates, `Cargo.lock` changes only on your machine and `--locked` stops the build. Empty `CARGO_FLAGS` in that case, as in `make ci CARGO_FLAGS=`.
 

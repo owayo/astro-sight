@@ -274,7 +274,7 @@ make ci      # CI と同じ検査 (書き換えない)
 `make` でターゲットの一覧を表示します。リリースは GitHub Actions で行います (**Actions → Release → Run workflow**)。
 <!-- standard:dev:end -->
 
-mise のほかに、tree-sitter のパーサをビルドする C コンパイラと、テストが呼ぶ `git` が要ります。mise を使わないときは `SYSTEM_TOOLS=1` を付けると、PATH 上のツールで動きます。`.cargo/config.toml` の `[patch]` でローカルの tree-sitter 系を差し込むと `Cargo.lock` が手元でだけ変わり、`--locked` で止まります。そのときは `make ci CARGO_FLAGS=` で外してください。
+mise のほかに、tree-sitter のパーサをビルドする C コンパイラと、テストが呼ぶ `git` が要ります。テストは [cargo-nextest](https://nexte.st/) で走らせ、`make setup` が `mise.toml` の版を入れます。mise を使わないときは `SYSTEM_TOOLS=1` を付けると、PATH 上のツールで動きます（`make test` には PATH 上の `cargo-nextest` も要ります）。`.cargo/config.toml` の `[patch]` でローカルの tree-sitter 系を差し込むと `Cargo.lock` が手元でだけ変わり、`--locked` で止まります。そのときは `make ci CARGO_FLAGS=` で外してください。
 
 `make install` で入れるスキルの選び方、ヒーププロファイル、利用状況の集計ツール、リリースの流れは [docs/development.ja.md](docs/development.ja.md) で説明しています。
 

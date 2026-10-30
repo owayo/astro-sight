@@ -5,8 +5,9 @@
 # (for example when make is started from an IDE or a GUI). SYSTEM_TOOLS=1 uses the tools on PATH
 # instead (the versions are then not guaranteed).
 #
-# The CI quality job only runs `make setup` and `make ci`. Add new checks to a target that ci
-# depends on instead of repeating commands in the workflow.
+# On Linux and macOS, CI only runs `make setup` and the targets that ci is made of (`make check`,
+# and `make test` with the tests split across runners). Add new checks to a target that ci depends
+# on instead of repeating commands in the workflow.
 #
 # Only GNU Make 3.81 features are used (the make that ships with macOS):
 # no .ONESHELL, .SHELLFLAGS, $(file ...) or !=.
@@ -19,6 +20,10 @@ INSTALL_PATH ?= /usr/local/bin
 # .cargo/config.toml swaps in local tree-sitter crates and Cargo.lock changes only on your machine,
 # drop the flag with `make ci CARGO_FLAGS=`.
 CARGO_FLAGS ?= --locked
+# CI splits the tests across runners: TEST_PARTITION=slice:<m>/<n> runs one part of them
+# (cargo nextest run --partition), and TEST_DOC=0 leaves the doctests to one of the runners.
+TEST_PARTITION ?=
+TEST_DOC ?= 1
 # AI agents that receive the skill after install. `make install SKILL_TARGETS=` installs none.
 SKILL_TARGETS ?= claude codex
 
@@ -74,8 +79,14 @@ run: ## Run the debug binary (arguments via ARGS="...")
 
 # Tests run with the default features (the same mimalloc setup as the released binary).
 # With --all-features the dhat-heap allocator is used and every process writes dhat-heap.json.
+# cargo-nextest (pinned in mise.toml, settings in .config/nextest.toml) runs the unit and
+# integration tests, each test in its own process. It does not run doctests, so cargo test --doc
+# runs them.
 test: ## Run the tests
-	$(RUN) cargo test $(CARGO_FLAGS)
+	$(RUN) cargo nextest run $(CARGO_FLAGS) $(if $(TEST_PARTITION),--partition $(TEST_PARTITION))
+ifeq ($(TEST_DOC),1)
+	$(RUN) cargo test $(CARGO_FLAGS) --doc
+endif
 
 # clippy runs twice: with the default features (the released binary, #[cfg(not(feature = "dhat-heap"))])
 # and with --all-features so that the dhat-heap code is checked too.

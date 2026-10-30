@@ -1,11 +1,15 @@
 # このリポジトリのツールチェーン。ローカルと CI の両方がここを正とする。
-# mise.lock は置かない。rust は rustup に任せるので、lock に固定するもの (URL と checksum) が無い。
+# 配布物の URL と checksum は mise.lock に固定する (rust は rustup に任せるので版だけが入る)。版を変えたら
+#   mise lock --platform linux-x64,linux-arm64,macos-x64,macos-arm64,windows-x64
+# で lock も作り直す。CI の mise-action は lock があると --locked で入れるので、食い違うとそこで止まる。
 
 [tools]
 # profile と components を明示する。未指定だと rustup の既定の profile 次第で入るものが変わり、
 # GitHub Actions のランナー (minimal) では cargo fmt が無いと言われて落ちる。minimal に要る
 # components だけを足すと、手元と CI で同じものが入り、使わない component (rust-docs など) を取らない
 rust = { version = "1.99.1", profile = "minimal", components = ["rustfmt", "clippy"] }
+# テストランナー (make test と CI のテストジョブ。設定は .config/nextest.toml)。公開から 14 日以上たった版を固定する
+"aqua:nextest-rs/nextest/cargo-nextest" = "0.9.148"
 
 [env]
 # macOS: cc crate (tree-sitter の C パーサ) と rustc のデプロイメントターゲットをそろえる。

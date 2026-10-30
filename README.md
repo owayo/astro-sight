@@ -280,7 +280,7 @@ make ci      # Run the same checks as CI (no changes)
 Run `make` to list every target. Releases are published from GitHub Actions (**Actions → Release → Run workflow**).
 <!-- standard:dev:end -->
 
-Besides mise, the build needs a C compiler for the tree-sitter parsers, and the tests need `git`. Without mise, add `SYSTEM_TOOLS=1` to use the tools on `PATH`. When a `[patch]` in `.cargo/config.toml` swaps in local tree-sitter crates, `Cargo.lock` changes only on your machine and `--locked` stops the build; run `make ci CARGO_FLAGS=` in that case.
+Besides mise, the build needs a C compiler for the tree-sitter parsers, and the tests need `git`. The tests run with [cargo-nextest](https://nexte.st/), which `make setup` installs at the version in `mise.toml`. Without mise, add `SYSTEM_TOOLS=1` to use the tools on `PATH` (`make test` then needs `cargo-nextest` on `PATH` as well). When a `[patch]` in `.cargo/config.toml` swaps in local tree-sitter crates, `Cargo.lock` changes only on your machine and `--locked` stops the build; run `make ci CARGO_FLAGS=` in that case.
 
 Choosing the skills that `make install` writes, heap profiling, the usage statistics tool, and how a release is built are covered in [docs/development.md](docs/development.md).
 

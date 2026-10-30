@@ -377,19 +377,22 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Build & Test
 
-開発コマンドは `make help` を参照する。ツールの版は `mise.toml` が正で、Makefile は `mise exec --` 経由でその版の `cargo` を呼ぶ（mise を使わない場合は `SYSTEM_TOOLS=1` を付ける）。
+開発コマンドは `make help` を参照する。ツールの版は `mise.toml` が正で、Makefile は `mise exec --` 経由でその版の `cargo` を呼ぶ（mise を使わない場合は `SYSTEM_TOOLS=1` を付ける）。配布物の URL と checksum は `mise.lock` に固定していて、版を変えたら `mise lock --platform linux-x64,linux-arm64,macos-x64,macos-arm64,windows-x64` で作り直す (CI の mise-action は lock があると `--locked` で入れる)。
 
 ```bash
 make setup    # mise.toml のツールチェーンを入れ、依存を取得する (初回と依存の更新後)
 make build    # デバッグビルド
-make test     # テスト (既定の feature = 配布物と同じ mimalloc の構成)
-make check    # fmt-check + clippy (--all-targets --all-features) + cargo check
-make ci       # check + test。CI の quality ジョブは make setup と make ci だけを呼ぶ
+make test     # テスト (cargo-nextest で単体・統合テスト + cargo test --doc。既定の feature = 配布物と同じ mimalloc の構成)
+make check    # fmt-check + clippy (既定の feature と --all-features の 2 回、--all-targets)
+make ci       # check + test
 make help     # 全ターゲット表示
 ```
 
-- CI の quality (Linux/macOS)、test-windows、6ターゲットの build は独立して開始する。Windows は単体/binary/doc と全統合テスト (`--test '*'`) を別ランナーへ分け、各テストは一度ずつ実行する。単体/binary のステップだけ `RUST_TEST_THREADS=8` を指定して Git・ファイル I/O の待機を重ね、期限付きのストレステストを含む統合テストは既定の並列数を使う。test-windows は既存の Windows build のキャッシュを読み、保存は build に任せる。feature と全 profile の設定は変更しない。
-- 個別のテストの絞り込みのように対応するターゲットが無いものは、`mise exec -- cargo test <filter>` のように mise 経由で直接呼ぶ
+- CI の lint (Linux の `make check`)、test (Linux / macOS を各 2 シャード。`make test TEST_PARTITION=slice:<m>/2`)、test-windows (5 シャード。Makefile の test と同じことを `cargo nextest run --partition slice:<m>/5` で直接呼ぶ)、6 ターゲットの build は独立して開始する。macOS の lint は別ランナーにせず、test の 1 番目が `make ci` で兼ねる (lint を分けると build の 2 つと合わせて macOS の同時実行の上限 5 を使い切る)。doctest は分割できないので各 OS の 1 番目のシャードだけが回し、残りは `TEST_DOC=0` で飛ばす。シャード数は、どのシャードも配布用 build (約 7 分) と同じころに終わることを目安に決めている。macOS のランナーは速さのばらつきが大きく、lint も回す 1 番目は build より長くなることがある
+- テストランナーは cargo-nextest (版は `mise.toml`、設定は `.config/nextest.toml`)。テストは 1 件ずつ別プロセスで走るので、テスト間で static やプロセスの状態 (環境変数・カレントディレクトリ) を共有する前提で書かない。並列数は既定 (CPU 数) のまま。テストの大半は git と astro-sight の子プロセスの起動待ちで、CPU 数より増やすと子プロセスが CPU を取り合って遅くなる (4 コアの Linux / Windows で 8・12 並列は悪化した)。CPU 律速の `deep_nesting::rust_impact_proofs_handle_deep_nesting` だけは `priority = 100` (最初に始める) と `threads-required = 2` を付ける (libtest の 8 並列では各コマンドの 300 秒期限を超えた)。同じように CPU を長く使うテストを足したら、同じ override に足す
+- Windows のテストは TMP / TEMP を `runner.temp` (作業ツリーと同じ D:) に置く。既定の TEMP (C:) では同じテストが 1.6 倍かかった。テストのステップだけ git の本体 (`git --exec-path` にある git.exe) を PATH の先頭に置く。PATH で見つかる `bin\git.exe` は本体を子プロセスとして起動し直すラッパーで、同じランナーで比べるとテストが 25% 前後縮んだ
+- キャッシュ (rust-cache) は main への push だけが保存し、PR は main のキャッシュを読むだけにする (PR ごとに保存すると上限 10GB を使い切り、main のキャッシュが追い出される)。鍵は用途ごとに分ける (`lint` / `test` / `build-<target>`)。test のシャードは OS ごとに 1 つの鍵を共有し、1 番目だけが保存する
+- 個別のテストの絞り込みのように対応するターゲットが無いものは、`mise exec -- cargo nextest run <filter>` のように mise 経由で直接呼ぶ (libtest で走らせる `cargo test <filter>` も使える)。`SYSTEM_TOOLS=1` では PATH 上の `cargo` と `cargo-nextest` を使う (nextest が無ければ `make test` は失敗する)
 - Cargo のコマンドには `CARGO_FLAGS` (既定 `--locked`) を付ける。`.cargo/config.toml` の `[patch]` で Cargo.lock が手元でだけ変わるときは `make ci CARGO_FLAGS=` で外す
 
 ## Notes
@@ -398,7 +401,7 @@ make help     # 全ターゲット表示
 - **Kotlin 文法の移行候補: `tree-sitter-kotlin-ng`（保留中・実施すると決定済み）** — 公式 tree-sitter-grammars org（https://github.com/tree-sitter-grammars/tree-sitter-kotlin）の後継クレート。依存が `tree-sitter-language ^0.1`（normal）だけで `tree-sitter ^0.24` は dev-dependency のみ＝現代的な `LanguageFn` 方式なので tree-sitter 0.27 とそのまま繋がり、`Language::new(tree_sitter_kotlin_ng::LANGUAGE)` で**unsafe FFI ブリッジを完全に削除できる**（差し替えビルド成功を実測済み）。**実測した移行の根拠**: square/okhttp（Kotlin 573 ファイル）を両文法で parse し AST に ERROR ノードを含むファイル数を比較したところ **旧 0.3.5 が 20 / 573、新 -ng が 4 / 573（80% 減）**。**未実施の理由**: `-ng` は同名の別文法で、識別子・import 系のノード名が全面的に変わる — 消えた名前 `simple_identifier` / `type_identifier` / `import_header` / `import_list` / `import_alias` / `statements` / `jump_expression` / `integer_literal` / `parameter_with_optional_type`、増えた名前 `identifier` / `qualified_identifier` / `import` / `block` / `return_expression` / `number_literal` / `class_parameters` / `delegation_specifiers`。分岐ノード（`if_expression` / `when_expression` / `for_statement` / `while_statement` / `do_while_statement` / `try_expression`）と `function_declaration` / `class_declaration` / `object_declaration` / `class_body` / `function_body` / `modifiers` は共通で変更不要。新たに `visibility_modifier` が使えるため、`modifiers` のテキストに `"private"` が含まれるかという現行の**文字列判定**を構造判定へ改善できる。**移行時に必須の検証**（設計相談の結論）: (1) 全 Kotlin クエリのコンパイルとノード名・フィールド名の実在検証 + 各 branch/boundary エントリを実際に通す fixture（capture の**内容と個数**まで検証。存在確認だけでは不十分）、(2) ジェネリクス / 継承 / コンストラクタプロパティ / object・companion・enum / getter・setter / 拡張関数 / 式形式関数 / lambda / safe call / callable reference / import alias・ワイルドカード / 可視性・override / ERROR・MISSING 入りの未完成コードを含む golden 回帰、(3) okhttp 573 ファイルで旧・新の全出力を意味的に差分比較し、**新の 4 ファイルが旧の 20 の部分集合か**を確認（総数の減少だけでは新規退行を否定できない。旧結果を正解とみなさないこと）、(4) 変更前後ペアで downstream 検証（公開 API 削除 / 型・可視性変更は検出、本体のみ変更は api.mod を出さない、alias・qualified call 経由の参照を dead にしない）、(5) ファイル列挙順・並列度を変えて出力一致を確認し、残り 15 言語の回帰と hook blocking 判定を通す。**落とし穴**: ERROR だけを検査して MISSING や回復された部分木を正常扱いにしない / `private` だけを見て包含クラスの可視性や `internal` を無視しない / signature が式形式の関数本体を含んだり戻り型・receiver を落としたりしない / capture の順序や重複数が変わると出力順が不安定になり決定論が壊れる。クエリは `name:` フィールドが使えるならそれを最優先し、無ければ確認済みの構造にアンカー `.` を打つ（`(class_declaration (identifier) @class.name)` は**直下の子だけ**を見るので型パラメータや継承リストへの過剰マッチは起きない。警戒すべきは同一宣言の直下に複数 identifier がある構造と、`modifiers` が先頭に来ることでアンカーが外れるケース）。初回は `=1.1.0` にピン留めし、文法更新と抽出ロジック変更を1 つの検証済み変更として管理する。**検証時は必ずキャッシュを退避すること**
 - tree-sitter 0.26 では Point/Range のフィールドがメソッドではなくパブリックフィールド
 - QueryMatches は StreamingIterator（標準 Iterator ではない）
-- Windows のメインスレッドのスタックは `build.rs` でリンカに渡して 8MB (Linux / macOS と同じ) にしている。既定の 1MB では debug ビルドが起動直後に stack overflow で落ちる。CI は Windows の全テストを test-windows の2ジョブで回す (quality の `make ci` は Linux と macOS だけ)
+- Windows のメインスレッドのスタックは `build.rs` でリンカに渡して 8MB (Linux / macOS と同じ) にしている。既定の 1MB では debug ビルドが起動直後に stack overflow で落ちる。CI は Windows の全テストを test-windows の 5 シャードで回す (make を通すのは Linux と macOS だけ)
 
 ## Lexer-Only バックエンド (v26.6 で導入)
 
