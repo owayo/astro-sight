@@ -4119,3 +4119,44 @@ fn cx_nested_generator_expression_branches_excluded() {
         ],
     );
 }
+
+fn extracted_names(source: &str, lang_id: LangId) -> Vec<String> {
+    let language = lang_id.ts_language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).unwrap();
+    let tree = parser.parse(source, None).unwrap();
+    extract_symbols(tree.root_node(), source.as_bytes(), lang_id)
+        .unwrap()
+        .into_iter()
+        .map(|symbol| symbol.name)
+        .collect()
+}
+
+/// Rust の `const _` / `static _` は名前を導入しない項目で、`_` という名前では参照できない。
+/// シンボルにすると型推論の `_` (`Vec<_>`) を参照と取り違える。名前付きの定数は従来どおり拾う。
+#[test]
+fn rust_anonymous_const_is_not_extracted_as_a_symbol() {
+    assert_eq!(
+        extracted_names(
+            "pub const LIMIT: u8 = 3;\nconst _: () = { assert!(LIMIT == 3); };\n",
+            LangId::Rust
+        ),
+        ["LIMIT"]
+    );
+    assert_eq!(
+        extracted_names("static _: u8 = 1;\nstatic NAMED: u8 = 2;\n", LangId::Rust),
+        ["NAMED"]
+    );
+}
+
+/// `_` を外すのは Rust だけ。他言語では普通の名前になる (JavaScript の lodash など)。
+#[test]
+fn underscore_binding_is_kept_outside_rust() {
+    for lang in [LangId::Javascript, LangId::Typescript] {
+        assert!(
+            extracted_names("export const _ = { map(items) { return items; } };\n", lang)
+                .contains(&"_".to_owned()),
+            "{lang:?} の `_` をシンボルから外してはいけない"
+        );
+    }
+}

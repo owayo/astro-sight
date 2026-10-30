@@ -214,6 +214,16 @@ fn run_symbol_query(
             if let Some(kind) = kind {
                 let name = node.utf8_text(source).unwrap_or("");
                 if !name.is_empty() {
+                    // Rust の `const _: () = ...;` は名前を導入しない項目で、`_` という名前では
+                    // 参照できない (`_` は識別子になり得ない予約語)。シンボルとして登録すると、
+                    // 型推論の `_` (`collect::<Vec<_>>()` 等) をその参照と取り違え、
+                    // 匿名定数を 1 つ足すだけで無関係なファイルが impact の呼び出し元に出て
+                    // 終了コードが 1 になる。`symbols` にも実体のない定数が並ぶ。
+                    // `_` が通常の識別子になり得る他言語 (JS の lodash、Python、Go の空白識別子)
+                    // には当てないので、言語を Rust に限る。
+                    if lang_id == LangId::Rust && name == "_" {
+                        continue;
+                    }
                     let mut parent_node = node.parent().unwrap_or(node);
                     // 代入から関数を作れるのは lambda を束縛した場合だけ。関数以外の capture
                     // (`--query` の `@constant.name` / `@variable.name` 等) には当てない。
