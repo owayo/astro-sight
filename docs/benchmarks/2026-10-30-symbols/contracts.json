@@ -1,0 +1,77 @@
+[
+  {
+    "case": "deep-500",
+    "stdout_bytes": 427,
+    "sha256": "d2a29368d137788d8c93fc1d5e21fdeaafaf7215cc5466889ff796c1f3941154"
+  },
+  {
+    "case": "deep-1000",
+    "stdout_bytes": 429,
+    "sha256": "28b561e3323b3ff23b6de3c2fb7aae9ede6e54417bceccf4f47f4d06138449e2"
+  },
+  {
+    "case": "deep-2000",
+    "stdout_bytes": 429,
+    "sha256": "0785c8238a2c3db578405b21b079cb3d24a3e8db7a88e375f107458fdedb91c9"
+  },
+  {
+    "case": "many-250",
+    "stdout_bytes": 8945,
+    "sha256": "7f33d96fe4988788ed40327ddebb59cd5d92b914d3f6c890064ec9d4fd3c858d"
+  },
+  {
+    "case": "many-500",
+    "stdout_bytes": 8945,
+    "sha256": "672086e163114b2f79fd6862109e685bff5aa08fc4754d1493bc35ae3127bed4"
+  },
+  {
+    "case": "leaf-control",
+    "stdout_bytes": 438,
+    "sha256": "787cde33a06ed549d9a081fc4302f45579ac204a87bb1b6b327bfee281a2a4b2"
+  },
+  {
+    "case": "absent-control",
+    "stdout_bytes": 30,
+    "sha256": "4aabb368084fc00c0238624a40aabad4d0e9db770352572a8f6f4355198d1d28"
+  },
+  {
+    "case": "ordinary",
+    "stdout_bytes": 8891,
+    "sha256": "1660a5750aaab5dc10690dd6194bea69b9385f0a7568bceb5d34a071894a8e3e"
+  },
+  {
+    "case": "mixed-languages",
+    "stdout_bytes": 1806,
+    "sha256": "c8a476292b5ccf52b51a86a6c0f72bf6d66f9ef6dbbd86743e197680a6c6066b"
+  },
+  {
+    "case": "classes-1000",
+    "stdout_bytes": 107153,
+    "sha256": "4105bcb96f86412ea4ee488025d6eb95a338f215e6d641711fd49ab1a96cdb73"
+  },
+  {
+    "case": "classes-4000",
+    "stdout_bytes": 438486,
+    "sha256": "269cbaacf5193c6b1f834345e468f510a182f7f874458f6b132b9af420ff2d5d"
+  },
+  {
+    "case": "classes-16000",
+    "stdout_bytes": 1794487,
+    "sha256": "923963020c57be2816efff9b4643193e1ed9ea32f99e1c3bce1fe6f45416fab5"
+  },
+  {
+    "case": "functions-control",
+    "stdout_bytes": 181891,
+    "sha256": "2e9bd22aee26544d20f73403a3e51f11032749d45d01c52ad1936b5f28a25a27"
+  },
+  {
+    "case": "real-rust",
+    "stdout_bytes": 9177,
+    "sha256": "94bba6fd9057d515cfd7dfb0ea8965103fe3660d5d089e6fe81137dccd0b9b92"
+  },
+  {
+    "case": "mixed-fixtures",
+    "stdout_bytes": 10669,
+    "sha256": "772e50f1eec00126a0096a580bef0c6e1d5d51db7588b395c92fdf78ba964a52"
+  }
+]

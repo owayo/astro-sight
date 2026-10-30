@@ -82,3 +82,15 @@ python tools/bench-refs.py `
 Use `--mode session` for request times inside one persistent process per case, or `--mode cli` (the default) to include process startup. The mixed-language session case sends the three names as separate requests. The script saves deterministic inputs, checks identical stdout for every run, warms up each binary once, and alternates their order. Cases cover a name deep inside Rust `use` paths, repeated path segments, a leaf name, an absent name, ordinary shallow functions, and the mixed-language fixtures. It writes every elapsed-time and peak-working-set measurement to `samples.csv`, with medians, ranges, executable hashes, and environment metadata in `summary.json`. On Windows, the peak comes from GetProcessMemoryInfo after each CLI process exits, or after each request in session mode and includes mapped pages; it is not an allocation count. Session peaks include the warmup and earlier requests within that case. Other platforms record null for this metric.
 
 Keep generated inputs outside the repository so they do not become extra sources for reference and API analyses. Record the source revision, dependency versions, toolchain, build command, machine load, and whether the file cache was warm with the results. Compare large improvements against the full range of samples; small differences can be scheduler noise. Rust closure binding and usage-role checks still have separate ancestor walks, so these measurements do not establish linear time for every Rust reference query.
+
+## Symbol Extraction Performance
+
+Use the same harness with `--suite symbols` to compare enclosing-type assignment on files with 1,000, 4,000, and 16,000 classes, each with one method. Controls cover functions without classes, a real Rust source file, and mixed-language fixtures. The fixture directory runs only in CLI mode; session mode measures single-file requests. CLI requests use `--no-cache` so the persistent result cache cannot bypass extraction. Session requests bypass that cache layer. Both modes verify identical stdout on every run and save time and peak-working-set samples.
+
+```powershell
+python tools/bench-refs.py --suite symbols --mode session --repeats 9 `
+  --baseline C:/temp/astro-before.exe --candidate C:/temp/astro-after.exe `
+  --output-directory C:/temp/astro-symbols-bench
+```
+
+The ownership index preserves the existing smallest-line-span rule, including extraction-order ties, exact column boundaries, and known Go receivers. Large inputs use O((C+F) log(C+F)) time and O(C+F) auxiliary space for C containers and F unassigned functions. Small inputs use direct comparison. This bound describes ownership assignment, not parsing or the entire `symbols` command. Results and limits from the maintenance run are in [the measurement record](benchmarks/2026-10-30-symbols/README.md).

@@ -1,4 +1,4 @@
-"""旧新 CLI の参照検索を交互に測定し、全出力の一致と生データを保存する。"""
+"""旧新 CLI の参照検索・シンボル抽出を交互に測定し、出力一致と生データを保存する。"""
 
 import argparse
 import csv
@@ -176,6 +176,47 @@ def cases(input_root):
     return result
 
 
+def symbol_cases(input_root):
+    """型とメソッドが増える入力、型のない対照と実ソースを測る。"""
+    result = []
+    for count in (1000, 4000, 16000):
+        source = "\n".join(
+            f"class Box{i} {{\n  method(): number {{ return {i}; }}\n}}"
+            for i in range(count)
+        )
+        path = input_root / f"classes-{count}.ts"
+        path.write_text(source + "\n", encoding="utf-8")
+        result.append(
+            (f"classes-{count}", ["symbols", "--path", path, "--format", "json"])
+        )
+    path = input_root / "functions.ts"
+    path.write_text(
+        "\n".join(f"function f{i}(): number {{ return {i}; }}" for i in range(4000)),
+        encoding="utf-8",
+    )
+    result.append(
+        ("functions-control", ["symbols", "--path", path, "--format", "json"])
+    )
+    root = Path(__file__).resolve().parents[1]
+    result.append(
+        (
+            "real-rust",
+            ["symbols", "--path", root / "src/engine/cochange.rs", "--format", "json"],
+        )
+    )
+    result.append(
+        (
+            "mixed-fixtures",
+            ["symbols", "--dir", root / "tests/fixtures", "--format", "json"],
+        )
+    )
+    # CLI の永続キャッシュが旧新で共有されると抽出自体を比較できない。
+    # session はこの層を通らず、要求の変換時にこの CLI 専用フラグを取り除く。
+    for _, arguments in result:
+        arguments.append("--no-cache")
+    return result
+
+
 @contextmanager
 def session_measurements(executable):
     """起動をウォームアップへ含め、同じ session 内の要求時間を測る。"""
@@ -192,19 +233,30 @@ def session_measurements(executable):
 
         def run(arguments):
             args = list(map(str, arguments))
-            directory = args[args.index("--dir") + 1]
-            glob = args[args.index("--glob") + 1] if "--glob" in args else None
-            names = (
-                args[args.index("--names") + 1].split(",")
-                if "--names" in args
-                else [args[args.index("--name") + 1]]
-            )
+            if args[0] == "symbols":
+                if "--path" not in args:
+                    raise ValueError("session symbols requires --path")
+                requests = [
+                    {"command": "symbols", "path": args[args.index("--path") + 1]}
+                ]
+            else:
+                directory = args[args.index("--dir") + 1]
+                glob = args[args.index("--glob") + 1] if "--glob" in args else None
+                names = (
+                    args[args.index("--names") + 1].split(",")
+                    if "--names" in args
+                    else [args[args.index("--name") + 1]]
+                )
+                requests = [
+                    {"command": "refs", "dir": directory, "name": name}
+                    for name in names
+                ]
+                if glob is not None:
+                    for request in requests:
+                        request["glob"] = glob
             output = []
             started = time.perf_counter()
-            for name in names:
-                request = {"command": "refs", "dir": directory, "name": name}
-                if glob is not None:
-                    request["glob"] = glob
+            for request in requests:
                 process.stdin.write(json.dumps(request).encode() + b"\n")
                 process.stdin.flush()
                 line = executor.submit(process.stdout.readline).result(timeout=120)
@@ -246,6 +298,7 @@ def main():
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--repeats", type=int, default=9)
     parser.add_argument("--mode", choices=("cli", "session"), default="cli")
+    parser.add_argument("--suite", choices=("refs", "symbols"), default="refs")
     options = parser.parse_args()
     if options.repeats < 3:
         parser.error("--repeats must be at least 3")
@@ -257,7 +310,15 @@ def main():
         "after": options.candidate.resolve(strict=True),
     }
     rows, summary = [], []
-    for name, arguments in cases(inputs):
+    selected = cases(inputs) if options.suite == "refs" else symbol_cases(inputs)
+    if options.mode == "session":
+        # ディレクトリの symbols は NDJSON 複数行なので CLI だけで測る。
+        selected = [
+            (name, args)
+            for name, args in selected
+            if "--dir" not in args or args[0] != "symbols"
+        ]
+    for name, arguments in selected:
         with measurement_pair(variants, options.mode) as runs:
             expected, _, _ = runs["before"](arguments)
             actual, _, _ = runs["after"](arguments)
@@ -315,6 +376,8 @@ def main():
     report = {
         "repeats": options.repeats,
         "mode": options.mode,
+        "suite": options.suite,
+        "symbols_result_cache": "disabled" if options.suite == "symbols" else None,
         "os": platform.platform(),
         "processors": os.cpu_count(),
         "python": platform.python_version(),

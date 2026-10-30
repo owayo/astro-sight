@@ -82,3 +82,15 @@ python tools/bench-refs.py `
 `--mode session` はケースごとに常駐するプロセス内の要求時間を測り、`--mode cli` (既定) は起動時間も含めます。多言語の session ケースは3つの名前を別々の要求で送ります。スクリプトは再現可能な入力を保存し、毎回の stdout 一致を確認します。各版を1回ウォームアップしてから実行順を交互に反転します。Rust の深い `use` パス内の名前、同名セグメントの反復、末尾の名前、不在の名前、浅い通常関数、多言語 fixture を測定します。全測定の時間とピーク working set は `samples.csv`、中央値・範囲・実行ファイルのハッシュ・環境は `summary.json` に出します。Windows のピーク値はCLI の終了後または session の各要求後に GetProcessMemoryInfo で取得し、mmap のページも含みます。割当回数ではありません。session のピークは同じケースのウォームアップと先行要求も含みます。他の OS ではこの指標を null として記録します。
 
 生成入力はリポジトリの外に置き、参照検索や API 分析の対象ソースへ混入させないでください。結果にはソース revision、依存の版、ツールチェーン、ビルドコマンド、同時負荷、ファイルキャッシュの条件を記録します。改善幅は全測定の範囲と比較し、小さな差をスケジューラ由来の変動と区別します。Rust の closure 束縛と参照役割には別の祖先走査が残るため、全 Rust 参照検索が線形時間になるという測定ではありません。
+
+## シンボル抽出の性能
+
+`tools/bench-refs.py --suite symbols` は、各1メソッドを持つ1,000・4,000・16,000クラスの入力を比較します。クラスなしの関数、実際の Rust ソース、多言語 fixture を対照に含め、全試行の出力一致と時間・ピーク working set を保存します。`--mode session` は単一ファイルの要求時間、`--mode cli` は起動を含む時間を測ります。fixture ディレクトリは CLI だけで測ります。CLI は `--no-cache` で永続結果キャッシュを無効にし、抽出が省略されない条件にします。session はこのキャッシュ層を通りません。
+
+```powershell
+python tools/bench-refs.py --suite symbols --mode session --repeats 9 `
+  --baseline C:/temp/astro-before.exe --candidate C:/temp/astro-after.exe `
+  --output-directory C:/temp/astro-symbols-bench
+```
+
+所属索引は従来の行数差による選択、同順位の抽出順、列境界、確定済みの Go receiver 等を維持します。コンテナ数 C・未確定の関数数 F に対し、大きい入力の所属判定は O((C+F) log(C+F))、追加領域は O(C+F) です。小さい入力は直接比較します。これは所属判定の計算量であり、パースや `symbols` 全体の計算量ではありません。[点検時の測定記録](benchmarks/2026-10-30-symbols/README.md)も参照してください。
