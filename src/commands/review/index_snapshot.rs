@@ -279,15 +279,77 @@ pub(in crate::commands) struct IndexSnapshot {
     analysis_dir: PathBuf,
 }
 
-impl IndexSnapshot {
-    pub(super) fn prepare(
-        dir: &str,
-        base: &str,
-        expected_diff: &str,
-        budget: SnapshotBudget,
-    ) -> Result<PreparedSnapshot> {
-        let original = Path::new(dir);
-        // hook の index は読むだけにし、tree の作成は一時 index で行う。
+/// スナップショットの作成に要る、元のリポジトリの値。
+#[cfg_attr(test, derive(Debug, PartialEq))]
+struct OriginalRepository {
+    index: String,
+    shared_index: String,
+    object_format: String,
+    /// `dir` のリポジトリのルートからの相対パス (両方を canonicalize してから求める)。
+    prefix: PathBuf,
+    objects: String,
+    common: String,
+}
+
+impl OriginalRepository {
+    /// rev-parse の 6 項目を、ふつうは 2 回の起動で読む ([`Self::read_batched`])。読めなければ
+    /// 1 項目ずつ読む従来の手順 ([`Self::read_one_by_one`]) をやり直すので、失敗したときのエラーは
+    /// 従来と同じになる。
+    fn read(original: &Path) -> Result<Self> {
+        match Self::read_batched(original) {
+            Some(repository) => Ok(repository),
+            None => Self::read_one_by_one(original),
+        }
+    }
+
+    /// 必ず 1 行を出す 5 項目を 1 回の rev-parse で読み、`--shared-index-path` だけを別に読む。
+    ///
+    /// `--shared-index-path` は split index でないとき改行も出さないので、一緒に読むと行数が変わり、
+    /// パスに改行が入った場合と区別できない。残りの 5 項目は改行で終わるレコードがちょうど 5 個で
+    /// あることを確かめてから使う (パスに改行が入っていれば個数が合わず、従来の手順に戻る)。
+    fn read_batched(original: &Path) -> Option<Self> {
+        let output = String::from_utf8(
+            git_bytes(
+                original,
+                &[
+                    "rev-parse",
+                    "--git-path",
+                    "index",
+                    "--show-object-format",
+                    "--show-toplevel",
+                    "--git-path",
+                    "objects",
+                    "--git-common-dir",
+                ],
+            )
+            .ok()?,
+        )
+        .ok()?;
+        let records: Vec<&str> = output.strip_suffix('\n')?.split('\n').collect();
+        let [index, object_format, toplevel, objects, common] = records[..] else {
+            return None;
+        };
+        if !matches!(object_format, "sha1" | "sha256") {
+            return None;
+        }
+        let shared_index = git_text(original, &["rev-parse", "--shared-index-path"]).ok()?;
+        let original_root = fs::canonicalize(toplevel).ok()?;
+        let prefix = fs::canonicalize(original)
+            .ok()?
+            .strip_prefix(&original_root)
+            .ok()?
+            .to_path_buf();
+        Some(Self {
+            index: index.to_owned(),
+            shared_index,
+            object_format: object_format.to_owned(),
+            prefix,
+            objects: objects.to_owned(),
+            common: common.to_owned(),
+        })
+    }
+
+    fn read_one_by_one(original: &Path) -> Result<Self> {
         let index = git_text(original, &["rev-parse", "--git-path", "index"])?;
         let shared_index = git_text(original, &["rev-parse", "--shared-index-path"])?;
         let object_format = git_text(original, &["rev-parse", "--show-object-format"])?;
@@ -297,9 +359,37 @@ impl IndexSnapshot {
         let original_root =
             fs::canonicalize(git_text(original, &["rev-parse", "--show-toplevel"])?)?;
         let canonical_dir = fs::canonicalize(original)?;
-        let prefix = canonical_dir.strip_prefix(&original_root)?;
+        let prefix = canonical_dir.strip_prefix(&original_root)?.to_path_buf();
         let objects = git_text(original, &["rev-parse", "--git-path", "objects"])?;
         let common = git_text(original, &["rev-parse", "--git-common-dir"])?;
+        Ok(Self {
+            index,
+            shared_index,
+            object_format,
+            prefix,
+            objects,
+            common,
+        })
+    }
+}
+
+impl IndexSnapshot {
+    pub(super) fn prepare(
+        dir: &str,
+        base: &str,
+        expected_diff: &str,
+        budget: SnapshotBudget,
+    ) -> Result<PreparedSnapshot> {
+        let original = Path::new(dir);
+        // hook の index は読むだけにし、tree の作成は一時 index で行う。
+        let OriginalRepository {
+            index,
+            shared_index,
+            object_format,
+            prefix,
+            objects,
+            common,
+        } = OriginalRepository::read(original)?;
         let absolute = |path: &str| {
             let path = Path::new(path);
             fs::canonicalize(if path.is_absolute() {
@@ -507,6 +597,52 @@ mod tests {
             PreparedSnapshot::Ready(snapshot) => snapshot,
             PreparedSnapshot::OverBudget(_) => panic!("small staged tree must be materialized"),
         }
+    }
+
+    /// 元のリポジトリの値を 2 回の rev-parse で読んでも、1 項目ずつ読んだ場合と同じになる。
+    /// サブディレクトリ・linked worktree (index と objects の場所が別)・split index
+    /// (`--shared-index-path` が出力を持つ) で比べる。
+    #[test]
+    fn original_repository_reads_the_same_values_in_two_rev_parse_calls() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).expect("mkdir");
+        init_git_repo_for_test(&repo);
+        write(&repo, "app/src/lib.rs", b"pub fn a() {}\n");
+        commit_all(&repo, "base");
+        let linked = dir.path().join("linked");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().expect("utf-8"),
+            ],
+        );
+        let split = dir.path().join("split");
+        fs::create_dir_all(&split).expect("mkdir");
+        init_git_repo_for_test(&split);
+        write(&split, "lib.rs", b"pub fn s() {}\n");
+        commit_all(&split, "base");
+        git(&split, &["update-index", "--split-index"]);
+
+        for target in [
+            repo.clone(),
+            repo.join("app/src"),
+            linked.join("app"),
+            split.clone(),
+        ] {
+            let batched = OriginalRepository::read_batched(&target).expect("batched read");
+            let one_by_one = OriginalRepository::read_one_by_one(&target).expect("one by one");
+            assert_eq!(batched, one_by_one, "{}", target.display());
+        }
+        let split_values = OriginalRepository::read_batched(&split).expect("split");
+        assert!(
+            !split_values.shared_index.is_empty(),
+            "前提: split index では shared index のパスが出る"
+        );
     }
 
     /// tree の通常ファイルは、解析対象の言語かどうかに関わらず index の raw blob のまま全部書き出す。

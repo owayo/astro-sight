@@ -155,6 +155,42 @@ fn resolve_git_diff_pins_commit_for_worktree_and_index() {
     }
 }
 
+/// worktree の判定・base の解決と同じ rev-parse で、`dir` の prefix も返す (リポジトリの
+/// ルートでは空)。`.git` の中は worktree の外として従来どおり skip する。
+#[test]
+fn resolve_git_diff_returns_workspace_prefix_from_the_same_rev_parse() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(repo, &[("app/src/lib.rs", "pub fn a() {}\n")], "initial");
+    fs::write(repo.join("app/src/lib.rs"), "pub fn b() {}\n").expect("write");
+
+    for (sub, expected) in [(".", ""), ("app", "app/"), ("app/src", "app/src/")] {
+        let path = repo.join(sub);
+        match resolve_git_diff(path.to_str().expect("utf-8"), None, false).expect("diff") {
+            GitDiffInput::Diff {
+                diff,
+                workspace_prefix,
+                ..
+            } => {
+                assert_eq!(
+                    workspace_prefix.as_deref(),
+                    Some(expected.as_bytes()),
+                    "{sub}"
+                );
+                assert!(diff.contains("+pub fn b()"), "{sub}: {diff}");
+            }
+            GitDiffInput::Skipped(skip) => panic!("{sub}: {skip:?}"),
+        }
+    }
+    match resolve_git_diff(repo.join(".git").to_str().expect("utf-8"), None, false)
+        .expect("resolve")
+    {
+        GitDiffInput::Skipped(skip) => assert_eq!(skip.reason.as_str(), "not_git_repository"),
+        GitDiffInput::Diff { .. } => panic!(".git の中は worktree の外として skip する"),
+    }
+}
+
 #[test]
 fn resolve_git_diff_rejects_unresolvable_commit() {
     let dir = tempfile::tempdir().expect("tempdir");

@@ -81,12 +81,22 @@ fn git_records(dir: &str, args: &[&str], mut each: impl FnMut(&[u8]) -> Option<(
     (complete && status.success()).then_some(())
 }
 
+/// `dir` のリポジトリのルートからの相対 prefix。`raw` は `git rev-parse --show-prefix` の出力
+/// (終端の改行の有無は問わない)。UTF-8 でなければ `None` (tree の一覧を使えない)。
+fn workspace_prefix(raw: Vec<u8>) -> Option<String> {
+    Some(
+        String::from_utf8(raw)
+            .ok()?
+            .trim_end_matches('\n')
+            .to_owned(),
+    )
+}
+
 fn tree_entries(
     dir: &str,
+    prefix: &str,
     revision: &str,
 ) -> Option<(HashSet<String>, HashSet<String>, HashSet<String>)> {
-    let prefix = String::from_utf8(git(dir, &["rev-parse", "--show-prefix"])?).ok()?;
-    let prefix = prefix.trim_end_matches('\n');
     let mut paths = HashSet::new();
     let mut links = HashSet::new();
     let mut regular = HashSet::new();
@@ -223,8 +233,25 @@ fn relative_path(from: &str, to: &str) -> String {
 }
 
 impl<'a> Scope<'a> {
+    /// prefix を自分で問い合わせる版。review は差分の取得で取れた prefix を渡す
+    /// ([`Self::with_known_prefix`])。
+    #[cfg(test)]
     pub fn new(
         dir: &'a str,
+        base: Option<&str>,
+        diff: &[DiffFile],
+        excluded_dirs: &'a [String],
+        excluded_globs: &[String],
+    ) -> Result<Self> {
+        Self::with_known_prefix(dir, None, base, diff, excluded_dirs, excluded_globs)
+    }
+
+    /// `known_prefix` は `dir` で `git rev-parse --show-prefix` を実行した出力 (差分の取得で
+    /// 同じ問い合わせを済ませていれば渡す)。無ければ tree の一覧が最初に要るときに 1 回だけ
+    /// 問い合わせ、base と staged の index tree の一覧で共有する (失敗も共有する)。
+    pub fn with_known_prefix(
+        dir: &'a str,
+        known_prefix: Option<&[u8]>,
         base: Option<&str>,
         diff: &[DiffFile],
         excluded_dirs: &'a [String],
@@ -234,8 +261,17 @@ impl<'a> Scope<'a> {
         for glob in excluded_globs {
             builder.add(Glob::new(glob.trim_start_matches('!'))?);
         }
+        let mut resolved_prefix: Option<Option<String>> =
+            known_prefix.map(|raw| workspace_prefix(raw.to_vec()));
+        let mut prefix = || {
+            resolved_prefix
+                .get_or_insert_with(|| {
+                    git(dir, &["rev-parse", "--show-prefix"]).and_then(workspace_prefix)
+                })
+                .clone()
+        };
         let mut gitlinks = HashSet::new();
-        let old_tree = base.and_then(|b| tree_entries(dir, b));
+        let old_tree = base.and_then(|b| tree_entries(dir, &prefix()?, b));
         let mut unavailable = base.is_some() && old_tree.is_none();
         let old_paths = old_tree
             .map(|(paths, links, _)| {
@@ -249,11 +285,13 @@ impl<'a> Scope<'a> {
             .as_ref()
             .map(|tree| crate::commands::git_input::GitBlobBatch::new(dir, tree));
         let indexed = if let Some(tree) = snapshot.as_ref() {
-            tree_entries(dir, tree).map(|(paths, links, regular)| {
-                indexed_regular = regular;
-                gitlinks.extend(links);
-                paths
-            })
+            prefix()
+                .and_then(|prefix| tree_entries(dir, &prefix, tree))
+                .map(|(paths, links, regular)| {
+                    indexed_regular = regular;
+                    gitlinks.extend(links);
+                    paths
+                })
         } else {
             git_records(dir, &["ls-files", "--stage", "-z", "--"], |entry| {
                 if let Ok(entry) = std::str::from_utf8(entry)
@@ -721,6 +759,36 @@ mod tests {
         assert!(!scope.candidate("module"));
         assert_eq!(scope.filters.gitlink_sources, 1);
         assert_eq!(scope.filters.gitlink_candidates, 1);
+    }
+
+    /// 差分の取得で取れた prefix を渡すと、Scope は prefix を問い合わせ直さずにそれを使い、
+    /// 自分で問い合わせた場合と同じ tree の一覧になる (サブディレクトリからの実行)。
+    #[test]
+    fn known_prefix_gives_the_same_scope_as_asking_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_git_repo_for_test(root);
+        git_commit_files(
+            root,
+            &[
+                ("app/a.ts", "export const a = 1;\n"),
+                ("root.ts", "export const r = 1;\n"),
+            ],
+            "base",
+        );
+        let app = root.join("app");
+        let name = app.to_str().unwrap();
+        let asked = Scope::new(name, Some("HEAD"), &[], &[], &[]).unwrap();
+        let known =
+            Scope::with_known_prefix(name, Some(b"app/"), Some("HEAD"), &[], &[], &[]).unwrap();
+        assert_eq!(asked.old_paths, HashSet::from(["a.ts".to_owned()]));
+        assert_eq!(known.old_paths, asked.old_paths);
+        assert_eq!(known.gitlinks, asked.gitlinks);
+        assert_eq!(known.filters, asked.filters);
+        // 渡した prefix を使っている (問い合わせ直していれば `app/` になり、一覧が空にならない)。
+        let other =
+            Scope::with_known_prefix(name, Some(b"other/"), Some("HEAD"), &[], &[], &[]).unwrap();
+        assert!(other.old_paths.is_empty());
     }
 
     /// 一覧系の git 出力は 2 MiB を超えても読み切る。メタデータ用の上限で切っていたころは、
