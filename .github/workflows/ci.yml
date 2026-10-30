@@ -16,18 +16,17 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# 全ジョブが独立して始まり、壁時計は最も長いジョブ (配布用の build、約 7 分) で決まる。テストは nextest の slice で
+# OS ごとに複数のランナーへ分け、どのシャードも build より先に終わる数にしている。
+# キャッシュは main への push だけが保存する。PR は main のキャッシュを読むだけにして、PR ごとのキャッシュで
+# 容量の上限 (10GB) を使い切らない (使い切ると古い順に追い出され、main のキャッシュも消える)
 jobs:
-  # 検査の中身は Makefile の ci が定義する (fmt-check / clippy / cargo test)。
-  # ここには OS 固有の準備だけを置き、検査コマンドを重ねて書かない
-  quality:
-    name: Quality (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # Windows は入れない。ランナーの make は MinGW の mingw32-make の写しで、レシピの POSIX シェル前提
-        # ($$(...) や [ -n ... ]) の解釈に癖がある。Windows のテストは test-windows で cargo を直接呼ぶ
-        os: [ubuntu-latest, macos-latest]
+  # 検査の中身は Makefile が定義する (lint は make check、テストは make test)。
+  # ここには OS 固有の準備とテストの分け方だけを置き、検査コマンドを重ねて書かない
+  lint:
+    name: Lint (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
         with:
@@ -42,21 +41,70 @@ jobs:
           version: 2026.10.4 # 2026-10-07 公開。14 日以上経過した版を固定する
           cache: false
 
-      # target/ と ~/.cargo のキャッシュ (鍵に rustc の版が入るので、mise.toml の rust を上げると作り直す)
+      # target/ と ~/.cargo のキャッシュ (鍵に rustc の版が入るので、mise.toml の rust を上げると作り直す)。
+      # clippy の成果物はテストのビルドと別物なので、test とは鍵を分ける
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - run: make setup
-      - run: make ci
+      - run: make check
 
-  # テストと配布用ビルドは成果物を受け渡さないので、Windows でも独立して始める。
-  test-windows:
-    name: Test (Windows, ${{ matrix.suite }})
-    runs-on: windows-latest
+  # テストを OS ごとに複数のランナーへ分ける (nextest の slice。件数で均等に分ける)。シャードはどれも同じ
+  # テストバイナリをビルドするので、キャッシュは OS ごとに 1 つを共有して 1 番目だけが保存する。
+  # doctest は分けられないので 1 番目だけが回す (doc: 0 で残りは飛ばす)
+  test:
+    name: Test (${{ matrix.os }}, ${{ matrix.partition }}/2)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        suite: [unit, integration]
+        # Windows は入れない。ランナーの make は MinGW の mingw32-make の写しで、レシピの POSIX シェル前提
+        # ($$(...) や [ -n ... ]) の解釈に癖がある。Windows のテストは test-windows で cargo を直接呼ぶ。
+        # macOS は lint も 1 番目で回す (make ci = check + test)。lint を別のランナーにすると、build の 2 つと
+        # 合わせて macOS の同時実行の上限 (Free は 5) を使い切り、ほかの実行を待たせる
+        include:
+          - { os: ubuntu-latest, partition: 1, target: test, doc: 1 }
+          - { os: ubuntu-latest, partition: 2, target: test, doc: 0 }
+          - { os: macos-latest, partition: 1, target: ci, doc: 1 }
+          - { os: macos-latest, partition: 2, target: test, doc: 0 }
+    env:
+      NEXTEST_PROFILE: ci
     steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.4 # 2026-10-07 公開。14 日以上経過した版を固定する
+          cache: false
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.partition == 1 }}
+
+      - run: make setup
+      - run: make ${{ matrix.target }} TEST_PARTITION=slice:${{ matrix.partition }}/2 TEST_DOC=${{ matrix.doc }}
+
+  # Makefile の test と同じことを cargo で直接呼ぶ。Windows は 4 コアのランナーでテストが最も遅いので、
+  # Linux / macOS より多くのランナーへ分ける
+  test-windows:
+    name: Test (windows-latest, ${{ matrix.partition }}/5)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4, 5]
+    env:
+      NEXTEST_PROFILE: ci
+    steps:
+      # Windows のランナーは既定で LF を CRLF に変えて checkout する。テストの期待値や include_str! で
+      # 埋め込む skills/SKILL.md の改行を配布物とそろえるため、LF のまま取る
       - name: Keep LF line endings
         run: git config --global core.autocrlf false
 
@@ -66,37 +114,39 @@ jobs:
 
       - uses: jdx/mise-action@v4
         with:
-          version: 2026.10.4
+          version: 2026.10.4 # 2026-10-07 公開。14 日以上経過した版を固定する
           cache: false
 
-      # 既存の Windows build の鍵 (key + job 名) を共有し、依存を再取得しない。
-      # 保存は build に任せ、2つのテストジョブは同じキャッシュを読む。
+      # 鍵の名前は Linux / macOS の test と同じ (OS とアーキテクチャは rust-cache が鍵に足す)
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: x86_64-pc-windows-msvc-build
-          save-if: 'false'
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.partition == 1 }}
 
-      # Git / ファイル I/O の待機を重ねる。実行時だけの設定なのでキャッシュの鍵には入れない。
-      - name: Unit and binary tests
-        if: matrix.suite == 'unit'
-        env:
-          RUST_TEST_THREADS: '8'
-        run: cargo test --locked --lib --bins
+      # テストは一時リポジトリを TEMP に作り、そこで git と astro-sight を何度も起動する。既定の TEMP (C:) より、
+      # 作業ツリーと同じドライブにある runner.temp (D:) の方が速い (同じテストが C: では 1.6 倍かかった)
+      - name: Put temporary files next to the workspace
+        run: |
+          "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+          "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
 
-      - name: Documentation tests
-        if: matrix.suite == 'unit'
+      # PATH で見つかる git (Git for Windows の bin\git.exe) は、本体の git.exe を子プロセスとして起動する
+      # ラッパーで、起動のたびにプロセスが 1 つ増える。テストは git を何千回も起動するので、このステップだけ
+      # 本体 (git --exec-path にある git.exe) を PATH の先頭に置く。同じランナーで比べるとテストが 25% 前後縮んだ
+      - name: Tests
+        run: |
+          $env:PATH = "$([IO.Path]::GetFullPath((git --exec-path)));$env:PATH"
+          cargo nextest run --locked --partition slice:${{ matrix.partition }}/5
+
+      - name: Doctests
+        if: matrix.partition == 1
         run: cargo test --locked --doc
-
-      # wildcard で全統合テストターゲットを含め、今後のターゲット追加も漏らさない。
-      # 期限付きの深い入れ子のテストがあるので、並列数は利用可能な CPU 数の既定値を使う。
-      - name: Integration tests
-        if: matrix.suite == 'integration'
-        run: cargo test --locked --test '*'
 
   build:
     name: Build (${{ matrix.target }})
-    # Quality とテストを待つ必要はない。全ジョブの成功で従来の検査範囲を確かめる。
+    # Lint とテストを待つ必要はない。全ジョブの成功で検査の範囲を確かめる。
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -128,15 +178,19 @@ jobs:
           persist-credentials: false
 
       # ビルドに効く環境変数 (MACOSX_DEPLOYMENT_TARGET など) は mise.toml の [env] に置く。mise-action が
-      # 後続のステップへ渡すので、ci.yml と release.yml と手元の make で同じ値になる
+      # 後続のステップへ渡すので、ci.yml と release.yml と手元の make で同じ値になる。
+      # ビルドに要るのは Rust だけなので、テストランナー (cargo-nextest) は入れない
       - uses: jdx/mise-action@v4
         with:
           version: 2026.10.4 # 2026-10-07 公開。14 日以上経過した版を固定する
           cache: false
+          install_args: rust
 
+      # 配布用の release の成果物だけを持つ鍵 (テストの debug の成果物と混ぜない)
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          shared-key: build-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # mise.toml の rust はホストのツールチェーンと components だけを入れるので、配布のターゲットを足す
       - name: Add the Rust target

@@ -4,9 +4,9 @@ README の [開発](../README.ja.md#開発) の補足。`make setup` と `make c
 
 ## 前提
 
-[mise](https://mise.jdx.dev/) を前提にしている。Rust の版は `mise.toml` で固定し、Makefile の各ターゲットが `mise exec --` 経由でその版の `cargo` を呼ぶ。シェルで mise を有効にしていなくても版はそろう。mise のほかに C コンパイラ（tree-sitter の各パーサをビルドする。macOS なら Xcode Command Line Tools）と git（結合テストが一時リポジトリを作って `git` コマンドを呼ぶ）が要る。
+[mise](https://mise.jdx.dev/) を前提にしている。Rust とテストランナー [cargo-nextest](https://nexte.st/) の版は `mise.toml` で固定し、Makefile の各ターゲットが `mise exec --` 経由でその版の `cargo` を呼ぶ。シェルで mise を有効にしていなくても版はそろう。mise のほかに C コンパイラ（tree-sitter の各パーサをビルドする。macOS なら Xcode Command Line Tools）と git（結合テストが一時リポジトリを作って `git` コマンドを呼ぶ）が要る。
 
-mise を使わずに PATH 上の `cargo` で動かすなら `SYSTEM_TOOLS=1` を付ける。Rust の版が `mise.toml` とずれることがある。
+mise を使わずに PATH 上の `cargo` で動かすなら `SYSTEM_TOOLS=1` を付ける。版が `mise.toml` とずれることがあり、`make test` には PATH 上の `cargo-nextest` も要る。
 
 ```bash
 make ci SYSTEM_TOOLS=1
@@ -15,9 +15,15 @@ make install SYSTEM_TOOLS=1
 
 ## CI と同じ検査
 
-CI の quality ジョブ (Linux と macOS) は `make setup` と `make ci` を呼ぶだけなので、手元の `make ci` がそのまま CI の検査になる。テストは配布物と同じ既定の feature で回す。clippy は既定の feature と `--all-features` の両方で、ヒーププロファイラ（`dhat-heap` feature）側のコードも検査する。
+Linux と macOS の CI は `make setup` と、`make ci` を構成するターゲット（`make check` と `make test`）を呼ぶだけなので、手元の `make ci` がそのまま CI の検査になる。テストは配布物と同じ既定の feature で回す。clippy は既定の feature と `--all-features` の両方で、ヒーププロファイラ（`dhat-heap` feature）側のコードも検査する。
 
-Quality、Windows のテスト、6ターゲットの配布用ビルドは独立して開始する。Windows は2つのランナーに分け、一方で `cargo test --locked --lib --bins` と `cargo test --locked --doc`、他方で `cargo test --locked --test '*'` による全統合ターゲットを実行する。単体/binary は `RUST_TEST_THREADS=8` で Git・ファイル I/O の待機を重ねる。統合テストには処理期限付きのストレステストがあるため、CPU 数に応じた既定の並列数を使う。2つのテストジョブは既存の Windows build のキャッシュを読み、保存は build が担当する。profile・feature・テスト内容・処理期限は従来どおり。
+`make test` は単体テストと結合テストを cargo-nextest で 1 件ずつ別のプロセスとして走らせ（設定は `.config/nextest.toml`）、nextest が扱わない doctest を `cargo test --doc` で回す。一部のテストだけを走らせるときは `mise exec -- cargo nextest run <filter>` のように mise 経由で呼ぶ。
+
+lint、テスト、6 ターゲットの配布用ビルドは独立して開始する。CI はテストを nextest の `--partition slice:<m>/<n>` で複数のランナーへ分ける。Linux と macOS は各 2 つ（`make test TEST_PARTITION=slice:<m>/2`）、Windows は 5 つで、Windows は `cargo nextest run` を直接呼ぶ。doctest は各 OS の 1 番目のランナーだけが回し、残りは `TEST_DOC=0` を渡す。macOS の 1 番目は `make ci` を呼び、macOS のランナーを増やさずに macOS の lint も兼ねる。ランナーの数は、どのランナーも配布用ビルド（約 7 分）より先に終わるように決めている。
+
+テストの並列数は既定（CPU 数）のまま。テストの時間の大半は `git` と `astro-sight` のプロセスの起動で、CPU 数より増やすと 4 コアの Linux と Windows のランナーではかえって遅くなった。CPU 律速のストレステスト（`deep_nesting::rust_impact_proofs_handle_deep_nesting`。各コマンドに 300 秒の期限がある）だけは最初に始め、2 件分の枠を使う。Windows では一時ファイルを作業ツリーと同じドライブにある `runner.temp` に置く。既定の `TEMP`（C:）では同じテストが 1.6 倍かかった。テストのステップでは git の本体（`git --exec-path` が示すディレクトリの `git.exe`）も PATH の先頭に置く。PATH で見つかる `git.exe` は本体を別のプロセスとして起動するラッパーで、ラッパーを通さないと同じランナーでテストが 25% 前後縮んだ。
+
+ビルドのキャッシュを保存するのは main への push だけで、PR は復元するだけにする。PR ごとに保存すると上限の 10GB を使い切り、main のキャッシュが追い出される。キャッシュの鍵はジョブの種類ごとに分け（`lint`、`test`、`build-<target>`）、テストのランナーは OS ごとに 1 つの鍵を共有して 1 番目だけが保存する。
 
 Cargo のコマンドには既定で `--locked` を付けている。`.cargo/config.toml` の `[patch]` でローカルの tree-sitter 系を差し込むと `Cargo.lock` が手元でだけ変わり、`--locked` で止まる。そのときは `make ci CARGO_FLAGS=` のように `CARGO_FLAGS` を空にする。
 

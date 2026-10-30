@@ -1,0 +1,21 @@
+# cargo-nextest の設定。make test と CI のテストジョブが読む (版は mise.toml で固定する)。
+# nextest はテストを 1 件ずつ別のプロセスで走らせる (libtest のようにテスト間で static を共有しない)。
+# 並列数は既定 (CPU 数) のまま。テストは git と astro-sight の子プロセスを起動するので、CPU 数より増やすと
+# 子プロセスが CPU を取り合い、かえって遅くなる (CI の 4 コアの Linux / Windows で確かめた)
+nextest-version = { required = "0.9.148" }
+
+[profile.default]
+# 60 秒を超えたテストを報告する (libtest の "has been running for over 60 seconds" と同じ間隔)。報告だけで止めない
+slow-timeout = { period = "60s" }
+
+# 数万段の入れ子を解析するストレステスト。ほかのテストと違って CPU を長く使い、各コマンドに 300 秒の期限がある。
+# 最初に始めて最後まで残らないようにし、2 スレッド分を割り当てて CPU の取り合いを減らす
+[[profile.default.overrides]]
+filter = 'binary_id(astro-sight::integration) & test(=integration::deep_nesting::rust_impact_proofs_handle_deep_nesting)'
+priority = 100
+threads-required = 2
+
+# CI (NEXTEST_PROFILE=ci): 失敗しても残りのテストを最後まで流し、失敗の出力を最後にもまとめて出す
+[profile.ci]
+fail-fast = false
+failure-output = "immediate-final"
