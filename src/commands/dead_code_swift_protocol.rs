@@ -184,6 +184,13 @@ fn builtin_methods() -> Vec<SwiftProtocolMethod> {
             "Swift.Void",
         ),
         (
+            "AppKit.NSWindowDelegate",
+            "windowWillClose",
+            vec!["_"],
+            vec!["Foundation.Notification"],
+            "Swift.Void",
+        ),
+        (
             "Swift.Hashable",
             "hash",
             vec!["into"],
@@ -554,7 +561,10 @@ fn name_matches(
                         )
                     })));
     };
-    if bindings.contains(module) || (module != "Swift" && !environment.imports.contains(module)) {
+    // AppKit が再公開する Notification だけは Foundation の直接 import を求めない。
+    let module_imported = environment.imports.contains(module)
+        || (expected == "Foundation.Notification" && environment.imports.contains("AppKit"));
+    if bindings.contains(module) || (module != "Swift" && !module_imported) {
         return false;
     }
     if actual == expected {
@@ -575,7 +585,9 @@ fn name_matches(
             | "AppKit.NSApplication"
             | "AppKit.NSMenuDelegate"
             | "AppKit.NSMenu"
+            | "AppKit.NSWindowDelegate"
             | "AppKit.NSView"
+            | "Foundation.Notification"
             | "SwiftUI.NSViewRepresentable"
     );
     actual == tail

@@ -52,6 +52,214 @@ public class Preferences: NSViewController {
 }
 
 #[test]
+fn dead_code_swift_window_delegate_callback_is_a_typed_runtime_witness() {
+    let source = r#"import AppKit
+@MainActor
+public final class ExamplePanel: NSPanel, NSWindowDelegate {
+    public init() {
+        super.init(contentRect: .zero,
+                   styleMask: [.titled, .closable],
+                   backing: .buffered, defer: true)
+        delegate = self
+    }
+    public func windowWillClose(_ notification: Notification) {}
+    public func unusedHelper() {}
+}
+"#;
+    for source in [
+        source.to_owned(),
+        source.replace("import AppKit", "import AppKit\nimport Foundation\nimport SwiftUI"),
+        source
+            .replace("NSWindowDelegate", "AppKit.NSWindowDelegate")
+            .replace(": Notification", ": Foundation.Notification")
+            .replace(") {}", ") -> Swift.Void {}"),
+        source.replace(
+            "    public func windowWillClose(_ notification: Notification) {}",
+            "}\nextension ExamplePanel {\n    public func windowWillClose(_ notification: Notification) -> () {}",
+        ),
+        format!("// 名前🙂\r\n{}", source.replace('\n', "\r\n")),
+    ] {
+        let repo = TestRepo::new();
+        repo.write("Panel.swift", &source);
+        let value = repo.run_json("dead-code", &[]);
+        for field in ["dead_symbols", "test_only_symbols"] {
+            assert!(
+                value[field].as_array().is_none_or(|symbols| {
+                    !symbols.iter().any(|symbol| {
+                        symbol["name"] == "ExamplePanel.windowWillClose"
+                            || symbol["name"] == "windowWillClose"
+                    })
+                }),
+                "{source}: {value}"
+            );
+        }
+        assert!(
+            value["dead_symbols"].as_array().unwrap().iter().any(|symbol| {
+                symbol["name"] == "ExamplePanel.unusedHelper" || symbol["name"] == "unusedHelper"
+            }),
+            "{value}"
+        );
+        let references = repo.run_json("refs", &["--name", "windowWillClose"]);
+        let references = references["refs"].as_array().unwrap();
+        assert_eq!(references.len(), 1, "{references:?}");
+        assert_eq!(references[0]["kind"], "def");
+        let line = source.lines().position(|line| line.contains("public func windowWillClose")).unwrap();
+        assert_eq!(references[0]["ln"], line);
+        assert_eq!(references[0]["col"], 16);
+    }
+}
+
+#[test]
+fn dead_code_swift_window_delegate_keeps_non_witnesses_dead() {
+    for (prefix, owner, method) in [
+        (
+            "import AppKit\n",
+            "Panel",
+            "public func windowWillClose(_ note: Notification) {}",
+        ),
+        (
+            "import Foundation\n",
+            "Panel: NSWindowDelegate",
+            "public func windowWillClose(_ note: Notification) {}",
+        ),
+        (
+            "import AppKit\n",
+            "Panel: NSWindowDelegate",
+            "public func windowWillClose(note: Notification) {}",
+        ),
+        (
+            "import AppKit\n",
+            "Panel: NSWindowDelegate",
+            "public func windowWillClose(_ note: String) {}",
+        ),
+        (
+            "import AppKit\n",
+            "Panel: NSWindowDelegate",
+            "public func windowWillClose(_ note: Notification) -> Bool { false }",
+        ),
+        (
+            "import AppKit\n",
+            "Panel: NSWindowDelegate",
+            "public static func windowWillClose(_ note: Notification) {}",
+        ),
+        (
+            "import AppKit\n",
+            "Panel: NSWindowDelegate",
+            "public func windowWillClose(_ note: Notification) async {}",
+        ),
+        (
+            "import AppKit\n",
+            "Panel: NSWindowDelegate",
+            "public func windowWillClose(_ note: Notification) throws {}",
+        ),
+        (
+            "import AppKit\n",
+            "Panel: NSWindowDelegate",
+            "public func windowWillClose(_ note: Notification, extra: Int) {}",
+        ),
+        (
+            "import AppKit\npublic struct Notification {}\n",
+            "Panel: NSWindowDelegate",
+            "public func windowWillClose(_ note: Notification) {}",
+        ),
+        (
+            "import AppKit\nprotocol NSWindowDelegate {}\n",
+            "Panel: NSWindowDelegate",
+            "public func windowWillClose(_ note: Notification) {}",
+        ),
+        (
+            "import AppKit\npublic struct Foundation {}\n",
+            "Panel: NSWindowDelegate",
+            "public func windowWillClose(_ note: Foundation.Notification) {}",
+        ),
+        (
+            "import AppKit\npublic struct AppKit {}\n",
+            "Panel: AppKit.NSWindowDelegate",
+            "public func windowWillClose(_ note: Notification) {}",
+        ),
+        (
+            "import AppKit\nimport Other\n",
+            "Panel: NSWindowDelegate",
+            "public func windowWillClose(_ note: Notification) {}",
+        ),
+    ] {
+        let repo = TestRepo::new();
+        let source = format!("{prefix}public class {owner} {{\n    {method}\n}}\n");
+        repo.write("Panel.swift", &source);
+        let value = repo.run_json("dead-code", &[]);
+        assert!(
+            value["dead_symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|symbol| symbol["name"] == "Panel.windowWillClose"),
+            "{source}: {value}"
+        );
+    }
+}
+
+#[test]
+fn dead_code_swift_window_delegate_review_uses_the_selected_source() {
+    for staged in [false, true] {
+        let repo = TestRepo::new();
+        repo.write(
+            "Panel.swift",
+            "import AppKit\npublic class Panel: NSWindowDelegate {}\n",
+        );
+        repo.init_git();
+        repo.commit_all("base");
+        repo.write("Panel.swift", "import AppKit\npublic class Panel: NSWindowDelegate {\n    public func windowWillClose(_ note: Notification) {}\n    public func unusedHelper() {}\n}\n");
+        if staged {
+            repo.stage_all();
+            repo.write("Panel.swift", "import AppKit\npublic class Panel {\n    public func windowWillClose(_ note: Notification) {}\n    public func unusedHelper() {}\n}\n");
+        }
+        for command in ["dead-code", "review"] {
+            let mut args = vec!["--git"];
+            if command == "review" {
+                args.push("--include-wip-dead");
+            }
+            if staged {
+                args.push("--staged");
+            }
+            let value = repo.run_json(command, &args);
+            let dead = value["dead_symbols"].as_array().unwrap();
+            assert!(
+                !dead
+                    .iter()
+                    .any(|symbol| symbol["name"] == "Panel.windowWillClose"),
+                "{command}, staged={staged}: {value}"
+            );
+            assert!(
+                dead.iter()
+                    .any(|symbol| symbol["name"] == "Panel.unusedHelper"),
+                "{value}"
+            );
+            if command == "review" {
+                assert!(
+                    value["api_changes"]["added"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|symbol| symbol["name"] == "Panel.windowWillClose"),
+                    "{value}"
+                );
+            }
+        }
+        if staged {
+            let ordinary = repo.run_json("dead-code", &[]);
+            assert!(
+                ordinary["dead_symbols"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|symbol| symbol["name"] == "Panel.windowWillClose"),
+                "{ordinary}"
+            );
+        }
+    }
+}
+
+#[test]
 fn dead_code_swift_protocol_custom_configuration_is_explicit_and_typed() {
     let repo = TestRepo::new();
     repo.write("Widget.swift", "import Acme\npublic struct Widget: Acme.RefreshDelegate {\n public func refresh(_ value: Swift.String) {}\n public func refresh(_ value: Swift.Int) {}\n public func unusedHelper() {}\n}\n");
