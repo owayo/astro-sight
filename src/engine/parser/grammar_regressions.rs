@@ -7,6 +7,45 @@ const SWIFT_COALESCING_SOURCE: &str =
 const SWIFT_TRY_AWAIT_SOURCE: &str = include_str!("../../../tests/fixtures/swift_try_await.swift");
 
 #[test]
+fn swift_forced_try_operator_is_not_boolean_negation() {
+    for (expression, operator, negations) in [
+        ("try! load()", "try!", 0),
+        ("try! await load()", "try!", 0),
+        ("try! /* 間 */ load()", "try!", 0),
+        ("try? load()", "try?", 0),
+        ("try load()", "try", 0),
+        ("try !flag()", "try", 1),
+    ] {
+        let tree = assert_swift_parse_clean(expression.as_bytes());
+        let nodes = swift_nodes(tree.root_node());
+        let operators: Vec<_> = nodes
+            .iter()
+            .filter(|node| node.kind() == "try_operator")
+            .collect();
+        assert_eq!(operators.len(), 1);
+        assert_eq!(
+            operators[0].utf8_text(expression.as_bytes()).unwrap(),
+            operator,
+            "{expression}"
+        );
+        assert_eq!(operators[0].byte_range(), 0..operator.len());
+        assert_eq!(
+            nodes.iter().filter(|node| node.kind() == "bang").count(),
+            negations,
+            "{expression}"
+        );
+    }
+    let tree = assert_swift_parse_clean(b"!flag()");
+    assert_eq!(
+        swift_nodes(tree.root_node())
+            .iter()
+            .filter(|node| node.kind() == "bang")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn swift_try_await_condition_keeps_block_and_following_declarations() {
     let source = SWIFT_TRY_AWAIT_SOURCE.as_bytes();
     let tree = assert_swift_parse_clean(source);

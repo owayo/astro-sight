@@ -17,6 +17,7 @@ Upstream: <https://github.com/alex-pinkus/tree-sitter-swift>.
 Local regression: <https://github.com/owayo/astro-sight/issues/32>.
 Empty-tuple regression: <https://github.com/owayo/astro-sight/issues/41>.
 Conditional try/await regression: <https://github.com/owayo/astro-sight/issues/200>.
+Windows forced-try regression: <https://github.com/owayo/astro-sight/issues/201>.
 
 ## Change
 
@@ -45,6 +46,16 @@ declarations during recovery. A conflict with `_primary_expression` keeps the
 alternative postfix interpretation available. Existing node names and fields,
 the scanner, and source bytes are unchanged; actual trailing closures remain
 part of their calls.
+
+The scanner's suppression mask for `FAKE_TRY_BANG` (token 32) uses `1ULL`
+instead of `1UL`. Windows has a 32-bit `unsigned long`, so shifting `1UL` by 32
+cannot construct the required 64-bit mask. The failed suppression lets the
+external scanner consume the `!` in `try!` as boolean negation. The 64-bit
+literal matches the existing mask storage and reader. Token order and scanner
+serialization are unchanged, and this scanner-only fix needs no regeneration.
+Regression tests distinguish `try!` from `try !flag()` and exercise forced
+try/await bindings through CLI definitions, calls, references, and Unicode/CRLF
+positions.
 
 ## Regenerate
 
