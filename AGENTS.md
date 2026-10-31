@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **Swift のウィンドウ終了 delegate** — `commands/dead_code_swift_protocol.rs` は `AppKit.NSWindowDelegate.windowWillClose(_:)` を既存の型付き protocol witness として扱う (Issue #204)。引数は `Foundation.Notification`、戻り型は Void、インスタンスメソッドに限り、AppKit の再公開により Foundation の直接 import がない形も照合する。protocol・型・module の同名束縛、未知の import、異なるラベル・引数型・戻り型・static/async/throws は既存の保留条件を維持する。他の delegate メソッドへ名前だけで広げず、API 差分・refs の出現は変えない。回帰は `dead_code_conventions.rs` の通常・修飾名・extension・CRLF/Unicode、同名ヘルパー、通常/staged の dead-code/review と index/worktree の対照。
+
 - **Swift の Windows における try!** — `vendor/tree-sitter-swift/src/scanner.c` の `OP_SYMBOL_SUPPRESSOR` は `FAKE_TRY_BANG` (32) のビットを `1ULL` で構成する (Issue #201)。Windows の32ビット `unsigned long` で `1UL << 32` が必要なマスクを作れず、`try!` の `!` が否定へ分離される不具合を防ぐ。token の順序・保存形式・生成済み文法は変更しない。parser は try!/try?/try と本来の否定を対照し、CLI は強制 try/await の条件束縛でも宣言・参照・call と CRLF/Unicode の byte 位置を確認する。
 
 - **Swift の条件束縛と try await** — `vendor/tree-sitter-swift/grammar.js` は `try_expression` の直接の `await_expression` に call と同じ左結合の優先順位を与え、`_primary_expression` との conflict を残す (Issue #200)。この代替の dynamic precedence は -1 とし、二項・三項・後置式を含む従来の広い operand を優先する。`if let x = try? await load()` のブロックを末尾クロージャとして取り込まず、後続の宣言を保持する。実際の末尾クロージャ・既存のノード名とフィールド・scanner は維持し、原文や診断を加工しない。生成は CLI 0.26.6 / ABI 15。parser と `tests/integration/swift_grammar.rs` で条件束縛・通常呼出し・末尾クロージャ・演算子の operand・CRLF/Unicode の byte 位置・不正入力と増分修復・後続宣言/参照/call を対照し、由来の上流コーパス238件の全 AST と範囲は旧文法と一致する。
