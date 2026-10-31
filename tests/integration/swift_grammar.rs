@@ -14,6 +14,16 @@ fn swift_try_await_cli_preserves_definitions_calls_and_positions() {
             format!(
                 "// 名前🙂\r\n{}",
                 SWIFT_TRY_AWAIT_SOURCE
+                    .replace("try? await", "/* 名前🙂 */ try! await")
+                    .replace('\n', "\r\n")
+            ),
+            1,
+            "/* 名前🙂 */ ".len(),
+        ),
+        (
+            format!(
+                "// 名前🙂\r\n{}",
+                SWIFT_TRY_AWAIT_SOURCE
                     .replace("try? await", "/* 名前🙂 */ try? await")
                     .replace('\n', "\r\n")
             ),
