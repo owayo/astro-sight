@@ -16,6 +16,7 @@ in the scanner and three query files; query contents otherwise match the crate. 
 Upstream: <https://github.com/alex-pinkus/tree-sitter-swift>.
 Local regression: <https://github.com/owayo/astro-sight/issues/32>.
 Empty-tuple regression: <https://github.com/owayo/astro-sight/issues/41>.
+Conditional try/await regression: <https://github.com/owayo/astro-sight/issues/200>.
 
 ## Change
 
@@ -34,6 +35,16 @@ Swift also permits an empty tuple `()` as a value and pattern. Both
 `tuple_expression` and `_tuple_pattern` now allow zero elements so valid uses
 such as `.success(())`, `[()]`, and `case .success(())` do not produce missing
 tokens or error nodes. The generated `tuple_expression.value` field is optional.
+
+The operand of `try` also gives a direct `await_expression` the same left
+associativity as a direct call, as a dynamically lower-priority alternative.
+The original broad-operand interpretations remain preferred for binary,
+ternary, and postfix expressions. Without the alternative, `if let x = try? await load()` can
+absorb the conditional block as a trailing closure and consume subsequent
+declarations during recovery. A conflict with `_primary_expression` keeps the
+alternative postfix interpretation available. Existing node names and fields,
+the scanner, and source bytes are unchanged; actual trailing closures remain
+part of their calls.
 
 ## Regenerate
 
@@ -57,6 +68,11 @@ multiline cast/coalescing expression and source ranges.
 The empty-tuple patch keeps the full ASTs of the current upstream corpus sources
 byte-identical and adds a CLI regression for values, patterns, and unaffected
 parenthesized expressions, calls, and function types.
+The try/await patch also preserves full ASTs, including ranges, for all 238
+corpus cases from the pinned upstream commit. Parser and CLI regressions cover
+conditional bindings (`if`, `guard`, `while`, and `case`), ordinary calls and
+trailing closures, broad binary/ternary/postfix operands, CRLF/Unicode positions, incremental repair, diagnostics for
+malformed input, and following definitions, references, and calls.
 
 ## Existing limitation
 
