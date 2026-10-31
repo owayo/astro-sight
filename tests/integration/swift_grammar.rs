@@ -4,6 +4,161 @@ use std::path::Path;
 
 const SWIFT_COALESCING_SOURCE: &str = include_str!("../fixtures/swift_nil_coalescing.swift");
 const SWIFT_EMPTY_TUPLE_SOURCE: &str = include_str!("../fixtures/swift_empty_tuple.swift");
+const SWIFT_TRY_AWAIT_SOURCE: &str = include_str!("../fixtures/swift_try_await.swift");
+
+#[test]
+fn swift_try_await_cli_preserves_definitions_calls_and_positions() {
+    for (source, line_delta, column_delta) in [
+        (SWIFT_TRY_AWAIT_SOURCE.to_owned(), 0, 0),
+        (
+            format!(
+                "// 名前🙂\r\n{}",
+                SWIFT_TRY_AWAIT_SOURCE
+                    .replace("try? await", "/* 名前🙂 */ try? await")
+                    .replace('\n', "\r\n")
+            ),
+            1,
+            "/* 名前🙂 */ ".len(),
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.write("loader.swift", &source);
+        let path = repo.path("loader.swift");
+        let ast = swift_cli_json("ast", &path, &["--full", "--depth", "32", "--no-cache"]);
+        let symbols = swift_cli_json("symbols", &path, &["--no-cache"]);
+        for output in [&ast, &symbols] {
+            assert!(
+                output["diagnostics"]
+                    .as_array()
+                    .is_none_or(|items| items.is_empty()),
+                "{}",
+                output["diagnostics"]
+            );
+        }
+        assert_eq!(
+            ast["hash"],
+            blake3::hash(source.as_bytes()).to_hex().as_str()
+        );
+        let nodes = swift_ast_nodes(&ast["ast"]);
+        assert!(nodes.iter().all(|node| node["kind"] != "ERROR"));
+        let try_expr = nodes
+            .iter()
+            .find(|node| node["kind"] == "try_expression")
+            .unwrap();
+        assert_eq!(try_expr["range"]["start"]["line"], 2 + line_delta);
+        assert_eq!(try_expr["range"]["start"]["column"], 19 + column_delta);
+        assert_eq!(try_expr["range"]["end"]["line"], 2 + line_delta);
+        assert_eq!(try_expr["range"]["end"]["column"], 41 + column_delta);
+        let names: Vec<_> = symbols["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|symbol| {
+                (
+                    symbol["name"].as_str().unwrap(),
+                    symbol["ln"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("Loader", line_delta),
+                ("names", 1 + line_delta),
+                ("loadGroup", 9 + line_delta),
+                ("fallback", 10 + line_delta)
+            ]
+        );
+        for symbol in symbols["symbols"].as_array().unwrap().iter().skip(1) {
+            assert_eq!(symbol["cn"], "Loader");
+        }
+        let cursor = swift_cli_json(
+            "ast",
+            &path,
+            &[
+                "--line",
+                &(6 + line_delta).to_string(),
+                "--col",
+                "5",
+                "--no-cache",
+            ],
+        );
+        assert!(
+            cursor["diagnostics"]
+                .as_array()
+                .is_none_or(|items| items.is_empty())
+        );
+        let calls = swift_cli_json("calls", &path, &["--function", "names"]);
+        let callees = calls["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|caller| caller["callees"].as_array().unwrap());
+        let locations: Vec<_> = callees
+            .map(|callee| {
+                (
+                    callee["name"].as_str().unwrap(),
+                    callee["ln"].as_u64().unwrap(),
+                    callee["col"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert!(
+            locations.contains(&("loadGroup", 2 + line_delta, (30 + column_delta) as u64)),
+            "{locations:?}"
+        );
+        assert!(
+            locations.contains(&("fallback", 6 + line_delta, 17)),
+            "{locations:?}"
+        );
+        let refs = repo.run_json(
+            "refs",
+            &["--name", "loadGroup", "--max-results", "unlimited"],
+        );
+        let references = refs["refs"].as_array().unwrap();
+        assert_eq!(references.len(), 2);
+        for (kind, line, column) in [
+            ("def", 9 + line_delta, 7),
+            ("ref", 2 + line_delta, (30 + column_delta) as u64),
+        ] {
+            assert!(
+                references.iter().any(|reference| reference["kind"] == kind
+                    && reference["ln"] == line
+                    && reference["col"] == column),
+                "{references:?}"
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), source.as_bytes());
+    }
+}
+
+#[test]
+fn swift_try_await_cli_keeps_malformed_diagnostics_and_later_definitions() {
+    let repo = TestRepo::new();
+    repo.write(
+        "broken.swift",
+        SWIFT_TRY_AWAIT_SOURCE.replacen("loadGroup()", "loadGroup(@)", 1),
+    );
+    let path = repo.path("broken.swift");
+    for command in ["ast", "symbols"] {
+        let output = swift_cli_json(command, &path, &["--no-cache"]);
+        assert!(
+            output["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["severity"] == "error")
+        );
+    }
+    let symbols = swift_cli_json("symbols", &path, &["--no-cache"]);
+    assert!(
+        symbols["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["name"] == "fallback" && symbol["ln"] == 10)
+    );
+}
 
 fn swift_cli_json(command: &str, path: &Path, args: &[&str]) -> Value {
     let output = cargo_bin()

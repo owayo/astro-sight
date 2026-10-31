@@ -4,6 +4,8 @@ AI エージェント向け AST 情報生成 CLI (Rust)
 
 ## Architecture
 
+- **Swift の条件束縛と try await** — `vendor/tree-sitter-swift/grammar.js` は `try_expression` の直接の `await_expression` に call と同じ左結合の優先順位を与え、`_primary_expression` との conflict を残す (Issue #200)。この代替の dynamic precedence は -1 とし、二項・三項・後置式を含む従来の広い operand を優先する。`if let x = try? await load()` のブロックを末尾クロージャとして取り込まず、後続の宣言を保持する。実際の末尾クロージャ・既存のノード名とフィールド・scanner は維持し、原文や診断を加工しない。生成は CLI 0.26.6 / ABI 15。parser と `tests/integration/swift_grammar.rs` で条件束縛・通常呼出し・末尾クロージャ・演算子の operand・CRLF/Unicode の byte 位置・不正入力と増分修復・後続宣言/参照/call を対照し、由来の上流コーパス238件の全 AST と範囲は旧文法と一致する。
+
 - **所属コンテナの範囲索引** — `engine/symbols/containers.rs` は、型・クラス等の終点と関数の終点を降順に照合し、始点順の Fenwick tree から内包候補の最小順位を選ぶ (Issue #198)。順位は従来どおり行数差、同順位は元の抽出順。列境界・交差/重複/反転範囲、既に確定した Go receiver 等の所属、シンボルの出力順を保持する。候補32件以下または未確定の関数16件以下では直接比較し、それ以外は O((C+F) log(C+F))・追加領域 O(C+F)。単体は旧実装との生成範囲・逆順比較と Rust/Python/TS/TSX の実解析を対照し、`tools/bench-refs.py --suite symbols` で出力一致・時間・working set を比較する。refs/dead-code の出現規則は変えない。
 
 - **SHA-256 リポジトリの共変更証拠** — `engine/cochange.rs` の blame・履歴 fallback・merge 除外は、完全な40桁または64桁の ASCII 16進 OID を同じ private 判定で受け付ける (Issue #194)。blame は最初の空白までを OID とし、author-mail/time と既存のヘッダ・metadata 契約は保持する。不正幅・非16進は受理せず、ランキング・既定値・出力形式は変えない。unit は両幅の metadata と不正値、実 SHA-1/SHA-256 の merge/nonmerge を対照し、CLI は history4件・blame1件・review の候補/診断の一致を確認する。

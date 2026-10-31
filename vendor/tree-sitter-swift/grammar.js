@@ -121,6 +121,8 @@ module.exports = grammar({
     // all the options and pick the best one that doesn't error out.
     [$.try_expression, $._unary_expression],
     [$.try_expression, $._expression],
+    // await の外側へ後置演算子を付ける解釈も残す。
+    [$.try_expression, $._primary_expression],
     // await {expression} has the same special cases as `try`.
     [$.await_expression, $._unary_expression],
     [$.await_expression, $._expression],
@@ -849,6 +851,8 @@ module.exports = grammar({
               prec.right(-2, $._expression),
               prec.left(0, $._binary_expression),
               prec.left(0, $.call_expression),
+              // 条件のブロックを取り込まない代替。通常の演算子を含む解釈を優先する。
+              prec.dynamic(-1, prec.left(0, $.await_expression)),
               // Similarly special case the ternary expression, where `try` may come earlier than it is actually needed.
               // When the parser just encounters some identifier after a `try`, it should prefer the `call_expression` (so
               // this should be lower in priority than that), but when we encounter an ambiguous expression that might be

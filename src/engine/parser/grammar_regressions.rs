@@ -4,6 +4,221 @@ use tree_sitter::{InputEdit, Node, Parser, Point, Query, Tree};
 
 const SWIFT_COALESCING_SOURCE: &str =
     include_str!("../../../tests/fixtures/swift_nil_coalescing.swift");
+const SWIFT_TRY_AWAIT_SOURCE: &str = include_str!("../../../tests/fixtures/swift_try_await.swift");
+
+#[test]
+fn swift_try_await_condition_keeps_block_and_following_declarations() {
+    let source = SWIFT_TRY_AWAIT_SOURCE.as_bytes();
+    let tree = assert_swift_parse_clean(source);
+    let nodes = swift_nodes(tree.root_node());
+    let try_expr = swift_node_with_text(&tree, source, "try_expression", "try? await loadGroup()");
+    let await_expr = try_expr.child_by_field_name("expr").unwrap();
+    assert_eq!(await_expr.kind(), "await_expression");
+    assert_eq!(await_expr.utf8_text(source).unwrap(), "await loadGroup()");
+    assert_eq!(
+        await_expr.child_by_field_name("expr").unwrap().kind(),
+        "call_expression"
+    );
+    assert_eq!(
+        nodes
+            .iter()
+            .filter(|node| node.kind() == "function_declaration")
+            .count(),
+        3
+    );
+    let after = swift_node_with_text(
+        &tree,
+        source,
+        "function_declaration",
+        "func loadGroup() async throws -> [Int]? { nil }",
+    );
+    assert_eq!(after.start_position(), Point::new(9, 2));
+    assert_eq!(after.end_position(), Point::new(9, 49));
+    let condition = swift_node_with_text(
+        &tree,
+        source,
+        "if_statement",
+        "if let group = try? await loadGroup() {\n      let options = group.map(\\.description)\n      if !options.isEmpty { return options }\n    }",
+    );
+    assert_eq!(condition.start_position(), Point::new(2, 4));
+    assert_eq!(condition.end_position(), Point::new(5, 5));
+    let fallback = swift_node_with_text(
+        &tree,
+        source,
+        "control_transfer_statement",
+        "return await fallback()",
+    );
+    assert_eq!(fallback.start_position(), Point::new(6, 4));
+    assert_eq!(fallback.parent().unwrap(), condition.parent().unwrap());
+}
+
+#[test]
+fn swift_try_await_conditions_and_trailing_closures_keep_boundaries() {
+    for (statement, expression, inner_kind) in [
+        (
+            "if let group = try? await loadGroup() { use(group) }",
+            "try? await loadGroup()",
+            "call_expression",
+        ),
+        (
+            "if var group = try await loadGroup() { use(group) }",
+            "try await loadGroup()",
+            "call_expression",
+        ),
+        (
+            "guard let group = try? await loadGroup() else { return [] }",
+            "try? await loadGroup()",
+            "call_expression",
+        ),
+        (
+            "while let group = try? await loadGroup() { use(group); break }",
+            "try? await loadGroup()",
+            "call_expression",
+        ),
+        (
+            "if case let .some(group) = try? await loadGroup() { use(group) }",
+            "try? await loadGroup()",
+            "call_expression",
+        ),
+        (
+            "if try await ready() { use(1) }",
+            "try await ready()",
+            "call_expression",
+        ),
+        (
+            "let value = try? await withCallback { group in group }",
+            "try? await withCallback { group in group }",
+            "call_expression",
+        ),
+        (
+            "let value = try? await loadGroup()",
+            "try? await loadGroup()",
+            "call_expression",
+        ),
+    ] {
+        let source = format!(
+            "func check() async throws -> [String] {{\n  {statement}\n  return await fallback()\n}}\nfunc afterCheck() {{}}\n"
+        );
+        let tree = assert_swift_parse_clean(source.as_bytes());
+        let try_expr = swift_node_with_text(&tree, source.as_bytes(), "try_expression", expression);
+        let await_expr = try_expr.child_by_field_name("expr").unwrap();
+        assert_eq!(await_expr.kind(), "await_expression", "{statement}");
+        assert_eq!(
+            await_expr.child_by_field_name("expr").unwrap().kind(),
+            inner_kind,
+            "{statement}"
+        );
+        swift_node_with_text(
+            &tree,
+            source.as_bytes(),
+            "control_transfer_statement",
+            "return await fallback()",
+        );
+        swift_node_with_text(
+            &tree,
+            source.as_bytes(),
+            "function_declaration",
+            "func afterCheck() {}",
+        );
+    }
+    Query::new(
+        &LangId::Swift.ts_language(),
+        "(try_expression expr: (await_expression expr: (call_expression)))",
+    )
+    .unwrap();
+}
+
+#[test]
+fn swift_try_await_keeps_binary_ternary_and_postfix_operand_spans() {
+    for (expression, operand_kind) in [
+        ("try await ready() ? yes() : no()", "ternary_expression"),
+        (
+            "try? await load() ?? fallback()",
+            "nil_coalescing_expression",
+        ),
+        ("try await load() + load()", "await_expression"),
+        ("try await load().count", "navigation_expression"),
+        ("try await load()[0]", "call_expression"),
+        ("try await load()()", "call_expression"),
+        ("try await load()!", "postfix_expression"),
+    ] {
+        let tree = assert_swift_parse_clean(expression.as_bytes());
+        let try_expr = tree.root_node().named_child(0).unwrap();
+        assert_eq!(try_expr.kind(), "try_expression", "{expression}");
+        assert_eq!(try_expr.byte_range(), 0..expression.len());
+        assert_eq!(
+            try_expr.child_by_field_name("expr").unwrap().kind(),
+            operand_kind,
+            "{expression}"
+        );
+    }
+}
+
+#[test]
+fn swift_try_await_preserves_unicode_crlf_byte_ranges() {
+    let source = SWIFT_TRY_AWAIT_SOURCE
+        .replace("if let", "/* 名前🙂 */ if let")
+        .replace('\n', "\r\n");
+    let tree = assert_swift_parse_clean(source.as_bytes());
+    for node in swift_nodes(tree.root_node()) {
+        assert_eq!(
+            node.start_position(),
+            swift_point_at(source.as_bytes(), node.start_byte())
+        );
+        assert_eq!(
+            node.end_position(),
+            swift_point_at(source.as_bytes(), node.end_byte())
+        );
+    }
+    let try_expr = swift_node_with_text(
+        &tree,
+        source.as_bytes(),
+        "try_expression",
+        "try? await loadGroup()",
+    );
+    assert_eq!(
+        try_expr.start_position(),
+        Point::new(2, 19 + "/* 名前🙂 */ ".len())
+    );
+}
+
+#[test]
+fn swift_try_await_incremental_repair_keeps_diagnostics_and_declarations() {
+    let valid = SWIFT_TRY_AWAIT_SOURCE;
+    let invalid = valid.replacen("loadGroup()", "loadGroup(@)", 1);
+    let mut parser = Parser::new();
+    parser.set_language(&LangId::Swift.ts_language()).unwrap();
+    let mut old_tree = parser.parse(invalid.as_bytes(), None).unwrap();
+    assert!(old_tree.root_node().has_error());
+    let byte = invalid.find('@').unwrap();
+    old_tree.edit(&InputEdit {
+        start_byte: byte,
+        old_end_byte: byte + 1,
+        new_end_byte: byte,
+        start_position: swift_point_at(invalid.as_bytes(), byte),
+        old_end_position: swift_point_at(invalid.as_bytes(), byte + 1),
+        new_end_position: swift_point_at(valid.as_bytes(), byte),
+    });
+    let tree = parser.parse(valid.as_bytes(), Some(&old_tree)).unwrap();
+    let fresh = assert_swift_parse_clean(valid.as_bytes());
+    assert!(!tree.root_node().has_error());
+    assert_eq!(tree.root_node().to_sexp(), fresh.root_node().to_sexp());
+    swift_node_with_text(
+        &tree,
+        valid.as_bytes(),
+        "function_declaration",
+        "func loadGroup() async throws -> [Int]? { nil }",
+    );
+    let invalid_tree = parse_source(invalid.as_bytes(), LangId::Swift).unwrap();
+    assert!(invalid_tree.root_node().has_error());
+    swift_node_with_text(
+        &invalid_tree,
+        invalid.as_bytes(),
+        "function_declaration",
+        "func fallback() async -> [String] { [] }",
+    );
+    assert_swift_parse_clean(valid.as_bytes());
+}
 
 fn swift_nodes(root: Node<'_>) -> Vec<Node<'_>> {
     let mut nodes = Vec::new();
