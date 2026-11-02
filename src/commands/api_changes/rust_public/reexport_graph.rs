@@ -89,6 +89,14 @@ impl RustPubUseIndex {
     }
 }
 
+#[cfg(test)]
+impl RustPubUseIndex {
+    /// 読み直した後の edge (テストで正規化先を確かめる)。
+    pub(crate) fn edges(&self) -> &[RustPubUseEdge] {
+        &self.edges
+    }
+}
+
 /// re-export item 名。Rust の method は `Container.method` qualname で出るが re-export 対象 item は
 /// container の `Container`。free function / struct 等は bare name。
 pub(crate) fn rust_reexport_item_name(name: &str) -> &str {
@@ -115,7 +123,7 @@ pub(crate) fn collect_rust_pub_use_index(
     info: &RustPrivateModuleInfo,
 ) -> Option<RustPubUseIndex> {
     let files = collect_rust_rs_files(source, dir, &info.src_root_rel)?;
-    let mut edges: Vec<RustPubUseEdge> = Vec::new();
+    let mut collected: Vec<CollectedPubUseEdge> = Vec::new();
     for file in files {
         let Ok(rel_to_src) = file.strip_prefix(&info.src_root_rel) else {
             continue;
@@ -123,8 +131,21 @@ pub(crate) fn collect_rust_pub_use_index(
         let module_path = module_path_segments(rel_to_src);
         let file_source = read_rs_blob(source, dir, &file)?;
         let tree = parser::parse_source(&file_source, crate::language::LangId::Rust).ok()?;
-        collect_pub_use_edges(tree.root_node(), &file_source, &module_path, &mut edges)?;
+        // 構文エラー (ERROR / MISSING) があると、module の直下の公開宣言がエラーのノードに
+        // 取り込まれて edge が黙って欠け得る。公開経路を確かめられないので index を作らない。
+        if tree.root_node().has_error() {
+            return None;
+        }
+        collect_pub_use_edges(tree.root_node(), &file_source, &module_path, &mut collected)?;
     }
+    let module_tree = collect_all_modules(source, dir, info)?;
+    // edition は同じ source tree (base は base の snapshot) の manifest から決める。
+    let edges = resolve_bare_pub_use_edges(collected, &module_tree, || {
+        crate::engine::rust_edition::library_edition(&info.crate_root_rel, |manifest| {
+            read_rust_manifest(source, dir, manifest)
+        })
+    })?;
+    let all_modules = module_tree.pub_children;
     let mut named_by_target: std::collections::HashMap<RustExportKey, Vec<usize>> =
         std::collections::HashMap::new();
     let mut wildcard_by_target_module: std::collections::HashMap<Vec<String>, Vec<usize>> =
@@ -150,7 +171,6 @@ pub(crate) fn collect_rust_pub_use_index(
             }
         }
     }
-    let all_modules = collect_all_modules(source, dir, info)?;
     let public_modules = pub_reachable_modules(&all_modules);
     let reachable_modules =
         compute_reexport_reachable_modules(&edges, &public_modules, &all_modules);
@@ -160,6 +180,79 @@ pub(crate) fn collect_rust_pub_use_index(
         named_by_target,
         wildcard_by_target_module,
     })
+}
+
+/// 先頭が識別子の edge (Bare) を、edition と use と同じスコープの束縛で読み直す。
+///
+/// - 束縛を見ない edge (ルートの module の use)、module tree に無い module (どの `mod` 宣言からも
+///   辿れないファイル) の use、edition 2015、スコープに束縛の無い名前 (2018 以降は extern
+///   prelude の名前): 従来どおりクレートルート起点の edge のまま
+/// - 2018 以降で先頭の名前が子 `mod` に束縛され、その子 module が条件なしと確かめられた
+///   (宣言・inline の body・外部ファイルの内部属性に `cfg` や未知の属性が無い): 現在の module
+///   起点に付け替える
+/// - それ以外 (2018 以降で束縛を決められない・子 module の条件を確かめられない、edition が
+///   不明で子 `mod` か未解決の束縛を持つ): `None`。index を不完全として、公開面による抑制を
+///   諦めさせる (公開面の外と断定しない)。
+///
+/// edition が不明なときに両方の読み方の edge を作らないのは、推測の edge が glob の shadow
+/// 判定 (`compute_reexport_reachable_modules`) に混ざると、glob で入る module を誤って隠し得る
+/// ため (クレートルート起点では module、子 module 起点では関数になる名前の再公開など)。
+/// `edition` は Bare な edge の束縛を読み直すときだけ呼ぶ (manifest を読む回数を増やさない)。
+fn resolve_bare_pub_use_edges(
+    collected: Vec<CollectedPubUseEdge>,
+    module_tree: &ModuleTree,
+    edition: impl FnOnce() -> Option<crate::engine::rust_edition::RustEdition>,
+) -> Option<Vec<RustPubUseEdge>> {
+    use crate::engine::rust_edition::RustEdition;
+    let edition = if collected.iter().any(|edge| edge.bare_leading.is_some()) {
+        edition()
+    } else {
+        None
+    };
+    collected
+        .into_iter()
+        .map(
+            |CollectedPubUseEdge {
+                 mut edge,
+                 bare_leading,
+             }| {
+                let Some(binding) = bare_leading else {
+                    return Some(edge);
+                };
+                let (RustPubUseEdge::Named { source_module, .. }
+                | RustPubUseEdge::Wildcard { source_module, .. }) = &edge;
+                // module tree に無い module の use は、外から辿れる公開経路にならない。
+                if !module_tree.pub_children.contains_key(source_module) {
+                    return Some(edge);
+                }
+                match (binding, edition) {
+                    (_, Some(RustEdition::E2015)) | (BareLeadingBinding::Unbound, _) => {}
+                    (BareLeadingBinding::ChildModule, Some(RustEdition::E2018OrLater)) => {
+                        let mut child = source_module.clone();
+                        child.push(bare_leading_name(&edge)?.to_string());
+                        if !module_tree.is_unconditional(&child) {
+                            return None;
+                        }
+                        let (RustPubUseEdge::Named {
+                            source_module,
+                            target_module,
+                            ..
+                        }
+                        | RustPubUseEdge::Wildcard {
+                            source_module,
+                            target_module,
+                            ..
+                        }) = &mut edge;
+                        target_module.splice(0..0, source_module.iter().cloned());
+                    }
+                    (BareLeadingBinding::ChildModule | BareLeadingBinding::Unresolved, _) => {
+                        return None;
+                    }
+                }
+                Some(edge)
+            },
+        )
+        .collect()
 }
 
 /// module 再エクスポート (`pub use path::to::module;`) による外部到達可能 module 集合を
@@ -204,6 +297,7 @@ fn compute_reexport_reachable_modules(
                 target_module,
                 target_item,
                 exported_name,
+                ..
             } => {
                 let mut target_path = target_module.clone();
                 target_path.push(target_item.clone());
@@ -227,6 +321,7 @@ fn compute_reexport_reachable_modules(
                 RustPubUseEdge::Wildcard {
                     source_module,
                     target_module,
+                    ..
                 } => (source_module, target_module, None),
             };
             if !reachable.contains(source_module) {
@@ -368,36 +463,81 @@ fn child_module_base_dir(current_file_rel: &std::path::Path) -> std::path::PathB
     }
 }
 
-/// crate 内の**全 module** (可視性問わず) を walk し、
-/// module 絶対 path → 「`pub` と宣言された子 module 名のリスト」を返す。
+/// crate の module tree (`mod` 宣言から辿れる module だけ。可視性は問わない)。
+pub(crate) struct ModuleTree {
+    /// module 絶対 path → `pub` と宣言された子 module 名のリスト。
+    pub(crate) pub_children: std::collections::HashMap<Vec<String>, Vec<String>>,
+    /// module 絶対 path → 条件なしと確かめられたか。宣言のすべてに条件 (`cfg` 等) も宣言を
+    /// 書き換え得る属性も無く、中身 (inline の body か外部ファイル) の内部属性も同様で、
+    /// 外部ファイルを読めた場合だけ true。
+    unconditional: std::collections::HashMap<Vec<String>, bool>,
+}
+
+impl ModuleTree {
+    fn is_unconditional(&self, module: &[String]) -> bool {
+        self.unconditional.get(module) == Some(&true)
+    }
+}
+
+/// `module` が条件なしかを記録する。一度でも条件付きと分かった module は条件付きのまま。
+fn record_unconditional(
+    map: &mut std::collections::HashMap<Vec<String>, bool>,
+    module: &[String],
+    unconditional: bool,
+) {
+    map.entry(module.to_vec())
+        .and_modify(|known| *known &= unconditional)
+        .or_insert(unconditional);
+}
+
+/// crate 内の**全 module** (可視性問わず) を walk し、module 絶対 path →
+/// 「`pub` と宣言された子 module 名のリスト」と、各 module が条件なしかを返す。
 /// module 再エクスポートの到達性固定点で「target が module か」
 /// 「reachable module の pub 子孫」の判定に使う。判定不能 (`#[path]` 等) は
 /// `None` (呼出元で index 全体を諦めて api.rm を残す fail-closed)。
+/// 外部ファイルの module の内部属性は、判定する側の source tree (base は base の snapshot)
+/// から読んだファイルで確かめる。
 pub(crate) fn collect_all_modules(
     source: RustSourceTree<'_>,
     dir: &str,
     info: &RustPrivateModuleInfo,
-) -> Option<std::collections::HashMap<Vec<String>, Vec<String>>> {
+) -> Option<ModuleTree> {
     use std::collections::HashMap;
     use std::path::PathBuf;
     let mut result: HashMap<Vec<String>, Vec<String>> = HashMap::new();
     result.insert(Vec::new(), Vec::new());
+    let mut unconditional: HashMap<Vec<String>, bool> = HashMap::new();
     let mut frontier: Vec<(Vec<String>, PathBuf)> = vec![(Vec::new(), PathBuf::from("lib.rs"))];
     while let Some((segments, current_rel)) = frontier.pop() {
         let module_source =
             read_rust_module_source(source, dir, &info.crate_root_rel, &current_rel)?;
         let tree = parser::parse_source(&module_source, crate::language::LangId::Rust).ok()?;
+        // 構文エラーのあるファイルは `mod` 宣言を取りこぼし得る (edge の収集と同じく諦める。
+        // ignore された module ファイルは edge の収集の走査に入らないので、ここでも確かめる)。
+        if tree.root_node().has_error() {
+            return None;
+        }
+        // ファイル先頭の内部属性 (`#![cfg(..)]` など) はこの module 全体に掛かる。
+        record_unconditional(
+            &mut unconditional,
+            &segments,
+            module_inner_attributes_are_plain(tree.root_node(), &module_source),
+        );
         let base_dir = child_module_base_dir(&current_rel);
         let mut collector = ModuleVisibilityCollector {
             source,
             dir,
             info,
             result: &mut result,
+            unconditional: &mut unconditional,
             frontier: &mut frontier,
         };
         collector.collect(tree.root_node(), &module_source, &segments, &base_dir)?;
     }
-    Some(result)
+    Some(ModuleTree {
+        pub_children: result,
+        unconditional,
+    })
 }
 
 /// `collect_public_pub_mods` の全 module 版。private mod にも潜って module 集合を作り、
@@ -410,11 +550,16 @@ struct ModuleVisibilityCollector<'a, 'b> {
     dir: &'a str,
     info: &'a RustPrivateModuleInfo,
     result: &'b mut std::collections::HashMap<Vec<String>, Vec<String>>,
+    /// module → 条件なしと確かめられたか (宣言の属性・inline の body の内部属性・外部ファイルの
+    /// 有無。外部ファイルの内部属性は `collect_all_modules` がファイルを読むときに足す)。
+    unconditional: &'b mut std::collections::HashMap<Vec<String>, bool>,
     frontier: &'b mut Vec<(Vec<String>, std::path::PathBuf)>,
 }
 
 impl ModuleVisibilityCollector<'_, '_> {
     /// `node` 配下の `mod` 宣言を前順に辿り、module 集合と pub な子の一覧を作る。
+    /// 辿るのは module のスコープ (ファイル・inline mod の body) だけで、関数の本体などの
+    /// ブロックの中の `mod` は外の module tree に入れない (外から辿れない)。
     /// inline module の入れ子は入力次第で深くなるため、再帰せず明示スタックで辿る。
     /// 要素は (ノード, 所属モジュール, 子 `mod name;` の解決基準 dir)。
     fn collect(
@@ -453,6 +598,13 @@ impl ModuleVisibilityCollector<'_, '_> {
                             .push(name.clone());
                     }
                     self.result.entry(child_segments.clone()).or_default();
+                    // 宣言の属性と inline の body の内部属性。外部ファイルの内部属性は
+                    // `collect_all_modules` がそのファイルを読むときに足す。
+                    record_unconditional(
+                        self.unconditional,
+                        &child_segments,
+                        mod_declaration_is_unconditional(node, source_bytes),
+                    );
                     let child_segments = Rc::new(child_segments);
                     let mut has_inline_body = false;
                     let mut cursor = node.walk();
@@ -488,10 +640,16 @@ impl ModuleVisibilityCollector<'_, '_> {
                         .is_some()
                         {
                             self.frontier.push((child_segments, as_file));
+                        } else {
+                            // ファイルが見つからない module は中身の条件を確かめられない。
+                            record_unconditional(self.unconditional, &child_segments, false);
                         }
                     }
                 }
-                _ => {
+                // module のスコープの中身 (ファイルの直下) だけを辿る。inline mod の body の中身は
+                // 上の `mod_item` で直接積んでいる。ERROR の中は辿らない (構文エラーのある
+                // ファイルでは `collect_all_modules` が module tree 自体を作らない)。
+                "source_file" => {
                     let mut cursor = node.walk();
                     stack.extend(
                         node.named_children(&mut cursor).map(|child| {
@@ -499,6 +657,7 @@ impl ModuleVisibilityCollector<'_, '_> {
                         }),
                     );
                 }
+                _ => {}
             }
             // 左の子から順に処理するため、今回積んだ分を逆順にする。
             stack[start..].reverse();
@@ -529,7 +688,8 @@ mod tests {
     use super::*;
 
     impl ModuleVisibilityCollector<'_, '_> {
-        /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+        /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。辿る範囲 (module のスコープ
+        /// だけ) と条件なしの記録は、反復版と同じ変更を入れてある。
         fn collect_recursive(
             &mut self,
             node: tree_sitter::Node<'_>,
@@ -556,6 +716,11 @@ mod tests {
                             .push(name.clone());
                     }
                     self.result.entry(child_segments.clone()).or_default();
+                    record_unconditional(
+                        self.unconditional,
+                        &child_segments,
+                        mod_declaration_is_unconditional(node, source_bytes),
+                    );
                     let mut has_inline_body = false;
                     let mut cursor = node.walk();
                     for child in node.children(&mut cursor) {
@@ -594,15 +759,18 @@ mod tests {
                         .is_some()
                         {
                             self.frontier.push((child_segments, as_file));
+                        } else {
+                            record_unconditional(self.unconditional, &child_segments, false);
                         }
                     }
                 }
-                _ => {
+                "source_file" => {
                     let mut cursor = node.walk();
                     for child in node.named_children(&mut cursor) {
                         self.collect_recursive(child, source_bytes, current_segments, base_dir)?;
                     }
                 }
+                _ => {}
             }
             Some(())
         }
@@ -612,6 +780,7 @@ mod tests {
         Option<()>,
         Vec<(Vec<String>, Vec<String>)>,
         Vec<(Vec<String>, std::path::PathBuf)>,
+        Vec<(Vec<String>, bool)>,
     );
 
     fn run_collector(dir: &str, source: &str, recursive: bool) -> Collected {
@@ -622,12 +791,14 @@ mod tests {
         };
         let tree = parser::parse_source(source.as_bytes(), crate::language::LangId::Rust).unwrap();
         let mut result = std::collections::HashMap::new();
+        let mut unconditional = std::collections::HashMap::new();
         let mut frontier = Vec::new();
         let mut collector = ModuleVisibilityCollector {
             source: RustSourceTree::Worktree,
             dir,
             info: &info,
             result: &mut result,
+            unconditional: &mut unconditional,
             frontier: &mut frontier,
         };
         let base = std::path::Path::new("");
@@ -639,7 +810,9 @@ mod tests {
         // HashMap の反復順は実行ごとに変わるので、キーで並べて比べる (値の Vec の順は保つ)。
         let mut result: Vec<_> = result.into_iter().collect();
         result.sort();
-        (outcome, result, frontier)
+        let mut unconditional: Vec<_> = unconditional.into_iter().collect();
+        unconditional.sort();
+        (outcome, result, frontier, unconditional)
     }
 
     /// 明示スタック版が、浅い入力で再帰版と同じ module 集合・pub な子の並び・
@@ -662,7 +835,7 @@ mod tests {
         let lib = "pub mod a;\nmod b;\npub mod inline {\n    pub mod deeper { pub mod leaf; mod hidden {} }\n\
                    mod private_inline { pub mod x {} pub mod y {} }\n    pub mod file_child;\n}\n\
                    mod missing;\nfn f() { mod in_fn { pub mod nested {} } }\npub(crate) mod restricted {}\n\
-                   pub mod z {}\n";
+                   pub mod z {}\n#[cfg(test)]\nmod conditional {}\nmod gated {\n    #![cfg(any())]\n}\n";
         let iterative = run_collector(dir, lib, false);
         assert_eq!(iterative, run_collector(dir, lib, true));
         assert_eq!(iterative.0, Some(()));
@@ -671,6 +844,28 @@ mod tests {
             "子ファイルの解決も比べる: {:?}",
             iterative.2
         );
+        // 関数の本体の中の `mod` は外の module tree に入れない
+        assert!(
+            iterative
+                .1
+                .iter()
+                .all(|(module, _)| module.first().map(String::as_str) != Some("in_fn")),
+            "{:?}",
+            iterative.1
+        );
+        // 条件なしの記録: 宣言の cfg・inline の body の内部属性・見つからないファイルは false
+        let unconditional = |name: &str| {
+            iterative
+                .3
+                .iter()
+                .find(|(module, _)| module == &[name.to_string()])
+                .map(|(_, known)| *known)
+        };
+        assert_eq!(unconditional("z"), Some(true));
+        assert_eq!(unconditional("conditional"), Some(false));
+        assert_eq!(unconditional("gated"), Some(false));
+        assert_eq!(unconditional("missing"), Some(false));
+        assert_eq!(unconditional("in_fn"), None);
 
         let with_path = "pub mod a;\npub mod inline {\n    #[path = \"x.rs\"]\n    mod p;\n}\n";
         let iterative = run_collector(dir, with_path, false);
@@ -774,19 +969,32 @@ mod tests {
         ));
     }
 
-    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。
+    /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。Bare な edge の束縛は、反復版と
+    /// 同じ `bare_leading_binding` で付ける (比べたいのは走査の順序と所属モジュール)。辿る範囲
+    /// (module のスコープだけ) と `#[path]` の扱いは反復版と同じ変更を入れてある。
     fn collect_pub_use_edges_recursive(
         node: tree_sitter::Node<'_>,
         source: &[u8],
         current_module: &[String],
-        edges: &mut Vec<RustPubUseEdge>,
+        scopes: &mut ScopeBindingsCache,
+        edges: &mut Vec<CollectedPubUseEdge>,
     ) -> Option<()> {
+        if node.kind() == "source_file"
+            && crate::engine::tree_walk::any_node(
+                node,
+                crate::engine::tree_walk::Children::All,
+                |node| node.kind() == "mod_item" && rust_mod_item_has_path_attribute(node, source),
+            )
+        {
+            return None;
+        }
         match node.kind() {
             "use_declaration" => {
                 if !rust_node_has_unrestricted_pub_visibility(node, source) {
                     return Some(());
                 }
                 let argument = node.child_by_field_name("argument")?;
+                let mut expanded = Vec::new();
                 expand_rust_use_tree_edges_ast(
                     argument,
                     source,
@@ -794,13 +1002,18 @@ mod tests {
                     current_module,
                     current_module,
                     None,
-                    edges,
+                    &mut expanded,
                 )?;
+                for edge in expanded {
+                    let bare_leading =
+                        bare_leading_binding(node, source, current_module, &edge, scopes);
+                    edges.push(CollectedPubUseEdge { edge, bare_leading });
+                }
             }
             "mod_item" => {
-                if rust_mod_item_has_path_attribute(node, source) {
-                    return None;
-                }
+                let Some(body) = node.child_by_field_name("body") else {
+                    return Some(());
+                };
                 let name = node
                     .child_by_field_name("name")
                     .and_then(|n| n.utf8_text(source).ok())
@@ -809,23 +1022,22 @@ mod tests {
                 if let Some(seg) = name {
                     next_module.push(seg);
                 }
+                collect_pub_use_edges_recursive(body, source, &next_module, scopes, edges)?;
+            }
+            "source_file" | "declaration_list" => {
                 let mut cursor = node.walk();
-                for child in node.children(&mut cursor) {
-                    collect_pub_use_edges_recursive(child, source, &next_module, edges)?;
+                for child in node.named_children(&mut cursor) {
+                    collect_pub_use_edges_recursive(child, source, current_module, scopes, edges)?;
                 }
             }
-            _ => {
-                let mut cursor = node.walk();
-                for child in node.children(&mut cursor) {
-                    collect_pub_use_edges_recursive(child, source, current_module, edges)?;
-                }
-            }
+            _ => {}
         }
         Some(())
     }
 
     /// 明示スタック版が、浅い入力で再帰版と同じ edge を同じ順に集め、判定不能
-    /// (`#[path]` / 解決できない `super::`) も同じく None を返す。
+    /// (`#[path]` / 解決できない `super::`) も同じく None を返す。関数の本体などのブロックの中の
+    /// `pub use` は module の edge にしない (`#[path]` の mod はブロックの中でも判定不能)。
     #[test]
     fn collect_pub_use_edges_matches_recursive_version() {
         let cases = [
@@ -834,6 +1046,11 @@ mod tests {
              pub use m::n;\nfn body() { pub use inner::x; }\n",
             "pub mod m {\n    #[path = \"x.rs\"]\n    mod p;\n    pub use q::r;\n}\n",
             "pub use super::super::too_far;\n",
+            // Bare な edge の束縛 (子 mod・extern crate 名・同名の import・glob・ブロックの use)
+            "mod value;\npub use value::{A, b::C};\npub use serde::Ser;\nuse other::alias;\n\
+             pub use alias::D;\npub mod g { use x::*; pub use y::E; mod z {} pub use z::F; }\n\
+             fn f() { pub use value::G; mod in_fn { pub use self::H; } }\n",
+            "fn f() {\n    #[path = \"x.rs\"]\n    mod p;\n}\n",
         ];
         for src in cases {
             let tree = parser::parse_source(src.as_bytes(), crate::language::LangId::Rust).unwrap();
@@ -848,6 +1065,7 @@ mod tests {
                         tree.root_node(),
                         src.as_bytes(),
                         &module,
+                        &mut ScopeBindingsCache::default(),
                         &mut edges_recursive
                     ),
                     "{src}"
@@ -868,5 +1086,57 @@ mod tests {
             collect_pub_use_edges(tree.root_node(), cases[0].as_bytes(), &[], &mut edges).is_some()
         );
         assert!(edges.len() >= 5, "{edges:?}");
+        // ブロックの中の `pub use` (関数の本体の `inner::x`) は edge にしない
+        assert!(
+            edges.iter().all(|collected| !matches!(
+                &collected.edge,
+                RustPubUseEdge::Named { exported_name, .. } if exported_name == "x"
+            )),
+            "{edges:?}"
+        );
+        // `#[path]` の mod はブロックの中でも判定不能
+        let tree =
+            parser::parse_source(cases[4].as_bytes(), crate::language::LangId::Rust).unwrap();
+        assert!(
+            collect_pub_use_edges(tree.root_node(), cases[4].as_bytes(), &[], &mut Vec::new())
+                .is_none()
+        );
+
+        // 束縛の分類そのもの: 非ルートの module に置いた入力で、先頭の名前ごとに確かめる。
+        let src = cases[3];
+        let tree = parser::parse_source(src.as_bytes(), crate::language::LangId::Rust).unwrap();
+        let mut edges = Vec::new();
+        collect_pub_use_edges(
+            tree.root_node(),
+            src.as_bytes(),
+            &["reader".to_string()],
+            &mut edges,
+        )
+        .unwrap();
+        let got: Vec<(String, Option<BareLeadingBinding>)> = edges
+            .iter()
+            .map(|collected| {
+                let RustPubUseEdge::Named { exported_name, .. } = &collected.edge else {
+                    panic!("Named のみ: {collected:?}");
+                };
+                (exported_name.clone(), collected.bare_leading)
+            })
+            .collect();
+        use BareLeadingBinding::{ChildModule, Unbound, Unresolved};
+        assert_eq!(
+            got,
+            [
+                ("A", Some(ChildModule)),
+                ("C", Some(ChildModule)),
+                ("Ser", Some(Unbound)),
+                ("D", Some(Unresolved)),
+                // glob のある inline mod では子 mod 以外は決められない
+                ("E", Some(Unresolved)),
+                ("F", Some(ChildModule)),
+                // 関数の本体の `pub use value::G;` と、その中の mod の `pub use` は edge にしない
+            ]
+            .map(|(name, binding)| (name.to_string(), binding))
+            .to_vec(),
+        );
     }
 }

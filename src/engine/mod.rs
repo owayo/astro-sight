@@ -26,6 +26,7 @@ pub mod query_cache;
 pub mod refs;
 pub(crate) mod rust_cfg;
 pub(crate) mod rust_dynamic_source;
+pub(crate) mod rust_edition;
 pub(crate) mod rust_macro_name;
 pub(crate) mod rust_scope;
 pub(crate) mod rust_signature;

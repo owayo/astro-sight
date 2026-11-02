@@ -2,9 +2,25 @@
 
 use std::rc::Rc;
 
+/// use path の起点 (書かれた path の先頭)。
+///
+/// `target_module` はどの起点でもクレートルート起点の表現で持つ。`Bare` の path をどの
+/// module から読むかは edition とスコープの束縛で決まる (2015 はクレートルート、2018 以降は
+/// 現在の module のスコープか extern prelude) ため、ここでは決めずに呼び出し側へ渡す。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UsePathOrigin {
+    /// `crate` / `self` / `super` で始まる (現在の module かクレートルートから解決済み)。
+    Anchored,
+    /// 識別子で始まる。`target_module` は書かれた path をクレートルート起点に並べたもの。
+    Bare,
+    /// `::` で始まる。2015 はクレートルート、2018 以降は extern crate だけを指す。
+    Global,
+}
+
 /// `pub use` から生成される re-export edge。Named は `source_module::exported_name` が
 /// `target_module::target_item` を指す。alias の場合 `exported_name = alias`、`target_item = 元名`。
 /// Wildcard は `source_module::* = target_module::*` で名前ごとに伝播する。
+/// `origin` は target の path の起点 (group の要素は group の path の起点を引き継ぐ)。
 #[derive(Clone, Debug)]
 pub(crate) enum RustPubUseEdge {
     Named {
@@ -12,11 +28,22 @@ pub(crate) enum RustPubUseEdge {
         exported_name: String,
         target_module: Vec<String>,
         target_item: String,
+        origin: UsePathOrigin,
     },
     Wildcard {
         source_module: Vec<String>,
         target_module: Vec<String>,
+        origin: UsePathOrigin,
     },
+}
+
+impl RustPubUseEdge {
+    /// target の path の起点。
+    pub(crate) fn origin(&self) -> UsePathOrigin {
+        match self {
+            Self::Named { origin, .. } | Self::Wildcard { origin, .. } => *origin,
+        }
+    }
 }
 
 /// 構造的に AST を walk して `pub use` re-export ターゲットを抽出する (whitespace / コメント非依存)。
@@ -32,6 +59,9 @@ pub(crate) enum RustPubUseEdge {
 ///
 /// 戻り値 `None` で「判定不能」(root を超える super::、解決不能な anchor) — 呼出元は index を `None` にする。
 ///
+/// `path_prefix` は解決済みの prefix で、起点はそれぞれの path の先頭から決める (呼び出し側は
+/// 通常は空を渡す)。
+///
 /// `a::{b::{c::{…}}}` の入れ子の深さだけ再帰しないよう、明示スタックで前順に展開する。
 /// 子は逆順に積むので、edge を出す順序と、失敗で打ち切る位置は子を順に再帰した場合と同じ。
 pub(crate) fn expand_rust_use_tree_edges_ast(
@@ -46,6 +76,7 @@ pub(crate) fn expand_rust_use_tree_edges_ast(
     let mut pending = vec![UseTreeFrame {
         node,
         path_prefix: Rc::from(path_prefix),
+        prefix_origin: None,
         current_module,
         alias_override,
     }];
@@ -53,6 +84,7 @@ pub(crate) fn expand_rust_use_tree_edges_ast(
         let UseTreeFrame {
             node,
             path_prefix,
+            prefix_origin,
             current_module,
             alias_override,
         } = frame;
@@ -71,22 +103,34 @@ pub(crate) fn expand_rust_use_tree_edges_ast(
                     }
                 }
                 let list = list_node?;
-                let resolved_prefix = match path_node {
+                let (resolved_prefix, origin) = match path_node {
                     Some(pn) => {
-                        let (prefix, leaf) =
+                        let (prefix, leaf, own_origin) =
                             resolve_use_path_node(pn, source, &path_prefix, current_module)?;
                         let mut p = prefix;
                         if let Some(name) = leaf {
                             p.push(name);
                         }
-                        Rc::from(p)
+                        (Rc::from(p), prefix_origin.unwrap_or(own_origin))
                     }
-                    None => path_prefix,
+                    // path の無い scoped_use_list は `::{a, b}` (先頭が `::`)。
+                    None => (path_prefix, prefix_origin.unwrap_or(UsePathOrigin::Global)),
                 };
-                push_use_list_items(&mut pending, list, &resolved_prefix);
+                // prefix 付き group の要素の `self` は prefix 自身を指すので、要素には
+                // current_module を渡さない (`self` を module anchor として読ませない)。
+                push_use_list_items(&mut pending, list, &resolved_prefix, Some(origin), &[]);
             }
             "use_list" => {
-                push_use_list_items(&mut pending, node, &path_prefix);
+                // prefix の無い group (`{a::b, self::c}`) の要素は、それぞれが use の引数と
+                // 同じく字句的な module で解決する (`{self::x}` の `self` は現在の module)。
+                // prefix 付き group の中の入れ子 (`a::{{b}}`) では current_module は既に空。
+                push_use_list_items(
+                    &mut pending,
+                    node,
+                    &path_prefix,
+                    prefix_origin,
+                    current_module,
+                );
             }
             "use_as_clause" => {
                 // [path, alias] 順。alias=`_` は外部非公開なので edge を作らない。
@@ -107,6 +151,7 @@ pub(crate) fn expand_rust_use_tree_edges_ast(
                 pending.push(UseTreeFrame {
                     node: named[0],
                     path_prefix,
+                    prefix_origin,
                     current_module,
                     alias_override: Some(alias_text),
                 });
@@ -116,7 +161,7 @@ pub(crate) fn expand_rust_use_tree_edges_ast(
                 let mut cursor = node.walk();
                 let path_node = node.named_children(&mut cursor).next();
                 if let Some(path_node) = path_node {
-                    let (resolved_prefix, leaf_name) =
+                    let (resolved_prefix, leaf_name, own_origin) =
                         resolve_use_path_node(path_node, source, &path_prefix, current_module)?;
                     let mut target_module = resolved_prefix;
                     if let Some(name) = leaf_name {
@@ -126,13 +171,14 @@ pub(crate) fn expand_rust_use_tree_edges_ast(
                         out.push(RustPubUseEdge::Wildcard {
                             source_module: source_module.to_vec(),
                             target_module,
+                            origin: prefix_origin.unwrap_or(own_origin),
                         });
                     }
                 }
             }
             "scoped_identifier" | "identifier" | "crate" | "self" | "super" => {
                 // path::name 形式の単純 re-export、または anchor 単体。
-                let (resolved_prefix, leaf_name) =
+                let (resolved_prefix, leaf_name, own_origin) =
                     resolve_use_path_node(node, source, &path_prefix, current_module)?;
                 if let Some(item) = leaf_name {
                     // resolved_prefix が空 (crate root 直下の item / module) でも edge を
@@ -148,6 +194,7 @@ pub(crate) fn expand_rust_use_tree_edges_ast(
                         exported_name,
                         target_module: resolved_prefix,
                         target_item: item,
+                        origin: prefix_origin.unwrap_or(own_origin),
                     });
                 }
             }
@@ -162,6 +209,7 @@ pub(crate) fn expand_rust_use_tree_edges_ast(
                     pending.push(UseTreeFrame {
                         node: child,
                         path_prefix: Rc::clone(&path_prefix),
+                        prefix_origin,
                         current_module,
                         alias_override,
                     });
@@ -176,16 +224,22 @@ pub(crate) fn expand_rust_use_tree_edges_ast(
 struct UseTreeFrame<'tree, 'a> {
     node: tree_sitter::Node<'tree>,
     path_prefix: Rc<[String]>,
+    /// `path_prefix` を作った group の path の起点。`None` はまだ path が無い (use の引数
+    /// そのもの、または prefix の無い group の要素)。`path_prefix` が空でも `crate::{..}` の
+    /// 要素は `Anchored` なので、prefix の有無とは別に持つ。
+    prefix_origin: Option<UsePathOrigin>,
     current_module: &'a [String],
     alias_override: Option<&'a str>,
 }
 
 /// `use_list` ノード (`{ ... }`) の各要素 (`,` 区切り) を展開待ちに積む。
-/// group 内では `current_module` は継承しない (空)。
-fn push_use_list_items<'tree>(
-    pending: &mut Vec<UseTreeFrame<'tree, '_>>,
+/// 要素は group の path の起点 (`prefix_origin`) を引き継ぎ、`current_module` で解決する。
+fn push_use_list_items<'tree, 'a>(
+    pending: &mut Vec<UseTreeFrame<'tree, 'a>>,
     list: tree_sitter::Node<'tree>,
     path_prefix: &Rc<[String]>,
+    prefix_origin: Option<UsePathOrigin>,
+    current_module: &'a [String],
 ) {
     let mut cursor = list.walk();
     let items: Vec<_> = list
@@ -196,7 +250,8 @@ fn push_use_list_items<'tree>(
         pending.push(UseTreeFrame {
             node: item,
             path_prefix: Rc::clone(path_prefix),
-            current_module: &[],
+            prefix_origin,
+            current_module,
             alias_override: None,
         });
     }
@@ -211,6 +266,8 @@ enum UsePathSegment {
     SelfMod,
     /// `super` (1 階層上)
     Super,
+    /// 先頭の `::` (`::a::b`)。起点を表すだけで、module パスは積まない。
+    Global,
     /// 通常の識別子
     Name(String),
 }
@@ -269,8 +326,8 @@ fn flatten_use_path(
             },
             "scoped_identifier" => {
                 // tree-sitter-rust grammar は scoped_identifier で path/name の field 名を出さない。
-                // named children は最大 2 つ: [path, name] または [name] のみ
-                // (path が省略された場合は crate root レベルの単一 identifier 扱い)。
+                // named children は最大 2 つ: [path, name] または [name] のみ。
+                // [name] だけなのは path を省いた `::name` (先頭が `::`) の形。
                 let mut named: Vec<tree_sitter::Node<'_>> = Vec::new();
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
@@ -278,6 +335,7 @@ fn flatten_use_path(
                 }
                 match named.as_slice() {
                     [only] => {
+                        out.push(UsePathSegment::Global);
                         tasks.push(Task::Visit(*only));
                         true
                     }
@@ -341,28 +399,42 @@ fn flatten_use_path(
     Some(())
 }
 
-/// use path のノードを (モジュール prefix, 末尾の item 名) へ解決する。
+/// use path のノードを (モジュール prefix, 末尾の item 名, path の起点) へ解決する。
 ///
 /// 先頭から続く `crate` / `self` / `super` を module anchor として消費し、残りの
 /// 識別子列のうち末尾を item、それ以外を module パスとして扱う。
 /// クレートルートを越える `super`、anchor が先頭以外に現れる不正な path、
 /// 解決できないノードはすべて `None` (fail-closed)。
+///
+/// 起点は書かれた path の先頭だけから決める (group の要素なら、呼び出し側が group の path の
+/// 起点を優先する)。anchor の無い path (`Bare` / `Global`) は従来どおり `path_prefix`
+/// (トップレベルでは空 = クレートルート) から積む。
 pub(crate) fn resolve_use_path_node(
     node: tree_sitter::Node<'_>,
     source: &[u8],
     path_prefix: &[String],
     current_module: &[String],
-) -> Option<(Vec<String>, Option<String>)> {
+) -> Option<(Vec<String>, Option<String>, UsePathOrigin)> {
     let mut segments = Vec::new();
     flatten_use_path(node, source, &mut segments)?;
-    if segments.is_empty() {
-        return None;
-    }
+    let origin = match segments.first()? {
+        UsePathSegment::Crate | UsePathSegment::SelfMod | UsePathSegment::Super => {
+            UsePathOrigin::Anchored
+        }
+        UsePathSegment::Global => UsePathOrigin::Global,
+        UsePathSegment::Name(_) => UsePathOrigin::Bare,
+    };
 
     let mut prefix: Vec<String> = path_prefix.to_vec();
     let mut names: Vec<String> = Vec::new();
     for (idx, segment) in segments.iter().enumerate() {
         match segment {
+            UsePathSegment::Global => {
+                // `::` は path の先頭にしか書けない。
+                if idx != 0 {
+                    return None;
+                }
+            }
             UsePathSegment::Crate => {
                 // 先頭以外の `crate` は Rust として不正。
                 if idx != 0 {
@@ -407,7 +479,7 @@ pub(crate) fn resolve_use_path_node(
         && !path_prefix.is_empty()
     {
         let item = prefix.pop()?;
-        return Some((prefix, Some(item)));
+        return Some((prefix, Some(item), origin));
     }
 
     // 末尾の `self` (`use a::b::self;` = `use a::b::{self};`) は「その module 自身」の
@@ -431,7 +503,7 @@ pub(crate) fn resolve_use_path_node(
 
     let leaf = names.pop();
     prefix.extend(names);
-    Some((prefix, leaf))
+    Some((prefix, leaf, origin))
 }
 
 #[cfg(test)]
@@ -440,11 +512,14 @@ mod tests {
     use crate::engine::parser;
     use crate::language::LangId;
 
-    /// 修正前の再帰版 (浅い入力で反復版と比べるためだけに残す)。
+    /// 修正前の再帰版 (浅い入力で反復版と比べるためだけに残す)。path の起点と、prefix の無い
+    /// group の要素へ current_module を渡す扱いは、反復版と同じ変更を入れてある。
+    #[allow(clippy::too_many_arguments)]
     fn expand_recursive(
         node: tree_sitter::Node<'_>,
         source: &[u8],
         path_prefix: &[String],
+        prefix_origin: Option<UsePathOrigin>,
         current_module: &[String],
         source_module: &[String],
         alias_override: Option<&str>,
@@ -465,20 +540,39 @@ mod tests {
                     }
                 }
                 let list = list_node?;
-                let resolved_prefix = match path_node {
+                let (resolved_prefix, origin) = match path_node {
                     Some(pn) => {
-                        let (mut prefix, leaf) =
+                        let (mut prefix, leaf, own_origin) =
                             resolve_use_path_node(pn, source, path_prefix, current_module)?;
                         if let Some(name) = leaf {
                             prefix.push(name);
                         }
-                        prefix
+                        (prefix, prefix_origin.unwrap_or(own_origin))
                     }
-                    None => path_prefix.to_vec(),
+                    None => (
+                        path_prefix.to_vec(),
+                        prefix_origin.unwrap_or(UsePathOrigin::Global),
+                    ),
                 };
-                expand_list_recursive(list, source, &resolved_prefix, source_module, out)?;
+                expand_list_recursive(
+                    list,
+                    source,
+                    &resolved_prefix,
+                    Some(origin),
+                    &[],
+                    source_module,
+                    out,
+                )?;
             }
-            "use_list" => expand_list_recursive(node, source, path_prefix, source_module, out)?,
+            "use_list" => expand_list_recursive(
+                node,
+                source,
+                path_prefix,
+                prefix_origin,
+                current_module,
+                source_module,
+                out,
+            )?,
             "use_as_clause" => {
                 let mut cursor = node.walk();
                 let named: Vec<_> = node.named_children(&mut cursor).collect();
@@ -493,6 +587,7 @@ mod tests {
                     named[0],
                     source,
                     path_prefix,
+                    prefix_origin,
                     current_module,
                     source_module,
                     Some(alias_text),
@@ -502,7 +597,7 @@ mod tests {
             "use_wildcard" => {
                 let mut cursor = node.walk();
                 if let Some(path_node) = node.named_children(&mut cursor).next() {
-                    let (mut target_module, leaf_name) =
+                    let (mut target_module, leaf_name, own_origin) =
                         resolve_use_path_node(path_node, source, path_prefix, current_module)?;
                     if let Some(name) = leaf_name {
                         target_module.push(name);
@@ -511,12 +606,13 @@ mod tests {
                         out.push(RustPubUseEdge::Wildcard {
                             source_module: source_module.to_vec(),
                             target_module,
+                            origin: prefix_origin.unwrap_or(own_origin),
                         });
                     }
                 }
             }
             "scoped_identifier" | "identifier" | "crate" | "self" | "super" => {
-                let (resolved_prefix, leaf_name) =
+                let (resolved_prefix, leaf_name, own_origin) =
                     resolve_use_path_node(node, source, path_prefix, current_module)?;
                 if let Some(item) = leaf_name {
                     out.push(RustPubUseEdge::Named {
@@ -526,6 +622,7 @@ mod tests {
                             .unwrap_or_else(|| item.clone()),
                         target_module: resolved_prefix,
                         target_item: item,
+                        origin: prefix_origin.unwrap_or(own_origin),
                     });
                 }
             }
@@ -537,6 +634,7 @@ mod tests {
                             child,
                             source,
                             path_prefix,
+                            prefix_origin,
                             current_module,
                             source_module,
                             alias_override,
@@ -553,13 +651,24 @@ mod tests {
         list: tree_sitter::Node<'_>,
         source: &[u8],
         path_prefix: &[String],
+        prefix_origin: Option<UsePathOrigin>,
+        current_module: &[String],
         source_module: &[String],
         out: &mut Vec<RustPubUseEdge>,
     ) -> Option<()> {
         let mut cursor = list.walk();
         for child in list.children(&mut cursor) {
             if child.is_named() {
-                expand_recursive(child, source, path_prefix, &[], source_module, None, out)?;
+                expand_recursive(
+                    child,
+                    source,
+                    path_prefix,
+                    prefix_origin,
+                    current_module,
+                    source_module,
+                    None,
+                    out,
+                )?;
             }
         }
         Some(())
@@ -581,7 +690,10 @@ mod tests {
                 let mut cursor = node.walk();
                 let named: Vec<_> = node.named_children(&mut cursor).collect();
                 return match named.as_slice() {
-                    [only] => flatten_recursive(*only, source, out),
+                    [only] => {
+                        out.push(UsePathSegment::Global);
+                        flatten_recursive(*only, source, out)
+                    }
                     [path_node, name_node] => {
                         flatten_recursive(*path_node, source, out)?;
                         flatten_recursive(*name_node, source, out)
@@ -624,7 +736,7 @@ mod tests {
     /// 後の子で成功する、すべて失敗する) も通す。
     #[test]
     fn iterative_use_tree_walk_matches_recursive_version() {
-        let source = b"pub use crate::a::b;\npub use self::c as d;\npub use super::super::e::{self, f as _, g::{h, i::*}};\npub use j::{k::{l, m}, n as o, self};\npub use crate::self;\npub use ::std::fmt;\npub use a::b::c::{self};\npub use super::{x, y::z};\npub use super::super::super::too::far;\npub use a::super::b;\npub use {p, q::r};\npub use crate::*;\nfn t() { let _ = [1, a]; let _ = (1, 2); let _ = a::b::c; }\n";
+        let source = b"pub use crate::a::b;\npub use self::c as d;\npub use super::super::e::{self, f as _, g::{h, i::*}};\npub use j::{k::{l, m}, n as o, self};\npub use crate::self;\npub use ::std::fmt;\npub use a::b::c::{self};\npub use super::{x, y::z};\npub use super::super::super::too::far;\npub use a::super::b;\npub use {p, q::r};\npub use crate::*;\npub use ::{s, t::u};\npub use {self::v::w, super::x2, crate::y2::{z2}, a2::b2, ::c2::*};\npub use crate::{d2::e2, self};\npub use f2::{{g2, h2::i2}, self as j2};\nfn t() { let _ = [1, a]; let _ = (1, 2); let _ = a::b::c; }\n";
         let tree = parser::parse_source(source, LangId::Rust).unwrap();
         let mut checked_edges = 0;
         for node in all_nodes(tree.root_node()) {
@@ -666,6 +778,7 @@ mod tests {
                         argument,
                         source,
                         &prefix,
+                        None,
                         &current,
                         &module(&["src"]),
                         alias,
@@ -682,5 +795,110 @@ mod tests {
             }
         }
         assert!(checked_edges > 20, "edge を出す入力を含む: {checked_edges}");
+    }
+
+    /// edge の起点は書かれた path の先頭から決まり、group の要素は group の path の起点を
+    /// 引き継ぐ。prefix が空かどうかでは決めない (`crate::{..}` は prefix が空でも Anchored)。
+    /// prefix の無い group の要素は字句的な module で解決する (`{self::x}` は現在の module)。
+    #[test]
+    fn edge_origin_follows_the_written_path_not_the_resolved_prefix() {
+        use UsePathOrigin::{Anchored, Bare, Global};
+        let module =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|name| name.to_string()).collect() };
+        let current = module(&["reader"]);
+        for (src, want) in [
+            (
+                "pub use value::NewValue;",
+                vec![(vec!["value"], Some("NewValue"), Bare)],
+            ),
+            (
+                "pub use self::value::NewValue;",
+                vec![(vec!["reader", "value"], Some("NewValue"), Anchored)],
+            ),
+            (
+                "pub use crate::{value::X};",
+                vec![(vec!["value"], Some("X"), Anchored)],
+            ),
+            (
+                "pub use {value::X};",
+                vec![(vec!["value"], Some("X"), Bare)],
+            ),
+            (
+                "pub use {self::value::X};",
+                vec![(vec!["reader", "value"], Some("X"), Anchored)],
+            ),
+            ("pub use {super::x};", vec![(vec![], Some("x"), Anchored)]),
+            (
+                "pub use value::{self, X};",
+                vec![
+                    (vec![], Some("value"), Bare),
+                    (vec!["value"], Some("X"), Bare),
+                ],
+            ),
+            (
+                "pub use value::X as Y;",
+                vec![(vec!["value"], Some("X"), Bare)],
+            ),
+            ("pub use value::*;", vec![(vec!["value"], None, Bare)]),
+            (
+                "pub use self::value::*;",
+                vec![(vec!["reader", "value"], None, Anchored)],
+            ),
+            (
+                "pub use ::value::X;",
+                vec![(vec!["value"], Some("X"), Global)],
+            ),
+            (
+                "pub use ::{a, b::c};",
+                vec![(vec![], Some("a"), Global), (vec!["b"], Some("c"), Global)],
+            ),
+            (
+                "pub use {a::b, crate::c::d, ::e::f};",
+                vec![
+                    (vec!["a"], Some("b"), Bare),
+                    (vec!["c"], Some("d"), Anchored),
+                    (vec!["e"], Some("f"), Global),
+                ],
+            ),
+        ] {
+            let tree = parser::parse_source(src.as_bytes(), LangId::Rust).unwrap();
+            let argument = tree
+                .root_node()
+                .named_child(0)
+                .and_then(|decl| decl.child_by_field_name("argument"))
+                .unwrap();
+            let mut edges = Vec::new();
+            expand_rust_use_tree_edges_ast(
+                argument,
+                src.as_bytes(),
+                &[],
+                &current,
+                &current,
+                None,
+                &mut edges,
+            )
+            .unwrap();
+            let got: Vec<_> = edges
+                .iter()
+                .map(|edge| match edge {
+                    RustPubUseEdge::Named {
+                        target_module,
+                        target_item,
+                        origin,
+                        ..
+                    } => (target_module.clone(), Some(target_item.clone()), *origin),
+                    RustPubUseEdge::Wildcard {
+                        target_module,
+                        origin,
+                        ..
+                    } => (target_module.clone(), None, *origin),
+                })
+                .collect();
+            let want: Vec<_> = want
+                .into_iter()
+                .map(|(target, item, origin)| (module(&target), item.map(str::to_string), origin))
+                .collect();
+            assert_eq!(got, want, "{src}");
+        }
     }
 }

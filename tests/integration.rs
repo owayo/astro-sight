@@ -69,6 +69,7 @@ mod integration {
     mod rust_format_captures;
     mod rust_parameter_patterns;
     mod rust_reference_sites;
+    mod rust_relative_reexport;
     mod rust_unicode_escapes;
     mod sandbox;
     mod session;
