@@ -883,7 +883,10 @@ struct RefFileEvidence<'a> {
     /// `None` は証明できないことを表し、`Some(false)` とは区別する。
     rust_private_scope: HashMap<usize, Option<bool>>,
     rust_private_widening_child: HashMap<usize, bool>,
-    rust_explicit_widening_scope: HashMap<(usize, usize), bool>,
+    /// 変更元 × シンボルごとの、可視性だけの拡大から見た参照ファイルの位置。
+    /// `None` は証明できないことを表す。
+    rust_explicit_widening_scope:
+        HashMap<(usize, usize), Option<super::rust_visibility_scope::WideningScope>>,
     rust_private_import_owners: HashMap<(usize, usize), bool>,
     rust_ref_source: std::cell::OnceCell<Option<Vec<u8>>>,
 }
@@ -1173,21 +1176,35 @@ impl<'a> ImpactCollector<'a> {
         } else {
             false
         };
-        let explicit_visibility_informational = ctx.lang_id == LangId::Rust
+        // private から pub(crate) / pub への拡大の証明 (`visibility_only_widening`) が条件と
+        // ゲートをすべて満たすときは、その結果だけを使う。満たさないときに、可視性だけの
+        // 拡大の証明で参照ファイルの位置を分類する。
+        let explicit_scope = if ctx.lang_id == LangId::Rust
             && !filter_disabled
+            && !visibility_only_widening
             && !filters::is_same_source_file(self.path_str, source_path)
-            && ctx.rust_explicit_widenings.get(name).is_some_and(|proof| {
+        {
+            ctx.rust_explicit_widenings.get(name).and_then(|proof| {
                 *evidence
                     .rust_explicit_widening_scope
                     .entry((fc_ix, sym_ix_usize))
                     .or_insert_with(|| {
-                        self.rust_path_owner_project.explicit_widening_contains(
+                        self.rust_path_owner_project.explicit_widening_scope(
                             source_path,
                             self.path_str,
                             proof,
                         )
                     })
-            });
+            })
+        } else {
+            None
+        };
+        // 新しい範囲の外の参照は、変更の前も後もこの宣言を指せない。
+        if explicit_scope == Some(super::rust_visibility_scope::WideningScope::OutsideNew) {
+            return None;
+        }
+        let explicit_visibility_informational =
+            explicit_scope == Some(super::rust_visibility_scope::WideningScope::InsideOld);
         let parent_glob_visibility_informational = ctx.lang_id == LangId::Rust
             && !filter_disabled
             && ctx.rust_private_widening_names.contains(name)

@@ -431,3 +431,417 @@ fn rust_visibility_widening_does_not_hide_other_changes_or_ambiguous_layouts() {
         );
     }
 }
+
+/// Issue #206 の変更前。`crate::numeric::ascii` の直下の private 宣言。
+const NUMERIC_ASCII: &str = "struct Number;\nfn parse(_: &str) -> Number { Number }\nfn readings(_: &str, _: Number) -> usize { 1 }\n";
+
+/// Issue #206 の変更後。3 つの宣言の可視性だけを `pub(super)` に広げる。
+const NUMERIC_ASCII_SUPER: &str = "pub(super) struct Number;\npub(super) fn parse(_: &str) -> Number { Number }\npub(super) fn readings(_: &str, _: Number) -> usize { 1 }\n";
+
+/// `numeric::ascii::parse` を指さない同名の参照 (Issue #206 の `src/unrelated.rs`)。
+const UNRELATED_CALLERS: &str = "pub struct Catalog;\nimpl Catalog { pub fn parse(_: &str) -> usize { 2 } }\npub fn run() -> usize {\n    let readings = vec![1usize];\n    let local = readings.iter().map(|readings| readings + 1).sum::<usize>();\n    local + Catalog::parse(\"x\") + \"2\".parse::<usize>().unwrap()\n}\n";
+
+const UNRELATED: &str = "src/unrelated.rs";
+
+/// 旧 private 範囲 (`crate::numeric::ascii` の部分木) の子モジュールから parse を呼ぶ。
+const CHILD_CALLER: &str =
+    "pub fn call() -> usize {\n    let _value = super::parse(\"x\");\n    1\n}\n";
+
+/// Issue #206 の配置を `files` で差し替えて (足して) コミットし、`src/numeric/ascii.rs` を
+/// `after` に書き換える。
+fn numeric_fixture(files: &[(&str, &str)], after: &str) -> TestRepo {
+    let repo = TestRepo::new();
+    let defaults = [
+        (
+            "Cargo.toml",
+            "[package]\nname = \"impact_repro\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        ),
+        ("src/lib.rs", "mod numeric;\nmod unrelated;\n"),
+        ("src/numeric/mod.rs", "mod ascii;\n"),
+        ("src/numeric/ascii.rs", NUMERIC_ASCII),
+        (UNRELATED, UNRELATED_CALLERS),
+    ];
+    for (path, content) in defaults.iter().chain(files) {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            repo.create_dir_all(parent);
+        }
+        repo.write(path, content);
+    }
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("src/numeric/ascii.rs", after);
+    repo
+}
+
+/// `impact` / `review` を Stop hook と同じ `--hook` 付きで起動する。
+fn run_hook(repo: &TestRepo, command: &str, args: &[&str]) -> std::process::Output {
+    cargo_bin()
+        .arg(command)
+        .arg("--dir")
+        .arg(repo.root())
+        .args(args)
+        .arg("--hook")
+        .output()
+        .unwrap()
+}
+
+/// `caller` を含む振り分け先 (impacted / low_confidence / informational) の一覧。
+fn caller_buckets(context: &serde_json::Value, caller: &str) -> Vec<&'static str> {
+    [
+        "impacted_callers",
+        "low_confidence_callers",
+        "informational_callers",
+    ]
+    .into_iter()
+    .filter(|bucket| has_caller(context, bucket, caller))
+    .collect()
+}
+
+#[test]
+fn rust_visibility_widening_to_restricted_scope_ignores_callers_outside_it() {
+    // Issue #206: private な直下宣言を pub(super) / pub(in ...) に広げても、新しい可視範囲
+    // (`crate::numeric` の部分木) の外の同名参照は、変更の前も後もその宣言を指せない。
+    // 参照の形 (局所型・import した型の関連関数、別モジュールの修飾パス) とマクロの有無に
+    // よらず、どの振り分け先にも出さず、Stop hook も止めない。
+    let parse_only = NUMERIC_ASCII.replacen("fn parse", "pub(super) fn parse", 1);
+    let restricted_path = NUMERIC_ASCII_SUPER.replace("pub(super)", "pub(in crate::numeric)");
+    let imported_type: &[(&str, &str)] = &[
+        ("src/lib.rs", "mod catalog;\nmod numeric;\nmod unrelated;\n"),
+        (
+            "src/catalog.rs",
+            "pub struct Catalog;\nimpl Catalog { pub fn parse(_: &str) -> usize { 2 } }\n",
+        ),
+        (
+            UNRELATED,
+            "use crate::catalog::Catalog;\npub fn run() -> usize {\n    Catalog::parse(\"x\")\n}\n",
+        ),
+    ];
+    let qualified_with_macro: &[(&str, &str)] = &[
+        ("src/lib.rs", "mod numeric;\nmod other;\nmod unrelated;\n"),
+        ("src/other.rs", "pub fn parse(_: &str) -> usize { 2 }\n"),
+        (
+            UNRELATED,
+            "pub fn run() -> usize {\n    let values = vec![1usize];\n    values.len() + crate::other::parse(\"x\")\n}\n",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (case, files, after) in [
+        ("issue", &[][..], NUMERIC_ASCII_SUPER),
+        ("parse-only", &[][..], parse_only.as_str()),
+        ("restricted-path", &[][..], restricted_path.as_str()),
+        ("imported-type", imported_type, NUMERIC_ASCII_SUPER),
+        (
+            "qualified-with-macro",
+            qualified_with_macro,
+            NUMERIC_ASCII_SUPER,
+        ),
+    ] {
+        let repo = numeric_fixture(files, after);
+        let context = repo.run_json("context", &["--git"]);
+        let buckets = caller_buckets(&context, UNRELATED);
+        if !buckets.is_empty() {
+            failures.push(format!("{case}: {UNRELATED} in {buckets:?}: {context}"));
+        }
+        for command in ["impact", "review"] {
+            let output = run_hook(&repo, command, &["--git"]);
+            if !output.status.success() {
+                failures.push(format!(
+                    "{case}: {command} exited with {:?}: {}{}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn rust_visibility_widening_to_restricted_scope_keeps_old_scope_child_informational() {
+    // 旧 private 範囲 (`crate::numeric::ascii` の部分木) の子モジュールは、変更前から parse を
+    // 呼べる。範囲外の参照を除いても、この呼び出しは除外しない。可視性の拡大では壊れないので
+    // 情報提供に分ける。
+    let child = "src/numeric/ascii/child.rs";
+    let before = format!("mod child;\n{NUMERIC_ASCII}");
+    let after = format!("mod child;\n{NUMERIC_ASCII_SUPER}");
+    let repo = numeric_fixture(
+        &[
+            ("src/numeric/ascii.rs", before.as_str()),
+            (child, CHILD_CALLER),
+        ],
+        &after,
+    );
+    let context = repo.run_json("context", &["--git"]);
+    assert_eq!(
+        caller_buckets(&context, child),
+        ["informational_callers"],
+        "{context}"
+    );
+    assert!(caller_buckets(&context, UNRELATED).is_empty(), "{context}");
+    for command in ["impact", "review"] {
+        let output = run_hook(&repo, command, &["--git"]);
+        assert!(output.status.success(), "{command}: {output:?}");
+    }
+}
+
+#[test]
+fn rust_visibility_widening_to_restricted_scope_keeps_uncertain_callers_blocking() {
+    let sibling = "src/numeric/sibling.rs";
+    let sibling_mod = ("src/numeric/mod.rs", "mod ascii;\nmod sibling;\n");
+    let parameter = NUMERIC_ASCII_SUPER.replace("fn parse(_: &str)", "fn parse(_: &str, _: bool)");
+    let body = NUMERIC_ASCII_SUPER.replace("-> usize { 1 }", "-> usize { 2 }");
+    let added_use = format!("use std::fmt::Debug;\n{NUMERIC_ASCII_SUPER}");
+    let added_mod = format!("mod extra {{}}\n{NUMERIC_ASCII_SUPER}");
+    let equivalent = NUMERIC_ASCII.replacen("fn parse", "pub(self) fn parse", 1);
+    let same_name_before = format!("struct parse {{}}\n{NUMERIC_ASCII}");
+    let same_name_after = format!("pub(super) struct parse {{}}\n{NUMERIC_ASCII_SUPER}");
+    for case in [
+        "sibling",
+        "parent-globs",
+        "parameter",
+        "body",
+        "use",
+        "mod",
+        "shrink",
+        "equivalent",
+        "same-name",
+        "both-roots",
+        "staged",
+    ] {
+        let (files, after, caller): (Vec<(&str, &str)>, &str, &str) = match case {
+            // 新しい範囲の中で旧範囲の外: 変更前の参照ではないと証明していないので残す。
+            "sibling" => (
+                vec![
+                    sibling_mod,
+                    (
+                        sibling,
+                        "pub struct Catalog;\nimpl Catalog { pub fn parse(_: &str) -> usize { 2 } }\npub fn run() -> usize {\n    let values = vec![1usize];\n    values.len() + Catalog::parse(\"x\")\n}\n",
+                    ),
+                ],
+                NUMERIC_ASCII_SUPER,
+                sibling,
+            ),
+            // 新しい範囲の中の glob が parse を取り込むと、範囲外の `crate::numeric::parse` が
+            // 曖昧になり rustc は E0659 で止まる (本物の影響)。
+            "parent-globs" => (
+                vec![
+                    (
+                        "src/numeric/mod.rs",
+                        "mod ascii;\nmod other;\npub use ascii::*;\npub use other::*;\n",
+                    ),
+                    (
+                        "src/numeric/other.rs",
+                        "pub fn parse(_: &str) -> usize { 2 }\n",
+                    ),
+                    (
+                        UNRELATED,
+                        "pub fn run() -> usize {\n    crate::numeric::parse(\"x\")\n}\n",
+                    ),
+                ],
+                NUMERIC_ASCII_SUPER,
+                UNRELATED,
+            ),
+            // 可視性以外の変更が混ざると、可視性だけの変更とは証明できない。
+            "parameter" => (Vec::new(), parameter.as_str(), UNRELATED),
+            "body" => (Vec::new(), body.as_str(), UNRELATED),
+            "use" => (Vec::new(), added_use.as_str(), UNRELATED),
+            "mod" => (Vec::new(), added_mod.as_str(), UNRELATED),
+            // 縮小は旧範囲の中の呼び出しを壊す。
+            "shrink" => (
+                vec![
+                    sibling_mod,
+                    ("src/numeric/ascii.rs", NUMERIC_ASCII_SUPER),
+                    (
+                        sibling,
+                        "pub fn call() -> usize {\n    let _value = super::ascii::parse(\"x\");\n    1\n}\n",
+                    ),
+                ],
+                NUMERIC_ASCII,
+                sibling,
+            ),
+            // 同じ範囲への書き換えは拡大ではない。
+            "equivalent" => (Vec::new(), equivalent.as_str(), UNRELATED),
+            // 型と値の両方の名前空間で同名の宣言を編集すると、どちらの範囲かを決められない。
+            "same-name" => (
+                vec![("src/numeric/ascii.rs", same_name_before.as_str())],
+                same_name_after.as_str(),
+                UNRELATED,
+            ),
+            // 同じソースが lib と bin の 2 つの crate に入ると、所属のモジュールが一意でない。
+            "both-roots" => (
+                vec![("src/main.rs", "mod numeric;\nfn main() {}\n")],
+                NUMERIC_ASCII_SUPER,
+                UNRELATED,
+            ),
+            "staged" => (Vec::new(), NUMERIC_ASCII_SUPER, UNRELATED),
+            _ => unreachable!(),
+        };
+        let repo = numeric_fixture(&files, after);
+        let args = if case == "staged" {
+            repo.stage_all();
+            vec!["--git", "--staged"]
+        } else {
+            vec!["--git"]
+        };
+        let context = repo.run_json("context", &args);
+        assert!(
+            has_caller(&context, "impacted_callers", caller),
+            "{case}: {context}"
+        );
+        let output = run_hook(&repo, "impact", &args);
+        assert_eq!(output.status.code(), Some(1), "{case}: {output:?}");
+    }
+}
+
+#[test]
+fn rust_visibility_widening_to_restricted_scope_keeps_refs_and_dead_code() {
+    // impact で除く参照も、refs の出現と dead-code の判定からは消さない。
+    let repo = numeric_fixture(&[], NUMERIC_ASCII_SUPER);
+    let refs = |repo: &TestRepo| {
+        repo.run_json("refs", &["--name", "parse"])["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["kind"] == "ref")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let new_refs = refs(&repo);
+    let new_dead = repo.run_json("dead-code", &[]);
+    assert_eq!(
+        new_refs
+            .iter()
+            .filter(|row| row["path"] == UNRELATED)
+            .count(),
+        2,
+        "{new_refs:?}"
+    );
+    repo.write("src/numeric/ascii.rs", NUMERIC_ASCII);
+    assert_eq!(refs(&repo), new_refs);
+    assert_eq!(repo.run_json("dead-code", &[]), new_dead);
+}
+
+#[test]
+fn rust_private_visibility_widening_to_crate_keeps_excluding_outside_callers() {
+    // private な宣言 1 つに pub(crate) を付けただけの変更は、従来の証明のまま扱う。旧 private
+    // 範囲の子モジュールは情報提供、旧範囲の外の未変更の同名参照 (兄弟モジュールと別の
+    // モジュール) は旧宣言を指せなかったので除外する。
+    let child = "src/numeric/ascii/child.rs";
+    let sibling = "src/numeric/sibling.rs";
+    let before = format!("mod child;\n{NUMERIC_ASCII}");
+    let after = format!(
+        "mod child;\n{}",
+        NUMERIC_ASCII.replacen("fn parse", "pub(crate) fn parse", 1)
+    );
+    let repo = numeric_fixture(
+        &[
+            ("src/numeric/mod.rs", "mod ascii;\nmod sibling;\n"),
+            ("src/numeric/ascii.rs", before.as_str()),
+            (child, CHILD_CALLER),
+            (
+                sibling,
+                "pub struct Catalog;\nimpl Catalog { pub fn parse(_: &str) -> usize { 2 } }\npub fn run() -> usize {\n    let values = vec![1usize];\n    values.len() + Catalog::parse(\"x\")\n}\n",
+            ),
+        ],
+        &after,
+    );
+    let context = repo.run_json("context", &["--git"]);
+    assert_eq!(
+        caller_buckets(&context, child),
+        ["informational_callers"],
+        "{context}"
+    );
+    for caller in [sibling, UNRELATED] {
+        assert!(
+            caller_buckets(&context, caller).is_empty(),
+            "{caller}: {context}"
+        );
+    }
+    for command in ["impact", "review"] {
+        let output = run_hook(&repo, command, &["--git"]);
+        assert!(output.status.success(), "{command}: {output:?}");
+    }
+}
+
+#[test]
+fn rust_visibility_widening_to_restricted_scope_keeps_unproven_sources_blocking() {
+    // ソースを別のモジュールへ展開し得る構文 (独自の属性マクロ、#[path]、include!、item 位置の
+    // マクロ) があると、参照ファイルの所属を証明できないので範囲外とみなさない。
+    let attribute =
+        UNRELATED_CALLERS.replacen("pub fn run", "#[tracing::instrument]\npub fn run", 1);
+    let item_macro = format!("{UNRELATED_CALLERS}make_items!();\n");
+    for (case, files) in [
+        ("attribute", vec![(UNRELATED, attribute.as_str())]),
+        (
+            "path",
+            vec![(
+                "src/numeric/mod.rs",
+                "mod ascii;\n#[path = \"../unrelated.rs\"]\nmod alias;\n",
+            )],
+        ),
+        (
+            "include",
+            vec![(
+                "src/numeric/mod.rs",
+                "mod ascii;\ninclude!(\"../unrelated.rs\");\n",
+            )],
+        ),
+        ("item-macro", vec![(UNRELATED, item_macro.as_str())]),
+    ] {
+        let repo = numeric_fixture(&files, NUMERIC_ASCII_SUPER);
+        let context = repo.run_json("context", &["--git"]);
+        assert!(
+            has_caller(&context, "impacted_callers", UNRELATED),
+            "{case}: {context}"
+        );
+        let output = run_hook(&repo, "impact", &["--git"]);
+        assert_eq!(output.status.code(), Some(1), "{case}: {output:?}");
+    }
+}
+
+#[test]
+fn rust_visibility_widening_to_restricted_scope_is_off_without_the_confidence_filter() {
+    // `ASTRO_SIGHT_NO_CONFIDENCE_FILTER=1` は、可視性の拡大の証明による除外と情報提供への
+    // 振り分けも止める。新しい範囲の外の参照も、旧範囲の子モジュールの参照も impacted に残す。
+    let child = "src/numeric/ascii/child.rs";
+    let before = format!("mod child;\n{NUMERIC_ASCII}");
+    let after = format!("mod child;\n{NUMERIC_ASCII_SUPER}");
+    let repo = numeric_fixture(
+        &[
+            ("src/numeric/ascii.rs", before.as_str()),
+            (child, CHILD_CALLER),
+        ],
+        &after,
+    );
+    // 対照: フィルタがあれば、子モジュールは情報提供、範囲外は除外。
+    let context = repo.run_json("context", &["--git"]);
+    assert_eq!(
+        caller_buckets(&context, child),
+        ["informational_callers"],
+        "{context}"
+    );
+    assert!(caller_buckets(&context, UNRELATED).is_empty(), "{context}");
+    let output = cargo_bin()
+        .args(["context", "--git", "--dir"])
+        .arg(repo.root())
+        .env("ASTRO_SIGHT_NO_CONFIDENCE_FILTER", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let context: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    for caller in [child, UNRELATED] {
+        assert_eq!(
+            caller_buckets(&context, caller),
+            ["impacted_callers"],
+            "{caller}: {context}"
+        );
+    }
+    let output = cargo_bin()
+        .args(["impact", "--git", "--hook", "--dir"])
+        .arg(repo.root())
+        .env("ASTRO_SIGHT_NO_CONFIDENCE_FILTER", "1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+}
