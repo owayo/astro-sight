@@ -320,28 +320,24 @@ impl RustPathOwnerProjectProof {
             && declarations.next().is_none()
     }
 
-    /// 旧境界内と確定した参照だけを認める。範囲外や不明の参照は除外しない。
-    pub(super) fn explicit_widening_contains(
+    /// 可視性だけの拡大で、参照ファイルが宣言の旧範囲・新しい範囲のどこに入るか。
+    /// ゲートが閉じている、宣言と参照の所属のモジュールを証明できない、別の crate に属する、
+    /// ファイル内の書き換えが拡大でない場合は `None` (この証明では判定を変えない)。
+    pub(super) fn explicit_widening_scope(
         &self,
         source_path: &str,
         ref_path: &str,
         proof: &super::rust_visibility_scope::ExplicitWidening,
-    ) -> bool {
+    ) -> Option<super::rust_visibility_scope::WideningScope> {
         if !self.allows_private_widening_paths() {
-            return false;
+            return None;
         }
-        let Some(source) = self.visibility_module(Path::new(source_path)) else {
-            return false;
-        };
-        let Some(reference) = self.visibility_module(Path::new(ref_path)) else {
-            return false;
-        };
+        let source = self.visibility_module(Path::new(source_path))?;
+        let reference = self.visibility_module(Path::new(ref_path))?;
         if source.crate_root != reference.crate_root {
-            return false;
+            return None;
         }
-        proof
-            .old_boundary(&source.modules)
-            .is_some_and(|old| reference.modules.starts_with(&old))
+        proof.classify(&source.modules, &reference.modules)
     }
 
     fn visibility_module(&self, file: &Path) -> Option<VisibilityModule> {
@@ -2246,6 +2242,73 @@ mod tests {
         )
         .unwrap();
         assert!(!scan_safe_private_import_environment(root.path()));
+    }
+
+    /// 可視性だけの拡大の分類は、宣言と参照が同じ crate root の通常のモジュールに属すると
+    /// 証明できたときだけ行う。別の crate (bin) の参照と、所属を決められない参照 (tests/)
+    /// は分類しない (`None`)。
+    #[test]
+    fn explicit_widening_scope_needs_one_crate_and_a_proven_module() {
+        use super::super::rust_visibility_scope::{WideningScope, explicit_widenings};
+        let root = tempfile::tempdir().unwrap();
+        for directory in ["src/numeric", "tests"] {
+            std::fs::create_dir_all(root.path().join(directory)).unwrap();
+        }
+        for (path, content) in [
+            (
+                "Cargo.toml",
+                "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("src/lib.rs", "mod numeric;\nmod unrelated;\n"),
+            ("src/main.rs", "mod tool;\nfn main() {}\n"),
+            ("src/tool.rs", "pub fn run() {}\n"),
+            ("src/numeric/mod.rs", "mod ascii;\nmod sibling;\n"),
+            ("src/numeric/ascii.rs", "pub(super) fn parse() {}\n"),
+            ("src/numeric/sibling.rs", "pub fn run() {}\n"),
+            ("src/unrelated.rs", "pub fn run() {}\n"),
+            ("tests/flow.rs", "fn run() {}\n"),
+        ] {
+            std::fs::write(root.path().join(path), content).unwrap();
+        }
+        let new = "pub(super) fn parse() {}\n";
+        let patch = format!(
+            "--- a/src/numeric/ascii.rs\n+++ b/src/numeric/ascii.rs\n@@ -1 +1 @@\n-fn parse() {{}}\n+{new}"
+        );
+        let tree = parser::parse_source(new.as_bytes(), LangId::Rust).unwrap();
+        let changed = [crate::models::impact::AffectedSymbol {
+            name: "parse".into(),
+            kind: "function".into(),
+            change_type: "modified".into(),
+        }];
+        let proofs = explicit_widenings(
+            &patch,
+            "src/numeric/ascii.rs",
+            new.as_bytes(),
+            tree.root_node(),
+            &changed,
+        );
+        let scope = |project: &RustPathOwnerProjectProof, reference: &str| {
+            project.explicit_widening_scope("src/numeric/ascii.rs", reference, &proofs["parse"])
+        };
+        let project = RustPathOwnerProjectProof::new(root.path(), true, true, true, &[], "");
+        assert_eq!(
+            scope(&project, "src/unrelated.rs"),
+            Some(WideningScope::OutsideNew)
+        );
+        assert_eq!(
+            scope(&project, "src/numeric/sibling.rs"),
+            Some(WideningScope::NewlyVisible)
+        );
+        assert_eq!(scope(&project, "src/tool.rs"), None);
+        assert_eq!(scope(&project, "tests/flow.rs"), None);
+        // glob があると、範囲外の参照も新しい曖昧さで壊れ得るので分類しない。
+        std::fs::write(
+            root.path().join("src/numeric/sibling.rs"),
+            "use super::*;\npub fn run() {}\n",
+        )
+        .unwrap();
+        let project = RustPathOwnerProjectProof::new(root.path(), true, true, true, &[], "");
+        assert_eq!(scope(&project, "src/unrelated.rs"), None);
     }
 
     #[test]
