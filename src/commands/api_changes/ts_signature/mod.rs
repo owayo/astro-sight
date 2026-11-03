@@ -16,9 +16,14 @@ mod callback_contract;
 mod function_params;
 mod literal_union;
 mod object_members;
+mod outside;
 mod pattern_extension;
 mod react;
 mod removed_params;
+mod removed_props;
+mod repository_audit;
+mod source_scan;
+mod type_dependencies;
 pub(crate) mod type_members;
 
 use super::signature_tokens::{SigTokens, node_signature_tokens, signature_tokens_in_range};
@@ -34,7 +39,9 @@ pub(crate) use object_members::*;
 pub(crate) use react::*;
 pub(crate) use removed_params::{
     OptionalRemovalCache, detect_trailing_optional_params_removed_compatible_mod,
+    optional_removal_words,
 };
+pub(crate) use removed_props::detect_optional_object_props_removed_compatible_mod;
 pub(crate) use type_members::{
     classify_member_property_removal, classify_member_type_narrowing,
     classify_required_member_addition, detect_type_members_compatible_mod,

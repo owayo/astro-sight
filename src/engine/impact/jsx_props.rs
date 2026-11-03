@@ -5,25 +5,23 @@ use std::ops::ControlFlow;
 
 use tree_sitter::Node;
 
+use crate::engine::jsx::{ReturnCategory, has_jsx_pragma, inferred_returns};
 use crate::engine::tree_walk::{Children, Walk, walk_preorder};
-use crate::engine::{diff, jsx, parser, symbols};
+use crate::engine::{diff, parser, symbols};
 use crate::language::LangId;
 use crate::models::impact::AffectedSymbol;
 use crate::models::symbol::Symbol;
+
+// 呼び出し側の属性の読み取りは、API 差分の props 削除の証明と共有する。
+pub(super) use crate::engine::jsx::{JsxShape, caller_shape, parse_is_clean};
 
 pub(super) struct OptionalPropChange {
     changed: HashSet<String>,
 }
 
-pub(super) struct JsxShape {
-    supplied: HashSet<String>,
-    children: bool,
-}
-
 impl OptionalPropChange {
     pub(super) fn is_omitted_by(&self, shape: &JsxShape) -> bool {
-        self.changed.is_disjoint(&shape.supplied)
-            && !(self.changed.contains("children") && shape.children)
+        shape.omits(&self.changed)
     }
 }
 
@@ -175,100 +173,6 @@ fn plain_pattern(pattern: Node<'_>, source: &[u8]) -> bool {
 struct Prop {
     optional: bool,
     tokens: Vec<(String, String)>,
-}
-
-#[derive(Debug, PartialEq, Eq, Hash)]
-enum ReturnCategory {
-    Jsx,
-    String,
-    Number,
-    Boolean,
-    Null,
-}
-
-fn has_jsx_pragma(root: Node<'_>, source: &[u8]) -> bool {
-    walk_preorder(root, Children::Named, |node, _| {
-        if node.kind() == "comment"
-            && node
-                .utf8_text(source)
-                .is_ok_and(|text| text.contains("@jsx"))
-        {
-            return ControlFlow::Break(());
-        }
-        ControlFlow::Continue(Walk::Descend)
-    })
-    .is_break()
-}
-
-fn return_category(mut value: Node<'_>, source: &[u8]) -> Option<ReturnCategory> {
-    while value.kind() == "parenthesized_expression" {
-        let mut cursor = value.walk();
-        let mut children = value
-            .named_children(&mut cursor)
-            .filter(|child| !child.is_extra());
-        value = children.next()?;
-        if children.next().is_some() {
-            return None;
-        }
-    }
-    match value.kind() {
-        "jsx_element" | "jsx_self_closing_element" => Some(ReturnCategory::Jsx),
-        "string" => Some(ReturnCategory::String),
-        "number" if !value.utf8_text(source).ok()?.ends_with('n') => Some(ReturnCategory::Number),
-        "true" | "false" => Some(ReturnCategory::Boolean),
-        "null" => Some(ReturnCategory::Null),
-        _ => None,
-    }
-}
-
-fn inferred_returns(body: Node<'_>, source: &[u8]) -> Option<HashSet<ReturnCategory>> {
-    let mut cursor = body.walk();
-    if body
-        .named_children(&mut cursor)
-        .filter(|node| !node.is_extra())
-        .last()?
-        .kind()
-        != "return_statement"
-    {
-        return None;
-    }
-    let mut result = HashSet::new();
-    walk_preorder(body, Children::Named, |node, _| {
-        if matches!(
-            node.kind(),
-            "function_declaration"
-                | "generator_function_declaration"
-                | "function_expression"
-                | "generator_function"
-                | "arrow_function"
-                | "method_definition"
-                | "class_declaration"
-                | "abstract_class_declaration"
-                | "class"
-        ) {
-            return ControlFlow::Continue(Walk::Skip);
-        }
-        if node.kind() == "return_statement" {
-            let mut cursor = node.walk();
-            let mut values = node
-                .named_children(&mut cursor)
-                .filter(|child| !child.is_extra());
-            let Some(category) = values
-                .next()
-                .and_then(|value| return_category(value, source))
-            else {
-                return ControlFlow::Break(());
-            };
-            if values.next().is_some() {
-                return ControlFlow::Break(());
-            }
-            result.insert(category);
-            return ControlFlow::Continue(Walk::Skip);
-        }
-        ControlFlow::Continue(Walk::Descend)
-    })
-    .is_continue()
-    .then_some(result)
 }
 
 struct Contract {
@@ -463,58 +367,6 @@ pub(super) fn collect(
         }
     }
     result
-}
-
-/// AST の寿命を越えて保持するのは属性名と children の有無だけ。
-pub(super) fn parse_is_clean(mut node: Node<'_>) -> bool {
-    while let Some(parent) = node.parent() {
-        node = parent;
-    }
-    !node.has_error()
-}
-
-pub(super) fn caller_shape(node: Node<'_>, source: &[u8], parse_clean: bool) -> Option<JsxShape> {
-    if !parse_clean {
-        return None;
-    }
-    let open = jsx::jsx_name_opening_tag(node, source)?;
-    let tag = open.child_by_field_name("name")?;
-    if tag.kind() != "identifier" || open.child_by_field_name("type_arguments").is_some() {
-        return None;
-    }
-    name(tag, source)?;
-    let mut supplied = HashSet::new();
-    let mut cursor = open.walk();
-    for attribute in open
-        .named_children(&mut cursor)
-        .filter(|child| child.id() != tag.id() && !child.is_extra())
-    {
-        if attribute.kind() != "jsx_attribute" {
-            return None;
-        }
-        let key = attribute.named_child(0)?;
-        if key.kind() != "property_identifier" || !supplied.insert(name(key, source)?) {
-            return None;
-        }
-    }
-    let children = if open.kind() == "jsx_opening_element" {
-        let element = open.parent()?;
-        if element.kind() != "jsx_element" {
-            return None;
-        }
-        let close = element.child_by_field_name("close_tag")?;
-        let close_name = close.child_by_field_name("name")?;
-        if close.kind() != "jsx_closing_element"
-            || close_name.kind() != "identifier"
-            || close_name.utf8_text(source).ok()? != tag.utf8_text(source).ok()?
-        {
-            return None;
-        }
-        open.end_byte() < close.start_byte()
-    } else {
-        false
-    };
-    Some(JsxShape { supplied, children })
 }
 
 #[cfg(test)]
