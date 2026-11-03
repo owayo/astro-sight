@@ -282,6 +282,15 @@ pub(crate) fn detect_api_changes_with_renames(
     // 全 modified シンボル横断で共有する。per-symbol の git diff 起動 + tree-sitter parse を
     // unique file 単位に削減 (#perf N+1 改善)。
     let mut closure_caches = crate::commands::api_changes::ref_index::ApiClosureCaches::default();
+    // 省略可能引数・props の削除の証明が在庫の外のファイルを 1 回で読めるように、照合する語
+    // (変えた関数の名前と、変えた TS 系のファイルを指す名前) を先に渡す (Issue #208)。
+    closure_caches.optional_removal =
+        crate::commands::api_changes::ts_signature::OptionalRemovalCache::with_words(
+            crate::commands::api_changes::ts_signature::optional_removal_words(
+                &index_names,
+                diff_files,
+            ),
+        );
 
     let inputs = DetectionInputs {
         dir,
@@ -706,6 +715,7 @@ mod js_public_name;
 mod js_ref_sites;
 mod js_ts_call_arity;
 mod js_ts_shadow;
+mod jsonc;
 mod moved_members;
 mod moved_symbols;
 pub(crate) mod prepare;

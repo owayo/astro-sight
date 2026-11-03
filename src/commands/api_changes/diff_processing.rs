@@ -1130,9 +1130,14 @@ fn decide_signature_change(
     if let Some(decision) = python_contract_decision(&site, sources, internally_closed) {
         return decision;
     }
-    if let Some(compat) =
-        compatible_modification(ref_index, &site, sources, caches, public_name_differs)
-    {
+    if let Some(compat) = compatible_modification(
+        ref_index,
+        &site,
+        sources,
+        caches,
+        public_name_differs,
+        inputs.diff_files,
+    ) {
         return SignatureDecision::Compatible(compat);
     }
     closure_or_blocking_decision(
@@ -1223,6 +1228,7 @@ fn compatible_modification(
     sources: &mut SignatureSourceCache<'_>,
     caches: &mut ApiClosureCaches,
     public_name_differs: bool,
+    diff_files: &[crate::models::impact::DiffFile],
 ) -> Option<CompatibleApiModification> {
     if let Some(compat) =
         detect_fixed_callback_contract_compatible_mod(ref_index, site, sources, caches)
@@ -1253,6 +1259,20 @@ fn compatible_modification(
             site,
             sources,
             &mut caches.optional_removal,
+        )
+    {
+        return Some(compat);
+    }
+    // TS/TSX の関数コンポーネントの inline object 型の props から省略可能プロパティを消し、
+    // リポジトリ内のどの JSX 要素・直接呼び出しもそのキーを渡さないと証明できたものも、
+    // 呼び出し側の書き換えが要らないので compatible_modified とする (Issue #208)。
+    if !public_name_differs
+        && let Some(compat) = detect_optional_object_props_removed_compatible_mod(
+            ref_index,
+            site,
+            sources,
+            &mut caches.optional_removal,
+            diff_files,
         )
     {
         return Some(compat);

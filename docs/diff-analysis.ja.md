@@ -437,6 +437,7 @@ Rust の `pub const` / 非 `mut` の `pub static` は、同一パスの通常変
 - 未参照の object member の削除
 - TS/TSX のトップレベル関数の末尾への optional / default 引数の追加（`trailing_optional_params`）
 - TypeScript の inline object 引数型への optional プロパティ追加。他の枝が変わらない union の、一意な object 枝も含む（`optional_object_props`）
+- export した TS/TSX のトップレベル関数の、唯一の引数の inline object 型からの optional プロパティの削除。解析したリポジトリのどの JSX 要素・直接呼び出しも、削除したキーを渡さないことが条件（`optional_object_props_removed`）。リポジトリ内の証拠に基づく分類なので、リポジトリの外の利用者には破壊的な変更になり得る
 - Python のトップレベル関数 / モジュール直下のクラスメソッドの末尾への、kwonly+default 引数または positional default 引数の追加（`trailing_optional_params`）。デコレータの差分がある場合や同名関数が複数定義されている場合は、保守的に blocking を維持する
 - Rust の関数・inherent impl のメソッドへの `const` の追加（`rust_const_fn_added`）。const の文脈の外からの呼び出しは変わらないので、呼び出し元は `impact_info` に残す。違ってよいのは `const` だけで、ほかの宣言・属性・外側のモジュールや `impl` のヘッダ・ファイルの import と、宣言に現れる名前の同じファイルの宣言（型別名・`use` の別名・配列長の定数など。それらが使う名前もたどる）は変わらないことが条件。戻り値が `impl Trait` の関数は、隠れた型と外に漏れる auto trait が本体で決まるので、本体と、その本体が参照する同じファイルの宣言も変わらないことが条件。マクロの token tree は原文を保ち、空の impl を含む impl ヘッダと、入れ子の `impl`・マクロ呼び出しは囲む宣言と属性も含めて比べ、そこに現れる名前も依存先として調べる。参照先が旧新とも一意な関数なら、既存のヘッダ正規化の下で const を足しただけで本体のトークンが不変な変更も許す。関数自身の `const` だけは除くので、関数内の未変更の `assert!` は証明を妨げない。位置依存または未証明のマクロ呼び出しは、行と Unicode 文字の列も不変であることを求める。別名と入れ子のマクロトークンも保留する。単純な assert と、入れ子のマクロ・属性・呼び出しを含まない一意な先行 root マクロ定義だけは位置を問わないが、同一ファイル内のマクロ束縛が不明ならこの例外は使わない。ヘッダのマクロは未対応のまま保守的に残す。`const` を外す変更や、引数・戻り値・ジェネリクス・`unsafe`・`async`・`extern`・公開範囲の同時の変更は blocking を維持する。同じファイルに同名の宣言（別の `impl` のメソッド、`cfg` で分けた関数）があると呼び出し元を区別できないので、`impacts` は残る
 
@@ -453,6 +454,67 @@ Rust の root 自由関数・定数を移すのと同時に互換な宣言変更
 rest・computed key・入れ子・キーや束縛の重複・新しい別名は、この証明の対象外となる。旧型に既にあるキーの束縛追加も扱わない。新しい束縛名が後続引数の既定値や、プロパティ型・戻り値型の `typeof` などに現れる場合も blocking を維持する。direct eval、escape を含む識別子、未対応のメンバー形式は証明しない。型だけを変える従来の分類は維持する。
 
 新しい束縛は、関数本体直下の lexical 宣言・関数宣言と、同じ関数 scope の `var` 束縛に衝突してはならない。未知の宣言形式は blocking を維持する。本体内の通常の参照が持つ意味は、この互換性の証明では検証しない。
+
+`optional_object_props_removed` では、旧新の宣言を AST のトークンで比べる。inline object 型から消えてよいのは、通常の名前の optional な `property_signature` と、その分割代入の束縛だけである。残りのメンバー、残りの束縛（別名・既定値を含む）とその順序、引数の kind、ヘッダ、戻り値型は変えない。method・call・construct・index signature、union、引数全体の既定値、rest、2 個目の引数は blocking を維持する。
+
+残ったプロパティと戻り値型が参照する型は、同じファイルの型別名と interface をたどり、旧新で一致することを確かめる。ほかのファイルの型はたどらない。相対パスで import した型は証明しない。宣言のファイルにある別の export を経由して、変わった型が戻ってくることがあるためである。registry の依存から import した型と、リポジトリで宣言していない大域の型（lib や `@types` のもの）は、diff が宣言のファイル以外を 1 つも変えていないときだけ受け入れる。lock ファイルと `package.json` の変更も、ほかのファイルの変更に数える。import 文が変わらないことも条件。リポジトリのどこか（ignore したファイルを含む）で宣言した大域の型（`declare global` の中や、module でない TS ファイルのトップレベル）は証明しない。`typeof`・`infer`・mapped type と、class・enum・namespace への参照は証明しない。
+
+利用側では、リポジトリのソースを閉じた一覧として読み、名前の出現をすべて確かめる。出現は、宣言・通常の named import・削除したキーを渡さない利用のどれかに限る。利用として認めるのは、関数名を直接タグにした JSX 要素と、通常のキーと shorthand だけの object リテラル 1 個を渡す直接呼び出しである。JSX 要素の spread・名前空間付きの属性名・型引数・重複した属性は認めない。直接呼び出しは、明示の戻り値型が変わらないときだけ認める。`children` を消す場合は、開始と終了のタグの間に何か（空白を含む）がある要素も認めない。戻り値型の注釈が無い場合は、直接返す値の種類（JSX・文字列・数値・真偽値・null）が旧新で一致することを求める。
+
+JSX の名前空間を差し替えると、属性を書かない要素でも型検査の結果が変わり得る。そのため、次のどれかがあれば証明しない。
+
+- リポジトリのどれかの `tsconfig*.json` / `jsconfig*.json`、またはいちばん近い祖先の設定にある `jsxFactory`・`jsxFragmentFactory`・`react` 以外の `jsxImportSource`
+- 同じ設定の、`react` やその配下（`react/jsx-runtime` など）に当たり得る `paths` のキー（`*` を含む）と、ローカルの `react` がある `baseUrl`
+- tsconfig / jsconfig の `extends`・`references` が指す、パッケージの設定やディレクトリの外の設定と、読めない設定
+- リポジトリのどれかの TS / JS / `.d.ts` のファイルにある、`JSX` という名前を作る宣言・公開（`export { Types as JSX }`・`import JSX = ...`・`declare global` や module の augmentation の中の `namespace JSX` など）
+- 同じファイルの `@jsx`・`@jsxImportSource`・`@jsxFrag` などの pragma コメント（TypeScript は pragma の名前の大文字小文字を区別しない）
+- 同じファイルの `declare module "react"`・`"react/jsx-runtime"`・`"react/jsx-dev-runtime"` の augmentation
+- 同じファイルの `/// <reference no-default-lib="true" />`、取り込む先のファイルが無い `path`、registry の依存でない `types`
+
+reference directive は TypeScript と同じく読む。タグと属性の名前の大文字小文字を区別せず、`=` の前後の空白（タブを含む）と、どちらの引用符も認める。
+
+自動の runtime（`jsx: react-jsx` / `react-jsxdev`）の import はソースに現れない。そのため、`react` と `@types/react` が `npm:` の別名でない registry の依存であることも求める。次のどれかがあるときも証明しない。
+
+- registry でない `@types/*`
+- git・URL・ディレクトリの外のパスから中身を入れる依存
+- registry の依存でないパッケージを指す `compilerOptions.types`
+
+`@/*` のような React と無関係な `paths` と、`declare module "*.svg"` のようなワイルドカードの module は認める。ワイルドカードの module は、ファイルに解決できない指定子にだけ当たるので、どちらの一覧も止めない。
+
+省略可能な引数・props の削除の証明（`trailing_optional_params_removed` と `optional_object_props_removed`）は、利用の一覧と信頼の境界を共有する。利用の一覧は、`.gitignore`・global ignore・隠しファイルの除外に従う走査のソースを全部解析する。この走査にほかの言語のソースや、`.vue` のような解析できないソースがあれば、従来どおりどちらの証明もしない。走査から外れたファイル（ignore したファイルと隠しファイル。`node_modules` と `.git` の中は除く）は、次のように扱う。
+
+- TS / JS 系のファイル（`.ts`・`.tsx`・`.mts`・`.cts`・`.d.ts`・`.js`・`.jsx`・`.mjs`・`.cjs`）と、埋め込みのソース（`.vue`・`.svelte`・`.astro`・`.mdx`）だけを読む。ほかの言語のファイルは TypeScript の型検査に関わらないので読まない
+- 1 回の検出で 1 度だけ、変えた全ての関数の名前をまとめて照合しながら流して読む。名前が識別子の単語として現れれば、現れたものとする。名前のどれかの文字を表す Unicode の escape（`\uXXXX`・`\u{...}`）も数える
+- 名前が現れる TS / JS 系のファイルは一覧に加え、同じ規則で証明する。埋め込みのソースに現れるときは証明しない
+- TS 系のファイル（宣言ファイルを含む）は解析して、依存を集める。対象は `import`・`export … from`・`import()`（`typeof import("…")` のような型の位置を含む）・`require()`・`import x = require()`・`declare module`・`/// <reference path|types>` である。一覧と同じ規則（相対パス・ディレクトリの index・`paths` と `baseUrl`・リポジトリの package の名前と自己参照）で解き、宣言のファイルに解決するものか、解決できず registry の依存とも決められないもの（動的な指定子・`import.meta`・`require` の別名・解決先の無い `paths` など）があれば一覧に加える。相対の指定子は、TypeScript と同じく、ファイル（拡張子の補完と `.js` → `.ts` の読み替えを含む）をディレクトリより先に、実際のファイルで解く。package.json のあるディレクトリ（`types`・`typings`・`main`・`typesVersions`・`exports` でどのファイルも指せる）と、何も無いパスは、解決できないものとする。解析するディレクトリの外へ一度出て戻る相対パスは、最後に指す位置で決める。そのファイルを経由する運び出し（再 export・namespace import・値の別名）は一覧の規則で止まるので、推移的にはたどらない
+- 宣言でない TS 系のファイル（`.ts`・`.tsx`・`.mts`・`.cts`）では、宣言のファイルの名前（`panel.tsx` なら `panel`、`index.tsx` ならディレクトリの名前）も、現れたものとして数える。JS 系のファイルとビルド出力は関数名だけで選ぶので、ignore した JS（`checkJs` で型検査するもの）が関数名を書かずに namespace import を計算したキーで使うときは拾えない
+- 1 回の検出で、外のファイルを読む量は 1 GiB、解析する量は 64 MiB（1 ファイル 8 MiB）までとし、変えた全ての関数で共有する。ファイルの数には上限を掛けない。読めないファイルがあるときや、上限を超えるときは証明しない。一覧の上限（512 ファイル・8 MiB・100,000 AST ノード・深さ 128）は、一覧に入れたファイルにだけ掛ける
+
+registry から入れた依存のパッケージ（`node_modules` の中身）は、リポジトリのソースに依存せず、React が定める標準の JSX の契約を変えないものとして信頼する。どちらとも決められないものは、従来の判定を維持する。
+
+監査は、ignore に関係なく、`node_modules` と `.git` を除く全てのファイルを対象にする。対象はソース・`.d.ts`・`tsconfig*.json` / `jsconfig*.json`・`package.json` で、設定と `package.json` は全部読む。走査のソースは、解析した一覧で調べる。走査から外れたファイルは、同じ 1 回の読みで、依存を調べる TS 系のファイルと、印のある TS / JS 系のファイルだけを解析する。印は `JSX`・`declare`・`@jsx`・`<reference`（後の 2 つは大文字小文字を区別しない）と、ASCII の識別子の文字を表す Unicode の escape である。解析した量は、上の共有する上限に数える。大域の型は、大域の宣言を持ち得る外の TS のファイル（module でないものと `global` を含むもの）だけを読み直し、名前が現れるものを解析する。props の証明は、監査を確かめてから走査の外の利用を探す。権限が無くて開けないディレクトリは外す。同じ利用者が動かす型検査も、そのディレクトリを読めないためである。
+
+次のどれかがあるときは、監査を作らない。監査が無ければ props の証明はせず、末尾の引数の証明は、解決できない import を 1 つも受け入れない。
+
+- ディレクトリの symlink（Linux の `.venv` の `lib64 -> lib` も含む）と、名前から TS / JS 系のソース・埋め込みのソース・設定・`package.json` になり得る symlink（走査は symlink をたどらない）
+- ディレクトリの外か `node_modules` を取り込む、tsconfig / jsconfig の `files`・`include`・`typeRoots`（祖先の設定の既定の include を含む。`typeRoots` の `node_modules/@types` は除く）
+- ディレクトリの外か `node_modules` を取り込む `/// <reference path>` と、相対パスの `/// <reference types>`
+- 読めない設定と `package.json`、読めないか解釈できない `pnpm-workspace.yaml`・`.yarnrc.yml`、解析するディレクトリの外のワークスペースの定義
+- どの依存の指定も書き換えられる pnpmfile（`.pnpmfile.cjs`・`.pnpmfile.mjs`・`pnpmfile.js`、`pnpm-workspace.yaml` の `pnpmfile`、ディレクトリの中と祖先の `.npmrc` の `pnpmfile`・`global-pnpmfile`）と、読めない `.npmrc`
+- 相対の import と `paths` の解決先を変える、tsconfig / jsconfig の `moduleSuffixes`（`[""]` 以外）と、2 つ以上の項目がある `rootDirs`
+- 解釈できない overrides のキー。キーは npm・pnpm・yarn の文法で読み、キーに現れるパッケージ名をすべて数える（pnpm の親子の選択子 `親>子` と yarn のパスの区切りも含む）。`@`・空白・`|` の直後の `>` は、版の範囲（`bridge@>=1.0.0`）の一部とみなす
+- 読めない外のファイル、印で選んだ外のファイルの構文エラー、読む量と解析の上限の超過
+
+一覧の中で指定子を解決できない import は、通常の named import で、パッケージが registry の依存のときだけ受け入れる。named import の条件は、import する名前と束縛する名前が、どれも対象と違うことである。registry の依存と見なすのは、次のすべてを満たすパッケージである。
+
+- 同じ名前の `package.json` がリポジトリにも祖先にも無い（ワークスペースのパッケージや自己参照ではない）
+- `paths` のキーと `baseUrl` で、指定子の解決先を差し替えられない
+- ディレクトリの中と祖先のどの `package.json` も、`file:`・`link:`・`workspace:`・`portal:`・`patch:`・`catalog:`・パス・git や URL の指定で、依存（4 つの欄）・`overrides`・`resolutions`・`pnpm.overrides`・パッチに入れていない。npm の overrides の `$名前` は、直接の依存 `名前` の指定を参照するので、その指定で判定する。参照先の依存が無ければ、決められないものとして扱う
+- ディレクトリの中と祖先の `pnpm-workspace.yaml`（`overrides`・`packageExtensions`・`patchedDependencies`・`catalog`・`catalogs`）と `.yarnrc.yml`（`packageExtensions`）でも、registry でない指定で入れていない。pnpm の `catalog:` の参照はここで解き、解けない参照は決められないものとする
+
+いちばん近い `package.json` だけでなく、すべての `package.json` を調べる。巻き上げで、別のパッケージが入れた依存もどこからでも解決され得るためである。
+
+解析するディレクトリの外にワークスペースの定義（`pnpm-workspace.yaml`・`lerna.json`・祖先の `package.json` の `workspaces`）があるときは、決められないものとして扱う。default・namespace・`default as`・文字列の名前・対象と同じ名前の import、`export ... from`、`import()`、`require()` は、指定子を解決できなければ証明しない。副作用だけの import も証明を止める。
 
 `export const` のような値バインディングは宣言全体（初期化子を含む）を比較するが、**値そのものが関数の場合は本体を比較から外す**（`export function` の本体変更が api.mod にならないのと揃える）。本体を比較から外すのは、次の関数の本体に限る。
 

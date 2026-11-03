@@ -4,6 +4,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::path::Path;
 
 use super::*;
+use crate::commands::api_changes::jsonc::json_bytes;
 
 pub(super) const MAX_SOURCE: usize = 2 * 1024 * 1024;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -413,82 +414,12 @@ fn audit_ancestor_configs(logical: &Path, physical: &Path) -> Option<ConfigAudit
     Some(audit)
 }
 
-/// JSONC のコメントと末尾 comma だけを空白へ置き換え、文字列と escape は JSON に解釈させる。
+/// JSONC のコメントと末尾 comma だけを空白へ置き換え、文字列と escape は JSON に解釈させる
+/// (前処理は [`json_bytes`] を props 削除の JSX 設定の監査と共有する)。
 pub(super) struct JsonSummary {
     pub(super) strings: Vec<String>,
     keys: BTreeSet<String>,
     nodes: usize,
-}
-fn json_bytes(source: &str) -> Option<Vec<u8>> {
-    let mut bytes = source.as_bytes().to_vec();
-    let mut index = 0;
-    let mut quoted = false;
-    while index < bytes.len() {
-        if quoted {
-            if bytes[index] == b'\\' {
-                index += 2;
-                continue;
-            }
-            if bytes[index] == b'"' {
-                quoted = false;
-            }
-            index += 1;
-            continue;
-        }
-        if bytes[index] == b'"' {
-            quoted = true;
-            index += 1;
-            continue;
-        }
-        if bytes[index..].starts_with(b"//") {
-            while index < bytes.len() && !matches!(bytes[index], b'\n' | b'\r') {
-                bytes[index] = b' ';
-                index += 1;
-            }
-        } else if bytes[index..].starts_with(b"/*") {
-            bytes[index] = b' ';
-            bytes[index + 1] = b' ';
-            index += 2;
-            loop {
-                if index + 1 >= bytes.len() {
-                    return None;
-                }
-                if bytes[index..].starts_with(b"*/") {
-                    bytes[index] = b' ';
-                    bytes[index + 1] = b' ';
-                    index += 2;
-                    break;
-                }
-                bytes[index] = b' ';
-                index += 1;
-            }
-        } else {
-            index += 1;
-        }
-    }
-    let mut quoted = false;
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\\' if quoted => {
-                index += 2;
-                continue;
-            }
-            b'"' => quoted = !quoted,
-            b',' if !quoted => {
-                let next = bytes[index + 1..]
-                    .iter()
-                    .copied()
-                    .find(|byte| !byte.is_ascii_whitespace());
-                if matches!(next, Some(b'}' | b']')) {
-                    bytes[index] = b' ';
-                }
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    Some(bytes)
 }
 
 /// Value の map 化で重複 key 配下の値を落とさず、全 string/key を残す。

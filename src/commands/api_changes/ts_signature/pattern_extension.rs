@@ -93,14 +93,18 @@ pub(super) fn added_optional_keys<'new>(
     Some(types)
 }
 
-struct Entry<'tree> {
-    node: Node<'tree>,
+/// 分割代入の要素 1 つ。props 削除の証明 (`removed_props`) も、消したキーの要素を除いた列の
+/// 比較に使う。
+pub(super) struct Entry<'tree> {
+    pub(super) node: Node<'tree>,
     binding: Node<'tree>,
-    key: String,
+    pub(super) key: String,
     default: Option<Node<'tree>>,
 }
 
-fn entries<'tree>(pattern: Node<'tree>, source: &[u8]) -> Option<Vec<Entry<'tree>>> {
+/// 単純な分割代入 (shorthand・既定値つき shorthand・`key: name`・`key: name = 既定値`) の
+/// 要素を、キーと束縛の名前が一意のときだけ返す。rest・ネスト・escape は None。
+pub(super) fn entries<'tree>(pattern: Node<'tree>, source: &[u8]) -> Option<Vec<Entry<'tree>>> {
     if pattern.kind() != "object_pattern" || pattern.has_error() {
         return None;
     }

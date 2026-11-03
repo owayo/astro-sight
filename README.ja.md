@@ -199,6 +199,33 @@ src/engine/symbols/mod.rs changed [extract_symbols]:
 
 呼び出し元をすべて直してあれば、`impact` は何も出力せずに exit 0 で終わります。未解決の影響が残っていれば、上の一覧を stderr に出して exit 1 を返します。このテキストの行番号は、エディタでそのまま開けるよう 1 始まりです。
 
+TS/TSX の関数の末尾にある省略可能な引数 (`?` 付きか既定値付き) を消した変更は、`review --hook` が `mod_compat` の理由 `trailing_optional_params_removed` として報告します。条件は、残りの引数と明示の戻り値型が変わらず、リポジトリ内の直接呼び出しを閉じた一覧で調べて、どの呼び出しも新しい引数の数に収まると確かめられることです。呼び出し箇所は `impact_info` に残ります。別名・動的な依存・解決が曖昧な依存があるときや、ソースを読み切れないときは、従来の判定を維持します。この証明が扱うのは解析したリポジトリ内の呼び出しだけで、外部の利用者との互換性や、実行時に同じ動作をすることは保証しません。
+
+TS/TSX で export した関数の引数が 1 個だけのとき、その inline object 型から省略可能なプロパティを消した変更も、`mod_compat` の理由 `optional_object_props_removed` として報告します。条件は、残りのプロパティと分割代入の束縛を含め、宣言のほかの部分が AST のトークンで変わらないことです。残りのプロパティと戻り値型が参照する型も、変わらないことを求めます。そのうえで、リポジトリのソースを閉じた一覧で調べ、関数を使う JSX 要素と直接呼び出しのどれもが、消したキーを渡していないことを確かめます。JSX 要素は、関数名を直接タグにして、spread の無い属性だけを書いていることが条件です。直接呼び出しは、関数に明示の戻り値型があり、object リテラルを 1 個だけ渡すときに限って数えます。JSX の呼び出し箇所は `impact_info` に残ります。JSX の型環境を差し替えているとき (`jsxFactory`・`jsxFragmentFactory`・`react` 以外の `jsxImportSource`・`react/jsx-runtime` の解決先を変え得る `paths` や `baseUrl`・`JSX` という名前を作る宣言や公開・大文字小文字を問わない `@jsx` の pragma) は、従来の判定を維持します。自動の JSX runtime (`jsx: react-jsx` / `react-jsxdev`) の import はソースに現れないので、`react` と `@types/react` が `npm:` の別名でない registry の依存であることも求めます。registry でない `@types/*` があるとき、git・URL・ディレクトリの外のパスから中身を入れる依存があるとき、`compilerOptions.types` や `/// <reference types>` が registry の依存でないパッケージを指すときも、証明しません。別名・再 export・動的なアクセスがあるときや、ソースを読み切れないときも同じです。残りの契約が相対パスで import した型を参照するときは、証明しません。registry の依存から import した型と、リポジトリで宣言していない大域の型 (lib や `@types` のもの) は、diff がほかのファイルを変えていない場合だけ受け入れます。この分類はリポジトリ内の証拠に基づくので、リポジトリの外に消したキーを渡す利用者がいれば、その利用者には破壊的な変更になります。
+
+どちらの削除の証明も、同じ信頼の境界を使います。利用の一覧 (消した引数やキーを渡していないかを調べる呼び出しと JSX 要素) は、`.gitignore`・global ignore・隠しファイルの除外に従う走査のソースを全部解析します。この走査にほかの言語のソースや解析できない形式 (`.vue` など) があれば、どちらの証明もしません。
+
+走査から外れたファイル (ignore したファイルと隠しファイル。`node_modules` と `.git` の中は除く) は、TS / JS 系のファイルと埋め込みのソース (`.vue`・`.svelte`・`.astro`・`.mdx`) だけを読みます。1 回の検出で 1 度だけ、変えた全ての関数についてまとめて読みます。
+
+- 変えた関数の名前が識別子の単語として現れるファイルは、一覧に加えて同じ規則で証明します。Unicode の escape で書いた名前も、現れたものとして数えます。埋め込みのソースに現れるときは証明しません
+- TS 系のファイル (`.d.ts` を含む) は、宣言のファイルに依存するときも一覧に加えます。`import`・`export … from`・`import()` (型の位置を含む)・`require()`・`import x = require()`・`declare module`・`/// <reference>` を、相対パス・ディレクトリの index・`paths` / `baseUrl`・リポジトリの package で解きます。宣言のファイルに解決するものと、解決できず registry の依存とも決められないものを、依存として数えます。package.json のあるディレクトリ (types・main・exports で何でも指せる) と、何も無いパスに当たる相対の指定子は、解決できないものとして扱います。ディレクトリの外へ一度出て戻る相対パス (`app` の中からの `../../app/src/ui` など) は、最後に指す位置で決めます
+- 宣言でない TS 系のファイル (`.d.ts` 以外) では、宣言のファイルの名前 (`panel.tsx` なら `panel`、`index.tsx` ならディレクトリの名前) も、現れたものとして数えます。JS 系のファイルは関数名だけで選ぶので、ignore した JS (`checkJs` で型検査するもの) が関数名を書かずに namespace import を計算したキーで使うときは、拾えません
+- どれにも当たらないファイルは一覧に入れません。ほかの言語のファイル (shell の hook・Python・Rust など) は読みません
+- 一覧は、加えたファイルを含めて 512 ファイル・8 MiB・100,000 ノードに収まる必要があります。外のファイルは、1 回の検出で読む量 1 GiB・解析する量 64 MiB までで、ファイルの数には上限を掛けません。読めないファイルがあるときや、上限を超えるときは証明しません
+
+監査は、ignore に関係なく、`node_modules` と `.git` を除く全てのファイルを対象にします。対象はソース・`.d.ts`・`tsconfig*.json` / `jsconfig*.json`・`package.json` です。走査から外れたファイルは、`JSX`・`declare`・`@jsx`・`<reference` か、ASCII の識別子の文字を表す Unicode の escape を含む TS / JS 系のファイルと、依存を調べる TS 系のファイルだけを解析します。解析は 1 ファイル 8 MiB までで、上の解析する量に数えます。registry から入れた依存のパッケージ (`node_modules` の中身) は、リポジトリのソースに依存せず、React が定める標準の JSX の契約を変えないものとして信頼します。どちらとも決められないものは、従来の判定を維持します。次のものがあるときは監査を作らず、props の証明はしません。末尾の引数の証明は、解決できない import を 1 つも受け入れません。
+
+- ディレクトリの symlink (Linux の `.venv` の `lib64 -> lib` も含みます) と、ソースや設定の symlink
+- ディレクトリの外か `node_modules` を取り込む、tsconfig の `files`・`include`・`typeRoots` と `/// <reference path>`
+- 読めない設定と `package.json`、上限の中で読めないか解析できない監査の対象のファイル
+- 解釈できない overrides のキー
+- どの依存も書き換えられる pnpmfile (`.pnpmfile.cjs`・`.pnpmfile.mjs`・`pnpmfile.js` と、ディレクトリの中と祖先の `.npmrc` の `pnpmfile`・`global-pnpmfile`)、読めない YAML と `.npmrc`
+- import の解決先を変える tsconfig の `moduleSuffixes` (`[""]` 以外) と、2 つ以上の項目がある `rootDirs`
+
+権限が無くて開けないディレクトリは、走査から外します。同じ利用者が動かす型検査も、そのディレクトリを読めないためです。
+
+リポジトリ内で指定子を解決できない import は、通常の named import で、パッケージが registry の依存のときだけ受け入れます。named import の条件は、import する名前と束縛する名前が、どれも変えた関数と違うことです (`import { useState } from "react"` など)。registry の依存と見なすのは、同じ名前の `package.json` がリポジトリに無く、`paths` や `baseUrl` で解決先を差し替えられないパッケージです。ディレクトリの中と祖先のどの `package.json` も、`file:`・`link:`・`workspace:`・`portal:`・`patch:`・パス・git や URL の指定で、依存・overrides・パッチに入れていないことも条件です。npm の overrides の `$名前` は参照先の依存の指定で判定し、参照先が無ければ registry の依存とは決めません。ディレクトリの中と祖先の `pnpm-workspace.yaml` (`overrides`・`packageExtensions`・`patchedDependencies`・`catalog`・`catalogs`) と `.yarnrc.yml` (`packageExtensions`) も同じ規則で判定し、`catalog:` の参照はそこで解きます。overrides のキーは、npm・pnpm・yarn の文法で読みます。キーに現れるパッケージ名は、pnpm で親子を選ぶ `親>子` の親も含めて、すべて判定に使います。`bridge@>=1.0.0` のような版の範囲にある `>` は、区切りとして扱いません。巻き上げで、別のパッケージが入れた依存もどこからでも解決され得るためです。default・namespace・`default as`・文字列の名前・同じ名前の import、再 export、`import()`、`require()`、副作用だけの import は、従来どおり指定子を解決できる必要があります。
+
 TS/TSX では、固定インターフェース型を受け取ってそのまま返すローカル関数に、単一メソッドのオブジェクトを直接登録して default export する形を限定的に証明します。契約に既存の引数をメソッド実装が受け取り始めても、契約・登録経路が不変で、直接呼び出しの引数数を確認できれば、`mod_compat` の理由 `fixed_callback_contract` として残します。`impact` とレビュー用 hook は停止せず、`context` の参照情報は保持します。
 
 対象は単純な必須引数と `void` 戻り値で、対象の default import に結び付く直接呼び出しを要求します。オブジェクトの受け渡し・別名・再 export・動的アクセス・解析失敗がある場合や、ソースが 512 ファイル・8 MiB・100,000 ノードの上限を超える場合は、従来の判定を維持します。現状の証明範囲は JS/TS のみで、リポジトリ全体に外部 import・計算アクセス・エスケープ付き文字列が無い場合に限られます。実装の引数と本体以外は旧新の byte 一致を要求し、動作の同値性や外部の利用者まで保証するものではありません。
