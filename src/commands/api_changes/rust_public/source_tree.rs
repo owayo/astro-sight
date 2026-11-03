@@ -41,6 +41,61 @@ pub(crate) fn read_rust_module_source(
     }
 }
 
+/// `manifest_rel` (dir 相対) の manifest (`Cargo.toml`) を `source` から読む。`Ok(None)` は不在。
+///
+/// base 側は base の snapshot だけで決め、作業ツリーで補わない。blob を読めなかったときは
+/// `git ls-tree` で base の tree にその path があるかを確かめ、無ければ不在、あれば
+/// (blob でない・上限超過・読み出しの失敗) 読めないとする。作業ツリー側も、無いのか
+/// 読めないのかを分ける (不在なら祖先の探索を続けられるが、読めない manifest は判定を止める)。
+pub(crate) fn read_rust_manifest(
+    source: RustSourceTree<'_>,
+    dir: &str,
+    manifest_rel: &std::path::Path,
+) -> Result<Option<Vec<u8>>, crate::engine::rust_edition::ManifestUnreadable> {
+    use crate::engine::rust_edition::ManifestUnreadable;
+    match source {
+        RustSourceTree::Worktree => {
+            let canonical_dir = std::fs::canonicalize(dir).map_err(|_| ManifestUnreadable)?;
+            let full = canonical_dir.join(manifest_rel);
+            match std::fs::symlink_metadata(&full) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(_) => Err(ManifestUnreadable),
+                Ok(_) => crate::engine::bounded_read::read_input_file(&full)
+                    .map(Some)
+                    .ok_or(ManifestUnreadable),
+            }
+        }
+        RustSourceTree::Base { blobs } => {
+            let path = crate::git_support::normalize_workspace_separators(
+                manifest_rel.to_str().ok_or(ManifestUnreadable)?,
+            );
+            if let Some(blob) = blobs.read_limited(&path, crate::commands::MAX_INPUT_SIZE) {
+                return Ok(Some(blob));
+            }
+            let rev = blobs.rev();
+            if validate_git_revision(rev, "--base").is_err()
+                || validate_git_revision(&path, "diff file path").is_err()
+            {
+                return Err(ManifestUnreadable);
+            }
+            // path に glob 文字が含まれても別の path に一致させない。
+            let out = crate::git_support::git_command_for_dir(dir)
+                .args(["--literal-pathspecs", "ls-tree", "-z", rev, "--", &path])
+                .current_dir(dir)
+                .output()
+                .map_err(|_| ManifestUnreadable)?;
+            if !out.status.success() {
+                return Err(ManifestUnreadable);
+            }
+            if out.stdout.is_empty() {
+                Ok(None)
+            } else {
+                Err(ManifestUnreadable)
+            }
+        }
+    }
+}
+
 /// `src_root_rel` 配下の `.rs` ファイル列 (repo 相対) を `source` 経由で取得する。
 /// Worktree なら `ignore::WalkBuilder`、Base なら `git ls-tree -r --name-only`。
 pub(crate) fn collect_rust_rs_files(

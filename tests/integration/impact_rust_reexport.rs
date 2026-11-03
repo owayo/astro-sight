@@ -762,3 +762,110 @@ fn impact_rust_reexport_retarget_keeps_old_side_caller() {
         "old binding must remain visible: {context}"
     );
 }
+
+/// prefix の無い group の中の `super` (`use {super::origin::Payload};`) は展開できるが、group が
+/// 束縛する名前・別名・glob は所有元を証明しない (影響に残す)。同じ module に group の import が
+/// あっても、無関係な別の名前 (その module の anchor 付きの再公開や、自分のファイルの宣言) は
+/// 所有元を確かめて除外する。
+#[test]
+fn impact_rust_prefixless_group_imports_keep_their_names_unproven() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    let files = [
+        ("origin", "pub struct Payload { pub value: u8 }\n"),
+        ("other", "pub struct Helper;\n"),
+        ("other2", "pub struct Payload { pub value: u8 }\n"),
+        // group が束縛する名前・別名・glob を同じファイルの中で使う
+        (
+            "g_named",
+            "use {super::origin::Payload};\npub fn read(value: Payload) -> u8 { value.value }\n",
+        ),
+        (
+            "g_alias",
+            "use {super::origin::Payload as Alias};\npub fn read(value: Alias) -> u8 { value.value }\n",
+        ),
+        (
+            "g_glob",
+            "use {super::origin::*};\npub fn read(value: Payload) -> u8 { value.value }\n",
+        ),
+        // group で公開した名前・別名・glob を別のファイルから使う
+        ("g_pub", "pub use {super::origin::Payload};\n"),
+        (
+            "t_pub",
+            "pub fn read(value: crate::g_pub::Payload) -> u8 { value.value }\n",
+        ),
+        (
+            "g_pub_alias",
+            "pub use {super::origin::Payload as Alias};\n",
+        ),
+        (
+            "t_alias",
+            "pub fn read(value: crate::g_pub_alias::Alias) -> u8 { value.value }\n",
+        ),
+        ("g_pub_glob", "pub use {super::origin::*};\n"),
+        (
+            "t_glob",
+            "pub fn read(value: crate::g_pub_glob::Payload) -> u8 { value.value }\n",
+        ),
+        // 同じ module に group の import がある、無関係な別の名前
+        (
+            "g_mixed",
+            "use {super::other::Helper};\npub use crate::other2::Payload;\npub fn helper() -> Helper { Helper }\n",
+        ),
+        (
+            "u_mixed",
+            "pub fn read(value: crate::g_mixed::Payload) -> u8 { value.value }\n",
+        ),
+        (
+            "g_other",
+            "use {super::other::Helper};\npub struct Payload { pub value: u8 }\npub fn read(value: Payload) -> u8 { let _ = Helper; value.value }\n",
+        ),
+    ];
+    let lib: String = files
+        .iter()
+        .map(|(name, _)| format!("pub mod {name};\n"))
+        .collect();
+    repo.write("src/lib.rs", lib);
+    for (name, source) in files {
+        repo.write(format!("src/{name}.rs"), source);
+    }
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write("src/origin.rs", "pub struct Payload { pub value: u64 }\n");
+
+    let context = repo.run_json("context", &["--git"]);
+    let change = context["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["path"] == "src/origin.rs")
+        .unwrap();
+    let in_bucket = |file: &str, bucket: &str| {
+        change[bucket]
+            .as_array()
+            .is_some_and(|callers| callers.iter().any(|caller| caller["path"] == file))
+    };
+    for file in [
+        "src/g_named.rs",
+        "src/g_alias.rs",
+        "src/g_glob.rs",
+        "src/t_pub.rs",
+        "src/g_pub_alias.rs",
+        "src/t_glob.rs",
+    ] {
+        assert!(in_bucket(file, "impacted_callers"), "{file}: {context}");
+    }
+    for file in ["src/u_mixed.rs", "src/g_other.rs"] {
+        for bucket in [
+            "impacted_callers",
+            "low_confidence_callers",
+            "informational_callers",
+        ] {
+            assert!(!in_bucket(file, bucket), "{file} {bucket}: {context}");
+        }
+    }
+}
