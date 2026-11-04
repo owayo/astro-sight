@@ -103,6 +103,8 @@ impl FileEvidence {
 
 pub(super) struct RustPathOwnerIndex {
     current: Option<Arc<FileEvidence>>,
+    root_associated_paths: HashSet<usize>,
+    associated_types: RefCell<HashMap<String, bool>>,
     source_hash: blake3::Hash,
     direct_imports: HashMap<String, Vec<String>>,
     local_type_names: HashSet<String>,
@@ -904,6 +906,8 @@ impl RustPathOwnerIndex {
             .collect();
         Self {
             current: FileEvidence::collect(node, source).map(Arc::new),
+            root_associated_paths: root_associated_paths(node, source),
+            associated_types: RefCell::new(HashMap::new()),
             source_hash: blake3::hash(source),
             direct_imports,
             local_type_names,
@@ -985,9 +989,15 @@ impl RustPathOwnerIndex {
             .then(|| ref_file.to_owned())
     }
 
-    /// A locally declared type (or `Self` inside an impl) cannot name a free
-    /// function in another module through `Type::function` syntax.
-    pub(super) fn is_local_associated_path(&self, node: Node<'_>, source: &[u8]) -> bool {
+    /// 宣言または named import から型と確認できるパスは、別 module の自由関数を指さない。
+    pub(super) fn is_local_associated_path(
+        &self,
+        node: Node<'_>,
+        source: &[u8],
+        dir: &Path,
+        ref_path: &str,
+        project: &RustPathOwnerProjectProof,
+    ) -> bool {
         if node.kind() != "identifier" || has_uncertain_ancestor(node) {
             return false;
         }
@@ -1017,9 +1027,25 @@ impl RustPathOwnerIndex {
             }
             return false;
         }
-        self.current
+        if !self.root_associated_paths.contains(&parent.id()) {
+            return false;
+        }
+        if self
+            .current
             .as_ref()
             .is_some_and(|evidence| evidence.types.contains(&path[0]))
+        {
+            return true;
+        }
+        if let Some(proven) = self.associated_types.borrow().get(&path[0]) {
+            return *proven;
+        }
+        let proven =
+            super::rust_reexport_owner::associated_type_binding(&path[0], dir, ref_path, project);
+        self.associated_types
+            .borrow_mut()
+            .insert(path[0].clone(), proven);
+        proven
     }
 
     fn resolve_qualified(
@@ -1143,6 +1169,136 @@ impl RustPathOwnerIndex {
             .insert(file.to_owned(), parsed.clone());
         parsed
     }
+}
+
+#[derive(Default)]
+struct AssociatedScope {
+    parent: Option<usize>,
+    names: HashSet<String>,
+    opaque: bool,
+}
+
+/// 型名を再束縛し得るスコープだけを一度走査し、参照ごとの祖先の再走査を避ける。
+fn root_associated_paths(root: Node<'_>, source: &[u8]) -> HashSet<usize> {
+    if root.has_error() {
+        return HashSet::new();
+    }
+    let mut scopes = vec![AssociatedScope::default()];
+    let mut paths = Vec::new();
+    let mut pending = vec![(root, 0, "")];
+    while let Some((node, enclosing, parent_kind)) = pending.pop() {
+        if node.kind() == "mod_item" {
+            if enclosing != 0
+                && let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(source).ok())
+            {
+                if !name.is_ascii() {
+                    scopes[enclosing].opaque = true;
+                }
+                scopes[enclosing]
+                    .names
+                    .insert(name.strip_prefix("r#").unwrap_or(name).to_owned());
+            }
+            continue;
+        }
+        let scope = if matches!(
+            node.kind(),
+            "block"
+                | "function_item"
+                | "impl_item"
+                | "closure_expression"
+                | "trait_item"
+                | "struct_item"
+                | "enum_item"
+                | "union_item"
+                | "type_item"
+        ) {
+            let scope = scopes.len();
+            scopes.push(AssociatedScope {
+                parent: Some(enclosing),
+                ..AssociatedScope::default()
+            });
+            scope
+        } else {
+            enclosing
+        };
+        match node.kind() {
+            "macro_definition" => scopes[0].opaque = true,
+            "macro_invocation"
+                if matches!(
+                    parent_kind,
+                    "source_file" | "block" | "expression_statement"
+                ) =>
+            {
+                scopes[scope].opaque = true
+            }
+            "use_declaration" | "extern_crate_declaration" if scope != 0 => {
+                scopes[scope].opaque = true
+            }
+            "type_parameter" | "struct_item" | "enum_item" | "union_item" | "type_item"
+            | "trait_item"
+                if scope != 0 =>
+            {
+                if let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(source).ok())
+                {
+                    let binding_scope = if node.kind() == "type_parameter" {
+                        scope
+                    } else {
+                        enclosing
+                    };
+                    if binding_scope != 0 {
+                        if !name.is_ascii() {
+                            scopes[binding_scope].opaque = true;
+                        }
+                        scopes[binding_scope]
+                            .names
+                            .insert(name.strip_prefix("r#").unwrap_or(name).to_owned());
+                    }
+                }
+            }
+            "scoped_identifier" => {
+                if let Some(path) = node.child_by_field_name("path")
+                    && path.kind() == "identifier"
+                    && let Ok(name) = path.utf8_text(source)
+                {
+                    paths.push((node.id(), scope, name.strip_prefix("r#").unwrap_or(name)));
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        pending.extend(
+            node.named_children(&mut cursor)
+                .map(|child| (child, scope, node.kind())),
+        );
+    }
+    let mut proven = HashMap::new();
+    paths
+        .into_iter()
+        .filter_map(|(path, mut scope, name)| {
+            let mut visited = Vec::new();
+            let safe = loop {
+                if let Some(safe) = proven.get(&(scope, name)) {
+                    break *safe;
+                }
+                visited.push(scope);
+                if scopes[scope].opaque || scopes[scope].names.contains(name) {
+                    break false;
+                }
+                let Some(parent) = scopes[scope].parent else {
+                    break true;
+                };
+                scope = parent;
+            };
+            for scope in visited {
+                proven.insert((scope, name), safe);
+            }
+            safe.then_some(path)
+        })
+        .collect()
 }
 
 fn scan_ordinary_sources(root: &Path) -> bool {

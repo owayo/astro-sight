@@ -61,6 +61,37 @@ pub(super) struct ModuleBindings {
     opaque: bool,
 }
 
+/// 参照位置で再束縛がない型名を、安定した named import と宣言まで解決する。
+pub(super) fn associated_type_binding(
+    name: &str,
+    dir: &Path,
+    ref_path: &str,
+    project: &RustPathOwnerProjectProof,
+) -> bool {
+    let prove = || {
+        if !project.allows_reexport_paths() {
+            return None;
+        }
+        let ref_file = Path::new(ref_path);
+        let (_, src, module) = cached_source_module_path(dir, ref_file, project)?;
+        if cached_module_file(dir, &src, &module, project)? != ref_file {
+            return None;
+        }
+        resolve_name(
+            dir,
+            &src,
+            &module,
+            name,
+            Namespace::Type,
+            &module,
+            project,
+            &mut HashSet::new(),
+            0,
+        )
+    };
+    prove().is_some()
+}
+
 pub(super) fn owner(
     node: Node<'_>,
     source: &[u8],
@@ -780,7 +811,7 @@ fn parse_bindings(root: Node<'_>, source: &[u8], module: &[String]) -> Option<Mo
                     bindings.unknown_functions.insert(name.to_owned());
                 }
                 "mod_item" if child.child_by_field_name("body").is_some() => {
-                    bindings.opaque = true;
+                    bindings.unknown_types.insert(name.to_owned());
                 }
                 "mod_item" => {
                     bindings.modules.push((name.to_owned(), visibility));
