@@ -15,6 +15,119 @@ use super::type_dependencies::{DependencyEnvironment, type_dependencies_unchange
 use super::*;
 use crate::models::impact::DiffFile;
 
+pub(crate) struct RemovedParameterProps {
+    pub(crate) parameter: usize,
+    pub(crate) names: HashSet<String>,
+}
+
+/// 互換性ではなく、変更行にも課す「消したキーを渡さない」義務を取り出す。
+pub(crate) fn removed_parameter_props(
+    site: &CompatibleModSite<'_>,
+    sources: &mut SignatureSourceCache<'_>,
+) -> Result<Vec<RemovedParameterProps>, ()> {
+    if site.kind != "function" || site.name.contains('.') || site.lang_in(TS_ONLY_LANGS).is_none() {
+        return Ok(Vec::new());
+    }
+    let src = sources.get(site).ok_or(())?;
+    let (old_tree, new_tree) = src.parse_pair(site.lang_id.ok_or(())?).ok_or(())?;
+    let old_fn =
+        super::super::js_ts_call_arity::unique_function(old_tree.root_node(), &src.old, site.name)
+            .ok_or(())?;
+    let new_fn =
+        super::super::js_ts_call_arity::unique_function(new_tree.root_node(), &src.new, site.name)
+            .ok_or(())?;
+    fn parameters(function: Node<'_>) -> Option<Vec<Node<'_>>> {
+        let parameters = function.child_by_field_name("parameters")?;
+        let mut cursor = parameters.walk();
+        Some(
+            parameters
+                .named_children(&mut cursor)
+                .filter(|n| !n.is_extra())
+                .collect::<Vec<_>>(),
+        )
+    }
+    let old_parameters = parameters(old_fn).ok_or(())?;
+    let new_parameters = parameters(new_fn).ok_or(())?;
+    let mut result = Vec::new();
+    for (parameter, old) in old_parameters.iter().enumerate() {
+        let Some(old_type) = old.child_by_field_name("type").and_then(inline_object_type) else {
+            continue;
+        };
+        let new_type = new_parameters
+            .get(parameter)
+            .and_then(|n| n.child_by_field_name("type"))
+            .and_then(inline_object_type)
+            .ok_or(())?;
+        if node_signature_tokens(old_type, &src.old) == node_signature_tokens(new_type, &src.new) {
+            continue;
+        }
+        let old = members(old_type, &src.old).ok_or(())?;
+        let new: HashSet<_> = members(new_type, &src.new)
+            .ok_or(())?
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        let names = old
+            .into_iter()
+            .map(|m| m.name)
+            .filter(|name| !new.contains(name))
+            .collect::<HashSet<_>>();
+        if !names.is_empty() {
+            result.push(RemovedParameterProps { parameter, names });
+        }
+    }
+    // rest / this / generic 等の制約は、削除キーがある場合だけ課す。無関係な引数追加には
+    // 従来の arity と変更行の証明をそのまま使う。
+    if !result.is_empty() {
+        unique_function_declaration(old_tree.root_node(), &src.old, site.name).ok_or(())?;
+        unique_function_declaration(new_tree.root_node(), &src.new, site.name).ok_or(())?;
+    }
+    Ok(result)
+}
+
+pub(crate) fn call_omits_removed_props(
+    identifier: Node<'_>,
+    source: &[u8],
+    removals: &[RemovedParameterProps],
+) -> bool {
+    if crate::engine::jsx::jsx_name_opening_tag(identifier, source).is_some() {
+        return removals.iter().all(|removal| {
+            removal.parameter == 0
+                && crate::engine::jsx::caller_shape(identifier, source, true)
+                    .is_some_and(|shape| !shape.children && shape.omits(&removal.names))
+        });
+    }
+    let Some(call) = identifier
+        .parent()
+        .filter(|n| n.kind() == "call_expression")
+    else {
+        return false;
+    };
+    if call.child_by_field_name("function").map(|n| n.id()) != Some(identifier.id())
+        || call.child_by_field_name("type_arguments").is_some()
+    {
+        return false;
+    }
+    let Some(arguments) = call
+        .child_by_field_name("arguments")
+        .filter(|n| n.kind() == "arguments")
+    else {
+        return false;
+    };
+    let mut cursor = arguments.walk();
+    let values = arguments
+        .named_children(&mut cursor)
+        .filter(|n| !n.is_extra())
+        .collect::<Vec<_>>();
+    // spread で位置がずれる場合も、渡したキーは確定できない。
+    !values.iter().any(|n| n.kind() == "spread_element")
+        && removals.iter().all(|removal| {
+            values.get(removal.parameter).is_none_or(|value| {
+                super::removed_params::object_omits(*value, source, &removal.names)
+            })
+        })
+}
+
 pub(crate) fn detect_optional_object_props_removed_compatible_mod(
     index: &ApiRefIndex,
     site: &CompatibleModSite<'_>,

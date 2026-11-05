@@ -32,7 +32,7 @@ fn contains_identifier(node: Node<'_>, source: &[u8], name: &str) -> bool {
     false
 }
 
-fn unique_function<'a>(root: Node<'a>, source: &[u8], name: &str) -> Option<Node<'a>> {
+pub(super) fn unique_function<'a>(root: Node<'a>, source: &[u8], name: &str) -> Option<Node<'a>> {
     let mut found = None;
     let mut cursor = root.walk();
     for statement in root.named_children(&mut cursor) {

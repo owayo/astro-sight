@@ -100,6 +100,132 @@ fn screen_with(module_items: &str, call: &str) -> String {
 }
 
 #[test]
+fn optional_props_removal_changed_callers_require_removed_key_proof() {
+    for (extension, name, before, after, old_call, cases) in [
+        (
+            "tsx",
+            "Panel",
+            "export function Panel({ label, legacy, children }: { label: string; legacy?: { id: string }; children?: string }) { return <>{label}</>; }\n",
+            "export function Panel({ label }: { label: string }) { return <>{label}</>; }\n",
+            "<Panel label=\"old\" />",
+            vec![
+                ("<Panel label=\"new\" legacy={{ id: \"a\" }} />", false),
+                ("<Panel label=\"new\" {...rest} />", false),
+                ("<Panel label=\"new\">child</Panel>", false),
+                ("<Panel label=\"new\" />", true),
+            ],
+        ),
+        (
+            "ts",
+            "configure",
+            "export function configure({ label, legacy }: { label: string; legacy?: boolean }): string { return label; }\n",
+            "export function configure({ label }: { label: string }): string { return label; }\n",
+            "configure({ label: \"old\" })",
+            vec![
+                ("configure({ label: \"new\", legacy: true })", false),
+                ("configure({ label: \"new\", \"legacy\": true })", false),
+                ("configure({ label: \"new\", [key]: true })", false),
+                ("configure({ label: \"new\", ...rest })", false),
+                ("configure(rest)", false),
+                ("configure({ label: \"new\" })", true),
+                ("setup({ label: \"new\", legacy: true })", false),
+                ("setup({ label: \"new\" })", true),
+            ],
+        ),
+    ] {
+        for (call, closed) in cases {
+            let repo = TestRepo::new();
+            repo.init_git();
+            repo.create_dir_all("src");
+            let target = format!("src/target.{extension}");
+            let caller = format!("src/caller.{extension}");
+            let import = if call.starts_with("setup(") {
+                format!("{name} as setup")
+            } else {
+                name.to_owned()
+            };
+            let old_call = if call.starts_with("setup(") {
+                old_call.replace(name, "setup")
+            } else {
+                old_call.to_owned()
+            };
+            let source = |call: &str| {
+                format!(
+                    "import {{ {import} }} from './target';\nconst rest = {{ label: 'rest' }}; const key = 'legacy';\nfunction Screen() {{ return {call}; }}\nScreen();\n"
+                )
+            };
+            repo.write(&target, before);
+            repo.write(&caller, source(&old_call));
+            repo.write("src/jsx.d.ts", "declare namespace JSX { interface Element {} interface IntrinsicElements {} interface ElementChildrenAttribute { children: {}; } }\n");
+            repo.commit_all("initial");
+            repo.write(&target, after);
+            repo.write(&caller, source(call));
+            for staged in [false, true] {
+                if staged {
+                    repo.git(["add", "."]);
+                    // index の不正な呼び出しを、worktree の正しい呼び出しで隠せない。
+                    repo.write(&caller, source(&old_call));
+                }
+                let (output, json) = hook_with(&repo, if staged { &["--staged"] } else { &[] });
+                assert_eq!(
+                    output.status.code(),
+                    Some(i32::from(!closed)),
+                    "{call}, staged={staged}: {json}"
+                );
+                assert_eq!(
+                    lists(&json["api"]["mod_closed"], name),
+                    closed,
+                    "{call}: {json}"
+                );
+                assert_eq!(lists(&json["api"]["mod"], name), !closed, "{call}: {json}");
+                assert_eq!(
+                    has_ref(&json["impacts"], &caller, 2),
+                    !closed,
+                    "{call}: {json}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn optional_props_removal_changed_type_references_require_member_proof() {
+    for declaration in [
+        "export interface Props { label: string; legacy?: boolean; }\n",
+        "export type Props = { label: string; legacy?: boolean; };\n",
+    ] {
+        for (value, closed) in [
+            ("{ label: 'new', legacy: true }", false),
+            ("{ label: 'new' }", true),
+        ] {
+            let repo = TestRepo::new();
+            repo.init_git();
+            repo.write("target.ts", declaration);
+            repo.write("caller.ts", "import { type Props } from './target';\nconst value: Props = { label: 'old' };\nconsole.log(value.label);\n");
+            repo.commit_all("initial");
+            repo.write("target.ts", declaration.replace(" legacy?: boolean;", ""));
+            repo.write("caller.ts", format!("import {{ type Props }} from './target';\nconst value: Props = {value};\nconsole.log(value.label);\n"));
+            let (output, json) = hook(&repo);
+            assert_eq!(
+                output.status.code(),
+                Some(i32::from(!closed)),
+                "{value}: {json}"
+            );
+            assert_eq!(
+                lists(&json["api"]["mod_closed"], "Props"),
+                closed,
+                "{value}: {json}"
+            );
+            assert_eq!(
+                has_ref(&json["impacts"], "caller.ts", 1),
+                !closed,
+                "{value}: {json}"
+            );
+        }
+    }
+}
+
+#[test]
 fn optional_props_removal_issue_repro_is_mod_compat() {
     let repo = props_repo(PANEL_BEFORE, PANEL_AFTER, &[("src/screen.tsx", SCREEN)]);
     let json = assert_compatible(&repo, "Panel", "issue repro");

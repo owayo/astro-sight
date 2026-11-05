@@ -42,6 +42,9 @@ pub(crate) use removed_params::{
     optional_removal_words,
 };
 pub(crate) use removed_props::detect_optional_object_props_removed_compatible_mod;
+pub(crate) use removed_props::{
+    RemovedParameterProps, call_omits_removed_props, removed_parameter_props,
+};
 pub(crate) use type_members::{
     classify_member_property_removal, classify_member_type_narrowing,
     classify_required_member_addition, detect_type_members_compatible_mod,

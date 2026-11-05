@@ -39,7 +39,10 @@ pub(super) fn collect(
             || !input.js_direct_function_change
             || input.name.contains('.')
             || !plain_name(bare)
-            || !matches!(input.arg_evidence, ClosureArgEvidence::None)
+            || !matches!(
+                input.arg_evidence,
+                ClosureArgEvidence::None | ClosureArgEvidence::TsRemovedProps(_)
+            )
         {
             return None;
         }
