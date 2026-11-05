@@ -471,6 +471,7 @@ pub(crate) fn detect_api_changes_with_renames(
         .collect();
 
     ApiChanges {
+        unresolved_modified_callers: closure_caches.unresolved_modified_callers,
         removed_unresolved,
         uncertain_removals: buckets.uncertain_removals,
         parse_truncations: buckets.parse_truncations,

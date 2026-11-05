@@ -82,6 +82,10 @@ pub struct MissingCochange {
 /// (Issue 2026-05-28-meet-virtual-you-gemini-multi-select 対応)。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ApiChanges {
+    /// 変更行でも呼び出し契約への追随を証明できなかった参照。hook の解決済み判定より優先する。
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub unresolved_modified_callers: Vec<UnresolvedApiCall>,
     pub added: Vec<ApiSymbol>,
     pub removed: Vec<ApiSymbol>,
     /// 解析エラー内に同名の宣言ヘッダが残り、削除と断定できない候補。
@@ -137,6 +141,14 @@ pub struct ApiChanges {
     /// (Issue 2026-06-02-react-memo / 2026-06-02-provider-avatar 対応)。
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub compatible_modified: Vec<CompatibleApiModification>,
+}
+
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct UnresolvedApiCall {
+    pub file: String,
+    pub name: String,
+    pub reference: crate::models::reference::SymbolReference,
 }
 
 /// 新側の宣言候補の位置 (0-based) と、比較できなかった旧シグネチャ。

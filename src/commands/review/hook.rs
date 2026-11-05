@@ -664,6 +664,36 @@ pub(crate) fn build_review_hook_json_for_diff(
         );
     }
 
+    // API の呼び出し契約で未証明だった参照は、ファイルや行の変更だけでは解決済みにしない。
+    for call in &result.api_changes.unresolved_modified_callers {
+        if !result
+            .api_changes
+            .modified
+            .iter()
+            .any(|change| change.file == call.file && change.name == call.name)
+        {
+            continue;
+        }
+        let group = unresolved.entry(call.file.clone()).or_default();
+        group.changed_symbols.insert(call.name.clone());
+        if let Some((_, _, symbols)) = group
+            .refs
+            .iter_mut()
+            .find(|(path, line, _)| *path == call.reference.path && *line == call.reference.line)
+        {
+            symbols.push(call.name.clone());
+            symbols.sort_unstable();
+            symbols.dedup();
+        } else {
+            group.refs.push((
+                call.reference.path.clone(),
+                call.reference.line,
+                vec![call.name.clone()],
+            ));
+        }
+        group.refs.sort_unstable();
+    }
+
     // 空セクションは省略した compact JSON を構築
     let mut hook_obj = serde_json::Map::new();
     // has_any_output: 出力すべき検出 (上記 + cochange)

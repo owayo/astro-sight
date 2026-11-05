@@ -952,6 +952,10 @@ fn object_argument_omits(identifier: Node<'_>, source: &[u8], removed: &HashSet<
     let [object] = values.as_slice() else {
         return false;
     };
+    object_omits(*object, source, removed)
+}
+
+pub(super) fn object_omits(object: Node<'_>, source: &[u8], removed: &HashSet<String>) -> bool {
     if object.kind() != "object" {
         return false;
     }

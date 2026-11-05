@@ -21,6 +21,12 @@ filter = 'binary_id(astro-sight::integration) & (test(=integration::rust_relativ
 priority = 50
 threads-required = 2
 
+# 変更された JSX / object 呼び出しを worktree と index の両方で確認する回帰を先に始める。
+[[profile.default.overrides]]
+filter = 'binary_id(astro-sight::integration) & test(=integration::optional_props_removal::optional_props_removal_changed_callers_require_removed_key_proof)'
+priority = 50
+threads-required = 2
+
 # CI (NEXTEST_PROFILE=ci): 失敗しても残りのテストを最後まで流し、失敗の出力を最後にもまとめて出す
 [profile.ci]
 fail-fast = false

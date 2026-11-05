@@ -534,6 +534,7 @@ pub(crate) fn embedded_js_sources_may_hide_removed_keys(
 /// Python はローカル変数のクラスと新しい Protocol の構造的な適合を証明する。
 pub(crate) enum ClosureArgEvidence<'a> {
     None,
+    TsRemovedProps(&'a [super::ts_signature::RemovedParameterProps]),
     TsAddedRequiredProps(&'a super::ts_signature::AddedRequiredObjectProps),
     PythonProtocolParams(&'a super::python_protocol_arg::ProtocolArgumentChange),
     /// TS の interface / object 型の type alias への必須プロパティ追加。型の参照を役割ごとの
@@ -601,6 +602,44 @@ pub(crate) fn is_modified_closed_in_diff(
     if call_refs.is_empty() && target.aliased_calls.is_empty() {
         return false;
     }
+    if let ClosureArgEvidence::TsRemovedProps(removals) = input.arg_evidence {
+        let mut rejected = false;
+        for (reference, reference_name) in call_refs.iter().map(|r| (*r, target.bare)).chain(
+            target
+                .aliased_calls
+                .iter()
+                .map(|call| (&call.reference, call.local_name.as_str())),
+        ) {
+            if reference_name == target.bare {
+                match classify_reference_owner(&input, &target, reference, caches) {
+                    ReferenceOwner::Other => continue,
+                    ReferenceOwner::Unknown => return false,
+                    ReferenceOwner::Target => {}
+                }
+            }
+            let proven = parsed_ref_file_shared(input.dir, &reference.path, caches)
+                .filter(|file| !file.tree.root_node().has_error())
+                .and_then(|file| {
+                    ref_name_node(&file, reference_name, reference.line, reference.column).map(
+                        |node| {
+                            super::ts_signature::call_omits_removed_props(
+                                node,
+                                &file.source,
+                                removals,
+                            )
+                        },
+                    )
+                })
+                .unwrap_or(false);
+            if !proven {
+                record_unresolved_call(&input, reference, caches);
+                rejected = true;
+            }
+        }
+        if rejected {
+            return false;
+        }
+    }
     // 型のメンバー変更は、参照の位置ごとの義務だけで閉じる (変更行の照合へ戻さない)。
     if let ClosureArgEvidence::TsRequiredTypeMembers(delta) = input.arg_evidence {
         let mut owned = Vec::with_capacity(call_refs.len());
@@ -617,7 +656,7 @@ pub(crate) fn is_modified_closed_in_diff(
             type_name: target.bare,
             target_path: input.target_new_path,
         };
-        return !owned.is_empty()
+        let closed = !owned.is_empty()
             && super::ts_required_members::prove_closure(
                 &scope,
                 &owned,
@@ -625,6 +664,17 @@ pub(crate) fn is_modified_closed_in_diff(
                 &mut diff_files,
                 caches,
             );
+        if !closed
+            && matches!(
+                delta.mode,
+                super::ts_required_members::MemberChangeMode::Removal(_)
+            )
+        {
+            for reference in owned {
+                record_unresolved_call(&input, reference, caches);
+            }
+        }
+        return closed;
     }
     // 全ての呼び出し参照が、diff 内ファイルかつ実際の追加/変更行 (context 行ではない) にあるか。
     // shadow 除外で全参照が消えた場合は「対象 API の caller を 1 件も確認できていない」
@@ -656,6 +706,20 @@ pub(crate) fn is_modified_closed_in_diff(
         }
     }
     effective_call_refs > 0
+}
+
+fn record_unresolved_call(
+    input: &ModifiedClosureInput<'_>,
+    reference: &crate::models::reference::SymbolReference,
+    caches: &mut ApiClosureCaches,
+) {
+    caches
+        .unresolved_modified_callers
+        .push(crate::models::review::UnresolvedApiCall {
+            file: input.target_new_path.to_owned(),
+            name: input.name.to_owned(),
+            reference: reference.clone(),
+        });
 }
 
 /// 閉包判定の対象。変更対象ファイル内の定義が 1 つに特定でき、他ファイルの同名定義の
@@ -1507,6 +1571,7 @@ fn closed_via_local_const_argument(
 /// unique file 単位の F 回に圧縮する。
 #[derive(Default)]
 pub(crate) struct ApiClosureCaches {
+    pub(super) unresolved_modified_callers: Vec<crate::models::review::UnresolvedApiCall>,
     pub(super) literal_union_removal: super::ts_literal_union_removal::RemovalCache,
     pub(super) function_handoffs: super::ts_function_values::HandoffCache,
     /// Rust の参照側 AST に ERROR / MISSING がないか、ファイルごとに一度だけ確認する。

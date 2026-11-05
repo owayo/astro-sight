@@ -1357,7 +1357,12 @@ fn closure_or_blocking_decision(
             SignatureDecision::Blocking(None)
         };
     }
-    if !public_name_differs
+    let removed_props = match super::ts_signature::removed_parameter_props(site, sources) {
+        Ok(props) => props,
+        Err(()) => return SignatureDecision::Blocking(None),
+    };
+    if removed_props.is_empty()
+        && !public_name_differs
         && moved_from.is_none()
         && caches.function_handoffs.covers(inputs, site, sources)
     {
@@ -1390,13 +1395,21 @@ fn closure_or_blocking_decision(
     ) {
         return SignatureDecision::Blocking(None);
     }
-    let arg_evidence = match (&added_required_props, &python_protocol, &required_members) {
-        (Some(props), _, _) => super::ref_index::ClosureArgEvidence::TsAddedRequiredProps(props),
-        (None, Some(proof), _) => super::ref_index::ClosureArgEvidence::PythonProtocolParams(proof),
-        (None, None, super::ts_required_members::RequiredMemberChange::Supported(delta)) => {
-            super::ref_index::ClosureArgEvidence::TsRequiredTypeMembers(delta)
+    let arg_evidence = if !removed_props.is_empty() {
+        super::ref_index::ClosureArgEvidence::TsRemovedProps(&removed_props)
+    } else {
+        match (&added_required_props, &python_protocol, &required_members) {
+            (Some(props), _, _) => {
+                super::ref_index::ClosureArgEvidence::TsAddedRequiredProps(props)
+            }
+            (None, Some(proof), _) => {
+                super::ref_index::ClosureArgEvidence::PythonProtocolParams(proof)
+            }
+            (None, None, super::ts_required_members::RequiredMemberChange::Supported(delta)) => {
+                super::ref_index::ClosureArgEvidence::TsRequiredTypeMembers(delta)
+            }
+            _ => super::ref_index::ClosureArgEvidence::None,
         }
-        _ => super::ref_index::ClosureArgEvidence::None,
     };
     // 真偽判定の不変性は関数のシグネチャ変更だけの証拠。値から関数への種類変更は除く。
     // ソースは互換判定器と共有し、候補ごとに一度だけ旧新の宣言を確かめる。
