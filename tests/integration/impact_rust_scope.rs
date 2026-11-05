@@ -2,6 +2,145 @@
 
 use super::support::*;
 
+#[test]
+fn impact_rust_associated_paths_ignore_unrelated_file_syntax() {
+    for (declaration, extra, body, imported) in [
+        (
+            "pub struct Catalog;",
+            "",
+            "let sizes = vec![1usize, 2]; sizes.len() +",
+            false,
+        ),
+        ("#[derive(Debug)]\npub struct Catalog;", "", "", false),
+        (
+            "pub struct Catalog;",
+            "mod unrelated { pub struct Other; }",
+            "",
+            false,
+        ),
+        (
+            "pub struct Catalog;",
+            "#[cfg(test)] mod tests { use super::*; #[test] fn works() { assert!(true); } }",
+            "",
+            false,
+        ),
+        (
+            "pub struct Catalog;",
+            "pub fn first<T: Copy>(items: &[T]) -> Option<T> { items.first().copied() }",
+            "",
+            false,
+        ),
+        ("pub struct Catalog;", "", "", true),
+        (
+            "pub struct Catalog;",
+            "#[cfg(test)] mod tests { use super::*; }",
+            "",
+            true,
+        ),
+    ] {
+        for actual in [false, true] {
+            let repo = TestRepo::new();
+            repo.create_dir_all("src");
+            repo.write(
+                "Cargo.toml",
+                "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            );
+            repo.write(
+                "src/lib.rs",
+                "pub mod catalog;\npub mod report;\npub mod text;\n",
+            );
+            repo.write(
+                "src/text.rs",
+                "pub(crate) fn parse(input: &str) -> usize { input.len() }\n",
+            );
+            let total = format!("pub fn total() -> usize {{ {body} Catalog::parse(\"x\") }}\n");
+            repo.write("src/catalog.rs", format!("{declaration}\nimpl Catalog {{ pub fn parse(input: &str) -> usize {{ input.len() * 2 }} }}\n{extra}\n{}", if imported { "" } else { &total }));
+            repo.write(
+                "src/report.rs",
+                format!(
+                    "{}{}",
+                    if imported {
+                        format!("use crate::catalog::Catalog;\n{total}")
+                    } else {
+                        String::new()
+                    },
+                    if actual {
+                        "pub fn actual() -> usize { crate::text::parse(\"x\") }\n"
+                    } else {
+                        ""
+                    }
+                ),
+            );
+            repo.init_git();
+            repo.commit_all("initial");
+            repo.write(
+                "src/text.rs",
+                "pub(crate) fn parse(input: &str, base: usize) -> usize { input.len() + base }\n",
+            );
+            let context = repo.run_json("context", &["--git"]);
+            let callers = context["changes"][0]["impacted_callers"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            assert_eq!(
+                callers.len(),
+                usize::from(actual),
+                "{declaration} / {extra} / {imported}: {context}"
+            );
+            let output = cargo_bin()
+                .args(["impact", "--dir", repo.root().to_str().unwrap(), "--git"])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(i32::from(actual)), "{context}");
+        }
+    }
+}
+
+#[test]
+fn impact_rust_associated_paths_keep_unknown_or_shadowed_type_bindings() {
+    for consumer in [
+        "pub struct Catalog; make_items!(); pub fn total() -> usize { Catalog::parse(\"x\") }",
+        "pub struct Catalog; macro_rules! make_items { () => {} } pub fn total() -> usize { Catalog::parse(\"x\") }",
+        "use crate::text as Catalog; pub fn total() -> usize { Catalog::parse(\"x\") }",
+        "pub struct Catalog; pub fn total<Catalog>() -> usize { Catalog::parse(\"x\") }",
+        "pub struct Catalog; pub fn total<r#Catalog>() -> usize { Catalog::parse(\"x\") }",
+        "pub struct Catalog; pub trait Other<Catalog> { fn total() -> usize { Catalog::parse(\"x\") } }",
+        "pub struct Katalog; pub fn total<Katalog>() -> usize { Katalog::parse(\"x\") }",
+        "pub struct Catalog; pub fn total() -> usize { use crate::text as Catalog; Catalog::parse(\"x\") }",
+        "pub struct Catalog; pub fn total() -> usize { type Catalog = crate::text::Catalog; Catalog::parse(\"x\") }",
+        "pub struct Catalog; pub fn total() -> usize { mod r#Catalog { pub use crate::text::parse; } Catalog::parse(\"x\") }",
+        "use custom::Debug; #[derive(Debug)] pub struct Catalog; pub fn total() -> usize { Catalog::parse(\"x\") }",
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        repo.write("src/lib.rs", "mod text;\nmod consumer;\n");
+        repo.write(
+            "src/text.rs",
+            "pub(crate) fn parse(input: &str) -> usize { input.len() }\n",
+        );
+        repo.write("src/consumer.rs", consumer);
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "src/text.rs",
+            "pub(crate) fn parse(input: &str, base: usize) -> usize { input.len() + base }\n",
+        );
+        let context = repo.run_json("context", &["--git"]);
+        assert!(
+            context["changes"][0]["impacted_callers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|caller| caller["path"] == "src/consumer.rs"),
+            "{consumer}: {context}"
+        );
+    }
+}
+
 fn rust_scope_repo(consumer: &str) -> TestRepo {
     let repo = TestRepo::new();
     repo.write("api.rs", "pub fn comments() -> usize { 1 }\n");

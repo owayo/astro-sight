@@ -609,14 +609,14 @@ fn rust_visibility_widening_to_restricted_scope_keeps_uncertain_callers_blocking
         "both-roots",
         "staged",
     ] {
-        let (files, after, caller): (Vec<(&str, &str)>, &str, &str) = match case {
+        let (mut files, after, caller): (Vec<(&str, &str)>, &str, &str) = match case {
             // 新しい範囲の中で旧範囲の外: 変更前の参照ではないと証明していないので残す。
             "sibling" => (
                 vec![
                     sibling_mod,
                     (
                         sibling,
-                        "pub struct Catalog;\nimpl Catalog { pub fn parse(_: &str) -> usize { 2 } }\npub fn run() -> usize {\n    let values = vec![1usize];\n    values.len() + Catalog::parse(\"x\")\n}\n",
+                        "pub fn run() -> usize {\n    let _value = super::ascii::parse(\"x\");\n    2\n}\n",
                     ),
                 ],
                 NUMERIC_ASCII_SUPER,
@@ -677,6 +677,13 @@ fn rust_visibility_widening_to_restricted_scope_keeps_uncertain_callers_blocking
             "staged" => (Vec::new(), NUMERIC_ASCII_SUPER, UNRELATED),
             _ => unreachable!(),
         };
+        // 型パスの独立した証明に頼らず、変更した自由関数への実参照で保守側の判定を確かめる。
+        if caller == UNRELATED && !files.iter().any(|(path, _)| *path == UNRELATED) {
+            files.push((
+                UNRELATED,
+                "pub fn run() { let _value = crate::numeric::ascii::parse(\"x\"); }\n",
+            ));
+        }
         let repo = numeric_fixture(&files, after);
         let args = if case == "staged" {
             repo.stage_all();

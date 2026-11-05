@@ -673,9 +673,15 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                     self.rust_path_owner_project,
                 )
             });
-        let rust_associated_type_path = rust_owner_index
-            .zip(node)
-            .is_some_and(|(index, node)| index.is_local_associated_path(node, source));
+        let rust_associated_type_path = rust_owner_index.zip(node).is_some_and(|(index, node)| {
+            index.is_local_associated_path(
+                node,
+                source,
+                Path::new(self.dir),
+                self.path_str,
+                self.rust_path_owner_project,
+            )
+        });
         let rust_plain_name = self.ref_lang == Some(LangId::Rust)
             && !ref_in_macro
             && !rust_macro_callee
