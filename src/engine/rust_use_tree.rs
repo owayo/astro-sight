@@ -160,21 +160,29 @@ pub(crate) fn expand_rust_use_tree_edges_ast(
                 // named child = [path]
                 let mut cursor = node.walk();
                 let path_node = node.named_children(&mut cursor).next();
-                if let Some(path_node) = path_node {
+                let (target_module, origin) = if let Some(path_node) = path_node {
                     let (resolved_prefix, leaf_name, own_origin) =
                         resolve_use_path_node(path_node, source, &path_prefix, current_module)?;
                     let mut target_module = resolved_prefix;
                     if let Some(name) = leaf_name {
                         target_module.push(name);
                     }
-                    if !target_module.is_empty() {
-                        out.push(RustPubUseEdge::Wildcard {
-                            source_module: source_module.to_vec(),
-                            target_module,
-                            origin: prefix_origin.unwrap_or(own_origin),
-                        });
+                    (target_module, prefix_origin.unwrap_or(own_origin))
+                } else {
+                    if path_prefix.is_empty() && prefix_origin.is_none() {
+                        return None;
                     }
-                }
+                    (
+                        path_prefix.to_vec(),
+                        prefix_origin.unwrap_or(UsePathOrigin::Bare),
+                    )
+                };
+                // 空の経路も crate root への有効な glob なので落とさない。
+                out.push(RustPubUseEdge::Wildcard {
+                    source_module: source_module.to_vec(),
+                    target_module,
+                    origin,
+                });
             }
             "scoped_identifier" | "identifier" | "crate" | "self" | "super" => {
                 // path::name 形式の単純 re-export、または anchor 単体。
@@ -596,20 +604,28 @@ mod tests {
             }
             "use_wildcard" => {
                 let mut cursor = node.walk();
-                if let Some(path_node) = node.named_children(&mut cursor).next() {
-                    let (mut target_module, leaf_name, own_origin) =
-                        resolve_use_path_node(path_node, source, path_prefix, current_module)?;
-                    if let Some(name) = leaf_name {
-                        target_module.push(name);
-                    }
-                    if !target_module.is_empty() {
-                        out.push(RustPubUseEdge::Wildcard {
-                            source_module: source_module.to_vec(),
-                            target_module,
-                            origin: prefix_origin.unwrap_or(own_origin),
-                        });
-                    }
-                }
+                let (target_module, origin) =
+                    if let Some(path_node) = node.named_children(&mut cursor).next() {
+                        let (mut target_module, leaf_name, own_origin) =
+                            resolve_use_path_node(path_node, source, path_prefix, current_module)?;
+                        if let Some(name) = leaf_name {
+                            target_module.push(name);
+                        }
+                        (target_module, prefix_origin.unwrap_or(own_origin))
+                    } else {
+                        if path_prefix.is_empty() && prefix_origin.is_none() {
+                            return None;
+                        }
+                        (
+                            path_prefix.to_vec(),
+                            prefix_origin.unwrap_or(UsePathOrigin::Bare),
+                        )
+                    };
+                out.push(RustPubUseEdge::Wildcard {
+                    source_module: source_module.to_vec(),
+                    target_module,
+                    origin,
+                });
             }
             "scoped_identifier" | "identifier" | "crate" | "self" | "super" => {
                 let (resolved_prefix, leaf_name, own_origin) =
@@ -807,6 +823,9 @@ mod tests {
             |names: &[&str]| -> Vec<String> { names.iter().map(|name| name.to_string()).collect() };
         let current = module(&["reader"]);
         for (src, want) in [
+            ("pub use crate::*;", vec![(vec![], None, Anchored)]),
+            ("pub use crate::{*};", vec![(vec![], None, Anchored)]),
+            ("pub use a::{*};", vec![(vec!["a"], None, Bare)]),
             (
                 "pub use value::NewValue;",
                 vec![(vec!["value"], Some("NewValue"), Bare)],

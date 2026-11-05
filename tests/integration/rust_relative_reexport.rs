@@ -4,6 +4,185 @@
 use super::support::*;
 
 #[test]
+fn review_rust_public_signatures_expose_hidden_types_individually() {
+    for (reader, exposed) in [
+        (
+            "use crate::hidden::Mode; pub fn current() -> Mode { Mode::Fast }",
+            true,
+        ),
+        ("pub fn current() -> u32 { 1 }", false),
+        (
+            "use super::*; pub fn parent_glob() -> Mode { Mode::Fast }",
+            true,
+        ),
+        (
+            "use crate::{*}; pub fn root_glob() -> Mode { Mode::Fast }",
+            true,
+        ),
+        (
+            "use crate::hidden::Mode; pub fn namespace_control() -> Mode { Mode::Fast }",
+            true,
+        ),
+        ("pub use crate::hidden::Mode;", true),
+        ("use crate::hidden::Mode; pub use Mode::Fast;", true),
+        (
+            "use crate::hidden::Mode as Current; pub fn current() -> Current { Current::Fast }",
+            true,
+        ),
+        (
+            "use crate::hidden::Mode; type Current = Mode; pub fn current() -> Current { Mode::Fast }",
+            true,
+        ),
+        ("use crate::hidden::Mode; pub fn accept(_: Mode) {}", true),
+        (
+            "use crate::hidden::Mode; pub struct Wrapper { pub mode: Mode }",
+            true,
+        ),
+        (
+            "use crate::hidden::Mode; pub struct Wrapper { mode: Mode }",
+            false,
+        ),
+        (
+            "use crate::hidden::Mode; pub fn current() -> impl Tag { Mode::Fast }",
+            false,
+        ),
+        (
+            "use crate::hidden::Mode; pub trait Opaque { type Item; } impl Opaque for Mode { type Item = Mode; } pub fn current() -> impl Opaque { Mode::Fast }",
+            false,
+        ),
+        (
+            "use crate::hidden::Mode; pub trait Get<T: Default> { fn get(&self) -> T { T::default() } } pub struct Wrapper; impl Get<Mode> for Wrapper {}",
+            true,
+        ),
+        (
+            "use crate::hidden::Mode; pub trait Get { type Item; fn get(&self) -> Self::Item; } impl<T> Get for T { type Item = Mode; fn get(&self) -> Mode { Mode::Fast } }",
+            true,
+        ),
+        (
+            "use crate::hidden::Mode as r#Current; pub fn current() -> r#Current { r#Current::Fast }",
+            true,
+        ),
+        (
+            "use crate::hidden::Mode; pub const FACTORY: fn() -> Mode = || Mode::Fast;",
+            true,
+        ),
+        (
+            "use crate::hidden::Mode; unsafe extern \"C\" { pub fn current() -> Mode; }",
+            true,
+        ),
+        (
+            "use crate::hidden::Mode; pub fn current<T>(_: T) -> Mode { Mode::Fast }",
+            true,
+        ),
+        (
+            "use crate::hidden::Mode; pub enum Wrapper { Value(Mode) }",
+            true,
+        ),
+        (
+            "use crate::hidden::Mode; pub struct Wrapper(pub Mode);",
+            true,
+        ),
+        ("use crate::hidden::Mode; pub struct Wrapper(Mode);", false),
+        (
+            "use crate::hidden::Mode; pub trait Factory { fn mode(&self) -> Mode; }",
+            true,
+        ),
+        (
+            "use crate::hidden::Mode; pub trait Factory { type Item: Into<Mode>; }",
+            true,
+        ),
+        (
+            "use crate::hidden::Mode; pub struct Wrapper; impl Wrapper { pub fn mode() -> Mode { Mode::Fast } }",
+            true,
+        ),
+        (
+            "use crate::hidden::Mode; pub struct Wrapper; impl Wrapper { fn mode() -> Mode { Mode::Fast } }",
+            false,
+        ),
+        (
+            "pub mod other { pub struct Mode; } pub fn current() -> other::Mode { other::Mode }",
+            false,
+        ),
+        (
+            "pub mod other { pub struct Mode; } use self::other::Mode; pub fn current() -> Mode { Mode }",
+            false,
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"signatures\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        let root = if reader.contains("parent_glob") || reader.contains("root_glob") {
+            "mod hidden; use hidden::Mode; pub mod reader;\n"
+        } else {
+            "mod hidden; pub mod reader;\n"
+        };
+        repo.write("src/lib.rs", root);
+        repo.write(
+            "src/not_a_module.rs",
+            "#[derive(Custom)] pub struct Orphan;\n",
+        );
+        repo.write("src/reader.rs", format!("pub trait Tag {{}}\n{reader}"));
+        let namespace_function = if reader.contains("namespace_control") {
+            "pub fn Mode() -> Unrelated { Unrelated }\n"
+        } else {
+            ""
+        };
+        repo.write("src/hidden.rs", ["pub enum Mode { Fast }\nimpl Mode { pub fn amount(&self) -> usize { 1 } pub fn next(&self) -> Other { Other } }\nimpl crate::reader::Tag for Mode {}\nimpl Default for Mode { fn default() -> Self { Mode::Fast } }\npub struct Other;\nimpl Other { pub fn amount(&self) -> usize { 1 } }\npub struct Unrelated;\nimpl Unrelated { pub fn untouched(&self) {} }\n", namespace_function].concat());
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write("src/hidden.rs", ["pub enum Mode { Fast }\nimpl Mode { pub fn amount(&self, scale: usize) -> usize { scale } pub fn next(&self) -> Other { Other } }\nimpl crate::reader::Tag for Mode {}\nimpl Default for Mode { fn default() -> Self { Mode::Fast } }\npub struct Other;\nimpl Other { pub fn amount(&self, scale: usize) -> usize { scale } }\npub struct Unrelated;\nimpl Unrelated { pub fn untouched(&self, extra: usize) {} }\n", namespace_function].concat());
+        let review = repo.run_json("review", &["--git"]);
+        let modified: Vec<_> = review["api_changes"]["modified"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|change| change["name"].as_str())
+            .collect();
+        assert_eq!(
+            modified.contains(&"Mode.amount"),
+            exposed,
+            "{reader}: {review}"
+        );
+        assert_eq!(
+            modified.contains(&"Other.amount"),
+            exposed,
+            "{reader}: {review}"
+        );
+        if !reader.contains("pub use Mode::Fast") {
+            assert!(
+                !modified.contains(&"Unrelated.untouched"),
+                "{reader}: {review}"
+            );
+        }
+        if reader == "use crate::hidden::Mode; pub fn current() -> Mode { Mode::Fast }" {
+            repo.stage_all();
+            let staged = repo.run_json("review", &["--git", "--staged"]);
+            assert!(
+                staged["api_changes"]["modified"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|change| change["name"] == "Mode.amount"),
+                "{staged}"
+            );
+            let hook = cargo_bin()
+                .args(["review", "--git", "--staged", "--hook", "--dir"])
+                .arg(repo.root())
+                .output()
+                .unwrap();
+            assert!(!hook.status.success(), "{hook:?}");
+            assert!(
+                String::from_utf8_lossy(&hook.stderr).contains("api.mod"),
+                "{hook:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn review_rust_global_reexport_distinguishes_external_and_local_crates() {
     for (edition, root, reexport, exposed) in [
         ("2021", "mod dep { pub mod api {} }", "::dep::api", true),

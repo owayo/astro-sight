@@ -6,6 +6,7 @@ use super::super::git_input::validate_git_revision;
 use super::{bare_name, find_mod_decl_visibility, module_path_segments};
 
 mod reexport_graph;
+mod signature_types;
 mod source_tree;
 mod use_tree;
 pub(crate) use reexport_graph::*;

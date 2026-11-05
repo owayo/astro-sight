@@ -16,6 +16,8 @@ pub(crate) struct RustPubUseIndex {
     named_by_target: std::collections::HashMap<RustExportKey, Vec<usize>>,
     /// `target_module` → Wildcard edge index。Wildcard 伝播の逆引き。
     wildcard_by_target_module: std::collections::HashMap<Vec<String>, Vec<usize>>,
+    signature_types: std::collections::HashSet<super::signature_types::TypeKey>,
+    signature_unknown: bool,
 }
 
 /// 「ある module でこの名前がエクスポートされている」を表す key。固定点計算の単位。
@@ -33,9 +35,20 @@ impl RustPubUseIndex {
     /// `pub use self::wifi as api;` で公開されているケースも item 伝播なしで検出できる。
     pub(super) fn exposes_symbol(&self, info: &RustPrivateModuleInfo, symbol_name: &str) -> bool {
         let item = rust_reexport_item_name(symbol_name).to_string();
+        self.signature_unknown
+            || self
+                .signature_types
+                .contains(&super::signature_types::TypeKey {
+                    module: info.module_segments.clone(),
+                    name: item.clone(),
+                })
+            || self.exposes_key(&info.module_segments, &item)
+    }
+
+    fn exposes_key(&self, module: &[String], name: &str) -> bool {
         let seed = RustExportKey {
-            module: info.module_segments.clone(),
-            name: item,
+            module: module.to_vec(),
+            name: name.to_owned(),
         };
         self.propagate_live_exports(seed)
             .into_iter()
@@ -123,7 +136,9 @@ pub(crate) fn collect_rust_pub_use_index(
     info: &RustPrivateModuleInfo,
 ) -> Option<RustPubUseIndex> {
     let files = collect_rust_rs_files(source, dir, &info.src_root_rel)?;
+    let module_tree = collect_all_modules(source, dir, info)?;
     let mut collected: Vec<CollectedPubUseEdge> = Vec::new();
+    let mut signatures = super::signature_types::SignatureTypes::default();
     for file in files {
         let Ok(rel_to_src) = file.strip_prefix(&info.src_root_rel) else {
             continue;
@@ -137,19 +152,16 @@ pub(crate) fn collect_rust_pub_use_index(
             return None;
         }
         collect_pub_use_edges(tree.root_node(), &file_source, &module_path, &mut collected)?;
+        if module_tree.pub_children.contains_key(&module_path)
+            && (!module_path.is_empty() || rel_to_src == std::path::Path::new("lib.rs"))
+        {
+            signatures.collect(tree.root_node(), &file_source, &module_path)?;
+        }
     }
-    let module_tree = collect_all_modules(source, dir, info)?;
     // edition と self 別名は、どちらも判定する側の snapshot から読む。
-    let needs_edition = collected.iter().any(|collected| {
-        collected.bare_leading.is_some() || collected.edge.origin() == UsePathOrigin::Global
+    let edition = crate::engine::rust_edition::library_edition(&info.crate_root_rel, |manifest| {
+        read_rust_manifest(source, dir, manifest)
     });
-    let edition = needs_edition
-        .then(|| {
-            crate::engine::rust_edition::library_edition(&info.crate_root_rel, |manifest| {
-                read_rust_manifest(source, dir, manifest)
-            })
-        })
-        .flatten();
     let collected = resolve_global_pub_use_edges(collected, edition, || {
         read_rust_module_source(
             source,
@@ -204,12 +216,31 @@ pub(crate) fn collect_rust_pub_use_index(
         &module_tree,
         &unconditional_named_edges,
     );
-    Some(RustPubUseIndex {
+    let mut index = RustPubUseIndex {
         edges,
         reachable_modules,
         named_by_target,
         wildcard_by_target_module,
-    })
+        signature_types: std::collections::HashSet::new(),
+        signature_unknown: false,
+    };
+    let aliases = read_rust_module_source(
+        source,
+        dir,
+        &info.crate_root_rel,
+        std::path::Path::new("lib.rs"),
+    )
+    .and_then(|source| global_self_aliases(&source));
+    let (types, unknown) = signatures.reachable(
+        all_modules,
+        &module_tree.unconditional,
+        edition,
+        aliases,
+        |module, name| index.exposes_key(module, name),
+    );
+    index.signature_types = types;
+    index.signature_unknown = unknown;
+    Some(index)
 }
 
 /// Global の経路をローカルのグラフへ混ぜない。2015 と self 別名だけを root 起点へ直す。

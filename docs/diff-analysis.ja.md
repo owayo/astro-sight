@@ -382,6 +382,14 @@ astro-sight review --dir . --git \
 
 既定の hook は情報提供にし、`--strict-public-const-values` 指定時は blocking にする。`g`・`y` などの flags は正規表現の使い方を変えうるため、動作が同じという証明ではない。種類の変更、置換あり・タグ付きの template、assertion、`satisfies` は従来の判定を維持する。宣言ヘッダの検査と、静的 object / array の scalar 葉の判定も変えない。
 
+### Rust の公開シグネチャから届く型
+
+private module の型も、公開関数の引数・戻り値、公開フィールド、enum のバリアント、trait のメソッド・関連型から届けば公開 API 面に含める。型ごとに module と名前を保持し、named import・別名・再公開・型別名をたどる。届いた型の公開メソッドが返す別の型にも伝播するため、名前を外から書けない型のメソッド変更も検出できる。
+
+private フィールド・private メソッドの戻り値や、関数本体にだけ現れる `impl Trait` の具体型は公開経路に含めない。型マクロ、解決できない関連型や import の循環などで公開範囲を確定できない場合は、API 変更を保守側に残す。旧側と新側はそれぞれの snapshot から判定し、ステージ済みの解析にも適用する。
+
+項目マクロや未知の属性が公開項目を生成し得る場合も、公開面からの除外を保留する。標準の derive・属性の名前は、同名のマクロ定義や named import、外部の glob で置換され得ないことを確認する。
+
 ### Rust の内部モジュールの定数値変更
 
 Rust の `pub const` / 非 `mut` の `pub static` は、同一パスの通常変更で名前・型・可視性・binding kind が変わらず、初期値だけが変わった場合、既存の `api_changes.const_value_changes`（hook では `api.const_value`）へ分類する。Cargo のbin-only crateやlibraryのprivate moduleにある場合も、外部API面から除く処理より先にこの値変更の情報を保持する。既定のhookでは、この分類だけを理由に未更新参照で停止しない。`--strict-public-const-values` を付けると同じ分類をblockingとして扱う。
