@@ -139,12 +139,26 @@ pub(crate) fn collect_rust_pub_use_index(
         collect_pub_use_edges(tree.root_node(), &file_source, &module_path, &mut collected)?;
     }
     let module_tree = collect_all_modules(source, dir, info)?;
-    // edition は同じ source tree (base は base の snapshot) の manifest から決める。
-    let collected = resolve_bare_pub_use_edges(collected, &module_tree, || {
-        crate::engine::rust_edition::library_edition(&info.crate_root_rel, |manifest| {
-            read_rust_manifest(source, dir, manifest)
+    // edition と self 別名は、どちらも判定する側の snapshot から読む。
+    let needs_edition = collected.iter().any(|collected| {
+        collected.bare_leading.is_some() || collected.edge.origin() == UsePathOrigin::Global
+    });
+    let edition = needs_edition
+        .then(|| {
+            crate::engine::rust_edition::library_edition(&info.crate_root_rel, |manifest| {
+                read_rust_manifest(source, dir, manifest)
+            })
         })
+        .flatten();
+    let collected = resolve_global_pub_use_edges(collected, edition, || {
+        read_rust_module_source(
+            source,
+            dir,
+            &info.crate_root_rel,
+            std::path::Path::new("lib.rs"),
+        )
     })?;
+    let collected = resolve_bare_pub_use_edges(collected, &module_tree, || edition)?;
     let unconditional_named_edges: std::collections::HashSet<_> = collected
         .iter()
         .enumerate()
@@ -196,6 +210,109 @@ pub(crate) fn collect_rust_pub_use_index(
         named_by_target,
         wildcard_by_target_module,
     })
+}
+
+/// Global の経路をローカルのグラフへ混ぜない。2015 と self 別名だけを root 起点へ直す。
+fn resolve_global_pub_use_edges(
+    collected: Vec<CollectedPubUseEdge>,
+    edition: Option<crate::engine::rust_edition::RustEdition>,
+    root_source: impl FnOnce() -> Option<Vec<u8>>,
+) -> Option<Vec<CollectedPubUseEdge>> {
+    use crate::engine::rust_edition::RustEdition;
+    if !collected
+        .iter()
+        .any(|collected| collected.edge.origin() == UsePathOrigin::Global)
+    {
+        return Some(collected);
+    }
+    let edition = edition?;
+    let aliases = match edition {
+        RustEdition::E2015 => std::collections::HashSet::new(),
+        RustEdition::E2018OrLater => global_self_aliases(&root_source()?)?,
+    };
+    let mut result = Vec::new();
+    for mut collected in collected {
+        if collected.edge.origin() == UsePathOrigin::Global {
+            let (target_module, target_item, origin) = match &mut collected.edge {
+                RustPubUseEdge::Named {
+                    target_module,
+                    target_item,
+                    origin,
+                    ..
+                } => (target_module, Some(target_item), origin),
+                RustPubUseEdge::Wildcard {
+                    target_module,
+                    origin,
+                    ..
+                } => (target_module, None, origin),
+            };
+            if edition == RustEdition::E2018OrLater {
+                let first = target_module.first().or(target_item.as_deref())?;
+                if !aliases.contains(first.strip_prefix("r#").unwrap_or(first)) {
+                    // extern prelude の経路は、この crate 内の宣言や module を運ばない。
+                    continue;
+                }
+                if target_module.is_empty() {
+                    // crate 自体の名前付き再公開は、この item グラフでは表現できない。
+                    return None;
+                }
+                target_module.remove(0);
+            }
+            *origin = UsePathOrigin::Anchored;
+        }
+        result.push(collected);
+    }
+    Some(result)
+}
+
+/// root で確実に extern prelude へ入る self 別名を集める。生成され得る別名は推測しない。
+fn global_self_aliases(source: &[u8]) -> Option<std::collections::HashSet<String>> {
+    let tree = parser::parse_source(source, crate::language::LangId::Rust).ok()?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let mut aliases = std::collections::HashSet::new();
+    let mut cursor = root.walk();
+    for item in root.named_children(&mut cursor) {
+        match item.kind() {
+            "attribute_item" | "inner_attribute_item" => {
+                crate::engine::impact::rust_std_origin::safe_attribute(item, source)?;
+                if item
+                    .named_child(0)?
+                    .named_child(0)?
+                    .utf8_text(source)
+                    .ok()?
+                    == "derive"
+                {
+                    // derive 名の置換を証明していないため、生成される root の項目を決めない。
+                    return None;
+                }
+            }
+            "macro_invocation" => return None,
+            "expression_statement"
+                if item
+                    .named_child(0)
+                    .is_some_and(|child| child.kind() == "macro_invocation") =>
+            {
+                return None;
+            }
+            "extern_crate_declaration" => {
+                let name = item.child_by_field_name("name")?.utf8_text(source).ok()?;
+                if name == "self" {
+                    if !item_attributes_are_plain(item, source) {
+                        return None;
+                    }
+                    let alias = item.child_by_field_name("alias")?.utf8_text(source).ok()?;
+                    if !aliases.insert(alias.strip_prefix("r#").unwrap_or(alias).to_owned()) {
+                        return None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(aliases)
 }
 
 /// 先頭が識別子の edge (Bare) を、edition と use と同じスコープの束縛で読み直す。
@@ -707,6 +824,46 @@ pub(crate) fn read_rs_blob(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_use_paths_need_edition_and_proven_self_aliases() {
+        use crate::engine::rust_edition::RustEdition::{E2015, E2018OrLater};
+        let resolve = |edition, root: &str| {
+            let source = b"pub use ::dep::api; pub use ::dep::*;";
+            let tree = parser::parse_source(source, crate::language::LangId::Rust).unwrap();
+            let mut edges = Vec::new();
+            collect_pub_use_edges(tree.root_node(), source, &[], &mut edges).unwrap();
+            resolve_global_pub_use_edges(edges, edition, || Some(root.as_bytes().to_vec()))
+        };
+        assert!(resolve(Some(E2018OrLater), "").unwrap().is_empty());
+        assert!(resolve(None, "").is_none());
+        for root in [
+            "#[cfg(any())] extern crate self as dep;",
+            "generate_alias!();",
+            "#[custom] struct Item;",
+            "#[derive(Debug)] struct Item;",
+            "extern crate self as dep; extern crate self as dep;",
+            "extern crate self as",
+        ] {
+            assert!(resolve(Some(E2018OrLater), root).is_none(), "{root}");
+        }
+        for (edition, root, target) in [
+            (E2015, "", vec!["dep"]),
+            (E2018OrLater, "extern crate self as dep;", vec![]),
+            (E2018OrLater, "extern crate self as r#dep;", vec![]),
+        ] {
+            let edges = resolve(Some(edition), root).unwrap();
+            assert_eq!(edges.len(), 2);
+            for collected in edges {
+                assert_eq!(collected.edge.origin(), UsePathOrigin::Anchored);
+                let module = match collected.edge {
+                    RustPubUseEdge::Named { target_module, .. }
+                    | RustPubUseEdge::Wildcard { target_module, .. } => target_module,
+                };
+                assert_eq!(module, target, "{root}");
+            }
+        }
+    }
 
     impl ModuleVisibilityCollector<'_, '_> {
         /// 修正前の再帰と同じ形の参照実装 (浅い入力でだけ使う)。辿る範囲 (module のスコープ
