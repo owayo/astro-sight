@@ -3,6 +3,73 @@
 use super::support::*;
 
 #[test]
+fn impact_rust_import_anchors_ignore_spacing_and_keep_real_callers() {
+    for (import, root_owner, child) in [
+        ("crate::alpha::helper", true, true),
+        ("crate :: alpha :: helper", true, true),
+        ("crate /* root */ :: alpha :: helper", true, true),
+        ("super::alpha::helper", true, true),
+        ("super :: alpha :: helper", true, true),
+        (
+            "{crate :: alpha :: helper, self :: alpha :: local}",
+            true,
+            true,
+        ),
+        ("self::alpha::helper", false, true),
+        ("self :: alpha :: helper", false, true),
+        ("alpha::helper", false, true),
+        ("::alpha :: helper", true, true),
+        ("crate :: alpha :: helper", true, false),
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src/beta");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"spaced\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        repo.write("src/lib.rs", "pub mod alpha;\npub mod beta;\n");
+        repo.write("src/alpha.rs", "pub fn helper(x: u32) -> u32 { x }\n");
+        let module = if child { "mod alpha;" } else { "" };
+        repo.write(
+            "src/beta.rs",
+            format!("{module}\nuse {import};\npub fn run() -> u32 {{ helper(1) }}\n"),
+        );
+        if child {
+            repo.write(
+                "src/beta/alpha.rs",
+                "pub fn helper(x: u32) -> u32 { x + 1 }\npub fn local() -> u32 { helper(0) }\n",
+            );
+        }
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "src/alpha.rs",
+            "pub fn helper(x: u32, y: u32) -> u32 { x + y }\n",
+        );
+        let context = repo.run_json("context", &["--git"]);
+        let callers = context["changes"][0]["impacted_callers"].as_array();
+        let actual = callers.is_some_and(|callers| {
+            callers
+                .iter()
+                .any(|caller| caller["path"] == "src/beta.rs" && caller["line"] == 2)
+        });
+        assert_eq!(actual, root_owner, "{import}: {context}");
+        assert!(
+            callers.is_none_or(|callers| callers
+                .iter()
+                .all(|caller| caller["path"] != "src/beta/alpha.rs")),
+            "{import}: {context}"
+        );
+        let output = cargo_bin()
+            .args(["impact", "--git", "--hook", "--dir"])
+            .arg(repo.root())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), !root_owner, "{import}: {output:?}");
+    }
+}
+
+#[test]
 fn impact_rust_imports_and_reexports_follow_their_owner() {
     let repo = TestRepo::new();
     repo.create_dir_all("src");
