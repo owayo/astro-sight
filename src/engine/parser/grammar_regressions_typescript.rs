@@ -494,10 +494,10 @@ fn typescript_type_query_node_and_field_contracts_exist() {
 }
 
 #[test]
-fn typescript_await_and_tagged_template_no_regression_vs_baseline() {
+fn typescript_await_controls_keep_shape_with_generic_tagged_template() {
     let source = "async function bare() { return await call<Item>(); }\nasync function grouped() { return await (call<Item>()); }\nconst tagged = tag<Item>`value`;\n";
-    // 旧文法の未解決構造を今回の修正で変えない。
-    let expected = "(program (function_declaration name: (identifier) parameters: (formal_parameters) body: (statement_block (return_statement (call_expression function: (await_expression (identifier)) type_arguments: (type_arguments (type_identifier)) arguments: (arguments))))) (function_declaration name: (identifier) parameters: (formal_parameters) body: (statement_block (return_statement (await_expression (parenthesized_expression (call_expression function: (identifier) type_arguments: (type_arguments (type_identifier)) arguments: (arguments))))))) (lexical_declaration (variable_declarator name: (identifier) value: (binary_expression left: (binary_expression left: (identifier) right: (identifier)) right: (template_string (string_fragment))))))";
+    // 通常の await の形は保ち、型引数付き template だけ call として扱う。
+    let expected = "(program (function_declaration name: (identifier) parameters: (formal_parameters) body: (statement_block (return_statement (call_expression function: (await_expression (identifier)) type_arguments: (type_arguments (type_identifier)) arguments: (arguments))))) (function_declaration name: (identifier) parameters: (formal_parameters) body: (statement_block (return_statement (await_expression (parenthesized_expression (call_expression function: (identifier) type_arguments: (type_arguments (type_identifier)) arguments: (arguments))))))) (lexical_declaration (variable_declarator name: (identifier) value: (call_expression function: (identifier) type_arguments: (type_arguments (type_identifier)) arguments: (template_string (string_fragment))))))";
     for lang in [LangId::Typescript, LangId::Tsx] {
         let tree = assert_typescript_parse_clean(source.as_bytes(), lang);
         assert_eq!(tree.root_node().to_sexp(), expected);
@@ -715,5 +715,95 @@ fn typescript_import_type_arguments_incremental_parse_recovers_invalid_to_valid(
             "import('./box.js').Box<string>",
         );
         Query::new(&lang.ts_language(), "(generic_type name: (member_expression object: (call_expression function: (import) arguments: (arguments (string))) property: (property_identifier)) type_arguments: (type_arguments (predefined_type)))").unwrap();
+    }
+}
+
+#[test]
+fn typescript_generic_tagged_templates_preserve_call_fields_and_ranges() {
+    for lang in [LangId::Typescript, LangId::Tsx] {
+        for (callee, args, template) in [
+            ("tag", "", "`value`"),
+            ("tag", "<Item>", "`value`"),
+            (
+                "db.query",
+                "<{ name: string }[]>",
+                "`SELECT name FROM locks`",
+            ),
+            ("tag", "<Map<string, Array<number>>>", "`value ${name}`"),
+            ("tag", "<typeof import(\"node:fs\")>", "`名前🙂`"),
+        ] {
+            let call = format!("{callee}{args}{template}");
+            let source = format!(
+                "// 名前🙂\r\nconst result = {call};\r\nexport function later() {{ return result; }}\r\n"
+            );
+            let bytes = source.as_bytes();
+            let tree = assert_typescript_parse_clean(bytes, lang);
+            let node = typescript_node_with_text(tree.root_node(), bytes, "call_expression", &call);
+            assert_eq!(
+                node.child_by_field_name("function")
+                    .unwrap()
+                    .utf8_text(bytes)
+                    .unwrap(),
+                callee
+            );
+            assert_eq!(
+                node.child_by_field_name("type_arguments")
+                    .map(|node| node.utf8_text(bytes).unwrap()),
+                (!args.is_empty()).then_some(args)
+            );
+            let arguments = node.child_by_field_name("arguments").unwrap();
+            assert_eq!(arguments.kind(), "template_string");
+            assert_eq!(arguments.utf8_text(bytes).unwrap(), template);
+            for node in typescript_nodes(tree.root_node()) {
+                assert_eq!(
+                    node.start_position(),
+                    typescript_point_at(bytes, node.start_byte())
+                );
+                assert_eq!(
+                    node.end_position(),
+                    typescript_point_at(bytes, node.end_byte())
+                );
+            }
+        }
+        for source in [
+            "tag<@>`value`;",
+            "tag<Item>`unterminated",
+            "tag?.<Item>`value`;",
+        ] {
+            assert!(
+                parse_source(source.as_bytes(), lang)
+                    .unwrap()
+                    .root_node()
+                    .has_error(),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn typescript_generic_tagged_template_incremental_parse_recovers() {
+    let valid =
+        "const rows = db.query<{ name: string }[]>`SELECT ${name}`;\nexport function later() {}\n";
+    let broken = valid.replace("{ name: string }[]", "@");
+    let at = broken.find('@').unwrap();
+    let replacement = "{ name: string }[]";
+    for lang in [LangId::Typescript, LangId::Tsx] {
+        let mut parser = Parser::new();
+        parser.set_language(&lang.ts_language()).unwrap();
+        let mut old = parser.parse(&broken, None).unwrap();
+        assert!(old.root_node().has_error());
+        old.edit(&InputEdit {
+            start_byte: at,
+            old_end_byte: at + 1,
+            new_end_byte: at + replacement.len(),
+            start_position: Point::new(0, at),
+            old_end_position: Point::new(0, at + 1),
+            new_end_position: Point::new(0, at + replacement.len()),
+        });
+        let tree = parser.parse(valid, Some(&old)).unwrap();
+        let fresh = assert_typescript_parse_clean(valid.as_bytes(), lang);
+        assert_eq!(tree.root_node().to_sexp(), fresh.root_node().to_sexp());
+        assert!(!tree.root_node().has_error());
     }
 }

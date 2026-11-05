@@ -35,3 +35,5 @@ All 16 languages get precise symbol extraction through tree-sitter queries. Ruby
 > ```
 
 `.zsh` files and zsh shebang scripts use the Bash grammar, not a native zsh parser. When parsing fails, `symbols` and `ast` identify this fallback in a diagnostic. Declarations inside `ERROR` regions may be absent from `symbols`; recognizable top-level declaration headers appear as `kind: "unknown"` in `refs`.
+
+TypeScript / TSX generic tagged templates (`tag<T>` followed by a template literal) are parsed as calls with type arguments and template arguments. This syntax in a function body also preserves the usual compatibility check for trailing optional parameter additions.
