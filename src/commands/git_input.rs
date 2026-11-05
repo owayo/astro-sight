@@ -9,8 +9,12 @@ use super::common::{
     read_paths_file_limited,
 };
 mod ts_extensions;
+
 pub use crate::git_support::DEFAULT_BLAME_BASE;
 pub(crate) use crate::git_support::validate_git_revision;
+pub(in crate::commands) use ts_extensions::{
+    ProvenPairs as TsExtensionProof, has_candidates as has_ts_extension_candidates,
+};
 
 /// `resolve_blame_source_files` の結果。起点ファイルが解決できたか、
 /// git 管理外 (かつ明示 `--paths` / `--paths-file` 無し) で skip かを型で表す。
@@ -827,6 +831,16 @@ fn run_git_diff_collecting_truncations(
     staged: bool,
     truncations: &mut Vec<TruncationInfo>,
 ) -> Result<String> {
+    run_git_diff_with_extension_proof(dir, base, staged, truncations, None).map(|(diff, _)| diff)
+}
+
+pub(in crate::commands) fn run_git_diff_with_extension_proof(
+    dir: &str,
+    base: &str,
+    staged: bool,
+    truncations: &mut Vec<TruncationInfo>,
+    replay: Option<&TsExtensionProof>,
+) -> Result<(String, TsExtensionProof)> {
     validate_git_revision(base, "--base")?;
     // git config `diff.renames` がユーザー環境で無効化されていても rename を検出できるよう、
     // 明示的に `--find-renames` を指定する。ファイル rename が api.rm/api.add の誤発報源に
@@ -934,8 +948,8 @@ fn run_git_diff_collecting_truncations(
     if !staged {
         append_untracked_added_diffs(dir, &mut diff, truncations);
     }
-    ts_extensions::normalize(dir, base, staged, &mut diff);
-    Ok(diff)
+    let proof = ts_extensions::normalize(dir, base, staged, &mut diff, replay, truncations);
+    Ok((diff, proof))
 }
 
 /// unstaged 解析用に未追跡の新規ソースファイルを diff に合成する (rename-aware)。

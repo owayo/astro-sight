@@ -843,6 +843,9 @@ pub(crate) fn build_review_hook_json_for_diff(
                     crate::models::truncation::TruncationReason::SourceAnalysisFailed => {
                         "source_analysis_failed"
                     }
+                    crate::models::truncation::TruncationReason::TsExtensionProofUnavailable => {
+                        "ts_extension_proof_unavailable"
+                    }
                 },
                 d: if t.reason == crate::models::truncation::TruncationReason::UnanalyzableSource {
                     t.detail

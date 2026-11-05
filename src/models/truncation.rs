@@ -62,6 +62,8 @@ pub enum TruncationReason {
     /// 中の参照を数えられなかった。dead-code はそのファイルから参照されうる候補を
     /// dead / test_only と断定しない (`dead-code` の出力では `unverified_symbols` に載せる)。
     SourceAnalysisFailed,
+    /// TS の拡張子変更で、設定・ソースの証拠を読み切れず同一モジュールと証明しなかった。
+    TsExtensionProofUnavailable,
 }
 
 impl TruncationInfo {

@@ -33,6 +33,12 @@ filter = 'binary_id(astro-sight::integration) & test(=integration::signature_typ
 priority = 50
 threads-required = 2
 
+# 祖先の設定・無関係なエントリを大量に作る回帰を先に実行する。
+[[profile.default.overrides]]
+filter = 'binary_id(astro-sight::integration) & (test(=integration::ts_extension_changes::ts_extension_changes_ignore_unrelated_ancestor_entries_and_snapshot_location) | test(=integration::ts_extension_changes::ts_extension_changes_config_budget_is_deduplicated_and_reported))'
+priority = 50
+threads-required = 2
+
 # CI (NEXTEST_PROFILE=ci): 失敗しても残りのテストを最後まで流し、失敗の出力を最後にもまとめて出す
 [profile.ci]
 fail-fast = false

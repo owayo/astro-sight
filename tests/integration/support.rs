@@ -12,6 +12,12 @@ impl TestRepo {
         }
     }
 
+    pub(super) fn new_in(parent: &Path) -> Self {
+        Self {
+            temp_dir: tempfile::tempdir_in(parent).expect("failed to create test repository"),
+        }
+    }
+
     pub(super) fn root(&self) -> &Path {
         self.temp_dir.path()
     }
