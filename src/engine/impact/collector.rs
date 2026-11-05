@@ -1169,7 +1169,9 @@ impl<'a> ImpactCollector<'a> {
             && !filter_disabled
             && !filters::is_same_source_file(self.path_str, source_path)
             && ctx.rust_private_widening_names.contains(name)
-            && self.rust_path_owner_project.allows_private_widening_paths();
+            && self
+                .rust_path_owner_project
+                .allows_private_widening_paths(name);
         let private_visibility_informational = if visibility_only_widening {
             let old_scope = *evidence
                 .rust_private_scope
@@ -1198,6 +1200,7 @@ impl<'a> ImpactCollector<'a> {
                         self.rust_path_owner_project.explicit_widening_scope(
                             source_path,
                             self.path_str,
+                            name,
                             proof,
                         )
                     })

@@ -135,6 +135,7 @@ pub(super) struct RustPathOwnerProjectProof {
     safe_macro_value_environment: OnceLock<bool>,
     no_source_inclusion: OnceLock<bool>,
     no_glob_imports: OnceLock<bool>,
+    widening_glob_imports: OnceLock<Option<HashSet<String>>>,
     parent_glob_widening_sources: OnceLock<bool>,
     module_wiring_unchanged: bool,
     private_scope_wiring_unchanged: bool,
@@ -188,6 +189,7 @@ impl RustPathOwnerProjectProof {
             safe_macro_value_environment: OnceLock::new(),
             no_source_inclusion: OnceLock::new(),
             no_glob_imports: OnceLock::new(),
+            widening_glob_imports: OnceLock::new(),
             parent_glob_widening_sources: OnceLock::new(),
             module_wiring_unchanged,
             private_scope_wiring_unchanged,
@@ -214,9 +216,10 @@ impl RustPathOwnerProjectProof {
     fn allows_private_scope_paths(&self) -> bool {
         self.private_scope_wiring_unchanged
             && self.has_safe_private_import_environment()
-            && *self
+            && (*self
                 .private_scope_sources
                 .get_or_init(|| scan_private_scope_sources(&self.root))
+                || self.allows_reexport_paths())
     }
 
     pub(super) fn allows_reexport_paths(&self) -> bool {
@@ -230,14 +233,37 @@ impl RustPathOwnerProjectProof {
         self.reexport_cargo_enabled
     }
 
-    /// Widening visibility can introduce a name through a glob anywhere in
-    /// the crate, including an ancestor module's re-export. Keep those cases
-    /// blocking until the import chain can be proved locally.
-    pub(super) fn allows_private_widening_paths(&self) -> bool {
-        self.allows_private_scope_paths()
-            && *self.no_glob_imports.get_or_init(|| {
-                scan_sources(&self.root, super::rust_visibility_scope::has_glob_import)
+    /// 非公開の親 glob だけなら、名前の輸送がないことを確かめて可視性の証明を使う。
+    pub(super) fn allows_private_widening_paths(&self, name: &str) -> bool {
+        if !self.allows_private_scope_paths() {
+            return false;
+        }
+        if *self
+            .no_glob_imports
+            .get_or_init(|| scan_sources(&self.root, super::rust_visibility_scope::has_glob_import))
+        {
+            return true;
+        }
+        let name = name.strip_prefix("r#").unwrap_or(name);
+        if name.is_empty() || !name.is_ascii() {
+            return false;
+        }
+        self.widening_glob_imports
+            .get_or_init(|| {
+                let mut names = HashSet::new();
+                let safe = scan_sources(&self.root, |source| {
+                    let Some(imports) =
+                        super::rust_visibility_scope::parent_glob_import_names(source)
+                    else {
+                        return true;
+                    };
+                    names.extend(imports);
+                    false
+                });
+                safe.then_some(names)
             })
+            .as_ref()
+            .is_some_and(|imports| !imports.contains(name))
     }
 
     /// 通常の直下子 module は、親の private 宣言を変更前から参照できる。
@@ -329,9 +355,10 @@ impl RustPathOwnerProjectProof {
         &self,
         source_path: &str,
         ref_path: &str,
+        name: &str,
         proof: &super::rust_visibility_scope::ExplicitWidening,
     ) -> Option<super::rust_visibility_scope::WideningScope> {
-        if !self.allows_private_widening_paths() {
+        if !self.allows_private_widening_paths(name) {
             return None;
         }
         let source = self.visibility_module(Path::new(source_path))?;
@@ -353,6 +380,8 @@ impl RustPathOwnerProjectProof {
         }
         let result = (|| {
             let (_, src, modules) = source_module_path_inner(&self.root, file, true)?;
+            // 全体の証明が標準名の置換も検査した場合は、局所の glob 一律禁止を重ねない。
+            let verify_syntax = !self.allows_reexport_paths();
             let mut owner = None;
             for root in [src.join("lib.rs"), src.join("main.rs")] {
                 // crate root 自体を別モジュールとして読む配置は所有元が一意でない。
@@ -361,7 +390,7 @@ impl RustPathOwnerProjectProof {
                         &self.root,
                         &src,
                         &[file.file_stem()?.to_str()?.to_owned()],
-                        true,
+                        verify_syntax,
                         true,
                         [root.clone()],
                     )
@@ -374,7 +403,7 @@ impl RustPathOwnerProjectProof {
                     &self.root,
                     &src,
                     &modules,
-                    true,
+                    verify_syntax,
                     true,
                     [root.clone()],
                 )
@@ -1596,7 +1625,7 @@ fn source_defines_allowed_macro(source: &[u8]) -> bool {
             else {
                 return true;
             };
-            if is_allowed_expression_macro(name) {
+            if is_allowed_expression_macro(name.strip_prefix("r#").unwrap_or(name)) {
                 return true;
             }
         }
@@ -2400,6 +2429,75 @@ mod tests {
         assert!(!scan_safe_private_import_environment(root.path()));
     }
 
+    #[test]
+    fn private_widening_ignores_nonpublic_parent_globs() {
+        for location in ["src/lib.rs", "src/numeric.rs", "src/unrelated.rs"] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("src")).unwrap();
+            for (path, source) in [
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                ),
+                (
+                    "src/lib.rs",
+                    "mod numeric;\nmod unrelated;\npub use std::fmt::Debug;\n",
+                ),
+                (
+                    "src/numeric.rs",
+                    "fn parse() {}\npub fn run() { parse(); }\n",
+                ),
+                ("src/unrelated.rs", "pub fn other() {}\n"),
+            ] {
+                let suffix = if path == location {
+                    "#[cfg(test)] mod tests { use super::*; #[test] fn works() { assert!(true); } }\n"
+                } else {
+                    ""
+                };
+                std::fs::write(root.path().join(path), format!("{source}{suffix}")).unwrap();
+            }
+            let proof = RustPathOwnerProjectProof::new(root.path(), true, true, true, &[], "");
+            assert!(proof.allows_private_widening_paths("parse"), "{location}");
+        }
+    }
+
+    #[test]
+    fn private_widening_parent_globs_keep_possible_name_transport_blocking() {
+        for extra in [
+            "use crate::numeric::*;",
+            "#[cfg(test)] mod tests { pub use super::*; }",
+            "use crate::numeric::parse as renamed; #[cfg(test)] mod tests { use super::*; }",
+            "pub use crate::numeric::parse as renamed; #[cfg(test)] mod tests { use super::*; }",
+            "macro_rules! assert { ($e:expr) => {} } #[cfg(test)] mod tests { use super::*; #[test] fn works() { assert!(true); } }",
+            "macro_rules! r#assert { ($e:expr) => {} } #[cfg(test)] mod tests { use super::*; #[test] fn works() { assert!(true); } }",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("src")).unwrap();
+            std::fs::write(
+                root.path().join("Cargo.toml"),
+                "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .unwrap();
+            std::fs::write(
+                root.path().join("src/lib.rs"),
+                "mod numeric;\nmod unrelated;\n",
+            )
+            .unwrap();
+            std::fs::write(
+                root.path().join("src/numeric.rs"),
+                "pub(crate) fn parse() {}\n",
+            )
+            .unwrap();
+            std::fs::write(root.path().join("src/unrelated.rs"), extra).unwrap();
+            let proof = RustPathOwnerProjectProof::new(root.path(), true, true, true, &[], "");
+            assert!(!proof.allows_private_widening_paths("parse"), "{extra}");
+            if extra.starts_with("use crate::numeric::parse as renamed;") {
+                assert!(proof.allows_private_widening_paths("other"), "{extra}");
+                assert!(!proof.allows_private_widening_paths("parse"), "{extra}");
+            }
+        }
+    }
+
     /// 可視性だけの拡大の分類は、宣言と参照が同じ crate root の通常のモジュールに属すると
     /// 証明できたときだけ行う。別の crate (bin) の参照と、所属を決められない参照 (tests/)
     /// は分類しない (`None`)。
@@ -2444,7 +2542,12 @@ mod tests {
             &changed,
         );
         let scope = |project: &RustPathOwnerProjectProof, reference: &str| {
-            project.explicit_widening_scope("src/numeric/ascii.rs", reference, &proofs["parse"])
+            project.explicit_widening_scope(
+                "src/numeric/ascii.rs",
+                reference,
+                "parse",
+                &proofs["parse"],
+            )
         };
         let project = RustPathOwnerProjectProof::new(root.path(), true, true, true, &[], "");
         assert_eq!(
@@ -2457,10 +2560,20 @@ mod tests {
         );
         assert_eq!(scope(&project, "src/tool.rs"), None);
         assert_eq!(scope(&project, "tests/flow.rs"), None);
-        // glob があると、範囲外の参照も新しい曖昧さで壊れ得るので分類しない。
+        // 非公開の親 glob は、ascii の中の parse を新たに取り込まない。
         std::fs::write(
             root.path().join("src/numeric/sibling.rs"),
             "use super::*;\npub fn run() {}\n",
+        )
+        .unwrap();
+        let project = RustPathOwnerProjectProof::new(root.path(), true, true, true, &[], "");
+        assert_eq!(
+            scope(&project, "src/unrelated.rs"),
+            Some(WideningScope::OutsideNew)
+        );
+        std::fs::write(
+            root.path().join("src/numeric/sibling.rs"),
+            "use super::ascii::*;\npub fn run() {}\n",
         )
         .unwrap();
         let project = RustPathOwnerProjectProof::new(root.path(), true, true, true, &[], "");

@@ -2,6 +2,55 @@
 
 use super::support::*;
 
+#[test]
+fn rust_private_visibility_widening_parent_test_globs_keep_external_calls_independent() {
+    let numeric =
+        "fn from_str(_: &str) -> usize { 1 }\npub fn total() -> usize { from_str(\"x\") }\n";
+    let tests = "#[cfg(test)] mod tests { use super::*; #[test] fn works() { assert!(true); } }\n";
+    for location in ["src/lib.rs", "src/numeric/ascii.rs", "src/unrelated.rs"] {
+        for visibility in ["pub(crate)", "pub(super)"] {
+            let repo = TestRepo::new();
+            repo.create_dir_all("src/numeric");
+            repo.write("Cargo.toml", "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nserde_json = \"1\"\n");
+            for (path, source) in [
+                ("src/lib.rs", "pub mod numeric;\npub mod unrelated;\n"),
+                ("src/numeric/mod.rs", "pub mod ascii;\n"),
+                ("src/numeric/ascii.rs", numeric),
+                (
+                    "src/unrelated.rs",
+                    "pub fn run() -> u32 { serde_json::from_str::<u32>(\"1\").unwrap() }\n",
+                ),
+            ] {
+                let suffix = if path == location { tests } else { "" };
+                repo.write(path, format!("{source}{suffix}"));
+            }
+            repo.init_git();
+            repo.commit_all("initial");
+            let suffix = if location == "src/numeric/ascii.rs" {
+                tests
+            } else {
+                ""
+            };
+            repo.write(
+                "src/numeric/ascii.rs",
+                format!("{visibility} {numeric}{suffix}"),
+            );
+            let context = repo.run_json("context", &["--git"]);
+            assert!(
+                !has_caller(&context, "impacted_callers", "src/unrelated.rs"),
+                "{location} / {visibility}: {context}"
+            );
+            for command in ["impact", "review"] {
+                let output = run_hook(&repo, command, &["--git"]);
+                assert!(
+                    output.status.success(),
+                    "{location} / {visibility} / {command}: {output:?}"
+                );
+            }
+        }
+    }
+}
+
 fn private_parent_glob_fixture(cargo: bool, directory_module: bool) -> TestRepo {
     let repo = TestRepo::new();
     let base = if cargo { "src/" } else { "" };
