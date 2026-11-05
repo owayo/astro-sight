@@ -2,6 +2,9 @@
 
 use super::*;
 
+mod binding_proof;
+pub(crate) use binding_proof::{Activation, BindingProof};
+
 /// `pub use` の edge 1 本と、先頭が識別子の path (`UsePathOrigin::Bare`) の先頭の名前が
 /// use と同じスコープで何に束縛されるか、および use 自身が条件なしか。
 ///
@@ -15,6 +18,7 @@ pub(crate) struct CollectedPubUseEdge {
     pub(crate) bare_leading: Option<BareLeadingBinding>,
     /// use 自身に条件や束縛を書き換え得る属性がない場合だけ glob を隠す根拠に使う。
     pub(crate) unconditional: bool,
+    pub(crate) activation: Activation,
 }
 
 /// Bare な path の先頭の名前の、use と同じスコープでの束縛 (2018 以降の解決規則で読む)。
@@ -23,6 +27,8 @@ pub(crate) enum BareLeadingBinding {
     /// 条件なし・一意・マクロの生成でない子 `mod` の宣言。2018 以降はこの子 module に解決する
     /// (宣言した名前は同名の extern crate や glob import より優先される)。
     ChildModule,
+    /// use が有効なとき子 module も有効になることを、宣言と内部属性から確認済み。
+    GuardedChildModule,
     /// 名前を束縛し得るもの (named import・別名・`extern crate`・同名の項目・条件付きか重複した
     /// `mod`・glob import・item 位置のマクロ) があり、どこを指すか決められない。
     Unresolved,
@@ -86,6 +92,7 @@ pub(crate) fn collect_pub_use_edges(
                         edge,
                         bare_leading,
                         unconditional: item_attributes_are_plain(node, source),
+                        activation: Activation::item(node, source),
                     });
                 }
             }
