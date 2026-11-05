@@ -22,6 +22,9 @@ use crate::engine::{
 use crate::language::LangId;
 use crate::models::impact::DiffFile;
 
+mod enum_owner;
+mod format_owner;
+
 struct FileEvidence {
     types: HashSet<String>,
     free_functions: HashSet<String>,
@@ -104,13 +107,17 @@ impl FileEvidence {
 pub(super) struct RustPathOwnerIndex {
     current: Option<Arc<FileEvidence>>,
     root_associated_paths: HashSet<usize>,
+    enum_variant_paths: HashSet<usize>,
     associated_types: RefCell<HashMap<String, bool>>,
     source_hash: blake3::Hash,
     direct_imports: HashMap<String, Vec<String>>,
     local_type_names: HashSet<String>,
-    local_function_names: HashSet<String>,
+    local_value_names: HashSet<String>,
     module_context: OnceLock<Option<(PathBuf, PathBuf, Vec<String>)>>,
     resolved_paths: RefCell<HashMap<Vec<String>, Option<PathBuf>>>,
+    enum_files: RefCell<HashMap<PathBuf, Option<enum_owner::EnumFile>>>,
+    enum_owners: RefCell<HashMap<(String, String), Option<PathBuf>>>,
+    format_environment: OnceLock<Option<format_owner::Environment>>,
 }
 
 /// Module-relative paths need a unique compilation context for each source
@@ -134,6 +141,7 @@ pub(super) struct RustPathOwnerProjectProof {
     safe_private_import_environment: OnceLock<bool>,
     safe_macro_value_environment: OnceLock<bool>,
     no_source_inclusion: OnceLock<bool>,
+    static_source_layout: OnceLock<Option<Vec<PathBuf>>>,
     no_glob_imports: OnceLock<bool>,
     widening_glob_imports: OnceLock<Option<HashSet<String>>>,
     parent_glob_widening_sources: OnceLock<bool>,
@@ -188,6 +196,7 @@ impl RustPathOwnerProjectProof {
             safe_private_import_environment: OnceLock::new(),
             safe_macro_value_environment: OnceLock::new(),
             no_source_inclusion: OnceLock::new(),
+            static_source_layout: OnceLock::new(),
             no_glob_imports: OnceLock::new(),
             widening_glob_imports: OnceLock::new(),
             parent_glob_widening_sources: OnceLock::new(),
@@ -211,6 +220,22 @@ impl RustPathOwnerProjectProof {
             && *self
                 .ordinary_sources
                 .get_or_init(|| scan_ordinary_sources(&self.root))
+    }
+
+    fn allows_static_source_path(&self, path: &Path) -> bool {
+        let Some(relocated) = self
+            .static_source_layout
+            .get_or_init(|| enum_owner::static_layout(&self.root, self))
+            .as_ref()
+        else {
+            return false;
+        };
+        let Some(file) = self.root.join(path).canonicalize().ok() else {
+            return false;
+        };
+        !relocated
+            .iter()
+            .any(|directory| file.starts_with(directory))
     }
 
     fn allows_private_scope_paths(&self) -> bool {
@@ -759,6 +784,9 @@ impl RustPathOwnerIndex {
         }
         let mut ancestor = node.parent();
         while let Some(scope) = ancestor {
+            if matches!(scope.kind(), "impl_item" | "trait_item") && has_attribute_prefix(scope) {
+                return false;
+            }
             if matches!(
                 scope.kind(),
                 "function_item" | "closure_expression" | "block"
@@ -771,16 +799,15 @@ impl RustPathOwnerIndex {
         true
     }
 
-    /// A unique file-root function owns an unqualified value call even when
-    /// its body contains expression macros or the source module is ambiguous.
-    pub(super) fn plain_local_function_owner(
+    /// 直下の一意な関数・定数・static の束縛を、利用位置の再束縛と区別する。
+    pub(super) fn plain_local_value_owner(
         &self,
         node: Node<'_>,
         source: &[u8],
         name: &str,
     ) -> bool {
         if node.kind() != "identifier"
-            || !self.local_function_names.contains(name)
+            || !self.local_value_names.contains(name)
             || blake3::hash(source) != self.source_hash
             || has_uncertain_ancestor(node)
         {
@@ -790,7 +817,7 @@ impl RustPathOwnerIndex {
         while let Some(scope) = ancestor {
             if matches!(
                 scope.kind(),
-                "function_item" | "closure_expression" | "block"
+                "function_item" | "closure_expression" | "block" | "impl_item" | "trait_item"
             ) && (has_attribute_prefix(scope)
                 || scope_can_rebind_import_name(scope, source, name))
             {
@@ -862,9 +889,15 @@ impl RustPathOwnerIndex {
         let mut type_counts = HashMap::<String, usize>::new();
         let mut function_counts = HashMap::<String, usize>::new();
         let mut root_imports = Vec::new();
+        let mut import_names = Some(HashSet::new());
         let mut root_uncertain = node.has_error();
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
+            if child.kind() == "inner_attribute_item"
+                && super::rust_std_origin::safe_attribute(child, source).is_none()
+            {
+                root_uncertain = true;
+            }
             if matches!(
                 child.kind(),
                 "macro_invocation" | "extern_crate_declaration"
@@ -882,7 +915,8 @@ impl RustPathOwnerIndex {
                         "struct_item" | "enum_item" | "union_item" | "trait_item"
                     ) {
                         *type_counts.entry(name.to_owned()).or_default() += 1;
-                    } else if child.kind() == "function_item" {
+                    } else if matches!(child.kind(), "function_item" | "const_item" | "static_item")
+                    {
                         *function_counts.entry(name.to_owned()).or_default() += 1;
                     }
                 }
@@ -893,6 +927,13 @@ impl RustPathOwnerIndex {
             } else {
                 root_uncertain = true;
             }
+            import_names =
+                import_names
+                    .zip(root_use_names(child, source))
+                    .map(|(mut names, found)| {
+                        names.extend(found);
+                        names
+                    });
             let Some(path) = child
                 .utf8_text(source)
                 .ok()
@@ -921,28 +962,32 @@ impl RustPathOwnerIndex {
         });
         let safe_name = |name: &str| {
             !root_uncertain
-                && !root_imports
-                    .iter()
-                    .any(|import| import.contains('*') || import.contains(name))
+                && import_names
+                    .as_ref()
+                    .is_some_and(|names| !names.contains(name))
         };
         let local_type_names = type_counts
             .into_iter()
             .filter_map(|(name, count)| (count == 1 && safe_name(&name)).then_some(name))
             .collect();
-        let local_function_names = function_counts
+        let local_value_names = function_counts
             .into_iter()
             .filter_map(|(name, count)| (count == 1 && safe_name(&name)).then_some(name))
             .collect();
         Self {
             current: FileEvidence::collect(node, source).map(Arc::new),
             root_associated_paths: root_associated_paths(node, source),
+            enum_variant_paths: root_associated_paths_with_attributes(node, source, true),
             associated_types: RefCell::new(HashMap::new()),
             source_hash: blake3::hash(source),
             direct_imports,
             local_type_names,
-            local_function_names,
+            local_value_names,
             module_context: OnceLock::new(),
             resolved_paths: RefCell::new(HashMap::new()),
+            enum_files: RefCell::new(HashMap::new()),
+            enum_owners: RefCell::new(HashMap::new()),
+            format_environment: OnceLock::new(),
         }
     }
 
@@ -1200,6 +1245,53 @@ impl RustPathOwnerIndex {
     }
 }
 
+fn root_use_names(declaration: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
+    let mut pending = vec![declaration.child_by_field_name("argument")?];
+    let mut names = Vec::new();
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "use_list" => {
+                let mut cursor = node.walk();
+                pending.extend(
+                    node.named_children(&mut cursor)
+                        .filter(|node| !matches!(node.kind(), "line_comment" | "block_comment")),
+                );
+            }
+            "scoped_use_list" => {
+                let mut cursor = node.walk();
+                pending.push(
+                    node.named_children(&mut cursor)
+                        .find(|node| node.kind() == "use_list")?,
+                );
+            }
+            "use_as_clause" => {
+                let alias = node.child_by_field_name("alias")?.utf8_text(source).ok()?;
+                names.push(alias.strip_prefix("r#").unwrap_or(alias).to_owned());
+            }
+            "scoped_identifier" => pending.push(node.child_by_field_name("name")?),
+            "self" => {
+                let list = node.parent()?;
+                let group = list.parent()?;
+                if list.kind() != "use_list" || group.kind() != "scoped_use_list" {
+                    return None;
+                }
+                let path = group.child_by_field_name("path")?;
+                pending.push(if path.kind() == "scoped_identifier" {
+                    path.child_by_field_name("name")?
+                } else {
+                    path
+                });
+            }
+            "identifier" => {
+                let name = node.utf8_text(source).ok()?;
+                names.push(name.strip_prefix("r#").unwrap_or(name).to_owned());
+            }
+            _ => return None,
+        }
+    }
+    Some(names)
+}
+
 #[derive(Default)]
 struct AssociatedScope {
     parent: Option<usize>,
@@ -1209,6 +1301,14 @@ struct AssociatedScope {
 
 /// 型名を再束縛し得るスコープだけを一度走査し、参照ごとの祖先の再走査を避ける。
 fn root_associated_paths(root: Node<'_>, source: &[u8]) -> HashSet<usize> {
+    root_associated_paths_with_attributes(root, source, false)
+}
+
+fn root_associated_paths_with_attributes(
+    root: Node<'_>,
+    source: &[u8],
+    check_attributes: bool,
+) -> HashSet<usize> {
     if root.has_error() {
         return HashSet::new();
     }
@@ -1246,6 +1346,7 @@ fn root_associated_paths(root: Node<'_>, source: &[u8]) -> HashSet<usize> {
             let scope = scopes.len();
             scopes.push(AssociatedScope {
                 parent: Some(enclosing),
+                opaque: check_attributes && transforming_scope_attribute(node, source),
                 ..AssociatedScope::default()
             });
             scope
@@ -1262,9 +1363,11 @@ fn root_associated_paths(root: Node<'_>, source: &[u8]) -> HashSet<usize> {
             {
                 scopes[scope].opaque = true
             }
-            "use_declaration" | "extern_crate_declaration" if scope != 0 => {
-                scopes[scope].opaque = true
-            }
+            "use_declaration" if scope != 0 => match root_use_names(node, source) {
+                Some(names) => scopes[scope].names.extend(names),
+                None => scopes[scope].opaque = true,
+            },
+            "extern_crate_declaration" if scope != 0 => scopes[scope].opaque = true,
             "type_parameter" | "struct_item" | "enum_item" | "union_item" | "type_item"
             | "trait_item"
                 if scope != 0 =>
@@ -2045,28 +2148,49 @@ pub(super) fn scope_can_rebind_import_name(scope: Node<'_>, source: &[u8], name:
     let mut cursor = scope.walk();
     let mut pending = scope.named_children(&mut cursor).collect::<Vec<_>>();
     while let Some(node) = pending.pop() {
-        if matches!(node.kind(), "macro_invocation" | "use_declaration") {
+        if node.kind() == "use_declaration" {
             return true;
         }
-        if matches!(
-            node.kind(),
-            "let_declaration"
-                | "let_condition"
-                | "let_chain"
-                | "parameters"
-                | "closure_parameters"
-                | "match_arm"
-                | "for_expression"
-        ) && node
-            .utf8_text(source)
-            .ok()
-            .is_none_or(|text| text.contains(name))
-        {
+        if node.kind() == "macro_invocation" {
+            // 式位置の展開は外側へ束縛を追加できない。文・item 位置は保留する。
+            if node.parent().is_none_or(|parent| {
+                matches!(
+                    parent.kind(),
+                    "source_file" | "block" | "expression_statement"
+                )
+            }) {
+                return true;
+            }
+            continue;
+        }
+        let pattern = match node.kind() {
+            "let_declaration" | "let_condition" | "parameter" | "match_arm" | "for_expression" => {
+                node.child_by_field_name("pattern")
+            }
+            "closure_parameters" => Some(node),
+            "const_parameter" => node.child_by_field_name("name"),
+            _ => None,
+        };
+        if pattern.is_some_and(|pattern| {
+            crate::engine::tree_walk::any_node(
+                pattern,
+                crate::engine::tree_walk::Children::Named,
+                |node| {
+                    node.kind() == "macro_invocation"
+                        || (matches!(node.kind(), "identifier" | "shorthand_field_identifier")
+                            && node
+                                .utf8_text(source)
+                                .ok()
+                                .is_none_or(|text| text.strip_prefix("r#").unwrap_or(text) == name))
+                },
+            )
+        }) {
             return true;
         }
         if matches!(
             node.kind(),
             "function_item"
+                | "function_signature_item"
                 | "const_item"
                 | "static_item"
                 | "type_item"
@@ -2078,6 +2202,20 @@ pub(super) fn scope_can_rebind_import_name(scope: Node<'_>, source: &[u8], name:
             == Some(name)
         {
             return true;
+        }
+        if matches!(
+            node.kind(),
+            "block"
+                | "function_item"
+                | "closure_expression"
+                | "impl_item"
+                | "trait_item"
+                | "mod_item"
+                | "const_item"
+                | "static_item"
+                | "macro_definition"
+        ) {
+            continue;
         }
         let mut cursor = node.walk();
         pending.extend(node.named_children(&mut cursor));
@@ -2266,6 +2404,25 @@ fn private_module_file_from_roots(
         }
     }
     resolved
+}
+
+fn transforming_scope_attribute(node: Node<'_>, source: &[u8]) -> bool {
+    let mut previous = node.prev_named_sibling();
+    while let Some(attribute) = previous {
+        match attribute.kind() {
+            "line_comment" | "block_comment" => {}
+            "attribute_item" => {
+                if super::rust_std_origin::safe_attribute(attribute, source)
+                    .is_none_or(|names| !names.is_empty())
+                {
+                    return true;
+                }
+            }
+            _ => break,
+        }
+        previous = attribute.prev_named_sibling();
+    }
+    false
 }
 
 #[cfg(test)]
@@ -2627,7 +2784,86 @@ mod tests {
             let mut cursor = node.walk();
             pending.extend(node.named_children(&mut cursor));
         }
-        assert!(index.plain_local_function_owner(call.unwrap(), source, "helper"));
+        assert!(index.plain_local_value_owner(call.unwrap(), source, "helper"));
+    }
+
+    #[test]
+    fn local_value_owner_distinguishes_patterns_and_nested_scopes() {
+        for query in [
+            "(function_signature_item)",
+            "(shorthand_field_identifier)",
+            "(for_expression pattern: (_))",
+            "(let_condition pattern: (_))",
+        ] {
+            tree_sitter::Query::new(&LangId::Rust.ts_language(), query).unwrap();
+        }
+        for (parameters, body, expected) in [
+            ("", "let value = record.normalize; normalize(1)", true),
+            ("", "let normalize = other; normalize(1)", false),
+            ("normalize: fn(u8) -> u8", "normalize(1)", false),
+            (
+                "",
+                "if let Some(normalize) = value { normalize(1) } else { 0 }",
+                false,
+            ),
+            ("", "for normalize in values { normalize(1); } 0", false),
+            (
+                "",
+                "match value { Some(normalize) => normalize(1), _ => 0 }",
+                false,
+            ),
+            ("", "let Binding { normalize } = value; normalize(1)", false),
+            ("", "let pattern!() = value; normalize(1)", false),
+            ("", "unknown!(); normalize(1)", false),
+            ("", "{ unknown!(); } normalize(1)", true),
+            ("", "let value = unknown!(); normalize(1)", true),
+            ("", "{ let normalize = other; } normalize(1)", true),
+            ("", "fn inner() { unknown!(); } normalize(1)", true),
+            (
+                "",
+                "unsafe extern \"C\" { fn normalize(x: u8) -> u8; } normalize(1)",
+                false,
+            ),
+        ] {
+            let source = format!(
+                "use crate::other::normalize_signature_range;\nfn normalize(x: u8) -> u8 {{ x }}\nfn local({parameters}) -> u8 {{ {body} }}\n"
+            );
+            let tree = parser::parse_source(source.as_bytes(), LangId::Rust).unwrap();
+            assert!(!tree.root_node().has_error(), "{source}");
+            let index = RustPathOwnerIndex::build(tree.root_node(), source.as_bytes());
+            let at = source.rfind("normalize(1)").unwrap();
+            let node = tree
+                .root_node()
+                .descendant_for_byte_range(at, at + "normalize".len())
+                .unwrap();
+            assert_eq!(
+                index.plain_local_value_owner(node, source.as_bytes(), "normalize"),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_value_owner_does_not_bind_a_call_in_a_let_initializer() {
+        let source = b"fn normalize(x: u8) -> u8 { x }\npub fn local() -> u8 { let result = normalize(1); if matches!(result, 0) { 0 } else { result } }\n#[cfg(test)] mod tests {}\n";
+        let tree = parser::parse_source(source, LangId::Rust).unwrap();
+        let root = tree.root_node();
+        let index = RustPathOwnerIndex::build(root, source);
+        let _ = crate::engine::tree_walk::walk_preorder(
+            root,
+            crate::engine::tree_walk::Children::Named,
+            |node, _| {
+                if node.kind() == "identifier"
+                    && node.utf8_text(source).ok() == Some("normalize")
+                    && node.start_position().row == 1
+                {
+                    assert!(index.local_value_names.contains("normalize"));
+                    assert!(index.plain_local_value_owner(node, source, "normalize"));
+                }
+                std::ops::ControlFlow::<(), _>::Continue(crate::engine::tree_walk::Walk::Descend)
+            },
+        );
     }
 
     #[test]

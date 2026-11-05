@@ -2,6 +2,330 @@
 
 use super::support::*;
 
+#[test]
+fn impact_rust_independent_root_values_ignore_initializer_mentions() {
+    for constant in [true, false] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src/changed");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"bindings\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        repo.write(
+            "src/lib.rs",
+            "mod changed; mod local; mod real;\nmacro_rules! marker { () => {} }\nmarker!();\n",
+        );
+        let (before, after, local, real) = if constant {
+            (
+                "mod child;\nconst KNOWN_FLAGS: u8 = 1;\n",
+                "mod child;\nconst KNOWN_FLAGS: u8 = 3;\n",
+                "const KNOWN_FLAGS: u8 = 1;\npub fn local() -> u8 { let result = KNOWN_FLAGS; if matches!(result, 0) { 0 } else { result } }\n#[cfg(test)] mod tests {}\n",
+                "pub fn real() {}\n",
+            )
+        } else {
+            (
+                "pub(crate) fn normalize(x: u8) -> u8 { x }\n",
+                "pub(crate) fn normalize(x: u16, _: bool) -> u16 { x }\n",
+                "fn normalize(x: u8) -> u8 { x }\npub fn local() -> u8 { let result = normalize(1); if matches!(result, 0) { 0 } else { result } }\n#[cfg(test)] mod tests {}\n",
+                "pub fn real() -> u8 { crate::changed::normalize(1) }\n",
+            )
+        };
+        repo.write("src/changed.rs", before);
+        if constant {
+            repo.write(
+                "src/changed/child.rs",
+                "pub fn real() -> u8 { super::KNOWN_FLAGS }\n",
+            );
+        }
+        repo.write("src/local.rs", local);
+        repo.write("src/real.rs", real);
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write("src/changed.rs", after);
+        let context = repo.run_json("context", &["--git"]);
+        let has_caller = |bucket: &str, path: &str| {
+            context["changes"].as_array().unwrap().iter().any(|change| {
+                change[bucket]
+                    .as_array()
+                    .is_some_and(|callers| callers.iter().any(|caller| caller["path"] == path))
+            })
+        };
+        assert!(!has_caller("impacted_callers", "src/local.rs"), "{context}");
+        let true_caller = if constant {
+            "src/changed/child.rs"
+        } else {
+            "src/real.rs"
+        };
+        assert!(has_caller("impacted_callers", true_caller), "{context}");
+    }
+}
+
+#[test]
+fn impact_rust_enum_variants_have_their_own_declaration_owner() {
+    for case in [
+        "plain",
+        "alias",
+        "tuple",
+        "generic",
+        "type alias",
+        "conditional",
+        "path",
+        "variant cfg",
+        "attribute",
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"variants\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        let module = match case {
+            "conditional" => "#[cfg(feature = \"enabled\")] mod kind;",
+            "path" => "#[path = \"other.rs\"] mod kind;",
+            _ => "mod kind;",
+        };
+        repo.write("src/lib.rs", format!("mod changed; {module} mod caller; mod real;\nmacro_rules! marker {{ () => {{}} }}\nmarker!();\n"));
+        let attribute = if case == "attribute" {
+            "#[transform]"
+        } else {
+            "#[derive(Clone, Debug)]"
+        };
+        let variant = if case == "tuple" {
+            "Reference(u8)"
+        } else if case == "variant cfg" {
+            "#[cfg(feature = \"enabled\")] Reference"
+        } else {
+            "Reference"
+        };
+        repo.write(
+            "src/kind.rs",
+            format!("{attribute}\npub enum Kind {{ {variant}, Other }}\n"),
+        );
+        repo.write("src/other.rs", "pub enum Kind { Reference, Other }\n");
+        let caller = match case {
+            "alias" => "use crate::kind::Kind as K;\npub fn other() -> K { K::Reference }\n",
+            "generic" => "pub fn other<Kind>() { let value = Kind::Reference; }\n",
+            "type alias" => {
+                "type Kind = crate::kind::Kind;\npub fn other() -> Kind { Kind::Reference }\n"
+            }
+            "tuple" => "use crate::kind::{Kind};\npub fn other() -> Kind { Kind::Reference(1) }\n",
+            _ => {
+                "use crate::kind::{Kind};\npub fn other() -> Kind { let result = Kind::Reference; result }\n"
+            }
+        };
+        repo.write("src/caller.rs", caller);
+        repo.write(
+            "src/real.rs",
+            "pub fn real() -> crate::changed::Reference { crate::changed::Reference(1) }\n",
+        );
+        repo.write(
+            "src/changed.rs",
+            "pub(crate) struct Reference(pub(crate) u8);\n",
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        let refs_before = repo.run_json("refs", &["--name", "Reference"]);
+        repo.write(
+            "src/changed.rs",
+            "pub(crate) struct Reference(pub(crate) u16);\n",
+        );
+        let context = repo.run_json("context", &["--git"]);
+        let has = |bucket: &str, path: &str| {
+            context["changes"].as_array().unwrap().iter().any(|change| {
+                change[bucket]
+                    .as_array()
+                    .is_some_and(|callers| callers.iter().any(|caller| caller["path"] == path))
+            })
+        };
+        assert!(has("impacted_callers", "src/real.rs"), "{case}: {context}");
+        assert_eq!(
+            has("impacted_callers", "src/caller.rs"),
+            !matches!(case, "plain" | "alias" | "tuple"),
+            "{case}: {context}"
+        );
+        let refs_after = repo.run_json("refs", &["--name", "Reference"]);
+        let uses = |result: &serde_json::Value| {
+            result["refs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["kind"] == "ref")
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(uses(&refs_before), uses(&refs_after), "{case}");
+    }
+}
+
+#[test]
+fn impact_rust_format_arguments_require_standard_macro_binding() {
+    for case in [
+        "plain",
+        "root shadow",
+        "parent shadow",
+        "parent import",
+        "parent glob",
+        "local shadow",
+        "import",
+        "block",
+        "nested macro",
+        "qualified",
+        "config",
+        "self import",
+        "unrelated path",
+        "assert variable",
+        "assert shadow",
+        "include source",
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src");
+        repo.write(
+            "Cargo.toml",
+            "[package]\nname = \"format_bindings\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        repo.write(
+            "src/main.rs",
+            "mod changed; mod real;\nfn main() { let _ = real::real(); }\n",
+        );
+        let macro_definition = "macro_rules! format { ($($args:tt)*) => { String::new() }; }\n";
+        repo.write(
+            "src/lib.rs",
+            format!(
+                "{}mod changed; mod local; mod real;\n",
+                if case == "parent shadow" {
+                    macro_definition
+                } else {
+                    ""
+                }
+            ),
+        );
+        if matches!(
+            case,
+            "unrelated path" | "assert variable" | "assert shadow" | "include source"
+        ) {
+            repo.write(
+                "src/lib.rs",
+                "mod changed; mod local; mod real; mod extra;\n",
+            );
+            match case {
+                "unrelated path" => {
+                    repo.write("src/lib.rs", "mod changed; mod local; mod real; #[path = \"item.rs\"] mod extra;\n");
+                    repo.create_dir_all("src/relocated");
+                    repo.write("src/extra.rs", "#[path = \"item.rs\"] mod item;\n");
+                    repo.write("src/item.rs", "pub fn item() {}\n");
+                }
+                "include source" => repo.write("src/extra.rs", "include!(\"external.rs\");\n"),
+                "assert shadow" => repo.write("src/extra.rs", "macro_rules! assert { ($($args:tt)*) => {} }\nfn demo() { let include = |x: bool| x; assert!(include(true)); }\n"),
+                _ => repo.write("src/extra.rs", "fn demo() { let include = |x: bool| x; assert!(include(true)); assert!(!include(false)); }\n"),
+            }
+        }
+        if matches!(case, "parent import" | "parent glob") {
+            let imported = if case == "parent import" {
+                "use crate::macros::format;"
+            } else {
+                "use crate::macros::*;"
+            };
+            repo.write(
+                "src/lib.rs",
+                format!("{imported} mod macros; mod changed; mod local; mod real;\n"),
+            );
+            repo.write("src/macros.rs", "#[macro_export] macro_rules! replacement_format { ($($args:tt)*) => { String::new() }; }\npub use crate::replacement_format as format;\n");
+        }
+        let prefix = match case {
+            "root shadow" => macro_definition,
+            "import" => "use crate::macros::format;\n",
+            "self import" => "use std::io::{self, Write};\n",
+            _ => "",
+        };
+        let local = if case == "local shadow" {
+            macro_definition
+        } else {
+            ""
+        };
+        let argument = match case {
+            "block" => "{ let normalize = crate::changed::normalize; normalize(1) }",
+            "nested macro" => "custom!(normalize(1))",
+            "qualified" => "crate::changed::normalize(1)",
+            _ => "normalize(1)",
+        };
+        let source = format!(
+            "{prefix}fn normalize(value: u8) -> u8 {{ value }}\npub fn local() -> Option<String> {{\n{local} Some(format!(\"{{}}{{}} {{}}\", if true {{ \"a\" }} else {{ \"b\" }}, 1, {argument}))\n}}\n#[cfg(test)] mod tests {{}}\n"
+        );
+        repo.write("src/local.rs", &source);
+        repo.write(
+            "src/changed.rs",
+            "pub(crate) fn normalize(value: u8) -> u8 { value }\n",
+        );
+        repo.write(
+            "src/real.rs",
+            "pub fn real() -> u8 { crate::changed::normalize(1) }\n",
+        );
+        if case == "config" {
+            repo.create_dir_all(".cargo");
+            repo.write(
+                ".cargo/config.toml",
+                "[build]\nrustflags = [\"--extern\", \"std=other.rlib\"]\n",
+            );
+        }
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "src/changed.rs",
+            "pub(crate) fn normalize(value: u16, _: bool) -> u16 { value }\n",
+        );
+        let context = repo.run_json("context", &["--git"]);
+        let line = source
+            .lines()
+            .position(|line| line.contains("Some(format!"))
+            .unwrap();
+        let changes = context["changes"].as_array().unwrap();
+        let calls = changes[0]["impacted_callers"].as_array().unwrap();
+        assert!(
+            calls.iter().any(|caller| caller["path"] == "src/real.rs"),
+            "{case}: {context}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .any(|caller| caller["path"] == "src/local.rs" && caller["line"] == line),
+            !matches!(
+                case,
+                "plain"
+                    | "self import"
+                    | "unrelated path"
+                    | "assert variable"
+                    | "parent import"
+                    | "parent glob"
+            ),
+            "{case}: {context}"
+        );
+        if case == "plain" {
+            repo.write(
+                "src/real.rs",
+                "pub fn real() -> u8 { crate::changed::normalize(1, true) as u8 }\n",
+            );
+            for command in ["impact", "review"] {
+                let output = cargo_bin()
+                    .args([command, "--git", "--hook", "--dir"])
+                    .arg(repo.root())
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{command}: {output:?}");
+            }
+            repo.stage_all();
+            let staged = repo.run_json("context", &["--git", "--staged"]);
+            assert!(
+                staged["changes"].as_array().unwrap().iter().any(|change| {
+                    change["impacted_callers"].as_array().is_some_and(|calls| {
+                        calls.iter().any(|caller| caller["path"] == "src/local.rs")
+                    })
+                }),
+                "{staged}"
+            );
+        }
+    }
+}
+
 fn private_helpers_repo() -> TestRepo {
     let repo = TestRepo::new();
     repo.create_dir_all("src/style");
