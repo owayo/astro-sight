@@ -474,6 +474,55 @@ pub(super) fn has_glob_import(source: &[u8]) -> bool {
     false
 }
 
+/// 非公開の親 glob だけなら、named import に含まれる名前を集める。
+pub(super) fn parent_glob_import_names(source: &[u8]) -> Option<HashSet<String>> {
+    let tree = parser::parse_source(source, LangId::Rust).ok()?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let mut names = HashSet::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "use_declaration" {
+            let mut cursor = node.walk();
+            let public = node
+                .named_children(&mut cursor)
+                .any(|child| child.kind() == "visibility_modifier");
+            let argument = node.child_by_field_name("argument")?;
+            let mut imports = vec![argument];
+            while let Some(part) = imports.pop() {
+                if part.kind() == "use_wildcard" {
+                    let mut cursor = part.walk();
+                    let mut children = part
+                        .named_children(&mut cursor)
+                        .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"));
+                    if public
+                        || part.id() != argument.id()
+                        || children.next().is_none_or(|child| child.kind() != "super")
+                        || children.next().is_some()
+                    {
+                        return None;
+                    }
+                }
+                if matches!(part.kind(), "identifier" | "type_identifier") {
+                    let binding = part.utf8_text(source).ok()?;
+                    if !binding.is_ascii() {
+                        return None;
+                    }
+                    names.insert(binding.strip_prefix("r#").unwrap_or(binding).to_owned());
+                }
+                let mut cursor = part.walk();
+                imports.extend(part.named_children(&mut cursor));
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    Some(names)
+}
+
 /// 親以外からの glob は、公開範囲の拡大で新しい同名束縛を取り込み得る。
 pub(super) fn has_non_parent_glob(source: &[u8]) -> bool {
     let Ok(tree) = parser::parse_source(source, LangId::Rust) else {
