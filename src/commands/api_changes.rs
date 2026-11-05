@@ -196,11 +196,11 @@ pub(crate) fn detect_api_changes_with_renames(
             continue;
         }
         // rename 差分では base 側に新パスが存在しないため、旧版は old_path から読む。
-        let old_facts = extract_exported_file_facts_from_git(&base_blobs, &df.old_path);
+        let mut old_facts = extract_exported_file_facts_from_git(&base_blobs, &df.old_path);
         // new_path を 1 回 read+parse して exported / callees / export surface を導出 (perf #2)。
         // export surface は process_modified_file が再 parse せず使えるよう
         // PreparedDiffFile に持たせる。
-        let facts = extract_new_file_facts(dir, &df.new_path);
+        let mut facts = extract_new_file_facts(dir, &df.new_path);
         buckets.parse_truncations.extend(facts.parse_truncations);
         // 対応言語でないファイルへの rename (`api.ts` → `api.ts.bak`) は、新側に API 面が
         // 無いので旧ファイルの削除と同じ。変更ファイルとして扱うと新側のシンボルが取れず
@@ -243,11 +243,30 @@ pub(crate) fn detect_api_changes_with_renames(
         } else {
             (HashSet::new(), HashSet::new())
         };
+        let type_dependencies = old_facts
+            .as_mut()
+            .and_then(|old| old.type_dependencies.take())
+            .zip(
+                facts
+                    .exported
+                    .as_mut()
+                    .and_then(|new| new.type_dependencies.take()),
+            )
+            .map(|(old, new)| old.compare(new))
+            .unwrap_or_default();
         let old_syms = old_facts.map(|facts| facts.symbols);
         let new_syms = facts.exported.map(|facts| facts.symbols);
         let in_file_callees = facts.callees;
         let new_export_surface_names = facts.export_surface_names;
         if let (Some(old), Some(new)) = (&old_syms, &new_syms) {
+            index_names.extend(
+                new.iter()
+                    .filter(|(name, _, _)| {
+                        type_dependencies.get(name)
+                            == Some(&ts_signature::DependencyStatus::Changed)
+                    })
+                    .map(|(name, _, _)| bare_name(name).to_owned()),
+            );
             collect_modified_file_index_names(
                 old,
                 new,
@@ -259,6 +278,7 @@ pub(crate) fn detect_api_changes_with_renames(
             );
         }
         prepared.push(PreparedDiffFile::Modified {
+            type_dependencies: Box::new(type_dependencies),
             unparsed_declarations: facts.unparsed_declarations,
             old_syms,
             new_syms,
@@ -337,6 +357,7 @@ pub(crate) fn detect_api_changes_with_renames(
                 }
             }
             PreparedDiffFile::Modified {
+                type_dependencies,
                 unparsed_declarations,
                 old_syms,
                 new_syms,
@@ -351,6 +372,7 @@ pub(crate) fn detect_api_changes_with_renames(
                         &mut state,
                         df,
                         &ModifiedFileFacts {
+                            type_dependencies,
                             unparsed_declarations,
                             old_syms,
                             new_syms,
@@ -470,7 +492,9 @@ pub(crate) fn detect_api_changes_with_renames(
         })
         .collect();
 
+    let type_dependency_symbols = type_dependency_symbols::collect(&inputs, &buckets.modified);
     ApiChanges {
+        type_dependency_symbols,
         unresolved_modified_callers: closure_caches.unresolved_modified_callers,
         removed_unresolved,
         uncertain_removals: buckets.uncertain_removals,
@@ -760,6 +784,7 @@ mod ts_namespace;
 mod ts_required_members;
 
 mod ts_signature;
+mod type_dependency_symbols;
 
 pub(crate) use diff_processing::*;
 pub(crate) use exported::*;

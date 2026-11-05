@@ -82,6 +82,11 @@ pub struct MissingCochange {
 /// (Issue 2026-05-28-meet-virtual-you-gemini-multi-select 対応)。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ApiChanges {
+    /// 同じファイルの型変更から導いた公開宣言の影響。review の通常の影響一覧へ合流する。
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub type_dependency_symbols:
+        std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
     /// 変更行でも呼び出し契約への追随を証明できなかった参照。hook の解決済み判定より優先する。
     #[serde(skip)]
     #[doc(hidden)]

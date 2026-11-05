@@ -74,6 +74,7 @@ mod integration {
     mod rust_unicode_escapes;
     mod sandbox;
     mod session;
+    mod signature_type_dependencies;
     mod static_const_values;
     mod swift_grammar;
     mod ts_extension_changes;

@@ -13,6 +13,7 @@ use super::{ApiClosureCaches, ApiRefIndex, has_blocking_value_usage};
 
 mod callable;
 mod callback_contract;
+mod dependency_changes;
 mod function_params;
 mod literal_union;
 mod object_members;
@@ -25,6 +26,8 @@ mod repository_audit;
 mod source_scan;
 mod type_dependencies;
 pub(crate) mod type_members;
+pub(crate) use dependency_changes::compatible_dependencies_unchanged;
+pub(crate) use dependency_changes::{DependencyChanges, DependencySnapshot, DependencyStatus};
 
 use super::signature_tokens::{SigTokens, node_signature_tokens, signature_tokens_in_range};
 pub(super) use callable::ts_const_value_header_guard;

@@ -367,6 +367,14 @@ astro-sight review --dir . --git \
 
 On top of the impact analysis of `context`, `review` returns candidates for missed changes from `cochange`, the public API diff, and dead symbols in a single run. It is meant for PR reviews and pre-merge checks.
 
+### TypeScript signature type dependencies
+
+`review` follows same-file non-exported type declarations used in explicit public contracts. Changing `type Label = string` to `number`, or changing a member of a private interface, reports the exported functions, classes, and annotated variables that depend on it in `api_changes.modified` (`api.mod` in the hook), even when their declaration headers have no changed lines. Their references enter the normal impact analysis, including its language, import ownership, alias, and exclusion rules. This also applies to staged review, using the index snapshot.
+
+The dependency graph follows alias chains, merged interfaces, class member annotations and inheritance, and literal enum contracts. It handles cycles and respects generic bindings; a local generic parameter named `Label` does not refer to a same-file alias of that name. Bodies, comments, and spacing outside literals do not change an explicit contract. Changes to types that are themselves exported retain the existing public-type classifications and closure proofs.
+
+A changed dependency shared by the old and new contracts also prevents optional-parameter additions or removals and optional inline-object property additions from being marked compatible. A dependency used only in a newly added or removed optional member does not invalidate the existing proof. Unknown imported or dynamic types alone do not create API changes when the header is unchanged. When compatibility depends on proving an unknown type unchanged, relative imports remain unproven; registry and undeclared global types use the existing isolated-diff environment checks. This is a syntax-based check of explicit contracts, not full TypeScript type inference or cross-file type resolution.
+
 ### TypeScript namespace name collisions
 
 When a separate namespace exports the same name as a directly exported root function, interface, type alias, or simple variable, TS/TSX API comparison can recover the root declaration's changed signature from its AST position. Both versions must use the same TS/TSX grammar and prove a unique root binding. Changed duplicate names remain in the reference index even when the new root signature equals an old namespace signature. A namespace-only edit does not become a root API change.

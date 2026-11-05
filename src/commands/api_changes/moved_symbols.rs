@@ -1240,6 +1240,7 @@ mod tests {
         let diff_files = [diff(OLD, renamed), diff(NEW, NEW)];
         let prepared = [
             PreparedDiffFile::Modified {
+                type_dependencies: Default::default(),
                 unparsed_declarations: Vec::new(),
                 old_syms: Some(scenario.old_syms.clone()),
                 new_syms: Some(Vec::new()),
@@ -1249,6 +1250,7 @@ mod tests {
                 new_export_surface_names: HashSet::new(),
             },
             PreparedDiffFile::Modified {
+                type_dependencies: Default::default(),
                 unparsed_declarations: Vec::new(),
                 old_syms: Some(Vec::new()),
                 new_syms: Some(scenario.new_syms.clone()),
@@ -1665,6 +1667,7 @@ mod tests {
                 in_file_callees: HashSet::new(),
             },
             PreparedDiffFile::Modified {
+                type_dependencies: Default::default(),
                 unparsed_declarations: Vec::new(),
                 old_syms: Some(vec![
                     symbol("local", "function", "pub fn local()"),

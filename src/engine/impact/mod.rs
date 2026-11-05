@@ -231,6 +231,7 @@ where
             dir,
             &new_side_source,
             &reexport_moves,
+            &options.derived_contract_changes,
         );
     log_phase("context.pass1", "end", t.elapsed().as_millis());
     log_phase(
@@ -471,6 +472,10 @@ fn collect_affected_symbols(
     dir: &Path,
     new_side_source: &NewSideSource,
     reexport_moves: &ReexportMoveIndex,
+    derived_contract_changes: &std::collections::BTreeMap<
+        String,
+        std::collections::BTreeSet<String>,
+    >,
 ) -> (
     Vec<FileContext>,
     Vec<String>,
@@ -661,6 +666,45 @@ fn collect_affected_symbols(
                 originals = kept_originals;
             }
         }
+        // ヘッダの行が不変でも、非公開型の変更で公開契約が変わった宣言を加える。
+        // 実 AST の宣言へ結び付け、以降の言語・所有元・参照の判定は通常と共有する。
+        let declaration_key = |symbol: &Symbol| {
+            (
+                symbol.range.start.line,
+                symbol.range.start.column,
+                symbol.range.end.line,
+                symbol.range.end.column,
+            )
+        };
+        let mut derived_declarations = HashSet::new();
+        if matches!(lang_id, LangId::Typescript | LangId::Tsx)
+            && let Some(names) = derived_contract_changes.get(&df.new_path)
+        {
+            for original in &syms {
+                let qualified = original.container.as_ref().map_or_else(
+                    || original.name.clone(),
+                    |container| format!("{container}.{}", original.name),
+                );
+                if !names.contains(&qualified)
+                    || symbols::is_local_scope_symbol(root, &source, lang_id, &original.range)
+                    || is_in_test_context(root, &source, &original.range, lang_id, &df.new_path)
+                {
+                    continue;
+                }
+                derived_declarations.insert(declaration_key(original));
+                if !originals
+                    .iter()
+                    .any(|previous| previous.range == original.range)
+                {
+                    originals.push(original);
+                    affected.push(AffectedSymbol {
+                        name: original.name.clone(),
+                        kind: symbol_kind_str(original.kind).to_owned(),
+                        change_type: "modified".to_owned(),
+                    });
+                }
+            }
+        }
         debug_assert_eq!(affected.len(), originals.len());
         // 透過的な型別名の導入と、関数に `const` を足しただけのシグネチャ変更は互換。
         let compatible_signature_keys: HashSet<String> = if lang_id == LangId::Rust {
@@ -819,12 +863,12 @@ fn collect_affected_symbols(
             .iter()
             .zip(&originals)
             .map(|(sym, original)| {
-                cross_file_filter
-                    .should_include_for_cross_file(sym, original)
-                    .then(|| {
-                        find_parent_type_name(root, &source, &original.range, lang_id)
-                            .map(|parent| ci_key(lang_id, &parent))
-                    })
+                (derived_declarations.contains(&declaration_key(original))
+                    || cross_file_filter.should_include_for_cross_file(sym, original))
+                .then(|| {
+                    find_parent_type_name(root, &source, &original.range, lang_id)
+                        .map(|parent| ci_key(lang_id, &parent))
+                })
             })
             .collect();
         // `method_parent_types` は名前だけを鍵にするので、同じファイルで同名の収録シンボルの

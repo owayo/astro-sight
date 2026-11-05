@@ -319,6 +319,19 @@ fn review_attempt_with_swift_protocols(
         framework_globs
     };
 
+    // 型依存で変わった契約を impact の起点にするため、API 差分を先に求める。
+    let mut api_changes = timed("api_changes", || {
+        detect_api_changes_with_renames(
+            analysis_dir,
+            analysis_base,
+            &api_diff_files(&diff_files, &diff_input),
+            &crate::engine::diff::parse_hunkless_renames(&diff_input),
+        )
+    });
+    if keep_reference_downgrades_blocking {
+        keep_reference_based_downgrades_blocking(&mut api_changes);
+    }
+
     let impact = timed_ok("context", || {
         // review の `--exclude-dir` / `--exclude-glob` は impact 解析と dead_symbols の
         // 両方に作用させる (v26.5.117 で挙動を統一)。
@@ -326,6 +339,7 @@ fn review_attempt_with_swift_protocols(
         let context_options = crate::models::impact::ContextAnalysisOptions {
             exclude_dirs: extra_exclude_dirs.to_vec(),
             exclude_globs: extra_exclude_globs.to_vec(),
+            derived_contract_changes: api_changes.type_dependency_symbols.clone(),
             new_side: if snapshot.is_some() {
                 crate::models::impact::DiffNewSide::WorkingTree
             } else {
@@ -371,19 +385,6 @@ fn review_attempt_with_swift_protocols(
             },
         )
     })?;
-
-    // 5. API 公開面の差分 (内容同一の rename も含めて見る。`api_diff_files` 参照)
-    let mut api_changes = timed("api_changes", || {
-        detect_api_changes_with_renames(
-            analysis_dir,
-            analysis_base,
-            &api_diff_files(&diff_files, &diff_input),
-            &crate::engine::diff::parse_hunkless_renames(&diff_input),
-        )
-    });
-    if keep_reference_downgrades_blocking {
-        keep_reference_based_downgrades_blocking(&mut api_changes);
-    }
 
     // 6. dead symbol 検出
     let dead_opts = ReviewDeadSymbolsOpts {

@@ -96,6 +96,7 @@ pub(crate) struct AddedFileFacts<'a> {
 
 /// 変更ファイル 1 件について Phase 0 で先取り済みの事実。
 pub(crate) struct ModifiedFileFacts<'a> {
+    pub(crate) type_dependencies: &'a super::ts_signature::DependencyChanges,
     pub(crate) unparsed_declarations:
         &'a [crate::engine::bash_parse_recovery::UnparsedBashDeclaration],
     pub(crate) old_syms: &'a [(String, String, String)],
@@ -153,6 +154,7 @@ pub(crate) enum PreparedDiffFile {
     },
     /// 通常の modified ファイル。
     Modified {
+        type_dependencies: Box<super::ts_signature::DependencyChanges>,
         unparsed_declarations: Vec<crate::engine::bash_parse_recovery::UnparsedBashDeclaration>,
         old_syms: Option<Vec<(String, String, String)>>,
         new_syms: Option<Vec<(String, String, String)>>,
