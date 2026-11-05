@@ -45,6 +45,12 @@ filter = 'binary_id(astro-sight::integration) & test(integration::required_type_
 priority = 50
 threads-required = 2
 
+# 型付き配列の全要素と書き込み・持ち出しを、通常と index で検証する回帰を先に実行する。
+[[profile.default.overrides]]
+filter = 'binary_id(astro-sight::integration) & test(integration::required_type_members::typed_array_)'
+priority = 50
+threads-required = 2
+
 # CI (NEXTEST_PROFILE=ci): 失敗しても残りのテストを最後まで流し、失敗の出力を最後にもまとめて出す
 [profile.ci]
 fail-fast = false

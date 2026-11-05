@@ -4,6 +4,162 @@
 use super::support::{TestRepo, cargo_bin};
 
 #[test]
+fn typed_array_literals_close_required_member_additions() {
+    for extension in ["ts", "tsx"] {
+        for (annotation, literal) in [
+            ("Causes[]", "[$VALUE]"),
+            ("Array<[Causes, string]>", "[[$VALUE, 'first']]"),
+        ] {
+            typed_array_case(extension, annotation, literal, "", "", 0);
+        }
+    }
+}
+
+#[test]
+fn typed_array_container_forms_prove_all_target_positions() {
+    for extension in ["ts", "tsx"] {
+        for (annotation, literal) in [
+            ("readonly Causes[]", "[$VALUE]"),
+            ("Array<Causes>", "[$VALUE]"),
+            ("ReadonlyArray<Causes>", "[$VALUE]"),
+            ("[Causes, string][]", "[[$VALUE, 'first']]"),
+            ("Array<[string, Causes]>", "[['first', $VALUE]]"),
+            ("Array<[Causes, Causes]>", "[[$VALUE, $VALUE]]"),
+            ("Causes[][]", "[[$VALUE]]"),
+            ("Causes[]", "[]"),
+        ] {
+            typed_array_case(extension, annotation, literal, "", "", 0);
+        }
+    }
+    typed_array_case(
+        "ts",
+        "Causes[]",
+        "[$VALUE]",
+        "const length = rows.length; consume(length);",
+        "",
+        0,
+    );
+    typed_array_case(
+        "ts",
+        "Causes[]",
+        "[build()]",
+        "",
+        "function build(): Causes {\n return $VALUE;\n}\n",
+        0,
+    );
+}
+
+#[test]
+fn typed_array_variables_keep_missing_values_and_escapes_blocking() {
+    for (annotation, literal, suffix, header) in [
+        ("Causes[]", "[$BAD]", "", ""),
+        ("Causes[]", "[$VALUE, $BAD]", "", ""),
+        ("Array<[Causes, string]>", "[[$BAD, 'first']]", "", ""),
+        ("Array<[Causes, Causes]>", "[[$VALUE, $BAD]]", "", ""),
+        ("Array<[Causes, Causes]>", "[[$BAD, $VALUE]]", "", ""),
+        ("Causes[]", "[$VALUE]", "rows[0] = $BAD;", ""),
+        ("Causes[]", "[$VALUE]", "delete (rows[0] as any).third;", ""),
+        ("Causes[]", "[$VALUE]", "rows.length = 0;", ""),
+        ("Causes[]", "[$VALUE]", "rows.push($BAD);", ""),
+        ("Causes[]", "[$VALUE]", "consume(rows);", ""),
+        ("Causes[]", "[$VALUE]", "const alias = rows;", ""),
+        ("Causes[]", "[$VALUE]", "const alias = rows[0];", ""),
+        ("Causes[]", "[$VALUE]", "type Original = typeof rows;", ""),
+        (
+            "Causes[]",
+            "[$VALUE]",
+            "type Original = typeof rows[0];",
+            "",
+        ),
+        ("Causes[]", "[...[], $VALUE]", "", ""),
+        ("Causes[]", "[, $VALUE]", "", ""),
+        ("Array<[Causes, string]>", "[[$VALUE]]", "", ""),
+        ("Array<[Causes, string?]>", "[[$VALUE, 'first']]", "", ""),
+        ("Array<Causes>", "[$VALUE]", "", "type Array<T> = T[];"),
+        (
+            "Causes[]",
+            "[$VALUE]",
+            "",
+            "function unused(value: Causes): number { return value.first ? 1 : 0; }",
+        ),
+    ] {
+        typed_array_case("ts", annotation, literal, suffix, header, 1);
+    }
+}
+
+fn typed_array_case(
+    extension: &str,
+    annotation: &str,
+    literal: &str,
+    suffix: &str,
+    header: &str,
+    expected: i32,
+) {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    let target = format!("src/causes.{extension}");
+    let table = format!("src/table.{extension}");
+    let old = "{ first: true, second: false }";
+    let new = "{ first: true, third: false, second: false }";
+    let source = |changed: bool| {
+        let values = literal
+            .replace("$VALUE", if changed { new } else { old })
+            .replace("$BAD", old);
+        let suffix = suffix
+            .replace("$VALUE", if changed { new } else { old })
+            .replace("$BAD", old);
+        let header = header
+            .replace("$VALUE", if changed { new } else { old })
+            .replace("$BAD", old);
+        format!(
+            "import type {{ Causes }} from './causes';\n{header}\ndeclare function consume(value: unknown): void;\nexport function countRows(): number {{\n const rows: {annotation} = {values};\n {suffix}\n return rows.length;\n}}\n"
+        )
+    };
+    repo.write(
+        &target,
+        "export interface Causes {\n first: boolean;\n second: boolean;\n}\n",
+    );
+    repo.write(&table, source(false));
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        &target,
+        "export interface Causes {\n first: boolean;\n third: boolean;\n second: boolean;\n}\n",
+    );
+    repo.write(&table, source(true));
+    let normal = repo.run_json("review", &["--git"]);
+    let bucket = if expected == 0 {
+        "modified_closed_in_diff"
+    } else {
+        "modified"
+    };
+    assert!(
+        normal["api_changes"][bucket]
+            .as_array()
+            .is_some_and(|changes| changes.iter().any(|c| c["name"] == "Causes")),
+        "{annotation}/{literal}/{suffix}/{header}: {normal}"
+    );
+    let (code, json) = hook(&repo);
+    assert_eq!(
+        code, expected,
+        "{annotation}/{literal}/{suffix}/{header}: {json}"
+    );
+    repo.stage_all();
+    repo.write(&table, "import type { Causes } from './causes';\nexport function countRows(): number { const rows: Causes[] = [{ first: true, second: false }]; return rows.length; }\n");
+    let output = cargo_bin()
+        .args(["review", "--git", "--staged", "--hook", "--dir"])
+        .arg(repo.root())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(expected),
+        "{annotation}/{literal}/{suffix}/{header}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn partial_factories_close_required_additions_with_typed_defaults() {
     for extension in ["ts", "tsx"] {
         for (before_params, after_params, labels) in [

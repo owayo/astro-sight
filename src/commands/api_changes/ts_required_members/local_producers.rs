@@ -26,6 +26,20 @@ fn prove_variable(
     allow_module: bool,
     type_name: &str,
 ) -> Option<bool> {
+    prove_variable_with_container(declaration, parsed, allow_module, type_name, false)
+}
+
+pub(super) fn prove_array_variable(declaration: Node<'_>, parsed: &ParsedRefFile) -> bool {
+    prove_variable_with_container(declaration, parsed, true, "", true) == Some(true)
+}
+
+fn prove_variable_with_container(
+    declaration: Node<'_>,
+    parsed: &ParsedRefFile,
+    allow_module: bool,
+    type_name: &str,
+    container: bool,
+) -> Option<bool> {
     if declaration.kind() != "variable_declarator" {
         return None;
     }
@@ -96,12 +110,76 @@ fn prove_variable(
                         .parent()
                         .is_some_and(|parent| parent.kind() == "export_specifier")
                     || reference_is_written(node)
-                    || !node_outside_type_query(node, source, false, Some(type_name))
+                    || (container && array_reference_is_unsafe(node, source))
+                    || !node_outside_type_query(
+                        node,
+                        source,
+                        container && !array_length_read(node, source),
+                        (!container).then_some(type_name),
+                    )
             }
             Some(_) => false,
             None => true,
         }
     }))
+}
+
+fn array_length_read(node: Node<'_>, source: &[u8]) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "member_expression"
+            && parent
+                .child_by_field_name("object")
+                .is_some_and(|object| object.id() == node.id())
+            && parent
+                .child_by_field_name("property")
+                .and_then(|key| key.utf8_text(source).ok())
+                == Some("length")
+    })
+}
+
+fn array_reference_is_unsafe(node: Node<'_>, source: &[u8]) -> bool {
+    let length = array_length_read(node, source);
+    let mut current = node;
+    for _ in 0..MAX_UNWRAP {
+        let Some(parent) = current.parent() else {
+            return false;
+        };
+        let field_is = |field| {
+            parent
+                .child_by_field_name(field)
+                .is_some_and(|child| child.id() == current.id())
+        };
+        match parent.kind() {
+            "parenthesized_expression" => current = parent,
+            "member_expression" | "subscript_expression" if field_is("object") => current = parent,
+            "as_expression"
+            | "satisfies_expression"
+            | "type_assertion"
+            | "non_null_expression"
+            | "type_query" => return true,
+            "assignment_expression" | "augmented_assignment_expression" if field_is("left") => {
+                return true;
+            }
+            "update_expression" | "unary_expression" if field_is("argument") => {
+                return parent.kind() == "update_expression"
+                    || parent
+                        .child_by_field_name("operator")
+                        .is_some_and(|operator| operator.kind() == "delete");
+            }
+            "call_expression" | "new_expression"
+                if field_is("function") || field_is("constructor") =>
+            {
+                return true;
+            }
+            "arguments" => return !length,
+            "return_statement" | "arrow_function" => {
+                return !length && current.kind() != "member_expression";
+            }
+            _ if value_flows_to_parent(current, parent) => current = parent,
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn reference_is_written(node: Node<'_>) -> bool {

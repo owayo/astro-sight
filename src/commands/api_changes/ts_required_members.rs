@@ -55,6 +55,7 @@ use super::ref_index::{
     ref_import_role, ref_is_pass_through_reexport, ref_name_node,
 };
 
+mod array_literals;
 pub(crate) mod invariant_members;
 mod local_producers;
 mod narrowed_uses;
@@ -314,6 +315,7 @@ pub(super) fn prove_closure(
         invariant_files: RefCell::new(HashMap::new()),
         invariant_builtins: OnceCell::new(),
         partial_builtin: OnceCell::new(),
+        array_literal_builtins: OnceCell::new(),
         wrapped_producers: Vec::new(),
         sites: 0,
     };
@@ -392,6 +394,7 @@ struct Prover<'s, 'a> {
     invariant_files: RefCell<HashMap<String, Option<Vec<invariant_members::ObjectRange>>>>,
     invariant_builtins: OnceCell<bool>,
     partial_builtin: OnceCell<bool>,
+    array_literal_builtins: OnceCell<bool>,
     wrapped_producers: Vec<row_array_map::WrappedProducer>,
     /// 証明した値を作る箇所・受け取る箇所の数。
     sites: usize,
@@ -443,6 +446,10 @@ impl Prover<'_, '_> {
             || !self.binds_target_type(node, &parsed, &r.path, caches)
         {
             return false;
+        }
+        if let Some(proven) = self.prove_array_variable(node, &parsed, &r.path, diff_files, caches)
+        {
+            return proven;
         }
         if self.partial_parameter_reference(node, &parsed, &r.path, caches) {
             return true;
