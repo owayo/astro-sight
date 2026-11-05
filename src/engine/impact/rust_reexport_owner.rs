@@ -8,7 +8,7 @@ use tree_sitter::Node;
 
 use crate::engine::bounded_read::{read_input_file, read_input_text_file};
 use crate::engine::parser;
-use crate::engine::rust_use_tree::{RustPubUseEdge, expand_rust_use_tree_edges_ast};
+use crate::engine::rust_use_tree::{RustPubUseEdge, UsePathOrigin, expand_rust_use_tree_edges_ast};
 use crate::language::LangId;
 
 use super::rust_path_owner::{
@@ -139,15 +139,16 @@ pub(super) fn owner(
     }
     let (target_module, target_name) = if let Some(statement) = use_statement {
         let argument = statement.child_by_field_name("argument")?;
-        let edges = parse_use_edges(argument, source, &current_module)?;
+        let edges = expand_use_edges(argument, source, &current_module)?;
         let mut matching = edges.iter().filter_map(|edge| match edge {
             RustPubUseEdge::Named {
                 exported_name,
                 target_module,
                 target_item,
+                origin,
                 ..
             } if target_item == name || exported_name == name => {
-                Some((target_module.clone(), target_item.clone()))
+                Some((target_module.clone(), target_item.clone(), *origin))
             }
             _ => None,
         });
@@ -155,7 +156,10 @@ pub(super) fn owner(
         if matching.next().is_some() {
             return None;
         }
-        target
+        if target.2 != UsePathOrigin::Anchored {
+            return None;
+        }
+        (target.0, target.1)
     } else {
         if has_uncertain_ancestor(node) {
             return None;
@@ -740,9 +744,8 @@ fn parse_bindings(root: Node<'_>, source: &[u8], module: &[String]) -> Option<Mo
                 continue;
             };
             let visibility = visibility(child, source);
-            let anchored = use_is_anchored(argument, source);
-            let bare_local = use_is_simple_bare(argument, source);
             for edge in edges {
+                let origin = edge.origin();
                 match edge {
                     RustPubUseEdge::Named {
                         exported_name,
@@ -750,8 +753,8 @@ fn parse_bindings(root: Node<'_>, source: &[u8], module: &[String]) -> Option<Mo
                         target_item,
                         ..
                     } => {
-                        if (anchored || bare_local) && attributes == AttributeStatus::Safe {
-                            if bare_local {
+                        if origin != UsePathOrigin::Global && attributes == AttributeStatus::Safe {
+                            if origin == UsePathOrigin::Bare {
                                 target_module.splice(0..0, module.iter().cloned());
                             }
                             bindings.named.push(NamedImport {
@@ -766,7 +769,8 @@ fn parse_bindings(root: Node<'_>, source: &[u8], module: &[String]) -> Option<Mo
                         }
                     }
                     RustPubUseEdge::Wildcard { target_module, .. } => {
-                        if anchored && attributes == AttributeStatus::Safe {
+                        if origin == UsePathOrigin::Anchored && attributes == AttributeStatus::Safe
+                        {
                             bindings.globs.push(GlobImport {
                                 target_module,
                                 visibility,
@@ -821,37 +825,6 @@ fn parse_bindings(root: Node<'_>, source: &[u8], module: &[String]) -> Option<Mo
         }
     }
     Some(bindings)
-}
-
-fn parse_use_edges(
-    argument: Node<'_>,
-    source: &[u8],
-    module: &[String],
-) -> Option<Vec<RustPubUseEdge>> {
-    if !use_is_anchored(argument, source) {
-        return None;
-    }
-    expand_use_edges(argument, source, module)
-}
-
-fn use_is_anchored(argument: Node<'_>, source: &[u8]) -> bool {
-    argument.utf8_text(source).ok().is_some_and(|text| {
-        let text = text.trim_start();
-        ["crate", "self", "super"]
-            .iter()
-            .any(|anchor| text == *anchor || text.starts_with(&format!("{anchor}::")))
-    })
-}
-
-fn use_is_simple_bare(argument: Node<'_>, source: &[u8]) -> bool {
-    argument.utf8_text(source).ok().is_some_and(|text| {
-        let text = text.trim_start();
-        !use_is_anchored(argument, source)
-            && text
-                .as_bytes()
-                .first()
-                .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
-    })
 }
 
 fn expand_use_edges(
@@ -914,5 +887,45 @@ fn visibility(node: Node<'_>, source: &[u8]) -> Visibility {
         Visibility::Crate
     } else {
         Visibility::Private
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn import_binding_origins_are_decided_per_group_edge() {
+        let source = b"use {crate :: alpha :: helper as root_helper, self :: alpha :: helper as child_helper, super :: alpha :: helper as parent_helper, alpha :: helper as bare_helper, ::alpha :: helper as external_helper, self :: alpha :: *};";
+        let tree = parser::parse_source(source, LangId::Rust).unwrap();
+        let bindings = parse_bindings(tree.root_node(), source, &["beta".to_owned()]).unwrap();
+        assert!(!bindings.opaque);
+        let names: Vec<_> = bindings
+            .named
+            .iter()
+            .map(|edge| {
+                (
+                    edge.name.as_str(),
+                    edge.target_module
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    edge.target_name.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("root_helper", vec!["alpha"], "helper"),
+                ("child_helper", vec!["beta", "alpha"], "helper"),
+                ("parent_helper", vec!["alpha"], "helper"),
+                ("bare_helper", vec!["beta", "alpha"], "helper"),
+            ]
+        );
+        assert!(bindings.unknown_types.contains("external_helper"));
+        assert!(bindings.unknown_functions.contains("external_helper"));
+        assert_eq!(bindings.globs.len(), 1);
+        assert_eq!(bindings.globs[0].target_module, ["beta", "alpha"]);
     }
 }
