@@ -377,6 +377,14 @@ For an otherwise unchanged exported `const` declaration without a type annotatio
 
 The default hook treats these value changes as informational; `--strict-public-const-values` makes them blocking. This policy does not establish equivalent runtime behavior: flags such as `g` and `y` can change how a regular expression is used. Changes between different kinds, templates with substitutions, tagged templates, assertions and `satisfies` retain their previous handling. Declaration-header checks and the separate scalar-leaf rules for static object/array constants are unchanged.
 
+### Rust types reached through public signatures
+
+A type in a private module belongs to the public API surface when public parameters, return types, fields, enum variants, or trait methods and associated types expose it. The analysis keeps module and name identities and follows named imports, aliases, re-exports and type aliases. It also follows the public methods of reached types to other returned types, so changes to methods on unnameable types remain visible.
+
+Private fields, private method results and concrete types that appear only in an `impl Trait` function body do not create public paths. Type macros, unresolved associated types and import cycles keep API changes conservative. Each side uses its own source snapshot, including staged analysis.
+
+Item macros and unknown attributes that may generate public items also prevent exclusion from the public surface. Standard derive and attribute names require evidence that macro definitions, named imports or external globs cannot replace them.
+
 ### Rust internal-module constant values
 
 For an ordinary change at the same path, a Rust `pub const` or non-`mut` `pub static` whose name, type, visibility, and binding kind remain unchanged while only its initializer changes uses the existing `api_changes.const_value_changes` bucket (`api.const_value` in hook output). This value-policy information is retained before external-API suppression, including Cargo bin-only crates and private modules in libraries. The default hook does not stop on unchanged references solely because of this classification. `--strict-public-const-values` makes the same classification blocking.
