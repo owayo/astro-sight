@@ -3,6 +3,106 @@
 
 use super::support::*;
 
+#[test]
+fn review_rust_glob_module_shadow_requires_unconditional_binding() {
+    for (facade, child, exposed) in [
+        ("pub use crate::internal::*;", "", true),
+        (
+            "mod api;\npub use crate::internal::*;",
+            "pub fn hidden() {}",
+            false,
+        ),
+        (
+            "mod api;\npub use crate::internal::*;",
+            "#![cfg(any())]",
+            true,
+        ),
+        (
+            "#[cfg(feature = \"x\")] mod api;\npub use crate::internal::*;",
+            "pub fn hidden() {}",
+            true,
+        ),
+        (
+            "mod api { #![cfg(any())] }\npub use crate::internal::*;",
+            "",
+            true,
+        ),
+        (
+            "pub mod other {}\npub use self::other as api;\npub use crate::internal::*;",
+            "",
+            false,
+        ),
+        (
+            "pub mod other { #![cfg(any())] }\n#[cfg(any())] pub use self::other as api;\npub use crate::internal::*;",
+            "",
+            true,
+        ),
+        (
+            "pub mod other {}\n#[cfg(any())] pub use self::other as api;\npub use crate::internal::*;",
+            "",
+            true,
+        ),
+        (
+            "pub mod other {}\npub fn value() {}\npub use self::value as api;\n#[cfg(any())] pub use self::other as api;\npub use crate::internal::*;",
+            "",
+            true,
+        ),
+        (
+            "#[cfg(any())] pub mod parent { pub mod other {} }\n#[cfg(any())] pub use self::parent::other as api;\npub use crate::internal::*;",
+            "",
+            true,
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src/internal");
+        repo.create_dir_all("src/facade");
+        repo.write("Cargo.toml", "[package]\nname = \"shadow\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\nx = []\n");
+        repo.write("src/lib.rs", "mod internal;\npub mod facade;\n");
+        repo.write("src/internal.rs", "pub mod api;\n");
+        repo.write("src/internal/api.rs", "pub fn found() -> u32 { 1 }\n");
+        repo.write("src/facade.rs", facade);
+        repo.write("src/facade/api.rs", child);
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "src/internal/api.rs",
+            "pub fn found(scale: u32) -> u32 { scale }\n",
+        );
+        for staged in [false, true] {
+            let mut args = vec!["--git"];
+            if staged {
+                repo.stage_all();
+                args.push("--staged");
+            }
+            let review = repo.run_json("review", &args);
+            let found = review["api_changes"]["modified"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|change| change["name"] == "found");
+            assert_eq!(
+                found, exposed,
+                "{facade} / {child} / staged={staged}: {review}"
+            );
+            if exposed && staged {
+                let output = cargo_bin()
+                    .arg("review")
+                    .args(&args)
+                    .arg("--hook")
+                    .arg("--dir")
+                    .arg(repo.root())
+                    .output()
+                    .unwrap();
+                assert!(!output.status.success(), "{output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("api.mod"),
+                    "{output:?}"
+                );
+            }
+        }
+    }
+}
+
 const NEW_VALUE: &str = "pub struct NewValue;\n\nimpl NewValue {\n    pub fn amount(&self) -> usize {\n        1\n    }\n}\n";
 
 /// Issue の手順: 初期の commit の後、`reader.rs` に `mod value;` と `reexport` を書き、
