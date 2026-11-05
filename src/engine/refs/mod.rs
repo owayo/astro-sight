@@ -197,6 +197,21 @@ pub struct RefScan<T> {
     pub unsupported_only: Option<UnsupportedScope>,
 }
 
+/// 公開の参照検索は検索名で申告を絞り、API の閉包証明は未知の入力をすべて保持する。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefCoverage {
+    MatchingNames,
+    AllSources,
+}
+
+fn unsupported_source_matches(path: &Path, matches: impl Fn(&[u8]) -> bool) -> bool {
+    camino::Utf8Path::from_path(path)
+        .and_then(|path| parser::read_file(path).ok())
+        .is_none_or(|source| {
+            source.contains(&0) || std::str::from_utf8(&source).is_err() || matches(&source)
+        })
+}
+
 /// 走査結果の入力の申告と、「検索できる入力が無い」判定をまとめて取り出す。
 ///
 /// Angular テンプレートは通常のファイル収集とは別経路の入力なので、対象テンプレートが
@@ -205,6 +220,7 @@ fn scan_coverage(
     collection: &FileCollection,
     dir: &Path,
     angular_ctx: Option<&crate::engine::angular_template_refs::AngularBatchContext>,
+    include: impl Fn(&Path) -> bool,
 ) -> (Vec<TruncationInfo>, Option<UnsupportedScope>) {
     let template_inputs = angular_ctx.map_or(0, |ctx| ctx.input_count());
     let unsupported_only = if template_inputs == 0 {
@@ -212,7 +228,10 @@ fn scan_coverage(
     } else {
         None
     };
-    (collection.unanalyzable_truncations(dir), unsupported_only)
+    (
+        collection.filtered_unanalyzable_truncations(dir, include),
+        unsupported_only,
+    )
 }
 
 /// 指定シンボルへの参照をディレクトリ内のファイルから検索する。
@@ -241,11 +260,14 @@ pub fn find_references_with_scan(
     // 非 Angular リポでは `None` となり、template scan を完全に skip する。
     let angular_ctx =
         crate::engine::angular_template_refs::AngularBatchContext::prepare(dir, glob_pattern);
-    let (unanalyzable, unsupported_only) = scan_coverage(&collection, dir, angular_ctx.as_ref());
+    let prefilter = SingleNamePrefilter::new(symbol_name)?;
+    let (unanalyzable, unsupported_only) =
+        scan_coverage(&collection, dir, angular_ctx.as_ref(), |path| {
+            unsupported_source_matches(path, |source| prefilter.ci.is_match(source))
+        });
     let files = collection.files;
 
     let pool = build_bounded_pool()?;
-    let prefilter = SingleNamePrefilter::new(symbol_name)?;
 
     // per-file Vec を全ファイル分保持せず、worker local の Vec へ直接統合する。
     // 読み込み・parse に失敗したファイルは参照 0 件と区別できるよう件数だけ数える。
@@ -499,7 +521,13 @@ pub fn find_references_batch_with_scan(
     glob_pattern: Option<&str>,
     options: FileScanOptions,
 ) -> Result<RefScan<ReferenceBatchMap>> {
-    find_references_batch_with_scan_policy::<true>(symbol_names, dir, glob_pattern, options)
+    find_references_batch_with_scan_policy::<true>(
+        symbol_names,
+        dir,
+        glob_pattern,
+        options,
+        RefCoverage::MatchingNames,
+    )
 }
 
 /// API 判定は Bash の変数を含めず、公開の出現検索は含める。
@@ -508,6 +536,7 @@ pub(crate) fn find_references_batch_with_scan_policy<const SHELL_VARS: bool>(
     dir: &Path,
     glob_pattern: Option<&str>,
     options: FileScanOptions,
+    coverage: RefCoverage,
 ) -> Result<RefScan<ReferenceBatchMap>> {
     use std::collections::HashMap;
 
@@ -529,10 +558,16 @@ pub(crate) fn find_references_batch_with_scan_policy<const SHELL_VARS: bool>(
     // 非 Angular リポでは `None` となり、template scan を完全に skip する。
     let angular_ctx =
         crate::engine::angular_template_refs::AngularBatchContext::prepare(dir, glob_pattern);
-    let (unanalyzable, unsupported_only) = scan_coverage(&collection, dir, angular_ctx.as_ref());
+    let acs = build_batch_acs(symbol_names)?;
+    let (unanalyzable, unsupported_only) =
+        scan_coverage(&collection, dir, angular_ctx.as_ref(), |path| {
+            coverage == RefCoverage::AllSources
+                || unsupported_source_matches(path, |source| {
+                    acs.iter().any(|(_, ac)| ac.is_match(source))
+                })
+        });
     let files = collection.files;
     let pool = build_bounded_pool()?;
-    let acs = build_batch_acs(symbol_names)?;
 
     // fold/reduce: ワーカーごとに Vec<Vec<SymbolReference>> を持ち、直接統合する。
     // 読み込み・parse に失敗したファイルは参照 0 件と区別できるよう件数だけ数える

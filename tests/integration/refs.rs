@@ -1,6 +1,78 @@
 //! refs サブコマンド (参照検索) の統合テスト。
 
 #[test]
+fn refs_mixed_objective_c_reports_only_potentially_matching_sources() {
+    let repo = TestRepo::new();
+    repo.write(
+        "A.m",
+        "static const char *MyPrefKey = \"key\"; void useIt() { consume(MyPrefKey); }\n",
+    );
+    repo.write("B.m", "void unrelated() {}\n");
+    repo.write("C.MM", "void useIt() { consume(OtherKey); }\n");
+    repo.write("README.md", "MyPrefKey OtherKey\n");
+    repo.write("Other.swift", "func other() -> Int { return 1 }\n");
+    let miss = repo.run_json("refs", &["--name", "MyPrefKey"]);
+    assert_eq!(miss["refs"], serde_json::json!([]));
+    assert_eq!(declared_unanalyzable(&miss), vec![("m".into(), 1)]);
+    assert_eq!(
+        miss["truncations"][0]["detail"]["examples"],
+        serde_json::json!(["A.m"])
+    );
+    let absent = repo.run_json("refs", &["--name", "AbsentKey", "--max-results", "1"]);
+    assert!(absent.get("truncations").is_none(), "{absent}");
+    repo.write(
+        "Other.swift",
+        "let MyPrefKey = 1\nfunc other() -> Int { return MyPrefKey }\n",
+    );
+    let hit = repo.run_json("refs", &["--name", "MyPrefKey", "--max-results", "1"]);
+    assert_eq!(hit["refs"].as_array().unwrap().len(), 1);
+    assert_eq!(declared_unanalyzable(&hit), vec![("m".into(), 1)]);
+    assert_eq!(hit["result_summary"]["complete_input"], false);
+    let scoped = repo.run_json("refs", &["--name", "MyPrefKey", "--glob", "*.swift"]);
+    assert!(scoped.get("truncations").is_none(), "{scoped}");
+    repo.write("Other.swift", "let MyPrefKey = 1\nlet OtherKey = 2\nfunc other() -> Int { return MyPrefKey + OtherKey }\n");
+    let output = cargo_bin()
+        .args([
+            "refs",
+            "--names",
+            "MyPrefKey,OtherKey",
+            "--max-results",
+            "1",
+            "--dir",
+        ])
+        .arg(repo.root())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let records: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        declared_unanalyzable(&records[0]),
+        vec![("m".into(), 1), ("mm".into(), 1)]
+    );
+    assert!(records[1].get("truncations").is_none());
+    assert_eq!(records[1]["result_summary"]["complete_input"], false);
+    let output = cargo_bin()
+        .args(["refs", "--name", "AbsentKey", "--glob", "*.m", "--dir"])
+        .arg(repo.root())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "UNSUPPORTED_LANGUAGE");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("2 file(s) matched"),
+        "{error}"
+    );
+}
+
+#[test]
 fn refs_swift_declarations_are_definitions_without_reclassifying_uses() {
     let repo = TestRepo::new();
     repo.write(
@@ -1679,11 +1751,11 @@ fn refs_declares_unsupported_language_sources() {
     let hit = repo.run_json("refs", &["--name", "greet_user", "--max-results", "1"]);
     assert_eq!(
         declared_unanalyzable(&hit),
-        expected,
-        "ヒットがあっても申告する"
+        Vec::<(String, u64)>::new(),
+        "検索名を含まない未対応ソースは公開検索で申告しない"
     );
     assert_eq!(hit["result_summary"]["total"], 2);
-    assert_eq!(hit["result_summary"]["complete_input"], false, "{hit}");
+    assert_eq!(hit["result_summary"]["complete_input"], true, "{hit}");
 
     let output = cargo_bin()
         .args([

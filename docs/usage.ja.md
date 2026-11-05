@@ -238,14 +238,15 @@ astro-sight refs --name "new" --dir . --max-results unlimited --token-budget unl
 
 ### 解析できない言語のファイル
 
-`refs` が検索するのは [astro-sight が解析できる言語](languages.ja.md) のファイルだけである。検索範囲にある、解析できない言語のソースは黙って落とさず、`truncations` に `reason: "unanalyzable_source"` として拡張子ごとに 1 件ずつ出す（`dead-code` と同じ申告）。そのファイルの中の参照は検索していないため、0 件でも、そこで使われている可能性は残る。
+`refs` が検索するのは [astro-sight が解析できる言語](languages.ja.md) のファイルだけである。検索範囲にある、検索名を含み得る未対応ソースは黙って落とさず、`truncations` に `reason: "unanalyzable_source"` として拡張子ごとに 1 件ずつ出す（`dead-code` と同じ形式の申告）。そのファイルの中の参照は検索していないため、0 件でも、そこで使われている可能性は残る。
 
 ```json
 {"symbol":"greetUser","refs":[],"truncations":[{"reason":"unanalyzable_source","message":"1 \".applescript\" file(s) were not analyzed (no parser for this language); references inside them are not counted (e.g. sample.applescript)","detail":{"extension":"applescript","count":1,"examples":["sample.applescript"]}}]}
 ```
 
-- 申告するのは、プログラム言語かテンプレート言語だと確実に言える拡張子だけである（`.vue` / `.svelte` / `.applescript` / `.scala` / `.lua` など）。画像・文書・データまで並べると、本当に見落としているソースが埋もれるため
-- 名前が見つかったかどうかに関係なく付ける。`refs --names` では `skipped` と同じく先頭のレコードにだけ付ける。名前ごとに繰り返すと、申告だけで出力の予算を使い切るため
+- 申告するのは、プログラム言語かテンプレート言語だと確実に言える拡張子だけである（`.vue` / `.svelte` / `.applescript` / `.scala` / `.lua` / Objective-C の `.m` / Objective-C++ の `.mm` など）。画像・文書・データまで並べると、本当に見落としているソースが埋もれるため
+- 未対応ソースの内容に検索名の候補（部分一致・ASCII の大小文字を区別しない）がある場合に付ける。読み取り不能・100MB 超過・不明な文字コードでは不在を確かめられないので申告に残す。対応ソース側のヒット有無には依存しない。`refs --names` では `skipped` と同じく先頭のレコードにだけ付ける。要求された名前のいずれかを含み得るファイルをまとめ、名前ごとに繰り返して出力予算を使い切らないため
+- 拡張子ごとの全件数と代表パスを3件まで載せ、該当する拡張子の種類は切り捨てない。API の閉包証明と dead-code は、検索名で絞らず未対応ソースをすべて保持する
 - 検索範囲は `--dir` と `--glob` で選んだファイルである。`--glob "**/*.rs"` を付ければ `.vue` は範囲に入らないので申告しない
 
 検索範囲にファイルはあるのに**どれも検索できない**ときは、空の結果ではなく `UNSUPPORTED_LANGUAGE` のエラーを返す（終了コード 1）。単一ファイルに対する `symbols --path` と同じ扱いである。この判定には文書や画像も含めて、範囲に入ったすべてのファイルを数える。メッセージには拡張子ごとの件数と、パスを 3 件まで載せる。`refs --names`・`session`・MCP も同じである。
