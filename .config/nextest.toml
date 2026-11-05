@@ -51,6 +51,12 @@ filter = 'binary_id(astro-sight::integration) & test(integration::required_type_
 priority = 50
 threads-required = 2
 
+# 判別 union の削除と不明な値の流れを、通常と index で検証する回帰を先に実行する。
+[[profile.default.overrides]]
+filter = 'binary_id(astro-sight::integration) & test(=integration::literal_union_removal::discriminated_union_removal_checks_switches_payloads_and_unsupported_flows)'
+priority = 50
+threads-required = 2
+
 # CI (NEXTEST_PROFILE=ci): 失敗しても残りのテストを最後まで流し、失敗の出力を最後にもまとめて出す
 [profile.ci]
 fail-fast = false
