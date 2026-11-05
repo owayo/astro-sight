@@ -4,6 +4,214 @@
 use super::support::*;
 
 #[test]
+fn review_rust_cfg_reexports_require_module_activation_proof() {
+    for (backend, child, resolved) in [
+        (
+            "mod imp; #[cfg(feature=\"fast\")] pub use imp::Engine;",
+            "#![cfg(feature=\"fast\")]\npub struct Engine;",
+            true,
+        ),
+        (
+            "#[cfg(feature=\"fast\")] pub mod wrap { mod imp { pub struct Engine; } pub use imp::Engine; }",
+            "pub struct Orphan;",
+            true,
+        ),
+        (
+            "#[custom] pub mod wrap { #[cfg(feature=\"fast\")] mod imp { pub struct Engine; } #[cfg(feature=\"fast\")] pub use imp::Engine; }",
+            "pub struct Orphan;",
+            false,
+        ),
+        (
+            "#[cfg(feature=\"f a\")] mod imp; #[cfg(feature=\"fa\")] pub use imp::Engine;",
+            "pub struct Engine;",
+            false,
+        ),
+        (
+            "#[cfg(feature = \"fast\")] mod imp; #[cfg(feature=\"fast\")] pub use imp::Engine;",
+            "pub struct Engine;",
+            true,
+        ),
+        (
+            "#[cfg(feature = \"fast\")] mod imp; #[cfg(feature=\"fast\")] #[cfg(unix)] pub use imp::Engine;",
+            "pub struct Engine;",
+            true,
+        ),
+        (
+            "#[cfg(feature = \"fast\")] mod imp; pub use imp::Engine;",
+            "pub struct Engine;",
+            false,
+        ),
+        (
+            "#[cfg(feature = \"fast\")] mod imp; #[cfg(feature=\"other\")] pub use imp::Engine;",
+            "pub struct Engine;",
+            false,
+        ),
+        (
+            "#[cfg(feature = \"fast\")] mod imp; #[cfg(feature=\"fast\")] pub use imp::Engine;",
+            "#![cfg(feature=\"other\")]\npub struct Engine;",
+            false,
+        ),
+        (
+            "#[cfg(feature = \"fast\")] mod imp; #[cfg(feature=\"fast\")] pub use imp::Engine;",
+            "#![cfg(feature=\"fast\")]\npub struct Engine;",
+            true,
+        ),
+        (
+            "#[cfg_attr(feature=\"fast\", cfg(unix))] mod imp; #[cfg(feature=\"fast\")] pub use imp::Engine;",
+            "pub struct Engine;",
+            false,
+        ),
+        (
+            "#[custom] mod imp; #[cfg(feature=\"fast\")] pub use imp::Engine;",
+            "pub struct Engine;",
+            false,
+        ),
+        (
+            "#[cfg(feature=\"fast\")] mod imp; #[cfg(not(feature=\"fast\"))] mod imp {} #[cfg(feature=\"fast\")] pub use imp::Engine;",
+            "pub struct Engine;",
+            false,
+        ),
+    ] {
+        assert_private_addition_surface(backend, child, "pub use crate::backend::*;", resolved);
+    }
+}
+
+#[test]
+fn review_rust_glob_external_names_require_complete_namespace_proof() {
+    for (extra, prelude, resolved) in [
+        (
+            "pub(crate) use core;",
+            "pub use crate::backend::*; pub use core::fmt::Debug;",
+            false,
+        ),
+        (
+            "",
+            "pub use crate::backend::*; pub use core::fmt::Debug;",
+            true,
+        ),
+        (
+            "pub mod nested {} pub use self::nested::*;",
+            "pub use crate::backend::*; pub use core::fmt::Debug;",
+            true,
+        ),
+        (
+            "pub fn core() {}",
+            "pub use crate::backend::*; pub use core::fmt::Debug;",
+            true,
+        ),
+        (
+            "pub mod core {}",
+            "pub use crate::backend::*; pub use core::fmt::Debug;",
+            false,
+        ),
+        (
+            "pub use core;",
+            "pub use crate::backend::*; pub use core::fmt::Debug;",
+            false,
+        ),
+        (
+            "#[cfg(feature=\"fast\")] pub mod core {}",
+            "pub use crate::backend::*; pub use core::fmt::Debug;",
+            false,
+        ),
+        (
+            "pub mod nested {} pub use self::nested as core;",
+            "pub use crate::backend::*; pub use core::fmt::Debug;",
+            false,
+        ),
+        (
+            "pub mod nested { pub mod core {} } pub use self::nested::*;",
+            "pub use crate::backend::*; pub use core::fmt::Debug;",
+            false,
+        ),
+        (
+            "pub use unknown::*;",
+            "pub use crate::backend::*; pub use core::fmt::Debug;",
+            false,
+        ),
+        (
+            "generate!();",
+            "pub use crate::backend::*; pub use core::fmt::Debug;",
+            false,
+        ),
+        (
+            "",
+            "#![no_implicit_prelude]\npub use crate::backend::*; pub use core::fmt::Debug;",
+            false,
+        ),
+    ] {
+        assert_private_addition_surface(
+            &format!("mod imp; pub use imp::Engine; {extra}"),
+            "pub struct Engine;",
+            prelude,
+            resolved,
+        );
+    }
+}
+
+fn assert_private_addition_surface(backend: &str, child: &str, prelude: &str, resolved: bool) {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src/backend");
+    repo.write("Cargo.toml", "[package]\nname=\"surface\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[features]\nfast=[]\nother=[]\n");
+    repo.write(
+        "src/lib.rs",
+        "pub mod backend; pub mod prelude; mod internal;\n",
+    );
+    repo.write("src/backend.rs", backend);
+    repo.write("src/backend/imp.rs", child);
+    repo.write("src/prelude.rs", prelude);
+    repo.write("src/internal.rs", "pub fn helper() -> u32 { 1 }\n");
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/internal.rs",
+        "pub fn helper() -> u32 { 1 }\npub fn added() -> u32 { 2 }\n",
+    );
+    repo.stage_all();
+    for staged in [false, true] {
+        let mut args = vec!["--git"];
+        if staged {
+            args.push("--staged");
+        }
+        let review = repo.run_json("review", &args);
+        let added = review["api_changes"]["added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["name"] == "added");
+        assert_eq!(
+            added, !resolved,
+            "{backend}\n{child}\n{prelude}\nstaged={staged}: {review}"
+        );
+        let hook = cargo_bin()
+            .arg("review")
+            .args(&args)
+            .args(["--hook", "--dir"])
+            .arg(repo.root())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&hook.stderr);
+        assert_eq!(hook.status.code(), Some(i32::from(resolved)), "{stderr}");
+        assert_eq!(stderr.contains("\"dead\""), resolved, "{stderr}");
+    }
+    if resolved && child.contains("pub struct Engine;") {
+        repo.write(
+            "src/backend/imp.rs",
+            format!("{child}\nimpl Engine {{ pub fn execute(&self, value: u32) {{}} }}\n"),
+        );
+        let review = repo.run_json("review", &["--git"]);
+        assert!(
+            review["api_changes"]["added"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["name"] == "Engine.execute"),
+            "public reexport lost: {backend}\n{prelude}\n{review}"
+        );
+    }
+}
+
+#[test]
 fn review_rust_public_signatures_expose_hidden_types_individually() {
     for (reader, exposed) in [
         (

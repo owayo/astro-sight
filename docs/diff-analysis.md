@@ -395,6 +395,8 @@ The default hook treats these value changes as informational; `--strict-public-c
 
 A type in a private module belongs to the public API surface when public parameters, return types, fields, enum variants, or trait methods and associated types expose it. The analysis keeps module and name identities and follows named imports, aliases, re-exports and type aliases. It also follows the public methods of reached types to other returned types, so changes to methods on unnameable types remain visible.
 
+A relative child-module re-export can be resolved when its activation conditions guarantee that the child exists, including ancestor, declaration, and inner attributes. Each cfg attribute is compared as a token-preserving requirement; Boolean equivalences are not inferred. A scope containing globs can still prove an external crate path when every glob target and its transitive globs lack that type-namespace name, including aliases and conditional declarations. Unknown globs, macros or attributes, `no_implicit_prelude`, self-crate aliases, and other unproven bindings retain the conservative public-surface result.
+
 Private fields, private method results and concrete types that appear only in an `impl Trait` function body do not create public paths. Type macros, unresolved associated types and import cycles keep API changes conservative. Each side uses its own source snapshot, including staged analysis.
 
 Item macros and unknown attributes that may generate public items also prevent exclusion from the public surface. Standard derive and attribute names require evidence that macro definitions, named imports or external globs cannot replace them.

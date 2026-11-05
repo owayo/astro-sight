@@ -139,6 +139,7 @@ pub(crate) fn collect_rust_pub_use_index(
     let module_tree = collect_all_modules(source, dir, info)?;
     let mut collected: Vec<CollectedPubUseEdge> = Vec::new();
     let mut signatures = super::signature_types::SignatureTypes::default();
+    let mut bindings = BindingProof::default();
     for file in files {
         let Ok(rel_to_src) = file.strip_prefix(&info.src_root_rel) else {
             continue;
@@ -156,6 +157,7 @@ pub(crate) fn collect_rust_pub_use_index(
             && (!module_path.is_empty() || rel_to_src == std::path::Path::new("lib.rs"))
         {
             signatures.collect(tree.root_node(), &file_source, &module_path)?;
+            bindings.collect(tree.root_node(), &file_source, &module_path);
         }
     }
     // edition と self 別名は、どちらも判定する側の snapshot から読む。
@@ -170,6 +172,7 @@ pub(crate) fn collect_rust_pub_use_index(
             std::path::Path::new("lib.rs"),
         )
     })?;
+    let collected = bindings.refine(collected, edition);
     let collected = resolve_bare_pub_use_edges(collected, &module_tree, || edition)?;
     let unconditional_named_edges: std::collections::HashSet<_> = collected
         .iter()
@@ -351,9 +354,8 @@ fn global_self_aliases(source: &[u8]) -> Option<std::collections::HashSet<String
 /// - 束縛を見ない edge (ルートの module の use)、module tree に無い module (どの `mod` 宣言からも
 ///   辿れないファイル) の use、edition 2015、スコープに束縛の無い名前 (2018 以降は extern
 ///   prelude の名前): 従来どおりクレートルート起点の edge のまま
-/// - 2018 以降で先頭の名前が子 `mod` に束縛され、その子 module が条件なしと確かめられた
-///   (宣言・inline の body・外部ファイルの内部属性に `cfg` や未知の属性が無い): 現在の module
-///   起点に付け替える
+/// - 2018 以降で先頭の名前が子 `mod` に束縛され、その子が無条件、または use の有効時に
+///   子も有効と確認済み (`BindingProof` が宣言・祖先・内部属性を検証): 現在の module 起点へ直す
 /// - それ以外 (2018 以降で束縛を決められない・子 module の条件を確かめられない、edition が
 ///   不明で子 `mod` か未解決の束縛を持つ): `None`。index を不完全として、公開面による抑制を
 ///   諦めさせる (公開面の外と断定しない)。
@@ -388,10 +390,18 @@ fn resolve_bare_pub_use_edges(
             }
             match (binding, edition) {
                 (_, Some(RustEdition::E2015)) | (BareLeadingBinding::Unbound, _) => {}
-                (BareLeadingBinding::ChildModule, Some(RustEdition::E2018OrLater)) => {
+                (
+                    BareLeadingBinding::ChildModule | BareLeadingBinding::GuardedChildModule,
+                    Some(RustEdition::E2018OrLater),
+                ) => {
                     let mut child = source_module.clone();
                     child.push(bare_leading_name(edge)?.to_string());
-                    if !module_tree.is_unconditional(&child) {
+                    if !module_tree.pub_children.contains_key(&child) {
+                        return None;
+                    }
+                    if binding != BareLeadingBinding::GuardedChildModule
+                        && !module_tree.is_unconditional(&child)
+                    {
                         return None;
                     }
                     let (RustPubUseEdge::Named {
@@ -406,7 +416,12 @@ fn resolve_bare_pub_use_edges(
                     }) = edge;
                     target_module.splice(0..0, source_module.iter().cloned());
                 }
-                (BareLeadingBinding::ChildModule | BareLeadingBinding::Unresolved, _) => {
+                (
+                    BareLeadingBinding::ChildModule
+                    | BareLeadingBinding::GuardedChildModule
+                    | BareLeadingBinding::Unresolved,
+                    _,
+                ) => {
                     return None;
                 }
             }
@@ -1220,6 +1235,7 @@ mod tests {
                         edge,
                         bare_leading,
                         unconditional: item_attributes_are_plain(node, source),
+                        activation: Activation::item(node, source),
                     });
                 }
             }
