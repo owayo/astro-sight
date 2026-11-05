@@ -1108,3 +1108,149 @@ fn property_removal_keeps_removed_non_scalar_members_outside_the_proof() {
     assert_eq!(code, 1, "{json}");
     assert_eq!(json["api"]["mod"][0]["n"], "Row", "{json}");
 }
+
+#[test]
+fn type_modifications_explain_unverified_proofs_without_changing_classification() {
+    for extension in ["ts", "tsx"] {
+        for case in [
+            "missing",
+            "closed",
+            "asserted value",
+            "function",
+            "union added",
+            "union closed",
+        ] {
+            let repo = TestRepo::new();
+            repo.create_dir_all("src");
+            let target = format!("src/item.{extension}");
+            let (before, after, producer_before, producer_after, application, name) = match case {
+                "function" => (
+                    "export function run(value: number): number {\nreturn value;\n}\n",
+                    "export function run(value: number, label: string): number {\nreturn value;\n}\n",
+                    "",
+                    "",
+                    "import { run } from './item';\nexport const result = run(1);\n",
+                    "run",
+                ),
+                "union added" => (
+                    "export type Level = 'low' | 'high';\nexport interface Alert { level: Level; }\n",
+                    "export type Level = 'low' | 'middle' | 'high';\nexport interface Alert { level: Level; }\n",
+                    "",
+                    "",
+                    "import type { Alert } from './item';\nexport const alert: Alert = { level: 'low' };\n",
+                    "Level",
+                ),
+                "union closed" => (
+                    "export type AppEvent = { type: 'start' } | { type: 'stop' };\n",
+                    "export type AppEvent = { type: 'stop' };\n",
+                    "import type { AppEvent } from './item';\nexport function handleEvent(event: AppEvent): string {\nif (event.type === 'start') return 'started';\nreturn event.type === 'stop' ? 'stopped' : 'unknown';\n}\n",
+                    "import type { AppEvent } from './item';\nexport function handleEvent(event: AppEvent): string {\nreturn event.type === 'stop' ? 'stopped' : 'unknown';\n}\n",
+                    "import { handleEvent } from './make';\nexport const state = handleEvent({ type: 'stop' });\n",
+                    "AppEvent",
+                ),
+                _ => (
+                    "export interface Item { id: number; }\n",
+                    "export interface Item { id: number; label: string; }\n",
+                    "import type { Item } from './item';\nexport function makeItem(): Item {\nreturn { id: 1 };\n}\nexport function makeDraft(): Item {\nreturn { id: 0 };\n}\n",
+                    if case == "missing" {
+                        "import type { Item } from './item';\nexport function makeItem(): Item {\nreturn { id: 1, label: 'first' };\n}\nexport function makeDraft(): Item {\nreturn { id: 0 };\n}\n"
+                    } else if case == "asserted value" {
+                        "import type { Item } from './item';\nexport function makeItem(): Item {\nreturn { id: 1, label: 'first' };\n}\nexport function makeDraft(): Item {\nreturn ({ id: 0, label: 'draft' } as Item);\n}\n"
+                    } else {
+                        "import type { Item } from './item';\nexport function makeItem(): Item {\nreturn { id: 1, label: 'first' };\n}\nexport function makeDraft(): Item {\nreturn { id: 0, label: 'draft' };\n}\n"
+                    },
+                    "import { makeItem, makeDraft } from './make';\nexport const items = [makeItem(), makeDraft()];\n",
+                    "Item",
+                ),
+            };
+            repo.write(&target, before);
+            let producer = format!("src/make.{extension}");
+            repo.write(&producer, producer_before);
+            repo.write(format!("src/app.{extension}"), application);
+            repo.init_git();
+            repo.commit_all("initial");
+            repo.write(&target, after);
+            repo.write(&producer, producer_after);
+            for staged in [false, true] {
+                if staged {
+                    repo.stage_all();
+                    repo.write(&producer, "broken unstaged source");
+                }
+                let args = if staged {
+                    vec!["--git", "--staged"]
+                } else {
+                    vec!["--git"]
+                };
+                let normal = repo.run_json("review", &args);
+                let modified = normal["api_changes"]["modified"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|change| change["name"] == name);
+                let blocking = matches!(
+                    case,
+                    "missing" | "asserted value" | "function" | "union added"
+                );
+                assert_eq!(
+                    modified.is_some(),
+                    blocking,
+                    "{extension} {case} {staged}: {normal}"
+                );
+                let output = cargo_bin()
+                    .args(["review", "--dir"])
+                    .arg(repo.root())
+                    .args(&args)
+                    .arg("--hook")
+                    .output()
+                    .unwrap();
+                let hook: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+                assert_eq!(output.status.success(), !blocking, "{case}: {hook}");
+                if let Some(change) = modified {
+                    let entry = hook["api"]["mod"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|change| change["n"] == name)
+                        .unwrap();
+                    assert_eq!(entry["unverified"], change["unverified"], "{normal} {hook}");
+                    let reason = if matches!(case, "missing" | "asserted value") {
+                        "type_member_proof_failed"
+                    } else if case == "function" {
+                        "compatibility_unverified"
+                    } else {
+                        "unsupported_type_change"
+                    };
+                    assert_eq!(change["unverified"]["reason"], reason, "{normal}");
+                    if matches!(case, "missing" | "asserted value") {
+                        assert_eq!(
+                            change["unverified"]["first_unproven"]["file"], producer,
+                            "{normal}"
+                        );
+                        assert_eq!(
+                            change["unverified"]["first_unproven"]["line"], 4,
+                            "{normal}"
+                        );
+                        assert_eq!(
+                            change["unverified"]["first_unproven"]["symbol"], "makeDraft",
+                            "{normal}"
+                        );
+                        if !staged && case == "missing" {
+                            let toon = cargo_bin()
+                                .args(["review", "--dir"])
+                                .arg(repo.root())
+                                .args(["--git", "--format", "toon"])
+                                .output()
+                                .unwrap();
+                            let text = String::from_utf8(toon.stdout).unwrap();
+                            assert!(
+                                text.contains("type_member_proof_failed")
+                                    && text.contains("makeDraft"),
+                                "{text}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

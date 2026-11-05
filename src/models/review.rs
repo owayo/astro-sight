@@ -291,6 +291,35 @@ pub struct ApiSymbolChange {
     /// 分類できない変更は `None` のまま従来どおり素の `api.mod` になる (網羅性は前提にしない)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract_change: Option<ApiContractChange>,
+    /// 互換・追随の証明を完了できなかった理由。分類・blocking は変えない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unverified: Option<ApiModificationUnverified>,
+}
+
+/// 証明できなかったことを示し、型の不適合を断定するものではない。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ApiModificationUnverified {
+    pub reason: ApiModificationUnverifiedReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_unproven: Option<ApiUnprovenSite>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiModificationUnverifiedReason {
+    UnsupportedTypeChange,
+    TypeMemberProofFailed,
+    LiteralUnionProofFailed,
+    CompatibilityUnverified,
+}
+
+/// 変更後ソースの位置。line は refs と同じ 0 始まり。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ApiUnprovenSite {
+    pub file: String,
+    pub line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
 }
 
 /// 型契約変更の内訳。`kind` (何が変わったか) と `breaks` (どちら側が壊れるか) を組で持つ。

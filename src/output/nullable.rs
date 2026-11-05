@@ -453,6 +453,7 @@ mod tests {
             refs_internal,
         };
         let change = |name: &str, no_callers: bool| ApiSymbolChange {
+            unverified: None,
             name: name.into(),
             kind: "function".into(),
             file: "lib/base.ts".into(),

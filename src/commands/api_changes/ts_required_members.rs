@@ -321,6 +321,11 @@ pub(super) fn prove_closure(
     };
     for r in refs {
         if !prover.prove_reference(r, diff_files, caches) {
+            let site = unproven_reference_site(scope, r, caches);
+            caches.type_member_unproven_sites.insert(
+                (scope.target_path.to_owned(), scope.type_name.to_owned()),
+                site,
+            );
             return false;
         }
     }
@@ -329,6 +334,89 @@ pub(super) fn prove_closure(
         && prover.prove_deferred(diff_files, caches)
         && (!delta.audits_uses() || prover.prove_narrowed_uses(caches))
         && (delta.removed_names().is_empty() || prover.prove_removed_keys_absent(caches))
+}
+
+struct UnprovenSymbolSite {
+    range: std::ops::Range<usize>,
+    line: usize,
+    symbol: String,
+    parent: Option<usize>,
+}
+
+pub(super) struct UnprovenSymbolSites(Vec<UnprovenSymbolSite>);
+
+impl UnprovenSymbolSites {
+    fn build(parsed: &ParsedRefFile) -> Self {
+        let mut sites: Vec<UnprovenSymbolSite> = Vec::new();
+        let mut owners: Vec<(usize, usize)> = Vec::new();
+        let _ = walk_preorder(parsed.tree.root_node(), Children::Named, |node, depth| {
+            while owners.last().is_some_and(|(at, _)| *at >= depth) {
+                owners.pop();
+            }
+            if matches!(
+                node.kind(),
+                "function_declaration"
+                    | "function_expression"
+                    | "method_definition"
+                    | "variable_declarator"
+            ) && let Some(name) = node
+                .child_by_field_name("name")
+                .filter(|name| matches!(name.kind(), "identifier" | "property_identifier"))
+                && let Ok(symbol) = name.utf8_text(&parsed.source)
+            {
+                let index = sites.len();
+                sites.push(UnprovenSymbolSite {
+                    range: node.byte_range(),
+                    line: name.start_position().row,
+                    symbol: symbol.to_owned(),
+                    parent: owners.last().map(|(_, index)| *index),
+                });
+                owners.push((depth, index));
+            }
+            ControlFlow::<(), _>::Continue(Walk::Descend)
+        });
+        Self(sites)
+    }
+
+    fn owner(&self, range: std::ops::Range<usize>) -> Option<&UnprovenSymbolSite> {
+        let mut index = self
+            .0
+            .partition_point(|site| site.range.start <= range.start)
+            .checked_sub(1)?;
+        loop {
+            let site = &self.0[index];
+            if range.end <= site.range.end {
+                return Some(site);
+            }
+            index = site.parent?;
+        }
+    }
+}
+
+/// 証明を止めた参照を示す。関数や値の名前は AST で確認できたときだけ添える。
+fn unproven_reference_site(
+    scope: &ClosureScope<'_>,
+    reference: &SymbolReference,
+    caches: &mut ApiClosureCaches,
+) -> crate::models::review::ApiUnprovenSite {
+    let mut site = crate::models::review::ApiUnprovenSite {
+        file: reference.path.clone(),
+        line: reference.line,
+        symbol: None,
+    };
+    if let Some(parsed) = parsed_ref_file_shared(scope.dir, &reference.path, caches)
+        && let Some(target) =
+            ref_name_node(&parsed, scope.type_name, reference.line, reference.column)
+        && let Some(owner) = caches
+            .unproven_symbol_sites
+            .entry(reference.path.clone())
+            .or_insert_with(|| UnprovenSymbolSites::build(&parsed))
+            .owner(target.byte_range())
+    {
+        site.line = owner.line;
+        site.symbol = Some(owner.symbol.clone());
+    }
+    site
 }
 
 /// 受け取る箇所 (ファイル直下の関数の必須引数) の義務。呼び出しは関数名で後から検索する。
@@ -2455,6 +2543,44 @@ mod tests {
             alias.child_by_field_name("value").unwrap(),
             source.as_bytes(),
         )
+    }
+
+    #[test]
+    fn unproven_reference_locations_handle_deep_types_and_anonymous_values() {
+        let deep = format!("{}Item{}", "Box<".repeat(2_000), ">".repeat(2_000));
+        for (source, expected) in [
+            (
+                format!("export function makeDraft(): {deep} {{ throw new Error(); }}"),
+                Some("makeDraft"),
+            ),
+            (
+                "const makeDraft = (): Item => { throw new Error(); };".to_owned(),
+                Some("makeDraft"),
+            ),
+            (format!("export type Alias = {deep};"), None),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("source.ts"), &source).unwrap();
+            let reference = SymbolReference {
+                path: "source.ts".to_owned(),
+                line: 0,
+                column: source.find("Item").unwrap(),
+                context: None,
+                kind: Some(RefKind::Reference),
+                confidence: None,
+            };
+            let scope = ClosureScope {
+                dir: root.path().to_str().unwrap(),
+                base: "HEAD",
+                type_name: "Item",
+                target_path: "item.ts",
+            };
+            let site =
+                unproven_reference_site(&scope, &reference, &mut ApiClosureCaches::default());
+            assert_eq!(site.file, "source.ts");
+            assert_eq!(site.line, 0);
+            assert_eq!(site.symbol.as_deref(), expected);
+        }
     }
 
     #[test]

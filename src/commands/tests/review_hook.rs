@@ -20,6 +20,7 @@ use std::process::Command;
 
 fn test_only_api_fixture(const_value: bool) -> ReviewResult {
     let change = ApiSymbolChange {
+        unverified: None,
         name: "PAGE_URL".into(),
         kind: "variable".into(),
         file: "e2e/pages.ts".into(),
@@ -147,6 +148,7 @@ fn callback_body_hook_reports_unverified_changes_and_supports_strict_mode() {
             unchanged_type_annotations: Vec::new(),
             callback_body_changes: vec![CallbackBodyChange {
                 change: ApiSymbolChange {
+                    unverified: None,
                     name: "store".into(),
                     kind: "variable".into(),
                     file: "store.ts".into(),
@@ -412,6 +414,7 @@ fn build_review_hook_json_mixed_compatible_and_breaking_impact_keeps_breaking_on
             added: Vec::new(),
             removed: Vec::new(),
             modified: vec![ApiSymbolChange {
+                unverified: None,
                 name: "loadTask".to_string(),
                 kind: "function".to_string(),
                 file: "TaskDetailHeader.tsx".to_string(),
@@ -1071,6 +1074,7 @@ fn build_review_hook_json_api_modified_is_blocking() {
             added: Vec::new(),
             removed: Vec::new(),
             modified: vec![ApiSymbolChange {
+                unverified: None,
                 name: "foo".to_string(),
                 kind: "function".to_string(),
                 file: "a.rs".to_string(),
@@ -1129,6 +1133,7 @@ fn build_review_hook_json_api_modified_carries_contract_change() {
             added: Vec::new(),
             removed: Vec::new(),
             modified: vec![ApiSymbolChange {
+                unverified: None,
                 name: "Payload".to_string(),
                 kind: "class".to_string(),
                 file: "models.py".to_string(),
@@ -1197,6 +1202,7 @@ fn build_review_hook_json_api_modified_without_callers_is_flagged_but_still_bloc
             added: Vec::new(),
             removed: Vec::new(),
             modified: vec![ApiSymbolChange {
+                unverified: None,
                 name: "foo".to_string(),
                 kind: "function".to_string(),
                 file: "a.rs".to_string(),
@@ -1327,6 +1333,7 @@ fn build_review_hook_json_const_value_only_is_informational() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: vec![ApiSymbolChange {
+                unverified: None,
                 name: "ENEMY_SPEED".to_string(),
                 kind: "constant".to_string(),
                 file: "src/constants.rs".to_string(),
@@ -1382,6 +1389,7 @@ fn build_review_hook_json_const_value_is_blocking_under_strict() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: vec![ApiSymbolChange {
+                unverified: None,
                 name: "ENEMY_SPEED".to_string(),
                 kind: "constant".to_string(),
                 file: "src/constants.rs".to_string(),
@@ -1790,6 +1798,7 @@ fn build_review_hook_json_api_modified_carries_field_contract_change() {
             removed: Vec::new(),
             modified: vec![
                 ApiSymbolChange {
+                    unverified: None,
                     name: "Payload.y".to_string(),
                     kind: "field".to_string(),
                     file: "models.py".to_string(),
@@ -1802,6 +1811,7 @@ fn build_review_hook_json_api_modified_carries_field_contract_change() {
                     }),
                 },
                 ApiSymbolChange {
+                    unverified: None,
                     name: "Mode".to_string(),
                     kind: "type".to_string(),
                     file: "models.py".to_string(),
@@ -1974,6 +1984,7 @@ fn build_review_hook_json_blocking_categories_match_filtered_output_and_exit() {
         refs_internal: 0,
     };
     let change = || ApiSymbolChange {
+        unverified: None,
         name: "item".into(),
         kind: "function".into(),
         file: "changed.ts".into(),

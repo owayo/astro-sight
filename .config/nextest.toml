@@ -69,6 +69,12 @@ filter = 'binary_id(astro-sight::integration) & test(=integration::typescript_gr
 priority = 50
 threads-required = 2
 
+# 証明理由の一致と staged snapshot を複数構成で検証する回帰を先に実行する。
+[[profile.default.overrides]]
+filter = 'binary_id(astro-sight::integration) & test(=integration::required_type_members::type_modifications_explain_unverified_proofs_without_changing_classification)'
+priority = 50
+threads-required = 2
+
 # CI (NEXTEST_PROFILE=ci): 失敗しても残りのテストを最後まで流し、失敗の出力を最後にもまとめて出す
 [profile.ci]
 fail-fast = false

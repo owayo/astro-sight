@@ -1571,6 +1571,10 @@ fn closed_via_local_const_argument(
 /// unique file 単位の F 回に圧縮する。
 #[derive(Default)]
 pub(crate) struct ApiClosureCaches {
+    pub(super) type_member_unproven_sites:
+        std::collections::HashMap<(String, String), crate::models::review::ApiUnprovenSite>,
+    pub(super) unproven_symbol_sites:
+        std::collections::HashMap<String, super::ts_required_members::UnprovenSymbolSites>,
     pub(super) unresolved_modified_callers: Vec<crate::models::review::UnresolvedApiCall>,
     pub(super) literal_union_removal: super::ts_literal_union_removal::RemovalCache,
     pub(super) function_handoffs: super::ts_function_values::HandoffCache,

@@ -383,6 +383,25 @@ astro-sight review --dir . --git \
 
 On top of the impact analysis of `context`, `review` returns candidates for missed changes from `cochange`, the public API diff, and dead symbols in a single run. It is meant for PR reviews and pre-merge checks.
 
+### Unverified TypeScript modifications
+
+Blocking TS / TSX entries in `api_changes.modified` and hook `api.mod` carry `unverified`. This adds evidence for triage without changing classification, blocking, or exit status. It does not establish a TypeScript type error.
+
+| `unverified.reason` | Meaning |
+|---|---|
+| `unsupported_type_change` | No specialized proof matched this type change, such as adding a string-union value |
+| `type_member_proof_failed` | A type-member proof was selected but could not verify every reference, value, and use |
+| `literal_union_proof_failed` | A union-removal proof was selected but could not verify all remaining values and uses |
+| `compatibility_unverified` | Other compatibility or caller-update evidence was incomplete, including unavailable staged reference evidence |
+
+When a type-member proof stops at a direct type reference, `first_unproven` includes the new source's `file`, zero-based `line`, and an AST-verified `symbol` when available. It is omitted when a location cannot be established. When snapshot fallback leaves worktree reference evidence unavailable for the index, these locations are discarded and the reason becomes `compatibility_unverified`. This identifies where the proof stopped, which may differ from a compiler's error location.
+
+```json
+{"n":"Item","f":"src/item.ts","unverified":{"reason":"type_member_proof_failed","first_unproven":{"file":"src/make.ts","line":4,"symbol":"makeDraft"}}}
+```
+
+An unsupported value assertion such as `as Item` can produce the same reason even when type checking succeeds. Inspect the location and use the TypeScript checker when needed. Proven compatible or updated entries retain their informational buckets and omit this field.
+
 ### TypeScript signature type dependencies
 
 `review` follows same-file non-exported type declarations used in explicit public contracts. Changing `type Label = string` to `number`, or changing a member of a private interface, reports the exported functions, classes, and annotated variables that depend on it in `api_changes.modified` (`api.mod` in the hook), even when their declaration headers have no changed lines. Their references enter the normal impact analysis, including its language, import ownership, alias, and exclusion rules. This also applies to staged review, using the index snapshot.
