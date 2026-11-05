@@ -105,6 +105,7 @@ export した TS / TSX の interface か object 型の type alias へ、必須�
 - 関数・メソッドの戻り値の型 (型注釈がちょうどその型)。すべての `return` が、後述の「証明できる値」を返すこと。async 関数は次の限定した形だけを扱い、generator は対象外
 - ファイル直下の通常関数宣言の戻り値が `Row[]`・`Array<Row>`・`readonly Row[]`、または async 関数宣言の戻り値が `Promise<Row[]>`・`Promise<Array<Row>>`・`Promise<readonly Row[]>`・`Promise<Row>`。配列を返す全 `return` は、配列型の必須引数か配列 literal に対する `.map` で、引数1つの無注釈 inline arrow が証明できる値だけを返すこと。callback の式本体とブロック本体を扱い、callback と外側の関数の両方で fallthrough がないことも確かめる。`Promise<Row>` は証明できる値を直接返す形だけを扱う。receiver の別名・書き換え・持ち出し、callback 引数の書き換え、任意オブジェクトの同名メソッド、`filter`・`flatMap`・spread・型アサーション・`await` は証明しない。`Array` / `ReadonlyArray` / `Promise` の宣言・import・prototype への参照や別名への持ち出しが解析範囲内にあっても証明しない。外部コードによる prototype の変更は解決しない
 - `const x: Row = <値>` と `<値> satisfies Row`。値が証明できること
+- 必須追加では、非公開の `const rows: Row[] = [...]` と `readonly Row[]`・組み込み `Array<Row>` / `ReadonlyArray<Row>`、固定長タプルの配列 (`Array<[Row, string]>`・`[Row, Row][]`)。型注釈の各 `Row` に対応する全要素が証明でき、同じ束縛への書き込み・別名・持ち出し・`typeof` が無いこと。ネストした配列も8段まで扱う。配列 literal の穴・spread、可変長・省略可能なタプル、未知の初期化子は証明しない。長さの読み出しは許すが、配列のメソッド呼び出しは保留する
 - ファイル直下の関数宣言の、既定値の無い必須引数 (`function label(row: Row)`)。本体でその引数へ代入せず、値を別の名前へ束縛したりオブジェクト・配列へ入れたりせず、`typeof` で型を取り出さないこと。メンバーの読み出し (`row.id`) と呼び出しへの受け渡しは妨げない。関数名で別に検索し、直接の呼び出しが 1 件以上あり、すべての参照が import・別名なしの export・その位置へ証明できる値を渡す直接の呼び出しのどれかであること
 - 組み込みの `Partial<Row>` を、既定値が空 object の引数として持ち、戻り値がちょうど `Row` であるファイル直下の通常関数。追加したメンバーは入力側では省略可能なので、構築箇所と、観測した直接呼び出しで値が渡される場合の型を確認する
 - 別名なしの `export { Row }`。値の名前空間の出現 (同名の変数・JSX のコンポーネント・プロパティ名) は型を指さないので数えない

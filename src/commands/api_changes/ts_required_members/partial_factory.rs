@@ -448,6 +448,7 @@ mod tests {
                 invariant_files: RefCell::new(HashMap::new()),
                 invariant_builtins: OnceCell::new(),
                 partial_builtin: OnceCell::new(),
+                array_literal_builtins: OnceCell::new(),
                 wrapped_producers: Vec::new(),
                 sites: 0,
             };
