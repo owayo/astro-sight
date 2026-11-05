@@ -1,4 +1,4 @@
-//! 文字列 union の純粋な削除を、限定した値の受け口と利用から証明する。
+//! 文字列・判別 union の純粋な削除を、限定した値の受け口と利用から証明する。
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
@@ -49,10 +49,11 @@ pub(super) fn prove_removal(
         return None;
     }
     let pair = sources.get(site)?;
-    let removal = match shape::classify(site, pair) {
+    let (removal, objects) = match shape::classify(site, pair) {
         shape::Change::NotApplicable => return None,
         shape::Change::Unsupported => return Some(false),
-        shape::Change::Removal(removal) => removal,
+        shape::Change::Removal(removal) => (removal, None),
+        shape::Change::ObjectRemoval(removal, objects) => (removal, Some(objects)),
     };
     let Some(references) = index.complete_refs_for(site.name) else {
         return Some(false);
@@ -82,7 +83,11 @@ pub(super) fn prove_removal(
     let Some(plan) = slots::collect(&inventory, site, &removal) else {
         return Some(false);
     };
-    if flows::audit(&inventory, &plan, &removal).is_none() {
+    let audited = match objects.as_ref() {
+        Some(objects) => flows::audit_objects(&inventory, &plan, &removal, objects),
+        None => flows::audit(&inventory, &plan, &removal),
+    };
+    if audited.is_none() {
         return Some(false);
     }
     let key = removal.removed.iter().cloned().collect::<Vec<_>>();

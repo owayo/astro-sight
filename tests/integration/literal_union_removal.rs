@@ -2,6 +2,201 @@
 
 use super::support::{TestRepo, cargo_bin};
 
+#[test]
+fn discriminated_union_removal_closes_updated_branches_and_literals() {
+    for extension in ["ts", "tsx"] {
+        let repo = TestRepo::new();
+        repo.init_git();
+        repo.create_dir_all("src");
+        let messages = format!("src/messages.{extension}");
+        let handler = format!("src/handler.{extension}");
+        repo.write(
+            &messages,
+            "export type Message = { type: 'open' } | { type: 'close' };\n",
+        );
+        let before = "import type { Message } from './messages';\nexport function handle(message: Message): string {\n if (message.type === 'open') return 'opened';\n if (message.type === 'close') return 'closed';\n return 'other';\n}\n";
+        repo.write(&handler, before);
+        repo.write(format!("src/sender.{extension}"), "import { handle } from './handler';\nexport const result = handle({ type: 'close' });\n");
+        repo.commit_all("initial");
+        repo.write(&messages, "export type Message = { type: 'close' };\n");
+        repo.write(
+            &handler,
+            before.replace(" if (message.type === 'open') return 'opened';\n", ""),
+        );
+        let normal = repo.run_json("review", &["--git"]);
+        assert!(
+            normal["api_changes"]["modified_closed_in_diff"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|entry| entry["name"] == "Message")),
+            "{normal}"
+        );
+        let (code, json) = union_hook(&repo, false, false);
+        assert_eq!(code, 0, "{json}");
+        assert_eq!(json["api"]["mod_closed"][0]["n"], "Message", "{json}");
+        repo.stage_all();
+        repo.write(&handler, before);
+        let (code, json) = union_hook(&repo, true, false);
+        assert_eq!(code, 0, "{json}");
+        assert_eq!(json["api"]["mod_closed"][0]["n"], "Message", "{json}");
+    }
+}
+
+#[test]
+fn discriminated_union_removal_checks_switches_payloads_and_unsupported_flows() {
+    for (body, argument, variant, expected) in [
+        (
+            "switch (message.type) { case 'close': return 'closed'; default: return 'other'; }",
+            "{ type: 'close' }",
+            "{ type: 'close' }",
+            0,
+        ),
+        (
+            "if ('close' === message.type) return 'closed'; return 'other';",
+            "{ type: 'close' }",
+            "{ type: 'close' }",
+            0,
+        ),
+        (
+            "return message.type === 'close' ? 'closed' : 'other';",
+            "{ type: 'close', count: 2, ready: true }",
+            "{ readonly type: 'close'; count: number; ready: boolean }",
+            0,
+        ),
+        (
+            "if (message.type === 'open') return 'opened'; return 'other';",
+            "{ type: 'close' }",
+            "{ type: 'close' }",
+            1,
+        ),
+        (
+            "switch (message.type) { case 'open': return 'opened'; default: return 'other'; }",
+            "{ type: 'close' }",
+            "{ type: 'close' }",
+            1,
+        ),
+        (
+            "return message.type === 'close' ? 'closed' : 'other';",
+            "{ type: 'open' }",
+            "{ type: 'close' }",
+            1,
+        ),
+        (
+            "return message.type === 'close' ? 'closed' : 'other';",
+            "{ type: 'close', count: 'wrong' }",
+            "{ type: 'close'; count: number }",
+            1,
+        ),
+        (
+            "return message.type === 'close' ? 'closed' : 'other';",
+            "{ type: 'close' }",
+            "{ type: 'close'; count: number }",
+            1,
+        ),
+        (
+            "const alias = message; return 'other';",
+            "{ type: 'close' }",
+            "{ type: 'close' }",
+            1,
+        ),
+        (
+            "consume(message); return 'other';",
+            "{ type: 'close' }",
+            "{ type: 'close' }",
+            1,
+        ),
+        (
+            "message.type = 'close'; return 'other';",
+            "{ type: 'close' }",
+            "{ type: 'close' }",
+            1,
+        ),
+        (
+            "type Original = typeof message; return 'other';",
+            "{ type: 'close' }",
+            "{ type: 'close' }",
+            1,
+        ),
+        (
+            "return message['type'] === 'close' ? 'closed' : 'other';",
+            "{ type: 'close' }",
+            "{ type: 'close' }",
+            1,
+        ),
+        (
+            "return message.type === 'close' ? 'closed' : 'other';",
+            "({ type: 'close' } as unknown)",
+            "{ type: 'close' }",
+            1,
+        ),
+        (
+            "return message.type === 'close' ? 'closed' : 'other';",
+            "{ ...{}, type: 'close' }",
+            "{ type: 'close' }",
+            1,
+        ),
+    ] {
+        discriminated_union_case("ts", body, argument, variant, expected);
+    }
+    discriminated_union_case(
+        "tsx",
+        "switch (message.type) { case 'close': return 'closed'; default: return 'other'; }",
+        "{ type: 'close', text: 'value' }",
+        "{ type: 'close'; text: string }",
+        0,
+    );
+}
+
+fn discriminated_union_case(
+    extension: &str,
+    body: &str,
+    argument: &str,
+    variant: &str,
+    expected: i32,
+) {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.create_dir_all("src");
+    let messages = format!("src/messages.{extension}");
+    let handler = format!("src/handler.{extension}");
+    let sender = format!("src/sender.{extension}");
+    let before = format!(
+        "import type {{ Message }} from './messages';\ndeclare function consume(value: unknown): void;\nexport function handle(message: Message): string {{\n if (message.type === 'open') return 'opened';\n {body}\n}}\n"
+    );
+    let after = before.replace(" if (message.type === 'open') return 'opened';\n", "");
+    repo.write(
+        &messages,
+        format!("export type Message = {{ type: 'open' }} | {variant};\n"),
+    );
+    repo.write(&handler, &before);
+    repo.write(
+        &sender,
+        format!(
+            "import {{ handle }} from './handler';\nexport const result = handle({argument});\n"
+        ),
+    );
+    repo.commit_all("initial");
+    repo.write(&messages, format!("export type Message = {variant};\n"));
+    repo.write(&handler, &after);
+    let normal = repo.run_json("review", &["--git"]);
+    let bucket = if expected == 0 {
+        "modified_closed_in_diff"
+    } else {
+        "modified"
+    };
+    assert!(
+        normal["api_changes"][bucket]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|entry| entry["name"] == "Message")),
+        "{body}/{argument}/{variant}: {normal}"
+    );
+    let (code, json) = union_hook(&repo, false, false);
+    assert_eq!(code, expected, "{body}/{argument}/{variant}: {json}");
+    repo.stage_all();
+    repo.write(&handler, &before);
+    let (code, json) = union_hook(&repo, true, false);
+    assert_eq!(code, expected, "{body}/{argument}/{variant}: {json}");
+}
+
 const OLD_MODE: &str = r#"export type Mode = "all" | "legacy" | "recent";
 export const MODE_LABELS: Record<Mode, string> = {
     all: "All",

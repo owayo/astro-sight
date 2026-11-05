@@ -174,7 +174,7 @@ inline object 型の引数からキーを消した通常関数では、変更さ
 
 ### TypeScript の文字列 union の要素削除
 
-ファイル直下で直接 export した、文字列 literal だけの type alias から要素を削除した変更も、観測した値の流れを証明できれば `api.mod_closed` にする。宣言ヘッダと残る要素の順序・表記を保持し、重複・escape・型引数・別名の展開・追加との混在は扱わない。対象と判断した形を証明できないときは、参照行が変更されていても blocking に残す。削除のない追加・並べ替えと、旧側が純粋な文字列型でない変更は既存の判定に返す。旧文字列要素が失われて `string` 等の一般型になる変更も、この証明では保留する。同一パス・同名の候補だけを扱い、rename は既存判定に任せる。旧入力の上限超過や ERROR に包まれた alias など、旧宣言そのものを認識できない場合も、この追加証明は適用しない。
+ファイル直下で直接 export した、文字列 literal だけの type alias から要素を削除した変更も、観測した値の流れを証明できれば `api.mod_closed` にする。宣言ヘッダと残る要素の順序・表記を保持し、重複・escape・型引数・別名の展開・追加との混在は扱わない。対象と判断した形を証明できないときは、参照行が変更されていても blocking に残す。削除のない追加・並べ替えと、後述の判別 union 以外で旧側が純粋な文字列型でない変更は既存の判定に返す。旧文字列要素が失われて `string` 等の一般型になる変更も、この証明では保留する。同一パス・同名の候補だけを扱い、rename は既存判定に任せる。旧入力の上限超過や ERROR に包まれた alias など、旧宣言そのものを認識できない場合も、この追加証明は適用しない。
 
 型の参照は、直下の `const X: Record<Mode, primitive>`、`const X: Mode[]` / `readonly Mode[]`、明示した primitive/void 戻り型を持つ通常関数の必須 `Mode` 引数に限る。primitive は `string`・`number`・`boolean`・`bigint` の keyword とし、戻り型だけ `void` も扱う。ほかの引数も型付きの必須 primitive 引数に限り、optional・既定値・rest・分割代入・generic は扱わない。Record のキーは残る集合と一致し、配列の要素は残る文字列 literal だけとする。直接の相対 named import は別名なしで一意に対象へ到達する場合だけ扱う。同名の別型は束縛で区別し、解析や所属が不明なら保留する。許可した受け口と値の実利用が少なくとも1件必要で、無参照・型位置だけの利用では閉じない。
 
@@ -187,6 +187,12 @@ inline object 型の引数からキーを消した通常関数では、変更さ
 `createRequire`・member の `require`・`require.context`・`import.meta.glob` 等の既知loaderも保留する。JSX の HTML entity は補助走査で復元せず、対象型の JSX 利用は未対応として保留する。生成物として選択から外れたソースや、任意の loader 別名・動的な名前合成は証明対象に含めない。
 
 保証は観測範囲内の限定した静的な流れまで。外部利用者・runtime データ・reflection は証明しない。Record 定数の `const_value` と strict const の方針、standalone impact・refs・dead-code の出現契約は変えない。
+
+### TypeScript の判別 union の要素削除
+
+object 型リテラルの union も、全要素で一意な文字列リテラルを持つ共通の判別プロパティが1つなら、純粋な要素削除を証明する。残る要素の順序・型のトークン列・宣言ヘッダを保持し、必須プロパティだけを扱う。payload の型は primitive keyword または string/number/boolean/bigint のリテラルに限る。型の escape・重複・曖昧な判別名・optional・名前付き型やネストした型、256要素を超える入力は証明しない。
+
+受け口は、上記と同じ通常関数の必須引数に限る。渡す値は残る要素に合う object literal か証明済み引数だけで、全プロパティの有無と値の型を確認する。判別プロパティの直接の読み出しによる比較・switch と、既知の consumer への受け渡しを扱う。配列・Record・payload の利用・computed access・別名・持ち出し・書き込み・assertion は保留する。補助走査は文字列 union と共有し、削除した判別値が比較・case・値の構築などに残れば blocking を保つ。通常・hook・staged に同じ証明を適用する。
 
 ### Rust の引数パターン
 

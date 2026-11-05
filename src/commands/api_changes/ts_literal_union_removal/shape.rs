@@ -1,6 +1,25 @@
 use super::super::source_pair::OldNewSources;
 use super::*;
 
+mod discriminated;
+
+#[derive(Clone)]
+enum ObjectField {
+    Primitive(slots::Primitive),
+    Literal(String),
+}
+
+pub(super) struct ObjectShape {
+    pub(super) tag: String,
+    variants: BTreeMap<String, BTreeMap<String, ObjectField>>,
+}
+
+impl ObjectShape {
+    pub(super) fn accepts(&self, node: Node<'_>, source: &str) -> bool {
+        discriminated::accepts(self, node, source).is_some()
+    }
+}
+
 pub(super) struct Removal {
     pub(super) kept: BTreeSet<String>,
     pub(super) removed: BTreeSet<String>,
@@ -9,6 +28,7 @@ pub(super) enum Change {
     NotApplicable,
     Unsupported,
     Removal(Removal),
+    ObjectRemoval(Removal, ObjectShape),
 }
 
 pub(super) fn classify(site: &CompatibleModSite<'_>, pair: &OldNewSources) -> Change {
@@ -33,7 +53,7 @@ pub(super) fn classify(site: &CompatibleModSite<'_>, pair: &OldNewSources) -> Ch
         .child_by_field_name("value")
         .and_then(|value| values(value, old_source))
     else {
-        return Change::NotApplicable;
+        return discriminated::classify(site, pair, old.root_node(), old_source, old_candidate);
     };
     // 旧側の純 string 候補を認識した後、新側の不明を既存の行判定へ戻さない。
     if pair.new.len() > inventory::MAX_SOURCE {
@@ -232,6 +252,53 @@ fn checked(root: Node<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn discriminated_union_shape_requires_unchanged_remaining_variants() {
+        for lang in [LangId::Typescript, LangId::Tsx] {
+            tree_sitter::Query::new(
+                &lang.ts_language(),
+                "(object_type (property_signature name: (_) type: (type_annotation)))",
+            )
+            .unwrap();
+            let old =
+                "export type Mode = { type: 'old' } | { readonly type: 'new'; count: number };";
+            assert!(matches!(
+                classify_pair(
+                    old,
+                    "export type Mode = { readonly type: 'new'; count: number };",
+                    lang
+                ),
+                Change::ObjectRemoval(_, _)
+            ));
+            for after in [
+                "export type Mode = { readonly type: 'new'; count: string };",
+                "export type Mode = { type: 'new'; count: number };",
+                "export type Mode = { readonly type: 'new'; count?: number };",
+                "export type Mode = { kind: 'new'; count: number };",
+                "export type Mode = { readonly type: 'other'; count: number };",
+                "export type Mode = { readonly type: 'new'; count: number }; const broken = ;",
+            ] {
+                assert!(
+                    matches!(classify_pair(old, after, lang), Change::Unsupported),
+                    "{after}"
+                );
+            }
+            for before in [
+                "export type Mode = { type: 'old' } | { type: 'old' };",
+                "export type Mode = { type: 'old'; value: Nested } | { type: 'new'; value: Nested };",
+                "export type Mode = { type: 'old'; kind: 'first' } | { type: 'new'; kind: 'second' };",
+                "export type Mode = { type?: 'old' } | { type?: 'new' };",
+            ] {
+                assert!(
+                    !matches!(
+                        classify_pair(before, "export type Mode = { type: 'new' };", lang),
+                        Change::ObjectRemoval(_, _)
+                    ),
+                    "{before}"
+                );
+            }
+        }
+    }
     fn classify_pair(old: &str, new: &str, lang: LangId) -> Change {
         classify_named_pair(old, new, "Mode", lang)
     }

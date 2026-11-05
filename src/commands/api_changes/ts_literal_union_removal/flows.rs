@@ -7,6 +7,7 @@ struct Proof<'a> {
     inventory: &'a inventory::Inventory,
     plan: &'a Plan,
     removal: &'a shape::Removal,
+    objects: Option<&'a shape::ObjectShape>,
     callbacks: Vec<Binding>,
 }
 
@@ -15,10 +16,32 @@ pub(super) fn audit(
     plan: &Plan,
     removal: &shape::Removal,
 ) -> Option<()> {
+    audit_inner(inventory, plan, removal, None)
+}
+
+pub(super) fn audit_objects(
+    inventory: &inventory::Inventory,
+    plan: &Plan,
+    removal: &shape::Removal,
+    objects: &shape::ObjectShape,
+) -> Option<()> {
+    if !plan.arrays.is_empty() || !plan.records.is_empty() {
+        return None;
+    }
+    audit_inner(inventory, plan, removal, Some(objects))
+}
+
+fn audit_inner(
+    inventory: &inventory::Inventory,
+    plan: &Plan,
+    removal: &shape::Removal,
+    objects: Option<&shape::ObjectShape>,
+) -> Option<()> {
     let mut proof = Proof {
         inventory,
         plan,
         removal,
+        objects,
         callbacks: Vec::new(),
     };
     let mut used = false;
@@ -213,7 +236,11 @@ impl Proof<'_> {
         let Some(source) = self.source(path) else {
             return false;
         };
-        if node.kind() == "string" {
+        if let Some(objects) = self.objects {
+            if node.kind() == "object" {
+                return objects.accepts(node, source);
+            }
+        } else if node.kind() == "string" {
             return decode::string(node, source)
                 .is_some_and(|value| self.removal.kept.contains(&value));
         }
@@ -298,15 +325,44 @@ impl Proof<'_> {
                 && decode::string(node, source)
                     .is_some_and(|value| self.removal.kept.contains(&value))
         };
-        (self.known_mode(path, left) && literal(right))
-            || (literal(left) && self.known_mode(path, right))
+        (self.known_discriminant(path, left) && literal(right))
+            || (literal(left) && self.known_discriminant(path, right))
+    }
+    fn known_discriminant(&self, path: &str, node: Node<'_>) -> bool {
+        let Some(objects) = self.objects else {
+            return self.known_mode(path, node);
+        };
+        let Some(node) = unparen(node) else {
+            return false;
+        };
+        node.kind() == "member_expression"
+            && !token(node, "?.")
+            && node.child_by_field_name("optional_chain").is_none()
+            && read_only(node)
+            && self.source(path).is_some_and(|source| {
+                node.child_by_field_name("property")
+                    .and_then(|key| text(key, source))
+                    == Some(objects.tag.as_str())
+            })
+            && node
+                .child_by_field_name("object")
+                .is_some_and(|object| self.known_mode(path, object))
     }
     fn binding_use(&self, path: &str, node: Node<'_>) -> Option<()> {
         let mut current = node;
+        let mut projected = false;
         for _ in 0..MAX_DEPTH {
             let parent = current.parent()?;
             if parent.kind() == "parenthesized_expression" {
                 current = parent;
+                continue;
+            }
+            if self.objects.is_some() && parent.kind() == "member_expression" && !projected {
+                if !self.known_discriminant(path, parent) {
+                    return None;
+                }
+                current = parent;
+                projected = true;
                 continue;
             }
             return match parent.kind() {
@@ -328,7 +384,8 @@ impl Proof<'_> {
                     self.record_read(path, parent).map(|_| ())
                 }
                 "switch_statement"
-                    if parent.child_by_field_name("value").map(span) == Some(span(current)) =>
+                    if parent.child_by_field_name("value").map(span) == Some(span(current))
+                        && (self.objects.is_none() || projected) =>
                 {
                     let source = self.source(path)?;
                     let body = parent.child_by_field_name("body")?;
