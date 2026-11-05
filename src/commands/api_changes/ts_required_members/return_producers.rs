@@ -162,7 +162,7 @@ impl Prover<'_, '_> {
         true
     }
 
-    fn builtin_types_are_plain(
+    pub(super) fn builtin_types_are_plain(
         &self,
         names: &BTreeSet<&str>,
         caches: &mut ApiClosureCaches,

@@ -39,6 +39,12 @@ filter = 'binary_id(astro-sight::integration) & (test(=integration::ts_extension
 priority = 50
 threads-required = 2
 
+# factory の入力・既定値・呼び出しを複数の構成で確認する回帰を先に実行する。
+[[profile.default.overrides]]
+filter = 'binary_id(astro-sight::integration) & test(integration::required_type_members::partial_factories_)'
+priority = 50
+threads-required = 2
+
 # CI (NEXTEST_PROFILE=ci): 失敗しても残りのテストを最後まで流し、失敗の出力を最後にもまとめて出す
 [profile.ci]
 fail-fast = false

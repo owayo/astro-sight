@@ -58,6 +58,7 @@ use super::ref_index::{
 pub(crate) mod invariant_members;
 mod local_producers;
 mod narrowed_uses;
+mod partial_factory;
 mod removed_uses;
 mod return_producers;
 mod row_array_map;
@@ -312,6 +313,7 @@ pub(super) fn prove_closure(
         narrowed_paths: BTreeSet::new(),
         invariant_files: RefCell::new(HashMap::new()),
         invariant_builtins: OnceCell::new(),
+        partial_builtin: OnceCell::new(),
         wrapped_producers: Vec::new(),
         sites: 0,
     };
@@ -333,8 +335,13 @@ struct ConsumerSite {
     function: String,
     /// 関数名の行 (定義の照合に使う)。
     name_line: usize,
+    /// 同じ行に別の関数がある場合も、読み出しの証拠を混ぜない。
+    function_start: usize,
+    function_end: usize,
     /// 引数の位置。
     index: usize,
+    /// factory の省略可能な入力で、追加した名前が存在する場合にだけ照合する型。
+    optional_members: Option<BTreeMap<String, Vec<TypeAtom>>>,
 }
 
 /// 型の参照 1 件の構文上の役割。
@@ -384,6 +391,7 @@ struct Prover<'s, 'a> {
     /// この型の旧新不変証明を producer ファイルごとに共有する。
     invariant_files: RefCell<HashMap<String, Option<Vec<invariant_members::ObjectRange>>>>,
     invariant_builtins: OnceCell<bool>,
+    partial_builtin: OnceCell<bool>,
     wrapped_producers: Vec<row_array_map::WrappedProducer>,
     /// 証明した値を作る箇所・受け取る箇所の数。
     sites: usize,
@@ -436,6 +444,9 @@ impl Prover<'_, '_> {
         {
             return false;
         }
+        if self.partial_parameter_reference(node, &parsed, &r.path, caches) {
+            return true;
+        }
         match type_role(node) {
             Some(TypeRole::Return(function)) => {
                 self.prove_return(function, &parsed, &r.path, diff_files, caches)
@@ -453,7 +464,7 @@ impl Prover<'_, '_> {
                 self.sites += usize::from(proven);
                 proven
             }
-            Some(TypeRole::Parameter(param)) => self.record_consumer(param, &parsed, &r.path),
+            Some(TypeRole::Parameter(param)) => self.record_consumer(param, &parsed, &r.path, None),
             None => false,
         }
     }
@@ -525,6 +536,9 @@ impl Prover<'_, '_> {
             return self.prove_wrapped_return(function, parsed, path, diff_files, caches);
         }
         if has_token(function, "async") || has_token(function, "*") {
+            return false;
+        }
+        if !self.register_factory_parameters(function, parsed, path, caches) {
             return false;
         }
         let Some(body) = function.child_by_field_name("body") else {
@@ -605,7 +619,13 @@ impl Prover<'_, '_> {
 
     /// 必須引数の型注釈を、呼び出し側の確認待ちの義務として記録する。ファイル直下の
     /// 関数宣言の、既定値の無い単純な識別子の引数で、本体が引数へ書き込まない場合だけ。
-    fn record_consumer(&mut self, param: Node<'_>, parsed: &ParsedRefFile, path: &str) -> bool {
+    fn record_consumer(
+        &mut self,
+        param: Node<'_>,
+        parsed: &ParsedRefFile,
+        path: &str,
+        optional_members: Option<BTreeMap<String, Vec<TypeAtom>>>,
+    ) -> bool {
         let source: &[u8] = &parsed.source;
         let Some(pattern) = param
             .child_by_field_name("pattern")
@@ -613,7 +633,12 @@ impl Prover<'_, '_> {
         else {
             return false;
         };
-        if param.child_by_field_name("value").is_some() {
+        let partial = optional_members.is_some();
+        if if partial {
+            !partial_factory::empty_default(param)
+        } else {
+            param.child_by_field_name("value").is_some()
+        } {
             return false;
         }
         let Some(formal) = param.parent().filter(|p| p.kind() == "formal_parameters") else {
@@ -670,13 +695,27 @@ impl Prover<'_, '_> {
         if body_rebinds_or_queries(body, source, param_name, copy_type) {
             return false;
         }
+        if partial && !partial_factory::parameter_reads_are_plain(body, source, param_name) {
+            return false;
+        }
+        if self.consumers.iter().any(|site| {
+            site.path == path
+                && site.function_start == function.start_byte()
+                && site.function_end == function.end_byte()
+                && site.index == index
+        }) {
+            return true;
+        }
         self.consumers.push(ConsumerSite {
             path: path.to_string(),
             function: function_name.to_string(),
             name_line: name_node.start_position().row,
+            function_start: function.start_byte(),
+            function_end: function.end_byte(),
             index,
+            optional_members,
         });
-        self.sites += 1;
+        self.sites += usize::from(!partial);
         true
     }
 
@@ -794,7 +833,7 @@ impl Prover<'_, '_> {
                 ConsumerRef::Unproven => return false,
             }
         }
-        calls > 0
+        calls > 0 || consumer.optional_members.is_some()
     }
 
     fn classify_consumer_reference(
@@ -838,6 +877,9 @@ impl Prover<'_, '_> {
             return ConsumerRef::Neutral;
         }
         let Some(call) = direct_call(node) else {
+            if consumer.optional_members.is_some() {
+                return ConsumerRef::Unproven;
+            }
             return if self.callee_is_consumer(node, &parsed, &r.path, consumer, caches)
                 && node
                     .parent()
@@ -874,6 +916,16 @@ impl Prover<'_, '_> {
             .any(|a| a.kind() == "spread_element")
         {
             return ConsumerRef::Unproven;
+        }
+        if let Some(properties) = &consumer.optional_members {
+            return if args
+                .get(consumer.index)
+                .is_none_or(|arg| self.prove_optional_factory_argument(*arg, properties, &parsed))
+            {
+                ConsumerRef::ProvenCall
+            } else {
+                ConsumerRef::Unproven
+            };
         }
         match args.get(consumer.index) {
             Some(arg) if self.prove_value(*arg, &parsed, &r.path, diff_files, caches) => {
@@ -1081,6 +1133,7 @@ impl Prover<'_, '_> {
                 && (property.accepts_any_value()
                     || self
                         .value_type(*value, parsed, 0)
+                        .or_else(|| self.factory_default_type(*value, parsed, path))
                         .is_some_and(|value_type| {
                             assignable(&value_type, &property.ty)
                                 && (!self.delta.audits_uses()

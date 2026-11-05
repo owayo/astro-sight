@@ -4,6 +4,82 @@
 use super::support::{TestRepo, cargo_bin};
 
 #[test]
+fn partial_factories_close_required_additions_with_typed_defaults() {
+    for extension in ["ts", "tsx"] {
+        for (before_params, after_params, labels) in [
+            (
+                "overrides: Partial<Info> = {}",
+                "overrides: Partial<Info> = {}",
+                "overrides.labels ?? []",
+            ),
+            (
+                "overrides: Partial<Info> = {}",
+                "overrides: Partial<Info> = {}",
+                "[]",
+            ),
+            (
+                "overrides: { tags?: string[]; labels?: string[]; ready?: boolean } = {}",
+                "overrides: { tags?: string[]; labels?: string[]; ready?: boolean } = {}",
+                "overrides.labels ?? []",
+            ),
+            ("", "", "[]"),
+        ] {
+            let repo = TestRepo::new();
+            repo.create_dir_all("src");
+            let info = format!("src/info.{extension}");
+            let factory = format!("src/factory.{extension}");
+            repo.write(
+                &info,
+                "export interface Info {\n tags: string[];\n ready: boolean;\n}\n",
+            );
+            let value = if before_params.is_empty() {
+                "tags: [], ready: false"
+            } else {
+                "tags: overrides.tags ?? [], ready: overrides.ready ?? false"
+            };
+            repo.write(&factory, format!("import type {{ Info }} from './info';\nexport function makeInfo({before_params}): Info {{\n return {{ {value} }};\n}}\n"));
+            repo.write(
+                "src/app.ts",
+                "import { makeInfo } from './factory';\nexport const value = makeInfo();\n",
+            );
+            repo.init_git();
+            repo.commit_all("initial");
+            repo.write(&info, "export interface Info {\n tags: string[];\n labels: string[];\n ready: boolean;\n}\n");
+            repo.write(&factory, format!("import type {{ Info }} from './info';\nexport function makeInfo({after_params}): Info {{\n return {{ {value}, labels: {labels} }};\n}}\n"));
+            for staged in [false, true] {
+                if staged {
+                    repo.stage_all();
+                }
+                let mut args = vec!["--git"];
+                if staged {
+                    args.push("--staged");
+                }
+                let normal = repo.run_json("review", &args);
+                assert!(
+                    normal["api_changes"]["modified_closed_in_diff"]
+                        .as_array()
+                        .is_some_and(|changes| changes.iter().any(|c| c["name"] == "Info")),
+                    "{after_params}/{labels}: {normal}"
+                );
+                let output = cargo_bin()
+                    .arg("review")
+                    .args(&args)
+                    .args(["--hook", "--dir"])
+                    .arg(repo.root())
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(0),
+                    "{after_params}/{labels}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn typed_spread_copy_matches_normal_hook_and_index_without_changing_refs() {
     for extension in ["ts", "tsx"] {
         for (copy, call, expected) in [
@@ -101,6 +177,207 @@ fn typed_spread_copy_matches_normal_hook_and_index_without_changing_refs() {
 }
 
 const ROW_BASE: &str = "export interface Row {\n\tid: string;\n}\n\nexport function toRow(id: string): Row {\n\treturn { id };\n}\n";
+
+#[test]
+fn partial_factories_preserve_unknown_types_and_unsafe_defaults() {
+    for (parameter, labels, definitions, prefix) in [
+        ("overrides: Partial<Info> = {}", None, "", ""),
+        (
+            "overrides: Partial<Info> = {}",
+            Some("overrides.labels"),
+            "",
+            "",
+        ),
+        (
+            "overrides: Partial<Info> = {}",
+            Some("overrides.labels ?? [1]"),
+            "",
+            "",
+        ),
+        (
+            "overrides: Partial<Info> = {}",
+            Some("overrides.labels || []"),
+            "",
+            "",
+        ),
+        (
+            "overrides: Partial<Info> = {}",
+            Some("overrides.labels ?? undefined"),
+            "",
+            "",
+        ),
+        (
+            "overrides: Readonly<Info> = { tags: [], ready: false }",
+            Some("[]"),
+            "",
+            "",
+        ),
+        (
+            "overrides: Required<Partial<Info>> = { tags: [], ready: false }",
+            Some("[]"),
+            "",
+            "",
+        ),
+        (
+            "overrides: Partial<Info> = {}",
+            Some("overrides.labels ?? []"),
+            "type Partial<T> = { tags?: string[]; ready?: boolean; labels?: number[] };",
+            "",
+        ),
+        (
+            "overrides: Partial<Info> = {}",
+            Some("[]"),
+            "",
+            "overrides.labels = [1] as any;",
+        ),
+        (
+            "overrides: Partial<Info> = {}",
+            Some("[]"),
+            "",
+            "const alias = overrides;",
+        ),
+        (
+            "overrides: Partial<Info> = {}",
+            Some("[]"),
+            "declare function mutate(value: unknown): void;",
+            "mutate(overrides);",
+        ),
+    ] {
+        partial_factory_case(parameter, labels, definitions, prefix, "makeInfo()", 1);
+    }
+}
+
+#[test]
+fn partial_factories_check_present_optional_values_at_observed_calls() {
+    partial_factory_case(
+        "overrides: { tags?: string[]; labels?: string[]; ready?: boolean } = {}",
+        Some("[]"),
+        "declare function unrelated(): void;",
+        "unrelated();",
+        "makeInfo()",
+        0,
+    );
+    partial_factory_case(
+        "overrides: { tags?: string[]; labels?: string[]; ready?: boolean } = { labels: [] }",
+        Some("[]"),
+        "",
+        "",
+        "makeInfo()",
+        0,
+    );
+    for (call, expected) in [
+        ("", 0),
+        ("makeInfo()", 0),
+        ("makeInfo({})", 0),
+        ("makeInfo({ labels: [] })", 0),
+        ("makeInfo({ labels: ['a'] })", 0),
+        ("makeInfo({ labels: [1] })", 1),
+        ("makeInfo({ labels: undefined })", 1),
+        ("makeInfo({ ...other })", 1),
+        ("makeInfo(other)", 1),
+    ] {
+        partial_factory_case(
+            "overrides: Partial<Info> = {}",
+            Some("overrides.labels ?? []"),
+            "",
+            "",
+            call,
+            expected,
+        );
+    }
+}
+
+fn partial_factory_case(
+    parameter: &str,
+    labels: Option<&str>,
+    definitions: &str,
+    prefix: &str,
+    call: &str,
+    expected: i32,
+) {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "src/info.ts",
+        "export interface Info {\n tags: string[];\n ready: boolean;\n}\n",
+    );
+    repo.write("src/factory.ts", format!("import type {{ Info }} from './info';\n{definitions}\nexport function makeInfo({parameter}): Info {{\n return {{ tags: overrides.tags ?? [], ready: overrides.ready ?? false }};\n}}\n"));
+    if !call.is_empty() {
+        repo.write(
+            "src/app.ts",
+            "import { makeInfo } from './factory';\nconst other = { tags: [] };\nmakeInfo();\n",
+        );
+    }
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/info.ts",
+        "export interface Info {\n tags: string[];\n labels: string[];\n ready: boolean;\n}\n",
+    );
+    let property = labels.map_or(String::new(), |value| format!(", labels: {value}"));
+    repo.write("src/factory.ts", format!("import type {{ Info }} from './info';\n{definitions}\nexport function makeInfo({parameter}): Info {{\n {prefix}\n return {{ tags: overrides.tags ?? [], ready: overrides.ready ?? false{property} }};\n}}\n"));
+    if !call.is_empty() {
+        repo.write(
+            "src/app.ts",
+            format!(
+                "import {{ makeInfo }} from './factory';\nconst other = {{ tags: [] }};\n{call};\n"
+            ),
+        );
+    }
+    let normal = repo.run_json("review", &["--git"]);
+    let bucket = if expected == 0 {
+        "modified_closed_in_diff"
+    } else {
+        "modified"
+    };
+    assert!(
+        normal["api_changes"][bucket]
+            .as_array()
+            .is_some_and(|changes| changes.iter().any(|c| c["name"] == "Info")),
+        "{parameter}/{labels:?}/{prefix}/{call}: {normal}"
+    );
+    let (code, output) = hook(&repo);
+    assert_eq!(
+        code, expected,
+        "{parameter}/{labels:?}/{prefix}/{call}: {output}"
+    );
+    repo.stage_all();
+    let output = cargo_bin()
+        .args(["review", "--git", "--staged", "--hook", "--dir"])
+        .arg(repo.root())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(expected),
+        "{parameter}/{labels:?}/{prefix}/{call}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn partial_factory_fallthrough_stays_blocking() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write("src/info.ts", "export interface Info { ready: boolean; }\n");
+    repo.write("src/factory.ts", "import type { Info } from './info';\ndeclare const condition: boolean;\nexport function makeInfo(overrides: Partial<Info> = {}): Info {\n return { ready: false };\n}\n");
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/info.ts",
+        "export interface Info { ready: boolean; labels: string[]; }\n",
+    );
+    repo.write("src/factory.ts", "import type { Info } from './info';\ndeclare const condition: boolean;\nexport function makeInfo(overrides: Partial<Info> = {}): Info {\n if (condition) { return { ready: false, labels: overrides.labels ?? [] }; }\n}\n");
+    let (code, json) = hook(&repo);
+    assert_eq!(code, 1, "{json}");
+    assert!(
+        json["api"]["mod"]
+            .as_array()
+            .is_some_and(|changes| changes.iter().any(|c| c["n"] == "Info")),
+        "{json}"
+    );
+}
+
 const VIEW_BASE: &str = "import { type Row, toRow } from \"./row\";\n\nexport function label(row: Row): string {\n\treturn row.id;\n}\n\nexport const first = label(toRow(\"a\"));\n";
 const VIEW_AFTER: &str = "import { type Row, toRow } from \"./row\";\n\nexport function label(row: Row): string {\n\treturn row.note === null ? row.id : `${row.id} (${row.note})`;\n}\n\nexport const first = label(toRow(\"a\"));\n";
 
