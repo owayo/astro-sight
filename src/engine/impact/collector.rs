@@ -639,7 +639,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                     })
                     .map(|owner| (owner, true))
             };
-            if is_import && self.ref_lang == Some(LangId::Rust) {
+            let owner = if is_import && self.ref_lang == Some(LangId::Rust) {
                 match (type_owner(), function_owner()) {
                     (Some(owner), None) => Some(owner),
                     (None, Some(owner)) => Some(owner),
@@ -649,7 +649,18 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                 type_owner()
             } else {
                 function_owner()
-            }
+            };
+            owner.or_else(|| {
+                index
+                    .enum_variant_owner(
+                        node,
+                        source,
+                        path,
+                        self.path_str,
+                        self.rust_path_owner_project,
+                    )
+                    .map(|owner| (owner, false))
+            })
         } else {
             None
         };
@@ -683,7 +694,6 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             )
         });
         let rust_plain_name = self.ref_lang == Some(LangId::Rust)
-            && !ref_in_macro
             && !rust_macro_callee
             && node.is_some_and(|node| {
                 matches!(node.kind(), "identifier" | "type_identifier")
@@ -697,7 +707,15 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
         let rust_local_owner = rust_plain_name
             && rust_owner_index.zip(node).is_some_and(|(index, node)| {
                 index.plain_local_owner(node, source, &self.all_symbol_names[ix])
-                    || index.plain_local_function_owner(node, source, &self.all_symbol_names[ix])
+                    || index.plain_local_value_owner(node, source, &self.all_symbol_names[ix])
+                    || index.format_local_value_owner(
+                        node,
+                        source,
+                        &self.all_symbol_names[ix],
+                        Path::new(self.dir),
+                        self.path_str,
+                        self.rust_path_owner_project,
+                    )
             });
         let rust_direct_import_site = rust_owner_index.zip(node).is_some_and(|(index, node)| {
             index.is_tracked_direct_import_site(node, source, &self.all_symbol_names[ix])
@@ -1099,6 +1117,13 @@ impl<'a> ImpactCollector<'a> {
         let all_symbol_names = self.all_symbol_names;
         let name = &all_symbol_names[e.sym_ix as usize];
         let filter_disabled = evidence.filter_disabled;
+        if ctx.lang_id == LangId::Rust
+            && !filter_disabled
+            && e.rust_local_owner
+            && !filters::is_same_source_file(self.path_str, &ctx.new_path)
+        {
+            return true;
+        }
         if e.python_attribute_write && ctx.python_modified_direct_function_names.contains(name) {
             return true;
         }
@@ -1236,9 +1261,6 @@ impl<'a> ImpactCollector<'a> {
                 .rust_path_owner_project
                 .private_source_is_leaf(source_path)
             {
-                return None;
-            }
-            if e.rust_local_owner {
                 return None;
             }
             let outside_subtree = evidence

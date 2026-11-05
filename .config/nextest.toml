@@ -57,6 +57,12 @@ filter = 'binary_id(astro-sight::integration) & test(=integration::literal_union
 priority = 50
 threads-required = 2
 
+# Rust の同名所有元とマクロ・モジュール配置の対照を先に実行する。
+[[profile.default.overrides]]
+filter = 'binary_id(astro-sight::integration) & (test(=integration::impact_rust_private_helpers::impact_rust_enum_variants_have_their_own_declaration_owner) | test(=integration::impact_rust_private_helpers::impact_rust_format_arguments_require_standard_macro_binding))'
+priority = 50
+threads-required = 2
+
 # CI (NEXTEST_PROFILE=ci): 失敗しても残りのテストを最後まで流し、失敗の出力を最後にもまとめて出す
 [profile.ci]
 fail-fast = false
