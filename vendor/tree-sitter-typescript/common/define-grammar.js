@@ -174,7 +174,7 @@ module.exports = function defineGrammar(dialect) {
         prec('call', seq(
           field('function', choice($.expression, $.import)),
           field('type_arguments', optional($.type_arguments)),
-          field('arguments', $.arguments),
+          field('arguments', choice($.arguments, $.template_string)),
         )),
         prec('template_call', seq(
           field('function', choice($.primary_expression, $.new_expression)),

@@ -488,3 +488,95 @@ fn typescript_import_type_arguments_cli_keeps_malformed_diagnostics() {
         }
     }
 }
+
+#[test]
+fn typescript_generic_tagged_template_keeps_optional_parameter_compatibility() {
+    for extension in ["ts", "tsx"] {
+        for case in [
+            "optional",
+            "default",
+            "required",
+            "changed type",
+            "broken body",
+        ] {
+            let repo = TestRepo::new();
+            repo.create_dir_all("src");
+            let target = format!("src/lock.{extension}");
+            repo.write(format!("src/db.{extension}"), "export const db = { async query<T>(_strings: TemplateStringsArray, ..._values: unknown[]): Promise<T> { return [] as T; } };\n");
+            repo.write(format!("src/job.{extension}"), "import { withLock } from './lock';\nexport const job = () => withLock(async () => 1);\n");
+            let body = "const rows = await db.query<{ name: string }[]>`SELECT name FROM locks`;\nif (rows.length > 0) throw new Error('busy');\nreturn fn();\n";
+            let old = format!(
+                "import {{ db }} from './db';\nexport async function withLock<T>(fn: () => Promise<T>): Promise<T> {{\n{body}}}\n"
+            );
+            repo.write(&target, old);
+            repo.init_git();
+            repo.commit_all("initial");
+            let params = match case {
+                "optional" | "broken body" => "fn: () => Promise<T>, options?: { label?: string }",
+                "default" => "fn: () => Promise<T>, options: { label?: string } = {}",
+                "required" => "fn: () => Promise<T>, options: { label?: string }",
+                _ => "fn: (value: number) => Promise<T>, options?: { label?: string }",
+            };
+            let body = if case == "broken body" {
+                body.replace("<{ name: string }[]>", "<@>")
+            } else {
+                body.to_owned()
+            };
+            let new = format!(
+                "import {{ db }} from './db';\nexport async function withLock<T>(\n{params},\n): Promise<T> {{\nvoid options;\n{body}}}\n"
+            );
+            repo.write(&target, &new);
+            let ast = typescript_cli_json(
+                "ast",
+                &repo.path(&target),
+                &["--full", "--depth", "32", "--no-cache"],
+            );
+            if case != "broken body" {
+                assert_typescript_cli_clean(&ast, &new);
+            }
+            let compatible = matches!(case, "optional" | "default");
+            for staged in [false, true] {
+                if staged {
+                    repo.stage_all();
+                }
+                let mut args = vec!["--git"];
+                if staged {
+                    args.push("--staged");
+                }
+                let review = repo.run_json("review", &args);
+                assert_eq!(
+                    review["api_changes"]["compatible_modified"]
+                        .as_array()
+                        .is_some_and(|changes| changes
+                            .iter()
+                            .any(|change| change["name"] == "withLock"
+                                && change["reason"] == "trailing_optional_params")),
+                    compatible,
+                    "{extension} {case} {staged}: {review}"
+                );
+                let output = cargo_bin()
+                    .args(["review", "--dir"])
+                    .arg(repo.root())
+                    .args(&args)
+                    .arg("--hook")
+                    .output()
+                    .unwrap();
+                let hook: Value = serde_json::from_slice(&output.stderr).unwrap();
+                assert_eq!(
+                    output.status.success(),
+                    compatible,
+                    "{extension} {case} {staged}: {hook}"
+                );
+                assert_eq!(
+                    hook["api"]["mod_compat"]
+                        .as_array()
+                        .is_some_and(|changes| changes
+                            .iter()
+                            .any(|change| change["n"] == "withLock")),
+                    compatible,
+                    "{hook}"
+                );
+            }
+        }
+    }
+}

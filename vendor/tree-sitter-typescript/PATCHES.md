@@ -16,7 +16,8 @@ The regeneration dependency is pinned to upstream's `tree-sitter-javascript`
 
 Upstream: <https://github.com/tree-sitter/tree-sitter-typescript>.
 Local regressions: <https://github.com/owayo/astro-sight/issues/33> and
-<https://github.com/owayo/astro-sight/issues/160>.
+<https://github.com/owayo/astro-sight/issues/160>, and
+<https://github.com/owayo/astro-sight/issues/235>.
 
 ## Type query conflicts (#33)
 
@@ -64,6 +65,28 @@ TSX also retained its JSX control (128 TypeScript / 129 TSX cases). TypeScript
 7.0.2 accepted the new valid import-type variants in both file kinds with
 `--strict --noEmit --module nodenext --jsx preserve`.
 
+## Generic tagged templates (#235)
+
+Accept a template string in the existing generic call's `arguments` field.
+The ordinary call branch already owns `type_arguments`; using the same prefix
+keeps generic calls and tagged templates ambiguous until their argument delimiter
+is available. Adding type arguments to the higher-precedence `template_call`
+branch instead commits too early and breaks ordinary `call<Item>()` parsing.
+The untyped template branch and optional-call branch are unchanged. No node kind,
+field or node schema changes; both generated parsers and grammar JSON are updated.
+
+Regressions cover TypeScript and TSX, object/array/nested/import type arguments,
+substitutions, Unicode/CRLF byte ranges, incremental recovery, malformed input,
+and unchanged ordinary-call, comparison, generic-arrow and JSX controls.
+CLI regressions check the reported async function through normal/index review
+and hook output: optional/default tail additions are compatible, while required
+parameters, changed parameter types and genuine body parse errors remain blocking.
+
+All 112 cases in the pinned upstream corpus pass through the configured language
+modes. TypeScript 7.0.2 accepts the reported optional-tail examples in both file
+kinds with strict checking. Regenerating with the pinned CLI reproduces both
+parser C files, grammar JSON and node schemas byte-for-byte.
+
 ## Regenerate
 
 Use tree-sitter CLI **0.26.6**, with grammar ABI **14**, and Node.js/npm:
@@ -92,8 +115,7 @@ imports, generic calls, optional calls, tagged templates and JSX.
 The original 0.23.2 grammar places `await_expression` in the function field of
 a bare `await call<Item>()`. The CLI's `calls` command consequently has no callee
 for that form. `await (call<Item>())` has the expected outer await and inner call,
-and its callee is extracted. Generic tagged templates such as
-`` tag<Item>`value` `` are already represented as binary expressions by the
-original grammar. The patched parsers preserve the original full ASTs for these
-controls. They remain separate precedence limitations; this patch fixes the
-reported import type query parse error and restores subsequent declarations.
+and its callee is extracted. That ordinary-call precedence limitation remains.
+Generic tagged templates such as `` tag<Item>`value` `` were represented as
+binary expressions by the original grammar; the #235 patch above deliberately
+corrects their structure to `call_expression`.

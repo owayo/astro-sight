@@ -63,6 +63,12 @@ filter = 'binary_id(astro-sight::integration) & (test(=integration::impact_rust_
 priority = 50
 threads-required = 2
 
+# TS / TSX の generic tagged template と互換性を通常・index で確認する回帰を先に実行する。
+[[profile.default.overrides]]
+filter = 'binary_id(astro-sight::integration) & test(=integration::typescript_grammar::typescript_generic_tagged_template_keeps_optional_parameter_compatibility)'
+priority = 50
+threads-required = 2
+
 # CI (NEXTEST_PROFILE=ci): 失敗しても残りのテストを最後まで流し、失敗の出力を最後にもまとめて出す
 [profile.ci]
 fail-fast = false
