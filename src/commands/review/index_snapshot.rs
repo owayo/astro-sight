@@ -380,6 +380,28 @@ impl IndexSnapshot {
         expected_diff: &str,
         budget: SnapshotBudget,
     ) -> Result<PreparedSnapshot> {
+        // 拡張子の候補がある場合だけ元の場所で再確認し、TEMP の祖先を証拠にしない。
+        let extension_proof =
+            if crate::commands::git_input::has_ts_extension_candidates(expected_diff) {
+                let (current_diff, extension_proof) =
+                    crate::commands::git_input::run_git_diff_with_extension_proof(
+                        dir,
+                        base,
+                        true,
+                        &mut Vec::new(),
+                        None,
+                    )?;
+                if diff_contract(&current_diff) != diff_contract(expected_diff) {
+                    return Err(AstroError::new(
+                        ErrorCode::ReviewInputChanged,
+                        "Staged input changed before creating the analysis snapshot",
+                    )
+                    .into());
+                }
+                extension_proof
+            } else {
+                crate::commands::git_input::TsExtensionProof::default()
+            };
         let original = Path::new(dir);
         // hook の index は読むだけにし、tree の作成は一時 index で行う。
         let OriginalRepository {
@@ -468,11 +490,16 @@ impl IndexSnapshot {
         let analysis_text = analysis_dir
             .to_str()
             .ok_or_else(|| failure("Non-UTF-8 staged analysis path"))?;
-        if diff_contract(&crate::commands::git_input::run_git_diff(
-            analysis_text,
-            base,
-            false,
-        )?) != diff_contract(expected_diff)
+        if diff_contract(
+            &crate::commands::git_input::run_git_diff_with_extension_proof(
+                analysis_text,
+                base,
+                false,
+                &mut Vec::new(),
+                Some(&extension_proof),
+            )?
+            .0,
+        ) != diff_contract(expected_diff)
         {
             return Err(AstroError::new(
                 ErrorCode::ReviewInputChanged,

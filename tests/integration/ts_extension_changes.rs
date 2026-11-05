@@ -3,7 +3,10 @@
 use super::support::*;
 
 fn fixture(old: &str, spec: &str, padding: bool) -> TestRepo {
-    let repo = TestRepo::new();
+    fixture_at(TestRepo::new(), old, spec, padding)
+}
+
+fn fixture_at(repo: TestRepo, old: &str, spec: &str, padding: bool) -> TestRepo {
     repo.create_dir_all("src");
     let pad = if padding {
         "// unchanged padding\n".repeat(30)
@@ -392,6 +395,222 @@ fn ts_extension_changes_audit_both_ancestor_alias_paths() {
     );
     assert!(
         has(&review["api_changes"]["removed"], "formatGreeting"),
+        "{review}"
+    );
+}
+
+#[test]
+fn ts_extension_changes_ignore_unrelated_ancestor_entries_and_snapshot_location() {
+    let parent = tempfile::tempdir().unwrap();
+    for index in 0..10_001 {
+        std::fs::write(parent.path().join(format!("unrelated-{index}")), "").unwrap();
+    }
+    let repo = fixture_at(
+        TestRepo::new_in(parent.path()),
+        "src/greet.ts",
+        "./greet",
+        false,
+    );
+    change(&repo, "src/greet.ts", "src/greet.tsx", false, false);
+    let plain_temp = tempfile::tempdir().unwrap();
+    let configured_temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        configured_temp.path().join("tsconfig.build.json"),
+        r#"{"compilerOptions":{"paths":{"*": ["other/*"]}}}"#,
+    )
+    .unwrap();
+    for (staged, temporary) in [
+        (false, plain_temp.path()),
+        (true, plain_temp.path()),
+        (true, parent.path()),
+        (true, configured_temp.path()),
+    ] {
+        if staged {
+            repo.stage_all();
+        }
+        let mut command = cargo_bin();
+        command
+            .args(["review", "--git", "--hook", "--dir"])
+            .arg(repo.root());
+        if staged {
+            command.arg("--staged");
+        }
+        for variable in ["TMPDIR", "TMP", "TEMP"] {
+            command.env(variable, temporary);
+        }
+        let output = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "staged={staged}: {stderr}");
+        let hook: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+        assert!(has(&hook["api"]["mod_compat"], "formatGreeting"), "{hook}");
+        assert!(!has(&hook["api"]["rm"], "formatGreeting"), "{hook}");
+    }
+    // 元の祖先の設定は、別名のファイルでも引き続き解決の証明を妨げる。
+    std::fs::write(
+        parent.path().join("tsconfig.custom.json"),
+        r#"{"compilerOptions":{"paths":{"*": ["other/*"]}}}"#,
+    )
+    .unwrap();
+    for staged in [false, true] {
+        let mut command = cargo_bin();
+        command
+            .args(["review", "--git", "--hook", "--dir"])
+            .arg(repo.root());
+        if staged {
+            command.arg("--staged");
+        }
+        for variable in ["TMPDIR", "TMP", "TEMP"] {
+            command.env(variable, plain_temp.path());
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let hook: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert!(has(&hook["api"]["rm"], "formatGreeting"), "{hook}");
+    }
+}
+
+#[test]
+fn ts_extension_changes_staged_ancestor_configs_come_from_the_index() {
+    for staged_unsafe in [false, true] {
+        let repo = fixture("src/greet.ts", "./greet", false);
+        repo.write("tsconfig.json", "{}");
+        repo.commit_all("plain config");
+        change(&repo, "src/greet.ts", "src/greet.tsx", false, false);
+        let unsafe_config = r#"{"compilerOptions":{"moduleSuffixes":[".native", ""]}}"#;
+        repo.write(
+            "tsconfig.json",
+            if staged_unsafe { unsafe_config } else { "{}" },
+        );
+        repo.stage_all();
+        repo.write(
+            "tsconfig.json",
+            if staged_unsafe { "{}" } else { unsafe_config },
+        );
+        let output = cargo_bin()
+            .args(["review", "--git", "--staged", "--hook", "--dir"])
+            .arg(repo.path("src"))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(staged_unsafe)),
+            "{stderr}"
+        );
+        let hook: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+        assert_eq!(
+            has(&hook["api"]["rm"], "formatGreeting"),
+            staged_unsafe,
+            "{hook}"
+        );
+        assert_eq!(
+            has(&hook["api"]["mod_compat"], "formatGreeting"),
+            !staged_unsafe,
+            "{hook}"
+        );
+    }
+}
+
+#[test]
+fn ts_extension_changes_config_budget_is_deduplicated_and_reported() {
+    let parent = tempfile::tempdir().unwrap();
+    for index in 0..6_000 {
+        std::fs::write(
+            parent.path().join(format!("tsconfig.{index:05}.json")),
+            "{}",
+        )
+        .unwrap();
+    }
+    let repo = fixture_at(
+        TestRepo::new_in(parent.path()),
+        "src/greet.ts",
+        "./greet",
+        false,
+    );
+    change(&repo, "src/greet.ts", "src/greet.tsx", false, false);
+    let output = cargo_bin()
+        .args(["review", "--git", "--hook", "--dir"])
+        .arg(repo.root())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let hook: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+    assert!(has(&hook["api"]["mod_compat"], "formatGreeting"), "{hook}");
+    for index in 6_000..10_001 {
+        std::fs::write(
+            parent.path().join(format!("tsconfig.{index:05}.json")),
+            "{}",
+        )
+        .unwrap();
+    }
+    let review = repo.run_json("review", &["--git"]);
+    assert!(
+        has(&review["api_changes"]["removed"], "formatGreeting"),
+        "{review}"
+    );
+    assert!(
+        review["truncations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(
+                |notice| notice["reason"] == "ts_extension_proof_unavailable"
+                    && notice["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("count exceeds 10000"))
+            ),
+        "{review}"
+    );
+    let output = cargo_bin()
+        .args(["review", "--git", "--hook", "--dir"])
+        .arg(repo.root())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let hook: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert!(
+        hook["trunc"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|notice| notice["r"] == "ts_extension_proof_unavailable"),
+        "{hook}"
+    );
+}
+
+#[test]
+fn ts_extension_changes_report_unreadable_external_config_evidence() {
+    let parent = tempfile::tempdir().unwrap();
+    std::fs::create_dir(parent.path().join("tsconfig.generated.json")).unwrap();
+    let repo = fixture_at(
+        TestRepo::new_in(parent.path()),
+        "src/greet.ts",
+        "./greet",
+        false,
+    );
+    change(&repo, "src/greet.ts", "src/greet.tsx", false, false);
+    let review = repo.run_json("review", &["--git"]);
+    assert!(
+        has(&review["api_changes"]["removed"], "formatGreeting"),
+        "{review}"
+    );
+    assert!(
+        review["truncations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(
+                |notice| notice["reason"] == "ts_extension_proof_unavailable"
+                    && notice["message"].as_str().is_some_and(
+                        |message| message.contains("external configuration could not be read")
+                    )
+            ),
         "{review}"
     );
 }

@@ -6,6 +6,10 @@ Rust declarations touched only by LF/CRLF conversion are excluded as impact orig
 
 With `--git`, a `.ts` ↔ `.tsx` extension change in the same directory can remain one module even when Git reports deletion and addition. After checking that static relative imports still resolve to that module, the usual signature comparison reports optional parameter additions as compatible and required additions with their affected callers. This applies to working-tree and staged changes. Explicit references to the old extension, ambiguous resolution, unsupported configuration or loaders, escapes, and incomplete source analysis retain the conservative result; external diffs are unchanged.
 
+The TS/TSX extension check inspects matching `tsconfig*.json` and `jsconfig*.json` ancestor files, deduplicates logical and physical directories, and does not count unrelated entries against its configuration budget. Staged review rechecks the proof in the original location and carries the proven file pairs into the index snapshot; the temporary directory's ancestors do not supply replacement configuration. Configurations inside the repository come from the base and index, including ancestors of a subdirectory selected with `--dir`. A genuine input change still fails the snapshot's diff comparison.
+
+If source/configuration evidence cannot be read or an analysis budget is exhausted, `truncations` reports `ts_extension_proof_unavailable` (`trunc[].r` in the hook), while unproven file changes retain the conservative classification. External configuration limits are 10,000 matching files, 2 MiB per file, 64 MiB total, and 128 ancestor levels.
+
 ## context: Smart Context (Diff → Impact Analysis)
 
 `context` takes a unified diff and analyzes the scope of the change, to support AI code review. Function signature changes are matched on identifier boundaries, so two different functions whose names only share a prefix, such as `foo` and `foo_bar`, are not confused.

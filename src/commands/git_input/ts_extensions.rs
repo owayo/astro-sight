@@ -15,6 +15,11 @@ const MAX_FILE: usize = 2 * 1024 * 1024;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ENTRIES: usize = 10_000;
 
+#[derive(Default)]
+pub(in crate::commands) struct ProvenPairs {
+    pairs: HashSet<(String, String)>,
+}
+
 struct Candidate {
     old: String,
     new: String,
@@ -31,9 +36,11 @@ fn counterpart(path: &str) -> Option<String> {
         .or_else(|| path.strip_suffix(".ts").map(|stem| format!("{stem}.tsx")))
 }
 
-pub(super) fn normalize(dir: &str, base: &str, staged: bool, input: &mut String) {
-    // 候補が無い通常の差分では、Git の追加起動もファイル走査も行わない。
-    let files = diff::parse_unified_diff(input);
+pub(in crate::commands) fn has_candidates(input: &str) -> bool {
+    !candidates(&diff::parse_unified_diff(input)).is_empty()
+}
+
+fn candidates(files: &[crate::models::impact::DiffFile]) -> Vec<Candidate> {
     let mut candidates = Vec::new();
     for (ix, file) in files.iter().enumerate() {
         let Some(new) = counterpart(&file.old_path) else {
@@ -62,8 +69,23 @@ pub(super) fn normalize(dir: &str, base: &str, staged: bool, input: &mut String)
             }
         }
     }
+    candidates
+}
+
+pub(super) fn normalize(
+    dir: &str,
+    base: &str,
+    staged: bool,
+    input: &mut String,
+    replay: Option<&ProvenPairs>,
+    truncations: &mut Vec<crate::models::truncation::TruncationInfo>,
+) -> ProvenPairs {
+    let mut proven_pairs = ProvenPairs::default();
+    // 候補が無い通常の差分では、Git の追加起動もファイル走査も行わない。
+    let files = diff::parse_unified_diff(input);
+    let candidates = candidates(&files);
     if candidates.is_empty() {
-        return;
+        return proven_pairs;
     }
     let blocks = split_into_file_blocks(input);
     // hunk を持たない block などで、配列の位置を取り違えない。
@@ -75,7 +97,7 @@ pub(super) fn normalize(dir: &str, base: &str, staged: bool, input: &mut String)
                 .insert((file.old_path.clone(), file.new_path.clone()), ix)
                 .is_some()
         {
-            return;
+            return proven_pairs;
         }
     }
     let old_blobs = GitBlobBatch::new(dir, base);
@@ -84,7 +106,18 @@ pub(super) fn normalize(dir: &str, base: &str, staged: bool, input: &mut String)
         .as_ref()
         .map(|tree| GitBlobBatch::new(dir, tree))
         .or_else(|| staged.then(|| GitBlobBatch::index(dir)));
-    let inventory = Inventory::read(dir, base, new_blobs.as_ref());
+    // snapshot は元の場所で証明したペアだけを使い、TEMP の祖先を新たな証拠にしない。
+    let inventory = if replay.is_none() {
+        match Inventory::read(dir, base, new_blobs.as_ref()) {
+            Ok(inventory) => inventory,
+            Err(reason) => {
+                proof_unavailable(truncations, reason);
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut replacements: HashMap<usize, String> = HashMap::new();
     for candidate in candidates {
         let Some(&old_ix) = by_path.get(&(
@@ -106,14 +139,32 @@ pub(super) fn normalize(dir: &str, base: &str, staged: bool, input: &mut String)
             .read_limited(&candidate.old, MAX_FILE)
             .and_then(|v| String::from_utf8(v).ok())
         else {
+            proof_unavailable(
+                truncations,
+                "old source could not be read within the 2 MiB file limit",
+            );
             continue;
         };
         let Some(new) = read_source(dir, new_blobs.as_ref(), &candidate.new) else {
+            proof_unavailable(
+                truncations,
+                "new source could not be read within the 2 MiB file limit",
+            );
             continue;
         };
-        let proven = inventory
-            .as_ref()
-            .is_some_and(|inventory| inventory.proves(&candidate.old, &candidate.new));
+        let proven = match replay {
+            Some(proof) => proof
+                .pairs
+                .contains(&(candidate.old.clone(), candidate.new.clone())),
+            None => inventory
+                .as_ref()
+                .is_some_and(|inventory| inventory.proves(&candidate.old, &candidate.new)),
+        };
+        if proven {
+            proven_pairs
+                .pairs
+                .insert((candidate.old.clone(), candidate.new.clone()));
+        }
         let replacement = if proven {
             synthesize_modified_file_diff(&candidate.old, &candidate.new, old.as_bytes(), &new)
                 .unwrap_or_default()
@@ -133,7 +184,7 @@ pub(super) fn normalize(dir: &str, base: &str, staged: bool, input: &mut String)
         }
     }
     if replacements.is_empty() {
-        return;
+        return proven_pairs;
     }
     let size = blocks
         .iter()
@@ -142,13 +193,33 @@ pub(super) fn normalize(dir: &str, base: &str, staged: bool, input: &mut String)
             total.checked_add(replacements.get(&ix).unwrap_or(block).len())
         });
     if size.is_none_or(|size| size > MAX_INPUT_SIZE) {
-        return;
+        return proven_pairs;
     }
     *input = blocks
         .into_iter()
         .enumerate()
         .map(|(ix, block)| replacements.remove(&ix).unwrap_or(block))
         .collect();
+    proven_pairs
+}
+
+fn proof_unavailable(
+    truncations: &mut Vec<crate::models::truncation::TruncationInfo>,
+    reason: &str,
+) {
+    use crate::models::truncation::{TruncationInfo, TruncationReason};
+    let message = format!(
+        "TS extension continuity proof unavailable: {reason}; unproven changes retain the conservative classification"
+    );
+    if !truncations.iter().any(|item| {
+        item.reason == TruncationReason::TsExtensionProofUnavailable && item.message == message
+    }) {
+        truncations.push(TruncationInfo::new(
+            None,
+            TruncationReason::TsExtensionProofUnavailable,
+            message,
+        ));
+    }
 }
 
 fn deleted_diff(path: &str, source: &str) -> String {
@@ -179,17 +250,39 @@ struct Inventory {
 }
 
 impl Inventory {
-    fn read(dir: &str, base: &str, new_blobs: Option<&GitBlobBatch>) -> Option<Self> {
-        let prefix = git_output(dir, &["rev-parse", "--show-prefix"], 4096)?;
+    fn read(
+        dir: &str,
+        base: &str,
+        new_blobs: Option<&GitBlobBatch>,
+    ) -> Result<Option<Self>, &'static str> {
+        let prefix = git_output(dir, &["rev-parse", "--show-prefix"], 4096)
+            .ok_or("Git workspace prefix could not be read within 4096 bytes")?;
         let prefix = std::str::from_utf8(&prefix)
-            .ok()?
+            .map_err(|_| "Git workspace prefix is not UTF-8")?
             .trim_end_matches(['\r', '\n']);
         if prefix.contains(['\\', '\n', '\r']) {
-            return None;
+            return Err("Git workspace prefix has unsupported characters");
         }
-        if !plain_external_configs(dir) {
-            return None;
+        if !plain_external_configs(dir, prefix, new_blobs.is_none())? {
+            return Ok(None);
         }
+        let mut known_unsupported = false;
+        let inventory = Self::read_sources(dir, base, new_blobs, prefix, &mut known_unsupported);
+        if inventory.is_none() && !known_unsupported {
+            return Err(
+                "source/config inventory could not be completed (read or parse failure, unsupported transport, or file/byte/node limit)",
+            );
+        }
+        Ok(inventory)
+    }
+
+    fn read_sources(
+        dir: &str,
+        base: &str,
+        new_blobs: Option<&GitBlobBatch>,
+        prefix: &str,
+        known_unsupported: &mut bool,
+    ) -> Option<Self> {
         let old = list_git_files(dir, Some(base), prefix)?;
         let new = match new_blobs {
             Some(blobs) if blobs.rev() != ":0" => list_git_files(dir, Some(blobs.rev()), prefix)?,
@@ -208,6 +301,7 @@ impl Inventory {
                     let source = read_source(dir, blobs, path)?;
                     bytes_left = bytes_left.checked_sub(source.len())?;
                     if !plain_config(&source) {
+                        *known_unsupported = true;
                         return None;
                     }
                     continue;
@@ -414,9 +508,10 @@ fn list_git_files(dir: &str, revision: Option<&str>, prefix: &str) -> Option<Has
             &["ls-tree", "-r", "-z", "--full-tree", revision],
             4 * 1024 * 1024,
         )?,
+        // --full-name は表示だけを変えるため、pathspec も root を指定する。
         None => git_output(
             dir,
-            &["ls-files", "--stage", "--full-name", "-z"],
+            &["ls-files", "--stage", "--full-name", "-z", "--", ":/"],
             4 * 1024 * 1024,
         )?,
     };
@@ -547,57 +642,130 @@ fn plain_metadata(path: &Path) -> bool {
     })
 }
 
-fn plain_external_configs(dir: &str) -> bool {
+fn plain_external_configs(
+    dir: &str,
+    prefix: &str,
+    include_repository_ancestors: bool,
+) -> Result<bool, &'static str> {
     let logical = if Path::new(dir).is_absolute() {
         Path::new(dir).to_owned()
     } else {
-        let Ok(cwd) = std::env::current_dir() else {
-            return false;
-        };
-        cwd.join(dir)
+        std::env::current_dir()
+            .map_err(|_| "current directory could not be read")?
+            .join(dir)
     };
     let logical: std::path::PathBuf = logical.components().collect();
     if !plain_metadata(&logical) {
-        return false;
+        return Err("workspace metadata could not be verified");
     }
-    let Ok(physical) = std::fs::canonicalize(&logical) else {
-        return false;
+    let physical =
+        std::fs::canonicalize(&logical).map_err(|_| "workspace path could not be resolved")?;
+    let levels = if include_repository_ancestors {
+        0
+    } else {
+        prefix.split('/').filter(|part| !part.is_empty()).count()
     };
-    let mut remaining = 10_000usize;
+    let mut seen = HashSet::new();
+    let mut remaining = MAX_ENTRIES;
+    let mut bytes_left = MAX_BYTES;
     for root in [&logical, &physical] {
+        let root = root
+            .ancestors()
+            .nth(levels)
+            .ok_or("Git workspace prefix is outside the workspace")?;
         for (depth, ancestor) in root.ancestors().skip(1).enumerate() {
             if depth >= 128 {
-                return false;
+                return Err("external configuration ancestor depth exceeds 128");
             }
-            let Ok(entries) = std::fs::read_dir(ancestor) else {
-                return false;
-            };
+            let identity = std::fs::canonicalize(ancestor)
+                .map_err(|_| "ancestor directory could not be resolved")?;
+            if !seen.insert(identity) {
+                continue;
+            }
+            let entries =
+                std::fs::read_dir(ancestor).map_err(|_| "ancestor directory could not be read")?;
+            let mut configs = Vec::new();
             for entry in entries {
-                let Some(next) = remaining.checked_sub(1) else {
-                    return false;
-                };
-                remaining = next;
-                let Ok(entry) = entry else { return false };
+                let entry = entry.map_err(|_| "ancestor directory entry could not be read")?;
                 let name = entry.file_name();
-                let Some(name) = name.to_str() else {
-                    return false;
-                };
-                if is_config(name)
-                    && (!plain_metadata(&entry.path())
-                        || !bounded_read::read_utf8_file_limited(&entry.path(), MAX_FILE as u64)
-                            .is_some_and(|source| plain_config(&source)))
-                {
-                    return false;
+                // 関係のない名前は予算に入れず、名前が一致する設定だけを保存する。
+                if !is_config(&name.to_string_lossy()) {
+                    continue;
+                }
+                if name.to_str().is_none() {
+                    return Err("external configuration name is not UTF-8");
+                }
+                remaining = remaining
+                    .checked_sub(1)
+                    .ok_or("external configuration count exceeds 10000")?;
+                configs.push(entry.path());
+            }
+            configs.sort();
+            for config in configs {
+                if !plain_metadata(&config) {
+                    return Err("external configuration metadata could not be verified");
+                }
+                let source = bounded_read::read_utf8_file_limited(&config, MAX_FILE as u64).ok_or(
+                    "external configuration could not be read within the 2 MiB file limit",
+                )?;
+                bytes_left = bytes_left
+                    .checked_sub(source.len())
+                    .ok_or("external configuration bytes exceed 64 MiB")?;
+                if !plain_config(&source) {
+                    return Ok(false);
                 }
             }
         }
     }
-    true
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_rechecks_only_actual_extension_candidates() {
+        let patch = |old: &str, new: &str| {
+            format!(
+                "diff --git a/{old} b/{new}\n--- {}\n+++ {}\n@@ -1 +1 @@\n-old\n+new\n",
+                if old == "/dev/null" {
+                    old.to_owned()
+                } else {
+                    format!("a/{old}")
+                },
+                if new == "/dev/null" {
+                    new.to_owned()
+                } else {
+                    format!("b/{new}")
+                },
+            )
+        };
+        for (diff, expected) in [
+            (patch("src/a.rs", "src/a.rs"), false),
+            (patch("src/a.ts", "src/a.ts"), false),
+            (patch("src/a.ts", "/dev/null"), false),
+            (patch("/dev/null", "src/a.tsx"), false),
+            (patch("src/a.ts", "src/a.tsx"), true),
+            (patch("src/a.tsx", "src/a.ts"), true),
+            (patch("src/a.d.ts", "src/a.d.tsx"), false),
+            (
+                patch("src/a.ts", "/dev/null") + &patch("/dev/null", "src/a.tsx"),
+                true,
+            ),
+            (
+                patch("src/a.ts", "/dev/null") + &patch("/dev/null", "src/other.tsx"),
+                false,
+            ),
+            (
+                patch("src/a.rs", "src/a.rs")
+                    .replace("+new", "+let paths = [\"a.ts\", \"a.tsx\"];"),
+                false,
+            ),
+        ] {
+            assert_eq!(has_candidates(&diff), expected, "{diff}");
+        }
+    }
 
     #[test]
     fn transport_nodes_and_fields_exist_in_all_js_grammars() {
