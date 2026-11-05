@@ -6,6 +6,7 @@ use super::*;
 #[derive(Default)]
 pub(crate) struct ExportedFileFacts {
     pub(crate) symbols: ExportedSymbols,
+    pub(crate) type_dependencies: Option<super::ts_signature::DependencySnapshot>,
     rust_parameters: RustParameterContracts,
 }
 
@@ -938,6 +939,16 @@ fn filter_exported_with_metadata(
             .windows(b"// astro-sight:allow-dead".len())
             .any(|bytes| bytes == b"// astro-sight:allow-dead");
     let mut result = ExportedFileFacts::default();
+    if collect_metadata
+        && matches!(
+            lang_id,
+            crate::language::LangId::Typescript | crate::language::LangId::Tsx
+        )
+    {
+        result.type_dependencies = Some(super::ts_signature::DependencySnapshot::collect(
+            root, source,
+        ));
+    }
     if collect_metadata && lang_id == crate::language::LangId::Rust {
         result.rust_parameters.imports =
             crate::engine::rust_signature::rust_parameter_import_environment(root, source);

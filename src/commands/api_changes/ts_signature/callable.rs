@@ -7,7 +7,7 @@ use super::{TS_ONLY_LANGS, with_resolved_ts_fn_pair};
 use crate::commands::api_changes::js_const::unique_top_level_const;
 use crate::commands::api_changes::source_pair::{CompatibleModSite, SignatureSourceCache};
 
-fn unwrap_parentheses(mut value: Node<'_>) -> Option<Node<'_>> {
+pub(super) fn unwrap_parentheses(mut value: Node<'_>) -> Option<Node<'_>> {
     while value.kind() == "parenthesized_expression" {
         let mut cursor = value.walk();
         let expressions: Vec<_> = value

@@ -521,6 +521,7 @@ pub fn cmd_context(service: &AppService, opts: &CmdContextOpts<'_>) -> Result<()
         exclude_dirs: exclude_dirs.to_vec(),
         exclude_globs: exclude_globs.to_vec(),
         new_side: diff_new_side(diff, diff_file, git, staged),
+        ..Default::default()
     };
 
     // 逐次出力できるのは compact JSON だけ。pretty は整形が要り、TOON はルート配列の
@@ -649,6 +650,7 @@ pub fn cmd_impact(service: &AppService, opts: &CmdImpactOpts<'_>) -> Result<()> 
         exclude_dirs: exclude_dirs.to_vec(),
         exclude_globs: exclude_globs.to_vec(),
         new_side: diff_new_side(None, None, git, staged),
+        ..Default::default()
     };
     let result = service.analyze_context(&diff_input, dir, &options)?;
 

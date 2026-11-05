@@ -140,6 +140,7 @@ fn callback_body_hook_reports_unverified_changes_and_supports_strict_mode() {
     use crate::models::review::{CallbackBodyChange, CallbackBodyChangeReason};
     let result = ReviewResult {
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -210,6 +211,7 @@ fn build_review_hook_json_compatible_modified_is_informational() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -301,6 +303,7 @@ fn build_review_hook_json_compatible_modified_impact_is_informational() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -398,6 +401,7 @@ fn build_review_hook_json_mixed_compatible_and_breaking_impact_keeps_breaking_on
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -491,6 +495,7 @@ fn build_review_hook_json_cochange_only_is_informational() {
         }],
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -561,6 +566,7 @@ fn build_review_hook_json_cochange_marks_history_evidence() {
         }],
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -617,6 +623,7 @@ fn build_review_hook_json_cochange_omits_denominator_when_unknown() {
         }],
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -694,6 +701,7 @@ fn build_review_hook_json_impact_info_only_is_informational() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -748,6 +756,7 @@ fn build_review_hook_json_api_add_only_is_informational() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -792,6 +801,7 @@ fn build_review_hook_json_api_add_only_is_informational() {
 fn build_review_hook_json_api_add_carries_extraction_scope() {
     let dir = tempfile::tempdir().expect("tempdir");
     let empty_api = || ApiChanges {
+        type_dependency_symbols: Default::default(),
         unresolved_modified_callers: vec![],
         unchanged_static_consts: Vec::new(),
         type_annotation_changes: Vec::new(),
@@ -891,6 +901,7 @@ fn build_review_hook_json_api_add_carries_internal_ref_count() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -1000,6 +1011,7 @@ fn build_review_hook_json_api_removed_is_blocking() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -1048,6 +1060,7 @@ fn build_review_hook_json_api_modified_is_blocking() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -1105,6 +1118,7 @@ fn build_review_hook_json_api_modified_carries_contract_change() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -1172,6 +1186,7 @@ fn build_review_hook_json_api_modified_without_callers_is_flagged_but_still_bloc
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -1234,6 +1249,7 @@ fn build_review_hook_json_removed_dead_only_is_not_blocking() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -1294,6 +1310,7 @@ fn build_review_hook_json_const_value_only_is_informational() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -1348,6 +1365,7 @@ fn build_review_hook_json_const_value_is_blocking_under_strict() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -1424,6 +1442,7 @@ fn build_review_hook_json_uses_changed_symbols_in_summary() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -1513,6 +1532,7 @@ fn build_review_hook_json_filters_non_causal_affected_symbols_from_syms() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -1596,6 +1616,7 @@ fn build_review_hook_json_added_only_caller_is_not_blocking() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -1696,6 +1717,7 @@ fn build_review_hook_json_mixed_added_and_modified_keeps_only_modified() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -1756,6 +1778,7 @@ fn build_review_hook_json_api_modified_carries_field_contract_change() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),
@@ -1877,6 +1900,7 @@ fn build_review_hook_json_resolves_updated_call_line_in_diff_file() {
         missing_cochanges: Vec::new(),
         cochange_diagnostics: Default::default(),
         api_changes: ApiChanges {
+            type_dependency_symbols: Default::default(),
             unresolved_modified_callers: vec![],
             unchanged_static_consts: Vec::new(),
             type_annotation_changes: Vec::new(),

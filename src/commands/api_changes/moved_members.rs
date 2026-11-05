@@ -802,6 +802,7 @@ mod tests {
                 in_file_callees: HashSet::new(),
             },
             PreparedDiffFile::Modified {
+                type_dependencies: Default::default(),
                 unparsed_declarations: Vec::new(),
                 old_syms: Some(vec![symbol("Local.run", "function", "pub fn run()")]),
                 new_syms: Some(vec![symbol("Local.run", "function", "pub fn run(n: u32)")]),

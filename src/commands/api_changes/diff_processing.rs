@@ -596,6 +596,7 @@ fn collect_modified_symbols(
     let mut files =
         ChangedSignatureFiles::new(inputs, state, &df.old_path, &df.new_path, in_file_callees);
     files.rust_const_additions = Some(facts.rust_const_additions);
+    files.type_dependencies = Some(facts.type_dependencies);
     let recovered = super::ts_namespace::recover_root_changes(inputs, df, facts);
 
     // 同一 (file, qualname) の modified を重複排除するためのキーセット
@@ -632,10 +633,15 @@ fn collect_modified_symbols(
             };
             let mut sources = SignatureSourceCache::with_base_blobs(base_blobs);
             // signature が同じなので、型注釈と静的 container の段階だけを見る。
-            let decision = match type_annotation_decision(&site, &mut sources) {
-                Some(decision) => decision,
-                None => {
-                    static_const_decision(&site, &mut sources).unwrap_or(SignatureDecision::Omit)
+            let decision = if facts.type_dependencies.get(name)
+                == Some(&super::ts_signature::DependencyStatus::Changed)
+            {
+                SignatureDecision::Blocking(None)
+            } else {
+                match type_annotation_decision(&site, &mut sources) {
+                    Some(decision) => decision,
+                    None => static_const_decision(&site, &mut sources)
+                        .unwrap_or(SignatureDecision::Omit),
                 }
             };
             let change = ApiSymbolChange {
@@ -789,6 +795,7 @@ pub(crate) fn process_moved_symbol_changes<'c, 'a>(
 /// ([`process_moved_symbol_changes`]) が同じ規則で判定するために共有する。ファイル内の
 /// 対応付け (同名の複数定義・引数パターンだけの変更) の検査は呼び出し側が済ませる。
 struct ChangedSignatureFiles<'a> {
+    type_dependencies: Option<&'a super::ts_signature::DependencyChanges>,
     old_path: &'a str,
     new_path: &'a str,
     /// 移動と同じ差分でシグネチャの変わった宣言なら移動元 (`old_path`)。
@@ -822,6 +829,7 @@ impl<'a> ChangedSignatureFiles<'a> {
             .is_binary_only_at_base(inputs.base_blobs, old_path)
             || is_binary_only_rust_crate(inputs.dir, new_path);
         Self {
+            type_dependencies: None,
             old_path,
             new_path,
             moved_from: None,
@@ -916,6 +924,11 @@ impl<'a> ChangedSignatureFiles<'a> {
                 change,
                 SignatureDecision::MovedConstAddition(site.compatible("rust_const_fn_added")),
             );
+        }
+        if self.type_dependencies.and_then(|types| types.get(name))
+            == Some(&super::ts_signature::DependencyStatus::Changed)
+        {
+            return (change, SignatureDecision::Blocking(None));
         }
         // closed-in-diff: 同一ファイル内でしか呼ばれていない関数のシグネチャ変更は除外。
         //
@@ -1019,7 +1032,8 @@ impl<'a> ChangedSignatureFiles<'a> {
             lang_id: self.lang_id,
             internally_closed,
         };
-        let decision = decide_signature_change(inputs, state.closure_caches, &site);
+        let decision =
+            decide_signature_change(inputs, state.closure_caches, &site, self.type_dependencies);
         (site.change, decision)
     }
 }
@@ -1073,7 +1087,12 @@ fn decide_signature_change(
     inputs: &DetectionInputs<'_>,
     caches: &mut ApiClosureCaches,
     site: &SignatureChangeSite<'_>,
+    dependencies: Option<&super::ts_signature::DependencyChanges>,
 ) -> SignatureDecision {
+    let dependency_status = dependencies
+        .and_then(|types| types.get(&site.change.name))
+        .copied()
+        .unwrap_or_default();
     let &DetectionInputs {
         dir,
         base,
@@ -1138,6 +1157,24 @@ fn decide_signature_change(
         public_name_differs,
         inputs.diff_files,
     ) {
+        if dependency_status == super::ts_signature::DependencyStatus::Unknown
+            && matches!(
+                compat.reason.as_str(),
+                "trailing_optional_params"
+                    | "trailing_optional_params_removed"
+                    | "optional_object_props"
+            )
+            && !super::ts_signature::compatible_dependencies_unchanged(
+                &site,
+                sources,
+                &mut caches.optional_removal,
+                inputs.diff_files,
+                &compat.reason,
+                dependencies,
+            )
+        {
+            return SignatureDecision::Blocking(None);
+        }
         return SignatureDecision::Compatible(compat);
     }
     closure_or_blocking_decision(

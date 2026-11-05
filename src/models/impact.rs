@@ -114,6 +114,11 @@ pub struct ContextAnalysisOptions {
     /// diff の new 側 (hunk の `+` 側の行番号が指す内容) がどこにあるか。
     /// 変更ファイルの解析はこの内容に対して行う。
     pub new_side: DiffNewSide,
+
+    /// review が同一ファイルの型依存から証明した契約変更 (パス → 公開宣言名)。
+    #[doc(hidden)]
+    pub derived_contract_changes:
+        std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
 }
 
 /// diff の new 側の内容がどこにあるか。

@@ -41,6 +41,8 @@ Rust cfg-condition classification reuses the current ancestor path to avoid repe
 
 Symbol extraction indexes declaration ranges when assigning methods to their enclosing types, avoiding a comparison of every method with every type in large files. Existing ownership and output ordering rules are preserved. See [symbol extraction benchmarks](docs/development.md#symbol-extraction-performance).
 
+TypeScript review follows same-file private types used in exported signatures, so a changed alias or interface can report an API change and affected callers even when the exported header stays unchanged. See [signature type dependencies](docs/diff-analysis.md#typescript-signature-type-dependencies).
+
 ## Features
 
 - **References by identifier**: `refs` lists the definitions and references of a symbol across a directory, and `refs --names` looks up many names in one pass

@@ -41,10 +41,10 @@ pub(crate) fn type_dependencies_unchanged(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Reference {
-    name: String,
+pub(super) struct Reference {
+    pub(super) name: String,
     /// `NS.Member` の `Member`。
-    member: Option<String>,
+    pub(super) member: Option<String>,
 }
 
 enum ImportKind {
@@ -325,8 +325,17 @@ const TRANSPARENT_TYPE_KINDS: &[&str] = &[
 
 /// 型の部分木から、型パラメータに束縛されない型名の参照を集める。たどれない形は None。
 fn collect_references(root: Node<'_>, source: &[u8], out: &mut Vec<Reference>) -> Option<()> {
+    collect_references_in_scope(root, source, out, &[])
+}
+
+pub(super) fn collect_references_in_scope(
+    root: Node<'_>,
+    source: &[u8],
+    out: &mut Vec<Reference>,
+    outer_names: &[String],
+) -> Option<()> {
     // 型パラメータの scope。`(親, 名前)` の列で、0 番は空の外側。
-    let mut scopes: Vec<(Option<usize>, Vec<String>)> = vec![(None, Vec::new())];
+    let mut scopes: Vec<(Option<usize>, Vec<String>)> = vec![(None, outer_names.to_vec())];
     let mut stack = vec![(root, 0usize)];
     while let Some((node, outer)) = stack.pop() {
         if node.is_extra() {
@@ -442,14 +451,35 @@ fn check(
     new_source: &[u8],
     roots: &[Node<'_>],
 ) -> Option<()> {
-    let old = TopLevel::collect(old_root, old_source)?;
-    let new = TopLevel::collect(new_root, new_source)?;
-    // ほかのファイルを変えていない diff では、宣言のファイルの外の型は変わらない。
-    let isolated = env.changed_paths.iter().all(|path| path == env.target_path);
     let mut pending = Vec::new();
     for root in roots {
         collect_references(*root, new_source, &mut pending)?;
     }
+    check_references(env, old_root, old_source, new_root, new_source, pending)
+}
+
+pub(super) fn references_unchanged(
+    env: &DependencyEnvironment<'_>,
+    old_root: Node<'_>,
+    old_source: &[u8],
+    new_root: Node<'_>,
+    new_source: &[u8],
+    references: Vec<Reference>,
+) -> bool {
+    check_references(env, old_root, old_source, new_root, new_source, references).is_some()
+}
+
+fn check_references(
+    env: &DependencyEnvironment<'_>,
+    old_root: Node<'_>,
+    old_source: &[u8],
+    new_root: Node<'_>,
+    new_source: &[u8],
+    mut pending: Vec<Reference>,
+) -> Option<()> {
+    let old = TopLevel::collect(old_root, old_source)?;
+    let new = TopLevel::collect(new_root, new_source)?;
+    let isolated = env.changed_paths.iter().all(|path| path == env.target_path);
     let mut seen = BTreeSet::new();
     while let Some(reference) = pending.pop() {
         if !seen.insert(reference.clone()) {
