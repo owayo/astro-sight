@@ -745,6 +745,11 @@ fn session_refs_reports_unsupported_language_scope_and_sources() {
             r#"{{"command":"refs","name":"greet_user","dir":"."}}"#
         )
         .unwrap();
+        writeln!(
+            stdin,
+            r#"{{"command":"refs","name":"greetUser","dir":"."}}"#
+        )
+        .unwrap();
     }
 
     let output = child.wait_with_output().expect("failed to wait session");
@@ -754,7 +759,7 @@ fn session_refs_reports_unsupported_language_scope_and_sources() {
         .lines()
         .map(|line| serde_json::from_str(line).expect("NDJSON line"))
         .collect();
-    assert_eq!(lines.len(), 2, "{stdout}");
+    assert_eq!(lines.len(), 3, "{stdout}");
     assert_eq!(
         lines[0]["error"]["code"], "UNSUPPORTED_LANGUAGE",
         "{}",
@@ -767,8 +772,9 @@ fn session_refs_reports_unsupported_language_scope_and_sources() {
         lines[1]
     );
     assert_eq!(
-        lines[1]["truncations"][0]["detail"]["extension"], "applescript",
+        lines[2]["truncations"][0]["detail"]["extension"], "applescript",
         "{}",
-        lines[1]
+        lines[2]
     );
+    assert!(lines[1].get("truncations").is_none(), "{}", lines[1]);
 }

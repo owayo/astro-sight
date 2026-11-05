@@ -1,6 +1,77 @@
 use super::*;
 
 #[test]
+fn refs_coverage_keeps_unreadable_sources_and_internal_proofs_conservative() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("ok.swift"), "let other = 1\n").unwrap();
+    std::fs::write(dir.path().join("other.m"), "void unrelated() {}\n").unwrap();
+    let names = vec!["TargetKey".to_string()];
+    let scan = |coverage| {
+        find_references_batch_with_scan_policy::<false>(
+            &names,
+            dir.path(),
+            None,
+            FileScanOptions::default(),
+            coverage,
+        )
+        .unwrap()
+    };
+    assert!(scan(RefCoverage::MatchingNames).unanalyzable.is_empty());
+    assert_eq!(
+        scan(RefCoverage::AllSources).unanalyzable[0]
+            .detail
+            .as_ref()
+            .unwrap()
+            .count,
+        1
+    );
+    let large = std::fs::File::create(dir.path().join("large.m")).unwrap();
+    large.set_len(101 * 1024 * 1024).unwrap();
+    let result = scan(RefCoverage::MatchingNames);
+    assert_eq!(result.unanalyzable.len(), 1);
+    assert_eq!(
+        result.unanalyzable[0].detail.as_ref().unwrap().examples,
+        vec!["large.m"]
+    );
+    assert_eq!(result.unanalyzable[0].detail.as_ref().unwrap().count, 1);
+    assert!(result.unsupported_only.is_none());
+    for bytes in [&b"\xffTarget"[..], &b"T\0a\0r\0g\0e\0t\0"[..]] {
+        let encoded = dir.path().join("encoded.mm");
+        std::fs::write(&encoded, bytes).unwrap();
+        assert!(
+            unsupported_source_matches(&encoded, |_| false),
+            "文字コードを確かめられない入力を不在の根拠にしない"
+        );
+    }
+}
+
+#[test]
+fn refs_coverage_reports_all_matching_extension_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("ok.swift"), "let other = 1\n").unwrap();
+    for ext in [
+        "m", "mm", "vue", "svelte", "astro", "mdx", "lua", "dart", "erl", "ex", "scala",
+    ] {
+        std::fs::write(dir.path().join(format!("source.{ext}")), "TargetKey\n").unwrap();
+    }
+    let result =
+        find_references_with_scan("TargetKey", dir.path(), None, FileScanOptions::default())
+            .unwrap();
+    assert_eq!(result.unanalyzable.len(), 11);
+    let extensions: Vec<_> = result
+        .unanalyzable
+        .iter()
+        .map(|entry| entry.detail.as_ref().unwrap().extension.as_str())
+        .collect();
+    assert_eq!(
+        extensions,
+        vec![
+            "astro", "dart", "erl", "ex", "lua", "m", "mdx", "mm", "scala", "svelte", "vue"
+        ]
+    );
+}
+
+#[test]
 fn is_generated_file_detects_laravel_ide_helper() {
     let path = Path::new("Laravel/www/_ide_helper.php");
     assert!(super::is_generated_file(path));

@@ -13,8 +13,6 @@ const SKIPPED_PATHS_CAP: usize = 50;
 
 /// 解析できないソースの申告で、1 拡張子あたりに載せる代表パスの上限。
 const UNANALYZABLE_EXAMPLES_PER_EXT: usize = 3;
-/// 同じく、申告する拡張子の種類数の上限 (件数降順 → 拡張子昇順で全順序を固定)。
-const UNANALYZABLE_EXT_CAP: usize = 10;
 
 /// astro-sight が解析できない「ソースコードの拡張子」。
 ///
@@ -34,7 +32,7 @@ const UNANALYZABLE_SOURCE_EXTENSIONS: &[&str] = &[
     "razor", "slim", "twig", "vbhtml",
     // 未対応のプログラミング言語
     "applescript", "clj", "cljc", "cljs", "cr", "dart", "erl", "ex", "exs", "fs", "fsi", "fsx",
-    "gradle", "groovy", "hrl", "hs", "jl", "lhs", "lua", "ml", "mli", "nim", "pas", "pl", "pm",
+    "gradle", "groovy", "hrl", "hs", "jl", "lhs", "lua", "m", "ml", "mli", "mm", "nim", "pas", "pl", "pm",
     "pp", "ps1", "psm1", "scala", "sol", "tcl", "vb", "vbs",
 ];
 
@@ -188,6 +186,15 @@ impl FileCollection {
         &self,
         dir: &Path,
     ) -> Vec<crate::models::truncation::TruncationInfo> {
+        self.filtered_unanalyzable_truncations(dir, |_| true)
+    }
+
+    /// 検索名を含み得るファイルに絞った申告。読み取り不能なファイルは呼び出し側で残す。
+    pub(crate) fn filtered_unanalyzable_truncations(
+        &self,
+        dir: &Path,
+        include: impl Fn(&Path) -> bool,
+    ) -> Vec<crate::models::truncation::TruncationInfo> {
         use crate::models::truncation::TruncationInfo;
         use std::collections::BTreeMap;
 
@@ -196,6 +203,9 @@ impl FileCollection {
         }
         let mut by_ext: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for path in &self.unanalyzable_sources {
+            if !include(path) {
+                continue;
+            }
             let ext = path
                 .extension()
                 .and_then(|e| e.to_str())
@@ -209,7 +219,7 @@ impl FileCollection {
         let mut entries: Vec<(String, Vec<String>)> = by_ext.into_iter().collect();
         // 件数降順 → 拡張子昇順。BTreeMap 由来なので同数のときの順序も決定論的。
         entries.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
-        entries.truncate(UNANALYZABLE_EXT_CAP);
+        // 種類数は既知の拡張子表で有限なので切り捨てない。代表パスだけを上限付きにする。
         entries
             .into_iter()
             .map(|(ext, mut paths)| {

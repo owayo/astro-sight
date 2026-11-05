@@ -240,14 +240,15 @@ Output (`astro-sight refs --name extract_symbols --dir .`):
 
 ### Files astro-sight Cannot Parse
 
-`refs` searches only the [languages astro-sight parses](languages.md). Source files in the search scope that have no parser are not dropped silently: they are listed in `truncations` with `reason: "unanalyzable_source"`, one entry per extension (the same report as `dead-code`). References inside them were not searched, so a zero result does not mean the name is unused there.
+`refs` searches only the [languages astro-sight parses](languages.md). Unparsed source files that may contain a requested name are not dropped silently: they are listed in `truncations` with `reason: "unanalyzable_source"`, one entry per extension (the same report format as `dead-code`). References inside them were not searched, so a zero result does not mean the name is unused there.
 
 ```json
 {"symbol":"greetUser","refs":[],"truncations":[{"reason":"unanalyzable_source","message":"1 \".applescript\" file(s) were not analyzed (no parser for this language); references inside them are not counted (e.g. sample.applescript)","detail":{"extension":"applescript","count":1,"examples":["sample.applescript"]}}]}
 ```
 
-- Only extensions that are certainly program or template languages are reported (`.vue` / `.svelte` / `.applescript` / `.scala` / `.lua`, and so on). Images, documents, and data are not, so that the report does not bury the sources that matter
-- The report is attached whether or not the name was found. `refs --names` attaches it once, to the first record, like `skipped`; repeating it for every name would spend the output budget on the report
+- Only extensions that are certainly program or template languages are reported (`.vue` / `.svelte` / `.applescript` / `.scala` / `.lua` / Objective-C `.m` / Objective-C++ `.mm`, and so on). Images, documents, and data are not, so that the report does not bury the sources that matter
+- The report includes unparsed sources whose contents may match a requested name (substring matching, ignoring ASCII case). Unreadable files, files above 100MB, and uncertain encodings remain reported because absence cannot be checked. Hits in parsed sources do not affect this report. `refs --names` attaches it once, to the first record, like `skipped`; it covers any requested name, without repeating the report for each name
+- Each extension reports its full count and up to three example paths; matching extension groups are not silently dropped. API closure proofs and dead-code retain all unparsed source files without filtering by name
 - The search scope is what `--dir` and `--glob` select. `--glob "**/*.rs"` leaves `.vue` files out of the scope, so they are not reported
 
 When the scope contains files but **none of them can be searched**, `refs` fails with `UNSUPPORTED_LANGUAGE` (exit code 1) instead of returning an empty list, as `symbols --path` does for a single file. This counts every matched file, including documents and images, and the message lists the extensions and up to three paths. The same applies to `refs --names`, `session`, and MCP.

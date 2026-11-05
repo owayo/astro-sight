@@ -636,6 +636,11 @@ impl AppService {
             &canonical_dir,
             glob,
             refs::FileScanOptions { include_generated },
+            if audience == RefSearchAudience::User {
+                refs::RefCoverage::MatchingNames
+            } else {
+                refs::RefCoverage::AllSources
+            },
         )?;
         if audience == RefSearchAudience::User {
             reject_unsupported_only_scope(scan.unsupported_only.as_ref())?;

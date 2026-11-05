@@ -46,7 +46,7 @@ fn fixture(generated: usize, unanalyzable: bool) -> TestRepo {
                     format!(
                         "{TEMPLATE_DIR}/component_template_with_a_rather_long_file_name_{i}.{ext}"
                     ),
-                    "x\n",
+                    "Alpha Beta Gamma Delta\n",
                 );
             }
         }
