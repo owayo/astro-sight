@@ -11,7 +11,7 @@ slow-timeout = { period = "60s" }
 # 数万段の入れ子を解析するストレステスト。ほかのテストと違って CPU を長く使い、各コマンドに 300 秒の期限がある。
 # 最初に始めて最後まで残らないようにし、2 スレッド分を割り当てて CPU の取り合いを減らす
 [[profile.default.overrides]]
-filter = 'binary_id(astro-sight::integration) & test(=integration::deep_nesting::rust_impact_proofs_handle_deep_nesting)'
+filter = 'binary_id(astro-sight::integration) & (test(=integration::deep_nesting::rust_impact_proofs_handle_deep_nesting) | test(=integration::deep_nesting::rust_visibility_paths_handle_deep_nesting))'
 priority = 100
 threads-required = 2
 
