@@ -3,7 +3,7 @@
 use super::*;
 
 /// `pub use` の edge 1 本と、先頭が識別子の path (`UsePathOrigin::Bare`) の先頭の名前が
-/// use と同じスコープで何に束縛されるか。
+/// use と同じスコープで何に束縛されるか、および use 自身が条件なしか。
 ///
 /// 束縛は、ルート以外の module (ファイルの module か inline mod の body) に書かれた Bare の
 /// edge だけに付ける。ルートの module では 2015 (クレートルート起点) と 2018 以降 (現在の
@@ -13,6 +13,8 @@ use super::*;
 pub(crate) struct CollectedPubUseEdge {
     pub(crate) edge: RustPubUseEdge,
     pub(crate) bare_leading: Option<BareLeadingBinding>,
+    /// use 自身に条件や束縛を書き換え得る属性がない場合だけ glob を隠す根拠に使う。
+    pub(crate) unconditional: bool,
 }
 
 /// Bare な path の先頭の名前の、use と同じスコープでの束縛 (2018 以降の解決規則で読む)。
@@ -80,7 +82,11 @@ pub(crate) fn collect_pub_use_edges(
                 for edge in expanded {
                     let bare_leading =
                         bare_leading_binding(node, source, &current_module, &edge, &mut scopes);
-                    edges.push(CollectedPubUseEdge { edge, bare_leading });
+                    edges.push(CollectedPubUseEdge {
+                        edge,
+                        bare_leading,
+                        unconditional: item_attributes_are_plain(node, source),
+                    });
                 }
             }
             "mod_item" => {
@@ -359,6 +365,14 @@ fn attribute_is_plain(attribute: tree_sitter::Node<'_>, source: &[u8]) -> bool {
 /// proc macro かもしれない未知の属性) も付いていないか。inline mod は body の内部属性も見る
 /// (外部ファイルの module の内部属性は module tree の走査がそのファイルを読むときに見る)。
 pub(crate) fn mod_declaration_is_unconditional(item: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    item_attributes_are_plain(item, source)
+        && item
+            .child_by_field_name("body")
+            .is_none_or(|body| module_inner_attributes_are_plain(body, source))
+}
+
+/// 項目の直前の属性が条件や未知の属性でないか。
+pub(crate) fn item_attributes_are_plain(item: tree_sitter::Node<'_>, source: &[u8]) -> bool {
     let mut previous = item.prev_named_sibling();
     while let Some(sibling) = previous {
         match sibling.kind() {
@@ -369,8 +383,7 @@ pub(crate) fn mod_declaration_is_unconditional(item: tree_sitter::Node<'_>, sour
         }
         previous = sibling.prev_named_sibling();
     }
-    item.child_by_field_name("body")
-        .is_none_or(|body| module_inner_attributes_are_plain(body, source))
+    true
 }
 
 /// module の中身 (外部ファイルの `source_file` か inline mod の body) の内部属性

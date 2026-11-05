@@ -15,6 +15,12 @@ filter = 'binary_id(astro-sight::integration) & test(=integration::deep_nesting:
 priority = 100
 threads-required = 2
 
+# worktree と index の公開経路を複数の cfg 構成で確認する回帰を先に始める。
+[[profile.default.overrides]]
+filter = 'binary_id(astro-sight::integration) & test(=integration::rust_relative_reexport::review_rust_glob_module_shadow_requires_unconditional_binding)'
+priority = 50
+threads-required = 2
+
 # CI (NEXTEST_PROFILE=ci): 失敗しても残りのテストを最後まで流し、失敗の出力を最後にもまとめて出す
 [profile.ci]
 fail-fast = false

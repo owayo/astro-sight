@@ -140,12 +140,24 @@ pub(crate) fn collect_rust_pub_use_index(
     }
     let module_tree = collect_all_modules(source, dir, info)?;
     // edition は同じ source tree (base は base の snapshot) の manifest から決める。
-    let edges = resolve_bare_pub_use_edges(collected, &module_tree, || {
+    let collected = resolve_bare_pub_use_edges(collected, &module_tree, || {
         crate::engine::rust_edition::library_edition(&info.crate_root_rel, |manifest| {
             read_rust_manifest(source, dir, manifest)
         })
     })?;
-    let all_modules = module_tree.pub_children;
+    let unconditional_named_edges: std::collections::HashSet<_> = collected
+        .iter()
+        .enumerate()
+        .filter(|(_, collected)| {
+            collected.unconditional && matches!(collected.edge, RustPubUseEdge::Named { .. })
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let edges: Vec<_> = collected
+        .into_iter()
+        .map(|collected| collected.edge)
+        .collect();
+    let all_modules = &module_tree.pub_children;
     let mut named_by_target: std::collections::HashMap<RustExportKey, Vec<usize>> =
         std::collections::HashMap::new();
     let mut wildcard_by_target_module: std::collections::HashMap<Vec<String>, Vec<usize>> =
@@ -171,9 +183,13 @@ pub(crate) fn collect_rust_pub_use_index(
             }
         }
     }
-    let public_modules = pub_reachable_modules(&all_modules);
-    let reachable_modules =
-        compute_reexport_reachable_modules(&edges, &public_modules, &all_modules);
+    let public_modules = pub_reachable_modules(all_modules);
+    let reachable_modules = compute_reexport_reachable_modules(
+        &edges,
+        &public_modules,
+        &module_tree,
+        &unconditional_named_edges,
+    );
     Some(RustPubUseIndex {
         edges,
         reachable_modules,
@@ -202,7 +218,7 @@ fn resolve_bare_pub_use_edges(
     collected: Vec<CollectedPubUseEdge>,
     module_tree: &ModuleTree,
     edition: impl FnOnce() -> Option<crate::engine::rust_edition::RustEdition>,
-) -> Option<Vec<RustPubUseEdge>> {
+) -> Option<Vec<CollectedPubUseEdge>> {
     use crate::engine::rust_edition::RustEdition;
     let edition = if collected.iter().any(|edge| edge.bare_leading.is_some()) {
         edition()
@@ -211,47 +227,43 @@ fn resolve_bare_pub_use_edges(
     };
     collected
         .into_iter()
-        .map(
-            |CollectedPubUseEdge {
-                 mut edge,
-                 bare_leading,
-             }| {
-                let Some(binding) = bare_leading else {
-                    return Some(edge);
-                };
-                let (RustPubUseEdge::Named { source_module, .. }
-                | RustPubUseEdge::Wildcard { source_module, .. }) = &edge;
-                // module tree に無い module の use は、外から辿れる公開経路にならない。
-                if !module_tree.pub_children.contains_key(source_module) {
-                    return Some(edge);
-                }
-                match (binding, edition) {
-                    (_, Some(RustEdition::E2015)) | (BareLeadingBinding::Unbound, _) => {}
-                    (BareLeadingBinding::ChildModule, Some(RustEdition::E2018OrLater)) => {
-                        let mut child = source_module.clone();
-                        child.push(bare_leading_name(&edge)?.to_string());
-                        if !module_tree.is_unconditional(&child) {
-                            return None;
-                        }
-                        let (RustPubUseEdge::Named {
-                            source_module,
-                            target_module,
-                            ..
-                        }
-                        | RustPubUseEdge::Wildcard {
-                            source_module,
-                            target_module,
-                            ..
-                        }) = &mut edge;
-                        target_module.splice(0..0, source_module.iter().cloned());
-                    }
-                    (BareLeadingBinding::ChildModule | BareLeadingBinding::Unresolved, _) => {
+        .map(|mut collected| {
+            let Some(binding) = collected.bare_leading else {
+                return Some(collected);
+            };
+            let edge = &mut collected.edge;
+            let (RustPubUseEdge::Named { source_module, .. }
+            | RustPubUseEdge::Wildcard { source_module, .. }) = &edge;
+            // module tree に無い module の use は、外から辿れる公開経路にならない。
+            if !module_tree.pub_children.contains_key(source_module) {
+                return Some(collected);
+            }
+            match (binding, edition) {
+                (_, Some(RustEdition::E2015)) | (BareLeadingBinding::Unbound, _) => {}
+                (BareLeadingBinding::ChildModule, Some(RustEdition::E2018OrLater)) => {
+                    let mut child = source_module.clone();
+                    child.push(bare_leading_name(edge)?.to_string());
+                    if !module_tree.is_unconditional(&child) {
                         return None;
                     }
+                    let (RustPubUseEdge::Named {
+                        source_module,
+                        target_module,
+                        ..
+                    }
+                    | RustPubUseEdge::Wildcard {
+                        source_module,
+                        target_module,
+                        ..
+                    }) = edge;
+                    target_module.splice(0..0, source_module.iter().cloned());
                 }
-                Some(edge)
-            },
-        )
+                (BareLeadingBinding::ChildModule | BareLeadingBinding::Unresolved, _) => {
+                    return None;
+                }
+            }
+            Some(collected)
+        })
         .collect()
 }
 
@@ -268,7 +280,8 @@ fn resolve_bare_pub_use_edges(
 ///   **中身**を再エクスポートするので target が private module でも有効で (E0365 は module 自体を
 ///   名前として再エクスポートする場合の制限)、target の `declared_pub` は要求しない。
 ///   ただし **glob import は source namespace の同名 item に shadow される**ため、型名前空間を
-///   占める同名 item (子 module / module の named re-export) が source にあれば到達可能化しない。
+///   占める同名 item (子 module / module の named re-export) が条件なしに存在すると証明できた
+///   場合だけ到達可能化しない。
 ///   旧実装は Named 以外を `else { continue; }` で捨てていたため、
 ///   `mod internal; pub use internal::*;` 構成で **pub 子 module 配下**の公開 API 変更が無音に
 ///   なっていた (落ちるのは seed の module が wildcard の target と一致しない子 module 配下)。
@@ -278,8 +291,10 @@ fn resolve_bare_pub_use_edges(
 fn compute_reexport_reachable_modules(
     edges: &[RustPubUseEdge],
     public_modules: &std::collections::HashSet<Vec<String>>,
-    all_modules: &std::collections::HashMap<Vec<String>, Vec<String>>,
+    module_tree: &ModuleTree,
+    unconditional_named_edges: &std::collections::HashSet<usize>,
 ) -> std::collections::HashSet<Vec<String>> {
+    let all_modules = &module_tree.pub_children;
     let mut reachable = public_modules.clone();
     // glob shadow 判定用: Named re-export が source namespace へ持ち込む **module 名**。
     //
@@ -287,11 +302,12 @@ fn compute_reexport_reachable_modules(
     // 値名前空間なので共存でき、`pub use other::thing as api;` (thing は関数) は
     // glob 由来の module `api` を shadow しない。名前だけで shadow 扱いにすると、
     // 実際に公開されている `api::found` の削除を見逃す (false negative)。
-    // target が module だと証明できる (= `target_module + target_item` が実在 module) 場合
-    // だけ shadow とみなす。
+    // use と target module、その祖先が条件なしに存在すると証明できた場合だけ隠す。
     let named_module_reexports: std::collections::HashSet<(&Vec<String>, &String)> = edges
         .iter()
-        .filter_map(|e| match e {
+        .enumerate()
+        .filter(|(index, _)| unconditional_named_edges.contains(index))
+        .filter_map(|(_, e)| match e {
             RustPubUseEdge::Named {
                 source_module,
                 target_module,
@@ -301,9 +317,9 @@ fn compute_reexport_reachable_modules(
             } => {
                 let mut target_path = target_module.clone();
                 target_path.push(target_item.clone());
-                all_modules
-                    .contains_key(&target_path)
-                    .then_some((source_module, exported_name))
+                (module_tree.is_unconditional_path(source_module)
+                    && module_tree.is_unconditional_path(&target_path))
+                .then_some((source_module, exported_name))
             }
             RustPubUseEdge::Wildcard { .. } => None,
         })
@@ -347,8 +363,8 @@ fn compute_reexport_reachable_modules(
                     // **glob import は source namespace の明示 item / named import に shadow
                     // される**。glob が持ち込むのは module なので、shadow するのも
                     // **型名前空間を占める同名 item** に限る:
-                    // (a) 同名の子 module が source にある (private でも namespace を占める)、
-                    // (b) 同名を **module の** named re-export で持ち込んでいる。
+                    // (a) 条件なしの同名の子 module が source にある (private でも占める)、
+                    // (b) 同名を条件なしの **module の** named re-export で持ち込んでいる。
                     // 関数などの値名前空間の同名 re-export は共存するので shadow しない。
                     //
                     // 検出できるのはこの 2 つの signal まで。型名前空間の非 module item
@@ -358,7 +374,7 @@ fn compute_reexport_reachable_modules(
                     // (= 修正前と同じ) 到達可能扱いに倒れる。
                     let mut shadow_probe = source_module.clone();
                     shadow_probe.push(child.clone());
-                    if all_modules.contains_key(&shadow_probe)
+                    if module_tree.is_unconditional_path(&shadow_probe)
                         || named_module_reexports.contains(&(source_module, child))
                     {
                         continue;
@@ -476,6 +492,11 @@ pub(crate) struct ModuleTree {
 impl ModuleTree {
     fn is_unconditional(&self, module: &[String]) -> bool {
         self.unconditional.get(module) == Some(&true)
+    }
+
+    /// 祖先の条件で消える module も、必ずある束縛とはみなさない。
+    fn is_unconditional_path(&self, module: &[String]) -> bool {
+        (0..=module.len()).all(|depth| self.is_unconditional(&module[..depth]))
     }
 }
 
@@ -1007,7 +1028,11 @@ mod tests {
                 for edge in expanded {
                     let bare_leading =
                         bare_leading_binding(node, source, current_module, &edge, scopes);
-                    edges.push(CollectedPubUseEdge { edge, bare_leading });
+                    edges.push(CollectedPubUseEdge {
+                        edge,
+                        bare_leading,
+                        unconditional: item_attributes_are_plain(node, source),
+                    });
                 }
             }
             "mod_item" => {
