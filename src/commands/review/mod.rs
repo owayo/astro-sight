@@ -564,6 +564,7 @@ fn keep_reference_based_downgrades_blocking(api: &mut ApiChanges) {
     let compatible = std::mem::take(&mut api.compatible_modified);
     api.modified
         .extend(compatible.into_iter().map(|change| ApiSymbolChange {
+            unverified: None,
             name: change.name,
             kind: change.kind,
             file: change.file,
@@ -577,6 +578,11 @@ fn keep_reference_based_downgrades_blocking(api: &mut ApiChanges) {
     let unresolved = std::mem::take(&mut api.removed_unresolved);
     api.removed
         .extend(unresolved.into_iter().map(|removal| removal.symbol));
+    // 未ステージの参照から得た理由・位置を index の証拠として残さない。
+    for change in &mut api.modified {
+        change.unverified = None;
+    }
+    super::api_changes::fill_modification_diagnostics(&mut api.modified);
 }
 
 #[cfg(test)]
@@ -859,6 +865,7 @@ mod snapshot_tests {
             refs_internal: 0,
         };
         let change = |name: &str| ApiSymbolChange {
+            unverified: None,
             name: name.into(),
             kind: "function".into(),
             file: "a.ts".into(),
@@ -898,7 +905,29 @@ mod snapshot_tests {
             const_value_changes: vec![change("value")],
             ..ApiChanges::default()
         };
+        api.modified[0].kind = "trait".to_owned();
+        api.modified[0].unverified = Some(crate::models::review::ApiModificationUnverified {
+            reason: crate::models::review::ApiModificationUnverifiedReason::TypeMemberProofFailed,
+            first_unproven: Some(crate::models::review::ApiUnprovenSite {
+                file: "unstaged.ts".to_owned(),
+                line: 42,
+                symbol: Some("workingTreeOnly".to_owned()),
+            }),
+        });
         keep_reference_based_downgrades_blocking(&mut api);
+        assert_eq!(
+            api.modified[0].unverified.as_ref().unwrap().reason,
+            crate::models::review::ApiModificationUnverifiedReason::CompatibilityUnverified
+        );
+        assert!(
+            api.modified[0]
+                .unverified
+                .as_ref()
+                .unwrap()
+                .first_unproven
+                .is_none()
+        );
+
         let names =
             |items: &[ApiSymbolChange]| items.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
         assert_eq!(names(&api.modified), ["modified", "closed", "compatible"]);

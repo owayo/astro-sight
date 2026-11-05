@@ -1,6 +1,7 @@
 //! 追加 / 削除 / 変更されたファイルごとの API 差分分類。
 
 use super::*;
+use crate::models::review::{ApiModificationUnverified, ApiModificationUnverifiedReason};
 
 /// 内部用: reconcile のために signature を保持する一時構造。
 #[derive(Debug, Clone)]
@@ -130,6 +131,7 @@ fn collect_python_contract_changes(
             parsed.new_source,
         ) {
             state.buckets.modified.push(ApiSymbolChange {
+                unverified: None,
                 name: change.name,
                 kind: "type".to_string(),
                 file: df.new_path.clone(),
@@ -204,6 +206,7 @@ fn collect_python_typed_dict_field_changes(
             class_name,
         ) {
             state.buckets.modified.push(ApiSymbolChange {
+                unverified: None,
                 name: change.name,
                 kind: "field".to_string(),
                 file: df.new_path.clone(),
@@ -474,6 +477,7 @@ fn collect_removed_symbols(
                     // 読み込み・解析に失敗した場合も、同名だけで変化を相殺しない。
                     if signatures.as_ref().is_none_or(|map| map.contains_key(name)) {
                         state.buckets.modified.push(ApiSymbolChange {
+                            unverified: None,
                             name: name.clone(),
                             kind: kind.clone(),
                             file: df.new_path.clone(),
@@ -645,6 +649,7 @@ fn collect_modified_symbols(
                 }
             };
             let change = ApiSymbolChange {
+                unverified: None,
                 name: name.clone(),
                 kind: kind.clone(),
                 file: df.new_path.clone(),
@@ -873,6 +878,7 @@ impl<'a> ChangedSignatureFiles<'a> {
             ..
         } = inputs;
         let change = ApiSymbolChange {
+            unverified: None,
             name: name.to_owned(),
             kind: kind.to_owned(),
             file: self.new_path.to_owned(),
@@ -1062,6 +1068,7 @@ enum SignatureDecision {
     CallbackBodyOnly,
     /// blocking な api.mod。型契約の種別を確定できたときだけ添える。
     Blocking(Option<crate::models::review::ApiContractChange>),
+    Unverified(ApiModificationUnverified),
 }
 
 impl SignatureDecision {
@@ -1364,6 +1371,9 @@ fn closure_or_blocking_decision(
     public_name_differs: bool,
     moved_from: Option<&str>,
 ) -> SignatureDecision {
+    caches
+        .type_member_unproven_sites
+        .remove(&(site.new_path.to_owned(), site.name.to_owned()));
     if !public_name_differs
         && moved_from.is_none()
         && let Some(closed) = super::python_optional_removal::prove_removal(
@@ -1391,7 +1401,10 @@ fn closure_or_blocking_decision(
         return if closed {
             SignatureDecision::ClosedInDiff
         } else {
-            SignatureDecision::Blocking(None)
+            SignatureDecision::Unverified(ApiModificationUnverified {
+                reason: ApiModificationUnverifiedReason::LiteralUnionProofFailed,
+                first_unproven: None,
+            })
         };
     }
     let removed_props = match super::ts_signature::removed_parameter_props(site, sources) {
@@ -1430,7 +1443,10 @@ fn closure_or_blocking_decision(
         required_members,
         super::ts_required_members::RequiredMemberChange::Unsupported
     ) {
-        return SignatureDecision::Blocking(None);
+        return SignatureDecision::Unverified(ApiModificationUnverified {
+            reason: ApiModificationUnverifiedReason::UnsupportedTypeChange,
+            first_unproven: None,
+        });
     }
     let arg_evidence = if !removed_props.is_empty() {
         super::ref_index::ClosureArgEvidence::TsRemovedProps(&removed_props)
@@ -1506,6 +1522,28 @@ fn closure_or_blocking_decision(
         SignatureDecision::ClosedInDiff
     } else if detect_callback_body_only_change(site, sources) {
         SignatureDecision::CallbackBodyOnly
+    } else if matches!(
+        required_members,
+        super::ts_required_members::RequiredMemberChange::Supported(_)
+    ) {
+        SignatureDecision::Unverified(ApiModificationUnverified {
+            reason: ApiModificationUnverifiedReason::TypeMemberProofFailed,
+            first_unproven: caches
+                .type_member_unproven_sites
+                .remove(&(site.new_path.to_owned(), site.name.to_owned())),
+        })
+    } else if site
+        .lang_in(&[
+            crate::language::LangId::Typescript,
+            crate::language::LangId::Tsx,
+        ])
+        .is_some()
+        && matches!(site.kind, "type" | "trait" | "interface")
+    {
+        SignatureDecision::Unverified(ApiModificationUnverified {
+            reason: ApiModificationUnverifiedReason::UnsupportedTypeChange,
+            first_unproven: None,
+        })
     } else {
         SignatureDecision::Blocking(None)
     }
@@ -1560,20 +1598,31 @@ fn record_signature_decision(
                 });
         }
         SignatureDecision::Blocking(contract) => {
-            if let Some(contract) = contract {
-                change.contract_change = Some(contract);
-            }
-            // blocking な api.mod にだけ「解決できた呼び出し参照ゼロ」フラグを添える。
-            // 分類も blocking 判定も変えず、トリアージが「呼び出し側を探す」段階を省けるようにする。
-            change.no_resolved_internal_callers = has_no_resolved_internal_callers(
-                inputs.ref_index,
-                inputs.dir,
-                &change.name,
-                state.closure_caches,
-            );
-            buckets.modified.push(change);
+            record_blocking_modification(inputs, state, change, contract);
+        }
+        SignatureDecision::Unverified(diagnostic) => {
+            change.unverified = Some(diagnostic);
+            record_blocking_modification(inputs, state, change, None);
         }
     }
+}
+
+fn record_blocking_modification(
+    inputs: &DetectionInputs<'_>,
+    state: &mut DetectionState<'_>,
+    mut change: ApiSymbolChange,
+    contract: Option<crate::models::review::ApiContractChange>,
+) {
+    if let Some(contract) = contract {
+        change.contract_change = Some(contract);
+    }
+    change.no_resolved_internal_callers = has_no_resolved_internal_callers(
+        inputs.ref_index,
+        inputs.dir,
+        &change.name,
+        state.closure_caches,
+    );
+    state.buckets.modified.push(change);
 }
 
 /// Python の root-level スクリプト (package 外の単体スクリプト、例: `build_font.py`) の削除/変更

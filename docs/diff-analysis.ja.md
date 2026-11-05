@@ -388,6 +388,25 @@ astro-sight review --dir . --git \
 
 `context` の影響分析に加えて、`cochange` による変更漏れ候補、公開 API 差分、死蔵シンボルを 1 回の実行でまとめて返す。PR レビューや pre-merge チェック向け。
 
+### TypeScript の互換性が未証明の変更
+
+blocking に残る TS / TSX の `api_changes.modified` と hook の `api.mod` は、`unverified` を持つ。分類・blocking・終了コードは変えず、型検査で非互換だと断定するものではない。
+
+| `unverified.reason` | 意味 |
+|---|---|
+| `unsupported_type_change` | この入力の型変更に適用できる専用の証明を選べなかった (文字列 union の値追加など) |
+| `type_member_proof_failed` | 型メンバー変更の証明を選んだが、参照・値・利用のすべてを証明できなかった |
+| `literal_union_proof_failed` | union 要素削除の証明を選んだが、残る値・利用の証明を完了できなかった |
+| `compatibility_unverified` | その他の変更で互換・追随の証明を完了できなかった。staged の参照証拠を使えない場合も含む |
+
+型メンバーの証明が直接の型参照で止まった場合は、`first_unproven` に変更後ソースの `file`・0始まりの `line` と、AST で確認できた `symbol` を付ける。位置を確定できない保留では省略する。スナップショットを作れず未ステージの参照を使う縮退時は、その位置を残さず `compatibility_unverified` にする。表示された位置は証明を止めた箇所であり、型エラーが確定した箇所とは限らない。
+
+```json
+{"n":"Item","f":"src/item.ts","unverified":{"reason":"type_member_proof_failed","first_unproven":{"file":"src/make.ts","line":4,"symbol":"makeDraft"}}}
+```
+
+たとえば値の `as Item` も証明の対象外なので、型検査が通るコードでも同じ理由になり得る。位置のコードを確認し、必要に応じて TypeScript の型検査で判断する。互換・追随を確認できたエントリは引き続き情報提供のバケットへ入り、この項目を付けない。
+
 ### TypeScript のシグネチャが参照する型
 
 `review` は、明示された公開契約が参照する、同じファイルの非公開型宣言をたどる。`type Label = string` から `number` への変更や、非公開 interface のメンバー型の変更は、その型に依存する export 済みの関数・クラス・型注釈付き変数を `api_changes.modified`（hook では `api.mod`）に出す。公開宣言のヘッダに変更行が無くても対象にする。参照先は通常の影響解析で調べ、言語・import の所属・別名・除外の規則を共用する。staged review も index のスナップショットから同じ判定を行う。

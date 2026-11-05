@@ -493,6 +493,7 @@ pub(crate) fn detect_api_changes_with_renames(
         .collect();
 
     let type_dependency_symbols = type_dependency_symbols::collect(&inputs, &buckets.modified);
+    fill_modification_diagnostics(&mut buckets.modified);
     ApiChanges {
         type_dependency_symbols,
         unresolved_modified_callers: closure_caches.unresolved_modified_callers,
@@ -728,6 +729,28 @@ pub(crate) fn reconcile_with_moves(
         .collect();
 
     (kept_added, kept_removed, moved, ambiguous_relation_keys)
+}
+
+/// 確定した blocking エントリだけに、証明が未完了であることを補足する。
+pub(crate) fn fill_modification_diagnostics(changes: &mut [ApiSymbolChange]) {
+    for change in changes {
+        if change.unverified.is_none()
+            && crate::language::LangId::from_path(camino::Utf8Path::new(&change.file)).is_ok_and(
+                |lang| {
+                    matches!(
+                        lang,
+                        crate::language::LangId::Typescript | crate::language::LangId::Tsx
+                    )
+                },
+            )
+        {
+            change.unverified = Some(crate::models::review::ApiModificationUnverified {
+                reason:
+                    crate::models::review::ApiModificationUnverifiedReason::CompatibilityUnverified,
+                first_unproven: None,
+            });
+        }
+    }
 }
 
 pub(crate) mod diff_processing;

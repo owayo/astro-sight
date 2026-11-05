@@ -110,6 +110,8 @@ struct HookModifiedSymbol<'a> {
     /// 既存 consumer の JSON パースは壊れない。分類できない変更では省略される。
     #[serde(rename = "contract", skip_serializing_if = "Option::is_none")]
     contract_change: Option<crate::models::review::ApiContractChange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unverified: Option<&'a crate::models::review::ApiModificationUnverified>,
 }
 
 /// dead シンボル用 DTO。`HookNameFile` と分けるのは、宣言行を持つのが
@@ -346,6 +348,7 @@ impl<'a> HookApi<'a> {
                     f: change.file.as_str(),
                     no_resolved_internal_callers: change.no_resolved_internal_callers,
                     contract_change: change.contract_change,
+                    unverified: change.unverified.as_ref(),
                 })
                 .collect(),
             modified_closed_in_diff: api
