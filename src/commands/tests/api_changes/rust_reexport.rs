@@ -2710,7 +2710,7 @@ fn detect_api_changes_relative_pub_use_through_named_import_gives_up_suppression
     }
 }
 
-/// 先頭が `::` の path と、スコープに束縛の無い名前 (extern crate の名前) は付け替えない。
+/// 外部の Global path はローカルのグラフから外し、Bare の extern 名は子 module に付け替えない。
 #[test]
 fn relative_pub_use_rebase_skips_global_paths_and_extern_crate_names() {
     let dir = relative_reexport_repo(
@@ -2728,7 +2728,6 @@ fn relative_pub_use_rebase_skips_global_paths_and_extern_crate_names() {
     assert_eq!(
         reexport_edges(RustSourceTree::Worktree, dir.path(), "src/reader/value.rs"),
         Some(vec![
-            "reader::NewValue -> value::NewValue".to_string(),
             "reader::Serialize -> serde::Serialize".to_string(),
             "reader::Again -> reader::value::NewValue".to_string(),
         ])

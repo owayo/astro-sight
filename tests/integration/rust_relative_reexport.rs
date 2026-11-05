@@ -4,6 +4,93 @@
 use super::support::*;
 
 #[test]
+fn review_rust_global_reexport_distinguishes_external_and_local_crates() {
+    for (edition, root, reexport, exposed) in [
+        ("2021", "mod dep { pub mod api {} }", "::dep::api", true),
+        (
+            "2021",
+            "mod dep { pub mod api {} }",
+            "crate::dep::api",
+            false,
+        ),
+        ("2015", "mod dep { pub mod api {} }", "::dep::api", false),
+        (
+            "2021",
+            "extern crate self as dep; pub mod api {}",
+            "::dep::api",
+            false,
+        ),
+        (
+            "2021",
+            "extern crate self as r#dep; pub mod api {}",
+            "::r#dep::api",
+            false,
+        ),
+    ] {
+        let repo = TestRepo::new();
+        repo.create_dir_all("src/internal");
+        repo.create_dir_all("dep/src");
+        repo.write("Cargo.toml", format!("[package]\nname = \"global\"\nversion = \"0.1.0\"\nedition = \"{edition}\"\n[dependencies]\ndep = {{ path = \"dep\" }}\n"));
+        repo.write(
+            "dep/Cargo.toml",
+            "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        repo.write("dep/src/lib.rs", "pub fn api() -> u32 { 7 }\n");
+        repo.write(
+            "src/lib.rs",
+            format!("{root}\nmod internal;\npub mod facade;\n"),
+        );
+        repo.write("src/internal.rs", "pub mod api;\n");
+        repo.write("src/internal/api.rs", "pub fn found() -> u32 { 1 }\n");
+        repo.write(
+            "src/facade.rs",
+            format!("pub use {reexport};\npub use crate::internal::*;\n"),
+        );
+        repo.init_git();
+        repo.commit_all("initial");
+        repo.write(
+            "src/internal/api.rs",
+            "pub fn found(scale: u32) -> u32 { scale }\n",
+        );
+        for staged in [false, true] {
+            let mut args = vec!["--git"];
+            if staged {
+                repo.stage_all();
+                args.push("--staged");
+                if root.starts_with("extern crate self") {
+                    repo.write(
+                        "src/lib.rs",
+                        "mod dep { pub mod api {} }\nmod internal;\npub mod facade;\n",
+                    );
+                }
+            }
+            let review = repo.run_json("review", &args);
+            let found = review["api_changes"]["modified"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|change| change["name"] == "found");
+            assert_eq!(
+                found, exposed,
+                "{edition} / {root} / {reexport} / staged={staged}: {review}"
+            );
+            if exposed && staged {
+                let hook = cargo_bin()
+                    .args(["review", "--git", "--staged", "--hook", "--dir"])
+                    .arg(repo.root())
+                    .output()
+                    .unwrap();
+                assert!(!hook.status.success(), "{hook:?}");
+                assert!(
+                    String::from_utf8_lossy(&hook.stderr).contains("api.mod"),
+                    "{hook:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn review_rust_glob_module_shadow_requires_unconditional_binding() {
     for (facade, child, exposed) in [
         ("pub use crate::internal::*;", "", true),
