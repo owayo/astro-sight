@@ -167,20 +167,28 @@ fn resolve_visibility_path(path: &[String], module: &[String]) -> Option<Vec<Str
 }
 
 fn visibility_path(node: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
-    match node.kind() {
-        "identifier" => {
-            let name = node.utf8_text(source).ok()?;
-            let name = name.strip_prefix("r#").unwrap_or(name);
-            (!matches!(name, "crate" | "self" | "super" | "Self")).then(|| vec![name.to_owned()])
+    let mut path = Vec::new();
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "identifier" => {
+                let name = node.utf8_text(source).ok()?;
+                let name = name.strip_prefix("r#").unwrap_or(name);
+                if matches!(name, "crate" | "self" | "super" | "Self") {
+                    return None;
+                }
+                path.push(name.to_owned());
+            }
+            "crate" | "self" | "super" => path.push(node.utf8_text(source).ok()?.to_owned()),
+            "scoped_identifier" => {
+                // LIFO なので path を先に処理し、元の左から右の順序を保つ。
+                pending.push(node.child_by_field_name("name")?);
+                pending.push(node.child_by_field_name("path")?);
+            }
+            _ => return None,
         }
-        "crate" | "self" | "super" => Some(vec![node.utf8_text(source).ok()?.to_owned()]),
-        "scoped_identifier" => {
-            let mut path = visibility_path(node.child_by_field_name("path")?, source)?;
-            path.extend(visibility_path(node.child_by_field_name("name")?, source)?);
-            Some(path)
-        }
-        _ => None,
     }
+    Some(path)
 }
 
 /// 宣言自身の可視性修飾子 (宣言の直接の子)。フィールドやメソッドの修飾子は含まない。
@@ -557,6 +565,38 @@ pub(super) fn has_non_parent_glob(source: &[u8]) -> bool {
 #[cfg(test)]
 mod explicit_tests {
     use super::*;
+
+    #[test]
+    fn visibility_paths_preserve_short_segments_and_reject_unknown_shapes() {
+        for (input, expected) in [
+            ("crate", Some(vec!["crate"])),
+            ("self", Some(vec!["self"])),
+            ("super::b", Some(vec!["super", "b"])),
+            ("super::super::a", Some(vec!["super", "super", "a"])),
+            ("crate::a::r#mod", Some(vec!["crate", "a", "mod"])),
+            ("crate::missing", Some(vec!["crate", "missing"])),
+            ("::crate::a", None),
+            ("Self", None),
+            ("r#self", None),
+        ] {
+            let source = format!("pub(in {input}) fn f() {{}}");
+            let tree = parser::parse_source(source.as_bytes(), LangId::Rust).unwrap();
+            let root = tree.root_node();
+            let item = root.named_child(0).expect("declaration");
+            let modifier = visibility_modifier(item).expect("visibility");
+            let node = modifier.named_child(0).expect("path");
+            let expected = expected.map(|parts| parts.into_iter().map(str::to_owned).collect());
+            assert_eq!(
+                visibility_path(node, source.as_bytes()),
+                expected,
+                "{input}"
+            );
+            assert!(
+                visibility_path(item, source.as_bytes()).is_none(),
+                "{input}"
+            );
+        }
+    }
 
     #[test]
     fn explicit_visibility_grammar_nodes_and_fields_exist() {

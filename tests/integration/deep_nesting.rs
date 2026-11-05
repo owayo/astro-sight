@@ -613,6 +613,56 @@ fn rust_impact_proofs_handle_deep_nesting() {
     );
 }
 
+/// 非実在の可視範囲も構文として解析し、証明できない呼び出しは blocking に残す。
+#[test]
+fn rust_visibility_paths_handle_deep_nesting() {
+    let visibility = format!("crate{}", "::m".repeat(40_000));
+    let repo = rust_impact_repo(
+        "fn f() {}\n",
+        &format!("pub(in {visibility}) fn f() {{}}\n"),
+        "pub fn g() {\n    crate::a::f();\n}\n",
+    );
+    assert_eq!(
+        rust_context_callers("deep visibility context", &repo),
+        callers(&[("impacted_callers", &[("src/c.rs", 1)])]),
+    );
+    let mut command = cargo_bin();
+    command.args(["impact", "--git", "--dir"]).arg(repo.root());
+    let output = run_bounded(command, None);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "deep visibility impact: {stderr}"
+    );
+    assert!(stderr.contains("→ src/c.rs:2 [f]"), "{stderr}");
+
+    let mut command = cargo_bin();
+    command
+        .args(["review", "--git", "--hook", "--dir"])
+        .arg(repo.root());
+    let output = run_bounded(command, None);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "deep visibility review: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stderr).expect("hook JSON");
+    assert!(
+        json["impacts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|impact| impact["refs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|reference| reference["p"] == "src/c.rs" && reference["ln"] == 1)),
+        "{json}"
+    );
+}
+
 /// session は深い入力の要求の後も、同じ接続で後続の要求を処理する。
 #[test]
 fn session_keeps_serving_after_deep_inputs() {
