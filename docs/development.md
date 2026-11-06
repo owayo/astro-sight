@@ -85,6 +85,8 @@ Use `--mode session` for request times inside one persistent process per case, o
 
 Keep generated inputs outside the repository so they do not become extra sources for reference and API analyses. Record the source revision, dependency versions, toolchain, build command, machine load, and whether the file cache was warm with the results. Compare large improvements against the full range of samples; small differences can be scheduler noise. Rust closure binding and usage-role checks still have separate ancestor walks, so these measurements do not establish linear time for every Rust reference query.
 
+`--suite escapes` compares `refs --name` and `refs --names` on 240 Rust files that contain a format macro name and escapes (`\x`, `\u{...}`) but not the searched name, against a control without those markers. It measures the files the prefilter treats specially because implicit format captures can be spelled with escapes. Results are in [the measurement record](benchmarks/2026-11-06-refs-escapes/README.md).
+
 ## Symbol Extraction Performance
 
 Use the same harness with `--suite symbols` to compare enclosing-type assignment on files with 1,000, 4,000, and 16,000 classes, each with one method. Controls cover functions without classes, a real Rust source file, and mixed-language fixtures. The fixture directory runs only in CLI mode; session mode measures single-file requests. CLI requests use `--no-cache` so the persistent result cache cannot bypass extraction. Session requests bypass that cache layer. Both modes verify identical stdout on every run and save time and peak-working-set samples.

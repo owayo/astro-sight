@@ -82,3 +82,96 @@ fn rust_format_captures_preserve_original_unicode_crlf_positions() {
         assert_eq!(references[0]["col"], col);
     }
 }
+
+/// 行継続 (`\` と改行と続く空白) をはさんで綴った暗黙キャプチャを、名前の生の綴りが無い
+/// ファイルでも参照として数える (Issue #248)。refs の単一名・一括、dead-code、context の
+/// 呼び出し元がそろい、位置は元のソースの名前の先頭を指す。
+#[test]
+fn rust_format_captures_decode_line_continuations_without_raw_prefilter_hits() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"continued\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write(
+        "src/lib.rs",
+        "pub mod api;\npub mod caller;\npub mod caller_crlf;\n",
+    );
+    repo.write(
+        "src/api.rs",
+        "pub const TOKEN: u32 = 7;\npub const WIDTH: usize = 4;\n",
+    );
+    repo.write(
+        "src/caller.rs",
+        "use crate::api::*;\npub fn render() -> String {\n    format!(\"{TO\\\n        KEN:>WI\\\n    DTH$}\")\n}\n",
+    );
+    repo.write(
+        "src/caller_crlf.rs",
+        "use crate::api::*;\r\npub fn render_crlf() -> String {\r\n    format!(\"{\\x54O\\\r\n\tKEN}\")\r\n}\r\n",
+    );
+    for (name, expected) in [
+        (
+            "TOKEN",
+            vec![("src/caller.rs", 2, 14), ("src/caller_crlf.rs", 2, 14)],
+        ),
+        ("WIDTH", vec![("src/caller.rs", 3, 13)]),
+    ] {
+        let single = repo.run_json("refs", &["--name", name]);
+        let references: Vec<_> = single["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["kind"] == "ref")
+            .map(|r| {
+                (
+                    r["path"].as_str().unwrap().to_string(),
+                    r["ln"].as_u64().unwrap(),
+                    r["col"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        let expected: Vec<_> = expected
+            .into_iter()
+            .map(|(path, ln, col)| (path.to_string(), ln, col))
+            .collect();
+        assert_eq!(references, expected, "{name}: {single}");
+        let batch = repo.run_json("refs", &["--names", name]);
+        assert_eq!(batch["refs"], single["refs"], "{name}");
+    }
+    let dead = repo.run_json("dead-code", &[]);
+    assert!(
+        dead["dead_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["name"] != "TOKEN" && s["name"] != "WIDTH"),
+        "{dead}"
+    );
+
+    repo.init_git();
+    repo.commit_all("base");
+    repo.write(
+        "src/api.rs",
+        "pub const TOKEN: u64 = 7;\npub const WIDTH: usize = 4;\n",
+    );
+    let context = repo.run_json("context", &["--git"]);
+    let callers: Vec<_> = context["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|change| {
+            change["impacted_callers"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .map(|caller| caller["path"].as_str().unwrap().to_string())
+        .collect();
+    for path in ["src/caller.rs", "src/caller_crlf.rs"] {
+        assert!(
+            callers.iter().any(|caller| caller == path),
+            "{path}: {context}"
+        );
+    }
+}

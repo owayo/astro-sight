@@ -193,3 +193,114 @@ fn rust_format_capture_keeps_closure_shadowing_exclusion() {
         [1]
     );
 }
+
+/// 行継続 (`\` と改行と続く空白) をはさんだ名前も、キャプチャとして取り出す。
+#[test]
+fn rust_format_capture_decodes_line_continuations() {
+    let source = "fn run() {\n    format!(\"{TO\\\n        KEN}\");\n    format!(\"{TO\\\r\n\tKEN:wid\\\n   th$}\");\n}\n";
+    assert_eq!(capture_names(source), ["TOKEN", "TOKEN", "width"]);
+}
+
+/// 復号した写しは、キャプチャの抽出と同じ規則でエスケープを読む。
+/// 不正なエスケープでは打ち切らず、`\` を残して続ける。
+#[test]
+fn rust_format_decode_escapes_follows_literal_rules() {
+    use crate::engine::refs::definition::rust_format::decode_escapes;
+    for (source, expected) in [
+        (r#"{\x54OKEN}"#, "{TOKEN}"),
+        (r#"{\u{54}OK\u{0_045}N}"#, "{TOKEN}"),
+        ("{TO\\\n        KEN}", "{TOKEN}"),
+        ("{TO\\\r\n\t KEN}", "{TOKEN}"),
+        (r#"\n\r\t\0\\\'\""#, "\n\r\t\0\\'\""),
+        // `\\` の後ろはエスケープにしない。
+        (r#"{\\x54OKEN}"#, r#"{\x54OKEN}"#),
+        // 不正なエスケープ・範囲外の値・閉じない波括弧はそのまま残して続ける。
+        (
+            r#"\q\x80\x7\u{D800}\u{110000}\u{41"#,
+            r#"\q\x80\x7\u{D800}\u{110000}\u{41"#,
+        ),
+        (r#"\d+ \x41"#, r#"\d+ A"#),
+        ("tail\\", "tail\\"),
+        ("名前\\u{524d}", "名前前"),
+    ] {
+        assert_eq!(
+            String::from_utf8(decode_escapes(source.as_bytes())).unwrap(),
+            expected,
+            "{source:?}"
+        );
+    }
+}
+
+/// 事前フィルタは、生のソースに無い名前を、エスケープを復号した写しでだけ見つける。
+/// 印が揃っても綴りの無い名前は出現なしのままで、全件解析に回さない。
+#[test]
+fn rust_format_prefilter_searches_decoded_view_only_for_missing_names() {
+    let names = vec!["TOKEN".to_string(), "OTHER".to_string(), "Seen".to_string()];
+    let acs = build_batch_acs(&names).unwrap();
+    let present = |source: &str| {
+        let mut found: Vec<usize> = ac_present_indices_multi(&acs, source.as_bytes(), names.len())
+            .into_iter()
+            .collect();
+        found.sort_unstable();
+        found
+    };
+    // 行継続だけで綴った名前 (修正前は印にならず見落としていた)。
+    assert_eq!(present("format!(\"{TO\\\n    KEN}\");"), [0]);
+    assert_eq!(present("format!(\"{TO\\\r\n    KEN}\");"), [0]);
+    assert_eq!(present("format!(\"{\\x54OKEN} {\\u{53}een}\");"), [0, 2]);
+    // 印が揃っても綴りが無ければ出現なし (修正前は全部の名前を出現ありとしていた)。
+    assert!(present("format!(\"\\x41 {value}\"); // \\\n").is_empty());
+    // `\\` で始まる綴りは名前にならない。生のソースでの一致は従来どおり。
+    assert!(present("format!(\"{\\\\x54OKEN}\");").is_empty());
+    assert_eq!(present("let seen = TOKEN; format!(\"\\x41\");"), [0, 2]);
+    // 書式マクロの印が無いファイルは復号しない (生のソースだけで判定する)。
+    assert!(present("let s = \"{TO\\\n    KEN}\";").is_empty());
+
+    // リテラルの外のバックスラッシュ・未完のエスケープ・raw / byte 文字列の後でも、
+    // 続くリテラルの本文は先頭から復号される。
+    let noisy = concat!(
+        "// C:\\path \\u{ \\x\n",
+        "let c = '\\\\'; let r = r\"\\\"; let b = b\"\\x80\\\\\";\n",
+        "let u = \"\\u{41\"; format!(\"{TO\\\n    KEN}\");\n",
+    );
+    assert_eq!(present(noisy), [0]);
+
+    let ac = build_ac_case_insensitive(&names).unwrap();
+    let mut single: Vec<usize> =
+        ac_present_indices(&ac, b"println!(\"{TO\\\n KEN}\");", names.len())
+            .into_iter()
+            .collect();
+    single.sort_unstable();
+    assert_eq!(single, [0]);
+}
+
+/// 読み込みに失敗したファイルのストリーム走査は、行継続も印として扱い、2 種類の印が
+/// 離れたチャンクにどちらの順で現れても、全部の名前を参照しうるとする。
+#[test]
+fn rust_format_stream_scan_keeps_continuation_markers_across_chunks() {
+    let names = vec!["TOKEN".to_string(), "OTHER".to_string()];
+    let acs = build_batch_acs(&names).unwrap();
+    let padding = " ".repeat(40);
+    for source in [
+        "format!(\"{TO\\\n    KEN}\");".to_string(),
+        format!("format!(\"x\");{padding}let s = \"a\\\n b\";"),
+        format!("let s = \"a\\\r\n b\";{padding}println!(\"x\");"),
+    ] {
+        for chunk in 1..=16 {
+            assert_eq!(
+                stream_present_indices_from(&acs, &names, source.as_bytes(), chunk, u64::MAX),
+                Some(vec![0, 1]),
+                "chunk={chunk}: {source:?}"
+            );
+        }
+    }
+    // 対照: 書式マクロの印が無ければ、行継続があっても生のソースの一致だけ。
+    let plain = format!("let s = \"a\\\n b\";{padding}let t = TOKEN;");
+    for chunk in 1..=16 {
+        assert_eq!(
+            stream_present_indices_from(&acs, &names, plain.as_bytes(), chunk, u64::MAX),
+            Some(vec![0]),
+            "chunk={chunk}"
+        );
+    }
+}

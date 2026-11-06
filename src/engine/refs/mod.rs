@@ -121,39 +121,55 @@ fn ac_present_indices(
     source: &[u8],
     num_names: usize,
 ) -> std::collections::HashSet<usize> {
-    if definition::rust_format::may_have_escaped_capture(source) {
-        return (0..num_names).collect();
-    }
-    let mut present_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for mat in ac.find_overlapping_iter(source) {
-        present_indices.insert(mat.pattern().as_usize());
-        if present_indices.len() == num_names {
-            break;
-        }
-    }
-    present_indices
+    present_indices_with_escapes(std::iter::once((0, ac)), source, num_names)
 }
 
 /// `build_batch_acs` が返す AC 群での事前フィルタ。パターン index は各 AC のオフセットを
 /// 加算してグローバル index (symbol_names 上の位置) に揃える。全名出現で早期打ち切り。
+///
+/// 書式マクロの暗黙キャプチャはエスケープで綴れる (`"{\x54OKEN}"`) ので、生のソースで
+/// 見つからない名前は、エスケープを復号した写しでも探す (印が揃うファイルだけ)。
 fn ac_present_indices_multi(
     acs: &[(usize, aho_corasick::AhoCorasick)],
     source: &[u8],
     num_names: usize,
 ) -> std::collections::HashSet<usize> {
-    if definition::rust_format::may_have_escaped_capture(source) {
-        return (0..num_names).collect();
-    }
+    present_indices_with_escapes(
+        acs.iter().map(|(offset, ac)| (*offset, ac)),
+        source,
+        num_names,
+    )
+}
+
+fn present_indices_with_escapes<'a>(
+    acs: impl Iterator<Item = (usize, &'a aho_corasick::AhoCorasick)> + Clone,
+    source: &[u8],
+    num_names: usize,
+) -> std::collections::HashSet<usize> {
     let mut present_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    'outer: for (offset, ac) in acs {
+    extend_present_indices(acs.clone(), source, num_names, &mut present_indices);
+    if present_indices.len() < num_names
+        && let Some(decoded) = definition::rust_format::escaped_capture_view(source)
+    {
+        extend_present_indices(acs, &decoded, num_names, &mut present_indices);
+    }
+    present_indices
+}
+
+fn extend_present_indices<'a>(
+    acs: impl Iterator<Item = (usize, &'a aho_corasick::AhoCorasick)>,
+    source: &[u8],
+    num_names: usize,
+    present_indices: &mut std::collections::HashSet<usize>,
+) {
+    for (offset, ac) in acs {
         for mat in ac.find_overlapping_iter(source) {
             present_indices.insert(offset + mat.pattern().as_usize());
             if present_indices.len() == num_names {
-                break 'outer;
+                return;
             }
         }
     }
-    present_indices
 }
 
 /// `find_references` の per-file 事前フィルタ。検索開始時に 1 回だけ構築して全ファイルで
@@ -360,9 +376,11 @@ fn find_refs_in_file(
         } else {
             prefilter.exact.find(&source).is_some()
         };
+        // Rust の書式マクロの暗黙キャプチャはエスケープで綴れるので、復号した写しでも探す。
         if !present
             && !(detected_lang == Some(LangId::Rust)
-                && definition::rust_format::may_have_escaped_capture(source.as_bytes()))
+                && definition::rust_format::escaped_capture_view(source.as_bytes())
+                    .is_some_and(|decoded| prefilter.exact.find(&decoded).is_some()))
         {
             return Ok(Vec::new());
         }

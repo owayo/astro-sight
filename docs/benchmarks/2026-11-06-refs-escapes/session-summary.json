@@ -1,0 +1,79 @@
+{
+  "repeats": 9,
+  "mode": "session",
+  "suite": "escapes",
+  "symbols_result_cache": null,
+  "os": "Windows-11-10.0.26300-SP0",
+  "processors": 16,
+  "python": "3.12.9",
+  "cases": [
+    {
+      "case": "escapes-refs",
+      "before": {
+        "median_ms": 75.16270002815872,
+        "min_ms": 71.2548999581486,
+        "max_ms": 76.03929995093495,
+        "max_working_set_bytes": 24559616
+      },
+      "after": {
+        "median_ms": 19.712300039827824,
+        "min_ms": 18.34229996893555,
+        "max_ms": 22.330999956466258,
+        "max_working_set_bytes": 18202624
+      },
+      "improvement_percent": 73.77382660223373
+    },
+    {
+      "case": "escapes-refs-batch",
+      "before": {
+        "median_ms": 151.01999999023974,
+        "min_ms": 143.97229999303818,
+        "max_ms": 178.84179996326566,
+        "max_working_set_bytes": 25387008
+      },
+      "after": {
+        "median_ms": 41.33839998394251,
+        "min_ms": 39.531700080260634,
+        "max_ms": 45.0690999859944,
+        "max_working_set_bytes": 19066880
+      },
+      "improvement_percent": 72.62720170400334
+    },
+    {
+      "case": "plain-refs",
+      "before": {
+        "median_ms": 20.4670000821352,
+        "min_ms": 18.440599902532995,
+        "max_ms": 22.94959989376366,
+        "max_working_set_bytes": 18296832
+      },
+      "after": {
+        "median_ms": 19.061999977566302,
+        "min_ms": 18.870100029744208,
+        "max_ms": 21.698799915611744,
+        "max_working_set_bytes": 18075648
+      },
+      "improvement_percent": 6.864709527192825
+    },
+    {
+      "case": "plain-refs-batch",
+      "before": {
+        "median_ms": 38.63129997625947,
+        "min_ms": 36.105999955907464,
+        "max_ms": 44.34089991264045,
+        "max_working_set_bytes": 18960384
+      },
+      "after": {
+        "median_ms": 37.763900007121265,
+        "min_ms": 37.11069992277771,
+        "max_ms": 42.54290007520467,
+        "max_working_set_bytes": 18903040
+      },
+      "improvement_percent": 2.245329485860581
+    }
+  ],
+  "executable_sha256": {
+    "before": "72fe74bcf4a877b355ff181b890958514baed0e88b80101e57ed1a01a1846f2b",
+    "after": "cf87e604fc4b8916e2736675bfe6d40069ff016c0f2516624a94a50c067a3b35"
+  }
+}

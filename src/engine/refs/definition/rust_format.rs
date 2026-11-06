@@ -18,13 +18,104 @@ pub(crate) fn has_format_marker(source: &[u8]) -> bool {
         .any(|word| memchr::memmem::find(source, word).is_some())
 }
 
+/// 名前の綴りをリテラルの中で変えうるエスケープ (`\x`・`\u{...}`・行継続) の印があるか。
 pub(crate) fn has_escape_marker(source: &[u8]) -> bool {
     memchr::memmem::find(source, b"\\u{").is_some()
         || memchr::memmem::find(source, b"\\x").is_some()
+        || memchr::memmem::find(source, b"\\\n").is_some()
+        || memchr::memmem::find(source, b"\\\r").is_some()
 }
 
 pub(crate) fn may_have_escaped_capture(source: &[u8]) -> bool {
     has_escape_marker(source) && has_format_marker(source)
+}
+
+/// エスケープで綴った暗黙キャプチャを探すための、ソースの復号した写し。
+/// 生のソースだけで名前を探せるファイル (印が揃わない) では `None`。
+pub(crate) fn escaped_capture_view(source: &[u8]) -> Option<Vec<u8>> {
+    may_have_escaped_capture(source).then(|| decode_escapes(source))
+}
+
+/// 文字列リテラルのエスケープを、ソース全体について左から復号した写しを返す。
+///
+/// 書式マクロの暗黙キャプチャは、復号後の綴りで名前を表す (`"{\x54OKEN}"`、行継続をはさむ
+/// `"{TO\` 改行 `KEN}"`)。エスケープの規則は [`LiteralChars`] と同じで、不正なエスケープは
+/// `\` だけを出して次のバイトから続ける (閉じ括弧まで読み飛ばさない)。リテラルの境界は
+/// 追わない。引用符はどのエスケープの途中にもならないので、各リテラルの本文は先頭から
+/// 同じ規則で復号され、キャプチャの名前は写しの中で連続する (エスケープでない CRLF は
+/// 正規化しないが、改行は名前に入らない)。リテラルの外 (コメント・raw 文字列) を余分に
+/// 復号しても、一致が増えるだけで落とさない。
+pub(crate) fn decode_escapes(source: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(source.len());
+    let mut i = 0;
+    while i < source.len() {
+        let byte = source[i];
+        if byte != b'\\' {
+            out.push(byte);
+            i += 1;
+            continue;
+        }
+        let decoded = match source.get(i + 1) {
+            Some(b'n') => Some(('\n', 2)),
+            Some(b'r') => Some(('\r', 2)),
+            Some(b't') => Some(('\t', 2)),
+            Some(b'0') => Some(('\0', 2)),
+            Some(b'\\') => Some(('\\', 2)),
+            Some(b'\'') => Some(('\'', 2)),
+            Some(b'"') => Some(('"', 2)),
+            Some(b'\n' | b'\r') => {
+                // 行継続は改行と続く ASCII 空白を読み飛ばす。
+                i += 2;
+                while source.get(i).is_some_and(u8::is_ascii_whitespace) {
+                    i += 1;
+                }
+                continue;
+            }
+            Some(b'x') => decode_hex_escape(source.get(i + 2..i + 4)).map(|ch| (ch, 4)),
+            Some(b'u') => decode_unicode_escape(&source[i + 2..]).map(|(ch, len)| (ch, 2 + len)),
+            _ => None,
+        };
+        match decoded {
+            Some((ch, len)) => {
+                out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+                i += len;
+            }
+            None => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// `\x` に続く 16 進 2 桁。[`LiteralChars`] と同じく 0x7f を超える値は不正。
+fn decode_hex_escape(digits: Option<&[u8]>) -> Option<char> {
+    let [high, low] = digits? else {
+        return None;
+    };
+    let value = char::from(*high).to_digit(16)? * 16 + char::from(*low).to_digit(16)?;
+    (value <= 0x7f).then(|| char::from(value as u8))
+}
+
+/// `\u` に続く `{...}`。返す長さは閉じ波括弧までのバイト数。
+fn decode_unicode_escape(rest: &[u8]) -> Option<(char, usize)> {
+    if rest.first() != Some(&b'{') {
+        return None;
+    }
+    let mut value = 0u32;
+    for (offset, &byte) in rest.iter().enumerate().skip(1) {
+        match byte {
+            b'}' => return char::from_u32(value).map(|ch| (ch, offset + 1)),
+            b'_' => {}
+            _ => {
+                value = value
+                    .checked_mul(16)?
+                    .checked_add(char::from(byte).to_digit(16)?)?;
+            }
+        }
+    }
+    None
 }
 
 fn previous(mut node: Node<'_>) -> Option<Node<'_>> {
