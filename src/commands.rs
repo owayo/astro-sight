@@ -880,6 +880,7 @@ mod api_changes;
 mod dead_code;
 mod dead_code_default_liveness;
 mod dead_code_member_liveness;
+mod dead_code_python_tests;
 mod dead_code_swift_protocol;
 
 #[cfg(test)]
