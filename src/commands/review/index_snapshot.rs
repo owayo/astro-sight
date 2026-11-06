@@ -277,6 +277,9 @@ impl OverBudget {
 pub(in crate::commands) struct IndexSnapshot {
     _temporary: tempfile::TempDir,
     analysis_dir: PathBuf,
+    /// 生成物の判定の属性を、スナップショットの `.gitattributes` (index の内容) と元のリポジトリの
+    /// info・利用者の属性ファイルから引くための登録 (一時リポジトリの info は書き出し用の属性)。
+    _attributes: crate::engine::gitattributes::SnapshotRegistration,
 }
 
 /// スナップショットの作成に要る、元のリポジトリの値。
@@ -507,9 +510,12 @@ impl IndexSnapshot {
             )
             .into());
         }
+        let attributes =
+            crate::engine::gitattributes::register_snapshot(root, std::path::Path::new(dir));
         Ok(PreparedSnapshot::Ready(Self {
             _temporary: temporary,
             analysis_dir,
+            _attributes: attributes,
         }))
     }
 

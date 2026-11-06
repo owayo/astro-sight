@@ -19,7 +19,7 @@ Linux と macOS の CI は `make setup` と、`make ci` を構成するターゲ
 
 `make test` は単体テストと結合テストを cargo-nextest で 1 件ずつ別のプロセスとして走らせ（設定は `.config/nextest.toml`）、nextest が扱わない doctest を `cargo test --doc` で回す。一部のテストだけを走らせるときは `mise exec -- cargo nextest run <filter>` のように mise 経由で呼ぶ。
 
-Rust の同名所有元の回帰は `impact_rust_private_helpers` にある。関数・非 leaf モジュールの定数・enum variant・標準 `format!` の引数を、実際の呼び出し元、再束縛、マクロの差し替え、`#[path]`、`include!` と対比する。直接の staged 解析では追加証明を使わず、通常の解析だけで候補を除く。
+Rust の同名所有元の回帰は `impact_rust_private_helpers` にある。関数・非 leaf モジュールの定数・enum variant・標準 `format!` の引数を、実際の呼び出し元、再束縛、マクロの差し替え、`#[path]`、`include!` と対比する。変更元の関数の本体に標準でないマクロがある場合の、書式の暗黙キャプチャと crate 起点の import の回帰は `impact_rust_same_named_constants` にある。直接の staged 解析では追加証明を使わず、通常の解析だけで候補を除く。
 
 lint、テスト、6 ターゲットの配布用ビルドは独立して開始する。CI はテストを nextest の `--partition slice:<m>/<n>` で複数のランナーへ分ける。Linux と macOS は各 2 つ（`make test TEST_PARTITION=slice:<m>/2`）、Windows は 5 つで、Windows は `cargo nextest run` を直接呼ぶ。doctest は各 OS の 1 番目のランナーだけが回し、残りは `TEST_DOC=0` を渡す。macOS の 1 番目は `make ci` を呼び、macOS のランナーを増やさずに macOS の lint も兼ねる。ランナーの数は、どのランナーも配布用ビルド（約 7 分）と同じころに終わることを目安に決めている。macOS のランナーは速さのばらつきが大きく、lint も回す 1 番目は配布用ビルドより長くなることがある。
 
