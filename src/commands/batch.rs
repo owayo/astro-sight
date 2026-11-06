@@ -433,6 +433,8 @@ pub struct BatchSymbolsOpts<'a> {
     pub full: bool,
     pub dir: Option<&'a std::path::Path>,
     pub skipped: Option<SkippedFiles>,
+    /// 走査の申告 (生成物か判定できずに解析したファイル)。空なら末尾の行に出さない。
+    pub truncations: Vec<crate::models::truncation::TruncationInfo>,
     pub query: Option<&'a str>,
     pub output: OutputOptions,
 }
@@ -442,8 +444,14 @@ pub fn batch_symbols(
     paths: &[String],
     opts: BatchSymbolsOpts<'_>,
 ) -> Result<()> {
-    let trailer = opts.skipped.map(|skipped| {
-        let mut value = serde_json::json!({ "skipped": skipped });
+    let trailer = (opts.skipped.is_some() || !opts.truncations.is_empty()).then(|| {
+        let mut value = serde_json::json!({});
+        if let Some(skipped) = &opts.skipped {
+            value["skipped"] = serde_json::json!(skipped);
+        }
+        if !opts.truncations.is_empty() {
+            value["truncations"] = serde_json::json!(opts.truncations);
+        }
         value.sort_all_objects();
         value
     });

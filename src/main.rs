@@ -384,6 +384,7 @@ fn dispatch_command(
                             full,
                             dir: None,
                             skipped: None,
+                            truncations: Vec::new(),
                             query: query.as_deref(),
                             output,
                         },

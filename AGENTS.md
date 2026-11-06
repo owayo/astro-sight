@@ -35,6 +35,7 @@ CLI (`src/cli.rs` の clap derive と `src/main.rs` のディスパッチ)、`se
 実装の規約:
 
 - 構文木を再帰で辿らない。深い入れ子のファイル 1 つでスタックが溢れ、プロセスごと落ちる。`engine/tree_walk.rs` の `walk_preorder` / `any_node` か明示スタックを使う。走査中に `Node::parent` で祖先を辿ると、深さの 2 乗の時間がかかる
+- 生成物を外す経路は `engine::generated::judge` (`.gitattributes` の `linguist-generated` → 名前 → ヘッダー) と `engine::gitattributes::AttributeResolver` (gix で Git と同じ規則で解決し、git を起動しない) を通す。経路ごとに `.gitattributes` を読んだり判定の順を変えたりしない
 - ファイルは上限付きで読む (`parser::read_file`、`bounded_read::read_input_file`。上限 100MB)。上限の無い `std::fs::read` を新たに書かない
 - 出力を解析する `git diff` には `git_support::GIT_DIFF_PARSEABLE_OUTPUT_ARGS` を付ける。付けないと、利用者の diff 設定次第で変更を 1 つも認識できなくなる。`git show` は `git_input.rs` の `git_show_blob` / `GitBlobBatch` を通し、パスの一覧 (`ls-tree` / `ls-files`) は `-z` で読む
 - 回帰テストには、修正前のコードで落ちることの確認と、変えてはいけない挙動の対照ケースを入れる。対照が無いと、別の理由で通る空振りのテストになる

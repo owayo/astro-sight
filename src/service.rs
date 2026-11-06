@@ -559,7 +559,11 @@ impl AppService {
             symbol: name.to_string(),
             references,
             skipped: scan.skipped,
-            truncations: scan.unanalyzable,
+            truncations: scan
+                .unanalyzable
+                .into_iter()
+                .chain(scan.generated_undetermined)
+                .collect(),
             // 上限適用は表現層 (commands / MCP) の責務。解析結果そのものは常に全件持つ。
             result_summary: None,
             failed_files: scan.failed_files,
@@ -667,7 +671,11 @@ impl AppService {
         // 走査の申告は全名前で共通なので、先頭の結果にだけ付ける。
         if let Some(first) = results.first_mut() {
             first.skipped = scan.skipped;
-            first.truncations = scan.unanalyzable;
+            first.truncations = scan
+                .unanalyzable
+                .into_iter()
+                .chain(scan.generated_undetermined)
+                .collect();
         }
 
         debug!(

@@ -2,29 +2,39 @@
 
 use super::*;
 
+/// 属性を解決できずに API 差分の対象に残したファイルと原因。
+pub(crate) type GeneratedUndetermined = (
+    std::path::PathBuf,
+    crate::engine::gitattributes::AttributeLookupError,
+);
+
 /// API 差分検出から除外すべき diff ファイルかを判定する。
 ///
 /// - 信頼境界外のトラバーサルパスを `dir.join()` で読まないよう、絶対パスや `..` を
 ///   含むパスは拒否する。
-/// - `.gitattributes` の `linguist-generated` 指定ファイルは検出対象外。
-/// - ファイル先頭の自動生成マーカーコメントが付くファイルも対象外。
+/// - 生成物は refs の走査と同じ判定 (`.gitattributes` の `linguist-generated` → 名前 →
+///   ヘッダー。[`crate::engine::generated::judge`]) で対象外にする。新旧のどちらかが生成物なら
+///   外す。旧側は作業ツリーに無いので、属性と名前だけで見る。`generated` は属性の照会
+///   (`canonical_dir` が無ければ判定しない)。属性を解決できなかった側は外さず、
+///   `undetermined` に積む。
 pub(crate) fn should_skip_diff_file(
     df: &crate::models::impact::DiffFile,
-    gitattrs: &crate::engine::gitattributes::GitAttributes,
+    generated: Option<&mut crate::engine::gitattributes::AttributeLookup<'_>>,
     canonical_dir: Option<&std::path::Path>,
+    undetermined: &mut Vec<GeneratedUndetermined>,
 ) -> bool {
+    use crate::engine::generated::{GeneratedVerdict, judge};
+
     if df.new_path != "/dev/null" && !crate::engine::impact::is_safe_diff_path(&df.new_path) {
         return true;
     }
     if df.old_path != "/dev/null" && !crate::engine::impact::is_safe_diff_path(&df.old_path) {
         return true;
     }
-    if gitattrs.is_generated(&df.new_path) || gitattrs.is_generated(&df.old_path) {
-        return true;
-    }
-    if let Some(root) = canonical_dir
-        && df.new_path != "/dev/null"
-    {
+    let Some(root) = canonical_dir else {
+        return false;
+    };
+    if df.new_path != "/dev/null" {
         let full = root.join(&df.new_path);
         // symlink 経由で workspace 外を指すファイルを on-disk read しないよう、
         // canonicalize して root 配下にあることを fail-closed で確認する。
@@ -35,10 +45,28 @@ pub(crate) fn should_skip_diff_file(
             Ok(canonical) if canonical.starts_with(root) => {}
             _ => return true,
         }
-        if crate::engine::generated::is_auto_generated(&full) {
-            return true;
+    }
+    let Some(lookup) = generated else {
+        return false;
+    };
+    let mut sides = vec![(df.new_path.as_str(), true)];
+    if df.old_path != df.new_path {
+        sides.push((df.old_path.as_str(), false));
+    }
+    let mut side_undetermined = Vec::new();
+    for (path, worktree) in sides {
+        if path == "/dev/null" {
+            continue;
+        }
+        let full = root.join(path);
+        let header = || worktree && crate::engine::generated::is_auto_generated(&full);
+        match judge(lookup.linguist_generated(&full), &full, header) {
+            GeneratedVerdict::Generated(_) => return true,
+            GeneratedVerdict::NotGenerated => {}
+            GeneratedVerdict::Undetermined(error) => side_undetermined.push((full, error)),
         }
     }
+    undetermined.extend(side_undetermined);
     false
 }
 
@@ -184,10 +212,12 @@ impl PreparedDiff {
     /// added / modified / deleted ファイルの exported シンボルを抽出し、cross-file 参照判定の
     /// 対象になりうる名前を集める。候補シンボルごとの全リポジトリ走査 (O(候補数 × 全ファイル))
     /// を `ApiRefIndex` の chunk 単位の batch 検索に集約するため、検索する名前をここで決める。
+    ///
+    /// 生成物の判定の属性は `canonical_dir` で解決する。解決できずに対象に残したファイルは
+    /// `parse_truncations` で申告する。
     pub(crate) fn new(
         dir: &str,
         diff_files: &[crate::models::impact::DiffFile],
-        gitattrs: &crate::engine::gitattributes::GitAttributes,
         canonical_dir: Option<&std::path::Path>,
         base_blobs: &crate::commands::git_input::GitBlobBatch,
     ) -> Self {
@@ -197,9 +227,24 @@ impl PreparedDiff {
             unverified_deleted_paths: HashSet::new(),
             parse_truncations: Vec::new(),
         };
+        let resolver = canonical_dir.map(crate::engine::gitattributes::AttributeResolver::open);
+        let mut lookup = resolver.as_ref().map(|resolver| resolver.lookup());
+        let mut undetermined = Vec::new();
         for df in diff_files {
-            let file = prepared.prepare_file(dir, df, gitattrs, canonical_dir, base_blobs);
+            let file = prepared.prepare_file(
+                dir,
+                df,
+                lookup.as_mut(),
+                canonical_dir,
+                base_blobs,
+                &mut undetermined,
+            );
             prepared.files.push(file);
+        }
+        if let Some(root) = canonical_dir {
+            prepared.parse_truncations.extend(
+                crate::engine::refs::generated_undetermined_truncations(root, &undetermined),
+            );
         }
         prepared
     }
@@ -208,11 +253,12 @@ impl PreparedDiff {
         &mut self,
         dir: &str,
         df: &crate::models::impact::DiffFile,
-        gitattrs: &crate::engine::gitattributes::GitAttributes,
+        generated: Option<&mut crate::engine::gitattributes::AttributeLookup<'_>>,
         canonical_dir: Option<&std::path::Path>,
         base_blobs: &crate::commands::git_input::GitBlobBatch,
+        undetermined: &mut Vec<GeneratedUndetermined>,
     ) -> PreparedDiffFile {
-        if should_skip_diff_file(df, gitattrs, canonical_dir) {
+        if should_skip_diff_file(df, generated, canonical_dir, undetermined) {
             return PreparedDiffFile::Skip;
         }
         if df.old_path == "/dev/null" {
