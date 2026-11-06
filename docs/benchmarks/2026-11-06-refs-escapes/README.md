@@ -84,7 +84,7 @@ rails は印を持つファイルが少なく、`dead-code` は数千の名前�
 
 `dhat-heap` feature のビルドでも同じ約1.5 GiB になり、dhat が数える Rust のヒープのピークは約1.2 MB だった。大半は tree-sitter (C) の構文木で、vendor の生成物 `parser.c` (6〜24 MB、`.gitattributes` で `linguist-generated`) の構文解析が時間とメモリを占める。refs の生成物の判定はファイル名と先頭 4 KB の印 (`@generated` など) だけを見て `.gitattributes` を見ないため、`refs` / `symbols --dir` / dead-code の参照の集計はこれらを解析する。dead-code は `--exclude-dir vendor` でも参照の集計で vendor を読む。
 
-対象から外すと、出現をそのまま返す `refs` と、生成物の参照も数える dead-code の出力の契約が変わるため、今回は変えない。生成物の判定をコマンド間でそろえるか、巨大なファイルの同時解析を抑えるかは、別に設計を決める課題として残す。
+対象から外すと、出現をそのまま返す `refs` と、生成物の参照も数える dead-code の出力の契約が変わるため、今回は変えない。生成物の判定をコマンド間でそろえるか、巨大なファイルの同時解析を抑えるかは、別に設計を決める課題として残す。巨大なファイルの同時解析は [#253](https://github.com/owayo/astro-sight/issues/253) で予算を入れた ([記録](../2026-11-06-dead-code-parse-budget/README.md))。
 
 ## 未解消の候補
 

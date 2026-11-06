@@ -39,6 +39,7 @@ CLI (`src/cli.rs` の clap derive と `src/main.rs` のディスパッチ)、`se
 - 出力を解析する `git diff` には `git_support::GIT_DIFF_PARSEABLE_OUTPUT_ARGS` を付ける。付けないと、利用者の diff 設定次第で変更を 1 つも認識できなくなる。`git show` は `git_input.rs` の `git_show_blob` / `GitBlobBatch` を通し、パスの一覧 (`ls-tree` / `ls-files`) は `-z` で読む
 - 回帰テストには、修正前のコードで落ちることの確認と、変えてはいけない挙動の対照ケースを入れる。対照が無いと、別の理由で通る空振りのテストになる
 - 並列集約や大規模リポジトリ向けの変更では、`/usr/bin/time -l` でピーク RSS を測る。`par_iter().collect()` で不要な中間 Vec を全展開していないか確かめる
+- 構文木はソースの 20〜30 倍のメモリを使う (24 MB の生成された `parser.c` 1 本で約 650 MiB)。全ファイルを並列に構文解析する経路で巨大なファイルを含みうるときは、`engine/parse_budget.rs` の予算で大きいファイルの同時解析を制限する (dead-code の候補の抽出と参照の集計が使う)
 - コードコメントは必要な箇所にだけ付け、付ける場合は日本語で簡潔に書く
 
 astro-sight 自身の使い方:

@@ -106,10 +106,15 @@ fn uncounted_files_are_reported_with_possible_names() {
     #[cfg(not(unix))]
     let locked = false;
 
-    let result = count_non_definition_refs_split_in_files(&names, &files, |path| {
-        path.file_name()
-            .is_some_and(|name| name == "notes.unknownext")
-    })
+    let result = count_non_definition_refs_split_in_files(
+        &names,
+        &files,
+        |path| {
+            path.file_name()
+                .is_some_and(|name| name == "notes.unknownext")
+        },
+        ParseBudget::default(),
+    )
     .unwrap();
     assert_eq!(result.counts["alpha"], (1, 0), "読めるファイルは数える");
 

@@ -19,6 +19,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use std::path::Path;
 
+use crate::engine::parse_budget::{BudgetScheduler, JobOutcome, ParseBudget};
 use crate::engine::parser;
 use crate::language::{LangId, identifier_prefilter_pattern, normalize_identifier};
 use crate::models::reference::{RefKind, SymbolReference};
@@ -687,6 +688,7 @@ where
         return Ok(RefCounts::default());
     }
 
+    let budget = ParseBudget::from_env()?;
     let canonical_dir = std::fs::canonicalize(dir)?;
     let mut files = collect_files_scan(
         &canonical_dir,
@@ -695,7 +697,7 @@ where
     )?
     .files;
     merge_extra_files(&mut files, &canonical_dir, extra_files);
-    count_non_definition_refs_split_in_files(symbol_names, &files, is_test)
+    count_non_definition_refs_split_in_files(symbol_names, &files, is_test, budget)
 }
 
 /// 参照の件数を数えられなかったファイル (読み込み・構文解析の失敗)。
@@ -731,10 +733,16 @@ pub struct RefCounts {
 /// 読み込み (100MB の上限超過・権限など) や構文解析に失敗したファイルは件数に含められない。
 /// 旧実装はこれを黙って捨てていたため、唯一の呼び出しが 100MB を超えるファイルにある関数を
 /// dead と報告していた。失敗は [`RefCounts::uncounted`] で返し、呼び出し側が断定を控える。
+///
+/// dead-code の名前は数千に及び、事前フィルタはほぼ全ファイルを通すので、vendor の生成された
+/// `parser.c` (6〜24 MB、木は 1 本で数百 MiB) のような大きいファイルもワーカーの数まで同時に
+/// 解析していた。`budget` の閾値以上のファイルは予算に入るぶんだけを同時に解析する
+/// ([`crate::engine::parse_budget`])。件数は予算に依らない。
 pub fn count_non_definition_refs_split_in_files<F>(
     symbol_names: &[String],
     files: &[std::path::PathBuf],
     is_test: F,
+    budget: ParseBudget,
 ) -> Result<RefCounts>
 where
     F: Fn(&Path) -> bool + Sync,
@@ -761,47 +769,75 @@ where
     // 失敗は稀なので Mutex で十分 (成功したファイルはロックを取らない)。
     let uncounted: std::sync::Mutex<Vec<UncountedFile>> = std::sync::Mutex::new(Vec::new());
 
-    files.par_iter().for_each(|path| {
-        let per_file = match path.to_str() {
-            Some(path_str) => {
-                count_refs_in_file(symbol_names, &acs, camino::Utf8Path::new(path_str))
-            }
-            // UTF-8 でないパスは開けない。中身を確かめられないので全部の名前を参照しうる。
-            None => FileRefCount::Uncounted {
-                cause: "the path is not valid UTF-8".to_string(),
-                possible_names: None,
-            },
-        };
-        match per_file {
-            FileRefCount::Counted(per_file) => {
-                let bucket = if is_test(path) {
-                    &test_counts
-                } else {
-                    &prod_counts
-                };
-                for (ix, cnt) in per_file.into_iter().enumerate() {
-                    if cnt != 0 {
-                        bucket[ix].fetch_add(cnt, Ordering::Relaxed);
-                    }
+    let record = |path: &std::path::PathBuf, per_file: FileRefCount| match per_file {
+        FileRefCount::Counted(per_file) => {
+            let bucket = if is_test(path) {
+                &test_counts
+            } else {
+                &prod_counts
+            };
+            for (ix, cnt) in per_file.into_iter().enumerate() {
+                if cnt != 0 {
+                    bucket[ix].fetch_add(cnt, Ordering::Relaxed);
                 }
             }
-            FileRefCount::Uncounted {
+        }
+        FileRefCount::Uncounted {
+            cause,
+            possible_names,
+        } => {
+            let file = UncountedFile {
+                path: path.clone(),
                 cause,
                 possible_names,
-            } => {
-                let file = UncountedFile {
-                    path: path.clone(),
-                    cause,
-                    possible_names,
-                    is_test: is_test(path),
-                };
-                uncounted
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(file);
-            }
+                is_test: is_test(path),
+            };
+            uncounted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(file);
         }
+    };
+
+    // 予算の対象のファイルは、待つ間に mmap を持たないよう実行するときに開き直す。開き直したら
+    // 予約より大きくなっていた (書き換えられた) なら、新しい大きさで待ち行列に入れ直す。
+    let count_large = |ix: usize, reserved: u64| {
+        let path = &files[ix];
+        match open_for_count(symbol_names, &acs, path) {
+            Ok((_, source))
+                if source.len() as u64 > reserved && budget.is_large(source.len() as u64) =>
+            {
+                return JobOutcome::Resubmit {
+                    size: source.len() as u64,
+                    job: ix,
+                };
+            }
+            Ok((utf8, source)) => record(
+                path,
+                count_refs_in_source(symbol_names, &acs, utf8, &source),
+            ),
+            Err(per_file) => record(path, per_file),
+        }
+        JobOutcome::Done
+    };
+    let scheduler = BudgetScheduler::new(budget, &count_large);
+    rayon::scope(|scope| {
+        files.par_iter().enumerate().for_each(|(ix, path)| {
+            match open_for_count(symbol_names, &acs, path) {
+                Ok((_, source)) if budget.is_large(source.len() as u64) => {
+                    let size = source.len() as u64;
+                    drop(source);
+                    scheduler.submit(scope, size, ix);
+                }
+                Ok((utf8, source)) => record(
+                    path,
+                    count_refs_in_source(symbol_names, &acs, utf8, &source),
+                ),
+                Err(per_file) => record(path, per_file),
+            }
+        });
     });
+    scheduler.finish()?;
 
     let mut out = HashMap::with_capacity(n);
     for (i, name) in symbol_names.iter().enumerate() {
@@ -1047,28 +1083,54 @@ pub(crate) fn find_refs_batch_in_file_indexed<const SHELL_VARS: bool>(
     Ok(result)
 }
 
-/// 単一ファイル内の非 Definition 参照件数をカウントする（SymbolReference を確保しない）。
+/// 件数集計のためにファイルを開く (64KB 超は mmap で、開いただけではページに触れない)。
 ///
-/// 読み込み・構文解析に失敗したら件数の代わりに [`FileRefCount::Uncounted`] を返す
-/// (呼び出し側で dead の断定を控えるため、黙って 0 件にしない)。
+/// 開けなければ件数の代わりに [`FileRefCount::Uncounted`] を返す (呼び出し側で dead の断定を
+/// 控えるため、黙って 0 件にしない)。
+fn open_for_count<'p>(
+    symbol_names: &[String],
+    acs: &[(usize, aho_corasick::AhoCorasick)],
+    path: &'p Path,
+) -> std::result::Result<(&'p camino::Utf8Path, parser::SourceBuf), FileRefCount> {
+    // UTF-8 でないパスは開けない。中身を確かめられないので全部の名前を参照しうる。
+    let Some(utf8) = camino::Utf8Path::from_path(path) else {
+        return Err(FileRefCount::Uncounted {
+            cause: "the path is not valid UTF-8".to_string(),
+            possible_names: None,
+        });
+    };
+    parser::read_file(utf8)
+        .map(|source| (utf8, source))
+        // 上限超過なら中身をストリームで走査して、参照しうる名前を絞る。
+        .map_err(|_| FileRefCount::Uncounted {
+            cause: read_failure_cause(path),
+            possible_names: stream_present_indices(acs, symbol_names, utf8),
+        })
+}
+
+/// 単一ファイル内の非 Definition 参照件数をカウントする（SymbolReference を確保しない）。
+#[cfg(test)]
 fn count_refs_in_file(
     symbol_names: &[String],
     acs: &[(usize, aho_corasick::AhoCorasick)],
     path: &camino::Utf8Path,
 ) -> FileRefCount {
-    let num = symbol_names.len();
-    let source = match parser::read_file(path) {
-        Ok(source) => source,
-        Err(_) => {
-            // 上限超過なら中身をストリームで走査して、参照しうる名前を絞る。
-            return FileRefCount::Uncounted {
-                cause: read_failure_cause(path.as_std_path()),
-                possible_names: stream_present_indices(acs, symbol_names, path),
-            };
-        }
-    };
+    match open_for_count(symbol_names, acs, path.as_std_path()) {
+        Ok((path, source)) => count_refs_in_source(symbol_names, acs, path, &source),
+        Err(uncounted) => uncounted,
+    }
+}
 
-    let present_indices = ac_present_indices_multi(acs, source.as_bytes(), num);
+/// 開いたソースの非 Definition 参照件数をカウントする。構文解析に失敗したら件数の代わりに
+/// [`FileRefCount::Uncounted`] を返す。
+fn count_refs_in_source(
+    symbol_names: &[String],
+    acs: &[(usize, aho_corasick::AhoCorasick)],
+    path: &camino::Utf8Path,
+    source: &[u8],
+) -> FileRefCount {
+    let num = symbol_names.len();
+    let present_indices = ac_present_indices_multi(acs, source, num);
     if present_indices.is_empty() {
         return FileRefCount::Counted(vec![0; num]);
     }
@@ -1084,12 +1146,12 @@ fn count_refs_in_file(
         return FileRefCount::Counted(count_refs_in_file_via_lexer(
             symbol_names,
             &present_indices,
-            &source,
+            source,
             lexer_lang,
         ));
     }
 
-    let (tree, lang_id) = match parser::parse_file(path, &source) {
+    let (tree, lang_id) = match parser::parse_file(path, source) {
         Ok(parsed) => parsed,
         Err(_) => {
             // 名前の出現は分かっているので、参照しうる名前はそれに絞れる。
@@ -1117,14 +1179,7 @@ fn count_refs_in_file(
     };
     // CountSink::NEEDS_LINE_INDEX = false のため run_ref_walk は LineIndex を構築せず、
     // context 文字列も一切生成しない (軽量 count 経路)。
-    run_ref_walk(
-        root,
-        &source,
-        lang_id,
-        definition_kinds,
-        &matcher,
-        &mut sink,
-    );
+    run_ref_walk(root, source, lang_id, definition_kinds, &matcher, &mut sink);
 
     FileRefCount::Counted(counts)
 }

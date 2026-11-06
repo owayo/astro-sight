@@ -4,6 +4,7 @@ mod cfg_ancestors;
 mod definition;
 mod files;
 mod line_context;
+mod parse_budget;
 mod php;
 mod rust;
 mod rust_format;
