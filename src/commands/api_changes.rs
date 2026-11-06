@@ -18,8 +18,8 @@ use crate::models::symbol::{Symbol, SymbolKind};
 use crate::service::AppService;
 
 use super::dead_code::{
-    collect_python_unittest_classes, enclosing_container, is_phpunit_test_symbol,
-    is_python_test_symbol, is_test_path,
+    collect_python_unittest_classes, enclosing_container, file_name_is_pytest_module,
+    is_phpunit_test_symbol, is_python_test_symbol, is_test_path,
 };
 
 use super::git_input::git_show_blob;

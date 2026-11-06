@@ -17,6 +17,7 @@ mod framework;
 mod go_test;
 mod operator;
 mod overrides;
+mod pytest;
 mod python_decorator;
 mod rust_allow_dead;
 mod scope;
@@ -36,6 +37,7 @@ pub use framework::{
 pub(crate) use go_test::is_go_test_entrypoint;
 pub use operator::is_syntax_invoked_method;
 pub use overrides::is_override_method;
+pub(crate) use pytest::PytestEntrypoints;
 pub use python_decorator::{PythonDecoratorImports, has_framework_entrypoint_decorator_python};
 pub(crate) use rust_allow_dead::rust_has_allow_dead_marker;
 pub use scope::is_local_scope_symbol;

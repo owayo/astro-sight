@@ -1763,8 +1763,9 @@ pub(crate) fn collect_python_unittest_classes(
     unittest_classes
 }
 
-/// ファイル名が pytest のモジュール命名規約 (`test_*.py` または `*_test.py`) に
-/// 一致するかを判定する。`conftest.py` は別関数で判定する。
+/// ファイル名が pytest のモジュール命名規約 (`python_files` の既定 `test_*.py` / `*_test.py`) に
+/// 一致するかを判定する。`*` は空にも一致するので `_test.py` も含む。`conftest.py` は別関数で
+/// 判定する。
 pub(crate) fn file_name_is_pytest_module(file_path: Option<&str>) -> bool {
     let Some(path) = file_path else {
         return false;
@@ -1784,8 +1785,7 @@ pub(crate) fn file_name_is_pytest_module(file_path: Option<&str>) -> bool {
         return true;
     }
     // `*_test.py` 規約 (ファイル名が `_test.py` で終わる)。
-    let stem = file_name.trim_end_matches(".py");
-    stem.ends_with("_test") && stem.len() > "_test".len()
+    file_name.ends_with("_test.py")
 }
 
 /// ファイル名が pytest の `conftest.py` かどうかを判定する。
@@ -1799,14 +1799,16 @@ pub(crate) fn file_name_is_python_conftest(file_path: Option<&str>) -> bool {
         == Some("conftest.py")
 }
 
-/// `unittest` / pytest のテスト規約に該当する Python シンボルかを判定する。
+/// `unittest` / pytest のテスト規約のうち、名前で判定する Python シンボルかを判定する。
 ///
 /// 対象:
 /// - `unittest.TestCase` 直接/間接継承クラス (同一ファイル内のチェーン)
-/// - そのクラス配下の `test_*` メソッドおよび `setUp` / `tearDown` /
-///   `setUpClass` / `tearDownClass` / `addCleanup` / `addClassCleanup`
-/// - `test_*.py` / `*_test.py` のトップレベル `test_*` 関数 (pytest 規約)
+/// - そのクラス配下の `test` で始まるメソッド (unittest の `testMethodPrefix`) および
+///   `setUp` / `tearDown` / `setUpClass` / `tearDownClass` / `addCleanup` / `addClassCleanup`
 /// - `conftest.py` 内のすべての関数 (pytest フィクスチャ規約)
+///
+/// pytest が `test_*.py` / `*_test.py` から集めるテスト (`test*` 関数、`Test*` クラスとその
+/// メソッドなど) は、構文から定義の位置で判定する (`engine::symbols::PytestEntrypoints`)。
 pub(crate) fn is_python_test_symbol(
     name: &str,
     kind: crate::models::symbol::SymbolKind,
@@ -1841,19 +1843,12 @@ pub(crate) fn is_python_test_symbol(
         return true;
     }
 
-    // `test_*.py` / `*_test.py` のトップレベル `test_*` 関数は pytest が discover する。
-    if file_name_is_pytest_module(file_path)
-        && effective_container.is_none()
-        && short.starts_with("test_")
-    {
-        return true;
-    }
-
-    // unittest.TestCase 派生クラス配下のメソッド。
+    // unittest.TestCase 派生クラス配下のメソッド。unittest (と pytest の unittest 対応) は
+    // `test` で始まる名前を集める (`test_foo` に限らず `testFoo` も)。
     if let Some(class_name) = effective_container
         && unittest_classes.contains(class_name)
     {
-        return short.starts_with("test_")
+        return short.starts_with("test")
             || matches!(
                 short,
                 "setUp"

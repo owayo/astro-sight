@@ -593,6 +593,8 @@ fn dead_code_python_unittest_conventions_excluded() {
                  self.assertEqual(1, 1)\n\n    \
              def test_extract_tests(self):\n        \
                  self.assertTrue(True)\n\n    \
+             def testCamel(self):\n        \
+                 self.assertTrue(True)\n\n    \
              def setUp(self):\n        \
                  pass\n\n    \
              def tearDown(self):\n        \
@@ -627,6 +629,8 @@ fn dead_code_python_unittest_conventions_excluded() {
         "CorpusTestScriptTests",
         "CorpusTestScriptTests.test_is_separator",
         "CorpusTestScriptTests.test_extract_tests",
+        // unittest の `testMethodPrefix` は `test` なので、`test_` で始まらない名前も集める
+        "CorpusTestScriptTests.testCamel",
         "CorpusTestScriptTests.setUp",
         "CorpusTestScriptTests.tearDown",
         // 同一ファイル内の間接継承 (CorpusTestScriptTests → DerivedTests) も解決される
@@ -638,6 +642,13 @@ fn dead_code_python_unittest_conventions_excluded() {
             "{banned} は unittest 規約として dead-code から除外されるべき: {names:?}"
         );
     }
+    // `test` で始まらないメソッドは unittest も集めない
+    assert!(
+        names
+            .iter()
+            .any(|n| n == "CorpusTestScriptTests.regular_helper"),
+        "unittest 規約外のメソッドは dead として報告される: {names:?}"
+    );
 }
 
 #[test]
@@ -692,6 +703,237 @@ fn dead_code_python_pytest_top_level_test_functions_excluded() {
     assert!(
         names.iter().any(|n| n == "regular_helper"),
         "pytest 規約外のトップレベル関数は dead として報告される: {names:?}"
+    );
+}
+
+/// Issue #255 の再現と対照に使う pytest のテストモジュール。
+const PYTEST_MODULE: &str = r#"from calc import add
+
+
+class TestAdd:
+    def test_small(self):
+        assert add(1, 2) == self.used_helper()
+
+    @staticmethod
+    def test_static():
+        assert add(0, 1) == 1
+
+    @classmethod
+    def test_class(cls):
+        assert add(1, 1) == 2
+
+    def testnounderscore(self):
+        assert add(2, 2) == 4
+
+    def setup_method(self, method):
+        pass
+
+    def used_helper(self):
+        return 3
+
+    def unused_helper(self):
+        return 1
+
+    class TestNested:
+        def test_nested(self):
+            assert add(3, 3) == 6
+
+    class NestedHelper:
+        def test_in_helper(self):
+            pass
+
+
+class SharedChecks:
+    def test_shared(self):
+        assert add(4, 4) == 8
+
+
+class TestShared(SharedChecks):
+    pass
+
+
+class TestWithInit:
+    def __init__(self):
+        self.value = 1
+
+    def test_never(self):
+        assert self.value == 1
+
+
+class Helper:
+    def test_not_collected(self):
+        pass
+
+
+def test_top():
+    assert add(0, 0) == 0
+
+
+def testplain():
+    assert add(0, 0) == 0
+
+
+def setup_module(module):
+    pass
+
+
+def pytest_generate_tests(metafunc):
+    pass
+
+
+def unused_function():
+    pass
+"#;
+
+#[test]
+fn dead_code_python_pytest_test_classes_excluded() {
+    // Issue #255: pytest は `test_*.py` / `*_test.py` の `Test` で始まり `__init__` を持たない
+    // クラスと、その中 (同じファイルの基底を含む) の `test` で始まるメソッド・入れ子の `Test*`
+    // クラス、`test` で始まるトップレベル関数を集め、xunit 形式の準備と後始末と
+    // `pytest_generate_tests` を名前で呼ぶ。旧実装はトップレベルの `test_*` 関数だけを除外し、
+    // クラス・メソッド・`testplain` などを dead と報告していた。
+    // pytest が集めない形 (本体で `__init__` を定義するクラス、`Test` で始まらないクラスと
+    // その入れ子、テストファイルでないファイルのクラス、`test` で始まらないメソッドと関数) は
+    // dead のまま残し、テストからだけ使う補助メソッドは test_only に残す。
+    for (directory, extra_args) in [("", &[][..]), ("tests/", &["--include-tests"][..])] {
+        for file_name in ["test_calc.py", "calc_test.py", "_test.py"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let root = dir.path();
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+            std::fs::write(root.join("calc.py"), "def add(a, b):\n    return a + b\n").unwrap();
+            std::fs::write(root.join(format!("{directory}{file_name}")), PYTEST_MODULE).unwrap();
+            std::fs::write(
+                root.join("helpers.py"),
+                "class TestLike:\n    def test_not_in_test_file(self):\n        pass\n",
+            )
+            .unwrap();
+
+            let output = cargo_bin()
+                .args(["dead-code", "--dir", root.to_str().unwrap()])
+                .args(extra_args)
+                .output()
+                .expect("failed to run");
+            assert!(output.status.success());
+            let json: serde_json::Value =
+                serde_json::from_slice(&output.stdout).expect("invalid JSON");
+            let names = |field: &str| -> Vec<String> {
+                json[field]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|s| s["name"].as_str().map(str::to_string))
+                    .collect()
+            };
+            let dead = names("dead_symbols");
+            let case = format!("{directory}{file_name}");
+            for live in [
+                "TestAdd",
+                "TestAdd.test_small",
+                "TestAdd.test_static",
+                "TestAdd.test_class",
+                "TestAdd.testnounderscore",
+                "TestAdd.setup_method",
+                "TestNested",
+                "TestNested.test_nested",
+                "SharedChecks.test_shared",
+                "TestShared",
+                "test_top",
+                "testplain",
+                "setup_module",
+                "pytest_generate_tests",
+            ] {
+                assert!(
+                    !dead.iter().any(|n| n == live),
+                    "{case}: {live} は pytest が集める (呼ぶ) ので dead にしない: {json}"
+                );
+            }
+            for expected in [
+                "TestAdd.unused_helper",
+                "NestedHelper",
+                "NestedHelper.test_in_helper",
+                "TestWithInit",
+                "TestWithInit.test_never",
+                "Helper",
+                "Helper.test_not_collected",
+                "TestLike",
+                "TestLike.test_not_in_test_file",
+                "unused_function",
+            ] {
+                assert!(
+                    dead.iter().any(|n| n == expected),
+                    "{case}: {expected} は pytest が集めないので dead に残す: {json}"
+                );
+            }
+            assert!(
+                names("test_only_symbols")
+                    .iter()
+                    .any(|n| n == "TestAdd.used_helper"),
+                "{case}: テストからだけ使う補助メソッドは test_only に残す: {json}"
+            );
+        }
+    }
+}
+
+#[test]
+fn review_hook_does_not_block_on_a_new_pytest_test_method() {
+    // Issue #255 の再現: コミット済みの pytest のテストクラスにテストメソッドを 1 つ足すだけで、
+    // `review --git --hook` が dead を blocking にして終了コード 1 を返していた。
+    // テストファイルは API 差分の対象外で WIP の抑止が効かないことを、`--include-wip-dead` でも
+    // 同じ結果になることと、テストでないメソッドを足した対照が dead で止まることで確かめる。
+    let repo = TestRepo::new();
+    repo.write("calc.py", "def add(a, b):\n    return a + b\n");
+    let baseline = "from calc import add\n\n\nclass TestAdd:\n    def test_small(self):\n        assert add(1, 2) == 3\n\n\ndef test_top():\n    assert add(0, 0) == 0\n";
+    repo.write("test_calc.py", baseline);
+    repo.init_git();
+    repo.commit_all("initial");
+    let with_method = |method: &str| {
+        baseline.replace(
+            "        assert add(1, 2) == 3\n",
+            &format!("        assert add(1, 2) == 3\n\n{method}"),
+        )
+    };
+    let hook = |extra: &[&str]| {
+        cargo_bin()
+            .args(["review", "--git", "--hook", "--dir"])
+            .arg(repo.root())
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+
+    repo.write(
+        "test_calc.py",
+        with_method("    def test_large(self):\n        assert add(10, 20) == 30\n"),
+    );
+    for extra in [&[][..], &["--include-wip-dead"][..]] {
+        let output = hook(extra);
+        assert!(
+            output.status.success(),
+            "{extra:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let review = repo.run_json("review", &["--git"]);
+    let dead: Vec<&str> = review["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    for live in ["TestAdd", "TestAdd.test_small", "TestAdd.test_large"] {
+        assert!(!dead.contains(&live), "{live}: {review}");
+    }
+
+    repo.write(
+        "test_calc.py",
+        with_method("    def unused_helper(self):\n        return 1\n"),
+    );
+    let output = hook(&[]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("\"dead\"") && stderr.contains("TestAdd.unused_helper"),
+        "{stderr}"
     );
 }
 
