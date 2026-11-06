@@ -285,6 +285,9 @@ pub(crate) struct ExportSurfaceContext<'tree, 'source> {
     /// Rust の関連定数の owner 候補 (型宣言 / trait / impl ブロック)。Rust 以外では空。
     rust_const_owners: Vec<&'source Symbol>,
     unittest_classes: HashSet<String>,
+    /// pytest のテストモジュール (`test_*.py` / `*_test.py`) で、pytest が既定の規約で集めるか
+    /// 名前で呼ぶ定義。dead-code の経路だけで作る。
+    pytest_entrypoints: Option<crate::engine::symbols::PytestEntrypoints>,
     python_export_policy: Option<crate::engine::symbols::PythonModuleExportPolicy>,
     /// Python のデコレータの別名を解決する import の索引。名前を書いたままでは登録と
     /// 決まらないデコレータが現れたときに 1 回だけ作る。
@@ -347,6 +350,12 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
             } else {
                 HashSet::new()
             };
+        // pytest のテストモジュールで集めるテストと、名前で呼ぶ準備・後始末。unittest と同じく
+        // 実行時入口を除外する dead-code の経路だけで、ファイル単位で 1 回作る。
+        let pytest_entrypoints = (exclude_framework_entrypoints
+            && lang_id == crate::language::LangId::Python
+            && file_name_is_pytest_module(file_path))
+        .then(|| crate::engine::symbols::PytestEntrypoints::collect(root, source));
         // Python の `__all__` 解析は AST 全体を走査するため、シンボルごとではなく
         // ファイル単位で 1 回だけ行う。非 Python では構築しない。
         let python_export_policy = (lang_id == crate::language::LangId::Python)
@@ -363,6 +372,7 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
             containers,
             rust_const_owners,
             unittest_classes,
+            pytest_entrypoints,
             python_export_policy,
             python_decorator_imports: std::cell::OnceCell::new(),
         }
@@ -754,11 +764,8 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
         {
             return true;
         }
-        // unittest / pytest のテスト規約シンボル。Python 限定。
-        // `class Foo(unittest.TestCase):` 派生クラスとそのメソッド (`test_*`,
-        // `setUp` 等)、`test_*.py` / `*_test.py` のトップレベル `test_*` 関数、
-        // `conftest.py` 内の関数はテストランナーから動的 discover されるため、
-        // 識別子レベルの cross-file refs では caller を追跡できない。
+        // Python ランタイムが名前規約で呼ぶ既知の基底クラスのメソッド (urllib の handler、
+        // watchdog の event handler)。
         if self.exclude_framework_entrypoints
             && self.lang_id == crate::language::LangId::Python
             && matches!(sym.kind, SymbolKind::Method | SymbolKind::Function)
@@ -772,6 +779,11 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
             return true;
         }
 
+        // unittest / pytest のテスト規約シンボル。Python 限定。テストランナーが名前と構造から
+        // 動的に集めるため、識別子レベルの cross-file refs では caller を追跡できない。
+        // `unittest.TestCase` 派生クラスとそのメソッド (`test*`、`setUp` 等) と `conftest.py` の
+        // 関数は名前で、pytest がテストモジュールから集めるもの (`test*` 関数、`Test*` クラスと
+        // その `test*` メソッド、xunit 形式の準備と後始末など) は構文から定義の位置で判定する。
         if self.exclude_framework_entrypoints
             && is_python_test_symbol(
                 &sym.name,
@@ -781,6 +793,13 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
                 sym.container.as_deref(),
                 &self.unittest_classes,
             )
+        {
+            return true;
+        }
+        if self
+            .pytest_entrypoints
+            .as_ref()
+            .is_some_and(|entrypoints| entrypoints.contains(&sym.range))
         {
             return true;
         }
