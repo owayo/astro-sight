@@ -607,6 +607,7 @@ mod python_optional_removal;
 mod python_private_owner;
 
 mod python_protocol_arg;
+mod python_return_usage;
 
 mod python_signature;
 

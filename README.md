@@ -171,6 +171,8 @@ Python function parameter annotation changes to a local `Protocol` can appear in
 
 This checks declared contracts using built-in types and containers. Aliased or relative imports, keyword or spread arguments, omitted changed parameters, complex local scopes or rebinding, decorated or inherited implementation classes, data members, unknown types, parse errors, and companion `.pyi` files keep the conservative blocking classification. Dynamic or transitive name resolution is outside this proof.
 
+When only the return annotation of a Python function or method changes, an unchanged call such as `result = entry()` also counts as updated if every later use of `result` was rewritten to compare it with a literal of the new type (`assert result == 0` for `-> int`). Comparisons carried over from the old file, comparisons with variables or other types, and results passed to other names or calls stay blocking. See [Python return annotation changes](docs/diff-analysis.md#python-return-annotation-changes).
+
 Adding a required property to a TypeScript interface or object type alias appears in `api.mod_closed` when the same diff updates every function that returns the type, every `const x: T` / `satisfies T` value, and the callers of every top-level function that takes the type as a parameter. The added property must carry a value whose type fits the new member. Generic or `extends` declarations, required methods, and references in unsupported positions (such as `T[]`) stay blocking even when the reference lines changed. See [TypeScript required property additions](docs/diff-analysis.md#typescript-required-property-additions).
 
 ### Find References

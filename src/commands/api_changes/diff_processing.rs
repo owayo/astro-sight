@@ -1448,18 +1448,31 @@ fn closure_or_blocking_decision(
             first_unproven: None,
         });
     }
+    // Python の関数・メソッドの戻り値の注釈だけの変更なら、結果の利用の書き換えを追加証拠に
+    // する (Issue #251)。移動と同じ差分の変更は、呼び出し側の旧版を移動元と比べられないので除く。
+    let python_return = (python_protocol.is_none() && moved_from.is_none())
+        .then(|| super::python_return_usage::prepare(site, sources, inputs.base_blobs))
+        .flatten();
     let arg_evidence = if !removed_props.is_empty() {
         super::ref_index::ClosureArgEvidence::TsRemovedProps(&removed_props)
     } else {
-        match (&added_required_props, &python_protocol, &required_members) {
-            (Some(props), _, _) => {
+        match (
+            &added_required_props,
+            &python_protocol,
+            &required_members,
+            &python_return,
+        ) {
+            (Some(props), _, _, _) => {
                 super::ref_index::ClosureArgEvidence::TsAddedRequiredProps(props)
             }
-            (None, Some(proof), _) => {
+            (None, Some(proof), _, _) => {
                 super::ref_index::ClosureArgEvidence::PythonProtocolParams(proof)
             }
-            (None, None, super::ts_required_members::RequiredMemberChange::Supported(delta)) => {
+            (None, None, super::ts_required_members::RequiredMemberChange::Supported(delta), _) => {
                 super::ref_index::ClosureArgEvidence::TsRequiredTypeMembers(delta)
+            }
+            (None, None, _, Some(contract)) => {
+                super::ref_index::ClosureArgEvidence::PythonReturnContract(contract)
             }
             _ => super::ref_index::ClosureArgEvidence::None,
         }

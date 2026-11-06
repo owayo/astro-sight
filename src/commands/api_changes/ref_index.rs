@@ -531,12 +531,16 @@ pub(crate) fn embedded_js_sources_may_hide_removed_keys(
 }
 
 /// 無変更の呼び出し式を閉じる追加証拠。TS は共有 const の必須プロパティ追加、
-/// Python はローカル変数のクラスと新しい Protocol の構造的な適合を証明する。
+/// Python はローカル変数のクラスと新しい Protocol の構造的な適合と、戻り値の注釈だけを
+/// 変えた関数の結果の利用の書き換えを証明する。
 pub(crate) enum ClosureArgEvidence<'a> {
     None,
     TsRemovedProps(&'a [super::ts_signature::RemovedParameterProps]),
     TsAddedRequiredProps(&'a super::ts_signature::AddedRequiredObjectProps),
     PythonProtocolParams(&'a super::python_protocol_arg::ProtocolArgumentChange),
+    /// Python の関数・メソッドの戻り値の注釈だけの変更。呼び出しの行が context でも、結果を
+    /// 受けた変数の読み取りがすべて新しい型に合わせて書き換えた比較なら追随済み (Issue #251)。
+    PythonReturnContract(&'a super::python_return_usage::PythonReturnContract<'a>),
     /// TS の interface / object 型の type alias への必須プロパティ追加。型の参照を役割ごとの
     /// 義務で閉じ、参照行が変更行にあるだけの証拠は使わない (Issue #89)。
     TsRequiredTypeMembers(&'a super::ts_required_members::RequiredMemberDelta),
@@ -569,7 +573,7 @@ pub(crate) struct ModifiedClosureInput<'a> {
 /// コミットで更新済みとみなし closed-in-diff (informational)。refs 解析失敗 /
 /// diff 外 or hunk 外の未証明の参照が 1 つでもあれば false を返し、保守的に blocking 側
 /// (通常の api.mod) へ倒す。無変更の呼び出しを閉じる追加証拠は ClosureArgEvidence に渡す
-/// (TS: Issue 2026-08-05-api-mod-callers-updated-indirectly、Python: #38)。
+/// (TS: Issue 2026-08-05-api-mod-callers-updated-indirectly、Python: #38・#251)。
 ///
 /// 同名定義が複数ある場合: 変更対象ファイル (`target_new_path`) 内の定義が 1 つに
 /// 特定できなければ従来どおり false。他ファイルの同名定義は、JS/TS/TSX のトップレベル
@@ -1038,7 +1042,9 @@ fn rust_member_site(
 /// 2. Python の Protocol 引数の証拠は diff 外の参照も閉じる (diff ファイルを探すより先)。
 /// 3. 参照のあるファイルが diff に無ければ未更新の可能性がある。
 /// 4. 参照行、または参照を callee とする複数行の呼び出しが実変更行にあれば追随済み。
-/// 5. 呼び出し式が無変更でも、引数の共有 const の定義側が同一 diff で更新されていれば追随済み。
+/// 5. Python の戻り値の注釈だけの変更なら、呼び出しの結果の読み取りがすべて新しい型に合わせて
+///    書き換えた比較にあれば追随済み (呼び出しの行は context のままでよい)。
+/// 6. 呼び出し式が無変更でも、引数の共有 const の定義側が同一 diff で更新されていれば追随済み。
 fn prove_reference_updated(
     input: &ModifiedClosureInput<'_>,
     target: &ClosureTarget<'_>,
@@ -1134,6 +1140,14 @@ fn prove_reference_updated(
     // トップレベル関数だけを対象にし、メソッド・クラス等や他言語の API からは範囲を広げない。
     if enclosing_call_line_range(dir, r, bare, python_function, caches)
         .is_some_and(|(start, end)| (start..=end).any(|line| changed.contains(&line)))
+    {
+        return true;
+    }
+    // Python の戻り値の注釈だけの変更では、呼び出しの文は変えずに結果を使う文を直す。
+    // git diff が呼び出しの行を旧版の別の行と対応付けて context 行にしても、結果の読み取りが
+    // すべて新しい型に合わせて書き換えた比較なら追随済み (Issue #251)。
+    if let ClosureArgEvidence::PythonReturnContract(contract) = arg_evidence
+        && contract.closes_reference(dir, df, r, bare, caches)
     {
         return true;
     }
@@ -1632,6 +1646,10 @@ pub(crate) struct ApiClosureCaches {
     /// (`ModifiedClosureInput::moved_from`)。
     moved_member_changed_lines:
         std::collections::HashMap<(String, String), std::rc::Rc<std::collections::HashSet<usize>>>,
+    /// Python の呼び出し側ファイルの旧版パス → 旧版の文の単位のトークン列
+    /// (`python_return_usage`)。`None` は読めない・解析できないファイル。
+    pub(super) python_old_statement_units:
+        std::collections::HashMap<String, Option<std::rc::Rc<std::collections::HashSet<String>>>>,
 }
 
 /// 参照行が named export clause (`export { X }` / `export type { X }`) かを判定する。

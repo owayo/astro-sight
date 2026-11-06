@@ -1864,6 +1864,68 @@ fn review_hook_python_multiline_unchecked_class_call_stays_blocking() {
     );
 }
 
+/// Issue #251: 戻り値の注釈だけを変え、新しく足したテスト関数の呼び出し行が旧版の別の関数と
+/// 同じ文字列だと、git diff はその行を context 行にする。結果の比較を新しい型に合わせて
+/// 書き換えていれば `mod_closed` にして終了コードを 0 にし、旧契約の比較が残る対照は `mod`
+/// のまま 1 で終える。staged では index のスナップショットを base の旧版と比べる。
+#[test]
+fn review_hook_python_return_annotation_change_follows_rewritten_result_comparisons() {
+    let app_before = "def build():\n    return \"done\"\n\n\ndef entry():\n    return build()\n\n\nif __name__ == \"__main__\":\n    print(entry())\n";
+    let app_after = "def build():\n    return \"done\"\n\n\ndef entry() -> int:\n    return 0 if build() else 1\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(entry())\n";
+    let test_before = "from app import entry\n\n\ndef test_entry_returns_text():\n    result = entry()\n    assert result == \"done\"\n";
+    for (label, test_after, closed) in [
+        (
+            "new test function reuses the old call line",
+            "from app import build, entry\n\n\ndef test_build_returns_text():\n    assert build() == \"done\"\n\n\ndef test_entry_returns_exit_code():\n    result = entry()\n    assert result == 0\n",
+            true,
+        ),
+        (
+            "old comparison is kept",
+            "from app import entry\n\n\ndef test_entry_returns_text():\n    print(\"checking\")\n    result = entry()\n    assert result == \"done\"\n",
+            false,
+        ),
+    ] {
+        for staged in [false, true] {
+            let repo = TestRepo::new();
+            repo.write("app.py", app_before);
+            repo.write("test_app.py", test_before);
+            repo.init_git();
+            repo.commit_all("base");
+            repo.write("app.py", app_after);
+            repo.write("test_app.py", test_after);
+            let mut command = cargo_bin();
+            command
+                .args(["review", "--git", "--hook", "--dir"])
+                .arg(repo.root());
+            if staged {
+                repo.stage_all();
+                // 作業ツリーだけを旧版の呼び出し側に戻し、index の内容で判定することを確かめる。
+                repo.write("test_app.py", test_before);
+                command.arg("--staged");
+            }
+            let output = command.output().expect("run review");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(i32::from(!closed)),
+                "{label} (staged={staged}): {stderr}"
+            );
+            let json: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+            for (category, expected) in [("mod_closed", closed), ("mod", !closed)] {
+                assert_eq!(
+                    json["api"][category]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|symbol| symbol["n"] == "entry"),
+                    expected,
+                    "{label} (staged={staged}): {stderr}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn review_hook_multiline_jsx_checks_only_the_opening_tag() {
     let before = "import { memo } from 'react';\nexport const Card = memo(function Card({ label }: { label: string }) {\n  return <span>{label}</span>;\n});\n";
