@@ -2,6 +2,7 @@
 //!
 //! 通常引数の binding-side `mut` 除去と、root-level の公開 type alias の導入・展開だけで
 //! 実体型が変わらないことの old/new AST 証明、関数に `const` を足しただけの証明を担う。
+//! const / static の初期値だけの変更の比較 (`const_value`) もここに置く。
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -14,8 +15,10 @@ use crate::engine::tree_walk::{Children, Walk, any_node, walk_preorder};
 use crate::language::LangId;
 
 mod const_qualifier;
+mod const_value;
 mod parameter_patterns;
 pub(crate) use const_qualifier::{RustConstQualifier, RustFileItems, rust_const_qualifier};
+pub(crate) use const_value::{is_type_like_name, rust_const_value_contract};
 pub(crate) use parameter_patterns::{
     rust_parameter_import_environment, rust_parameter_pattern_contract,
 };

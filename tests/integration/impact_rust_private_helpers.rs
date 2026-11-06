@@ -15,10 +15,12 @@ fn impact_rust_independent_root_values_ignore_initializer_mentions() {
             "src/lib.rs",
             "mod changed; mod local; mod real;\nmacro_rules! marker { () => {} }\nmarker!();\n",
         );
+        // 定数の側は型を変える。初期値だけの変更は、関数の本体で値を読むだけの参照を情報提供に
+        // 回す (Issue #257) ので、本当の呼び出し元が impacted_callers に残る対照にならない。
         let (before, after, local, real) = if constant {
             (
                 "mod child;\nconst KNOWN_FLAGS: u8 = 1;\n",
-                "mod child;\nconst KNOWN_FLAGS: u8 = 3;\n",
+                "mod child;\nconst KNOWN_FLAGS: u16 = 3;\n",
                 "const KNOWN_FLAGS: u8 = 1;\npub fn local() -> u8 { let result = KNOWN_FLAGS; if matches!(result, 0) { 0 } else { result } }\n#[cfg(test)] mod tests {}\n",
                 "pub fn real() {}\n",
             )

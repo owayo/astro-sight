@@ -108,6 +108,9 @@ pub(super) struct RefEventMini {
     pub(super) rust_local_owner: bool,
     pub(super) rust_direct_import_site: bool,
     pub(super) rust_import_binding_safe: bool,
+    /// 初期値だけを変えた非公開の Rust の const / static の参照の、値の使われ方
+    /// (`rust_const_value::classify`)。対象の名前でなければ `Unproven`。
+    pub(super) rust_value_use: super::rust_const_value::RustValueUse,
 }
 
 /// 汎用すぎてシンボル名だけでは owner を特定できない PHP/JS 系メソッド名。
@@ -208,8 +211,21 @@ impl RouteDecisionContext<'_> {
         // を足しただけと証明できたシグネチャ変更は、caller を消さず informational に残す。
         let compatible_signature_informational =
             file_context.compatible_signature_keys.contains(symbol_name);
+        // 初期値だけを変えた非公開の const / static は、`const` の付かない関数の本体で値を
+        // そのまま使う参照を情報提供に回す (static は借用などの場所としての利用も。const を
+        // 場所として使う参照は値が `'static` へ昇格できるかで変わるので通常のまま)。
+        // 値変更のポリシー分類で、互換の証明ではない。
+        let value_only_informational = file_context
+            .rust_value_only_constants
+            .get(symbol_name)
+            .is_some_and(|constant| match event.rust_value_use {
+                super::rust_const_value::RustValueUse::Read => true,
+                super::rust_const_value::RustValueUse::Place => constant.is_static,
+                super::rust_const_value::RustValueUse::Unproven => false,
+            });
 
         let route_informational = compatible_signature_informational
+            || value_only_informational
             || fn_value_informational
             || reexport_move_informational
             || (event.is_import
@@ -326,6 +342,8 @@ pub(super) struct ImpactCollector<'a> {
         std::cell::OnceCell<Option<super::python_imports::PythonImportIndex>>,
     pub(super) rust_std_origin:
         std::cell::OnceCell<Option<super::rust_std_origin::RustStdOriginIndex>>,
+    /// 参照ファイルが差し替える標準マクロの名前 (`rust_const_value::LocalMacros`)。
+    pub(super) rust_local_macros: std::cell::OnceCell<super::rust_const_value::LocalMacros>,
     pub(super) rust_path_owner: std::cell::OnceCell<super::rust_path_owner::RustPathOwnerIndex>,
     pub(super) rust_path_owner_project: &'a super::rust_path_owner::RustPathOwnerProjectProof,
     pub(super) rust_source_paths: &'a [Option<PathBuf>],
@@ -724,6 +742,25 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             && rust_owner_index.zip(node).is_some_and(|(index, node)| {
                 index.plain_import_binding_safe(node, source, &self.all_symbol_names[ix])
             });
+        // 初期値だけを変えた非公開の const / static の参照だけ、値の使われ方を構文で確かめる。
+        let rust_value_use = match node {
+            Some(node)
+                if self.ref_lang == Some(LangId::Rust)
+                    && self.sym_to_fc.get(ix).is_some_and(|contexts| {
+                        contexts.iter().any(|&fc_ix| {
+                            self.file_contexts[fc_ix as usize]
+                                .rust_value_only_constants
+                                .contains_key(&self.all_symbol_names[ix])
+                        })
+                    }) =>
+            {
+                let local_macros = self
+                    .rust_local_macros
+                    .get_or_init(|| super::rust_const_value::LocalMacros::collect(node, source));
+                super::rust_const_value::classify(node, source, local_macros)
+            }
+            _ => super::rust_const_value::RustValueUse::Unproven,
+        };
 
         let jsx_shape_id = if self.ref_lang == Some(LangId::Tsx) {
             node.and_then(|node| {
@@ -780,6 +817,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             rust_local_owner,
             rust_direct_import_site,
             rust_import_binding_safe,
+            rust_value_use,
         });
     }
 }
@@ -1531,6 +1569,7 @@ mod tests {
             rust_local_owner: false,
             rust_direct_import_site: false,
             rust_import_binding_safe: false,
+            rust_value_use: super::super::rust_const_value::RustValueUse::Unproven,
         }
     }
 
@@ -1669,6 +1708,7 @@ mod tests {
             rust_private_method_owners: Default::default(),
             rust_private_widening_names: Default::default(),
             rust_explicit_widenings: Default::default(),
+            rust_value_only_constants: Default::default(),
         }
     }
 
@@ -1791,6 +1831,57 @@ mod tests {
             decide_route(&ev(0, 0), &transparent_alias, true),
             CallerRoute::Informational,
             "証明済み alias 導入は low/high より優先して informational に残す"
+        );
+    }
+
+    /// 初期値だけを変えた非公開の const / static は、関数の本体で値をそのまま使う参照と、static を
+    /// 場所として使う参照だけを情報提供に回す (Issue #257)。
+    #[test]
+    fn route_decision_demotes_only_runtime_uses_of_value_only_constants() {
+        use super::super::rust_const_value::RustValueUse;
+        let constant = |is_static: bool| {
+            let mut context = file_context(Vec::new(), Vec::new());
+            context.rust_value_only_constants.insert(
+                "target".to_owned(),
+                super::super::declaration::RustValueOnlyConstant {
+                    is_static,
+                    type_names: Default::default(),
+                },
+            );
+            context
+        };
+        let event = |value_use: RustValueUse| {
+            let mut event = ev(0, 0);
+            event.rust_value_use = value_use;
+            event
+        };
+        for is_static in [false, true] {
+            assert_eq!(
+                decide_route(&event(RustValueUse::Read), &constant(is_static), false),
+                CallerRoute::Informational
+            );
+            assert_eq!(
+                decide_route(&event(RustValueUse::Unproven), &constant(is_static), false),
+                CallerRoute::Normal
+            );
+        }
+        assert_eq!(
+            decide_route(&event(RustValueUse::Place), &constant(true), false),
+            CallerRoute::Informational
+        );
+        assert_eq!(
+            decide_route(&event(RustValueUse::Place), &constant(false), false),
+            CallerRoute::Normal,
+            "const を場所として使う参照は値が 'static へ昇格できるかで変わる"
+        );
+        // 対照: 初期値だけの変更の証明が無ければ、値の読み出しでも通常のまま。
+        assert_eq!(
+            decide_route(
+                &event(RustValueUse::Read),
+                &file_context(Vec::new(), Vec::new()),
+                false
+            ),
+            CallerRoute::Normal
         );
     }
 }

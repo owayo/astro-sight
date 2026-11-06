@@ -11,6 +11,7 @@ mod reexport_move;
 mod rust_assert_include;
 pub(crate) mod rust_cargo_config;
 pub(crate) mod rust_cargo_reachability;
+mod rust_const_value;
 mod rust_impl_owner;
 mod rust_line_endings;
 mod rust_path_owner;
@@ -134,6 +135,9 @@ struct FileContext {
     /// Names whose entire source edit only widens a direct private Rust item.
     rust_private_widening_names: HashSet<String>,
     rust_explicit_widenings: HashMap<String, rust_visibility_scope::ExplicitWidening>,
+    /// 初期値だけを変えた非公開の Rust の const / static (`ci_key` 正規化済み)。
+    /// 関数の本体で値を読むだけの参照を情報提供に回す (`rust_const_value`)。
+    rust_value_only_constants: HashMap<String, declaration::RustValueOnlyConstant>,
 }
 
 fn rust_function_names(lang: LangId, affected: &[AffectedSymbol]) -> HashSet<String> {
@@ -847,6 +851,7 @@ fn collect_affected_symbols(
             sig_changes: &sig_changes,
             rust_kind_changes: &declaration_proof.rust_kind_changes,
             rust_alias_changes: &declaration_proof.rust_alias_changes,
+            rust_value_only_constants: &declaration_proof.rust_value_only_constants,
             rust_private_method_owners: &rust_private_method_owners,
             diff_input: file_diff,
             file_path: &df.new_path,
@@ -983,6 +988,11 @@ fn collect_affected_symbols(
             rust_private_method_owners,
             rust_private_widening_names,
             rust_explicit_widenings,
+            rust_value_only_constants: declaration_proof
+                .rust_value_only_constants
+                .into_iter()
+                .map(|(name, constant)| (ci_key(lang_id, &name), constant))
+                .collect(),
             affected,
             sig_changes,
             compatible_signature_keys,
@@ -994,6 +1004,7 @@ fn collect_affected_symbols(
             jsx_prop_changes,
         });
     }
+    revoke_value_only_constants_with_changed_types(&mut file_contexts);
 
     (
         file_contexts,
@@ -1001,6 +1012,43 @@ fn collect_affected_symbols(
         method_parent_types,
         included_symbols,
     )
+}
+
+/// 初期値だけの変更の証明 (`declaration::rust_value_only_constants`) は、定数と同じファイルの
+/// 宣言を直接含むスコープしか比べない。型に現れる名前 (たどった名前を含む) と同じ名前の宣言を
+/// 差分の Rust のファイルが変えていれば (`use crate::Note;` の先の `struct Note` のフィールド、
+/// 同じファイルの別のスコープの `impl Sizes { const N }` など)、同じ字面の型でも意味が変わりうる
+/// ので証明を取り消し、参照を通常の振り分けに戻す。定数自身の変更は数えない。
+fn revoke_value_only_constants_with_changed_types(file_contexts: &mut [FileContext]) {
+    if file_contexts
+        .iter()
+        .all(|context| context.rust_value_only_constants.is_empty())
+    {
+        return;
+    }
+    let changed_names: Vec<HashSet<String>> = file_contexts
+        .iter()
+        .map(|context| {
+            if context.lang_id != LangId::Rust {
+                return HashSet::new();
+            }
+            context
+                .affected
+                .iter()
+                .map(|symbol| ci_key(LangId::Rust, &symbol.name))
+                .collect()
+        })
+        .collect();
+    for (ix, context) in file_contexts.iter_mut().enumerate() {
+        context.rust_value_only_constants.retain(|key, constant| {
+            !changed_names.iter().enumerate().any(|(other, names)| {
+                constant.type_names.iter().any(|name| {
+                    let name = ci_key(LangId::Rust, name);
+                    (other != ix || name != *key) && names.contains(&name)
+                })
+            })
+        });
+    }
 }
 
 /// シンボルの全行 (`sym_start..=sym_end`, 0-indexed) が新規追加行 (`changed_new_lines`)
