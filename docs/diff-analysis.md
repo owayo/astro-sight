@@ -353,7 +353,7 @@ To turn off the default exclusions:
 ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1 astro-sight impact --dir . --git
 ```
 
-The exclusion of `.gitignore`d and hidden files and the detection of generated files (through `refs::collect_files`) are separate mechanisms from these default exclusions. Of these, only the exclusion of generated files can be turned off, with `--include-generated` or `skip_generated = false`.
+The exclusion of `.gitignore`d and hidden files is a separate mechanism from these default exclusions and always applies. Generated files (a generated-file declaration in the header, and so on) are not excluded: as in dead-code's reference counting, they are searched for callers like any other source. Generated code depends on hand-written declarations at run time (a tree-sitter `parser.c` declares and calls the external scanner functions in `scanner.c`), so changing such a signature breaks the generated code, which needs regenerating. Unlike `refs` and `symbols`, `--include-generated` / `skip_generated` do not change this search.
 
 ### Additional Exclusions You Specify
 

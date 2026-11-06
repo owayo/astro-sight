@@ -59,6 +59,16 @@ impl FileScanOptions {
     pub const DEAD_CODE_REFERENCES: Self = Self {
         include_generated: true,
     };
+
+    /// impact (context / impact / review) の呼び出し元の検索の走査条件。
+    ///
+    /// dead-code の参照集計と同じく、生成物も `--include-generated` と無関係に必ず含める。
+    /// 生成コードは手書きコードの宣言や関数を実行時に使い (tree-sitter の `parser.c` →
+    /// 外部スキャナの関数)、その型を変えると生成コードが壊れる。生成物という理由だけで
+    /// 呼び出し元から外すと、この影響を黙って見落とす。
+    pub const IMPACT_CALLERS: Self = Self {
+        include_generated: true,
+    };
 }
 
 /// Files selected for parsing plus generated files intentionally omitted.
@@ -337,23 +347,7 @@ pub fn collect_files_scan(
 ///   内部で `!<pattern>` として `ignore::overrides` に追加し、パッケージパス内の特定サブ
 ///   ディレクトリだけをピンポイント除外する。
 ///
-/// 両方が空であれば `collect_files(dir, glob)` と同じ挙動。`.gitignore` は常に尊重する。
-pub fn collect_files_with_excludes(
-    dir: &Path,
-    glob_pattern: Option<&str>,
-    excluded_dir_names: &[&str],
-    excluded_globs: &[&str],
-) -> Result<Vec<std::path::PathBuf>> {
-    Ok(collect_files_scan_with_excludes(
-        dir,
-        glob_pattern,
-        excluded_dir_names,
-        excluded_globs,
-        FileScanOptions::default(),
-    )?
-    .files)
-}
-
+/// 両方が空であれば `collect_files_scan(dir, glob, options)` と同じ挙動。`.gitignore` は常に尊重する。
 pub fn collect_files_scan_with_excludes(
     dir: &Path,
     glob_pattern: Option<&str>,

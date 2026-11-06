@@ -42,8 +42,9 @@ const CHUNK_SIZE: usize = 128;
 ///
 /// 解除する場合は `ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1` を設定する
 /// (環境変数名は v26.5.115 互換のため変更しない。新規 build artifact 除外も同じ
-/// フラグで一括解除される)。`.gitignore` / hidden file / generated file の除外
-/// (refs::collect_files の挙動) は引き続き有効で、本リストとは別系統。
+/// フラグで一括解除される)。`.gitignore` / hidden file の除外は本リストとは別系統で
+/// 引き続き有効。生成物 (ヘッダーの生成宣言などで判定したファイル) は除外せず、
+/// 呼び出し元として探す (`FileScanOptions::IMPACT_CALLERS`)。
 const IMPACT_DEFAULT_EXCLUDED_DIRS: &[&str] = &[
     // vendor / package manager trees
     "vendor",
@@ -199,7 +200,15 @@ fn prepare_scan(
     excluded_dirs.sort_unstable();
     excluded_dirs.dedup();
     let excluded_globs: Vec<&str> = options.exclude_globs.iter().map(String::as_str).collect();
-    let mut files = refs::collect_files_with_excludes(dir, None, &excluded_dirs, &excluded_globs)?;
+    // 生成物も呼び出し元として探す (`FileScanOptions::IMPACT_CALLERS`)。
+    let mut files = refs::collect_files_scan_with_excludes(
+        dir,
+        None,
+        &excluded_dirs,
+        &excluded_globs,
+        refs::FileScanOptions::IMPACT_CALLERS,
+    )?
+    .files;
     if cargo_aware_bin_exclusion {
         let mut cargo_package_roots: HashMap<std::path::PathBuf, bool> = HashMap::new();
         files.retain(|path| {

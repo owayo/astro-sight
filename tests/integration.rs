@@ -77,6 +77,7 @@ mod integration {
     mod signature_type_dependencies;
     mod static_const_values;
     mod swift_grammar;
+    mod tree_sitter_generated;
     mod ts_extension_changes;
     mod ts_import_alias;
     mod ts_namespace_collisions;
