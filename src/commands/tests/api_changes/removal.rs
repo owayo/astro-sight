@@ -191,6 +191,71 @@ fn detect_api_changes_deleted_source_missing_everywhere_reports_mismatch() {
     }));
 }
 
+/// 削除と、対応言語の外への内容同一の rename は、どちらも旧ファイルの削除として準備する。
+/// base と照合できない旧ソースは、diff の順にそれぞれの主語で申告する。
+#[test]
+fn detect_api_changes_reports_unverified_deleted_and_renamed_sources_in_diff_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    let kept = "export function kept(): void {}\n";
+    git_commit_files(repo, &[("kept.ts", kept)], "base");
+    fs::remove_file(repo.join("kept.ts")).expect("remove renamed source");
+    fs::write(repo.join("kept.ts.bak"), kept).expect("write verified rename");
+    fs::write(repo.join("moved.rs.bak"), "pub struct Moved;\n").expect("write unverified rename");
+    let deleted = crate::models::impact::DiffFile {
+        old_path: "gone/src/lib.rs".to_string(),
+        new_path: "/dev/null".to_string(),
+        hunks: vec![],
+        deleted_old_source: None,
+    };
+    let renamed = crate::models::impact::DiffFile {
+        old_path: "moved.rs".to_string(),
+        new_path: "moved.rs.bak".to_string(),
+        hunks: vec![],
+        deleted_old_source: None,
+    };
+    // 対照: base にある旧ソースは照合でき、申告せずに旧ファイルの API を削除として扱う。
+    let verified_rename = crate::models::impact::DiffFile {
+        old_path: "kept.ts".to_string(),
+        new_path: "kept.ts.bak".to_string(),
+        hunks: vec![],
+        deleted_old_source: None,
+    };
+    let api = detect_api_changes(
+        repo.to_str().expect("utf-8 path"),
+        "HEAD",
+        &[renamed, verified_rename, deleted],
+    );
+    let mismatches: Vec<_> = api
+        .parse_truncations
+        .iter()
+        .filter(|item| item.reason == crate::models::truncation::TruncationReason::DiffBaseMismatch)
+        .map(|item| (item.path.as_deref(), item.message.as_str()))
+        .collect();
+    assert_eq!(
+        mismatches,
+        vec![
+            (
+                Some("moved.rs"),
+                "renamed file's old source cannot be verified against the requested base",
+            ),
+            (
+                Some("gone/src/lib.rs"),
+                "deleted file's old source cannot be verified against the requested base",
+            ),
+        ],
+        "{api:?}"
+    );
+    assert!(
+        api.removed
+            .iter()
+            .chain(&api.removed_dead)
+            .any(|symbol| symbol.name == "kept" && symbol.file == "kept.ts"),
+        "a rename with a verified old source must still remove its API: {api:?}"
+    );
+}
+
 #[test]
 fn detect_api_changes_deleted_non_source_and_gitlink_do_not_report_mismatch() {
     let dir = tempfile::tempdir().expect("tempdir");

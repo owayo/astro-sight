@@ -53,22 +53,6 @@ pub(crate) fn api_diff_files<'a>(
     std::borrow::Cow::Owned(diff_files.iter().cloned().chain(hunkless_renames).collect())
 }
 
-/// 削除扱いにしたファイル (削除 / 対応言語外への rename) が bash なら、関数名を
-/// ApiRefIndex の検索対象に入れる。残存参照判定 (`is_removed_bash_symbol_unreferenced`) を
-/// 関数ごとの全リポジトリ走査ではなく index から引くため。bash の関数名は `.` を含みうるので
-/// bare name に畳まず、そのままの名前で検索する。
-fn collect_deleted_bash_index_names(
-    df: &crate::models::impact::DiffFile,
-    old_syms: Option<&[(String, String, String)]>,
-    index_names: &mut HashSet<String>,
-) {
-    if is_bash_script_path(&df.old_path)
-        && let Some(syms) = old_syms
-    {
-        index_names.extend(syms.iter().map(|(name, _, _)| name.clone()));
-    }
-}
-
 /// rename の旧パスは拡張子で言語を判定できるが、新パスはできない (`api.ts` → `api.ts.bak`)。
 fn renames_out_of_known_extension(df: &crate::models::impact::DiffFile) -> bool {
     let known =
@@ -111,183 +95,23 @@ pub(crate) fn detect_api_changes_with_renames(
 
     let canonical_dir = std::fs::canonicalize(dir).ok();
 
-    // Phase 0: added / modified / deleted ファイルの exported シンボルを抽出し、cross-file
-    // 参照判定の対象になりうる name を集めて ApiRefIndex を構築する。候補シンボルごとの
-    // 全リポジトリ走査 (O(候補数 × 全ファイル)) を chunk 単位の batch 検索に集約する。
-    let mut prepared: Vec<PreparedDiffFile> = Vec::with_capacity(diff_files.len());
-    let mut index_names: HashSet<String> = HashSet::new();
-    let mut unverified_deleted_paths: HashSet<String> = HashSet::new();
     // 変更 / 削除ファイルの旧版はここで 1 プロセスの `git cat-file --batch` から読む。
     let base_blobs = crate::commands::git_input::GitBlobBatch::new(dir, base);
-    for df in diff_files {
-        if should_skip_diff_file(df, &gitattrs, canonical_dir.as_deref()) {
-            prepared.push(PreparedDiffFile::Skip);
-            continue;
-        }
-        if df.old_path == "/dev/null" {
-            // new_path を 1 回 read+parse して exported / callees を導出 (perf #2)。
-            let facts = extract_new_file_facts(dir, &df.new_path);
-            buckets.parse_truncations.extend(facts.parse_truncations);
-            let new_syms = facts.exported.map(|facts| facts.symbols);
-            let in_file_callees = facts.callees;
-            if let Some(syms) = &new_syms {
-                for (name, _, _) in syms {
-                    // per-symbol 実装と同じ短絡: ファイル内から呼ばれるシンボルは
-                    // `is_used_in_diff_paths` に到達しないため検索対象に入れない。
-                    if !is_internally_connected(&in_file_callees, name) {
-                        index_names.insert(bare_name(name).to_string());
-                    }
-                }
-            }
-            prepared.push(PreparedDiffFile::Added {
-                new_syms,
-                in_file_callees,
-            });
-            continue;
-        }
-        if df.new_path == "/dev/null" {
-            let facts = extract_deleted_file_exported_symbols(&base_blobs, df);
-            if facts.old_source_unverified && facts.analyzable_source {
-                unverified_deleted_paths.insert(df.old_path.clone());
-                buckets
-                    .parse_truncations
-                    .push(crate::models::truncation::TruncationInfo::new(
-                        Some(df.old_path.clone()),
-                        crate::models::truncation::TruncationReason::DiffBaseMismatch,
-                        "deleted file's old source cannot be verified against the requested base"
-                            .to_string(),
-                    ));
-            }
-            collect_deleted_bash_index_names(df, facts.symbols.as_deref(), &mut index_names);
-            prepared.push(PreparedDiffFile::Deleted {
-                old_syms: facts.symbols,
-                old_source_unverified: facts.old_source_unverified,
-            });
-            continue;
-        }
-        // hunk の無い rename (内容同一) はシンボルが変わらない。旧側が拡張子で判定できる
-        // ソースで、新側が対応言語の外へ出た (拡張子でも shebang でも言語を判定できない) 場合
-        // だけ、旧ファイルの削除として扱う。内容が同一なので、旧側を拡張子で判定できなければ
-        // 旧側の言語も新側と同じ shebang で決まり、API 面は変わらない。
-        if df.hunks.is_empty() {
-            let leaves_source = renames_out_of_known_extension(df)
-                && extract_new_file_facts(dir, &df.new_path).language_unknown;
-            prepared.push(if leaves_source {
-                let facts = extract_deleted_file_exported_symbols(&base_blobs, df);
-                if facts.old_source_unverified && facts.analyzable_source {
-                    unverified_deleted_paths.insert(df.old_path.clone());
-                    buckets
-                        .parse_truncations
-                        .push(crate::models::truncation::TruncationInfo::new(
-                        Some(df.old_path.clone()),
-                        crate::models::truncation::TruncationReason::DiffBaseMismatch,
-                        "renamed file's old source cannot be verified against the requested base"
-                            .to_string(),
-                    ));
-                }
-                collect_deleted_bash_index_names(df, facts.symbols.as_deref(), &mut index_names);
-                PreparedDiffFile::Deleted {
-                    old_syms: facts.symbols,
-                    old_source_unverified: facts.old_source_unverified,
-                }
-            } else {
-                PreparedDiffFile::Skip
-            });
-            continue;
-        }
-        // rename 差分では base 側に新パスが存在しないため、旧版は old_path から読む。
-        let mut old_facts = extract_exported_file_facts_from_git(&base_blobs, &df.old_path);
-        // new_path を 1 回 read+parse して exported / callees / export surface を導出 (perf #2)。
-        // export surface は process_modified_file が再 parse せず使えるよう
-        // PreparedDiffFile に持たせる。
-        let mut facts = extract_new_file_facts(dir, &df.new_path);
-        buckets.parse_truncations.extend(facts.parse_truncations);
-        // 対応言語でないファイルへの rename (`api.ts` → `api.ts.bak`) は、新側に API 面が
-        // 無いので旧ファイルの削除と同じ。変更ファイルとして扱うと新側のシンボルが取れず
-        // 何も検出されない (旧 API がすべて消えるのに api.rm が出ない)。
-        // 読み込み / parse の失敗は「API 面が無い」証明ではないので対象外。同じパスのまま
-        // shebang を消した拡張子なしスクリプトのような in-place 変更も、パスで参照する
-        // 利用側は壊れないので対象外 (rename に限る)。
-        if df.old_path != df.new_path
-            && old_facts.is_some()
-            && facts.exported.is_none()
-            && facts.language_unknown
-        {
-            let old_syms = old_facts.map(|facts| facts.symbols);
-            collect_deleted_bash_index_names(df, old_syms.as_deref(), &mut index_names);
-            prepared.push(PreparedDiffFile::Deleted {
-                old_syms,
-                old_source_unverified: false,
-            });
-            continue;
-        }
-        // 同じ parse で得た証拠を比較し、以後は証明済みの名前だけを運ぶ。
-        let (parameter_pattern_only_names, rust_const_additions) = if df.old_path == df.new_path {
-            old_facts
-                .as_ref()
-                .zip(facts.exported.as_ref())
-                .map(|(old, new)| {
-                    (
-                        old.parameter_pattern_only_names(new),
-                        old.const_addition_names(new, || {
-                            load_old_source_with_new(
-                                &base_blobs,
-                                &df.old_path,
-                                &df.new_path,
-                                load_new_source(dir, &df.new_path)?,
-                            )
-                        }),
-                    )
-                })
-                .unwrap_or_default()
-        } else {
-            (HashSet::new(), HashSet::new())
-        };
-        let type_dependencies = old_facts
-            .as_mut()
-            .and_then(|old| old.type_dependencies.take())
-            .zip(
-                facts
-                    .exported
-                    .as_mut()
-                    .and_then(|new| new.type_dependencies.take()),
-            )
-            .map(|(old, new)| old.compare(new))
-            .unwrap_or_default();
-        let old_syms = old_facts.map(|facts| facts.symbols);
-        let new_syms = facts.exported.map(|facts| facts.symbols);
-        let in_file_callees = facts.callees;
-        let new_export_surface_names = facts.export_surface_names;
-        if let (Some(old), Some(new)) = (&old_syms, &new_syms) {
-            index_names.extend(
-                new.iter()
-                    .filter(|(name, _, _)| {
-                        type_dependencies.get(name)
-                            == Some(&ts_signature::DependencyStatus::Changed)
-                    })
-                    .map(|(name, _, _)| bare_name(name).to_owned()),
-            );
-            collect_modified_file_index_names(
-                old,
-                new,
-                &in_file_callees,
-                &parameter_pattern_only_names,
-                is_bash_script_path(&df.old_path),
-                ts_namespace::recovery_language(&df.old_path, &df.new_path),
-                &mut index_names,
-            );
-        }
-        prepared.push(PreparedDiffFile::Modified {
-            type_dependencies: Box::new(type_dependencies),
-            unparsed_declarations: facts.unparsed_declarations,
-            old_syms,
-            new_syms,
-            parameter_pattern_only_names,
-            rust_const_additions,
-            in_file_callees,
-            new_export_surface_names,
-        });
-    }
+    // Phase 0: diff ファイルごとの事実と、ApiRefIndex で検索する名前を先に集める。
+    let PreparedDiff {
+        files: prepared,
+        mut index_names,
+        unverified_deleted_paths,
+        parse_truncations,
+    } = PreparedDiff::new(
+        dir,
+        diff_files,
+        &gitattrs,
+        canonical_dir.as_deref(),
+        &base_blobs,
+    );
+    buckets.parse_truncations.extend(parse_truncations);
+
     // 型の移動と同じ差分でシグネチャの変わったメンバー、移動と同じ差分でシグネチャの変わった
     // 自由関数・定数は、削除と追加に割れた後で変更として判定し直す
     // (`pair_moved_member_changes` / `pair_moved_symbol_changes`)。その名前も検索対象に入れておく。
