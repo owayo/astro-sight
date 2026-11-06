@@ -176,6 +176,49 @@ def cases(input_root):
     return result
 
 
+def escape_cases(input_root):
+    """書式マクロの名前とエスケープを含むが検索名を含まないファイルが多い入力と、対照を測る。
+
+    Rust の書式マクロの暗黙キャプチャはエスケープで綴れるので、事前フィルタはこの印を持つ
+    ファイルを特別に扱う。印だけを外した `plain` を対照にする。
+    """
+    result = []
+    for variant, label in (("escapes", r"\x41\u{42}"), ("plain", "AB")):
+        root = input_root / variant
+        (root / "src").mkdir(parents=True, exist_ok=True)
+        (root / "src" / "target.rs").write_text(
+            "pub const TARGET_NAME: u32 = 1;\n", encoding="utf-8"
+        )
+        for user in range(5):
+            (root / "src" / f"user_{user}.rs").write_text(
+                "use crate::target::TARGET_NAME;\n"
+                f"pub fn use_{user}() -> u32 {{ TARGET_NAME + {user} }}\n",
+                encoding="utf-8",
+            )
+        for noise in range(240):
+            helpers = "\n".join(
+                f"pub fn helper_{noise}_{index}(input: &[u32]) -> u32 {{\n"
+                f"    input.iter().map(|x| if *x > {index} {{ x * 2 }} else {{ x + 1 }}).sum()\n"
+                "}"
+                for index in range(40)
+            )
+            (root / "src" / f"noise_{noise}.rs").write_text(
+                f"pub fn render_{noise}(value: u32) -> String {{\n"
+                f'    let label = "{label}";\n'
+                '    format!("{label}: {value}")\n'
+                f"}}\n{helpers}\n",
+                encoding="utf-8",
+            )
+        for name, arguments in (
+            (f"{variant}-refs", ["--name", "TARGET_NAME"]),
+            (f"{variant}-refs-batch", ["--names", "TARGET_NAME,OTHER_NAME"]),
+        ):
+            result.append(
+                (name, ["refs", "--dir", root, *arguments, "--format", "json"])
+            )
+    return result
+
+
 def symbol_cases(input_root):
     """型とメソッドが増える入力、型のない対照と実ソースを測る。"""
     result = []
@@ -298,7 +341,9 @@ def main():
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--repeats", type=int, default=9)
     parser.add_argument("--mode", choices=("cli", "session"), default="cli")
-    parser.add_argument("--suite", choices=("refs", "symbols"), default="refs")
+    parser.add_argument(
+        "--suite", choices=("refs", "symbols", "escapes"), default="refs"
+    )
     options = parser.parse_args()
     if options.repeats < 3:
         parser.error("--repeats must be at least 3")
@@ -310,7 +355,9 @@ def main():
         "after": options.candidate.resolve(strict=True),
     }
     rows, summary = [], []
-    selected = cases(inputs) if options.suite == "refs" else symbol_cases(inputs)
+    selected = {"refs": cases, "symbols": symbol_cases, "escapes": escape_cases}[
+        options.suite
+    ](inputs)
     if options.mode == "session":
         # ディレクトリの symbols は NDJSON 複数行なので CLI だけで測る。
         selected = [
