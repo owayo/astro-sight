@@ -3027,3 +3027,481 @@ fn literal_alias_change_ignores_test_path_but_reports_production_path() {
         "テストファイルの Literal 縮小は api.mod に出してはならない"
     );
 }
+
+/// 定義と呼び出し側を旧版でコミットし、作業ツリーを新版に書き換えて API 差分を検出する。
+fn python_return_change(
+    definition: (&str, &str),
+    caller: (&str, &str),
+) -> crate::models::review::ApiChanges {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[("app.py", definition.0), ("test_app.py", caller.0)],
+        "initial",
+    );
+    fs::write(repo.join("app.py"), definition.1).expect("write definition");
+    fs::write(repo.join("test_app.py"), caller.1).expect("write caller");
+    detect_api_changes_from_worktree(repo)
+}
+
+/// `name` が `modified_closed_in_diff` に入り、`modified` に残らないか (どちらか一方に入ることも確かめる)。
+fn closed_in_diff(changes: &crate::models::review::ApiChanges, name: &str) -> bool {
+    let closed = changes
+        .modified_closed_in_diff
+        .iter()
+        .any(|c| c.name == name);
+    let blocking = changes.modified.iter().any(|c| c.name == name);
+    assert_ne!(closed, blocking, "{name}: {changes:?}");
+    closed
+}
+
+const PY_ENTRY_BEFORE: &str =
+    "def build():\n    return \"done\"\n\n\ndef entry():\n    return build()\n";
+const PY_ENTRY_AFTER: &str =
+    "def build():\n    return \"done\"\n\n\ndef entry() -> int:\n    return 0 if build() else 1\n";
+const PY_ENTRY_CALLER_BEFORE: &str = "from app import entry
+
+
+def test_entry_returns_text():
+    result = entry()
+    assert result == \"done\"
+";
+
+/// 戻り値の注釈だけを変えた関数の呼び出しを、結果の比較の書き換えで閉じる (Issue #251)。
+///
+/// git diff は呼び出しの文 (`result = entry()`) を旧版の同じ文字列の行と対応付けて context
+/// 行にする。結果の読み取りがすべて新しい型 (`int`) のリテラルとの比較で、その文が旧版に
+/// 無いときだけ閉じる。改名・コピー・切り出しで旧版と同じ比較が残る形、一部の比較だけを
+/// 直した形、比較の相手が変数・別の型の形、結果を別の名前や関数へ渡す形は blocking に残す。
+#[test]
+fn python_return_annotation_change_closes_when_result_comparisons_follow_the_new_type() {
+    for (label, before, after, should_close) in [
+        (
+            // Issue の再現: 旧版の関数は entry を呼ばなくなり、新しい関数が旧版と同じ文字列の行で呼ぶ。
+            "new function reuses the old call line",
+            PY_ENTRY_CALLER_BEFORE,
+            "from app import build, entry
+
+
+def test_build_returns_text():
+    assert build() == \"done\"
+
+
+def test_entry_returns_exit_code():
+    result = entry()
+    assert result == 0
+",
+            true,
+        ),
+        (
+            "same function rewrites the assertion",
+            PY_ENTRY_CALLER_BEFORE,
+            "from app import entry
+
+
+def test_entry_returns_text():
+    result = entry()
+    assert result in (0, 1), f\"unexpected {result}\"
+",
+            true,
+        ),
+        (
+            // 受け入れ条件 2: 関数は旧版のまま本体の別の行だけを直し、呼び出しも使い方も旧契約。
+            "same function changes only another line",
+            PY_ENTRY_CALLER_BEFORE,
+            "from app import entry
+
+
+def test_entry_returns_text():
+    print(\"checking\")
+    result = entry()
+    assert result == \"done\"
+",
+            false,
+        ),
+        (
+            "rename only",
+            PY_ENTRY_CALLER_BEFORE,
+            "from app import entry
+
+
+def test_entry_returns_string():
+    result = entry()
+    assert result == \"done\"
+",
+            false,
+        ),
+        (
+            "rename and rewrite an unrelated line",
+            "from app import entry
+
+
+def test_entry_returns_text():
+    print(\"a\")
+    result = entry()
+    assert result == \"done\"
+",
+            "from app import entry
+
+
+def test_entry_returns_string():
+    print(\"b\")
+    result = entry()
+    assert result == \"done\"
+",
+            false,
+        ),
+        (
+            "copy the old body under a new name",
+            PY_ENTRY_CALLER_BEFORE,
+            "from app import entry
+
+
+def test_entry_returns_text():
+    assert entry() == 0
+
+
+def test_entry_returns_copy():
+    result = entry()
+    assert result == \"done\"
+",
+            false,
+        ),
+        (
+            "extract the old check into a helper",
+            "from app import entry
+
+
+def test_entry():
+    print(\"start\")
+    result = entry()
+    assert result == \"done\"
+",
+            "from app import entry
+
+
+def test_entry():
+    print(\"start\")
+    check()
+
+
+def check():
+    result = entry()
+    assert result == \"done\"
+",
+            false,
+        ),
+        (
+            "add a new comparison but keep the old one",
+            PY_ENTRY_CALLER_BEFORE,
+            "from app import entry
+
+
+def test_entry_returns_text():
+    result = entry()
+    assert result == 0
+    assert result != \"done\"
+",
+            false,
+        ),
+        (
+            "compare with a variable",
+            PY_ENTRY_CALLER_BEFORE,
+            "from app import entry
+
+
+def test_entry_returns_text():
+    result = entry()
+    expected = 0
+    assert result == expected
+",
+            false,
+        ),
+        (
+            "compare with a literal of another type",
+            PY_ENTRY_CALLER_BEFORE,
+            "from app import entry
+
+
+def test_entry_returns_text():
+    result = entry()
+    assert result == \"0\"
+",
+            false,
+        ),
+        (
+            "pass the result to a function",
+            PY_ENTRY_CALLER_BEFORE,
+            "from app import entry
+
+
+def test_entry_returns_text():
+    result = entry()
+    check(result)
+    assert result == 0
+",
+            false,
+        ),
+        (
+            "hand the result to another name",
+            PY_ENTRY_CALLER_BEFORE,
+            "from app import entry
+
+
+def test_entry_returns_text():
+    result = entry()
+    value = result
+    assert value == 0
+",
+            false,
+        ),
+        (
+            // 新しい型に合う比較でも、旧版と同じ文なら持ち越しで、この差分で直した証拠にならない。
+            "rename keeps an old comparison that already fits",
+            "from app import entry
+
+
+def test_entry_returns_text():
+    result = entry()
+    assert result == 0
+",
+            "from app import entry
+
+
+def test_entry_returns_zero():
+    result = entry()
+    assert result == 0
+",
+            false,
+        ),
+        (
+            // 旧版の比較のコメントだけを変えても、比べる値は書き換えていない。
+            "only the comment of an old comparison changes",
+            "from app import entry
+
+
+def test_entry_returns_text():
+    result = entry()
+    assert result == 0
+",
+            "from app import entry
+
+
+def test_entry_returns_text():
+    result = entry()
+    assert result == 0  # exit code
+",
+            false,
+        ),
+        (
+            "module-level call is not followed",
+            "from app import entry\n\nresult = entry()\nassert result == \"done\"\n",
+            "from app import entry\n\nresult = entry()\nassert result == 0\n",
+            false,
+        ),
+    ] {
+        let changes = python_return_change((PY_ENTRY_BEFORE, PY_ENTRY_AFTER), (before, after));
+        assert_eq!(
+            closed_in_diff(&changes, "entry"),
+            should_close,
+            "{label}: {changes:?}"
+        );
+    }
+}
+
+/// 結果の比較を証拠にするのは、名前・`async`・型引数・引数・すべてのデコレータが同じで、
+/// 戻り値の注釈だけが扱える型に変わったときに限る。引数の変更は呼び出し式の追随が要り、
+/// `async` 化・デコレータの付け外し・generator・束縛し直した型名では、結果が注釈の型の値と
+/// 言えない。
+#[test]
+fn python_return_comparison_evidence_requires_a_return_annotation_only_change() {
+    let rewritten_caller = |call: &str, wrapper: &str| {
+        (
+            format!(
+                "from app import entry\n\n\n{wrapper}def test_entry_returns_text():\n    result = {call}\n    assert result == \"done\"\n"
+            ),
+            format!(
+                "from app import entry\n\n\n{wrapper}def test_entry_returns_text():\n    result = {call}\n    assert result == 0\n"
+            ),
+        )
+    };
+    for (label, definition_before, definition_after, call, wrapper, should_close) in [
+        (
+            "return annotation only",
+            "def entry():\n    return \"done\"\n",
+            "def entry() -> int:\n    return 0\n",
+            "entry()",
+            "",
+            true,
+        ),
+        (
+            "awaited async function",
+            "async def entry():\n    return \"done\"\n",
+            "async def entry() -> int:\n    return 0\n",
+            "await entry()",
+            "async ",
+            true,
+        ),
+        (
+            "parameter annotation also changes",
+            "def entry(value):\n    return \"done\"\n",
+            "def entry(value: int) -> int:\n    return value\n",
+            "entry(1)",
+            "",
+            false,
+        ),
+        (
+            "function becomes async",
+            "def entry():\n    return \"done\"\n",
+            "async def entry() -> int:\n    return 0\n",
+            "entry()",
+            "",
+            false,
+        ),
+        (
+            "decorator is removed",
+            "import functools\n\n\n@functools.cache\ndef entry():\n    return \"done\"\n",
+            "import functools\n\n\ndef entry() -> int:\n    return 0\n",
+            "entry()",
+            "",
+            false,
+        ),
+        (
+            "function becomes a generator",
+            "def entry():\n    return \"done\"\n",
+            "def entry() -> int:\n    yield 0\n",
+            "entry()",
+            "",
+            false,
+        ),
+        (
+            "annotation name is rebound",
+            "def entry():\n    return \"done\"\n",
+            "int = float\n\n\ndef entry() -> int:\n    return 0\n",
+            "entry()",
+            "",
+            false,
+        ),
+        (
+            "annotation is not a plain builtin",
+            "def entry():\n    return \"done\"\n",
+            "def entry() -> list[int]:\n    return [0]\n",
+            "entry()",
+            "",
+            false,
+        ),
+    ] {
+        let (caller_before, caller_after) = rewritten_caller(call, wrapper);
+        let changes = python_return_change(
+            (definition_before, definition_after),
+            (&caller_before, &caller_after),
+        );
+        assert_eq!(
+            closed_in_diff(&changes, "entry"),
+            should_close,
+            "{label}: {changes:?}"
+        );
+    }
+}
+
+/// メソッドの戻り値の注釈だけの変更も、受け手を確かめた呼び出しの結果の比較で閉じる。
+#[test]
+fn python_method_return_annotation_change_follows_result_comparisons() {
+    let definition = (
+        "class Service:\n    def price(self):\n        return \"1\"\n",
+        "class Service:\n    def price(self) -> int:\n        return 1\n",
+    );
+    let caller_before = "from app import Service
+
+
+def test_price():
+    result = Service().price()
+    assert result == \"1\"
+";
+    for (label, caller_after, should_close) in [
+        (
+            "comparison rewritten",
+            "from app import Service
+
+
+def test_price():
+    result = Service().price()
+    assert result == 1
+",
+            true,
+        ),
+        (
+            "old comparison kept",
+            "from app import Service
+
+
+def test_price():
+    print(\"checking\")
+    result = Service().price()
+    assert result == \"1\"
+",
+            false,
+        ),
+    ] {
+        let changes = python_return_change(definition, (caller_before, caller_after));
+        assert_eq!(
+            closed_in_diff(&changes, "Service.price"),
+            should_close,
+            "{label}: {changes:?}"
+        );
+    }
+}
+
+/// 呼び出し側のファイルを改名した差分では、改名前のパスの旧版と比べる。
+#[test]
+fn python_return_comparison_evidence_reads_the_renamed_caller_from_its_old_path() {
+    for (label, caller_after, should_close) in [
+        (
+            "comparison rewritten",
+            "from app import entry
+
+
+def test_entry_returns_text():
+    print(\"renamed\")
+    result = entry()
+    assert result == 0
+",
+            true,
+        ),
+        (
+            "old comparison kept",
+            "from app import entry
+
+
+def test_entry_returns_text():
+    print(\"renamed\")
+    result = entry()
+    assert result == \"done\"
+",
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        init_git_repo_for_test(repo);
+        git_commit_files(
+            repo,
+            &[
+                ("app.py", PY_ENTRY_BEFORE),
+                ("test_app.py", PY_ENTRY_CALLER_BEFORE),
+            ],
+            "initial",
+        );
+        git_in(repo, &["mv", "test_app.py", "test_entry.py"]);
+        fs::write(repo.join("app.py"), PY_ENTRY_AFTER).expect("write definition");
+        fs::write(repo.join("test_entry.py"), caller_after).expect("write caller");
+        let changes = detect_api_changes_from_worktree(repo);
+        assert_eq!(
+            closed_in_diff(&changes, "entry"),
+            should_close,
+            "{label}: {changes:?}"
+        );
+    }
+}

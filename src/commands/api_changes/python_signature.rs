@@ -329,6 +329,18 @@ pub(crate) struct PyFunctionSignatureParts {
     decorators: Vec<String>,
 }
 
+impl PyFunctionSignatureParts {
+    /// `async`・名前・型引数 (head)、引数、すべてのデコレータが同じで、戻り値の注釈
+    /// (tail) だけが違うか。デコレータは束縛を変えるものに限らず全部を比べる
+    /// (シグネチャの文字列は束縛デコレータしか持たないので、それだけでは決めない)。
+    pub(crate) fn differs_only_in_return_annotation(&self, other: &Self) -> bool {
+        self.head == other.head
+            && self.parts == other.parts
+            && self.decorators == other.decorators
+            && self.tail != other.tail
+    }
+}
+
 /// Python の `function_definition` を head (def 〜 `(` 直前) / parameters / tail
 /// (戻り値型 + `:` まで) に分け、body 直前で切る。`decorated_definition` 配下の
 /// `function_definition` を受け取った場合は親のデコレータ列も併せて返し、

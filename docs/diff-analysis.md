@@ -209,6 +209,17 @@ Removing optional keyword-only parameters or trailing defaulted positional param
 
 Aliases, module transport, re-exports, function values, ambiguous bindings, dynamic namespace access, non-ASCII identifiers, variadic or positional-only signatures, parse failures and incomplete inventories remain unproven. The inventory follows the reference scan's ignore and hidden-file scope; other source languages, links or junctions, read/walk failures, and limits of 512 source files, 2 MiB per file, 8 MiB total, 100,000 AST nodes or walk entries, and depth 128 prevent the proof. Staged review uses the index snapshot. This is a repository-local call proof; external consumers and arbitrary runtime reflection are outside its scope.
 
+### Python Return Annotation Changes
+
+When only the return annotation of a unique top-level Python function or method changes (`def entry():` to `def entry() -> int:`), callers usually keep the call statement (`result = entry()`) and rewrite the statements that use the result. git diff can then pair the unchanged call line with an identical line elsewhere in the old file, such as one in a test function that was rewritten, and leave it as a context line. Such a call still counts toward `api.mod_closed` when every use of its result follows the new type:
+
+- The old and new definitions have the same name, `async`, type parameters, parameters, and decorators (all of them, not only the binding decorators in the signature); only the return annotation differs. The new annotation is `int`, `float`, `str`, `bytes`, `bool`, or `None`, the module never rebinds that name (assignments, imports including star imports, definitions, parameters, and patterns all count), and the function body has no `yield`.
+- The call is the whole right-hand side of a plain assignment `v = entry()` (`v = await entry()` for an `async def`) inside a function body.
+- Every later read of `v` in that function is either a comparison with a literal of the new type that forms the whole condition of an `assert`, `if`, `elif`, or `while` (`==` and `!=`; ordering for numbers, strings, and bytes; `is` only for `None`, `True`, and `False`; `in` with `v` on the left and a tuple, list, or set of literals), or a read inside an `assert` message. At least one comparison is required.
+- None of those statements appears in the caller's old file, compared as token sequences without comments. A comparison carried over unchanged, for example through a renamed, copied, or extracted function, is not evidence.
+
+Rebinding, aliases, passing the result to a call or `return`, nested scopes, `locals()`, `vars()`, `globals()`, `eval()`, `exec()`, assignments at module or class level, parse errors, and unreadable old files keep the changed-line check. Parameter changes, including annotation-only ones, still need the call itself to change. Staged review uses the index snapshot. The proof shows that the comparisons were rewritten for the new type, not that they pass.
+
 ### Python Local Function Definitions and Attribute Writes
 
 Impact analysis can also identify a unique, undecorated function declared directly in the reference file as the owner of a bare use after its declaration. Rebinding, duplicate or conditional definitions, decorators, and the namespace barriers above keep the reference unproven.
