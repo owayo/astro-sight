@@ -233,9 +233,10 @@ fn open_source(dir: &Path) -> Result<(Source, BString), AttributeLookupError> {
         return Ok(standalone());
     };
     let attributes = repository_attributes(&local, root)?;
-    let index = local.index_or_empty().map_err(|error| {
-        AttributeLookupError::whole(format!("the index could not be read: {error}"))
-    })?;
+    // gix のエラーの文面は絶対パスを含みうるので、申告には載せない。
+    let index = local
+        .index_or_empty()
+        .map_err(|_| AttributeLookupError::whole("the index could not be read"))?;
     Ok((
         Source::Repository {
             repo: Box::new(repo),
@@ -252,10 +253,8 @@ fn repository_attributes(
     repo: &gix::Repository,
     root: PathBuf,
 ) -> Result<DirectoryAttributes, AttributeLookupError> {
-    let globals = repo.attribute_global_paths().map_err(|error| {
-        AttributeLookupError::whole(format!(
-            "the global attribute file could not be located: {error}"
-        ))
+    let globals = repo.attribute_global_paths().map_err(|_| {
+        AttributeLookupError::whole("the global attribute file could not be located")
     })?;
     let info = repo.common_dir().join("info").join("attributes");
     for file in globals.iter().chain([&info]) {
@@ -306,9 +305,10 @@ fn discover(dir: &Path) -> Result<gix::ThreadSafeRepository, Discovery> {
                 | Error::NoGitRepositoryWithinCeiling { .. }
                 | Error::NoGitRepositoryWithinFs { .. },
             ) => Discovery::NotFound,
-            _ => Discovery::Failed(AttributeLookupError::whole(format!(
-                "the git repository could not be opened: {error}"
-            ))),
+            // gix のエラーの文面は絶対パスを含みうるので、申告には載せない。
+            _ => Discovery::Failed(AttributeLookupError::whole(
+                "the git repository could not be opened",
+            )),
         }
     })
 }
