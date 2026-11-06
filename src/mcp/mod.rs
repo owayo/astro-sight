@@ -1,4 +1,3 @@
-use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::schemars;
@@ -207,9 +206,7 @@ fn default_max_files_per_commit() -> usize {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct AstroSightServer {
-    tool_router: ToolRouter<Self>,
     service: std::sync::Arc<AppService>,
     /// ツール結果の text content をどの形式で返すか。JSON-RPC transport 自体は
     /// 常に JSON で、ここは payload の表現だけを決める。
@@ -230,7 +227,6 @@ impl AstroSightServer {
         let service = AppService::sandboxed(cwd)
             .expect("MCP server requires a valid sandbox (failed to canonicalize cwd)");
         Self {
-            tool_router: Self::tool_router(),
             service: std::sync::Arc::new(service),
             output,
         }
