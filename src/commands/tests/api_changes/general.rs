@@ -364,33 +364,6 @@ fn detect_api_changes_uses_diff_old_source_when_git_show_fails() {
 }
 
 #[test]
-fn import_specifier_package_name_classifies_internal_and_external() {
-    // 外部パッケージ
-    assert_eq!(
-        import_specifier_package_name("tailwindcss").as_deref(),
-        Some("tailwindcss")
-    );
-    assert_eq!(
-        import_specifier_package_name("tailwindcss/plugin").as_deref(),
-        Some("tailwindcss")
-    );
-    assert_eq!(
-        import_specifier_package_name("@scope/pkg").as_deref(),
-        Some("@scope/pkg")
-    );
-    assert_eq!(
-        import_specifier_package_name("@scope/pkg/sub").as_deref(),
-        Some("@scope/pkg")
-    );
-    // 相対 / alias は None (内部、除外しない)
-    assert_eq!(import_specifier_package_name("./config"), None);
-    assert_eq!(import_specifier_package_name("../lib/config"), None);
-    assert_eq!(import_specifier_package_name("@/config"), None);
-    assert_eq!(import_specifier_package_name("~/config"), None);
-    assert_eq!(import_specifier_package_name("#internal"), None);
-}
-
-#[test]
 fn detect_api_changes_skips_linguist_generated_files() {
     // .gitattributes で linguist-generated 指定されたファイルの API 変更は報告しない。
     let dir = tempfile::tempdir().expect("tempdir");

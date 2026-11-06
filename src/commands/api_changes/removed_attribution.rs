@@ -52,9 +52,10 @@ pub(crate) enum RefOrigin {
         dependency_targets: Rc<HashSet<String>>,
         dependency_opaque: bool,
     },
-    /// TS/JS: 参照が相対 import / from 句付き export の束縛 (文の中の出現、またはその束縛の
-    /// 利用) で、文の解決候補が `candidates`。`export_proven` は、存在する全ての候補がその
-    /// 公開名を由来の分かる形 (通常の宣言、または同名の明示的な再 export) で export していること。
+    /// TS/JS: 参照が相対 import か tsconfig / jsconfig の別名の import / from 句付き export の
+    /// 束縛 (文の中の出現、またはその束縛の利用) で、文の解決候補が `candidates`。`export_proven`
+    /// は、存在する全ての候補がその公開名を由来の分かる形 (通常の宣言、または同名の明示的な
+    /// 再 export) で export していること。
     ImportResolved {
         candidates: Rc<HashSet<String>>,
         export_proven: bool,
@@ -174,10 +175,16 @@ pub(crate) fn proves_survivor_origin_with_ffi(
                     .iter()
                     .any(|path| super::js_member_origin::paths_match(path, candidate.old_path))
         }
+        // 大文字小文字を区別しないファイルシステムでは、綴りの違う候補も削除元を指す。
         RefOrigin::ImportResolved {
             candidates,
             export_proven,
-        } => *export_proven && !candidates.contains(candidate.old_path),
+        } => {
+            *export_proven
+                && !candidates
+                    .iter()
+                    .any(|path| super::ts_module_paths::may_be_same_path(path, candidate.old_path))
+        }
         RefOrigin::PythonAttributeAccess {
             receiver_module_names,
         } => {
@@ -393,7 +400,6 @@ pub(crate) fn analyze_ref_attribution_facts(
     dir: &str,
     ref_path: &str,
     symbol: &str,
-    external_pkgs: &HashSet<String>,
     member_proof: bool,
     export_cache: &mut super::js_ref_sites::JsExportOriginCache,
     rust_paths: &mut super::removed_rust_paths::RustPathResolver,
@@ -415,7 +421,6 @@ pub(crate) fn analyze_ref_attribution_facts(
             lang,
             ref_path,
             symbol,
-            external_pkgs,
             member_proof,
             dir,
             export_cache,
@@ -737,7 +742,6 @@ fn analyze_js_ts_facts(
     lang: LangId,
     ref_path: &str,
     symbol: &str,
-    external_pkgs: &HashSet<String>,
     member_proof: bool,
     dir: &str,
     export_cache: &mut super::js_ref_sites::JsExportOriginCache,
@@ -780,7 +784,6 @@ fn analyze_js_ts_facts(
         &source,
         root,
         symbol,
-        external_pkgs,
         export_cache,
     );
     facts

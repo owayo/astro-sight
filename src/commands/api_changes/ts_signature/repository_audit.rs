@@ -12,7 +12,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::ControlFlow;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use tree_sitter::Node;
 
@@ -21,6 +21,10 @@ use super::removed_params::{RemovalInventory, escaped_identifier};
 use super::source_scan::{Budget, Needle, Needles, scan_file};
 use crate::commands::api_changes::ref_index::contains_js_word;
 use crate::commands::api_changes::ts_const_arg::collect_bindings_named;
+pub(super) use crate::commands::api_changes::ts_module_paths::normalize_lexically;
+use crate::commands::api_changes::ts_module_paths::{
+    RESOLVED_EXTENSIONS, file_candidates, package_name, registry_spec,
+};
 use crate::commands::dead_code_default_liveness::static_specifier;
 use crate::engine::bounded_read::read_utf8_file_limited;
 use crate::engine::tree_walk::{Children, Walk, any_node, walk_preorder};
@@ -628,25 +632,6 @@ impl ConfigScan {
     }
 }
 
-/// `.` と `..` を字句の上で畳む。根より上へ出るなら None。解析するディレクトリの中に symlink が
-/// あれば監査を作らないので、中のパスは字句の上の位置と実際の位置が一致する。
-pub(super) fn normalize_lexically(path: &Path) -> Option<PathBuf> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return None;
-                }
-            }
-            Component::Normal(name) => normalized.push(name),
-        }
-    }
-    Some(normalized)
-}
-
 /// `directory` から `path` を解決し、解析するディレクトリ `root` からの相対パスにする。外なら None。
 fn inner_path(root: &Path, directory: &Path, path: &str) -> Option<PathBuf> {
     if path.contains('\\') {
@@ -739,43 +724,6 @@ pub(super) enum ModuleResolution {
     Missing,
 }
 
-/// 解決で補う TS / JS の拡張子 (宣言ファイルを含む)。
-const RESOLVED_EXTENSIONS: [&str; 11] = [
-    ".ts", ".tsx", ".d.ts", ".mts", ".cts", ".d.mts", ".d.cts", ".js", ".jsx", ".mjs", ".cjs",
-];
-
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(suffix);
-    PathBuf::from(name)
-}
-
-/// ファイルとして解くときの候補 (拡張子の補完と、`.js` → `.ts` などの読み替え)。
-fn file_candidates(joined: &Path) -> Vec<PathBuf> {
-    let mut candidates = vec![joined.to_path_buf()];
-    let Some(name) = joined.file_name().and_then(|name| name.to_str()) else {
-        return candidates;
-    };
-    let stem_with = |stem: &str, extensions: &[&str]| -> Vec<PathBuf> {
-        extensions
-            .iter()
-            .map(|extension| joined.with_file_name(format!("{stem}{extension}")))
-            .collect()
-    };
-    match name.rsplit_once('.') {
-        Some((stem, "js" | "jsx")) => candidates.extend(stem_with(stem, &[".ts", ".tsx", ".d.ts"])),
-        Some((stem, "mjs")) => candidates.extend(stem_with(stem, &[".mts", ".d.mts"])),
-        Some((stem, "cjs")) => candidates.extend(stem_with(stem, &[".cts", ".d.cts"])),
-        Some((_, "ts" | "tsx" | "mts" | "cts")) => {}
-        _ => candidates.extend(
-            RESOLVED_EXTENSIONS
-                .iter()
-                .map(|extension| with_suffix(joined, extension)),
-        ),
-    }
-    candidates
-}
-
 /// `joined` (絶対パス) をモジュールとして解き、`target` (`dir` 相対) に当たり得るかを決める。
 /// TypeScript と同じく、ファイル (拡張子の補完を含む) をディレクトリより先に探す。
 /// `directory_import` (`./`・`.`・`..` で終わる指定子) なら、ディレクトリだけを探す。
@@ -824,60 +772,6 @@ pub(super) fn resolve_module(
             .collect(),
     )
     .unwrap_or(ModuleResolution::Missing)
-}
-
-/// bare specifier のパッケージ名 (`@scope/name` か先頭の区切り)。相対・絶対・`#` の subpath
-/// import・URL のように、パッケージを指さない指定子は None。
-fn package_name(specifier: &str) -> Option<&str> {
-    if specifier.is_empty()
-        || specifier.starts_with(['.', '/', '#', '~'].as_slice())
-        || specifier.contains(['\\', ' ', '\t', '\n'].as_slice())
-    {
-        return None;
-    }
-    if let Some(builtin) = specifier.strip_prefix("node:") {
-        return (!builtin.is_empty()).then(|| specifier.split('/').next().unwrap_or(specifier));
-    }
-    if specifier.contains(':') {
-        return None;
-    }
-    let mut segments = specifier.split('/');
-    let first = segments.next()?;
-    if first.starts_with('@') {
-        let second = segments.next()?;
-        if first.len() < 2 || second.is_empty() {
-            return None;
-        }
-        return Some(&specifier[..first.len() + 1 + second.len()]);
-    }
-    (!first.is_empty()).then_some(first)
-}
-
-/// 依存の版の指定が registry のものか。`file:`・`link:`・`workspace:`・`portal:`・パス・git や
-/// URL の指定は registry ではない。`npm:` の別名は registry の別のパッケージを指す。
-fn registry_spec(spec: &str) -> bool {
-    const NON_REGISTRY: [&str; 13] = [
-        "file:",
-        "link:",
-        "workspace:",
-        "portal:",
-        "git+",
-        "git:",
-        "git@",
-        "github:",
-        "gitlab:",
-        "bitbucket:",
-        "gist:",
-        "http:",
-        "https:",
-    ];
-    let spec = spec.trim();
-    if spec.starts_with("npm:") {
-        return true;
-    }
-    !(NON_REGISTRY.iter().any(|prefix| spec.starts_with(prefix))
-        || spec.starts_with(['.', '/', '~'].as_slice())
-        || spec.contains(['\\', '/', ':'].as_slice()))
 }
 
 /// package.json の依存の指定が、どこから中身を持ってくるか。
@@ -2733,6 +2627,7 @@ mod tests {
             ("@scope/pkg/sub", Some("@scope/pkg")),
             ("node:fs/promises", Some("node:fs")),
             ("@scope", None),
+            ("@/config", None),
             ("./x", None),
             ("/abs", None),
             ("#internal", None),
