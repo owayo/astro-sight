@@ -482,7 +482,11 @@ impl Default for CoChangeOptions {
     }
 }
 
-/// blame モードの既定除外 glob (生成物ディレクトリ / minified)。
+/// blame モードの既定除外 glob (生成物・依存・ビルドのディレクトリ)。
+///
+/// minified (`*.min.js` / `*.min.css`) はここに置かず、生成物の判定
+/// (`engine::cochange::generated_policy`) がファイル名の型で外す。glob で先に落とすと、
+/// `.gitattributes` の `-linguist-generated` で残すと宣言しても効かないため。
 ///
 /// ロックファイルはここに列挙しない。glob を手で並べると
 /// `crate::models::dependency_files::DEPENDENCY_MANIFEST_LOCK_PAIRS` との乖離が起きて
@@ -500,6 +504,4 @@ pub const BLAME_DEFAULT_EXCLUDE_GLOBS: &[&str] = &[
     "**/build/**",
     "target/**",
     "**/target/**",
-    "**/*.min.js",
-    "**/*.min.css",
 ];

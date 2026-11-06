@@ -37,12 +37,14 @@ mod integration {
     mod impact_rust_line_endings;
     mod impact_rust_private_helpers;
     mod impact_rust_reexport;
+    mod impact_rust_same_named_constants;
     mod impact_rust_scope;
     mod impact_rust_visibility_widening;
     mod impact_ts_barrels;
     mod js_signature_sites;
     mod kotlin_grammar;
     mod languages;
+    mod linguist_generated_attributes;
     mod literal_const_values;
     mod literal_union_removal;
     mod local_callable_shadow;

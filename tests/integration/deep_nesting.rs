@@ -1214,8 +1214,9 @@ fn calls_handles_deep_pointer_declarator() {
 /// dead-code: 深い入力で、Java の長い修飾名の照合 (Flyway の基底クラス判定)、PHP の深い
 /// 制御構造の中の `return new self('X')` (疑似 enum の判定)、JS/TS の引数の深い分割代入
 /// (同名メンバーの帰属で束縛を集める処理)、`**` が長く続く `.gitattributes` の照合が落ちず、
-/// それぞれの結論 (疑似 enum の値は dead にしない・帰属できた `Alpha.fmt` は live・
-/// 生成物は候補から外す) を変えない。
+/// それぞれの結論 (疑似 enum の値は dead にしない・帰属できた `Alpha.fmt` は live) を変えない。
+/// 2048 バイトを超える属性の行は Git が無視する (`ignoring overly long attributes line`) ので、
+/// その行の `gen.ts` は生成物にならず、未使用の `generatedHelper` は dead になる。
 #[test]
 fn dead_code_handles_deep_names_conditions_patterns_and_gitattributes() {
     let repo = TestRepo::new();
@@ -1265,12 +1266,16 @@ fn dead_code_handles_deep_names_conditions_patterns_and_gitattributes() {
     let json: serde_json::Value = serde_json::from_str(&stdout).expect("dead-code JSON");
     assert_eq!(
         names_in(&json, "dead_symbols"),
-        ["Beta", "Beta.fmt", "Deep", "Status", "out"]
+        [
+            "Beta",
+            "Beta.fmt",
+            "Deep",
+            "Status",
+            "generatedHelper",
+            "out"
+        ]
     );
-    assert_eq!(
-        json["generated_candidates_skipped"]["paths"],
-        serde_json::json!(["src/gen.ts"])
-    );
+    assert!(json.get("generated_candidates_skipped").is_none(), "{json}");
 }
 
 /// calls: 入れ子の呼び出し (`wrap(wrap(…(() => inner())…))`) の呼び出し元の解決が、深さの

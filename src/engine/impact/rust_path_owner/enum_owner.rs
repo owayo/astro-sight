@@ -515,6 +515,26 @@ impl RustPathOwnerIndex {
     }
 }
 
+/// 参照ファイルから親へ順に並べた module のファイルと、crate root のファイル。参照ファイルが
+/// crate root のときは `modules` は参照ファイルだけで、`roots` からは除く。
+pub(super) fn ancestor_chain(dir: &Path, ref_path: &str) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let (_, src, modules) = source_module_path(dir, Path::new(ref_path))?;
+    if ordinary_module_file(dir, &src, &modules)? != Path::new(ref_path) {
+        return None;
+    }
+    let mut chain = vec![PathBuf::from(ref_path)];
+    for count in (1..modules.len()).rev() {
+        chain.push(ordinary_module_file(dir, &src, &modules[..count])?);
+    }
+    let mut roots = Vec::new();
+    for root in [src.join("lib.rs"), src.join("main.rs")] {
+        if ordinary_file(dir, &root)? && !chain.contains(&root) {
+            roots.push(root);
+        }
+    }
+    Some((chain, roots))
+}
+
 pub(super) fn ancestor_files(dir: &Path, ref_path: &str) -> Option<Vec<PathBuf>> {
     let (_, src, modules) = source_module_path(dir, Path::new(ref_path))?;
     if ordinary_module_file(dir, &src, &modules)? != Path::new(ref_path) {

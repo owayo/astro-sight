@@ -6,6 +6,7 @@
 use anyhow::Result;
 use std::path::Path;
 
+use crate::engine::gitattributes::AttributeLookupError;
 use crate::language::LangId;
 use crate::models::skip::SkippedFiles;
 
@@ -83,6 +84,8 @@ pub struct FileCollection {
     /// 拡張子が無く、先頭を読めずに言語を判定できなかったファイルの数。
     /// 対応言語のスクリプトかもしれないので「対応言語のファイルが無い」根拠にしない。
     unreadable_candidates: usize,
+    /// `.gitattributes` の属性を解決できず、生成物として外さずに残したファイルと原因。
+    generated_undetermined: Vec<(std::path::PathBuf, AttributeLookupError)>,
 }
 
 /// 黙って外したファイルの集計。全パスは持たず、件数・拡張子別の件数・辞書順で先頭の
@@ -185,6 +188,14 @@ impl FileCollection {
     /// 解析できないソースとして走査から外したファイル (全件)。
     pub fn unanalyzable_source_paths(&self) -> &[std::path::PathBuf] {
         &self.unanalyzable_sources
+    }
+
+    /// `.gitattributes` の属性を解決できず、生成物として外さずに走査したファイルの申告。
+    pub fn generated_undetermined_truncations(
+        &self,
+        dir: &Path,
+    ) -> Vec<crate::models::truncation::TruncationInfo> {
+        generated_undetermined_truncations(dir, &self.generated_undetermined)
     }
 
     /// 解析できなかったソースを拡張子単位に畳んで打ち切り申告にする。
@@ -314,9 +325,11 @@ pub fn skipped_files_from_relative(mut paths: Vec<String>) -> Option<SkippedFile
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CandidateDecision {
     Keep,
+    /// 生成物か判定できず (属性を解決できない) 残した。
+    KeepUndetermined(AttributeLookupError),
     SkipGenerated,
     /// ソースコードだが解析できない (申告対象)。
     UnanalyzableSource,
@@ -405,20 +418,25 @@ pub fn collect_files_scan_with_excludes(
         candidates.push(path);
     }
 
-    // 判定は「名前ベース generated → 言語判定 → 内容ベース generated / shebang」の順。
-    // 旧実装 (内容ベース generated → 言語判定) と最終集合は同一で、言語判定を先に
-    // 通すことで parse 対象になり得ないファイル (.png 等) の open を丸ごと省く。
-    // par_iter + collect は入力順を保つため、出力順は逐次実装と一致する。
+    // 生成物の判定 (属性 → 名前 → ヘッダー) と言語の判定をファイルごとに並列に行う。属性の
+    // 照会は `map_init` で作り、その状態は解決器のプールで使い回す (作り直しても属性ファイルを
+    // 読み直さない)。生成物の除外を解除した走査では属性を解決しない。par_iter + collect は
+    // 入力順を保つため、出力順は逐次実装と一致する。
     use rayon::prelude::*;
     let exclude_generated = !options.include_generated
         && !is_generated_exclusion_disabled()
         && !glob_names_explicit_file(glob_pattern);
+    let resolver =
+        exclude_generated.then(|| crate::engine::gitattributes::AttributeResolver::open(dir));
     let decisions: Vec<(std::path::PathBuf, CandidateDecision)> = candidates
         .into_par_iter()
-        .map(|path| {
-            let decision = classify_candidate(&path, exclude_generated);
-            (path, decision)
-        })
+        .map_init(
+            || resolver.as_ref().map(|resolver| resolver.lookup()),
+            |lookup, path| {
+                let decision = classify_candidate(&path, lookup.as_mut());
+                (path, decision)
+            },
+        )
         .collect();
 
     let mut files = Vec::new();
@@ -426,9 +444,14 @@ pub fn collect_files_scan_with_excludes(
     let mut unanalyzable_sources = Vec::new();
     let mut ignored = IgnoredFiles::default();
     let mut unreadable_candidates = 0;
+    let mut generated_undetermined = Vec::new();
     for (path, decision) in decisions {
         match decision {
             CandidateDecision::Keep => files.push(path),
+            CandidateDecision::KeepUndetermined(error) => {
+                generated_undetermined.push((path.clone(), error));
+                files.push(path);
+            }
             CandidateDecision::SkipGenerated => skipped_generated.push(path),
             CandidateDecision::UnanalyzableSource => unanalyzable_sources.push(path),
             CandidateDecision::Unreadable => unreadable_candidates += 1,
@@ -442,45 +465,103 @@ pub fn collect_files_scan_with_excludes(
         unanalyzable_sources,
         ignored,
         unreadable_candidates,
+        generated_undetermined,
     })
+}
+
+/// 生成物か判定できずに残したファイルを、原因ごとに 1 件の申告にまとめる (原因の範囲と
+/// 説明の順。代表パスは辞書順で [`UNANALYZABLE_EXAMPLES_PER_EXT`] 件まで)。
+pub(crate) fn generated_undetermined_truncations(
+    dir: &Path,
+    undetermined: &[(std::path::PathBuf, AttributeLookupError)],
+) -> Vec<crate::models::truncation::TruncationInfo> {
+    use std::collections::BTreeMap;
+
+    let mut by_cause: BTreeMap<&AttributeLookupError, Vec<String>> = BTreeMap::new();
+    for (path, error) in undetermined {
+        by_cause.entry(error).or_default().push(
+            crate::git_support::normalize_workspace_separators(
+                &path.strip_prefix(dir).unwrap_or(path).to_string_lossy(),
+            ),
+        );
+    }
+    by_cause
+        .into_iter()
+        .map(|(error, mut paths)| {
+            let count = paths.len();
+            paths.sort();
+            paths.truncate(UNANALYZABLE_EXAMPLES_PER_EXT);
+            crate::models::truncation::TruncationInfo::generated_detection_unavailable(
+                error, count, &paths,
+            )
+        })
+        .collect()
 }
 
 /// 収集候補 1 ファイルを最終集合に残すかの判定。
 ///
-/// - ベンダー / IDE 補助 / `@generated` マーカー付きファイルはノイズ源になるため
-///   refs / impact / dead-code から除外する (`ASTRO_SIGHT_NO_GENERATED_EXCLUSION=1` で抑止可)。
+/// - 生成物 (`.gitattributes` の `linguist-generated` → IDE 補助・minified の名前 → 先頭の
+///   ヘッダーの宣言の順。[`crate::engine::generated::judge`]) はノイズ源になるため除外する。
+///   `generated` が `None` (除外を解除した走査) なら判定しない。属性を解決できなければ
+///   除外せずに残し、申告する
 /// - パース可能なファイルのみ対象。拡張子なしの実行スクリプト (例: `bin/install`) は
 ///   shebang から言語推定する (CLI ツール / ビルドスクリプトで shebang 命名は一般的)。
 /// - 拡張子なしファイルは先頭 4KB を 1 回だけ読み、generated マーカー判定と shebang
 ///   判定を同じバッファで行う (旧実装は 2 回 open していた)。
-fn classify_candidate(path: &Path, exclude_generated: bool) -> CandidateDecision {
-    if exclude_generated && is_generated_by_name(path) {
-        return CandidateDecision::SkipGenerated;
+/// - 解析できないソース (`.vue` など) はヘッダーを読まず、属性と名前だけで判定する。走査
+///   しないファイル (画像・minified の CSS など) は、名前か先頭の宣言で生成物と分かるときだけ
+///   属性を確かめて生成物として申告する (それ以外は属性を引かずに黙って外す)
+fn classify_candidate(
+    path: &Path,
+    generated: Option<&mut crate::engine::gitattributes::AttributeLookup<'_>>,
+) -> CandidateDecision {
+    use crate::engine::generated::{GeneratedVerdict, is_generated_by_name, judge};
+
+    enum Kind {
+        Parseable,
+        Unanalyzable,
+        Extensionless { head: Vec<u8>, shebang: bool },
+        Other,
     }
-    if LangId::from_path(camino::Utf8Path::new(path.to_str().unwrap_or(""))).is_ok() {
-        return if exclude_generated && has_generated_marker(path) {
-            CandidateDecision::SkipGenerated
+    let kind = if LangId::from_path(camino::Utf8Path::new(path.to_str().unwrap_or(""))).is_ok() {
+        Kind::Parseable
+    } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        if is_unanalyzable_source_ext(ext) {
+            Kind::Unanalyzable
         } else {
-            CandidateDecision::Keep
-        };
-    }
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        return if is_unanalyzable_source_ext(ext) {
-            CandidateDecision::UnanalyzableSource
-        } else {
-            CandidateDecision::Ignore
-        };
-    }
-    let Some(head) = read_head_4k(path) else {
-        return CandidateDecision::Unreadable;
-    };
-    if exclude_generated && head_has_generated_marker(&head) {
-        return CandidateDecision::SkipGenerated;
-    }
-    if detect_lang_from_shebang_head(&head).is_some() {
-        CandidateDecision::Keep
+            Kind::Other
+        }
     } else {
-        CandidateDecision::Ignore
+        let Some(head) = read_head_4k(path) else {
+            return CandidateDecision::Unreadable;
+        };
+        let shebang = detect_lang_from_shebang_head(&head).is_some();
+        Kind::Extensionless { head, shebang }
+    };
+    let kept = match &kind {
+        Kind::Parseable | Kind::Extensionless { shebang: true, .. } => CandidateDecision::Keep,
+        Kind::Unanalyzable => CandidateDecision::UnanalyzableSource,
+        Kind::Extensionless { shebang: false, .. } | Kind::Other => CandidateDecision::Ignore,
+    };
+    let Some(lookup) = generated else {
+        return kept;
+    };
+    let header = || match &kind {
+        Kind::Parseable => has_generated_marker(path),
+        Kind::Extensionless { head, .. } => head_has_generated_marker(head),
+        Kind::Unanalyzable | Kind::Other => false,
+    };
+    if matches!(kept, CandidateDecision::Ignore) && !is_generated_by_name(path) && !header() {
+        return kept;
+    }
+    match judge(lookup.linguist_generated(path), path, header) {
+        GeneratedVerdict::Generated(_) => CandidateDecision::SkipGenerated,
+        GeneratedVerdict::NotGenerated => kept,
+        GeneratedVerdict::Undetermined(error) => match kept {
+            CandidateDecision::Keep => CandidateDecision::KeepUndetermined(error),
+            // 走査しないファイルは、残しても参照を数えないので申告しない。
+            other => other,
+        },
     }
 }
 
@@ -521,21 +602,7 @@ fn glob_names_explicit_file(glob_pattern: Option<&str>) -> bool {
 /// 判定仕様を固定するテスト専用ヘルパーとして残す。
 #[cfg(test)]
 pub(crate) fn is_generated_file(path: &Path) -> bool {
-    is_generated_by_name(path) || has_generated_marker(path)
-}
-
-/// ファイル名パターンだけで判定できる generated 判定 (I/O なし)。
-fn is_generated_by_name(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    if name.starts_with("_ide_helper") && name.ends_with(".php") {
-        return true;
-    }
-    if name == "_lighthouse_ide_helper.php" {
-        return true;
-    }
-    name.ends_with(".min.js") || name.ends_with(".min.css") || name.ends_with(".bundle.js")
+    crate::engine::generated::is_generated_by_name(path) || has_generated_marker(path)
 }
 
 /// ファイル先頭最大 4KB を読む。読めない場合は None (パーミッション欠落等)。

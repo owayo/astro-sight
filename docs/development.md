@@ -15,7 +15,7 @@ make install SYSTEM_TOOLS=1
 
 ## Same Checks as CI
 
-Rust owner regressions in `impact_rust_private_helpers` compare functions, constants in non-leaf modules, enum variants, and standard `format!` arguments against real callers, rebinding, macro replacement, `#[path]`, and `include!`. Direct staged analysis keeps its conservative behavior; the additional owner proofs apply to ordinary analysis.
+Rust owner regressions in `impact_rust_private_helpers` compare functions, constants in non-leaf modules, enum variants, and standard `format!` arguments against real callers, rebinding, macro replacement, `#[path]`, and `include!`. Regressions for implicit format captures and crate-anchored imports next to non-standard macros in function bodies of the changed file are in `impact_rust_same_named_constants`. Direct staged analysis keeps its conservative behavior; the additional owner proofs apply to ordinary analysis.
 
 On Linux and macOS, CI only runs `make setup` and the targets that make up `make ci` (`make check` and `make test`), so a local `make ci` runs the same checks. Tests run with the default features, the same as the released binary. Clippy runs with both the default features and `--all-features`, to check the heap profiler code (the `dhat-heap` feature) as well.
 

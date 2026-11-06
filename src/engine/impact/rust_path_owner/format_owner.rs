@@ -24,6 +24,29 @@ impl Environment {
     }
 }
 
+/// `use super::*;` か。親 module の名前 (親の import を含む) をこのスコープへ持ち込む。
+fn is_parent_glob(item: Node<'_>) -> bool {
+    let Some(argument) = item
+        .child_by_field_name("argument")
+        .filter(|_| item.kind() == "use_declaration")
+    else {
+        return false;
+    };
+    let mut cursor = argument.walk();
+    argument.kind() == "use_wildcard"
+        && argument
+            .named_children(&mut cursor)
+            .any(|node| node.kind() == "super")
+        && argument
+            .named_children(&mut argument.walk())
+            .all(|node| matches!(node.kind(), "super" | "line_comment" | "block_comment"))
+}
+
+fn has_parent_glob(scope: Node<'_>) -> bool {
+    let mut cursor = scope.walk();
+    scope.named_children(&mut cursor).any(is_parent_glob)
+}
+
 fn environment(
     scope: Node<'_>,
     source: &[u8],
@@ -37,16 +60,8 @@ fn environment(
     for item in scope.named_children(&mut cursor) {
         match item.kind() {
             "use_declaration" => {
-                let argument = item.child_by_field_name("argument")?;
-                let mut cursor = argument.walk();
-                let parent_glob = argument.kind() == "use_wildcard"
-                    && argument
-                        .named_children(&mut cursor)
-                        .any(|node| node.kind() == "super")
-                    && argument.named_children(&mut argument.walk()).all(|node| {
-                        matches!(node.kind(), "super" | "line_comment" | "block_comment")
-                    });
-                if !parent_glob {
+                item.child_by_field_name("argument")?;
+                if !is_parent_glob(item) {
                     if let Some(names) = root_use_names(item, source) {
                         result.imports.extend(names);
                     } else {
@@ -195,6 +210,24 @@ fn argument_macro<'t>(node: Node<'t>, source: &[u8]) -> Option<(Node<'t>, Node<'
     Some((invocation, callee))
 }
 
+/// 暗黙キャプチャを含む書式マクロの呼び出しと、その呼び出し名。別のマクロの token tree の
+/// 中の呼び出しと、パスで書いたマクロ名は扱わない。
+fn capture_macro<'t, 's>(
+    tree: Node<'t>,
+    source: &'s [u8],
+) -> Option<(Node<'t>, Node<'t>, &'s str)> {
+    let invocation = tree
+        .parent()
+        .filter(|node| node.kind() == "macro_invocation")?;
+    let callee = invocation.child_by_field_name("macro")?;
+    if callee.kind() != "identifier" {
+        return None;
+    }
+    let text = callee.utf8_text(source).ok()?;
+    let name = text.strip_prefix("r#").unwrap_or(text);
+    crate::engine::refs::is_capture_format_macro(name).then_some((invocation, callee, name))
+}
+
 impl RustPathOwnerIndex {
     pub(in crate::engine::impact) fn format_local_value_owner(
         &self,
@@ -205,11 +238,71 @@ impl RustPathOwnerIndex {
         ref_path: &str,
         project: &RustPathOwnerProjectProof,
     ) -> bool {
+        if !self.local_value_names.contains(name) || blake3::hash(source) != self.source_hash {
+            return false;
+        }
+        let Some((invocation, callee)) = argument_macro(node, source) else {
+            return false;
+        };
+        self.standard_macro_call(invocation, "format", source, dir, ref_path, project)
+            && self.local_value_owner_beside(callee, source, name, Some(invocation.id()))
+    }
+
+    /// 書式の暗黙キャプチャが、参照ファイル直下の一意な値の宣言を指すか。キャプチャは呼び出し
+    /// 位置の式の識別子と同じに解決されるので、呼び出し名のノードで同じ束縛の証明を使う。
+    pub(in crate::engine::impact) fn format_capture_local_owner(
+        &self,
+        tree: Node<'_>,
+        source: &[u8],
+        name: &str,
+        dir: &Path,
+        ref_path: &str,
+        project: &RustPathOwnerProjectProof,
+    ) -> bool {
+        if !self.local_value_names.contains(name) || blake3::hash(source) != self.source_hash {
+            return false;
+        }
+        let Some((invocation, callee, macro_name)) = capture_macro(tree, source) else {
+            return false;
+        };
+        self.standard_macro_call(invocation, macro_name, source, dir, ref_path, project)
+            && self.local_value_owner_beside(callee, source, name, Some(invocation.id()))
+    }
+
+    /// 書式の暗黙キャプチャが、直下の crate 起点の import の束縛を使うか。
+    pub(in crate::engine::impact) fn format_capture_import_binding_safe(
+        &self,
+        tree: Node<'_>,
+        source: &[u8],
+        name: &str,
+        dir: &Path,
+        ref_path: &str,
+        project: &RustPathOwnerProjectProof,
+    ) -> bool {
+        let Some((invocation, callee, macro_name)) = capture_macro(tree, source) else {
+            return false;
+        };
+        self.standard_macro_call(invocation, macro_name, source, dir, ref_path, project)
+            && self.import_binding_safe_beside(callee, source, name, Some(invocation.id()))
+    }
+
+    /// `invocation` が標準の `macro_name!` を指すか。参照ファイルとその祖先、外側の block で
+    /// マクロ名を import・定義で差し替えておらず、ソースの配置と依存の置き換えも無いことを
+    /// 確かめる。`#[macro_export]` は crate root の名前を差し替えるので、属性の付いた同名の
+    /// `macro_rules!` がプロジェクトのどこかにあれば標準とみなさない。
+    fn standard_macro_call(
+        &self,
+        invocation: Node<'_>,
+        macro_name: &str,
+        source: &[u8],
+        dir: &Path,
+        ref_path: &str,
+        project: &RustPathOwnerProjectProof,
+    ) -> bool {
         let prove = || {
-            if !self.local_value_names.contains(name) || blake3::hash(source) != self.source_hash {
+            if project.may_define_macro(macro_name) {
                 return None;
             }
-            let (invocation, callee) = argument_macro(node, source)?;
             let base = self
                 .format_environment
                 .get_or_init(|| {
@@ -223,38 +316,45 @@ impl RustPathOwnerIndex {
                     {
                         return None;
                     }
+                    let (chain, roots) = enum_owner::ancestor_chain(dir, ref_path)?;
                     let mut combined = Environment::default();
-                    for file in enum_owner::ancestor_files(dir, ref_path)? {
-                        if !project.allows_static_source_path(&file) {
+                    // 親 module の import は子へ継承されないが、`use super::*;` は親の名前を
+                    // 持ち込む。参照ファイルから途切れずに持ち込まれる祖先の import は見える範囲に入れる。
+                    let mut visible = true;
+                    for (index, file) in chain.iter().chain(&roots).enumerate() {
+                        if !project.allows_static_source_path(file) {
                             return None;
                         }
-                        let source = read_input_file(&dir.join(&file))?;
+                        let source = read_input_file(&dir.join(file))?;
                         let tree = parser::parse_source(&source, LangId::Rust).ok()?;
-                        if tree.root_node().has_error() {
+                        let root = tree.root_node();
+                        if root.has_error() {
                             return None;
                         }
-                        combined.merge(environment(
-                            tree.root_node(),
-                            &source,
-                            None,
-                            file == Path::new(ref_path),
-                        )?);
+                        combined.merge(environment(root, &source, None, visible)?);
+                        // crate root は module の連鎖の最上位の親。root どうしは持ち込まない。
+                        if index < chain.len() {
+                            visible = visible && has_parent_glob(root);
+                        }
                     }
-                    combined.plain("format").then_some(combined)
+                    // マクロ名ごとの判定は外側の block を合わせてから行う (`plain` は要素を
+                    // 足すほど偽に寄るので、先に絞っても結果は変わらない)。
+                    Some(combined)
                 })
                 .as_ref()?;
             let mut combined = base.clone();
             let mut ancestor = invocation.parent();
             while let Some(scope) = ancestor {
                 if scope.kind() == "block" {
+                    // block の `use super::*;` は module の親の import を持ち込むので証明しない。
+                    if has_parent_glob(scope) {
+                        return None;
+                    }
                     combined.merge(environment(scope, source, Some(invocation.id()), true)?);
                 }
                 ancestor = scope.parent();
             }
-            if !combined.plain("format") || !self.plain_local_value_owner(callee, source, name) {
-                return None;
-            }
-            Some(())
+            combined.plain(macro_name).then_some(())
         };
         prove().is_some()
     }

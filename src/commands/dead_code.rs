@@ -31,6 +31,8 @@ pub(crate) struct DeadCodeDetection {
     /// 生成物として dead 候補から外したファイル (`dir` 相対、`/` 区切り)。
     /// 参照の集計には含めている。
     pub(crate) generated_candidates_skipped: Vec<String>,
+    /// `.gitattributes` の属性を解決できず、生成物として外さずに候補に残したファイルの申告。
+    pub(crate) generated_undetermined: Vec<crate::models::truncation::TruncationInfo>,
     /// 参照集計の走査で見つかった「解析できないソース」の申告。候補が 0 件で参照集計を
     /// 行わなかった場合は空 (dead と断定したものが無いので誤検出の余地も無い)。
     pub(crate) unanalyzable: Vec<crate::models::truncation::TruncationInfo>,
@@ -43,13 +45,22 @@ pub(crate) struct DeadCodeDetection {
 }
 
 impl DeadCodeDetection {
-    /// dead を 1 件も断定しなかった結果。候補から外した生成物の申告だけは残す。
-    fn without_dead(generated_candidates_skipped: Vec<String>) -> Self {
+    /// dead を 1 件も断定しなかった結果。候補から外した生成物と、生成物か判定できなかった
+    /// ファイルの申告だけは残す。
+    fn without_dead(generated: GeneratedCandidateReport) -> Self {
         Self {
-            generated_candidates_skipped,
+            generated_candidates_skipped: generated.skipped,
+            generated_undetermined: generated.undetermined,
             ..Self::default()
         }
     }
+}
+
+/// 候補の生成物の申告 (外したファイルと、判定できずに残したファイル)。
+#[derive(Debug, Default, Clone)]
+struct GeneratedCandidateReport {
+    skipped: Vec<String>,
+    undetermined: Vec<crate::models::truncation::TruncationInfo>,
 }
 
 /// dead-code 検出本体 (既定の生成物の扱い)。`(dead_symbols, test_only_symbols)` を返す
@@ -123,9 +134,15 @@ fn detect_dead_symbols_with_budget(
 
     let mut candidates =
         collect_dead_code_candidates(dir, &canonical_dir, files, include_generated, parse_budget);
-    let generated_candidates_skipped = std::mem::take(&mut candidates.generated_skipped);
+    let generated = GeneratedCandidateReport {
+        skipped: std::mem::take(&mut candidates.generated_skipped),
+        undetermined: crate::engine::refs::generated_undetermined_truncations(
+            &canonical_dir,
+            &candidates.generated_undetermined,
+        ),
+    };
     if candidates.all_syms.is_empty() {
-        return DeadCodeDetection::without_dead(generated_candidates_skipped);
+        return DeadCodeDetection::without_dead(generated);
     }
 
     // 参照は候補の絞り込み (`--glob` / 既定のディレクトリ除外 / `--git`) と無関係に
@@ -133,7 +150,7 @@ fn detect_dead_symbols_with_budget(
     // 同じ集合から出し、「数えた範囲」と「申告した範囲」を一致させる。
     let scan = match collect_reference_scan(&canonical_dir, files) {
         Ok(scan) => scan,
-        Err(_) => return DeadCodeDetection::without_dead(generated_candidates_skipped),
+        Err(_) => return DeadCodeDetection::without_dead(generated.clone()),
     };
     let unanalyzable = scan.unanalyzable_truncations(&canonical_dir);
 
@@ -145,7 +162,7 @@ fn detect_dead_symbols_with_budget(
         let liveness = SwiftProtocolLiveness::build(&canonical_dir, &scan.files, swift_protocols);
         exclude_swift_protocol_witnesses(&mut candidates, &liveness);
         if candidates.all_syms.is_empty() {
-            return DeadCodeDetection::without_dead(generated_candidates_skipped);
+            return DeadCodeDetection::without_dead(generated.clone());
         }
     }
 
@@ -166,7 +183,7 @@ fn detect_dead_symbols_with_budget(
         parse_budget,
     ) {
         Ok(v) => v,
-        Err(_) => return DeadCodeDetection::without_dead(generated_candidates_skipped),
+        Err(_) => return DeadCodeDetection::without_dead(generated.clone()),
     };
     let unobserved = UnobservedReferences::new(&index.unique_names, &ref_counts.uncounted);
 
@@ -192,7 +209,7 @@ fn detect_dead_symbols_with_budget(
         PythonTestLiveness::default()
     };
     if candidates.all_syms.is_empty() {
-        return DeadCodeDetection::without_dead(generated_candidates_skipped);
+        return DeadCodeDetection::without_dead(generated.clone());
     }
 
     let asset_refs = collect_framework_asset_refs(&canonical_dir);
@@ -223,7 +240,8 @@ fn detect_dead_symbols_with_budget(
     DeadCodeDetection {
         dead: classified.dead,
         test_only: classified.test_only,
-        generated_candidates_skipped,
+        generated_candidates_skipped: generated.skipped,
+        generated_undetermined: generated.undetermined,
         unanalyzable,
         uncounted,
         unverified: classified.unverified,
@@ -654,6 +672,8 @@ struct DeadCodeCandidates {
     liveness_raw: Vec<(String, String, Vec<String>, crate::language::LangId)>,
     /// 生成物として候補から外したファイル (`dir` 相対、`/` 区切り)。
     generated_skipped: Vec<String>,
+    /// 生成物か判定できずに候補に残したファイル。
+    generated_undetermined: Vec<GeneratedUndetermined>,
 }
 
 /// 走査対象ファイルからエクスポートシンボル（trait impl メソッドは除外）と
@@ -672,31 +692,39 @@ fn collect_dead_code_candidates(
     include_generated: bool,
     parse_budget: ParseBudget,
 ) -> DeadCodeCandidates {
-    // .gitattributes の linguist-generated 指定ファイルは dead-code 検出から除外する
-    let gitattrs = crate::engine::gitattributes::GitAttributes::load(canonical_dir);
+    // 生成物は refs の走査と同じ判定 (属性 → 名前 → ヘッダー) で候補から外す。属性の照会の
+    // 状態は解決器のプールで使い回す (ファイルごとに借りても属性ファイルを読み直さない)。
+    // `--include-generated` では属性を解決しない。
+    let resolver = (!include_generated)
+        .then(|| crate::engine::gitattributes::AttributeResolver::open(canonical_dir));
     let scan = |path: &std::path::PathBuf| {
-        scan_candidate_file(dir, canonical_dir, path, &gitattrs, include_generated)
+        let mut lookup = resolver.as_ref().map(|resolver| resolver.lookup());
+        scan_candidate_file(dir, canonical_dir, path, lookup.as_mut())
     };
     // 上限付きのプールで回す (`ASTRO_SIGHT_BATCH_WORKERS` で低メモリ環境向けに並列度を
     // 下げられる)。予算の対象かはファイルの大きさで決める。プールを作れないか、予算の
     // スケジューラが壊れた (起こらないはず) ときは直列に処理する (結果は同じ)。
     let size = |path: &std::path::PathBuf| std::fs::metadata(path).map_or(0, |m| m.len());
-    let scanned: Vec<CandidateFile> = crate::engine::refs::build_bounded_pool()
-        .ok()
-        .and_then(|pool| {
-            pool.install(|| {
-                crate::engine::parse_budget::map_with_budget(files, parse_budget, size, scan).ok()
+    let scanned: Vec<(CandidateFile, Option<GeneratedUndetermined>)> =
+        crate::engine::refs::build_bounded_pool()
+            .ok()
+            .and_then(|pool| {
+                pool.install(|| {
+                    crate::engine::parse_budget::map_with_budget(files, parse_budget, size, scan)
+                        .ok()
+                })
             })
-        })
-        .unwrap_or_else(|| files.iter().map(scan).collect());
+            .unwrap_or_else(|| files.iter().map(scan).collect());
 
     let mut all_syms: Vec<(String, String, String, crate::language::LangId)> = Vec::new();
     let mut liveness_raw: Vec<(String, String, Vec<String>, crate::language::LangId)> = Vec::new();
     let mut generated_skipped: Vec<String> = Vec::new();
+    let mut generated_undetermined = Vec::new();
     let mut swift_signatures = Vec::new();
     let mut python_starts = Vec::new();
     let mut python_facts = std::collections::HashMap::new();
-    for file in scanned {
+    for (file, undetermined) in scanned {
+        generated_undetermined.extend(undetermined);
         match file {
             CandidateFile::Ignored => {}
             CandidateFile::Generated(rel) => generated_skipped.push(rel),
@@ -733,8 +761,15 @@ fn collect_dead_code_candidates(
         python_facts,
         liveness_raw,
         generated_skipped,
+        generated_undetermined,
     }
 }
+
+/// 生成物か判定できず (属性を解決できない) 候補に残したファイル (`dir` 相対の絶対パス) と原因。
+type GeneratedUndetermined = (
+    std::path::PathBuf,
+    crate::engine::gitattributes::AttributeLookupError,
+);
 
 /// 候補抽出の 1 ファイルぶんの結果。
 enum CandidateFile {
@@ -746,17 +781,19 @@ enum CandidateFile {
     Extracted(String, FileCandidates),
 }
 
-/// `collect_dead_code_candidates` の 1 ファイルぶんの処理。
+/// `collect_dead_code_candidates` の 1 ファイルぶんの処理。`generated` は生成物の判定に使う
+/// 属性の照会 (`--include-generated` では `None`)。
 fn scan_candidate_file(
     dir: &str,
     canonical_dir: &std::path::Path,
     path: &std::path::Path,
-    gitattrs: &crate::engine::gitattributes::GitAttributes,
-    include_generated: bool,
-) -> CandidateFile {
+    generated: Option<&mut crate::engine::gitattributes::AttributeLookup<'_>>,
+) -> (CandidateFile, Option<GeneratedUndetermined>) {
+    use crate::engine::generated::{GeneratedVerdict, judge};
+
     // canonicalize で削除済みファイルをスキップ、dir 外のパスも除外
     let Ok(canonical_path) = std::fs::canonicalize(path) else {
-        return CandidateFile::Ignored;
+        return (CandidateFile::Ignored, None);
     };
     // diff 由来のパス (常に `/` 区切り) と突き合わせるため区切り文字を正規化する。
     // そろえないと filter_dead_by_touched_symbols / filter_dead_by_wip_added の突合せが
@@ -764,19 +801,24 @@ fn scan_candidate_file(
     // dead 検出が丸ごと消える)、後者は WIP 抑止が効かなくなる。
     let rel = match canonical_path.strip_prefix(canonical_dir) {
         Ok(p) => normalize_workspace_separators(&p.to_string_lossy()),
-        Err(_) => return CandidateFile::Ignored, // dir 外のパスは除外（セキュリティ境界）
+        // dir 外のパスは除外（セキュリティ境界）
+        Err(_) => return (CandidateFile::Ignored, None),
     };
-    // ファイル先頭の「自動生成」マーカーコメントでも除外する (.gitattributes が
-    // 無いリポジトリでも tree-sitter の parser.c / protoc の *.pb.go 等を無視できる)
-    if !include_generated
-        && (gitattrs.is_generated(&rel)
-            || crate::engine::generated::is_auto_generated(&canonical_path))
-    {
-        return CandidateFile::Generated(rel);
+    let mut undetermined = None;
+    if let Some(lookup) = generated {
+        match judge(
+            lookup.linguist_generated(&canonical_path),
+            &canonical_path,
+            || crate::engine::generated::is_auto_generated(&canonical_path),
+        ) {
+            GeneratedVerdict::Generated(_) => return (CandidateFile::Generated(rel), None),
+            GeneratedVerdict::NotGenerated => {}
+            GeneratedVerdict::Undetermined(error) => undetermined = Some((canonical_path, error)),
+        }
     }
     match extract_file_candidates(dir, &rel) {
-        Some(candidates) => CandidateFile::Extracted(rel, candidates),
-        None => CandidateFile::Ignored,
+        Some(candidates) => (CandidateFile::Extracted(rel, candidates), undetermined),
+        None => (CandidateFile::Ignored, undetermined),
     }
 }
 
@@ -2147,6 +2189,7 @@ pub fn cmd_dead_code_with_swift_protocols(
     };
 
     let mut truncations = resolved_diff.truncations;
+    truncations.extend(detection.generated_undetermined);
     truncations.extend(detection.unanalyzable);
     // 参照を数えられなかったファイルは、dead を保留したかに関わらず申告する
     // (「全部数えた」と読めないように)。
@@ -2300,7 +2343,8 @@ mod candidate_tests {
         files: &[std::path::PathBuf],
         include_generated: bool,
     ) -> ReferenceCandidates {
-        let gitattrs = crate::engine::gitattributes::GitAttributes::load(canonical_dir);
+        let resolver = crate::engine::gitattributes::AttributeResolver::open(canonical_dir);
+        let mut lookup = resolver.lookup();
         let mut all_syms = Vec::new();
         let mut liveness_raw = Vec::new();
         let mut generated_skipped = Vec::new();
@@ -2313,8 +2357,12 @@ mod candidate_tests {
                 Err(_) => continue,
             };
             if !include_generated
-                && (gitattrs.is_generated(&rel)
-                    || crate::engine::generated::is_auto_generated(&canonical_path))
+                && crate::engine::generated::judge(
+                    lookup.linguist_generated(&canonical_path),
+                    &canonical_path,
+                    || crate::engine::generated::is_auto_generated(&canonical_path),
+                )
+                .is_generated()
             {
                 generated_skipped.push(rel);
                 continue;

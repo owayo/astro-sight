@@ -79,11 +79,6 @@ pub(crate) fn detect_api_changes_with_renames(
     let mut buckets = ApiChangeBuckets::default();
     let mut rust_public = RustPublicApiContext::default();
 
-    // .gitattributes の linguist-generated 指定ファイルは API 変更検出から除外する
-    let gitattrs = std::fs::canonicalize(dir)
-        .map(|d| crate::engine::gitattributes::GitAttributes::load(&d))
-        .unwrap_or_default();
-
     // 同一 diff 内で追加/変更されたファイルパスの集合。新規 pub シンボルが diff 内の
     // 別ファイルから参照されていれば「同一 diff 内で完結して使用されている」と判断し、
     // api.add から除外する（binary crate の pub struct が同 diff 内で use されるケース等）。
@@ -103,13 +98,7 @@ pub(crate) fn detect_api_changes_with_renames(
         mut index_names,
         unverified_deleted_paths,
         parse_truncations,
-    } = PreparedDiff::new(
-        dir,
-        diff_files,
-        &gitattrs,
-        canonical_dir.as_deref(),
-        &base_blobs,
-    );
+    } = PreparedDiff::new(dir, diff_files, canonical_dir.as_deref(), &base_blobs);
     buckets.parse_truncations.extend(parse_truncations);
 
     // 型の移動と同じ差分でシグネチャの変わったメンバー、移動と同じ差分でシグネチャの変わった

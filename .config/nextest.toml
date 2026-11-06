@@ -59,7 +59,7 @@ threads-required = 2
 
 # Rust の同名所有元とマクロ・モジュール配置の対照を先に実行する。
 [[profile.default.overrides]]
-filter = 'binary_id(astro-sight::integration) & (test(=integration::impact_rust_private_helpers::impact_rust_enum_variants_have_their_own_declaration_owner) | test(=integration::impact_rust_private_helpers::impact_rust_format_arguments_require_standard_macro_binding))'
+filter = 'binary_id(astro-sight::integration) & (test(=integration::impact_rust_private_helpers::impact_rust_enum_variants_have_their_own_declaration_owner) | test(=integration::impact_rust_private_helpers::impact_rust_format_arguments_require_standard_macro_binding) | test(=integration::impact_rust_same_named_constants::impact_rust_same_named_constants_keep_unproven_bindings))'
 priority = 50
 threads-required = 2
 

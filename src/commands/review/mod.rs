@@ -410,6 +410,16 @@ fn review_attempt_with_swift_protocols(
     truncations.extend(snapshot_notice);
     truncations.extend(dead_truncations);
     truncations.append(&mut api_changes.parse_truncations);
+    // dead-code と API 差分は同じ原因 (属性を解決できないなど) を別々に申告しうるので、
+    // まったく同じ申告は 1 件にする (最初に現れた順を保つ)。
+    let mut unique: Vec<crate::models::truncation::TruncationInfo> =
+        Vec::with_capacity(truncations.len());
+    for truncation in truncations {
+        if !unique.contains(&truncation) {
+            unique.push(truncation);
+        }
+    }
+    let truncations = unique;
 
     let result = ReviewResult {
         impact,
@@ -1098,6 +1108,7 @@ fn review_dead_symbols(opts: &ReviewDeadSymbolsOpts<'_>) -> Result<ReviewDeadSym
     };
     // 参照を数えられなかったファイル (読み込み・構文解析の失敗) は、dead を保留した結果
     // dead が 0 件でも申告する (「全部数えた」と読めないように)。
+    truncations.extend(detection.generated_undetermined);
     truncations.extend(detection.uncounted);
 
     Ok(ReviewDeadSymbols {

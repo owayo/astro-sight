@@ -159,8 +159,7 @@ fn review_git_hook_starts_each_git_query_once() {
             ("blame --line-porcelain", 3),
             ("log --format=%H%x00%aE%x00%at", 3),
             ("cat-file --batch", 1),
-            // 起点と候補の生成物判定
-            ("check-attr -z", 2),
+            // 起点と候補の生成物判定は git を起動しない (属性は gix で解決する)
             // 起点 3 ファイルの変更行 (まとめて 1 回)
             ("diff --no-ext-diff", 1),
             // 差分の取得と解析後の確認
@@ -205,7 +204,6 @@ fn staged_review_hook_starts_each_git_query_once() {
             ("log --format=%H%x00%aE%x00%at", 3),
             // 一時リポジトリの index tree と、API 差分の base
             ("cat-file --batch", 2),
-            ("check-attr -z", 2),
             ("diff --no-ext-diff", 1),
             // staged の差分と作業ツリーの差分をそれぞれ、取得・解析前の確認・解析後の確認で 3 回ずつ。
             // 残る 1 回は一時リポジトリが index と一致するかの確認。
