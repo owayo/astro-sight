@@ -17,6 +17,7 @@ mod integration {
     mod dead_code_conventions;
     mod dead_code_languages;
     mod dead_code_locations;
+    mod dead_code_parse_budget;
     mod dead_code_uncounted;
     mod deep_nesting;
     mod fixed_callback_contract;

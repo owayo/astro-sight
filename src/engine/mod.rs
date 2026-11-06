@@ -17,6 +17,7 @@ pub(crate) mod jsx;
 pub mod lexer;
 pub(crate) mod lexical_binding;
 pub mod lint;
+pub mod parse_budget;
 pub mod parser;
 pub mod phpunit_refs;
 pub(crate) mod python_callable;

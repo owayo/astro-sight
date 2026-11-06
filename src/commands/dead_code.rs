@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::collections::HashSet;
 use tracing::info;
 
+use crate::engine::parse_budget::ParseBudget;
 use crate::engine::parser;
 use crate::error::{AstroError, ErrorCode};
 use crate::git_support::normalize_workspace_separators;
@@ -72,19 +73,39 @@ pub(crate) fn detect_dead_symbols(
     files: &[std::path::PathBuf],
     include_generated: bool,
 ) -> DeadCodeDetection {
-    detect_dead_symbols_with_swift_protocols(
+    detect_dead_symbols_with_budget(
         dir,
         files,
         include_generated,
         &SwiftProtocolMethods::default(),
+        ParseBudget::default(),
     )
 }
 
+/// dead-code 検出本体。参照の集計の構文解析の予算 ([`ParseBudget::from_env`]) は走査を始める
+/// 前に 1 度だけ読み、不正な値は既定に戻さずに失敗させる。
 pub(crate) fn detect_dead_symbols_with_swift_protocols(
     dir: &str,
     files: &[std::path::PathBuf],
     include_generated: bool,
     swift_protocols: &SwiftProtocolMethods,
+) -> Result<DeadCodeDetection> {
+    let budget = ParseBudget::from_env()?;
+    Ok(detect_dead_symbols_with_budget(
+        dir,
+        files,
+        include_generated,
+        swift_protocols,
+        budget,
+    ))
+}
+
+fn detect_dead_symbols_with_budget(
+    dir: &str,
+    files: &[std::path::PathBuf],
+    include_generated: bool,
+    swift_protocols: &SwiftProtocolMethods,
+    parse_budget: ParseBudget,
 ) -> DeadCodeDetection {
     let canonical_dir = match std::fs::canonicalize(dir) {
         Ok(d) => d,
@@ -100,7 +121,7 @@ pub(crate) fn detect_dead_symbols_with_swift_protocols(
     // (no-op、警告も出さない)。
 
     let mut candidates =
-        collect_dead_code_candidates(dir, &canonical_dir, files, include_generated);
+        collect_dead_code_candidates(dir, &canonical_dir, files, include_generated, parse_budget);
     let generated_candidates_skipped = std::mem::take(&mut candidates.generated_skipped);
     if candidates.all_syms.is_empty() {
         return DeadCodeDetection::without_dead(generated_candidates_skipped);
@@ -141,6 +162,7 @@ pub(crate) fn detect_dead_symbols_with_swift_protocols(
         &index.unique_names,
         &scan.files,
         is_test,
+        parse_budget,
     ) {
         Ok(v) => v,
         Err(_) => return DeadCodeDetection::without_dead(generated_candidates_skipped),
@@ -233,7 +255,8 @@ mod swift_protocol_candidate_tests {
         std::fs::write(&path, "public struct A: Hashable {}\nextension A {\n public func hash(into value: inout Hasher) {}\n}\npublic struct B<T> {}\nextension B where T: Equatable {\n public func hash(into value: inout Hasher) {}\n}\n").unwrap();
         let files = vec![path];
         let dir = root.to_str().unwrap();
-        let mut candidates = collect_dead_code_candidates(dir, &root, &files, false);
+        let mut candidates =
+            collect_dead_code_candidates(dir, &root, &files, false, ParseBudget::default());
         assert_eq!(
             candidates
                 .all_syms
@@ -532,26 +555,32 @@ struct DeadCodeCandidates {
 /// 外したファイルは申告用に記録する。`include_generated` のときは候補に含める。
 ///
 /// ファイルごとの読み込み・parse・抽出は互いに独立しているので並列に行い、結果は
-/// 入力の順に組み立てる (直列で処理したときと同じ順序になる)。
+/// 入力の順に組み立てる (直列で処理したときと同じ順序になる)。大きいファイルは参照の集計と
+/// 同じ予算 (`parse_budget`) で同時に解析する大きさを制限する。
 fn collect_dead_code_candidates(
     dir: &str,
     canonical_dir: &std::path::Path,
     files: &[std::path::PathBuf],
     include_generated: bool,
+    parse_budget: ParseBudget,
 ) -> DeadCodeCandidates {
-    use rayon::prelude::*;
-
     // .gitattributes の linguist-generated 指定ファイルは dead-code 検出から除外する
     let gitattrs = crate::engine::gitattributes::GitAttributes::load(canonical_dir);
     let scan = |path: &std::path::PathBuf| {
         scan_candidate_file(dir, canonical_dir, path, &gitattrs, include_generated)
     };
-    // 参照の集計と同じ上限付きのプールで回す (`ASTRO_SIGHT_BATCH_WORKERS` で低メモリ環境向けに
-    // 並列度を下げられる)。プールを作れなければ直列に処理する (結果は同じ)。
-    let scanned: Vec<CandidateFile> = match crate::engine::refs::build_bounded_pool() {
-        Ok(pool) => pool.install(|| files.par_iter().map(scan).collect()),
-        Err(_) => files.iter().map(scan).collect(),
-    };
+    // 上限付きのプールで回す (`ASTRO_SIGHT_BATCH_WORKERS` で低メモリ環境向けに並列度を
+    // 下げられる)。予算の対象かはファイルの大きさで決める。プールを作れないか、予算の
+    // スケジューラが壊れた (起こらないはず) ときは直列に処理する (結果は同じ)。
+    let size = |path: &std::path::PathBuf| std::fs::metadata(path).map_or(0, |m| m.len());
+    let scanned: Vec<CandidateFile> = crate::engine::refs::build_bounded_pool()
+        .ok()
+        .and_then(|pool| {
+            pool.install(|| {
+                crate::engine::parse_budget::map_with_budget(files, parse_budget, size, scan).ok()
+            })
+        })
+        .unwrap_or_else(|| files.iter().map(scan).collect());
 
     let mut all_syms: Vec<(String, String, String, crate::language::LangId)> = Vec::new();
     let mut liveness_raw: Vec<(String, String, Vec<String>, crate::language::LangId)> = Vec::new();
@@ -2065,7 +2094,7 @@ pub fn cmd_dead_code_with_swift_protocols(
     // 報告する** (最悪方向の誤り)。候補の絞り込み (`--glob` / `--git`) で申告を狭めると、
     // 数えていない範囲が申告から消える。
     let detection =
-        detect_dead_symbols_with_swift_protocols(dir, &files, include_generated, swift_protocols);
+        detect_dead_symbols_with_swift_protocols(dir, &files, include_generated, swift_protocols)?;
     generated_skipped.extend(detection.generated_candidates_skipped);
     let dead_symbols = detection.dead;
     let test_only_symbols = detection.test_only;
@@ -2356,8 +2385,13 @@ mod candidate_tests {
         files.push(outside.path().join("x.ts"));
 
         for include_generated in [false, true] {
-            let actual =
-                collect_dead_code_candidates(dir, &canonical_dir, &files, include_generated);
+            let actual = collect_dead_code_candidates(
+                dir,
+                &canonical_dir,
+                &files,
+                include_generated,
+                ParseBudget::default(),
+            );
             let (all_syms, liveness_raw, generated_skipped) =
                 reference_collect(dir, &canonical_dir, &files, include_generated);
             assert_eq!(

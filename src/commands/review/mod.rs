@@ -1056,7 +1056,7 @@ fn review_dead_symbols(opts: &ReviewDeadSymbolsOpts<'_>) -> Result<ReviewDeadSym
         None,
     )?;
     let detection =
-        detect_dead_symbols_with_swift_protocols(opts.dir, &files, false, opts.swift_protocols);
+        detect_dead_symbols_with_swift_protocols(opts.dir, &files, false, opts.swift_protocols)?;
     let (dead_symbols, test_only_symbols) = (detection.dead, detection.test_only);
     // dead-scope=touched-symbols: 宣言行が diff の `+` 行と重ならない dead を除外。
     // `--hook` のデフォルトで「changed file 内の元から存在した dead」の
