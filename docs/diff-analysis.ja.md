@@ -358,7 +358,7 @@ condition = { command_exists = "astro-sight" }
 ASTRO_SIGHT_INCLUDE_VENDOR_FOR_IMPACT=1 astro-sight impact --dir . --git
 ```
 
-`.gitignore` と隠しファイルの除外、および生成ファイルの判定（`refs::collect_files` 経由）は、この既定の除外とは別の仕組みで動く。このうち生成ファイルの除外だけは、`--include-generated` または `skip_generated = false` で解除できる。
+`.gitignore` と隠しファイルの除外は、この既定の除外とは別の仕組みで常に効く。生成ファイル（先頭の生成宣言コメントなどで判定したもの）は除外せず、dead-code の参照の集計と同じく通常のソースとして呼び出し元を探す。生成コードは手書きの宣言に実行時に依存し（tree-sitter の `parser.c` は `scanner.c` の外部スキャナの関数を宣言して呼ぶ）、その型を変えると生成コードは再生成が必要になるためである。`refs` や `symbols` と違い、`--include-generated` / `skip_generated` はこの検索を変えない。
 
 ### ユーザー指定の追加除外
 
