@@ -1797,7 +1797,7 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-swift"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "cc",
  "tree-sitter-language",

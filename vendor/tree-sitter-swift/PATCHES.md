@@ -1,61 +1,57 @@
 # Swift grammar patch
 
-This directory vendors `tree-sitter-swift` 0.7.3 under its original MIT license.
+This directory vendors `tree-sitter-swift` 0.7.4 under its original MIT license.
 The published crate is the baseline: SHA-256
-`fe36052155b9dd69ca82b3b8f1b4ccfb2d867125ac1a4db1dd7331829242668c`.
+`2688c06564afa397313e0db17d140a73e2c6a47f3884794614246167c9dd5dfd`.
 Its VCS record names upstream commit
-`b8b22bffbb3441780e6471665bacfb263741c86a` with `dirty = true`, so the crate
-must not be assumed to equal that commit. The missing `grammar.js` and
-`tree-sitter.json` come from that commit; the grammar rules match the crate's
-`src/grammar.json`. Runtime sources, Rust bindings, queries and license originate
-from the crate. Packaging is reduced to the Rust build and grammar regeneration;
-contact email metadata is omitted. Redundant blank lines at EOF are trimmed
-in the scanner and three query files; query contents otherwise match the crate. Standalone Rust tests use the same tree-sitter
-0.27 runtime as the CLI, matching the generated ABI 15 parser.
+`171fa3bc343233fe07f5e17205aaada33d778825` (tag `0.7.4`) with `dirty = true`.
+The missing `grammar.js` and `tree-sitter.json` come from that commit.
+Regenerating that unmodified `grammar.js` with the CLI below reproduces the
+crate's `src/grammar.json` and `src/parser.c` byte for byte. Runtime sources,
+Rust bindings, queries and license originate from the crate. Packaging is
+reduced to the Rust build and grammar regeneration; contact email metadata is
+omitted. Redundant blank lines at EOF are trimmed in three query files; query
+contents otherwise match the crate. Standalone Rust tests use the same
+tree-sitter 0.27 runtime as the CLI, matching the generated ABI 15 parser.
 
 Upstream: <https://github.com/alex-pinkus/tree-sitter-swift>.
-Local regression: <https://github.com/owayo/astro-sight/issues/32>.
 Empty-tuple regression: <https://github.com/owayo/astro-sight/issues/41>.
 Conditional try/await regression: <https://github.com/owayo/astro-sight/issues/200>.
-Windows forced-try regression: <https://github.com/owayo/astro-sight/issues/201>.
 
-## Change
+## Changes
 
-An optional type suffix needs an adjacent `??`, while nil coalescing can follow
-whitespace, comments or a newline. The original scanner used the same external
-token for both and could consume a multiline nil coalescing operator as a type
-suffix after `as? String`.
+Swift permits an empty tuple `()` as a value and pattern. Both
+`tuple_expression` and `_tuple_pattern` allow zero elements so valid uses such
+as `.success(())`, `[()]`, and `case .success(())` do not produce missing tokens
+or error nodes. Upstream 0.7.4 still requires an element and parses `()` as a
+tuple holding a zero-width `bang`. The generated `tuple_expression.value` field
+is optional.
 
-Append a dedicated `_immediate_double_quest` external token and use it only in
-`optional_type`. Scan it before skipping whitespace or comments. Keep the
-existing nil coalescing token and scanner serialization unchanged. Disable this
-new token during the all-symbols-valid error-recovery probe. Generated node-type
-entries retain the upstream schema.
+Upstream 0.7.4 gives the operand of `try` a direct `await_expression`
+alternative with the same left associativity as a direct call, so that
+`if let x = try? await load() { ... }` no longer absorbs the conditional block
+as a trailing closure. Without a dynamic precedence, that alternative also wins
+over the broad operands, and `try` loses the rest of the expression:
+`try await load().count` parses as `(try await load()).count`, and
+`try await ready() ? yes() : no()` puts the ternary inside `await`. The patch
+gives the alternative a dynamic precedence of -1, as the 0.7.3-based vendor did.
+Binary, ternary, nil-coalescing and postfix operands then stay inside `try`,
+and the conditional block stays out of the call. The scanner, node names and
+fields are unchanged.
 
-Swift also permits an empty tuple `()` as a value and pattern. Both
-`tuple_expression` and `_tuple_pattern` now allow zero elements so valid uses
-such as `.success(())`, `[()]`, and `case .success(())` do not produce missing
-tokens or error nodes. The generated `tuple_expression.value` field is optional.
+## Patches taken over by upstream
 
-The operand of `try` also gives a direct `await_expression` the same left
-associativity as a direct call, as a dynamically lower-priority alternative.
-The original broad-operand interpretations remain preferred for binary,
-ternary, and postfix expressions. Without the alternative, `if let x = try? await load()` can
-absorb the conditional block as a trailing closure and consume subsequent
-declarations during recovery. A conflict with `_primary_expression` keeps the
-alternative postfix interpretation available. Existing node names and fields,
-the scanner, and source bytes are unchanged; actual trailing closures remain
-part of their calls.
+The 0.7.3-based vendor carried two more patches. Upstream 0.7.4 fixes the same
+problems, so they were dropped. Their regression tests stay in place and pass
+with the upstream implementations.
 
-The scanner's suppression mask for `FAKE_TRY_BANG` (token 32) uses `1ULL`
-instead of `1UL`. Windows has a 32-bit `unsigned long`, so shifting `1UL` by 32
-cannot construct the required 64-bit mask. The failed suppression lets the
-external scanner consume the `!` in `try!` as boolean negation. The 64-bit
-literal matches the existing mask storage and reader. Token order and scanner
-serialization are unchanged, and this scanner-only fix needs no regeneration.
-Regression tests distinguish `try!` from `try !flag()` and exercise forced
-try/await bindings through CLI definitions, calls, references, and Unicode/CRLF
-positions.
+- Multiline nil coalescing after `as? String`
+  (<https://github.com/owayo/astro-sight/issues/32>): upstream commit
+  `b5fa894c60` adds the `_double_optional` external token for an adjacent
+  `??` type suffix, replacing the local `_immediate_double_quest` token.
+- `try!` parsed as boolean negation on Windows
+  (<https://github.com/owayo/astro-sight/issues/201>): upstream commit
+  `6ab8d1d74e` uses the same `1ULL` mask for `FAKE_TRY_BANG`.
 
 ## Regenerate
 
@@ -66,29 +62,31 @@ cd vendor/tree-sitter-swift
 tree-sitter generate --abi 15
 ```
 
-The generated C parser and headers are checked in. Normal Cargo builds need no
-Node.js or grammar generator. A generator upgrade may change unrelated tables;
-keep it separate from this patch.
+The generated C parser and headers are checked in, and the command reproduces
+them byte for byte. Normal Cargo builds need no Node.js or grammar generator.
+The published crate's `src/node-types.json` lacks the anonymous `?` and `??`
+entries that this CLI writes, and its `src/tree_sitter/array.h` comes from a
+newer generator (C++ casts only); the checked-in files are the CLI 0.26.6
+output. A generator upgrade may change unrelated tables; keep it separate from
+this patch.
 
 Before removing this vendor patch in favor of an upstream release, run the Swift
-grammar regression tests (including double optional closure parameters), the
-CLI grammar tests and the upstream corpus. The original crate, its unmodified
-regeneration and the patched parser produced identical full ASTs for all 238
-upstream corpus cases. The regression tests additionally cover the reported
-multiline cast/coalescing expression and source ranges.
-The empty-tuple patch keeps the full ASTs of the current upstream corpus sources
-byte-identical and adds a CLI regression for values, patterns, and unaffected
-parenthesized expressions, calls, and function types.
-The try/await patch also preserves full ASTs, including ranges, for all 238
-corpus cases from the pinned upstream commit. Parser and CLI regressions cover
-conditional bindings (`if`, `guard`, `while`, and `case`), ordinary calls and
-trailing closures, broad binary/ternary/postfix operands, CRLF/Unicode positions, incremental repair, diagnostics for
-malformed input, and following definitions, references, and calls.
+grammar regression tests (including double optional closure parameters and the
+`try await` operand spans), the CLI grammar tests and the upstream corpus. For
+all 296 corpus cases of the pinned upstream commit, the unmodified regeneration
+and the patched parser produce identical full ASTs, including ranges; across the
+corpus and the Swift fixtures, only the empty-tuple fixture differs. The corpus
+has no `try await` with a postfix, navigation, ternary or nil-coalescing
+operand, so the parser regressions cover those spans.
 
 ## Existing limitation
 
 The adjacent-comment expression `value as? String/**/?? "fallback"` retains an
-upstream AST ambiguity (`optional_type` plus `infix_expression`) in all three
-parsers. This patch fixes the reported multiline expression; it does not resolve
-that existing comment-trivia case. Spaced comments and newline cases are covered
+upstream AST ambiguity (`optional_type` plus `infix_expression`). Upstream
+0.7.4 and the patched parser parse it the same way as the 0.7.3-based vendor
+did. Spaced comments and newline cases parse as nil coalescing and are covered
 by the regression tests.
+
+`unsafe` (SE-0458), new in upstream 0.7.4, binds only the next primary
+expression: `unsafe load().count` parses as `(unsafe load()).count`. Following
+declarations are kept.
