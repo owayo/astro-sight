@@ -1055,8 +1055,9 @@ fn pair_key_matches(pair: Node, source: &[u8], expected: &str) -> bool {
 /// Python の `class_definition` が直接持つ base class 名のリストを返す。
 /// 例: `class Foo(Bar, baz.Qux):` → `["Bar", "baz.Qux"]`
 ///
-/// dead-code 判定で同一ファイル内の継承チェーンを fixed-point で解決するための低レベル
-/// helper。クロスファイル継承解析や引数 (`metaclass=...`) の解釈は行わない。
+/// 既知の基底クラスの直接の継承を書き方で判定するための低レベル helper。継承の連鎖や
+/// import の解決、引数 (`metaclass=...`) の解釈は行わない (テストランナーの判定は
+/// `python_tests` が行う)。
 pub fn python_class_base_names(root: Node, source: &[u8], symbol_range: &Range) -> Vec<String> {
     let Some(node) = node_for_symbol_range(root, symbol_range) else {
         return Vec::new();

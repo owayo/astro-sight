@@ -11,12 +11,13 @@ use crate::models::review::DeadSymbol;
 
 #[cfg(test)]
 use super::api_changes::extract_exported_symbols_from_file_inner;
-use super::api_changes::{ExportedSymbols, bare_name, filter_exported_symbols};
+use super::api_changes::{ExportedSymbols, bare_name, filter_dead_code_candidates};
 use super::dead_code_default_liveness::DefaultExportLiveness;
 use super::dead_code_member_liveness::{
     JsTsMemberLiveness, MemberStatus, PhpMemberLiveness, RubyConstructorLiveness,
     RustMemberLiveness,
 };
+use super::dead_code_python_tests::{PythonTestLiveness, is_python_test_target};
 use super::dead_code_swift_protocol::SwiftProtocolLiveness;
 use super::git_input::{DiffSourceResolution, resolve_diff_source};
 use crate::config::SwiftProtocolMethods;
@@ -170,7 +171,7 @@ fn detect_dead_symbols_with_budget(
     // 全参照をテストからの参照と数えていた (本番で使うシンボルが test_only になる)。
     let is_test = |path: &std::path::Path| is_workspace_test_path(&canonical_dir, path);
 
-    let index =
+    let mut index =
         build_dead_code_name_index(&candidates, &canonical_dir, files, &scan.files, &is_test);
 
     // production / test 別に refs カウント。test/ 配下のみで参照されるシンボルは
@@ -186,6 +187,31 @@ fn detect_dead_symbols_with_budget(
     };
     let unobserved = UnobservedReferences::new(&index.unique_names, &ref_counts.uncounted);
 
+    // Python のテストランナーがモジュールをまたいで集めるテスト (別ファイルの基底の `test*`、
+    // テストモジュールへ import したクラス、別ファイルの TestCase の連鎖など) を候補から外す。
+    // 集めるかどうか分からないものは、分類で dead と断定せずに保留する。プロジェクトの Python の
+    // ファイルをすべて構文解析するので、本番の参照が無く報告されうる対象の候補があるときだけ
+    // 行う (本番の参照がある候補は判定に依らず生存で、同じ名前のほかの候補も報告されない)。
+    let python_tests = if needs_python_test_liveness(&candidates, &ref_counts.counts) {
+        let python_tests = PythonTestLiveness::build(
+            &candidates.all_syms,
+            &candidates.python_starts,
+            std::mem::take(&mut candidates.python_facts),
+            &canonical_dir,
+            &scan.files,
+            parse_budget,
+        );
+        exclude_python_test_entrypoints(&mut candidates, &python_tests);
+        // 外した候補は同名の数から除く (残った同名の候補が一意なら参照の数で判定する)。
+        index.name_counts = candidate_name_counts(&candidates);
+        python_tests
+    } else {
+        PythonTestLiveness::default()
+    };
+    if candidates.all_syms.is_empty() {
+        return DeadCodeDetection::without_dead(generated.clone());
+    }
+
     let asset_refs = collect_framework_asset_refs(&canonical_dir);
     let default_liveness =
         DefaultExportLiveness::build(&candidates.all_syms, &canonical_dir, &scan.files);
@@ -200,6 +226,7 @@ fn detect_dead_symbols_with_budget(
         &default_liveness,
         &rust_member_liveness,
         &unobserved,
+        &python_tests,
     );
     attach_declaration_lines(dir, &mut classified.dead, &mut classified.test_only);
     attach_declaration_lines(dir, &mut classified.unverified, &mut []);
@@ -207,6 +234,7 @@ fn detect_dead_symbols_with_budget(
         &canonical_dir,
         &ref_counts.uncounted,
         default_liveness.unobserved_files(),
+        python_tests.unobserved_files(),
         classified.unverified.len(),
     );
     DeadCodeDetection {
@@ -218,6 +246,58 @@ fn detect_dead_symbols_with_budget(
         uncounted,
         unverified: classified.unverified,
     }
+}
+
+/// 本番の参照が無く、モジュールをまたぐ Python のテストの判定で結果が変わりうる候補
+/// (クラスと、テストランナーが名前で集めうる関数とメソッド) があるか。
+fn needs_python_test_liveness(
+    candidates: &DeadCodeCandidates,
+    counts: &std::collections::HashMap<String, (usize, usize)>,
+) -> bool {
+    candidates
+        .all_syms
+        .iter()
+        .zip(&candidates.python_starts)
+        .any(|((name, kind, _, lang), start)| {
+            *lang == crate::language::LangId::Python
+                && start.is_some()
+                && is_python_test_target(name, kind)
+                && counts
+                    .get(&normalized_bare_name(*lang, name))
+                    .is_none_or(|&(production, _)| production == 0)
+        })
+}
+
+/// Python のテストランナーが集めるか名前で呼ぶと分かった候補を外す (並びを共有する
+/// `swift_signatures` と `python_starts` も同じだけ外す)。呼び出し側は外したあとに同名の数を
+/// 数え直すので、同じ bare name の残った候補は一意になって参照の数で判定される (その数には
+/// 外した候補あての参照も入るので、生存の側に倒れるだけ。ファイル単位の除外と同じ扱い)。
+fn exclude_python_test_entrypoints(
+    candidates: &mut DeadCodeCandidates,
+    liveness: &PythonTestLiveness,
+) {
+    debug_assert_eq!(candidates.all_syms.len(), candidates.swift_signatures.len());
+    debug_assert_eq!(candidates.all_syms.len(), candidates.python_starts.len());
+    let count = candidates.all_syms.len();
+    let mut all_syms = Vec::with_capacity(count);
+    let mut swift_signatures = Vec::with_capacity(count);
+    let mut python_starts = Vec::with_capacity(count);
+    for ((candidate, signature), start) in candidates
+        .all_syms
+        .drain(..)
+        .zip(candidates.swift_signatures.drain(..))
+        .zip(candidates.python_starts.drain(..))
+    {
+        if candidate.3 == crate::language::LangId::Python && liveness.is_live(&candidate.2, start) {
+            continue;
+        }
+        all_syms.push(candidate);
+        swift_signatures.push(signature);
+        python_starts.push(start);
+    }
+    candidates.all_syms = all_syms;
+    candidates.swift_signatures = swift_signatures;
+    candidates.python_starts = python_starts;
 }
 
 fn exclude_swift_protocol_witnesses(
@@ -236,12 +316,20 @@ fn exclude_swift_protocol_witnesses(
                 .or_insert(0) += 1;
         }
     }
-    let mut kept = Vec::with_capacity(candidates.all_syms.len());
-    let mut lines = Vec::with_capacity(candidates.all_syms.len());
-    for (candidate, signature) in candidates
+    // 並びを共有する `swift_signatures` と `python_starts` も同じだけ外す (外さないと、後ろの
+    // Python の候補が前の候補の開始位置を引く)。
+    debug_assert_eq!(candidates.all_syms.len(), candidates.swift_signatures.len());
+    debug_assert_eq!(candidates.all_syms.len(), candidates.python_starts.len());
+    let count = candidates.all_syms.len();
+    let mut kept = Vec::with_capacity(count);
+    let mut lines = Vec::with_capacity(count);
+    let mut signatures = Vec::with_capacity(count);
+    let mut python_starts = Vec::with_capacity(count);
+    for ((candidate, signature), start) in candidates
         .all_syms
         .drain(..)
-        .zip(&candidates.swift_signatures)
+        .zip(candidates.swift_signatures.drain(..))
+        .zip(candidates.python_starts.drain(..))
     {
         let (name, _, file, _) = &candidate;
         if signature.as_deref().is_some_and(|signature| {
@@ -256,9 +344,13 @@ fn exclude_swift_protocol_witnesses(
                 .and_then(|signature| liveness.line(file, name, signature)),
         );
         kept.push(candidate);
+        signatures.push(signature);
+        python_starts.push(start);
     }
     candidates.all_syms = kept;
     candidates.swift_lines = lines;
+    candidates.swift_signatures = signatures;
+    candidates.python_starts = python_starts;
 }
 
 #[cfg(test)]
@@ -353,6 +445,7 @@ fn uncounted_truncations(
     canonical_dir: &std::path::Path,
     uncounted: &[crate::engine::refs::UncountedFile],
     default_unobserved: &super::dead_code_default_liveness::UnobservedFiles,
+    python_unobserved: &[(String, String)],
     withheld: usize,
 ) -> Vec<crate::models::truncation::TruncationInfo> {
     use crate::models::truncation::TruncationInfo;
@@ -397,6 +490,16 @@ fn uncounted_truncations(
                  default-export candidates are not reported as dead"
             )
         });
+    }
+    for (rel, cause) in python_unobserved {
+        let python = "Python test classes and methods that a test runner could collect \
+                      through its imports and classes are not reported as dead";
+        entries
+            .entry(rel.clone())
+            .and_modify(|message| message.push_str(&format!("; {python}")))
+            .or_insert_with(|| {
+                format!("the imports and classes in this file were not read ({cause}); {python}")
+            });
     }
     let total = entries.len();
     let mut out: Vec<TruncationInfo> = entries
@@ -559,6 +662,11 @@ struct DeadCodeCandidates {
     all_syms: Vec<(String, String, String, crate::language::LangId)>,
     swift_signatures: Vec<Option<String>>,
     swift_lines: Vec<Option<usize>>,
+    /// `all_syms` と同じ順の、Python の候補の定義の開始位置 (ほかの言語は `None`)。
+    python_starts: Vec<Option<(usize, usize)>>,
+    /// Python の候補のファイル (`dir` 相対) → 候補の抽出で作ったファイル単位の facts。
+    /// モジュールをまたぐテストの判定に渡す (構文解析をやり直さない)。
+    python_facts: std::collections::HashMap<String, crate::engine::symbols::PythonModuleFacts>,
     /// C/C++ の追加 liveness 情報 (file, シンボル名, 追加名リスト, lang)。
     /// enum→列挙子名 / typedef tag→alias 名。後段で正規化して liveness_aliases に変換する。
     liveness_raw: Vec<(String, String, Vec<String>, crate::language::LangId)>,
@@ -613,6 +721,8 @@ fn collect_dead_code_candidates(
     let mut generated_skipped: Vec<String> = Vec::new();
     let mut generated_undetermined = Vec::new();
     let mut swift_signatures = Vec::new();
+    let mut python_starts = Vec::new();
+    let mut python_facts = std::collections::HashMap::new();
     for (file, undetermined) in scanned {
         generated_undetermined.extend(undetermined);
         match file {
@@ -622,15 +732,22 @@ fn collect_dead_code_candidates(
                 let FileCandidates {
                     lang,
                     symbols,
+                    starts,
                     cpp_liveness,
+                    python,
                 } = candidates;
-                for (name, kind, signature) in symbols {
+                let python_file = lang == crate::language::LangId::Python;
+                for (index, (name, kind, signature)) in symbols.into_iter().enumerate() {
                     swift_signatures
                         .push((lang == crate::language::LangId::Swift).then_some(signature));
+                    python_starts.push(starts.get(index).copied().filter(|_| python_file));
                     all_syms.push((name, kind, rel.clone(), lang));
                 }
                 for (sym, extras) in cpp_liveness {
                     liveness_raw.push((rel.clone(), sym, extras, lang));
+                }
+                if let Some(facts) = python {
+                    python_facts.insert(rel, *facts);
                 }
             }
         }
@@ -640,6 +757,8 @@ fn collect_dead_code_candidates(
         all_syms,
         swift_signatures,
         swift_lines: Vec::new(),
+        python_starts,
+        python_facts,
         liveness_raw,
         generated_skipped,
         generated_undetermined,
@@ -709,8 +828,12 @@ struct FileCandidates {
     /// エクスポートシンボル (name, kind, signature)。trait impl メソッドと
     /// フレームワークの実行時入口は除外済み。
     symbols: ExportedSymbols,
+    /// `symbols` と同じ順の、宣言の開始位置 (lexer-only の言語では空)。
+    starts: Vec<(usize, usize)>,
     /// C/C++ の liveness 補助情報 (シンボル名, 追加名リスト)。他の言語では空。
     cpp_liveness: Vec<(String, Vec<String>)>,
+    /// Python のテストの判定に使ったファイル単位の facts。他の言語では `None`。
+    python: Option<Box<crate::engine::symbols::PythonModuleFacts>>,
 }
 
 /// `dir` 相対の `file_path` から dead-code の候補を抽出する。
@@ -739,7 +862,9 @@ fn extract_file_candidates(dir: &str, file_path: &str) -> Option<FileCandidates>
         return Some(FileCandidates {
             lang,
             symbols: crate::engine::lexer::extract_exported_symbols(&source, lexer_lang, true),
+            starts: Vec::new(),
             cpp_liveness: Vec::new(),
+            python: None,
         });
     }
 
@@ -747,7 +872,8 @@ fn extract_file_candidates(dir: &str, file_path: &str) -> Option<FileCandidates>
     let root = tree.root_node();
     let syms =
         crate::engine::symbols::extract_symbols_without_complexity(root, &source, lang).ok()?;
-    let symbols = filter_exported_symbols(&syms, root, &source, lang, true, true, Some(file_path));
+    let (symbols, starts, python) =
+        filter_dead_code_candidates(&syms, root, &source, lang, Some(file_path));
     let cpp_liveness = if matches!(
         lang,
         crate::language::LangId::C | crate::language::LangId::Cpp
@@ -759,7 +885,9 @@ fn extract_file_candidates(dir: &str, file_path: &str) -> Option<FileCandidates>
     Some(FileCandidates {
         lang,
         symbols,
+        starts,
         cpp_liveness,
+        python: python.map(Box::new),
     })
 }
 
@@ -801,6 +929,22 @@ fn normalized_bare_name(lang: crate::language::LangId, name: &str) -> String {
     crate::language::normalize_identifier(lang, key).into_owned()
 }
 
+/// 候補の正規化した bare name → 候補の数。同名 export が複数ファイル/複数コンテナに存在する
+/// 場合は保守的にスキップする (誤判定防止)。キーは bare name を言語別に正規化したもの (Xojo では
+/// `Foo` と `FOO` を同一視)。
+fn candidate_name_counts(
+    candidates: &DeadCodeCandidates,
+) -> std::collections::HashMap<String, usize> {
+    let mut name_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (name, _, _, lang) in &candidates.all_syms {
+        *name_counts
+            .entry(normalized_bare_name(*lang, name))
+            .or_default() += 1;
+    }
+    name_counts
+}
+
 /// 候補シンボルから同名カウント / liveness alias / refs 検索対象名のインデックスを構築する。
 /// `candidate_files` は diff 由来の候補ファイル (hidden 配下含む)。member liveness の
 /// 走査集合は count 経路と同じ `collect_reference_scan` で作る。
@@ -814,15 +958,7 @@ fn build_dead_code_name_index<F>(
 where
     F: Fn(&std::path::Path) -> bool + Sync,
 {
-    // 同名 export が複数ファイル/複数コンテナに存在する場合は保守的にスキップ（誤判定防止）。
-    // キーは bare name を言語別に正規化したもの (Xojo では `Foo` と `FOO` を同一視)。
-    let mut name_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for (name, _, _, lang) in &candidates.all_syms {
-        *name_counts
-            .entry(normalized_bare_name(*lang, name))
-            .or_default() += 1;
-    }
+    let name_counts = candidate_name_counts(candidates);
 
     // C/C++ の (file, 正規化シンボル名) → 追加 liveness 名 (正規化済み) を構築。
     // enum 候補は列挙子名、typedef tag 候補は alias 名を介した参照でも live と判定する。
@@ -991,6 +1127,7 @@ fn member_status_for_candidate(
 }
 
 /// 参照カウントと各除外規約から dead / test-only シンボルを分類する。
+#[allow(clippy::too_many_arguments)]
 fn classify_dead_symbols(
     candidates: &DeadCodeCandidates,
     index: &DeadCodeNameIndex,
@@ -999,6 +1136,7 @@ fn classify_dead_symbols(
     default_liveness: &DefaultExportLiveness,
     rust_member_liveness: &RustMemberLiveness,
     unobserved: &UnobservedReferences,
+    python_tests: &PythonTestLiveness,
 ) -> ClassifiedDead {
     // production 0 / test 0 → dead_symbols
     // production 0 / test > 0 → test_only_symbols (F5)
@@ -1020,7 +1158,19 @@ fn classify_dead_symbols(
             let (prod, test) = unobserved.may_be_referenced(&keys);
             let (default_prod, default_test) =
                 default_liveness.may_have_unobserved_uses(file, name);
-            (prod || default_prod, test || default_test)
+            // テストランナーが集めるかどうか分からない Python の候補は、テストから使われうる。
+            let python_test = *lang == crate::language::LangId::Python
+                && python_tests.is_uncertain(
+                    file,
+                    name,
+                    kind,
+                    candidates
+                        .python_starts
+                        .get(candidate_index)
+                        .copied()
+                        .flatten(),
+                );
+            (prod || default_prod, test || default_test || python_test)
         };
         let symbol = || DeadSymbol {
             name: name.clone(),
@@ -1766,74 +1916,6 @@ pub(crate) fn is_phpunit_test_method_name(name: &str) -> bool {
     c.is_ascii_uppercase() || c == b'_'
 }
 
-/// `unittest.TestCase` / `unittest.IsolatedAsyncioTestCase` を直接示す base 名集合。
-pub(crate) const PYTHON_UNITTEST_ROOT_BASES: &[&str] = &[
-    "TestCase",
-    "unittest.TestCase",
-    "IsolatedAsyncioTestCase",
-    "unittest.IsolatedAsyncioTestCase",
-];
-
-/// 同一ファイル内の Python クラスについて、`unittest.TestCase` 系を直接/間接継承する
-/// クラス名集合を fixed-point で解決して返す。クロスファイル継承は対象外。
-///
-/// 例: `class Base(unittest.TestCase): ...` と `class Child(Base): ...` の両方を拾う。
-pub(crate) fn collect_python_unittest_classes(
-    syms: &[crate::models::symbol::Symbol],
-    root: tree_sitter::Node<'_>,
-    source: &[u8],
-    lang_id: crate::language::LangId,
-) -> std::collections::HashSet<String> {
-    use crate::models::symbol::SymbolKind;
-    let mut unittest_classes: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if lang_id != crate::language::LangId::Python {
-        return unittest_classes;
-    }
-
-    // (クラス名, 解決待ち base 名のリスト) のペアを集める。
-    let mut class_bases: Vec<(String, Vec<String>)> = Vec::new();
-    for sym in syms {
-        if !matches!(sym.kind, SymbolKind::Class) {
-            continue;
-        }
-        let bases = crate::engine::symbols::python_class_base_names(root, source, &sym.range);
-        // 直接 root base を継承していれば即座に確定。
-        if bases
-            .iter()
-            .any(|b| PYTHON_UNITTEST_ROOT_BASES.contains(&b.as_str()))
-        {
-            unittest_classes.insert(sym.name.clone());
-            continue;
-        }
-        // それ以外は候補として保留し、後段で fixed-point 解決する。
-        class_bases.push((sym.name.clone(), bases));
-    }
-
-    // 同一ファイル内の Base → Child チェーンを fixed-point で広げる。
-    loop {
-        let mut changed = false;
-        let mut idx = 0;
-        while idx < class_bases.len() {
-            let inherited = class_bases[idx]
-                .1
-                .iter()
-                .any(|b| unittest_classes.contains(b.as_str()));
-            if inherited {
-                let (name, _) = class_bases.swap_remove(idx);
-                unittest_classes.insert(name);
-                changed = true;
-            } else {
-                idx += 1;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    unittest_classes
-}
-
 /// ファイル名が pytest のモジュール命名規約 (`python_files` の既定 `test_*.py` / `*_test.py`) に
 /// 一致するかを判定する。`*` は空にも一致するので `_test.py` も含む。`conftest.py` は別関数で
 /// 判定する。
@@ -1870,71 +1952,25 @@ pub(crate) fn file_name_is_python_conftest(file_path: Option<&str>) -> bool {
         == Some("conftest.py")
 }
 
-/// `unittest` / pytest のテスト規約のうち、名前で判定する Python シンボルかを判定する。
+/// `conftest.py` の module 直下の関数か。pytest はフィクスチャやフックとして名前で使う。
 ///
-/// 対象:
-/// - `unittest.TestCase` 直接/間接継承クラス (同一ファイル内のチェーン)
-/// - そのクラス配下の `test` で始まるメソッド (unittest の `testMethodPrefix`) および
-///   `setUp` / `tearDown` / `setUpClass` / `tearDownClass` / `addCleanup` / `addClassCleanup`
-/// - `conftest.py` 内のすべての関数 (pytest フィクスチャ規約)
-///
-/// pytest が `test_*.py` / `*_test.py` から集めるテスト (`test*` 関数、`Test*` クラスとその
-/// メソッドなど) は、構文から定義の位置で判定する (`engine::symbols::PytestEntrypoints`)。
-pub(crate) fn is_python_test_symbol(
-    name: &str,
+/// unittest と pytest がテストとして集めるもの (`TestCase` の派生とその基底の `test*`、
+/// pytest のテストモジュールの `test*` 関数と `Test*` クラスなど) は、構文から定義の位置で
+/// 判定する (`engine::symbols::PythonTestEntrypoints` と、モジュールをまたぐ
+/// `dead_code_python_tests`)。
+pub(crate) fn is_python_conftest_function(
     kind: crate::models::symbol::SymbolKind,
     lang_id: crate::language::LangId,
     file_path: Option<&str>,
     container: Option<&str>,
-    unittest_classes: &std::collections::HashSet<String>,
 ) -> bool {
-    use crate::language::LangId;
-    use crate::models::symbol::SymbolKind;
-    if lang_id != LangId::Python {
-        return false;
-    }
-
-    // qualname (`Foo.test_bar`) の場合は末尾要素を取り出して container を補正する。
-    let (short, qual_container) = match name.rsplit_once('.') {
-        Some((head, tail)) => (tail, Some(head)),
-        None => (name, None),
-    };
-    let effective_container = container.or(qual_container);
-
-    if matches!(kind, SymbolKind::Class) {
-        return unittest_classes.contains(short);
-    }
-
-    if !matches!(kind, SymbolKind::Function | SymbolKind::Method) {
-        return false;
-    }
-
-    // conftest.py 内の関数はすべて pytest 規約で参照されうる。
-    if file_name_is_python_conftest(file_path) && effective_container.is_none() {
-        return true;
-    }
-
-    // unittest.TestCase 派生クラス配下のメソッド。unittest (と pytest の unittest 対応) は
-    // `test` で始まる名前を集める (`test_foo` に限らず `testFoo` も)。
-    if let Some(class_name) = effective_container
-        && unittest_classes.contains(class_name)
-    {
-        return short.starts_with("test")
-            || matches!(
-                short,
-                "setUp"
-                    | "tearDown"
-                    | "setUpClass"
-                    | "tearDownClass"
-                    | "asyncSetUp"
-                    | "asyncTearDown"
-                    | "addCleanup"
-                    | "addClassCleanup"
-                    | "addAsyncCleanup"
-            );
-    }
-
-    false
+    lang_id == crate::language::LangId::Python
+        && matches!(
+            kind,
+            crate::models::symbol::SymbolKind::Function | crate::models::symbol::SymbolKind::Method
+        )
+        && container.is_none()
+        && file_name_is_python_conftest(file_path)
 }
 
 /// `dead-code` CLI の入力一式。

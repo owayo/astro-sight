@@ -6,6 +6,8 @@ use super::*;
 #[derive(Default)]
 pub(crate) struct ExportedFileFacts {
     pub(crate) symbols: ExportedSymbols,
+    /// `symbols` と同じ順の、宣言の開始位置 (行, 列)。
+    pub(crate) starts: Vec<(usize, usize)>,
     pub(crate) type_dependencies: Option<super::ts_signature::DependencySnapshot>,
     rust_parameters: RustParameterContracts,
 }
@@ -284,10 +286,13 @@ pub(crate) struct ExportSurfaceContext<'tree, 'source> {
     containers: Vec<&'source Symbol>,
     /// Rust の関連定数の owner 候補 (型宣言 / trait / impl ブロック)。Rust 以外では空。
     rust_const_owners: Vec<&'source Symbol>,
-    unittest_classes: HashSet<String>,
-    /// pytest のテストモジュール (`test_*.py` / `*_test.py`) で、pytest が既定の規約で集めるか
-    /// 名前で呼ぶ定義。dead-code の経路だけで作る。
-    pytest_entrypoints: Option<crate::engine::symbols::PytestEntrypoints>,
+    /// Python のファイル単位の facts と、それから求めた、unittest と pytest が既定の規約で
+    /// 集めるか名前で呼ぶと同じファイルの中で言える定義。dead-code の経路だけで作る
+    /// (facts はモジュールをまたぐ判定に渡す)。
+    python_tests: Option<(
+        crate::engine::symbols::PythonModuleFacts,
+        crate::engine::symbols::PythonTestEntrypoints,
+    )>,
     python_export_policy: Option<crate::engine::symbols::PythonModuleExportPolicy>,
     /// Python のデコレータの別名を解決する import の索引。名前を書いたままでは登録と
     /// 決まらないデコレータが現れたときに 1 回だけ作る。
@@ -342,20 +347,19 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
             Vec::new()
         };
 
-        // Python 限定: 同一ファイル内の `unittest.TestCase` 派生クラスを固定点計算で解決する。
-        // dead-code 経路だけで使うため、実行時入口を除外する場合に限って構築する。
-        let unittest_classes =
-            if exclude_framework_entrypoints && lang_id == crate::language::LangId::Python {
-                collect_python_unittest_classes(syms, root, source, lang_id)
-            } else {
-                HashSet::new()
-            };
-        // pytest のテストモジュールで集めるテストと、名前で呼ぶ準備・後始末。unittest と同じく
-        // 実行時入口を除外する dead-code の経路だけで、ファイル単位で 1 回作る。
-        let pytest_entrypoints = (exclude_framework_entrypoints
-            && lang_id == crate::language::LangId::Python
-            && file_name_is_pytest_module(file_path))
-        .then(|| crate::engine::symbols::PytestEntrypoints::collect(root, source));
+        // Python 限定: unittest (`TestCase` の派生とその基底) と pytest (テストモジュールの
+        // `Test*` クラスなど) が集めるテストと、名前で呼ぶ準備・後始末。実行時入口を除外する
+        // dead-code の経路だけで、ファイル単位で 1 回作る。
+        let python_tests = (exclude_framework_entrypoints
+            && lang_id == crate::language::LangId::Python)
+            .then(|| {
+                let facts = crate::engine::symbols::PythonModuleFacts::collect(root, source);
+                let entrypoints = crate::engine::symbols::PythonTestEntrypoints::collect(
+                    &facts,
+                    file_name_is_pytest_module(file_path),
+                );
+                (facts, entrypoints)
+            });
         // Python の `__all__` 解析は AST 全体を走査するため、シンボルごとではなく
         // ファイル単位で 1 回だけ行う。非 Python では構築しない。
         let python_export_policy = (lang_id == crate::language::LangId::Python)
@@ -371,8 +375,7 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
             file_path,
             containers,
             rust_const_owners,
-            unittest_classes,
-            pytest_entrypoints,
+            python_tests,
             python_export_policy,
             python_decorator_imports: std::cell::OnceCell::new(),
         }
@@ -781,25 +784,24 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
 
         // unittest / pytest のテスト規約シンボル。Python 限定。テストランナーが名前と構造から
         // 動的に集めるため、識別子レベルの cross-file refs では caller を追跡できない。
-        // `unittest.TestCase` 派生クラスとそのメソッド (`test*`、`setUp` 等) と `conftest.py` の
-        // 関数は名前で、pytest がテストモジュールから集めるもの (`test*` 関数、`Test*` クラスと
-        // その `test*` メソッド、xunit 形式の準備と後始末など) は構文から定義の位置で判定する。
+        // `conftest.py` の関数は名前で、unittest と pytest が集めるもの (`TestCase` の派生と
+        // その基底の `test*` と `setUp` など、pytest のテストモジュールの `test*` 関数と `Test*`
+        // クラスなど) は構文から定義の位置で判定する。同じファイルで分からない基底や import の
+        // 先は、dead-code の段階でモジュールをまたいで判定する (`dead_code_python_tests`)。
         if self.exclude_framework_entrypoints
-            && is_python_test_symbol(
-                &sym.name,
+            && is_python_conftest_function(
                 sym.kind,
                 self.lang_id,
                 self.file_path,
                 sym.container.as_deref(),
-                &self.unittest_classes,
             )
         {
             return true;
         }
         if self
-            .pytest_entrypoints
+            .python_tests
             .as_ref()
-            .is_some_and(|entrypoints| entrypoints.contains(&sym.range))
+            .is_some_and(|(_, entrypoints)| entrypoints.contains(&sym.range))
         {
             return true;
         }
@@ -880,19 +882,6 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
         if is_phpunit_test_symbol(qualname, sym.kind, self.lang_id) {
             return true;
         }
-        // qualname ベースでも Python unittest 規約をチェック (`Foo.test_bar` 等)
-        if self.exclude_framework_entrypoints
-            && is_python_test_symbol(
-                qualname,
-                sym.kind,
-                self.lang_id,
-                self.file_path,
-                sym.container.as_deref(),
-                &self.unittest_classes,
-            )
-        {
-            return true;
-        }
 
         false
     }
@@ -917,6 +906,25 @@ pub(crate) fn filter_exported_symbols(
         file_path,
     );
     filter_exported_with_metadata(syms, &context, false).symbols
+}
+
+/// dead-code の候補 (`filter_exported_symbols(..., true, true, ...)` と同じもの) と、その宣言の
+/// 開始位置、Python ならテストの判定に使ったファイル単位の facts (モジュールをまたぐ判定に渡す)。
+pub(crate) fn filter_dead_code_candidates(
+    syms: &[Symbol],
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    lang_id: crate::language::LangId,
+    file_path: Option<&str>,
+) -> (
+    ExportedSymbols,
+    Vec<(usize, usize)>,
+    Option<crate::engine::symbols::PythonModuleFacts>,
+) {
+    let mut context = ExportSurfaceContext::new(syms, root, source, lang_id, true, true, file_path);
+    let facts = filter_exported_with_metadata(syms, &context, false);
+    let python_facts = context.python_tests.take().map(|(facts, _)| facts);
+    (facts.symbols, facts.starts, python_facts)
 }
 
 pub(crate) fn filter_exported_file_facts(
@@ -1017,6 +1025,9 @@ fn filter_exported_with_metadata(
         result
             .symbols
             .push((qualname, format!("{:?}", sym.kind).to_lowercase(), sig));
+        result
+            .starts
+            .push((sym.range.start.line, sym.range.start.column));
     }
     result
 }

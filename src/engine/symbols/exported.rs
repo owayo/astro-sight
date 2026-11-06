@@ -747,6 +747,25 @@ impl PythonModuleExportPolicy {
             PythonDunderAll::Indeterminate => None,
         }
     }
+
+    /// 静的な `__all__` の名前 (`__all__` が無いか、組み立てが動的なら空)。
+    pub(crate) fn static_names(&self) -> impl Iterator<Item = &str> {
+        let names = match &self.dunder_all {
+            PythonDunderAll::Static(names) => Some(names),
+            PythonDunderAll::Absent | PythonDunderAll::Indeterminate => None,
+        };
+        names.into_iter().flatten().map(String::as_str)
+    }
+
+    /// `__all__` を定義している (静的でも、組み立てが動的でも)。
+    pub(crate) fn defines_all(&self) -> bool {
+        !matches!(self.dunder_all, PythonDunderAll::Absent)
+    }
+
+    /// `__all__` の組み立てが動的で、名前を確定できない。
+    pub(crate) fn all_is_indeterminate(&self) -> bool {
+        matches!(self.dunder_all, PythonDunderAll::Indeterminate)
+    }
 }
 
 /// Python module の公開名規約を解析する。

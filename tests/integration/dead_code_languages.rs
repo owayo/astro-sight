@@ -937,6 +937,446 @@ fn review_hook_does_not_block_on_a_new_pytest_test_method() {
     );
 }
 
+/// `dead-code` を走らせ、`field` (`dead_symbols` など) の名前を返す。
+fn python_dead_code_names(root: &std::path::Path, extra: &[&str], field: &str) -> Vec<String> {
+    let output = cargo_bin()
+        .args(["dead-code", "--dir", root.to_str().unwrap()])
+        .args(extra)
+        .output()
+        .expect("failed to run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("invalid JSON");
+    json[field]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Issue #259 の再現と対照に使う unittest のモジュール。
+const UNITTEST_MIXIN_MODULE: &str = r#"import unittest
+
+
+class SharedMixin:
+    def test_shared_from_mixin(self):
+        self.assertTrue(True)
+
+    def setUp(self):
+        self.ready = True
+
+    def tearDown(self):
+        self.ready = False
+
+    def mixin_unused_helper(self):
+        return 1
+
+
+class DeeperChecks:
+    def test_deeper_from_chain(self):
+        self.assertTrue(True)
+
+
+class MiddleChecks(DeeperChecks):
+    def test_middle_from_chain(self):
+        self.assertTrue(True)
+
+
+class CalcTests(SharedMixin, unittest.TestCase):
+    def test_own(self):
+        self.assertTrue(self.ready)
+
+
+class ChainTests(MiddleChecks, unittest.TestCase):
+    pass
+
+
+class OrphanMixin:
+    def test_orphan_never_collected(self):
+        pass
+
+
+class PlainHolder(OrphanMixin):
+    pass
+"#;
+
+#[test]
+fn dead_code_python_unittest_mixin_test_methods_are_live() {
+    // Issue #259: unittest (と pytest の unittest 対応) は `TestCase` 派生クラスの MRO にある
+    // 基底の `test` で始まるメソッドも集め、`setUp` / `tearDown` を MRO で呼ぶ。旧実装は
+    // 派生クラス自身のメソッドだけを除外し (クラス名の集合で判定していた)、同じファイルの
+    // mixin や基底の連鎖のテストメソッドと準備・後始末を dead と報告していた。
+    // TestCase の派生に継承されない mixin のメソッド、`test` で始まらず準備・後始末でもない
+    // メソッド、集めないクラスは dead に残す。pytest のテストモジュールの名前でも、そうでない
+    // 名前のファイルでも同じ。
+    for file_name in ["test_unit_mixin.py", "unit_checks.py"] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(file_name), UNITTEST_MIXIN_MODULE).unwrap();
+        let dead = python_dead_code_names(root, &[], "dead_symbols");
+        for live in [
+            "SharedMixin.test_shared_from_mixin",
+            "SharedMixin.setUp",
+            "SharedMixin.tearDown",
+            "CalcTests",
+            "CalcTests.test_own",
+            "ChainTests",
+            "MiddleChecks.test_middle_from_chain",
+            "DeeperChecks.test_deeper_from_chain",
+        ] {
+            assert!(
+                !dead.iter().any(|n| n == live),
+                "{file_name}: {live} は unittest が集める (呼ぶ) ので dead にしない: {dead:?}"
+            );
+        }
+        for expected in [
+            "SharedMixin.mixin_unused_helper",
+            "OrphanMixin.test_orphan_never_collected",
+            "PlainHolder",
+        ] {
+            assert!(
+                dead.iter().any(|n| n == expected),
+                "{file_name}: {expected} は unittest が集めないので dead に残す: {dead:?}"
+            );
+        }
+    }
+}
+
+/// Issue #261 の再現と対照に使う、テストモジュールの外にあるテストの基底と補助のクラス。
+const CROSS_FILE_SHARED_CHECKS: &str = r#"class SharedChecks:
+    def test_from_base(self):
+        assert True
+
+    def base_unused_helper(self):
+        return 1
+
+
+class TestExported:
+    def test_exported(self):
+        assert True
+
+
+class Renamed:
+    def test_renamed(self):
+        assert True
+
+
+class TestImportedAsHidden:
+    def test_hidden_never_collected(self):
+        pass
+
+
+class TestWithInit:
+    def __init__(self):
+        self.value = 1
+
+    def test_init_never_collected(self):
+        pass
+
+
+class UnrelatedChecks:
+    def test_unrelated_never_collected(self):
+        pass
+"#;
+
+/// Issue #261 の再現と対照に使う pytest のテストモジュール。
+const CROSS_FILE_TEST_MODULE: &str = r#"import unittest
+
+import library_checks as TestLibrary
+from base_tests import BaseTests
+from mixins import CrossMixin
+from shared_checks import SharedChecks, TestExported, TestWithInit
+from shared_checks import Renamed as TestRenamed
+from shared_checks import TestImportedAsHidden as Hidden
+
+
+class TestCross(SharedChecks):
+    pass
+
+
+class MyTests(BaseTests):
+    def test_mine(self):
+        pass
+
+
+class MixedTests(CrossMixin, unittest.TestCase):
+    pass
+"#;
+
+#[test]
+fn dead_code_python_test_bases_and_imports_in_other_files_are_live() {
+    // Issue #261: pytest と unittest は、テストクラスの MRO にある基底のテストメソッドを、
+    // 基底が別のファイル (テストの補助モジュールなど) にあっても集める。pytest はテスト
+    // モジュールの名前空間に `Test*` の名前で束縛したクラス (import・別名・`import *`) も集め、
+    // unittest は別ファイルの TestCase の派生を継承したクラスも集める。旧実装は同じファイルの
+    // 基底しか見ず、これらのテストメソッドとクラスを dead と報告していた。
+    // pytest が集めない形 (`Test*` でない名前に束縛したクラス、`__init__` を持つクラス、
+    // モジュールの別名、どのテストクラスも継承しないクラス、別のモジュールの同じ名前のクラス、
+    // `Test*` でない名前のクラス) と、`test` で始まらないメソッドは dead に残す。
+    // テストモジュールは既定で候補から外す `tests/` に置いても、参照の走査集合として読む。
+    for include_tests in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        for directory in ["other", "pkg", "tests"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        let files = [
+            ("shared_checks.py", CROSS_FILE_SHARED_CHECKS),
+            ("test_cross.py", CROSS_FILE_TEST_MODULE),
+            (
+                "base_tests.py",
+                "import unittest\n\n\nclass BaseTests(unittest.TestCase):\n    def test_base_case(self):\n        pass\n",
+            ),
+            (
+                "mixins.py",
+                "class CrossMixin:\n    def test_cross_mixin(self):\n        pass\n\n    def setUp(self):\n        pass\n",
+            ),
+            (
+                "library_checks.py",
+                "class LibraryChecks:\n    def test_library_never_collected(self):\n        pass\n",
+            ),
+            (
+                "star_checks.py",
+                "class TestStarred:\n    def test_starred(self):\n        pass\n\n\nclass Starred:\n    pass\n",
+            ),
+            ("test_star.py", "from star_checks import *\n"),
+            (
+                "other/checks.py",
+                "class SharedChecks:\n    def test_other_never_collected(self):\n        pass\n",
+            ),
+            ("pkg/__init__.py", "from .impl import Checks as Shared\n"),
+            (
+                "pkg/impl.py",
+                "class Checks:\n    def test_reexported(self):\n        pass\n",
+            ),
+            (
+                "tests/test_pkg.py",
+                "from pkg import Shared\n\n\nclass TestReexport(Shared):\n    pass\n",
+            ),
+            (
+                "tests/helper_mod.py",
+                "class InTestsDir:\n    def test_in_tests_dir(self):\n        pass\n",
+            ),
+            (
+                "tests/test_tests_dir.py",
+                "from helper_mod import InTestsDir\n\n\nclass TestUsesDir(InTestsDir):\n    pass\n",
+            ),
+        ];
+        for (path, content) in files {
+            std::fs::write(root.join(path), content).unwrap();
+        }
+        let extra: &[&str] = if include_tests {
+            &["--include-tests"]
+        } else {
+            &[]
+        };
+        let dead = python_dead_code_names(root, extra, "dead_symbols");
+        let mut live = vec![
+            "SharedChecks.test_from_base",
+            "TestExported",
+            "TestExported.test_exported",
+            "Renamed.test_renamed",
+            "MyTests",
+            "MyTests.test_mine",
+            "CrossMixin.test_cross_mixin",
+            "CrossMixin.setUp",
+            "TestStarred",
+            "TestStarred.test_starred",
+            "Checks.test_reexported",
+        ];
+        if include_tests {
+            live.push("InTestsDir.test_in_tests_dir");
+        }
+        for live in live {
+            assert!(
+                !dead.iter().any(|n| n == live),
+                "include_tests={include_tests}: {live} は pytest / unittest が集める (呼ぶ) ので dead にしない: {dead:?}"
+            );
+        }
+        for expected in [
+            "SharedChecks.base_unused_helper",
+            "TestImportedAsHidden.test_hidden_never_collected",
+            "TestWithInit.test_init_never_collected",
+            "UnrelatedChecks",
+            "UnrelatedChecks.test_unrelated_never_collected",
+            "LibraryChecks",
+            "LibraryChecks.test_library_never_collected",
+            "SharedChecks.test_other_never_collected",
+            "Starred",
+        ] {
+            assert!(
+                dead.iter().any(|n| n == expected),
+                "include_tests={include_tests}: {expected} は pytest / unittest が集めないので dead に残す: {dead:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dead_code_python_unresolved_test_bases_are_unverified() {
+    // Issue #261 の対照の側: 第三者のモジュールの基底 (TestCase の派生か分からない) を持つ
+    // クラスは、テストランナーが集めるかどうかを確かめられない。そのクラスと `test*` メソッド、
+    // それが継承する別ファイルの基底の `test*` は、dead と断定せず unverified に回す。
+    // テストメソッドを持たない普通のクラス (第三者の基底を持っていても) と、`test` で始まらない
+    // メソッドは dead のまま。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("shared_checks.py"),
+        "class SharedChecks:\n    def test_from_external_chain(self):\n        pass\n\n    def helper_never_called(self):\n        pass\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("test_api.py"),
+        "from rest_framework.test import APITestCase\nfrom shared_checks import SharedChecks\n\n\nclass UserAPITests(APITestCase):\n    def test_list_users(self):\n        pass\n\n\nclass Checks(SharedChecks, APITestCase):\n    pass\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("models.py"),
+        "from pydantic import BaseModel\n\n\nclass UnusedModel(BaseModel):\n    def save_never_called(self):\n        pass\n",
+    )
+    .unwrap();
+    let dead = python_dead_code_names(root, &[], "dead_symbols");
+    let unverified = python_dead_code_names(root, &[], "unverified_symbols");
+    for held in [
+        "UserAPITests",
+        "UserAPITests.test_list_users",
+        "Checks",
+        "SharedChecks.test_from_external_chain",
+    ] {
+        assert!(
+            unverified.iter().any(|n| n == held) && !dead.iter().any(|n| n == held),
+            "{held} は集めるかどうか確かめられないので unverified に回す: dead={dead:?} unverified={unverified:?}"
+        );
+    }
+    for expected in [
+        "SharedChecks.helper_never_called",
+        "UnusedModel",
+        "UnusedModel.save_never_called",
+    ] {
+        assert!(
+            dead.iter().any(|n| n == expected),
+            "{expected} はテストランナーが集めないので dead に残す: dead={dead:?} unverified={unverified:?}"
+        );
+    }
+}
+
+#[test]
+fn dead_code_python_test_liveness_survives_swift_witness_exclusion() {
+    // Swift のプロトコルの witness を候補から外したあとも、後ろに並ぶ Python の候補の定義の
+    // 開始位置を取り違えない。第三者の基底を持つテストクラス (TestCase の派生か分からない) は
+    // unverified に回す。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("a.swift"),
+        "public struct A: Hashable {\n    public func hash(into hasher: inout Hasher) {}\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("z_checks.py"),
+        "from external_cases import ExternalCase\n\n\nclass ForeignCase(ExternalCase):\n    def test_live(self):\n        pass\n",
+    )
+    .unwrap();
+    let dead = python_dead_code_names(root, &[], "dead_symbols");
+    let unverified = python_dead_code_names(root, &[], "unverified_symbols");
+    for held in ["ForeignCase", "ForeignCase.test_live"] {
+        assert!(
+            unverified.iter().any(|n| n == held) && !dead.iter().any(|n| n == held),
+            "{held} は集めるかどうか確かめられないので unverified に回す: dead={dead:?} unverified={unverified:?}"
+        );
+    }
+}
+
+#[test]
+fn dead_code_python_test_methods_in_files_with_syntax_errors_are_not_dead() {
+    // tree-sitter のエラー回復で、TestCase の派生の本体のメソッドが `class_definition` の ERROR
+    // の子に入り、後ろのメソッドはクラスの外に出る (括弧の中の継続行の字下げを誤解析する)。
+    // 本体のメソッドはクラスのメンバーとして集め、クラスの外に出たテストの名前の関数は
+    // 集めるかどうか確かめられないので unverified に回す。テストの名前でないメソッドは dead の
+    // まま。
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("positions.py"),
+        "import unittest\n\n\nclass Positions(unittest.TestCase):\n    def test_before(self):\n        pass\n\n    def helper_never_called(self):\n        pass\n\n    def test_weird(self):\n        def f():\n            (bar.\n        baz)\n            (bar.\n        baz(\n        ))\n            files().setdefault(\n                0\n            ).setdefault(\n                0\n            )\n        for line, end_line, column, end_column in f.__code__.co_positions():\n            pass\n\n    def test_after(self):\n        pass\n",
+    )
+    .unwrap();
+    let dead = python_dead_code_names(root, &[], "dead_symbols");
+    let unverified = python_dead_code_names(root, &[], "unverified_symbols");
+    for live in ["Positions.test_before", "Positions.test_weird"] {
+        assert!(
+            !dead.iter().any(|n| n == live) && !unverified.iter().any(|n| n == live),
+            "{live} は unittest が集める: dead={dead:?} unverified={unverified:?}"
+        );
+    }
+    assert!(
+        unverified.iter().any(|n| n == "test_after") && !dead.iter().any(|n| n == "test_after"),
+        "クラスの外に出た test_after は unverified に回す: dead={dead:?} unverified={unverified:?}"
+    );
+    assert!(
+        dead.iter().any(|n| n == "Positions.helper_never_called"),
+        "テストの名前でないメソッドは dead に残す: dead={dead:?} unverified={unverified:?}"
+    );
+}
+
+#[test]
+fn review_hook_does_not_block_on_a_test_method_of_an_inherited_base() {
+    // Issue #261 の再現: 別ファイルのテストクラスが継承する基底のテストメソッドに触れるだけで、
+    // `review --git --hook` が触れた dead を blocking にして終了コード 1 を返していた。
+    // 既存のメソッドの宣言行に触れるので、新規追加の WIP の抑止には依存しない。テストでない
+    // メソッドに触れた対照は dead で止まる。
+    let repo = TestRepo::new();
+    let baseline = "class SharedChecks:\n    def test_existing(self):\n        assert True\n\n    def helper_never_called(self):\n        return 1\n";
+    repo.write("shared_checks.py", baseline);
+    repo.write(
+        "test_cross.py",
+        "from shared_checks import SharedChecks\n\n\nclass TestCross(SharedChecks):\n    pass\n",
+    );
+    repo.init_git();
+    repo.commit_all("initial");
+    let hook = || {
+        cargo_bin()
+            .args(["review", "--git", "--hook", "--dir"])
+            .arg(repo.root())
+            .output()
+            .unwrap()
+    };
+
+    repo.write(
+        "shared_checks.py",
+        baseline.replace(
+            "    def test_existing(self):\n",
+            "    def test_existing(self):  # touched\n",
+        ),
+    );
+    let output = hook();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    repo.write(
+        "shared_checks.py",
+        baseline.replace(
+            "    def helper_never_called(self):\n",
+            "    def helper_never_called(self):  # touched\n",
+        ),
+    );
+    let output = hook();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("\"dead\"") && stderr.contains("SharedChecks.helper_never_called"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn dead_code_python_instance_method_is_live() {
     // Python の `obj.method()` 形式の呼び出しが参照として認識され、
