@@ -153,7 +153,7 @@ pub(super) struct RustPathOwnerProjectProof {
     safe_private_import_environment: OnceLock<bool>,
     /// module の配置を変え得る構文が無いときの、関数の本体の外の `use` が束縛する名前。
     static_module_bindings: OnceLock<Option<HashSet<String>>>,
-    /// プロジェクトの属性付きの `macro_rules!` の名前。走査できなければ `None`。
+    /// 公開し得る属性の付いた `macro_rules!` の名前。走査できなければ `None`。
     macro_definitions: OnceLock<Option<HashSet<String>>>,
     safe_macro_value_environment: OnceLock<bool>,
     no_source_inclusion: OnceLock<bool>,
@@ -484,8 +484,8 @@ impl RustPathOwnerProjectProof {
             .as_ref()
     }
 
-    /// プロジェクトのどこかの属性付きの `macro_rules!` (`#[macro_export]` など) が `name` を
-    /// 定義し得るか (走査できなければ真)。
+    /// プロジェクトのどこかの `macro_rules!` が `#[macro_export]` などで `name` を crate root へ
+    /// 公開し得るか (走査できなければ真)。
     pub(super) fn may_define_macro(&self, name: &str) -> bool {
         self.macro_definitions
             .get_or_init(|| scan_macro_definitions(&self.root))
@@ -1907,13 +1907,15 @@ fn scan_static_module_placement(root: &Path) -> Option<HashSet<String>> {
     .then_some(module_bindings)
 }
 
-/// 属性の付いた `macro_rules!` の名前をプロジェクト全体から集める。`#[macro_export]` の定義は
-/// crate root の名前を差し替え、どのファイルにあっても届く (`cfg_attr` などで付く場合も含めて、
-/// 属性があれば数える)。属性の無い定義は、定義した module とその後の子にしか見えず、参照
-/// ファイルの祖先にあれば祖先の環境が拾う。解析できないソースがあれば `None`。
+/// 公開し得る属性の付いた `macro_rules!` の名前をプロジェクト全体から集める。`#[macro_export]`
+/// の定義は crate root の名前を差し替え、どのファイルにあっても届く (`cfg_attr` や未知の属性で
+/// 付く場合も数え、`allow` や `doc` のような名前を公開しない属性は数えない)。それ以外の定義は、
+/// 定義した module とその後の子にしか見えず、参照ファイルの祖先にあれば祖先の環境が拾う。
+/// 依存の `path` はマクロの名前を crate root へ入れないので、manifest は見ない。解析できない
+/// ソースがあれば `None`。
 fn scan_macro_definitions(root: &Path) -> Option<HashSet<String>> {
     let mut names = HashSet::new();
-    let scanned = scan_safe_source_environment(root, |source| {
+    let scanned = scan_project_sources(root, false, |source| {
         if memchr::memmem::find(source, b"macro_rules").is_none() {
             return false;
         }
@@ -1926,7 +1928,7 @@ fn scan_macro_definitions(root: &Path) -> Option<HashSet<String>> {
         }
         let mut pending = vec![root];
         while let Some(node) = pending.pop() {
-            if node.kind() == "macro_definition" && has_attribute_prefix(node) {
+            if node.kind() == "macro_definition" && transforming_scope_attribute(node, source) {
                 let Some(name) = node
                     .child_by_field_name("name")
                     .and_then(|name| name.utf8_text(source).ok())
@@ -2014,6 +2016,16 @@ fn unconditional_declaration(node: Node<'_>, source: &[u8]) -> bool {
 
 fn scan_safe_source_environment(
     root: &Path,
+    source_is_uncertain: impl FnMut(&[u8]) -> bool,
+) -> bool {
+    scan_project_sources(root, true, source_is_uncertain)
+}
+
+/// プロジェクトの Rust ソースを全部読む。`check_manifests` なら、ソースの置き場所を指定する
+/// `path` キーのある Cargo.toml も拒む (依存の `path` も含む)。
+fn scan_project_sources(
+    root: &Path,
+    check_manifests: bool,
     mut source_is_uncertain: impl FnMut(&[u8]) -> bool,
 ) -> bool {
     let Ok(root) = root.canonicalize() else {
@@ -2050,6 +2062,9 @@ fn scan_safe_source_environment(
                     .to_str()
                     .is_some_and(|name| name.eq_ignore_ascii_case("Cargo.toml"))
             {
+                if !check_manifests {
+                    continue;
+                }
                 let Some(manifest) = read_input_text_file(&entry.path()) else {
                     return false;
                 };
@@ -2789,17 +2804,25 @@ mod tests {
         assert!(scan_static_module_placement(&root.path().join("src")).is_none());
     }
 
-    /// `#[macro_export]` は crate root の名前を差し替えるので、属性の付いた定義を置き場所を
-    /// 問わず集める。属性の無い定義は定義した module の字句スコープにとどまる。
+    /// `#[macro_export]` は crate root の名前を差し替えるので、公開し得る属性の付いた定義を
+    /// 置き場所を問わず集める。それ以外の定義は定義した module の字句スコープにとどまる。
     #[test]
     fn macro_definitions_are_collected_from_every_source() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("src/nested")).unwrap();
+        std::fs::create_dir_all(root.path().join("helper/src")).unwrap();
+        // 依存の `path` はマクロの名前を crate root へ入れないので、走査を止めない。
         std::fs::write(
             root.path().join("Cargo.toml"),
-            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nhelper = { path = \"helper\" }\n",
         )
         .unwrap();
+        std::fs::write(
+            root.path().join("helper/Cargo.toml"),
+            "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("helper/src/lib.rs"), "").unwrap();
         std::fs::write(root.path().join("src/lib.rs"), "mod store;\n").unwrap();
         std::fs::write(
             root.path().join("src/store.rs"),
@@ -2808,7 +2831,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             root.path().join("src/nested/deep.rs"),
-            "macro_rules! println { () => {} }\nfn f() {\n    #[cfg_attr(test, macro_export)]\n    /// doc\n    macro_rules! r#local { () => {} }\n}\n",
+            "macro_rules! println { () => {} }\n#[allow(unused_macros)]\n#[doc(hidden)]\nmacro_rules! write { () => {} }\nfn f() {\n    #[cfg_attr(test, macro_export)]\n    /// doc\n    macro_rules! r#local { () => {} }\n}\n",
         )
         .unwrap();
         let names = scan_macro_definitions(root.path()).unwrap();
@@ -2816,7 +2839,10 @@ mod tests {
             names.contains("format") && names.contains("local"),
             "{names:?}"
         );
-        assert!(!names.contains("println"), "{names:?}");
+        assert!(
+            !names.contains("println") && !names.contains("write"),
+            "{names:?}"
+        );
         std::fs::write(
             root.path().join("src/nested/deep.rs"),
             "macro_rules! broken { (\n",
