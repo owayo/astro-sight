@@ -185,6 +185,11 @@ fn format_argument(name: &str) -> Option<usize> {
     }
 }
 
+/// 暗黙キャプチャを数える書式マクロの名前か (impact はこの名前の呼び出しだけを証明する)。
+pub(crate) fn is_capture_format_macro(name: &str) -> bool {
+    format_argument(name).is_some()
+}
+
 /// 追加の木はマクロ1個の引数だけ。式内の generic のカンマや入れ子を文字列で分割しない。
 pub(crate) fn captures(
     tree: Node<'_>,

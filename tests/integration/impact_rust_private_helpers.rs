@@ -326,6 +326,55 @@ fn impact_rust_format_arguments_require_standard_macro_binding() {
     }
 }
 
+/// 文・末尾式の位置の `format!` そのものは束縛を作らない。標準と証明した呼び出しだけを
+/// 再束縛の障壁から外し、ほかの文のマクロは障壁に残す (Issue #260)。
+#[test]
+fn impact_rust_format_arguments_in_statement_positions_use_local_bindings() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"format_statements\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "mod changed; mod local; mod real;\n");
+    repo.write(
+        "src/changed.rs",
+        "pub(crate) fn normalize(value: u8) -> u8 { value }\n",
+    );
+    repo.write(
+        "src/real.rs",
+        "pub fn real() -> u8 { crate::changed::normalize(1) }\n",
+    );
+    let local = "fn normalize(value: u8) -> u8 {\n    value\n}\n\npub fn tail() -> String {\n    format!(\"{}\", normalize(1))\n}\n\npub fn statement() {\n    format!(\"{}\", normalize(2));\n}\n\npub fn after_macro() -> String {\n    make_binding!();\n    format!(\"{}\", normalize(3))\n}\n";
+    repo.write("src/local.rs", local);
+    repo.init_git();
+    repo.commit_all("initial");
+    repo.write(
+        "src/changed.rs",
+        "pub(crate) fn normalize(value: u16, _: bool) -> u16 { value }\n",
+    );
+    let context = repo.run_json("context", &["--git"]);
+    let calls = context["changes"][0]["impacted_callers"]
+        .as_array()
+        .unwrap();
+    let reported = |path: &str, needle: &str| {
+        let line = local
+            .lines()
+            .position(|line| line.contains(needle))
+            .unwrap();
+        calls
+            .iter()
+            .any(|caller| caller["path"] == path && caller["line"] == line)
+    };
+    assert!(
+        calls.iter().any(|caller| caller["path"] == "src/real.rs"),
+        "{context}"
+    );
+    assert!(!reported("src/local.rs", "normalize(1)"), "{context}");
+    assert!(!reported("src/local.rs", "normalize(2)"), "{context}");
+    assert!(reported("src/local.rs", "normalize(3)"), "{context}");
+}
+
 fn private_helpers_repo() -> TestRepo {
     let repo = TestRepo::new();
     repo.create_dir_all("src/style");
