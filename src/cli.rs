@@ -535,6 +535,8 @@ pub enum Commands {
         /// 厳格に扱う。api.const_value と、任意 wrapper 内の callback 本体だけの変更
         /// (api.callback_body、戻り値の公開形状は未検証) を Stop hook の blocking 対象にする。
         /// デフォルトではこれらを informational (非 blocking) として報告する。
+        /// 非公開の Rust の const / static の初期値だけの変更 (関数の本体で値を読むだけの参照を
+        /// impact_info に分ける) には効かない。
         #[arg(long = "strict-public-const-values")]
         strict_public_const_values: bool,
 

@@ -462,6 +462,7 @@ pub(super) fn stream_caller_maps_and_defs(
                             jsx_parse_clean: std::cell::OnceCell::new(),
                             python_imports: std::cell::OnceCell::new(),
                             rust_std_origin: std::cell::OnceCell::new(),
+                            rust_local_macros: std::cell::OnceCell::new(),
                             rust_path_owner: std::cell::OnceCell::new(),
                             rust_path_owner_project: &rust_path_owner_project,
                             rust_source_paths: &rust_source_paths,
@@ -594,6 +595,7 @@ mod tests {
             rust_private_method_owners: Default::default(),
             rust_private_widening_names: Default::default(),
             rust_explicit_widenings: Default::default(),
+            rust_value_only_constants: Default::default(),
         }
     }
 

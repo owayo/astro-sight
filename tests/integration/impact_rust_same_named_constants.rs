@@ -16,8 +16,9 @@ fn store_source(call: &str) -> String {
     )
 }
 
-/// `store` の `const SCHEMA_VERSION: i32 = 2;` を 3 に変えた作業ツリーを作る。`files` は既定の
-/// ファイルを上書きできる。
+/// `store` の `const SCHEMA_VERSION: i32 = 2;` の型を `i64` に変えた作業ツリーを作る。`files` は
+/// 既定のファイルを上書きできる。初期値だけの変更は、関数の本体で値を読むだけの参照を情報提供に
+/// 回す (Issue #257) ので、証明できない参照が impacted_callers に残る対照には型を変える。
 fn constants_repo(store: &str, files: &[(&str, &str)]) -> TestRepo {
     let repo = TestRepo::new();
     repo.create_dir_all("src");
@@ -42,7 +43,7 @@ fn constants_repo(store: &str, files: &[(&str, &str)]) -> TestRepo {
     repo.commit_all("initial");
     let changed = store.replace(
         "const SCHEMA_VERSION: i32 = 2;",
-        "const SCHEMA_VERSION: i32 = 3;",
+        "const SCHEMA_VERSION: i64 = 2;",
     );
     assert_ne!(changed, store);
     repo.write("src/store.rs", changed);

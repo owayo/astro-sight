@@ -700,6 +700,18 @@ pub(super) struct DeclarationProof {
     /// 宣言ヘッダの違いが関数に `const` を足したことだけの名前。シグネチャ変更は残し、
     /// 呼び出し元は型別名の証明と同じく情報提供に回す。
     pub(super) rust_const_additions: HashSet<String>,
+    /// 無修飾 `pub` でない Rust の const / 非 mut static で、初期値だけを変えた名前と、その型の
+    /// 名前を束縛しうる名前 (`rust_signature::RustConstValueContract::type_names`)。
+    pub(super) rust_value_only_constants: HashMap<String, RustValueOnlyConstant>,
+}
+
+/// 初期値だけを変えた Rust の非公開の const / static (`DeclarationProof::rust_value_only_constants`)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RustValueOnlyConstant {
+    /// `static` なら true。`&NAME` は static では値によらず `'static` の参照になるが、const では
+    /// 値が昇格できるかで変わる (`None` → `Some(AtomicU8::new(0))` で E0515)。
+    pub(super) is_static: bool,
+    pub(super) type_names: std::collections::BTreeSet<String>,
 }
 
 /// モジュール直下の type alias だけを対象にする。trait / impl の関連型は同じ
@@ -1174,6 +1186,7 @@ pub(super) fn reconcile_declaration_changes(
     };
     if input.lang_id == LangId::Rust {
         proof.rust_alias_changes = rust_modified_alias_names(input, affected, &mut old_side);
+        proof.rust_value_only_constants = rust_value_only_constants(input, affected, &mut old_side);
     }
     if input.lang_id != LangId::Rust || affected.is_empty() || input.root.has_error() {
         return proof;
@@ -1248,6 +1261,83 @@ pub(super) fn reconcile_declaration_changes(
         }
     }
     proof
+}
+
+/// 無修飾 `pub` でない Rust の const / 非 mut static のうち、初期値だけを変えた宣言 (Issue #257)。
+///
+/// 同じパスの旧新のファイルで同じ名前の宣言がそれぞれ 1 つだけあり、初期値を除いた比較用の
+/// トークン (`rust_signature::rust_const_value_contract`) が一致するものに限る。同じファイルの
+/// ほかの差分 (テストの追加など) には依らない。無修飾 `pub` は API 差分が const_value に分け、
+/// `--strict-public-const-values` の方針で扱うので対象外。
+fn rust_value_only_constants(
+    input: &DeclarationChangeInput<'_>,
+    affected: &[AffectedSymbol],
+    old_side: &mut LazyOldSide,
+) -> HashMap<String, RustValueOnlyConstant> {
+    let mut proven = HashMap::new();
+    let mut candidates = affected
+        .iter()
+        .filter(|change| change.kind == "constant" && change.change_type == "modified")
+        .map(|change| change.name.as_str())
+        .peekable();
+    if candidates.peek().is_none()
+        || input.old_file_path != input.file_path
+        || input.root.has_error()
+    {
+        return proven;
+    }
+    let Some(old) = old_side.get(input) else {
+        return proven;
+    };
+    let old_root = old.tree.root_node();
+    if old_root.has_error() {
+        return proven;
+    }
+    let only_named = |symbols: &'_ [Symbol], name: &str| {
+        let mut named = symbols.iter().filter(|symbol| symbol.name == name);
+        named.next().filter(|_| named.next().is_none()).cloned()
+    };
+    for name in candidates {
+        let (Some(new_symbol), Some(old_symbol)) =
+            (only_named(input.syms, name), only_named(&old.symbols, name))
+        else {
+            continue;
+        };
+        if symbols::is_rust_declaration_unrestricted_pub(
+            input.root,
+            input.source,
+            &new_symbol.range,
+        ) != Some(false)
+        {
+            continue;
+        }
+        let (Some(new_item), Some(old_item)) = (
+            super::descendant_for_range(input.root, &new_symbol.range),
+            super::descendant_for_range(old_root, &old_symbol.range),
+        ) else {
+            continue;
+        };
+        if new_item.kind() != old_item.kind() {
+            continue;
+        }
+        let (Some(new_contract), Some(old_contract)) = (
+            crate::engine::rust_signature::rust_const_value_contract(new_item, input.source),
+            crate::engine::rust_signature::rust_const_value_contract(old_item, &old.source),
+        ) else {
+            continue;
+        };
+        if new_contract != old_contract {
+            continue;
+        }
+        proven.insert(
+            name.to_owned(),
+            RustValueOnlyConstant {
+                is_static: new_item.kind() == "static_item",
+                type_names: new_contract.type_names,
+            },
+        );
+    }
+    proven
 }
 
 /// 同じパスの旧新で、型の名前を束縛する import とモジュールの構成が同じか。

@@ -27,6 +27,8 @@ pub(super) struct CrossFileFilterContext<'a> {
     pub(super) sig_changes: &'a [SignatureChange],
     pub(super) rust_kind_changes: &'a HashSet<String>,
     pub(super) rust_alias_changes: &'a HashSet<String>,
+    /// 初期値だけを変えた非公開の Rust の const / static (`declaration::rust_value_only_constants`)。
+    pub(super) rust_value_only_constants: &'a HashMap<String, declaration::RustValueOnlyConstant>,
     pub(super) rust_private_method_owners: &'a HashMap<String, String>,
     /// 対象ファイルの diff 区間 (`diff::FileSections`。シンボル名が変更行に出現するかの
     /// 照合に使う)。diff 全体を渡しても結果は同じだが、シンボルごとに走査するため遅い。
@@ -165,8 +167,13 @@ impl CrossFileFilterContext<'_> {
         // 変更行には出ないため、名前の有無では呼び出し元への影響を判定できない
         // (メンバー追加だけの変更は 3c で除外済み。`as const` / `satisfies` / 括弧で包んだ
         // オブジェクトも同じ理由で除外しない)。
+        // 初期値だけを変えた非公開の Rust の const / static も除外しない。名前の有無は同じ
+        // ファイルのほかの差分 (テストの追加など) で変わるので使わず、参照の位置で振り分ける
+        // (パターンや配列長などの値をコンパイル時に使う参照は blocking、関数の本体で読むだけの
+        // 参照は情報提供。`rust_const_value`)。
         if !self.sig_changes.iter().any(|sc| sc.name == sym.name)
             && !self.rust_alias_changes.contains(&sym.name)
+            && !self.rust_value_only_constants.contains_key(&sym.name)
             && !(sym.kind == "variable"
                 && overlapping.is_some_and(|s| {
                     is_js_ts_wrapped_object_literal_variable(self.root, self.lang_id, &s.range)
@@ -546,6 +553,7 @@ mod tests {
         let ctx = CrossFileFilterContext {
             rust_kind_changes: &HashSet::new(),
             rust_alias_changes: &rust_alias_changes,
+            rust_value_only_constants: &HashMap::new(),
             rust_private_method_owners: &HashMap::new(),
             sig_changes,
             diff_input: &diff_input,
@@ -673,6 +681,7 @@ mod tests {
         let ctx = CrossFileFilterContext {
             rust_kind_changes: &HashSet::new(),
             rust_alias_changes: &HashSet::new(),
+            rust_value_only_constants: &HashMap::new(),
             rust_private_method_owners: &HashMap::new(),
             sig_changes: &[],
             diff_input,
@@ -853,6 +862,7 @@ mod tests {
             CrossFileFilterContext {
                 rust_kind_changes: &HashSet::new(),
                 rust_alias_changes: &HashSet::new(),
+                rust_value_only_constants: &HashMap::new(),
                 rust_private_method_owners: &HashMap::new(),
                 sig_changes,
                 diff_input: diff,
@@ -872,6 +882,59 @@ mod tests {
         // 対照: シグネチャ変更が無ければ従来どおり「名前が変更行に無い」で除外する
         // (本体だけの変更を cross-file 検索に載せない既存の抑制)。
         assert!(!include(&[]));
+    }
+
+    /// 初期値だけを変えた非公開の Rust の static は、変更行に名前が無くても cross-file 検索に
+    /// 載せる (Issue #257)。名前の有無は同じファイルのほかの差分で変わるので、参照の位置で
+    /// 振り分ける。
+    #[test]
+    fn cross_file_filter_keeps_rust_value_only_constant_whose_name_is_not_on_changed_lines() {
+        let source =
+            "pub(super) static GREETING: Note = Note {\n    text: \"Hello, world.\",\n};\n";
+        let diff = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,3 @@\n pub(super) static GREETING: Note = Note {\n-    text: \"Hello.\",\n+    text: \"Hello, world.\",\n };\n";
+        let bytes = source.as_bytes();
+        let tree = crate::engine::parser::parse_source(bytes, LangId::Rust).expect("parse");
+        let root = tree.root_node();
+        let syms = symbols::extract_symbols(root, bytes, LangId::Rust).expect("symbols");
+        let hunks = vec![HunkInfo {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 3,
+        }];
+        let changed_new_lines: HashSet<usize> = HashSet::from([1]);
+        let deletion_gaps =
+            crate::engine::diff::extract_changed_line_facts(diff, "src/lib.rs").deletion_gaps;
+        let include = |value_only: &HashMap<String, declaration::RustValueOnlyConstant>| {
+            CrossFileFilterContext {
+                rust_kind_changes: &HashSet::new(),
+                rust_alias_changes: &HashSet::new(),
+                rust_value_only_constants: value_only,
+                rust_private_method_owners: &HashMap::new(),
+                sig_changes: &[],
+                diff_input: diff,
+                file_path: "src/lib.rs",
+                root,
+                source: bytes,
+                lang_id: LangId::Rust,
+                changed_new_lines: &changed_new_lines,
+                deletion_gaps: &deletion_gaps,
+            }
+            .should_include_for_cross_file(
+                &affected("GREETING", "constant", "modified"),
+                original_for(&syms, "GREETING", &hunks),
+            )
+        };
+        let proven = HashMap::from([(
+            "GREETING".to_owned(),
+            declaration::RustValueOnlyConstant {
+                is_static: true,
+                type_names: ["Note".to_owned()].into(),
+            },
+        )]);
+        assert!(include(&proven));
+        // 対照: 証明が無ければ従来どおり「名前が変更行に無い」で除外する。
+        assert!(!include(&HashMap::new()));
     }
 
     // 3b. 宣言ヘッダ行が変更行に含まれない型シンボルは除外 (body/コメントのみ変更)
