@@ -64,6 +64,9 @@ pub enum TruncationReason {
     SourceAnalysisFailed,
     /// TS の拡張子変更で、設定・ソースの証拠を読み切れず同一モジュールと証明しなかった。
     TsExtensionProofUnavailable,
+    /// `.gitattributes` の `linguist-generated` を解決できず (属性ファイルや index を読めない、
+    /// リポジトリを開けない)、生成物として外さずに通常のソースとして解析した。
+    GeneratedDetectionUnavailable,
 }
 
 impl TruncationInfo {
@@ -159,6 +162,28 @@ impl TruncationInfo {
             reason: TruncationReason::UnanalyzableSource,
             message,
             detail: Some(detail),
+        }
+    }
+
+    /// 属性を解決できず、生成物として外さずに解析したファイルの申告 (原因ごとに 1 件)。
+    /// `path` は原因の範囲 (読めない属性ファイルのディレクトリ。全体なら付けない)。
+    pub fn generated_detection_unavailable(
+        error: &crate::engine::gitattributes::AttributeLookupError,
+        count: usize,
+        examples: &[String],
+    ) -> Self {
+        let mut message = format!(
+            "generated-file detection was not applied to {count} file(s), which were analyzed as ordinary sources ({})",
+            error.cause
+        );
+        if !examples.is_empty() {
+            message.push_str(&format!(" (e.g. {})", examples.join(", ")));
+        }
+        Self {
+            path: (!error.scope.is_empty()).then(|| error.scope.clone()),
+            reason: TruncationReason::GeneratedDetectionUnavailable,
+            message,
+            detail: None,
         }
     }
 

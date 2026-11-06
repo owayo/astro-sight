@@ -44,6 +44,7 @@ mod integration {
     mod js_signature_sites;
     mod kotlin_grammar;
     mod languages;
+    mod linguist_generated_attributes;
     mod literal_const_values;
     mod literal_union_removal;
     mod local_callable_shadow;

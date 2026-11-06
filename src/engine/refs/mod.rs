@@ -34,7 +34,9 @@ pub use files::{
     FileCollection, FileScanOptions, UnsupportedScope, collect_files, collect_files_scan,
     collect_files_scan_with_excludes, merge_extra_files, skipped_files_from_relative,
 };
-pub(crate) use files::{detect_source_lang, is_unanalyzable_source_ext};
+pub(crate) use files::{
+    detect_source_lang, generated_undetermined_truncations, is_unanalyzable_source_ext,
+};
 pub(crate) use line_index::{LineIndex, absolute_position, byte_offset_to_row_col};
 pub(crate) use role::RefUsageRole;
 pub(crate) use walker::{RefVisitEvent, RefVisitor};
@@ -209,6 +211,9 @@ pub struct RefScan<T> {
     /// 対応言語でないソースとして走査から外したファイルの申告 (拡張子単位の
     /// `unanalyzable_source`)。その中の参照は数えていない。
     pub unanalyzable: Vec<TruncationInfo>,
+    /// `.gitattributes` の属性を解決できず、生成物として外さずに検索したファイルの申告
+    /// (`generated_detection_unavailable`)。
+    pub generated_undetermined: Vec<TruncationInfo>,
     /// 検索範囲にファイルはあるが、参照を検索できる入力 (対応言語のファイル・Angular
     /// テンプレート) が 1 件も無かったときの内訳。利用者向けの面はエラーにする。
     pub unsupported_only: Option<UnsupportedScope>,
@@ -282,6 +287,7 @@ pub fn find_references_with_scan(
         scan_coverage(&collection, dir, angular_ctx.as_ref(), |path| {
             unsupported_source_matches(path, |source| prefilter.ci.is_match(source))
         });
+    let generated_undetermined = collection.generated_undetermined_truncations(dir);
     let files = collection.files;
 
     let pool = build_bounded_pool()?;
@@ -333,6 +339,7 @@ pub fn find_references_with_scan(
         skipped,
         failed_files,
         unanalyzable,
+        generated_undetermined,
         unsupported_only,
     })
 }
@@ -565,6 +572,7 @@ pub(crate) fn find_references_batch_with_scan_policy<const SHELL_VARS: bool>(
             skipped: None,
             failed_files: 0,
             unanalyzable: Vec::new(),
+            generated_undetermined: Vec::new(),
             unsupported_only: None,
         });
     }
@@ -585,6 +593,7 @@ pub(crate) fn find_references_batch_with_scan_policy<const SHELL_VARS: bool>(
                     acs.iter().any(|(_, ac)| ac.is_match(source))
                 })
         });
+    let generated_undetermined = collection.generated_undetermined_truncations(dir);
     let files = collection.files;
     let pool = build_bounded_pool()?;
 
@@ -650,6 +659,7 @@ pub(crate) fn find_references_batch_with_scan_policy<const SHELL_VARS: bool>(
         skipped,
         failed_files,
         unanalyzable,
+        generated_undetermined,
         unsupported_only,
     })
 }

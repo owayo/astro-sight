@@ -695,7 +695,7 @@ Ruby では `Builder.new`・`Demo::Builder.new`・`::Demo::Builder.new` のよ�
 
 ### 生成ファイルの扱い
 
-生成ファイルとして検出したファイル（先頭の生成宣言コメント、`.gitattributes` の `linguist-generated` など）は、既定で dead 判定の**候補**から外す。ただし生成ファイルの中の参照は常に数える。gRPC の生成ハンドラ（`*_grpc.pb.go`）が手書きのサーバー実装を呼ぶ構成のように、生成コードは実行時に手書きコードを呼ぶため、その参照を捨てると生きているシンボルを dead と報告してしまう。
+生成ファイルとして検出したファイル（`refs` と同じ判定で、`.gitattributes` の `linguist-generated`、ファイル名、先頭の生成宣言コメントの順。[生成ファイルの除外と申告](usage.ja.md#生成ファイルの除外と申告)）は、既定で dead 判定の**候補**から外す。ただし生成ファイルの中の参照は常に数える。gRPC の生成ハンドラ（`*_grpc.pb.go`）が手書きのサーバー実装を呼ぶ構成のように、生成コードは実行時に手書きコードを呼ぶため、その参照を捨てると生きているシンボルを dead と報告してしまう。
 
 候補から外したファイルは `generated_candidates_skipped` に `refs` の `skipped` と同じ形で出す（0 件なら出力しない）。`--include-generated`（または `skip_generated = false`）を指定すると生成ファイルのシンボルも候補にする。
 
@@ -754,14 +754,14 @@ astro-sight cochange --dir . --git --base HEAD~10 --rename --copy
 
 `--paths-file` は 100MB 上限付きで読み込まれ、空リストは `INVALID_REQUEST` を返す。`--min-confidence` は有限な `0.0..=1.0`、`--smoothing-alpha` / `--smoothing-beta` は有限な非負値のみ受け付ける。`--paths` / `--paths-file` で渡すソースファイルは `--dir` 配下の相対パスである必要があり、`..` を含むパス・絶対パス・Windows のドライブ修飾パスは `PATH_OUT_OF_BOUNDS` で拒否される。
 
-**生成物は起点・候補の両方から除外する。** バッチ処理・コード生成・ビルドが同時に書き出すファイル群は履歴上ほぼ必ず同一コミットに乗るため、そのままでは「機械的な同時更新」が高い confidence の共変更として提示されてしまう。判定では `.gitattributes` の `linguist-generated` を最優先する（`set` / `true` なら除外し、`unset` / `false` ならヘッダマーカーを見ずに残す）。指定がなければ、ファイル先頭の生成マーカー（`@generated` / `DO NOT EDIT` など）を見る。どちらでも決まらなければ候補に残す。拡張子や更新頻度では判定しないので、コメントを書けない生成 JSON / CSV は `.gitattributes` で宣言する。
+**生成物は起点・候補の両方から除外する。** バッチ処理・コード生成・ビルドが同時に書き出すファイル群は履歴上ほぼ必ず同一コミットに乗るため、そのままでは「機械的な同時更新」が高い confidence の共変更として提示されてしまう。判定は `refs` と同じで（[生成ファイルの除外と申告](usage.ja.md#生成ファイルの除外と申告)）、`.gitattributes` の `linguist-generated` を最優先する（指定と `false` 以外の値なら除外し、解除と `false` ならファイル名やヘッダマーカーを見ずに残す）。指定がなければ、minified / bundle / IDE helper のファイル名、ファイル先頭の生成マーカー（`@generated` / `DO NOT EDIT` など）の順に見る。どれでも決まらなければ候補に残す。拡張子や更新頻度では判定しないので、コメントを書けない生成 JSON / CSV は `.gitattributes` で宣言する。
 
 ```gitattributes
 data/*.json linguist-generated=true
 fixtures/hand-maintained.yaml -linguist-generated
 ```
 
-除外しても**残った起点の分母は変わらない**（生成物が同居していたコミットを分母から抜くと `1/2` が `1/1` に化けて選択バイアスになるため）。除外件数は `diagnostics` の `excluded_generated_sources` / `filtered_generated_candidates` に出る。`git check-attr` を実行できない場合は除外を一切行わず（`GeneratedAttrLookupFailed` を申告）、判定できないことを理由に候補を消さない。グローバルの `--include-generated`（`config.toml` の `skip_generated = false` も同義）で、生成物も対象にできる。この指定は単体の `cochange` だけでなく `review` の `missing_cochanges` にも効く。
+除外しても**残った起点の分母は変わらない**（生成物が同居していたコミットを分母から抜くと `1/2` が `1/1` に化けて選択バイアスになるため）。除外件数は `diagnostics` の `excluded_generated_sources` / `filtered_generated_candidates` に出る。属性を解決できないファイルは、ファイル名やマーカーでも除外せず（`GeneratedAttrLookupFailed` を申告）、判定できないことを理由に候補を消さない。グローバルの `--include-generated`（`config.toml` の `skip_generated = false` も同義）で、生成物も対象にできる。この指定は単体の `cochange` だけでなく `review` の `missing_cochanges` にも効く。
 
 ## シェルの解析エラー
 
