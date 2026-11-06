@@ -167,6 +167,9 @@ pub(crate) struct RefVisitEvent<'a> {
     pub(crate) js_signature_site: crate::engine::js_occurrence::JsSignatureSite,
     /// callback の間だけ有効な AST とソース。impact 固有の証明は collector 側で行う。
     pub(crate) node: Option<Node<'a>>,
+    /// Rust の書式マクロの暗黙キャプチャのとき、キャプチャを含む書式マクロの token tree。
+    /// キャプチャには識別子のノードが無いので `node` は `None` のまま。
+    pub(crate) rust_format_capture: Option<Node<'a>>,
     pub(crate) source: &'a [u8],
 }
 
@@ -218,6 +221,9 @@ impl MatchSet<'_> {
 pub(crate) enum HitOrigin<'tree> {
     Identifier(Node<'tree>),
     Synthetic(RefConfidence),
+    /// Rust の書式マクロの暗黙キャプチャ。ノードはキャプチャを含む書式マクロの token tree で、
+    /// impact が束縛を確かめるときだけ使う (出現と件数は synthetic と同じに扱う)。
+    RustFormatCapture(Node<'tree>),
 }
 
 /// walk_refs が sink に渡す最小 hit 情報。context 抽出や列補正は sink 側で
@@ -464,6 +470,9 @@ impl<V: RefVisitor> RawRefSink for VisitorAdapter<'_, V> {
                 classify_ref_usage_role(node, env.lang_id),
             ),
             HitOrigin::Synthetic(confidence) => (confidence, false, RefUsageRole::Other),
+            HitOrigin::RustFormatCapture(_) => {
+                (RefConfidence::ExactOwner, false, RefUsageRole::Other)
+            }
         };
         hit.matches.for_each_index(|ix| {
             self.visitor.on_ref(RefVisitEvent {
@@ -480,7 +489,11 @@ impl<V: RefVisitor> RawRefSink for VisitorAdapter<'_, V> {
                 js_signature_site,
                 node: match hit.origin {
                     HitOrigin::Identifier(node) => Some(node),
-                    HitOrigin::Synthetic(_) => None,
+                    HitOrigin::Synthetic(_) | HitOrigin::RustFormatCapture(_) => None,
+                },
+                rust_format_capture: match hit.origin {
+                    HitOrigin::RustFormatCapture(tree) => Some(tree),
+                    HitOrigin::Identifier(_) | HitOrigin::Synthetic(_) => None,
                 },
                 source: env.source,
             });
@@ -532,11 +545,33 @@ fn emit_synthetic_hit<M: RefMatcher, S: RawRefSink>(
     sink: &mut S,
     env: &RefEnvironment<'_>,
 ) {
+    emit_segment_hit(
+        segment,
+        row,
+        column,
+        HitOrigin::Synthetic(confidence),
+        matcher,
+        sink,
+        env,
+    );
+}
+
+/// 文字列セグメント由来の hit を、発生源を指定して sink に流す。
+#[inline]
+fn emit_segment_hit<M: RefMatcher, S: RawRefSink>(
+    segment: &str,
+    row: usize,
+    column: usize,
+    origin: HitOrigin<'_>,
+    matcher: &M,
+    sink: &mut S,
+    env: &RefEnvironment<'_>,
+) {
     if let Some(matches) = matcher.segment_matches(segment) {
         sink.on_hit(
             RawRefHit {
                 matches,
-                origin: HitOrigin::Synthetic(confidence),
+                origin,
                 line: row,
                 column,
                 is_def: false,
@@ -638,7 +673,15 @@ fn visit_ref_node<M: RefMatcher, S: RawRefSink>(
             let (row, col) = env
                 .line_index
                 .map_or((0, 0), |index| index.row_col(source.len(), byte));
-            emit_synthetic_hit(&name, row, col, exact, matcher, sink, env);
+            emit_segment_hit(
+                &name,
+                row,
+                col,
+                HitOrigin::RustFormatCapture(node),
+                matcher,
+                sink,
+                env,
+            );
         }
     }
 

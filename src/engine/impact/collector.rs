@@ -108,6 +108,8 @@ pub(super) struct RefEventMini {
     pub(super) rust_local_owner: bool,
     pub(super) rust_direct_import_site: bool,
     pub(super) rust_import_binding_safe: bool,
+    /// 直接 import の証明で import の先に求める名前空間 (import の宣言そのものは `Any`)。
+    pub(super) rust_import_namespace: super::rust_path_owner::ImportNamespace,
 }
 
 /// 汎用すぎてシンボル名だけでは owner を特定できない PHP/JS 系メソッド名。
@@ -386,6 +388,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             lexical_binding,
             js_signature_site,
             node,
+            rust_format_capture,
             source,
         } = event;
         let ix = sym_ix as usize;
@@ -585,10 +588,14 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             u32::MAX
         };
 
+        // 書式の暗黙キャプチャには識別子のノードが無い。所有元の索引はキャプチャを含む
+        // token tree から作り、キャプチャ用の証明だけに使う。
+        let rust_format_capture =
+            rust_format_capture.filter(|_| self.ref_lang == Some(LangId::Rust));
         let rust_owner_index = (self.ref_lang == Some(LangId::Rust)
             && self.rust_path_owner_enabled)
             .then(|| {
-                node.map(|node| {
+                node.or(rust_format_capture).map(|node| {
                     self.rust_path_owner.get_or_init(|| {
                         super::rust_path_owner::RustPathOwnerIndex::build(node, source)
                     })
@@ -704,7 +711,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                         )
                     })
             });
-        let rust_local_owner = rust_plain_name
+        let rust_local_owner = (rust_plain_name
             && rust_owner_index.zip(node).is_some_and(|(index, node)| {
                 index.plain_local_owner(node, source, &self.all_symbol_names[ix])
                     || index.plain_local_value_owner(node, source, &self.all_symbol_names[ix])
@@ -716,14 +723,46 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
                         self.path_str,
                         self.rust_path_owner_project,
                     )
-            });
+            }))
+            || rust_owner_index
+                .zip(rust_format_capture)
+                .is_some_and(|(index, tree)| {
+                    index.format_capture_local_owner(
+                        tree,
+                        source,
+                        &self.all_symbol_names[ix],
+                        Path::new(self.dir),
+                        self.path_str,
+                        self.rust_path_owner_project,
+                    )
+                });
         let rust_direct_import_site = rust_owner_index.zip(node).is_some_and(|(index, node)| {
             index.is_tracked_direct_import_site(node, source, &self.all_symbol_names[ix])
         });
-        let rust_import_binding_safe = rust_plain_name
+        let rust_import_binding_safe = (rust_plain_name
             && rust_owner_index.zip(node).is_some_and(|(index, node)| {
                 index.plain_import_binding_safe(node, source, &self.all_symbol_names[ix])
-            });
+            }))
+            || rust_owner_index
+                .zip(rust_format_capture)
+                .is_some_and(|(index, tree)| {
+                    index.format_capture_import_binding_safe(
+                        tree,
+                        source,
+                        &self.all_symbol_names[ix],
+                        Path::new(self.dir),
+                        self.path_str,
+                        self.rust_path_owner_project,
+                    )
+                });
+        // 直接 import の証明は、参照と同じ名前空間の宣言が import の先にあることを求める。
+        let rust_import_namespace = if rust_direct_import_site {
+            super::rust_path_owner::ImportNamespace::Any
+        } else if node.is_some_and(|node| node.kind() == "type_identifier") {
+            super::rust_path_owner::ImportNamespace::Type
+        } else {
+            super::rust_path_owner::ImportNamespace::Value
+        };
 
         let jsx_shape_id = if self.ref_lang == Some(LangId::Tsx) {
             node.and_then(|node| {
@@ -780,6 +819,7 @@ impl<'a> refs::RefVisitor for ImpactCollector<'a> {
             rust_local_owner,
             rust_direct_import_site,
             rust_import_binding_safe,
+            rust_import_namespace,
         });
     }
 }
@@ -911,7 +951,9 @@ struct RefFileEvidence<'a> {
     /// `None` は証明できないことを表す。
     rust_explicit_widening_scope:
         HashMap<(usize, usize), Option<super::rust_visibility_scope::WideningScope>>,
-    rust_private_import_owners: HashMap<(usize, usize), bool>,
+    /// 変更元 × シンボル × 名前空間ごとの、直接 import が別の所有元を指すかの証明。
+    rust_private_import_owners:
+        HashMap<(usize, usize, super::rust_path_owner::ImportNamespace), bool>,
     rust_ref_source: std::cell::OnceCell<Option<Vec<u8>>>,
 }
 
@@ -1275,7 +1317,7 @@ impl<'a> ImpactCollector<'a> {
             let other_import = (e.rust_import_binding_safe || e.rust_direct_import_site)
                 && *evidence
                     .rust_private_import_owners
-                    .entry((fc_ix, sym_ix_usize))
+                    .entry((fc_ix, sym_ix_usize, e.rust_import_namespace))
                     .or_insert_with(|| {
                         self.rust_path_owner.get().is_some_and(|index| {
                             rust_ref_source
@@ -1292,6 +1334,7 @@ impl<'a> ImpactCollector<'a> {
                                         self.path_str,
                                         source,
                                         name,
+                                        e.rust_import_namespace,
                                         self.rust_path_owner_project,
                                     )
                                 })
@@ -1531,6 +1574,7 @@ mod tests {
             rust_local_owner: false,
             rust_direct_import_site: false,
             rust_import_binding_safe: false,
+            rust_import_namespace: super::super::rust_path_owner::ImportNamespace::Value,
         }
     }
 

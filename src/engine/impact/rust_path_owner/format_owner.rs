@@ -195,6 +195,24 @@ fn argument_macro<'t>(node: Node<'t>, source: &[u8]) -> Option<(Node<'t>, Node<'
     Some((invocation, callee))
 }
 
+/// 暗黙キャプチャを含む書式マクロの呼び出しと、その呼び出し名。別のマクロの token tree の
+/// 中の呼び出しと、パスで書いたマクロ名は扱わない。
+fn capture_macro<'t, 's>(
+    tree: Node<'t>,
+    source: &'s [u8],
+) -> Option<(Node<'t>, Node<'t>, &'s str)> {
+    let invocation = tree
+        .parent()
+        .filter(|node| node.kind() == "macro_invocation")?;
+    let callee = invocation.child_by_field_name("macro")?;
+    if callee.kind() != "identifier" {
+        return None;
+    }
+    let text = callee.utf8_text(source).ok()?;
+    let name = text.strip_prefix("r#").unwrap_or(text);
+    crate::engine::refs::is_capture_format_macro(name).then_some((invocation, callee, name))
+}
+
 impl RustPathOwnerIndex {
     pub(in crate::engine::impact) fn format_local_value_owner(
         &self,
@@ -205,11 +223,66 @@ impl RustPathOwnerIndex {
         ref_path: &str,
         project: &RustPathOwnerProjectProof,
     ) -> bool {
+        if !self.local_value_names.contains(name) || blake3::hash(source) != self.source_hash {
+            return false;
+        }
+        let Some((invocation, callee)) = argument_macro(node, source) else {
+            return false;
+        };
+        self.standard_macro_call(invocation, "format", source, dir, ref_path, project)
+            && self.local_value_owner_beside(callee, source, name, Some(invocation.id()))
+    }
+
+    /// 書式の暗黙キャプチャが、参照ファイル直下の一意な値の宣言を指すか。キャプチャは呼び出し
+    /// 位置の式の識別子と同じに解決されるので、呼び出し名のノードで同じ束縛の証明を使う。
+    pub(in crate::engine::impact) fn format_capture_local_owner(
+        &self,
+        tree: Node<'_>,
+        source: &[u8],
+        name: &str,
+        dir: &Path,
+        ref_path: &str,
+        project: &RustPathOwnerProjectProof,
+    ) -> bool {
+        if !self.local_value_names.contains(name) || blake3::hash(source) != self.source_hash {
+            return false;
+        }
+        let Some((invocation, callee, macro_name)) = capture_macro(tree, source) else {
+            return false;
+        };
+        self.standard_macro_call(invocation, macro_name, source, dir, ref_path, project)
+            && self.local_value_owner_beside(callee, source, name, Some(invocation.id()))
+    }
+
+    /// 書式の暗黙キャプチャが、直下の crate 起点の import の束縛を使うか。
+    pub(in crate::engine::impact) fn format_capture_import_binding_safe(
+        &self,
+        tree: Node<'_>,
+        source: &[u8],
+        name: &str,
+        dir: &Path,
+        ref_path: &str,
+        project: &RustPathOwnerProjectProof,
+    ) -> bool {
+        let Some((invocation, callee, macro_name)) = capture_macro(tree, source) else {
+            return false;
+        };
+        self.standard_macro_call(invocation, macro_name, source, dir, ref_path, project)
+            && self.import_binding_safe_beside(callee, source, name, Some(invocation.id()))
+    }
+
+    /// `invocation` が標準の `macro_name!` を指すか。祖先のファイルと外側の block で、マクロ名を
+    /// import・定義で差し替えておらず、ソースの配置と依存の置き換えも無いことを確かめる。
+    fn standard_macro_call(
+        &self,
+        invocation: Node<'_>,
+        macro_name: &str,
+        source: &[u8],
+        dir: &Path,
+        ref_path: &str,
+        project: &RustPathOwnerProjectProof,
+    ) -> bool {
         let prove = || {
-            if !self.local_value_names.contains(name) || blake3::hash(source) != self.source_hash {
-                return None;
-            }
-            let (invocation, callee) = argument_macro(node, source)?;
             let base = self
                 .format_environment
                 .get_or_init(|| {
@@ -240,7 +313,9 @@ impl RustPathOwnerIndex {
                             file == Path::new(ref_path),
                         )?);
                     }
-                    combined.plain("format").then_some(combined)
+                    // マクロ名ごとの判定は外側の block を合わせてから行う (`plain` は要素を
+                    // 足すほど偽に寄るので、先に絞っても結果は変わらない)。
+                    Some(combined)
                 })
                 .as_ref()?;
             let mut combined = base.clone();
@@ -251,10 +326,7 @@ impl RustPathOwnerIndex {
                 }
                 ancestor = scope.parent();
             }
-            if !combined.plain("format") || !self.plain_local_value_owner(callee, source, name) {
-                return None;
-            }
-            Some(())
+            combined.plain(macro_name).then_some(())
         };
         prove().is_some()
     }
