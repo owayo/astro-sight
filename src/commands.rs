@@ -174,6 +174,7 @@ pub fn cmd_symbols_dir(service: &AppService, opts: &CmdSymbolsDirOpts<'_>) -> Re
         },
     )?;
     let skipped = collection.skipped(&canonical_dir);
+    let truncations = collection.generated_undetermined_truncations(&canonical_dir);
     let file_paths: Vec<String> = collection
         .files
         .iter()
@@ -187,6 +188,7 @@ pub fn cmd_symbols_dir(service: &AppService, opts: &CmdSymbolsDirOpts<'_>) -> Re
             full: opts.full,
             dir: Some(&canonical_dir),
             skipped,
+            truncations,
             query: opts.query,
             output: opts.output,
         },

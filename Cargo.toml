@@ -20,6 +20,10 @@ camino = { version = "1.2.6", features = ["serde1"] }
 clap = { version = "4.6.7", features = ["derive"] }
 dhat = { version = "0.3.3", optional = true }
 dirs = "7.0.0"
+# `.gitattributes` の解決 (engine/gitattributes.rs)。git を起動せずに Git と同じ規則で属性を引く。
+# parallel はリポジトリと index をワーカー間で共有するため (無いと共有型が Rc になる)。
+# sha256 は SHA-256 のリポジトリを開くため
+gix = { version = "0.90.0", default-features = false, features = ["attributes", "parallel", "sha1", "sha256"] }
 globset = "0.4.21"
 hashbrown = "0.17.1"
 ignore = "0.4.34"

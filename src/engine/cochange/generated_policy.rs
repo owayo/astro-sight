@@ -9,10 +9,18 @@
 //!
 //! # 判定順 (先に決まったものが勝つ)
 //!
-//! 1. `.gitattributes` の `linguist-generated` — 明示宣言。`set` / `true` は除外、
-//!    `unset` / `false` は**マーカーを見ずに**残す (利用者による明示的な上書き)
-//! 2. ファイル先頭のヘッダマーカー (`@generated` / `DO NOT EDIT` 等) — 自動認識
-//! 3. どちらでも決まらなければ残す
+//! refs / dead-code / API 差分と同じ [`crate::engine::generated::judge`] を使う。
+//!
+//! 1. `.gitattributes` の `linguist-generated` — 明示宣言。set と `false` 以外の値は除外、
+//!    unset / `false` は**名前とマーカーを見ずに**残す (利用者による明示的な上書き)
+//! 2. ファイル名の型 (`*.min.js` などの minified・bundled、IDE 補助)
+//! 3. ファイル先頭のヘッダマーカー (`@generated` / `DO NOT EDIT` 等) — 自動認識
+//! 4. どれでも決まらなければ残す
+//!
+//! 属性を解決できなかったパス (属性ファイルや index を読めない、リポジトリを開けない) は
+//! 除外しない。利用者が `-linguist-generated` で除外を解除しているかを確かめられないので、
+//! 名前やマーカーだけで除外すると明示的な解除指定を無視して本物の共変更を消しうる。失敗した
+//! 事実は `attr_lookup_failed` で申告する。
 //!
 //! # 判定しないもの
 //!
@@ -37,39 +45,18 @@
 //! パスの履歴を使わない」という仕様)。
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
-/// 生成物と判定した根拠。診断出力の理由づけに使う。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GeneratedReason {
-    /// `.gitattributes` の `linguist-generated` が set / true。
-    GitAttribute,
-    /// ファイル先頭のヘッダコメントが生成物を宣言している。
-    HeaderMarker,
-}
-
-/// `git check-attr` が返す `linguist-generated` の状態。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttrState {
-    /// `set` / `true` — 生成物と宣言されている。
-    Generated,
-    /// `unset` / `false` — 生成物ではないと明示されている (マーカーより優先)。
-    NotGenerated,
-    /// `unspecified`、または解釈できない値。マーカー判定へ進む。
-    Unspecified,
-}
+pub(crate) use crate::engine::generated::GeneratedReason;
 
 /// cochange の起点・候補から生成物を落とすためのポリシー。
 ///
-/// パス集合に対して `.gitattributes` を 1 度だけバッチ問い合わせし、必要なパスだけ
-/// ヘッダマーカーを読む。判定結果はパス単位でメモ化するので、同じ候補が複数の起点に
-/// 現れても I/O は 1 回きり。
+/// パス集合の属性を 1 度に解決し、必要なパスだけヘッダマーカーを読む。判定結果はパス単位で
+/// メモ化するので、同じ候補が複数の起点に現れても I/O は 1 回きり。
 pub(crate) struct GeneratedPolicy {
     /// 判定済みのパス → 除外理由 (None = 残す)。
     decided: HashMap<String, Option<GeneratedReason>>,
-    /// `git check-attr` の実行に失敗した (属性を一切参照できなかった)。
+    /// 属性を解決できず、判定せずに残したパスがあった。
     attr_lookup_failed: bool,
 }
 
@@ -82,52 +69,41 @@ impl GeneratedPolicy {
         }
     }
 
-    /// `paths` について生成物判定をまとめて解決する。
-    ///
-    /// **`git check-attr` に失敗したら判定そのものを行わない** (全パスを「残す」)。
-    /// 属性が読めないということは、利用者が `-linguist-generated` で除外を解除している
-    /// 可能性を確認できないということなので、マーカーだけで除外すると明示的な解除指定を
-    /// 無視して本物の共変更を消しうる。「判定できないことを理由に候補を消さない」は
-    /// `collect_base_tree_paths` (削除済み候補のフィルタ) と同じ方針。
-    /// 失敗した事実は `attr_lookup_failed` で申告する。
+    /// `paths` (`dir` 相対) について生成物判定をまとめて解決する。
     pub(crate) fn resolve<'a, I>(dir: &str, paths: I) -> Self
     where
         I: IntoIterator<Item = &'a str>,
     {
+        use crate::engine::generated::{GeneratedVerdict, judge};
+
         let mut unique: Vec<&str> = paths.into_iter().collect();
         unique.sort_unstable();
         unique.dedup();
         if unique.is_empty() {
             return Self::disabled();
         }
-
-        let Some(attrs) = query_linguist_generated(dir, &unique) else {
-            return Self {
-                decided: HashMap::new(),
-                attr_lookup_failed: true,
-            };
-        };
-
+        let base = Path::new(dir);
+        let resolver = crate::engine::gitattributes::AttributeResolver::open(base);
+        let mut lookup = resolver.lookup();
         let mut decided = HashMap::with_capacity(unique.len());
+        let mut attr_lookup_failed = false;
         for path in unique {
-            let state = attrs.get(path).copied().unwrap_or(AttrState::Unspecified);
-            let reason = match state {
-                AttrState::Generated => Some(GeneratedReason::GitAttribute),
-                // 明示的に「生成物ではない」と宣言されていればマーカーは見ない。
-                AttrState::NotGenerated => None,
-                AttrState::Unspecified => {
-                    if crate::engine::generated::is_auto_generated(&Path::new(dir).join(path)) {
-                        Some(GeneratedReason::HeaderMarker)
-                    } else {
-                        None
-                    }
+            let full = base.join(path);
+            let reason = match judge(lookup.linguist_generated(&full), &full, || {
+                crate::engine::generated::is_auto_generated(&full)
+            }) {
+                GeneratedVerdict::Generated(reason) => Some(reason),
+                GeneratedVerdict::NotGenerated => None,
+                GeneratedVerdict::Undetermined(_) => {
+                    attr_lookup_failed = true;
+                    None
                 }
             };
             decided.insert(path.to_string(), reason);
         }
         Self {
             decided,
-            attr_lookup_failed: false,
+            attr_lookup_failed,
         }
     }
 
@@ -136,132 +112,33 @@ impl GeneratedPolicy {
         self.decided.get(path).copied().flatten()
     }
 
-    /// `git check-attr` に失敗したか (診断で申告する)。
+    /// 属性を解決できなかったパスがあったか (診断で申告する)。
     pub(crate) fn attr_lookup_failed(&self) -> bool {
         self.attr_lookup_failed
-    }
-}
-
-/// `git check-attr -z --stdin linguist-generated` をバッチ実行する。
-///
-/// パスは `--stdin` から NUL 区切りで渡すので ARG_MAX を超えない。出力も `-z` で
-/// NUL 区切りになり、非 ASCII ファイル名が 8 進クォートされる問題を避けられる。
-/// `current_dir(dir)` 基準で解決されるため、astro-sight の `--dir` 相対規約とそのまま
-/// 一致する。
-///
-/// 実行できなかった場合は `None` を返す。呼び出し側は**マーカー判定へ進まず生成物の
-/// 除外そのものを諦める** (`GeneratedPolicy::resolve` の doc 参照)。
-fn query_linguist_generated(dir: &str, paths: &[&str]) -> Option<HashMap<String, AttrState>> {
-    let mut child = Command::new("git")
-        .args(["check-attr", "-z", "--stdin", "linguist-generated"])
-        .current_dir(dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    // stdin を閉じてから wait する。パス数が多いと git 側の出力バッファが埋まって
-    // 書き込みがブロックしうるため、書き込みは別スレッドに逃がす。
-    let mut stdin = child.stdin.take()?;
-    let payload: Vec<u8> = paths.iter().fold(Vec::new(), |mut buf, p| {
-        buf.extend_from_slice(p.as_bytes());
-        buf.push(0);
-        buf
-    });
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&payload);
-        // drop で閉じる
-    });
-    let output = child.wait_with_output().ok();
-    let _ = writer.join();
-    let output = output?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(parse_check_attr_z(&output.stdout))
-}
-
-/// `git check-attr -z` の出力 (`<path>NUL<attr>NUL<value>NUL` の繰り返し) を解釈する。
-///
-/// レコードは NUL 終端なので、split すると必ず末尾に空要素が 1 つ残る。空の `path` は
-/// そこで打ち切り、空の `value` は「レコードが途中で切れた」とみなして捨てる
-/// (git は必ず `set` / `unset` / `unspecified` / 値のいずれかを返すため、正常な出力で
-/// 空 value は現れない)。壊れた出力を黙って判定に使わない。
-fn parse_check_attr_z(stdout: &[u8]) -> HashMap<String, AttrState> {
-    let mut out = HashMap::new();
-    let mut fields = stdout.split(|&b| b == 0);
-    while let (Some(path), Some(_attr), Some(value)) = (fields.next(), fields.next(), fields.next())
-    {
-        // 末尾の NUL による空要素で打ち切る (path が空 = 実データではない)。
-        if path.is_empty() {
-            break;
-        }
-        if value.is_empty() {
-            continue;
-        }
-        let path = String::from_utf8_lossy(path).into_owned();
-        out.insert(path, attr_state_from_value(&String::from_utf8_lossy(value)));
-    }
-    out
-}
-
-/// `linguist-generated` の値を状態へ写す。
-///
-/// Linguist は属性の有無 (`set` / `unset`) と明示値 (`true` / `false`) の両方を受け付ける。
-/// 未知の値は「判定不能」として残す側 (`Unspecified`) に倒す — 除外方向へ倒すと、
-/// 意味の分からない宣言を理由に本物の共変更を消してしまう。
-fn attr_state_from_value(value: &str) -> AttrState {
-    match value {
-        "set" | "true" => AttrState::Generated,
-        "unset" | "false" => AttrState::NotGenerated,
-        _ => AttrState::Unspecified,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
-    #[test]
-    fn attr_values_map_to_states() {
-        assert_eq!(attr_state_from_value("set"), AttrState::Generated);
-        assert_eq!(attr_state_from_value("true"), AttrState::Generated);
-        assert_eq!(attr_state_from_value("unset"), AttrState::NotGenerated);
-        assert_eq!(attr_state_from_value("false"), AttrState::NotGenerated);
-        assert_eq!(attr_state_from_value("unspecified"), AttrState::Unspecified);
-        // 未知の値は「残す」側へ倒す (除外方向に倒さない)。
-        assert_eq!(attr_state_from_value("linguist"), AttrState::Unspecified);
-        assert_eq!(attr_state_from_value(""), AttrState::Unspecified);
-    }
-
-    #[test]
-    fn parses_nul_separated_check_attr_output() {
-        let raw = b"a.json\0linguist-generated\0set\0b.py\0linguist-generated\0unspecified\0";
-        let parsed = parse_check_attr_z(raw);
-        assert_eq!(parsed.get("a.json"), Some(&AttrState::Generated));
-        assert_eq!(parsed.get("b.py"), Some(&AttrState::Unspecified));
-        assert_eq!(parsed.len(), 2);
-    }
-
-    /// 壊れた (3 要素揃わない) 出力で誤った判定を作らない。
-    #[test]
-    fn ignores_truncated_trailing_record() {
-        let raw = b"a.json\0linguist-generated\0set\0b.py\0linguist-generated\0";
-        let parsed = parse_check_attr_z(raw);
-        assert_eq!(parsed.get("a.json"), Some(&AttrState::Generated));
-        assert_eq!(parsed.get("b.py"), None, "3 要素揃わない末尾は捨てる");
-    }
-
-    /// 非 ASCII のファイル名が 8 進クォートされずそのまま復元できる (`-z` の効果)。
-    #[test]
-    fn preserves_non_ascii_paths() {
-        let raw = "データ/生成物.yaml\0linguist-generated\0set\0".as_bytes();
-        let parsed = parse_check_attr_z(raw);
-        assert_eq!(
-            parsed.get("データ/生成物.yaml"),
-            Some(&AttrState::Generated)
+    fn git(dir: &Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("git")
+                .success(),
+            "git {args:?}"
         );
+    }
+
+    fn init_repo(dir: &Path) {
+        git(dir, &["init", "-q", "-b", "main"]);
+        git(dir, &["config", "user.name", "astro-sight-tests"]);
+        git(dir, &["config", "user.email", "astro-sight@example.com"]);
     }
 
     #[test]
@@ -271,28 +148,100 @@ mod tests {
         assert!(!policy.attr_lookup_failed());
     }
 
-    /// `git check-attr` に失敗したら、マーカーがあっても除外しない。
+    /// 属性、名前、マーカーの順で判定し、属性の unset はマーカーと名前を打ち消す。
+    /// 非 ASCII のパスも属性どおりに判定する。
+    #[test]
+    fn resolves_attribute_name_and_marker_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        std::fs::create_dir_all(dir.path().join("data")).expect("mkdir");
+        std::fs::create_dir_all(dir.path().join("データ")).expect("mkdir");
+        std::fs::write(dir.path().join("data/out.json"), "{}\n").expect("write");
+        std::fs::write(
+            dir.path().join("kept.yaml"),
+            "# @generated by a job\nv: 1\n",
+        )
+        .expect("write");
+        std::fs::write(
+            dir.path().join("marked.yaml"),
+            "# @generated by a job\nv: 1\n",
+        )
+        .expect("write");
+        std::fs::write(dir.path().join("app.min.js"), "x\n").expect("write");
+        std::fs::write(dir.path().join("kept.min.js"), "x\n").expect("write");
+        std::fs::write(dir.path().join("hand.yaml"), "v: 1\n").expect("write");
+        std::fs::write(
+            dir.path().join(".gitattributes"),
+            "data/*.json linguist-generated\nkept.yaml -linguist-generated\nkept.min.js -linguist-generated\nデータ/*.yaml linguist-generated\n",
+        )
+        .expect("write");
+        std::fs::write(dir.path().join("データ/生成物.yaml"), "v: 1\n").expect("write");
+
+        let dir_str = dir.path().to_str().expect("utf-8 path");
+        let paths = [
+            "data/out.json",
+            "kept.yaml",
+            "marked.yaml",
+            "app.min.js",
+            "kept.min.js",
+            "hand.yaml",
+            "データ/生成物.yaml",
+        ];
+        let policy = GeneratedPolicy::resolve(dir_str, paths);
+        assert!(!policy.attr_lookup_failed());
+        assert_eq!(
+            policy.excluded("data/out.json"),
+            Some(GeneratedReason::Attribute)
+        );
+        assert_eq!(
+            policy.excluded("kept.yaml"),
+            None,
+            "unset はマーカーを打ち消す"
+        );
+        assert_eq!(
+            policy.excluded("marked.yaml"),
+            Some(GeneratedReason::Header)
+        );
+        assert_eq!(policy.excluded("app.min.js"), Some(GeneratedReason::Name));
+        assert_eq!(
+            policy.excluded("kept.min.js"),
+            None,
+            "unset は名前を打ち消す"
+        );
+        assert_eq!(policy.excluded("hand.yaml"), None);
+        assert_eq!(
+            policy.excluded("データ/生成物.yaml"),
+            Some(GeneratedReason::Attribute)
+        );
+    }
+
+    /// 属性を解決できなかったら、マーカーがあっても除外しない。
     ///
     /// 属性が読めない = 利用者が `-linguist-generated` で除外を解除している可能性を
     /// 確認できない、ということ。マーカーだけで除外すると明示的な解除指定を無視して
-    /// 本物の共変更を消しうる。対照として、同じファイルが git 管理下では除外されることも
-    /// 確かめる (「マーカー判定自体が壊れていて常に残る」実装でも通るテストにしない)。
+    /// 本物の共変更を消しうる。対照として、index を直せば同じファイルがマーカーで除外される
+    /// ことも確かめる (「マーカー判定自体が壊れていて常に残る」実装でも通るテストにしない)。
     #[test]
     fn attr_lookup_failure_keeps_everything_even_with_marker() {
         let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
         let generated = "gen.yaml";
         std::fs::write(
             dir.path().join(generated),
             "# @generated by a batch job\nv: 1\n",
         )
         .expect("write");
+        git(dir.path(), &["add", "-A"]);
+        // 壊れた index は読めないので、属性を解決できない。
+        let index = dir.path().join(".git").join("index");
+        let original = std::fs::read(&index).expect("read index");
+        std::fs::write(&index, b"not an index").expect("corrupt index");
 
-        // git 管理外なので check-attr が失敗する。
         let dir_str = dir.path().to_str().expect("utf-8 path");
         let policy = GeneratedPolicy::resolve(dir_str, [generated]);
         assert!(
             policy.attr_lookup_failed(),
-            "git 管理外では check-attr が失敗するはず (前提が崩れるとこのテストは無意味になる)"
+            "壊れた index では属性を解決できないはず (前提が崩れるとこのテストは無意味になる)"
         );
         assert_eq!(
             policy.excluded(generated),
@@ -300,26 +249,13 @@ mod tests {
             "属性を確認できないなら、マーカーがあっても除外しない"
         );
 
-        // 対照: git 管理下 (属性は unspecified) ならマーカーで除外される。
-        for args in [
-            vec!["init", "-b", "main"],
-            vec!["config", "user.name", "astro-sight-tests"],
-            vec!["config", "user.email", "astro-sight@example.com"],
-        ] {
-            assert!(
-                Command::new("git")
-                    .args(&args)
-                    .current_dir(dir.path())
-                    .status()
-                    .expect("git")
-                    .success()
-            );
-        }
+        // 対照: index を戻せば (属性は unspecified) マーカーで除外される。
+        std::fs::write(&index, original).expect("restore index");
         let policy = GeneratedPolicy::resolve(dir_str, [generated]);
-        assert!(!policy.attr_lookup_failed(), "git 管理下なら成功する");
+        assert!(!policy.attr_lookup_failed(), "読める index なら成功する");
         assert_eq!(
             policy.excluded(generated),
-            Some(GeneratedReason::HeaderMarker),
+            Some(GeneratedReason::Header),
             "属性が unspecified ならマーカーで判定する"
         );
     }

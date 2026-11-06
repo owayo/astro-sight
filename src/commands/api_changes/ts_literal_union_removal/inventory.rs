@@ -61,6 +61,11 @@ impl Inventory {
             crate::engine::refs::FileScanOptions::default(),
         )
         .ok()?;
+        // 生成物か判定できなかった (属性を解決できない) ソースがあれば、在庫の範囲を確かめ
+        // られないので証明しない。
+        if !sources.generated_undetermined_truncations(&root).is_empty() {
+            return None;
+        }
         let selected = sources
             .files
             .into_iter()
@@ -73,26 +78,23 @@ impl Inventory {
             })
             .collect::<BTreeMap<_, _>>();
         let attributes_path = root.join(".gitattributes");
-        let attributes = if attributes_path.exists() {
+        if attributes_path.exists() {
             let metadata = std::fs::symlink_metadata(&attributes_path).ok()?;
             if !metadata.is_file() || metadata.file_type().is_symlink() || reparse_point(&metadata)
             {
                 return None;
             }
-            crate::engine::gitattributes::GitAttributes::parse(
-                &crate::engine::bounded_read::read_utf8_file_limited(
-                    &attributes_path,
-                    1024 * 1024,
-                )?,
-            )
-        } else {
-            crate::engine::gitattributes::GitAttributes::default()
-        };
+        }
+        // JSON と埋め込み (`.vue` など) のソースは走査の選別を通らないので、走査と同じ判定
+        // (属性 → 名前 → ヘッダー) をここで行う。TS / JS のソースは走査の選別で判定済み。
         let mut files = BTreeMap::new();
         let mut bytes = 0usize;
         let include_generated = std::env::var("ASTRO_SIGHT_NO_GENERATED_EXCLUSION")
             .ok()
             .is_some_and(|value| !value.is_empty() && value != "0");
+        let resolver = (!include_generated)
+            .then(|| crate::engine::gitattributes::AttributeResolver::open(&root));
+        let mut lookup = resolver.as_ref().map(|resolver| resolver.lookup());
         for entry in walked {
             let path = entry.path();
             let metadata = std::fs::symlink_metadata(path).ok()?;
@@ -121,24 +123,27 @@ impl Inventory {
             let kind = if let Some(lang) = selected.get(path) {
                 Kind::Source(*lang)
             } else if extension == "json" {
-                if !include_generated && crate::engine::generated::is_auto_generated(path) {
-                    continue;
-                }
                 Kind::Json
             } else if crate::engine::refs::is_unanalyzable_source_ext(extension) {
-                if !include_generated && crate::engine::generated::is_auto_generated(path) {
-                    continue;
-                }
                 Kind::Embedded
             } else {
                 continue;
             };
+            if let Some(lookup) = lookup.as_mut()
+                && !matches!(kind, Kind::Source(_))
+            {
+                use crate::engine::generated::{GeneratedVerdict, judge};
+                match judge(lookup.linguist_generated(path), path, || {
+                    crate::engine::generated::is_auto_generated(path)
+                }) {
+                    GeneratedVerdict::Generated(_) => continue,
+                    GeneratedVerdict::NotGenerated => {}
+                    GeneratedVerdict::Undetermined(_) => return None,
+                }
+            }
             let relative = crate::git_support::normalize_workspace_separators(
                 path.strip_prefix(&root).ok()?.to_str()?,
             );
-            if !include_generated && attributes.is_generated(&relative) {
-                continue;
-            }
             let source =
                 crate::engine::bounded_read::read_utf8_file_limited(path, MAX_SOURCE as u64)?;
             bytes = bytes.checked_add(source.len())?;
