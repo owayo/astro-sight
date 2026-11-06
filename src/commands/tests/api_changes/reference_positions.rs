@@ -504,6 +504,154 @@ fn external_import_excludes_only_its_own_binding() {
     }
 }
 
+const ERRORS_OLD: &str = "export interface RequestFailure {\n\terror: string;\n}\n\nexport function describe(message: string): string {\n\treturn message;\n}\n";
+const ERRORS_NEW: &str =
+    "export function describe(message: string): string {\n\treturn message;\n}\n";
+const TRANSPORT: &str = "export class RequestFailure extends Error {\n\tstatus = 0;\n}\n";
+
+/// tsconfig の paths の別名で import した同名のクラスは、削除した interface を指さない
+/// (Issue #264)。別名で削除元のモジュール自身を import している、設定が別名を解かない
+/// (バンドラーだけの別名かもしれない)、node16 で解決先が参照ファイルの形式に依る、のどれかなら
+/// 従来どおり api.rm (対照)。
+#[test]
+fn tsconfig_paths_alias_import_is_attributed_to_its_target() {
+    let alias = r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@/*": ["./src/*"] } } }"#;
+    for (tsconfig, spec, expected) in [
+        (alias, "@/net/transport", "rm_dead"),
+        (
+            r#"{ "compilerOptions": { "paths": { "@/*": ["./src/*"] } } }"#,
+            "@/net/transport",
+            "rm_dead",
+        ),
+        (alias, "../net/transport", "rm_dead"),
+        (alias, "@/server/errors", "rm"),
+        (
+            r#"{ "compilerOptions": { "baseUrl": "." } }"#,
+            "@/net/transport",
+            "rm",
+        ),
+        (
+            r#"{ "compilerOptions": { "module": "Node16", "paths": { "@/*": ["./src/*"] } } }"#,
+            "@/net/transport",
+            "rm",
+        ),
+    ] {
+        let user = format!(
+            "import {{ RequestFailure }} from \"{spec}\";\n\nexport function isClientError(value: unknown): boolean {{\n\treturn value instanceof RequestFailure && value.status < 500;\n}}\n"
+        );
+        let api = api_after(
+            &[
+                ("tsconfig.json", tsconfig),
+                ("src/net/transport.ts", TRANSPORT),
+                ("src/server/errors.ts", ERRORS_OLD),
+                ("src/app/use.ts", &user),
+                (
+                    "src/app/label.ts",
+                    "import { describe } from \"../server/errors\";\n\nexport const label = describe(\"failed\");\n",
+                ),
+            ],
+            &[("src/server/errors.ts", ERRORS_NEW)],
+        );
+        assert_eq!(
+            bucket(&api, "RequestFailure"),
+            expected,
+            "{tsconfig} {spec}: {api:?}"
+        );
+    }
+}
+
+/// 最優先の paths のパターンの置換先が無いと、TypeScript は弱いパターンへ進まずに package.json の
+/// `imports` で解く (ここでは削除元)。弱いパターンが生き残りのクラスに当たっても証明しない。
+#[test]
+fn alias_falling_back_to_package_imports_is_not_proven() {
+    let api = api_after(
+        &[
+            (
+                "tsconfig.json",
+                r##"{ "compilerOptions": { "module": "ESNext", "moduleResolution": "bundler", "paths": { "#failure": ["./missing"], "*": ["./src/net/transport"] } } }"##,
+            ),
+            (
+                "package.json",
+                r##"{ "type": "module", "imports": { "#failure": "./src/server/errors.js" } }"##,
+            ),
+            ("src/net/transport.ts", TRANSPORT),
+            ("src/server/errors.ts", ERRORS_OLD),
+            (
+                "src/app/use.ts",
+                "import type { RequestFailure } from \"#failure\";\n\nexport type Failure = RequestFailure;\n",
+            ),
+        ],
+        &[("src/server/errors.ts", ERRORS_NEW)],
+    );
+    assert_eq!(bucket(&api, "RequestFailure"), "rm", "{api:?}");
+}
+
+/// 依存の名前の import でも、tsconfig の baseUrl / paths がローカルのファイルへ差し替えていれば、
+/// 外部パッケージとして除かない (削除したファイルを指す)。差し替えていなければ従来どおり外部
+/// パッケージの束縛として除く (対照)。
+#[test]
+fn dependency_import_overridden_by_tsconfig_is_not_external() {
+    let lodash_old =
+        "export function debounce(): void {}\n\nexport function keep(): number {\n  return 1;\n}\n";
+    let lodash_new = "export function keep(): number {\n  return 1;\n}\n";
+    for (tsconfig, expected) in [
+        (r#"{ "compilerOptions": { "baseUrl": "./src" } }"#, "rm"),
+        (
+            r#"{ "compilerOptions": { "paths": { "lodash": ["./src/lodash"] } } }"#,
+            "rm",
+        ),
+        (r#"{ "compilerOptions": { "strict": true } }"#, "rm_dead"),
+    ] {
+        let api = api_after(
+            &[
+                (
+                    "package.json",
+                    "{\n  \"dependencies\": { \"lodash\": \"^4.0.0\" }\n}\n",
+                ),
+                ("tsconfig.json", tsconfig),
+                ("src/lodash.ts", lodash_old),
+                (
+                    "src/app/use.ts",
+                    "import { debounce } from \"lodash\";\n\nexport const run = (): void => debounce();\n",
+                ),
+            ],
+            &[("src/lodash.ts", lodash_new)],
+        );
+        assert_eq!(bucket(&api, "debounce"), expected, "{tsconfig}: {api:?}");
+    }
+}
+
+/// 大文字小文字を区別しないファイルシステムでは、綴りの違う置換先 (`./SRC/SERVER/errors`) も
+/// 削除したファイルを指す。削除したファイルと同じ名前の JS のファイルが残っていても証明しない。
+#[test]
+fn alias_spelled_in_other_case_still_points_to_the_removed_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            (
+                "tsconfig.json",
+                r#"{ "compilerOptions": { "paths": { "@failure": ["./SRC/SERVER/errors"] } } }"#,
+            ),
+            (
+                "src/server/errors.ts",
+                "export function RequestFailure(): void {}\n",
+            ),
+            ("src/server/errors.js", "export class RequestFailure {}\n"),
+            (
+                "src/app/use.ts",
+                "import { RequestFailure } from \"@failure\";\n\nRequestFailure();\n",
+            ),
+        ],
+        "base",
+    );
+    fs::remove_file(repo.join("src/server/errors.ts")).expect("remove");
+    let api = detect_api_changes_from_worktree(repo);
+    assert_eq!(bucket(&api, "RequestFailure"), "rm", "{api:?}");
+}
+
 /// default export / 別名 export で公開していた関数を削除すると、利用者は公開名で import して
 /// いるので宣言名の参照は 0 件になる。参照 0 件を根拠に removed_dead へ落とさない。宣言名の
 /// まま公開していた未使用の関数の削除は従来どおり removed_dead (対照)。

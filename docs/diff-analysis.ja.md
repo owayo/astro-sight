@@ -438,6 +438,12 @@ blocking に残る TS / TSX の `api_changes.modified` と hook の `api.mod` �
 
 既定の hook は情報提供にし、`--strict-public-const-values` 指定時は blocking にする。`g`・`y` などの flags は正規表現の使い方を変えうるため、動作が同じという証明ではない。種類の変更、置換あり・タグ付きの template、assertion、`satisfies` は従来の判定を維持する。宣言ヘッダの検査と、静的 object / array の scalar 葉の判定も変えない。
 
+### JavaScript / TypeScript の削除と相対でない import
+
+消した export の名前の残った出現が、どれも別のものを指すと証明できれば (同じ名前を宣言する別のモジュールに解かれる import など)、`removed_dead`（hook では `api.rm_dead`）にする。相対でない指定子 (`@/net/transport` やパッケージの名前) は、リポジトリの `tsconfig*.json` / `jsconfig*.json` と、その `references` の先、解析するディレクトリに無ければ祖先のいちばん近い `tsconfig.json` / `jsconfig.json` で解く。設定は TypeScript と同じく読む。`extends` (相対パスと、package.json に `exports` の無い node_modules のパッケージ) を辿って `paths` と `baseUrl` を継承し、`${configDir}` も展開する。指定子には `paths` の完全一致のキーか、当たるパターンのうち接頭辞の最も長いものを使い、どのキーにも当たらないときだけ `baseUrl` を使う。既定の解決の方式は TypeScript 5 と 6 で違うので、候補は node10・bundler・classic (参照ファイルの祖先のディレクトリにある同名のファイルも探す) のどれで解いても入るように集める。宣言ファイル・拡張子の読み替え・ディレクトリの index・もう無いファイルも候補に入れる。どの設定でも候補に削除したファイルが無く、存在する候補がどれもその名前を export しているときだけ、import が別のものを指すと証明する。
+
+パッケージの名前の import は、どの設定もローカルのファイルへ差し替えず、ルートの `package.json` の registry の依存にあるときだけ外部パッケージとみなす。ワークスペースのパッケージ、`file:` / `link:` / `workspace:` の依存、ローカルのパスを指す `overrides` / `resolutions` / `pnpm.overrides`、`node_modules` の外に設定した `typeRoots` の下のパッケージ (宣言ファイルを消したものを含む)、依存に無いパッケージは証明しない。ほかにも次のときは blocking の `removed` (`api.rm`) のままにする。読めない・解けない設定がある (辿れない `extends`、`[""]` 以外の `moduleSuffixes`)。`node16` / `nodenext` の設定で指定子がローカルに解ける (ES module のファイルでは拡張子を補わない)。classic になり得る設定で、ディレクトリを経てしか解けない。当たるパターンの置換先にファイルが無く、`node_modules` や `package.json` の `imports` (`#` の指定子) へ解決が進む。候補のパスが symlink や `package.json` のあるディレクトリを通る。その先へ進む前の候補に、削除したファイルがある。どの設定も解かない別名は、バンドラーだけが解くものかもしれないので、これも証明しない。TypeScript の版で `paths` の読み方が違うところ (TypeScript 6 は空の捕獲で `*` を置き換えない) は、どちらの読み方でも成り立つことを求める。一覧を読めないディレクトリがあっても、これらの import は証明しない。バンドラーの別名・Jest の `moduleNameMapper`・`package.json` の外のパッケージマネージャの設定 (pnpmfile、`pnpm-workspace.yaml`) は、これらのファイルと一致するものとして扱う。パッケージの名前の後に `.` や `..` の区切りが続く指定子 (`pkg/../src/x`) は外部パッケージとみなさない。パスは大文字小文字と Unicode の正規化を区別せずに比べる。ASCII の文字は大文字小文字を区別せず、ASCII へ畳み込まれる文字 (KELVIN SIGN や `ß` など) は展開し、ほかの ASCII でない文字の並びどうしは、ファイルシステムの規則を正確には再現できないので、同じかもしれないものとして扱う。
+
 ### Rust の公開シグネチャから届く型
 
 private module の型も、公開関数の引数・戻り値、公開フィールド、enum のバリアント、trait のメソッド・関連型から届けば公開 API 面に含める。型ごとに module と名前を保持し、named import・別名・再公開・型別名をたどる。届いた型の公開メソッドが返す別の型にも伝播するため、名前を外から書けない型のメソッド変更も検出できる。

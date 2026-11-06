@@ -17,6 +17,7 @@ use tree_sitter::Node;
 
 use super::js_ts_shadow::{Namespace, ScopeBinding, resolve_scope_binding};
 use super::removed_attribution::relative_import_candidates;
+use super::ts_alias_resolution::{AliasResolution, TsAliasResolver};
 use crate::language::LangId;
 
 /// 参照 1 件の分類。
@@ -29,7 +30,8 @@ pub(crate) enum JsRefSite {
     Member,
     /// 外部パッケージの import の中の出現と、その束縛の利用。削除したローカルのシンボルとは別物。
     External,
-    /// 相対 import / from 句付き export の束縛。`export_proven` は、存在する全ての解決候補が
+    /// 相対 import か、tsconfig / jsconfig の別名で解いた import (from 句付き export を含む) の
+    /// 束縛。`candidates` は実際の解決先を含む候補。`export_proven` は、存在する全ての解決候補が
     /// その公開名を由来の分かる形 (同じファイルの通常の宣言、または同名の明示的な再 export) で
     /// export していること。`export *` だけの転送は由来が分からないので含めない。
     Import {
@@ -50,21 +52,42 @@ enum ImportedName {
     Namespace,
 }
 
-/// モジュールの公開名の由来を確かめた結果のキャッシュ (検出 1 回に閉じる)。
+/// モジュールの公開名の由来を確かめた結果と、相対でない指定子の解決器のキャッシュ (検出 1 回に
+/// 閉じる)。
 #[derive(Default)]
 pub(crate) struct JsExportOriginCache {
     proven: HashMap<(String, ImportedName, String), bool>,
+    /// 削除したシンボルのファイル (`dir` 相対)。
+    removed_files: HashSet<String>,
+    aliases: Option<TsAliasResolver>,
 }
 
-/// `symbol` と同じテキストを持つ出現を位置ごとに分類する。外部パッケージの判定は
-/// `external_pkgs` (package.json の依存名) で行う。
+impl JsExportOriginCache {
+    pub(crate) fn new(removed_files: HashSet<String>) -> Self {
+        Self {
+            removed_files,
+            ..Self::default()
+        }
+    }
+
+    /// `ref_path` のファイルにある相対でない指定子を、`dir` の tsconfig / jsconfig と
+    /// package.json で解く。解決器は最初に使うときに作る。
+    fn resolve_alias(&mut self, dir: &str, ref_path: &str, spec: &str) -> AliasResolution {
+        let removed_files = &self.removed_files;
+        self.aliases
+            .get_or_insert_with(|| TsAliasResolver::load(dir, removed_files.clone()))
+            .resolve(ref_path, spec)
+    }
+}
+
+/// `symbol` と同じテキストを持つ出現を位置ごとに分類する。相対でない import の解決先と外部
+/// パッケージの判定は、`dir` の tsconfig / jsconfig と package.json で行う ([`TsAliasResolver`])。
 pub(crate) fn classify_js_ref_sites(
     dir: &str,
     ref_path: &str,
     source: &[u8],
     root: Node<'_>,
     symbol: &str,
-    external_pkgs: &HashSet<String>,
     cache: &mut JsExportOriginCache,
 ) -> HashMap<(usize, usize), JsRefSite> {
     let context = SiteContext {
@@ -72,7 +95,6 @@ pub(crate) fn classify_js_ref_sites(
         ref_path,
         source,
         symbol,
-        external_pkgs,
     };
     let mut sites = HashMap::new();
     let mut nodes = vec![root];
@@ -101,7 +123,6 @@ struct SiteContext<'a> {
     ref_path: &'a str,
     source: &'a [u8],
     symbol: &'a str,
-    external_pkgs: &'a HashSet<String>,
 }
 
 fn field_is(parent: Node<'_>, field: &str, node: Node<'_>) -> bool {
@@ -229,21 +250,20 @@ impl SiteContext<'_> {
         else {
             return JsRefSite::Unproven;
         };
-        if let Some(package) = super::import_specifier_package_name(spec) {
-            // package.json の依存なら削除したローカルのシンボルとは別物。依存に無い bare
-            // specifier (workspace パッケージ等) は解決できないので証明しない。
-            return if self.external_pkgs.contains(&package) {
-                JsRefSite::External
-            } else {
-                JsRefSite::Unproven
-            };
-        }
-        let Some(candidates) = relative_import_candidates(self.ref_path, spec) else {
-            return JsRefSite::Unproven;
+        let candidates = match relative_import_candidates(self.ref_path, spec) {
+            Some(candidates) => Rc::new(candidates),
+            // 相対でない指定子は、tsconfig / jsconfig の paths・baseUrl を先に解き、ローカルに
+            // 解かれなければ package.json の依存を見る。依存の名前でも別名で差し替わり得るので、
+            // 名前だけで外部とはしない。
+            None => match cache.resolve_alias(self.dir, self.ref_path, spec) {
+                AliasResolution::Local(candidates) => candidates,
+                AliasResolution::External => return JsRefSite::External,
+                AliasResolution::Unknown => return JsRefSite::Unproven,
+            },
         };
         let export_proven = export_proven(self.dir, &candidates, &imported, self.symbol, cache);
         JsRefSite::Import {
-            candidates: Rc::new(candidates),
+            candidates,
             export_proven,
         }
     }
@@ -668,7 +688,6 @@ mod tests {
             source.as_bytes(),
             tree.root_node(),
             symbol,
-            &HashSet::from(["datefmt".to_string()]),
             &mut cache,
         )
         .into_iter()
@@ -695,6 +714,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "dependencies": { "datefmt": "^1.0.0" } }"#,
+        )
+        .unwrap();
         std::fs::write(root.join("src/b.ts"), "export function helper() {}\n").unwrap();
         std::fs::write(
             root.join("src/star.ts"),

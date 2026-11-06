@@ -94,11 +94,6 @@ pub(crate) fn partition_removed_dead_candidates(
         }
     }
 
-    // 外部パッケージ (package.json deps) から import された同名 binding は、削除した
-    // ローカルシンボルとは別物 (例: tailwindcss の `Config` 型) なので参照カウントから
-    // 除外する。これがないと汎用名の削除が外部同名 import を拾って api.rm に誤分類される
-    // (codex 設計合意。full TS resolver は入れず、証明できる外部 import binding のみ除外)。
-    let external_pkgs = load_external_package_names(dir);
     let member_names: HashSet<String> = candidates
         .iter()
         .filter(|c| {
@@ -110,8 +105,17 @@ pub(crate) fn partition_removed_dead_candidates(
         .collect();
     // (path, symbol) -> ファイル解析結果 (外部 import 事実 + 参照帰属の素材)
     let mut facts_cache: HashMap<(String, String), RefAttributionFacts> = HashMap::new();
-    // import 先のモジュールが公開名をどう export しているかの判定 (候補ファイルごとに 1 回)。
-    let mut export_cache = super::js_ref_sites::JsExportOriginCache::default();
+    // import 先のモジュールが公開名をどう export しているかの判定 (候補ファイルごとに 1 回) と、
+    // 相対でない指定子の解決 (tsconfig / jsconfig の別名と package.json の依存)。外部パッケージ
+    // (例: tailwindcss の `Config` 型) から import した同名の束縛は、削除したローカルのシンボルとは
+    // 別物なので参照に数えない。依存の名前でも paths / baseUrl でローカルへ差し替わり得るので、
+    // 名前だけで外部とはしない。
+    let mut export_cache = super::js_ref_sites::JsExportOriginCache::new(
+        candidates
+            .iter()
+            .map(|candidate| candidate.file.clone())
+            .collect(),
+    );
     let mut python_members = super::python_member_origin::PythonMemberOrigins::default();
     let mut private_owners = super::python_private_owner::PrivateOwnerRemovals::default();
     let mut old_rust_functions: HashMap<String, Option<super::rust_ref_sites::ModuleFunctions>> =
@@ -148,7 +152,6 @@ pub(crate) fn partition_removed_dead_candidates(
                     dir,
                     &x.path,
                     &r.symbol,
-                    &external_pkgs,
                     member_names.contains(&r.symbol),
                     &mut export_cache,
                     &mut rust_paths,
@@ -507,64 +510,6 @@ fn current_gitlinks(dir: &str) -> Option<Vec<std::path::PathBuf>> {
         }
     }
     Some(paths)
-}
-
-/// `<dir>/package.json` の dependencies / devDependencies / peerDependencies /
-/// optionalDependencies のキー (外部パッケージ名) を集める。package.json 不在 / パース
-/// 失敗時は空集合 (= 何も除外しない、保守的)。
-fn load_external_package_names(dir: &str) -> std::collections::HashSet<String> {
-    use std::collections::HashSet;
-    let path = std::path::Path::new(dir).join("package.json");
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return HashSet::new();
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return HashSet::new();
-    };
-    let mut pkgs = HashSet::new();
-    for key in [
-        "dependencies",
-        "devDependencies",
-        "peerDependencies",
-        "optionalDependencies",
-    ] {
-        if let Some(obj) = json.get(key).and_then(|v| v.as_object()) {
-            for name in obj.keys() {
-                pkgs.insert(name.clone());
-            }
-        }
-    }
-    pkgs
-}
-
-/// import specifier から npm パッケージ名を取り出す。相対 (`./` `../` `/`) / alias
-/// (`@/` `~/` `#`) は外部パッケージではないため None (保守的に内部扱い)。scoped は
-/// `@scope/pkg`、bare は最初のセグメント。
-pub(crate) fn import_specifier_package_name(spec: &str) -> Option<String> {
-    if spec.is_empty()
-        || spec.starts_with("./")
-        || spec.starts_with("../")
-        || spec.starts_with('/')
-        || spec.starts_with("@/")
-        || spec.starts_with("~/")
-        || spec.starts_with('#')
-    {
-        return None;
-    }
-    if let Some(scoped) = spec.strip_prefix('@') {
-        // @scope/pkg[/sub]
-        let mut parts = scoped.splitn(3, '/');
-        let scope = parts.next()?;
-        let pkg = parts.next()?;
-        if scope.is_empty() || pkg.is_empty() {
-            return None;
-        }
-        return Some(format!("@{scope}/{pkg}"));
-    }
-    spec.split('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
 }
 
 /// 削除された bash 関数 `name` が、変更後ツリーの bash 系ファイル内のどこからも
