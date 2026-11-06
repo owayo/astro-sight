@@ -159,6 +159,17 @@ fn impact_rust_same_named_constants_keep_unproven_bindings() {
     // 型だけを import すると、取り込まれた先の値の参照は変更した定数へ解決される。
     let inclusion_store = "const SCHEMA_VERSION: i32 = 2;\n\nmacro_rules! catalog_items {\n    () => {\n        include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/catalog.rs\"));\n    };\n}\n\npub fn run() -> bool {\n    catalog_items!();\n    check(3)\n}\n";
     let type_catalog = "use crate::source::SCHEMA_VERSION;\n\npub fn check(schema: i32) -> bool {\n    schema > SCHEMA_VERSION\n}\n";
+    // `#[macro_export]` の定義は crate root の `format!` を差し替える。
+    let exported_lib = "pub mod catalog;\npub mod macros;\npub mod source;\npub mod store;\n\npub const SCHEMA_VERSION: u8 = 1;\n\npub fn label() -> String {\n    format!(\"{SCHEMA_VERSION}\")\n}\n";
+    // `use super::*;` は親の import (`format` の差し替え) を子へ持ち込む。
+    let with_nested_report = "pub mod catalog;\npub mod report;\npub mod source;\npub mod store;\n";
+    let nested_child = |glob: &str| {
+        format!(
+            "{glob}pub const SCHEMA_VERSION: u8 = 1;\n\npub fn label() -> String {{\n    format!(\"{{SCHEMA_VERSION}}\")\n}}\n"
+        )
+    };
+    let transported_child = nested_child("use super::*;\n\n");
+    let separate_child = nested_child("");
     let catalog_lines = vec![line_of(CATALOG, "if schema"), line_of(CATALOG, "format!(")];
     let report_line = |source: &str| ("src/report.rs", vec![line_of(source, "format!(")]);
     let cases = [
@@ -215,6 +226,51 @@ fn impact_rust_same_named_constants_keep_unproven_bindings() {
             kept: vec![report_line(std_path)],
             excluded: vec!["src/source.rs", "src/catalog.rs"],
         },
+        Case {
+            name: "format exported from another file",
+            store: &params,
+            files: vec![
+                ("src/lib.rs", exported_lib),
+                (
+                    "src/macros.rs",
+                    "#[macro_export]\nmacro_rules! format {\n    ($s:literal) => {\n        $crate::store::label()\n    };\n}\n",
+                ),
+            ],
+            kept: vec![("src/lib.rs", vec![line_of(exported_lib, "format!(")])],
+            excluded: vec![],
+        },
+        Case {
+            name: "parent import brought in by a parent glob",
+            store: &params,
+            files: vec![
+                ("src/lib.rs", with_nested_report),
+                (
+                    "src/report.rs",
+                    "use crate::helpers::format;\n\npub mod child;\n",
+                ),
+                ("src/report/child.rs", transported_child.as_str()),
+            ],
+            kept: vec![(
+                "src/report/child.rs",
+                vec![line_of(&transported_child, "format!(")],
+            )],
+            excluded: vec!["src/source.rs", "src/catalog.rs"],
+        },
+        // 親の import は `use super::*;` が無ければ子のスコープに入らない (上の対照)。
+        Case {
+            name: "parent import without a parent glob",
+            store: &params,
+            files: vec![
+                ("src/lib.rs", with_nested_report),
+                (
+                    "src/report.rs",
+                    "use crate::helpers::format;\n\npub mod child;\n",
+                ),
+                ("src/report/child.rs", separate_child.as_str()),
+            ],
+            kept: vec![],
+            excluded: vec!["src/report/child.rs", "src/source.rs", "src/catalog.rs"],
+        },
         // crate 起点の import を証明できない環境 (直下の宣言の証明は環境に依らない)。
         Case {
             name: "module-level macro elsewhere",
@@ -238,6 +294,27 @@ fn impact_rust_same_named_constants_keep_unproven_bindings() {
             )],
             kept: vec![("src/catalog.rs", catalog_lines.clone())],
             excluded: vec!["src/source.rs"],
+        },
+        // 取り込み先の crate では、import のパスの module 名が変更元の別名になり得る。
+        Case {
+            name: "module alias in a binary crate",
+            store: &params,
+            files: vec![(
+                "src/main.rs",
+                "mod store;\nuse crate::store as source;\n\nfn main() {}\n",
+            )],
+            kept: vec![("src/catalog.rs", catalog_lines.clone())],
+            excluded: vec!["src/source.rs"],
+        },
+        Case {
+            name: "module alias beside a disabled module",
+            store: &params,
+            files: vec![(
+                "src/lib.rs",
+                "pub mod catalog;\npub mod store;\n#[cfg(any())]\npub mod source;\npub use crate::store as source;\n",
+            )],
+            kept: vec![("src/catalog.rs", catalog_lines.clone())],
+            excluded: vec![],
         },
         Case {
             name: "derive name replaced by an import",

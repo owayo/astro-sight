@@ -151,7 +151,10 @@ pub(super) struct RustPathOwnerProjectProof {
     private_scope_sources: OnceLock<bool>,
     reexport_sources: OnceLock<bool>,
     safe_private_import_environment: OnceLock<bool>,
-    static_module_placement: OnceLock<bool>,
+    /// module の配置を変え得る構文が無いときの、関数の本体の外の `use` が束縛する名前。
+    static_module_bindings: OnceLock<Option<HashSet<String>>>,
+    /// プロジェクトの属性付きの `macro_rules!` の名前。走査できなければ `None`。
+    macro_definitions: OnceLock<Option<HashSet<String>>>,
     safe_macro_value_environment: OnceLock<bool>,
     no_source_inclusion: OnceLock<bool>,
     static_source_layout: OnceLock<Option<Vec<PathBuf>>>,
@@ -207,7 +210,8 @@ impl RustPathOwnerProjectProof {
             private_scope_sources: OnceLock::new(),
             reexport_sources: OnceLock::new(),
             safe_private_import_environment: OnceLock::new(),
-            static_module_placement: OnceLock::new(),
+            static_module_bindings: OnceLock::new(),
+            macro_definitions: OnceLock::new(),
             safe_macro_value_environment: OnceLock::new(),
             no_source_inclusion: OnceLock::new(),
             static_source_layout: OnceLock::new(),
@@ -474,10 +478,19 @@ impl RustPathOwnerProjectProof {
             .get_or_init(|| scan_safe_private_import_environment(&self.root))
     }
 
-    fn has_static_module_placement(&self) -> bool {
-        *self
-            .static_module_placement
+    fn static_module_bindings(&self) -> Option<&HashSet<String>> {
+        self.static_module_bindings
             .get_or_init(|| scan_static_module_placement(&self.root))
+            .as_ref()
+    }
+
+    /// プロジェクトのどこかの属性付きの `macro_rules!` (`#[macro_export]` など) が `name` を
+    /// 定義し得るか (走査できなければ真)。
+    pub(super) fn may_define_macro(&self, name: &str) -> bool {
+        self.macro_definitions
+            .get_or_init(|| scan_macro_definitions(&self.root))
+            .as_ref()
+            .is_none_or(|names| names.contains(name))
     }
 
     pub(super) fn allows_macro_value_bindings(&self) -> bool {
@@ -718,7 +731,9 @@ impl RustPathOwnerIndex {
     /// when an unsafe construct in another file prevents a project-wide proof.
     /// 関数の本体のマクロが参照ファイルを変更元の block の中へ取り込んでも、crate 起点の
     /// import はその名前空間で外側の宣言を隠す。import の先には、参照と同じ名前空間の
-    /// 無条件の宣言を求める (型だけの import は値の参照を外側へ素通しする)。
+    /// 無条件の宣言を求める (型だけの import は値の参照を外側へ素通しする)。取り込み先は
+    /// 別の crate のこともあるので、import のパスの module 名を `use` で別名に束縛する宣言が
+    /// プロジェクトのどこかにあれば証明しない (`use crate::store as source;` など)。
     #[allow(clippy::too_many_arguments)]
     pub(super) fn imports_other_private_owner(
         &self,
@@ -732,11 +747,13 @@ impl RustPathOwnerIndex {
     ) -> bool {
         if blake3::hash(ref_source) != self.source_hash
             || !project.private_scope_wiring_unchanged
-            || !project.has_static_module_placement()
             || source_can_retarget_private_scope(ref_source)
         {
             return false;
         }
+        let Some(module_bindings) = project.static_module_bindings() else {
+            return false;
+        };
         let Some(import) = self.direct_imports.get(name) else {
             return false;
         };
@@ -754,7 +771,12 @@ impl RustPathOwnerIndex {
             return false;
         }
         let target_modules = &import[1..import.len() - 1];
-        if ref_modules.starts_with(&source_modules) || target_modules.starts_with(&source_modules) {
+        if ref_modules.starts_with(&source_modules)
+            || target_modules.starts_with(&source_modules)
+            || target_modules
+                .iter()
+                .any(|segment| module_bindings.contains(segment))
+        {
             return false;
         }
         let Some(verified_ref) = private_module_file(dir, &ref_src, &ref_modules, true) else {
@@ -781,7 +803,7 @@ impl RustPathOwnerIndex {
         }
         let mut cursor = root.walk();
         root.named_children(&mut cursor).any(|child| {
-            declares_in_namespace(child, namespace)
+            declares_in_namespace(child, &target_source, namespace)
                 && child
                     .child_by_field_name("name")
                     .and_then(|node| node.utf8_text(&target_source).ok())
@@ -1288,10 +1310,17 @@ impl RustPathOwnerIndex {
 }
 
 fn root_use_names(declaration: Node<'_>, source: &[u8]) -> Option<Vec<String>> {
+    use_names(declaration, source, false)
+}
+
+/// `use` が束縛する名前 (別名を含む)。`skip_globs` なら名前を束縛しない glob を数えずに
+/// 続け、そうでなければ glob を解釈できない形として `None` を返す。
+fn use_names(declaration: Node<'_>, source: &[u8], skip_globs: bool) -> Option<Vec<String>> {
     let mut pending = vec![declaration.child_by_field_name("argument")?];
     let mut names = Vec::new();
     while let Some(node) = pending.pop() {
         match node.kind() {
+            "use_wildcard" if skip_globs => {}
             "use_list" => {
                 let mut cursor = node.walk();
                 pending.extend(
@@ -1792,11 +1821,13 @@ fn scan_safe_private_import_environment(root: &Path) -> bool {
 /// ことを確かめる。関数の本体のマクロは block の中の item しか作れず、crate 起点のパスの解決を
 /// 変えないので、名前を問わず許す。関数の本体の外のマクロ、未知の属性、`extern crate` は拒み、
 /// 標準の属性名 (`test`・std の derive) を import・マクロ定義・外部の glob で差し替えていない
-/// ことも確かめる (差し替えた derive は任意の item を作れる)。
-fn scan_static_module_placement(root: &Path) -> bool {
+/// ことも確かめる (差し替えた derive は任意の item を作れる)。配置を変えられないときは、関数の
+/// 本体の外の `use` が束縛する名前を返す (import のパスの module 名の別名を見つけるため)。
+fn scan_static_module_placement(root: &Path) -> Option<HashSet<String>> {
     let mut shadowable_names = HashSet::new();
     let mut defined_macros = HashSet::new();
     let mut imported_names = HashSet::new();
+    let mut module_bindings = HashSet::new();
     let mut external_glob = false;
     let placed = scan_safe_source_environment(root, |source| {
         // 属性とマクロは `#` か `!` を含む。`use` と `extern crate` は綴りで見つける。
@@ -1851,6 +1882,12 @@ fn scan_static_module_placement(root: &Path) -> bool {
                             .filter(|token| !token.is_empty())
                             .map(|token| token.strip_prefix("r#").unwrap_or(token).to_owned()),
                     );
+                    if !in_body {
+                        let Some(names) = use_names(node, source, true) else {
+                            return true;
+                        };
+                        module_bindings.extend(names);
+                    }
                 }
                 _ => {}
             }
@@ -1863,18 +1900,57 @@ fn scan_static_module_placement(root: &Path) -> bool {
         }
         false
     });
-    placed
+    (placed
         && shadowable_names.iter().all(|name| {
             !external_glob && !defined_macros.contains(name) && !imported_names.contains(name)
-        })
+        }))
+    .then_some(module_bindings)
+}
+
+/// 属性の付いた `macro_rules!` の名前をプロジェクト全体から集める。`#[macro_export]` の定義は
+/// crate root の名前を差し替え、どのファイルにあっても届く (`cfg_attr` などで付く場合も含めて、
+/// 属性があれば数える)。属性の無い定義は、定義した module とその後の子にしか見えず、参照
+/// ファイルの祖先にあれば祖先の環境が拾う。解析できないソースがあれば `None`。
+fn scan_macro_definitions(root: &Path) -> Option<HashSet<String>> {
+    let mut names = HashSet::new();
+    let scanned = scan_safe_source_environment(root, |source| {
+        if memchr::memmem::find(source, b"macro_rules").is_none() {
+            return false;
+        }
+        let Ok(tree) = parser::parse_source(source, LangId::Rust) else {
+            return true;
+        };
+        let root = tree.root_node();
+        if root.has_error() {
+            return true;
+        }
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            if node.kind() == "macro_definition" && has_attribute_prefix(node) {
+                let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(source).ok())
+                else {
+                    return true;
+                };
+                names.insert(name.strip_prefix("r#").unwrap_or(name).to_owned());
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+        false
+    });
+    scanned.then_some(names)
 }
 
 /// 直下の宣言が `namespace` の名前を持つか。単位 struct は値の名前も持つ。タプル struct の
-/// 値の名前 (コンストラクタ) はフィールドの可視性で外から見えなくなり得るので数えない。
-fn declares_in_namespace(node: Node<'_>, namespace: ImportNamespace) -> bool {
+/// 値の名前 (コンストラクタ) はフィールドより広くは見えないので、全フィールドが `pub` のときだけ数える。
+fn declares_in_namespace(node: Node<'_>, source: &[u8], namespace: ImportNamespace) -> bool {
     let value = match node.kind() {
         "function_item" | "const_item" | "static_item" => true,
-        "struct_item" => node.child_by_field_name("body").is_none(),
+        "struct_item" => node.child_by_field_name("body").is_none_or(|body| {
+            body.kind() == "ordered_field_declaration_list" && public_tuple_fields(body, source)
+        }),
         _ => false,
     };
     let type_name = matches!(
@@ -1885,6 +1961,29 @@ fn declares_in_namespace(node: Node<'_>, namespace: ImportNamespace) -> bool {
         ImportNamespace::Any => value || type_name,
         ImportNamespace::Value => value,
         ImportNamespace::Type => type_name,
+    }
+}
+
+/// タプル struct の全フィールドが `pub` か。各フィールドは `type` フィールドの子で終わる。
+fn public_tuple_fields(body: Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = body.walk();
+    if !cursor.goto_first_child() {
+        return false;
+    }
+    let mut public = false;
+    loop {
+        let child = cursor.node();
+        if cursor.field_name() == Some("type") {
+            if !public {
+                return false;
+            }
+            public = false;
+        } else if child.kind() == "visibility_modifier" {
+            public = child.utf8_text(source).is_ok_and(|text| text == "pub");
+        }
+        if !cursor.goto_next_sibling() {
+            return true;
+        }
     }
 }
 
@@ -2609,11 +2708,11 @@ fn transforming_scope_attribute(node: Node<'_>, source: &[u8]) -> bool {
 mod tests {
     use super::{
         FileEvidence, ImportNamespace, RustPathOwnerIndex, RustPathOwnerProjectProof,
-        declares_in_namespace, scan_ordinary_sources, scan_safe_private_import_environment,
-        scan_static_module_placement, source_can_retarget_modules,
-        source_can_retarget_private_scope, source_defines_allowed_macro,
-        source_has_external_child_module, source_has_include_macro, source_may_include_elsewhere,
-        unconditional_declaration,
+        declares_in_namespace, scan_macro_definitions, scan_ordinary_sources,
+        scan_safe_private_import_environment, scan_static_module_placement,
+        source_can_retarget_modules, source_can_retarget_private_scope,
+        source_defines_allowed_macro, source_has_external_child_module, source_has_include_macro,
+        source_may_include_elsewhere, unconditional_declaration,
     };
     use crate::engine::parser;
     use crate::language::LangId;
@@ -2631,9 +2730,12 @@ mod tests {
         .unwrap();
         std::fs::write(root.path().join("src/lib.rs"), "mod a;\nmod b;\n").unwrap();
         std::fs::write(root.path().join("src/a.rs"), "fn helper() {}\n").unwrap();
-        let body_macros = "pub fn row(id: i64) -> Vec<i64> { params![id] }\npub fn more() { thing!(); let f = || custom!(1); include!(\"a.rs\"); }\n#[derive(Clone, Debug)]\nstruct Plain;\n#[cfg(test)]\nmod tests { use super::*; #[test] fn works() { assert!(true); } }\n";
+        let body_macros = "use crate::a::{self as renamed, helper};\npub fn row(id: i64) -> Vec<i64> { params![id] }\npub fn more() { use crate::a as local; thing!(); let f = || custom!(1); include!(\"a.rs\"); }\n#[derive(Clone, Debug)]\nstruct Plain;\n#[cfg(test)]\nmod tests { use super::*; #[test] fn works() { assert!(true); } }\n";
         std::fs::write(root.path().join("src/b.rs"), body_macros).unwrap();
-        assert!(scan_static_module_placement(root.path()));
+        // 関数の本体の外の `use` が束縛する名前だけを返す (glob と関数の本体の `use` は数えない)。
+        let bindings = scan_static_module_placement(root.path()).unwrap();
+        assert!(bindings.contains("renamed") && bindings.contains("helper"));
+        assert!(!bindings.contains("local") && !bindings.contains("a"));
         // 従来の環境は関数の本体の標準でないマクロも拒む。
         assert!(!scan_safe_private_import_environment(root.path()));
 
@@ -2665,7 +2767,7 @@ mod tests {
         ] {
             std::fs::write(root.path().join(path), source).unwrap();
             assert!(
-                !scan_static_module_placement(root.path()),
+                scan_static_module_placement(root.path()).is_none(),
                 "{path}: {source}"
             );
             if path == "src/b.rs" {
@@ -2674,7 +2776,7 @@ mod tests {
                 std::fs::remove_file(root.path().join(path)).unwrap();
             }
         }
-        assert!(scan_static_module_placement(root.path()));
+        assert!(scan_static_module_placement(root.path()).is_some());
         // 入れ子の manifest の `path` と、祖先の Cargo プロジェクトは従来の環境と同じく拒む。
         std::fs::create_dir_all(root.path().join("other")).unwrap();
         std::fs::write(
@@ -2682,15 +2784,51 @@ mod tests {
             "[lib]\npath = \"a.rs\"\n",
         )
         .unwrap();
-        assert!(!scan_static_module_placement(root.path()));
+        assert!(scan_static_module_placement(root.path()).is_none());
         std::fs::remove_file(root.path().join("other/cargo.toml")).unwrap();
-        assert!(!scan_static_module_placement(&root.path().join("src")));
+        assert!(scan_static_module_placement(&root.path().join("src")).is_none());
+    }
+
+    /// `#[macro_export]` は crate root の名前を差し替えるので、属性の付いた定義を置き場所を
+    /// 問わず集める。属性の無い定義は定義した module の字句スコープにとどまる。
+    #[test]
+    fn macro_definitions_are_collected_from_every_source() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src/nested")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("src/lib.rs"), "mod store;\n").unwrap();
+        std::fs::write(
+            root.path().join("src/store.rs"),
+            "#[macro_export]\nmacro_rules! format { ($s:literal) => { 1 }; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("src/nested/deep.rs"),
+            "macro_rules! println { () => {} }\nfn f() {\n    #[cfg_attr(test, macro_export)]\n    /// doc\n    macro_rules! r#local { () => {} }\n}\n",
+        )
+        .unwrap();
+        let names = scan_macro_definitions(root.path()).unwrap();
+        assert!(
+            names.contains("format") && names.contains("local"),
+            "{names:?}"
+        );
+        assert!(!names.contains("println"), "{names:?}");
+        std::fs::write(
+            root.path().join("src/nested/deep.rs"),
+            "macro_rules! broken { (\n",
+        )
+        .unwrap();
+        assert!(scan_macro_definitions(root.path()).is_none());
     }
 
     /// import は宣言のある名前空間だけを束縛する。`cfg` などで消え得る宣言は束縛の根拠にしない。
     #[test]
     fn import_targets_need_an_unconditional_declaration_in_the_namespace() {
-        let source = b"pub const C: u8 = 1;\npub static S: u8 = 1;\npub fn f() {}\npub struct Unit;\npub struct Tuple(u8);\npub struct Named { x: u8 }\npub enum E { A }\npub union U { x: u8 }\npub type T = u8;\npub trait Tr {}\n#[cfg(feature = \"x\")]\npub const GATED: u8 = 1;\n#[test]\nfn tested() {}\n#[derive(Clone)]\n/// doc\npub struct Derived;\n#[inline]\npub fn inlined() {}\n#[custom]\npub fn custom() {}\n";
+        let source = b"pub const C: u8 = 1;\npub static S: u8 = 1;\npub fn f() {}\npub struct Unit;\npub struct Tuple(u8);\npub struct Open(pub u8, #[allow(unused)] pub u16);\npub struct Mixed(pub u8, pub(crate) u16);\npub struct Empty();\npub struct Named { x: u8 }\npub enum E { A }\npub union U { x: u8 }\npub type T = u8;\npub trait Tr {}\n#[cfg(feature = \"x\")]\npub const GATED: u8 = 1;\n#[test]\nfn tested() {}\n#[derive(Clone)]\n/// doc\npub struct Derived;\n#[inline]\npub fn inlined() {}\n#[custom]\npub fn custom() {}\n";
         let tree = parser::parse_source(source, LangId::Rust).unwrap();
         let root = tree.root_node();
         let mut cursor = root.walk();
@@ -2706,7 +2844,11 @@ mod tests {
             ("S", true, false),
             ("f", true, false),
             ("Unit", true, true),
+            // タプル struct のコンストラクタはフィールドより広くは見えない。
             ("Tuple", false, true),
+            ("Open", true, true),
+            ("Mixed", false, true),
+            ("Empty", true, true),
             ("Named", false, true),
             ("E", false, true),
             ("U", false, true),
@@ -2715,16 +2857,19 @@ mod tests {
         ] {
             let node = declarations[name];
             assert_eq!(
-                declares_in_namespace(node, ImportNamespace::Value),
+                declares_in_namespace(node, source, ImportNamespace::Value),
                 value,
                 "{name}"
             );
             assert_eq!(
-                declares_in_namespace(node, ImportNamespace::Type),
+                declares_in_namespace(node, source, ImportNamespace::Type),
                 type_name,
                 "{name}"
             );
-            assert!(declares_in_namespace(node, ImportNamespace::Any), "{name}");
+            assert!(
+                declares_in_namespace(node, source, ImportNamespace::Any),
+                "{name}"
+            );
             assert!(unconditional_declaration(node, source), "{name}");
         }
         for (name, unconditional) in [
