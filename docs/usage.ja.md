@@ -155,7 +155,7 @@ TypeScript の interface / abstract メソッドと Go の interface メソッ�
 {"symbol":"foo","refs":[],"skipped":{"generated":2,"paths":["gen/a.rs","gen/b.rs"]}}
 ```
 
-`symbols --dir` は NDJSON なので、同じ `skipped` object を持つ制御用のレコード（control record）を末尾に 1 行追加する。複数名の `refs --names` は「1 シンボル 1 レコード」の形のまま、共有の `skipped` を先頭レコードへ 1 回だけ追加する。session / MCP の batch 応答は、ルート配列の形のまま返す。
+`symbols --dir` は NDJSON なので、同じ `skipped` object を持つ制御用のレコード（control record）を末尾に 1 行追加する（生成ファイルの判定をできなかったときは `truncations` も載せる）。複数名の `refs --names` は「1 シンボル 1 レコード」の形のまま、共有の `skipped` を先頭レコードへ 1 回だけ追加する。session / MCP の batch 応答は、ルート配列の形のまま返す。
 
 除外せず走査する場合はグローバルオプション `--include-generated` を指定する。
 

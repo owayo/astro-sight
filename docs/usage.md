@@ -157,7 +157,7 @@ When at least one file is excluded, a machine-readable `skipped` always appears 
 {"symbol":"foo","refs":[],"skipped":{"generated":2,"paths":["gen/a.rs","gen/b.rs"]}}
 ```
 
-`symbols --dir` prints NDJSON, so it adds one control record with the same `skipped` object at the end. `refs --names` with several names keeps its "one record per symbol" form and adds the shared `skipped` once, to the first record. Batch responses of session / MCP keep their root array.
+`symbols --dir` prints NDJSON, so it adds one control record with the same `skipped` object at the end (with `truncations` too when the generated-file decision could not be applied). `refs --names` with several names keeps its "one record per symbol" form and adds the shared `skipped` once, to the first record. Batch responses of session / MCP keep their root array.
 
 To scan without the exclusion, pass the global option `--include-generated`.
 
