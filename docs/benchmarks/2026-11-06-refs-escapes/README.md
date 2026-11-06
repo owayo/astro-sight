@@ -65,7 +65,26 @@ python tools/bench-refs.py --suite escapes --mode session --repeats 9 `
 | rails `refs --name deep_transform_keys` | 9 | 677.2 [659.1–687.4] | 671.3 [655.1–701.1] | 0.9% | 29.4→29.3 |
 | `dead-code --dir .` | 5 | 5161.0 [5099.5–5207.2] | 5186.2 [5119.3–5398.2] | -0.5% | 1499.6→1498.3 |
 
-rails は印を持つファイルが少なく、`dead-code` は数千の名前をまとめて数えるためほぼ全ファイルが生のソースで一致し、どちらも差は変動の範囲内だった。生データは [repo-samples.csv](repo-samples.csv)。`dead-code` のピーク working set (約1.5 GiB) は変更前後で同じで、今回の変更とは別の課題として残る。
+rails は印を持つファイルが少なく、`dead-code` は数千の名前をまとめて数えるためほぼ全ファイルが生のソースで一致し、どちらも差は変動の範囲内だった。生データは [repo-samples.csv](repo-samples.csv)。`dead-code` のピーク working set (約1.5 GiB) は変更前後で同じで、要因は次の節に記す。
+
+## dead-code のピーク working set
+
+上の変更後の実行ファイルで、このリポジトリの `4a81a9d` の作業ツリーと rails を各1〜3回測った。
+
+| コマンド | 時間 (中央値) | ピーク working set |
+|---|---:|---:|
+| `dead-code --dir .` (rayon 既定の16スレッド) | 6.07 s | 1466.5 MiB |
+| `dead-code --dir .` (`RAYON_NUM_THREADS=4`) | 7.46 s | 1327.0 MiB |
+| `dead-code --dir .` (`RAYON_NUM_THREADS=1`) | 17.36 s | 644.9 MiB |
+| `dead-code --dir . --exclude-dir vendor` | 6.07 s | 1467.2 MiB |
+| `symbols --dir src --no-cache` | 0.55 s | 33.1 MiB |
+| `symbols --path vendor/tree-sitter-swift/src/parser.c --no-cache` | 5.17 s | 586.1 MiB |
+| `symbols --path vendor/tree-sitter-kotlin/src/parser.c --no-cache` | 5.12 s | 653.6 MiB |
+| rails `dead-code --dir .` (Ruby 3,481ファイル、50 MB) | 3.05 s | 103.4 MiB |
+
+`dhat-heap` feature のビルドでも同じ約1.5 GiB になり、dhat が数える Rust のヒープのピークは約1.2 MB だった。大半は tree-sitter (C) の構文木で、vendor の生成物 `parser.c` (6〜24 MB、`.gitattributes` で `linguist-generated`) の構文解析が時間とメモリを占める。refs の生成物の判定はファイル名と先頭 4 KB の印 (`@generated` など) だけを見て `.gitattributes` を見ないため、`refs` / `symbols --dir` / dead-code の参照の集計はこれらを解析する。dead-code は `--exclude-dir vendor` でも参照の集計で vendor を読む。
+
+対象から外すと、出現をそのまま返す `refs` と、生成物の参照も数える dead-code の出力の契約が変わるため、今回は変えない。生成物の判定をコマンド間でそろえるか、巨大なファイルの同時解析を抑えるかは、別に設計を決める課題として残す。
 
 ## 未解消の候補
 
@@ -73,3 +92,4 @@ rails は印を持つファイルが少なく、`dead-code` は数千の名前�
 
 - `impact --git` の Pass1 (変更10ファイルで約0.6秒) の記録がある内訳は、シグネチャ検出 143 ms・構文解析 88 ms・呼び出しの抽出 88 ms・シンボル抽出 60 ms で、単独で大きいボトルネックは見つからなかった
 - Pass2 の並列度 (`ASTRO_SIGHT_IMPACT_WORKERS`、既定1) を4・8に上げても明確な短縮は見られず、ピーク working set は 29→41 MiB に増えた (各5回)
+- テストの debug ビルドで依存だけを `opt-level=3` にしても、結合テスト8件の合計 (A: 77.5 / 70.5 s、B: 69.6 / 94.6 s) に一貫した差は無かった。全テスト (約55〜65分) の遅さは、並列に起動する git と astro-sight の子プロセスの競合が主で、同じテストは単独なら4〜15秒で終わる
