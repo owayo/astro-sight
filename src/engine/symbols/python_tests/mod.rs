@@ -8,8 +8,10 @@
 //! 基底 (`__mro__`) の名前空間から `test` で始まるメソッドと入れ子のクラスを同じ規則で集め、
 //! xunit 形式の準備と後始末 (`setup_method` など) と `pytest_generate_tests` を名前で呼ぶ。
 //! unittest (と pytest の unittest 対応) は `unittest.TestCase` の派生クラスを集め、自身と基底の
-//! `test` で始まるメソッドを集めて、`setUp` などを MRO で呼ぶ。呼び出し側に名前が現れないので、
-//! 参照を数えるだけでは dead と誤報する。
+//! `test` で始まるメソッドを集めて、`setUp` などを MRO で呼ぶ。pytest の unittest 対応
+//! (`UnitTestCase`) は、テストモジュールの名前空間 (と集めたクラスの本体) に束縛した TestCase の
+//! 派生を名前に依らず集め、xunit 形式の準備と後始末 (`setup_method` など 4 つ) も呼ぶ。呼び出し側に
+//! 名前が現れないので、参照を数えるだけでは dead と誤報する。
 //!
 //! 事実はファイルごとに [`PythonModuleFacts`] へ集め、判定は [`collect`] の 1 つの実装で行う。
 //! 基底や束縛の名前をクラスへ解決する [`Universe`] だけを差し替える。ファイル単位の判定
@@ -81,6 +83,16 @@ const UNITTEST_CLASS_HOOKS: &[&str] = &[
     "addAsyncCleanup",
 ];
 
+/// pytest の unittest 対応 (`UnitTestCase`) が、`TestCase` の派生クラス (と、その基底) に書くと
+/// unittest の準備・後始末に加えて名前で呼ぶ xunit 形式のメソッド。`pytest_generate_tests` は
+/// 呼ばない (`UnitTestCase` は通常の pytest のクラスの収集を通らない)。
+const PYTEST_UNITTEST_HOOKS: &[&str] = &[
+    "setup_method",
+    "teardown_method",
+    "setup_class",
+    "teardown_class",
+];
+
 /// 名前がプロジェクトのクラスに解決できないときに、unittest の TestCase とみなす基底の書き方
 /// (`from django.test import TestCase` のような第三者の TestCase の派生を含む)。
 const UNITTEST_ROOT_BASES: &[&str] = &[
@@ -98,6 +110,11 @@ const UNITTEST_ROOT_NAMES: &[&str] = &["TestCase", "IsolatedAsyncioTestCase"];
 enum Runner {
     Pytest,
     Unittest,
+    /// pytest が、テストモジュールの名前空間 (と集めたクラスの本体) に束縛された `TestCase` の
+    /// 派生を、名前と印に依らず `UnitTestCase` として集めたもの。unittest の規則で歩き、xunit 形式の
+    /// 準備・後始末も呼ぶ。入れ子のクラスや別名は調べない (`UnitTestCase` はメソッドの名前だけを
+    /// 見る)。
+    PytestUnittest,
 }
 
 impl Runner {
@@ -107,6 +124,9 @@ impl Runner {
             || match self {
                 Self::Pytest => PYTEST_CLASS_HOOKS.contains(&name),
                 Self::Unittest => UNITTEST_CLASS_HOOKS.contains(&name),
+                Self::PytestUnittest => {
+                    UNITTEST_CLASS_HOOKS.contains(&name) || PYTEST_UNITTEST_HOOKS.contains(&name)
+                }
             }
     }
 }
@@ -411,6 +431,8 @@ fn collect(universe: &impl Universe) -> Collected {
         bases: &bases,
         markers: &markers,
         unknown_markers: &unknown_markers,
+        testcase: &testcase,
+        unknown: &unknown,
         collected: Collected::default(),
         walked: HashMap::new(),
         examined: HashMap::new(),
@@ -419,6 +441,7 @@ fn collect(universe: &impl Universe) -> Collected {
         aliased: Vec::new(),
         markers_held: false,
         tests_held: false,
+        testcases_held: false,
     };
     let (members, classes) = universe.unobserved();
     walker.collected.any_member_uncertain |= members;
@@ -487,6 +510,10 @@ struct Walker<'w, U: Universe, G: Fn(ClassId) -> usize> {
     bases: &'w [ClassBases],
     markers: &'w [bool],
     unknown_markers: &'w [bool],
+    /// TestCase の派生 (確かめられた経路で root に届く)。
+    testcase: &'w [bool],
+    /// TestCase の派生か分からない。
+    unknown: &'w [bool],
     collected: Collected,
     /// (クラス, テストランナー) → 歩いたときの一番強い確かさ。
     walked: HashMap<(usize, Runner), Certainty>,
@@ -502,6 +529,8 @@ struct Walker<'w, U: Universe, G: Fn(ClassId) -> usize> {
     markers_held: bool,
     /// テストを持ちうるクラスを、どれも集めうるとした。
     tests_held: bool,
+    /// TestCase の派生 (か、そうかもしれないクラス) を、どれも `UnitTestCase` として集めうるとした。
+    testcases_held: bool,
 }
 
 impl<'w, U: Universe, G: Fn(ClassId) -> usize> Walker<'w, U, G> {
@@ -564,16 +593,47 @@ impl<'w, U: Universe, G: Fn(ClassId) -> usize> Walker<'w, U, G> {
                 self.collected.any_member_uncertain = true;
                 self.hold_tests();
             } else {
-                // `Test*` でない名前なら、`__test__ = True` と分かっているクラスだけを集めうる。
+                // `Test*` でない名前なら、`__test__ = True` と分かっているクラスと、名前に依らず
+                // 集める TestCase の派生 (か、そうかもしれないクラス) だけを集めうる。
                 self.hold_markers();
+                self.hold_testcases();
             }
         }
         for &(id, confirmed) in &resolution.classes {
             let index = (self.global)(id);
+            if self.testcase[index] {
+                // TestCase の派生は、名前と印に依らず `UnitTestCase` として集める。
+                self.collect_unittest(index, certainty.through(confirmed));
+                continue;
+            }
             if name.starts_with("Test") || self.markers[index] {
                 self.aliased.push((index, certainty.through(confirmed)));
             } else if self.unknown_markers[index] {
                 self.aliased.push((index, Certainty::Uncertain));
+            }
+            if self.unknown[index] {
+                self.collect_unittest(index, Certainty::Uncertain);
+            }
+        }
+    }
+
+    /// pytest が `UnitTestCase` として集めるクラス (名前空間に束縛された TestCase の派生) の定義を
+    /// 記録し、unittest の規則と xunit 形式の準備・後始末で歩く。`UnitTestCase` は通常の pytest の
+    /// クラスの `__init__` / `__new__` による除外を通らない。
+    fn collect_unittest(&mut self, index: usize, certainty: Certainty) {
+        self.define(index, certainty);
+        self.to_walk
+            .push((index, Runner::PytestUnittest, certainty));
+    }
+
+    /// TestCase の派生 (か、そうかもしれないクラス) を、どれも `UnitTestCase` として集めうるとする。
+    fn hold_testcases(&mut self) {
+        if std::mem::replace(&mut self.testcases_held, true) {
+            return;
+        }
+        for index in 0..self.ids.len() {
+            if self.testcase[index] || self.unknown[index] {
+                self.collect_unittest(index, Certainty::Uncertain);
             }
         }
     }
@@ -629,6 +689,14 @@ impl<'w, U: Universe, G: Fn(ClassId) -> usize> Walker<'w, U, G> {
                     continue;
                 }
                 self.examined.insert(index, certainty);
+                if self.testcase[index] {
+                    // TestCase の派生は、名前と印に依らず `UnitTestCase` として集める。
+                    self.collect_unittest(index, certainty);
+                    continue;
+                }
+                if self.unknown[index] {
+                    self.collect_unittest(index, Certainty::Uncertain);
+                }
                 let (module, class) = self.ids[index];
                 let facts = self.universe.facts(module);
                 if facts.skipped_by_constructor(class) {
