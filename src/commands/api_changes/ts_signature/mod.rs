@@ -548,7 +548,8 @@ fn ts_param_pair_added_required_prop_names(
 
 /// old object_type の全メンバーが new にテキスト一致で残り、new の追加メンバーがすべて
 /// 必須 (`?` なし) の property_signature なら、その名前一覧を返す。
-/// メンバー削除・変更、optional 追加の混在は None。
+/// メンバー削除・変更、optional 追加の混在は None。メンバーの間と中の通常のコメントは
+/// 比べない ([`object_type_members`])。
 fn ts_object_type_added_required_members(
     old_ty: tree_sitter::Node<'_>,
     old_source: &[u8],
@@ -557,16 +558,10 @@ fn ts_object_type_added_required_members(
 ) -> Option<Vec<String>> {
     use std::collections::HashMap;
     let mut new_members: HashMap<SigTokens, Vec<tree_sitter::Node>> = HashMap::new();
-    let mut cursor = new_ty.walk();
-    for member in new_ty.named_children(&mut cursor) {
-        new_members
-            .entry(node_signature_tokens(member, new_source)?)
-            .or_default()
-            .push(member);
+    for (tokens, member) in object_type_members(new_ty, new_source)? {
+        new_members.entry(tokens).or_default().push(member);
     }
-    let mut cursor = old_ty.walk();
-    for member in old_ty.named_children(&mut cursor) {
-        let text = node_signature_tokens(member, old_source)?;
+    for (text, _) in object_type_members(old_ty, old_source)? {
         match new_members.get_mut(&text) {
             Some(nodes) if !nodes.is_empty() => {
                 nodes.pop();
@@ -864,7 +859,8 @@ fn ts_param_object_type(param: tree_sitter::Node<'_>) -> Option<tree_sitter::Nod
 }
 
 /// old object_type の全メンバーが new にテキスト一致で残り、new の追加メンバーがすべて
-/// optional (`?`) の property_signature なら true。メンバー削除・変更は false。
+/// optional (`?`) の property_signature なら true。メンバー削除・変更は false。メンバーの間と
+/// 中の通常のコメントは比べない ([`object_type_members`])。
 fn ts_object_type_members_optional_superset(
     old_ty: tree_sitter::Node<'_>,
     old_source: &[u8],
@@ -872,20 +868,18 @@ fn ts_object_type_members_optional_superset(
     new_source: &[u8],
 ) -> bool {
     use std::collections::HashMap;
+    let (Some(new), Some(old)) = (
+        object_type_members(new_ty, new_source),
+        object_type_members(old_ty, old_source),
+    ) else {
+        return false;
+    };
     // signature tokens -> 出現ノード列 (同一テキストの重複は TS エラーだが multiset で保守)
     let mut new_members: HashMap<SigTokens, Vec<tree_sitter::Node>> = HashMap::new();
-    let mut cursor = new_ty.walk();
-    for member in new_ty.named_children(&mut cursor) {
-        let Some(text) = node_signature_tokens(member, new_source) else {
-            return false;
-        };
+    for (text, member) in new {
         new_members.entry(text).or_default().push(member);
     }
-    let mut cursor = old_ty.walk();
-    for member in old_ty.named_children(&mut cursor) {
-        let Some(text) = node_signature_tokens(member, old_source) else {
-            return false;
-        };
+    for (text, _) in old {
         // 既存メンバーは new 側で 1 つ消費できなければ削除/変更あり → 不成立
         match new_members.get_mut(&text) {
             Some(nodes) if !nodes.is_empty() => {
@@ -898,6 +892,34 @@ fn ts_object_type_members_optional_superset(
     new_members.values().flatten().all(|member| {
         member.kind() == "property_signature" && ts_property_signature_is_optional(*member)
     })
+}
+
+/// 型リテラルのメンバーと、比べるトークン。説明のコメントは型を変えないので、メンバーの間の
+/// コメントは飛ばし、メンバーの中のコメントのトークンも除く (interface の宣言の比較と同じ規約)。
+/// `stripInternal` で宣言の出力からメンバーを外す `@internal` と、型検査の診断を変える `@ts-` の
+/// 指示 (`@ts-ignore`・`@ts-expect-error` など) は、どこにあっても None (コメントを除いて比べると
+/// その付け外しを見落とす)。解析できないメンバーも None。
+fn object_type_members<'a>(
+    ty: tree_sitter::Node<'a>,
+    source: &[u8],
+) -> Option<Vec<(SigTokens, tree_sitter::Node<'a>)>> {
+    if crate::engine::tree_walk::any_node(ty, crate::engine::tree_walk::Children::Named, |node| {
+        node.kind() == "comment"
+            && node
+                .utf8_text(source)
+                .is_ok_and(|text| text.contains("@internal") || text.contains("@ts-"))
+    }) {
+        return None;
+    }
+    let mut cursor = ty.walk();
+    ty.named_children(&mut cursor)
+        .filter(|member| member.kind() != "comment")
+        .map(|member| {
+            let mut tokens = node_signature_tokens(member, source)?;
+            tokens.0.retain(|(kind, _)| kind != "comment");
+            Some((tokens, member))
+        })
+        .collect()
 }
 
 /// property_signature が optional (`?` トークン付き) か。`?` は named child に現れない

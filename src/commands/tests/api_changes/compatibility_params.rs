@@ -1914,3 +1914,127 @@ export const PLAIN: string[] = [\n  // 説明を書き直した\n  \"y\",\n];\n"
         "通常コメントのみ変更した PLAIN は API 変更に出すべきでない: modified={modified:?} demoted={demoted:?}"
     );
 }
+
+/// base の `files` をコミットし、作業ツリーへ `changes` を書いてから、`name` の API 差分の区分を
+/// 返す (どこにも無ければ "none")。
+fn bucket_after(files: &[(&str, &str)], changes: &[(&str, &str)], name: &str) -> &'static str {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(repo, files, "base");
+    for (path, content) in changes {
+        fs::write(repo.join(path), content).expect("write");
+    }
+    let api = detect_api_changes_from_worktree(repo);
+    if api.modified.iter().any(|c| c.name == name) {
+        "mod"
+    } else if api.modified_closed_in_diff.iter().any(|c| c.name == name) {
+        "mod_closed"
+    } else if api
+        .compatible_modified
+        .iter()
+        .any(|c| c.name == name && c.reason == "optional_object_props")
+    {
+        "mod_compat"
+    } else {
+        "none"
+    }
+}
+
+const PRICE_PACKAGE: &str = "{ \"name\": \"repro\", \"private\": true, \"type\": \"module\", \"dependencies\": { \"react\": \"19.0.0\" }, \"devDependencies\": { \"@types/react\": \"19.0.0\" } }\n";
+const PRICE_OLD: &str =
+    "export function Price({ amount }: { amount: number }) {\n\treturn <span>{amount}</span>;\n}\n";
+const PRICE_CART: &str = "import { Price } from \"./price\";\n\nexport function Cart() {\n\treturn <Price amount={1200} />;\n}\n";
+
+/// 関数部品の props の型リテラルに足した省略可能なプロパティの前のコメント (JSDoc・行コメント・
+/// メンバーの中のコメント) は型を変えないので、コメントが無いときと同じく
+/// `optional_object_props` の互換 (Issue #265)。既存のメンバーのコメントだけの変更も互換。
+/// 宣言の出力を変える `@internal` と、診断を変える `@ts-` の指示が付けば従来どおり blocking
+/// (対照)。
+#[test]
+fn ts_optional_object_prop_comments_keep_compatibility() {
+    let added = |comment: &str, member: &str| {
+        format!(
+            "export function Price({{\n\tamount,\n\tcurrency = \"JPY\",\n}}: {{\n\tamount: number;\n{comment}\t{member};\n}}) {{\n\treturn (\n\t\t<span>\n\t\t\t{{amount}} {{currency}}\n\t\t</span>\n\t);\n}}\n"
+        )
+    };
+    for (price_new, expected) in [
+        (added("", "currency?: string"), "mod_compat"),
+        (
+            added("\t/** ISO 4217 currency code */\n", "currency?: string"),
+            "mod_compat",
+        ),
+        (
+            added("\t// ISO 4217 currency code\n", "currency?: string"),
+            "mod_compat",
+        ),
+        (
+            added("", "currency /* ISO 4217 */ ?: string"),
+            "mod_compat",
+        ),
+        (
+            "export function Price({ amount }: {\n\t/** price in yen */\n\tamount: number;\n}) {\n\treturn <span>{amount}</span>;\n}\n".to_string(),
+            "mod_compat",
+        ),
+        (
+            added("\t/** @internal */\n", "currency?: string"),
+            "mod",
+        ),
+        (
+            added("\t// @ts-expect-error\n", "currency?: string"),
+            "mod",
+        ),
+    ] {
+        assert_eq!(
+            bucket_after(
+                &[
+                    ("package.json", PRICE_PACKAGE),
+                    ("tsconfig.json", "{ \"compilerOptions\": { \"jsx\": \"react-jsx\" } }\n"),
+                    ("src/price.tsx", PRICE_OLD),
+                    ("src/cart.tsx", PRICE_CART),
+                ],
+                &[("src/price.tsx", &price_new)],
+                "Price",
+            ),
+            expected,
+            "{price_new}"
+        );
+    }
+}
+
+/// 必須プロパティの追加の証明 (呼び出し側の共有 const を同じ差分で直した) も、足した
+/// プロパティの前のコメントを数えない。`@internal` が付けば証明しない (対照)。
+#[test]
+fn ts_required_object_prop_comment_keeps_shared_const_closure() {
+    let build = |comment: &str| {
+        format!(
+            "export function buildSql(deps: {{\n\tevents: string;\n\tusers: string;\n{comment}\tgroups: string;\n}}): string {{\n\treturn `${{deps.events}}:${{deps.users}}:${{deps.groups}}`;\n}}\n"
+        )
+    };
+    let caller_after = "import { buildSql } from \"./build\";\n\nconst SHARED_DEPS = {\n\tevents: \"e\",\n\tusers: \"u\",\n\tgroups: \"g\",\n};\n\nexport function run(): string {\n\treturn buildSql(SHARED_DEPS);\n}\n";
+    for (comment, expected) in [
+        ("", "mod_closed"),
+        ("\t/** grouping key */\n", "mod_closed"),
+        ("\t/** @internal */\n", "mod"),
+    ] {
+        let build_new = build(comment);
+        assert_eq!(
+            bucket_after(
+                &[
+                    (
+                        "src/build.ts",
+                        "export function buildSql(deps: {\n\tevents: string;\n\tusers: string;\n}): string {\n\treturn `${deps.events}:${deps.users}`;\n}\n",
+                    ),
+                    ("src/build.test.ts", TS_SHARED_CONST_CALLER_BEFORE),
+                ],
+                &[
+                    ("src/build.ts", &build_new),
+                    ("src/build.test.ts", caller_after)
+                ],
+                "buildSql",
+            ),
+            expected,
+            "{build_new}"
+        );
+    }
+}
