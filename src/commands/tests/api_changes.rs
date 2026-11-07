@@ -22,4 +22,5 @@ mod rust_reexport;
 mod rust_reference_sites;
 mod rust_struct_fields;
 mod rust_type_alias;
+mod ts_declaration_imports;
 mod typescript;

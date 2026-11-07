@@ -73,10 +73,19 @@ impl JsExportOriginCache {
     /// `ref_path` のファイルにある相対でない指定子を、`dir` の tsconfig / jsconfig と
     /// package.json で解く。解決器は最初に使うときに作る。
     fn resolve_alias(&mut self, dir: &str, ref_path: &str, spec: &str) -> AliasResolution {
+        self.resolver(dir).resolve(ref_path, spec)
+    }
+
+    /// 相対の指定子を [`relative_import_candidates`] で網羅できるか (どの設定も
+    /// `moduleSuffixes`・`rootDirs` で相対の探索を変えない)。
+    pub(crate) fn relative_resolution_unchanged(&mut self, dir: &str) -> bool {
+        self.resolver(dir).relative_resolution_unchanged()
+    }
+
+    fn resolver(&mut self, dir: &str) -> &mut TsAliasResolver {
         let removed_files = &self.removed_files;
         self.aliases
             .get_or_insert_with(|| TsAliasResolver::load(dir, removed_files.clone()))
-            .resolve(ref_path, spec)
     }
 }
 
@@ -251,6 +260,18 @@ impl SiteContext<'_> {
             return JsRefSite::Unproven;
         };
         let candidates = match relative_import_candidates(self.ref_path, spec) {
+            // 設定 (`moduleSuffixes`・`rootDirs`) やディレクトリの package.json (`types`・
+            // `typesVersions`) が探索を変えると、候補で網羅できない。
+            Some(_)
+                if !cache.relative_resolution_unchanged(self.dir)
+                    || super::removed_attribution::relative_directory_has_manifest(
+                        self.dir,
+                        self.ref_path,
+                        spec,
+                    ) =>
+            {
+                return JsRefSite::Unproven;
+            }
             Some(candidates) => Rc::new(candidates),
             // 相対でない指定子は、tsconfig / jsconfig の paths・baseUrl を先に解き、ローカルに
             // 解かれなければ package.json の依存を見る。依存の名前でも別名で差し替わり得るので、
@@ -481,7 +502,14 @@ fn module_export_proven(
         .named_children(&mut cursor)
         .filter(|node| node.kind() == "export_statement")
     {
-        match export_statement_origin(statement, &source, root, export_name, symbol) {
+        match export_statement_origin(
+            statement,
+            &source,
+            root,
+            export_name,
+            symbol,
+            super::ts_module_paths::is_declaration_path(module_path),
+        ) {
             Some(true) => found = true,
             Some(false) => return false,
             None => {}
@@ -498,6 +526,7 @@ fn export_statement_origin(
     root: Node<'_>,
     export_name: &str,
     symbol: &str,
+    declaration_file: bool,
 ) -> Option<bool> {
     let text = |node: Node<'_>| node.utf8_text(source).ok();
     let mut tokens = statement.walk();
@@ -505,11 +534,15 @@ fn export_statement_origin(
         .children(&mut tokens)
         .any(|child| child.kind() == "default");
     if let Some(declaration) = statement.child_by_field_name("declaration") {
+        let declaration = declared_in_file(declaration, declaration_file).unwrap_or(declaration);
         if is_default {
             return (export_name == "default").then(|| ordinary_declaration(declaration));
         }
-        return declaration_exports(declaration, source, export_name)
-            .then(|| ordinary_declaration(declaration) || independent_lexical(declaration));
+        return declaration_exports(declaration, source, export_name).then(|| {
+            ordinary_declaration(declaration)
+                || independent_lexical(declaration)
+                || (declaration_file && declares_in_declaration_file(declaration))
+        });
     }
     if is_default {
         if export_name != "default" {
@@ -517,7 +550,9 @@ fn export_statement_origin(
         }
         let value = statement.child_by_field_name("value")?;
         return Some(if value.kind() == "identifier" {
-            text(value).is_some_and(|name| top_level_binding_proven(root, source, name, symbol))
+            text(value).is_some_and(|name| {
+                top_level_binding_proven(root, source, name, symbol, declaration_file)
+            })
         } else {
             independent_value(value) || value.kind() == "object"
         });
@@ -547,7 +582,7 @@ fn export_statement_origin(
                 // 別の名前の転送は検査されないので証明しない。
                 name == symbol && alias.is_none_or(|alias| alias == name)
             } else {
-                top_level_binding_proven(root, source, name, symbol)
+                top_level_binding_proven(root, source, name, symbol, declaration_file)
             };
             result = Some(result.unwrap_or(true) && proven);
         }
@@ -580,6 +615,25 @@ fn declaration_exports(declaration: Node<'_>, source: &[u8], export_name: &str) 
             });
     }
     false
+}
+
+/// 宣言ファイルの `declare` の宣言 (`export declare class Name {}`) の中の宣言。宣言ファイルでは
+/// `declare` が普通の書き方で、そのファイルの宣言を表す。namespace と `global` は含めない。
+fn declared_in_file(node: Node<'_>, declaration_file: bool) -> Option<Node<'_>> {
+    if !declaration_file || node.kind() != "ambient_declaration" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| ordinary_declaration(*child) || declares_in_declaration_file(*child))
+}
+
+/// 宣言ファイルの中の、初期化子の無い宣言 (`declare const name: T`・`declare function name()`)。
+fn declares_in_declaration_file(declaration: Node<'_>) -> bool {
+    matches!(
+        declaration.kind(),
+        "lexical_declaration" | "variable_declaration" | "function_signature"
+    )
 }
 
 /// 実体を同じファイルに持つ通常の宣言 (`declare` だけの宣言や namespace は含めない)。
@@ -623,7 +677,13 @@ fn independent_lexical(declaration: Node<'_>) -> bool {
 /// モジュール直下の束縛 `name` が、同じファイルの通常の宣言か独立した初期化子の const か。
 /// `name` が削除シンボルと同じ名前で import されている場合は、その import の出現が別に
 /// 検査されるので由来の分かる転送とみなす。
-fn top_level_binding_proven(root: Node<'_>, source: &[u8], name: &str, symbol: &str) -> bool {
+fn top_level_binding_proven(
+    root: Node<'_>,
+    source: &[u8],
+    name: &str,
+    symbol: &str,
+    declaration_file: bool,
+) -> bool {
     let mut found = None;
     let mut cursor = root.walk();
     for statement in root.named_children(&mut cursor) {
@@ -651,6 +711,16 @@ fn top_level_binding_proven(root: Node<'_>, source: &[u8], name: &str, symbol: &
             "import_statement" => local_import_binding(node, source, name).map(|imported| {
                 name == symbol && imported == ImportedName::Named(symbol.to_string())
             }),
+            "ambient_declaration"
+                if declared_in_file(node, declaration_file).is_some_and(|inner| {
+                    inner
+                        .child_by_field_name("name")
+                        .is_some_and(|n| n.utf8_text(source).ok() == Some(name))
+                        || declaration_exports(inner, source, name)
+                }) =>
+            {
+                Some(true)
+            }
             "ambient_declaration" | "expression_statement" => {
                 // `declare function name` や `namespace name {}` は由来を確かめない。
                 let mut inner = node.walk();
