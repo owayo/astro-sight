@@ -22,7 +22,7 @@ pub(super) fn unwrap_parentheses(mut value: Node<'_>) -> Option<Node<'_>> {
     Some(value)
 }
 
-fn ts_site_languages(
+pub(super) fn ts_site_languages(
     site: &CompatibleModSite<'_>,
 ) -> Option<(crate::language::LangId, crate::language::LangId)> {
     let old = crate::language::LangId::from_path(camino::Utf8Path::new(site.old_path)).ok()?;

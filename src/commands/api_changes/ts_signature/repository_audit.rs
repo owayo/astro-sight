@@ -16,9 +16,11 @@ use std::path::{Path, PathBuf};
 
 use tree_sitter::Node;
 
-use super::outside::{OutsideScan, parse_outside};
+use super::outside::{
+    OutsideScan, audit_sources, checks_specifiers, parse_outside, reaches_outside,
+};
 use super::removed_params::{RemovalInventory, escaped_identifier};
-use super::source_scan::{Budget, Needle, Needles, scan_file};
+use super::source_scan::{Budget, Needle, Needles, ScanLimits, scan_file};
 use crate::commands::api_changes::ref_index::contains_js_word;
 use crate::commands::api_changes::ts_const_arg::collect_bindings_named;
 pub(super) use crate::commands::api_changes::ts_module_paths::normalize_lexically;
@@ -46,6 +48,26 @@ const REACT_RUNTIME: [&str; 3] = ["react", "react/jsx-runtime", "react/jsx-dev-r
 const REFERENCE_EXTENSIONS: [&str; 3] = [".ts", ".tsx", ".d.ts"];
 /// JS / TS を埋め込むソースの拡張子。
 const EMBEDDED_EXTENSIONS: [&str; 4] = ["vue", "svelte", "astro", "mdx"];
+/// React の環境の全体の監査 ([`ReactEnvironment`]) の上限。依存の指定子を確かめるため、TS の
+/// ソースはほぼ全部を解析する (構文木は 1 ファイルずつ捨てる)。
+const REACT_ENVIRONMENT_LIMITS: ScanLimits = ScanLimits {
+    stream_bytes: ScanLimits::DEFAULT.stream_bytes,
+    parse_bytes: 512 * 1024 * 1024,
+};
+/// 入る依存の版と解決先を決める、設定と package.json のほかのファイル (ロックファイル、
+/// Yarn の PnP、lerna のワークスペースの定義)。
+const DEPENDENCY_STATE_NAMES: [&str; 10] = [
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "bun.lockb",
+    ".yarnrc",
+    ".pnp.cjs",
+    ".pnp.loader.mjs",
+    "lerna.json",
+];
 
 /// 解析するディレクトリを、node_modules と .git の中を除き、ignore の指定に関係なく走査した結果。
 pub(super) struct RepositoryFiles {
@@ -117,7 +139,7 @@ fn file_role(name: &str) -> Option<FileRole> {
 
 /// 拡張子が TS / JS 系なら `Some(Some(言語))`、埋め込みのソースなら `Some(None)`。ほかの言語の
 /// ソースは TS の型検査に関わらないので None。
-fn source_language(name: &str) -> Option<Option<LangId>> {
+pub(super) fn source_language(name: &str) -> Option<Option<LangId>> {
     let extension = Path::new(name).extension()?.to_str()?;
     if EMBEDDED_EXTENSIONS
         .iter()
@@ -247,6 +269,12 @@ pub(super) struct Settings {
     /// 設定と依存が、JSX の型環境と runtime の解決先を差し替えていないか。
     jsx_standard: bool,
     pub(super) packages: PackageBoundary,
+    /// 読んだ tsconfig / jsconfig (`extends`・`references` の先と祖先の設定を含む。正規化した
+    /// パス)。
+    config_files: BTreeSet<PathBuf>,
+    /// どれかの設定が `allowJs`・`checkJs` を有効にした (JS 系のファイルも TypeScript の
+    /// プログラムに入る)。
+    pub(super) allow_js: bool,
 }
 
 impl Settings {
@@ -294,8 +322,14 @@ impl Settings {
                 }
             }
         }
+        configs.expand_deferred_bases()?;
+        let mappings_resolved = configs.resolve_mapping_uses();
         let packages = PackageBoundary::load(files, &configs)?;
         let jsx_standard = configs.standard
+            && mappings_resolved
+            && configs.mappings_stay_inside()
+            && configs.deferred_stay_inside()
+            && packages.entries_stay_inside()
             && packages.standard_react()
             && configs
                 .types
@@ -304,6 +338,8 @@ impl Settings {
         Some(Self {
             jsx_standard,
             packages,
+            config_files: configs.checked,
+            allow_js: configs.allow_js,
         })
     }
 }
@@ -360,7 +396,19 @@ impl RepositoryAudit {
         let settings = settings?;
         let mut jsx_standard = settings.jsx_standard && outside_standard?;
         for (path, source, tree_root, _) in base.parsed() {
-            jsx_standard &= audit_source(&files.root, path, source, tree_root, &settings.packages)?;
+            let name = path.rsplit('/').next().unwrap_or(path);
+            let lang = source_language(name).flatten();
+            let specifiers = lang.is_some_and(|lang| checks_specifiers(lang, settings.allow_js));
+            jsx_standard &= audit_source(&files.root, path, source, tree_root, &settings.packages)?
+                && !(specifiers
+                    && reaches_outside(
+                        &files.root,
+                        path,
+                        tree_root,
+                        source,
+                        lang == Some(LangId::Javascript),
+                        &|specifier| settings.packages.bare_reaches_outside(specifier),
+                    ));
         }
         Some(Self {
             jsx_standard,
@@ -392,6 +440,102 @@ impl RepositoryAudit {
     }
 }
 
+/// React の `memo()` で包んだ関数部品の証明 (Issue #266) が頼る、解析するディレクトリの全体の
+/// 監査。在庫を作らずに全ての TS / JS 系のソースを流して読み、監査の印があるものだけを解析する
+/// ので、ファイル数に上限を掛けない (読む量と解析する量にだけ上限がある)。設定・依存・ソースが
+/// `react` の解決先と React・JSX の型を差し替えていないこと ([`RepositoryAudit`] の `jsx_standard`
+/// と同じ条件) を確かめる。
+pub(super) struct ReactEnvironment {
+    root: PathBuf,
+    packages: PackageBoundary,
+    config_files: BTreeSet<PathBuf>,
+    allow_js: bool,
+}
+
+impl ReactEnvironment {
+    /// 差し替えが無ければ Some。先を監査できない symlink、読めない設定・package.json、解析できない
+    /// ソースがあるとき、読む量か解析する量の上限を超えるときも None。
+    pub(super) fn load(dir: &str) -> Option<Self> {
+        let mut files = RepositoryFiles::walk(dir, &HashSet::new())?;
+        if files.symlinked {
+            return None;
+        }
+        let settings = Settings::load(&files)?;
+        if !settings.jsx_standard {
+            return None;
+        }
+        let sources = std::mem::take(&mut files.outside);
+        let budget = Budget::new(REACT_ENVIRONMENT_LIMITS);
+        if !audit_sources(
+            &files.root,
+            &sources,
+            &settings.packages,
+            settings.allow_js,
+            &budget,
+        )? {
+            return None;
+        }
+        Some(Self {
+            root: files.root,
+            packages: settings.packages,
+            config_files: settings.config_files,
+            allow_js: settings.allow_js,
+        })
+    }
+
+    /// `relative` (`dir` 相対、`/` 区切り) の名前が、`react` の解決先か入る依存を決めるファイル
+    /// (tsconfig / jsconfig、package.json、パッケージマネージャの設定、ロックファイル) のものか。
+    pub(super) fn names_environment(relative: &str) -> bool {
+        let name = relative.rsplit('/').next().unwrap_or(relative);
+        file_role(name).is_some() || DEPENDENCY_STATE_NAMES.contains(&name)
+    }
+
+    /// `relative` が [`Self::names_environment`] の名前か、読んだ設定 (`extends`・`references` の先
+    /// を含む) か。
+    pub(super) fn is_environment_path(&self, relative: &str) -> bool {
+        if Self::names_environment(relative) {
+            return true;
+        }
+        let path = self.root.join(relative);
+        self.config_files.contains(&path)
+            || path
+                .canonicalize()
+                .is_ok_and(|canonical| self.config_files.contains(&canonical))
+    }
+
+    /// 変更前の `relative` の中身 (`read` で読む) が、React の import 元と JSX の型環境を差し替えて
+    /// いないか (いまのソースと同じ監査)。TS / JS 系でないファイルと埋め込みのソースは、いまの
+    /// ソースの監査と同じく見ない (読まない)。読めない・解析できなければ false。
+    pub(super) fn keeps_standard(
+        &self,
+        relative: &str,
+        read: impl FnOnce() -> Option<Vec<u8>>,
+    ) -> bool {
+        let name = relative.rsplit('/').next().unwrap_or(relative);
+        let Some(Some(lang)) = source_language(name) else {
+            return true;
+        };
+        let Some(source) = read() else {
+            return false;
+        };
+        let Ok(tree) = crate::engine::parser::parse_source(&source, lang) else {
+            return false;
+        };
+        let tree_root = tree.root_node();
+        !tree_root.has_error()
+            && audit_source(&self.root, relative, &source, tree_root, &self.packages) == Some(true)
+            && !(checks_specifiers(lang, self.allow_js)
+                && reaches_outside(
+                    &self.root,
+                    relative,
+                    tree_root,
+                    &source,
+                    lang == LangId::Javascript,
+                    &|specifier| self.packages.bare_reaches_outside(specifier),
+                ))
+    }
+}
+
 /// tsconfig / jsconfig の `extends`・`references` の鎖も含めて読み、JSX の設定と `paths`・
 /// `baseUrl`・`types` を集める。
 struct ConfigScan {
@@ -405,6 +549,55 @@ struct ConfigScan {
     path_mappings: Vec<PathMapping>,
     /// `compilerOptions.types` のパッケージの名前。
     types: Vec<String>,
+    /// どれかの設定が `allowJs`・`checkJs` を有効にした (jsconfig は既定で有効)。
+    allow_js: bool,
+    /// 読んだ設定 (正規化したパス) → プロジェクトとしての実効値を求める材料。
+    configs: BTreeMap<PathBuf, ConfigEntry>,
+    /// `${configDir}` で始まる `files`・`include`・`typeRoots`・相対の `types` と、書いた設定
+    /// (正規化したパス)。使う設定で位置が変わるので、読み終えてから、書いた設定とそれを `extends`
+    /// で引き継ぐ設定のディレクトリで確かめる。
+    deferred: Vec<(PathBuf, &'static str, String)>,
+    /// `${configDir}` を含む `baseUrl` と、書いた設定。読み終えてから同じように解く。
+    deferred_bases: Vec<(PathBuf, String)>,
+}
+
+/// 設定 1 つの、`extends` で引き継がれる値。
+#[derive(Default)]
+struct ConfigEntry {
+    directory: PathBuf,
+    /// `baseUrl` (書いたとおりの値)。
+    base: Option<String>,
+    /// `paths` の置き換え先 (書いたとおりの値。`paths` を書けば空でも上書きする)。
+    paths: Option<Vec<String>>,
+    /// `extends` の先の設定 (正規化したパス)。後のものが前のものを上書きする。
+    parents: Vec<PathBuf>,
+    /// 書いた値 (`baseUrl`・`typeRoots`・`types`・`files`・`include`)。書けば引き継いだ値を上書きする。
+    keys: BTreeSet<&'static str>,
+}
+
+/// 設定をプロジェクトとして使うときの、`baseUrl` (値と、書いた設定のディレクトリ) と、`paths` を
+/// 書いた設定 (正規化したパス)。
+#[derive(Default)]
+struct EffectivePaths<'a> {
+    base: Option<(&'a str, &'a Path)>,
+    paths: Option<&'a Path>,
+}
+
+/// tsconfig のパスの値で、使う設定のディレクトリに置き換わる変数。
+const CONFIG_DIR: &str = "${configDir}";
+
+/// `${configDir}` で始まるパスは `project` (使う設定のディレクトリ) から、ほかは `base` から解く。
+/// 途中の `${configDir}` と `\` を含むものは解けないので None。
+fn config_path(base: &Path, project: &Path, path: &str) -> Option<PathBuf> {
+    if path.contains('\\') {
+        return None;
+    }
+    match path.strip_prefix(CONFIG_DIR) {
+        Some(rest) => {
+            (!rest.contains(CONFIG_DIR)).then(|| project.join(rest.trim_start_matches('/')))
+        }
+        None => (!path.contains(CONFIG_DIR)).then(|| base.join(path)),
+    }
 }
 
 /// tsconfig の `paths` の 1 項目。置き換え先は、`baseUrl` があればそこから、無ければ設定の
@@ -414,6 +607,11 @@ struct PathMapping {
     key: String,
     patterns: Vec<String>,
     directory: PathBuf,
+    /// `paths` を書いた設定 (正規化したパス)。
+    config: PathBuf,
+    /// この `paths` を実効値として使う設定ごとの、置き換え先を解く位置 (実効の `baseUrl` か、
+    /// `paths` を書いた設定のディレクトリ) と、`${configDir}` を置き換える設定のディレクトリ。
+    uses: Vec<(PathBuf, PathBuf)>,
 }
 
 impl PathMapping {
@@ -444,6 +642,10 @@ impl ConfigScan {
             base_dirs: Vec::new(),
             path_mappings: Vec::new(),
             types: Vec::new(),
+            allow_js: false,
+            configs: BTreeMap::new(),
+            deferred: Vec::new(),
+            deferred_bases: Vec::new(),
         }
     }
 
@@ -479,6 +681,22 @@ impl ConfigScan {
         let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
         let config = value.as_object()?;
         let directory = canonical.parent()?;
+        let mut entry = ConfigEntry {
+            directory: directory.to_path_buf(),
+            ..ConfigEntry::default()
+        };
+        // jsconfig は、`allowJs` を書かなければ有効にする。
+        let jsconfig = canonical
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("jsconfig"));
+        let explicit_allow_js = config
+            .get("compilerOptions")
+            .and_then(|options| options.get("allowJs"))
+            .map(|value| value.as_bool() != Some(false));
+        if jsconfig && explicit_allow_js != Some(false) {
+            self.allow_js = true;
+        }
         if let Some(options) = config.get("compilerOptions") {
             let options = options.as_object()?;
             if options.contains_key("jsxFactory")
@@ -505,7 +723,16 @@ impl ConfigScan {
             {
                 return None;
             }
+            // allowJs・checkJs で、JS 系のファイルの import も TypeScript のプログラムに効く。
+            if ["allowJs", "checkJs"].iter().any(|key| {
+                options
+                    .get(*key)
+                    .is_some_and(|value| value.as_bool() != Some(false))
+            }) {
+                self.allow_js = true;
+            }
             if let Some(paths) = options.get("paths") {
+                let entry_paths = entry.paths.insert(Vec::new());
                 for (key, patterns) in paths.as_object()? {
                     // `react/jsx-runtime` などの解決先を、`paths` で差し替えない。
                     self.standard &= !maps_react(key);
@@ -515,29 +742,55 @@ impl ConfigScan {
                         .iter()
                         .map(|pattern| pattern.as_str().map(str::to_owned))
                         .collect::<Option<Vec<_>>>()?;
+                    entry_paths.extend(patterns.iter().cloned());
                     self.path_mappings.push(PathMapping {
                         key: key.clone(),
                         patterns,
                         directory: directory.to_path_buf(),
+                        config: canonical.clone(),
+                        uses: Vec::new(),
                     });
                 }
             }
+            for key in ["baseUrl", "typeRoots", "types"] {
+                if options.contains_key(key) {
+                    entry.keys.insert(key);
+                }
+            }
             if let Some(base) = options.get("baseUrl") {
-                let base = directory.join(base.as_str()?);
-                self.standard &= !has_local_module(&base, "react")?;
-                self.base_dirs.push(base);
+                let raw = base.as_str()?;
+                entry.base = Some(raw.to_owned());
+                // TypeScript は `\` を区切りとして読むが、ここでは同じに解けない (Unix では名前の
+                // 一部になる)。
+                if raw.contains('\\') {
+                    self.standard = false;
+                }
+                if raw.contains(CONFIG_DIR) {
+                    self.deferred_bases
+                        .push((canonical.clone(), raw.to_owned()));
+                } else {
+                    let base = directory.join(raw);
+                    self.standard &= !has_local_module(&base, "react")?;
+                    self.base_dirs.push(base);
+                }
             }
             // `typeRoots` の下のパッケージは、import しなくても大域の型として取り込まれる。
             if let Some(roots) = options.get("typeRoots") {
-                for entry in roots.as_array()? {
-                    self.type_root(directory, entry.as_str()?)?;
+                for root in roots.as_array()? {
+                    let root = root.as_str()?;
+                    if root.contains(CONFIG_DIR) {
+                        self.deferred
+                            .push((canonical.clone(), "typeRoots", root.to_owned()));
+                    } else {
+                        self.type_root(directory, root)?;
+                    }
                 }
             }
             if let Some(types) = options.get("types") {
-                for entry in types.as_array()? {
-                    let name = entry.as_str()?;
-                    if name.starts_with(['.', '/']) {
-                        self.included(directory, name)?;
+                for name in types.as_array()? {
+                    let name = name.as_str()?;
+                    if name.starts_with(['.', '/']) || name.starts_with(CONFIG_DIR) {
+                        self.included_or_deferred(&canonical, "types", directory, name)?;
                     } else {
                         self.types.push(name.to_owned());
                     }
@@ -549,8 +802,9 @@ impl ConfigScan {
         for field in ["files", "include"] {
             if let Some(entries) = config.get(field) {
                 explicit = true;
-                for entry in entries.as_array()? {
-                    self.included(directory, entry.as_str()?)?;
+                entry.keys.insert(field);
+                for included in entries.as_array()? {
+                    self.included_or_deferred(&canonical, field, directory, included.as_str()?)?;
                 }
             }
         }
@@ -568,8 +822,10 @@ impl ConfigScan {
         };
         for parent in parents {
             let parent = self.extended_path(&canonical, parent)?;
+            entry.parents.push(parent.canonicalize().ok()?);
             self.scan(&parent, depth + 1)?;
         }
+        self.configs.insert(canonical.clone(), entry);
         // solution 形式の設定では、ソースに効くのは参照先のプロジェクトの設定になる。
         if let Some(references) = config.get("references") {
             for reference in references.as_array()? {
@@ -589,8 +845,77 @@ impl ConfigScan {
         (!has_node_modules(&inner)).then_some(())
     }
 
+    /// [`Self::included`] と同じ。`${configDir}` を含むものは、読み終えてから確かめる。
+    fn included_or_deferred(
+        &mut self,
+        config: &Path,
+        key: &'static str,
+        directory: &Path,
+        pattern: &str,
+    ) -> Option<()> {
+        if pattern.contains(CONFIG_DIR) {
+            self.deferred
+                .push((config.to_path_buf(), key, pattern.to_owned()));
+            return Some(());
+        }
+        self.included(directory, pattern)
+    }
+
+    /// 設定 `path` をプロジェクトとして使うときに、値 `key` を書いた設定 (自分か、`extends` の先の
+    /// うち後のもの)。どれも書かなければ `Some(None)`。鎖が深すぎる・読んでいない設定は None。
+    fn effective_source(&self, path: &Path, key: &str, depth: usize) -> Option<Option<&Path>> {
+        if depth > MAX_CHAIN_DEPTH {
+            return None;
+        }
+        let (own, entry) = self.configs.get_key_value(path)?;
+        if entry.keys.contains(key) {
+            return Some(Some(own.as_path()));
+        }
+        let mut source = None;
+        for parent in &entry.parents {
+            if let Some(found) = self.effective_source(parent, key, depth + 1)? {
+                source = Some(found);
+            }
+        }
+        Some(source)
+    }
+
+    /// 設定 `config` の値 `key` を実効値として使う設定 (決められない設定も含める)。
+    fn inheriting(&self, config: &Path, key: &str) -> Vec<&ConfigEntry> {
+        self.configs
+            .iter()
+            .filter(|(path, _)| {
+                self.effective_source(path, key, 0)
+                    .is_none_or(|source| source == Some(config))
+            })
+            .map(|(_, entry)| entry)
+            .collect()
+    }
+
+    /// `${configDir}` を含む `baseUrl` を、書いた設定とそれを引き継ぐ設定のディレクトリで解き、
+    /// ローカルの `react` を探して、依存の判定に使う `baseUrl` に加える。解けなければ標準でない。
+    fn expand_deferred_bases(&mut self) -> Option<()> {
+        let mut bases = Vec::new();
+        for (config, raw) in &self.deferred_bases {
+            let directory = self.configs.get(config)?.directory.clone();
+            for project in self.inheriting(config, "baseUrl") {
+                bases.push(config_path(&directory, &project.directory, raw));
+            }
+        }
+        for base in bases {
+            match base {
+                Some(base) => {
+                    self.standard &= !has_local_module(&base, "react")?;
+                    self.base_dirs.push(base);
+                }
+                None => self.standard = false,
+            }
+        }
+        Some(())
+    }
+
     /// `typeRoots` の項目。既定と同じ `node_modules/@types` は、registry の型として依存の判定に
-    /// 任せる。
+    /// 任せる。外や node_modules (ほかの場所) を指せば None。
     fn type_root(&self, directory: &Path, entry: &str) -> Option<()> {
         let inner = inner_path(&self.root, directory, entry)?;
         let modules = inner
@@ -598,6 +923,111 @@ impl ConfigScan {
             .filter(|component| component.as_os_str() == "node_modules")
             .count();
         (modules == 0 || (modules == 1 && inner.ends_with("node_modules/@types"))).then_some(())
+    }
+
+    /// `${configDir}` で始まる `files`・`include`・`typeRoots`・相対の `types` が、どの設定から
+    /// 使われても解析するディレクトリの中の node_modules の外 (`typeRoots` は既定と同じ
+    /// `node_modules/@types` も) に収まるか。途中の `${configDir}` は解けないので false。
+    fn deferred_stay_inside(&self) -> bool {
+        self.deferred.iter().all(|(config, key, pattern)| {
+            self.inheriting(config, key).into_iter().all(|project| {
+                config_path(&project.directory, &project.directory, pattern)
+                    .and_then(|path| normalize_lexically(&path))
+                    .and_then(|path| path.strip_prefix(&self.root).ok().map(Path::to_path_buf))
+                    .is_some_and(|inner| {
+                        let modules = inner
+                            .components()
+                            .filter(|component| component.as_os_str() == "node_modules")
+                            .count();
+                        modules == 0 || (modules == 1 && inner.ends_with("node_modules/@types"))
+                    })
+            })
+        })
+    }
+
+    /// 設定 `path` をプロジェクトとして使うときの `baseUrl` と `paths`。`extends` は後の設定が前の
+    /// 設定を上書きし、自分の値が全てを上書きする。鎖が深すぎる・読んでいない設定を指すときは None。
+    fn effective(&self, path: &Path, depth: usize) -> Option<EffectivePaths<'_>> {
+        if depth > MAX_CHAIN_DEPTH {
+            return None;
+        }
+        let (own, entry) = self.configs.get_key_value(path)?;
+        let mut effective = EffectivePaths::default();
+        for parent in &entry.parents {
+            let inherited = self.effective(parent, depth + 1)?;
+            effective.base = inherited.base.or(effective.base);
+            effective.paths = inherited.paths.or(effective.paths);
+        }
+        if let Some(base) = &entry.base {
+            effective.base = Some((base.as_str(), entry.directory.as_path()));
+        }
+        if entry.paths.is_some() {
+            effective.paths = Some(own.as_path());
+        }
+        Some(effective)
+    }
+
+    /// 読んだ設定のそれぞれをプロジェクトとして使うときの実効の `baseUrl` と `paths` から、`paths` の
+    /// 項目ごとに、置き換え先を解く位置 (実効の `baseUrl` か `paths` を書いた設定のディレクトリ) と
+    /// `${configDir}` を置き換える設定のディレクトリを記録する。実効値を求められない・`baseUrl` を
+    /// 解けない設定があれば false。
+    fn resolve_mapping_uses(&mut self) -> bool {
+        let mut uses = Vec::new();
+        let mut resolved = true;
+        for (path, project) in &self.configs {
+            let Some(effective) = self.effective(path, 0) else {
+                resolved = false;
+                continue;
+            };
+            let Some(source) = effective.paths else {
+                continue;
+            };
+            let base = match effective.base {
+                Some((raw, directory)) => config_path(directory, &project.directory, raw),
+                None => self
+                    .configs
+                    .get(source)
+                    .map(|entry| entry.directory.clone()),
+            };
+            match base {
+                Some(base) => uses.push((source.to_path_buf(), base, project.directory.clone())),
+                None => resolved = false,
+            }
+        }
+        for (source, base, project) in uses {
+            for mapping in self
+                .path_mappings
+                .iter_mut()
+                .filter(|mapping| mapping.config == source)
+            {
+                mapping.uses.push((base.clone(), project.clone()));
+            }
+        }
+        resolved
+    }
+
+    /// `paths` の置き換え先と `baseUrl` が、どの設定から使われても解析するディレクトリの中の
+    /// node_modules の外に収まるか。外のファイルは監査せず、node_modules の中は registry の名前を
+    /// 通らずに React の型を指し得る。置き換え先は、使う設定ごとの位置
+    /// ([`Self::resolve_mapping_uses`]) から、`*` に区切りの無い名前と空を入れて解く (実際の捕獲は
+    /// 指定子の側で [`PackageBoundary::bare_reaches_outside`] が解く)。
+    fn mappings_stay_inside(&self) -> bool {
+        let inside = |path: &Path| {
+            normalize_lexically(path).is_some_and(|path| {
+                path.strip_prefix(&self.root)
+                    .is_ok_and(|inner| !has_node_modules(inner))
+            })
+        };
+        self.base_dirs.iter().all(|base| inside(base))
+            && self.path_mappings.iter().all(|mapping| {
+                mapping.uses.iter().all(|(base, project)| {
+                    mapping.patterns.iter().all(|pattern| {
+                        pattern_stays_inside(pattern, |target| {
+                            config_path(base, project, target).is_some_and(|target| inside(&target))
+                        })
+                    })
+                })
+            })
     }
 
     /// `references` の `path` (設定ファイルか、tsconfig.json を持つディレクトリ) を解決する。
@@ -683,6 +1113,39 @@ fn path_key_matches(key: &str, specifier: &str) -> bool {
                 && specifier.ends_with(suffix)
         }
     }
+}
+
+/// `*` を含み得るパターン (`paths` の置き換え先、package.json の入口) が、どんな捕獲でも外へ
+/// 出ないか (`resolve` で確かめる)。捕獲の `..` と `.`・空の区切りは指定子の側で数えるので、`*` に
+/// 区切りの無い名前と空を入れて解く。`*` を含む区切りの固定の部分が `.` だけで、捕獲と合わせて
+/// `..` になり得るもの (`.*`・`*.` など) と、`*` が 2 つ以上のものは拒む。
+fn pattern_stays_inside(pattern: &str, resolve: impl Fn(&str) -> bool) -> bool {
+    if pattern.matches('*').count() > 1 {
+        return false;
+    }
+    if let Some(segment) = pattern.split('/').find(|segment| segment.contains('*')) {
+        let (prefix, suffix) = segment.split_once('*').unwrap_or((segment, ""));
+        let dots = |part: &str| part.chars().all(|character| character == '.');
+        if !(prefix.is_empty() && suffix.is_empty())
+            && dots(prefix)
+            && dots(suffix)
+            && prefix.len() + suffix.len() <= 2
+        {
+            return false;
+        }
+    }
+    ["_", ""]
+        .iter()
+        .all(|capture| resolve(&pattern.replace('*', capture)))
+}
+
+/// package.json の入口 `target` (`directory` からの相対のパス) が、`root` の中を指すか
+/// ([`pattern_stays_inside`])。`\` を含むものは解かない。
+fn entry_inside(root: &Path, directory: &Path, target: &str) -> bool {
+    !target.contains('\\')
+        && pattern_stays_inside(target, |target| {
+            normalize_lexically(&directory.join(target)).is_some_and(|path| path.starts_with(root))
+        })
 }
 
 /// `paths` のキーやモジュール宣言の名前が、React の import 元 (`react` とその配下。
@@ -879,6 +1342,13 @@ fn override_names(key: &str) -> Option<Vec<String>> {
 struct Manifest {
     name: Option<String>,
     workspaces: bool,
+    /// 型とモジュールの入口 (`types`・`typings`・`main`・`module`・`exports`・`typesVersions`・
+    /// `imports`) の文字列。
+    entry_targets: Vec<String>,
+    /// `imports` (`#` の指定子の解決先) を持つ。
+    imports: bool,
+    /// `exports` (名前での自己参照の解決先) を持つ。
+    exports: bool,
     /// 依存と overrides・resolutions の、名前と版の指定 (文字列でなければ None)。
     dependencies: Vec<(String, Option<String>)>,
     /// パッチを当てた依存の名前。
@@ -899,6 +1369,27 @@ impl Manifest {
             None => None,
             Some(name) => Some(name.as_str()?.to_owned()),
         };
+        let mut entry_targets = Vec::new();
+        let mut pending: Vec<&serde_json::Value> = [
+            "types",
+            "typings",
+            "main",
+            "module",
+            "exports",
+            "typesVersions",
+            "imports",
+        ]
+        .iter()
+        .filter_map(|field| object.get(*field))
+        .collect();
+        while let Some(value) = pending.pop() {
+            match value {
+                serde_json::Value::String(target) => entry_targets.push(target.clone()),
+                serde_json::Value::Array(items) => pending.extend(items),
+                serde_json::Value::Object(entries) => pending.extend(entries.values()),
+                _ => {}
+            }
+        }
         let mut dependencies = Vec::new();
         for field in [
             "dependencies",
@@ -983,6 +1474,9 @@ impl Manifest {
         Some(Self {
             name,
             workspaces: object.contains_key("workspaces"),
+            entry_targets,
+            imports: object.contains_key("imports"),
+            exports: object.contains_key("exports"),
             dependencies,
             patched,
         })
@@ -1009,6 +1503,8 @@ pub(super) struct PackageBoundary {
     foreign: bool,
     /// pnpm-workspace.yaml の catalog の指定 (`catalog:` の参照先)。
     catalogs: Vec<CatalogEntry>,
+    /// 解析するディレクトリの中の package.json の、型とモジュールの入口が外を指す。
+    entries_escape: bool,
 }
 
 /// pnpm-workspace.yaml の catalog の 1 項目。
@@ -1137,6 +1633,7 @@ impl PackageBoundary {
             aliased: BTreeSet::new(),
             foreign: false,
             catalogs: Vec::new(),
+            entries_escape: false,
         };
         let mut bytes = 0;
         let mut package_configs = Vec::new();
@@ -1148,10 +1645,15 @@ impl PackageBoundary {
         }
         let mut manifests = Vec::new();
         for path in &files.manifests {
-            manifests.push((
-                path.parent()?.to_path_buf(),
-                Manifest::read(path, &mut bytes)?,
-            ));
+            let directory = path.parent()?.to_path_buf();
+            let manifest = Manifest::read(path, &mut bytes)?;
+            // 入口は import (ディレクトリの import・`types`・reference) のどれからも使われ得るので、
+            // どこにある package.json も確かめる。
+            boundary.entries_escape |= !manifest
+                .entry_targets
+                .iter()
+                .all(|target| entry_inside(&files.root, &directory, target));
+            manifests.push((directory, manifest));
         }
         // 外の祖先の package.json の依存も、祖先の node_modules から解決され得る。外に
         // ワークスペースの定義や pnpmfile があると、外のパッケージの名前や依存の指定を確かめられ
@@ -1182,6 +1684,10 @@ impl PackageBoundary {
                     if manifest.workspaces {
                         return None;
                     }
+                    // 祖先の package.json の `imports` は中の `#` の指定子を、`exports` は名前での
+                    // 自己参照を、監査しない外のファイルへ解き得る。
+                    boundary.entries_escape |=
+                        manifest.imports || (manifest.name.is_some() && manifest.exports);
                     manifests.push((ancestor.to_path_buf(), manifest));
                 }
             }
@@ -1304,6 +1810,39 @@ impl PackageBoundary {
                 .any(|base| has_local_module(base, name) != Some(false)))
     }
 
+    /// 相対でも絶対でもない指定子が、`paths` の別名か `baseUrl` の下の解決で、解析するディレクトリの
+    /// 外を指し得るか。別名は実際の捕獲を入れて、使う設定ごとの位置 (実効の `baseUrl` か、`paths` を
+    /// 書いた設定のディレクトリ) から解く。`..` を含むものは、パッケージの中からも上へ出得るので
+    /// 数える。どの別名にも当たらず `baseUrl` も無ければ、node_modules の依存を指す。
+    pub(super) fn bare_reaches_outside(&self, specifier: &str) -> bool {
+        if specifier.contains("..") {
+            return true;
+        }
+        let inside = |path: &Path| {
+            normalize_lexically(path).is_some_and(|path| path.starts_with(&self.root))
+        };
+        for mapping in self
+            .path_mappings
+            .iter()
+            .filter(|mapping| path_key_matches(&mapping.key, specifier))
+        {
+            let Some(targets) = mapping.substitute(specifier) else {
+                return true;
+            };
+            for target in &targets {
+                if !mapping.uses.iter().all(|(base, project)| {
+                    config_path(base, project, target).is_some_and(|path| inside(&path))
+                }) {
+                    return true;
+                }
+            }
+        }
+        !self
+            .base_dirs
+            .iter()
+            .all(|base| inside(&base.join(specifier)))
+    }
+
     /// bare specifier が、リポジトリの中の `target` (`dir` 相対) に解決され得るか。`paths`・
     /// `baseUrl`・リポジトリの package (名前と自己参照) で解き、registry の依存と決められず解決先も
     /// 確かめられないときも true。
@@ -1367,6 +1906,13 @@ impl PackageBoundary {
         !self.is_registry_dependency(specifier)
     }
 
+    /// 解析するディレクトリの中の package.json の型とモジュールの入口 (`types`・`typings`・`main`・
+    /// `module`・`exports`・`typesVersions`・`imports`) が、全て中を指すか。外のファイルを入口に
+    /// すれば、監査しないファイルが TypeScript のプログラムに入り、React の型を差し替え得る。
+    pub(super) fn entries_stay_inside(&self) -> bool {
+        !self.entries_escape
+    }
+
     /// JSX の証明が頼る React (自動の runtime の `react/jsx-runtime`・`react/jsx-dev-runtime` と、
     /// 型の `@types/react`) が、registry の React (別名でない) から解決されるか。外の中身の依存や
     /// registry でない `@types/*` があれば、大域の JSX の型が変わり得るので false。
@@ -1407,7 +1953,9 @@ fn contains_ignore_ascii_case(text: &[u8], needle: &[u8]) -> bool {
 /// `export * as JSX from`)。型の参照 (`JSX.Element`) は宣言ではないので数えない。
 pub(super) fn declares_jsx_name(root: Node<'_>, source: &[u8]) -> bool {
     let is_jsx = |node: Node<'_>| node.utf8_text(source).ok() == Some("JSX");
-    !collect_bindings_named(root, source, "JSX").is_empty()
+    collect_bindings_named(root, source, "JSX")
+        .into_iter()
+        .any(|binding| !imports_react_jsx(binding, source))
         || any_node(root, Children::Named, |node| match node.kind() {
             "export_specifier" => ["name", "alias"]
                 .iter()
@@ -1418,6 +1966,53 @@ pub(super) fn declares_jsx_name(root: Node<'_>, source: &[u8]) -> bool {
             }
             _ => false,
         })
+}
+
+/// `import { JSX } from "react"` (型だけの import も) のように、React の `JSX` の名前空間を同じ名前で
+/// 束縛するだけの import か。React 19 の型で `JSX.Element` を書く普通の形で、JSX の型環境を差し替え
+/// ない。default・namespace の import や、別の名前を `JSX` に束縛する import は数える。
+fn imports_react_jsx(node: Node<'_>, source: &[u8]) -> bool {
+    // 束縛の一覧は import 文と、その中の `name` を持つ specifier の両方を返す。
+    let mut node = node;
+    while node.kind() != "import_statement" {
+        match node.parent() {
+            Some(parent)
+                if matches!(
+                    node.kind(),
+                    "import_specifier" | "named_imports" | "import_clause"
+                ) =>
+            {
+                node = parent;
+            }
+            _ => return false,
+        }
+    }
+    if node.kind() != "import_statement"
+        || !node
+            .child_by_field_name("source")
+            .and_then(|specifier| static_specifier(specifier, source))
+            .is_some_and(|specifier| REACT_RUNTIME.contains(&specifier))
+    {
+        return false;
+    }
+    let mut bindings = 0usize;
+    crate::engine::js_scope::visit_import_bindings(node, source, |name| {
+        bindings += usize::from(name == "JSX");
+        false
+    });
+    let mut named = 0usize;
+    let _ = walk_preorder(node, Children::Named, |child, _| {
+        if child.kind() == "import_specifier" {
+            let name = child.child_by_field_name("name");
+            let local = child.child_by_field_name("alias").or(name);
+            let text = |node: Option<Node<'_>>| node.and_then(|node| node.utf8_text(source).ok());
+            if text(local) == Some("JSX") && text(name) == Some("JSX") {
+                named += 1;
+            }
+        }
+        ControlFlow::<(), Walk>::Continue(Walk::Descend)
+    });
+    bindings == named
 }
 
 /// JSX の型環境を差し替える宣言か。`namespace JSX` (global・module の augmentation の中を含む)
@@ -1441,8 +2036,20 @@ pub(super) fn replaces_jsx_environment(node: Node<'_>, source: &[u8]) -> bool {
     })
 }
 
+/// `relative` が宣言ファイル (`.d.ts`・`.d.mts`・`.d.cts` と、`.d.css.ts` のような任意の拡張子の
+/// 宣言) か。宣言ファイルは全体が ambient の文脈なので、`declare` を省いた宣言を書ける。
+pub(super) fn is_declaration_file(relative: &str) -> bool {
+    let name = relative.rsplit('/').next().unwrap_or(relative);
+    [".d.ts", ".d.mts", ".d.cts"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+        || (name.ends_with(".ts") && name.contains(".d."))
+}
+
 /// `declare module "react"` など、React の import 元を augmentation で差し替える宣言か。
 /// `*` を含む名前 (`"*.svg"` など) は、`react` と JSX の runtime に当たるときだけ数える。
+/// `@types/react` と、`node_modules` を通る相対・絶対のパス (`"../node_modules/@types/react"`)
+/// も、`react` の import と同じ宣言ファイルを指し得るので数える。
 fn augments_react(node: Node<'_>, source: &[u8]) -> bool {
     node.kind() == "module"
         && node
@@ -1454,8 +2061,23 @@ fn augments_react(node: Node<'_>, source: &[u8]) -> bool {
                         REACT_RUNTIME
                             .iter()
                             .any(|specifier| path_key_matches(module, specifier))
+                    } else if module.starts_with(['.', '/'])
+                        || (module
+                            .as_bytes()
+                            .first()
+                            .is_some_and(u8::is_ascii_alphabetic)
+                            && module.as_bytes().get(1) == Some(&b':'))
+                    {
+                        module
+                            .split('/')
+                            .any(|segment| segment.eq_ignore_ascii_case("node_modules"))
                     } else {
-                        module == "react" || module.starts_with("react/")
+                        ["react", "@types/react"].iter().any(|package| {
+                            module == *package
+                                || module
+                                    .strip_prefix(package)
+                                    .is_some_and(|rest| rest.starts_with('/'))
+                        })
                     }
                 })
             })
@@ -1564,10 +2186,11 @@ pub(super) fn audit_source(
     packages: &PackageBoundary,
 ) -> Option<bool> {
     // どの宣言も、これらの文字列を含まずには書けない (pragma と reference は大文字小文字を
-    // 区別しない)。
+    // 区別しない)。宣言ファイルは `declare` を省いた `module "react" { … }` も書ける。
     let finds = |needle: &[u8]| memchr::memmem::find(source, needle).is_some();
     if !(finds(b"JSX")
         || finds(b"declare")
+        || (is_declaration_file(relative) && finds(b"module"))
         || finds(b"\\")
         || contains_ignore_ascii_case(source, b"@jsx")
         || contains_ignore_ascii_case(source, b"<reference"))
@@ -1835,6 +2458,429 @@ mod tests {
                 "{path}"
             );
         }
+        // node_modules (registry の名前を通らずに React の型を指し得る) や外を指す置き換え先と
+        // baseUrl。
+        for options in [
+            r#""paths": { "r": ["./node_modules/@types/react"] }"#,
+            r#""paths": { "@shared/*": ["../shared/*"] }"#,
+            r#""paths": { "x": ["/abs/x"] }"#,
+            r#""baseUrl": "./src", "paths": { "@lib/*": ["../../lib/*"] }"#,
+            r#""baseUrl": "../""#,
+            r#""baseUrl": "./node_modules""#,
+            // `\` は TypeScript が区切りとして読むが、同じに解けない。
+            r#""baseUrl": "..\\shared""#,
+            // `*` の後ろの `..` も、置き換えた先を外へ出す (空の捕獲は 1 段浅い)。
+            r#""paths": { "@env/*": ["./src/*/../../../shared/react-env"] }"#,
+            r#""paths": { "@env/*": ["./src/*/../../shared/react-env"] }"#,
+        ] {
+            let config = format!(r#"{{ "compilerOptions": {{ {options} }} }}"#);
+            assert!(!standard(&[("tsconfig.json", &config)]), "{options}");
+        }
+    }
+
+    #[test]
+    fn reaches_outside_counts_specifiers_that_leave_the_directory() {
+        let root = Path::new("/repo");
+        let parse = |path: &str, source: &str, lang: LangId| {
+            let tree = crate::engine::parser::parse_source(source.as_bytes(), lang).unwrap();
+            reaches_outside(
+                root,
+                path,
+                tree.root_node(),
+                source.as_bytes(),
+                lang == LangId::Javascript,
+                // 別名の無い構成では、`..` を含む指定子だけが外へ出得る。
+                &|specifier: &str| specifier.contains(".."),
+            )
+        };
+        let reaches = |path: &str, source: &str| parse(path, source, LangId::Typescript);
+        // JS では、JSDoc の `@import` と `import("…")` 型も型の依存になる。
+        for source in [
+            "/** @import { X } from \"../../shared/react-env\" */\nexport {};\n",
+            "/** @type {import(\"../../shared/react-env\").X} */\nvar x;\nexport {};\n",
+        ] {
+            assert!(parse("src/env.js", source, LangId::Javascript), "{source}");
+            // TS のコメントは型の依存にならない。
+            assert!(!parse("src/env.ts", source, LangId::Typescript), "{source}");
+        }
+        // 説明文の引用符と、複数行の JSDoc の行頭の `*` に左右されない。
+        for source in [
+            "/** Don't discard this dependency.\n * @import { X } from \"../../shared/react-env\"\n */\nexport {};\n",
+            "/** @type {import(\n * \"../../shared/react-env\"\n * ).X} */\nlet x;\nexport {};\n",
+            "/**\n * @import { X }\n * from\n * \"../../shared/react-env\"\n */\nexport {};\n",
+            // `from` という名前を import しても、タグの中の後ろの `from` を読む。
+            "/** @import { from } from \"../../shared/tag-adapter\" */\nexport {};\n",
+            "/** @import { from as streamFrom } from \"../../shared/tag-adapter\" */\nexport {};\n",
+        ] {
+            assert!(parse("src/env.js", source, LangId::Javascript), "{source}");
+        }
+        // 出典の `from "URL"` のような、JSDoc の依存でない文字列は数えない。
+        for source in [
+            "// don't touch '../lib/x' or \"./y\"\nexport {};\n",
+            "/** See \"https://example.com/docs\" for usage. */\nexport {};\n",
+            "/** Adapted from \"https://react.dev/learn\". */\nexport {};\n",
+            "/** @import { X } from \"../lib/x\" */\nexport {};\n",
+        ] {
+            assert!(!parse("src/env.js", source, LangId::Javascript), "{source}");
+        }
+        let long = format!("import \"{}../../shared/react-env\";\n", "./".repeat(2050));
+        for (path, source) in [
+            ("src/env.ts", "import '../../shared/react-env';\n"),
+            // 別名の指定子は `bare` が決める (ここでは `..` を含むものだけ)。
+            ("src/env.ts", "import '@env/x../shared/react-env';\n"),
+            ("src/a/b.ts", "export * from \"../../../outside\";\n"),
+            ("index.ts", "const x = require(`../x`);\n"),
+            ("src/env.ts", "import '../..';\n"),
+            ("src/env.ts", "import x from '@alias/../../outside';\n"),
+            ("src/env.ts", "import x from '/abs/x';\n"),
+            ("src/env.ts", "import x from 'C:/abs/x';\n"),
+            // escape と行の継続は解かない。
+            (
+                "src/env.ts",
+                "import x from '\\x2e\\x2e/\\x2e\\x2e/shared/react-env';\n",
+            ),
+            (
+                "src/env.ts",
+                "import x from \".\\\n./../shared/react-env\";\n",
+            ),
+            ("src/env.ts", long.as_str()),
+            ("src/env.ts", "declare module '../../outside/x' {}\n"),
+            ("src/env.ts", "type T = typeof import('../../outside');\n"),
+            ("src/env.ts", "import x = require('../../outside');\n"),
+        ] {
+            assert!(reaches(path, source), "{path}: {source}");
+        }
+        for (path, source) in [
+            ("src/env.ts", "import '../lib/x';\nimport './y';\n"),
+            ("src/a/b.ts", "import '../../index';\n"),
+            // 指定子でない文字列とコメント、TypeScript が解決しない式の指定子は数えない。
+            (
+                "src/env.ts",
+                "const p = path.resolve(__dirname, '../../outside');\n",
+            ),
+            (
+                "src/env.ts",
+                "export const label = \"ok\"; // ../../README.md\n",
+            ),
+            ("src/env.ts", "const m = import(`../../${name}`);\n"),
+            ("src/env.ts", "const m = require(name);\n"),
+            (
+                "src/env.ts",
+                "import React from 'react';\nimport x from '@/lib/x';\n",
+            ),
+            (
+                "src/env.ts",
+                "import { PrismaClient } from '.prisma/client';\n",
+            ),
+        ] {
+            assert!(!reaches(path, source), "{path}: {source}");
+        }
+    }
+
+    #[test]
+    fn repository_audit_rejects_sources_that_import_outside_the_directory() {
+        assert!(!standard(&[(
+            "src/env.ts",
+            "import \"../../shared/react-env\";\n"
+        )]));
+        // 無視したファイル (在庫の外) も同じく数える。
+        assert!(!standard(&[
+            (".ignore", "generated/\n"),
+            ("generated/env.ts", "import \"../../shared/react-env\";\n"),
+        ]));
+        // 対照: 中を指す相対の import は許す。
+        assert!(standard(&[
+            ("src/env.ts", "import \"../lib/x\";\n"),
+            ("lib/x.ts", "export {};\n"),
+        ]));
+    }
+
+    #[test]
+    fn repository_audit_rejects_type_packages_with_manifests() {
+        let config = r#"{ "compilerOptions": { "types": ["helpers"], "typeRoots": ["./types"] } }"#;
+        for (manifest, entry) in [
+            (
+                "types/helpers/package.json",
+                r#"{ "types": "../../../shared/react-types.ts" }"#,
+            ),
+            (
+                "types/@scope/helpers/package.json",
+                r#"{ "types": "../../../../shared/react-types.ts" }"#,
+            ),
+            (
+                "types/helpers/package.json",
+                r#"{ "exports": { ".": { "types": "../../../shared/react-types.ts" } } }"#,
+            ),
+            (
+                "types/helpers/package.json",
+                r#"{ "typesVersions": { "*": { "*": ["../../../shared/*"] } } }"#,
+            ),
+        ] {
+            assert!(
+                !standard(&[("tsconfig.json", config), (manifest, entry)]),
+                "{manifest}: {entry}"
+            );
+        }
+        // `types` に書いた名前は、typeRoots の下のどの深さも型の入口にできる。
+        assert!(!standard(&[
+            (
+                "tsconfig.json",
+                r#"{ "compilerOptions": { "types": ["helpers/nested"], "typeRoots": ["./types"] } }"#,
+            ),
+            (
+                "types/helpers/nested/package.json",
+                r#"{ "types": "../../../../shared/react-env.ts" }"#,
+            ),
+        ]));
+        // typeRoots の外でも、ディレクトリの import・相対の `types`・reference から package.json の
+        // 入口を使える。
+        let outside_entry = r#"{ "types": "../../../shared/react-env.ts" }"#;
+        for files in [
+            vec![("src/env.ts", "import \"../types/nested\";\n")],
+            vec![(
+                "tsconfig.json",
+                r#"{ "compilerOptions": { "types": ["./types/nested"] } }"#,
+            )],
+            vec![(
+                "src/env.ts",
+                "/// <reference types=\"../types/nested\" />\nexport {};\n",
+            )],
+        ] {
+            let mut files = files;
+            files.push(("types/nested/package.json", outside_entry));
+            assert!(!standard(&files), "{files:?}");
+        }
+        // `*` を含む区切りの固定の `.` は、捕獲の `.` と合わせて `..` になり得る。
+        assert!(!standard(&[(
+            "types/pkg/package.json",
+            r#"{ "types": "x.", "typesVersions": { "*": { "x*": ["./src/.*/../../../shared/react-env"] } } }"#,
+        )]));
+        // 対照: 宣言ファイルだけの型のパッケージと、中を指す入口の package.json は、中身を監査して
+        // 許す。
+        assert!(standard(&[
+            ("tsconfig.json", config),
+            ("types/helpers/index.d.ts", "export {};\n"),
+        ]));
+        assert!(standard(&[
+            ("tsconfig.json", config),
+            (
+                "types/helpers/package.json",
+                r#"{ "types": "./index.d.ts", "exports": { ".": { "types": "./index.d.ts" }, "./*": "./lib/*.js" } }"#,
+            ),
+            ("types/helpers/index.d.ts", "export {};\n"),
+        ]));
+    }
+
+    #[test]
+    fn repository_audit_rejects_ancestor_manifests_that_reach_outside() {
+        // 解析するディレクトリの祖先の package.json の `imports` は `#` の指定子を、`exports` は名前
+        // での自己参照を、監査しない外へ解き得る。
+        for (ancestor, expected) in [
+            (
+                r##"{ "imports": { "#env": "./shared/react-env.d.ts" } }"##,
+                false,
+            ),
+            (
+                r#"{ "name": "parent", "exports": "./shared/index.ts" }"#,
+                false,
+            ),
+            (r#"{ "name": "parent", "private": true }"#, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            write_files(
+                directory.path(),
+                &[
+                    ("package.json", ancestor),
+                    ("repo/src/app.tsx", "export const app = 1;\n"),
+                ],
+            );
+            let evidence =
+                RemovalEvidence::load(directory.path().join("repo").to_str().unwrap(), &[])
+                    .unwrap_or_else(|| panic!("inventory: {ancestor}"));
+            assert_eq!(
+                evidence.repository.unwrap().jsx_standard(),
+                expected,
+                "{ancestor}"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_audit_resolves_config_dir_and_implicit_allow_js() {
+        // `${configDir}` は、使う設定のディレクトリに置き換えてから解く。
+        for config in [
+            r#"{ "compilerOptions": { "paths": { "@env": ["${configDir}/../shared/react-env"] } } }"#,
+            r#"{ "files": ["src/app.tsx", "${configDir}/../shared/react-env.ts"] }"#,
+            r#"{ "compilerOptions": { "baseUrl": "${configDir}/.." } }"#,
+        ] {
+            assert!(!standard(&[("tsconfig.json", config)]), "{config}");
+        }
+        assert!(standard(&[(
+            "tsconfig.json",
+            r#"{ "include": ["${configDir}/src"], "compilerOptions": { "paths": { "@/*": ["${configDir}/src/*"] } } }"#,
+        )]));
+        // jsconfig は allowJs を既定で有効にするので、JS の import も外を指せばプログラムに入る。
+        let js = (
+            "src/env.js",
+            "import \"../../shared/react-env\";\nexport {};\n",
+        );
+        assert!(!standard(&[
+            ("jsconfig.json", r#"{ "compilerOptions": {} }"#),
+            js
+        ]));
+        assert!(!standard(&[
+            (
+                "tsconfig.json",
+                r#"{ "compilerOptions": { "allowJs": true, "checkJs": true } }"#,
+            ),
+            (
+                "src/env.js",
+                "/** @import { X } from \"../../shared/react-env\" */\nexport {};\n",
+            ),
+        ]));
+        // 対照: JSDoc の依存でない JS のコメントの文字列は数えない。
+        assert!(standard(&[
+            (
+                "tsconfig.json",
+                r#"{ "compilerOptions": { "allowJs": true, "checkJs": true } }"#,
+            ),
+            (
+                "src/docs.js",
+                "/** See \"https://example.com/docs\" for usage. */\nexport {};\n",
+            ),
+        ]));
+        // `${configDir}` の baseUrl も、ローカルの react を探す。
+        assert!(!standard(&[
+            (
+                "tsconfig.json",
+                r#"{ "compilerOptions": { "baseUrl": "${configDir}/.local" } }"#,
+            ),
+            (
+                ".local/react/jsx-runtime.d.ts",
+                "export * from \"custom-runtime\";\n"
+            ),
+        ]));
+        // 対照: `${configDir}` の include は、書いた設定とそれを引き継ぐ設定でだけ解く。
+        assert!(standard(&[
+            (
+                "tsconfig.base.json",
+                r#"{ "compilerOptions": { "strict": true } }"#
+            ),
+            (
+                "tsconfig.json",
+                r#"{ "extends": "./tsconfig.base.json", "include": ["src"] }"#,
+            ),
+            (
+                "tools/tsconfig.json",
+                r#"{ "extends": "../tsconfig.base.json", "include": ["${configDir}/../src"] }"#,
+            ),
+        ]));
+        // 対照: 引き継ぐ設定が自分の include を書けば、基底の `${configDir}` の include は効かない。
+        assert!(standard(&[
+            (
+                "config/tsconfig.base.json",
+                r#"{ "compilerOptions": { "strict": true }, "include": ["${configDir}/../src"] }"#,
+            ),
+            (
+                "tsconfig.json",
+                r#"{ "extends": "./config/tsconfig.base.json", "include": ["src"] }"#,
+            ),
+        ]));
+        // 対照: 複数の extends では、後の設定の include が前の設定の include を上書きする。
+        assert!(standard(&[
+            (
+                "config/tsconfig.base.json",
+                r#"{ "compilerOptions": { "strict": true }, "include": ["${configDir}/../src"] }"#,
+            ),
+            ("tsconfig.app.json", r#"{ "include": ["src"] }"#),
+            (
+                "tsconfig.json",
+                r#"{ "extends": ["./config/tsconfig.base.json", "./tsconfig.app.json"] }"#,
+            ),
+        ]));
+        // 上書きしなければ、基底の include は引き継ぐ設定のディレクトリで解く。
+        assert!(!standard(&[
+            (
+                "config/tsconfig.base.json",
+                r#"{ "compilerOptions": { "strict": true }, "include": ["${configDir}/../src"] }"#,
+            ),
+            (
+                "tsconfig.json",
+                r#"{ "extends": "./config/tsconfig.base.json" }"#
+            ),
+        ]));
+        // 対照: allowJs の無い tsconfig では、JS はプログラムに入らない。
+        assert!(standard(&[
+            ("tsconfig.json", r#"{ "compilerOptions": {} }"#),
+            js
+        ]));
+        assert!(standard(&[
+            (
+                "jsconfig.json",
+                r#"{ "compilerOptions": { "allowJs": false } }"#
+            ),
+            js
+        ]));
+    }
+
+    #[test]
+    fn repository_audit_resolves_aliases_with_the_actual_capture() {
+        let config = r#"{ "compilerOptions": { "paths": { "@env/x*": ["./src/.*suffix/../../shared/react-env"], "@/*": ["./src/*"] } } }"#;
+        // `/` をまたぐ捕獲 (`./a`) は、置き換え先の固定の `.` と合わせて `..` になる。
+        assert!(!standard(&[
+            ("tsconfig.json", config),
+            ("src/env.ts", "import \"@env/x./a\";\n"),
+        ]));
+        // 対照: 中に収まる捕獲と、`.` で始まる区切りに置き換わる普通の別名、パッケージ名。
+        for source in [
+            "import \"@env/xa\";\n",
+            "import type { Schema } from \"@/.generated/schema\";\n",
+            "import { PrismaClient } from \".prisma/client\";\n",
+        ] {
+            assert!(
+                standard(&[("tsconfig.json", config), ("src/env.ts", source)]),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_audit_resolves_paths_against_related_base_urls() {
+        // extends でつながる設定の baseUrl は、paths の解決に効く。
+        let child = r#"{ "extends": "../../tsconfig.base.json", "compilerOptions": { "paths": { "@x/*": ["../../*"] } } }"#;
+        assert!(!standard(&[
+            (
+                "tsconfig.base.json",
+                r#"{ "compilerOptions": { "baseUrl": "./packages" } }"#,
+            ),
+            ("apps/web/tsconfig.json", child),
+        ]));
+        // 対照: 共通の基底の設定を持つ兄弟の設定は、それぞれの実効の baseUrl で解く。
+        assert!(standard(&[
+            (
+                "tsconfig.base.json",
+                r#"{ "compilerOptions": { "strict": true } }"#
+            ),
+            (
+                "tsconfig.json",
+                r#"{ "extends": "./tsconfig.base.json", "compilerOptions": { "baseUrl": ".", "paths": { "@app/*": ["src/*"] } } }"#,
+            ),
+            (
+                "tools/tsconfig.json",
+                r#"{ "extends": "../tsconfig.base.json", "compilerOptions": { "baseUrl": ".", "paths": { "@tool/*": ["../src/*"] } } }"#,
+            ),
+        ]));
+        // 対照: つながらない設定の baseUrl とは組み合わせない。
+        assert!(standard(&[
+            (
+                "tsconfig.json",
+                r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@app/*": ["src/*"] } } }"#,
+            ),
+            (
+                "tools/tsconfig.json",
+                r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@app/*": ["../src/*"] } } }"#,
+            ),
+        ]));
     }
 
     #[test]
@@ -1908,6 +2954,16 @@ mod tests {
                 "namespace Types { export interface Element {} }\nexport { Types as JSX };\n",
             ),
             ("src/alias.ts", "import JSX = Other.Types;\n"),
+            // React の `JSX` の名前空間でないものを `JSX` に束縛する import。
+            ("src/default.ts", "import JSX from \"react\";\nexport {};\n"),
+            (
+                "src/renamed.ts",
+                "import { Fragment as JSX } from \"react\";\nexport {};\n",
+            ),
+            (
+                "src/preact.ts",
+                "import { JSX } from \"preact\";\nexport {};\n",
+            ),
             (
                 "src/pragma.tsx",
                 "/** @jsxImportSource preact */\nexport const v = 1;\n",
@@ -1938,6 +2994,20 @@ mod tests {
                 "/// <reference path=../x.d.ts />\nexport {};\n",
             ),
             ("src/escaped.ts", "export const \\u0061 = 1;\n"),
+            // `.d.ts` は `declare` を省いた module 宣言も書ける。
+            (
+                "types/bare.d.ts",
+                "import 'react';\nmodule 'react' { function memo(value: unknown): never; }\n",
+            ),
+            // `@types/react` と、node_modules を通るパスも、`react` と同じ宣言ファイルを指す。
+            (
+                "src/types.ts",
+                "import '@types/react';\ndeclare module '@types/react' { interface Attributes { legacy?: never } }\n",
+            ),
+            (
+                "src/env.ts",
+                "import '../node_modules/@types/react';\ndeclare module '../node_modules/@types/react' { function memo(value: unknown): never; }\n",
+            ),
         ] {
             let (directory, audit) = audit(&[
                 (".ignore", "types/\n"),
@@ -1970,6 +3040,21 @@ mod tests {
             (
                 "src/types.ts",
                 "/// <reference types=\"node\" />\n/// <reference lib=\"dom\" />\nexport {};\n",
+            ),
+            // リポジトリの中のモジュールの augmentation (`module.exports` の語も含む)。
+            (
+                "src/augment.ts",
+                "import './store';\ndeclare module './store' { interface Store { extra?: string } }\n",
+            ),
+            ("src/legacy.js", "module.exports = { value: 1 };\n"),
+            // React 19 の型で `JSX.Element` を書くための import は、React の型をそのまま参照する。
+            (
+                "src/other.tsx",
+                "import type { JSX } from \"react\";\nexport function Other(): JSX.Element { return <b />; }\n",
+            ),
+            (
+                "src/other.tsx",
+                "import { type JSX, useState } from \"react\";\nexport const s = useState;\nexport type E = JSX.Element;\n",
             ),
         ] {
             let (_directory, audit) = audit(&[

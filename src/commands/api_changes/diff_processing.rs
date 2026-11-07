@@ -1323,7 +1323,12 @@ fn compatible_modification(
     }
     // TS/TSX の引数 object type literal へ optional プロパティを追加しただけなら、
     // 既存呼び出しが渡す object はそのまま受理されるため compatible_modified として扱う。
-    if let Some(compat) = detect_optional_object_props_compatible_mod(site, sources) {
+    if let Some(compat) = detect_optional_object_props_compatible_mod(
+        site,
+        sources,
+        &mut caches.react_memo,
+        diff_files,
+    ) {
         return Some(compat);
     }
     // 同一ファイル内で有限 literal union の値集合が old/new 同値と証明できる type alias

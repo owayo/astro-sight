@@ -6,7 +6,7 @@ use super::source_pair::{CompatibleModSite, SignatureSourceCache};
 use super::ts_const_arg::{collect_bindings_named, declarator_is_const};
 
 /// 本文内のローカル束縛と、module の同名宣言を区別する。
-fn is_module_binding(mut node: Node<'_>) -> bool {
+pub(super) fn is_module_binding(mut node: Node<'_>) -> bool {
     while let Some(parent) = node.parent() {
         match parent.kind() {
             "program" => return true,

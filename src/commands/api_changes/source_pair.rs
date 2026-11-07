@@ -146,4 +146,16 @@ impl<'b> SignatureSourceCache<'b> {
             .get_or_insert_with(|| site.load_sources(base_blobs))
             .as_ref()
     }
+
+    /// 同じ diff のほかのファイル `path` の、base 側の中身。信頼境界の外のパスと、読めない
+    /// ときは None。
+    pub(crate) fn read_base(&self, site: &CompatibleModSite<'_>, path: &str) -> Option<Vec<u8>> {
+        if !crate::engine::impact::is_safe_diff_path(path) {
+            return None;
+        }
+        match self.base_blobs {
+            Some(blobs) => blobs.read(path),
+            None => git_show_blob(site.dir, site.base, path),
+        }
+    }
 }

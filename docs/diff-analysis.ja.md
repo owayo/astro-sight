@@ -539,6 +539,8 @@ rest・computed key・入れ子・キーや束縛の重複・新しい別名は�
 
 新しい束縛は、関数本体直下の lexical 宣言・関数宣言と、同じ関数 scope の `var` 束縛に衝突してはならない。未知の宣言形式は blocking を維持する。本体内の通常の参照が持つ意味は、この互換性の証明では検証しない。
 
+React の `memo()` で包んだ関数部品は、変更の前後で包み方が同じなら、包んだ関数で証明する (`export const Tag = memo(function Tag(props) { … })` や arrow 関数)。宣言は、型注釈の無い一意なトップレベルの `const` で、初期化子 (括弧は透過する) が `memo` (`memo as m` も) に function 式か arrow 関数を 1 つだけ渡すこと。関数の種類と、その前後のトークン (`export const Tag = memo(` と `);`) は変えない。比較関数・型引数・`React.memo`・`memo` の中の `forwardRef`・ほかの wrapper は、包んだ関数の新しい型に合うことを証明できないので、従来の分類を維持する。その名前は `"react"` からの値の named import の `memo` だけで束縛し (`import type`・`{ type memo }` は不可)、ファイルのどこにも module のほかの束縛・`var` 宣言・書き込みが無いこと。`react` は、相対でない import の解決器が、ルートの `package.json` の registry の依存に解決すること (`paths`・`baseUrl`・`typeRoots`・classic の解決・ワークスペースのパッケージ・registry でない上書きがあれば証明しない)。解析するディレクトリの全体も、後述の JSX の証明と同じ監査を通ること。この証明では、ignore に関係なくすべての TS/JS のソースを流して読み、在庫のファイル数の上限は掛けない。diff はその環境を変えないこと。`tsconfig*.json` / `jsconfig*.json`、`extends`・`references` で読む設定、`package.json`、パッケージマネージャの設定、ロックファイル、Yarn の PnP のファイル、`lerna.json` を変えず、変えた TS/JS のソースの変更前の中身も同じ監査を通ること。改名したファイルは証明しない。包まない関数と同じく、部品の利用 (余分なプロパティを持つ値の spread や、props の `keyof`) は検査しない。
+
 `optional_object_props_removed` では、旧新の宣言を AST のトークンで比べる。inline object 型から消えてよいのは、通常の名前の optional な `property_signature` と、その分割代入の束縛だけである。残りのメンバー、残りの束縛（別名・既定値を含む）とその順序、引数の kind、ヘッダ、戻り値型は変えない。method・call・construct・index signature、union、引数全体の既定値、rest、2 個目の引数は blocking を維持する。
 
 残ったプロパティと戻り値型が参照する型は、同じファイルの型別名と interface をたどり、旧新で一致することを確かめる。ほかのファイルの型はたどらない。相対パスで import した型は証明しない。宣言のファイルにある別の export を経由して、変わった型が戻ってくることがあるためである。registry の依存から import した型と、リポジトリで宣言していない大域の型（lib や `@types` のもの）は、diff が宣言のファイル以外を 1 つも変えていないときだけ受け入れる。lock ファイルと `package.json` の変更も、ほかのファイルの変更に数える。import 文が変わらないことも条件。リポジトリのどこか（ignore したファイルを含む）で宣言した大域の型（`declare global` の中や、module でない TS ファイルのトップレベル）は証明しない。`typeof`・`infer`・mapped type と、class・enum・namespace への参照は証明しない。
@@ -550,9 +552,12 @@ JSX の名前空間を差し替えると、属性を書かない要素でも型�
 - リポジトリのどれかの `tsconfig*.json` / `jsconfig*.json`、またはいちばん近い祖先の設定にある `jsxFactory`・`jsxFragmentFactory`・`react` 以外の `jsxImportSource`
 - 同じ設定の、`react` やその配下（`react/jsx-runtime` など）に当たり得る `paths` のキー（`*` を含む）と、ローカルの `react` がある `baseUrl`
 - tsconfig / jsconfig の `extends`・`references` が指す、パッケージの設定やディレクトリの外の設定と、読めない設定
-- リポジトリのどれかの TS / JS / `.d.ts` のファイルにある、`JSX` という名前を作る宣言・公開（`export { Types as JSX }`・`import JSX = ...`・`declare global` や module の augmentation の中の `namespace JSX` など）
+- リポジトリのどれかの TS / JS / `.d.ts` のファイルにある、`JSX` という名前を作る宣言・公開（`export { Types as JSX }`・`import JSX = ...`・`declare global` や module の augmentation の中の `namespace JSX` など。`import type { JSX } from "react"` のように、React の `JSX` を同じ名前で束縛するだけの import は認める）
 - 同じファイルの `@jsx`・`@jsxImportSource`・`@jsxFrag` などの pragma コメント（TypeScript は pragma の名前の大文字小文字を区別しない）
-- 同じファイルの `declare module "react"`・`"react/jsx-runtime"`・`"react/jsx-dev-runtime"` の augmentation
+- 同じファイルの `declare module "react"`・`"react/jsx-runtime"`・`"react/jsx-dev-runtime"` の augmentation。`declare` を省いた module 宣言（`.d.ts` で書ける）、`@types/react` とその配下の augmentation、`node_modules` を通る相対・絶対の指定子（`"../node_modules/@types/react"` など）の augmentation も同じく数える
+- `node_modules` の中か解析するディレクトリの外を指す `paths` の置き換え先と `baseUrl`、`\` を含む `baseUrl`。どの設定もプロジェクトとして、`extends` で引き継ぐ `baseUrl` と `paths`（自分の値、無ければ後に書いた `extends` の先の値）で解く。置き換え先は、その `baseUrl`（無ければ `paths` を書いた設定のディレクトリ）から、`*` に区切りの無い名前と空を入れて解く。`*` の隣の固定の `.` が捕獲と合わせて `..` になり得るもの（`.*`・`*.` など）も証明しない。`${configDir}` は、その値を実効値とする設定 (自分の値か、後に書いた `extends` の先の値が前のものを上書きする) のディレクトリに置き換える（`files`・`include`・`typeRoots`・相対の `types` と、ローカルの `react` を探す `baseUrl` も同じ）
+- ディレクトリのどこかの `package.json` の `types`・`typings`・`main`・`module`・`exports`・`typesVersions`・`imports` が、ディレクトリの外を指すもの。ディレクトリの import・`types`・reference から、そのファイルが入口になり得る。ディレクトリの祖先の `package.json` で、`imports`（`#` の指定子）か、`name` と `exports`（自己参照）を持つものも同じ
+- ディレクトリの外へ出る指定子。外のファイルは監査しないが、import で TypeScript のプログラムに入り得る。そのため、指定子を持つ TS のソース（どれかの設定が `allowJs`・`checkJs` を有効にすれば JS のソースも。`jsconfig.json` は既定で有効）を全て解析し、`import`・`export … from`・`import()`（型の位置を含む）・`require()`・`import x = require()`・`declare module` の指定子を調べる。外へ解かれる相対・絶対のパス、ほかのどこかに `..` を含む指定子と、`paths` の別名（実際の `*` の捕獲を入れて、使う設定ごとに解く）か `baseUrl` の下の解決が外へ出る指定子、escape と行の継続を含む文字列（復号しない）があれば証明しない。JS のソースでは、JSDoc の `@import … from "…"`・`import("…")` 型も依存になるので、コメントの中のそれらの指定子も数える。指定子でない文字列・ほかのコメントと、TypeScript が解決しない動的な指定子（`import(name)`・置換のある template）は数えない
 - 同じファイルの `/// <reference no-default-lib="true" />`、取り込む先のファイルが無い `path`、registry の依存でない `types`
 
 reference directive は TypeScript と同じく読む。タグと属性の名前の大文字小文字を区別せず、`=` の前後の空白（タブを含む）と、どちらの引用符も認める。
@@ -576,7 +581,7 @@ reference directive は TypeScript と同じく読む。タグと属性の名前
 
 registry から入れた依存のパッケージ（`node_modules` の中身）は、リポジトリのソースに依存せず、React が定める標準の JSX の契約を変えないものとして信頼する。どちらとも決められないものは、従来の判定を維持する。
 
-監査は、ignore に関係なく、`node_modules` と `.git` を除く全てのファイルを対象にする。対象はソース・`.d.ts`・`tsconfig*.json` / `jsconfig*.json`・`package.json` で、設定と `package.json` は全部読む。走査のソースは、解析した一覧で調べる。走査から外れたファイルは、同じ 1 回の読みで、依存を調べる TS 系のファイルと、印のある TS / JS 系のファイルだけを解析する。印は `JSX`・`declare`・`@jsx`・`<reference`（後の 2 つは大文字小文字を区別しない）と、ASCII の識別子の文字を表す Unicode の escape である。解析した量は、上の共有する上限に数える。大域の型は、大域の宣言を持ち得る外の TS のファイル（module でないものと `global` を含むもの）だけを読み直し、名前が現れるものを解析する。props の証明は、監査を確かめてから走査の外の利用を探す。権限が無くて開けないディレクトリは外す。同じ利用者が動かす型検査も、そのディレクトリを読めないためである。
+監査は、ignore に関係なく、`node_modules` と `.git` を除く全てのファイルを対象にする。対象はソース・`.d.ts`・`tsconfig*.json` / `jsconfig*.json`・`package.json` で、設定と `package.json` は全部読む。走査のソースは、解析した一覧で調べる。走査から外れたファイルは、同じ 1 回の読みで、依存を調べる TS 系のファイルと、印のある TS / JS 系のファイルだけを解析する。印は `JSX`・`declare`・`module`（宣言ファイルだけ）・`@jsx`・`<reference`（後の 2 つは大文字小文字を区別しない）と、ASCII の識別子の文字を表す Unicode の escape である。解析した量は、上の共有する上限に数える。大域の型は、大域の宣言を持ち得る外の TS のファイル（module でないものと `global` を含むもの）だけを読み直し、名前が現れるものを解析する。props の証明は、監査を確かめてから走査の外の利用を探す。権限が無くて開けないディレクトリは外す。同じ利用者が動かす型検査も、そのディレクトリを読めないためである。
 
 次のどれかがあるときは、監査を作らない。監査が無ければ props の証明はせず、末尾の引数の証明は、解決できない import を 1 つも受け入れない。
 

@@ -238,25 +238,33 @@ impl DependencySnapshot {
                         else {
                             continue;
                         };
-                        let references =
-                            if let Some(annotation) = variable.child_by_field_name("type") {
-                                let mut references = References::default();
-                                references.add(annotation, source, &[]);
-                                references
-                            } else if let Some(function) = variable
-                                .child_by_field_name("value")
-                                .and_then(super::callable::unwrap_parentheses)
-                                .filter(|n| {
-                                    matches!(n.kind(), "arrow_function" | "function_expression")
-                                })
-                            {
-                                header_references(function, source, &[])
-                            } else {
-                                References {
-                                    unknown: true,
-                                    ..References::default()
+                        let references = if let Some(annotation) =
+                            variable.child_by_field_name("type")
+                        {
+                            let mut references = References::default();
+                            references.add(annotation, source, &[]);
+                            references
+                        } else if let Some(function) = variable
+                            .child_by_field_name("value")
+                            .and_then(super::callable::unwrap_parentheses)
+                            .and_then(|value| {
+                                if matches!(value.kind(), "arrow_function" | "function_expression")
+                                {
+                                    Some(value)
+                                } else {
+                                    // `react` の `memo()` の公開型は、包んだ関数の型から作る
+                                    // (Issue #266)。
+                                    super::react_memo::react_memo_function(root, source, value)
                                 }
-                            };
+                            })
+                        {
+                            header_references(function, source, &[])
+                        } else {
+                            References {
+                                unknown: true,
+                                ..References::default()
+                            }
+                        };
                         snapshot.insert_declaration(name, references);
                     }
                 }

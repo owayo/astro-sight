@@ -20,6 +20,7 @@ mod object_members;
 mod outside;
 mod pattern_extension;
 mod react;
+mod react_memo;
 mod removed_params;
 mod removed_props;
 mod repository_audit;
@@ -40,6 +41,7 @@ pub(crate) use function_params::*;
 pub(crate) use literal_union::*;
 pub(crate) use object_members::*;
 pub(crate) use react::*;
+pub(crate) use react_memo::ReactMemoCache;
 pub(crate) use removed_params::{
     OptionalRemovalCache, detect_trailing_optional_params_removed_compatible_mod,
     optional_removal_words,
