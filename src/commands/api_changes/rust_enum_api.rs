@@ -39,6 +39,7 @@ use std::ops::ControlFlow;
 
 use tree_sitter::Node;
 
+use super::rust_cfg_predicate::*;
 use super::rust_type_api::*;
 use crate::engine::tree_walk::{Children, Walk, walk_preorder};
 
@@ -76,227 +77,6 @@ impl Variant {
     /// 並べるときの鍵 (名前と cfg の条件)。
     fn sort_key(&self) -> (String, Vec<Vec<String>>) {
         (self.key.clone(), condition_keys(&self.conditions))
-    }
-}
-
-/// 比べる述語の原子の数の上限 (組み合わせは 2 のその数乗)。超えれば壊す扱いにする。
-const MAX_ATOMS: usize = 16;
-
-/// cfg の述語。原子 (`unix`・`feature = "x"` など) は番号で表す。`All(vec![])` は真、
-/// `Any(vec![])` は偽。
-#[derive(Clone, Debug)]
-enum Predicate {
-    Atom(usize),
-    All(Vec<Predicate>),
-    Any(Vec<Predicate>),
-    Not(Box<Predicate>),
-}
-
-impl Predicate {
-    fn always() -> Self {
-        Self::All(Vec::new())
-    }
-
-    /// 原子の真偽 `config` (番号のビット) で成り立つか。
-    fn holds(&self, config: u64) -> bool {
-        match self {
-            Self::Atom(index) => config & (1 << index) != 0,
-            Self::All(parts) => parts.iter().all(|part| part.holds(config)),
-            Self::Any(parts) => parts.iter().any(|part| part.holds(config)),
-            Self::Not(inner) => !inner.holds(config),
-        }
-    }
-}
-
-/// `name ( .. )` の形 (外側の括弧が組になる) なら、名前と括弧の中。
-fn call(tokens: &[String]) -> Option<(&str, &[String])> {
-    let (name, rest) = tokens.split_first()?;
-    let inner = rest
-        .strip_prefix(&["(".to_owned()])?
-        .strip_suffix(&[")".to_owned()])?;
-    let mut depth = 0usize;
-    for token in inner {
-        match token.as_str() {
-            "(" => depth += 1,
-            ")" => depth = depth.checked_sub(1)?,
-            _ => {}
-        }
-    }
-    (depth == 0).then_some((name.as_str(), inner))
-}
-
-/// 括弧の外の `,` で分けた並び (空のものは除く)。
-fn split_commas(tokens: &[String]) -> Vec<&[String]> {
-    let mut parts = Vec::new();
-    let mut depth = 0usize;
-    let mut start = 0;
-    for (index, token) in tokens.iter().enumerate() {
-        match token.as_str() {
-            "(" | "[" | "{" => depth += 1,
-            ")" | "]" | "}" => depth = depth.saturating_sub(1),
-            "," if depth == 0 => {
-                if index > start {
-                    parts.push(&tokens[start..index]);
-                }
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    if tokens.len() > start {
-        parts.push(&tokens[start..]);
-    }
-    parts
-}
-
-/// 1 つの値しか取らない cfg の鍵 (`target_os = "linux"` と `target_os = "windows"` は同時に
-/// 真にならない)。`feature`・`target_family`・`target_feature` などは複数の値を取る。
-const SINGLE_VALUED: [&str; 8] = [
-    "target_arch",
-    "target_os",
-    "target_env",
-    "target_abi",
-    "target_endian",
-    "target_pointer_width",
-    "target_vendor",
-    "panic",
-];
-
-/// 文字列のリテラル (`"x"`・`r"x"`・`r#"x"#`) の中身。読めなければ None。
-fn string_value(literal: &str) -> Option<String> {
-    if let Some(rest) = literal.strip_prefix('r') {
-        let hashes = rest.len() - rest.trim_start_matches('#').len();
-        let inner = rest.get(hashes..rest.len().checked_sub(hashes)?)?;
-        return Some(inner.strip_prefix('"')?.strip_suffix('"')?.to_owned());
-    }
-    let inner = literal.strip_prefix('"')?.strip_suffix('"')?;
-    let mut value = String::new();
-    let mut chars = inner.chars();
-    while let Some(character) = chars.next() {
-        if character != '\\' {
-            value.push(character);
-            continue;
-        }
-        value.push(match chars.next()? {
-            'n' => '\n',
-            't' => '\t',
-            'r' => '\r',
-            '0' => '\0',
-            escaped @ ('\\' | '"' | '\'') => escaped,
-            _ => return None,
-        });
-    }
-    Some(value)
-}
-
-/// 述語の原子の表。同じ字面の原子は同じ番号にする (旧新で共有する)。
-#[derive(Default)]
-struct Atoms(Vec<Vec<String>>);
-
-impl Atoms {
-    /// 1 つの値しか取らない鍵ごとの、原子の番号のビット。
-    fn exclusive(&self) -> Vec<u64> {
-        let mut masks: BTreeMap<&str, u64> = BTreeMap::new();
-        for (index, atom) in self.0.iter().enumerate() {
-            if let [key, equals, _] = atom.as_slice()
-                && equals == "="
-                && SINGLE_VALUED.contains(&key.as_str())
-            {
-                *masks.entry(key.as_str()).or_default() |= 1 << index;
-            }
-        }
-        masks.into_values().collect()
-    }
-
-    fn atom(&mut self, tokens: &[String]) -> Predicate {
-        // `key = "value"` の値は、書き方 (raw 文字列・エスケープ) に依らず中身で比べる。
-        let normalized: Vec<String> = match tokens {
-            [key, equals, value] if equals == "=" => match string_value(value) {
-                Some(value) => vec![key.clone(), equals.clone(), format!("{value:?}")],
-                None => tokens.to_vec(),
-            },
-            _ => tokens.to_vec(),
-        };
-        let tokens = normalized.as_slice();
-        let index = match self.0.iter().position(|atom| atom.as_slice() == tokens) {
-            Some(index) => index,
-            None => {
-                self.0.push(tokens.to_vec());
-                self.0.len() - 1
-            }
-        };
-        Predicate::Atom(index)
-    }
-
-    /// cfg の述語 (`all(..)`・`any(..)`・`not(..)` と原子)。読めない形は字面全体を 1 つの原子にする。
-    fn predicate(&mut self, tokens: &[String]) -> Predicate {
-        // `cfg(true)`・`cfg(false)` は定数。
-        match tokens {
-            [literal] if literal == "true" => return Predicate::always(),
-            [literal] if literal == "false" => return Predicate::Any(Vec::new()),
-            _ => {}
-        }
-        if let Some((name, inner)) = call(tokens)
-            && matches!(name, "all" | "any" | "not")
-        {
-            let parts: Vec<Predicate> = split_commas(inner)
-                .into_iter()
-                .map(|part| self.predicate(part))
-                .collect();
-            match name {
-                "all" => return Predicate::All(parts),
-                "any" => return Predicate::Any(parts),
-                _ => {
-                    if let Ok([only]) = <[Predicate; 1]>::try_from(parts) {
-                        return Predicate::Not(Box::new(only));
-                    }
-                }
-            }
-        }
-        self.atom(tokens)
-    }
-
-    /// 属性 `key` (`cfg(..)` と、`cfg` を含む `cfg_attr(..)`) の付いたものが有る条件。
-    /// `cfg_attr(P, cfg(Q))` は P のときだけ `cfg(Q)` を付けるので `not(P) or Q`。
-    fn presence(&mut self, key: &[String]) -> Predicate {
-        match call(key) {
-            Some(("cfg", inner)) => self.predicate(inner),
-            Some(("cfg_attr", inner)) => {
-                let parts = split_commas(inner);
-                let Some((predicate, attributes)) = parts.split_first() else {
-                    return self.atom(key);
-                };
-                let predicate = self.predicate(predicate);
-                let applied = Predicate::All(
-                    attributes
-                        .iter()
-                        .map(|attribute| self.presence(attribute))
-                        .collect(),
-                );
-                Predicate::Any(vec![Predicate::Not(Box::new(predicate)), applied])
-            }
-            _ => self.atom(key),
-        }
-    }
-
-    /// 属性 `key` の中の、効かせる属性 (`non_exhaustive`・`repr(..)`) と、それが効く条件
-    /// (入れ子の `cfg_attr` の述語が全て成り立つとき)。
-    fn payloads(&mut self, key: &[String]) -> Vec<(Predicate, Vec<String>)> {
-        let Some(("cfg_attr", inner)) = call(key) else {
-            return vec![(Predicate::always(), key.to_vec())];
-        };
-        let parts = split_commas(inner);
-        let Some((predicate, attributes)) = parts.split_first() else {
-            return Vec::new();
-        };
-        let predicate = self.predicate(predicate);
-        let mut payloads = Vec::new();
-        for attribute in attributes {
-            for (inner, payload) in self.payloads(attribute) {
-                payloads.push((Predicate::All(vec![predicate.clone(), inner]), payload));
-            }
-        }
-        payloads
     }
 }
 
@@ -602,14 +382,6 @@ impl RustEnumShape {
 
     /// 原子の表 `atoms` で読んだ、variant・フィールド・`#[non_exhaustive]`・`#[repr]` の条件。
     fn conditions(&self, atoms: &mut Atoms) -> Conditions {
-        let presence = |attributes: &[Attr], atoms: &mut Atoms| {
-            Predicate::All(
-                attributes
-                    .iter()
-                    .map(|attribute| atoms.presence(&attribute.key))
-                    .collect(),
-            )
-        };
         let restriction = |unconditional: bool, conditional: &[Attr], atoms: &mut Atoms| {
             let mut parts = Vec::new();
             if unconditional {
@@ -617,7 +389,10 @@ impl RustEnumShape {
             }
             for attribute in conditional {
                 for (predicate, payload) in atoms.payloads(&attribute.key) {
-                    if payload.first().is_some_and(|name| name == "non_exhaustive") {
+                    if payload
+                        .first()
+                        .is_some_and(|name| unraw(name) == "non_exhaustive")
+                    {
                         parts.push(predicate);
                     }
                 }
@@ -625,22 +400,20 @@ impl RustEnumShape {
             Predicate::Any(parts)
         };
         let mut conditions = Conditions {
-            present: presence(&self.conditions, atoms),
+            present: atoms.present(&self.conditions),
             variants: Vec::with_capacity(self.variants.len()),
             fields: Vec::with_capacity(self.variants.len()),
             restricted_variants: Vec::with_capacity(self.variants.len()),
             restricted: restriction(self.non_exhaustive, &self.conditional_non_exhaustive, atoms),
-            repr: vec![(Predicate::always(), self.repr())],
+            repr: atoms.reprs(&self.layout),
         };
         for variant in &self.variants {
-            conditions
-                .variants
-                .push(presence(&variant.conditions, atoms));
+            conditions.variants.push(atoms.present(&variant.conditions));
             conditions.fields.push(
                 variant
                     .fields
                     .iter()
-                    .map(|field| presence(&field.conditions, atoms))
+                    .map(|field| atoms.present(&field.conditions))
                     .collect(),
             );
             conditions.restricted_variants.push(restriction(
@@ -649,13 +422,6 @@ impl RustEnumShape {
                 atoms,
             ));
         }
-        for key in conditional_repr(&self.layout) {
-            for (predicate, payload) in atoms.payloads(&key) {
-                let mut items = conditional_repr_items(&payload);
-                items.remove(&vec!["Rust".to_owned()]);
-                conditions.repr.push((predicate, items));
-            }
-        }
         conditions
     }
 
@@ -663,17 +429,13 @@ impl RustEnumShape {
     fn values_observable(&self) -> bool {
         let mut atoms = Atoms::default();
         let conditions = self.conditions(&mut atoms);
-        if atoms.0.len() > MAX_ATOMS {
+        let Some(mut configs) = atoms.configs() else {
             return true;
-        }
-        let exclusive = atoms.exclusive();
-        (0..1u64 << atoms.0.len())
-            .filter(|config| possible(*config, &exclusive))
-            .any(|config| {
-                effective(self, &conditions, config).is_some_and(|shape| {
-                    shape.present && (shape.castable() || shape.layout_defined())
-                })
-            })
+        };
+        configs.any(|config| {
+            effective(self, &conditions, config)
+                .is_some_and(|shape| shape.present && (shape.castable() || shape.layout_defined()))
+        })
     }
 
     /// API の signature として出す表示。variant は宣言の順 (値を観測できない enum は名前の順) で、
@@ -795,48 +557,6 @@ fn defined_repr(items: &BTreeSet<Vec<String>>) -> bool {
         && !(transparent && items.len() > 1)
 }
 
-/// `#[cfg_attr(.., repr(..))]` の鍵の中の `repr` の項目。
-fn conditional_repr_items(key: &[String]) -> BTreeSet<Vec<String>> {
-    let mut items = BTreeSet::new();
-    let mut position = 0;
-    while position + 1 < key.len() {
-        if key[position] != "repr" || key[position + 1] != "(" {
-            position += 1;
-            continue;
-        }
-        let mut depth = 0usize;
-        let mut item = Vec::new();
-        position += 2;
-        while let Some(token) = key.get(position) {
-            position += 1;
-            match token.as_str() {
-                "(" => depth += 1,
-                ")" if depth == 0 => break,
-                ")" => depth -= 1,
-                "," if depth == 0 => {
-                    if !item.is_empty() {
-                        items.insert(std::mem::take(&mut item));
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-            item.push(token.clone());
-        }
-        if !item.is_empty() {
-            items.insert(item);
-        }
-    }
-    items
-}
-
-/// 起こり得る組み合わせか (1 つの値しか取らない鍵の原子は、同時に 2 つ真にならない)。
-fn possible(config: u64, exclusive: &[u64]) -> bool {
-    exclusive
-        .iter()
-        .all(|mask| (config & mask).count_ones() <= 1)
-}
-
 /// variant・フィールド・`#[non_exhaustive]`・`#[repr]` が効く条件。
 struct Conditions {
     /// enum が有る条件。
@@ -913,17 +633,11 @@ fn effective<'a>(
             restricted: conditions.restricted_variants[index].holds(config),
         });
     }
-    let mut repr = BTreeSet::new();
-    for (predicate, items) in &conditions.repr {
-        if predicate.holds(config) {
-            repr.extend(items.iter().cloned());
-        }
-    }
     Some(EffectiveEnum {
         present: conditions.present.holds(config),
         variants,
         restricted: conditions.restricted.holds(config),
-        repr,
+        repr: effective_repr(&conditions.repr, config),
         outlives,
     })
 }
@@ -1163,12 +877,11 @@ pub(crate) fn classify(old: &RustEnumShape, new: &RustEnumShape) -> ShapeChange 
     // cfg の原子の真偽の組み合わせ (設定) ごとに比べる。
     let mut atoms = Atoms::default();
     let (old_conditions, new_conditions) = (old.conditions(&mut atoms), new.conditions(&mut atoms));
-    if atoms.0.len() > MAX_ATOMS {
+    let Some(configs) = atoms.configs() else {
         return Breaking;
-    }
-    let exclusive = atoms.exclusive();
+    };
     let mut compared = false;
-    for config in (0..1u64 << atoms.0.len()).filter(|config| possible(*config, &exclusive)) {
+    for config in configs {
         // 旧い enum が無いか、同じ名前が 2 つ有ってビルドできない設定は比べない。
         let Some(old_enum) = effective(old, &old_conditions, config).filter(|shape| shape.present)
         else {
@@ -1273,7 +986,9 @@ mod tests {
         let shape = shape(source);
         let mut atoms = Atoms::default();
         let conditions = shape.conditions(&mut atoms);
-        let results: Vec<bool> = (0..1u64 << atoms.0.len())
+        let results: Vec<bool> = atoms
+            .configs()
+            .expect("configs")
             .filter_map(|config| effective(&shape, &conditions, config))
             .map(|shape| shape.castable())
             .collect();
@@ -1361,32 +1076,5 @@ mod tests {
             ),
             (false, false)
         );
-    }
-
-    #[test]
-    fn predicates_follow_cfg_and_cfg_attr() {
-        let tokens = |text: &str| -> Vec<String> { text.split(' ').map(str::to_owned).collect() };
-        let mut atoms = Atoms::default();
-        // any / all / not と原子
-        let predicate = atoms.predicate(&tokens("any ( unix , all ( windows , not ( test ) ) )"));
-        assert_eq!(atoms.0.len(), 3);
-        assert!(predicate.holds(0b001));
-        assert!(predicate.holds(0b010));
-        assert!(!predicate.holds(0b110));
-        // cfg_attr(P, cfg(Q)) は not(P) or Q
-        let mut atoms = Atoms::default();
-        let presence = atoms.presence(&tokens("cfg_attr ( a , cfg ( b ) )"));
-        assert!(presence.holds(0b00));
-        assert!(!presence.holds(0b01));
-        assert!(presence.holds(0b11));
-        // 入れ子の cfg_attr の中の属性は、述語が全て成り立つときに効く
-        let mut atoms = Atoms::default();
-        let payloads = atoms.payloads(&tokens("cfg_attr ( a , cfg_attr ( b , repr ( C ) ) )"));
-        let [(predicate, payload)] = payloads.as_slice() else {
-            panic!("{payloads:?}");
-        };
-        assert_eq!(payload, &tokens("repr ( C )"));
-        assert!(!predicate.holds(0b01));
-        assert!(predicate.holds(0b11));
     }
 }

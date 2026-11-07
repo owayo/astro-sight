@@ -507,6 +507,47 @@ fn rust_private_fn_is_not_exported() {
     assert!(!check_exported("fn foo() {}", LangId::Rust, "foo"));
 }
 
+/// Rust の union は種類 `union` のシンボルで、構造体と同じく可視性を書けば公開の候補 (Issue #277)。
+/// `pub(crate)` などの制限は API の差分の側で除く。
+#[test]
+fn rust_union_is_extracted_and_exported() {
+    let symbols = syms_of(
+        "pub union Value {
+    pub number: u32,
+}
+
+union Hidden {
+    value: u8,
+}
+",
+        LangId::Rust,
+    );
+    let kinds: Vec<(&str, SymbolKind)> = symbols
+        .iter()
+        .map(|symbol| (symbol.name.as_str(), symbol.kind))
+        .collect();
+    assert_eq!(
+        kinds,
+        [("Value", SymbolKind::Union), ("Hidden", SymbolKind::Union)]
+    );
+    assert_eq!(symbols[0].to_compact(false).kind, SymbolKind::Union);
+    assert!(
+        serde_json::to_string(&symbols[0].to_compact(false))
+            .expect("json")
+            .contains("\"kind\":\"union\"")
+    );
+    assert!(check_exported(
+        "pub union Value { pub number: u32 }",
+        LangId::Rust,
+        "Value"
+    ));
+    assert!(!check_exported(
+        "union Value { number: u32 }",
+        LangId::Rust,
+        "Value"
+    ));
+}
+
 #[test]
 fn swift_public_struct_is_exported() {
     assert!(check_exported(

@@ -912,10 +912,12 @@ impl<'a> ChangedSignatureFiles<'a> {
         ) {
             return (change, SignatureDecision::Omit);
         }
-        // Rust の公開構造体と enum の形の変更は、中の利用を同じ差分で直しても外の利用者 (構造体式・
-        // フィールドの読み書き・variant の構築と照合) を直せないので、閉包や同じファイルの中だけの
-        // 利用による除外より先に決める (Issue #270・#276)。旧新の形を読めなければ blocking に残す。
-        if self.lang_id == Some(crate::language::LangId::Rust) && matches!(kind, "struct" | "enum")
+        // Rust の公開構造体・enum・union の形の変更は、中の利用を同じ差分で直しても外の利用者
+        // (構造体式・フィールドの読み書き・variant の構築と照合) を直せないので、閉包や同じファイルの
+        // 中だけの利用による除外より先に決める (Issue #270・#276・#277)。旧新の形を読めなければ
+        // blocking に残す。
+        if self.lang_id == Some(crate::language::LangId::Rust)
+            && matches!(kind, "struct" | "enum" | "union")
         {
             let site = CompatibleModSite {
                 dir,
@@ -937,21 +939,27 @@ impl<'a> ChangedSignatureFiles<'a> {
                         new,
                     )
                 })
-                .and_then(|sources| {
-                    if kind == "struct" {
+                .and_then(|sources| match kind {
+                    "struct" => {
                         let old = super::rust_struct_api::unique_struct_shape(&sources.old, name)?;
                         let new = super::rust_struct_api::unique_struct_shape(&sources.new, name)?;
                         Some(super::rust_struct_api::classify(&old, &new))
-                    } else {
+                    }
+                    "enum" => {
                         let old = super::rust_enum_api::unique_enum_shape(&sources.old, name)?;
                         let new = super::rust_enum_api::unique_enum_shape(&sources.new, name)?;
                         Some(super::rust_enum_api::classify(&old, &new))
                     }
+                    _ => {
+                        let old = super::rust_union_api::unique_union_shape(&sources.old, name)?;
+                        let new = super::rust_union_api::unique_union_shape(&sources.new, name)?;
+                        Some(super::rust_union_api::classify(&old, &new))
+                    }
                 });
-            let reason = if kind == "struct" {
-                "rust_struct_shape_compatible"
-            } else {
-                "rust_enum_shape_compatible"
+            let reason = match kind {
+                "struct" => "rust_struct_shape_compatible",
+                "enum" => "rust_enum_shape_compatible",
+                _ => "rust_union_shape_compatible",
             };
             let decision = match shapes {
                 // 整形・型の引数の改名・外から見えない変更だけで、公開の形は同じ。

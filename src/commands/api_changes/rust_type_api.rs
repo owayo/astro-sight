@@ -1044,6 +1044,21 @@ pub(super) fn condition_prefix(conditions: &[Attr]) -> String {
     })
 }
 
+/// 公開でないフィールドの表示。無条件のものがあれば `..`、cfg の付いたものだけなら条件ごとに
+/// `#[cfg(..)] ..`。
+pub(super) fn private_summary<'a>(fields: impl Iterator<Item = &'a Field>) -> Vec<String> {
+    let mut conditional = BTreeMap::new();
+    for field in fields.filter(|field| !field.public) {
+        if field.conditions.is_empty() {
+            return vec!["..".to_owned()];
+        }
+        conditional
+            .entry(condition_keys(&field.conditions))
+            .or_insert_with(|| format!("{}..", condition_prefix(&field.conditions)));
+    }
+    conditional.into_values().collect()
+}
+
 /// フィールドの前に付いた属性のうち、`cfg` と `cfg` を含む `cfg_attr`。
 pub(super) fn field_conditions(attributes: &[Node<'_>], source: &[u8]) -> Option<Vec<Attr>> {
     let mut conditions = Vec::new();
@@ -1336,44 +1351,151 @@ pub(super) fn compare_generics(
     change
 }
 
+/// 整数のリテラル (`8`・`0x8`・`1_0`。接尾辞は無い) の値。
+fn unsuffixed_integer(literal: &str) -> Option<u128> {
+    let digits: String = literal.chars().filter(|c| *c != '_').collect();
+    let (radix, digits) = match digits.get(..2) {
+        Some("0x") => (16, &digits[2..]),
+        Some("0o") => (8, &digits[2..]),
+        Some("0b") => (2, &digits[2..]),
+        _ => (10, digits.as_str()),
+    };
+    u128::from_str_radix(digits, radix).ok()
+}
+
+/// `#[repr]` の項目 1 つを、意味の同じ書き方にそろえる (`packed(1)` と `packed(1,)` は `packed`、
+/// `align(0x8)` は `align(8)`。Rust の参照の alignment modifiers)。
+pub(super) fn normalize_repr_item(item: Vec<String>) -> Vec<String> {
+    // 属性の引数の中の識別子は `r#` を保つので外す (`r#packed` は `packed`)。
+    let item: Vec<String> = item.iter().map(|token| unraw(token).to_owned()).collect();
+    if let [name, open, value, rest @ ..] = item.as_slice()
+        && matches!(name.as_str(), "packed" | "align")
+        && open == "("
+        && (rest == [")"] || rest == [",", ")"])
+        && let Some(value) = unsuffixed_integer(value)
+    {
+        if name == "packed" && value == 1 {
+            return vec![name.clone()];
+        }
+        return vec![
+            name.clone(),
+            open.clone(),
+            value.to_string(),
+            ")".to_owned(),
+        ];
+    }
+    item
+}
+
 /// 無条件の `#[repr(..)]` の項目 (`C`・`u8`・`align(8)` など) の集合。属性を分けて書いても、
-/// 並べ替えても、末尾に `,` があっても同じ。
+/// 並べ替えても、末尾に `,` があっても、`packed` を `packed(1)` と書いても同じ。
 pub(super) fn repr_items(layout: &[Attr]) -> BTreeSet<Vec<String>> {
-    let mut items = BTreeSet::new();
-    for attr in layout.iter().filter(|attr| !attr.is_conditional()) {
-        // `repr` `(` 項目 `,` .. `)`
-        let inner = attr
-            .key
-            .get(2..attr.key.len().saturating_sub(1))
-            .unwrap_or_default();
-        let mut depth = 0usize;
-        let mut item = Vec::new();
-        for token in inner {
-            match token.as_str() {
-                "(" => depth += 1,
-                ")" => depth = depth.saturating_sub(1),
-                "," if depth == 0 => {
-                    if !item.is_empty() {
-                        items.insert(std::mem::take(&mut item));
-                    }
-                    continue;
+    let mut items: BTreeSet<Vec<String>> = layout
+        .iter()
+        .filter(|attr| !attr.is_conditional())
+        .flat_map(|attr| {
+            // `repr` `(` 項目 `,` .. `)`
+            split_repr_items(
+                attr.key
+                    .get(2..attr.key.len().saturating_sub(1))
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    keep_widest_align(&mut items);
+    items
+}
+
+/// `align(N)` が複数あれば、効く最大の値のものだけを残す (Rust の参照の alignment modifiers)。
+pub(super) fn keep_widest_align(items: &mut BTreeSet<Vec<String>>) {
+    let align = |item: &Vec<String>| match item.as_slice() {
+        [name, open, value, close] if name == "align" && open == "(" && close == ")" => {
+            value.parse::<u128>().ok()
+        }
+        _ => None,
+    };
+    let Some(widest) = items.iter().filter_map(align).max() else {
+        return;
+    };
+    items.retain(|item| align(item).is_none_or(|value| value == widest));
+}
+
+/// `repr(..)` の括弧の中 `inner` の項目 (深さ 0 の `,` で分け、意味の同じ書き方にそろえる)。
+pub(super) fn split_repr_items(inner: &[String]) -> Vec<Vec<String>> {
+    let mut items = Vec::new();
+    let mut depth = 0usize;
+    let mut item = Vec::new();
+    for token in inner {
+        match token.as_str() {
+            "(" => depth += 1,
+            ")" => depth = depth.saturating_sub(1),
+            "," if depth == 0 => {
+                if !item.is_empty() {
+                    items.push(normalize_repr_item(std::mem::take(&mut item)));
                 }
-                _ => {}
+                continue;
             }
-            item.push(token.clone());
+            _ => {}
         }
-        if !item.is_empty() {
-            items.insert(item);
-        }
+        item.push(token.clone());
+    }
+    if !item.is_empty() {
+        items.push(normalize_repr_item(item));
     }
     items
 }
 
-/// `#[repr]` を含む `#[cfg_attr]` の鍵。
+/// `tokens[start..]` の、深さ 0 の閉じ括弧の位置 (無ければ長さ)。
+pub(super) fn closing_paren(tokens: &[String], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut position = start;
+    while let Some(token) = tokens.get(position) {
+        match token.as_str() {
+            "(" => depth += 1,
+            ")" if depth == 0 => return position,
+            ")" => depth -= 1,
+            _ => {}
+        }
+        position += 1;
+    }
+    tokens.len()
+}
+
+/// `#[repr]` を含む `#[cfg_attr]` の鍵 (`repr(..)` の項目の書き方と識別子の `r#` をそろえる)。
 pub(super) fn conditional_repr(layout: &[Attr]) -> BTreeSet<Vec<String>> {
     layout
         .iter()
         .filter(|attr| attr.is_conditional())
-        .map(|attr| attr.key.clone())
+        .map(|attr| normalize_layout_key(&attr.key))
         .collect()
+}
+
+/// `#[cfg_attr]` の鍵の `repr(..)` を、項目を意味の同じ書き方にそろえて並べたもの (属性の引数の
+/// 中では識別子の `r#` が残るので `r#repr` も読む)。条件の字面は変えない (`r#true` は名前の付いた
+/// cfg で、定数の `true` ではない)。
+fn normalize_layout_key(key: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(key.len());
+    let mut position = 0;
+    while let Some(token) = key.get(position) {
+        if unraw(token) == "repr" && key.get(position + 1).is_some_and(|next| next == "(") {
+            let end = closing_paren(key, position + 2);
+            let mut items: BTreeSet<Vec<String>> = split_repr_items(&key[position + 2..end])
+                .into_iter()
+                .collect();
+            keep_widest_align(&mut items);
+            out.extend(["repr".to_owned(), "(".to_owned()]);
+            for (index, item) in items.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(",".to_owned());
+                }
+                out.extend(item);
+            }
+            out.push(")".to_owned());
+            position = end + 1;
+            continue;
+        }
+        out.push(token.clone());
+        position += 1;
+    }
+    out
 }

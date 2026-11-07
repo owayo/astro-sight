@@ -433,6 +433,7 @@ fn capture_name_to_kind(name: &str) -> Option<SymbolKind> {
         "class.name" => Some(SymbolKind::Class),
         "struct.name" => Some(SymbolKind::Struct),
         "enum.name" => Some(SymbolKind::Enum),
+        "union.name" => Some(SymbolKind::Union),
         "interface.name" | "trait.name" => Some(SymbolKind::Trait),
         "constant.name" => Some(SymbolKind::Constant),
         "variable.name" => Some(SymbolKind::Variable),
@@ -522,6 +523,7 @@ fn node_kind_to_symbol_kind(kind: &str) -> SymbolKind {
         }
         "struct_item" | "struct_declaration" => SymbolKind::Struct,
         "enum_item" | "enum_declaration" => SymbolKind::Enum,
+        "union_item" => SymbolKind::Union,
         "class_declaration" | "class_definition" => SymbolKind::Class,
         "trait_item" | "interface_declaration" => SymbolKind::Trait,
         "const_item" | "const_declaration" => SymbolKind::Constant,
@@ -545,6 +547,7 @@ fn symbol_query(lang_id: LangId) -> &'static str {
             (trait_item body: (declaration_list (function_signature_item name: (identifier) @function.name)))
             (struct_item name: (type_identifier) @struct.name)
             (enum_item name: (type_identifier) @enum.name)
+            (union_item name: (type_identifier) @union.name)
             (trait_item name: (type_identifier) @trait.name)
             (impl_item type: (type_identifier) @type.name)
             ; generic inherent impl (`impl<T> Holder<T>`) の型名。`generic_type` を

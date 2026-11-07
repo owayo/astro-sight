@@ -610,11 +610,13 @@ mod removed_ffi;
 mod removed_rust_paths;
 mod removed_scope;
 
+mod rust_cfg_predicate;
 mod rust_enum_api;
 mod rust_public;
 mod rust_ref_sites;
 mod rust_struct_api;
 mod rust_type_api;
+mod rust_union_api;
 pub(crate) mod ts_strip_internal;
 
 mod source_pair;

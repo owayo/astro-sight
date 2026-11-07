@@ -80,6 +80,8 @@ fn definition_node_kinds_rust() {
     assert!(kinds.contains(&"function_item"));
     assert!(kinds.contains(&"struct_item"));
     assert!(kinds.contains(&"enum_item"));
+    // union の宣言の名前も定義 (参照に数えると、使われない union が生きて見える。Issue #277)
+    assert!(kinds.contains(&"union_item"));
     assert!(kinds.contains(&"trait_item"));
 }
 

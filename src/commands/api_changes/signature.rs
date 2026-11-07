@@ -74,6 +74,13 @@ pub(crate) fn extract_api_signature(
     {
         return signature;
     }
+    // Rust の union も、公開フィールドと `#[repr]` の公開の形を signature にする (Issue #277)。
+    if lang_id == crate::language::LangId::Rust
+        && sym.kind == SymbolKind::Union
+        && let Some(signature) = super::rust_union_api::union_signature(sym, root, source)
+    {
+        return signature;
+    }
     if matches!(sym.kind, SymbolKind::Function | SymbolKind::Method) {
         let start = tree_sitter::Point {
             row: sym.range.start.line,

@@ -114,7 +114,7 @@ Compact output:
 | Field | Meaning |
 |---|---|
 | `name` | Symbol name |
-| `kind` | Short form of the kind (`fn` / `method` / `class` / `struct` / `enum` / `iface` / `trait` / `var` / `const` / `mod` / `import` / `type` / `field` / `param`) |
+| `kind` | Short form of the kind (`fn` / `method` / `class` / `struct` / `enum` / `union` / `iface` / `trait` / `var` / `const` / `mod` / `import` / `type` / `field` / `param`) |
 | `ln` | Line of the definition (0-indexed) |
 | `cx` | Cyclomatic complexity, for functions and methods only (1 + the number of branch nodes). The counting rules are below the table |
 | `cn` | Name of the container that encloses the symbol. For a method inside `impl Default for AppService`, it is `AppService`. Use it to tell methods with the same name apart |

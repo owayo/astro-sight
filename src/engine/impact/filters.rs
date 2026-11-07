@@ -117,7 +117,7 @@ impl CrossFileFilterContext<'_> {
         // シグネチャ行に型名が出現するだけのケースにも正しく作用する。
         if matches!(
             sym.kind.as_str(),
-            "trait" | "struct" | "class" | "interface" | "enum"
+            "trait" | "struct" | "class" | "interface" | "enum" | "union"
         ) && let Some(s) = overlapping
             && !self.changed_new_lines.contains(&s.range.start.line)
         {

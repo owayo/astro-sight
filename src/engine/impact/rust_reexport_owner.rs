@@ -169,7 +169,12 @@ pub(super) fn owner(
             if namespace == Namespace::Type
                 && matches!(
                     parent.kind(),
-                    "function_item" | "impl_item" | "trait_item" | "struct_item" | "enum_item"
+                    "function_item"
+                        | "impl_item"
+                        | "trait_item"
+                        | "struct_item"
+                        | "enum_item"
+                        | "union_item"
                 )
                 && parent
                     .child_by_field_name("type_parameters")

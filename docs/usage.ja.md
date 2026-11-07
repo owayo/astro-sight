@@ -112,7 +112,7 @@ compact 出力例:
 | フィールド | 意味 |
 |---|---|
 | `name` | シンボル名 |
-| `kind` | 種別の短縮形（`fn` / `method` / `class` / `struct` / `enum` / `iface` / `trait` / `var` / `const` / `mod` / `import` / `type` / `field` / `param`） |
+| `kind` | 種別の短縮形（`fn` / `method` / `class` / `struct` / `enum` / `union` / `iface` / `trait` / `var` / `const` / `mod` / `import` / `type` / `field` / `param`） |
 | `ln` | 定義行（0-indexed） |
 | `cx` | 循環的複雑度。関数/メソッドのみ付与（ベース 1 + 分岐ノード数）。計上規約は表の下を参照 |
 | `cn` | そのシンボルを囲む container の名前。`impl Default for AppService` の中のメソッドなら `AppService`。同名メソッドの見分けに使う |

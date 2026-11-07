@@ -331,7 +331,7 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
         let source_str = std::str::from_utf8(source).unwrap_or("");
         let lines = source_str.lines().collect();
 
-        // 同名別メソッドを区別するため、class/struct/trait/interface/enum を収集する。
+        // 同名別メソッドを区別するため、class/struct/trait/interface/enum/union を収集する。
         // メソッド/関数の範囲を内包する最も内側の要素を qualname に使う。
         let containers = syms
             .iter()
@@ -343,6 +343,7 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
                         | SymbolKind::Trait
                         | SymbolKind::Interface
                         | SymbolKind::Enum
+                        | SymbolKind::Union
                 )
             })
             .collect();
@@ -358,6 +359,7 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
                             | SymbolKind::Trait
                             | SymbolKind::Interface
                             | SymbolKind::Enum
+                            | SymbolKind::Union
                             | SymbolKind::Type
                     )
                 })
@@ -441,7 +443,7 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
             c.name == owner
                 && matches!(
                     c.kind,
-                    SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Class
+                    SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Union | SymbolKind::Class
                 )
         });
         let Some(owner_decl) = decls.next() else {

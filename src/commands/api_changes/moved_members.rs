@@ -106,7 +106,10 @@ impl<'a> MemberFileFacts<'a> {
 
 /// メンバーを持つ型の種別。
 fn is_owner_kind(kind: &str) -> bool {
-    matches!(kind, "class" | "struct" | "trait" | "interface" | "enum")
+    matches!(
+        kind,
+        "class" | "struct" | "trait" | "interface" | "enum" | "union"
+    )
 }
 
 /// 宣言を読む側。移動元は base の旧版、移動先は作業ツリーの新版。

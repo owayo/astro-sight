@@ -124,6 +124,14 @@ fn rust_enum_breaking_changes_are_modified() {
             format!("#[repr(u8)]\n{}", tagged("    A,\n    B,")),
             format!("#[repr(u16)]\n{}", tagged("    A,\n    B,")),
         ),
+        // `cfg_attr` の中の `r#non_exhaustive` も `#[non_exhaustive]` (属性の引数の中では `r#` が残る)
+        (
+            tagged("    A,\n    B,"),
+            format!(
+                "#[cfg_attr(feature = \"x\", r#non_exhaustive)]\n{}",
+                tagged("    A,\n    B,")
+            ),
+        ),
         // `repr(u8)` のデータを持つ enum の、名前付きのフィールドの並べ替え
         (
             format!("#[repr(u8)]\n{}", tagged("    A { x: u8, y: u16 },")),

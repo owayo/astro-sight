@@ -380,6 +380,7 @@ pub(crate) fn definition_node_kinds(lang_id: LangId) -> &'static [&'static str] 
             "function_signature_item", // trait メソッド宣言（ボディなし）
             "struct_item",
             "enum_item",
+            "union_item",
             "trait_item",
             "impl_item",
             "const_item",

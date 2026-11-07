@@ -211,6 +211,8 @@ React の `memo()` で包んだ関数部品 (`export const Tag = memo(function T
 
 公開 API の Rust の enum も同じく比べます。variant の削除・改名・形の変更、variant のフィールドの変更、`#[non_exhaustive]` の無い enum への variant の追加、`#[non_exhaustive]` の追加、クレートの外から観測できる discriminant の値 (`as` か `repr(C)`・`repr(<int>)` のレイアウト) の変更は blocking な `api.mod` にし、`#[non_exhaustive]` の enum への variant の追加など今の利用を壊さない変更は `mod_compat` の理由 `rust_enum_shape_compatible` にします。
 
+Rust の `union` は種類 `union` のシンボルで、公開 API の union も公開の形で比べます。`pub` のフィールドの削除・改名・型の変更・制限、`#[repr]` の変更、全てのフィールドが `pub` の `#[repr]` の union へのフィールドの追加、クレートの外から作れる union への型の引数の追加 (値は 1 つのフィールドで作るので、新しい引数を推論できないことがある) は blocking な `api.mod` にします。union の値は 1 つのフィールドで作るので、`pub` のフィールドの追加は `mod_compat` の理由 `rust_union_shape_compatible` とし、フィールドの並べ替えや `pub` でないフィールドの変更は報告しません。
+
 ファイルをコンパイルする TypeScript の設定が `stripInternal` を有効にすると、`api_changes` は出力する宣言ファイルを使う利用者から見た API として比べます。export やメンバーへの `@internal` の付け足しは、その削除と同じ区分になります (export は `api.rm` / `api.rm_dead`、インタフェースや object 型のメンバーは、それを含む型や関数の変更)。
 
 呼び出し側を同じ diff で変更した場合も、inline object 型の引数から消したキーを渡していないことを確かめてから `mod_closed` にします。削除キーを含む JSX 属性・object リテラルや、spread・計算キー・引用符付きキー・変数の引数・暗黙の JSX children などキーを確定できない形は `api.mod` と hook の `impacts` に残ります。interface / object 型の type alias のプロパティ削除も、値の構築と利用の証明に失敗した参照を変更行だけで解決済みにはしません。
