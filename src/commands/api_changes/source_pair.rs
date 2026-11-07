@@ -35,6 +35,7 @@ impl<'a> CompatibleModSite<'a> {
     /// 互換変更 1 件を組み立てる。`file` は常に新側パス。
     pub(crate) fn compatible(&self, reason: &str) -> CompatibleApiModification {
         CompatibleApiModification {
+            inline_module: None,
             name: self.name.to_string(),
             kind: self.kind.to_string(),
             file: self.new_path.to_string(),

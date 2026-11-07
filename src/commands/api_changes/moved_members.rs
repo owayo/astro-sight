@@ -43,6 +43,7 @@ impl<'a> MemberFileFacts<'a> {
                 PreparedDiffFile::Added {
                     new_syms,
                     in_file_callees,
+                    ..
                 } => (None, new_syms.as_deref().zip(Some(in_file_callees))),
                 PreparedDiffFile::Deleted { old_syms, .. } => (old_syms.as_deref(), None),
                 PreparedDiffFile::Modified {
@@ -540,6 +541,7 @@ mod tests {
 
     fn candidate(name: &str, kind: &str, file: &str, signature: &str) -> ApiSymbolCandidate {
         ApiSymbolCandidate {
+            inline_module: None,
             name: name.to_owned(),
             kind: kind.to_owned(),
             file: file.to_owned(),
@@ -549,6 +551,8 @@ mod tests {
 
     fn moved(name: &str, kind: &str, from: &str, to: &str) -> MovedSymbol {
         MovedSymbol {
+            from_inline_module: None,
+            to_inline_module: None,
             name: name.to_owned(),
             kind: kind.to_owned(),
             from: from.to_owned(),
@@ -606,10 +610,12 @@ mod tests {
                 PreparedDiffFile::Deleted {
                     old_syms: Some(self.old_syms.clone()),
                     old_source_unverified: false,
+                    rust_declarations: None,
                 },
                 PreparedDiffFile::Added {
                     new_syms: Some(self.new_syms.clone()),
                     in_file_callees: HashSet::new(),
+                    rust_declarations: None,
                 },
             ];
             let files = MemberFileFacts::new(&diff_files, &prepared);
@@ -734,10 +740,12 @@ mod tests {
             PreparedDiffFile::Deleted {
                 old_syms: Some(old_syms.clone()),
                 old_source_unverified: false,
+                rust_declarations: None,
             },
             PreparedDiffFile::Deleted {
                 old_syms: Some(old_syms),
                 old_source_unverified: false,
+                rust_declarations: None,
             },
             PreparedDiffFile::Added {
                 new_syms: Some(vec![
@@ -745,6 +753,7 @@ mod tests {
                     symbol("Packer.pack", "function", NEW_SIG),
                 ]),
                 in_file_callees: HashSet::new(),
+                rust_declarations: None,
             },
         ];
         let files = MemberFileFacts::new(&diff_files, &prepared);
@@ -795,6 +804,7 @@ mod tests {
                     symbol("free", "function", "pub fn free()"),
                 ]),
                 old_source_unverified: false,
+                rust_declarations: None,
             },
             PreparedDiffFile::Added {
                 new_syms: Some(vec![
@@ -803,6 +813,7 @@ mod tests {
                     symbol("free", "function", "pub fn free(n: u32)"),
                 ]),
                 in_file_callees: HashSet::new(),
+                rust_declarations: None,
             },
             PreparedDiffFile::Modified {
                 type_dependencies: Default::default(),
@@ -813,6 +824,7 @@ mod tests {
                 rust_const_additions: HashSet::new(),
                 in_file_callees: HashSet::new(),
                 new_export_surface_names: HashSet::new(),
+                rust_declarations: None,
             },
         ];
         let mut names = HashSet::new();

@@ -168,9 +168,12 @@ fn moved_member_signature_change_checks_calls_inside_the_moved_file() {
 }
 
 /// 移した先に同じ名前のメソッドや関数、同じ名前の型が別にあると組が一意に決まらないので、
-/// 今と同じく api.rm に残す。
+/// 今と同じく api.rm に残す。移動先のファイルの別の inline module に同じ signature の型がある
+/// 例では、型の移動もどちらの型へか決められないので、型も移動にしない (Issue #282)。
 #[test]
 fn moved_member_signature_change_with_ambiguous_destination_stays_removed() {
+    let same_type_in_inline_module =
+        format!("pub struct Packer;\n\npub mod other {{\n{NEW_TYPE}}}\n");
     for new_type in [
         format!(
             "{NEW_TYPE}pub struct Other;\n\nimpl Other {{\n    pub fn pack_with_progress(&self) -> u32 {{\n        0\n    }}\n}}\n"
@@ -199,7 +202,11 @@ fn moved_member_signature_change_with_ambiguous_destination_stays_removed() {
         ),
     ] {
         let api = api_after_move(OLD_TYPE, &new_type, NEW_CALL, Move::DeleteAdd);
-        assert!(packer_moved(&api), "{new_type}: {api:?}");
+        assert_eq!(
+            packer_moved(&api),
+            new_type != same_type_in_inline_module,
+            "{new_type}: {api:?}"
+        );
         assert!(
             api.removed
                 .iter()

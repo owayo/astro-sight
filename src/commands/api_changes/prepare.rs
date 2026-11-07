@@ -126,6 +126,8 @@ pub(crate) struct DetectionState<'a> {
 pub(crate) struct AddedFileFacts<'a> {
     pub(crate) new_syms: &'a [(String, String, String)],
     pub(crate) in_file_callees: &'a HashSet<String>,
+    /// Rust のとき、`new_syms` と同じ順の宣言の文脈 (Issue #282)。
+    pub(crate) rust_declarations: Option<&'a [super::RustDeclarationContext]>,
 }
 
 /// 変更ファイル 1 件について Phase 0 で先取り済みの事実。
@@ -140,6 +142,8 @@ pub(crate) struct ModifiedFileFacts<'a> {
     pub(crate) rust_const_additions: &'a HashSet<String>,
     pub(crate) in_file_callees: &'a HashSet<String>,
     pub(crate) new_export_surface_names: &'a HashSet<String>,
+    /// Rust のとき、旧新の公開シンボルの宣言の文脈 (`old_syms`・`new_syms` と同じ順)。
+    pub(crate) rust_declarations: Option<&'a super::RustDeclarationPair>,
 }
 
 /// シグネチャ変更 1 件を分類するための現場情報。
@@ -170,6 +174,10 @@ pub(crate) struct SignatureChangeSite<'a> {
 
 /// Phase 0 で抽出した diff ファイルごとの exported シンボル。
 /// 抽出は git show / parse を伴うため 1 回だけ行い、name 収集と process_* で共有する。
+///
+/// 差分ファイルのほとんどは `Modified` なので、大きい variant の値を Box にしても間接参照が
+/// 増えるだけで、ほかの variant の分の領域はほとんど節約できない。
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum PreparedDiffFile {
     /// `should_skip_diff_file` で除外されたファイル。
     Skip,
@@ -177,6 +185,8 @@ pub(crate) enum PreparedDiffFile {
     Added {
         new_syms: Option<Vec<(String, String, String)>>,
         in_file_callees: std::collections::HashSet<String>,
+        /// Rust のとき、`new_syms` と同じ順の宣言の文脈 (Issue #282)。
+        rust_declarations: Option<Vec<super::RustDeclarationContext>>,
     },
     /// 削除ファイル (`new_path == "/dev/null"`)、または対応言語でないファイルへの rename
     /// (新側に API 面が無い)。削除 bash 関数の残存参照判定に使う名前を ApiRefIndex へ
@@ -185,6 +195,8 @@ pub(crate) enum PreparedDiffFile {
         old_syms: Option<Vec<(String, String, String)>>,
         /// 指定 base に旧ソースが無い、または diff と照合できない。
         old_source_unverified: bool,
+        /// Rust のとき、`old_syms` と同じ順の宣言の文脈 (Issue #282)。
+        rust_declarations: Option<Vec<super::RustDeclarationContext>>,
     },
     /// 通常の modified ファイル。
     Modified {
@@ -199,6 +211,8 @@ pub(crate) enum PreparedDiffFile {
         /// Phase 0 の単一 parse で先取りし、process_modified_file が再 read+parse
         /// せず使う (perf #2)。
         new_export_surface_names: std::collections::HashSet<String>,
+        /// Rust のとき、旧新の公開シンボルの宣言の文脈 (Issue #282)。
+        rust_declarations: Option<Box<super::RustDeclarationPair>>,
     },
 }
 
@@ -305,8 +319,12 @@ impl PreparedDiff {
         strip_internal: &super::ts_strip_internal::StripInternal,
     ) -> PreparedDiffFile {
         // new_path を 1 回 read+parse して exported / callees を導出 (perf #2)。
-        let facts = extract_new_file_facts(dir, &df.new_path, strip_internal);
+        let mut facts = extract_new_file_facts(dir, &df.new_path, strip_internal);
         self.parse_truncations.extend(facts.parse_truncations);
+        let rust_declarations = facts
+            .exported
+            .as_mut()
+            .and_then(|exported| exported.rust_declarations.take());
         let new_syms = facts.exported.map(|facts| facts.symbols);
         let in_file_callees = facts.callees;
         if let Some(syms) = &new_syms {
@@ -321,6 +339,7 @@ impl PreparedDiff {
         PreparedDiffFile::Added {
             new_syms,
             in_file_callees,
+            rust_declarations,
         }
     }
 
@@ -347,6 +366,7 @@ impl PreparedDiff {
         PreparedDiffFile::Deleted {
             old_syms: facts.symbols,
             old_source_unverified: facts.old_source_unverified,
+            rust_declarations: facts.rust_declarations,
         }
     }
 
@@ -377,11 +397,15 @@ impl PreparedDiff {
             && facts.exported.is_none()
             && facts.language_unknown
         {
+            let rust_declarations = old_facts
+                .as_mut()
+                .and_then(|old| old.rust_declarations.take());
             let old_syms = old_facts.map(|facts| facts.symbols);
             collect_deleted_bash_index_names(df, old_syms.as_deref(), &mut self.index_names);
             return PreparedDiffFile::Deleted {
                 old_syms,
                 old_source_unverified: false,
+                rust_declarations,
             };
         }
         // 同じ parse で得た証拠を比較し、以後は証明済みの名前だけを運ぶ。
@@ -417,6 +441,20 @@ impl PreparedDiff {
             )
             .map(|(old, new)| old.compare(new))
             .unwrap_or_default();
+        let rust_declarations = old_facts
+            .as_mut()
+            .and_then(|old| old.rust_declarations.take())
+            .zip(facts.exported.as_mut().and_then(|new| {
+                let declarations = new.rust_declarations.take()?;
+                Some((declarations, std::mem::take(&mut new.rust_shared_callables)))
+            }))
+            .map(|(old, (new, new_shared_callables))| {
+                Box::new(super::RustDeclarationPair {
+                    old,
+                    new,
+                    new_shared_callables,
+                })
+            });
         let old_syms = old_facts.map(|facts| facts.symbols);
         let new_syms = facts.exported.map(|facts| facts.symbols);
         let in_file_callees = facts.callees;
@@ -449,6 +487,7 @@ impl PreparedDiff {
             rust_const_additions,
             in_file_callees,
             new_export_surface_names,
+            rust_declarations,
         }
     }
 }
@@ -543,6 +582,8 @@ pub(crate) fn collect_modified_file_index_names(
 /// 削除前の公開宣言と、指定 base で旧ソースを検証できたかを一緒に返す。
 pub(crate) struct DeletedSourceFacts {
     pub(crate) symbols: Option<ExportedSymbols>,
+    /// Rust のとき、`symbols` と同じ順の宣言の文脈 (Issue #282)。
+    pub(crate) rust_declarations: Option<Vec<super::RustDeclarationContext>>,
     pub(crate) old_source_unverified: bool,
     pub(crate) analyzable_source: bool,
 }
@@ -603,14 +644,16 @@ pub(crate) fn extract_deleted_file_exported_symbols(
     let analyzable_source = !gitlink
         && (crate::language::LangId::from_path(path).is_ok()
             || source.is_some_and(|src| crate::engine::parser::detect_lang(path, src).is_ok()));
+    let (symbols, rust_declarations) = source
+        .and_then(|src| {
+            super::exported::extract_deleted_exported_facts(&df.old_path, src, strip_internal)
+        })
+        .map_or((None, None), |(symbols, declarations)| {
+            (Some(symbols), declarations)
+        });
     DeletedSourceFacts {
-        symbols: source.and_then(|src| {
-            super::exported::extract_exported_symbols_from_source_with(
-                &df.old_path,
-                src,
-                strip_internal,
-            )
-        }),
+        symbols,
+        rust_declarations,
         old_source_unverified,
         analyzable_source,
     }

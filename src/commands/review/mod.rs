@@ -574,6 +574,7 @@ fn keep_reference_based_downgrades_blocking(api: &mut ApiChanges) {
     let compatible = std::mem::take(&mut api.compatible_modified);
     api.modified
         .extend(compatible.into_iter().map(|change| ApiSymbolChange {
+            inline_module: change.inline_module,
             unverified: None,
             name: change.name,
             kind: change.kind,
@@ -869,12 +870,14 @@ mod snapshot_tests {
             UnresolvedRemovalConfidence, UnresolvedRemovalReason,
         };
         let symbol = |name: &str| ApiSymbol {
+            inline_module: None,
             name: name.into(),
             kind: "function".into(),
             file: "a.ts".into(),
             refs_internal: 0,
         };
         let change = |name: &str| ApiSymbolChange {
+            inline_module: None,
             unverified: None,
             name: name.into(),
             kind: "function".into(),
@@ -888,6 +891,7 @@ mod snapshot_tests {
             modified: vec![change("modified")],
             modified_closed_in_diff: vec![change("closed")],
             compatible_modified: vec![CompatibleApiModification {
+                inline_module: None,
                 name: "compatible".into(),
                 kind: "function".into(),
                 file: "a.ts".into(),

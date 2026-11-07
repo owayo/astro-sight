@@ -183,6 +183,21 @@ pub(crate) fn declaration_in_scope(
     Some(scope_declaration(scope, source, name)?.map(|(kind, _)| kind))
 }
 
+/// Rust のソース `source` の直下にある名前 `name` の唯一の宣言の始まりの位置 (行, 列) と種類
+/// ([`declaration_in_scope`] と同じ条件)。
+pub(crate) fn root_declaration(
+    source: &[u8],
+    name: &str,
+) -> Option<((usize, usize), &'static str)> {
+    let tree = parser::parse_source(source, crate::language::LangId::Rust).ok()?;
+    if tree.root_node().has_error() {
+        return None;
+    }
+    let (kind, node) = scope_declaration(tree.root_node(), source, name)??;
+    let start = node.start_position();
+    Some(((start.row, start.column), kind))
+}
+
 /// ファイル `source` の module のスコープ (直下と inline module の中) にある、名前が `name` の宣言の
 /// 数。構文エラーなら None。
 pub(crate) fn module_scope_declarations(source: &[u8], name: &str) -> Option<usize> {
@@ -225,7 +240,7 @@ fn has_visibility(item: tree_sitter::Node<'_>) -> bool {
 /// 構文木の葉に現れない)、中身の空白も保つ (`"a b"` と `"a  b"` は別)。トークンの間の空白とコメント
 /// の違いは無視するが、マクロの入力 (トークン木) の中の doc コメントは `#[doc]` 属性として渡るので
 /// 足す。連結しないので、区切りの違う並びが同じになることもない。
-type Tokens = Vec<String>;
+pub(crate) type Tokens = Vec<String>;
 
 /// ノード全体を 1 つのトークンにするリテラルの種類。
 const LITERAL_KINDS: [&str; 6] = [
@@ -238,7 +253,7 @@ const LITERAL_KINDS: [&str; 6] = [
 ];
 
 /// `node` のトークンを `tokens` に足す ([`Tokens`])。
-fn push_tokens(node: tree_sitter::Node<'_>, source: &[u8], tokens: &mut Tokens) {
+pub(crate) fn push_tokens(node: tree_sitter::Node<'_>, source: &[u8], tokens: &mut Tokens) {
     push_tokens_in(node, source, false, tokens);
 }
 

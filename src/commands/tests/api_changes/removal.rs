@@ -2955,21 +2955,23 @@ fn detect_api_changes_same_signature_variant_consolidation_is_not_removal() {
         api.modified.iter().map(|s| &s.name).collect::<Vec<_>>()
     );
 
-    // 対照: まとめた結果シグネチャが変わった場合は、旧シグネチャが残らないので削除として報告する。
+    // 対照: まとめた結果シグネチャが変わった場合は、旧シグネチャが残らないので blocking に報告する。
+    // Rust は同じ場所の分岐を宣言の場所で組にするので (Issue #282)、どの分岐も同じシグネチャから
+    // 同じシグネチャへ変わった変更として api.mod 1 件にする。
     fs::write(
         repo.join("src/lib.rs"),
         "pub fn open_url(url: &str) -> Result<(), String> {\n    if url.is_empty() { Err(String::new()) } else { Ok(()) }\n}\n",
     )
     .expect("write lib.rs");
     let api = detect_api_changes_from_worktree(repo);
-    assert_eq!(
-        api.removed
-            .iter()
-            .map(|s| s.name.clone())
-            .collect::<Vec<_>>(),
-        vec!["open_url".to_string(), "open_url".to_string()],
-        "旧シグネチャが残らない統合は blocking な削除として報告すべき。removed_dead={:?}",
-        api.removed_dead.iter().map(|s| &s.name).collect::<Vec<_>>()
+    assert!(removed_names(&api).is_empty(), "{api:?}");
+    assert!(
+        api.modified.iter().any(|change| change.name == "open_url"
+            && change
+                .new_signature
+                .as_deref()
+                .is_some_and(|signature| signature.contains("Result"))),
+        "旧シグネチャが残らない統合は blocking に報告すべき。{api:?}"
     );
 
     // C: `#ifdef` 分岐。

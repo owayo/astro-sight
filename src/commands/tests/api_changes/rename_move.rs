@@ -649,12 +649,14 @@ fn reconcile_with_moves_pairs_by_signature() {
     // moved に分類し、残りだけを返す。
     let added = vec![
         ApiSymbolCandidate {
+            inline_module: None,
             name: "foo".into(),
             kind: "function".into(),
             file: "new.py".into(),
             signature: "def foo():".into(),
         },
         ApiSymbolCandidate {
+            inline_module: None,
             name: "new_api".into(),
             kind: "function".into(),
             file: "new.py".into(),
@@ -663,12 +665,14 @@ fn reconcile_with_moves_pairs_by_signature() {
     ];
     let removed = vec![
         ApiSymbolCandidate {
+            inline_module: None,
             name: "foo".into(),
             kind: "function".into(),
             file: "old.py".into(),
             signature: "def foo():".into(),
         },
         ApiSymbolCandidate {
+            inline_module: None,
             name: "gone".into(),
             kind: "function".into(),
             file: "old.py".into(),
@@ -701,6 +705,7 @@ fn reconcile_with_moves_preserves_removed_input_order() {
     let removed: Vec<ApiSymbolCandidate> = names
         .iter()
         .map(|n| ApiSymbolCandidate {
+            inline_module: None,
             name: (*n).into(),
             kind: "function".into(),
             file: "lib.ts".into(),
@@ -726,6 +731,7 @@ fn reconcile_with_moves_preserves_order_around_matched_entries() {
     let removed: Vec<ApiSymbolCandidate> = ["a", "b", "c", "d"]
         .iter()
         .map(|n| ApiSymbolCandidate {
+            inline_module: None,
             name: (*n).into(),
             kind: "function".into(),
             file: "old.ts".into(),
@@ -734,6 +740,7 @@ fn reconcile_with_moves_preserves_order_around_matched_entries() {
         .collect();
     // 真ん中の `b` だけが移動先で見つかる
     let added = vec![ApiSymbolCandidate {
+        inline_module: None,
         name: "b".into(),
         kind: "function".into(),
         file: "new.ts".into(),
@@ -751,12 +758,14 @@ fn reconcile_with_moves_preserves_order_around_matched_entries() {
 fn reconcile_with_moves_keeps_different_signatures() {
     // 同名でもシグネチャが違うなら相殺しない（signature change の検出漏れ防止）。
     let added = vec![ApiSymbolCandidate {
+        inline_module: None,
         name: "foo".into(),
         kind: "function".into(),
         file: "b.py".into(),
         signature: "def foo(x):".into(),
     }];
     let removed = vec![ApiSymbolCandidate {
+        inline_module: None,
         name: "foo".into(),
         kind: "function".into(),
         file: "a.py".into(),
@@ -780,12 +789,14 @@ fn reconcile_with_moves_uses_filtered_new_candidates_for_pairing() {
     // に残っていれば removed と相殺する。module → package 化リファクタの中核。
     let added: Vec<ApiSymbolCandidate> = Vec::new();
     let removed = vec![ApiSymbolCandidate {
+        inline_module: None,
         name: "rotate_command".into(),
         kind: "function".into(),
         file: "src/cli.py".into(),
         signature: "def rotate_command(name: str):".into(),
     }];
     let all_new_candidates = vec![ApiSymbolCandidate {
+        inline_module: None,
         name: "rotate_command".into(),
         kind: "function".into(),
         file: "src/cli/_commands/rotate.py".into(),
@@ -820,18 +831,21 @@ fn reconcile_with_moves_uses_filtered_new_candidates_for_pairing() {
 #[test]
 fn reconcile_with_moves_keeps_all_removals_for_many_to_one_consolidation() {
     let destination = ApiSymbolCandidate {
+        inline_module: None,
         name: "Store".into(),
         kind: "class".into(),
         file: "shared/store.py".into(),
         signature: "class Store:".into(),
     };
     let removed_a = ApiSymbolCandidate {
+        inline_module: None,
         name: "Store".into(),
         kind: "class".into(),
         file: "pkg_a/store.py".into(),
         signature: "class Store:".into(),
     };
     let removed_b = ApiSymbolCandidate {
+        inline_module: None,
         name: "Store".into(),
         kind: "class".into(),
         file: "pkg_b/store.py".into(),
@@ -894,12 +908,14 @@ fn reconcile_with_moves_keeps_all_removals_for_many_to_one_consolidation() {
 #[test]
 fn reconcile_with_moves_many_to_one_result_is_independent_of_input_order() {
     let destination = ApiSymbolCandidate {
+        inline_module: None,
         name: "Store".into(),
         kind: "class".into(),
         file: "shared/store.py".into(),
         signature: "class Store:".into(),
     };
     let make = |file: &str| ApiSymbolCandidate {
+        inline_module: None,
         name: "Store".into(),
         kind: "class".into(),
         file: file.into(),
@@ -930,12 +946,14 @@ fn reconcile_with_moves_many_to_one_result_is_independent_of_input_order() {
 #[test]
 fn reconcile_with_moves_keeps_removal_when_destination_is_ambiguous() {
     let removed = ApiSymbolCandidate {
+        inline_module: None,
         name: "Store".into(),
         kind: "class".into(),
         file: "pkg_a/store.py".into(),
         signature: "class Store:".into(),
     };
     let dest_one = ApiSymbolCandidate {
+        inline_module: None,
         name: "Store".into(),
         kind: "class".into(),
         file: "shared/store.py".into(),
@@ -973,12 +991,14 @@ fn reconcile_with_moves_keeps_removal_when_destination_is_ambiguous() {
 #[test]
 fn reconcile_with_moves_treats_duplicate_new_candidates_in_same_file_as_one() {
     let destination = ApiSymbolCandidate {
+        inline_module: None,
         name: "Store".into(),
         kind: "class".into(),
         file: "shared/store.py".into(),
         signature: "class Store:".into(),
     };
     let removed = ApiSymbolCandidate {
+        inline_module: None,
         name: "Store".into(),
         kind: "class".into(),
         file: "pkg_a/store.py".into(),
