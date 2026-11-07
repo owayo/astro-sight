@@ -207,6 +207,8 @@ TS/TSX で export した関数の引数が 1 個だけのとき、その inline 
 
 React の `memo()` で包んだ関数部品 (`export const Tag = memo(function Tag({ … }: { … }) { … })` や arrow 関数) の props に省略可能なプロパティを足した変更も、包まない関数部品と同じく、`review --hook` が `mod_compat` の理由 `optional_object_props` として報告します。条件は、包み方が変わらず、`react` から名前で import した `memo` に関数を 1 つだけ渡していることです。比較関数・型引数・`React.memo`・ほかの wrapper は、従来の判定を維持します。`react` がルートの `package.json` の registry の依存で、解析するディレクトリの設定・依存・ソースのどれも React の型を差し替えていないことも求めます。diff が設定・`package.json`・ロックファイルを変えず、変えたソースの変更前の中身も同じ監査を通ることが必要です。条件の一覧は [docs/diff-analysis.ja.md](docs/diff-analysis.ja.md) にあります。
 
+公開 API の Rust の構造体は、`api_changes` が公開の形 (`pub` のフィールドとその型、クレートの外から構築できるか、`#[repr]`・`#[non_exhaustive]`・型の引数・`where`) を Cargo の SemVer の手引きに沿って比べます。`pub` のフィールドの削除・改名・型の変更・制限・位置の移動、外から構築できる構造体への `pub` のフィールドの追加、クレートの外から構築できなくする変更、型の引数の制約を強める変更、寿命の境界の付け外しは、同じ diff でリポジトリの中の利用を直しても、blocking な `api.mod` にします。クレートの外の利用は直らないためです。構築の制限を緩める・境界を緩める・既定値の付いた型の引数を足すなど、今の利用を壊さない変更は `mod_compat` の理由 `rust_struct_shape_compatible` とし、型の引数の改名や、すでにクレートの外から構築できない構造体の `pub` でないフィールドの変更は報告しません。
+
 呼び出し側を同じ diff で変更した場合も、inline object 型の引数から消したキーを渡していないことを確かめてから `mod_closed` にします。削除キーを含む JSX 属性・object リテラルや、spread・計算キー・引用符付きキー・変数の引数・暗黙の JSX children などキーを確定できない形は `api.mod` と hook の `impacts` に残ります。interface / object 型の type alias のプロパティ削除も、値の構築と利用の証明に失敗した参照を変更行だけで解決済みにはしません。
 
 どちらの削除の証明も、同じ信頼の境界を使います。利用の一覧 (消した引数やキーを渡していないかを調べる呼び出しと JSX 要素) は、`.gitignore`・global ignore・隠しファイルの除外に従う走査のソースを全部解析します。この走査にほかの言語のソースや解析できない形式 (`.vue` など) があれば、どちらの証明もしません。
