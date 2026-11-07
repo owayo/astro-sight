@@ -911,6 +911,50 @@ impl<'a> ChangedSignatureFiles<'a> {
         ) {
             return (change, SignatureDecision::Omit);
         }
+        // Rust の公開構造体の形の変更は、中の利用を同じ差分で直しても外の利用者 (構造体式・
+        // フィールドの読み書き) を直せないので、閉包や同じファイルの中だけの利用による除外より先に
+        // 決める (Issue #270)。旧新の形を読めなければ blocking に残す。
+        if self.lang_id == Some(crate::language::LangId::Rust) && kind == "struct" {
+            let site = CompatibleModSite {
+                dir,
+                base: inputs.base,
+                old_path: self.old_path,
+                new_path: self.new_path,
+                name,
+                kind,
+                old_sig,
+                new_sig,
+                lang_id: self.lang_id,
+            };
+            let shapes = super::source_pair::load_new_source(dir, self.new_path)
+                .and_then(|new| {
+                    super::source_pair::load_old_source_with_new(
+                        base_blobs,
+                        self.old_path,
+                        self.new_path,
+                        new,
+                    )
+                })
+                .and_then(|sources| {
+                    Some((
+                        super::rust_struct_api::unique_struct_shape(&sources.old, name)?,
+                        super::rust_struct_api::unique_struct_shape(&sources.new, name)?,
+                    ))
+                });
+            let decision = match shapes
+                .map(|(old, new)| super::rust_struct_api::classify(&old, &new))
+            {
+                // 整形・型の引数の改名・外から見えない変更だけで、公開の形は同じ。
+                Some(super::rust_struct_api::StructChange::Unchanged) => SignatureDecision::Omit,
+                Some(super::rust_struct_api::StructChange::Compatible) => {
+                    SignatureDecision::Compatible(site.compatible("rust_struct_shape_compatible"))
+                }
+                Some(super::rust_struct_api::StructChange::Breaking) | None => {
+                    SignatureDecision::Blocking(None)
+                }
+            };
+            return (change, decision);
+        }
         // 移動先への全参照と const 追加を証明した組は、同一ファイル内だけの caller でも記録する。
         if self.lang_id == Some(crate::language::LangId::Rust)
             && self.rust_moved_const_additions.contains(name)

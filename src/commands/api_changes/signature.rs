@@ -58,6 +58,14 @@ pub(crate) fn extract_api_signature(
     {
         return signature;
     }
+    // Rust の構造体は、先頭行ではなく公開の形 (公開フィールドと、外から構築できるか) を
+    // signature にする。フィールドの変更が API 差分に現れるようにする (Issue #270)。
+    if lang_id == crate::language::LangId::Rust
+        && sym.kind == SymbolKind::Struct
+        && let Some(signature) = super::rust_struct_api::struct_signature(sym, root, source)
+    {
+        return signature;
+    }
     if matches!(sym.kind, SymbolKind::Function | SymbolKind::Method) {
         let start = tree_sitter::Point {
             row: sym.range.start.line,

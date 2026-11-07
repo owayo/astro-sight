@@ -610,6 +610,7 @@ mod removed_scope;
 
 mod rust_public;
 mod rust_ref_sites;
+mod rust_struct_api;
 
 mod source_pair;
 
