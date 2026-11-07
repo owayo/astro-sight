@@ -776,11 +776,42 @@ fn collect_rust_modified_symbols(
     declarations: &RustDeclarationPair,
     files: &mut ChangedSignatureFiles<'_>,
 ) {
+    // 契約が名指す名前の束縛を旧新で比べる (Issue #283)。旧新のソースを読めて構文エラーが無い
+    // ときだけ比べる。
+    let indexes = inputs.base_blobs.read(&df.old_path).and_then(|old_source| {
+        let new_source = load_new_source(inputs.dir, &df.new_path)?;
+        Some((
+            DependencyIndex::new(&old_source, &df.old_path)?,
+            DependencyIndex::new(&new_source, &df.new_path)?,
+        ))
+    });
+    // 定義を差分の中のほかのファイルへ移したかは、そのファイルの旧新を引いて確かめる (索引は
+    // 引くときに作る)。
+    let modules = DiffModules::new(
+        &df.new_path,
+        inputs.diff_files,
+        Box::new(|path: &str| inputs.base_blobs.read(path)),
+        Box::new(|path: &str| load_new_source(inputs.dir, path).map(|source| source.to_vec())),
+    );
+    let dependency = |olds: &[usize], news: &[usize]| {
+        let (old_index, new_index) = indexes.as_ref()?;
+        let old: Vec<RustDeclarationContext> =
+            olds.iter().map(|&i| declarations.old[i].clone()).collect();
+        let new: Vec<RustDeclarationContext> =
+            news.iter().map(|&j| declarations.new[j].clone()).collect();
+        old_index
+            .compare(&old, new_index, &new, &modules)
+            .unverified_reason()
+    };
     for &(old_index, new_index) in &pairing.pairs {
         let (name, _, old_sig) = &facts.old_syms[old_index];
         let (_, kind, new_sig) = &facts.new_syms[new_index];
-        // signature が同じ組は報告しない (型注釈と静的 container の段階は TS・JS だけ)。
-        if old_sig == new_sig || facts.parameter_pattern_only_names.contains(name) {
+        let dependency = dependency(&[old_index], &[new_index]);
+        // signature が同じ組は、名指す名前の束縛も同じなら報告しない (型注釈と静的 container の
+        // 段階は TS・JS だけ)。
+        if dependency.is_none()
+            && (old_sig == new_sig || facts.parameter_pattern_only_names.contains(name))
+        {
             continue;
         }
         let site = RustDeclarationSite {
@@ -788,6 +819,36 @@ fn collect_rust_modified_symbols(
             new_start: declarations.new[new_index].start,
             name_shared: pairing.name_is_shared(name),
             callee_shared: declarations.new_shared_callables.contains(bare_name(name)),
+            dependency,
+        };
+        let inline_module = declarations.new_inline_module(new_index);
+        files.classify_rust(
+            inputs,
+            state,
+            name,
+            kind,
+            old_sig,
+            new_sig,
+            site,
+            inline_module,
+        );
+    }
+    // 同じ場所の分岐で変わっていないとみなしたものも、名指す名前の束縛は分岐ごとに比べる。
+    for (olds, news) in &pairing.unchanged_groups {
+        let Some(dependency) = dependency(olds, news) else {
+            continue;
+        };
+        let (Some(&old_index), Some(&new_index)) = (olds.first(), news.first()) else {
+            continue;
+        };
+        let (name, _, old_sig) = &facts.old_syms[old_index];
+        let (_, kind, new_sig) = &facts.new_syms[new_index];
+        let site = RustDeclarationSite {
+            old_start: declarations.old[old_index].start,
+            new_start: declarations.new[new_index].start,
+            name_shared: true,
+            callee_shared: true,
+            dependency: Some(dependency),
         };
         let inline_module = declarations.new_inline_module(new_index);
         files.classify_rust(
@@ -1024,6 +1085,7 @@ fn reexport_site(
         new_start: target.start,
         name_shared,
         callee_shared,
+        dependency: None,
     }
 }
 
@@ -1388,6 +1450,28 @@ impl<'a> ChangedSignatureFiles<'a> {
             // 型契約変更として種別が確定した時点で埋める (record_signature_decision)。
             contract_change: None,
         };
+        // 契約が名指す名前の指す先が変わったか、同じと確かめられなければ、公開面の外でない限り、
+        // 値だけの変更・互換・同じファイルの中だけ・追随済みとせず blocking にする (Issue #283)。
+        if let Some(reason) = self.rust_site.and_then(|site| site.dependency) {
+            if self.skip_for_binary_crate
+                || is_rust_old_symbol_outside_public_api_surface(
+                    dir,
+                    base_blobs,
+                    self.old_path,
+                    name,
+                    state.rust_public,
+                )
+            {
+                return (change, SignatureDecision::Omit);
+            }
+            return (
+                change,
+                SignatureDecision::Unverified(ApiModificationUnverified {
+                    reason,
+                    first_unproven: None,
+                }),
+            );
+        }
         // 値変更の方針は外部API面から独立。通常のRust定数変更だけ、公開面の抑制より先に残す。
         // 移動では公開面や型所有元の検査を省けないため、従来の判定経路を使う。
         if self.lang_id == Some(crate::language::LangId::Rust)

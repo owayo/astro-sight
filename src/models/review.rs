@@ -324,6 +324,11 @@ pub enum ApiModificationUnverifiedReason {
     /// Rust の同じファイルの同じ場所 (inline module の経路・名前・種類) に同じ名前の宣言が複数
     /// あり (`#[cfg]` の分岐など)、旧新のどの宣言どうしを比べればよいか決められなかった (Issue #282)。
     RustDeclarationPairingAmbiguous,
+    /// Rust の公開シンボルの契約が名指す名前 (`use … as` の別名・非公開の型別名など) の指す先が
+    /// 変わった。契約の字面が同じでも、利用者から見た型が変わり得る (Issue #283)。
+    RustSignatureDependencyChanged,
+    /// Rust の公開シンボルの契約が名指す名前の指す先を解けず、同じと確かめられなかった (Issue #283)。
+    RustSignatureDependencyUnresolved,
 }
 
 /// 変更後ソースの位置。line は refs と同じ 0 始まり。

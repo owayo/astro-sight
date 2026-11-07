@@ -73,7 +73,7 @@ fn is_condition_attribute(attribute: tree_sitter::Node<'_>, source: &[u8]) -> bo
 }
 
 /// `item` の直前に並ぶ外側の属性のうち、`cfg`・`cfg_attr` のトークンの並び (書いた順)。
-fn preceding_conditions(item: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+pub(crate) fn preceding_conditions(item: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
     let mut attributes = Vec::new();
     let mut previous = item.prev_named_sibling();
     while let Some(sibling) = previous {
@@ -96,7 +96,7 @@ fn preceding_conditions(item: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Strin
 }
 
 /// 中身 (`declaration_list`) の内側の属性のうち、`cfg`・`cfg_attr` のトークンの並び。
-fn inner_conditions(body: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+pub(crate) fn inner_conditions(body: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cursor = body.walk();
     for child in body.named_children(&mut cursor) {
@@ -160,7 +160,8 @@ pub(crate) fn rust_declaration_context(
                 .child_by_field_name("name")
                 .and_then(|name| name.utf8_text(source).ok())
         {
-            modules.push(name.to_owned());
+            // `r#api` と `api` は同じ module。
+            modules.push(name.strip_prefix("r#").unwrap_or(name).to_owned());
         }
         node = container;
     }
@@ -183,6 +184,9 @@ pub(crate) struct RustPairing {
     /// 同じキーの宣言が複数あり、旧新で cfg の条件と signature の対応が変わったキーの、旧と新の
     /// 添字の並び。どの宣言どうしを比べればよいか決められない。
     pub(crate) ambiguous: Vec<(Vec<usize>, Vec<usize>)>,
+    /// 同じキーの宣言が複数あり、変わっていないとみなしたキーの、旧と新の添字の並び。契約が名指す
+    /// 名前の束縛は別に比べる (Issue #283)。
+    pub(crate) unchanged_groups: Vec<(Vec<usize>, Vec<usize>)>,
     /// 旧か新に、同じ qualname の宣言が 2 つ以上ある名前。名前で引く判定は別の宣言に当たり得る。
     shared_names: HashSet<String>,
 }
@@ -228,6 +232,7 @@ impl RustPairing {
             added: vec![false; new.len()],
             pairs: Vec::new(),
             ambiguous: Vec::new(),
+            unchanged_groups: Vec::new(),
             shared_names: counts
                 .into_iter()
                 .filter(|(_, (old, new))| *old > 1 || *new > 1)
@@ -255,6 +260,8 @@ impl RustPairing {
                     {
                         if old_signatures != new_signatures {
                             pairing.pairs.push((olds[0], news[0]));
+                        } else {
+                            pairing.unchanged_groups.push((olds, news));
                         }
                         continue;
                     }
@@ -262,6 +269,8 @@ impl RustPairing {
                         != condition_signatures(&news, new, new_declarations)
                     {
                         pairing.ambiguous.push((olds, news));
+                    } else {
+                        pairing.unchanged_groups.push((olds, news));
                     }
                 }
             }
@@ -312,6 +321,9 @@ pub(crate) struct RustDeclarationSite {
     /// 含む) が複数ある。同じファイルの中の呼び出しがどの宣言のものか決められないので、同じ
     /// ファイルの中だけで使う証明にしない。
     pub(crate) callee_shared: bool,
+    /// 契約が名指す名前の指す先が変わったか、同じと確かめられなかったときの理由 (Issue #283)。
+    /// あれば、互換・変更なし・追随済みとせず blocking にする。
+    pub(crate) dependency: Option<crate::models::review::ApiModificationUnverifiedReason>,
 }
 
 /// Rust のソース `source` の、名前が `name` の関数・メソッドの宣言 (非公開・入れ子を含む) の数。

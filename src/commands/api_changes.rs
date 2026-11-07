@@ -643,6 +643,7 @@ mod removed_scope;
 
 mod rust_cfg_predicate;
 mod rust_declarations;
+mod rust_dependencies;
 mod rust_enum_api;
 mod rust_public;
 mod rust_ref_sites;
@@ -687,6 +688,7 @@ pub(crate) use ref_index::*;
 pub(crate) use removed_attribution::*;
 
 pub(crate) use rust_declarations::*;
+pub(crate) use rust_dependencies::*;
 pub(crate) use rust_public::*;
 
 pub(crate) use source_pair::{

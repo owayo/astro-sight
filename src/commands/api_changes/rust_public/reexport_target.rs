@@ -254,33 +254,32 @@ const LITERAL_KINDS: [&str; 6] = [
 
 /// `node` のトークンを `tokens` に足す ([`Tokens`])。
 pub(crate) fn push_tokens(node: tree_sitter::Node<'_>, source: &[u8], tokens: &mut Tokens) {
-    push_tokens_in(node, source, false, tokens);
-}
-
-/// [`push_tokens`] の本体。`in_macro` はマクロの入力 (トークン木) の中か。
-fn push_tokens_in(node: tree_sitter::Node<'_>, source: &[u8], in_macro: bool, tokens: &mut Tokens) {
-    let kind = node.kind();
-    let text = node.utf8_text(source).unwrap_or_default();
-    if matches!(kind, "line_comment" | "block_comment") {
-        if in_macro && is_doc_comment(node) {
-            tokens.push(format!("{kind}:{text}"));
+    // 深い入れ子 (`Option<Option<…>>`) でスタックを溢れさせないよう、明示のスタックで前順に
+    // たどる。`in_macro` はマクロの入力 (トークン木) の中か。
+    let mut stack = vec![(node, false)];
+    while let Some((node, in_macro)) = stack.pop() {
+        let kind = node.kind();
+        let text = node.utf8_text(source).unwrap_or_default();
+        if matches!(kind, "line_comment" | "block_comment") {
+            if in_macro && is_doc_comment(node) {
+                tokens.push(format!("{kind}:{text}"));
+            }
+            continue;
         }
-        return;
-    }
-    if node.child_count() == 0 || LITERAL_KINDS.contains(&kind) {
-        if !text.is_empty() {
-            tokens.push(if node.is_named() {
-                format!("{kind}:{text}")
-            } else {
-                text.to_owned()
-            });
+        if node.child_count() == 0 || LITERAL_KINDS.contains(&kind) {
+            if !text.is_empty() {
+                tokens.push(if node.is_named() {
+                    format!("{kind}:{text}")
+                } else {
+                    text.to_owned()
+                });
+            }
+            continue;
         }
-        return;
-    }
-    let in_macro = in_macro || kind == "token_tree";
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        push_tokens_in(child, source, in_macro, tokens);
+        let in_macro = in_macro || kind == "token_tree";
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        stack.extend(children.into_iter().rev().map(|child| (child, in_macro)));
     }
 }
 
