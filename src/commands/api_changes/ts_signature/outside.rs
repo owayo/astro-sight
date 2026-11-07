@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use tree_sitter::Node;
 
 use super::repository_audit::{
-    ModuleResolution, OutsideSource, PackageBoundary, audit_source, normalize_lexically,
-    reference_attribute, reference_attributes, resolve_module,
+    ModuleResolution, OutsideSource, PackageBoundary, audit_source, is_declaration_file,
+    normalize_lexically, reference_attribute, reference_attributes, resolve_module,
 };
 use super::source_scan::{Budget, Needle, Needles, Scan, scan_file};
 use crate::commands::dead_code_default_liveness::static_specifier;
@@ -34,6 +34,51 @@ const DEPENDENCY_MARKERS: [&str; 4] = ["import", "require", "from", "declare"];
 const AUDIT_MARKERS: [&str; 2] = ["JSX", "declare"];
 /// 監査で調べる印 (大文字小文字を区別しないもの)。`<reference` は依存の印でもある。
 const AUDIT_MARKERS_IGNORE_CASE: [&str; 2] = ["@jsx", "<reference"];
+/// 宣言ファイルだけで調べる印。宣言ファイルは `declare` を省いた `module "react" { … }` も書ける。
+const DECLARATION_MARKER: &str = "module";
+
+/// 依存と監査の印の needle。順に [`DEPENDENCY_MARKERS`]・[`AUDIT_MARKERS`]・
+/// [`AUDIT_MARKERS_IGNORE_CASE`]・[`DECLARATION_MARKER`]。
+fn marker_needles() -> impl Iterator<Item = Needle> {
+    DEPENDENCY_MARKERS
+        .iter()
+        .chain(AUDIT_MARKERS.iter())
+        .map(|marker| Needle::text(marker))
+        .chain(
+            AUDIT_MARKERS_IGNORE_CASE
+                .iter()
+                .map(|marker| Needle::ignore_case(marker)),
+        )
+        .chain(std::iter::once(Needle::text(DECLARATION_MARKER)))
+}
+
+/// [`marker_needles`] を `start` 番から並べた scan の、印の見つかり方。
+struct Marks {
+    /// 依存の指定子を持ち得る。
+    dependency: bool,
+    /// 解析して監査する。
+    audit: bool,
+}
+
+impl Marks {
+    fn read(scan: &Scan, start: usize, relative: &str) -> Self {
+        let audit = start + DEPENDENCY_MARKERS.len();
+        let declaration = audit + AUDIT_MARKERS.len() + AUDIT_MARKERS_IGNORE_CASE.len();
+        Self {
+            dependency: (start..audit).any(|index| scan.found(index))
+                || scan.found(declaration - 1),
+            audit: (audit..declaration).any(|index| scan.found(index))
+                || (is_declaration_file(relative) && scan.found(declaration))
+                || scan.escapes_identifier(),
+        }
+    }
+}
+
+/// `lang` のファイルの指定子が、TypeScript のプログラムにファイルを取り込み得るか。JS 系のファイルは、
+/// どれかの設定が `allowJs`・`checkJs` を有効にしたときだけプログラムに入る。
+pub(super) fn checks_specifiers(lang: LangId, allow_js: bool) -> bool {
+    matches!(lang, LangId::Typescript | LangId::Tsx) || allow_js
+}
 
 /// 在庫の外のファイルを読んで解析する。1 ファイルの上限か、解析する量の残りを超えるとき・
 /// 読めないときは None。
@@ -51,6 +96,51 @@ pub(super) fn parse_outside(
     Some((text, tree))
 }
 
+/// `sources` のうち、監査の印 (JSX の宣言・pragma・`declare`・reference・宣言ファイルの
+/// `module`) か識別子の escape がある TS / JS 系のファイルと、TypeScript のプログラムに入り得て依存の
+/// 印があるファイルを解析して、監査と、指定子が解析するディレクトリの外を指さないか
+/// ([`reaches_outside`]) を確かめる。埋め込みのソースは、在庫の外の走査と同じく監査しない。
+/// 読めない・解析できないファイルがあるとき、読む量か解析する量の残りを超えるときは None。
+pub(super) fn audit_sources(
+    root: &Path,
+    sources: &[OutsideSource],
+    packages: &PackageBoundary,
+    allow_js: bool,
+    budget: &Budget,
+) -> Option<bool> {
+    let needles = Needles::new(marker_needles().collect());
+    for source in sources {
+        let Some(lang) = source.lang else {
+            continue;
+        };
+        let scan = scan_file(&source.path, &needles, budget)?;
+        let marks = Marks::read(&scan, 0, &source.relative);
+        let specifiers = marks.dependency && checks_specifiers(lang, allow_js);
+        if !(marks.audit || specifiers) {
+            continue;
+        }
+        let (text, tree) = parse_outside(&source.path, budget)?;
+        let tree_root = tree.root_node();
+        if tree_root.has_error() {
+            return None;
+        }
+        if !audit_source(root, &source.relative, text.as_ref(), tree_root, packages)?
+            || (specifiers
+                && reaches_outside(
+                    root,
+                    &source.relative,
+                    tree_root,
+                    text.as_ref(),
+                    lang == LangId::Javascript,
+                    &|specifier| packages.bare_reaches_outside(specifier),
+                ))
+        {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
 /// 依存の指定子。
 #[derive(Debug, PartialEq, Eq)]
 enum Dependency {
@@ -65,24 +155,27 @@ enum Dependency {
     Unknown,
 }
 
-/// TS 系のファイルの依存の指定子を集める。
-fn collect_dependencies(root: Node<'_>, source: &[u8]) -> Vec<Dependency> {
-    let mut dependencies = Vec::new();
-    let mut specifier = |node: Option<Node<'_>>| {
-        dependencies.push(
-            node.filter(|node| matches!(node.kind(), "string" | "template_string"))
-                .and_then(|node| static_specifier(node, source))
-                .map_or(Dependency::Unknown, |specifier| {
-                    Dependency::Specifier(specifier.to_owned())
-                }),
-        );
-    };
-    let mut references = Vec::new();
+/// 依存の指定子の場所。
+enum SpecifierSite<'tree> {
+    /// 指定子を書く位置の式 (文字列でなければ静的に決められない)。None は `require` の別名や
+    /// `import.meta` のように、指定子を決められない依存。
+    Expression(Option<Node<'tree>>),
+    /// コメント (`/// <reference …>` を読む)。
+    Comment(Node<'tree>),
+}
+
+/// import・`export … from`・`import()` (型の位置を含む)・`require()`・`import x = require()`・
+/// `declare module` (`*` を含むパターンの ambient module を除く) の指定子と、コメントを順に渡す。
+fn visit_specifier_sites<'tree>(
+    root: Node<'tree>,
+    source: &[u8],
+    mut visit: impl FnMut(SpecifierSite<'tree>),
+) {
     let _ = walk_preorder(root, Children::All, |node, _| {
         match node.kind() {
             "import_statement" | "export_statement" => {
                 if let Some(source_node) = node.child_by_field_name("source") {
-                    specifier(Some(source_node));
+                    visit(SpecifierSite::Expression(Some(source_node)));
                 }
             }
             "import_require_clause" => {
@@ -90,7 +183,7 @@ fn collect_dependencies(root: Node<'_>, source: &[u8]) -> Vec<Dependency> {
                 let string = node
                     .named_children(&mut cursor)
                     .find(|child| child.kind() == "string");
-                specifier(string);
+                visit(SpecifierSite::Expression(string));
             }
             "call_expression" => {
                 let function = node.child_by_field_name("function");
@@ -106,7 +199,7 @@ fn collect_dependencies(root: Node<'_>, source: &[u8]) -> Vec<Dependency> {
                             .named_children(&mut cursor)
                             .find(|child| child.kind() != "comment")
                     });
-                    specifier(first);
+                    visit(SpecifierSite::Expression(first));
                 }
             }
             "identifier" if node.utf8_text(source).ok() == Some("require") => {
@@ -117,10 +210,10 @@ fn collect_dependencies(root: Node<'_>, source: &[u8]) -> Vec<Dependency> {
                             .is_some_and(|function| function.id() == node.id())
                 });
                 if !direct {
-                    specifier(None);
+                    visit(SpecifierSite::Expression(None));
                 }
             }
-            "meta_property" => specifier(None),
+            "meta_property" => visit(SpecifierSite::Expression(None)),
             "module" | "internal_module" => {
                 if let Some(name) = node
                     .child_by_field_name("name")
@@ -129,31 +222,196 @@ fn collect_dependencies(root: Node<'_>, source: &[u8]) -> Vec<Dependency> {
                     // `*` を含む名前はパターンの ambient module で、ファイルに解決される
                     // モジュールを変えない。
                     if !static_specifier(name, source).is_some_and(|name| name.contains('*')) {
-                        specifier(Some(name));
+                        visit(SpecifierSite::Expression(Some(name)));
                     }
                 }
             }
-            "comment" => {
-                let text = String::from_utf8_lossy(&source[node.byte_range()]);
-                if let Some(attributes) = reference_attributes(&text) {
-                    let value = |name: &str| {
-                        reference_attribute(attributes, name)
-                            .filter(|value| !value.is_empty())
-                            .map(str::to_owned)
-                    };
-                    if let Some(types) = value("types") {
-                        references.push(Dependency::ReferenceTypes(types));
-                    } else if let Some(path) = value("path") {
-                        references.push(Dependency::ReferencePath(path));
-                    }
-                }
-            }
+            "comment" => visit(SpecifierSite::Comment(node)),
             _ => {}
         }
         ControlFlow::<(), Walk>::Continue(Walk::Descend)
     });
+}
+
+/// TS 系のファイルの依存の指定子を集める。
+fn collect_dependencies(root: Node<'_>, source: &[u8]) -> Vec<Dependency> {
+    let mut dependencies = Vec::new();
+    let mut references = Vec::new();
+    visit_specifier_sites(root, source, |site| match site {
+        SpecifierSite::Expression(node) => dependencies.push(
+            node.filter(|node| matches!(node.kind(), "string" | "template_string"))
+                .and_then(|node| static_specifier(node, source))
+                .map_or(Dependency::Unknown, |specifier| {
+                    Dependency::Specifier(specifier.to_owned())
+                }),
+        ),
+        SpecifierSite::Comment(node) => {
+            let text = String::from_utf8_lossy(&source[node.byte_range()]);
+            if let Some(attributes) = reference_attributes(&text) {
+                let value = |name: &str| {
+                    reference_attribute(attributes, name)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                };
+                if let Some(types) = value("types") {
+                    references.push(Dependency::ReferenceTypes(types));
+                } else if let Some(path) = value("path") {
+                    references.push(Dependency::ReferencePath(path));
+                }
+            }
+        }
+    });
     dependencies.extend(references);
     dependencies
+}
+
+/// `relative` (`dir` 相対) のファイル (構文木 `tree_root`) の指定子に、解析するディレクトリの外の
+/// ファイルを TypeScript のプログラムへ取り込み得るものがあるか。外のファイルは監査しないので、
+/// React の型を差し替え得る。`./`・`../` で始まる相対のパスと絶対パスは、字句の上で解いて外へ出れば
+/// 数える。ほかの指定子 (パッケージ名や `paths` の別名) は `bare` で決める
+/// ([`PackageBoundary::bare_reaches_outside`])。escape と行の継続 (`\`) は解かずに数える。式の
+/// 指定子と、置換のある template は TypeScript が解決しないので数えない。`/// <reference path>` は
+/// 監査 ([`audit_source`]) が見る。`javascript` (JS 系のファイル) なら、JSDoc の
+/// `@import … from "…"`・`import("…")` 型も型の依存になるので、コメントの中のそれらの指定子も同じ
+/// 規則で数える。
+pub(super) fn reaches_outside(
+    root: &Path,
+    relative: &str,
+    tree_root: Node<'_>,
+    source: &[u8],
+    javascript: bool,
+    bare: &dyn Fn(&str) -> bool,
+) -> bool {
+    let directory = root.join(Path::new(relative).parent().unwrap_or(Path::new("")));
+    let target = Specifiers {
+        root,
+        directory: &directory,
+        bare,
+    };
+    let mut outside = false;
+    visit_specifier_sites(tree_root, source, |site| match site {
+        SpecifierSite::Expression(Some(node)) => {
+            outside = outside || target.node_reaches_outside(node, source);
+        }
+        SpecifierSite::Comment(node) if javascript && !outside => {
+            outside = target.comment_reaches_outside(&source[node.byte_range()]);
+        }
+        _ => {}
+    });
+    outside
+}
+
+/// 1 つのファイルの指定子を、外を指すかで調べる。
+struct Specifiers<'a> {
+    root: &'a Path,
+    directory: &'a Path,
+    bare: &'a dyn Fn(&str) -> bool,
+}
+
+impl Specifiers<'_> {
+    fn node_reaches_outside(&self, node: Node<'_>, source: &[u8]) -> bool {
+        if !matches!(node.kind(), "string" | "template_string") {
+            return false;
+        }
+        let mut cursor = node.walk();
+        if node
+            .named_children(&mut cursor)
+            .any(|child| child.kind() == "template_substitution")
+        {
+            return false;
+        }
+        node.utf8_text(source)
+            .ok()
+            .and_then(|text| text.get(1..text.len().checked_sub(1)?))
+            .is_none_or(|text| self.text_reaches_outside(text))
+    }
+
+    /// JS のコメントの中の JSDoc の型の依存 (`@import … from "…"` と `import("…")` 型) の指定子が、
+    /// 外を指すか。説明文の引用符 (`Don't` など) や出典の `from "URL"` に左右されないよう、`import(`
+    /// の後ろと、`@import` のタグの中 (次のタグか、コメントの終わりまで) の単語の `from` の後ろの、
+    /// 引用符で始まる文字列だけを読む (`@import { from } from "…"` のように、名前の `from` の後ろは
+    /// 引用符で始まらない)。行頭の `*` (複数行の JSDoc) は空白と同じく読み飛ばす。閉じない文字列は
+    /// 外を指し得るものとして数える。
+    fn comment_reaches_outside(&self, comment: &[u8]) -> bool {
+        let Ok(text) = std::str::from_utf8(comment) else {
+            return true;
+        };
+        let mut rests: Vec<&str> = words_followed_by(text, "import")
+            .into_iter()
+            .filter_map(|rest| skip_jsdoc_space(rest).strip_prefix('('))
+            .collect();
+        for (index, tag) in text.match_indices("@import") {
+            let tag_text = &text[index + tag.len()..];
+            rests.extend(words_followed_by(jsdoc_tag(tag_text), "from"));
+        }
+        rests
+            .into_iter()
+            .filter_map(quoted_prefix)
+            .any(|specifier| specifier.is_none_or(|specifier| self.text_reaches_outside(specifier)))
+    }
+
+    /// 指定子の文字列 `text` が外を指し得るか。
+    fn text_reaches_outside(&self, text: &str) -> bool {
+        if text.contains('\\') {
+            return true;
+        }
+        let bytes = text.as_bytes();
+        let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+        let relative =
+            text == "." || text == ".." || text.starts_with("./") || text.starts_with("../");
+        if relative || text.starts_with('/') || drive {
+            let path = if relative {
+                self.directory.join(text)
+            } else {
+                PathBuf::from(text)
+            };
+            return !normalize_lexically(&path).is_some_and(|path| path.starts_with(self.root));
+        }
+        (self.bare)(text)
+    }
+}
+
+/// JSDoc のタグの本文: 次のタグ (行頭か空白の後の `@`) の前か、コメントの終わりまで。
+fn jsdoc_tag(text: &str) -> &str {
+    let mut previous = ' ';
+    for (index, character) in text.char_indices() {
+        if character == '@' && (previous.is_whitespace() || previous == '*') {
+            return &text[..index];
+        }
+        previous = character;
+    }
+    text
+}
+
+/// `text` の中の単語 `keyword` の、それぞれの後ろの部分。
+fn words_followed_by<'a>(text: &'a str, keyword: &str) -> Vec<&'a str> {
+    let identifier =
+        |character: char| character.is_alphanumeric() || matches!(character, '_' | '$');
+    text.match_indices(keyword)
+        .filter_map(|(index, _)| {
+            let before = text[..index].chars().next_back();
+            let rest = &text[index + keyword.len()..];
+            let next = rest.chars().next();
+            (!before.is_some_and(identifier) && !next.is_some_and(identifier)).then_some(rest)
+        })
+        .collect()
+}
+
+/// 空白と、複数行の JSDoc の行頭の `*` を読み飛ばす。
+fn skip_jsdoc_space(text: &str) -> &str {
+    text.trim_start_matches(|character: char| character.is_whitespace() || character == '*')
+}
+
+/// 空白 (と JSDoc の行頭の `*`) の後ろが引用符で始まれば、閉じるまでの文字列 (閉じなければ
+/// `Some(None)`)。
+fn quoted_prefix(rest: &str) -> Option<Option<&str>> {
+    let rest = skip_jsdoc_space(rest);
+    let quote = rest
+        .chars()
+        .next()
+        .filter(|character| matches!(character, '"' | '\'' | '`'))?;
+    let body = &rest[1..];
+    Some(body.find(quote).map(|end| &body[..end]))
 }
 
 /// `.mts`・`.cts` か、トップレベルに import / export 文がある (module である)。
@@ -225,6 +483,7 @@ impl OutsideScan {
         sources: Vec<OutsideSource>,
         words: Vec<String>,
         packages: Option<&PackageBoundary>,
+        allow_js: bool,
         budget: &Budget,
     ) -> Option<Self> {
         let marker_start = words.len();
@@ -232,17 +491,9 @@ impl OutsideScan {
             words
                 .iter()
                 .map(|word| Needle::word(word))
-                .chain(DEPENDENCY_MARKERS.iter().map(|marker| Needle::text(marker)))
-                .chain(AUDIT_MARKERS.iter().map(|marker| Needle::text(marker)))
-                .chain(
-                    AUDIT_MARKERS_IGNORE_CASE
-                        .iter()
-                        .map(|marker| Needle::ignore_case(marker)),
-                )
+                .chain(marker_needles())
                 .collect(),
         );
-        let dependency_range = marker_start..marker_start + DEPENDENCY_MARKERS.len();
-        let audit_range = dependency_range.end..needles.len();
         let mut jsx_standard = packages.map(|_| true);
         let mut files = Vec::new();
         for source in sources {
@@ -252,11 +503,13 @@ impl OutsideScan {
             if let Some(lang) = source.lang {
                 let ts = matches!(lang, LangId::Typescript | LangId::Tsx);
                 global_capable = ts;
-                let dependency_marked = dependency_range.clone().any(|index| scan.found(index))
-                    || scan.found(needles.len() - 1);
-                let audit_marked =
-                    audit_range.clone().any(|index| scan.found(index)) || scan.escapes_identifier();
-                if (ts && dependency_marked) || audit_marked {
+                let marks = Marks::read(&scan, marker_start, &source.relative);
+                let dependency_marked = marks.dependency;
+                let audit_marked = marks.audit;
+                // JS 系のファイルは、allowJs・checkJs で TypeScript のプログラムに入るときだけ、
+                // 外を取り込む指定子を確かめる。
+                let specifiers = dependency_marked && checks_specifiers(lang, allow_js);
+                if (ts && dependency_marked) || audit_marked || specifiers {
                     let (text, tree) = parse_outside(&source.path, budget)?;
                     let tree_root = tree.root_node();
                     if tree_root.has_error() {
@@ -276,7 +529,19 @@ impl OutsideScan {
                                 tree_root,
                                 packages,
                             )
-                            .map(|outside| standard && outside);
+                            .map(|outside| {
+                                standard
+                                    && outside
+                                    && !(specifiers
+                                        && reaches_outside(
+                                            root,
+                                            &source.relative,
+                                            tree_root,
+                                            text.as_ref(),
+                                            !ts,
+                                            &|specifier| packages.bare_reaches_outside(specifier),
+                                        ))
+                            });
                         }
                     }
                 }

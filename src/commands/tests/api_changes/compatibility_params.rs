@@ -1918,12 +1918,25 @@ export const PLAIN: string[] = [\n  // 説明を書き直した\n  \"y\",\n];\n"
 /// base の `files` をコミットし、作業ツリーへ `changes` を書いてから、`name` の API 差分の区分を
 /// 返す (どこにも無ければ "none")。
 fn bucket_after(files: &[(&str, &str)], changes: &[(&str, &str)], name: &str) -> &'static str {
+    bucket_after_removing(files, changes, &[], name)
+}
+
+/// [`bucket_after`] に加えて、作業ツリーから `removed` のファイルを消す。
+fn bucket_after_removing(
+    files: &[(&str, &str)],
+    changes: &[(&str, &str)],
+    removed: &[&str],
+    name: &str,
+) -> &'static str {
     let dir = tempfile::tempdir().expect("tempdir");
     let repo = dir.path();
     init_git_repo_for_test(repo);
     git_commit_files(repo, files, "base");
     for (path, content) in changes {
         fs::write(repo.join(path), content).expect("write");
+    }
+    for path in removed {
+        fs::remove_file(repo.join(path)).expect("remove");
     }
     let api = detect_api_changes_from_worktree(repo);
     if api.modified.iter().any(|c| c.name == name) {
@@ -2037,4 +2050,383 @@ fn ts_required_object_prop_comment_keeps_shared_const_closure() {
             "{build_new}"
         );
     }
+}
+
+const TAG_LIST: &str = "import { Tag } from \"./tag\";\n\nexport function List() {\n\treturn <Tag text=\"new\" />;\n}\n";
+const TAG_TSCONFIG: &str = "{ \"compilerOptions\": { \"jsx\": \"react-jsx\" } }\n";
+
+/// `memo(` から `)` までを差し替えた `src/tag.tsx`。`{wrap}` に内側の関数を入れる。
+fn memo_tag(import: &str, wrap: &str, props: &str) -> String {
+    let function = format!("function Tag({props}) {{\n\treturn <span>{{text}}</span>;\n}}");
+    format!(
+        "{import}\n\nexport const Tag = {};\n",
+        wrap.replace("{fn}", &function)
+    )
+}
+
+/// `memo_tag` の変更前と変更後 (省略可能な `outlined` を足す) の組。
+fn memo_tag_pair(import: &str, wrap: &str) -> (String, String) {
+    (
+        memo_tag(import, wrap, "{ text }: { text: string }"),
+        memo_tag(
+            import,
+            wrap,
+            "{\n\ttext,\n\toutlined = false,\n}: {\n\ttext: string;\n\toutlined?: boolean;\n}",
+        ),
+    )
+}
+
+/// 共通の base (package.json・tsconfig.json・利用側) に `extra` を足し、`src/tag.tsx` を
+/// `old` → `new` に変えたときの `Tag` の区分。`changes` は同じ差分で変えるほかのファイル。
+fn memo_bucket(
+    package: &str,
+    extra: &[(&str, &str)],
+    old: &str,
+    new: &str,
+    changes: &[(&str, &str)],
+) -> &'static str {
+    memo_bucket_removing(package, extra, old, new, changes, &[])
+}
+
+/// [`memo_bucket`] に加えて、同じ差分で `removed` のファイルを消す。
+fn memo_bucket_removing(
+    package: &str,
+    extra: &[(&str, &str)],
+    old: &str,
+    new: &str,
+    changes: &[(&str, &str)],
+    removed: &[&str],
+) -> &'static str {
+    let mut files = vec![
+        ("package.json", package),
+        ("tsconfig.json", TAG_TSCONFIG),
+        ("src/tag.tsx", old),
+        ("src/list.tsx", TAG_LIST),
+    ];
+    for (path, content) in extra {
+        match files.iter_mut().find(|(existing, _)| existing == path) {
+            Some(entry) => entry.1 = content,
+            None => files.push((path, content)),
+        }
+    }
+    let mut after = vec![("src/tag.tsx", new)];
+    after.extend_from_slice(changes);
+    bucket_after_removing(&files, &after, removed, "Tag")
+}
+
+/// React の `memo()` で包んだ関数部品の props の型リテラルに省略可能なプロパティを足すだけの変更は、
+/// 包まない関数部品と同じく `optional_object_props` の互換 (Issue #266)。function 式・arrow 関数・
+/// `memo as m`・括弧・同じ差分での利用側の変更でも同じ。
+#[test]
+fn ts_react_memo_optional_object_prop_is_compatible() {
+    let import = "import { memo } from \"react\";";
+    for (import, wrap) in [
+        (import, "memo({fn})"),
+        (import, "memo(({fn}))"),
+        ("import { memo as m } from \"react\";", "m({fn})"),
+        ("import React, { memo } from \"react\";", "(memo({fn},))"),
+    ] {
+        let (old, new) = memo_tag_pair(import, wrap);
+        assert_eq!(
+            memo_bucket(PRICE_PACKAGE, &[], &old, &new, &[]),
+            "mod_compat",
+            "{new}"
+        );
+    }
+    let arrow = |props: &str| {
+        format!(
+            "import {{ memo }} from \"react\";\n\nexport const Tag = memo(({props}) => <span>{{text}}</span>);\n"
+        )
+    };
+    assert_eq!(
+        memo_bucket(
+            PRICE_PACKAGE,
+            &[],
+            &arrow("{ text }: { text: string }"),
+            &arrow("{ text, outlined = false }: { text: string; outlined?: boolean }"),
+            &[],
+        ),
+        "mod_compat"
+    );
+    // 同じ差分で利用側を変えても、利用側の変更前が React の型を差し替えていなければ互換。
+    let (old, new) = memo_tag_pair(import, "memo({fn})");
+    assert_eq!(
+        memo_bucket(
+            PRICE_PACKAGE,
+            &[],
+            &old,
+            &new,
+            &[(
+                "src/list.tsx",
+                "import { Tag } from \"./tag\";\n\nexport function List() {\n\treturn <Tag text=\"new\" outlined />;\n}\n",
+            )],
+        ),
+        "mod_compat"
+    );
+    // 指定子でない文字列やコメントの中のパス、中を指す相対の import、React 19 の型で `JSX.Element` を
+    // 書くための `JSX` の import は、環境を差し替えない。
+    assert_eq!(
+        memo_bucket(
+            PRICE_PACKAGE,
+            &[
+                (
+                    "src/info.ts",
+                    "export const label = \"ok\"; // ../../README.md\nexport const docs = \"../../../docs\";\n",
+                ),
+                (
+                    "src/nested/view.ts",
+                    "import { label } from \"../info\";\nexport const view = label;\n"
+                ),
+                (
+                    "src/other.tsx",
+                    "import type { JSX } from \"react\";\n\nexport function Other(): JSX.Element {\n\treturn <b />;\n}\n",
+                ),
+            ],
+            &old,
+            &new,
+            &[],
+        ),
+        "mod_compat"
+    );
+}
+
+/// `memo()` の証明に当たらないものは、従来どおり api.mod (対照)。react 以外の `memo`、比較関数・
+/// 型引数を渡す呼び出し、`React.memo`、必須のプロパティの追加。
+#[test]
+fn ts_react_memo_unproven_wrappers_stay_modified() {
+    let import = "import { memo } from \"react\";";
+    let local_memo = [(
+        "src/memo.ts",
+        "export function memo<T>(component: T): T {\n\treturn component;\n}\n",
+    )];
+    for (import, wrap, extra) in [
+        (
+            "import { memo } from \"./memo\";",
+            "memo({fn})",
+            &local_memo[..],
+        ),
+        (import, "memo({fn}, (a, b) => a.text === b.text)", &[][..]),
+        (import, "memo<{ text: string }>({fn})", &[][..]),
+        (
+            "import * as React from \"react\";",
+            "React.memo({fn})",
+            &[][..],
+        ),
+        (
+            "import { memo } from \"react\";",
+            "memo(forwardRef({fn}))",
+            &[][..],
+        ),
+    ] {
+        let (old, new) = memo_tag_pair(import, wrap);
+        assert_eq!(
+            memo_bucket(PRICE_PACKAGE, extra, &old, &new, &[]),
+            "mod",
+            "{new}"
+        );
+    }
+    let old = memo_tag(import, "memo({fn})", "{ text }: { text: string }");
+    let required = memo_tag(
+        import,
+        "memo({fn})",
+        "{ text, outlined }: { text: string; outlined: boolean }",
+    );
+    assert_eq!(memo_bucket(PRICE_PACKAGE, &[], &old, &required, &[]), "mod");
+}
+
+/// `react` を registry の React と決められない・React の型を差し替えている・diff が環境を変える
+/// ときは、`memo()` の結果の型を証明しない (対照)。
+#[test]
+fn ts_react_memo_requires_a_standard_react_environment() {
+    let (old, new) = memo_tag_pair("import { memo } from \"react\";", "memo({fn})");
+    let augmentation = "import \"react\";\n\ndeclare module \"react\" {\n\tfunction memo<T>(component: T, extra?: unknown): T;\n}\n";
+    let no_react = "{ \"name\": \"repro\", \"private\": true, \"type\": \"module\" }\n";
+    let paths = "{ \"compilerOptions\": { \"jsx\": \"react-jsx\", \"paths\": { \"react\": [\"./src/fake-react\"] } } }\n";
+    let bare_module = "import \"react\";\n\nmodule \"react\" {\n\tfunction memo<P extends object>(f: (p: P) => null): (p: { [K in keyof P]-?: P[K] }) => null;\n}\n";
+    let relative_augmentation = "import \"../node_modules/@types/react\";\n\ndeclare module \"../node_modules/@types/react\" {\n\tfunction memo<P extends object>(f: (p: P) => null): (p: { [K in keyof P]-?: P[K] }) => null;\n}\n";
+    let type_roots = "{ \"compilerOptions\": { \"jsx\": \"react-jsx\", \"types\": [\"helpers\"], \"typeRoots\": [\"./types\"] } }\n";
+    let type_entry = "{ \"types\": \"../../../shared/react-types.ts\" }\n";
+    let paths_into_modules = "{ \"compilerOptions\": { \"jsx\": \"react-jsx\", \"paths\": { \"r\": [\"./node_modules/@types/react\"] } } }\n";
+    let paths_outside = "{ \"compilerOptions\": { \"jsx\": \"react-jsx\", \"paths\": { \"@shared/*\": [\"../shared/*\"] } } }\n";
+    let extends = "{ \"extends\": \"./configs/base.json\" }\n";
+    let outside_import = "import \"../../shared/react-env\";\n";
+    let strict = "{ \"compilerOptions\": { \"jsx\": \"react-jsx\", \"strict\": true } }\n";
+    for (package, extra, changes) in [
+        // ルートの package.json に react が無い
+        (no_react, &[][..], &[][..]),
+        // paths で react を差し替える
+        (PRICE_PACKAGE, &[("tsconfig.json", paths)][..], &[][..]),
+        // リポジトリのどこかで React の型を augmentation で差し替える
+        (
+            PRICE_PACKAGE,
+            &[("src/react-memo.d.ts", augmentation)][..],
+            &[][..],
+        ),
+        // 同じ差分で依存を変える
+        (
+            PRICE_PACKAGE,
+            &[][..],
+            &[(
+                "package.json",
+                "{ \"name\": \"repro\", \"private\": true, \"type\": \"module\", \"dependencies\": { \"react\": \"19.1.0\" }, \"devDependencies\": { \"@types/react\": \"19.1.0\" } }\n",
+            )][..],
+        ),
+        // 変更前だけ React の型を差し替えていた
+        (
+            PRICE_PACKAGE,
+            &[("src/react-memo.d.ts", augmentation)][..],
+            &[("src/react-memo.d.ts", "export {};\n")][..],
+        ),
+        // `declare` を省いた `.d.ts` の module 宣言 (変更後にもある・変更前だけにある)
+        (PRICE_PACKAGE, &[("src/env.d.ts", bare_module)][..], &[][..]),
+        (
+            PRICE_PACKAGE,
+            &[("src/env.d.ts", bare_module)][..],
+            &[("src/env.d.ts", "export {};\n")][..],
+        ),
+        // 相対パスで React の型の宣言ファイルを augmentation する
+        (
+            PRICE_PACKAGE,
+            &[("src/env.ts", relative_augmentation)][..],
+            &[][..],
+        ),
+        // typeRoots の型のパッケージが package.json で外のファイルを型の入口にする
+        (
+            PRICE_PACKAGE,
+            &[
+                ("tsconfig.json", type_roots),
+                ("types/helpers/package.json", type_entry),
+            ][..],
+            &[][..],
+        ),
+        // paths が node_modules や解析するディレクトリの外を指す
+        (
+            PRICE_PACKAGE,
+            &[("tsconfig.json", paths_into_modules)][..],
+            &[][..],
+        ),
+        (
+            PRICE_PACKAGE,
+            &[("tsconfig.json", paths_outside)][..],
+            &[][..],
+        ),
+        // extends で読む、tsconfig の名前でない設定を同じ差分で変える
+        (
+            PRICE_PACKAGE,
+            &[
+                ("tsconfig.json", extends),
+                ("configs/base.json", TAG_TSCONFIG),
+            ][..],
+            &[("configs/base.json", strict)][..],
+        ),
+        // 解析するディレクトリの外のファイルを import で取り込む (変更後にもある・変更前だけにある)
+        (
+            PRICE_PACKAGE,
+            &[("src/env.ts", outside_import)][..],
+            &[][..],
+        ),
+        (
+            PRICE_PACKAGE,
+            &[("src/env.ts", outside_import)][..],
+            &[("src/env.ts", "export {};\n")][..],
+        ),
+    ] {
+        assert_eq!(
+            memo_bucket(package, extra, &old, &new, changes),
+            "mod",
+            "{package} {extra:?} {changes:?}"
+        );
+    }
+}
+
+/// `memo()` で包んだ関数部品の props が参照する同じファイルの型の変更は、包まない関数部品と同じく
+/// 部品の型の変更として扱う (Issue #266 で、依存の検査が包んだ関数を見るようにした)。
+#[test]
+fn ts_react_memo_props_type_dependencies_are_tracked() {
+    let tag = |members: &str| {
+        format!(
+            "import {{ memo }} from \"react\";\n\ntype TagProps = {{ {members} }};\n\nexport const Tag = memo(function Tag({{ text }}: TagProps) {{\n\treturn <span>{{text}}</span>;\n}});\n"
+        )
+    };
+    assert_eq!(
+        memo_bucket(
+            PRICE_PACKAGE,
+            &[],
+            &tag("text: string"),
+            &tag("text: string; size: number"),
+            &[],
+        ),
+        "mod"
+    );
+}
+
+/// 変更前に `react` の解決先だったかもしれないファイル (`baseUrl` の下の `react.ts`) を同じ差分で
+/// 消したときは、変更前の `memo` を React のものと決められないので証明しない (対照)。
+#[test]
+fn ts_react_memo_rejects_a_removed_resolution_candidate() {
+    let (old, new) = memo_tag_pair("import { memo } from \"react\";", "memo({fn})");
+    let base_url = "{ \"compilerOptions\": { \"jsx\": \"react-jsx\", \"baseUrl\": \"./src\" } }\n";
+    let fake = "export function memo<T>(component: T): T {\n\treturn component;\n}\n";
+    assert_eq!(
+        memo_bucket_removing(
+            PRICE_PACKAGE,
+            &[("tsconfig.json", base_url), ("src/react.ts", fake)],
+            &old,
+            &new,
+            &[],
+            &["src/react.ts"],
+        ),
+        "mod"
+    );
+    // 対照: 解決先の候補でないファイルを消すだけなら証明する。
+    assert_eq!(
+        memo_bucket_removing(
+            PRICE_PACKAGE,
+            &[("tsconfig.json", base_url), ("src/unused.ts", fake)],
+            &old,
+            &new,
+            &[],
+            &["src/unused.ts"],
+        ),
+        "mod_compat"
+    );
+}
+
+/// `memo()` の内側の関数でも、props が参照する同じファイルの型を同じ差分で変えたとき・2 つ目の
+/// 引数を足したときは、省略可能なプロパティの追加として証明しない (対照)。
+#[test]
+fn ts_react_memo_keeps_other_changes_modified() {
+    let tag = |alias: &str, props: &str| {
+        format!(
+            "import {{ memo }} from \"react\";\n\ntype Text = {alias};\n\nexport const Tag = memo(function Tag({props}) {{\n\treturn <span>{{text}}</span>;\n}});\n"
+        )
+    };
+    assert_eq!(
+        memo_bucket(
+            PRICE_PACKAGE,
+            &[],
+            &tag("string", "{ text }: { text: Text }"),
+            &tag(
+                "number",
+                "{ text, outlined = false }: { text: Text; outlined?: boolean }"
+            ),
+            &[],
+        ),
+        "mod"
+    );
+    let arrow = |params: &str| {
+        format!(
+            "import {{ memo }} from \"react\";\n\nexport const Tag = memo(({params}) => <span>{{text}}</span>);\n"
+        )
+    };
+    assert_eq!(
+        memo_bucket(
+            PRICE_PACKAGE,
+            &[],
+            &arrow("{ text }: { text: string }"),
+            &arrow("{ text }: { text: string }, legacy?: unknown"),
+            &[],
+        ),
+        "mod"
+    );
 }

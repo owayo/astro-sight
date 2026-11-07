@@ -160,6 +160,7 @@ impl RemovalEvidence {
             std::mem::take(&mut files.outside),
             words.to_vec(),
             settings.as_ref().map(|settings| &settings.packages),
+            settings.as_ref().is_some_and(|settings| settings.allow_js),
             &budget,
         );
         let repository = RepositoryAudit::load(

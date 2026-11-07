@@ -22,11 +22,24 @@ pub(crate) fn detect_trailing_optional_params_compatible_mod(
 }
 
 /// inline object type の第一階層へ optional property を追加しただけなら互換とする。
+/// `react` の `memo()` で包んだ関数部品は、包んだ関数に委ねる (Issue #266)。
 pub(crate) fn detect_optional_object_props_compatible_mod(
     site: &CompatibleModSite<'_>,
     sources: &mut SignatureSourceCache<'_>,
+    react_memo: &mut super::ReactMemoCache,
+    diff_files: &[crate::models::impact::DiffFile],
 ) -> Option<CompatibleApiModification> {
-    with_resolved_ts_callable_pair(site, sources, optional_object_props_extension)?;
+    with_resolved_ts_callable_pair(site, sources, optional_object_props_extension).or_else(
+        || {
+            super::react_memo::with_resolved_react_memo_pair(
+                site,
+                sources,
+                react_memo,
+                diff_files,
+                optional_object_props_extension,
+            )
+        },
+    )?;
     Some(site.compatible("optional_object_props"))
 }
 

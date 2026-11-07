@@ -1596,6 +1596,8 @@ pub(crate) struct ApiClosureCaches {
     rust_clean_files: std::collections::HashMap<String, bool>,
     pub(crate) fixed_callback: super::ts_signature::FixedCallbackCache,
     pub(crate) optional_removal: super::ts_signature::OptionalRemovalCache,
+    /// React の `memo()` で包んだ関数部品の証明が頼る、`react` の解決と環境の監査。
+    pub(crate) react_memo: super::ts_signature::ReactMemoCache,
     pub(super) python_optional_removal: super::python_optional_removal::RemovalCache,
     /// `import_statement_lines_for_ref` の (ref path → import 行集合) キャッシュ。
     pub(crate) import_lines: std::collections::HashMap<String, std::collections::HashSet<usize>>,
