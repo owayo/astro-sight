@@ -225,6 +225,8 @@ A Rust `union` is a symbol of kind `union`, and a public union is compared by it
 
 Items with the same name in different inline modules of one Rust file (`pub mod a { pub fn run() }` and `pub mod b { pub fn run() }`) are compared declaration by declaration: `api_changes` pairs them by the enclosing inline module path, and the output adds that path as `inline_module` (`m` in hook output) while `name` stays the bare name. Same-place declarations such as `#[cfg]` variants whose pairing cannot be decided stay a blocking `api.mod`.
 
+When a Rust signature names a type through an alias (`use … as Text;` or a private `type Text = …;`), `api_changes` also compares what the alias points to: if the target changes while the signature text stays the same, the declaration is a blocking `api.mod` with `unverified.reason` `rust_signature_dependency_changed`. Bindings are followed within the same file.
+
 When a Rust item is moved to another file and re-exported from its old place with `pub use`, `api_changes` resolves the re-export to the moved declaration and compares the two like an in-place change: a breaking change is a blocking `api.mod`, and an unchanged item is reported as `moved`. A re-export that cannot be resolved (an external crate, a glob, a `#[cfg]`, a renaming `as`) stays a blocking `api.mod`.
 
 When a TypeScript config that compiles a file enables `stripInternal`, `api_changes` compares the API as consumers of the emitted declaration files see it: adding `@internal` to an export or a member is classified the same as deleting it (`api.rm` / `api.rm_dead` for an export, and a change to the containing type or function for a member of an interface or object type).
