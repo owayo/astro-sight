@@ -557,8 +557,97 @@ class NotATest(Unrelated):
         "Derived.test_derived",
     ]);
     assert_eq!(live_in(source, false), expected);
-    // pytest のテストモジュールでも同じ (どのクラスも `Test` で始まらない)。
-    assert_eq!(live_in(source, true), expected);
+    // pytest のテストモジュールでは、名前に依らず TestCase の派生を集め (`UnitTestCase`)、
+    // xunit 形式の準備と後始末も基底からたどって呼ぶ (Issue #267)。入れ子のクラスは集めない。
+    let mut expected_pytest = expected.clone();
+    expected_pytest.push("SharedMixin.setup_method".to_string());
+    expected_pytest.sort();
+    assert_eq!(live_in(source, true), expected_pytest);
+}
+
+/// Issue #267: pytest の unittest 対応は、テストモジュールの名前空間に束縛した TestCase の派生を
+/// 名前に依らず集め、`setup_method` / `teardown_method` / `setup_class` / `teardown_class` を
+/// 基底からたどって呼ぶ (`pytest_generate_tests` と入れ子のクラスは見ない)。テストモジュールで
+/// ないファイルの TestCase の派生は、標準の unittest が呼ばないので dead のまま (対照)。
+#[test]
+fn pytest_collects_testcase_subclasses_with_xunit_hooks() {
+    let source = r#"import unittest
+
+
+class Base(unittest.TestCase):
+    def setup_method(self, method):
+        pass
+
+
+class CalcTests(Base):
+    def teardown_method(self, method):
+        pass
+
+    @classmethod
+    def setup_class(cls):
+        pass
+
+    @classmethod
+    def teardown_class(cls):
+        pass
+
+    def pytest_generate_tests(self, metafunc):
+        pass
+
+    def test_value(self):
+        pass
+
+    class TestNested:
+        def test_nested(self):
+            pass
+"#;
+    let pytest = sorted(&[
+        "Base",
+        "Base.setup_method",
+        "CalcTests",
+        "CalcTests.teardown_method",
+        "CalcTests.setup_class",
+        "CalcTests.teardown_class",
+        "CalcTests.test_value",
+    ]);
+    assert_eq!(live_in(source, true), pytest);
+    assert_eq!(
+        live_in(source, false),
+        sorted(&["Base", "CalcTests", "CalcTests.test_value"])
+    );
+    // `Test` で始まる TestCase の派生も `UnitTestCase` として集める (入れ子と
+    // `pytest_generate_tests` は見ない)。
+    let named = source.replace("CalcTests", "TestCalc");
+    assert_eq!(
+        live_in(&named, true),
+        pytest
+            .iter()
+            .map(|name| name.replace("CalcTests", "TestCalc"))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Issue #267: テストモジュールへ import した TestCase の派生 (別名を含む) も集めて xunit 形式の
+/// 準備を呼ぶ。テストモジュールに入らない TestCase の派生は dead のまま (対照)。
+#[test]
+fn project_imported_testcase_subclasses_get_xunit_hooks() {
+    let helpers = "import unittest\n\n\nclass CalcCase(unittest.TestCase):\n    def setup_method(self, method):\n        pass\n\n    def test_value(self):\n        pass\n\n\nclass OtherCase(unittest.TestCase):\n    def setup_method(self, method):\n        pass\n";
+    let (live, uncertain) = project(&[
+        ("helpers.py", helpers),
+        (
+            "test_calc.py",
+            "from helpers import CalcCase\nfrom helpers import CalcCase as Alias\n",
+        ),
+    ]);
+    assert!(
+        live.contains(&"helpers.py:CalcCase.setup_method".to_string()),
+        "{live:?}"
+    );
+    assert!(
+        !live.contains(&"helpers.py:OtherCase.setup_method".to_string())
+            && !uncertain.contains(&"helpers.py:OtherCase.setup_method".to_string()),
+        "{live:?} {uncertain:?}"
+    );
 }
 
 /// ファイル単位の判定は、import した名前の先や、先頭が同じファイルのクラスでない属性の
@@ -725,6 +814,9 @@ fn project_follows_bases_and_bindings_across_files() {
             "checks_all.py:TestExportedByAll",
             "checks_all.py:TestExportedByAll.test_exported_by_all",
             "mixins.py:CrossMixin.setUp",
+            // テストモジュールの `MixedTests(CrossMixin, unittest.TestCase)` は、pytest が
+            // `UnitTestCase` として集め、基底の xunit 形式の準備も呼ぶ (Issue #267)
+            "mixins.py:CrossMixin.setup_method",
             "mixins.py:CrossMixin.test_mixin",
             "pkg/impl.py:Checks",
             "pkg/impl.py:Checks.test_reexported",
@@ -996,11 +1088,18 @@ fn project_unittest_root_bindings_keep_other_bindings_incomplete() {
             "from helper import Base as TestCase\n\n\nclass Consumer(TestCase):\n    def test_unused(self):\n        pass\n",
         ),
     ]);
+    // `Parent` の束縛の 1 つが確かめられた経路で TestCase に届くので TestCase の派生とし、
+    // テストモジュールの `Checks` は pytest が `UnitTestCase` として集めて `setup_method` も呼ぶ
+    // (Issue #267。unittest の `test_active` と同じ確かさ)。
     assert_eq!(
         live,
-        sorted(&["test_checks.py:Checks", "test_checks.py:Checks.test_active"])
+        sorted(&[
+            "test_checks.py:Checks",
+            "test_checks.py:Checks.setup_method",
+            "test_checks.py:Checks.test_active"
+        ])
     );
-    assert_eq!(uncertain, sorted(&["test_checks.py:Checks.setup_method"]));
+    assert_eq!(uncertain, Vec::<String>::new());
 
     let ordinary = "from helper import Base as TestCase\n\n\nclass Consumer(TestCase):\n    def test_unused(self):\n        pass\n";
     assert_eq!(live_in(ordinary, false), Vec::<String>::new());
@@ -1539,9 +1638,16 @@ fn project_wildcard_bindings_only_reach_marked_classes() {
         &[],
     );
     assert_eq!(live, Vec::<String>::new());
+    // `Test*` でない名前の動的な束縛でも、TestCase の派生かもしれないクラス (`Unknown`) は
+    // pytest が名前に依らず `UnitTestCase` として集めうる (Issue #267)。
     assert_eq!(
         uncertain,
-        sorted(&["marked.py:Marked", "marked.py:Marked.test_marked"])
+        sorted(&[
+            "external_based.py:Unknown",
+            "external_based.py:Unknown.setup_method",
+            "marked.py:Marked",
+            "marked.py:Marked.test_marked"
+        ])
     );
     assert!(!any_member && !any_class);
 }
