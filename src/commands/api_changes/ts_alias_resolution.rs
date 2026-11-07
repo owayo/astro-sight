@@ -18,6 +18,12 @@
 //! 祖先の探索に削除したファイルがあって native の解決へ進む指定子 (削除前は削除したファイルに
 //! 解かれていた)。
 //!
+//! native の解決で外部のパッケージとみなすのは、参照ファイルのディレクトリから祖先へ解析する
+//! ディレクトリのルートまでの package.json のどれかに registry の指定で書いた依存 (Issue #280。
+//! ワークスペースのパッケージにだけ書いた依存も、そのパッケージのファイルからは外部)。祖先でない
+//! package.json にだけ書いた依存は、hoisting で解決されても宣言からは決められないので決めない。
+//! 実際の配置 (node_modules・PnP) は確かめず、宣言から分類する。
+//!
 //! 前提 (信頼の境界): 実行環境の解決先 (バンドラーの alias、Jest の moduleNameMapper、実行時の
 //! loader、コマンドラインで渡す設定、pnpmfile や pnpm-workspace.yaml などのパッケージマネージャの
 //! 設定) は、ここで解いた tsconfig / jsconfig と package.json の解決先と一致する。どの設定も別名を
@@ -72,8 +78,8 @@ pub(crate) enum AliasResolution {
     /// リポジトリの中のファイルに解かれる。候補は `dir` 相対 (`/` 区切り) で、存在しないものも含み、
     /// 実際の解決先はこの中にある。
     Local(Rc<HashSet<String>>),
-    /// ルートの package.json に registry の指定で書いた依存のパッケージ。リポジトリのファイルでは
-    /// ない。
+    /// 参照ファイルの祖先 (解析するディレクトリのルートまで) の package.json に registry の指定で
+    /// 書いた依存のパッケージ。リポジトリのファイルではない。
     External,
     /// 解決先を決められない。
     Unknown,
@@ -90,7 +96,7 @@ pub(crate) struct TsAliasResolver {
     projects: Option<Vec<Option<Effective>>>,
     /// package.json から読んだ事実。None は読めない package.json があった。
     packages: Option<Packages>,
-    /// (classic の祖先の探索を始めるディレクトリ, 指定子) → 結果。
+    /// (参照ファイルのディレクトリ, 指定子) → 結果。
     memo: HashMap<(String, String), AliasResolution>,
     /// 読んだ設定のどれも、相対の指定子の探索を変えない (`moduleSuffixes`・`rootDirs` が無い)。
     /// 設定を走査できなければ false。
@@ -133,22 +139,13 @@ impl TsAliasResolver {
 
     /// `ref_path` (`dir` 相対) のファイルにある相対でない指定子 `spec` を解く。
     pub(crate) fn resolve(&mut self, ref_path: &str, spec: &str) -> AliasResolution {
-        // classic の祖先の探索だけが参照ファイルの位置に依る。
-        let classic = self.projects.as_ref().is_some_and(|projects| {
-            projects
-                .iter()
-                .flatten()
-                .any(|project| project.mode == Mode::MaybeClassic)
-        });
-        let from = if classic {
-            Path::new(ref_path)
-                .parent()
-                .and_then(Path::to_str)
-                .map(normalize_workspace_separators)
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
+        // native の解決で数える package.json (祖先のもの) と classic の祖先の探索が、参照ファイルの
+        // 位置に依る。
+        let from = Path::new(ref_path)
+            .parent()
+            .and_then(Path::to_str)
+            .map(normalize_workspace_separators)
+            .unwrap_or_default();
         let key = (from, spec.to_owned());
         if let Some(resolution) = self.memo.get(&key) {
             return resolution.clone();
@@ -196,7 +193,7 @@ impl TsAliasResolver {
                 return AliasResolution::Unknown;
             }
         }
-        let native = reach.native.then(|| self.native(spec));
+        let native = reach.native.then(|| self.native(from, spec));
         if native == Some(Native::Unknown) {
             return AliasResolution::Unknown;
         }
@@ -354,8 +351,9 @@ impl TsAliasResolver {
         Some(normalize_workspace_separators(inner))
     }
 
-    /// paths と baseUrl で解けないときの native の解決が、リポジトリの中へ届き得るか。
-    fn native(&self, spec: &str) -> Native {
+    /// paths と baseUrl で解けないときの native の解決が、リポジトリの中へ届き得るか。`from` は
+    /// 参照ファイルのディレクトリ (`dir` 相対)。
+    fn native(&self, from: &str, spec: &str) -> Native {
         if spec.starts_with('#') {
             // package.json の `imports` は、パッケージの中のどのファイルも指し得る。
             return Native::Unknown;
@@ -421,10 +419,11 @@ impl TsAliasResolver {
                 }
             }
         }
-        if packages.root_registry.contains(name) {
+        if packages.declares_registry(from, name) {
             Native::External
         } else {
-            // 依存に無いパッケージは、どこから入るか決められない。
+            // 祖先の package.json の依存に無いパッケージは、どこから入るか決められない (ほかの
+            // ワークスペースのパッケージの依存が hoisting で見えるのは、配置に依る)。
             Native::Unknown
         }
     }
@@ -451,7 +450,7 @@ impl Reach {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Native {
-    /// ルートの package.json の registry の依存。
+    /// 参照ファイルの祖先 (解析するディレクトリまで) の package.json の registry の依存。
     External,
     /// パッケージ名として成り立たない (`@/x`・`~/x`)。node_modules からはリポジトリのファイルに
     /// 解かれない。
@@ -884,8 +883,9 @@ struct Packages {
     names: HashSet<String>,
     /// どれかの package.json に registry でない指定 (`file:`・`workspace:` など) で書いた依存の名前。
     non_registry: HashSet<String>,
-    /// ルートの package.json に registry の指定で書いた依存の名前。
-    root_registry: HashSet<String>,
+    /// package.json のディレクトリ (`dir` 相対、`/` 区切り。ルートは空) ごとの、registry の指定で
+    /// 書いた依存の名前。
+    registry_by_directory: HashMap<String, HashSet<String>>,
     /// `overrides`・`resolutions`・`pnpm.overrides` に registry でない指定がある (どの依存も
     /// リポジトリの中を指し得る)。
     local_overrides: bool,
@@ -905,7 +905,12 @@ fn read_packages(root: &Path, manifests: &[PathBuf]) -> Option<Packages> {
         if let Some(name) = manifest.get("name") {
             packages.names.insert(name.as_str()?.to_owned());
         }
-        let at_root = path.parent() == Some(root);
+        // 走査はルートの下だけなので、ディレクトリはルート相対にできる。
+        let directory = path
+            .parent()
+            .and_then(|parent| parent.strip_prefix(root).ok())
+            .and_then(Path::to_str)
+            .map(normalize_workspace_separators);
         for field in DEPENDENCY_FIELDS {
             let Some(dependencies) = manifest.get(field) else {
                 continue;
@@ -913,8 +918,12 @@ fn read_packages(root: &Path, manifests: &[PathBuf]) -> Option<Packages> {
             for (name, spec) in dependencies.as_object()? {
                 if !registry_spec(spec.as_str()?) {
                     packages.non_registry.insert(name.clone());
-                } else if at_root {
-                    packages.root_registry.insert(name.clone());
+                } else if let Some(directory) = &directory {
+                    packages
+                        .registry_by_directory
+                        .entry(directory.clone())
+                        .or_default()
+                        .insert(name.clone());
                 }
             }
         }
@@ -931,6 +940,21 @@ fn read_packages(root: &Path, manifests: &[PathBuf]) -> Option<Packages> {
         }
     }
     Some(packages)
+}
+
+impl Packages {
+    /// `from` (参照ファイルのディレクトリ、`dir` 相対) から祖先へ解析するディレクトリのルートまでの
+    /// package.json のどれかが、`name` を registry の指定で依存に書いているか。ディレクトリは
+    /// 区切りごとに完全一致で比べる (`ui` と `ui-other`、大文字小文字の違う名前を混ぜない)。
+    fn declares_registry(&self, from: &str, name: &str) -> bool {
+        Path::new(from).ancestors().any(|directory| {
+            directory
+                .to_str()
+                .map(normalize_workspace_separators)
+                .and_then(|directory| self.registry_by_directory.get(&directory))
+                .is_some_and(|names| names.contains(name))
+        })
+    }
 }
 
 /// 上書きの指定 (入れ子の object を含む) に、registry でない指定があるか。読めない形も含める。
@@ -1516,6 +1540,118 @@ mod tests {
             ),
             "local:${configDir}/src/item.ts"
         );
+    }
+
+    /// 結果の種類。
+    fn kind(resolution: &AliasResolution) -> &'static str {
+        match resolution {
+            AliasResolution::Local(_) => "local",
+            AliasResolution::External => "external",
+            AliasResolution::Unknown => "unknown",
+        }
+    }
+
+    /// registry の依存は、参照ファイルの祖先 (ルートまで) の package.json に書いたときだけ外部
+    /// (Issue #280)。祖先でないワークスペースのパッケージにだけ書いた依存と、名前の似たディレクトリ
+    /// の依存は数えない。同じ解決器でどの順に解いても、参照ファイルのディレクトリごとに決める。
+    #[test]
+    fn registry_dependencies_of_ancestor_manifests_are_external() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            dir.path(),
+            &[
+                (
+                    "package.json",
+                    r#"{ "name": "mono", "private": true, "workspaces": ["packages/*"] }"#,
+                ),
+                (
+                    "packages/ui/package.json",
+                    r#"{ "name": "@example/ui", "dependencies": { "react": "19.0.0" }, "devDependencies": { "@types/react": "19.0.0" } }"#,
+                ),
+                (
+                    "packages/ui-other/package.json",
+                    r#"{ "name": "@example/ui-other" }"#,
+                ),
+                (
+                    "packages/package.json",
+                    r#"{ "dependencies": { "lodash": "^4.0.0" } }"#,
+                ),
+                (
+                    "tools/package.json",
+                    r#"{ "optionalDependencies": { "chalk": "^5.0.0" } }"#,
+                ),
+            ],
+        );
+        let cases = [
+            ("packages/ui/src/tag.tsx", "react", "external"),
+            ("packages/ui/tag.tsx", "@types/react", "external"),
+            (
+                "packages/ui/src/deep/view.tsx",
+                "react/jsx-runtime",
+                "external",
+            ),
+            // 祖先でないワークスペースのパッケージ・名前の似たディレクトリ・ルートのファイル
+            ("packages/ui-other/src/tag.tsx", "react", "unknown"),
+            ("packages/other/tag.tsx", "react", "unknown"),
+            ("index.ts", "react", "unknown"),
+            // 途中の祖先の package.json の依存
+            ("packages/ui/src/tag.tsx", "lodash", "external"),
+            ("packages/ui-other/src/tag.tsx", "lodash", "external"),
+            ("index.ts", "lodash", "unknown"),
+            ("tools/run.ts", "chalk", "external"),
+            ("packages/ui/src/tag.tsx", "chalk", "unknown"),
+        ];
+        for reversed in [false, true] {
+            let mut resolver = TsAliasResolver::load(dir.path().to_str().unwrap(), HashSet::new());
+            let ordered: Vec<_> = if reversed {
+                cases.iter().rev().collect()
+            } else {
+                cases.iter().collect()
+            };
+            for (ref_path, spec, expected) in ordered {
+                assert_eq!(
+                    kind(&resolver.resolve(ref_path, spec)),
+                    *expected,
+                    "{ref_path} {spec} (reversed: {reversed})"
+                );
+            }
+        }
+        // ほかの package.json の registry でない指定・同じ名前のパッケージ・上書きは、どこからも
+        // 決めない
+        for extra in [
+            (
+                "packages/legacy/package.json",
+                r#"{ "dependencies": { "react": "file:../vendor/react" } }"#,
+            ),
+            ("packages/react/package.json", r#"{ "name": "react" }"#),
+            (
+                "package.json",
+                r#"{ "name": "mono", "workspaces": ["packages/*"], "overrides": { "react": "link:./vendor/react" } }"#,
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut files = vec![
+                (
+                    "package.json",
+                    r#"{ "name": "mono", "workspaces": ["packages/*"] }"#,
+                ),
+                (
+                    "packages/ui/package.json",
+                    r#"{ "dependencies": { "react": "19.0.0" } }"#,
+                ),
+            ];
+            match files.iter_mut().find(|(path, _)| *path == extra.0) {
+                Some(entry) => entry.1 = extra.1,
+                None => files.push(extra),
+            }
+            write(dir.path(), &files);
+            let mut resolver = TsAliasResolver::load(dir.path().to_str().unwrap(), HashSet::new());
+            assert_eq!(
+                kind(&resolver.resolve("packages/ui/src/tag.tsx", "react")),
+                "unknown",
+                "{extra:?}"
+            );
+        }
     }
 
     /// 依存の名前でも、baseUrl の下にファイルがあればローカルに解かれる。ワークスペース・

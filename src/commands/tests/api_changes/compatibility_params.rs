@@ -2430,3 +2430,33 @@ fn ts_react_memo_keeps_other_changes_modified() {
         "mod"
     );
 }
+
+/// `react` と `@types/react` をワークスペースのパッケージの package.json にだけ書くモノレポでも、
+/// そのパッケージの部品は `optional_object_props` の互換 (Issue #280)。宣言の無いほかの
+/// ワークスペースのパッケージの部品は、hoisting で解決されても宣言からは決められないので、従来
+/// どおり証明しない。
+#[test]
+fn ts_react_memo_in_a_workspace_package_is_compatible() {
+    let (old, new) = memo_tag_pair("import { memo } from \"react\";", "memo({fn})");
+    let root = "{ \"name\": \"mono\", \"private\": true, \"workspaces\": [\"packages/*\"] }\n";
+    let ui = "{ \"name\": \"@example/ui\", \"private\": true, \"type\": \"module\", \"dependencies\": { \"react\": \"19.0.0\" }, \"devDependencies\": { \"@types/react\": \"19.0.0\" } }\n";
+    let other = "{ \"name\": \"@example/other\", \"private\": true, \"type\": \"module\" }\n";
+    for (package, expected) in [("ui", "mod_compat"), ("other", "mod")] {
+        let tag = format!("packages/{package}/src/tag.tsx");
+        let list = format!("packages/{package}/src/list.tsx");
+        let tsconfig = format!("packages/{package}/tsconfig.json");
+        let files = [
+            ("package.json", root),
+            ("packages/ui/package.json", ui),
+            ("packages/other/package.json", other),
+            (tsconfig.as_str(), TAG_TSCONFIG),
+            (tag.as_str(), old.as_str()),
+            (list.as_str(), TAG_LIST),
+        ];
+        assert_eq!(
+            bucket_after(&files, &[(tag.as_str(), new.as_str())], "Tag"),
+            expected,
+            "{package}"
+        );
+    }
+}
