@@ -66,6 +66,14 @@ pub(crate) fn extract_api_signature(
     {
         return signature;
     }
+    // Rust の enum も、variant とそのフィールド・discriminant・`#[non_exhaustive]`・`#[repr]` の
+    // 公開の形を signature にする (Issue #276)。
+    if lang_id == crate::language::LangId::Rust
+        && sym.kind == SymbolKind::Enum
+        && let Some(signature) = super::rust_enum_api::enum_signature(sym, root, source)
+    {
+        return signature;
+    }
     if matches!(sym.kind, SymbolKind::Function | SymbolKind::Method) {
         let start = tree_sitter::Point {
             row: sym.range.start.line,
