@@ -225,6 +225,10 @@ pub struct UnresolvedFieldOwner {
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiSymbol {
     pub name: String,
+    /// Rust の項目が inline module の中にあれば、ファイルの中のその経路 (`a::b`)。同じファイルの
+    /// 別々の inline module にある同じ名前の項目を区別する (Issue #282)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_module: Option<String>,
     pub kind: String,
     pub file: String,
     /// 同一ファイル内の実利用参照数 (定義行 / import・re-export 行を除く)。
@@ -255,6 +259,10 @@ pub(crate) fn is_false(value: &bool) -> bool {
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiSymbolChange {
     pub name: String,
+    /// Rust の項目が inline module の中にあれば、ファイルの中のその経路 (`a::b`)。同じファイルの
+    /// 別々の inline module にある同じ名前の項目を区別する (Issue #282)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_module: Option<String>,
     pub kind: String,
     pub file: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -313,6 +321,9 @@ pub enum ApiModificationUnverifiedReason {
     CompatibilityUnverified,
     /// 元のファイルの `pub use` で再公開した名前の解決先の宣言を、確かめられなかった (Issue #281)。
     ReexportTargetUnresolved,
+    /// Rust の同じファイルの同じ場所 (inline module の経路・名前・種類) に同じ名前の宣言が複数
+    /// あり (`#[cfg]` の分岐など)、旧新のどの宣言どうしを比べればよいか決められなかった (Issue #282)。
+    RustDeclarationPairingAmbiguous,
 }
 
 /// 変更後ソースの位置。line は refs と同じ 0 始まり。
@@ -378,6 +389,10 @@ pub enum ApiContractSide {
 #[derive(Debug, Clone, Serialize)]
 pub struct CompatibleApiModification {
     pub name: String,
+    /// Rust の項目が inline module の中にあれば、ファイルの中のその経路 (`a::b`)。同じファイルの
+    /// 別々の inline module にある同じ名前の項目を区別する (Issue #282)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_module: Option<String>,
     pub kind: String,
     pub file: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -446,6 +461,13 @@ pub struct MovedSymbol {
     pub kind: String,
     pub from: String,
     pub to: String,
+    /// Rust の項目が移動元で inline module の中にあれば、ファイルの中のその経路。同じファイルの
+    /// inline module の間の移動を区別する (Issue #282)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_inline_module: Option<String>,
+    /// Rust の項目が移動先で inline module の中にあれば、ファイルの中のその経路。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_inline_module: Option<String>,
 }
 
 /// Python の `@property` メソッドを dataclass フィールドへ置き換えた変更。

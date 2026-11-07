@@ -1109,6 +1109,7 @@ fn filter_dead_by_wip_added_drops_symbols_listed_in_added() {
         },
     ];
     let added = vec![ApiSymbol {
+        inline_module: None,
         name: "matchAssigneeName".to_string(),
         kind: "function".to_string(),
         file: "src/notes.ts".to_string(),
@@ -1135,6 +1136,7 @@ fn filter_dead_by_wip_added_matches_on_file_and_name_pair() {
         line: None,
     }];
     let added = vec![ApiSymbol {
+        inline_module: None,
         // 同じ name だが別 file の追加 — dead 側 (a.ts) は残るべき。
         name: "helper".to_string(),
         kind: "function".to_string(),

@@ -20,6 +20,7 @@ use std::process::Command;
 
 fn test_only_api_fixture(const_value: bool) -> ReviewResult {
     let change = ApiSymbolChange {
+        inline_module: None,
         unverified: None,
         name: "PAGE_URL".into(),
         kind: "variable".into(),
@@ -148,6 +149,7 @@ fn callback_body_hook_reports_unverified_changes_and_supports_strict_mode() {
             unchanged_type_annotations: Vec::new(),
             callback_body_changes: vec![CallbackBodyChange {
                 change: ApiSymbolChange {
+                    inline_module: None,
                     unverified: None,
                     name: "store".into(),
                     kind: "variable".into(),
@@ -231,6 +233,7 @@ fn build_review_hook_json_compatible_modified_is_informational() {
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: vec![CompatibleApiModification {
+                inline_module: None,
                 name: "ScheduleItem".to_string(),
                 kind: "constant".to_string(),
                 file: "ScheduleItem.tsx".to_string(),
@@ -323,6 +326,7 @@ fn build_review_hook_json_compatible_modified_impact_is_informational() {
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: vec![CompatibleApiModification {
+                inline_module: None,
                 name: "TaskDetailHeader".to_string(),
                 kind: "function".to_string(),
                 file: "TaskDetailHeader.tsx".to_string(),
@@ -414,6 +418,7 @@ fn build_review_hook_json_mixed_compatible_and_breaking_impact_keeps_breaking_on
             added: Vec::new(),
             removed: Vec::new(),
             modified: vec![ApiSymbolChange {
+                inline_module: None,
                 unverified: None,
                 name: "loadTask".to_string(),
                 kind: "function".to_string(),
@@ -432,6 +437,7 @@ fn build_review_hook_json_mixed_compatible_and_breaking_impact_keeps_breaking_on
             callback_body_changes: Vec::new(),
             const_value_changes: Vec::new(),
             compatible_modified: vec![CompatibleApiModification {
+                inline_module: None,
                 name: "TaskDetailHeader".to_string(),
                 kind: "function".to_string(),
                 file: "TaskDetailHeader.tsx".to_string(),
@@ -768,6 +774,7 @@ fn build_review_hook_json_api_add_only_is_informational() {
             removed_unresolved: Vec::new(),
             parse_truncations: Vec::new(),
             added: vec![ApiSymbol {
+                inline_module: None,
                 name: "foo".to_string(),
                 kind: "function".to_string(),
                 file: "a.rs".to_string(),
@@ -846,6 +853,7 @@ fn build_review_hook_json_api_add_carries_extraction_scope() {
         removed_unresolved: Vec::new(),
         parse_truncations: Vec::new(),
         added: vec![ApiSymbol {
+            inline_module: None,
             name: "foo".to_string(),
             kind: "function".to_string(),
             file: "a.rs".to_string(),
@@ -869,6 +877,7 @@ fn build_review_hook_json_api_add_carries_extraction_scope() {
         removed_unresolved: Vec::new(),
         parse_truncations: Vec::new(),
         removed: vec![ApiSymbol {
+            inline_module: None,
             name: "bar".to_string(),
             kind: "function".to_string(),
             file: "a.rs".to_string(),
@@ -923,6 +932,7 @@ fn build_review_hook_json_api_add_carries_internal_ref_count() {
 
     // 同一ファイル内に実利用参照が 2 件 → `ri: 2` を出して refs 再実行を不要にする
     let with_internal_refs = review_with_added(vec![ApiSymbol {
+        inline_module: None,
         name: "TypeObservation".to_string(),
         kind: "interface".to_string(),
         file: "module.ts".to_string(),
@@ -941,6 +951,7 @@ fn build_review_hook_json_api_add_carries_internal_ref_count() {
 
     // 完全に未参照なら `ri` は省略する (compact 規約: 0 は出さない)
     let without_internal_refs = review_with_added(vec![ApiSymbol {
+        inline_module: None,
         name: "Orphan".to_string(),
         kind: "interface".to_string(),
         file: "module.ts".to_string(),
@@ -1024,6 +1035,7 @@ fn build_review_hook_json_api_removed_is_blocking() {
             parse_truncations: Vec::new(),
             added: Vec::new(),
             removed: vec![ApiSymbol {
+                inline_module: None,
                 name: "foo".to_string(),
                 kind: "function".to_string(),
                 file: "a.rs".to_string(),
@@ -1074,6 +1086,7 @@ fn build_review_hook_json_api_modified_is_blocking() {
             added: Vec::new(),
             removed: Vec::new(),
             modified: vec![ApiSymbolChange {
+                inline_module: None,
                 unverified: None,
                 name: "foo".to_string(),
                 kind: "function".to_string(),
@@ -1133,6 +1146,7 @@ fn build_review_hook_json_api_modified_carries_contract_change() {
             added: Vec::new(),
             removed: Vec::new(),
             modified: vec![ApiSymbolChange {
+                inline_module: None,
                 unverified: None,
                 name: "Payload".to_string(),
                 kind: "class".to_string(),
@@ -1202,6 +1216,7 @@ fn build_review_hook_json_api_modified_without_callers_is_flagged_but_still_bloc
             added: Vec::new(),
             removed: Vec::new(),
             modified: vec![ApiSymbolChange {
+                inline_module: None,
                 unverified: None,
                 name: "foo".to_string(),
                 kind: "function".to_string(),
@@ -1270,12 +1285,14 @@ fn build_review_hook_json_removed_dead_only_is_not_blocking() {
             property_to_field: Vec::new(),
             removed_dead: vec![
                 ApiSymbol {
+                    inline_module: None,
                     name: "MapZoomUtils".to_string(),
                     kind: "object".to_string(),
                     file: "MapZoomUtils.kt".to_string(),
                     refs_internal: 0,
                 },
                 ApiSymbol {
+                    inline_module: None,
                     name: "MapZoomUtils.zoomForBounds".to_string(),
                     kind: "function".to_string(),
                     file: "MapZoomUtils.kt".to_string(),
@@ -1333,6 +1350,7 @@ fn build_review_hook_json_const_value_only_is_informational() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: vec![ApiSymbolChange {
+                inline_module: None,
                 unverified: None,
                 name: "ENEMY_SPEED".to_string(),
                 kind: "constant".to_string(),
@@ -1389,6 +1407,7 @@ fn build_review_hook_json_const_value_is_blocking_under_strict() {
             modified_closed_in_diff: Vec::new(),
             callback_body_changes: Vec::new(),
             const_value_changes: vec![ApiSymbolChange {
+                inline_module: None,
                 unverified: None,
                 name: "ENEMY_SPEED".to_string(),
                 kind: "constant".to_string(),
@@ -1797,7 +1816,7 @@ fn build_review_hook_json_api_modified_carries_field_contract_change() {
             added: Vec::new(),
             removed: Vec::new(),
             modified: vec![
-                ApiSymbolChange {
+                ApiSymbolChange { inline_module: None,
                     unverified: None,
                     name: "Payload.y".to_string(),
                     kind: "field".to_string(),
@@ -1810,7 +1829,7 @@ fn build_review_hook_json_api_modified_carries_field_contract_change() {
                         breaks: crate::models::review::ApiContractSide::Producer,
                     }),
                 },
-                ApiSymbolChange {
+                ApiSymbolChange { inline_module: None,
                     unverified: None,
                     name: "Mode".to_string(),
                     kind: "type".to_string(),
@@ -1978,12 +1997,14 @@ fn build_review_hook_json_blocking_categories_match_filtered_output_and_exit() {
     )
     .unwrap();
     let symbol = || ApiSymbol {
+        inline_module: None,
         name: "item".into(),
         kind: "function".into(),
         file: "changed.ts".into(),
         refs_internal: 0,
     };
     let change = || ApiSymbolChange {
+        inline_module: None,
         unverified: None,
         name: "item".into(),
         kind: "function".into(),
@@ -2132,6 +2153,7 @@ fn build_review_hook_json_preserves_unanalyzable_source_detail() {
     for blocking in [false, true] {
         if blocking {
             result.api_changes.removed.push(ApiSymbol {
+                inline_module: None,
                 name: "Removed".into(),
                 kind: "class".into(),
                 file: "api.ts".into(),

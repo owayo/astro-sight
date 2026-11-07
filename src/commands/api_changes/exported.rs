@@ -10,6 +10,11 @@ pub(crate) struct ExportedFileFacts {
     pub(crate) starts: Vec<(usize, usize)>,
     pub(crate) type_dependencies: Option<super::ts_signature::DependencySnapshot>,
     rust_parameters: RustParameterContracts,
+    /// Rust のとき、`symbols` と同じ順の宣言の文脈 (inline module の経路と cfg の条件)。同じ
+    /// ファイルの同じ名前の項目を区別して旧新を組にするのに使う (Issue #282)。
+    pub(crate) rust_declarations: Option<Vec<super::RustDeclarationContext>>,
+    /// Rust のとき、関数とメソッドの宣言 (非公開を含む) に 2 回以上現れる名前 (Issue #282)。
+    pub(crate) rust_shared_callables: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -184,6 +189,19 @@ pub(crate) fn extract_exported_symbols_from_source(
 }
 
 /// [`extract_exported_symbols_from_source`] で、TS の `stripInternal` の設定も当てる。
+/// 削除ファイルの旧ソースの公開シンボルと、Rust なら宣言の文脈 (`symbols` と同じ順。inline
+/// module の経路を出力に添えるのに使う。Issue #282)。
+pub(crate) fn extract_deleted_exported_facts(
+    file_path: &str,
+    source: &[u8],
+    strip_internal: &super::ts_strip_internal::StripInternal,
+) -> Option<(ExportedSymbols, Option<Vec<super::RustDeclarationContext>>)> {
+    let rust = crate::language::LangId::from_path(camino::Utf8Path::new(file_path)).ok()
+        == Some(crate::language::LangId::Rust);
+    let facts = extract_exported_file_facts_from_source(file_path, source, rust, strip_internal)?;
+    Some((facts.symbols, facts.rust_declarations))
+}
+
 pub(crate) fn extract_exported_symbols_from_source_with(
     file_path: &str,
     source: &[u8],
@@ -1036,6 +1054,19 @@ fn filter_exported_with_metadata(
     if collect_metadata && lang_id == crate::language::LangId::Rust {
         result.rust_parameters.imports =
             crate::engine::rust_signature::rust_parameter_import_environment(root, source);
+        result.rust_declarations = Some(Vec::new());
+        let mut callables: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for sym in syms {
+            if matches!(sym.kind, SymbolKind::Function | SymbolKind::Method) {
+                *callables.entry(sym.name.as_str()).or_default() += 1;
+            }
+        }
+        result.rust_shared_callables = callables
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(name, _)| name.to_owned())
+            .collect();
     }
     for sym in syms {
         if context.is_excluded_before_qualname(sym) {
@@ -1096,6 +1127,9 @@ fn filter_exported_with_metadata(
         result
             .starts
             .push((sym.range.start.line, sym.range.start.column));
+        if let Some(declarations) = &mut result.rust_declarations {
+            declarations.push(super::rust_declaration_context(sym, root, source));
+        }
     }
     result
 }

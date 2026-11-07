@@ -7,6 +7,8 @@ use crate::models::review::{ApiModificationUnverified, ApiModificationUnverified
 #[derive(Debug, Clone)]
 pub(crate) struct ApiSymbolCandidate {
     pub(crate) name: String,
+    /// Rust の項目が inline module の中にあれば、ファイルの中のその経路 (Issue #282)。
+    pub(crate) inline_module: Option<String>,
     pub(crate) kind: String,
     pub(crate) file: String,
     pub(crate) signature: String,
@@ -16,6 +18,7 @@ impl ApiSymbolCandidate {
     pub(crate) fn into_api_symbol(self) -> ApiSymbol {
         ApiSymbol {
             name: self.name,
+            inline_module: self.inline_module,
             kind: self.kind,
             file: self.file,
             refs_internal: 0,
@@ -131,6 +134,7 @@ fn collect_python_contract_changes(
             parsed.new_source,
         ) {
             state.buckets.modified.push(ApiSymbolChange {
+                inline_module: None,
                 unverified: None,
                 name: change.name,
                 kind: "type".to_string(),
@@ -206,6 +210,7 @@ fn collect_python_typed_dict_field_changes(
             class_name,
         ) {
             state.buckets.modified.push(ApiSymbolChange {
+                inline_module: None,
                 unverified: None,
                 name: change.name,
                 kind: "field".to_string(),
@@ -244,6 +249,9 @@ struct SymbolMaps<'a> {
     new_map: std::collections::HashMap<&'a str, (&'a str, &'a str)>,
     old_name_counts: std::collections::HashMap<&'a str, usize>,
     new_name_counts: std::collections::HashMap<&'a str, usize>,
+    /// Rust のとき、旧新を宣言の場所 (inline module の経路・qualname・種類) で組にした結果
+    /// (Issue #282)。あれば追加・削除・変更は名前ではなくこれで決める。
+    rust: Option<RustPairing>,
 }
 
 impl<'a> SymbolMaps<'a> {
@@ -271,6 +279,14 @@ impl<'a> SymbolMaps<'a> {
                 .collect(),
             old_name_counts,
             new_name_counts,
+            rust: facts.rust_declarations.and_then(|declarations| {
+                RustPairing::build(
+                    facts.old_syms,
+                    &declarations.old,
+                    facts.new_syms,
+                    &declarations.new,
+                )
+            }),
         }
     }
 }
@@ -334,7 +350,7 @@ fn collect_added_symbols(
         in_file_callees,
         ..
     } = facts;
-    let SymbolMaps { old_map, .. } = maps;
+    let SymbolMaps { old_map, rust, .. } = maps;
 
     let is_binary_rust_crate = is_binary_only_rust_crate(dir, &df.new_path);
 
@@ -342,13 +358,21 @@ fn collect_added_symbols(
     let mut new_symbols_in_current_file: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
-    let same_name_additions = same_name_surplus_mask(new_syms, old_syms);
-    for ((name, kind, sig), same_name_addition) in new_syms.iter().zip(same_name_additions) {
+    // Rust は宣言の場所で組にしたので、同じ名前の数の差ではなく、旧い版に同じキーの宣言が
+    // 無いものを追加とする (Issue #282)。
+    let same_name_additions = match rust {
+        Some(_) => vec![false; new_syms.len()],
+        None => same_name_surplus_mask(new_syms, old_syms),
+    };
+    for (index, ((name, kind, sig), same_name_addition)) in
+        new_syms.iter().zip(same_name_additions).enumerate()
+    {
         if same_name_addition {
             // 同名が旧側にもある追加 (overload の追加など)。api.add には載せないが、
             // 同名の 1 つを別ファイルへ移した変更の移動先として move 突き合わせの候補にする。
             // 候補にしないと、移動元で件数の減った削除が相殺されず api.rm に残る。
             state.buckets.all_new_candidates.push(ApiSymbolCandidate {
+                inline_module: None,
                 name: name.clone(),
                 kind: kind.clone(),
                 file: df.new_path.clone(),
@@ -356,9 +380,16 @@ fn collect_added_symbols(
             });
             continue;
         }
-        if !old_map.contains_key(name.as_str()) {
+        let is_new = match rust {
+            Some(pairing) => pairing.added[index],
+            None => !old_map.contains_key(name.as_str()),
+        };
+        if is_new {
             new_symbols_in_current_file.insert(name.clone());
             let candidate = ApiSymbolCandidate {
+                inline_module: facts
+                    .rust_declarations
+                    .and_then(|declarations| declarations.new_inline_module(index)),
                 name: name.clone(),
                 kind: kind.clone(),
                 file: df.new_path.clone(),
@@ -415,7 +446,7 @@ fn collect_removed_symbols(
         new_export_surface_names,
         ..
     } = facts;
-    let SymbolMaps { new_map, .. } = maps;
+    let SymbolMaps { new_map, rust, .. } = maps;
 
     // Bash スクリプトでは関数定義は `export -f` (または `declare -fx`/`declare -xf`) で
     // 明示しない限りサブプロセスへ波及しない。
@@ -440,7 +471,28 @@ fn collect_removed_symbols(
     });
     // 同名が新側にも残る削除 (overload の片方など)。名前の有無だけで判定すると検出
     // できないが、件数が減り旧シグネチャも残っていない以上、消えた定義があるので曖昧ではない。
-    let same_name_removals = same_name_surplus_mask(old_syms, new_syms);
+    // Rust は宣言の場所で組にしたので、新しい版に同じキーの宣言が無いものを削除とする
+    // (Issue #282)。同じ名前の宣言がほかの場所に残る削除は、名前で推測する rename や field 化の
+    // 判定に流さない。
+    let (removals, same_name_removals): (Vec<bool>, Vec<bool>) = match rust {
+        Some(pairing) => old_syms
+            .iter()
+            .zip(&pairing.removed)
+            .map(|((name, _, _), &removed)| {
+                (removed, removed && new_map.contains_key(name.as_str()))
+            })
+            .unzip(),
+        None => old_syms
+            .iter()
+            .zip(same_name_surplus_mask(old_syms, new_syms))
+            .map(|((name, _, _), same_name_removal)| {
+                (
+                    same_name_removal || !new_map.contains_key(name.as_str()),
+                    same_name_removal,
+                )
+            })
+            .unzip(),
+    };
     let mut unparsed_by_name = std::collections::HashMap::<&str, Vec<_>>::new();
     let mut old_name_counts = std::collections::HashMap::<&str, usize>::new();
     // 旧側も Bash 文法で解析していた場合だけ照合する。別言語の同名 API を
@@ -462,8 +514,16 @@ fn collect_removed_symbols(
     // export { name };`) により name が公開され続けているシンボルは、利用者から見た
     // API 面が維持されているため api.rm から除外する。
     // `new_export_surface_names` は Phase 0 の単一 parse で先取り済み (perf #2)。
-    for ((name, kind, sig), same_name_removal) in old_syms.iter().zip(same_name_removals) {
-        if same_name_removal || !new_map.contains_key(name.as_str()) {
+    for (index, (((name, kind, sig), same_name_removal), removed)) in old_syms
+        .iter()
+        .zip(same_name_removals)
+        .zip(removals)
+        .enumerate()
+    {
+        if removed {
+            let inline_module = facts
+                .rust_declarations
+                .and_then(|declarations| declarations.old_inline_module(index));
             if is_rust_old_symbol_outside_public_api_surface(
                 dir,
                 base_blobs,
@@ -481,6 +541,7 @@ fn collect_removed_symbols(
                     // 読み込み・解析に失敗した場合も、同名だけで変化を相殺しない。
                     if signatures.as_ref().is_none_or(|map| map.contains_key(name)) {
                         state.buckets.modified.push(ApiSymbolChange {
+                            inline_module: None,
                             unverified: None,
                             name: name.clone(),
                             kind: kind.clone(),
@@ -498,6 +559,7 @@ fn collect_removed_symbols(
                     // Rust は、再公開の先の宣言と組にして比べる (Issue #281)。
                     state.buckets.reexported_removals.push((
                         ApiSymbolCandidate {
+                            inline_module: inline_module.clone(),
                             name: name.clone(),
                             kind: kind.clone(),
                             file: df.old_path.clone(),
@@ -512,6 +574,7 @@ fn collect_removed_symbols(
             // 消えた場合の判定。同名が残る削除は rename でも field 化でもない。
             if same_name_removal {
                 state.buckets.removed.push(ApiSymbolCandidate {
+                    inline_module,
                     name: name.clone(),
                     kind: kind.clone(),
                     file: df.old_path.clone(),
@@ -581,6 +644,7 @@ fn collect_removed_symbols(
                 continue;
             }
             state.buckets.removed.push(ApiSymbolCandidate {
+                inline_module,
                 name: name.clone(),
                 kind: kind.clone(),
                 file: df.old_path.clone(),
@@ -616,6 +680,10 @@ fn collect_modified_symbols(
         ChangedSignatureFiles::new(inputs, state, &df.old_path, &df.new_path, in_file_callees);
     files.rust_const_additions = Some(facts.rust_const_additions);
     files.type_dependencies = Some(facts.type_dependencies);
+    if let (Some(pairing), Some(declarations)) = (&maps.rust, facts.rust_declarations) {
+        collect_rust_modified_symbols(inputs, state, df, facts, pairing, declarations, &mut files);
+        return;
+    }
     let recovered = super::ts_namespace::recover_root_changes(inputs, df, facts);
 
     // 同一 (file, qualname) の modified を重複排除するためのキーセット
@@ -665,6 +733,7 @@ fn collect_modified_symbols(
                 }
             };
             let change = ApiSymbolChange {
+                inline_module: None,
                 unverified: None,
                 name: name.clone(),
                 kind: kind.clone(),
@@ -692,6 +761,74 @@ fn collect_modified_symbols(
             }
             files.classify(inputs, state, name, kind, old_sig, new_sig);
         }
+    }
+}
+
+/// Rust の変更ファイルで、宣言の場所 (inline module の経路・qualname・種類) で組にした旧新の
+/// 宣言を比べる (Issue #282)。同じキーの宣言が複数あって組にできず、cfg の条件と signature の
+/// 対応が変わったものは、比べられない変更として blocking にする。
+fn collect_rust_modified_symbols(
+    inputs: &DetectionInputs<'_>,
+    state: &mut DetectionState<'_>,
+    df: &crate::models::impact::DiffFile,
+    facts: &ModifiedFileFacts<'_>,
+    pairing: &RustPairing,
+    declarations: &RustDeclarationPair,
+    files: &mut ChangedSignatureFiles<'_>,
+) {
+    for &(old_index, new_index) in &pairing.pairs {
+        let (name, _, old_sig) = &facts.old_syms[old_index];
+        let (_, kind, new_sig) = &facts.new_syms[new_index];
+        // signature が同じ組は報告しない (型注釈と静的 container の段階は TS・JS だけ)。
+        if old_sig == new_sig || facts.parameter_pattern_only_names.contains(name) {
+            continue;
+        }
+        let site = RustDeclarationSite {
+            old_start: declarations.old[old_index].start,
+            new_start: declarations.new[new_index].start,
+            name_shared: pairing.name_is_shared(name),
+            callee_shared: declarations.new_shared_callables.contains(bare_name(name)),
+        };
+        let inline_module = declarations.new_inline_module(new_index);
+        files.classify_rust(
+            inputs,
+            state,
+            name,
+            kind,
+            old_sig,
+            new_sig,
+            site,
+            inline_module,
+        );
+    }
+    if files.skip_for_binary_crate {
+        return;
+    }
+    for (olds, _) in &pairing.ambiguous {
+        let Some(&first) = olds.first() else {
+            continue;
+        };
+        let (name, kind, _) = &facts.old_syms[first];
+        let change = ApiSymbolChange {
+            inline_module: declarations.old_inline_module(first),
+            unverified: None,
+            name: name.clone(),
+            kind: kind.clone(),
+            file: df.new_path.clone(),
+            old_signature: None,
+            new_signature: None,
+            no_resolved_internal_callers: false,
+            contract_change: None,
+        };
+        record_signature_decision(
+            inputs,
+            state,
+            change,
+            SignatureDecision::Unverified(ApiModificationUnverified {
+                reason: ApiModificationUnverifiedReason::RustDeclarationPairingAmbiguous,
+                first_unproven: None,
+            }),
+        );
     }
 }
 
@@ -805,9 +942,9 @@ fn base_file_of(
 }
 
 /// 旧い宣言 `old` (再公開したファイル `reexporting_file`) を再公開の先の宣言と組にする。旧い宣言が
-/// 旧いファイルの module のスコープ (直下と inline module の中) で唯一の、その名前の宣言で、直下に
-/// ある (inline module の中の宣言は別のパスなので組にしない) こと、先を解けて種類が同じこと、先の
-/// 宣言の signature と base での有無を決められることを求める。
+/// 旧いファイルの直下の、その名前の唯一の宣言である (inline module の中の宣言は別のパスなので
+/// 組にしない。削除の候補は宣言の場所で組にした結果なので、どの宣言かは `inline_module` で分かる)
+/// こと、先を解けて種類が同じこと、先の宣言の signature と base での有無を決められることを求める。
 fn pair_reexported_removal(
     inputs: &DetectionInputs<'_>,
     renames: &[crate::models::impact::DiffFile],
@@ -820,7 +957,7 @@ fn pair_reexported_removal(
         return None;
     }
     let old_source = inputs.base_blobs.read(&old.file)?;
-    if module_scope_declarations(&old_source, &old.name)? != 1
+    if old.inline_module.is_some()
         || declaration_in_scope(&old_source, &[], &old.name)? != Some(old.kind.as_str())
     {
         return None;
@@ -854,6 +991,40 @@ fn pair_reexported_removal(
         new_signature,
         merged,
     })
+}
+
+/// 再公開の組の、旧新の宣言の場所と名前の共有。読めなければ名前を共有するとみなす (名前で引く
+/// 判定を使わない)。
+fn reexport_site(
+    inputs: &DetectionInputs<'_>,
+    old: &ApiSymbolCandidate,
+    target: &ReexportTarget,
+) -> RustDeclarationSite {
+    let old_source = inputs.base_blobs.read(&old.file);
+    let new_source = load_new_source(inputs.dir, &target.file);
+    let old_start = old_source
+        .as_deref()
+        .and_then(|source| root_declaration(source, &old.name))
+        .map_or((usize::MAX, usize::MAX), |(start, _)| start);
+    let declarations = |source: Option<&[u8]>| {
+        source.and_then(|source| module_scope_declarations(source, &old.name))
+    };
+    let name_shared = [
+        declarations(old_source.as_deref()),
+        declarations(new_source.as_deref()),
+    ]
+    .iter()
+    .any(|count| count.is_none_or(|count| count > 1));
+    let callee_shared = new_source
+        .as_deref()
+        .and_then(|source| callable_declarations(source, bare_name(&old.name)))
+        .is_none_or(|count| count > 1);
+    RustDeclarationSite {
+        old_start,
+        new_start: target.start,
+        name_shared,
+        callee_shared,
+    }
 }
 
 /// 項目を別のファイルへ移して元のファイルから `pub use` で再公開した差分の、旧い宣言
@@ -904,6 +1075,7 @@ pub(crate) fn process_reexported_removals(
     let mut moved_files = MovedSymbolFiles::new(inputs.dir, inputs.base_blobs);
     for ((old, reexporting_file), pair) in removals.iter().zip(&pairs) {
         let blocking = |new_signature: Option<String>, unverified: bool| ApiSymbolChange {
+            inline_module: None,
             unverified: unverified.then_some(ApiModificationUnverified {
                 reason: ApiModificationUnverifiedReason::ReexportTargetUnresolved,
                 first_unproven: None,
@@ -945,6 +1117,8 @@ pub(crate) fn process_reexported_removals(
             continue;
         }
         let moved_symbol = || crate::models::review::MovedSymbol {
+            from_inline_module: old.inline_module.clone(),
+            to_inline_module: (!target.inline.is_empty()).then(|| target.inline.join("::")),
             name: old.name.clone(),
             kind: old.kind.clone(),
             from: old.file.clone(),
@@ -964,8 +1138,12 @@ pub(crate) fn process_reexported_removals(
         let mut changed =
             ChangedSignatureFiles::new(inputs, state, &old.file, &target.file, callees);
         changed.moved_from = Some(&old.file);
+        // 旧新の宣言そのものの場所で判定し、同じ名前の宣言がどちらかのファイルに複数あれば、名前で
+        // 引く判定は使わない (Issue #282)。
+        changed.rust_site = Some(reexport_site(inputs, old, target));
         // 関数に `const` を足しただけなら、通常の移動と同じ証明で互換 (#113・#114)。
         let destination = ApiSymbolCandidate {
+            inline_module: None,
             name: old.name.clone(),
             kind: old.kind.clone(),
             file: target.file.clone(),
@@ -1102,6 +1280,8 @@ struct ChangedSignatureFiles<'a> {
     rust_const_additions: Option<&'a std::collections::HashSet<String>>,
     /// 自由関数の移動で、const 追加と別ファイルの型所有元まで証明した名前。
     rust_moved_const_additions: std::collections::HashSet<String>,
+    /// 判定中の変更が、Rust の宣言を宣言の場所で組にしたものなら、その場所 (Issue #282)。
+    rust_site: Option<RustDeclarationSite>,
 }
 
 impl<'a> ChangedSignatureFiles<'a> {
@@ -1127,7 +1307,42 @@ impl<'a> ChangedSignatureFiles<'a> {
             rust_type_aliases: None,
             rust_const_additions: None,
             rust_moved_const_additions: std::collections::HashSet::new(),
+            rust_site: None,
         }
+    }
+
+    /// Rust の宣言を宣言の場所で組にした変更 1 件を判定し、対応する bucket へ入れる。形は
+    /// 組にした宣言そのものから読み、同じ名前の宣言がファイルに複数あれば、名前で引く判定は
+    /// 使わない (Issue #282)。
+    #[allow(clippy::too_many_arguments)]
+    fn classify_rust(
+        &mut self,
+        inputs: &DetectionInputs<'_>,
+        state: &mut DetectionState<'_>,
+        name: &str,
+        kind: &str,
+        old_sig: &str,
+        new_sig: &str,
+        site: RustDeclarationSite,
+        inline_module: Option<String>,
+    ) {
+        self.rust_site = Some(site);
+        let (mut change, decision) = self.decide(inputs, state, name, kind, old_sig, new_sig);
+        self.rust_site = None;
+        change.inline_module = inline_module;
+        record_signature_decision(inputs, state, change, decision);
+    }
+
+    /// 判定中の変更の名前が、ファイルの複数の宣言に共有されている (名前で引く判定は別の宣言に
+    /// 当たり得る)。
+    fn name_is_shared(&self) -> bool {
+        self.rust_site.is_some_and(|site| site.name_shared)
+    }
+
+    /// 判定中の変更の名前の末尾と同じ名前の関数・メソッドが、新しい版のファイルに複数ある
+    /// (同じファイルの中の呼び出しがどの宣言のものか決められない)。
+    fn callee_is_shared(&self) -> bool {
+        self.rust_site.is_some_and(|site| site.callee_shared)
     }
 
     /// シグネチャの変わったシンボル 1 件を判定し、対応する bucket へ入れる。
@@ -1161,6 +1376,7 @@ impl<'a> ChangedSignatureFiles<'a> {
             ..
         } = inputs;
         let change = ApiSymbolChange {
+            inline_module: None,
             unverified: None,
             name: name.to_owned(),
             kind: kind.to_owned(),
@@ -1221,21 +1437,55 @@ impl<'a> ChangedSignatureFiles<'a> {
                         new,
                     )
                 })
-                .and_then(|sources| match kind {
-                    "struct" => {
-                        let old = super::rust_struct_api::unique_struct_shape(&sources.old, name)?;
-                        let new = super::rust_struct_api::unique_struct_shape(&sources.new, name)?;
-                        Some(super::rust_struct_api::classify(&old, &new))
-                    }
-                    "enum" => {
-                        let old = super::rust_enum_api::unique_enum_shape(&sources.old, name)?;
-                        let new = super::rust_enum_api::unique_enum_shape(&sources.new, name)?;
-                        Some(super::rust_enum_api::classify(&old, &new))
-                    }
-                    _ => {
-                        let old = super::rust_union_api::unique_union_shape(&sources.old, name)?;
-                        let new = super::rust_union_api::unique_union_shape(&sources.new, name)?;
-                        Some(super::rust_union_api::classify(&old, &new))
+                .and_then(|sources| {
+                    // 宣言の場所で組にした変更は、その宣言そのものの形を比べる (Issue #282)。
+                    let site = self.rust_site;
+                    match kind {
+                        "struct" => {
+                            let (old, new) = match site {
+                                Some(site) => (
+                                    super::struct_shape_at(&sources.old, site.old_start)?,
+                                    super::struct_shape_at(&sources.new, site.new_start)?,
+                                ),
+                                None => (
+                                    super::rust_struct_api::unique_struct_shape(
+                                        &sources.old,
+                                        name,
+                                    )?,
+                                    super::rust_struct_api::unique_struct_shape(
+                                        &sources.new,
+                                        name,
+                                    )?,
+                                ),
+                            };
+                            Some(super::rust_struct_api::classify(&old, &new))
+                        }
+                        "enum" => {
+                            let (old, new) = match site {
+                                Some(site) => (
+                                    super::enum_shape_at(&sources.old, site.old_start)?,
+                                    super::enum_shape_at(&sources.new, site.new_start)?,
+                                ),
+                                None => (
+                                    super::rust_enum_api::unique_enum_shape(&sources.old, name)?,
+                                    super::rust_enum_api::unique_enum_shape(&sources.new, name)?,
+                                ),
+                            };
+                            Some(super::rust_enum_api::classify(&old, &new))
+                        }
+                        _ => {
+                            let (old, new) = match site {
+                                Some(site) => (
+                                    super::union_shape_at(&sources.old, site.old_start)?,
+                                    super::union_shape_at(&sources.new, site.new_start)?,
+                                ),
+                                None => (
+                                    super::rust_union_api::unique_union_shape(&sources.old, name)?,
+                                    super::rust_union_api::unique_union_shape(&sources.new, name)?,
+                                ),
+                            };
+                            Some(super::rust_union_api::classify(&old, &new))
+                        }
                     }
                 });
             let reason = match kind {
@@ -1288,7 +1538,11 @@ impl<'a> ChangedSignatureFiles<'a> {
         // `decide_signature_change` 側で従来どおり捨てる。
         // default export / 別名 export (`export { f as g }`) の利用者は宣言名で現れないので、
         // 宣言名の cross-file 参照 0 件は「同一ファイル内でしか使われていない」証明にならない。
-        let internally_closed = is_internally_connected(self.in_file_callees, name)
+        // 同じ名前の宣言がファイルに複数あると、同じファイルの中の呼び出しがどの宣言のものか
+        // 決められないので、同じファイルの中だけで使う証明にしない (Issue #282)。
+        let internally_closed = !self.name_is_shared()
+            && !self.callee_is_shared()
+            && is_internally_connected(self.in_file_callees, name)
             && !has_cross_file_refs(ref_index, self.new_path, name)
             && !super::js_public_name::published_names_for_diff_file(
                 dir,
@@ -1330,7 +1584,12 @@ impl<'a> ChangedSignatureFiles<'a> {
 
         // Rust の透過的な root public type alias の導入・展開だけで説明できる表記変更は
         // 非 blocking。同一ファイルの候補間では old/new alias index を再利用する。
-        if self.lang_id == Some(crate::language::LangId::Rust) && kind == "function" {
+        // 同じ名前の宣言がファイルに複数あると、名前で引く関数の見出しが別の宣言のものになり
+        // 得るので証明しない (Issue #282)。
+        if self.lang_id == Some(crate::language::LangId::Rust)
+            && kind == "function"
+            && !self.name_is_shared()
+        {
             let (old_path, new_path) = (self.old_path, self.new_path);
             let context = self.rust_type_aliases.get_or_insert_with(|| {
                 let new_source = super::source_pair::load_new_source(dir, new_path)?;
@@ -1371,6 +1630,11 @@ impl<'a> ChangedSignatureFiles<'a> {
             }
         }
 
+        // 同じ名前の宣言がファイルに複数あると、呼び出し側の追随も名前では宣言に結び付けられない
+        // ので、互換・追随済みの証明に進まず blocking にする (Issue #282)。
+        if self.name_is_shared() {
+            return (change, SignatureDecision::Blocking(None));
+        }
         let site = SignatureChangeSite {
             change,
             old_path: self.old_path,
@@ -1923,6 +2187,7 @@ fn record_signature_decision(
         SignatureDecision::Omit => {}
         SignatureDecision::UnchangedTypeAnnotation => {
             buckets.unchanged_type_annotations.push(ApiSymbol {
+                inline_module: change.inline_module,
                 name: change.name,
                 kind: change.kind,
                 file: change.file,
@@ -1941,13 +2206,19 @@ fn record_signature_decision(
         SignatureDecision::ConstValue => buckets.const_value_changes.push(change),
         SignatureDecision::UnchangedStaticConst => {
             buckets.unchanged_static_consts.push(ApiSymbol {
+                inline_module: change.inline_module,
                 name: change.name,
                 kind: change.kind,
                 file: change.file,
                 refs_internal: 0,
             });
         }
-        SignatureDecision::Compatible(compat) | SignatureDecision::MovedConstAddition(compat) => {
+        SignatureDecision::Compatible(mut compat)
+        | SignatureDecision::MovedConstAddition(mut compat) => {
+            // 互換の判定器は名前で作るので、変更の inline module の経路を引き継ぐ。
+            if compat.inline_module.is_none() {
+                compat.inline_module = change.inline_module;
+            }
             buckets.compatible_modified.push(compat)
         }
         SignatureDecision::ClosedInDiff => buckets.modified_closed_in_diff.push(change),
@@ -2101,6 +2372,7 @@ pub(crate) fn process_deleted_file(
     df: &crate::models::impact::DiffFile,
     old_syms: &[(String, String, String)],
     old_source_unverified: bool,
+    rust_declarations: Option<&[RustDeclarationContext]>,
 ) {
     let &DetectionInputs {
         dir,
@@ -2118,7 +2390,7 @@ pub(crate) fn process_deleted_file(
     let is_bash_old_file = is_bash_script_path(&df.old_path);
     // base 側 blob の `export -f` 宣言はファイル単位で 1 回だけ読む (関数ごとの git show を避ける)。
     let mut bash_exported: Option<std::collections::HashSet<String>> = None;
-    for (name, kind, sig) in old_syms {
+    for (index, (name, kind, sig)) in old_syms.iter().enumerate() {
         if !old_source_unverified
             && is_rust_old_symbol_outside_public_api_surface(
                 dir,
@@ -2140,6 +2412,9 @@ pub(crate) fn process_deleted_file(
             continue;
         }
         state.buckets.removed.push(ApiSymbolCandidate {
+            inline_module: rust_declarations
+                .and_then(|declarations| declarations.get(index))
+                .and_then(inline_module_of),
             name: name.clone(),
             kind: kind.clone(),
             file: df.old_path.clone(),
@@ -2171,10 +2446,14 @@ pub(crate) fn process_added_file(
     let &AddedFileFacts {
         new_syms,
         in_file_callees,
+        rust_declarations,
     } = facts;
     let is_binary_rust_crate = is_binary_only_rust_crate(dir, &df.new_path);
-    for (name, kind, sig) in new_syms {
+    for (index, (name, kind, sig)) in new_syms.iter().enumerate() {
         let candidate = ApiSymbolCandidate {
+            inline_module: rust_declarations
+                .and_then(|declarations| declarations.get(index))
+                .and_then(inline_module_of),
             name: name.clone(),
             kind: kind.clone(),
             file: df.new_path.clone(),

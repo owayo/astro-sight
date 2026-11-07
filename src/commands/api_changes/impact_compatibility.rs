@@ -63,6 +63,7 @@ pub(crate) fn compatible_impact_names(
             for change in api.modified_closed_in_diff {
                 if proof.covers(&change.file, &change.name) {
                     changes.push(CompatibleApiModification {
+                        inline_module: change.inline_module,
                         name: change.name,
                         kind: change.kind,
                         file: change.file,

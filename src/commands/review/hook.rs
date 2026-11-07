@@ -67,6 +67,9 @@ struct HookImpact<'a> {
 #[derive(Serialize)]
 struct HookNameFile<'a> {
     n: &'a str,
+    /// Rust の項目が inline module の中にあれば、ファイルの中のその経路 (Issue #282)。
+    #[serde(rename = "m", skip_serializing_if = "Option::is_none")]
+    inline_module: Option<&'a str>,
     f: &'a str,
 }
 
@@ -76,6 +79,9 @@ struct HookNameFile<'a> {
 #[derive(Serialize)]
 struct HookAddedSymbol<'a> {
     n: &'a str,
+    /// Rust の項目が inline module の中にあれば、ファイルの中のその経路 (Issue #282)。
+    #[serde(rename = "m", skip_serializing_if = "Option::is_none")]
+    inline_module: Option<&'a str>,
     f: &'a str,
     /// 同一ファイル内の実利用参照数 (定義 / import・re-export 行を除く)。
     /// `add_scope` は「同一 diff の他ファイルから参照されていない」抽出範囲しか表せず、
@@ -94,6 +100,9 @@ struct HookAddedSymbol<'a> {
 #[derive(Serialize)]
 struct HookModifiedSymbol<'a> {
     n: &'a str,
+    /// Rust の項目が inline module の中にあれば、ファイルの中のその経路 (Issue #282)。
+    #[serde(rename = "m", skip_serializing_if = "Option::is_none")]
+    inline_module: Option<&'a str>,
     f: &'a str,
     /// リポジトリ内に解決できた呼び出し参照が 1 件も無い。`api.mod` は「未更新の呼び出し側が
     /// あるかもしれない」警告だが、呼び出し参照 0 件では更新すべき呼び出し側が存在せず、
@@ -128,6 +137,9 @@ struct HookDeadSymbol<'a> {
 #[derive(Serialize)]
 struct HookCompatibleModification<'a> {
     n: &'a str,
+    /// Rust の項目が inline module の中にあれば、ファイルの中のその経路 (Issue #282)。
+    #[serde(rename = "m", skip_serializing_if = "Option::is_none")]
+    inline_module: Option<&'a str>,
     f: &'a str,
     reason: &'a str,
 }
@@ -151,7 +163,13 @@ struct HookTypeAnnotationChange<'a> {
 struct HookMovedSymbol<'a> {
     n: &'a str,
     from: &'a str,
+    /// Rust の項目が移動元で inline module の中にあれば、ファイルの中のその経路 (Issue #282)。
+    #[serde(rename = "fm", skip_serializing_if = "Option::is_none")]
+    from_inline_module: Option<&'a str>,
     to: &'a str,
+    /// Rust の項目が移動先で inline module の中にあれば、ファイルの中のその経路。
+    #[serde(rename = "tm", skip_serializing_if = "Option::is_none")]
+    to_inline_module: Option<&'a str>,
 }
 
 /// missing_cochange の hook 用 DTO。
@@ -278,15 +296,18 @@ struct HookApi<'a> {
 
 impl<'a> HookApi<'a> {
     fn from_api_changes(api: &'a ApiChanges) -> Self {
-        let name_file = |name: &'a String, file: &'a String| HookNameFile {
-            n: name.as_str(),
-            f: file.as_str(),
-        };
+        let name_file =
+            |name: &'a String, inline_module: Option<&'a str>, file: &'a String| HookNameFile {
+                n: name.as_str(),
+                inline_module,
+                f: file.as_str(),
+            };
         let added: Vec<HookAddedSymbol<'a>> = api
             .added
             .iter()
             .map(|change| HookAddedSymbol {
                 n: change.name.as_str(),
+                inline_module: change.inline_module.as_deref(),
                 f: change.file.as_str(),
                 refs_internal: change.refs_internal,
             })
@@ -338,13 +359,16 @@ impl<'a> HookApi<'a> {
             removed: api
                 .removed
                 .iter()
-                .map(|change| name_file(&change.name, &change.file))
+                .map(|change| {
+                    name_file(&change.name, change.inline_module.as_deref(), &change.file)
+                })
                 .collect(),
             modified: api
                 .modified
                 .iter()
                 .map(|change| HookModifiedSymbol {
                     n: change.name.as_str(),
+                    inline_module: change.inline_module.as_deref(),
                     f: change.file.as_str(),
                     no_resolved_internal_callers: change.no_resolved_internal_callers,
                     contract_change: change.contract_change,
@@ -354,12 +378,16 @@ impl<'a> HookApi<'a> {
             modified_closed_in_diff: api
                 .modified_closed_in_diff
                 .iter()
-                .map(|change| name_file(&change.name, &change.file))
+                .map(|change| {
+                    name_file(&change.name, change.inline_module.as_deref(), &change.file)
+                })
                 .collect(),
             const_value_changes: api
                 .const_value_changes
                 .iter()
-                .map(|change| name_file(&change.name, &change.file))
+                .map(|change| {
+                    name_file(&change.name, change.inline_module.as_deref(), &change.file)
+                })
                 .collect(),
             type_annotation_changes: api
                 .type_annotation_changes
@@ -376,6 +404,7 @@ impl<'a> HookApi<'a> {
                 .iter()
                 .map(|change| HookCompatibleModification {
                     n: change.name.as_str(),
+                    inline_module: change.inline_module.as_deref(),
                     f: change.file.as_str(),
                     reason: change.reason.as_str(),
                 })
@@ -395,18 +424,22 @@ impl<'a> HookApi<'a> {
                 .map(|change| HookMovedSymbol {
                     n: change.name.as_str(),
                     from: change.from.as_str(),
+                    from_inline_module: change.from_inline_module.as_deref(),
                     to: change.to.as_str(),
+                    to_inline_module: change.to_inline_module.as_deref(),
                 })
                 .collect(),
             removed_dead: api
                 .removed_dead
                 .iter()
-                .map(|change| name_file(&change.name, &change.file))
+                .map(|change| {
+                    name_file(&change.name, change.inline_module.as_deref(), &change.file)
+                })
                 .collect(),
             property_to_field: api
                 .property_to_field
                 .iter()
-                .map(|change| name_file(&change.name, &change.file))
+                .map(|change| name_file(&change.name, None, &change.file))
                 .collect(),
         }
     }

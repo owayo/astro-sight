@@ -577,7 +577,13 @@ fn stale_reexport_files_and_same_file_merges_stay_blocking() {
             api.modified.iter().any(|change| change.name == *name),
             "{new:?}: {api:?}"
         );
-        assert!(!moved(&api, name), "{new:?}: {api:?}");
+        // 再公開した旧い宣言は移動にしない (先のファイルの中の inline module の間の移動は出てよい)
+        assert!(
+            !api.moved
+                .iter()
+                .any(|symbol| symbol.name == *name && symbol.from != symbol.to),
+            "{new:?}: {api:?}"
+        );
     }
 }
 
@@ -610,4 +616,49 @@ fn kept_same_named_bindings_in_the_destination_file_do_not_block_moves() {
             "{nested}: {api:?}"
         );
     }
+}
+
+/// 再公開の先と同じ名前の宣言が先のファイルにほかにもあれば、名前で引く判定 (同じファイルの中だけで
+/// 使う、呼び出し側の追随) で壊す変更を降格しない (Issue #282)。
+#[test]
+fn reexported_moves_into_files_with_same_named_items_keep_breaking_changes() {
+    let api = api_changes(
+        &[("src/lib.rs", "pub fn run(x: u8) {}\n")],
+        &[(
+            "src/lib.rs",
+            Some(
+                "pub mod a {\n    pub fn run(x: u8, y: u8) {}\n}\npub mod b {\n    pub fn run() {}\n    pub fn caller() {\n        run();\n    }\n}\npub use a::run;\n",
+            ),
+        )],
+    );
+    assert!(
+        api.modified.iter().any(|change| change.name == "run"
+            && change
+                .new_signature
+                .as_deref()
+                .is_some_and(|signature| signature.contains("y: u8"))),
+        "{api:?}"
+    );
+    assert!(!moved(&api, "run"), "{api:?}");
+}
+
+/// 旧いファイルの別の inline module に同じ名前の宣言があっても、直下の宣言だけを別のファイルへ
+/// 移して再公開するのは移動 (どの宣言の削除かは宣言の場所で分かる。Issue #282)。
+#[test]
+fn reexported_moves_beside_same_named_inline_items_are_moves() {
+    let api = api_changes(
+        &[(
+            "src/lib.rs",
+            "pub fn run() {}\npub mod b {\n    pub fn run() {}\n}\n",
+        )],
+        &[
+            (
+                "src/lib.rs",
+                Some("mod detail;\npub use detail::run;\npub mod b {\n    pub fn run() {}\n}\n"),
+            ),
+            ("src/detail.rs", Some("pub fn run() {}\n")),
+        ],
+    );
+    assert!(moved(&api, "run"), "{api:?}");
+    assert!(api.modified.is_empty(), "{api:?}");
 }

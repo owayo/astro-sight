@@ -447,12 +447,14 @@ mod tests {
         use crate::output::{JsonStyle, OutputFormat, OutputOptions, serialize_document};
 
         let symbol = |name: &str, refs_internal: usize| ApiSymbol {
+            inline_module: None,
             name: name.into(),
             kind: "function".into(),
             file: "lib/base.ts".into(),
             refs_internal,
         };
         let change = |name: &str, no_callers: bool| ApiSymbolChange {
+            inline_module: None,
             unverified: None,
             name: name.into(),
             kind: "function".into(),

@@ -1032,6 +1032,8 @@ pub(crate) fn settle_moved_symbol_changes(
         .map(|change| candidate_key(&change.new))
         .collect();
     moved.extend(accepted.iter().map(|change| MovedSymbol {
+        from_inline_module: None,
+        to_inline_module: None,
         name: change.old.name.clone(),
         kind: change.old.kind.clone(),
         from: change.old.file.clone(),
@@ -1144,6 +1146,7 @@ mod tests {
 
     fn candidate(name: &str, kind: &str, file: &str, signature: &str) -> ApiSymbolCandidate {
         ApiSymbolCandidate {
+            inline_module: None,
             name: name.to_owned(),
             kind: kind.to_owned(),
             file: file.to_owned(),
@@ -1191,10 +1194,12 @@ mod tests {
                 PreparedDiffFile::Deleted {
                     old_syms: Some(self.old_syms.clone()),
                     old_source_unverified: false,
+                    rust_declarations: None,
                 },
                 PreparedDiffFile::Added {
                     new_syms: Some(self.new_syms.clone()),
                     in_file_callees: HashSet::new(),
+                    rust_declarations: None,
                 },
             ];
             let files = MemberFileFacts::new(&diff_files, &prepared);
@@ -1248,6 +1253,7 @@ mod tests {
                 rust_const_additions: HashSet::new(),
                 in_file_callees: HashSet::new(),
                 new_export_surface_names: HashSet::new(),
+                rust_declarations: None,
             },
             PreparedDiffFile::Modified {
                 type_dependencies: Default::default(),
@@ -1258,6 +1264,7 @@ mod tests {
                 rust_const_additions: HashSet::new(),
                 in_file_callees: HashSet::new(),
                 new_export_surface_names: HashSet::new(),
+                rust_declarations: None,
             },
         ];
         let files = MemberFileFacts::new(&diff_files, &prepared);
@@ -1297,6 +1304,8 @@ mod tests {
                 "同じ (name, kind) の削除が厳密一致で移動している",
                 |s| {
                     s.moved.push(MovedSymbol {
+                        from_inline_module: None,
+                        to_inline_module: None,
                         name: "WEEK".to_owned(),
                         kind: "constant".to_owned(),
                         from: "c/src/items.rs".to_owned(),
@@ -1656,6 +1665,7 @@ mod tests {
                     symbol("Packer", "struct", "pub struct Packer"),
                 ]),
                 old_source_unverified: false,
+                rust_declarations: None,
             },
             PreparedDiffFile::Added {
                 new_syms: Some(vec![
@@ -1665,6 +1675,7 @@ mod tests {
                     symbol("Packer", "struct", "pub struct Packer<T>"),
                 ]),
                 in_file_callees: HashSet::new(),
+                rust_declarations: None,
             },
             PreparedDiffFile::Modified {
                 type_dependencies: Default::default(),
@@ -1678,6 +1689,7 @@ mod tests {
                 rust_const_additions: HashSet::new(),
                 in_file_callees: HashSet::new(),
                 new_export_surface_names: HashSet::new(),
+                rust_declarations: None,
             },
         ];
         let mut names = HashSet::new();

@@ -150,6 +150,7 @@ pub(crate) fn detect_api_changes_with_renames(
             PreparedDiffFile::Added {
                 new_syms,
                 in_file_callees,
+                rust_declarations,
             } => {
                 if let Some(new_syms) = new_syms {
                     process_added_file(
@@ -159,6 +160,7 @@ pub(crate) fn detect_api_changes_with_renames(
                         &AddedFileFacts {
                             new_syms,
                             in_file_callees,
+                            rust_declarations: rust_declarations.as_deref(),
                         },
                     );
                 }
@@ -166,9 +168,17 @@ pub(crate) fn detect_api_changes_with_renames(
             PreparedDiffFile::Deleted {
                 old_syms,
                 old_source_unverified,
+                rust_declarations,
             } => {
                 if let Some(old_syms) = old_syms {
-                    process_deleted_file(&inputs, &mut state, df, old_syms, *old_source_unverified);
+                    process_deleted_file(
+                        &inputs,
+                        &mut state,
+                        df,
+                        old_syms,
+                        *old_source_unverified,
+                        rust_declarations.as_deref(),
+                    );
                 }
             }
             PreparedDiffFile::Modified {
@@ -180,6 +190,7 @@ pub(crate) fn detect_api_changes_with_renames(
                 rust_const_additions,
                 in_file_callees,
                 new_export_surface_names,
+                rust_declarations,
             } => {
                 if let (Some(old_syms), Some(new_syms)) = (old_syms, new_syms) {
                     process_modified_file(
@@ -195,6 +206,7 @@ pub(crate) fn detect_api_changes_with_renames(
                             rust_const_additions,
                             in_file_callees,
                             new_export_surface_names,
+                            rust_declarations: rust_declarations.as_deref(),
                         },
                     );
                 }
@@ -471,17 +483,21 @@ pub(crate) fn reconcile_with_moves(
             .push(i);
     }
 
-    // 2) 追加側も同じキーで「相異なる移動先ファイル数」を数える。同じ
-    //    (name, kind, signature, file) の重複候補は 1 件として扱う (同一ファイル内の
-    //    重複検出で移動先が 2 つあると誤判定しないため)。
-    let mut new_files: HashMap<ApiRelationKey, HashSet<String>> = HashMap::new();
-    let mut seen_new_keys: HashSet<(String, String, String, String)> = HashSet::new();
+    // 2) 追加側も同じキーで「相異なる移動先」(ファイルと、Rust の inline module の経路) の数を
+    //    数える。同じ (name, kind, signature, file, inline module) の重複候補は 1 件として扱う
+    //    (同一ファイル内の重複検出で移動先が 2 つあると誤判定しないため)。同じファイルの別々の
+    //    inline module は別の移動先 (Issue #282)。
+    let destination = |new: &ApiSymbolCandidate| (new.file.clone(), new.inline_module.clone());
+    let mut new_files: HashMap<ApiRelationKey, HashSet<(String, Option<String>)>> = HashMap::new();
+    let mut seen_new_keys: HashSet<(String, String, String, String, Option<String>)> =
+        HashSet::new();
     for new in &all_new_candidates {
         let dedup_key = (
             new.name.clone(),
             new.kind.clone(),
             new.signature.clone(),
             new.file.clone(),
+            new.inline_module.clone(),
         );
         if !seen_new_keys.insert(dedup_key) {
             continue;
@@ -489,7 +505,7 @@ pub(crate) fn reconcile_with_moves(
         new_files
             .entry(api_relation_key(new))
             .or_default()
-            .insert(new.file.clone());
+            .insert(destination(new));
     }
 
     // 3) 削除 1 件・追加先 1 ファイルのキーだけを move 認定する。
@@ -498,7 +514,7 @@ pub(crate) fn reconcile_with_moves(
     //    `removed` / `all_new_candidates` の並び順を入れ替えても結果は変わらない。
     let mut moved: Vec<MovedSymbol> = Vec::new();
     let mut removed_matched = vec![false; removed.len()];
-    let mut matched_new_files: HashMap<ApiRelationKey, String> = HashMap::new();
+    let mut matched_new_files: HashMap<ApiRelationKey, (String, Option<String>)> = HashMap::new();
     for new in &all_new_candidates {
         let bucket_key = api_relation_key(new);
         if matched_new_files.contains_key(&bucket_key) {
@@ -523,8 +539,10 @@ pub(crate) fn reconcile_with_moves(
         let rm_ix = rm_ixs[0];
         let rm = &removed[rm_ix];
         removed_matched[rm_ix] = true;
-        matched_new_files.insert(bucket_key, new.file.clone());
+        matched_new_files.insert(bucket_key, destination(new));
         moved.push(MovedSymbol {
+            from_inline_module: rm.inline_module.clone(),
+            to_inline_module: new.inline_module.clone(),
             name: rm.name.clone(),
             kind: rm.kind.clone(),
             from: rm.file.clone(),
@@ -546,7 +564,7 @@ pub(crate) fn reconcile_with_moves(
     // 5) `moved` で相殺された候補は `added` からも除外する。
     let kept_added: Vec<ApiSymbolCandidate> = added
         .into_iter()
-        .filter(|a| matched_new_files.get(&api_relation_key(a)) != Some(&a.file))
+        .filter(|a| matched_new_files.get(&api_relation_key(a)) != Some(&destination(a)))
         .collect();
 
     // 6) ペア化されなかった `removed` を、入力順のまま集める。
@@ -624,6 +642,7 @@ mod removed_rust_paths;
 mod removed_scope;
 
 mod rust_cfg_predicate;
+mod rust_declarations;
 mod rust_enum_api;
 mod rust_public;
 mod rust_ref_sites;
@@ -667,6 +686,7 @@ pub(crate) use ref_index::*;
 
 pub(crate) use removed_attribution::*;
 
+pub(crate) use rust_declarations::*;
 pub(crate) use rust_public::*;
 
 pub(crate) use source_pair::{
