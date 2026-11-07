@@ -464,6 +464,24 @@ Rust の構造体の `api_changes` の signature は、先頭行ではなく公�
 
 今の利用を壊さない変更は `mod_compat` の理由 `rust_struct_shape_compatible` にする。構築の制限を緩めること（最後の `pub` でないフィールドや `#[non_exhaustive]` を外す）、クレートの外から構築できない構造体への `pub` のフィールドの追加、トレイトの境界を緩めること、型の引数に既定値を付けること、境界が無く、既定値で置き換えても `pub` のフィールドの型が変わらず、既定値が見た目から大きさの決まった、今のどの利用でも正しい型である型の引数の追加（`Foo(pub u8)` から `Foo<T = u8>(pub T)`。既定値は `str` 以外の基本型・`()`・構造体の引数を含まない参照やポインタや関数ポインタ・それらのタプルと配列・大きさの決まっていることを求める今の型の引数に限り、`Box<T>` のような名前の付いた型とマクロを含む型は数えない。`?Sized` の引数は前の引数そのものを既定値にしてよい）、`#[repr]` の無い構造体への `repr(C)`・`repr(transparent)` の追加、全てのフィールドが `pub` でない構造体のタプルと名前付きの間の変更である。型の引数の改名（`for<'a>` が束縛するライフタイムも）、`::std::marker::Sized` を明示すること、整形、`r#` の表記、同じ `#[repr]` の項目の別の書き方、`#[repr]` の無い構造体の名前付きのフィールドの並べ替え、すでにクレートの外から構築できない構造体の `pub` でないフィールドの変更（手引きのとおり `repr(C)` でも）は報告しない。マクロの引数の中は、マクロが字面で照合するので字面のまま比べる（`r#T` と `T`、ドキュメントコメントと普通のコメントは別）。derive と構造体自体の `#[cfg]` は形に含めない。`Send`・`Sync` などの自動トレイトと型の引数の分散は、`pub` でないフィールドや別の場所で定義した型まで含む全てのフィールドの型から決まるので、追うには型の検査が要り、対象外とする。形を読めない構造体（型の引数に属性があるなど）は宣言全体を signature にし、変われば blocking に残す。マクロが生成する構造体は解析しない。公開 API 面の外の構造体（bin だけのクレート、どこからも再公開しない private module）は、従来の規則のままである。
 
+### Rust の enum の variant
+
+Rust の enum の `api_changes` の signature は、先頭行ではなく公開の形を示す。`#[repr]`・`#[non_exhaustive]`（`#[cfg_attr]` の中も）、可視性、型の引数、`where`、variant のフィールドから推論される寿命の境界と、variant（`#[cfg]`・`#[non_exhaustive]`・形・フィールド・書いたとおりの discriminant）である。variant は discriminant の値を観測できるときは宣言の順、できないときは名前の順に示し、名前付きのフィールドは名前の順（`repr(C)`・`repr(<int>)` の enum は宣言の順）にする。
+
+旧新の形は、Cargo の SemVer の手引きと Rust の参照に沿って、設定ごとに比べる。`#[cfg]` と `#[cfg_attr]` を述語（`all`・`any`・`not` と、`unix` や `feature = "x"` のような原子。`#[cfg_attr(P, cfg(Q))]` は `not(P) or Q`、入れ子の `#[cfg_attr]` は述語を合わせる）として読み、原子の真偽の組み合わせごとに、その設定で有る variant・フィールド・`#[non_exhaustive]`・`#[repr]` を作る。設定の中では、variant と名前付きのフィールドは名前、タプルのフィールドは位置で対応させる。どれかの設定を壊す変更は、同じ diff でリポジトリの中の利用を直しても blocking な `api.mod` にする。クレートの外の構築と `match` は直らないためである。
+
+- variant の削除・改名・形（unit・タプル・名前付き）の変更。有った設定で無くすことも含む。フィールドの無い `#[non_exhaustive]` の variant は、クレートの外で構築できず照合も `V { .. }` だけなので、フィールドを持たせてよい
+- `#[non_exhaustive]` の無い enum への variant の追加（網羅的な `match` を壊す）
+- `#[non_exhaustive]` の無い variant へのフィールドの追加と、フィールドの削除・改名・型の変更・タプルのフィールドの位置の変更
+- enum と variant への `#[non_exhaustive]` の追加
+- `as` を使えなくすること（有る variant の全てにフィールドが無く、書いた discriminant が unit の variant にだけあり、`#[non_exhaustive]` の variant が無い設定では、クレートの外から `as` で変換できる）と、`as` か `repr(C)`・`repr(<int>)` のレイアウトでクレートの外から観測できる discriminant の値の変更。途中への variant の追加は後ろの暗黙の値をずらす
+- `#[repr]` の削除と変更、`repr(C)`・`repr(<int>)` の enum の variant の名前付きのフィールドの並べ替え
+- 可視性の変更と、構造体と同じ型の引数の変更
+
+どの設定でも今の利用を壊さない変更は `mod_compat` の理由 `rust_enum_shape_compatible` とする。既存の値と `as` を保った `#[non_exhaustive]` の enum への variant の追加（variant から `#[cfg]` を外して、無かった設定に足すのも）、`#[non_exhaustive]` の variant への名前付きのフィールドとタプルの末尾のフィールドの追加、enum と variant の `#[non_exhaustive]` を外すこと、既定の表現の設定に `repr(C)`・`repr(<int>)`・`repr(C, <int>)`・`repr(transparent)` を付けること（無条件でも、`#[cfg_attr]` でも、`#[cfg_attr]` の条件を広げても）、互換な型の引数の変更である。整形・コメント・型の引数の改名・`r#`、どの設定も変えない `#[cfg]` の書き換え（`#[cfg(P)]` と `#[cfg(not(P))]` で分けた variant をまとめるなど）、値を観測できない enum の variant の並べ替え、`repr(C)`・`repr(<int>)` でない enum の名前付きのフィールドの並べ替え、同じ値の discriminant の書き方、derive・helper 属性（`#[serde(..)]`・`#[default]`）・`#[doc(hidden)]` は報告しない。
+
+discriminant の値は、設定ごとに有る variant から求める。整数のリテラル（符号・接尾辞・`_` を許し、`repr(u128)` の enum の `i128` を超える値も）と、前に有る variant からの暗黙の `+ 1` である。リテラルでない discriminant は書いたとおりに比べ、同じ式から同じ数だけ後ろの variant を同じ値とみなす。式が名指す定数の変更は追わない。1 つの値しか取らない鍵（`target_os`・`target_arch`・`target_env`・`target_abi`・`target_endian`・`target_pointer_width`・`target_vendor`・`panic`）の原子は同時に真にせず、`cfg(true)`・`cfg(false)` は定数とし、文字列の値は中身で比べる（`"x"` と `r"x"` は同じ）。推論される寿命の境界も、設定ごとに有るフィールドから求めて比べる。旧い enum が無いか、同じ名前の variant かフィールドが 2 つ有る組み合わせは比べず、旧い enum がビルドできる設定で新しい enum が無いか名前が 2 つ有るのは blocking にする。述語の原子が 16 を超える enum は blocking にする。enum 自身の `#[cfg]` は比べる設定を絞るが、構造体と同じく signature には含めないので、それだけの変更は報告しない。フィールドの型で決まる自動トレイト（`Send`・`Sync`）と分散、派生したトレイト（`Ord`・`Default`）の振る舞いは比べない。
+
 ### Rust の公開シグネチャから届く型
 
 private module の型も、公開関数の引数・戻り値、公開フィールド、enum のバリアント、trait のメソッド・関連型から届けば公開 API 面に含める。型ごとに module と名前を保持し、named import・別名・再公開・型別名をたどる。届いた型の公開メソッドが返す別の型にも伝播するため、名前を外から書けない型のメソッド変更も検出できる。
