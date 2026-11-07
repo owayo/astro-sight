@@ -621,6 +621,67 @@ fn dependency_import_overridden_by_tsconfig_is_not_external() {
     }
 }
 
+/// ワークスペースのパッケージの package.json にだけ書いた依存も、そのパッケージのファイルからの
+/// import は外部パッケージの束縛として除く (Issue #280)。tsconfig がローカルのファイルへ差し替える
+/// とき、祖先でないほかのパッケージからの import、`paths` の解決先のファイルを消すときは、従来どおり
+/// 除かない。
+#[test]
+fn workspace_dependency_import_is_external_only_from_its_package() {
+    let lodash_old =
+        "export function debounce(): void {}\n\nexport function keep(): number {\n  return 1;\n}\n";
+    let lodash_new = "export function keep(): number {\n  return 1;\n}\n";
+    let user =
+        "import { debounce } from \"lodash\";\n\nexport const run = (): void => debounce();\n";
+    let strict = r#"{ "compilerOptions": { "strict": true } }"#;
+    let paths = r#"{ "compilerOptions": { "paths": { "lodash": ["./src/lodash"] } } }"#;
+    let files = |tsconfig: &'static str, user_path: &'static str| {
+        vec![
+            (
+                "package.json",
+                r#"{ "name": "mono", "private": true, "workspaces": ["packages/*"] }"#,
+            ),
+            (
+                "packages/ui/package.json",
+                r#"{ "name": "@example/ui", "dependencies": { "lodash": "^4.0.0" } }"#,
+            ),
+            (
+                "packages/other/package.json",
+                r#"{ "name": "@example/other" }"#,
+            ),
+            ("packages/ui/tsconfig.json", tsconfig),
+            ("packages/ui/src/lodash.ts", lodash_old),
+            (user_path, user),
+        ]
+    };
+    for (tsconfig, user_path, expected) in [
+        (strict, "packages/ui/src/app/use.ts", "rm_dead"),
+        (
+            r#"{ "compilerOptions": { "baseUrl": "./src" } }"#,
+            "packages/ui/src/app/use.ts",
+            "rm",
+        ),
+        (paths, "packages/ui/src/app/use.ts", "rm"),
+        (strict, "packages/other/src/use.ts", "rm"),
+    ] {
+        let api = api_after(
+            &files(tsconfig, user_path),
+            &[("packages/ui/src/lodash.ts", lodash_new)],
+        );
+        assert_eq!(
+            bucket(&api, "debounce"),
+            expected,
+            "{tsconfig} {user_path}: {api:?}"
+        );
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(repo, &files(paths, "packages/ui/src/app/use.ts"), "base");
+    fs::remove_file(repo.join("packages/ui/src/lodash.ts")).expect("remove");
+    let api = detect_api_changes_from_worktree(repo);
+    assert_eq!(bucket(&api, "debounce"), "rm", "{api:?}");
+}
+
 /// 大文字小文字を区別しないファイルシステムでは、綴りの違う置換先 (`./SRC/SERVER/errors`) も
 /// 削除したファイルを指す。削除したファイルと同じ名前の JS のファイルが残っていても証明しない。
 #[test]

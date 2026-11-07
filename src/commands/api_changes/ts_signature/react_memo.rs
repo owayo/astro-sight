@@ -9,7 +9,8 @@
 //!   呼び出しで、内側の関数の種類と、その前後のトークン (`export const Tag = memo(` と `);`) が
 //!   同じ。比較関数・型引数は、包んだ関数との型の適合を証明できないので受け付けない
 //! - その名前の module の束縛が import の 1 つだけで、どこでも書き換えていない
-//! - `react` が registry の React に解決され (ルートの package.json の registry の依存)、設定・
+//! - `react` が registry の React に解決され (import するファイルの祖先の package.json の registry の
+//!   依存。ワークスペースのパッケージの package.json にだけ書いたものも、Issue #280)、設定・
 //!   依存・ソースが React と JSX の型を差し替えていない (解析するディレクトリの全体の監査)
 //! - diff が `react` の解決と型の環境を変えていない。設定・package.json・ロックファイルを変えず、
 //!   変えたソースの変更前も同じ監査を通り、削除・改名したファイルが `react` の解決先の候補でない
