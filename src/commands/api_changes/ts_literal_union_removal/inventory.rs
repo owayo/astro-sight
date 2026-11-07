@@ -794,7 +794,9 @@ mod tests {
         )
         .unwrap();
         assert!(candidates.contains("src/feature/index.ts"));
-        assert!(!candidates.contains("src/feature/index.d.ts"));
+        // 宣言ファイルの index も候補に入る (Issue #272)。package.json の `types` が先に効く
+        // 構成は、下の索引の検査で証明しない。
+        assert!(candidates.contains("src/feature/index.d.ts"));
         let (_directory, inventory) = fixture(&[
             (".gitignore", "src/feature/package.json\n"),
             ("src/feature/package.json", r#"{"types":"./native.ts"}"#),

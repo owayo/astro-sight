@@ -63,6 +63,16 @@ pub(crate) fn normalize_lexically(path: &Path) -> Option<PathBuf> {
 /// `/` 区切りの 2 つのパスが、同じファイルを指し得るか。大文字小文字を区別しないファイルシステム
 /// (Windows と macOS の既定) では綴りの違うパスも同じファイルになり、macOS は Unicode の正規化も
 /// 区別しない。区切りごとに [`segment_skeleton`] で比べる。
+/// 宣言ファイル (`.d.ts`・`.d.mts`・`.d.cts`・任意の拡張子の宣言 `.d.<拡張子>.ts`) の
+/// パスか。
+pub(crate) fn is_declaration_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    [".d.ts", ".d.mts", ".d.cts"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+        || (name.ends_with(".ts") && name.contains(".d."))
+}
+
 pub(crate) fn may_be_same_path(a: &str, b: &str) -> bool {
     let (a, b): (Vec<&str>, Vec<&str>) = (a.split('/').collect(), b.split('/').collect());
     a.len() == b.len() && segments_may_match(&a, &b)

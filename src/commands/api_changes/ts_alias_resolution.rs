@@ -89,6 +89,9 @@ pub(crate) struct TsAliasResolver {
     packages: Option<Packages>,
     /// (classic の祖先の探索を始めるディレクトリ, 指定子) → 結果。
     memo: HashMap<(String, String), AliasResolution>,
+    /// 読んだ設定のどれも、相対の指定子の探索を変えない (`moduleSuffixes`・`rootDirs` が無い)。
+    /// 設定を走査できなければ false。
+    relative_unchanged: bool,
 }
 
 impl TsAliasResolver {
@@ -102,6 +105,7 @@ impl TsAliasResolver {
             projects: None,
             packages: None,
             memo: HashMap::new(),
+            relative_unchanged: false,
         };
         let Some(root) = root else {
             return resolver;
@@ -110,8 +114,18 @@ impl TsAliasResolver {
             return resolver;
         };
         resolver.packages = read_packages(&root, &walked.manifests);
-        resolver.projects = load_projects(&root, &walked.configs);
+        if let Some((projects, relative_unchanged)) = load_projects(&root, &walked.configs) {
+            resolver.projects = Some(projects);
+            resolver.relative_unchanged = relative_unchanged;
+        }
         resolver
+    }
+
+    /// 相対の指定子を [`relative_import_candidates`](super::removed_attribution::relative_import_candidates)
+    /// で網羅できるか。どの設定も相対の探索を変えない (`moduleSuffixes`・`rootDirs` が無い) とき
+    /// だけ true。
+    pub(crate) fn relative_resolution_unchanged(&self) -> bool {
+        self.relative_unchanged
     }
 
     /// `ref_path` (`dir` 相対) のファイルにある相対でない指定子 `spec` を解く。
@@ -943,7 +957,33 @@ struct ConfigLoader {
     chains: HashMap<(PathBuf, PathBuf), Option<Chain>>,
 }
 
-fn load_projects(root: &Path, configs: &[PathBuf]) -> Option<Vec<Option<Effective>>> {
+/// `compilerOptions` が相対の指定子の探索を変えるか: 既定でない `moduleSuffixes` (`[]`・`[""]`・
+/// `null` は既定と同じ) と、2 つ以上の `rootDirs` (1 つ以下では別のルートへ展開しない)。
+fn changes_relative_resolution(config: &Map<String, Value>) -> bool {
+    let Some(options) = config.get("compilerOptions") else {
+        return false;
+    };
+    let Some(options) = options.as_object() else {
+        return true;
+    };
+    let suffixes_changed = options
+        .get("moduleSuffixes")
+        .is_some_and(|value| match value {
+            Value::Null => false,
+            Value::Array(suffixes) => {
+                !(suffixes.is_empty() || (suffixes.len() == 1 && suffixes[0].as_str() == Some("")))
+            }
+            _ => true,
+        });
+    let roots_changed = options.get("rootDirs").is_some_and(|value| match value {
+        Value::Null => false,
+        Value::Array(roots) => roots.len() > 1,
+        _ => true,
+    });
+    suffixes_changed || roots_changed
+}
+
+fn load_projects(root: &Path, configs: &[PathBuf]) -> Option<(Vec<Option<Effective>>, bool)> {
     let mut loader = ConfigLoader::default();
     // (設定, extends と references で辿ってよい範囲)。
     let mut pending: Vec<(PathBuf, PathBuf)> = configs
@@ -984,6 +1024,7 @@ fn load_projects(root: &Path, configs: &[PathBuf]) -> Option<Vec<Option<Effectiv
     }
     let mut seen = HashSet::new();
     let mut projects = Vec::new();
+    let mut relative_unchanged = true;
     while let Some((path, area)) = pending.pop() {
         let Some(canonical) = regular_file(&path) else {
             projects.push(None);
@@ -1023,8 +1064,9 @@ fn load_projects(root: &Path, configs: &[PathBuf]) -> Option<Vec<Option<Effectiv
                 .chain(&canonical, &area, 0, &mut Vec::new())
                 .and_then(|chain| chain.effective(&leaf)),
         );
+        relative_unchanged &= loader.relative_unchanged(&canonical, &area, 0, &mut HashSet::new());
     }
-    Some(projects)
+    Some((projects, relative_unchanged))
 }
 
 impl ConfigLoader {
@@ -1046,6 +1088,49 @@ impl ConfigLoader {
         });
         self.raw.insert(canonical.to_path_buf(), raw.clone());
         raw
+    }
+
+    /// `canonical` の設定と `extends` の先のどれも、相対の指定子の探索を変えないか
+    /// ([`changes_relative_resolution`])。[`Self::chain`] と違い、途中の設定を解釈できなくても
+    /// 辿れる先は全て見る。読めない・解けない設定は、字面に `moduleSuffixes` も `rootDirs` も
+    /// 無いときだけ変えないとみなす。辿れない `extends` の先 (入っていないパッケージの設定) は、
+    /// 変えないと仮定する (信頼の境界)。
+    fn relative_unchanged(
+        &mut self,
+        canonical: &Path,
+        area: &Path,
+        depth: usize,
+        visited: &mut HashSet<PathBuf>,
+    ) -> bool {
+        if depth > MAX_CHAIN_DEPTH {
+            return false;
+        }
+        if !visited.insert(canonical.to_path_buf()) {
+            return true;
+        }
+        let Some(raw) = self.read(canonical) else {
+            return read_utf8_file_limited(canonical, MAX_FILE_BYTES).is_some_and(|text| {
+                !text.contains("moduleSuffixes") && !text.contains("rootDirs")
+            });
+        };
+        if changes_relative_resolution(&raw) {
+            return false;
+        }
+        let Some(directory) = canonical.parent().map(Path::to_path_buf) else {
+            return false;
+        };
+        let parents: Vec<String> = match raw.get("extends") {
+            Some(Value::String(parent)) => vec![parent.clone()],
+            Some(Value::Array(parents)) => parents
+                .iter()
+                .filter_map(|parent| parent.as_str().map(str::to_owned))
+                .collect(),
+            _ => Vec::new(),
+        };
+        parents.iter().all(|parent| {
+            self.extended_path(&directory, parent, area)
+                .is_none_or(|path| self.relative_unchanged(&path, area, depth + 1, visited))
+        })
     }
 
     /// `canonical` の設定の `compilerOptions` を、`extends` の先から順に上書きして合わせる。

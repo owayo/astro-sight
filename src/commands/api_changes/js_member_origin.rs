@@ -57,6 +57,10 @@ pub(super) fn collect_member_evidence(
         let Some(files) = relative_import_candidates(ref_path, spec) else {
             continue;
         };
+        // ディレクトリの package.json が解決先を変えると、候補で網羅できない。
+        if super::removed_attribution::relative_directory_has_manifest(dir, ref_path, spec) {
+            continue;
+        }
         let Some(clause) = named_child(stmt, "import_clause") else {
             continue;
         };
@@ -203,10 +207,11 @@ fn verify_class(
             &module_source,
             &imported.exported_name,
             member_name,
+            super::ts_module_paths::is_declaration_path(file),
         ) {
             return None;
         }
-        let scan = dependency_targets(file, &module_source, module_tree.root_node());
+        let scan = dependency_targets(dir, file, &module_source, module_tree.root_node());
         if scan.opaque {
             return None;
         }
@@ -247,6 +252,7 @@ fn defines_exported_instance_method(
     source: &[u8],
     class_name: &str,
     member_name: &str,
+    declaration_file: bool,
 ) -> bool {
     if contains_kind(root, "decorator") {
         return false;
@@ -258,9 +264,19 @@ fn defines_exported_instance_method(
         if stmt.kind() != "export_statement" {
             continue;
         }
-        let Some(class) = stmt.child_by_field_name("declaration") else {
+        let Some(mut class) = stmt.child_by_field_name("declaration") else {
             continue;
         };
+        // 宣言ファイルでは `export declare class Name { method(): T; }` が普通の書き方。
+        if declaration_file && class.kind() == "ambient_declaration" {
+            let mut inner = class.walk();
+            if let Some(declared) = class
+                .named_children(&mut inner)
+                .find(|child| child.kind() == "class_declaration")
+            {
+                class = declared;
+            }
+        }
         if class.kind() != "class_declaration"
             || class
                 .child_by_field_name("name")
@@ -293,13 +309,16 @@ fn defines_exported_instance_method(
         }) {
             continue;
         }
+        // 宣言ファイルのメソッドは本体の無いシグネチャ (`method(): T;`)。
         valid = members.into_iter().any(|method| {
-            method.kind() == "method_definition"
+            let defined = (method.kind() == "method_definition"
+                && method.child_by_field_name("body").is_some())
+                || (declaration_file && method.kind() == "method_signature");
+            defined
                 && method
                     .child_by_field_name("name")
                     .and_then(|n| n.utf8_text(source).ok())
                     == Some(member_name)
-                && method.child_by_field_name("body").is_some()
                 && !has_token(method, "static")
                 && !has_token(method, "get")
                 && !has_token(method, "set")
@@ -336,7 +355,12 @@ fn class_name_is_unique(root: Node<'_>, source: &[u8], name: &str, definition: u
     true
 }
 
-pub(super) fn dependency_targets(path: &str, source: &[u8], root: Node<'_>) -> DependencyScan {
+pub(super) fn dependency_targets(
+    dir: &str,
+    path: &str,
+    source: &[u8],
+    root: Node<'_>,
+) -> DependencyScan {
     let mut targets = HashSet::new();
     let mut opaque = false;
     let mut nodes = vec![root];
@@ -348,13 +372,13 @@ pub(super) fn dependency_targets(path: &str, source: &[u8], root: Node<'_>) -> D
                 if (spec.starts_with('.') || spec.starts_with('\\')) && spec.contains('\\') {
                     opaque = true;
                 } else if let Some(paths) = relative_import_candidates(path, spec) {
-                    targets.extend(paths);
-                    if let Some(stem) = spec.strip_suffix(".js")
-                        && let Some(base) =
-                            super::removed_attribution::normalize_relative_specifier(path, stem)
+                    // 宣言ファイル (`.d.ts` など) も候補に入る。ディレクトリの package.json が
+                    // 解決先を変えると網羅できない。
+                    if super::removed_attribution::relative_directory_has_manifest(dir, path, spec)
                     {
-                        targets.insert(format!("{base}.d.ts"));
+                        opaque = true;
                     }
+                    targets.extend(paths);
                 }
             }
         }
@@ -386,7 +410,7 @@ mod tests {
     fn dependency_scan_reads_static_templates_and_marks_dynamic_ones_opaque() {
         let source = b"import(`../dist/util.js`); import(`../dist/${name}.js`);";
         let tree = parser::parse_source(source, LangId::Typescript).unwrap();
-        let scan = dependency_targets("src/main.ts", source, tree.root_node());
+        let scan = dependency_targets(".", "src/main.ts", source, tree.root_node());
         assert!(scan.targets.contains("dist/util.js"));
         assert!(scan.opaque);
     }

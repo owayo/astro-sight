@@ -174,8 +174,17 @@ pub(super) fn module(inventory: &inventory::Inventory, from: &str, spec: &str) -
     inventory.caller_resolution_is_plain(from)?;
     let normalized = super::super::removed_attribution::normalize_relative_specifier(from, spec)?;
     let candidates = super::super::removed_attribution::relative_import_candidates(from, spec)?;
+    // 明示の実装 source (`./x.ts` など) は exact path だけを肯定する。TypeScript は無ければ
+    // 同じ名前の宣言や JS へ進むが、所有元の証明ではそれを当てにしない。
+    let explicit_source = matches!(
+        std::path::Path::new(&normalized)
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some("ts" | "tsx" | "mts" | "cts")
+    );
     let existing = candidates
         .into_iter()
+        .filter(|candidate| !explicit_source || *candidate == normalized)
         .filter(|candidate| inventory.dir.join(candidate).is_file())
         .collect::<Vec<_>>();
     let [target] = existing.as_slice() else {

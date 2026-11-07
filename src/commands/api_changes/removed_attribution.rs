@@ -155,8 +155,11 @@ pub(crate) fn proves_survivor_origin_with_ffi(
             dependency_targets,
             dependency_opaque,
         } => {
+            // 大文字小文字を区別しないファイルシステムでは、綴りの違う依存先も削除元を指す。
             !dependency_opaque
-                && !dependency_targets.contains(candidate.old_path)
+                && !dependency_targets
+                    .iter()
+                    .any(|path| super::ts_module_paths::may_be_same_path(path, candidate.old_path))
                 && !(matches!(candidate.kind, "method" | "function")
                     && (candidate.kind == "method" || candidate.name.contains('.'))
                     && path_lang(candidate.old_path).is_some_and(is_js_ts_family))
@@ -765,7 +768,12 @@ fn analyze_js_ts_facts(
     };
     let root = tree.root_node();
     let mut facts = opaque;
-    let dependency_scan = super::js_member_origin::dependency_targets(ref_path, &source, root);
+    let mut dependency_scan =
+        super::js_member_origin::dependency_targets(dir, ref_path, &source, root);
+    // 設定 (`moduleSuffixes`・`rootDirs`) が相対の探索を変えると、相対の依存先を網羅できない。
+    if !dependency_scan.targets.is_empty() && !export_cache.relative_resolution_unchanged(dir) {
+        dependency_scan.opaque = true;
+    }
     if member_proof && !dependency_scan.opaque {
         facts.js_member_evidence = super::js_member_origin::collect_member_evidence(
             dir,
@@ -905,6 +913,32 @@ pub(crate) fn normalize_relative_specifier(base_file: &str, spec: &str) -> Optio
     Some(components.join("/"))
 }
 
+/// 相対の指定子 `spec` が指すディレクトリに package.json があるか。TypeScript はその `types`・
+/// `typesVersions` の先へ解くので、[`relative_import_candidates`] では網羅できない。確かめられ
+/// なければ true。
+pub(crate) fn relative_directory_has_manifest(dir: &str, from: &str, spec: &str) -> bool {
+    let Some(normalized) = normalize_relative_specifier(from, spec) else {
+        return false;
+    };
+    let target = std::path::Path::new(dir).join(normalized);
+    // 普通のファイルや無いパスはディレクトリではない (Unix ではファイルの下を調べると
+    // NotADirectory になる)。
+    match std::fs::metadata(&target) {
+        Ok(metadata) if !metadata.is_dir() => return false,
+        Ok(_) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return false;
+        }
+        Err(_) => return true,
+    }
+    !matches!(target.join("package.json").try_exists(), Ok(false))
+}
+
 /// `arg` (相対形式) を repo ルート基準で正規化する。`..` 成分がルートを突き抜ける場合は None。
 fn normalize_repo_root_relative(arg: &str) -> Option<String> {
     let mut components: Vec<&str> = Vec::new();
@@ -923,51 +957,66 @@ fn normalize_repo_root_relative(arg: &str) -> Option<String> {
     Some(components.join("/"))
 }
 
-/// TS/JS の相対 import specifier を実体ファイルの解決候補 (repo 相対パス集合) に展開する。
-/// - `.js` / `.mjs` / `.cjs` 指定は TS 実体 (`.ts` / `.tsx` / `.mts` / `.cts`) も候補に含める
-///   (moduleResolution=node16/bundler の ESM 慣習)
-/// - JS 系拡張子なしは各拡張子の付与と `index.*` を展開する
+/// TS/JS の相対 import specifier を、TypeScript と Node の探索が試し得る実体ファイル
+/// (repo 相対パス集合) の上位集合に展開する。TypeScript は実装より先に宣言ファイルへ解くので、
+/// 宣言ファイル (`.d.ts`・`.d.mts`・`.d.cts`) も必ず含める (Issue #272)。
+/// - 拡張子なし (と JS/TS でない拡張子): `.ts`・`.tsx`・`.d.ts`・`.js`・`.jsx`・`.mjs`・`.cjs` の
+///   付与と、`index.*` と、そのままのパス。JS/TS でない拡張子 (`./styles.css`) は任意の拡張子の
+///   宣言 (`styles.d.css.ts`) も
+/// - JS/TS の拡張子: 拡張子を外した名前に、同じ種類のモジュールの拡張子 (`.ts`・`.tsx`・`.d.ts`・
+///   `.js`・`.jsx` / `.mts`・`.d.mts`・`.mjs` / `.cts`・`.d.cts`・`.cjs`) を付けたものと、
+///   そのまま。JS の拡張子は node10 の付け足した名前 (`errors.js.d.ts`) も
 ///
-/// 相対でない / ルート突き抜けは None (解決不能)。
+/// 設定 (`moduleSuffixes`・`rootDirs`) とディレクトリの package.json (`types`・`typesVersions`)
+/// による解決先は含まないので、証明する側はそれらが無いことを別に確かめる
+/// ([`relative_directory_has_manifest`])。相対でない / ルート突き抜けは None (解決不能)。
 pub(crate) fn relative_import_candidates(base_file: &str, spec: &str) -> Option<HashSet<String>> {
-    const EXTS: [&str; 6] = ["ts", "tsx", "js", "jsx", "mjs", "cjs"];
+    const EXTS: [&str; 7] = ["ts", "tsx", "d.ts", "js", "jsx", "mjs", "cjs"];
     let normalized = normalize_relative_specifier(base_file, spec)?;
     let mut out = HashSet::new();
-    let known_ext = std::path::Path::new(&normalized)
+    let extension = std::path::Path::new(&normalized)
         .extension()
         .and_then(|e| e.to_str())
-        .filter(|e| EXTS.contains(e) || matches!(*e, "mts" | "cts"))
         .map(str::to_string);
-    match known_ext.as_deref() {
-        Some("js") | Some("jsx") => {
-            let stem = normalized.rsplit_once('.').map(|(s, _)| s).unwrap_or("");
-            out.insert(format!("{stem}.ts"));
-            out.insert(format!("{stem}.tsx"));
-            out.insert(normalized);
-        }
-        Some("mjs") => {
-            let stem = normalized.rsplit_once('.').map(|(s, _)| s).unwrap_or("");
-            out.insert(format!("{stem}.mts"));
-            out.insert(normalized);
-        }
-        Some("cjs") => {
-            let stem = normalized.rsplit_once('.').map(|(s, _)| s).unwrap_or("");
-            out.insert(format!("{stem}.cts"));
-            out.insert(normalized);
-        }
-        Some(_) => {
-            out.insert(normalized);
+    // TypeScript は指定子の拡張子を外した名前に、同じ種類のモジュールの拡張子を順に付けて試す
+    // (`./x.ts` でも `x.ts` が無ければ `x.d.ts`・`x.js` などへ進む)。宣言ファイルの拡張子は
+    // まとめて外す。
+    let stem = [".d.ts", ".d.mts", ".d.cts"]
+        .iter()
+        .find_map(|suffix| normalized.strip_suffix(suffix))
+        .or_else(|| normalized.rsplit_once('.').map(|(stem, _)| stem))
+        .unwrap_or_default()
+        .to_owned();
+    let family: Option<&[&str]> = match extension.as_deref() {
+        Some("ts" | "tsx" | "js" | "jsx") => Some(&["ts", "tsx", "d.ts", "js", "jsx"]),
+        Some("mts" | "mjs") => Some(&["mts", "d.mts", "mjs"]),
+        Some("cts" | "cjs") => Some(&["cts", "d.cts", "cjs"]),
+        _ => None,
+    };
+    match family {
+        Some(family) => {
+            for extension in family {
+                out.insert(format!("{stem}.{extension}"));
+            }
+            // node10 の探索は、指定子に TS の拡張子を付け足した名前 (`errors.js.d.ts`・
+            // `errors.ts.d.ts`) も試す。
+            for appended in ["ts", "tsx", "d.ts"] {
+                out.insert(format!("{normalized}.{appended}"));
+            }
         }
         None => {
+            if let Some(other) = &extension {
+                out.insert(format!("{stem}.d.{other}.ts"));
+            }
             for e in EXTS {
                 out.insert(format!("{normalized}.{e}"));
             }
             for e in EXTS {
                 out.insert(format!("{normalized}/index.{e}"));
             }
-            out.insert(normalized);
         }
     }
+    out.insert(normalized);
     Some(out)
 }
 
@@ -1046,6 +1095,45 @@ mod tests {
         // 拡張子付きピリオド入りファイル名 (`.util` は JS 拡張子でない) は拡張子なし扱い
         let c = relative_import_candidates("src/a.ts", "./b.util").expect("resolved");
         assert!(c.contains("src/b.util.ts"));
+    }
+
+    /// TypeScript は実装より先に宣言ファイルへ解くので、宣言ファイルも候補に入れる (Issue #272)。
+    #[test]
+    fn relative_import_candidates_include_declaration_files() {
+        let c = relative_import_candidates("src/app/use.ts", "../server/errors").expect("resolved");
+        assert!(c.contains("src/server/errors.d.ts"));
+        assert!(c.contains("src/server/errors/index.d.ts"));
+        assert!(c.contains("src/server/errors.js"));
+        let c = relative_import_candidates("src/a.ts", "./b.js").expect("resolved");
+        assert!(c.contains("src/b.d.ts"));
+        assert!(c.contains("src/b.jsx"));
+        let c = relative_import_candidates("src/a.ts", "./b.mjs").expect("resolved");
+        assert!(c.contains("src/b.mts"));
+        assert!(c.contains("src/b.d.mts"));
+        assert!(c.contains("src/b.mjs"));
+        let c = relative_import_candidates("src/a.ts", "./b.cjs").expect("resolved");
+        assert!(c.contains("src/b.d.cts"));
+        // `./b.ts` でも `b.ts` が無ければ同じ種類のほかの拡張子へ進む
+        let c = relative_import_candidates("src/a.ts", "./b.ts").expect("resolved");
+        assert!(c.contains("src/b.ts"));
+        assert!(c.contains("src/b.d.ts"));
+        assert!(c.contains("src/b.js"));
+        let c = relative_import_candidates("src/a.ts", "./b.mts").expect("resolved");
+        assert!(c.contains("src/b.d.mts"));
+        assert!(c.contains("src/b.mjs"));
+        // 宣言ファイルの指定子は拡張子をまとめて外す
+        let c = relative_import_candidates("src/a.ts", "./b.d.ts").expect("resolved");
+        assert!(c.contains("src/b.d.ts"));
+        assert!(c.contains("src/b.ts"));
+        // node10 の付け足した名前
+        let c = relative_import_candidates("src/a.ts", "./b.js").expect("resolved");
+        assert!(c.contains("src/b.js.d.ts"));
+        let c = relative_import_candidates("src/a.ts", "./b.ts").expect("resolved");
+        assert!(c.contains("src/b.ts.d.ts"));
+        // 任意の拡張子の宣言 (`allowArbitraryExtensions`)
+        let c = relative_import_candidates("src/a.ts", "./styles.css").expect("resolved");
+        assert!(c.contains("src/styles.d.css.ts"));
+        assert!(c.contains("src/styles.css"));
     }
 
     /// 言語による証明を挟まない (= 従来ロジックのみを見る) ための helper。
