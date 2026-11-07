@@ -1292,3 +1292,27 @@ fn rust_pattern_binds_name_matches_recursive_version() {
         "bound={bound} unbound={unbound}"
     );
 }
+
+/// union の宣言の名前は Definition で、型・式・パターンの位置は Reference (Issue #277)。宣言を
+/// 参照に数えると、使われない union が dead-code で生きて見える。
+#[test]
+fn rust_union_declaration_is_a_definition() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.rs"),
+        "pub union Value {\n    pub number: u32,\n}\n\npub fn make() -> Value {\n    Value { number: 1 }\n}\n",
+    )
+    .unwrap();
+    let refs = find_references("Value", dir.path(), Some("**/*.rs")).unwrap();
+    let of = |kind_is_definition: bool| -> Vec<String> {
+        refs.iter()
+            .filter(|r| (r.kind == Some(RefKind::Definition)) == kind_is_definition)
+            .map(|r| r.context.clone().unwrap_or_default().trim().to_string())
+            .collect()
+    };
+    assert_eq!(of(true), ["pub union Value {"]);
+    assert_eq!(
+        of(false),
+        ["pub fn make() -> Value {", "Value { number: 1 }"]
+    );
+}

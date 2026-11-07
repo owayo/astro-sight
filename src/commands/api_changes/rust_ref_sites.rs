@@ -38,7 +38,11 @@ impl ModuleFunctions {
         for symbol in symbols {
             if matches!(
                 symbol.kind,
-                SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Constant | SymbolKind::Variable
+                SymbolKind::Struct
+                    | SymbolKind::Enum
+                    | SymbolKind::Union
+                    | SymbolKind::Constant
+                    | SymbolKind::Variable
             ) && let Some(node) = root.descendant_for_point_range(
                 tree_sitter::Point::new(symbol.range.start.line, symbol.range.start.column),
                 tree_sitter::Point::new(symbol.range.end.line, symbol.range.end.column),

@@ -19,8 +19,9 @@
 //!   どの利用でも正しい型と言えるとき)、既定の表現に `repr(C)`・`repr(transparent)` を付けること、
 //!   公開フィールドの無い構築できない構造体のタプルと名前付きの間の変更
 //! - 変更なし: 型の引数の改名 (`for<'a>` の束縛も)、整形とコメント、`r#` の付け外し、`#[repr]` の
-//!   書き方 (項目の集合で比べる)、`#[repr]` の無い構造体の名前付きのフィールドの並べ替え、外から
-//!   構築できない構造体の公開でないフィールドの変更 (`repr(C)` でも)
+//!   書き方 (`#[cfg_attr]` の条件の設定ごとに、効く項目の集合で比べる)、`#[repr]` の効かない
+//!   構造体 (`repr(Rust)` だけを含む) の名前付きのフィールドの並べ替え、外から構築できない構造体の
+//!   公開でないフィールドの変更 (`repr(C)` でも)
 //!
 //! 寿命の境界は、フィールドの参照から推論されるもの (公開でないフィールドからも。cfg の付いた
 //! フィールドからのものは条件付き) を合わせて比べ、推論されるものは signature に
@@ -42,22 +43,8 @@ use tree_sitter::Node;
 
 use crate::engine::tree_walk::{Children, Walk, walk_preorder};
 
+use super::rust_cfg_predicate::{Atoms, effective_repr};
 use super::rust_type_api::*;
-
-/// 公開でないフィールドの表示。無条件のものがあれば `..`、cfg の付いたものだけなら条件ごとに
-/// `#[cfg(..)] ..`。
-fn private_summary<'a>(fields: impl Iterator<Item = &'a Field>) -> Vec<String> {
-    let mut conditional = BTreeMap::new();
-    for field in fields.filter(|field| !field.public) {
-        if field.conditions.is_empty() {
-            return vec!["..".to_owned()];
-        }
-        conditional
-            .entry(condition_keys(&field.conditions))
-            .or_insert_with(|| format!("{}..", condition_prefix(&field.conditions)));
-    }
-    conditional.into_values().collect()
-}
 
 /// 構造体 1 つの公開の形。
 #[derive(Clone, Debug)]
@@ -224,19 +211,21 @@ impl RustStructShape {
             && self.unconditionally_restricted()
     }
 
-    /// 無条件の `#[repr(..)]` の項目 (`C`・`align(8)` など) の集合。属性を分けて書いても、
-    /// 並べ替えても、末尾に `,` があっても同じ。
-    fn layout_items(&self) -> BTreeSet<Vec<String>> {
-        repr_items(&self.layout)
+    /// 既定でない表現になる設定がある (`repr(Rust)` は既定の表現)。フィールドの順をレイアウトの約束と
+    /// みなすかに使う。`align`・`packed` だけや `repr(transparent)` は Rust の参照では順を約束しないが、
+    /// `#[cfg]` で分けた同じ名前の公開フィールドを名前だけで対応させている間 (Issue #290) は、その
+    /// 変更を順の違いで捉えられるよう、順を約束するものとして扱う。
+    fn has_repr(&self) -> bool {
+        let mut atoms = Atoms::default();
+        let reprs = atoms.reprs(&self.layout);
+        let Some(mut configs) = atoms.configs() else {
+            return true;
+        };
+        configs.any(|config| !effective_repr(&reprs, config).is_empty())
     }
 
-    /// `#[repr]` を含む `#[cfg_attr]` の鍵。
-    fn conditional_layout(&self) -> BTreeSet<Vec<String>> {
-        conditional_repr(&self.layout)
-    }
-
-    /// API の signature として出す表示。名前付きの公開フィールドは名前の順 (`#[repr]` の構造体は
-    /// 宣言の順)、タプルは最後の公開フィールドまでの位置 (公開でないものは `_`) を示し、残りの
+    /// API の signature として出す表示。名前付きの公開フィールドは名前の順 (`#[repr]` が効く設定のある
+    /// 構造体は宣言の順)、タプルは最後の公開フィールドまでの位置 (公開でないものは `_`) を示し、残りの
     /// 公開でないフィールドは `..` で示す。
     pub(crate) fn signature(&self) -> String {
         let mut out = String::new();
@@ -281,7 +270,7 @@ impl RustStructShape {
             Form::Named => {
                 out.push_str(&where_text);
                 let mut public: Vec<&Field> = self.fields.iter().filter(|f| f.public).collect();
-                if self.layout.is_empty() {
+                if !self.has_repr() {
                     public.sort_by(|a, b| a.key.cmp(&b.key));
                 }
                 let mut parts: Vec<String> = public
@@ -361,19 +350,27 @@ pub(crate) fn classify(old: &RustStructShape, new: &RustStructShape) -> ShapeCha
                 == substitute_defaults(new_names.apply(&new_field.ty), &defaults)
     };
 
-    // 既定の表現に `repr(C)`・`repr(transparent)` を付けるだけが互換。
-    if old.conditional_layout() != new.conditional_layout() {
+    // 表現は、`#[cfg_attr]` の条件の原子の真偽の組み合わせ (設定) ごとに、効く項目の集合で比べる
+    // (enum・union と同じ)。既定の表現に `repr(C)`・`repr(transparent)` を付けるだけが互換。
+    let mut atoms = Atoms::default();
+    let (old_reprs, new_reprs) = (atoms.reprs(&old.layout), atoms.reprs(&new.layout));
+    let Some(configs) = atoms.configs() else {
         return Breaking;
-    }
-    let (old_items, new_items) = (old.layout_items(), new.layout_items());
-    if old_items != new_items {
-        let defined = |item: &Vec<String>| matches!(item.as_slice(), [only] if only == "C" || only == "transparent");
-        if !old_items.is_empty() || !new_items.iter().all(defined) {
-            return Breaking;
+    };
+    let defined = |item: &Vec<String>| matches!(item.as_slice(), [only] if only == "C" || only == "transparent");
+    for config in configs {
+        let (old_items, new_items) = (
+            effective_repr(&old_reprs, config),
+            effective_repr(&new_reprs, config),
+        );
+        if old_items != new_items {
+            if !old_items.is_empty() || !new_items.iter().all(defined) {
+                return Breaking;
+            }
+            change = change.max(Compatible);
         }
-        change = change.max(Compatible);
     }
-    let (old_layout, new_layout) = (!old.layout.is_empty(), !new.layout.is_empty());
+    let (old_layout, new_layout) = (old.has_repr(), new.has_repr());
     if old.form != new.form {
         let private_only =
             |shape: &RustStructShape| shape.form != Form::Unit && shape.has_only_private_fields();

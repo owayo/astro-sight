@@ -692,6 +692,81 @@ fn rust_struct_repr_items_and_public_additions() {
                 "#[repr(align(8), C)]\npub struct S {\n    pub value: u32,\n}\n",
                 "none",
             ),
+            // `packed` と `packed(1)`、`align(0x8)` と `align(8)` は同じ (`cfg_attr` の中も。
+            // 属性の引数の中の `r#repr` も `repr`)
+            (
+                "#[repr(C, packed)]\npub struct S {\n    pub value: u32,\n}\n",
+                "#[repr(C, packed(1,))]\npub struct S {\n    pub value: u32,\n}\n",
+                "none",
+            ),
+            (
+                "#[cfg_attr(all(), repr(C, packed))]\npub struct S {\n    pub value: u32,\n}\n",
+                "#[cfg_attr(all(), r#repr(packed(1,), C))]\npub struct S {\n    pub value: u32,\n}\n",
+                "none",
+            ),
+            (
+                "#[cfg_attr(all(), repr(C, align(0x8)))]\npub struct S {\n    pub value: u32,\n}\n",
+                "#[cfg_attr(all(), r#repr(align(8,), C))]\npub struct S {\n    pub value: u32,\n}\n",
+                "none",
+            ),
+            // 複数の `align` は最大のものが効き、`repr(Rust)` は既定の表現
+            (
+                "#[repr(C, align(4), align(8))]\npub struct S {\n    pub value: u32,\n}\n",
+                "#[repr(C, align(8))]\npub struct S {\n    pub value: u32,\n}\n",
+                "none",
+            ),
+            (
+                "pub struct S {\n    pub value: u32,\n    pub other: u8,\n}\n",
+                "#[repr(Rust)]\npub struct S {\n    pub other: u8,\n    pub value: u32,\n}\n",
+                "none",
+            ),
+            // `cfg_attr` の条件の `r#true` は名前の付いた cfg で、定数の `true` ではない
+            (
+                "#[cfg_attr(true, repr(C, packed))]\npub struct S {\n    pub value: u32,\n}\n",
+                "#[cfg_attr(r#true, repr(C, packed))]\npub struct S {\n    pub value: u32,\n}\n",
+                "mod",
+            ),
+            // 表現は設定ごとに効く項目で比べる (条件の `r#feature` は `feature`、条件付きの小さい
+            // `align` は無条件の大きい `align` に負ける)
+            (
+                "#[cfg_attr(feature = \"ffi\", repr(C))]\npub struct S {\n    pub a: u8,\n    pub b: u32,\n}\n",
+                "#[cfg_attr(r#feature = \"ffi\", repr(C))]\npub struct S {\n    pub a: u8,\n    pub b: u32,\n}\n",
+                "none",
+            ),
+            (
+                "#[repr(C, align(8))]\n#[cfg_attr(feature = \"extra\", repr(align(4)))]\npub struct S {\n    pub a: u8,\n    pub b: u32,\n}\n",
+                "#[repr(C, align(8))]\npub struct S {\n    pub a: u8,\n    pub b: u32,\n}\n",
+                "none",
+            ),
+            // 条件付きの `repr(Rust)` は既定の表現なので、フィールドの順を約束しない
+            (
+                "#[cfg_attr(all(), repr(Rust))]\npub struct S {\n    pub a: u8,\n    pub b: u32,\n}\n",
+                "#[cfg_attr(all(), repr(Rust))]\npub struct S {\n    pub b: u32,\n    pub a: u8,\n}\n",
+                "none",
+            ),
+            // `#[repr]` が効く設定があれば、順は約束 (`repr(transparent)` で `#[cfg]` で分けた同じ名前の
+            // 公開フィールドの片方を消す変更も、順の違いで捉える)
+            (
+                "#[repr(transparent)]\npub struct S {\n    #[cfg(feature = \"wide\")]\n    pub value: u64,\n    #[cfg(not(feature = \"wide\"))]\n    pub value: u8,\n    hidden: (),\n}\n",
+                "#[repr(transparent)]\npub struct S {\n    #[cfg(not(feature = \"wide\"))]\n    pub value: u8,\n    hidden: (),\n}\n",
+                "mod",
+            ),
+            (
+                "#[cfg_attr(feature = \"ffi\", repr(C))]\npub struct S {\n    pub a: u8,\n    pub b: u32,\n}\n",
+                "#[cfg_attr(feature = \"ffi\", repr(C))]\npub struct S {\n    pub b: u32,\n    pub a: u8,\n}\n",
+                "mod",
+            ),
+            // 条件付きの `repr(C)` を無条件にするのは、既定の表現だった設定に足すだけ
+            (
+                "#[cfg_attr(feature = \"ffi\", repr(C))]\npub struct S {\n    pub a: u8,\n    pub b: u32,\n}\n",
+                "#[repr(C)]\npub struct S {\n    pub a: u8,\n    pub b: u32,\n}\n",
+                "mod_compat",
+            ),
+            (
+                "#[cfg_attr(all(), repr(C, packed))]\npub struct S {\n    pub value: u32,\n}\n",
+                "#[cfg_attr(all(), repr(C))]\npub struct S {\n    pub value: u32,\n}\n",
+                "mod",
+            ),
             // 旧い公開フィールドより前に足すと、そのオフセットが変わる
             (
                 "#[repr(C)]\npub struct S {\n    pub value: u32,\n    hidden: (),\n}\n",

@@ -29,6 +29,7 @@ pub(super) fn assign_enclosing_containers(symbols: &mut [Symbol]) {
                     | SymbolKind::Trait
                     | SymbolKind::Interface
                     | SymbolKind::Enum
+                    | SymbolKind::Union
                     | SymbolKind::Type
             )
         })
@@ -169,6 +170,7 @@ mod tests {
                             | SymbolKind::Trait
                             | SymbolKind::Interface
                             | SymbolKind::Enum
+                            | SymbolKind::Union
                             | SymbolKind::Type
                     ) {
                         continue;
@@ -263,6 +265,7 @@ mod tests {
             SymbolKind::Trait,
             SymbolKind::Interface,
             SymbolKind::Enum,
+            SymbolKind::Union,
             SymbolKind::Type,
             SymbolKind::Method,
             SymbolKind::Function,

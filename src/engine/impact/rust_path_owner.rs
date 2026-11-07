@@ -2490,6 +2490,7 @@ fn scope_can_rebind_import_name_beside(
                 | "type_item"
                 | "struct_item"
                 | "enum_item"
+                | "union_item"
         ) && node
             .child_by_field_name("name")
             .and_then(|child| child.utf8_text(source).ok())

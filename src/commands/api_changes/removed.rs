@@ -381,14 +381,14 @@ pub(crate) fn partition_removed_dead_candidates(
     // その場合 owner 型は生存しており member 削除は破壊的変更なので降格してはならない。
     // よって counts が厳密に (0, 0) の owner だけを対象にする。counts に owner が無い
     // (参照検索の欠落) 場合も fail-closed で除外する (codex レビュー指摘)。
-    // owner は型 kind (class/struct/trait/interface/enum) に限定し、同名の削除済み関数など
+    // owner は型 kind (class/struct/trait/interface/enum/union) に限定し、同名の削除済み関数など
     // による誤降格を防ぐ。
     let dead_type_owner_keys: HashSet<(String, String)> = removed_dead
         .iter()
         .filter(|c| {
             matches!(
                 c.kind.as_str(),
-                "class" | "struct" | "trait" | "interface" | "enum"
+                "class" | "struct" | "trait" | "interface" | "enum" | "union"
             ) && counts
                 .get(bare_name(&c.name))
                 .is_some_and(|(def_count, attributions)| *def_count == 0 && attributions.is_empty())

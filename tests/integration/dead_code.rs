@@ -1909,3 +1909,32 @@ fn dead_code_rust_allow_dead_marker_is_shared_with_review_without_changing_refs(
             .is_empty()
     );
 }
+
+/// 公開 union も構造体と同じく dead-code の候補になり、使われていれば候補にしない (Issue #277)。
+#[test]
+fn dead_code_rust_unused_public_union_is_reported() {
+    let repo = TestRepo::new();
+    repo.create_dir_all("src");
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    repo.write("src/lib.rs", "pub mod values; pub mod call;\n");
+    repo.write(
+        "src/values.rs",
+        "pub union Unused { pub number: u32 }\npub union Used { pub number: u32 }\n",
+    );
+    repo.write(
+        "src/call.rs",
+        "use crate::values::Used; pub fn call() -> u32 { let value = Used { number: 1 }; unsafe { value.number } }\n",
+    );
+    let result = repo.run_json("dead-code", &[]);
+    let dead: Vec<(&str, &str)> = result["dead_symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| Some((item["name"].as_str()?, item["kind"].as_str()?)))
+        .collect();
+    assert!(dead.contains(&("Unused", "union")), "{result}");
+    assert!(!dead.iter().any(|(name, _)| *name == "Used"), "{result}");
+}

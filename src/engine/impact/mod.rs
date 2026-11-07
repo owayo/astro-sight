@@ -1249,6 +1249,7 @@ fn symbol_kind_str(kind: SymbolKind) -> &'static str {
         SymbolKind::Class => "class",
         SymbolKind::Struct => "struct",
         SymbolKind::Enum => "enum",
+        SymbolKind::Union => "union",
         SymbolKind::Interface => "interface",
         SymbolKind::Trait => "trait",
         SymbolKind::Variable => "variable",
