@@ -827,7 +827,11 @@ function compute() { return 1; }\n",
     )
     .expect("write");
 
-    let facts = extract_new_file_facts(dir.path().to_str().expect("utf-8"), "mod.ts");
+    let facts = extract_new_file_facts(
+        dir.path().to_str().expect("utf-8"),
+        "mod.ts",
+        &crate::commands::api_changes::ts_strip_internal::StripInternal::disabled(),
+    );
     let exported: Vec<&str> = facts
         .exported
         .as_ref()
@@ -863,7 +867,11 @@ fn extract_new_file_facts_xojo_lexer_only_no_panic() {
     )
     .expect("write");
 
-    let facts = extract_new_file_facts(dir.path().to_str().expect("utf-8"), "Sample.xojo_code");
+    let facts = extract_new_file_facts(
+        dir.path().to_str().expect("utf-8"),
+        "Sample.xojo_code",
+        &crate::commands::api_changes::ts_strip_internal::StripInternal::disabled(),
+    );
     assert!(
         facts.exported.is_some(),
         "lexer-only でも exported は Some (lexer 経由)"

@@ -635,7 +635,8 @@ fn collect_modified_symbols(
                 new_sig,
                 lang_id: files.lang_id,
             };
-            let mut sources = SignatureSourceCache::with_base_blobs(base_blobs);
+            let mut sources =
+                SignatureSourceCache::with_base_blobs(base_blobs, inputs.strip_internal);
             // signature が同じなので、型注釈と静的 container の段階だけを見る。
             let decision = if facts.type_dependencies.get(name)
                 == Some(&super::ts_signature::DependencyStatus::Changed)
@@ -1184,7 +1185,7 @@ fn decide_signature_change(
         new_sig,
         lang_id: lang_id_for_file,
     };
-    let sources = &mut SignatureSourceCache::with_base_blobs(base_blobs);
+    let sources = &mut SignatureSourceCache::with_base_blobs(base_blobs, inputs.strip_internal);
     if let Some(decision) = type_annotation_decision(&site, sources) {
         return decision;
     }

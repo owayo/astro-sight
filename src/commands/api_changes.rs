@@ -98,6 +98,7 @@ pub(crate) fn detect_api_changes_with_renames(
         mut index_names,
         unverified_deleted_paths,
         parse_truncations,
+        strip_internal,
     } = PreparedDiff::new(dir, diff_files, canonical_dir.as_deref(), &base_blobs);
     buckets.parse_truncations.extend(parse_truncations);
 
@@ -135,6 +136,7 @@ pub(crate) fn detect_api_changes_with_renames(
         index_names: &index_names,
         prepared: &prepared,
         base_blobs: &base_blobs,
+        strip_internal: &strip_internal,
     };
     let mut state = DetectionState {
         buckets: &mut buckets,
@@ -611,6 +613,7 @@ mod removed_scope;
 mod rust_public;
 mod rust_ref_sites;
 mod rust_struct_api;
+pub(crate) mod ts_strip_internal;
 
 mod source_pair;
 

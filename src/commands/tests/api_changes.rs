@@ -23,4 +23,5 @@ mod rust_reference_sites;
 mod rust_struct_fields;
 mod rust_type_alias;
 mod ts_declaration_imports;
+mod ts_strip_internal;
 mod typescript;

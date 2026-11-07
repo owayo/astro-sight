@@ -183,7 +183,8 @@ pub(crate) fn detect_optional_object_props_removed_compatible_mod(
     }
     // 在庫は基本の集合と、その外で名前が現れるか宣言のファイルに依存し得るファイル。
     let (inventory, evidence) = cache.inventory(site.dir, site.name, site.new_path)?;
-    if !inventory.has_source(site.new_path, &src.new) {
+    // 在庫は元のソースを読んでいるので、元の新版と照合する。
+    if !inventory.has_source(site.new_path, src.original_new()) {
         return None;
     }
     prove_repository_uses(
