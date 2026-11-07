@@ -20,6 +20,7 @@ mod rust_enum_variants;
 mod rust_module_visibility;
 mod rust_parameter_binding;
 mod rust_reexport;
+mod rust_reexport_moves;
 mod rust_reference_sites;
 mod rust_struct_fields;
 mod rust_type_alias;

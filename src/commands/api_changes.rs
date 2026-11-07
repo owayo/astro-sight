@@ -260,6 +260,19 @@ pub(crate) fn detect_api_changes_with_renames(
     let (added, removed, moved) =
         settle_moved_symbol_changes(added, removed, moved, &compatible_moves);
 
+    // 項目を別のファイルへ移して元のファイルから `pub use` で再公開した差分は、削除にしなかった
+    // 旧い宣言を再公開の先の宣言と組にして、移さない場合と同じ規則で比べる (Issue #281)。
+    let reexported_removals = std::mem::take(&mut state.buckets.reexported_removals);
+    let (added, moved) = process_reexported_removals(
+        &inputs,
+        &mut state,
+        &reexported_removals,
+        renames,
+        added,
+        moved,
+        &member_files,
+    );
+
     // removed のうち HEAD ツリーで他ファイル参照 0 件のものを `removed_dead` に振り分け。
     // 「base 時点で dead だった symbol の整理」だけでなく「base alive → HEAD で関連
     // caller も削除」も同 diff 内で repo 内到達性 0 になるため同一カテゴリに含む。

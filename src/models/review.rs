@@ -311,6 +311,8 @@ pub enum ApiModificationUnverifiedReason {
     TypeMemberProofFailed,
     LiteralUnionProofFailed,
     CompatibilityUnverified,
+    /// 元のファイルの `pub use` で再公開した名前の解決先の宣言を、確かめられなかった (Issue #281)。
+    ReexportTargetUnresolved,
 }
 
 /// 変更後ソースの位置。line は refs と同じ 0 始まり。

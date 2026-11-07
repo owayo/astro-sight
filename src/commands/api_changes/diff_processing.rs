@@ -424,6 +424,10 @@ fn collect_removed_symbols(
     let mut bash_exported: Option<std::collections::HashSet<String>> = None;
     // 対象となる値の置き換えがあるときだけ、ファイル単位で 1 回読む。
     let mut forwarded_signatures = None;
+    let is_rust_pair = [&df.old_path, &df.new_path].iter().all(|path| {
+        crate::language::LangId::from_path(camino::Utf8Path::new(path)).ok()
+            == Some(crate::language::LangId::Rust)
+    });
     let is_js_ts_pair = [&df.old_path, &df.new_path].iter().all(|path| {
         matches!(
             crate::language::LangId::from_path(camino::Utf8Path::new(path)).ok(),
@@ -490,6 +494,17 @@ fn collect_removed_symbols(
                             contract_change: None,
                         });
                     }
+                } else if is_rust_pair && REEXPORT_COMPARED_KINDS.contains(&kind.as_str()) {
+                    // Rust は、再公開の先の宣言と組にして比べる (Issue #281)。
+                    state.buckets.reexported_removals.push((
+                        ApiSymbolCandidate {
+                            name: name.clone(),
+                            kind: kind.clone(),
+                            file: df.old_path.clone(),
+                            signature: sig.clone(),
+                        },
+                        df.new_path.clone(),
+                    ));
                 }
                 continue;
             }
@@ -719,6 +734,273 @@ pub(crate) fn process_moved_member_changes(
             &change.new.signature,
         );
     }
+}
+
+/// 再公開の先と組にして比べる、Rust の宣言の種類。マクロ・module は扱わない (公開の規則が違う)。
+const REEXPORT_COMPARED_KINDS: [&str; 7] = [
+    "function", "constant", "struct", "enum", "union", "trait", "type",
+];
+
+/// 型の同一性を持つ宣言の種類。差分の外の同じ形の宣言や、ほかの旧い型と共有する宣言を再公開
+/// しても、別の型になるので壊す (利用側の trait の実装が重なる、など)。
+const NOMINAL_KINDS: [&str; 4] = ["struct", "enum", "union", "trait"];
+
+/// 作業ツリーの `file` の、`start` (行, 列) に始まる名前が `name` の宣言の API の signature。
+fn declaration_signature_at(
+    dir: &str,
+    file: &str,
+    name: &str,
+    start: (usize, usize),
+) -> Option<String> {
+    let source = load_new_source(dir, file)?;
+    let tree = crate::engine::parser::parse_source(&source, crate::language::LangId::Rust).ok()?;
+    let root = tree.root_node();
+    let symbols =
+        crate::engine::symbols::extract_symbols(root, &source, crate::language::LangId::Rust)
+            .ok()?;
+    let declarations =
+        unfiltered_declaration_signatures(&symbols, root, &source, crate::language::LangId::Rust);
+    let mut matching = symbols
+        .iter()
+        .zip(declarations)
+        .filter(|(symbol, (qualname, _, _))| {
+            qualname == name && (symbol.range.start.line, symbol.range.start.column) == start
+        });
+    match (matching.next(), matching.next()) {
+        (Some((_, (_, _, signature))), None) => Some(signature),
+        _ => None,
+    }
+}
+
+/// 再公開の先と組にできた旧い宣言。
+struct ReexportPair {
+    target: ReexportTarget,
+    /// 先の宣言の API の signature。
+    new_signature: String,
+    /// 先の型を足したファイルで、base にあった同じ名前の型の束縛が消えたか変わった (型をまとめた
+    /// かもしれない)。
+    merged: bool,
+}
+
+/// 作業ツリーのパス `path` の base での中身。diff の rename (内容同一の rename を含む) は旧いパスを
+/// 読み、同じ差分で足したファイルは無いとする。
+fn base_file_of(
+    inputs: &DetectionInputs<'_>,
+    renames: &[crate::models::impact::DiffFile],
+    path: &str,
+) -> BaseFile {
+    let entry =
+        inputs.diff_files.iter().chain(renames).find(|file| {
+            crate::git_support::normalize_workspace_separators(&file.new_path) == path
+        });
+    let old_path = match entry {
+        Some(file) if file.old_path == "/dev/null" => return BaseFile::Missing,
+        Some(file) => file.old_path.as_str(),
+        None => path,
+    };
+    inputs
+        .base_blobs
+        .read(old_path)
+        .map_or(BaseFile::Unknown, BaseFile::Content)
+}
+
+/// 旧い宣言 `old` (再公開したファイル `reexporting_file`) を再公開の先の宣言と組にする。旧い宣言が
+/// 旧いファイルの module のスコープ (直下と inline module の中) で唯一の、その名前の宣言で、直下に
+/// ある (inline module の中の宣言は別のパスなので組にしない) こと、先を解けて種類が同じこと、先の
+/// 宣言の signature と base での有無を決められることを求める。
+fn pair_reexported_removal(
+    inputs: &DetectionInputs<'_>,
+    renames: &[crate::models::impact::DiffFile],
+    old: &ApiSymbolCandidate,
+    reexporting_file: &str,
+) -> Option<ReexportPair> {
+    // 旧いファイルと再公開したファイル (rename した新しいパス) は、同じ crate の同じ module
+    // (旧いパスが同じ)。
+    if source_module_path(&old.file)? != source_module_path(reexporting_file)? {
+        return None;
+    }
+    let old_source = inputs.base_blobs.read(&old.file)?;
+    if module_scope_declarations(&old_source, &old.name)? != 1
+        || declaration_in_scope(&old_source, &[], &old.name)? != Some(old.kind.as_str())
+    {
+        return None;
+    }
+    let target = resolve_reexport_target(inputs.dir, reexporting_file, &old.name, &|path| {
+        base_file_of(inputs, renames, path)
+    })?;
+    if target.kind != old.kind {
+        return None;
+    }
+    let new_signature =
+        declaration_signature_at(inputs.dir, &target.file, &old.name, target.start)?;
+    // 型を同じ差分で足したなら、先のファイルの base の module のスコープ (直下と inline module の
+    // 中) で型の名前空間にその名前を束縛し得たもの (型の宣言・型別名・可視性付きの `use`・item 位置の
+    // マクロ) が、新しい版の同じ module に同じ字面ですべて残っていること。消えたか変わったものが
+    // あれば、別の型を指していたパスが移した型を指すようになった (型をまとめた) かもしれない。
+    // 同じファイルの同じ名前の宣言どうしの変更は、名前で組にできず比べられないので、ここで止める。
+    let merged = NOMINAL_KINDS.contains(&old.kind.as_str())
+        && target.added_in_diff
+        && match base_file_of(inputs, renames, &target.file) {
+            BaseFile::Missing => false,
+            BaseFile::Content(base) => !type_namespace_bindings_kept(
+                &base,
+                load_new_source(inputs.dir, &target.file).as_deref(),
+                &old.name,
+            ),
+            BaseFile::Unknown => true,
+        };
+    Some(ReexportPair {
+        target,
+        new_signature,
+        merged,
+    })
+}
+
+/// 項目を別のファイルへ移して元のファイルから `pub use` で再公開した差分の、旧い宣言
+/// (`removals`、再公開したファイルと組) を再公開の先の宣言と組にして比べる (Issue #281)。先は
+/// 同じ名前の候補から推測せず、経路から解き ([`resolve_reexport_target`])、その宣言そのものの
+/// signature と比べる。
+///
+/// - 先が同じ差分で足した宣言なら、シグネチャが同じなら移動 (`moved`)。違えば移さない場合と同じ
+///   規則で判定し、壊す変更でなければ移動にもする。どちらも先の追加は `added` から外す
+/// - 構造体・enum・union・trait は、先が差分の外からある宣言か、ほかの旧い宣言と同じ先を共有する
+///   (通常の移動でその先へ来た型を含む) なら、型の同一性が変わるので壊す変更
+/// - 関数・定数・型別名の先が差分の外からある宣言なら、シグネチャが同じなら変更なし、違えば移さない
+///   場合と同じ規則で判定する
+/// - 組にできなければ、対応を確かめられないものとして blocking な api.mod
+///   (`reexport_target_unresolved`) に残す
+pub(crate) fn process_reexported_removals(
+    inputs: &DetectionInputs<'_>,
+    state: &mut DetectionState<'_>,
+    removals: &[(ApiSymbolCandidate, String)],
+    renames: &[crate::models::impact::DiffFile],
+    mut added: Vec<ApiSymbolCandidate>,
+    mut moved: Vec<crate::models::review::MovedSymbol>,
+    files: &MemberFileFacts<'_>,
+) -> (
+    Vec<ApiSymbolCandidate>,
+    Vec<crate::models::review::MovedSymbol>,
+) {
+    let pairs: Vec<Option<ReexportPair>> = removals
+        .iter()
+        .map(|(old, reexporting_file)| {
+            pair_reexported_removal(inputs, renames, old, reexporting_file)
+        })
+        .collect();
+    // 通常の移動でファイルへ来た宣言 (名前, 種類, 先のファイル)。型なら、再公開の先と共有し得る。
+    let moved_into: std::collections::HashSet<(String, String, String)> = moved
+        .iter()
+        .map(|symbol| (symbol.name.clone(), symbol.kind.clone(), symbol.to.clone()))
+        .collect();
+    // 同じ先の宣言を共有する旧い宣言の数 (型を 1 つにまとめると、別だった型が同じ型になる)。
+    let mut sharing: std::collections::HashMap<(&str, (usize, usize)), usize> =
+        std::collections::HashMap::new();
+    for pair in pairs.iter().flatten() {
+        *sharing
+            .entry((pair.target.file.as_str(), pair.target.start))
+            .or_default() += 1;
+    }
+    let no_callees = std::collections::HashSet::new();
+    let mut moved_files = MovedSymbolFiles::new(inputs.dir, inputs.base_blobs);
+    for ((old, reexporting_file), pair) in removals.iter().zip(&pairs) {
+        let blocking = |new_signature: Option<String>, unverified: bool| ApiSymbolChange {
+            unverified: unverified.then_some(ApiModificationUnverified {
+                reason: ApiModificationUnverifiedReason::ReexportTargetUnresolved,
+                first_unproven: None,
+            }),
+            name: old.name.clone(),
+            kind: old.kind.clone(),
+            file: reexporting_file.clone(),
+            old_signature: Some(old.signature.clone()),
+            new_signature,
+            no_resolved_internal_callers: false,
+            contract_change: None,
+        };
+        let Some(pair) = pair else {
+            state.buckets.modified.push(blocking(None, true));
+            continue;
+        };
+        let target = &pair.target;
+        // 先の追加の候補は、先の宣言の signature まで同じものだけ (同じファイルの別の module の
+        // 同じ名前の宣言を外さない)。
+        let is_destination = |candidate: &ApiSymbolCandidate| {
+            candidate.name == old.name
+                && candidate.kind == old.kind
+                && candidate.file == target.file
+                && candidate.signature == pair.new_signature
+        };
+        if NOMINAL_KINDS.contains(&old.kind.as_str())
+            && (!target.added_in_diff
+                || pair.merged
+                || sharing[&(target.file.as_str(), target.start)] > 1
+                || moved_into.contains(&(old.name.clone(), old.kind.clone(), target.file.clone())))
+        {
+            state
+                .buckets
+                .modified
+                .push(blocking(Some(pair.new_signature.clone()), false));
+            if target.added_in_diff {
+                added.retain(|candidate| !is_destination(candidate));
+            }
+            continue;
+        }
+        let moved_symbol = || crate::models::review::MovedSymbol {
+            name: old.name.clone(),
+            kind: old.kind.clone(),
+            from: old.file.clone(),
+            to: target.file.clone(),
+        };
+        if pair.new_signature == old.signature {
+            if target.added_in_diff {
+                added.retain(|candidate| !is_destination(candidate));
+                moved.push(moved_symbol());
+            }
+            continue;
+        }
+        let callees = files
+            .new
+            .get(target.file.as_str())
+            .map_or(&no_callees, |(_, callees)| *callees);
+        let mut changed =
+            ChangedSignatureFiles::new(inputs, state, &old.file, &target.file, callees);
+        changed.moved_from = Some(&old.file);
+        // 関数に `const` を足しただけなら、通常の移動と同じ証明で互換 (#113・#114)。
+        let destination = ApiSymbolCandidate {
+            name: old.name.clone(),
+            kind: old.kind.clone(),
+            file: target.file.clone(),
+            signature: pair.new_signature.clone(),
+        };
+        if moved_files.const_addition_is_compatible(&MovedSymbolChange {
+            old: old.clone(),
+            new: destination,
+            new_in_file_callees: callees,
+            old_file_after: None,
+            new_file_before: None,
+        }) {
+            changed.rust_moved_const_additions.insert(old.name.clone());
+        }
+        let (change, decision) = changed.decide(
+            inputs,
+            state,
+            &old.name,
+            &old.kind,
+            &old.signature,
+            &pair.new_signature,
+        );
+        let breaking = matches!(
+            decision,
+            SignatureDecision::Blocking(_) | SignatureDecision::Unverified(_)
+        );
+        record_signature_decision(inputs, state, change, decision);
+        if target.added_in_diff {
+            added.retain(|candidate| !is_destination(candidate));
+            if !breaking {
+                moved.push(moved_symbol());
+            }
+        }
+    }
+    (added, moved)
 }
 
 /// 自由関数・定数を別のファイルへ移した同じ差分でシグネチャの変わった組

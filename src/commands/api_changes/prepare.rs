@@ -88,6 +88,9 @@ pub(crate) struct ApiChangeBuckets {
     pub(crate) compatible_modified: Vec<CompatibleApiModification>,
     pub(crate) all_new_candidates: Vec<ApiSymbolCandidate>,
     pub(crate) property_to_field: Vec<PropertyToFieldChange>,
+    /// 新しいファイルの `pub use` で同じ名前を再公開したので削除にしなかった Rust の旧い宣言と、
+    /// 再公開したファイル (新しいパス)。再公開の先の宣言と組にして比べる (Issue #281)。
+    pub(crate) reexported_removals: Vec<(ApiSymbolCandidate, String)>,
 }
 
 /// diff 全体で不変な入力。ファイル単位の分類関数が共通で参照する。
