@@ -247,7 +247,7 @@ pub(crate) fn collect_rust_pub_use_index(
 }
 
 /// Global の経路をローカルのグラフへ混ぜない。2015 と self 別名だけを root 起点へ直す。
-fn resolve_global_pub_use_edges(
+pub(crate) fn resolve_global_pub_use_edges(
     collected: Vec<CollectedPubUseEdge>,
     edition: Option<crate::engine::rust_edition::RustEdition>,
     root_source: impl FnOnce() -> Option<Vec<u8>>,
@@ -364,7 +364,7 @@ fn global_self_aliases(source: &[u8]) -> Option<std::collections::HashSet<String
 /// 判定 (`compute_reexport_reachable_modules`) に混ざると、glob で入る module を誤って隠し得る
 /// ため (クレートルート起点では module、子 module 起点では関数になる名前の再公開など)。
 /// `edition` は Bare な edge の束縛を読み直すときだけ呼ぶ (manifest を読む回数を増やさない)。
-fn resolve_bare_pub_use_edges(
+pub(crate) fn resolve_bare_pub_use_edges(
     collected: Vec<CollectedPubUseEdge>,
     module_tree: &ModuleTree,
     edition: impl FnOnce() -> Option<crate::engine::rust_edition::RustEdition>,
@@ -650,6 +650,17 @@ pub(crate) struct ModuleTree {
     /// 書き換え得る属性も無く、中身 (inline の body か外部ファイル) の内部属性も同様で、
     /// 外部ファイルを読めた場合だけ true。
     unconditional: std::collections::HashMap<Vec<String>, bool>,
+    /// module 絶対 path → 中身の場所。同じ module を 2 回以上宣言していれば None。
+    locations: std::collections::HashMap<Vec<String>, Option<ModuleLocation>>,
+}
+
+/// module の中身の場所。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ModuleLocation {
+    /// module の中身を書いたファイル (crate の `src` 相対)。
+    pub(crate) file: std::path::PathBuf,
+    /// ファイルの中の inline module の名前の並び (ファイルの module 自身なら空)。
+    pub(crate) inline: Vec<String>,
 }
 
 impl ModuleTree {
@@ -658,9 +669,25 @@ impl ModuleTree {
     }
 
     /// 祖先の条件で消える module も、必ずある束縛とはみなさない。
-    fn is_unconditional_path(&self, module: &[String]) -> bool {
+    pub(crate) fn is_unconditional_path(&self, module: &[String]) -> bool {
         (0..=module.len()).all(|depth| self.is_unconditional(&module[..depth]))
     }
+
+    /// module の中身の場所 (1 回だけ宣言した module だけ)。
+    pub(crate) fn location(&self, module: &[String]) -> Option<&ModuleLocation> {
+        self.locations.get(module)?.as_ref()
+    }
+}
+
+/// `module` の中身の場所を記録する。2 回目からは、どの宣言か決められないので None にする。
+fn record_location(
+    map: &mut std::collections::HashMap<Vec<String>, Option<ModuleLocation>>,
+    module: &[String],
+    location: ModuleLocation,
+) {
+    map.entry(module.to_vec())
+        .and_modify(|known| *known = None)
+        .or_insert(Some(location));
 }
 
 /// `module` が条件なしかを記録する。一度でも条件付きと分かった module は条件付きのまま。
@@ -691,8 +718,17 @@ pub(crate) fn collect_all_modules(
     let mut result: HashMap<Vec<String>, Vec<String>> = HashMap::new();
     result.insert(Vec::new(), Vec::new());
     let mut unconditional: HashMap<Vec<String>, bool> = HashMap::new();
+    let mut locations: HashMap<Vec<String>, Option<ModuleLocation>> = HashMap::new();
     let mut frontier: Vec<(Vec<String>, PathBuf)> = vec![(Vec::new(), PathBuf::from("lib.rs"))];
     while let Some((segments, current_rel)) = frontier.pop() {
+        record_location(
+            &mut locations,
+            &segments,
+            ModuleLocation {
+                file: current_rel.clone(),
+                inline: Vec::new(),
+            },
+        );
         let module_source =
             read_rust_module_source(source, dir, &info.crate_root_rel, &current_rel)?;
         let tree = parser::parse_source(&module_source, crate::language::LangId::Rust).ok()?;
@@ -715,12 +751,16 @@ pub(crate) fn collect_all_modules(
             result: &mut result,
             unconditional: &mut unconditional,
             frontier: &mut frontier,
+            locations: &mut locations,
+            file: &current_rel,
+            file_depth: segments.len(),
         };
         collector.collect(tree.root_node(), &module_source, &segments, &base_dir)?;
     }
     Some(ModuleTree {
         pub_children: result,
         unconditional,
+        locations,
     })
 }
 
@@ -738,6 +778,11 @@ struct ModuleVisibilityCollector<'a, 'b> {
     /// 有無。外部ファイルの内部属性は `collect_all_modules` がファイルを読むときに足す)。
     unconditional: &'b mut std::collections::HashMap<Vec<String>, bool>,
     frontier: &'b mut Vec<(Vec<String>, std::path::PathBuf)>,
+    /// module → 中身の場所 (inline module の宣言をここで足す)。
+    locations: &'b mut std::collections::HashMap<Vec<String>, Option<ModuleLocation>>,
+    /// 辿っているファイル (crate の `src` 相対) と、その module の深さ。
+    file: &'b std::path::Path,
+    file_depth: usize,
 }
 
 impl ModuleVisibilityCollector<'_, '_> {
@@ -795,6 +840,14 @@ impl ModuleVisibilityCollector<'_, '_> {
                     for child in node.children(&mut cursor) {
                         if child.kind() == "declaration_list" {
                             has_inline_body = true;
+                            record_location(
+                                self.locations,
+                                &child_segments,
+                                ModuleLocation {
+                                    file: self.file.to_path_buf(),
+                                    inline: child_segments[self.file_depth..].to_vec(),
+                                },
+                            );
                             let inline_base = Rc::new(base_dir.join(&name));
                             let mut inner_cursor = child.walk();
                             stack.extend(child.named_children(&mut inner_cursor).map(|inner| {
@@ -1017,6 +1070,7 @@ mod tests {
         let mut result = std::collections::HashMap::new();
         let mut unconditional = std::collections::HashMap::new();
         let mut frontier = Vec::new();
+        let mut locations = std::collections::HashMap::new();
         let mut collector = ModuleVisibilityCollector {
             source: RustSourceTree::Worktree,
             dir,
@@ -1024,6 +1078,9 @@ mod tests {
             result: &mut result,
             unconditional: &mut unconditional,
             frontier: &mut frontier,
+            locations: &mut locations,
+            file: std::path::Path::new("lib.rs"),
+            file_depth: 0,
         };
         let base = std::path::Path::new("");
         let outcome = if recursive {
