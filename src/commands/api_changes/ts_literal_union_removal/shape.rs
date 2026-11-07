@@ -314,10 +314,10 @@ mod tests {
             new_sig: "",
             lang_id: Some(lang),
         };
-        let pair = OldNewSources {
-            old: old.as_bytes().to_vec(),
-            new: crate::engine::parser::SourceBuf::Vec(new.as_bytes().to_vec()),
-        };
+        let pair = OldNewSources::new(
+            old.as_bytes().to_vec(),
+            crate::engine::parser::SourceBuf::Vec(new.as_bytes().to_vec()),
+        );
         classify(&site, &pair)
     }
     #[test]

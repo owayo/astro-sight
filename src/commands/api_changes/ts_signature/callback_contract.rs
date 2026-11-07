@@ -119,17 +119,19 @@ pub(crate) fn detect_fixed_callback_contract_compatible_mod(
     if !old_names.is_empty() || new_names.is_empty() || new_names.len() > new.arity {
         return None;
     }
-    // 契約・登録関数・公開経路を含め、実装の引数と本体以外は変更されていない。
-    if src.old.get(..old_params.start_byte())? != src.new.get(..new_params.start_byte())?
-        || src.old.get(old_params.end_byte()..old_body.start_byte())?
-            != src.new.get(new_params.end_byte()..new_body.start_byte())?
-        || src.old.get(old_body.end_byte()..)? != src.new.get(new_body.end_byte()..)?
+    // 契約・登録関数・公開経路を含め、実装の引数と本体以外は変更されていない。宣言ファイルから
+    // 消える型のメンバーも含めて、元のソースの字面で比べる。
+    let (old_source, new_source) = (src.original_old(), src.original_new());
+    if old_source.get(..old_params.start_byte())? != new_source.get(..new_params.start_byte())?
+        || old_source.get(old_params.end_byte()..old_body.start_byte())?
+            != new_source.get(new_params.end_byte()..new_body.start_byte())?
+        || old_source.get(old_body.end_byte()..)? != new_source.get(new_body.end_byte()..)?
     {
         return None;
     }
     let refs = index.refs_for(site.name)?;
     let files = inventory(site.dir, caches)?;
-    if files.get(site.new_path)?.source.as_ref() != src.new.as_ref() {
+    if files.get(site.new_path)?.source.as_ref() != new_source {
         return None;
     }
     if prove_default_imports(&files, site.new_path, site.name, new.arity)? == 0 {

@@ -438,7 +438,8 @@ pub(crate) fn detect_trailing_optional_params_removed_compatible_mod(
         return None;
     }
     let (inventory, evidence) = cache.inventory(site.dir, site.name, site.new_path)?;
-    if !inventory.has_source(site.new_path, &src.new) {
+    // 在庫は元のソースを読んでいるので、元の新版と照合する。
+    if !inventory.has_source(site.new_path, src.original_new()) {
         return None;
     }
     prove_repository_uses(

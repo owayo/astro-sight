@@ -62,7 +62,7 @@ impl<'a> CompatibleModSite<'a> {
             None => git_show_blob(self.dir, self.base, self.old_path)?,
         };
         let new = load_new_source(self.dir, self.new_path)?;
-        Some(OldNewSources { old, new })
+        Some(OldNewSources::new(old, new))
     }
 }
 
@@ -91,16 +91,61 @@ pub(crate) fn load_old_source_with_new(
         return None;
     }
     let old = base_blobs.read(old_path)?;
-    Some(OldNewSources { old, new })
+    Some(OldNewSources::new(old, new))
 }
 
 /// base 側 blob と working tree ソースの組。
+///
+/// TS の `stripInternal` が当たる側は、`old` / `new` を宣言ファイルの型のメンバーにしたソース
+/// ([`OldNewSources::publish`]) にし、元のソースも持つ。宣言の形の比較は `old` / `new` で、
+/// 読み込んだ内容の照合 (在庫と同じ版か) と、宣言の外を変えていないことの字面の比較は元のソース
+/// ([`OldNewSources::original_old`] / [`OldNewSources::original_new`]) で行う。
 pub(crate) struct OldNewSources {
     pub(crate) old: Vec<u8>,
     pub(crate) new: SourceBuf,
+    /// `publish` で書き換える前の旧版。書き換えていなければ None。
+    original_old: Option<Vec<u8>>,
+    /// `publish` で書き換える前の新版。書き換えていなければ None。
+    original_new: Option<SourceBuf>,
 }
 
 impl OldNewSources {
+    pub(crate) fn new(old: Vec<u8>, new: SourceBuf) -> Self {
+        Self {
+            old,
+            new,
+            original_old: None,
+            original_new: None,
+        }
+    }
+
+    /// 元の旧版 (`publish` で型のメンバーを除く前)。
+    pub(crate) fn original_old(&self) -> &[u8] {
+        self.original_old.as_deref().unwrap_or(&self.old)
+    }
+
+    /// 元の新版 (`publish` で型のメンバーを除く前)。
+    pub(crate) fn original_new(&self) -> &[u8] {
+        self.original_new.as_deref().unwrap_or(&self.new)
+    }
+
+    /// `stripInternal` の当たる側を、宣言ファイルの型のメンバーにする (位置は変えない。元の
+    /// ソースは残す。Issue #274)。
+    pub(crate) fn publish(
+        &mut self,
+        strip_internal: &super::ts_strip_internal::StripInternal,
+        old_path: &str,
+        new_path: &str,
+        lang: LangId,
+    ) {
+        if let Some(published) = strip_internal.published(old_path, lang, &self.old) {
+            self.original_old = Some(std::mem::replace(&mut self.old, published));
+        }
+        if let Some(published) = strip_internal.published(new_path, lang, &self.new) {
+            self.original_new = Some(std::mem::replace(&mut self.new, SourceBuf::Vec(published)));
+        }
+    }
+
     /// old / new を同一言語で parse したツリー組を返す。
     pub(crate) fn parse_pair(
         &self,
@@ -124,26 +169,42 @@ impl OldNewSources {
 /// base 側は検出全体で共有する常駐の読み手 (`with_base_blobs`) から読む。シンボルごとに
 /// `git show` を起動していた旧実装は、TS 関数 1000 ファイルの引数追加で API 差分フェーズの
 /// 大半を占めていた。
+///
+/// TS の `stripInternal` が当たる側は、宣言ファイルから消える型のメンバーを除いたソースにする
+/// ([`OldNewSources::publish`])。判定器は宣言ファイルを使う利用者から見た型を比べる。
 #[derive(Default)]
 pub(crate) struct SignatureSourceCache<'b> {
     /// base 側 blob の読み手。`None` (判定器を単体で呼ぶテストの既定値) は単発の `git show`。
     base_blobs: Option<&'b GitBlobBatch>,
+    /// TS の `stripInternal` の設定。`None` (テストの既定値) は当てない。
+    strip_internal: Option<&'b super::ts_strip_internal::StripInternal>,
     /// 外 `None` = 未取得、内 `None` = 取得失敗 (再試行しない)。
     loaded: Option<Option<OldNewSources>>,
 }
 
 impl<'b> SignatureSourceCache<'b> {
-    pub(crate) fn with_base_blobs(base_blobs: &'b GitBlobBatch) -> Self {
+    pub(crate) fn with_base_blobs(
+        base_blobs: &'b GitBlobBatch,
+        strip_internal: &'b super::ts_strip_internal::StripInternal,
+    ) -> Self {
         Self {
             base_blobs: Some(base_blobs),
+            strip_internal: Some(strip_internal),
             loaded: None,
         }
     }
 
     pub(crate) fn get(&mut self, site: &CompatibleModSite<'_>) -> Option<&OldNewSources> {
         let base_blobs = self.base_blobs;
+        let strip_internal = self.strip_internal;
         self.loaded
-            .get_or_insert_with(|| site.load_sources(base_blobs))
+            .get_or_insert_with(|| {
+                let mut sources = site.load_sources(base_blobs)?;
+                if let (Some(strip_internal), Some(lang)) = (strip_internal, site.lang_id) {
+                    sources.publish(strip_internal, site.old_path, site.new_path, lang);
+                }
+                Some(sources)
+            })
             .as_ref()
     }
 

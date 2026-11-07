@@ -36,6 +36,9 @@ use super::ts_module_paths::{
 use crate::engine::bounded_read::read_utf8_file_limited;
 use crate::git_support::normalize_workspace_separators;
 
+mod strip_internal;
+pub(crate) use strip_internal::StripInternalConfigs;
+
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_CONFIG_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MANIFEST_TOTAL_BYTES: usize = 32 * 1024 * 1024;

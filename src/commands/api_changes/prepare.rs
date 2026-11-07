@@ -106,6 +106,9 @@ pub(crate) struct DetectionInputs<'a> {
     /// base リビジョンの blob の読み手 (常駐 `git cat-file --batch`)。旧版を読む経路は
     /// すべてこれを通し、ファイルやシンボルごとに `git show` を起動しない。
     pub(crate) base_blobs: &'a crate::commands::git_input::GitBlobBatch,
+    /// TS の `stripInternal` の設定 (Issue #274)。公開面の抽出と同じ設定で、互換判定器にも
+    /// 宣言ファイルから消える型のメンバーを除いたソースを渡す。
+    pub(crate) strip_internal: &'a super::ts_strip_internal::StripInternal,
 }
 
 /// 分類の過程で更新される可変状態 (結果バケットと、ファイル単位のメモ化キャッシュ)。
@@ -206,6 +209,8 @@ pub(crate) struct PreparedDiff {
     pub(crate) unverified_deleted_paths: HashSet<String>,
     /// 読み込み・parse の失敗と、base と照合できなかった旧ソースの申告 (ファイル順)。
     pub(crate) parse_truncations: Vec<crate::models::truncation::TruncationInfo>,
+    /// TS の `stripInternal` の設定。公開面の抽出で読んだ設定を、分類でも使う。
+    pub(crate) strip_internal: super::ts_strip_internal::StripInternal,
 }
 
 impl PreparedDiff {
@@ -226,10 +231,12 @@ impl PreparedDiff {
             index_names: HashSet::new(),
             unverified_deleted_paths: HashSet::new(),
             parse_truncations: Vec::new(),
+            strip_internal: super::ts_strip_internal::StripInternal::disabled(),
         };
         let resolver = canonical_dir.map(crate::engine::gitattributes::AttributeResolver::open);
         let mut lookup = resolver.as_ref().map(|resolver| resolver.lookup());
         let mut undetermined = Vec::new();
+        let strip_internal = super::ts_strip_internal::StripInternal::new(dir);
         for df in diff_files {
             let file = prepared.prepare_file(
                 dir,
@@ -238,6 +245,7 @@ impl PreparedDiff {
                 canonical_dir,
                 base_blobs,
                 &mut undetermined,
+                &strip_internal,
             );
             prepared.files.push(file);
         }
@@ -246,9 +254,11 @@ impl PreparedDiff {
                 crate::engine::refs::generated_undetermined_truncations(root, &undetermined),
             );
         }
+        prepared.strip_internal = strip_internal;
         prepared
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_file(
         &mut self,
         dir: &str,
@@ -257,15 +267,16 @@ impl PreparedDiff {
         canonical_dir: Option<&std::path::Path>,
         base_blobs: &crate::commands::git_input::GitBlobBatch,
         undetermined: &mut Vec<GeneratedUndetermined>,
+        strip_internal: &super::ts_strip_internal::StripInternal,
     ) -> PreparedDiffFile {
         if should_skip_diff_file(df, generated, canonical_dir, undetermined) {
             return PreparedDiffFile::Skip;
         }
         if df.old_path == "/dev/null" {
-            return self.prepare_added_file(dir, df);
+            return self.prepare_added_file(dir, df, strip_internal);
         }
         if df.new_path == "/dev/null" {
-            return self.prepare_deleted_file(df, base_blobs, "deleted file");
+            return self.prepare_deleted_file(df, base_blobs, "deleted file", strip_internal);
         }
         // hunk の無い rename (内容同一) はシンボルが変わらない。旧側が拡張子で判定できる
         // ソースで、新側が対応言語の外へ出た (拡張子でも shebang でも言語を判定できない) 場合
@@ -273,14 +284,14 @@ impl PreparedDiff {
         // 旧側の言語も新側と同じ shebang で決まり、API 面は変わらない。
         if df.hunks.is_empty() {
             let leaves_source = renames_out_of_known_extension(df)
-                && extract_new_file_facts(dir, &df.new_path).language_unknown;
+                && extract_new_file_facts(dir, &df.new_path, strip_internal).language_unknown;
             return if leaves_source {
-                self.prepare_deleted_file(df, base_blobs, "renamed file")
+                self.prepare_deleted_file(df, base_blobs, "renamed file", strip_internal)
             } else {
                 PreparedDiffFile::Skip
             };
         }
-        self.prepare_modified_file(dir, df, base_blobs)
+        self.prepare_modified_file(dir, df, base_blobs, strip_internal)
     }
 
     /// 新規ファイル (`old_path == "/dev/null"`)。
@@ -288,9 +299,10 @@ impl PreparedDiff {
         &mut self,
         dir: &str,
         df: &crate::models::impact::DiffFile,
+        strip_internal: &super::ts_strip_internal::StripInternal,
     ) -> PreparedDiffFile {
         // new_path を 1 回 read+parse して exported / callees を導出 (perf #2)。
-        let facts = extract_new_file_facts(dir, &df.new_path);
+        let facts = extract_new_file_facts(dir, &df.new_path, strip_internal);
         self.parse_truncations.extend(facts.parse_truncations);
         let new_syms = facts.exported.map(|facts| facts.symbols);
         let in_file_callees = facts.callees;
@@ -316,8 +328,9 @@ impl PreparedDiff {
         df: &crate::models::impact::DiffFile,
         base_blobs: &crate::commands::git_input::GitBlobBatch,
         subject: &str,
+        strip_internal: &super::ts_strip_internal::StripInternal,
     ) -> PreparedDiffFile {
-        let facts = extract_deleted_file_exported_symbols(base_blobs, df);
+        let facts = extract_deleted_file_exported_symbols(base_blobs, df, strip_internal);
         if facts.old_source_unverified && facts.analyzable_source {
             self.unverified_deleted_paths.insert(df.old_path.clone());
             self.parse_truncations
@@ -340,13 +353,15 @@ impl PreparedDiff {
         dir: &str,
         df: &crate::models::impact::DiffFile,
         base_blobs: &crate::commands::git_input::GitBlobBatch,
+        strip_internal: &super::ts_strip_internal::StripInternal,
     ) -> PreparedDiffFile {
         // rename 差分では base 側に新パスが存在しないため、旧版は old_path から読む。
-        let mut old_facts = extract_exported_file_facts_from_git(base_blobs, &df.old_path);
+        let mut old_facts =
+            extract_exported_file_facts_from_git(base_blobs, &df.old_path, strip_internal);
         // new_path を 1 回 read+parse して exported / callees / export surface を導出 (perf #2)。
         // export surface は process_modified_file が再 parse せず使えるよう
         // PreparedDiffFile に持たせる。
-        let mut facts = extract_new_file_facts(dir, &df.new_path);
+        let mut facts = extract_new_file_facts(dir, &df.new_path, strip_internal);
         self.parse_truncations.extend(facts.parse_truncations);
         // 対応言語でないファイルへの rename (`api.ts` → `api.ts.bak`) は、新側に API 面が
         // 無いので旧ファイルの削除と同じ。変更ファイルとして扱うと新側のシンボルが取れず
@@ -546,6 +561,7 @@ fn is_gitlink_patch_source(source: &[u8]) -> bool {
 pub(crate) fn extract_deleted_file_exported_symbols(
     base_blobs: &crate::commands::git_input::GitBlobBatch,
     df: &crate::models::impact::DiffFile,
+    strip_internal: &super::ts_strip_internal::StripInternal,
 ) -> DeletedSourceFacts {
     let base_source = base_blobs.read(&df.old_path);
     let diff_source = df.deleted_old_source.as_deref();
@@ -585,7 +601,13 @@ pub(crate) fn extract_deleted_file_exported_symbols(
         && (crate::language::LangId::from_path(path).is_ok()
             || source.is_some_and(|src| crate::engine::parser::detect_lang(path, src).is_ok()));
     DeletedSourceFacts {
-        symbols: source.and_then(|src| extract_exported_symbols_from_source(&df.old_path, src)),
+        symbols: source.and_then(|src| {
+            super::exported::extract_exported_symbols_from_source_with(
+                &df.old_path,
+                src,
+                strip_internal,
+            )
+        }),
         old_source_unverified,
         analyzable_source,
     }
@@ -674,7 +696,11 @@ pub(crate) struct NewFileFacts {
     pub(crate) language_unknown: bool,
 }
 
-pub(crate) fn extract_new_file_facts(dir: &str, file_path: &str) -> NewFileFacts {
+pub(crate) fn extract_new_file_facts(
+    dir: &str,
+    file_path: &str,
+    strip_internal: &super::ts_strip_internal::StripInternal,
+) -> NewFileFacts {
     let mut facts = NewFileFacts {
         unparsed_declarations: Vec::new(),
         parse_truncations: Vec::new(),
@@ -750,6 +776,7 @@ pub(crate) fn extract_new_file_facts(dir: &str, file_path: &str) -> NewFileFacts
             true,
             false,
             Some(file_path),
+            strip_internal.applies(file_path, lang_id, &source),
         ));
     }
 
@@ -769,6 +796,12 @@ pub(crate) fn extract_new_file_facts(dir: &str, file_path: &str) -> NewFileFacts
             }
             _ => crate::engine::symbols::collect_js_ts_named_export_surface_names(root, &source),
         };
+        // `stripInternal` で宣言ファイルから消える export 文だけが公開する名前は、公開の面に無い。
+        if strip_internal.applies(file_path, lang_id, &source) {
+            for name in super::ts_strip_internal::internal_only_export_names(root, &source) {
+                facts.export_surface_names.remove(&name);
+            }
+        }
     }
 
     facts

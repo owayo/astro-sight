@@ -155,6 +155,7 @@ pub(crate) fn bare_name(qualname: &str) -> &str {
 pub(crate) fn extract_exported_file_facts_from_git(
     base_blobs: &crate::commands::git_input::GitBlobBatch,
     file_path: &str,
+    strip_internal: &super::ts_strip_internal::StripInternal,
 ) -> Option<ExportedFileFacts> {
     // テストファイル配下のシンボルは API 差分検出の対象外。
     // (api.rm の base 側比較もテストファイルからは行わない)
@@ -164,7 +165,7 @@ pub(crate) fn extract_exported_file_facts_from_git(
     // 旧版は常駐 `git cat-file --batch` で読む (ファイルごとの `git show` 起動を避ける)。
     // revision / path の検証と取得失敗時の None は git_show_blob と同一。
     let old_source = base_blobs.read(file_path)?;
-    extract_exported_file_facts_from_source(file_path, &old_source, true)
+    extract_exported_file_facts_from_source(file_path, &old_source, true, strip_internal)
 }
 
 /// 与えられた旧側ソースから export シンボル一覧を抽出する。
@@ -175,13 +176,28 @@ pub(crate) fn extract_exported_symbols_from_source(
     file_path: &str,
     source: &[u8],
 ) -> Option<ExportedSymbols> {
-    extract_exported_file_facts_from_source(file_path, source, false).map(|facts| facts.symbols)
+    extract_exported_symbols_from_source_with(
+        file_path,
+        source,
+        &super::ts_strip_internal::StripInternal::disabled(),
+    )
+}
+
+/// [`extract_exported_symbols_from_source`] で、TS の `stripInternal` の設定も当てる。
+pub(crate) fn extract_exported_symbols_from_source_with(
+    file_path: &str,
+    source: &[u8],
+    strip_internal: &super::ts_strip_internal::StripInternal,
+) -> Option<ExportedSymbols> {
+    extract_exported_file_facts_from_source(file_path, source, false, strip_internal)
+        .map(|facts| facts.symbols)
 }
 
 fn extract_exported_file_facts_from_source(
     file_path: &str,
     source: &[u8],
     collect_metadata: bool,
+    strip_internal: &super::ts_strip_internal::StripInternal,
 ) -> Option<ExportedFileFacts> {
     if is_test_path(std::path::Path::new(file_path)) {
         return Some(ExportedFileFacts::default());
@@ -198,7 +214,8 @@ fn extract_exported_file_facts_from_source(
     // 旧側を読む経路は API 変更検出 (api.rm 比較) のみで使われる。
     // dead-code は最新コミット側だけを見るため framework entrypoint の除外は不要。
     let context =
-        ExportSurfaceContext::new(&syms, root, source, lang_id, true, false, Some(file_path));
+        ExportSurfaceContext::new(&syms, root, source, lang_id, true, false, Some(file_path))
+            .with_strip_internal(strip_internal.applies(file_path, lang_id, source));
     Some(filter_exported_with_metadata(
         &syms,
         &context,
@@ -297,6 +314,8 @@ pub(crate) struct ExportSurfaceContext<'tree, 'source> {
     /// Python のデコレータの別名を解決する import の索引。名前を書いたままでは登録と
     /// 決まらないデコレータが現れたときに 1 回だけ作る。
     python_decorator_imports: std::cell::OnceCell<crate::engine::symbols::PythonDecoratorImports>,
+    /// TS の `stripInternal`: `@internal` の宣言とメンバーを宣言ファイルから消す (Issue #274)。
+    strip_internal: bool,
 }
 
 impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
@@ -378,7 +397,14 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
             python_tests,
             python_export_policy,
             python_decorator_imports: std::cell::OnceCell::new(),
+            strip_internal: false,
         }
+    }
+
+    /// TS の `stripInternal` を当てる (`@internal` の宣言とメンバーを公開の面から除く)。
+    pub(crate) fn with_strip_internal(mut self, strip_internal: bool) -> Self {
+        self.strip_internal = strip_internal;
+        self
     }
 
     fn is_excluded_before_qualname(&self, sym: &Symbol) -> bool {
@@ -927,6 +953,7 @@ pub(crate) fn filter_dead_code_candidates(
     (facts.symbols, facts.starts, python_facts)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn filter_exported_file_facts(
     syms: &[Symbol],
     root: tree_sitter::Node<'_>,
@@ -935,6 +962,7 @@ pub(crate) fn filter_exported_file_facts(
     exclude_trait_impls: bool,
     exclude_framework_entrypoints: bool,
     file_path: Option<&str>,
+    strip_internal: bool,
 ) -> ExportedFileFacts {
     let context = ExportSurfaceContext::new(
         syms,
@@ -944,7 +972,8 @@ pub(crate) fn filter_exported_file_facts(
         exclude_trait_impls,
         exclude_framework_entrypoints,
         file_path,
-    );
+    )
+    .with_strip_internal(strip_internal);
     filter_exported_with_metadata(syms, &context, true)
 }
 
@@ -965,6 +994,31 @@ fn filter_exported_with_metadata(
         && source
             .windows(b"// astro-sight:allow-dead".len())
             .any(|bytes| bytes == b"// astro-sight:allow-dead");
+    // `stripInternal` で宣言ファイルから消える型のメンバーは、シグネチャと型の依存に含めない。
+    // 位置を保って空白にしたソースから作る (宣言の位置は元のソースと同じ)。
+    let published = context
+        .strip_internal
+        .then(|| super::ts_strip_internal::published_source(root, source))
+        .flatten()
+        .and_then(|published| {
+            let tree = parser::parse_source(&published, lang_id).ok()?;
+            Some((published, tree))
+        });
+    let published_lines: Vec<&str>;
+    let (signature_root, signature_source, signature_lines) = match &published {
+        Some((published, tree)) => {
+            published_lines = std::str::from_utf8(published)
+                .unwrap_or("")
+                .lines()
+                .collect();
+            (
+                tree.root_node(),
+                published.as_slice(),
+                published_lines.as_slice(),
+            )
+        }
+        None => (root, source, context.lines.as_slice()),
+    };
     let mut result = ExportedFileFacts::default();
     if collect_metadata
         && matches!(
@@ -973,7 +1027,8 @@ fn filter_exported_with_metadata(
         )
     {
         result.type_dependencies = Some(super::ts_signature::DependencySnapshot::collect(
-            root, source,
+            signature_root,
+            signature_source,
         ));
     }
     if collect_metadata && lang_id == crate::language::LangId::Rust {
@@ -999,8 +1054,19 @@ fn filter_exported_with_metadata(
         {
             continue;
         }
+        // `stripInternal` で宣言ファイルから消える宣言は、宣言ファイルを使う利用者から見て無い。
+        if context.strip_internal && super::ts_strip_internal::is_internal_symbol(sym, root, source)
+        {
+            continue;
+        }
         // 除外判定後に署名を作り、不要な文字列構築を避ける。
-        let sig = extract_api_signature(sym, root, source, &context.lines, lang_id);
+        let sig = extract_api_signature(
+            sym,
+            signature_root,
+            signature_source,
+            signature_lines,
+            lang_id,
+        );
         if result.rust_parameters.imports.is_some() {
             let function = rust_function_node_for_symbol(sym, root, source);
             let contract = function.and_then(|function| {

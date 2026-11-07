@@ -39,10 +39,14 @@ export const TaskKanbanCard = memo(function TaskKanbanCard() {\n\
     )
     .expect("write");
 
-    let syms = extract_new_file_facts(repo.to_str().expect("utf-8 path"), "Card.tsx")
-        .exported
-        .expect("symbols")
-        .symbols;
+    let syms = extract_new_file_facts(
+        repo.to_str().expect("utf-8 path"),
+        "Card.tsx",
+        &crate::commands::api_changes::ts_strip_internal::StripInternal::disabled(),
+    )
+    .exported
+    .expect("symbols")
+    .symbols;
     let names: Vec<&str> = syms.iter().map(|(n, _, _)| n.as_str()).collect();
     assert!(
         !names.contains(&"hasAssignee"),

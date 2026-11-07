@@ -58,11 +58,13 @@ pub(super) fn recover_root_changes(
     if names.is_empty() {
         return HashMap::new();
     }
-    let Some(sources) = load_new_source(inputs.dir, &df.new_path).and_then(|new| {
+    let Some(mut sources) = load_new_source(inputs.dir, &df.new_path).and_then(|new| {
         load_old_source_with_new(inputs.base_blobs, &df.old_path, &df.new_path, new)
     }) else {
         return HashMap::new();
     };
+    // 公開面の抽出と同じく、宣言ファイルから消える型のメンバーを除いて比べる (Issue #274)。
+    sources.publish(inputs.strip_internal, &df.old_path, &df.new_path, lang);
     let Some((old_tree, new_tree)) = sources.parse_pair(lang) else {
         return HashMap::new();
     };
