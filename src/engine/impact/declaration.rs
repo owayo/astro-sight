@@ -560,6 +560,33 @@ fn rust_is_root_inherent_method(root: Node<'_>, source: &[u8], symbol: &Symbol) 
             })
 }
 
+/// ファイルに、名前を明示せずに項目を生み得る構文があるか (Issue #298)。項目の位置のマクロの呼び出し
+/// (`include!` を含む) と、名前を生まないと分かっている組み込みの属性 (`safe_attribute`) でない
+/// 属性 (手続きマクロかもしれない)。関数の本体の中のマクロの呼び出しは、ファイル直下の項目を生まない。
+fn may_generate_items(root: Node<'_>, source: &[u8]) -> bool {
+    use crate::engine::tree_walk::{Children, Walk, walk_preorder};
+    use std::ops::ControlFlow;
+    walk_preorder(root, Children::Named, |node, _| {
+        // 項目の位置の `name!(..);` は `expression_statement` に包まれることもある。
+        let item_scope = |node: Node<'_>| {
+            node.parent()
+                .is_some_and(|parent| matches!(parent.kind(), "source_file" | "declaration_list"))
+        };
+        let item_macro = node.kind() == "macro_invocation"
+            && (item_scope(node)
+                || node.parent().is_some_and(|parent| {
+                    parent.kind() == "expression_statement" && item_scope(parent)
+                }));
+        let unknown_attribute = matches!(node.kind(), "attribute_item" | "inner_attribute_item")
+            && super::rust_std_origin::safe_attribute(node, source).is_none();
+        if item_macro || unknown_attribute {
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(Walk::Descend)
+    })
+    .is_break()
+}
+
 /// 生成・条件付き項目と名前の正規化を解決せず、明示された関数/関連項目名だけを集める。
 fn rust_explicit_method_bindings(root: Node<'_>, source: &[u8]) -> Option<HashSet<String>> {
     use crate::engine::tree_walk::{Children, Walk, walk_preorder};
@@ -870,6 +897,8 @@ pub(super) fn reconcile_declaration_changes(
     // 混在 hunk 内の新規宣言は行だけでは modified になる。旧側の同名宣言と
     // diff 全体の削除名が無いと証明できる場合に限り added へ戻す。
     // 同名複数・復元失敗では AffectedSymbol を位置へ一意に対応付けられない。
+    // 候補は宣言の先頭行 (名前の行) を書き換えた宣言。ほかの宣言の行を置き換えると、閉じ括弧の
+    // ように旧い版と同じ字面の行が文脈に残るので、全ての行が追加行とは限らない (Issue #298)。
     if input.lang_id == LangId::Rust && file_has_removed_lines && !input.root.has_error() {
         let mut new_by_key: HashMap<(&str, &str), Option<&Symbol>> = HashMap::new();
         let mut callable_counts = HashMap::<String, usize>::new();
@@ -888,7 +917,8 @@ pub(super) fn reconcile_declaration_changes(
             }
         }
         let new_method_bindings = rust_explicit_method_bindings(input.root, input.source);
-        let candidates: Vec<(usize, &Symbol, bool)> = affected
+        // (添字, 宣言, メソッドか, 全ての行が追加行か)。
+        let candidates: Vec<(usize, &Symbol, bool, bool)> = affected
             .iter()
             .enumerate()
             .filter(|(_, change)| change.change_type == "modified")
@@ -896,13 +926,7 @@ pub(super) fn reconcile_declaration_changes(
                 new_by_key
                     .get(&(change.name.as_str(), change.kind.as_str()))
                     .and_then(|symbol| *symbol)
-                    .filter(|symbol| {
-                        super::symbol_lines_all_added(
-                            symbol.range.start.line,
-                            symbol.range.end.line,
-                            &input.facts.added_lines,
-                        )
-                    })
+                    .filter(|symbol| input.facts.added_lines.contains(&symbol.range.start.line))
                     .and_then(|symbol| {
                         let is_root = is_rust_file_root_symbol(input.root, symbol);
                         let is_method = !is_root
@@ -912,7 +936,12 @@ pub(super) fn reconcile_declaration_changes(
                                     .as_ref(),
                             ) == Some(&1)
                             && rust_is_root_inherent_method(input.root, input.source, symbol);
-                        (is_root || is_method).then_some((index, symbol, is_method))
+                        let fully_added = super::symbol_lines_all_added(
+                            symbol.range.start.line,
+                            symbol.range.end.line,
+                            &input.facts.added_lines,
+                        );
+                        (is_root || is_method).then_some((index, symbol, is_method, fully_added))
                     })
             })
             .collect();
@@ -920,11 +949,17 @@ pub(super) fn reconcile_declaration_changes(
             && let Some(old) = old_side.get(input)
             && !old.tree.root_node().has_error()
         {
-            let old_names: HashSet<&str> = old
+            // 名前は `r#` を外して比べる (`Holder` を `r#Holder` に書き換えても同じ宣言)。
+            let old_names: HashSet<String> = old
                 .symbols
                 .iter()
-                .map(|symbol| symbol.name.as_str())
+                .map(|symbol| {
+                    crate::language::normalize_identifier(LangId::Rust, &symbol.name).into_owned()
+                })
                 .collect();
+            // 一部の行が文脈に残る候補 (ほかの宣言の行を置き換えたもの) は、旧い版に名前を明示せずに
+            // 項目を生み得る構文があれば、同じ名前の宣言が無いことを確かめられない (Issue #298)。
+            let mut generated: Option<bool> = None;
             let mut old_use_names = HashSet::new();
             let mut old_use_uncertain = false;
             collect_old_rust_use_bindings(
@@ -935,10 +970,10 @@ pub(super) fn reconcile_declaration_changes(
             );
             let old_method_bindings = candidates
                 .iter()
-                .any(|(_, _, method)| *method)
+                .any(|(_, _, method, _)| *method)
                 .then(|| rust_explicit_method_bindings(old.tree.root_node(), &old.source))
                 .flatten();
-            for (index, symbol, is_method) in candidates {
+            for (index, symbol, is_method, fully_added) in candidates {
                 let normalized = crate::language::normalize_identifier(LangId::Rust, &symbol.name);
                 let removed_identity_is_unproven = if is_method {
                     input
@@ -948,11 +983,23 @@ pub(super) fn reconcile_declaration_changes(
                     input
                         .reexport_moves
                         .might_have_removed_identity(&symbol.name)
+                        || input
+                            .reexport_moves
+                            .might_have_removed_identity(normalized.as_ref())
                 };
-                if !old_names.contains(symbol.name.as_str())
+                if !fully_added
+                    && *generated.get_or_insert_with(|| {
+                        may_generate_items(old.tree.root_node(), &old.source)
+                    })
+                {
+                    continue;
+                }
+                if !old_names.contains(normalized.as_ref())
                     && !removed_identity_is_unproven
                     && !old_use_uncertain
-                    && !old_use_names.contains(&symbol.name)
+                    && old_use_names.iter().all(|name| {
+                        crate::language::normalize_identifier(LangId::Rust, name) != normalized
+                    })
                     && (!is_method
                         || old_method_bindings.as_ref().is_some_and(|names| {
                             !names.contains(normalized.as_ref())
@@ -1906,6 +1953,38 @@ mod tests {
             true,
         );
         assert_eq!(change_type_of(&with_test_glob, "NewState"), Some("added"));
+
+        // ほかの宣言の行を置き換えた新しい宣言は、閉じ括弧の行が旧い版と同じ字面で文脈に残っても
+        // added (Issue #298)。
+        let old_replaced = "pub fn helper() {}\n\nstruct Alias {\n    tokens: Vec<String>,\n}\n\nenum Resolved {\n    Module(Vec<String>),\n}\n";
+        let new_replaced = "pub fn helper() {}\n\nstruct Definition {\n    range: (usize, usize),\n}\n\nenum ModulePath {\n    Inline(Vec<String>),\n}\n";
+        let (replaced, _) = run_pass1(
+            LangId::Rust,
+            "internal.rs",
+            old_replaced,
+            new_replaced,
+            true,
+        );
+        for name in ["Definition", "ModulePath"] {
+            assert_eq!(change_type_of(&replaced, name), Some("added"), "{name}");
+        }
+        // 同じ名前の宣言の中身だけを書き換えたものは modified のまま。
+        let new_body = "pub fn helper() {}\n\nstruct Alias {\n    tokens: Vec<u8>,\n}\n\nenum Resolved {\n    Module(Vec<String>),\n}\n";
+        let (body, _) = run_pass1(LangId::Rust, "internal.rs", old_replaced, new_body, true);
+        assert_ne!(change_type_of(&body, "Alias"), Some("added"));
+        // `r#` を付けただけの同じ名前は、旧い版の宣言と同じ (modified のまま)。
+        let old_holder = "pub(crate) struct Holder {\n    value: u8,\n}\n";
+        let new_raw = "pub(crate) struct r#Holder<T> {\n    value: T,\n}\n";
+        let (raw, _) = run_pass1(LangId::Rust, "api.rs", old_holder, new_raw, true);
+        for name in ["Holder", "r#Holder"] {
+            assert_ne!(change_type_of(&raw, name), Some("added"), "{name}");
+        }
+        // 旧い版が項目を生み得るマクロ (`include!`) を持てば、閉じ括弧の残る置き換えを added に
+        // しない (取り込み先に同じ名前があったかもしれない)。
+        let old_include = "include!(\"types.inc\");\n\npub struct Alias {\n    pub value: u8,\n}\n";
+        let new_include = "pub struct Holder {\n    pub value: u16,\n}\n";
+        let (include, _) = run_pass1(LangId::Rust, "api.rs", old_include, new_include, true);
+        assert_ne!(change_type_of(&include, "Holder"), Some("added"));
 
         // 同名の宣言が移動しただけなら、追加行だけでは新規 API と証明できない。
         let moved = "pub fn changed() -> u8 { 2 }\npub fn stable() -> u8 { 1 }\n";

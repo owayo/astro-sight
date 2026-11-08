@@ -37,6 +37,7 @@ mod integration {
     mod impact_rust_line_endings;
     mod impact_rust_private_helpers;
     mod impact_rust_reexport;
+    mod impact_rust_replaced_types;
     mod impact_rust_same_named_constants;
     mod impact_rust_scope;
     mod impact_rust_visibility_widening;
