@@ -744,13 +744,14 @@ fn rust_struct_repr_items_and_public_additions() {
                 "#[cfg_attr(all(), repr(Rust))]\npub struct S {\n    pub b: u32,\n    pub a: u8,\n}\n",
                 "none",
             ),
-            // `#[repr]` が効く設定があれば、順は約束 (`repr(transparent)` で `#[cfg]` で分けた同じ名前の
-            // 公開フィールドの片方を消す変更も、順の違いで捉える)
+            // `#[cfg]` で分けた同じ名前の公開フィールドの片方を消す変更は、名前と条件の組で捉える
+            // (Issue #290)
             (
                 "#[repr(transparent)]\npub struct S {\n    #[cfg(feature = \"wide\")]\n    pub value: u64,\n    #[cfg(not(feature = \"wide\"))]\n    pub value: u8,\n    hidden: (),\n}\n",
                 "#[repr(transparent)]\npub struct S {\n    #[cfg(not(feature = \"wide\"))]\n    pub value: u8,\n    hidden: (),\n}\n",
                 "mod",
             ),
+            // `#[repr]` が効く設定があれば、順は約束
             (
                 "#[cfg_attr(feature = \"ffi\", repr(C))]\npub struct S {\n    pub a: u8,\n    pub b: u32,\n}\n",
                 "#[cfg_attr(feature = \"ffi\", repr(C))]\npub struct S {\n    pub b: u32,\n    pub a: u8,\n}\n",
@@ -911,4 +912,194 @@ fn rust_struct_conditional_outlives_written_on_parameters_are_unchanged() {
         )],
         "S",
     );
+}
+
+/// `#[cfg]` で分けた同じ名前の公開フィールドは、名前と条件の組で対応させて比べる (Issue #290)。
+#[test]
+fn rust_struct_cfg_split_fields_are_matched_by_name_and_condition() {
+    let shape = |repr: &str, wide: &str, narrow: &str| {
+        format!(
+            "{repr}pub struct Config {{\n    #[cfg(feature = \"wide\")]\n    {wide},\n    #[cfg(not(feature = \"wide\"))]\n    {narrow},\n}}\n"
+        )
+    };
+    for repr in ["", "#[repr(C)]\n"] {
+        let old = shape(repr, "pub value: u32", "pub value: u8");
+        for (wide, narrow) in [
+            // 先に書いた側の型の変更 (Issue の再現)・改名・公開でなくすこと
+            ("pub value: u64", "pub value: u8"),
+            ("pub wide: u32", "pub value: u8"),
+            ("pub(crate) value: u32", "pub value: u8"),
+            // 後に書いた側の同じ変更
+            ("pub value: u32", "pub value: u16"),
+            ("pub value: u32", "pub narrow: u8"),
+            ("pub value: u32", "pub(crate) value: u8"),
+            // 型の入れ替え
+            ("pub value: u8", "pub value: u32"),
+        ] {
+            let new = shape(repr, wide, narrow);
+            assert_eq!(bucket(&old, &new, &[], &[], "Config"), "mod", "{new}");
+        }
+        // 先に書いた側・後に書いた側の削除
+        for new in [
+            format!(
+                "{repr}pub struct Config {{\n    #[cfg(not(feature = \"wide\"))]\n    pub value: u8,\n}}\n"
+            ),
+            format!(
+                "{repr}pub struct Config {{\n    #[cfg(feature = \"wide\")]\n    pub value: u32,\n}}\n"
+            ),
+        ] {
+            assert_eq!(bucket(&old, &new, &[], &[], "Config"), "mod", "{new}");
+        }
+    }
+    let old = shape("", "pub value: u32", "pub value: u8");
+    // signature は両方の設定のフィールドを示す
+    let api = api_changes(
+        &old,
+        &shape("", "pub value: u64", "pub value: u8"),
+        &[],
+        &[],
+    );
+    let change = api
+        .modified
+        .iter()
+        .find(|change| change.name == "Config")
+        .expect("Config is modified");
+    assert_eq!(
+        change.new_signature.as_deref(),
+        Some(
+            "pub struct Config { #[cfg(feature = \"wide\")] pub value: u64, #[cfg(not(feature = \"wide\"))] pub value: u8 }"
+        )
+    );
+    // `cfg_attr` の中の `cfg` で分けても同じ
+    let nested = |wide: &str| {
+        format!(
+            "pub struct Config {{\n    #[cfg_attr(all(), cfg(feature = \"wide\"))]\n    pub value: {wide},\n    #[cfg(not(feature = \"wide\"))]\n    pub value: u8,\n}}\n"
+        )
+    };
+    assert_eq!(
+        bucket(&nested("u32"), &nested("u64"), &[], &[], "Config"),
+        "mod"
+    );
+    // `#[repr]` の無い構造体での並べ替えは変えない
+    assert_eq!(
+        bucket(
+            &old,
+            "pub struct Config {\n    #[cfg(not(feature = \"wide\"))]\n    pub value: u8,\n    #[cfg(feature = \"wide\")]\n    pub value: u32,\n}\n",
+            &[],
+            &[],
+            "Config"
+        ),
+        "none"
+    );
+    // 別の条件の同じ名前の公開フィールドを足すのは、外から構築できる構造体では壊し、できない
+    // 構造体では互換
+    let narrow_added = |hidden: &str| {
+        (
+            format!(
+                "pub struct Config {{\n    #[cfg(feature = \"wide\")]\n    pub value: u32,\n{hidden}}}\n"
+            ),
+            format!(
+                "pub struct Config {{\n    #[cfg(feature = \"wide\")]\n    pub value: u32,\n    #[cfg(not(feature = \"wide\"))]\n    pub value: u8,\n{hidden}}}\n"
+            ),
+        )
+    };
+    for (hidden, expected) in [("", "mod"), ("    hidden: (),\n", "mod_compat")] {
+        let (before, after) = narrow_added(hidden);
+        assert_eq!(
+            bucket(&before, &after, &[], &[], "Config"),
+            expected,
+            "{after}"
+        );
+    }
+    // `repr(C)` の構造体では、`#[cfg]` で分けたフィールドの前へ足すのと、無条件のフィールドとの
+    // 並べ替えは壊し、後へ足すのは (外から構築できなければ) 互換。順は同じ設定に有るフィールド
+    // どうしで比べるので、`#[cfg]` で分けた同じ名前のフィールドの間の並べ替えは変えない
+    let ordered = |fields: &[&str]| {
+        format!(
+            "#[repr(C)]\npub struct Config {{\n{}    hidden: (),\n}}\n",
+            fields.concat()
+        )
+    };
+    let wide = "    #[cfg(feature = \"wide\")]\n    pub value: u32,\n";
+    let narrow = "    #[cfg(not(feature = \"wide\"))]\n    pub value: u8,\n";
+    let extra = "    pub extra: u16,\n";
+    let linux = "    #[cfg(target_os = \"linux\")]\n    pub value: u32,\n";
+    let windows = "    #[cfg(target_os = \"windows\")]\n    pub value: u16,\n";
+    let macos = "    #[cfg(target_os = \"macos\")]\n    pub value: u8,\n";
+    let linux_a = "    #[cfg(target_os = \"linux\")]\n    pub a: u8,\n";
+    let escaped_linux_b = "    #[cfg(target_os = \"\\x6cinux\")]\n    pub b: u32,\n";
+    for (before, after, expected) in [
+        (
+            ordered(&[wide, narrow]),
+            ordered(&[extra, wide, narrow]),
+            "mod",
+        ),
+        (ordered(&[wide, extra]), ordered(&[extra, wide]), "mod"),
+        (
+            ordered(&[wide, extra, narrow]),
+            ordered(&[narrow, extra, wide]),
+            "mod",
+        ),
+        (
+            ordered(&[wide, narrow]),
+            ordered(&[wide, narrow, extra]),
+            "mod_compat",
+        ),
+        (ordered(&[wide, narrow]), ordered(&[narrow, wide]), "none"),
+        (
+            ordered(&[linux, windows, macos]),
+            ordered(&[windows, linux, macos]),
+            "none",
+        ),
+        // 同じ値をエスケープで書いた条件は同じ設定に有るので、その並べ替えは壊す
+        (
+            ordered(&[linux_a, escaped_linux_b]),
+            ordered(&[escaped_linux_b, linux_a]),
+            "mod",
+        ),
+    ] {
+        assert_eq!(
+            bucket(&before, &after, &[], &[], "Config"),
+            expected,
+            "{before}\n=>\n{after}"
+        );
+    }
+    // 同じ名前と条件の公開フィールドが 2 つあれば (旧新のどちらか一方でも)、対応を決められない
+    // ので blocking に残す
+    let twice = |second: &str| {
+        format!(
+            "pub struct Config {{\n    #[cfg(feature = \"wide\")]\n    pub value: u32,\n    #[cfg(feature = \"wide\")]\n    pub value: {second},\n    hidden: (),\n}}\n"
+        )
+    };
+    let once =
+        "pub struct Config {\n    #[cfg(feature = \"wide\")]\n    pub value: u32,\n    hidden: (),\n}\n"
+            .to_owned();
+    for (before, after) in [
+        (twice("u8"), twice("u16")),
+        (twice("u8"), once.clone()),
+        (once, twice("u8")),
+    ] {
+        assert_eq!(
+            bucket(&before, &after, &[], &[], "Config"),
+            "mod",
+            "{before}\n=>\n{after}"
+        );
+    }
+    // 条件の書き換えと、同じ型の分岐を 1 つにまとめる変更は、組が変わるので blocking に残す
+    // (フィールドの `#[cfg]` の変更)
+    for new in [
+        "pub struct Config {\n    #[cfg(any(feature = \"wide\"))]\n    pub value: u32,\n    #[cfg(not(feature = \"wide\"))]\n    pub value: u8,\n}\n".to_owned(),
+        "pub struct Config {\n    pub value: u32,\n}\n".to_owned(),
+    ] {
+        let before = if new.contains("any(") {
+            old.clone()
+        } else {
+            shape("", "pub value: u32", "pub value: u32")
+        };
+        assert_eq!(
+            bucket(&before, &new, &[], &[], "Config"),
+            "mod",
+            "{before}\n=>\n{new}"
+        );
+    }
 }
