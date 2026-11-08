@@ -23,6 +23,10 @@
 //!   構造体 (`repr(Rust)` だけを含む) の名前付きのフィールドの並べ替え、外から構築できない構造体の
 //!   公開でないフィールドの変更 (`repr(C)` でも)
 //!
+//! 名前付きの公開フィールドは、名前と `#[cfg]` の条件の組で対応させる (`#[cfg]` で分けた同じ名前の
+//! フィールドは、それぞれを比べる。Issue #290)。同じ組の公開フィールドが 2 つあれば、対応を
+//! 決められないので blocking に残す。
+//!
 //! 寿命の境界は、フィールドの参照から推論されるもの (公開でないフィールドからも。cfg の付いた
 //! フィールドからのものは条件付き) を合わせて比べ、推論されるものは signature に
 //! `/* implied: .. */` として示す。推論は組み込みの型 (参照・ポインタ・タプル・配列・スライス) だけを
@@ -43,7 +47,7 @@ use tree_sitter::Node;
 
 use crate::engine::tree_walk::{Children, Walk, walk_preorder};
 
-use super::rust_cfg_predicate::{Atoms, effective_repr};
+use super::rust_cfg_predicate::{Atoms, Predicate, effective_repr};
 use super::rust_type_api::*;
 
 /// 構造体 1 つの公開の形。
@@ -213,8 +217,7 @@ impl RustStructShape {
 
     /// 既定でない表現になる設定がある (`repr(Rust)` は既定の表現)。フィールドの順をレイアウトの約束と
     /// みなすかに使う。`align`・`packed` だけや `repr(transparent)` は Rust の参照では順を約束しないが、
-    /// `#[cfg]` で分けた同じ名前の公開フィールドを名前だけで対応させている間 (Issue #290) は、その
-    /// 変更を順の違いで捉えられるよう、順を約束するものとして扱う。
+    /// 今は順を約束するものとして扱う (絞るのは Issue #293)。
     fn has_repr(&self) -> bool {
         let mut atoms = Atoms::default();
         let reprs = atoms.reprs(&self.layout);
@@ -224,9 +227,9 @@ impl RustStructShape {
         configs.any(|config| !effective_repr(&reprs, config).is_empty())
     }
 
-    /// API の signature として出す表示。名前付きの公開フィールドは名前の順 (`#[repr]` が効く設定のある
-    /// 構造体は宣言の順)、タプルは最後の公開フィールドまでの位置 (公開でないものは `_`) を示し、残りの
-    /// 公開でないフィールドは `..` で示す。
+    /// API の signature として出す表示。名前付きの公開フィールドは名前と `#[cfg]` の条件の順
+    /// (`#[repr]` が効く設定のある構造体は宣言の順)、タプルは最後の公開フィールドまでの位置
+    /// (公開でないものは `_`) を示し、残りの公開でないフィールドは `..` で示す。
     pub(crate) fn signature(&self) -> String {
         let mut out = String::new();
         for attribute in &self.attributes {
@@ -271,7 +274,7 @@ impl RustStructShape {
                 out.push_str(&where_text);
                 let mut public: Vec<&Field> = self.fields.iter().filter(|f| f.public).collect();
                 if !self.has_repr() {
-                    public.sort_by(|a, b| a.key.cmp(&b.key));
+                    public.sort_by_key(|field| public_key(field));
                 }
                 let mut parts: Vec<String> = public
                     .iter()
@@ -315,6 +318,88 @@ impl RustStructShape {
         }
         out
     }
+}
+
+/// 名前付きの公開フィールドを旧新で対応させる鍵 (名前と `#[cfg]` の条件)。
+type PublicKey = (FieldKey, Vec<Vec<String>>);
+
+fn public_key(field: &Field) -> PublicKey {
+    (field.key.clone(), condition_keys(&field.conditions))
+}
+
+/// 名前付きの公開フィールドの鍵から、宣言の位置へ。同じ鍵の公開フィールドが 2 つあれば、どれと
+/// どれが対応するかを決められないので None。
+fn public_fields(shape: &RustStructShape) -> Option<BTreeMap<PublicKey, usize>> {
+    let mut public = BTreeMap::new();
+    for (index, field) in shape.fields.iter().enumerate() {
+        if field.public && public.insert(public_key(field), index).is_some() {
+            return None;
+        }
+    }
+    Some(public)
+}
+
+/// `#[repr]` の構造体の公開フィールドの順を、`#[cfg]` の原子の真偽の組み合わせ (設定) ごとに、その
+/// 設定に同時に有るフィールドどうしで比べる (`#[cfg]` で分けた同じ名前のフィールドは同じ設定に
+/// 有らないので、その間の並べ替えはどの設定の順も変えない)。旧い公開フィールド (`old_public`) の
+/// 並びが同じで、足した公開フィールドが旧い公開フィールドより前に無ければ true。同じ名前の
+/// フィールドが 2 つ有る設定はビルドできないので、旧版でそうなら比べず、新版だけでそうなら壊す
+/// ものとする。原子が多すぎれば false。
+fn same_public_order(
+    old: &RustStructShape,
+    new: &RustStructShape,
+    old_public: &BTreeMap<PublicKey, usize>,
+) -> bool {
+    let mut atoms = Atoms::default();
+    let mut presence = |shape: &RustStructShape| -> Vec<Predicate> {
+        shape
+            .fields
+            .iter()
+            .map(|field| atoms.present(&field.conditions))
+            .collect()
+    };
+    let (old_presence, new_presence) = (presence(old), presence(new));
+    let Some(configs) = atoms.configs() else {
+        return false;
+    };
+    // 設定 `config` で有る公開フィールドの鍵 (宣言の順)。同じ名前のフィールドが 2 つ有れば None。
+    let present = |shape: &RustStructShape, presence: &[Predicate], config: u64| {
+        let mut names = BTreeSet::new();
+        let mut keys = Vec::new();
+        for (field, predicate) in shape.fields.iter().zip(presence) {
+            if !predicate.holds(config) {
+                continue;
+            }
+            if !names.insert(&field.key) {
+                return None;
+            }
+            if field.public {
+                keys.push(public_key(field));
+            }
+        }
+        Some(keys)
+    };
+    for config in configs {
+        let Some(old_keys) = present(old, &old_presence, config) else {
+            continue;
+        };
+        let Some(new_keys) = present(new, &new_presence, config) else {
+            return false;
+        };
+        let kept = |key: &&PublicKey| old_public.contains_key(*key);
+        if !old_keys.iter().eq(new_keys.iter().filter(kept)) {
+            return false;
+        }
+        let last_kept = new_keys.iter().rposition(|key| kept(&key));
+        let inserted_before = new_keys
+            .iter()
+            .enumerate()
+            .any(|(index, key)| !kept(&key) && last_kept.is_some_and(|last| index < last));
+        if inserted_before {
+            return false;
+        }
+    }
+    true
 }
 
 /// 旧新の公開の形を比べる。
@@ -384,16 +469,12 @@ pub(crate) fn classify(old: &RustStructShape, new: &RustStructShape) -> ShapeCha
     let mut added = false;
     match (old.form, new.form) {
         (Form::Named, Form::Named) => {
-            let public = |shape: &'_ RustStructShape| -> BTreeMap<FieldKey, usize> {
-                shape
-                    .fields
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, field)| field.public)
-                    .map(|(index, field)| (field.key.clone(), index))
-                    .collect()
+            // 名前と `#[cfg]` の条件の組で対応させる (`#[cfg]` で分けた同じ名前のフィールドを、
+            // 後のものが前のものを隠さないように。Issue #290)。
+            let (Some(old_public), Some(new_public)) = (public_fields(old), public_fields(new))
+            else {
+                return Breaking;
             };
-            let (old_public, new_public) = (public(old), public(new));
             for (key, &old_index) in &old_public {
                 let Some(&new_index) = new_public.get(key) else {
                     return Breaking;
@@ -406,27 +487,8 @@ pub(crate) fn classify(old: &RustStructShape, new: &RustStructShape) -> ShapeCha
             // `#[repr]` の構造体は、公開フィールドの順もレイアウトの約束 (公開でないフィールドの
             // 変更は Cargo の手引きでも互換)。足す公開フィールドは、ほかのフィールドのレイアウトを
             // 変えないよう、旧い公開フィールドの後に置く必要がある (`repr-c-private-change`)。
-            if old_layout && new_layout {
-                let order = |shape: &RustStructShape| -> Vec<FieldKey> {
-                    shape
-                        .fields
-                        .iter()
-                        .filter(|field| field.public && old_public.contains_key(&field.key))
-                        .map(|field| field.key.clone())
-                        .collect()
-                };
-                let last_kept = new
-                    .fields
-                    .iter()
-                    .rposition(|field| field.public && old_public.contains_key(&field.key));
-                let inserted_before = new.fields.iter().enumerate().any(|(index, field)| {
-                    field.public
-                        && !old_public.contains_key(&field.key)
-                        && last_kept.is_some_and(|last| index < last)
-                });
-                if order(old) != order(new) || inserted_before {
-                    return Breaking;
-                }
+            if old_layout && new_layout && !same_public_order(old, new, &old_public) {
+                return Breaking;
             }
         }
         (Form::Tuple, Form::Tuple) => {
