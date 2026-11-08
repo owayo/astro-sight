@@ -222,6 +222,10 @@ fn extract_exported_file_facts_from_source(
     }
     let utf8_path = camino::Utf8Path::new(file_path);
     let lang_id = parser::detect_lang(utf8_path, source).ok()?;
+    // 旧版の `stripInternal` の判定を決められなかったファイルは、残すと決めた項目の `@internal` を
+    // 読まない (Issue #288。位置は変わらない)。
+    let view = strip_internal.view(true, file_path, lang_id, source);
+    let source: &[u8] = &view;
     let tree = parser::parse_source(source, lang_id).ok()?;
     let root = tree.root_node();
 

@@ -3,7 +3,9 @@
 //! `stripInternal` の旧版の評価は、旧版のソースを旧版の設定で読む。base の版では、Git のルートの
 //! 中で追跡したパスを base の tree から読み、base に無い設定を作業ツリーで補わない。Git のルートの
 //! 外 (モノレポの外の共通の設定) と node_modules の下 (追跡しない依存) は、旧新で共通の今の
-//! ファイルシステムから読む (依存の過去の状態は再現しない)。
+//! ファイルシステムから読む (依存の過去の状態は再現しない)。base の tree の symlink と submodule は、
+//! checkout では先のファイルやディレクトリになるので、それとその下はある・無いを確かめられない
+//! ものとする (Issue #288)。
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -42,8 +44,11 @@ pub(crate) struct BaseTree {
     files: HashSet<String>,
     /// ディレクトリ (root 相対。root は空文字) → 子の名前。
     directories: HashMap<String, HashSet<String>>,
+    /// symlink と submodule (root 相対)。checkout では先のファイルやディレクトリになるので、それと
+    /// その下はある・無いを確かめられない (Issue #288)。名前はディレクトリの子に入れる。
+    special: HashSet<String>,
     /// 大文字小文字を区別しないファイルシステムのための、小文字にしたパス → tree のパス (ファイル
-    /// とディレクトリ)。
+    /// ・ディレクトリ・symlink・submodule)。
     folded: HashMap<String, String>,
     /// root を cwd にした base の blob の読み手 (root 相対のパスで読む)。
     blobs: crate::commands::git_input::GitBlobBatch,
@@ -65,6 +70,7 @@ impl BaseTree {
             MAX_LISTING_BYTES,
         )?;
         let mut files = HashSet::new();
+        let mut special = HashSet::new();
         let mut directories: HashMap<String, HashSet<String>> = HashMap::new();
         directories.insert(String::new(), HashSet::new());
         for entry in listing.split(|byte| *byte == 0) {
@@ -74,9 +80,10 @@ impl BaseTree {
             let entry = std::str::from_utf8(entry).ok()?;
             let (meta, path) = entry.split_once('\t')?;
             let mode = meta.split(' ').next()?;
-            // 通常のファイル (100644・100755) だけ。symlink (120000) と submodule (160000) は
-            // 通常のファイルとして読まない。
-            if !mode.starts_with("100") {
+            // 通常のファイル (100644・100755) だけを読む。symlink (120000) と submodule (160000) は
+            // 名前だけを親のディレクトリに入れ、ある・無いを確かめられないものにする。
+            let regular = mode.starts_with("100");
+            if !regular && !matches!(mode, "120000" | "160000") {
                 continue;
             }
             let parts: Vec<&str> = path.split('/').collect();
@@ -96,17 +103,23 @@ impl BaseTree {
                 }
                 parent = child;
             }
-            files.insert(path.to_owned());
+            if regular {
+                files.insert(path.to_owned());
+            } else {
+                special.insert(path.to_owned());
+            }
         }
         let folded = files
             .iter()
             .chain(directories.keys())
+            .chain(&special)
             .map(|path| (path.to_lowercase(), path.clone()))
             .collect();
         Some(Self {
             root,
             files,
             directories,
+            special,
             folded,
             blobs: crate::commands::git_input::GitBlobBatch::new(&top, rev),
         })
@@ -119,13 +132,41 @@ impl BaseTree {
         if !(cfg!(windows) || cfg!(target_os = "macos"))
             || self.files.contains(&relative)
             || self.directories.contains_key(&relative)
+            || self.special.contains(&relative)
         {
             return relative;
         }
-        self.folded
-            .get(&relative.to_lowercase())
-            .cloned()
-            .unwrap_or(relative)
+        if let Some(spelled) = self.folded.get(&relative.to_lowercase()) {
+            return spelled.clone();
+        }
+        // symlink・submodule の下のパスは、その綴りにそろえる (確かめられないものと分かるように)。
+        let mut end = relative.len();
+        while let Some(slash) = relative[..end].rfind('/') {
+            end = slash;
+            if let Some(spelled) = self.folded.get(&relative[..end].to_lowercase())
+                && self.special.contains(spelled)
+            {
+                return format!("{spelled}{}", &relative[end..]);
+            }
+        }
+        relative
+    }
+
+    /// `relative` が symlink・submodule か、その下か (ある・無いを確かめられない)。
+    fn is_special(&self, relative: &str) -> bool {
+        if self.special.is_empty() {
+            return false;
+        }
+        let mut end = relative.len();
+        loop {
+            if self.special.contains(&relative[..end]) {
+                return true;
+            }
+            match relative[..end].rfind('/') {
+                Some(slash) => end = slash,
+                None => return false,
+            }
+        }
     }
 
     /// `path` が base の tree から読む場所なら、root 相対のパス。root の外と node_modules の下は
@@ -158,28 +199,32 @@ impl ConfigFs {
         }
     }
 
-    /// symlink でない通常のファイルがあるか。読めないときは None。
+    /// symlink でない通常のファイルがあるか。symlink か、読めないときは None。
     pub(crate) fn is_regular_file(&self, path: &Path) -> Option<bool> {
         match self.base(path) {
-            Some((tree, relative)) => Some(tree.files.contains(&relative)),
+            Some((tree, relative)) => {
+                (!tree.is_special(&relative)).then(|| tree.files.contains(&relative))
+            }
             None => super::is_regular_file(path),
         }
     }
 
-    /// symlink でないディレクトリがあるか。読めないときは None。
+    /// symlink でないディレクトリがあるか。symlink か、読めないときは None。
     pub(crate) fn is_directory(&self, path: &Path) -> Option<bool> {
         match self.base(path) {
-            Some((tree, relative)) => Some(tree.directories.contains_key(&relative)),
+            Some((tree, relative)) => {
+                (!tree.is_special(&relative)).then(|| tree.directories.contains_key(&relative))
+            }
             None => super::is_directory(path),
         }
     }
 
-    /// 正規化したパス。base の tree の中は、あるファイルかディレクトリだけ (symlink は tree に
-    /// 通常のファイルとして入らない)。無ければ None。
+    /// 正規化したパス。base の tree の中は、あるファイルかディレクトリだけ (symlink と submodule
+    /// とその下は確かめられない)。無ければ None。
     pub(crate) fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
         match self.base(path) {
-            Some((tree, relative)) => (tree.files.contains(&relative)
-                || tree.directories.contains_key(&relative))
+            Some((tree, relative)) => (!tree.is_special(&relative)
+                && (tree.files.contains(&relative) || tree.directories.contains_key(&relative)))
             .then(|| {
                 relative
                     .split('/')
@@ -216,6 +261,9 @@ impl ConfigFs {
     /// ディレクトリの子の名前。
     pub(crate) fn read_dir(&self, directory: &Path) -> Listing {
         if let Some((tree, relative)) = self.base(directory) {
+            if tree.is_special(&relative) {
+                return Listing::Unreadable;
+            }
             return match tree.directories.get(&relative) {
                 Some(names) => Listing::Entries(names.iter().cloned().collect()),
                 None => Listing::Missing,

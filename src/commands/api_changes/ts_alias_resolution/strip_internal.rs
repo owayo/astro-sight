@@ -1,13 +1,14 @@
 //! ファイルに当たる TypeScript の `stripInternal` の設定 (Issue #274)。
 //!
 //! ファイルから近いディレクトリの順に、tsconfig*.json / jsconfig*.json を見る。ファイルを入力に
-//! 含む設定 (`files`・`include`・`exclude` の実効値。`extends` で継いだものも) のあるディレクトリで
-//! 決め、そのどれかが実効で `stripInternal` を有効にすれば有効とする (宣言は `tsconfig.build.json`
-//! のような別名の設定で出すことが多い)。ファイルを入力に含まない設定は、判定を止めず、数えも
-//! しない。設定は入力から import で取り込んだファイルの宣言も出すが、TypeScript と同じ解決で
-//! 取り込むと確かめられなければ、宣言ファイルに残るとみなす (消えるとみなすと、宣言ファイルに残る
-//! 公開の宣言の削除を見逃す)。`"files": ["src/index.ts"]` のような入口だけを書いた出力の設定が
-//! import で取り込むファイルには、その設定の `stripInternal` をまだ当てない。
+//! 含む設定 (`files`・`include`・`exclude` の実効値。`extends` で継いだものも。`exclude` が無ければ
+//! `outDir`・`declarationDir` を除く) のあるディレクトリで決め、そのどれかが実効で `stripInternal` を
+//! 有効にすれば有効とする (宣言は `tsconfig.build.json` のような別名の設定で出すことが多い)。
+//! 設定は入力から import で取り込んだファイルの宣言も出すので、TypeScript と同じ解決で取り込むと
+//! 確かめられたファイルも入力と同じく数える (Issue #288。[`reach`])。ファイルを入力に含まず、
+//! 取り込まないと確かめられた設定は、判定を止めず、数えもしない。取り込むかを確かめられない設定は、
+//! 消えるとはみなさず (宣言ファイルに残る公開の宣言の削除を見逃さない)、判定を決められない
+//! ([`StripState::Unknown`]) ものとする。
 //!
 //! `stripInternal` の実効値は、設定自身の値、配列の `extends` の後ろの設定、前の設定の順に決まり、
 //! `null` は既定 (無効) に戻す。読めない・解けない設定は、ファイルを含み得るものとして扱い、
@@ -15,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use serde_json::{Map, Value};
 
@@ -22,6 +24,9 @@ use super::config_fs::{ConfigFs, Listing};
 use super::{
     ConfigLoader, MAX_ANCESTORS, MAX_CHAIN_DEPTH, is_config_name, normalize_lexically, option_path,
 };
+
+mod reach;
+pub(crate) use reach::imports_differ;
 
 /// TypeScript がワイルドカードで辿らないディレクトリ。
 const PACKAGE_FOLDERS: [&str; 3] = ["node_modules", "bower_components", "jspm_packages"];
@@ -47,6 +52,47 @@ pub(crate) struct StripInternalConfigs {
     inputs: HashMap<PathBuf, Option<Inputs>>,
     /// 設定 → `stripInternal` の実効値 (読めない・解けなければ None)。
     strips: HashMap<PathBuf, Option<bool>>,
+    /// 設定 → 入力から取り込みを辿ったファイル (Issue #288)。
+    graphs: HashMap<PathBuf, Rc<reach::Graph>>,
+    /// グラフで共有する読み取り (ソースの取り込み・存在・package.json)。
+    reach: reach::ReachCache,
+}
+
+/// 判定に数える設定 1 つ。
+struct Candidate {
+    config: PathBuf,
+    membership: Membership,
+    setting: Option<bool>,
+}
+
+/// 設定 1 つがファイルを含むときの判定 ((有効にするか, [`StripState`]))。
+fn outcome(membership: Membership, setting: Option<bool>) -> (bool, StripState) {
+    let state = match (membership, setting) {
+        (Membership::Includes, Some(true)) => StripState::Strips,
+        (_, Some(false)) => StripState::Keeps,
+        _ => StripState::Unknown,
+    };
+    (setting == Some(true), state)
+}
+
+/// 同じディレクトリの設定の判定を合わせる (どれかが有効にすれば有効)。
+fn combine(outcomes: &[(bool, StripState)]) -> Option<(bool, StripState)> {
+    outcomes
+        .iter()
+        .copied()
+        .reduce(|(strips, state), (other, other_state)| {
+            (strips || other, stronger(state, other_state))
+        })
+}
+
+/// 合わせた判定: 有効にするものがあれば有効、無ければ決められないものがあれば決められない。
+fn stronger(a: StripState, b: StripState) -> StripState {
+    let rank = |state: StripState| match state {
+        StripState::Keeps => 0,
+        StripState::Unknown => 1,
+        StripState::Strips => 2,
+    };
+    if rank(a) >= rank(b) { a } else { b }
 }
 
 impl StripInternalConfigs {
@@ -67,6 +113,8 @@ impl StripInternalConfigs {
             directories: HashMap::new(),
             inputs: HashMap::new(),
             strips: HashMap::new(),
+            graphs: HashMap::new(),
+            reach: reach::ReachCache::default(),
         }
     }
 
@@ -84,14 +132,21 @@ impl StripInternalConfigs {
     }
 
     /// ([`Self::strips`] の値, [`Self::strips_state`] の値)。
+    ///
+    /// 入力に含まない設定は、取り込みで届くと確かめられれば入力と同じく数え、届かないと確かめ
+    /// られれば数えない (Issue #288)。届くかを確かめられない設定は、届く場合と届かない場合の
+    /// どちらの判定もあり得るものとし、どちらでも有効にするときだけ有効、判定が分かれれば決め
+    /// られないとする。取り込みを辿るのは、届けば判定が変わり得るときだけ。
     fn evaluate(&mut self, path: &str) -> (bool, StripState) {
         let Some(file) = self.root.as_ref().map(|root| root.join(path)) else {
             return (false, StripState::Unknown);
         };
-        let Some(start) = file.parent() else {
+        let Some(start) = file.parent().map(Path::to_path_buf) else {
             return (false, StripState::Unknown);
         };
         let target = components(&file);
+        // 近いディレクトリから、ファイルを入力に含む (か分からない) 設定のあるディレクトリまで。
+        let mut levels: Vec<Vec<Candidate>> = Vec::new();
         for (depth, directory) in start.ancestors().enumerate() {
             if depth > MAX_ANCESTORS {
                 return (false, StripState::Unknown);
@@ -99,38 +154,125 @@ impl StripInternalConfigs {
             let Some(configs) = self.directory_configs(directory) else {
                 return (false, StripState::Unknown);
             };
-            let mut decided: Option<(bool, StripState)> = None;
+            let mut level = Vec::new();
             for config in configs {
                 let membership = self.membership(&config, &target);
-                if matches!(membership, Membership::Excludes) {
-                    continue;
-                }
                 let setting = self.config_strips(&config);
-                let strips = setting == Some(true);
-                let state = match (membership, setting) {
-                    (Membership::Includes, Some(true)) => StripState::Strips,
-                    (_, Some(false)) => StripState::Keeps,
-                    _ => StripState::Unknown,
-                };
-                decided = Some(match decided {
-                    None => (strips, state),
-                    Some((previous, previous_state)) => (
-                        previous || strips,
-                        match (previous_state, state) {
-                            (StripState::Strips, _) | (_, StripState::Strips) => StripState::Strips,
-                            (StripState::Unknown, _) | (_, StripState::Unknown) => {
-                                StripState::Unknown
-                            }
-                            _ => StripState::Keeps,
-                        },
-                    ),
+                level.push(Candidate {
+                    config,
+                    membership,
+                    setting,
                 });
             }
-            if let Some(decided) = decided {
-                return decided;
+            let decides = level
+                .iter()
+                .any(|candidate| !matches!(candidate.membership, Membership::Excludes));
+            levels.push(level);
+            if decides {
+                break;
             }
         }
-        (false, StripState::Keeps)
+        // 入力だけで決めた判定。どの設定がファイルを含むとしても同じ判定になるなら、取り込みを
+        // 辿らない。
+        let baseline = levels
+            .last()
+            .and_then(|level| {
+                let outcomes: Vec<_> = level
+                    .iter()
+                    .filter(|candidate| !matches!(candidate.membership, Membership::Excludes))
+                    .map(|candidate| outcome(candidate.membership, candidate.setting))
+                    .collect();
+                combine(&outcomes)
+            })
+            .unwrap_or((false, StripState::Keeps));
+        let alone = |candidate: &Candidate| {
+            let membership = match candidate.membership {
+                Membership::Excludes => Membership::Includes,
+                membership => membership,
+            };
+            outcome(membership, candidate.setting)
+        };
+        if levels
+            .iter()
+            .flatten()
+            .all(|candidate| alone(candidate) == baseline)
+        {
+            return baseline;
+        }
+        let canonical = self
+            .loader
+            .fs
+            .canonicalize(&file)
+            .unwrap_or_else(|| file.clone());
+        let mut reaches = HashMap::new();
+        for candidate in levels.iter().flatten() {
+            if matches!(candidate.membership, Membership::Excludes)
+                && !reaches.contains_key(&candidate.config)
+            {
+                let reach = self.graph(&candidate.config).reach(&canonical);
+                reaches.insert(candidate.config.clone(), reach);
+            }
+        }
+        // 届くかを確かめられない設定ごとに、届く場合と届かない場合の判定を集める。
+        let mut states = Vec::new();
+        let mut strips = true;
+        let mut settled = false;
+        for level in &levels {
+            let mut definite = Vec::new();
+            let mut maybe = Vec::new();
+            for candidate in level {
+                match candidate.membership {
+                    Membership::Excludes => match reaches.get(&candidate.config) {
+                        Some(reach::Reach::Reached) => {
+                            definite.push(outcome(Membership::Includes, candidate.setting));
+                        }
+                        Some(reach::Reach::Unknown) => {
+                            maybe.push(outcome(Membership::Includes, candidate.setting));
+                        }
+                        _ => {}
+                    },
+                    membership => definite.push(outcome(membership, candidate.setting)),
+                }
+            }
+            if let Some(decided) = combine(&definite) {
+                states.push(decided.1);
+                states.extend(maybe.iter().map(|(_, state)| stronger(decided.1, *state)));
+                strips &= decided.0;
+                settled = true;
+                break;
+            }
+            for (maybe_strips, state) in maybe {
+                states.push(state);
+                strips &= maybe_strips;
+            }
+        }
+        if !settled {
+            states.push(StripState::Keeps);
+            strips = false;
+        }
+        let state = if states.windows(2).all(|pair| pair[0] == pair[1]) {
+            states[0]
+        } else {
+            StripState::Unknown
+        };
+        (strips, state)
+    }
+
+    /// 設定 `config` の入力から取り込みを辿ったファイル (初めて要るときに作る)。
+    fn graph(&mut self, config: &Path) -> Rc<reach::Graph> {
+        if let Some(graph) = self.graphs.get(config) {
+            return Rc::clone(graph);
+        }
+        let options = reach::Options::read(&mut self.loader, config);
+        let graph = match (self.inputs.get(config).and_then(Option::as_ref), options) {
+            (Some(inputs), Some(options)) => {
+                reach::build(&self.loader.fs, inputs, &options, &mut self.reach)
+            }
+            _ => reach::Graph::unknown(),
+        };
+        let graph = Rc::new(graph);
+        self.graphs.insert(config.to_path_buf(), Rc::clone(&graph));
+        graph
     }
 
     fn directory_configs(&mut self, directory: &Path) -> Option<Vec<PathBuf>> {
@@ -145,7 +287,15 @@ impl StripInternalConfigs {
         let loader = &mut self.loader;
         let inputs = self.inputs.entry(config.to_path_buf()).or_insert_with(|| {
             let raw = loader.raw_inputs(config, 0, &mut Vec::new())?;
-            Inputs::resolve(raw, config.parent()?)
+            let leaf = config.parent()?;
+            // `exclude` をどこにも書いていなければ、TypeScript は `outDir`・`declarationDir` を
+            // 除く。
+            let outputs = if raw.exclude.is_none() {
+                loader.output_directories(config, leaf)?
+            } else {
+                Vec::new()
+            };
+            Inputs::resolve(raw, leaf, &outputs)
         });
         match inputs {
             Some(inputs) => inputs.membership(target),
@@ -188,6 +338,7 @@ fn read_directory_configs(fs: &ConfigFs, directory: &Path) -> Option<Vec<PathBuf
 }
 
 /// 設定がファイルを入力に含むか。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Membership {
     Includes,
     Excludes,
@@ -203,6 +354,17 @@ enum Setting {
     /// `null` で既定に戻した。
     Reset,
     Value(bool),
+}
+
+/// `compilerOptions` の値の、継承を辿った結果。
+#[derive(Clone, Debug, PartialEq)]
+enum OptionSetting {
+    /// どこにも書いていない。
+    Unset,
+    /// `null` で既定に戻した。
+    Reset,
+    /// 値と、それを書いた設定のディレクトリ。
+    Value(Value, PathBuf),
 }
 
 /// 書いたままの入力の指定と、それを書いた設定のディレクトリ。`None` は書いていない。
@@ -222,9 +384,10 @@ struct Inputs {
 
 impl Inputs {
     /// TypeScript と同じく、`files` も `include` も書いていなければ `include` は設定のある
-    /// ディレクトリの `**/*`、`files` だけなら `include` は無い。`${configDir}` は入力を決める
+    /// ディレクトリの `**/*`、`files` だけなら `include` は無い。`exclude` が無ければ出力の
+    /// ディレクトリ `outputs` (`outDir`・`declarationDir`) を除く。`${configDir}` は入力を決める
     /// 設定 (`leaf`) のディレクトリで解く。
-    fn resolve(raw: RawInputs, leaf: &Path) -> Option<Self> {
+    fn resolve(raw: RawInputs, leaf: &Path, outputs: &[PathBuf]) -> Option<Self> {
         let files = match &raw.files {
             Some(specs) => specs
                 .iter()
@@ -241,13 +404,38 @@ impl Inputs {
         };
         let exclude = match &raw.exclude {
             Some(specs) => patterns(specs, leaf, true)?,
-            None => Vec::new(),
+            // 出力のディレクトリは、その下の全てを除く (`exclude` のパターンはディレクトリの下にも
+            // 当たる)。
+            None => outputs.iter().map(|output| components(output)).collect(),
         };
         Some(Self {
             files,
             include,
             exclude,
         })
+    }
+
+    /// `include` に当たり、`exclude` に当たらないか (TypeScript がディレクトリを辿って入力に
+    /// 列挙するファイル。拡張子は呼び出し側で見る)。
+    fn wildcard_includes(&self, target: &[String]) -> bool {
+        self.include
+            .iter()
+            .any(|pattern| pattern_matches(pattern, target, false))
+            && !self.excludes(target)
+    }
+
+    /// `exclude` に当たるか (ディレクトリなら、その下の全て)。
+    fn excludes(&self, target: &[String]) -> bool {
+        self.exclude
+            .iter()
+            .any(|pattern| pattern_matches(pattern, target, true))
+    }
+
+    /// ディレクトリ `directory` の下に、`include` に当たり得るファイルがあるか。
+    fn may_descend(&self, directory: &[String]) -> bool {
+        self.include
+            .iter()
+            .any(|pattern| pattern_may_descend(pattern, directory))
     }
 
     fn membership(&self, target: &[String]) -> Membership {
@@ -328,31 +516,58 @@ fn pattern_matches(pattern: &[String], target: &[String], exclude: bool) -> bool
     let Some((name, target_rest)) = target.split_first() else {
         return false;
     };
-    component_matches(first, name, exclude) && pattern_matches(rest, target_rest, exclude)
+    component_matches(first, name, exclude, rest.is_empty())
+        && pattern_matches(rest, target_rest, exclude)
+}
+
+/// `include` のパターン `pattern` が、ディレクトリ `directory` の下のファイルに当たり得るか
+/// ([`pattern_matches`] と同じく、`**` は `.` で始まるディレクトリとパッケージのディレクトリを辿ら
+/// ない)。
+fn pattern_may_descend(pattern: &[String], directory: &[String]) -> bool {
+    let Some((name, below)) = directory.split_first() else {
+        return !pattern.is_empty();
+    };
+    let Some((first, rest)) = pattern.split_first() else {
+        return false;
+    };
+    if first == "**" {
+        if pattern_may_descend(rest, directory) {
+            return true;
+        }
+        if name.starts_with('.') || is_package_folder(name) {
+            return false;
+        }
+        return pattern_may_descend(pattern, below);
+    }
+    component_matches(first, name, false, false) && pattern_may_descend(rest, below)
 }
 
 /// パターンの区切り 1 つが名前に当たるか。`include` では、ワイルドカードのある区切りはパッケージの
-/// ディレクトリに当たらず、先頭の `*`・`?` は `.` で始まる名前の先頭に当たらない。
-fn component_matches(pattern: &str, name: &str, exclude: bool) -> bool {
+/// ディレクトリに当たらず、先頭の `*`・`?` は `.` で始まる名前の先頭に当たらない。`include` の
+/// 最後の区切り (`last`) の `*` は、TypeScript と同じく末尾の `.min.js` の `.` に当たらない
+/// (`*.js` は `a.min.js` に当たらず、`*.min.js` は当たる)。
+fn component_matches(pattern: &str, name: &str, exclude: bool, last: bool) -> bool {
     if !pattern.contains(['*', '?']) {
         return same_name(pattern, name);
     }
+    let files = !exclude && last;
     if !exclude {
         if is_package_folder(name) {
             return false;
         }
         if name.starts_with('.') {
             return match pattern.strip_prefix('*') {
-                Some(rest) => wildcard_matches(rest, name),
-                None => !pattern.starts_with('?') && wildcard_matches(pattern, name),
+                Some(rest) => wildcard_matches(rest, name, files),
+                None => !pattern.starts_with('?') && wildcard_matches(pattern, name, files),
             };
         }
     }
-    wildcard_matches(pattern, name)
+    wildcard_matches(pattern, name, files)
 }
 
-/// `*` (任意の文字列) と `?` (任意の 1 文字) のパターンが、名前の全体に当たるか。
-fn wildcard_matches(pattern: &str, name: &str) -> bool {
+/// `*` (任意の文字列) と `?` (任意の 1 文字) のパターンが、名前の全体に当たるか。`min_js` なら、
+/// `*` は末尾の `.min.js` の `.` に当たらない。
+fn wildcard_matches(pattern: &str, name: &str, min_js: bool) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let name: Vec<char> = name.chars().collect();
     let (mut p, mut n) = (0, 0);
@@ -368,6 +583,16 @@ fn wildcard_matches(pattern: &str, name: &str) -> bool {
                 n += 1;
             }
             _ => match star {
+                Some((_, star_n))
+                    if min_js
+                        && name.len() - star_n == ".min.js".len()
+                        && name[star_n..]
+                            .iter()
+                            .zip(".min.js".chars())
+                            .all(|(actual, expected)| same_char(expected, *actual)) =>
+                {
+                    return false;
+                }
                 Some((star_p, star_n)) => {
                     star = Some((star_p, star_n + 1));
                     p = star_p + 1;
@@ -417,6 +642,67 @@ fn extended_names(raw: &Map<String, Value>) -> Option<Vec<String>> {
 }
 
 impl ConfigLoader {
+    /// `canonical` の設定の `compilerOptions` の `key`。[`Self::strip_setting`] と同じく、設定自身の
+    /// 値が最も優先し、配列の `extends` は後ろの設定が優先する (`null` も前の値を打ち消す)。読めない・
+    /// 解けなければ None。
+    fn option_setting(
+        &mut self,
+        canonical: &Path,
+        key: &str,
+        depth: usize,
+        visiting: &mut Vec<PathBuf>,
+    ) -> Option<OptionSetting> {
+        if depth > MAX_CHAIN_DEPTH || visiting.iter().any(|path| path == canonical) {
+            return None;
+        }
+        let raw = self.read(canonical)?;
+        let directory = canonical.parent()?.to_path_buf();
+        if let Some(options) = raw.get("compilerOptions") {
+            match options.as_object()?.get(key) {
+                None => {}
+                Some(Value::Null) => return Some(OptionSetting::Reset),
+                Some(value) => return Some(OptionSetting::Value(value.clone(), directory)),
+            }
+        }
+        // `jsconfig.json` は `allowJs` を既定で有効にし (TypeScript の `getDefaultCompilerOptions`)、
+        // その既定は継いだ設定の値より優先する。
+        if key == "allowJs"
+            && canonical
+                .file_name()
+                .is_some_and(|name| name == "jsconfig.json")
+        {
+            return Some(OptionSetting::Value(Value::Bool(true), directory));
+        }
+        let parents = extended_names(&raw)?;
+        visiting.push(canonical.to_path_buf());
+        let mut setting = Some(OptionSetting::Unset);
+        for parent in parents.iter().rev() {
+            let inherited = self
+                .extended_path(&directory, parent, Path::new(""))
+                .and_then(|path| self.option_setting(&path, key, depth + 1, visiting));
+            if inherited != Some(OptionSetting::Unset) {
+                setting = inherited;
+                break;
+            }
+        }
+        visiting.pop();
+        setting
+    }
+
+    /// `canonical` の設定 (ディレクトリ `leaf`) の出力のディレクトリ (`outDir`・`declarationDir`)。
+    /// 文字列でない値は TypeScript と同じく使わない。読めない・解けなければ None。
+    fn output_directories(&mut self, canonical: &Path, leaf: &Path) -> Option<Vec<PathBuf>> {
+        let mut outputs = Vec::new();
+        for key in ["outDir", "declarationDir"] {
+            if let OptionSetting::Value(Value::String(text), directory) =
+                self.option_setting(canonical, key, 0, &mut Vec::new())?
+            {
+                outputs.push(normalize_lexically(&option_path(&text, &directory, leaf)?)?);
+            }
+        }
+        Some(outputs)
+    }
+
     /// `canonical` の設定の `stripInternal`。設定自身の値が最も優先し、配列の `extends` は
     /// 後ろの設定が優先する (`null` も前の値を打ち消す)。読めない・解けなければ None。
     fn strip_setting(
@@ -558,10 +844,16 @@ mod tests {
 
     #[test]
     fn wildcards_match_whole_names() {
-        assert!(wildcard_matches("*.ts", "lib.ts"));
-        assert!(wildcard_matches("*.test.ts", "a.test.ts"));
-        assert!(!wildcard_matches("*.test.ts", "a.ts"));
-        assert!(wildcard_matches("l*b*.ts", "library.ts"));
-        assert!(!wildcard_matches("l?b.ts", "liib.ts"));
+        assert!(wildcard_matches("*.ts", "lib.ts", false));
+        assert!(wildcard_matches("*.test.ts", "a.test.ts", false));
+        assert!(!wildcard_matches("*.test.ts", "a.ts", false));
+        assert!(wildcard_matches("l*b*.ts", "library.ts", false));
+        assert!(!wildcard_matches("l?b.ts", "liib.ts", false));
+        // `include` の最後の区切りの `*` は、末尾の `.min.js` の `.` に当たらない
+        assert!(!wildcard_matches("*.js", "loader.min.js", true));
+        assert!(!wildcard_matches("*", "loader.min.js", true));
+        assert!(wildcard_matches("*.min.js", "loader.min.js", true));
+        assert!(wildcard_matches("loader.*", "loader.min.js", true));
+        assert!(wildcard_matches("*.js", "loader.min.js", false));
     }
 }
