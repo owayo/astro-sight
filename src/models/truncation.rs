@@ -71,6 +71,10 @@ pub enum TruncationReason {
     /// ファイルを取り込むかを確かめられない、比べ直すソースの上限を超えた)、設定や取り込みの変更で
     /// 宣言ファイルから消える・現れる宣言を比べなかった (Issue #287・#288)。
     TsStripInternalUnavailable,
+    /// Rust の lib crate で束縛 (型別名・定数・`use`・glob・`mod` など) が変わり、それを名指し得る
+    /// 差分に無いファイルを探し切れなかった (上限を超えた・module を決められない、Issue #300)。
+    /// 公開シグネチャの束縛の変化を見逃し得るので、hook は止める。
+    RustDependentsIncomplete,
 }
 
 impl TruncationInfo {

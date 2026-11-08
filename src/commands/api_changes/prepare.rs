@@ -118,6 +118,9 @@ pub(crate) struct DetectionInputs<'a> {
     /// TS の `stripInternal` の設定 (Issue #274)。公開面の抽出と同じ設定で、互換判定器にも
     /// 宣言ファイルから消える型のメンバーを除いたソースを渡す。
     pub(crate) strip_internal: &'a super::ts_strip_internal::StripInternal,
+    /// 差分の中の package の Rust の lib crate (Issue #300)。束縛が変わった package では、契約が
+    /// 名指す名前をほかのファイルまで版ごとに解く。
+    pub(crate) rust_crates: &'a super::RustCrates<'a>,
 }
 
 /// 分類の過程で更新される可変状態 (結果バケットと、ファイル単位のメモ化キャッシュ)。
@@ -322,6 +325,7 @@ impl PreparedDiff {
         renames: &[crate::models::impact::DiffFile],
         canonical_dir: Option<&std::path::Path>,
         base_blobs: &crate::commands::git_input::GitBlobBatch,
+        rust_crates: &super::RustCrates<'_>,
     ) -> Self {
         let mut prepared = Self {
             files: Vec::with_capacity(diff_files.len()),
@@ -387,6 +391,17 @@ impl PreparedDiff {
                 &mut undetermined,
             );
         }
+        // Rust の lib crate で束縛が変わったときは、それを名指し得る差分に無いソースも比べ直す
+        // (Issue #300)。
+        prepared.recheck_rust_dependents(
+            dir,
+            rust_crates,
+            lookup.as_mut(),
+            canonical_dir,
+            &mut undetermined,
+            base_blobs,
+            &strip_internal,
+        );
         if let Some(root) = canonical_dir {
             prepared.parse_truncations.extend(
                 crate::engine::refs::generated_undetermined_truncations(root, &undetermined),
@@ -394,6 +409,49 @@ impl PreparedDiff {
         }
         prepared.strip_internal = strip_internal;
         prepared
+    }
+
+    /// Rust の lib crate で束縛 (型別名・定数・`use`・glob・`mod` など) が変わった package の、それを
+    /// 名指し得る差分に無いソースを、変更ファイルと同じく比べる (Issue #300)。シグネチャは同じなので、
+    /// 名指す束縛が変わった宣言だけが blocking な api.mod になる。探し切れなければ申告し、hook を止める。
+    #[allow(clippy::too_many_arguments)]
+    fn recheck_rust_dependents(
+        &mut self,
+        dir: &str,
+        rust_crates: &super::RustCrates<'_>,
+        mut generated: Option<&mut crate::engine::gitattributes::AttributeLookup<'_>>,
+        canonical_dir: Option<&std::path::Path>,
+        undetermined: &mut Vec<GeneratedUndetermined>,
+        base_blobs: &crate::commands::git_input::GitBlobBatch,
+        strip_internal: &super::ts_strip_internal::StripInternal,
+    ) {
+        for (root, pair) in rust_crates.pairs() {
+            if let Some(reason) = &pair.incomplete {
+                self.parse_truncations
+                    .push(crate::models::truncation::TruncationInfo::new(
+                        Some(root.clone()),
+                        crate::models::truncation::TruncationReason::RustDependentsIncomplete,
+                        format!(
+                            "Rust sources that may name the changed bindings of this crate were not all compared: {reason}"
+                        ),
+                    ));
+            }
+            for (old_path, new_path) in &pair.dependents {
+                let df = crate::models::impact::DiffFile {
+                    old_path: old_path.clone(),
+                    new_path: new_path.clone(),
+                    hunks: Vec::new(),
+                    deleted_old_source: None,
+                };
+                // 生成物は通常の差分と同じく外す。
+                if should_skip_diff_file(&df, generated.as_deref_mut(), canonical_dir, undetermined)
+                {
+                    continue;
+                }
+                let file = self.prepare_modified_file(dir, &df, base_blobs, strip_internal);
+                self.rechecks.push((df, file));
+            }
+        }
     }
 
     /// 設定や取り込みの変更で `stripInternal` の当たり方が変わる、差分に無い TS のソースを比べ直す
