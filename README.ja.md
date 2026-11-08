@@ -217,7 +217,7 @@ Rust の公開の項目に `#[cfg]` を足したり条件を狭めたりする�
 
 Rust の 1 つのファイルの別々の inline module にある同じ名前の項目 (`pub mod a { pub fn run() }` と `pub mod b { pub fn run() }`) は、宣言ごとに比べます。`api_changes` は宣言を囲む inline module の経路で組にし、出力ではその経路を `inline_module` (hook の出力では `m`) に添えます。`name` は裸の名前のままです。組にできない同じ場所の宣言 (`#[cfg]` の分岐など) の変更は blocking な `api.mod` に残します。
 
-Rust のシグネチャが別名 (`use … as Text;` や非公開の `type Text = …;`) を通して型を名指すときは、`api_changes` は別名の指す先も比べます。シグネチャの字面が同じまま指す先が変われば、`unverified.reason` が `rust_signature_dependency_changed` の blocking な `api.mod` にします。束縛は同じファイルの中で追います。
+Rust のシグネチャが別名 (`use … as Text;` や非公開の `type Text = …;`) を通して型を名指すときは、`api_changes` は別名の指す先も比べます。シグネチャの字面が同じまま指す先が変われば、`unverified.reason` が `rust_signature_dependency_changed` の blocking な `api.mod` にします。lib crate のほかのファイルの束縛を差分で変えたときは、ほかのファイルもたどり、差分で変えていないファイルの公開の宣言も、変わった束縛を名指していれば比べます。
 
 Rust の項目を別のファイルへ移し、元の場所から `pub use` で再公開するときは、`api_changes` が再公開の先の宣言を解き、その場で変えた場合と同じく比べます。壊す変更は blocking な `api.mod` にし、変えずに移した項目は `moved` にします。解けない再公開 (外部 crate・glob・`#[cfg]`・`as` の改名) は blocking な `api.mod` に残します。
 
