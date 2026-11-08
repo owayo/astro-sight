@@ -11,17 +11,17 @@
 //!   既定値の無い追加・境界の付いた追加・既定値の変更と削除・トレイトの境界を強めること・寿命の
 //!   境界の付け外し (利用側の暗黙の境界になる。フィールドから推論される境界は書かなくてもある
 //!   ものとして比べる)、`#[repr]` を外すことと `repr(packed)`・`repr(align)` の付け外し、
-//!   `#[repr]` の構造体の公開フィールドの並べ替えと、旧い公開フィールドより前への公開フィールドの
-//!   追加
+//!   `repr(C)` の構造体の公開フィールドの並べ替えと、旧い公開フィールドより前への公開フィールドの
+//!   追加 (構造体が有り `repr(C)` が効く設定ごとに、そこに同時に有るフィールドどうしで比べる)
 //! - 互換 (mod_compat): 構築の制限を緩めること、外から構築できない構造体への公開フィールドの追加、
 //!   トレイトの境界を緩めること、型の引数に既定値を付けること、境界の無い既定値の付いた型の引数を
 //!   足すこと (既定値で置き換えて公開フィールドの型が同じで、既定値が見た目から `Sized` で今の
 //!   どの利用でも正しい型と言えるとき)、既定の表現に `repr(C)`・`repr(transparent)` を付けること、
 //!   公開フィールドの無い構築できない構造体のタプルと名前付きの間の変更
 //! - 変更なし: 型の引数の改名 (`for<'a>` の束縛も)、整形とコメント、`r#` の付け外し、`#[repr]` の
-//!   書き方 (`#[cfg_attr]` の条件の設定ごとに、効く項目の集合で比べる)、`#[repr]` の効かない
-//!   構造体 (`repr(Rust)` だけを含む) の名前付きのフィールドの並べ替え、外から構築できない構造体の
-//!   公開でないフィールドの変更 (`repr(C)` でも)
+//!   書き方 (構造体の有る、`#[cfg]`・`#[cfg_attr]` の条件の設定ごとに、効く項目の集合で比べる)、
+//!   `repr(C)` の効かない構造体 (`align`・`packed`・`transparent` だけや `repr(Rust)`) の名前付きの
+//!   フィールドの並べ替え、外から構築できない構造体の公開でないフィールドの変更 (`repr(C)` でも)
 //!
 //! 名前付きの公開フィールドは、名前と `#[cfg]` の条件の組で対応させる (`#[cfg]` で分けた同じ名前の
 //! フィールドは、それぞれを比べる。Issue #290)。同じ組の公開フィールドが 2 つあれば、対応を
@@ -53,6 +53,9 @@ use super::rust_type_api::*;
 /// 構造体 1 つの公開の形。
 #[derive(Clone, Debug)]
 pub(crate) struct RustStructShape {
+    /// 構造体自身と囲む項目の `#[cfg]` と、`cfg` を含む `#[cfg_attr]` (比べる設定を、構造体の有る設定に
+    /// 絞る。enum・union と同じく signature には出さない。Issue #293)。
+    conditions: Vec<Attr>,
     /// 表示する属性 (`#[repr]`・`#[non_exhaustive]` と、それを含む `#[cfg_attr]`)。
     attributes: Vec<String>,
     /// `#[repr]` と、それを含む `#[cfg_attr]`。
@@ -114,11 +117,15 @@ impl RustStructShape {
             item.named_children(&mut item.walk())
                 .find(|child| child.kind() == "where_clause")
         };
+        let mut conditions = Vec::new();
         let mut attributes = Vec::new();
         let mut layout = Vec::new();
         let mut non_exhaustive = false;
         let mut conditional_non_exhaustive = Vec::new();
         for attribute in preceding_attributes(item) {
+            if let Some(attr) = project_attribute(attribute, source, &["cfg"])? {
+                conditions.push(attr);
+            }
             if let Some(attr) = project_attribute(attribute, source, &["repr", "non_exhaustive"])? {
                 attributes.push(attr.shown);
             }
@@ -165,6 +172,7 @@ impl RustStructShape {
             generics.infer_outlives(&field_types(body, source)?, source);
         }
         Some(Self {
+            conditions,
             attributes,
             layout,
             non_exhaustive,
@@ -181,6 +189,13 @@ impl RustStructShape {
             form,
             fields,
         })
+    }
+
+    /// 囲む項目 (inline module・ファイルの先頭など) の有る条件を足す。比べる設定を、構造体の有る
+    /// 設定に絞る (Issue #291・#293)。
+    pub(super) fn with_enclosing(mut self, enclosing: Vec<Attr>) -> Self {
+        self.conditions.extend(enclosing);
+        self
     }
 
     /// 外から構築できない (構造体式を書けない) か。無条件の公開でないフィールドがあるか、
@@ -215,20 +230,21 @@ impl RustStructShape {
             && self.unconditionally_restricted()
     }
 
-    /// 既定でない表現になる設定がある (`repr(Rust)` は既定の表現)。フィールドの順をレイアウトの約束と
-    /// みなすかに使う。`align`・`packed` だけや `repr(transparent)` は Rust の参照では順を約束しないが、
-    /// 今は順を約束するものとして扱う (絞るのは Issue #293)。
-    fn has_repr(&self) -> bool {
+    /// 構造体の有る設定のどこかで、フィールドの順をレイアウトの約束にする表現 ([`orders_fields`]) が
+    /// 効くか。signature で公開フィールドを宣言の順に示すかに使う。原子が多すぎれば true。
+    fn has_ordered_layout(&self) -> bool {
         let mut atoms = Atoms::default();
+        let present = atoms.present(&self.conditions);
         let reprs = atoms.reprs(&self.layout);
         let Some(mut configs) = atoms.configs() else {
             return true;
         };
-        configs.any(|config| !effective_repr(&reprs, config).is_empty())
+        configs
+            .any(|config| present.holds(config) && orders_fields(&effective_repr(&reprs, config)))
     }
 
     /// API の signature として出す表示。名前付きの公開フィールドは名前と `#[cfg]` の条件の順
-    /// (`#[repr]` が効く設定のある構造体は宣言の順)、タプルは最後の公開フィールドまでの位置
+    /// (順を約束する `repr(C)` が効く設定のある構造体は宣言の順)、タプルは最後の公開フィールドまでの位置
     /// (公開でないものは `_`) を示し、残りの公開でないフィールドは `..` で示す。
     pub(crate) fn signature(&self) -> String {
         let mut out = String::new();
@@ -273,7 +289,7 @@ impl RustStructShape {
             Form::Named => {
                 out.push_str(&where_text);
                 let mut public: Vec<&Field> = self.fields.iter().filter(|f| f.public).collect();
-                if !self.has_repr() {
+                if !self.has_ordered_layout() {
                     public.sort_by_key(|field| public_key(field));
                 }
                 let mut parts: Vec<String> = public
@@ -339,18 +355,41 @@ fn public_fields(shape: &RustStructShape) -> Option<BTreeMap<PublicKey, usize>> 
     Some(public)
 }
 
-/// `#[repr]` の構造体の公開フィールドの順を、`#[cfg]` の原子の真偽の組み合わせ (設定) ごとに、その
-/// 設定に同時に有るフィールドどうしで比べる (`#[cfg]` で分けた同じ名前のフィールドは同じ設定に
-/// 有らないので、その間の並べ替えはどの設定の順も変えない)。旧い公開フィールド (`old_public`) の
-/// 並びが同じで、足した公開フィールドが旧い公開フィールドより前に無ければ true。同じ名前の
-/// フィールドが 2 つ有る設定はビルドできないので、旧版でそうなら比べず、新版だけでそうなら壊す
-/// ものとする。原子が多すぎれば false。
+/// 効く表現の項目 `items` が、フィールドの順をレイアウトの約束にするか。`repr(C)` は順を約束し、
+/// `align`・`packed` (既定の表現の修飾) と `transparent` (唯一の大きさのあるフィールドと同じ
+/// レイアウト) だけでは約束しない (Rust の参照)。ほかの読めない項目は約束するものとする (Issue #293)。
+fn orders_fields(items: &BTreeSet<Vec<String>>) -> bool {
+    items.iter().any(|item| {
+        !matches!(
+            item.first().map(String::as_str),
+            Some("align" | "packed" | "transparent")
+        )
+    })
+}
+
+/// 構造体の公開フィールドの順を、`#[cfg]`・`#[cfg_attr]` の原子の真偽の組み合わせ (設定) ごとに比べる。
+/// 比べるのは、旧新の構造体が有り、旧新とも順を約束する表現 ([`orders_fields`]) が効く設定だけで、
+/// その設定に同時に有るフィールドどうしで比べる (`#[cfg]` で分けた同じ名前のフィールドは同じ設定に
+/// 有らないので、その間の並べ替えはどの設定の順も変えない。Issue #290・#293)。旧い公開フィールド
+/// (`old_public`) の並びが同じで、足した公開フィールドが旧い公開フィールドより前に無ければ true。
+/// 同じ名前のフィールドが 2 つ有る設定はビルドできないので、旧版でそうなら比べず、新版だけでそう
+/// なら壊すものとする。原子が多すぎれば false。
 fn same_public_order(
     old: &RustStructShape,
     new: &RustStructShape,
     old_public: &BTreeMap<PublicKey, usize>,
 ) -> bool {
+    // 順を約束する表現の効く設定が旧新のどちらかに無ければ、順は比べない (フィールドの条件の原子を
+    // 列挙しない)。
+    if !old.has_ordered_layout() || !new.has_ordered_layout() {
+        return true;
+    }
     let mut atoms = Atoms::default();
+    let (old_present, new_present) = (
+        atoms.present(&old.conditions),
+        atoms.present(&new.conditions),
+    );
+    let (old_reprs, new_reprs) = (atoms.reprs(&old.layout), atoms.reprs(&new.layout));
     let mut presence = |shape: &RustStructShape| -> Vec<Predicate> {
         shape
             .fields
@@ -380,6 +419,13 @@ fn same_public_order(
         Some(keys)
     };
     for config in configs {
+        if !old_present.holds(config)
+            || !new_present.holds(config)
+            || !orders_fields(&effective_repr(&old_reprs, config))
+            || !orders_fields(&effective_repr(&new_reprs, config))
+        {
+            continue;
+        }
         let Some(old_keys) = present(old, &old_presence, config) else {
             continue;
         };
@@ -402,8 +448,13 @@ fn same_public_order(
     true
 }
 
-/// 旧新の公開の形を比べる。
-pub(crate) fn classify(old: &RustStructShape, new: &RustStructShape) -> ShapeChange {
+/// 旧新の公開の形を比べる。`availability_compared` は、旧新の有る設定の変化を別に比べる (同じ
+/// ファイルの宣言の組。Issue #291) か。比べるなら、新しい構造体が無い設定はここでは比べない。
+pub(crate) fn classify(
+    old: &RustStructShape,
+    new: &RustStructShape,
+    availability_compared: bool,
+) -> ShapeChange {
     use ShapeChange::{Breaking, Compatible};
     if old.visibility.as_ref().map(Tokens::key) != new.visibility.as_ref().map(Tokens::key) {
         return Breaking;
@@ -435,15 +486,30 @@ pub(crate) fn classify(old: &RustStructShape, new: &RustStructShape) -> ShapeCha
                 == substitute_defaults(new_names.apply(&new_field.ty), &defaults)
     };
 
-    // 表現は、`#[cfg_attr]` の条件の原子の真偽の組み合わせ (設定) ごとに、効く項目の集合で比べる
-    // (enum・union と同じ)。既定の表現に `repr(C)`・`repr(transparent)` を付けるだけが互換。
+    // 表現は、`#[cfg]`・`#[cfg_attr]` の条件の原子の真偽の組み合わせ (設定) ごとに、効く項目の集合で
+    // 比べる (enum・union と同じ)。既定の表現に `repr(C)`・`repr(transparent)` を付けるだけが互換。
+    // 構造体の無い設定は比べない (Issue #293)。旧い構造体だけが有る設定は、有る設定の変化を別に
+    // 比べるならそちらに任せ、そうでなければ壊す (enum・union と同じ)。
     let mut atoms = Atoms::default();
+    let (old_present, new_present) = (
+        atoms.present(&old.conditions),
+        atoms.present(&new.conditions),
+    );
     let (old_reprs, new_reprs) = (atoms.reprs(&old.layout), atoms.reprs(&new.layout));
     let Some(configs) = atoms.configs() else {
         return Breaking;
     };
     let defined = |item: &Vec<String>| matches!(item.as_slice(), [only] if only == "C" || only == "transparent");
     for config in configs {
+        if !old_present.holds(config) {
+            continue;
+        }
+        if !new_present.holds(config) {
+            if availability_compared {
+                continue;
+            }
+            return Breaking;
+        }
         let (old_items, new_items) = (
             effective_repr(&old_reprs, config),
             effective_repr(&new_reprs, config),
@@ -455,7 +521,6 @@ pub(crate) fn classify(old: &RustStructShape, new: &RustStructShape) -> ShapeCha
             change = change.max(Compatible);
         }
     }
-    let (old_layout, new_layout) = (old.has_repr(), new.has_repr());
     if old.form != new.form {
         let private_only =
             |shape: &RustStructShape| shape.form != Form::Unit && shape.has_only_private_fields();
@@ -484,10 +549,10 @@ pub(crate) fn classify(old: &RustStructShape, new: &RustStructShape) -> ShapeCha
                 }
             }
             added = new_public.keys().any(|key| !old_public.contains_key(key));
-            // `#[repr]` の構造体は、公開フィールドの順もレイアウトの約束 (公開でないフィールドの
+            // `repr(C)` の構造体は、公開フィールドの順もレイアウトの約束 (公開でないフィールドの
             // 変更は Cargo の手引きでも互換)。足す公開フィールドは、ほかのフィールドのレイアウトを
             // 変えないよう、旧い公開フィールドの後に置く必要がある (`repr-c-private-change`)。
-            if old_layout && new_layout && !same_public_order(old, new, &old_public) {
+            if !same_public_order(old, new, &old_public) {
                 return Breaking;
             }
         }
@@ -587,6 +652,11 @@ pub(crate) fn struct_signature(
         node = node.parent()?;
     }
     if let Some(shape) = RustStructShape::from_node(node, source) {
+        // 囲む項目の有る条件も、順を約束する表現が効く設定を決めるのに使う (読めなければ自身の条件だけ)。
+        let shape = match super::rust_declarations::enclosing_conditions(node, source) {
+            Some(enclosing) => shape.with_enclosing(enclosing),
+            None => shape,
+        };
         return Some(shape.signature());
     }
     // 文字列の中の空白とコメントも字面のまま残す (どの変更も signature に現れるように)。
@@ -602,5 +672,6 @@ pub(crate) fn unique_struct_shape(source: &[u8], name: &str) -> Option<RustStruc
     let [item] = items.as_slice() else {
         return None;
     };
-    RustStructShape::from_node(*item, source)
+    let enclosing = super::rust_declarations::enclosing_conditions(*item, source)?;
+    Some(RustStructShape::from_node(*item, source)?.with_enclosing(enclosing))
 }

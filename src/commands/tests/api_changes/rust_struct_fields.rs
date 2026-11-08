@@ -1103,3 +1103,171 @@ fn rust_struct_cfg_split_fields_are_matched_by_name_and_condition() {
         );
     }
 }
+
+/// 公開フィールドの順をレイアウトの約束とみなすのは、構造体が有り、`repr(C)` が効き、並べ替えた
+/// フィールドが有る設定だけ。`#[repr]` の違いも、構造体が有る設定だけで比べる (Issue #293)。
+#[test]
+fn rust_struct_field_order_is_promised_only_by_repr_c() {
+    let reorder = |attributes: &str| {
+        (
+            format!("{attributes}pub struct Header {{\n    pub a: u8,\n    pub b: u32,\n}}\n"),
+            format!("{attributes}pub struct Header {{\n    pub b: u32,\n    pub a: u8,\n}}\n"),
+        )
+    };
+    // `align`・`packed` だけでは順を約束しない (Issue の再現)
+    for attributes in [
+        "#[repr(align(8))]\n",
+        "#[repr(packed)]\n",
+        "#[repr(packed(2))]\n",
+        "#[repr(align(8), packed)]\n",
+    ] {
+        let (old, new) = reorder(attributes);
+        assert_eq!(
+            bucket(&old, &new, &[], &[], "Header"),
+            "none",
+            "{attributes}"
+        );
+    }
+    // `repr(transparent)` (唯一の大きさのあるフィールドと同じレイアウト) も約束しない
+    let transparent =
+        |fields: &str| format!("#[repr(transparent)]\npub struct Header {{\n{fields}}}\n");
+    assert_eq!(
+        bucket(
+            &transparent("    pub value: u32,\n    pub marker: (),\n"),
+            &transparent("    pub marker: (),\n    pub value: u32,\n"),
+            &[],
+            &[],
+            "Header"
+        ),
+        "none"
+    );
+    // `repr(C)` は (`align`・`packed` と一緒でも) 順を約束する
+    for attributes in [
+        "#[repr(C)]\n",
+        "#[repr(C, packed)]\n",
+        "#[repr(C, align(8))]\n",
+        "#[cfg_attr(feature = \"ffi\", repr(C))]\n",
+    ] {
+        let (old, new) = reorder(attributes);
+        assert_eq!(
+            bucket(&old, &new, &[], &[], "Header"),
+            "mod",
+            "{attributes}"
+        );
+    }
+    // 構造体が無い設定の `#[repr]` の違いは比べない (Issue の再現 1)
+    assert_eq!(
+        bucket(
+            "#[cfg(feature = \"ffi\")]\n#[repr(C)]\npub struct Header {\n    pub value: u32,\n}\n",
+            "#[cfg(feature = \"ffi\")]\n#[cfg_attr(feature = \"ffi\", repr(C))]\npub struct Header {\n    pub value: u32,\n}\n",
+            &[],
+            &[],
+            "Header"
+        ),
+        "none"
+    );
+    // `repr(C)` が効く設定に無いフィールドだけの並べ替えは順を変えない (Issue の再現 2)。効く設定に
+    // 有るフィールドとの並べ替えは今までどおり壊す
+    let fields = |order: &[&str]| {
+        format!(
+            "#[cfg_attr(feature = \"ffi\", repr(C))]\npub struct Header {{\n{}}}\n",
+            order.concat()
+        )
+    };
+    let a = "    #[cfg(not(feature = \"ffi\"))]\n    pub a: u8,\n";
+    let b = "    #[cfg(not(feature = \"ffi\"))]\n    pub b: u32,\n";
+    let c = "    pub c: u16,\n";
+    let d = "    pub d: u8,\n";
+    assert_eq!(
+        bucket(&fields(&[a, b, c]), &fields(&[b, a, c]), &[], &[], "Header"),
+        "none"
+    );
+    assert_eq!(
+        bucket(
+            &fields(&[a, b, c, d]),
+            &fields(&[a, b, d, c]),
+            &[],
+            &[],
+            "Header"
+        ),
+        "mod"
+    );
+    // signature: 順を約束しない表現だけの構造体の公開フィールドは名前の順
+    let api = api_changes(
+        "#[repr(align(8))]\npub struct Header {\n    pub b: u32,\n    pub a: u8,\n}\n",
+        "#[repr(align(8))]\npub struct Header {\n    pub b: u32,\n    pub a: u8,\n    pub c: u8,\n}\n",
+        &[],
+        &[],
+    );
+    let change = api
+        .modified
+        .iter()
+        .find(|change| change.name == "Header")
+        .expect("Header is modified");
+    assert_eq!(
+        change.new_signature.as_deref(),
+        Some("#[repr(align(8))] pub struct Header { pub a: u8, pub b: u32, pub c: u8 }")
+    );
+}
+
+/// `#[cfg]` の分岐に分けた構造体は、有る条件の重なる旧新の分岐の組ごとに、両方が有る設定で比べる
+/// (代表の 1 組では、ほかの分岐の設定の形を比べられない)。順を約束する表現の無い構造体では、フィールドの
+/// 条件の原子の数に関わらず順を比べない (Issue #293)。
+#[test]
+fn rust_struct_branch_representatives_and_unordered_layouts() {
+    // 分岐をまとめ、`repr(C)` の効く分岐の公開フィールドを並べ替える (旧い先頭の分岐は、signature では
+    // 名前の順になり、ほかの分岐と同じに見える)
+    assert_eq!(
+        bucket(
+            "#[cfg(not(feature = \"ffi\"))]\n#[cfg_attr(feature = \"ffi\", repr(C))]\npub struct S {\n    pub b: u32,\n    pub a: u8,\n}\n\n#[cfg(feature = \"ffi\")]\n#[cfg_attr(feature = \"ffi\", repr(C))]\npub struct S {\n    pub a: u8,\n    pub b: u32,\n}\n",
+            "#[cfg_attr(feature = \"ffi\", repr(C))]\npub struct S {\n    pub b: u32,\n    pub a: u8,\n}\n",
+            &[],
+            &[],
+            "S"
+        ),
+        "mod"
+    );
+    // 分岐をまとめ、`repr(C)` の効く設定で公開フィールドを並べ替える
+    let branch = |condition: &str| {
+        format!(
+            "#[cfg({condition})]\n#[cfg_attr(feature = \"ffi\", repr(C))]\npub struct S {{\n    pub a: u8,\n    pub b: u32,\n}}\n"
+        )
+    };
+    assert_eq!(
+        bucket(
+            &format!(
+                "{}\n{}",
+                branch("not(feature = \"ffi\")"),
+                branch("feature = \"ffi\"")
+            ),
+            "#[cfg_attr(feature = \"ffi\", repr(C))]\npub struct S {\n    pub b: u32,\n    pub a: u8,\n}\n",
+            &[],
+            &[],
+            "S"
+        ),
+        "mod"
+    );
+    // 分岐に分けて `#[non_exhaustive]` を外す (どの設定にも構造体が有り、構築の制限を緩めるだけ)
+    assert_eq!(
+        bucket(
+            "#[non_exhaustive]\npub struct S {\n    pub a: u8,\n}\n",
+            "#[cfg(feature = \"ffi\")]\npub struct S {\n    pub a: u8,\n}\n\n#[cfg(not(feature = \"ffi\"))]\npub struct S {\n    pub a: u8,\n}\n",
+            &[],
+            &[],
+            "S"
+        ),
+        "mod_compat"
+    );
+    // 順を約束する表現の無い構造体は、フィールドの条件の原子が多くても順を比べない
+    let atoms: Vec<String> = (0..17).map(|index| format!("a{index}")).collect();
+    let many = format!("#[cfg(any({}))]\n", atoms.join(", "));
+    let fields = |extra: &str| {
+        format!(
+            "pub struct S {{\n    pub a: u8,\n{extra}    _private: (),\n    {many}    _optional: (),\n}}\n"
+        )
+    };
+    assert_eq!(
+        bucket(&fields(""), &fields("    pub b: u8,\n"), &[], &[], "S"),
+        "mod_compat"
+    );
+}

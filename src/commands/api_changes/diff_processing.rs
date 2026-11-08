@@ -818,15 +818,33 @@ fn collect_rust_modified_symbols(
         {
             continue;
         }
+        let representative = pairing
+            .branch_representatives
+            .contains(&(old_index, new_index));
+        // `#[cfg]` の分岐の代表の組の構造体・enum・union は、分岐の組ごとに形を比べる (Issue #293)。
+        let shape_override =
+            (representative && matches!(kind.as_str(), "struct" | "enum" | "union"))
+                .then(|| {
+                    let group = pairing.groups.iter().find(|(olds, news)| {
+                        olds.contains(&old_index) && news.contains(&new_index)
+                    })?;
+                    let old_source = inputs.base_blobs.read(&df.old_path)?;
+                    let new_source = load_new_source(inputs.dir, &df.new_path)?;
+                    let old: Vec<&RustDeclarationContext> =
+                        group.0.iter().map(|&i| &declarations.old[i]).collect();
+                    let new: Vec<&RustDeclarationContext> =
+                        group.1.iter().map(|&j| &declarations.new[j]).collect();
+                    branch_shape_change(kind, &old_source, &new_source, &old, &new)
+                })
+                .map(|change| change.unwrap_or(super::rust_type_api::ShapeChange::Breaking));
         let site = RustDeclarationSite {
             old_start: declarations.old[old_index].start,
             new_start: declarations.new[new_index].start,
             name_shared: pairing.name_is_shared(name),
             callee_shared: declarations.new_shared_callables.contains(bare_name(name)),
             dependency,
-            availability_compared: !pairing
-                .branch_representatives
-                .contains(&(old_index, new_index)),
+            availability_compared: !representative,
+            shape_override,
         };
         let inline_module = declarations.new_inline_module(new_index);
         files.classify_rust(
@@ -857,6 +875,7 @@ fn collect_rust_modified_symbols(
             callee_shared: true,
             dependency: Some(dependency),
             availability_compared: false,
+            shape_override: None,
         };
         let inline_module = declarations.new_inline_module(new_index);
         files.classify_rust(
@@ -1452,6 +1471,7 @@ fn reexport_site(
         callee_shared,
         dependency: None,
         availability_compared: false,
+        shape_override: None,
     }
 }
 
@@ -1878,74 +1898,94 @@ impl<'a> ChangedSignatureFiles<'a> {
                 new_sig,
                 lang_id: self.lang_id,
             };
-            let shapes = super::source_pair::load_new_source(dir, self.new_path)
-                .and_then(|new| {
-                    super::source_pair::load_old_source_with_new(
-                        base_blobs,
-                        self.old_path,
-                        self.new_path,
-                        new,
-                    )
-                })
-                .and_then(|sources| {
-                    // 宣言の場所で組にした変更は、その宣言そのものの形を比べる (Issue #282)。
-                    let site = self.rust_site;
-                    match kind {
-                        "struct" => {
-                            let (old, new) = match site {
-                                Some(site) => (
-                                    super::struct_shape_at(&sources.old, site.old_start)?,
-                                    super::struct_shape_at(&sources.new, site.new_start)?,
-                                ),
-                                None => (
-                                    super::rust_struct_api::unique_struct_shape(
-                                        &sources.old,
-                                        name,
-                                    )?,
-                                    super::rust_struct_api::unique_struct_shape(
-                                        &sources.new,
-                                        name,
-                                    )?,
-                                ),
-                            };
-                            Some(super::rust_struct_api::classify(&old, &new))
+            let shapes = match self.rust_site.and_then(|site| site.shape_override) {
+                // `#[cfg]` の分岐の代表の組は、分岐の組ごとに比べた結果 (Issue #293)。
+                Some(change) => Some(change),
+                None => super::source_pair::load_new_source(dir, self.new_path)
+                    .and_then(|new| {
+                        super::source_pair::load_old_source_with_new(
+                            base_blobs,
+                            self.old_path,
+                            self.new_path,
+                            new,
+                        )
+                    })
+                    .and_then(|sources| {
+                        // 宣言の場所で組にした変更は、その宣言そのものの形を比べる (Issue #282)。
+                        let site = self.rust_site;
+                        match kind {
+                            "struct" => {
+                                let (old, new) = match site {
+                                    Some(site) => (
+                                        super::struct_shape_at(&sources.old, site.old_start)?,
+                                        super::struct_shape_at(&sources.new, site.new_start)?,
+                                    ),
+                                    None => (
+                                        super::rust_struct_api::unique_struct_shape(
+                                            &sources.old,
+                                            name,
+                                        )?,
+                                        super::rust_struct_api::unique_struct_shape(
+                                            &sources.new,
+                                            name,
+                                        )?,
+                                    ),
+                                };
+                                Some(super::rust_struct_api::classify(
+                                    &old,
+                                    &new,
+                                    site.is_some_and(|site| site.availability_compared),
+                                ))
+                            }
+                            "enum" => {
+                                let (old, new) = match site {
+                                    Some(site) => (
+                                        super::enum_shape_at(&sources.old, site.old_start)?,
+                                        super::enum_shape_at(&sources.new, site.new_start)?,
+                                    ),
+                                    None => (
+                                        super::rust_enum_api::unique_enum_shape(
+                                            &sources.old,
+                                            name,
+                                        )?,
+                                        super::rust_enum_api::unique_enum_shape(
+                                            &sources.new,
+                                            name,
+                                        )?,
+                                    ),
+                                };
+                                Some(super::rust_enum_api::classify(
+                                    &old,
+                                    &new,
+                                    site.is_some_and(|site| site.availability_compared),
+                                ))
+                            }
+                            _ => {
+                                let (old, new) = match site {
+                                    Some(site) => (
+                                        super::union_shape_at(&sources.old, site.old_start)?,
+                                        super::union_shape_at(&sources.new, site.new_start)?,
+                                    ),
+                                    None => (
+                                        super::rust_union_api::unique_union_shape(
+                                            &sources.old,
+                                            name,
+                                        )?,
+                                        super::rust_union_api::unique_union_shape(
+                                            &sources.new,
+                                            name,
+                                        )?,
+                                    ),
+                                };
+                                Some(super::rust_union_api::classify(
+                                    &old,
+                                    &new,
+                                    site.is_some_and(|site| site.availability_compared),
+                                ))
+                            }
                         }
-                        "enum" => {
-                            let (old, new) = match site {
-                                Some(site) => (
-                                    super::enum_shape_at(&sources.old, site.old_start)?,
-                                    super::enum_shape_at(&sources.new, site.new_start)?,
-                                ),
-                                None => (
-                                    super::rust_enum_api::unique_enum_shape(&sources.old, name)?,
-                                    super::rust_enum_api::unique_enum_shape(&sources.new, name)?,
-                                ),
-                            };
-                            Some(super::rust_enum_api::classify(
-                                &old,
-                                &new,
-                                site.is_some_and(|site| site.availability_compared),
-                            ))
-                        }
-                        _ => {
-                            let (old, new) = match site {
-                                Some(site) => (
-                                    super::union_shape_at(&sources.old, site.old_start)?,
-                                    super::union_shape_at(&sources.new, site.new_start)?,
-                                ),
-                                None => (
-                                    super::rust_union_api::unique_union_shape(&sources.old, name)?,
-                                    super::rust_union_api::unique_union_shape(&sources.new, name)?,
-                                ),
-                            };
-                            Some(super::rust_union_api::classify(
-                                &old,
-                                &new,
-                                site.is_some_and(|site| site.availability_compared),
-                            ))
-                        }
-                    }
-                });
+                    }),
+            };
             let reason = match kind {
                 "struct" => "rust_struct_shape_compatible",
                 "enum" => "rust_enum_shape_compatible",

@@ -578,6 +578,74 @@ pub(crate) struct RustDeclarationSite {
     /// 比べない (消える設定は削除と同じ区分で出す)。分岐の代表の組では、ほかの分岐の形を比べ
     /// られないので false。
     pub(crate) availability_compared: bool,
+    /// `#[cfg]` の分岐の代表の組で、構造体・enum・union の形を分岐の組ごとに比べた結果
+    /// ([`branch_shape_change`])。あれば代表の組の形の比較に代える (Issue #293)。
+    pub(crate) shape_override: Option<super::rust_type_api::ShapeChange>,
+}
+
+/// 旧新の宣言が、ある設定で同時に有り得るか (読めない条件か、原子が多すぎれば有り得るとする)。
+fn coexist(old: &RustDeclarationContext, new: &RustDeclarationContext) -> bool {
+    use super::rust_cfg_predicate::{Atoms, Predicate};
+    let (Some(old_attributes), Some(new_attributes)) = (&old.availability, &new.availability)
+    else {
+        return true;
+    };
+    let mut atoms = Atoms::default();
+    let mut predicate = |attributes: &[AvailabilityAttr]| {
+        Predicate::All(
+            attributes
+                .iter()
+                .map(|attribute| atoms.presence(&attribute.key))
+                .collect(),
+        )
+    };
+    let (old_predicate, new_predicate) = (predicate(old_attributes), predicate(new_attributes));
+    let Some(mut configs) = atoms.configs() else {
+        return true;
+    };
+    configs.any(|config| old_predicate.holds(config) && new_predicate.holds(config))
+}
+
+/// `#[cfg]` の分岐に分けた構造体・enum・union (`kind`) の形を、有る条件の重なる旧新の分岐の組ごとに、
+/// 両方が有る設定で比べ、最も重い変化を返す (Issue #293)。代表の 1 組では、ほかの分岐の設定の形
+/// (signature の正規化で失われるフィールドの順など) を比べられないため。旧い分岐にしか無い設定は、
+/// 有る設定の比較 (Issue #291) で出す。形を読めない宣言があれば None。
+pub(crate) fn branch_shape_change(
+    kind: &str,
+    old_source: &[u8],
+    new_source: &[u8],
+    old: &[&RustDeclarationContext],
+    new: &[&RustDeclarationContext],
+) -> Option<super::rust_type_api::ShapeChange> {
+    let mut change = super::rust_type_api::ShapeChange::Unchanged;
+    for old_declaration in old {
+        for new_declaration in new {
+            if !coexist(old_declaration, new_declaration) {
+                continue;
+            }
+            let (old_start, new_start) = (old_declaration.start, new_declaration.start);
+            let pair = match kind {
+                "struct" => super::rust_struct_api::classify(
+                    &struct_shape_at(old_source, old_start)?,
+                    &struct_shape_at(new_source, new_start)?,
+                    true,
+                ),
+                "enum" => super::rust_enum_api::classify(
+                    &enum_shape_at(old_source, old_start)?,
+                    &enum_shape_at(new_source, new_start)?,
+                    true,
+                ),
+                "union" => super::rust_union_api::classify(
+                    &union_shape_at(old_source, old_start)?,
+                    &union_shape_at(new_source, new_start)?,
+                    true,
+                ),
+                _ => return None,
+            };
+            change = change.max(pair);
+        }
+    }
+    Some(change)
 }
 
 /// Rust のソース `source` の、名前が `name` の関数・メソッドの宣言 (非公開・入れ子を含む) の数。
@@ -629,10 +697,10 @@ pub(crate) fn struct_shape_at(
     start: (usize, usize),
 ) -> Option<super::rust_struct_api::RustStructShape> {
     let tree = parser::parse_source(source, crate::language::LangId::Rust).ok()?;
-    super::rust_struct_api::RustStructShape::from_node(
-        item_at(tree.root_node(), start, "struct_item")?,
-        source,
-    )
+    let item = item_at(tree.root_node(), start, "struct_item")?;
+    super::rust_struct_api::RustStructShape::from_node(item, source)?
+        .with_enclosing(enclosing_conditions(item, source)?)
+        .into()
 }
 
 /// `source` の `start` に始まる enum の形。
@@ -789,7 +857,7 @@ mod tests {
         let first = struct_shape_at(source, (1, 4)).expect("a::Note");
         let second = struct_shape_at(source, (6, 4)).expect("b::Note");
         assert_ne!(
-            super::super::rust_struct_api::classify(&first, &second),
+            super::super::rust_struct_api::classify(&first, &second, false),
             super::super::rust_type_api::ShapeChange::Unchanged
         );
         assert!(struct_shape_at(source, (0, 0)).is_none());
