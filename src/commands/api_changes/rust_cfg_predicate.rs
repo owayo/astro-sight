@@ -4,7 +4,7 @@
 //! 比べるための部品。`#[cfg(P)]` は P、`#[cfg_attr(P, cfg(Q))]` は `not(P) or Q` として読み、入れ子の
 //! `#[cfg_attr]` の中の属性は、述語が全て成り立つときに効くものとする。1 つの値しか取らない鍵
 //! (`target_os` など) の原子は同時に真にせず、`cfg(true)`・`cfg(false)` は定数、文字列の値は中身で
-//! 比べる。
+//! 比べる (エスケープを解く。解けない値の原子は、ほかの値と同時に真になり得るものとする)。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -95,17 +95,24 @@ const SINGLE_VALUED: [&str; 8] = [
     "panic",
 ];
 
-/// 文字列のリテラル (`"x"`・`r"x"`・`r#"x"#`) の中身。読めなければ None。
+/// 文字列のリテラル (`"x"`・`r"x"`・`r#"x"#`) の中身。エスケープ (`\n`・`\x6c`・`\u{6c}`・行の
+/// 継続) は Rust の字句の規則で解き、CRLF は LF にする (Rust はソースの CRLF を LF として読む)。
+/// 読めなければ None。
 fn string_value(literal: &str) -> Option<String> {
     if let Some(rest) = literal.strip_prefix('r') {
         let hashes = rest.len() - rest.trim_start_matches('#').len();
         let inner = rest.get(hashes..rest.len().checked_sub(hashes)?)?;
-        return Some(inner.strip_prefix('"')?.strip_suffix('"')?.to_owned());
+        let inner = inner.strip_prefix('"')?.strip_suffix('"')?;
+        return Some(inner.replace("\r\n", "\n"));
     }
     let inner = literal.strip_prefix('"')?.strip_suffix('"')?;
     let mut value = String::new();
-    let mut chars = inner.chars();
+    let mut chars = inner.chars().peekable();
     while let Some(character) = chars.next() {
+        if character == '\r' && chars.next_if_eq(&'\n').is_some() {
+            value.push('\n');
+            continue;
+        }
         if character != '\\' {
             value.push(character);
             continue;
@@ -116,6 +123,48 @@ fn string_value(literal: &str) -> Option<String> {
             'r' => '\r',
             '0' => '\0',
             escaped @ ('\\' | '"' | '\'') => escaped,
+            // `\x` と 2 桁の 16 進。文字列では 0x7F まで (1 桁目は 0〜7)。
+            'x' => {
+                let high = chars.next()?.to_digit(8)?;
+                let low = chars.next()?.to_digit(16)?;
+                char::from_u32(high * 16 + low)?
+            }
+            // `\u{..}`: 1〜6 桁の 16 進 (桁の後の `_` は読み飛ばす)。
+            'u' => {
+                if chars.next()? != '{' {
+                    return None;
+                }
+                let (mut code, mut digits) = (0u32, 0);
+                loop {
+                    match chars.next()? {
+                        '}' if digits > 0 => break,
+                        '_' if digits > 0 => {}
+                        digit => {
+                            code = code * 16 + digit.to_digit(16)?;
+                            digits += 1;
+                            if digits > 6 {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                char::from_u32(code)?
+            }
+            // 行の継続: `\` と改行 (LF か CRLF) と、その後の空白を読み飛ばす。
+            '\n' => {
+                while chars
+                    .next_if(|next| matches!(next, ' ' | '\t' | '\n' | '\r'))
+                    .is_some()
+                {}
+                continue;
+            }
+            '\r' if chars.next_if_eq(&'\n').is_some() => {
+                while chars
+                    .next_if(|next| matches!(next, ' ' | '\t' | '\n' | '\r'))
+                    .is_some()
+                {}
+                continue;
+            }
             _ => return None,
         });
     }
@@ -127,13 +176,15 @@ fn string_value(literal: &str) -> Option<String> {
 pub(super) struct Atoms(Vec<Vec<String>>);
 
 impl Atoms {
-    /// 1 つの値しか取らない鍵ごとの、原子の番号のビット。
+    /// 1 つの値しか取らない鍵ごとの、原子の番号のビット。値を解けない原子 (読めないエスケープ) は、
+    /// 同じ値の別の書き方かもしれないので含めない。
     pub(super) fn exclusive(&self) -> Vec<u64> {
         let mut masks: BTreeMap<&str, u64> = BTreeMap::new();
         for (index, atom) in self.0.iter().enumerate() {
-            if let [key, equals, _] = atom.as_slice()
+            if let [key, equals, value] = atom.as_slice()
                 && equals == "="
                 && SINGLE_VALUED.contains(&key.as_str())
+                && string_value(value).is_some()
             {
                 *masks.entry(key.as_str()).or_default() |= 1 << index;
             }
@@ -371,6 +422,43 @@ mod tests {
         assert!(atoms.predicate(&tokens("true")).holds(0));
         assert!(!atoms.predicate(&tokens("r#true")).holds(0));
         assert_eq!(atoms.len(), 1);
+    }
+
+    #[test]
+    fn string_values_follow_rust_escapes() {
+        for (literal, expected) in [
+            (r#""linux""#, Some("linux")),
+            (r#""\x6cinux""#, Some("linux")),
+            (r#""\u{6c}inux""#, Some("linux")),
+            (r#""\u{0_6_c}inux""#, Some("linux")),
+            ("\"lin\\\n    ux\"", Some("linux")),
+            ("\"lin\\\r\n\tux\"", Some("linux")),
+            ("\"a\r\nb\"", Some("a\nb")),
+            (r##"r#"lin"ux"#"##, Some("lin\"ux")),
+            (r#""\x80""#, None),
+            (r#""\u{d800}""#, None),
+            (r#""\u{}""#, None),
+            (r#""\u{_6c}""#, None),
+            (r#""\u{1234567}""#, None),
+            (r#""\q""#, None),
+            ("\"lin\\\rux\"", None),
+        ] {
+            assert_eq!(string_value(literal).as_deref(), expected, "{literal}");
+        }
+        let tokens = |text: &str| -> Vec<String> { text.split(' ').map(str::to_owned).collect() };
+        // 同じ値の別の書き方は同じ原子で、1 つの値しか取らない鍵の別の値とは同時に真にならない
+        let mut atoms = Atoms::default();
+        let plain = atoms.predicate(&tokens("target_os = \"linux\""));
+        let escaped = atoms.predicate(&tokens("target_os = \"\\x6cinux\""));
+        let other = atoms.predicate(&tokens("target_os = \"macos\""));
+        assert_eq!(atoms.len(), 2);
+        assert!(plain.holds(0b01) && escaped.holds(0b01) && other.holds(0b10));
+        assert_eq!(atoms.exclusive(), vec![0b11]);
+        // 解けない値の原子は、ほかの値と同時に真になり得る
+        let mut atoms = Atoms::default();
+        atoms.predicate(&tokens("target_os = \"linux\""));
+        atoms.predicate(&tokens("target_os = \"\\qinux\""));
+        assert_eq!(atoms.exclusive(), vec![0b01]);
     }
 
     #[test]
