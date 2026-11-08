@@ -27,6 +27,7 @@ mod rust_signature_dependencies;
 mod rust_struct_fields;
 mod rust_type_alias;
 mod rust_union_fields;
+mod ts_class_members;
 mod ts_declaration_imports;
 mod ts_strip_internal;
 mod typescript;

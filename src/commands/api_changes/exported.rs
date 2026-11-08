@@ -616,6 +616,19 @@ impl<'tree, 'source> ExportSurfaceContext<'tree, 'source> {
         {
             return true;
         }
+        // TypeScript のアクセサ (`get`・`set`) は、型の読み書きを持つプロパティとしてクラスの公開の
+        // 形 (クラスの signature) に入る (Issue #286)。API 差分では別のメソッドとして数えない
+        // (二重に報告しない)。dead-code の経路 (実行時入口を除外する) では従来どおり候補にする。
+        if !self.exclude_framework_entrypoints
+            && matches!(sym.kind, SymbolKind::Method)
+            && matches!(
+                self.lang_id,
+                crate::language::LangId::Typescript | crate::language::LangId::Tsx
+            )
+            && super::ts_class_api::is_accessor_symbol(sym, self.root)
+        {
+            return true;
+        }
 
         false
     }
@@ -1093,12 +1106,13 @@ fn filter_exported_with_metadata(
             continue;
         }
         // 除外判定後に署名を作り、不要な文字列構築を避ける。
-        let sig = extract_api_signature(
+        let sig = super::signature::extract_api_signature_with_original(
             sym,
             signature_root,
             signature_source,
             signature_lines,
             lang_id,
+            published.is_some().then_some((root, source)),
         );
         if result.rust_parameters.imports.is_some() {
             let function = rust_function_node_for_symbol(sym, root, source);

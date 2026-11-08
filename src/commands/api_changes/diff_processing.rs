@@ -1589,6 +1589,65 @@ impl<'a> ChangedSignatureFiles<'a> {
             };
             return (change, decision);
         }
+        // TypeScript のクラスの公開のメンバー (フィールド・パラメータプロパティ・アクセサ・
+        // コンストラクタなど) と enum のメンバーの変更も、中の利用を同じ差分で直しても外の利用者
+        // (フィールドの読み書き・継承・`implements`・`Record<Mode, T>` など) を直せないので、閉包や
+        // 同じファイルの中だけの利用による除外より先に決める (Issue #286)。見出しだけの変更は従来
+        // どおりに判定する。旧新の形を読めなければ blocking に残す。
+        if matches!(
+            self.lang_id,
+            Some(crate::language::LangId::Typescript | crate::language::LangId::Tsx)
+        ) && matches!(kind, "class" | "enum")
+        {
+            let site = CompatibleModSite {
+                dir,
+                base: inputs.base,
+                old_path: self.old_path,
+                new_path: self.new_path,
+                name,
+                kind,
+                old_sig,
+                new_sig,
+                lang_id: self.lang_id,
+            };
+            let decision = if kind == "enum" {
+                super::ts_class_api::enum_members_changed(old_sig, new_sig)
+                    .then_some(SignatureDecision::Blocking(None))
+            } else {
+                let mut sources =
+                    SignatureSourceCache::with_base_blobs(base_blobs, inputs.strip_internal);
+                let shape_change = site.lang_id.and_then(|lang| {
+                    let pair = sources.get(&site)?;
+                    let (old, new) = pair.parse_pair(lang)?;
+                    Some(super::ts_class_api::classify_class(
+                        &super::ts_class_api::unique_class_shape(old.root_node(), &pair.old, name)?,
+                        &super::ts_class_api::unique_class_shape(new.root_node(), &pair.new, name)?,
+                    ))
+                });
+                match shape_change {
+                    Some(super::ts_class_api::ClassChange::HeaderOnly) => None,
+                    // optional のフィールドの追加だけでも、メンバーの型が名指す同じファイルの型が
+                    // 変わっていれば互換と言えない。
+                    Some(super::ts_class_api::ClassChange::Compatible)
+                        if self.type_dependencies.and_then(|types| types.get(name))
+                            == Some(&super::ts_signature::DependencyStatus::Changed) =>
+                    {
+                        Some(SignatureDecision::Blocking(None))
+                    }
+                    Some(super::ts_class_api::ClassChange::Compatible) => {
+                        Some(SignatureDecision::Compatible(
+                            site.compatible("ts_class_optional_members_added"),
+                        ))
+                    }
+                    Some(super::ts_class_api::ClassChange::Breaking) | None => {
+                        Some(SignatureDecision::Blocking(None))
+                    }
+                }
+            };
+            if let Some(decision) = decision {
+                return (change, decision);
+            }
+        }
         // 移動先への全参照と const 追加を証明した組は、同一ファイル内だけの caller でも記録する。
         if self.lang_id == Some(crate::language::LangId::Rust)
             && self.rust_moved_const_additions.contains(name)
@@ -1718,6 +1777,42 @@ impl<'a> ChangedSignatureFiles<'a> {
         // ので、互換・追随済みの証明に進まず blocking にする (Issue #282)。
         if self.name_is_shared() {
             return (change, SignatureDecision::Blocking(None));
+        }
+        // TypeScript の関数・メソッドのオーバーロード: 宣言ファイルに出るのはオーバーロードの宣言の
+        // 並びで、既存の判定 (末尾の optional 引数の追加などの互換・呼び出し側の追随) は 1 つの
+        // シグネチャを前提にする。旧新のどちらかにオーバーロードがあれば blocking にする
+        // (Issue #286)。オーバーロードの足し引きと並べ替えは、呼び出しの解決や推論を変え得る。
+        if matches!(
+            self.lang_id,
+            Some(crate::language::LangId::Typescript | crate::language::LangId::Tsx)
+        ) && matches!(kind, "function" | "method")
+        {
+            let site = CompatibleModSite {
+                dir,
+                base: inputs.base,
+                old_path: self.old_path,
+                new_path: self.new_path,
+                name,
+                kind,
+                old_sig,
+                new_sig,
+                lang_id: self.lang_id,
+            };
+            let mut sources =
+                SignatureSourceCache::with_base_blobs(base_blobs, inputs.strip_internal);
+            let overloaded = site.lang_id.and_then(|lang| {
+                let pair = sources.get(&site)?;
+                let (old, new) = pair.parse_pair(lang)?;
+                Some(
+                    super::ts_class_api::has_overloads(old.root_node(), &pair.old, name)
+                        == Some(true)
+                        || super::ts_class_api::has_overloads(new.root_node(), &pair.new, name)
+                            == Some(true),
+                )
+            });
+            if overloaded == Some(true) {
+                return (change, SignatureDecision::Blocking(None));
+            }
         }
         let site = SignatureChangeSite {
             change,
