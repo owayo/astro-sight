@@ -390,6 +390,22 @@ fn collect_added_symbols(
         };
         if is_new {
             new_symbols_in_current_file.insert(name.clone());
+            // module の置き場の付け替えで旧版にもある項目は、比べ直しが扱う (Issue #305)。
+            if facts
+                .rust_declarations
+                .and_then(|declarations| declarations.new.get(index))
+                .is_some_and(|context| {
+                    inputs.module_availability.drops_candidate(
+                        super::rust_module_availability::Version::New,
+                        &df.new_path,
+                        context,
+                        name,
+                        kind,
+                    )
+                })
+            {
+                continue;
+            }
             let candidate = ApiSymbolCandidate {
                 inline_module: facts
                     .rust_declarations
@@ -525,6 +541,22 @@ fn collect_removed_symbols(
         .enumerate()
     {
         if removed {
+            // module の置き場の付け替えで新版にもある項目は、比べ直しが扱う (Issue #305)。
+            if facts
+                .rust_declarations
+                .and_then(|declarations| declarations.old.get(index))
+                .is_some_and(|context| {
+                    inputs.module_availability.drops_candidate(
+                        super::rust_module_availability::Version::Old,
+                        &df.old_path,
+                        context,
+                        name,
+                        kind,
+                    )
+                })
+            {
+                continue;
+            }
             let inline_module = facts
                 .rust_declarations
                 .and_then(|declarations| declarations.old_inline_module(index));
@@ -978,6 +1010,24 @@ fn collect_rust_availability_changes(
         return;
     }
     for (olds, news) in &pairing.groups {
+        // module の宣言の条件の変化で比べ直した項目は、置き場の条件を含めて比べてある (Issue #305)。
+        fn described<'a>(
+            indices: &[usize],
+            symbols: &'a [(String, String, String)],
+            contexts: &'a [RustDeclarationContext],
+        ) -> Vec<(&'a RustDeclarationContext, &'a str, &'a str)> {
+            indices
+                .iter()
+                .map(|&k| (&contexts[k], symbols[k].0.as_str(), symbols[k].1.as_str()))
+                .collect()
+        }
+        if inputs.module_availability.covers_availability(
+            df,
+            &described(olds, facts.old_syms, &declarations.old),
+            &described(news, facts.new_syms, &declarations.new),
+        ) {
+            continue;
+        }
         let old: Vec<&RustDeclarationContext> =
             olds.iter().map(|&i| &declarations.old[i]).collect();
         let new: Vec<&RustDeclarationContext> =
@@ -1088,6 +1138,114 @@ fn record_availability_change(
             }
             if gained && addable(state) {
                 state.buckets.cfg_added.push((candidate, availability));
+            }
+        }
+    }
+}
+
+/// module の宣言の条件が変わった module の項目の比べ直しの結果 (Issue #305) を、ファイルごとの比較と
+/// 同じ区分に振り分ける。ファイルごとの比較が同じ項目を出していれば重ねない。
+pub(crate) fn record_module_availability(
+    inputs: &DetectionInputs<'_>,
+    state: &mut DetectionState<'_>,
+) {
+    use super::rust_availability::AvailabilityChange;
+    use super::rust_module_availability::Outcome;
+    // 同じ項目の同じ条件の報告は重ねない (同じファイルを 2 つの module に使えば、条件の違う報告は別に
+    // 残す)。
+    let identity = |candidate: &ApiSymbolCandidate,
+                    availability: &crate::models::review::CfgAvailability| {
+        format!(
+            "{}\u{0}{:?}\u{0}{}\u{0}{}\u{0}{:?}",
+            candidate.file, candidate.inline_module, candidate.name, candidate.kind, availability
+        )
+    };
+    let mut reported_removed: std::collections::HashSet<String> = state
+        .buckets
+        .cfg_removed
+        .iter()
+        .map(|(candidate, availability)| identity(candidate, availability))
+        .collect();
+    let mut reported_added: std::collections::HashSet<String> = state
+        .buckets
+        .cfg_added
+        .iter()
+        .map(|(candidate, availability)| identity(candidate, availability))
+        .collect();
+    let mut callees: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for outcome in inputs.module_availability.outcomes() {
+        match outcome {
+            Outcome::Availability {
+                change,
+                candidate,
+                old_signature,
+                availability,
+                removable,
+            } => {
+                let reported = identity(candidate, availability);
+                let change = match *change {
+                    AvailabilityChange::Changed { lost, gained } => {
+                        let lost = lost && reported_removed.insert(reported.clone());
+                        let gained = gained && reported_added.insert(reported);
+                        if !lost && !gained {
+                            continue;
+                        }
+                        AvailabilityChange::Changed { lost, gained }
+                    }
+                    other => other,
+                };
+                let item = AvailabilityItem {
+                    candidate: candidate.clone(),
+                    old_signature: old_signature.clone(),
+                    availability: availability.clone(),
+                    removable: *removable,
+                };
+                let name = candidate.name.clone();
+                let file = candidate.file.clone();
+                record_availability_change(inputs, state, change, item, |_| {
+                    let callees = callees.entry(file.clone()).or_insert_with(|| {
+                        super::prepare::extract_new_file_facts(
+                            inputs.dir,
+                            &file,
+                            inputs.strip_internal,
+                        )
+                        .callees
+                    });
+                    !is_internally_connected(callees, &name)
+                        && !is_used_in_diff_paths(
+                            inputs.ref_index,
+                            inputs.dir,
+                            &name,
+                            &file,
+                            inputs.diff_new_paths,
+                        )
+                });
+            }
+            Outcome::Ambiguous {
+                candidate,
+                old_signature,
+            } => {
+                let change = ApiSymbolChange {
+                    inline_module: candidate.inline_module.clone(),
+                    unverified: None,
+                    name: candidate.name.clone(),
+                    kind: candidate.kind.clone(),
+                    file: candidate.file.clone(),
+                    old_signature: Some(old_signature.clone()),
+                    new_signature: Some(candidate.signature.clone()),
+                    no_resolved_internal_callers: false,
+                    contract_change: None,
+                };
+                record_signature_decision(
+                    inputs,
+                    state,
+                    change,
+                    SignatureDecision::Unverified(ApiModificationUnverified {
+                        reason: ApiModificationUnverifiedReason::RustDeclarationPairingAmbiguous,
+                        first_unproven: None,
+                    }),
+                );
             }
         }
     }
@@ -3019,6 +3177,21 @@ pub(crate) fn process_deleted_file(
     // base 側 blob の `export -f` 宣言はファイル単位で 1 回だけ読む (関数ごとの git show を避ける)。
     let mut bash_exported: Option<std::collections::HashSet<String>> = None;
     for (index, (name, kind, sig)) in old_syms.iter().enumerate() {
+        // module の置き場の付け替えで新版にもある項目は、比べ直しが扱う (Issue #305)。
+        if rust_declarations
+            .and_then(|declarations| declarations.get(index))
+            .is_some_and(|context| {
+                inputs.module_availability.drops_candidate(
+                    super::rust_module_availability::Version::Old,
+                    &df.old_path,
+                    context,
+                    name,
+                    kind,
+                )
+            })
+        {
+            continue;
+        }
         if !old_source_unverified
             && is_rust_old_symbol_outside_public_api_surface(
                 dir,
@@ -3078,6 +3251,21 @@ pub(crate) fn process_added_file(
     } = facts;
     let is_binary_rust_crate = is_binary_only_rust_crate(dir, &df.new_path);
     for (index, (name, kind, sig)) in new_syms.iter().enumerate() {
+        // module の置き場の付け替えで旧版にもある項目は、比べ直しが扱う (Issue #305)。
+        if rust_declarations
+            .and_then(|declarations| declarations.get(index))
+            .is_some_and(|context| {
+                inputs.module_availability.drops_candidate(
+                    super::rust_module_availability::Version::New,
+                    &df.new_path,
+                    context,
+                    name,
+                    kind,
+                )
+            })
+        {
+            continue;
+        }
         let candidate = ApiSymbolCandidate {
             inline_module: rust_declarations
                 .and_then(|declarations| declarations.get(index))

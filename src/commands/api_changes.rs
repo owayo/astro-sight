@@ -113,6 +113,21 @@ pub(crate) fn detect_api_changes_with_renames(
         &rust_crates,
     );
     buckets.parse_truncations.extend(parse_truncations);
+    // module の宣言の条件 (`#[cfg] mod m;` など) が変わった lib crate で、配下の公開の項目の有る設定を
+    // 比べ直す (Issue #305)。追加の候補の名前は索引で引けるよう先に足す。
+    let module_availability = rust_module_availability::ModuleAvailability::new(
+        dir,
+        &rust_crates,
+        &base_blobs,
+        &strip_internal,
+        diff_files,
+        renames,
+        &mut rust_public,
+    );
+    index_names.extend(module_availability.index_names().cloned());
+    buckets
+        .parse_truncations
+        .extend(module_availability.truncations.iter().cloned());
 
     // 型の移動と同じ差分でシグネチャの変わったメンバー、移動と同じ差分でシグネチャの変わった
     // 自由関数・定数は、削除と追加に割れた後で変更として判定し直す
@@ -150,6 +165,7 @@ pub(crate) fn detect_api_changes_with_renames(
         base_blobs: &base_blobs,
         strip_internal: &strip_internal,
         rust_crates: &rust_crates,
+        module_availability: &module_availability,
     };
     let mut state = DetectionState {
         buckets: &mut buckets,
@@ -308,6 +324,9 @@ pub(crate) fn detect_api_changes_with_renames(
     // まとめて) の有る設定を比べる (Issue #291)。移動は項目の対応を示すだけで、有る設定を保った
     // ことの証明にはしない。
     compare_moved_availability(&inputs, &mut state, &moved);
+    // module の宣言の条件が変わった module の項目の比べ直しの結果を、ファイルごとの比較と同じ区分に
+    // 振り分ける (Issue #305)。
+    record_module_availability(&inputs, &mut state);
 
     // removed のうち HEAD ツリーで他ファイル参照 0 件のものを `removed_dead` に振り分け。
     // 「base 時点で dead だった symbol の整理」だけでなく「base alive → HEAD で関連
@@ -737,6 +756,7 @@ mod rust_cfg_predicate;
 mod rust_declarations;
 mod rust_dependencies;
 mod rust_enum_api;
+mod rust_module_availability;
 mod rust_public;
 mod rust_ref_sites;
 mod rust_struct_api;

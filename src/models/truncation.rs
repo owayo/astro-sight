@@ -75,6 +75,10 @@ pub enum TruncationReason {
     /// 差分に無いファイルを探し切れなかった (上限を超えた・module を決められない、Issue #300)。
     /// 公開シグネチャの束縛の変化を見逃し得るので、hook は止める。
     RustDependentsIncomplete,
+    /// Rust の lib crate で module の宣言の条件 (`#[cfg]`・`#[path]` など) が変わり、条件の変わった
+    /// module の公開の項目を探し切れなかった (場所を決められない・読めない・構文エラー・項目の位置の
+    /// マクロ・上限、Issue #305)。公開の項目が消える設定を見逃し得るので、hook は止める。
+    RustModuleAvailabilityIncomplete,
 }
 
 impl TruncationInfo {

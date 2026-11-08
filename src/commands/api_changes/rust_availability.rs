@@ -52,17 +52,37 @@ fn side_predicate(atoms: &mut Atoms, keys: &[Vec<Vec<String>>]) -> Predicate {
     )
 }
 
+/// 属性 (有る条件の鍵) が全て付いたものが、どの設定でも無いと確かめられるか (`cfg(any())` など)。
+/// 原子が多すぎれば確かめられないので false (Issue #305)。
+pub(crate) fn unsatisfiable(attributes: &[super::AvailabilityAttr]) -> bool {
+    if attributes.is_empty() {
+        return false;
+    }
+    let mut atoms = Atoms::default();
+    let predicate = Predicate::All(
+        attributes
+            .iter()
+            .map(|attribute| atoms.presence(&attribute.key))
+            .collect(),
+    );
+    let Some(mut configs) = atoms.configs() else {
+        return false;
+    };
+    !configs.any(|config| predicate.holds(config))
+}
+
 /// 旧新の宣言 (同じキーの宣言をまとめて) の有る設定を比べる。
 pub(crate) fn compare(
     old: &[&RustDeclarationContext],
     new: &[&RustDeclarationContext],
 ) -> AvailabilityChange {
     let (Some(old_keys), Some(new_keys)) = (availability_keys(old), availability_keys(new)) else {
-        // 読めない属性があれば、条件の字面 (宣言ごとの cfg の属性のトークン) が同じときだけ同じとする。
+        // 読めない属性があれば、条件の字面 (宣言ごとの、有る条件に入れる cfg の属性のトークン) が
+        // 同じときだけ同じとする。
         fn conditions<'a>(side: &[&'a RustDeclarationContext]) -> Vec<&'a Vec<String>> {
             let mut conditions: Vec<&Vec<String>> = side
                 .iter()
-                .map(|declaration| &declaration.conditions)
+                .map(|declaration| &declaration.availability_raw)
                 .collect();
             conditions.sort();
             conditions
@@ -112,7 +132,7 @@ pub(crate) fn describe(
                     .iter()
                     .map(|attribute| attribute.shown.clone())
                     .collect(),
-                None => vec![declaration.conditions.join(" ")],
+                None => vec![declaration.availability_raw.join(" ")],
             })
             .collect()
     };
@@ -237,7 +257,7 @@ mod tests {
         // 読めない条件は、字面が同じときだけ同じ
         let unreadable = || RustDeclarationContext {
             availability: None,
-            conditions: vec!["#".to_owned(), "[".to_owned(), "cfg".to_owned()],
+            availability_raw: vec!["#".to_owned(), "[".to_owned(), "cfg".to_owned()],
             ..RustDeclarationContext::default()
         };
         let (old, new) = (unreadable(), unreadable());

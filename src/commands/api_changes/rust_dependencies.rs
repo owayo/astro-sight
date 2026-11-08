@@ -36,6 +36,7 @@ use crate::engine::rust_use_tree::{RustPubUseEdge, UsePathOrigin, expand_rust_us
 
 pub(crate) mod crates;
 pub(crate) mod dependents;
+pub(crate) mod placements;
 mod resolver;
 
 pub(crate) use crates::RustCrates;
@@ -200,9 +201,57 @@ pub(crate) struct ModuleDeclaration {
     attributes: Vec<String>,
     /// 見える範囲 (ほかの module の glob に持ち込まれるか)。
     visibility: Visibility,
+    /// 宣言の有る条件 (Issue #305。宣言自身、囲む inline module、ファイルの先頭の、`cfg` と `cfg` に
+    /// 絞った `cfg_attr`。外側から)。読めない属性があれば None。
+    availability: Option<Vec<AvailabilityAttr>>,
+    /// `availability` に入れる属性の生のトークン。
+    availability_raw: Vec<String>,
+    /// 宣言自身の属性のうち、中身の場所の決め方に効き得るもの (`path`・`cfg_attr`) のトークン。
+    location_attributes: Vec<String>,
+    /// 宣言を囲む inline module の属性のうち、中身の場所の決め方に効き得るもののトークン (外側から)。
+    enclosing_attributes: Vec<String>,
+    /// 宣言を囲む inline module が全て `pub` (制限なし) か。
+    enclosing_public: bool,
 }
 
 impl ModuleDeclaration {
+    /// 中身がこのファイルにある (inline) か。
+    pub(crate) fn inline(&self) -> bool {
+        self.inline
+    }
+
+    /// `pub` (制限なし) か。
+    pub(crate) fn public(&self) -> bool {
+        self.visibility == Visibility::Public
+    }
+
+    /// 宣言自身と、それを囲む inline module が全て `pub` (制限なし) か (crate の外から module の経路で
+    /// 届くか)。
+    pub(crate) fn reachable(&self) -> bool {
+        self.public() && self.enclosing_public
+    }
+
+    /// 宣言の有る条件 (読めない属性があれば None)。
+    pub(crate) fn availability(&self) -> Option<&[AvailabilityAttr]> {
+        self.availability.as_deref()
+    }
+
+    /// 宣言の有る条件の生のトークン。
+    pub(crate) fn availability_raw(&self) -> &[String] {
+        &self.availability_raw
+    }
+
+    /// 中身のファイルの場所を決める入力の識別 (宣言と囲む inline module の、場所の決め方に効き得る
+    /// 属性 (`path`・`cfg_attr`) のトークン)。場所を決められない宣言の旧新を比べるのに使う。
+    pub(crate) fn resolution_identity(&self) -> String {
+        format!(
+            "{:?} {} | {}",
+            self.path,
+            self.location_attributes.join(" "),
+            self.enclosing_attributes.join(" ")
+        )
+    }
+
     /// 宣言に `#[cfg(test)]` が付いているか (テストの build にだけある module)。
     pub(crate) fn only_in_tests(&self) -> bool {
         self.conditions
@@ -239,6 +288,8 @@ struct ScopeBindings {
     macros: Vec<String>,
     /// inline module に `#[path]` が付いている (中の `mod x;` の場所を決められない)。
     path_attribute: bool,
+    /// item 位置でマクロを呼び出す (項目や module を生成し得る。Issue #305)。
+    invokes_macros: bool,
 }
 
 impl ScopeBindings {
@@ -262,6 +313,7 @@ impl ScopeBindings {
         self.globs.extend(other.globs);
         self.macros.extend(other.macros);
         self.path_attribute |= other.path_attribute;
+        self.invokes_macros |= other.invokes_macros;
     }
 
     /// スコープが束縛する名前 (宣言・型別名・定数・module・`use`)。
@@ -302,6 +354,8 @@ pub(crate) struct DependencyIndex {
     mod_rs: bool,
     /// ファイルのマクロ定義 (`macro_rules!`) のトークン。マクロの呼び出しの識別に添える。
     macro_definitions: Vec<String>,
+    /// ファイルの先頭の内側の `cfg` と `cfg` に絞った `cfg_attr` (読めなければ None。Issue #305)。
+    file_availability: Option<Vec<AvailabilityAttr>>,
     tree: tree_sitter::Tree,
     source: Vec<u8>,
 }
@@ -429,10 +483,12 @@ impl DependencyIndex {
             path: file.to_owned(),
             mod_rs,
             macro_definitions: Vec::new(),
+            file_availability: None,
             tree,
             source: source.to_vec(),
         };
         let root = index.tree.root_node();
+        index.file_availability = file_availability(root, &index.source);
         let mut scopes = Vec::new();
         let mut definitions = Vec::new();
         // 深い入れ子の inline module でもスタックを溢れさせないよう、明示のスタックで下りる。
@@ -593,6 +649,117 @@ impl DependencyIndex {
             .get(scope)
             .map(|bindings| bindings.names().into_iter().map(str::to_owned).collect())
             .unwrap_or_default()
+    }
+
+    /// module の置き場の条件に効く入力の指紋 (Issue #305)。スコープごとの、中身が別のファイルの `mod` の
+    /// 宣言の名前・中身の場所の指定・公開か・場所の決め方に効き得る属性・有る条件の生のトークン・囲む
+    /// inline module の場所の決め方に効き得る属性。ファイルの先頭の `#![cfg]` は宣言の有る条件に入る。
+    pub(crate) fn module_condition_fingerprint(&self) -> Vec<String> {
+        let mut entries = Vec::new();
+        for (scope, bindings) in &self.scopes {
+            for (name, declarations) in &bindings.modules {
+                // inline module の宣言は、中のファイルの module の宣言の有る条件と場所の入力 (囲む inline
+                // module の属性を含む) に入るので、それ自体は数えない (`#[cfg(test)] mod tests {}` を
+                // 足しても門を開かない)。
+                for declaration in declarations
+                    .iter()
+                    .filter(|declaration| !declaration.inline)
+                {
+                    entries.push(format!(
+                        "{scope:?} {name} {} {} {} | {}",
+                        declaration.inline,
+                        declaration.reachable(),
+                        declaration.resolution_identity(),
+                        declaration.availability_raw.join(" ")
+                    ));
+                }
+            }
+        }
+        entries.sort();
+        entries
+    }
+
+    /// ファイルの `pub` (制限なし) の `use` が持ち込む・公開する名前 (束縛の名前と先の名前)。公開の glob・
+    /// 展開できない `use`・項目の位置のマクロがあれば、どの名前も公開し得る (None)。`reachable` が偽の
+    /// スコープ (どの設定でも無い inline module) は見ない。ファイルの非公開の inline module の項目を
+    /// 再公開し得るかに使う (Issue #305)。
+    pub(crate) fn public_mentions(
+        &self,
+        reachable: impl Fn(&[String]) -> bool,
+    ) -> Option<std::collections::HashSet<String>> {
+        let mut names = std::collections::HashSet::new();
+        for (scope, bindings) in &self.scopes {
+            // どの設定でも無い inline module の中は、何も公開しない。
+            if !reachable(scope) {
+                continue;
+            }
+            if !bindings.macros.is_empty()
+                || bindings
+                    .globs
+                    .iter()
+                    .any(|glob| glob.visibility == Visibility::Public)
+            {
+                return None;
+            }
+            for (bound, targets) in &bindings.uses {
+                for target in targets {
+                    if target.visibility == Visibility::Public {
+                        names.insert(bound.clone());
+                        names.extend(target.item.iter().cloned());
+                    }
+                }
+            }
+        }
+        Some(names)
+    }
+
+    /// ファイルのソースの大きさ。
+    pub(crate) fn source_len(&self) -> usize {
+        self.source.len()
+    }
+
+    /// ファイルの先頭の内側の `cfg` と `cfg` に絞った `cfg_attr` (読めなければ None)。
+    pub(crate) fn file_availability(&self) -> Option<&[AvailabilityAttr]> {
+        self.file_availability.as_deref()
+    }
+
+    /// 始まりが `start` の型別名・構造体・enum・union の宣言全体のトークンと、trait の見出し (型引数・上位
+    /// trait・`where`) と関連型のトークン (signature に入らない型別名の右辺、フィールド・variant、関連型の
+    /// 制約を含む。コメントは除く。trait のメソッドと関連定数は別の項目として比べる)。ほかの宣言 (signature
+    /// と束縛で比べる関数など) と引けない宣言は None (Issue #305)。
+    pub(crate) fn declaration_contract(&self, start: (usize, usize)) -> Option<Vec<String>> {
+        let node = declaration_at(self.tree.root_node(), start)?;
+        match node.kind() {
+            "type_item" | "struct_item" | "enum_item" | "union_item" => {
+                Some(tokens_of(node, &self.source))
+            }
+            "trait_item" => {
+                let body = node.child_by_field_name("body");
+                let mut tokens = Vec::new();
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if Some(child) != body {
+                        tokens.extend(tokens_of(child, &self.source));
+                        continue;
+                    }
+                    let mut members = child.walk();
+                    for member in child.named_children(&mut members) {
+                        if member.kind() == "associated_type" {
+                            tokens.extend(tokens_of(member, &self.source));
+                        }
+                    }
+                }
+                Some(tokens)
+            }
+            _ => None,
+        }
+    }
+    /// スコープ `scope` (inline module の経路) が item 位置でマクロを呼び出すか (項目や module を
+    /// 生成し得る)。
+    pub(crate) fn scope_invokes_macros(&self, scope: &[String]) -> bool {
+        self.scopes
+            .get(scope)
+            .is_some_and(|bindings| bindings.invokes_macros)
     }
 
     /// resolver が読む束縛の指紋 (Issue #300)。スコープ (inline module の経路) ごと。関数の本体・
@@ -1137,6 +1304,8 @@ fn collect_scope<'tree>(
             | "trait_item"
             | "function_item"
             | "function_signature_item" => {
+                // trait の中身の項目の位置のマクロは、関連項目を生成し得る (Issue #305)。
+                bindings.invokes_macros |= item.kind() == "trait_item" && body_invokes_macros(item);
                 if let Some(name) = name() {
                     let kind: &'static str = match item.kind() {
                         "struct_item" => "struct_item",
@@ -1164,6 +1333,7 @@ fn collect_scope<'tree>(
                 let attributes = preceding_attribute_tokens(item, source);
                 let module_source = module_source(item, source);
                 let path_attribute = module_source != ModuleSource::Default;
+                let (availability, availability_raw) = item_availability(item, source);
                 bindings
                     .modules
                     .entry(name.clone())
@@ -1174,6 +1344,11 @@ fn collect_scope<'tree>(
                         conditions: conditions(),
                         attributes,
                         visibility: visibility(item, source, &current_module),
+                        availability,
+                        availability_raw,
+                        location_attributes: location_attribute_tokens(item, source),
+                        enclosing_attributes: enclosing_module_attributes(item, source),
+                        enclosing_public: enclosing_modules_public(item, source),
                     });
                 if let Some(body) = body {
                     let mut child = path.clone();
@@ -1185,13 +1360,111 @@ fn collect_scope<'tree>(
             }
             "macro_invocation" | "expression_statement" => {
                 bindings.macros.extend(tokens_of(item, source));
+                bindings.invokes_macros = true;
             }
             "macro_definition" => definitions.extend(tokens_of(item, source)),
+            // impl・extern ブロックの中身の項目の位置のマクロは、項目を生成し得る (Issue #305)。
+            "impl_item" | "foreign_mod_item" => {
+                bindings.invokes_macros |= body_invokes_macros(item);
+            }
             _ => {}
         }
     }
     scopes.push((path, bindings));
     children
+}
+
+/// 項目 `item` を囲む inline module の属性のトークン (外側から。各 module の外側の属性と、中身の
+/// 内側の属性)。
+fn enclosing_module_attributes(item: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    let mut node = item;
+    while let Some(body) = node.parent() {
+        if body.kind() != "declaration_list" {
+            break;
+        }
+        let Some(container) = body.parent() else {
+            break;
+        };
+        let mut tokens = location_attribute_tokens(container, source);
+        let mut cursor = body.walk();
+        for child in body.named_children(&mut cursor) {
+            if child.kind() == "inner_attribute_item"
+                && let Some(found) = location_tokens(child, source)
+            {
+                tokens.push("#![".to_owned());
+                tokens.extend(found);
+                tokens.push("]".to_owned());
+            }
+        }
+        groups.push(tokens);
+        node = container;
+    }
+    groups.reverse();
+    groups.into_iter().flatten().collect()
+}
+
+/// 項目 `item` (impl・trait・extern ブロック) の中身の直下で、マクロを呼び出すか。
+fn body_invokes_macros(item: tree_sitter::Node<'_>) -> bool {
+    let Some(body) = item.child_by_field_name("body") else {
+        return false;
+    };
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .any(|child| matches!(child.kind(), "macro_invocation" | "expression_statement"))
+}
+
+/// 属性 `attribute` の、module の中身の場所の決め方に効く部分のトークン (`path` と、`cfg_attr` の
+/// `path` に絞った鍵)。効かなければ None、読めなければ属性全体。
+fn location_tokens(attribute: tree_sitter::Node<'_>, source: &[u8]) -> Option<Vec<String>> {
+    match super::rust_type_api::project_attribute(attribute, source, &["path"]) {
+        Some(Some(projected)) => Some(projected.key),
+        Some(None) => None,
+        None => Some(tokens_of(attribute, source)),
+    }
+}
+
+/// 項目 `item` の直前に並ぶ外側の属性のうち、module の中身の場所の決め方に効く部分のトークン。
+fn location_attribute_tokens(item: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    let mut attributes = Vec::new();
+    let mut previous = item.prev_named_sibling();
+    while let Some(sibling) = previous {
+        match sibling.kind() {
+            "attribute_item" => attributes.push(sibling),
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        previous = sibling.prev_named_sibling();
+    }
+    let mut tokens = Vec::new();
+    for attribute in attributes.into_iter().rev() {
+        if let Some(found) = location_tokens(attribute, source) {
+            tokens.push("#[".to_owned());
+            tokens.extend(found);
+            tokens.push("]".to_owned());
+        }
+    }
+    tokens
+}
+
+/// 項目 `item` を囲む inline module が全て `pub` (制限なし) か。
+fn enclosing_modules_public(item: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut node = item;
+    while let Some(body) = node.parent() {
+        if body.kind() != "declaration_list" {
+            break;
+        }
+        let Some(container) = body.parent() else {
+            break;
+        };
+        if container.kind() == "mod_item"
+            && !crate::engine::symbols::rust_node_has_unrestricted_pub_visibility(container, source)
+        {
+            return false;
+        }
+        node = container;
+    }
+    true
 }
 
 /// 項目 `item` の直前に並ぶ外側の属性のトークン (コメントは飛ばす)。
@@ -1659,6 +1932,8 @@ mod tests {
                         start: (start.row, start.column),
                         container_header: Vec::new(),
                         availability: Some(Vec::new()),
+                        availability_raw: Vec::new(),
+                        inline_public: true,
                     };
                 }
                 let mut cursor = node.walk();

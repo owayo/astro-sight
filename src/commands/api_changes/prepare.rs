@@ -121,6 +121,9 @@ pub(crate) struct DetectionInputs<'a> {
     /// 差分の中の package の Rust の lib crate (Issue #300)。束縛が変わった package では、契約が
     /// 名指す名前をほかのファイルまで版ごとに解く。
     pub(crate) rust_crates: &'a super::RustCrates<'a>,
+    /// module の宣言の条件が変わった module の項目の比べ直し (Issue #305)。比べ直した項目は、
+    /// ファイルごとの有る設定の比較と削除・追加の候補から外す。
+    pub(crate) module_availability: &'a super::rust_module_availability::ModuleAvailability,
 }
 
 /// 分類の過程で更新される可変状態 (結果バケットと、ファイル単位のメモ化キャッシュ)。
