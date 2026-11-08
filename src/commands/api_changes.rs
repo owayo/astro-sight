@@ -662,6 +662,7 @@ mod ts_namespace;
 mod ts_required_members;
 
 mod ts_alias_resolution;
+mod ts_class_api;
 mod ts_module_paths;
 mod ts_signature;
 mod type_dependency_symbols;

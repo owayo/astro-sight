@@ -321,8 +321,42 @@ fn is_strippable_type_element(node: Node<'_>) -> bool {
                         .any(|child| child.kind() == "mapped_type_clause"))
         }
         "tuple_type" => node.is_named() && node.kind() != "comment",
+        // クラスのメンバー (フィールド・メソッド・アクセサ・宣言・index signature) と enum の
+        // メンバーも、宣言ファイルから消える (Issue #286)。
+        "class_body" => matches!(
+            node.kind(),
+            "public_field_definition"
+                | "method_definition"
+                | "method_signature"
+                | "abstract_method_signature"
+                | "index_signature"
+        ),
+        "enum_body" => matches!(
+            node.kind(),
+            "property_identifier" | "string" | "number" | "enum_assignment"
+        ),
         _ => false,
     }
+}
+
+/// 宣言ファイルを作るとき `stripInternal` で消える、本体の無い関数の宣言の文か (オーバーロードと
+/// ambient の宣言。export 文も)。実装のある宣言とクラスなどは、シンボルごとに除く
+/// ([`is_internal_symbol`])。オーバーロードの一部だけが `@internal` なら、残りのオーバーロードが
+/// 宣言ファイルに出る (Issue #286)。
+fn is_stripped_signature_statement(node: Node<'_>, source: &[u8]) -> bool {
+    node.parent()
+        .is_some_and(|parent| matches!(parent.kind(), "program" | "statement_block"))
+        && declaration_of(node).kind() == "function_signature"
+        && has_internal_comment(node, source)
+        && is_emitted_position(node)
+}
+
+/// 宣言ファイルを作るとき `stripInternal` で消えるメンバーか ([`published_source`] が空白にする
+/// もの)。
+pub(crate) fn is_stripped_member(node: Node<'_>, source: &[u8]) -> bool {
+    is_strippable_type_element(node)
+        && has_internal_comment(node, source)
+        && is_emitted_position(node)
 }
 
 /// 式の種類。式の中の型 (アロー関数の引数・`as` の型など) は、宣言ファイルでは推論した型として
@@ -417,10 +451,7 @@ pub(crate) fn published_source(root: Node<'_>, source: &[u8]) -> Option<Vec<u8>>
     let mut ranges = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if is_strippable_type_element(node)
-            && has_internal_comment(node, source)
-            && is_emitted_position(node)
-        {
+        if is_stripped_member(node, source) || is_stripped_signature_statement(node, source) {
             ranges.push(member_extent(node, source));
             continue;
         }

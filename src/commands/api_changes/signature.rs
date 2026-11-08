@@ -46,7 +46,38 @@ pub(crate) fn extract_api_signature(
     lines: &[&str],
     lang_id: crate::language::LangId,
 ) -> String {
+    extract_api_signature_with_original(sym, root, source, lines, lang_id, None)
+}
+
+/// [`extract_api_signature`] で、`root`・`source` が TS の `stripInternal` を当てたファイルなら、
+/// 当てる前のファイルを `original` に渡す (enum のメンバーの値は消える前の宣言から求める)。
+pub(crate) fn extract_api_signature_with_original(
+    sym: &crate::models::symbol::Symbol,
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    lines: &[&str],
+    lang_id: crate::language::LangId,
+    original: Option<(tree_sitter::Node<'_>, &[u8])>,
+) -> String {
     use crate::models::symbol::SymbolKind;
+    let typescript = matches!(
+        lang_id,
+        crate::language::LangId::Typescript | crate::language::LangId::Tsx
+    );
+    // TypeScript のクラスと enum は、宣言ファイルに出る公開の形 (クラスのフィールド・アクセサ・
+    // コンストラクタなど、enum のメンバーと値) を signature にする (Issue #286)。
+    if typescript
+        && sym.kind == SymbolKind::Class
+        && let Some(signature) = super::ts_class_api::class_signature(sym, root, source)
+    {
+        return signature;
+    }
+    if typescript
+        && sym.kind == SymbolKind::Enum
+        && let Some(signature) = super::ts_class_api::enum_signature(sym, root, source, original)
+    {
+        return signature;
+    }
     if matches!(
         lang_id,
         crate::language::LangId::Typescript | crate::language::LangId::Tsx
@@ -116,6 +147,20 @@ pub(crate) fn extract_api_signature(
                     // Swift protocol requirement (body なしの宣言)。複数行 requirement でも
                     // 先頭行 fallback でなく AST から signature 全体を抽出する (codex 指摘)。
                     | "protocol_function_declaration" => {
+                        // TypeScript の関数・メソッドにオーバーロードの宣言があれば、宣言ファイルに
+                        // 出るのはそちらで、実装の宣言は出ない (Issue #286)。
+                        if typescript
+                            && matches!(cur.kind(), "function_declaration" | "method_definition")
+                        {
+                            let overloads =
+                                super::ts_class_api::overload_declarations(cur, source);
+                            if !overloads.is_empty()
+                                && let Some(signature) =
+                                    super::ts_class_api::overloads_signature(&overloads, source)
+                            {
+                                return signature;
+                            }
+                        }
                         let s = cur.start_byte();
                         let e =
                             function_body_start_byte(cur).unwrap_or_else(|| cur.end_byte());
