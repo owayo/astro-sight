@@ -139,7 +139,8 @@ impl OldNewSources {
         new_path: &str,
         lang: LangId,
     ) {
-        if let Some(published) = strip_internal.published(old_path, lang, &self.old) {
+        // 旧版は base の版の設定で判定する (Issue #287)。
+        if let Some(published) = strip_internal.published_old(old_path, lang, &self.old) {
             self.original_old = Some(std::mem::replace(&mut self.old, published));
         }
         if let Some(published) = strip_internal.published(new_path, lang, &self.new) {

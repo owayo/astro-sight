@@ -15,41 +15,137 @@ use crate::language::LangId;
 use crate::models::symbol::Symbol;
 
 /// リポジトリの `stripInternal` の設定。TS のソースに `@internal` があるときだけ、ファイルに
-/// 適用される設定を読む (設定ごとに覚える)。
+/// 適用される設定を読む (設定ごとに覚える)。旧版のソースは base の版の設定で判定する (Issue #287)。
 pub(crate) struct StripInternal {
+    /// 今の設定 (新版のソース)。
     configs: Option<RefCell<super::ts_alias_resolution::StripInternalConfigs>>,
+    /// base の版の設定を読む場所 (`dir`, 版)。[`Self::with_base`] のときだけ。
+    base: Option<(String, String)>,
+    /// base の版の設定 (旧版のソース)。初めて要るとき (`@internal` を含む TS のソースか、設定の
+    /// 変更) に読み、`@internal` の無い差分では git を動かさない。base の tree を読めなければ None
+    /// で、旧版も今の設定で判定する。
+    base_configs:
+        std::cell::OnceCell<Option<RefCell<super::ts_alias_resolution::StripInternalConfigs>>>,
+    /// 片方の設定を決められなかったファイルの、もう片方の判定 ((旧版か, パス) → 当たるか)。
+    /// [`Self::align`]。
+    overrides: RefCell<std::collections::HashMap<(bool, String), bool>>,
 }
 
 impl StripInternal {
+    /// 旧版も新版も今の設定で判定する。
     pub(crate) fn new(dir: &str) -> Self {
         Self {
             configs: Some(RefCell::new(
                 super::ts_alias_resolution::StripInternalConfigs::new(dir),
             )),
+            base: None,
+            base_configs: std::cell::OnceCell::new(),
+            overrides: RefCell::default(),
+        }
+    }
+
+    /// 旧版のソースを base の版 `rev` の設定で、新版を今の設定で判定する。base の tree を読めな
+    /// ければ、旧版も今の設定で判定する ([`Self::has_base`] が false)。
+    pub(crate) fn with_base(dir: &str, rev: &str) -> Self {
+        Self {
+            base: Some((dir.to_owned(), rev.to_owned())),
+            ..Self::new(dir)
         }
     }
 
     /// 設定を読まず、`@internal` を見ない (API の差分以外の用途)。
     pub(crate) fn disabled() -> Self {
-        Self { configs: None }
+        Self {
+            configs: None,
+            base: None,
+            base_configs: std::cell::OnceCell::new(),
+            overrides: RefCell::default(),
+        }
+    }
+
+    /// base の版の設定 (初めて要るときに読む)。
+    fn base_configs(&self) -> Option<&RefCell<super::ts_alias_resolution::StripInternalConfigs>> {
+        let (dir, rev) = self.base.as_ref()?;
+        self.base_configs
+            .get_or_init(|| {
+                super::ts_alias_resolution::BaseTree::load(dir, rev).map(|tree| {
+                    RefCell::new(super::ts_alias_resolution::StripInternalConfigs::with_fs(
+                        dir,
+                        super::ts_alias_resolution::ConfigFs::Base(std::rc::Rc::new(tree)),
+                    ))
+                })
+            })
+            .as_ref()
+    }
+
+    /// 旧版を base の版の設定で判定するか。
+    pub(crate) fn has_base(&self) -> bool {
+        self.base_configs().is_some()
+    }
+
+    /// 旧版の判定に使う設定。
+    fn old_configs(&self) -> Option<&RefCell<super::ts_alias_resolution::StripInternalConfigs>> {
+        self.base_configs().or(self.configs.as_ref())
     }
 
     /// `path` (`dir` 相対。言語 `lang`、ソース `source`) で、`@internal` の宣言を宣言ファイルから
-    /// 消すか。手書きの宣言ファイル (`.d.ts` など) は出力しないので消えない。
+    /// 消すか (新版)。手書きの宣言ファイル (`.d.ts` など) は出力しないので消えない。
     pub(crate) fn applies(&self, path: &str, lang: LangId, source: &[u8]) -> bool {
-        let Some(configs) = &self.configs else {
+        self.configs.as_ref().is_some_and(|configs| {
+            may_strip(path, lang, source)
+                && match self.overrides.borrow().get(&(false, path.to_owned())) {
+                    Some(&value) => value,
+                    None => configs.borrow_mut().strips(path),
+                }
+        })
+    }
+
+    /// [`Self::applies`] の旧版 (base の版の設定で判定する)。
+    pub(crate) fn applies_old(&self, path: &str, lang: LangId, source: &[u8]) -> bool {
+        // `@internal` を含まないソースでは base の版の設定を読まない (git を動かさない)。
+        may_strip(path, lang, source)
+            && self.old_configs().is_some_and(|configs| {
+                match self.overrides.borrow().get(&(true, path.to_owned())) {
+                    Some(&value) => value,
+                    None => configs.borrow_mut().strips(path),
+                }
+            })
+    }
+
+    /// 旧版 `old_path` と新版 `new_path` の片方の設定を決められなければ、決められた側の判定を
+    /// 両方に当てる (設定が変わったかを確かめられないので、変わらなかったとみなす)。旧新とも決め
+    /// られなければ、両方とも有効にしないとみなす (読めない設定の扱いと同じ。片方だけが有効と
+    /// 読めても、変化を結論しない)。決められない側があれば true (申告する)。
+    pub(crate) fn align(&self, old_path: &str, new_path: &str) -> bool {
+        use super::ts_alias_resolution::StripState;
+        let Some((old, new)) = self.states(old_path, new_path) else {
             return false;
         };
-        matches!(lang, LangId::Typescript | LangId::Tsx)
-            && !super::ts_module_paths::is_declaration_path(path)
-            && source
-                .windows(b"@internal".len())
-                .any(|window| window == b"@internal")
-            && configs.borrow_mut().strips(path)
+        match (old, new) {
+            (StripState::Unknown, StripState::Unknown) => {
+                let mut overrides = self.overrides.borrow_mut();
+                overrides.insert((true, old_path.to_owned()), false);
+                overrides.insert((false, new_path.to_owned()), false);
+                true
+            }
+            (StripState::Unknown, known) => {
+                self.overrides
+                    .borrow_mut()
+                    .insert((true, old_path.to_owned()), known == StripState::Strips);
+                true
+            }
+            (known, StripState::Unknown) => {
+                self.overrides
+                    .borrow_mut()
+                    .insert((false, new_path.to_owned()), known == StripState::Strips);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// `path` に `stripInternal` が当たるとき、宣言ファイルの型のメンバーにした `source`
-    /// ([`published_source`])。当たらない・消すものが無い・解けないときは None。
+    /// ([`published_source`])。当たらない・消すものが無い・解けないときは None (新版)。
     pub(crate) fn published(&self, path: &str, lang: LangId, source: &[u8]) -> Option<Vec<u8>> {
         if !self.applies(path, lang, source) {
             return None;
@@ -57,6 +153,42 @@ impl StripInternal {
         let tree = crate::engine::parser::parse_source(source, lang).ok()?;
         published_source(tree.root_node(), source)
     }
+
+    /// [`Self::published`] の旧版。
+    pub(crate) fn published_old(&self, path: &str, lang: LangId, source: &[u8]) -> Option<Vec<u8>> {
+        if !self.applies_old(path, lang, source) {
+            return None;
+        }
+        let tree = crate::engine::parser::parse_source(source, lang).ok()?;
+        published_source(tree.root_node(), source)
+    }
+
+    /// 旧版 `old_path` と新版 `new_path` に当たる設定の判定 (`@internal` の有無を問わない)。
+    /// base の版の設定を読めないときは None (旧新を比べ直さない)。
+    pub(crate) fn states(
+        &self,
+        old_path: &str,
+        new_path: &str,
+    ) -> Option<(
+        super::ts_alias_resolution::StripState,
+        super::ts_alias_resolution::StripState,
+    )> {
+        let base = self.base_configs()?;
+        let configs = self.configs.as_ref()?;
+        let old = base.borrow_mut().strips_state(old_path);
+        let new = configs.borrow_mut().strips_state(new_path);
+        Some((old, new))
+    }
+}
+
+/// `@internal` の宣言を宣言ファイルから消し得るソースか (TS の出力するソースで、`@internal` を
+/// 含む)。手書きの宣言ファイル (`.d.ts` など) は出力しない。
+pub(crate) fn may_strip(path: &str, lang: LangId, source: &[u8]) -> bool {
+    matches!(lang, LangId::Typescript | LangId::Tsx)
+        && !super::ts_module_paths::is_declaration_path(path)
+        && source
+            .windows(b"@internal".len())
+            .any(|window| window == b"@internal")
 }
 
 /// TypeScript の改行 (`\n`・`\r`・U+2028・U+2029) があるか。

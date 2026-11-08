@@ -18,13 +18,25 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
+use super::config_fs::{ConfigFs, Listing};
 use super::{
-    ConfigLoader, MAX_ANCESTORS, MAX_CHAIN_DEPTH, is_config_name, missing, normalize_lexically,
-    option_path, regular_file,
+    ConfigLoader, MAX_ANCESTORS, MAX_CHAIN_DEPTH, is_config_name, normalize_lexically, option_path,
 };
 
 /// TypeScript がワイルドカードで辿らないディレクトリ。
 const PACKAGE_FOLDERS: [&str; 3] = ["node_modules", "bower_components", "jspm_packages"];
+
+/// ファイルに当たる `stripInternal` の判定 (Issue #287)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StripState {
+    /// ファイルを入力に含む設定のどれかが有効にする。
+    Strips,
+    /// 有効にする設定が無い (設定が無いことも含む)。
+    Keeps,
+    /// 決められない (設定やディレクトリの一覧を読めない・解けない、入力に含むか分からない設定が
+    /// 有効にする)。
+    Unknown,
+}
 
 pub(crate) struct StripInternalConfigs {
     root: Option<PathBuf>,
@@ -33,17 +45,25 @@ pub(crate) struct StripInternalConfigs {
     directories: HashMap<PathBuf, Option<Vec<PathBuf>>>,
     /// 設定 → 入力 (読めない・解けなければ None)。
     inputs: HashMap<PathBuf, Option<Inputs>>,
-    /// 設定 → `stripInternal` を実効で有効にするか。
-    strips: HashMap<PathBuf, bool>,
+    /// 設定 → `stripInternal` の実効値 (読めない・解けなければ None)。
+    strips: HashMap<PathBuf, Option<bool>>,
 }
 
 impl StripInternalConfigs {
     pub(crate) fn new(dir: &str) -> Self {
+        Self::with_fs(dir, ConfigFs::Current)
+    }
+
+    /// 設定をファイルシステム `fs` (今のものか base の版) から読む。
+    pub(crate) fn with_fs(dir: &str, fs: ConfigFs) -> Self {
         Self {
             root: std::path::absolute(Path::new(dir))
                 .ok()
                 .and_then(|path| path.canonicalize().ok()),
-            loader: ConfigLoader::default(),
+            loader: ConfigLoader {
+                fs,
+                ..ConfigLoader::default()
+            },
             directories: HashMap::new(),
             inputs: HashMap::new(),
             strips: HashMap::new(),
@@ -51,43 +71,73 @@ impl StripInternalConfigs {
     }
 
     /// `path` (`dir` 相対) のファイルの宣言を出し得る設定が、`stripInternal` を実効で有効に
-    /// するか。削除したファイルのディレクトリが無くても、祖先の設定を見る。
+    /// するか。削除したファイルのディレクトリが無くても、祖先の設定を見る。読めない・解けない
+    /// 設定は、ファイルを含み得るものとして扱い、有効にするとはみなさない。
     pub(crate) fn strips(&mut self, path: &str) -> bool {
+        self.evaluate(path).0
+    }
+
+    /// [`Self::strips`] を、決められないときを分けて返す。設定だけの変更で旧新を比べ直すときは、
+    /// 決められない側があれば確定した差分にしない。
+    pub(crate) fn strips_state(&mut self, path: &str) -> StripState {
+        self.evaluate(path).1
+    }
+
+    /// ([`Self::strips`] の値, [`Self::strips_state`] の値)。
+    fn evaluate(&mut self, path: &str) -> (bool, StripState) {
         let Some(file) = self.root.as_ref().map(|root| root.join(path)) else {
-            return false;
+            return (false, StripState::Unknown);
         };
         let Some(start) = file.parent() else {
-            return false;
+            return (false, StripState::Unknown);
         };
         let target = components(&file);
         for (depth, directory) in start.ancestors().enumerate() {
             if depth > MAX_ANCESTORS {
-                break;
+                return (false, StripState::Unknown);
             }
             let Some(configs) = self.directory_configs(directory) else {
-                break;
+                return (false, StripState::Unknown);
             };
-            let mut decided: Option<bool> = None;
+            let mut decided: Option<(bool, StripState)> = None;
             for config in configs {
-                match self.membership(&config, &target) {
-                    Membership::Includes | Membership::Unknown => {
-                        let strips = self.config_strips(&config);
-                        decided = Some(decided.unwrap_or(false) || strips);
-                    }
-                    Membership::Excludes => {}
+                let membership = self.membership(&config, &target);
+                if matches!(membership, Membership::Excludes) {
+                    continue;
                 }
+                let setting = self.config_strips(&config);
+                let strips = setting == Some(true);
+                let state = match (membership, setting) {
+                    (Membership::Includes, Some(true)) => StripState::Strips,
+                    (_, Some(false)) => StripState::Keeps,
+                    _ => StripState::Unknown,
+                };
+                decided = Some(match decided {
+                    None => (strips, state),
+                    Some((previous, previous_state)) => (
+                        previous || strips,
+                        match (previous_state, state) {
+                            (StripState::Strips, _) | (_, StripState::Strips) => StripState::Strips,
+                            (StripState::Unknown, _) | (_, StripState::Unknown) => {
+                                StripState::Unknown
+                            }
+                            _ => StripState::Keeps,
+                        },
+                    ),
+                });
             }
-            if let Some(strips) = decided {
-                return strips;
+            if let Some(decided) = decided {
+                return decided;
             }
         }
-        false
+        (false, StripState::Keeps)
     }
 
     fn directory_configs(&mut self, directory: &Path) -> Option<Vec<PathBuf>> {
+        let fs = &self.loader.fs;
         self.directories
             .entry(directory.to_path_buf())
-            .or_insert_with(|| read_directory_configs(directory))
+            .or_insert_with(|| read_directory_configs(fs, directory))
             .clone()
     }
 
@@ -103,12 +153,15 @@ impl StripInternalConfigs {
         }
     }
 
-    fn config_strips(&mut self, config: &Path) -> bool {
+    /// 設定の `stripInternal` の実効値。読めない・解けなければ None。
+    fn config_strips(&mut self, config: &Path) -> Option<bool> {
         if let Some(&strips) = self.strips.get(config) {
             return strips;
         }
-        let strips =
-            self.loader.strip_setting(config, 0, &mut Vec::new()) == Some(Setting::Value(true));
+        let strips = self
+            .loader
+            .strip_setting(config, 0, &mut Vec::new())
+            .map(|setting| setting == Setting::Value(true));
         self.strips.insert(config.to_path_buf(), strips);
         strips
     }
@@ -116,21 +169,16 @@ impl StripInternalConfigs {
 
 /// `directory` の tsconfig*.json / jsconfig*.json (正規化したパス)。ディレクトリが無ければ空
 /// (削除したファイルのディレクトリ)、一覧を読めなければ None。
-fn read_directory_configs(directory: &Path) -> Option<Vec<PathBuf>> {
-    let entries = match std::fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if missing(&error) => return Some(Vec::new()),
-        Err(_) => return None,
+fn read_directory_configs(fs: &ConfigFs, directory: &Path) -> Option<Vec<PathBuf>> {
+    let names = match fs.read_dir(directory) {
+        Listing::Entries(names) => names,
+        Listing::Missing => return Some(Vec::new()),
+        Listing::Unreadable => return None,
     };
     let mut configs = Vec::new();
-    for entry in entries {
-        let entry = entry.ok()?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if is_config_name(name)
-            && let Some(canonical) = regular_file(&entry.path())
+    for name in names {
+        if is_config_name(&name)
+            && let Some(canonical) = fs.regular_file(&directory.join(&name))
         {
             configs.push(canonical);
         }

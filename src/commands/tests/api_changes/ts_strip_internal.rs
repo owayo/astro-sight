@@ -707,3 +707,229 @@ fn ts_internal_tags_in_default_classes_tuples_and_type_queries() {
         "mod"
     );
 }
+
+const API: &str = "/** @internal */\nexport function f(): void {}\n\nexport interface Options {\n  name: string;\n  /** @internal */\n  retries: number;\n}\n";
+
+/// Issue #287 の再現: 設定だけを変えて `stripInternal` を有効にすると、変えていないソースの
+/// `@internal` の宣言とメンバーが宣言ファイルから消える。
+#[test]
+fn ts_strip_internal_config_changes_recheck_unchanged_sources() {
+    let files = [("tsconfig.json", NO_STRIP), ("src/api.ts", API)];
+    assert_eq!(bucket(&files, &[("tsconfig.json", STRIP)], "f"), "rm_dead");
+    assert_eq!(
+        bucket(&files, &[("tsconfig.json", STRIP)], "Options"),
+        "mod"
+    );
+    // `extends` の先の設定だけを変える
+    let base = "{ \"extends\": \"./tsconfig.base.json\" }\n";
+    let files = [
+        ("tsconfig.json", base),
+        ("tsconfig.base.json", NO_STRIP),
+        ("src/api.ts", API),
+    ];
+    assert_eq!(
+        bucket(&files, &[("tsconfig.base.json", STRIP)], "f"),
+        "rm_dead"
+    );
+    // 設定を変えなければ比べ直さない
+    let files = [("tsconfig.json", STRIP), ("src/api.ts", API)];
+    assert_eq!(
+        bucket(
+            &files,
+            &[("src/other.ts", "export const other = 1;\n")],
+            "f"
+        ),
+        "none"
+    );
+}
+
+/// 旧版のソースは旧版の設定で読む: 同じ差分で設定とソースを変えると、旧版の面は旧版の設定で
+/// 作る。
+#[test]
+fn ts_strip_internal_reads_old_sources_with_old_configs() {
+    let api = changed_api(
+        &[("tsconfig.json", STRIP), ("src/api.ts", API)],
+        &[
+            ("tsconfig.json", NO_STRIP),
+            ("src/api.ts", &format!("{API}\nexport const extra = 1;\n")),
+        ],
+        &[],
+    );
+    assert!(api.added.iter().any(|symbol| symbol.name == "f"), "{api:?}");
+    assert!(
+        api.modified.iter().any(|change| change.name == "Options"),
+        "{api:?}"
+    );
+}
+
+/// 内容が同じ rename でも、旧新のパスに当たる設定が違えば比べる。
+#[test]
+fn ts_strip_internal_renames_between_configs_are_compared() {
+    let api = changed_api(
+        &[
+            ("packages/a/tsconfig.json", STRIP),
+            ("packages/b/tsconfig.json", NO_STRIP),
+            ("packages/b/src/api.ts", API),
+            ("packages/a/src/keep.ts", "export const keep = 1;\n"),
+        ],
+        &[("packages/a/src/api.ts", API)],
+        &["packages/b/src/api.ts"],
+    );
+    assert!(
+        api.removed_dead.iter().any(|symbol| symbol.name == "f")
+            || api.removed.iter().any(|symbol| symbol.name == "f"),
+        "{api:?}"
+    );
+}
+
+/// 設定を読めないときは、確定した差分にせず申告する。
+#[test]
+fn ts_strip_internal_unreadable_configs_are_reported() {
+    let api = changed_api(
+        &[("tsconfig.json", NO_STRIP), ("src/api.ts", API)],
+        &[("tsconfig.json", "{ \"compilerOptions\": ")],
+        &[],
+    );
+    assert!(
+        api.removed_dead.iter().all(|symbol| symbol.name != "f"),
+        "{api:?}"
+    );
+    assert!(
+        api.parse_truncations
+            .iter()
+            .any(|truncation| truncation.reason
+                == crate::models::truncation::TruncationReason::TsStripInternalUnavailable),
+        "{api:?}"
+    );
+}
+
+/// 設定ファイルだけを動かす (内容が同じ rename) 差分も、比べ直しの引き金になる。
+#[test]
+fn ts_strip_internal_config_renames_trigger_rechecks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_git_repo_for_test(repo);
+    git_commit_files(
+        repo,
+        &[
+            ("packages/a/tsconfig.json", STRIP),
+            ("packages/a/src/keep.ts", "export const keep = 1;\n"),
+            ("packages/b/src/api.ts", API),
+        ],
+        "base",
+    );
+    git_in(
+        repo,
+        &["mv", "packages/a/tsconfig.json", "packages/b/tsconfig.json"],
+    );
+    let api = detect_api_changes_from_worktree(repo);
+    assert!(
+        api.removed_dead.iter().any(|symbol| symbol.name == "f"),
+        "{api:?}"
+    );
+}
+
+/// 生成物は、設定だけの変更でも比べ直さない (通常の差分と同じく外す)。
+#[test]
+fn ts_strip_internal_rechecks_skip_generated_files() {
+    let api = changed_api(
+        &[
+            ("tsconfig.json", NO_STRIP),
+            (".gitattributes", "src/gen.ts linguist-generated\n"),
+            ("src/gen.ts", API),
+        ],
+        &[("tsconfig.json", STRIP)],
+        &[],
+    );
+    assert!(
+        api.removed_dead.iter().all(|symbol| symbol.name != "f")
+            && api.removed.iter().all(|symbol| symbol.name != "f")
+            && api.modified.iter().all(|change| change.name != "Options"),
+        "{api:?}"
+    );
+}
+
+/// 変えたソースでも、片方の設定を読めなければ、読めた側の判定を両方に当て (設定が変わったかを
+/// 確かめられない)、申告する。
+#[test]
+fn ts_strip_internal_unreadable_side_uses_the_known_setting() {
+    let api = changed_api(
+        &[("tsconfig.json", STRIP), ("src/api.ts", API)],
+        &[
+            ("tsconfig.json", "{ \"compilerOptions\": "),
+            ("src/api.ts", &format!("{API}\n")),
+        ],
+        &[],
+    );
+    assert!(
+        api.modified.iter().all(|change| change.name != "Options")
+            && api.added.iter().all(|symbol| symbol.name != "f"),
+        "{api:?}"
+    );
+    assert!(
+        api.parse_truncations
+            .iter()
+            .any(|truncation| truncation.reason
+                == crate::models::truncation::TruncationReason::TsStripInternalUnavailable),
+        "{api:?}"
+    );
+}
+
+/// 大文字小文字を区別しないファイルシステムでは、base の版の設定も綴りの違いを同じパスとみなす。
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn ts_strip_internal_base_configs_follow_case_insensitive_paths() {
+    let files = [
+        (
+            "tsconfig.json",
+            "{ \"extends\": \"./TSConfig.base.json\" }\n",
+        ),
+        ("tsconfig.base.json", NO_STRIP),
+        ("src/api.ts", API),
+    ];
+    assert_eq!(
+        bucket(&files, &[("tsconfig.base.json", STRIP)], "f"),
+        "rm_dead"
+    );
+}
+
+/// 旧新とも設定を決められなければ、どちらも消さないとみなす (片方だけが有効と読めても、変化を
+/// 結論しない)。旧版にだけ `@internal` がある (最後のタグを消した) 変更でも、決められた側の設定を
+/// 旧版に当てる。
+#[test]
+fn ts_strip_internal_alignment_covers_both_unknown_and_removed_tags() {
+    let api = changed_api(
+        &[
+            ("tsconfig.json", "{ \"compilerOptions\": "),
+            ("src/api.ts", API),
+        ],
+        &[
+            (
+                "tsconfig.json",
+                "{ \"extends\": \"./missing.json\", \"compilerOptions\": { \"stripInternal\": true } }\n",
+            ),
+            ("src/api.ts", &format!("{API}\n")),
+        ],
+        &[],
+    );
+    assert!(
+        api.modified.iter().all(|change| change.name != "Options")
+            && api.removed_dead.iter().all(|symbol| symbol.name != "f"),
+        "{api:?}"
+    );
+    let api = changed_api(
+        &[
+            ("tsconfig.json", "{ \"compilerOptions\": "),
+            (
+                "src/api.ts",
+                "/** @internal */\nexport function f(): void {}\n",
+            ),
+        ],
+        &[
+            ("tsconfig.json", STRIP),
+            ("src/api.ts", "export function f(): void {}\n"),
+        ],
+        &[],
+    );
+    assert!(api.added.iter().any(|symbol| symbol.name == "f"), "{api:?}");
+}

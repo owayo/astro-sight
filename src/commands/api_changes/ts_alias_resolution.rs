@@ -42,8 +42,10 @@ use super::ts_module_paths::{
 use crate::engine::bounded_read::read_utf8_file_limited;
 use crate::git_support::normalize_workspace_separators;
 
+mod config_fs;
 mod strip_internal;
-pub(crate) use strip_internal::StripInternalConfigs;
+pub(crate) use config_fs::{BaseTree, ConfigFs};
+pub(crate) use strip_internal::{StripInternalConfigs, StripState};
 
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_CONFIG_TOTAL_BYTES: usize = 8 * 1024 * 1024;
@@ -977,6 +979,8 @@ fn has_local_override(value: &Value) -> bool {
 /// 設定を読み、`extends` を辿って合わせる。
 #[derive(Default)]
 struct ConfigLoader {
+    /// 設定を読むファイルシステム (今のものか base の版。Issue #287)。
+    fs: ConfigFs,
     bytes: usize,
     raw: HashMap<PathBuf, Option<Rc<Map<String, Value>>>>,
     /// (設定, 辿ってよい範囲) → 合わせた結果。同じ親を何度も書いた `extends` で、探索が指数的に
@@ -1102,17 +1106,20 @@ impl ConfigLoader {
         if let Some(raw) = self.raw.get(canonical) {
             return raw.clone();
         }
-        let raw = read_utf8_file_limited(canonical, MAX_FILE_BYTES).and_then(|source| {
-            self.bytes = self.bytes.checked_add(source.len())?;
-            if self.bytes > MAX_CONFIG_TOTAL_BYTES {
-                return None;
-            }
-            let bytes = super::jsonc::json_bytes(source.trim_start_matches('\u{feff}'))?;
-            match serde_json::from_slice(&bytes).ok()? {
-                Value::Object(map) => Some(Rc::new(map)),
-                _ => None,
-            }
-        });
+        let raw = self
+            .fs
+            .read_utf8_limited(canonical, MAX_FILE_BYTES)
+            .and_then(|source| {
+                self.bytes = self.bytes.checked_add(source.len())?;
+                if self.bytes > MAX_CONFIG_TOTAL_BYTES {
+                    return None;
+                }
+                let bytes = super::jsonc::json_bytes(source.trim_start_matches('\u{feff}'))?;
+                match serde_json::from_slice(&bytes).ok()? {
+                    Value::Object(map) => Some(Rc::new(map)),
+                    _ => None,
+                }
+            });
         self.raw.insert(canonical.to_path_buf(), raw.clone());
         raw
     }
@@ -1234,7 +1241,7 @@ impl ConfigLoader {
         let found =
             if parent.starts_with("./") || parent.starts_with("../") || parent.starts_with('/') {
                 let base = normalize_lexically(&directory.join(parent))?;
-                if is_regular_file(&base)? || parent.ends_with(".json") {
+                if self.fs.is_regular_file(&base)? || parent.ends_with(".json") {
                     base
                 } else {
                     with_suffix(&base, ".json")
@@ -1242,7 +1249,7 @@ impl ConfigLoader {
             } else {
                 self.package_config(directory, parent, area)?
             };
-        let canonical = regular_file(&found)?;
+        let canonical = self.fs.regular_file(&found)?;
         canonical.starts_with(area).then_some(canonical)
     }
 
@@ -1256,17 +1263,20 @@ impl ConfigLoader {
             if !ancestor.starts_with(area) {
                 return None;
             }
-            let Ok(package) = ancestor.join("node_modules").join(name).canonicalize() else {
+            let Some(package) = self
+                .fs
+                .canonicalize(&ancestor.join("node_modules").join(name))
+            else {
                 continue;
             };
             if !package.starts_with(area) {
                 return None;
             }
-            if !is_directory(&package)? {
+            if !self.fs.is_directory(&package)? {
                 continue;
             }
             let manifest_path = package.join("package.json");
-            let manifest = if is_regular_file(&manifest_path)? {
+            let manifest = if self.fs.is_regular_file(&manifest_path)? {
                 Some(self.read(&manifest_path)?)
             } else {
                 None
@@ -1288,11 +1298,13 @@ impl ConfigLoader {
                 return Some(package.join(field));
             }
             let base = normalize_lexically(&package.join(subpath))?;
-            return Some(if is_regular_file(&base)? || subpath.ends_with(".json") {
-                base
-            } else {
-                with_suffix(&base, ".json")
-            });
+            return Some(
+                if self.fs.is_regular_file(&base)? || subpath.ends_with(".json") {
+                    base
+                } else {
+                    with_suffix(&base, ".json")
+                },
+            );
         }
         None
     }

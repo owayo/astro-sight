@@ -99,7 +99,14 @@ pub(crate) fn detect_api_changes_with_renames(
         unverified_deleted_paths,
         parse_truncations,
         strip_internal,
-    } = PreparedDiff::new(dir, diff_files, canonical_dir.as_deref(), &base_blobs);
+        rechecks,
+    } = PreparedDiff::new(
+        dir,
+        diff_files,
+        renames,
+        canonical_dir.as_deref(),
+        &base_blobs,
+    );
     buckets.parse_truncations.extend(parse_truncations);
 
     // 型の移動と同じ差分でシグネチャの変わったメンバー、移動と同じ差分でシグネチャの変わった
@@ -144,7 +151,13 @@ pub(crate) fn detect_api_changes_with_renames(
         closure_caches: &mut closure_caches,
     };
 
-    for (df, prep) in diff_files.iter().zip(&prepared) {
+    // 設定だけの変更で比べ直す TS のソース (Issue #287) も、変更ファイルと同じく比べる。差分の
+    // ファイル (`diff_files`) には入れないので、変えたファイルとしては扱わない。
+    for (df, prep) in diff_files
+        .iter()
+        .zip(&prepared)
+        .chain(rechecks.iter().map(|(df, prep)| (df, prep)))
+    {
         match prep {
             PreparedDiffFile::Skip => {}
             PreparedDiffFile::Added {

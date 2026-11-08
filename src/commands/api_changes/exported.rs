@@ -233,7 +233,8 @@ fn extract_exported_file_facts_from_source(
     // dead-code は最新コミット側だけを見るため framework entrypoint の除外は不要。
     let context =
         ExportSurfaceContext::new(&syms, root, source, lang_id, true, false, Some(file_path))
-            .with_strip_internal(strip_internal.applies(file_path, lang_id, source));
+            // 旧版のソースは base の版の設定で判定する (Issue #287)。
+            .with_strip_internal(strip_internal.applies_old(file_path, lang_id, source));
     Some(filter_exported_with_metadata(
         &syms,
         &context,
