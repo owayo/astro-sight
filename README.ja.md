@@ -221,7 +221,7 @@ Rust の項目を別のファイルへ移し、元の場所から `pub use` で�
 
 TypeScript のクラス・enum・オーバーロードのある関数は、宣言ファイルに出る形で比べます。クラスはコンストラクタと、公開のフィールド (パラメータプロパティを含む)・アクセサ・index signature・実装の無いメソッドの宣言、enum はメンバーと値、オーバーロードのある関数・メソッドはオーバーロードの宣言です。これらの変更は、クラス・enum・関数・メソッドの blocking な `api.mod` になります (クラスに optional のフィールドを足しただけなら `mod_compat`)。
 
-ファイルをコンパイルする TypeScript の設定が `stripInternal` を有効にすると、`api_changes` は出力する宣言ファイルを使う利用者から見た API として比べます。export やメンバーへの `@internal` の付け足しは、その削除と同じ区分になります (export は `api.rm` / `api.rm_dead`、インタフェースや object 型のメンバーは、それを含む型や関数の変更)。
+ファイルをコンパイルする TypeScript の設定が `stripInternal` を有効にすると、`api_changes` は出力する宣言ファイルを使う利用者から見た API として比べます。export やメンバーへの `@internal` の付け足しは、その削除と同じ区分になります (export は `api.rm` / `api.rm_dead`、インタフェースや object 型のメンバーは、それを含む型や関数の変更)。旧版のソースは base の版の設定で判定し、設定だけの変更 (`stripInternal` を有効にする、継ぐ設定を変える) でも、その設定が当たる変えていない TypeScript のソースを比べ直します。
 
 呼び出し側を同じ diff で変更した場合も、inline object 型の引数から消したキーを渡していないことを確かめてから `mod_closed` にします。削除キーを含む JSX 属性・object リテラルや、spread・計算キー・引用符付きキー・変数の引数・暗黙の JSX children などキーを確定できない形は `api.mod` と hook の `impacts` に残ります。interface / object 型の type alias のプロパティ削除も、値の構築と利用の証明に失敗した参照を変更行だけで解決済みにはしません。
 
